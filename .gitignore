@@ -1,0 +1,25 @@
+# intentionally untracked
+AGENTS.md
+.agents/
+notes/
+*.notes.md
+
+# artifacts
+build/
+bin/
+makefiles/defaults/*
+*.d
+*.o
+*.obj
+*.so
+*.a
+*.tmp
+
+# logs
+*.log
+results/
+
+# per-system shit
+models/
+.venv*/
+venv/
