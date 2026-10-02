@@ -5,14 +5,6 @@ namespace cg = cooperative_groups;
 #include "ptx.cuh"
 #include "exl3_kernel_map.cuh"
 #include "trellis_context.h"
-#include "comp_units/exl3_comp_unit_1.cuh"
-#include "comp_units/exl3_comp_unit_2.cuh"
-#include "comp_units/exl3_comp_unit_3.cuh"
-#include "comp_units/exl3_comp_unit_4.cuh"
-#include "comp_units/exl3_comp_unit_5.cuh"
-#include "comp_units/exl3_comp_unit_6.cuh"
-#include "comp_units/exl3_comp_unit_7.cuh"
-#include "comp_units/exl3_comp_unit_8.cuh"
 
 int select_gemm_shape( int cc, int size_m, int size_k, int size_n, int K, bool multi, int bszm_in, int bszm_out ) {
 	(void) multi;

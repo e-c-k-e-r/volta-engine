@@ -24,7 +24,6 @@ set(ENGINE_CORE_SOURCES
 
 file(GLOB TRELLIS_SOURCES
 	src/kernels/trellis/*.cu
-	src/kernels/trellis/comp_units/*.cu
 )
 
 add_library(engine_kernels STATIC
