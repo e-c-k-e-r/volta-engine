@@ -17,6 +17,7 @@ int trellis_get_smem_request( int device = 0 );
 int trellis_get_cc( int device = 0 );
 int* trellis_get_locks( int device = 0 );
 half* trellis_get_workspace( int device = 0, size_t bytes = 16 * 1024 * 1024 );
+void trellis_context_init_all();
 void trellis_context_destroy();
 
 } // namespace engine::modules

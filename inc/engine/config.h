@@ -22,7 +22,7 @@
 	do { \
 		if ( ENGINE_UNLIKELY(!(cond)) ) { \
 			std::fprintf(stderr, "[FATAL] Assertion failed: %s (%s:%d): %s\n", #cond, __FILE__, __LINE__, msg); \
-			std::abort(); \
+			std::_Exit(1); \
 		} \
 	} while (0)
 
@@ -31,7 +31,7 @@
 		cudaError_t err = (call); \
 		if ( ENGINE_UNLIKELY(err != cudaSuccess) ) { \
 			std::fprintf(stderr, "[CUDA ERROR] %s (%s:%d): %s\n", #call, __FILE__, __LINE__, cudaGetErrorString(err)); \
-			std::abort(); \
+			std::_Exit(1); \
 		} \
 	} while (0)
 

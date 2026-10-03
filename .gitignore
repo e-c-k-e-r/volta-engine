@@ -20,6 +20,6 @@ makefiles/defaults/*
 results/
 
 # per-system shit
-models/
+/models/
 .venv*/
 venv/

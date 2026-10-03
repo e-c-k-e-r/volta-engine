@@ -66,6 +66,13 @@ half* trellis_get_workspace( int device, size_t bytes ) {
 	return static_cast<half*>( g_workspace[device] );
 }
 
+void trellis_context_init_all() {
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		trellis_get_workspace( d, 16 * 1024 * 1024 );
+		trellis_get_locks( d );
+	}
+}
+
 void trellis_context_destroy() {
 	std::lock_guard<std::mutex> lock( g_trellis_ctx_mtx );
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
