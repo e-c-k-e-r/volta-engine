@@ -20,10 +20,13 @@ include_directories(
 set(ENGINE_CORE_SOURCES
 	src/core/arena.cpp
 	src/loader/safetensors.cpp
+	src/comm/all_reduce_ipc.cu
+	src/kernels/nvfp4/skinny_kernels.cu
 )
 
 file(GLOB TRELLIS_SOURCES
 	src/kernels/trellis/*.cu
+	src/kernels/trellis/comp_units/*.cu
 )
 
 add_library(engine_kernels STATIC
@@ -36,14 +39,20 @@ set_target_properties(engine_kernels PROPERTIES
 	OUTPUT_NAME "engine_kernels"
 )
 
-add_executable(test_trellis
-	tests/2_parity/test_trellis.cpp
-)
+# Test Trellis
+add_executable(test_trellis tests/2_parity/test_trellis.cpp)
+target_link_libraries(test_trellis PRIVATE engine_kernels)
+set_target_properties(test_trellis PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
-target_link_libraries(test_trellis PRIVATE
-	engine_kernels
-)
+# Benchmarks
+add_executable(bench_all_reduce tests/3_bench/bench_all_reduce.cpp)
+target_link_libraries(bench_all_reduce PRIVATE engine_kernels)
+set_target_properties(bench_all_reduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
-set_target_properties(test_trellis PROPERTIES
-	RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
-)
+add_executable(bench_trellis tests/3_bench/bench_trellis.cpp)
+target_link_libraries(bench_trellis PRIVATE engine_kernels)
+set_target_properties(bench_trellis PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(bench_nvfp4 tests/3_bench/bench_nvfp4.cpp)
+target_link_libraries(bench_nvfp4 PRIVATE engine_kernels)
+set_target_properties(bench_nvfp4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
