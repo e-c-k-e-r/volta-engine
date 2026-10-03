@@ -13,6 +13,7 @@ void LinearTrellis::forward(
 	pod::TensorView& out,
 	int bits,
 	bool mcg,
+	bool mul1,
 	cudaStream_t stream
 ) {
 	const int m = x.shape[0];
@@ -43,7 +44,7 @@ void LinearTrellis::forward(
 			n,
 			bits,
 			mcg,
-			false,
+			mul1,
 			c_fp32,
 			stream
 		);
@@ -61,7 +62,7 @@ void LinearTrellis::forward(
 			n,
 			bits,
 			mcg,
-			false,
+			mul1,
 			c_fp32,
 			stream
 		);

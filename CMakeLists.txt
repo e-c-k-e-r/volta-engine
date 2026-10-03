@@ -22,6 +22,11 @@ set(ENGINE_CORE_SOURCES
 	src/loader/safetensors.cpp
 	src/comm/all_reduce_ipc.cu
 	src/kernels/nvfp4/skinny_kernels.cu
+	src/modules/norm.cu
+	src/modules/swiglu.cu
+	src/modules/rope.cu
+	src/modules/attention.cu
+	src/modules/gdn.cu
 	src/models/qwen38_27b.cu
 	src/models/glm53_flash.cu
 )

@@ -15,6 +15,7 @@ struct LinearTrellis {
 		pod::TensorView& out,
 		int bits,
 		bool mcg,
+		bool mul1 = false,
 		cudaStream_t stream = nullptr
 	);
 };

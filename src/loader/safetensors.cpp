@@ -28,6 +28,9 @@ static pod::DType parse_dtype_str( const char* str, size_t len ) {
 	if ( len == 3 && std::strncmp( str, "U16", 3 ) == 0 ) {
 		return pod::DType::UINT16;
 	}
+	if ( len == 3 && std::strncmp( str, "I16", 3 ) == 0 ) {
+		return pod::DType::UINT16;
+	}
 	if ( len == 3 && std::strncmp( str, "U32", 3 ) == 0 ) {
 		return pod::DType::UINT32;
 	}

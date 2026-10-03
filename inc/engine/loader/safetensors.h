@@ -10,7 +10,7 @@
 namespace pod {
 
 struct SafeTensorMeta {
-	char        name[128];
+	char        name[256];
 	pod::DType  dtype;
 	int         ndim;
 	int         shape[4];
@@ -19,13 +19,13 @@ struct SafeTensorMeta {
 };
 
 struct SafeTensorsFile {
-	int             fd;
-	size_t          file_size;
-	void*           mmap_addr;
-	uint64_t        header_len;
-	SafeTensorMeta* tensors;
-	int             tensor_count;
-	int             tensor_capacity;
+	int             fd = -1;
+	size_t          file_size = 0;
+	void*           mmap_addr = nullptr;
+	uint64_t        header_len = 0;
+	SafeTensorMeta* tensors = nullptr;
+	int             tensor_count = 0;
+	int             tensor_capacity = 0;
 };
 
 } // namespace pod
