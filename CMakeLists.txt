@@ -27,6 +27,8 @@ set(ENGINE_CORE_SOURCES
 	src/modules/rope.cu
 	src/modules/attention.cu
 	src/modules/gdn.cu
+	src/modules/mla.cu
+	src/modules/moe.cu
 	src/models/qwen38_27b.cu
 	src/models/glm53_flash.cu
 )

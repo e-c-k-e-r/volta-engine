@@ -161,6 +161,10 @@ private:
 	pod::TensorView dummy_suh_;
 	pod::TensorView dummy_svh_;
 	pod::TensorView dummy_norm_;
+	pod::TensorView dummy_down_;
+	pod::TensorView dummy_suh_h_;
+	pod::TensorView dummy_svh_h_;
+	pod::TensorView dummy_norm_h_;
 
 	// Full-attention buffers
 	pod::TensorView q_gate_buf_;

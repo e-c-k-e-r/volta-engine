@@ -327,6 +327,7 @@ void init_4gpu_mesh(
 		for ( int peer = 0; peer < ENGINE_NUM_GPUS; ++peer ) {
 			if ( peer != d ) {
 				cudaDeviceEnablePeerAccess( peer, 0 );
+				cudaGetLastError();
 			}
 		}
 		CUDA_CHECK( cudaMalloc( &staging_ptrs[d], staging_bytes ) );

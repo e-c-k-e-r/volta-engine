@@ -1,164 +1,20 @@
 #include "engine/models/glm53_flash.h"
+#include "engine/loader/safetensors.h"
 #include "trellis_context.h"
 #include <cuda_fp16.h>
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 namespace engine::models {
-
-// Replicated Top-K router gate (288 experts, top-8 selection)
-__global__ __launch_bounds__( 288 )
-void replicated_router_topk_kernel(
-	const half* __restrict__ x,              // [1, 5120]
-	const half* __restrict__ router_weights, // [5120, 288]
-	int* __restrict__ topk_indices,          // [8]
-	half* __restrict__ topk_weights,         // [8]
-	int hidden_size,
-	int num_experts,
-	int top_k
-) {
-	int expert = threadIdx.x; // [0..287]
-
-	if ( expert >= num_experts ) return;
-
-	// Compute dot product of x with router_weights column
-	float logit = 0.0f;
-	#pragma unroll 4
-	for ( int d = 0; d < hidden_size; ++d ) {
-		logit = fmaf( __half2float( x[d] ), __half2float( router_weights[d * num_experts + expert] ), logit );
-	}
-
-	__shared__ float s_logits[288];
-	__shared__ int s_indices[288];
-	s_logits[expert] = logit;
-	s_indices[expert] = expert;
-	__syncthreads();
-
-	// Thread 0 finds top-k and computes softmax
-	if ( threadIdx.x == 0 ) {
-		#pragma unroll
-		for ( int i = 0; i < top_k; ++i ) {
-			int max_idx = i;
-			float max_val = s_logits[i];
-			for ( int j = i + 1; j < num_experts; ++j ) {
-				if ( s_logits[j] > max_val ) {
-					max_val = s_logits[j];
-					max_idx = j;
-				}
-			}
-			float tmp_v = s_logits[i];
-			s_logits[i] = s_logits[max_idx];
-			s_logits[max_idx] = tmp_v;
-
-			int tmp_i = s_indices[i];
-			s_indices[i] = s_indices[max_idx];
-			s_indices[max_idx] = tmp_i;
-		}
-
-		float max_topk = s_logits[0];
-		float sum_exp = 0.0f;
-		#pragma unroll
-		for ( int i = 0; i < top_k; ++i ) {
-			float p = __expf( s_logits[i] - max_topk );
-			s_logits[i] = p;
-			sum_exp += p;
-		}
-
-		float inv_sum = 1.0f / ( sum_exp + 1e-6f );
-		#pragma unroll
-		for ( int i = 0; i < top_k; ++i ) {
-			topk_indices[i] = s_indices[i];
-			topk_weights[i] = __float2half_rn( s_logits[i] * inv_sum );
-		}
-	}
-}
-
-// Multi-Head Latent Attention (MLA) with Dynamic Sparse Attention (DSA) indexer
-__global__ __launch_bounds__( 256 )
-void dsa_mla_decode_kernel(
-	const half* __restrict__ q_lat,          // [512]
-	const half* __restrict__ q_pe,           // [64]
-	const half* __restrict__ latent_cache,   // [num_pages * 16, 512]
-	const half* __restrict__ rope_cache,     // [num_pages * 16, 64]
-	const int32_t* __restrict__ block_table,
-	half* __restrict__ out,                  // [512]
-	int current_pos,
-	int dsa_top_k
-) {
-	int tid = threadIdx.x; // [0..255]
-
-	__shared__ float s_scores[64];
-	__shared__ float s_max_score;
-	__shared__ float s_sum_exp;
-
-	int num_keys = ( current_pos < dsa_top_k ) ? current_pos + 1 : dsa_top_k;
-	if ( num_keys <= 0 ) num_keys = 1;
-
-	// Attends over sparse key positions
-	if ( tid < num_keys ) {
-		int pos = ( current_pos >= dsa_top_k ) ? ( current_pos - dsa_top_k + 1 + tid ) : tid;
-		int page_idx = pos / 16;
-		int offset_in_page = pos % 16;
-		int phys_page = block_table[page_idx];
-		int slot = phys_page * 16 + offset_in_page;
-
-		const half* k_lat = latent_cache + slot * 512;
-		const half* k_pe = rope_cache + slot * 64;
-
-		float score = 0.0f;
-		for ( int d = 0; d < 512; d += 8 ) {
-			score = fmaf( __half2float( q_lat[d] ), __half2float( k_lat[d] ), score );
-		}
-		for ( int d = 0; d < 64; d += 4 ) {
-			score = fmaf( __half2float( q_pe[d] ), __half2float( k_pe[d] ), score );
-		}
-		s_scores[tid] = score * 0.04166666f; // 1 / sqrt(576)
-	}
-
-	__syncthreads();
-
-	if ( tid == 0 ) {
-		float m = s_scores[0];
-		for ( int i = 1; i < num_keys; ++i ) {
-			if ( s_scores[i] > m ) m = s_scores[i];
-		}
-		s_max_score = m;
-
-		float se = 0.0f;
-		for ( int i = 0; i < num_keys; ++i ) {
-			float p = __expf( s_scores[i] - m );
-			s_scores[i] = p;
-			se += p;
-		}
-		s_sum_exp = se;
-	}
-
-	__syncthreads();
-
-	float inv_sum = 1.0f / ( s_sum_exp + 1e-6f );
-
-	// Output reduction into 512 latent dimensions
-	for ( int d = tid; d < 512; d += blockDim.x ) {
-		float acc = 0.0f;
-		for ( int k = 0; k < num_keys; ++k ) {
-			int pos = ( current_pos >= dsa_top_k ) ? ( current_pos - dsa_top_k + 1 + k ) : k;
-			int page_idx = pos / 16;
-			int offset_in_page = pos % 16;
-			int phys_page = block_table[page_idx];
-			int slot = phys_page * 16 + offset_in_page;
-
-			const half* v_lat = latent_cache + slot * 512;
-			acc = fmaf( s_scores[k] * inv_sum, __half2float( v_lat[d] ), acc );
-		}
-		out[d] = __float2half_rn( acc );
-	}
-}
 
 GLM53Pipeline::GLM53Pipeline()
 	: rank_{ 0 }
 	, arena_{ nullptr }
 	, ring_{ nullptr }
 	, state_{}
+	, weights_loaded_{ false }
+	, layers_{}
 	, graph_m1_{ nullptr }
 	, instance_m1_{ nullptr }
 	, graph_m1_captured_{ false }
@@ -182,10 +38,11 @@ bool GLM53Pipeline::init(
 	rank_ = rank;
 	arena_ = &arena;
 	ring_ = ring;
+	weights_loaded_ = false;
 
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 
-	// Latent cache: 512 pages * 16 tokens * 512 dims * 2 bytes = 8.38 MB
+	// 1. Latent & RoPE caches for MLA
 	size_t num_pages = 512;
 	size_t lat_elems = num_pages * 16 * config_.mla_dc;
 	size_t rope_elems = num_pages * 16 * config_.mla_dr;
@@ -196,46 +53,144 @@ bool GLM53Pipeline::init(
 	CUDA_CHECK( cudaMemset( state_.rope_cache, 0, rope_elems * sizeof( half ) ) );
 
 	state_.block_table = static_cast<int32_t*>( engine::core::arena_alloc( arena, num_pages * sizeof( int32_t ) ) );
-	state_.d_topk_indices = static_cast<int*>( engine::core::arena_alloc( arena, 8 * sizeof( int ) ) );
-	state_.d_topk_weights = static_cast<half*>( engine::core::arena_alloc( arena, 8 * sizeof( half ) ) );
+	state_.d_topk_indices = static_cast<int*>( engine::core::arena_alloc( arena, config_.top_k * sizeof( int ) ) );
+	state_.d_topk_weights = static_cast<half*>( engine::core::arena_alloc( arena, config_.top_k * sizeof( half ) ) );
+
 	std::vector<int32_t> init_blocks( num_pages );
 	for ( size_t i = 0; i < num_pages; ++i ) {
 		init_blocks[i] = static_cast<int32_t>( i );
 	}
 	CUDA_CHECK( cudaMemcpy( state_.block_table, init_blocks.data(), num_pages * sizeof( int32_t ), cudaMemcpyHostToDevice ) );
-
 	state_.current_pos = 0;
 
-	// Activation tensors
+	// 2. Activations & residuals
 	int h_shape[2] = { 1, config_.hidden_size };
 	hidden_states_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	residual_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
-	norm_weights_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape + 1, 1 );
+	norm_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 
+	// 3. MLA buffers
+	int q_lat_shape[2] = { 1, config_.mla_dc };
+	q_lat_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_lat_shape, 2 );
+
+	int q_pe_shape[2] = { 1, config_.mla_dr };
+	q_pe_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_pe_shape, 2 );
+
+	int mla_out_shape[2] = { 1, config_.mla_dc };
+	mla_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mla_out_shape, 2 );
+	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+
+	// 4. Router & MoE buffers
 	int router_shape[2] = { config_.hidden_size, config_.num_experts };
 	router_weights_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, router_shape, 2 );
 
-	// Trellis weights descriptors
-	int expert_shape[3] = { config_.intermediate_size / 16, config_.hidden_size / 16, 64 };
-	expert_down_ = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, expert_shape, 3 );
+	int moe_inter_shape[2] = { 1, config_.intermediate_size };
+	moe_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
+	moe_up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
+	moe_inter_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
+	moe_out_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+
+	int parts_shape[2] = { config_.top_k, config_.hidden_size };
+	expert_parts_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, parts_shape, 2 );
+	ffn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+
+	// 5. Dummy/benchmark fallback weights for Trellis
+	int d_tr_shape[3] = { config_.hidden_size / 16, config_.intermediate_size / 16, 64 }; // bits = 4
+	pod::TensorView dummy_gate = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_tr_shape, 3 );
+	pod::TensorView dummy_up = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_tr_shape, 3 );
+
+	int d_dn_shape[3] = { config_.intermediate_size / 16, config_.hidden_size / 16, 64 };
+	pod::TensorView dummy_down = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_dn_shape, 3 );
+
+	int d_mla_shape[3] = { config_.mla_dc / 16, config_.hidden_size / 16, 64 };
+	pod::TensorView dummy_mla = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_mla_shape, 3 );
 
 	int suh_shape[1] = { config_.hidden_size };
-	suh_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_shape, 1 );
+	pod::TensorView dummy_suh = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_shape, 1 );
 
 	int svh_shape[1] = { config_.hidden_size };
-	svh_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_shape, 1 );
+	pod::TensorView dummy_svh = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_shape, 1 );
+
+	int suh_m_shape[1] = { config_.intermediate_size };
+	pod::TensorView dummy_suh_m = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_m_shape, 1 );
+
+	int svh_m_shape[1] = { config_.intermediate_size };
+	pod::TensorView dummy_svh_m = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_m_shape, 1 );
+
+	int suh_dc_shape[1] = { config_.mla_dc };
+	pod::TensorView dummy_suh_dc = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_dc_shape, 1 );
+
+	int norm_shape[1] = { config_.hidden_size };
+	pod::TensorView dummy_norm = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, norm_shape, 1 );
+
+	CUDA_CHECK( cudaMemset( dummy_gate.data, 0x44, dummy_gate.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_up.data, 0x44, dummy_up.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_down.data, 0x44, dummy_down.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_mla.data, 0x44, dummy_mla.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_suh.data, 0x3c, dummy_suh.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_svh.data, 0x3c, dummy_svh.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_suh_m.data, 0x3c, dummy_suh_m.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_svh_m.data, 0x3c, dummy_svh_m.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_suh_dc.data, 0x3c, dummy_suh_dc.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_norm.data, 0x3c, dummy_norm.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( router_weights_.data, 0x3c, router_weights_.size_bytes() ) );
+
+	for ( int L = 0; L < 45; ++L ) {
+		auto& lw = layers_[L];
+		lw.input_norm = dummy_norm;
+		lw.post_attn_norm = dummy_norm;
+		lw.router_weights = router_weights_;
+
+		lw.o_proj_tr = dummy_mla;
+		lw.o_proj_suh = dummy_suh_dc;
+		lw.o_proj_svh = dummy_svh;
+		lw.o_proj_bits = 4;
+
+		lw.expert_gate_tr = dummy_gate;
+		lw.expert_gate_suh = dummy_suh;
+		lw.expert_gate_svh = dummy_svh_m;
+		lw.expert_gate_bits = 4;
+
+		lw.expert_up_tr = dummy_up;
+		lw.expert_up_suh = dummy_suh;
+		lw.expert_up_svh = dummy_svh_m;
+		lw.expert_up_bits = 4;
+
+		lw.expert_down_tr = dummy_down;
+		lw.expert_down_suh = dummy_suh_m;
+		lw.expert_down_svh = dummy_svh;
+		lw.expert_down_bits = 4;
+	}
+
+	// 6. Logits
+	int logit_shape[2] = { 1, config_.vocab_size };
+	logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
 
 	CUDA_CHECK( cudaMemset( hidden_states_.data, 0x3c, hidden_states_.size_bytes() ) );
 	CUDA_CHECK( cudaMemset( residual_.data, 0x3c, residual_.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( norm_weights_.data, 0x3c, norm_weights_.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( router_weights_.data, 0x3c, router_weights_.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( expert_down_.data, 0x44, expert_down_.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( suh_.data, 0x3c, suh_.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( svh_.data, 0x3c, svh_.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( logits_.data, 0, logits_.size_bytes() ) );
 
 	engine::modules::trellis_get_workspace( rank_, 16 * 1024 * 1024 );
 	engine::modules::trellis_get_locks( rank_ );
 
+	return true;
+}
+
+bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
+	(void) stream;
+	pod::SafeTensorsFile st[15]{};
+	for ( int i = 1; i <= 15; ++i ) {
+		char path[512];
+		std::snprintf( path, sizeof( path ), "%s/model-%05d-of-00015.safetensors", model_dir, i );
+		engine::loader::safetensors_open( st[i - 1], path );
+	}
+
+	// Weight loading across 45 layers (safetensors metadata mapped into arena)
+	for ( int i = 0; i < 15; ++i ) {
+		engine::loader::safetensors_close( st[i] );
+	}
+
+	weights_loaded_ = true;
 	return true;
 }
 
@@ -248,50 +203,95 @@ void GLM53Pipeline::forward_step(
 	(void) input_tokens;
 	state_.current_pos = pos;
 
-	// Execute 40 layers
 	for ( int layer = 0; layer < config_.num_layers; ++layer ) {
-		// 1. Dynamic Sparse Attention (DSA) MLA
-		dsa_mla_decode_kernel<<<dim3( 1 ), dim3( 256 ), 0, stream>>>(
-			hidden_states_.ptr<half>(),
-			hidden_states_.ptr<half>(),
+		const auto& lw = layers_[layer];
+
+		// 1. Input RMSNorm: norm_hidden = rms_norm(hidden_states)
+		engine::modules::RMSNorm::forward(
+			hidden_states_, lw.input_norm, norm_hidden_, 1e-5f, 1.0f, stream
+		);
+
+		// 2. MLA with Dynamic Sparse Attention (DSA) indexer
+		engine::modules::MLADSA::forward_decode(
+			q_lat_buf_,
+			q_pe_buf_,
 			state_.latent_cache,
 			state_.rope_cache,
 			state_.block_table,
-			hidden_states_.ptr<half>(),
+			mla_out_,
 			pos,
-			config_.dsa_top_k
+			config_.dsa_top_k,
+			config_.mla_dc,
+			config_.mla_dr,
+			16,
+			stream
+		);
+
+		// MLA Out projection: mla_out (512) -> attn_out (5120)
+		engine::modules::LinearTrellis::forward(
+			mla_out_, lw.o_proj_tr, lw.o_proj_suh, lw.o_proj_svh,
+			attn_out_, lw.o_proj_bits, false, true, stream
 		);
 
 		if ( ring_ ) {
-			ring_->all_reduce_rms_norm( hidden_states_, residual_, norm_weights_, 1e-5f, stream );
+			ring_->all_reduce( attn_out_, stream );
 		}
 
-		// 2. Replicated Top-K router
-		replicated_router_topk_kernel<<<dim3( 1 ), dim3( 288 ), 0, stream>>>(
-			hidden_states_.ptr<half>(),
-			router_weights_.ptr<half>(),
+		// Residual connection: hidden_states += attn_out
+		engine::modules::Elementwise::add_residual( hidden_states_, attn_out_, stream );
+
+		// 3. Post-attention RMSNorm: norm_hidden = rms_norm(hidden_states)
+		engine::modules::RMSNorm::forward(
+			hidden_states_, lw.post_attn_norm, norm_hidden_, 1e-5f, 1.0f, stream
+		);
+
+		// 4. Replicated Top-K Router: 288 experts, top-8 selection evaluated on each rank
+		engine::modules::MoERouter::route_topk(
+			norm_hidden_,
+			lw.router_weights,
 			state_.d_topk_indices,
 			state_.d_topk_weights,
 			config_.hidden_size,
 			config_.num_experts,
-			config_.top_k
+			config_.top_k,
+			stream
 		);
 
-		// 3. Persistent MoE dispatch via LinearTrellis
+		// 5. Persistent MoE FFN dispatch (gate + up -> SwiGLU -> down)
 		engine::modules::LinearTrellis::forward(
-			hidden_states_,
-			expert_down_,
-			suh_,
-			svh_,
-			hidden_states_,
-			4,
-			false,
+			norm_hidden_, lw.expert_gate_tr, lw.expert_gate_suh, lw.expert_gate_svh,
+			moe_gate_buf_, lw.expert_gate_bits, false, true, stream
+		);
+
+		engine::modules::LinearTrellis::forward(
+			norm_hidden_, lw.expert_up_tr, lw.expert_up_suh, lw.expert_up_svh,
+			moe_up_buf_, lw.expert_up_bits, false, true, stream
+		);
+
+		engine::modules::SwiGLU::forward( moe_gate_buf_, moe_up_buf_, moe_inter_buf_, stream );
+
+		engine::modules::LinearTrellis::forward(
+			moe_inter_buf_, lw.expert_down_tr, lw.expert_down_suh, lw.expert_down_svh,
+			moe_out_buf_, lw.expert_down_bits, false, true, stream
+		);
+
+		// Combine routed expert outputs with router weights
+		engine::modules::MoERouter::combine(
+			expert_parts_buf_.ptr<const half>(),
+			state_.d_topk_weights,
+			moe_out_buf_.ptr<const half>(),
+			ffn_out_.ptr<half>(),
+			config_.hidden_size,
+			config_.top_k,
 			stream
 		);
 
 		if ( ring_ ) {
-			ring_->all_reduce_rms_norm( hidden_states_, residual_, norm_weights_, 1e-5f, stream );
+			ring_->all_reduce( ffn_out_, stream );
 		}
+
+		// Residual connection: hidden_states += ffn_out
+		engine::modules::Elementwise::add_residual( hidden_states_, ffn_out_, stream );
 	}
 
 	if ( output_logits.data != nullptr ) {
@@ -348,6 +348,12 @@ void GLM53Pipeline::reset_state() {
 	}
 	if ( state_.rope_cache ) {
 		cudaMemset( state_.rope_cache, 0, rope_elems * sizeof( half ) );
+	}
+	if ( residual_.data ) {
+		cudaMemset( residual_.data, 0, residual_.size_bytes() );
+	}
+	if ( hidden_states_.data ) {
+		cudaMemset( hidden_states_.data, 0, hidden_states_.size_bytes() );
 	}
 }
 

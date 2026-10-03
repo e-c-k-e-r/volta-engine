@@ -16,6 +16,7 @@ int main( int argc, char** argv ) {
 	std::printf( "========================================================\n" );
 	std::printf( "   volta-engine Phase 2: Autoregressive Decode Benchmark\n" );
 	std::printf( "========================================================\n" );
+	std::fflush( stdout );
 
 	int dev = 0;
 	CUDA_CHECK( cudaSetDevice( dev ) );
@@ -24,7 +25,7 @@ int main( int argc, char** argv ) {
 	CUDA_CHECK( cudaStreamCreate( &stream ) );
 
 	pod::MemoryArena arena;
-	size_t arena_bytes = 1024 * 1024 * 1024; // 1 GB arena
+	size_t arena_bytes = 2ULL * 1024 * 1024 * 1024; // 2 GB arena
 	bool ok = engine::core::arena_create( arena, dev, arena_bytes );
 	ENGINE_ASSERT( ok, "Failed to create static arena" );
 
@@ -40,6 +41,7 @@ int main( int argc, char** argv ) {
 	// 1. Qwen3.8-27B Benchmark
 	// -----------------------------------------------------------------------
 	std::printf( "[*] Initializing Qwen3.8-27B Pipeline (64 layers, 48 GDN + 16 SWA)...\n" );
+	std::fflush( stdout );
 	engine::models::Qwen38Config qwen_cfg;
 	engine::models::Qwen38Pipeline qwen_pipe;
 	ok = qwen_pipe.init( qwen_cfg, dev, arena, nullptr );
@@ -47,8 +49,11 @@ int main( int argc, char** argv ) {
 
 	// Capture static CUDA Graph for M=1 decode
 	std::printf( "[*] Capturing static CUDA Graph for M=1 decode...\n" );
+	std::fflush( stdout );
 	ok = qwen_pipe.capture_graph( 1, stream );
 	ENGINE_ASSERT( ok, "Failed to capture Qwen38 M=1 graph" );
+	std::printf( "[+] Captured Qwen38 M=1 graph\n" );
+	std::fflush( stdout );
 
 	// Warm-up
 	for ( int i = 0; i < 20; ++i ) {

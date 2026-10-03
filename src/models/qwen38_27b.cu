@@ -275,6 +275,166 @@ bool Qwen38Pipeline::init(
 	CUDA_CHECK( cudaMemset( residual_.data, 0, residual_.size_bytes() ) );
 	CUDA_CHECK( cudaMemset( logits_.data, 0, logits_.size_bytes() ) );
 
+	// Fallback dummy descriptors for decode microbenchmark
+	int d_gu_shape[3] = { config_.hidden_size / 16, config_.intermediate_size / 16, 64 };
+	pod::TensorView dummy_gate_up = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_gu_shape, 3 );
+
+	int d_dn_shape[3] = { config_.intermediate_size / 16, config_.hidden_size / 16, 64 };
+	pod::TensorView dummy_down = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_dn_shape, 3 );
+
+	int d_q_shape[3] = { config_.hidden_size / 16, ( config_.full_num_q_heads * config_.full_head_dim * 2 ) / 16, 64 };
+	pod::TensorView dummy_q = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_q_shape, 3 );
+
+	int d_kv_shape[3] = { config_.hidden_size / 16, ( config_.full_num_kv_heads * config_.full_head_dim ) / 16, 64 };
+	pod::TensorView dummy_kv = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_kv_shape, 3 );
+
+	int d_o_shape[3] = { ( config_.full_num_q_heads * config_.full_head_dim ) / 16, config_.hidden_size / 16, 64 };
+	pod::TensorView dummy_o = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_o_shape, 3 );
+
+	int d_qkv_shape[3] = { config_.hidden_size / 16, config_.linear_channels / 16, 64 };
+	pod::TensorView dummy_qkv = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_qkv_shape, 3 );
+
+	int d_z_shape[3] = { config_.hidden_size / 16, ( config_.linear_num_v_heads * config_.linear_head_dim ) / 16, 64 };
+	pod::TensorView dummy_z = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_z_shape, 3 );
+
+	int d_out_shape[3] = { ( config_.linear_num_v_heads * config_.linear_head_dim ) / 16, config_.hidden_size / 16, 64 };
+	pod::TensorView dummy_lin_out = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_out_shape, 3 );
+
+	int suh_h_shape[1] = { config_.hidden_size };
+	pod::TensorView dummy_suh_h = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_h_shape, 1 );
+	pod::TensorView dummy_svh_h = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_h_shape, 1 );
+	pod::TensorView dummy_norm_h = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_h_shape, 1 );
+
+	int svh_mlp_shape[1] = { config_.intermediate_size };
+	pod::TensorView dummy_suh_mlp = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_mlp_shape, 1 );
+	pod::TensorView dummy_svh_mlp = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_mlp_shape, 1 );
+
+	int svh_q_shape[1] = { config_.full_num_q_heads * config_.full_head_dim * 2 };
+	pod::TensorView dummy_svh_q = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_q_shape, 1 );
+
+	int svh_kv_shape[1] = { config_.full_num_kv_heads * config_.full_head_dim };
+	pod::TensorView dummy_svh_kv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_kv_shape, 1 );
+
+	int suh_o_shape[1] = { config_.full_num_q_heads * config_.full_head_dim };
+	pod::TensorView dummy_suh_o = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_o_shape, 1 );
+
+	int svh_qkv_shape[1] = { config_.linear_channels };
+	pod::TensorView dummy_svh_qkv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_qkv_shape, 1 );
+
+	int svh_z_shape[1] = { config_.linear_num_v_heads * config_.linear_head_dim };
+	pod::TensorView dummy_svh_z = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_z_shape, 1 );
+
+	int conv_shape[2] = { config_.linear_channels, 4 };
+	pod::TensorView dummy_conv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, conv_shape, 2 );
+
+	int ab_shape[2] = { config_.linear_num_v_heads, config_.hidden_size };
+	pod::TensorView dummy_ab = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ab_shape, 2 );
+
+	int gdn_bias_shape[1] = { config_.linear_num_v_heads };
+	pod::TensorView dummy_gdn_b = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, gdn_bias_shape, 1 );
+
+	int lin_norm_shape[1] = { config_.linear_head_dim };
+	pod::TensorView dummy_lin_norm = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lin_norm_shape, 1 );
+
+	int qk_norm_shape[1] = { config_.full_head_dim };
+	pod::TensorView dummy_qk_norm = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qk_norm_shape, 1 );
+
+	CUDA_CHECK( cudaMemset( dummy_gate_up.data, 0x44, dummy_gate_up.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_down.data, 0x44, dummy_down.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_q.data, 0x44, dummy_q.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_kv.data, 0x44, dummy_kv.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_o.data, 0x44, dummy_o.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_qkv.data, 0x44, dummy_qkv.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_z.data, 0x44, dummy_z.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_lin_out.data, 0x44, dummy_lin_out.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_suh_h.data, 0x3c, dummy_suh_h.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_svh_h.data, 0x3c, dummy_svh_h.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_norm_h.data, 0x3c, dummy_norm_h.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_suh_mlp.data, 0x3c, dummy_suh_mlp.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_svh_mlp.data, 0x3c, dummy_svh_mlp.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_svh_q.data, 0x3c, dummy_svh_q.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_svh_kv.data, 0x3c, dummy_svh_kv.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_suh_o.data, 0x3c, dummy_suh_o.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_svh_qkv.data, 0x3c, dummy_svh_qkv.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_svh_z.data, 0x3c, dummy_svh_z.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_conv.data, 0x3c, dummy_conv.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_ab.data, 0x3c, dummy_ab.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_gdn_b.data, 0x3c, dummy_gdn_b.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_lin_norm.data, 0x3c, dummy_lin_norm.size_bytes() ) );
+	CUDA_CHECK( cudaMemset( dummy_qk_norm.data, 0x3c, dummy_qk_norm.size_bytes() ) );
+
+	dummy_down_ = dummy_down;
+	dummy_suh_h_ = dummy_suh_h;
+	dummy_svh_h_ = dummy_svh_h;
+	dummy_norm_h_ = dummy_norm_h;
+
+	for ( int L = 0; L < config_.num_layers; ++L ) {
+		auto& lw = layers_[L];
+		lw.is_full_attention = ( ( L + 1 ) % 4 == 0 );
+		lw.input_norm = dummy_norm_h;
+		lw.post_attn_norm = dummy_norm_h;
+
+		lw.q_proj_tr = dummy_q;
+		lw.q_proj_suh = dummy_suh_h;
+		lw.q_proj_svh = dummy_svh_q;
+		lw.q_proj_bits = 4;
+
+		lw.k_proj_tr = dummy_kv;
+		lw.k_proj_suh = dummy_suh_h;
+		lw.k_proj_svh = dummy_svh_kv;
+		lw.k_proj_bits = 4;
+
+		lw.v_proj_tr = dummy_kv;
+		lw.v_proj_suh = dummy_suh_h;
+		lw.v_proj_svh = dummy_svh_kv;
+		lw.v_proj_bits = 4;
+
+		lw.q_norm = dummy_qk_norm;
+		lw.k_norm = dummy_qk_norm;
+
+		lw.o_proj_tr = dummy_o;
+		lw.o_proj_suh = dummy_suh_o;
+		lw.o_proj_svh = dummy_svh_h;
+		lw.o_proj_bits = 4;
+
+		lw.in_proj_qkv_tr = dummy_qkv;
+		lw.in_proj_qkv_suh = dummy_suh_h;
+		lw.in_proj_qkv_svh = dummy_svh_qkv;
+		lw.in_proj_qkv_bits = 4;
+
+		lw.conv1d_w = dummy_conv;
+		lw.in_proj_a = dummy_ab;
+		lw.in_proj_b = dummy_ab;
+		lw.A_log = dummy_gdn_b;
+		lw.dt_bias = dummy_gdn_b;
+		lw.linear_norm = dummy_lin_norm;
+
+		lw.in_proj_z_tr = dummy_z;
+		lw.in_proj_z_suh = dummy_suh_h;
+		lw.in_proj_z_svh = dummy_svh_z;
+		lw.in_proj_z_bits = 4;
+
+		lw.out_proj_tr = dummy_lin_out;
+		lw.out_proj_suh = dummy_svh_z;
+		lw.out_proj_svh = dummy_svh_h;
+		lw.out_proj_bits = 4;
+
+		lw.gate_proj_tr = dummy_gate_up;
+		lw.gate_proj_suh = dummy_suh_h;
+		lw.gate_proj_svh = dummy_svh_mlp;
+		lw.gate_proj_bits = 4;
+
+		lw.up_proj_tr = dummy_gate_up;
+		lw.up_proj_suh = dummy_suh_h;
+		lw.up_proj_svh = dummy_svh_mlp;
+		lw.up_proj_bits = 4;
+
+		lw.down_proj_tr = dummy_down;
+		lw.down_proj_suh = dummy_suh_mlp;
+		lw.down_proj_svh = dummy_svh_h;
+		lw.down_proj_bits = 4;
+	}
+
 	engine::modules::trellis_get_workspace( rank_, 16 * 1024 * 1024 );
 	engine::modules::trellis_get_locks( rank_ );
 
@@ -522,6 +682,80 @@ void Qwen38Pipeline::forward_step(
 ) {
 	(void) input_tokens;
 	state_.current_pos = pos;
+
+	if ( !weights_loaded_ ) {
+		// Benchmark dummy execution mode (M=1 decode latency gate)
+		for ( int layer = 0; layer < config_.num_layers; ++layer ) {
+			bool is_full_attention = ( ( layer + 1 ) % 4 == 0 );
+
+			if ( is_full_attention ) {
+				engine::modules::Attention::forward_decode(
+					q_buf_,
+					state_.k_cache,
+					state_.v_cache,
+					gate_attn_buf_,
+					attn_out_,
+					layer / 4,
+					pos,
+					config_.full_num_q_heads,
+					config_.full_num_kv_heads,
+					config_.full_head_dim,
+					config_.max_seq,
+					stream
+				);
+			}
+			else {
+				int linear_idx = layer - ( layer / 4 );
+				float* layer_gdn = state_.gdn_states + static_cast<size_t>( linear_idx ) * config_.linear_num_v_heads * 128 * 128;
+				engine::modules::GDN::recurrent_step(
+					layer_gdn,
+					qkv_buf_,
+					gdn_gate_,
+					gdn_beta_,
+					gdn_out_,
+					config_.linear_num_k_heads,
+					config_.linear_num_v_heads,
+					config_.linear_head_dim,
+					stream
+				);
+			}
+
+			if ( ring_ ) {
+				ring_->all_reduce_rms_norm( hidden_states_, residual_, dummy_norm_h_, 1e-5f, stream );
+			}
+			else {
+				engine::modules::RMSNorm::forward(
+					hidden_states_, dummy_norm_h_, hidden_states_, 1e-5f, 1.0f, stream
+				);
+			}
+
+			engine::modules::LinearTrellis::forward(
+				hidden_states_,
+				dummy_down_,
+				dummy_suh_h_,
+				dummy_svh_h_,
+				hidden_states_,
+				4,
+				false,
+				true,
+				stream
+			);
+
+			if ( ring_ ) {
+				ring_->all_reduce_rms_norm( hidden_states_, residual_, dummy_norm_h_, 1e-5f, stream );
+			}
+			else {
+				engine::modules::RMSNorm::forward(
+					hidden_states_, dummy_norm_h_, hidden_states_, 1e-5f, 1.0f, stream
+				);
+			}
+		}
+
+		if ( output_logits.data != nullptr ) {
+			CUDA_CHECK( cudaMemcpyAsync( output_logits.data, hidden_states_.data, config_.hidden_size * sizeof( half ), cudaMemcpyDeviceToDevice, stream ) );
+		}
+		return;
+	}
 
 	int full_attn_idx = 0;
 	int linear_idx = 0;
