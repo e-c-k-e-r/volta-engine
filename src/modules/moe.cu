@@ -10,11 +10,13 @@ __global__ __launch_bounds__( 288 )
 void router_topk_kernel(
 	const half* __restrict__ x,
 	const half* __restrict__ router_weights,
+	const half* __restrict__ e_score_bias,
 	int* __restrict__ topk_indices,
 	half* __restrict__ topk_weights,
 	int hidden_size,
 	int num_experts,
-	int top_k
+	int top_k,
+	float routed_scaling_factor
 ) {
 	int expert = threadIdx.x;
 	if ( expert >= num_experts ) return;
@@ -27,9 +29,14 @@ void router_topk_kernel(
 		logit = fmaf( x_val, w_val, logit );
 	}
 
+	float score = 1.0f / ( 1.0f + __expf( -logit ) );
+	if ( e_score_bias != nullptr ) {
+		score += __half2float( e_score_bias[expert] );
+	}
+
 	__shared__ float s_logits[288];
 	__shared__ int s_indices[288];
-	s_logits[expert] = logit;
+	s_logits[expert] = score;
 	s_indices[expert] = expert;
 	__syncthreads();
 
@@ -53,16 +60,13 @@ void router_topk_kernel(
 			s_indices[max_idx] = tmp_i;
 		}
 
-		float max_topk = s_logits[0];
-		float sum_exp = 0.0f;
+		float sum_scores = 0.0f;
 		#pragma unroll
 		for ( int i = 0; i < top_k; ++i ) {
-			float p = expf( s_logits[i] - max_topk );
-			s_logits[i] = p;
-			sum_exp += p;
+			sum_scores += s_logits[i];
 		}
 
-		float inv_sum = 1.0f / ( sum_exp + 1e-9f );
+		float inv_sum = routed_scaling_factor / ( sum_scores + 1e-9f );
 		#pragma unroll
 		for ( int i = 0; i < top_k; ++i ) {
 			topk_indices[i] = s_indices[i];
@@ -97,21 +101,25 @@ __global__ void moe_combine_kernel(
 void MoERouter::route_topk(
 	const pod::TensorView& x,
 	const pod::TensorView& router_weights,
+	const pod::TensorView& e_score_bias,
 	int* d_topk_indices,
 	half* d_topk_weights,
 	int hidden_size,
 	int num_experts,
 	int top_k,
+	float routed_scaling_factor,
 	cudaStream_t stream
 ) {
 	router_topk_kernel<<<dim3( 1 ), dim3( num_experts ), 0, stream>>>(
 		x.ptr<const half>(),
 		router_weights.ptr<const half>(),
+		e_score_bias.ptr<const half>(),
 		d_topk_indices,
 		d_topk_weights,
 		hidden_size,
 		num_experts,
-		top_k
+		top_k,
+		routed_scaling_factor
 	);
 }
 

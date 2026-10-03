@@ -14,11 +14,11 @@ struct MLADSA {
 		half* rope_cache,
 		const half* k_lat,
 		const half* k_pe,
-		const int32_t* block_table,
+		int layer_idx,
 		int pos,
 		int mla_dc = 512,
 		int mla_dr = 64,
-		int page_size = 16,
+		int max_seq = 2048,
 		cudaStream_t stream = nullptr
 	);
 
@@ -27,13 +27,14 @@ struct MLADSA {
 		const pod::TensorView& q_pe,
 		const half* latent_cache,
 		const half* rope_cache,
-		const int32_t* block_table,
 		pod::TensorView& out,
+		int layer_idx,
 		int current_pos,
 		int dsa_top_k = 64,
 		int mla_dc = 512,
 		int mla_dr = 64,
-		int page_size = 16,
+		int max_seq = 2048,
+		int out_dim = 4096,
 		cudaStream_t stream = nullptr
 	);
 };

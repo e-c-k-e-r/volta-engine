@@ -17,7 +17,7 @@ int select_gemm_shape( int cc, int size_m, int size_k, int size_n, int K, bool m
 	switch ( cc ) {
 		case CC_OLD: {
 			if ( size_m <= 16 ) {
-				if ( mod_512 && size_n >= 4096 && K <= 6 ) return 4;
+				if ( mod_512 && size_n > 4096 && K <= 6 ) return 4;
 				if ( mod_256 && size_n >= 4096 && K <= 6 ) return 3;
 				return 2;
 			}

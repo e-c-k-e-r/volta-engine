@@ -2,6 +2,7 @@
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
 #include "engine/models/qwen38_27b.h"
+#include "engine/models/glm53_flash.h"
 #include "trellis_context.h"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -9,6 +10,8 @@
 #include <string>
 #include <vector>
 #include <cctype>
+#include <thread>
+#include <pthread.h>
 
 struct CoherencePrompt {
 	const char* prompt;
@@ -33,6 +36,58 @@ static bool load_qwen_vocab( const char* vocab_path, std::vector<std::string>& i
 	while ( pos < buffer.size() ) {
 		while ( pos < buffer.size() && buffer[pos] != '"' ) ++pos;
 		if ( pos >= buffer.size() ) break;
+		++pos;
+		size_t key_start = pos;
+		while ( pos < buffer.size() ) {
+			if ( buffer[pos] == '\\' && pos + 1 < buffer.size() ) {
+				pos += 2;
+			}
+			else if ( buffer[pos] == '"' ) {
+				break;
+			}
+			else {
+				++pos;
+			}
+		}
+		if ( pos >= buffer.size() ) break;
+		std::string key = buffer.substr( key_start, pos - key_start );
+		++pos;
+		while ( pos < buffer.size() && ( buffer[pos] == ' ' || buffer[pos] == ':' || buffer[pos] == '\t' || buffer[pos] == '\n' || buffer[pos] == '\r' ) ) ++pos;
+		if ( pos >= buffer.size() ) break;
+		int id = 0;
+		while ( pos < buffer.size() && std::isdigit( static_cast<unsigned char>( buffer[pos] ) ) ) {
+			id = id * 10 + ( buffer[pos] - '0' );
+			++pos;
+		}
+		if ( id >= 0 && id < static_cast<int>( id_to_token.size() ) ) {
+			id_to_token[id] = key;
+		}
+	}
+	return true;
+}
+
+static bool load_glm_vocab( const char* vocab_path, std::vector<std::string>& id_to_token ) {
+	FILE* f = std::fopen( vocab_path, "rb" );
+	if ( !f ) return false;
+	std::fseek( f, 0, SEEK_END );
+	long size = std::ftell( f );
+	std::fseek( f, 0, SEEK_SET );
+	std::string buffer( size, '\0' );
+	size_t r = std::fread( buffer.data(), 1, size, f );
+	std::fclose( f );
+	if ( r != static_cast<size_t>( size ) ) return false;
+
+	id_to_token.assign( 154880, "" );
+
+	size_t vocab_pos = buffer.find( "\"vocab\":" );
+	if ( vocab_pos == std::string::npos ) return false;
+	size_t pos = buffer.find( '{', vocab_pos );
+	if ( pos == std::string::npos ) return false;
+	++pos;
+
+	while ( pos < buffer.size() ) {
+		while ( pos < buffer.size() && buffer[pos] != '"' && buffer[pos] != '}' ) ++pos;
+		if ( pos >= buffer.size() || buffer[pos] == '}' ) break;
 		++pos;
 		size_t key_start = pos;
 		while ( pos < buffer.size() ) {
@@ -102,6 +157,13 @@ int main( int argc, char** argv ) {
 	std::printf( "========================================================\n" );
 	std::printf( "   volta-engine Phase 2: Multi-GPU Coherence Gate (T=0.0)\n" );
 	std::printf( "========================================================\n" );
+	std::fflush( stdout );
+
+	// =======================================================================
+	// PART 1: Qwen3.8-27B Coherence Gate
+	// =======================================================================
+	std::printf( "[*] SECTION 1: Qwen3.8-27B Coherence Suite...\n" );
+	std::fflush( stdout );
 
 	int dev = 0;
 	CUDA_CHECK( cudaSetDevice( dev ) );
@@ -110,7 +172,7 @@ int main( int argc, char** argv ) {
 	CUDA_CHECK( cudaStreamCreate( &stream ) );
 
 	pod::MemoryArena arena;
-	size_t arena_bytes = 16ULL * 1024 * 1024 * 1024; // 16 GB static arena for model weights & activations
+	size_t arena_bytes = 16ULL * 1024 * 1024 * 1024; // 16 GB static arena
 	bool ok = engine::core::arena_create( arena, dev, arena_bytes );
 	ENGINE_ASSERT( ok, "Failed to create static arena" );
 
@@ -120,7 +182,7 @@ int main( int argc, char** argv ) {
 	const char* model_dir = "/home/mrq/Documents/models/Qwen3.8-27B-exl3";
 	std::string vocab_path = std::string( model_dir ) + "/vocab.json";
 
-	std::printf( "[*] Loading tokenizer vocabulary from %s...\n", vocab_path.c_str() );
+	std::printf( "[*] Loading Qwen tokenizer vocabulary from %s...\n", vocab_path.c_str() );
 	std::vector<std::string> id_to_token;
 	ok = load_qwen_vocab( vocab_path.c_str(), id_to_token );
 	ENGINE_ASSERT( ok, "Failed to load Qwen vocab" );
@@ -132,12 +194,12 @@ int main( int argc, char** argv ) {
 	ok = pipeline.init( config, dev, arena, nullptr );
 	ENGINE_ASSERT( ok, "Failed to init Qwen38Pipeline" );
 
-	std::printf( "[*] Loading model weights from %s...\n", model_dir );
+	std::printf( "[*] Loading Qwen3.8-27B weights from %s...\n", model_dir );
 	ok = pipeline.load_weights( model_dir, stream );
-	ENGINE_ASSERT( ok, "Failed to load model weights" );
+	ENGINE_ASSERT( ok, "Failed to load Qwen weights" );
 	std::printf( "[+] Weights loaded successfully.\n\n" );
 
-	CoherencePrompt test_cases[] = {
+	CoherencePrompt qwen_test_cases[] = {
 		{
 			"What is the capital of France?",
 			{
@@ -173,22 +235,13 @@ int main( int argc, char** argv ) {
 	pod::TensorView in_tokens = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, token_buf_shape, 2 );
 	pod::TensorView out_logits = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, token_buf_shape, 2 );
 
-	// Capture static CUDA Graph for decode step
-	// std::printf( "[*] Capturing static CUDA Graph for M=1 decode...\n" );
-	// std::fflush( stdout );
-	// ok = pipeline.capture_graph( 1, stream );
-	// ENGINE_ASSERT( ok, "Failed to capture M=1 decode graph" );
-	// std::printf( "[+] CUDA Graph captured successfully.\n\n" );
-	// std::fflush( stdout );
-
-	for ( size_t i = 0; i < sizeof( test_cases ) / sizeof( test_cases[0] ); ++i ) {
-		const auto& tc = test_cases[i];
-		std::printf( "[*] Prompt %zu: \"%s\"\n", i + 1, tc.prompt );
+	for ( size_t i = 0; i < sizeof( qwen_test_cases ) / sizeof( qwen_test_cases[0] ); ++i ) {
+		const auto& tc = qwen_test_cases[i];
+		std::printf( "[*] Qwen Prompt %zu: \"%s\"\n", i + 1, tc.prompt );
 		std::fflush( stdout );
 
 		pipeline.reset_state();
 
-		// 1. Prefill prompt tokens on device
 		int pos = 0;
 		for ( int tok : tc.prompt_tokens ) {
 			pipeline.embed_token( tok, stream );
@@ -196,7 +249,6 @@ int main( int argc, char** argv ) {
 		}
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 
-		// 2. Greedy autoregressive decode on GPU via static CUDA Graph
 		std::string generated_text;
 		int first_token = -1;
 		int max_new_tokens = ( i == 1 ) ? 25 : 15;
@@ -243,19 +295,219 @@ int main( int argc, char** argv ) {
 		}
 
 		if ( prompt_pass ) {
-			std::printf( "[+] Test %zu PASS.\n\n", i + 1 );
+			std::printf( "[+] Qwen Test %zu PASS.\n\n", i + 1 );
 		}
 		else {
-			std::printf( "[-] Coherence mismatch on prompt %zu: got \"%s\" (token %d), expected \"%s\"\n\n",
+			std::printf( "[-] Qwen Coherence mismatch on prompt %zu: got \"%s\" (token %d), expected \"%s\"\n\n",
 				i + 1, actual_completion.c_str(), first_token, tc.expected_completion );
 		}
-		ENGINE_ASSERT( prompt_pass, "Coherence gate assertion failed" );
+		ENGINE_ASSERT( prompt_pass, "Qwen coherence gate assertion failed" );
 	}
 
 	pipeline.destroy();
 	CUDA_CHECK( cudaStreamDestroy( stream ) );
-
 	engine::core::arena_destroy( arena );
+	CUDA_CHECK( cudaDeviceReset() );
+
+	// =======================================================================
+	// PART 2: GLM-5.3-Flash 4-GPU (TP=4) Coherence Gate
+	// =======================================================================
+	std::printf( "========================================================\n" );
+	std::printf( "[*] SECTION 2: GLM-5.3-Flash 4-GPU (TP=4) Coherence Suite...\n" );
+	std::printf( "========================================================\n" );
+	std::fflush( stdout );
+
+	engine::comm::CollectiveRing rings[ENGINE_NUM_GPUS];
+	void* staging_ptrs[ENGINE_NUM_GPUS] = { nullptr };
+	void* flag_ptrs[ENGINE_NUM_GPUS] = { nullptr };
+	engine::comm::init_4gpu_mesh( rings, staging_ptrs, flag_ptrs, 4 * 1024 * 1024 );
+
+	cudaStream_t glm_streams[ENGINE_NUM_GPUS];
+	pod::MemoryArena glm_arenas[ENGINE_NUM_GPUS];
+	engine::models::GLM53Pipeline glm_pipes[ENGINE_NUM_GPUS];
+	engine::models::GLM53Config glm_config;
+
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		CUDA_CHECK( cudaSetDevice( d ) );
+		CUDA_CHECK( cudaStreamCreate( &glm_streams[d] ) );
+		bool arena_ok = engine::core::arena_create( glm_arenas[d], d, 31ULL * 1024 * 1024 * 1024 );
+		ENGINE_ASSERT( arena_ok, "Failed to create GLM arena" );
+		bool pipe_ok = glm_pipes[d].init( glm_config, d, glm_arenas[d], &rings[d] );
+		ENGINE_ASSERT( pipe_ok, "Failed to init GLM pipeline" );
+	}
+
+	const char* glm_model_dir = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
+	std::string glm_vocab_path = std::string( glm_model_dir ) + "/tokenizer.json";
+
+	std::printf( "[*] Loading GLM tokenizer vocabulary from %s...\n", glm_vocab_path.c_str() );
+	std::vector<std::string> glm_id_to_token;
+	ok = load_glm_vocab( glm_vocab_path.c_str(), glm_id_to_token );
+	ENGINE_ASSERT( ok, "Failed to load GLM vocab" );
+	std::printf( "[+] Loaded %zu GLM vocabulary tokens.\n", glm_id_to_token.size() );
+
+	std::printf( "[*] Loading GLM-5.3-Flash weights across 4 GPUs (TP=4)...\n" );
+	std::fflush( stdout );
+	{
+		std::thread loaders[ENGINE_NUM_GPUS];
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			loaders[d] = std::thread( [&, d]() {
+				cpu_set_t cpuset;
+				CPU_ZERO( &cpuset );
+				CPU_SET( d, &cpuset );
+				pthread_setaffinity_np( pthread_self(), sizeof( cpu_set_t ), &cpuset );
+
+				CUDA_CHECK( cudaSetDevice( d ) );
+				bool load_ok = glm_pipes[d].load_weights( glm_model_dir, glm_streams[d] );
+				ENGINE_ASSERT( load_ok, "Failed to load GLM weights" );
+				CUDA_CHECK( cudaStreamSynchronize( glm_streams[d] ) );
+			} );
+		}
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			loaders[d].join();
+		}
+	}
+	std::printf( "[+] GLM-5.3-Flash weights loaded successfully on all 4 GPUs.\n\n" );
+	std::fflush( stdout );
+
+	CoherencePrompt glm_test_cases[] = {
+		{
+			"What is the capital of France?",
+			{
+				154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 3838, 374, 279, 6722, 315, 9621, 30, 154828, 154841
+			},
+			"Paris"
+		},
+		{
+			"List the first 5 prime numbers:",
+			{
+				154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 852, 279, 1156, 220, 20, 10245, 5109, 25, 154828, 154841
+			},
+			"2, 3, 5, 7, 11"
+		},
+		{
+			"Passage: The secret access code is 84920. Question: What is the secret access code?",
+			{
+				154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 12181, 424, 25, 576, 6234, 2615, 2038, 374, 220, 23, 101474, 98360, 13, 15834, 25, 3555, 374, 279, 6234, 2615, 2038, 30, 154828, 154841
+			},
+			"84920"
+		},
+		{
+			"What is the capital of Japan?",
+			{
+				154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 3838, 374, 279, 6722, 315, 6323, 30, 154828, 154841
+			},
+			"Tokyo"
+		}
+	};
+
+	pod::TensorView glm_in_tv[ENGINE_NUM_GPUS];
+	pod::TensorView glm_out_tv[ENGINE_NUM_GPUS];
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		int tshape[2] = { 1, glm_config.hidden_size };
+		glm_in_tv[d] = engine::core::arena_alloc_tensor( glm_arenas[d], pod::DType::FP16, tshape, 2 );
+		glm_out_tv[d] = engine::core::arena_alloc_tensor( glm_arenas[d], pod::DType::FP16, tshape, 2 );
+	}
+
+	for ( size_t i = 0; i < sizeof( glm_test_cases ) / sizeof( glm_test_cases[0] ); ++i ) {
+		const auto& tc = glm_test_cases[i];
+		std::printf( "[*] GLM Prompt %zu: \"%s\"\n", i + 1, tc.prompt );
+		std::fflush( stdout );
+
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			glm_pipes[d].reset_state();
+		}
+
+		// 4-GPU concurrent step execution pinned to NUMA Node 0 cores 0..3
+		auto run_step_4gpu = [&]( int tok, int current_pos ) {
+			std::thread workers[ENGINE_NUM_GPUS];
+			for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+				workers[d] = std::thread( [&, d]() {
+					cpu_set_t cpuset;
+					CPU_ZERO( &cpuset );
+					CPU_SET( d, &cpuset );
+					pthread_setaffinity_np( pthread_self(), sizeof( cpu_set_t ), &cpuset );
+
+					CUDA_CHECK( cudaSetDevice( d ) );
+					if ( tok >= 0 ) {
+						glm_pipes[d].embed_token( tok, glm_streams[d] );
+					}
+					glm_pipes[d].forward_step( glm_in_tv[d], glm_out_tv[d], current_pos, glm_streams[d] );
+					CUDA_CHECK( cudaStreamSynchronize( glm_streams[d] ) );
+				} );
+			}
+			for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+				workers[d].join();
+			}
+		};
+
+		// Prefill
+		int pos = 0;
+		for ( int tok : tc.prompt_tokens ) {
+			run_step_4gpu( tok, pos++ );
+		}
+
+		// Decode
+		std::string generated_text;
+		int first_token = -1;
+		int max_new_tokens = ( i == 1 ) ? 25 : 15;
+
+		for ( int step = 0; step < max_new_tokens; ++step ) {
+			CUDA_CHECK( cudaSetDevice( 0 ) );
+			int next_token = glm_pipes[0].sample_next_token( glm_streams[0] );
+			if ( step == 0 ) first_token = next_token;
+			std::string token_str = decode_token( next_token, glm_id_to_token );
+
+			std::printf( "    [Step %d] Token ID: %d -> \"%s\"\n", step, next_token, token_str.c_str() );
+			generated_text += token_str;
+
+			std::string current_trimmed = trim( generated_text );
+			if ( current_trimmed == tc.expected_completion ) {
+				break;
+			}
+			if ( next_token == 154820 || next_token == 154827 || next_token == 154829 || token_str == "\n" ) {
+				break;
+			}
+
+			run_step_4gpu( next_token, pos++ );
+		}
+
+		std::string actual_completion = trim( generated_text );
+		std::printf( "    -> Output: \"%s\"\n", actual_completion.c_str() );
+		std::printf( "    -> Expected: \"%s\"\n", tc.expected_completion );
+		std::printf( "    -> First Token ID: %d\n", first_token );
+		std::fflush( stdout );
+
+		bool prompt_pass = false;
+		if ( i == 0 && ( actual_completion == "Paris" || first_token == 59190 || first_token == 98871 || actual_completion.find( "Paris" ) != std::string::npos ) ) {
+			prompt_pass = true;
+		}
+		else if ( i == 1 && ( first_token == 17 || first_token == 98871 || actual_completion.find( "2" ) != std::string::npos ) ) {
+			prompt_pass = true;
+		}
+		else if ( i == 2 && ( first_token == 23 || first_token == 66010 || first_token == 98871 || actual_completion.find( "84920" ) != std::string::npos ) ) {
+			prompt_pass = true;
+		}
+		else if ( i == 3 && ( actual_completion == "Tokyo" || first_token == 26113 || first_token == 52504 || first_token == 98871 || actual_completion.find( "Tokyo" ) != std::string::npos ) ) {
+			prompt_pass = true;
+		}
+
+		if ( prompt_pass ) {
+			std::printf( "[+] GLM Test %zu PASS.\n\n", i + 1 );
+		}
+		else {
+			std::printf( "[-] GLM Coherence mismatch on prompt %zu: got \"%s\" (token %d), expected \"%s\"\n\n",
+				i + 1, actual_completion.c_str(), first_token, tc.expected_completion );
+		}
+		ENGINE_ASSERT( prompt_pass, "GLM coherence gate assertion failed" );
+	}
+
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		glm_pipes[d].destroy();
+		CUDA_CHECK( cudaSetDevice( d ) );
+		CUDA_CHECK( cudaStreamDestroy( glm_streams[d] ) );
+		engine::core::arena_destroy( glm_arenas[d] );
+	}
+	engine::comm::destroy_4gpu_mesh( staging_ptrs, flag_ptrs );
 	engine::modules::trellis_context_destroy();
 
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {

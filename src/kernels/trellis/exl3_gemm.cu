@@ -9,7 +9,7 @@ namespace cg = cooperative_groups;
 #include "trellis_context.h"
 #include <set>
 
-static std::set<void*> g_gemm_attr_set;
+static std::set<void*> g_gemm_attr_set[ENGINE_NUM_GPUS];
 
 void exl3_gemm(
 	const half* A,
@@ -88,9 +88,16 @@ void exl3_gemm(
 	ENGINE_ASSERT( kernel != nullptr, "exl3_gemm: failed to select kernel" );
 
 	size_t actual_smem = exl3_gemm_shape_smem( shape_idx, K );
-	if ( g_gemm_attr_set.find( (void*) kernel ) == g_gemm_attr_set.end() ) {
+	if ( g_gemm_attr_set[device].find( (void*) kernel ) == g_gemm_attr_set[device].end() ) {
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, ENGINE_MAX_SMEM ) );
-		g_gemm_attr_set.insert( (void*) kernel );
+		g_gemm_attr_set[device].insert( (void*) kernel );
+	}
+
+	int max_active_blocks = 0;
+	cudaOccupancyMaxActiveBlocksPerMultiprocessor( &max_active_blocks, (void*) kernel, block_dim, actual_smem );
+	int max_coop_grid = max_active_blocks * 80;
+	if ( max_coop_grid > 0 && num_sms > max_coop_grid ) {
+		num_sms = max_coop_grid;
 	}
 
 	CUDA_CHECK( cudaLaunchCooperativeKernel(

@@ -19,17 +19,14 @@ __global__ void store_mla_cache_kernel(
 	half* __restrict__ rope_cache,
 	const half* __restrict__ k_lat,
 	const half* __restrict__ k_pe,
-	const int32_t* __restrict__ block_table,
+	int layer_idx,
 	int pos,
 	int mla_dc,
 	int mla_dr,
-	int page_size
+	int max_seq
 ) {
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
-	int page_idx = pos / page_size;
-	int offset_in_page = pos % page_size;
-	int phys_page = ( block_table != nullptr ) ? block_table[page_idx] : page_idx;
-	size_t slot = static_cast<size_t>( phys_page ) * page_size + offset_in_page;
+	size_t slot = static_cast<size_t>( layer_idx ) * max_seq + pos;
 
 	if ( tid < mla_dc && k_lat != nullptr ) {
 		latent_cache[slot * mla_dc + tid] = k_lat[tid];
@@ -45,13 +42,14 @@ void dsa_mla_decode_kernel(
 	const half* __restrict__ q_pe,
 	const half* __restrict__ latent_cache,
 	const half* __restrict__ rope_cache,
-	const int32_t* __restrict__ block_table,
 	half* __restrict__ out,
+	int layer_idx,
 	int current_pos,
 	int dsa_top_k,
 	int mla_dc,
 	int mla_dr,
-	int page_size
+	int max_seq,
+	int out_dim
 ) {
 	int tid = threadIdx.x;
 	int wid = tid >> 5;
@@ -69,10 +67,7 @@ void dsa_mla_decode_kernel(
 	// 1. Compute dot product Q . K for each sparse token position across warps
 	for ( int k = wid; k < num_keys; k += 8 ) {
 		int pos = ( current_pos >= dsa_top_k ) ? ( current_pos - dsa_top_k + 1 + k ) : k;
-		int page_idx = pos / page_size;
-		int offset_in_page = pos % page_size;
-		int phys_page = ( block_table != nullptr ) ? block_table[page_idx] : page_idx;
-		size_t slot = static_cast<size_t>( phys_page ) * page_size + offset_in_page;
+		size_t slot = static_cast<size_t>( layer_idx ) * max_seq + pos;
 
 		const half* k_lat = latent_cache + slot * mla_dc;
 		const half* k_pe = rope_cache + slot * mla_dr;
@@ -122,19 +117,21 @@ void dsa_mla_decode_kernel(
 	__syncthreads();
 
 	// 3. Output reduction into latent dimensions
-	for ( int d = tid; d < mla_dc; d += blockDim.x ) {
-		float acc = 0.0f;
-		for ( int k = 0; k < num_keys; ++k ) {
-			int pos = ( current_pos >= dsa_top_k ) ? ( current_pos - dsa_top_k + 1 + k ) : k;
-			int page_idx = pos / page_size;
-			int offset_in_page = pos % page_size;
-			int phys_page = ( block_table != nullptr ) ? block_table[page_idx] : page_idx;
-			size_t slot = static_cast<size_t>( phys_page ) * page_size + offset_in_page;
+	for ( int d = tid; d < out_dim; d += blockDim.x ) {
+		if ( d < mla_dc ) {
+			float acc = 0.0f;
+			for ( int k = 0; k < num_keys; ++k ) {
+				int pos = ( current_pos >= dsa_top_k ) ? ( current_pos - dsa_top_k + 1 + k ) : k;
+				size_t slot = static_cast<size_t>( layer_idx ) * max_seq + pos;
 
-			const half* v_lat = latent_cache + slot * mla_dc;
-			acc = fmaf( s_scores[k], __half2float( v_lat[d] ), acc );
+				const half* v_lat = latent_cache + slot * mla_dc;
+				acc = fmaf( s_scores[k], __half2float( v_lat[d] ), acc );
+			}
+			out[d] = __float2half_rn( acc );
 		}
-		out[d] = __float2half_rn( acc );
+		else {
+			out[d] = 0;
+		}
 	}
 }
 
@@ -145,11 +142,11 @@ void MLADSA::store_cache(
 	half* rope_cache,
 	const half* k_lat,
 	const half* k_pe,
-	const int32_t* block_table,
+	int layer_idx,
 	int pos,
 	int mla_dc,
 	int mla_dr,
-	int page_size,
+	int max_seq,
 	cudaStream_t stream
 ) {
 	int max_dim = ( mla_dc > mla_dr ) ? mla_dc : mla_dr;
@@ -160,11 +157,11 @@ void MLADSA::store_cache(
 		rope_cache,
 		k_lat,
 		k_pe,
-		block_table,
+		layer_idx,
 		pos,
 		mla_dc,
 		mla_dr,
-		page_size
+		max_seq
 	);
 }
 
@@ -173,13 +170,14 @@ void MLADSA::forward_decode(
 	const pod::TensorView& q_pe,
 	const half* latent_cache,
 	const half* rope_cache,
-	const int32_t* block_table,
 	pod::TensorView& out,
+	int layer_idx,
 	int current_pos,
 	int dsa_top_k,
 	int mla_dc,
 	int mla_dr,
-	int page_size,
+	int max_seq,
+	int out_dim,
 	cudaStream_t stream
 ) {
 	dsa_mla_decode_kernel<<<dim3( 1 ), dim3( 256 ), 0, stream>>>(
@@ -187,13 +185,14 @@ void MLADSA::forward_decode(
 		q_pe.ptr<const half>(),
 		latent_cache,
 		rope_cache,
-		block_table,
 		out.ptr<half>(),
+		layer_idx,
 		current_pos,
 		dsa_top_k,
 		mla_dc,
 		mla_dr,
-		page_size
+		max_seq,
+		out_dim
 	);
 }
 

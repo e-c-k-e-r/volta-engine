@@ -18,15 +18,17 @@
 namespace engine::models {
 
 struct GLM53Config {
-	int num_layers = 40;
-	int hidden_size = 5120;
+	int num_layers = 45;
+	int hidden_size = 4096;
 	int intermediate_size = 2048; // per expert
+	int dense_intermediate_size = 12288;
 	int num_experts = 288;
 	int top_k = 8;
 	int mla_dc = 512;
 	int mla_dr = 64;
 	int dsa_top_k = 64;
 	int vocab_size = 154880;
+	int tp_size = 4;
 };
 
 struct GLM53State {
@@ -38,42 +40,45 @@ struct GLM53State {
 	int current_pos;
 };
 
+struct GLM53ExpertWeights {
+	pod::TensorView gate_tr;
+	pod::TensorView gate_suh;
+	pod::TensorView gate_svh;
+	int             gate_bits = 4;
+
+	pod::TensorView up_tr;
+	pod::TensorView up_suh;
+	pod::TensorView up_svh;
+	int             up_bits = 4;
+
+	pod::TensorView down_tr;
+	pod::TensorView down_suh;
+	pod::TensorView down_svh;
+	int             down_bits = 4;
+};
+
 struct GLM53LayerWeights {
+	bool is_moe = false;
 	pod::TensorView input_norm;
 	pod::TensorView post_attn_norm;
 	pod::TensorView router_weights; // [hidden_size, num_experts]
+	pod::TensorView e_score_bias;   // [num_experts]
 
 	// MLA weights
-	pod::TensorView q_proj_tr;
-	pod::TensorView q_proj_suh;
-	pod::TensorView q_proj_svh;
-	int             q_proj_bits = 4;
-
-	pod::TensorView kv_proj_tr;
-	pod::TensorView kv_proj_suh;
-	pod::TensorView kv_proj_svh;
-	int             kv_proj_bits = 4;
-
 	pod::TensorView o_proj_tr;
 	pod::TensorView o_proj_suh;
 	pod::TensorView o_proj_svh;
 	int             o_proj_bits = 4;
 
-	// MoE Expert weights
-	pod::TensorView expert_gate_tr;
-	pod::TensorView expert_gate_suh;
-	pod::TensorView expert_gate_svh;
-	int             expert_gate_bits = 4;
+	// Dense MLP (layers 0, 1, 2)
+	GLM53ExpertWeights dense_mlp;
 
-	pod::TensorView expert_up_tr;
-	pod::TensorView expert_up_suh;
-	pod::TensorView expert_up_svh;
-	int             expert_up_bits = 4;
+	// 72 local experts for this rank: rank * 72 .. (rank + 1) * 72 - 1
+	GLM53ExpertWeights experts[72];
 
-	pod::TensorView expert_down_tr;
-	pod::TensorView expert_down_suh;
-	pod::TensorView expert_down_svh;
-	int             expert_down_bits = 4;
+	// Shared expert
+	bool has_shared_expert = false;
+	GLM53ExpertWeights shared_expert;
 };
 
 class GLM53Pipeline {
@@ -83,6 +88,8 @@ public:
 
 	bool init( const GLM53Config& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
 	bool load_weights( const char* model_dir, cudaStream_t stream = nullptr );
+	void embed_token( int token_id, cudaStream_t stream = nullptr );
+	int sample_next_token( cudaStream_t stream = nullptr );
 
 	void forward_step(
 		const pod::TensorView& input_tokens,
@@ -96,6 +103,8 @@ public:
 
 	void reset_state();
 	void destroy();
+
+	const pod::TensorView& logits() const { return logits_; }
 
 private:
 	GLM53Config config_;
@@ -120,9 +129,15 @@ private:
 	pod::TensorView moe_gate_buf_;
 	pod::TensorView moe_up_buf_;
 	pod::TensorView moe_inter_buf_;
-	pod::TensorView moe_out_buf_;
-	pod::TensorView expert_parts_buf_;
+	pod::TensorView moe_expert_out_;
+	pod::TensorView local_moe_out_;
 	pod::TensorView ffn_out_;
+
+	// Fallback dummy descriptors
+	pod::TensorView dummy_expert_down_;
+	pod::TensorView dummy_suh_;
+	pod::TensorView dummy_svh_;
+	pod::TensorView dummy_norm_;
 
 	// Model level
 	GLM53LayerWeights layers_[45];
@@ -132,6 +147,8 @@ private:
 	pod::TensorView lm_head_suh_;
 	pod::TensorView lm_head_svh_;
 	pod::TensorView logits_;
+	int* d_argmax_idx_;
+	int* h_argmax_idx_;
 
 	cudaGraph_t graph_m1_;
 	cudaGraphExec_t instance_m1_;

@@ -17,7 +17,7 @@ void LinearTrellis::forward(
 	cudaStream_t stream
 ) {
 	const int m = x.shape[0];
-	const int k = x.shape[1];
+	const int k = trellis.shape[0] * 16;
 	const int n = trellis.shape[1] * 16;
 
 	int device = 0;
