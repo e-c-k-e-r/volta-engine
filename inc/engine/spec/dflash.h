@@ -134,7 +134,11 @@ public:
 	void draft(
 		int anchor_token,
 		int current_pos,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		const half* target_logits = nullptr,
+		const int* context_tokens = nullptr,
+		int context_len = 0,
+		const half* tapped_states = nullptr
 	);
 
 	// Construct in-stream tree mask
@@ -160,6 +164,8 @@ public:
 	// Buffer accessors
 	int* d_draft_tokens() { return d_draft_tokens_; }
 	const int* d_draft_tokens() const { return d_draft_tokens_; }
+	float* d_conf() { return d_conf_; }
+	const float* d_conf() const { return d_conf_; }
 	int* d_accepted_count() { return d_accepted_count_; }
 	int* d_next_token() { return d_next_token_; }
 	half* d_tree_mask() { return d_tree_mask_; }
@@ -176,6 +182,8 @@ private:
 	bool weights_loaded_;
 
 	// Weights loaded via SafeTensorsRepo
+	pod::LinearWeight fc_;
+	pod::TensorView fc_norm_;
 	pod::TensorView pred_codebook_;
 	pod::TensorView succ_codebook_;
 	pod::LinearWeight hidden_proj_;
@@ -194,10 +202,12 @@ private:
 	int* d_accepted_count_;     // [1]
 	int* d_next_token_;         // [1]
 	int* d_target_argmax_;      // [8]
+	int* d_ctx_scratch_;        // [2048]
 	int* h_accepted_count_;     // [1] pinned host
 	int* h_next_token_;         // [1] pinned host
 
 	// Scratch buffers for drafting
+	pod::TensorView draft_projected_; // [1, hidden]
 	pod::TensorView draft_hidden_;  // [8, hidden]
 	pod::TensorView draft_dyn_;     // [1, 8, 2, groups]
 	float* d_topk_values_;          // [7, 16]

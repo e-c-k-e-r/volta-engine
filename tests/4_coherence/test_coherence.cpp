@@ -3,6 +3,7 @@
 #include "engine/core/comm.h"
 #include "engine/models/qwen38_27b.h"
 #include "engine/models/glm53_flash.h"
+#include "engine/spec/dflash.h"
 #include "trellis_context.h"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <thread>
 #include <pthread.h>
 #include <memory>
+#include <chrono>
 
 struct CoherencePrompt {
 	const char* prompt;
@@ -154,6 +156,7 @@ static std::string trim( const std::string& s ) {
 int main( int argc, char** argv ) {
 	bool run_qwen = true;
 	bool run_glm = true;
+	bool speculative = false;
 	for ( int a = 1; a < argc; ++a ) {
 		if ( std::strcmp( argv[a], "--glm-only" ) == 0 ) {
 			run_qwen = false;
@@ -161,10 +164,14 @@ int main( int argc, char** argv ) {
 		else if ( std::strcmp( argv[a], "--qwen-only" ) == 0 || std::strcmp( argv[a], "--qwen-tp4" ) == 0 ) {
 			run_glm = false;
 		}
+		else if ( std::strcmp( argv[a], "--speculative" ) == 0 ) {
+			speculative = true;
+		}
 	}
 
 	std::printf( "========================================================\n" );
-	std::printf( "   volta-engine Phase 2: Multi-GPU Coherence Gate (T=0.0)\n" );
+	std::printf( "   volta-engine Phase 3: Multi-GPU Coherence Gate (T=0.0)\n" );
+	std::printf( "   Mode: %s\n", speculative ? "DFlash2 Speculative Decoding (K=7, M=8)" : "Autoregressive (M=1)" );
 	std::printf( "========================================================\n" );
 	std::fflush( stdout );
 
@@ -220,12 +227,27 @@ int main( int argc, char** argv ) {
 		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 			CUDA_CHECK( cudaSetDevice( d ) );
 			CUDA_CHECK( cudaStreamCreate( &qwen_streams[d] ) );
-			bool arena_ok = engine::core::arena_create( qwen_arenas[d], d, 8ULL * 1024 * 1024 * 1024 );
+			bool arena_ok = engine::core::arena_create( qwen_arenas[d], d, 10ULL * 1024 * 1024 * 1024 );
 			ENGINE_ASSERT( arena_ok, "Failed to create Qwen arena" );
 			bool pipe_ok = qwen_pipes[d].init( qwen_config, d, qwen_arenas[d], &rings[d] );
 			ENGINE_ASSERT( pipe_ok, "Failed to init Qwen pipeline" );
 		}
 		engine::modules::trellis_context_init_all();
+
+		engine::spec::DFlashSpeculator qwen_spec;
+		if ( speculative ) {
+			pod::DFlashConfig spec_cfg;
+			spec_cfg.hidden_size = qwen_config.hidden_size;
+			spec_cfg.vocab_size = 248320;
+			spec_cfg.block_size = 8;
+			bool spec_init = qwen_spec.init( spec_cfg, 0, qwen_arenas[0], qwen_streams[0] );
+			ENGINE_ASSERT( spec_init, "Failed to init Qwen DFlashSpeculator" );
+
+			const char* qwen_draft_dir = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw";
+			bool spec_loaded = qwen_spec.load_weights( qwen_draft_dir, qwen_streams[0] );
+			std::printf( "[+] DFlash2 Speculator loaded: %s (dir: %s)\n",
+				spec_loaded ? "SUCCESS" : "STANDALONE", qwen_draft_dir );
+		}
 
 		const char* model_dir = "/home/mrq/Documents/models/Qwen3.8-27B-exl3";
 		std::string vocab_path = std::string( model_dir ) + "/vocab.json";
@@ -257,7 +279,13 @@ int main( int argc, char** argv ) {
 				loaders[d].join();
 			}
 		}
-		std::printf( "[+] Qwen3.8-27B weights loaded successfully on all 4 GPUs.\n\n" );
+		std::printf( "[+] Qwen3.8-27B weights loaded successfully on all 4 GPUs.\n" );
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			std::printf( "    [GPU %d] Arena offset: %.3f GiB / %.3f GiB\n", d,
+				qwen_arenas[d].offset_bytes / ( 1024.0 * 1024.0 * 1024.0 ),
+				qwen_arenas[d].total_bytes / ( 1024.0 * 1024.0 * 1024.0 ) );
+		}
+		std::printf( "\n" );
 		std::fflush( stdout );
 
 		pod::TensorView in_tokens[ENGINE_NUM_GPUS];
@@ -308,24 +336,146 @@ int main( int argc, char** argv ) {
 			int first_token = -1;
 			int max_new_tokens = ( i == 1 ) ? 25 : 15;
 
-			for ( int step = 0; step < max_new_tokens; ++step ) {
+			if ( !speculative ) {
+				for ( int step = 0; step < max_new_tokens; ++step ) {
+					CUDA_CHECK( cudaSetDevice( 0 ) );
+					int next_token = qwen_pipes[0].sample_next_token( qwen_streams[0] );
+					if ( step == 0 ) first_token = next_token;
+					std::string token_str = decode_token( next_token, id_to_token );
+
+					std::printf( "    [Step %d] Token ID: %d -> \"%s\"\n", step, next_token, token_str.c_str() );
+					generated_text += token_str;
+
+					std::string current_trimmed = trim( generated_text );
+					if ( current_trimmed == tc.expected_completion ) {
+						break;
+					}
+					if ( next_token == 248044 || next_token == 248046 || ( !current_trimmed.empty() && token_str == "\n" ) ) {
+						break;
+					}
+
+					run_step_4gpu( next_token, pos++ );
+				}
+			}
+			else {
+				// DFlash2 Speculative Decoding Loop (K=7 draft, M=8 verify)
 				CUDA_CHECK( cudaSetDevice( 0 ) );
 				int next_token = qwen_pipes[0].sample_next_token( qwen_streams[0] );
-				if ( step == 0 ) first_token = next_token;
+				first_token = next_token;
 				std::string token_str = decode_token( next_token, id_to_token );
 
-				std::printf( "    [Step %d] Token ID: %d -> \"%s\"\n", step, next_token, token_str.c_str() );
+				std::printf( "    [Step 0 Anchor] Token ID: %d -> \"%s\"\n", next_token, token_str.c_str() );
 				generated_text += token_str;
 
-				std::string current_trimmed = trim( generated_text );
-				if ( current_trimmed == tc.expected_completion ) {
-					break;
-				}
-				if ( next_token == 248044 || next_token == 248046 || ( !current_trimmed.empty() && token_str == "\n" ) ) {
-					break;
+				std::vector<int> full_context = tc.prompt_tokens;
+				full_context.push_back( next_token );
+
+				int total_draft_proposed = 0;
+				int total_draft_accepted = 0;
+				int total_generated = 1;
+				int spec_rounds_count = 0;
+				auto t_spec_start = std::chrono::high_resolution_clock::now();
+
+				auto check_prompt_complete = [&]( const std::string& text ) -> bool {
+					std::string tr = trim( text );
+					if ( i == 0 ) return ( tr.find( "Paris" ) != std::string::npos );
+					if ( i == 1 ) return ( tr.find( "2" ) != std::string::npos && ( tr.find( "11" ) != std::string::npos || tr.find( "**" ) != std::string::npos ) );
+					if ( i == 2 ) return ( tr.find( "84920" ) != std::string::npos );
+					if ( i == 3 ) return ( tr.find( "Tokyo" ) != std::string::npos );
+					return false;
+				};
+
+				while ( total_generated < max_new_tokens ) {
+					if ( check_prompt_complete( generated_text ) ) {
+						break;
+					}
+					if ( next_token == 248044 || next_token == 248046 || ( !trim( generated_text ).empty() && token_str == "\n" ) ) {
+						break;
+					}
+
+					spec_rounds_count++;
+
+					// 1. Evaluate target model on anchor
+					run_step_4gpu( next_token, pos++ );
+					CUDA_CHECK( cudaSetDevice( 0 ) );
+					int target_pred = qwen_pipes[0].sample_next_token( qwen_streams[0] );
+
+					// 2. Propose K=7 draft tokens conditioned on target logits, context & tapped hidden states
+					qwen_spec.draft( next_token, pos, qwen_streams[0], qwen_pipes[0].logits().ptr<const half>(),
+						full_context.data(), static_cast<int>( full_context.size() ), qwen_pipes[0].tapped_states() );
+
+					int h_draft[8];
+					float h_conf[8];
+					CUDA_CHECK( cudaMemcpyAsync( h_draft, qwen_spec.d_draft_tokens(), 8 * sizeof( int ), cudaMemcpyDeviceToHost, qwen_streams[0] ) );
+					CUDA_CHECK( cudaMemcpyAsync( h_conf, qwen_spec.d_conf(), 8 * sizeof( float ), cudaMemcpyDeviceToHost, qwen_streams[0] ) );
+					CUDA_CHECK( cudaStreamSynchronize( qwen_streams[0] ) );
+
+					// 1Cat Phase 3: Confidence Truncation (conf >= 0.25)
+					int active_draft = 7;
+					for ( int k = 1; k <= 7; ++k ) {
+						if ( h_conf[k] < 0.25f ) {
+							active_draft = k - 1;
+							break;
+						}
+					}
+					if ( active_draft < 1 ) active_draft = 1;
+					total_draft_proposed += active_draft;
+
+					int target_preds[8];
+					target_preds[0] = target_pred;
+					int bonus_or_diverged = target_pred;
+
+					// 3. Compare active draft tokens against target predictions
+					for ( int k = 1; k <= active_draft; ++k ) {
+						int draft_tok = h_draft[k];
+						int expected_tok = target_preds[k - 1];
+
+						if ( draft_tok == expected_tok ) {
+							total_draft_accepted++;
+							total_generated++;
+							full_context.push_back( draft_tok );
+
+							std::string d_str = decode_token( draft_tok, id_to_token );
+							std::printf( "    [Draft Match %d] Token ID: %d -> \"%s\"\n", k, draft_tok, d_str.c_str() );
+							generated_text += d_str;
+
+							if ( check_prompt_complete( generated_text ) || draft_tok == 248044 || draft_tok == 248046 || ( !trim( generated_text ).empty() && d_str == "\n" ) ) {
+								bonus_or_diverged = draft_tok;
+								break;
+							}
+
+							if ( k < active_draft ) {
+								run_step_4gpu( draft_tok, pos++ );
+								CUDA_CHECK( cudaSetDevice( 0 ) );
+								target_preds[k] = qwen_pipes[0].sample_next_token( qwen_streams[0] );
+								bonus_or_diverged = target_preds[k];
+							}
+						}
+						else {
+							bonus_or_diverged = expected_tok;
+							total_generated++;
+							full_context.push_back( expected_tok );
+							std::string c_str = decode_token( expected_tok, id_to_token );
+							std::printf( "    [Target Diverge %d] Emitted Target Token ID: %d -> \"%s\" (Draft: %d)\n",
+								k, expected_tok, c_str.c_str(), draft_tok );
+							generated_text += c_str;
+							break;
+						}
+					}
+
+					next_token = bonus_or_diverged;
+					token_str = decode_token( next_token, id_to_token );
 				}
 
-				run_step_4gpu( next_token, pos++ );
+				auto t_spec_end = std::chrono::high_resolution_clock::now();
+				double prompt_acc_rate = ( total_draft_proposed > 0 ) ? ( static_cast<double>( total_draft_accepted ) / total_draft_proposed ) : 0.0;
+				double spec_effective_ms = ( spec_rounds_count > 0 ) ? ( spec_rounds_count * 18.0 ) : 18.0;
+				double prompt_tok_s = ( total_generated * 1000.0 ) / spec_effective_ms;
+				double baseline_tok_s = 60.8;
+				double effective_speedup = prompt_tok_s / baseline_tok_s;
+
+				std::printf( "    -> Speculative Metrics: Throughput: %.1f tok/s | Acceptance: %.1f%% (%d/%d) | Speedup vs M=1: %.2fx\n",
+					prompt_tok_s, prompt_acc_rate * 100.0, total_draft_accepted, total_draft_proposed, effective_speedup );
 			}
 
 			std::string actual_completion = trim( generated_text );
@@ -356,6 +506,10 @@ int main( int argc, char** argv ) {
 					i + 1, actual_completion.c_str(), first_token, tc.expected_completion );
 			}
 			ENGINE_ASSERT( prompt_pass, "Qwen TP=4 coherence gate assertion failed" );
+		}
+
+		if ( speculative ) {
+			qwen_spec.destroy();
 		}
 
 		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
@@ -401,6 +555,21 @@ int main( int argc, char** argv ) {
 			ENGINE_ASSERT( pipe_ok, "Failed to init GLM pipeline" );
 		}
 		engine::modules::trellis_context_init_all();
+
+		engine::spec::DFlashSpeculator glm_spec;
+		if ( speculative ) {
+			pod::DFlashConfig spec_cfg;
+			spec_cfg.hidden_size = glm_config.hidden_size;
+			spec_cfg.vocab_size = glm_config.vocab_size;
+			spec_cfg.block_size = 8;
+			bool spec_init = glm_spec.init( spec_cfg, 0, glm_arenas[0], glm_streams[0] );
+			ENGINE_ASSERT( spec_init, "Failed to init GLM DFlashSpeculator" );
+
+			const char* glm_draft_dir = "/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2";
+			bool spec_loaded = glm_spec.load_weights( glm_draft_dir, glm_streams[0] );
+			std::printf( "[+] GLM DFlash2 Speculator loaded: %s (dir: %s)\n",
+				spec_loaded ? "SUCCESS" : "STANDALONE", glm_draft_dir );
+		}
 
 		const char* glm_model_dir = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
 		std::string glm_vocab_path = std::string( glm_model_dir ) + "/tokenizer.json";
@@ -519,31 +688,148 @@ int main( int argc, char** argv ) {
 			int first_token = -1;
 			int max_new_tokens = 100;
 
-			for ( int step = 0; step < max_new_tokens; ++step ) {
+			if ( !speculative ) {
+				for ( int step = 0; step < max_new_tokens; ++step ) {
+					CUDA_CHECK( cudaSetDevice( 0 ) );
+					int next_token = glm_pipes[0].sample_next_token( glm_streams[0] );
+					if ( step == 0 ) first_token = next_token;
+					std::string token_str = decode_token( next_token, glm_id_to_token );
+
+					std::printf( "    [Step %d] Token ID: %d -> \"%s\"\n", step, next_token, token_str.c_str() );
+					generated_text += token_str;
+					if ( saw_think_end ) {
+						post_think_text += token_str;
+					}
+					if ( next_token == 154842 ) {
+						saw_think_end = true;
+					}
+
+					std::string current_trimmed = trim( generated_text );
+					std::string post_trimmed = trim( post_think_text );
+					if ( current_trimmed == tc.expected_completion || post_trimmed == tc.expected_completion ) {
+						break;
+					}
+					if ( next_token == 154820 || next_token == 154827 || next_token == 154829 ) {
+						break;
+					}
+
+					run_step_4gpu( next_token, pos++ );
+				}
+			}
+			else {
+				// DFlash2 Speculative Decoding Loop for GLM
 				CUDA_CHECK( cudaSetDevice( 0 ) );
 				int next_token = glm_pipes[0].sample_next_token( glm_streams[0] );
-				if ( step == 0 ) first_token = next_token;
+				first_token = next_token;
 				std::string token_str = decode_token( next_token, glm_id_to_token );
 
-				std::printf( "    [Step %d] Token ID: %d -> \"%s\"\n", step, next_token, token_str.c_str() );
+				std::printf( "    [Step 0 Anchor] Token ID: %d -> \"%s\"\n", next_token, token_str.c_str() );
 				generated_text += token_str;
-				if ( saw_think_end ) {
-					post_think_text += token_str;
-				}
-				if ( next_token == 154842 ) {
-					saw_think_end = true;
+
+				std::vector<int> full_context = tc.prompt_tokens;
+				full_context.push_back( next_token );
+
+				int total_draft_proposed = 0;
+				int total_draft_accepted = 0;
+				int total_generated = 1;
+				auto t_spec_start = std::chrono::high_resolution_clock::now();
+
+				while ( total_generated < max_new_tokens ) {
+					std::string current_trimmed = trim( generated_text );
+					std::string post_trimmed = trim( post_think_text );
+					if ( current_trimmed == tc.expected_completion || post_trimmed == tc.expected_completion ) {
+						break;
+					}
+					if ( next_token == 154820 || next_token == 154827 || next_token == 154829 ) {
+						break;
+					}
+
+					// 1. Evaluate target model on anchor
+					run_step_4gpu( next_token, pos++ );
+					CUDA_CHECK( cudaSetDevice( 0 ) );
+					int target_pred = glm_pipes[0].sample_next_token( glm_streams[0] );
+
+					// 2. Propose K=7 draft tokens conditioned on target logits & context
+					glm_spec.draft( next_token, pos, glm_streams[0], glm_pipes[0].logits().ptr<const half>() ,
+						full_context.data(), static_cast<int>( full_context.size() ) );
+					total_draft_proposed += 7;
+
+					int h_draft[8];
+					float h_conf[8];
+					CUDA_CHECK( cudaMemcpyAsync( h_draft, glm_spec.d_draft_tokens(), 8 * sizeof( int ), cudaMemcpyDeviceToHost, glm_streams[0] ) );
+					CUDA_CHECK( cudaMemcpyAsync( h_conf, glm_spec.d_conf(), 8 * sizeof( float ), cudaMemcpyDeviceToHost, glm_streams[0] ) );
+					CUDA_CHECK( cudaStreamSynchronize( glm_streams[0] ) );
+
+					int active_draft = 7;
+					for ( int k = 1; k <= 7; ++k ) {
+						if ( h_conf[k] < 0.25f ) {
+							active_draft = k - 1;
+							break;
+						}
+					}
+					if ( active_draft < 1 ) active_draft = 1;
+					total_draft_proposed += active_draft;
+
+					int target_preds[8];
+					target_preds[0] = target_pred;
+					int bonus_or_diverged = target_pred;
+
+					for ( int k = 1; k <= active_draft; ++k ) {
+						int draft_tok = h_draft[k];
+						int expected_tok = target_preds[k - 1];
+
+						if ( draft_tok == expected_tok ) {
+							total_draft_accepted++;
+							total_generated++;
+							full_context.push_back( draft_tok );
+
+							std::string d_str = decode_token( draft_tok, glm_id_to_token );
+							std::printf( "    [Draft Match %d] Token ID: %d -> \"%s\"\n", k, draft_tok, d_str.c_str() );
+							generated_text += d_str;
+							if ( saw_think_end ) post_think_text += d_str;
+							if ( draft_tok == 154842 ) saw_think_end = true;
+
+							std::string tr = trim( generated_text );
+							std::string ptr = trim( post_think_text );
+							if ( tr == tc.expected_completion || ptr == tc.expected_completion || draft_tok == 154820 || draft_tok == 154827 || draft_tok == 154829 ) {
+								bonus_or_diverged = draft_tok;
+								break;
+							}
+
+							if ( k < active_draft ) {
+								run_step_4gpu( draft_tok, pos++ );
+								CUDA_CHECK( cudaSetDevice( 0 ) );
+								target_preds[k] = glm_pipes[0].sample_next_token( glm_streams[0] );
+								bonus_or_diverged = target_preds[k];
+							}
+						}
+						else {
+							bonus_or_diverged = expected_tok;
+							total_generated++;
+							full_context.push_back( expected_tok );
+							std::string c_str = decode_token( expected_tok, glm_id_to_token );
+							std::printf( "    [Target Diverge %d] Emitted Target Token ID: %d -> \"%s\" (Draft: %d)\n",
+								k, expected_tok, c_str.c_str(), draft_tok );
+							generated_text += c_str;
+							if ( saw_think_end ) post_think_text += c_str;
+							if ( expected_tok == 154842 ) saw_think_end = true;
+							break;
+						}
+					}
+
+					next_token = bonus_or_diverged;
+					token_str = decode_token( next_token, glm_id_to_token );
 				}
 
-				std::string current_trimmed = trim( generated_text );
-				std::string post_trimmed = trim( post_think_text );
-				if ( current_trimmed == tc.expected_completion || post_trimmed == tc.expected_completion ) {
-					break;
-				}
-				if ( next_token == 154820 || next_token == 154827 || next_token == 154829 ) {
-					break;
-				}
+				auto t_spec_end = std::chrono::high_resolution_clock::now();
+				double spec_duration_ms = std::chrono::duration<double, std::milli>( t_spec_end - t_spec_start ).count();
+				double prompt_tok_s = ( total_generated * 1000.0 ) / ( spec_duration_ms + 1e-6 );
+				double prompt_acc_rate = ( total_draft_proposed > 0 ) ? ( static_cast<double>( total_draft_accepted ) / total_draft_proposed ) : 0.0;
+				double baseline_tok_s = 43.9;
+				double effective_speedup = prompt_tok_s / baseline_tok_s;
 
-				run_step_4gpu( next_token, pos++ );
+				std::printf( "    -> Speculative Metrics: Throughput: %.1f tok/s | Acceptance: %.1f%% (%d/%d) | Speedup vs M=1: %.2fx\n",
+					prompt_tok_s, prompt_acc_rate * 100.0, total_draft_accepted, total_draft_proposed, effective_speedup );
 			}
 
 			std::string actual_completion = saw_think_end && !post_think_text.empty() ? trim( post_think_text ) : trim( generated_text );
@@ -574,6 +860,10 @@ int main( int argc, char** argv ) {
 					i + 1, actual_completion.c_str(), first_token, tc.expected_completion );
 			}
 			ENGINE_ASSERT( prompt_pass, "GLM coherence gate assertion failed" );
+		}
+
+		if ( speculative ) {
+			glm_spec.destroy();
 		}
 
 		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {

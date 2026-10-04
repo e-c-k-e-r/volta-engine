@@ -406,9 +406,10 @@ int main( int argc, char** argv ) {
 			const auto* m1 = repo.find( "candidate_selector.predecessor_codebook" );
 			const auto* m2 = repo.find( "candidate_selector.successor_codebook" );
 			const auto* m3 = repo.find( "layers.0.attention_conv.base_kernel" );
-			if ( m1 && m2 && m3 ) {
-				std::printf( "   [+] Found key tensors: pred_cb (%ld bytes), succ_cb (%ld bytes), base_kernel (%ld bytes)\n",
-					m1->size_bytes, m2->size_bytes, m3->size_bytes );
+			const auto* m4 = repo.find( "fc.trellis" );
+			if ( m1 && m2 && m3 && m4 ) {
+				std::printf( "   [+] Found key tensors: pred_cb (%zu bytes), succ_cb (%zu bytes), base_kernel (%zu bytes), fc.trellis (%zu bytes)\n",
+					m1->size_bytes, m2->size_bytes, m3->size_bytes, m4->size_bytes );
 			}
 			repo.close();
 		}

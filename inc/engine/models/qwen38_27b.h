@@ -107,6 +107,8 @@ public:
 	void destroy();
 
 	const pod::TensorView& logits() const { return logits_; }
+	half* tapped_states() { return tapped_states_; }
+	const half* tapped_states() const { return tapped_states_; }
 
 private:
 	Qwen38Config config_;
@@ -116,6 +118,7 @@ private:
 	Qwen38State state_;
 	bool weights_loaded_;
 
+	half* tapped_states_; // [5, hidden_size] tapped hidden states for DFlash2
 	pod::TensorView hidden_states_;
 	pod::TensorView residual_;
 	pod::TensorView norm_hidden_;

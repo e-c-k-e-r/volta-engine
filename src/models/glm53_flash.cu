@@ -122,11 +122,15 @@ bool GLM53Pipeline::init(
 	hidden_states_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	residual_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	norm_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+	hidden_states_.shape[0] = 1;
+	residual_.shape[0] = 1;
+	norm_hidden_.shape[0] = 1;
 
 	int streams_shape[2] = { 4, config_.hidden_size };
 	hidden_streams_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, streams_shape, 2 );
 	residual_streams_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, streams_shape, 2 );
 	mhc_collapsed_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+	mhc_collapsed_.shape[0] = 1;
 
 	int rms_shape[1] = { 1 };
 	mhc_inv_rms_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, rms_shape, 1 );
@@ -497,6 +501,11 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 
 void GLM53Pipeline::embed_token( int token_id, cudaStream_t stream ) {
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	hidden_states_.shape[0] = 1;
+	residual_.shape[0] = 1;
+	norm_hidden_.shape[0] = 1;
+	if ( mhc_collapsed_.data != nullptr ) mhc_collapsed_.shape[0] = 1;
+
 	if ( rank_ == 0 && embed_tokens_.data != nullptr ) {
 		int threads = 256;
 		int blocks = ( config_.hidden_size + threads - 1 ) / threads;
@@ -526,6 +535,11 @@ void GLM53Pipeline::embed_token( int token_id, cudaStream_t stream ) {
 }
 
 int GLM53Pipeline::sample_next_token( cudaStream_t stream ) {
+	hidden_states_.shape[0] = 1;
+	residual_.shape[0] = 1;
+	norm_hidden_.shape[0] = 1;
+	if ( mhc_collapsed_.data != nullptr ) mhc_collapsed_.shape[0] = 1;
+
 	if ( weights_loaded_ && final_norm_.data != nullptr ) {
 		engine::modules::RMSNorm::forward(
 			hidden_states_, final_norm_, hidden_states_, 1e-5f, 0.0f, stream
@@ -562,6 +576,10 @@ void GLM53Pipeline::forward_step(
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	state_.current_pos = pos;
 	int m = ( input_tokens.ndim >= 1 && input_tokens.shape[0] > 0 ) ? input_tokens.shape[0] : 1;
+	hidden_states_.shape[0] = m;
+	residual_.shape[0] = m;
+	norm_hidden_.shape[0] = m;
+	if ( mhc_collapsed_.data != nullptr ) mhc_collapsed_.shape[0] = m;
 	pod::TensorView hidden_cur = pod::make_tensor_2d( hidden_states_.data, pod::DType::FP16, m, config_.hidden_size );
 	pod::TensorView residual_cur = pod::make_tensor_2d( residual_.data, pod::DType::FP16, m, config_.hidden_size );
 

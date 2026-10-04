@@ -35,6 +35,7 @@ Qwen38Pipeline::Qwen38Pipeline()
 	, ring_{ nullptr }
 	, state_{}
 	, weights_loaded_{ false }
+	, tapped_states_{ nullptr }
 	, layers_{}
 	, d_argmax_idx_{ nullptr }
 	, h_argmax_idx_{ nullptr }
@@ -95,6 +96,13 @@ bool Qwen38Pipeline::init(
 	hidden_states_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	residual_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	norm_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+	hidden_states_.shape[0] = 1;
+	residual_.shape[0] = 1;
+	norm_hidden_.shape[0] = 1;
+
+	// Tapped hidden states for DFlash2: 5 target layers x hidden_size
+	tapped_states_ = static_cast<half*>( engine::core::arena_alloc( arena, 5ULL * config_.hidden_size * sizeof( half ) ) );
+	CUDA_CHECK( cudaMemset( tapped_states_, 0, 5ULL * config_.hidden_size * sizeof( half ) ) );
 
 	// 5. Full attention buffers
 	int q_gate_shape[2] = { 1, full_q_heads * config_.full_head_dim * 2 };
@@ -395,6 +403,9 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 }
 
 void Qwen38Pipeline::embed_token( int token_id, cudaStream_t stream ) {
+	hidden_states_.shape[0] = 1;
+	residual_.shape[0] = 1;
+	norm_hidden_.shape[0] = 1;
 	if ( embed_tokens_.data != nullptr ) {
 		int threads = 256;
 		int blocks = ( config_.hidden_size + threads - 1 ) / threads;
@@ -408,6 +419,9 @@ void Qwen38Pipeline::embed_token( int token_id, cudaStream_t stream ) {
 }
 
 int Qwen38Pipeline::sample_next_token( cudaStream_t stream ) {
+	hidden_states_.shape[0] = 1;
+	residual_.shape[0] = 1;
+	norm_hidden_.shape[0] = 1;
 	if ( weights_loaded_ && final_norm_.data != nullptr ) {
 		engine::modules::RMSNorm::forward(
 			hidden_states_, final_norm_, hidden_states_, 1e-6f, 1.0f, stream
@@ -444,6 +458,9 @@ void Qwen38Pipeline::forward_step(
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	state_.current_pos = pos;
 	int m = ( input_tokens.ndim >= 1 && input_tokens.shape[0] > 0 ) ? input_tokens.shape[0] : 1;
+	hidden_states_.shape[0] = m;
+	residual_.shape[0] = m;
+	norm_hidden_.shape[0] = m;
 	pod::TensorView hidden_cur = pod::make_tensor_2d( hidden_states_.data, pod::DType::FP16, m, config_.hidden_size );
 	pod::TensorView residual_cur = pod::make_tensor_2d( residual_.data, pod::DType::FP16, m, config_.hidden_size );
 
@@ -686,6 +703,13 @@ void Qwen38Pipeline::forward_step(
 
 		// Residual connection: hidden_states += mlp_out
 		engine::modules::Elementwise::add_residual( hidden_states_, mlp_out_, stream );
+
+		// Tapped layer states for DFlash2: [5, 19, 33, 47, 61]
+		if ( tapped_states_ != nullptr && ( layer == 5 || layer == 19 || layer == 33 || layer == 47 || layer == 61 ) ) {
+			int tap_idx = ( layer == 5 ) ? 0 : ( ( layer == 19 ) ? 1 : ( ( layer == 33 ) ? 2 : ( ( layer == 47 ) ? 3 : 4 ) ) );
+			CUDA_CHECK( cudaMemcpyAsync( tapped_states_ + static_cast<size_t>( tap_idx ) * config_.hidden_size,
+				hidden_states_.data, config_.hidden_size * sizeof( half ), cudaMemcpyDeviceToDevice, stream ) );
+		}
 	}
 
 	if ( output_logits.data != nullptr ) {
@@ -760,6 +784,9 @@ void Qwen38Pipeline::reset_state() {
 	}
 	if ( hidden_states_.data ) {
 		cudaMemset( hidden_states_.data, 0, hidden_states_.size_bytes() );
+	}
+	if ( tapped_states_ ) {
+		cudaMemset( tapped_states_, 0, 5ULL * config_.hidden_size * sizeof( half ) );
 	}
 }
 
