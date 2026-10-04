@@ -9,7 +9,7 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_ARCHITECTURES 70)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fno-exceptions -DNO_EXCEPTIONS")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -Xcompiler -fno-exceptions -DNO_EXCEPTIONS -DEXL3_SM70_HMMA=1 -DEXL3_VOLTA=1 --expt-relaxed-constexpr")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -Xcompiler -fno-exceptions -DNO_EXCEPTIONS -DEXL3_SM70_HMMA=1 -DEXL3_VOLTA=1 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 20012")
 
 include_directories(
 	${PROJECT_SOURCE_DIR}/inc
@@ -32,6 +32,7 @@ set(ENGINE_CORE_SOURCES
 	src/modules/mhc.cu
 	src/models/qwen38_27b.cu
 	src/models/glm53_flash.cu
+	src/spec/dflash.cu
 )
 
 file(GLOB TRELLIS_SOURCES
@@ -59,6 +60,11 @@ add_executable(test_mhc tests/2_parity/test_mhc.cpp)
 target_link_libraries(test_mhc PRIVATE engine_kernels)
 set_target_properties(test_mhc PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+# Test DFlash2 Parity & Spec Suite
+add_executable(test_dflash tests/2_parity/test_dflash.cpp)
+target_link_libraries(test_dflash PRIVATE engine_kernels)
+set_target_properties(test_dflash PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 # Microbenchmarks
 add_executable(bench_all_reduce tests/3_bench/bench_all_reduce.cpp)
 target_link_libraries(bench_all_reduce PRIVATE engine_kernels)
@@ -75,6 +81,10 @@ set_target_properties(bench_nvfp4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT
 add_executable(bench_decode tests/3_bench/bench_decode.cpp)
 target_link_libraries(bench_decode PRIVATE engine_kernels)
 set_target_properties(bench_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(bench_spec tests/3_bench/bench_spec.cpp)
+target_link_libraries(bench_spec PRIVATE engine_kernels)
+set_target_properties(bench_spec PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Coherence Tests
 add_executable(test_coherence tests/4_coherence/test_coherence.cpp)

@@ -14,11 +14,14 @@ __global__ void rms_norm_kernel(
 	float eps,
 	float constant_bias
 ) {
+	int row = blockIdx.x;
+	const half* row_src = src + static_cast<int64_t>( row ) * hidden_size;
+	half* row_dst = dst + static_cast<int64_t>( row ) * hidden_size;
 	int tid = threadIdx.x;
 	float local_sq = 0.0f;
 
 	for ( int i = tid; i < hidden_size; i += blockDim.x ) {
-		float val = __half2float( src[i] );
+		float val = __half2float( row_src[i] );
 		local_sq = fmaf( val, val, local_sq );
 	}
 
@@ -50,9 +53,9 @@ __global__ void rms_norm_kernel(
 	float inv_rms = s_warp_sums[0];
 
 	for ( int i = tid; i < hidden_size; i += blockDim.x ) {
-		float val = __half2float( src[i] );
+		float val = __half2float( row_src[i] );
 		float w = ( weight != nullptr ) ? ( __half2float( weight[i] ) + constant_bias ) : 1.0f;
-		dst[i] = __float2half_rn( val * w * inv_rms );
+		row_dst[i] = __float2half_rn( val * w * inv_rms );
 	}
 }
 
@@ -185,7 +188,11 @@ void RMSNorm::forward(
 	cudaStream_t stream
 ) {
 	int hidden_size = x.shape[x.ndim - 1];
-	rms_norm_kernel<<<dim3( 1 ), dim3( 256 ), 0, stream>>>(
+	int rows = 1;
+	for ( int i = 0; i < x.ndim - 1; ++i ) {
+		rows *= x.shape[i];
+	}
+	rms_norm_kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>(
 		x.ptr<const half>(),
 		out.ptr<half>(),
 		weight.ptr<const half>(),
@@ -220,12 +227,17 @@ void Elementwise::add_residual(
 	cudaStream_t stream
 ) {
 	int hidden_size = hidden.shape[hidden.ndim - 1];
+	int rows = 1;
+	for ( int i = 0; i < hidden.ndim - 1; ++i ) {
+		rows *= hidden.shape[i];
+	}
+	int total_elements = rows * hidden_size;
 	int threads = 256;
-	int blocks = ( hidden_size + threads - 1 ) / threads;
+	int blocks = ( total_elements + threads - 1 ) / threads;
 	add_residual_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
 		hidden.ptr<half>(),
 		residual.ptr<const half>(),
-		hidden_size
+		total_elements
 	);
 }
 

@@ -90,8 +90,8 @@ bool Qwen38Pipeline::init(
 	CUDA_CHECK( cudaMemset( state_.v_cache, 0, cache_elems * sizeof( half ) ) );
 	state_.current_pos = 0;
 
-	// 4. Hidden states & residuals
-	int h_shape[2] = { 1, config_.hidden_size };
+	// 4. Hidden states & residuals (allocated with capacity for M=8 verify)
+	int h_shape[2] = { 8, config_.hidden_size };
 	hidden_states_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	residual_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	norm_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
@@ -442,11 +442,13 @@ void Qwen38Pipeline::forward_step(
 	cudaStream_t stream
 ) {
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
-	(void) input_tokens;
 	state_.current_pos = pos;
+	int m = ( input_tokens.ndim >= 1 && input_tokens.shape[0] > 0 ) ? input_tokens.shape[0] : 1;
+	pod::TensorView hidden_cur = pod::make_tensor_2d( hidden_states_.data, pod::DType::FP16, m, config_.hidden_size );
+	pod::TensorView residual_cur = pod::make_tensor_2d( residual_.data, pod::DType::FP16, m, config_.hidden_size );
 
 	if ( !weights_loaded_ ) {
-		// Benchmark dummy execution mode (M=1 decode latency gate)
+		// Benchmark dummy execution mode (M=1 decode latency gate & M=8 verify gate)
 		for ( int layer = 0; layer < config_.num_layers; ++layer ) {
 			bool is_full_attention = ( ( layer + 1 ) % 4 == 0 );
 
@@ -483,20 +485,20 @@ void Qwen38Pipeline::forward_step(
 			}
 
 			if ( ring_ ) {
-				ring_->all_reduce_rms_norm( hidden_states_, residual_, dummy_norm_h_, 1e-5f, stream );
+				ring_->all_reduce_rms_norm( hidden_cur, residual_cur, dummy_norm_h_, 1e-5f, stream );
 			}
 			else {
 				engine::modules::RMSNorm::forward(
-					hidden_states_, dummy_norm_h_, hidden_states_, 1e-5f, 1.0f, stream
+					hidden_cur, dummy_norm_h_, hidden_cur, 1e-5f, 1.0f, stream
 				);
 			}
 
 			engine::modules::LinearTrellis::forward(
-				hidden_states_,
+				hidden_cur,
 				dummy_down_,
 				dummy_suh_h_,
 				dummy_svh_h_,
-				hidden_states_,
+				hidden_cur,
 				4,
 				false,
 				true,
@@ -504,17 +506,17 @@ void Qwen38Pipeline::forward_step(
 			);
 
 			if ( ring_ ) {
-				ring_->all_reduce_rms_norm( hidden_states_, residual_, dummy_norm_h_, 1e-5f, stream );
+				ring_->all_reduce_rms_norm( hidden_cur, residual_cur, dummy_norm_h_, 1e-5f, stream );
 			}
 			else {
 				engine::modules::RMSNorm::forward(
-					hidden_states_, dummy_norm_h_, hidden_states_, 1e-5f, 1.0f, stream
+					hidden_cur, dummy_norm_h_, hidden_cur, 1e-5f, 1.0f, stream
 				);
 			}
 		}
 
 		if ( output_logits.data != nullptr ) {
-			CUDA_CHECK( cudaMemcpyAsync( output_logits.data, hidden_states_.data, config_.hidden_size * sizeof( half ), cudaMemcpyDeviceToDevice, stream ) );
+			CUDA_CHECK( cudaMemcpyAsync( output_logits.data, hidden_states_.data, static_cast<size_t>( m ) * config_.hidden_size * sizeof( half ), cudaMemcpyDeviceToDevice, stream ) );
 		}
 		return;
 	}
