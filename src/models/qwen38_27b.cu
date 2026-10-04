@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <vector>
 #include <algorithm>
+#include <cstring>
 
 namespace engine::models {
 
@@ -24,147 +25,6 @@ __global__ void embed_token_kernel(
 		__nv_bfloat16 bf = embed_table[idx];
 		hidden_state[tid] = __float2half_rn( __bfloat162float( bf ) );
 	}
-}
-
-const pod::SafeTensorMeta* find_meta(
-	pod::SafeTensorsFile& st1,
-	pod::SafeTensorsFile& st2,
-	const char* name,
-	pod::SafeTensorsFile*& out_st
-) {
-	const auto* m = engine::loader::safetensors_find( st1, name );
-	if ( m != nullptr ) {
-		out_st = &st1;
-		return m;
-	}
-	m = engine::loader::safetensors_find( st2, name );
-	if ( m != nullptr ) {
-		out_st = &st2;
-		return m;
-	}
-	out_st = nullptr;
-	return nullptr;
-}
-
-pod::TensorView load_trellis(
-	pod::SafeTensorsFile& st1,
-	pod::SafeTensorsFile& st2,
-	const char* name,
-	pod::MemoryArena& arena,
-	cudaStream_t stream
-) {
-	pod::SafeTensorsFile* st = nullptr;
-	const auto* meta = find_meta( st1, st2, name, st );
-	if ( !meta || !st ) return pod::TensorView{};
-
-	int shape[3] = { meta->shape[0], meta->shape[1], meta->shape[2] };
-	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, shape, 3 );
-	if ( tv.data != nullptr ) {
-		engine::loader::safetensors_load_to_device( *st, meta, tv.data, stream );
-	}
-	return tv;
-}
-
-pod::TensorView load_fp16_vector(
-	pod::SafeTensorsFile& st1,
-	pod::SafeTensorsFile& st2,
-	const char* name,
-	pod::MemoryArena& arena,
-	cudaStream_t stream
-) {
-	pod::SafeTensorsFile* st = nullptr;
-	const auto* meta = find_meta( st1, st2, name, st );
-	if ( !meta || !st ) return pod::TensorView{};
-
-	int shape[1] = { meta->shape[0] };
-	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 1 );
-	if ( tv.data != nullptr ) {
-		const void* src_cpu = engine::loader::safetensors_get_data_cpu( *st, meta );
-		if ( src_cpu != nullptr ) {
-			CUDA_CHECK( cudaMemcpyAsync( tv.data, src_cpu, meta->size_bytes, cudaMemcpyHostToDevice, stream ) );
-		}
-	}
-	return tv;
-}
-
-pod::TensorView load_bf16_as_fp16_vector(
-	pod::SafeTensorsFile& st1,
-	pod::SafeTensorsFile& st2,
-	const char* name,
-	pod::MemoryArena& arena,
-	cudaStream_t stream
-) {
-	pod::SafeTensorsFile* st = nullptr;
-	const auto* meta = find_meta( st1, st2, name, st );
-	if ( !meta || !st ) return pod::TensorView{};
-
-	int total_elems = meta->shape[0];
-	const uint16_t* src_bf16 = static_cast<const uint16_t*>( engine::loader::safetensors_get_data_cpu( *st, meta ) );
-	if ( !src_bf16 ) return pod::TensorView{};
-
-	int shape[1] = { total_elems };
-	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 1 );
-	if ( tv.data != nullptr ) {
-		std::vector<half> h_fp16( total_elems );
-		for ( int i = 0; i < total_elems; ++i ) {
-			uint32_t u32 = static_cast<uint32_t>( src_bf16[i] ) << 16;
-			float f = *reinterpret_cast<const float*>( &u32 );
-			h_fp16[i] = __float2half_rn( f );
-		}
-		CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), total_elems * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
-	}
-	return tv;
-}
-
-pod::TensorView load_fp16_2d(
-	pod::SafeTensorsFile& st1,
-	pod::SafeTensorsFile& st2,
-	const char* name,
-	pod::MemoryArena& arena,
-	cudaStream_t stream
-) {
-	pod::SafeTensorsFile* st = nullptr;
-	const auto* meta = find_meta( st1, st2, name, st );
-	if ( !meta || !st ) return pod::TensorView{};
-
-	int shape[2] = { meta->shape[0], meta->shape[1] };
-	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
-	if ( tv.data != nullptr ) {
-		const void* src_cpu = engine::loader::safetensors_get_data_cpu( *st, meta );
-		if ( src_cpu != nullptr ) {
-			CUDA_CHECK( cudaMemcpyAsync( tv.data, src_cpu, meta->size_bytes, cudaMemcpyHostToDevice, stream ) );
-		}
-	}
-	return tv;
-}
-
-pod::TensorView load_conv1d_weight(
-	pod::SafeTensorsFile& st1,
-	pod::SafeTensorsFile& st2,
-	const char* name,
-	pod::MemoryArena& arena,
-	cudaStream_t stream
-) {
-	pod::SafeTensorsFile* st = nullptr;
-	const auto* meta = find_meta( st1, st2, name, st );
-	if ( !meta || !st ) return pod::TensorView{};
-
-	int channels = meta->shape[0];
-	int shape[2] = { channels, 4 };
-	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
-
-	const uint16_t* src_bf16 = static_cast<const uint16_t*>( engine::loader::safetensors_get_data_cpu( *st, meta ) );
-	if ( src_bf16 != nullptr && tv.data != nullptr ) {
-		size_t total_elems = static_cast<size_t>( channels ) * 4;
-		std::vector<half> h_conv( total_elems );
-		for ( size_t i = 0; i < total_elems; ++i ) {
-			uint32_t u = static_cast<uint32_t>( src_bf16[i] ) << 16;
-			float f = *reinterpret_cast<const float*>( &u );
-			h_conv[i] = __float2half_rn( f );
-		}
-		CUDA_CHECK( cudaMemcpyAsync( tv.data, h_conv.data(), total_elems * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
-	}
-	return tv;
 }
 
 } // namespace
@@ -205,18 +65,25 @@ bool Qwen38Pipeline::init(
 
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 
-	// 1. Allocate recurrent GDN states: 48 layers x 48 value heads x 128 x 128 (FP32)
-	size_t gdn_floats = static_cast<size_t>( config_.num_linear_layers ) * config_.linear_num_v_heads * 128 * 128;
+	int tp_size = ( ring_ != nullptr ) ? 4 : 1;
+	int full_q_heads = ( tp_size == 4 ) ? 6 : config_.full_num_q_heads;
+	int full_kv_heads = ( tp_size == 4 ) ? 1 : config_.full_num_kv_heads;
+	int lin_v_heads = ( tp_size == 4 ) ? 12 : config_.linear_num_v_heads;
+	int lin_channels = ( tp_size == 4 ) ? 2560 : config_.linear_channels;
+	int inter_size = ( tp_size == 4 ) ? 4352 : config_.intermediate_size;
+
+	// 1. Allocate recurrent GDN states: 48 layers x lin_v_heads x 128 x 128 (FP32)
+	size_t gdn_floats = static_cast<size_t>( config_.num_linear_layers ) * lin_v_heads * 128 * 128;
 	state_.gdn_states = static_cast<float*>( engine::core::arena_alloc( arena, gdn_floats * sizeof( float ) ) );
 	CUDA_CHECK( cudaMemset( state_.gdn_states, 0, gdn_floats * sizeof( float ) ) );
 
-	// 2. Allocate GDN causal conv1d history: 48 layers x 10240 channels x 3 taps (FP32)
-	size_t conv_hist_floats = static_cast<size_t>( config_.num_linear_layers ) * config_.linear_channels * 3;
+	// 2. Allocate GDN causal conv1d history: 48 layers x lin_channels x 3 taps (FP32)
+	size_t conv_hist_floats = static_cast<size_t>( config_.num_linear_layers ) * lin_channels * 3;
 	state_.conv_history = static_cast<float*>( engine::core::arena_alloc( arena, conv_hist_floats * sizeof( float ) ) );
 	CUDA_CHECK( cudaMemset( state_.conv_history, 0, conv_hist_floats * sizeof( float ) ) );
 
-	// 3. Allocate full-attention KV cache: 16 layers x max_seq x 4 kv_heads x 256 (FP16)
-	size_t cache_elems = static_cast<size_t>( config_.num_attn_layers ) * config_.max_seq * config_.full_num_kv_heads * config_.full_head_dim;
+	// 3. Allocate full-attention KV cache: 16 layers x max_seq x full_kv_heads x 256 (FP16)
+	size_t cache_elems = static_cast<size_t>( config_.num_attn_layers ) * config_.max_seq * full_kv_heads * config_.full_head_dim;
 	state_.k_cache = static_cast<half*>( engine::core::arena_alloc( arena, cache_elems * sizeof( half ) ) );
 	state_.v_cache = static_cast<half*>( engine::core::arena_alloc( arena, cache_elems * sizeof( half ) ) );
 	CUDA_CHECK( cudaMemset( state_.k_cache, 0, cache_elems * sizeof( half ) ) );
@@ -230,209 +97,174 @@ bool Qwen38Pipeline::init(
 	norm_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 
 	// 5. Full attention buffers
-	int q_gate_shape[2] = { 1, config_.full_num_q_heads * config_.full_head_dim * 2 }; // 12288
+	int q_gate_shape[2] = { 1, full_q_heads * config_.full_head_dim * 2 };
 	q_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_gate_shape, 2 );
 
-	int q_shape[2] = { 1, config_.full_num_q_heads * config_.full_head_dim }; // 6144
+	int q_shape[2] = { 1, full_q_heads * config_.full_head_dim };
 	q_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_shape, 2 );
 	gate_attn_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_shape, 2 );
 	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_shape, 2 );
 
-	int kv_shape[2] = { 1, config_.full_num_kv_heads * config_.full_head_dim }; // 1024
+	int kv_shape[2] = { 1, full_kv_heads * config_.full_head_dim };
 	k_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_shape, 2 );
 	v_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_shape, 2 );
 
 	// 6. Linear attention (GDN) buffers
-	int qkv_shape[2] = { 1, config_.linear_channels }; // 10240
+	int qkv_shape[2] = { 1, lin_channels };
 	qkv_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
 
-	int z_shape[2] = { 1, config_.linear_num_v_heads * config_.linear_head_dim }; // 6144
+	int z_shape[2] = { 1, lin_v_heads * config_.linear_head_dim };
 	z_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
 	gdn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
 
-	int gdn_param_shape[1] = { config_.linear_num_v_heads }; // 48
+	int gdn_param_shape[1] = { lin_v_heads };
 	gdn_gate_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, gdn_param_shape, 1 );
 	gdn_beta_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, gdn_param_shape, 1 );
 
 	// 7. MLP buffers
-	int mlp_shape[2] = { 1, config_.intermediate_size }; // 17408
+	int mlp_shape[2] = { 1, inter_size };
 	gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_shape, 2 );
 	up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_shape, 2 );
 	mlp_inter_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_shape, 2 );
 
-	int mlp_out_shape[2] = { 1, config_.hidden_size }; // 5120
+	int mlp_out_shape[2] = { 1, config_.hidden_size };
 	mlp_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_out_shape, 2 );
 
-	// 8. Logits & argmax
-	int logit_shape[2] = { 1, 248320 };
-	logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
+	// 8. Logits & argmax (rank 0 hosts)
+	if ( rank_ == 0 ) {
+		int logit_shape[2] = { 1, 248320 };
+		logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
 
-	d_argmax_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
-	h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( sizeof( int ) ) );
-	*h_argmax_idx_ = 0;
+		d_argmax_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
+		h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( sizeof( int ) ) );
+		*h_argmax_idx_ = 0;
+	}
 
 	CUDA_CHECK( cudaMemset( hidden_states_.data, 0, hidden_states_.size_bytes() ) );
 	CUDA_CHECK( cudaMemset( residual_.data, 0, residual_.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( logits_.data, 0, logits_.size_bytes() ) );
 
-	// Fallback dummy descriptors for decode microbenchmark
-	int d_gu_shape[3] = { config_.hidden_size / 16, config_.intermediate_size / 16, 64 };
-	pod::TensorView dummy_gate_up = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_gu_shape, 3 );
+	if ( ring_ == nullptr ) {
+		// Fallback dummy descriptors for decode microbenchmark in single-GPU mode
+		int d_gu_shape[3] = { config_.hidden_size / 16, config_.intermediate_size / 16, 64 };
+		pod::TensorView dummy_gate_up = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_gu_shape, 3 );
 
-	int d_dn_shape[3] = { config_.intermediate_size / 16, config_.hidden_size / 16, 64 };
-	pod::TensorView dummy_down = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_dn_shape, 3 );
+		int d_dn_shape[3] = { config_.intermediate_size / 16, config_.hidden_size / 16, 64 };
+		pod::TensorView dummy_down = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_dn_shape, 3 );
 
-	int d_q_shape[3] = { config_.hidden_size / 16, ( config_.full_num_q_heads * config_.full_head_dim * 2 ) / 16, 64 };
-	pod::TensorView dummy_q = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_q_shape, 3 );
+		int d_q_shape[3] = { config_.hidden_size / 16, ( config_.full_num_q_heads * config_.full_head_dim * 2 ) / 16, 64 };
+		pod::TensorView dummy_q = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_q_shape, 3 );
 
-	int d_kv_shape[3] = { config_.hidden_size / 16, ( config_.full_num_kv_heads * config_.full_head_dim ) / 16, 64 };
-	pod::TensorView dummy_kv = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_kv_shape, 3 );
+		int d_kv_shape[3] = { config_.hidden_size / 16, ( config_.full_num_kv_heads * config_.full_head_dim ) / 16, 64 };
+		pod::TensorView dummy_kv = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_kv_shape, 3 );
 
-	int d_o_shape[3] = { ( config_.full_num_q_heads * config_.full_head_dim ) / 16, config_.hidden_size / 16, 64 };
-	pod::TensorView dummy_o = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_o_shape, 3 );
+		int d_o_shape[3] = { ( config_.full_num_q_heads * config_.full_head_dim ) / 16, config_.hidden_size / 16, 64 };
+		pod::TensorView dummy_o = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_o_shape, 3 );
 
-	int d_qkv_shape[3] = { config_.hidden_size / 16, config_.linear_channels / 16, 64 };
-	pod::TensorView dummy_qkv = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_qkv_shape, 3 );
+		int d_qkv_shape[3] = { config_.hidden_size / 16, config_.linear_channels / 16, 64 };
+		pod::TensorView dummy_qkv = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_qkv_shape, 3 );
 
-	int d_z_shape[3] = { config_.hidden_size / 16, ( config_.linear_num_v_heads * config_.linear_head_dim ) / 16, 64 };
-	pod::TensorView dummy_z = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_z_shape, 3 );
+		int d_z_shape[3] = { config_.hidden_size / 16, ( config_.linear_num_v_heads * config_.linear_head_dim ) / 16, 64 };
+		pod::TensorView dummy_z = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_z_shape, 3 );
 
-	int d_out_shape[3] = { ( config_.linear_num_v_heads * config_.linear_head_dim ) / 16, config_.hidden_size / 16, 64 };
-	pod::TensorView dummy_lin_out = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_out_shape, 3 );
+		int d_out_shape[3] = { ( config_.linear_num_v_heads * config_.linear_head_dim ) / 16, config_.hidden_size / 16, 64 };
+		pod::TensorView dummy_lin_out = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, d_out_shape, 3 );
 
-	int suh_h_shape[1] = { config_.hidden_size };
-	pod::TensorView dummy_suh_h = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_h_shape, 1 );
-	pod::TensorView dummy_svh_h = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_h_shape, 1 );
-	pod::TensorView dummy_norm_h = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_h_shape, 1 );
+		int suh_h_shape[1] = { config_.hidden_size };
+		pod::TensorView dummy_suh_h = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_h_shape, 1 );
+		pod::TensorView dummy_svh_h = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_h_shape, 1 );
+		pod::TensorView dummy_norm_h = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_h_shape, 1 );
 
-	int svh_mlp_shape[1] = { config_.intermediate_size };
-	pod::TensorView dummy_suh_mlp = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_mlp_shape, 1 );
-	pod::TensorView dummy_svh_mlp = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_mlp_shape, 1 );
+		int svh_mlp_shape[1] = { config_.intermediate_size };
+		pod::TensorView dummy_suh_mlp = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_mlp_shape, 1 );
+		pod::TensorView dummy_svh_mlp = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_mlp_shape, 1 );
 
-	int svh_q_shape[1] = { config_.full_num_q_heads * config_.full_head_dim * 2 };
-	pod::TensorView dummy_svh_q = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_q_shape, 1 );
+		int svh_q_shape[1] = { config_.full_num_q_heads * config_.full_head_dim * 2 };
+		pod::TensorView dummy_svh_q = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_q_shape, 1 );
 
-	int svh_kv_shape[1] = { config_.full_num_kv_heads * config_.full_head_dim };
-	pod::TensorView dummy_svh_kv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_kv_shape, 1 );
+		int svh_kv_shape[1] = { config_.full_num_kv_heads * config_.full_head_dim };
+		pod::TensorView dummy_svh_kv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_kv_shape, 1 );
 
-	int suh_o_shape[1] = { config_.full_num_q_heads * config_.full_head_dim };
-	pod::TensorView dummy_suh_o = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_o_shape, 1 );
+		int suh_o_shape[1] = { config_.full_num_q_heads * config_.full_head_dim };
+		pod::TensorView dummy_suh_o = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, suh_o_shape, 1 );
 
-	int svh_qkv_shape[1] = { config_.linear_channels };
-	pod::TensorView dummy_svh_qkv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_qkv_shape, 1 );
+		int svh_qkv_shape[1] = { config_.linear_channels };
+		pod::TensorView dummy_svh_qkv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_qkv_shape, 1 );
 
-	int svh_z_shape[1] = { config_.linear_num_v_heads * config_.linear_head_dim };
-	pod::TensorView dummy_svh_z = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_z_shape, 1 );
+		int svh_z_shape[1] = { config_.linear_num_v_heads * config_.linear_head_dim };
+		pod::TensorView dummy_svh_z = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_z_shape, 1 );
 
-	int conv_shape[2] = { config_.linear_channels, 4 };
-	pod::TensorView dummy_conv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, conv_shape, 2 );
+		int conv_shape[2] = { config_.linear_channels, 4 };
+		pod::TensorView dummy_conv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, conv_shape, 2 );
 
-	int ab_shape[2] = { config_.linear_num_v_heads, config_.hidden_size };
-	pod::TensorView dummy_ab = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ab_shape, 2 );
+		int ab_shape[2] = { config_.linear_num_v_heads, config_.hidden_size };
+		pod::TensorView dummy_ab = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ab_shape, 2 );
 
-	int gdn_bias_shape[1] = { config_.linear_num_v_heads };
-	pod::TensorView dummy_gdn_b = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, gdn_bias_shape, 1 );
+		int gdn_bias_shape[1] = { config_.linear_num_v_heads };
+		pod::TensorView dummy_gdn_b = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, gdn_bias_shape, 1 );
 
-	int lin_norm_shape[1] = { config_.linear_head_dim };
-	pod::TensorView dummy_lin_norm = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lin_norm_shape, 1 );
+		int lin_norm_shape[1] = { config_.linear_head_dim };
+		pod::TensorView dummy_lin_norm = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lin_norm_shape, 1 );
 
-	int qk_norm_shape[1] = { config_.full_head_dim };
-	pod::TensorView dummy_qk_norm = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qk_norm_shape, 1 );
+		int qk_norm_shape[1] = { config_.full_head_dim };
+		pod::TensorView dummy_qk_norm = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qk_norm_shape, 1 );
 
-	CUDA_CHECK( cudaMemset( dummy_gate_up.data, 0x44, dummy_gate_up.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_down.data, 0x44, dummy_down.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_q.data, 0x44, dummy_q.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_kv.data, 0x44, dummy_kv.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_o.data, 0x44, dummy_o.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_qkv.data, 0x44, dummy_qkv.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_z.data, 0x44, dummy_z.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_lin_out.data, 0x44, dummy_lin_out.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_suh_h.data, 0x3c, dummy_suh_h.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_svh_h.data, 0x3c, dummy_svh_h.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_norm_h.data, 0x3c, dummy_norm_h.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_suh_mlp.data, 0x3c, dummy_suh_mlp.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_svh_mlp.data, 0x3c, dummy_svh_mlp.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_svh_q.data, 0x3c, dummy_svh_q.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_svh_kv.data, 0x3c, dummy_svh_kv.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_suh_o.data, 0x3c, dummy_suh_o.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_svh_qkv.data, 0x3c, dummy_svh_qkv.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_svh_z.data, 0x3c, dummy_svh_z.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_conv.data, 0x3c, dummy_conv.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_ab.data, 0x3c, dummy_ab.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_gdn_b.data, 0x3c, dummy_gdn_b.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_lin_norm.data, 0x3c, dummy_lin_norm.size_bytes() ) );
-	CUDA_CHECK( cudaMemset( dummy_qk_norm.data, 0x3c, dummy_qk_norm.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_gate_up.data, 0x44, dummy_gate_up.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_down.data, 0x44, dummy_down.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_q.data, 0x44, dummy_q.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_kv.data, 0x44, dummy_kv.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_o.data, 0x44, dummy_o.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_qkv.data, 0x44, dummy_qkv.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_z.data, 0x44, dummy_z.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_lin_out.data, 0x44, dummy_lin_out.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_suh_h.data, 0x3c, dummy_suh_h.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_svh_h.data, 0x3c, dummy_svh_h.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_norm_h.data, 0x3c, dummy_norm_h.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_suh_mlp.data, 0x3c, dummy_suh_mlp.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_svh_mlp.data, 0x3c, dummy_svh_mlp.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_svh_q.data, 0x3c, dummy_svh_q.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_svh_kv.data, 0x3c, dummy_svh_kv.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_suh_o.data, 0x3c, dummy_suh_o.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_svh_qkv.data, 0x3c, dummy_svh_qkv.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_svh_z.data, 0x3c, dummy_svh_z.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_conv.data, 0x3c, dummy_conv.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_ab.data, 0x3c, dummy_ab.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_gdn_b.data, 0x3c, dummy_gdn_b.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_lin_norm.data, 0x3c, dummy_lin_norm.size_bytes() ) );
+		CUDA_CHECK( cudaMemset( dummy_qk_norm.data, 0x3c, dummy_qk_norm.size_bytes() ) );
 
-	dummy_down_ = dummy_down;
-	dummy_suh_h_ = dummy_suh_h;
-	dummy_svh_h_ = dummy_svh_h;
-	dummy_norm_h_ = dummy_norm_h;
+		dummy_down_ = dummy_down;
+		dummy_suh_h_ = dummy_suh_h;
+		dummy_svh_h_ = dummy_svh_h;
+		dummy_norm_h_ = dummy_norm_h;
 
-	for ( int L = 0; L < config_.num_layers; ++L ) {
-		auto& lw = layers_[L];
-		lw.is_full_attention = ( ( L + 1 ) % 4 == 0 );
-		lw.input_norm = dummy_norm_h;
-		lw.post_attn_norm = dummy_norm_h;
+		for ( int L = 0; L < config_.num_layers; ++L ) {
+			auto& lw = layers_[L];
+			lw.is_full_attention = ( ( L + 1 ) % 4 == 0 );
+			lw.input_norm = dummy_norm_h;
+			lw.post_attn_norm = dummy_norm_h;
 
-		lw.q_proj_tr = dummy_q;
-		lw.q_proj_suh = dummy_suh_h;
-		lw.q_proj_svh = dummy_svh_q;
-		lw.q_proj_bits = 4;
+			lw.q_proj = pod::LinearWeight::make_trellis( dummy_q, dummy_suh_h, dummy_svh_q, 4 );
+			lw.k_proj = pod::LinearWeight::make_trellis( dummy_kv, dummy_suh_h, dummy_svh_kv, 4 );
+			lw.v_proj = pod::LinearWeight::make_trellis( dummy_kv, dummy_suh_h, dummy_svh_kv, 4 );
+			lw.q_norm = dummy_qk_norm;
+			lw.k_norm = dummy_qk_norm;
+			lw.o_proj = pod::LinearWeight::make_trellis( dummy_o, dummy_suh_o, dummy_svh_h, 4 );
 
-		lw.k_proj_tr = dummy_kv;
-		lw.k_proj_suh = dummy_suh_h;
-		lw.k_proj_svh = dummy_svh_kv;
-		lw.k_proj_bits = 4;
+			lw.in_proj_qkv = pod::LinearWeight::make_trellis( dummy_qkv, dummy_suh_h, dummy_svh_qkv, 4 );
+			lw.conv1d_w = dummy_conv;
+			lw.in_proj_a = dummy_ab;
+			lw.in_proj_b = dummy_ab;
+			lw.A_log = dummy_gdn_b;
+			lw.dt_bias = dummy_gdn_b;
+			lw.linear_norm = dummy_lin_norm;
 
-		lw.v_proj_tr = dummy_kv;
-		lw.v_proj_suh = dummy_suh_h;
-		lw.v_proj_svh = dummy_svh_kv;
-		lw.v_proj_bits = 4;
+			lw.in_proj_z = pod::LinearWeight::make_trellis( dummy_z, dummy_suh_h, dummy_svh_z, 4 );
+			lw.out_proj = pod::LinearWeight::make_trellis( dummy_lin_out, dummy_svh_z, dummy_svh_h, 4 );
 
-		lw.q_norm = dummy_qk_norm;
-		lw.k_norm = dummy_qk_norm;
-
-		lw.o_proj_tr = dummy_o;
-		lw.o_proj_suh = dummy_suh_o;
-		lw.o_proj_svh = dummy_svh_h;
-		lw.o_proj_bits = 4;
-
-		lw.in_proj_qkv_tr = dummy_qkv;
-		lw.in_proj_qkv_suh = dummy_suh_h;
-		lw.in_proj_qkv_svh = dummy_svh_qkv;
-		lw.in_proj_qkv_bits = 4;
-
-		lw.conv1d_w = dummy_conv;
-		lw.in_proj_a = dummy_ab;
-		lw.in_proj_b = dummy_ab;
-		lw.A_log = dummy_gdn_b;
-		lw.dt_bias = dummy_gdn_b;
-		lw.linear_norm = dummy_lin_norm;
-
-		lw.in_proj_z_tr = dummy_z;
-		lw.in_proj_z_suh = dummy_suh_h;
-		lw.in_proj_z_svh = dummy_svh_z;
-		lw.in_proj_z_bits = 4;
-
-		lw.out_proj_tr = dummy_lin_out;
-		lw.out_proj_suh = dummy_svh_z;
-		lw.out_proj_svh = dummy_svh_h;
-		lw.out_proj_bits = 4;
-
-		lw.gate_proj_tr = dummy_gate_up;
-		lw.gate_proj_suh = dummy_suh_h;
-		lw.gate_proj_svh = dummy_svh_mlp;
-		lw.gate_proj_bits = 4;
-
-		lw.up_proj_tr = dummy_gate_up;
-		lw.up_proj_suh = dummy_suh_h;
-		lw.up_proj_svh = dummy_svh_mlp;
-		lw.up_proj_bits = 4;
-
-		lw.down_proj_tr = dummy_down;
-		lw.down_proj_suh = dummy_suh_mlp;
-		lw.down_proj_svh = dummy_svh_h;
-		lw.down_proj_bits = 4;
+			lw.gate_proj = pod::LinearWeight::make_trellis( dummy_gate_up, dummy_suh_h, dummy_svh_mlp, 4 );
+			lw.up_proj = pod::LinearWeight::make_trellis( dummy_gate_up, dummy_suh_h, dummy_svh_mlp, 4 );
+			lw.down_proj = pod::LinearWeight::make_trellis( dummy_down, dummy_suh_mlp, dummy_svh_h, 4 );
+		}
 	}
 
 	engine::modules::trellis_get_workspace( rank_, 16 * 1024 * 1024 );
@@ -442,40 +274,24 @@ bool Qwen38Pipeline::init(
 }
 
 bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
-	char path1[512];
-	char path2[512];
-	std::snprintf( path1, sizeof( path1 ), "%s/model-00001-of-00002.safetensors", model_dir );
-	std::snprintf( path2, sizeof( path2 ), "%s/model-00002-of-00002.safetensors", model_dir );
-
-	pod::SafeTensorsFile st1{};
-	pod::SafeTensorsFile st2{};
-
-	if ( !engine::loader::safetensors_open( st1, path1 ) ) {
-		std::printf( "    [loader] FAILED to open %s\n", path1 );
-		return false;
-	}
-	if ( !engine::loader::safetensors_open( st2, path2 ) ) {
-		std::printf( "    [loader] FAILED to open %s\n", path2 );
-		engine::loader::safetensors_close( st1 );
+	engine::loader::SafeTensorsRepo repo;
+	if ( !repo.open( model_dir ) ) {
+		std::printf( "    [loader] FAILED to open model directory %s\n", model_dir );
 		return false;
 	}
 
 	// 1. Embed tokens
-	pod::SafeTensorsFile* st_embed = nullptr;
-	const auto* meta_embed = find_meta( st1, st2, "model.language_model.embed_tokens.weight", st_embed );
-	if ( meta_embed != nullptr && st_embed != nullptr ) {
-		int emb_shape[2] = { 248320, config_.hidden_size };
-		embed_tokens_ = engine::core::arena_alloc_tensor( *arena_, pod::DType::BF16, emb_shape, 2 );
-		engine::loader::safetensors_load_to_device( *st_embed, meta_embed, embed_tokens_.data, stream );
-	}
+	embed_tokens_ = repo.load( "model.language_model.embed_tokens.weight", *arena_, stream, pod::DType::BF16 );
 
 	// 2. Final norm
-	final_norm_ = load_bf16_as_fp16_vector( st1, st2, "model.language_model.norm.weight", *arena_, stream );
+	final_norm_ = repo.load( "model.language_model.norm.weight", *arena_, stream, pod::DType::FP16 );
 
 	// 3. LM Head
-	lm_head_suh_ = load_fp16_vector( st1, st2, "lm_head.suh", *arena_, stream );
-	lm_head_svh_ = load_fp16_vector( st1, st2, "lm_head.svh", *arena_, stream );
-	lm_head_trellis_ = load_trellis( st1, st2, "lm_head.trellis", *arena_, stream );
+	if ( rank_ == 0 ) {
+		lm_head_ = repo.load_linear( "lm_head", *arena_, 5, stream );
+	}
+
+	int tp_size = ( ring_ != nullptr ) ? 4 : 1;
 
 	// 4. Per-layer weights across 64 layers
 	char name_buf[256];
@@ -484,147 +300,90 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 		lw.is_full_attention = ( ( L + 1 ) % 4 == 0 );
 
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.input_layernorm.weight", L );
-		lw.input_norm = load_bf16_as_fp16_vector( st1, st2, name_buf, *arena_, stream );
+		lw.input_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.post_attention_layernorm.weight", L );
-		lw.post_attn_norm = load_bf16_as_fp16_vector( st1, st2, name_buf, *arena_, stream );
+		lw.post_attn_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 		if ( lw.is_full_attention ) {
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.q_proj.trellis", L );
-			lw.q_proj_tr = load_trellis( st1, st2, name_buf, *arena_, stream );
-			lw.q_proj_bits = lw.q_proj_tr.data ? ( lw.q_proj_tr.shape[2] / 16 ) : 4;
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.q_proj.suh", L );
-			lw.q_proj_suh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.q_proj.svh", L );
-			lw.q_proj_svh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
+			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.q_proj", L );
+			lw.q_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, 4, stream )
+			                             : repo.load_linear( name_buf, *arena_, 4, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.q_norm.weight", L );
-			lw.q_norm = load_bf16_as_fp16_vector( st1, st2, name_buf, *arena_, stream );
+			lw.q_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.k_proj.trellis", L );
-			lw.k_proj_tr = load_trellis( st1, st2, name_buf, *arena_, stream );
-			lw.k_proj_bits = lw.k_proj_tr.data ? ( lw.k_proj_tr.shape[2] / 16 ) : 5;
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.k_proj.suh", L );
-			lw.k_proj_suh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.k_proj.svh", L );
-			lw.k_proj_svh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
+			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.k_proj", L );
+			lw.k_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 5, 1, rank_, 4, stream )
+			                             : repo.load_linear( name_buf, *arena_, 5, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.k_norm.weight", L );
-			lw.k_norm = load_bf16_as_fp16_vector( st1, st2, name_buf, *arena_, stream );
+			lw.k_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.v_proj.trellis", L );
-			lw.v_proj_tr = load_trellis( st1, st2, name_buf, *arena_, stream );
-			lw.v_proj_bits = lw.v_proj_tr.data ? ( lw.v_proj_tr.shape[2] / 16 ) : 5;
+			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.v_proj", L );
+			lw.v_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 5, 1, rank_, 4, stream )
+			                             : repo.load_linear( name_buf, *arena_, 5, stream );
 
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.v_proj.suh", L );
-			lw.v_proj_suh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.v_proj.svh", L );
-			lw.v_proj_svh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.o_proj.trellis", L );
-			lw.o_proj_tr = load_trellis( st1, st2, name_buf, *arena_, stream );
-			lw.o_proj_bits = lw.o_proj_tr.data ? ( lw.o_proj_tr.shape[2] / 16 ) : 4;
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.o_proj.suh", L );
-			lw.o_proj_suh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.o_proj.svh", L );
-			lw.o_proj_svh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
+			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.o_proj", L );
+			lw.o_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 4, 0, rank_, 4, stream )
+			                             : repo.load_linear( name_buf, *arena_, 4, stream );
 		}
 		else {
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_qkv.trellis", L );
-			lw.in_proj_qkv_tr = load_trellis( st1, st2, name_buf, *arena_, stream );
-			lw.in_proj_qkv_bits = lw.in_proj_qkv_tr.data ? ( lw.in_proj_qkv_tr.shape[2] / 16 ) : 5;
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_qkv.suh", L );
-			lw.in_proj_qkv_suh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_qkv.svh", L );
-			lw.in_proj_qkv_svh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
+			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_qkv", L );
+			lw.in_proj_qkv = ( tp_size == 4 ) ? repo.load_linear_qkv_qwen( name_buf, *arena_, rank_, 4, stream )
+			                                  : repo.load_linear( name_buf, *arena_, 5, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.conv1d.weight", L );
-			lw.conv1d_w = load_conv1d_weight( st1, st2, name_buf, *arena_, stream );
+			lw.conv1d_w = ( tp_size == 4 ) ? repo.load_conv1d_qwen( name_buf, *arena_, rank_, 4, stream )
+			                               : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.A_log", L );
-			lw.A_log = load_bf16_as_fp16_vector( st1, st2, name_buf, *arena_, stream );
+			lw.A_log = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
+			                            : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.dt_bias", L );
-			lw.dt_bias = load_bf16_as_fp16_vector( st1, st2, name_buf, *arena_, stream );
+			lw.dt_bias = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
+			                              : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", L );
-			lw.in_proj_a = load_fp16_2d( st1, st2, name_buf, *arena_, stream );
+			lw.in_proj_a = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
+			                                : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", L );
-			lw.in_proj_b = load_fp16_2d( st1, st2, name_buf, *arena_, stream );
+			lw.in_proj_b = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
+			                                : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_z.trellis", L );
-			lw.in_proj_z_tr = load_trellis( st1, st2, name_buf, *arena_, stream );
-			lw.in_proj_z_bits = lw.in_proj_z_tr.data ? ( lw.in_proj_z_tr.shape[2] / 16 ) : 5;
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_z.suh", L );
-			lw.in_proj_z_suh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_z.svh", L );
-			lw.in_proj_z_svh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
+			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_z", L );
+			lw.in_proj_z = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 5, 1, rank_, 4, stream )
+			                                : repo.load_linear( name_buf, *arena_, 5, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.norm.weight", L );
-			lw.linear_norm = load_bf16_as_fp16_vector( st1, st2, name_buf, *arena_, stream );
+			lw.linear_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.out_proj.trellis", L );
-			lw.out_proj_tr = load_trellis( st1, st2, name_buf, *arena_, stream );
-			lw.out_proj_bits = lw.out_proj_tr.data ? ( lw.out_proj_tr.shape[2] / 16 ) : 5;
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.out_proj.suh", L );
-			lw.out_proj_suh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
-
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.out_proj.svh", L );
-			lw.out_proj_svh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
+			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.out_proj", L );
+			lw.out_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 5, 0, rank_, 4, stream )
+			                               : repo.load_linear( name_buf, *arena_, 5, stream );
 		}
 
 		// MLP
-		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.gate_proj.trellis", L );
-		lw.gate_proj_tr = load_trellis( st1, st2, name_buf, *arena_, stream );
-		lw.gate_proj_bits = lw.gate_proj_tr.data ? ( lw.gate_proj_tr.shape[2] / 16 ) : 3;
+		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.gate_proj", L );
+		lw.gate_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 3, 1, rank_, 4, stream )
+		                                : repo.load_linear( name_buf, *arena_, 3, stream );
 
-		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.gate_proj.suh", L );
-		lw.gate_proj_suh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
+		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.up_proj", L );
+		lw.up_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 3, 1, rank_, 4, stream )
+		                              : repo.load_linear( name_buf, *arena_, 3, stream );
 
-		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.gate_proj.svh", L );
-		lw.gate_proj_svh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
-
-		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.up_proj.trellis", L );
-		lw.up_proj_tr = load_trellis( st1, st2, name_buf, *arena_, stream );
-		lw.up_proj_bits = lw.up_proj_tr.data ? ( lw.up_proj_tr.shape[2] / 16 ) : 3;
-
-		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.up_proj.suh", L );
-		lw.up_proj_suh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
-
-		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.up_proj.svh", L );
-		lw.up_proj_svh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
-
-		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.down_proj.trellis", L );
-		lw.down_proj_tr = load_trellis( st1, st2, name_buf, *arena_, stream );
-		lw.down_proj_bits = lw.down_proj_tr.data ? ( lw.down_proj_tr.shape[2] / 16 ) : 3;
-
-		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.down_proj.suh", L );
-		lw.down_proj_suh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
-
-		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.down_proj.svh", L );
-		lw.down_proj_svh = load_fp16_vector( st1, st2, name_buf, *arena_, stream );
+		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.down_proj", L );
+		lw.down_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 3, 0, rank_, 4, stream )
+		                                : repo.load_linear( name_buf, *arena_, 3, stream );
 	}
 
-	engine::loader::safetensors_close( st1 );
-	engine::loader::safetensors_close( st2 );
-
-	weights_loaded_ = true;
 	if ( stream ) {
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	}
+	repo.close();
+	weights_loaded_ = true;
 	return true;
 }
 
@@ -648,16 +407,11 @@ int Qwen38Pipeline::sample_next_token( cudaStream_t stream ) {
 		);
 	}
 
-	if ( lm_head_trellis_.data != nullptr ) {
-		engine::modules::LinearTrellis::forward(
+	if ( lm_head_.is_valid() ) {
+		engine::modules::Linear::forward(
 			hidden_states_,
-			lm_head_trellis_,
-			lm_head_suh_,
-			lm_head_svh_,
+			lm_head_,
 			logits_,
-			5,
-			false,
-			true,
 			stream
 		);
 	}
@@ -671,6 +425,18 @@ int Qwen38Pipeline::sample_next_token( cudaStream_t stream ) {
 	CUDA_CHECK( cudaMemcpyAsync( h_argmax_idx_, d_argmax_idx_, sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
 
+	std::vector<half> h_logits( 248320 );
+	CUDA_CHECK( cudaMemcpy( h_logits.data(), logits_.data, 248320 * sizeof( half ), cudaMemcpyDeviceToHost ) );
+	std::vector<int> sorted_idx( 248320 );
+	for ( int i = 0; i < 248320; ++i ) sorted_idx[i] = i;
+	std::partial_sort( sorted_idx.begin(), sorted_idx.begin() + 5, sorted_idx.end(), [&]( int a, int b ) {
+		return __half2float( h_logits[a] ) > __half2float( h_logits[b] );
+	} );
+	std::printf( "    [QWEN TP=4 TOP-5] best=%d (logit=%f)\n", *h_argmax_idx_, __half2float( h_logits[*h_argmax_idx_] ) );
+	for ( int k = 0; k < 5; ++k ) {
+		std::printf( "       top %d: id=%d logit=%f\n", k, sorted_idx[k], __half2float( h_logits[sorted_idx[k]] ) );
+	}
+
 	return *h_argmax_idx_;
 }
 
@@ -680,6 +446,7 @@ void Qwen38Pipeline::forward_step(
 	int pos,
 	cudaStream_t stream
 ) {
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	(void) input_tokens;
 	state_.current_pos = pos;
 
@@ -770,44 +537,44 @@ void Qwen38Pipeline::forward_step(
 
 		// 2. Attention
 		if ( lw.is_full_attention ) {
-			// Q proj: projects norm_hidden (5120) to Q+Gate (12288 = 24 * 512)
-			engine::modules::LinearTrellis::forward(
-				norm_hidden_, lw.q_proj_tr, lw.q_proj_suh, lw.q_proj_svh,
-				q_gate_buf_, lw.q_proj_bits, false, true, stream
+			int q_heads = ( ring_ != nullptr ) ? 6 : config_.full_num_q_heads;
+			int kv_heads = ( ring_ != nullptr ) ? 1 : config_.full_num_kv_heads;
+
+			// Q proj: projects norm_hidden (5120) to Q+Gate (12288 or 3072)
+			engine::modules::Linear::forward(
+				norm_hidden_, lw.q_proj, q_gate_buf_, stream
 			);
 
 			// Unpack Q and Gate
 			engine::modules::Attention::unpack_q_gate(
 				q_gate_buf_, q_buf_, gate_attn_buf_,
-				config_.full_num_q_heads, config_.full_head_dim, stream
+				q_heads, config_.full_head_dim, stream
 			);
 
-			// RMSNorm on Q heads (24 heads of 256)
+			// RMSNorm on Q heads
 			engine::modules::RMSNorm::forward_heads(
-				q_buf_, lw.q_norm, config_.full_num_q_heads, config_.full_head_dim, 1e-6f, 1.0f, stream
+				q_buf_, lw.q_norm, q_heads, config_.full_head_dim, 1e-6f, 1.0f, stream
 			);
 
-			// K proj: projects norm_hidden (5120) to K (1024 = 4 * 256)
-			engine::modules::LinearTrellis::forward(
-				norm_hidden_, lw.k_proj_tr, lw.k_proj_suh, lw.k_proj_svh,
-				k_buf_, lw.k_proj_bits, false, true, stream
+			// K proj: projects norm_hidden (5120) to K (1024 or 256)
+			engine::modules::Linear::forward(
+				norm_hidden_, lw.k_proj, k_buf_, stream
 			);
 
-			// RMSNorm on K heads (4 heads of 256)
+			// RMSNorm on K heads
 			engine::modules::RMSNorm::forward_heads(
-				k_buf_, lw.k_norm, config_.full_num_kv_heads, config_.full_head_dim, 1e-6f, 1.0f, stream
+				k_buf_, lw.k_norm, kv_heads, config_.full_head_dim, 1e-6f, 1.0f, stream
 			);
 
-			// V proj: projects norm_hidden (5120) to V (1024 = 4 * 256)
-			engine::modules::LinearTrellis::forward(
-				norm_hidden_, lw.v_proj_tr, lw.v_proj_suh, lw.v_proj_svh,
-				v_buf_, lw.v_proj_bits, false, true, stream
+			// V proj: projects norm_hidden (5120) to V (1024 or 256)
+			engine::modules::Linear::forward(
+				norm_hidden_, lw.v_proj, v_buf_, stream
 			);
 
 			// RoPE applied to Q and K
 			engine::modules::RoPE::forward(
 				q_buf_, k_buf_,
-				config_.full_num_q_heads, config_.full_num_kv_heads,
+				q_heads, kv_heads,
 				config_.full_head_dim, config_.full_rot_dim,
 				pos, 10000000.0f, stream
 			);
@@ -817,7 +584,7 @@ void Qwen38Pipeline::forward_step(
 				state_.k_cache, state_.v_cache,
 				k_buf_, v_buf_,
 				full_attn_idx, pos,
-				config_.full_num_kv_heads, config_.full_head_dim,
+				kv_heads, config_.full_head_dim,
 				config_.max_seq, stream
 			);
 
@@ -826,65 +593,65 @@ void Qwen38Pipeline::forward_step(
 				q_buf_, state_.k_cache, state_.v_cache, gate_attn_buf_,
 				attn_out_,
 				full_attn_idx, pos,
-				config_.full_num_q_heads, config_.full_num_kv_heads,
+				q_heads, kv_heads,
 				config_.full_head_dim, config_.max_seq, stream
 			);
 			full_attn_idx++;
 
-			// O proj: projects attn_out (6144) to mlp_out (5120)
-			engine::modules::LinearTrellis::forward(
-				attn_out_, lw.o_proj_tr, lw.o_proj_suh, lw.o_proj_svh,
-				mlp_out_, lw.o_proj_bits, false, true, stream
+			// O proj: projects attn_out (6144 or 1536) to mlp_out (5120)
+			engine::modules::Linear::forward(
+				attn_out_, lw.o_proj, mlp_out_, stream
 			);
 		}
 		else {
-			// In proj QKV: projects norm_hidden (5120) to QKV (10240)
-			engine::modules::LinearTrellis::forward(
-				norm_hidden_, lw.in_proj_qkv_tr, lw.in_proj_qkv_suh, lw.in_proj_qkv_svh,
-				qkv_buf_, lw.in_proj_qkv_bits, false, true, stream
+			int k_heads = ( ring_ != nullptr ) ? 4 : config_.linear_num_k_heads;
+			int v_heads = ( ring_ != nullptr ) ? 12 : config_.linear_num_v_heads;
+			int lin_channels = ( ring_ != nullptr ) ? 2560 : config_.linear_channels;
+
+			// In proj QKV: projects norm_hidden (5120) to QKV (10240 or 2560)
+			engine::modules::Linear::forward(
+				norm_hidden_, lw.in_proj_qkv, qkv_buf_, stream
 			);
 
 			// Causal conv1d + SiLU
-			float* hist_ptr = state_.conv_history + static_cast<size_t>( linear_idx ) * config_.linear_channels * 3;
-			pod::TensorView conv_hist = pod::make_tensor_2d( hist_ptr, pod::DType::FP32, config_.linear_channels, 3 );
+			float* hist_ptr = state_.conv_history + static_cast<size_t>( linear_idx ) * lin_channels * 3;
+			pod::TensorView conv_hist = pod::make_tensor_2d( hist_ptr, pod::DType::FP32, lin_channels, 3 );
 			engine::modules::GDN::causal_conv1d_silu(
-				qkv_buf_, conv_hist, lw.conv1d_w, config_.linear_channels, stream
+				qkv_buf_, conv_hist, lw.conv1d_w, lin_channels, stream
 			);
 
-			// L2 norm on Q and K heads (16 heads each of dim 128)
+			// L2 norm on Q and K heads
 			engine::modules::GDN::l2_norm_heads(
-				qkv_buf_, config_.linear_num_k_heads, config_.linear_head_dim, stream
+				qkv_buf_, k_heads, config_.linear_head_dim, stream
 			);
 
 			// Project gates: in_proj_a, in_proj_b -> gdn_gate, gdn_beta
 			engine::modules::GDN::project_gates(
 				norm_hidden_, lw.in_proj_a, lw.in_proj_b, lw.A_log, lw.dt_bias,
-				gdn_gate_, gdn_beta_, config_.linear_num_v_heads, config_.hidden_size, stream
+				gdn_gate_, gdn_beta_, v_heads, config_.hidden_size, stream
 			);
 
-			// In proj Z: projects norm_hidden (5120) to Z (6144 = 48 * 128)
-			engine::modules::LinearTrellis::forward(
-				norm_hidden_, lw.in_proj_z_tr, lw.in_proj_z_suh, lw.in_proj_z_svh,
-				z_buf_, lw.in_proj_z_bits, false, true, stream
+			// In proj Z: projects norm_hidden (5120) to Z (6144 or 1536)
+			engine::modules::Linear::forward(
+				norm_hidden_, lw.in_proj_z, z_buf_, stream
 			);
 
 			// GDN recurrent step
-			float* layer_gdn_state = state_.gdn_states + static_cast<size_t>( linear_idx ) * config_.linear_num_v_heads * 128 * 128;
+			float* layer_gdn_state = state_.gdn_states + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
 			engine::modules::GDN::recurrent_step(
 				layer_gdn_state, qkv_buf_, gdn_gate_, gdn_beta_,
-				gdn_out_, config_.linear_num_k_heads, config_.linear_num_v_heads,
+				gdn_out_, k_heads, v_heads,
 				config_.linear_head_dim, stream
 			);
 
 			// Gated RMSNorm: gdn_out * rsqrt * norm_weight * silu(z)
 			engine::modules::GDN::gated_rmsnorm(
-				gdn_out_, z_buf_, lw.linear_norm, config_.linear_num_v_heads, config_.linear_head_dim, stream
+				gdn_out_, z_buf_, lw.linear_norm, v_heads, config_.linear_head_dim, stream, false
 			);
 
-			// Out proj: projects gdn_out (6144) to mlp_out (5120)
-			engine::modules::LinearTrellis::forward(
-				gdn_out_, lw.out_proj_tr, lw.out_proj_suh, lw.out_proj_svh,
-				mlp_out_, lw.out_proj_bits, false, true, stream
+			// Out proj: projects gdn_out (6144 or 1536) to mlp_out (5120)
+			engine::modules::Linear::forward(
+				gdn_out_, lw.out_proj, mlp_out_, stream
 			);
 			linear_idx++;
 		}
@@ -902,21 +669,18 @@ void Qwen38Pipeline::forward_step(
 		);
 
 		// 4. MLP
-		engine::modules::LinearTrellis::forward(
-			norm_hidden_, lw.gate_proj_tr, lw.gate_proj_suh, lw.gate_proj_svh,
-			gate_buf_, lw.gate_proj_bits, false, true, stream
+		engine::modules::Linear::forward(
+			norm_hidden_, lw.gate_proj, gate_buf_, stream
 		);
 
-		engine::modules::LinearTrellis::forward(
-			norm_hidden_, lw.up_proj_tr, lw.up_proj_suh, lw.up_proj_svh,
-			up_buf_, lw.up_proj_bits, false, true, stream
+		engine::modules::Linear::forward(
+			norm_hidden_, lw.up_proj, up_buf_, stream
 		);
 
 		engine::modules::SwiGLU::forward( gate_buf_, up_buf_, mlp_inter_, stream );
 
-		engine::modules::LinearTrellis::forward(
-			mlp_inter_, lw.down_proj_tr, lw.down_proj_suh, lw.down_proj_svh,
-			mlp_out_, lw.down_proj_bits, false, true, stream
+		engine::modules::Linear::forward(
+			mlp_inter_, lw.down_proj, mlp_out_, stream
 		);
 
 		if ( ring_ ) {
@@ -925,6 +689,14 @@ void Qwen38Pipeline::forward_step(
 
 		// Residual connection: hidden_states += mlp_out
 		engine::modules::Elementwise::add_residual( hidden_states_, mlp_out_, stream );
+
+		if ( rank_ == 0 && pos == 0 && layer <= 4 ) {
+			half h_hs[4];
+			CUDA_CHECK( cudaMemcpy( h_hs, hidden_states_.data, 4 * sizeof( half ), cudaMemcpyDeviceToHost ) );
+			std::printf( "    [QWEN L%d] hidden_[0..3]: %f %f %f %f\n",
+				layer, __half2float( h_hs[0] ), __half2float( h_hs[1] ), __half2float( h_hs[2] ), __half2float( h_hs[3] ) );
+			std::fflush( stdout );
+		}
 	}
 
 	if ( output_logits.data != nullptr ) {
@@ -972,16 +744,22 @@ void Qwen38Pipeline::launch_graph( int m, cudaStream_t stream ) {
 }
 
 void Qwen38Pipeline::reset_state() {
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	state_.current_pos = 0;
-	size_t gdn_floats = static_cast<size_t>( config_.num_linear_layers ) * config_.linear_num_v_heads * 128 * 128;
+	int tp_size = ( ring_ != nullptr ) ? 4 : 1;
+	int lin_v_heads = ( tp_size == 4 ) ? 12 : config_.linear_num_v_heads;
+	int lin_channels = ( tp_size == 4 ) ? 2560 : config_.linear_channels;
+	int full_kv_heads = ( tp_size == 4 ) ? 1 : config_.full_num_kv_heads;
+
+	size_t gdn_floats = static_cast<size_t>( config_.num_linear_layers ) * lin_v_heads * 128 * 128;
 	if ( state_.gdn_states ) {
 		cudaMemset( state_.gdn_states, 0, gdn_floats * sizeof( float ) );
 	}
-	size_t conv_hist_floats = static_cast<size_t>( config_.num_linear_layers ) * config_.linear_channels * 3;
+	size_t conv_hist_floats = static_cast<size_t>( config_.num_linear_layers ) * lin_channels * 3;
 	if ( state_.conv_history ) {
 		cudaMemset( state_.conv_history, 0, conv_hist_floats * sizeof( float ) );
 	}
-	size_t cache_elems = static_cast<size_t>( config_.num_attn_layers ) * config_.max_seq * config_.full_num_kv_heads * config_.full_head_dim;
+	size_t cache_elems = static_cast<size_t>( config_.num_attn_layers ) * config_.max_seq * full_kv_heads * config_.full_head_dim;
 	if ( state_.k_cache ) {
 		cudaMemset( state_.k_cache, 0, cache_elems * sizeof( half ) );
 	}

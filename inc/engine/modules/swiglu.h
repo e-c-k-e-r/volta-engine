@@ -12,7 +12,8 @@ struct SwiGLU {
 		const pod::TensorView& gate,
 		const pod::TensorView& up,
 		pod::TensorView& out,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		float limit = 0.0f
 	);
 };
 

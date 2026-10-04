@@ -29,14 +29,17 @@ void router_topk_kernel(
 		logit = fmaf( x_val, w_val, logit );
 	}
 
-	float score = 1.0f / ( 1.0f + __expf( -logit ) );
+	float raw_score = 1.0f / ( 1.0f + __expf( -logit ) );
+	float select_score = raw_score;
 	if ( e_score_bias != nullptr ) {
-		score += __half2float( e_score_bias[expert] );
+		select_score += __half2float( e_score_bias[expert] );
 	}
 
-	__shared__ float s_logits[288];
+	__shared__ float s_raw[288];
+	__shared__ float s_select[288];
 	__shared__ int s_indices[288];
-	s_logits[expert] = score;
+	s_raw[expert] = raw_score;
+	s_select[expert] = select_score;
 	s_indices[expert] = expert;
 	__syncthreads();
 
@@ -44,16 +47,16 @@ void router_topk_kernel(
 		#pragma unroll
 		for ( int i = 0; i < top_k; ++i ) {
 			int max_idx = i;
-			float max_val = s_logits[i];
+			float max_val = s_select[i];
 			for ( int j = i + 1; j < num_experts; ++j ) {
-				if ( s_logits[j] > max_val ) {
-					max_val = s_logits[j];
+				if ( s_select[j] > max_val ) {
+					max_val = s_select[j];
 					max_idx = j;
 				}
 			}
-			float tmp_v = s_logits[i];
-			s_logits[i] = s_logits[max_idx];
-			s_logits[max_idx] = tmp_v;
+			float tmp_s = s_select[i];
+			s_select[i] = s_select[max_idx];
+			s_select[max_idx] = tmp_s;
 
 			int tmp_i = s_indices[i];
 			s_indices[i] = s_indices[max_idx];
@@ -63,14 +66,14 @@ void router_topk_kernel(
 		float sum_scores = 0.0f;
 		#pragma unroll
 		for ( int i = 0; i < top_k; ++i ) {
-			sum_scores += s_logits[i];
+			sum_scores += s_raw[s_indices[i]];
 		}
 
 		float inv_sum = routed_scaling_factor / ( sum_scores + 1e-9f );
 		#pragma unroll
 		for ( int i = 0; i < top_k; ++i ) {
 			topk_indices[i] = s_indices[i];
-			topk_weights[i] = __float2half_rn( s_logits[i] * inv_sum );
+			topk_weights[i] = __float2half_rn( s_raw[s_indices[i]] * inv_sum );
 		}
 	}
 }
@@ -94,6 +97,21 @@ __global__ void moe_combine_kernel(
 		sum = fmaf( part, w, sum );
 	}
 	output[d] = __float2half_rn( sum );
+}
+
+__global__ void moe_accumulate_kernel(
+	half* __restrict__ accum_out,
+	const half* __restrict__ expert_out,
+	half weight,
+	int hidden_size
+) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( tid < hidden_size ) {
+		float cur = __half2float( accum_out[tid] );
+		float val = __half2float( expert_out[tid] );
+		float w = __half2float( weight );
+		accum_out[tid] = __float2half_rn( fmaf( val, w, cur ) );
+	}
 }
 
 } // namespace
@@ -142,6 +160,30 @@ void MoERouter::combine(
 		hidden_size,
 		top_k
 	);
+}
+
+void MoERouter::accumulate(
+	half* accum_out,
+	const half* expert_out,
+	half weight,
+	int hidden_size,
+	cudaStream_t stream
+) {
+	int threads = 256;
+	int blocks = ( hidden_size + threads - 1 ) / threads;
+	moe_accumulate_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
+		accum_out, expert_out, weight, hidden_size
+	);
+}
+
+void MoERouter::accumulate(
+	pod::TensorView& accum_out,
+	const pod::TensorView& expert_out,
+	half weight,
+	int hidden_size,
+	cudaStream_t stream
+) {
+	accumulate( accum_out.ptr<half>(), expert_out.ptr<const half>(), weight, hidden_size, stream );
 }
 
 } // namespace engine::modules

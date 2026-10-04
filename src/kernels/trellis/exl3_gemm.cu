@@ -93,13 +93,6 @@ void exl3_gemm(
 		g_gemm_attr_set[device].insert( (void*) kernel );
 	}
 
-	int max_active_blocks = 0;
-	cudaOccupancyMaxActiveBlocksPerMultiprocessor( &max_active_blocks, (void*) kernel, block_dim, actual_smem );
-	int max_coop_grid = max_active_blocks * 80;
-	if ( max_coop_grid > 0 && num_sms > max_coop_grid ) {
-		num_sms = max_coop_grid;
-	}
-
 	CUDA_CHECK( cudaLaunchCooperativeKernel(
 		(void*) kernel,
 		num_sms,

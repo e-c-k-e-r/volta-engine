@@ -29,6 +29,7 @@ set(ENGINE_CORE_SOURCES
 	src/modules/gdn.cu
 	src/modules/mla.cu
 	src/modules/moe.cu
+	src/modules/mhc.cu
 	src/models/qwen38_27b.cu
 	src/models/glm53_flash.cu
 )
@@ -52,6 +53,11 @@ set_target_properties(engine_kernels PROPERTIES
 add_executable(test_trellis tests/2_parity/test_trellis.cpp)
 target_link_libraries(test_trellis PRIVATE engine_kernels)
 set_target_properties(test_trellis PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# Test mHC Parity
+add_executable(test_mhc tests/2_parity/test_mhc.cpp)
+target_link_libraries(test_mhc PRIVATE engine_kernels)
+set_target_properties(test_mhc PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Microbenchmarks
 add_executable(bench_all_reduce tests/3_bench/bench_all_reduce.cpp)

@@ -20,7 +20,8 @@ enum class DType : uint8_t {
 	TRELLIS_4,
 	TRELLIS_5,
 	TRELLIS_6,
-	NVFP4
+	NVFP4,
+	AUTO = 255
 };
 
 inline size_t dtype_bytes( DType dtype ) {

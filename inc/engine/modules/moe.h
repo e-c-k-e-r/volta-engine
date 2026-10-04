@@ -30,6 +30,22 @@ struct MoERouter {
 		int top_k = 8,
 		cudaStream_t stream = nullptr
 	);
+
+	static void accumulate(
+		half* accum_out,
+		const half* expert_out,
+		half weight,
+		int hidden_size,
+		cudaStream_t stream = nullptr
+	);
+
+	static void accumulate(
+		pod::TensorView& accum_out,
+		const pod::TensorView& expert_out,
+		half weight,
+		int hidden_size,
+		cudaStream_t stream = nullptr
+	);
 };
 
 } // namespace engine::modules

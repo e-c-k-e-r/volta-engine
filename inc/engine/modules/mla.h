@@ -39,4 +39,41 @@ struct MLADSA {
 	);
 };
 
+struct MLA {
+	static void project_kv_b(
+		const pod::TensorView& kv_norm,
+		const pod::TensorView& kv_b_proj,
+		pod::TensorView& k_out,
+		pod::TensorView& v_out,
+		int num_heads = 16,
+		int head_dim = 256,
+		cudaStream_t stream = nullptr
+	);
+
+	static void store_kv_cache(
+		half* k_cache,
+		half* v_cache,
+		const pod::TensorView& k,
+		const pod::TensorView& v,
+		int mla_layer_idx,
+		int pos,
+		int total_elems = 4096,
+		int max_seq = 2048,
+		cudaStream_t stream = nullptr
+	);
+
+	static void forward_decode(
+		const pod::TensorView& q,
+		const half* k_cache,
+		const half* v_cache,
+		pod::TensorView& out,
+		int mla_layer_idx,
+		int pos,
+		int num_heads = 16,
+		int head_dim = 256,
+		int max_seq = 2048,
+		cudaStream_t stream = nullptr
+	);
+};
+
 } // namespace engine::modules

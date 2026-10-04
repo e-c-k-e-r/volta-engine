@@ -113,7 +113,8 @@ __global__ void causal_conv1d_silu_kernel(
 __global__ void l2_norm_heads_kernel(
 	half* __restrict__ qkv,
 	int num_k_heads,
-	int head_dim
+	int head_dim,
+	bool scale_q
 ) {
 	int block = blockIdx.x; // 0 .. num_k_heads * 2 - 1
 	int tid = threadIdx.x;
@@ -149,6 +150,9 @@ __global__ void l2_norm_heads_kernel(
 	__syncthreads();
 
 	float inv_l2 = s_warp_sums[0];
+	if ( scale_q && block < num_k_heads ) {
+		inv_l2 *= 1.0f / sqrtf( static_cast<float>( head_dim ) );
+	}
 	ptr[tid] = __float2half_rn( val * inv_l2 );
 }
 
@@ -215,7 +219,8 @@ __global__ void gated_rmsnorm_kernel(
 	const half* __restrict__ z,
 	const half* __restrict__ norm_weight,
 	int num_v_heads,
-	int head_dim
+	int head_dim,
+	bool use_sigmoid
 ) {
 	int head = blockIdx.x;
 	int tid = threadIdx.x;
@@ -253,9 +258,230 @@ __global__ void gated_rmsnorm_kernel(
 	float inv_rms = s_warp_sums[0];
 	float gamma = ( norm_weight != nullptr ) ? __half2float( norm_weight[tid] ) : 1.0f;
 	float z_val = ( z != nullptr ) ? __half2float( z[head * head_dim + tid] ) : 0.0f;
-	float silu_z = z_val / ( 1.0f + __expf( -z_val ) );
+	float gate_val;
+	if ( use_sigmoid ) {
+		gate_val = 1.0f / ( 1.0f + __expf( -z_val ) );
+	}
+	else {
+		gate_val = z_val / ( 1.0f + __expf( -z_val ) );
+	}
 
-	head_out[tid] = __float2half_rn( val * inv_rms * gamma * silu_z );
+	head_out[tid] = __float2half_rn( val * inv_rms * gamma * gate_val );
+}
+
+__global__ void project_kda_stage1_kernel(
+	const half* __restrict__ norm_hidden,
+	const half* __restrict__ b_proj,
+	const half* __restrict__ f_a_proj,
+	const half* __restrict__ g_a_proj,
+	float* __restrict__ beta_out,
+	half* __restrict__ f_a_buf,
+	half* __restrict__ g_a_buf,
+	int hidden_size
+) {
+	int t = threadIdx.x;
+
+	if ( t < 16 && b_proj != nullptr ) {
+		int h = t;
+		const half* b_row = b_proj + h * hidden_size;
+		float sum_b = 0.0f;
+		#pragma unroll 4
+		for ( int i = 0; i < hidden_size; ++i ) {
+			sum_b = fmaf( __half2float( norm_hidden[i] ), __half2float( b_row[i] ), sum_b );
+		}
+		beta_out[h] = 1.0f / ( 1.0f + __expf( -sum_b ) );
+	}
+
+	if ( t < 128 && f_a_proj != nullptr ) {
+		int i = t;
+		const half* fa_row = f_a_proj + i * hidden_size;
+		float sum_f = 0.0f;
+		#pragma unroll 4
+		for ( int k = 0; k < hidden_size; ++k ) {
+			sum_f = fmaf( __half2float( norm_hidden[k] ), __half2float( fa_row[k] ), sum_f );
+		}
+		f_a_buf[i] = __float2half_rn( sum_f );
+	}
+
+	if ( t >= 128 && g_a_proj != nullptr ) {
+		int i = t - 128;
+		const half* ga_row = g_a_proj + i * hidden_size;
+		float sum_g = 0.0f;
+		#pragma unroll 4
+		for ( int k = 0; k < hidden_size; ++k ) {
+			sum_g = fmaf( __half2float( norm_hidden[k] ), __half2float( ga_row[k] ), sum_g );
+		}
+		g_a_buf[i] = __float2half_rn( sum_g );
+	}
+}
+
+__global__ void project_kda_stage2_kernel(
+	const half* __restrict__ f_a_buf,
+	const half* __restrict__ g_a_buf,
+	const half* __restrict__ f_b_proj,
+	const half* __restrict__ g_b_proj,
+	const half* __restrict__ A_log,
+	const half* __restrict__ dt_bias,
+	float* __restrict__ g_decay_out,
+	half* __restrict__ z_out,
+	int num_channels
+) {
+	int j = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( j >= num_channels ) return;
+
+	int h = j / 128;
+
+	if ( f_b_proj != nullptr ) {
+		const half* fb_row = f_b_proj + j * 128;
+		float f_val = 0.0f;
+		#pragma unroll 4
+		for ( int i = 0; i < 128; ++i ) {
+			f_val = fmaf( __half2float( f_a_buf[i] ), __half2float( fb_row[i] ), f_val );
+		}
+		float dt = ( dt_bias != nullptr ) ? __half2float( dt_bias[j] ) : 0.0f;
+		float gf = f_val + dt;
+		float a_val = ( A_log != nullptr ) ? __half2float( A_log[h] ) : 0.0f;
+		float decay = __expf( a_val );
+		float g_val = -5.0f / ( 1.0f + __expf( -decay * gf ) );
+		g_decay_out[j] = g_val;
+	}
+
+	if ( g_b_proj != nullptr ) {
+		const half* gb_row = g_b_proj + j * 128;
+		float z_val = 0.0f;
+		#pragma unroll 4
+		for ( int i = 0; i < 128; ++i ) {
+			z_val = fmaf( __half2float( g_a_buf[i] ), __half2float( gb_row[i] ), z_val );
+		}
+		z_out[j] = __float2half_rn( z_val );
+	}
+}
+
+__global__ void kda_recurrent_step_kernel(
+	float* __restrict__ state,
+	const half* __restrict__ qkv,
+	const float* __restrict__ g_decay,
+	const float* __restrict__ beta,
+	half* __restrict__ output,
+	int num_heads,
+	int head_dim
+) {
+	int h = blockIdx.x;
+	int c = threadIdx.x;
+	if ( h >= num_heads || c >= head_dim ) return;
+
+	float* head_state = state + static_cast<size_t>( h ) * head_dim * head_dim;
+	const half* q_ptr = qkv + h * head_dim;
+	const half* k_ptr = qkv + num_heads * head_dim + h * head_dim;
+	const half* v_ptr = qkv + 2 * num_heads * head_dim + h * head_dim;
+	const float* head_g = g_decay + h * head_dim;
+	float beta_h = beta[h];
+
+	// 1. Compute kv_mem from S_{t-1} and decay state
+	float kv_mem = 0.0f;
+	#pragma unroll 4
+	for ( int r = 0; r < head_dim; ++r ) {
+		float s_prev = head_state[r * head_dim + c];
+		kv_mem = fmaf( s_prev, __half2float( k_ptr[r] ), kv_mem );
+		float g_exp = __expf( head_g[r] );
+		head_state[r * head_dim + c] = s_prev * g_exp;
+	}
+
+	// 2. Compute delta for column c
+	float v_val = __half2float( v_ptr[c] );
+	float delta = ( v_val - kv_mem ) * beta_h;
+
+	// 3. Update state and compute attention output for column c
+	float attn_out = 0.0f;
+	#pragma unroll 4
+	for ( int r = 0; r < head_dim; ++r ) {
+		float s = fmaf( __half2float( k_ptr[r] ), delta, head_state[r * head_dim + c] );
+		head_state[r * head_dim + c] = s;
+		attn_out = fmaf( s, __half2float( q_ptr[r] ), attn_out );
+	}
+
+	output[h * head_dim + c] = __float2half_rn( attn_out );
+}
+
+__global__ void kda_recurrent_step_and_norm_kernel(
+	float* __restrict__ state,
+	const half* __restrict__ qkv,
+	const float* __restrict__ g_decay,
+	const float* __restrict__ beta,
+	const half* __restrict__ z,
+	const half* __restrict__ o_norm,
+	half* __restrict__ output,
+	int num_heads,
+	int head_dim,
+	float eps
+) {
+	int h = blockIdx.x;
+	int c = threadIdx.x;
+	if ( h >= num_heads || c >= head_dim ) return;
+
+	float* head_state = state + static_cast<size_t>( h ) * head_dim * head_dim;
+	const half* q_ptr = qkv + h * head_dim;
+	const half* k_ptr = qkv + num_heads * head_dim + h * head_dim;
+	const half* v_ptr = qkv + 2 * num_heads * head_dim + h * head_dim;
+	const float* head_g = g_decay + h * head_dim;
+	float beta_h = beta[h];
+
+	// 1. Decay state and compute kv_mem for column c
+	float kv_mem = 0.0f;
+	#pragma unroll 4
+	for ( int r = 0; r < head_dim; ++r ) {
+		float g_exp = __expf( head_g[r] );
+		float s = head_state[r * head_dim + c] * g_exp;
+		head_state[r * head_dim + c] = s;
+		kv_mem = fmaf( s, __half2float( k_ptr[r] ), kv_mem );
+	}
+
+	// 2. Compute delta for column c: beta_t * (v_t - S_{t-1} k_t)
+	float v_val = __half2float( v_ptr[c] );
+	float delta = ( v_val - kv_mem ) * beta_h;
+
+	// 3. Update state and compute attention output for column c: y = S_t * q_t
+	float y_core = 0.0f;
+	#pragma unroll 4
+	for ( int r = 0; r < head_dim; ++r ) {
+		float s = fmaf( __half2float( k_ptr[r] ), delta, head_state[r * head_dim + c] );
+		head_state[r * head_dim + c] = s;
+		y_core = fmaf( s, __half2float( q_ptr[r] ), y_core );
+	}
+
+	// 4. In-register Gated RMSNorm across 128 threads of this head
+	float sq = y_core * y_core;
+	#pragma unroll
+	for ( int mask = 16; mask > 0; mask >>= 1 ) {
+		sq += __shfl_xor_sync( 0xffffffff, sq, mask );
+	}
+
+	__shared__ float s_warp_sums[4];
+	int warp_id = c >> 5;
+	int lane_id = c & 31;
+	if ( lane_id == 0 ) {
+		s_warp_sums[warp_id] = sq;
+	}
+	__syncthreads();
+
+	if ( warp_id == 0 ) {
+		float b_sum = ( lane_id < 4 ) ? s_warp_sums[lane_id] : 0.0f;
+		#pragma unroll
+		for ( int mask = 2; mask > 0; mask >>= 1 ) {
+			b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
+		}
+		if ( lane_id == 0 ) {
+			s_warp_sums[0] = rsqrtf( b_sum / static_cast<float>( head_dim ) + eps );
+		}
+	}
+	__syncthreads();
+
+	float inv_rms = s_warp_sums[0];
+	float gamma = ( o_norm != nullptr ) ? __half2float( o_norm[c] ) : 1.0f;
+	float z_val = ( z != nullptr ) ? __half2float( z[h * head_dim + c] ) : 0.0f;
+	float gate_val = 1.0f / ( 1.0f + __expf( -z_val ) );
+
+	output[h * head_dim + c] = __float2half_rn( y_core * inv_rms * gamma * gate_val );
 }
 
 } // namespace
@@ -306,13 +532,15 @@ void GDN::l2_norm_heads(
 	pod::TensorView& qkv,
 	int num_k_heads,
 	int head_dim,
-	cudaStream_t stream
+	cudaStream_t stream,
+	bool scale_q
 ) {
 	int total_blocks = num_k_heads * 2;
 	l2_norm_heads_kernel<<<dim3( total_blocks ), dim3( head_dim ), 0, stream>>>(
 		qkv.ptr<half>(),
 		num_k_heads,
-		head_dim
+		head_dim,
+		scale_q
 	);
 }
 
@@ -340,20 +568,118 @@ void GDN::recurrent_step(
 	);
 }
 
+void GDN::project_kda_gates(
+	const pod::TensorView& norm_hidden,
+	const pod::TensorView& b_proj,
+	const pod::TensorView& f_a_proj,
+	const pod::TensorView& f_b_proj,
+	const pod::TensorView& g_a_proj,
+	const pod::TensorView& g_b_proj,
+	const pod::TensorView& A_log,
+	const pod::TensorView& dt_bias,
+	pod::TensorView& beta_out,
+	pod::TensorView& g_decay_out,
+	pod::TensorView& z_out,
+	pod::TensorView& f_a_buf,
+	pod::TensorView& g_a_buf,
+	int num_heads,
+	int head_dim,
+	int hidden_size,
+	cudaStream_t stream
+) {
+	(void) num_heads;
+	(void) head_dim;
+	project_kda_stage1_kernel<<<dim3( 1 ), dim3( 256 ), 0, stream>>>(
+		norm_hidden.ptr<const half>(),
+		b_proj.ptr<const half>(),
+		f_a_proj.ptr<const half>(),
+		g_a_proj.ptr<const half>(),
+		beta_out.ptr<float>(),
+		f_a_buf.ptr<half>(),
+		g_a_buf.ptr<half>(),
+		hidden_size
+	);
+
+	int num_channels = num_heads * head_dim; // 2048
+	int threads = 256;
+	int blocks = ( num_channels + threads - 1 ) / threads;
+	project_kda_stage2_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
+		f_a_buf.ptr<const half>(),
+		g_a_buf.ptr<const half>(),
+		f_b_proj.ptr<const half>(),
+		g_b_proj.ptr<const half>(),
+		A_log.ptr<const half>(),
+		dt_bias.ptr<const half>(),
+		g_decay_out.ptr<float>(),
+		z_out.ptr<half>(),
+		num_channels
+	);
+}
+
+void GDN::recurrent_step_kda(
+	float* gdn_state,
+	const pod::TensorView& qkv,
+	const pod::TensorView& g_decay,
+	const pod::TensorView& beta,
+	pod::TensorView& attn_out,
+	int num_heads,
+	int head_dim,
+	cudaStream_t stream
+) {
+	kda_recurrent_step_kernel<<<dim3( num_heads ), dim3( head_dim ), 0, stream>>>(
+		gdn_state,
+		qkv.ptr<const half>(),
+		g_decay.ptr<const float>(),
+		beta.ptr<const float>(),
+		attn_out.ptr<half>(),
+		num_heads,
+		head_dim
+	);
+}
+
+void GDN::recurrent_step_kda_fused(
+	float* gdn_state,
+	const pod::TensorView& qkv,
+	const pod::TensorView& g_decay,
+	const pod::TensorView& beta,
+	const pod::TensorView& z,
+	const pod::TensorView& o_norm,
+	pod::TensorView& attn_out,
+	int num_heads,
+	int head_dim,
+	float eps,
+	cudaStream_t stream
+) {
+	kda_recurrent_step_and_norm_kernel<<<dim3( num_heads ), dim3( head_dim ), 0, stream>>>(
+		gdn_state,
+		qkv.ptr<const half>(),
+		g_decay.ptr<const float>(),
+		beta.ptr<const float>(),
+		z.ptr<const half>(),
+		o_norm.ptr<const half>(),
+		attn_out.ptr<half>(),
+		num_heads,
+		head_dim,
+		eps
+	);
+}
+
 void GDN::gated_rmsnorm(
 	pod::TensorView& attn_out,
 	const pod::TensorView& z,
 	const pod::TensorView& norm_weight,
 	int num_v_heads,
 	int head_dim,
-	cudaStream_t stream
+	cudaStream_t stream,
+	bool use_sigmoid
 ) {
 	gated_rmsnorm_kernel<<<dim3( num_v_heads ), dim3( head_dim ), 0, stream>>>(
 		attn_out.ptr<half>(),
 		z.ptr<const half>(),
 		norm_weight.ptr<const half>(),
 		num_v_heads,
-		head_dim
+		head_dim,
+		use_sigmoid
 	);
 }
 

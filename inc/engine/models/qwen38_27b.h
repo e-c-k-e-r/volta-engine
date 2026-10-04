@@ -10,6 +10,7 @@
 #include "engine/modules/rope.h"
 #include "engine/modules/attention.h"
 #include "engine/modules/gdn.h"
+#include "engine/modules/linear.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -56,20 +57,9 @@ struct Qwen38LayerWeights {
 	bool is_full_attention;
 
 	// Linear attention (GDN) weights
-	pod::TensorView in_proj_qkv_tr;
-	pod::TensorView in_proj_qkv_suh;
-	pod::TensorView in_proj_qkv_svh;
-	int             in_proj_qkv_bits;
-
-	pod::TensorView in_proj_z_tr;
-	pod::TensorView in_proj_z_suh;
-	pod::TensorView in_proj_z_svh;
-	int             in_proj_z_bits;
-
-	pod::TensorView out_proj_tr;
-	pod::TensorView out_proj_suh;
-	pod::TensorView out_proj_svh;
-	int             out_proj_bits;
+	pod::LinearWeight in_proj_qkv;
+	pod::LinearWeight in_proj_z;
+	pod::LinearWeight out_proj;
 
 	pod::TensorView conv1d_w;
 	pod::TensorView A_log;
@@ -79,44 +69,18 @@ struct Qwen38LayerWeights {
 	pod::TensorView linear_norm;
 
 	// Full attention weights
-	pod::TensorView q_proj_tr;
-	pod::TensorView q_proj_suh;
-	pod::TensorView q_proj_svh;
-	int             q_proj_bits;
-
-	pod::TensorView k_proj_tr;
-	pod::TensorView k_proj_suh;
-	pod::TensorView k_proj_svh;
-	int             k_proj_bits;
-
-	pod::TensorView v_proj_tr;
-	pod::TensorView v_proj_suh;
-	pod::TensorView v_proj_svh;
-	int             v_proj_bits;
-
-	pod::TensorView o_proj_tr;
-	pod::TensorView o_proj_suh;
-	pod::TensorView o_proj_svh;
-	int             o_proj_bits;
+	pod::LinearWeight q_proj;
+	pod::LinearWeight k_proj;
+	pod::LinearWeight v_proj;
+	pod::LinearWeight o_proj;
 
 	pod::TensorView q_norm;
 	pod::TensorView k_norm;
 
 	// MLP weights
-	pod::TensorView gate_proj_tr;
-	pod::TensorView gate_proj_suh;
-	pod::TensorView gate_proj_svh;
-	int             gate_proj_bits;
-
-	pod::TensorView up_proj_tr;
-	pod::TensorView up_proj_suh;
-	pod::TensorView up_proj_svh;
-	int             up_proj_bits;
-
-	pod::TensorView down_proj_tr;
-	pod::TensorView down_proj_suh;
-	pod::TensorView down_proj_svh;
-	int             down_proj_bits;
+	pod::LinearWeight gate_proj;
+	pod::LinearWeight up_proj;
+	pod::LinearWeight down_proj;
 };
 
 class Qwen38Pipeline {
@@ -191,9 +155,7 @@ private:
 	Qwen38LayerWeights layers_[64];
 	pod::TensorView embed_tokens_;
 	pod::TensorView final_norm_;
-	pod::TensorView lm_head_trellis_;
-	pod::TensorView lm_head_suh_;
-	pod::TensorView lm_head_svh_;
+	pod::LinearWeight lm_head_;
 	pod::TensorView logits_;
 	int* d_argmax_idx_;
 	int* h_argmax_idx_;
