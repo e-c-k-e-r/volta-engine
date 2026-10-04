@@ -76,8 +76,7 @@ GLM53Pipeline::GLM53Pipeline()
 	, graph_m4_captured_{ false }
 	, graph_m8_{ nullptr }
 	, instance_m8_{ nullptr }
-	, graph_m8_captured_{ false }
-{
+	, graph_m8_captured_{ false } {
 }
 
 GLM53Pipeline::~GLM53Pipeline() {
@@ -159,12 +158,11 @@ bool GLM53Pipeline::init(
 	mla_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mla_out_shape, 2 );
 	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 
-	// Real MLA KV cache & execution buffers
-	size_t mla_kv_elems = 11ULL * max_seq * 4096;
-	state_.k_cache = static_cast<half*>( engine::core::arena_alloc( arena, mla_kv_elems * sizeof( half ) ) );
-	state_.v_cache = static_cast<half*>( engine::core::arena_alloc( arena, mla_kv_elems * sizeof( half ) ) );
-	CUDA_CHECK( cudaMemset( state_.k_cache, 0, mla_kv_elems * sizeof( half ) ) );
-	CUDA_CHECK( cudaMemset( state_.v_cache, 0, mla_kv_elems * sizeof( half ) ) );
+	// Real MLA KV cache pool & execution buffers
+	internal_kv_pool_.init( rank_, arena, 1, max_seq, 11, 16, 256 );
+	kv_pool_ = &internal_kv_pool_;
+	state_.k_cache = static_cast<half*>( kv_pool_->get_k_ptr( 0, 0, 0 ) );
+	state_.v_cache = static_cast<half*>( kv_pool_->get_v_ptr( 0, 0, 0 ) );
 
 	int q_lora_shape[2] = { 1, 1536 };
 	q_lora_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_lora_shape, 2 );
@@ -259,7 +257,72 @@ bool GLM53Pipeline::init(
 	engine::modules::trellis_get_workspace( rank_, 16 * 1024 * 1024 );
 	engine::modules::trellis_get_locks( rank_ );
 
+	metadata_.model_name = "glm53";
+	metadata_.hidden_size = config_.hidden_size;
+	metadata_.vocab_size = config_.vocab_size;
+	metadata_.num_layers = config_.num_layers;
+	metadata_.num_heads = 16;
+	metadata_.num_kv_heads = 16;
+	metadata_.head_dim = 256;
+	metadata_.max_seq_len = 2048;
+	metadata_.tp_size = config_.tp_size;
+
 	return true;
+}
+
+bool GLM53Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
+	return init( GLM53Config{}, device_id, arena, ring );
+}
+
+void GLM53Pipeline::set_kv_pool( engine::runtime::KVCachePool* pool ) {
+	if ( pool ) {
+		kv_pool_ = pool;
+		state_.k_cache = static_cast<half*>( kv_pool_->get_k_ptr( 0, 0, 0 ) );
+		state_.v_cache = static_cast<half*>( kv_pool_->get_v_ptr( 0, 0, 0 ) );
+	}
+}
+
+void GLM53Pipeline::embed_token( int token_id, int pos, cudaStream_t stream ) {
+	(void) pos;
+	embed_token( token_id, stream );
+}
+
+void GLM53Pipeline::forward_step( int token_id, int pos, int slot_id, cudaStream_t stream ) {
+	if ( token_id >= 0 ) {
+		embed_token( token_id, stream );
+	}
+	forward_step( hidden_states_, logits_, pos, slot_id, stream );
+}
+
+void GLM53Pipeline::forward_step( int token_id, int pos, cudaStream_t stream ) {
+	forward_step( token_id, pos, 0, stream );
+}
+
+void GLM53Pipeline::forward_batch( const int* token_ids, int batch_size, int pos, cudaStream_t stream ) {
+	if ( batch_size <= 1 ) {
+		forward_step( token_ids ? token_ids[0] : -1, pos, stream );
+		return;
+	}
+	for ( int i = 0; i < batch_size; ++i ) {
+		forward_step( token_ids ? token_ids[i] : -1, pos + i, stream );
+	}
+}
+
+pod::TensorView GLM53Pipeline::get_logits() {
+	return logits_;
+}
+
+const ModelMetadata& GLM53Pipeline::get_metadata() const {
+	return metadata_;
+}
+
+void GLM53Pipeline::reset_kv_cache( int slot_id ) {
+	if ( kv_pool_ ) {
+		kv_pool_->reset_slot( slot_id );
+	}
+	if ( slot_id == 0 ) {
+		reset_state();
+	}
 }
 
 bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
@@ -574,10 +637,15 @@ void GLM53Pipeline::forward_step(
 	const pod::TensorView& input_tokens,
 	pod::TensorView& output_logits,
 	int pos,
+	int slot_id,
 	cudaStream_t stream
 ) {
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	state_.current_pos = pos;
+	active_slot_id_ = slot_id;
+	half* slot_k = kv_pool_ ? static_cast<half*>( kv_pool_->get_k_ptr( slot_id, 0, 0 ) ) : state_.k_cache;
+	half* slot_v = kv_pool_ ? static_cast<half*>( kv_pool_->get_v_ptr( slot_id, 0, 0 ) ) : state_.v_cache;
+
 	int m = ( input_tokens.ndim >= 1 && input_tokens.shape[0] > 0 ) ? input_tokens.shape[0] : 1;
 	hidden_states_.shape[0] = m;
 	residual_.shape[0] = m;
@@ -775,13 +843,13 @@ void GLM53Pipeline::forward_step(
 
 			// Store to KV cache
 			engine::modules::MLA::store_kv_cache(
-				state_.k_cache, state_.v_cache, k_head_buf_, v_head_buf_,
+				slot_k, slot_v, k_head_buf_, v_head_buf_,
 				mla_idx, pos, 4096, 2048, stream
 			);
 
 			// Compute latent attention dot product and attend over past tokens
 			engine::modules::MLA::forward_decode(
-				q_buf_, state_.k_cache, state_.v_cache, mla_heads_out_,
+				q_buf_, slot_k, slot_v, mla_heads_out_,
 				mla_idx, pos, 16, 256, 2048, stream
 			);
 
@@ -978,6 +1046,15 @@ void GLM53Pipeline::forward_step(
 	if ( output_logits.data != nullptr ) {
 		CUDA_CHECK( cudaMemcpyAsync( output_logits.data, hidden_states_.data, config_.hidden_size * sizeof( half ), cudaMemcpyDeviceToDevice, stream ) );
 	}
+}
+
+void GLM53Pipeline::forward_step(
+	const pod::TensorView& input_tokens,
+	pod::TensorView& output_logits,
+	int pos,
+	cudaStream_t stream
+) {
+	forward_step( input_tokens, output_logits, pos, 0, stream );
 }
 
 bool GLM53Pipeline::capture_graph( int m, cudaStream_t stream ) {

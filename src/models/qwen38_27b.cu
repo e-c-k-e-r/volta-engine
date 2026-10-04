@@ -47,8 +47,7 @@ Qwen38Pipeline::Qwen38Pipeline()
 	, graph_m4_captured_{ false }
 	, graph_m8_{ nullptr }
 	, instance_m8_{ nullptr }
-	, graph_m8_captured_{ false }
-{
+	, graph_m8_captured_{ false } {
 }
 
 Qwen38Pipeline::~Qwen38Pipeline() {
@@ -86,12 +85,11 @@ bool Qwen38Pipeline::init(
 	state_.conv_history = static_cast<float*>( engine::core::arena_alloc( arena, conv_hist_floats * sizeof( float ) ) );
 	CUDA_CHECK( cudaMemset( state_.conv_history, 0, conv_hist_floats * sizeof( float ) ) );
 
-	// 3. Allocate full-attention KV cache: 16 layers x max_seq x full_kv_heads x 256 (FP16)
-	size_t cache_elems = static_cast<size_t>( config_.num_attn_layers ) * config_.max_seq * full_kv_heads * config_.full_head_dim;
-	state_.k_cache = static_cast<half*>( engine::core::arena_alloc( arena, cache_elems * sizeof( half ) ) );
-	state_.v_cache = static_cast<half*>( engine::core::arena_alloc( arena, cache_elems * sizeof( half ) ) );
-	CUDA_CHECK( cudaMemset( state_.k_cache, 0, cache_elems * sizeof( half ) ) );
-	CUDA_CHECK( cudaMemset( state_.v_cache, 0, cache_elems * sizeof( half ) ) );
+	// 3. Allocate full-attention KV cache pool: 8 slots x 16 layers x max_seq x full_kv_heads x 256 (FP16)
+	internal_kv_pool_.init( rank_, arena, 8, config_.max_seq, config_.num_attn_layers, full_kv_heads, config_.full_head_dim );
+	kv_pool_ = &internal_kv_pool_;
+	state_.k_cache = static_cast<half*>( kv_pool_->get_k_ptr( 0, 0, 0 ) );
+	state_.v_cache = static_cast<half*>( kv_pool_->get_v_ptr( 0, 0, 0 ) );
 	state_.current_pos = 0;
 
 	// 4. Hidden states & residuals (allocated with capacity for M=8 verify)
@@ -281,7 +279,72 @@ bool Qwen38Pipeline::init(
 	engine::modules::trellis_get_workspace( rank_, 16 * 1024 * 1024 );
 	engine::modules::trellis_get_locks( rank_ );
 
+	metadata_.model_name = "qwen38";
+	metadata_.hidden_size = config_.hidden_size;
+	metadata_.vocab_size = 248320;
+	metadata_.num_layers = config_.num_layers;
+	metadata_.num_heads = config_.full_num_q_heads;
+	metadata_.num_kv_heads = config_.full_num_kv_heads;
+	metadata_.head_dim = config_.full_head_dim;
+	metadata_.max_seq_len = config_.max_seq;
+	metadata_.tp_size = 4;
+
 	return true;
+}
+
+bool Qwen38Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
+	return init( Qwen38Config{}, device_id, arena, ring );
+}
+
+void Qwen38Pipeline::embed_token( int token_id, int pos, cudaStream_t stream ) {
+	(void) pos;
+	embed_token( token_id, stream );
+}
+
+void Qwen38Pipeline::set_kv_pool( engine::runtime::KVCachePool* pool ) {
+	if ( pool ) {
+		kv_pool_ = pool;
+		state_.k_cache = static_cast<half*>( kv_pool_->get_k_ptr( 0, 0, 0 ) );
+		state_.v_cache = static_cast<half*>( kv_pool_->get_v_ptr( 0, 0, 0 ) );
+	}
+}
+
+void Qwen38Pipeline::forward_step( int token_id, int pos, int slot_id, cudaStream_t stream ) {
+	if ( token_id >= 0 ) {
+		embed_token( token_id, stream );
+	}
+	forward_step( hidden_states_, logits_, pos, slot_id, stream );
+}
+
+void Qwen38Pipeline::forward_step( int token_id, int pos, cudaStream_t stream ) {
+	forward_step( token_id, pos, 0, stream );
+}
+
+void Qwen38Pipeline::forward_batch( const int* token_ids, int batch_size, int pos, cudaStream_t stream ) {
+	if ( batch_size <= 1 ) {
+		forward_step( token_ids ? token_ids[0] : -1, pos, stream );
+		return;
+	}
+	for ( int i = 0; i < batch_size; ++i ) {
+		forward_step( token_ids ? token_ids[i] : -1, pos + i, stream );
+	}
+}
+
+pod::TensorView Qwen38Pipeline::get_logits() {
+	return logits_;
+}
+
+const ModelMetadata& Qwen38Pipeline::get_metadata() const {
+	return metadata_;
+}
+
+void Qwen38Pipeline::reset_kv_cache( int slot_id ) {
+	if ( kv_pool_ ) {
+		kv_pool_->reset_slot( slot_id );
+	}
+	if ( slot_id == 0 ) {
+		reset_state();
+	}
 }
 
 bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
@@ -456,10 +519,15 @@ void Qwen38Pipeline::forward_step(
 	const pod::TensorView& input_tokens,
 	pod::TensorView& output_logits,
 	int pos,
+	int slot_id,
 	cudaStream_t stream
 ) {
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	state_.current_pos = pos;
+	active_slot_id_ = slot_id;
+	half* slot_k = kv_pool_ ? static_cast<half*>( kv_pool_->get_k_ptr( slot_id, 0, 0 ) ) : state_.k_cache;
+	half* slot_v = kv_pool_ ? static_cast<half*>( kv_pool_->get_v_ptr( slot_id, 0, 0 ) ) : state_.v_cache;
+
 	int m = ( input_tokens.ndim >= 1 && input_tokens.shape[0] > 0 ) ? input_tokens.shape[0] : 1;
 	hidden_states_.shape[0] = m;
 	residual_.shape[0] = m;
@@ -475,8 +543,8 @@ void Qwen38Pipeline::forward_step(
 			if ( is_full_attention ) {
 				engine::modules::Attention::forward_decode(
 					q_buf_,
-					state_.k_cache,
-					state_.v_cache,
+					slot_k,
+					slot_v,
 					gate_attn_buf_,
 					attn_out_,
 					layer / 4,
@@ -598,7 +666,7 @@ void Qwen38Pipeline::forward_step(
 
 			// Store K and V to KV Cache
 			engine::modules::Attention::store_kv_cache(
-				state_.k_cache, state_.v_cache,
+				slot_k, slot_v,
 				k_buf_, v_buf_,
 				full_attn_idx, pos,
 				kv_heads, config_.full_head_dim,
@@ -607,7 +675,7 @@ void Qwen38Pipeline::forward_step(
 
 			// Attend over past tokens + sigmoid gate
 			engine::modules::Attention::forward_decode(
-				q_buf_, state_.k_cache, state_.v_cache, gate_attn_buf_,
+				q_buf_, slot_k, slot_v, gate_attn_buf_,
 				attn_out_,
 				full_attn_idx, pos,
 				q_heads, kv_heads,
@@ -718,6 +786,15 @@ void Qwen38Pipeline::forward_step(
 	if ( output_logits.data != nullptr ) {
 		CUDA_CHECK( cudaMemcpyAsync( output_logits.data, hidden_states_.data, config_.hidden_size * sizeof( half ), cudaMemcpyDeviceToDevice, stream ) );
 	}
+}
+
+void Qwen38Pipeline::forward_step(
+	const pod::TensorView& input_tokens,
+	pod::TensorView& output_logits,
+	int pos,
+	cudaStream_t stream
+) {
+	forward_step( input_tokens, output_logits, pos, 0, stream );
 }
 
 bool Qwen38Pipeline::capture_graph( int m, cudaStream_t stream ) {

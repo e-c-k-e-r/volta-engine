@@ -1,6 +1,8 @@
 #pragma once
 
 #include "engine/config.h"
+#include "engine/models/model.h"
+#include "engine/runtime/kv_cache.h"
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
@@ -110,15 +112,39 @@ struct GLM53LayerWeights {
 	pod::TensorView hc_ffn_fn;
 };
 
-class GLM53Pipeline {
+class GLM53Pipeline : public ModelPipeline {
 public:
 	GLM53Pipeline();
-	~GLM53Pipeline();
+	virtual ~GLM53Pipeline() override;
 
+	// ModelPipeline interface overrides
+	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
+	bool load_weights( const char* model_dir, cudaStream_t stream = nullptr ) override;
+	void embed_token( int token_id, int pos, cudaStream_t stream = nullptr ) override;
+	void forward_step( int token_id, int pos, int slot_id, cudaStream_t stream = nullptr ) override;
+	void forward_step( int token_id, int pos, cudaStream_t stream = nullptr ) override;
+	void forward_batch( const int* token_ids, int batch_size, int pos, cudaStream_t stream = nullptr ) override;
+	int sample_next_token( cudaStream_t stream = nullptr ) override;
+	bool capture_graph( int batch_size, cudaStream_t stream = nullptr ) override;
+	void launch_graph( int batch_size, cudaStream_t stream = nullptr ) override;
+	pod::TensorView get_logits() override;
+	const ModelMetadata& get_metadata() const override;
+
+	// KV Cache Management
+	void set_kv_pool( engine::runtime::KVCachePool* pool ) override;
+	void reset_kv_cache( int slot_id = 0 ) override;
+
+	// Concrete interface
 	bool init( const GLM53Config& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
-	bool load_weights( const char* model_dir, cudaStream_t stream = nullptr );
 	void embed_token( int token_id, cudaStream_t stream = nullptr );
-	int sample_next_token( cudaStream_t stream = nullptr );
+
+	void forward_step(
+		const pod::TensorView& input_tokens,
+		pod::TensorView& output_logits,
+		int pos,
+		int slot_id = 0,
+		cudaStream_t stream = nullptr
+	);
 
 	void forward_step(
 		const pod::TensorView& input_tokens,
@@ -127,15 +153,17 @@ public:
 		cudaStream_t stream = nullptr
 	);
 
-	bool capture_graph( int m, cudaStream_t stream = nullptr );
-	void launch_graph( int m, cudaStream_t stream = nullptr );
-
 	void reset_state();
 	void destroy();
 
 	const pod::TensorView& logits() const { return logits_; }
 
 private:
+	engine::runtime::KVCachePool* kv_pool_ = nullptr;
+	engine::runtime::KVCachePool internal_kv_pool_;
+	int active_slot_id_ = 0;
+
+	ModelMetadata metadata_;
 	GLM53Config config_;
 	int rank_;
 	pod::MemoryArena* arena_;

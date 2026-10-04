@@ -33,9 +33,13 @@ set(ENGINE_CORE_SOURCES
 	src/modules/mla.cu
 	src/modules/moe.cu
 	src/modules/mhc.cu
+	src/models/model.cpp
 	src/models/qwen38_27b.cu
 	src/models/glm53_flash.cu
 	src/spec/dflash.cu
+	src/runtime/kv_cache.cpp
+	src/runtime/generator.cpp
+	src/server/config.cpp
 	src/server/server.cpp
 )
 

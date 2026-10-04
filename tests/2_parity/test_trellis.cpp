@@ -160,6 +160,7 @@ static void run_parity_test_k(
 		out_tv,
 		K,
 		mcg,
+		false,
 		stream
 	);
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
@@ -176,6 +177,7 @@ static void run_parity_test_k(
 		out_tv,
 		K,
 		mcg,
+		false,
 		stream
 	);
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
