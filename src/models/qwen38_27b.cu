@@ -329,13 +329,20 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 			                             : repo.load_linear( name_buf, *arena_, 4, stream );
 		}
 		else {
+			static constexpr int QWEN_QKV_BLOCKS[3] = { 128, 128, 384 };
+			static constexpr int QWEN_QKV_RANK_BLOCKS[3] = { 32, 32, 96 };
+			static constexpr int QWEN_CONV_CHANNELS[3] = { 2048, 2048, 6144 };
+			static constexpr int QWEN_CONV_RANK_CHANNELS[3] = { 512, 512, 1536 };
+
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_qkv", L );
-			lw.in_proj_qkv = ( tp_size == 4 ) ? repo.load_linear_qkv_qwen( name_buf, *arena_, rank_, 4, stream )
-			                                  : repo.load_linear( name_buf, *arena_, 5, stream );
+			lw.in_proj_qkv = ( tp_size == 4 )
+				? repo.load_grouped_trellis_slice( name_buf, *arena_, QWEN_QKV_BLOCKS, QWEN_QKV_RANK_BLOCKS, 3, rank_, stream )
+				: repo.load_linear( name_buf, *arena_, 5, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.conv1d.weight", L );
-			lw.conv1d_w = ( tp_size == 4 ) ? repo.load_conv1d_qwen( name_buf, *arena_, rank_, 4, stream )
-			                               : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
+			lw.conv1d_w = ( tp_size == 4 )
+				? repo.load_grouped_slice( name_buf, *arena_, QWEN_CONV_CHANNELS, QWEN_CONV_RANK_CHANNELS, 3, rank_, 0, stream )
+				: repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.A_log", L );
 			lw.A_log = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
@@ -424,18 +431,6 @@ int Qwen38Pipeline::sample_next_token( cudaStream_t stream ) {
 	);
 	CUDA_CHECK( cudaMemcpyAsync( h_argmax_idx_, d_argmax_idx_, sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
-
-	std::vector<half> h_logits( 248320 );
-	CUDA_CHECK( cudaMemcpy( h_logits.data(), logits_.data, 248320 * sizeof( half ), cudaMemcpyDeviceToHost ) );
-	std::vector<int> sorted_idx( 248320 );
-	for ( int i = 0; i < 248320; ++i ) sorted_idx[i] = i;
-	std::partial_sort( sorted_idx.begin(), sorted_idx.begin() + 5, sorted_idx.end(), [&]( int a, int b ) {
-		return __half2float( h_logits[a] ) > __half2float( h_logits[b] );
-	} );
-	std::printf( "    [QWEN TP=4 TOP-5] best=%d (logit=%f)\n", *h_argmax_idx_, __half2float( h_logits[*h_argmax_idx_] ) );
-	for ( int k = 0; k < 5; ++k ) {
-		std::printf( "       top %d: id=%d logit=%f\n", k, sorted_idx[k], __half2float( h_logits[sorted_idx[k]] ) );
-	}
 
 	return *h_argmax_idx_;
 }
@@ -689,14 +684,6 @@ void Qwen38Pipeline::forward_step(
 
 		// Residual connection: hidden_states += mlp_out
 		engine::modules::Elementwise::add_residual( hidden_states_, mlp_out_, stream );
-
-		if ( rank_ == 0 && pos == 0 && layer <= 4 ) {
-			half h_hs[4];
-			CUDA_CHECK( cudaMemcpy( h_hs, hidden_states_.data, 4 * sizeof( half ), cudaMemcpyDeviceToHost ) );
-			std::printf( "    [QWEN L%d] hidden_[0..3]: %f %f %f %f\n",
-				layer, __half2float( h_hs[0] ), __half2float( h_hs[1] ), __half2float( h_hs[2] ), __half2float( h_hs[3] ) );
-			std::fflush( stdout );
-		}
 	}
 
 	if ( output_logits.data != nullptr ) {

@@ -90,20 +90,26 @@ public:
 		cudaStream_t stream = nullptr
 	);
 
-	pod::LinearWeight load_linear_qkv_qwen(
+	pod::LinearWeight load_grouped_trellis_slice(
 		const char* base_name,
 		pod::MemoryArena& arena,
+		const int* group_channel_blocks,
+		const int* rank_channel_blocks,
+		int num_groups,
 		int rank,
-		int tp_size,
 		cudaStream_t stream = nullptr
 	);
 
-	pod::TensorView load_conv1d_qwen(
+	pod::TensorView load_grouped_slice(
 		const char* name,
 		pod::MemoryArena& arena,
+		const int* group_sizes,
+		const int* rank_sizes,
+		int num_groups,
 		int rank,
-		int tp_size,
-		cudaStream_t stream = nullptr
+		int slice_dim = 0,
+		cudaStream_t stream = nullptr,
+		pod::DType target_dtype = pod::DType::FP16
 	);
 
 	const pod::SafeTensorsFile* get_shard( int idx ) const {

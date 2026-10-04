@@ -28,102 +28,6 @@ __global__ void embed_token_kernel(
 	}
 }
 
-pod::TensorView load_qkv_trellis_glm(
-	engine::loader::SafeTensorsRepo& repo,
-	const char* name,
-	pod::MemoryArena& arena,
-	int rank,
-	cudaStream_t stream
-) {
-	int shard_idx = -1;
-	const auto* meta = repo.find( name, &shard_idx );
-	if ( !meta || shard_idx < 0 ) return pod::TensorView{};
-
-	int BK = meta->shape[0]; // 256
-	int BN = meta->shape[1]; // 1536
-	int B = meta->shape[2];  // 80
-
-	int local_BN = 384;
-	int local_shape[3] = { BK, local_BN, B };
-	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, local_shape, 3 );
-	const uint16_t* src_cpu = static_cast<const uint16_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta ) );
-	if ( src_cpu && tv.data ) {
-		std::vector<uint16_t> h_qkv( static_cast<size_t>( BK ) * local_BN * B );
-		for ( int bk = 0; bk < BK; ++bk ) {
-			const uint16_t* src_row = src_cpu + static_cast<size_t>( bk ) * ( BN * B );
-			uint16_t* dst_row = h_qkv.data() + static_cast<size_t>( bk ) * ( local_BN * B );
-
-			// Q: 128 blocks from offset rank * 128
-			std::memcpy( dst_row + 0 * B, src_row + ( rank * 128 ) * B, 128 * B * sizeof( uint16_t ) );
-			// K: 128 blocks from offset 512 + rank * 128
-			std::memcpy( dst_row + 128 * B, src_row + ( 512 + rank * 128 ) * B, 128 * B * sizeof( uint16_t ) );
-			// V: 128 blocks from offset 1024 + rank * 128
-			std::memcpy( dst_row + 256 * B, src_row + ( 1024 + rank * 128 ) * B, 128 * B * sizeof( uint16_t ) );
-		}
-		CUDA_CHECK( cudaMemcpy( tv.data, h_qkv.data(), h_qkv.size() * sizeof( uint16_t ), cudaMemcpyHostToDevice ) );
-	}
-	return tv;
-}
-
-pod::TensorView load_qkv_svh_glm(
-	engine::loader::SafeTensorsRepo& repo,
-	const char* name,
-	pod::MemoryArena& arena,
-	int rank,
-	cudaStream_t stream
-) {
-	int shard_idx = -1;
-	const auto* meta = repo.find( name, &shard_idx );
-	if ( !meta || shard_idx < 0 ) return pod::TensorView{};
-
-	int local_elems = 6144;
-	int shape[1] = { local_elems };
-	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 1 );
-	const half* src_cpu = static_cast<const half*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta ) );
-	if ( src_cpu && tv.data ) {
-		std::vector<half> h_svh( local_elems );
-		std::memcpy( h_svh.data() + 0, src_cpu + rank * 2048, 2048 * sizeof( half ) );
-		std::memcpy( h_svh.data() + 2048, src_cpu + 8192 + rank * 2048, 2048 * sizeof( half ) );
-		std::memcpy( h_svh.data() + 4096, src_cpu + 16384 + rank * 2048, 2048 * sizeof( half ) );
-		CUDA_CHECK( cudaMemcpy( tv.data, h_svh.data(), local_elems * sizeof( half ), cudaMemcpyHostToDevice ) );
-	}
-	return tv;
-}
-
-pod::TensorView load_conv1d_weights_glm(
-	engine::loader::SafeTensorsRepo& repo,
-	const char* name,
-	pod::MemoryArena& arena,
-	int rank,
-	cudaStream_t stream
-) {
-	int shard_idx = -1;
-	const auto* meta = repo.find( name, &shard_idx );
-	if ( !meta || shard_idx < 0 ) return pod::TensorView{};
-
-	int local_channels = 6144;
-	int shape[1] = { local_channels * 4 };
-	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 1 );
-	const uint16_t* src_bf16 = static_cast<const uint16_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta ) );
-	if ( src_bf16 && tv.data ) {
-		std::vector<half> h_conv( local_channels * 4 );
-		auto to_fp16 = []( uint16_t bf ) {
-			uint32_t u32 = static_cast<uint32_t>( bf ) << 16;
-			float f = *reinterpret_cast<const float*>( &u32 );
-			return __float2half_rn( f );
-		};
-		for ( int c = 0; c < 2048; ++c ) {
-			for ( int k = 0; k < 4; ++k ) {
-				h_conv[( 0 + c ) * 4 + k] = to_fp16( src_bf16[( rank * 2048 + c ) * 4 + k] );
-				h_conv[( 2048 + c ) * 4 + k] = to_fp16( src_bf16[( 8192 + rank * 2048 + c ) * 4 + k] );
-				h_conv[( 4096 + c ) * 4 + k] = to_fp16( src_bf16[( 16384 + rank * 2048 + c ) * 4 + k] );
-			}
-		}
-		CUDA_CHECK( cudaMemcpy( tv.data, h_conv.data(), h_conv.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
-	}
-	return tv;
-}
-
 pod::TensorView load_router_weights_glm(
 	engine::loader::SafeTensorsRepo& repo,
 	const char* name,
@@ -373,9 +277,13 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 
 	// 2. Per-layer weights across 45 layers
 	char name_buf[256];
-	char name_tr[256], name_suh[256], name_svh[256];
 	int experts_per_rank = config_.num_experts / config_.tp_size; // 288 / 4 = 72
 	int start_expert = rank_ * experts_per_rank;
+
+	static constexpr int GLM_QKV_BLOCKS[3] = { 512, 512, 512 };
+	static constexpr int GLM_QKV_RANK_BLOCKS[3] = { 128, 128, 128 };
+	static constexpr int GLM_CONV_CHANNELS[3] = { 8192, 8192, 8192 };
+	static constexpr int GLM_CONV_RANK_CHANNELS[3] = { 2048, 2048, 2048 };
 
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		auto& lw = layers_[L];
@@ -387,20 +295,13 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.post_attention_layernorm.weight", L );
 		lw.post_attn_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
-		std::snprintf( name_tr, sizeof( name_tr ), "model.language_model.layers.%d.self_attn.qkv_proj.trellis", L );
-		std::snprintf( name_suh, sizeof( name_suh ), "model.language_model.layers.%d.self_attn.qkv_proj.suh", L );
-		std::snprintf( name_svh, sizeof( name_svh ), "model.language_model.layers.%d.self_attn.qkv_proj.svh", L );
-
-		pod::TensorView qkv_tr = load_qkv_trellis_glm( repo, name_tr, *arena_, rank_, stream );
-		lw.is_linear_attn = ( qkv_tr.data != nullptr );
+		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.qkv_proj", L );
+		lw.qkv = repo.load_grouped_trellis_slice( name_buf, *arena_, GLM_QKV_BLOCKS, GLM_QKV_RANK_BLOCKS, 3, rank_, stream );
+		lw.is_linear_attn = lw.qkv.is_valid();
 
 		if ( lw.is_linear_attn ) {
-			pod::TensorView qkv_suh = repo.load( name_suh, *arena_, stream, pod::DType::FP16 );
-			pod::TensorView qkv_svh = load_qkv_svh_glm( repo, name_svh, *arena_, rank_, stream );
-			lw.qkv = pod::LinearWeight::make_trellis( qkv_tr, qkv_suh, qkv_svh, 5 );
-
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.conv1d.weight", L );
-			lw.conv1d_weights = load_conv1d_weights_glm( repo, name_buf, *arena_, rank_, stream );
+			lw.conv1d_weights = repo.load_grouped_slice( name_buf, *arena_, GLM_CONV_CHANNELS, GLM_CONV_RANK_CHANNELS, 3, rank_, 0, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.A_log", L );
 			lw.A_log = repo.load_slice( name_buf, *arena_, 0, rank_, config_.tp_size, stream, pod::DType::FP16 );
@@ -578,11 +479,13 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 	}
 
 	size_t bytes_after = arena_->offset_bytes;
-	std::printf( "[RANK %d] load_weights complete: missing_count=%d | arena: before=%.3f GiB, after=%.3f GiB, loaded=%.3f GiB\n",
-		rank_, missing_count,
-		bytes_before / ( 1024.0 * 1024.0 * 1024.0 ),
-		bytes_after / ( 1024.0 * 1024.0 * 1024.0 ),
-		( bytes_after - bytes_before ) / ( 1024.0 * 1024.0 * 1024.0 ) );
+	if ( missing_count > 0 || rank_ == 0 ) {
+		std::printf( "    [RANK %d] load_weights complete: missing_count=%d | arena: before=%.3f GiB, after=%.3f GiB, loaded=%.3f GiB\n",
+			rank_, missing_count,
+			bytes_before / ( 1024.0 * 1024.0 * 1024.0 ),
+			bytes_after / ( 1024.0 * 1024.0 * 1024.0 ),
+			( bytes_after - bytes_before ) / ( 1024.0 * 1024.0 * 1024.0 ) );
+	}
 
 	if ( stream ) {
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
