@@ -42,6 +42,9 @@ Qwen38Pipeline::Qwen38Pipeline()
 	, graph_m1_{ nullptr }
 	, instance_m1_{ nullptr }
 	, graph_m1_captured_{ false }
+	, graph_m4_{ nullptr }
+	, instance_m4_{ nullptr }
+	, graph_m4_captured_{ false }
 	, graph_m8_{ nullptr }
 	, instance_m8_{ nullptr }
 	, graph_m8_captured_{ false }
@@ -723,6 +726,9 @@ bool Qwen38Pipeline::capture_graph( int m, cudaStream_t stream ) {
 		pod::TensorView dummy_in = pod::make_tensor_2d( hidden_states_.data, pod::DType::FP16, 1, config_.hidden_size );
 		pod::TensorView dummy_out = pod::make_tensor_2d( residual_.data, pod::DType::FP16, 1, config_.hidden_size );
 
+		forward_step( dummy_in, dummy_out, 0, stream );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+
 		CUDA_CHECK( cudaStreamBeginCapture( stream, cudaStreamCaptureModeGlobal ) );
 		forward_step( dummy_in, dummy_out, 0, stream );
 		CUDA_CHECK( cudaStreamEndCapture( stream, &graph_m1_ ) );
@@ -730,10 +736,28 @@ bool Qwen38Pipeline::capture_graph( int m, cudaStream_t stream ) {
 		graph_m1_captured_ = true;
 		return true;
 	}
+	else if ( m == 4 ) {
+		if ( graph_m4_captured_ ) return true;
+		pod::TensorView dummy_in = pod::make_tensor_2d( hidden_states_.data, pod::DType::FP16, 4, config_.hidden_size );
+		pod::TensorView dummy_out = pod::make_tensor_2d( residual_.data, pod::DType::FP16, 4, config_.hidden_size );
+
+		forward_step( dummy_in, dummy_out, 0, stream );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+
+		CUDA_CHECK( cudaStreamBeginCapture( stream, cudaStreamCaptureModeGlobal ) );
+		forward_step( dummy_in, dummy_out, 0, stream );
+		CUDA_CHECK( cudaStreamEndCapture( stream, &graph_m4_ ) );
+		CUDA_CHECK( cudaGraphInstantiate( &instance_m4_, graph_m4_, nullptr, nullptr, 0 ) );
+		graph_m4_captured_ = true;
+		return true;
+	}
 	else if ( m == 8 ) {
 		if ( graph_m8_captured_ ) return true;
 		pod::TensorView dummy_in = pod::make_tensor_2d( hidden_states_.data, pod::DType::FP16, 8, config_.hidden_size );
 		pod::TensorView dummy_out = pod::make_tensor_2d( residual_.data, pod::DType::FP16, 8, config_.hidden_size );
+
+		forward_step( dummy_in, dummy_out, 0, stream );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 
 		CUDA_CHECK( cudaStreamBeginCapture( stream, cudaStreamCaptureModeGlobal ) );
 		forward_step( dummy_in, dummy_out, 0, stream );
@@ -749,6 +773,10 @@ void Qwen38Pipeline::launch_graph( int m, cudaStream_t stream ) {
 	if ( m == 1 ) {
 		ENGINE_ASSERT( graph_m1_captured_, "Graph M=1 not captured" );
 		CUDA_CHECK( cudaGraphLaunch( instance_m1_, stream ) );
+	}
+	else if ( m == 4 ) {
+		ENGINE_ASSERT( graph_m4_captured_, "Graph M=4 not captured" );
+		CUDA_CHECK( cudaGraphLaunch( instance_m4_, stream ) );
 	}
 	else if ( m == 8 ) {
 		ENGINE_ASSERT( graph_m8_captured_, "Graph M=8 not captured" );
@@ -799,6 +827,11 @@ void Qwen38Pipeline::destroy() {
 		cudaGraphExecDestroy( instance_m1_ );
 		cudaGraphDestroy( graph_m1_ );
 		graph_m1_captured_ = false;
+	}
+	if ( graph_m4_captured_ ) {
+		cudaGraphExecDestroy( instance_m4_ );
+		cudaGraphDestroy( graph_m4_ );
+		graph_m4_captured_ = false;
 	}
 	if ( graph_m8_captured_ ) {
 		cudaGraphExecDestroy( instance_m8_ );

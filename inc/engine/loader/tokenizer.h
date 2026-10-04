@@ -21,6 +21,7 @@ public:
 
 	// Decode a single token ID or a sequence of token IDs to text
 	std::string decode_token( int token_id ) const;
+	const std::string& decode_token_fast( int token_id ) const;
 	std::string decode( const std::vector<int>& tokens ) const;
 
 	// Special token lookup
@@ -49,6 +50,7 @@ private:
 	std::unordered_map<std::string, int> vocab_;
 	std::unordered_map<std::string, int> special_tokens_;
 	std::vector<std::string> id_to_token_;
+	std::vector<std::string> decoded_tokens_;
 	std::vector<bool> is_special_;
 
 	// Byte <-> Token mappings for BPE pretokenization

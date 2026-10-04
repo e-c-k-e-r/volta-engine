@@ -36,6 +36,7 @@ set(ENGINE_CORE_SOURCES
 	src/models/qwen38_27b.cu
 	src/models/glm53_flash.cu
 	src/spec/dflash.cu
+	src/server/server.cpp
 )
 
 file(GLOB TRELLIS_SOURCES
@@ -98,3 +99,8 @@ set_target_properties(bench_spec PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_
 add_executable(test_coherence tests/4_coherence/test_coherence.cpp)
 target_link_libraries(test_coherence PRIVATE engine_kernels)
 set_target_properties(test_coherence PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# Unified Production Server
+add_executable(volta_server src/server/main.cpp)
+target_link_libraries(volta_server PRIVATE engine_kernels pthread)
+set_target_properties(volta_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

@@ -463,6 +463,11 @@ bool Tokenizer::load( const char* model_dir ) {
 		}
 	}
 
+	decoded_tokens_.resize( id_to_token_.size() );
+	for ( size_t id = 0; id < id_to_token_.size(); ++id ) {
+		decoded_tokens_[id] = decode_token( static_cast<int>( id ) );
+	}
+
 	return true;
 }
 
@@ -599,6 +604,14 @@ std::string Tokenizer::decode_token( int token_id ) const {
 		i += len;
 	}
 	return raw;
+}
+
+const std::string& Tokenizer::decode_token_fast( int token_id ) const {
+	static const std::string empty;
+	if ( token_id < 0 || token_id >= static_cast<int>( decoded_tokens_.size() ) ) {
+		return empty;
+	}
+	return decoded_tokens_[token_id];
 }
 
 std::string Tokenizer::decode( const std::vector<int>& tokens ) const {

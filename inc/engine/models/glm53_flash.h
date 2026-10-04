@@ -206,6 +206,10 @@ private:
 	cudaGraphExec_t instance_m1_;
 	bool graph_m1_captured_;
 
+	cudaGraph_t graph_m4_;
+	cudaGraphExec_t instance_m4_;
+	bool graph_m4_captured_;
+
 	cudaGraph_t graph_m8_;
 	cudaGraphExec_t instance_m8_;
 	bool graph_m8_captured_;
