@@ -8,18 +8,21 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 set(CMAKE_CUDA_ARCHITECTURES 70)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fno-exceptions -DNO_EXCEPTIONS")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -Xcompiler -fno-exceptions -DNO_EXCEPTIONS -DEXL3_SM70_HMMA=1 -DEXL3_VOLTA=1 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 20012")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -Xcompiler -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION -DEXL3_SM70_HMMA=1 -DEXL3_VOLTA=1 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 20012")
 
 include_directories(
 	${PROJECT_SOURCE_DIR}/inc
 	${PROJECT_SOURCE_DIR}/src/kernels/trellis
+	${PROJECT_SOURCE_DIR}/deps/json/single_include
 	${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
 )
 
 set(ENGINE_CORE_SOURCES
 	src/core/arena.cpp
 	src/loader/safetensors.cpp
+	src/loader/tokenizer.cpp
+	src/loader/chat_template.cpp
 	src/comm/all_reduce_ipc.cu
 	src/kernels/nvfp4/skinny_kernels.cu
 	src/modules/norm.cu
@@ -64,6 +67,11 @@ set_target_properties(test_mhc PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BI
 add_executable(test_dflash tests/2_parity/test_dflash.cpp)
 target_link_libraries(test_dflash PRIVATE engine_kernels)
 set_target_properties(test_dflash PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# Test Tokenizer & Chat Template Parity
+add_executable(test_tokenizer tests/2_parity/test_tokenizer.cpp)
+target_link_libraries(test_tokenizer PRIVATE engine_kernels)
+set_target_properties(test_tokenizer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Microbenchmarks
 add_executable(bench_all_reduce tests/3_bench/bench_all_reduce.cpp)
