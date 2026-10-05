@@ -226,3 +226,163 @@ inline __device__ void had_fh_r_128_inner(
 
 	( (half4*) output_ptr )[t] = o;
 }
+
+// Fused op: o <- in_had(silu(out_had(g)) * out_had(u))
+inline __device__ void had_hf_r_128_guad_inner(
+	const half* __restrict__ input_ptr_g,
+	const half* __restrict__ input_ptr_u,
+	half* __restrict__ output_ptr,
+	const half* __restrict__ post_scale_g,
+	const half* __restrict__ post_scale_u,
+	const half* __restrict__ pre_scale_d,
+	const float r_scale,
+	const float act_limit,
+	const int act_function
+) {
+	int t = threadIdx.x & 31;
+
+	auto had = [&]( half4& v ) {
+		float v0 = __half2float( __low2half( v.x ) );
+		float v1 = __half2float( __high2half( v.x ) );
+		float v2 = __half2float( __low2half( v.y ) );
+		float v3 = __half2float( __high2half( v.y ) );
+		float s0 = v0 + v1;
+		float d0 = v0 - v1;
+		float s1 = v2 + v3;
+		float d1 = v2 - v3;
+		float h0 = s0 + s1;
+		float h1 = d0 + d1;
+		float h2 = s0 - s1;
+		float h3 = d0 - d1;
+
+		shuffle_had_f4x32( h0, h1, h2, h3, t );
+		v.x = __floats2half2_rn( h0 * r_scale, h1 * r_scale );
+		v.y = __floats2half2_rn( h2 * r_scale, h3 * r_scale );
+		return v;
+	};
+
+	auto _silu = [&]( const half2& x ) {
+		half2 one = __float2half2_rn( 1.0f );
+		half2 neg_x = __hneg2( x );
+		half2 e = h2exp( neg_x );
+		half2 sum = __hadd2( one, e );
+		half2 r = h2rcp( sum );
+		half2 result = __hmul2( x, r );
+		return result;
+	};
+
+	auto _gelu = [&]( const half2& x ) {
+		float2 xf = __half22float2( x );
+		const float c = 0.797884560803f;
+		xf.x = 0.5f * xf.x * ( 1.0f + tanh_opt( c * ( xf.x + 0.044715f * xf.x * xf.x * xf.x ) ) );
+		xf.y = 0.5f * xf.y * ( 1.0f + tanh_opt( c * ( xf.y + 0.044715f * xf.y * xf.y * xf.y ) ) );
+		return __float22half2_rn( xf );
+	};
+
+	half4 vg = {};
+	half4 vu = ( (half4*) input_ptr_u )[t];
+
+	vu = had( vu );
+
+	int i = blockIdx.y * 32 + t;
+	half4 scales_u = ( (half4*) post_scale_u )[i];
+	vu.x = __hmul2( vu.x, scales_u.x );
+	vu.y = __hmul2( vu.y, scales_u.y );
+
+	if ( act_function != ACT_RELU2_NOGATE ) {
+		vg = ( (half4*) input_ptr_g )[t];
+		vg = had( vg );
+		half4 scales_g = ( (half4*) post_scale_g )[i];
+		vg.x = __hmul2( vg.x, scales_g.x );
+		vg.y = __hmul2( vg.y, scales_g.y );
+	}
+
+	switch ( act_function ) {
+		case ACT_SILU: {
+			vg.x = _silu( vg.x );
+			vg.y = _silu( vg.y );
+		} break;
+		case ACT_GELU: {
+			vg.x = _gelu( vg.x );
+			vg.y = _gelu( vg.y );
+		} break;
+		case ACT_RELU2_NOGATE: {
+			vg.x = __hmax2( vu.x, __float2half2_rn( 0.0f ) );
+			vg.y = __hmax2( vu.y, __float2half2_rn( 0.0f ) );
+		} break;
+		default: break;
+	}
+
+	if ( act_limit != 0.0f ) {
+		vu.x = __hmax2( vu.x, __float2half2_rn( -act_limit ) );
+		vu.y = __hmax2( vu.y, __float2half2_rn( -act_limit ) );
+		vu.x = __hmin2( vu.x, __float2half2_rn( act_limit ) );
+		vu.y = __hmin2( vu.y, __float2half2_rn( act_limit ) );
+		vg.x = __hmin2( vg.x, __float2half2_rn( act_limit ) );
+		vg.y = __hmin2( vg.y, __float2half2_rn( act_limit ) );
+	}
+
+	vg.x = __hmul2( vg.x, vu.x );
+	vg.y = __hmul2( vg.y, vu.y );
+
+	half4 scales_d = ( (half4*) pre_scale_d )[i];
+	vg.x = __hmul2( vg.x, scales_d.x );
+	vg.y = __hmul2( vg.y, scales_d.y );
+
+	vg = had( vg );
+
+	( (half4*) output_ptr )[t] = vg;
+}
+
+inline __device__ void had_hf_r_128_d_inner(
+	const half* __restrict__ input_ptr,
+	half* __restrict__ output_ptr,
+	const half* __restrict__ post_scale,
+	const float r_scale
+) {
+	int t = threadIdx.x & 31;
+
+	half4 v = ( (half4*) input_ptr )[t];
+
+	float v0 = __half2float( __low2half( v.x ) );
+	float v1 = __half2float( __high2half( v.x ) );
+	float v2 = __half2float( __low2half( v.y ) );
+	float v3 = __half2float( __high2half( v.y ) );
+	float s0 = v0 + v1;
+	float d0 = v0 - v1;
+	float s1 = v2 + v3;
+	float d1 = v2 - v3;
+	float h0 = s0 + s1;
+	float h1 = d0 + d1;
+	float h2 = s0 - s1;
+	float h3 = d0 - d1;
+
+	shuffle_had_f4x32( h0, h1, h2, h3, t );
+	h0 *= r_scale;
+	h1 *= r_scale;
+	h2 *= r_scale;
+	h3 *= r_scale;
+
+	int i = blockIdx.y * 32 + t;
+	half4 scales = ( (half4*) post_scale )[i];
+	h0 *= __low2float( scales.x );
+	h1 *= __high2float( scales.x );
+	h2 *= __low2float( scales.y );
+	h3 *= __high2float( scales.y );
+
+	extern __shared__ float temp_shared[];
+	int warp_id = threadIdx.x / 32;
+	float* sh = temp_shared + warp_id * 128;
+	sh[t * 4 + 0] = h0;
+	sh[t * 4 + 1] = h1;
+	sh[t * 4 + 2] = h2;
+	sh[t * 4 + 3] = h3;
+	__syncwarp();
+
+	half2 o01 = __floats2half2_rn( sh[t * 2 + 0], sh[t * 2 + 1] );
+	half2 o23 = __floats2half2_rn( sh[64 + t * 2 + 0], sh[64 + t * 2 + 1] );
+
+	half2* out_h2 = reinterpret_cast<half2*>( output_ptr );
+	atomicAdd( out_h2 + t, o01 );
+	atomicAdd( out_h2 + 32 + t, o23 );
+}

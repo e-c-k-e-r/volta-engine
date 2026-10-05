@@ -19,3 +19,5 @@ void exl3_gemm(
 	bool c_fp32 = false,
 	cudaStream_t stream = nullptr
 );
+
+void exl3_gemm_init_all_attrs( int device );

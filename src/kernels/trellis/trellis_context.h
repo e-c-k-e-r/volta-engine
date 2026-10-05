@@ -9,6 +9,7 @@
 #define MAX_TILES_C (1024 * 1024)
 #define MAX_BARRIERS 1024
 #define BARRIER_LOCKS_OFFSET MAX_TILES_C
+#define MOE_SCHED_OFFSET (MAX_TILES_C + 2 * MAX_BARRIERS)
 
 namespace engine::modules {
 

@@ -43,6 +43,11 @@ struct GLM53State {
 	int32_t* block_table;
 	int* d_topk_indices;
 	half* d_topk_weights;
+	int64_t* expert_count;
+	int64_t* token_sorted;
+	half* weight_sorted;
+	int* cursors;
+	int4* d_active_experts;
 	int current_pos;
 };
 
@@ -97,6 +102,7 @@ struct GLM53LayerWeights {
 
 	// 72 local experts for this rank: rank * 72 .. (rank + 1) * 72 - 1
 	GLM53ExpertWeights experts[72];
+	pod::MoELayerWeights moe_weights;
 
 	// Shared expert
 	bool has_shared_expert = false;
@@ -216,6 +222,10 @@ private:
 	pod::TensorView moe_expert_out_;
 	pod::TensorView local_moe_out_;
 	pod::TensorView ffn_out_;
+	half* temp_state_g_ = nullptr;
+	half* temp_state_u_ = nullptr;
+	half* temp_interm_g_ = nullptr;
+	half* temp_interm_u_ = nullptr;
 
 	// Fallback dummy descriptors
 	pod::LinearWeight dummy_linear_;

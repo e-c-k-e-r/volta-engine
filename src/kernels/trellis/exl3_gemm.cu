@@ -11,6 +11,30 @@ namespace cg = cooperative_groups;
 
 static std::set<void*> g_gemm_attr_set[ENGINE_NUM_GPUS];
 
+void exl3_gemm_init_all_attrs( int device ) {
+	if ( device < 0 || device >= ENGINE_NUM_GPUS ) device = 0;
+	int orig_dev = 0;
+	cudaGetDevice( &orig_dev );
+	cudaSetDevice( device );
+	for ( int K = 1; K <= 8; ++K ) {
+		for ( int cb = 0; cb <= 2; ++cb ) {
+			for ( int shape_idx = 1; shape_idx <= 4; ++shape_idx ) {
+				fp_exl3_gemm_kernel k_fp16 = get_gemm_kernel_ptr( K, shape_idx, false, cb );
+				if ( k_fp16 && g_gemm_attr_set[device].find( (void*) k_fp16 ) == g_gemm_attr_set[device].end() ) {
+					cudaFuncSetAttribute( (void*) k_fp16, cudaFuncAttributeMaxDynamicSharedMemorySize, ENGINE_MAX_SMEM );
+					g_gemm_attr_set[device].insert( (void*) k_fp16 );
+				}
+				fp_exl3_gemm_kernel k_fp32 = get_gemm_kernel_ptr( K, shape_idx, true, cb );
+				if ( k_fp32 && g_gemm_attr_set[device].find( (void*) k_fp32 ) == g_gemm_attr_set[device].end() ) {
+					cudaFuncSetAttribute( (void*) k_fp32, cudaFuncAttributeMaxDynamicSharedMemorySize, ENGINE_MAX_SMEM );
+					g_gemm_attr_set[device].insert( (void*) k_fp32 );
+				}
+			}
+		}
+	}
+	cudaSetDevice( orig_dev );
+}
+
 void exl3_gemm(
 	const half* A,
 	const uint16_t* B,

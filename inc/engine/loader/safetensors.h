@@ -90,6 +90,17 @@ public:
 		cudaStream_t stream = nullptr
 	);
 
+	pod::LinearWeight load_linear_slice_fused(
+		const char* base_name_a,
+		const char* base_name_b,
+		pod::MemoryArena& arena,
+		int bits,
+		int slice_dim,
+		int rank,
+		int tp_size,
+		cudaStream_t stream = nullptr
+	);
+
 	pod::LinearWeight load_grouped_trellis_slice(
 		const char* base_name,
 		pod::MemoryArena& arena,

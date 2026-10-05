@@ -15,6 +15,13 @@ struct SwiGLU {
 		cudaStream_t stream = nullptr,
 		float limit = 0.0f
 	);
+
+	static void forward_fused(
+		const pod::TensorView& gate_up,
+		pod::TensorView& out,
+		cudaStream_t stream = nullptr,
+		float limit = 0.0f
+	);
 };
 
 } // namespace engine::modules

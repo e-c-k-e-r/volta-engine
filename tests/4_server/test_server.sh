@@ -6,7 +6,8 @@ echo "========================================================"
 echo "   VOLTA ENGINE: INTEGRATION TEST SUITE (PHASE 4)       "
 echo "========================================================"
 
-SERVER_BIN="./build/volta_server"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SERVER_BIN="$DIR/build/volta_server"
 SERVER_LOG="/tmp/volta_server_test.log"
 PORT=8000
 HOST="127.0.0.1"

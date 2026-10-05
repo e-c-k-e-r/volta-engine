@@ -82,6 +82,7 @@ struct Qwen38LayerWeights {
 	// MLP weights
 	pod::LinearWeight gate_proj;
 	pod::LinearWeight up_proj;
+	pod::LinearWeight gate_up_proj;
 	pod::LinearWeight down_proj;
 };
 
@@ -180,6 +181,7 @@ private:
 	// MLP buffers
 	pod::TensorView gate_buf_;
 	pod::TensorView up_buf_;
+	pod::TensorView gate_up_buf_;
 	pod::TensorView mlp_inter_;
 	pod::TensorView mlp_out_;
 

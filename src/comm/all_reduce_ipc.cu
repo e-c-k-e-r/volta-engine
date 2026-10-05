@@ -32,7 +32,9 @@ void all_reduce_rms_norm_4ring_kernel(
 	half* __restrict__ residual,
 	const half* __restrict__ weight,
 	int hidden_size,
-	float eps
+	float eps,
+	float constant_bias = 1.0f,
+	half* __restrict__ out = nullptr
 ) {
 	int row = blockIdx.x;
 	size_t row_elems = static_cast<size_t>( hidden_size );
@@ -144,7 +146,8 @@ void all_reduce_rms_norm_4ring_kernel(
 
 	float inv_rms = s_block_sum_sq;
 
-	// Step 5: normalize residual with weight and write to X
+	// Step 5: normalize residual with weight and write to out (or x if out is null)
+	half* dst_row = ( out != nullptr ) ? ( out + row * row_elems ) : row_x;
 	for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) {
 		uint4 vr = *( (const uint4*) ( row_res + i * 8 ) );
 		uint4 vw = *( (const uint4*) ( weight + i * 8 ) );
@@ -155,11 +158,11 @@ void all_reduce_rms_norm_4ring_kernel(
 		#pragma unroll
 		for ( int k = 0; k < 8; ++k ) {
 			float r_val = __half2float( hr[k] );
-			float w_val = __half2float( hw[k] );
+			float w_val = ( weight != nullptr ) ? ( __half2float( hw[k] ) + constant_bias ) : 1.0f;
 			hx[k] = __float2half_rn( r_val * w_val * inv_rms );
 		}
 
-		*( (uint4*) ( row_x + i * 8 ) ) = *reinterpret_cast<uint4*>( hx );
+		*( (uint4*) ( dst_row + i * 8 ) ) = *reinterpret_cast<uint4*>( hx );
 	}
 }
 
@@ -257,7 +260,9 @@ void CollectiveRing::all_reduce_rms_norm(
 	pod::TensorView& residual,
 	const pod::TensorView& weight,
 	float eps,
-	cudaStream_t stream
+	cudaStream_t stream,
+	float constant_bias,
+	pod::TensorView* out
 ) {
 	int rows = x.shape[0];
 	int hidden_size = x.shape[1];
@@ -268,6 +273,7 @@ void CollectiveRing::all_reduce_rms_norm(
 	half* x_ptr = x.ptr<half>();
 	half* res_ptr = residual.ptr<half>();
 	const half* w_ptr = weight.ptr<const half>();
+	half* out_ptr = ( out != nullptr ) ? out->ptr<half>() : nullptr;
 
 	all_reduce_rms_norm_4ring_kernel<<<dim3( rows ), dim3( 512 ), 0, stream>>>(
 		rank,
@@ -284,7 +290,9 @@ void CollectiveRing::all_reduce_rms_norm(
 		res_ptr,
 		w_ptr,
 		hidden_size,
-		eps
+		eps,
+		constant_bias,
+		out_ptr
 	);
 }
 

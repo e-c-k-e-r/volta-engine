@@ -840,6 +840,109 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 	}
 }
 
+pod::LinearWeight SafeTensorsRepo::load_linear_slice_fused(
+	const char* base_name_a,
+	const char* base_name_b,
+	pod::MemoryArena& arena,
+	int bits,
+	int slice_dim,
+	int rank,
+	int tp_size,
+	cudaStream_t stream
+) {
+	char name_buf_a[512];
+	char name_buf_b[512];
+	std::snprintf( name_buf_a, sizeof( name_buf_a ), "%s.trellis", base_name_a );
+	std::snprintf( name_buf_b, sizeof( name_buf_b ), "%s.trellis", base_name_b );
+
+	int shard_a = -1, shard_b = -1;
+	const auto* meta_a = find( name_buf_a, &shard_a );
+	const auto* meta_b = find( name_buf_b, &shard_b );
+	if ( !meta_a || !meta_b || shard_a < 0 || shard_b < 0 ) {
+		return pod::LinearWeight{};
+	}
+
+	ENGINE_ASSERT( meta_a->ndim == 3 && meta_b->ndim == 3, "Trellis tensor must be 3D" );
+	ENGINE_ASSERT( meta_a->shape[0] == meta_b->shape[0], "K dimension must match" );
+	ENGINE_ASSERT( meta_a->shape[2] == meta_b->shape[2], "B dimension must match" );
+
+	int BK = meta_a->shape[0];
+	int BN_a = meta_a->shape[1];
+	int BN_b = meta_b->shape[1];
+	int B = meta_a->shape[2];
+
+	int local_BN_a = BN_a / tp_size;
+	int local_BN_b = BN_b / tp_size;
+	int local_BN_fused = local_BN_a + local_BN_b;
+
+	int fused_shape[3] = { BK, local_BN_fused, B };
+	pod::TensorView tr = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, fused_shape, 3 );
+	if ( !tr.data ) {
+		return pod::LinearWeight{};
+	}
+
+	const void* src_cpu_a = safetensors_get_data_cpu( shards_[shard_a], meta_a );
+	const void* src_cpu_b = safetensors_get_data_cpu( shards_[shard_b], meta_b );
+	ENGINE_ASSERT( src_cpu_a && src_cpu_b, "Failed to get CPU data for trellis tensors" );
+
+	const uint16_t* u16_a = static_cast<const uint16_t*>( src_cpu_a );
+	const uint16_t* u16_b = static_cast<const uint16_t*>( src_cpu_b );
+
+	size_t total_fused_elems = static_cast<size_t>( BK ) * local_BN_fused * B;
+	std::vector<uint16_t> h_fused( total_fused_elems );
+
+	size_t chunk_a_elems = static_cast<size_t>( local_BN_a ) * B;
+	size_t chunk_b_elems = static_cast<size_t>( local_BN_b ) * B;
+	size_t chunk_fused_elems = static_cast<size_t>( local_BN_fused ) * B;
+
+	for ( int k = 0; k < BK; ++k ) {
+		const uint16_t* src_ak = u16_a + ( static_cast<size_t>( k ) * BN_a + rank * local_BN_a ) * B;
+		const uint16_t* src_bk = u16_b + ( static_cast<size_t>( k ) * BN_b + rank * local_BN_b ) * B;
+		uint16_t* dst_k = h_fused.data() + static_cast<size_t>( k ) * chunk_fused_elems;
+
+		std::memcpy( dst_k, src_ak, chunk_a_elems * sizeof( uint16_t ) );
+		std::memcpy( dst_k + chunk_a_elems, src_bk, chunk_b_elems * sizeof( uint16_t ) );
+	}
+
+	CUDA_CHECK( cudaMemcpyAsync( tr.data, h_fused.data(), total_fused_elems * sizeof( uint16_t ), cudaMemcpyHostToDevice, stream ) );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+
+	std::snprintf( name_buf_a, sizeof( name_buf_a ), "%s.suh", base_name_a );
+	pod::TensorView suh = load( name_buf_a, arena, stream, pod::DType::FP16 );
+
+	std::snprintf( name_buf_a, sizeof( name_buf_a ), "%s.svh", base_name_a );
+	std::snprintf( name_buf_b, sizeof( name_buf_b ), "%s.svh", base_name_b );
+
+	int svh_shard_a = -1, svh_shard_b = -1;
+	const auto* meta_svh_a = find( name_buf_a, &svh_shard_a );
+	const auto* meta_svh_b = find( name_buf_b, &svh_shard_b );
+	ENGINE_ASSERT( meta_svh_a && meta_svh_b, "svh metadata missing" );
+
+	int local_N_a = meta_svh_a->shape[0] / tp_size;
+	int local_N_b = meta_svh_b->shape[0] / tp_size;
+	int local_N_fused = local_N_a + local_N_b;
+
+	int svh_shape[1] = { local_N_fused };
+	pod::TensorView svh = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_shape, 1 );
+
+	const void* src_svh_a = safetensors_get_data_cpu( shards_[svh_shard_a], meta_svh_a );
+	const void* src_svh_b = safetensors_get_data_cpu( shards_[svh_shard_b], meta_svh_b );
+	ENGINE_ASSERT( src_svh_a && src_svh_b, "Failed to get CPU data for svh tensors" );
+
+	const half* h_svh_a = static_cast<const half*>( src_svh_a ) + rank * local_N_a;
+	const half* h_svh_b = static_cast<const half*>( src_svh_b ) + rank * local_N_b;
+
+	std::vector<half> h_svh_fused( local_N_fused );
+	std::memcpy( h_svh_fused.data(), h_svh_a, local_N_a * sizeof( half ) );
+	std::memcpy( h_svh_fused.data() + local_N_a, h_svh_b, local_N_b * sizeof( half ) );
+
+	CUDA_CHECK( cudaMemcpyAsync( svh.data, h_svh_fused.data(), local_N_fused * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+
+	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( tr.shape[2] / 16 ) : bits;
+	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits );
+}
+
 pod::LinearWeight SafeTensorsRepo::load_grouped_trellis_slice(
 	const char* base_name,
 	pod::MemoryArena& arena,

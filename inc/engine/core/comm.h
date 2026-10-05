@@ -21,7 +21,9 @@ struct CollectiveRing {
 		pod::TensorView& residual,
 		const pod::TensorView& weight,
 		float eps,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		float constant_bias = 1.0f,
+		pod::TensorView* out = nullptr
 	);
 
 	void all_reduce(

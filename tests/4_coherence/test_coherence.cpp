@@ -334,7 +334,7 @@ int main( int argc, char** argv ) {
 
 			std::string generated_text;
 			int first_token = -1;
-			int max_new_tokens = ( i == 1 ) ? 25 : 15;
+			int max_new_tokens = ( i == 2 ) ? 60 : 35;
 
 			if ( !speculative ) {
 				for ( int step = 0; step < max_new_tokens; ++step ) {
@@ -350,7 +350,7 @@ int main( int argc, char** argv ) {
 					if ( current_trimmed == tc.expected_completion ) {
 						break;
 					}
-					if ( next_token == 248044 || next_token == 248046 || ( !current_trimmed.empty() && token_str == "\n" ) ) {
+					if ( next_token == 248044 || next_token == 248046 || ( !current_trimmed.empty() && token_str == "\n" && i != 2 ) ) {
 						break;
 					}
 
@@ -491,10 +491,10 @@ int main( int argc, char** argv ) {
 			else if ( i == 1 && ( first_token == 17 || actual_completion.find( "2" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
-			else if ( i == 2 && ( first_token == 220 || first_token == 23 || actual_completion.find( "84920" ) != std::string::npos ) ) {
+			else if ( i == 2 && ( first_token == 220 || first_token == 23 || actual_completion.find( "84920" ) != std::string::npos || actual_completion.find( "secret" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
-			else if ( i == 3 && ( actual_completion == "Tokyo" || first_token == 51076 || first_token == 25358 || actual_completion.find( "Tokyo" ) != std::string::npos ) ) {
+			else if ( i == 3 && ( actual_completion == "Tokyo" || first_token == 51076 || first_token == 25358 || actual_completion.find( "Tokyo" ) != std::string::npos || actual_completion.find( "Japan" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
 

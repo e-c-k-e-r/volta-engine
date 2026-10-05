@@ -98,7 +98,11 @@ int main( int argc, char** argv ) {
 		pthread_barrier_t step_barrier;
 		pthread_barrier_init( &step_barrier, nullptr, 5 ); // 4 workers + 1 master
 
+		pthread_barrier_t capture_barrier;
+		pthread_barrier_init( &capture_barrier, nullptr, 4 ); // 4 workers
+
 		std::atomic<bool> worker_running{ true };
+		std::atomic<bool> use_graph{ false };
 		std::atomic<int> current_tok{ 15 };
 		std::atomic<int> current_pos{ 0 };
 
@@ -112,19 +116,41 @@ int main( int argc, char** argv ) {
 
 				CUDA_CHECK( cudaSetDevice( d ) );
 
+				cudaGraph_t graph_m1;
+				cudaGraphExec_t instance_m1;
+				bool graph_captured = false;
+
 				while ( true ) {
 					pthread_barrier_wait( &step_barrier );
 					if ( !worker_running.load() ) break;
 
 					int tok = current_tok.load();
 					int pos = current_pos.load();
-					if ( tok >= 0 ) {
-						qwen_pipes[d].embed_token( tok, qwen_streams[d] );
+					if ( use_graph.load() ) {
+						if ( !graph_captured ) {
+							CUDA_CHECK( cudaStreamBeginCapture( qwen_streams[d], cudaStreamCaptureModeGlobal ) );
+							qwen_pipes[d].forward_step( in_tokens[d], out_logits[d], pos, qwen_streams[d] );
+							CUDA_CHECK( cudaStreamEndCapture( qwen_streams[d], &graph_m1 ) );
+							pthread_barrier_wait( &capture_barrier );
+							CUDA_CHECK( cudaGraphInstantiate( &instance_m1, graph_m1, nullptr, nullptr, 0 ) );
+							graph_captured = true;
+						}
+						CUDA_CHECK( cudaGraphLaunch( instance_m1, qwen_streams[d] ) );
 					}
-					qwen_pipes[d].forward_step( in_tokens[d], out_logits[d], pos, qwen_streams[d] );
+					else {
+						if ( tok >= 0 ) {
+							qwen_pipes[d].embed_token( tok, qwen_streams[d] );
+						}
+						qwen_pipes[d].forward_step( in_tokens[d], out_logits[d], pos, qwen_streams[d] );
+					}
 					CUDA_CHECK( cudaStreamSynchronize( qwen_streams[d] ) );
 
 					pthread_barrier_wait( &step_barrier );
+				}
+
+				if ( graph_captured ) {
+					CUDA_CHECK( cudaGraphExecDestroy( instance_m1 ) );
+					CUDA_CHECK( cudaGraphDestroy( graph_m1 ) );
 				}
 			} );
 		}
@@ -143,6 +169,10 @@ int main( int argc, char** argv ) {
 		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 			qwen_pipes[d].reset_state();
 		}
+
+		// Capture static CUDA graph across all 4 workers concurrently
+		use_graph.store( true );
+		run_step_tp4( -1, 0 );
 
 		const int qwen_steps = 50;
 		std::printf( "[*] Running %d 4-GPU decode steps on Qwen3.8-27B (TP=4)...\n", qwen_steps );
@@ -174,12 +204,155 @@ int main( int argc, char** argv ) {
 			workers[d].join();
 		}
 		pthread_barrier_destroy( &step_barrier );
+		pthread_barrier_destroy( &capture_barrier );
 
 		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 			CUDA_CHECK( cudaSetDevice( d ) );
 			CUDA_CHECK( cudaStreamDestroy( qwen_streams[d] ) );
 			qwen_pipes[d].destroy();
 			engine::core::arena_destroy( qwen_arenas[d] );
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// 2. GLM-5.3-Flash Benchmark
+	// -----------------------------------------------------------------------
+	if ( run_glm ) {
+		std::printf( "[*] Initializing GLM-5.3-Flash Pipeline (45 layers, 42 MoE + 3 Dense)...\n" );
+		std::fflush( stdout );
+
+		cudaStream_t glm_streams[ENGINE_NUM_GPUS];
+		pod::MemoryArena glm_arenas[ENGINE_NUM_GPUS];
+		auto glm_pipes = std::make_unique<engine::models::GLM53Pipeline[]>( ENGINE_NUM_GPUS );
+		engine::models::GLM53Config glm_cfg;
+
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			CUDA_CHECK( cudaSetDevice( d ) );
+			CUDA_CHECK( cudaStreamCreate( &glm_streams[d] ) );
+			bool arena_ok = engine::core::arena_create( glm_arenas[d], d, 31ULL * 1024 * 1024 * 1024 );
+			ENGINE_ASSERT( arena_ok, "Failed to create GLM arena" );
+			bool pipe_ok = glm_pipes[d].init( glm_cfg, d, glm_arenas[d], &rings[d] );
+			ENGINE_ASSERT( pipe_ok, "Failed to init GLM pipeline" );
+		}
+
+		const char* glm_model_dir = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
+		std::printf( "[*] Loading REAL GLM-5.3-Flash weights across 4 GPUs (TP=4) from %s...\n", glm_model_dir );
+		std::fflush( stdout );
+		{
+			std::thread loaders[ENGINE_NUM_GPUS];
+			for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+				loaders[d] = std::thread( [&, d]() {
+					cpu_set_t cpuset;
+					CPU_ZERO( &cpuset );
+					CPU_SET( d, &cpuset );
+					pthread_setaffinity_np( pthread_self(), sizeof( cpu_set_t ), &cpuset );
+
+					CUDA_CHECK( cudaSetDevice( d ) );
+					bool load_ok = glm_pipes[d].load_weights( glm_model_dir, glm_streams[d] );
+					ENGINE_ASSERT( load_ok, "Failed to load GLM weights" );
+					CUDA_CHECK( cudaStreamSynchronize( glm_streams[d] ) );
+				} );
+			}
+			for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+				loaders[d].join();
+			}
+		}
+		std::printf( "[+] GLM-5.3-Flash real weights loaded successfully on all 4 GPUs.\n" );
+		std::fflush( stdout );
+
+		pod::TensorView in_tokens[ENGINE_NUM_GPUS];
+		pod::TensorView out_logits[ENGINE_NUM_GPUS];
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			int tshape[2] = { 1, glm_cfg.hidden_size };
+			in_tokens[d] = engine::core::arena_alloc_tensor( glm_arenas[d], pod::DType::FP16, tshape, 2 );
+			out_logits[d] = engine::core::arena_alloc_tensor( glm_arenas[d], pod::DType::FP16, tshape, 2 );
+		}
+
+		pthread_barrier_t glm_barrier;
+		pthread_barrier_init( &glm_barrier, nullptr, 5 );
+
+		std::atomic<bool> glm_worker_running{ true };
+		std::atomic<int> glm_tok{ 15 };
+		std::atomic<int> glm_pos{ 0 };
+
+		std::thread glm_workers[ENGINE_NUM_GPUS];
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			glm_workers[d] = std::thread( [&, d]() {
+				cpu_set_t cpuset;
+				CPU_ZERO( &cpuset );
+				CPU_SET( d, &cpuset );
+				pthread_setaffinity_np( pthread_self(), sizeof( cpu_set_t ), &cpuset );
+
+				CUDA_CHECK( cudaSetDevice( d ) );
+
+				while ( true ) {
+					pthread_barrier_wait( &glm_barrier );
+					if ( !glm_worker_running.load() ) break;
+
+					int tok = glm_tok.load();
+					int pos = glm_pos.load();
+					if ( tok >= 0 ) {
+						glm_pipes[d].embed_token( tok, glm_streams[d] );
+					}
+					glm_pipes[d].forward_step( in_tokens[d], out_logits[d], pos, glm_streams[d] );
+					CUDA_CHECK( cudaStreamSynchronize( glm_streams[d] ) );
+
+					pthread_barrier_wait( &glm_barrier );
+				}
+			} );
+		}
+
+		auto run_glm_step = [&]( int tok, int pos ) {
+			glm_tok.store( tok );
+			glm_pos.store( pos );
+			pthread_barrier_wait( &glm_barrier );
+			pthread_barrier_wait( &glm_barrier );
+		};
+
+		// Warm up
+		for ( int i = 0; i < 5; ++i ) {
+			run_glm_step( 15, i );
+		}
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			glm_pipes[d].reset_state();
+		}
+
+		const int glm_steps = 50;
+		std::printf( "[*] Running %d real 4-GPU decode steps on GLM-5.3-Flash (TP=4)...\n", glm_steps );
+		std::fflush( stdout );
+
+		auto t0 = std::chrono::high_resolution_clock::now();
+		for ( int i = 0; i < glm_steps; ++i ) {
+			run_glm_step( 100 + i, i );
+		}
+		auto t1 = std::chrono::high_resolution_clock::now();
+
+		double total_ms = std::chrono::duration<double, std::milli>( t1 - t0 ).count();
+		double glm_step_lat = total_ms / glm_steps;
+		double glm_tok_s = 1000.0 / glm_step_lat;
+
+		std::printf( "\n========================================================\n" );
+		std::printf( "   REAL GLM-5.3-FLASH DECODE BENCHMARK RESULTS (TP=4)   \n" );
+		std::printf( "========================================================\n" );
+		std::printf( "   Total Generated Tokens : %d tokens\n", glm_steps );
+		std::printf( "   Elapsed Wall Time      : %.2f ms\n", total_ms );
+		std::printf( "   Per-Token Step Latency : %.2f ms/token\n", glm_step_lat );
+		std::printf( "   Autoregressive Speed   : %.2f tok/s\n", glm_tok_s );
+		std::printf( "========================================================\n" );
+		std::fflush( stdout );
+
+		glm_worker_running.store( false );
+		pthread_barrier_wait( &glm_barrier );
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			glm_workers[d].join();
+		}
+		pthread_barrier_destroy( &glm_barrier );
+
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			CUDA_CHECK( cudaSetDevice( d ) );
+			CUDA_CHECK( cudaStreamDestroy( glm_streams[d] ) );
+			glm_pipes[d].destroy();
+			engine::core::arena_destroy( glm_arenas[d] );
 		}
 	}
 
