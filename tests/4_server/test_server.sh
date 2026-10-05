@@ -13,6 +13,8 @@ PORT=8000
 HOST="127.0.0.1"
 MODEL_DIR="/home/mrq/Documents/models/Qwen3.8-27B-exl3"
 
+DRAFT_DIR="/home/mrq/Documents/models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw"
+
 if [ ! -f "$SERVER_BIN" ]; then
 	echo "[-] FATAL: Server binary $SERVER_BIN not found! Build it first."
 	exit 1
@@ -20,8 +22,8 @@ fi
 
 rm -f "$SERVER_LOG"
 
-echo "[*] Launching volta_server detached under taskset -c 0-9..."
-taskset -c 0-9 "$SERVER_BIN" --port "$PORT" --host "$HOST" --load-weights --model-dir "$MODEL_DIR" > "$SERVER_LOG" 2>&1 &
+echo "[*] Launching volta_server detached under taskset -c 0-9 (speculative enabled)..."
+taskset -c 0-9 "$SERVER_BIN" --port "$PORT" --host "$HOST" --load-weights --model-dir "$MODEL_DIR" --use-speculation --draft-model-dir "$DRAFT_DIR" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 cleanup() {

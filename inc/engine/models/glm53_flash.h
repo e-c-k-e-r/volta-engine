@@ -165,7 +165,8 @@ public:
 	void reset_state();
 	void destroy();
 
-	const pod::TensorView& logits() const { return logits_; }
+	pod::TensorView& logits() override { return logits_; }
+	const pod::TensorView& logits() const override { return logits_; }
 
 private:
 	engine::runtime::KVCachePool* kv_pool_ = nullptr;

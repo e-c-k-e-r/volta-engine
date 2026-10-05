@@ -121,6 +121,7 @@ private:
 		int last_token = -1;
 		bool prefill_done = false;
 		std::string accumulated_text;
+		std::vector<int> all_tokens;
 		SlotMetrics metrics;
 	};
 

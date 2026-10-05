@@ -5,6 +5,7 @@
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <string>
 #include <memory>
 
@@ -49,6 +50,15 @@ public:
 
 	// Descriptors & Buffers
 	virtual pod::TensorView get_logits() = 0;
+	virtual pod::TensorView& logits() = 0;
+	virtual const pod::TensorView& logits() const = 0;
+	virtual half* tapped_states( int row = 0 ) { (void) row; return nullptr; }
+	virtual const half* tapped_states( int row = 0 ) const { (void) row; return nullptr; }
+	virtual void checkpoint_state( cudaStream_t stream = nullptr ) { (void) stream; }
+	virtual void rollback_state( cudaStream_t stream = nullptr ) { (void) stream; }
+	virtual void sample_next_tokens( int* preds, int count, cudaStream_t stream = nullptr ) {
+		for ( int i = 0; i < count; ++i ) preds[i] = sample_next_token( stream );
+	}
 	virtual const ModelMetadata& get_metadata() const = 0;
 
 	// KV Cache Management

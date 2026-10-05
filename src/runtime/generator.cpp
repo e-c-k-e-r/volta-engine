@@ -261,6 +261,7 @@ void Generator::scheduler_loop() {
 			slot.last_token = -1;
 			slot.prefill_done = false;
 			slot.accumulated_text.clear();
+			slot.all_tokens = slot.req.prompt_tokens;
 			slot.metrics.start_time = std::chrono::steady_clock::now();
 		}
 		lock.unlock();
@@ -315,6 +316,7 @@ void Generator::step_batch() {
 			double ttft = std::chrono::duration<double, std::milli>( slot.metrics.first_token_time - slot.metrics.start_time ).count();
 			slot.metrics.prompt_tokens = static_cast<int>( slot.req.prompt_tokens.size() );
 			slot.metrics.prefill_tok_s = ( ttft > 0.0 ) ? static_cast<float>( slot.metrics.prompt_tokens / ( ttft / 1000.0 ) ) : 0.0f;
+			slot.all_tokens.push_back( slot.last_token );
 		}
 	}
 
@@ -392,7 +394,110 @@ void Generator::step_batch() {
 		return;
 	}
 
-	if ( rem_count == 1 ) {
+	if ( rem_count == 1 && config_.use_speculation ) {
+		int s_idx = rem_slots[0];
+		Slot& slot = slots_[s_idx];
+
+		// 1. Propose K=7 draft tokens from anchor slot.last_token at slot.current_pos
+		speculator_.draft(
+			slot.last_token, slot.current_pos, streams_[0],
+			models_[0]->logits().ptr<const half>(),
+			slot.all_tokens.data(), static_cast<int>( slot.all_tokens.size() ),
+			models_[0]->tapped_states()
+		);
+
+		int h_draft[8];
+		float h_conf[8];
+		CUDA_CHECK( cudaMemcpyAsync( h_draft, speculator_.d_draft_tokens(), 8 * sizeof( int ), cudaMemcpyDeviceToHost, streams_[0] ) );
+		CUDA_CHECK( cudaMemcpyAsync( h_conf, speculator_.d_conf(), 8 * sizeof( float ), cudaMemcpyDeviceToHost, streams_[0] ) );
+		CUDA_CHECK( cudaStreamSynchronize( streams_[0] ) );
+
+		int active_draft = 7;
+		for ( int k = 1; k <= 7; ++k ) {
+			if ( h_conf[k] < 0.25f ) {
+				active_draft = k - 1;
+				break;
+			}
+		}
+		if ( active_draft < 1 ) active_draft = 1;
+
+		spec_proposals_ += active_draft;
+
+		// 2. Candidate sequence: [T_1..T_active_draft]
+		int h_cands[8];
+		for ( int k = 1; k <= active_draft; ++k ) {
+			h_cands[k - 1] = h_draft[k];
+		}
+
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			models_[d]->checkpoint_state( streams_[d] );
+		}
+
+		run_gpu_step_batched( h_cands, active_draft, slot.current_pos, s_idx );
+		CUDA_CHECK( cudaSetDevice( 0 ) );
+		int target_preds[8];
+		models_[0]->sample_next_tokens( target_preds, active_draft, streams_[0] );
+
+		int accepted_count = 0;
+		int next_anchor = slot.last_token;
+
+		for ( int k = 1; k <= active_draft; ++k ) {
+			int draft_tok = h_draft[k];
+			int expected_tok = ( k == 1 ) ? slot.last_token : target_preds[k - 2];
+
+			if ( draft_tok == expected_tok ) {
+				accepted_count++;
+				spec_accepted_++;
+				slot.all_tokens.push_back( draft_tok );
+				slot.tokens_generated++;
+
+				std::string tok_str = tokenizer_.decode_token( draft_tok );
+				slot.accumulated_text += tok_str;
+				if ( slot.req.stream_callback ) {
+					slot.req.stream_callback( tok_str, false );
+				}
+
+				if ( slot.tokens_generated >= slot.req.max_tokens || draft_tok == tokenizer_.eos_id() ) {
+					next_anchor = draft_tok;
+					break;
+				}
+
+				if ( k == active_draft ) {
+					next_anchor = target_preds[active_draft - 1];
+					slot.all_tokens.push_back( next_anchor );
+					slot.tokens_generated++;
+					std::string b_str = tokenizer_.decode_token( next_anchor );
+					slot.accumulated_text += b_str;
+					if ( slot.req.stream_callback ) {
+						slot.req.stream_callback( b_str, false );
+					}
+				}
+			}
+			else {
+				next_anchor = expected_tok;
+				slot.all_tokens.push_back( expected_tok );
+				slot.tokens_generated++;
+				std::string c_str = tokenizer_.decode_token( expected_tok );
+				slot.accumulated_text += c_str;
+				if ( slot.req.stream_callback ) {
+					slot.req.stream_callback( c_str, false );
+				}
+				break;
+			}
+		}
+
+		if ( accepted_count < active_draft ) {
+			for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+				models_[d]->rollback_state( streams_[d] );
+			}
+			if ( accepted_count > 0 ) {
+				run_gpu_step_batched( h_cands, accepted_count, slot.current_pos, s_idx );
+			}
+		}
+		slot.current_pos += ( accepted_count + 1 );
+		slot.last_token = next_anchor;
+	}
+	else if ( rem_count == 1 ) {
 		int s_idx = rem_slots[0];
 		Slot& slot = slots_[s_idx];
 		run_gpu_step_token( slot.last_token, slot.current_pos++, s_idx );
@@ -400,17 +505,13 @@ void Generator::step_batch() {
 		slot.last_token = models_[0]->sample_next_token( streams_[0] );
 	}
 	else {
-		int leader_s_idx = rem_slots[0];
-		Slot& leader = slots_[leader_s_idx];
-		run_gpu_step_token( leader.last_token, leader.current_pos++, leader_s_idx );
-		CUDA_CHECK( cudaSetDevice( 0 ) );
-		leader.last_token = models_[0]->sample_next_token( streams_[0] );
-
-		for ( int i = 1; i < rem_count; ++i ) {
+		// Honest concurrent multi-slot execution (step each active slot on GPU)
+		for ( int i = 0; i < rem_count; ++i ) {
 			int s_idx = rem_slots[i];
-			Slot& follower = slots_[s_idx];
-			follower.current_pos++;
-			follower.last_token = 1000 + ( ( follower.tokens_generated * 37 + s_idx * 101 ) % 10000 );
+			Slot& slot = slots_[s_idx];
+			run_gpu_step_token( slot.last_token, slot.current_pos++, s_idx );
+			CUDA_CHECK( cudaSetDevice( 0 ) );
+			slot.last_token = models_[0]->sample_next_token( streams_[0] );
 		}
 	}
 }

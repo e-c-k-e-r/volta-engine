@@ -237,62 +237,90 @@ int main( int argc, char** argv ) {
 	while ( total_generated < 100 ) {
 		rounds++;
 
-		// 1. Draft proposes K=7 candidate tokens [T_1..T_7] from anchor T_0 at pos conditioned on tapped states from row A of previous round
-		const half* anchor_logits = pipes[0].logits().ptr<const half>() + static_cast<size_t>( prev_a ) * 248320;
-		spec.draft( cur_token, pos, streams[0], anchor_logits,
-			context.data(), static_cast<int>( context.size() ), pipes[0].tapped_states( prev_a ) );
+		// 1. Evaluate target model on anchor token
+		run_step_4gpu( cur_token, pos++ );
+		CUDA_CHECK( cudaSetDevice( 0 ) );
+		int target_pred = pipes[0].sample_next_token( streams[0] );
+
+		// 2. Draft proposes K=7 candidate tokens conditioned on anchor logits & tapped states
+		spec.draft( cur_token, pos, streams[0], pipes[0].logits().ptr<const half>(),
+			context.data(), static_cast<int>( context.size() ), pipes[0].tapped_states() );
 
 		int h_draft[8];
+		float h_conf[8];
 		CUDA_CHECK( cudaMemcpyAsync( h_draft, spec.d_draft_tokens(), 8 * sizeof( int ), cudaMemcpyDeviceToHost, streams[0] ) );
+		CUDA_CHECK( cudaMemcpyAsync( h_conf, spec.d_conf(), 8 * sizeof( float ), cudaMemcpyDeviceToHost, streams[0] ) );
 		CUDA_CHECK( cudaStreamSynchronize( streams[0] ) );
 
-		// 2. Candidate block [T_0, T_1..T_7] assembled: T_0 is current anchor
-		h_draft[0] = cur_token;
+		int active_draft = 7;
+		for ( int k = 1; k <= 7; ++k ) {
+			if ( h_conf[k] < 0.25f ) {
+				active_draft = k - 1;
+				break;
+			}
+		}
+		if ( active_draft < 1 ) active_draft = 1;
+		total_draft_proposed += active_draft;
 
-		// 3. Launch single batched target forward pass (M=8) across all 4 GPUs via cudaGraphLaunch
+		// 3. Batched Target Verification: evaluate active draft tokens in a single forward pass
+		int h_cands[8];
+		for ( int k = 1; k <= active_draft; ++k ) {
+			h_cands[k - 1] = h_draft[k];
+		}
+
 		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 			pipes[d].checkpoint_state( streams[d] );
 		}
-		run_step_tp4_batched( h_draft, 8, pos );
 
-		// 4. Extract the 8 target predictions [P_0..P_7] via GPU-side argmax on GPU 0
+		run_step_tp4_batched( h_cands, active_draft, pos );
 		CUDA_CHECK( cudaSetDevice( 0 ) );
 		int target_preds[8];
-		pipes[0].sample_next_tokens( target_preds, 8, streams[0] );
+		pipes[0].sample_next_tokens( target_preds, active_draft, streams[0] );
 
-		// 5. Find first mismatch index A in [0, 7] where T_{i+1} != P_i
-		int A = 7;
-		for ( int i = 0; i < 7; ++i ) {
-			if ( h_draft[i + 1] != target_preds[i] ) {
-				A = i;
+		int accepted_count = 0;
+		int bonus_or_diverged = target_pred;
+
+		for ( int k = 1; k <= active_draft; ++k ) {
+			int draft_tok = h_draft[k];
+			int expected_tok = ( k == 1 ) ? target_pred : target_preds[k - 2];
+
+			if ( draft_tok == expected_tok ) {
+				accepted_count++;
+				total_draft_accepted++;
+				total_generated++;
+				context.push_back( draft_tok );
+
+				if ( total_generated >= 100 ) {
+					bonus_or_diverged = draft_tok;
+					break;
+				}
+
+				if ( k == active_draft ) {
+					// All active draft tokens matched! Bonus token from target prediction
+					bonus_or_diverged = target_preds[active_draft - 1];
+					total_generated++;
+					context.push_back( bonus_or_diverged );
+				}
+			}
+			else {
+				bonus_or_diverged = expected_tok;
+				total_generated++;
+				context.push_back( expected_tok );
 				break;
 			}
 		}
 
-		// 6. Emitted tokens this round: A + 1 (the A accepted draft tokens plus the target model's correction/bonus token P_A)
-		total_draft_proposed += 7;
-		total_draft_accepted += A;
-		for ( int i = 0; i < A; ++i ) {
-			context.push_back( h_draft[i + 1] );
-			total_generated++;
-			if ( total_generated >= 100 ) break;
-		}
-		if ( total_generated < 100 ) {
-			context.push_back( target_preds[A] );
-			total_generated++;
-		}
-
-		// 7. Next anchor token is T_next = P_A. Advance position: pos += (A + 1)
-		cur_token = target_preds[A];
-		pos += ( A + 1 );
-		prev_a = A;
-
-		// 8. Rollback GDN/KV state to pos
-		if ( A < 7 ) {
+		// Update position and state: if partial accept, rollback and step the accepted prefix
+		if ( accepted_count < active_draft ) {
 			for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 				pipes[d].rollback_state( streams[d] );
 			}
+			if ( accepted_count > 0 ) {
+				run_step_tp4_batched( h_cands, accepted_count, pos );
+			}
 		}
+		pos += ( accepted_count + 1 );
+		cur_token = bonus_or_diverged;
 	}
 
 	auto t_end = std::chrono::high_resolution_clock::now();
