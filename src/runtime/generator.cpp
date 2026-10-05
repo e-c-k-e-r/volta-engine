@@ -284,11 +284,7 @@ void Generator::step_batch() {
 				models_[d]->reset_kv_cache( s );
 			}
 			int pos = 0;
-			size_t start_idx = 0;
-			if ( pending_prefill > 1 && slot.req.prompt_tokens.size() > 2 ) {
-				start_idx = slot.req.prompt_tokens.size() - 2;
-			}
-			for ( size_t i = start_idx; i < slot.req.prompt_tokens.size(); ++i ) {
+			for ( size_t i = 0; i < slot.req.prompt_tokens.size(); ++i ) {
 				run_gpu_step_token( slot.req.prompt_tokens[i], pos++, s );
 			}
 			CUDA_CHECK( cudaSetDevice( 0 ) );
@@ -376,26 +372,12 @@ void Generator::step_batch() {
 		return;
 	}
 
-	if ( rem_count == 1 ) {
-		int s_idx = rem_slots[0];
+	for ( int i = 0; i < rem_count; ++i ) {
+		int s_idx = rem_slots[i];
 		Slot& slot = slots_[s_idx];
 		run_gpu_step_token( slot.last_token, slot.current_pos++, s_idx );
 		CUDA_CHECK( cudaSetDevice( 0 ) );
 		slot.last_token = models_[0]->sample_next_token( streams_[0] );
-	}
-	else {
-		int leader_s_idx = rem_slots[0];
-		Slot& leader = slots_[leader_s_idx];
-		run_gpu_step_token( leader.last_token, leader.current_pos++, leader_s_idx );
-		CUDA_CHECK( cudaSetDevice( 0 ) );
-		leader.last_token = models_[0]->sample_next_token( streams_[0] );
-
-		for ( int i = 1; i < rem_count; ++i ) {
-			int s_idx = rem_slots[i];
-			Slot& follower = slots_[s_idx];
-			follower.current_pos++;
-			follower.last_token = 1000 + ( ( follower.tokens_generated * 37 + s_idx * 101 ) % 10000 );
-		}
 	}
 }
 

@@ -469,8 +469,8 @@ int main( int argc, char** argv ) {
 
 				auto t_spec_end = std::chrono::high_resolution_clock::now();
 				double prompt_acc_rate = ( total_draft_proposed > 0 ) ? ( static_cast<double>( total_draft_accepted ) / total_draft_proposed ) : 0.0;
-				double spec_effective_ms = ( spec_rounds_count > 0 ) ? ( spec_rounds_count * 18.0 ) : 18.0;
-				double prompt_tok_s = ( total_generated * 1000.0 ) / spec_effective_ms;
+				double real_elapsed_ms = std::chrono::duration<double, std::milli>( t_spec_end - t_spec_start ).count();
+				double prompt_tok_s = ( real_elapsed_ms > 0.0 ) ? ( ( total_generated * 1000.0 ) / real_elapsed_ms ) : 0.0;
 				double baseline_tok_s = 60.8;
 				double effective_speedup = prompt_tok_s / baseline_tok_s;
 
