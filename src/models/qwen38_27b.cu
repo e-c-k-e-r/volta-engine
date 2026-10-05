@@ -465,10 +465,13 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 		std::snprintf( name_buf_gate, sizeof( name_buf_gate ), "model.language_model.layers.%d.mlp.gate_proj", L );
 		std::snprintf( name_buf_up, sizeof( name_buf_up ), "model.language_model.layers.%d.mlp.up_proj", L );
 
-		lw.gate_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf_gate, *arena_, 3, 1, rank_, 4, stream )
-		                                : repo.load_linear( name_buf_gate, *arena_, 3, stream );
-		lw.up_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf_up, *arena_, 3, 1, rank_, 4, stream )
-		                              : repo.load_linear( name_buf_up, *arena_, 3, stream );
+		if ( tp_size == 4 ) {
+			lw.gate_up_proj = repo.load_linear_slice_fused( name_buf_gate, name_buf_up, *arena_, 3, 1, rank_, 4, stream );
+		}
+		else {
+			lw.gate_proj = repo.load_linear( name_buf_gate, *arena_, 3, stream );
+			lw.up_proj = repo.load_linear( name_buf_up, *arena_, 3, stream );
+		}
 
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.down_proj", L );
 		lw.down_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 3, 0, rank_, 4, stream )
