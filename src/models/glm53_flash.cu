@@ -205,6 +205,8 @@ bool GLM53Pipeline::init(
 	int moe_inter_shape[2] = { 1, config_.dense_intermediate_size };
 	moe_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
 	moe_up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
+	int moe_gate_up_shape[2] = { 1, config_.dense_intermediate_size * 2 };
+	moe_gate_up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_gate_up_shape, 2 );
 	moe_inter_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
 	moe_expert_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	local_moe_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
@@ -468,16 +470,27 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 			engine::modules::MoE::init_device_ptrs( lw.moe_weights, *arena_, stream );
 
 			// Shared experts
-			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.gate_proj", L );
-			lw.shared_expert.gate = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, 4, stream )
-			                                         : repo.load_linear( name_buf, *arena_, 4, stream );
-			lw.has_shared_expert = lw.shared_expert.gate.is_valid();
+			char name_buf_gate[512];
+			char name_buf_up[512];
+			std::snprintf( name_buf_gate, sizeof( name_buf_gate ), "model.language_model.layers.%d.mlp.shared_experts.gate_proj", L );
+			std::snprintf( name_buf_up, sizeof( name_buf_up ), "model.language_model.layers.%d.mlp.shared_experts.up_proj", L );
+			lw.shared_expert.gate_up_proj = ( tp_size == 4 ) ? repo.load_linear_slice_fused( name_buf_gate, name_buf_up, *arena_, 4, 1, rank_, 4, stream )
+			                                                 : repo.load_linear_slice_fused( name_buf_gate, name_buf_up, *arena_, 4, 1, 0, 1, stream );
+
+			if ( lw.shared_expert.gate_up_proj.is_valid() ) {
+				lw.has_shared_expert = true;
+			}
+			else {
+				lw.shared_expert.gate = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf_gate, *arena_, 4, 1, rank_, 4, stream )
+				                                         : repo.load_linear( name_buf_gate, *arena_, 4, stream );
+				lw.has_shared_expert = lw.shared_expert.gate.is_valid();
+				if ( lw.has_shared_expert ) {
+					lw.shared_expert.up = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf_up, *arena_, 4, 1, rank_, 4, stream )
+					                                       : repo.load_linear( name_buf_up, *arena_, 4, stream );
+				}
+			}
 
 			if ( lw.has_shared_expert ) {
-				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.up_proj", L );
-				lw.shared_expert.up = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, 4, stream )
-				                                       : repo.load_linear( name_buf, *arena_, 4, stream );
-
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.down_proj", L );
 				lw.shared_expert.down = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 4, 0, rank_, 4, stream )
 				                                         : repo.load_linear( name_buf, *arena_, 4, stream );
@@ -554,7 +567,7 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 				std::printf( "[RANK %d L%d] MISSING: %d/%d local experts invalid!\n", rank_, L, expert_miss, experts_per_rank );
 				missing_count += expert_miss;
 			}
-			if ( !lw.shared_expert.gate.is_valid() || !lw.shared_expert.up.is_valid() || !lw.shared_expert.down.is_valid() ) {
+			if ( ( !lw.shared_expert.gate_up_proj.is_valid() && ( !lw.shared_expert.gate.is_valid() || !lw.shared_expert.up.is_valid() ) ) || !lw.shared_expert.down.is_valid() ) {
 				std::printf( "[RANK %d L%d] MISSING: shared_expert\n", rank_, L );
 				++missing_count;
 			}
@@ -785,15 +798,6 @@ void GLM53Pipeline::forward_step(
 			);
 		}
 
-		static int debug_steps = 0;
-		cudaEvent_t ev_a0, ev_a1, ev_m0, ev_m1;
-		bool do_time = ( rank_ == 0 && layer == 3 && debug_steps == 0 );
-		if ( do_time ) {
-			cudaEventCreate( &ev_a0 ); cudaEventCreate( &ev_a1 );
-			cudaEventCreate( &ev_m0 ); cudaEventCreate( &ev_m1 );
-			cudaEventRecord( ev_a0, stream );
-		}
-
 		// 2. Attention
 		if ( lw.is_linear_attn && lw.qkv.is_valid() ) {
 			engine::modules::Linear::forward(
@@ -989,13 +993,21 @@ void GLM53Pipeline::forward_step(
 
 			// Shared expert (executed on all 4 ranks when TP=4, or rank 0 if single-GPU)
 			if ( lw.has_shared_expert && ( ring_ != nullptr || rank_ == 0 ) ) {
-				engine::modules::Linear::forward(
-					norm_hidden_, lw.shared_expert.gate, moe_gate_buf_, stream
-				);
-				engine::modules::Linear::forward(
-					norm_hidden_, lw.shared_expert.up, moe_up_buf_, stream
-				);
-				engine::modules::SwiGLU::forward( moe_gate_buf_, moe_up_buf_, moe_inter_buf_, stream, 10.0f );
+				if ( lw.shared_expert.gate_up_proj.is_valid() ) {
+					engine::modules::Linear::forward(
+						norm_hidden_, lw.shared_expert.gate_up_proj, moe_gate_up_buf_, stream
+					);
+					engine::modules::SwiGLU::forward_fused( moe_gate_up_buf_, moe_inter_buf_, stream, 10.0f );
+				}
+				else {
+					engine::modules::Linear::forward(
+						norm_hidden_, lw.shared_expert.gate, moe_gate_buf_, stream
+					);
+					engine::modules::Linear::forward(
+						norm_hidden_, lw.shared_expert.up, moe_up_buf_, stream
+					);
+					engine::modules::SwiGLU::forward( moe_gate_buf_, moe_up_buf_, moe_inter_buf_, stream, 10.0f );
+				}
 				engine::modules::Linear::forward(
 					moe_inter_buf_, lw.shared_expert.down, moe_expert_out_, stream
 				);

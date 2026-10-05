@@ -111,7 +111,9 @@ public:
 	// Concrete interface
 	bool init( const Qwen38Config& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
 	void embed_token( int token_id, cudaStream_t stream = nullptr );
+	void embed_tokens( const int* token_ids, int count, cudaStream_t stream = nullptr );
 	int sample_next_token_impl( cudaStream_t stream = nullptr );
+	void sample_next_tokens( int* h_preds, int count, cudaStream_t stream = nullptr );
 
 	void forward_step(
 		const pod::TensorView& input_tokens,
@@ -129,11 +131,16 @@ public:
 	);
 
 	void reset_state();
+	void checkpoint_state( cudaStream_t stream = nullptr );
+	void rollback_state( cudaStream_t stream = nullptr );
 	void destroy();
 
+	pod::TensorView& logits() { return logits_; }
 	const pod::TensorView& logits() const { return logits_; }
-	half* tapped_states() { return tapped_states_; }
-	const half* tapped_states() const { return tapped_states_; }
+	pod::TensorView& hidden_states() { return hidden_states_; }
+	const pod::TensorView& hidden_states() const { return hidden_states_; }
+	half* tapped_states( int row = 0 ) { return tapped_states_ + static_cast<size_t>( row ) * 5 * config_.hidden_size; }
+	const half* tapped_states( int row = 0 ) const { return tapped_states_ + static_cast<size_t>( row ) * 5 * config_.hidden_size; }
 
 private:
 	engine::runtime::KVCachePool* kv_pool_ = nullptr;
@@ -147,6 +154,8 @@ private:
 	engine::comm::CollectiveRing* ring_;
 	Qwen38State state_;
 	bool weights_loaded_;
+	float* gdn_checkpoint_ = nullptr;
+	float* conv_checkpoint_ = nullptr;
 
 	half* tapped_states_; // [5, hidden_size] tapped hidden states for DFlash2
 	pod::TensorView hidden_states_;

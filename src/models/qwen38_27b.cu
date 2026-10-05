@@ -8,6 +8,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
+#include <chrono>
 
 namespace engine::models {
 
@@ -24,6 +25,23 @@ __global__ void embed_token_kernel(
 		size_t idx = static_cast<size_t>( token_id ) * hidden_size + tid;
 		__nv_bfloat16 bf = embed_table[idx];
 		hidden_state[tid] = __float2half_rn( __bfloat162float( bf ) );
+	}
+}
+
+__global__ void embed_tokens_kernel(
+	const __nv_bfloat16* __restrict__ embed_table,
+	half* __restrict__ hidden_state,
+	const int* __restrict__ token_ids,
+	int count,
+	int hidden_size
+) {
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	int b = blockIdx.y;
+	if ( b < count && tid < hidden_size ) {
+		int token_id = token_ids[b];
+		size_t idx = static_cast<size_t>( token_id ) * hidden_size + tid;
+		__nv_bfloat16 bf = embed_table[idx];
+		hidden_state[static_cast<size_t>( b ) * hidden_size + tid] = __float2half_rn( __bfloat162float( bf ) );
 	}
 }
 
@@ -79,11 +97,15 @@ bool Qwen38Pipeline::init(
 	size_t gdn_floats = 8ULL * static_cast<size_t>( config_.num_linear_layers ) * lin_v_heads * 128 * 128;
 	state_.gdn_states = static_cast<float*>( engine::core::arena_alloc( arena, gdn_floats * sizeof( float ) ) );
 	CUDA_CHECK( cudaMemset( state_.gdn_states, 0, gdn_floats * sizeof( float ) ) );
+	gdn_checkpoint_ = static_cast<float*>( engine::core::arena_alloc( arena, gdn_floats * sizeof( float ) ) );
+	CUDA_CHECK( cudaMemset( gdn_checkpoint_, 0, gdn_floats * sizeof( float ) ) );
 
 	// 2. Allocate GDN causal conv1d history: 8 slots x 48 layers x lin_channels x 3 taps (FP32)
 	size_t conv_hist_floats = 8ULL * static_cast<size_t>( config_.num_linear_layers ) * lin_channels * 3;
 	state_.conv_history = static_cast<float*>( engine::core::arena_alloc( arena, conv_hist_floats * sizeof( float ) ) );
 	CUDA_CHECK( cudaMemset( state_.conv_history, 0, conv_hist_floats * sizeof( float ) ) );
+	conv_checkpoint_ = static_cast<float*>( engine::core::arena_alloc( arena, conv_hist_floats * sizeof( float ) ) );
+	CUDA_CHECK( cudaMemset( conv_checkpoint_, 0, conv_hist_floats * sizeof( float ) ) );
 
 	// 3. Allocate full-attention KV cache pool: 8 slots x 16 layers x max_seq x full_kv_heads x 256 (FP16)
 	internal_kv_pool_.init( rank_, arena, 8, config_.max_seq, config_.num_attn_layers, full_kv_heads, config_.full_head_dim );
@@ -101,28 +123,28 @@ bool Qwen38Pipeline::init(
 	residual_.shape[0] = 1;
 	norm_hidden_.shape[0] = 1;
 
-	// Tapped hidden states for DFlash2: 5 target layers x hidden_size
-	tapped_states_ = static_cast<half*>( engine::core::arena_alloc( arena, 5ULL * config_.hidden_size * sizeof( half ) ) );
-	CUDA_CHECK( cudaMemset( tapped_states_, 0, 5ULL * config_.hidden_size * sizeof( half ) ) );
+	// Tapped hidden states for DFlash2: 8 rows x 5 target layers x hidden_size
+	tapped_states_ = static_cast<half*>( engine::core::arena_alloc( arena, 8ULL * 5ULL * config_.hidden_size * sizeof( half ) ) );
+	CUDA_CHECK( cudaMemset( tapped_states_, 0, 8ULL * 5ULL * config_.hidden_size * sizeof( half ) ) );
 
 	// 5. Full attention buffers
-	int q_gate_shape[2] = { 1, full_q_heads * config_.full_head_dim * 2 };
+	int q_gate_shape[2] = { 8, full_q_heads * config_.full_head_dim * 2 };
 	q_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_gate_shape, 2 );
 
-	int q_shape[2] = { 1, full_q_heads * config_.full_head_dim };
+	int q_shape[2] = { 8, full_q_heads * config_.full_head_dim };
 	q_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_shape, 2 );
 	gate_attn_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_shape, 2 );
 	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_shape, 2 );
 
-	int kv_shape[2] = { 1, full_kv_heads * config_.full_head_dim };
+	int kv_shape[2] = { 8, full_kv_heads * config_.full_head_dim };
 	k_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_shape, 2 );
 	v_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_shape, 2 );
 
 	// 6. Linear attention (GDN) buffers
-	int qkv_shape[2] = { 1, lin_channels };
+	int qkv_shape[2] = { 8, lin_channels };
 	qkv_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
 
-	int z_shape[2] = { 1, lin_v_heads * config_.linear_head_dim };
+	int z_shape[2] = { 8, lin_v_heads * config_.linear_head_dim };
 	z_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
 	gdn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
 
@@ -131,24 +153,24 @@ bool Qwen38Pipeline::init(
 	gdn_beta_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, gdn_param_shape, 1 );
 
 	// 7. MLP buffers
-	int mlp_shape[2] = { 1, inter_size };
+	int mlp_shape[2] = { 8, inter_size };
 	gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_shape, 2 );
 	up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_shape, 2 );
-	int gate_up_shape[2] = { 1, inter_size * 2 };
+	int gate_up_shape[2] = { 8, inter_size * 2 };
 	gate_up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, gate_up_shape, 2 );
 	mlp_inter_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_shape, 2 );
 
-	int mlp_out_shape[2] = { 1, config_.hidden_size };
+	int mlp_out_shape[2] = { 8, config_.hidden_size };
 	mlp_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_out_shape, 2 );
 
 	// 8. Logits & argmax (rank 0 hosts)
 	if ( rank_ == 0 ) {
-		int logit_shape[2] = { 1, 248320 };
+		int logit_shape[2] = { 8, 248320 };
 		logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
 
-		d_argmax_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
-		h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( sizeof( int ) ) );
-		*h_argmax_idx_ = 0;
+		d_argmax_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, 8 * sizeof( int ) ) );
+		h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( 8 * sizeof( int ) ) );
+		std::memset( h_argmax_idx_, 0, 8 * sizeof( int ) );
 	}
 
 	CUDA_CHECK( cudaMemset( hidden_states_.data, 0, hidden_states_.size_bytes() ) );
@@ -502,6 +524,23 @@ void Qwen38Pipeline::embed_token( int token_id, cudaStream_t stream ) {
 	}
 }
 
+void Qwen38Pipeline::embed_tokens( const int* token_ids, int count, cudaStream_t stream ) {
+	hidden_states_.shape[0] = count;
+	residual_.shape[0] = count;
+	norm_hidden_.shape[0] = count;
+	if ( embed_tokens_.data != nullptr ) {
+		int threads = 256;
+		int blocks = ( config_.hidden_size + threads - 1 ) / threads;
+		embed_tokens_kernel<<<dim3( blocks, count ), dim3( threads ), 0, stream>>>(
+			embed_tokens_.ptr<const __nv_bfloat16>(),
+			hidden_states_.ptr<half>(),
+			token_ids,
+			count,
+			config_.hidden_size
+		);
+	}
+}
+
 int Qwen38Pipeline::sample_next_token( cudaStream_t stream ) {
 	hidden_states_.shape[0] = 1;
 	residual_.shape[0] = 1;
@@ -513,6 +552,7 @@ int Qwen38Pipeline::sample_next_token( cudaStream_t stream ) {
 	}
 
 	if ( lm_head_.is_valid() ) {
+		logits_.shape[0] = 1;
 		engine::modules::Linear::forward(
 			hidden_states_,
 			lm_head_,
@@ -533,6 +573,42 @@ int Qwen38Pipeline::sample_next_token( cudaStream_t stream ) {
 	return *h_argmax_idx_;
 }
 
+void Qwen38Pipeline::sample_next_tokens( int* h_preds, int count, cudaStream_t stream ) {
+	hidden_states_.shape[0] = count;
+	residual_.shape[0] = count;
+	norm_hidden_.shape[0] = count;
+	if ( weights_loaded_ && final_norm_.data != nullptr ) {
+		engine::modules::RMSNorm::forward(
+			hidden_states_, final_norm_, hidden_states_, 1e-6f, 1.0f, stream
+		);
+	}
+
+	if ( lm_head_.is_valid() ) {
+		logits_.shape[0] = count;
+		engine::modules::Linear::forward(
+			hidden_states_,
+			lm_head_,
+			logits_,
+			stream
+		);
+	}
+
+	engine::modules::Elementwise::batched_argmax(
+		logits_,
+		d_argmax_idx_,
+		248320,
+		count,
+		stream
+	);
+
+	CUDA_CHECK( cudaMemcpyAsync( h_argmax_idx_, d_argmax_idx_, count * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+
+	for ( int i = 0; i < count; ++i ) {
+		h_preds[i] = h_argmax_idx_[i];
+	}
+}
+
 void Qwen38Pipeline::forward_step(
 	const pod::TensorView& input_tokens,
 	pod::TensorView& output_logits,
@@ -550,6 +626,20 @@ void Qwen38Pipeline::forward_step(
 	hidden_states_.shape[0] = m;
 	residual_.shape[0] = m;
 	norm_hidden_.shape[0] = m;
+	q_buf_.shape[0] = m;
+	gate_attn_buf_.shape[0] = m;
+	q_gate_buf_.shape[0] = m;
+	attn_out_.shape[0] = m;
+	k_buf_.shape[0] = m;
+	v_buf_.shape[0] = m;
+	qkv_buf_.shape[0] = m;
+	z_buf_.shape[0] = m;
+	gdn_out_.shape[0] = m;
+	gate_buf_.shape[0] = m;
+	up_buf_.shape[0] = m;
+	gate_up_buf_.shape[0] = m;
+	mlp_inter_.shape[0] = m;
+	mlp_out_.shape[0] = m;
 	pod::TensorView hidden_cur = pod::make_tensor_2d( hidden_states_.data, pod::DType::FP16, m, config_.hidden_size );
 	pod::TensorView residual_cur = pod::make_tensor_2d( residual_.data, pod::DType::FP16, m, config_.hidden_size );
 
@@ -827,8 +917,14 @@ void Qwen38Pipeline::forward_step(
 		// Tapped layer states for DFlash2: [5, 19, 33, 47, 61]
 		if ( tapped_states_ != nullptr && ( layer == 5 || layer == 19 || layer == 33 || layer == 47 || layer == 61 ) ) {
 			int tap_idx = ( layer == 5 ) ? 0 : ( ( layer == 19 ) ? 1 : ( ( layer == 33 ) ? 2 : ( ( layer == 47 ) ? 3 : 4 ) ) );
-			CUDA_CHECK( cudaMemcpyAsync( tapped_states_ + static_cast<size_t>( tap_idx ) * config_.hidden_size,
-				hidden_states_.data, config_.hidden_size * sizeof( half ), cudaMemcpyDeviceToDevice, stream ) );
+			for ( int r = 0; r < m; ++r ) {
+				CUDA_CHECK( cudaMemcpyAsync(
+					tapped_states_ + ( static_cast<size_t>( r ) * 5 + tap_idx ) * config_.hidden_size,
+					hidden_states_.ptr<const half>() + static_cast<size_t>( r ) * config_.hidden_size,
+					config_.hidden_size * sizeof( half ),
+					cudaMemcpyDeviceToDevice, stream
+				) );
+			}
 		}
 	}
 
@@ -963,6 +1059,38 @@ void Qwen38Pipeline::destroy() {
 		cudaGraphExecDestroy( instance_m8_ );
 		cudaGraphDestroy( graph_m8_ );
 		graph_m8_captured_ = false;
+	}
+}
+
+void Qwen38Pipeline::checkpoint_state( cudaStream_t stream ) {
+	int tp_size = ( ring_ != nullptr ) ? 4 : 1;
+	int lin_v_heads = ( tp_size == 4 ) ? 12 : config_.linear_num_v_heads;
+	int lin_channels = ( tp_size == 4 ) ? 2560 : config_.linear_channels;
+	size_t slot_gdn_floats = static_cast<size_t>( config_.num_linear_layers ) * lin_v_heads * 128 * 128;
+	size_t slot_conv_floats = static_cast<size_t>( config_.num_linear_layers ) * lin_channels * 3;
+	size_t offset_gdn = static_cast<size_t>( active_slot_id_ ) * slot_gdn_floats;
+	size_t offset_conv = static_cast<size_t>( active_slot_id_ ) * slot_conv_floats;
+	if ( gdn_checkpoint_ && state_.gdn_states ) {
+		CUDA_CHECK( cudaMemcpyAsync( gdn_checkpoint_ + offset_gdn, state_.gdn_states + offset_gdn, slot_gdn_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
+	}
+	if ( conv_checkpoint_ && state_.conv_history ) {
+		CUDA_CHECK( cudaMemcpyAsync( conv_checkpoint_ + offset_conv, state_.conv_history + offset_conv, slot_conv_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
+	}
+}
+
+void Qwen38Pipeline::rollback_state( cudaStream_t stream ) {
+	int tp_size = ( ring_ != nullptr ) ? 4 : 1;
+	int lin_v_heads = ( tp_size == 4 ) ? 12 : config_.linear_num_v_heads;
+	int lin_channels = ( tp_size == 4 ) ? 2560 : config_.linear_channels;
+	size_t slot_gdn_floats = static_cast<size_t>( config_.num_linear_layers ) * lin_v_heads * 128 * 128;
+	size_t slot_conv_floats = static_cast<size_t>( config_.num_linear_layers ) * lin_channels * 3;
+	size_t offset_gdn = static_cast<size_t>( active_slot_id_ ) * slot_gdn_floats;
+	size_t offset_conv = static_cast<size_t>( active_slot_id_ ) * slot_conv_floats;
+	if ( gdn_checkpoint_ && state_.gdn_states ) {
+		CUDA_CHECK( cudaMemcpyAsync( state_.gdn_states + offset_gdn, gdn_checkpoint_ + offset_gdn, slot_gdn_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
+	}
+	if ( conv_checkpoint_ && state_.conv_history ) {
+		CUDA_CHECK( cudaMemcpyAsync( state_.conv_history + offset_conv, conv_checkpoint_ + offset_conv, slot_conv_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
 	}
 }
 

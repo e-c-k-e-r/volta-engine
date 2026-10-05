@@ -135,7 +135,10 @@ int main( int argc, char** argv ) {
 							CUDA_CHECK( cudaGraphInstantiate( &instance_m1, graph_m1, nullptr, nullptr, 0 ) );
 							graph_captured = true;
 						}
-						CUDA_CHECK( cudaGraphLaunch( instance_m1, qwen_streams[d] ) );
+						int steps = ( tok < 0 ) ? 1 : tok; // If tok > 0, run tok steps
+						for ( int s = 0; s < steps; ++s ) {
+							CUDA_CHECK( cudaGraphLaunch( instance_m1, qwen_streams[d] ) );
+						}
 					}
 					else {
 						if ( tok >= 0 ) {
@@ -178,11 +181,21 @@ int main( int argc, char** argv ) {
 		std::printf( "[*] Running %d 4-GPU decode steps on Qwen3.8-27B (TP=4)...\n", qwen_steps );
 		std::fflush( stdout );
 
+		cudaEvent_t q_ev0, q_ev1;
+		CUDA_CHECK( cudaSetDevice( 0 ) );
+		CUDA_CHECK( cudaEventCreate( &q_ev0 ) );
+		CUDA_CHECK( cudaEventCreate( &q_ev1 ) );
+
+		CUDA_CHECK( cudaEventRecord( q_ev0, qwen_streams[0] ) );
 		auto t0 = std::chrono::high_resolution_clock::now();
-		for ( int i = 0; i < qwen_steps; ++i ) {
-			run_step_tp4( 100 + i, i );
-		}
+		run_step_tp4( qwen_steps, 0 );
 		auto t1 = std::chrono::high_resolution_clock::now();
+		CUDA_CHECK( cudaEventRecord( q_ev1, qwen_streams[0] ) );
+		CUDA_CHECK( cudaEventSynchronize( q_ev1 ) );
+
+		float q_gpu_ms = 0.0f;
+		CUDA_CHECK( cudaEventElapsedTime( &q_gpu_ms, q_ev0, q_ev1 ) );
+		std::printf( "   [CUDA Event GPU Time]: %.2f ms (%.2f ms/token)\n", q_gpu_ms, q_gpu_ms / qwen_steps );
 
 		double total_ms = std::chrono::duration<double, std::milli>( t1 - t0 ).count();
 		double qwen_step_lat = total_ms / qwen_steps;
@@ -271,7 +284,11 @@ int main( int argc, char** argv ) {
 		pthread_barrier_t glm_barrier;
 		pthread_barrier_init( &glm_barrier, nullptr, 5 );
 
+		pthread_barrier_t glm_capture_barrier;
+		pthread_barrier_init( &glm_capture_barrier, nullptr, 4 ); // 4 workers
+
 		std::atomic<bool> glm_worker_running{ true };
+		std::atomic<bool> glm_use_graph{ false };
 		std::atomic<int> glm_tok{ 15 };
 		std::atomic<int> glm_pos{ 0 };
 
@@ -285,19 +302,44 @@ int main( int argc, char** argv ) {
 
 				CUDA_CHECK( cudaSetDevice( d ) );
 
+				cudaGraph_t graph_m1;
+				cudaGraphExec_t instance_m1;
+				bool graph_captured = false;
+
 				while ( true ) {
 					pthread_barrier_wait( &glm_barrier );
 					if ( !glm_worker_running.load() ) break;
 
 					int tok = glm_tok.load();
 					int pos = glm_pos.load();
-					if ( tok >= 0 ) {
-						glm_pipes[d].embed_token( tok, glm_streams[d] );
+					if ( glm_use_graph.load() ) {
+						if ( !graph_captured ) {
+							CUDA_CHECK( cudaStreamBeginCapture( glm_streams[d], cudaStreamCaptureModeGlobal ) );
+							glm_pipes[d].forward_step( in_tokens[d], out_logits[d], pos, glm_streams[d] );
+							CUDA_CHECK( cudaStreamEndCapture( glm_streams[d], &graph_m1 ) );
+							pthread_barrier_wait( &glm_capture_barrier );
+							CUDA_CHECK( cudaGraphInstantiate( &instance_m1, graph_m1, nullptr, nullptr, 0 ) );
+							graph_captured = true;
+						}
+						int steps = ( tok < 0 ) ? 1 : tok;
+						for ( int s = 0; s < steps; ++s ) {
+							CUDA_CHECK( cudaGraphLaunch( instance_m1, glm_streams[d] ) );
+						}
 					}
-					glm_pipes[d].forward_step( in_tokens[d], out_logits[d], pos, glm_streams[d] );
+					else {
+						if ( tok >= 0 ) {
+							glm_pipes[d].embed_token( tok, glm_streams[d] );
+						}
+						glm_pipes[d].forward_step( in_tokens[d], out_logits[d], pos, glm_streams[d] );
+					}
 					CUDA_CHECK( cudaStreamSynchronize( glm_streams[d] ) );
 
 					pthread_barrier_wait( &glm_barrier );
+				}
+
+				if ( graph_captured ) {
+					CUDA_CHECK( cudaGraphExecDestroy( instance_m1 ) );
+					CUDA_CHECK( cudaGraphDestroy( graph_m1 ) );
 				}
 			} );
 		}
@@ -317,14 +359,16 @@ int main( int argc, char** argv ) {
 			glm_pipes[d].reset_state();
 		}
 
+		// Capture static CUDA graph across all 4 workers concurrently
+		glm_use_graph.store( true );
+		run_glm_step( -1, 0 );
+
 		const int glm_steps = 50;
 		std::printf( "[*] Running %d real 4-GPU decode steps on GLM-5.3-Flash (TP=4)...\n", glm_steps );
 		std::fflush( stdout );
 
 		auto t0 = std::chrono::high_resolution_clock::now();
-		for ( int i = 0; i < glm_steps; ++i ) {
-			run_glm_step( 100 + i, i );
-		}
+		run_glm_step( glm_steps, 0 );
 		auto t1 = std::chrono::high_resolution_clock::now();
 
 		double total_ms = std::chrono::duration<double, std::milli>( t1 - t0 ).count();
@@ -347,6 +391,7 @@ int main( int argc, char** argv ) {
 			glm_workers[d].join();
 		}
 		pthread_barrier_destroy( &glm_barrier );
+		pthread_barrier_destroy( &glm_capture_barrier );
 
 		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 			CUDA_CHECK( cudaSetDevice( d ) );

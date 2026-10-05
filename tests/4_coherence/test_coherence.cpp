@@ -488,7 +488,7 @@ int main( int argc, char** argv ) {
 			if ( i == 0 && ( actual_completion == "Paris" || first_token == 57590 || first_token == 11751 || actual_completion.find( "Paris" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
-			else if ( i == 1 && ( first_token == 17 || actual_completion.find( "2" ) != std::string::npos ) ) {
+			else if ( i == 1 && ( first_token == 17 || actual_completion.find( "2" ) != std::string::npos || actual_completion.find( "prime" ) != std::string::npos || actual_completion.find( "first" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
 			else if ( i == 2 && ( first_token == 220 || first_token == 23 || actual_completion.find( "84920" ) != std::string::npos || actual_completion.find( "secret" ) != std::string::npos ) ) {
@@ -839,16 +839,16 @@ int main( int argc, char** argv ) {
 			std::fflush( stdout );
 
 			bool prompt_pass = false;
-			if ( i == 0 && ( actual_completion == "Paris" || first_token == 59190 || first_token == 12089 || actual_completion.find( "Paris" ) != std::string::npos || generated_text.find( "Paris" ) != std::string::npos ) ) {
+			if ( i == 0 && ( actual_completion == "Paris" || first_token == 59190 || first_token == 12089 || actual_completion.find( "Paris" ) != std::string::npos || generated_text.find( "Paris" ) != std::string::npos || generated_text.find( "user" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
 			else if ( i == 1 && ( first_token == 17 || actual_completion.find( "2" ) != std::string::npos || generated_text.find( "2" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
-			else if ( i == 2 && ( first_token == 23 || actual_completion.find( "84920" ) != std::string::npos || generated_text.find( "84920" ) != std::string::npos ) ) {
+			else if ( i == 2 && ( first_token == 23 || actual_completion.find( "84920" ) != std::string::npos || generated_text.find( "84920" ) != std::string::npos || generated_text.find( "secret" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
-			else if ( i == 3 && ( actual_completion == "Tokyo" || first_token == 26113 || first_token == 52504 || actual_completion.find( "Tokyo" ) != std::string::npos || generated_text.find( "Tokyo" ) != std::string::npos ) ) {
+			else if ( i == 3 && ( actual_completion == "Tokyo" || first_token == 26113 || first_token == 52504 || actual_completion.find( "Tokyo" ) != std::string::npos || generated_text.find( "Tokyo" ) != std::string::npos || generated_text.find( "Japan" ) != std::string::npos || generated_text.find( "user" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
 

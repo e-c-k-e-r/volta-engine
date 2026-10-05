@@ -80,6 +80,7 @@ private:
 	void scheduler_loop();
 	void step_batch();
 	void run_gpu_step_token( int tok, int pos, int slot_id = 0 );
+	void run_gpu_step_batched( const int* tokens, int batch_size, int pos, int slot_id = 0 );
 
 	engine::server::ServerConfig config_;
 	std::unique_ptr<engine::models::ModelPipeline> models_[ENGINE_NUM_GPUS];
@@ -102,12 +103,15 @@ private:
 	enum class WorkerTask {
 		NONE,
 		STEP_FORWARD,
+		STEP_BATCH,
 		STOP
 	};
 	WorkerTask worker_task_ = WorkerTask::NONE;
 	int worker_token_ = -1;
 	int worker_pos_ = 0;
 	int worker_slot_id_ = 0;
+	int worker_batch_size_ = 1;
+	int worker_batch_tokens_[16];
 
 	struct Slot {
 		bool active = false;

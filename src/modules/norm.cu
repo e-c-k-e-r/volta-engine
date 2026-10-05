@@ -177,6 +177,68 @@ __global__ void argmax_kernel(
 	}
 }
 
+__global__ void batched_argmax_kernel(
+	const half* __restrict__ logits,
+	int* __restrict__ out_idx,
+	int numel,
+	int batch_size
+) {
+	int row = blockIdx.x;
+	if ( row >= batch_size ) return;
+
+	const half* row_logits = logits + static_cast<size_t>( row ) * numel;
+	int tid = threadIdx.x;
+
+	float max_val = -1e30f;
+	int max_idx = -1;
+
+	for ( int i = tid; i < numel; i += blockDim.x ) {
+		float val = __half2float( row_logits[i] );
+		if ( val > max_val ) {
+			max_val = val;
+			max_idx = i;
+		}
+	}
+
+	#pragma unroll
+	for ( int mask = 16; mask > 0; mask >>= 1 ) {
+		float other_val = __shfl_xor_sync( 0xffffffff, max_val, mask );
+		int other_idx = __shfl_xor_sync( 0xffffffff, max_idx, mask );
+		if ( other_val > max_val ) {
+			max_val = other_val;
+			max_idx = other_idx;
+		}
+	}
+
+	__shared__ float s_max_vals[32];
+	__shared__ int s_max_idxs[32];
+	int warp_id = tid >> 5;
+	int lane_id = tid & 31;
+
+	if ( lane_id == 0 ) {
+		s_max_vals[warp_id] = max_val;
+		s_max_idxs[warp_id] = max_idx;
+	}
+	__syncthreads();
+
+	if ( warp_id == 0 ) {
+		float b_max = ( lane_id < ( blockDim.x >> 5 ) ) ? s_max_vals[lane_id] : -1e30f;
+		int b_idx = ( lane_id < ( blockDim.x >> 5 ) ) ? s_max_idxs[lane_id] : -1;
+		#pragma unroll
+		for ( int mask = 16; mask > 0; mask >>= 1 ) {
+			float other_val = __shfl_xor_sync( 0xffffffff, b_max, mask );
+			int other_idx = __shfl_xor_sync( 0xffffffff, b_idx, mask );
+			if ( other_val > b_max ) {
+				b_max = other_val;
+				b_idx = other_idx;
+			}
+		}
+		if ( lane_id == 0 ) {
+			out_idx[row] = b_idx;
+		}
+	}
+}
+
 } // namespace
 
 void RMSNorm::forward(
@@ -251,6 +313,21 @@ void Elementwise::argmax(
 		logits.ptr<const half>(),
 		d_out_idx,
 		numel
+	);
+}
+
+void Elementwise::batched_argmax(
+	const pod::TensorView& logits,
+	int* d_out_idx,
+	int numel,
+	int batch_size,
+	cudaStream_t stream
+) {
+	batched_argmax_kernel<<<dim3( batch_size ), dim3( 512 ), 0, stream>>>(
+		logits.ptr<const half>(),
+		d_out_idx,
+		numel,
+		batch_size
 	);
 }
 

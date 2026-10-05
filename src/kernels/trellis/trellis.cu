@@ -31,7 +31,7 @@ void LinearTrellis::forward(
 	const half* suh_ptr = suh.ptr<const half>();
 	const half* svh_ptr = svh.ptr<const half>();
 
-	if ( m <= 8 && ( m == 1 || m == 2 || m == 4 || m == 8 ) && ( k % 128 == 0 ) && ( n % 128 == 0 ) && n < 4096 ) {
+	if ( m <= 8 && ( m == 1 || m == 2 || m == 4 || m == 8 ) && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 		exl3_gemv(
 			x_ptr,
 			trellis_ptr,

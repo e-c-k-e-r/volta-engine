@@ -298,7 +298,7 @@ void MoERouter::exl3_moe_dispatch(
 	cudaGetDevice( &device );
 	int* locks = engine::modules::trellis_get_locks( device );
 	int* sched = locks + MOE_SCHED_OFFSET;
-	int num_groups = 10;
+	int num_groups = 1;
 
 	moe_dispatch_hist_kernel<<<dim3( 1 ), dim3( 128 ), 0, stream>>>(
 		selected_experts,
@@ -462,7 +462,7 @@ void exl3_moe(
 	int num_sms = engine::modules::trellis_get_num_sms( device );
 	int* locks = engine::modules::trellis_get_locks( device );
 
-	int group_size = 8;
+	int group_size = 80;
 	int num_groups = num_sms / group_size;
 	dim3 grid_dim( group_size, 1, num_groups );
 	int block_dim = 256 * MOE_TILESIZE_K / 16;
@@ -513,10 +513,10 @@ void exl3_moe(
 		(void*) &active_experts
 	};
 
-	static bool attr_set = false;
-	if ( !attr_set ) {
-		cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX );
-		attr_set = true;
+	static bool attr_set[ENGINE_NUM_GPUS] = { false };
+	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
+		attr_set[device] = true;
 	}
 
 	CUDA_CHECK( cudaLaunchKernel(

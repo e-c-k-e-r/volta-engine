@@ -41,6 +41,14 @@ struct Elementwise {
 		int numel,
 		cudaStream_t stream = nullptr
 	);
+
+	static void batched_argmax(
+		const pod::TensorView& logits,
+		int* d_out_idx,
+		int numel,
+		int batch_size,
+		cudaStream_t stream = nullptr
+	);
 };
 
 } // namespace engine::modules

@@ -54,6 +54,7 @@ struct GLM53State {
 struct GLM53ExpertWeights {
 	pod::LinearWeight gate;
 	pod::LinearWeight up;
+	pod::LinearWeight gate_up_proj;
 	pod::LinearWeight down;
 };
 
@@ -218,6 +219,7 @@ private:
 	pod::TensorView router_weights_;
 	pod::TensorView moe_gate_buf_;
 	pod::TensorView moe_up_buf_;
+	pod::TensorView moe_gate_up_buf_;
 	pod::TensorView moe_inter_buf_;
 	pod::TensorView moe_expert_out_;
 	pod::TensorView local_moe_out_;

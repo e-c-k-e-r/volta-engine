@@ -194,6 +194,18 @@ void Generator::run_gpu_step_token( int tok, int pos, int slot_id ) {
 	pthread_barrier_wait( &step_barrier_ );
 }
 
+void Generator::run_gpu_step_batched( const int* tokens, int batch_size, int pos, int slot_id ) {
+	worker_batch_size_ = batch_size;
+	for ( int i = 0; i < batch_size && i < 16; ++i ) {
+		worker_batch_tokens_[i] = tokens[i];
+	}
+	worker_pos_ = pos;
+	worker_slot_id_ = slot_id;
+	worker_task_ = WorkerTask::STEP_BATCH;
+	pthread_barrier_wait( &step_barrier_ );
+	pthread_barrier_wait( &step_barrier_ );
+}
+
 void Generator::worker_thread_func( int rank ) {
 	cpu_set_t cpuset;
 	CPU_ZERO( &cpuset );
@@ -214,6 +226,10 @@ void Generator::worker_thread_func( int rank ) {
 				models_[rank]->embed_token( worker_token_, worker_pos_, streams_[rank] );
 			}
 			models_[rank]->forward_step( worker_token_, worker_pos_, worker_slot_id_, streams_[rank] );
+			CUDA_CHECK( cudaStreamSynchronize( streams_[rank] ) );
+		}
+		else if ( worker_task_ == WorkerTask::STEP_BATCH ) {
+			models_[rank]->forward_batch( worker_batch_tokens_, worker_batch_size_, worker_pos_, streams_[rank] );
 			CUDA_CHECK( cudaStreamSynchronize( streams_[rank] ) );
 		}
 

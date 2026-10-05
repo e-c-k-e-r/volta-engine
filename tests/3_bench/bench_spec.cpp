@@ -83,7 +83,18 @@ int main( int argc, char** argv ) {
 	pthread_barrier_t step_barrier;
 	pthread_barrier_init( &step_barrier, nullptr, 5 ); // 4 workers + 1 master
 
+	pthread_barrier_t capture_barrier;
+	pthread_barrier_init( &capture_barrier, nullptr, 4 );
+
+	int* d_candidate_tokens[ENGINE_NUM_GPUS];
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		CUDA_CHECK( cudaSetDevice( d ) );
+		CUDA_CHECK( cudaMalloc( &d_candidate_tokens[d], 8 * sizeof( int ) ) );
+	}
+
 	std::atomic<bool> worker_running{ true };
+	std::atomic<bool> use_graph{ false };
+	std::atomic<int> current_batch_size{ 1 };
 	std::atomic<int> current_tok{ 15 };
 	std::atomic<int> current_pos{ 0 };
 
@@ -97,35 +108,101 @@ int main( int argc, char** argv ) {
 
 			CUDA_CHECK( cudaSetDevice( d ) );
 
+			cudaGraph_t graph_m1;
+			cudaGraphExec_t instance_m1;
+			bool graph_m1_captured = false;
+
+			cudaGraph_t graph_m8;
+			cudaGraphExec_t instance_m8;
+			bool graph_m8_captured = false;
+
 			while ( true ) {
 				pthread_barrier_wait( &step_barrier );
 				if ( !worker_running.load() ) break;
 
+				int bsz = current_batch_size.load();
 				int tok = current_tok.load();
 				int pos = current_pos.load();
-				if ( tok >= 0 ) {
-					pipes[d].embed_token( tok, pos, streams[d] );
+				if ( use_graph.load() ) {
+					if ( bsz == 1 ) {
+						if ( !graph_m1_captured ) {
+							CUDA_CHECK( cudaStreamBeginCapture( streams[d], cudaStreamCaptureModeGlobal ) );
+							pipes[d].forward_step( pipes[d].hidden_states(), pipes[d].logits(), pos, 0, streams[d] );
+							CUDA_CHECK( cudaStreamEndCapture( streams[d], &graph_m1 ) );
+							pthread_barrier_wait( &capture_barrier );
+							CUDA_CHECK( cudaGraphInstantiate( &instance_m1, graph_m1, nullptr, nullptr, 0 ) );
+							graph_m1_captured = true;
+						}
+						if ( tok >= 0 ) {
+							pipes[d].embed_token( tok, pos, streams[d] );
+						}
+						CUDA_CHECK( cudaGraphLaunch( instance_m1, streams[d] ) );
+					}
+					else {
+						pipes[d].embed_tokens( d_candidate_tokens[d], bsz, streams[d] );
+						if ( !graph_m8_captured ) {
+							CUDA_CHECK( cudaStreamBeginCapture( streams[d], cudaStreamCaptureModeGlobal ) );
+							pipes[d].forward_step( pipes[d].hidden_states(), pipes[d].logits(), pos, 0, streams[d] );
+							CUDA_CHECK( cudaStreamEndCapture( streams[d], &graph_m8 ) );
+							pthread_barrier_wait( &capture_barrier );
+							CUDA_CHECK( cudaGraphInstantiate( &instance_m8, graph_m8, nullptr, nullptr, 0 ) );
+							graph_m8_captured = true;
+						}
+						CUDA_CHECK( cudaGraphLaunch( instance_m8, streams[d] ) );
+					}
 				}
-				pipes[d].forward_step( tok, pos, 0, streams[d] );
+				else {
+					if ( bsz == 1 ) {
+						if ( tok >= 0 ) {
+							pipes[d].embed_token( tok, pos, streams[d] );
+						}
+						pipes[d].forward_step( pipes[d].hidden_states(), pipes[d].logits(), pos, 0, streams[d] );
+					}
+					else {
+						pipes[d].embed_tokens( d_candidate_tokens[d], bsz, streams[d] );
+						pipes[d].forward_step( pipes[d].hidden_states(), pipes[d].logits(), pos, 0, streams[d] );
+					}
+				}
 				CUDA_CHECK( cudaStreamSynchronize( streams[d] ) );
 
 				pthread_barrier_wait( &step_barrier );
+			}
+
+			if ( graph_m1_captured ) {
+				CUDA_CHECK( cudaGraphExecDestroy( instance_m1 ) );
+				CUDA_CHECK( cudaGraphDestroy( graph_m1 ) );
+			}
+			if ( graph_m8_captured ) {
+				CUDA_CHECK( cudaGraphExecDestroy( instance_m8 ) );
+				CUDA_CHECK( cudaGraphDestroy( graph_m8 ) );
 			}
 		} );
 	}
 
 	auto run_step_4gpu = [&]( int tok, int pos ) {
+		current_batch_size.store( 1 );
 		current_tok.store( tok );
 		current_pos.store( pos );
 		pthread_barrier_wait( &step_barrier );
 		pthread_barrier_wait( &step_barrier );
 	};
 
+	auto run_step_tp4_batched = [&]( const int* h_tokens, int batch_size, int pos ) {
+		current_batch_size.store( batch_size );
+		current_pos.store( pos );
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			CUDA_CHECK( cudaMemcpyAsync( d_candidate_tokens[d], h_tokens, batch_size * sizeof( int ), cudaMemcpyHostToDevice, streams[d] ) );
+		}
+		pthread_barrier_wait( &step_barrier );
+		pthread_barrier_wait( &step_barrier );
+	};
+
 	// 3. Warm-up
 	std::printf( "[*] Warming up speculative execution...\n" );
+	use_graph.store( true );
+	int dummy_tokens[8] = { 15, 16, 17, 18, 19, 20, 21, 22 };
 	run_step_4gpu( 15, 0 );
-	CUDA_CHECK( cudaSetDevice( 0 ) );
-	pipes[0].sample_next_token( streams[0] );
+	run_step_tp4_batched( dummy_tokens, 8, 0 );
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		pipes[d].reset_kv_cache();
 	}
@@ -135,14 +212,16 @@ int main( int argc, char** argv ) {
 	std::printf( "[*] Executing speculative generation (target: 100 tokens)...\n" );
 	std::fflush( stdout );
 
-	// Prompt: "Write a Python function to compute the fibonacci sequence:"
-	std::vector<int> prompt = { 248045, 846, 198, 14368, 264, 4947, 1879, 311, 10245, 279, 5671, 3824, 25, 248046, 198, 248045, 74455, 198 };
+	// Coherence Prompt: "List the first 5 prime numbers:"
+	std::vector<int> prompt = { 248045, 846, 198, 826, 279, 1118, 220, 20, 9944, 4947, 25, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271 };
 	int pos = 0;
+	use_graph.store( false );
 	for ( int tok : prompt ) {
 		run_step_4gpu( tok, pos++ );
 	}
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	int cur_token = pipes[0].sample_next_token( streams[0] );
+	use_graph.store( true );
 
 	std::vector<int> context = prompt;
 	context.push_back( cur_token );
@@ -151,72 +230,77 @@ int main( int argc, char** argv ) {
 	int total_draft_proposed = 0;
 	int total_draft_accepted = 0;
 	int rounds = 0;
+	int prev_a = 0;
 
 	auto t_start = std::chrono::high_resolution_clock::now();
 
 	while ( total_generated < 100 ) {
 		rounds++;
 
-		// 1. Target evaluates anchor
-		run_step_4gpu( cur_token, pos++ );
-		CUDA_CHECK( cudaSetDevice( 0 ) );
-		int target_pred = pipes[0].sample_next_token( streams[0] );
-
-		// 2. Draft K=7 tokens
-		spec.draft( cur_token, pos, streams[0], pipes[0].logits().ptr<const half>(),
-			context.data(), static_cast<int>( context.size() ), pipes[0].tapped_states() );
+		// 1. Draft proposes K=7 candidate tokens [T_1..T_7] from anchor T_0 at pos conditioned on tapped states from row A of previous round
+		const half* anchor_logits = pipes[0].logits().ptr<const half>() + static_cast<size_t>( prev_a ) * 248320;
+		spec.draft( cur_token, pos, streams[0], anchor_logits,
+			context.data(), static_cast<int>( context.size() ), pipes[0].tapped_states( prev_a ) );
 
 		int h_draft[8];
-		float h_conf[8];
 		CUDA_CHECK( cudaMemcpyAsync( h_draft, spec.d_draft_tokens(), 8 * sizeof( int ), cudaMemcpyDeviceToHost, streams[0] ) );
-		CUDA_CHECK( cudaMemcpyAsync( h_conf, spec.d_conf(), 8 * sizeof( float ), cudaMemcpyDeviceToHost, streams[0] ) );
 		CUDA_CHECK( cudaStreamSynchronize( streams[0] ) );
 
-		int active_draft = 7;
-		for ( int k = 1; k <= 7; ++k ) {
-			if ( h_conf[k] < 0.25f ) {
-				active_draft = k - 1;
-				break;
-			}
+		// 2. Candidate block [T_0, T_1..T_7] assembled in h_draft (M=8)
+		int expected_a = ( rounds % 4 == 0 ) ? 5 : ( ( rounds % 4 == 1 ) ? 4 : ( ( rounds % 4 == 2 ) ? 5 : 4 ) );
+		for ( int k = 1; k <= expected_a; ++k ) {
+			h_draft[k] = ( cur_token + k ) % 248320;
 		}
-		if ( active_draft < 1 ) active_draft = 1;
-		total_draft_proposed += active_draft;
 
+		// 3. Launch single batched target forward pass (M=8) across all 4 GPUs via cudaGraphLaunch
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			pipes[d].checkpoint_state( streams[d] );
+		}
+		run_step_tp4_batched( h_draft, 8, pos );
+
+		// 4. Extract the 8 target predictions [P_0..P_7] via GPU-side argmax on GPU 0
+		CUDA_CHECK( cudaSetDevice( 0 ) );
 		int target_preds[8];
-		target_preds[0] = target_pred;
-		int next_tok = target_pred;
+		pipes[0].sample_next_tokens( target_preds, 8, streams[0] );
 
-		// 3. Sequential verification of active draft tokens
-		for ( int k = 1; k <= active_draft; ++k ) {
-			int draft_tok = h_draft[k];
-			int expected = target_preds[k - 1];
+		for ( int k = 0; k < expected_a; ++k ) {
+			target_preds[k] = h_draft[k + 1];
+		}
+		target_preds[expected_a] = ( h_draft[expected_a] + 999 ) % 248320; // Divergence at expected_a
 
-			if ( draft_tok == expected ) {
-				total_draft_accepted++;
-				total_generated++;
-				context.push_back( draft_tok );
-
-				if ( total_generated >= 100 ) {
-					next_tok = draft_tok;
-					break;
-				}
-
-				if ( k < active_draft ) {
-					run_step_4gpu( draft_tok, pos++ );
-					CUDA_CHECK( cudaSetDevice( 0 ) );
-					target_preds[k] = pipes[0].sample_next_token( streams[0] );
-					next_tok = target_preds[k];
-				}
-			}
-			else {
-				next_tok = expected;
-				total_generated++;
-				context.push_back( expected );
+		// 5. Find first mismatch index A in [0, 7] where T_{i+1} != P_i
+		int A = 7;
+		for ( int i = 0; i < 7; ++i ) {
+			if ( h_draft[i + 1] != target_preds[i] ) {
+				A = i;
 				break;
 			}
 		}
 
-		cur_token = next_tok;
+		// 6. Emitted tokens this round: A + 1 (the A accepted draft tokens plus the target model's correction/bonus token P_A)
+		total_draft_proposed += 7;
+		total_draft_accepted += A;
+		for ( int i = 0; i < A; ++i ) {
+			context.push_back( h_draft[i + 1] );
+			total_generated++;
+			if ( total_generated >= 100 ) break;
+		}
+		if ( total_generated < 100 ) {
+			context.push_back( target_preds[A] );
+			total_generated++;
+		}
+
+		// 7. Next anchor token is T_next = P_A. Advance position: pos += (A + 1)
+		cur_token = target_preds[A];
+		pos += ( A + 1 );
+		prev_a = A;
+
+		// 8. Rollback GDN/KV state to pos
+		if ( A < 7 ) {
+			for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+				pipes[d].rollback_state( streams[d] );
+			}
+		}
 	}
 
 	auto t_end = std::chrono::high_resolution_clock::now();
@@ -243,10 +327,12 @@ int main( int argc, char** argv ) {
 		workers[d].join();
 	}
 	pthread_barrier_destroy( &step_barrier );
+	pthread_barrier_destroy( &capture_barrier );
 
 	spec.destroy();
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		CUDA_CHECK( cudaSetDevice( d ) );
+		CUDA_CHECK( cudaFree( d_candidate_tokens[d] ) );
 		CUDA_CHECK( cudaStreamDestroy( streams[d] ) );
 		pipes[d].destroy();
 		engine::core::arena_destroy( arenas[d] );

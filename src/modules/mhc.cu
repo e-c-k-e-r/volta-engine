@@ -1,10 +1,20 @@
 #include "engine/modules/mhc.h"
 #include <cuda_fp16.h>
 #include <cmath>
+#include <type_traits>
 
 namespace engine::modules {
 
 namespace {
+
+#define NUM_THREADS 256
+#define NUM_THREADS_A 64
+
+__device__ float g_mhc_partials[64 * 25];
+
+__device__ __forceinline__ float sigmoidf_( float x ) {
+	return 1.0f / ( 1.0f + __expf( -x ) );
+}
 
 __global__ void init_streams_kernel(
 	const half* __restrict__ in,
@@ -20,213 +30,276 @@ __global__ void init_streams_kernel(
 	}
 }
 
-__global__ void mhc_calc_inv_rms_kernel(
+template <int H, int M_, typename FN_T>
+__global__ __launch_bounds__( NUM_THREADS_A )
+void hc_mix_partials_kernel(
 	const float* __restrict__ streams,
-	float* __restrict__ inv_rms,
-	int total_elements
+	const FN_T* __restrict__ fn,
+	const int row_len,
+	const int chunk_cols
 ) {
-	int tid = threadIdx.x;
-	float sum_sq = 0.0f;
-	for ( int i = tid; i < total_elements; i += blockDim.x ) {
-		float val = streams[i];
-		sum_sq = fmaf( val, val, sum_sq );
-	}
+	constexpr int M = M_;
+	const int r = blockIdx.y;
+	const int c0 = blockIdx.x * chunk_cols;
+	const int c1 = min( c0 + chunk_cols, row_len );
+
+	const float4* s4 = (const float4*)( streams + static_cast<size_t>( r ) * row_len );
+	const int row_len4 = row_len / 4;
+
+	float acc[M + 1];
 	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) {
-		sum_sq += __shfl_xor_sync( 0xffffffff, sum_sq, mask );
+	for ( int k = 0; k <= M; ++k ) acc[k] = 0.0f;
+
+	for ( int c = c0 / 4 + threadIdx.x; c < c1 / 4; c += NUM_THREADS_A ) {
+		float4 s = s4[c];
+		acc[M] = fmaf( s.x, s.x, acc[M] );
+		acc[M] = fmaf( s.y, s.y, acc[M] );
+		acc[M] = fmaf( s.z, s.z, acc[M] );
+		acc[M] = fmaf( s.w, s.w, acc[M] );
+		#pragma unroll
+		for ( int j = 0; j < M; ++j ) {
+			float4 w;
+			if constexpr ( std::is_same_v<FN_T, half> ) {
+				int2 pk = ((const int2*) fn)[static_cast<size_t>( j ) * row_len4 + c];
+				float2 lo = __half22float2( *(const half2*) &pk.x );
+				float2 hi = __half22float2( *(const half2*) &pk.y );
+				w = make_float4( lo.x, lo.y, hi.x, hi.y );
+			}
+			else {
+				w = ((const float4*) fn)[static_cast<size_t>( j ) * row_len4 + c];
+			}
+			float d = fmaf( s.x, w.x, fmaf( s.y, w.y, fmaf( s.z, w.z, s.w * w.w ) ) );
+			acc[j] += d;
+		}
 	}
-	__shared__ float s_warp_sums[8];
-	int warp_id = tid >> 5;
-	int lane_id = tid & 31;
-	if ( lane_id == 0 ) {
-		s_warp_sums[warp_id] = sum_sq;
+
+	__shared__ float red[NUM_THREADS_A / 32][M + 1];
+	int lane = threadIdx.x % 32;
+	int warp = threadIdx.x / 32;
+	#pragma unroll
+	for ( int k = 0; k <= M; ++k ) {
+		float v = acc[k];
+		for ( int offset = 16; offset > 0; offset >>= 1 ) {
+			v += __shfl_down_sync( 0xffffffffu, v, offset );
+		}
+		if ( lane == 0 ) red[warp][k] = v;
 	}
 	__syncthreads();
-	if ( warp_id == 0 ) {
-		float b_sum = ( lane_id < ( blockDim.x >> 5 ) ) ? s_warp_sums[lane_id] : 0.0f;
-		#pragma unroll
-		for ( int mask = 4; mask > 0; mask >>= 1 ) {
-			b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
-		}
-		if ( lane_id == 0 ) {
-			*inv_rms = rsqrtf( b_sum / static_cast<float>( total_elements ) + 1e-5f );
+
+	if ( warp == 0 ) {
+		float* out = g_mhc_partials + ( static_cast<size_t>( r ) * gridDim.x + blockIdx.x ) * ( M + 1 );
+		for ( int k = lane; k <= M; k += 32 ) {
+			float v = 0.0f;
+			#pragma unroll
+			for ( int w = 0; w < NUM_THREADS_A / 32; ++w ) {
+				v += red[w][k];
+			}
+			out[k] = v;
 		}
 	}
 }
 
-__global__ void mhc_gemv_kernel(
+template <int H, int M_, bool HEAD, bool HALF_OUT>
+__global__ __launch_bounds__( NUM_THREADS )
+void hc_mix_finalize_kernel(
 	const float* __restrict__ streams,
-	const float* __restrict__ inv_rms_ptr,
-	const float* __restrict__ fn,
-	float* __restrict__ mix_logits,
-	int total_elements
-) {
-	int k = blockIdx.x; // 0 .. 23
-	int tid = threadIdx.x;
-	float inv_rms = *inv_rms_ptr;
-	const float* fn_row = fn + k * total_elements;
-
-	float dot = 0.0f;
-	for ( int j = tid; j < total_elements; j += blockDim.x ) {
-		float v = streams[j] * inv_rms;
-		dot = fmaf( v, fn_row[j], dot );
-	}
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) {
-		dot += __shfl_xor_sync( 0xffffffff, dot, mask );
-	}
-	__shared__ float s_warp_sums[8];
-	int warp_id = tid >> 5;
-	int lane_id = tid & 31;
-	if ( lane_id == 0 ) {
-		s_warp_sums[warp_id] = dot;
-	}
-	__syncthreads();
-	if ( warp_id == 0 ) {
-		float b_sum = ( lane_id < ( blockDim.x >> 5 ) ) ? s_warp_sums[lane_id] : 0.0f;
-		#pragma unroll
-		for ( int mask = 4; mask > 0; mask >>= 1 ) {
-			b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
-		}
-		if ( lane_id == 0 ) {
-			mix_logits[k] = b_sum;
-		}
-	}
-}
-
-__global__ void mhc_sinkhorn_kernel(
-	const float* __restrict__ mix_logits,
 	const float* __restrict__ base,
 	const float* __restrict__ scale,
-	float* __restrict__ pre_out,
-	float* __restrict__ post_out,
-	float* __restrict__ comb_out,
-	int sinkhorn_iters,
-	float eps
+	float* __restrict__ post,
+	float* __restrict__ comb,
+	void* __restrict__ collapsed,
+	float* __restrict__ inv_rms_buf,
+	float* __restrict__ mix_logits_buf,
+	float* __restrict__ pre_buf,
+	const int D,
+	const int chunksA,
+	const int chunk_cols_c,
+	const float rms_eps,
+	const float hc_eps,
+	const int sinkhorn_iters
 ) {
-	if ( threadIdx.x != 0 ) return;
+	constexpr int M = M_;
+	const int r = blockIdx.y;
+	const int row_len = H * D;
 
-	float s_pre = scale[0];
-	float s_post = scale[1];
-	float s_comb = scale[2];
-
-	#pragma unroll
-	for ( int h = 0; h < 4; ++h ) {
-		float val = mix_logits[h] * s_pre + base[h];
-		pre_out[h] = 1.0f / ( 1.0f + __expf( -val ) ) + eps;
-	}
-
-	#pragma unroll
-	for ( int h = 0; h < 4; ++h ) {
-		float val = mix_logits[4 + h] * s_post + base[4 + h];
-		post_out[h] = 2.0f / ( 1.0f + __expf( -val ) );
-	}
-
-	float comb[4][4];
-	for ( int i = 0; i < 4; ++i ) {
-		float max_v = -1e20f;
-		for ( int j = 0; j < 4; ++j ) {
-			float val = mix_logits[8 + i * 4 + j] * s_comb + base[8 + i * 4 + j];
-			comb[i][j] = val;
-			if ( val > max_v ) max_v = val;
+	__shared__ float mix_s[M + 1];
+	__shared__ float pre_s[H];
+	__shared__ float red_s[NUM_THREADS / 32][M + 1];
+	const int lane = threadIdx.x % 32;
+	const int warp = threadIdx.x / 32;
+	if ( lane <= M ) {
+		const float* p = g_mhc_partials + static_cast<size_t>( r ) * chunksA * ( M + 1 ) + lane;
+		float v = 0.0f;
+		for ( int i = warp; i < chunksA; i += NUM_THREADS / 32 ) {
+			v += p[static_cast<size_t>( i ) * ( M + 1 )];
 		}
-		float sum_exp = 0.0f;
-		for ( int j = 0; j < 4; ++j ) {
-			comb[i][j] = __expf( comb[i][j] - max_v );
-			sum_exp += comb[i][j];
-		}
-		float inv_sum = 1.0f / sum_exp;
-		for ( int j = 0; j < 4; ++j ) {
-			comb[i][j] = comb[i][j] * inv_sum + eps;
-		}
+		red_s[warp][lane] = v;
 	}
-
-	// Initial column normalization
-	for ( int j = 0; j < 4; ++j ) {
-		float col_sum = comb[0][j] + comb[1][j] + comb[2][j] + comb[3][j] + eps;
-		float inv_col = 1.0f / col_sum;
-		for ( int i = 0; i < 4; ++i ) {
-			comb[i][j] *= inv_col;
+	__syncthreads();
+	if ( threadIdx.x <= M ) {
+		float v = 0.0f;
+		#pragma unroll
+		for ( int w = 0; w < NUM_THREADS / 32; ++w ) {
+			v += red_s[w][threadIdx.x];
 		}
+		mix_s[threadIdx.x] = v;
 	}
+	__syncthreads();
+	float rmr = rsqrtf( mix_s[M] / static_cast<float>( row_len ) + rms_eps );
+	if ( threadIdx.x < H ) {
+		pre_s[threadIdx.x] = sigmoidf_( fmaf( mix_s[threadIdx.x] * rmr, scale[0], base[threadIdx.x] ) ) + hc_eps;
+	}
+	__syncthreads();
 
-	// Sinkhorn iterations
-	for ( int it = 0; it < sinkhorn_iters - 1; ++it ) {
-		// Row normalization
-		for ( int i = 0; i < 4; ++i ) {
-			float row_sum = comb[i][0] + comb[i][1] + comb[i][2] + comb[i][3] + eps;
-			float inv_row = 1.0f / row_sum;
-			for ( int j = 0; j < 4; ++j ) {
-				comb[i][j] *= inv_row;
+	if ( inv_rms_buf && threadIdx.x == 0 && blockIdx.x == 0 ) *inv_rms_buf = rmr;
+	if ( mix_logits_buf && threadIdx.x < M && blockIdx.x == 0 ) mix_logits_buf[threadIdx.x] = mix_s[threadIdx.x];
+	if ( pre_buf && threadIdx.x < H && blockIdx.x == 0 ) pre_buf[threadIdx.x] = pre_s[threadIdx.x];
+
+	const bool sink_warp = !HEAD && blockIdx.x == 0 && threadIdx.x < 32;
+	if ( sink_warp ) {
+		if ( threadIdx.x < H ) {
+			post[static_cast<size_t>( r ) * H + threadIdx.x] =
+				2.0f * sigmoidf_( fmaf( mix_s[H + threadIdx.x] * rmr, scale[1], base[H + threadIdx.x] ) );
+		}
+
+		if ( threadIdx.x < H * H ) {
+			const unsigned mask = ( H * H == 32 ) ? 0xffffffffu : ( ( 1u << ( H * H ) ) - 1u );
+			float v = fmaf( mix_s[2 * H + threadIdx.x] * rmr, scale[2], base[2 * H + threadIdx.x] );
+
+			// softmax over rows
+			float m = v;
+			#pragma unroll
+			for ( int o = 1; o < H; o <<= 1 ) m = fmaxf( m, __shfl_xor_sync( mask, m, o ) );
+			v = __expf( v - m );
+			float s = v;
+			#pragma unroll
+			for ( int o = 1; o < H; o <<= 1 ) s += __shfl_xor_sync( mask, s, o );
+			v = __fdividef( v, s ) + hc_eps;
+
+			// column normalize, then (iters - 1) x (row, column)
+			float cs = v;
+			#pragma unroll
+			for ( int o = H; o < H * H; o <<= 1 ) cs += __shfl_xor_sync( mask, cs, o );
+			v = __fdividef( v, cs + hc_eps );
+			for ( int it = 0; it < sinkhorn_iters - 1; ++it ) {
+				float rs = v;
+				#pragma unroll
+				for ( int o = 1; o < H; o <<= 1 ) rs += __shfl_xor_sync( mask, rs, o );
+				v = __fdividef( v, rs + hc_eps );
+				cs = v;
+				#pragma unroll
+				for ( int o = H; o < H * H; o <<= 1 ) cs += __shfl_xor_sync( mask, cs, o );
+				v = __fdividef( v, cs + hc_eps );
 			}
+			comb[static_cast<size_t>( r ) * H * H + threadIdx.x] = v;
 		}
-		// Column normalization
-		for ( int j = 0; j < 4; ++j ) {
-			float col_sum = comb[0][j] + comb[1][j] + comb[2][j] + comb[3][j] + eps;
-			float inv_col = 1.0f / col_sum;
-			for ( int i = 0; i < 4; ++i ) {
-				comb[i][j] *= inv_col;
-			}
-		}
+		return;
 	}
 
-	for ( int i = 0; i < 4; ++i ) {
-		for ( int j = 0; j < 4; ++j ) {
-			comb_out[i * 4 + j] = comb[i][j];
+	float pre_r[H];
+	#pragma unroll
+	for ( int h = 0; h < H; ++h ) pre_r[h] = pre_s[h];
+
+	const bool shrunk = !HEAD && blockIdx.x == 0;
+	const int tid = shrunk ? threadIdx.x - 32 : threadIdx.x;
+	const int nth = shrunk ? NUM_THREADS - 32 : NUM_THREADS;
+	const int c0 = blockIdx.x * chunk_cols_c;
+	const int c1 = min( c0 + chunk_cols_c, D );
+	const float4* s4 = (const float4*)( streams + static_cast<size_t>( r ) * row_len );
+	const int D4 = D / 4;
+	for ( int c = c0 / 4 + tid; c < c1 / 4; c += nth ) {
+		float4 o = make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
+		#pragma unroll
+		for ( int h = 0; h < H; ++h ) {
+			float4 s = s4[static_cast<size_t>( h ) * D4 + c];
+			o.x = fmaf( pre_r[h], s.x, o.x );
+			o.y = fmaf( pre_r[h], s.y, o.y );
+			o.z = fmaf( pre_r[h], s.z, o.z );
+			o.w = fmaf( pre_r[h], s.w, o.w );
+		}
+		if ( HALF_OUT ) {
+			half2* out2 = (half2*)( static_cast<half*>( collapsed ) + static_cast<size_t>( r ) * D );
+			out2[c * 2] = __floats2half2_rn( o.x, o.y );
+			out2[c * 2 + 1] = __floats2half2_rn( o.z, o.w );
+		}
+		else {
+			((float4*)( static_cast<float*>( collapsed ) + static_cast<size_t>( r ) * D ))[c] = o;
 		}
 	}
 }
 
-__global__ void mhc_collapse_kernel(
-	const float* __restrict__ streams,
-	const float* __restrict__ pre,
-	half* __restrict__ collapsed_out,
-	int hidden_size
-) {
-	int j = blockIdx.x * blockDim.x + threadIdx.x;
-	if ( j >= hidden_size ) return;
-
-	float p0 = pre[0];
-	float p1 = pre[1];
-	float p2 = pre[2];
-	float p3 = pre[3];
-
-	float sum = p0 * streams[0 * hidden_size + j]
-	          + p1 * streams[1 * hidden_size + j]
-	          + p2 * streams[2 * hidden_size + j]
-	          + p3 * streams[3 * hidden_size + j];
-
-	collapsed_out[j] = __float2half_rn( sum );
-}
-
-__global__ void mhc_expand_and_update_kernel(
-	float* __restrict__ streams_out,
-	const float* __restrict__ streams_in,
-	const half* __restrict__ sublayer_out,
+template <int H, typename Y_T, bool HAS_COMB>
+__global__ __launch_bounds__( NUM_THREADS )
+void hc_apply_kernel(
+	float* __restrict__ x,
+	const Y_T* __restrict__ y,
 	const float* __restrict__ post,
 	const float* __restrict__ comb,
-	int hidden_size
+	const int D,
+	const int chunk_cols
 ) {
-	int j = blockIdx.x * blockDim.x + threadIdx.x;
-	if ( j >= hidden_size ) return;
+	const int r = blockIdx.y;
+	const int c0 = blockIdx.x * chunk_cols;
+	const int c1 = min( c0 + chunk_cols, D );
+	const int D4 = D / 4;
 
-	float y = __half2float( sublayer_out[j] );
-	float r0 = streams_in[0 * hidden_size + j];
-	float r1 = streams_in[1 * hidden_size + j];
-	float r2 = streams_in[2 * hidden_size + j];
-	float r3 = streams_in[3 * hidden_size + j];
-
+	float post_r[H];
+	float comb_r[H][H];
 	#pragma unroll
-	for ( int h = 0; h < 4; ++h ) {
-		float post_h = post[h];
-		float c0 = comb[0 * 4 + h];
-		float c1 = comb[1 * 4 + h];
-		float c2 = comb[2 * 4 + h];
-		float c3 = comb[3 * 4 + h];
+	for ( int h = 0; h < H; ++h ) {
+		post_r[h] = __ldg( post + static_cast<size_t>( r ) * H + h );
+		if ( HAS_COMB ) {
+			#pragma unroll
+			for ( int g = 0; g < H; ++g ) {
+				comb_r[h][g] = __ldg( comb + ( static_cast<size_t>( r ) * H + h ) * H + g );
+			}
+		}
+	}
 
-		float res_mix = c0 * r0 + c1 * r1 + c2 * r2 + c3 * r3;
-		float new_val = fmaf( post_h, y, res_mix );
-		streams_out[h * hidden_size + j] = new_val;
+	float4* x4 = (float4*)( x + static_cast<size_t>( r ) * H * D );
+	for ( int c = c0 / 4 + threadIdx.x; c < c1 / 4; c += NUM_THREADS ) {
+		float4 xv[H];
+		#pragma unroll
+		for ( int h = 0; h < H; ++h ) {
+			xv[h] = x4[static_cast<size_t>( h ) * D4 + c];
+		}
+
+		float4 yv;
+		if constexpr ( std::is_same_v<Y_T, half> ) {
+			half2 y01 = ((const half2*)( y + static_cast<size_t>( r ) * D ))[c * 2];
+			half2 y23 = ((const half2*)( y + static_cast<size_t>( r ) * D ))[c * 2 + 1];
+			float2 lo = __half22float2( y01 );
+			float2 hi = __half22float2( y23 );
+			yv = make_float4( lo.x, lo.y, hi.x, hi.y );
+		}
+		else {
+			yv = ((const float4*)( y + static_cast<size_t>( r ) * D ))[c];
+		}
+
+		#pragma unroll
+		for ( int h = 0; h < H; ++h ) {
+			float4 o;
+			o.x = post_r[h] * yv.x;
+			o.y = post_r[h] * yv.y;
+			o.z = post_r[h] * yv.z;
+			o.w = post_r[h] * yv.w;
+			if ( HAS_COMB ) {
+				#pragma unroll
+				for ( int g = 0; g < H; ++g ) {
+					o.x = fmaf( comb_r[g][h], xv[g].x, o.x );
+					o.y = fmaf( comb_r[g][h], xv[g].y, o.y );
+					o.z = fmaf( comb_r[g][h], xv[g].z, o.z );
+					o.w = fmaf( comb_r[g][h], xv[g].w, o.w );
+				}
+			}
+			else {
+				o.x += xv[h].x;
+				o.y += xv[h].y;
+				o.z += xv[h].z;
+				o.w += xv[h].w;
+			}
+			x4[static_cast<size_t>( h ) * D4 + c] = o;
+		}
 	}
 }
 
@@ -235,15 +308,24 @@ __global__ void mhc_hyperhead_mean_kernel(
 	half* __restrict__ final_hidden,
 	int hidden_size
 ) {
-	int j = blockIdx.x * blockDim.x + threadIdx.x;
-	if ( j >= hidden_size ) return;
-
-	float sum = streams[0 * hidden_size + j]
-	          + streams[1 * hidden_size + j]
-	          + streams[2 * hidden_size + j]
-	          + streams[3 * hidden_size + j];
-
-	final_hidden[j] = __float2half_rn( sum * 0.25f );
+	int idx = ( blockIdx.x * blockDim.x + threadIdx.x ) * 4;
+	if ( idx < hidden_size ) {
+		const float4* s4 = (const float4*) streams;
+		int D4 = hidden_size / 4;
+		int c = idx / 4;
+		float4 o = make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
+		#pragma unroll
+		for ( int h = 0; h < 4; ++h ) {
+			float4 s = s4[h * D4 + c];
+			o.x += s.x;
+			o.y += s.y;
+			o.z += s.z;
+			o.w += s.w;
+		}
+		half2* out2 = (half2*)( final_hidden + idx );
+		out2[0] = __floats2half2_rn( o.x * 0.25f, o.y * 0.25f );
+		out2[1] = __floats2half2_rn( o.z * 0.25f, o.w * 0.25f );
+	}
 }
 
 } // namespace
@@ -320,20 +402,42 @@ void HyperConnection::collapse(
 	float eps,
 	cudaStream_t stream
 ) {
-	int total_elements = 4 * hidden_size;
-	mhc_calc_inv_rms_kernel<<<dim3( 1 ), dim3( 256 ), 0, stream>>>(
-		streams, inv_rms_buf, total_elements
+	const int H = 4;
+	const int row_len = H * hidden_size;
+	const int chunksA = 64;
+	const int chunk_cols = ( ( row_len / chunksA + 4 * NUM_THREADS_A - 1 ) / ( 4 * NUM_THREADS_A ) ) * ( 4 * NUM_THREADS_A );
+	const int n_chunks_a = ( row_len + chunk_cols - 1 ) / chunk_cols;
+
+	const int chunksC = 4;
+	const int chunk_cols_c = ( ( hidden_size / chunksC + 4 * NUM_THREADS - 1 ) / ( 4 * NUM_THREADS ) ) * ( 4 * NUM_THREADS );
+	const int n_chunks_c = ( hidden_size + chunk_cols_c - 1 ) / chunk_cols_c;
+
+	dim3 grid_a( n_chunks_a, 1 );
+	dim3 grid_c( n_chunks_c, 1 );
+
+	hc_mix_partials_kernel<4, 24, float><<<grid_a, NUM_THREADS_A, 0, stream>>>(
+		streams,
+		fn,
+		row_len,
+		chunk_cols
 	);
-	mhc_gemv_kernel<<<dim3( 24 ), dim3( 256 ), 0, stream>>>(
-		streams, inv_rms_buf, fn, mix_logits_buf, total_elements
-	);
-	mhc_sinkhorn_kernel<<<dim3( 1 ), dim3( 32 ), 0, stream>>>(
-		mix_logits_buf, base, scale, pre_buf, post_out, comb_out, sinkhorn_iters, eps
-	);
-	int threads = 256;
-	int blocks = ( hidden_size + threads - 1 ) / threads;
-	mhc_collapse_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
-		streams, pre_buf, collapsed_out, hidden_size
+
+	hc_mix_finalize_kernel<4, 24, false, true><<<grid_c, NUM_THREADS, 0, stream>>>(
+		streams,
+		base,
+		scale,
+		post_out,
+		comb_out,
+		collapsed_out,
+		inv_rms_buf,
+		mix_logits_buf,
+		pre_buf,
+		hidden_size,
+		chunksA,
+		chunk_cols_c,
+		1e-5f,
+		eps,
+		sinkhorn_iters
 	);
 }
 
@@ -396,10 +500,20 @@ void HyperConnection::update(
 	int hidden_size,
 	cudaStream_t stream
 ) {
-	int threads = 256;
-	int blocks = ( hidden_size + threads - 1 ) / threads;
-	mhc_expand_and_update_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
-		streams_out, streams_in, sublayer_out, post, comb, hidden_size
+	if ( streams_out != streams_in ) {
+		CUDA_CHECK( cudaMemcpyAsync( streams_out, streams_in, 4 * hidden_size * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
+	}
+	int chunks_c = 4;
+	int chunk_cols = ( ( hidden_size / chunks_c + 4 * NUM_THREADS - 1 ) / ( 4 * NUM_THREADS ) ) * ( 4 * NUM_THREADS );
+	int n_chunks = ( hidden_size + chunk_cols - 1 ) / chunk_cols;
+	dim3 grid( n_chunks, 1 );
+	hc_apply_kernel<4, half, true><<<grid, NUM_THREADS, 0, stream>>>(
+		streams_out,
+		sublayer_out,
+		post,
+		comb,
+		hidden_size,
+		chunk_cols
 	);
 }
 
@@ -431,7 +545,7 @@ void HyperHead::mean(
 	cudaStream_t stream
 ) {
 	int threads = 256;
-	int blocks = ( hidden_size + threads - 1 ) / threads;
+	int blocks = ( ( hidden_size / 4 ) + threads - 1 ) / threads;
 	mhc_hyperhead_mean_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
 		streams, final_hidden, hidden_size
 	);

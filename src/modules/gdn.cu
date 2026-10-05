@@ -279,39 +279,75 @@ __global__ void project_kda_stage1_kernel(
 	half* __restrict__ g_a_buf,
 	int hidden_size
 ) {
-	int t = threadIdx.x;
+	int row = blockIdx.x;
+	if ( row >= 272 ) return;
 
-	if ( t < 16 && b_proj != nullptr ) {
-		int h = t;
-		const half* b_row = b_proj + h * hidden_size;
-		float sum_b = 0.0f;
-		#pragma unroll 4
-		for ( int i = 0; i < hidden_size; ++i ) {
-			sum_b = fmaf( __half2float( norm_hidden[i] ), __half2float( b_row[i] ), sum_b );
-		}
-		beta_out[h] = 1.0f / ( 1.0f + __expf( -sum_b ) );
+	const half* weight_row = nullptr;
+	if ( row < 16 ) {
+		if ( b_proj == nullptr ) return;
+		weight_row = b_proj + row * hidden_size;
+	}
+	else if ( row < 144 ) {
+		if ( f_a_proj == nullptr ) return;
+		weight_row = f_a_proj + ( row - 16 ) * hidden_size;
+	}
+	else {
+		if ( g_a_proj == nullptr ) return;
+		weight_row = g_a_proj + ( row - 144 ) * hidden_size;
 	}
 
-	if ( t < 128 && f_a_proj != nullptr ) {
-		int i = t;
-		const half* fa_row = f_a_proj + i * hidden_size;
-		float sum_f = 0.0f;
-		#pragma unroll 4
-		for ( int k = 0; k < hidden_size; ++k ) {
-			sum_f = fmaf( __half2float( norm_hidden[k] ), __half2float( fa_row[k] ), sum_f );
+	int tid = threadIdx.x;
+	float sum = 0.0f;
+
+	const float4* x4 = reinterpret_cast<const float4*>( norm_hidden );
+	const float4* w4 = reinterpret_cast<const float4*>( weight_row );
+	int num_float4 = hidden_size / 8; // 4096 / 8 = 512
+
+	for ( int i = tid; i < num_float4; i += blockDim.x ) {
+		float4 vx = x4[i];
+		float4 vw = w4[i];
+		const half2* hx = reinterpret_cast<const half2*>( &vx );
+		const half2* hw = reinterpret_cast<const half2*>( &vw );
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			float2 fx = __half22float2( hx[j] );
+			float2 fw = __half22float2( hw[j] );
+			sum = fmaf( fx.x, fw.x, sum );
+			sum = fmaf( fx.y, fw.y, sum );
 		}
-		f_a_buf[i] = __float2half_rn( sum_f );
 	}
 
-	if ( t >= 128 && g_a_proj != nullptr ) {
-		int i = t - 128;
-		const half* ga_row = g_a_proj + i * hidden_size;
-		float sum_g = 0.0f;
-		#pragma unroll 4
-		for ( int k = 0; k < hidden_size; ++k ) {
-			sum_g = fmaf( __half2float( norm_hidden[k] ), __half2float( ga_row[k] ), sum_g );
+	#pragma unroll
+	for ( int mask = 16; mask > 0; mask >>= 1 ) {
+		sum += __shfl_xor_sync( 0xffffffff, sum, mask );
+	}
+
+	__shared__ float s_warp_sums[8];
+	int warp_id = tid >> 5;
+	int lane_id = tid & 31;
+
+	if ( lane_id == 0 ) {
+		s_warp_sums[warp_id] = sum;
+	}
+	__syncthreads();
+
+	if ( warp_id == 0 ) {
+		float b_sum = ( lane_id < ( blockDim.x >> 5 ) ) ? s_warp_sums[lane_id] : 0.0f;
+		#pragma unroll
+		for ( int mask = 4; mask > 0; mask >>= 1 ) {
+			b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
 		}
-		g_a_buf[i] = __float2half_rn( sum_g );
+		if ( lane_id == 0 ) {
+			if ( row < 16 ) {
+				beta_out[row] = 1.0f / ( 1.0f + __expf( -b_sum ) );
+			}
+			else if ( row < 144 ) {
+				f_a_buf[row - 16] = __float2half_rn( b_sum );
+			}
+			else {
+				g_a_buf[row - 144] = __float2half_rn( b_sum );
+			}
+		}
 	}
 }
 
@@ -332,11 +368,22 @@ __global__ void project_kda_stage2_kernel(
 	int h = j / 128;
 
 	if ( f_b_proj != nullptr ) {
-		const half* fb_row = f_b_proj + j * 128;
+		const float4* fa4 = reinterpret_cast<const float4*>( f_a_buf );
+		const float4* fb4 = reinterpret_cast<const float4*>( f_b_proj + j * 128 );
 		float f_val = 0.0f;
-		#pragma unroll 4
-		for ( int i = 0; i < 128; ++i ) {
-			f_val = fmaf( __half2float( f_a_buf[i] ), __half2float( fb_row[i] ), f_val );
+		#pragma unroll
+		for ( int i = 0; i < 16; ++i ) {
+			float4 vfa = fa4[i];
+			float4 vfb = fb4[i];
+			const half2* hfa = reinterpret_cast<const half2*>( &vfa );
+			const half2* hfb = reinterpret_cast<const half2*>( &vfb );
+			#pragma unroll
+			for ( int k = 0; k < 4; ++k ) {
+				float2 f1 = __half22float2( hfa[k] );
+				float2 f2 = __half22float2( hfb[k] );
+				f_val = fmaf( f1.x, f2.x, f_val );
+				f_val = fmaf( f1.y, f2.y, f_val );
+			}
 		}
 		float dt = ( dt_bias != nullptr ) ? __half2float( dt_bias[j] ) : 0.0f;
 		float gf = f_val + dt;
@@ -347,11 +394,22 @@ __global__ void project_kda_stage2_kernel(
 	}
 
 	if ( g_b_proj != nullptr ) {
-		const half* gb_row = g_b_proj + j * 128;
+		const float4* ga4 = reinterpret_cast<const float4*>( g_a_buf );
+		const float4* gb4 = reinterpret_cast<const float4*>( g_b_proj + j * 128 );
 		float z_val = 0.0f;
-		#pragma unroll 4
-		for ( int i = 0; i < 128; ++i ) {
-			z_val = fmaf( __half2float( g_a_buf[i] ), __half2float( gb_row[i] ), z_val );
+		#pragma unroll
+		for ( int i = 0; i < 16; ++i ) {
+			float4 vga = ga4[i];
+			float4 vgb = gb4[i];
+			const half2* hga = reinterpret_cast<const half2*>( &vga );
+			const half2* hgb = reinterpret_cast<const half2*>( &vgb );
+			#pragma unroll
+			for ( int k = 0; k < 4; ++k ) {
+				float2 g1 = __half22float2( hga[k] );
+				float2 g2 = __half22float2( hgb[k] );
+				z_val = fmaf( g1.x, g2.x, z_val );
+				z_val = fmaf( g1.y, g2.y, z_val );
+			}
 		}
 		z_out[j] = __float2half_rn( z_val );
 	}
@@ -419,6 +477,10 @@ __global__ void kda_recurrent_step_and_norm_kernel(
 	int c = threadIdx.x;
 	if ( h >= num_heads || c >= head_dim ) return;
 
+	__shared__ float s_g_exp[128];
+	__shared__ float s_k[128];
+	__shared__ float s_q[128];
+
 	float* head_state = state + static_cast<size_t>( h ) * head_dim * head_dim;
 	const half* q_ptr = qkv + h * head_dim;
 	const half* k_ptr = qkv + num_heads * head_dim + h * head_dim;
@@ -426,14 +488,19 @@ __global__ void kda_recurrent_step_and_norm_kernel(
 	const float* head_g = g_decay + h * head_dim;
 	float beta_h = beta[h];
 
+	s_g_exp[c] = __expf( head_g[c] );
+	s_k[c] = __half2float( k_ptr[c] );
+	s_q[c] = __half2float( q_ptr[c] );
+	__syncthreads();
+
 	// 1. Decay state and compute kv_mem for column c
 	float kv_mem = 0.0f;
 	#pragma unroll 4
 	for ( int r = 0; r < head_dim; ++r ) {
-		float g_exp = __expf( head_g[r] );
+		float g_exp = s_g_exp[r];
 		float s = head_state[r * head_dim + c] * g_exp;
 		head_state[r * head_dim + c] = s;
-		kv_mem = fmaf( s, __half2float( k_ptr[r] ), kv_mem );
+		kv_mem = fmaf( s, s_k[r], kv_mem );
 	}
 
 	// 2. Compute delta for column c: beta_t * (v_t - S_{t-1} k_t)
@@ -444,9 +511,9 @@ __global__ void kda_recurrent_step_and_norm_kernel(
 	float y_core = 0.0f;
 	#pragma unroll 4
 	for ( int r = 0; r < head_dim; ++r ) {
-		float s = fmaf( __half2float( k_ptr[r] ), delta, head_state[r * head_dim + c] );
+		float s = fmaf( s_k[r], delta, head_state[r * head_dim + c] );
 		head_state[r * head_dim + c] = s;
-		y_core = fmaf( s, __half2float( q_ptr[r] ), y_core );
+		y_core = fmaf( s, s_q[r], y_core );
 	}
 
 	// 4. In-register Gated RMSNorm across 128 threads of this head
@@ -589,7 +656,7 @@ void GDN::project_kda_gates(
 ) {
 	(void) num_heads;
 	(void) head_dim;
-	project_kda_stage1_kernel<<<dim3( 1 ), dim3( 256 ), 0, stream>>>(
+	project_kda_stage1_kernel<<<dim3( 272 ), dim3( 256 ), 0, stream>>>(
 		norm_hidden.ptr<const half>(),
 		b_proj.ptr<const half>(),
 		f_a_proj.ptr<const half>(),
