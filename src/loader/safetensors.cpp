@@ -801,8 +801,12 @@ pod::LinearWeight SafeTensorsRepo::load_linear(
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.svh", base_name );
 	pod::TensorView svh = load( name_buf, arena, stream, pod::DType::FP16 );
 
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.mul1", base_name );
+	int dummy_shard = -1;
+	bool has_mul1 = ( find( name_buf, &dummy_shard ) != nullptr );
+
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( tr.shape[2] / 16 ) : bits;
-	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits );
+	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1 );
 }
 
 pod::LinearWeight SafeTensorsRepo::load_linear_slice(
@@ -818,6 +822,10 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
 	pod::TensorView tr = load_slice( name_buf, arena, slice_dim, rank, tp_size, stream );
 
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.mul1", base_name );
+	int dummy_shard = -1;
+	bool has_mul1 = ( find( name_buf, &dummy_shard ) != nullptr );
+
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( tr.shape[2] / 16 ) : bits;
 
 	if ( slice_dim == 0 ) {
@@ -827,7 +835,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.svh", base_name );
 		pod::TensorView svh = load( name_buf, arena, stream, pod::DType::FP16 );
 
-		return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits );
+		return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1 );
 	}
 	else {
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.suh", base_name );
@@ -836,7 +844,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.svh", base_name );
 		pod::TensorView svh = load_slice( name_buf, arena, 0, rank, tp_size, stream, pod::DType::FP16 );
 
-		return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits );
+		return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1 );
 	}
 }
 
@@ -976,8 +984,12 @@ pod::LinearWeight SafeTensorsRepo::load_grouped_trellis_slice(
 		name_buf, arena, group_channels.data(), rank_channels.data(), num_groups, rank, 0, stream, pod::DType::FP16
 	);
 
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.mul1", base_name );
+	int dummy_shard = -1;
+	bool has_mul1 = ( find( name_buf, &dummy_shard ) != nullptr );
+
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( tr.shape[2] / 16 ) : 5;
-	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits );
+	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1 );
 }
 
 pod::TensorView SafeTensorsRepo::load_grouped_slice(

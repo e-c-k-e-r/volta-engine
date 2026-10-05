@@ -623,16 +623,44 @@ void GDN::recurrent_step(
 	cudaStream_t stream
 ) {
 	float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
-	recurrent_step_kernel<<<dim3( num_v_heads, 1, head_dim / 4 ), dim3( 32, 4 ), 0, stream>>>(
-		gdn_state,
-		qkv.ptr<const half>(),
-		gate.ptr<const float>(),
-		beta.ptr<const float>(),
-		attn_out.ptr<half>(),
-		num_k_heads,
-		num_v_heads,
-		scale
-	);
+	const int m_tokens = ( qkv.ndim >= 1 && qkv.shape[0] > 0 ) ? qkv.shape[0] : 1;
+
+	if ( m_tokens == 1 ) {
+		recurrent_step_kernel<<<dim3( num_v_heads, 1, head_dim / 4 ), dim3( 32, 4 ), 0, stream>>>(
+			gdn_state,
+			qkv.ptr<const half>(),
+			gate.ptr<const float>(),
+			beta.ptr<const float>(),
+			attn_out.ptr<half>(),
+			num_k_heads,
+			num_v_heads,
+			scale
+		);
+	}
+	else {
+		size_t qkv_stride = ( 2 * num_k_heads + num_v_heads ) * head_dim;
+		size_t gate_stride = num_v_heads;
+		size_t beta_stride = num_v_heads;
+		size_t out_stride = num_v_heads * head_dim;
+
+		for ( int m = 0; m < m_tokens; ++m ) {
+			const half* qkv_m = qkv.ptr<const half>() + m * qkv_stride;
+			const float* gate_m = gate.ptr<const float>() + m * gate_stride;
+			const float* beta_m = beta.ptr<const float>() + m * beta_stride;
+			half* out_m = attn_out.ptr<half>() + m * out_stride;
+
+			recurrent_step_kernel<<<dim3( num_v_heads, 1, head_dim / 4 ), dim3( 32, 4 ), 0, stream>>>(
+				gdn_state,
+				qkv_m,
+				gate_m,
+				beta_m,
+				out_m,
+				num_k_heads,
+				num_v_heads,
+				scale
+			);
+		}
+	}
 }
 
 void GDN::project_kda_gates(

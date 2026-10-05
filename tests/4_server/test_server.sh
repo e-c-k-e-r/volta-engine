@@ -90,8 +90,8 @@ SSE_RESP=$(curl -s -N -X POST "http://$HOST:$PORT/v1/chat/completions" \
 	-H "Content-Type: application/json" \
 	-d '{"model":"qwen38","messages":[{"role":"user","content":"List the first 5 prime numbers:"}],"stream":true,"max_tokens":20}')
 
-echo "    SSE Output sample (first 10 lines):"
-echo "$SSE_RESP" | head -n 10
+echo "    SSE Output sample:"
+echo "$SSE_RESP"
 if ! echo "$SSE_RESP" | grep -q "data: \[DONE\]"; then
 	echo "[-] FATAL: Streaming SSE completion missing data: [DONE] termination marker!"
 	exit 1

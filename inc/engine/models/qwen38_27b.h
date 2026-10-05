@@ -39,6 +39,8 @@ struct Qwen38Config {
 	int linear_head_dim = 128;
 	int linear_channels = 10240; // 16*128 + 16*128 + 48*128
 	int max_seq = 2048;
+	float rms_norm_eps = 1e-6f;
+	float rms_norm_bias = 1.0f;
 };
 
 struct Qwen38State {

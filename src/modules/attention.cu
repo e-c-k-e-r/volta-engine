@@ -9,8 +9,9 @@ namespace {
 
 #define ATTN_PAGE_SIZE 256
 #define ATTN_MAX_CHUNKS 16
+#define ATTN_MAX_HEAD_DIM 256
 
-__device__ float g_attn_workspace[8 * 16 * ATTN_MAX_CHUNKS * ( 128 + 2 )];
+__device__ float g_attn_workspace[8 * 16 * ATTN_MAX_CHUNKS * ( ATTN_MAX_HEAD_DIM + 2 )];
 
 __global__ void unpack_q_gate_kernel(
 	const half* __restrict__ q_gate,
@@ -133,19 +134,13 @@ __global__ void attn_chunked_paged_kernel(
 
 			float my_v = __half2float( v_cache[kv_offset] );
 			float score = s_score;
-			if ( t == kv_start ) {
-				m_reg = score;
-				l_reg = 1.0f;
-				o_dim = my_v;
-			}
-			else {
-				float m_new = fmaxf( m_reg, score );
-				float alpha = expf( m_reg - m_new );
-				float exp_s = expf( score - m_new );
-				o_dim = alpha * o_dim + exp_s * my_v;
-				l_reg = alpha * l_reg + exp_s;
-				m_reg = m_new;
-			}
+
+			float m_new = fmaxf( m_reg, score );
+			float alpha = expf( m_reg - m_new );
+			float exp_s = expf( score - m_new );
+			o_dim = alpha * o_dim + exp_s * my_v;
+			l_reg = alpha * l_reg + exp_s;
+			m_reg = m_new;
 		}
 	}
 
@@ -160,7 +155,7 @@ __global__ void attn_chunked_paged_kernel(
 		out_head[tid] = __float2half_rn( o_dim * inv_l * sig );
 	}
 	else {
-		float* ws = workspace + ( ( static_cast<size_t>( m ) * num_q_heads + head ) * n_chunks + chunk ) * ( head_dim + 2 );
+		float* ws = workspace + ( ( static_cast<size_t>( m ) * num_q_heads + head ) * n_chunks + chunk ) * ( ATTN_MAX_HEAD_DIM + 2 );
 		if ( tid == 0 ) {
 			ws[0] = m_reg;
 			ws[1] = l_reg;
@@ -186,10 +181,10 @@ __global__ void attn_reduce_kernel(
 	float l_acc = 0.0f;
 	float o_acc = 0.0f;
 
-	const float* ws_base = workspace + ( static_cast<size_t>( token_idx ) * num_q_heads + q_head ) * n_chunks * ( D + 2 );
+	const float* ws_base = workspace + ( static_cast<size_t>( token_idx ) * num_q_heads + q_head ) * n_chunks * ( ATTN_MAX_HEAD_DIM + 2 );
 
 	for ( int c = 0; c < n_chunks; ++c ) {
-		const float* ws_c = ws_base + static_cast<size_t>( c ) * ( D + 2 );
+		const float* ws_c = ws_base + static_cast<size_t>( c ) * ( ATTN_MAX_HEAD_DIM + 2 );
 		float m_c = ws_c[0];
 		float l_c = ws_c[1];
 		float o_c = ws_c[2 + tid];
@@ -227,7 +222,9 @@ void Attention::unpack_q_gate(
 	cudaStream_t stream
 ) {
 	int M = ( q_gate.ndim >= 2 && q_gate.shape[0] > 0 ) ? q_gate.shape[0] : 1;
-	unpack_q_gate_kernel<<<dim3( num_q_heads, M ), dim3( head_dim ), 0, stream>>>(
+	dim3 grid( num_q_heads, M );
+	dim3 block( head_dim );
+	unpack_q_gate_kernel<<<grid, block, 0, stream>>>(
 		q_gate.ptr<const half>(),
 		q.ptr<half>(),
 		gate.ptr<half>(),
@@ -314,13 +311,33 @@ void Attention::forward_decode(
 	if ( n_chunks > 1 ) {
 		dim3 red_grid( num_q_heads, M );
 		dim3 red_block( head_dim );
-		attn_reduce_kernel<128><<<red_grid, red_block, 0, stream>>>(
-			g_attn_workspace,
-			gate.ptr<const half>(),
-			out.ptr<half>(),
-			num_q_heads,
-			n_chunks
-		);
+		if ( head_dim == 256 ) {
+			attn_reduce_kernel<256><<<red_grid, red_block, 0, stream>>>(
+				g_attn_workspace,
+				gate.ptr<const half>(),
+				out.ptr<half>(),
+				num_q_heads,
+				n_chunks
+			);
+		}
+		else if ( head_dim == 128 ) {
+			attn_reduce_kernel<128><<<red_grid, red_block, 0, stream>>>(
+				g_attn_workspace,
+				gate.ptr<const half>(),
+				out.ptr<half>(),
+				num_q_heads,
+				n_chunks
+			);
+		}
+		else {
+			attn_reduce_kernel<64><<<red_grid, red_block, 0, stream>>>(
+				g_attn_workspace,
+				gate.ptr<const half>(),
+				out.ptr<half>(),
+				num_q_heads,
+				n_chunks
+			);
+		}
 	}
 }
 

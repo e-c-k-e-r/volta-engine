@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 #include <cctype>
+#include <algorithm>
+#include <functional>
 #include <thread>
 #include <pthread.h>
 #include <memory>
@@ -290,10 +292,13 @@ int main( int argc, char** argv ) {
 
 		pod::TensorView in_tokens[ENGINE_NUM_GPUS];
 		pod::TensorView out_logits[ENGINE_NUM_GPUS];
+		int* d_candidate_tokens[ENGINE_NUM_GPUS];
 		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-			int tshape[2] = { 1, qwen_config.hidden_size };
+			int tshape[2] = { 8, qwen_config.hidden_size };
 			in_tokens[d] = engine::core::arena_alloc_tensor( qwen_arenas[d], pod::DType::FP16, tshape, 2 );
 			out_logits[d] = engine::core::arena_alloc_tensor( qwen_arenas[d], pod::DType::FP16, tshape, 2 );
+			CUDA_CHECK( cudaSetDevice( d ) );
+			d_candidate_tokens[d] = static_cast<int*>( engine::core::arena_alloc( qwen_arenas[d], 8 * sizeof( int ) ) );
 		}
 
 		for ( size_t i = 0; i < sizeof( qwen_test_cases ) / sizeof( qwen_test_cases[0] ); ++i ) {
@@ -318,6 +323,31 @@ int main( int argc, char** argv ) {
 						if ( tok >= 0 ) {
 							qwen_pipes[d].embed_token( tok, qwen_streams[d] );
 						}
+						in_tokens[d].shape[0] = 1;
+						out_logits[d].shape[0] = 1;
+						qwen_pipes[d].forward_step( in_tokens[d], out_logits[d], current_pos, qwen_streams[d] );
+						CUDA_CHECK( cudaStreamSynchronize( qwen_streams[d] ) );
+					} );
+				}
+				for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+					workers[d].join();
+				}
+			};
+
+			auto run_step_4gpu_batched = [&]( const int* h_tokens, int batch_size, int current_pos ) {
+				std::thread workers[ENGINE_NUM_GPUS];
+				for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+					workers[d] = std::thread( [&, d]() {
+						cpu_set_t cpuset;
+						CPU_ZERO( &cpuset );
+						CPU_SET( d, &cpuset );
+						pthread_setaffinity_np( pthread_self(), sizeof( cpu_set_t ), &cpuset );
+
+						CUDA_CHECK( cudaSetDevice( d ) );
+						CUDA_CHECK( cudaMemcpyAsync( d_candidate_tokens[d], h_tokens, batch_size * sizeof( int ), cudaMemcpyHostToDevice, qwen_streams[d] ) );
+						qwen_pipes[d].embed_tokens( d_candidate_tokens[d], batch_size, qwen_streams[d] );
+						in_tokens[d].shape[0] = batch_size;
+						out_logits[d].shape[0] = batch_size;
 						qwen_pipes[d].forward_step( in_tokens[d], out_logits[d], current_pos, qwen_streams[d] );
 						CUDA_CHECK( cudaStreamSynchronize( qwen_streams[d] ) );
 					} );
@@ -343,7 +373,27 @@ int main( int argc, char** argv ) {
 					if ( step == 0 ) first_token = next_token;
 					std::string token_str = decode_token( next_token, id_to_token );
 
-					std::printf( "    [Step %d] Token ID: %d -> \"%s\"\n", step, next_token, token_str.c_str() );
+					// Diagnostic: print top 3 logits
+					std::vector<half> h_logits( 248320 );
+					CUDA_CHECK( cudaMemcpy( h_logits.data(), qwen_pipes[0].logits().ptr<const half>(), 248320 * sizeof( half ), cudaMemcpyDeviceToHost ) );
+					std::vector<std::pair<float, int>> topk;
+					for ( int v = 0; v < 248320; ++v ) {
+						float val = __half2float( h_logits[v] );
+						if ( topk.size() < 3 ) {
+							topk.push_back( { val, v } );
+							std::sort( topk.begin(), topk.end(), std::greater<std::pair<float, int>>() );
+						}
+						else if ( val > topk.back().first ) {
+							topk.back() = { val, v };
+							std::sort( topk.begin(), topk.end(), std::greater<std::pair<float, int>>() );
+						}
+					}
+					std::printf( "    [Step %d] Token ID: %d -> \"%s\" (top3: %d:%.2f \"%s\", %d:%.2f \"%s\", %d:%.2f \"%s\")\n",
+						step, next_token, token_str.c_str(),
+						topk[0].second, topk[0].first, decode_token( topk[0].second, id_to_token ).c_str(),
+						topk[1].second, topk[1].first, decode_token( topk[1].second, id_to_token ).c_str(),
+						topk[2].second, topk[2].first, decode_token( topk[2].second, id_to_token ).c_str()
+					);
 					generated_text += token_str;
 
 					std::string current_trimmed = trim( generated_text );
@@ -421,16 +471,30 @@ int main( int argc, char** argv ) {
 					if ( active_draft < 1 ) active_draft = 1;
 					total_draft_proposed += active_draft;
 
+					// 3. Batched Target Verification: evaluate active draft tokens in a single forward pass
+					int h_cands[8];
+					for ( int k = 1; k <= active_draft; ++k ) {
+						h_cands[k - 1] = h_draft[k];
+					}
+
+					for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+						qwen_pipes[d].checkpoint_state( qwen_streams[d] );
+					}
+
+					run_step_4gpu_batched( h_cands, active_draft, pos );
+					CUDA_CHECK( cudaSetDevice( 0 ) );
 					int target_preds[8];
-					target_preds[0] = target_pred;
+					qwen_pipes[0].sample_next_tokens( target_preds, active_draft, qwen_streams[0] );
+
+					int accepted_count = 0;
 					int bonus_or_diverged = target_pred;
 
-					// 3. Compare active draft tokens against target predictions
 					for ( int k = 1; k <= active_draft; ++k ) {
 						int draft_tok = h_draft[k];
-						int expected_tok = target_preds[k - 1];
+						int expected_tok = ( k == 1 ) ? target_pred : target_preds[k - 2];
 
 						if ( draft_tok == expected_tok ) {
+							accepted_count++;
 							total_draft_accepted++;
 							total_generated++;
 							full_context.push_back( draft_tok );
@@ -444,11 +508,14 @@ int main( int argc, char** argv ) {
 								break;
 							}
 
-							if ( k < active_draft ) {
-								run_step_4gpu( draft_tok, pos++ );
-								CUDA_CHECK( cudaSetDevice( 0 ) );
-								target_preds[k] = qwen_pipes[0].sample_next_token( qwen_streams[0] );
-								bonus_or_diverged = target_preds[k];
+							if ( k == active_draft ) {
+								// All active draft tokens matched! Bonus token from target prediction
+								bonus_or_diverged = target_preds[active_draft - 1];
+								total_generated++;
+								full_context.push_back( bonus_or_diverged );
+								std::string b_str = decode_token( bonus_or_diverged, id_to_token );
+								std::printf( "    [Bonus Token %d] Token ID: %d -> \"%s\"\n", active_draft + 1, bonus_or_diverged, b_str.c_str() );
+								generated_text += b_str;
 							}
 						}
 						else {
@@ -463,6 +530,16 @@ int main( int argc, char** argv ) {
 						}
 					}
 
+					// Update position and state: if partial accept, rollback and step the accepted prefix
+					if ( accepted_count < active_draft ) {
+						for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+							qwen_pipes[d].rollback_state( qwen_streams[d] );
+						}
+						if ( accepted_count > 0 ) {
+							run_step_4gpu_batched( h_cands, accepted_count, pos );
+						}
+					}
+					pos += ( accepted_count + 1 );
 					next_token = bonus_or_diverged;
 					token_str = decode_token( next_token, id_to_token );
 				}
@@ -488,13 +565,13 @@ int main( int argc, char** argv ) {
 			if ( i == 0 && ( actual_completion == "Paris" || first_token == 57590 || first_token == 11751 || actual_completion.find( "Paris" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
-			else if ( i == 1 && ( first_token == 17 || actual_completion.find( "2" ) != std::string::npos || actual_completion.find( "prime" ) != std::string::npos || actual_completion.find( "first" ) != std::string::npos ) ) {
+			else if ( i == 1 && ( first_token == 17 || actual_completion.find( "2" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
-			else if ( i == 2 && ( first_token == 220 || first_token == 23 || actual_completion.find( "84920" ) != std::string::npos || actual_completion.find( "secret" ) != std::string::npos ) ) {
+			else if ( i == 2 && ( first_token == 220 || first_token == 23 || actual_completion.find( "84920" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
-			else if ( i == 3 && ( actual_completion == "Tokyo" || first_token == 51076 || first_token == 25358 || actual_completion.find( "Tokyo" ) != std::string::npos || actual_completion.find( "Japan" ) != std::string::npos ) ) {
+			else if ( i == 3 && ( actual_completion == "Tokyo" || first_token == 51076 || first_token == 25358 || actual_completion.find( "Tokyo" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
 
@@ -839,16 +916,16 @@ int main( int argc, char** argv ) {
 			std::fflush( stdout );
 
 			bool prompt_pass = false;
-			if ( i == 0 && ( actual_completion == "Paris" || first_token == 59190 || first_token == 12089 || actual_completion.find( "Paris" ) != std::string::npos || generated_text.find( "Paris" ) != std::string::npos || generated_text.find( "user" ) != std::string::npos ) ) {
+			if ( i == 0 && ( actual_completion == "Paris" || first_token == 59190 || first_token == 12089 || actual_completion.find( "Paris" ) != std::string::npos || generated_text.find( "Paris" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
 			else if ( i == 1 && ( first_token == 17 || actual_completion.find( "2" ) != std::string::npos || generated_text.find( "2" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
-			else if ( i == 2 && ( first_token == 23 || actual_completion.find( "84920" ) != std::string::npos || generated_text.find( "84920" ) != std::string::npos || generated_text.find( "secret" ) != std::string::npos ) ) {
+			else if ( i == 2 && ( first_token == 23 || actual_completion.find( "84920" ) != std::string::npos || generated_text.find( "84920" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
-			else if ( i == 3 && ( actual_completion == "Tokyo" || first_token == 26113 || first_token == 52504 || actual_completion.find( "Tokyo" ) != std::string::npos || generated_text.find( "Tokyo" ) != std::string::npos || generated_text.find( "Japan" ) != std::string::npos || generated_text.find( "user" ) != std::string::npos ) ) {
+			else if ( i == 3 && ( actual_completion == "Tokyo" || first_token == 26113 || first_token == 52504 || actual_completion.find( "Tokyo" ) != std::string::npos || generated_text.find( "Tokyo" ) != std::string::npos ) ) {
 				prompt_pass = true;
 			}
 

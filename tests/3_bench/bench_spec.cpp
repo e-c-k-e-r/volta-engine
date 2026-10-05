@@ -246,11 +246,8 @@ int main( int argc, char** argv ) {
 		CUDA_CHECK( cudaMemcpyAsync( h_draft, spec.d_draft_tokens(), 8 * sizeof( int ), cudaMemcpyDeviceToHost, streams[0] ) );
 		CUDA_CHECK( cudaStreamSynchronize( streams[0] ) );
 
-		// 2. Candidate block [T_0, T_1..T_7] assembled in h_draft (M=8)
-		int expected_a = ( rounds % 4 == 0 ) ? 5 : ( ( rounds % 4 == 1 ) ? 4 : ( ( rounds % 4 == 2 ) ? 5 : 4 ) );
-		for ( int k = 1; k <= expected_a; ++k ) {
-			h_draft[k] = ( cur_token + k ) % 248320;
-		}
+		// 2. Candidate block [T_0, T_1..T_7] assembled: T_0 is current anchor
+		h_draft[0] = cur_token;
 
 		// 3. Launch single batched target forward pass (M=8) across all 4 GPUs via cudaGraphLaunch
 		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
@@ -262,11 +259,6 @@ int main( int argc, char** argv ) {
 		CUDA_CHECK( cudaSetDevice( 0 ) );
 		int target_preds[8];
 		pipes[0].sample_next_tokens( target_preds, 8, streams[0] );
-
-		for ( int k = 0; k < expected_a; ++k ) {
-			target_preds[k] = h_draft[k + 1];
-		}
-		target_preds[expected_a] = ( h_draft[expected_a] + 999 ) % 248320; // Divergence at expected_a
 
 		// 5. Find first mismatch index A in [0, 7] where T_{i+1} != P_i
 		int A = 7;

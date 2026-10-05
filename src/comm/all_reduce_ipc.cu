@@ -275,7 +275,7 @@ void CollectiveRing::all_reduce_rms_norm(
 	const half* w_ptr = weight.ptr<const half>();
 	half* out_ptr = ( out != nullptr ) ? out->ptr<half>() : nullptr;
 
-	all_reduce_rms_norm_4ring_kernel<<<dim3( rows ), dim3( 512 ), 0, stream>>>(
+	all_reduce_rms_norm_4ring_kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>(
 		rank,
 		peer_ptrs[0],
 		peer_ptrs[1],

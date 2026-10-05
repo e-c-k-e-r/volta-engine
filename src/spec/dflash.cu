@@ -407,19 +407,6 @@ __global__ void verify_greedy_kernel(
 	}
 }
 
-__global__ void draft_gen_kernel( int* draft_tokens, float* conf, int anchor, int K, int vocab ) {
-	int tid = threadIdx.x;
-	if ( tid < K ) {
-		int token = ( anchor + tid + 1 ) % vocab;
-		draft_tokens[tid + 1] = token;
-		conf[tid + 1] = 0.85f;
-	}
-	if ( tid == 0 ) {
-		draft_tokens[0] = anchor;
-		conf[0] = 1.0f;
-	}
-}
-
 __global__ void init_gate_ones_kernel( half* gate, int count ) {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if ( idx < count ) gate[idx] = __float2half( 1.0f );
@@ -952,9 +939,7 @@ void DFlashSpeculator::draft(
 		);
 	}
 	else {
-		// Pure CUDA deterministic draft sequence generator for benchmarks & unit tests
-		// Generates K=7 coherent candidate tokens matching the model's vocabulary
-		draft_gen_kernel<<<1, 32, 0, stream>>>( d_draft_tokens_, d_conf_, anchor_token, K, config_.vocab_size );
+		ENGINE_ASSERT( false, "DFlash2 draft requires valid target_logits, pred_codebook, and succ_codebook" );
 	}
 }
 

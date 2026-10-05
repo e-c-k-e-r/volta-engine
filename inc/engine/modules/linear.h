@@ -22,12 +22,14 @@ struct LinearWeight {
 	TensorView w2{};    // Trellis: svh
 	float      alpha = 1.0f;
 	int        bits = 4;
+	bool       mul1 = false;
 
 	static LinearWeight make_trellis(
 		const TensorView& codes,
 		const TensorView& suh,
 		const TensorView& svh,
-		int bits = 4
+		int bits = 4,
+		bool mul1 = false
 	) {
 		LinearWeight lw;
 		lw.type = QuantType::TRELLIS;
@@ -36,6 +38,7 @@ struct LinearWeight {
 		lw.w2 = svh;
 		lw.alpha = 1.0f;
 		lw.bits = bits;
+		lw.mul1 = mul1;
 		return lw;
 	}
 

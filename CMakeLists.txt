@@ -78,6 +78,31 @@ add_executable(test_tokenizer tests/2_parity/test_tokenizer.cpp)
 target_link_libraries(test_tokenizer PRIVATE engine_kernels)
 set_target_properties(test_tokenizer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+# Test NVLink AllReduce & Norm Parity
+add_executable(test_all_reduce tests/2_parity/test_all_reduce.cpp)
+target_link_libraries(test_all_reduce PRIVATE engine_kernels pthread)
+set_target_properties(test_all_reduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# Test Attention Module Parity
+add_executable(test_attention tests/2_parity/test_attention.cpp)
+target_link_libraries(test_attention PRIVATE engine_kernels)
+set_target_properties(test_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# Test MLA Module Parity
+add_executable(test_mla tests/2_parity/test_mla.cpp)
+target_link_libraries(test_mla PRIVATE engine_kernels)
+set_target_properties(test_mla PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# Test GDN Linear Attention Parity
+add_executable(test_gdn tests/2_parity/test_gdn.cpp)
+target_link_libraries(test_gdn PRIVATE engine_kernels)
+set_target_properties(test_gdn PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# Test Norm & Elementwise Parity
+add_executable(test_norm tests/2_parity/test_norm.cpp)
+target_link_libraries(test_norm PRIVATE engine_kernels)
+set_target_properties(test_norm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 # Microbenchmarks
 add_executable(bench_all_reduce tests/3_bench/bench_all_reduce.cpp)
 target_link_libraries(bench_all_reduce PRIVATE engine_kernels)

@@ -8,7 +8,6 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
-#include <chrono>
 
 namespace engine::models {
 
@@ -127,7 +126,7 @@ bool Qwen38Pipeline::init(
 	tapped_states_ = static_cast<half*>( engine::core::arena_alloc( arena, 8ULL * 5ULL * config_.hidden_size * sizeof( half ) ) );
 	CUDA_CHECK( cudaMemset( tapped_states_, 0, 8ULL * 5ULL * config_.hidden_size * sizeof( half ) ) );
 
-	// 5. Full attention buffers
+	// 5. Full attention buffers (M=8 capacity)
 	int q_gate_shape[2] = { 8, full_q_heads * config_.full_head_dim * 2 };
 	q_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_gate_shape, 2 );
 
@@ -140,7 +139,7 @@ bool Qwen38Pipeline::init(
 	k_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_shape, 2 );
 	v_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_shape, 2 );
 
-	// 6. Linear attention (GDN) buffers
+	// 6. Linear attention (GDN) buffers (M=8 capacity)
 	int qkv_shape[2] = { 8, lin_channels };
 	qkv_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
 
@@ -152,7 +151,7 @@ bool Qwen38Pipeline::init(
 	gdn_gate_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, gdn_param_shape, 1 );
 	gdn_beta_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, gdn_param_shape, 1 );
 
-	// 7. MLP buffers
+	// 7. MLP buffers (M=8 capacity)
 	int mlp_shape[2] = { 8, inter_size };
 	gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_shape, 2 );
 	up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_shape, 2 );
@@ -163,7 +162,7 @@ bool Qwen38Pipeline::init(
 	int mlp_out_shape[2] = { 8, config_.hidden_size };
 	mlp_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_out_shape, 2 );
 
-	// 8. Logits & argmax (rank 0 hosts)
+	// 8. Logits & argmax (rank 0 hosts M=8 capacity)
 	if ( rank_ == 0 ) {
 		int logit_shape[2] = { 8, 248320 };
 		logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
@@ -482,18 +481,13 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 		}
 
 		// MLP
-		char name_buf_gate[512];
-		char name_buf_up[512];
-		std::snprintf( name_buf_gate, sizeof( name_buf_gate ), "model.language_model.layers.%d.mlp.gate_proj", L );
-		std::snprintf( name_buf_up, sizeof( name_buf_up ), "model.language_model.layers.%d.mlp.up_proj", L );
+		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.gate_proj", L );
+		lw.gate_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 3, 1, rank_, 4, stream )
+		                                : repo.load_linear( name_buf, *arena_, 3, stream );
 
-		if ( tp_size == 4 ) {
-			lw.gate_up_proj = repo.load_linear_slice_fused( name_buf_gate, name_buf_up, *arena_, 3, 1, rank_, 4, stream );
-		}
-		else {
-			lw.gate_proj = repo.load_linear( name_buf_gate, *arena_, 3, stream );
-			lw.up_proj = repo.load_linear( name_buf_up, *arena_, 3, stream );
-		}
+		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.up_proj", L );
+		lw.up_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 3, 1, rank_, 4, stream )
+		                              : repo.load_linear( name_buf, *arena_, 3, stream );
 
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.down_proj", L );
 		lw.down_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 3, 0, rank_, 4, stream )
@@ -724,11 +718,9 @@ void Qwen38Pipeline::forward_step(
 		const auto& lw = layers_[layer];
 
 		// 1. Input RMSNorm: norm_hidden = rms_norm(hidden_states)
-		if ( !ring_ || layer == 0 ) {
-			engine::modules::RMSNorm::forward(
-				hidden_states_, lw.input_norm, norm_hidden_, 1e-6f, 1.0f, stream
-			);
-		}
+		engine::modules::RMSNorm::forward(
+			hidden_states_, lw.input_norm, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
+		);
 
 		// 2. Attention
 		if ( lw.is_full_attention ) {
@@ -803,48 +795,59 @@ void Qwen38Pipeline::forward_step(
 			int v_heads = ( ring_ != nullptr ) ? 12 : config_.linear_num_v_heads;
 			int lin_channels = ( ring_ != nullptr ) ? 2560 : config_.linear_channels;
 
-			// In proj QKV: projects norm_hidden (5120) to QKV (10240 or 2560)
+			// In proj QKV: projects norm_hidden (5120) to QKV (10240 or 2560) across all M rows
 			engine::modules::Linear::forward(
 				norm_hidden_, lw.in_proj_qkv, qkv_buf_, stream
 			);
 
-			// Causal conv1d + SiLU
-			float* hist_ptr = state_.conv_history + ( static_cast<size_t>( active_slot_id_ ) * config_.num_linear_layers + linear_idx ) * lin_channels * 3;
-			pod::TensorView conv_hist = pod::make_tensor_2d( hist_ptr, pod::DType::FP32, lin_channels, 3 );
-			engine::modules::GDN::causal_conv1d_silu(
-				qkv_buf_, conv_hist, lw.conv1d_w, lin_channels, stream
-			);
-
-			// L2 norm on Q and K heads
-			engine::modules::GDN::l2_norm_heads(
-				qkv_buf_, k_heads, config_.linear_head_dim, stream
-			);
-
-			// Project gates: in_proj_a, in_proj_b -> gdn_gate, gdn_beta
-			engine::modules::GDN::project_gates(
-				norm_hidden_, lw.in_proj_a, lw.in_proj_b, lw.A_log, lw.dt_bias,
-				gdn_gate_, gdn_beta_, v_heads, config_.hidden_size, stream
-			);
-
-			// In proj Z: projects norm_hidden (5120) to Z (6144 or 1536)
+			// In proj Z: projects norm_hidden (5120) to Z (6144 or 1536) across all M rows
 			engine::modules::Linear::forward(
 				norm_hidden_, lw.in_proj_z, z_buf_, stream
 			);
 
-			// GDN recurrent step
+			float* hist_ptr = state_.conv_history + ( static_cast<size_t>( active_slot_id_ ) * config_.num_linear_layers + linear_idx ) * lin_channels * 3;
+			pod::TensorView conv_hist = pod::make_tensor_2d( hist_ptr, pod::DType::FP32, lin_channels, 3 );
 			float* layer_gdn_state = state_.gdn_states + ( static_cast<size_t>( active_slot_id_ ) * config_.num_linear_layers + linear_idx ) * v_heads * 128 * 128;
-			engine::modules::GDN::recurrent_step(
-				layer_gdn_state, qkv_buf_, gdn_gate_, gdn_beta_,
-				gdn_out_, k_heads, v_heads,
-				config_.linear_head_dim, stream
-			);
 
-			// Gated RMSNorm: gdn_out * rsqrt * norm_weight * silu(z)
-			engine::modules::GDN::gated_rmsnorm(
-				gdn_out_, z_buf_, lw.linear_norm, v_heads, config_.linear_head_dim, stream, false
-			);
+			// Causal progression across M rows in candidate block
+			for ( int m_idx = 0; m_idx < m; ++m_idx ) {
+				pod::TensorView qkv_row = pod::make_tensor_2d( qkv_buf_.ptr<half>() + m_idx * lin_channels, pod::DType::FP16, 1, lin_channels );
+				pod::TensorView norm_row = pod::make_tensor_2d( norm_hidden_.ptr<half>() + m_idx * config_.hidden_size, pod::DType::FP16, 1, config_.hidden_size );
+				pod::TensorView z_row = pod::make_tensor_2d( z_buf_.ptr<half>() + m_idx * v_heads * 128, pod::DType::FP16, 1, v_heads * 128 );
+				pod::TensorView out_row = pod::make_tensor_2d( gdn_out_.ptr<half>() + m_idx * v_heads * 128, pod::DType::FP16, 1, v_heads * 128 );
+				pod::TensorView gate_row = pod::make_tensor_2d( gdn_gate_.ptr<float>() + m_idx * v_heads, pod::DType::FP32, 1, v_heads );
+				pod::TensorView beta_row = pod::make_tensor_2d( gdn_beta_.ptr<float>() + m_idx * v_heads, pod::DType::FP32, 1, v_heads );
 
-			// Out proj: projects gdn_out (6144 or 1536) to mlp_out (5120)
+				// Causal conv1d + SiLU
+				engine::modules::GDN::causal_conv1d_silu(
+					qkv_row, conv_hist, lw.conv1d_w, lin_channels, stream
+				);
+
+				// L2 norm on Q and K heads
+				engine::modules::GDN::l2_norm_heads(
+					qkv_row, k_heads, config_.linear_head_dim, stream
+				);
+
+				// Project gates: in_proj_a, in_proj_b -> gdn_gate, gdn_beta
+				engine::modules::GDN::project_gates(
+					norm_row, lw.in_proj_a, lw.in_proj_b, lw.A_log, lw.dt_bias,
+					gate_row, beta_row, v_heads, config_.hidden_size, stream
+				);
+
+				// GDN recurrent step: advances state causally
+				engine::modules::GDN::recurrent_step(
+					layer_gdn_state, qkv_row, gate_row, beta_row,
+					out_row, k_heads, v_heads,
+					config_.linear_head_dim, stream
+				);
+
+				// Gated RMSNorm: gdn_out * rsqrt * norm_weight * silu(z)
+				engine::modules::GDN::gated_rmsnorm(
+					out_row, z_row, lw.linear_norm, v_heads, config_.linear_head_dim, stream, false
+				);
+			}
+
+			// Out proj: projects gdn_out (6144 or 1536) to mlp_out (5120) across all M rows
 			engine::modules::Linear::forward(
 				gdn_out_, lw.out_proj, mlp_out_, stream
 			);
@@ -856,9 +859,9 @@ void Qwen38Pipeline::forward_step(
 				mlp_out_,
 				hidden_states_,
 				lw.post_attn_norm,
-				1e-6f,
+				config_.rms_norm_eps,
 				stream,
-				1.0f,
+				config_.rms_norm_bias,
 				&norm_hidden_
 			);
 		}
@@ -866,53 +869,29 @@ void Qwen38Pipeline::forward_step(
 			ring_->all_reduce( mlp_out_, stream );
 			engine::modules::Elementwise::add_residual( hidden_states_, mlp_out_, stream );
 			engine::modules::RMSNorm::forward(
-				hidden_states_, lw.post_attn_norm, norm_hidden_, 1e-6f, 1.0f, stream
+				hidden_states_, lw.post_attn_norm, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
 			);
 		}
 
 		// 4. MLP
-		if ( lw.gate_up_proj.is_valid() ) {
-			engine::modules::Linear::forward(
-				norm_hidden_, lw.gate_up_proj, gate_up_buf_, stream
-			);
-			engine::modules::SwiGLU::forward_fused( gate_up_buf_, mlp_inter_, stream );
-		}
-		else {
-			engine::modules::Linear::forward(
-				norm_hidden_, lw.gate_proj, gate_buf_, stream
-			);
-			engine::modules::Linear::forward(
-				norm_hidden_, lw.up_proj, up_buf_, stream
-			);
-			engine::modules::SwiGLU::forward( gate_buf_, up_buf_, mlp_inter_, stream );
-		}
+		engine::modules::Linear::forward(
+			norm_hidden_, lw.gate_proj, gate_buf_, stream
+		);
+
+		engine::modules::Linear::forward(
+			norm_hidden_, lw.up_proj, up_buf_, stream
+		);
+
+		engine::modules::SwiGLU::forward( gate_buf_, up_buf_, mlp_inter_, stream );
 
 		engine::modules::Linear::forward(
 			mlp_inter_, lw.down_proj, mlp_out_, stream
 		);
 
-		if ( layer + 1 < config_.num_layers ) {
-			if ( ring_ ) {
-				ring_->all_reduce_rms_norm(
-					mlp_out_,
-					hidden_states_,
-					layers_[layer + 1].input_norm,
-					1e-6f,
-					stream,
-					1.0f,
-					&norm_hidden_
-				);
-			}
-			else {
-				engine::modules::Elementwise::add_residual( hidden_states_, mlp_out_, stream );
-			}
+		if ( ring_ ) {
+			ring_->all_reduce( mlp_out_, stream );
 		}
-		else {
-			if ( ring_ ) {
-				ring_->all_reduce( mlp_out_, stream );
-			}
-			engine::modules::Elementwise::add_residual( hidden_states_, mlp_out_, stream );
-		}
+		engine::modules::Elementwise::add_residual( hidden_states_, mlp_out_, stream );
 
 		// Tapped layer states for DFlash2: [5, 19, 33, 47, 61]
 		if ( tapped_states_ != nullptr && ( layer == 5 || layer == 19 || layer == 33 || layer == 47 || layer == 61 ) ) {
@@ -929,7 +908,7 @@ void Qwen38Pipeline::forward_step(
 	}
 
 	if ( output_logits.data != nullptr ) {
-		CUDA_CHECK( cudaMemcpyAsync( output_logits.data, hidden_states_.data, config_.hidden_size * sizeof( half ), cudaMemcpyDeviceToDevice, stream ) );
+		CUDA_CHECK( cudaMemcpyAsync( output_logits.data, hidden_states_.data, static_cast<size_t>( m ) * config_.hidden_size * sizeof( half ), cudaMemcpyDeviceToDevice, stream ) );
 	}
 }
 

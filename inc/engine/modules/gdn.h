@@ -101,7 +101,7 @@ struct GDN {
 		int num_v_heads,
 		int head_dim,
 		cudaStream_t stream = nullptr,
-		bool use_sigmoid = true
+		bool use_sigmoid = false
 	);
 };
 

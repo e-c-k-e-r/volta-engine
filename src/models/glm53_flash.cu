@@ -205,23 +205,10 @@ bool GLM53Pipeline::init(
 	int moe_inter_shape[2] = { 1, config_.dense_intermediate_size };
 	moe_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
 	moe_up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
-	int moe_gate_up_shape[2] = { 1, config_.dense_intermediate_size * 2 };
-	moe_gate_up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_gate_up_shape, 2 );
 	moe_inter_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
 	moe_expert_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	local_moe_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	ffn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
-
-	state_.expert_count = static_cast<int64_t*>( engine::core::arena_alloc( arena, 73 * sizeof( int64_t ) ) );
-	state_.token_sorted = static_cast<int64_t*>( engine::core::arena_alloc( arena, 8 * sizeof( int64_t ) ) );
-	state_.weight_sorted = static_cast<half*>( engine::core::arena_alloc( arena, 8 * sizeof( half ) ) );
-	state_.cursors = static_cast<int*>( engine::core::arena_alloc( arena, 73 * sizeof( int ) ) );
-	state_.d_active_experts = static_cast<int4*>( engine::core::arena_alloc( arena, 73 * sizeof( int4 ) ) );
-
-	temp_state_g_ = static_cast<half*>( engine::core::arena_alloc( arena, 10 * 8 * 4096 * sizeof( half ) ) );
-	temp_state_u_ = static_cast<half*>( engine::core::arena_alloc( arena, 10 * 8 * 4096 * sizeof( half ) ) );
-	temp_interm_g_ = static_cast<half*>( engine::core::arena_alloc( arena, 10 * 8 * 2048 * sizeof( half ) ) );
-	temp_interm_u_ = static_cast<half*>( engine::core::arena_alloc( arena, 10 * 8 * 2048 * sizeof( half ) ) );
 
 	// 5. Fallback dummy descriptors for decode benchmark
 	int d_dn_shape[3] = { config_.hidden_size / 16, config_.hidden_size / 16, 64 };
@@ -360,7 +347,6 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 
 	// 2. Per-layer weights across 45 layers
 	char name_buf[256];
-	int tp_size = config_.tp_size;
 	int experts_per_rank = config_.num_experts / config_.tp_size; // 288 / 4 = 72
 	int start_expert = rank_ * experts_per_rank;
 
@@ -460,55 +446,31 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, gid );
 				ew.down = repo.load_linear( name_buf, *arena_, 4, stream );
-
-				lw.moe_weights.gate[e] = ew.gate;
-				lw.moe_weights.up[e] = ew.up;
-				lw.moe_weights.down[e] = ew.down;
 			}
-			lw.moe_weights.num_local_experts = experts_per_rank;
-			lw.moe_weights.type = pod::QuantType::TRELLIS;
-			engine::modules::MoE::init_device_ptrs( lw.moe_weights, *arena_, stream );
 
 			// Shared experts
-			char name_buf_gate[512];
-			char name_buf_up[512];
-			std::snprintf( name_buf_gate, sizeof( name_buf_gate ), "model.language_model.layers.%d.mlp.shared_experts.gate_proj", L );
-			std::snprintf( name_buf_up, sizeof( name_buf_up ), "model.language_model.layers.%d.mlp.shared_experts.up_proj", L );
-			lw.shared_expert.gate_up_proj = ( tp_size == 4 ) ? repo.load_linear_slice_fused( name_buf_gate, name_buf_up, *arena_, 4, 1, rank_, 4, stream )
-			                                                 : repo.load_linear_slice_fused( name_buf_gate, name_buf_up, *arena_, 4, 1, 0, 1, stream );
-
-			if ( lw.shared_expert.gate_up_proj.is_valid() ) {
-				lw.has_shared_expert = true;
-			}
-			else {
-				lw.shared_expert.gate = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf_gate, *arena_, 4, 1, rank_, 4, stream )
-				                                         : repo.load_linear( name_buf_gate, *arena_, 4, stream );
-				lw.has_shared_expert = lw.shared_expert.gate.is_valid();
-				if ( lw.has_shared_expert ) {
-					lw.shared_expert.up = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf_up, *arena_, 4, 1, rank_, 4, stream )
-					                                       : repo.load_linear( name_buf_up, *arena_, 4, stream );
-				}
-			}
+			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.gate_proj", L );
+			lw.shared_expert.gate = repo.load_linear( name_buf, *arena_, 4, stream );
+			lw.has_shared_expert = lw.shared_expert.gate.is_valid();
 
 			if ( lw.has_shared_expert ) {
+				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.up_proj", L );
+				lw.shared_expert.up = repo.load_linear( name_buf, *arena_, 4, stream );
+
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.down_proj", L );
-				lw.shared_expert.down = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 4, 0, rank_, 4, stream )
-				                                         : repo.load_linear( name_buf, *arena_, 4, stream );
+				lw.shared_expert.down = repo.load_linear( name_buf, *arena_, 4, stream );
 			}
 		}
 		else {
 			// Dense layer
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.gate_proj", L );
-			lw.dense_mlp.gate = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, 4, stream )
-			                                     : repo.load_linear( name_buf, *arena_, 4, stream );
+			lw.dense_mlp.gate = repo.load_linear( name_buf, *arena_, 4, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.up_proj", L );
-			lw.dense_mlp.up = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, 4, stream )
-			                                   : repo.load_linear( name_buf, *arena_, 4, stream );
+			lw.dense_mlp.up = repo.load_linear( name_buf, *arena_, 4, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.down_proj", L );
-			lw.dense_mlp.down = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 4, 0, rank_, 4, stream )
-			                                     : repo.load_linear( name_buf, *arena_, 4, stream );
+			lw.dense_mlp.down = repo.load_linear( name_buf, *arena_, 4, stream );
 		}
 
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.hc_attn_base", L );
@@ -567,7 +529,7 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 				std::printf( "[RANK %d L%d] MISSING: %d/%d local experts invalid!\n", rank_, L, expert_miss, experts_per_rank );
 				missing_count += expert_miss;
 			}
-			if ( ( !lw.shared_expert.gate_up_proj.is_valid() && ( !lw.shared_expert.gate.is_valid() || !lw.shared_expert.up.is_valid() ) ) || !lw.shared_expert.down.is_valid() ) {
+			if ( !lw.shared_expert.gate.is_valid() || !lw.shared_expert.up.is_valid() || !lw.shared_expert.down.is_valid() ) {
 				std::printf( "[RANK %d L%d] MISSING: shared_expert\n", rank_, L );
 				++missing_count;
 			}
@@ -966,48 +928,54 @@ void GLM53Pipeline::forward_step(
 				stream
 			);
 
+			// Copy selected indices and weights to host to dispatch local experts
+			int h_indices[8];
+			half h_weights[8];
+			CUDA_CHECK( cudaMemcpyAsync( h_indices, state_.d_topk_indices, 8 * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
+			CUDA_CHECK( cudaMemcpyAsync( h_weights, state_.d_topk_weights, 8 * sizeof( half ), cudaMemcpyDeviceToHost, stream ) );
+			CUDA_CHECK( cudaStreamSynchronize( stream ) );
+
 			CUDA_CHECK( cudaMemsetAsync( local_moe_out_.data, 0, local_moe_out_.size_bytes(), stream ) );
 
-			pod::TensorView topk_idx_tv = pod::make_tensor_1d( state_.d_topk_indices, pod::DType::INT32, config_.top_k );
-			pod::TensorView topk_weight_tv = pod::make_tensor_1d( state_.d_topk_weights, pod::DType::FP16, config_.top_k );
+			// Execute local active experts falling into this rank's partition
+			for ( int k = 0; k < config_.top_k; ++k ) {
+				int gid = h_indices[k];
+				if ( gid >= start_expert && gid < end_expert ) {
+					int local_e = gid - start_expert;
+					const auto& ew = lw.experts[local_e];
 
-			engine::modules::MoE::forward(
-				norm_hidden_,
-				lw.moe_weights,
-				topk_idx_tv,
-				topk_weight_tv,
-				local_moe_out_,
-				start_expert,
-				end_expert,
-				temp_state_g_,
-				temp_state_u_,
-				temp_interm_g_,
-				temp_interm_u_,
-				state_.expert_count,
-				state_.token_sorted,
-				state_.weight_sorted,
-				state_.cursors,
-				state_.d_active_experts,
-				stream
-			);
+					if ( ew.gate.is_valid() && ew.up.is_valid() && ew.down.is_valid() ) {
+						engine::modules::Linear::forward(
+							norm_hidden_, ew.gate, moe_gate_buf_, stream
+						);
+						engine::modules::Linear::forward(
+							norm_hidden_, ew.up, moe_up_buf_, stream
+						);
+						engine::modules::SwiGLU::forward( moe_gate_buf_, moe_up_buf_, moe_inter_buf_, stream, 10.0f );
+						engine::modules::Linear::forward(
+							moe_inter_buf_, ew.down, moe_expert_out_, stream
+						);
 
-			// Shared expert (executed on all 4 ranks when TP=4, or rank 0 if single-GPU)
-			if ( lw.has_shared_expert && ( ring_ != nullptr || rank_ == 0 ) ) {
-				if ( lw.shared_expert.gate_up_proj.is_valid() ) {
-					engine::modules::Linear::forward(
-						norm_hidden_, lw.shared_expert.gate_up_proj, moe_gate_up_buf_, stream
-					);
-					engine::modules::SwiGLU::forward_fused( moe_gate_up_buf_, moe_inter_buf_, stream, 10.0f );
+						engine::modules::MoERouter::accumulate(
+							local_moe_out_.ptr<half>(),
+							moe_expert_out_.ptr<const half>(),
+							h_weights[k],
+							config_.hidden_size,
+							stream
+						);
+					}
 				}
-				else {
-					engine::modules::Linear::forward(
-						norm_hidden_, lw.shared_expert.gate, moe_gate_buf_, stream
-					);
-					engine::modules::Linear::forward(
-						norm_hidden_, lw.shared_expert.up, moe_up_buf_, stream
-					);
-					engine::modules::SwiGLU::forward( moe_gate_buf_, moe_up_buf_, moe_inter_buf_, stream, 10.0f );
-				}
+			}
+
+			// Shared expert (executed on rank 0, or partitioned)
+			if ( lw.has_shared_expert && rank_ == 0 ) {
+				engine::modules::Linear::forward(
+					norm_hidden_, lw.shared_expert.gate, moe_gate_buf_, stream
+				);
+				engine::modules::Linear::forward(
+					norm_hidden_, lw.shared_expert.up, moe_up_buf_, stream
+				);
+				engine::modules::SwiGLU::forward( moe_gate_buf_, moe_up_buf_, moe_inter_buf_, stream, 10.0f );
 				engine::modules::Linear::forward(
 					moe_inter_buf_, lw.shared_expert.down, moe_expert_out_, stream
 				);
@@ -1039,9 +1007,6 @@ void GLM53Pipeline::forward_step(
 				engine::modules::Linear::forward(
 					moe_inter_buf_, lw.dense_mlp.down, ffn_out_, stream
 				);
-				if ( ring_ ) {
-					ring_->all_reduce( ffn_out_, stream );
-				}
 			}
 		}
 

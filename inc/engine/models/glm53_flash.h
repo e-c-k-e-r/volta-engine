@@ -33,6 +33,8 @@ struct GLM53Config {
 	int dsa_top_k = 64;
 	int vocab_size = 154880;
 	int tp_size = 4;
+	float rms_norm_eps = 1e-6f;
+	float rms_norm_bias = 1.0f;
 };
 
 struct GLM53State {
