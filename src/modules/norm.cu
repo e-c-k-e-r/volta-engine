@@ -67,11 +67,12 @@ __global__ void rms_norm_heads_kernel(
 	float eps,
 	float constant_bias
 ) {
+	// blockIdx.y = row: rows are [num_heads * head_dim] contiguous
 	int head = blockIdx.x;
 	int tid = threadIdx.x;
 	if ( head >= num_heads || tid >= head_dim ) return;
 
-	half* ptr = qk + head * head_dim;
+	half* ptr = qk + ( static_cast<size_t>( blockIdx.y ) * num_heads + head ) * head_dim;
 	float val = __half2float( ptr[tid] );
 	float sq = val * val;
 
@@ -273,7 +274,8 @@ void RMSNorm::forward_heads(
 	float constant_bias,
 	cudaStream_t stream
 ) {
-	rms_norm_heads_kernel<<<dim3( num_heads ), dim3( head_dim ), 0, stream>>>(
+	const int rows = ( qk.ndim >= 2 && qk.shape[0] > 0 ) ? qk.shape[0] : 1;
+	rms_norm_heads_kernel<<<dim3( num_heads, rows ), dim3( head_dim ), 0, stream>>>(
 		qk.ptr<half>(),
 		weight.ptr<const half>(),
 		num_heads,
