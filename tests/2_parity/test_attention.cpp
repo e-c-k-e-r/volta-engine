@@ -59,14 +59,18 @@ int main() {
 		size_t cache_elems = static_cast<size_t>( cfg.max_seq ) * cfg.kv_heads * cfg.head_dim;
 		half* d_k_cache = static_cast<half*>( engine::core::arena_alloc( arena, cache_elems * sizeof( half ) ) );
 		half* d_v_cache = static_cast<half*>( engine::core::arena_alloc( arena, cache_elems * sizeof( half ) ) );
+		auto* d_rows = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
 		CUDA_CHECK( cudaMemset( d_k_cache, 0, cache_elems * sizeof( half ) ) );
 		CUDA_CHECK( cudaMemset( d_v_cache, 0, cache_elems * sizeof( half ) ) );
 
 		std::vector<float> cpu_k_cache( cache_elems, 0.0f );
 		std::vector<float> cpu_v_cache( cache_elems, 0.0f );
 
-		// Simulate 32 sequential decoding steps
-		for ( int pos = 0; pos < 32; ++pos ) {
+		// Sequential decode across several 256-token pages (exercises split-chunk + reduce path);
+		// CPU reference checked on the first 32 steps and a stride beyond
+		const int steps = 600;
+		int checked = 0;
+		for ( int pos = 0; pos < steps; ++pos ) {
 			std::vector<half> h_q( cfg.q_heads * cfg.head_dim );
 			std::vector<half> h_k( cfg.kv_heads * cfg.head_dim );
 			std::vector<half> h_v( cfg.kv_heads * cfg.head_dim );
@@ -96,15 +100,18 @@ int main() {
 
 			// Store K, V in cache
 			const auto rows = pod::BatchRows::causal( 1, pos, 0 );
+			CUDA_CHECK( cudaMemcpyAsync( d_rows, &rows, sizeof( rows ), cudaMemcpyHostToDevice, stream ) );
 			engine::modules::Attention::store_kv_cache(
-				d_k_cache, d_v_cache, d_k, d_v, 0, 0, rows, cfg.kv_heads, cfg.head_dim, cfg.max_seq, stream
+				d_k_cache, d_v_cache, d_k, d_v, 0, 0, d_rows, 1, cfg.kv_heads, cfg.head_dim, cfg.max_seq, stream
 			);
 
 			// Forward decode
 			engine::modules::Attention::forward_decode(
-				d_q, d_k_cache, d_v_cache, d_gate, d_out, 0, 0, rows, cfg.q_heads, cfg.kv_heads, cfg.head_dim, cfg.max_seq, stream
+				d_q, d_k_cache, d_v_cache, d_gate, d_out, 0, 0, d_rows, 1, cfg.q_heads, cfg.kv_heads, cfg.head_dim, cfg.max_seq, stream
 			);
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
+			if ( pos >= 32 && pos % 37 != 0 && pos != steps - 1 ) continue;
+			++checked;
 
 			// Compute exact CPU reference
 			std::vector<float> h_ref_out( cfg.q_heads * cfg.head_dim, 0.0f );
@@ -164,7 +171,7 @@ int main() {
 			double cos_sim = dot / ( std::sqrt( norm_ref ) * std::sqrt( norm_gpu ) + 1e-9 );
 			ENGINE_ASSERT( cos_sim >= 0.9999, "Attention decode failed cosine similarity" );
 		}
-		std::printf( "    -> Config %zu 32/32 steps PASS (cos_sim >= 0.9999).\n", c_idx + 1 );
+		std::printf( "    -> Config %zu %d checked positions (0..%d) PASS (cos_sim >= 0.9999).\n", c_idx + 1, checked, steps - 1 );
 		engine::core::arena_reset( arena );
 	}
 

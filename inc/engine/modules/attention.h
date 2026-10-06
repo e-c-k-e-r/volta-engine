@@ -10,7 +10,8 @@ namespace engine::modules {
 
 // KV cache layout: [slot][layer][max_seq][num_kv_heads * head_dim] FP16.
 // k_cache / v_cache point at slot 0; slot_stride is the per-slot element stride.
-// Row m of every call reads/writes slot rows.slot[m] at position rows.pos[m].
+// Row m of every call reads/writes slot d_rows->slot[m] at position d_rows->pos[m]; d_rows is
+// device-resident so launches carry no position/slot values (CUDA-graph replayable).
 struct Attention {
 	static void unpack_q_gate(
 		const pod::TensorView& q_gate,
@@ -28,7 +29,8 @@ struct Attention {
 		const pod::TensorView& v,
 		size_t slot_stride,
 		int layer_idx,
-		const pod::BatchRows& rows,
+		const pod::BatchRows* d_rows,
+		int count,
 		int num_kv_heads,
 		int head_dim,
 		int max_seq = 2048,
@@ -43,7 +45,8 @@ struct Attention {
 		pod::TensorView& out,
 		size_t slot_stride,
 		int layer_idx,
-		const pod::BatchRows& rows,
+		const pod::BatchRows* d_rows,
+		int count,
 		int num_q_heads,
 		int num_kv_heads,
 		int head_dim,

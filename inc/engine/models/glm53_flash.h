@@ -6,6 +6,7 @@
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
+#include "engine/core/graph_cache.h"
 #include "engine/modules/trellis.h"
 #include "engine/modules/norm.h"
 #include "engine/modules/swiglu.h"
@@ -146,8 +147,12 @@ public:
 	void destroy();
 
 private:
-	// Single-token layer stack for one row: embed_rows_[row] -> logits_[row]
-	void forward_row( int row, int pos, int slot_id, cudaStream_t stream );
+	// Single-token layer stack for one row: embed_rows_[row] -> logits_[row]; slot and position
+	// are read from d_rows_ on device so the launch sequence is graph-replayable
+	void forward_row( int row, cudaStream_t stream );
+
+	pod::BatchRows* d_rows_ = nullptr;
+	engine::core::GraphCache graphs_;
 
 	engine::runtime::KVCachePool kv_pool_;
 	int last_rows_ = 0;

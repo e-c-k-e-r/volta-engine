@@ -52,6 +52,10 @@ public:
 	void sample( int* out, int count );
 	int sample_one();
 
+	// Pre-capture decode graphs for row counts 1..max_m (two dummy forwards each on `slot`,
+	// which is reset afterwards) so serving never pays eager warm-up or capture mid-stream.
+	void warm_graphs( int max_m, int slot = 0 );
+
 	void reset_slot( int slot );
 	void checkpoint( int slot );
 	void rollback( int slot );

@@ -85,10 +85,12 @@ __global__ void causal_conv1d_silu_kernel(
 	half* __restrict__ qkv,
 	float* __restrict__ history,
 	const half* __restrict__ weights,
-	int channels
+	int channels,
+	const pod::SlotRef slot
 ) {
 	int c = blockIdx.x * blockDim.x + threadIdx.x;
 	if ( c >= channels ) return;
+	history = slot.apply( history );
 
 	float v0 = history[c * 3 + 0];
 	float v1 = history[c * 3 + 1];
@@ -165,8 +167,10 @@ recurrent_step_kernel(
 	half* __restrict__ output,
 	int h_k,
 	int h_v,
-	float scale
+	float scale,
+	const pod::SlotRef slot
 ) {
+	state = slot.apply( state );
 	const int head = blockIdx.x;
 	const int lane = threadIdx.x;
 	const int col = blockIdx.z * blockDim.y + threadIdx.y;
@@ -471,11 +475,13 @@ __global__ void kda_recurrent_step_and_norm_kernel(
 	half* __restrict__ output,
 	int num_heads,
 	int head_dim,
-	float eps
+	float eps,
+	const pod::SlotRef slot
 ) {
 	int h = blockIdx.x;
 	int c = threadIdx.x;
 	if ( h >= num_heads || c >= head_dim ) return;
+	state = slot.apply( state );
 
 	__shared__ float s_g_exp[128];
 	__shared__ float s_k[128];
@@ -583,7 +589,8 @@ void GDN::causal_conv1d_silu(
 	pod::TensorView& conv_history,
 	const pod::TensorView& conv_weights,
 	int channels,
-	cudaStream_t stream
+	cudaStream_t stream,
+	const pod::SlotRef& slot
 ) {
 	int threads = 256;
 	int blocks = ( channels + threads - 1 ) / threads;
@@ -591,7 +598,8 @@ void GDN::causal_conv1d_silu(
 		qkv.ptr<half>(),
 		conv_history.ptr<float>(),
 		conv_weights.ptr<const half>(),
-		channels
+		channels,
+		slot
 	);
 }
 
@@ -620,7 +628,8 @@ void GDN::recurrent_step(
 	int num_k_heads,
 	int num_v_heads,
 	int head_dim,
-	cudaStream_t stream
+	cudaStream_t stream,
+	const pod::SlotRef& slot
 ) {
 	float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
 	const int m_tokens = ( qkv.ndim >= 1 && qkv.shape[0] > 0 ) ? qkv.shape[0] : 1;
@@ -634,7 +643,8 @@ void GDN::recurrent_step(
 			attn_out.ptr<half>(),
 			num_k_heads,
 			num_v_heads,
-			scale
+			scale,
+			slot
 		);
 	}
 	else {
@@ -648,6 +658,8 @@ void GDN::recurrent_step(
 			const float* gate_m = gate.ptr<const float>() + m * gate_stride;
 			const float* beta_m = beta.ptr<const float>() + m * beta_stride;
 			half* out_m = attn_out.ptr<half>() + m * out_stride;
+			pod::SlotRef slot_m = slot;
+			slot_m.row = slot.row + m;
 
 			recurrent_step_kernel<<<dim3( num_v_heads, 1, head_dim / 4 ), dim3( 32, 4 ), 0, stream>>>(
 				gdn_state,
@@ -657,7 +669,8 @@ void GDN::recurrent_step(
 				out_m,
 				num_k_heads,
 				num_v_heads,
-				scale
+				scale,
+				slot_m
 			);
 		}
 	}
@@ -743,7 +756,8 @@ void GDN::recurrent_step_kda_fused(
 	int num_heads,
 	int head_dim,
 	float eps,
-	cudaStream_t stream
+	cudaStream_t stream,
+	const pod::SlotRef& slot
 ) {
 	kda_recurrent_step_and_norm_kernel<<<dim3( num_heads ), dim3( head_dim ), 0, stream>>>(
 		gdn_state,
@@ -755,7 +769,8 @@ void GDN::recurrent_step_kda_fused(
 		attn_out.ptr<half>(),
 		num_heads,
 		head_dim,
-		eps
+		eps,
+		slot
 	);
 }
 

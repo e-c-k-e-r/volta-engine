@@ -11,8 +11,7 @@ namespace engine::comm {
 struct CollectiveRing {
 	int   rank;
 	void* peer_ptrs[ENGINE_NUM_GPUS];
-	void* sync_flags[ENGINE_NUM_GPUS];
-	uint32_t seq;
+	void* sync_flags[ENGINE_NUM_GPUS]; // flag pages; sequence counter is device-resident (graph-safe)
 
 	void init( int local_rank, void* const peer_staging[ENGINE_NUM_GPUS], void* const peer_flags[ENGINE_NUM_GPUS] );
 

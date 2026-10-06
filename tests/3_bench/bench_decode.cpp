@@ -3,6 +3,7 @@
 //   Mode A M=8   : causal verify block latency
 //   Mode B       : one token per slot across `slots` independent requests
 #include "engine/runtime/test_driver.h"
+#include <cuda_profiler_api.h>
 #include <cstring>
 
 using namespace engine::runtime;
@@ -17,18 +18,22 @@ void bench_model( const char* type, const char* dir, int steps ) {
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	const auto& meta = mc.metadata();
 	const std::vector<int> prompt = { 15, 16, 17, 18, 19, 20, 21, 22 };
+	mc.warm_graphs( 8 );
 
 	// M=1 decode
 	mc.reset_slot( 0 );
 	int tok = mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0 );
 	int pos = static_cast<int>( prompt.size() );
 	for ( int i = 0; i < 4; ++i ) { mc.forward( &tok, 1, pos++, 0 ); tok = mc.sample_one(); } // warmup
+	// Profiler window (nvprof --profile-from-start off) covers steady-state M=1 decode only
+	CUDA_CHECK( cudaProfilerStart() );
 	auto t0 = std::chrono::steady_clock::now();
 	for ( int i = 0; i < steps; ++i ) {
 		mc.forward( &tok, 1, pos++, 0 );
 		tok = mc.sample_one();
 	}
 	const double m1_ms = test::ms_since( t0 ) / steps;
+	CUDA_CHECK( cudaProfilerStop() );
 
 	// Mode A: M=8 causal block (state rolled back each iteration)
 	const int iters = 16;

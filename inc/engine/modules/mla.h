@@ -2,6 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/core/tensor.h"
+#include "engine/core/batch.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -59,7 +60,8 @@ struct MLA {
 		int pos,
 		int total_elems = 4096,
 		int max_seq = 2048,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		const pod::SlotRef& slot = {} // if set: pos/slot read on device (graph-capturable)
 	);
 
 	static void forward_decode(
@@ -72,7 +74,8 @@ struct MLA {
 		int num_heads = 16,
 		int head_dim = 256,
 		int max_seq = 2048,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		const pod::SlotRef& slot = {} // if set: pos/slot read on device (graph-capturable)
 	);
 };
 

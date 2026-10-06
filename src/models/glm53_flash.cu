@@ -91,6 +91,7 @@ bool GLM53Pipeline::init(
 	int rows_shape[2] = { R, config_.hidden_size };
 	embed_rows_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rows_shape, 2 );
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
+	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
 	int h_shape[2] = { 1, config_.hidden_size };
 	hidden_states_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	norm_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
@@ -495,21 +496,31 @@ void GLM53Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) {
 	ENGINE_ASSERT( weights_loaded_, "GLM53Pipeline::forward: weights not loaded" );
 	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_BATCH, "GLM53Pipeline::forward: row count out of range" );
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
-	// MLA / KDA / mHC kernels are single-token; rows run in order so a causal block advances
-	// its slot state exactly as sequential decode would.
 	for ( int r = 0; r < rows.count; ++r ) {
 		ENGINE_ASSERT( rows.slot[r] >= 0 && rows.slot[r] < config_.max_slots, "GLM53Pipeline::forward: slot out of range" );
 		ENGINE_ASSERT( rows.pos[r] >= 0 && rows.pos[r] < config_.max_seq, "GLM53Pipeline::forward: position out of range" );
-		forward_row( r, rows.pos[r], rows.slot[r], stream );
 	}
-	last_rows_ = rows.count;
+	const int m = rows.count;
+	last_rows_ = m;
+	CUDA_CHECK( cudaMemcpyAsync( d_rows_, &rows, sizeof( pod::BatchRows ), cudaMemcpyHostToDevice, stream ) );
+	// MLA / KDA / mHC kernels are single-token; rows run in order so a causal block advances
+	// its slot state exactly as sequential decode would. The per-m body is graph-replayed.
+	graphs_.run( m, stream, [&]( cudaStream_t s ) {
+		for ( int r = 0; r < m; ++r ) {
+			forward_row( r, s );
+		}
+	} );
 }
 
-void GLM53Pipeline::forward_row( int row, int pos, int slot_id, cudaStream_t stream ) {
-	half* slot_k = static_cast<half*>( kv_pool_.get_k_ptr( slot_id, 0, 0 ) );
-	half* slot_v = static_cast<half*>( kv_pool_.get_v_ptr( slot_id, 0, 0 ) );
-	float* slot_kda = state_.kda_states + static_cast<size_t>( slot_id ) * config_.num_layers * state_.layer_kda_floats;
-	float* slot_conv = state_.conv_history + static_cast<size_t>( slot_id ) * config_.num_layers * state_.layer_conv_floats;
+void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
+	// Slot-0 base pointers; slot and position of `row` are resolved on device from d_rows_
+	half* slot_k = static_cast<half*>( kv_pool_.get_k_ptr( 0, 0, 0 ) );
+	half* slot_v = static_cast<half*>( kv_pool_.get_v_ptr( 0, 0, 0 ) );
+	float* slot_kda = state_.kda_states;
+	float* slot_conv = state_.conv_history;
+	const pod::SlotRef kv_ref{ d_rows_, row, kv_pool_.slot_stride_bytes / sizeof( half ) };
+	const pod::SlotRef kda_ref{ d_rows_, row, state_.layer_kda_floats * config_.num_layers };
+	const pod::SlotRef conv_ref{ d_rows_, row, state_.layer_conv_floats * config_.num_layers };
 
 	// mHC: expand this row's embedding into the 4 residual streams
 	pod::TensorView embed_row = pod::make_tensor_2d( embed_rows_.ptr<half>() + static_cast<size_t>( row ) * config_.hidden_size, pod::DType::FP16, 1, config_.hidden_size );
@@ -566,7 +577,7 @@ void GLM53Pipeline::forward_row( int row, int pos, int slot_id, cudaStream_t str
 			);
 
 			engine::modules::GDN::causal_conv1d_silu(
-				qkv_buf_, conv_hist, lw.conv1d_weights, config_.kda_channels, stream
+				qkv_buf_, conv_hist, lw.conv1d_weights, config_.kda_channels, stream, conv_ref
 			);
 
 			engine::modules::GDN::l2_norm_heads(
@@ -581,7 +592,7 @@ void GLM53Pipeline::forward_row( int row, int pos, int slot_id, cudaStream_t str
 
 			engine::modules::GDN::recurrent_step_kda_fused(
 				layer_kda, qkv_buf_, g_decay_buf_, beta_buf_, z_buf_, lw.o_norm, attn_head_out_,
-				16, 128, 1e-5f, stream
+				16, 128, 1e-5f, stream, kda_ref
 			);
 
 			if ( lw.o_proj.is_valid() ) {
@@ -643,13 +654,13 @@ void GLM53Pipeline::forward_row( int row, int pos, int slot_id, cudaStream_t str
 			// Store to KV cache
 			engine::modules::MLA::store_kv_cache(
 				slot_k, slot_v, k_head_buf_, v_head_buf_,
-				mla_idx, pos, 4096, 2048, stream
+				mla_idx, 0, 4096, config_.max_seq, stream, kv_ref
 			);
 
 			// Compute latent attention dot product and attend over past tokens
 			engine::modules::MLA::forward_decode(
 				q_buf_, slot_k, slot_v, mla_heads_out_,
-				mla_idx, pos, 16, 256, 2048, stream
+				mla_idx, 0, 16, 256, config_.max_seq, stream, kv_ref
 			);
 
 			// Project output: o_proj -> ring_->all_reduce across the 4 ranks
@@ -822,6 +833,10 @@ void GLM53Pipeline::forward_row( int row, int pos, int slot_id, cudaStream_t str
 }
 
 void GLM53Pipeline::destroy() {
+	if ( arena_ != nullptr ) {
+		CUDA_CHECK( cudaSetDevice( rank_ ) );
+		graphs_.reset();
+	}
 	if ( h_argmax_idx_ != nullptr ) {
 		engine::core::host_free_pinned( h_argmax_idx_ );
 		h_argmax_idx_ = nullptr;

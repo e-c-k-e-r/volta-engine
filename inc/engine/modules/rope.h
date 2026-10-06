@@ -16,7 +16,8 @@ struct RoPE {
 		int num_kv_heads,
 		int head_dim,
 		int rot_dim,
-		const pod::BatchRows& rows,
+		const pod::BatchRows* d_rows, // device-resident row descriptor (pos per row)
+		int count,                    // rows to process (grid size)
 		float freq_base = 10000000.0f,
 		cudaStream_t stream = nullptr
 	);

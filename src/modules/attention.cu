@@ -14,6 +14,21 @@ namespace {
 
 __device__ float g_attn_workspace[ATTN_MAX_ROW_HEADS * ATTN_MAX_CHUNKS * ( ATTN_MAX_HEAD_DIM + 2 )];
 
+// Device address of g_attn_workspace on the current GPU. The bare symbol in host code is the
+// host shadow, not a usable kernel argument; resolve once per device.
+float* attn_workspace_ptr() {
+	static float* ptrs[ENGINE_NUM_GPUS] = {};
+	int dev = 0;
+	CUDA_CHECK( cudaGetDevice( &dev ) );
+	ENGINE_ASSERT( dev >= 0 && dev < ENGINE_NUM_GPUS, "attn_workspace_ptr: device out of range" );
+	if ( !ptrs[dev] ) {
+		void* p = nullptr;
+		CUDA_CHECK( cudaGetSymbolAddress( &p, g_attn_workspace ) );
+		ptrs[dev] = static_cast<float*>( p );
+	}
+	return ptrs[dev];
+}
+
 __global__ void unpack_q_gate_kernel(
 	const half* __restrict__ q_gate,
 	half* __restrict__ q,
@@ -41,18 +56,19 @@ __global__ void store_kv_cache_kernel(
 	const half* __restrict__ v,
 	size_t slot_stride,
 	int layer_idx,
-	const pod::BatchRows rows,
+	const pod::BatchRows* __restrict__ rows,
+	int count,
 	int num_kv_heads,
 	int head_dim,
 	int max_seq
 ) {
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
 	int total_elems = num_kv_heads * head_dim;
-	if ( tid < total_elems * rows.count ) {
+	if ( tid < total_elems * count ) {
 		int m = tid / total_elems;
 		int elem = tid % total_elems;
-		size_t offset = static_cast<size_t>( rows.slot[m] ) * slot_stride
-			+ ( static_cast<size_t>( layer_idx ) * max_seq + rows.pos[m] ) * total_elems + elem;
+		size_t offset = static_cast<size_t>( rows->slot[m] ) * slot_stride
+			+ ( static_cast<size_t>( layer_idx ) * max_seq + rows->pos[m] ) * total_elems + elem;
 		k_cache[offset] = k[tid];
 		v_cache[offset] = v[tid];
 	}
@@ -67,7 +83,7 @@ __global__ void attn_chunked_paged_kernel(
 	float* __restrict__ workspace,
 	size_t slot_stride,
 	int layer_idx,
-	const pod::BatchRows rows,
+	const pod::BatchRows* __restrict__ rows,
 	int num_q_heads,
 	int num_kv_heads,
 	int head_dim,
@@ -85,10 +101,12 @@ __global__ void attn_chunked_paged_kernel(
 	if ( heads_per_kv < 1 ) heads_per_kv = 1;
 	int kv_head = head / heads_per_kv;
 
-	int cur_pos = rows.pos[m];
+	// Chunks past this row's context write an empty (l = 0) partial that the reduce skips, so
+	// the grid can be sized by max_seq and stay valid across positions (graph replay)
+	int cur_pos = rows->pos[m];
 	int total_tokens = min( cur_pos + 1, max_seq );
-	k_cache += static_cast<size_t>( rows.slot[m] ) * slot_stride;
-	v_cache += static_cast<size_t>( rows.slot[m] ) * slot_stride;
+	k_cache += static_cast<size_t>( rows->slot[m] ) * slot_stride;
+	v_cache += static_cast<size_t>( rows->slot[m] ) * slot_stride;
 
 	int kv_start = chunk * ATTN_PAGE_SIZE;
 	int kv_end = min( kv_start + ATTN_PAGE_SIZE, total_tokens );
@@ -246,14 +264,15 @@ void Attention::store_kv_cache(
 	const pod::TensorView& v,
 	size_t slot_stride,
 	int layer_idx,
-	const pod::BatchRows& rows,
+	const pod::BatchRows* d_rows,
+	int count,
 	int num_kv_heads,
 	int head_dim,
 	int max_seq,
 	cudaStream_t stream
 ) {
 	int total_elems = num_kv_heads * head_dim;
-	int total_work = total_elems * rows.count;
+	int total_work = total_elems * count;
 	int threads = 256;
 	int blocks = ( total_work + threads - 1 ) / threads;
 	store_kv_cache_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
@@ -263,7 +282,8 @@ void Attention::store_kv_cache(
 		v.ptr<const half>(),
 		slot_stride,
 		layer_idx,
-		rows,
+		d_rows,
+		count,
 		num_kv_heads,
 		head_dim,
 		max_seq
@@ -278,21 +298,22 @@ void Attention::forward_decode(
 	pod::TensorView& out,
 	size_t slot_stride,
 	int layer_idx,
-	const pod::BatchRows& rows,
+	const pod::BatchRows* d_rows,
+	int count,
 	int num_q_heads,
 	int num_kv_heads,
 	int head_dim,
 	int max_seq,
 	cudaStream_t stream
 ) {
-	const int M = rows.count;
+	const int M = count;
 	ENGINE_ASSERT( M * num_q_heads <= ATTN_MAX_ROW_HEADS, "Attention::forward_decode: workspace too small for rows x heads" );
+	ENGINE_ASSERT( max_seq <= ATTN_MAX_CHUNKS * ATTN_PAGE_SIZE, "Attention::forward_decode: max_seq exceeds chunk capacity" );
 	float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
 
-	int cur_max_tokens = std::min( rows.max_pos() + 1, max_seq );
-	int n_chunks = ( cur_max_tokens + ATTN_PAGE_SIZE - 1 ) / ATTN_PAGE_SIZE;
-	if ( n_chunks < 1 ) n_chunks = 1;
-	if ( n_chunks > ATTN_MAX_CHUNKS ) n_chunks = ATTN_MAX_CHUNKS;
+	// Position-independent grid: one chunk per page of the full window (graph-capturable)
+	int n_chunks = MAX( 1, ( max_seq + ATTN_PAGE_SIZE - 1 ) / ATTN_PAGE_SIZE );
+	float* workspace = attn_workspace_ptr();
 
 	dim3 grid( num_q_heads, M, n_chunks );
 	dim3 block( head_dim );
@@ -304,10 +325,10 @@ void Attention::forward_decode(
 		v_cache,
 		gate.ptr<const half>(),
 		out.ptr<half>(),
-		g_attn_workspace,
+		workspace,
 		slot_stride,
 		layer_idx,
-		rows,
+		d_rows,
 		num_q_heads,
 		num_kv_heads,
 		head_dim,
@@ -321,7 +342,7 @@ void Attention::forward_decode(
 		dim3 red_block( head_dim );
 		if ( head_dim == 256 ) {
 			attn_reduce_kernel<256><<<red_grid, red_block, 0, stream>>>(
-				g_attn_workspace,
+				workspace,
 				gate.ptr<const half>(),
 				out.ptr<half>(),
 				num_q_heads,
@@ -330,7 +351,7 @@ void Attention::forward_decode(
 		}
 		else if ( head_dim == 128 ) {
 			attn_reduce_kernel<128><<<red_grid, red_block, 0, stream>>>(
-				g_attn_workspace,
+				workspace,
 				gate.ptr<const half>(),
 				out.ptr<half>(),
 				num_q_heads,
@@ -339,7 +360,7 @@ void Attention::forward_decode(
 		}
 		else {
 			attn_reduce_kernel<64><<<red_grid, red_block, 0, stream>>>(
-				g_attn_workspace,
+				workspace,
 				gate.ptr<const half>(),
 				out.ptr<half>(),
 				num_q_heads,

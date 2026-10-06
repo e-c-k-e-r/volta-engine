@@ -1,6 +1,7 @@
 #include "engine/runtime/cluster.h"
 #include "trellis_context.h"
 #include <cstdio>
+#include <chrono>
 #include <cstring>
 #include <thread>
 
@@ -124,6 +125,19 @@ int ModelCluster::sample_one() {
 	int tok = -1;
 	sample( &tok, 1 );
 	return tok;
+}
+
+void ModelCluster::warm_graphs( int max_m, int slot ) {
+	max_m = MIN( max_m, metadata().max_rows );
+	const int tokens[pod::MAX_BATCH] = {};
+	auto t0 = std::chrono::steady_clock::now();
+	for ( int m = 1; m <= max_m; ++m ) {
+		forward( tokens, m, 0, slot ); // eager warm-up
+		forward( tokens, m, 0, slot ); // capture + first replay
+	}
+	reset_slot( slot );
+	std::printf( "[+] Decode graphs warmed for m=1..%d in %.0f ms\n", max_m,
+		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
 }
 
 void ModelCluster::reset_slot( int slot ) {

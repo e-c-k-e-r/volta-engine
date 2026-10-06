@@ -176,9 +176,13 @@ __global__ void mla_store_kv_cache_kernel(
 	int mla_layer_idx,
 	int pos,
 	int total_elems,
-	int max_seq
+	int max_seq,
+	const pod::SlotRef slot
 ) {
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( slot.rows ) pos = slot.rows->pos[slot.row];
+	k_cache = slot.apply( k_cache );
+	v_cache = slot.apply( v_cache );
 	if ( tid < total_elems ) {
 		size_t offset = ( static_cast<size_t>( mla_layer_idx ) * max_seq + pos ) * total_elems + tid;
 		k_cache[offset] = k[tid];
@@ -196,11 +200,15 @@ void mla_attend_decode_kernel(
 	int pos,
 	int num_heads,
 	int head_dim,
-	int max_seq
+	int max_seq,
+	const pod::SlotRef slot
 ) {
 	int head = blockIdx.x;
 	int tid = threadIdx.x;
 	if ( head >= num_heads || tid >= head_dim ) return;
+	if ( slot.rows ) pos = slot.rows->pos[slot.row];
+	k_cache = slot.apply( k_cache );
+	v_cache = slot.apply( v_cache );
 
 	int total_elems = num_heads * head_dim;
 	const half* q_head = q + head * head_dim;
@@ -376,7 +384,8 @@ void MLA::store_kv_cache(
 	int pos,
 	int total_elems,
 	int max_seq,
-	cudaStream_t stream
+	cudaStream_t stream,
+	const pod::SlotRef& slot
 ) {
 	int threads = 256;
 	int blocks = ( total_elems + threads - 1 ) / threads;
@@ -388,7 +397,8 @@ void MLA::store_kv_cache(
 		mla_layer_idx,
 		pos,
 		total_elems,
-		max_seq
+		max_seq,
+		slot
 	);
 }
 
@@ -402,11 +412,14 @@ void MLA::forward_decode(
 	int num_heads,
 	int head_dim,
 	int max_seq,
-	cudaStream_t stream
+	cudaStream_t stream,
+	const pod::SlotRef& slot
 ) {
-	int num_tokens = pos + 1;
-	if ( num_tokens > max_seq ) num_tokens = max_seq;
+	// Device-resolved position (slot.rows set): size scores for the full window so the
+	// launch is position-independent; otherwise size for the host-provided position
+	int num_tokens = slot.rows ? max_seq : MIN( pos + 1, max_seq );
 	size_t smem_bytes = static_cast<size_t>( num_tokens ) * sizeof( float );
+	ENGINE_ASSERT( smem_bytes <= 48 * 1024, "MLA::forward_decode: score buffer exceeds default smem" );
 
 	mla_attend_decode_kernel<<<dim3( num_heads ), dim3( head_dim ), smem_bytes, stream>>>(
 		q.ptr<const half>(),
@@ -417,7 +430,8 @@ void MLA::forward_decode(
 		pos,
 		num_heads,
 		head_dim,
-		max_seq
+		max_seq,
+		slot
 	);
 }
 

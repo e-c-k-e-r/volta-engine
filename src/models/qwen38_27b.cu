@@ -74,6 +74,7 @@ bool Qwen38Pipeline::init(
 	tapped_states_ = static_cast<half*>( engine::core::arena_alloc( arena, tap_bytes ) );
 	CUDA_CHECK( cudaMemset( tapped_states_, 0, tap_bytes ) );
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
+	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
 
 	// 5. Full attention buffers
 	int q_gate_shape[2] = { R, full_q_heads * config_.full_head_dim * 2 };
@@ -326,6 +327,14 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) 
 	last_rows_ = m;
 	set_rows( m );
 
+	// Row descriptor goes to the device; the layer stack only reads slots/positions from there,
+	// so its launch sequence depends on m alone and is replayed from a per-m CUDA graph.
+	// Pageable source: the copy is staged before return, so `rows` may be a temporary.
+	CUDA_CHECK( cudaMemcpyAsync( d_rows_, &rows, sizeof( pod::BatchRows ), cudaMemcpyHostToDevice, stream ) );
+	graphs_.run( m, stream, [&]( cudaStream_t s ) { forward_body( m, s ); } );
+}
+
+void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 	half* slot_k = static_cast<half*>( kv_pool_.get_k_ptr( 0, 0, 0 ) );
 	half* slot_v = static_cast<half*>( kv_pool_.get_v_ptr( 0, 0, 0 ) );
 	const size_t kv_slot_stride = kv_pool_.slot_stride_bytes / sizeof( half );
@@ -382,14 +391,14 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) 
 				q_buf_, k_buf_,
 				q_heads, kv_heads,
 				config_.full_head_dim, config_.full_rot_dim,
-				rows, config_.rope_theta, stream
+				d_rows_, m, config_.rope_theta, stream
 			);
 
 			// Store K and V to KV Cache
 			engine::modules::Attention::store_kv_cache(
 				slot_k, slot_v,
 				k_buf_, v_buf_,
-				kv_slot_stride, full_attn_idx, rows,
+				kv_slot_stride, full_attn_idx, d_rows_, m,
 				kv_heads, config_.full_head_dim,
 				config_.max_seq, stream
 			);
@@ -398,7 +407,7 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) 
 			engine::modules::Attention::forward_decode(
 				q_buf_, slot_k, slot_v, gate_attn_buf_,
 				attn_out_,
-				kv_slot_stride, full_attn_idx, rows,
+				kv_slot_stride, full_attn_idx, d_rows_, m,
 				q_heads, kv_heads,
 				config_.full_head_dim, config_.max_seq, stream
 			);
@@ -426,11 +435,13 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) 
 
 			// Rows advance their own slot's recurrent state in order: a causal block (Mode A) re-uses
 			// one slot row after row; independent requests (Mode B) each touch a distinct slot.
+			// Slot-0 layer pointers; the kernels add d_rows_->slot[m_idx] * stride on device.
 			for ( int m_idx = 0; m_idx < m; ++m_idx ) {
-				const size_t slot = static_cast<size_t>( rows.slot[m_idx] );
-				float* hist_ptr = state_.conv_history + slot * state_.slot_conv_floats + static_cast<size_t>( linear_idx ) * lin_channels * 3;
+				const pod::SlotRef conv_slot{ d_rows_, m_idx, state_.slot_conv_floats };
+				const pod::SlotRef gdn_slot{ d_rows_, m_idx, state_.slot_gdn_floats };
+				float* hist_ptr = state_.conv_history + static_cast<size_t>( linear_idx ) * lin_channels * 3;
 				pod::TensorView conv_hist = pod::make_tensor_2d( hist_ptr, pod::DType::FP32, lin_channels, 3 );
-				float* layer_gdn_state = state_.gdn_states + slot * state_.slot_gdn_floats + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
+				float* layer_gdn_state = state_.gdn_states + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
 
 				pod::TensorView qkv_row = pod::make_tensor_2d( qkv_buf_.ptr<half>() + m_idx * lin_channels, pod::DType::FP16, 1, lin_channels );
 				pod::TensorView norm_row = pod::make_tensor_2d( norm_hidden_.ptr<half>() + m_idx * config_.hidden_size, pod::DType::FP16, 1, config_.hidden_size );
@@ -441,7 +452,7 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) 
 
 				// Causal conv1d + SiLU
 				engine::modules::GDN::causal_conv1d_silu(
-					qkv_row, conv_hist, lw.conv1d_w, lin_channels, stream
+					qkv_row, conv_hist, lw.conv1d_w, lin_channels, stream, conv_slot
 				);
 
 				// L2 norm on Q and K heads
@@ -459,7 +470,7 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) 
 				engine::modules::GDN::recurrent_step(
 					layer_gdn_state, qkv_row, gate_row, beta_row,
 					out_row, k_heads, v_heads,
-					config_.linear_head_dim, stream
+					config_.linear_head_dim, stream, gdn_slot
 				);
 
 				// Gated RMSNorm: gdn_out * rsqrt * norm_weight * silu(z)
@@ -539,6 +550,10 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) 
 
 
 void Qwen38Pipeline::destroy() {
+	if ( arena_ != nullptr ) {
+		CUDA_CHECK( cudaSetDevice( rank_ ) );
+		graphs_.reset();
+	}
 	if ( h_argmax_idx_ != nullptr ) {
 		engine::core::host_free_pinned( h_argmax_idx_ );
 		h_argmax_idx_ = nullptr;

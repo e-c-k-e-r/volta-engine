@@ -14,6 +14,7 @@
 #include "engine/modules/gdn.h"
 #include "engine/modules/linear.h"
 #include "engine/modules/embedding.h"
+#include "engine/core/graph_cache.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -119,6 +120,11 @@ public:
 
 private:
 	void set_rows( int m );
+	// Layer stack + LM head for m rows; reads slots/positions from d_rows_ only (graph body)
+	void forward_body( int m, cudaStream_t stream );
+
+	pod::BatchRows* d_rows_ = nullptr; // device-resident row descriptor of the current forward
+	engine::core::GraphCache graphs_;
 
 	// Per-rank (TP-sharded) head counts
 	int q_heads_ = 0;

@@ -38,6 +38,8 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 	}
 	num_slots_ = MIN( MIN( config_.max_batch_size, MAX_SLOTS ), cluster_.metadata().max_slots );
 	num_slots_ = MAX( num_slots_, 1 );
+	// Mode B uses m <= num_slots_; speculative verify uses m <= 7 draft rows
+	cluster_.warm_graphs( MAX( num_slots_, cluster_.has_speculator() ? 7 : 1 ) );
 	std::printf( "[+] Generator ready: %d slots, speculation %s\n", num_slots_, cluster_.has_speculator() ? "on" : "off" );
 
 	running_.store( true );

@@ -2,6 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/core/tensor.h"
+#include "engine/core/batch.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
@@ -26,7 +27,8 @@ struct GDN {
 		pod::TensorView& conv_history,
 		const pod::TensorView& conv_weights,
 		int channels,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		const pod::SlotRef& slot = {}
 	);
 
 	static void l2_norm_heads(
@@ -46,7 +48,8 @@ struct GDN {
 		int num_k_heads,
 		int num_v_heads,
 		int head_dim,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		const pod::SlotRef& slot = {}
 	);
 
 	static void project_kda_gates(
@@ -91,7 +94,8 @@ struct GDN {
 		int num_heads = 16,
 		int head_dim = 128,
 		float eps = 1e-5f,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		const pod::SlotRef& slot = {}
 	);
 
 	static void gated_rmsnorm(

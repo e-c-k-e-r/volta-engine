@@ -16,6 +16,33 @@ __device__ __forceinline__ void stg_release_sys_u32( uint32_t* p, uint32_t v ) {
 	asm volatile ( "st.global.release.sys.u32 [%0], %1;" :: "l"( p ), "r"( v ) : "memory" );
 }
 
+// Flag page layout (per rank, uint32 words): [stage(4)][row(16)][rank(4)] publish flags,
+// then a device-resident sequence counter and a block-retire counter. Sequence numbers live
+// on the device so launches carry no host-incremented arguments and replay inside CUDA graphs.
+#define AR_MAX_ROWS 16
+#define AR_SEQ_WORD 512
+#define AR_RETIRE_WORD 513
+
+__device__ __forceinline__ uint32_t* ar_flag( uint32_t* base, uint32_t stage, int row, int p ) {
+	return base + ( stage * AR_MAX_ROWS + row ) * 4 + p;
+}
+
+__device__ __forceinline__ uint32_t ar_next_seq( const uint32_t* local_flags ) {
+	return *reinterpret_cast<const volatile uint32_t*>( local_flags + AR_SEQ_WORD ) + 1;
+}
+
+// Last block to finish publishes seq as consumed; the next launch (stream-ordered) reads seq + 1
+__device__ __forceinline__ void ar_retire( uint32_t* local_flags, uint32_t seq ) {
+	__syncthreads();
+	if ( threadIdx.x == 0 ) {
+		if ( atomicAdd( local_flags + AR_RETIRE_WORD, 1u ) == gridDim.x - 1 ) {
+			local_flags[AR_RETIRE_WORD] = 0;
+			local_flags[AR_SEQ_WORD] = seq;
+			__threadfence();
+		}
+	}
+}
+
 __global__ __launch_bounds__( 512 )
 void all_reduce_rms_norm_4ring_kernel(
 	int rank,
@@ -27,7 +54,6 @@ void all_reduce_rms_norm_4ring_kernel(
 	uint32_t* __restrict__ f1,
 	uint32_t* __restrict__ f2,
 	uint32_t* __restrict__ f3,
-	uint32_t seq,
 	half* __restrict__ x,
 	half* __restrict__ residual,
 	const half* __restrict__ weight,
@@ -43,7 +69,8 @@ void all_reduce_rms_norm_4ring_kernel(
 	const void* peer_slots[4] = { p0, p1, p2, p3 };
 	uint32_t* flags[4] = { f0, f1, f2, f3 };
 
-	int stage = seq & 3;
+	const uint32_t seq = ar_next_seq( flags[rank] );
+	const uint32_t stage = seq & 3;
 	uint8_t* my_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[rank] ) ) + ( (size_t) stage * 4 + rank ) * IPC_SLOT_BYTES;
 	uint4* my_slot = reinterpret_cast<uint4*>( my_staging ) + row * n4;
 	const uint4* src_x = ( (const uint4*) ( x + row * row_elems ) );
@@ -53,18 +80,19 @@ void all_reduce_rms_norm_4ring_kernel(
 		my_slot[i] = src_x[i];
 	}
 
+	__threadfence_system();
 	__syncthreads();
 
-	// Step 2: synchronization across 4 ranks using system-scope flags
+	// Step 2: per-row synchronization across 4 ranks using system-scope flags
 	if ( threadIdx.x == 0 ) {
-		stg_release_sys_u32( flags[rank] + stage * 4 + rank, seq );
+		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
 	}
 	__syncwarp();
 
 	if ( threadIdx.x < 4 ) {
 		int p = threadIdx.x;
 		if ( p != rank ) {
-			uint32_t* flag_ptr = flags[p] + stage * 4 + p;
+			uint32_t* flag_ptr = ar_flag( flags[p], stage, row, p );
 			int spins = 0;
 			while ( ldg_acquire_sys_u32( flag_ptr ) < seq ) {
 				if ( ++spins > 64 ) {
@@ -164,6 +192,8 @@ void all_reduce_rms_norm_4ring_kernel(
 
 		*( (uint4*) ( dst_row + i * 8 ) ) = *reinterpret_cast<uint4*>( hx );
 	}
+
+	ar_retire( flags[rank], seq );
 }
 
 __global__ __launch_bounds__( 256 )
@@ -177,7 +207,6 @@ void all_reduce_4ring_kernel(
 	uint32_t* __restrict__ f1,
 	uint32_t* __restrict__ f2,
 	uint32_t* __restrict__ f3,
-	uint32_t seq,
 	half* __restrict__ x,
 	int hidden_size
 ) {
@@ -188,7 +217,8 @@ void all_reduce_4ring_kernel(
 	const void* peer_slots[4] = { p0, p1, p2, p3 };
 	uint32_t* flags[4] = { f0, f1, f2, f3 };
 
-	int stage = seq & 3;
+	const uint32_t seq = ar_next_seq( flags[rank] );
+	const uint32_t stage = seq & 3;
 	uint8_t* my_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[rank] ) ) + ( (size_t) stage * 4 + rank ) * IPC_SLOT_BYTES;
 	uint4* my_slot = reinterpret_cast<uint4*>( my_staging ) + row * n4;
 	const uint4* src_x = ( (const uint4*) ( x + row * row_elems ) );
@@ -201,10 +231,10 @@ void all_reduce_4ring_kernel(
 	__syncthreads();
 
 	if ( threadIdx.x == 0 ) {
-		stg_release_sys_u32( flags[rank] + stage * 4 + rank, seq );
+		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
 		for ( int p = 0; p < 4; ++p ) {
 			if ( p == rank ) continue;
-			while ( ldg_acquire_sys_u32( flags[p] + stage * 4 + p ) < seq ) {
+			while ( ldg_acquire_sys_u32( ar_flag( flags[p], stage, row, p ) ) < seq ) {
 				__nanosleep( 32 );
 			}
 		}
@@ -240,6 +270,8 @@ void all_reduce_4ring_kernel(
 
 		*( (uint4*) ( row_x + i * 8 ) ) = *reinterpret_cast<uint4*>( h_sum );
 	}
+
+	ar_retire( flags[rank], seq );
 }
 
 void CollectiveRing::init(
@@ -248,7 +280,6 @@ void CollectiveRing::init(
 	void* const peer_flags[ENGINE_NUM_GPUS]
 ) {
 	rank = local_rank;
-	seq = 1;
 	for ( int p = 0; p < ENGINE_NUM_GPUS; ++p ) {
 		peer_ptrs[p] = peer_staging[p];
 		sync_flags[p] = peer_flags[p];
@@ -285,7 +316,6 @@ void CollectiveRing::all_reduce_rms_norm(
 		static_cast<uint32_t*>( sync_flags[1] ),
 		static_cast<uint32_t*>( sync_flags[2] ),
 		static_cast<uint32_t*>( sync_flags[3] ),
-		seq++,
 		x_ptr,
 		res_ptr,
 		w_ptr,
@@ -318,7 +348,6 @@ void CollectiveRing::all_reduce(
 		static_cast<uint32_t*>( sync_flags[1] ),
 		static_cast<uint32_t*>( sync_flags[2] ),
 		static_cast<uint32_t*>( sync_flags[3] ),
-		seq++,
 		x_ptr,
 		hidden_size
 	);

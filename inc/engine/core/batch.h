@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/config.h"
+#include <cuda_runtime.h>
 
 namespace pod {
 
@@ -43,12 +44,26 @@ struct BatchRows {
 		return r;
 	}
 
-	int max_pos() const {
+	__host__ __device__ int max_pos() const {
 		int p = 0;
 		for ( int m = 0; m < count; ++m ) {
 			p = MAX( p, pos[m] );
 		}
 		return p;
+	}
+};
+
+// Device-side slot resolution for per-slot state buffers (graph-capturable: the slot is read
+// from a device-resident BatchRows at kernel time, not baked into launch arguments).
+// rows == nullptr => base pointer used as-is.
+struct SlotRef {
+	const BatchRows* rows = nullptr; // device pointer
+	int row = 0;
+	size_t stride = 0;               // elements per slot
+
+	template <typename T>
+	__host__ __device__ T* apply( T* base ) const {
+		return rows ? base + static_cast<size_t>( rows->slot[row] ) * stride : base;
 	}
 };
 
