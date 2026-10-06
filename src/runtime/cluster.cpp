@@ -118,7 +118,36 @@ int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk ) {
 
 void ModelCluster::sample( int* out, int count ) {
 	CUDA_CHECK( cudaSetDevice( 0 ) );
-	models_[0]->sample_tokens( out, count, streams_[0] );
+
+	// Vocabulary-parallel path: every rank picks the best token inside its own shard, and the winner
+	// is the largest logit across ranks. Each rank syncs its own stream inside sample_local, so by the
+	// time the fan-out returns all four (token, logit) pairs are in host memory. Ties keep the lower
+	// token id, matching the single-shard argmax tie-break.
+	int toks[ENGINE_NUM_GPUS][pod::MAX_BATCH];
+	float vals[ENGINE_NUM_GPUS][pod::MAX_BATCH];
+	int sharded[ENGINE_NUM_GPUS] = {};
+	pool_.run( [&]( int d ) {
+		toks[d][0] = -1;
+		sharded[d] = models_[d]->sample_local( toks[d], vals[d], count, streams_[d] ) ? 1 : 0;
+	} );
+	if ( !sharded[0] ) {
+		models_[0]->sample_tokens( out, count, streams_[0] );
+		return;
+	}
+	for ( int d = 1; d < ENGINE_NUM_GPUS; ++d ) {
+		ENGINE_ASSERT( sharded[d] != 0, "ModelCluster::sample: vocabulary sharding must be uniform across ranks" );
+	}
+	for ( int r = 0; r < count; ++r ) {
+		int best = toks[0][r];
+		float best_val = vals[0][r];
+		for ( int d = 1; d < ENGINE_NUM_GPUS; ++d ) {
+			if ( vals[d][r] > best_val || ( vals[d][r] == best_val && toks[d][r] < best ) ) {
+				best_val = vals[d][r];
+				best = toks[d][r];
+			}
+		}
+		out[r] = best;
+	}
 }
 
 int ModelCluster::sample_one() {
@@ -169,7 +198,17 @@ SpecResult ModelCluster::speculate( int slot, int anchor, int pos, const std::ve
 
 	// 2. Draft K tokens conditioned on target logits, context and tapped hidden states
 	CUDA_CHECK( cudaSetDevice( 0 ) );
-	speculator_.draft( anchor, pos + 1, streams_[0], models_[0]->logits().ptr<const half>(),
+	// The drafter scores the whole vocabulary, so rank 0 materializes the full logits from the shards.
+	// ModelCluster::forward already synchronized every rank, so the peer copies below are safe.
+	const half* peer_shards[ENGINE_NUM_GPUS] = { nullptr };
+	int peer_cols = 0;
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		peer_shards[d] = models_[d]->shard_logits_ptr();
+		peer_cols = models_[d]->shard_logits_cols();
+	}
+	const pod::TensorView& target_logits = models_[0]->gather_logits( 1, peer_shards, peer_cols, streams_[0] );
+	CUDA_CHECK( cudaStreamSynchronize( streams_[0] ) );
+	speculator_.draft( anchor, pos + 1, streams_[0], target_logits.ptr<const half>(),
 		context.data(), static_cast<int>( context.size() ), models_[0]->tapped_states() );
 	int h_draft[8];
 	float h_conf[8];

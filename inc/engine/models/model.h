@@ -54,6 +54,37 @@ public:
 	// 4. Greedy sampling of the last forward's first `count` rows into host out_preds (rank 0)
 	virtual void sample_tokens( int* out_preds, int count, cudaStream_t stream = nullptr ) = 0;
 
+	// 4b. Vocabulary-parallel sampling: each rank picks the best token inside its own vocabulary
+	// shard and reports (token, logit) into caller-owned host arrays. Returns false when the model's
+	// logits are not sharded, in which case the caller falls back to sample_tokens on rank 0.
+	virtual bool sample_local( int* out_tokens, float* out_vals, int count, cudaStream_t stream = nullptr ) {
+		(void) out_tokens;
+		(void) out_vals;
+		(void) count;
+		(void) stream;
+		return false;
+	}
+
+	// 4c. This rank's local logits shard, for a vocabulary-parallel head. Null when unsharded.
+	virtual const half* shard_logits_ptr() const { return nullptr; }
+	virtual int shard_logits_cols() const { return 0; }
+
+	// 4d. Materialize the full-vocabulary logits on rank 0 from every rank's shard. Only consumers that
+	// need the whole distribution (the DFlash2 drafter) pay for this; sampling uses sample_local.
+	// The caller must have synchronized every rank's stream first. Returns logits() when unsharded.
+	virtual const pod::TensorView& gather_logits(
+		int rows,
+		const half* const* peer_shard_ptrs,
+		int peer_shard_cols,
+		cudaStream_t stream = nullptr
+	) {
+		(void) rows;
+		(void) peer_shard_ptrs;
+		(void) peer_shard_cols;
+		(void) stream;
+		return logits();
+	}
+
 	// 5. Speculative state management: snapshot / restore the recurrent state of one slot.
 	//    KV cache entries need no snapshot: rejected positions are overwritten by the next forward.
 	virtual void checkpoint_state( int slot_id, cudaStream_t stream = nullptr ) = 0;

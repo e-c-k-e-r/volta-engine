@@ -49,6 +49,19 @@ struct Elementwise {
 		int batch_size,
 		cudaStream_t stream = nullptr
 	);
+
+	// Scans only the first `columns` entries of each row and adds `index_offset` to the index, for a
+	// vocabulary-parallel LM head whose shard is padded past its real width. Also returns the winning
+	// logit so the caller can reduce across shards. d_out_val may be null.
+	static void batched_argmax_range(
+		const pod::TensorView& logits,
+		int* d_out_idx,
+		float* d_out_val,
+		int columns,
+		int batch_size,
+		int index_offset,
+		cudaStream_t stream = nullptr
+	);
 };
 
 } // namespace engine::modules

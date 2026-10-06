@@ -181,13 +181,16 @@ __global__ void argmax_kernel(
 __global__ void batched_argmax_kernel(
 	const half* __restrict__ logits,
 	int* __restrict__ out_idx,
+	float* __restrict__ out_val,
 	int numel,
-	int batch_size
+	int batch_size,
+	int index_offset,
+	int row_stride
 ) {
 	int row = blockIdx.x;
 	if ( row >= batch_size ) return;
 
-	const half* row_logits = logits + static_cast<size_t>( row ) * numel;
+	const half* row_logits = logits + static_cast<size_t>( row ) * row_stride;
 	int tid = threadIdx.x;
 
 	float max_val = -1e30f;
@@ -235,7 +238,8 @@ __global__ void batched_argmax_kernel(
 			}
 		}
 		if ( lane_id == 0 ) {
-			out_idx[row] = b_idx;
+			out_idx[row] = b_idx < 0 ? -1 : b_idx + index_offset;
+			if ( out_val ) out_val[row] = b_max;
 		}
 	}
 }
@@ -328,8 +332,35 @@ void Elementwise::batched_argmax(
 	batched_argmax_kernel<<<dim3( batch_size ), dim3( 512 ), 0, stream>>>(
 		logits.ptr<const half>(),
 		d_out_idx,
+		nullptr,
 		numel,
-		batch_size
+		batch_size,
+		0,
+		logits.shape[1]
+	);
+}
+
+void Elementwise::batched_argmax_range(
+	const pod::TensorView& logits,
+	int* d_out_idx,
+	float* d_out_val,
+	int columns,
+	int batch_size,
+	int index_offset,
+	cudaStream_t stream
+) {
+	// A vocabulary shard carries pad columns past `columns`; they decode to 0.0 and would win against
+	// real negative logits, so the scan stops at the real width and the index is offset to the shard's
+	// slice of the global vocabulary.
+	ENGINE_ASSERT( columns > 0 && columns <= logits.shape[1], "batched_argmax_range: columns outside the row" );
+	batched_argmax_kernel<<<dim3( batch_size ), dim3( 512 ), 0, stream>>>(
+		logits.ptr<const half>(),
+		d_out_idx,
+		d_out_val,
+		columns,
+		batch_size,
+		index_offset,
+		logits.shape[1]
 	);
 }
 

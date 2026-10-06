@@ -848,6 +848,80 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 	}
 }
 
+pod::LinearWeight SafeTensorsRepo::load_linear_slice_padded(
+	const char* base_name,
+	pod::MemoryArena& arena,
+	int bits,
+	int rank,
+	int tp_size,
+	int pad_cols,
+	cudaStream_t stream
+) {
+	char name_buf[512];
+	int shard = -1;
+
+	// Trellis: rank's column slice, zero-padded to pad_cols. The pad rows are never read for a token
+	// decision (the argmax range stops at the real width), but the kernel still walks them, so they
+	// have to be finite: zero trellis plus zero svh makes those logits exactly 0.0.
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
+	const auto* meta_tr = find( name_buf, &shard );
+	if ( !meta_tr || shard < 0 ) return pod::LinearWeight{};
+	ENGINE_ASSERT( meta_tr->ndim == 3, "Trellis tensor must be 3D" );
+	ENGINE_ASSERT( meta_tr->shape[1] % tp_size == 0, "Trellis column count must divide across ranks" );
+
+	const int BK = meta_tr->shape[0];
+	const int BN = meta_tr->shape[1];
+	const int B = meta_tr->shape[2];
+	const int local_BN = BN / tp_size;
+	const int padded_BN = local_BN + pad_cols / 16;
+	ENGINE_ASSERT( pad_cols % 128 == 0, "Pad must be a whole number of 128-column Hadamard spans" );
+	ENGINE_ASSERT( padded_BN * 16 % 256 == 0, "Padded shard width must be a multiple of 256 for the int8 GEMV" );
+
+	int tr_shape[3] = { BK, padded_BN, B };
+	pod::TensorView tr = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, tr_shape, 3 );
+	if ( !tr.data ) return pod::LinearWeight{};
+
+	std::vector<uint16_t> h_tr( static_cast<size_t>( BK ) * padded_BN * B, 0 );
+	const uint16_t* src_tr = static_cast<const uint16_t*>( safetensors_get_data_cpu( shards_[shard], meta_tr ) );
+	ENGINE_ASSERT( src_tr != nullptr, "Failed to get CPU data for trellis tensor" );
+	size_t chunk_elems = static_cast<size_t>( local_BN ) * B;
+	for ( int k = 0; k < BK; ++k ) {
+		const uint16_t* src_k = src_tr + ( static_cast<size_t>( k ) * BN + rank * local_BN ) * B;
+		std::memcpy( h_tr.data() + static_cast<size_t>( k ) * padded_BN * B, src_k, chunk_elems * sizeof( uint16_t ) );
+	}
+	CUDA_CHECK( cudaMemcpyAsync( tr.data, h_tr.data(), h_tr.size() * sizeof( uint16_t ), cudaMemcpyHostToDevice, stream ) );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+
+	// Input Hadamard scales are shared by every rank (they scale the activation, not the output).
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.suh", base_name );
+	pod::TensorView suh = load( name_buf, arena, stream, pod::DType::FP16 );
+
+	// Output Hadamard scales: this rank's columns, zero-padded by pad_cols.
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.svh", base_name );
+	shard = -1;
+	const auto* meta_svh = find( name_buf, &shard );
+	if ( !meta_svh || shard < 0 ) return pod::LinearWeight{};
+	ENGINE_ASSERT( meta_svh->ndim == 1 && meta_svh->shape[0] == BN * 16, "svh must be one scale per column" );
+
+	std::vector<half> h_svh( static_cast<size_t>( local_BN ) * 16 + pad_cols, __float2half( 0.0f ) );
+	const half* src_svh = static_cast<const half*>( safetensors_get_data_cpu( shards_[shard], meta_svh ) );
+	ENGINE_ASSERT( src_svh != nullptr, "Failed to get CPU data for svh" );
+	std::memcpy( h_svh.data(), src_svh + static_cast<size_t>( rank ) * local_BN * 16, ( h_svh.size() - pad_cols ) * sizeof( half ) );
+
+	int svh_shape[1] = { static_cast<int>( h_svh.size() ) };
+	pod::TensorView svh = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_shape, 1 );
+	if ( !svh.data ) return pod::LinearWeight{};
+	CUDA_CHECK( cudaMemcpyAsync( svh.data, h_svh.data(), h_svh.size() * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.mul1", base_name );
+	int dummy_shard = -1;
+	bool has_mul1 = ( find( name_buf, &dummy_shard ) != nullptr );
+
+	int actual_bits = B / 16;
+	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits ? actual_bits : bits, has_mul1 );
+}
+
 pod::LinearWeight SafeTensorsRepo::load_linear_slice_fused(
 	const char* base_name_a,
 	const char* base_name_b,

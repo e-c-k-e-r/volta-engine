@@ -32,6 +32,7 @@ bool Qwen38Pipeline::init(
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 
 	const int tp_size = ( ring_ != nullptr ) ? ENGINE_NUM_GPUS : 1;
+	tp_size_ = tp_size;
 	q_heads_ = config_.full_num_q_heads / tp_size;
 	kv_heads_ = config_.full_num_kv_heads / tp_size;
 	lin_k_heads_ = config_.linear_num_k_heads / tp_size;
@@ -108,13 +109,28 @@ bool Qwen38Pipeline::init(
 	mlp_inter_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_shape, 2 );
 	mlp_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 
-	// 8. Logits & argmax (rank 0 only)
-	if ( rank_ == 0 ) {
-		int logit_shape[2] = { R, config_.vocab_size };
+	// 8. Logits & argmax. The vocabulary is sharded the same way the rest of the head is: each rank
+	// projects only its own columns, which takes the 5120 x 248320 LM head off rank 0's critical path.
+	// The shard is padded to a multiple of 256 columns (one extra 128-column Hadamard block for
+	// 62080 -> 62208) so the dp4a int8 GEMV engages; pad columns are excluded from the argmax.
+	lm_shard_real_cols_ = config_.vocab_size / tp_size;
+	int pad_cols = 0;
+	if ( tp_size > 1 ) {
+		pad_cols = ( 256 - ( lm_shard_real_cols_ % 256 ) ) % 256;
+	}
+	lm_shard_cols_ = lm_shard_real_cols_ + pad_cols;
+	{
+		int logit_shape[2] = { R, lm_shard_cols_ };
 		logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
 		d_argmax_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
+		d_argmax_val_ = static_cast<float*>( engine::core::arena_alloc( arena, R * sizeof( float ) ) );
 		h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( R * sizeof( int ) ) );
 		std::memset( h_argmax_idx_, 0, R * sizeof( int ) );
+		if ( rank_ == 0 && tp_size_ > 1 ) {
+			// Only the DFlash2 drafter needs the whole distribution; sampling reduces per shard.
+			int full_shape[2] = { R, config_.vocab_size };
+			full_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, full_shape, 2 );
+		}
 	}
 
 	for ( int L = 0; L < config_.num_layers; ++L ) {
@@ -167,8 +183,11 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 	// 2. Final norm
 	final_norm_ = repo.load( "model.language_model.norm.weight", *arena_, stream, pod::DType::FP16 );
 
-	// 3. LM Head
-	if ( rank_ == 0 ) {
+	// 3. LM Head, sharded across the vocabulary dimension
+	if ( tp_size_ > 1 ) {
+		lm_head_ = repo.load_linear_slice_padded( "lm_head", *arena_, 5, rank_, tp_size_, lm_shard_cols_ - lm_shard_real_cols_, stream );
+	}
+	else {
 		lm_head_ = repo.load_linear( "lm_head", *arena_, 5, stream );
 	}
 
@@ -304,14 +323,72 @@ void Qwen38Pipeline::embed_tokens( const int* token_ids, int count, cudaStream_t
 }
 
 void Qwen38Pipeline::sample_tokens( int* out_preds, int count, cudaStream_t stream ) {
-	ENGINE_ASSERT( rank_ == 0, "Qwen38Pipeline::sample_tokens: logits live on rank 0" );
+	ENGINE_ASSERT( tp_size_ == 1, "Qwen38Pipeline::sample_tokens: vocabulary is sharded, use sample_local" );
 	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen38Pipeline::sample_tokens: count exceeds last forward rows" );
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	logits_.shape[0] = count;
-	engine::modules::Elementwise::batched_argmax( logits_, d_argmax_idx_, config_.vocab_size, count, stream );
+	engine::modules::Elementwise::batched_argmax( logits_, d_argmax_idx_, lm_shard_cols_, count, stream );
 	CUDA_CHECK( cudaMemcpyAsync( h_argmax_idx_, d_argmax_idx_, count * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	std::memcpy( out_preds, h_argmax_idx_, count * sizeof( int ) );
+}
+
+bool Qwen38Pipeline::sample_local( int* out_tokens, float* out_vals, int count, cudaStream_t stream ) {
+	ENGINE_ASSERT( tp_size_ > 1, "Qwen38Pipeline::sample_local: vocabulary is not sharded" );
+	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen38Pipeline::sample_local: count exceeds last forward rows" );
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	logits_.shape[0] = count;
+	// Scan only this rank's real columns: the pad block decodes to 0.0 and would beat a real negative
+	// logit. index_offset turns the shard-local winner into a global token id.
+	engine::modules::Elementwise::batched_argmax_range(
+		logits_,
+		d_argmax_idx_,
+		d_argmax_val_,
+		lm_shard_real_cols_,
+		count,
+		rank_ * lm_shard_real_cols_,
+		stream
+	);
+	CUDA_CHECK( cudaMemcpyAsync( h_argmax_idx_, d_argmax_idx_, count * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	std::memcpy( out_tokens, h_argmax_idx_, count * sizeof( int ) );
+	if ( out_vals != nullptr ) {
+		std::vector<float> h_vals( count );
+		CUDA_CHECK( cudaMemcpyAsync( h_vals.data(), d_argmax_val_, count * sizeof( float ), cudaMemcpyDeviceToHost, stream ) );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		std::memcpy( out_vals, h_vals.data(), count * sizeof( float ) );
+	}
+	return true;
+}
+
+const pod::TensorView& Qwen38Pipeline::gather_logits(
+	int rows,
+	const half* const* peer_shard_ptrs,
+	int peer_shard_cols,
+	cudaStream_t stream
+) {
+	ENGINE_ASSERT( tp_size_ == 1 || rank_ == 0, "Qwen38Pipeline::gather_logits: only rank 0 materializes the full vocabulary" );
+	if ( tp_size_ == 1 ) {
+		return logits_;
+	}
+	ENGINE_ASSERT( rows >= 1 && rows <= last_rows_, "Qwen38Pipeline::gather_logits: rows exceeds last forward rows" );
+	ENGINE_ASSERT( peer_shard_cols == lm_shard_cols_, "Qwen38Pipeline::gather_logits: shard width mismatch" );
+
+	full_logits_.shape[0] = rows;
+	// Row r of the gathered buffer is [shard 0 | shard 1 | ...], so each row needs one copy per rank:
+	// the source rows are lm_shard_cols_ apart (pad block included), the destination rows
+	// lm_shard_real_cols_ apart.
+	const size_t shard_elems = static_cast<size_t>( lm_shard_real_cols_ );
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		const half* src_base = ( d == rank_ ) ? logits_.ptr<const half>() : peer_shard_ptrs[d];
+		ENGINE_ASSERT( src_base != nullptr, "Qwen38Pipeline::gather_logits: missing peer shard pointer" );
+		for ( int r = 0; r < rows; ++r ) {
+			const half* src = src_base + static_cast<size_t>( r ) * lm_shard_cols_;
+			half* dst = full_logits_.ptr<half>() + ( static_cast<size_t>( r ) * ENGINE_NUM_GPUS + d ) * shard_elems;
+			CUDA_CHECK( cudaMemcpyPeerAsync( dst, rank_, src, d, shard_elems * sizeof( half ), stream ) );
+		}
+	}
+	return full_logits_;
 }
 
 void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) {
@@ -539,13 +616,12 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 		}
 	}
 
-	// Final norm + LM head (vocab is not sharded; rank 0 owns logits)
-	if ( rank_ == 0 ) {
-		engine::modules::RMSNorm::forward(
-			hidden_states_, final_norm_, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
-		);
-		engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
-	}
+	// Final norm + LM head. Every rank projects its own vocabulary shard, so the 5120 x 248320 head is
+	// four 5120 x 62208 GEMVs running in parallel instead of one 5120 x 248320 GEMV gating rank 0.
+	engine::modules::RMSNorm::forward(
+		hidden_states_, final_norm_, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
+	);
+	engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
 }
 
 

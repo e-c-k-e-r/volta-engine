@@ -90,6 +90,20 @@ public:
 		cudaStream_t stream = nullptr
 	);
 
+	// Vocabulary-parallel shard: this rank's columns of a [K, N] weight, padded up by pad_cols so the
+	// shard width is a multiple of 256 and the dp4a int8 GEMV engages. Pad columns decode to exactly
+	// 0.0 (zero trellis, zero svh), so the caller must keep them out of the argmax range and offset
+	// the returned indices by rank * (N / tp_size).
+	pod::LinearWeight load_linear_slice_padded(
+		const char* base_name,
+		pod::MemoryArena& arena,
+		int bits,
+		int rank,
+		int tp_size,
+		int pad_cols,
+		cudaStream_t stream = nullptr
+	);
+
 	pod::LinearWeight load_linear_slice_fused(
 		const char* base_name_a,
 		const char* base_name_b,

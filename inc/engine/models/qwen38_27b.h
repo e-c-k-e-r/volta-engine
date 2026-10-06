@@ -106,6 +106,15 @@ public:
 	void embed_tokens( const int* token_ids, int count, cudaStream_t stream = nullptr ) override;
 	void forward( const pod::BatchRows& rows, cudaStream_t stream = nullptr ) override;
 	void sample_tokens( int* out_preds, int count, cudaStream_t stream = nullptr ) override;
+	bool sample_local( int* out_tokens, float* out_vals, int count, cudaStream_t stream = nullptr ) override;
+	const half* shard_logits_ptr() const override { return logits_.ptr<const half>(); }
+	int shard_logits_cols() const override { return lm_shard_cols_; }
+	const pod::TensorView& gather_logits(
+		int rows,
+		const half* const* peer_shard_ptrs,
+		int peer_shard_cols,
+		cudaStream_t stream = nullptr
+	) override;
 
 	void checkpoint_state( int slot_id, cudaStream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, cudaStream_t stream = nullptr ) override;
@@ -180,6 +189,13 @@ private:
 	pod::TensorView logits_;
 	int* d_argmax_idx_ = nullptr;
 	int* h_argmax_idx_ = nullptr;
+	// Vocabulary-parallel head: every rank owns vocab_size / tp_size columns, padded up to a multiple
+	// of 256 so the dp4a int8 GEMV engages. lm_shard_real_cols_ excludes the pad.
+	int tp_size_ = 1;
+	int lm_shard_cols_ = 0;
+	int lm_shard_real_cols_ = 0;
+	float* d_argmax_val_ = nullptr;
+	pod::TensorView full_logits_;   // rank 0 only, for consumers that need the whole distribution
 };
 
 } // namespace engine::models
