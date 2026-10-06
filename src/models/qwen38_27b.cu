@@ -113,9 +113,13 @@ bool Qwen38Pipeline::init(
 	// projects only its own columns, which takes the 5120 x 248320 LM head off rank 0's critical path.
 	// The shard is padded to a multiple of 256 columns (one extra 128-column Hadamard block for
 	// 62080 -> 62208) so the dp4a int8 GEMV engages; pad columns are excluded from the argmax.
-	lm_shard_real_cols_ = config_.vocab_size / tp_size;
+	// EXL3_LM_SHARD=0 restores the single-rank full-vocabulary head for A/B measurement.
+	shard_lm_ = tp_size > 1;
+	if ( const char* e = std::getenv( "EXL3_LM_SHARD" ) ) shard_lm_ = ( atoi( e ) != 0 );
+	tp_size_ = shard_lm_ ? tp_size : 1;
+	lm_shard_real_cols_ = config_.vocab_size / tp_size_;
 	int pad_cols = 0;
-	if ( tp_size > 1 ) {
+	if ( tp_size_ > 1 ) {
 		pad_cols = ( 256 - ( lm_shard_real_cols_ % 256 ) ) % 256;
 	}
 	lm_shard_cols_ = lm_shard_real_cols_ + pad_cols;
@@ -187,7 +191,7 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 	if ( tp_size_ > 1 ) {
 		lm_head_ = repo.load_linear_slice_padded( "lm_head", *arena_, 5, rank_, tp_size_, lm_shard_cols_ - lm_shard_real_cols_, stream );
 	}
-	else {
+	else if ( rank_ == 0 ) {
 		lm_head_ = repo.load_linear( "lm_head", *arena_, 5, stream );
 	}
 
@@ -334,7 +338,7 @@ void Qwen38Pipeline::sample_tokens( int* out_preds, int count, cudaStream_t stre
 }
 
 bool Qwen38Pipeline::sample_local( int* out_tokens, float* out_vals, int count, cudaStream_t stream ) {
-	ENGINE_ASSERT( tp_size_ > 1, "Qwen38Pipeline::sample_local: vocabulary is not sharded" );
+	if ( tp_size_ <= 1 ) return false;   // single-rank head: the caller samples on rank 0
 	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen38Pipeline::sample_local: count exceeds last forward rows" );
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	logits_.shape[0] = count;
@@ -618,10 +622,12 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 
 	// Final norm + LM head. Every rank projects its own vocabulary shard, so the 5120 x 248320 head is
 	// four 5120 x 62208 GEMVs running in parallel instead of one 5120 x 248320 GEMV gating rank 0.
-	engine::modules::RMSNorm::forward(
-		hidden_states_, final_norm_, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
-	);
-	engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
+	if ( tp_size_ > 1 || rank_ == 0 ) {
+		engine::modules::RMSNorm::forward(
+			hidden_states_, final_norm_, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
+		);
+		engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
+	}
 }
 
 
