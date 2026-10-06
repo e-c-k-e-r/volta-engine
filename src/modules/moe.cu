@@ -69,8 +69,11 @@ __global__ void moe_dispatch_hist_kernel(
 		if ( threadIdx.x == 0 ) {
 			int total_active = ( num_experts > 0 ) ? scan[num_experts - 1] : 0;
 			active_experts[num_experts] = make_int4( total_active, 0, 0, 0 );
+			// exl3_moe_kernel hands out tickets as num_groups + atomicAdd( &sched[0], 1 ) (tickets
+			// 0..num_groups-1 are implicit) and resets sched[0] to 0 on exit: seed must be 0.
+			// Seeding num_groups here skipped active experts num_groups..2*num_groups-1.
 			if ( sched ) {
-				sched[0] = num_groups;
+				sched[0] = 0;
 				sched[1] = 0;
 			}
 		}
@@ -355,76 +358,103 @@ void MoE::init_device_ptrs(
 	}
 }
 
+pod::MoEScratch MoE::alloc_scratch(
+	pod::MemoryArena& arena,
+	int num_local_experts,
+	int top_k,
+	int hidden_size,
+	int intermediate_size
+) {
+	const int groups = 10;
+	const size_t E1 = static_cast<size_t>( num_local_experts ) + 1;
+	pod::MoEScratch s;
+	s.expert_count = static_cast<int64_t*>( engine::core::arena_alloc( arena, E1 * sizeof( int64_t ) ) );
+	s.token_sorted = static_cast<int64_t*>( engine::core::arena_alloc( arena, top_k * sizeof( int64_t ) ) );
+	s.weight_sorted = static_cast<half*>( engine::core::arena_alloc( arena, top_k * sizeof( half ) ) );
+	s.cursors = static_cast<int*>( engine::core::arena_alloc( arena, E1 * sizeof( int ) ) );
+	s.active_experts = static_cast<int4*>( engine::core::arena_alloc( arena, E1 * sizeof( int4 ) ) );
+	const size_t state_elems = static_cast<size_t>( groups ) * top_k * hidden_size;
+	const size_t interm_elems = static_cast<size_t>( groups ) * top_k * intermediate_size;
+	s.state_g = static_cast<half*>( engine::core::arena_alloc( arena, state_elems * sizeof( half ) ) );
+	s.state_u = static_cast<half*>( engine::core::arena_alloc( arena, state_elems * sizeof( half ) ) );
+	s.interm_g = static_cast<half*>( engine::core::arena_alloc( arena, interm_elems * sizeof( half ) ) );
+	s.interm_u = static_cast<half*>( engine::core::arena_alloc( arena, interm_elems * sizeof( half ) ) );
+	return s;
+}
+
 void MoE::forward(
 	const pod::TensorView& x,
 	const pod::MoELayerWeights& weights,
-	const pod::TensorView& topk_idx,
-	const pod::TensorView& topk_weight,
+	const int* d_topk_indices,
+	const half* d_topk_weights,
 	pod::TensorView& out,
 	int start_expert,
 	int end_expert,
-	half* temp_state_g,
-	half* temp_state_u,
-	half* temp_intermediate_g,
-	half* temp_intermediate_u,
-	int64_t* expert_count,
-	int64_t* token_sorted,
-	half* weight_sorted,
-	int* cursors,
-	int4* active_experts,
+	const pod::MoEScratch& scratch,
+	float act_limit,
 	cudaStream_t stream
 ) {
-	if ( weights.type == pod::QuantType::TRELLIS ) {
-		const int* d_selected_experts = topk_idx.ptr<const int>();
-		const half* d_routing_weights = topk_weight.ptr<const half>();
-		const int E = weights.num_local_experts;
+	CUDA_CHECK( cudaMemsetAsync( out.data, 0, out.size_bytes(), stream ) );
 
-		MoERouter::exl3_moe_dispatch(
-			d_selected_experts,
-			d_routing_weights,
-			expert_count,
-			token_sorted,
-			weight_sorted,
-			cursors,
-			E,
-			start_expert,
-			end_expert,
-			active_experts,
-			stream
-		);
+	switch ( weights.type ) {
+		case pod::QuantType::TRELLIS: {
+			const int E = weights.num_local_experts;
+			const int K_gate = weights.gate[0].bits;
+			const int K_up = weights.up[0].bits;
+			const int K_down = weights.down[0].bits;
+			ENGINE_ASSERT( weights.device_ptrs != nullptr, "MoE::forward: init_device_ptrs not called" );
+			ENGINE_ASSERT( K_gate == 3 && K_up == 3 && K_down == 3, "MoE::forward: persistent trellis MoE kernel is instantiated for 3-bit experts only" );
 
-		const void** d_ptrs = static_cast<const void**>( weights.device_ptrs );
-		const uint16_t** gate_trellis = reinterpret_cast<const uint16_t**>( d_ptrs + 0 * E );
-		const half** gate_suh = reinterpret_cast<const half**>( d_ptrs + 1 * E );
-		const half** gate_svh = reinterpret_cast<const half**>( d_ptrs + 2 * E );
-		const uint16_t** up_trellis = reinterpret_cast<const uint16_t**>( d_ptrs + 3 * E );
-		const half** up_suh = reinterpret_cast<const half**>( d_ptrs + 4 * E );
-		const half** up_svh = reinterpret_cast<const half**>( d_ptrs + 5 * E );
-		const uint16_t** down_trellis = reinterpret_cast<const uint16_t**>( d_ptrs + 6 * E );
-		const half** down_suh = reinterpret_cast<const half**>( d_ptrs + 7 * E );
-		const half** down_svh = reinterpret_cast<const half**>( d_ptrs + 8 * E );
+			MoERouter::exl3_moe_dispatch(
+				d_topk_indices,
+				d_topk_weights,
+				scratch.expert_count,
+				scratch.token_sorted,
+				scratch.weight_sorted,
+				scratch.cursors,
+				E,
+				start_expert,
+				end_expert,
+				scratch.active_experts,
+				stream
+			);
 
-		ext::exl3_moe(
-			x.data,
-			out.data,
-			expert_count,
-			token_sorted,
-			weight_sorted,
-			temp_state_g,
-			temp_state_u,
-			temp_intermediate_g,
-			temp_intermediate_u,
-			0,
-			3, 3, 3,
-			gate_trellis, gate_suh, gate_svh,
-			up_trellis, up_suh, up_svh,
-			down_trellis, down_suh, down_svh,
-			false, true, false, true, false, true,
-			10.0f,
-			-1,
-			active_experts,
-			stream
-		);
+			const void** d_ptrs = static_cast<const void**>( weights.device_ptrs );
+			const uint16_t** gate_trellis = reinterpret_cast<const uint16_t**>( d_ptrs + 0 * E );
+			const half** gate_suh = reinterpret_cast<const half**>( d_ptrs + 1 * E );
+			const half** gate_svh = reinterpret_cast<const half**>( d_ptrs + 2 * E );
+			const uint16_t** up_trellis = reinterpret_cast<const uint16_t**>( d_ptrs + 3 * E );
+			const half** up_suh = reinterpret_cast<const half**>( d_ptrs + 4 * E );
+			const half** up_svh = reinterpret_cast<const half**>( d_ptrs + 5 * E );
+			const uint16_t** down_trellis = reinterpret_cast<const uint16_t**>( d_ptrs + 6 * E );
+			const half** down_suh = reinterpret_cast<const half**>( d_ptrs + 7 * E );
+			const half** down_svh = reinterpret_cast<const half**>( d_ptrs + 8 * E );
+
+			ext::exl3_moe(
+				x.data,
+				out.data,
+				scratch.expert_count,
+				scratch.token_sorted,
+				scratch.weight_sorted,
+				scratch.state_g,
+				scratch.state_u,
+				scratch.interm_g,
+				scratch.interm_u,
+				0,
+				K_gate, K_up, K_down,
+				gate_trellis, gate_suh, gate_svh,
+				up_trellis, up_suh, up_svh,
+				down_trellis, down_suh, down_svh,
+				false, weights.gate[0].mul1, false, weights.up[0].mul1, false, weights.down[0].mul1,
+				act_limit,
+				-1,
+				scratch.active_experts,
+				stream
+			);
+		} break;
+		default: {
+			ENGINE_ASSERT( false, "MoE::forward: no routed-expert driver for this weight format (only TRELLIS is implemented)" );
+		} break;
 	}
 }
 

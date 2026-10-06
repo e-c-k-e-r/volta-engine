@@ -33,30 +33,32 @@ struct GLM53Config {
 	int dsa_top_k = 64;
 	int vocab_size = 154880;
 	int tp_size = 4;
+	int max_seq = 2048;
+	int max_slots = 1; // MLA KV is ~369 MiB/slot/rank; weights fill the 31 GiB arena
+	int num_mla_layers = 11;
+	int kda_heads = 16;
+	int kda_head_dim = 128;
+	int kda_channels = 6144;
 	float rms_norm_eps = 1e-6f;
 	float rms_norm_bias = 1.0f;
 };
 
+// Per-rank recurrent state laid out [slot][layer][...] so one slot is contiguous.
 struct GLM53State {
-	half* latent_cache; // [num_pages, 16, mla_dc]
-	half* rope_cache;   // [num_pages, 16, mla_dr]
-	half* k_cache;      // [11, max_seq, 16 * 256]
-	half* v_cache;      // [11, max_seq, 16 * 256]
-	int32_t* block_table;
-	int* d_topk_indices;
-	half* d_topk_weights;
-	int64_t* expert_count;
-	int64_t* token_sorted;
-	half* weight_sorted;
-	int* cursors;
-	int4* d_active_experts;
-	int current_pos;
+	float* kda_states = nullptr;      // [slots, 45, heads, 128, 128] FP32
+	float* conv_history = nullptr;    // [slots, 45, channels, 3] FP32
+	float* kda_checkpoint = nullptr;
+	float* conv_checkpoint = nullptr;
+	size_t layer_kda_floats = 0;
+	size_t layer_conv_floats = 0;
+	int* d_topk_indices = nullptr;
+	half* d_topk_weights = nullptr;
+	pod::MoEScratch moe;
 };
 
 struct GLM53ExpertWeights {
 	pod::LinearWeight gate;
 	pod::LinearWeight up;
-	pod::LinearWeight gate_up_proj;
 	pod::LinearWeight down;
 };
 
@@ -73,7 +75,6 @@ struct GLM53LayerWeights {
 	pod::LinearWeight qkv;
 
 	pod::TensorView conv1d_weights; // [6144 * 4] half
-	pod::TensorView conv_history;   // [6144 * 3] float
 	pod::TensorView A_log;          // [16] half
 	pod::TensorView dt_bias;        // [2048] half
 
@@ -83,8 +84,6 @@ struct GLM53LayerWeights {
 	pod::TensorView g_a_proj;       // [128, 4096] half
 	pod::TensorView g_b_proj;       // [2048, 128] half
 	pod::TensorView o_norm;         // [128] half
-
-	float*          gdn_state = nullptr; // [16 * 128 * 128] float
 
 	// MLA Attention (DeepSeek-style MLA)
 	pod::LinearWeight q_a;
@@ -103,8 +102,7 @@ struct GLM53LayerWeights {
 	// Dense MLP (layers 0, 1, 2)
 	GLM53ExpertWeights dense_mlp;
 
-	// 72 local experts for this rank: rank * 72 .. (rank + 1) * 72 - 1
-	GLM53ExpertWeights experts[72];
+	// 72 local routed experts for this rank: rank * 72 .. (rank + 1) * 72 - 1
 	pod::MoELayerWeights moe_weights;
 
 	// Shared expert
@@ -126,68 +124,49 @@ public:
 	GLM53Pipeline();
 	virtual ~GLM53Pipeline() override;
 
-	// ModelPipeline interface overrides
+	using ModelPipeline::forward;
+
 	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
-	bool load_weights( const char* model_dir, cudaStream_t stream = nullptr ) override;
-	void embed_token( int token_id, int pos, cudaStream_t stream = nullptr ) override;
-	void forward_step( int token_id, int pos, int slot_id, cudaStream_t stream = nullptr ) override;
-	void forward_step( int token_id, int pos, cudaStream_t stream = nullptr ) override;
-	void forward_batch( const int* token_ids, int batch_size, int pos, cudaStream_t stream = nullptr ) override;
-	int sample_next_token( cudaStream_t stream = nullptr ) override;
-	bool capture_graph( int batch_size, cudaStream_t stream = nullptr ) override;
-	void launch_graph( int batch_size, cudaStream_t stream = nullptr ) override;
-	pod::TensorView get_logits() override;
-	const ModelMetadata& get_metadata() const override;
-
-	// KV Cache Management
-	void set_kv_pool( engine::runtime::KVCachePool* pool ) override;
-	void reset_kv_cache( int slot_id = 0 ) override;
-
-	// Concrete interface
 	bool init( const GLM53Config& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
-	void embed_token( int token_id, cudaStream_t stream = nullptr );
+	bool load_weights( const char* model_dir, cudaStream_t stream = nullptr ) override;
 
-	void forward_step(
-		const pod::TensorView& input_tokens,
-		pod::TensorView& output_logits,
-		int pos,
-		int slot_id = 0,
-		cudaStream_t stream = nullptr
-	);
+	void embed_tokens( const int* token_ids, int count, cudaStream_t stream = nullptr ) override;
+	void forward( const pod::BatchRows& rows, cudaStream_t stream = nullptr ) override;
+	void sample_tokens( int* out_preds, int count, cudaStream_t stream = nullptr ) override;
 
-	void forward_step(
-		const pod::TensorView& input_tokens,
-		pod::TensorView& output_logits,
-		int pos,
-		cudaStream_t stream = nullptr
-	);
-
-	void reset_state();
-	void destroy();
+	void checkpoint_state( int slot_id, cudaStream_t stream = nullptr ) override;
+	void rollback_state( int slot_id, cudaStream_t stream = nullptr ) override;
+	void reset_state( int slot_id = 0 ) override;
 
 	pod::TensorView& logits() override { return logits_; }
 	const pod::TensorView& logits() const override { return logits_; }
+	const half* tapped_states( int row = 0 ) const override { (void) row; return nullptr; }
+	const ModelMetadata& get_metadata() const override { return metadata_; }
+
+	void destroy();
 
 private:
-	engine::runtime::KVCachePool* kv_pool_ = nullptr;
-	engine::runtime::KVCachePool internal_kv_pool_;
-	int active_slot_id_ = 0;
+	// Single-token layer stack for one row: embed_rows_[row] -> logits_[row]
+	void forward_row( int row, int pos, int slot_id, cudaStream_t stream );
+
+	engine::runtime::KVCachePool kv_pool_;
+	int last_rows_ = 0;
 
 	ModelMetadata metadata_;
 	GLM53Config config_;
-	int rank_;
-	pod::MemoryArena* arena_;
-	engine::comm::CollectiveRing* ring_;
+	int rank_ = 0;
+	pod::MemoryArena* arena_ = nullptr;
+	engine::comm::CollectiveRing* ring_ = nullptr;
 	GLM53State state_;
-	bool weights_loaded_;
+	bool weights_loaded_ = false;
 
-	pod::TensorView hidden_states_;
-	pod::TensorView residual_;
+	pod::TensorView embed_rows_;    // [MAX_BATCH, hidden] embedded inputs
+	int* d_token_ids_ = nullptr;    // [MAX_BATCH]
+	pod::TensorView hidden_states_; // [1, hidden] current row
 	pod::TensorView norm_hidden_;
 
 	// mHC residual stream buffers
 	pod::TensorView hidden_streams_;
-	pod::TensorView residual_streams_;
 	pod::TensorView mhc_collapsed_;
 	pod::TensorView mhc_inv_rms_;
 	pod::TensorView mhc_mix_logits_;
@@ -196,9 +175,6 @@ private:
 	pod::TensorView mhc_comb_;
 
 	// MLA buffers
-	pod::TensorView q_lat_buf_;
-	pod::TensorView q_pe_buf_;
-	pod::TensorView mla_out_;
 	pod::TensorView attn_out_;
 	pod::TensorView q_lora_buf_;
 	pod::TensorView q_lora_norm_buf_;
@@ -218,44 +194,22 @@ private:
 	pod::TensorView z_buf_;         // [1, 2048] FP16
 	pod::TensorView attn_head_out_; // [1, 2048] FP16
 
-	// Router and MoE buffers
-	pod::TensorView router_weights_;
+	// Dense / shared-expert FFN buffers
 	pod::TensorView moe_gate_buf_;
 	pod::TensorView moe_up_buf_;
-	pod::TensorView moe_gate_up_buf_;
 	pod::TensorView moe_inter_buf_;
 	pod::TensorView moe_expert_out_;
 	pod::TensorView local_moe_out_;
 	pod::TensorView ffn_out_;
-	half* temp_state_g_ = nullptr;
-	half* temp_state_u_ = nullptr;
-	half* temp_interm_g_ = nullptr;
-	half* temp_interm_u_ = nullptr;
-
-	// Fallback dummy descriptors
-	pod::LinearWeight dummy_linear_;
-	pod::TensorView   dummy_norm_;
 
 	// Model level
 	GLM53LayerWeights layers_[45];
 	pod::TensorView embed_tokens_;
 	pod::TensorView final_norm_;
 	pod::LinearWeight lm_head_;
-	pod::TensorView logits_;
-	int* d_argmax_idx_;
-	int* h_argmax_idx_;
-
-	cudaGraph_t graph_m1_;
-	cudaGraphExec_t instance_m1_;
-	bool graph_m1_captured_;
-
-	cudaGraph_t graph_m4_;
-	cudaGraphExec_t instance_m4_;
-	bool graph_m4_captured_;
-
-	cudaGraph_t graph_m8_;
-	cudaGraphExec_t instance_m8_;
-	bool graph_m8_captured_;
+	pod::TensorView logits_;  // [MAX_BATCH, vocab] (rank 0)
+	int* d_argmax_idx_ = nullptr;
+	int* h_argmax_idx_ = nullptr;
 };
 
 } // namespace engine::models

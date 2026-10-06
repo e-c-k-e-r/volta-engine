@@ -1,0 +1,113 @@
+// MoE parity: persistent MoE::forward vs per-expert reference (Linear + SwiGLU + accumulate)
+// on real GLM-5.3-Flash layer-3 routed experts (rank-0 partition, 72 experts).
+#include "engine/config.h"
+#include "engine/core/arena.h"
+#include "engine/loader/safetensors.h"
+#include "engine/modules/linear.h"
+#include "engine/modules/moe.h"
+#include "engine/modules/swiglu.h"
+#include "trellis_context.h"
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+int main() {
+	setvbuf( stdout, nullptr, _IOLBF, 0 );
+	const char* dir = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
+	const int H = 4096, I = 2048, E = 72, K = 8, L = 3;
+	CUDA_CHECK( cudaSetDevice( 0 ) );
+	engine::modules::trellis_context_init_all();
+	engine::modules::trellis_get_workspace( 0, 16 * 1024 * 1024 );
+	engine::modules::trellis_get_locks( 0 );
+	cudaStream_t stream;
+	CUDA_CHECK( cudaStreamCreate( &stream ) );
+	pod::MemoryArena arena;
+	ENGINE_ASSERT( engine::core::arena_create( arena, 0, 2ULL * 1024 * 1024 * 1024 ), "arena" );
+
+	engine::loader::SafeTensorsRepo repo;
+	ENGINE_ASSERT( repo.open( dir ), "open model dir" );
+	pod::MoELayerWeights mw;
+	mw.type = pod::QuantType::TRELLIS;
+	mw.num_local_experts = E;
+	char name[256];
+	for ( int e = 0; e < E; ++e ) {
+		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, e );
+		mw.gate[e] = repo.load_linear( name, arena, 4, stream );
+		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, e );
+		mw.up[e] = repo.load_linear( name, arena, 4, stream );
+		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, e );
+		mw.down[e] = repo.load_linear( name, arena, 4, stream );
+	}
+	engine::modules::MoE::init_device_ptrs( mw, arena, stream );
+	std::printf( "[*] experts: bits g/u/d = %d/%d/%d, mul1 g/u/d = %d/%d/%d\n",
+		mw.gate[0].bits, mw.up[0].bits, mw.down[0].bits, mw.gate[0].mul1, mw.up[0].mul1, mw.down[0].mul1 );
+
+	// Inputs: x ~ U(-1, 1); routes include out-of-partition experts (>= 72) that must be skipped
+	int h_idx[K] = { 3, 17, 40, 71, 100, 5, 250, 66 };
+	// MOE_ACTIVE=n keeps only the first n routes (others moved out of partition) for bisection
+	if ( const char* env = std::getenv( "MOE_ACTIVE" ) ) {
+		for ( int k = std::atoi( env ); k < K; ++k ) h_idx[k] = 300;
+	}
+	const float h_wf[K] = { 0.21f, 0.17f, 0.14f, 0.12f, 0.11f, 0.10f, 0.08f, 0.07f };
+	std::vector<half> h_x( H ), h_w( K );
+	uint32_t seed = 12345u;
+	for ( int i = 0; i < H; ++i ) {
+		seed = seed * 1664525u + 1013904223u;
+		h_x[i] = __float2half( ( ( seed >> 8 ) / 16777216.0f ) * 2.0f - 1.0f );
+	}
+	for ( int k = 0; k < K; ++k ) h_w[k] = __float2half( h_wf[k] );
+
+	int hs[2] = { 1, H }, is[2] = { 1, I };
+	auto x = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, hs, 2 );
+	auto ref = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, hs, 2 );
+	auto out = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, hs, 2 );
+	auto eo = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, hs, 2 );
+	auto g = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, is, 2 );
+	auto u = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, is, 2 );
+	auto inter = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, is, 2 );
+	int* d_idx = static_cast<int*>( engine::core::arena_alloc( arena, K * sizeof( int ) ) );
+	half* d_w = static_cast<half*>( engine::core::arena_alloc( arena, K * sizeof( half ) ) );
+	CUDA_CHECK( cudaMemcpy( x.data, h_x.data(), H * sizeof( half ), cudaMemcpyHostToDevice ) );
+	CUDA_CHECK( cudaMemcpy( d_idx, h_idx, sizeof( h_idx ), cudaMemcpyHostToDevice ) );
+	CUDA_CHECK( cudaMemcpy( d_w, h_w.data(), K * sizeof( half ), cudaMemcpyHostToDevice ) );
+
+	// Reference: per-expert Linear path (the validated pre-refactor decode path)
+	CUDA_CHECK( cudaMemset( ref.data, 0, ref.size_bytes() ) );
+	for ( int k = 0; k < K; ++k ) {
+		if ( h_idx[k] >= E ) continue;
+		const int e = h_idx[k];
+		engine::modules::Linear::forward( x, mw.gate[e], g, stream );
+		engine::modules::Linear::forward( x, mw.up[e], u, stream );
+		engine::modules::SwiGLU::forward( g, u, inter, stream, 10.0f );
+		engine::modules::Linear::forward( inter, mw.down[e], eo, stream );
+		engine::modules::MoERouter::accumulate( ref.ptr<half>(), eo.ptr<const half>(), h_w[k], H, stream );
+	}
+
+	auto scratch = engine::modules::MoE::alloc_scratch( arena, E, K, H, I );
+	engine::modules::MoE::forward( x, mw, d_idx, d_w, out, 0, E, scratch, 10.0f, stream );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+
+	std::vector<half> h_ref( H ), h_out( H );
+	CUDA_CHECK( cudaMemcpy( h_ref.data(), ref.data, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
+	CUDA_CHECK( cudaMemcpy( h_out.data(), out.data, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
+	double dot = 0, na = 0, nb = 0, maxd = 0, maxr = 0;
+	for ( int i = 0; i < H; ++i ) {
+		const double a = __half2float( h_ref[i] ), b = __half2float( h_out[i] );
+		dot += a * b;
+		na += a * a;
+		nb += b * b;
+		maxd = std::fmax( maxd, std::fabs( a - b ) );
+		maxr = std::fmax( maxr, std::fabs( a ) );
+	}
+	const double cos = dot / ( std::sqrt( na ) * std::sqrt( nb ) + 1e-12 );
+	std::printf( "[*] MoE::forward vs reference: cos=%.6f max_abs=%.4f (ref max %.4f, |ref|=%.3f |out|=%.3f)\n",
+		cos, maxd, maxr, std::sqrt( na ), std::sqrt( nb ) );
+	const bool pass = cos >= 0.9999;
+	std::printf( "[%c] MoE PARITY %s\n", pass ? '+' : '-', pass ? "PASS" : "FAIL" );
+	repo.close();
+	engine::core::arena_destroy( arena );
+	engine::modules::trellis_context_destroy();
+	cudaDeviceReset();
+	return 0;
+}

@@ -33,11 +33,13 @@ set(ENGINE_CORE_SOURCES
 	src/modules/mla.cu
 	src/modules/moe.cu
 	src/modules/mhc.cu
+	src/modules/embedding.cu
 	src/models/model.cpp
 	src/models/qwen38_27b.cu
 	src/models/glm53_flash.cu
 	src/spec/dflash.cu
 	src/runtime/kv_cache.cpp
+	src/runtime/cluster.cpp
 	src/runtime/generator.cpp
 	src/server/config.cpp
 	src/server/server.cpp
@@ -97,6 +99,16 @@ set_target_properties(test_mla PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BI
 add_executable(test_gdn tests/2_parity/test_gdn.cpp)
 target_link_libraries(test_gdn PRIVATE engine_kernels)
 set_target_properties(test_gdn PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# Test multi-row (Mode A / Mode B) forward parity against sequential M=1
+add_executable(test_rows tests/2_parity/test_rows.cpp)
+target_link_libraries(test_rows PRIVATE engine_kernels pthread)
+set_target_properties(test_rows PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# Test routed MoE (persistent kernel) parity against per-expert reference
+add_executable(test_moe tests/2_parity/test_moe.cpp)
+target_link_libraries(test_moe PRIVATE engine_kernels)
+set_target_properties(test_moe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Test Norm & Elementwise Parity
 add_executable(test_norm tests/2_parity/test_norm.cpp)

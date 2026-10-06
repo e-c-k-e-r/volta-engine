@@ -13,15 +13,14 @@ __global__ void rope_kernel(
 	int num_kv_heads,
 	int head_dim,
 	int rot_dim,
-	int base_pos,
-	int m_tokens,
+	const pod::BatchRows rows,
 	float freq_base
 ) {
 	int tid = threadIdx.x; // pair index [0 .. 31]
 	int m = blockIdx.y;    // token index [0 .. m_tokens - 1]
-	if ( m >= m_tokens || tid >= rot_dim / 2 ) return;
+	if ( m >= rows.count || tid >= rot_dim / 2 ) return;
 
-	int pos = base_pos + m;
+	int pos = rows.pos[m];
 	float theta = static_cast<float>( pos ) * powf( freq_base, -( 2.0f * tid / static_cast<float>( rot_dim ) ) );
 	float cos_val = __cosf( theta );
 	float sin_val = __sinf( theta );
@@ -58,20 +57,18 @@ void RoPE::forward(
 	int num_kv_heads,
 	int head_dim,
 	int rot_dim,
-	int pos,
+	const pod::BatchRows& rows,
 	float freq_base,
 	cudaStream_t stream
 ) {
-	int m = ( q.ndim >= 1 && q.shape[0] > 0 ) ? q.shape[0] : 1;
-	rope_kernel<<<dim3( 1, m ), dim3( rot_dim / 2 ), 0, stream>>>(
+	rope_kernel<<<dim3( 1, rows.count ), dim3( rot_dim / 2 ), 0, stream>>>(
 		q.ptr<half>(),
 		k.ptr<half>(),
 		num_q_heads,
 		num_kv_heads,
 		head_dim,
 		rot_dim,
-		pos,
-		m,
+		rows,
 		freq_base
 	);
 }

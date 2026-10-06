@@ -3,11 +3,9 @@
 #include "engine/config.h"
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
-#include "engine/models/model.h"
-#include "engine/runtime/kv_cache.h"
+#include "engine/runtime/cluster.h"
 #include "engine/loader/tokenizer.h"
 #include "engine/loader/chat_template.h"
-#include "engine/spec/dflash.h"
 #include "engine/server/config.h"
 
 #include <cuda_runtime.h>
@@ -76,56 +74,36 @@ public:
 	}
 
 private:
-	void worker_thread_func( int rank );
-	void scheduler_loop();
-	void step_batch();
-	void run_gpu_step_token( int tok, int pos, int slot_id = 0 );
-	void run_gpu_step_batched( const int* tokens, int batch_size, int pos, int slot_id = 0 );
-
-	engine::server::ServerConfig config_;
-	std::unique_ptr<engine::models::ModelPipeline> models_[ENGINE_NUM_GPUS];
-	KVCachePool kv_pools_[ENGINE_NUM_GPUS];
-	pod::MemoryArena arenas_[ENGINE_NUM_GPUS];
-	engine::comm::CollectiveRing rings_[ENGINE_NUM_GPUS];
-	cudaStream_t streams_[ENGINE_NUM_GPUS];
-	void* staging_ptrs_[ENGINE_NUM_GPUS] = { nullptr };
-	void* flag_ptrs_[ENGINE_NUM_GPUS] = { nullptr };
-
-	engine::loader::Tokenizer tokenizer_;
-	engine::loader::ChatTemplate chat_template_;
-	engine::spec::DFlashSpeculator speculator_;
-
-	std::thread worker_threads_[ENGINE_NUM_GPUS];
-	std::thread scheduler_thread_;
-	pthread_barrier_t step_barrier_;
-	std::atomic<bool> running_{ false };
-
-	enum class WorkerTask {
-		NONE,
-		STEP_FORWARD,
-		STEP_BATCH,
-		STOP
-	};
-	WorkerTask worker_task_ = WorkerTask::NONE;
-	int worker_token_ = -1;
-	int worker_pos_ = 0;
-	int worker_slot_id_ = 0;
-	int worker_batch_size_ = 1;
-	int worker_batch_tokens_[16];
-
 	struct Slot {
 		bool active = false;
 		GenerationRequest req;
-		int current_pos = 0;
+		int current_pos = 0;   // next position to write (== tokens committed to KV / recurrent state)
 		int tokens_generated = 0;
-		int last_token = -1;
+		int last_token = -1;   // sampled, not yet forwarded (next anchor)
 		bool prefill_done = false;
 		std::string accumulated_text;
 		std::vector<int> all_tokens;
 		SlotMetrics metrics;
 	};
 
+	void scheduler_loop();
+	void admit_pending();
+	void step_batch();
+	void prefill_slot( int s );
+	// Commits `tok` to slot s's output; returns true when the request finished.
+	bool emit_token( int s, int tok );
+	void finish_slot( int s );
+
+	engine::server::ServerConfig config_;
+	ModelCluster cluster_;
+	engine::loader::Tokenizer tokenizer_;
+	engine::loader::ChatTemplate chat_template_;
+
+	std::thread scheduler_thread_;
+	std::atomic<bool> running_{ false };
+
 	static constexpr int MAX_SLOTS = 8;
+	int num_slots_ = 1;
 	Slot slots_[MAX_SLOTS];
 
 	std::mutex queue_mtx_;

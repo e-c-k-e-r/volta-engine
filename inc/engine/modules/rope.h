@@ -2,6 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/core/tensor.h"
+#include "engine/core/batch.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
@@ -15,7 +16,7 @@ struct RoPE {
 		int num_kv_heads,
 		int head_dim,
 		int rot_dim,
-		int pos,
+		const pod::BatchRows& rows,
 		float freq_base = 10000000.0f,
 		cudaStream_t stream = nullptr
 	);

@@ -95,13 +95,14 @@ int main() {
 			CUDA_CHECK( cudaMemcpyAsync( d_gate.data, h_gate.data(), h_gate.size() * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
 
 			// Store K, V in cache
+			const auto rows = pod::BatchRows::causal( 1, pos, 0 );
 			engine::modules::Attention::store_kv_cache(
-				d_k_cache, d_v_cache, d_k, d_v, 0, pos, cfg.kv_heads, cfg.head_dim, cfg.max_seq, stream
+				d_k_cache, d_v_cache, d_k, d_v, 0, 0, rows, cfg.kv_heads, cfg.head_dim, cfg.max_seq, stream
 			);
 
 			// Forward decode
 			engine::modules::Attention::forward_decode(
-				d_q, d_k_cache, d_v_cache, d_gate, d_out, 0, pos, cfg.q_heads, cfg.kv_heads, cfg.head_dim, cfg.max_seq, stream
+				d_q, d_k_cache, d_v_cache, d_gate, d_out, 0, 0, rows, cfg.q_heads, cfg.kv_heads, cfg.head_dim, cfg.max_seq, stream
 			);
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 

@@ -18,6 +18,19 @@ struct MoELayerWeights {
 	void* device_ptrs = nullptr;
 };
 
+// Device scratch for one MoE dispatch (single token, top_k routes). Allocated once at init.
+struct MoEScratch {
+	int64_t* expert_count = nullptr;   // [num_local_experts + 1]
+	int64_t* token_sorted = nullptr;   // [top_k]
+	half*    weight_sorted = nullptr;  // [top_k]
+	int*     cursors = nullptr;        // [num_local_experts + 1]
+	int4*    active_experts = nullptr; // [num_local_experts + 1]
+	half*    state_g = nullptr;        // [groups, top_k, hidden]
+	half*    state_u = nullptr;
+	half*    interm_g = nullptr;       // [groups, top_k, intermediate]
+	half*    interm_u = nullptr;
+};
+
 } // namespace pod
 
 namespace engine::modules {
@@ -84,23 +97,26 @@ struct MoE {
 		cudaStream_t stream = nullptr
 	);
 
+	static pod::MoEScratch alloc_scratch(
+		pod::MemoryArena& arena,
+		int num_local_experts,
+		int top_k,
+		int hidden_size,
+		int intermediate_size
+	);
+
+	// Routed-expert FFN for one token: out = sum_k w_k * expert_k( x ) over the experts in
+	// [start_expert, end_expert). Fully device-resident (no host sync); dispatches on weights.type.
 	static void forward(
 		const pod::TensorView& x,
 		const pod::MoELayerWeights& weights,
-		const pod::TensorView& topk_idx,
-		const pod::TensorView& topk_weight,
+		const int* d_topk_indices,
+		const half* d_topk_weights,
 		pod::TensorView& out,
 		int start_expert,
 		int end_expert,
-		half* temp_state_g,
-		half* temp_state_u,
-		half* temp_intermediate_g,
-		half* temp_intermediate_u,
-		int64_t* expert_count,
-		int64_t* token_sorted,
-		half* weight_sorted,
-		int* cursors,
-		int4* active_experts,
+		const pod::MoEScratch& scratch,
+		float act_limit = 10.0f,
 		cudaStream_t stream = nullptr
 	);
 };

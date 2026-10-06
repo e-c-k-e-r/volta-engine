@@ -4,68 +4,67 @@
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
+#include "engine/core/batch.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <string>
 #include <memory>
 
-namespace engine::runtime {
-struct KVCachePool;
-}
-
 namespace engine::models {
 
 struct ModelMetadata {
 	std::string model_name;
-	int hidden_size;
-	int vocab_size;
-	int num_layers;
-	int num_heads;
-	int num_kv_heads;
-	int head_dim;
-	int max_seq_len;
-	int tp_size;
+	int hidden_size = 0;
+	int vocab_size = 0;
+	int num_layers = 0;
+	int num_heads = 0;
+	int num_kv_heads = 0;
+	int head_dim = 0;
+	int max_seq_len = 0;
+	int tp_size = 0;
+	int max_slots = 1;    // independent request slots (KV + recurrent state) resident on device
+	int max_rows = 1;     // max rows per forward pass (<= pod::MAX_BATCH)
+	int eos_ids[4] = { -1, -1, -1, -1 };
 };
 
+// Unified per-rank model contract. One instance per GPU; all ranks are driven in lockstep.
+//
+// Row semantics (see pod::BatchRows):
+//   Mode A (speculative verify / chunked prefill): forward( M, pos, slot ) evaluates the causal
+//          candidate block [pos, pos + M) of a single slot.
+//   Mode B (concurrent batching): forward( rows ) evaluates one token per independent slot,
+//          rows.slot[b] / rows.pos[b] mapped per row.
 class ModelPipeline {
 public:
 	virtual ~ModelPipeline() = default;
 
-	// Initialization & Weight Loading
+	// 1. Lifecycle & weight loading
 	virtual bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) = 0;
 	virtual bool load_weights( const char* model_dir, cudaStream_t stream = nullptr ) = 0;
 
-	// Execution & Forward Passes
-	virtual void embed_token( int token_id, int pos, cudaStream_t stream = nullptr ) = 0;
-	virtual void forward_step( int token_id, int pos, int slot_id, cudaStream_t stream = nullptr ) = 0;
-	virtual void forward_step( int token_id, int pos, cudaStream_t stream = nullptr ) {
-		forward_step( token_id, pos, 0, stream );
+	// 2. Token embedding: token_ids is a host array of `count` ids for rows 0..count-1
+	virtual void embed_tokens( const int* token_ids, int count, cudaStream_t stream = nullptr ) = 0;
+
+	// 3. Forward over embedded rows
+	virtual void forward( const pod::BatchRows& rows, cudaStream_t stream = nullptr ) = 0;
+	void forward( int batch_size, int pos, int slot_id = 0, cudaStream_t stream = nullptr ) {
+		forward( pod::BatchRows::causal( batch_size, pos, slot_id ), stream );
 	}
-	virtual void forward_batch( const int* token_ids, int batch_size, int pos, cudaStream_t stream = nullptr ) = 0;
-	virtual int sample_next_token( cudaStream_t stream = nullptr ) = 0;
 
-	// CUDA Graph Management
-	virtual bool capture_graph( int batch_size, cudaStream_t stream = nullptr ) = 0;
-	virtual void launch_graph( int batch_size, cudaStream_t stream = nullptr ) = 0;
+	// 4. Greedy sampling of the last forward's first `count` rows into host out_preds (rank 0)
+	virtual void sample_tokens( int* out_preds, int count, cudaStream_t stream = nullptr ) = 0;
 
-	// Descriptors & Buffers
-	virtual pod::TensorView get_logits() = 0;
+	// 5. Speculative state management: snapshot / restore the recurrent state of one slot.
+	//    KV cache entries need no snapshot: rejected positions are overwritten by the next forward.
+	virtual void checkpoint_state( int slot_id, cudaStream_t stream = nullptr ) = 0;
+	virtual void rollback_state( int slot_id, cudaStream_t stream = nullptr ) = 0;
+	virtual void reset_state( int slot_id = 0 ) = 0;
+
+	// 6. Output descriptors & tapped states
 	virtual pod::TensorView& logits() = 0;
 	virtual const pod::TensorView& logits() const = 0;
-	virtual half* tapped_states( int row = 0 ) { (void) row; return nullptr; }
-	virtual const half* tapped_states( int row = 0 ) const { (void) row; return nullptr; }
-	virtual void checkpoint_state( cudaStream_t stream = nullptr ) { (void) stream; }
-	virtual void rollback_state( cudaStream_t stream = nullptr ) { (void) stream; }
-	virtual void sample_next_tokens( int* preds, int count, cudaStream_t stream = nullptr ) {
-		for ( int i = 0; i < count; ++i ) preds[i] = sample_next_token( stream );
-	}
+	virtual const half* tapped_states( int row = 0 ) const = 0;
 	virtual const ModelMetadata& get_metadata() const = 0;
-
-	// KV Cache Management
-	virtual void set_kv_pool( engine::runtime::KVCachePool* pool ) {
-		(void) pool;
-	}
-	virtual void reset_kv_cache( int slot_id = 0 ) = 0;
 };
 
 // Factory helper to instantiate models dynamically

@@ -2,11 +2,15 @@
 
 #include "engine/config.h"
 #include "engine/core/tensor.h"
+#include "engine/core/batch.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 namespace engine::modules {
 
+// KV cache layout: [slot][layer][max_seq][num_kv_heads * head_dim] FP16.
+// k_cache / v_cache point at slot 0; slot_stride is the per-slot element stride.
+// Row m of every call reads/writes slot rows.slot[m] at position rows.pos[m].
 struct Attention {
 	static void unpack_q_gate(
 		const pod::TensorView& q_gate,
@@ -22,8 +26,9 @@ struct Attention {
 		half* v_cache,
 		const pod::TensorView& k,
 		const pod::TensorView& v,
+		size_t slot_stride,
 		int layer_idx,
-		int pos,
+		const pod::BatchRows& rows,
 		int num_kv_heads,
 		int head_dim,
 		int max_seq = 2048,
@@ -36,8 +41,9 @@ struct Attention {
 		const half* v_cache,
 		const pod::TensorView& gate,
 		pod::TensorView& out,
+		size_t slot_stride,
 		int layer_idx,
-		int pos,
+		const pod::BatchRows& rows,
 		int num_q_heads,
 		int num_kv_heads,
 		int head_dim,

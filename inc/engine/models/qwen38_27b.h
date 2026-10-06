@@ -13,6 +13,7 @@
 #include "engine/modules/attention.h"
 #include "engine/modules/gdn.h"
 #include "engine/modules/linear.h"
+#include "engine/modules/embedding.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -39,19 +40,22 @@ struct Qwen38Config {
 	int linear_head_dim = 128;
 	int linear_channels = 10240; // 16*128 + 16*128 + 48*128
 	int max_seq = 2048;
+	int max_slots = 8;
+	int vocab_size = 248320;
 	float rms_norm_eps = 1e-6f;
 	float rms_norm_bias = 1.0f;
+	float rope_theta = 10000000.0f;
+	int tap_layers[5] = { 5, 19, 33, 47, 61 }; // DFlash2 tapped hidden states
 };
 
+// Per-rank recurrent state, laid out [slot][layer][...] so one slot is a contiguous block.
 struct Qwen38State {
-	// 48 GDN layers: [48, 48, 128, 128] FP32 recurrent state matrix
-	float* gdn_states;
-	// 48 GDN layers: [48, 10240, 3] FP32 causal conv1d history
-	float* conv_history;
-	// 16 full-attention layers: [16, max_seq, 4, 256] FP16 KV cache
-	half* k_cache;
-	half* v_cache;
-	int current_pos;
+	float* gdn_states = nullptr;      // [slots, 48, v_heads, 128, 128] FP32
+	float* conv_history = nullptr;    // [slots, 48, channels, 3] FP32
+	float* gdn_checkpoint = nullptr;  // one-slot snapshot
+	float* conv_checkpoint = nullptr;
+	size_t slot_gdn_floats = 0;
+	size_t slot_conv_floats = 0;
 };
 
 struct Qwen38LayerWeights {
@@ -84,7 +88,6 @@ struct Qwen38LayerWeights {
 	// MLP weights
 	pod::LinearWeight gate_proj;
 	pod::LinearWeight up_proj;
-	pod::LinearWeight gate_up_proj;
 	pod::LinearWeight down_proj;
 };
 
@@ -93,86 +96,54 @@ public:
 	Qwen38Pipeline();
 	virtual ~Qwen38Pipeline() override;
 
-	// ModelPipeline interface overrides
+	using ModelPipeline::forward;
+
 	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
-	bool load_weights( const char* model_dir, cudaStream_t stream = nullptr ) override;
-	void embed_token( int token_id, int pos, cudaStream_t stream = nullptr ) override;
-	void forward_step( int token_id, int pos, int slot_id, cudaStream_t stream = nullptr ) override;
-	void forward_step( int token_id, int pos, cudaStream_t stream = nullptr ) override;
-	void forward_batch( const int* token_ids, int batch_size, int pos, cudaStream_t stream = nullptr ) override;
-	int sample_next_token( cudaStream_t stream = nullptr ) override;
-	bool capture_graph( int batch_size, cudaStream_t stream = nullptr ) override;
-	void launch_graph( int batch_size, cudaStream_t stream = nullptr ) override;
-	pod::TensorView get_logits() override;
-	const ModelMetadata& get_metadata() const override;
-
-	// KV Cache Management
-	void set_kv_pool( engine::runtime::KVCachePool* pool ) override;
-	void reset_kv_cache( int slot_id = 0 ) override;
-
-	// Concrete interface
 	bool init( const Qwen38Config& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
-	void embed_token( int token_id, cudaStream_t stream = nullptr );
-	void embed_tokens( const int* token_ids, int count, cudaStream_t stream = nullptr );
-	int sample_next_token_impl( cudaStream_t stream = nullptr );
-	void sample_next_tokens( int* h_preds, int count, cudaStream_t stream = nullptr ) override;
+	bool load_weights( const char* model_dir, cudaStream_t stream = nullptr ) override;
 
-	void forward_step(
-		const pod::TensorView& input_tokens,
-		pod::TensorView& output_logits,
-		int pos,
-		int slot_id = 0,
-		cudaStream_t stream = nullptr
-	);
+	void embed_tokens( const int* token_ids, int count, cudaStream_t stream = nullptr ) override;
+	void forward( const pod::BatchRows& rows, cudaStream_t stream = nullptr ) override;
+	void sample_tokens( int* out_preds, int count, cudaStream_t stream = nullptr ) override;
 
-	void forward_step(
-		const pod::TensorView& input_tokens,
-		pod::TensorView& output_logits,
-		int pos,
-		cudaStream_t stream = nullptr
-	);
-
-	void reset_state();
-	void checkpoint_state( cudaStream_t stream = nullptr ) override;
-	void rollback_state( cudaStream_t stream = nullptr ) override;
-	void destroy();
+	void checkpoint_state( int slot_id, cudaStream_t stream = nullptr ) override;
+	void rollback_state( int slot_id, cudaStream_t stream = nullptr ) override;
+	void reset_state( int slot_id = 0 ) override;
 
 	pod::TensorView& logits() override { return logits_; }
 	const pod::TensorView& logits() const override { return logits_; }
-	pod::TensorView& hidden_states() { return hidden_states_; }
-	const pod::TensorView& hidden_states() const { return hidden_states_; }
-	half* tapped_states( int row = 0 ) override { return tapped_states_ + static_cast<size_t>( row ) * 5 * config_.hidden_size; }
 	const half* tapped_states( int row = 0 ) const override { return tapped_states_ + static_cast<size_t>( row ) * 5 * config_.hidden_size; }
+	const ModelMetadata& get_metadata() const override { return metadata_; }
+
+	void destroy();
 
 private:
-	engine::runtime::KVCachePool* kv_pool_ = nullptr;
-	engine::runtime::KVCachePool internal_kv_pool_;
-	int active_slot_id_ = 0;
+	void set_rows( int m );
+
+	// Per-rank (TP-sharded) head counts
+	int q_heads_ = 0;
+	int kv_heads_ = 0;
+	int lin_k_heads_ = 0;
+	int lin_v_heads_ = 0;
+	int lin_channels_ = 0;
+	int inter_size_ = 0;
+
+	engine::runtime::KVCachePool kv_pool_;
+	int last_slot_ = 0;
+	int last_rows_ = 0;
 
 	ModelMetadata metadata_;
 	Qwen38Config config_;
-	int rank_;
-	pod::MemoryArena* arena_;
-	engine::comm::CollectiveRing* ring_;
+	int rank_ = 0;
+	pod::MemoryArena* arena_ = nullptr;
+	engine::comm::CollectiveRing* ring_ = nullptr;
 	Qwen38State state_;
-	bool weights_loaded_;
-	float* gdn_checkpoint_ = nullptr;
-	float* conv_checkpoint_ = nullptr;
+	bool weights_loaded_ = false;
 
-	half* tapped_states_; // [5, hidden_size] tapped hidden states for DFlash2
+	half* tapped_states_ = nullptr; // [MAX_BATCH, 5, hidden_size]
+	int* d_token_ids_ = nullptr;    // [MAX_BATCH]
 	pod::TensorView hidden_states_;
-	pod::TensorView residual_;
 	pod::TensorView norm_hidden_;
-
-	// Benchmark dummy weights/buffers
-	pod::TensorView dummy_proj_;
-	pod::TensorView dummy_suh_;
-	pod::TensorView dummy_svh_;
-	pod::TensorView dummy_norm_;
-	pod::TensorView dummy_down_;
-	pod::TensorView dummy_suh_h_;
-	pod::TensorView dummy_svh_h_;
-	pod::TensorView dummy_norm_h_;
 
 	// Full-attention buffers
 	pod::TensorView q_gate_buf_;
@@ -192,7 +163,6 @@ private:
 	// MLP buffers
 	pod::TensorView gate_buf_;
 	pod::TensorView up_buf_;
-	pod::TensorView gate_up_buf_;
 	pod::TensorView mlp_inter_;
 	pod::TensorView mlp_out_;
 
@@ -202,20 +172,8 @@ private:
 	pod::TensorView final_norm_;
 	pod::LinearWeight lm_head_;
 	pod::TensorView logits_;
-	int* d_argmax_idx_;
-	int* h_argmax_idx_;
-
-	cudaGraph_t graph_m1_;
-	cudaGraphExec_t instance_m1_;
-	bool graph_m1_captured_;
-
-	cudaGraph_t graph_m4_;
-	cudaGraphExec_t instance_m4_;
-	bool graph_m4_captured_;
-
-	cudaGraph_t graph_m8_;
-	cudaGraphExec_t instance_m8_;
-	bool graph_m8_captured_;
+	int* d_argmax_idx_ = nullptr;
+	int* h_argmax_idx_ = nullptr;
 };
 
 } // namespace engine::models
