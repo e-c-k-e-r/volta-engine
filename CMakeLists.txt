@@ -124,6 +124,11 @@ add_executable(bench_trellis tests/3_bench/bench_trellis.cpp)
 target_link_libraries(bench_trellis PRIVATE engine_kernels)
 set_target_properties(bench_trellis PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(bench_shapes tests/3_bench/bench_shapes.cpp)
+target_link_libraries(bench_shapes PRIVATE engine_kernels)
+target_include_directories(bench_shapes PRIVATE src/kernels/trellis)
+set_target_properties(bench_shapes PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(bench_nvfp4 tests/3_bench/bench_nvfp4.cpp)
 target_link_libraries(bench_nvfp4 PRIVATE engine_kernels)
 set_target_properties(bench_nvfp4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

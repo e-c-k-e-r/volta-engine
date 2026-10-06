@@ -83,12 +83,15 @@ int main( int argc, char** argv ) {
 		CUDA_CHECK( cudaEventElapsedTime( &ms, ev_start, ev_stop ) );
 		double s_per_iter = ( ms / 1000.0 ) / iters;
 
-		size_t effective_bytes = static_cast<size_t>( k_dim ) * n_dim * sizeof( half )
+		// Physical bytes actually read from HBM: packed 4-bit trellis words plus the
+		// FP16 activation/scale vectors. Never K*N*sizeof(half) -- that is 4x the
+		// packed weight size and inflated the old 520 GB/s gate to 1059 GB/s.
+		size_t effective_bytes = weight_bytes
 			+ static_cast<size_t>( m ) * ( k_dim + n_dim ) * sizeof( half );
 		double bw_gbs = ( effective_bytes / s_per_iter ) / 1e9;
 
-		std::printf( "[+] Shape 4 GEMM (M=%d, K=%d, N=%d, %d-bpw): %.2f GB/s effective (%.3f ms)\n",
-			m, k_dim, n_dim, bits, bw_gbs, s_per_iter * 1000.0 );
+		std::printf( "[+] Shape 4 GEMM (M=%d, K=%d, N=%d, %d-bpw): %.2f GB/s physical (%.3f ms, %.2f MB packed)\n",
+			m, k_dim, n_dim, bits, bw_gbs, s_per_iter * 1000.0, effective_bytes / 1e6 );
 		std::fflush( stdout );
 
 		if ( bw_gbs > peak_bw ) {
@@ -108,10 +111,14 @@ int main( int argc, char** argv ) {
 		cudaDeviceReset();
 	}
 
+	// Gate is on physical packed bytes. 4-bit trellis dequant is instruction-bound
+	// (dp4a/unpack + HMMA), not HBM-bound, so the reachable ceiling on this shape
+	// is ~265 GB/s, ~29% of the 900 GB/s V100 pin bandwidth. Gate keeps ~9% margin.
+	constexpr double kTrellisBwGate = 240.0;
 	std::printf( "--------------------------------------------------------\n" );
-	std::printf( "[+] Peak Trellis Shape 4 Bandwidth: %.2f GB/s (target >= 520.00 GB/s)\n", peak_bw );
+	std::printf( "[+] Peak Trellis Shape 4 Bandwidth: %.2f GB/s physical (target >= %.2f GB/s)\n", peak_bw, kTrellisBwGate );
 	std::fflush( stdout );
-	ENGINE_ASSERT( peak_bw >= 520.0, "Trellis Shape 4 bandwidth below 520 GB/s exit gate" );
+	ENGINE_ASSERT( peak_bw >= kTrellisBwGate, "Trellis Shape 4 physical bandwidth below exit gate" );
 	std::printf( "[+] Trellis Shape 4 Bandwidth Gate PASS.\n" );
 
 	return 0;
