@@ -117,7 +117,7 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 		else if ( ( std::strcmp( argv[i], "--draft-model-dir" ) == 0 || std::strcmp( argv[i], "--spec-dir" ) == 0 ) && i + 1 < argc ) {
 			draft_model_dir = argv[++i];
 		}
-		else if ( std::strcmp( argv[i], "--speculative" ) == 0 ) {
+		else if ( std::strcmp( argv[i], "--speculative" ) == 0 || std::strcmp( argv[i], "--use-speculation" ) == 0 ) {
 			use_speculation = true;
 		}
 		else if ( std::strcmp( argv[i], "--benchmark" ) == 0 ) {
