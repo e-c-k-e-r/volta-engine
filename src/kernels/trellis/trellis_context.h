@@ -11,12 +11,20 @@
 #define BARRIER_LOCKS_OFFSET MAX_TILES_C
 #define MOE_SCHED_OFFSET (MAX_TILES_C + 2 * MAX_BARRIERS)
 
+// dp4a int8 GEMV workspace: counters, per-slice scales and per-slice partials. Fixed size so the
+// pointer baked into captured graphs stays valid.
+#define INT8_WS_BYTES ( 16 * 1024 * 1024 )
+#define INT8_WS_INTS ( INT8_WS_BYTES / sizeof( int ) )
+
 namespace engine::modules {
 
 int trellis_get_num_sms( int device = 0 );
 int trellis_get_smem_request( int device = 0 );
 int trellis_get_cc( int device = 0 );
 int* trellis_get_locks( int device = 0 );
+// Workspace for the dp4a int8 GEMV path. Fixed size, allocated once: its pointer is baked into
+// captured CUDA graphs, so it must never move or be reallocated.
+int* trellis_get_int8_ws( int device = 0 );
 half* trellis_get_workspace( int device = 0, size_t bytes = 16 * 1024 * 1024 );
 void trellis_context_init_all();
 void trellis_context_destroy();

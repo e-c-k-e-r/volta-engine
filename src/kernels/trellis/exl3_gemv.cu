@@ -1,6 +1,7 @@
 #include <cuda_fp16.h>
 #include "exl3_gemv.cuh"
 #include "exl3_gemm.cuh"
+#include "exl3_gemv_int8.cuh"
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 #include "util.cuh"
@@ -186,6 +187,12 @@ void exl3_gemv(
 
 	int device = 0;
 	cudaGetDevice( &device );
+
+	// dp4a int8 path first: at M=1 it beats both the fp16 GEMV and the Shape 4 GEMM on every
+	// per-rank Qwen shape, and it is a plain launch with a fixed workspace, so it captures cleanly.
+	if ( exl3_gemv_int8( A, B, C, suh, A_had, svh, size_m, size_k, size_n, K, mcg, mul1, c_fp32, device, stream ) )
+		return;
+
 	int* locks = engine::modules::trellis_get_locks( device );
 
 	void* kernel_args[] = {

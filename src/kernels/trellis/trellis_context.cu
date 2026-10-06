@@ -1,11 +1,13 @@
 #include "trellis_context.h"
 #include "exl3_gemm.cuh"
+#include "exl3_gemv_int8.cuh"
 #include <mutex>
 #include <cstdio>
 
 namespace engine::modules {
 
 static int* g_locks[ENGINE_NUM_GPUS] = { nullptr };
+static int* g_int8_ws[ENGINE_NUM_GPUS] = { nullptr };
 static void* g_workspace[ENGINE_NUM_GPUS] = { nullptr };
 static size_t g_workspace_size[ENGINE_NUM_GPUS] = { 0 };
 static std::mutex g_trellis_ctx_mtx;
@@ -44,6 +46,26 @@ int* trellis_get_locks( int device ) {
 	return g_locks[device];
 }
 
+int* trellis_get_int8_ws( int device ) {
+	if ( device < 0 || device >= ENGINE_NUM_GPUS ) {
+		device = 0;
+	}
+	if ( g_int8_ws[device] == nullptr ) {
+		std::lock_guard<std::mutex> lock( g_trellis_ctx_mtx );
+		if ( g_int8_ws[device] == nullptr ) {
+			int orig_dev = 0;
+			cudaGetDevice( &orig_dev );
+			cudaSetDevice( device );
+			// Zeroed so the sq kernel's per-256-column completion counters start at zero; the finishing
+			// block resets them, so they stay zero between calls and across graph replays.
+			CUDA_CHECK( cudaMalloc( reinterpret_cast<void**>( &g_int8_ws[device] ), INT8_WS_BYTES ) );
+			CUDA_CHECK( cudaMemset( g_int8_ws[device], 0, INT8_WS_BYTES ) );
+			cudaSetDevice( orig_dev );
+		}
+	}
+	return g_int8_ws[device];
+}
+
 half* trellis_get_workspace( int device, size_t bytes ) {
 	if ( device < 0 || device >= ENGINE_NUM_GPUS ) {
 		device = 0;
@@ -71,7 +93,9 @@ void trellis_context_init_all() {
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		trellis_get_workspace( d, 16 * 1024 * 1024 );
 		trellis_get_locks( d );
+		trellis_get_int8_ws( d );
 		exl3_gemm_init_all_attrs( d );
+		exl3_gemv_int8_init( d );
 	}
 }
 
@@ -82,6 +106,11 @@ void trellis_context_destroy() {
 			cudaSetDevice( d );
 			cudaFree( g_locks[d] );
 			g_locks[d] = nullptr;
+		}
+		if ( g_int8_ws[d] != nullptr ) {
+			cudaSetDevice( d );
+			cudaFree( g_int8_ws[d] );
+			g_int8_ws[d] = nullptr;
 		}
 		if ( g_workspace[d] != nullptr ) {
 			cudaSetDevice( d );

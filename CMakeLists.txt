@@ -65,6 +65,12 @@ add_executable(test_trellis tests/2_parity/test_trellis.cpp)
 target_link_libraries(test_trellis PRIVATE engine_kernels)
 set_target_properties(test_trellis PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+# Test dp4a int8 GEMV Parity
+add_executable(test_gemv_int8 tests/2_parity/test_gemv_int8.cpp)
+target_link_libraries(test_gemv_int8 PRIVATE engine_kernels)
+target_include_directories(test_gemv_int8 PRIVATE src/kernels/trellis)
+set_target_properties(test_gemv_int8 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 # Test mHC Parity
 add_executable(test_mhc tests/2_parity/test_mhc.cpp)
 target_link_libraries(test_mhc PRIVATE engine_kernels)
