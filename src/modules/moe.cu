@@ -104,13 +104,11 @@ __global__ void moe_dispatch_scatter_kernel(
 	}
 }
 
-// Router scratch: the 288 logits handed from the dot-product kernel to the selection kernel.
-__device__ float g_router_logits[256 * 288];
+// Router scratch: split-K partial logits [row][k slice of 128][expert] handed from the dot-product kernel to the
+// selection kernel, which sums the slices in slice order (deterministic).
+#define ROUTER_MAX_KSLICES 32
+__device__ float g_router_partials[256 * ROUTER_MAX_KSLICES * 288];
 
-// One warp per 32 experts, one thread per expert, summed in the same sequential order as the original
-// single-block kernel (bit-identical logits). The single block was bound by memory-level parallelism on
-// one SM (0.43 ms per layer for 288 x 4096 weights); spreading the experts over nine blocks gives nine
-// SMs' worth of outstanding loads, with 128 independent weight loads in flight per thread.
 __global__ __launch_bounds__( 32 )
 void router_logits_kernel(
 	const half* __restrict__ x,
@@ -118,31 +116,30 @@ void router_logits_kernel(
 	int hidden_size,
 	int num_experts
 ) {
-	extern __shared__ float s_x[];
+	// Block (expert tile, row, k slice): 128 input dims for 32 experts. Many small blocks spread the 288 x 4096 weight
+	// read over the GPU; one warp per tile left it latency bound at ~90 us.
+	__shared__ float s_x[128];
 	const int m = blockIdx.y;
-	x += static_cast<size_t>( m ) * hidden_size;
-	for ( int d = threadIdx.x; d < hidden_size; d += blockDim.x ) {
-		s_x[d] = __half2float( x[d] );
-	}
-	__syncthreads();
+	const int ks = blockIdx.z;
+	const int d0 = ks * 128;
+	x += static_cast<size_t>( m ) * hidden_size + d0;
+	for ( int d = threadIdx.x; d < 128; d += 32 ) s_x[d] = __half2float( x[d] );
+	__syncwarp();
 
 	const int expert = blockIdx.x * 32 + threadIdx.x;
 	if ( expert >= num_experts ) return;
-	float logit = 0.0f;
-	const half* wcol = router_weights + expert;
-	for ( int d0 = 0; d0 < hidden_size; d0 += 128 ) {
-		// Unconditional loads (hidden_size % 128 == 0, asserted on the host) so all 128 issue back to back.
-		half w[128];
-		#pragma unroll
-		for ( int j = 0; j < 128; ++j ) {
-			w[j] = __ldg( wcol + static_cast<size_t>( d0 + j ) * num_experts );
-		}
-		#pragma unroll
-		for ( int j = 0; j < 128; ++j ) {
-			logit = fmaf( s_x[d0 + j], __half2float( w[j] ), logit );
-		}
+	const half* wcol = router_weights + static_cast<size_t>( d0 ) * num_experts + expert;
+	half w[128];
+	#pragma unroll
+	for ( int j = 0; j < 128; ++j ) {
+		w[j] = __ldg( wcol + static_cast<size_t>( j ) * num_experts );
 	}
-	g_router_logits[m * 288 + expert] = logit;
+	float logit = 0.0f;
+	#pragma unroll
+	for ( int j = 0; j < 128; ++j ) {
+		logit = fmaf( s_x[j], __half2float( w[j] ), logit );
+	}
+	g_router_partials[( static_cast<size_t>( m ) * ROUTER_MAX_KSLICES + ks ) * 288 + expert] = logit;
 }
 
 __global__ __launch_bounds__( 32 )
@@ -152,7 +149,8 @@ void router_select_kernel(
 	half* __restrict__ topk_weights,
 	int num_experts,
 	int top_k,
-	float routed_scaling_factor
+	float routed_scaling_factor,
+	int k_slices
 ) {
 	__shared__ float s_raw[288];
 	__shared__ float s_select[288];
@@ -160,7 +158,11 @@ void router_select_kernel(
 	topk_indices += m * top_k;
 	topk_weights += m * top_k;
 	for ( int expert = threadIdx.x; expert < num_experts; expert += 32 ) {
-		const float raw_score = 1.0f / ( 1.0f + __expf( -g_router_logits[m * 288 + expert] ) );
+		float logit = 0.0f;
+		for ( int ks = 0; ks < k_slices; ++ks ) {
+			logit += g_router_partials[( static_cast<size_t>( m ) * ROUTER_MAX_KSLICES + ks ) * 288 + expert];
+		}
+		const float raw_score = 1.0f / ( 1.0f + __expf( -logit ) );
 		float select_score = raw_score;
 		if ( e_score_bias != nullptr ) {
 			select_score += __half2float( e_score_bias[expert] );
@@ -287,9 +289,8 @@ void MoERouter::route_topk(
 ) {
 	ENGINE_ASSERT( rows >= 1 && rows <= 256, "MoERouter::route_topk: rows out of range" );
 	ENGINE_ASSERT( top_k <= 16 && num_experts <= 288 && hidden_size % 128 == 0, "MoERouter::route_topk: top_k / num_experts / hidden_size out of range" );
-	const size_t smem = static_cast<size_t>( hidden_size ) * sizeof( float );
-	ENGINE_ASSERT( smem <= 48 * 1024, "MoERouter::route_topk: hidden_size exceeds the staged activation" );
-	router_logits_kernel<<<dim3( ( num_experts + 31 ) / 32, rows ), dim3( 32 ), smem, stream>>>(
+	ENGINE_ASSERT( hidden_size / 128 <= ROUTER_MAX_KSLICES, "MoERouter::route_topk: hidden_size exceeds the router k slices" );
+	router_logits_kernel<<<dim3( ( num_experts + 31 ) / 32, rows, hidden_size / 128 ), dim3( 32 ), 0, stream>>>(
 		x.ptr<const half>(),
 		router_weights.ptr<const half>(),
 		hidden_size,
@@ -301,7 +302,8 @@ void MoERouter::route_topk(
 		d_topk_weights,
 		num_experts,
 		top_k,
-		routed_scaling_factor
+		routed_scaling_factor,
+		hidden_size / 128
 	);
 }
 
