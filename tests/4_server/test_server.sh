@@ -11,9 +11,15 @@ SERVER_BIN="$DIR/build/volta_server"
 SERVER_LOG="/tmp/volta_server_test.log"
 PORT=8000
 HOST="127.0.0.1"
-MODEL_DIR="/home/mrq/Documents/models/Qwen3.8-27B-exl3"
-
-DRAFT_DIR="/home/mrq/Documents/models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw"
+# VOLTA_TEST_MODEL=glm53 runs the same suite against GLM-5.3-Flash
+MODEL="${VOLTA_TEST_MODEL:-qwen38}"
+if [ "$MODEL" = "glm53" ]; then
+	MODEL_DIR="${EXL3_GLM_DIR:-/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw}"
+	DRAFT_DIR="/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2"
+else
+	MODEL_DIR="/home/mrq/Documents/models/Qwen3.8-27B-exl3"
+	DRAFT_DIR="/home/mrq/Documents/models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw"
+fi
 
 if [ ! -f "$SERVER_BIN" ]; then
 	echo "[-] FATAL: Server binary $SERVER_BIN not found! Build it first."
@@ -23,7 +29,7 @@ fi
 rm -f "$SERVER_LOG"
 
 echo "[*] Launching volta_server detached under taskset -c 0-9 (speculative enabled)..."
-taskset -c 0-9 "$SERVER_BIN" --port "$PORT" --host "$HOST" --load-weights --model-dir "$MODEL_DIR" --use-speculation --draft-model-dir "$DRAFT_DIR" > "$SERVER_LOG" 2>&1 &
+taskset -c 0-9 "$SERVER_BIN" --port "$PORT" --host "$HOST" --load-weights --model "$MODEL" --model-dir "$MODEL_DIR" --use-speculation --draft-model-dir "$DRAFT_DIR" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 cleanup() {
@@ -46,7 +52,7 @@ trap cleanup EXIT INT TERM
 
 echo "[*] Polling http://$HOST:$PORT/health..."
 READY=0
-for i in $(seq 1 50); do
+for i in $(seq 1 "${VOLTA_READY_TRIES:-50}"); do
 	if curl -s -f "http://$HOST:$PORT/health" 2>/dev/null | grep -q '"status":\s*"ok"'; then
 		READY=1
 		echo "[+] Server is ready! Health check passed."
@@ -56,7 +62,7 @@ for i in $(seq 1 50); do
 done
 
 if [ "$READY" -ne 1 ]; then
-	echo "[-] FATAL: Server failed to respond to /health within 15 seconds."
+	echo "[-] FATAL: Server failed to respond to /health in time (VOLTA_READY_TRIES x 0.3 s)."
 	if [ -f "$SERVER_LOG" ]; then
 		echo "--- Server Log Excerpt ---"
 		tail -n 30 "$SERVER_LOG"
@@ -78,7 +84,7 @@ echo "[+] Health check OK."
 echo "[*] STEP 2: Verifying non-streaming POST /v1/chat/completions..."
 COMP_RESP=$(curl -s -X POST "http://$HOST:$PORT/v1/chat/completions" \
 	-H "Content-Type: application/json" \
-	-d '{"model":"qwen38","messages":[{"role":"user","content":"What is the capital of France?"}],"stream":false,"max_tokens":10}')
+	-d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"What is the capital of France?"}],"stream":false,"max_tokens":10}')
 echo "    Response: $COMP_RESP"
 if ! echo "$COMP_RESP" | grep -q "Paris"; then
 	echo "[-] FATAL: Non-streaming completion did not contain expected answer Paris!"
@@ -90,7 +96,7 @@ echo "[+] Non-streaming completion OK."
 echo "[*] STEP 3: Verifying streaming SSE POST /v1/chat/completions..."
 SSE_RESP=$(curl -s -N -X POST "http://$HOST:$PORT/v1/chat/completions" \
 	-H "Content-Type: application/json" \
-	-d '{"model":"qwen38","messages":[{"role":"user","content":"List the first 5 prime numbers:"}],"stream":true,"max_tokens":20}')
+	-d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"List the first 5 prime numbers:"}],"stream":true,"max_tokens":20}')
 
 echo "    SSE Output sample:"
 echo "$SSE_RESP"
@@ -103,11 +109,11 @@ echo "[+] Streaming SSE completion OK."
 # 3b. Single-stream speculative throughput (Case A: one request owns the drafter context)
 echo "[*] STEP 3b: Single-stream speculative throughput..."
 SS_TOKENS=200
-SS_GATE=90
+SS_GATE="${VOLTA_SS_GATE:-90}"
 SS_START=$(date +%s%N)
 SS_RESP=$(curl -s -N -X POST "http://$HOST:$PORT/v1/chat/completions" \
 	-H "Content-Type: application/json" \
-	-d '{"model":"qwen38","messages":[{"role":"user","content":"Explain how a hash table handles collisions, and compare chaining with open addressing."}],"stream":true,"max_tokens":'"$SS_TOKENS"'}')
+	-d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Explain how a hash table handles collisions, and compare chaining with open addressing."}],"stream":true,"max_tokens":'"$SS_TOKENS"'}')
 SS_END=$(date +%s%N)
 SS_CHUNKS=$(echo "$SS_RESP" | grep -c 'content' || true)
 SS_SEC=$(awk -v a="$SS_START" -v b="$SS_END" 'BEGIN { printf "%.4f", (b - a) / 1000000000 }')
@@ -125,7 +131,7 @@ echo "[*] STEP 3c: Sampling (temperature 1.0, top_p 0.95)..."
 sample_req() {
 	curl -s -X POST "http://$HOST:$PORT/v1/chat/completions" \
 		-H "Content-Type: application/json" \
-		-d '{"model":"qwen38","messages":[{"role":"user","content":"Write a short story about a robot who learns to paint."}],"stream":false,"max_tokens":40,"temperature":1.0,"top_p":0.95,"seed":'"$1"'}'
+		-d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Write a short story about a robot who learns to paint."}],"stream":false,"max_tokens":40,"temperature":1.0,"top_p":0.95,"seed":'"$1"'}'
 }
 content_of() { python3 -I -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'; }
 S1=$(sample_req 7 | content_of); S2=$(sample_req 7 | content_of); S3=$(sample_req 8 | content_of)
@@ -153,7 +159,7 @@ CLIENT_PIDS=()
 for i in $(seq 1 $CONCURRENCY); do
 	curl -s -N -X POST "http://$HOST:$PORT/v1/chat/completions" \
 		-H "Content-Type: application/json" \
-		-d '{"model":"qwen38","messages":[{"role":"user","content":"Tell me about distributed computing on Volta GPUs."}],"stream":true,"max_tokens":'"$TOKENS_PER_CLIENT"'}' \
+		-d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Tell me about distributed computing on Volta GPUs."}],"stream":true,"max_tokens":'"$TOKENS_PER_CLIENT"'}' \
 		> "$TEMP_DIR/stream_$i.txt" &
 	CLIENT_PIDS+=($!)
 done
@@ -178,14 +184,15 @@ THROUGHPUT=$(awk -v tok="$TOTAL_TOKENS" -v s="$ELAPSED_SEC" 'BEGIN { printf "%.1
 echo "[+] 8 Concurrent Streams Results:"
 echo "    Total Tokens Received: $TOTAL_TOKENS (Target: ~$EXPECTED_TOTAL_TOKENS)"
 echo "    Elapsed Time: ${ELAPSED_SEC} s"
-echo "    Aggregate Throughput: ${THROUGHPUT} tok/s (Target >= 150.0 tok/s)"
+echo "    Aggregate Throughput: ${THROUGHPUT} tok/s (Target >= ${VOLTA_AGG_GATE:-150} tok/s)"
 
 THROUGHPUT_INT=${THROUGHPUT%.*}
-if [ "$THROUGHPUT_INT" -lt 150 ]; then
-	echo "[-] FATAL: Aggregate throughput $THROUGHPUT tok/s below 150.0 tok/s exit gate!"
+AGG_GATE="${VOLTA_AGG_GATE:-150}"
+if [ "$THROUGHPUT_INT" -lt "$AGG_GATE" ]; then
+	echo "[-] FATAL: Aggregate throughput $THROUGHPUT tok/s below ${AGG_GATE} tok/s exit gate!"
 	exit 1
 fi
-echo "[+] Concurrency Exit Gate PASS (${THROUGHPUT} tok/s >= 150.0 tok/s)."
+echo "[+] Concurrency Exit Gate PASS (${THROUGHPUT} tok/s >= ${AGG_GATE} tok/s)."
 
 # 5. Graceful SIGTERM Shutdown & VRAM Teardown Audit
 echo "[*] STEP 5: Testing Graceful Server Shutdown (SIGTERM)..."
