@@ -178,4 +178,41 @@ pod::TensorView SafeTensorsRepo::load_nvfp4_dense(
 	return tv;
 }
 
+pod::LinearWeight SafeTensorsRepo::load_dense_rows_padded(
+	const char* weight_name,
+	pod::MemoryArena& arena,
+	int row_begin,
+	int row_count,
+	int pad_rows,
+	cudaStream_t stream
+) {
+	int shard = -1;
+	const auto* meta = find( weight_name, &shard );
+	if ( !meta || meta->ndim != 2 ) return pod::LinearWeight{};
+	ENGINE_ASSERT( row_begin + row_count <= meta->shape[0], "load_dense_rows_padded: row range" );
+	ENGINE_ASSERT( meta->dtype == pod::DType::BF16 || meta->dtype == pod::DType::FP16, "load_dense_rows_padded: BF16/FP16 only" );
+	const size_t K = meta->shape[1];
+	const size_t rows = static_cast<size_t>( row_count ) + pad_rows;
+	const uint16_t* src = static_cast<const uint16_t*>( cpu_data( weight_name ) ) + static_cast<size_t>( row_begin ) * K;
+	std::vector<half> out( rows * K );
+	for ( size_t i = 0; i < static_cast<size_t>( row_count ) * K; ++i ) {
+		if ( meta->dtype == pod::DType::FP16 ) {
+			std::memcpy( &out[i], &src[i], 2 );
+		}
+		else {
+			const uint32_t bits = static_cast<uint32_t>( src[i] ) << 16;
+			float f;
+			std::memcpy( &f, &bits, 4 );
+			out[i] = __float2half( f );
+		}
+	}
+	std::memset( &out[static_cast<size_t>( row_count ) * K], 0, static_cast<size_t>( pad_rows ) * K * sizeof( half ) );
+	const int shape[2] = { static_cast<int>( rows ), static_cast<int>( K ) };
+	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
+	if ( tv.data == nullptr ) return pod::LinearWeight{};
+	CUDA_CHECK( cudaMemcpyAsync( tv.data, out.data(), out.size() * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	return pod::LinearWeight::make_fp16( pod::make_tensor_2d( tv.data, pod::DType::FP16, static_cast<int>( K ), static_cast<int>( rows ) ) );
+}
+
 }  // namespace engine::loader

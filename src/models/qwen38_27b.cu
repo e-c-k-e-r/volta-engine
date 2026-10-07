@@ -253,8 +253,18 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 	// 2. Final norm
 	final_norm_ = repo.load( "model.language_model.norm.weight", *arena_, stream, pod::DType::FP16 );
 
+	// NVFP4 checkpoint (compressed-tensors): projections are W4A16 through the skinny NVFP4 kernels, the LM head is a dense
+	// BF16 matrix served as FP16.
+	const bool fp4 = repo.find( "model.language_model.layers.0.mlp.gate_proj.weight_packed" ) != nullptr;
+	if ( fp4 ) std::printf( "    [RANK %d] NVFP4 checkpoint\n", rank_ );
+
 	// 3. LM Head, sharded across the vocabulary dimension
-	if ( tp_size_ > 1 ) {
+	if ( fp4 ) {
+		ENGINE_ASSERT( tp_size_ > 1, "Qwen38Pipeline: the NVFP4 checkpoint needs the vocabulary-parallel head" );
+		lm_head_ = repo.load_dense_rows_padded( "lm_head.weight", *arena_, rank_ * lm_shard_real_cols_, lm_shard_real_cols_,
+			lm_shard_cols_ - lm_shard_real_cols_, stream );
+	}
+	else if ( tp_size_ > 1 ) {
 		lm_head_ = repo.load_linear_slice_padded( "lm_head", *arena_, 5, rank_, tp_size_, lm_shard_cols_ - lm_shard_real_cols_, stream );
 	}
 	else if ( rank_ == 0 ) {
@@ -265,6 +275,15 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 
 	// 4. Per-layer weights across 64 layers
 	char name_buf[256];
+	// Column-parallel (output split, dim 1) and row-parallel (input split, dim 0) projection loads for either format
+	auto load_col = [&]( const char* name, int bits ) {
+		if ( fp4 ) return repo.load_nvfp4_slice( name, *arena_, true, rank_, 4, stream );
+		return ( tp_size == 4 ) ? repo.load_linear_slice( name, *arena_, bits, 1, rank_, 4, stream ) : repo.load_linear( name, *arena_, bits, stream );
+	};
+	auto load_row = [&]( const char* name, int bits ) {
+		if ( fp4 ) return repo.load_nvfp4_slice( name, *arena_, false, rank_, 4, stream );
+		return ( tp_size == 4 ) ? repo.load_linear_slice( name, *arena_, bits, 0, rank_, 4, stream ) : repo.load_linear( name, *arena_, bits, stream );
+	};
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		auto& lw = layers_[L];
 		lw.is_full_attention = ( ( L + 1 ) % 4 == 0 );
@@ -277,26 +296,22 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 
 		if ( lw.is_full_attention ) {
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.q_proj", L );
-			lw.q_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, 4, stream )
-			                             : repo.load_linear( name_buf, *arena_, 4, stream );
+			lw.q_proj = load_col( name_buf, 4 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.q_norm.weight", L );
 			lw.q_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.k_proj", L );
-			lw.k_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 5, 1, rank_, 4, stream )
-			                             : repo.load_linear( name_buf, *arena_, 5, stream );
+			lw.k_proj = load_col( name_buf, 5 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.k_norm.weight", L );
 			lw.k_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.v_proj", L );
-			lw.v_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 5, 1, rank_, 4, stream )
-			                             : repo.load_linear( name_buf, *arena_, 5, stream );
+			lw.v_proj = load_col( name_buf, 5 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.o_proj", L );
-			lw.o_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 4, 0, rank_, 4, stream )
-			                             : repo.load_linear( name_buf, *arena_, 4, stream );
+			lw.o_proj = load_row( name_buf, 4 );
 		}
 		else {
 			static constexpr int QWEN_QKV_BLOCKS[3] = { 128, 128, 384 };
@@ -305,9 +320,21 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 			static constexpr int QWEN_CONV_RANK_CHANNELS[3] = { 512, 512, 1536 };
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_qkv", L );
-			lw.in_proj_qkv = ( tp_size == 4 )
-				? repo.load_grouped_trellis_slice( name_buf, *arena_, QWEN_QKV_BLOCKS, QWEN_QKV_RANK_BLOCKS, 3, rank_, stream )
-				: repo.load_linear( name_buf, *arena_, 5, stream );
+			if ( fp4 ) {
+				// Rows are [q | k | v] groups; each rank takes its share of every group
+				int n_begin[3], n_count[3], start = 0;
+				for ( int g = 0; g < 3; ++g ) {
+					n_count[g] = QWEN_QKV_RANK_BLOCKS[g] * 16;
+					n_begin[g] = start + rank_ * n_count[g];
+					start += QWEN_QKV_BLOCKS[g] * 16;
+				}
+				lw.in_proj_qkv = repo.load_nvfp4( name_buf, *arena_, n_begin, n_count, 3, 0, 5120, stream );
+			}
+			else {
+				lw.in_proj_qkv = ( tp_size == 4 )
+					? repo.load_grouped_trellis_slice( name_buf, *arena_, QWEN_QKV_BLOCKS, QWEN_QKV_RANK_BLOCKS, 3, rank_, stream )
+					: repo.load_linear( name_buf, *arena_, 5, stream );
+			}
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.conv1d.weight", L );
 			lw.conv1d_w = ( tp_size == 4 )
@@ -323,37 +350,40 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 			                              : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", L );
-			lw.in_proj_a = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
+			if ( fp4 ) {
+				name_buf[std::strlen( name_buf ) - 7] = 0;  // drop ".weight"
+				lw.in_proj_a = repo.load_nvfp4_dense( name_buf, *arena_, true, rank_, 4, stream );
+			}
+			else lw.in_proj_a = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
 			                                : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", L );
-			lw.in_proj_b = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
+			if ( fp4 ) {
+				name_buf[std::strlen( name_buf ) - 7] = 0;
+				lw.in_proj_b = repo.load_nvfp4_dense( name_buf, *arena_, true, rank_, 4, stream );
+			}
+			else lw.in_proj_b = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
 			                                : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_z", L );
-			lw.in_proj_z = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 5, 1, rank_, 4, stream )
-			                                : repo.load_linear( name_buf, *arena_, 5, stream );
+			lw.in_proj_z = load_col( name_buf, 5 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.norm.weight", L );
 			lw.linear_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.out_proj", L );
-			lw.out_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 5, 0, rank_, 4, stream )
-			                               : repo.load_linear( name_buf, *arena_, 5, stream );
+			lw.out_proj = load_row( name_buf, 5 );
 		}
 
 		// MLP
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.gate_proj", L );
-		lw.gate_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 3, 1, rank_, 4, stream )
-		                                : repo.load_linear( name_buf, *arena_, 3, stream );
+		lw.gate_proj = load_col( name_buf, 3 );
 
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.up_proj", L );
-		lw.up_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 3, 1, rank_, 4, stream )
-		                              : repo.load_linear( name_buf, *arena_, 3, stream );
+		lw.up_proj = load_col( name_buf, 3 );
 
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.down_proj", L );
-		lw.down_proj = ( tp_size == 4 ) ? repo.load_linear_slice( name_buf, *arena_, 3, 0, rank_, 4, stream )
-		                                : repo.load_linear( name_buf, *arena_, 3, stream );
+		lw.down_proj = load_row( name_buf, 3 );
 	}
 
 	if ( stream ) {

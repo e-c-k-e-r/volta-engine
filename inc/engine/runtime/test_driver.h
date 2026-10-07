@@ -12,7 +12,8 @@
 
 namespace engine::runtime::test {
 
-static constexpr const char* QWEN_DIR = "/home/mrq/Documents/models/Qwen3.8-27B-exl3";
+// EXL3_QWEN_DIR selects another Qwen checkpoint (the NVFP4 one, for instance); the loader detects the format.
+static const char* QWEN_DIR = std::getenv( "EXL3_QWEN_DIR" ) ? std::getenv( "EXL3_QWEN_DIR" ) : "/home/mrq/Documents/models/Qwen3.8-27B-exl3";
 static constexpr const char* QWEN_DRAFT_DIR_DEFAULT = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw";
 // Overridable so the unquantized drafter can be A/B'd against the quantized one without a rebuild:
 // load_linear falls back to a dense <base>.weight when no trellis group is present, so
@@ -23,7 +24,7 @@ static const char* QWEN_DRAFT_DIR = std::getenv( "EXL3_DRAFT_DIR" )
 // The same drafter before quantization: 81 BF16 tensors, `fc.weight` and the 35 block projections
 // unquantized. It is the ground truth the Trellis weights are checked against.
 static constexpr const char* QWEN_DRAFT_BF16_DIR = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2";
-static constexpr const char* GLM_DIR = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
+static const char* GLM_DIR = std::getenv( "EXL3_GLM_DIR" ) ? std::getenv( "EXL3_GLM_DIR" ) : "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
 static constexpr const char* GLM_DRAFT_DIR = "/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2";
 
 struct GenStats {

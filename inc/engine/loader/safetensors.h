@@ -166,6 +166,17 @@ public:
 		cudaStream_t stream = nullptr
 	);
 
+	// Dense [rows, K] weight (BF16/FP16 checkpoint tensor) rows [row_begin, row_begin + row_count) as FP16, followed by
+	// pad_rows zero rows; the shape is tagged for LinearWeight::make_fp16 (an [n, k] matrix, shape [k, n]).
+	pod::LinearWeight load_dense_rows_padded(
+		const char* weight_name,
+		pod::MemoryArena& arena,
+		int row_begin,
+		int row_count,
+		int pad_rows,
+		cudaStream_t stream = nullptr
+	);
+
 	pod::LinearWeight load_grouped_trellis_slice(
 		const char* base_name,
 		pod::MemoryArena& arena,
