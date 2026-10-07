@@ -8,9 +8,9 @@ namespace engine::modules {
 namespace {
 
 #define ATTN_PAGE_SIZE 256
-#define ATTN_MAX_CHUNKS 32
+#define ATTN_MAX_CHUNKS 128
 #define ATTN_MAX_HEAD_DIM 256
-#define ATTN_MAX_ROW_HEADS ( pod::MAX_ROWS * 16 )
+#define ATTN_MAX_ROW_HEADS ( pod::MAX_BATCH * 16 )
 
 __device__ float g_attn_workspace[ATTN_MAX_ROW_HEADS * ATTN_MAX_CHUNKS * ( ATTN_MAX_HEAD_DIM + 2 )];
 
@@ -89,6 +89,7 @@ __global__ void attn_chunked_paged_kernel(
 	int head_dim,
 	int max_seq,
 	int n_chunks,
+	int chunk_len,
 	float scale
 ) {
 	int head = blockIdx.x;
@@ -108,8 +109,8 @@ __global__ void attn_chunked_paged_kernel(
 	k_cache += static_cast<size_t>( rows->slot[m] ) * slot_stride;
 	v_cache += static_cast<size_t>( rows->slot[m] ) * slot_stride;
 
-	int kv_start = chunk * ATTN_PAGE_SIZE;
-	int kv_end = min( kv_start + ATTN_PAGE_SIZE, total_tokens );
+	int kv_start = chunk * chunk_len;
+	int kv_end = min( kv_start + chunk_len, total_tokens );
 
 	const half* q_head = q + ( static_cast<size_t>( m ) * num_q_heads + head ) * head_dim;
 	half* out_head = out + ( static_cast<size_t>( m ) * num_q_heads + head ) * head_dim;
@@ -467,11 +468,13 @@ void Attention::forward_decode(
 ) {
 	const int M = count;
 	ENGINE_ASSERT( M * num_q_heads <= ATTN_MAX_ROW_HEADS, "Attention::forward_decode: workspace too small for rows x heads" );
-	ENGINE_ASSERT( max_seq <= ATTN_MAX_CHUNKS * ATTN_PAGE_SIZE, "Attention::forward_decode: max_seq exceeds chunk capacity" );
+	// Keys per chunk: one page, doubled until the window fits the workspace's chunk capacity
+	int chunk_len = ATTN_PAGE_SIZE;
+	while ( ( max_seq + chunk_len - 1 ) / chunk_len > ATTN_MAX_CHUNKS ) chunk_len *= 2;
 	float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
 
 	// Position-independent grid: one chunk per page of the full window (graph-capturable)
-	int n_chunks = MAX( 1, ( max_seq + ATTN_PAGE_SIZE - 1 ) / ATTN_PAGE_SIZE );
+	int n_chunks = MAX( 1, ( max_seq + chunk_len - 1 ) / chunk_len );
 	float* workspace = attn_workspace_ptr();
 
 	dim3 grid( num_q_heads, M, n_chunks );
@@ -493,6 +496,7 @@ void Attention::forward_decode(
 		head_dim,
 		max_seq,
 		n_chunks,
+		chunk_len,
 		scale
 	);
 

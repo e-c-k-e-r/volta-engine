@@ -220,3 +220,7 @@ set_target_properties(test_dflash2_blocks PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$
 # DFlash2 Trellis weights against the unquantized BF16 checkpoint
 add_executable(test_dflash2_quant tests/2_parity/test_dflash2_quant.cpp)
 target_link_libraries(test_dflash2_quant PRIVATE engine_kernels)
+
+add_executable(test_longctx tests/4_coherence/test_longctx.cpp)
+target_link_libraries(test_longctx PRIVATE engine_kernels)
+set_target_properties(test_longctx PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

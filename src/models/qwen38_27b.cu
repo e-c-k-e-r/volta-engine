@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <vector>
 #include <algorithm>
@@ -224,7 +225,10 @@ bool Qwen38Pipeline::init(
 }
 
 bool Qwen38Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
-	return init( Qwen38Config{}, device_id, arena, ring );
+	Qwen38Config config;
+	if ( const char* env = std::getenv( "EXL3_MAX_SEQ" ) ) config.max_seq = std::atoi( env );  // context window (KV pool size)
+	if ( const char* env = std::getenv( "EXL3_MAX_SLOTS" ) ) config.max_slots = std::atoi( env );
+	return init( config, device_id, arena, ring );
 }
 
 
