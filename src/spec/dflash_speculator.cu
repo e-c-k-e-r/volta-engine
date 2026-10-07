@@ -209,9 +209,12 @@ bool DFlashSpeculator::init(
 		config_.head_dim, config_.rope_theta, config_.rope_dim_sections, stream );
 
 	// Default dummy codebooks (for standalone benchmarks or tests without weights on disk)
-	int cb_shape[2] = { config_.vocab_size, sel_rank };
-	pred_codebook_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, cb_shape, 2 );
-	succ_codebook_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, cb_shape, 2 );
+	// Only the output rank (0) runs the selector walk, so the other ranks of a TP drafter skip the 254 MiB.
+	if ( rank_ == 0 ) {
+		int cb_shape[2] = { config_.vocab_size, sel_rank };
+		pred_codebook_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, cb_shape, 2 );
+		succ_codebook_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, cb_shape, 2 );
+	}
 
 	initialized_ = true;
 	return true;
@@ -289,13 +292,14 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 	fc_norm_ = repo.load( "hidden_norm.weight", *arena_, stream, pod::DType::FP16 );
 	final_norm_ = repo.load( "norm.weight", *arena_, stream, pod::DType::FP16 );
 
-	// Candidate selector. The codebooks are read by the walk on the output rank only, but every rank
-	// holds a well-formed module tree, so they are replicated (254 MiB as FP16).
-	pred_codebook_ = repo.load( "candidate_selector.predecessor_codebook", *arena_, stream, pod::DType::FP16 );
-	succ_codebook_ = repo.load( "candidate_selector.successor_codebook", *arena_, stream, pod::DType::FP16 );
-	// The selector's hidden projection is a plain FP16 [rank, hidden] matrix, not a trellis tensor, so
-	// it cannot go through load_linear. Stored as a raw weight for a small dedicated GEMV.
-	hidden_proj_w_ = repo.load( "candidate_selector.hidden_projection.weight", *arena_, stream, pod::DType::FP16 );
+	// Candidate selector: read by the walk on the output rank (0) only.
+	if ( R == 0 ) {
+		pred_codebook_ = repo.load( "candidate_selector.predecessor_codebook", *arena_, stream, pod::DType::FP16 );
+		succ_codebook_ = repo.load( "candidate_selector.successor_codebook", *arena_, stream, pod::DType::FP16 );
+		// The selector's hidden projection is a plain FP16 [rank, hidden] matrix, not a trellis tensor, so
+		// it cannot go through load_linear. Stored as a raw weight for a small dedicated GEMV.
+		hidden_proj_w_ = repo.load( "candidate_selector.hidden_projection.weight", *arena_, stream, pod::DType::FP16 );
+	}
 
 	// Backbone. The residual stream stays full width and replicated; only heads and the MLP
 	// intermediate are split, so this is 10 all-reduces per draft round and no more.

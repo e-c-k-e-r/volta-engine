@@ -816,6 +816,23 @@ void dflash_h2f( const half* in, float* out, int n, cudaStream_t stream ) {
 	dflash_h2f_kernel<<<( n + threads - 1 ) / threads, threads, 0, stream >>>( out, in, n );
 }
 
+// Copies a [rows, src_cols] slice into columns [col0, col0 + src_cols) of a [rows, dst_cols] matrix.
+__global__ void dflash_place_cols_kernel( half* __restrict__ dst, const half* __restrict__ src,
+	int rows, int dst_cols, int src_cols, int col0 ) {
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( i >= rows * src_cols ) return;
+	const int r = i / src_cols;
+	const int c = i - r * src_cols;
+	dst[static_cast<size_t>( r ) * dst_cols + col0 + c] = src[i];
+}
+
+void dflash_place_cols( half* dst, const half* src, int rows, int dst_cols, int src_cols, int col0, cudaStream_t stream ) {
+	const int n = rows * src_cols;
+	if ( n <= 0 ) return;
+	const int threads = 256;
+	dflash_place_cols_kernel<<<( n + threads - 1 ) / threads, threads, 0, stream >>>( dst, src, rows, dst_cols, src_cols, col0 );
+}
+
 void dflash2_dynconv(
 	const pod::TensorView& x,
 	const pod::TensorView& dyn,

@@ -29,12 +29,13 @@ struct SpecProfile {
 	int commits = 0;
 };
 
-// One DFlash2 round over a ModelCluster: draft (backbone on rank 0, head shard + top-k on every
-// rank, merge) -> selector walk -> batched target verify -> greedy accept -> state repair.
+// One DFlash2 round over a ModelCluster: draft (backbone, head shard + top-k on every rank, merge) ->
+// selector walk -> batched target verify -> greedy accept -> state repair.
 //
-// TP-readiness: every stage is driven through the cluster's rank pool and the per-rank DraftHooks,
-// so sharding the drafter backbone only fills in work for ranks != 0 without changing this control
-// flow. The speculator itself lives on rank 0 until then.
+// The drafter backbone is tensor-parallel across the ranks by default: every rank holds a shard of each
+// projection, runs the whole block in lockstep (all-reduce after o_proj and down_proj, fc all-gather) and
+// ends with the full drafter hidden replicated, which feeds its own head shard with no peer copy. The walk
+// runs on rank 0. EXL3_DRAFT_TP=0 selects the single-GPU drafter on rank 0 (A/B knob).
 class DFlash2Runner {
 public:
 	bool init( ModelCluster& mc, const std::string& draft_dir );
@@ -59,7 +60,8 @@ private:
 	void mark( SpecProfile::Stage stage );
 
 	ModelCluster* mc_ = nullptr;
-	engine::spec::DFlashSpeculator spec_;
+	engine::spec::DFlashSpeculator spec_[ENGINE_NUM_GPUS];  // [0] only when tp_ == 1
+	int tp_ = 1;                                            // drafter tensor-parallel width
 	int owner_ = -1;
 
 	int att_[8] = {};

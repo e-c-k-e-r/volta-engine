@@ -72,6 +72,7 @@ public:
 	engine::models::ModelPipeline& model( int rank = 0 ) { return *models_[rank]; }
 	const engine::models::ModelMetadata& metadata() const { return models_[0]->get_metadata(); }
 	cudaStream_t stream( int rank ) const { return streams_[rank]; }
+	engine::comm::CollectiveRing* ring( int rank ) { return &rings_[rank]; }
 	const pod::MemoryArena& arena( int rank ) const { return arenas_[rank]; }
 	pod::MemoryArena& arena( int rank ) { return arenas_[rank]; }
 	bool is_eos( int token ) const;

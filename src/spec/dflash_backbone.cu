@@ -50,9 +50,10 @@ void DFlashSpeculator::forward_backbone(
 	const int ctx_strides_layer = stride_layer;
 
 	// ---- Stage 1: project the target context into the drafter's own KV cache ----
-	// fc is column-parallel on the output; gathering the shards back to full width is V5's job, so the
-	// backbone only runs unsharded for now.
-	ENGINE_ASSERT( tp_size_ == 1, "DFlashSpeculator::forward_backbone: TP > 1 needs the fc gather (V5)" );
+	// fc is column-parallel on the output. At tp > 1 each rank computes its H/tp columns, writes them into
+	// a zeroed full-width buffer and a sum across ranks gathers them (x + 0 is exact), so the norm and
+	// every later stage see the full-width row on every rank.
+	ENGINE_ASSERT( tp_size_ == 1 || ring_ != nullptr, "DFlashSpeculator::forward_backbone: TP > 1 needs set_ring" );
 	if ( n_ctx > 0 && fc_.is_valid() ) {
 		for ( int base = 0; base < n_ctx; base += ctx_chunk_ ) {
 			const int cnt = MIN( ctx_chunk_, n_ctx - base );
@@ -65,7 +66,24 @@ void DFlashSpeculator::forward_backbone(
 				const_cast<half*>( tapped_states ) + tap_off,
 				pod::DType::FP16, cnt, 5 * H );
 			pod::TensorView fc_out = pod::make_tensor_2d( bb_ctx_fc_.ptr<half>(), pod::DType::FP16, cnt, H );
-			engine::modules::Linear::forward( taps_in, fc_, fc_out, stream );
+			if ( tp_size_ == 1 ) {
+				engine::modules::Linear::forward( taps_in, fc_, fc_out, stream );
+			}
+			else {
+				const int Hs = H / tp_size_;
+				// bb_ctx_resid_ is FP32 [chunk, H]: ample room for the FP16 [cnt, H / tp] local slice, and it is
+				// only written again by the norm below, after the gather has consumed the slice.
+				pod::TensorView fc_local = pod::make_tensor_2d( bb_ctx_resid_.ptr<half>(), pod::DType::FP16, cnt, Hs );
+				engine::modules::Linear::forward( taps_in, fc_, fc_local, stream );
+				CUDA_CHECK( cudaMemsetAsync( fc_out.data, 0, static_cast<size_t>( cnt ) * H * sizeof( half ), stream ) );
+				dflash_place_cols( fc_out.ptr<half>(), fc_local.ptr<const half>(), cnt, H, Hs, rank_ * Hs, stream );
+				// The ring all-reduce handles at most 16 rows per launch (one block per row).
+				for ( int r0 = 0; r0 < cnt; r0 += 16 ) {
+					pod::TensorView part = pod::make_tensor_2d( fc_out.ptr<half>() + static_cast<size_t>( r0 ) * H,
+						pod::DType::FP16, MIN( 16, cnt - r0 ), H );
+					ring_->all_reduce( part, stream );
+				}
+			}
 			pod::TensorView ctx_n = pod::make_tensor_2d( bb_ctx_normed_.ptr<half>(), pod::DType::FP16, cnt, H );
 			pod::TensorView ctx_r = pod::make_tensor_2d( bb_ctx_resid_.ptr<float>(), pod::DType::FP32, cnt, H );
 			dflash_rmsnorm_residual( fc_out, pod::TensorView{}, fc_norm_, ctx_n, ctx_r, cnt,
@@ -177,6 +195,10 @@ void DFlashSpeculator::forward_backbone(
 			const pod::TensorView attn_flat = pod::make_tensor_2d(
 				bb_attn_out_.ptr<half>(), pod::DType::FP16, rows, qh_local * hd );
 			engine::modules::Linear::forward( attn_flat, ly.o_proj, bb_o_proj_, stream );
+			if ( tp_size_ > 1 ) {
+				pod::TensorView o_full = pod::make_tensor_2d( bb_o_proj_.ptr<half>(), pod::DType::FP16, rows, H );
+				ring_->all_reduce( o_full, stream );
+			}
 		}
 
 		// (d) grouped dynamic conv, post-attention side (side 1 of the same projection)
@@ -232,6 +254,10 @@ void DFlashSpeculator::forward_backbone(
 			engine::modules::Linear::forward( s, ly.up_proj, bb_ffn_up_, stream );
 			engine::modules::SwiGLU::forward( bb_ffn_gate_, bb_ffn_up_, bb_ffn_mlp_, stream );
 			engine::modules::Linear::forward( bb_ffn_mlp_, ly.down_proj, bb_hidden_, stream );
+			if ( tp_size_ > 1 ) {
+				pod::TensorView down_full = pod::make_tensor_2d( bb_hidden_.ptr<half>(), pod::DType::FP16, rows, H );
+				ring_->all_reduce( down_full, stream );
+			}
 		}
 
 		// (h) grouped dynamic conv, post-MLP side

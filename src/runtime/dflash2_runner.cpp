@@ -2,6 +2,7 @@
 #include "engine/runtime/cluster.h"
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 
 namespace engine::runtime {
 
@@ -32,24 +33,32 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 	cfg.rope_dim_sections[3] = 0;
 	ENGINE_ASSERT( cfg.selector_top_k == models::kDraftTopK, "DFlash2Runner: selector_top_k != kDraftTopK" );
 
-	CUDA_CHECK( cudaSetDevice( 0 ) );
-	spec_.set_candidate_ranks( ENGINE_NUM_GPUS );
-	if ( !spec_.init( cfg, 0, mc.arena( 0 ), mc.stream( 0 ) ) ) return false;
-	const bool loaded = spec_.load_weights( draft_dir.c_str(), mc.stream( 0 ) );
-	std::printf( "[+] DFlash2 speculator: %s (%s)\n", loaded ? "loaded" : "STANDALONE", draft_dir.c_str() );
+	const char* tp_env = std::getenv( "EXL3_DRAFT_TP" );
+	tp_ = ( tp_env && tp_env[0] == '0' ) ? 1 : ENGINE_NUM_GPUS;
+	bool loaded = true;
+	for ( int d = 0; d < tp_; ++d ) {
+		CUDA_CHECK( cudaSetDevice( d ) );
+		spec_[d].set_candidate_ranks( ENGINE_NUM_GPUS );
+		if ( tp_ > 1 ) spec_[d].set_ring( mc.ring( d ) );
+		if ( !spec_[d].init( cfg, d, mc.arena( d ), mc.stream( d ), d, tp_ ) ) return false;
+		loaded = spec_[d].load_weights( draft_dir.c_str(), mc.stream( d ) ) && loaded;
+	}
+	std::printf( "[+] DFlash2 speculator: %s (%s), drafter tp=%d\n", loaded ? "loaded" : "STANDALONE", draft_dir.c_str(), tp_ );
 	return true;
 }
 
 void DFlash2Runner::shutdown() {
-	CUDA_CHECK( cudaSetDevice( 0 ) );
-	spec_.destroy();
+	for ( int d = 0; d < tp_; ++d ) {
+		CUDA_CHECK( cudaSetDevice( d ) );
+		spec_[d].destroy();
+	}
 	mc_ = nullptr;
 	owner_ = -1;
 }
 
 void DFlash2Runner::claim( int slot ) {
 	owner_ = slot;
-	spec_.reset_context();
+	for ( int d = 0; d < tp_; ++d ) spec_[d].reset_context();
 	for ( int i = 0; i < 8; ++i ) att_[i] = hit_[i] = 0;
 	// cond_ survives: per-step survival is a property of the drafter against this target, not of the
 	// sequence being decoded, so resetting it per request would re-learn it at full depth every time.
@@ -80,46 +89,57 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	prof_last_ = SpecProfile::DRAFT;
 	prof_t0_ = impl::now_ms();
 
-	// 1. Drafter backbone on rank 0: block [anchor, mask x K] over the target's tapped context.
+	// 1. Drafter backbone over the block [anchor, mask x K] and the target's tapped context, then each rank's
+	// head shard + local top-k over the drafter hidden. Every rank's candidate set is the top-k of its
+	// vocabulary shard (exact: a rank's local top-k is a superset of the global top-k restricted to its shard).
 	const auto& hk0 = mc.model( 0 ).draft_hooks();
-	CUDA_CHECK( cudaSetDevice( 0 ) );
-	spec_.draft_backbone( *hk0.embedding, anchor, hk0.taps, pos, hk0.taps_cap, s0 );
-
-	// 2. Each row's candidates are the top-k of its hidden state through the target's vocabulary-
-	// parallel head. Peer the hidden rows to every rank, run each rank's head shard + local top-k on
-	// its own worker/stream, then bring the small [M, k] results back and merge (exact: a rank's local
-	// top-k is a superset of the global top-k restricted to its shard).
-	const pod::TensorView& dh = spec_.draft_hidden();
-	const size_t hid_bytes = static_cast<size_t>( M ) * dh.shape[1] * sizeof( half );
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		CUDA_CHECK( cudaMemcpyPeerAsync( mc.model( d ).draft_hooks().lm_in, d, dh.ptr<const half>(), 0, hid_bytes, s0 ) );
+	const size_t hid_bytes = static_cast<size_t>( M ) * mc.metadata().hidden_size * sizeof( half );
+	if ( tp_ > 1 ) {
+		// Sharded drafter: all ranks run the backbone in lockstep and end with the same full hidden.
+		mc.run_ranks( [&]( int d ) {
+			const auto& hk = mc.model( d ).draft_hooks();
+			spec_[d].draft_backbone( *hk.embedding, anchor, hk.taps, pos, hk.taps_cap, mc.stream( d ) );
+			CUDA_CHECK( cudaMemcpyAsync( hk.lm_in, spec_[d].draft_hidden().data, hid_bytes, cudaMemcpyDeviceToDevice, mc.stream( d ) ) );
+			mc.model( d ).draft_head_topk( M, mc.stream( d ) );
+			CUDA_CHECK( cudaStreamSynchronize( mc.stream( d ) ) );
+		} );
 	}
-	CUDA_CHECK( cudaStreamSynchronize( s0 ) );
-	mc.run_ranks( [&]( int d ) {
-		mc.model( d ).draft_head_topk( M, mc.stream( d ) );
-		CUDA_CHECK( cudaStreamSynchronize( mc.stream( d ) ) );
-	} );
+	else {
+		CUDA_CHECK( cudaSetDevice( 0 ) );
+		spec_[0].draft_backbone( *hk0.embedding, anchor, hk0.taps, pos, hk0.taps_cap, s0 );
+		// Peer the hidden rows to every rank, then run each rank's head shard on its own worker/stream.
+		const pod::TensorView& dh = spec_[0].draft_hidden();
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			CUDA_CHECK( cudaMemcpyPeerAsync( mc.model( d ).draft_hooks().lm_in, d, dh.ptr<const half>(), 0, hid_bytes, s0 ) );
+		}
+		CUDA_CHECK( cudaStreamSynchronize( s0 ) );
+		mc.run_ranks( [&]( int d ) {
+			mc.model( d ).draft_head_topk( M, mc.stream( d ) );
+			CUDA_CHECK( cudaStreamSynchronize( mc.stream( d ) ) );
+		} );
+	}
 
+	// Bring the small [M, k] results to rank 0 and merge.
 	const size_t val_bytes = static_cast<size_t>( M ) * models::kDraftTopK * sizeof( float );
 	const size_t idx_bytes = static_cast<size_t>( M ) * models::kDraftTopK * sizeof( int );
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		const auto& hk = mc.model( d ).draft_hooks();
-		CUDA_CHECK( cudaMemcpyPeerAsync( spec_.merged_cand_values_ptr( d ), 0, hk.cand_vals, d, val_bytes, s0 ) );
-		CUDA_CHECK( cudaMemcpyPeerAsync( spec_.merged_cand_indices_ptr( d ), 0, hk.cand_idx, d, idx_bytes, s0 ) );
+		CUDA_CHECK( cudaMemcpyPeerAsync( spec_[0].merged_cand_values_ptr( d ), 0, hk.cand_vals, d, val_bytes, s0 ) );
+		CUDA_CHECK( cudaMemcpyPeerAsync( spec_[0].merged_cand_indices_ptr( d ), 0, hk.cand_idx, d, idx_bytes, s0 ) );
 	}
 	engine::spec::dflash2_topk_merge(
-		spec_.merged_cand_values_ptr( 0 ), spec_.merged_cand_indices_ptr( 0 ),
+		spec_[0].merged_cand_values_ptr( 0 ), spec_[0].merged_cand_indices_ptr( 0 ),
 		ENGINE_NUM_GPUS, M, models::kDraftTopK,
-		spec_.merged_final_values_ptr(), spec_.merged_final_indices_ptr(), M, s0 );
+		spec_[0].merged_final_values_ptr(), spec_[0].merged_final_indices_ptr(), M, s0 );
 
 	// 3. Selector gate + bilinear lattice walk over the merged candidates.
 	mark( SpecProfile::WALK );
-	spec_.project_gate( K, s0 );
-	spec_.set_walk_anchor( anchor, s0 );
-	spec_.draft_select( spec_.merged_final_values_ptr(), spec_.merged_final_indices_ptr(), K, s0 );
+	spec_[0].project_gate( K, s0 );
+	spec_[0].set_walk_anchor( anchor, s0 );
+	spec_[0].draft_select( spec_[0].merged_final_values_ptr(), spec_[0].merged_final_indices_ptr(), K, s0 );
 	int h_draft[M];
-	CUDA_CHECK( cudaMemcpyAsync( h_draft, spec_.d_draft_tokens(), sizeof( h_draft ), cudaMemcpyDeviceToHost, s0 ) );
+	CUDA_CHECK( cudaMemcpyAsync( h_draft, spec_[0].d_draft_tokens(), sizeof( h_draft ), cudaMemcpyDeviceToHost, s0 ) );
 	CUDA_CHECK( cudaStreamSynchronize( s0 ) );
 	CUDA_CHECK( cudaGetLastError() );
 

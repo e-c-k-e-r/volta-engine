@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/core/comm.h"
 #include "engine/config.h"
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
@@ -91,6 +92,10 @@ void dflash2_dynconv(
 	bool accumulate,
 	cudaStream_t stream = nullptr
 );
+
+// Places a [rows, src_cols] slice at column col0 of a [rows, dst_cols] matrix (the fc all-gather writes each
+// rank's slice into a zeroed full-width buffer and sums across ranks).
+void dflash_place_cols( half* dst, const half* src, int rows, int dst_cols, int src_cols, int col0, cudaStream_t stream = nullptr );
 
 // FP16 -> FP32 widening copy (the drafter widens o_proj / down_proj before their conv).
 void dflash_h2f( const half* in, float* out, int n, cudaStream_t stream = nullptr );
@@ -276,6 +281,10 @@ class DFlashSpeculator {
 public:
 	DFlashSpeculator();
 
+	// Collective ring used for the backbone's all-reduces/all-gather when tp_size > 1 (the cluster's ring for
+	// this rank; the same ring the target forward uses, driven in the same order on every rank).
+	void set_ring( engine::comm::CollectiveRing* ring ) { ring_ = ring; }
+
 	// Number of target LM-head ranks that contribute a candidate slice to the merge. The drafter's own
 	// tp_size is 1 while the head is sharded, so the merge staging cannot be sized from tp_size_.
 	void set_candidate_ranks( int ranks ) { cand_ranks_ = MAX( ranks, 1 ); }
@@ -399,6 +408,7 @@ private:
 	bool weights_loaded_;
 	int rank_ = 0;
 	int tp_size_ = 1;
+	engine::comm::CollectiveRing* ring_ = nullptr;
 
 	// Weights loaded via SafeTensorsRepo
 	pod::LinearWeight fc_;
