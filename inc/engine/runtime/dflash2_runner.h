@@ -56,8 +56,24 @@ public:
 	void profile_dump();
 	void set_profile( bool on ) { profile_on_ = on; }
 
+	// Candidate-quality diagnostics (off by default; each round then pays one extra readback). For draft
+	// position k, counted only where the target's own token at that position is known to be on its true
+	// continuation (k <= first mismatch): rows seen, rows where the drafter's best candidate was the target's
+	// token, rows where it was anywhere in the top-k set, and rows where the selector walk chose it.
+	struct DiagStats {
+		int seen[8] = {};
+		int top1[8] = {};
+		int in_topk[8] = {};
+		int walk[8] = {};
+	};
+	void set_diag( bool on ) { diag_on_ = on; }
+	const DiagStats& diag() const { return diag_; }
+	void diag_reset() { diag_ = DiagStats{}; }
+
 private:
 	void mark( SpecProfile::Stage stage );
+	bool diag_on_ = false;
+	DiagStats diag_;
 
 	ModelCluster* mc_ = nullptr;
 	engine::spec::DFlashSpeculator spec_[ENGINE_NUM_GPUS];  // [0] only when tp_ == 1

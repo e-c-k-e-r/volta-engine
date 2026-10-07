@@ -2,6 +2,7 @@
 #include "engine/runtime/cluster.h"
 #include <chrono>
 #include <cstdio>
+#include <vector>
 #include <cstdlib>
 
 namespace engine::runtime {
@@ -119,6 +120,31 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		} );
 	}
 
+	// Diagnostic: EXL3_DUMP_DRAFT=<round> writes that round's inputs and the drafter hidden to
+	// /tmp/draft_dump.bin for comparison against an independent implementation. Header (int32): pos, anchor,
+	// hidden, taps_cap; then the tap ring rows for positions [0, pos) as FP16 [pos, 5 * hidden]
+	// (only valid while pos <= taps_cap), then the drafter hidden FP16 [M, hidden].
+	{
+		static const int dump_round = std::getenv( "EXL3_DUMP_DRAFT" ) ? std::atoi( std::getenv( "EXL3_DUMP_DRAFT" ) ) : -1;
+		static int round_no = 0;
+		if ( dump_round >= 0 && round_no++ == dump_round ) {
+			const int H = mc.metadata().hidden_size;
+			ENGINE_ASSERT( pos <= hk0.taps_cap, "dump: context longer than the tap ring" );
+			std::vector<half> taps( static_cast<size_t>( pos ) * 5 * H ), hid( static_cast<size_t>( M ) * H );
+			CUDA_CHECK( cudaSetDevice( 0 ) );
+			CUDA_CHECK( cudaStreamSynchronize( s0 ) );
+			CUDA_CHECK( cudaMemcpy( taps.data(), hk0.taps, taps.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+			CUDA_CHECK( cudaMemcpy( hid.data(), spec_[0].draft_hidden().data, hid.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+			FILE* f = std::fopen( "/tmp/draft_dump.bin", "wb" );
+			const int hdr[4] = { pos, anchor, H, hk0.taps_cap };
+			std::fwrite( hdr, sizeof( int ), 4, f );
+			std::fwrite( taps.data(), sizeof( half ), taps.size(), f );
+			std::fwrite( hid.data(), sizeof( half ), hid.size(), f );
+			std::fclose( f );
+			std::printf( "[dump] round %d: pos %d anchor %d\n", dump_round, pos, anchor );
+		}
+	}
+
 	// Bring the small [M, k] results to rank 0 and merge.
 	const size_t val_bytes = static_cast<size_t>( M ) * models::kDraftTopK * sizeof( float );
 	const size_t idx_bytes = static_cast<size_t>( M ) * models::kDraftTopK * sizeof( int );
@@ -135,7 +161,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 
 	// 3. Selector gate + bilinear lattice walk over the merged candidates.
 	mark( SpecProfile::WALK );
-	spec_[0].project_gate( K, s0 );
+	spec_[0].project_gate( M, s0 );
 	spec_[0].set_walk_anchor( anchor, s0 );
 	spec_[0].draft_select( spec_[0].merged_final_values_ptr(), spec_[0].merged_final_indices_ptr(), K, s0 );
 	int h_draft[M];
@@ -192,6 +218,28 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		++hit_[k];
 		res.emitted[res.emitted_count++] = cands[k];
 		res.accepted++;
+	}
+	if ( diag_on_ ) {
+		constexpr int kTop = models::kDraftTopK;
+		float hv[M * kTop];
+		int hi[M * kTop];
+		CUDA_CHECK( cudaSetDevice( 0 ) );
+		CUDA_CHECK( cudaMemcpy( hv, spec_[0].merged_final_values_ptr(), sizeof( hv ), cudaMemcpyDeviceToHost ) );
+		CUDA_CHECK( cudaMemcpy( hi, spec_[0].merged_final_indices_ptr(), sizeof( hi ), cudaMemcpyDeviceToHost ) );
+		for ( int k = 0; k < active && k <= res.accepted; ++k ) {
+			// Draft token k is chosen from candidate row k + 1 (row 0 is the anchor and is never scored).
+			const int row = k + 1;
+			int best = 0;
+			bool any = false;
+			for ( int j = 0; j < kTop; ++j ) {
+				if ( hv[row * kTop + j] > hv[row * kTop + best] ) best = j;
+				any = any || ( hi[row * kTop + j] == preds[k] );
+			}
+			++diag_.seen[k];
+			diag_.top1[k] += ( hi[row * kTop + best] == preds[k] ) ? 1 : 0;
+			diag_.in_topk[k] += any ? 1 : 0;
+			diag_.walk[k] += ( cands[k] == preds[k] ) ? 1 : 0;
+		}
 	}
 	// Per-step survival EMA, observed only where the step was proposed.
 	constexpr float kEma = 0.25f;
