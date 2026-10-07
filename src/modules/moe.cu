@@ -103,74 +103,111 @@ __global__ void moe_dispatch_scatter_kernel(
 	}
 }
 
-__global__ __launch_bounds__( 288 )
-void router_topk_kernel(
+// Router scratch: the 288 logits handed from the dot-product kernel to the selection kernel.
+__device__ float g_router_logits[288];
+
+// One warp per 32 experts, one thread per expert, summed in the same sequential order as the original
+// single-block kernel (bit-identical logits). The single block was bound by memory-level parallelism on
+// one SM (0.43 ms per layer for 288 x 4096 weights); spreading the experts over nine blocks gives nine
+// SMs' worth of outstanding loads, with 128 independent weight loads in flight per thread.
+__global__ __launch_bounds__( 32 )
+void router_logits_kernel(
 	const half* __restrict__ x,
 	const half* __restrict__ router_weights,
+	int hidden_size,
+	int num_experts
+) {
+	extern __shared__ float s_x[];
+	for ( int d = threadIdx.x; d < hidden_size; d += blockDim.x ) {
+		s_x[d] = __half2float( x[d] );
+	}
+	__syncthreads();
+
+	const int expert = blockIdx.x * 32 + threadIdx.x;
+	if ( expert >= num_experts ) return;
+	float logit = 0.0f;
+	const half* wcol = router_weights + expert;
+	for ( int d0 = 0; d0 < hidden_size; d0 += 128 ) {
+		// Unconditional loads (hidden_size % 128 == 0, asserted on the host) so all 128 issue back to back.
+		half w[128];
+		#pragma unroll
+		for ( int j = 0; j < 128; ++j ) {
+			w[j] = __ldg( wcol + static_cast<size_t>( d0 + j ) * num_experts );
+		}
+		#pragma unroll
+		for ( int j = 0; j < 128; ++j ) {
+			logit = fmaf( s_x[d0 + j], __half2float( w[j] ), logit );
+		}
+	}
+	g_router_logits[expert] = logit;
+}
+
+__global__ __launch_bounds__( 32 )
+void router_select_kernel(
 	const half* __restrict__ e_score_bias,
 	int* __restrict__ topk_indices,
 	half* __restrict__ topk_weights,
-	int hidden_size,
 	int num_experts,
 	int top_k,
 	float routed_scaling_factor
 ) {
-	int expert = threadIdx.x;
-	if ( expert >= num_experts ) return;
-
-	float logit = 0.0f;
-	#pragma unroll 4
-	for ( int d = 0; d < hidden_size; ++d ) {
-		float x_val = __half2float( x[d] );
-		float w_val = __half2float( router_weights[d * num_experts + expert] );
-		logit = fmaf( x_val, w_val, logit );
-	}
-
-	float raw_score = 1.0f / ( 1.0f + __expf( -logit ) );
-	float select_score = raw_score;
-	if ( e_score_bias != nullptr ) {
-		select_score += __half2float( e_score_bias[expert] );
-	}
-
 	__shared__ float s_raw[288];
 	__shared__ float s_select[288];
-	__shared__ int s_indices[288];
-	s_raw[expert] = raw_score;
-	s_select[expert] = select_score;
-	s_indices[expert] = expert;
-	__syncthreads();
+	for ( int expert = threadIdx.x; expert < num_experts; expert += 32 ) {
+		const float raw_score = 1.0f / ( 1.0f + __expf( -g_router_logits[expert] ) );
+		float select_score = raw_score;
+		if ( e_score_bias != nullptr ) {
+			select_score += __half2float( e_score_bias[expert] );
+		}
+		s_raw[expert] = raw_score;
+		s_select[expert] = select_score;
+	}
+	__syncwarp();
 
-	if ( threadIdx.x == 0 ) {
+	// Top-k by warp 0: each lane owns experts lane, lane + 32, ...; k rounds of a warp argmax (ties go to the
+	// lowest expert index), removing the winner each round. Same descending order as the old selection sort.
+	if ( threadIdx.x < 32 ) {
+		const int lane = threadIdx.x;
+		bool taken[9];
 		#pragma unroll
+		for ( int q = 0; q < 9; ++q ) taken[q] = false;
+		int sel[16];
 		for ( int i = 0; i < top_k; ++i ) {
-			int max_idx = i;
-			float max_val = s_select[i];
-			for ( int j = i + 1; j < num_experts; ++j ) {
-				if ( s_select[j] > max_val ) {
-					max_val = s_select[j];
-					max_idx = j;
+			float best = -INFINITY;
+			int best_idx = 0x7fffffff;
+			#pragma unroll
+			for ( int q = 0; q < 9; ++q ) {
+				const int e = lane + q * 32;
+				if ( e < num_experts && !taken[q] ) {
+					const float v = s_select[e];
+					if ( v > best || ( v == best && e < best_idx ) ) {
+						best = v;
+						best_idx = e;
+					}
 				}
 			}
-			float tmp_s = s_select[i];
-			s_select[i] = s_select[max_idx];
-			s_select[max_idx] = tmp_s;
-
-			int tmp_i = s_indices[i];
-			s_indices[i] = s_indices[max_idx];
-			s_indices[max_idx] = tmp_i;
+			#pragma unroll
+			for ( int off = 16; off > 0; off >>= 1 ) {
+				const float ov = __shfl_xor_sync( 0xffffffff, best, off );
+				const int oi = __shfl_xor_sync( 0xffffffff, best_idx, off );
+				if ( ov > best || ( ov == best && oi < best_idx ) ) {
+					best = ov;
+					best_idx = oi;
+				}
+			}
+			sel[i] = best_idx;
+			if ( ( best_idx & 31 ) == lane ) taken[best_idx >> 5] = true;
 		}
-
-		float sum_scores = 0.0f;
-		#pragma unroll
-		for ( int i = 0; i < top_k; ++i ) {
-			sum_scores += s_raw[s_indices[i]];
-		}
-
-		float inv_sum = routed_scaling_factor / ( sum_scores + 1e-9f );
-		#pragma unroll
-		for ( int i = 0; i < top_k; ++i ) {
-			topk_indices[i] = s_indices[i];
-			topk_weights[i] = __float2half_rn( s_raw[s_indices[i]] * inv_sum );
+		if ( lane == 0 ) {
+			float sum_scores = 0.0f;
+			for ( int i = 0; i < top_k; ++i ) {
+				sum_scores += s_raw[sel[i]];
+			}
+			const float inv_sum = routed_scaling_factor / ( sum_scores + 1e-9f );
+			for ( int i = 0; i < top_k; ++i ) {
+				topk_indices[i] = sel[i];
+				topk_weights[i] = __float2half_rn( s_raw[sel[i]] * inv_sum );
+			}
 		}
 	}
 }
@@ -225,13 +262,19 @@ void MoERouter::route_topk(
 	float routed_scaling_factor,
 	cudaStream_t stream
 ) {
-	router_topk_kernel<<<dim3( 1 ), dim3( num_experts ), 0, stream>>>(
+	ENGINE_ASSERT( top_k <= 16 && num_experts <= 288 && hidden_size % 128 == 0, "MoERouter::route_topk: top_k / num_experts / hidden_size out of range" );
+	const size_t smem = static_cast<size_t>( hidden_size ) * sizeof( float );
+	ENGINE_ASSERT( smem <= 48 * 1024, "MoERouter::route_topk: hidden_size exceeds the staged activation" );
+	router_logits_kernel<<<dim3( ( num_experts + 31 ) / 32 ), dim3( 32 ), smem, stream>>>(
 		x.ptr<const half>(),
 		router_weights.ptr<const half>(),
+		hidden_size,
+		num_experts
+	);
+	router_select_kernel<<<dim3( 1 ), dim3( 32 ), 0, stream>>>(
 		e_score_bias.ptr<const half>(),
 		d_topk_indices,
 		d_topk_weights,
-		hidden_size,
 		num_experts,
 		top_k,
 		routed_scaling_factor
