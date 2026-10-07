@@ -10,12 +10,12 @@ using namespace engine::runtime;
 namespace impl {
 
 std::vector<float> logits_row( ModelCluster& mc, int row ) {
+	// Full-vocabulary row regardless of LM-head sharding
 	const int V = mc.metadata().vocab_size;
-	std::vector<half> h( V );
-	CUDA_CHECK( cudaSetDevice( 0 ) );
-	CUDA_CHECK( cudaMemcpy( h.data(), mc.model( 0 ).logits().ptr<const half>() + static_cast<size_t>( row ) * V, V * sizeof( half ), cudaMemcpyDeviceToHost ) );
+	std::vector<half> h( static_cast<size_t>( row + 1 ) * V );
+	mc.read_logits( row + 1, h.data() );
 	std::vector<float> f( V );
-	for ( int i = 0; i < V; ++i ) f[i] = __half2float( h[i] );
+	for ( int i = 0; i < V; ++i ) f[i] = __half2float( h[static_cast<size_t>( row ) * V + i] );
 	return f;
 }
 

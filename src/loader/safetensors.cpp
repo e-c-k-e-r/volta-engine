@@ -793,6 +793,24 @@ pod::LinearWeight SafeTensorsRepo::load_linear(
 ) {
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
+	if ( find( name_buf ) == nullptr ) {
+		// No quantized tensor: this is an unquantized checkpoint (the DFlash2 drafter's own
+		// pre-quantization release, for instance), where the weight is a plain [n, k] matrix. Load it
+		// dense and hand it to the same FP16 GEMV the unquantized projections already use, so such a
+		// checkpoint can be dropped into cfg.draft_model_dir unchanged and A/B'd against the quantized
+		// one. Max |w| there is 20.9 against FP16's 65504, and BF16 -> FP16 is exact for normals.
+		std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
+		int shard = -1;
+		const pod::SafeTensorMeta* meta = find( name_buf, &shard );
+		if ( meta == nullptr || meta->ndim != 2 ) {
+			ENGINE_ASSERT( false, "load_linear: neither a trellis group nor a 2-D weight for this name" );
+		}
+		pod::TensorView w = load( name_buf, arena, stream, pod::DType::FP16 );
+		const int n = meta->shape[0], k = meta->shape[1];
+		// The tensor is stored [n, k]; Linear::forward takes n from shape[1] and k from shape[0].
+		return pod::LinearWeight::make_fp16(
+			pod::make_tensor_2d( w.data, pod::DType::FP16, k, n ) );
+	}
 	pod::TensorView tr = load( name_buf, arena, stream );
 
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.suh", base_name );

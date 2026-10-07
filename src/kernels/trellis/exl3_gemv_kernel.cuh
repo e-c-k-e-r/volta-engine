@@ -29,6 +29,13 @@
 
 #define EXL3_GEMV_MAX_M 8
 
+// Split-K partials: [k_slice][row][col] FP32, summed in fixed slice order after a grid sync so the
+// output is bit-identical run to run (FP16 atomicAdd made the target forward nondeterministic).
+// Split-K only fires for size_n < 80 * 64 with at most 4 slices and EXL3_GEMV_MAX_M rows.
+#define EXL3_GEMV_SPLITK_MAX 4
+#define EXL3_GEMV_SPLITK_WS ( EXL3_GEMV_SPLITK_MAX * EXL3_GEMV_MAX_M * 5120 )
+__device__ float g_exl3_gemv_splitk_ws[EXL3_GEMV_SPLITK_WS];
+
 namespace exl3_gemv_ns {
 
 // mma.m16n8k16 with the A operand supplied as two FragB halves, fp16 accumulate.
@@ -307,18 +314,6 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 suh + (this_warp * 128) % size_k,
                 0.088388347648f  // 1/sqrt(128)
             );
-
-        if (gridDim.y > 1 && blockIdx.y == 0)
-        {
-            int total_elements = size_m * size_n;
-            int threads_grid = gridDim.x * blockDim.x;
-            int this_tid = threadIdx.x + blockDim.x * blockIdx.x;
-            for (int idx = this_tid; idx < total_elements; idx += threads_grid)
-            {
-                if constexpr (c_fp32) ((float*) C)[idx] = 0.0f;
-                else                  ((half*)  C)[idx] = __ushort_as_half(0);
-            }
-        }
 
         grid.sync();
         A = A_had;
@@ -734,15 +729,27 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             }
             else
             {
-                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__) >= 700
-                if constexpr (c_fp32)
-                    atomicAdd(&((float*) C)[(size_t) r * size_n + col], sum);
-                else
-                    atomicAdd(&((half*)  C)[(size_t) r * size_n + col], __float2half_rn(sum));
-                #endif
+                g_exl3_gemv_splitk_ws[((size_t) blockIdx.y * size_m + r) * size_n + col] = sum;
             }
         }
         __syncthreads();
+    }
+
+    // Fixed-order split-K reduction (deterministic): slice 0 + slice 1 + ... in FP32, one rounding
+    if (gridDim.y > 1)
+    {
+        grid.sync();
+        const int total = size_m * size_n;
+        const int threads_grid = gridDim.x * gridDim.y * blockDim.x;
+        const int this_tid = threadIdx.x + blockDim.x * (blockIdx.x + blockIdx.y * gridDim.x);
+        for (int idx = this_tid; idx < total; idx += threads_grid)
+        {
+            float sum = 0.0f;
+            for (int s = 0; s < (int) gridDim.y; ++s)
+                sum += g_exl3_gemv_splitk_ws[(size_t) s * total + idx];
+            if constexpr (c_fp32) ((float*) C)[idx] = sum;
+            else                  ((half*)  C)[idx] = __float2half_rn(sum);
+        }
     }
 
     // Output scales and Hadamard transform, same semantics as the inner GEMM epilogue

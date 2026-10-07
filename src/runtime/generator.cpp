@@ -176,11 +176,12 @@ void Generator::step_batch() {
 	}
 	if ( n == 0 ) return;
 
-	if ( n == 1 && cluster_.has_speculator() ) {
-		// Case A: single request, DFlash2 speculative round (Mode A causal verify block)
+	if ( n == 1 && cluster_.spec_owns( ids[0] ) ) {
+		// Case A: single request that owns the drafter context, DFlash2 speculative round (Mode A
+		// causal verify block). A slot that lost ownership to a newer request decodes normally.
 		const int s = ids[0];
 		Slot& slot = slots_[s];
-		const SpecResult r = cluster_.speculate( s, slot.last_token, slot.current_pos, slot.all_tokens );
+		const SpecResult r = cluster_.speculate( s, slot.last_token, slot.current_pos );
 		slot.current_pos = r.next_pos;
 		slot.last_token = r.emitted[r.emitted_count - 1];
 		{

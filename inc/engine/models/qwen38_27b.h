@@ -116,6 +116,9 @@ public:
 		cudaStream_t stream = nullptr
 	) override;
 
+	const DraftHooks& draft_hooks() const override { return draft_hooks_; }
+	void draft_head_topk( int rows, cudaStream_t stream = nullptr ) override;
+
 	void checkpoint_state( int slot_id, cudaStream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, cudaStream_t stream = nullptr ) override;
 	void reset_state( int slot_id = 0 ) override;
@@ -183,6 +186,17 @@ private:
 
 	// Model level
 	Qwen38LayerWeights layers_[64];
+
+	// DFlash2 attachment (see DraftHooks): tap ring, head scratch and per-rank candidate top-k scratch.
+	DraftHooks draft_hooks_;
+	pod::TensorView draft_taps_;         // [taps_cap, 5 * hidden]
+	pod::TensorView draft_lm_logits_;    // [kDraftM, lm_shard_cols]
+	static constexpr int kTopkTile = 4096;   // TOPK_THREADS * 16
+	float* draft_cand_part_v_ = nullptr;
+	int* draft_cand_part_i_ = nullptr;
+	int* draft_cand_counters_ = nullptr;
+	int* d_taps_owner_ = nullptr;
+
 	pod::TensorView embed_tokens_;
 	pod::TensorView final_norm_;
 	pod::LinearWeight lm_head_;

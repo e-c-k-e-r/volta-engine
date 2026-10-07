@@ -1,5 +1,6 @@
 #include "engine/models/qwen38_27b.h"
 #include "engine/loader/safetensors.h"
+#include "engine/spec/dflash.h"
 #include "trellis_context.h"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -74,6 +75,23 @@ bool Qwen38Pipeline::init(
 	const size_t tap_bytes = static_cast<size_t>( R ) * 5 * config_.hidden_size * sizeof( half );
 	tapped_states_ = static_cast<half*>( engine::core::arena_alloc( arena, tap_bytes ) );
 	CUDA_CHECK( cudaMemset( tapped_states_, 0, tap_bytes ) );
+
+	// Drafter context taps. tapped_states_ only survives the last forward (MAX_BATCH rows), but the
+	// drafter's context stage needs every position in the window, so keep a position-indexed ring of
+	// the same per-position [5, hidden] tap set.
+	//
+	// The ring is per position, not per slot (a per-slot ring would cost ~840 MiB per rank), so only
+	// one slot may publish into it: rows from every other slot are skipped on device. The owner is a
+	// device scalar so the captured forward graph stays valid when it changes. -1 publishes nothing.
+	draft_hooks_.taps_cap = MAX( MIN( config_.max_seq, 2048 ), 256 );
+	int wtap_shape[2] = { draft_hooks_.taps_cap, 5 * config_.hidden_size };
+	draft_taps_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, wtap_shape, 2 );
+	CUDA_CHECK( cudaMemset( draft_taps_.data, 0, wtap_shape[0] * wtap_shape[1] * sizeof( half ) ) );
+	d_taps_owner_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
+	CUDA_CHECK( cudaMemset( d_taps_owner_, 0xFF, sizeof( int ) ) );
+	draft_hooks_.taps = draft_taps_.ptr<const half>();
+	draft_hooks_.taps_owner = d_taps_owner_;
+	draft_hooks_.embedding = &embed_tokens_;
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
 
@@ -134,6 +152,28 @@ bool Qwen38Pipeline::init(
 			// Only the DFlash2 drafter needs the whole distribution; sampling reduces per shard.
 			int full_shape[2] = { R, config_.vocab_size };
 			full_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, full_shape, 2 );
+		}
+
+		// Drafter head scratch, on this rank's device: the drafter's [kDraftM, hidden] rows land in
+		// lm_in, the head shard writes [kDraftM, shard] logits, and the local top-k comes out in
+		// cand_vals / cand_idx. Each row's candidate set is the top-k over the union of every rank's
+		// shard, so every rank needs all of it.
+		{
+			const int kM = kDraftM;
+			int ds[2] = { kM, config_.hidden_size };
+			draft_hooks_.lm_in = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ds, 2 ).ptr<half>();
+			int dl[2] = { kM, lm_shard_cols_ };
+			draft_lm_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, dl, 2 );
+			const int splits = ( lm_shard_cols_ + kTopkTile - 1 ) / kTopkTile;
+			const size_t per = static_cast<size_t>( kM ) * splits * kDraftTopK;
+			draft_cand_part_v_ = static_cast<float*>( engine::core::arena_alloc( arena, per * sizeof( float ) ) );
+			draft_cand_part_i_ = static_cast<int*>( engine::core::arena_alloc( arena, per * sizeof( int ) ) );
+			draft_cand_counters_ = static_cast<int*>( engine::core::arena_alloc( arena, kM * sizeof( int ) ) );
+			draft_hooks_.cand_vals = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( kM ) * kDraftTopK * sizeof( float ) ) );
+			draft_hooks_.cand_idx = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( kM ) * kDraftTopK * sizeof( int ) ) );
+			CUDA_CHECK( cudaMemset( draft_cand_counters_, 0, kM * sizeof( int ) ) );
+			draft_hooks_.shard_offset = rank_ * lm_shard_real_cols_;
+			draft_hooks_.shard_real_cols = lm_shard_real_cols_;
 		}
 	}
 
@@ -395,6 +435,48 @@ const pod::TensorView& Qwen38Pipeline::gather_logits(
 	return full_logits_;
 }
 
+// Runs this rank's head shard over the drafter's hidden rows and leaves the local top-k in the hooks'
+// cand buffers. Not a target forward: the rows are the drafter's, with no slot or position.
+void Qwen38Pipeline::draft_head_topk( int rows, cudaStream_t stream ) {
+	ENGINE_ASSERT( weights_loaded_, "Qwen38Pipeline::draft_head_topk: weights not loaded" );
+	ENGINE_ASSERT( rows >= 1 && rows <= kDraftM, "Qwen38Pipeline::draft_head_topk: rows out of range" );
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	const int H = config_.hidden_size;
+	// All kDraftM rows, whatever `rows` is: the head's fast path only covers m in {1, 2, 4, 8}, and any
+	// other m falls through to the cooperative GEMM (far slower). The caller consumes the first rows.
+	pod::TensorView in = pod::make_tensor_2d( draft_hooks_.lm_in, pod::DType::FP16, kDraftM, H );
+	engine::modules::Linear::forward( in, lm_head_, draft_lm_logits_, stream );
+	// Columns are the slice's real width: pad columns hold the next rank's tokens, so scanning them
+	// would put the same token in two ranks' candidate sets and let the merge emit it twice.
+	engine::spec::dflash2_topk_shard(
+		draft_lm_logits_.ptr<const half>(), kDraftM, lm_shard_cols_, lm_shard_real_cols_, kDraftTopK,
+		draft_hooks_.cand_vals, draft_hooks_.cand_idx, draft_hooks_.shard_offset,
+		draft_cand_part_v_, draft_cand_part_i_, draft_cand_counters_, stream );
+}
+
+// Graph-safe tap publication. forward_body is captured once per row count and replayed, so anything
+// that depends on which position a row occupies, or which slot owns the ring, has to read it from
+// device memory; a host-side value would be frozen into the graph at capture time.
+__global__ void dflash_store_taps_kernel(
+	half* __restrict__ taps,
+	const half* __restrict__ hidden,
+	const pod::BatchRows* __restrict__ rows,
+	const int* __restrict__ owner,
+	int m,
+	int tap,
+	int H,
+	int cap
+) {
+	const int r = blockIdx.y;
+	if ( r >= m ) return;
+	if ( rows->slot[r] != *owner ) return;
+	const int pos = rows->pos[r];
+	if ( pos < 0 ) return;
+	half* dst = taps + static_cast<size_t>( pos % cap ) * 5 * H + static_cast<size_t>( tap ) * H;
+	const half* src = hidden + static_cast<size_t>( r ) * H;
+	for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < H; i += blockDim.x ) dst[i] = src[i];
+}
+
 void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) {
 	ENGINE_ASSERT( weights_loaded_, "Qwen38Pipeline::forward: weights not loaded" );
 	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_BATCH, "Qwen38Pipeline::forward: row count out of range" );
@@ -617,6 +699,17 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 				m,
 				cudaMemcpyDeviceToDevice, stream
 			) );
+			// Also keep it position-indexed for the drafter's context stage. Each row lands in its own
+			// ring slot, so this cannot be the same strided copy as above. The slot, the position and
+			// the owner all come from device memory: forward_body is replayed from a CUDA graph keyed
+			// only on the row count, and a host-side value would be frozen at capture time.
+			{
+				const int H = config_.hidden_size;
+				dim3 g( ( H + 255 ) / 256, m );
+				dflash_store_taps_kernel<<<g, 256, 0, stream >>>(
+					draft_taps_.ptr<half>(), hidden_states_.ptr<const half>(), d_rows_, d_taps_owner_,
+					m, tap, H, draft_hooks_.taps_cap );
+			}
 		}
 	}
 
@@ -629,7 +722,6 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 		engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
 	}
 }
-
 
 void Qwen38Pipeline::destroy() {
 	if ( arena_ != nullptr ) {

@@ -1,5 +1,6 @@
 #include "engine/runtime/cluster.h"
 #include "trellis_context.h"
+#include <cmath>
 #include <cstdio>
 #include <chrono>
 #include <cstring>
@@ -10,7 +11,12 @@ namespace engine::runtime {
 bool ModelCluster::init( const ClusterConfig& cfg ) {
 	ENGINE_ASSERT( !initialized_, "ModelCluster::init: already initialized" );
 	const bool is_glm = ( cfg.model_type == "glm53" || cfg.model_type == "glm" );
-	const size_t arena_bytes = cfg.arena_bytes ? cfg.arena_bytes : ( is_glm ? 31ULL : 10ULL ) * 1024 * 1024 * 1024;
+	// EXL3_ARENA_GIB overrides the per-GPU arena. The default of 10 GiB is sized for the quantized
+	// drafter; loading the unquantized one needs roughly twice the weight bytes.
+	const char* arena_env = std::getenv( "EXL3_ARENA_GIB" );
+	const size_t arena_bytes = cfg.arena_bytes ? cfg.arena_bytes
+		: ( arena_env ? strtoull( arena_env, nullptr, 10 ) : ( is_glm ? 31ULL : 10ULL ) )
+			* 1024 * 1024 * 1024;
 
 	created_ = true;
 	engine::comm::init_4gpu_mesh( rings_, staging_ptrs_, flag_ptrs_, 4 * 1024 * 1024 );
@@ -39,16 +45,8 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	}
 
 	if ( !cfg.draft_model_dir.empty() ) {
-		const auto& meta = models_[0]->get_metadata();
-		pod::DFlashConfig spec_cfg;
-		spec_cfg.hidden_size = meta.hidden_size;
-		spec_cfg.vocab_size = meta.vocab_size;
-		spec_cfg.block_size = 8;
-		CUDA_CHECK( cudaSetDevice( 0 ) );
-		if ( !speculator_.init( spec_cfg, 0, arenas_[0], streams_[0] ) ) return false;
-		const bool loaded = speculator_.load_weights( cfg.draft_model_dir.c_str(), streams_[0] );
-		std::printf( "[+] DFlash2 speculator: %s (%s)\n", loaded ? "loaded" : "STANDALONE", cfg.draft_model_dir.c_str() );
-		has_spec_ = true;
+		runner_ = std::make_unique<DFlash2Runner>();
+		if ( !runner_->init( *this, cfg.draft_model_dir ) ) return false;
 	}
 
 	initialized_ = true;
@@ -60,10 +58,9 @@ void ModelCluster::shutdown() {
 	created_ = false;
 	initialized_ = false;
 	pool_.stop();
-	if ( has_spec_ ) {
-		CUDA_CHECK( cudaSetDevice( 0 ) );
-		speculator_.destroy();
-		has_spec_ = false;
+	if ( runner_ ) {
+		runner_->shutdown();
+		runner_.reset();
 	}
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		CUDA_CHECK( cudaSetDevice( d ) );
@@ -150,6 +147,20 @@ void ModelCluster::sample( int* out, int count ) {
 	}
 }
 
+void ModelCluster::read_logits( int rows, half* host_dst ) {
+	CUDA_CHECK( cudaSetDevice( 0 ) );
+	const half* peer_shards[ENGINE_NUM_GPUS] = { nullptr };
+	int peer_cols = 0;
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		peer_shards[d] = models_[d]->shard_logits_ptr();
+		peer_cols = models_[d]->shard_logits_cols();
+	}
+	const pod::TensorView& full = models_[0]->gather_logits( rows, peer_shards, peer_cols, streams_[0] );
+	const size_t bytes = static_cast<size_t>( rows ) * metadata().vocab_size * sizeof( half );
+	CUDA_CHECK( cudaMemcpyAsync( host_dst, full.data, bytes, cudaMemcpyDeviceToHost, streams_[0] ) );
+	CUDA_CHECK( cudaStreamSynchronize( streams_[0] ) );
+}
+
 int ModelCluster::sample_one() {
 	int tok = -1;
 	sample( &tok, 1 );
@@ -170,6 +181,9 @@ void ModelCluster::warm_graphs( int max_m, int slot ) {
 }
 
 void ModelCluster::reset_slot( int slot ) {
+	// The drafter's context (tap ring, projected KV, fill level) describes one slot at a time. The
+	// slot being recycled takes it over, so its prefill publishes taps from position 0.
+	if ( runner_ ) runner_->claim( slot );
 	pool_.run( [&]( int d ) {
 		models_[d]->reset_state( slot );
 	} );
@@ -185,83 +199,6 @@ void ModelCluster::rollback( int slot ) {
 	pool_.run( [&]( int d ) {
 		models_[d]->rollback_state( slot, streams_[d] );
 	} );
-}
-
-SpecResult ModelCluster::speculate( int slot, int anchor, int pos, const std::vector<int>& context, float conf_threshold ) {
-	ENGINE_ASSERT( has_spec_, "ModelCluster::speculate: no speculator loaded" );
-	const auto& meta = metadata();
-	SpecResult res;
-
-	// 1. Anchor forward: logits row 0 predicts the token after the anchor; tapped states feed the drafter
-	forward( &anchor, 1, pos, slot );
-	const int target_pred = sample_one();
-
-	// 2. Draft K tokens conditioned on target logits, context and tapped hidden states
-	CUDA_CHECK( cudaSetDevice( 0 ) );
-	// The drafter scores the whole vocabulary, so rank 0 materializes the full logits from the shards.
-	// ModelCluster::forward already synchronized every rank, so the peer copies below are safe.
-	const half* peer_shards[ENGINE_NUM_GPUS] = { nullptr };
-	int peer_cols = 0;
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		peer_shards[d] = models_[d]->shard_logits_ptr();
-		peer_cols = models_[d]->shard_logits_cols();
-	}
-	const pod::TensorView& target_logits = models_[0]->gather_logits( 1, peer_shards, peer_cols, streams_[0] );
-	CUDA_CHECK( cudaStreamSynchronize( streams_[0] ) );
-	speculator_.draft( anchor, pos + 1, streams_[0], target_logits.ptr<const half>(),
-		context.data(), static_cast<int>( context.size() ), models_[0]->tapped_states() );
-	int h_draft[8];
-	float h_conf[8];
-	CUDA_CHECK( cudaMemcpyAsync( h_draft, speculator_.d_draft_tokens(), sizeof( h_draft ), cudaMemcpyDeviceToHost, streams_[0] ) );
-	CUDA_CHECK( cudaMemcpyAsync( h_conf, speculator_.d_conf(), sizeof( h_conf ), cudaMemcpyDeviceToHost, streams_[0] ) );
-	CUDA_CHECK( cudaStreamSynchronize( streams_[0] ) );
-
-	// Confidence truncation; keep >= 1 and stay inside the context window
-	int active = 7;
-	for ( int k = 1; k <= 7; ++k ) {
-		if ( h_conf[k] < conf_threshold ) {
-			active = k - 1;
-			break;
-		}
-	}
-	active = MIN( MAX( active, 1 ), meta.max_seq_len - pos - 2 );
-	if ( active < 1 ) {
-		res.emitted[res.emitted_count++] = target_pred;
-		res.next_pos = pos + 1;
-		return res;
-	}
-	res.proposed = active;
-	const int* cands = h_draft + 1;
-
-	// 3. Batched verify of the candidate block [pos + 1, pos + 1 + active)
-	checkpoint( slot );
-	forward( cands, active, pos + 1, slot );
-	int preds[pod::MAX_BATCH];
-	sample( preds, active );
-
-	// 4. Greedy acceptance: candidate k is checked against the prediction of the previous position
-	for ( int k = 0; k < active; ++k ) {
-		const int expected = ( k == 0 ) ? target_pred : preds[k - 1];
-		if ( cands[k] != expected ) {
-			res.emitted[res.emitted_count++] = expected; // correction token
-			break;
-		}
-		res.emitted[res.emitted_count++] = cands[k];
-		res.accepted++;
-	}
-	if ( res.accepted == active ) {
-		res.emitted[res.emitted_count++] = preds[active - 1]; // bonus token
-	}
-
-	// 5. State repair: recurrent state holds all candidates; restore and replay the accepted prefix
-	if ( res.accepted < active ) {
-		rollback( slot );
-		if ( res.accepted > 0 ) {
-			forward( cands, res.accepted, pos + 1, slot );
-		}
-	}
-	res.next_pos = pos + 1 + res.accepted;
-	return res;
 }
 
 } // namespace engine::runtime

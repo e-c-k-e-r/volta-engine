@@ -12,6 +12,26 @@
 
 namespace engine::models {
 
+// The drafter's query block width, shared by the model scratch, the speculator and the cluster so
+// the three cannot disagree about how many rows a draft round has.
+static constexpr int kDraftM = 8;
+static constexpr int kDraftTopK = 16;   // dflash2.selector_top_k
+
+// Per-rank view of the target that the DFlash2 drafter reads. Filled once at init; every pointer is
+// stable for the model's lifetime, so a captured graph may bake them in.
+struct DraftHooks {
+	const pod::TensorView* embedding = nullptr; // [vocab, hidden] table (replicated on every rank)
+	const half* taps = nullptr;                 // [taps_cap, 5 * hidden] position-indexed tap ring
+	int taps_cap = 0;
+	int* taps_owner = nullptr;                  // device scalar: slot whose rows publish taps (-1: none)
+	half* lm_in = nullptr;                      // [kDraftM, hidden] drafter hidden, written by the runner
+	float* cand_vals = nullptr;                 // [kDraftM, kDraftTopK] local top-k logits
+	int* cand_idx = nullptr;                    // [kDraftM, kDraftTopK] global token ids
+	int shard_offset = 0;                       // first global token id of this rank's slice
+	int shard_real_cols = 0;                    // unpadded slice width
+	bool valid() const { return embedding != nullptr && taps != nullptr; }
+};
+
 struct ModelMetadata {
 	std::string model_name;
 	int hidden_size = 0;
@@ -69,7 +89,15 @@ public:
 	virtual const half* shard_logits_ptr() const { return nullptr; }
 	virtual int shard_logits_cols() const { return 0; }
 
-	// 4d. Materialize the full-vocabulary logits on rank 0 from every rank's shard. Only consumers that
+	// 4d. DFlash2 drafter attachment. The drafter has no embedding table or output head of its own: it
+	// reads this rank's embedding, the tap ring and a head-shard top-k through one descriptor, and
+	// asks the model to run the head over caller-provided hidden rows.
+	virtual const DraftHooks& draft_hooks() const { static const DraftHooks none; return none; }
+	// Runs this rank's LM head shard over hooks.lm_in[rows, hidden] and leaves the local top-k
+	// (token ids offset into the global vocabulary, sorted) in hooks.cand_vals / cand_idx.
+	virtual void draft_head_topk( int rows, cudaStream_t stream = nullptr ) { (void) rows; (void) stream; }
+
+	// 4e. Materialize the full-vocabulary logits on rank 0 from every rank's shard. Only consumers that
 	// need the whole distribution (the DFlash2 drafter) pay for this; sampling uses sample_local.
 	// The caller must have synchronized every rank's stream first. Returns logits() when unsharded.
 	virtual const pod::TensorView& gather_logits(

@@ -1,9 +1,46 @@
 // Tier-3 speculative benchmark: DFlash2 rounds vs plain greedy decode on the same prompts.
-// Speculative output is asserted token-identical to greedy (lossless at T=0).
+// Speculative output must be token-identical to greedy (lossless at T=0); on divergence the first
+// differing token is diagnosed as a near-tie flip or a speculative-round logic error. Exit 1 if any.
 #include "engine/runtime/test_driver.h"
 #include <cstring>
 
 using namespace engine::runtime;
+
+namespace impl {
+
+// Replays greedy decode up to the step that produced g[i] (i >= 1) and reports the target's top-2
+// there and where the speculative token ranks. A tiny margin with spec == runner-up is a near-tie
+// flip (M>1 vs M=1 numerics); a large margin is a logic error in the speculative round.
+void diagnose( ModelCluster& mc, const std::vector<int>& prompt, const std::vector<int>& g, const std::vector<int>& s, size_t i ) {
+	std::printf( "    first divergence at token %zu: greedy %d, spec %d\n", i, g[i], s[i] );
+	if ( i == 0 ) {
+		std::printf( "    (prefill prediction differs: both paths share prefill, so this is a harness bug)\n" );
+		return;
+	}
+	mc.reset_slot( 0 );
+	mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0 );
+	int pos = static_cast<int>( prompt.size() );
+	for ( size_t t = 0; t < i; ++t ) {
+		mc.forward( &g[t], 1, pos++, 0 );
+	}
+	const int V = mc.metadata().vocab_size;
+	std::vector<half> h( V );
+	mc.read_logits( 1, h.data() );
+	int i1 = 0, i2 = -1;
+	for ( int j = 1; j < V; ++j ) {
+		if ( __half2float( h[j] ) > __half2float( h[i1] ) ) { i2 = i1; i1 = j; }
+		else if ( i2 < 0 || __half2float( h[j] ) > __half2float( h[i2] ) ) { i2 = j; }
+	}
+	int rank = 0;
+	const float vs = __half2float( h[s[i]] );
+	for ( int j = 0; j < V; ++j ) rank += ( __half2float( h[j] ) > vs ) ? 1 : 0;
+	std::printf( "    greedy step logits: top1 %d (%.4f), top2 %d (%.4f), margin %.4f; spec token rank %d (%.4f)\n",
+		i1, __half2float( h[i1] ), i2, __half2float( h[i2] ), __half2float( h[i1] ) - __half2float( h[i2] ), rank, vs );
+	std::printf( "    -> %s\n", ( rank <= 1 && __half2float( h[i1] ) - vs <= 0.0625f )
+		? "near-tie flip (batch numerics)" : "NOT a near tie: speculative-round logic error" );
+}
+
+} // namespace impl
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
@@ -22,11 +59,23 @@ int main( int argc, char** argv ) {
 	};
 	const int max_new = 96;
 	double g_ms = 0.0, s_ms = 0.0;
-	int g_tok = 0, s_tok = 0, proposed = 0, accepted = 0, rounds = 0;
-	for ( const auto& p : prompts ) {
+	int g_tok = 0, s_tok = 0, proposed = 0, accepted = 0, rounds = 0, diverged = 0;
+	for ( size_t pi = 0; pi < prompts.size(); ++pi ) {
+		const auto& p = prompts[pi];
 		const auto g = test::generate( mc, p, max_new, false );
 		const auto s = test::generate( mc, p, max_new, true );
-		ENGINE_ASSERT( g.tokens == s.tokens, "speculative output diverged from greedy" );
+		if ( g.tokens != s.tokens ) {
+			++diverged;
+			std::printf( "[-] prompt %zu: speculative output diverged from greedy\n", pi );
+			size_t i = 0;
+			while ( i < g.tokens.size() && i < s.tokens.size() && g.tokens[i] == s.tokens[i] ) ++i;
+			if ( i < g.tokens.size() && i < s.tokens.size() ) {
+				impl::diagnose( mc, p, g.tokens, s.tokens, i );
+			}
+			else {
+				std::printf( "    length differs only: greedy %zu, spec %zu tokens\n", g.tokens.size(), s.tokens.size() );
+			}
+		}
 		g_ms += g.decode_ms;
 		s_ms += s.decode_ms;
 		g_tok += static_cast<int>( g.tokens.size() ) - 1;
@@ -42,7 +91,7 @@ int main( int argc, char** argv ) {
 	std::printf( "   Speculative       : %.2f tok/s (%.2fx)\n", s_tps, s_tps / g_tps );
 	std::printf( "   Acceptance        : %.1f%% (%d/%d), %.2f tokens/round\n",
 		proposed ? 100.0 * accepted / proposed : 0.0, accepted, proposed, rounds ? static_cast<double>( s_tok ) / rounds : 0.0 );
-	std::printf( "   Output            : token-identical to greedy\n" );
+	std::printf( "   Output            : %s\n", diverged ? "DIVERGED from greedy" : "token-identical to greedy" );
 	mc.shutdown();
-	return 0;
+	return diverged ? 1 : 0;
 }

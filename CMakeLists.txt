@@ -37,9 +37,12 @@ set(ENGINE_CORE_SOURCES
 	src/models/model.cpp
 	src/models/qwen38_27b.cu
 	src/models/glm53_flash.cu
-	src/spec/dflash.cu
+	src/spec/dflash_kernels.cu
+	src/spec/dflash_speculator.cu
+	src/spec/dflash_backbone.cu
 	src/runtime/kv_cache.cpp
 	src/runtime/cluster.cpp
+	src/runtime/dflash2_runner.cpp
 	src/runtime/generator.cpp
 	src/server/config.cpp
 	src/server/server.cpp
@@ -156,3 +159,21 @@ set_target_properties(test_coherence PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJ
 add_executable(volta_server src/server/main.cpp)
 target_link_libraries(volta_server PRIVATE engine_kernels pthread)
 set_target_properties(volta_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# Speculative-decoding losslessness precondition: M>1 verify forward vs M=1 greedy forward
+add_executable(test_spec_target_equiv tests/2_parity/test_spec_target_equiv.cpp)
+target_link_libraries(test_spec_target_equiv PRIVATE engine_kernels)
+set_target_properties(test_spec_target_equiv PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# DFlash2 backbone building blocks parity
+add_executable(test_dflash2_backbone tests/2_parity/test_dflash2_backbone.cpp)
+target_link_libraries(test_dflash2_backbone PRIVATE engine_kernels)
+
+add_executable(test_dflash2_blocks tests/2_parity/test_dflash2_blocks.cpp)
+target_link_libraries(test_dflash2_blocks PRIVATE engine_kernels)
+target_include_directories(test_dflash2_blocks PRIVATE src/kernels/trellis)
+set_target_properties(test_dflash2_blocks PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# DFlash2 Trellis weights against the unquantized BF16 checkpoint
+add_executable(test_dflash2_quant tests/2_parity/test_dflash2_quant.cpp)
+target_link_libraries(test_dflash2_quant PRIVATE engine_kernels)

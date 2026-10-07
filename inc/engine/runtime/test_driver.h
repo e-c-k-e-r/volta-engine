@@ -13,7 +13,16 @@
 namespace engine::runtime::test {
 
 static constexpr const char* QWEN_DIR = "/home/mrq/Documents/models/Qwen3.8-27B-exl3";
-static constexpr const char* QWEN_DRAFT_DIR = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw";
+static constexpr const char* QWEN_DRAFT_DIR_DEFAULT = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw";
+// Overridable so the unquantized drafter can be A/B'd against the quantized one without a rebuild:
+// load_linear falls back to a dense <base>.weight when no trellis group is present, so
+// QWEN_DRAFT_BF16_DIR drops straight into cfg.draft_model_dir.
+static const char* QWEN_DRAFT_DIR = std::getenv( "EXL3_DRAFT_DIR" )
+	? std::getenv( "EXL3_DRAFT_DIR" )
+	: QWEN_DRAFT_DIR_DEFAULT;
+// The same drafter before quantization: 81 BF16 tensors, `fc.weight` and the 35 block projections
+// unquantized. It is the ground truth the Trellis weights are checked against.
+static constexpr const char* QWEN_DRAFT_BF16_DIR = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2";
 static constexpr const char* GLM_DIR = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
 static constexpr const char* GLM_DRAFT_DIR = "/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2";
 
@@ -44,13 +53,11 @@ inline GenStats generate( ModelCluster& mc, const std::vector<int>& prompt, int 
 	st.prefill_ms = ms_since( t0 );
 	st.tokens.push_back( tok );
 	int pos = static_cast<int>( prompt.size() );
-	std::vector<int> context = prompt;
-	context.push_back( tok );
 
 	t0 = std::chrono::steady_clock::now();
 	while ( static_cast<int>( st.tokens.size() ) < max_new && !mc.is_eos( tok ) ) {
 		if ( speculative ) {
-			const SpecResult r = mc.speculate( slot, tok, pos, context );
+			const SpecResult r = mc.speculate( slot, tok, pos );
 			st.rounds++;
 			st.proposed += r.proposed;
 			st.accepted += r.accepted;
@@ -58,7 +65,6 @@ inline GenStats generate( ModelCluster& mc, const std::vector<int>& prompt, int 
 			for ( int i = 0; i < r.emitted_count && static_cast<int>( st.tokens.size() ) < max_new; ++i ) {
 				tok = r.emitted[i];
 				st.tokens.push_back( tok );
-				context.push_back( tok );
 				if ( mc.is_eos( tok ) ) break;
 			}
 		}
@@ -66,7 +72,6 @@ inline GenStats generate( ModelCluster& mc, const std::vector<int>& prompt, int 
 			mc.forward( &tok, 1, pos++, slot );
 			tok = mc.sample_one();
 			st.tokens.push_back( tok );
-			context.push_back( tok );
 		}
 	}
 	st.decode_ms = ms_since( t0 );

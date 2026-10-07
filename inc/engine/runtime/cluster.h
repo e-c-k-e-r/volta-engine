@@ -6,7 +6,8 @@
 #include "engine/core/batch.h"
 #include "engine/models/model.h"
 #include "engine/runtime/rank_pool.h"
-#include "engine/spec/dflash.h"
+#include "engine/runtime/dflash2_runner.h"
+#include <functional>
 #include <cuda_runtime.h>
 #include <memory>
 #include <string>
@@ -19,15 +20,6 @@ struct ClusterConfig {
 	std::string model_dir;
 	std::string draft_model_dir; // empty => no speculator
 	size_t arena_bytes = 0;      // 0 => per-model default
-};
-
-// Outcome of one speculative round on a single slot.
-struct SpecResult {
-	int proposed = 0;          // draft tokens submitted for verification
-	int accepted = 0;          // draft tokens matching the target
-	int emitted[pod::MAX_BATCH] = {}; // tokens committed this round (accepted drafts + correction/bonus)
-	int emitted_count = 0;
-	int next_pos = 0;          // position of the next anchor (== tokens committed to KV)
 };
 
 // TP=4 model instance: per-rank arenas, streams, NVLink mesh, pipelines and a persistent
@@ -50,6 +42,11 @@ public:
 
 	// Greedy argmax of the last forward's first `count` rows (rank 0).
 	void sample( int* out, int count );
+
+	// Full-vocabulary FP16 logits of the last forward's first `rows` rows, copied to host
+	// ([rows, vocab_size], row-major). Reassembles the TP shards when the LM head is sharded.
+	// Diagnostic / test path: synchronizes and issues per-row peer copies.
+	void read_logits( int rows, half* host_dst );
 	int sample_one();
 
 	// Pre-capture decode graphs for row counts 1..max_m (two dummy forwards each on `slot`,
@@ -60,28 +57,33 @@ public:
 	void checkpoint( int slot );
 	void rollback( int slot );
 
-	// One DFlash2 round: anchor forward at pos, K-token draft, batched verify, state repair.
-	// context = all committed tokens (prompt + generated, ending with `anchor`).
-	SpecResult speculate( int slot, int anchor, int pos, const std::vector<int>& context, float conf_threshold = 0.25f );
+	// Speculative decoding (DFlash2). The round itself lives in DFlash2Runner.
+	bool has_speculator() const { return runner_ != nullptr; }
+	DFlash2Runner& spec() { return *runner_; }
+	bool spec_owns( int slot ) const { return runner_ && runner_->owns( slot ); }
+	SpecResult speculate( int slot, int anchor, int pos, float depth_threshold = -1.0f ) {
+		return runner_->speculate( slot, anchor, pos, depth_threshold );
+	}
 
-	bool has_speculator() const { return has_spec_; }
+	// Runs fn( rank ) on every rank's pinned worker thread and waits for all of them.
+	void run_ranks( const std::function<void( int )>& fn ) { pool_.run( fn ); }
 	engine::models::ModelPipeline& model( int rank = 0 ) { return *models_[rank]; }
 	const engine::models::ModelMetadata& metadata() const { return models_[0]->get_metadata(); }
 	cudaStream_t stream( int rank ) const { return streams_[rank]; }
 	const pod::MemoryArena& arena( int rank ) const { return arenas_[rank]; }
+	pod::MemoryArena& arena( int rank ) { return arenas_[rank]; }
 	bool is_eos( int token ) const;
 
 private:
 	bool created_ = false;
 	bool initialized_ = false;
-	bool has_spec_ = false;
 	std::unique_ptr<engine::models::ModelPipeline> models_[ENGINE_NUM_GPUS];
 	pod::MemoryArena arenas_[ENGINE_NUM_GPUS];
 	engine::comm::CollectiveRing rings_[ENGINE_NUM_GPUS];
 	cudaStream_t streams_[ENGINE_NUM_GPUS] = {};
 	void* staging_ptrs_[ENGINE_NUM_GPUS] = {};
 	void* flag_ptrs_[ENGINE_NUM_GPUS] = {};
-	engine::spec::DFlashSpeculator speculator_;
+	std::unique_ptr<DFlash2Runner> runner_;
 	RankPool pool_;
 };
 
