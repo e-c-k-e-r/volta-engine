@@ -8,7 +8,7 @@ namespace pod {
 // Maximum rows of a decode / speculative forward: the sizes a CUDA graph is captured for.
 static constexpr int MAX_BATCH = 16;
 // Capacity of a BatchRows: a prefill chunk may run up to this many rows in one eager forward.
-static constexpr int MAX_ROWS = 256;
+static constexpr int MAX_ROWS = 512;
 
 // Per-row execution descriptor for a single forward pass, passed by value into kernels.
 //

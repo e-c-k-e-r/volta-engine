@@ -1,5 +1,6 @@
 #include "engine/modules/moe.h"
 #include "exl3_moe_kernel.cuh"
+#include "engine/core/batch.h"
 #include <cuda_fp16.h>
 #include <cmath>
 #include <vector>
@@ -107,7 +108,7 @@ __global__ void moe_dispatch_scatter_kernel(
 // Router scratch: split-K partial logits [row][k slice of 128][expert] handed from the dot-product kernel to the
 // selection kernel, which sums the slices in slice order (deterministic).
 #define ROUTER_MAX_KSLICES 32
-__device__ float g_router_partials[256 * ROUTER_MAX_KSLICES * 288];
+__device__ float g_router_partials[pod::MAX_ROWS * ROUTER_MAX_KSLICES * 288];
 
 __global__ __launch_bounds__( 32 )
 void router_logits_kernel(
@@ -323,7 +324,7 @@ void MoERouter::route_topk(
 	cudaStream_t stream,
 	int rows
 ) {
-	ENGINE_ASSERT( rows >= 1 && rows <= 256, "MoERouter::route_topk: rows out of range" );
+	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS, "MoERouter::route_topk: rows out of range" );
 	ENGINE_ASSERT( top_k <= 16 && num_experts <= 288 && hidden_size % 128 == 0, "MoERouter::route_topk: top_k / num_experts / hidden_size out of range" );
 	ENGINE_ASSERT( hidden_size / 128 <= ROUTER_MAX_KSLICES, "MoERouter::route_topk: hidden_size exceeds the router k slices" );
 	router_logits_kernel<<<dim3( ( num_experts + 31 ) / 32, rows, hidden_size / 128 ), dim3( 32 ), 0, stream>>>(

@@ -4,8 +4,8 @@
 
 namespace engine::comm {
 
-// One staging slot per (stage, rank). Sized for a 256-row prefill chunk at hidden 5120 (2.5 MiB); 16 slots per device.
-#define IPC_SLOT_BYTES ( 3 * 1024 * 1024 )
+// One staging slot per (stage, rank). Sized for a 512-row prefill chunk at hidden 5120 (5 MiB); 16 slots per device.
+#define IPC_SLOT_BYTES ( 6 * 1024 * 1024 )
 
 __device__ __forceinline__ uint32_t ldg_acquire_sys_u32( const uint32_t* p ) {
 	uint32_t v;
@@ -17,10 +17,10 @@ __device__ __forceinline__ void stg_release_sys_u32( uint32_t* p, uint32_t v ) {
 	asm volatile ( "st.global.release.sys.u32 [%0], %1;" :: "l"( p ), "r"( v ) : "memory" );
 }
 
-// Flag page layout (per rank, uint32 words): [stage(4)][row(256)][rank(4)] publish flags,
+// Flag page layout (per rank, uint32 words): [stage(4)][row(512)][rank(4)] publish flags,
 // then a device-resident sequence counter and a block-retire counter. Sequence numbers live
 // on the device so launches carry no host-incremented arguments and replay inside CUDA graphs.
-#define AR_MAX_ROWS 256
+#define AR_MAX_ROWS 512
 #define AR_SEQ_WORD ( 4 * AR_MAX_ROWS * 4 )
 #define AR_RETIRE_WORD ( AR_SEQ_WORD + 1 )
 

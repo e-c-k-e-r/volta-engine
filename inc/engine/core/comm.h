@@ -9,7 +9,7 @@
 namespace engine::comm {
 
 // Staging bytes per device the mesh needs: 16 slots (4 stages x 4 ranks) of 3 MiB.
-static constexpr size_t kMeshStagingBytes = 16 * 3 * 1024 * 1024;
+static constexpr size_t kMeshStagingBytes = 16 * 6 * 1024 * 1024;
 
 struct CollectiveRing {
 	int   rank;

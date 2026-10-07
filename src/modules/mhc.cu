@@ -1,4 +1,5 @@
 #include "engine/modules/mhc.h"
+#include "engine/core/batch.h"
 #include <cuda_fp16.h>
 #include <cmath>
 #include <type_traits>
@@ -11,7 +12,7 @@ namespace {
 #define NUM_THREADS_A 64
 
 // Per-row partial sums: up to MAX_ROWS rows x 64 chunks x (M + 1) values
-__device__ float g_mhc_partials[256 * 64 * 25];
+__device__ float g_mhc_partials[pod::MAX_ROWS * 64 * 25];
 
 __device__ __forceinline__ float sigmoidf_( float x ) {
 	return 1.0f / ( 1.0f + __expf( -x ) );
@@ -411,7 +412,7 @@ void HyperConnection::collapse(
 	cudaStream_t stream,
 	int rows
 ) {
-	ENGINE_ASSERT( rows >= 1 && rows <= 256, "HyperConnection::collapse: rows out of range" );
+	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS, "HyperConnection::collapse: rows out of range" );
 	const int H = 4;
 	const int row_len = H * hidden_size;
 	const int chunksA = 64;
