@@ -68,9 +68,16 @@ std::vector<Case> glm_cases() {
 	};
 }
 
-bool check( const char* tag, const Case& c, const std::vector<int>& got, const engine::loader::Tokenizer& tok ) {
-	const bool ok = c.probe ? true : ( got == c.golden );
+// EXL3_KV selects a quantized KV cache. The recorded goldens are FP16-KV greedy outputs, so a quantized cache is judged
+// by the expected answer in plain decoding and Mode B, and speculation must match greedy decoding in the same format.
+bool kv_quantized() {
+	const char* e = getenv( "EXL3_KV" );
+	return e != nullptr && std::strcmp( e, "fp16" ) != 0;
+}
+
+bool check( const char* tag, const Case& c, const std::vector<int>& got, const engine::loader::Tokenizer& tok, bool by_answer = false ) {
 	const std::string text = tok.decode( got );
+	const bool ok = c.probe ? true : ( by_answer ? text.find( c.expect ) != std::string::npos : got == c.golden );
 	std::printf( "    [%s] %s \"%s\"\n", tag, ok ? "PASS" : "FAIL", text.c_str() );
 	if ( !ok ) {
 		std::printf( "        got:    %s\n        golden: %s\n", test::format_tokens( got ).c_str(), test::format_tokens( c.golden ).c_str() );
@@ -123,7 +130,7 @@ int run_concurrent( ModelCluster& mc, const std::vector<Case>& cases, const engi
 	std::printf( "    [Mode B] %d slots, %d batched steps in %.1f ms\n", n, steps, test::ms_since( t0 ) );
 	int fail = 0;
 	for ( int i = 0; i < n; ++i ) {
-		fail += check( "Mode B", cases[i], out[i], tok ) ? 0 : 1;
+		fail += check( "Mode B", cases[i], out[i], tok, kv_quantized() ) ? 0 : 1;
 	}
 	return fail;
 }
@@ -141,13 +148,15 @@ int run_model( const char* type, const char* dir, const char* draft, const std::
 	tok.load( dir );
 
 	int fail = 0;
+	const bool kvq = kv_quantized();
 	for ( size_t i = 0; i < cases.size(); ++i ) {
-		const auto& c = cases[i];
+		Case c = cases[i];
 		std::printf( "[*] Prompt %zu: \"%s\"\n", i + 1, c.prompt );
 		const std::vector<int> ids = c.ids.empty() ? tok.encode( c.prompt, true ) : c.ids;
 		const int want = c.want_tokens ? c.want_tokens : static_cast<int>( c.golden.size() );
+		if ( kvq && spec && !c.probe ) c.golden = test::generate( mc, ids, want, false ).tokens;
 		const auto st = test::generate( mc, ids, want, spec );
-		fail += check( spec ? "spec" : "greedy", c, st.tokens, tok ) ? 0 : 1;
+		fail += check( spec ? "spec" : "greedy", c, st.tokens, tok, kvq && !spec ) ? 0 : 1;
 		std::printf( "        prefill %.1f ms | decode %.1f tok/s", st.prefill_ms, st.decode_tok_s() );
 		if ( spec ) {
 			std::printf( " | acceptance %d/%d over %d rounds", st.accepted, st.proposed, st.rounds );

@@ -51,8 +51,8 @@ int main() {
 		CUDA_CHECK( cudaMemcpy( g.data, hg.data(), qn * 2, cudaMemcpyHostToDevice ) );
 		const auto rows = pod::BatchRows::causal( c.rows, c.pos0, 0 );
 		CUDA_CHECK( cudaMemcpy( d_rows, &rows, sizeof( rows ), cudaMemcpyHostToDevice ) );
-		engine::modules::Attention::forward_decode( q, k_cache, v_cache, g, o_ref, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s );
-		engine::modules::Attention::forward_prefill( q, k_cache, v_cache, g, o_new, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s );
+		engine::modules::Attention::forward_decode( pod::kv_ref_f16( k_cache, v_cache ), q, g, o_ref, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s );
+		engine::modules::Attention::forward_prefill( pod::kv_ref_f16( k_cache, v_cache ), q, g, o_new, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s );
 		CUDA_CHECK( cudaStreamSynchronize( s ) );
 		std::vector<half> r1( qn ), r2( qn );
 		CUDA_CHECK( cudaMemcpy( r1.data(), o_ref.data, qn * 2, cudaMemcpyDeviceToHost ) );
@@ -71,11 +71,11 @@ int main() {
 		cudaEvent_t e0, e1;
 		CUDA_CHECK( cudaEventCreate( &e0 ) ); CUDA_CHECK( cudaEventCreate( &e1 ) );
 		CUDA_CHECK( cudaEventRecord( e0, s ) );
-		for ( int i = 0; i < 5; ++i ) engine::modules::Attention::forward_decode( q, k_cache, v_cache, g, o_ref, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s );
+		for ( int i = 0; i < 5; ++i ) engine::modules::Attention::forward_decode( pod::kv_ref_f16( k_cache, v_cache ), q, g, o_ref, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s );
 		CUDA_CHECK( cudaEventRecord( e1, s ) ); CUDA_CHECK( cudaEventSynchronize( e1 ) );
 		float t_dec = 0; CUDA_CHECK( cudaEventElapsedTime( &t_dec, e0, e1 ) );
 		CUDA_CHECK( cudaEventRecord( e0, s ) );
-		for ( int i = 0; i < 5; ++i ) engine::modules::Attention::forward_prefill( q, k_cache, v_cache, g, o_new, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s );
+		for ( int i = 0; i < 5; ++i ) engine::modules::Attention::forward_prefill( pod::kv_ref_f16( k_cache, v_cache ), q, g, o_new, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s );
 		CUDA_CHECK( cudaEventRecord( e1, s ) ); CUDA_CHECK( cudaEventSynchronize( e1 ) );
 		float t_pre = 0; CUDA_CHECK( cudaEventElapsedTime( &t_pre, e0, e1 ) );
 		std::printf( "  rows %3d at pos %4d: cos %.6f max|d| %.4g (max %.3g) | decode kernel %8.1f us  prefill kernel %8.1f us (%.1fx)  %s\n",

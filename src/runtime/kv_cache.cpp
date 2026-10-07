@@ -1,6 +1,8 @@
 #include "engine/runtime/kv_cache.h"
 #include <cuda_fp16.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace engine::runtime {
 
@@ -11,7 +13,8 @@ bool KVCachePool::init(
 	int max_seq_len_in,
 	int num_layers_in,
 	int num_heads_in,
-	int head_dim_in
+	int head_dim_in,
+	pod::KVFormat format_in
 ) {
 	CUDA_CHECK( cudaSetDevice( device_id ) );
 
@@ -21,67 +24,81 @@ bool KVCachePool::init(
 	num_heads = num_heads_in;
 	head_dim = head_dim_in;
 
-	size_t pos_stride_bytes = static_cast<size_t>( num_heads ) * head_dim * sizeof( half );
-	size_t layer_stride_bytes = static_cast<size_t>( max_seq_len ) * pos_stride_bytes;
-	slot_stride_bytes = static_cast<size_t>( num_layers ) * layer_stride_bytes;
+	format = format_in;
+	if ( const char* env = std::getenv( "EXL3_KV" ) ) {
+		if ( !std::strcmp( env, "fp8" ) ) format = pod::KVFormat::FP8;
+		else if ( !std::strcmp( env, "k8v4" ) ) format = pod::KVFormat::K8V4;
+		else if ( !std::strcmp( env, "nvfp4" ) ) format = pod::KVFormat::NVFP4;
+		else if ( !std::strcmp( env, "fp16" ) ) format = pod::KVFormat::FP16;
+	}
+	const pod::KVQ kq = pod::kv_k_quant( format ), vq = pod::kv_v_quant( format );
 
-	size_t total_bytes_per_pool = static_cast<size_t>( max_slots ) * slot_stride_bytes;
+	slot_stride_elems = static_cast<size_t>( num_layers ) * max_seq_len * num_heads * head_dim;
+	slot_stride_bytes = slot_stride_elems * sizeof( half );
+	k_slot_bytes = pod::kv_data_bytes( kq, slot_stride_elems );
+	v_slot_bytes = pod::kv_data_bytes( vq, slot_stride_elems );
+	k_scale_slot_bytes = pod::kv_scale_bytes( kq, slot_stride_elems );
+	v_scale_slot_bytes = pod::kv_scale_bytes( vq, slot_stride_elems );
 
-	k_data = engine::core::arena_alloc( arena, total_bytes_per_pool, 128 );
-	v_data = engine::core::arena_alloc( arena, total_bytes_per_pool, 128 );
-
-	if ( !k_data || !v_data ) {
+	k_data = engine::core::arena_alloc( arena, static_cast<size_t>( max_slots ) * k_slot_bytes, 128 );
+	v_data = engine::core::arena_alloc( arena, static_cast<size_t>( max_slots ) * v_slot_bytes, 128 );
+	if ( k_scale_slot_bytes ) k_scale = engine::core::arena_alloc( arena, static_cast<size_t>( max_slots ) * k_scale_slot_bytes, 128 );
+	if ( v_scale_slot_bytes ) v_scale = engine::core::arena_alloc( arena, static_cast<size_t>( max_slots ) * v_scale_slot_bytes, 128 );
+	if ( !k_data || !v_data || ( k_scale_slot_bytes && !k_scale ) || ( v_scale_slot_bytes && !v_scale ) ) {
 		return false;
 	}
 
-	CUDA_CHECK( cudaMemset( k_data, 0, total_bytes_per_pool ) );
-	CUDA_CHECK( cudaMemset( v_data, 0, total_bytes_per_pool ) );
-
+	CUDA_CHECK( cudaMemset( k_data, 0, static_cast<size_t>( max_slots ) * k_slot_bytes ) );
+	CUDA_CHECK( cudaMemset( v_data, 0, static_cast<size_t>( max_slots ) * v_slot_bytes ) );
+	if ( k_scale ) CUDA_CHECK( cudaMemset( k_scale, 0, static_cast<size_t>( max_slots ) * k_scale_slot_bytes ) );
+	if ( v_scale ) CUDA_CHECK( cudaMemset( v_scale, 0, static_cast<size_t>( max_slots ) * v_scale_slot_bytes ) );
 	return true;
 }
 
+pod::KVRef KVCachePool::ref() const {
+	pod::KVRef r;
+	r.k = k_data;
+	r.v = v_data;
+	r.ks = k_scale;
+	r.vs = v_scale;
+	r.kq = pod::kv_k_quant( format );
+	r.vq = pod::kv_v_quant( format );
+	return r;
+}
+
+// Base of the slot's tensors; only slot 0, layer 0, position 0 is meaningful for the quantized formats.
 void* KVCachePool::get_k_ptr( int slot_id, int layer_idx, int pos ) {
 	if ( !k_data || slot_id >= max_slots || layer_idx >= num_layers || pos >= max_seq_len ) {
 		return nullptr;
 	}
-
-	size_t pos_stride_bytes = static_cast<size_t>( num_heads ) * head_dim * sizeof( half );
-	size_t layer_stride_bytes = static_cast<size_t>( max_seq_len ) * pos_stride_bytes;
-	size_t offset = static_cast<size_t>( slot_id ) * slot_stride_bytes +
-		static_cast<size_t>( layer_idx ) * layer_stride_bytes +
-		static_cast<size_t>( pos ) * pos_stride_bytes;
-
-	return static_cast<char*>( k_data ) + offset;
+	ENGINE_ASSERT( format == pod::KVFormat::FP16 || ( slot_id == 0 && layer_idx == 0 && pos == 0 ), "KVCachePool::get_k_ptr: base pointer only" );
+	const size_t elem = static_cast<size_t>( slot_id ) * slot_stride_elems + ( static_cast<size_t>( layer_idx ) * max_seq_len + pos ) * num_heads * head_dim;
+	return static_cast<char*>( k_data ) + elem * sizeof( half );
 }
 
 void* KVCachePool::get_v_ptr( int slot_id, int layer_idx, int pos ) {
 	if ( !v_data || slot_id >= max_slots || layer_idx >= num_layers || pos >= max_seq_len ) {
 		return nullptr;
 	}
-
-	size_t pos_stride_bytes = static_cast<size_t>( num_heads ) * head_dim * sizeof( half );
-	size_t layer_stride_bytes = static_cast<size_t>( max_seq_len ) * pos_stride_bytes;
-	size_t offset = static_cast<size_t>( slot_id ) * slot_stride_bytes +
-		static_cast<size_t>( layer_idx ) * layer_stride_bytes +
-		static_cast<size_t>( pos ) * pos_stride_bytes;
-
-	return static_cast<char*>( v_data ) + offset;
+	ENGINE_ASSERT( format == pod::KVFormat::FP16 || ( slot_id == 0 && layer_idx == 0 && pos == 0 ), "KVCachePool::get_v_ptr: base pointer only" );
+	const size_t elem = static_cast<size_t>( slot_id ) * slot_stride_elems + ( static_cast<size_t>( layer_idx ) * max_seq_len + pos ) * num_heads * head_dim;
+	return static_cast<char*>( v_data ) + elem * sizeof( half );
 }
 
 void KVCachePool::reset_slot( int slot_id, cudaStream_t stream ) {
 	if ( !k_data || !v_data || slot_id >= max_slots ) {
 		return;
 	}
-
-	size_t offset = static_cast<size_t>( slot_id ) * slot_stride_bytes;
-	if ( stream ) {
-		CUDA_CHECK( cudaMemsetAsync( static_cast<char*>( k_data ) + offset, 0, slot_stride_bytes, stream ) );
-		CUDA_CHECK( cudaMemsetAsync( static_cast<char*>( v_data ) + offset, 0, slot_stride_bytes, stream ) );
-	}
-	else {
-		CUDA_CHECK( cudaMemset( static_cast<char*>( k_data ) + offset, 0, slot_stride_bytes ) );
-		CUDA_CHECK( cudaMemset( static_cast<char*>( v_data ) + offset, 0, slot_stride_bytes ) );
-	}
+	auto clear = [&]( void* base, size_t slot_bytes ) {
+		if ( !base || slot_bytes == 0 ) return;
+		char* p = static_cast<char*>( base ) + static_cast<size_t>( slot_id ) * slot_bytes;
+		if ( stream ) CUDA_CHECK( cudaMemsetAsync( p, 0, slot_bytes, stream ) );
+		else CUDA_CHECK( cudaMemset( p, 0, slot_bytes ) );
+	};
+	clear( k_data, k_slot_bytes );
+	clear( v_data, v_slot_bytes );
+	clear( k_scale, k_scale_slot_bytes );
+	clear( v_scale, v_scale_slot_bytes );
 }
 
 } // namespace engine::runtime

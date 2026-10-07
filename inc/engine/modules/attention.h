@@ -3,6 +3,7 @@
 #include "engine/config.h"
 #include "engine/core/tensor.h"
 #include "engine/core/batch.h"
+#include "engine/core/kv_format.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
@@ -22,9 +23,10 @@ struct Attention {
 		cudaStream_t stream = nullptr
 	);
 
+	// KV tensors are addressed through a KVRef (formats and scales in kv_format.h); element offsets and slot_stride are
+	// in elements whatever the format.
 	static void store_kv_cache(
-		half* k_cache,
-		half* v_cache,
+		const pod::KVRef& kv,
 		const pod::TensorView& k,
 		const pod::TensorView& v,
 		size_t slot_stride,
@@ -38,9 +40,8 @@ struct Attention {
 	);
 
 	static void forward_decode(
+		const pod::KVRef& kv,
 		const pod::TensorView& q,
-		const half* k_cache,
-		const half* v_cache,
 		const pod::TensorView& gate,
 		pod::TensorView& out,
 		size_t slot_stride,
@@ -57,9 +58,8 @@ struct Attention {
 	// Prefill form for chunks above the decode sizes (one slot, head_dim 256): K/V tiles are shared across queries.
 	// Same arguments and result as forward_decode.
 	static void forward_prefill(
+		const pod::KVRef& kv,
 		const pod::TensorView& q,
-		const half* k_cache,
-		const half* v_cache,
 		const pod::TensorView& gate,
 		pod::TensorView& out,
 		size_t slot_stride,

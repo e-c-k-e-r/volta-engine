@@ -1,4 +1,5 @@
 #include "engine/modules/attention.h"
+#include "kv_quant.cuh"
 #include <cuda_fp16.h>
 #include <cmath>
 #include <algorithm>
@@ -49,35 +50,50 @@ __global__ void unpack_q_gate_kernel(
 	gate[dst_offset] = q_gate[src_offset + head_dim + tid];
 }
 
-__global__ void store_kv_cache_kernel(
-	half* __restrict__ k_cache,
-	half* __restrict__ v_cache,
-	const half* __restrict__ k,
-	const half* __restrict__ v,
+// One thread quantizes one unit (element, 16- or 64-element group) of one row's K or V into its slot/layer/position.
+template <KVQ Q>
+__global__ void kv_store_kernel(
+	void* __restrict__ data,
+	void* __restrict__ scales,
+	const half* __restrict__ src,
 	size_t slot_stride,
 	int layer_idx,
 	const pod::BatchRows* __restrict__ rows,
 	int count,
-	int num_kv_heads,
-	int head_dim,
+	int total_elems,
 	int max_seq
 ) {
-	int tid = blockIdx.x * blockDim.x + threadIdx.x;
-	int total_elems = num_kv_heads * head_dim;
-	if ( tid < total_elems * count ) {
-		int m = tid / total_elems;
-		int elem = tid % total_elems;
-		size_t offset = static_cast<size_t>( rows->slot[m] ) * slot_stride
-			+ ( static_cast<size_t>( layer_idx ) * max_seq + rows->pos[m] ) * total_elems + elem;
-		k_cache[offset] = k[tid];
-		v_cache[offset] = v[tid];
-	}
+	constexpr int U = kv_unit<Q>();
+	const int units_per_row = total_elems / U;
+	const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( tid >= units_per_row * count ) return;
+	const int m = tid / units_per_row;
+	const int u = tid % units_per_row;
+	const size_t idx0 = static_cast<size_t>( rows->slot[m] ) * slot_stride
+		+ ( static_cast<size_t>( layer_idx ) * max_seq + rows->pos[m] ) * total_elems + static_cast<size_t>( u ) * U;
+	kv_store_unit<Q>( data, scales, idx0, src + static_cast<size_t>( m ) * total_elems + static_cast<size_t>( u ) * U );
 }
 
+// Block-wide orthonormal 64-point Walsh-Hadamard transform of one value per thread (blockDim a multiple of 64);
+// s holds blockDim floats. Its own inverse, used to undo the rotation applied to Q4 values on store.
+__device__ __forceinline__ float kv_fwht64_block( float v, int tid, float* s ) {
+	s[tid] = v;
+	__syncthreads();
+	for ( int h = 1; h < 64; h <<= 1 ) {
+		const float a = s[tid], b = s[tid ^ h];
+		__syncthreads();
+		s[tid] = ( tid & h ) ? b - a : a + b;
+		__syncthreads();
+	}
+	const float r = s[tid] * 0.125f;
+	__syncthreads();
+	return r;
+}
+
+template <KVQ KQ, KVQ VQ>
 __global__ void attn_chunked_paged_kernel(
 	const half* __restrict__ q,
-	const half* __restrict__ k_cache,
-	const half* __restrict__ v_cache,
+	const pod::KVRef kv,
 	const half* __restrict__ gate,
 	half* __restrict__ out,
 	float* __restrict__ workspace,
@@ -107,8 +123,7 @@ __global__ void attn_chunked_paged_kernel(
 	// the grid can be sized by max_seq and stay valid across positions (graph replay)
 	int cur_pos = rows->pos[row0 + m];
 	int total_tokens = min( cur_pos + 1, max_seq );
-	k_cache += static_cast<size_t>( rows->slot[row0 + m] ) * slot_stride;
-	v_cache += static_cast<size_t>( rows->slot[row0 + m] ) * slot_stride;
+	const size_t slot_off = static_cast<size_t>( rows->slot[row0 + m] ) * slot_stride;
 
 	int kv_start = chunk * chunk_len;
 	int kv_end = min( kv_start + chunk_len, total_tokens );
@@ -131,8 +146,8 @@ __global__ void attn_chunked_paged_kernel(
 
 	if ( kv_start < total_tokens ) {
 		for ( int t = kv_start; t < kv_end; ++t ) {
-			size_t kv_offset = ( static_cast<size_t>( layer_idx ) * max_seq + t ) * ( num_kv_heads * head_dim ) + kv_head * head_dim + tid;
-			float my_k = __half2float( k_cache[kv_offset] );
+			size_t kv_offset = slot_off + ( static_cast<size_t>( layer_idx ) * max_seq + t ) * ( num_kv_heads * head_dim ) + kv_head * head_dim + tid;
+			float my_k = kv_load1<KQ>( kv.k, kv.ks, kv_offset );
 			float dot = my_q * my_k;
 
 			#pragma unroll
@@ -157,7 +172,7 @@ __global__ void attn_chunked_paged_kernel(
 			}
 			__syncthreads();
 
-			float my_v = __half2float( v_cache[kv_offset] );
+			float my_v = kv_load1<VQ>( kv.v, kv.vs, kv_offset );
 			float score = s_score;
 
 			float m_new = fmaxf( m_reg, score );
@@ -171,13 +186,18 @@ __global__ void attn_chunked_paged_kernel(
 
 	if ( n_chunks == 1 ) {
 		float inv_l = ( l_reg > 0.0f ) ? ( 1.0f / l_reg ) : 0.0f;
+		float val = o_dim * inv_l;
+		if constexpr ( VQ == KVQ::Q4 ) {
+			__shared__ float s_rot[ATTN_MAX_HEAD_DIM];
+			val = kv_fwht64_block( val, tid, s_rot );
+		}
 		float sig = 1.0f;
 		if ( gate != nullptr ) {
 			size_t g_off = ( static_cast<size_t>( m ) * num_q_heads + head ) * head_dim + tid;
 			float g_val = __half2float( gate[g_off] );
 			sig = 1.0f / ( 1.0f + __expf( -g_val ) );
 		}
-		out_head[tid] = __float2half_rn( o_dim * inv_l * sig );
+		out_head[tid] = __float2half_rn( val * sig );
 	}
 	else {
 		float* ws = workspace + ( ( static_cast<size_t>( m ) * num_q_heads + head ) * n_chunks + chunk ) * ( ATTN_MAX_HEAD_DIM + 2 );
@@ -196,11 +216,11 @@ __global__ void attn_chunked_paged_kernel(
 // row-major within a kv head's group, so the 3 heads of a row share a block.
 #define PF_TILE 32
 #define PF_QPB 8
+template <KVQ KQ, KVQ VQ>
 __global__ __launch_bounds__( 256 )
 void attn_prefill_kernel(
 	const half* __restrict__ q,
-	const half* __restrict__ k_cache,
-	const half* __restrict__ v_cache,
+	const pod::KVRef kv,
 	const half* __restrict__ gate,
 	half* __restrict__ out,
 	size_t slot_stride,
@@ -257,8 +277,7 @@ void attn_prefill_kernel(
 	for ( int i = 0; i < 8; ++i ) o[i] = 0.0f;
 
 	const size_t kv_stride = static_cast<size_t>( num_kv_heads ) * HD;
-	const half* kbase = k_cache + slot_off + static_cast<size_t>( layer_idx ) * max_seq * kv_stride + static_cast<size_t>( kvh ) * HD;
-	const half* vbase = v_cache + slot_off + static_cast<size_t>( layer_idx ) * max_seq * kv_stride + static_cast<size_t>( kvh ) * HD;
+	const size_t kv_base = slot_off + static_cast<size_t>( layer_idx ) * max_seq * kv_stride + static_cast<size_t>( kvh ) * HD;
 
 	for ( int kb = 0; kb <= max_pos; kb += PF_TILE ) {
 		// Stage the tile: 32 keys x 512 B each for K and V (1024 uint4 apiece); keys past max_pos load as zero.
@@ -268,8 +287,16 @@ void attn_prefill_kernel(
 			const int key = kb + j;
 			uint4 kk = make_uint4( 0, 0, 0, 0 ), vv = make_uint4( 0, 0, 0, 0 );
 			if ( key <= max_pos ) {
-				kk = *reinterpret_cast<const uint4*>( kbase + static_cast<size_t>( key ) * kv_stride + c * 8 );
-				vv = *reinterpret_cast<const uint4*>( vbase + static_cast<size_t>( key ) * kv_stride + c * 8 );
+				const size_t at = kv_base + static_cast<size_t>( key ) * kv_stride + c * 8;
+				float f[8];
+				half2* o2 = reinterpret_cast<half2*>( &kk );
+				kv_load8<KQ>( kv.k, kv.ks, at, f );
+				#pragma unroll
+				for ( int i = 0; i < 4; ++i ) o2[i] = __floats2half2_rn( f[2 * i], f[2 * i + 1] );
+				o2 = reinterpret_cast<half2*>( &vv );
+				kv_load8<VQ>( kv.v, kv.vs, at, f );
+				#pragma unroll
+				for ( int i = 0; i < 4; ++i ) o2[i] = __floats2half2_rn( f[2 * i], f[2 * i + 1] );
 			}
 			*reinterpret_cast<uint4*>( sK + j * HD + c * 8 ) = kk;
 			*reinterpret_cast<uint4*>( sV + j * HD + c * 8 ) = vv;
@@ -322,6 +349,31 @@ void attn_prefill_kernel(
 		__syncthreads();
 	}
 
+	if constexpr ( VQ == KVQ::Q4 ) {
+		// Undo the per-64 rotation of V: bits 0..2 of an element index are the register, bits 3..5 the lane within its group of 8
+		#pragma unroll
+		for ( int h = 1; h < 8; h <<= 1 ) {
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) {
+				if ( ( i & h ) == 0 ) {
+					const float a = o[i], b = o[i | h];
+					o[i] = a + b;
+					o[i | h] = a - b;
+				}
+			}
+		}
+		#pragma unroll
+		for ( int h = 1; h < 8; h <<= 1 ) {
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) {
+				const float other = __shfl_xor_sync( 0xffffffff, o[i], h );
+				o[i] = ( lane & h ) ? other - o[i] : o[i] + other;
+			}
+		}
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) o[i] *= 0.125f;
+	}
+
 	if ( valid ) {
 		const float inv_l = ( l_run > 0.0f ) ? ( 1.0f / l_run ) : 0.0f;
 		const size_t off = ( static_cast<size_t>( row ) * num_q_heads + head ) * HD + lane * 8;
@@ -354,7 +406,8 @@ __global__ void attn_reduce_kernel(
 	const half* __restrict__ gate,
 	half* __restrict__ output,
 	int num_q_heads,
-	int n_chunks
+	int n_chunks,
+	int vrot
 ) {
 	const int token_idx = blockIdx.y;
 	const int q_head = blockIdx.x;
@@ -385,6 +438,11 @@ __global__ void attn_reduce_kernel(
 	}
 
 	float inv_l = ( l_acc > 0.0f ) ? ( 1.0f / l_acc ) : 0.0f;
+	float val = o_acc * inv_l;
+	if ( vrot ) {
+		__shared__ float s_rot[D];
+		val = kv_fwht64_block( val, tid, s_rot );
+	}
 	float sig = 1.0f;
 	if ( gate != nullptr ) {
 		size_t g_off = ( static_cast<size_t>( token_idx ) * num_q_heads + q_head ) * D + tid;
@@ -392,7 +450,7 @@ __global__ void attn_reduce_kernel(
 		sig = 1.0f / ( 1.0f + __expf( -g_val ) );
 	}
 	size_t out_off = ( static_cast<size_t>( token_idx ) * num_q_heads + q_head ) * D + tid;
-	output[out_off] = __float2half_rn( o_acc * inv_l * sig );
+	output[out_off] = __float2half_rn( val * sig );
 }
 
 } // namespace
@@ -418,9 +476,40 @@ void Attention::unpack_q_gate(
 	);
 }
 
+namespace {
+
+template <KVQ Q>
+void launch_kv_store( void* data, void* scales, const half* src, size_t slot_stride, int layer_idx,
+	const pod::BatchRows* d_rows, int count, int total_elems, int max_seq, cudaStream_t stream ) {
+	constexpr int U = kv_unit<Q>();
+	ENGINE_ASSERT( total_elems % U == 0, "KV store: row width must be a multiple of the quantization group" );
+	const int units = ( total_elems / U ) * count;
+	kv_store_kernel<Q><<<( units + 127 ) / 128, 128, 0, stream>>>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq );
+}
+
+void kv_store_dispatch( KVQ q, void* data, void* scales, const half* src, size_t slot_stride, int layer_idx,
+	const pod::BatchRows* d_rows, int count, int total_elems, int max_seq, cudaStream_t stream ) {
+	switch ( q ) {
+		case KVQ::F16: launch_kv_store<KVQ::F16>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream ); break;
+		case KVQ::E5M2: launch_kv_store<KVQ::E5M2>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream ); break;
+		case KVQ::I8: launch_kv_store<KVQ::I8>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream ); break;
+		case KVQ::Q4: launch_kv_store<KVQ::Q4>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream ); break;
+		case KVQ::FP4: launch_kv_store<KVQ::FP4>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream ); break;
+	}
+}
+
+// Instantiated combinations: (F16, F16), (E5M2, E5M2), (I8, Q4), (FP4, FP4)
+#define KV_DISPATCH( KQV, VQV, CALL ) \
+	if ( kv.kq == KVQ::F16 && kv.vq == KVQ::F16 ) { constexpr KVQ KQV = KVQ::F16; constexpr KVQ VQV = KVQ::F16; CALL; } \
+	else if ( kv.kq == KVQ::E5M2 && kv.vq == KVQ::E5M2 ) { constexpr KVQ KQV = KVQ::E5M2; constexpr KVQ VQV = KVQ::E5M2; CALL; } \
+	else if ( kv.kq == KVQ::I8 && kv.vq == KVQ::Q4 ) { constexpr KVQ KQV = KVQ::I8; constexpr KVQ VQV = KVQ::Q4; CALL; } \
+	else if ( kv.kq == KVQ::FP4 && kv.vq == KVQ::FP4 ) { constexpr KVQ KQV = KVQ::FP4; constexpr KVQ VQV = KVQ::FP4; CALL; } \
+	else { ENGINE_ASSERT( false, "Attention: unsupported KV format pair" ); }
+
+} // namespace
+
 void Attention::store_kv_cache(
-	half* k_cache,
-	half* v_cache,
+	const pod::KVRef& kv,
 	const pod::TensorView& k,
 	const pod::TensorView& v,
 	size_t slot_stride,
@@ -432,29 +521,14 @@ void Attention::store_kv_cache(
 	int max_seq,
 	cudaStream_t stream
 ) {
-	int total_elems = num_kv_heads * head_dim;
-	int total_work = total_elems * count;
-	int threads = 256;
-	int blocks = ( total_work + threads - 1 ) / threads;
-	store_kv_cache_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
-		k_cache,
-		v_cache,
-		k.ptr<const half>(),
-		v.ptr<const half>(),
-		slot_stride,
-		layer_idx,
-		d_rows,
-		count,
-		num_kv_heads,
-		head_dim,
-		max_seq
-	);
+	const int total_elems = num_kv_heads * head_dim;
+	kv_store_dispatch( kv.kq, kv.k, kv.ks, k.ptr<const half>(), slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream );
+	kv_store_dispatch( kv.vq, kv.v, kv.vs, v.ptr<const half>(), slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream );
 }
 
 void Attention::forward_decode(
+	const pod::KVRef& kv,
 	const pod::TensorView& q,
-	const half* k_cache,
-	const half* v_cache,
 	const pod::TensorView& gate,
 	pod::TensorView& out,
 	size_t slot_stride,
@@ -477,29 +551,36 @@ void Attention::forward_decode(
 	float* workspace = attn_workspace_ptr();
 	const half* gate_ptr = gate.data != nullptr ? gate.ptr<const half>() : nullptr;
 	const size_t row_elems = static_cast<size_t>( num_q_heads ) * head_dim;
+	ENGINE_ASSERT( kv.vq != KVQ::Q4 || head_dim % 64 == 0, "Attention::forward_decode: Q4 values need head_dim % 64 == 0" );
+	const int vrot = kv.vq == KVQ::Q4 ? 1 : 0;
 
 	// The partial-result workspace holds MAX_BATCH rows; larger counts (a GLM prefill chunk) run in row batches
 	for ( int row0 = 0; row0 < count; row0 += pod::MAX_BATCH ) {
 		const int M = MIN( pod::MAX_BATCH, count - row0 );
 		const half* g = gate_ptr ? gate_ptr + row0 * row_elems : nullptr;
 		half* o = out.ptr<half>() + row0 * row_elems;
-		attn_chunked_paged_kernel<<<dim3( num_q_heads, M, n_chunks ), dim3( head_dim ), 0, stream>>>(
-			q.ptr<const half>() + row0 * row_elems, k_cache, v_cache, g, o, workspace, slot_stride, layer_idx, d_rows,
-			num_q_heads, num_kv_heads, head_dim, max_seq, n_chunks, chunk_len, row0, scale );
+		#define LAUNCH_DECODE() attn_chunked_paged_kernel<KQ_, VQ_><<<dim3( num_q_heads, M, n_chunks ), dim3( head_dim ), 0, stream>>>( \
+			q.ptr<const half>() + row0 * row_elems, kv, g, o, workspace, slot_stride, layer_idx, d_rows, \
+			num_q_heads, num_kv_heads, head_dim, max_seq, n_chunks, chunk_len, row0, scale )
+		#define KQ_ KQV_
+		#define VQ_ VQV_
+		KV_DISPATCH( KQV_, VQV_, LAUNCH_DECODE() )
+		#undef KQ_
+		#undef VQ_
+		#undef LAUNCH_DECODE
 		if ( n_chunks > 1 ) {
 			const dim3 red_grid( num_q_heads, M );
 			const dim3 red_block( head_dim );
-			if ( head_dim == 256 ) attn_reduce_kernel<256><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks );
-			else if ( head_dim == 128 ) attn_reduce_kernel<128><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks );
-			else attn_reduce_kernel<64><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks );
+			if ( head_dim == 256 ) attn_reduce_kernel<256><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks, vrot );
+			else if ( head_dim == 128 ) attn_reduce_kernel<128><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks, vrot );
+			else attn_reduce_kernel<64><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks, vrot );
 		}
 	}
 }
 
 void Attention::forward_prefill(
+	const pod::KVRef& kv,
 	const pod::TensorView& q,
-	const half* k_cache,
-	const half* v_cache,
 	const pod::TensorView& gate,
 	pod::TensorView& out,
 	size_t slot_stride,
@@ -515,10 +596,16 @@ void Attention::forward_prefill(
 	ENGINE_ASSERT( head_dim == 256 && num_q_heads % num_kv_heads == 0, "Attention::forward_prefill: head_dim 256 and GQA only" );
 	const float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
 	const int G = num_q_heads / num_kv_heads;
-	dim3 grid( num_kv_heads, ( count * G + PF_QPB - 1 ) / PF_QPB );
-	attn_prefill_kernel<<<grid, 256, 0, stream>>>(
-		q.ptr<const half>(), k_cache, v_cache, gate.data != nullptr ? gate.ptr<const half>() : nullptr, out.ptr<half>(),
-		slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, max_seq, scale );
+	const dim3 grid( num_kv_heads, ( count * G + PF_QPB - 1 ) / PF_QPB );
+	const half* gate_ptr = gate.data != nullptr ? gate.ptr<const half>() : nullptr;
+	#define LAUNCH_PREFILL() attn_prefill_kernel<KQ_, VQ_><<<grid, 256, 0, stream>>>( \
+		q.ptr<const half>(), kv, gate_ptr, out.ptr<half>(), slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, max_seq, scale )
+	#define KQ_ KQV_
+	#define VQ_ VQV_
+	KV_DISPATCH( KQV_, VQV_, LAUNCH_PREFILL() )
+	#undef KQ_
+	#undef VQ_
+	#undef LAUNCH_PREFILL
 }
 
 } // namespace engine::modules

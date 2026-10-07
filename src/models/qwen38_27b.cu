@@ -548,9 +548,8 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) 
 }
 
 void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
-	half* slot_k = static_cast<half*>( kv_pool_.get_k_ptr( 0, 0, 0 ) );
-	half* slot_v = static_cast<half*>( kv_pool_.get_v_ptr( 0, 0, 0 ) );
-	const size_t kv_slot_stride = kv_pool_.slot_stride_bytes / sizeof( half );
+	const pod::KVRef kv = kv_pool_.ref();
+	const size_t kv_slot_stride = kv_pool_.slot_stride_elems;
 
 	int full_attn_idx = 0;
 	int linear_idx = 0;
@@ -609,7 +608,7 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 
 			// Store K and V to KV Cache
 			engine::modules::Attention::store_kv_cache(
-				slot_k, slot_v,
+				kv,
 				k_buf_, v_buf_,
 				kv_slot_stride, full_attn_idx, d_rows_, m,
 				kv_heads, config_.full_head_dim,
@@ -620,7 +619,7 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 			if ( m > pod::MAX_BATCH && config_.full_head_dim == 256 ) {
 				// Prefill chunk: tiled kernel that shares K/V tiles across queries.
 				engine::modules::Attention::forward_prefill(
-					q_buf_, slot_k, slot_v, gate_attn_buf_,
+					kv, q_buf_, gate_attn_buf_,
 					attn_out_,
 					kv_slot_stride, full_attn_idx, d_rows_, m,
 					q_heads, kv_heads,
@@ -629,7 +628,7 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 			}
 			else {
 				engine::modules::Attention::forward_decode(
-					q_buf_, slot_k, slot_v, gate_attn_buf_,
+					kv, q_buf_, gate_attn_buf_,
 					attn_out_,
 					kv_slot_stride, full_attn_idx, d_rows_, m,
 					q_heads, kv_heads,

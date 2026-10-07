@@ -723,9 +723,8 @@ void GLM53Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) {
 
 void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 	// Slot-0 base pointers; slot and position of each row are resolved on device from d_rows_
-	half* slot_k = static_cast<half*>( kv_pool_.get_k_ptr( 0, 0, 0 ) );
-	half* slot_v = static_cast<half*>( kv_pool_.get_v_ptr( 0, 0, 0 ) );
-	const size_t kv_slot_stride = kv_pool_.slot_stride_bytes / sizeof( half );
+	const pod::KVRef kv = kv_pool_.ref();
+	const size_t kv_slot_stride = kv_pool_.slot_stride_elems;
 	const pod::SlotRef kv_ref{ d_rows_, 0, kv_slot_stride };
 	const size_t slot_kda_floats = state_.slot_kda_floats;
 	const size_t slot_conv_floats = state_.slot_conv_floats;
@@ -849,12 +848,12 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 
 			// Store every row's K/V first, then attend: row r reads positions 0..pos[r] of its slot
 			engine::modules::MLA::store_kv_cache(
-				slot_k, slot_v, k_head_buf_, v_head_buf_,
+				kv, k_head_buf_, v_head_buf_,
 				mla_idx, 0, 4096, config_.max_seq, stream, kv_ref, m
 			);
 
 			engine::modules::MLA::forward_decode(
-				q_buf_, slot_k, slot_v, mla_heads_out_,
+				q_buf_, kv, mla_heads_out_,
 				mla_idx, 0, 16, 256, config_.max_seq, stream, kv_ref, m
 			);
 

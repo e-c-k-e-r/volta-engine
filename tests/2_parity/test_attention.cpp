@@ -102,12 +102,12 @@ int main() {
 			const auto rows = pod::BatchRows::causal( 1, pos, 0 );
 			CUDA_CHECK( cudaMemcpyAsync( d_rows, &rows, sizeof( rows ), cudaMemcpyHostToDevice, stream ) );
 			engine::modules::Attention::store_kv_cache(
-				d_k_cache, d_v_cache, d_k, d_v, 0, 0, d_rows, 1, cfg.kv_heads, cfg.head_dim, cfg.max_seq, stream
+				pod::kv_ref_f16( d_k_cache, d_v_cache ), d_k, d_v, 0, 0, d_rows, 1, cfg.kv_heads, cfg.head_dim, cfg.max_seq, stream
 			);
 
 			// Forward decode
 			engine::modules::Attention::forward_decode(
-				d_q, d_k_cache, d_v_cache, d_gate, d_out, 0, 0, d_rows, 1, cfg.q_heads, cfg.kv_heads, cfg.head_dim, cfg.max_seq, stream
+				pod::kv_ref_f16( d_k_cache, d_v_cache ), d_q, d_gate, d_out, 0, 0, d_rows, 1, cfg.q_heads, cfg.kv_heads, cfg.head_dim, cfg.max_seq, stream
 			);
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 			if ( pos >= 32 && pos % 37 != 0 && pos != steps - 1 ) continue;

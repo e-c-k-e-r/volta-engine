@@ -229,3 +229,7 @@ set_target_properties(test_longctx PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJEC
 add_executable(test_nvfp4_linear tests/2_parity/test_nvfp4_linear.cpp)
 target_link_libraries(test_nvfp4_linear PRIVATE engine_kernels)
 set_target_properties(test_nvfp4_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_kv_quant tests/2_parity/test_kv_quant.cpp)
+target_link_libraries(test_kv_quant PRIVATE engine_kernels)
+set_target_properties(test_kv_quant PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

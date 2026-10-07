@@ -74,12 +74,12 @@ int main() {
 
 		// Store K, V to MLA cache
 		engine::modules::MLA::store_kv_cache(
-			d_k_cache, d_v_cache, d_k, d_v, 0, pos, total_elems, max_seq, stream
+			pod::kv_ref_f16( d_k_cache, d_v_cache ), d_k, d_v, 0, pos, total_elems, max_seq, stream
 		);
 
 		// Forward decode
 		engine::modules::MLA::forward_decode(
-			d_q, d_k_cache, d_v_cache, d_out, 0, pos, num_heads, head_dim, max_seq, stream
+			d_q, pod::kv_ref_f16( d_k_cache, d_v_cache ), d_out, 0, pos, num_heads, head_dim, max_seq, stream
 		);
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 

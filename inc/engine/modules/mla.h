@@ -3,6 +3,7 @@
 #include "engine/config.h"
 #include "engine/core/tensor.h"
 #include "engine/core/batch.h"
+#include "engine/core/kv_format.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -52,9 +53,9 @@ struct MLA {
 		int rows = 1                    // kv_norm [rows, 512] -> k/v [rows, heads * head_dim]
 	);
 
+	// Requires slot.rows (positions and slots are read on the device); K/V formats per the KVRef.
 	static void store_kv_cache(
-		half* k_cache,
-		half* v_cache,
+		const pod::KVRef& kv,
 		const pod::TensorView& k,
 		const pod::TensorView& v,
 		int mla_layer_idx,
@@ -68,8 +69,7 @@ struct MLA {
 
 	static void forward_decode(
 		const pod::TensorView& q,
-		const half* k_cache,
-		const half* v_cache,
+		const pod::KVRef& kv,
 		pod::TensorView& out,
 		int mla_layer_idx,
 		int pos,

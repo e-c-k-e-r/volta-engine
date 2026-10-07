@@ -389,8 +389,7 @@ void MLA::project_kv_b(
 }
 
 void MLA::store_kv_cache(
-	half* k_cache,
-	half* v_cache,
+	const pod::KVRef& kv,
 	const pod::TensorView& k,
 	const pod::TensorView& v,
 	int mla_layer_idx,
@@ -401,11 +400,19 @@ void MLA::store_kv_cache(
 	const pod::SlotRef& slot,
 	int rows
 ) {
+	if ( slot.rows ) {
+		// Device-resolved positions: the shared quantizing store (FP16 included)
+		ENGINE_ASSERT( slot.row == 0, "MLA::store_kv_cache: row offset unsupported" );
+		const int num_heads = total_elems / 256;
+		Attention::store_kv_cache( kv, k, v, slot.stride, mla_layer_idx, slot.rows, rows, num_heads, 256, max_seq, stream );
+		return;
+	}
+	ENGINE_ASSERT( kv.kq == pod::KVQ::F16 && kv.vq == pod::KVQ::F16, "MLA::store_kv_cache: quantized formats need device-resolved positions" );
 	int threads = 256;
 	int blocks = ( total_elems + threads - 1 ) / threads;
 	mla_store_kv_cache_kernel<<<dim3( blocks, rows ), dim3( threads ), 0, stream>>>(
-		k_cache,
-		v_cache,
+		static_cast<half*>( kv.k ),
+		static_cast<half*>( kv.v ),
 		k.ptr<const half>(),
 		v.ptr<const half>(),
 		mla_layer_idx,
@@ -418,8 +425,7 @@ void MLA::store_kv_cache(
 
 void MLA::forward_decode(
 	const pod::TensorView& q,
-	const half* k_cache,
-	const half* v_cache,
+	const pod::KVRef& kv,
 	pod::TensorView& out,
 	int mla_layer_idx,
 	int pos,
@@ -435,10 +441,13 @@ void MLA::forward_decode(
 	if ( slot.rows ) {
 		ENGINE_ASSERT( slot.row == 0, "MLA::forward_decode: row offset unsupported" );
 		pod::TensorView no_gate{};
-		Attention::forward_decode( q, k_cache, v_cache, no_gate, out, slot.stride, mla_layer_idx, slot.rows, rows,
+		Attention::forward_decode( kv, q, no_gate, out, slot.stride, mla_layer_idx, slot.rows, rows,
 			num_heads, num_heads, head_dim, max_seq, stream );
 		return;
 	}
+	ENGINE_ASSERT( kv.kq == pod::KVQ::F16 && kv.vq == pod::KVQ::F16, "MLA::forward_decode: quantized formats need device-resolved positions" );
+	const half* k_cache = static_cast<const half*>( kv.k );
+	const half* v_cache = static_cast<const half*>( kv.v );
 	// Device-resolved position (slot.rows set): size scores for the full window so the
 	// launch is position-independent; otherwise size for the host-provided position
 	int num_tokens = slot.rows ? max_seq : MIN( pos + 1, max_seq );
