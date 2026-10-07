@@ -28,6 +28,10 @@ __global__ void project_gates_kernel(
 	int head = blockIdx.x;
 	int tid = threadIdx.x;
 	if ( head >= num_v_heads ) return;
+	// Rows ride blockIdx.y: row r reads norm_hidden[r] and writes gate/beta[r].
+	norm_hidden += static_cast<size_t>( blockIdx.y ) * hidden_size;
+	gate_out += static_cast<size_t>( blockIdx.y ) * num_v_heads;
+	beta_out += static_cast<size_t>( blockIdx.y ) * num_v_heads;
 
 	const half* a_row = in_proj_a + head * hidden_size;
 	const half* b_row = in_proj_b + head * hidden_size;
@@ -121,17 +125,79 @@ __global__ void causal_conv1d_silu_kernel(
 	}
 }
 
+// Multi-row conv: one thread per channel walks the rows in order, keeping the 3-tap history in
+// registers across consecutive rows of the same slot (same arithmetic as the single-row kernel).
+__global__ void causal_conv1d_silu_rows_kernel(
+	half* __restrict__ qkv,
+	float* __restrict__ history,
+	const half* __restrict__ weights,
+	int channels,
+	int rows,
+	const pod::BatchRows* __restrict__ d_rows,
+	size_t slot_stride,
+	float* __restrict__ snap,
+	size_t snap_stride,
+	int snap_rows,
+	const int* __restrict__ snap_on
+) {
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( c >= channels ) return;
+
+	float w0 = ( weights != nullptr ) ? __half2float( weights[c * 4 + 0] ) : 0.0f;
+	float w1 = ( weights != nullptr ) ? __half2float( weights[c * 4 + 1] ) : 0.0f;
+	float w2 = ( weights != nullptr ) ? __half2float( weights[c * 4 + 2] ) : 0.0f;
+	float w3 = ( weights != nullptr ) ? __half2float( weights[c * 4 + 3] ) : 1.0f;
+	const bool do_snap = snap && *snap_on;
+
+	int cur = -1;
+	float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f;
+	for ( int m = 0; m < rows; ++m ) {
+		const int slot = d_rows->slot[m];
+		if ( slot != cur ) {
+			if ( cur >= 0 ) {
+				float* h = history + static_cast<size_t>( cur ) * slot_stride;
+				h[c * 3 + 0] = v0;
+				h[c * 3 + 1] = v1;
+				h[c * 3 + 2] = v2;
+			}
+			const float* h = history + static_cast<size_t>( slot ) * slot_stride;
+			v0 = h[c * 3 + 0];
+			v1 = h[c * 3 + 1];
+			v2 = h[c * 3 + 2];
+			cur = slot;
+		}
+		float in_val = __half2float( qkv[static_cast<size_t>( m ) * channels + c] );
+		float sum = v0 * w0 + v1 * w1 + v2 * w2 + in_val * w3;
+		float silu = sum / ( 1.0f + __expf( -sum ) );
+		qkv[static_cast<size_t>( m ) * channels + c] = __float2half_rn( silu );
+		v0 = v1;
+		v1 = v2;
+		v2 = in_val;
+		if ( do_snap && m < snap_rows ) {
+			float* sp = snap + m * snap_stride;
+			sp[c * 3 + 0] = v0;
+			sp[c * 3 + 1] = v1;
+			sp[c * 3 + 2] = v2;
+		}
+	}
+	float* h = history + static_cast<size_t>( cur ) * slot_stride;
+	h[c * 3 + 0] = v0;
+	h[c * 3 + 1] = v1;
+	h[c * 3 + 2] = v2;
+}
+
 __global__ void l2_norm_heads_kernel(
 	half* __restrict__ qkv,
 	int num_k_heads,
 	int head_dim,
-	bool scale_q
+	bool scale_q,
+	size_t row_stride
 ) {
 	int block = blockIdx.x; // 0 .. num_k_heads * 2 - 1
 	int tid = threadIdx.x;
 	if ( tid >= head_dim ) return;
 
-	half* ptr = qkv + block * head_dim;
+	half* ptr = qkv + blockIdx.y * row_stride + block * head_dim;
 	float val = __half2float( ptr[tid] );
 	float sq = val * val;
 
@@ -233,6 +299,101 @@ recurrent_step_kernel(
 	}
 }
 
+// Multi-row recurrence: the 128x128 per-head state stays in registers across consecutive rows of the
+// same slot and touches memory once per slot run instead of once per row. Per-row arithmetic is that of
+// recurrent_step_kernel.
+__global__ void __launch_bounds__( 128, 2 )
+recurrent_step_rows_kernel(
+	float* __restrict__ state,
+	const half* __restrict__ qkv,
+	const float* __restrict__ gate,
+	const float* __restrict__ beta,
+	half* __restrict__ output,
+	int h_k,
+	int h_v,
+	float scale,
+	int rows,
+	const pod::BatchRows* __restrict__ d_rows,
+	size_t slot_stride,
+	float* __restrict__ snap,
+	size_t snap_stride,
+	int snap_rows,
+	const int* __restrict__ snap_on
+) {
+	const int head = blockIdx.x;
+	const int lane = threadIdx.x;
+	const int col = blockIdx.z * blockDim.y + threadIdx.y;
+	const int q_head = head / ( h_v / h_k );
+	const size_t qkv_stride = static_cast<size_t>( 2 * h_k + h_v ) * 128;
+	const bool do_snap = snap && *snap_on;
+
+	float s_shard[4] = {};
+	int cur = -1;
+	for ( int m = 0; m < rows; ++m ) {
+		const int slot = d_rows->slot[m];
+		if ( slot != cur ) {
+			if ( cur >= 0 ) {
+				float* st = state + static_cast<size_t>( cur ) * slot_stride;
+				#pragma unroll
+				for ( int r = 0; r < 4; ++r ) {
+					st[( size_t( head ) * 128 + r * 32 + lane ) * 128 + col] = s_shard[r];
+				}
+			}
+			const float* st = state + static_cast<size_t>( slot ) * slot_stride;
+			#pragma unroll
+			for ( int r = 0; r < 4; ++r ) {
+				s_shard[r] = st[( size_t( head ) * 128 + r * 32 + lane ) * 128 + col];
+			}
+			cur = slot;
+		}
+
+		const half* q_ptr = qkv + m * qkv_stride + q_head * 128;
+		const half* k_ptr = qkv + m * qkv_stride + h_k * 128 + q_head * 128;
+		const half* v_ptr = qkv + m * qkv_stride + 2 * h_k * 128 + head * 128;
+		float k_reg[4], q_reg[4];
+		#pragma unroll
+		for ( int r = 0; r < 4; ++r ) {
+			const int i = r * 32 + lane;
+			k_reg[r] = __half2float( k_ptr[i] );
+			q_reg[r] = __half2float( q_ptr[i] );
+		}
+
+		const float g_val = expf( gate[m * h_v + head] );
+		float kv_shard = 0.0f;
+		#pragma unroll
+		for ( int r = 0; r < 4; ++r ) {
+			kv_shard += s_shard[r] * k_reg[r];
+		}
+		const float kv_col = warp_sum( kv_shard );
+		const float v_val = __half2float( v_ptr[col] );
+		const float delta_col = ( v_val - g_val * kv_col ) * beta[m * h_v + head];
+
+		float attn_partial = 0.0f;
+		#pragma unroll
+		for ( int r = 0; r < 4; ++r ) {
+			s_shard[r] = g_val * s_shard[r] + k_reg[r] * delta_col;
+			attn_partial += s_shard[r] * q_reg[r];
+		}
+		const float attn_col = warp_sum( attn_partial );
+
+		if ( lane == 0 ) {
+			output[m * static_cast<size_t>( h_v ) * 128 + head * 128 + col] = __float2half_rn( attn_col * scale );
+		}
+		if ( do_snap && m < snap_rows ) {
+			float* sp = snap + m * snap_stride;
+			#pragma unroll
+			for ( int r = 0; r < 4; ++r ) {
+				sp[( size_t( head ) * 128 + r * 32 + lane ) * 128 + col] = s_shard[r];
+			}
+		}
+	}
+	float* st = state + static_cast<size_t>( cur ) * slot_stride;
+	#pragma unroll
+	for ( int r = 0; r < 4; ++r ) {
+		st[( size_t( head ) * 128 + r * 32 + lane ) * 128 + col] = s_shard[r];
+	}
+}
+
 __global__ void gated_rmsnorm_kernel(
 	half* __restrict__ attn_out,
 	const half* __restrict__ z,
@@ -244,6 +405,10 @@ __global__ void gated_rmsnorm_kernel(
 	int head = blockIdx.x;
 	int tid = threadIdx.x;
 	if ( head >= num_v_heads || tid >= head_dim ) return;
+	// Rows ride blockIdx.y with a packed [rows, num_v_heads * head_dim] layout for attn_out and z.
+	const size_t row_off = static_cast<size_t>( blockIdx.y ) * num_v_heads * head_dim;
+	attn_out += row_off;
+	if ( z != nullptr ) z += row_off;
 
 	half* head_out = attn_out + head * head_dim;
 	float val = __half2float( head_out[tid] );
@@ -584,9 +749,10 @@ void GDN::project_gates(
 	pod::TensorView& beta_out,
 	int num_v_heads,
 	int hidden_size,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
-	project_gates_kernel<<<dim3( num_v_heads ), dim3( 256 ), 0, stream>>>(
+	project_gates_kernel<<<dim3( num_v_heads, rows ), dim3( 256 ), 0, stream>>>(
 		norm_hidden.ptr<const half>(),
 		in_proj_a.ptr<const half>(),
 		in_proj_b.ptr<const half>(),
@@ -627,14 +793,17 @@ void GDN::l2_norm_heads(
 	int num_k_heads,
 	int head_dim,
 	cudaStream_t stream,
-	bool scale_q
+	bool scale_q,
+	int rows,
+	size_t row_stride
 ) {
 	int total_blocks = num_k_heads * 2;
-	l2_norm_heads_kernel<<<dim3( total_blocks ), dim3( head_dim ), 0, stream>>>(
+	l2_norm_heads_kernel<<<dim3( total_blocks, rows ), dim3( head_dim ), 0, stream>>>(
 		qkv.ptr<half>(),
 		num_k_heads,
 		head_dim,
-		scale_q
+		scale_q,
+		row_stride
 	);
 }
 
@@ -699,6 +868,53 @@ void GDN::recurrent_step(
 			);
 		}
 	}
+}
+
+void GDN::causal_conv1d_silu_rows(
+	pod::TensorView& qkv,
+	float* history,
+	const pod::TensorView& conv_weights,
+	int channels,
+	int rows,
+	const pod::BatchRows* d_rows,
+	size_t slot_stride,
+	float* snap,
+	size_t snap_stride,
+	int snap_rows,
+	const int* snap_on,
+	cudaStream_t stream
+) {
+	int threads = 256;
+	int blocks = ( channels + threads - 1 ) / threads;
+	causal_conv1d_silu_rows_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
+		qkv.ptr<half>(), history, conv_weights.ptr<const half>(), channels, rows, d_rows, slot_stride,
+		snap, snap_stride, snap_rows, snap_on
+	);
+}
+
+void GDN::recurrent_step_rows(
+	float* gdn_state,
+	const pod::TensorView& qkv,
+	const pod::TensorView& gate,
+	const pod::TensorView& beta,
+	pod::TensorView& attn_out,
+	int num_k_heads,
+	int num_v_heads,
+	int head_dim,
+	int rows,
+	const pod::BatchRows* d_rows,
+	size_t slot_stride,
+	float* snap,
+	size_t snap_stride,
+	int snap_rows,
+	const int* snap_on,
+	cudaStream_t stream
+) {
+	const float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
+	recurrent_step_rows_kernel<<<dim3( num_v_heads, 1, head_dim / 4 ), dim3( 32, 4 ), 0, stream>>>(
+		gdn_state, qkv.ptr<const half>(), gate.ptr<const float>(), beta.ptr<const float>(), attn_out.ptr<half>(),
+		num_k_heads, num_v_heads, scale, rows, d_rows, slot_stride, snap, snap_stride, snap_rows, snap_on
+	);
 }
 
 void GDN::project_kda_gates(
@@ -806,9 +1022,10 @@ void GDN::gated_rmsnorm(
 	int num_v_heads,
 	int head_dim,
 	cudaStream_t stream,
-	bool use_sigmoid
+	bool use_sigmoid,
+	int rows
 ) {
-	gated_rmsnorm_kernel<<<dim3( num_v_heads ), dim3( head_dim ), 0, stream>>>(
+	gated_rmsnorm_kernel<<<dim3( num_v_heads, rows ), dim3( head_dim ), 0, stream>>>(
 		attn_out.ptr<half>(),
 		z.ptr<const half>(),
 		norm_weight.ptr<const half>(),

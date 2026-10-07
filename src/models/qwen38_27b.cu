@@ -603,55 +603,49 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 			);
 
 			// Rows advance their own slot's recurrent state in order: a causal block (Mode A) re-uses
-			// one slot row after row; independent requests (Mode B) each touch a distinct slot.
-			// Slot-0 layer pointers; the kernels add d_rows_->slot[m_idx] * stride on device.
-			for ( int m_idx = 0; m_idx < m; ++m_idx ) {
-				const pod::SlotRef conv_slot{ d_rows_, m_idx, state_.slot_conv_floats };
-				const pod::SlotRef gdn_slot{ d_rows_, m_idx, state_.slot_gdn_floats };
-				float* hist_ptr = state_.conv_history + static_cast<size_t>( linear_idx ) * lin_channels * 3;
-				pod::TensorView conv_hist = pod::make_tensor_2d( hist_ptr, pod::DType::FP32, lin_channels, 3 );
-				float* layer_gdn_state = state_.gdn_states + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
+			// one slot row after row; independent requests (Mode B) each touch a distinct slot. Each stage
+			// runs once over all m rows (the conv and the recurrence walk rows in order inside the kernel and
+			// resolve each row's slot from d_rows_ on device).
+			float* hist_ptr = state_.conv_history + static_cast<size_t>( linear_idx ) * lin_channels * 3;
+			float* layer_gdn_state = state_.gdn_states + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
+			const int snap_rows = MIN( m, kDraftM );
+			float* conv_snap = state_.conv_snap + static_cast<size_t>( linear_idx ) * lin_channels * 3;
+			float* gdn_snap = state_.gdn_snap + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
 
-				pod::TensorView qkv_row = pod::make_tensor_2d( qkv_buf_.ptr<half>() + m_idx * lin_channels, pod::DType::FP16, 1, lin_channels );
-				pod::TensorView norm_row = pod::make_tensor_2d( norm_hidden_.ptr<half>() + m_idx * config_.hidden_size, pod::DType::FP16, 1, config_.hidden_size );
-				pod::TensorView z_row = pod::make_tensor_2d( z_buf_.ptr<half>() + m_idx * v_heads * 128, pod::DType::FP16, 1, v_heads * 128 );
-				pod::TensorView out_row = pod::make_tensor_2d( gdn_out_.ptr<half>() + m_idx * v_heads * 128, pod::DType::FP16, 1, v_heads * 128 );
-				pod::TensorView gate_row = pod::make_tensor_2d( gdn_gate_.ptr<float>() + m_idx * v_heads, pod::DType::FP32, 1, v_heads );
-				pod::TensorView beta_row = pod::make_tensor_2d( gdn_beta_.ptr<float>() + m_idx * v_heads, pod::DType::FP32, 1, v_heads );
+			pod::TensorView qkv_rows = pod::make_tensor_2d( qkv_buf_.ptr<half>(), pod::DType::FP16, m, lin_channels );
+			pod::TensorView out_rows = pod::make_tensor_2d( gdn_out_.ptr<half>(), pod::DType::FP16, m, v_heads * 128 );
+			pod::TensorView z_rows = pod::make_tensor_2d( z_buf_.ptr<half>(), pod::DType::FP16, m, v_heads * 128 );
+			pod::TensorView gate_rows = pod::make_tensor_2d( gdn_gate_.ptr<float>(), pod::DType::FP32, m, v_heads );
+			pod::TensorView beta_rows = pod::make_tensor_2d( gdn_beta_.ptr<float>(), pod::DType::FP32, m, v_heads );
 
-				// Snapshot targets for this row/layer; rows beyond kDraftM never run with the flag set.
-				const bool snap_row = m_idx < kDraftM;
-				float* conv_snap = snap_row ? state_.conv_snap + m_idx * state_.slot_conv_floats + static_cast<size_t>( linear_idx ) * lin_channels * 3 : nullptr;
-				float* gdn_snap = snap_row ? state_.gdn_snap + m_idx * state_.slot_gdn_floats + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128 : nullptr;
+			// Causal conv1d + SiLU
+			engine::modules::GDN::causal_conv1d_silu_rows(
+				qkv_rows, hist_ptr, lw.conv1d_w, lin_channels, m, d_rows_, state_.slot_conv_floats,
+				conv_snap, state_.slot_conv_floats, snap_rows, state_.d_snap_on, stream
+			);
 
-				// Causal conv1d + SiLU
-				engine::modules::GDN::causal_conv1d_silu(
-					qkv_row, conv_hist, lw.conv1d_w, lin_channels, stream, conv_slot, conv_snap, state_.d_snap_on
-				);
+			// L2 norm on Q and K heads
+			engine::modules::GDN::l2_norm_heads(
+				qkv_rows, k_heads, config_.linear_head_dim, stream, false, m, lin_channels
+			);
 
-				// L2 norm on Q and K heads
-				engine::modules::GDN::l2_norm_heads(
-					qkv_row, k_heads, config_.linear_head_dim, stream
-				);
+			// Project gates: in_proj_a, in_proj_b -> gdn_gate, gdn_beta
+			engine::modules::GDN::project_gates(
+				norm_hidden_, lw.in_proj_a, lw.in_proj_b, lw.A_log, lw.dt_bias,
+				gate_rows, beta_rows, v_heads, config_.hidden_size, stream, m
+			);
 
-				// Project gates: in_proj_a, in_proj_b -> gdn_gate, gdn_beta
-				engine::modules::GDN::project_gates(
-					norm_row, lw.in_proj_a, lw.in_proj_b, lw.A_log, lw.dt_bias,
-					gate_row, beta_row, v_heads, config_.hidden_size, stream
-				);
+			// GDN recurrent step: advances state causally
+			engine::modules::GDN::recurrent_step_rows(
+				layer_gdn_state, qkv_rows, gate_rows, beta_rows, out_rows,
+				k_heads, v_heads, config_.linear_head_dim, m, d_rows_, state_.slot_gdn_floats,
+				gdn_snap, state_.slot_gdn_floats, snap_rows, state_.d_snap_on, stream
+			);
 
-				// GDN recurrent step: advances state causally
-				engine::modules::GDN::recurrent_step(
-					layer_gdn_state, qkv_row, gate_row, beta_row,
-					out_row, k_heads, v_heads,
-					config_.linear_head_dim, stream, gdn_slot, gdn_snap, state_.d_snap_on
-				);
-
-				// Gated RMSNorm: gdn_out * rsqrt * norm_weight * silu(z)
-				engine::modules::GDN::gated_rmsnorm(
-					out_row, z_row, lw.linear_norm, v_heads, config_.linear_head_dim, stream, false
-				);
-			}
+			// Gated RMSNorm: gdn_out * rsqrt * norm_weight * silu(z)
+			engine::modules::GDN::gated_rmsnorm(
+				out_rows, z_rows, lw.linear_norm, v_heads, config_.linear_head_dim, stream, false, m
+			);
 
 			// Out proj: projects gdn_out (6144 or 1536) to mlp_out (5120) across all M rows
 			engine::modules::Linear::forward(

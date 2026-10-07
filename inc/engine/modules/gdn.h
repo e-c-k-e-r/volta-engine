@@ -19,7 +19,8 @@ struct GDN {
 		pod::TensorView& beta_out,
 		int num_v_heads,
 		int hidden_size,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // independent rows: norm_hidden [rows, hidden], gate/beta [rows, heads]
 	);
 
 	static void causal_conv1d_silu(
@@ -38,7 +39,9 @@ struct GDN {
 		int num_k_heads,
 		int head_dim,
 		cudaStream_t stream = nullptr,
-		bool scale_q = false
+		bool scale_q = false,
+		int rows = 1,
+		size_t row_stride = 0           // elements between rows of qkv
 	);
 
 	static void recurrent_step(
@@ -54,6 +57,44 @@ struct GDN {
 		const pod::SlotRef& slot = {},
 		float* snap = nullptr,          // per-row post-state copy, written only while *snap_on != 0
 		const int* snap_on = nullptr
+	);
+
+	// Multi-row forms for a causal block or a batch: rows are walked in order per channel / head, the
+	// recurrent state stays in registers across consecutive rows of one slot, and the slot of each row is
+	// read on device from d_rows. snap (optional) receives the state after each of the first snap_rows rows
+	// at snap + row * snap_stride while *snap_on != 0.
+	static void causal_conv1d_silu_rows(
+		pod::TensorView& qkv,             // [rows, channels]
+		float* history,                   // layer base; slot s at + s * slot_stride
+		const pod::TensorView& conv_weights,
+		int channels,
+		int rows,
+		const pod::BatchRows* d_rows,
+		size_t slot_stride,
+		float* snap,
+		size_t snap_stride,
+		int snap_rows,
+		const int* snap_on,
+		cudaStream_t stream
+	);
+
+	static void recurrent_step_rows(
+		float* gdn_state,                 // layer base; slot s at + s * slot_stride
+		const pod::TensorView& qkv,       // [rows, (2 * k_heads + v_heads) * head_dim]
+		const pod::TensorView& gate,      // [rows, v_heads]
+		const pod::TensorView& beta,
+		pod::TensorView& attn_out,        // [rows, v_heads * head_dim]
+		int num_k_heads,
+		int num_v_heads,
+		int head_dim,
+		int rows,
+		const pod::BatchRows* d_rows,
+		size_t slot_stride,
+		float* snap,
+		size_t snap_stride,
+		int snap_rows,
+		const int* snap_on,
+		cudaStream_t stream
 	);
 
 	static void project_kda_gates(
@@ -109,7 +150,8 @@ struct GDN {
 		int num_v_heads,
 		int head_dim,
 		cudaStream_t stream = nullptr,
-		bool use_sigmoid = false
+		bool use_sigmoid = false,
+		int rows = 1                    // packed [rows, num_v_heads * head_dim] attn_out and z
 	);
 };
 
