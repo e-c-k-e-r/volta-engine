@@ -236,6 +236,42 @@ __global__ void moe_sum_planes_kernel(
 	out[i] = __float2half_rn( acc );
 }
 
+// Same sum, eight halves per thread (128-bit loads and store); same FP32 order per element
+__global__ void moe_sum_planes8_kernel(
+	const half* __restrict__ planes,
+	half* __restrict__ out,
+	int n8,
+	int num_groups
+) {
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( i >= n8 ) return;
+	const uint4* p = reinterpret_cast<const uint4*>( planes );
+	float acc[8];
+	#pragma unroll
+	for ( int g = 0; g < 8; ++g ) {
+		if ( g >= num_groups ) break;
+		const uint4 raw = p[static_cast<size_t>( g ) * n8 + i];
+		const half2* h2 = reinterpret_cast<const half2*>( &raw );
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			const float2 f = __half22float2( h2[j] );
+			if ( g == 0 ) {
+				acc[2 * j] = f.x;
+				acc[2 * j + 1] = f.y;
+			}
+			else {
+				acc[2 * j] += f.x;
+				acc[2 * j + 1] += f.y;
+			}
+		}
+	}
+	uint4 res;
+	half2* r2 = reinterpret_cast<half2*>( &res );
+	#pragma unroll
+	for ( int j = 0; j < 4; ++j ) r2[j] = __floats2half2_rn( acc[2 * j], acc[2 * j + 1] );
+	reinterpret_cast<uint4*>( out )[i] = res;
+}
+
 __global__ void moe_combine_kernel(
 	const half* __restrict__ expert_parts,
 	const half* __restrict__ topk_weights,
@@ -535,8 +571,14 @@ void MoE::forward(
 				stream
 			);
 			if ( num_groups > 1 ) {
-				moe_sum_planes_kernel<<<dim3( ( plane_elems + 255 ) / 256 ), dim3( 256 ), 0, stream>>>(
-					scratch.planes, out.ptr<half>(), static_cast<int>( plane_elems ), num_groups );
+				if ( plane_elems % 8 == 0 && num_groups <= MOE_MAX_GROUPS ) {
+					moe_sum_planes8_kernel<<<dim3( ( plane_elems / 8 + 255 ) / 256 ), dim3( 256 ), 0, stream>>>(
+						scratch.planes, out.ptr<half>(), static_cast<int>( plane_elems / 8 ), num_groups );
+				}
+				else {
+					moe_sum_planes_kernel<<<dim3( ( plane_elems + 255 ) / 256 ), dim3( 256 ), 0, stream>>>(
+						scratch.planes, out.ptr<half>(), static_cast<int>( plane_elems ), num_groups );
+				}
 			}
 		} break;
 		default: {
