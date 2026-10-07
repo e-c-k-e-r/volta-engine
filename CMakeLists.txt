@@ -155,6 +155,10 @@ add_executable(test_coherence tests/4_coherence/test_coherence.cpp)
 target_link_libraries(test_coherence PRIVATE engine_kernels)
 set_target_properties(test_coherence PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(test_long_context tests/4_coherence/test_long_context.cpp)
+target_link_libraries(test_long_context PRIVATE engine_kernels)
+set_target_properties(test_long_context PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 # Unified Production Server
 add_executable(volta_server src/server/main.cpp)
 target_link_libraries(volta_server PRIVATE engine_kernels pthread)

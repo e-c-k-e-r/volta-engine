@@ -8,7 +8,7 @@ namespace engine::modules {
 namespace {
 
 #define ATTN_PAGE_SIZE 256
-#define ATTN_MAX_CHUNKS 16
+#define ATTN_MAX_CHUNKS 32
 #define ATTN_MAX_HEAD_DIM 256
 #define ATTN_MAX_ROW_HEADS ( pod::MAX_BATCH * 16 )
 

@@ -326,7 +326,14 @@ void DFlashSpeculator::draft_backbone(
 	own_first_row_ = 0;
 	int n_ctx = anchor_pos - ctx_ingested_;
 	if ( n_ctx < 0 ) n_ctx = 0;
-	if ( taps_cap > 0 && n_ctx > taps_cap ) n_ctx = taps_cap;
+	if ( taps_cap > 0 && n_ctx > taps_cap ) {
+		// More positions pending than the tap ring holds (a prompt longer than the ring): only the newest
+		// taps_cap positions still exist (older slots were overwritten by the wrap) and the drafter's
+		// window is no wider, so skip ahead and ingest [anchor_pos - taps_cap, anchor_pos). Clamping n_ctx
+		// alone would read ring slots that now hold later positions and label them with the old ones.
+		ctx_ingested_ = anchor_pos - taps_cap;
+		n_ctx = taps_cap;
+	}
 	if ( n_ctx > 0 ) ctx_ingested_ += n_ctx;
 	else n_ctx = 0;
 

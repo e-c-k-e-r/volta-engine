@@ -40,7 +40,7 @@ struct Qwen38Config {
 	int linear_num_v_heads = 48;
 	int linear_head_dim = 128;
 	int linear_channels = 10240; // 16*128 + 16*128 + 48*128
-	int max_seq = 2048;
+	int max_seq = 8192;
 	int max_slots = 8;
 	int vocab_size = 248320;
 	float rms_norm_eps = 1e-6f;
