@@ -1,7 +1,7 @@
 // Draft acceptance characterisation (O5): speculative decode on a spread of prompts with Qwen's thinking
 // enabled (the regime DFlash2 was trained on) or suppressed (--nothink), reporting per-position candidate
 // quality: how often the drafter's best candidate / its top-k set / the selector walk hit the target's token.
-//   bench_accept [--nothink] [--tokens N] [--prompts K]
+//   bench_accept [--nothink] [--tokens N] [--prompts K] [--temp T]   (T > 0 samples, top_p 0.95)
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"
 #include <cstdlib>
@@ -14,10 +14,12 @@ int main( int argc, char** argv ) {
 	bool think = true;
 	int n_tokens = 256;
 	int n_prompts = 100;
+	float temp = 0.0f;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--nothink" ) ) think = false;
 		else if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--prompts" ) && i + 1 < argc ) n_prompts = std::atoi( argv[++i] );
+		else if ( !std::strcmp( argv[i], "--temp" ) && i + 1 < argc ) temp = static_cast<float>( std::atof( argv[++i] ) );
 	}
 	const char* prompts[] = {
 		"Solve step by step: what is 17 * 23 + 144 / 12? Show your reasoning.",
@@ -52,7 +54,37 @@ int main( int argc, char** argv ) {
 			? std::vector<int>{ 248046, 198, 248045, 74455, 198, 248068, 198 }
 			: std::vector<int>{ 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271 };
 		ids.insert( ids.end(), tail.begin(), tail.end() );
-		const auto st = test::generate( mc, ids, n_tokens, true );
+		test::GenStats st;
+		if ( temp <= 0.0f ) {
+			st = test::generate( mc, ids, n_tokens, true );
+		}
+		else {
+			SamplingParams sp;
+			sp.temperature = temp;
+			sp.top_p = 0.95f;
+			sp.seed = 1000 + pi;
+			Rng rng( sp.seed );
+			mc.reset_slot( 0 );
+			Candidates c;
+			auto t0 = std::chrono::steady_clock::now();
+			int tok = sample_token( ( mc.prefill( ids.data(), static_cast<int>( ids.size() ), 0, pod::MAX_BATCH, &c ), c ), sp, rng );
+			st.tokens.push_back( tok );
+			int pos = static_cast<int>( ids.size() );
+			t0 = std::chrono::steady_clock::now();
+			while ( static_cast<int>( st.tokens.size() ) < n_tokens && !mc.is_eos( tok ) ) {
+				const SpecResult r = mc.speculate( 0, tok, pos, -1.0f, &sp, &rng );
+				st.rounds++;
+				st.proposed += r.proposed;
+				st.accepted += r.accepted;
+				pos = r.next_pos;
+				for ( int i = 0; i < r.emitted_count && static_cast<int>( st.tokens.size() ) < n_tokens; ++i ) {
+					tok = r.emitted[i];
+					st.tokens.push_back( tok );
+					if ( mc.is_eos( tok ) ) break;
+				}
+			}
+			st.decode_ms = test::ms_since( t0 );
+		}
 		std::printf( "  prompt %d: %3zu tokens, %2d rounds, acceptance %3d/%3d (%.0f%%), %.1f tok/s | \"%.50s\"\n", pi,
 			st.tokens.size(), st.rounds, st.accepted, st.proposed, st.proposed ? 100.0 * st.accepted / st.proposed : 0.0,
 			st.decode_tok_s(), tok.decode( std::vector<int>( st.tokens.begin(), st.tokens.begin() + MIN( 24, static_cast<int>( st.tokens.size() ) ) ) ).c_str() );
