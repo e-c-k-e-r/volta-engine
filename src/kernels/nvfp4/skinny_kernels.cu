@@ -2,6 +2,7 @@
 #include "trellis_context.h"
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
@@ -238,11 +239,150 @@ __global__ void nvfp4_dequant_kernel(
 	dst[1] = *reinterpret_cast<const uint4*>( b + 4 );
 }
 
+
+// Fused dequantize + tensor-core GEMM for prefill chunks: Y[M, N] = X[M, K] @ W[N, K]^T with W decoded from the prepacked
+// FP4 codes straight into shared memory, so the FP16 weight never goes through HBM. 128 x 128 x 32 tiles, 8 warps (2 x 4),
+// each warp 64 x 32 as 4 x 2 wmma 16x16x16 fragments. SM70 has no cp.async: the next tile's raw words are fetched into
+// registers before the current tile's MMAs and decoded into the other shared buffer after them.
+constexpr int GT_BM = 128, GT_BN = 128, GT_BK = 32, GT_LD = GT_BK + 8;
+
+__global__ __launch_bounds__( 256 )
+void nvfp4_gemm_tc_kernel(
+	const uint8_t* __restrict__ qcodes,
+	const uint8_t* __restrict__ qscales,
+	const half* __restrict__ x,
+	half* __restrict__ y,
+	int M,
+	int N,
+	int K,
+	float gscale
+) {
+	using namespace nvcuda;
+	__shared__ __align__( 16 ) half sm[2][2][GT_BM * GT_LD]; // [buffer][A, B]
+	const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+	const int m0 = blockIdx.y * GT_BM;
+	const int tile0 = blockIdx.x * 4; // first 32-column weight tile of this block
+	const int G = K >> 4;
+	const int ntiles32 = N >> 5;
+
+	// B-load role: one (32-column tile, k group of 16) per warp-pair; lanes walk the tile's 32 packed columns
+	const int jt = warp & 3, gi = warp >> 2;
+	const int qp = ( lane >> 2 ) & 3;
+	const int r = ( lane & 3 ) + ( ( lane & 16 ) ? 4 : 0 );
+	const int b_row = jt * 32 + qp * 8 + r;
+	const bool b_live = tile0 + jt < ntiles32;
+	const uint2* cb = reinterpret_cast<const uint2*>( qcodes );
+	const half2 gm2 = __float2half2_rn( gscale * 16384.f );
+
+	// A-load role: two 16-byte pieces of the 128 x 32 tile
+	const int a_idx0 = t, a_idx1 = t + 256;
+
+	const int KT = K / GT_BK;
+	uint4 a_raw[2];
+	uint2 b_raw = make_uint2( 0, 0 );
+	unsigned char b_sc = 0;
+
+	auto fetch = [&]( int kt ) {
+		const int k0 = kt * GT_BK;
+		#pragma unroll
+		for ( int i = 0; i < 2; ++i ) {
+			const int idx = i ? a_idx1 : a_idx0;
+			const int row = idx >> 2, c = idx & 3;
+			a_raw[i] = ( m0 + row < M ) ? *reinterpret_cast<const uint4*>( x + (size_t) ( m0 + row ) * K + k0 + c * 8 ) : make_uint4( 0, 0, 0, 0 );
+		}
+		if ( b_live ) {
+			const size_t qi = ( (size_t) ( tile0 + jt ) * G + ( kt * 2 + gi ) ) * 32 + lane;
+			b_raw = cb[qi];
+			b_sc = qscales[qi];
+		}
+		else {
+			b_raw = make_uint2( 0, 0 );
+			b_sc = 0;
+		}
+	};
+	auto store = [&]( int buf ) {
+		half* As = sm[buf][0];
+		half* Bs = sm[buf][1];
+		#pragma unroll
+		for ( int i = 0; i < 2; ++i ) {
+			const int idx = i ? a_idx1 : a_idx0;
+			*reinterpret_cast<uint4*>( As + ( idx >> 2 ) * GT_LD + ( idx & 3 ) * 8 ) = a_raw[i];
+		}
+		const half2 sc2 = __hmul2( fp8e4m3_to_half2( b_sc ), gm2 );
+		half2 b[8];
+		dequant8_tm( b_raw.x, sc2, b + 0 );
+		dequant8_tm( b_raw.y, sc2, b + 4 );
+		uint4* dst = reinterpret_cast<uint4*>( Bs + b_row * GT_LD + gi * 16 );
+		dst[0] = *reinterpret_cast<const uint4*>( b );
+		dst[1] = *reinterpret_cast<const uint4*>( b + 4 );
+	};
+
+	wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][2];
+	#pragma unroll
+	for ( int i = 0; i < 4; ++i )
+		#pragma unroll
+		for ( int j = 0; j < 2; ++j ) wmma::fill_fragment( acc[i][j], 0.0f );
+
+	const int wm = warp & 1, wn = warp >> 1;
+	fetch( 0 );
+	store( 0 );
+	__syncthreads();
+	for ( int kt = 0; kt < KT; ++kt ) {
+		const bool more = kt + 1 < KT;
+		if ( more ) fetch( kt + 1 );
+		const half* As = sm[kt & 1][0];
+		const half* Bs = sm[kt & 1][1];
+		#pragma unroll
+		for ( int kk = 0; kk < GT_BK; kk += 16 ) {
+			wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> af[4];
+			wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf[2];
+			#pragma unroll
+			for ( int i = 0; i < 4; ++i ) wmma::load_matrix_sync( af[i], As + ( wm * 64 + i * 16 ) * GT_LD + kk, GT_LD );
+			#pragma unroll
+			for ( int j = 0; j < 2; ++j ) wmma::load_matrix_sync( bf[j], Bs + ( wn * 32 + j * 16 ) * GT_LD + kk, GT_LD );
+			#pragma unroll
+			for ( int i = 0; i < 4; ++i )
+				#pragma unroll
+				for ( int j = 0; j < 2; ++j ) wmma::mma_sync( acc[i][j], af[i], bf[j], acc[i][j] );
+		}
+		if ( more ) store( ( kt + 1 ) & 1 );
+		__syncthreads();
+	}
+
+	// Epilogue: stage each fragment through shared memory, convert and store 8 halves per lane
+	float* scratch = reinterpret_cast<float*>( &sm[0][0][0] ) + warp * 16 * 16;
+	const int n_base = blockIdx.x * GT_BN + wn * 32;
+	#pragma unroll
+	for ( int i = 0; i < 4; ++i ) {
+		#pragma unroll
+		for ( int j = 0; j < 2; ++j ) {
+			wmma::store_matrix_sync( scratch, acc[i][j], 16, wmma::mem_row_major );
+			__syncwarp();
+			const int row = m0 + wm * 64 + i * 16 + ( lane >> 1 );
+			const int col = n_base + j * 16 + ( lane & 1 ) * 8;
+			if ( row < M && col < N ) {
+				const float* sp = scratch + ( lane >> 1 ) * 16 + ( lane & 1 ) * 8;
+				half2 h[4];
+				#pragma unroll
+				for ( int q = 0; q < 4; ++q ) h[q] = __floats2half2_rn( sp[2 * q], sp[2 * q + 1] );
+				*reinterpret_cast<uint4*>( y + (size_t) row * N + col ) = *reinterpret_cast<const uint4*>( h );
+			}
+			__syncwarp();
+		}
+	}
+}
+
 namespace engine::modules {
 
 // Rows up to which the fused skinny kernel beats dequantize + HGEMM; EXL3_NVFP4_SKINNY_MAX overrides (A/B knob).
 static int nvfp4_skinny_max_rows() {
 	static const int v = std::getenv( "EXL3_NVFP4_SKINNY_MAX" ) ? std::min( 32, std::atoi( std::getenv( "EXL3_NVFP4_SKINNY_MAX" ) ) ) : 32;
+	return v;
+}
+
+// Fused dequantize + GEMM above the skinny range; EXL3_NVFP4_FUSED=0 selects dequantize + cuBLAS (A/B knob).
+static bool nvfp4_fused_gemm() {
+	static const bool v = !( std::getenv( "EXL3_NVFP4_FUSED" ) && std::atoi( std::getenv( "EXL3_NVFP4_FUSED" ) ) == 0 );
 	return v;
 }
 
@@ -302,6 +442,12 @@ void LinearNVFP4::forward(
 				codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale
 			);
 		}
+	}
+	else if ( nvfp4_fused_gemm() && m < 384 && ( ( n + GT_BN - 1 ) / GT_BN ) * ( ( m + GT_BM - 1 ) / GT_BM ) >= 48 ) {
+		// Mid-size chunks with enough tiles to fill the GPU; at 512 rows the cuBLAS GEMM (dequantized weight reused across
+		// the whole chunk) is as fast, and narrow outputs leave most SMs idle in the fused kernel
+		nvfp4_gemm_tc_kernel<<<dim3( ( n + GT_BN - 1 ) / GT_BN, ( m + GT_BM - 1 ) / GT_BM ), dim3( 256 ), 0, stream>>>(
+			codes_ptr, scales_ptr, x_ptr, y_ptr, m, n, k, gscale );
 	}
 	else {
 		// Dequantize once into FP16 and run a tensor-core HGEMM: C[m, n] = X[m, k] @ W[n, k]^T

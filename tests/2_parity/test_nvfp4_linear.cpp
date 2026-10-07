@@ -36,7 +36,7 @@ int main() {
 		const int N = dense.shape[0], K = dense.shape[1];
 		std::vector<half> h_w( static_cast<size_t>( N ) * K );
 		CUDA_CHECK( cudaMemcpy( h_w.data(), dense.data, h_w.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
-		for ( int M : { 1, 2, 3, 4, 7, 8, 9, 16, 17, 24, 32, 33, 64, 256 } ) {
+		for ( int M : { 1, 2, 3, 4, 7, 8, 9, 16, 17, 24, 32, 33, 64, 100, 256, 512 } ) {
 			std::vector<half> h_x( static_cast<size_t>( M ) * K );
 			uint32_t seed = 777u + M;
 			for ( auto& v : h_x ) {
