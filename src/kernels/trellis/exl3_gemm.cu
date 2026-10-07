@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cuda_fp16.h>
 #include "exl3_gemm.cuh"
 #include <cooperative_groups.h>
@@ -113,6 +114,9 @@ void exl3_gemm(
 		cb
 	);
 
+	if ( kernel == nullptr ) {
+		std::fprintf( stderr, "exl3_gemm: no kernel for m=%d k=%d n=%d bits=%d cb=%d fp32=%d\n", size_m, size_k, size_n, K, cb, c_fp32 ? 1 : 0 );
+	}
 	ENGINE_ASSERT( kernel != nullptr, "exl3_gemm: failed to select kernel" );
 
 	size_t actual_smem = exl3_gemm_shape_smem( shape_idx, K );

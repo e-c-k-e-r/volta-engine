@@ -24,13 +24,15 @@ struct LinearWeight {
 	float      alpha = 1.0f;
 	int        bits = 4;
 	bool       mul1 = false;
+	bool       mcg = false;   // MCG codebook (the quantized DFlash2 drafters); everything else decodes as mul1
 
 	static LinearWeight make_trellis(
 		const TensorView& codes,
 		const TensorView& suh,
 		const TensorView& svh,
 		int bits = 4,
-		bool mul1 = false
+		bool mul1 = false,
+		bool mcg = false
 	) {
 		LinearWeight lw;
 		lw.type = QuantType::TRELLIS;
@@ -40,6 +42,7 @@ struct LinearWeight {
 		lw.alpha = 1.0f;
 		lw.bits = bits;
 		lw.mul1 = mul1;
+		lw.mcg = mcg;
 		return lw;
 	}
 
@@ -106,8 +109,8 @@ struct Linear {
 					weight.w2,
 					out,
 					weight.bits,
-					false,
-					true,
+					weight.mcg,
+					!weight.mcg,
 					stream
 				);
 			} break;

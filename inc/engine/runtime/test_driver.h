@@ -25,7 +25,7 @@ static const char* QWEN_DRAFT_DIR = std::getenv( "EXL3_DRAFT_DIR" )
 // unquantized. It is the ground truth the Trellis weights are checked against.
 static constexpr const char* QWEN_DRAFT_BF16_DIR = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2";
 static const char* GLM_DIR = std::getenv( "EXL3_GLM_DIR" ) ? std::getenv( "EXL3_GLM_DIR" ) : "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
-static constexpr const char* GLM_DRAFT_DIR = "/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2";
+static const char* GLM_DRAFT_DIR = std::getenv( "EXL3_GLM_DRAFT_DIR" ) ? std::getenv( "EXL3_GLM_DRAFT_DIR" ) : "/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2";
 
 struct GenStats {
 	std::vector<int> tokens; // generated tokens (first = prefill prediction)

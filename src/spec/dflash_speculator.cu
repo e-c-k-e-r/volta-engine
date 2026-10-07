@@ -220,6 +220,67 @@ bool DFlashSpeculator::init(
 	return true;
 }
 
+
+// One-hot rows c0..c0+R of the K x K identity: X[r][c0 + r] = 1
+__global__ void identity_chunk_kernel( half* x, int K, int c0, int R ) {
+	const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	if ( i >= (size_t) R * K ) return;
+	const int r = (int) ( i / K ), c = (int) ( i % K );
+	x[i] = __float2half( c == c0 + r ? 1.0f : 0.0f );
+}
+
+// dst[n][c0 + r] = src[r][n]: the chunk of W^T rows (Y = X W^T, X one-hot) back into the dense [N, K] layout
+__global__ void transpose_chunk_kernel( const half* src, half* dst, int N, int K, int c0, int R ) {
+	const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	if ( i >= (size_t) R * N ) return;
+	const int r = (int) ( i / N ), n = (int) ( i % N );
+	dst[(size_t) n * K + c0 + r] = src[i];
+}
+
+// Dense FP16 [N, K] weight from an EXL3 tensor, by pushing the identity through the same Linear path the model uses (so
+// Hadamards, scales and the codebook come out exactly as at run time).
+static pod::TensorView dequant_dense( const pod::LinearWeight& lw, pod::MemoryArena& arena, cudaStream_t stream ) {
+	ENGINE_ASSERT( lw.is_valid() && lw.type == pod::QuantType::TRELLIS, "dflash2: projection is not an EXL3 tensor" );
+	const int K = lw.w1.shape[0]; // suh
+	const int N = lw.w2.shape[0]; // svh
+	const int shape[2] = { N, K };
+	pod::TensorView dense = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
+	ENGINE_ASSERT( dense.data != nullptr, "dflash2: arena exhausted dequantizing a projection" );
+	constexpr int R = 256; // above the fused-GEMM row limit, so it takes the same dequantize + cuBLAS path as prefill
+	half *x = nullptr, *y = nullptr;
+	CUDA_CHECK( cudaMalloc( &x, (size_t) R * K * sizeof( half ) ) );
+	CUDA_CHECK( cudaMalloc( &y, (size_t) R * N * sizeof( half ) ) );
+	pod::TensorView xt = pod::make_tensor_2d( x, pod::DType::FP16, R, K );
+	pod::TensorView yt = pod::make_tensor_2d( y, pod::DType::FP16, R, N );
+	for ( int c0 = 0; c0 < K; c0 += R ) {
+		const int rows = MIN( R, K - c0 );
+		xt.shape[0] = rows;
+		yt.shape[0] = rows;
+		identity_chunk_kernel<<<(unsigned) ( ( (size_t) rows * K + 255 ) / 256 ), 256, 0, stream>>>( x, K, c0, rows );
+		engine::modules::Linear::forward( xt, lw, yt, stream );
+		transpose_chunk_kernel<<<(unsigned) ( ( (size_t) rows * N + 255 ) / 256 ), 256, 0, stream>>>( y, dense.ptr<half>(), N, K, c0, rows );
+	}
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	CUDA_CHECK( cudaFree( x ) );
+	CUDA_CHECK( cudaFree( y ) );
+	return dense;
+}
+
+// A projection the DFlash2 code runs as a plain FP16 GEMV ([N, K] weight): read as such from an unquantized checkpoint, or
+// dequantized from the EXL3 tensors of a quantized one. These few projections are small and latency-bound, which is why
+// they stay dense.
+static pod::TensorView load_dense_proj(
+	engine::loader::SafeTensorsRepo& repo,
+	const char* base,
+	pod::MemoryArena& arena,
+	cudaStream_t stream
+) {
+	char key[256];
+	std::snprintf( key, sizeof( key ), "%s.weight", base );
+	if ( repo.find( key ) != nullptr ) return repo.load( key, arena, stream, pod::DType::FP16 );
+	return dequant_dense( repo.load_linear( base, arena, 5, stream ), arena, stream );
+}
+
 // Loads one projection as a TP shard: column-parallel (slice_dim 1, splits out_features) for
 // q/k/v/gate/up, row-parallel (slice_dim 0, splits in_features) for o_proj/down_proj. The full
 // out_features value is the shape[0]*16 of the trellis tensor.
@@ -273,7 +334,13 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 		check1d( "layers.0.input_layernorm.weight", H );
 		check1d( "layers.0.post_attention_layernorm.weight", H );
 		check1d( "norm.weight", H );
-		check( "candidate_selector.hidden_projection.weight", config_.selector_rank, H );
+		if ( repo.find( "candidate_selector.hidden_projection.weight" ) != nullptr ) {
+			check( "candidate_selector.hidden_projection.weight", config_.selector_rank, H );
+		}
+		else {
+			const pod::SafeTensorMeta* sv = repo.find( "candidate_selector.hidden_projection.svh" );
+			ENGINE_ASSERT( sv != nullptr && sv->shape[0] == config_.selector_rank, "dflash2 selector projection geometry does not match DFlashConfig" );
+		}
 		ENGINE_ASSERT( repo.find( "candidate_selector.predecessor_codebook" ) != nullptr
 			&& repo.find( "candidate_selector.successor_codebook" ) != nullptr,
 			"dflash2 checkpoint is missing the selector codebooks" );
@@ -289,6 +356,12 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 	// Context projection: 5 tapped target states (5*H) -> H. Column-parallel on the output with an
 	// all-gather back to full width, so the 82 MB weight is a quarter per rank instead of replicated.
 	fc_ = load_shard( repo, "fc", *arena_, 1, R, TP, stream );
+	if ( fc_.type == pod::QuantType::TRELLIS && fc_.bits > 6 ) {
+		// The 8-bit EXL3 fc has no fused-GEMM instantiation (only 2..6 bits are built); run it as the dense FP16 shard
+		// an unquantized checkpoint would give.
+		const pod::TensorView dense = dequant_dense( fc_, *arena_, stream );
+		fc_ = pod::LinearWeight::make_fp16( pod::make_tensor_2d( dense.data, pod::DType::FP16, dense.shape[1], dense.shape[0] ) );
+	}
 	fc_norm_ = repo.load( "hidden_norm.weight", *arena_, stream, pod::DType::FP16 );
 	final_norm_ = repo.load( "norm.weight", *arena_, stream, pod::DType::FP16 );
 
@@ -298,7 +371,7 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 		succ_codebook_ = repo.load( "candidate_selector.successor_codebook", *arena_, stream, pod::DType::FP16 );
 		// The selector's hidden projection is a plain FP16 [rank, hidden] matrix, not a trellis tensor, so
 		// it cannot go through load_linear. Stored as a raw weight for a small dedicated GEMV.
-		hidden_proj_w_ = repo.load( "candidate_selector.hidden_projection.weight", *arena_, stream, pod::DType::FP16 );
+		hidden_proj_w_ = load_dense_proj( repo, "candidate_selector.hidden_projection", *arena_, stream );
 	}
 
 	// Backbone. The residual stream stays full width and replicated; only heads and the MLP
@@ -339,10 +412,10 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 		ly.attn_conv_base = repo.load( key, *arena_, stream, pod::DType::FP16 );
 		std::snprintf( key, sizeof( key ), "layers.%d.mlp_conv.base_kernel", i );
 		ly.mlp_conv_base = repo.load( key, *arena_, stream, pod::DType::FP16 );
-		std::snprintf( key, sizeof( key ), "layers.%d.attention_conv.kernel_projection.weight", i );
-		ly.attn_conv_proj = repo.load( key, *arena_, stream, pod::DType::FP16 );
-		std::snprintf( key, sizeof( key ), "layers.%d.mlp_conv.kernel_projection.weight", i );
-		ly.mlp_conv_proj = repo.load( key, *arena_, stream, pod::DType::FP16 );
+		std::snprintf( key, sizeof( key ), "layers.%d.attention_conv.kernel_projection", i );
+		ly.attn_conv_proj = load_dense_proj( repo, key, *arena_, stream );
+		std::snprintf( key, sizeof( key ), "layers.%d.mlp_conv.kernel_projection", i );
+		ly.mlp_conv_proj = load_dense_proj( repo, key, *arena_, stream );
 	}
 
 	weights_loaded_ = true;
