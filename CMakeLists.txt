@@ -150,6 +150,10 @@ add_executable(bench_spec tests/3_bench/bench_spec.cpp)
 target_link_libraries(bench_spec PRIVATE engine_kernels)
 set_target_properties(bench_spec PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(test_spec_state tests/2_parity/test_spec_state.cpp)
+target_link_libraries(test_spec_state PRIVATE engine_kernels)
+set_target_properties(test_spec_state PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(bench_accept tests/3_bench/bench_accept.cpp)
 target_link_libraries(bench_accept PRIVATE engine_kernels)
 set_target_properties(bench_accept PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

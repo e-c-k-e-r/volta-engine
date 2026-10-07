@@ -100,6 +100,26 @@ if ! echo "$SSE_RESP" | grep -q "data: \[DONE\]"; then
 fi
 echo "[+] Streaming SSE completion OK."
 
+# 3b. Single-stream speculative throughput (Case A: one request owns the drafter context)
+echo "[*] STEP 3b: Single-stream speculative throughput..."
+SS_TOKENS=200
+SS_GATE=90
+SS_START=$(date +%s%N)
+SS_RESP=$(curl -s -N -X POST "http://$HOST:$PORT/v1/chat/completions" \
+	-H "Content-Type: application/json" \
+	-d '{"model":"qwen38","messages":[{"role":"user","content":"Explain how a hash table handles collisions, and compare chaining with open addressing."}],"stream":true,"max_tokens":'"$SS_TOKENS"'}')
+SS_END=$(date +%s%N)
+SS_CHUNKS=$(echo "$SS_RESP" | grep -c 'content' || true)
+SS_SEC=$(awk -v a="$SS_START" -v b="$SS_END" 'BEGIN { printf "%.4f", (b - a) / 1000000000 }')
+SS_TPS=$(awk -v t="$SS_CHUNKS" -v s="$SS_SEC" 'BEGIN { printf "%.1f", t / s }')
+echo "    $SS_CHUNKS chunks in ${SS_SEC} s: ${SS_TPS} tok/s single stream (greedy M=1 is ~60 tok/s; gate >= $SS_GATE)"
+SS_INT=${SS_TPS%.*}
+if [ "$SS_INT" -lt "$SS_GATE" ]; then
+	echo "[-] FATAL: single-stream speculative throughput ${SS_TPS} tok/s below ${SS_GATE} tok/s!"
+	exit 1
+fi
+echo "[+] Single-stream speculative throughput OK."
+
 # 4. Concurrency Gate: 8 Simultaneous Client Streams
 echo "[*] STEP 4: Concurrency Gate (8 Simultaneous Streams)..."
 CONCURRENCY=8
