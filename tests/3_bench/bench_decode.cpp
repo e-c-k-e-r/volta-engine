@@ -5,6 +5,7 @@
 #include "engine/runtime/test_driver.h"
 #include <cuda_profiler_api.h>
 #include <cstring>
+#include <cstdlib>
 
 using namespace engine::runtime;
 
@@ -43,11 +44,22 @@ void bench_model( const char* type, const char* dir, int steps ) {
 	int preds[pod::MAX_BATCH];
 	if ( prof_a ) CUDA_CHECK( cudaProfilerStart() );
 	t0 = std::chrono::steady_clock::now();
+	// BENCH_SNAP=1 runs the block the way a speculative round does (per-row state snapshots on, a commit after).
+	const bool snap = std::getenv( "BENCH_SNAP" ) != nullptr;
 	for ( int i = 0; i < iters; ++i ) {
-		mc.checkpoint( 0 );
-		mc.forward( block, 8, pos, 0 );
-		mc.sample( preds, 8 );
-		mc.rollback( 0 );
+		if ( snap ) {
+			mc.set_spec_snapshot( true );
+			mc.forward( block, 8, pos, 0 );
+			mc.sample( preds, 8 );
+			mc.commit_spec_row( 0, 3 );
+			mc.set_spec_snapshot( false );
+		}
+		else {
+			mc.checkpoint( 0 );
+			mc.forward( block, 8, pos, 0 );
+			mc.sample( preds, 8 );
+			mc.rollback( 0 );
+		}
 	}
 	const double m8_ms = test::ms_since( t0 ) / iters;
 	if ( prof_a ) CUDA_CHECK( cudaProfilerStop() );

@@ -51,7 +51,7 @@ struct Qwen38Config {
 
 // Per-rank recurrent state, laid out [slot][layer][...] so one slot is a contiguous block.
 struct Qwen38State {
-	float* gdn_states = nullptr;      // [slots, 48, v_heads, 128, 128] FP32
+	float* gdn_states = nullptr;      // [slots, 48, v_heads, col 128, row 128] FP32 (row fastest)
 	float* conv_history = nullptr;    // [slots, 48, channels, 3] FP32
 	float* gdn_checkpoint = nullptr;  // one-slot snapshot
 	float* conv_checkpoint = nullptr;

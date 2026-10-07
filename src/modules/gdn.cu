@@ -233,6 +233,8 @@ __global__ void l2_norm_heads_kernel(
 	ptr[tid] = __float2half_rn( val * inv_l2 );
 }
 
+// GDN state layout: [v_head][col][row], row fastest. A warp's lanes walk the row index, so this makes the state
+// reads, writes and snapshot writes fully coalesced (the [head][row][col] layout touched 32 sectors for 128 bytes).
 __global__ void __launch_bounds__( 128, 2 )
 recurrent_step_kernel(
 	float* __restrict__ state,
@@ -262,7 +264,7 @@ recurrent_step_kernel(
 	#pragma unroll
 	for ( int r = 0; r < 4; ++r ) {
 		const int i = r * 32 + lane;
-		s_shard[r] = state[( size_t( head ) * 128 + i ) * 128 + col];
+		s_shard[r] = state[( size_t( head ) * 128 + col ) * 128 + i];
 		k_reg[r] = __half2float( k_ptr[i] );
 		q_reg[r] = __half2float( q_ptr[i] );
 	}
@@ -292,9 +294,9 @@ recurrent_step_kernel(
 	#pragma unroll
 	for ( int r = 0; r < 4; ++r ) {
 		const int i = r * 32 + lane;
-		state[( size_t( head ) * 128 + i ) * 128 + col] = s_shard[r];
+		state[( size_t( head ) * 128 + col ) * 128 + i] = s_shard[r];
 		if ( do_snap ) {
-			snap[( size_t( head ) * 128 + i ) * 128 + col] = s_shard[r];
+			snap[( size_t( head ) * 128 + col ) * 128 + i] = s_shard[r];
 		}
 	}
 }
@@ -336,13 +338,13 @@ recurrent_step_rows_kernel(
 				float* st = state + static_cast<size_t>( cur ) * slot_stride;
 				#pragma unroll
 				for ( int r = 0; r < 4; ++r ) {
-					st[( size_t( head ) * 128 + r * 32 + lane ) * 128 + col] = s_shard[r];
+					st[( size_t( head ) * 128 + col ) * 128 + r * 32 + lane] = s_shard[r];
 				}
 			}
 			const float* st = state + static_cast<size_t>( slot ) * slot_stride;
 			#pragma unroll
 			for ( int r = 0; r < 4; ++r ) {
-				s_shard[r] = st[( size_t( head ) * 128 + r * 32 + lane ) * 128 + col];
+				s_shard[r] = st[( size_t( head ) * 128 + col ) * 128 + r * 32 + lane];
 			}
 			cur = slot;
 		}
@@ -383,14 +385,14 @@ recurrent_step_rows_kernel(
 			float* sp = snap + m * snap_stride;
 			#pragma unroll
 			for ( int r = 0; r < 4; ++r ) {
-				sp[( size_t( head ) * 128 + r * 32 + lane ) * 128 + col] = s_shard[r];
+				sp[( size_t( head ) * 128 + col ) * 128 + r * 32 + lane] = s_shard[r];
 			}
 		}
 	}
 	float* st = state + static_cast<size_t>( cur ) * slot_stride;
 	#pragma unroll
 	for ( int r = 0; r < 4; ++r ) {
-		st[( size_t( head ) * 128 + r * 32 + lane ) * 128 + col] = s_shard[r];
+		st[( size_t( head ) * 128 + col ) * 128 + r * 32 + lane] = s_shard[r];
 	}
 }
 
