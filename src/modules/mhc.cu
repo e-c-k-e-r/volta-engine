@@ -10,7 +10,8 @@ namespace {
 #define NUM_THREADS 256
 #define NUM_THREADS_A 64
 
-__device__ float g_mhc_partials[64 * 25];
+// Per-row partial sums: up to MAX_ROWS rows x 64 chunks x (M + 1) values
+__device__ float g_mhc_partials[256 * 64 * 25];
 
 __device__ __forceinline__ float sigmoidf_( float x ) {
 	return 1.0f / ( 1.0f + __expf( -x ) );
@@ -23,10 +24,12 @@ __global__ void init_streams_kernel(
 ) {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if ( idx >= hidden_size ) return;
-	float val = __half2float( in[idx] );
+	const int r = blockIdx.y;
+	float val = __half2float( in[static_cast<size_t>( r ) * hidden_size + idx] );
+	float* out = streams + static_cast<size_t>( r ) * 4 * hidden_size;
 	#pragma unroll
 	for ( int h = 0; h < 4; ++h ) {
-		streams[h * hidden_size + idx] = val;
+		out[h * hidden_size + idx] = val;
 	}
 }
 
@@ -151,9 +154,9 @@ void hc_mix_finalize_kernel(
 	}
 	__syncthreads();
 
-	if ( inv_rms_buf && threadIdx.x == 0 && blockIdx.x == 0 ) *inv_rms_buf = rmr;
-	if ( mix_logits_buf && threadIdx.x < M && blockIdx.x == 0 ) mix_logits_buf[threadIdx.x] = mix_s[threadIdx.x];
-	if ( pre_buf && threadIdx.x < H && blockIdx.x == 0 ) pre_buf[threadIdx.x] = pre_s[threadIdx.x];
+	if ( inv_rms_buf && threadIdx.x == 0 && blockIdx.x == 0 ) inv_rms_buf[r] = rmr;
+	if ( mix_logits_buf && threadIdx.x < M && blockIdx.x == 0 ) mix_logits_buf[r * M + threadIdx.x] = mix_s[threadIdx.x];
+	if ( pre_buf && threadIdx.x < H && blockIdx.x == 0 ) pre_buf[r * H + threadIdx.x] = pre_s[threadIdx.x];
 
 	const bool sink_warp = !HEAD && blockIdx.x == 0 && threadIdx.x < 32;
 	if ( sink_warp ) {
@@ -310,7 +313,8 @@ __global__ void mhc_hyperhead_mean_kernel(
 ) {
 	int idx = ( blockIdx.x * blockDim.x + threadIdx.x ) * 4;
 	if ( idx < hidden_size ) {
-		const float4* s4 = (const float4*) streams;
+		const float4* s4 = (const float4*)( streams + static_cast<size_t>( blockIdx.y ) * 4 * hidden_size );
+		final_hidden += static_cast<size_t>( blockIdx.y ) * hidden_size;
 		int D4 = hidden_size / 4;
 		int c = idx / 4;
 		float4 o = make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
@@ -334,20 +338,22 @@ void HyperConnection::init_streams(
 	const pod::TensorView& in,
 	pod::TensorView& streams,
 	int hidden_size,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
-	init_streams( in.ptr<const half>(), streams.ptr<float>(), hidden_size, stream );
+	init_streams( in.ptr<const half>(), streams.ptr<float>(), hidden_size, stream, rows );
 }
 
 void HyperConnection::init_streams(
 	const half* in,
 	float* streams,
 	int hidden_size,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
 	int threads = 256;
 	int blocks = ( hidden_size + threads - 1 ) / threads;
-	init_streams_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
+	init_streams_kernel<<<dim3( blocks, rows ), dim3( threads ), 0, stream>>>(
 		in, streams, hidden_size
 	);
 }
@@ -366,7 +372,8 @@ void HyperConnection::collapse(
 	int hidden_size,
 	int sinkhorn_iters,
 	float eps,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
 	collapse(
 		streams.ptr<const float>(),
@@ -382,7 +389,8 @@ void HyperConnection::collapse(
 		hidden_size,
 		sinkhorn_iters,
 		eps,
-		stream
+		stream,
+		rows
 	);
 }
 
@@ -400,8 +408,10 @@ void HyperConnection::collapse(
 	int hidden_size,
 	int sinkhorn_iters,
 	float eps,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
+	ENGINE_ASSERT( rows >= 1 && rows <= 256, "HyperConnection::collapse: rows out of range" );
 	const int H = 4;
 	const int row_len = H * hidden_size;
 	const int chunksA = 64;
@@ -412,8 +422,8 @@ void HyperConnection::collapse(
 	const int chunk_cols_c = ( ( hidden_size / chunksC + 4 * NUM_THREADS - 1 ) / ( 4 * NUM_THREADS ) ) * ( 4 * NUM_THREADS );
 	const int n_chunks_c = ( hidden_size + chunk_cols_c - 1 ) / chunk_cols_c;
 
-	dim3 grid_a( n_chunks_a, 1 );
-	dim3 grid_c( n_chunks_c, 1 );
+	dim3 grid_a( n_chunks_a, rows );
+	dim3 grid_c( n_chunks_c, rows );
 
 	hc_mix_partials_kernel<4, 24, float><<<grid_a, NUM_THREADS_A, 0, stream>>>(
 		streams,
@@ -447,7 +457,8 @@ void HyperConnection::update(
 	const pod::TensorView& post,
 	const pod::TensorView& comb,
 	int hidden_size,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
 	update(
 		streams.ptr<float>(),
@@ -456,7 +467,8 @@ void HyperConnection::update(
 		post.ptr<const float>(),
 		comb.ptr<const float>(),
 		hidden_size,
-		stream
+		stream,
+		rows
 	);
 }
 
@@ -467,7 +479,8 @@ void HyperConnection::update(
 	const pod::TensorView& post,
 	const pod::TensorView& comb,
 	int hidden_size,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
 	update(
 		streams_out.ptr<float>(),
@@ -476,7 +489,8 @@ void HyperConnection::update(
 		post.ptr<const float>(),
 		comb.ptr<const float>(),
 		hidden_size,
-		stream
+		stream,
+		rows
 	);
 }
 
@@ -486,9 +500,10 @@ void HyperConnection::update(
 	const float* post,
 	const float* comb,
 	int hidden_size,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
-	update( streams, streams, sublayer_out, post, comb, hidden_size, stream );
+	update( streams, streams, sublayer_out, post, comb, hidden_size, stream, rows );
 }
 
 void HyperConnection::update(
@@ -498,15 +513,16 @@ void HyperConnection::update(
 	const float* post,
 	const float* comb,
 	int hidden_size,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
 	if ( streams_out != streams_in ) {
-		CUDA_CHECK( cudaMemcpyAsync( streams_out, streams_in, 4 * hidden_size * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
+		CUDA_CHECK( cudaMemcpyAsync( streams_out, streams_in, static_cast<size_t>( rows ) * 4 * hidden_size * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
 	}
 	int chunks_c = 4;
 	int chunk_cols = ( ( hidden_size / chunks_c + 4 * NUM_THREADS - 1 ) / ( 4 * NUM_THREADS ) ) * ( 4 * NUM_THREADS );
 	int n_chunks = ( hidden_size + chunk_cols - 1 ) / chunk_cols;
-	dim3 grid( n_chunks, 1 );
+	dim3 grid( n_chunks, rows );
 	hc_apply_kernel<4, half, true><<<grid, NUM_THREADS, 0, stream>>>(
 		streams_out,
 		sublayer_out,
@@ -522,10 +538,11 @@ void HyperHead::forward(
 	pod::TensorView& final_hidden,
 	int hidden_size,
 	bool is_mean,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
 	if ( is_mean ) {
-		mean( streams, final_hidden, hidden_size, stream );
+		mean( streams, final_hidden, hidden_size, stream, rows );
 	}
 }
 
@@ -533,20 +550,22 @@ void HyperHead::mean(
 	const pod::TensorView& streams,
 	pod::TensorView& final_hidden,
 	int hidden_size,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
-	mean( streams.ptr<const float>(), final_hidden.ptr<half>(), hidden_size, stream );
+	mean( streams.ptr<const float>(), final_hidden.ptr<half>(), hidden_size, stream, rows );
 }
 
 void HyperHead::mean(
 	const float* streams,
 	half* final_hidden,
 	int hidden_size,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
 	int threads = 256;
 	int blocks = ( ( hidden_size / 4 ) + threads - 1 ) / threads;
-	mhc_hyperhead_mean_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
+	mhc_hyperhead_mean_kernel<<<dim3( blocks, rows ), dim3( threads ), 0, stream>>>(
 		streams, final_hidden, hidden_size
 	);
 }

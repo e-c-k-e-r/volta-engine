@@ -105,6 +105,63 @@ int main() {
 		cos, maxd, maxr, std::sqrt( na ), std::sqrt( nb ) );
 	const bool pass = cos >= 0.9999;
 	std::printf( "[%c] MoE PARITY %s\n", pass ? '+' : '-', pass ? "PASS" : "FAIL" );
+
+	// Multi-row: R rows routed into a narrow expert set so several experts exceed the 8-token chunk. Reference is
+	// the single-row MoE::forward per row (the validated path).
+	bool multi_pass = true;
+	for ( int R : { 2, 3, 5, 8, 9, 24, 64 } ) {
+		int rs[2] = { R, H };
+		auto xr = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rs, 2 );
+		auto outr = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rs, 2 );
+		int* d_idx_r = static_cast<int*>( engine::core::arena_alloc( arena, R * K * sizeof( int ) ) );
+		half* d_w_r = static_cast<half*>( engine::core::arena_alloc( arena, R * K * sizeof( half ) ) );
+		std::vector<half> hxr( static_cast<size_t>( R ) * H ), hwr( R * K );
+		std::vector<int> hir( R * K );
+		for ( auto& v : hxr ) {
+			seed = seed * 1664525u + 1013904223u;
+			v = __float2half( ( ( seed >> 8 ) / 16777216.0f ) * 2.0f - 1.0f );
+		}
+		for ( int r = 0; r < R; ++r ) {
+			int used[300] = {};
+			for ( int k = 0; k < K; ++k ) {
+				int e;
+				do {
+					seed = seed * 1664525u + 1013904223u;
+					e = ( ( seed >> 12 ) % 4 == 0 ) ? 72 + ( ( seed >> 4 ) % 200 ) : ( ( seed >> 4 ) % 10 );
+				} while ( used[e] );
+				used[e] = 1;
+				hir[r * K + k] = e;
+				hwr[r * K + k] = __float2half( h_wf[k] );
+			}
+		}
+		CUDA_CHECK( cudaMemcpy( xr.data, hxr.data(), hxr.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMemcpy( d_idx_r, hir.data(), hir.size() * sizeof( int ), cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMemcpy( d_w_r, hwr.data(), hwr.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
+		auto scratch_r = engine::modules::MoE::alloc_scratch( arena, E, K, H, I, R );
+		engine::modules::MoE::forward( xr, mw, d_idx_r, d_w_r, outr, 0, E, scratch_r, 10.0f, stream );
+		std::vector<half> h_got( static_cast<size_t>( R ) * H ), h_want( static_cast<size_t>( R ) * H );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		CUDA_CHECK( cudaMemcpy( h_got.data(), outr.data, h_got.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+		for ( int r = 0; r < R; ++r ) {
+			pod::TensorView x1 = pod::make_tensor_2d( xr.ptr<half>() + static_cast<size_t>( r ) * H, pod::DType::FP16, 1, H );
+			pod::TensorView o1 = pod::make_tensor_2d( outr.ptr<half>() + static_cast<size_t>( r ) * H, pod::DType::FP16, 1, H );
+			engine::modules::MoE::forward( x1, mw, d_idx_r + r * K, d_w_r + r * K, o1, 0, E, scratch, 10.0f, stream );
+			CUDA_CHECK( cudaStreamSynchronize( stream ) );
+			CUDA_CHECK( cudaMemcpy( h_want.data() + static_cast<size_t>( r ) * H, o1.data, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
+		}
+		double dot = 0, na = 0, nb = 0, maxd = 0;
+		for ( size_t i = 0; i < h_got.size(); ++i ) {
+			const double a = __half2float( h_want[i] ), b = __half2float( h_got[i] );
+			dot += a * b;
+			na += a * a;
+			nb += b * b;
+			maxd = std::fmax( maxd, std::fabs( a - b ) );
+		}
+		const double c = dot / ( std::sqrt( na ) * std::sqrt( nb ) + 1e-12 );
+		std::printf( "[*] MoE %2d rows vs per-row: cos=%.6f max_abs=%.5f (|ref|=%.2f)\n", R, c, maxd, std::sqrt( na ) );
+		multi_pass = multi_pass && c >= 0.9999;
+	}
+	std::printf( "[%c] MoE MULTI-ROW %s\n", multi_pass ? '+' : '-', multi_pass ? "PASS" : "FAIL" );
 	repo.close();
 	engine::core::arena_destroy( arena );
 	engine::modules::trellis_context_destroy();

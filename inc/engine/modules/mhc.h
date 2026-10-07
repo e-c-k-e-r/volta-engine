@@ -12,14 +12,16 @@ struct HyperConnection {
 		const pod::TensorView& in,
 		pod::TensorView& streams,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
 	static void init_streams(
 		const half* in,
 		float* streams,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
 	static void collapse(
@@ -36,7 +38,8 @@ struct HyperConnection {
 		int hidden_size = 4096,
 		int sinkhorn_iters = 20,
 		float eps = 1e-6f,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
 	static void collapse(
@@ -53,7 +56,8 @@ struct HyperConnection {
 		int hidden_size = 4096,
 		int sinkhorn_iters = 20,
 		float eps = 1e-6f,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
 	static void update(
@@ -62,7 +66,8 @@ struct HyperConnection {
 		const pod::TensorView& post,
 		const pod::TensorView& comb,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
 	static void update(
@@ -72,7 +77,8 @@ struct HyperConnection {
 		const pod::TensorView& post,
 		const pod::TensorView& comb,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
 	static void update(
@@ -81,7 +87,8 @@ struct HyperConnection {
 		const float* post,
 		const float* comb,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
 	static void update(
@@ -91,7 +98,8 @@ struct HyperConnection {
 		const float* post,
 		const float* comb,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 };
 
@@ -101,21 +109,24 @@ struct HyperHead {
 		pod::TensorView& final_hidden,
 		int hidden_size = 4096,
 		bool mean = true,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
 	static void mean(
 		const pod::TensorView& streams,
 		pod::TensorView& final_hidden,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
 	static void mean(
 		const float* streams,
 		half* final_hidden,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 };
 

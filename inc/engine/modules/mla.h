@@ -48,7 +48,8 @@ struct MLA {
 		pod::TensorView& v_out,
 		int num_heads = 16,
 		int head_dim = 256,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // kv_norm [rows, 512] -> k/v [rows, heads * head_dim]
 	);
 
 	static void store_kv_cache(
@@ -61,7 +62,8 @@ struct MLA {
 		int total_elems = 4096,
 		int max_seq = 2048,
 		cudaStream_t stream = nullptr,
-		const pod::SlotRef& slot = {} // if set: pos/slot read on device (graph-capturable)
+		const pod::SlotRef& slot = {}, // if set: pos/slot read on device (graph-capturable)
+		int rows = 1                   // consecutive rows slot.row .. slot.row + rows - 1
 	);
 
 	static void forward_decode(
@@ -75,7 +77,8 @@ struct MLA {
 		int head_dim = 256,
 		int max_seq = 2048,
 		cudaStream_t stream = nullptr,
-		const pod::SlotRef& slot = {} // if set: pos/slot read on device (graph-capturable)
+		const pod::SlotRef& slot = {}, // if set: pos/slot read on device (graph-capturable)
+		int rows = 1                   // consecutive rows slot.row .. slot.row + rows - 1
 	);
 };
 

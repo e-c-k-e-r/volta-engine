@@ -104,7 +104,7 @@ __global__ void moe_dispatch_scatter_kernel(
 }
 
 // Router scratch: the 288 logits handed from the dot-product kernel to the selection kernel.
-__device__ float g_router_logits[288];
+__device__ float g_router_logits[256 * 288];
 
 // One warp per 32 experts, one thread per expert, summed in the same sequential order as the original
 // single-block kernel (bit-identical logits). The single block was bound by memory-level parallelism on
@@ -118,6 +118,8 @@ void router_logits_kernel(
 	int num_experts
 ) {
 	extern __shared__ float s_x[];
+	const int m = blockIdx.y;
+	x += static_cast<size_t>( m ) * hidden_size;
 	for ( int d = threadIdx.x; d < hidden_size; d += blockDim.x ) {
 		s_x[d] = __half2float( x[d] );
 	}
@@ -139,7 +141,7 @@ void router_logits_kernel(
 			logit = fmaf( s_x[d0 + j], __half2float( w[j] ), logit );
 		}
 	}
-	g_router_logits[expert] = logit;
+	g_router_logits[m * 288 + expert] = logit;
 }
 
 __global__ __launch_bounds__( 32 )
@@ -153,8 +155,11 @@ void router_select_kernel(
 ) {
 	__shared__ float s_raw[288];
 	__shared__ float s_select[288];
+	const int m = blockIdx.x;
+	topk_indices += m * top_k;
+	topk_weights += m * top_k;
 	for ( int expert = threadIdx.x; expert < num_experts; expert += 32 ) {
-		const float raw_score = 1.0f / ( 1.0f + __expf( -g_router_logits[expert] ) );
+		const float raw_score = 1.0f / ( 1.0f + __expf( -g_router_logits[m * 288 + expert] ) );
 		float select_score = raw_score;
 		if ( e_score_bias != nullptr ) {
 			select_score += __half2float( e_score_bias[expert] );
@@ -260,18 +265,20 @@ void MoERouter::route_topk(
 	int num_experts,
 	int top_k,
 	float routed_scaling_factor,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
+	ENGINE_ASSERT( rows >= 1 && rows <= 256, "MoERouter::route_topk: rows out of range" );
 	ENGINE_ASSERT( top_k <= 16 && num_experts <= 288 && hidden_size % 128 == 0, "MoERouter::route_topk: top_k / num_experts / hidden_size out of range" );
 	const size_t smem = static_cast<size_t>( hidden_size ) * sizeof( float );
 	ENGINE_ASSERT( smem <= 48 * 1024, "MoERouter::route_topk: hidden_size exceeds the staged activation" );
-	router_logits_kernel<<<dim3( ( num_experts + 31 ) / 32 ), dim3( 32 ), smem, stream>>>(
+	router_logits_kernel<<<dim3( ( num_experts + 31 ) / 32, rows ), dim3( 32 ), smem, stream>>>(
 		x.ptr<const half>(),
 		router_weights.ptr<const half>(),
 		hidden_size,
 		num_experts
 	);
-	router_select_kernel<<<dim3( 1 ), dim3( 32 ), 0, stream>>>(
+	router_select_kernel<<<dim3( rows ), dim3( 32 ), 0, stream>>>(
 		e_score_bias.ptr<const half>(),
 		d_topk_indices,
 		d_topk_weights,
@@ -337,9 +344,10 @@ void MoERouter::exl3_moe_dispatch(
 	int routing_first,
 	int routing_last,
 	int4* active_experts,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
-	int n = 8;
+	const int n = 8 * rows;
 	int device = 0;
 	cudaGetDevice( &device );
 	int* locks = engine::modules::trellis_get_locks( device );
@@ -359,7 +367,7 @@ void MoERouter::exl3_moe_dispatch(
 		num_groups
 	);
 
-	moe_dispatch_scatter_kernel<<<dim3( 1 ), dim3( 32 ), 0, stream>>>(
+	moe_dispatch_scatter_kernel<<<dim3( ( n + 31 ) / 32 ), dim3( 32 ), 0, stream>>>(
 		selected_experts,
 		routing_weights,
 		n,
@@ -406,14 +414,15 @@ pod::MoEScratch MoE::alloc_scratch(
 	int num_local_experts,
 	int top_k,
 	int hidden_size,
-	int intermediate_size
+	int intermediate_size,
+	int max_rows
 ) {
 	const int groups = 10;
 	const size_t E1 = static_cast<size_t>( num_local_experts ) + 1;
 	pod::MoEScratch s;
 	s.expert_count = static_cast<int64_t*>( engine::core::arena_alloc( arena, E1 * sizeof( int64_t ) ) );
-	s.token_sorted = static_cast<int64_t*>( engine::core::arena_alloc( arena, top_k * sizeof( int64_t ) ) );
-	s.weight_sorted = static_cast<half*>( engine::core::arena_alloc( arena, top_k * sizeof( half ) ) );
+	s.token_sorted = static_cast<int64_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( top_k ) * max_rows * sizeof( int64_t ) ) );
+	s.weight_sorted = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( top_k ) * max_rows * sizeof( half ) ) );
 	s.cursors = static_cast<int*>( engine::core::arena_alloc( arena, E1 * sizeof( int ) ) );
 	s.active_experts = static_cast<int4*>( engine::core::arena_alloc( arena, E1 * sizeof( int4 ) ) );
 	const size_t state_elems = static_cast<size_t>( groups ) * top_k * hidden_size;
@@ -438,6 +447,7 @@ void MoE::forward(
 	cudaStream_t stream
 ) {
 	CUDA_CHECK( cudaMemsetAsync( out.data, 0, out.size_bytes(), stream ) );
+	const int rows = ( out.ndim >= 2 && out.shape[0] > 0 ) ? out.shape[0] : 1;
 
 	switch ( weights.type ) {
 		case pod::QuantType::TRELLIS: {
@@ -459,7 +469,8 @@ void MoE::forward(
 				start_expert,
 				end_expert,
 				scratch.active_experts,
-				stream
+				stream,
+				rows
 			);
 
 			const void** d_ptrs = static_cast<const void**>( weights.device_ptrs );
@@ -547,9 +558,9 @@ void exl3_moe(
 	int intermediate_dim = 2048;
 	int num_experts = 72;
 	int num_experts_per_tok = 8;
-	int max_tokens_per_expert = 8;
+	int max_tokens_per_expert = 4; // the m4 GEMM tile holds 4 rows; larger expert batches run in chunks
 	int concurrency = num_groups;
-	int chunk_all = 0;
+	int chunk_all = 1; // experts above max_tokens_per_expert tokens are evaluated in chunks of max_tokens_per_expert
 
 	void* kernel_args[] = {
 		(void*) &_hidden_state,

@@ -134,6 +134,7 @@ public:
 	void embed_tokens( const int* token_ids, int count, cudaStream_t stream = nullptr ) override;
 	void forward( const pod::BatchRows& rows, cudaStream_t stream = nullptr ) override;
 	void sample_tokens( int* out_preds, int count, cudaStream_t stream = nullptr ) override;
+	bool topk_local( float* out_vals, int* out_ids, int count, cudaStream_t stream = nullptr ) override;
 
 	void checkpoint_state( int slot_id, cudaStream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, cudaStream_t stream = nullptr ) override;
@@ -147,15 +148,19 @@ public:
 	void destroy();
 
 private:
-	// Single-token layer stack for one row: embed_rows_[row] -> logits_[row]; slot and position
-	// are read from d_rows_ on device so the launch sequence is graph-replayable
-	void forward_row( int row, cudaStream_t stream );
+	static constexpr int kTopkTile = 4096;   // TOPK_THREADS * 16, as in the Qwen head
+
+	// Layer stack over m rows at once: embed_rows_[0..m) -> logits_[0..m); slot and position of each row are
+	// read from d_rows_ on device so the launch sequence depends on m alone and is graph-replayable
+	void forward_body( int m, cudaStream_t stream );
+	void set_rows( int m );
 
 	pod::BatchRows* d_rows_ = nullptr;
 	engine::core::GraphCache graphs_;
 
 	engine::runtime::KVCachePool kv_pool_;
 	int last_rows_ = 0;
+	int lm_mode_ = pod::BatchRows::LOGITS_ALL;
 
 	ModelMetadata metadata_;
 	GLM53Config config_;
@@ -165,9 +170,9 @@ private:
 	GLM53State state_;
 	bool weights_loaded_ = false;
 
-	pod::TensorView embed_rows_;    // [MAX_BATCH, hidden] embedded inputs
-	int* d_token_ids_ = nullptr;    // [MAX_BATCH]
-	pod::TensorView hidden_states_; // [1, hidden] current row
+	pod::TensorView embed_rows_;    // [MAX_ROWS, hidden] embedded inputs
+	int* d_token_ids_ = nullptr;    // [MAX_ROWS]
+	pod::TensorView hidden_states_; // [rows, hidden]
 	pod::TensorView norm_hidden_;
 
 	// mHC residual stream buffers
@@ -214,6 +219,11 @@ private:
 	pod::LinearWeight lm_head_;
 	pod::TensorView logits_;  // [MAX_BATCH, vocab] (rank 0)
 	int* d_argmax_idx_ = nullptr;
+	float* samp_part_v_ = nullptr;   // top-k sampling scratch (rank 0)
+	int* samp_part_i_ = nullptr;
+	int* samp_counters_ = nullptr;
+	float* d_samp_vals_ = nullptr;
+	int* d_samp_idx_ = nullptr;
 	int* h_argmax_idx_ = nullptr;
 };
 

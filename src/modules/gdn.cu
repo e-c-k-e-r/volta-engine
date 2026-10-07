@@ -533,6 +533,10 @@ __global__ void project_kda_stage1_kernel(
 ) {
 	int row = blockIdx.x;
 	if ( row >= 272 ) return;
+	norm_hidden += static_cast<size_t>( blockIdx.y ) * hidden_size;
+	beta_out += blockIdx.y * 16;
+	f_a_buf += blockIdx.y * 128;
+	g_a_buf += blockIdx.y * 128;
 
 	const half* weight_row = nullptr;
 	if ( row < 16 ) {
@@ -616,6 +620,10 @@ __global__ void project_kda_stage2_kernel(
 ) {
 	int j = blockIdx.x * blockDim.x + threadIdx.x;
 	if ( j >= num_channels ) return;
+	f_a_buf += blockIdx.y * 128;
+	g_a_buf += blockIdx.y * 128;
+	g_decay_out += static_cast<size_t>( blockIdx.y ) * num_channels;
+	z_out += static_cast<size_t>( blockIdx.y ) * num_channels;
 
 	int h = j / 128;
 
@@ -803,6 +811,115 @@ __global__ void kda_recurrent_step_and_norm_kernel(
 	float gate_val = 1.0f / ( 1.0f + __expf( -z_val ) );
 
 	output[h * head_dim + c] = __float2half_rn( y_core * inv_rms * gamma * gate_val );
+}
+
+
+// Multi-row KDA step: thread c owns value column c of one head; its 128-element state column stays in registers
+// across consecutive rows of one slot. Per-row arithmetic and summation order are those of
+// kda_recurrent_step_and_norm_kernel (bit-identical to stepping the rows one at a time).
+__global__ void __launch_bounds__( 128 )
+kda_recurrent_rows_kernel(
+	float* __restrict__ state,
+	const half* __restrict__ qkv,
+	const float* __restrict__ g_decay,
+	const float* __restrict__ beta,
+	const half* __restrict__ z,
+	const half* __restrict__ o_norm,
+	half* __restrict__ output,
+	int num_heads,
+	float eps,
+	int rows,
+	const pod::BatchRows* __restrict__ d_rows,
+	size_t slot_stride,
+	float* __restrict__ snap,
+	size_t snap_stride,
+	int snap_rows,
+	const int* __restrict__ snap_on
+) {
+	const int h = blockIdx.x;
+	const int c = threadIdx.x;
+	const int channels = num_heads * 128;
+	const bool do_snap = snap && *snap_on;
+
+	__shared__ float s_g_exp[128];
+	__shared__ float s_k[128];
+	__shared__ float s_q[128];
+	__shared__ float s_warp_sums[4];
+
+	float s[128];
+	int cur = -1;
+	for ( int m = 0; m < rows; ++m ) {
+		const int slot = d_rows->slot[m];
+		if ( slot != cur ) {
+			if ( cur >= 0 ) {
+				float* st = state + static_cast<size_t>( cur ) * slot_stride + static_cast<size_t>( h ) * 128 * 128;
+				#pragma unroll
+				for ( int r = 0; r < 128; ++r ) st[r * 128 + c] = s[r];
+			}
+			const float* st = state + static_cast<size_t>( slot ) * slot_stride + static_cast<size_t>( h ) * 128 * 128;
+			#pragma unroll
+			for ( int r = 0; r < 128; ++r ) s[r] = st[r * 128 + c];
+			cur = slot;
+		}
+
+		const half* q_ptr = qkv + static_cast<size_t>( m ) * 3 * channels + h * 128;
+		const half* k_ptr = q_ptr + channels;
+		const half* v_ptr = q_ptr + 2 * channels;
+		s_g_exp[c] = __expf( g_decay[static_cast<size_t>( m ) * channels + h * 128 + c] );
+		s_k[c] = __half2float( k_ptr[c] );
+		s_q[c] = __half2float( q_ptr[c] );
+		__syncthreads();
+
+		float kv_mem = 0.0f;
+		#pragma unroll
+		for ( int r = 0; r < 128; ++r ) {
+			s[r] = s[r] * s_g_exp[r];
+			kv_mem = fmaf( s[r], s_k[r], kv_mem );
+		}
+		const float delta = ( __half2float( v_ptr[c] ) - kv_mem ) * beta[m * num_heads + h];
+
+		float y_core = 0.0f;
+		#pragma unroll
+		for ( int r = 0; r < 128; ++r ) {
+			s[r] = fmaf( s_k[r], delta, s[r] );
+			y_core = fmaf( s[r], s_q[r], y_core );
+		}
+
+		if ( do_snap && m < snap_rows ) {
+			float* sp = snap + m * snap_stride + static_cast<size_t>( h ) * 128 * 128;
+			#pragma unroll
+			for ( int r = 0; r < 128; ++r ) sp[r * 128 + c] = s[r];
+		}
+
+		float sq = y_core * y_core;
+		#pragma unroll
+		for ( int mask = 16; mask > 0; mask >>= 1 ) {
+			sq += __shfl_xor_sync( 0xffffffff, sq, mask );
+		}
+		const int warp_id = c >> 5;
+		const int lane_id = c & 31;
+		if ( lane_id == 0 ) s_warp_sums[warp_id] = sq;
+		__syncthreads();
+		if ( warp_id == 0 ) {
+			float b_sum = ( lane_id < 4 ) ? s_warp_sums[lane_id] : 0.0f;
+			#pragma unroll
+			for ( int mask = 2; mask > 0; mask >>= 1 ) {
+				b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
+			}
+			if ( lane_id == 0 ) s_warp_sums[0] = rsqrtf( b_sum / 128.0f + eps );
+		}
+		__syncthreads();
+
+		const float inv_rms = s_warp_sums[0];
+		const float gamma = ( o_norm != nullptr ) ? __half2float( o_norm[c] ) : 1.0f;
+		const float z_val = ( z != nullptr ) ? __half2float( z[static_cast<size_t>( m ) * channels + h * 128 + c] ) : 0.0f;
+		const float gate_val = 1.0f / ( 1.0f + __expf( -z_val ) );
+		output[static_cast<size_t>( m ) * channels + h * 128 + c] = __float2half_rn( y_core * inv_rms * gamma * gate_val );
+		__syncthreads();
+	}
+	float* st = state + static_cast<size_t>( cur ) * slot_stride + static_cast<size_t>( h ) * 128 * 128;
+	#pragma unroll
+	for ( int r = 0; r < 128; ++r ) st[r * 128 + c] = s[r];
 }
 
 } // namespace
@@ -1022,11 +1139,12 @@ void GDN::project_kda_gates(
 	int num_heads,
 	int head_dim,
 	int hidden_size,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
 	(void) num_heads;
 	(void) head_dim;
-	project_kda_stage1_kernel<<<dim3( 272 ), dim3( 256 ), 0, stream>>>(
+	project_kda_stage1_kernel<<<dim3( 272, rows ), dim3( 256 ), 0, stream>>>(
 		norm_hidden.ptr<const half>(),
 		b_proj.ptr<const half>(),
 		f_a_proj.ptr<const half>(),
@@ -1040,7 +1158,7 @@ void GDN::project_kda_gates(
 	int num_channels = num_heads * head_dim; // 2048
 	int threads = 256;
 	int blocks = ( num_channels + threads - 1 ) / threads;
-	project_kda_stage2_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
+	project_kda_stage2_kernel<<<dim3( blocks, rows ), dim3( threads ), 0, stream>>>(
 		f_a_buf.ptr<const half>(),
 		g_a_buf.ptr<const half>(),
 		f_b_proj.ptr<const half>(),
@@ -1120,6 +1238,34 @@ void GDN::gated_rmsnorm(
 		num_v_heads,
 		head_dim,
 		use_sigmoid
+	);
+}
+
+void GDN::recurrent_step_kda_rows(
+	float* gdn_state,
+	const pod::TensorView& qkv,
+	const pod::TensorView& g_decay,
+	const pod::TensorView& beta,
+	const pod::TensorView& z,
+	const pod::TensorView& o_norm,
+	pod::TensorView& attn_out,
+	int num_heads,
+	int head_dim,
+	float eps,
+	int rows,
+	const pod::BatchRows* d_rows,
+	size_t slot_stride,
+	float* snap,
+	size_t snap_stride,
+	int snap_rows,
+	const int* snap_on,
+	cudaStream_t stream
+) {
+	ENGINE_ASSERT( head_dim == 128, "GDN::recurrent_step_kda_rows: head_dim must be 128" );
+	kda_recurrent_rows_kernel<<<dim3( num_heads ), dim3( 128 ), 0, stream>>>(
+		gdn_state, qkv.ptr<const half>(), g_decay.ptr<const float>(), beta.ptr<const float>(), z.ptr<const half>(),
+		o_norm.ptr<const half>(), attn_out.ptr<half>(), num_heads, eps, rows, d_rows, slot_stride,
+		snap, snap_stride, snap_rows, snap_on
 	);
 }
 

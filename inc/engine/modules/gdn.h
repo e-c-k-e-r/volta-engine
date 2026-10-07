@@ -128,7 +128,31 @@ struct GDN {
 		int num_heads = 16,
 		int head_dim = 128,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // norm_hidden [rows, hidden]; outputs are [rows, ...]
+	);
+
+	// Multi-row KDA step with the per-head state held in registers across consecutive rows of one slot;
+	// bit-identical to stepping recurrent_step_kda_fused row by row. Optional per-row post-state snapshots.
+	static void recurrent_step_kda_rows(
+		float* gdn_state,                 // layer base; slot s at + s * slot_stride
+		const pod::TensorView& qkv,       // [rows, 3 * heads * 128]
+		const pod::TensorView& g_decay,   // [rows, heads * 128]
+		const pod::TensorView& beta,      // [rows, heads]
+		const pod::TensorView& z,         // [rows, heads * 128]
+		const pod::TensorView& o_norm,
+		pod::TensorView& attn_out,        // [rows, heads * 128]
+		int num_heads,
+		int head_dim,
+		float eps,
+		int rows,
+		const pod::BatchRows* d_rows,
+		size_t slot_stride,
+		float* snap,
+		size_t snap_stride,
+		int snap_rows,
+		const int* snap_on,
+		cudaStream_t stream
 	);
 
 	static void recurrent_step_kda(

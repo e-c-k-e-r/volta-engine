@@ -146,9 +146,13 @@ __global__ void mla_kv_b_gemv_unpack_kernel(
 	int row = blockIdx.x * blockDim.x + threadIdx.x;
 	int total_rows = num_heads * ( head_dim * 2 );
 	if ( row >= total_rows ) return;
+	const int m = blockIdx.y;
+	const int out_stride = num_heads * head_dim;
+	k_out += static_cast<size_t>( m ) * out_stride;
+	v_out += static_cast<size_t>( m ) * out_stride;
 
 	const half2* W2 = reinterpret_cast<const half2*>( W + row * 512 );
-	const half2* x2 = reinterpret_cast<const half2*>( x );
+	const half2* x2 = reinterpret_cast<const half2*>( x + static_cast<size_t>( m ) * 512 );
 
 	float sum = 0.0f;
 	#pragma unroll 16
@@ -180,9 +184,12 @@ __global__ void mla_store_kv_cache_kernel(
 	const pod::SlotRef slot
 ) {
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
-	if ( slot.rows ) pos = slot.rows->pos[slot.row];
-	k_cache = slot.apply( k_cache );
-	v_cache = slot.apply( v_cache );
+	const int m = blockIdx.y;
+	if ( slot.rows ) pos = slot.rows->pos[slot.row + m];
+	k_cache += slot.rows ? static_cast<size_t>( slot.rows->slot[slot.row + m] ) * slot.stride : 0;
+	v_cache += slot.rows ? static_cast<size_t>( slot.rows->slot[slot.row + m] ) * slot.stride : 0;
+	k += static_cast<size_t>( m ) * total_elems;
+	v += static_cast<size_t>( m ) * total_elems;
 	if ( tid < total_elems ) {
 		size_t offset = ( static_cast<size_t>( mla_layer_idx ) * max_seq + pos ) * total_elems + tid;
 		k_cache[offset] = k[tid];
@@ -206,13 +213,17 @@ void mla_attend_decode_kernel(
 	int head = blockIdx.x;
 	int tid = threadIdx.x;
 	if ( head >= num_heads || tid >= head_dim ) return;
-	if ( slot.rows ) pos = slot.rows->pos[slot.row];
-	k_cache = slot.apply( k_cache );
-	v_cache = slot.apply( v_cache );
+	const int m = blockIdx.y;
+	if ( slot.rows ) {
+		pos = slot.rows->pos[slot.row + m];
+		const size_t base = static_cast<size_t>( slot.rows->slot[slot.row + m] ) * slot.stride;
+		k_cache += base;
+		v_cache += base;
+	}
 
 	int total_elems = num_heads * head_dim;
-	const half* q_head = q + head * head_dim;
-	half* out_head = out + head * head_dim;
+	const half* q_head = q + static_cast<size_t>( m ) * total_elems + head * head_dim;
+	half* out_head = out + static_cast<size_t>( m ) * total_elems + head * head_dim;
 
 	float my_q = __half2float( q_head[tid] );
 	float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
@@ -360,12 +371,13 @@ void MLA::project_kv_b(
 	pod::TensorView& v_out,
 	int num_heads,
 	int head_dim,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int rows
 ) {
 	int total_rows = num_heads * ( head_dim * 2 );
 	int threads = 256;
 	int blocks = ( total_rows + threads - 1 ) / threads;
-	mla_kv_b_gemv_unpack_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
+	mla_kv_b_gemv_unpack_kernel<<<dim3( blocks, rows ), dim3( threads ), 0, stream>>>(
 		kv_b_proj.ptr<const half>(),
 		kv_norm.ptr<const half>(),
 		k_out.ptr<half>(),
@@ -385,11 +397,12 @@ void MLA::store_kv_cache(
 	int total_elems,
 	int max_seq,
 	cudaStream_t stream,
-	const pod::SlotRef& slot
+	const pod::SlotRef& slot,
+	int rows
 ) {
 	int threads = 256;
 	int blocks = ( total_elems + threads - 1 ) / threads;
-	mla_store_kv_cache_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
+	mla_store_kv_cache_kernel<<<dim3( blocks, rows ), dim3( threads ), 0, stream>>>(
 		k_cache,
 		v_cache,
 		k.ptr<const half>(),
@@ -413,7 +426,8 @@ void MLA::forward_decode(
 	int head_dim,
 	int max_seq,
 	cudaStream_t stream,
-	const pod::SlotRef& slot
+	const pod::SlotRef& slot,
+	int rows
 ) {
 	// Device-resolved position (slot.rows set): size scores for the full window so the
 	// launch is position-independent; otherwise size for the host-provided position
@@ -421,7 +435,7 @@ void MLA::forward_decode(
 	size_t smem_bytes = static_cast<size_t>( num_tokens ) * sizeof( float );
 	ENGINE_ASSERT( smem_bytes <= 48 * 1024, "MLA::forward_decode: score buffer exceeds default smem" );
 
-	mla_attend_decode_kernel<<<dim3( num_heads ), dim3( head_dim ), smem_bytes, stream>>>(
+	mla_attend_decode_kernel<<<dim3( num_heads, rows ), dim3( head_dim ), smem_bytes, stream>>>(
 		q.ptr<const half>(),
 		k_cache,
 		v_cache,

@@ -15,10 +15,11 @@ int main( int argc, char** argv ) {
 	if ( chunks.empty() ) chunks = { 16, 64, 128 };
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = "qwen38";
-	cfg.model_dir = test::QWEN_DIR;
+	const bool glm = std::getenv( "BENCH_GLM" ) != nullptr;
+	cfg.model_type = glm ? "glm53" : "qwen38";
+	cfg.model_dir = glm ? test::GLM_DIR : test::QWEN_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
-	mc.warm_graphs( 8 );
+	if ( !glm ) mc.warm_graphs( 8 );
 	std::vector<int> ids( n );
 	uint32_t st = 12345u;
 	for ( auto& t : ids ) { st = st * 1664525u + 1013904223u; t = 1000 + static_cast<int>( ( st >> 16 ) % 100000 ); }

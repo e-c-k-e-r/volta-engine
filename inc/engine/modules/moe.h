@@ -46,7 +46,8 @@ struct MoERouter {
 		int num_experts = 288,
 		int top_k = 8,
 		float routed_scaling_factor = 2.5f,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // x [rows, hidden] -> indices / weights [rows, top_k]
 	);
 
 	static void combine(
@@ -86,7 +87,8 @@ struct MoERouter {
 		int routing_first,
 		int routing_last,
 		int4* active_experts,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int rows = 1                    // routes = 8 * rows, token index = route / 8
 	);
 };
 
@@ -102,7 +104,8 @@ struct MoE {
 		int num_local_experts,
 		int top_k,
 		int hidden_size,
-		int intermediate_size
+		int intermediate_size,
+		int max_rows = 1
 	);
 
 	// Routed-expert FFN for one token: out = sum_k w_k * expert_k( x ) over the experts in

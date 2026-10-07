@@ -168,6 +168,9 @@ set_target_properties(test_prefill_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$
 add_executable(test_prefill_equiv tests/2_parity/test_prefill_equiv.cpp)
 target_link_libraries(test_prefill_equiv PRIVATE engine_kernels)
 set_target_properties(test_prefill_equiv PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_glm_rows tests/2_parity/test_glm_rows.cpp)
+target_link_libraries(test_glm_rows PRIVATE engine_kernels)
+set_target_properties(test_glm_rows PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_attention_prefill tests/2_parity/test_attention_prefill.cpp)
 target_link_libraries(test_attention_prefill PRIVATE engine_kernels)

@@ -2,6 +2,7 @@
 #include "engine/loader/safetensors.h"
 #include "engine/modules/gdn.h"
 #include "engine/modules/embedding.h"
+#include "engine/spec/dflash.h"
 #include "trellis_context.h"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -66,14 +67,14 @@ bool GLM53Pipeline::init(
 
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 
-	const int R = pod::MAX_BATCH;
+	const int R = pod::MAX_ROWS;
 	const int S = config_.max_slots;
 	const int E_local = config_.num_experts / config_.tp_size;
 
 	// 1. Router outputs + routed-MoE dispatch scratch
-	state_.d_topk_indices = static_cast<int*>( engine::core::arena_alloc( arena, config_.top_k * sizeof( int ) ) );
-	state_.d_topk_weights = static_cast<half*>( engine::core::arena_alloc( arena, config_.top_k * sizeof( half ) ) );
-	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size );
+	state_.d_topk_indices = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( int ) ) );
+	state_.d_topk_weights = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( half ) ) );
+	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R );
 
 	// KDA recurrent state + conv history per slot: [S, 45, ...] FP32, plus one-slot checkpoints
 	state_.layer_kda_floats = static_cast<size_t>( config_.kda_heads ) * config_.kda_head_dim * config_.kda_head_dim;
@@ -87,72 +88,72 @@ bool GLM53Pipeline::init(
 	CUDA_CHECK( cudaMemset( state_.kda_states, 0, S * slot_kda * sizeof( float ) ) );
 	CUDA_CHECK( cudaMemset( state_.conv_history, 0, S * slot_conv * sizeof( float ) ) );
 
-	// 2. Activations: rows are embedded together, then the layer stack runs one row at a time
+	// 2. Activations: [R, ...] row buffers, viewed as [m, ...] per forward
 	int rows_shape[2] = { R, config_.hidden_size };
 	embed_rows_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rows_shape, 2 );
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
-	int h_shape[2] = { 1, config_.hidden_size };
+	int h_shape[2] = { R, config_.hidden_size };
 	hidden_states_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	norm_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 
-	int streams_shape[2] = { 4, config_.hidden_size };
+	int streams_shape[2] = { 4 * R, config_.hidden_size };
 	hidden_streams_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, streams_shape, 2 );
 	mhc_collapsed_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 
-	int rms_shape[1] = { 1 };
+	int rms_shape[1] = { R };
 	mhc_inv_rms_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, rms_shape, 1 );
 
-	int mix_shape[1] = { 24 };
+	int mix_shape[1] = { 24 * R };
 	mhc_mix_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, mix_shape, 1 );
 
-	int hc_shape[1] = { 4 };
+	int hc_shape[1] = { 4 * R };
 	mhc_pre_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, hc_shape, 1 );
 	mhc_post_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, hc_shape, 1 );
 
-	int comb_shape[2] = { 4, 4 };
+	int comb_shape[2] = { 4 * R, 4 };
 	mhc_comb_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, comb_shape, 2 );
 
 	// 3. MLA KV cache pool [S, 11, max_seq, 16 * 256] FP16 & execution buffers
 	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	kv_pool_.init( rank_, arena, S, config_.max_seq, config_.num_mla_layers, 16, 256 );
 
-	int q_lora_shape[2] = { 1, 1536 };
+	int q_lora_shape[2] = { R, 1536 };
 	q_lora_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_lora_shape, 2 );
 	q_lora_norm_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_lora_shape, 2 );
 
-	int q_shape[2] = { 1, 4096 };
+	int q_shape[2] = { R, 4096 };
 	q_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_shape, 2 );
 
-	int kv_lora_shape[2] = { 1, 512 };
+	int kv_lora_shape[2] = { R, 512 };
 	kv_lora_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_lora_shape, 2 );
 	kv_lora_norm_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_lora_shape, 2 );
 
-	int kv_head_shape[2] = { 1, 4096 };
+	int kv_head_shape[2] = { R, 4096 };
 	k_head_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_head_shape, 2 );
 	v_head_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_head_shape, 2 );
 	mla_heads_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_head_shape, 2 );
 
 	// KDA linear attention buffers
-	int qkv_shape[2] = { 1, 6144 };
+	int qkv_shape[2] = { R, 6144 };
 	qkv_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
 
-	int fa_shape[2] = { 1, 128 };
+	int fa_shape[2] = { R, 128 };
 	f_a_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, fa_shape, 2 );
 	g_a_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, fa_shape, 2 );
 
-	int beta_shape[2] = { 1, 16 };
+	int beta_shape[2] = { R, 16 };
 	beta_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, beta_shape, 2 );
 
-	int gdec_shape[2] = { 1, 2048 };
+	int gdec_shape[2] = { R, 2048 };
 	g_decay_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, gdec_shape, 2 );
 
-	int z_shape[2] = { 1, 2048 };
+	int z_shape[2] = { R, 2048 };
 	z_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
 	attn_head_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
 
 	// 4. Dense / shared-expert FFN buffers
-	int moe_inter_shape[2] = { 1, config_.dense_intermediate_size };
+	int moe_inter_shape[2] = { R, config_.dense_intermediate_size };
 	moe_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
 	moe_up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
 	moe_inter_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
@@ -162,10 +163,19 @@ bool GLM53Pipeline::init(
 
 	// 5. Logits & argmax (rank 0 owns the unsharded LM head)
 	if ( rank_ == 0 ) {
-		int logit_shape[2] = { R, config_.vocab_size };
+		int logit_shape[2] = { pod::MAX_BATCH, config_.vocab_size };
 		logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
-		d_argmax_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
-		h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( R * sizeof( int ) ) );
+		d_argmax_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, pod::MAX_BATCH * sizeof( int ) ) );
+		h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( pod::MAX_BATCH * sizeof( int ) ) );
+		const int B = pod::MAX_BATCH;
+		const int splits = ( config_.vocab_size + kTopkTile - 1 ) / kTopkTile;
+		const size_t per = static_cast<size_t>( B ) * splits * 16;
+		samp_part_v_ = static_cast<float*>( engine::core::arena_alloc( arena, per * sizeof( float ) ) );
+		samp_part_i_ = static_cast<int*>( engine::core::arena_alloc( arena, per * sizeof( int ) ) );
+		samp_counters_ = static_cast<int*>( engine::core::arena_alloc( arena, B * sizeof( int ) ) );
+		d_samp_vals_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( B ) * 16 * sizeof( float ) ) );
+		d_samp_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( B ) * 16 * sizeof( int ) ) );
+		CUDA_CHECK( cudaMemset( samp_counters_, 0, B * sizeof( int ) ) );
 	}
 
 	engine::modules::trellis_get_workspace( rank_, 16 * 1024 * 1024 );
@@ -465,9 +475,9 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 }
 
 void GLM53Pipeline::embed_tokens( const int* token_ids, int count, cudaStream_t stream ) {
-	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_BATCH, "GLM53Pipeline::embed_tokens: count out of range" );
+	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_ROWS, "GLM53Pipeline::embed_tokens: count out of range" );
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
-	embed_rows_.shape[0] = count;
+	set_rows( count );
 	// Rank 0 hosts the vocabulary table; other ranks contribute zeros to the all-reduce broadcast
 	if ( rank_ == 0 ) {
 		CUDA_CHECK( cudaMemcpyAsync( d_token_ids_, token_ids, count * sizeof( int ), cudaMemcpyHostToDevice, stream ) );
@@ -492,39 +502,86 @@ void GLM53Pipeline::sample_tokens( int* out_preds, int count, cudaStream_t strea
 	std::memcpy( out_preds, h_argmax_idx_, count * sizeof( int ) );
 }
 
+void GLM53Pipeline::set_rows( int m ) {
+	hidden_states_.shape[0] = m;
+	norm_hidden_.shape[0] = m;
+	mhc_collapsed_.shape[0] = m;
+	attn_out_.shape[0] = m;
+	q_lora_buf_.shape[0] = m;
+	q_lora_norm_buf_.shape[0] = m;
+	q_buf_.shape[0] = m;
+	kv_lora_buf_.shape[0] = m;
+	kv_lora_norm_buf_.shape[0] = m;
+	k_head_buf_.shape[0] = m;
+	v_head_buf_.shape[0] = m;
+	mla_heads_out_.shape[0] = m;
+	qkv_buf_.shape[0] = m;
+	f_a_buf_.shape[0] = m;
+	g_a_buf_.shape[0] = m;
+	beta_buf_.shape[0] = m;
+	g_decay_buf_.shape[0] = m;
+	z_buf_.shape[0] = m;
+	attn_head_out_.shape[0] = m;
+	moe_gate_buf_.shape[0] = m;
+	moe_up_buf_.shape[0] = m;
+	moe_inter_buf_.shape[0] = m;
+	moe_expert_out_.shape[0] = m;
+	local_moe_out_.shape[0] = m;
+	ffn_out_.shape[0] = m;
+	embed_rows_.shape[0] = m;
+}
+
+bool GLM53Pipeline::topk_local( float* out_vals, int* out_ids, int count, cudaStream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_BATCH, "GLM53Pipeline::topk_local: count out of range" );
+	if ( rank_ != 0 ) {
+		// The vocabulary is not sharded: other ranks contribute nothing to the cluster-wide merge
+		for ( int i = 0; i < count * 16; ++i ) {
+			out_vals[i] = -INFINITY;
+			out_ids[i] = 0;
+		}
+		return true;
+	}
+	ENGINE_ASSERT( count <= last_rows_, "GLM53Pipeline::topk_local: count exceeds last forward rows" );
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	engine::spec::dflash2_topk_shard(
+		logits_.ptr<const half>(), count, config_.vocab_size, config_.vocab_size, 16,
+		d_samp_vals_, d_samp_idx_, 0, samp_part_v_, samp_part_i_, samp_counters_, stream );
+	CUDA_CHECK( cudaMemcpyAsync( out_vals, d_samp_vals_, static_cast<size_t>( count ) * 16 * sizeof( float ), cudaMemcpyDeviceToHost, stream ) );
+	CUDA_CHECK( cudaMemcpyAsync( out_ids, d_samp_idx_, static_cast<size_t>( count ) * 16 * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	return true;
+}
+
 void GLM53Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) {
 	ENGINE_ASSERT( weights_loaded_, "GLM53Pipeline::forward: weights not loaded" );
-	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_BATCH, "GLM53Pipeline::forward: row count out of range" );
+	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_ROWS, "GLM53Pipeline::forward: row count out of range" );
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	for ( int r = 0; r < rows.count; ++r ) {
 		ENGINE_ASSERT( rows.slot[r] >= 0 && rows.slot[r] < config_.max_slots, "GLM53Pipeline::forward: slot out of range" );
 		ENGINE_ASSERT( rows.pos[r] >= 0 && rows.pos[r] < config_.max_seq, "GLM53Pipeline::forward: position out of range" );
 	}
 	const int m = rows.count;
-	last_rows_ = m;
+	// Logits selection applies to eager prefill chunks only (decode graphs are keyed on m alone)
+	lm_mode_ = ( m > pod::MAX_BATCH ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;
+	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
+	set_rows( m );
+	// Pageable source: the copy is staged before return, so `rows` may be a temporary
 	CUDA_CHECK( cudaMemcpyAsync( d_rows_, &rows, sizeof( pod::BatchRows ), cudaMemcpyHostToDevice, stream ) );
-	// MLA / KDA / mHC kernels are single-token; rows run in order so a causal block advances
-	// its slot state exactly as sequential decode would. The per-m body is graph-replayed.
-	graphs_.run( m, stream, [&]( cudaStream_t s ) {
-		for ( int r = 0; r < m; ++r ) {
-			forward_row( r, s );
-		}
-	} );
+	graphs_.run( m, stream, [&]( cudaStream_t s ) { forward_body( m, s ); } );
 }
 
-void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
-	// Slot-0 base pointers; slot and position of `row` are resolved on device from d_rows_
+void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
+	// Slot-0 base pointers; slot and position of each row are resolved on device from d_rows_
 	half* slot_k = static_cast<half*>( kv_pool_.get_k_ptr( 0, 0, 0 ) );
 	half* slot_v = static_cast<half*>( kv_pool_.get_v_ptr( 0, 0, 0 ) );
-	float* slot_kda = state_.kda_states;
-	float* slot_conv = state_.conv_history;
-	const pod::SlotRef kv_ref{ d_rows_, row, kv_pool_.slot_stride_bytes / sizeof( half ) };
-	const pod::SlotRef kda_ref{ d_rows_, row, state_.layer_kda_floats * config_.num_layers };
-	const pod::SlotRef conv_ref{ d_rows_, row, state_.layer_conv_floats * config_.num_layers };
+	const size_t kv_slot_stride = kv_pool_.slot_stride_bytes / sizeof( half );
+	const pod::SlotRef kv_ref{ d_rows_, 0, kv_slot_stride };
+	const size_t slot_kda_floats = state_.layer_kda_floats * config_.num_layers;
+	const size_t slot_conv_floats = state_.layer_conv_floats * config_.num_layers;
+	const int H = config_.hidden_size;
 
-	// mHC: expand this row's embedding into the 4 residual streams
-	pod::TensorView embed_row = pod::make_tensor_2d( embed_rows_.ptr<half>() + static_cast<size_t>( row ) * config_.hidden_size, pod::DType::FP16, 1, config_.hidden_size );
-	engine::modules::HyperConnection::init_streams( embed_row, hidden_streams_, config_.hidden_size, stream );
+	// mHC: expand every row's embedding into its 4 residual streams
+	engine::modules::HyperConnection::init_streams( embed_rows_, hidden_streams_, H, stream, m );
 
 	// Routed experts are partitioned across ranks (TP=4)
 	int experts_per_rank = config_.num_experts / config_.tp_size; // 72
@@ -537,20 +594,9 @@ void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
 		if ( lw.hc_attn_fn.data != nullptr ) {
 			// mHC pre-step: attention
 			engine::modules::HyperConnection::collapse(
-				hidden_streams_,
-				lw.hc_attn_fn,
-				lw.hc_attn_base,
-				lw.hc_attn_scale,
-				mhc_collapsed_,
-				mhc_post_,
-				mhc_comb_,
-				mhc_inv_rms_,
-				mhc_mix_logits_,
-				mhc_pre_,
-				config_.hidden_size,
-				20,
-				1e-6f,
-				stream
+				hidden_streams_, lw.hc_attn_fn, lw.hc_attn_base, lw.hc_attn_scale,
+				mhc_collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_logits_, mhc_pre_,
+				H, 20, 1e-6f, stream, m
 			);
 
 			// 1. Input RMSNorm: norm_hidden = rms_norm(mhc_collapsed_)
@@ -567,32 +613,31 @@ void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
 
 		// 2. Attention
 		if ( lw.is_linear_attn && lw.qkv.is_valid() ) {
-			float* layer_kda = slot_kda + static_cast<size_t>( layer ) * state_.layer_kda_floats;
-			pod::TensorView conv_hist = pod::make_tensor_1d(
-				slot_conv + static_cast<size_t>( layer ) * state_.layer_conv_floats, pod::DType::FP32, static_cast<int>( state_.layer_conv_floats )
-			);
+			float* layer_kda = state_.kda_states + static_cast<size_t>( layer ) * state_.layer_kda_floats;
+			float* layer_conv = state_.conv_history + static_cast<size_t>( layer ) * state_.layer_conv_floats;
 
 			engine::modules::Linear::forward(
 				norm_hidden_, lw.qkv, qkv_buf_, stream
 			);
 
-			engine::modules::GDN::causal_conv1d_silu(
-				qkv_buf_, conv_hist, lw.conv1d_weights, config_.kda_channels, stream, conv_ref
+			engine::modules::GDN::causal_conv1d_silu_rows(
+				qkv_buf_, layer_conv, lw.conv1d_weights, config_.kda_channels, m, d_rows_, slot_conv_floats,
+				nullptr, 0, 0, nullptr, stream
 			);
 
 			engine::modules::GDN::l2_norm_heads(
-				qkv_buf_, 16, 128, stream, true
+				qkv_buf_, 16, 128, stream, true, m, config_.kda_channels
 			);
 
 			engine::modules::GDN::project_kda_gates(
 				norm_hidden_, lw.b_proj, lw.f_a_proj, lw.f_b_proj, lw.g_a_proj, lw.g_b_proj,
 				lw.A_log, lw.dt_bias, beta_buf_, g_decay_buf_, z_buf_, f_a_buf_, g_a_buf_,
-				16, 128, config_.hidden_size, stream
+				16, 128, H, stream, m
 			);
 
-			engine::modules::GDN::recurrent_step_kda_fused(
+			engine::modules::GDN::recurrent_step_kda_rows(
 				layer_kda, qkv_buf_, g_decay_buf_, beta_buf_, z_buf_, lw.o_norm, attn_head_out_,
-				16, 128, 1e-5f, stream, kda_ref
+				16, 128, 1e-5f, m, d_rows_, slot_kda_floats, nullptr, 0, 0, nullptr, stream
 			);
 
 			if ( lw.o_proj.is_valid() ) {
@@ -608,12 +653,7 @@ void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
 			if ( lw.hc_attn_fn.data != nullptr ) {
 				// mHC post-step: attention update
 				engine::modules::HyperConnection::update(
-					hidden_streams_,
-					attn_out_,
-					mhc_post_,
-					mhc_comb_,
-					config_.hidden_size,
-					stream
+					hidden_streams_, attn_out_, mhc_post_, mhc_comb_, H, stream, m
 				);
 			}
 			else {
@@ -648,19 +688,18 @@ void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
 
 			engine::modules::MLA::project_kv_b(
 				kv_lora_norm_buf_, lw.kv_b_proj, k_head_buf_, v_head_buf_,
-				16, 256, stream
+				16, 256, stream, m
 			);
 
-			// Store to KV cache
+			// Store every row's K/V first, then attend: row r reads positions 0..pos[r] of its slot
 			engine::modules::MLA::store_kv_cache(
 				slot_k, slot_v, k_head_buf_, v_head_buf_,
-				mla_idx, 0, 4096, config_.max_seq, stream, kv_ref
+				mla_idx, 0, 4096, config_.max_seq, stream, kv_ref, m
 			);
 
-			// Compute latent attention dot product and attend over past tokens
 			engine::modules::MLA::forward_decode(
 				q_buf_, slot_k, slot_v, mla_heads_out_,
-				mla_idx, 0, 16, 256, config_.max_seq, stream, kv_ref
+				mla_idx, 0, 16, 256, config_.max_seq, stream, kv_ref, m
 			);
 
 			// Project output: o_proj -> ring_->all_reduce across the 4 ranks
@@ -677,12 +716,7 @@ void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
 			if ( lw.hc_attn_fn.data != nullptr ) {
 				// mHC post-step: attention update
 				engine::modules::HyperConnection::update(
-					hidden_streams_,
-					attn_out_,
-					mhc_post_,
-					mhc_comb_,
-					config_.hidden_size,
-					stream
+					hidden_streams_, attn_out_, mhc_post_, mhc_comb_, H, stream, m
 				);
 			}
 			else {
@@ -694,20 +728,9 @@ void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
 		if ( lw.hc_ffn_fn.data != nullptr ) {
 			// mHC pre-step: FFN
 			engine::modules::HyperConnection::collapse(
-				hidden_streams_,
-				lw.hc_ffn_fn,
-				lw.hc_ffn_base,
-				lw.hc_ffn_scale,
-				mhc_collapsed_,
-				mhc_post_,
-				mhc_comb_,
-				mhc_inv_rms_,
-				mhc_mix_logits_,
-				mhc_pre_,
-				config_.hidden_size,
-				20,
-				1e-6f,
-				stream
+				hidden_streams_, lw.hc_ffn_fn, lw.hc_ffn_base, lw.hc_ffn_scale,
+				mhc_collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_logits_, mhc_pre_,
+				H, 20, 1e-6f, stream, m
 			);
 
 			// 3. Post-attention RMSNorm: norm_hidden = rms_norm(mhc_collapsed_)
@@ -726,19 +749,12 @@ void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
 		if ( lw.is_moe ) {
 			// Replicated Top-K Router: 288 experts, top-8 selection evaluated on all ranks
 			engine::modules::MoERouter::route_topk(
-				norm_hidden_,
-				lw.router_weights,
-				lw.e_score_bias,
-				state_.d_topk_indices,
-				state_.d_topk_weights,
-				config_.hidden_size,
-				config_.num_experts,
-				config_.top_k,
-				2.5f,
-				stream
+				norm_hidden_, lw.router_weights, lw.e_score_bias,
+				state_.d_topk_indices, state_.d_topk_weights,
+				H, config_.num_experts, config_.top_k, 2.5f, stream, m
 			);
 
-			// Routed experts in this rank's partition: device-resident dispatch, no host sync
+				// Routed experts in this rank's partition: device-resident dispatch, no host sync
 			engine::modules::MoE::forward(
 				norm_hidden_, lw.moe_weights,
 				state_.d_topk_indices, state_.d_topk_weights,
@@ -746,7 +762,7 @@ void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
 				state_.moe, 10.0f, stream
 			);
 
-			// Shared expert (executed on rank 0, or partitioned)
+				// Shared expert (executed on rank 0, or partitioned)
 			if ( lw.has_shared_expert && rank_ == 0 ) {
 				engine::modules::Linear::forward(
 					norm_hidden_, lw.shared_expert.gate, moe_gate_buf_, stream
@@ -763,12 +779,12 @@ void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
 					local_moe_out_.ptr<half>(),
 					moe_expert_out_.ptr<const half>(),
 					__float2half_rn( 1.0f ),
-					config_.hidden_size,
+					m * H,
 					stream
 				);
 			}
 
-			// Sum local expert contributions across NVLink mesh
+				// Sum local expert contributions across NVLink mesh
 			if ( ring_ ) {
 				ring_->all_reduce( local_moe_out_, stream );
 			}
@@ -794,12 +810,7 @@ void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
 		if ( lw.hc_ffn_fn.data != nullptr ) {
 			// mHC post-step: FFN update
 			engine::modules::HyperConnection::update(
-				hidden_streams_,
-				ffn_res,
-				mhc_post_,
-				mhc_comb_,
-				config_.hidden_size,
-				stream
+				hidden_streams_, ffn_res, mhc_post_, mhc_comb_, H, stream, m
 			);
 		}
 		else {
@@ -814,21 +825,24 @@ void GLM53Pipeline::forward_row( int row, cudaStream_t stream ) {
 
 	if ( layers_[0].hc_attn_fn.data != nullptr ) {
 		// HyperHead unweighted mean across 4 streams
-		engine::modules::HyperHead::mean(
-			hidden_streams_,
-			hidden_states_,
-			config_.hidden_size,
-			stream
-		);
+		engine::modules::HyperHead::mean( hidden_streams_, hidden_states_, H, stream, m );
 	}
 
-	// Final norm + LM head into logits_[row] (rank 0 owns the unsharded vocabulary)
+	// Final norm + LM head (rank 0 owns the unsharded vocabulary)
 	if ( rank_ == 0 ) {
+		if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
+		if ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) {
+			// Prefill: only the final row's logits are read
+			pod::TensorView h1 = pod::make_tensor_2d( hidden_states_.ptr<half>() + static_cast<size_t>( m - 1 ) * H, pod::DType::FP16, 1, H );
+			pod::TensorView n1 = pod::make_tensor_2d( norm_hidden_.ptr<half>(), pod::DType::FP16, 1, H );
+			pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<half>(), pod::DType::FP16, 1, config_.vocab_size );
+			engine::modules::RMSNorm::forward( h1, final_norm_, n1, 1e-5f, 0.0f, stream );
+			engine::modules::Linear::forward( n1, lm_head_, l1, stream );
+			return;
+		}
+		logits_.shape[0] = m;
 		engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, 1e-5f, 0.0f, stream );
-		pod::TensorView logits_row = pod::make_tensor_2d(
-			logits_.ptr<half>() + static_cast<size_t>( row ) * config_.vocab_size, pod::DType::FP16, 1, config_.vocab_size
-		);
-		engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_row, stream );
+		engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
 	}
 }
 
