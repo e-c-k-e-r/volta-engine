@@ -468,7 +468,7 @@ void MoE::forward(
 	// Concurrent expert groups: a rank has ~2 active experts at one row, ~13 at eight, all 72 in a prefill chunk, and
 	// each group has fewer blocks, so wide grouping only pays once there are experts to run side by side.
 	static const int env_groups = std::getenv( "EXL3_MOE_GROUPS" ) ? std::atoi( std::getenv( "EXL3_MOE_GROUPS" ) ) : 0;
-	const int num_groups = env_groups > 0 ? MIN( env_groups, MOE_MAX_GROUPS ) : ( rows <= 16 ? 1 : MOE_MAX_GROUPS );
+	const int num_groups = env_groups > 0 ? MIN( env_groups, MOE_MAX_GROUPS ) : ( rows == 1 ? 1 : rows <= 16 ? 4 : MOE_MAX_GROUPS );
 	const size_t plane_elems = static_cast<size_t>( rows ) * out.shape[out.ndim - 1];
 	half* target = ( num_groups == 1 ) ? out.ptr<half>() : scratch.planes;
 	CUDA_CHECK( cudaMemsetAsync( target, 0, plane_elems * num_groups * sizeof( half ), stream ) );

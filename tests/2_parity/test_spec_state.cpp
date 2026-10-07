@@ -104,7 +104,8 @@ int main() {
 		// GLM: the replay runs a different row count than the verify block, hence a different Linear kernel family
 		// (int8 GEMV at 1-2 rows, FP16 GEMV at 4/8, fused GEMM otherwise), which already differ by ~0.5 logit; replay
 		// lengths that land in the verify block's family (4, 8) agree bit for bit.
-		const bool ok = max_ulps <= ( glm ? 64.0 : 2.0 ) && ia == ib;
+		// The MoE also sums its expert groups in a row-count-dependent order (4 groups at 2..16 rows, 1 at one row).
+		const bool ok = max_ulps <= ( glm ? 96.0 : 2.0 ) && ia == ib;
 		fails += ok ? 0 : 1;
 		std::printf( "  accepted %d: max logit diff %.2f ULP, argmax %d vs %d  %s\n", a, max_ulps, ia, ib, ok ? "PASS" : "FAIL" );
 	}
