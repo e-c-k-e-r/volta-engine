@@ -44,8 +44,12 @@ int main() {
 		{ "gdn qkv", 5120, 2560, 4 }, { "gdn z", 5120, 1536, 4 }, { "gdn out", 1536, 5120, 4 },
 		{ "attn q+gate", 5120, 3072, 4 }, { "mlp gate/up 5b", 5120, 4352, 5 },
 		{ "lm_head full", 5120, 248320, 5 }, { "lm_head /4", 5120, 62080, 5 },
+		// DFlash2 drafter backbone (5-bit, unsharded): per layer q, k/v, o, gate/up, down; plus fc
+		{ "drafter gate/up", 5120, 17408, 5 }, { "drafter down", 17408, 5120, 5 },
+		{ "drafter q", 5120, 4096, 5 }, { "drafter o", 4096, 5120, 5 }, { "drafter k/v", 5120, 1024, 5 },
+		{ "drafter fc", 25600, 5120, 5 },
 	};
-	const int ms_list[] = { 1, 8 };
+	const int ms_list[] = { 1, 2, 4, 8 };
 	for ( const auto& sh : shapes ) {
 		const size_t words = static_cast<size_t>( sh.k / 16 ) * ( sh.n / 16 ) * 16 * sh.bits;
 		auto* B = static_cast<uint16_t*>( engine::core::arena_alloc( arena, words * 2 ) );
