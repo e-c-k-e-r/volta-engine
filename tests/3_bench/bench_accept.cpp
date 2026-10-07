@@ -48,6 +48,9 @@ int main( int argc, char** argv ) {
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	mc.warm_graphs( 8 );
 	mc.spec().set_diag( true );
+	for ( int i = 1; i < argc; ++i ) {
+		if ( !std::strcmp( argv[i], "--profile" ) ) mc.spec().set_profile( true );
+	}
 
 	int rounds = 0, proposed = 0, accepted = 0, produced = 0;
 	double ms = 0.0;
@@ -117,6 +120,7 @@ int main( int argc, char** argv ) {
 		std::printf( "   %d  | %5d | %5.1f%%       | %5.1f%%           | %5.1f%%\n", k, d.seen[k],
 			100.0 * d.top1[k] / d.seen[k], 100.0 * d.in_topk[k] / d.seen[k], 100.0 * d.walk[k] / d.seen[k] );
 	}
+	mc.spec().profile_dump();
 	mc.shutdown();
 	return 0;
 }
