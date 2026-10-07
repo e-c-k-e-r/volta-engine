@@ -105,6 +105,54 @@ int main() {
 		engine::core::arena_reset( arena );
 		A_had = engine::modules::trellis_get_workspace( 0, 16ULL * 8192 * sizeof( half ) );
 	}
+	// Concurrency probe: two independent GEMVs of one shape (own weights, own Hadamard workspace) back to
+	// back on one stream versus forked onto two streams. M >= 4 only: the M <= 2 int8 path shares one
+	// device workspace and cannot run concurrently with itself.
+	{
+		cudaStream_t s2;
+		CUDA_CHECK( cudaStreamCreateWithFlags( &s2, cudaStreamNonBlocking ) );
+		cudaEvent_t fork_ev, join_ev;
+		CUDA_CHECK( cudaEventCreateWithFlags( &fork_ev, cudaEventDisableTiming ) );
+		CUDA_CHECK( cudaEventCreateWithFlags( &join_ev, cudaEventDisableTiming ) );
+		const impl::Shape pair_shapes[] = {
+			{ "mlp gate+up", 5120, 4352, 4 }, { "gdn qkv+z", 5120, 2560, 4 }, { "drafter gate+up", 5120, 17408, 5 },
+		};
+		for ( const auto& sh : pair_shapes ) {
+			const size_t words = static_cast<size_t>( sh.k / 16 ) * ( sh.n / 16 ) * 16 * sh.bits;
+			uint16_t* B[2];
+			half* Ah[2];
+			half* C[2];
+			half* suh = static_cast<half*>( engine::core::arena_alloc( arena, sh.k * 2 ) );
+			half* svh = static_cast<half*>( engine::core::arena_alloc( arena, sh.n * 2 ) );
+			half* A = static_cast<half*>( engine::core::arena_alloc( arena, 8ULL * sh.k * 2 ) );
+			CUDA_CHECK( cudaMemset( suh, 0x3c, sh.k * 2 ) );
+			CUDA_CHECK( cudaMemset( svh, 0x3c, sh.n * 2 ) );
+			CUDA_CHECK( cudaMemset( A, 0x30, 8ULL * sh.k * 2 ) );
+			for ( int i = 0; i < 2; ++i ) {
+				B[i] = static_cast<uint16_t*>( engine::core::arena_alloc( arena, words * 2 ) );
+				C[i] = static_cast<half*>( engine::core::arena_alloc( arena, 8ULL * sh.n * 2 ) );
+				Ah[i] = static_cast<half*>( engine::core::arena_alloc( arena, 8ULL * sh.k * 2 ) );
+				CUDA_CHECK( cudaMemset( B[i], 0x5a + i, words * 2 ) );
+			}
+			for ( int m : { 4, 8 } ) {
+				auto one = [&]( int i, cudaStream_t st ) {
+					exl3_gemv( A, B[i], C[i], suh, Ah[i], svh, m, sh.k, sh.n, sh.bits, false, true, false, st );
+				};
+				const float t_seq = impl::time_ms( [&]() { one( 0, s ); one( 1, s ); }, s, 50 );
+				const float t_par = impl::time_ms( [&]() {
+					CUDA_CHECK( cudaEventRecord( fork_ev, s ) );
+					CUDA_CHECK( cudaStreamWaitEvent( s2, fork_ev, 0 ) );
+					one( 0, s );
+					one( 1, s2 );
+					CUDA_CHECK( cudaEventRecord( join_ev, s2 ) );
+					CUDA_CHECK( cudaStreamWaitEvent( s, join_ev, 0 ) );
+				}, s, 50 );
+				std::printf( "%-16s M=%d pair: sequential %7.1f us | forked %7.1f us (%.2fx)\n", sh.name, m, t_seq * 1e3, t_par * 1e3, t_seq / t_par );
+			}
+			engine::core::arena_reset( arena );
+			A_had = engine::modules::trellis_get_workspace( 0, 16ULL * 8192 * sizeof( half ) );
+		}
+	}
 	engine::core::arena_destroy( arena );
 	engine::modules::trellis_context_destroy();
 	cudaDeviceReset();
