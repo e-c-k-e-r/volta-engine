@@ -1,6 +1,7 @@
 #include "engine/models/qwen38_27b.h"
 #include "engine/loader/safetensors.h"
 #include "engine/spec/dflash.h"
+#include "engine/spec/tap_ring.h"
 #include "trellis_context.h"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -490,29 +491,6 @@ void Qwen38Pipeline::draft_head_topk( int rows, cudaStream_t stream ) {
 		draft_cand_part_v_, draft_cand_part_i_, draft_cand_counters_, stream );
 }
 
-// Graph-safe tap publication. forward_body is captured once per row count and replayed, so anything
-// that depends on which position a row occupies, or which slot owns the ring, has to read it from
-// device memory; a host-side value would be frozen into the graph at capture time.
-__global__ void dflash_store_taps_kernel(
-	half* __restrict__ taps,
-	const half* __restrict__ hidden,
-	const pod::BatchRows* __restrict__ rows,
-	const int* __restrict__ owner,
-	int m,
-	int tap,
-	int H,
-	int cap
-) {
-	const int r = blockIdx.y;
-	if ( r >= m ) return;
-	if ( rows->slot[r] != *owner ) return;
-	const int pos = rows->pos[r];
-	if ( pos < 0 ) return;
-	half* dst = taps + static_cast<size_t>( pos % cap ) * 5 * H + static_cast<size_t>( tap ) * H;
-	const half* src = hidden + static_cast<size_t>( r ) * H;
-	for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < H; i += blockDim.x ) dst[i] = src[i];
-}
-
 void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) {
 	ENGINE_ASSERT( weights_loaded_, "Qwen38Pipeline::forward: weights not loaded" );
 	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_ROWS, "Qwen38Pipeline::forward: row count out of range" );
@@ -761,13 +739,9 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 			// ring slot, so this cannot be the same strided copy as above. The slot, the position and
 			// the owner all come from device memory: forward_body is replayed from a CUDA graph keyed
 			// only on the row count, and a host-side value would be frozen at capture time.
-			{
-				const int H = config_.hidden_size;
-				dim3 g( ( H + 255 ) / 256, m );
-				dflash_store_taps_kernel<<<g, 256, 0, stream >>>(
-					draft_taps_.ptr<half>(), hidden_states_.ptr<const half>(), d_rows_, d_taps_owner_,
-					m, tap, H, draft_hooks_.taps_cap );
-			}
+			engine::spec::dflash_publish_taps(
+				draft_taps_.ptr<half>(), hidden_states_.ptr<const half>(), d_rows_, d_taps_owner_,
+				m, tap, config_.hidden_size, draft_hooks_.taps_cap, stream );
 		}
 	}
 

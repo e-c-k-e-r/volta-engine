@@ -505,6 +505,11 @@ int main( int argc, char** argv ) {
 		std::printf( "  [geometry] production attention shape: hidden=%d layers=%d qh=%d kvh=%d hd=%d gs=%d groups=%d\n",
 			H, L, QH, KVH, HD, GS, H / GS );
 	}
+	if ( argc > 1 && std::string( argv[1] ) == "glm" ) {
+		H = 4096; L = 1; QH = 32; KVH = 8; HD = 128; INTER = 256; GS = 16; VOCAB = 512;
+		std::printf( "  [geometry] GLM drafter attention shape: hidden=%d layers=%d qh=%d kvh=%d hd=%d gs=%d groups=%d\n",
+			H, L, QH, KVH, HD, GS, H / GS );
+	}
 	const int ROWS = 8;
 
 	Synthetic s = build( H, L, ROWS, QH, KVH, HD, INTER, GS, VOCAB );

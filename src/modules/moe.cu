@@ -547,6 +547,12 @@ void MoE::forward(
 
 namespace ext {
 
+static bool attr_set[ENGINE_NUM_GPUS] = { false };
+
+void exl3_moe_reset_caches() {
+	for ( auto& b : attr_set ) b = false;
+}
+
 void exl3_moe(
 	const void* hidden_state,
 	void* output_state,
@@ -633,7 +639,6 @@ void exl3_moe(
 		(void*) &out_plane_stride
 	};
 
-	static bool attr_set[ENGINE_NUM_GPUS] = { false };
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );

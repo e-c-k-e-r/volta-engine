@@ -15,8 +15,15 @@ from safetensors import safe_open
 dev = "cuda:0"
 import os
 VAR = os.environ.get("VAR","")
-D = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2/model.safetensors"
-E = "/home/mrq/Documents/models/Qwen3.8-27B-exl3/model-00001-of-00002.safetensors"
+GLM = os.environ.get("MODEL", "") == "glm"
+if GLM:
+    D = "/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2/model.safetensors"
+    GDIR = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw/"
+    idx = json.load(open(GDIR + "model.safetensors.index.json"))["weight_map"]
+    E = GDIR + idx["model.language_model.embed_tokens.weight"]
+else:
+    D = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2/model.safetensors"
+    E = "/home/mrq/Documents/models/Qwen3.8-27B-exl3/model-00001-of-00002.safetensors"
 raw = open("/tmp/draft_dump.bin", "rb").read()
 pos, anchor, H, cap = struct.unpack("4i", raw[:16])
 taps = np.frombuffer(raw[16:16 + pos * 5 * H * 2], dtype=np.float16).reshape(pos, 5 * H)
@@ -27,9 +34,10 @@ with safe_open(D, "pt", device=dev) as f:
     for k in f.keys(): W[k] = f.get_tensor(k).float()
 with safe_open(E, "pt", device=dev) as f:
     emb = f.get_tensor("model.language_model.embed_tokens.weight")
-x_ids = [anchor] + [248070] * 7
+x_ids = [anchor] + [154856 if GLM else 248070] * 7
 x = emb[x_ids].float()
-L, NH, NKV, HD, TAPS, GS, EPS, THETA = 5, 32, 8, 128, 2, 16, 1e-6, 1e7
+L, NH, NKV, HD, TAPS, GS = 5, 32, 8, 128, 2, 16
+EPS, THETA = (1e-5, 1e4) if GLM else (1e-6, 1e7)
 G = H // GS
 def rms(v, w): return v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + EPS) * ((1 + w) if 'plus1' in VAR else w)
 def rope(t, p0):  # t [n, heads, hd]

@@ -16,6 +16,16 @@ namespace {
 // does not fit is rejected by the launcher.
 std::set<void*> int8_attr_set[ENGINE_NUM_GPUS];
 std::map<std::pair<void*, size_t>, int> int8_occ_cache[ENGINE_NUM_GPUS];
+
+}
+
+void exl3_gemv_int8_reset_caches() {
+	for ( auto& st : int8_attr_set ) st.clear();
+	for ( auto& m : int8_occ_cache ) m.clear();
+}
+
+namespace {
+
 int env_int( const char* name, int dflt ) {
 	const char* e = std::getenv( name );
 	if ( !e ) return dflt;

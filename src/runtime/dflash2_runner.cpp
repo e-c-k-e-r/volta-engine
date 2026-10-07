@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <vector>
 #include <cstdlib>
+#include <fstream>
+#include <nlohmann/json.hpp>
 
 namespace engine::runtime {
 
@@ -11,6 +13,46 @@ namespace impl {
 
 double now_ms() {
 	return std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now().time_since_epoch() ).count();
+}
+
+// Geometry from the drafter checkpoint's own config.json (DFlashConfig's defaults describe the Qwen drafter).
+// Missing keys keep the defaults.
+void load_draft_config( const std::string& dir, pod::DFlashConfig& cfg ) {
+	std::ifstream f( dir + "/config.json" );
+	if ( !f ) return;
+	const nlohmann::json j = nlohmann::json::parse( f, nullptr, false );
+	if ( j.is_discarded() || !j.is_object() ) return;
+	const auto geti = [&]( const nlohmann::json& o, const char* key, int& out ) {
+		if ( o.contains( key ) && o[key].is_number_integer() ) out = o[key].get<int>();
+	};
+	geti( j, "hidden_size", cfg.hidden_size );
+	geti( j, "intermediate_size", cfg.intermediate_size );
+	geti( j, "num_attention_heads", cfg.num_q_heads );
+	geti( j, "num_key_value_heads", cfg.num_kv_heads );
+	geti( j, "head_dim", cfg.head_dim );
+	geti( j, "num_hidden_layers", cfg.num_hidden_layers );
+	geti( j, "num_target_layers", cfg.num_target_layers );
+	geti( j, "sliding_window", cfg.sliding_window );
+	if ( j.contains( "rms_norm_eps" ) && j["rms_norm_eps"].is_number() ) cfg.rms_norm_eps = j["rms_norm_eps"].get<float>();
+	if ( j.contains( "rope_parameters" ) && j["rope_parameters"].is_object() && j["rope_parameters"].contains( "rope_theta" ) ) {
+		cfg.rope_theta = j["rope_parameters"]["rope_theta"].get<float>();
+	}
+	if ( j.contains( "dflash_config" ) && j["dflash_config"].is_object() ) {
+		const auto& d = j["dflash_config"];
+		geti( d, "block_size", cfg.block_size );
+		geti( d, "conv_group_size", cfg.conv_group_size );
+		geti( d, "conv_kernel_size", cfg.conv_kernel_size );
+		geti( d, "mask_token_id", cfg.mask_token_id );
+		geti( d, "selector_rank", cfg.selector_rank );
+		geti( d, "selector_top_k", cfg.selector_top_k );
+		if ( d.contains( "target_layer_ids" ) && d["target_layer_ids"].is_array() ) {
+			int n = 0;
+			for ( const auto& v : d["target_layer_ids"] ) {
+				if ( n < 8 && v.is_number_integer() ) cfg.target_layer_ids[n++] = v.get<int>();
+			}
+			cfg.num_target_layer_ids = n;
+		}
+	}
 }
 
 } // namespace impl
@@ -22,10 +64,12 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 	}
 	const auto& meta = mc.metadata();
 	pod::DFlashConfig cfg;
+	impl::load_draft_config( draft_dir, cfg );
+	ENGINE_ASSERT( cfg.hidden_size == meta.hidden_size, "DFlash2Runner: drafter hidden size does not match the target" );
 	cfg.hidden_size = meta.hidden_size;
 	cfg.vocab_size = meta.vocab_size;
+	ENGINE_ASSERT( cfg.block_size == models::kDraftM, "DFlash2Runner: drafter block size != kDraftM" );
 	cfg.block_size = models::kDraftM;
-	cfg.mask_token_id = 248070;
 	// Full rotary over head_dim: the drafter checkpoint declares rope_type "default" with no
 	// partial_rotary_factor, and a partial-rotation default would quietly poison every prediction.
 	cfg.rope_dim_sections[0] = cfg.head_dim;

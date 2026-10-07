@@ -4,6 +4,11 @@
 #include <mutex>
 #include <cstdio>
 
+void exl3_gemm_reset_caches();
+void exl3_gemv_reset_caches();
+void exl3_gemv_int8_reset_caches();
+namespace ext { void exl3_moe_reset_caches(); }
+
 namespace engine::modules {
 
 static int* g_locks[ENGINE_NUM_GPUS] = { nullptr };
@@ -138,7 +143,15 @@ void trellis_context_init_all() {
 	}
 }
 
+void trellis_reset_launch_caches() {
+	exl3_gemm_reset_caches();
+	exl3_gemv_reset_caches();
+	exl3_gemv_int8_reset_caches();
+	::ext::exl3_moe_reset_caches();
+}
+
 void trellis_context_destroy() {
+	trellis_reset_launch_caches();
 	std::lock_guard<std::mutex> lock( g_trellis_ctx_mtx );
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		if ( g_locks[d] != nullptr ) {

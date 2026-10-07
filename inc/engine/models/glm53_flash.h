@@ -42,16 +42,22 @@ struct GLM53Config {
 	int kda_channels = 6144;
 	float rms_norm_eps = 1e-6f;
 	float rms_norm_bias = 1.0f;
+	int tap_layers[5] = { 5, 14, 24, 33, 42 };   // DFlash2 drafter taps (target_layer_ids)
 };
 
 // Per-rank recurrent state laid out [slot][layer][...] so one slot is contiguous.
 struct GLM53State {
 	float* kda_states = nullptr;      // [slots, 45, heads, 128, 128] FP32
 	float* conv_history = nullptr;    // [slots, 45, channels, 3] FP32
+	float* kda_snap = nullptr;        // [kDraftM, 45, heads, 128, 128] per-row post-state (speculative verify)
+	float* conv_snap = nullptr;       // [kDraftM, 45, channels, 3]
+	int* d_snap_on = nullptr;         // device flag: forwards publish the per-row snapshots while non-zero
 	float* kda_checkpoint = nullptr;
 	float* conv_checkpoint = nullptr;
 	size_t layer_kda_floats = 0;
 	size_t layer_conv_floats = 0;
+	size_t slot_kda_floats = 0;       // linear layers only
+	size_t slot_conv_floats = 0;
 	int* d_topk_indices = nullptr;
 	half* d_topk_weights = nullptr;
 	pod::MoEScratch moe;
@@ -134,7 +140,21 @@ public:
 	void embed_tokens( const int* token_ids, int count, cudaStream_t stream = nullptr ) override;
 	void forward( const pod::BatchRows& rows, cudaStream_t stream = nullptr ) override;
 	void sample_tokens( int* out_preds, int count, cudaStream_t stream = nullptr ) override;
+	bool sample_local( int* out_tokens, float* out_vals, int count, cudaStream_t stream = nullptr ) override;
 	bool topk_local( float* out_vals, int* out_ids, int count, cudaStream_t stream = nullptr ) override;
+	const half* shard_logits_ptr() const override { return logits_.ptr<const half>(); }
+	int shard_logits_cols() const override { return lm_shard_cols_; }
+	const pod::TensorView& gather_logits(
+		int rows,
+		const half* const* peer_shard_ptrs,
+		int peer_shard_cols,
+		cudaStream_t stream = nullptr
+	) override;
+
+	const DraftHooks& draft_hooks() const override { return draft_hooks_; }
+	void draft_head_topk( int rows, cudaStream_t stream = nullptr ) override;
+	void set_spec_snapshot( bool on, cudaStream_t stream = nullptr ) override;
+	void commit_spec_row( int slot_id, int row, cudaStream_t stream = nullptr ) override;
 
 	void checkpoint_state( int slot_id, cudaStream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, cudaStream_t stream = nullptr ) override;
@@ -149,6 +169,11 @@ public:
 
 private:
 	static constexpr int kTopkTile = 4096;   // TOPK_THREADS * 16, as in the Qwen head
+
+	// 154880 = 1210 x 128 columns do not split four ways at 128-column granularity (the output Hadamard spans 128):
+	// ranks 0..1 take 303 spans, ranks 2..3 take 302
+	static int lm_shard_spans( int vocab, int tp, int rank ) { return vocab / 128 / tp + ( rank < vocab / 128 % tp ? 1 : 0 ); }
+	static int lm_shard_offset( int vocab, int tp, int rank ) { return 128 * ( rank * ( vocab / 128 / tp ) + MIN( rank, vocab / 128 % tp ) ); }
 
 	// Layer stack over m rows at once: embed_rows_[0..m) -> logits_[0..m); slot and position of each row are
 	// read from d_rows_ on device so the launch sequence depends on m alone and is graph-replayable
@@ -169,6 +194,16 @@ private:
 	engine::comm::CollectiveRing* ring_ = nullptr;
 	GLM53State state_;
 	bool weights_loaded_ = false;
+
+	// DFlash2 attachment (see DraftHooks): tap ring, head scratch and per-rank candidate top-k scratch
+	DraftHooks draft_hooks_;
+	pod::TensorView draft_taps_;         // [taps_cap, 5 * hidden]
+	pod::TensorView tap_tmp_;            // [MAX_ROWS, hidden] mean of the 4 residual streams at a tapped layer
+	pod::TensorView draft_lm_logits_;    // [kDraftM, lm_shard_cols]
+	float* draft_cand_part_v_ = nullptr;
+	int* draft_cand_part_i_ = nullptr;
+	int* draft_cand_counters_ = nullptr;
+	int* d_taps_owner_ = nullptr;
 
 	pod::TensorView embed_rows_;    // [MAX_ROWS, hidden] embedded inputs
 	int* d_token_ids_ = nullptr;    // [MAX_ROWS]
@@ -217,9 +252,15 @@ private:
 	pod::TensorView embed_tokens_;
 	pod::TensorView final_norm_;
 	pod::LinearWeight lm_head_;
-	pod::TensorView logits_;  // [MAX_BATCH, vocab] (rank 0)
+	pod::TensorView logits_;  // [MAX_BATCH, lm_shard_cols] this rank's vocabulary shard
 	int* d_argmax_idx_ = nullptr;
-	float* samp_part_v_ = nullptr;   // top-k sampling scratch (rank 0)
+	float* d_argmax_val_ = nullptr;
+	// Vocabulary-parallel head: every rank owns vocab_size / tp_size columns padded to a multiple of 256
+	int lm_shard_cols_ = 0;
+	int lm_shard_real_cols_ = 0;
+	int lm_shard_offset_ = 0;        // first global token id of this rank's slice
+	pod::TensorView full_logits_;    // rank 0 only: whole-distribution consumers
+	float* samp_part_v_ = nullptr;   // top-k sampling scratch
 	int* samp_part_i_ = nullptr;
 	int* samp_counters_ = nullptr;
 	float* d_samp_vals_ = nullptr;

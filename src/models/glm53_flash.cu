@@ -3,6 +3,7 @@
 #include "engine/modules/gdn.h"
 #include "engine/modules/embedding.h"
 #include "engine/spec/dflash.h"
+#include "engine/spec/tap_ring.h"
 #include "trellis_context.h"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -13,6 +14,13 @@
 #include <algorithm>
 
 namespace engine::models {
+
+namespace {
+
+// Host-resident embedding table shared by all ranks (see load_weights)
+pod::TensorView g_embed_table;
+
+} // namespace
 
 namespace impl {
 
@@ -77,16 +85,26 @@ bool GLM53Pipeline::init(
 	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R );
 
 	// KDA recurrent state + conv history per slot: [S, 45, ...] FP32, plus one-slot checkpoints
+	// Only the linear-attention layers carry state: every fourth layer (3, 7, ...) is MLA
 	state_.layer_kda_floats = static_cast<size_t>( config_.kda_heads ) * config_.kda_head_dim * config_.kda_head_dim;
 	state_.layer_conv_floats = static_cast<size_t>( config_.kda_channels ) * 3;
-	const size_t slot_kda = state_.layer_kda_floats * config_.num_layers;
-	const size_t slot_conv = state_.layer_conv_floats * config_.num_layers;
+	const int n_lin = config_.num_layers - config_.num_mla_layers;
+	ENGINE_ASSERT( config_.num_layers == 45 && n_lin == 34, "GLM53Pipeline: linear-layer indexing assumes 45 layers with every fourth MLA" );
+	const size_t slot_kda = state_.layer_kda_floats * n_lin;
+	const size_t slot_conv = state_.layer_conv_floats * n_lin;
+	state_.slot_kda_floats = slot_kda;
+	state_.slot_conv_floats = slot_conv;
 	state_.kda_states = static_cast<float*>( engine::core::arena_alloc( arena, S * slot_kda * sizeof( float ) ) );
 	state_.conv_history = static_cast<float*>( engine::core::arena_alloc( arena, S * slot_conv * sizeof( float ) ) );
 	state_.kda_checkpoint = static_cast<float*>( engine::core::arena_alloc( arena, slot_kda * sizeof( float ) ) );
 	state_.conv_checkpoint = static_cast<float*>( engine::core::arena_alloc( arena, slot_conv * sizeof( float ) ) );
 	CUDA_CHECK( cudaMemset( state_.kda_states, 0, S * slot_kda * sizeof( float ) ) );
 	CUDA_CHECK( cudaMemset( state_.conv_history, 0, S * slot_conv * sizeof( float ) ) );
+	// Per-row post-state slots written during a speculative verify forward (replace checkpoint + replay)
+	state_.kda_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * slot_kda * sizeof( float ) ) );
+	state_.conv_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * slot_conv * sizeof( float ) ) );
+	state_.d_snap_on = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
+	CUDA_CHECK( cudaMemset( state_.d_snap_on, 0, sizeof( int ) ) );
 
 	// 2. Activations: [R, ...] row buffers, viewed as [m, ...] per forward
 	int rows_shape[2] = { R, config_.hidden_size };
@@ -161,14 +179,24 @@ bool GLM53Pipeline::init(
 	local_moe_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	ffn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 
-	// 5. Logits & argmax (rank 0 owns the unsharded LM head)
-	if ( rank_ == 0 ) {
-		int logit_shape[2] = { pod::MAX_BATCH, config_.vocab_size };
-		logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
-		d_argmax_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, pod::MAX_BATCH * sizeof( int ) ) );
-		h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( pod::MAX_BATCH * sizeof( int ) ) );
+	// 5. Logits & argmax: the LM head is vocabulary-parallel, every rank owns vocab_size / tp_size columns padded
+	// up to a multiple of 256 (so the dp4a int8 GEMV engages); lm_shard_real_cols_ excludes the pad
+	ENGINE_ASSERT( config_.vocab_size % 128 == 0, "GLM53Pipeline: vocab_size must be a multiple of 128" );
+	lm_shard_real_cols_ = 128 * lm_shard_spans( config_.vocab_size, config_.tp_size, rank_ );
+	lm_shard_offset_ = lm_shard_offset( config_.vocab_size, config_.tp_size, rank_ );
+	{
+		const int widest = 128 * lm_shard_spans( config_.vocab_size, config_.tp_size, 0 );
+		lm_shard_cols_ = widest + ( 256 - widest % 256 ) % 256;   // uniform across ranks so logits gather with one stride
+	}
+	{
 		const int B = pod::MAX_BATCH;
-		const int splits = ( config_.vocab_size + kTopkTile - 1 ) / kTopkTile;
+		int logit_shape[2] = { B, lm_shard_cols_ };
+		logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
+		d_argmax_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, B * sizeof( int ) ) );
+		d_argmax_val_ = static_cast<float*>( engine::core::arena_alloc( arena, B * sizeof( float ) ) );
+		h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( B * sizeof( int ) ) );
+		std::memset( h_argmax_idx_, 0, B * sizeof( int ) );
+		const int splits = ( lm_shard_cols_ + kTopkTile - 1 ) / kTopkTile;
 		const size_t per = static_cast<size_t>( B ) * splits * 16;
 		samp_part_v_ = static_cast<float*>( engine::core::arena_alloc( arena, per * sizeof( float ) ) );
 		samp_part_i_ = static_cast<int*>( engine::core::arena_alloc( arena, per * sizeof( int ) ) );
@@ -176,6 +204,43 @@ bool GLM53Pipeline::init(
 		d_samp_vals_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( B ) * 16 * sizeof( float ) ) );
 		d_samp_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( B ) * 16 * sizeof( int ) ) );
 		CUDA_CHECK( cudaMemset( samp_counters_, 0, B * sizeof( int ) ) );
+		if ( rank_ == 0 ) {
+			// Only whole-distribution consumers (the drafter's tests) need the gathered logits
+			int full_shape[2] = { B, config_.vocab_size };
+			full_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, full_shape, 2 );
+		}
+	}
+
+	// 6. DFlash2 attachment: position-indexed tap ring (one slot publishes), head scratch, candidate top-k scratch
+	{
+		draft_hooks_.taps_cap = MAX( MIN( config_.max_seq, 2048 ), 256 );
+		int wtap_shape[2] = { draft_hooks_.taps_cap, 5 * config_.hidden_size };
+		draft_taps_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, wtap_shape, 2 );
+		CUDA_CHECK( cudaMemset( draft_taps_.data, 0, static_cast<size_t>( wtap_shape[0] ) * wtap_shape[1] * sizeof( half ) ) );
+		d_taps_owner_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
+		CUDA_CHECK( cudaMemset( d_taps_owner_, 0xFF, sizeof( int ) ) );
+		draft_hooks_.taps = draft_taps_.ptr<const half>();
+		draft_hooks_.taps_owner = d_taps_owner_;
+		// embedding: set when the table is loaded (host-resident, shared by every rank)
+		int tap_shape[2] = { R, config_.hidden_size };
+		tap_tmp_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, tap_shape, 2 );
+
+		const int kM = kDraftM;
+		int ds[2] = { kM, config_.hidden_size };
+		draft_hooks_.lm_in = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ds, 2 ).ptr<half>();
+		int dl[2] = { kM, lm_shard_cols_ };
+		draft_lm_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, dl, 2 );
+		const int splits = ( lm_shard_cols_ + kTopkTile - 1 ) / kTopkTile;
+		const size_t per = static_cast<size_t>( kM ) * splits * kDraftTopK;
+		draft_cand_part_v_ = static_cast<float*>( engine::core::arena_alloc( arena, per * sizeof( float ) ) );
+		draft_cand_part_i_ = static_cast<int*>( engine::core::arena_alloc( arena, per * sizeof( int ) ) );
+		draft_cand_counters_ = static_cast<int*>( engine::core::arena_alloc( arena, kM * sizeof( int ) ) );
+		draft_hooks_.cand_vals = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( kM ) * kDraftTopK * sizeof( float ) ) );
+		draft_hooks_.cand_idx = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( kM ) * kDraftTopK * sizeof( int ) ) );
+		CUDA_CHECK( cudaMemset( draft_cand_counters_, 0, kM * sizeof( int ) ) );
+		draft_hooks_.shard_offset = lm_shard_offset_;
+		draft_hooks_.shard_real_cols = lm_shard_real_cols_;
+		draft_hooks_.embedding = &g_embed_table;
 	}
 
 	engine::modules::trellis_get_workspace( rank_, 16 * 1024 * 1024 );
@@ -207,8 +272,8 @@ void GLM53Pipeline::reset_state( int slot_id ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "GLM53Pipeline::reset_state: slot out of range" );
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	kv_pool_.reset_slot( slot_id );
-	const size_t slot_kda = state_.layer_kda_floats * config_.num_layers;
-	const size_t slot_conv = state_.layer_conv_floats * config_.num_layers;
+	const size_t slot_kda = state_.slot_kda_floats;
+	const size_t slot_conv = state_.slot_conv_floats;
 	CUDA_CHECK( cudaMemset( state_.kda_states + slot_id * slot_kda, 0, slot_kda * sizeof( float ) ) );
 	CUDA_CHECK( cudaMemset( state_.conv_history + slot_id * slot_conv, 0, slot_conv * sizeof( float ) ) );
 }
@@ -216,8 +281,8 @@ void GLM53Pipeline::reset_state( int slot_id ) {
 void GLM53Pipeline::checkpoint_state( int slot_id, cudaStream_t stream ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "GLM53Pipeline::checkpoint_state: slot out of range" );
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
-	const size_t slot_kda = state_.layer_kda_floats * config_.num_layers;
-	const size_t slot_conv = state_.layer_conv_floats * config_.num_layers;
+	const size_t slot_kda = state_.slot_kda_floats;
+	const size_t slot_conv = state_.slot_conv_floats;
 	CUDA_CHECK( cudaMemcpyAsync( state_.kda_checkpoint, state_.kda_states + slot_id * slot_kda, slot_kda * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
 	CUDA_CHECK( cudaMemcpyAsync( state_.conv_checkpoint, state_.conv_history + slot_id * slot_conv, slot_conv * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
 }
@@ -225,8 +290,8 @@ void GLM53Pipeline::checkpoint_state( int slot_id, cudaStream_t stream ) {
 void GLM53Pipeline::rollback_state( int slot_id, cudaStream_t stream ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "GLM53Pipeline::rollback_state: slot out of range" );
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
-	const size_t slot_kda = state_.layer_kda_floats * config_.num_layers;
-	const size_t slot_conv = state_.layer_conv_floats * config_.num_layers;
+	const size_t slot_kda = state_.slot_kda_floats;
+	const size_t slot_conv = state_.slot_conv_floats;
 	CUDA_CHECK( cudaMemcpyAsync( state_.kda_states + slot_id * slot_kda, state_.kda_checkpoint, slot_kda * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
 	CUDA_CHECK( cudaMemcpyAsync( state_.conv_history + slot_id * slot_conv, state_.conv_checkpoint, slot_conv * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
 }
@@ -241,15 +306,32 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 
 	int missing_count = 0;
 
-	// 1. Embed tokens (rank 0 hosts full vocabulary embedding and LM head)
+	// 1. Embedding table: 1.27 GB of BF16 kept in portable pinned host memory instead of rank 0's arena (which has
+	// no room for the drafter beside it). Lookups touch a few rows per forward and read over the link; every rank
+	// shares the one table (the drafter looks up its anchor token on all four).
 	if ( rank_ == 0 ) {
-		embed_tokens_ = repo.load( "model.language_model.embed_tokens.weight", *arena_, stream, pod::DType::BF16 );
-		if ( !embed_tokens_.data ) { std::printf( "[RANK %d] MISSING: embed_tokens\n", rank_ ); ++missing_count; }
-		final_norm_ = repo.load( "model.language_model.norm.weight", *arena_, stream, pod::DType::FP16 );
-		if ( !final_norm_.data ) { std::printf( "[RANK %d] MISSING: norm\n", rank_ ); ++missing_count; }
-		lm_head_ = repo.load_linear( "lm_head", *arena_, 6, stream );
-		if ( !lm_head_.is_valid() ) { std::printf( "[RANK %d] MISSING: lm_head\n", rank_ ); ++missing_count; }
+		const char* ename = "model.language_model.embed_tokens.weight";
+		int shard_idx = -1;
+		const auto* meta = repo.find( ename, &shard_idx );
+		if ( meta == nullptr || shard_idx < 0 ) { std::printf( "[RANK %d] MISSING: embed_tokens\n", rank_ ); ++missing_count; }
+		else {
+			const size_t bytes = static_cast<size_t>( config_.vocab_size ) * config_.hidden_size * sizeof( uint16_t );
+			const void* src = engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta );
+			if ( g_embed_table.data == nullptr ) {
+				void* host = nullptr;
+				CUDA_CHECK( cudaHostAlloc( &host, bytes, cudaHostAllocPortable | cudaHostAllocMapped ) );
+				g_embed_table = pod::make_tensor_2d( host, pod::DType::BF16, config_.vocab_size, config_.hidden_size );
+			}
+			if ( src == nullptr ) { ++missing_count; }
+			else { std::memcpy( g_embed_table.data, src, bytes ); }
+		}
 	}
+	embed_tokens_ = g_embed_table;
+	// Final norm + this rank's vocabulary shard of the LM head
+	final_norm_ = repo.load( "model.language_model.norm.weight", *arena_, stream, pod::DType::FP16 );
+	if ( !final_norm_.data ) { std::printf( "[RANK %d] MISSING: norm\n", rank_ ); ++missing_count; }
+	lm_head_ = repo.load_linear_cols_padded( "lm_head", *arena_, 6, lm_shard_offset_ / 16, lm_shard_real_cols_ / 16, lm_shard_cols_ - lm_shard_real_cols_, stream );
+	if ( !lm_head_.is_valid() ) { std::printf( "[RANK %d] MISSING: lm_head\n", rank_ ); ++missing_count; }
 
 	// 2. Per-layer weights across 45 layers
 	char name_buf[256];
@@ -491,17 +573,6 @@ void GLM53Pipeline::embed_tokens( const int* token_ids, int count, cudaStream_t 
 	}
 }
 
-void GLM53Pipeline::sample_tokens( int* out_preds, int count, cudaStream_t stream ) {
-	ENGINE_ASSERT( rank_ == 0, "GLM53Pipeline::sample_tokens: logits live on rank 0" );
-	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "GLM53Pipeline::sample_tokens: count exceeds last forward rows" );
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
-	logits_.shape[0] = count;
-	engine::modules::Elementwise::batched_argmax( logits_, d_argmax_idx_, config_.vocab_size, count, stream );
-	CUDA_CHECK( cudaMemcpyAsync( h_argmax_idx_, d_argmax_idx_, count * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
-	CUDA_CHECK( cudaStreamSynchronize( stream ) );
-	std::memcpy( out_preds, h_argmax_idx_, count * sizeof( int ) );
-}
-
 void GLM53Pipeline::set_rows( int m ) {
 	hidden_states_.shape[0] = m;
 	norm_hidden_.shape[0] = m;
@@ -531,25 +602,102 @@ void GLM53Pipeline::set_rows( int m ) {
 	embed_rows_.shape[0] = m;
 }
 
-bool GLM53Pipeline::topk_local( float* out_vals, int* out_ids, int count, cudaStream_t stream ) {
-	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_BATCH, "GLM53Pipeline::topk_local: count out of range" );
-	if ( rank_ != 0 ) {
-		// The vocabulary is not sharded: other ranks contribute nothing to the cluster-wide merge
-		for ( int i = 0; i < count * 16; ++i ) {
-			out_vals[i] = -INFINITY;
-			out_ids[i] = 0;
-		}
-		return true;
-	}
-	ENGINE_ASSERT( count <= last_rows_, "GLM53Pipeline::topk_local: count exceeds last forward rows" );
+void GLM53Pipeline::sample_tokens( int* out_preds, int count, cudaStream_t stream ) {
+	(void) out_preds;
+	(void) count;
+	(void) stream;
+	ENGINE_ASSERT( false, "GLM53Pipeline::sample_tokens: the vocabulary is sharded, use sample_local" );
+}
+
+bool GLM53Pipeline::sample_local( int* out_tokens, float* out_vals, int count, cudaStream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "GLM53Pipeline::sample_local: count exceeds last forward rows" );
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	logits_.shape[0] = count;
+	// Scan only this rank's real columns: the pad block decodes to 0.0 and would beat a real negative logit.
+	// index_offset turns the shard-local winner into a global token id.
+	engine::modules::Elementwise::batched_argmax_range(
+		logits_, d_argmax_idx_, d_argmax_val_, lm_shard_real_cols_, count, lm_shard_offset_, stream );
+	CUDA_CHECK( cudaMemcpyAsync( h_argmax_idx_, d_argmax_idx_, count * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	std::memcpy( out_tokens, h_argmax_idx_, count * sizeof( int ) );
+	if ( out_vals != nullptr ) {
+		float h_vals[pod::MAX_BATCH];
+		CUDA_CHECK( cudaMemcpyAsync( h_vals, d_argmax_val_, count * sizeof( float ), cudaMemcpyDeviceToHost, stream ) );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		std::memcpy( out_vals, h_vals, count * sizeof( float ) );
+	}
+	return true;
+}
+
+bool GLM53Pipeline::topk_local( float* out_vals, int* out_ids, int count, cudaStream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "GLM53Pipeline::topk_local: count exceeds last forward rows" );
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	// Real columns only (pad columns decode to 0.0), global ids via the shard offset
 	engine::spec::dflash2_topk_shard(
-		logits_.ptr<const half>(), count, config_.vocab_size, config_.vocab_size, 16,
-		d_samp_vals_, d_samp_idx_, 0, samp_part_v_, samp_part_i_, samp_counters_, stream );
+		logits_.ptr<const half>(), count, lm_shard_cols_, lm_shard_real_cols_, 16,
+		d_samp_vals_, d_samp_idx_, lm_shard_offset_, samp_part_v_, samp_part_i_, samp_counters_, stream );
 	CUDA_CHECK( cudaMemcpyAsync( out_vals, d_samp_vals_, static_cast<size_t>( count ) * 16 * sizeof( float ), cudaMemcpyDeviceToHost, stream ) );
 	CUDA_CHECK( cudaMemcpyAsync( out_ids, d_samp_idx_, static_cast<size_t>( count ) * 16 * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	return true;
+}
+
+const pod::TensorView& GLM53Pipeline::gather_logits(
+	int rows,
+	const half* const* peer_shard_ptrs,
+	int peer_shard_cols,
+	cudaStream_t stream
+) {
+	ENGINE_ASSERT( rank_ == 0, "GLM53Pipeline::gather_logits: only rank 0 materializes the full vocabulary" );
+	ENGINE_ASSERT( rows >= 1 && rows <= last_rows_, "GLM53Pipeline::gather_logits: rows exceeds last forward rows" );
+	ENGINE_ASSERT( peer_shard_cols == lm_shard_cols_, "GLM53Pipeline::gather_logits: shard width mismatch" );
+	full_logits_.shape[0] = rows;
+	// Row r of the gathered buffer is [shard 0 | shard 1 | ...]: source rows are lm_shard_cols_ apart (pad included),
+	// destination rows lm_shard_real_cols_ * tp apart
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		const size_t shard_elems = static_cast<size_t>( 128 * lm_shard_spans( config_.vocab_size, config_.tp_size, d ) );
+		const size_t shard_off = static_cast<size_t>( lm_shard_offset( config_.vocab_size, config_.tp_size, d ) );
+		const half* src_base = ( d == rank_ ) ? logits_.ptr<const half>() : peer_shard_ptrs[d];
+		ENGINE_ASSERT( src_base != nullptr, "GLM53Pipeline::gather_logits: missing peer shard pointer" );
+		for ( int r = 0; r < rows; ++r ) {
+			const half* src = src_base + static_cast<size_t>( r ) * lm_shard_cols_;
+			half* dst = full_logits_.ptr<half>() + static_cast<size_t>( r ) * config_.vocab_size + shard_off;
+			CUDA_CHECK( cudaMemcpyPeerAsync( dst, rank_, src, d, shard_elems * sizeof( half ), stream ) );
+		}
+	}
+	return full_logits_;
+}
+
+// Runs this rank's head shard over the drafter's hidden rows and leaves the local top-k in the hooks' cand buffers.
+void GLM53Pipeline::draft_head_topk( int rows, cudaStream_t stream ) {
+	ENGINE_ASSERT( weights_loaded_, "GLM53Pipeline::draft_head_topk: weights not loaded" );
+	ENGINE_ASSERT( rows >= 1 && rows <= kDraftM, "GLM53Pipeline::draft_head_topk: rows out of range" );
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	// All kDraftM rows, whatever `rows` is: the head's fast path only covers m in {1, 2, 4, 8}
+	pod::TensorView in = pod::make_tensor_2d( draft_hooks_.lm_in, pod::DType::FP16, kDraftM, config_.hidden_size );
+	engine::modules::Linear::forward( in, lm_head_, draft_lm_logits_, stream );
+	engine::spec::dflash2_topk_shard(
+		draft_lm_logits_.ptr<const half>(), kDraftM, lm_shard_cols_, lm_shard_real_cols_, kDraftTopK,
+		draft_hooks_.cand_vals, draft_hooks_.cand_idx, draft_hooks_.shard_offset,
+		draft_cand_part_v_, draft_cand_part_i_, draft_cand_counters_, stream );
+}
+
+void GLM53Pipeline::set_spec_snapshot( bool on, cudaStream_t stream ) {
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	const int v = on ? 1 : 0;
+	CUDA_CHECK( cudaMemcpyAsync( state_.d_snap_on, &v, sizeof( int ), cudaMemcpyHostToDevice, stream ) );
+}
+
+void GLM53Pipeline::commit_spec_row( int slot_id, int row, cudaStream_t stream ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "GLM53Pipeline::commit_spec_row: slot out of range" );
+	ENGINE_ASSERT( row >= 0 && row < kDraftM, "GLM53Pipeline::commit_spec_row: row out of range" );
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	CUDA_CHECK( cudaMemcpyAsync( state_.kda_states + static_cast<size_t>( slot_id ) * state_.slot_kda_floats,
+		state_.kda_snap + static_cast<size_t>( row ) * state_.slot_kda_floats,
+		state_.slot_kda_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
+	CUDA_CHECK( cudaMemcpyAsync( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats,
+		state_.conv_snap + static_cast<size_t>( row ) * state_.slot_conv_floats,
+		state_.slot_conv_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
 }
 
 void GLM53Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) {
@@ -576,8 +724,9 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 	half* slot_v = static_cast<half*>( kv_pool_.get_v_ptr( 0, 0, 0 ) );
 	const size_t kv_slot_stride = kv_pool_.slot_stride_bytes / sizeof( half );
 	const pod::SlotRef kv_ref{ d_rows_, 0, kv_slot_stride };
-	const size_t slot_kda_floats = state_.layer_kda_floats * config_.num_layers;
-	const size_t slot_conv_floats = state_.layer_conv_floats * config_.num_layers;
+	const size_t slot_kda_floats = state_.slot_kda_floats;
+	const size_t slot_conv_floats = state_.slot_conv_floats;
+	const int snap_rows = MIN( m, kDraftM );
 	const int H = config_.hidden_size;
 
 	// mHC: expand every row's embedding into its 4 residual streams
@@ -613,8 +762,12 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 
 		// 2. Attention
 		if ( lw.is_linear_attn && lw.qkv.is_valid() ) {
-			float* layer_kda = state_.kda_states + static_cast<size_t>( layer ) * state_.layer_kda_floats;
-			float* layer_conv = state_.conv_history + static_cast<size_t>( layer ) * state_.layer_conv_floats;
+			// Linear layers are every layer but the MLA ones (3, 7, ...): ordinal = layer - (layer + 1) / 4
+			const size_t lin = static_cast<size_t>( layer - ( layer + 1 ) / 4 );
+			float* layer_kda = state_.kda_states + lin * state_.layer_kda_floats;
+			float* layer_conv = state_.conv_history + lin * state_.layer_conv_floats;
+			float* kda_snap = state_.kda_snap + lin * state_.layer_kda_floats;
+			float* conv_snap = state_.conv_snap + lin * state_.layer_conv_floats;
 
 			engine::modules::Linear::forward(
 				norm_hidden_, lw.qkv, qkv_buf_, stream
@@ -622,7 +775,7 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 
 			engine::modules::GDN::causal_conv1d_silu_rows(
 				qkv_buf_, layer_conv, lw.conv1d_weights, config_.kda_channels, m, d_rows_, slot_conv_floats,
-				nullptr, 0, 0, nullptr, stream
+				conv_snap, slot_conv_floats, snap_rows, state_.d_snap_on, stream
 			);
 
 			engine::modules::GDN::l2_norm_heads(
@@ -637,7 +790,7 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 
 			engine::modules::GDN::recurrent_step_kda_rows(
 				layer_kda, qkv_buf_, g_decay_buf_, beta_buf_, z_buf_, lw.o_norm, attn_head_out_,
-				16, 128, 1e-5f, m, d_rows_, slot_kda_floats, nullptr, 0, 0, nullptr, stream
+				16, 128, 1e-5f, m, d_rows_, slot_kda_floats, kda_snap, slot_kda_floats, snap_rows, state_.d_snap_on, stream
 			);
 
 			if ( lw.o_proj.is_valid() ) {
@@ -821,6 +974,16 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 				engine::modules::Elementwise::add_residual( hidden_states_, ffn_out_, stream );
 			}
 		}
+
+		// Tapped layer states for the DFlash2 drafter: position-indexed ring, owner/slot/position read on device.
+		// The tapped hidden state of an mHC layer is the mean of its four residual streams (as HyperHead).
+		for ( int tap = 0; tap < 5; ++tap ) {
+			if ( layer != config_.tap_layers[tap] ) continue;
+			engine::spec::dflash_reduce_streams( hidden_streams_.ptr<const float>(), tap_tmp_.ptr<half>(), m, H, 0, stream );
+			engine::spec::dflash_publish_taps(
+				draft_taps_.ptr<half>(), tap_tmp_.ptr<const half>(), d_rows_, d_taps_owner_,
+				m, tap, H, draft_hooks_.taps_cap, stream );
+		}
 	}
 
 	if ( layers_[0].hc_attn_fn.data != nullptr ) {
@@ -828,22 +991,20 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 		engine::modules::HyperHead::mean( hidden_streams_, hidden_states_, H, stream, m );
 	}
 
-	// Final norm + LM head (rank 0 owns the unsharded vocabulary)
-	if ( rank_ == 0 ) {
-		if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
-		if ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) {
-			// Prefill: only the final row's logits are read
-			pod::TensorView h1 = pod::make_tensor_2d( hidden_states_.ptr<half>() + static_cast<size_t>( m - 1 ) * H, pod::DType::FP16, 1, H );
-			pod::TensorView n1 = pod::make_tensor_2d( norm_hidden_.ptr<half>(), pod::DType::FP16, 1, H );
-			pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<half>(), pod::DType::FP16, 1, config_.vocab_size );
-			engine::modules::RMSNorm::forward( h1, final_norm_, n1, 1e-5f, 0.0f, stream );
-			engine::modules::Linear::forward( n1, lm_head_, l1, stream );
-			return;
-		}
-		logits_.shape[0] = m;
-		engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, 1e-5f, 0.0f, stream );
-		engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
+	// Final norm + this rank's vocabulary shard of the LM head
+	if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
+	if ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) {
+		// Prefill: only the final row's logits are read
+		pod::TensorView h1 = pod::make_tensor_2d( hidden_states_.ptr<half>() + static_cast<size_t>( m - 1 ) * H, pod::DType::FP16, 1, H );
+		pod::TensorView n1 = pod::make_tensor_2d( norm_hidden_.ptr<half>(), pod::DType::FP16, 1, H );
+		pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<half>(), pod::DType::FP16, 1, lm_shard_cols_ );
+		engine::modules::RMSNorm::forward( h1, final_norm_, n1, 1e-5f, 0.0f, stream );
+		engine::modules::Linear::forward( n1, lm_head_, l1, stream );
+		return;
 	}
+	logits_.shape[0] = m;
+	engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, 1e-5f, 0.0f, stream );
+	engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
 }
 
 void GLM53Pipeline::destroy() {
@@ -854,6 +1015,10 @@ void GLM53Pipeline::destroy() {
 	if ( h_argmax_idx_ != nullptr ) {
 		engine::core::host_free_pinned( h_argmax_idx_ );
 		h_argmax_idx_ = nullptr;
+	}
+	if ( rank_ == 0 && g_embed_table.data != nullptr ) {
+		cudaFreeHost( g_embed_table.data );
+		g_embed_table.data = nullptr;
 	}
 }
 

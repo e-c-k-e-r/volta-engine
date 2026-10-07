@@ -10,6 +10,12 @@ namespace cg = cooperative_groups;
 #include <map>
 #include <cstdlib>
 
+static std::map<void*, int> occ_cache[ENGINE_NUM_GPUS];
+
+void exl3_gemv_reset_caches() {
+	for ( auto& m : occ_cache ) m.clear();
+}
+
 static int exl3_gemv_env_mode() {
 	const char* env = std::getenv( "EXL3_GEMV" );
 	if ( !env ) return 1;
@@ -99,7 +105,6 @@ bool exl3_gemv_try_launch(
 	int mmode = size_m == 1 ? 0 : 1;
 	int num_sms = ENGINE_SM_COUNT;
 
-	static std::map<void*, int> occ_cache[ENGINE_NUM_GPUS];
 	auto& cache = occ_cache[device < ENGINE_NUM_GPUS ? device : 0];
 	auto occupancy = [&]( void* kern, int bdim ) -> int {
 		auto it = cache.find( kern );

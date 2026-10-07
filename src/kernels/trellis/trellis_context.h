@@ -33,5 +33,8 @@ half* trellis_get_recon_ws( int device, size_t bytes );
 cublasHandle_t trellis_get_cublas( int device );
 void trellis_context_init_all();
 void trellis_context_destroy();
+// Forgets per-process memos keyed on kernel addresses (shared-memory attributes, occupancy): cudaDeviceReset drops the
+// attributes, so a second cluster in the same process must set them again.
+void trellis_reset_launch_caches();
 
 } // namespace engine::modules

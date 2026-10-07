@@ -94,6 +94,18 @@ public:
 	// shard width is a multiple of 256 and the dp4a int8 GEMV engages. Pad columns decode to exactly
 	// 0.0 (zero trellis, zero svh), so the caller must keep them out of the argmax range and offset
 	// the returned indices by rank * (N / tp_size).
+	// Column range [col_block_begin, col_block_begin + col_blocks) in 16-column blocks (a whole number of 128-column
+	// Hadamard spans), zero-padded by pad_cols; the general form of load_linear_slice_padded.
+	pod::LinearWeight load_linear_cols_padded(
+		const char* base_name,
+		pod::MemoryArena& arena,
+		int bits,
+		int col_block_begin,
+		int col_blocks,
+		int pad_cols,
+		cudaStream_t stream = nullptr
+	);
+
 	pod::LinearWeight load_linear_slice_padded(
 		const char* base_name,
 		pod::MemoryArena& arena,

@@ -838,6 +838,15 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 ) {
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
+	if ( find( name_buf ) == nullptr && tp_size > 1 ) {
+		// Unquantized checkpoint (the DFlash2 drafter's own release): a dense [n, k] weight. Trellis slice_dim 1 splits
+		// the output dimension n (dense dim 0), slice_dim 0 splits the input dimension k (dense dim 1).
+		std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
+		const pod::SafeTensorMeta* meta = find( name_buf );
+		ENGINE_ASSERT( meta != nullptr && meta->ndim == 2, "load_linear_slice: neither a trellis group nor a 2-D weight for this name" );
+		pod::TensorView w = load_slice( name_buf, arena, slice_dim == 1 ? 0 : 1, rank, tp_size, stream, pod::DType::FP16 );
+		return pod::LinearWeight::make_fp16( pod::make_tensor_2d( w.data, pod::DType::FP16, w.shape[1], w.shape[0] ) );
+	}
 	pod::TensorView tr = load_slice( name_buf, arena, slice_dim, rank, tp_size, stream );
 
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.mul1", base_name );
@@ -876,6 +885,24 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_padded(
 	cudaStream_t stream
 ) {
 	char name_buf[512];
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
+	const auto* meta = find( name_buf );
+	if ( !meta ) return pod::LinearWeight{};
+	ENGINE_ASSERT( meta->ndim == 3 && meta->shape[1] % tp_size == 0, "Trellis column count must divide across ranks" );
+	const int local_blocks = meta->shape[1] / tp_size;
+	return load_linear_cols_padded( base_name, arena, bits, rank * local_blocks, local_blocks, pad_cols, stream );
+}
+
+pod::LinearWeight SafeTensorsRepo::load_linear_cols_padded(
+	const char* base_name,
+	pod::MemoryArena& arena,
+	int bits,
+	int col_block_begin,
+	int col_blocks,
+	int pad_cols,
+	cudaStream_t stream
+) {
+	char name_buf[512];
 	int shard = -1;
 
 	// Trellis: rank's column slice, zero-padded to pad_cols. The pad rows are never read for a token
@@ -885,12 +912,13 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_padded(
 	const auto* meta_tr = find( name_buf, &shard );
 	if ( !meta_tr || shard < 0 ) return pod::LinearWeight{};
 	ENGINE_ASSERT( meta_tr->ndim == 3, "Trellis tensor must be 3D" );
-	ENGINE_ASSERT( meta_tr->shape[1] % tp_size == 0, "Trellis column count must divide across ranks" );
 
 	const int BK = meta_tr->shape[0];
 	const int BN = meta_tr->shape[1];
 	const int B = meta_tr->shape[2];
-	const int local_BN = BN / tp_size;
+	const int local_BN = col_blocks;
+	ENGINE_ASSERT( col_block_begin >= 0 && col_block_begin + local_BN <= BN, "column range outside the tensor" );
+	ENGINE_ASSERT( local_BN % 8 == 0, "column range must be whole 128-column Hadamard spans" );
 	const int padded_BN = local_BN + pad_cols / 16;
 	ENGINE_ASSERT( pad_cols % 128 == 0, "Pad must be a whole number of 128-column Hadamard spans" );
 	ENGINE_ASSERT( padded_BN * 16 % 256 == 0, "Padded shard width must be a multiple of 256 for the int8 GEMV" );
@@ -904,7 +932,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_padded(
 	ENGINE_ASSERT( src_tr != nullptr, "Failed to get CPU data for trellis tensor" );
 	size_t chunk_elems = static_cast<size_t>( local_BN ) * B;
 	for ( int k = 0; k < BK; ++k ) {
-		const uint16_t* src_k = src_tr + ( static_cast<size_t>( k ) * BN + rank * local_BN ) * B;
+		const uint16_t* src_k = src_tr + ( static_cast<size_t>( k ) * BN + col_block_begin ) * B;
 		std::memcpy( h_tr.data() + static_cast<size_t>( k ) * padded_BN * B, src_k, chunk_elems * sizeof( uint16_t ) );
 	}
 	CUDA_CHECK( cudaMemcpyAsync( tr.data, h_tr.data(), h_tr.size() * sizeof( uint16_t ), cudaMemcpyHostToDevice, stream ) );
@@ -924,7 +952,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_padded(
 	std::vector<half> h_svh( static_cast<size_t>( local_BN ) * 16 + pad_cols, __float2half( 0.0f ) );
 	const half* src_svh = static_cast<const half*>( safetensors_get_data_cpu( shards_[shard], meta_svh ) );
 	ENGINE_ASSERT( src_svh != nullptr, "Failed to get CPU data for svh" );
-	std::memcpy( h_svh.data(), src_svh + static_cast<size_t>( rank ) * local_BN * 16, ( h_svh.size() - pad_cols ) * sizeof( half ) );
+	std::memcpy( h_svh.data(), src_svh + static_cast<size_t>( col_block_begin ) * 16, ( h_svh.size() - pad_cols ) * sizeof( half ) );
 
 	int svh_shape[1] = { static_cast<int>( h_svh.size() ) };
 	pod::TensorView svh = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_shape, 1 );

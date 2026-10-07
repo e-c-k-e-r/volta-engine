@@ -41,6 +41,7 @@ set(ENGINE_CORE_SOURCES
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
 	src/spec/dflash_backbone.cu
+	src/spec/tap_ring.cu
 	src/runtime/kv_cache.cpp
 	src/runtime/cluster.cpp
 	src/runtime/dflash2_runner.cpp

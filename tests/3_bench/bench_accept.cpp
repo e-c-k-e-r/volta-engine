@@ -1,9 +1,10 @@
 // Draft acceptance characterisation (O5): speculative decode on a spread of prompts with Qwen's thinking
 // enabled (the regime DFlash2 was trained on) or suppressed (--nothink), reporting per-position candidate
 // quality: how often the drafter's best candidate / its top-k set / the selector walk hit the target's token.
-//   bench_accept [--nothink] [--tokens N] [--prompts K] [--temp T]   (T > 0 samples, top_p 0.95)
+//   bench_accept [--glm] [--nothink] [--tokens N] [--prompts K] [--temp T]   (T > 0 samples, top_p 0.95)
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"
+#include "engine/loader/chat_template.h"
 #include <cstdlib>
 #include <cstring>
 
@@ -15,8 +16,10 @@ int main( int argc, char** argv ) {
 	int n_tokens = 256;
 	int n_prompts = 100;
 	float temp = 0.0f;
+	bool glm = false;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--nothink" ) ) think = false;
+		else if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
 		else if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--prompts" ) && i + 1 < argc ) n_prompts = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--temp" ) && i + 1 < argc ) temp = static_cast<float>( std::atof( argv[++i] ) );
@@ -34,12 +37,14 @@ int main( int argc, char** argv ) {
 	const int total = static_cast<int>( sizeof( prompts ) / sizeof( prompts[0] ) );
 
 	engine::loader::Tokenizer tok;
-	ENGINE_ASSERT( tok.load( test::QWEN_DIR ), "tokenizer load failed" );
+	ENGINE_ASSERT( tok.load( glm ? test::GLM_DIR : test::QWEN_DIR ), "tokenizer load failed" );
+	engine::loader::ChatTemplate chat;
+	ENGINE_ASSERT( chat.load( glm ? test::GLM_DIR : test::QWEN_DIR ), "chat template load failed" );
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = "qwen38";
-	cfg.model_dir = test::QWEN_DIR;
-	cfg.draft_model_dir = test::QWEN_DRAFT_DIR;
+	cfg.model_type = glm ? "glm53" : "qwen38";
+	cfg.model_dir = glm ? test::GLM_DIR : test::QWEN_DIR;
+	cfg.draft_model_dir = glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	mc.warm_graphs( 8 );
 	mc.spec().set_diag( true );
@@ -47,13 +52,21 @@ int main( int argc, char** argv ) {
 	int rounds = 0, proposed = 0, accepted = 0, produced = 0;
 	double ms = 0.0;
 	for ( int pi = 0; pi < total && pi < n_prompts; ++pi ) {
-		std::vector<int> ids = { 248045, 846, 198 };
-		const std::vector<int> body = tok.encode( prompts[pi], false );
-		ids.insert( ids.end(), body.begin(), body.end() );
-		const std::vector<int> tail = think
-			? std::vector<int>{ 248046, 198, 248045, 74455, 198, 248068, 198 }
-			: std::vector<int>{ 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271 };
-		ids.insert( ids.end(), tail.begin(), tail.end() );
+		std::vector<int> ids;
+		if ( glm ) {
+			engine::loader::ChatTemplateOptions opts;
+			opts.enable_thinking = think;
+			ids = tok.encode( chat.render( { { "user", prompts[pi] } }, opts ), false );
+		}
+		else {
+			ids = { 248045, 846, 198 };
+			const std::vector<int> body = tok.encode( prompts[pi], false );
+			ids.insert( ids.end(), body.begin(), body.end() );
+			const std::vector<int> tail = think
+				? std::vector<int>{ 248046, 198, 248045, 74455, 198, 248068, 198 }
+				: std::vector<int>{ 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271 };
+			ids.insert( ids.end(), tail.begin(), tail.end() );
+		}
 		test::GenStats st;
 		if ( temp <= 0.0f ) {
 			st = test::generate( mc, ids, n_tokens, true );

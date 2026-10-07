@@ -11,6 +11,10 @@ namespace cg = cooperative_groups;
 
 static std::set<void*> g_gemm_attr_set[ENGINE_NUM_GPUS];
 
+void exl3_gemm_reset_caches() {
+	for ( auto& st : g_gemm_attr_set ) st.clear();
+}
+
 void exl3_gemm_init_all_attrs( int device ) {
 	if ( device < 0 || device >= ENGINE_NUM_GPUS ) device = 0;
 	int orig_dev = 0;
