@@ -112,6 +112,7 @@ public:
 	void forward( const pod::BatchRows& rows, cudaStream_t stream = nullptr ) override;
 	void sample_tokens( int* out_preds, int count, cudaStream_t stream = nullptr ) override;
 	bool sample_local( int* out_tokens, float* out_vals, int count, cudaStream_t stream = nullptr ) override;
+	bool topk_local( float* out_vals, int* out_ids, int count, cudaStream_t stream = nullptr ) override;
 	const half* shard_logits_ptr() const override { return logits_.ptr<const half>(); }
 	int shard_logits_cols() const override { return lm_shard_cols_; }
 	const pod::TensorView& gather_logits(
@@ -202,6 +203,12 @@ private:
 	float* draft_cand_part_v_ = nullptr;
 	int* draft_cand_part_i_ = nullptr;
 	int* draft_cand_counters_ = nullptr;
+	// Sampling top-k scratch (target logits, up to MAX_BATCH rows).
+	float* samp_part_v_ = nullptr;
+	int* samp_part_i_ = nullptr;
+	int* samp_counters_ = nullptr;
+	float* d_samp_vals_ = nullptr;
+	int* d_samp_idx_ = nullptr;
 	int* d_taps_owner_ = nullptr;
 
 	pod::TensorView embed_tokens_;

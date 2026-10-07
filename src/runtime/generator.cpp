@@ -86,6 +86,11 @@ void Generator::admit_pending() {
 		slot.req = std::move( pending_queue_.front() );
 		pending_queue_.erase( pending_queue_.begin() );
 		slot.all_tokens = slot.req.prompt_tokens;
+		slot.sp.temperature = slot.req.temperature;
+		slot.sp.top_p = slot.req.top_p;
+		slot.sp.top_k = MAX( 1, MIN( slot.req.top_k, kSampleTopK ) );
+		slot.sp.seed = slot.req.seed != 0 ? slot.req.seed : ( 0x51ED270B0F5A8C3DULL ^ slot.req.req_id );
+		slot.rng.reseed( slot.sp.seed );
 		slot.metrics.start_time = std::chrono::steady_clock::now();
 	}
 }
@@ -151,7 +156,9 @@ void Generator::prefill_slot( int s ) {
 	Slot& slot = slots_[s];
 	const int n = static_cast<int>( slot.req.prompt_tokens.size() );
 	cluster_.reset_slot( s );
-	const int first = cluster_.prefill( slot.req.prompt_tokens.data(), n, s );
+	Candidates first_cands;
+	int first = cluster_.prefill( slot.req.prompt_tokens.data(), n, s, pod::MAX_BATCH, slot.sp.greedy() ? nullptr : &first_cands );
+	if ( !slot.sp.greedy() ) first = sample_token( first_cands, slot.sp, slot.rng );
 	slot.current_pos = n;
 	slot.prefill_done = true;
 	slot.metrics.first_token_time = std::chrono::steady_clock::now();
@@ -181,7 +188,7 @@ void Generator::step_batch() {
 		// causal verify block). A slot that lost ownership to a newer request decodes normally.
 		const int s = ids[0];
 		Slot& slot = slots_[s];
-		const SpecResult r = cluster_.speculate( s, slot.last_token, slot.current_pos );
+		const SpecResult r = cluster_.speculate( s, slot.last_token, slot.current_pos, -1.0f, &slot.sp, &slot.rng );
 		slot.current_pos = r.next_pos;
 		slot.last_token = r.emitted[r.emitted_count - 1];
 		{
@@ -205,6 +212,16 @@ void Generator::step_batch() {
 	cluster_.forward( tokens, pod::BatchRows::batched( n, ids, positions ) );
 	int preds[MAX_SLOTS];
 	cluster_.sample( preds, n );
+	bool any_sampled = false;
+	for ( int i = 0; i < n; ++i ) any_sampled = any_sampled || !slots_[ids[i]].sp.greedy();
+	if ( any_sampled ) {
+		Candidates cs[MAX_SLOTS];
+		cluster_.sample_topk( n, cs );
+		for ( int i = 0; i < n; ++i ) {
+			Slot& sl = slots_[ids[i]];
+			if ( !sl.sp.greedy() ) preds[i] = sample_token( cs[i], sl.sp, sl.rng );
+		}
+	}
 	for ( int i = 0; i < n; ++i ) {
 		Slot& slot = slots_[ids[i]];
 		slot.current_pos++;

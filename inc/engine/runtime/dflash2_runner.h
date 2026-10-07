@@ -4,6 +4,7 @@
 #include "engine/core/batch.h"
 #include "engine/models/model.h"
 #include "engine/spec/dflash.h"
+#include "engine/runtime/sampling.h"
 #include <cuda_runtime.h>
 #include <string>
 
@@ -48,7 +49,10 @@ public:
 	bool owns( int slot ) const { return owner_ == slot; }
 
 	// Requires owns( slot ). `anchor` is the last committed, not yet forwarded token at `pos`.
-	SpecResult speculate( int slot, int anchor, int pos, float depth_threshold = -1.0f );
+	// With a non-greedy `sp` the round samples: each draft token is accepted with the target's probability of it
+	// (exact for a deterministic draft) and the correction / bonus token is drawn from the target's distribution.
+	SpecResult speculate( int slot, int anchor, int pos, float depth_threshold = -1.0f,
+		const SamplingParams* sp = nullptr, Rng* rng = nullptr );
 
 	// Per-step draft accuracy where the step was reached (the loop breaks at the first mismatch, so
 	// step k is sampled exactly when steps 0..k-1 were accepted).

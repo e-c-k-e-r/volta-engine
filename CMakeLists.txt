@@ -154,6 +154,10 @@ add_executable(test_spec_state tests/2_parity/test_spec_state.cpp)
 target_link_libraries(test_spec_state PRIVATE engine_kernels)
 set_target_properties(test_spec_state PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(test_sampling tests/2_parity/test_sampling.cpp)
+target_link_libraries(test_sampling PRIVATE engine_kernels)
+set_target_properties(test_sampling PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(bench_accept tests/3_bench/bench_accept.cpp)
 target_link_libraries(bench_accept PRIVATE engine_kernels)
 set_target_properties(bench_accept PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
@@ -166,6 +170,10 @@ set_target_properties(test_coherence PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJ
 add_executable(test_long_context tests/4_coherence/test_long_context.cpp)
 target_link_libraries(test_long_context PRIVATE engine_kernels)
 set_target_properties(test_long_context PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_sampling_gpu tests/4_coherence/test_sampling_gpu.cpp)
+target_link_libraries(test_sampling_gpu PRIVATE engine_kernels)
+set_target_properties(test_sampling_gpu PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Unified Production Server
 add_executable(volta_server src/server/main.cpp)

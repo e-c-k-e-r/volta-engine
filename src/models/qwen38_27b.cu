@@ -154,6 +154,17 @@ bool Qwen38Pipeline::init(
 		d_argmax_val_ = static_cast<float*>( engine::core::arena_alloc( arena, R * sizeof( float ) ) );
 		h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( R * sizeof( int ) ) );
 		std::memset( h_argmax_idx_, 0, R * sizeof( int ) );
+		if ( tp_size_ > 1 ) {
+			// Top-k sampling scratch over the target logits (up to R rows).
+			const int splits = ( lm_shard_cols_ + kTopkTile - 1 ) / kTopkTile;
+			const size_t per = static_cast<size_t>( R ) * splits * 16;
+			samp_part_v_ = static_cast<float*>( engine::core::arena_alloc( arena, per * sizeof( float ) ) );
+			samp_part_i_ = static_cast<int*>( engine::core::arena_alloc( arena, per * sizeof( int ) ) );
+			samp_counters_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
+			d_samp_vals_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * 16 * sizeof( float ) ) );
+			d_samp_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * 16 * sizeof( int ) ) );
+			CUDA_CHECK( cudaMemset( samp_counters_, 0, R * sizeof( int ) ) );
+		}
 		if ( rank_ == 0 && tp_size_ > 1 ) {
 			// Only the DFlash2 drafter needs the whole distribution; sampling reduces per shard.
 			int full_shape[2] = { R, config_.vocab_size };
@@ -408,6 +419,21 @@ bool Qwen38Pipeline::sample_local( int* out_tokens, float* out_vals, int count, 
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		std::memcpy( out_vals, h_vals.data(), count * sizeof( float ) );
 	}
+	return true;
+}
+
+bool Qwen38Pipeline::topk_local( float* out_vals, int* out_ids, int count, cudaStream_t stream ) {
+	if ( tp_size_ <= 1 ) return false;
+	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen38Pipeline::topk_local: count exceeds last forward rows" );
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	// Real columns only (pad columns decode to 0.0), global ids via the shard offset.
+	engine::spec::dflash2_topk_shard(
+		logits_.ptr<const half>(), count, lm_shard_cols_, lm_shard_real_cols_, 16,
+		d_samp_vals_, d_samp_idx_, rank_ * lm_shard_real_cols_,
+		samp_part_v_, samp_part_i_, samp_counters_, stream );
+	CUDA_CHECK( cudaMemcpyAsync( out_vals, d_samp_vals_, static_cast<size_t>( count ) * 16 * sizeof( float ), cudaMemcpyDeviceToHost, stream ) );
+	CUDA_CHECK( cudaMemcpyAsync( out_ids, d_samp_idx_, static_cast<size_t>( count ) * 16 * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	return true;
 }
 

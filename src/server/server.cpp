@@ -280,6 +280,9 @@ void VoltaServer::handle_chat_completion( ClientContext& client, const char* bod
 		max_tokens = 64;
 	}
 	float temperature = req.value( "temperature", config_.default_temperature );
+	const float top_p = req.value( "top_p", 1.0f );
+	const int top_k = req.value( "top_k", 16 );
+	const uint64_t seed = req.value( "seed", static_cast<uint64_t>( 0 ) );
 
 	std::vector<engine::loader::ChatMessage> chat_messages;
 	if ( req.contains( "messages" ) && req["messages"].is_array() ) {
@@ -310,6 +313,9 @@ void VoltaServer::handle_chat_completion( ClientContext& client, const char* bod
 	gen_req.prompt_tokens = std::move( prompt_tokens );
 	gen_req.max_tokens = max_tokens;
 	gen_req.temperature = temperature;
+	gen_req.top_p = top_p;
+	gen_req.top_k = top_k;
+	gen_req.seed = seed;
 	gen_req.stream = stream;
 
 	if ( stream ) {

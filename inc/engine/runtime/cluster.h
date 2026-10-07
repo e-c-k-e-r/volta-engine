@@ -7,6 +7,7 @@
 #include "engine/models/model.h"
 #include "engine/runtime/rank_pool.h"
 #include "engine/runtime/dflash2_runner.h"
+#include "engine/runtime/sampling.h"
 #include <functional>
 #include <cuda_runtime.h>
 #include <memory>
@@ -38,10 +39,15 @@ public:
 
 	// Chunked causal prefill of `count` tokens starting at pos 0 into `slot`.
 	// Returns the greedy prediction for the token following the prompt.
-	int prefill( const int* tokens, int count, int slot, int chunk = pod::MAX_BATCH );
+	// last_cands (optional) receives the final row's top-16 candidates so the caller can sample the first token.
+	int prefill( const int* tokens, int count, int slot, int chunk = pod::MAX_BATCH, Candidates* last_cands = nullptr );
 
 	// Greedy argmax of the last forward's first `count` rows (rank 0).
 	void sample( int* out, int count );
+
+	// Top-16 candidates (merged across the vocabulary shards, descending) for each of the last forward's first
+	// `count` rows, for temperature / top-p sampling. Synchronizes.
+	void sample_topk( int count, Candidates* out );
 
 	// Full-vocabulary FP16 logits of the last forward's first `rows` rows, copied to host
 	// ([rows, vocab_size], row-major). Reassembles the TP shards when the LM head is sharded.
@@ -63,8 +69,9 @@ public:
 	bool has_speculator() const { return runner_ != nullptr; }
 	DFlash2Runner& spec() { return *runner_; }
 	bool spec_owns( int slot ) const { return runner_ && runner_->owns( slot ); }
-	SpecResult speculate( int slot, int anchor, int pos, float depth_threshold = -1.0f ) {
-		return runner_->speculate( slot, anchor, pos, depth_threshold );
+	SpecResult speculate( int slot, int anchor, int pos, float depth_threshold = -1.0f,
+		const SamplingParams* sp = nullptr, Rng* rng = nullptr ) {
+		return runner_->speculate( slot, anchor, pos, depth_threshold, sp, rng );
 	}
 
 	// Runs fn( rank ) on every rank's pinned worker thread and waits for all of them.

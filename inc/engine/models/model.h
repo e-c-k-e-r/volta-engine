@@ -85,6 +85,17 @@ public:
 		return false;
 	}
 
+	// 4b'. Vocabulary-parallel top-k for sampling: this rank's top-kSampleTopK (16) logits per row over its shard of
+	// the last forward's first `count` rows, with global token ids, into caller-owned host arrays
+	// [count][16] (descending). False when the logits are not sharded.
+	virtual bool topk_local( float* out_vals, int* out_ids, int count, cudaStream_t stream = nullptr ) {
+		(void) out_vals;
+		(void) out_ids;
+		(void) count;
+		(void) stream;
+		return false;
+	}
+
 	// 4c. This rank's local logits shard, for a vocabulary-parallel head. Null when unsharded.
 	virtual const half* shard_logits_ptr() const { return nullptr; }
 	virtual int shard_logits_cols() const { return 0; }

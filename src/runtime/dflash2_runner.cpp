@@ -79,7 +79,8 @@ void DFlash2Runner::step_stats( int* attempts, int* hits ) const {
 	}
 }
 
-SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_threshold ) {
+SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_threshold,
+	const SamplingParams* sp, Rng* rng ) {
 	ENGINE_ASSERT( owner_ == slot, "DFlash2Runner::speculate: slot does not own the drafter context" );
 	constexpr int M = models::kDraftM;
 	constexpr int K = M - 1;
@@ -87,6 +88,8 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	const auto& meta = mc.metadata();
 	const cudaStream_t s0 = mc.stream( 0 );
 	SpecResult res;
+	const bool sampled = sp != nullptr && !sp->greedy();
+	ENGINE_ASSERT( !sampled || rng != nullptr, "DFlash2Runner::speculate: sampling needs an Rng" );
 	prof_last_ = SpecProfile::DRAFT;
 	prof_t0_ = impl::now_ms();
 
@@ -184,7 +187,14 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	if ( active < 1 ) {
 		// No room to verify a block: fall back to the target's own prediction for the anchor.
 		mc.forward( &anchor, 1, pos, slot );
-		res.emitted[res.emitted_count++] = mc.sample_one();
+		if ( sampled ) {
+			Candidates c1[1];
+			mc.sample_topk( 1, c1 );
+			res.emitted[res.emitted_count++] = sample_token( c1[0], *sp, *rng );
+		}
+		else {
+			res.emitted[res.emitted_count++] = mc.sample_one();
+		}
 		res.next_pos = pos + 1;
 		return res;
 	}
@@ -204,14 +214,26 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	mark( SpecProfile::VERIFY );
 	mc.forward( block, active + 1, pos, slot );
 	int preds[pod::MAX_BATCH];
-	mc.sample( preds, active + 1 );
+	Candidates cs[pod::MAX_BATCH];
+	if ( sampled ) mc.sample_topk( active + 1, cs );
+	else mc.sample( preds, active + 1 );
 	mark( SpecProfile::REPAIR );
 	++prof_.rounds;
 
-	// 5. Greedy acceptance.
+	// 5. Acceptance. Greedy: the draft must equal the target's argmax. Sampled: accept with the target's
+	// probability of the draft token (speculative sampling against a point-mass proposal), else draw the
+	// correction from the target's distribution with that token removed.
 	for ( int k = 0; k < active; ++k ) {
 		++att_[k];
-		if ( cands[k] != preds[k] ) {
+		if ( sampled ) {
+			bool acc = false;
+			const int tok = spec_step( cs[k], *sp, cands[k], *rng, &acc );
+			if ( !acc ) {
+				res.emitted[res.emitted_count++] = tok; // correction token
+				break;
+			}
+		}
+		else if ( cands[k] != preds[k] ) {
 			res.emitted[res.emitted_count++] = preds[k]; // correction token
 			break;
 		}
@@ -219,7 +241,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		res.emitted[res.emitted_count++] = cands[k];
 		res.accepted++;
 	}
-	if ( diag_on_ ) {
+	if ( diag_on_ && !sampled ) {
 		constexpr int kTop = models::kDraftTopK;
 		float hv[M * kTop];
 		int hi[M * kTop];
@@ -248,7 +270,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	}
 	// Bonus token: the target's prediction just past the accepted prefix.
 	if ( res.accepted == active ) {
-		res.emitted[res.emitted_count++] = preds[active];
+		res.emitted[res.emitted_count++] = sampled ? sample_token( cs[active], *sp, *rng ) : preds[active];
 	}
 
 	// 6. State repair. The next round expects exactly accepted + 1 rows consumed ([anchor, c1..c_accepted]),

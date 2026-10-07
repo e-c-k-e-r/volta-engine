@@ -120,6 +120,26 @@ if [ "$SS_INT" -lt "$SS_GATE" ]; then
 fi
 echo "[+] Single-stream speculative throughput OK."
 
+# 3c. Temperature sampling: same seed reproduces, a different seed differs (open-ended prompt, speculative path)
+echo "[*] STEP 3c: Sampling (temperature 1.0, top_p 0.95)..."
+sample_req() {
+	curl -s -X POST "http://$HOST:$PORT/v1/chat/completions" \
+		-H "Content-Type: application/json" \
+		-d '{"model":"qwen38","messages":[{"role":"user","content":"Write a short story about a robot who learns to paint."}],"stream":false,"max_tokens":40,"temperature":1.0,"top_p":0.95,"seed":'"$1"'}'
+}
+content_of() { python3 -I -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'; }
+S1=$(sample_req 7 | content_of); S2=$(sample_req 7 | content_of); S3=$(sample_req 8 | content_of)
+if [ "$S1" != "$S2" ]; then
+	echo "[-] FATAL: same seed gave different sampled output!"
+	echo "    $S1"; echo "    $S2"
+	exit 1
+fi
+if [ "$S1" = "$S3" ]; then
+	echo "[-] FATAL: different seeds gave identical sampled output!"
+	exit 1
+fi
+echo "[+] Sampling OK (seed 7 reproduces, seed 8 differs)."
+
 # 4. Concurrency Gate: 8 Simultaneous Client Streams
 echo "[*] STEP 4: Concurrency Gate (8 Simultaneous Streams)..."
 CONCURRENCY=8

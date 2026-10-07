@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/runtime/sampling.h"
 #include "engine/config.h"
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
@@ -37,6 +38,9 @@ struct GenerationRequest {
 	std::vector<int> prompt_tokens;
 	int max_tokens = 64;
 	float temperature = 0.0f;
+	float top_p = 1.0f;
+	int top_k = 16;          // capped at 16 (kSampleTopK)
+	uint64_t seed = 0;       // 0 = derive from req_id
 	bool stream = false;
 	std::function<void( const std::string& token_str, bool is_done )> stream_callback;
 	std::function<void( const std::string& full_text, const SlotMetrics& metrics )> completion_callback;
@@ -80,6 +84,8 @@ private:
 		int current_pos = 0;   // next position to write (== tokens committed to KV / recurrent state)
 		int tokens_generated = 0;
 		int last_token = -1;   // sampled, not yet forwarded (next anchor)
+		SamplingParams sp;
+		Rng rng;
 		bool prefill_done = false;
 		std::string accumulated_text;
 		std::vector<int> all_tokens;

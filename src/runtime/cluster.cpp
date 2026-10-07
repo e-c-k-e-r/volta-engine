@@ -105,7 +105,7 @@ void ModelCluster::forward( const int* tokens, int count, int pos, int slot ) {
 	forward( tokens, pod::BatchRows::causal( count, pos, slot ) );
 }
 
-int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk ) {
+int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Candidates* last_cands ) {
 	ENGINE_ASSERT( count >= 1, "ModelCluster::prefill: empty prompt" );
 	chunk = MAX( 1, MIN( chunk, metadata().max_rows ) );
 	int last_rows = 1;
@@ -115,7 +115,52 @@ int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk ) {
 	}
 	int preds[pod::MAX_BATCH];
 	sample( preds, last_rows );
+	if ( last_cands != nullptr ) {
+		Candidates cs[pod::MAX_BATCH];
+		sample_topk( last_rows, cs );
+		*last_cands = cs[last_rows - 1];
+	}
 	return preds[last_rows - 1];
+}
+
+void ModelCluster::sample_topk( int count, Candidates* out ) {
+	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_BATCH, "ModelCluster::sample_topk: row count out of range" );
+	constexpr int K = kSampleTopK;
+	float vals[ENGINE_NUM_GPUS][pod::MAX_BATCH * K];
+	int ids[ENGINE_NUM_GPUS][pod::MAX_BATCH * K];
+	int ok[ENGINE_NUM_GPUS] = {};
+	pool_.run( [&]( int d ) {
+		ok[d] = models_[d]->topk_local( vals[d], ids[d], count, streams_[d] ) ? 1 : 0;
+	} );
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		ENGINE_ASSERT( ok[d] != 0, "ModelCluster::sample_topk: the model has no vocabulary-parallel top-k" );
+	}
+	// A rank's local top-16 is a superset of the global top-16 restricted to its shard, so the union holds the
+	// answer. Ties keep the lower token id (argmax convention).
+	for ( int r = 0; r < count; ++r ) {
+		float v[ENGINE_NUM_GPUS * K];
+		int t[ENGINE_NUM_GPUS * K];
+		int n = 0;
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			for ( int j = 0; j < K; ++j ) {
+				v[n] = vals[d][r * K + j];
+				t[n] = ids[d][r * K + j];
+				++n;
+			}
+		}
+		Candidates& c = out[r];
+		c.n = K;
+		for ( int j = 0; j < K; ++j ) {
+			int best = j;
+			for ( int i = j + 1; i < n; ++i ) {
+				if ( v[i] > v[best] || ( v[i] == v[best] && t[i] < t[best] ) ) best = i;
+			}
+			std::swap( v[j], v[best] );
+			std::swap( t[j], t[best] );
+			c.logits[j] = v[j];
+			c.ids[j] = t[j];
+		}
+	}
 }
 
 void ModelCluster::sample( int* out, int count ) {
