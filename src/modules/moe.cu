@@ -4,6 +4,7 @@
 #include <cmath>
 #include <vector>
 #include <cstdio>
+#include <cstdlib>
 
 namespace engine::modules {
 
@@ -217,6 +218,22 @@ void router_select_kernel(
 	}
 }
 
+// out = sum over group planes in group order (fixed order, so the result is independent of group timing)
+__global__ void moe_sum_planes_kernel(
+	const half* __restrict__ planes,
+	half* __restrict__ out,
+	int n,
+	int num_groups
+) {
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( i >= n ) return;
+	float acc = __half2float( planes[i] );
+	for ( int g = 1; g < num_groups; ++g ) {
+		acc += __half2float( planes[static_cast<size_t>( g ) * n + i] );
+	}
+	out[i] = __float2half_rn( acc );
+}
+
 __global__ void moe_combine_kernel(
 	const half* __restrict__ expert_parts,
 	const half* __restrict__ topk_weights,
@@ -417,7 +434,7 @@ pod::MoEScratch MoE::alloc_scratch(
 	int intermediate_size,
 	int max_rows
 ) {
-	const int groups = 10;
+	const int groups = MOE_MAX_GROUPS;
 	const size_t E1 = static_cast<size_t>( num_local_experts ) + 1;
 	pod::MoEScratch s;
 	s.expert_count = static_cast<int64_t*>( engine::core::arena_alloc( arena, E1 * sizeof( int64_t ) ) );
@@ -425,12 +442,13 @@ pod::MoEScratch MoE::alloc_scratch(
 	s.weight_sorted = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( top_k ) * max_rows * sizeof( half ) ) );
 	s.cursors = static_cast<int*>( engine::core::arena_alloc( arena, E1 * sizeof( int ) ) );
 	s.active_experts = static_cast<int4*>( engine::core::arena_alloc( arena, E1 * sizeof( int4 ) ) );
-	const size_t state_elems = static_cast<size_t>( groups ) * top_k * hidden_size;
-	const size_t interm_elems = static_cast<size_t>( groups ) * top_k * intermediate_size;
+	const size_t state_elems = static_cast<size_t>( groups ) * 16 * hidden_size;
+	const size_t interm_elems = static_cast<size_t>( groups ) * 16 * intermediate_size;
 	s.state_g = static_cast<half*>( engine::core::arena_alloc( arena, state_elems * sizeof( half ) ) );
 	s.state_u = static_cast<half*>( engine::core::arena_alloc( arena, state_elems * sizeof( half ) ) );
 	s.interm_g = static_cast<half*>( engine::core::arena_alloc( arena, interm_elems * sizeof( half ) ) );
 	s.interm_u = static_cast<half*>( engine::core::arena_alloc( arena, interm_elems * sizeof( half ) ) );
+	s.planes = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( groups ) * max_rows * hidden_size * sizeof( half ) ) );
 	return s;
 }
 
@@ -446,8 +464,14 @@ void MoE::forward(
 	float act_limit,
 	cudaStream_t stream
 ) {
-	CUDA_CHECK( cudaMemsetAsync( out.data, 0, out.size_bytes(), stream ) );
 	const int rows = ( out.ndim >= 2 && out.shape[0] > 0 ) ? out.shape[0] : 1;
+	// Concurrent expert groups: a rank has ~2 active experts at one row, ~13 at eight, all 72 in a prefill chunk, and
+	// each group has fewer blocks, so wide grouping only pays once there are experts to run side by side.
+	static const int env_groups = std::getenv( "EXL3_MOE_GROUPS" ) ? std::atoi( std::getenv( "EXL3_MOE_GROUPS" ) ) : 0;
+	const int num_groups = env_groups > 0 ? MIN( env_groups, MOE_MAX_GROUPS ) : ( rows <= 16 ? 1 : MOE_MAX_GROUPS );
+	const size_t plane_elems = static_cast<size_t>( rows ) * out.shape[out.ndim - 1];
+	half* target = ( num_groups == 1 ) ? out.ptr<half>() : scratch.planes;
+	CUDA_CHECK( cudaMemsetAsync( target, 0, plane_elems * num_groups * sizeof( half ), stream ) );
 
 	switch ( weights.type ) {
 		case pod::QuantType::TRELLIS: {
@@ -486,7 +510,7 @@ void MoE::forward(
 
 			ext::exl3_moe(
 				x.data,
-				out.data,
+				target,
 				scratch.expert_count,
 				scratch.token_sorted,
 				scratch.weight_sorted,
@@ -503,8 +527,15 @@ void MoE::forward(
 				act_limit,
 				-1,
 				scratch.active_experts,
+				num_groups,
+				plane_elems,
+				static_cast<int>( std::getenv( "EXL3_MOE_WIDE" ) ? std::atoi( std::getenv( "EXL3_MOE_WIDE" ) ) : ( rows > 8 ? 2 : 0 ) ),
 				stream
 			);
+			if ( num_groups > 1 ) {
+				moe_sum_planes_kernel<<<dim3( ( plane_elems + 255 ) / 256 ), dim3( 256 ), 0, stream>>>(
+					scratch.planes, out.ptr<half>(), static_cast<int>( plane_elems ), num_groups );
+			}
 		} break;
 		default: {
 			ENGINE_ASSERT( false, "MoE::forward: no routed-expert driver for this weight format (only TRELLIS is implemented)" );
@@ -537,6 +568,9 @@ void exl3_moe(
 	float act_limit,
 	int num_active,
 	const int4* active_experts,
+	int num_groups,
+	size_t out_plane_stride,
+	int wide,
 	cudaStream_t stream
 ) {
 	(void) gate_mcg; (void) gate_mul1; (void) up_mcg; (void) up_mul1; (void) down_mcg; (void) down_mul1;
@@ -546,8 +580,9 @@ void exl3_moe(
 	int num_sms = engine::modules::trellis_get_num_sms( device );
 	int* locks = engine::modules::trellis_get_locks( device );
 
-	int group_size = 80;
-	int num_groups = num_sms / group_size;
+	// num_groups experts run concurrently on num_sms / num_groups blocks each, all co-resident
+	ENGINE_ASSERT( num_groups >= 1 && num_groups <= MOE_MAX_GROUPS, "exl3_moe: bad group count" );
+	int group_size = num_sms / num_groups;
 	dim3 grid_dim( group_size, 1, num_groups );
 	int block_dim = 256 * MOE_TILESIZE_K / 16;
 
@@ -558,7 +593,7 @@ void exl3_moe(
 	int intermediate_dim = 2048;
 	int num_experts = 72;
 	int num_experts_per_tok = 8;
-	int max_tokens_per_expert = 4; // the m4 GEMM tile holds 4 rows; larger expert batches run in chunks
+	int max_tokens_per_expert = wide == 2 ? 16 : 4; // rows per expert pass (the GEMM tile); larger batches run in chunks
 	int concurrency = num_groups;
 	int chunk_all = 1; // experts above max_tokens_per_expert tokens are evaluated in chunks of max_tokens_per_expert
 
@@ -594,17 +629,20 @@ void exl3_moe(
 		(void*) &K_up,
 		(void*) &K_down,
 		(void*) &locks,
-		(void*) &active_experts
+		(void*) &active_experts,
+		(void*) &out_plane_stride
 	};
 
 	static bool attr_set[ENGINE_NUM_GPUS] = { false };
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		attr_set[device] = true;
 	}
 
+	// The wide kernel carries the 16-row GEMM tile as well; keeping it out of the decode kernel preserves its registers
 	CUDA_CHECK( cudaLaunchKernel(
-		(void*) exl3_moe_kernel<3, 128, 2>,
+		wide == 2 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<3, 128, 2, 0>,
 		grid_dim,
 		dim3( block_dim ),
 		kernel_args,

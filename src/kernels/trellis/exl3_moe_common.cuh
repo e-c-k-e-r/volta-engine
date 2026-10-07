@@ -62,4 +62,5 @@ inline int get_moe_group_size( int bsz, int num_sms, int num_groups ) {
 	const int K_down,                           \
 	                                            \
 	int* __restrict__ locks,                    \
-	const int4* __restrict__ active_experts
+	const int4* __restrict__ active_experts,    \
+	const size_t out_plane_stride

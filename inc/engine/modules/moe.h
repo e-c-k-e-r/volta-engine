@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#define MOE_MAX_GROUPS 8
+
 namespace pod {
 
 struct MoELayerWeights {
@@ -29,6 +31,7 @@ struct MoEScratch {
 	half*    state_u = nullptr;
 	half*    interm_g = nullptr;       // [groups, top_k, intermediate]
 	half*    interm_u = nullptr;
+	half*    planes = nullptr;         // [MOE_MAX_GROUPS, max_rows, hidden] per-group output planes
 };
 
 } // namespace pod
@@ -149,6 +152,9 @@ void exl3_moe(
 	float act_limit,
 	int num_active,
 	const int4* active_experts,
+	int num_groups,
+	size_t out_plane_stride,        // elements between the per-group output planes
+	int wide,                       // expert GEMM tile: 0: 4 rows, 2: 16 rows above 4
 	cudaStream_t stream = nullptr
 );
 

@@ -42,6 +42,7 @@ int main() {
 	engine::modules::trellis_get_locks( 0 );
 
 	const impl::Shape shapes[] = {
+		{ "glm expert g/u", 4096, 2048, 3 }, { "glm expert down", 2048, 4096, 3 },
 		{ "mlp gate/up", 5120, 4352, 4 }, { "mlp down", 4352, 5120, 4 },
 		{ "gdn qkv", 5120, 2560, 4 }, { "gdn z", 5120, 1536, 4 }, { "gdn out", 1536, 5120, 4 },
 		{ "attn q+gate", 5120, 3072, 4 }, { "mlp gate/up 5b", 5120, 4352, 5 },
@@ -104,6 +105,39 @@ int main() {
 		}
 		engine::core::arena_reset( arena );
 		A_had = engine::modules::trellis_get_workspace( 0, 16ULL * 8192 * sizeof( half ) );
+	}
+
+	// Cold-weight probe: cycle through 72 distinct expert matrices (223 MB, far above the 6 MB L2) so every call streams
+	// its weights from HBM, as the MoE does; the loop above re-reads one matrix from L2.
+	{
+		const impl::Shape sh = { "glm expert cold", 4096, 2048, 3 };
+		const int N = 72;
+		const size_t words = static_cast<size_t>( sh.k / 16 ) * ( sh.n / 16 ) * 16 * sh.bits;
+		std::vector<uint16_t*> Bs( N );
+		std::vector<uint16_t> hb( words );
+		uint32_t st = 99u;
+		for ( auto& w : hb ) { st = st * 1664525u + 1013904223u; w = static_cast<uint16_t>( st >> 16 ); }
+		for ( auto& b : Bs ) {
+			b = static_cast<uint16_t*>( engine::core::arena_alloc( arena, words * 2 ) );
+			CUDA_CHECK( cudaMemcpy( b, hb.data(), words * 2, cudaMemcpyHostToDevice ) );
+		}
+		auto* suh = static_cast<half*>( engine::core::arena_alloc( arena, sh.k * 2 ) );
+		auto* svh = static_cast<half*>( engine::core::arena_alloc( arena, sh.n * 2 ) );
+		auto* A = static_cast<half*>( engine::core::arena_alloc( arena, 16ULL * sh.k * 2 ) );
+		auto* C = static_cast<half*>( engine::core::arena_alloc( arena, 16ULL * sh.n * 2 ) );
+		CUDA_CHECK( cudaMemset( suh, 0x3c, sh.k * 2 ) );
+		CUDA_CHECK( cudaMemset( svh, 0x3c, sh.n * 2 ) );
+		CUDA_CHECK( cudaMemset( A, 0x3c, 16ULL * sh.k * 2 ) );
+		A_had = engine::modules::trellis_get_workspace( 0, 16ULL * 8192 * sizeof( half ) );
+		const double mb = words * 2 / 1e6;
+		for ( int m : { 1, 4, 8, 16 } ) {
+			int i = 0;
+			const float tv = impl::time_ms( [&]() { exl3_gemv( A, Bs[i++ % N], C, suh, A_had, svh, m, sh.k, sh.n, sh.bits, false, true, false, s ); }, s, 144 );
+			const float tg = impl::time_ms( [&]() { exl3_gemm( A, Bs[i++ % N], C, suh, A_had, svh, m, sh.k, sh.n, sh.bits, false, true, false, s ); }, s, 144 );
+			std::printf( "%-15s k%-5d n%-6d %db M=%d  %7.1f MB | gemv %8.1f us %6.0f GB/s | gemm %8.1f us %6.0f GB/s\n",
+				sh.name, sh.k, sh.n, sh.bits, m, mb, tv * 1e3, mb / tv, tg * 1e3, mb / tg );
+		}
+		engine::core::arena_reset( arena );
 	}
 	// Concurrency probe: two independent GEMVs of one shape (own weights, own Hadamard workspace) back to
 	// back on one stream versus forked onto two streams. M >= 4 only: the M <= 2 int8 path shares one

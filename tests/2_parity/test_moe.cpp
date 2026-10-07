@@ -158,6 +158,18 @@ int main() {
 			maxd = std::fmax( maxd, std::fabs( a - b ) );
 		}
 		const double c = dot / ( std::sqrt( na ) * std::sqrt( nb ) + 1e-12 );
+		if ( std::getenv( "MOE_ROWS_VERBOSE" ) && R <= 9 ) {
+			for ( int r = 0; r < R; ++r ) {
+				double d2 = 0, a2 = 0, b2 = 0;
+				for ( int i = 0; i < H; ++i ) {
+					const double a = __half2float( h_want[static_cast<size_t>( r ) * H + i] ), b = __half2float( h_got[static_cast<size_t>( r ) * H + i] );
+					d2 += a * b; a2 += a * a; b2 += b * b;
+				}
+				std::printf( "    row %d: cos %.6f routes:", r, d2 / ( std::sqrt( a2 * b2 ) + 1e-12 ) );
+				for ( int k = 0; k < K; ++k ) std::printf( " %d", hir[r * K + k] );
+				std::printf( "\n" );
+			}
+		}
 		std::printf( "[*] MoE %2d rows vs per-row: cos=%.6f max_abs=%.5f (|ref|=%.2f)\n", R, c, maxd, std::sqrt( na ) );
 		multi_pass = multi_pass && c >= 0.9999;
 	}

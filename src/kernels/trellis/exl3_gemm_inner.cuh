@@ -374,6 +374,8 @@ void exl3_gemm_kernel_inner_m64
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) frag_c[rb][n][j] += sh_red[n * 4 + j];
             }
+            // sh_red is reused by the next row block: sub_k 1 must not overwrite it before sub_k 0 has read it
+            __syncthreads();
         }
 
         int lock_i = tiles_k - slice2_k - 1;
