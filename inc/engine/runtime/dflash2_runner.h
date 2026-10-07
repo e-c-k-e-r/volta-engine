@@ -24,7 +24,7 @@ struct SpecResult {
 // Per-stage wall time of a speculative round (host clock: several stages are host syncs whose cost a
 // device event would not attribute to them). Accumulated since the last dump.
 struct SpecProfile {
-	enum Stage : int { DRAFT = 0, WALK, CHECKPOINT, VERIFY, REPAIR, COUNT };
+	enum Stage : int { DRAFT = 0, WALK, CHECKPOINT, VERIFY, SAMPLE, REPAIR, COUNT };
 	double ms[COUNT] = {};
 	int rounds = 0;
 	int commits = 0;

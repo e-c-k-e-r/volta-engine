@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/runtime/spec_controller.h"
 #include "engine/runtime/sampling.h"
 #include "engine/config.h"
 #include "engine/core/arena.h"
@@ -90,6 +91,7 @@ private:
 		std::string accumulated_text;
 		std::vector<int> all_tokens;
 		SlotMetrics metrics;
+		SpecController ctrl;
 	};
 
 	void scheduler_loop();

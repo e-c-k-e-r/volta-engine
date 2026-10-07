@@ -183,12 +183,15 @@ void Generator::step_batch() {
 	}
 	if ( n == 0 ) return;
 
-	if ( n == 1 && cluster_.spec_owns( ids[0] ) ) {
+	const bool single_spec = ( n == 1 && cluster_.spec_owns( ids[0] ) );
+	if ( single_spec && slots_[ids[0]].ctrl.use_spec() ) {
 		// Case A: single request that owns the drafter context, DFlash2 speculative round (Mode A
 		// causal verify block). A slot that lost ownership to a newer request decodes normally.
 		const int s = ids[0];
 		Slot& slot = slots_[s];
+		const auto t0 = std::chrono::steady_clock::now();
 		const SpecResult r = cluster_.speculate( s, slot.last_token, slot.current_pos, -1.0f, &slot.sp, &slot.rng );
+		slot.ctrl.observe_spec( r.emitted_count, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
 		slot.current_pos = r.next_pos;
 		slot.last_token = r.emitted[r.emitted_count - 1];
 		{
@@ -203,6 +206,7 @@ void Generator::step_batch() {
 	}
 
 	// Case B (n == 1) / Case C (n > 1): one token per active slot in a single Mode B forward
+	const auto dense_t0 = std::chrono::steady_clock::now();
 	int tokens[MAX_SLOTS];
 	int positions[MAX_SLOTS];
 	for ( int i = 0; i < n; ++i ) {
@@ -221,6 +225,9 @@ void Generator::step_batch() {
 			Slot& sl = slots_[ids[i]];
 			if ( !sl.sp.greedy() ) preds[i] = sample_token( cs[i], sl.sp, sl.rng );
 		}
+	}
+	if ( single_spec ) {
+		slots_[ids[0]].ctrl.observe_dense( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - dense_t0 ).count() );
 	}
 	for ( int i = 0; i < n; ++i ) {
 		Slot& slot = slots_[ids[i]];

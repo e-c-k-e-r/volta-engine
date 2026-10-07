@@ -257,6 +257,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	mc.set_spec_snapshot( true );
 	mark( SpecProfile::VERIFY );
 	mc.forward( block, active + 1, pos, slot );
+	mark( SpecProfile::SAMPLE );
 	int preds[pod::MAX_BATCH];
 	Candidates cs[pod::MAX_BATCH];
 	if ( sampled ) mc.sample_topk( active + 1, cs );
@@ -348,7 +349,7 @@ void DFlash2Runner::mark( SpecProfile::Stage stage ) {
 
 void DFlash2Runner::profile_dump() {
 	static const char* names[SpecProfile::COUNT] = {
-		"draft(backbone+head+merge)", "walk(gate+lattice)", "snapshot_on", "verify_fwd", "commit"
+		"draft(backbone+head+merge)", "walk(gate+lattice)", "snapshot_on", "verify_fwd", "sample(sync+merge)", "accept+commit"
 	};
 	double total = 0.0;
 	for ( int i = 0; i < SpecProfile::COUNT; ++i ) total += prof_.ms[i];
