@@ -153,6 +153,31 @@ int main() {
 			A_had = engine::modules::trellis_get_workspace( 0, 16ULL * 8192 * sizeof( half ) );
 		}
 	}
+	// Large-M GEMM scaling (prefill chunks): time per call as M grows, on the Qwen MLP shapes.
+	{
+		const impl::Shape big[] = { { "mlp gate/up", 5120, 4352, 4 }, { "mlp down", 4352, 5120, 4 }, { "gdn qkv", 5120, 2560, 4 } };
+		const int ms_big[] = { 16, 32, 64, 128, 256 };
+		for ( const auto& sh : big ) {
+			const size_t words = static_cast<size_t>( sh.k / 16 ) * ( sh.n / 16 ) * 16 * sh.bits;
+			auto* B = static_cast<uint16_t*>( engine::core::arena_alloc( arena, words * 2 ) );
+			auto* suh = static_cast<half*>( engine::core::arena_alloc( arena, sh.k * 2 ) );
+			auto* svh = static_cast<half*>( engine::core::arena_alloc( arena, sh.n * 2 ) );
+			auto* A = static_cast<half*>( engine::core::arena_alloc( arena, 256ULL * sh.k * 2 ) );
+			auto* C = static_cast<half*>( engine::core::arena_alloc( arena, 256ULL * sh.n * 2 ) );
+			half* Ah = engine::modules::trellis_get_workspace( 0, 256ULL * 8192 * sizeof( half ) );
+			CUDA_CHECK( cudaMemset( B, 0x5a, words * 2 ) );
+			CUDA_CHECK( cudaMemset( suh, 0x3c, sh.k * 2 ) );
+			CUDA_CHECK( cudaMemset( svh, 0x3c, sh.n * 2 ) );
+			CUDA_CHECK( cudaMemset( A, 0x30, 256ULL * sh.k * 2 ) );
+			for ( int m : ms_big ) {
+				const float t = impl::time_ms( [&]() { exl3_gemm( A, B, C, suh, Ah, svh, m, sh.k, sh.n, sh.bits, false, true, false, s ); }, s, 20 );
+				const double flop = 2.0 * m * sh.k * sh.n;
+				std::printf( "%-12s gemm M=%3d: %8.1f us  (%.1f us/row, %.1f TFLOP/s)\n", sh.name, m, t * 1e3, t * 1e3 / m, flop / ( t * 1e-3 ) / 1e12 );
+			}
+			engine::core::arena_reset( arena );
+			A_had = engine::modules::trellis_get_workspace( 0, 16ULL * 8192 * sizeof( half ) );
+		}
+	}
 	engine::core::arena_destroy( arena );
 	engine::modules::trellis_context_destroy();
 	cudaDeviceReset();
