@@ -191,8 +191,10 @@ bool exl3_gemv_int8(
 	if ( size_m < 1 || size_m > 2 ) return false;
 
 	bool residual = ( int8_mode() == 1 );
-	if ( residual && size_m > 1 ) return false; // residual mode is single row only
-	int M = size_m;
+	// Residual mode now serves two rows too. More rows lose to the tensor-core GEMM: the dp4a chains (two
+	// per row in residual mode) are issue-bound, so time grows ~linearly in M (M=4 315 us, M=8 457 us on
+	// the 5120x17408 5-bit shape against 217 us for the GEMM).
+	const int M = size_m;
 	bool smem = gemv_int8_stage_smem( K );
 
 	// Both the sq kernel and the launcher size shared memory against the ~80 KB budget baked into
@@ -208,19 +210,26 @@ bool exl3_gemv_int8(
 
 	int num_sms = engine::modules::trellis_get_num_sms( device );
 
-	// Mirror of the kernel's decomposition for the occupancy query and the shared memory size.
-	Decomp d = decomp( 6 * num_sms, size_k, size_n, M, residual );
-	size_t smem_guess = smem_for( d.rows_per, size_n, M, residual, smem, K );
+	// The grid is sized from the single-row variant's occupancy for every row count, so the k-slice
+	// decomposition (and with it every per-slice activation scale and the fixed-order reduction) is
+	// identical across M: row r of an M-row call is bit-identical to the same row run alone. Wider
+	// variants may then exceed their own resident-block count, which is fine (blocks never wait on
+	// each other; the last finisher of a column group runs its epilogue).
+	void* fn1 = select_kernel( K, 1, c_fp32, residual );
+	if ( !fn1 ) fn1 = fn;
+	const int M1 = ( fn1 == fn ) ? M : 1;
+	Decomp d = decomp( 6 * num_sms, size_k, size_n, M1, residual );
+	size_t smem_guess = smem_for( d.rows_per, size_n, M1, residual, smem, K );
 
 	int maxb = 1;
-	auto occ_key = std::make_pair( fn, smem_guess );
+	auto occ_key = std::make_pair( fn1, smem_guess );
 	auto occ_it = int8_occ_cache[device].find( occ_key );
 	if ( occ_it != int8_occ_cache[device].end() ) {
 		maxb = occ_it->second;
 	}
 	else {
 		maxb = 1;
-		cudaOccupancyMaxActiveBlocksPerMultiprocessor( &maxb, fn, NUM_THREADS, smem_guess );
+		cudaOccupancyMaxActiveBlocksPerMultiprocessor( &maxb, fn1, NUM_THREADS, smem_guess );
 		int8_occ_cache[device][occ_key] = maxb;
 	}
 	int grid = MIN( MAX( maxb, 1 ) * num_sms, 1024 );

@@ -51,6 +51,7 @@ int main( int argc, char** argv ) {
 	cfg.model_dir = glm ? test::GLM_DIR : test::QWEN_DIR;
 	cfg.draft_model_dir = glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
+	mc.warm_graphs( 8 );
 
 	// Qwen chat prompts ("List the first 5 prime numbers:" / "What is the capital of France?")
 	const std::vector<std::vector<int>> prompts = {

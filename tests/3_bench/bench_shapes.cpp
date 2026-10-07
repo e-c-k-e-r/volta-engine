@@ -1,5 +1,7 @@
 // Per-shape GEMV vs GEMM timing on Qwen TP4 per-rank shapes (GPU 0). Random trellis data:
 // timing only, numerics meaningless.
+#include <vector>
+#include <cmath>
 #include "engine/config.h"
 #include "engine/core/arena.h"
 #include "exl3_gemv.cuh"
@@ -57,16 +59,48 @@ int main() {
 		auto* svh = static_cast<half*>( engine::core::arena_alloc( arena, sh.n * 2 ) );
 		auto* A = static_cast<half*>( engine::core::arena_alloc( arena, 8ULL * sh.k * 2 ) );
 		auto* C = static_cast<half*>( engine::core::arena_alloc( arena, 8ULL * sh.n * 2 ) );
-		CUDA_CHECK( cudaMemset( B, 0x5a, words * 2 ) );
+		{
+			// Pseudo-random trellis words and activations so the row-consistency check below is not trivial.
+			std::vector<uint16_t> hb( words );
+			uint32_t st = 12345u;
+			for ( auto& w : hb ) { st = st * 1664525u + 1013904223u; w = static_cast<uint16_t>( st >> 16 ); }
+			CUDA_CHECK( cudaMemcpy( B, hb.data(), words * 2, cudaMemcpyHostToDevice ) );
+		}
 		CUDA_CHECK( cudaMemset( suh, 0x3c, sh.k * 2 ) );
 		CUDA_CHECK( cudaMemset( svh, 0x3c, sh.n * 2 ) );
-		CUDA_CHECK( cudaMemset( A, 0x30, 8ULL * sh.k * 2 ) );
+		{
+			std::vector<half> ha( 8ULL * sh.k );
+			uint32_t st = 777u;
+			for ( auto& v : ha ) { st = st * 1664525u + 1013904223u; v = __float2half( ( static_cast<int>( st >> 16 ) % 2001 - 1000 ) / 1000.0f ); }
+			CUDA_CHECK( cudaMemcpy( A, ha.data(), ha.size() * 2, cudaMemcpyHostToDevice ) );
+		}
 		const double mb = words * 2 / 1e6;
 		for ( int m : ms_list ) {
 			const float tv = impl::time_ms( [&]() { exl3_gemv( A, B, C, suh, A_had, svh, m, sh.k, sh.n, sh.bits, false, true, false, s ); }, s, 50 );
 			const float tg = impl::time_ms( [&]() { exl3_gemm( A, B, C, suh, A_had, svh, m, sh.k, sh.n, sh.bits, false, true, false, s ); }, s, 50 );
 			std::printf( "%-15s k%-5d n%-6d %db M=%d  %7.1f MB | gemv %8.1f us %6.0f GB/s | gemm %8.1f us %6.0f GB/s\n",
 				sh.name, sh.k, sh.n, sh.bits, m, mb, tv * 1e3, mb / tv, tg * 1e3, mb / tg );
+		}
+		// Row consistency: row r of an M=2 call against the same row run alone at M=1.
+		{
+			const size_t cn = 2ULL * sh.n;
+			std::vector<half> c8( cn ), c1( sh.n );
+			exl3_gemv( A, B, C, suh, A_had, svh, 2, sh.k, sh.n, sh.bits, false, true, false, s );
+			CUDA_CHECK( cudaStreamSynchronize( s ) );
+			CUDA_CHECK( cudaMemcpy( c8.data(), C, cn * 2, cudaMemcpyDeviceToHost ) );
+			int bad = 0;
+			double maxd = 0.0;
+			for ( int r = 0; r < 2; ++r ) {
+				exl3_gemv( A + static_cast<size_t>( r ) * sh.k, B, C, suh, A_had, svh, 1, sh.k, sh.n, sh.bits, false, true, false, s );
+				CUDA_CHECK( cudaStreamSynchronize( s ) );
+				CUDA_CHECK( cudaMemcpy( c1.data(), C, sh.n * 2, cudaMemcpyDeviceToHost ) );
+				for ( int j = 0; j < sh.n; ++j ) {
+					const double d = std::fabs( static_cast<double>( __half2float( c8[r * sh.n + j] ) ) - __half2float( c1[j] ) );
+					if ( d != 0.0 ) ++bad;
+					maxd = d > maxd ? d : maxd;
+				}
+			}
+			std::printf( "%-15s row-consistency M=2 vs M=1: %d / %zu elements differ, max |d| %.4g\n", sh.name, bad, cn, maxd );
 		}
 		engine::core::arena_reset( arena );
 		A_had = engine::modules::trellis_get_workspace( 0, 16ULL * 8192 * sizeof( half ) );

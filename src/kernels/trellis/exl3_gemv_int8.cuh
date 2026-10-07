@@ -4,7 +4,7 @@
 // exl3_gemv_int8.cu / exl3_gemv_int8.cuh and adapted to our CUDA-graph decode path.
 //
 // EXL3_INT8_GEMV selects the mode: 0 disabled, 1 int8 + error-feedback residual pass (~15-16 bit
-// effective activation precision, size_m <= 1), 2 plain int8 (lossy, size_m <= 2). EXL3_INT8_GEMV_MAX_K
+// effective activation precision, size_m <= 2), 2 plain int8 (lossy, size_m <= 2). EXL3_INT8_GEMV_MAX_K
 // overrides the per-arch K cap and EXL3_INT8_SMEM=0/1 forces the smem-staged unit off or on.
 //
 // Only the per-slice-scale kernel is ported (plain launch, fixed workspace, no grid.sync), so it

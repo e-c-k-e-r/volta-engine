@@ -49,6 +49,11 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		if ( !runner_->init( *this, cfg.draft_model_dir ) ) return false;
 	}
 
+	// arena_create on the third device leaves cudaErrorInvalidValue pending on this thread although every
+	// call it makes reports success (bisected with cudaPeekAtLastError; source inside the driver, not
+	// identified). Clear it so a later CUDA_CHECK( cudaGetLastError() ) on this thread, such as the
+	// speculative round's, reports only errors raised after init.
+	(void) cudaGetLastError();
 	initialized_ = true;
 	return true;
 }
