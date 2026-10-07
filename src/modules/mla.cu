@@ -1,4 +1,5 @@
 #include "engine/modules/mla.h"
+#include "engine/modules/attention.h"
 #include <cuda_fp16.h>
 #include <cmath>
 
@@ -429,6 +430,15 @@ void MLA::forward_decode(
 	const pod::SlotRef& slot,
 	int rows
 ) {
+	// Device-resolved positions: split-KV decode attention (chunks over the window, merged by a reduce), no score
+	// buffer, so the window is not bounded by shared memory. Every head is its own KV head (full-expanded cache).
+	if ( slot.rows ) {
+		ENGINE_ASSERT( slot.row == 0, "MLA::forward_decode: row offset unsupported" );
+		pod::TensorView no_gate{};
+		Attention::forward_decode( q, k_cache, v_cache, no_gate, out, slot.stride, mla_layer_idx, slot.rows, rows,
+			num_heads, num_heads, head_dim, max_seq, stream );
+		return;
+	}
 	// Device-resolved position (slot.rows set): size scores for the full window so the
 	// launch is position-independent; otherwise size for the host-provided position
 	int num_tokens = slot.rows ? max_seq : MIN( pos + 1, max_seq );

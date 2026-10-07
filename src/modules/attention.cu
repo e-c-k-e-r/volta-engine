@@ -90,6 +90,7 @@ __global__ void attn_chunked_paged_kernel(
 	int max_seq,
 	int n_chunks,
 	int chunk_len,
+	int row0,
 	float scale
 ) {
 	int head = blockIdx.x;
@@ -104,10 +105,10 @@ __global__ void attn_chunked_paged_kernel(
 
 	// Chunks past this row's context write an empty (l = 0) partial that the reduce skips, so
 	// the grid can be sized by max_seq and stay valid across positions (graph replay)
-	int cur_pos = rows->pos[m];
+	int cur_pos = rows->pos[row0 + m];
 	int total_tokens = min( cur_pos + 1, max_seq );
-	k_cache += static_cast<size_t>( rows->slot[m] ) * slot_stride;
-	v_cache += static_cast<size_t>( rows->slot[m] ) * slot_stride;
+	k_cache += static_cast<size_t>( rows->slot[row0 + m] ) * slot_stride;
+	v_cache += static_cast<size_t>( rows->slot[row0 + m] ) * slot_stride;
 
 	int kv_start = chunk * chunk_len;
 	int kv_end = min( kv_start + chunk_len, total_tokens );
@@ -466,69 +467,31 @@ void Attention::forward_decode(
 	int max_seq,
 	cudaStream_t stream
 ) {
-	const int M = count;
-	ENGINE_ASSERT( M * num_q_heads <= ATTN_MAX_ROW_HEADS, "Attention::forward_decode: workspace too small for rows x heads" );
 	// Keys per chunk: one page, doubled until the window fits the workspace's chunk capacity
 	int chunk_len = ATTN_PAGE_SIZE;
 	while ( ( max_seq + chunk_len - 1 ) / chunk_len > ATTN_MAX_CHUNKS ) chunk_len *= 2;
-	float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
+	const float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
 
 	// Position-independent grid: one chunk per page of the full window (graph-capturable)
-	int n_chunks = MAX( 1, ( max_seq + chunk_len - 1 ) / chunk_len );
+	const int n_chunks = MAX( 1, ( max_seq + chunk_len - 1 ) / chunk_len );
 	float* workspace = attn_workspace_ptr();
+	const half* gate_ptr = gate.data != nullptr ? gate.ptr<const half>() : nullptr;
+	const size_t row_elems = static_cast<size_t>( num_q_heads ) * head_dim;
 
-	dim3 grid( num_q_heads, M, n_chunks );
-	dim3 block( head_dim );
-	size_t smem = 0;
-
-	attn_chunked_paged_kernel<<<grid, block, smem, stream>>>(
-		q.ptr<const half>(),
-		k_cache,
-		v_cache,
-		gate.ptr<const half>(),
-		out.ptr<half>(),
-		workspace,
-		slot_stride,
-		layer_idx,
-		d_rows,
-		num_q_heads,
-		num_kv_heads,
-		head_dim,
-		max_seq,
-		n_chunks,
-		chunk_len,
-		scale
-	);
-
-	if ( n_chunks > 1 ) {
-		dim3 red_grid( num_q_heads, M );
-		dim3 red_block( head_dim );
-		if ( head_dim == 256 ) {
-			attn_reduce_kernel<256><<<red_grid, red_block, 0, stream>>>(
-				workspace,
-				gate.ptr<const half>(),
-				out.ptr<half>(),
-				num_q_heads,
-				n_chunks
-			);
-		}
-		else if ( head_dim == 128 ) {
-			attn_reduce_kernel<128><<<red_grid, red_block, 0, stream>>>(
-				workspace,
-				gate.ptr<const half>(),
-				out.ptr<half>(),
-				num_q_heads,
-				n_chunks
-			);
-		}
-		else {
-			attn_reduce_kernel<64><<<red_grid, red_block, 0, stream>>>(
-				workspace,
-				gate.ptr<const half>(),
-				out.ptr<half>(),
-				num_q_heads,
-				n_chunks
-			);
+	// The partial-result workspace holds MAX_BATCH rows; larger counts (a GLM prefill chunk) run in row batches
+	for ( int row0 = 0; row0 < count; row0 += pod::MAX_BATCH ) {
+		const int M = MIN( pod::MAX_BATCH, count - row0 );
+		const half* g = gate_ptr ? gate_ptr + row0 * row_elems : nullptr;
+		half* o = out.ptr<half>() + row0 * row_elems;
+		attn_chunked_paged_kernel<<<dim3( num_q_heads, M, n_chunks ), dim3( head_dim ), 0, stream>>>(
+			q.ptr<const half>() + row0 * row_elems, k_cache, v_cache, g, o, workspace, slot_stride, layer_idx, d_rows,
+			num_q_heads, num_kv_heads, head_dim, max_seq, n_chunks, chunk_len, row0, scale );
+		if ( n_chunks > 1 ) {
+			const dim3 red_grid( num_q_heads, M );
+			const dim3 red_block( head_dim );
+			if ( head_dim == 256 ) attn_reduce_kernel<256><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks );
+			else if ( head_dim == 128 ) attn_reduce_kernel<128><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks );
+			else attn_reduce_kernel<64><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks );
 		}
 	}
 }

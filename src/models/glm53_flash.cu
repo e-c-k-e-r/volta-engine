@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -265,7 +266,9 @@ bool GLM53Pipeline::init(
 }
 
 bool GLM53Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
-	return init( GLM53Config{}, device_id, arena, ring );
+	GLM53Config config;
+	if ( const char* env = std::getenv( "EXL3_MAX_SEQ" ) ) config.max_seq = std::atoi( env );  // context window (KV pool size)
+	return init( config, device_id, arena, ring );
 }
 
 void GLM53Pipeline::reset_state( int slot_id ) {
