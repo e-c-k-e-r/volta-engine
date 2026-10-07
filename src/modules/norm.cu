@@ -20,9 +20,28 @@ __global__ void rms_norm_kernel(
 	int tid = threadIdx.x;
 	float local_sq = 0.0f;
 
-	for ( int i = tid; i < hidden_size; i += blockDim.x ) {
-		float val = __half2float( row_src[i] );
-		local_sq = fmaf( val, val, local_sq );
+	// Element i belongs to thread i % blockDim.x and is accumulated in ascending order, exactly as the plain loop
+	// did, so the result is bit-identical; but all of a thread's loads are issued before any is consumed (the row
+	// stays in registers for the second pass) instead of one dependent global load per step.
+	constexpr int kMaxPer = 24;
+	float v[kMaxPer];
+	const int per = ( hidden_size + static_cast<int>( blockDim.x ) - 1 ) / static_cast<int>( blockDim.x );
+	if ( per <= kMaxPer ) {
+		#pragma unroll
+		for ( int k = 0; k < kMaxPer; ++k ) {
+			const int i = tid + k * blockDim.x;
+			v[k] = ( i < hidden_size ) ? __half2float( row_src[i] ) : 0.0f;
+		}
+		#pragma unroll
+		for ( int k = 0; k < kMaxPer; ++k ) {
+			if ( tid + k * blockDim.x < hidden_size ) local_sq = fmaf( v[k], v[k], local_sq );
+		}
+	}
+	else {
+		for ( int i = tid; i < hidden_size; i += blockDim.x ) {
+			float val = __half2float( row_src[i] );
+			local_sq = fmaf( val, val, local_sq );
+		}
 	}
 
 	#pragma unroll
@@ -52,10 +71,25 @@ __global__ void rms_norm_kernel(
 
 	float inv_rms = s_warp_sums[0];
 
-	for ( int i = tid; i < hidden_size; i += blockDim.x ) {
-		float val = __half2float( row_src[i] );
-		float w = ( weight != nullptr ) ? ( __half2float( weight[i] ) + constant_bias ) : 1.0f;
-		row_dst[i] = __float2half_rn( val * w * inv_rms );
+	if ( per <= kMaxPer ) {
+		float w[kMaxPer];
+		#pragma unroll
+		for ( int k = 0; k < kMaxPer; ++k ) {
+			const int i = tid + k * blockDim.x;
+			w[k] = ( weight != nullptr && i < hidden_size ) ? ( __half2float( weight[i] ) + constant_bias ) : 1.0f;
+		}
+		#pragma unroll
+		for ( int k = 0; k < kMaxPer; ++k ) {
+			const int i = tid + k * blockDim.x;
+			if ( i < hidden_size ) row_dst[i] = __float2half_rn( v[k] * w[k] * inv_rms );
+		}
+	}
+	else {
+		for ( int i = tid; i < hidden_size; i += blockDim.x ) {
+			float val = __half2float( row_src[i] );
+			float w = ( weight != nullptr ) ? ( __half2float( weight[i] ) + constant_bias ) : 1.0f;
+			row_dst[i] = __float2half_rn( val * w * inv_rms );
+		}
 	}
 }
 
