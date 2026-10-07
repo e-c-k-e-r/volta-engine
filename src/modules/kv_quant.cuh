@@ -102,6 +102,71 @@ __device__ __forceinline__ void kv_load8( const void* data, const void* scales, 
 	}
 }
 
+// kv_load8 split in two so a kernel can issue the loads early and decode later: the raw words (and scale code) first,
+// the conversion to floats once the data is needed.
+struct KVRaw8 {
+	uint4 w;
+	uint32_t s;
+};
+
+template <KVQ Q>
+__device__ __forceinline__ KVRaw8 kv_fetch8( const void* data, const void* scales, size_t idx ) {
+	KVRaw8 r;
+	r.w = make_uint4( 0, 0, 0, 0 );
+	r.s = 0;
+	if constexpr ( Q == KVQ::F16 ) {
+		r.w = *reinterpret_cast<const uint4*>( static_cast<const half*>( data ) + idx );
+	}
+	else if constexpr ( Q == KVQ::E5M2 || Q == KVQ::I8 ) {
+		const uint2 raw = *reinterpret_cast<const uint2*>( static_cast<const uint8_t*>( data ) + idx );
+		r.w.x = raw.x;
+		r.w.y = raw.y;
+		if constexpr ( Q == KVQ::I8 ) r.s = static_cast<uint32_t>( __half_as_ushort( static_cast<const half*>( scales )[idx >> 6] ) );
+	}
+	else {
+		r.w.x = *reinterpret_cast<const uint32_t*>( static_cast<const uint8_t*>( data ) + ( idx >> 1 ) );
+		if constexpr ( Q == KVQ::Q4 ) r.s = static_cast<uint32_t>( __half_as_ushort( static_cast<const half*>( scales )[idx >> 6] ) );
+		else r.s = static_cast<uint32_t>( static_cast<const uint8_t*>( scales )[idx >> 4] );
+	}
+	return r;
+}
+
+// Eight elements of a raw fetch converted to packed halves.
+template <KVQ Q>
+__device__ __forceinline__ uint4 kv_decode8_h( const KVRaw8& r ) {
+	uint4 res;
+	half2* o2 = reinterpret_cast<half2*>( &res );
+	if constexpr ( Q == KVQ::F16 ) {
+		res = r.w;
+	}
+	else if constexpr ( Q == KVQ::E5M2 ) {
+		const uint8_t* b = reinterpret_cast<const uint8_t*>( &r.w );
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const unsigned short lo = static_cast<unsigned short>( b[2 * i] ) << 8, hi = static_cast<unsigned short>( b[2 * i + 1] ) << 8;
+			o2[i] = __halves2half2( __ushort_as_half( lo ), __ushort_as_half( hi ) );
+		}
+	}
+	else if constexpr ( Q == KVQ::I8 ) {
+		const int8_t* b = reinterpret_cast<const int8_t*>( &r.w );
+		const float sc = __half2float( __ushort_as_half( static_cast<unsigned short>( r.s ) ) );
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) o2[i] = __floats2half2_rn( static_cast<float>( b[2 * i] ) * sc, static_cast<float>( b[2 * i + 1] ) * sc );
+	}
+	else {
+		const float sc = ( Q == KVQ::Q4 ) ? __half2float( __ushort_as_half( static_cast<unsigned short>( r.s ) ) )
+		                                  : kv_e4m3_value( static_cast<uint8_t>( r.s ) );
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const int n0 = ( r.w.x >> ( 8 * i ) ) & 15, n1 = ( r.w.x >> ( 8 * i + 4 ) ) & 15;
+			const float a = ( Q == KVQ::Q4 ) ? static_cast<float>( n0 - 8 ) * sc : kv_e2m1_value( n0 ) * sc;
+			const float b = ( Q == KVQ::Q4 ) ? static_cast<float>( n1 - 8 ) * sc : kv_e2m1_value( n1 ) * sc;
+			o2[i] = __floats2half2_rn( a, b );
+		}
+	}
+	return res;
+}
+
 // Elements per quantization unit of a store: one thread quantizes a whole unit.
 template <KVQ Q>
 __host__ __device__ constexpr int kv_unit() {

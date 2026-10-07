@@ -78,7 +78,8 @@ struct MLA {
 		int max_seq = 2048,
 		cudaStream_t stream = nullptr,
 		const pod::SlotRef& slot = {}, // if set: pos/slot read on device (graph-capturable)
-		int rows = 1                   // consecutive rows slot.row .. slot.row + rows - 1
+		int rows = 1,                  // consecutive rows slot.row .. slot.row + rows - 1
+		int key_hint = 0               // prefill chunks: keys the rows can attend to (sizes the split only)
 	);
 };
 

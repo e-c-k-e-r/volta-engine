@@ -434,13 +434,20 @@ void MLA::forward_decode(
 	int max_seq,
 	cudaStream_t stream,
 	const pod::SlotRef& slot,
-	int rows
+	int rows,
+	int key_hint
 ) {
 	// Device-resolved positions: split-KV decode attention (chunks over the window, merged by a reduce), no score
 	// buffer, so the window is not bounded by shared memory. Every head is its own KV head (full-expanded cache).
 	if ( slot.rows ) {
 		ENGINE_ASSERT( slot.row == 0, "MLA::forward_decode: row offset unsupported" );
 		pod::TensorView no_gate{};
+		if ( rows > pod::MAX_BATCH && head_dim == 256 ) {
+			// Prefill chunk (one slot): tensor-core kernel sharing K/V tiles across queries
+			Attention::forward_prefill( kv, q, no_gate, out, slot.stride, mla_layer_idx, slot.rows, rows,
+				num_heads, num_heads, head_dim, max_seq, stream, key_hint );
+			return;
+		}
 		Attention::forward_decode( kv, q, no_gate, out, slot.stride, mla_layer_idx, slot.rows, rows,
 			num_heads, num_heads, head_dim, max_seq, stream );
 		return;

@@ -535,6 +535,7 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) 
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	const int m = rows.count;
 	last_slot_ = rows.slot[0];
+	key_hint_ = rows.pos[m - 1] + 1;
 	// Logits selection applies to eager prefill chunks only (decode graphs are keyed on m alone).
 	lm_mode_ = ( m > pod::MAX_BATCH ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;
 	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
@@ -623,7 +624,7 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 					attn_out_,
 					kv_slot_stride, full_attn_idx, d_rows_, m,
 					q_heads, kv_heads,
-					config_.full_head_dim, config_.max_seq, stream
+					config_.full_head_dim, config_.max_seq, stream, key_hint_
 				);
 			}
 			else {

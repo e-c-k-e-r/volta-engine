@@ -56,7 +56,8 @@ struct Attention {
 	);
 
 	// Prefill form for chunks above the decode sizes (one slot, head_dim 256): K/V tiles are shared across queries.
-	// Same arguments and result as forward_decode.
+	// Same arguments and result as forward_decode; key_hint (keys the chunk can attend to, 0 = unknown) only sizes the
+	// split of the key range over blocks.
 	static void forward_prefill(
 		const pod::KVRef& kv,
 		const pod::TensorView& q,
@@ -70,7 +71,8 @@ struct Attention {
 		int num_kv_heads,
 		int head_dim,
 		int max_seq = 2048,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		int key_hint = 0
 	);
 };
 

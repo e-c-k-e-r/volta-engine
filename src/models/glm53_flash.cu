@@ -712,6 +712,7 @@ void GLM53Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) {
 		ENGINE_ASSERT( rows.pos[r] >= 0 && rows.pos[r] < config_.max_seq, "GLM53Pipeline::forward: position out of range" );
 	}
 	const int m = rows.count;
+	key_hint_ = rows.pos[m - 1] + 1;
 	// Logits selection applies to eager prefill chunks only (decode graphs are keyed on m alone)
 	lm_mode_ = ( m > pod::MAX_BATCH ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;
 	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
@@ -854,7 +855,7 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 
 			engine::modules::MLA::forward_decode(
 				q_buf_, kv, mla_heads_out_,
-				mla_idx, 0, 16, 256, config_.max_seq, stream, kv_ref, m
+				mla_idx, 0, 16, 256, config_.max_seq, stream, kv_ref, m, key_hint_
 			);
 
 			// Project output: o_proj -> ring_->all_reduce across the 4 ranks

@@ -186,6 +186,7 @@ private:
 	engine::runtime::KVCachePool kv_pool_;
 	int last_rows_ = 0;
 	int lm_mode_ = pod::BatchRows::LOGITS_ALL;
+	int key_hint_ = 0;   // keys the current chunk can attend to; sizes the prefill attention split only
 
 	ModelMetadata metadata_;
 	GLM53Config config_;
