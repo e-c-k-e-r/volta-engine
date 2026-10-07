@@ -36,7 +36,7 @@ int main() {
 		const int N = dense.shape[0], K = dense.shape[1];
 		std::vector<half> h_w( static_cast<size_t>( N ) * K );
 		CUDA_CHECK( cudaMemcpy( h_w.data(), dense.data, h_w.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
-		for ( int M : { 1, 2, 3, 4, 7, 8, 9, 16, 17, 64, 256 } ) {
+		for ( int M : { 1, 2, 3, 4, 7, 8, 9, 16, 17, 24, 32, 33, 64, 256 } ) {
 			std::vector<half> h_x( static_cast<size_t>( M ) * K );
 			uint32_t seed = 777u + M;
 			for ( auto& v : h_x ) {
@@ -52,6 +52,20 @@ int main() {
 			y.data = d_y; y.dtype = pod::DType::FP16; y.ndim = 2; y.shape[0] = M; y.shape[1] = N;
 			engine::modules::Linear::forward( x, lw, y, stream );
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
+			float us = 0.0f;
+			{
+				cudaEvent_t e0, e1;
+				CUDA_CHECK( cudaEventCreate( &e0 ) );
+				CUDA_CHECK( cudaEventCreate( &e1 ) );
+				CUDA_CHECK( cudaEventRecord( e0, stream ) );
+				for ( int it = 0; it < 20; ++it ) engine::modules::Linear::forward( x, lw, y, stream );
+				CUDA_CHECK( cudaEventRecord( e1, stream ) );
+				CUDA_CHECK( cudaEventSynchronize( e1 ) );
+				CUDA_CHECK( cudaEventElapsedTime( &us, e0, e1 ) );
+				us *= 1000.0f / 20.0f;
+				cudaEventDestroy( e0 );
+				cudaEventDestroy( e1 );
+			}
 			std::vector<half> h_y( static_cast<size_t>( M ) * N );
 			CUDA_CHECK( cudaMemcpy( h_y.data(), d_y, h_y.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
 			double dot = 0, na = 0, nb = 0, maxabs = 0, maxref = 0;
@@ -69,7 +83,7 @@ int main() {
 			const double cosine = dot / sqrt( na * nb + 1e-30 );
 			const bool ok = cosine >= 0.9999 && maxabs <= 0.005 * maxref + 1e-3;
 			all_ok = all_ok && ok;
-			std::printf( "  %-52s %s rank %d M=%2d N=%5d K=%5d  cos=%.6f max_abs=%.4f (|ref|max=%.2f) %s\n", c.name + 25, c.split_n ? "N" : "K", c.rank, M, N, K, cosine, maxabs, maxref, ok ? "ok" : "FAIL" );
+			std::printf( "  %-52s %s rank %d M=%2d N=%5d K=%5d  cos=%.6f max_abs=%.4f (|ref|max=%.2f) %6.1f us %s\n", c.name + 25, c.split_n ? "N" : "K", c.rank, M, N, K, cosine, maxabs, maxref, us, ok ? "ok" : "FAIL" );
 			CUDA_CHECK( cudaFree( d_x ) );
 			CUDA_CHECK( cudaFree( d_y ) );
 		}

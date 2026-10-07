@@ -3,6 +3,8 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <cstdlib>
+#include <algorithm>
 
 #define DEV_INLINE __device__ __forceinline__
 
@@ -238,6 +240,12 @@ __global__ void nvfp4_dequant_kernel(
 
 namespace engine::modules {
 
+// Rows up to which the fused skinny kernel beats dequantize + HGEMM; EXL3_NVFP4_SKINNY_MAX overrides (A/B knob).
+static int nvfp4_skinny_max_rows() {
+	static const int v = std::getenv( "EXL3_NVFP4_SKINNY_MAX" ) ? std::min( 32, std::atoi( std::getenv( "EXL3_NVFP4_SKINNY_MAX" ) ) ) : 32;
+	return v;
+}
+
 void LinearNVFP4::forward(
 	const pod::TensorView& x,
 	const pod::TensorView& codes,
@@ -281,6 +289,19 @@ void LinearNVFP4::forward(
 		skinny_nvfp4_qpn<2><<<grid, dim3( 128 ), 0, stream>>>(
 			codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale
 		);
+	}
+	else if ( m <= nvfp4_skinny_max_rows() ) {
+		// Up to 32 rows: the decoded weights are reused across 3 or 4 row tiles of 8
+		if ( m <= 24 ) {
+			skinny_nvfp4_qpn<3><<<grid, dim3( 128 ), 0, stream>>>(
+				codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale
+			);
+		}
+		else {
+			skinny_nvfp4_qpn<4><<<grid, dim3( 128 ), 0, stream>>>(
+				codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale
+			);
+		}
 	}
 	else {
 		// Dequantize once into FP16 and run a tensor-core HGEMM: C[m, n] = X[m, k] @ W[n, k]^T
