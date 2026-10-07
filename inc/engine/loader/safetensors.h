@@ -127,6 +127,45 @@ public:
 		cudaStream_t stream = nullptr
 	);
 
+	// Host pointer to a tensor's mmap'd bytes, nullptr if absent.
+	const void* cpu_data( const char* name ) const;
+
+	// NVFP4 (compressed-tensors nvfp4-pack-quantized): weight_packed [N, K/2] u8 (low nibble = even k), weight_scale
+	// [N, K/16] e4m3, weight_global_scale f32 (weight = e2m1 * scale / global). Loads the output rows
+	// [n_begin[i], n_begin[i] + n_count[i]) of each range, concatenated, and K elements [k0, k0 + kcount),
+	// prepacked into the skinny kernel's fragment order with N zero-padded to a multiple of 32.
+	pod::LinearWeight load_nvfp4(
+		const char* base_name,
+		pod::MemoryArena& arena,
+		const int* n_begin,
+		const int* n_count,
+		int ranges,
+		int k0,
+		int kcount,
+		cudaStream_t stream = nullptr
+	);
+
+	// Tensor-parallel slice: split_n splits the output rows (column parallel), otherwise K (row parallel).
+	pod::LinearWeight load_nvfp4_slice(
+		const char* base_name,
+		pod::MemoryArena& arena,
+		bool split_n,
+		int rank,
+		int tp_size,
+		cudaStream_t stream = nullptr
+	);
+
+	// The same weights dequantized to dense FP16 [N_local, K] (a .weight tensor), for the few small projections
+	// that stay unquantized in the engine.
+	pod::TensorView load_nvfp4_dense(
+		const char* base_name,
+		pod::MemoryArena& arena,
+		bool split_n,
+		int rank,
+		int tp_size,
+		cudaStream_t stream = nullptr
+	);
+
 	pod::LinearWeight load_grouped_trellis_slice(
 		const char* base_name,
 		pod::MemoryArena& arena,

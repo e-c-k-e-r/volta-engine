@@ -22,6 +22,7 @@ include_directories(
 set(ENGINE_CORE_SOURCES
 	src/core/arena.cpp
 	src/loader/safetensors.cpp
+	src/loader/nvfp4.cpp
 	src/loader/tokenizer.cpp
 	src/loader/chat_template.cpp
 	src/comm/all_reduce_ipc.cu
@@ -224,3 +225,7 @@ target_link_libraries(test_dflash2_quant PRIVATE engine_kernels)
 add_executable(test_longctx tests/4_coherence/test_longctx.cpp)
 target_link_libraries(test_longctx PRIVATE engine_kernels)
 set_target_properties(test_longctx PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_nvfp4_linear tests/2_parity/test_nvfp4_linear.cpp)
+target_link_libraries(test_nvfp4_linear PRIVATE engine_kernels)
+set_target_properties(test_nvfp4_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

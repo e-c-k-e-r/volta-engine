@@ -1,4 +1,6 @@
 #include "engine/modules/nvfp4.h"
+#include "trellis_context.h"
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cstdint>
 
@@ -202,6 +204,38 @@ __global__ void skinny_nvfp4_qpn2(
 	}
 }
 
+// Dequantize the prepacked weight into dense FP16 W[N, K] (row n = output column n): one thread per (tile, group, lane).
+__global__ void nvfp4_dequant_kernel(
+	const uint8_t* __restrict__ qcodes,
+	const uint8_t* __restrict__ qscales,
+	half* __restrict__ w,
+	int N,
+	int K,
+	float gscale
+) {
+	const int G = K >> 4;
+	const size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+	const size_t total = (size_t) ( N >> 5 ) * G * 32;
+	if ( idx >= total ) return;
+	const int lane = (int) ( idx & 31 );
+	const size_t tg = idx >> 5;
+	const int g = (int) ( tg % G );
+	const int tile = (int) ( tg / G );
+	const int qp = ( lane >> 2 ) & 3;
+	const int r = ( lane & 3 ) + ( ( lane & 16 ) ? 4 : 0 );
+	const int n = tile * 32 + qp * 8 + r;
+
+	const uint2 q2 = reinterpret_cast<const uint2*>( qcodes )[idx];
+	const half2 gm2 = __float2half2_rn( gscale * 16384.f );
+	const half2 sc2 = __hmul2( fp8e4m3_to_half2( qscales[idx] ), gm2 );
+	half2 b[8];
+	dequant8_tm( q2.x, sc2, b + 0 );
+	dequant8_tm( q2.y, sc2, b + 4 );
+	uint4* dst = reinterpret_cast<uint4*>( w + (size_t) n * K + (size_t) g * 16 );
+	dst[0] = *reinterpret_cast<const uint4*>( b );
+	dst[1] = *reinterpret_cast<const uint4*>( b + 4 );
+}
+
 namespace engine::modules {
 
 void LinearNVFP4::forward(
@@ -249,7 +283,20 @@ void LinearNVFP4::forward(
 		);
 	}
 	else {
-		ENGINE_ASSERT( false, "NVFP4: M > 16 not supported in Phase 1" );
+		// Dequantize once into FP16 and run a tensor-core HGEMM: C[m, n] = X[m, k] @ W[n, k]^T
+		int device = 0;
+		cudaGetDevice( &device );
+		half* w = trellis_get_recon_ws( device, static_cast<size_t>( n ) * k * sizeof( half ) );
+		const size_t threads_total = static_cast<size_t>( n / 32 ) * ( k / 16 ) * 32;
+		nvfp4_dequant_kernel<<<static_cast<unsigned>( ( threads_total + 255 ) / 256 ), 256, 0, stream>>>(
+			codes_ptr, scales_ptr, w, n, k, gscale );
+		cublasHandle_t h = trellis_get_cublas( device );
+		cublasSetStream( h, stream );
+		const float one = 1.0f, zero = 0.0f;
+		const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k,
+			&one, w, CUDA_R_16F, k, x_ptr, CUDA_R_16F, k,
+			&zero, y_ptr, CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP );
+		ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "NVFP4: cublasGemmEx failed" );
 	}
 }
 

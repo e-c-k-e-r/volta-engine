@@ -41,6 +41,9 @@ static pod::DType parse_dtype_str( const char* str, size_t len ) {
 	if ( len == 2 && std::strncmp( str, "U8", 2 ) == 0 ) {
 		return pod::DType::UINT8;
 	}
+	if ( len == 7 && std::strncmp( str, "F8_E4M3", 7 ) == 0 ) {
+		return pod::DType::UINT8;  // raw bytes; the NVFP4 loader decodes them
+	}
 	return pod::DType::FP16;
 }
 
