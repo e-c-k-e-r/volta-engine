@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <algorithm>
 
 namespace engine::modules {
 
@@ -104,7 +105,9 @@ struct MLALatent {
 	static void attend( const half* cache, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
 		const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream );
 	static int workspace_chunks( int max_seq ) { return ( max_seq + 1023 ) / 1024; }
-	static size_t workspace_floats( int max_seq, int heads ) { return static_cast<size_t>( pod::MAX_BATCH ) * heads * workspace_chunks( max_seq ) * ( LORA + 2 ); }
+	// Partial slots (row, head, split) of 514 floats: decode rows x chunks, or a prefill chunk's key splits (at least 8192)
+	static size_t workspace_slots( int max_seq, int heads ) { return std::max<size_t>( static_cast<size_t>( pod::MAX_BATCH ) * heads * workspace_chunks( max_seq ), 8192 ); }
+	static size_t workspace_floats( int max_seq, int heads ) { return workspace_slots( max_seq, heads ) * ( LORA + 2 ); }
 };
 
 } // namespace engine::modules

@@ -135,7 +135,21 @@ bool GLM53Pipeline::init(
 
 	// 3. MLA KV cache pool [S, 11, max_seq, 16 * 256] FP16 & execution buffers
 	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
-	kv_pool_.init( rank_, arena, S, config_.max_seq, config_.num_mla_layers, 16, 256 );
+	latent_ = !( std::getenv( "EXL3_MLA_LATENT" ) && std::atoi( std::getenv( "EXL3_MLA_LATENT" ) ) == 0 );
+	if ( latent_ ) {
+		latent_slot_stride_ = static_cast<size_t>( config_.num_mla_layers ) * config_.max_seq * 512;
+		latent_cache_ = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * latent_slot_stride_ * sizeof( half ), 128 ) );
+		ENGINE_ASSERT( latent_cache_ != nullptr, "GLM53Pipeline::init: arena exhausted allocating the latent cache" );
+		CUDA_CHECK( cudaMemset( latent_cache_, 0, static_cast<size_t>( S ) * latent_slot_stride_ * sizeof( half ) ) );
+		latent_ws_ = static_cast<float*>( engine::core::arena_alloc( arena, engine::modules::MLALatent::workspace_floats( config_.max_seq, 16 ) * sizeof( float ), 128 ) );
+		ENGINE_ASSERT( latent_ws_ != nullptr, "GLM53Pipeline::init: arena exhausted allocating the latent workspace" );
+		int lat_shape[2] = { R, 16 * 512 };
+		q_lat_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lat_shape, 2 );
+		o_lat_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lat_shape, 2 );
+	}
+	else {
+		kv_pool_.init( rank_, arena, S, config_.max_seq, config_.num_mla_layers, 16, 256 );
+	}
 
 	int q_lora_shape[2] = { R, 1536 };
 	q_lora_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_lora_shape, 2 );
@@ -267,14 +281,22 @@ bool GLM53Pipeline::init(
 
 bool GLM53Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
 	GLM53Config config;
+	// The expanded per-head cache costs 16x the latent: without the latent path the window defaults to 2K
+	if ( std::getenv( "EXL3_MLA_LATENT" ) && std::atoi( std::getenv( "EXL3_MLA_LATENT" ) ) == 0 ) config.max_seq = 2048;
 	if ( const char* env = std::getenv( "EXL3_MAX_SEQ" ) ) config.max_seq = std::atoi( env );  // context window (KV pool size)
+	if ( const char* env = std::getenv( "EXL3_MAX_SLOTS" ) ) config.max_slots = std::atoi( env );
 	return init( config, device_id, arena, ring );
 }
 
 void GLM53Pipeline::reset_state( int slot_id ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "GLM53Pipeline::reset_state: slot out of range" );
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
-	kv_pool_.reset_slot( slot_id );
+	if ( latent_ ) {
+		CUDA_CHECK( cudaMemset( latent_cache_ + static_cast<size_t>( slot_id ) * latent_slot_stride_, 0, latent_slot_stride_ * sizeof( half ) ) );
+	}
+	else {
+		kv_pool_.reset_slot( slot_id );
+	}
 	const size_t slot_kda = state_.slot_kda_floats;
 	const size_t slot_conv = state_.slot_conv_floats;
 	CUDA_CHECK( cudaMemset( state_.kda_states + slot_id * slot_kda, 0, slot_kda * sizeof( float ) ) );
@@ -725,7 +747,7 @@ void GLM53Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) {
 void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 	// Slot-0 base pointers; slot and position of each row are resolved on device from d_rows_
 	const pod::KVRef kv = kv_pool_.ref();
-	const size_t kv_slot_stride = kv_pool_.slot_stride_elems;
+	const size_t kv_slot_stride = latent_ ? latent_slot_stride_ : kv_pool_.slot_stride_elems;
 	const pod::SlotRef kv_ref{ d_rows_, 0, kv_slot_stride };
 	const size_t slot_kda_floats = state_.slot_kda_floats;
 	const size_t slot_conv_floats = state_.slot_conv_floats;
@@ -842,21 +864,33 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 				kv_lora_buf_, lw.kv_a_norm, kv_lora_norm_buf_, 1e-5f, 0.0f, stream
 			);
 
-			engine::modules::MLA::project_kv_b(
-				kv_lora_norm_buf_, lw.kv_b_proj, k_head_buf_, v_head_buf_,
-				16, 256, stream, m
-			);
+			if ( latent_ ) {
+				// Absorbed: cache the normalized latent, attend in latent space, expand the value side per head
+				pod::TensorView q_lat = q_lat_, o_lat = o_lat_;
+				q_lat.shape[0] = m;
+				o_lat.shape[0] = m;
+				engine::modules::MLALatent::store( latent_cache_, kv_lora_norm_buf_, mla_idx, config_.max_seq, m, kv_ref, stream );
+				engine::modules::MLALatent::absorb_q( q_buf_, lw.kv_b_proj, q_lat, 16, m, stream );
+				engine::modules::MLALatent::attend( latent_cache_, q_lat, o_lat, mla_idx, config_.max_seq, m, 16, kv_ref, latent_ws_, key_hint_, stream );
+				engine::modules::MLALatent::expand_out( o_lat, lw.kv_b_proj, mla_heads_out_, 16, m, stream );
+			}
+			else {
+				engine::modules::MLA::project_kv_b(
+					kv_lora_norm_buf_, lw.kv_b_proj, k_head_buf_, v_head_buf_,
+					16, 256, stream, m
+				);
 
-			// Store every row's K/V first, then attend: row r reads positions 0..pos[r] of its slot
-			engine::modules::MLA::store_kv_cache(
-				kv, k_head_buf_, v_head_buf_,
-				mla_idx, 0, 4096, config_.max_seq, stream, kv_ref, m
-			);
+				// Store every row's K/V first, then attend: row r reads positions 0..pos[r] of its slot
+				engine::modules::MLA::store_kv_cache(
+					kv, k_head_buf_, v_head_buf_,
+					mla_idx, 0, 4096, config_.max_seq, stream, kv_ref, m
+				);
 
-			engine::modules::MLA::forward_decode(
-				q_buf_, kv, mla_heads_out_,
-				mla_idx, 0, 16, 256, config_.max_seq, stream, kv_ref, m, key_hint_
-			);
+				engine::modules::MLA::forward_decode(
+					q_buf_, kv, mla_heads_out_,
+					mla_idx, 0, 16, 256, config_.max_seq, stream, kv_ref, m, key_hint_
+				);
+			}
 
 			// Project output: o_proj -> ring_->all_reduce across the 4 ranks
 			if ( lw.o_proj.is_valid() ) {

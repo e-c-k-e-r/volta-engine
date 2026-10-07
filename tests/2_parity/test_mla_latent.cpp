@@ -26,13 +26,19 @@ int main() {
 	CUDA_CHECK( cudaMemcpy( h_w.data(), kv_b.data, h_w.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
 
 	bool all_ok = true;
-	for ( int max_seq : { 1024, 3072 } ) {
+	for ( int scenario = 0; scenario < 4; ++scenario ) {
+		const int max_seq = ( scenario & 1 ) ? 3072 : 1024;
 		const int N = max_seq - 40; // tokens in the cache
 		uint32_t seed = 4242u + max_seq;
 		auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return ( ( seed >> 8 ) / 16777216.0f ) * 2.0f - 1.0f; };
 		std::vector<half> h_c( static_cast<size_t>( N ) * LORA );
 		for ( auto& v : h_c ) v = __float2half( rnd() * 1.7f );
-		const std::vector<int> positions = { N - 1, N / 2, 37 };
+		// Scenarios 0, 1: three decode-style rows (SIMT kernel); 2, 3: a 40-row prefill chunk (tensor-core kernel, key splits)
+		std::vector<int> positions = { N - 1, N / 2, 37 };
+		if ( scenario >= 2 ) {
+			positions.clear();
+			for ( int r = 0; r < 40; ++r ) positions.push_back( N - 40 + r );
+		}
 		const int R = static_cast<int>( positions.size() );
 		std::vector<half> h_q( static_cast<size_t>( R ) * H * HD );
 		for ( auto& v : h_q ) v = __float2half( rnd() * 1.5f );
@@ -60,8 +66,8 @@ int main() {
 			pod::TensorView ct = pod::make_tensor_2d( d_c + static_cast<size_t>( p0 ) * LORA, pod::DType::FP16, n, LORA );
 			engine::modules::MLALatent::store( d_cache, ct, 1, max_seq, n, sr, stream );
 		}
-		int slots[3] = { 0, 0, 0 };
-		pod::BatchRows br = pod::BatchRows::batched( R, slots, positions.data() );
+		std::vector<int> slots( R, 0 );
+		pod::BatchRows br = pod::BatchRows::batched( R, slots.data(), positions.data() );
 		CUDA_CHECK( cudaMemcpy( d_rows, &br, sizeof( br ), cudaMemcpyHostToDevice ) );
 		pod::SlotRef sr; sr.rows = d_rows; sr.row = 0; sr.stride = slot_stride;
 		pod::TensorView qt = pod::make_tensor_2d( d_q, pod::DType::FP16, R, H * HD );
@@ -121,7 +127,7 @@ int main() {
 		const double cosine = dot / std::sqrt( na * nb + 1e-30 );
 		const bool ok = cosine >= 0.9999 && maxabs <= 0.01 * maxref + 1e-3;
 		all_ok = all_ok && ok;
-		std::printf( "  max_seq %d (%d cached tokens, %d chunks): cos=%.6f max_abs=%.4f (|ref|max=%.3f) %s\n", max_seq, N,
+		std::printf( "  %s max_seq %d (%d cached tokens, %d chunks): cos=%.6f max_abs=%.4f (|ref|max=%.3f) %s\n", scenario >= 2 ? "prefill" : "decode ", max_seq, N,
 			engine::modules::MLALatent::workspace_chunks( max_seq ), cosine, maxabs, maxref, ok ? "ok" : "FAIL" );
 		cudaFree( d_cache ); cudaFree( d_c ); cudaFree( d_q ); cudaFree( d_qlat ); cudaFree( d_olat ); cudaFree( d_out ); cudaFree( d_ws ); cudaFree( d_rows );
 	}

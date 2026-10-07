@@ -34,8 +34,8 @@ struct GLM53Config {
 	int dsa_top_k = 64;
 	int vocab_size = 154880;
 	int tp_size = 4;
-	int max_seq = 2048;
-	int max_slots = 1; // MLA KV is ~369 MiB/slot/rank; weights fill the 31 GiB arena
+	int max_seq = 32768;
+	int max_slots = 1; // absorbed MLA latent cache: ~360 MiB/slot/rank at 32K (expanded K/V: 369 MiB at 2K); weights fill the 31 GiB arena
 	int num_mla_layers = 11;
 	int kda_heads = 16;
 	int kda_head_dim = 128;
@@ -184,6 +184,14 @@ private:
 	engine::core::GraphCache graphs_;
 
 	engine::runtime::KVCachePool kv_pool_;
+	// Absorbed MLA (EXL3_MLA_LATENT, default on): the cache holds the 512-wide KV latent per token, shared by all heads,
+	// instead of expanded per-head K / V (1 KiB vs 16 KiB per token per layer, so kv_pool_ is not allocated)
+	bool latent_ = true;
+	half* latent_cache_ = nullptr;    // [slots][mla layers][max_seq][512]
+	size_t latent_slot_stride_ = 0;   // elements per slot
+	float* latent_ws_ = nullptr;      // split-KV partials
+	pod::TensorView q_lat_;           // [rows, 16 * 512]
+	pod::TensorView o_lat_;
 	int last_rows_ = 0;
 	int lm_mode_ = pod::BatchRows::LOGITS_ALL;
 	int key_hint_ = 0;   // keys the current chunk can attend to; sizes the prefill attention split only
