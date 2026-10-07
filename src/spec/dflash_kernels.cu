@@ -106,6 +106,51 @@ void dflash_f16_gemv_nt_kernel(
 	if ( lane == 0 ) out[static_cast<int64_t>( row ) * n + col] = __float2half_rn( acc );
 }
 
+// Skinny variant for up to MR rows (the LM head at decode / verify): one warp per output column streams the weight
+// row once with 128-bit loads and accumulates all rows, instead of re-reading it per row. k % 8 == 0.
+template <int MR>
+__global__ __launch_bounds__(256)
+void dflash_f16_gemv_skinny_kernel(
+	const half* __restrict__ w,
+	const half* __restrict__ x,
+	half* __restrict__ out,
+	int n, int k, int m
+) {
+	const int col = blockIdx.x * ( blockDim.x >> 5 ) + ( threadIdx.x >> 5 );
+	if ( col >= n ) return;
+	const int lane = threadIdx.x & 31;
+	const half* wc = w + static_cast<int64_t>( col ) * k;
+	float acc[MR];
+	#pragma unroll
+	for ( int r = 0; r < MR; ++r ) acc[r] = 0.0f;
+	for ( int k0 = lane * 8; k0 < k; k0 += 256 ) {
+		const uint4 wv = __ldcs( reinterpret_cast<const uint4*>( wc + k0 ) );
+		const half2* w2 = reinterpret_cast<const half2*>( &wv );
+		#pragma unroll
+		for ( int r = 0; r < MR; ++r ) {
+			if ( r < m ) {
+				const uint4 xv = __ldg( reinterpret_cast<const uint4*>( x + static_cast<int64_t>( r ) * k + k0 ) );
+				const half2* x2 = reinterpret_cast<const half2*>( &xv );
+				float a = acc[r];
+				#pragma unroll
+				for ( int j = 0; j < 4; ++j ) {
+					const float2 wf = __half22float2( w2[j] ), xf = __half22float2( x2[j] );
+					a = fmaf( wf.x, xf.x, a );
+					a = fmaf( wf.y, xf.y, a );
+				}
+				acc[r] = a;
+			}
+		}
+	}
+	#pragma unroll
+	for ( int r = 0; r < MR; ++r ) {
+		float a = acc[r];
+		#pragma unroll
+		for ( int mask = 16; mask > 0; mask >>= 1 ) a += __shfl_xor_sync( 0xffffffff, a, mask );
+		if ( lane == 0 && r < m ) out[static_cast<int64_t>( r ) * n + col] = __float2half_rn( a );
+	}
+}
+
 // RMSNorm with the residual split the reference uses (qwen3_dflash2.py:294-299):
 //   sum = x + residual_in;  normed = rmsnorm(sum) * (w + bias);  residual_out = sum
 // One block per row. The residual is FP32 in and FP32 out: it accumulates across all layers and the
@@ -765,6 +810,13 @@ void dflash_f16_gemv_nt(
 	ENGINE_ASSERT( m >= 1 && n >= 1 && k >= 1, "dflash_f16_gemv_nt: degenerate shape" );
 	const int threads = 256;
 	const int warps = threads >> 5;
+	if ( m <= 16 && k % 8 == 0 ) {
+		const int blocks = ( n + warps - 1 ) / warps;
+		if ( m <= 4 ) dflash_f16_gemv_skinny_kernel<4><<<blocks, threads, 0, stream>>>( w, x, out, n, k, m );
+		else if ( m <= 8 ) dflash_f16_gemv_skinny_kernel<8><<<blocks, threads, 0, stream>>>( w, x, out, n, k, m );
+		else dflash_f16_gemv_skinny_kernel<16><<<blocks, threads, 0, stream>>>( w, x, out, n, k, m );
+		return;
+	}
 	const int64_t warps_needed = static_cast<int64_t>( m ) * n;
 	dflash_f16_gemv_nt_kernel<<<static_cast<int>( ( warps_needed + warps - 1 ) / warps ), threads, 0, stream >>>(
 		w, x, out, n, k, m );
