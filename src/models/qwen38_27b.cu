@@ -62,6 +62,12 @@ bool Qwen38Pipeline::init(
 	CUDA_CHECK( cudaMemset( state_.conv_history, 0, conv_hist_floats * sizeof( float ) ) );
 	state_.conv_checkpoint = static_cast<float*>( engine::core::arena_alloc( arena, state_.slot_conv_floats * sizeof( float ) ) );
 
+	// 2b. Per-row snapshots for the speculative verify forward (kDraftM rows, one speculating slot).
+	state_.gdn_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * state_.slot_gdn_floats * sizeof( float ) ) );
+	state_.conv_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * state_.slot_conv_floats * sizeof( float ) ) );
+	state_.d_snap_on = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
+	CUDA_CHECK( cudaMemset( state_.d_snap_on, 0, sizeof( int ) ) );
+
 	// 3. Full-attention KV cache pool: [S, 16, max_seq, kv_heads, 256] FP16
 	kv_pool_.init( rank_, arena, S, config_.max_seq, config_.num_attn_layers, full_kv_heads, config_.full_head_dim );
 
@@ -613,9 +619,14 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 				pod::TensorView gate_row = pod::make_tensor_2d( gdn_gate_.ptr<float>() + m_idx * v_heads, pod::DType::FP32, 1, v_heads );
 				pod::TensorView beta_row = pod::make_tensor_2d( gdn_beta_.ptr<float>() + m_idx * v_heads, pod::DType::FP32, 1, v_heads );
 
+				// Snapshot targets for this row/layer; rows beyond kDraftM never run with the flag set.
+				const bool snap_row = m_idx < kDraftM;
+				float* conv_snap = snap_row ? state_.conv_snap + m_idx * state_.slot_conv_floats + static_cast<size_t>( linear_idx ) * lin_channels * 3 : nullptr;
+				float* gdn_snap = snap_row ? state_.gdn_snap + m_idx * state_.slot_gdn_floats + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128 : nullptr;
+
 				// Causal conv1d + SiLU
 				engine::modules::GDN::causal_conv1d_silu(
-					qkv_row, conv_hist, lw.conv1d_w, lin_channels, stream, conv_slot
+					qkv_row, conv_hist, lw.conv1d_w, lin_channels, stream, conv_slot, conv_snap, state_.d_snap_on
 				);
 
 				// L2 norm on Q and K heads
@@ -633,7 +644,7 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 				engine::modules::GDN::recurrent_step(
 					layer_gdn_state, qkv_row, gate_row, beta_row,
 					out_row, k_heads, v_heads,
-					config_.linear_head_dim, stream, gdn_slot
+					config_.linear_head_dim, stream, gdn_slot, gdn_snap, state_.d_snap_on
 				);
 
 				// Gated RMSNorm: gdn_out * rsqrt * norm_weight * silu(z)
@@ -750,6 +761,25 @@ void Qwen38Pipeline::rollback_state( int slot_id, cudaStream_t stream ) {
 	const size_t offset_conv = static_cast<size_t>( slot_id ) * state_.slot_conv_floats;
 	CUDA_CHECK( cudaMemcpyAsync( state_.gdn_states + offset_gdn, state_.gdn_checkpoint, state_.slot_gdn_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
 	CUDA_CHECK( cudaMemcpyAsync( state_.conv_history + offset_conv, state_.conv_checkpoint, state_.slot_conv_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
+}
+
+void Qwen38Pipeline::set_spec_snapshot( bool on, cudaStream_t stream ) {
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	const int v = on ? 1 : 0;
+	// Pageable source: staged before return, so a stack value is fine.
+	CUDA_CHECK( cudaMemcpyAsync( state_.d_snap_on, &v, sizeof( int ), cudaMemcpyHostToDevice, stream ) );
+}
+
+void Qwen38Pipeline::commit_spec_row( int slot_id, int row, cudaStream_t stream ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen38Pipeline::commit_spec_row: slot out of range" );
+	ENGINE_ASSERT( row >= 0 && row < kDraftM, "Qwen38Pipeline::commit_spec_row: row out of range" );
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	CUDA_CHECK( cudaMemcpyAsync( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats,
+		state_.gdn_snap + static_cast<size_t>( row ) * state_.slot_gdn_floats,
+		state_.slot_gdn_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
+	CUDA_CHECK( cudaMemcpyAsync( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats,
+		state_.conv_snap + static_cast<size_t>( row ) * state_.slot_conv_floats,
+		state_.slot_conv_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
 }
 
 } // namespace engine::models

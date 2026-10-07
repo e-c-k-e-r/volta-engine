@@ -118,6 +118,11 @@ public:
 	virtual void checkpoint_state( int slot_id, cudaStream_t stream = nullptr ) = 0;
 	virtual void rollback_state( int slot_id, cudaStream_t stream = nullptr ) = 0;
 	virtual void reset_state( int slot_id = 0 ) = 0;
+	// Per-row state slots (replace checkpoint + replay). While on, a forward also publishes the recurrent
+	// state after every row; commit_spec_row( slot, t ) makes the state after row t the slot's live state.
+	// Stream-ordered, so a flag change applies to the forwards queued after it.
+	virtual void set_spec_snapshot( bool on, cudaStream_t stream = nullptr ) { (void) on; (void) stream; ENGINE_ASSERT( false, "model has no speculative state slots" ); }
+	virtual void commit_spec_row( int slot_id, int row, cudaStream_t stream = nullptr ) { (void) slot_id; (void) row; (void) stream; ENGINE_ASSERT( false, "model has no speculative state slots" ); }
 
 	// 6. Output descriptors & tapped states
 	virtual pod::TensorView& logits() = 0;

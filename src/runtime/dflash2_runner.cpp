@@ -154,7 +154,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	for ( int i = 0; i < active; ++i ) block[1 + i] = cands[i];
 
 	mark( SpecProfile::CHECKPOINT );
-	mc.checkpoint( slot );
+	mc.set_spec_snapshot( true );
 	mark( SpecProfile::VERIFY );
 	mc.forward( block, active + 1, pos, slot );
 	int preds[pod::MAX_BATCH];
@@ -183,13 +183,14 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		res.emitted[res.emitted_count++] = preds[active];
 	}
 
-	// 6. State repair. The checkpoint predates row 0 (the anchor), so on a partial accept restore it
-	// and replay [anchor, c1..c_accepted]: exactly the span the next round expects consumed.
+	// 6. State repair. The next round expects exactly accepted + 1 rows consumed ([anchor, c1..c_accepted]),
+	// which is the snapshot published after row `accepted` of the verify forward. A full accept already
+	// leaves the live state there, so only a partial accept copies it in. No re-forward.
 	if ( res.accepted < active ) {
-		++prof_.replays;
-		mc.rollback( slot );
-		mc.forward( block, res.accepted + 1, pos, slot );
+		++prof_.commits;
+		mc.commit_spec_row( slot, res.accepted );
 	}
+	mc.set_spec_snapshot( false );
 	res.next_pos = pos + 1 + res.accepted;
 	// Close the round: account the trailing segment and rewind the cursor.
 	if ( profile_on_ ) {
@@ -213,13 +214,13 @@ void DFlash2Runner::mark( SpecProfile::Stage stage ) {
 
 void DFlash2Runner::profile_dump() {
 	static const char* names[SpecProfile::COUNT] = {
-		"draft(backbone+head+merge)", "walk(gate+lattice)", "checkpoint", "verify_fwd", "rollback+replay"
+		"draft(backbone+head+merge)", "walk(gate+lattice)", "snapshot_on", "verify_fwd", "commit"
 	};
 	double total = 0.0;
 	for ( int i = 0; i < SpecProfile::COUNT; ++i ) total += prof_.ms[i];
 	const int n = prof_.rounds;
-	std::printf( "\n--- speculative round profile: %d rounds, %d replays (%.0f%%) ---\n",
-		n, prof_.replays, n ? 100.0 * prof_.replays / n : 0.0 );
+	std::printf( "\n--- speculative round profile: %d rounds, %d commits (%.0f%%) ---\n",
+		n, prof_.commits, n ? 100.0 * prof_.commits / n : 0.0 );
 	for ( int i = 0; i < SpecProfile::COUNT; ++i ) {
 		std::printf( "  %-26s %8.2f ms total  %7.3f ms/round  %5.1f%%\n", names[i], prof_.ms[i],
 			n ? prof_.ms[i] / n : 0.0, total > 0.0 ? 100.0 * prof_.ms[i] / total : 0.0 );

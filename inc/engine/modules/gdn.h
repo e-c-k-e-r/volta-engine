@@ -28,7 +28,9 @@ struct GDN {
 		const pod::TensorView& conv_weights,
 		int channels,
 		cudaStream_t stream = nullptr,
-		const pod::SlotRef& slot = {}
+		const pod::SlotRef& slot = {},
+		float* snap = nullptr,          // per-row post-state copy, written only while *snap_on != 0
+		const int* snap_on = nullptr
 	);
 
 	static void l2_norm_heads(
@@ -49,7 +51,9 @@ struct GDN {
 		int num_v_heads,
 		int head_dim,
 		cudaStream_t stream = nullptr,
-		const pod::SlotRef& slot = {}
+		const pod::SlotRef& slot = {},
+		float* snap = nullptr,          // per-row post-state copy, written only while *snap_on != 0
+		const int* snap_on = nullptr
 	);
 
 	static void project_kda_gates(

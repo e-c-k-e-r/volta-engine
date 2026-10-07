@@ -26,7 +26,7 @@ struct SpecProfile {
 	enum Stage : int { DRAFT = 0, WALK, CHECKPOINT, VERIFY, REPAIR, COUNT };
 	double ms[COUNT] = {};
 	int rounds = 0;
-	int replays = 0;
+	int commits = 0;
 };
 
 // One DFlash2 round over a ModelCluster: draft (backbone on rank 0, head shard + top-k on every

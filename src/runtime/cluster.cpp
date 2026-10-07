@@ -201,4 +201,16 @@ void ModelCluster::rollback( int slot ) {
 	} );
 }
 
+void ModelCluster::set_spec_snapshot( bool on ) {
+	pool_.run( [&]( int d ) {
+		models_[d]->set_spec_snapshot( on, streams_[d] );
+	} );
+}
+
+void ModelCluster::commit_spec_row( int slot, int row ) {
+	pool_.run( [&]( int d ) {
+		models_[d]->commit_spec_row( slot, row, streams_[d] );
+	} );
+}
+
 } // namespace engine::runtime

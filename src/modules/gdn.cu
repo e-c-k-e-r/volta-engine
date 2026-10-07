@@ -86,7 +86,9 @@ __global__ void causal_conv1d_silu_kernel(
 	float* __restrict__ history,
 	const half* __restrict__ weights,
 	int channels,
-	const pod::SlotRef slot
+	const pod::SlotRef slot,
+	float* __restrict__ snap,
+	const int* __restrict__ snap_on
 ) {
 	int c = blockIdx.x * blockDim.x + threadIdx.x;
 	if ( c >= channels ) return;
@@ -110,6 +112,13 @@ __global__ void causal_conv1d_silu_kernel(
 	history[c * 3 + 0] = v1;
 	history[c * 3 + 1] = v2;
 	history[c * 3 + 2] = in_val;
+
+	// Speculative verify: also publish the post-row history so the accepted prefix can be committed by index.
+	if ( snap && *snap_on ) {
+		snap[c * 3 + 0] = v1;
+		snap[c * 3 + 1] = v2;
+		snap[c * 3 + 2] = in_val;
+	}
 }
 
 __global__ void l2_norm_heads_kernel(
@@ -168,9 +177,12 @@ recurrent_step_kernel(
 	int h_k,
 	int h_v,
 	float scale,
-	const pod::SlotRef slot
+	const pod::SlotRef slot,
+	float* __restrict__ snap,
+	const int* __restrict__ snap_on
 ) {
 	state = slot.apply( state );
+	const bool do_snap = snap && *snap_on;
 	const int head = blockIdx.x;
 	const int lane = threadIdx.x;
 	const int col = blockIdx.z * blockDim.y + threadIdx.y;
@@ -215,6 +227,9 @@ recurrent_step_kernel(
 	for ( int r = 0; r < 4; ++r ) {
 		const int i = r * 32 + lane;
 		state[( size_t( head ) * 128 + i ) * 128 + col] = s_shard[r];
+		if ( do_snap ) {
+			snap[( size_t( head ) * 128 + i ) * 128 + col] = s_shard[r];
+		}
 	}
 }
 
@@ -590,7 +605,9 @@ void GDN::causal_conv1d_silu(
 	const pod::TensorView& conv_weights,
 	int channels,
 	cudaStream_t stream,
-	const pod::SlotRef& slot
+	const pod::SlotRef& slot,
+	float* snap,
+	const int* snap_on
 ) {
 	int threads = 256;
 	int blocks = ( channels + threads - 1 ) / threads;
@@ -599,7 +616,9 @@ void GDN::causal_conv1d_silu(
 		conv_history.ptr<float>(),
 		conv_weights.ptr<const half>(),
 		channels,
-		slot
+		slot,
+		snap,
+		snap_on
 	);
 }
 
@@ -629,7 +648,9 @@ void GDN::recurrent_step(
 	int num_v_heads,
 	int head_dim,
 	cudaStream_t stream,
-	const pod::SlotRef& slot
+	const pod::SlotRef& slot,
+	float* snap,
+	const int* snap_on
 ) {
 	float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
 	const int m_tokens = ( qkv.ndim >= 1 && qkv.shape[0] > 0 ) ? qkv.shape[0] : 1;
@@ -644,7 +665,9 @@ void GDN::recurrent_step(
 			num_k_heads,
 			num_v_heads,
 			scale,
-			slot
+			slot,
+			snap,
+			snap_on
 		);
 	}
 	else {
@@ -670,7 +693,9 @@ void GDN::recurrent_step(
 				num_k_heads,
 				num_v_heads,
 				scale,
-				slot_m
+				slot_m,
+				snap,
+				snap_on
 			);
 		}
 	}

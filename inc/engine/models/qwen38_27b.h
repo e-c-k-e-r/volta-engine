@@ -55,6 +55,11 @@ struct Qwen38State {
 	float* conv_history = nullptr;    // [slots, 48, channels, 3] FP32
 	float* gdn_checkpoint = nullptr;  // one-slot snapshot
 	float* conv_checkpoint = nullptr;
+	// Per-row post-state snapshots for a speculative verify forward: [kDraftM, <slot layout>].
+	// Row t holds the state after consuming rows 0..t; commit_spec_row copies one into the live slot.
+	float* gdn_snap = nullptr;
+	float* conv_snap = nullptr;
+	int* d_snap_on = nullptr;         // device flag: snapshots are written only while nonzero
 	size_t slot_gdn_floats = 0;
 	size_t slot_conv_floats = 0;
 };
@@ -121,6 +126,8 @@ public:
 
 	void checkpoint_state( int slot_id, cudaStream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, cudaStream_t stream = nullptr ) override;
+	void set_spec_snapshot( bool on, cudaStream_t stream = nullptr ) override;
+	void commit_spec_row( int slot_id, int row, cudaStream_t stream = nullptr ) override;
 	void reset_state( int slot_id = 0 ) override;
 
 	pod::TensorView& logits() override { return logits_; }

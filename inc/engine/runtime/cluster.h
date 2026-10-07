@@ -56,6 +56,8 @@ public:
 	void reset_slot( int slot );
 	void checkpoint( int slot );
 	void rollback( int slot );
+	void set_spec_snapshot( bool on );
+	void commit_spec_row( int slot, int row );
 
 	// Speculative decoding (DFlash2). The round itself lives in DFlash2Runner.
 	bool has_speculator() const { return runner_ != nullptr; }
