@@ -472,8 +472,8 @@ void dflash_qk_norm_rope_kernel(
 	__syncthreads();
 	const float inv_rms = s_inv;
 
-	// Stage the normalized values: an even lane needs its odd partner's *normalized* value, and
-	// reading hrow directly would race with the odd lane writing its own rotated result.
+	// Stage the normalized values: each element needs its rotation partner's *normalized* value, and
+	// reading hrow directly would race with the partner writing its own rotated result.
 	__shared__ float s_norm[128];
 	for ( int i = tid; i < head_dim; i += blockDim.x ) {
 		float v = __half2float( hrow[i] ) * inv_rms;
@@ -487,12 +487,14 @@ void dflash_qk_norm_rope_kernel(
 			hrow[i] = __float2half_rn( s_norm[i] );
 			continue;
 		}
-		const int p = i >> 1;
+		// NeoX layout (rotate-half): element i pairs with i + pairs, not with its neighbour. The drafter
+		// checkpoint declares no other layout and both reference implementations (exllamav3 RopeStyle.NEOX,
+		// vLLM is_neox_style=True) default to this one; adjacent-pair rotation halves later-row acceptance.
+		const int p = ( i < pairs ) ? i : i - pairs;
 		const float c = cos_p[p];
 		const float s = sin_p[p];
-		const float vo = s_norm[i & ~1];
-		const float vodd = s_norm[( i & ~1 ) | 1];
-		hrow[i] = __float2half_rn( ( i & 1 ) == 0 ? ( vo * c - vodd * s ) : ( vodd * c + vo * s ) );
+		hrow[i] = __float2half_rn( ( i < pairs ) ? ( s_norm[i] * c - s_norm[i + pairs] * s )
+		                                         : ( s_norm[i] * c + s_norm[i - pairs] * s ) );
 	}
 }
 

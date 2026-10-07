@@ -382,8 +382,9 @@ void DFlashSpeculator::project_gate( int rows, cudaStream_t stream ) {
 	ENGINE_ASSERT( hidden_proj_w_.shape[0] == sel_rank && hidden_proj_w_.shape[1] == H,
 		"project_gate: hidden_projection shape does not match selector_rank / hidden_size" );
 
-	const int rows_max = config_.block_size - 1;
-	rows = MIN( rows, rows_max );
+	// The walk reads gate rows 1..block_size - 1 (step i scores candidate row i + 1 against gate row i + 1), so the
+	// projection has to cover every block row; stopping at block_size - 1 left the last step on a stale row.
+	rows = MIN( rows, config_.block_size );
 	pod::TensorView h = pod::make_tensor_2d(
 		draft_hidden_.ptr<half>(), pod::DType::FP16, rows, H );
 	pod::TensorView g = pod::make_tensor_2d(

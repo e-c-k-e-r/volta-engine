@@ -239,7 +239,7 @@ void test_f16_gemv_nt( pod::MemoryArena& arena, int m, int n, int k ) {
 	ENGINE_ASSERT( d.max_ulp <= 4.0, "plain FP16 NT GEMV deviates from reference" );
 }
 
-// Reference: block-local per-head RMSNorm then NeoX RoPE over adjacent pairs, pass-through past the
+// Reference: block-local per-head RMSNorm then NeoX (rotate-half) RoPE over the first rope_dim components, pass-through past the
 // rotary width. theta^(-2p/rope_dim) with rope_dim = 2*pairs.
 void test_qk_norm_rope( pod::MemoryArena& arena, int rows, int heads, int head_dim, int rope_dim ) {
 	const int pairs = rope_dim / 2;
@@ -276,11 +276,11 @@ void test_qk_norm_rope( pod::MemoryArena& arena, int rows, int heads, int head_d
 			const int pos = pos0 + r;
 			for ( int d = 0; d < head_dim; ++d ) {
 				if ( d < rope_dim ) {
-					const int p = d >> 1;
+					const int p = ( d < pairs ) ? d : d - pairs;
 					const float c = cos_t[static_cast<size_t>( pos ) * pairs + p];
 					const float si = sin_t[static_cast<size_t>( pos ) * pairs + p];
-					if ( ( d & 1 ) == 0 ) ref[base + d] = n[d] * c - n[d + 1] * si;
-					else ref[base + d] = n[d] * c + n[d - 1] * si;
+					if ( d < pairs ) ref[base + d] = n[d] * c - n[d + pairs] * si;
+					else ref[base + d] = n[d] * c + n[d - pairs] * si;
 				}
 				else ref[base + d] = n[d];
 			}

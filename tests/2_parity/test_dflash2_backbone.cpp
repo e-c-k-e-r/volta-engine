@@ -214,7 +214,7 @@ void ref_swiglu( const std::vector<half>& gate, const std::vector<half>& up, int
 	}
 }
 
-// Per-head RMS norm with a learned weight, then interleaved-pair RoPE over the first rope_dims
+// Per-head RMS norm with a learned weight, then NeoX (rotate-half) RoPE over the first rope_dims
 // components. Q and K are normalized independently, each with its own head count.
 void ref_qk_norm_rope(
 	const std::vector<half>& x,
@@ -251,11 +251,11 @@ void ref_qk_norm_rope(
 			const int pos = pos0 + r;
 			for ( int d = 0; d < hd; ++d ) {
 				if ( d < rope_dims ) {
-					const int p = d >> 1;
+					const int p = ( d < rope_pairs ) ? d : d - rope_pairs;
 					const float c = cos_t[static_cast<size_t>( pos ) * rope_pairs + p];
 					const float si = sin_t[static_cast<size_t>( pos ) * rope_pairs + p];
-					if ( ( d & 1 ) == 0 ) out[base + d] = __float2half_rn( n[d] * c - n[d + 1] * si );
-					else out[base + d] = __float2half_rn( n[d] * c + n[d - 1] * si );
+					if ( d < rope_pairs ) out[base + d] = __float2half_rn( n[d] * c - n[d + rope_pairs] * si );
+					else out[base + d] = __float2half_rn( n[d] * c + n[d - rope_pairs] * si );
 				}
 				else out[base + d] = __float2half_rn( n[d] );
 			}
