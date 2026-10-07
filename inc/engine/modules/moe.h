@@ -91,7 +91,8 @@ struct MoERouter {
 		int routing_last,
 		int4* active_experts,
 		cudaStream_t stream = nullptr,
-		int rows = 1                    // routes = 8 * rows, token index = route / 8
+		int rows = 1,                   // routes = 8 * rows, token index = route / 8
+		int chunk_rows = 4              // rows per work item (the expert GEMM tile)
 	);
 };
 

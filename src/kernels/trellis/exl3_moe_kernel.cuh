@@ -247,11 +247,12 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
 	};
 
 	if ( active_experts ) {
-		const int num_active = active_experts[num_experts].x;
+		const int num_active = active_experts[0].x;
 
-		// Static assignment: group g evaluates active experts g, g + num_groups, ... in ascending order
+		// Static assignment: group g evaluates work items g, g + num_groups, ... in ascending order. An item is one
+		// expert's chunk of at most max_tokens_per_expert rows, so a hot expert spreads over the groups.
 		while ( ticket < num_active ) {
-			int4 act = active_experts[ticket];
+			int4 act = active_experts[1 + ticket];
 			int expert_idx = act.x;
 			int start = act.y;
 			int token_count = act.z;

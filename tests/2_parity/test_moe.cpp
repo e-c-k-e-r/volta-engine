@@ -109,7 +109,16 @@ int main() {
 	// Multi-row: R rows routed into a narrow expert set so several experts exceed the 8-token chunk. Reference is
 	// the single-row MoE::forward per row (the validated path).
 	bool multi_pass = true;
-	for ( int R : { 2, 3, 5, 8, 9, 24, 64 } ) {
+	std::vector<int> r_list = { 2, 3, 5, 8, 9, 24, 64 };
+	if ( const char* env = std::getenv( "MOE_ROWS" ) ) {
+		r_list.clear();
+		for ( const char* p = env; *p; ) {
+			r_list.push_back( std::atoi( p ) );
+			while ( *p && *p != ',' ) ++p;
+			if ( *p == ',' ) ++p;
+		}
+	}
+	for ( int R : r_list ) {
 		int rs[2] = { R, H };
 		auto xr = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rs, 2 );
 		auto outr = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rs, 2 );

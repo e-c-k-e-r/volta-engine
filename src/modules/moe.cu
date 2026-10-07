@@ -21,7 +21,8 @@ __global__ void moe_dispatch_hist_kernel(
 	int* __restrict__ cursors,
 	int4* __restrict__ active_experts,
 	int* __restrict__ sched,
-	int num_groups
+	int num_groups,
+	int chunk_rows
 ) {
 	__shared__ int hist[128];
 	const int threads = blockDim.x;
@@ -52,8 +53,11 @@ __global__ void moe_dispatch_hist_kernel(
 	}
 
 	if ( active_experts ) {
+		// Work items are (expert, first row, rows <= chunk_rows): a hot expert's chunks spread over all expert groups
+		// instead of serializing in one. Item 0 is the header (item count); items follow, ordered by expert then row.
 		__syncthreads();
-		scan[threadIdx.x] = ( threadIdx.x < num_experts && hist[threadIdx.x] > 0 ) ? 1 : 0;
+		const int nchunks = ( threadIdx.x < num_experts ) ? ( hist[threadIdx.x] + chunk_rows - 1 ) / chunk_rows : 0;
+		scan[threadIdx.x] = nchunks;
 		__syncthreads();
 		for ( int d = 1; d < 128; d <<= 1 ) {
 			int v = ( threadIdx.x >= d ) ? scan[threadIdx.x - d] : 0;
@@ -62,15 +66,17 @@ __global__ void moe_dispatch_hist_kernel(
 			__syncthreads();
 		}
 
-		if ( threadIdx.x < num_experts && hist[threadIdx.x] > 0 ) {
-			int act_idx = scan[threadIdx.x] - 1;
-			int my_start = cursors[threadIdx.x];
-			active_experts[act_idx] = make_int4( threadIdx.x, my_start, hist[threadIdx.x], 0 );
+		if ( nchunks > 0 ) {
+			const int first_item = scan[threadIdx.x] - nchunks;
+			const int my_start = cursors[threadIdx.x];
+			for ( int c = 0; c < nchunks; ++c ) {
+				active_experts[1 + first_item + c] = make_int4( threadIdx.x, my_start + c * chunk_rows, MIN( chunk_rows, hist[threadIdx.x] - c * chunk_rows ), 0 );
+			}
 		}
 
 		if ( threadIdx.x == 0 ) {
-			int total_active = ( num_experts > 0 ) ? scan[num_experts - 1] : 0;
-			active_experts[num_experts] = make_int4( total_active, 0, 0, 0 );
+			int total_items = ( num_experts > 0 ) ? scan[num_experts - 1] : 0;
+			active_experts[0] = make_int4( total_items, 0, 0, 0 );
 			// exl3_moe_kernel hands out tickets as num_groups + atomicAdd( &sched[0], 1 ) (tickets
 			// 0..num_groups-1 are implicit) and resets sched[0] to 0 on exit: seed must be 0.
 			// Seeding num_groups here skipped active experts num_groups..2*num_groups-1.
@@ -98,8 +104,12 @@ __global__ void moe_dispatch_scatter_kernel(
 	if ( i >= n ) return;
 	int e = selected_experts[i];
 	if ( e >= routing_first && e < routing_last ) {
-		int el = e - routing_first;
-		int pos = atomicAdd( &cursors[el], 1 );
+		// Position = the expert's start + the number of earlier routes to it, so every expert's rows are in route order
+		// and a chunk always holds the same tokens (an atomic cursor made the order, and with it the chunk-to-group
+		// assignment and the plane rounding, vary from run to run).
+		int rank = 0;
+		for ( int j = 0; j < i; ++j ) rank += ( selected_experts[j] == e ) ? 1 : 0;
+		const int pos = cursors[e - routing_first] + rank;
 		token_sorted[pos] = static_cast<int64_t>( i / top_k );
 		weight_sorted[pos] = routing_weights[i];
 	}
@@ -401,7 +411,8 @@ void MoERouter::exl3_moe_dispatch(
 	int routing_last,
 	int4* active_experts,
 	cudaStream_t stream,
-	int rows
+	int rows,
+	int chunk_rows
 ) {
 	const int n = 8 * rows;
 	int device = 0;
@@ -420,7 +431,8 @@ void MoERouter::exl3_moe_dispatch(
 		cursors,
 		active_experts,
 		sched,
-		num_groups
+		num_groups,
+		chunk_rows
 	);
 
 	moe_dispatch_scatter_kernel<<<dim3( ( n + 31 ) / 32 ), dim3( 32 ), 0, stream>>>(
@@ -480,9 +492,10 @@ pod::MoEScratch MoE::alloc_scratch(
 	s.token_sorted = static_cast<int64_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( top_k ) * max_rows * sizeof( int64_t ) ) );
 	s.weight_sorted = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( top_k ) * max_rows * sizeof( half ) ) );
 	s.cursors = static_cast<int*>( engine::core::arena_alloc( arena, E1 * sizeof( int ) ) );
-	s.active_experts = static_cast<int4*>( engine::core::arena_alloc( arena, E1 * sizeof( int4 ) ) );
-	const size_t state_elems = static_cast<size_t>( groups ) * 16 * hidden_size;
-	const size_t interm_elems = static_cast<size_t>( groups ) * 16 * intermediate_size;
+	// header + one item per (expert, chunk of >= 4 rows)
+	s.active_experts = static_cast<int4*>( engine::core::arena_alloc( arena, ( 1 + E1 + static_cast<size_t>( top_k ) * max_rows / 4 ) * sizeof( int4 ) ) );
+	const size_t state_elems = static_cast<size_t>( groups ) * 64 * hidden_size;
+	const size_t interm_elems = static_cast<size_t>( groups ) * 64 * intermediate_size;
 	s.state_g = static_cast<half*>( engine::core::arena_alloc( arena, state_elems * sizeof( half ) ) );
 	s.state_u = static_cast<half*>( engine::core::arena_alloc( arena, state_elems * sizeof( half ) ) );
 	s.interm_g = static_cast<half*>( engine::core::arena_alloc( arena, interm_elems * sizeof( half ) ) );
@@ -521,6 +534,7 @@ void MoE::forward(
 			ENGINE_ASSERT( weights.device_ptrs != nullptr, "MoE::forward: init_device_ptrs not called" );
 			ENGINE_ASSERT( K_gate == 3 && K_up == 3 && K_down == 3, "MoE::forward: persistent trellis MoE kernel is instantiated for 3-bit experts only" );
 
+			const int wide = static_cast<int>( std::getenv( "EXL3_MOE_WIDE" ) ? std::atoi( std::getenv( "EXL3_MOE_WIDE" ) ) : ( rows > 8 ? 2 : 0 ) );
 			MoERouter::exl3_moe_dispatch(
 				d_topk_indices,
 				d_topk_weights,
@@ -533,7 +547,8 @@ void MoE::forward(
 				end_expert,
 				scratch.active_experts,
 				stream,
-				rows
+				rows,
+				wide == 2 ? 16 : 4
 			);
 
 			const void** d_ptrs = static_cast<const void**>( weights.device_ptrs );
@@ -568,7 +583,7 @@ void MoE::forward(
 				scratch.active_experts,
 				num_groups,
 				plane_elems,
-				static_cast<int>( std::getenv( "EXL3_MOE_WIDE" ) ? std::atoi( std::getenv( "EXL3_MOE_WIDE" ) ) : ( rows > 8 ? 2 : 0 ) ),
+				wide,
 				stream
 			);
 			if ( num_groups > 1 ) {
@@ -686,6 +701,7 @@ void exl3_moe(
 
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		attr_set[device] = true;
 	}

@@ -448,6 +448,9 @@ void exl3_gemm_kernel_inner_m64
         }
 
         barrier_release(lock, lock_d, last);
+
+        // A block whose slice spans more than one output column starts the next one from zero
+        clear_frag_c();
     };
 
     // Perform tensor core matmul on current tile. The A fragments are gathered

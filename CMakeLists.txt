@@ -233,3 +233,7 @@ set_target_properties(test_nvfp4_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${P
 add_executable(test_kv_quant tests/2_parity/test_kv_quant.cpp)
 target_link_libraries(test_kv_quant PRIVATE engine_kernels)
 set_target_properties(test_kv_quant PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(bench_moe_prefill tests/3_bench/bench_moe_prefill.cpp)
+target_link_libraries(bench_moe_prefill PRIVATE engine_kernels)
+set_target_properties(bench_moe_prefill PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
