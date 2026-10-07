@@ -157,7 +157,7 @@ void Generator::prefill_slot( int s ) {
 	const int n = static_cast<int>( slot.req.prompt_tokens.size() );
 	cluster_.reset_slot( s );
 	Candidates first_cands;
-	int first = cluster_.prefill( slot.req.prompt_tokens.data(), n, s, pod::MAX_BATCH, slot.sp.greedy() ? nullptr : &first_cands );
+	int first = cluster_.prefill( slot.req.prompt_tokens.data(), n, s, 0, slot.sp.greedy() ? nullptr : &first_cands );
 	if ( !slot.sp.greedy() ) first = sample_token( first_cands, slot.sp, slot.rng );
 	slot.current_pos = n;
 	slot.prefill_done = true;

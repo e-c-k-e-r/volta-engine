@@ -4,7 +4,8 @@
 
 namespace engine::comm {
 
-#define IPC_SLOT_BYTES (256 * 1024)
+// One staging slot per (stage, rank). Sized for a 256-row prefill chunk at hidden 5120 (2.5 MiB); 16 slots per device.
+#define IPC_SLOT_BYTES ( 3 * 1024 * 1024 )
 
 __device__ __forceinline__ uint32_t ldg_acquire_sys_u32( const uint32_t* p ) {
 	uint32_t v;
@@ -16,12 +17,12 @@ __device__ __forceinline__ void stg_release_sys_u32( uint32_t* p, uint32_t v ) {
 	asm volatile ( "st.global.release.sys.u32 [%0], %1;" :: "l"( p ), "r"( v ) : "memory" );
 }
 
-// Flag page layout (per rank, uint32 words): [stage(4)][row(16)][rank(4)] publish flags,
+// Flag page layout (per rank, uint32 words): [stage(4)][row(256)][rank(4)] publish flags,
 // then a device-resident sequence counter and a block-retire counter. Sequence numbers live
 // on the device so launches carry no host-incremented arguments and replay inside CUDA graphs.
-#define AR_MAX_ROWS 16
-#define AR_SEQ_WORD 512
-#define AR_RETIRE_WORD 513
+#define AR_MAX_ROWS 256
+#define AR_SEQ_WORD ( 4 * AR_MAX_ROWS * 4 )
+#define AR_RETIRE_WORD ( AR_SEQ_WORD + 1 )
 
 __device__ __forceinline__ uint32_t* ar_flag( uint32_t* base, uint32_t stage, int row, int p ) {
 	return base + ( stage * AR_MAX_ROWS + row ) * 4 + p;
@@ -298,7 +299,7 @@ void CollectiveRing::all_reduce_rms_norm(
 	int rows = x.shape[0];
 	int hidden_size = x.shape[1];
 
-	ENGINE_ASSERT( rows >= 1 && rows <= 16, "all_reduce_rms_norm: rows must be 1..16" );
+	ENGINE_ASSERT( rows >= 1 && rows <= AR_MAX_ROWS && static_cast<size_t>( rows ) * hidden_size * sizeof( half ) <= IPC_SLOT_BYTES, "all_reduce_rms_norm: rows out of range for the staging slot" );
 	ENGINE_ASSERT( hidden_size % 128 == 0, "all_reduce_rms_norm: hidden_size must be multiple of 128" );
 
 	half* x_ptr = x.ptr<half>();
@@ -333,7 +334,7 @@ void CollectiveRing::all_reduce(
 	int rows = x.shape[0];
 	int hidden_size = x.shape[1];
 
-	ENGINE_ASSERT( rows >= 1 && rows <= 16, "all_reduce: rows must be 1..16" );
+	ENGINE_ASSERT( rows >= 1 && rows <= AR_MAX_ROWS && static_cast<size_t>( rows ) * hidden_size * sizeof( half ) <= IPC_SLOT_BYTES, "all_reduce: rows out of range for the staging slot" );
 	ENGINE_ASSERT( hidden_size % 128 == 0, "all_reduce: hidden_size must be multiple of 128" );
 
 	half* x_ptr = x.ptr<half>();
@@ -367,11 +368,12 @@ void init_4gpu_mesh(
 				cudaGetLastError();
 			}
 		}
+		ENGINE_ASSERT( staging_bytes >= kMeshStagingBytes, "init_4gpu_mesh: staging too small for 16 slots" );
 		CUDA_CHECK( cudaMalloc( &staging_ptrs[d], staging_bytes ) );
 		CUDA_CHECK( cudaMemset( staging_ptrs[d], 0, staging_bytes ) );
 
-		CUDA_CHECK( cudaMalloc( &flag_ptrs[d], 4096 ) );
-		CUDA_CHECK( cudaMemset( flag_ptrs[d], 0, 4096 ) );
+		CUDA_CHECK( cudaMalloc( &flag_ptrs[d], 65536 ) );
+		CUDA_CHECK( cudaMemset( flag_ptrs[d], 0, 65536 ) );
 	}
 
 	for ( int r = 0; r < ENGINE_NUM_GPUS; ++r ) {

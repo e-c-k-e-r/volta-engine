@@ -14,7 +14,7 @@ std::vector<int> run_sampled( ModelCluster& mc, const std::vector<int>& prompt, 
 	Rng rng( sp.seed );
 	mc.reset_slot( 0 );
 	Candidates c;
-	int tok = mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0, pod::MAX_BATCH, &c );
+	int tok = mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0, 0, &c );
 	tok = sample_token( c, sp, rng );
 	std::vector<int> out = { tok };
 	int pos = static_cast<int>( prompt.size() );

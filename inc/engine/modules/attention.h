@@ -53,6 +53,25 @@ struct Attention {
 		int max_seq = 2048,
 		cudaStream_t stream = nullptr
 	);
+
+	// Prefill form for chunks above the decode sizes (one slot, head_dim 256): K/V tiles are shared across queries.
+	// Same arguments and result as forward_decode.
+	static void forward_prefill(
+		const pod::TensorView& q,
+		const half* k_cache,
+		const half* v_cache,
+		const pod::TensorView& gate,
+		pod::TensorView& out,
+		size_t slot_stride,
+		int layer_idx,
+		const pod::BatchRows* d_rows,
+		int count,
+		int num_q_heads,
+		int num_kv_heads,
+		int head_dim,
+		int max_seq = 2048,
+		cudaStream_t stream = nullptr
+	);
 };
 
 } // namespace engine::modules

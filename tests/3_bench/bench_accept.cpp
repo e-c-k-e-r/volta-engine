@@ -67,7 +67,7 @@ int main( int argc, char** argv ) {
 			mc.reset_slot( 0 );
 			Candidates c;
 			auto t0 = std::chrono::steady_clock::now();
-			int tok = sample_token( ( mc.prefill( ids.data(), static_cast<int>( ids.size() ), 0, pod::MAX_BATCH, &c ), c ), sp, rng );
+			int tok = sample_token( ( mc.prefill( ids.data(), static_cast<int>( ids.size() ), 0, 0, &c ), c ), sp, rng );
 			st.tokens.push_back( tok );
 			int pos = static_cast<int>( ids.size() );
 			t0 = std::chrono::steady_clock::now();

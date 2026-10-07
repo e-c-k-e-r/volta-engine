@@ -186,6 +186,72 @@ __global__ void causal_conv1d_silu_rows_kernel(
 	h[c * 3 + 2] = v2;
 }
 
+// Prefill conv: the 4-tap FIR is over *inputs*, so rows are independent given the previous three inputs. Each thread
+// takes one channel and a tile of rows, reads from src and writes to dst (distinct buffers: a tile reads the three
+// rows before its own, which a neighbouring tile would otherwise already have overwritten). One slot per chunk.
+#define CONV_TILE_ROWS 16
+__global__ void causal_conv1d_silu_tiled_kernel(
+	const half* __restrict__ src,
+	half* __restrict__ dst,
+	const float* __restrict__ history,
+	const half* __restrict__ weights,
+	int channels,
+	int rows,
+	const pod::BatchRows* __restrict__ d_rows,
+	size_t slot_stride
+) {
+	const int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( c >= channels ) return;
+	const int r0 = blockIdx.y * CONV_TILE_ROWS;
+	const int r1 = min( rows, r0 + CONV_TILE_ROWS );
+	const float* h = history + static_cast<size_t>( d_rows->slot[0] ) * slot_stride + c * 3;
+
+	const float w0 = ( weights != nullptr ) ? __half2float( weights[c * 4 + 0] ) : 0.0f;
+	const float w1 = ( weights != nullptr ) ? __half2float( weights[c * 4 + 1] ) : 0.0f;
+	const float w2 = ( weights != nullptr ) ? __half2float( weights[c * 4 + 2] ) : 0.0f;
+	const float w3 = ( weights != nullptr ) ? __half2float( weights[c * 4 + 3] ) : 1.0f;
+
+	// x[t - 3], x[t - 2], x[t - 1] for t = r0; indices below zero come from the saved history (oldest first).
+	float v[3];
+	#pragma unroll
+	for ( int k = 0; k < 3; ++k ) {
+		const int idx = r0 - 3 + k;
+		v[k] = ( idx >= 0 ) ? __half2float( src[static_cast<size_t>( idx ) * channels + c] ) : h[3 + idx];
+	}
+	float v0 = v[0], v1 = v[1], v2 = v[2];
+	for ( int t = r0; t < r1; ++t ) {
+		const float in_val = __half2float( src[static_cast<size_t>( t ) * channels + c] );
+		const float sum = v0 * w0 + v1 * w1 + v2 * w2 + in_val * w3;
+		dst[static_cast<size_t>( t ) * channels + c] = __float2half_rn( sum / ( 1.0f + __expf( -sum ) ) );
+		v0 = v1;
+		v1 = v2;
+		v2 = in_val;
+	}
+}
+
+// After the tiles: the history for the next chunk is the last three inputs.
+__global__ void causal_conv1d_history_kernel(
+	const half* __restrict__ src,
+	float* __restrict__ history,
+	int channels,
+	int rows,
+	const pod::BatchRows* __restrict__ d_rows,
+	size_t slot_stride
+) {
+	const int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( c >= channels ) return;
+	float* h = history + static_cast<size_t>( d_rows->slot[0] ) * slot_stride + c * 3;
+	float nv[3];
+	#pragma unroll
+	for ( int k = 0; k < 3; ++k ) {
+		const int idx = rows - 3 + k;
+		nv[k] = ( idx >= 0 ) ? __half2float( src[static_cast<size_t>( idx ) * channels + c] ) : h[3 + idx];
+	}
+	h[0] = nv[0];
+	h[1] = nv[1];
+	h[2] = nv[2];
+}
+
 __global__ void l2_norm_heads_kernel(
 	half* __restrict__ qkv,
 	int num_k_heads,
@@ -917,6 +983,26 @@ void GDN::recurrent_step_rows(
 		gdn_state, qkv.ptr<const half>(), gate.ptr<const float>(), beta.ptr<const float>(), attn_out.ptr<half>(),
 		num_k_heads, num_v_heads, scale, rows, d_rows, slot_stride, snap, snap_stride, snap_rows, snap_on
 	);
+}
+
+void GDN::causal_conv1d_silu_tiled(
+	const pod::TensorView& src,
+	pod::TensorView& dst,
+	float* history,
+	const pod::TensorView& conv_weights,
+	int channels,
+	int rows,
+	const pod::BatchRows* d_rows,
+	size_t slot_stride,
+	cudaStream_t stream
+) {
+	const int threads = 128;
+	const int blocks = ( channels + threads - 1 ) / threads;
+	const int tiles = ( rows + CONV_TILE_ROWS - 1 ) / CONV_TILE_ROWS;
+	causal_conv1d_silu_tiled_kernel<<<dim3( blocks, tiles ), dim3( threads ), 0, stream>>>(
+		src.ptr<const half>(), dst.ptr<half>(), history, conv_weights.ptr<const half>(), channels, rows, d_rows, slot_stride );
+	causal_conv1d_history_kernel<<<dim3( blocks ), dim3( threads ), 0, stream>>>(
+		src.ptr<const half>(), history, channels, rows, d_rows, slot_stride );
 }
 
 void GDN::project_kda_gates(

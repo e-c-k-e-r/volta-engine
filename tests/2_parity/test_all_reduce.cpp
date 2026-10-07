@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
 #include "engine/core/tensor.h"
@@ -26,13 +27,13 @@ int main() {
 	engine::comm::CollectiveRing rings[ENGINE_NUM_GPUS];
 	void* staging_ptrs[ENGINE_NUM_GPUS] = { nullptr };
 	void* flag_ptrs[ENGINE_NUM_GPUS] = { nullptr };
-	engine::comm::init_4gpu_mesh( rings, staging_ptrs, flag_ptrs, 4 * 1024 * 1024 );
+	engine::comm::init_4gpu_mesh( rings, staging_ptrs, flag_ptrs, engine::comm::kMeshStagingBytes );
 
 	cudaStream_t streams[ENGINE_NUM_GPUS];
 	pod::MemoryArena arenas[ENGINE_NUM_GPUS];
 
 	const int hidden_size = 5120;
-	const int rows = 1;
+	const int rows = std::getenv( "AR_ROWS" ) ? std::atoi( std::getenv( "AR_ROWS" ) ) : 1;
 	const size_t total_elems = static_cast<size_t>( rows ) * hidden_size;
 
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {

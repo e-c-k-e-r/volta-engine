@@ -40,7 +40,9 @@ public:
 	// Chunked causal prefill of `count` tokens starting at pos 0 into `slot`.
 	// Returns the greedy prediction for the token following the prompt.
 	// last_cands (optional) receives the final row's top-16 candidates so the caller can sample the first token.
-	int prefill( const int* tokens, int count, int slot, int chunk = pod::MAX_BATCH, Candidates* last_cands = nullptr );
+	// chunk 0 = the model's largest row count (128 for Qwen). Chunks above MAX_BATCH rows run eagerly and skip the
+	// LM head except for the final row of the final chunk.
+	int prefill( const int* tokens, int count, int slot, int chunk = 0, Candidates* last_cands = nullptr );
 
 	// Greedy argmax of the last forward's first `count` rows (rank 0).
 	void sample( int* out, int count );

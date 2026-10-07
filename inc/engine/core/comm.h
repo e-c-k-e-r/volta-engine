@@ -8,6 +8,9 @@
 
 namespace engine::comm {
 
+// Staging bytes per device the mesh needs: 16 slots (4 stages x 4 ranks) of 3 MiB.
+static constexpr size_t kMeshStagingBytes = 16 * 3 * 1024 * 1024;
+
 struct CollectiveRing {
 	int   rank;
 	void* peer_ptrs[ENGINE_NUM_GPUS];
@@ -35,7 +38,7 @@ void init_4gpu_mesh(
 	CollectiveRing rings[ENGINE_NUM_GPUS],
 	void* staging_ptrs[ENGINE_NUM_GPUS],
 	void* flag_ptrs[ENGINE_NUM_GPUS],
-	size_t staging_bytes = 1024 * 1024
+	size_t staging_bytes = kMeshStagingBytes
 );
 
 void destroy_4gpu_mesh(

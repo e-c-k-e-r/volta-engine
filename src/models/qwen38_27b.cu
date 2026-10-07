@@ -45,7 +45,7 @@ bool Qwen38Pipeline::init(
 	const int lin_v_heads = lin_v_heads_;
 	const int lin_channels = lin_channels_;
 	const int inter_size = inter_size_;
-	const int R = pod::MAX_BATCH;
+	const int R = pod::MAX_ROWS;   // prefill chunk capacity; decode graphs use up to MAX_BATCH
 	const int S = config_.max_slots;
 
 	// 1. Recurrent GDN state per slot: [S, 48, v_heads, 128, 128] FP32 + one-slot checkpoint
@@ -117,6 +117,10 @@ bool Qwen38Pipeline::init(
 	// 6. Linear attention (GDN) buffers
 	int qkv_shape[2] = { R, lin_channels };
 	qkv_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
+	{
+		int conv_shape[2] = { R, lin_channels };
+		conv_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, conv_shape, 2 );   // prefill conv output
+	}
 
 	int z_shape[2] = { R, lin_v_heads * config_.linear_head_dim };
 	z_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
@@ -167,7 +171,7 @@ bool Qwen38Pipeline::init(
 		}
 		if ( rank_ == 0 && tp_size_ > 1 ) {
 			// Only the DFlash2 drafter needs the whole distribution; sampling reduces per shard.
-			int full_shape[2] = { R, config_.vocab_size };
+			int full_shape[2] = { pod::MAX_BATCH, config_.vocab_size };   // the drafter / tests read at most a decode block
 			full_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, full_shape, 2 );
 		}
 
@@ -375,7 +379,7 @@ void Qwen38Pipeline::set_rows( int m ) {
 }
 
 void Qwen38Pipeline::embed_tokens( const int* token_ids, int count, cudaStream_t stream ) {
-	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_BATCH, "Qwen38Pipeline::embed_tokens: count out of range" );
+	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_ROWS, "Qwen38Pipeline::embed_tokens: count out of range" );
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	// Pageable H2D: the source is staged before return, so the caller's array may be reused immediately
 	CUDA_CHECK( cudaMemcpyAsync( d_token_ids_, token_ids, count * sizeof( int ), cudaMemcpyHostToDevice, stream ) );
@@ -511,7 +515,7 @@ __global__ void dflash_store_taps_kernel(
 
 void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) {
 	ENGINE_ASSERT( weights_loaded_, "Qwen38Pipeline::forward: weights not loaded" );
-	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_BATCH, "Qwen38Pipeline::forward: row count out of range" );
+	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_ROWS, "Qwen38Pipeline::forward: row count out of range" );
 	for ( int r = 0; r < rows.count; ++r ) {
 		ENGINE_ASSERT( rows.slot[r] >= 0 && rows.slot[r] < config_.max_slots, "Qwen38Pipeline::forward: slot out of range" );
 		ENGINE_ASSERT( rows.pos[r] >= 0 && rows.pos[r] < config_.max_seq, "Qwen38Pipeline::forward: position out of range" );
@@ -519,7 +523,9 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) 
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	const int m = rows.count;
 	last_slot_ = rows.slot[0];
-	last_rows_ = m;
+	// Logits selection applies to eager prefill chunks only (decode graphs are keyed on m alone).
+	lm_mode_ = ( m > pod::MAX_BATCH ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;
+	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
 	set_rows( m );
 
 	// Row descriptor goes to the device; the layer stack only reads slots/positions from there,
@@ -599,13 +605,25 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 			);
 
 			// Attend over past tokens + sigmoid gate
-			engine::modules::Attention::forward_decode(
-				q_buf_, slot_k, slot_v, gate_attn_buf_,
-				attn_out_,
-				kv_slot_stride, full_attn_idx, d_rows_, m,
-				q_heads, kv_heads,
-				config_.full_head_dim, config_.max_seq, stream
-			);
+			if ( m > pod::MAX_BATCH && config_.full_head_dim == 256 ) {
+				// Prefill chunk: tiled kernel that shares K/V tiles across queries.
+				engine::modules::Attention::forward_prefill(
+					q_buf_, slot_k, slot_v, gate_attn_buf_,
+					attn_out_,
+					kv_slot_stride, full_attn_idx, d_rows_, m,
+					q_heads, kv_heads,
+					config_.full_head_dim, config_.max_seq, stream
+				);
+			}
+			else {
+				engine::modules::Attention::forward_decode(
+					q_buf_, slot_k, slot_v, gate_attn_buf_,
+					attn_out_,
+					kv_slot_stride, full_attn_idx, d_rows_, m,
+					q_heads, kv_heads,
+					config_.full_head_dim, config_.max_seq, stream
+				);
+			}
 			full_attn_idx++;
 
 			// O proj: projects attn_out (6144 or 1536) to mlp_out (5120)
@@ -644,11 +662,20 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 			pod::TensorView gate_rows = pod::make_tensor_2d( gdn_gate_.ptr<float>(), pod::DType::FP32, m, v_heads );
 			pod::TensorView beta_rows = pod::make_tensor_2d( gdn_beta_.ptr<float>(), pod::DType::FP32, m, v_heads );
 
-			// Causal conv1d + SiLU
-			engine::modules::GDN::causal_conv1d_silu_rows(
-				qkv_rows, hist_ptr, lw.conv1d_w, lin_channels, m, d_rows_, state_.slot_conv_floats,
-				conv_snap, state_.slot_conv_floats, snap_rows, state_.d_snap_on, stream
-			);
+			// Causal conv1d + SiLU. Prefill chunks run it in parallel row tiles into a separate buffer; the rest of
+			// the layer then reads that buffer instead of the in-place result.
+			if ( m > pod::MAX_BATCH ) {
+				pod::TensorView conv_rows = pod::make_tensor_2d( conv_out_.ptr<half>(), pod::DType::FP16, m, lin_channels );
+				engine::modules::GDN::causal_conv1d_silu_tiled(
+					qkv_rows, conv_rows, hist_ptr, lw.conv1d_w, lin_channels, m, d_rows_, state_.slot_conv_floats, stream );
+				qkv_rows = conv_rows;
+			}
+			else {
+				engine::modules::GDN::causal_conv1d_silu_rows(
+					qkv_rows, hist_ptr, lw.conv1d_w, lin_channels, m, d_rows_, state_.slot_conv_floats,
+					conv_snap, state_.slot_conv_floats, snap_rows, state_.d_snap_on, stream
+				);
+			}
 
 			// L2 norm on Q and K heads
 			engine::modules::GDN::l2_norm_heads(
@@ -747,6 +774,17 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 	// Final norm + LM head. Every rank projects its own vocabulary shard, so the 5120 x 248320 head is
 	// four 5120 x 62208 GEMVs running in parallel instead of one 5120 x 248320 GEMV gating rank 0.
 	if ( tp_size_ > 1 || rank_ == 0 ) {
+		if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
+		if ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) {
+			// Prefill: only the final row's logits are read. A one-row head also takes the int8 GEMV path.
+			const int H = config_.hidden_size;
+			pod::TensorView h1 = pod::make_tensor_2d( hidden_states_.ptr<half>() + static_cast<size_t>( m - 1 ) * H, pod::DType::FP16, 1, H );
+			pod::TensorView n1 = pod::make_tensor_2d( norm_hidden_.ptr<half>(), pod::DType::FP16, 1, H );
+			pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<half>(), pod::DType::FP16, 1, lm_shard_cols_ );
+			engine::modules::RMSNorm::forward( h1, final_norm_, n1, config_.rms_norm_eps, config_.rms_norm_bias, stream );
+			engine::modules::Linear::forward( n1, lm_head_, l1, stream );
+			return;
+		}
 		engine::modules::RMSNorm::forward(
 			hidden_states_, final_norm_, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
 		);

@@ -10,6 +10,9 @@ static int* g_locks[ENGINE_NUM_GPUS] = { nullptr };
 static int* g_int8_ws[ENGINE_NUM_GPUS] = { nullptr };
 static void* g_workspace[ENGINE_NUM_GPUS] = { nullptr };
 static size_t g_workspace_size[ENGINE_NUM_GPUS] = { 0 };
+static void* g_recon_ws[ENGINE_NUM_GPUS] = { nullptr };
+static size_t g_recon_ws_size[ENGINE_NUM_GPUS] = { 0 };
+static cublasHandle_t g_cublas[ENGINE_NUM_GPUS] = { nullptr };
 static std::mutex g_trellis_ctx_mtx;
 
 int trellis_get_num_sms( int device ) {
@@ -89,6 +92,42 @@ half* trellis_get_workspace( int device, size_t bytes ) {
 	return static_cast<half*>( g_workspace[device] );
 }
 
+cublasHandle_t trellis_get_cublas( int device ) {
+	if ( device < 0 || device >= ENGINE_NUM_GPUS ) device = 0;
+	if ( g_cublas[device] == nullptr ) {
+		std::lock_guard<std::mutex> lock( g_trellis_ctx_mtx );
+		if ( g_cublas[device] == nullptr ) {
+			int orig_dev = 0;
+			cudaGetDevice( &orig_dev );
+			cudaSetDevice( device );
+			ENGINE_ASSERT( cublasCreate( &g_cublas[device] ) == CUBLAS_STATUS_SUCCESS, "cublasCreate failed" );
+			cublasSetMathMode( g_cublas[device], CUBLAS_TENSOR_OP_MATH );
+			cudaSetDevice( orig_dev );
+		}
+	}
+	return g_cublas[device];
+}
+
+half* trellis_get_recon_ws( int device, size_t bytes ) {
+	if ( device < 0 || device >= ENGINE_NUM_GPUS ) device = 0;
+	if ( g_recon_ws[device] == nullptr || g_recon_ws_size[device] < bytes ) {
+		std::lock_guard<std::mutex> lock( g_trellis_ctx_mtx );
+		if ( g_recon_ws[device] == nullptr || g_recon_ws_size[device] < bytes ) {
+			int orig_dev = 0;
+			cudaGetDevice( &orig_dev );
+			cudaSetDevice( device );
+			if ( g_recon_ws[device] != nullptr ) {
+				CUDA_CHECK( cudaFree( g_recon_ws[device] ) );
+				g_recon_ws[device] = nullptr;
+			}
+			CUDA_CHECK( cudaMalloc( &g_recon_ws[device], bytes ) );
+			g_recon_ws_size[device] = bytes;
+			cudaSetDevice( orig_dev );
+		}
+	}
+	return static_cast<half*>( g_recon_ws[device] );
+}
+
 void trellis_context_init_all() {
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		trellis_get_workspace( d, 16 * 1024 * 1024 );
@@ -111,6 +150,17 @@ void trellis_context_destroy() {
 			cudaSetDevice( d );
 			cudaFree( g_int8_ws[d] );
 			g_int8_ws[d] = nullptr;
+		}
+		if ( g_cublas[d] != nullptr ) {
+			cudaSetDevice( d );
+			cublasDestroy( g_cublas[d] );
+			g_cublas[d] = nullptr;
+		}
+		if ( g_recon_ws[d] != nullptr ) {
+			cudaSetDevice( d );
+			cudaFree( g_recon_ws[d] );
+			g_recon_ws[d] = nullptr;
+			g_recon_ws_size[d] = 0;
 		}
 		if ( g_workspace[d] != nullptr ) {
 			cudaSetDevice( d );

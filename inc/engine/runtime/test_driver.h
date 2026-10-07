@@ -45,7 +45,7 @@ inline double ms_since( std::chrono::steady_clock::time_point t0 ) {
 
 // Greedy (T=0) generation of up to max_new tokens on `slot`; stops at EOS.
 // speculative=true drives DFlash2 rounds; output must be identical to plain greedy decoding.
-inline GenStats generate( ModelCluster& mc, const std::vector<int>& prompt, int max_new, bool speculative, int slot = 0, int prefill_chunk = pod::MAX_BATCH ) {
+inline GenStats generate( ModelCluster& mc, const std::vector<int>& prompt, int max_new, bool speculative, int slot = 0, int prefill_chunk = 0 ) {
 	GenStats st;
 	mc.reset_slot( slot );
 	auto t0 = std::chrono::steady_clock::now();

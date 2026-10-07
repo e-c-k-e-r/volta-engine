@@ -167,7 +167,8 @@ private:
 	bool weights_loaded_ = false;
 
 	half* tapped_states_ = nullptr; // [MAX_BATCH, 5, hidden_size]
-	int* d_token_ids_ = nullptr;    // [MAX_BATCH]
+	int* d_token_ids_ = nullptr;    // [MAX_ROWS]
+	int lm_mode_ = 0;               // BatchRows::LogitsMode of the forward in flight
 	pod::TensorView hidden_states_;
 	pod::TensorView norm_hidden_;
 
@@ -181,6 +182,7 @@ private:
 
 	// Linear-attention buffers
 	pod::TensorView qkv_buf_;
+	pod::TensorView conv_out_;    // [MAX_ROWS, channels] GDN conv output for prefill chunks
 	pod::TensorView z_buf_;
 	pod::TensorView gdn_gate_;
 	pod::TensorView gdn_beta_;

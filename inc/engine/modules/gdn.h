@@ -78,6 +78,20 @@ struct GDN {
 		cudaStream_t stream
 	);
 
+	// Prefill form (rows above the decode sizes, one slot): rows run in parallel tiles, reading src and writing a
+	// separate dst; the history is then advanced to the last three inputs. Bit-identical to the sequential kernel.
+	static void causal_conv1d_silu_tiled(
+		const pod::TensorView& src,
+		pod::TensorView& dst,
+		float* history,
+		const pod::TensorView& conv_weights,
+		int channels,
+		int rows,
+		const pod::BatchRows* d_rows,
+		size_t slot_stride,
+		cudaStream_t stream
+	);
+
 	static void recurrent_step_rows(
 		float* gdn_state,                 // layer base; slot s at + s * slot_stride
 		const pod::TensorView& qkv,       // [rows, (2 * k_heads + v_heads) * head_dim]

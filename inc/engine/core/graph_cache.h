@@ -27,8 +27,9 @@ public:
 
 	template <typename Body>
 	void run( int m, cudaStream_t stream, Body&& body ) {
-		ENGINE_ASSERT( m >= 1 && m <= pod::MAX_BATCH, "GraphCache::run: row count out of range" );
-		if ( !enabled_ || stream == nullptr ) {
+		ENGINE_ASSERT( m >= 1 && m <= pod::MAX_ROWS, "GraphCache::run: row count out of range" );
+		// Prefill chunks (above the decode sizes) run eagerly: a graph per chunk size would never be replayed.
+		if ( !enabled_ || stream == nullptr || m > pod::MAX_BATCH ) {
 			body( stream );
 			return;
 		}

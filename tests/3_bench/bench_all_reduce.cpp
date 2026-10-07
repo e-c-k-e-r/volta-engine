@@ -24,7 +24,7 @@ int main( int argc, char** argv ) {
 	void* staging_ptrs[ENGINE_NUM_GPUS] = { nullptr };
 	void* flag_ptrs[ENGINE_NUM_GPUS] = { nullptr };
 
-	engine::comm::init_4gpu_mesh( rings, staging_ptrs, flag_ptrs, 4 * 1024 * 1024 );
+	engine::comm::init_4gpu_mesh( rings, staging_ptrs, flag_ptrs, engine::comm::kMeshStagingBytes );
 
 	const int rows = 1;
 	const int hidden_size = 5120;

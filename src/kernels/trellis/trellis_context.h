@@ -3,6 +3,7 @@
 #include "engine/config.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 #include <cstdint>
 #include <cstddef>
 
@@ -26,6 +27,10 @@ int* trellis_get_locks( int device = 0 );
 // captured CUDA graphs, so it must never move or be reallocated.
 int* trellis_get_int8_ws( int device = 0 );
 half* trellis_get_workspace( int device = 0, size_t bytes = 16 * 1024 * 1024 );
+// Scratch for a dequantized FP16 weight (large-M path). Grows on demand; never captured in a CUDA graph, so it may move.
+half* trellis_get_recon_ws( int device, size_t bytes );
+// Per-device cuBLAS handle (created on first use, destroyed with the context).
+cublasHandle_t trellis_get_cublas( int device );
 void trellis_context_init_all();
 void trellis_context_destroy();
 

@@ -7,6 +7,7 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 set(CMAKE_CUDA_ARCHITECTURES 70)
+find_package(CUDAToolkit REQUIRED)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -Xcompiler -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION -DEXL3_SM70_HMMA=1 -DEXL3_VOLTA=1 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 20012")
@@ -57,6 +58,8 @@ add_library(engine_kernels STATIC
 	${ENGINE_CORE_SOURCES}
 	${TRELLIS_SOURCES}
 )
+# cuBLAS for the large-M prefill path (dequantize once, then a tensor-core HGEMM).
+target_link_libraries(engine_kernels PUBLIC CUDA::cublas)
 
 set_target_properties(engine_kernels PROPERTIES
 	ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
@@ -157,6 +160,22 @@ set_target_properties(test_spec_state PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PRO
 add_executable(test_sampling tests/2_parity/test_sampling.cpp)
 target_link_libraries(test_sampling PRIVATE engine_kernels)
 set_target_properties(test_sampling PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_prefill_linear tests/2_parity/test_prefill_linear.cpp)
+target_link_libraries(test_prefill_linear PRIVATE engine_kernels)
+set_target_properties(test_prefill_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_prefill_equiv tests/2_parity/test_prefill_equiv.cpp)
+target_link_libraries(test_prefill_equiv PRIVATE engine_kernels)
+set_target_properties(test_prefill_equiv PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_attention_prefill tests/2_parity/test_attention_prefill.cpp)
+target_link_libraries(test_attention_prefill PRIVATE engine_kernels)
+set_target_properties(test_attention_prefill PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(bench_prefill tests/3_bench/bench_prefill.cpp)
+target_link_libraries(bench_prefill PRIVATE engine_kernels)
+set_target_properties(bench_prefill PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(bench_accept tests/3_bench/bench_accept.cpp)
 target_link_libraries(bench_accept PRIVATE engine_kernels)

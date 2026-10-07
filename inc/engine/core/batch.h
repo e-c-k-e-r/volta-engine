@@ -5,8 +5,10 @@
 
 namespace pod {
 
-// Maximum number of rows (M) evaluated by a single model forward pass.
+// Maximum rows of a decode / speculative forward: the sizes a CUDA graph is captured for.
 static constexpr int MAX_BATCH = 16;
+// Capacity of a BatchRows: a prefill chunk may run up to this many rows in one eager forward.
+static constexpr int MAX_ROWS = 256;
 
 // Per-row execution descriptor for a single forward pass, passed by value into kernels.
 //
@@ -18,14 +20,21 @@ static constexpr int MAX_BATCH = 16;
 // Stateful modules (KV cache, GDN recurrence, conv history) walk rows in order, so both modes
 // share one code path: a causal block simply re-uses the same slot state row after row.
 struct BatchRows {
-	int count = 1;
-	int slot[MAX_BATCH] = {};
-	int pos[MAX_BATCH] = {};
+	// Which rows need logits. Only honoured for chunks above MAX_BATCH rows (the eager prefill path); a prefill
+	// chunk whose logits nobody reads skips the final norm and LM head, and the last chunk computes only its
+	// final row (written to logits row 0).
+	enum LogitsMode : int { LOGITS_ALL = 0, LOGITS_NONE = 1, LOGITS_LAST = 2 };
 
-	static BatchRows causal( int count, int base_pos, int slot_id ) {
-		ENGINE_ASSERT( count >= 1 && count <= MAX_BATCH, "BatchRows::causal: count out of range" );
+	int count = 1;
+	int logits_mode = LOGITS_ALL;
+	int slot[MAX_ROWS] = {};
+	int pos[MAX_ROWS] = {};
+
+	static BatchRows causal( int count, int base_pos, int slot_id, int logits_mode = LOGITS_ALL ) {
+		ENGINE_ASSERT( count >= 1 && count <= MAX_ROWS, "BatchRows::causal: count out of range" );
 		BatchRows r;
 		r.count = count;
+		r.logits_mode = logits_mode;
 		for ( int m = 0; m < count; ++m ) {
 			r.slot[m] = slot_id;
 			r.pos[m] = base_pos + m;
@@ -34,7 +43,7 @@ struct BatchRows {
 	}
 
 	static BatchRows batched( int count, const int* slot_ids, const int* positions ) {
-		ENGINE_ASSERT( count >= 1 && count <= MAX_BATCH, "BatchRows::batched: count out of range" );
+		ENGINE_ASSERT( count >= 1 && count <= MAX_ROWS, "BatchRows::batched: count out of range" );
 		BatchRows r;
 		r.count = count;
 		for ( int m = 0; m < count; ++m ) {

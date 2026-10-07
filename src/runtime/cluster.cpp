@@ -19,7 +19,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 			* 1024 * 1024 * 1024;
 
 	created_ = true;
-	engine::comm::init_4gpu_mesh( rings_, staging_ptrs_, flag_ptrs_, 4 * 1024 * 1024 );
+	engine::comm::init_4gpu_mesh( rings_, staging_ptrs_, flag_ptrs_, engine::comm::kMeshStagingBytes );
 	engine::modules::trellis_context_init_all();
 
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
@@ -107,20 +107,25 @@ void ModelCluster::forward( const int* tokens, int count, int pos, int slot ) {
 
 int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Candidates* last_cands ) {
 	ENGINE_ASSERT( count >= 1, "ModelCluster::prefill: empty prompt" );
-	chunk = MAX( 1, MIN( chunk, metadata().max_rows ) );
+	const int max_rows = metadata().max_rows;
+	chunk = ( chunk <= 0 ) ? max_rows : MAX( 1, MIN( chunk, max_rows ) );
 	int last_rows = 1;
 	for ( int pos = 0; pos < count; pos += chunk ) {
 		last_rows = MIN( chunk, count - pos );
-		forward( tokens + pos, last_rows, pos, slot );
+		const bool last = ( pos + last_rows >= count );
+		forward( tokens + pos, pod::BatchRows::causal( last_rows, pos, slot,
+			last ? pod::BatchRows::LOGITS_LAST : pod::BatchRows::LOGITS_NONE ) );
 	}
+	// A final chunk above the decode sizes computed logits for its last row only (in row 0).
+	const int rows = ( last_rows > pod::MAX_BATCH ) ? 1 : last_rows;
 	int preds[pod::MAX_BATCH];
-	sample( preds, last_rows );
+	sample( preds, rows );
 	if ( last_cands != nullptr ) {
 		Candidates cs[pod::MAX_BATCH];
-		sample_topk( last_rows, cs );
-		*last_cands = cs[last_rows - 1];
+		sample_topk( rows, cs );
+		*last_cands = cs[rows - 1];
 	}
-	return preds[last_rows - 1];
+	return preds[rows - 1];
 }
 
 void ModelCluster::sample_topk( int count, Candidates* out ) {
