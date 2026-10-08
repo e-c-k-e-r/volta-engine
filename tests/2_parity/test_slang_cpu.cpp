@@ -19,6 +19,8 @@ void moe_sum_planes( ComputeVaryingInput*, void*, void* );
 void moe_accumulate( ComputeVaryingInput*, void*, void* );
 void batched_argmax( ComputeVaryingInput*, void*, void* );
 void router_select( ComputeVaryingInput*, void*, void* );
+void l2_norm_heads( ComputeVaryingInput*, void*, void* );
+void gated_rmsnorm( ComputeVaryingInput*, void*, void* );
 }
 
 struct NormParams { half* src; half* dst; half* weight; int hidden_size; int has_weight; float eps; float bias; };
@@ -33,6 +35,9 @@ struct SumPlanesParams { half* planes; half* out_; int n; int groups; };
 struct AccumParams { half* accum; half* expert_out; float weight; int n; };
 struct ArgmaxParams { half* logits; int* out_idx; float* out_val; int numel; int batch_size; int index_offset; int row_stride; int has_val; };
 struct RouterParams { float* partials; half* bias; int* topk_idx; half* topk_w; int num_experts; int top_k; int k_slices; int max_slices; float scale; int has_bias; };
+
+struct L2Params { half* qkv; int num_k_heads; int head_dim; int scale_q; int64_t row_stride; };
+struct GatedNormParams { half* attn_out; half* z; half* norm_weight; int num_v_heads; int head_dim; int use_sigmoid; int has_z; int has_weight; };
 
 static uint32_t g_state = 777u;
 static float frand( float scale ) {
@@ -228,6 +233,40 @@ int main() {
 		}
 		std::printf( "  %-22s expert ids  %s\n", "router_select", ok ? "PASS" : "FAIL" );
 		pass = ok && check( "router_select weights", ref, w ) && pass;
+	}
+	{ // l2_norm_heads and gated_rmsnorm against FP64 references
+		const int rows = 2, kh = 3, hd = 96, stride = 2 * kh * hd + 64;
+		auto qkv = make( rows * stride, 1.0f );
+		auto in = qkv;
+		L2Params p{ qkv.data(), kh, hd, 1, stride };
+		dispatch( l2_norm_heads, &p, 2 * kh, rows );
+		std::vector<double> ref( rows * stride );
+		for ( int r = 0; r < rows; ++r ) for ( int i = 0; i < stride; ++i ) ref[r * stride + i] = h2d( in[r * stride + i] );
+		for ( int r = 0; r < rows; ++r ) for ( int b = 0; b < 2 * kh; ++b ) {
+			double sq = 0; for ( int i = 0; i < hd; ++i ) { const double v = h2d( in[r * stride + b * hd + i] ); sq += v * v; }
+			double inv = 1.0 / std::sqrt( sq + 1e-6 );
+			if ( b < kh ) inv *= 1.0 / std::sqrt( static_cast<double>( hd ) );
+			for ( int i = 0; i < hd; ++i ) ref[r * stride + b * hd + i] = h2d( in[r * stride + b * hd + i] ) * inv;
+		}
+		pass = check( "l2_norm_heads", ref, qkv ) && pass;
+		const int vh = 5;
+		for ( int sig = 0; sig < 2; ++sig ) {
+			auto o = make( rows * vh * hd, 1.0f ), z = make( rows * vh * hd, 2.0f ), gw = make( hd, 0.5f );
+			auto o0 = o;
+			GatedNormParams q{ o.data(), z.data(), gw.data(), vh, hd, sig, 1, 1 };
+			dispatch( gated_rmsnorm, &q, vh, rows );
+			std::vector<double> r2( o.size() );
+			for ( int g = 0; g < rows * vh; ++g ) {
+				double sq = 0; for ( int i = 0; i < hd; ++i ) { const double v = h2d( o0[g * hd + i] ); sq += v * v; }
+				const double inv = 1.0 / std::sqrt( sq / hd + 1e-6 );
+				for ( int i = 0; i < hd; ++i ) {
+					const double zv = h2d( z[g * hd + i] );
+					const double gate = sig ? 1.0 / ( 1.0 + std::exp( -zv ) ) : zv / ( 1.0 + std::exp( -zv ) );
+					r2[g * hd + i] = h2d( o0[g * hd + i] ) * inv * h2d( gw[i] ) * gate;
+				}
+			}
+			pass = check( sig ? "gated_rmsnorm sigmoid" : "gated_rmsnorm silu", r2, o ) && pass;
+		}
 	}
 	std::printf( pass ? "[+] Slang CPU target parity PASS\n" : "[-] Slang CPU target parity FAIL\n" );
 	return pass ? 0 : 1;

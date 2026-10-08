@@ -15,3 +15,5 @@ void slang_moe_sum_planes( void* planes, void* out, int n, int groups, cudaStrea
 void slang_moe_accumulate( void* accum, void* expert_out, float weight, int n, cudaStream_t s );
 void slang_batched_argmax( void* logits, void* out_idx, void* out_val, int numel, int batch, int index_offset, int row_stride, cudaStream_t s );
 void slang_router_select( void* partials, void* bias, void* topk_idx, void* topk_w, int rows, int num_experts, int top_k, int k_slices, int max_slices, float scale, cudaStream_t s );
+void slang_l2_norm_heads( void* qkv, int rows, int num_k_heads, int head_dim, int scale_q, long long row_stride, cudaStream_t s );
+void slang_gated_rmsnorm( void* attn_out, void* z, void* norm_weight, int rows, int num_v_heads, int head_dim, int use_sigmoid, cudaStream_t s );

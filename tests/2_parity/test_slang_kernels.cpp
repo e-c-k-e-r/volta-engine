@@ -3,6 +3,7 @@
 #include "engine/modules/swiglu.h"
 #include "engine/modules/rope.h"
 #include "engine/modules/embedding.h"
+#include "engine/modules/gdn.h"
 #include "engine/backend/runtime.h"
 #include "shaders_cuda.h"
 #include <cstdio>
@@ -251,6 +252,27 @@ int main() {
 		std::printf( "  %-22s expert ids vs CPU  %s\n", "router_select", ok ? "PASS" : "FAIL" );
 		pass = ok && compare_ref( "router_select weights", ref, w.get() ) && pass;
 		backend::device_free( d_part ); backend::device_free( d_idx );
+	}
+	{ // l2_norm_heads (q and k slices of a packed row, q scaled) and gated_rmsnorm, against the engine kernels
+		const int rows = 3, kh = 4, hd = 128, stride = 2 * kh * hd + 512;
+		Buf a( rows * stride ), b( rows * stride );
+		b.set( a.get() );
+		pod::TensorView ta = pod::make_tensor_2d( a.d, pod::DType::FP16, rows, stride );
+		modules::GDN::l2_norm_heads( ta, kh, hd, s, true, rows, stride );
+		slang_l2_norm_heads( b.d, rows, kh, hd, 1, stride, s );
+		backend::stream_sync( s );
+		pass = compare( "l2_norm_heads", a.get(), b.get() ) && pass;
+		const int vh = 8;
+		for ( bool sig : { false, true } ) {
+			Buf o1( rows * vh * hd ), o2( rows * vh * hd ), z( rows * vh * hd, 2.0f ), gw( hd, 0.5f );
+			o2.set( o1.get() );
+			pod::TensorView to = pod::make_tensor_2d( o1.d, pod::DType::FP16, rows, vh * hd ), tz = pod::make_tensor_2d( z.d, pod::DType::FP16, rows, vh * hd );
+			pod::TensorView tgw = pod::make_tensor_1d( gw.d, pod::DType::FP16, hd );
+			modules::GDN::gated_rmsnorm( to, tz, tgw, vh, hd, s, sig, rows );
+			slang_gated_rmsnorm( o2.d, z.d, gw.d, rows, vh, hd, sig ? 1 : 0, s );
+			backend::stream_sync( s );
+			pass = compare( sig ? "gated_rmsnorm sigmoid" : "gated_rmsnorm silu", o1.get(), o2.get() ) && pass;
+		}
 	}
 	{ // speed, for reference: the CUDA build keeps its own kernels unless a Slang one matches
 		const int rows = 1, hidden = 5120;
