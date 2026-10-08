@@ -1,4 +1,5 @@
 #include "engine/modules/expert_tier.h"
+#include "engine/runtime/options.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
@@ -6,10 +7,7 @@
 namespace engine::modules {
 
 double ExpertTier::env_fraction() {
-	const char* e = std::getenv( "EXL3_EXPERT_CACHE" );
-	if ( e == nullptr ) return 1.0;
-	const double f = std::atof( e );
-	return f > 0.0 && f < 1.0 ? f : 1.0;
+	return runtime::options().expert_cache;
 }
 
 void ExpertTier::configure( int experts_per_layer, double fraction, const size_t bytes[3] ) {
@@ -21,7 +19,7 @@ void ExpertTier::configure( int experts_per_layer, double fraction, const size_t
 		slot_bytes += bytes[i];
 	}
 	ENGINE_ASSERT( slot_bytes % 256 == 0, "ExpertTier: expert code bytes must be a multiple of 256" );
-	if ( const char* e = std::getenv( "EXL3_EXPERT_SWAPS" ) ) max_swaps = std::max( 0, std::atoi( e ) );
+	if ( runtime::options().expert_swaps >= 0 ) max_swaps = runtime::options().expert_swaps;
 }
 
 void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, pod::MemoryArena& host, std::vector<int> resident_set ) {

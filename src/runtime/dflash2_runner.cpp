@@ -1,4 +1,5 @@
 #include "engine/runtime/dflash2_runner.h"
+#include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #include "engine/runtime/cluster.h"
 #include <chrono>
@@ -79,8 +80,7 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 	cfg.rope_dim_sections[3] = 0;
 	ENGINE_ASSERT( cfg.selector_top_k == models::kDraftTopK, "DFlash2Runner: selector_top_k != kDraftTopK" );
 
-	const char* tp_env = std::getenv( "EXL3_DRAFT_TP" );
-	tp_ = ( tp_env && tp_env[0] == '0' ) ? 1 : mc.tp();
+	tp_ = runtime::options().draft_tp ? mc.tp() : 1;
 	bool loaded = true;
 	for ( int d = 0; d < tp_; ++d ) {
 		backend::set_device( d );

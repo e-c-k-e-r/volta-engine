@@ -45,6 +45,7 @@ set(ENGINE_HOST_SOURCES
 	src/models/model.cpp
 	src/models/qwen38_27b.cpp
 	src/models/glm53_flash.cpp
+	src/runtime/options.cpp
 	src/runtime/kv_cache.cpp
 	src/runtime/cluster.cpp
 	src/runtime/dflash2_runner.cpp

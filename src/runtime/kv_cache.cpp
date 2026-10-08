@@ -1,4 +1,5 @@
 #include "engine/runtime/kv_cache.h"
+#include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #include <cstdio>
 #include <cstdlib>
@@ -25,7 +26,7 @@ bool KVCachePool::init(
 	head_dim = head_dim_in;
 
 	format = format_in;
-	if ( const char* env = std::getenv( "EXL3_KV" ) ) {
+	if ( const char* env = runtime::options().kv_format.c_str(); *env ) {
 		if ( !std::strcmp( env, "fp8" ) ) format = pod::KVFormat::FP8;
 		else if ( !std::strcmp( env, "k8v4" ) ) format = pod::KVFormat::K8V4;
 		else if ( !std::strcmp( env, "nvfp4" ) ) format = pod::KVFormat::NVFP4;

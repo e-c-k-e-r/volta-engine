@@ -1,4 +1,5 @@
 #include "engine/models/qwen38_27b.h"
+#include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #include "engine/loader/safetensors.h"
 #include "engine/spec/dflash.h"
@@ -148,7 +149,7 @@ bool Qwen38Pipeline::init(
 	// 62080 -> 62208) so the dp4a int8 GEMV engages; pad columns are excluded from the argmax.
 	// EXL3_LM_SHARD=0 restores the single-rank full-vocabulary head for A/B measurement.
 	shard_lm_ = tp_size > 1;
-	if ( const char* e = std::getenv( "EXL3_LM_SHARD" ) ) shard_lm_ = ( atoi( e ) != 0 );
+	if ( runtime::options().lm_shard >= 0 ) shard_lm_ = ( runtime::options().lm_shard != 0 );
 	tp_size_ = shard_lm_ ? tp_size : 1;
 	lm_shard_real_cols_ = config_.vocab_size / tp_size_;
 	int pad_cols = 0;
@@ -231,8 +232,8 @@ bool Qwen38Pipeline::init(
 
 bool Qwen38Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
 	Qwen38Config config;
-	if ( const char* env = std::getenv( "EXL3_MAX_SEQ" ) ) config.max_seq = std::atoi( env );  // context window (KV pool size)
-	if ( const char* env = std::getenv( "EXL3_MAX_SLOTS" ) ) config.max_slots = std::atoi( env );
+	if ( runtime::options().max_seq > 0 ) config.max_seq = runtime::options().max_seq;  // context window (KV pool size)
+	if ( runtime::options().max_slots > 0 ) config.max_slots = runtime::options().max_slots;
 	return init( config, device_id, arena, ring );
 }
 
@@ -554,7 +555,7 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, backend::stream_t stre
 	// distinct slots get a block each. The graph body differs, so the two shapes get separate graphs.
 	attn_tc_ = true;
 	for ( int r = 1; r < m; ++r ) attn_tc_ = attn_tc_ && rows.slot[r] == rows.slot[0];
-	static const bool tc_on = !( std::getenv( "EXL3_ATTN_TC" ) && std::atoi( std::getenv( "EXL3_ATTN_TC" ) ) == 0 );
+	const bool tc_on = runtime::options().attn_tc;
 	attn_tc_on_ = tc_on;
 	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); }, attn_tc_ ? 1 : 0 );
 }

@@ -1,4 +1,5 @@
 #include "engine/runtime/generator.h"
+#include "engine/runtime/options.h"
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -172,7 +173,7 @@ void Generator::prefill_slot( int s ) {
 
 void Generator::step_batch() {
 	// Tiered experts: fold the routing since the last pass into the residency every so often (a device sync per rank)
-	static const int adapt_every = std::getenv( "EXL3_EXPERT_ADAPT_EVERY" ) ? std::atoi( std::getenv( "EXL3_EXPERT_ADAPT_EVERY" ) ) : 64;
+	const int adapt_every = runtime::options().expert_adapt_every;
 	if ( adapt_every > 0 && ++adapt_steps_ >= adapt_every ) {
 		adapt_steps_ = 0;
 		cluster_.rebalance_experts();

@@ -1,4 +1,5 @@
 #include "engine/runtime/cluster.h"
+#include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #if ENGINE_BACKEND_CUDA
 #include "trellis_context.h"
@@ -16,23 +17,23 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	const bool is_glm = ( cfg.model_type == "glm53" || cfg.model_type == "glm" );
 	// EXL3_ARENA_GIB overrides the per-GPU arena. The default of 10 GiB is sized for the quantized
 	// drafter; loading the unquantized one needs roughly twice the weight bytes.
-	const char* arena_env = std::getenv( "EXL3_ARENA_GIB" );
+	const auto& opt = runtime::options();
+	const bool arena_env = opt.arena_gib >= 0;
 	// A tiered GLM (EXL3_EXPERT_CACHE < 1) keeps only that fraction of the routed experts (~26 GiB per rank in all) in the arena
 	size_t glm_gib = 31;
-	if ( is_glm && std::getenv( "EXL3_EXPERT_CACHE" ) ) {
-		const double f = std::atof( std::getenv( "EXL3_EXPERT_CACHE" ) );
+	if ( is_glm ) {
+		const double f = opt.expert_cache;
 		if ( f > 0.0 && f < 1.0 ) glm_gib = static_cast<size_t>( std::ceil( 31.0 - ( 1.0 - f ) * 25.0 ) );
 	}
-	tp_ = std::getenv( "EXL3_TP" ) ? std::atoi( std::getenv( "EXL3_TP" ) ) : cfg.tp;
+	tp_ = opt.tp > 0 ? opt.tp : cfg.tp;
 	// A single-rank group holds the whole model, so the 4-rank defaults are meaningless: take the device's free memory
 	// less a reserve for what lives outside the arena (graphs, trellis workspace, collective scratch, CUDA context).
 	// EXL3_VRAM_RESERVE_MIB overrides the reserve; EXL3_ARENA_GIB or cfg.arena_bytes still win.
 	size_t arena_bytes = cfg.arena_bytes ? cfg.arena_bytes
-		: ( arena_env ? strtoull( arena_env, nullptr, 10 ) : ( is_glm ? glm_gib : 10ULL ) )
+		: ( arena_env ? static_cast<size_t>( opt.arena_gib ) : ( is_glm ? glm_gib : 10ULL ) )
 			* 1024 * 1024 * 1024;
 	if ( tp_ == 1 && !cfg.arena_bytes && !arena_env ) {
-		const char* res_env = std::getenv( "EXL3_VRAM_RESERVE_MIB" );
-		const size_t reserve = ( res_env ? strtoull( res_env, nullptr, 10 ) : 1536ULL ) * 1024 * 1024;
+		const size_t reserve = ( opt.vram_reserve_mib >= 0 ? static_cast<size_t>( opt.vram_reserve_mib ) : 1536ULL ) * 1024 * 1024;
 		const size_t free_bytes = backend::device_free_bytes( 0 );
 		if ( free_bytes > reserve ) {
 			arena_bytes = ( free_bytes - reserve ) & ~( ( size_t ) 0xFFFFF );

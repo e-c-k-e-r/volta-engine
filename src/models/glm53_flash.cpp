@@ -1,4 +1,5 @@
 #include "engine/models/glm53_flash.h"
+#include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
 #include "engine/loader/safetensors.h"
@@ -85,7 +86,7 @@ bool GLM53Pipeline::init(
 	// Routed experts: sharded over the ranks (every rank holds a quarter of every expert's intermediate width, EXL3_MOE_TP,
 	// default) or expert-parallel (72 whole experts per rank, forced by the two-tier expert cache). The sharded layout balances
 	// the load: each active expert costs every rank the same, where expert-parallel waits for the rank that drew the most.
-	moe_tp_ = !( std::getenv( "EXL3_MOE_TP" ) && std::atoi( std::getenv( "EXL3_MOE_TP" ) ) == 0 )
+	moe_tp_ = runtime::options().moe_tp
 		&& engine::modules::ExpertTier::env_fraction() >= 1.0 && config_.tp_size == ENGINE_NUM_GPUS;
 	const int E_local = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
 
@@ -147,7 +148,7 @@ bool GLM53Pipeline::init(
 
 	// 3. MLA KV cache pool [S, 11, max_seq, 16 * 256] FP16 & execution buffers
 	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
-	latent_ = !( std::getenv( "EXL3_MLA_LATENT" ) && std::atoi( std::getenv( "EXL3_MLA_LATENT" ) ) == 0 );
+	latent_ = runtime::options().mla_latent;
 	if ( latent_ ) {
 		latent_slot_stride_ = static_cast<size_t>( config_.num_mla_layers ) * config_.max_seq * 512;
 		latent_cache_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * latent_slot_stride_ * sizeof( backend::half_t ), 128 ) );
@@ -159,7 +160,7 @@ bool GLM53Pipeline::init(
 		q_lat_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lat_shape, 2 );
 		o_lat_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lat_shape, 2 );
 
-		dsa_ = !( std::getenv( "EXL3_DSA" ) && std::atoi( std::getenv( "EXL3_DSA" ) ) == 0 );
+		dsa_ = runtime::options().dsa;
 		if ( dsa_ ) {
 			const int NP = config_.max_seq / engine::modules::DSA::POOL;
 			dsa_plane_stride_ = static_cast<size_t>( config_.num_mla_layers ) * engine::modules::DSA::PLANE_CAP * engine::modules::DSA::PLANE;
@@ -316,9 +317,9 @@ bool GLM53Pipeline::init(
 bool GLM53Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
 	GLM53Config config;
 	// The expanded per-head cache costs 16x the latent: without the latent path the window defaults to 2K
-	if ( std::getenv( "EXL3_MLA_LATENT" ) && std::atoi( std::getenv( "EXL3_MLA_LATENT" ) ) == 0 ) config.max_seq = 2048;
-	if ( const char* env = std::getenv( "EXL3_MAX_SEQ" ) ) config.max_seq = std::atoi( env );  // context window (KV pool size)
-	if ( const char* env = std::getenv( "EXL3_MAX_SLOTS" ) ) config.max_slots = std::atoi( env );
+	if ( !runtime::options().mla_latent ) config.max_seq = 2048;
+	if ( runtime::options().max_seq > 0 ) config.max_seq = runtime::options().max_seq;  // context window (KV pool size)
+	if ( runtime::options().max_slots > 0 ) config.max_slots = runtime::options().max_slots;
 	return init( config, device_id, arena, ring );
 }
 
@@ -328,7 +329,7 @@ bool GLM53Pipeline::rebalance_experts( backend::stream_t stream ) {
 	tier_.reset_window();
 	int moved = 0;
 	for ( int l = 0; l < tier_layers_; ++l ) moved += tier_.rebalance( l, stream );
-	if ( std::getenv( "EXL3_EXPERT_LOG" ) ) {
+	if ( runtime::options().expert_log ) {
 		std::printf( "[experts rank %d] window hit rate %.3f over %llu routes, %d swaps (%llu total)\n", rank_, tier_.hit_rate(),
 			static_cast<unsigned long long>( tier_.window_routes ), moved, static_cast<unsigned long long>( tier_.swaps ) );
 	}
@@ -1021,7 +1022,7 @@ void GLM53Pipeline::forward_body( int m, backend::stream_t stream ) {
 					}
 				}
 				engine::modules::MLALatent::attend( latent_cache_, q_lat, o_lat, mla_idx, config_.max_seq, m, 16, kv_ref, latent_ws_, key_hint_, stream, sel_idx, sel_n );
-				static const bool dsa_diag = std::getenv( "EXL3_DSA_DIAG" ) != nullptr;
+				static const bool dsa_diag = runtime::options().dsa_diag;
 				if ( dsa_diag && sel_idx != nullptr && m > pod::MAX_BATCH && rank_ == 0 ) {
 					// Recall of the dense attention mass by the selection, last row of the chunk (eager prefill only)
 					const int n = key_hint_;
