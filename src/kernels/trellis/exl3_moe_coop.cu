@@ -12,6 +12,11 @@ namespace cg = cooperative_groups;
 #include "exl3_moe_coop.cuh"
 #include "trellis_context.h"
 
+// 1: real Volta m8n8k4 tile (FP32 accumulate); 0: shuffle/HFMA2 emulation of m16n8k16
+#ifndef MOE_COOP_M8N8K4
+#define MOE_COOP_M8N8K4 1
+#endif
+
 namespace exl3_moe_coop_ns {
 
 constexpr int WK = 16;                          // warps per block
@@ -272,8 +277,15 @@ __device__ __forceinline__ void gemv_tile(
 		}
 	}
 
+#if MOE_COOP_M8N8K4
+	float dacc[WNT][2][8] = {};
+	const int r_v = ( lane & 3 ) + 4 * ( lane >= 16 );
+	const bool r_v_ok = r_v < nrows;
+	const size_t a_row_v = r_v_ok ? static_cast<size_t>( rows[r_v] ) * a_stride2 : 0;
+#else
 	FragC_h ch[WNT][2] = {};
 	float2 acc0[WNT][2] = {};
+#endif
 
 	for ( int ib = 0; ib < myn; ib += PF ) {
 		#pragma unroll
@@ -290,6 +302,32 @@ __device__ __forceinline__ void gemv_tile(
 				for ( int l = 0; l < LOADS; ++l ) pf[d][l] = ld_b( i + PF, l );
 			}
 
+#if MOE_COOP_M8N8K4
+			// Real Volta m8n8k4 with FP32 accumulation: lane row (lane&3)+4*(lane>=16), 4 k per step
+			uint32_t va[4][2];
+			#pragma unroll
+			for ( int c = 0; c < 4; ++c ) {
+				va[c][0] = r_v_ok ? *reinterpret_cast<const uint32_t*>( &A2[a_row_v + static_cast<size_t>( ks0 + i ) * 8 + 2 * c + 0] ) : 0;
+				va[c][1] = r_v_ok ? *reinterpret_cast<const uint32_t*>( &A2[a_row_v + static_cast<size_t>( ks0 + i ) * 8 + 2 * c + 1] ) : 0;
+			}
+			#pragma unroll
+			for ( int t = 0; t < WNT; ++t ) {
+				FragB f0, f1;
+				const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+				const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
+				exl3_gemv_ns::dq8_regs_3bits<cb>( awv, bwv, x_s2, f0, f1 );
+				const int cv = ( lane & 3 ) + 4 * ( lane >= 16 );
+				#pragma unroll
+				for ( int s = 0; s < 4; ++s ) {
+					const int half_ = s >> 1;
+					const int src = 4 * cv + 2 * ( s & 1 );
+					const uint32_t e0 = *reinterpret_cast<const uint32_t*>( &f0[half_] );
+					const uint32_t e1 = *reinterpret_cast<const uint32_t*>( &f1[half_] );
+					volta_mma_m8n8k4( va[s][0], va[s][1], __shfl_sync( 0xffffffffu, e0, src ), __shfl_sync( 0xffffffffu, e0, src + 1 ), dacc[t][0] );
+					volta_mma_m8n8k4( va[s][0], va[s][1], __shfl_sync( 0xffffffffu, e1, src ), __shfl_sync( 0xffffffffu, e1, src + 1 ), dacc[t][1] );
+				}
+			}
+#else
 			// A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
 			const size_t a_col = static_cast<size_t>( ks0 + i ) * 8 + ( lane & 3 );
 			FragB a01, a23;
@@ -307,7 +345,9 @@ __device__ __forceinline__ void gemv_tile(
 				exl3_gemv_ns::mma_ab_h( a01, a23, f0, ch[t][0] );
 				exl3_gemv_ns::mma_ab_h( a01, a23, f1, ch[t][1] );
 			}
+#endif
 
+#if !MOE_COOP_M8N8K4
 			if ( ( d + 1 ) % FOLD == 0 || i + 1 == myn ) {
 				#pragma unroll
 				for ( int t = 0; t < WNT; ++t ) {
@@ -319,9 +359,27 @@ __device__ __forceinline__ void gemv_tile(
 					}
 				}
 			}
+#endif
 		}
 	}
 
+#if MOE_COOP_M8N8K4
+	{
+		float* red = sh_red + wk * ROWS * TCOLS + wn * COLS;
+		#pragma unroll
+		for ( int t = 0; t < WNT; ++t ) {
+			#pragma unroll
+			for ( int reg = 0; reg < 8; ++reg ) {
+				int m, n;
+				volta_d_slot( lane, reg, &m, &n );
+				if ( m < ROWS ) {
+					red[m * TCOLS + t * 16 + n] = dacc[t][0][reg];
+					red[m * TCOLS + t * 16 + 8 + n] = dacc[t][1][reg];
+				}
+			}
+		}
+	}
+#else
 	// Cross-warp reduction over the k splits. Lane l holds row l/4, cols tile*16 + frag*8 + 2*(l%4) (+1)
 	if ( r0_ok ) {
 		const int c0 = 2 * ( lane & 3 );
@@ -336,6 +394,7 @@ __device__ __forceinline__ void gemv_tile(
 			}
 		}
 	}
+#endif
 	__syncthreads();
 
 	for ( int o = threadIdx.x; o < TCOLS * nrows; o += THREADS ) {
