@@ -16,7 +16,8 @@
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	const char* dir = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
-	const int H = 4096, I = 2048, E = 72, K = 8, L = 3;
+	const bool shard = std::getenv( "BENCH_SHARD" ) != nullptr; // every expert a quarter wide (rank 0 of 4), all 288 local
+	const int H = 4096, I = 2048, E = shard ? 288 : 72, K = 8, L = 3;
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	engine::modules::trellis_context_init_all();
 	engine::modules::trellis_get_workspace( 0, 16 * 1024 * 1024 );
@@ -34,11 +35,11 @@ int main( int argc, char** argv ) {
 	char name[256];
 	for ( int e = 0; e < E; ++e ) {
 		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, e );
-		mw.gate[e] = repo.load_linear( name, arena, 4, stream );
+		mw.gate[e] = shard ? repo.load_linear_slice( name, arena, 4, 1, 0, 4, stream ) : repo.load_linear( name, arena, 4, stream );
 		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, e );
-		mw.up[e] = repo.load_linear( name, arena, 4, stream );
+		mw.up[e] = shard ? repo.load_linear_slice( name, arena, 4, 1, 0, 4, stream ) : repo.load_linear( name, arena, 4, stream );
 		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, e );
-		mw.down[e] = repo.load_linear( name, arena, 4, stream );
+		mw.down[e] = shard ? repo.load_linear_slice( name, arena, 4, 0, 0, 4, stream ) : repo.load_linear( name, arena, 4, stream );
 	}
 	engine::modules::MoE::init_device_ptrs( mw, arena, stream );
 	std::printf( "[*] experts: bits g/u/d = %d/%d/%d, mul1 g/u/d = %d/%d/%d\n",

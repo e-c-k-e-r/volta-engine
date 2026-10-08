@@ -716,13 +716,21 @@ void exl3_moe(
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 256, 2, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 256, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		attr_set[device] = true;
 	}
 
 	// The wide kernel carries the 16-row GEMM tile as well; keeping it out of the decode kernel preserves its registers
+	// Output-tile width of the expert GEMMs: 256 is 18-29% faster than 128 below 64 rows on both the sharded and the whole-expert
+	// layouts (fewer K-split reductions per weight decoded) and level at 512; EXL3_MOE_TILE_N=128 selects the old tile
+	static const int tile_n = std::getenv( "EXL3_MOE_TILE_N" ) ? std::atoi( std::getenv( "EXL3_MOE_TILE_N" ) ) : 256;
+	void* moe_fn = tile_n == 128
+		? ( wide == 2 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<3, 128, 2, 0> )
+		: ( wide == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0> );
 	CUDA_CHECK( cudaLaunchKernel(
-		wide == 2 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<3, 128, 2, 0>,
+		moe_fn,
 		grid_dim,
 		dim3( block_dim ),
 		kernel_args,
