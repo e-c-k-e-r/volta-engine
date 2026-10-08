@@ -54,7 +54,8 @@ void exl3_gemm(
 	bool mcg,
 	bool mul1,
 	bool c_fp32,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int force_shape
 ) {
 	int device = 0;
 	cudaGetDevice( &device );
@@ -79,7 +80,7 @@ void exl3_gemm(
 		(void*) &svh
 	};
 
-	if ( size_m <= 8 && size_n < 4096 && size_k % 128 == 0 && size_n % 128 == 0 ) {
+	if ( force_shape <= 0 && size_m <= 8 && size_n < 4096 && size_k % 128 == 0 && size_n % 128 == 0 ) {
 		if ( exl3_gemv_try_launch(
 			kernel_args,
 			size_m,
@@ -99,7 +100,7 @@ void exl3_gemm(
 	}
 
 	int block_dim = 0;
-	int shape_idx = select_gemm_shape( cc, size_m, size_k, size_n, K, false, 1, 1 );
+	int shape_idx = force_shape > 0 ? force_shape : select_gemm_shape( cc, size_m, size_k, size_n, K, false, 1, 1 );
 	fp_exl3_gemm_kernel kernel = select_exl3_gemm_kernel(
 		cc,
 		size_m,

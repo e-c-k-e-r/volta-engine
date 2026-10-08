@@ -7,6 +7,7 @@
 #include "engine/modules/mla.h"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 int main() {
@@ -26,7 +27,7 @@ int main() {
 	CUDA_CHECK( cudaMemcpy( h_w.data(), kv_b.data, h_w.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
 
 	bool all_ok = true;
-	for ( int scenario = 0; scenario < 4; ++scenario ) {
+	for ( int scenario = 0; scenario < ( std::getenv( "MLA_TIME" ) ? 0 : 4 ); ++scenario ) {
 		const int max_seq = ( scenario & 1 ) ? 3072 : 1024;
 		const int N = max_seq - 40; // tokens in the cache
 		uint32_t seed = 4242u + max_seq;
@@ -130,6 +131,31 @@ int main() {
 		std::printf( "  %s max_seq %d (%d cached tokens, %d chunks): cos=%.6f max_abs=%.4f (|ref|max=%.3f) %s\n", scenario >= 2 ? "prefill" : "decode ", max_seq, N,
 			engine::modules::MLALatent::workspace_chunks( max_seq ), cosine, maxabs, maxref, ok ? "ok" : "FAIL" );
 		cudaFree( d_cache ); cudaFree( d_c ); cudaFree( d_q ); cudaFree( d_qlat ); cudaFree( d_olat ); cudaFree( d_out ); cudaFree( d_ws ); cudaFree( d_rows );
+	}
+	if ( std::getenv( "MLA_TIME" ) ) {
+		half* d_a; half* d_b; half* d_c2;
+		CUDA_CHECK( cudaMalloc( &d_a, 512ull * H * LORA * sizeof( half ) ) );
+		CUDA_CHECK( cudaMalloc( &d_b, 512ull * H * LORA * sizeof( half ) ) );
+		CUDA_CHECK( cudaMalloc( &d_c2, 512ull * H * LORA * sizeof( half ) ) );
+		CUDA_CHECK( cudaMemset( d_a, 0, 512ull * H * LORA * sizeof( half ) ) );
+		cudaEvent_t e0, e1;
+		cudaEventCreate( &e0 ); cudaEventCreate( &e1 );
+		for ( int R : { 1, 8, 64, 512 } ) {
+			pod::TensorView qt = pod::make_tensor_2d( d_a, pod::DType::FP16, R, H * HD );
+			pod::TensorView ql = pod::make_tensor_2d( d_b, pod::DType::FP16, R, H * LORA );
+			pod::TensorView ot = pod::make_tensor_2d( d_c2, pod::DType::FP16, R, H * HD );
+			float ms[2];
+			for ( int k = 0; k < 2; ++k ) {
+				for ( int it = 0; it < 22; ++it ) {
+					if ( it == 2 ) cudaEventRecord( e0, stream );
+					if ( k == 0 ) engine::modules::MLALatent::absorb_q( qt, kv_b, ql, H, R, stream );
+					else engine::modules::MLALatent::expand_out( ql, kv_b, ot, H, R, stream );
+				}
+				cudaEventRecord( e1, stream ); cudaEventSynchronize( e1 );
+				cudaEventElapsedTime( &ms[k], e0, e1 );
+			}
+			std::printf( "  rows %3d: absorb_q %.1f us  expand_out %.1f us\n", R, ms[0] * 50.0f, ms[1] * 50.0f );
+		}
 	}
 	std::printf( "%s absorbed MLA parity\n", all_ok ? "[+] PASS" : "[-] FAIL" );
 	return all_ok ? 0 : 1;

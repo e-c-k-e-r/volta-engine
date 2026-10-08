@@ -17,7 +17,8 @@ void exl3_gemm(
 	bool mcg,
 	bool mul1,
 	bool c_fp32 = false,
-	cudaStream_t stream = nullptr
+	cudaStream_t stream = nullptr,
+	int force_shape = 0 // > 0: tile shape 1..4, skips the small-n GEMV attempt
 );
 
 void exl3_gemm_init_all_attrs( int device );

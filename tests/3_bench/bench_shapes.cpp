@@ -42,6 +42,9 @@ int main() {
 	engine::modules::trellis_get_locks( 0 );
 
 	const impl::Shape shapes[] = {
+		{ "glm k4096 n6144", 4096, 6144, 5 }, { "glm k4096 n4096", 4096, 4096, 5 }, { "glm k2048 n4096", 2048, 4096, 5 },
+		{ "glm k1536 n4096", 1536, 4096, 5 }, { "glm k4096 n2048", 4096, 2048, 5 }, { "glm k4096 n1536", 4096, 1536, 5 },
+		{ "glm k4096 n512", 4096, 512, 5 },
 		{ "glm expert g/u", 4096, 2048, 3 }, { "glm expert down", 2048, 4096, 3 },
 		{ "mlp gate/up", 5120, 4352, 4 }, { "mlp down", 4352, 5120, 4 },
 		{ "gdn qkv", 5120, 2560, 4 }, { "gdn z", 5120, 1536, 4 }, { "gdn out", 1536, 5120, 4 },
@@ -81,6 +84,29 @@ int main() {
 			const float tg = impl::time_ms( [&]() { exl3_gemm( A, B, C, suh, A_had, svh, m, sh.k, sh.n, sh.bits, false, true, false, s ); }, s, 50 );
 			std::printf( "%-15s k%-5d n%-6d %db M=%d  %7.1f MB | gemv %8.1f us %6.0f GB/s | gemm %8.1f us %6.0f GB/s\n",
 				sh.name, sh.k, sh.n, sh.bits, m, mb, tv * 1e3, mb / tv, tg * 1e3, mb / tg );
+		}
+		// Tile shape sweep of the GEMM at M=4 and M=8 over enough distinct weight copies to defeat the L2 (as in the model, where
+		// every layer's matrix is cold). Shape 0 = default selection, gemv = the GEMV kernel.
+		{
+			const int nb = static_cast<int>( MAX( 2ULL, MIN( 24ULL, ( 48ULL << 20 ) / ( words * 2 ) + 1 ) ) );
+			std::vector<uint16_t*> Bc( nb );
+			Bc[0] = B;
+			for ( int b = 1; b < nb; ++b ) {
+				Bc[b] = static_cast<uint16_t*>( engine::core::arena_alloc( arena, words * 2 ) );
+				CUDA_CHECK( cudaMemcpy( Bc[b], B, words * 2, cudaMemcpyDeviceToDevice ) );
+			}
+			for ( int m : { 4, 8 } ) {
+				float t[5], tg;
+				int it = 0;
+				for ( int pass = 0; pass < 2; ++pass ) {
+					for ( int sh_i = 0; sh_i <= 4; ++sh_i ) {
+						if ( sh_i > 0 && ( sh.k % ( sh_i == 1 || sh_i == 4 ? 16 : 32 ) || sh.n % ( sh_i == 1 || sh_i == 2 ? 128 : sh_i == 3 ? 256 : 512 ) ) ) { t[sh_i] = 0; continue; }
+						t[sh_i] = impl::time_ms( [&]() { exl3_gemm( A, Bc[it++ % nb], C, suh, A_had, svh, m, sh.k, sh.n, sh.bits, false, true, false, s, sh_i ); }, s, 100 );
+					}
+					tg = impl::time_ms( [&]() { exl3_gemv( A, Bc[it++ % nb], C, suh, A_had, svh, m, sh.k, sh.n, sh.bits, false, true, false, s ); }, s, 100 );
+				}
+				std::printf( "%-15s cold sweep M=%d  gemv %6.1f | default-gemm %6.1f | shape1 %6.1f shape2 %6.1f shape3 %6.1f shape4 %6.1f us\n", sh.name, m, tg * 1e3, t[0] * 1e3, t[1] * 1e3, t[2] * 1e3, t[3] * 1e3, t[4] * 1e3 );
+			}
 		}
 		// Row consistency: row r of an M=2 call against the same row run alone at M=1.
 		{

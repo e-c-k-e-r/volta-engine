@@ -84,8 +84,16 @@ void LinearTrellis::forward(
 	const half* suh_ptr = suh.ptr<const half>();
 	const half* svh_ptr = svh.ptr<const half>();
 
+	// GLM 5-bit n=6144 projection (the KDA input) at 4..8 rows: the emulated-MMA GEMV falls to ~120 GB/s while the 16x512 tensor-core
+	// GEMM tile keeps ~190 (bench_shapes cold sweep over 24 weight copies: 129 -> 82 us). Every other shape measures level or
+	// better on the GEMV with cold weights (the L2-resident loop of a single matrix says otherwise and is misleading).
+	int gemm_shape = 0;
+	if ( bits == 5 && m >= 4 && m <= 8 && mul1 && !c_fp32 && n == 6144 && ( k % 16 == 0 ) && getenv( "EXL3_GEMV_M8" ) == nullptr ) gemm_shape = 4;
 	if ( recon_threshold() > 0 && m > recon_threshold() && !c_fp32 && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 		forward_recon( x, trellis, suh, svh, out, bits, mcg, mul1, stream );
+	}
+	else if ( gemm_shape > 0 ) {
+		exl3_gemm( x_ptr, trellis_ptr, out_ptr, suh_ptr, A_had, svh_ptr, m, k, n, bits, mcg, mul1, c_fp32, stream, gemm_shape );
 	}
 	else if ( m <= 8 && ( m == 1 || m == 2 || m == 4 || m == 8 ) && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 		exl3_gemv(

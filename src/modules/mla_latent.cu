@@ -1,8 +1,11 @@
 #include "engine/modules/mla.h"
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+
+namespace wmma = nvcuda::wmma;
 
 namespace engine::modules {
 
@@ -12,77 +15,102 @@ constexpr int LORA = MLALatent::LORA;
 constexpr int HD = MLALatent::HEAD;
 constexpr int ROWG = 16; // rows per pass of the projection kernels
 
-// q_lat[r][h][c] = sum_d q[r][h][d] * W_UK[h][d][c]. Block = (head, 64-column slice), 32 threads of 2 columns; the q rows of
-// a group of 16 are staged in shared memory, the weight column slice streams once per group.
-__global__ __launch_bounds__( 32 )
+// Both projections are per-head GEMMs on tensor cores (m16n16k16, FP32 accumulate). A block owns (head, 16 output columns, up to
+// RCH rows); its four warps split the contraction four ways and the partial tiles are summed through shared memory, so the weight
+// streams over 16 x heads x (columns / 16) blocks even for a single decode row.
+constexpr int RCH = 64; // rows per block
+constexpr int APAD = 8;
+
+// q_lat[r][h][c] = sum_d q[r][h][d] * W_UK[h][d][c]  (W_UK rows d, row-major over c; K rows come first in kv_b)
+__global__ __launch_bounds__( 128 )
 void absorb_q_kernel( const half* __restrict__ q, const half* __restrict__ kv_b, half* __restrict__ q_lat, int heads, int rows ) {
-	__shared__ float sq[ROWG][HD];
+	__shared__ __align__( 32 ) half sa[ROWG][HD + APAD];
+	__shared__ __align__( 32 ) float sc[4][ROWG * 16];
 	const int h = blockIdx.x;
-	const int c0 = blockIdx.y * 64 + threadIdx.x * 2;
-	const half* w = kv_b + static_cast<size_t>( h ) * 2 * HD * LORA; // K rows first
-	for ( int r0 = 0; r0 < rows; r0 += ROWG ) {
-		const int nr = min( ROWG, rows - r0 );
+	const int c0 = blockIdx.y * 16;
+	const int warp = threadIdx.x >> 5;
+	const int rbeg = blockIdx.z * RCH;
+	const int rend = min( rows, rbeg + RCH );
+	const half* w = kv_b + static_cast<size_t>( h ) * 2 * HD * LORA + c0;
+	for ( int r0 = rbeg; r0 < rend; r0 += ROWG ) {
+		const int nr = min( ROWG, rend - r0 );
 		__syncthreads();
-		for ( int i = threadIdx.x; i < nr * HD; i += 32 ) {
-			const int r = i / HD, d = i % HD;
-			sq[r][d] = __half2float( q[( static_cast<size_t>( r0 + r ) * heads + h ) * HD + d] );
+		for ( int i = threadIdx.x; i < ROWG * ( HD / 8 ); i += 128 ) {
+			const int r = i / ( HD / 8 ), v = i % ( HD / 8 );
+			uint4 val = make_uint4( 0, 0, 0, 0 );
+			if ( r < nr ) val = *reinterpret_cast<const uint4*>( q + ( static_cast<size_t>( r0 + r ) * heads + h ) * HD + v * 8 );
+			*reinterpret_cast<uint4*>( &sa[r][v * 8] ) = val;
 		}
 		__syncthreads();
-		float acc[ROWG][2];
+		wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa[HD / 64];
+		wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> fb[HD / 64];
+		wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+		wmma::fill_fragment( acc, 0.0f );
 		#pragma unroll
-		for ( int r = 0; r < ROWG; ++r ) { acc[r][0] = 0.0f; acc[r][1] = 0.0f; }
-		for ( int d = 0; d < HD; ++d ) {
-			const float2 wf = __half22float2( *reinterpret_cast<const half2*>( w + static_cast<size_t>( d ) * LORA + c0 ) );
-			#pragma unroll
-			for ( int r = 0; r < ROWG; ++r ) {
-				const float qv = sq[r][d];
-				acc[r][0] = fmaf( qv, wf.x, acc[r][0] );
-				acc[r][1] = fmaf( qv, wf.y, acc[r][1] );
-			}
+		for ( int ks = 0; ks < HD / 64; ++ks ) {
+			const int kk = warp * ( HD / 4 ) + ks * 16;
+			wmma::load_matrix_sync( fb[ks], w + static_cast<size_t>( kk ) * LORA, LORA );
+			wmma::load_matrix_sync( fa[ks], &sa[0][kk], HD + APAD );
 		}
-		for ( int r = 0; r < nr; ++r ) {
-			*reinterpret_cast<half2*>( q_lat + ( static_cast<size_t>( r0 + r ) * heads + h ) * LORA + c0 ) = __floats2half2_rn( acc[r][0], acc[r][1] );
+		#pragma unroll
+		for ( int ks = 0; ks < HD / 64; ++ks ) wmma::mma_sync( acc, fa[ks], fb[ks], acc );
+		wmma::store_matrix_sync( sc[warp], acc, 16, wmma::mem_row_major );
+		__syncthreads();
+		{
+			const int idx = threadIdx.x * 2;
+			const int r = idx >> 4, c = idx & 15;
+			if ( r < nr ) {
+				const float x = sc[0][idx] + sc[1][idx] + sc[2][idx] + sc[3][idx];
+				const float y = sc[0][idx + 1] + sc[1][idx + 1] + sc[2][idx + 1] + sc[3][idx + 1];
+				*reinterpret_cast<half2*>( q_lat + ( static_cast<size_t>( r0 + r ) * heads + h ) * LORA + c0 + c ) = __floats2half2_rn( x, y );
+			}
 		}
 	}
 }
 
-// out[r][h][v] = sum_c W_UV[h][v][c] * o_lat[r][h][c]. Block = (head, 64 values), one thread per value streaming its 1 KiB weight
-// row once per group of 16 rows (o_lat of the group staged in shared memory).
-__global__ __launch_bounds__( 64 )
+// out[r][h][v] = sum_c W_UV[h][v][c] * o_lat[r][h][c]  (V rows follow the K rows; B read column-major: element (c, v) at v * LORA + c)
+__global__ __launch_bounds__( 128 )
 void expand_out_kernel( const half* __restrict__ o_lat, const half* __restrict__ kv_b, half* __restrict__ out, int heads, int rows ) {
-	__shared__ float so[ROWG][LORA];
+	__shared__ __align__( 32 ) half so[ROWG][LORA + APAD];
+	__shared__ __align__( 32 ) float sc[4][ROWG * 16];
 	const int h = blockIdx.x;
-	const int v = blockIdx.y * 64 + threadIdx.x;
-	const half* w = kv_b + ( static_cast<size_t>( h ) * 2 * HD + HD + v ) * LORA; // V rows follow the K rows
-	for ( int r0 = 0; r0 < rows; r0 += ROWG ) {
-		const int nr = min( ROWG, rows - r0 );
+	const int v0 = blockIdx.y * 16;
+	const int warp = threadIdx.x >> 5;
+	const int rbeg = blockIdx.z * RCH;
+	const int rend = min( rows, rbeg + RCH );
+	const half* w = kv_b + ( static_cast<size_t>( h ) * 2 * HD + HD + v0 ) * LORA;
+	for ( int r0 = rbeg; r0 < rend; r0 += ROWG ) {
+		const int nr = min( ROWG, rend - r0 );
 		__syncthreads();
-		for ( int i = threadIdx.x; i < nr * LORA; i += 64 ) {
-			const int r = i / LORA, c = i % LORA;
-			so[r][c] = __half2float( o_lat[( static_cast<size_t>( r0 + r ) * heads + h ) * LORA + c] );
+		for ( int i = threadIdx.x; i < ROWG * ( LORA / 8 ); i += 128 ) {
+			const int r = i / ( LORA / 8 ), v = i % ( LORA / 8 );
+			uint4 val = make_uint4( 0, 0, 0, 0 );
+			if ( r < nr ) val = *reinterpret_cast<const uint4*>( o_lat + ( static_cast<size_t>( r0 + r ) * heads + h ) * LORA + v * 8 );
+			*reinterpret_cast<uint4*>( &so[r][v * 8] ) = val;
 		}
 		__syncthreads();
-		float acc[ROWG];
+		wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa[LORA / 64];
+		wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb[LORA / 64];
+		wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+		wmma::fill_fragment( acc, 0.0f );
 		#pragma unroll
-		for ( int r = 0; r < ROWG; ++r ) acc[r] = 0.0f;
-		for ( int c = 0; c < LORA; c += 8 ) {
-			const uint4 raw = *reinterpret_cast<const uint4*>( w + c );
-			const half2* w2 = reinterpret_cast<const half2*>( &raw );
-			float wf[8];
-			#pragma unroll
-			for ( int i = 0; i < 4; ++i ) {
-				const float2 f = __half22float2( w2[i] );
-				wf[2 * i] = f.x;
-				wf[2 * i + 1] = f.y;
-			}
-			#pragma unroll
-			for ( int r = 0; r < ROWG; ++r ) {
-				#pragma unroll
-				for ( int i = 0; i < 8; ++i ) acc[r] = fmaf( wf[i], so[r][c + i], acc[r] );
-			}
+		for ( int ks = 0; ks < LORA / 64; ++ks ) {
+			const int kk = warp * ( LORA / 4 ) + ks * 16;
+			wmma::load_matrix_sync( fb[ks], w + kk, LORA );
+			wmma::load_matrix_sync( fa[ks], &so[0][kk], LORA + APAD );
 		}
-		for ( int r = 0; r < nr; ++r ) {
-			out[( static_cast<size_t>( r0 + r ) * heads + h ) * HD + v] = __float2half_rn( acc[r] );
+		#pragma unroll
+		for ( int ks = 0; ks < LORA / 64; ++ks ) wmma::mma_sync( acc, fa[ks], fb[ks], acc );
+		wmma::store_matrix_sync( sc[warp], acc, 16, wmma::mem_row_major );
+		__syncthreads();
+		{
+			const int idx = threadIdx.x * 2;
+			const int r = idx >> 4, c = idx & 15;
+			if ( r < nr ) {
+				const float x = sc[0][idx] + sc[1][idx] + sc[2][idx] + sc[3][idx];
+				const float y = sc[0][idx + 1] + sc[1][idx + 1] + sc[2][idx + 1] + sc[3][idx + 1];
+				*reinterpret_cast<half2*>( out + ( static_cast<size_t>( r0 + r ) * heads + h ) * HD + v0 + c ) = __floats2half2_rn( x, y );
+			}
 		}
 	}
 }
@@ -796,11 +824,11 @@ void latent_reduce_kernel( const float* __restrict__ workspace, half* __restrict
 } // namespace
 
 void MLALatent::absorb_q( const pod::TensorView& q, const pod::TensorView& kv_b, pod::TensorView& q_lat, int heads, int rows, cudaStream_t stream ) {
-	absorb_q_kernel<<<dim3( heads, LORA / 64 ), dim3( 32 ), 0, stream>>>( q.ptr<const half>(), kv_b.ptr<const half>(), q_lat.ptr<half>(), heads, rows );
+	absorb_q_kernel<<<dim3( heads, LORA / 16, ( rows + RCH - 1 ) / RCH ), dim3( 128 ), 0, stream>>>( q.ptr<const half>(), kv_b.ptr<const half>(), q_lat.ptr<half>(), heads, rows );
 }
 
 void MLALatent::expand_out( const pod::TensorView& o_lat, const pod::TensorView& kv_b, pod::TensorView& out, int heads, int rows, cudaStream_t stream ) {
-	expand_out_kernel<<<dim3( heads, HEAD / 64 ), dim3( 64 ), 0, stream>>>( o_lat.ptr<const half>(), kv_b.ptr<const half>(), out.ptr<half>(), heads, rows );
+	expand_out_kernel<<<dim3( heads, HEAD / 16, ( rows + RCH - 1 ) / RCH ), dim3( 128 ), 0, stream>>>( o_lat.ptr<const half>(), kv_b.ptr<const half>(), out.ptr<half>(), heads, rows );
 }
 
 void MLALatent::store( half* cache, const pod::TensorView& c, int layer, int max_seq, int rows, const pod::SlotRef& slot, cudaStream_t stream ) {
