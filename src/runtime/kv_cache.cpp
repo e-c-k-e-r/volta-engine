@@ -1,4 +1,5 @@
 #include "engine/runtime/kv_cache.h"
+#include "engine/backend/runtime.h"
 #include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
@@ -16,7 +17,7 @@ bool KVCachePool::init(
 	int head_dim_in,
 	pod::KVFormat format_in
 ) {
-	CUDA_CHECK( cudaSetDevice( device_id ) );
+	backend::set_device( device_id );
 
 	max_slots = max_slots_in;
 	max_seq_len = max_seq_len_in;
@@ -48,10 +49,10 @@ bool KVCachePool::init(
 		return false;
 	}
 
-	CUDA_CHECK( cudaMemset( k_data, 0, static_cast<size_t>( max_slots ) * k_slot_bytes ) );
-	CUDA_CHECK( cudaMemset( v_data, 0, static_cast<size_t>( max_slots ) * v_slot_bytes ) );
-	if ( k_scale ) CUDA_CHECK( cudaMemset( k_scale, 0, static_cast<size_t>( max_slots ) * k_scale_slot_bytes ) );
-	if ( v_scale ) CUDA_CHECK( cudaMemset( v_scale, 0, static_cast<size_t>( max_slots ) * v_scale_slot_bytes ) );
+	backend::memset_sync( k_data, 0, static_cast<size_t>( max_slots ) * k_slot_bytes );
+	backend::memset_sync( v_data, 0, static_cast<size_t>( max_slots ) * v_slot_bytes );
+	if ( k_scale ) backend::memset_sync( k_scale, 0, static_cast<size_t>( max_slots ) * k_scale_slot_bytes );
+	if ( v_scale ) backend::memset_sync( v_scale, 0, static_cast<size_t>( max_slots ) * v_scale_slot_bytes );
 	return true;
 }
 
@@ -85,15 +86,15 @@ void* KVCachePool::get_v_ptr( int slot_id, int layer_idx, int pos ) {
 	return static_cast<char*>( v_data ) + elem * sizeof( half );
 }
 
-void KVCachePool::reset_slot( int slot_id, cudaStream_t stream ) {
+void KVCachePool::reset_slot( int slot_id, backend::stream_t stream ) {
 	if ( !k_data || !v_data || slot_id >= max_slots ) {
 		return;
 	}
 	auto clear = [&]( void* base, size_t slot_bytes ) {
 		if ( !base || slot_bytes == 0 ) return;
 		char* p = static_cast<char*>( base ) + static_cast<size_t>( slot_id ) * slot_bytes;
-		if ( stream ) CUDA_CHECK( cudaMemsetAsync( p, 0, slot_bytes, stream ) );
-		else CUDA_CHECK( cudaMemset( p, 0, slot_bytes ) );
+		if ( stream ) backend::memset_async( p, 0, slot_bytes, stream );
+		else backend::memset_sync( p, 0, slot_bytes );
 	};
 	clear( k_data, k_slot_bytes );
 	clear( v_data, v_slot_bytes );

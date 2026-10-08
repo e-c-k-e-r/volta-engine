@@ -1,4 +1,5 @@
 #include "engine/runtime/dflash2_runner.h"
+#include "engine/backend/runtime.h"
 #include "engine/runtime/cluster.h"
 #include <chrono>
 #include <cstdio>
@@ -82,7 +83,7 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 	tp_ = ( tp_env && tp_env[0] == '0' ) ? 1 : ENGINE_NUM_GPUS;
 	bool loaded = true;
 	for ( int d = 0; d < tp_; ++d ) {
-		CUDA_CHECK( cudaSetDevice( d ) );
+		backend::set_device( d );
 		spec_[d].set_candidate_ranks( ENGINE_NUM_GPUS );
 		if ( tp_ > 1 ) spec_[d].set_ring( mc.ring( d ) );
 		if ( !spec_[d].init( cfg, d, mc.arena( d ), mc.stream( d ), d, tp_ ) ) return false;
@@ -94,7 +95,7 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 
 void DFlash2Runner::shutdown() {
 	for ( int d = 0; d < tp_; ++d ) {
-		CUDA_CHECK( cudaSetDevice( d ) );
+		backend::set_device( d );
 		spec_[d].destroy();
 	}
 	mc_ = nullptr;
@@ -111,8 +112,8 @@ void DFlash2Runner::claim( int slot ) {
 		const int v = slot;
 		const auto& hk = mc_->model( d ).draft_hooks();
 		// Pageable source: staged before return, and the sync below orders it before any forward.
-		CUDA_CHECK( cudaMemcpyAsync( hk.taps_owner, &v, sizeof( int ), cudaMemcpyHostToDevice, mc_->stream( d ) ) );
-		CUDA_CHECK( cudaStreamSynchronize( mc_->stream( d ) ) );
+		backend::memcpy_async( hk.taps_owner, &v, sizeof( int ), backend::Copy::H2D, mc_->stream( d ) );
+		backend::stream_sync( mc_->stream( d ) );
 	} );
 }
 
@@ -130,7 +131,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	constexpr int K = M - 1;
 	ModelCluster& mc = *mc_;
 	const auto& meta = mc.metadata();
-	const cudaStream_t s0 = mc.stream( 0 );
+	const backend::stream_t s0 = mc.stream( 0 );
 	SpecResult res;
 	const bool sampled = sp != nullptr && !sp->greedy();
 	ENGINE_ASSERT( !sampled || rng != nullptr, "DFlash2Runner::speculate: sampling needs an Rng" );
@@ -147,23 +148,23 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		mc.run_ranks( [&]( int d ) {
 			const auto& hk = mc.model( d ).draft_hooks();
 			spec_[d].draft_backbone( *hk.embedding, anchor, hk.taps, pos, hk.taps_cap, mc.stream( d ) );
-			CUDA_CHECK( cudaMemcpyAsync( hk.lm_in, spec_[d].draft_hidden().data, hid_bytes, cudaMemcpyDeviceToDevice, mc.stream( d ) ) );
+			backend::memcpy_async( hk.lm_in, spec_[d].draft_hidden().data, hid_bytes, backend::Copy::D2D, mc.stream( d ) );
 			mc.model( d ).draft_head_topk( M, mc.stream( d ) );
-			CUDA_CHECK( cudaStreamSynchronize( mc.stream( d ) ) );
+			backend::stream_sync( mc.stream( d ) );
 		} );
 	}
 	else {
-		CUDA_CHECK( cudaSetDevice( 0 ) );
+		backend::set_device( 0 );
 		spec_[0].draft_backbone( *hk0.embedding, anchor, hk0.taps, pos, hk0.taps_cap, s0 );
 		// Peer the hidden rows to every rank, then run each rank's head shard on its own worker/stream.
 		const pod::TensorView& dh = spec_[0].draft_hidden();
 		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-			CUDA_CHECK( cudaMemcpyPeerAsync( mc.model( d ).draft_hooks().lm_in, d, dh.ptr<const half>(), 0, hid_bytes, s0 ) );
+			backend::peer_copy_async( mc.model( d ).draft_hooks().lm_in, d, dh.ptr<const half>(), 0, hid_bytes, s0 );
 		}
-		CUDA_CHECK( cudaStreamSynchronize( s0 ) );
+		backend::stream_sync( s0 );
 		mc.run_ranks( [&]( int d ) {
 			mc.model( d ).draft_head_topk( M, mc.stream( d ) );
-			CUDA_CHECK( cudaStreamSynchronize( mc.stream( d ) ) );
+			backend::stream_sync( mc.stream( d ) );
 		} );
 	}
 
@@ -178,10 +179,10 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 			const int H = mc.metadata().hidden_size;
 			ENGINE_ASSERT( pos <= hk0.taps_cap, "dump: context longer than the tap ring" );
 			std::vector<half> taps( static_cast<size_t>( pos ) * 5 * H ), hid( static_cast<size_t>( M ) * H );
-			CUDA_CHECK( cudaSetDevice( 0 ) );
-			CUDA_CHECK( cudaStreamSynchronize( s0 ) );
-			CUDA_CHECK( cudaMemcpy( taps.data(), hk0.taps, taps.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
-			CUDA_CHECK( cudaMemcpy( hid.data(), spec_[0].draft_hidden().data, hid.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+			backend::set_device( 0 );
+			backend::stream_sync( s0 );
+			backend::memcpy_sync( taps.data(), hk0.taps, taps.size() * sizeof( half ), backend::Copy::D2H );
+			backend::memcpy_sync( hid.data(), spec_[0].draft_hidden().data, hid.size() * sizeof( half ), backend::Copy::D2H );
 			FILE* f = std::fopen( "/tmp/draft_dump.bin", "wb" );
 			const int hdr[4] = { pos, anchor, H, hk0.taps_cap };
 			std::fwrite( hdr, sizeof( int ), 4, f );
@@ -195,11 +196,11 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	// Bring the small [M, k] results to rank 0 and merge.
 	const size_t val_bytes = static_cast<size_t>( M ) * models::kDraftTopK * sizeof( float );
 	const size_t idx_bytes = static_cast<size_t>( M ) * models::kDraftTopK * sizeof( int );
-	CUDA_CHECK( cudaSetDevice( 0 ) );
+	backend::set_device( 0 );
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		const auto& hk = mc.model( d ).draft_hooks();
-		CUDA_CHECK( cudaMemcpyPeerAsync( spec_[0].merged_cand_values_ptr( d ), 0, hk.cand_vals, d, val_bytes, s0 ) );
-		CUDA_CHECK( cudaMemcpyPeerAsync( spec_[0].merged_cand_indices_ptr( d ), 0, hk.cand_idx, d, idx_bytes, s0 ) );
+		backend::peer_copy_async( spec_[0].merged_cand_values_ptr( d ), 0, hk.cand_vals, d, val_bytes, s0 );
+		backend::peer_copy_async( spec_[0].merged_cand_indices_ptr( d ), 0, hk.cand_idx, d, idx_bytes, s0 );
 	}
 	engine::spec::dflash2_topk_merge(
 		spec_[0].merged_cand_values_ptr( 0 ), spec_[0].merged_cand_indices_ptr( 0 ),
@@ -212,9 +213,9 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	spec_[0].set_walk_anchor( anchor, s0 );
 	spec_[0].draft_select( spec_[0].merged_final_values_ptr(), spec_[0].merged_final_indices_ptr(), K, s0 );
 	int h_draft[M];
-	CUDA_CHECK( cudaMemcpyAsync( h_draft, spec_[0].d_draft_tokens(), sizeof( h_draft ), cudaMemcpyDeviceToHost, s0 ) );
-	CUDA_CHECK( cudaStreamSynchronize( s0 ) );
-	CUDA_CHECK( cudaGetLastError() );
+	backend::memcpy_async( h_draft, spec_[0].d_draft_tokens(), sizeof( h_draft ), backend::Copy::D2H, s0 );
+	backend::stream_sync( s0 );
+	backend::check_last_error();
 
 	// Depth: the whole block by default (what DFlash2 does natively). depth_threshold > 0 enables the
 	// survival-EMA truncation; it is a throughput option, off by default so acceptance is measurable.
@@ -290,9 +291,9 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		constexpr int kTop = models::kDraftTopK;
 		float hv[M * kTop];
 		int hi[M * kTop];
-		CUDA_CHECK( cudaSetDevice( 0 ) );
-		CUDA_CHECK( cudaMemcpy( hv, spec_[0].merged_final_values_ptr(), sizeof( hv ), cudaMemcpyDeviceToHost ) );
-		CUDA_CHECK( cudaMemcpy( hi, spec_[0].merged_final_indices_ptr(), sizeof( hi ), cudaMemcpyDeviceToHost ) );
+		backend::set_device( 0 );
+		backend::memcpy_sync( hv, spec_[0].merged_final_values_ptr(), sizeof( hv ), backend::Copy::D2H );
+		backend::memcpy_sync( hi, spec_[0].merged_final_indices_ptr(), sizeof( hi ), backend::Copy::D2H );
 		for ( int k = 0; k < active && k <= res.accepted; ++k ) {
 			// Draft token k is chosen from candidate row k + 1 (row 0 is the anchor and is never scored).
 			const int row = k + 1;

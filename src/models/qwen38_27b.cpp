@@ -1,4 +1,5 @@
 #include "engine/models/qwen38_27b.h"
+#include "engine/backend/runtime.h"
 #include "engine/loader/safetensors.h"
 #include "engine/spec/dflash.h"
 #include "engine/spec/tap_ring.h"
@@ -32,7 +33,7 @@ bool Qwen38Pipeline::init(
 	ring_ = ring;
 	weights_loaded_ = false;
 
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	backend::set_device( rank_ );
 
 	const int tp_size = ( ring_ != nullptr ) ? ENGINE_NUM_GPUS : 1;
 	tp_size_ = tp_size;
@@ -54,21 +55,21 @@ bool Qwen38Pipeline::init(
 	state_.slot_gdn_floats = static_cast<size_t>( config_.num_linear_layers ) * lin_v_heads * 128 * 128;
 	size_t gdn_floats = static_cast<size_t>( S ) * state_.slot_gdn_floats;
 	state_.gdn_states = static_cast<float*>( engine::core::arena_alloc( arena, gdn_floats * sizeof( float ) ) );
-	CUDA_CHECK( cudaMemset( state_.gdn_states, 0, gdn_floats * sizeof( float ) ) );
+	backend::memset_sync( state_.gdn_states, 0, gdn_floats * sizeof( float ) );
 	state_.gdn_checkpoint = static_cast<float*>( engine::core::arena_alloc( arena, state_.slot_gdn_floats * sizeof( float ) ) );
 
 	// 2. Causal conv1d history per slot: [S, 48, channels, 3] FP32 + one-slot checkpoint
 	state_.slot_conv_floats = static_cast<size_t>( config_.num_linear_layers ) * lin_channels * 3;
 	size_t conv_hist_floats = static_cast<size_t>( S ) * state_.slot_conv_floats;
 	state_.conv_history = static_cast<float*>( engine::core::arena_alloc( arena, conv_hist_floats * sizeof( float ) ) );
-	CUDA_CHECK( cudaMemset( state_.conv_history, 0, conv_hist_floats * sizeof( float ) ) );
+	backend::memset_sync( state_.conv_history, 0, conv_hist_floats * sizeof( float ) );
 	state_.conv_checkpoint = static_cast<float*>( engine::core::arena_alloc( arena, state_.slot_conv_floats * sizeof( float ) ) );
 
 	// 2b. Per-row snapshots for the speculative verify forward (kDraftM rows, one speculating slot).
 	state_.gdn_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * state_.slot_gdn_floats * sizeof( float ) ) );
 	state_.conv_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * state_.slot_conv_floats * sizeof( float ) ) );
 	state_.d_snap_on = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
-	CUDA_CHECK( cudaMemset( state_.d_snap_on, 0, sizeof( int ) ) );
+	backend::memset_sync( state_.d_snap_on, 0, sizeof( int ) );
 
 	// 3. Full-attention KV cache pool: [S, 16, max_seq, kv_heads, 256] FP16
 	kv_pool_.init( rank_, arena, S, config_.max_seq, config_.num_attn_layers, full_kv_heads, config_.full_head_dim );
@@ -77,12 +78,12 @@ bool Qwen38Pipeline::init(
 	int h_shape[2] = { R, config_.hidden_size };
 	hidden_states_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	norm_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
-	CUDA_CHECK( cudaMemset( hidden_states_.data, 0, hidden_states_.size_bytes() ) );
+	backend::memset_sync( hidden_states_.data, 0, hidden_states_.size_bytes() );
 
 	// Tapped hidden states for DFlash2: [R, 5, hidden]
 	const size_t tap_bytes = static_cast<size_t>( R ) * 5 * config_.hidden_size * sizeof( half );
 	tapped_states_ = static_cast<half*>( engine::core::arena_alloc( arena, tap_bytes ) );
-	CUDA_CHECK( cudaMemset( tapped_states_, 0, tap_bytes ) );
+	backend::memset_sync( tapped_states_, 0, tap_bytes );
 
 	// Drafter context taps. tapped_states_ only survives the last forward (MAX_BATCH rows), but the
 	// drafter's context stage needs every position in the window, so keep a position-indexed ring of
@@ -94,9 +95,9 @@ bool Qwen38Pipeline::init(
 	draft_hooks_.taps_cap = MAX( MIN( config_.max_seq, 2048 ), 256 );
 	int wtap_shape[2] = { draft_hooks_.taps_cap, 5 * config_.hidden_size };
 	draft_taps_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, wtap_shape, 2 );
-	CUDA_CHECK( cudaMemset( draft_taps_.data, 0, wtap_shape[0] * wtap_shape[1] * sizeof( half ) ) );
+	backend::memset_sync( draft_taps_.data, 0, wtap_shape[0] * wtap_shape[1] * sizeof( half ) );
 	d_taps_owner_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
-	CUDA_CHECK( cudaMemset( d_taps_owner_, 0xFF, sizeof( int ) ) );
+	backend::memset_sync( d_taps_owner_, 0xFF, sizeof( int ) );
 	draft_hooks_.taps = draft_taps_.ptr<const half>();
 	draft_hooks_.taps_owner = d_taps_owner_;
 	draft_hooks_.embedding = &embed_tokens_;
@@ -169,7 +170,7 @@ bool Qwen38Pipeline::init(
 			samp_counters_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 			d_samp_vals_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * 16 * sizeof( float ) ) );
 			d_samp_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * 16 * sizeof( int ) ) );
-			CUDA_CHECK( cudaMemset( samp_counters_, 0, R * sizeof( int ) ) );
+			backend::memset_sync( samp_counters_, 0, R * sizeof( int ) );
 		}
 		if ( rank_ == 0 && tp_size_ > 1 ) {
 			// Only the DFlash2 drafter needs the whole distribution; sampling reduces per shard.
@@ -194,7 +195,7 @@ bool Qwen38Pipeline::init(
 			draft_cand_counters_ = static_cast<int*>( engine::core::arena_alloc( arena, kM * sizeof( int ) ) );
 			draft_hooks_.cand_vals = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( kM ) * kDraftTopK * sizeof( float ) ) );
 			draft_hooks_.cand_idx = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( kM ) * kDraftTopK * sizeof( int ) ) );
-			CUDA_CHECK( cudaMemset( draft_cand_counters_, 0, kM * sizeof( int ) ) );
+			backend::memset_sync( draft_cand_counters_, 0, kM * sizeof( int ) );
 			draft_hooks_.shard_offset = rank_ * lm_shard_real_cols_;
 			draft_hooks_.shard_real_cols = lm_shard_real_cols_;
 		}
@@ -234,13 +235,13 @@ bool Qwen38Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm:
 
 void Qwen38Pipeline::reset_state( int slot_id ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen38Pipeline::reset_state: slot out of range" );
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	backend::set_device( rank_ );
 	kv_pool_.reset_slot( slot_id );
-	CUDA_CHECK( cudaMemset( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, 0, state_.slot_gdn_floats * sizeof( float ) ) );
-	CUDA_CHECK( cudaMemset( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, 0, state_.slot_conv_floats * sizeof( float ) ) );
+	backend::memset_sync( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, 0, state_.slot_gdn_floats * sizeof( float ) );
+	backend::memset_sync( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, 0, state_.slot_conv_floats * sizeof( float ) );
 }
 
-bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
+bool Qwen38Pipeline::load_weights( const char* model_dir, backend::stream_t stream ) {
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) {
 		std::printf( "    [loader] FAILED to open model directory %s\n", model_dir );
@@ -387,7 +388,7 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) 
 	}
 
 	if ( stream ) {
-		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		backend::stream_sync( stream );
 	}
 	repo.close();
 	weights_loaded_ = true;
@@ -413,30 +414,30 @@ void Qwen38Pipeline::set_rows( int m ) {
 	if ( logits_.data ) logits_.shape[0] = m;
 }
 
-void Qwen38Pipeline::embed_tokens( const int* token_ids, int count, cudaStream_t stream ) {
+void Qwen38Pipeline::embed_tokens( const int* token_ids, int count, backend::stream_t stream ) {
 	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_ROWS, "Qwen38Pipeline::embed_tokens: count out of range" );
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	backend::set_device( rank_ );
 	// Pageable H2D: the source is staged before return, so the caller's array may be reused immediately
-	CUDA_CHECK( cudaMemcpyAsync( d_token_ids_, token_ids, count * sizeof( int ), cudaMemcpyHostToDevice, stream ) );
+	backend::memcpy_async( d_token_ids_, token_ids, count * sizeof( int ), backend::Copy::H2D, stream );
 	set_rows( count );
 	engine::modules::Embedding::forward( embed_tokens_, d_token_ids_, count, hidden_states_, stream );
 }
 
-void Qwen38Pipeline::sample_tokens( int* out_preds, int count, cudaStream_t stream ) {
+void Qwen38Pipeline::sample_tokens( int* out_preds, int count, backend::stream_t stream ) {
 	ENGINE_ASSERT( tp_size_ == 1, "Qwen38Pipeline::sample_tokens: vocabulary is sharded, use sample_local" );
 	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen38Pipeline::sample_tokens: count exceeds last forward rows" );
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	backend::set_device( rank_ );
 	logits_.shape[0] = count;
 	engine::modules::Elementwise::batched_argmax( logits_, d_argmax_idx_, lm_shard_cols_, count, stream );
-	CUDA_CHECK( cudaMemcpyAsync( h_argmax_idx_, d_argmax_idx_, count * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
-	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	backend::memcpy_async( h_argmax_idx_, d_argmax_idx_, count * sizeof( int ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
 	std::memcpy( out_preds, h_argmax_idx_, count * sizeof( int ) );
 }
 
-bool Qwen38Pipeline::sample_local( int* out_tokens, float* out_vals, int count, cudaStream_t stream ) {
+bool Qwen38Pipeline::sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream ) {
 	if ( tp_size_ <= 1 ) return false;   // single-rank head: the caller samples on rank 0
 	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen38Pipeline::sample_local: count exceeds last forward rows" );
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	backend::set_device( rank_ );
 	logits_.shape[0] = count;
 	// Scan only this rank's real columns: the pad block decodes to 0.0 and would beat a real negative
 	// logit. index_offset turns the shard-local winner into a global token id.
@@ -449,30 +450,30 @@ bool Qwen38Pipeline::sample_local( int* out_tokens, float* out_vals, int count, 
 		rank_ * lm_shard_real_cols_,
 		stream
 	);
-	CUDA_CHECK( cudaMemcpyAsync( h_argmax_idx_, d_argmax_idx_, count * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
-	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	backend::memcpy_async( h_argmax_idx_, d_argmax_idx_, count * sizeof( int ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
 	std::memcpy( out_tokens, h_argmax_idx_, count * sizeof( int ) );
 	if ( out_vals != nullptr ) {
 		std::vector<float> h_vals( count );
-		CUDA_CHECK( cudaMemcpyAsync( h_vals.data(), d_argmax_val_, count * sizeof( float ), cudaMemcpyDeviceToHost, stream ) );
-		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		backend::memcpy_async( h_vals.data(), d_argmax_val_, count * sizeof( float ), backend::Copy::D2H, stream );
+		backend::stream_sync( stream );
 		std::memcpy( out_vals, h_vals.data(), count * sizeof( float ) );
 	}
 	return true;
 }
 
-bool Qwen38Pipeline::topk_local( float* out_vals, int* out_ids, int count, cudaStream_t stream ) {
+bool Qwen38Pipeline::topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream ) {
 	if ( tp_size_ <= 1 ) return false;
 	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen38Pipeline::topk_local: count exceeds last forward rows" );
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	backend::set_device( rank_ );
 	// Real columns only (pad columns decode to 0.0), global ids via the shard offset.
 	engine::spec::dflash2_topk_shard(
 		logits_.ptr<const half>(), count, lm_shard_cols_, lm_shard_real_cols_, 16,
 		d_samp_vals_, d_samp_idx_, rank_ * lm_shard_real_cols_,
 		samp_part_v_, samp_part_i_, samp_counters_, stream );
-	CUDA_CHECK( cudaMemcpyAsync( out_vals, d_samp_vals_, static_cast<size_t>( count ) * 16 * sizeof( float ), cudaMemcpyDeviceToHost, stream ) );
-	CUDA_CHECK( cudaMemcpyAsync( out_ids, d_samp_idx_, static_cast<size_t>( count ) * 16 * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
-	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	backend::memcpy_async( out_vals, d_samp_vals_, static_cast<size_t>( count ) * 16 * sizeof( float ), backend::Copy::D2H, stream );
+	backend::memcpy_async( out_ids, d_samp_idx_, static_cast<size_t>( count ) * 16 * sizeof( int ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
 	return true;
 }
 
@@ -480,7 +481,7 @@ const pod::TensorView& Qwen38Pipeline::gather_logits(
 	int rows,
 	const half* const* peer_shard_ptrs,
 	int peer_shard_cols,
-	cudaStream_t stream
+	backend::stream_t stream
 ) {
 	ENGINE_ASSERT( tp_size_ == 1 || rank_ == 0, "Qwen38Pipeline::gather_logits: only rank 0 materializes the full vocabulary" );
 	if ( tp_size_ == 1 ) {
@@ -500,7 +501,7 @@ const pod::TensorView& Qwen38Pipeline::gather_logits(
 		for ( int r = 0; r < rows; ++r ) {
 			const half* src = src_base + static_cast<size_t>( r ) * lm_shard_cols_;
 			half* dst = full_logits_.ptr<half>() + ( static_cast<size_t>( r ) * ENGINE_NUM_GPUS + d ) * shard_elems;
-			CUDA_CHECK( cudaMemcpyPeerAsync( dst, rank_, src, d, shard_elems * sizeof( half ), stream ) );
+			backend::peer_copy_async( dst, rank_, src, d, shard_elems * sizeof( half ), stream );
 		}
 	}
 	return full_logits_;
@@ -508,10 +509,10 @@ const pod::TensorView& Qwen38Pipeline::gather_logits(
 
 // Runs this rank's head shard over the drafter's hidden rows and leaves the local top-k in the hooks'
 // cand buffers. Not a target forward: the rows are the drafter's, with no slot or position.
-void Qwen38Pipeline::draft_head_topk( int rows, cudaStream_t stream ) {
+void Qwen38Pipeline::draft_head_topk( int rows, backend::stream_t stream ) {
 	ENGINE_ASSERT( weights_loaded_, "Qwen38Pipeline::draft_head_topk: weights not loaded" );
 	ENGINE_ASSERT( rows >= 1 && rows <= kDraftM, "Qwen38Pipeline::draft_head_topk: rows out of range" );
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	backend::set_device( rank_ );
 	const int H = config_.hidden_size;
 	// All kDraftM rows, whatever `rows` is: the head's fast path only covers m in {1, 2, 4, 8}, and any
 	// other m falls through to the cooperative GEMM (far slower). The caller consumes the first rows.
@@ -525,14 +526,14 @@ void Qwen38Pipeline::draft_head_topk( int rows, cudaStream_t stream ) {
 		draft_cand_part_v_, draft_cand_part_i_, draft_cand_counters_, stream );
 }
 
-void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) {
+void Qwen38Pipeline::forward( const pod::BatchRows& rows, backend::stream_t stream ) {
 	ENGINE_ASSERT( weights_loaded_, "Qwen38Pipeline::forward: weights not loaded" );
 	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_ROWS, "Qwen38Pipeline::forward: row count out of range" );
 	for ( int r = 0; r < rows.count; ++r ) {
 		ENGINE_ASSERT( rows.slot[r] >= 0 && rows.slot[r] < config_.max_slots, "Qwen38Pipeline::forward: slot out of range" );
 		ENGINE_ASSERT( rows.pos[r] >= 0 && rows.pos[r] < config_.max_seq, "Qwen38Pipeline::forward: position out of range" );
 	}
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	backend::set_device( rank_ );
 	const int m = rows.count;
 	last_slot_ = rows.slot[0];
 	key_hint_ = rows.pos[m - 1] + 1;
@@ -544,17 +545,17 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) 
 	// Row descriptor goes to the device; the layer stack only reads slots/positions from there,
 	// so its launch sequence depends on m alone and is replayed from a per-m CUDA graph.
 	// Pageable source: the copy is staged before return, so `rows` may be a temporary.
-	CUDA_CHECK( cudaMemcpyAsync( d_rows_, &rows, sizeof( pod::BatchRows ), cudaMemcpyHostToDevice, stream ) );
+	backend::memcpy_async( d_rows_, &rows, sizeof( pod::BatchRows ), backend::Copy::H2D, stream );
 	// Tensor-core attention shares K/V tiles across the rows of one slot (verify blocks, single-row decode); rows of
 	// distinct slots get a block each. The graph body differs, so the two shapes get separate graphs.
 	attn_tc_ = true;
 	for ( int r = 1; r < m; ++r ) attn_tc_ = attn_tc_ && rows.slot[r] == rows.slot[0];
 	static const bool tc_on = !( std::getenv( "EXL3_ATTN_TC" ) && std::atoi( std::getenv( "EXL3_ATTN_TC" ) ) == 0 );
 	attn_tc_on_ = tc_on;
-	graphs_.run( m, stream, [&]( cudaStream_t s ) { forward_body( m, s ); }, attn_tc_ ? 1 : 0 );
+	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); }, attn_tc_ ? 1 : 0 );
 }
 
-void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
+void Qwen38Pipeline::forward_body( int m, backend::stream_t stream ) {
 	const pod::KVRef kv = kv_pool_.ref();
 	const size_t kv_slot_stride = kv_pool_.slot_stride_elems;
 
@@ -766,15 +767,7 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 		// Tapped layer states for DFlash2: tapped_states_[r][tap] = hidden after layer tap_layers[tap]
 		for ( int tap = 0; tap < 5; ++tap ) {
 			if ( layer != config_.tap_layers[tap] ) continue;
-			CUDA_CHECK( cudaMemcpy2DAsync(
-				tapped_states_ + static_cast<size_t>( tap ) * config_.hidden_size,
-				5 * config_.hidden_size * sizeof( half ),
-				hidden_states_.data,
-				config_.hidden_size * sizeof( half ),
-				config_.hidden_size * sizeof( half ),
-				m,
-				cudaMemcpyDeviceToDevice, stream
-			) );
+			backend::memcpy2d_async( tapped_states_ + static_cast<size_t>( tap ) * config_.hidden_size, 5 * config_.hidden_size * sizeof( half ), hidden_states_.data, config_.hidden_size * sizeof( half ), config_.hidden_size * sizeof( half ), m, backend::Copy::D2D, stream );
 			// Also keep it position-indexed for the drafter's context stage. Each row lands in its own
 			// ring slot, so this cannot be the same strided copy as above. The slot, the position and
 			// the owner all come from device memory: forward_body is replayed from a CUDA graph keyed
@@ -808,7 +801,7 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 
 void Qwen38Pipeline::destroy() {
 	if ( arena_ != nullptr ) {
-		CUDA_CHECK( cudaSetDevice( rank_ ) );
+		backend::set_device( rank_ );
 		graphs_.reset();
 	}
 	if ( h_argmax_idx_ != nullptr ) {
@@ -817,41 +810,37 @@ void Qwen38Pipeline::destroy() {
 	}
 }
 
-void Qwen38Pipeline::checkpoint_state( int slot_id, cudaStream_t stream ) {
+void Qwen38Pipeline::checkpoint_state( int slot_id, backend::stream_t stream ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen38Pipeline::checkpoint_state: slot out of range" );
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	backend::set_device( rank_ );
 	const size_t offset_gdn = static_cast<size_t>( slot_id ) * state_.slot_gdn_floats;
 	const size_t offset_conv = static_cast<size_t>( slot_id ) * state_.slot_conv_floats;
-	CUDA_CHECK( cudaMemcpyAsync( state_.gdn_checkpoint, state_.gdn_states + offset_gdn, state_.slot_gdn_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
-	CUDA_CHECK( cudaMemcpyAsync( state_.conv_checkpoint, state_.conv_history + offset_conv, state_.slot_conv_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
+	backend::memcpy_async( state_.gdn_checkpoint, state_.gdn_states + offset_gdn, state_.slot_gdn_floats * sizeof( float ), backend::Copy::D2D, stream );
+	backend::memcpy_async( state_.conv_checkpoint, state_.conv_history + offset_conv, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
 }
 
-void Qwen38Pipeline::rollback_state( int slot_id, cudaStream_t stream ) {
+void Qwen38Pipeline::rollback_state( int slot_id, backend::stream_t stream ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen38Pipeline::rollback_state: slot out of range" );
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	backend::set_device( rank_ );
 	const size_t offset_gdn = static_cast<size_t>( slot_id ) * state_.slot_gdn_floats;
 	const size_t offset_conv = static_cast<size_t>( slot_id ) * state_.slot_conv_floats;
-	CUDA_CHECK( cudaMemcpyAsync( state_.gdn_states + offset_gdn, state_.gdn_checkpoint, state_.slot_gdn_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
-	CUDA_CHECK( cudaMemcpyAsync( state_.conv_history + offset_conv, state_.conv_checkpoint, state_.slot_conv_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
+	backend::memcpy_async( state_.gdn_states + offset_gdn, state_.gdn_checkpoint, state_.slot_gdn_floats * sizeof( float ), backend::Copy::D2D, stream );
+	backend::memcpy_async( state_.conv_history + offset_conv, state_.conv_checkpoint, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
 }
 
-void Qwen38Pipeline::set_spec_snapshot( bool on, cudaStream_t stream ) {
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
+void Qwen38Pipeline::set_spec_snapshot( bool on, backend::stream_t stream ) {
+	backend::set_device( rank_ );
 	const int v = on ? 1 : 0;
 	// Pageable source: staged before return, so a stack value is fine.
-	CUDA_CHECK( cudaMemcpyAsync( state_.d_snap_on, &v, sizeof( int ), cudaMemcpyHostToDevice, stream ) );
+	backend::memcpy_async( state_.d_snap_on, &v, sizeof( int ), backend::Copy::H2D, stream );
 }
 
-void Qwen38Pipeline::commit_spec_row( int slot_id, int row, cudaStream_t stream ) {
+void Qwen38Pipeline::commit_spec_row( int slot_id, int row, backend::stream_t stream ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen38Pipeline::commit_spec_row: slot out of range" );
 	ENGINE_ASSERT( row >= 0 && row < kDraftM, "Qwen38Pipeline::commit_spec_row: row out of range" );
-	CUDA_CHECK( cudaSetDevice( rank_ ) );
-	CUDA_CHECK( cudaMemcpyAsync( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats,
-		state_.gdn_snap + static_cast<size_t>( row ) * state_.slot_gdn_floats,
-		state_.slot_gdn_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
-	CUDA_CHECK( cudaMemcpyAsync( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats,
-		state_.conv_snap + static_cast<size_t>( row ) * state_.slot_conv_floats,
-		state_.slot_conv_floats * sizeof( float ), cudaMemcpyDeviceToDevice, stream ) );
+	backend::set_device( rank_ );
+	backend::memcpy_async( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, state_.gdn_snap + static_cast<size_t>( row ) * state_.slot_gdn_floats, state_.slot_gdn_floats * sizeof( float ), backend::Copy::D2D, stream );
+	backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, state_.conv_snap + static_cast<size_t>( row ) * state_.slot_conv_floats, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
 }
 
 } // namespace engine::models

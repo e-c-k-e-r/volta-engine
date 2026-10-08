@@ -1,4 +1,5 @@
 #include "engine/runtime/cluster.h"
+#include "engine/backend/runtime.h"
 #include "trellis_context.h"
 #include <cmath>
 #include <cstdio>
@@ -29,8 +30,8 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	engine::modules::trellis_context_init_all();
 
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		CUDA_CHECK( cudaSetDevice( d ) );
-		CUDA_CHECK( cudaStreamCreate( &streams_[d] ) );
+		backend::set_device( d );
+		streams_[d] = backend::stream_create();
 		if ( !engine::core::arena_create( arenas_[d], d, arena_bytes ) ) return false;
 		models_[d] = engine::models::create_model_pipeline( cfg.model_type );
 		if ( !models_[d] || !models_[d]->init( d, arenas_[d], &rings_[d] ) ) return false;
@@ -42,7 +43,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	bool ok[ENGINE_NUM_GPUS] = {};
 	pool_.run( [&]( int d ) {
 		ok[d] = models_[d]->load_weights( cfg.model_dir.c_str(), streams_[d] );
-		CUDA_CHECK( cudaStreamSynchronize( streams_[d] ) );
+		backend::stream_sync( streams_[d] );
 	} );
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		if ( !ok[d] ) return false;
@@ -59,7 +60,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	// call it makes reports success (bisected with cudaPeekAtLastError; source inside the driver, not
 	// identified). Clear it so a later CUDA_CHECK( cudaGetLastError() ) on this thread, such as the
 	// speculative round's, reports only errors raised after init.
-	(void) cudaGetLastError();
+	backend::clear_last_error();
 	initialized_ = true;
 	return true;
 }
@@ -74,11 +75,11 @@ void ModelCluster::shutdown() {
 		runner_.reset();
 	}
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		CUDA_CHECK( cudaSetDevice( d ) );
+		backend::set_device( d );
 		models_[d].reset();
 		if ( streams_[d] ) {
-			cudaStreamSynchronize( streams_[d] );
-			cudaStreamDestroy( streams_[d] );
+			backend::stream_sync( streams_[d] );
+			backend::stream_destroy( streams_[d] );
 			streams_[d] = nullptr;
 		}
 		engine::core::arena_destroy( arenas_[d] );
@@ -86,8 +87,8 @@ void ModelCluster::shutdown() {
 	engine::comm::destroy_4gpu_mesh( staging_ptrs_, flag_ptrs_ );
 	engine::modules::trellis_context_destroy();
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		cudaSetDevice( d );
-		cudaDeviceReset();
+		backend::set_device( d );
+		backend::device_reset();
 	}
 }
 
@@ -103,7 +104,7 @@ void ModelCluster::forward( const int* tokens, const pod::BatchRows& rows ) {
 	pool_.run( [&]( int d ) {
 		models_[d]->embed_tokens( tokens, rows.count, streams_[d] );
 		models_[d]->forward( rows, streams_[d] );
-		CUDA_CHECK( cudaStreamSynchronize( streams_[d] ) );
+		backend::stream_sync( streams_[d] );
 	} );
 }
 
@@ -175,7 +176,7 @@ void ModelCluster::sample_topk( int count, Candidates* out ) {
 }
 
 void ModelCluster::sample( int* out, int count ) {
-	CUDA_CHECK( cudaSetDevice( 0 ) );
+	backend::set_device( 0 );
 
 	// Vocabulary-parallel path: every rank picks the best token inside its own shard, and the winner
 	// is the largest logit across ranks. Each rank syncs its own stream inside sample_local, so by the
@@ -209,7 +210,7 @@ void ModelCluster::sample( int* out, int count ) {
 }
 
 void ModelCluster::read_logits( int rows, half* host_dst ) {
-	CUDA_CHECK( cudaSetDevice( 0 ) );
+	backend::set_device( 0 );
 	const half* peer_shards[ENGINE_NUM_GPUS] = { nullptr };
 	int peer_cols = 0;
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
@@ -218,8 +219,8 @@ void ModelCluster::read_logits( int rows, half* host_dst ) {
 	}
 	const pod::TensorView& full = models_[0]->gather_logits( rows, peer_shards, peer_cols, streams_[0] );
 	const size_t bytes = static_cast<size_t>( rows ) * metadata().vocab_size * sizeof( half );
-	CUDA_CHECK( cudaMemcpyAsync( host_dst, full.data, bytes, cudaMemcpyDeviceToHost, streams_[0] ) );
-	CUDA_CHECK( cudaStreamSynchronize( streams_[0] ) );
+	backend::memcpy_async( host_dst, full.data, bytes, backend::Copy::D2H, streams_[0] );
+	backend::stream_sync( streams_[0] );
 }
 
 int ModelCluster::sample_one() {

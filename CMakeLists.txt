@@ -40,8 +40,8 @@ set(ENGINE_CORE_SOURCES
 	src/modules/mhc.cu
 	src/modules/embedding.cu
 	src/models/model.cpp
-	src/models/qwen38_27b.cu
-	src/models/glm53_flash.cu
+	src/models/qwen38_27b.cpp
+	src/models/glm53_flash.cpp
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
 	src/spec/dflash_backbone.cu
