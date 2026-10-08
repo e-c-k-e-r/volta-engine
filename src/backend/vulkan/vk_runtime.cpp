@@ -427,6 +427,10 @@ bool set_device_try( int device ) {
 	return device == g.device_index;
 }
 
+size_t device_free_bytes( int ) {
+	return 0;   // heap budgets are not queried; callers fall back to their defaults
+}
+
 void* device_malloc_try( size_t bytes ) {
 	ctx();
 	if ( !g.default_stream ) g.default_stream = make_stream();

@@ -57,6 +57,8 @@ inline void device_reset() { cudaDeviceReset(); }
 
 // Non-aborting forms for callers that report failure to their own caller (arena creation, loaders)
 inline bool set_device_try( int device ) { return cudaSetDevice( device ) == cudaSuccess; }
+// Free device memory in bytes on `device`; 0 when unknown
+inline size_t device_free_bytes( int device ) { size_t f = 0, t = 0; return ( cudaSetDevice( device ) == cudaSuccess && cudaMemGetInfo( &f, &t ) == cudaSuccess ) ? f : 0; }
 inline void* device_malloc_try( size_t bytes ) { void* p = nullptr; return cudaMalloc( &p, bytes ) == cudaSuccess ? p : nullptr; }
 inline bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, stream_t s ) {
 	return cudaMemcpyAsync( dst, src, bytes, copy_kind( dir ), s ) == cudaSuccess;

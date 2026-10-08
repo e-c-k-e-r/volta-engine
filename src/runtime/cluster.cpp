@@ -23,11 +23,23 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		const double f = std::atof( std::getenv( "EXL3_EXPERT_CACHE" ) );
 		if ( f > 0.0 && f < 1.0 ) glm_gib = static_cast<size_t>( std::ceil( 31.0 - ( 1.0 - f ) * 25.0 ) );
 	}
-	const size_t arena_bytes = cfg.arena_bytes ? cfg.arena_bytes
+	tp_ = std::getenv( "EXL3_TP" ) ? std::atoi( std::getenv( "EXL3_TP" ) ) : cfg.tp;
+	// A single-rank group holds the whole model, so the 4-rank defaults are meaningless: take the device's free memory
+	// less a reserve for what lives outside the arena (graphs, trellis workspace, collective scratch, CUDA context).
+	// EXL3_VRAM_RESERVE_MIB overrides the reserve; EXL3_ARENA_GIB or cfg.arena_bytes still win.
+	size_t arena_bytes = cfg.arena_bytes ? cfg.arena_bytes
 		: ( arena_env ? strtoull( arena_env, nullptr, 10 ) : ( is_glm ? glm_gib : 10ULL ) )
 			* 1024 * 1024 * 1024;
-
-	tp_ = std::getenv( "EXL3_TP" ) ? std::atoi( std::getenv( "EXL3_TP" ) ) : cfg.tp;
+	if ( tp_ == 1 && !cfg.arena_bytes && !arena_env ) {
+		const char* res_env = std::getenv( "EXL3_VRAM_RESERVE_MIB" );
+		const size_t reserve = ( res_env ? strtoull( res_env, nullptr, 10 ) : 1536ULL ) * 1024 * 1024;
+		const size_t free_bytes = backend::device_free_bytes( 0 );
+		if ( free_bytes > reserve ) {
+			arena_bytes = ( free_bytes - reserve ) & ~( ( size_t ) 0xFFFFF );
+			std::printf( "[*] Arena sized from free memory: %.2f GiB (%.2f GiB free, %.2f GiB reserve)\n",
+				arena_bytes / 1073741824.0, free_bytes / 1073741824.0, reserve / 1073741824.0 );
+		}
+	}
 	ENGINE_ASSERT( tp_ == 1 || tp_ == ENGINE_NUM_GPUS, "ModelCluster::init: the collective supports tp 1 or 4 ranks" );
 	created_ = true;
 	if ( tp_ > 1 ) engine::comm::init_4gpu_mesh( rings_, staging_ptrs_, flag_ptrs_, engine::comm::kMeshStagingBytes );

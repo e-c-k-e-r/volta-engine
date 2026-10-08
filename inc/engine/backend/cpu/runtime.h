@@ -58,6 +58,18 @@ inline void clear_last_error() {}
 inline void device_reset() {}
 
 inline bool set_device_try( int device ) { return device == 0; }
+// Available host memory in bytes (MemAvailable); 0 when unknown
+inline size_t device_free_bytes( int ) {
+	size_t kb = 0;
+	if ( FILE* f = std::fopen( "/proc/meminfo", "r" ) ) {
+		char line[128];
+		while ( std::fgets( line, sizeof( line ), f ) ) {
+			if ( std::sscanf( line, "MemAvailable: %zu kB", &kb ) == 1 ) break;
+		}
+		std::fclose( f );
+	}
+	return kb * 1024;
+}
 inline void* device_malloc_try( size_t bytes ) { return aligned_alloc64( bytes ); }
 inline bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, stream_t s ) { memcpy_async( dst, src, bytes, dir, s ); return true; }
 

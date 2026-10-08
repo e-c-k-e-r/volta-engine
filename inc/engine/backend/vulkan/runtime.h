@@ -42,6 +42,7 @@ void clear_last_error();
 void device_reset();
 
 bool set_device_try( int device );
+size_t device_free_bytes( int device );   // 0 when unknown
 void* device_malloc_try( size_t bytes );
 bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, stream_t s );
 
