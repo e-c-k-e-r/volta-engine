@@ -84,6 +84,66 @@ set_target_properties(engine_kernels PROPERTIES
 	OUTPUT_NAME "engine_kernels"
 )
 
+# Slang Tier B kernels (src/shaders/*.slang): portable sources for the CUDA / Vulkan / CPU backends. The CUDA build keeps its
+# hand-tuned kernels as the default; these are generated for the parity test and as the base for the other backends.
+find_program(SLANGC slangc HINTS /opt/shader-slang/bin)
+if(SLANGC)
+	get_filename_component(SLANG_BIN_DIR ${SLANGC} DIRECTORY)
+	set(SLANG_INCLUDE_DIR ${SLANG_BIN_DIR}/../include)
+	set(SLANG_OUT ${PROJECT_BINARY_DIR}/slang)
+	file(MAKE_DIRECTORY ${SLANG_OUT})
+	set(SLANG_KERNELS rms_norm:rms_norm rms_norm:rms_norm_heads elementwise:add_residual elementwise:swiglu
+		elementwise:swiglu_fused elementwise:embed_tokens rope:rope)
+	set(SLANG_GENERATED "")
+	foreach(item ${SLANG_KERNELS})
+		string(REPLACE ":" ";" parts ${item})
+		list(GET parts 0 sfile)
+		list(GET parts 1 entry)
+		set(ssrc ${PROJECT_SOURCE_DIR}/src/shaders/${sfile}.slang)
+		foreach(tgt cuda:cuda.cu:0 spirv:spv:0 cpp:cpp:1)
+			string(REPLACE ":" ";" tparts ${tgt})
+			list(GET tparts 0 target)
+			list(GET tparts 1 ext)
+			list(GET tparts 2 cpu)
+			set(sout ${SLANG_OUT}/${entry}.${ext})
+			add_custom_command(OUTPUT ${sout}
+				COMMAND ${SLANGC} ${ssrc} -target ${target} -stage compute -entry ${entry} -DENGINE_TARGET_CPU=${cpu} -o ${sout}
+				DEPENDS ${ssrc}
+				COMMENT "slangc ${entry} -> ${target}")
+			list(APPEND SLANG_GENERATED ${sout})
+		endforeach()
+	endforeach()
+	add_custom_target(slang_kernels DEPENDS ${SLANG_GENERATED})
+
+	# Generated CUDA kernels live in their own translation units: the Slang prelude redefines the half2 operators
+	file(GLOB SLANG_CUDA_LAUNCHERS src/shaders/cuda/*.cu)
+	add_library(engine_slang_cuda STATIC ${SLANG_CUDA_LAUNCHERS})
+	add_dependencies(engine_slang_cuda slang_kernels)
+	target_include_directories(engine_slang_cuda PRIVATE ${SLANG_OUT} ${SLANG_INCLUDE_DIR} src/shaders/cuda)
+	target_compile_definitions(engine_slang_cuda PRIVATE __CUDA_NO_HALF2_OPERATORS__)
+	set_target_properties(engine_slang_cuda PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	# Host target: the generated C++ kernels run on the CPU (no GPU involved)
+	set(SLANG_CPU_SOURCES "")
+	foreach(item ${SLANG_KERNELS})
+		string(REPLACE ":" ";" parts ${item})
+		list(GET parts 1 entry)
+		list(APPEND SLANG_CPU_SOURCES ${SLANG_OUT}/${entry}.cpp)
+	endforeach()
+	set_source_files_properties(${SLANG_CPU_SOURCES} PROPERTIES GENERATED TRUE)
+	add_executable(test_slang_cpu tests/2_parity/test_slang_cpu.cpp ${SLANG_CPU_SOURCES})
+	add_dependencies(test_slang_cpu slang_kernels)
+	target_include_directories(test_slang_cpu PRIVATE ${SLANG_INCLUDE_DIR})
+	set_target_properties(test_slang_cpu PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	add_executable(test_slang_kernels tests/2_parity/test_slang_kernels.cpp)
+	target_include_directories(test_slang_kernels PRIVATE src/shaders/cuda)
+	target_link_libraries(test_slang_kernels PRIVATE engine_kernels engine_slang_cuda)
+	set_target_properties(test_slang_kernels PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+else()
+	message(STATUS "slangc not found: Slang kernels skipped")
+endif()
+
 # Test Trellis Parity
 add_executable(test_trellis tests/2_parity/test_trellis.cpp)
 target_link_libraries(test_trellis PRIVATE engine_kernels)

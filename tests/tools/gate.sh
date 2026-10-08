@@ -31,12 +31,14 @@ static_checks() {
 	done
 	echo "kernel launches in models: $(grep -c '<<<' $ROOT/src/models/*.cpp 2>/dev/null | tr '\n' ' ')"
 	ninja > $out/build.log 2>&1 || { echo "build FAILED"; bad=1; }
+	# Slang-generated SPIR-V must validate
+	for f in slang/*.spv(N); do spirv-val $f > $out/$f:t.log 2>&1 || { echo "spirv-val FAILED: $f"; bad=1; }; done
 	return $bad
 }
 
 tier2() {
 	for t in test_trellis test_gemv_int8 test_mhc test_attention test_attention_prefill test_mla test_dsa test_gdn test_rows \
-		test_norm test_rope test_kv_quant test_all_reduce test_moe test_nvfp4_linear test_prefill_linear test_sampling test_mla_latent test_spec_state; do
+		test_norm test_rope test_kv_quant test_all_reduce test_moe test_nvfp4_linear test_prefill_linear test_sampling test_mla_latent test_spec_state test_slang_cpu test_slang_kernels; do
 		run $t gpu ./$t
 	done
 	# test_dflash prints a known FATAL in its geometry step (present before 2026-10-07); judged by its final line
