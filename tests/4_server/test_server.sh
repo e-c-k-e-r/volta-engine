@@ -15,7 +15,7 @@ HOST="127.0.0.1"
 MODEL="${VOLTA_TEST_MODEL:-qwen38}"
 if [ "$MODEL" = "glm53" ]; then
 	MODEL_DIR="${EXL3_GLM_DIR:-/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw}"
-	DRAFT_DIR="/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2"
+	DRAFT_DIR="${EXL3_GLM_DRAFT_DIR:-/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2}"
 else
 	MODEL_DIR="/home/mrq/Documents/models/Qwen3.8-27B-exl3"
 	DRAFT_DIR="/home/mrq/Documents/models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw"
