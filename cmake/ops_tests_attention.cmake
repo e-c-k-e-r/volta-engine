@@ -5,9 +5,12 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	target_link_libraries(test_ops_attention PRIVATE engine_kernels)
 	set_target_properties(test_ops_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 elseif(ENGINE_BACKEND STREQUAL "CPU" AND TARGET ref_attn_cpu)
-	# ref_attn_cpu holds the host-target reference attention kernels; the module layer binds them weakly, so force them into the link
+	# The CPU attention (src/backend/cpu/attention_ref.cpp) runs on the E2 reference Slang kernels: build their host-target sources
+	# into the common Slang object library so every CPU executable (smoke test, server, op tests) links them
+	set_source_files_properties(${REF_ATTN_CPU_SOURCES} PROPERTIES GENERATED TRUE)
+	target_sources(engine_cpu_slang PRIVATE ${REF_ATTN_CPU_SOURCES})
+	add_dependencies(engine_cpu_slang ref_attn_slang)
 	add_executable(test_ops_attention tests/2_parity/test_ops_attention.cpp ${ENGINE_CPU_OBJECTS})
-	target_link_libraries(test_ops_attention PRIVATE ref_attn_cpu pthread)
-	target_link_options(test_ops_attention PRIVATE -Wl,-u,ref_attn_decode_cpu -Wl,-u,ref_latent_decode_cpu)
+	target_link_libraries(test_ops_attention PRIVATE pthread)
 	set_target_properties(test_ops_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 endif()
