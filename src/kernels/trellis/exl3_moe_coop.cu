@@ -408,6 +408,256 @@ __device__ __forceinline__ void gemv_tile(
 	__syncthreads();
 }
 
+__device__ __forceinline__ int dp4a_us_c( uint32_t a, uint32_t b, int c ) {
+	int d;
+	asm ( "dp4a.u32.s32 %0, %1, %2, %3;" : "=r"( d ) : "r"( a ), "r"( b ), "r"( c ) );
+	return d;
+}
+
+// GEMV tile on int8 activations for runs of up to R rows (the mul1 codebook is affine in the byte sum of x * 0x83DCD12D, so one
+// dp4a against a splatted int8 activation evaluates codebook(x) * a, see exl3_gemv_int8_kernel.cuh). Each row quantizes every
+// k-slab (the k range of one warp row) with its own scale q = max / 127 plus an int8 residual at q / 254 (~15 bit), so a row's
+// result does not depend on the other rows of the run. The slab is staged in shared memory as the four bytes (k = 2m, 2m + 1,
+// 2m + 8, 2m + 9) that every lane with lane % 4 = m needs. Warps of one slab quantize a quarter each and the sums come from the
+// quantized values, so all warps of a slab agree bit-exactly.
+template <int cb, int WN_, int R>
+__device__ __forceinline__ void gemv_tile_i8(
+	const uint32_t* __restrict__ B32,
+	const half2* __restrict__ A2,
+	size_t a_stride2,
+	const int* __restrict__ rows,
+	int nrows,
+	float* __restrict__ C,
+	size_t c_stride,
+	int k_begin,
+	int k_end,
+	int ntiles,
+	int group,
+	float* __restrict__ sh_red,         // [WKK][ROWS][TCOLS]
+	uint32_t* __restrict__ sh_stage     // [R][2][WKK][chunk][4]
+) {
+	constexpr int WN = WN_;
+	constexpr int WKK = tile_wk<WN_>();
+	constexpr int TCOLS = tile_cols<WN_>();
+	__shared__ int sh_si[WK][R][2];
+
+	const int warp = threadIdx.x / 32;
+	const int lane = threadIdx.x % 32;
+	const int wn = warp % WN;
+	const int wk = warp / WN;
+
+	const int kslices = k_end - k_begin;
+	const int chunk = CEIL_DIVIDE( kslices, WKK );
+	const int ks0 = k_begin + wk * chunk;
+	const int myn = max( 0, min( chunk, k_end - ks0 ) );
+	const size_t slice_stride = static_cast<size_t>( ntiles ) * TWORDS;
+	const int npairs = myn * 8;
+
+	float qr[R], q2r[R];
+	#pragma unroll
+	for ( int r = 0; r < R; ++r ) {
+		qr[r] = 1.0f;
+		q2r[r] = 1.0f / 254.0f;
+		if ( r >= nrows ) continue;
+		uint16_t* st_q = reinterpret_cast<uint16_t*>( sh_stage ) + ( ( r * 2 ) * WKK + wk ) * chunk * 8;
+		uint16_t* st_r = reinterpret_cast<uint16_t*>( sh_stage ) + ( ( r * 2 + 1 ) * WKK + wk ) * chunk * 8;
+
+		// Slab scale
+		const half2* Ap = A2 + static_cast<size_t>( rows[r] ) * a_stride2 + static_cast<size_t>( ks0 ) * 8;
+		float mx = 0.0f;
+		for ( int i = lane; i < npairs; i += 32 ) {
+			const half2 h = Ap[i];
+			mx = fmaxf( mx, fmaxf( fabsf( __low2float( h ) ), fabsf( __high2float( h ) ) ) );
+		}
+		#pragma unroll
+		for ( int o = 16; o > 0; o >>= 1 ) mx = fmaxf( mx, __shfl_xor_sync( 0xffffffffu, mx, o ) );
+		const float q = mx > 0.0f ? mx * ( 1.0f / 127.0f ) : 1.0f;
+		const float rq = 1.0f / q;
+		const float rq2 = rq * 254.0f;
+		qr[r] = q;
+		q2r[r] = q * ( 1.0f / 254.0f );
+
+		// Quantize this warp's share of the slab (blocks of 32 pairs, wn, wn + WN, ...)
+		int s1 = 0, s2 = 0;
+		for ( int blk = wn; blk * 32 < npairs; blk += WN ) {
+			const int i = blk * 32 + lane;
+			if ( i >= npairs ) break;
+			const half2 h = Ap[i];
+			uint32_t pq = 0, pr = 0;
+			#pragma unroll
+			for ( int e = 0; e < 2; ++e ) {
+				const float a = e == 0 ? __low2float( h ) : __high2float( h );
+				const int v = max( -127, min( 127, __float2int_rn( a * rq ) ) );
+				const int v2 = max( -127, min( 127, __float2int_rn( ( a - q * static_cast<float>( v ) ) * rq2 ) ) );
+				pq |= ( static_cast<uint32_t>( v ) & 0xff ) << ( 8 * e );
+				pr |= ( static_cast<uint32_t>( v2 ) & 0xff ) << ( 8 * e );
+				s1 += v;
+				s2 += v2;
+			}
+			const int tile = i >> 3, j = i & 7;
+			const int at = ( tile * 4 + ( j & 3 ) ) * 2 + ( j >> 2 );
+			st_q[at] = static_cast<uint16_t>( pq );
+			st_r[at] = static_cast<uint16_t>( pr );
+		}
+		#pragma unroll
+		for ( int o = 16; o > 0; o >>= 1 ) {
+			s1 += __shfl_xor_sync( 0xffffffffu, s1, o );
+			s2 += __shfl_xor_sync( 0xffffffffu, s2, o );
+		}
+		if ( lane == 0 ) { sh_si[warp][r][0] = s1; sh_si[warp][r][1] = s2; }
+	}
+	__syncthreads();
+
+	const float k_inv = __half2float( __ushort_as_half( 0x1eee ) );
+	const float k_bias = __half2float( __ushort_as_half( 0xc931 ) );
+	float corr[R];
+	#pragma unroll
+	for ( int r = 0; r < R; ++r ) {
+		int S1 = 0, S2 = 0;
+		#pragma unroll
+		for ( int w = 0; w < WN; ++w ) { S1 += sh_si[wk * WN + w][r][0]; S2 += sh_si[wk * WN + w][r][1]; }
+		corr[r] = ( 1024.0f * k_inv + k_bias ) * ( qr[r] * static_cast<float>( S1 ) + q2r[r] * static_cast<float>( S2 ) );
+	}
+
+	int x_src_a, x_src_b, x_s2;
+	{
+		const int t_offset = lane << 3;
+		const int b1 = ( t_offset + 257 ) * 3;
+		const int b2 = b1 + 21;
+		const int i0 = ( b1 - 16 ) / 32;
+		const int i2 = ( b2 - 1 ) / 32;
+		x_s2 = ( i2 + 1 ) * 32 - b2;
+		x_src_a = i0 % 24;
+		x_src_b = i2 % 24;
+	}
+
+	const uint32_t* bp = B32 + static_cast<size_t>( ks0 ) * slice_stride + ( group * WN + wn ) * GWORDS + lane;
+	auto ld_b = [&]( int i, int l ) -> uint32_t {
+		return lane < 24 ? __ldcs( bp + static_cast<size_t>( i ) * slice_stride + l * LSTRIDE ) : 0;
+	};
+
+	uint32_t pf[PF][LOADS];
+	#pragma unroll
+	for ( int d = 0; d < PF; ++d ) {
+		if ( d < myn ) {
+			#pragma unroll
+			for ( int l = 0; l < LOADS; ++l ) pf[d][l] = ld_b( d, l );
+		}
+	}
+
+	int ia[R][WNT][2] = {}, ja[R][WNT][2] = {};
+	const int m = lane & 3;
+
+	for ( int ib = 0; ib < myn; ib += PF ) {
+		#pragma unroll
+		for ( int d = 0; d < PF; ++d ) {
+			const int i = ib + d;
+			if ( i >= myn ) break;
+
+			uint32_t bw[LOADS];
+			#pragma unroll
+			for ( int l = 0; l < LOADS; ++l ) bw[l] = pf[d][l];
+			if ( i + PF < myn ) {
+				#pragma unroll
+				for ( int l = 0; l < LOADS; ++l ) pf[d][l] = ld_b( i + PF, l );
+			}
+
+			uint32_t pa[R][4], pb[R][4];
+			#pragma unroll
+			for ( int r = 0; r < R; ++r ) {
+				const uint32_t qa = reinterpret_cast<const uint32_t*>( sh_stage )[( ( ( r * 2 ) * WKK + wk ) * chunk + i ) * 4 + m];
+				const uint32_t qb = reinterpret_cast<const uint32_t*>( sh_stage )[( ( ( r * 2 + 1 ) * WKK + wk ) * chunk + i ) * 4 + m];
+				pa[r][0] = __byte_perm( qa, 0, 0x0000 ); pa[r][1] = __byte_perm( qa, 0, 0x1111 );
+				pa[r][2] = __byte_perm( qa, 0, 0x2222 ); pa[r][3] = __byte_perm( qa, 0, 0x3333 );
+				pb[r][0] = __byte_perm( qb, 0, 0x0000 ); pb[r][1] = __byte_perm( qb, 0, 0x1111 );
+				pb[r][2] = __byte_perm( qb, 0, 0x2222 ); pb[r][3] = __byte_perm( qb, 0, 0x3333 );
+			}
+
+			#pragma unroll
+			for ( int t = 0; t < WNT; ++t ) {
+				const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+				const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
+				uint32_t w[8];
+				w[7] = fshift( bwv, awv, x_s2 );
+				w[6] = w[7] >> 3;
+				w[5] = w[6] >> 3;
+				w[4] = w[5] >> 3;
+				w[3] = fshift( bwv, awv, x_s2 + 12 );
+				w[2] = w[3] >> 3;
+				w[1] = w[2] >> 3;
+				w[0] = w[1] >> 3;
+				#pragma unroll
+				for ( int j = 0; j < 8; ++j ) w[j] = ( w[j] & 0xffff ) * 0x83DCD12Du;
+				#pragma unroll
+				for ( int r = 0; r < R; ++r ) {
+					#pragma unroll
+					for ( int j = 0; j < 4; ++j ) {
+						ia[r][t][0] = dp4a_us_c( w[j], pa[r][j], ia[r][t][0] );
+						ia[r][t][1] = dp4a_us_c( w[4 + j], pa[r][j], ia[r][t][1] );
+						ja[r][t][0] = dp4a_us_c( w[j], pb[r][j], ja[r][t][0] );
+						ja[r][t][1] = dp4a_us_c( w[4 + j], pb[r][j], ja[r][t][1] );
+					}
+				}
+			}
+		}
+	}
+
+	// Four lanes (lane % 4) share each column
+	#pragma unroll
+	for ( int r = 0; r < R; ++r ) {
+		#pragma unroll
+		for ( int t = 0; t < WNT; ++t ) {
+			#pragma unroll
+			for ( int f = 0; f < 2; ++f ) {
+				#pragma unroll
+				for ( int o = 1; o < 4; o <<= 1 ) {
+					ia[r][t][f] += __shfl_xor_sync( 0xffffffffu, ia[r][t][f], o );
+					ja[r][t][f] += __shfl_xor_sync( 0xffffffffu, ja[r][t][f], o );
+				}
+			}
+		}
+	}
+	if ( m == 0 ) {
+		#pragma unroll
+		for ( int r = 0; r < R; ++r ) {
+			float* red = sh_red + ( wk * ROWS + r ) * TCOLS + wn * COLS;
+			#pragma unroll
+			for ( int t = 0; t < WNT; ++t ) {
+				#pragma unroll
+				for ( int f = 0; f < 2; ++f ) {
+					red[t * 16 + f * 8 + ( lane >> 2 )] = k_inv * ( qr[r] * static_cast<float>( ia[r][t][f] ) + q2r[r] * static_cast<float>( ja[r][t][f] ) ) + corr[r];
+				}
+			}
+		}
+	}
+	__syncthreads();
+
+	for ( int o = threadIdx.x; o < TCOLS * nrows; o += THREADS ) {
+		const int r = o / TCOLS;
+		const int c = o % TCOLS;
+		float sum = 0.0f;
+		#pragma unroll
+		for ( int j = 0; j < WKK; ++j ) sum += sh_red[( j * ROWS + r ) * TCOLS + c];
+		C[static_cast<size_t>( rows[r] ) * c_stride + group * TCOLS + c] = sum;
+	}
+	__syncthreads();
+}
+
+// A run of any width in passes of up to RMAX (1 or 4) rows, each in the smallest instantiation that holds it. Rows are
+// independent, so a row's result is the same whichever pass it lands in.
+template <int cb, int WN_, int RMAX>
+__device__ __forceinline__ void gemv_tile_i8_rows(
+	const uint32_t* __restrict__ B32, const half2* __restrict__ A2, size_t a_stride2, const int* __restrict__ rows, int nrows,
+	float* __restrict__ C, size_t c_stride, int k_begin, int k_end, int ntiles, int group, float* __restrict__ sh_red, uint32_t* __restrict__ sh_stage
+) {
+	for ( int r0 = 0; r0 < nrows; r0 += RMAX ) {
+		const int n = min( RMAX, nrows - r0 );
+		if ( RMAX == 1 || n == 1 ) gemv_tile_i8<cb, WN_, 1>( B32, A2, a_stride2, rows + r0, n, C, c_stride, k_begin, k_end, ntiles, group, sh_red, sh_stage );
+		else if ( n == 2 ) gemv_tile_i8<cb, WN_, 2>( B32, A2, a_stride2, rows + r0, n, C, c_stride, k_begin, k_end, ntiles, group, sh_red, sh_stage );
+		else gemv_tile_i8<cb, WN_, 4>( B32, A2, a_stride2, rows + r0, n, C, c_stride, k_begin, k_end, ntiles, group, sh_red, sh_stage );
+	}
+}
+
 // Completion counter: every thread fences its own stores, then one thread arrives. Returns true (block-uniform) for the
 // last arriving block, which may then read the other blocks' results through L2 (load_*_cg)
 __device__ __forceinline__ bool arrive_last( int* counter, int expected, int* sh_flag ) {
@@ -457,7 +707,7 @@ void rot_kernel( const MoeCoopParams p ) {
 
 // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (output rotation, svh, activation,
 // down-input rotation) by the last arrival per (slot, chunk)
-template <int cb, int WN_>
+template <int cb, int WN_, int MODE>
 __global__ __launch_bounds__( THREADS )
 void a_kernel( const MoeCoopParams p ) {
 	constexpr int TCOLS = tile_cols<WN_>();
@@ -512,7 +762,18 @@ void a_kernel( const MoeCoopParams p ) {
 		const uint32_t* B32 = reinterpret_cast<const uint32_t*>( ( is_gate ? p.g_trellis : p.u_trellis )[local] );
 		// Partial output rows of split ks live at slot + ks * slots
 		float* C = ( is_gate ? p.gu_g : p.gu_u ) + static_cast<size_t>( ks ) * ( p.bsz * p.topk ) * p.I;
-		gemv_tile<cb, WN_>( B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red );
+		// Tile mode: 0 tensor core, 1 int8 one row, 2 int8 any width, 3 int8 up to 4 rows and tensor core above
+		bool done = false;
+		if constexpr ( MODE > 0 ) {
+			if ( MODE != 3 || nrows <= 4 ) {
+				uint32_t* sh_stage = reinterpret_cast<uint32_t*>( sh_red ) + smem_red_bytes() / 4;
+				gemv_tile_i8_rows<cb, WN_, MODE == 1 ? 1 : 4>( B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red, sh_stage );
+				done = true;
+			}
+		}
+		if constexpr ( MODE == 0 || MODE == 3 ) {
+			if ( !done ) gemv_tile<cb, WN_>( B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red );
+		}
 	}
 
 	for ( int r = 0; r < nrows; ++r ) {
@@ -560,7 +821,7 @@ void a_kernel( const MoeCoopParams p ) {
 
 // Kernel B: down GEMV per (expert run, group); the last arrival of a (token, chunk) reduces the token's slots (rotation, svh,
 // routing weight) in a fixed order and stores the row
-template <int cb, int WN_>
+template <int cb, int WN_, int MODE>
 __global__ __launch_bounds__( THREADS )
 void b_kernel( const MoeCoopParams p ) {
 	constexpr int TCOLS = tile_cols<WN_>();
@@ -589,8 +850,19 @@ void b_kernel( const MoeCoopParams p ) {
 
 	{
 		const uint32_t* B32 = reinterpret_cast<const uint32_t*>( p.d_trellis[local] );
-		gemv_tile<cb, WN_>( B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
-			0, p.I / 16, p.H / 16, group, sh_red );
+		bool done = false;
+		if constexpr ( MODE > 0 ) {
+			if ( MODE != 3 || nrows <= 4 ) {
+				uint32_t* sh_stage = reinterpret_cast<uint32_t*>( sh_part ) + smem_part_bytes() / 4;
+				gemv_tile_i8_rows<cb, WN_, MODE == 1 ? 1 : 4>( B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
+					0, p.I / 16, p.H / 16, group, sh_red, sh_stage );
+				done = true;
+			}
+		}
+		if constexpr ( MODE == 0 || MODE == 3 ) {
+			if ( !done ) gemv_tile<cb, WN_>( B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
+				0, p.I / 16, p.H / 16, group, sh_red );
+		}
 	}
 
 	for ( int r = 0; r < nrows; ++r ) {
@@ -646,6 +918,8 @@ void b_kernel( const MoeCoopParams p ) {
 
 namespace {
 
+int tile_wk_rt( int wn ) { return exl3_moe_coop_ns::WK / wn; }
+
 int pick_ksplit( int base, int kslices, int max_split, int num_sms ) {
 	static const int forced = std::getenv( "EXL3_MOE_COOP_KSPLIT" ) ? std::atoi( std::getenv( "EXL3_MOE_COOP_KSPLIT" ) ) : 0;
 	if ( forced > 0 ) return MIN( forced, max_split );
@@ -666,36 +940,44 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	p.ctr_a_len = MOE_COOP_MAX_SLOTS * ( p.I / 128 );
 	p.ctr_b_len = MOE_COOP_MAX_ROWS * ( p.H / 128 );
 
-	// Block geometry per stage: warps along n (the rest split k). Gate/up has a long k and takes few columns per block; the
-	// down projection's k is short, so wide column tiles keep the per-block fixed costs down
-	static const int wn_a_env = std::getenv( "EXL3_MOE_COOP_WNA" ) ? std::atoi( std::getenv( "EXL3_MOE_COOP_WNA" ) ) : 4;
-	static const int wn_b_env = std::getenv( "EXL3_MOE_COOP_WNB" ) ? std::atoi( std::getenv( "EXL3_MOE_COOP_WNB" ) ) : 4;
-	const int wn_a = wn_a_env, wn_b = wn_b_env;
+	// Block geometry: 4 warps along n (128 columns per block) for both stages; other widths, 8 vs 16 warps and the split-k
+	// factor all measured level
+	constexpr int WN = 4;
 	const int num_sms = engine::modules::trellis_get_num_sms( device );
-	const int tcols_a = wn_a * COLS;
-	const int tcols_b = wn_b * COLS;
-	ENGINE_ASSERT( p.I % tcols_a == 0 && p.H % tcols_b == 0, "exl3_moe_coop: tile width" );
+	constexpr int tcols = WN * COLS;
+	ENGINE_ASSERT( p.I % tcols == 0 && p.H % tcols == 0, "exl3_moe_coop: tile width" );
 
 	// The split-k factor is sized for the one-row grid and kept for every row count: it sets the order in which a row's partial
 	// sums are added, and a row's result must not depend on how many other rows share the call (speculative verify == plain decode)
-	const int base_a = slots * 2 * ( p.I / tcols_a );
-	p.ksplit_a = pick_ksplit( MOE_COOP_TOPK * 2 * ( p.I / tcols_a ), p.H / 16, MOE_COOP_KSPLIT_MAX, num_sms );
+	const int base_a = slots * 2 * ( p.I / tcols );
+	p.ksplit_a = pick_ksplit( MOE_COOP_TOPK * 2 * ( p.I / tcols ), p.H / 16, MOE_COOP_KSPLIT_MAX, num_sms );
 	p.ksplit_b = 1;
 	const int grid_a = base_a * p.ksplit_a;
-	const int grid_b = slots * ( p.H / tcols_b );
+	const int grid_b = slots * ( p.H / tcols );
 
-	const int smem_a = p.H * 2 + smem_red_bytes();
-	const int smem_b = smem_red_bytes() + smem_part_bytes();
+	// Tile: 0 fp16 tensor core (EXL3_MOE_I8=0), 1 int8 dp4a for one-row decode. With more rows EXL3_MOE_I8_VERIFY picks 0 tensor
+	// core, 1 (default) dp4a for runs of up to 4 rows and tensor core above, 2 dp4a for every run (wide runs in 4-row passes,
+	// which re-read the weights and lose to the tensor core there)
+	static const bool i8_env = !std::getenv( "EXL3_MOE_I8" ) || std::atoi( std::getenv( "EXL3_MOE_I8" ) ) != 0;
+	static const int i8_verify_env = std::getenv( "EXL3_MOE_I8_VERIFY" ) ? std::atoi( std::getenv( "EXL3_MOE_I8_VERIFY" ) ) : 1;
+	const int mode = !i8_env ? 0 : ( p.bsz == 1 ? 1 : ( i8_verify_env == 0 ? 0 : ( i8_verify_env == 1 ? 3 : 2 ) ) );
+	const int stage_rows = mode == 1 ? 1 : ( mode >= 2 ? 4 : 0 );
+	// int8 activation staging: 2 x 16 B per k-tile per k-slab
+	constexpr int wkk = WK / WN;
+	const int stage_a = stage_rows * wkk * CEIL_DIVIDE( CEIL_DIVIDE( p.H / 16, p.ksplit_a ), wkk ) * 32;
+	const int stage_b = stage_rows * wkk * CEIL_DIVIDE( p.I / 16, wkk ) * 32;
+	const int smem_a = p.H * 2 + smem_red_bytes() + stage_a;
+	const int smem_b = smem_red_bytes() + smem_part_bytes() + stage_b;
 	static bool attr_set[ENGINE_NUM_GPUS] = { false };
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, WN, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, WN, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, WN, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, WN, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, WN, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, WN, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
 		attr_set[device] = true;
 	}
 
@@ -703,17 +985,23 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 		const int rot_warps = slots * ( p.H / 128 ) * 2;
 		rot_kernel<<<dim3( MAX( 1, CEIL_DIVIDE( rot_warps, THREADS / 32 ) ) ), dim3( THREADS ), 0, stream>>>( p );
 	}
-	switch ( wn_a ) {
-		case 1: a_kernel<2, 1><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p ); break;
-		case 2: a_kernel<2, 2><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p ); break;
-		case 8: a_kernel<2, 8><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p ); break;
-		default: a_kernel<2, 4><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p ); break;
-	}
-	switch ( wn_b ) {
-		case 2: b_kernel<2, 2><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p ); break;
-		case 8: b_kernel<2, 8><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p ); break;
-		case 16: b_kernel<2, 16><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p ); break;
-		default: b_kernel<2, 4><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p ); break;
+	switch ( mode ) {
+		case 1: {
+			a_kernel<2, WN, 1><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+			b_kernel<2, WN, 1><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+		} break;
+		case 2: {
+			a_kernel<2, WN, 2><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+			b_kernel<2, WN, 2><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+		} break;
+		case 3: {
+			a_kernel<2, WN, 3><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+			b_kernel<2, WN, 3><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+		} break;
+		default: {
+			a_kernel<2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+			b_kernel<2, WN, 0><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+		} break;
 	}
 	CUDA_CHECK( cudaGetLastError() );
 }

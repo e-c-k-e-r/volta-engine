@@ -93,11 +93,12 @@ int main( int argc, char** argv ) {
 		// The open-ended prompt (last) only checks seeds: its FP16 logits can tie exactly (GLM: two tokens at 17.73438),
 		// greedy takes the lower id and the sampler legitimately picks either.
 		const bool tie_prone = ( pi + 1 == all.size() );
-		// A divergence is also excused where the greedy choice was decided by under 0.1 logits (a few FP16 steps at this
-		// magnitude): the verify rows and the single-row graph differ in rounding, so a near-tie can legitimately flip
+		// A divergence is also excused where the greedy choice was decided by under 0.4 logits: the verify rows and the
+		// single-row graph round differently (test_glm_rows measures up to 0.2-0.3 logits at the last position of a 64-token
+		// prompt), so a near-tie can legitimately flip
 		auto matches = [&]( const std::vector<int>& v ) {
 			for ( size_t i = 0; i < g.size() && i < v.size(); ++i ) {
-				if ( g[i] != v[i] ) return i < gaps.size() && gaps[i] < 0.1f;
+				if ( g[i] != v[i] ) return i < gaps.size() && gaps[i] < 0.4f;
 			}
 			return true;
 		};
@@ -107,7 +108,7 @@ int main( int argc, char** argv ) {
 		for ( const auto* v : { &a, &b } ) {
 			for ( size_t i = 0; i < g.size() && i < v->size(); ++i ) {
 				if ( g[i] != ( *v )[i] ) {
-					std::printf( "    first divergence at %zu: greedy %d, sampled %d\n", i, g[i], ( *v )[i] );
+					std::printf( "    first divergence at %zu: greedy %d, sampled %d (gap %.4f)\n", i, g[i], ( *v )[i], i < gaps.size() ? gaps[i] : -1.0f );
 					break;
 				}
 			}
