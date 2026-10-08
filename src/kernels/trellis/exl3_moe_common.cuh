@@ -9,7 +9,7 @@
 
 #define MOE_SMS_PER_EXPERT 8
 #define MOE_MAX_SMS_PER_EXPERT 32
-#define MOE_TILESIZE_K 32
+#define MOE_TILESIZE_K 16
 #define MOE_TILESIZE_M 16
 #define MOE_SH_STAGES 3
 #define MOE_FRAG_STAGES 3
