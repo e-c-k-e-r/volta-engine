@@ -8,6 +8,7 @@ struct ServerConfig {
 	std::string host = "0.0.0.0";
 	int port = 8000;
 	int max_batch_size = 8;
+	int request_timeout_s = 30;   // a connection that sends nothing for this long before its request is complete is dropped
 	int default_max_tokens = 256;
 	// Sampling defaults for requests that do not set them; negative = take the checkpoint's generation_config.json
 	// (temperature, top_p, top_k), else greedy / 1.0 / 16.

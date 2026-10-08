@@ -61,6 +61,7 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 	if ( j.contains( "port" ) && j["port"].is_number_integer() ) {
 		port = j["port"].get<int>();
 	}
+	if ( j.contains( "request_timeout_s" ) && j["request_timeout_s"].is_number_integer() ) request_timeout_s = j["request_timeout_s"].get<int>();
 	if ( j.contains( "max_batch_size" ) && j["max_batch_size"].is_number_integer() ) {
 		max_batch_size = j["max_batch_size"].get<int>();
 	}

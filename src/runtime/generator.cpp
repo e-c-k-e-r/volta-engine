@@ -232,7 +232,7 @@ void Generator::prefill_slot( int s ) {
 	if ( prefix_cache_ && n >= kPrefixMinTokens ) {
 		std::vector<GenerationRequest::Checkpoint> cps = slot.req.checkpoint_at;
 		const int interval = runtime::options().prefix_interval;
-		for ( int p = interval; interval > 0 && p < n - kPrefixMinTokens; p += interval ) cps.push_back( { p, false } );
+		for ( int p = interval; interval > 0 && p < n - kPrefixMinTokens; p += interval ) cps.push_back( { p, false, false } );
 		std::sort( cps.begin(), cps.end(), []( const GenerationRequest::Checkpoint& a, const GenerationRequest::Checkpoint& b ) { return a.pos < b.pos || ( a.pos == b.pos && a.pinned > b.pinned ); } );
 		bool chain_ok = true;
 		int last = -1;
@@ -241,7 +241,7 @@ void Generator::prefill_slot( int s ) {
 			last = cp.pos;
 			cluster_.prefill( prompt.data() + pos, cp.pos - pos, s, 0, nullptr, pos );
 			pos = cp.pos;
-			node = store_prefix( s, node, pos, cp.pinned );
+			node = store_prefix( s, node, pos, cp.pinned, cp.taps );
 			chain_ok = node != nullptr;
 		}
 	}
@@ -260,11 +260,11 @@ void Generator::prefill_slot( int s ) {
 
 // Snapshots slot s's prompt up to `tokens` as a child of `parent` (KV rows since the parent only). Returns the cache node for
 // that prefix, an existing one if present, or nullptr if it could not be stored.
-PrefixCache::Entry* Generator::store_prefix( int s, PrefixCache::Entry* parent, int tokens, bool pinned ) {
+PrefixCache::Entry* Generator::store_prefix( int s, PrefixCache::Entry* parent, int tokens, bool pinned, bool with_taps ) {
 	const std::vector<int> key( slots_[s].req.prompt_tokens.begin(), slots_[s].req.prompt_tokens.begin() + tokens );
 	if ( PrefixCache::Entry* e = prefix_cache_->exact( key ) ) return e;
 	ModelCluster::SeqSnapshot snap;
-	if ( !cluster_.save_snapshot( s, parent ? static_cast<int>( parent->tokens.size() ) : 0, tokens, &snap ) ) return nullptr;
+	if ( !cluster_.save_snapshot( s, parent ? static_cast<int>( parent->tokens.size() ) : 0, tokens, &snap, with_taps ) ) return nullptr;
 	return prefix_cache_->insert( parent, key, snap, pinned );
 }
 

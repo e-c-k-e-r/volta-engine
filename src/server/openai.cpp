@@ -152,7 +152,7 @@ public:
 				if ( !sse( u ) ) return;
 			}
 			conn_->write_all( "data: [DONE]\n\n" );
-			conn_->close_now();
+			conn_->finish();
 			return;
 		}
 		json msg = { { "role", "assistant" }, { "content", content_.empty() && !calls_.empty() ? json( nullptr ) : json( content_ ) } };
@@ -228,6 +228,11 @@ public:
 			if ( j["tools"].is_array() && !j["tools"].empty() ) r.tools_json = tools;
 		}
 
+		if ( j.contains( "tool_choice" ) ) {
+			const json& tc = j["tool_choice"];
+			if ( tc.is_string() && tc == "required" ) r.require_tool = true;
+			else if ( tc.is_object() && tc.contains( "function" ) && tc["function"].is_object() ) r.force_tool = tc["function"].value( "name", std::string() );
+		}
 		r.stream = j.value( "stream", false );
 		if ( j.contains( "stream_options" ) && j["stream_options"].is_object() ) r.include_usage = j["stream_options"].value( "include_usage", false );
 		for ( const char* key : { "max_completion_tokens", "max_tokens" } ) {

@@ -148,9 +148,11 @@ public:
 	virtual void set_snapshot_taps( bool on ) { (void) on; }
 	// A snapshot covers positions [from, tokens): the recurrent state and tap rows at `tokens` plus only the KV rows of that
 	// range, so a chain of snapshots (from = the parent's tokens) stores each KV row once. load with kv_only skips the state.
-	virtual size_t seq_state_bytes( int from, int tokens ) const { (void) from; (void) tokens; return 0; }
-	virtual bool save_seq_state( int slot_id, int from, int tokens, void* host_dst, backend::stream_t stream = nullptr ) { (void) slot_id; (void) from; (void) tokens; (void) host_dst; (void) stream; return false; }
-	virtual bool load_seq_state( int slot_id, int from, int tokens, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) { (void) slot_id; (void) from; (void) tokens; (void) host_src; (void) kv_only; (void) stream; return false; }
+	// with_taps: also store the drafter tap rows (only meaningful after set_snapshot_taps); a snapshot without them resumes a
+	// slot that cannot speculate.
+	virtual size_t seq_state_bytes( int from, int tokens, bool with_taps ) const { (void) from; (void) tokens; (void) with_taps; return 0; }
+	virtual bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) { (void) slot_id; (void) from; (void) tokens; (void) with_taps; (void) host_dst; (void) stream; return false; }
+	virtual bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) { (void) slot_id; (void) from; (void) tokens; (void) with_taps; (void) host_src; (void) kv_only; (void) stream; return false; }
 
 	// 6. Output descriptors & tapped states
 	virtual pod::TensorView& logits() = 0;

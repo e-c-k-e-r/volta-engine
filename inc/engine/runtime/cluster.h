@@ -54,11 +54,12 @@ public:
 	struct SeqSnapshot {
 		int from = 0;                      // the snapshot holds KV rows [from, tokens); a chain links from = the parent's tokens
 		int tokens = 0;
+		bool with_taps = false;            // carries the drafter tap rows: a restore keeps speculating
 		size_t bytes = 0;                  // per rank
 		void* host[ENGINE_NUM_GPUS] = {};
 	};
-	size_t snapshot_bytes( int from, int tokens ) const;    // per rank; 0 when the model cannot snapshot
-	bool save_snapshot( int slot, int from, int tokens, SeqSnapshot* snap );
+	size_t snapshot_bytes( int from, int tokens, bool with_taps = false ) const;    // per rank; 0 when the model cannot snapshot
+	bool save_snapshot( int slot, int from, int tokens, SeqSnapshot* snap, bool with_taps = true );
 	// Writes the snapshot into the slot: its KV rows, and unless kv_only the recurrent state and tap rows (the slot then
 	// claims the drafter, which re-reads its window from the restored taps). A chain is restored ancestors first (kv_only),
 	// then the node being resumed from.

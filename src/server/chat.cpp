@@ -121,6 +121,15 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 		return false;
 	}
 	if ( vars["messages"].is_array() ) fold_system_messages( vars["messages"] );
+	// tool_choice required / named: say so on the last user turn (not after a tool result, or the model would loop on it)
+	if ( !req.tools_json.empty() && ( req.require_tool || !req.force_tool.empty() ) && vars["messages"].is_array() && !vars["messages"].empty() &&
+		vars["messages"].back().value( "role", std::string() ) == "user" ) {
+		const std::string hint = req.force_tool.empty() ? "\n\n(Respond by calling one of the available functions.)"
+			: "\n\n(Respond by calling the function " + req.force_tool + ".)";
+		auto& last = vars["messages"].back();
+		if ( last["content"].is_string() ) last["content"] = last["content"].get<std::string>() + hint;
+		else if ( last["content"].is_array() ) last["content"].push_back( { { "type", "text" }, { "text", hint } } );
+	}
 	if ( !req.tools_json.empty() ) vars["tools"] = nlohmann::ordered_json::parse( req.tools_json, nullptr, false );
 	vars["add_generation_prompt"] = true;
 	vars["enable_thinking"] = thinking;
@@ -131,6 +140,8 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 		err->message = "the chat template rejected this conversation: " + terr;
 		return false;
 	}
+	// The GLM template always opens <think>; non-thinking mode closes it right away (GLM-4.5 convention)
+	if ( !thinking && family == engine::loader::ModelFamily::GLM && ends_with( *prompt, "<think>" ) ) *prompt += "</think>";
 	*tokens = gen.tokenizer().encode( *prompt, false );
 	const int ctx = gen.max_context();
 	if ( tokens->empty() || static_cast<int>( tokens->size() ) + 1 >= ctx ) {

@@ -857,22 +857,22 @@ size_t Qwen3_5Pipeline::tap_snapshot_bytes( int tokens ) const {
 	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * 5 * config_.hidden_size * sizeof( backend::half_t );
 }
 
-size_t Qwen3_5Pipeline::seq_state_bytes( int from, int tokens ) const {
+size_t Qwen3_5Pipeline::seq_state_bytes( int from, int tokens, bool with_taps ) const {
 	if ( kv_pool_.format != pod::KVFormat::FP16 || from < 0 || tokens < from || tokens > config_.max_seq ) return 0;
 	const size_t recurrent = ( state_.slot_gdn_floats + state_.slot_conv_floats ) * sizeof( float );
 	const size_t kv_row = static_cast<size_t>( kv_pool_.num_heads ) * kv_pool_.head_dim * sizeof( backend::half_t );
-	return recurrent + tap_snapshot_bytes( tokens ) + 2 * static_cast<size_t>( kv_pool_.num_layers ) * ( tokens - from ) * kv_row + kSeqAlign;
+	return recurrent + ( with_taps ? tap_snapshot_bytes( tokens ) : 0 ) + 2 * static_cast<size_t>( kv_pool_.num_layers ) * ( tokens - from ) * kv_row + kSeqAlign;
 }
 
-bool Qwen3_5Pipeline::save_seq_state( int slot_id, int from, int tokens, void* host_dst, backend::stream_t stream ) {
-	if ( seq_state_bytes( from, tokens ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+bool Qwen3_5Pipeline::save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens, with_taps ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
 	backend::set_device( rank_ );
 	char* dst = static_cast<char*>( host_dst );
 	const size_t gdn = state_.slot_gdn_floats * sizeof( float ), conv = state_.slot_conv_floats * sizeof( float );
 	backend::memcpy_async( dst, state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, gdn, backend::Copy::D2H, stream );
 	backend::memcpy_async( dst + gdn, state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, conv, backend::Copy::D2H, stream );
 	dst += gdn + conv;
-	if ( const size_t tap_bytes = tap_snapshot_bytes( tokens ) ) {
+	if ( const size_t tap_bytes = with_taps ? tap_snapshot_bytes( tokens ) : 0 ) {
 		backend::memcpy_async( dst, draft_taps_.data, tap_bytes, backend::Copy::D2H, stream );
 		dst += tap_bytes;
 	}
@@ -886,12 +886,12 @@ bool Qwen3_5Pipeline::save_seq_state( int slot_id, int from, int tokens, void* h
 	return true;
 }
 
-bool Qwen3_5Pipeline::load_seq_state( int slot_id, int from, int tokens, const void* host_src, bool kv_only, backend::stream_t stream ) {
-	if ( seq_state_bytes( from, tokens ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+bool Qwen3_5Pipeline::load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens, with_taps ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
 	backend::set_device( rank_ );
 	const char* src = static_cast<const char*>( host_src );
 	const size_t gdn = state_.slot_gdn_floats * sizeof( float ), conv = state_.slot_conv_floats * sizeof( float );
-	const size_t tap_bytes = tap_snapshot_bytes( tokens );
+	const size_t tap_bytes = with_taps ? tap_snapshot_bytes( tokens ) : 0;
 	if ( !kv_only ) {
 		backend::memcpy_async( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, src, gdn, backend::Copy::H2D, stream );
 		backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, src + gdn, conv, backend::Copy::H2D, stream );

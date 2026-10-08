@@ -153,7 +153,12 @@ void VoltaServer::handle_new_connection() {
 }
 
 void VoltaServer::sweep_closed() {
+	// Connections that never complete a request are dropped (request_timeout_s since the last byte)
+	const auto now = std::chrono::steady_clock::now();
 	for ( auto it = conns_.begin(); it != conns_.end(); ) {
+		if ( !it->second->closed() && !it->second->dispatched && now - it->second->last_activity > std::chrono::seconds( config_.request_timeout_s ) ) {
+			send_error( it->second, 408, "invalid_request_error", "timed out waiting for the request" );
+		}
 		if ( it->second->closed() ) it = conns_.erase( it );
 		else ++it;
 	}
@@ -240,6 +245,7 @@ void VoltaServer::dispatch( const ConnPtr& conn, const Request& req ) {
 	const bool post = req.method == "POST";
 	if ( get && ( req.path == "/health" || req.path == "/" ) ) return handle_health( conn );
 	if ( get && req.path == "/metrics" ) return handle_metrics( conn );
+	if ( get && req.path == "/metrics/prometheus" ) return handle_metrics_prometheus( conn );
 	if ( get && req.path == "/v1/models" ) return handle_models( conn );
 	if ( req.path == "/v1/chat/completions" ) {
 		if ( !post ) return send_error( conn, 405, "invalid_request_error", "use POST" );
@@ -282,6 +288,31 @@ void VoltaServer::handle_metrics( const ConnPtr& conn ) {
 			{ "inserts", metrics.prefix.inserts }, { "evictions", metrics.prefix.evictions }, { "entries", metrics.prefix.entries }, { "bytes", metrics.prefix.bytes } };
 	}
 	send_json( conn, 200, m.dump( 2 ) + "\n" );
+}
+
+void VoltaServer::handle_metrics_prometheus( const ConnPtr& conn ) {
+	const auto m = generator_->get_metrics();
+	char buf[4096];
+	int n = 0;
+	auto line = [&]( const char* name, const char* type, double v, const char* labels = "" ) {
+		n += std::snprintf( buf + n, sizeof( buf ) - static_cast<size_t>( n ), "# TYPE %s %s\n%s%s %.6g\n", name, type, name, labels, v );
+	};
+	line( "volta_uptime_seconds", "gauge", m.uptime_seconds );
+	line( "volta_active_slots", "gauge", m.active_slots );
+	line( "volta_requests_total", "counter", static_cast<double>( m.total_requests ) );
+	line( "volta_ttft_milliseconds_avg", "gauge", m.avg_ttft_ms );
+	line( "volta_prefill_tokens_per_second_avg", "gauge", m.avg_prefill_tok_s );
+	line( "volta_decode_tokens_per_second_avg", "gauge", m.avg_decode_tok_s );
+	line( "volta_speculation_acceptance_ratio", "gauge", m.spec_acceptance_rate );
+	if ( m.prefix_enabled ) {
+		line( "volta_prefix_cache_lookups_total", "counter", static_cast<double>( m.prefix.lookups ) );
+		line( "volta_prefix_cache_hits_total", "counter", static_cast<double>( m.prefix.hits ) );
+		line( "volta_prefix_cache_hit_tokens_total", "counter", static_cast<double>( m.prefix.hit_tokens ) );
+		line( "volta_prefix_cache_evictions_total", "counter", static_cast<double>( m.prefix.evictions ) );
+		line( "volta_prefix_cache_entries", "gauge", static_cast<double>( m.prefix.entries ) );
+		line( "volta_prefix_cache_bytes", "gauge", static_cast<double>( m.prefix.bytes ) );
+	}
+	send_response( conn, 200, "text/plain; version=0.0.4", std::string( buf, static_cast<size_t>( n ) ) );
 }
 
 void VoltaServer::handle_chat( const ConnPtr& conn, const Request& req, ChatProtocol& protocol ) {
@@ -330,7 +361,11 @@ void VoltaServer::run() {
 				if ( it != conns_.end() ) it->second->close_now();
 				continue;
 			}
-			handle_readable( fd );
+			if ( events[i].events & EPOLLOUT ) {
+				auto it = conns_.find( fd );
+				if ( it != conns_.end() ) it->second->on_writable();
+			}
+			if ( events[i].events & EPOLLIN ) handle_readable( fd );
 		}
 		sweep_closed();
 	}

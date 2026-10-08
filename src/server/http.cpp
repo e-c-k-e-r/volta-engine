@@ -4,12 +4,28 @@
 #include <nlohmann/json.hpp>
 
 #include <errno.h>
-#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 namespace engine::server {
+
+void Connection::close_locked() {
+	if ( closed_.exchange( true ) ) return;
+	epoll_ctl( epoll_fd_, EPOLL_CTL_DEL, fd_, nullptr );
+	::shutdown( fd_, SHUT_WR );
+	::close( fd_ );
+	out_.clear();
+}
+
+void Connection::set_epollout_locked( bool on ) {
+	if ( epollout_ == on ) return;
+	epollout_ = on;
+	epoll_event ev = {};
+	ev.events = EPOLLIN | EPOLLRDHUP | ( on ? EPOLLOUT : 0u );
+	ev.data.fd = fd_;
+	epoll_ctl( epoll_fd_, EPOLL_CTL_MOD, fd_, &ev );
+}
 
 bool Connection::read_some( std::string& buf ) {
 	std::lock_guard<std::mutex> lock( mtx_ );
@@ -19,15 +35,13 @@ bool Connection::read_some( std::string& buf ) {
 		const ssize_t n = ::read( fd_, tmp, sizeof( tmp ) );
 		if ( n > 0 ) {
 			buf.append( tmp, static_cast<size_t>( n ) );
+			last_activity = std::chrono::steady_clock::now();
 			if ( buf.size() > ( size_t( 64 ) << 20 ) ) break;
 			continue;
 		}
 		if ( n < 0 && ( errno == EAGAIN || errno == EWOULDBLOCK ) ) return true;
 		if ( n < 0 && errno == EINTR ) continue;
-		// EOF or error
-		if ( closed_.exchange( true ) ) return false;
-		epoll_ctl( epoll_fd_, EPOLL_CTL_DEL, fd_, nullptr );
-		::close( fd_ );
+		close_locked(); // EOF or error
 		return false;
 	}
 	return true;
@@ -36,36 +50,63 @@ bool Connection::read_some( std::string& buf ) {
 bool Connection::write_all( const char* data, size_t len ) {
 	std::lock_guard<std::mutex> lock( mtx_ );
 	if ( closed_.load() ) return false;
-	size_t written = 0;
-	int stalls = 0;
-	while ( written < len ) {
-		const ssize_t n = ::send( fd_, data + written, len - written, MSG_NOSIGNAL );
-		if ( n > 0 ) {
-			written += static_cast<size_t>( n );
-			stalls = 0;
-			continue;
+	size_t off = 0;
+	if ( out_.empty() ) {
+		while ( off < len ) {
+			const ssize_t n = ::send( fd_, data + off, len - off, MSG_NOSIGNAL | MSG_DONTWAIT );
+			if ( n > 0 ) {
+				off += static_cast<size_t>( n );
+				continue;
+			}
+			if ( n < 0 && errno == EINTR ) continue;
+			if ( n < 0 && ( errno == EAGAIN || errno == EWOULDBLOCK ) ) break;
+			close_locked();
+			return false;
 		}
-		if ( n < 0 && errno == EINTR ) continue;
-		if ( n < 0 && ( errno == EAGAIN || errno == EWOULDBLOCK ) ) {
-			pollfd p = { fd_, POLLOUT, 0 };
-			if ( ::poll( &p, 1, 1000 ) > 0 ) continue;
-			if ( ++stalls < 30 ) continue; // a peer that accepts nothing for 30 s is dropped
+	}
+	if ( off < len ) {
+		out_.append( data + off, len - off );
+		if ( out_.size() > kMaxQueued ) {
+			close_locked();
+			return false;
 		}
-		if ( !closed_.exchange( true ) ) {
-			epoll_ctl( epoll_fd_, EPOLL_CTL_DEL, fd_, nullptr );
-			::close( fd_ );
-		}
-		return false;
+		set_epollout_locked( true );
 	}
 	return true;
 }
 
+void Connection::on_writable() {
+	std::lock_guard<std::mutex> lock( mtx_ );
+	if ( closed_.load() ) return;
+	size_t off = 0;
+	while ( off < out_.size() ) {
+		const ssize_t n = ::send( fd_, out_.data() + off, out_.size() - off, MSG_NOSIGNAL | MSG_DONTWAIT );
+		if ( n > 0 ) {
+			off += static_cast<size_t>( n );
+			continue;
+		}
+		if ( n < 0 && errno == EINTR ) continue;
+		if ( n < 0 && ( errno == EAGAIN || errno == EWOULDBLOCK ) ) break;
+		close_locked();
+		return;
+	}
+	out_.erase( 0, off );
+	if ( out_.empty() ) {
+		set_epollout_locked( false );
+		if ( want_close_ ) close_locked();
+	}
+}
+
+void Connection::finish() {
+	std::lock_guard<std::mutex> lock( mtx_ );
+	if ( closed_.load() ) return;
+	if ( out_.empty() ) close_locked();
+	else want_close_ = true;
+}
+
 void Connection::close_now() {
 	std::lock_guard<std::mutex> lock( mtx_ );
-	if ( closed_.exchange( true ) ) return;
-	epoll_ctl( epoll_fd_, EPOLL_CTL_DEL, fd_, nullptr );
-	::shutdown( fd_, SHUT_WR );
-	::close( fd_ );
+	close_locked();
 }
 
 const char* http_reason( int status ) {
@@ -89,7 +130,7 @@ void send_response( const ConnPtr& c, int status, const std::string& content_typ
 	std::string head = "HTTP/1.1 " + std::to_string( status ) + " " + http_reason( status ) + "\r\nContent-Type: " + content_type +
 		"\r\nContent-Length: " + std::to_string( body.size() ) + "\r\nConnection: close\r\n\r\n";
 	c->write_all( head + body );
-	c->close_now();
+	c->finish();
 }
 
 void send_json( const ConnPtr& c, int status, const std::string& json ) {

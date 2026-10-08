@@ -109,6 +109,23 @@ int main( int argc, char** argv ) {
 		mc.free_snapshot( &snap );
 	}
 
+	// A snapshot without taps resumes a slot that decodes without the drafter, with the same tokens
+	if ( spec ) {
+		const int cut = chunk * ( ( n / 2 ) / chunk );
+		mc.reset_slot( 0 );
+		mc.prefill( ids.data(), cut, 0 );
+		ModelCluster::SeqSnapshot nt;
+		ENGINE_ASSERT( mc.save_snapshot( 0, 0, cut, &nt, false ), "save_snapshot failed" );
+		mc.reset_slot( 1 );
+		ENGINE_ASSERT( mc.load_snapshot( 1, nt ), "load_snapshot failed" );
+		const int first = mc.prefill( ids.data() + cut, n - cut, 1, 0, nullptr, cut );
+		const bool plain = !mc.spec_owns( 1 );
+		const std::vector<int> t = decode( mc, first, n, 1, 48 );
+		std::printf( "%s snapshot without taps: drafter %s, tokens %s\n", plain && t == cold ? "[+]" : "[-]", plain ? "released" : "STILL OWNS", t == cold ? "identical" : "DIFFER" );
+		failures += plain && t == cold ? 0 : 1;
+		mc.free_snapshot( &nt );
+	}
+
 	// Steady-state save cost: the second save of a size reuses the pooled pinned buffers
 	{
 		ModelCluster::SeqSnapshot a, b;
@@ -143,7 +160,7 @@ int main( int argc, char** argv ) {
 			pos = cp;
 		}
 		const PrefixCache::Stats chain_stats = cache.stats();
-		const size_t flat = 3 * mc.snapshot_bytes( 0, 4096 ) * mc.tp();
+		const size_t flat = 3 * mc.snapshot_bytes( 0, 4096, true ) * mc.tp();
 		std::printf( "[*] chain of 3 snapshots holds %.0f MiB (3 flat snapshots of 4096 tokens: %.0f MiB)\n", chain_stats.bytes / 1048576.0, flat / 1048576.0 );
 		expect( chain_stats.bytes < flat, "chained storage is smaller than flat snapshots" );
 
@@ -171,7 +188,7 @@ int main( int argc, char** argv ) {
 		cache.clear();
 		auto rounded = [&]( int from, int to ) {
 			const size_t r = size_t( 8 ) << 20;
-			return ( mc.snapshot_bytes( from, to ) + r - 1 ) / r * r * mc.tp();
+			return ( mc.snapshot_bytes( from, to, true ) + r - 1 ) / r * r * mc.tp();
 		};
 		// room for the root and two children, not for a fourth node
 		PrefixCache small( mc, rounded( 0, 900 ) + rounded( 900, 950 ) + rounded( 900, 960 ) + rounded( 960, 1000 ) / 2 );

@@ -48,6 +48,7 @@ struct GenerationRequest {
 	struct Checkpoint {
 		int pos = 0;
 		bool pinned = false;
+		bool taps = true;        // snapshot the drafter taps too (a resume there keeps speculating)
 	};
 	std::vector<Checkpoint> checkpoint_at;   // ascending prompt positions to snapshot into the prefix cache (system-prompt end, turn boundary)
 	std::vector<std::string> stop_strings;   // generation ends before the first match
@@ -115,7 +116,7 @@ private:
 	void step_batch();
 	int adapt_steps_ = 0;
 	void prefill_slot( int s );
-	PrefixCache::Entry* store_prefix( int s, PrefixCache::Entry* parent, int tokens, bool pinned );
+	PrefixCache::Entry* store_prefix( int s, PrefixCache::Entry* parent, int tokens, bool pinned, bool with_taps );
 	static constexpr int kPrefixMinTokens = 512;
 	// Commits `tok` to slot s's output; returns true when the request finished.
 	bool emit_token( int s, int tok );

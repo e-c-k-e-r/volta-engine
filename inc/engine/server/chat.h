@@ -35,6 +35,9 @@ struct ChatRequest {
 	std::vector<std::string> stop;
 	int enable_thinking = -1;    // -1: server default
 	std::string reasoning_effort;
+	// tool_choice "required" / a named function: the model is told to call a tool (best effort, no constrained decoding)
+	bool require_tool = false;
+	std::string force_tool;
 };
 
 struct Usage {

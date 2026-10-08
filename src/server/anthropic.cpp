@@ -174,7 +174,7 @@ public:
 			if ( !event( "message_delta", { { "type", "message_delta" }, { "delta", { { "stop_reason", stop }, { "stop_sequence", stop_seq } } },
 				{ "usage", { { "output_tokens", usage.completion_tokens } } } } ) ) return;
 			event( "message_stop", { { "type", "message_stop" } } );
-			conn_->close_now();
+			conn_->finish();
 			return;
 		}
 		json msg = { { "id", message_id_ }, { "type", "message" }, { "role", "assistant" }, { "model", model_ }, { "content", blocks_.empty() ? json::array() : blocks_ },
@@ -250,6 +250,11 @@ public:
 			std::string tools = normalize_tools( j["tools"].dump(), &ok );
 			if ( !ok ) return fail( err, "malformed tools" );
 			r.tools_json = tools;
+		}
+		if ( j.contains( "tool_choice" ) && j["tool_choice"].is_object() ) {
+			const std::string t = j["tool_choice"].value( "type", std::string() );
+			if ( t == "any" ) r.require_tool = true;
+			else if ( t == "tool" ) r.force_tool = j["tool_choice"].value( "name", std::string() );
 		}
 		r.stream = j.value( "stream", false );
 		if ( j.contains( "max_tokens" ) && j["max_tokens"].is_number_integer() ) {
