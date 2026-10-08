@@ -6,6 +6,8 @@ namespace engine::modules {
 
 namespace {
 
+// Interleaved: channel pair (2i, 2i+1) as in GLM4V / MRoPE; otherwise the halves pair (i, i + rot/2) as in Llama / Qwen.
+template <bool Interleaved>
 __global__ void rope_kernel(
 	half* __restrict__ q,
 	half* __restrict__ k,
@@ -32,19 +34,21 @@ __global__ void rope_kernel(
 	#pragma unroll
 	for ( int h = 0; h < num_q_heads; ++h ) {
 		half* q_head = q_m + h * head_dim;
-		float a = __half2float( q_head[tid] );
-		float b = __half2float( q_head[tid + half_rot] );
-		q_head[tid] = __float2half_rn( a * cos_val - b * sin_val );
-		q_head[tid + half_rot] = __float2half_rn( a * sin_val + b * cos_val );
+		const int i0 = Interleaved ? 2 * tid : tid, i1 = Interleaved ? 2 * tid + 1 : tid + half_rot;
+		float a = __half2float( q_head[i0] );
+		float b = __half2float( q_head[i1] );
+		q_head[i0] = __float2half_rn( a * cos_val - b * sin_val );
+		q_head[i1] = __float2half_rn( a * sin_val + b * cos_val );
 	}
 
 	#pragma unroll
 	for ( int h = 0; h < num_kv_heads; ++h ) {
 		half* k_head = k_m + h * head_dim;
-		float a = __half2float( k_head[tid] );
-		float b = __half2float( k_head[tid + half_rot] );
-		k_head[tid] = __float2half_rn( a * cos_val - b * sin_val );
-		k_head[tid + half_rot] = __float2half_rn( a * sin_val + b * cos_val );
+		const int i0 = Interleaved ? 2 * tid : tid, i1 = Interleaved ? 2 * tid + 1 : tid + half_rot;
+		float a = __half2float( k_head[i0] );
+		float b = __half2float( k_head[i1] );
+		k_head[i0] = __float2half_rn( a * cos_val - b * sin_val );
+		k_head[i1] = __float2half_rn( a * sin_val + b * cos_val );
 	}
 }
 
@@ -60,9 +64,11 @@ void RoPE::forward(
 	const pod::BatchRows* d_rows,
 	int count,
 	float freq_base,
-	cudaStream_t stream
+	cudaStream_t stream,
+	bool interleaved
 ) {
-	rope_kernel<<<dim3( 1, count ), dim3( rot_dim / 2 ), 0, stream>>>(
+	auto kernel = interleaved ? rope_kernel<true> : rope_kernel<false>;
+	kernel<<<dim3( 1, count ), dim3( rot_dim / 2 ), 0, stream>>>(
 		q.ptr<half>(),
 		k.ptr<half>(),
 		num_q_heads,
