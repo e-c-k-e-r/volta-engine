@@ -318,7 +318,7 @@ int main() {
 		for ( size_t i = 0; i < ref.size(); ++i ) ref[i] = d( x[i] );
 		pass = check( "HyperHead::mean", ref, out.get() ) && pass;
 	}
-	{ // LinearPlainGEMV::forward (ref_gemm_f16), ragged sizes
+	{ // LinearPlainGEMV::forward (ref_gemm_nt_f16, weight [n, k]), ragged sizes
 		const int m = 5, k = 300, n = 130;
 		auto x = make( size_t( m ) * k, 1.0f ), w = make( size_t( k ) * n, 0.2f );
 		Dev<half_t> dx( x ), dw( w ), out( size_t( m ) * n );
@@ -327,7 +327,7 @@ int main() {
 		std::vector<double> ref( size_t( m ) * n, 0.0 );
 		for ( int i = 0; i < m; ++i )
 			for ( int p = 0; p < k; ++p )
-				for ( int j = 0; j < n; ++j ) ref[size_t( i ) * n + j] += d( x[size_t( i ) * k + p] ) * d( w[size_t( p ) * n + j] );
+				for ( int j = 0; j < n; ++j ) ref[size_t( i ) * n + j] += d( x[size_t( i ) * k + p] ) * d( w[size_t( j ) * k + p] );
 		pass = check( "LinearPlainGEMV::forward", ref, out.get() ) && pass;
 	}
 
