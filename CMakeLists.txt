@@ -1,13 +1,13 @@
 cmake_minimum_required(VERSION 3.18)
 
-# Computing backend: exactly one (CUDA, CPU or VULKAN). Chosen before project() so the CPU and Vulkan configurations never enable the CUDA language.
-set(ENGINE_BACKEND "CUDA" CACHE STRING "Computing backend: CUDA, CPU or VULKAN")
+# Computing backend: exactly one (CUDA or CPU). Chosen before project() so the CPU configuration never enables the CUDA language.
+set(ENGINE_BACKEND "CUDA" CACHE STRING "Computing backend: CUDA or CPU")
 if(ENGINE_BACKEND STREQUAL "CUDA")
 	project(volta_engine LANGUAGES CXX CUDA)
-elseif(ENGINE_BACKEND STREQUAL "CPU" OR ENGINE_BACKEND STREQUAL "VULKAN")
+elseif(ENGINE_BACKEND STREQUAL "CPU")
 	project(volta_engine LANGUAGES CXX)
 else()
-	message(FATAL_ERROR "ENGINE_BACKEND=${ENGINE_BACKEND}: only CUDA, CPU and VULKAN are implemented")
+	message(FATAL_ERROR "ENGINE_BACKEND=${ENGINE_BACKEND}: only CUDA and CPU are implemented")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -20,8 +20,6 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	add_compile_definitions(ENGINE_BACKEND_CUDA=1)
 	find_package(CUDAToolkit REQUIRED)
 	set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -Xcompiler -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION -DEXL3_SM70_HMMA=1 -DEXL3_VOLTA=1 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 20012")
-elseif(ENGINE_BACKEND STREQUAL "VULKAN")
-	add_compile_definitions(ENGINE_BACKEND_VULKAN=1)
 else()
 	add_compile_definitions(ENGINE_BACKEND_CPU=1)
 endif()
