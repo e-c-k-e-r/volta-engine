@@ -4,6 +4,10 @@
 #include "engine/modules/rope.h"
 #include "engine/modules/embedding.h"
 #include "engine/modules/gdn.h"
+#include "engine/modules/mhc.h"
+#include "engine/modules/dsa.h"
+#include "engine/modules/attention.h"
+#include "engine/spec/tap_ring.h"
 #include "engine/backend/runtime.h"
 #include "shaders_cuda.h"
 #include <cstdio>
@@ -79,6 +83,52 @@ static bool compare( const char* name, const std::vector<half>& ref, const std::
 		100.0 * exact / ref.size(), ok ? "PASS" : "FAIL" );
 	return ok;
 }
+
+// FP32 / INT32 device buffer (the FP16 Buf above rounds its contents)
+template <typename T>
+struct DBuf {
+	T* d = nullptr;
+	size_t n = 0;
+	explicit DBuf( size_t count ) : n( count ) {
+		d = static_cast<T*>( backend::device_malloc( count * sizeof( T ) ) );
+		backend::memset_sync( d, 0, count * sizeof( T ) );
+	}
+	~DBuf() { backend::device_free( d ); }
+	void set( const std::vector<T>& h ) { backend::memcpy_sync( d, h.data(), n * sizeof( T ), backend::Copy::H2D ); }
+	std::vector<T> get() const {
+		std::vector<T> h( n );
+		backend::memcpy_sync( h.data(), d, n * sizeof( T ), backend::Copy::D2H );
+		return h;
+	}
+};
+static std::vector<float> rnd( size_t n, float scale ) {
+	std::vector<float> v( n );
+	for ( auto& x : v ) x = frand( scale );
+	return v;
+}
+static bool compare_f( const char* name, const std::vector<float>& ref, const std::vector<float>& got ) {
+	double dot = 0, na = 0, nb = 0, maxd = 0, maxabs = 0;
+	for ( size_t i = 0; i < ref.size(); ++i ) {
+		dot += static_cast<double>( ref[i] ) * got[i]; na += static_cast<double>( ref[i] ) * ref[i]; nb += static_cast<double>( got[i] ) * got[i];
+		maxd = std::fmax( maxd, std::fabs( static_cast<double>( ref[i] ) - got[i] ) );
+		maxabs = std::fmax( maxabs, std::fabs( ref[i] ) );
+	}
+	const double cosv = dot / ( std::sqrt( na ) * std::sqrt( nb ) + 1e-30 );
+	const bool ok = cosv >= 0.9999 && maxd <= 0.005 * maxabs + 1e-3;
+	std::printf( "  %-22s cos %.7f max|d| %.3g (max %.3g)                    %s\n", name, cosv, maxd, maxabs, ok ? "PASS" : "FAIL" );
+	return ok;
+}
+// Device copy of a BatchRows; slot / pos arrays are addressed inside it
+struct DRows {
+	pod::BatchRows* d = nullptr;
+	explicit DRows( const pod::BatchRows& r ) {
+		d = static_cast<pod::BatchRows*>( backend::device_malloc( sizeof( pod::BatchRows ) ) );
+		backend::memcpy_sync( d, &r, sizeof( r ), backend::Copy::H2D );
+	}
+	~DRows() { backend::device_free( d ); }
+	void* slots() const { return reinterpret_cast<char*>( d ) + offsetof( pod::BatchRows, slot ); }
+	void* pos() const { return reinterpret_cast<char*>( d ) + offsetof( pod::BatchRows, pos ); }
+};
 
 static bool compare_ref( const char* name, const std::vector<double>& ref, const std::vector<half>& got ) {
 	std::vector<half> r( ref.size() );
@@ -272,6 +322,166 @@ int main() {
 			slang_gated_rmsnorm( o2.d, z.d, gw.d, rows, vh, hd, sig ? 1 : 0, s );
 			backend::stream_sync( s );
 			pass = compare( sig ? "gated_rmsnorm sigmoid" : "gated_rmsnorm silu", o1.get(), o2.get() ) && pass;
+		}
+	}
+	{ // GDN gate projection
+		const int rows = 3, vh = 32, hid = 2048;
+		Buf x( rows * hid ), wa( vh * hid, 0.05f ), wb( vh * hid, 0.05f ), alog( vh, 0.5f ), dt( vh, 0.5f );
+		DBuf<float> g1( rows * vh ), b1( rows * vh ), g2( rows * vh ), b2( rows * vh );
+		pod::TensorView tx = pod::make_tensor_2d( x.d, pod::DType::FP16, rows, hid ), ta = pod::make_tensor_2d( wa.d, pod::DType::FP16, vh, hid ), tb = pod::make_tensor_2d( wb.d, pod::DType::FP16, vh, hid );
+		pod::TensorView tl = pod::make_tensor_1d( alog.d, pod::DType::FP16, vh ), td = pod::make_tensor_1d( dt.d, pod::DType::FP16, vh );
+		pod::TensorView tg = pod::make_tensor_2d( g1.d, pod::DType::FP32, rows, vh ), tbe = pod::make_tensor_2d( b1.d, pod::DType::FP32, rows, vh );
+		modules::GDN::project_gates( tx, ta, tb, tl, td, tg, tbe, vh, hid, s, rows );
+		slang_project_gates( x.d, wa.d, wb.d, alog.d, dt.d, g2.d, b2.d, rows, vh, hid, s );
+		backend::stream_sync( s );
+		pass = compare_f( "project_gates gate", g1.get(), g2.get() ) && pass;
+		pass = compare_f( "project_gates beta", b1.get(), b2.get() ) && pass;
+	}
+	{ // GDN multi-row conv, tiled prefill conv and history update, multi-row recurrence (two slots, snapshots)
+		const int ch = 1000, rows = 5, nslot = 2, snap_rows = 4;
+		const size_t ss = ch * 3 + 16;
+		const int slot_ids[5] = { 0, 0, 1, 1, 1 }, positions[5] = { 4, 5, 9, 10, 11 };
+		DRows rws( pod::BatchRows::batched( rows, slot_ids, positions ) );
+		Buf qa( rows * ch ), qb( rows * ch ), w( ch * 4, 0.5f );
+		qb.set( qa.get() );
+		const auto h_init = rnd( nslot * ss, 1.0f );
+		DBuf<float> ha( nslot * ss ), hb( nslot * ss ), sa( rows * ch * 3 ), sb( rows * ch * 3 );
+		DBuf<int> on( 1 );
+		ha.set( h_init ); hb.set( h_init );
+		on.set( { 1 } );
+		pod::TensorView tq = pod::make_tensor_2d( qa.d, pod::DType::FP16, rows, ch ), tw = pod::make_tensor_2d( w.d, pod::DType::FP16, ch, 4 );
+		modules::GDN::causal_conv1d_silu_rows( tq, ha.d, tw, ch, rows, rws.d, ss, sa.d, ch * 3, snap_rows, on.d, s );
+		slang_causal_conv1d_silu_rows( qb.d, hb.d, w.d, rws.slots(), sb.d, on.d, ch, rows, snap_rows, ss, ch * 3, s );
+		backend::stream_sync( s );
+		pass = compare( "causal_conv1d rows", qa.get(), qb.get() ) && pass;
+		pass = compare_f( "conv rows history", ha.get(), hb.get() ) && pass;
+		pass = compare_f( "conv rows snap", sa.get(), sb.get() ) && pass;
+
+		const int trows = 50;
+		const int cslot[1] = { 1 }, cpos[1] = { 0 };
+		DRows crw( pod::BatchRows::batched( 1, cslot, cpos ) );
+		Buf src( trows * ch ), da( trows * ch ), db( trows * ch );
+		ha.set( h_init ); hb.set( h_init );
+		pod::TensorView ts = pod::make_tensor_2d( src.d, pod::DType::FP16, trows, ch ), tdst = pod::make_tensor_2d( da.d, pod::DType::FP16, trows, ch );
+		modules::GDN::causal_conv1d_silu_tiled( ts, tdst, ha.d, tw, ch, trows, crw.d, ss, s );
+		slang_causal_conv1d_silu_tiled( src.d, db.d, hb.d, w.d, crw.slots(), ch, trows, 16, ss, s );
+		slang_causal_conv1d_history( src.d, hb.d, crw.slots(), ch, trows, ss, s );
+		backend::stream_sync( s );
+		pass = compare( "causal_conv1d tiled", da.get(), db.get() ) && pass;
+		pass = compare_f( "conv tiled history", ha.get(), hb.get() ) && pass;
+
+		const int hk = 4, hv = 8, stride = ( 2 * hk + hv ) * 128;
+		const size_t rss = static_cast<size_t>( hv ) * 128 * 128;
+		Buf qkv( rows * stride, 0.5f ), oa( rows * hv * 128 ), ob( rows * hv * 128 );
+		std::vector<float> gate_h( rows * hv ), beta_h( rows * hv );
+		for ( auto& v : gate_h ) v = -std::fabs( frand( 0.5f ) );
+		for ( auto& v : beta_h ) v = std::fabs( frand( 1.0f ) );
+		DBuf<float> gate( rows * hv ), beta( rows * hv ), st_a( nslot * rss ), st_b( nslot * rss ), sn_a( snap_rows * rss ), sn_b( snap_rows * rss );
+		gate.set( gate_h ); beta.set( beta_h );
+		const auto st_init = rnd( nslot * rss, 0.1f );
+		st_a.set( st_init ); st_b.set( st_init );
+		pod::TensorView tqkv = pod::make_tensor_2d( qkv.d, pod::DType::FP16, rows, stride ), tgate = pod::make_tensor_2d( gate.d, pod::DType::FP32, rows, hv );
+		pod::TensorView tbeta = pod::make_tensor_2d( beta.d, pod::DType::FP32, rows, hv ), tout = pod::make_tensor_2d( oa.d, pod::DType::FP16, rows, hv * 128 );
+		modules::GDN::recurrent_step_rows( st_a.d, tqkv, tgate, tbeta, tout, hk, hv, 128, rows, rws.d, rss, sn_a.d, rss, snap_rows, on.d, s );
+		slang_recurrent_step_rows( st_b.d, qkv.d, gate.d, beta.d, ob.d, rws.slots(), sn_b.d, on.d, hk, hv, rows, snap_rows, rss, rss, s );
+		backend::stream_sync( s );
+		pass = compare( "recurrent_step_rows", oa.get(), ob.get() ) && pass;
+		pass = compare_f( "recurrent state", st_a.get(), st_b.get() ) && pass;
+		pass = compare_f( "recurrent snap", sn_a.get(), sn_b.get() ) && pass;
+	}
+	{ // FP16 paged KV store, K and V
+		const int count = 5, kvh = 4, hd = 64, total = kvh * hd, max_seq = 32, layer = 2, nslot = 3;
+		const size_t ss = static_cast<size_t>( 4 ) * max_seq * total + 8;
+		const int slot_ids[5] = { 0, 0, 2, 1, 1 }, positions[5] = { 3, 4, 17, 0, 1 };
+		DRows rws( pod::BatchRows::batched( count, slot_ids, positions ) );
+		Buf k( count * total ), v( count * total ), k1( nslot * ss ), v1( nslot * ss ), k2( nslot * ss ), v2( nslot * ss );
+		k2.set( k1.get() ); v2.set( v1.get() );
+		pod::TensorView tk = pod::make_tensor_2d( k.d, pod::DType::FP16, count, total ), tv = pod::make_tensor_2d( v.d, pod::DType::FP16, count, total );
+		modules::Attention::store_kv_cache( pod::kv_ref_f16( k1.d, v1.d ), tk, tv, ss, layer, rws.d, count, kvh, hd, max_seq, s );
+		slang_kv_store_f16( k2.d, k.d, rws.slots(), rws.pos(), ss, layer, count, total, max_seq, s );
+		slang_kv_store_f16( v2.d, v.d, rws.slots(), rws.pos(), ss, layer, count, total, max_seq, s );
+		backend::stream_sync( s );
+		pass = compare( "kv_store_f16 K", k1.get(), k2.get() ) && pass;
+		pass = compare( "kv_store_f16 V", v1.get(), v2.get() ) && pass;
+	}
+	{ // mHC: init, collapse (partials + finalize), update, hyper-head mean
+		const int D = 4096, rows = 3, row_len = 4 * D, chunk_cols = 256, nch = row_len / chunk_cols, chunk_cols_c = 1024, iters = 20;
+		Buf in( rows * D );
+		DBuf<float> s1( rows * row_len ), s2( rows * row_len );
+		modules::HyperConnection::init_streams( in.d, s1.d, D, s, rows );
+		slang_init_streams( in.d, s2.d, D, rows, s );
+		backend::stream_sync( s );
+		pass = compare_f( "init_streams", s1.get(), s2.get() ) && pass;
+
+		const auto sv = rnd( rows * row_len, 1.0f );
+		s1.set( sv ); s2.set( sv );
+		DBuf<float> fn( 24 * row_len ), base( 24 ), scale( 3 ), partials( rows * nch * 25 );
+		fn.set( rnd( 24 * row_len, 0.02f ) ); base.set( rnd( 24, 0.5f ) ); scale.set( { 0.7f, 0.9f, 1.1f } );
+		DBuf<float> post1( rows * 4 ), comb1( rows * 16 ), inv1( rows ), log1( rows * 24 ), pre1( rows * 4 );
+		DBuf<float> post2( rows * 4 ), comb2( rows * 16 ), inv2( rows ), log2( rows * 24 ), pre2( rows * 4 );
+		Buf col1( rows * D ), col2( rows * D );
+		modules::HyperConnection::collapse( s1.d, fn.d, base.d, scale.d, col1.d, post1.d, comb1.d, inv1.d, log1.d, pre1.d, D, iters, 1e-6f, s, rows );
+		slang_hc_mix_partials( s2.d, fn.d, partials.d, row_len, chunk_cols, rows, s );
+		slang_hc_mix_finalize( s2.d, partials.d, base.d, scale.d, post2.d, comb2.d, col2.d, inv2.d, log2.d, pre2.d, D, nch, chunk_cols_c, iters, 1e-5f, 1e-6f, rows, s );
+		backend::stream_sync( s );
+		pass = compare( "hc_mix collapsed", col1.get(), col2.get() ) && pass;
+		pass = compare_f( "hc_mix post", post1.get(), post2.get() ) && pass;
+		pass = compare_f( "hc_mix comb (sinkhorn)", comb1.get(), comb2.get() ) && pass;
+		pass = compare_f( "hc_mix inv_rms", inv1.get(), inv2.get() ) && pass;
+		pass = compare_f( "hc_mix logits", log1.get(), log2.get() ) && pass;
+		pass = compare_f( "hc_mix pre", pre1.get(), pre2.get() ) && pass;
+
+		Buf y( rows * D );
+		modules::HyperConnection::update( s1.d, y.d, post1.d, comb1.d, D, s, rows );
+		slang_hc_apply( s2.d, s2.d, y.d, post1.d, comb1.d, D, rows, s );
+		backend::stream_sync( s );
+		pass = compare_f( "hc_apply", s1.get(), s2.get() ) && pass;
+
+		Buf m1( rows * D ), m2( rows * D );
+		modules::HyperHead::mean( s1.d, m1.d, D, s, rows );
+		slang_hyperhead_mean( s1.d, m2.d, D, rows, s );
+		backend::stream_sync( s );
+		pass = compare( "hyperhead_mean", m1.get(), m2.get() ) && pass;
+	}
+	{ // DSA indexer prep and pool update
+		const int rows = 3, layer = 1, max_seq = 2048;
+		const size_t pss = 2 * 1024 * 256, qss = 2 * ( max_seq / 4 ) * 128;
+		const int slot_ids[3] = { 0, 1, 0 }, positions[3] = { 5, 1030, 7 }, positions2[3] = { 7, 1027, 6 };
+		DRows rws( pod::BatchRows::batched( rows, slot_ids, positions ) ), rws2( pod::BatchRows::batched( rows, slot_ids, positions2 ) );
+		Buf proj( rows * 288 ), lw( 128, 1.0f ), lb( 128, 0.5f ), pl1( 2 * pss ), pl2( 2 * pss ), w1( rows * 32 ), w2( rows * 32 );
+		pl2.set( pl1.get() );
+		modules::DSA::prep( proj.d, lw.d, lb.d, pl1.d, w1.d, layer, max_seq, rows, rws.d, pss, s );
+		slang_dsa_prep( proj.d, lw.d, lb.d, pl2.d, w2.d, rws.slots(), rws.pos(), layer, pss, rows, s );
+		backend::stream_sync( s );
+		pass = compare( "dsa_prep plane", pl1.get(), pl2.get() ) && pass;
+		pass = compare( "dsa_prep head weights", w1.get(), w2.get() ) && pass;
+		Buf ape( 4 * 128, 0.5f ), po1( 2 * qss ), po2( 2 * qss );
+		po1.set( std::vector<half>( 2 * qss, __float2half( 0.0f ) ) ); po2.set( po1.get() );
+		modules::DSA::pool_update( pl1.d, po1.d, ape.d, layer, max_seq, rows, rws2.d, pss, qss, s );
+		slang_dsa_pool_update( pl1.d, po2.d, ape.d, rws2.slots(), rws2.pos(), layer, max_seq, pss, qss, rows, s );
+		backend::stream_sync( s );
+		pass = compare( "dsa_pool_update", po1.get(), po2.get() ) && pass;
+	}
+	{ // speculative tap ring store and stream reduction
+		const int m = 4, tap = 3, H = 4096, cap = 16;
+		const int slot_ids[4] = { 0, 1, 0, 0 }, positions[4] = { 3, 9, 20, 5 };
+		DRows rws( pod::BatchRows::batched( m, slot_ids, positions ) );
+		DBuf<int> owner( 1 );
+		owner.set( { 0 } );
+		Buf hidden( m * H ), t1( cap * 5 * H ), t2( cap * 5 * H );
+		t2.set( t1.get() );
+		spec::dflash_publish_taps( t1.d, hidden.d, rws.d, owner.d, m, tap, H, cap, s );
+		slang_dflash_store_taps( t2.d, hidden.d, rws.slots(), rws.pos(), owner.d, m, tap, H, cap, s );
+		backend::stream_sync( s );
+		pass = compare( "dflash_store_taps", t1.get(), t2.get() ) && pass;
+		DBuf<float> streams( m * 4 * H );
+		streams.set( rnd( m * 4 * H, 1.0f ) );
+		for ( int mode = 0; mode < 5; ++mode ) {
+			Buf r1( m * H ), r2( m * H );
+			spec::dflash_reduce_streams( streams.d, r1.d, m, H, mode, s );
+			slang_reduce_streams( streams.d, r2.d, m, H, mode, s );
+			backend::stream_sync( s );
+			pass = compare( mode == 0 ? "reduce_streams mean" : "reduce_streams stream", r1.get(), r2.get() ) && pass;
 		}
 	}
 	{ // speed, for reference: the CUDA build keeps its own kernels unless a Slang one matches

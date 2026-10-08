@@ -54,7 +54,7 @@ public:
 	// Full-vocabulary FP16 logits of the last forward's first `rows` rows, copied to host
 	// ([rows, vocab_size], row-major). Reassembles the TP shards when the LM head is sharded.
 	// Diagnostic / test path: synchronizes and issues per-row peer copies.
-	void read_logits( int rows, backend::half_t* host_dst );
+	void read_logits( int rows, half* host_dst );
 	int sample_one();
 	// Adapts the routed-expert residency (EXL3_EXPERT_CACHE) to the routing seen since the last call; false when no model tiers
 	bool rebalance_experts();

@@ -4,6 +4,7 @@
 #include "engine/core/tensor.h"
 #include "engine/core/batch.h"
 #include "engine/backend/types.h"
+#include <cuda_fp16.h>
 
 namespace engine::modules {
 
@@ -29,25 +30,25 @@ struct DSA {
 	static constexpr int PLANE_CAP = 1024;
 
 	// proj[r][j] = sum_k w[j][k] x[r][k] for rows <= 16 (graph-capturable); larger row counts use the caller's GEMM
-	static void project_small( const backend::half_t* w, const backend::half_t* x, backend::half_t* proj, int rows, int n, int k, backend::stream_t stream );
+	static void project_small( const half* w, const half* x, half* proj, int rows, int n, int k, backend::stream_t stream );
 
 	// Same product for larger row counts (prefill chunks): one dense GEMM
-	static void project_large( const backend::half_t* w, const backend::half_t* x, backend::half_t* proj, int rows, int n, int k, backend::stream_t stream );
+	static void project_large( const half* w, const half* x, half* proj, int rows, int n, int k, backend::stream_t stream );
 
 	// LayerNorm the key part of proj, append [k_norm | gate] to the plane at each row's position, copy the head weights to w_out
-	static void prep( const backend::half_t* proj, const backend::half_t* ln_w, const backend::half_t* ln_b, backend::half_t* plane, backend::half_t* w_out, int layer, int max_seq, int rows,
+	static void prep( const half* proj, const half* ln_w, const half* ln_b, half* plane, half* w_out, int layer, int max_seq, int rows,
 		const pod::BatchRows* d_rows, size_t plane_slot_stride, backend::stream_t stream );
 
 	// Build the pool each row completes (position % kpool == kpool - 1) from the plane
-	static void pool_update( const backend::half_t* plane, backend::half_t* pool_plane, const backend::half_t* ape, int layer, int max_seq, int rows,
+	static void pool_update( const half* plane, half* pool_plane, const half* ape, int layer, int max_seq, int rows,
 		const pod::BatchRows* d_rows, size_t plane_slot_stride, size_t pool_slot_stride, backend::stream_t stream );
 
 	// scores[r][p] for p < (pos + 1) / kpool (fp16); rows already dense (<= SEL_POOLS pools) are skipped
-	static void score( const backend::half_t* q_idx, const backend::half_t* w, const backend::half_t* pool_plane, backend::half_t* scores, int score_stride, int layer, int max_seq, int rows,
+	static void score( const half* q_idx, const half* w, const half* pool_plane, half* scores, int score_stride, int layer, int max_seq, int rows,
 		const pod::BatchRows* d_rows, size_t pool_slot_stride, backend::stream_t stream );
 
 	// Top SEL_POOLS pools per row, expanded to token indices + tail: idx[r][0 .. nkeys[r]); nkeys[r] = -1 marks a dense row
-	static void select( const backend::half_t* scores, int score_stride, int* idx, int* nkeys, int rows, const pod::BatchRows* d_rows, backend::stream_t stream );
+	static void select( const half* scores, int score_stride, int* idx, int* nkeys, int rows, const pod::BatchRows* d_rows, backend::stream_t stream );
 };
 
 } // namespace engine::modules

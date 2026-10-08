@@ -4,6 +4,8 @@
 #include "engine/spec/dflash.h"
 #include "engine/spec/tap_ring.h"
 #include "trellis_context.h"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -79,8 +81,8 @@ bool Qwen38Pipeline::init(
 	backend::memset_sync( hidden_states_.data, 0, hidden_states_.size_bytes() );
 
 	// Tapped hidden states for DFlash2: [R, 5, hidden]
-	const size_t tap_bytes = static_cast<size_t>( R ) * 5 * config_.hidden_size * sizeof( backend::half_t );
-	tapped_states_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, tap_bytes ) );
+	const size_t tap_bytes = static_cast<size_t>( R ) * 5 * config_.hidden_size * sizeof( half );
+	tapped_states_ = static_cast<half*>( engine::core::arena_alloc( arena, tap_bytes ) );
 	backend::memset_sync( tapped_states_, 0, tap_bytes );
 
 	// Drafter context taps. tapped_states_ only survives the last forward (MAX_BATCH rows), but the
@@ -93,10 +95,10 @@ bool Qwen38Pipeline::init(
 	draft_hooks_.taps_cap = MAX( MIN( config_.max_seq, 2048 ), 256 );
 	int wtap_shape[2] = { draft_hooks_.taps_cap, 5 * config_.hidden_size };
 	draft_taps_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, wtap_shape, 2 );
-	backend::memset_sync( draft_taps_.data, 0, wtap_shape[0] * wtap_shape[1] * sizeof( backend::half_t ) );
+	backend::memset_sync( draft_taps_.data, 0, wtap_shape[0] * wtap_shape[1] * sizeof( half ) );
 	d_taps_owner_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
 	backend::memset_sync( d_taps_owner_, 0xFF, sizeof( int ) );
-	draft_hooks_.taps = draft_taps_.ptr<const backend::half_t>();
+	draft_hooks_.taps = draft_taps_.ptr<const half>();
 	draft_hooks_.taps_owner = d_taps_owner_;
 	draft_hooks_.embedding = &embed_tokens_;
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
@@ -183,7 +185,7 @@ bool Qwen38Pipeline::init(
 		{
 			const int kM = kDraftM;
 			int ds[2] = { kM, config_.hidden_size };
-			draft_hooks_.lm_in = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ds, 2 ).ptr<backend::half_t>();
+			draft_hooks_.lm_in = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ds, 2 ).ptr<half>();
 			int dl[2] = { kM, lm_shard_cols_ };
 			draft_lm_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, dl, 2 );
 			const int splits = ( lm_shard_cols_ + kTopkTile - 1 ) / kTopkTile;
@@ -466,7 +468,7 @@ bool Qwen38Pipeline::topk_local( float* out_vals, int* out_ids, int count, backe
 	backend::set_device( rank_ );
 	// Real columns only (pad columns decode to 0.0), global ids via the shard offset.
 	engine::spec::dflash2_topk_shard(
-		logits_.ptr<const backend::half_t>(), count, lm_shard_cols_, lm_shard_real_cols_, 16,
+		logits_.ptr<const half>(), count, lm_shard_cols_, lm_shard_real_cols_, 16,
 		d_samp_vals_, d_samp_idx_, rank_ * lm_shard_real_cols_,
 		samp_part_v_, samp_part_i_, samp_counters_, stream );
 	backend::memcpy_async( out_vals, d_samp_vals_, static_cast<size_t>( count ) * 16 * sizeof( float ), backend::Copy::D2H, stream );
@@ -477,7 +479,7 @@ bool Qwen38Pipeline::topk_local( float* out_vals, int* out_ids, int count, backe
 
 const pod::TensorView& Qwen38Pipeline::gather_logits(
 	int rows,
-	const backend::half_t* const* peer_shard_ptrs,
+	const half* const* peer_shard_ptrs,
 	int peer_shard_cols,
 	backend::stream_t stream
 ) {
@@ -494,12 +496,12 @@ const pod::TensorView& Qwen38Pipeline::gather_logits(
 	// lm_shard_real_cols_ apart.
 	const size_t shard_elems = static_cast<size_t>( lm_shard_real_cols_ );
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		const backend::half_t* src_base = ( d == rank_ ) ? logits_.ptr<const backend::half_t>() : peer_shard_ptrs[d];
+		const half* src_base = ( d == rank_ ) ? logits_.ptr<const half>() : peer_shard_ptrs[d];
 		ENGINE_ASSERT( src_base != nullptr, "Qwen38Pipeline::gather_logits: missing peer shard pointer" );
 		for ( int r = 0; r < rows; ++r ) {
-			const backend::half_t* src = src_base + static_cast<size_t>( r ) * lm_shard_cols_;
-			backend::half_t* dst = full_logits_.ptr<backend::half_t>() + ( static_cast<size_t>( r ) * ENGINE_NUM_GPUS + d ) * shard_elems;
-			backend::peer_copy_async( dst, rank_, src, d, shard_elems * sizeof( backend::half_t ), stream );
+			const half* src = src_base + static_cast<size_t>( r ) * lm_shard_cols_;
+			half* dst = full_logits_.ptr<half>() + ( static_cast<size_t>( r ) * ENGINE_NUM_GPUS + d ) * shard_elems;
+			backend::peer_copy_async( dst, rank_, src, d, shard_elems * sizeof( half ), stream );
 		}
 	}
 	return full_logits_;
@@ -519,7 +521,7 @@ void Qwen38Pipeline::draft_head_topk( int rows, backend::stream_t stream ) {
 	// Columns are the slice's real width: pad columns hold the next rank's tokens, so scanning them
 	// would put the same token in two ranks' candidate sets and let the merge emit it twice.
 	engine::spec::dflash2_topk_shard(
-		draft_lm_logits_.ptr<const backend::half_t>(), kDraftM, lm_shard_cols_, lm_shard_real_cols_, kDraftTopK,
+		draft_lm_logits_.ptr<const half>(), kDraftM, lm_shard_cols_, lm_shard_real_cols_, kDraftTopK,
 		draft_hooks_.cand_vals, draft_hooks_.cand_idx, draft_hooks_.shard_offset,
 		draft_cand_part_v_, draft_cand_part_i_, draft_cand_counters_, stream );
 }
@@ -673,16 +675,16 @@ void Qwen38Pipeline::forward_body( int m, backend::stream_t stream ) {
 			float* conv_snap = state_.conv_snap + static_cast<size_t>( linear_idx ) * lin_channels * 3;
 			float* gdn_snap = state_.gdn_snap + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
 
-			pod::TensorView qkv_rows = pod::make_tensor_2d( qkv_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, lin_channels );
-			pod::TensorView out_rows = pod::make_tensor_2d( gdn_out_.ptr<backend::half_t>(), pod::DType::FP16, m, v_heads * 128 );
-			pod::TensorView z_rows = pod::make_tensor_2d( z_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, v_heads * 128 );
+			pod::TensorView qkv_rows = pod::make_tensor_2d( qkv_buf_.ptr<half>(), pod::DType::FP16, m, lin_channels );
+			pod::TensorView out_rows = pod::make_tensor_2d( gdn_out_.ptr<half>(), pod::DType::FP16, m, v_heads * 128 );
+			pod::TensorView z_rows = pod::make_tensor_2d( z_buf_.ptr<half>(), pod::DType::FP16, m, v_heads * 128 );
 			pod::TensorView gate_rows = pod::make_tensor_2d( gdn_gate_.ptr<float>(), pod::DType::FP32, m, v_heads );
 			pod::TensorView beta_rows = pod::make_tensor_2d( gdn_beta_.ptr<float>(), pod::DType::FP32, m, v_heads );
 
 			// Causal conv1d + SiLU. Prefill chunks run it in parallel row tiles into a separate buffer; the rest of
 			// the layer then reads that buffer instead of the in-place result.
 			if ( m > pod::MAX_BATCH ) {
-				pod::TensorView conv_rows = pod::make_tensor_2d( conv_out_.ptr<backend::half_t>(), pod::DType::FP16, m, lin_channels );
+				pod::TensorView conv_rows = pod::make_tensor_2d( conv_out_.ptr<half>(), pod::DType::FP16, m, lin_channels );
 				engine::modules::GDN::causal_conv1d_silu_tiled(
 					qkv_rows, conv_rows, hist_ptr, lw.conv1d_w, lin_channels, m, d_rows_, state_.slot_conv_floats, stream );
 				qkv_rows = conv_rows;
@@ -765,13 +767,13 @@ void Qwen38Pipeline::forward_body( int m, backend::stream_t stream ) {
 		// Tapped layer states for DFlash2: tapped_states_[r][tap] = hidden after layer tap_layers[tap]
 		for ( int tap = 0; tap < 5; ++tap ) {
 			if ( layer != config_.tap_layers[tap] ) continue;
-			backend::memcpy2d_async( tapped_states_ + static_cast<size_t>( tap ) * config_.hidden_size, 5 * config_.hidden_size * sizeof( backend::half_t ), hidden_states_.data, config_.hidden_size * sizeof( backend::half_t ), config_.hidden_size * sizeof( backend::half_t ), m, backend::Copy::D2D, stream );
+			backend::memcpy2d_async( tapped_states_ + static_cast<size_t>( tap ) * config_.hidden_size, 5 * config_.hidden_size * sizeof( half ), hidden_states_.data, config_.hidden_size * sizeof( half ), config_.hidden_size * sizeof( half ), m, backend::Copy::D2D, stream );
 			// Also keep it position-indexed for the drafter's context stage. Each row lands in its own
 			// ring slot, so this cannot be the same strided copy as above. The slot, the position and
 			// the owner all come from device memory: forward_body is replayed from a CUDA graph keyed
 			// only on the row count, and a host-side value would be frozen at capture time.
 			engine::spec::dflash_publish_taps(
-				draft_taps_.ptr<backend::half_t>(), hidden_states_.ptr<const backend::half_t>(), d_rows_, d_taps_owner_,
+				draft_taps_.ptr<half>(), hidden_states_.ptr<const half>(), d_rows_, d_taps_owner_,
 				m, tap, config_.hidden_size, draft_hooks_.taps_cap, stream );
 		}
 	}
@@ -783,9 +785,9 @@ void Qwen38Pipeline::forward_body( int m, backend::stream_t stream ) {
 		if ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) {
 			// Prefill: only the final row's logits are read. A one-row head also takes the int8 GEMV path.
 			const int H = config_.hidden_size;
-			pod::TensorView h1 = pod::make_tensor_2d( hidden_states_.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * H, pod::DType::FP16, 1, H );
-			pod::TensorView n1 = pod::make_tensor_2d( norm_hidden_.ptr<backend::half_t>(), pod::DType::FP16, 1, H );
-			pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
+			pod::TensorView h1 = pod::make_tensor_2d( hidden_states_.ptr<half>() + static_cast<size_t>( m - 1 ) * H, pod::DType::FP16, 1, H );
+			pod::TensorView n1 = pod::make_tensor_2d( norm_hidden_.ptr<half>(), pod::DType::FP16, 1, H );
+			pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<half>(), pod::DType::FP16, 1, lm_shard_cols_ );
 			engine::modules::RMSNorm::forward( h1, final_norm_, n1, config_.rms_norm_eps, config_.rms_norm_bias, stream );
 			engine::modules::Linear::forward( n1, lm_head_, l1, stream );
 			return;

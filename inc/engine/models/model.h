@@ -7,6 +7,7 @@
 #include "engine/core/comm.h"
 #include "engine/core/batch.h"
 #include "engine/backend/types.h"
+#include <cuda_fp16.h>
 #include <string>
 #include <memory>
 
@@ -21,10 +22,10 @@ static constexpr int kDraftTopK = 16;   // dflash2.selector_top_k
 // stable for the model's lifetime, so a captured graph may bake them in.
 struct DraftHooks {
 	const pod::TensorView* embedding = nullptr; // [vocab, hidden] table (replicated on every rank)
-	const backend::half_t* taps = nullptr;                 // [taps_cap, 5 * hidden] position-indexed tap ring
+	const half* taps = nullptr;                 // [taps_cap, 5 * hidden] position-indexed tap ring
 	int taps_cap = 0;
 	int* taps_owner = nullptr;                  // device scalar: slot whose rows publish taps (-1: none)
-	backend::half_t* lm_in = nullptr;                      // [kDraftM, hidden] drafter hidden, written by the runner
+	half* lm_in = nullptr;                      // [kDraftM, hidden] drafter hidden, written by the runner
 	float* cand_vals = nullptr;                 // [kDraftM, kDraftTopK] local top-k logits
 	int* cand_idx = nullptr;                    // [kDraftM, kDraftTopK] global token ids
 	int shard_offset = 0;                       // first global token id of this rank's slice
@@ -101,7 +102,7 @@ public:
 	virtual bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) { (void) out; (void) layers; (void) experts; (void) reset; return false; }
 	// Adapt the routed-expert residency to the routing seen so far; false when the model keeps every expert resident
 	virtual bool rebalance_experts( backend::stream_t stream = nullptr ) { (void) stream; return false; }
-	virtual const backend::half_t* shard_logits_ptr() const { return nullptr; }
+	virtual const half* shard_logits_ptr() const { return nullptr; }
 	virtual int shard_logits_cols() const { return 0; }
 
 	// 4d. DFlash2 drafter attachment. The drafter has no embedding table or output head of its own: it
@@ -117,7 +118,7 @@ public:
 	// The caller must have synchronized every rank's stream first. Returns logits() when unsharded.
 	virtual const pod::TensorView& gather_logits(
 		int rows,
-		const backend::half_t* const* peer_shard_ptrs,
+		const half* const* peer_shard_ptrs,
 		int peer_shard_cols,
 		backend::stream_t stream = nullptr
 	) {
@@ -142,7 +143,7 @@ public:
 	// 6. Output descriptors & tapped states
 	virtual pod::TensorView& logits() = 0;
 	virtual const pod::TensorView& logits() const = 0;
-	virtual const backend::half_t* tapped_states( int row = 0 ) const = 0;
+	virtual const half* tapped_states( int row = 0 ) const = 0;
 	virtual const ModelMetadata& get_metadata() const = 0;
 };
 

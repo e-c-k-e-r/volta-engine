@@ -3,6 +3,7 @@
 #include "engine/config.h"
 #include "engine/core/tensor.h"
 #include "engine/backend/types.h"
+#include <cuda_fp16.h>
 
 namespace engine::modules {
 

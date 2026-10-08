@@ -17,6 +17,7 @@
 #include "engine/modules/mhc.h"
 #include "engine/modules/linear.h"
 #include "engine/backend/types.h"
+#include <cuda_fp16.h>
 #include <cstdint>
 #include <vector>
 
@@ -59,7 +60,7 @@ struct GLM53State {
 	size_t slot_kda_floats = 0;       // linear layers only
 	size_t slot_conv_floats = 0;
 	int* d_topk_indices = nullptr;
-	backend::half_t* d_topk_weights = nullptr;
+	half* d_topk_weights = nullptr;
 	pod::MoEScratch moe;
 };
 
@@ -148,11 +149,11 @@ public:
 	void sample_tokens( int* out_preds, int count, backend::stream_t stream = nullptr ) override;
 	bool sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream = nullptr ) override;
 	bool topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream = nullptr ) override;
-	const backend::half_t* shard_logits_ptr() const override { return logits_.ptr<const backend::half_t>(); }
+	const half* shard_logits_ptr() const override { return logits_.ptr<const half>(); }
 	int shard_logits_cols() const override { return lm_shard_cols_; }
 	const pod::TensorView& gather_logits(
 		int rows,
-		const backend::half_t* const* peer_shard_ptrs,
+		const half* const* peer_shard_ptrs,
 		int peer_shard_cols,
 		backend::stream_t stream = nullptr
 	) override;
@@ -171,7 +172,7 @@ public:
 
 	pod::TensorView& logits() override { return logits_; }
 	const pod::TensorView& logits() const override { return logits_; }
-	const backend::half_t* tapped_states( int row = 0 ) const override { (void) row; return nullptr; }
+	const half* tapped_states( int row = 0 ) const override { (void) row; return nullptr; }
 	const ModelMetadata& get_metadata() const override { return metadata_; }
 
 	void destroy();
@@ -200,19 +201,19 @@ private:
 	pod::MemoryArena host_arena_{};     // pinned cold-expert tier
 	int tier_layers_ = 0;
 	bool latent_ = true;
-	backend::half_t* latent_cache_ = nullptr;    // [slots][mla layers][max_seq][512]
+	half* latent_cache_ = nullptr;    // [slots][mla layers][max_seq][512]
 	size_t latent_slot_stride_ = 0;   // elements per slot
 	float* latent_ws_ = nullptr;      // split-KV partials
 	pod::TensorView q_lat_;           // [rows, 16 * 512]
 	// DSA (EXL3_DSA, default on with the latent cache): indexer planes and selection scratch
 	bool dsa_ = true;
-	backend::half_t* dsa_plane_ = nullptr;       // [slots][mla layers][DSA::PLANE_CAP][256]  ring of per-token [k_norm | gate]
-	backend::half_t* dsa_pool_ = nullptr;        // [slots][mla layers][max_seq / 4][128]  pooled keys
+	half* dsa_plane_ = nullptr;       // [slots][mla layers][DSA::PLANE_CAP][256]  ring of per-token [k_norm | gate]
+	half* dsa_pool_ = nullptr;        // [slots][mla layers][max_seq / 4][128]  pooled keys
 	size_t dsa_plane_stride_ = 0, dsa_pool_stride_ = 0;
-	backend::half_t* dsa_proj_ = nullptr;        // [rows, 288]
-	backend::half_t* dsa_w_ = nullptr;           // [rows, 32]
-	backend::half_t* dsa_q_ = nullptr;           // [rows, 32 * 128]
-	backend::half_t* dsa_scores_ = nullptr;      // [rows, max_seq / 4]
+	half* dsa_proj_ = nullptr;        // [rows, 288]
+	half* dsa_w_ = nullptr;           // [rows, 32]
+	half* dsa_q_ = nullptr;           // [rows, 32 * 128]
+	half* dsa_scores_ = nullptr;      // [rows, max_seq / 4]
 	int* dsa_idx_ = nullptr;          // [rows, DSA::KPAD]
 	int* dsa_nk_ = nullptr;           // [rows]
 	pod::TensorView o_lat_;

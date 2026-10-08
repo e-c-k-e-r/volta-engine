@@ -1,6 +1,5 @@
 #include "engine/models/glm53_flash.h"
 #include "engine/backend/runtime.h"
-#include "engine/backend/numeric.h"
 #include "engine/loader/safetensors.h"
 #include "engine/modules/gdn.h"
 #include "engine/modules/dsa.h"
@@ -8,6 +7,8 @@
 #include "engine/spec/dflash.h"
 #include "engine/spec/tap_ring.h"
 #include "trellis_context.h"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -38,19 +39,19 @@ pod::TensorView load_router_weights_glm(
 
 	int num_experts = meta->shape[0]; // 288
 	int hidden_size = meta->shape[1]; // 4096
-	const backend::half_t* src = static_cast<const backend::half_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta ) );
+	const half* src = static_cast<const half*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta ) );
 	if ( !src ) return pod::TensorView{};
 
 	int shape[2] = { hidden_size, num_experts };
 	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
 	if ( tv.data != nullptr ) {
-		std::vector<backend::half_t> h_transposed( static_cast<size_t>( hidden_size ) * num_experts );
+		std::vector<half> h_transposed( static_cast<size_t>( hidden_size ) * num_experts );
 		for ( int e = 0; e < num_experts; ++e ) {
 			for ( int d = 0; d < hidden_size; ++d ) {
 				h_transposed[d * num_experts + e] = src[e * hidden_size + d];
 			}
 		}
-		backend::memcpy_sync( tv.data, h_transposed.data(), h_transposed.size() * sizeof( backend::half_t ), backend::Copy::H2D );
+		backend::memcpy_sync( tv.data, h_transposed.data(), h_transposed.size() * sizeof( half ), backend::Copy::H2D );
 	}
 	return tv;
 }
@@ -88,7 +89,7 @@ bool GLM53Pipeline::init(
 
 	// 1. Router outputs + routed-MoE dispatch scratch
 	state_.d_topk_indices = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( int ) ) );
-	state_.d_topk_weights = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( backend::half_t ) ) );
+	state_.d_topk_weights = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( half ) ) );
 	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R );
 	// The fused decode kernels read cold experts from host memory a little slower than the persistent kernel (6.4 vs 6.8 tok/s at a
 	// 50% tier), so the tier keeps the persistent path
@@ -147,9 +148,9 @@ bool GLM53Pipeline::init(
 	latent_ = !( std::getenv( "EXL3_MLA_LATENT" ) && std::atoi( std::getenv( "EXL3_MLA_LATENT" ) ) == 0 );
 	if ( latent_ ) {
 		latent_slot_stride_ = static_cast<size_t>( config_.num_mla_layers ) * config_.max_seq * 512;
-		latent_cache_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * latent_slot_stride_ * sizeof( backend::half_t ), 128 ) );
+		latent_cache_ = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * latent_slot_stride_ * sizeof( half ), 128 ) );
 		ENGINE_ASSERT( latent_cache_ != nullptr, "GLM53Pipeline::init: arena exhausted allocating the latent cache" );
-		backend::memset_sync( latent_cache_, 0, static_cast<size_t>( S ) * latent_slot_stride_ * sizeof( backend::half_t ) );
+		backend::memset_sync( latent_cache_, 0, static_cast<size_t>( S ) * latent_slot_stride_ * sizeof( half ) );
 		latent_ws_ = static_cast<float*>( engine::core::arena_alloc( arena, engine::modules::MLALatent::workspace_floats( config_.max_seq, 16 ) * sizeof( float ), 128 ) );
 		ENGINE_ASSERT( latent_ws_ != nullptr, "GLM53Pipeline::init: arena exhausted allocating the latent workspace" );
 		int lat_shape[2] = { R, 16 * 512 };
@@ -161,7 +162,7 @@ bool GLM53Pipeline::init(
 			const int NP = config_.max_seq / engine::modules::DSA::POOL;
 			dsa_plane_stride_ = static_cast<size_t>( config_.num_mla_layers ) * engine::modules::DSA::PLANE_CAP * engine::modules::DSA::PLANE;
 			dsa_pool_stride_ = static_cast<size_t>( config_.num_mla_layers ) * NP * engine::modules::DSA::DIM;
-			auto halves = [&]( size_t n ) { return static_cast<backend::half_t*>( engine::core::arena_alloc( arena, n * sizeof( backend::half_t ), 128 ) ); };
+			auto halves = [&]( size_t n ) { return static_cast<half*>( engine::core::arena_alloc( arena, n * sizeof( half ), 128 ) ); };
 			dsa_plane_ = halves( static_cast<size_t>( S ) * dsa_plane_stride_ );
 			dsa_pool_ = halves( static_cast<size_t>( S ) * dsa_pool_stride_ );
 			dsa_proj_ = halves( static_cast<size_t>( R ) * engine::modules::DSA::PROJ );
@@ -171,8 +172,8 @@ bool GLM53Pipeline::init(
 			dsa_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * engine::modules::DSA::KPAD * sizeof( int ), 128 ) );
 			dsa_nk_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * sizeof( int ), 128 ) );
 			ENGINE_ASSERT( dsa_plane_ && dsa_pool_ && dsa_proj_ && dsa_w_ && dsa_q_ && dsa_scores_ && dsa_idx_ && dsa_nk_, "GLM53Pipeline::init: arena exhausted allocating the DSA state" );
-			backend::memset_sync( dsa_plane_, 0, static_cast<size_t>( S ) * dsa_plane_stride_ * sizeof( backend::half_t ) );
-			backend::memset_sync( dsa_pool_, 0, static_cast<size_t>( S ) * dsa_pool_stride_ * sizeof( backend::half_t ) );
+			backend::memset_sync( dsa_plane_, 0, static_cast<size_t>( S ) * dsa_plane_stride_ * sizeof( half ) );
+			backend::memset_sync( dsa_pool_, 0, static_cast<size_t>( S ) * dsa_pool_stride_ * sizeof( half ) );
 		}
 	}
 	else {
@@ -260,10 +261,10 @@ bool GLM53Pipeline::init(
 		draft_hooks_.taps_cap = MAX( MIN( config_.max_seq, 2048 ), 256 );
 		int wtap_shape[2] = { draft_hooks_.taps_cap, 5 * config_.hidden_size };
 		draft_taps_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, wtap_shape, 2 );
-		backend::memset_sync( draft_taps_.data, 0, static_cast<size_t>( wtap_shape[0] ) * wtap_shape[1] * sizeof( backend::half_t ) );
+		backend::memset_sync( draft_taps_.data, 0, static_cast<size_t>( wtap_shape[0] ) * wtap_shape[1] * sizeof( half ) );
 		d_taps_owner_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
 		backend::memset_sync( d_taps_owner_, 0xFF, sizeof( int ) );
-		draft_hooks_.taps = draft_taps_.ptr<const backend::half_t>();
+		draft_hooks_.taps = draft_taps_.ptr<const half>();
 		draft_hooks_.taps_owner = d_taps_owner_;
 		// embedding: set when the table is loaded (host-resident, shared by every rank)
 		int tap_shape[2] = { R, config_.hidden_size };
@@ -271,7 +272,7 @@ bool GLM53Pipeline::init(
 
 		const int kM = kDraftM;
 		int ds[2] = { kM, config_.hidden_size };
-		draft_hooks_.lm_in = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ds, 2 ).ptr<backend::half_t>();
+		draft_hooks_.lm_in = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ds, 2 ).ptr<half>();
 		int dl[2] = { kM, lm_shard_cols_ };
 		draft_lm_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, dl, 2 );
 		const int splits = ( lm_shard_cols_ + kTopkTile - 1 ) / kTopkTile;
@@ -351,7 +352,7 @@ void GLM53Pipeline::reset_state( int slot_id ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "GLM53Pipeline::reset_state: slot out of range" );
 	backend::set_device( rank_ );
 	if ( latent_ ) {
-		backend::memset_sync( latent_cache_ + static_cast<size_t>( slot_id ) * latent_slot_stride_, 0, latent_slot_stride_ * sizeof( backend::half_t ) );
+		backend::memset_sync( latent_cache_ + static_cast<size_t>( slot_id ) * latent_slot_stride_, 0, latent_slot_stride_ * sizeof( half ) );
 	}
 	else {
 		kv_pool_.reset_slot( slot_id );
@@ -512,7 +513,7 @@ bool GLM53Pipeline::load_weights( const char* model_dir, backend::stream_t strea
 					std::snprintf( name_buf, sizeof( name_buf ), "%s.%s", pre, parts[i] );
 					const pod::TensorView part = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 					ENGINE_ASSERT( part.data != nullptr && part.shape[0] == part_rows[i] && part.shape[1] == 4096, "GLM53Pipeline: indexer projection shape" );
-					backend::memcpy_async( lw.idx_dense.ptr<backend::half_t>() + static_cast<size_t>( row0 ) * 4096, part.data, static_cast<size_t>( part_rows[i] ) * 4096 * sizeof( backend::half_t ), backend::Copy::D2D, stream );
+					backend::memcpy_async( lw.idx_dense.ptr<half>() + static_cast<size_t>( row0 ) * 4096, part.data, static_cast<size_t>( part_rows[i] ) * 4096 * sizeof( half ), backend::Copy::D2D, stream );
 					row0 += part_rows[i];
 				}
 				backend::stream_sync( stream );
@@ -775,7 +776,7 @@ bool GLM53Pipeline::topk_local( float* out_vals, int* out_ids, int count, backen
 	backend::set_device( rank_ );
 	// Real columns only (pad columns decode to 0.0), global ids via the shard offset
 	engine::spec::dflash2_topk_shard(
-		logits_.ptr<const backend::half_t>(), count, lm_shard_cols_, lm_shard_real_cols_, 16,
+		logits_.ptr<const half>(), count, lm_shard_cols_, lm_shard_real_cols_, 16,
 		d_samp_vals_, d_samp_idx_, lm_shard_offset_, samp_part_v_, samp_part_i_, samp_counters_, stream );
 	backend::memcpy_async( out_vals, d_samp_vals_, static_cast<size_t>( count ) * 16 * sizeof( float ), backend::Copy::D2H, stream );
 	backend::memcpy_async( out_ids, d_samp_idx_, static_cast<size_t>( count ) * 16 * sizeof( int ), backend::Copy::D2H, stream );
@@ -785,7 +786,7 @@ bool GLM53Pipeline::topk_local( float* out_vals, int* out_ids, int count, backen
 
 const pod::TensorView& GLM53Pipeline::gather_logits(
 	int rows,
-	const backend::half_t* const* peer_shard_ptrs,
+	const half* const* peer_shard_ptrs,
 	int peer_shard_cols,
 	backend::stream_t stream
 ) {
@@ -798,12 +799,12 @@ const pod::TensorView& GLM53Pipeline::gather_logits(
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		const size_t shard_elems = static_cast<size_t>( 128 * lm_shard_spans( config_.vocab_size, config_.tp_size, d ) );
 		const size_t shard_off = static_cast<size_t>( lm_shard_offset( config_.vocab_size, config_.tp_size, d ) );
-		const backend::half_t* src_base = ( d == rank_ ) ? logits_.ptr<const backend::half_t>() : peer_shard_ptrs[d];
+		const half* src_base = ( d == rank_ ) ? logits_.ptr<const half>() : peer_shard_ptrs[d];
 		ENGINE_ASSERT( src_base != nullptr, "GLM53Pipeline::gather_logits: missing peer shard pointer" );
 		for ( int r = 0; r < rows; ++r ) {
-			const backend::half_t* src = src_base + static_cast<size_t>( r ) * lm_shard_cols_;
-			backend::half_t* dst = full_logits_.ptr<backend::half_t>() + static_cast<size_t>( r ) * config_.vocab_size + shard_off;
-			backend::peer_copy_async( dst, rank_, src, d, shard_elems * sizeof( backend::half_t ), stream );
+			const half* src = src_base + static_cast<size_t>( r ) * lm_shard_cols_;
+			half* dst = full_logits_.ptr<half>() + static_cast<size_t>( r ) * config_.vocab_size + shard_off;
+			backend::peer_copy_async( dst, rank_, src, d, shard_elems * sizeof( half ), stream );
 		}
 	}
 	return full_logits_;
@@ -818,7 +819,7 @@ void GLM53Pipeline::draft_head_topk( int rows, backend::stream_t stream ) {
 	pod::TensorView in = pod::make_tensor_2d( draft_hooks_.lm_in, pod::DType::FP16, kDraftM, config_.hidden_size );
 	engine::modules::Linear::forward( in, lm_head_, draft_lm_logits_, stream );
 	engine::spec::dflash2_topk_shard(
-		draft_lm_logits_.ptr<const backend::half_t>(), kDraftM, lm_shard_cols_, lm_shard_real_cols_, kDraftTopK,
+		draft_lm_logits_.ptr<const half>(), kDraftM, lm_shard_cols_, lm_shard_real_cols_, kDraftTopK,
 		draft_hooks_.cand_vals, draft_hooks_.cand_idx, draft_hooks_.shard_offset,
 		draft_cand_part_v_, draft_cand_part_i_, draft_cand_counters_, stream );
 }
@@ -994,14 +995,14 @@ void GLM53Pipeline::forward_body( int m, backend::stream_t stream ) {
 					using engine::modules::DSA;
 					// Indexer keys and gates of this chunk go into the plane, finished pools into the pool plane
 					if ( m <= pod::MAX_BATCH ) {
-						DSA::project_small( lw.idx_dense.ptr<backend::half_t>(), norm_hidden_.ptr<backend::half_t>(), dsa_proj_, m, DSA::PROJ, 4096, stream );
+						DSA::project_small( lw.idx_dense.ptr<half>(), norm_hidden_.ptr<half>(), dsa_proj_, m, DSA::PROJ, 4096, stream );
 					}
 					else {
-						DSA::project_large( lw.idx_dense.ptr<backend::half_t>(), norm_hidden_.ptr<backend::half_t>(), dsa_proj_, m, DSA::PROJ, 4096, stream );
+						DSA::project_large( lw.idx_dense.ptr<half>(), norm_hidden_.ptr<half>(), dsa_proj_, m, DSA::PROJ, 4096, stream );
 					}
-					DSA::prep( dsa_proj_, lw.idx_ln_w.ptr<backend::half_t>(), lw.idx_ln_b.ptr<backend::half_t>(), dsa_plane_, dsa_w_, mla_idx, config_.max_seq, m,
+					DSA::prep( dsa_proj_, lw.idx_ln_w.ptr<half>(), lw.idx_ln_b.ptr<half>(), dsa_plane_, dsa_w_, mla_idx, config_.max_seq, m,
 						d_rows_, dsa_plane_stride_, stream );
-					DSA::pool_update( dsa_plane_, dsa_pool_, lw.idx_ape.ptr<backend::half_t>(), mla_idx, config_.max_seq, m, d_rows_,
+					DSA::pool_update( dsa_plane_, dsa_pool_, lw.idx_ape.ptr<half>(), mla_idx, config_.max_seq, m, d_rows_,
 						dsa_plane_stride_, dsa_pool_stride_, stream );
 					// Selection matters once a row sees more than topk tokens; decode graphs always run it (rows below the
 					// threshold exit early on the device), eager chunks skip it while every row is still dense
@@ -1022,7 +1023,7 @@ void GLM53Pipeline::forward_body( int m, backend::stream_t stream ) {
 					const int n = key_hint_;
 					std::vector<float> sc( static_cast<size_t>( 16 ) * n );
 					float* d_sc = static_cast<float*>( backend::device_malloc( sc.size() * sizeof( float ) ) );
-					engine::modules::MLALatent::diag_scores( q_lat.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * 16 * 512,
+					engine::modules::MLALatent::diag_scores( q_lat.ptr<half>() + static_cast<size_t>( m - 1 ) * 16 * 512,
 						latent_cache_ + static_cast<size_t>( mla_idx ) * config_.max_seq * 512, n, 16, d_sc, stream );
 					std::vector<int> sel( engine::modules::DSA::KPAD );
 					int nk = 0;
@@ -1149,9 +1150,9 @@ void GLM53Pipeline::forward_body( int m, backend::stream_t stream ) {
 				);
 
 				engine::modules::MoERouter::accumulate(
-					local_moe_out_.ptr<backend::half_t>(),
-					moe_expert_out_.ptr<const backend::half_t>(),
-					backend::from_float_half( 1.0f ),
+					local_moe_out_.ptr<half>(),
+					moe_expert_out_.ptr<const half>(),
+					__float2half_rn( 1.0f ),
 					m * H,
 					stream
 				);
@@ -1199,9 +1200,9 @@ void GLM53Pipeline::forward_body( int m, backend::stream_t stream ) {
 		// The tapped hidden state of an mHC layer is the mean of its four residual streams (as HyperHead).
 		for ( int tap = 0; tap < 5; ++tap ) {
 			if ( layer != config_.tap_layers[tap] ) continue;
-			engine::spec::dflash_reduce_streams( hidden_streams_.ptr<const float>(), tap_tmp_.ptr<backend::half_t>(), m, H, 0, stream );
+			engine::spec::dflash_reduce_streams( hidden_streams_.ptr<const float>(), tap_tmp_.ptr<half>(), m, H, 0, stream );
 			engine::spec::dflash_publish_taps(
-				draft_taps_.ptr<backend::half_t>(), tap_tmp_.ptr<const backend::half_t>(), d_rows_, d_taps_owner_,
+				draft_taps_.ptr<half>(), tap_tmp_.ptr<const half>(), d_rows_, d_taps_owner_,
 				m, tap, H, draft_hooks_.taps_cap, stream );
 		}
 	}
@@ -1215,9 +1216,9 @@ void GLM53Pipeline::forward_body( int m, backend::stream_t stream ) {
 	if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
 	if ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) {
 		// Prefill: only the final row's logits are read
-		pod::TensorView h1 = pod::make_tensor_2d( hidden_states_.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * H, pod::DType::FP16, 1, H );
-		pod::TensorView n1 = pod::make_tensor_2d( norm_hidden_.ptr<backend::half_t>(), pod::DType::FP16, 1, H );
-		pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
+		pod::TensorView h1 = pod::make_tensor_2d( hidden_states_.ptr<half>() + static_cast<size_t>( m - 1 ) * H, pod::DType::FP16, 1, H );
+		pod::TensorView n1 = pod::make_tensor_2d( norm_hidden_.ptr<half>(), pod::DType::FP16, 1, H );
+		pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<half>(), pod::DType::FP16, 1, lm_shard_cols_ );
 		engine::modules::RMSNorm::forward( h1, final_norm_, n1, 1e-5f, 0.0f, stream );
 		engine::modules::Linear::forward( n1, lm_head_, l1, stream );
 		return;

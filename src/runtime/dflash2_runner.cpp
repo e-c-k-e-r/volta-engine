@@ -142,7 +142,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	// head shard + local top-k over the drafter hidden. Every rank's candidate set is the top-k of its
 	// vocabulary shard (exact: a rank's local top-k is a superset of the global top-k restricted to its shard).
 	const auto& hk0 = mc.model( 0 ).draft_hooks();
-	const size_t hid_bytes = static_cast<size_t>( M ) * mc.metadata().hidden_size * sizeof( backend::half_t );
+	const size_t hid_bytes = static_cast<size_t>( M ) * mc.metadata().hidden_size * sizeof( half );
 	if ( tp_ > 1 ) {
 		// Sharded drafter: all ranks run the backbone in lockstep and end with the same full hidden.
 		mc.run_ranks( [&]( int d ) {
@@ -159,7 +159,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		// Peer the hidden rows to every rank, then run each rank's head shard on its own worker/stream.
 		const pod::TensorView& dh = spec_[0].draft_hidden();
 		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-			backend::peer_copy_async( mc.model( d ).draft_hooks().lm_in, d, dh.ptr<const backend::half_t>(), 0, hid_bytes, s0 );
+			backend::peer_copy_async( mc.model( d ).draft_hooks().lm_in, d, dh.ptr<const half>(), 0, hid_bytes, s0 );
 		}
 		backend::stream_sync( s0 );
 		mc.run_ranks( [&]( int d ) {
@@ -178,16 +178,16 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		if ( dump_round >= 0 && round_no++ == dump_round ) {
 			const int H = mc.metadata().hidden_size;
 			ENGINE_ASSERT( pos <= hk0.taps_cap, "dump: context longer than the tap ring" );
-			std::vector<backend::half_t> taps( static_cast<size_t>( pos ) * 5 * H ), hid( static_cast<size_t>( M ) * H );
+			std::vector<half> taps( static_cast<size_t>( pos ) * 5 * H ), hid( static_cast<size_t>( M ) * H );
 			backend::set_device( 0 );
 			backend::stream_sync( s0 );
-			backend::memcpy_sync( taps.data(), hk0.taps, taps.size() * sizeof( backend::half_t ), backend::Copy::D2H );
-			backend::memcpy_sync( hid.data(), spec_[0].draft_hidden().data, hid.size() * sizeof( backend::half_t ), backend::Copy::D2H );
+			backend::memcpy_sync( taps.data(), hk0.taps, taps.size() * sizeof( half ), backend::Copy::D2H );
+			backend::memcpy_sync( hid.data(), spec_[0].draft_hidden().data, hid.size() * sizeof( half ), backend::Copy::D2H );
 			FILE* f = std::fopen( "/tmp/draft_dump.bin", "wb" );
 			const int hdr[4] = { pos, anchor, H, hk0.taps_cap };
 			std::fwrite( hdr, sizeof( int ), 4, f );
-			std::fwrite( taps.data(), sizeof( backend::half_t ), taps.size(), f );
-			std::fwrite( hid.data(), sizeof( backend::half_t ), hid.size(), f );
+			std::fwrite( taps.data(), sizeof( half ), taps.size(), f );
+			std::fwrite( hid.data(), sizeof( half ), hid.size(), f );
 			std::fclose( f );
 			std::printf( "[dump] round %d: pos %d anchor %d\n", dump_round, pos, anchor );
 		}

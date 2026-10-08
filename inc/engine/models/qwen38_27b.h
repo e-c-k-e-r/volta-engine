@@ -16,6 +16,7 @@
 #include "engine/modules/embedding.h"
 #include "engine/core/graph_cache.h"
 #include "engine/backend/types.h"
+#include <cuda_fp16.h>
 #include <cstdint>
 #include <vector>
 
@@ -112,11 +113,11 @@ public:
 	void sample_tokens( int* out_preds, int count, backend::stream_t stream = nullptr ) override;
 	bool sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream = nullptr ) override;
 	bool topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream = nullptr ) override;
-	const backend::half_t* shard_logits_ptr() const override { return logits_.ptr<const backend::half_t>(); }
+	const half* shard_logits_ptr() const override { return logits_.ptr<const half>(); }
 	int shard_logits_cols() const override { return lm_shard_cols_; }
 	const pod::TensorView& gather_logits(
 		int rows,
-		const backend::half_t* const* peer_shard_ptrs,
+		const half* const* peer_shard_ptrs,
 		int peer_shard_cols,
 		backend::stream_t stream = nullptr
 	) override;
@@ -132,7 +133,7 @@ public:
 
 	pod::TensorView& logits() override { return logits_; }
 	const pod::TensorView& logits() const override { return logits_; }
-	const backend::half_t* tapped_states( int row = 0 ) const override { return tapped_states_ + static_cast<size_t>( row ) * 5 * config_.hidden_size; }
+	const half* tapped_states( int row = 0 ) const override { return tapped_states_ + static_cast<size_t>( row ) * 5 * config_.hidden_size; }
 	const ModelMetadata& get_metadata() const override { return metadata_; }
 
 	void destroy();
@@ -168,7 +169,7 @@ private:
 	Qwen38State state_;
 	bool weights_loaded_ = false;
 
-	backend::half_t* tapped_states_ = nullptr; // [MAX_BATCH, 5, hidden_size]
+	half* tapped_states_ = nullptr; // [MAX_BATCH, 5, hidden_size]
 	int* d_token_ids_ = nullptr;    // [MAX_ROWS]
 	int lm_mode_ = 0;               // BatchRows::LogitsMode of the forward in flight
 	pod::TensorView hidden_states_;

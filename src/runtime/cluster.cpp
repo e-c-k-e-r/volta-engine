@@ -209,16 +209,16 @@ void ModelCluster::sample( int* out, int count ) {
 	}
 }
 
-void ModelCluster::read_logits( int rows, backend::half_t* host_dst ) {
+void ModelCluster::read_logits( int rows, half* host_dst ) {
 	backend::set_device( 0 );
-	const backend::half_t* peer_shards[ENGINE_NUM_GPUS] = { nullptr };
+	const half* peer_shards[ENGINE_NUM_GPUS] = { nullptr };
 	int peer_cols = 0;
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		peer_shards[d] = models_[d]->shard_logits_ptr();
 		peer_cols = models_[d]->shard_logits_cols();
 	}
 	const pod::TensorView& full = models_[0]->gather_logits( rows, peer_shards, peer_cols, streams_[0] );
-	const size_t bytes = static_cast<size_t>( rows ) * metadata().vocab_size * sizeof( backend::half_t );
+	const size_t bytes = static_cast<size_t>( rows ) * metadata().vocab_size * sizeof( half );
 	backend::memcpy_async( host_dst, full.data, bytes, backend::Copy::D2H, streams_[0] );
 	backend::stream_sync( streams_[0] );
 }
