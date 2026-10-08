@@ -45,7 +45,7 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 	std::printf( "[+] Generator ready: %d slots, speculation %s\n", num_slots_, cluster_.has_speculator() ? "on" : "off" );
 
 	const size_t cache_budget = static_cast<size_t>( std::max( 0, runtime::options().prefix_cache_gib ) ) << 30;
-	if ( cache_budget > 0 && cluster_.snapshot_bytes( 1 ) > 0 ) {
+	if ( cache_budget > 0 && cluster_.snapshot_bytes( 0, 1 ) > 0 ) {
 		prefix_cache_ = std::make_unique<PrefixCache>( cluster_, cache_budget );
 		std::printf( "[+] Prefix cache: %.0f GiB pinned host budget\n", cache_budget / 1073741824.0 );
 	}
@@ -214,23 +214,36 @@ void Generator::prefill_slot( int s ) {
 	Slot& slot = slots_[s];
 	const std::vector<int>& prompt = slot.req.prompt_tokens;
 	const int n = static_cast<int>( prompt.size() );
-	// Resume from the longest cached prefix of the prompt, else start cold (which also hands the drafter to this slot)
+	// Resume from the deepest cached prefix of the prompt, else start cold (which also hands the drafter to this slot)
 	int pos = 0;
+	PrefixCache::Entry* node = nullptr;
 	if ( prefix_cache_ && n >= kPrefixMinTokens ) {
-		if ( const PrefixCache::Entry* hit = prefix_cache_->find( prompt ) ) {
-			if ( cluster_.load_snapshot( s, hit->snap ) ) {
-				pos = hit->snap.tokens;
+		if ( PrefixCache::Entry* hit = prefix_cache_->find( prompt ) ) {
+			if ( prefix_cache_->restore( s, hit ) ) {
+				node = hit;
+				pos = static_cast<int>( hit->tokens.size() );
 				std::printf( "[prefix] slot %d resumes at token %d of %d\n", s, pos, n );
 			}
 		}
 	}
 	if ( pos == 0 ) cluster_.reset_slot( s );
-	// Pinned roots (end of the system prompt) are snapshotted on the way through
-	for ( const GenerationRequest::Checkpoint& cp : slot.req.checkpoint_at ) {
-		if ( !prefix_cache_ || cp.pos <= pos || cp.pos >= n ) continue;
-		cluster_.prefill( prompt.data() + pos, cp.pos - pos, s, 0, nullptr, pos );
-		pos = cp.pos;
-		store_prefix( s, pos, cp.pinned );
+	// Checkpoints on the way through: the requested ones (end of the system prompt, turn boundary) plus one every
+	// prefix_interval tokens of a long prompt. Each stores only the KV rows since the previous one.
+	if ( prefix_cache_ && n >= kPrefixMinTokens ) {
+		std::vector<GenerationRequest::Checkpoint> cps = slot.req.checkpoint_at;
+		const int interval = runtime::options().prefix_interval;
+		for ( int p = interval; interval > 0 && p < n - kPrefixMinTokens; p += interval ) cps.push_back( { p, false } );
+		std::sort( cps.begin(), cps.end(), []( const GenerationRequest::Checkpoint& a, const GenerationRequest::Checkpoint& b ) { return a.pos < b.pos || ( a.pos == b.pos && a.pinned > b.pinned ); } );
+		bool chain_ok = true;
+		int last = -1;
+		for ( const GenerationRequest::Checkpoint& cp : cps ) {
+			if ( cp.pos <= pos || cp.pos >= n || cp.pos == last || !chain_ok ) continue;
+			last = cp.pos;
+			cluster_.prefill( prompt.data() + pos, cp.pos - pos, s, 0, nullptr, pos );
+			pos = cp.pos;
+			node = store_prefix( s, node, pos, cp.pinned );
+			chain_ok = node != nullptr;
+		}
 	}
 	Candidates first_cands;
 	int first = cluster_.prefill( prompt.data() + pos, n - pos, s, 0, slot.sp.greedy() ? nullptr : &first_cands, pos );
@@ -245,13 +258,14 @@ void Generator::prefill_slot( int s ) {
 	emit_token( s, first );
 }
 
-// Snapshots the first `tokens` positions of slot s (its prompt) into the prefix cache unless an identical entry exists
-void Generator::store_prefix( int s, int tokens, bool pinned ) {
+// Snapshots slot s's prompt up to `tokens` as a child of `parent` (KV rows since the parent only). Returns the cache node for
+// that prefix, an existing one if present, or nullptr if it could not be stored.
+PrefixCache::Entry* Generator::store_prefix( int s, PrefixCache::Entry* parent, int tokens, bool pinned ) {
 	const std::vector<int> key( slots_[s].req.prompt_tokens.begin(), slots_[s].req.prompt_tokens.begin() + tokens );
-	if ( prefix_cache_->contains( key ) ) return;
+	if ( PrefixCache::Entry* e = prefix_cache_->exact( key ) ) return e;
 	ModelCluster::SeqSnapshot snap;
-	if ( !cluster_.save_snapshot( s, tokens, &snap ) ) return;
-	prefix_cache_->insert( key, snap, pinned );
+	if ( !cluster_.save_snapshot( s, parent ? static_cast<int>( parent->tokens.size() ) : 0, tokens, &snap ) ) return nullptr;
+	return prefix_cache_->insert( parent, key, snap, pinned );
 }
 
 void Generator::step_batch() {

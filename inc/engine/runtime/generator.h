@@ -115,7 +115,7 @@ private:
 	void step_batch();
 	int adapt_steps_ = 0;
 	void prefill_slot( int s );
-	void store_prefix( int s, int tokens, bool pinned );
+	PrefixCache::Entry* store_prefix( int s, PrefixCache::Entry* parent, int tokens, bool pinned );
 	static constexpr int kPrefixMinTokens = 512;
 	// Commits `tok` to slot s's output; returns true when the request finished.
 	bool emit_token( int s, int tok );

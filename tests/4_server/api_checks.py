@@ -168,12 +168,15 @@ if "prefix_cache" in metrics:
     def ask(q):
         code, body = post("/v1/chat/completions", {"messages": [{"role": "system", "content": "You answer from these facts, briefly. " + facts}, {"role": "user", "content": q}], "max_tokens": 12})
         return json.loads(body)["choices"][0]["message"]["content"]
-    h0 = json.loads(urllib.request.urlopen(BASE + "/metrics").read())["prefix_cache"]["hits"]
+    m0 = json.loads(urllib.request.urlopen(BASE + "/metrics").read())["prefix_cache"]
+    h0 = m0["hits"]
     a1 = ask("What is the code for district 7? Number only.")
     a2 = ask("What is the code for district 100? Number only.")
     a3 = ask("What is the code for district 7? Number only.")
-    h1 = json.loads(urllib.request.urlopen(BASE + "/metrics").read())["prefix_cache"]["hits"]
+    m1 = json.loads(urllib.request.urlopen(BASE + "/metrics").read())["prefix_cache"]
+    h1 = m1["hits"]
     check(h1 - h0 >= 2, "prefix cache hits on a shared system prompt", (h0, h1))
+    check((m1["hit_tokens"] - m0["hit_tokens"]) / max(1, h1 - h0) > 3000, "hits resume deep into the shared system prompt", (m0, m1))
     check("259" in a1 and a1 == a3, "answer after a prefix hit equals the cold answer", (a1, a2, a3))
 
 # client disconnect frees the slot

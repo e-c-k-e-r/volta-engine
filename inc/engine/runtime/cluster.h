@@ -52,14 +52,17 @@ public:
 	// Sequence snapshots (prefix cache): one pinned host buffer per rank holding the slot's recurrent state and the KV
 	// rows [0, tokens). Buffers are recycled through a pool, so steady-state saves allocate nothing.
 	struct SeqSnapshot {
+		int from = 0;                      // the snapshot holds KV rows [from, tokens); a chain links from = the parent's tokens
 		int tokens = 0;
 		size_t bytes = 0;                  // per rank
 		void* host[ENGINE_NUM_GPUS] = {};
 	};
-	size_t snapshot_bytes( int tokens ) const;    // per rank; 0 when the model cannot snapshot
-	bool save_snapshot( int slot, int tokens, SeqSnapshot* snap );
-	// Overwrites the slot's state with the snapshot (with a drafter: its tap ring rows, then the slot claims the drafter).
-	bool load_snapshot( int slot, const SeqSnapshot& snap );
+	size_t snapshot_bytes( int from, int tokens ) const;    // per rank; 0 when the model cannot snapshot
+	bool save_snapshot( int slot, int from, int tokens, SeqSnapshot* snap );
+	// Writes the snapshot into the slot: its KV rows, and unless kv_only the recurrent state and tap rows (the slot then
+	// claims the drafter, which re-reads its window from the restored taps). A chain is restored ancestors first (kv_only),
+	// then the node being resumed from.
+	bool load_snapshot( int slot, const SeqSnapshot& snap, bool kv_only = false );
 	void free_snapshot( SeqSnapshot* snap );
 
 	// Greedy argmax of the last forward's first `count` rows (rank 0).

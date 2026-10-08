@@ -288,15 +288,16 @@ void ModelCluster::warm_graphs( int max_m, int slot ) {
 		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
 }
 
-size_t ModelCluster::snapshot_bytes( int tokens ) const {
-	return models_[0]->seq_state_bytes( tokens );
+size_t ModelCluster::snapshot_bytes( int from, int tokens ) const {
+	return models_[0]->seq_state_bytes( from, tokens );
 }
 
-bool ModelCluster::save_snapshot( int slot, int tokens, SeqSnapshot* snap ) {
+bool ModelCluster::save_snapshot( int slot, int from, int tokens, SeqSnapshot* snap ) {
 	constexpr size_t kRound = size_t( 8 ) << 20;
-	const size_t need = snapshot_bytes( tokens );
+	const size_t need = snapshot_bytes( from, tokens );
 	if ( need == 0 ) return false;
 	const size_t cls = ( need + kRound - 1 ) / kRound * kRound;
+	snap->from = from;
 	snap->tokens = tokens;
 	snap->bytes = cls;
 	for ( int d = 0; d < tp_; ++d ) {
@@ -321,7 +322,7 @@ bool ModelCluster::save_snapshot( int slot, int tokens, SeqSnapshot* snap ) {
 	}
 	int ok[ENGINE_NUM_GPUS] = {};
 	pool_.run( [&]( int d ) {
-		ok[d] = models_[d]->save_seq_state( slot, tokens, snap->host[d], streams_[d] ) ? 1 : 0;
+		ok[d] = models_[d]->save_seq_state( slot, from, tokens, snap->host[d], streams_[d] ) ? 1 : 0;
 		backend::stream_sync( streams_[d] );
 	} );
 	for ( int d = 0; d < tp_; ++d ) {
@@ -333,18 +334,18 @@ bool ModelCluster::save_snapshot( int slot, int tokens, SeqSnapshot* snap ) {
 	return true;
 }
 
-bool ModelCluster::load_snapshot( int slot, const SeqSnapshot& snap ) {
+bool ModelCluster::load_snapshot( int slot, const SeqSnapshot& snap, bool kv_only ) {
 	if ( snap.tokens <= 0 || !snap.host[0] ) return false;
 	int ok[ENGINE_NUM_GPUS] = {};
 	pool_.run( [&]( int d ) {
-		ok[d] = models_[d]->load_seq_state( slot, snap.tokens, snap.host[d], streams_[d] ) ? 1 : 0;
+		ok[d] = models_[d]->load_seq_state( slot, snap.from, snap.tokens, snap.host[d], kv_only, streams_[d] ) ? 1 : 0;
 		backend::stream_sync( streams_[d] );
 	} );
 	for ( int d = 0; d < tp_; ++d ) {
 		if ( !ok[d] ) return false;
 	}
 	// The drafter takes the slot over: the restored tap rows are its context for the prefix, and the tail prefill publishes the rest
-	if ( runner_ ) runner_->claim( slot );
+	if ( runner_ && !kv_only ) runner_->claim( slot );
 	return true;
 }
 

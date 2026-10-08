@@ -14,6 +14,7 @@ struct Options {
 	int max_seq = 0;              // context window (KV pool); 0 = model default
 	int max_slots = 0;            // decode slots; 0 = model default
 	int prefix_cache_gib = 16;    // pinned host RAM for the prefix cache (sequence snapshots); 0 = off
+	int prefix_interval = 16384;  // prompt tokens between automatic prefix checkpoints inside long prompts; 0 = only the requested ones
 	std::string kv_format;        // "", fp16, fp8, k8v4, nvfp4
 	double expert_cache = 1.0;    // GLM resident expert fraction (<1 enables the two-tier cache)
 	int expert_adapt_every = 64;  // decode steps between expert residency rebalances (0 = never)

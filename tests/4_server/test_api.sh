@@ -8,7 +8,7 @@ PORT="${VOLTA_TEST_PORT:-18080}"
 LOG="$(mktemp -u /tmp/volta_api_test_XXXXXX.log)"
 
 taskset -c 0-9 "$DIR/build/volta_server" --port "$PORT" --host 127.0.0.1 --model-dir "$VOLTA_MODEL_ROOT/Qwen3.8-27B-exl3" \
-	--speculative --draft-model-dir "$VOLTA_MODEL_ROOT/Qwen3.8-27B-DFlash2-EXL3-5.0bpw" > "$LOG" 2>&1 &
+	--speculative --draft-model-dir "$VOLTA_MODEL_ROOT/Qwen3.8-27B-DFlash2-EXL3-5.0bpw" --set prefix_interval=1024 > "$LOG" 2>&1 &
 PID=$!
 cleanup() { kill -TERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; }
 trap cleanup EXIT

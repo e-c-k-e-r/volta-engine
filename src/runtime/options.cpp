@@ -29,6 +29,7 @@ Options from_env() {
 	env_int( "EXL3_MAX_SEQ", o.max_seq );
 	env_int( "EXL3_MAX_SLOTS", o.max_slots );
 	env_int( "ENGINE_PREFIX_CACHE_GIB", o.prefix_cache_gib );
+	env_int( "ENGINE_PREFIX_INTERVAL", o.prefix_interval );
 	if ( const char* e = std::getenv( "EXL3_KV" ) ) o.kv_format = e;
 	if ( const char* e = std::getenv( "EXL3_EXPERT_CACHE" ) ) {
 		const double f = std::atof( e );
@@ -80,6 +81,7 @@ bool set_option( const std::string& key, const std::string& value ) {
 	if ( key == "max_seq" ) return as_int( o.max_seq );
 	if ( key == "max_slots" ) return as_int( o.max_slots );
 	if ( key == "prefix_cache_gib" ) return as_int( o.prefix_cache_gib );
+	if ( key == "prefix_interval" ) return as_int( o.prefix_interval );
 	if ( key == "kv_format" ) {
 		if ( !value.empty() && value != "fp16" && value != "fp8" && value != "k8v4" && value != "nvfp4" ) return false;
 		o.kv_format = value;

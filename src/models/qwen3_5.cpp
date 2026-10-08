@@ -846,59 +846,65 @@ void Qwen3_5Pipeline::commit_spec_row( int slot_id, int row, backend::stream_t s
 	backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, state_.conv_snap + static_cast<size_t>( row ) * state_.slot_conv_floats, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
 }
 
-// -- Sequence snapshots (prefix cache). Host layout: [GDN states][conv history][per attention layer: K rows, V rows].
+// -- Sequence snapshots (prefix cache). Host layout: [GDN states][conv history][tap rows][per attention layer: K rows, V rows
+// for positions [from, tokens)].
 namespace {
 constexpr size_t kSeqAlign = 256;
 }
 
-size_t Qwen3_5Pipeline::seq_state_bytes( int tokens ) const {
-	if ( kv_pool_.format != pod::KVFormat::FP16 || tokens < 0 || tokens > config_.max_seq ) return 0;
-	const size_t recurrent = ( state_.slot_gdn_floats + state_.slot_conv_floats ) * sizeof( float );
-	const size_t kv_row = static_cast<size_t>( kv_pool_.num_heads ) * kv_pool_.head_dim * sizeof( backend::half_t );
-	return recurrent + 2 * static_cast<size_t>( kv_pool_.num_layers ) * tokens * kv_row + tap_snapshot_bytes( tokens ) + kSeqAlign;
-}
-
-// Tap ring rows [0, min(tokens, cap)): position p lives in row p % cap, so they are the newest positions of the prefix
 size_t Qwen3_5Pipeline::tap_snapshot_bytes( int tokens ) const {
 	if ( !snap_taps_ ) return 0;
 	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * 5 * config_.hidden_size * sizeof( backend::half_t );
 }
 
-bool Qwen3_5Pipeline::save_seq_state( int slot_id, int tokens, void* host_dst, backend::stream_t stream ) {
-	if ( seq_state_bytes( tokens ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+size_t Qwen3_5Pipeline::seq_state_bytes( int from, int tokens ) const {
+	if ( kv_pool_.format != pod::KVFormat::FP16 || from < 0 || tokens < from || tokens > config_.max_seq ) return 0;
+	const size_t recurrent = ( state_.slot_gdn_floats + state_.slot_conv_floats ) * sizeof( float );
+	const size_t kv_row = static_cast<size_t>( kv_pool_.num_heads ) * kv_pool_.head_dim * sizeof( backend::half_t );
+	return recurrent + tap_snapshot_bytes( tokens ) + 2 * static_cast<size_t>( kv_pool_.num_layers ) * ( tokens - from ) * kv_row + kSeqAlign;
+}
+
+bool Qwen3_5Pipeline::save_seq_state( int slot_id, int from, int tokens, void* host_dst, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
 	backend::set_device( rank_ );
 	char* dst = static_cast<char*>( host_dst );
 	const size_t gdn = state_.slot_gdn_floats * sizeof( float ), conv = state_.slot_conv_floats * sizeof( float );
 	backend::memcpy_async( dst, state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, gdn, backend::Copy::D2H, stream );
 	backend::memcpy_async( dst + gdn, state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, conv, backend::Copy::D2H, stream );
 	dst += gdn + conv;
-	const size_t bytes = static_cast<size_t>( tokens ) * kv_pool_.num_heads * kv_pool_.head_dim * sizeof( backend::half_t );
-	for ( int layer = 0; layer < kv_pool_.num_layers && tokens > 0; ++layer ) {
-		backend::memcpy_async( dst, kv_pool_.get_k_ptr( slot_id, layer, 0 ), bytes, backend::Copy::D2H, stream );
+	if ( const size_t tap_bytes = tap_snapshot_bytes( tokens ) ) {
+		backend::memcpy_async( dst, draft_taps_.data, tap_bytes, backend::Copy::D2H, stream );
+		dst += tap_bytes;
+	}
+	const size_t bytes = static_cast<size_t>( tokens - from ) * kv_pool_.num_heads * kv_pool_.head_dim * sizeof( backend::half_t );
+	for ( int layer = 0; layer < kv_pool_.num_layers && bytes > 0; ++layer ) {
+		backend::memcpy_async( dst, kv_pool_.get_k_ptr( slot_id, layer, from ), bytes, backend::Copy::D2H, stream );
 		dst += bytes;
-		backend::memcpy_async( dst, kv_pool_.get_v_ptr( slot_id, layer, 0 ), bytes, backend::Copy::D2H, stream );
+		backend::memcpy_async( dst, kv_pool_.get_v_ptr( slot_id, layer, from ), bytes, backend::Copy::D2H, stream );
 		dst += bytes;
 	}
-	if ( const size_t tap_bytes = tap_snapshot_bytes( tokens ) ) backend::memcpy_async( dst, draft_taps_.data, tap_bytes, backend::Copy::D2H, stream );
 	return true;
 }
 
-bool Qwen3_5Pipeline::load_seq_state( int slot_id, int tokens, const void* host_src, backend::stream_t stream ) {
-	if ( seq_state_bytes( tokens ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+bool Qwen3_5Pipeline::load_seq_state( int slot_id, int from, int tokens, const void* host_src, bool kv_only, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
 	backend::set_device( rank_ );
 	const char* src = static_cast<const char*>( host_src );
 	const size_t gdn = state_.slot_gdn_floats * sizeof( float ), conv = state_.slot_conv_floats * sizeof( float );
-	backend::memcpy_async( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, src, gdn, backend::Copy::H2D, stream );
-	backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, src + gdn, conv, backend::Copy::H2D, stream );
-	src += gdn + conv;
-	const size_t bytes = static_cast<size_t>( tokens ) * kv_pool_.num_heads * kv_pool_.head_dim * sizeof( backend::half_t );
-	for ( int layer = 0; layer < kv_pool_.num_layers && tokens > 0; ++layer ) {
-		backend::memcpy_async( kv_pool_.get_k_ptr( slot_id, layer, 0 ), src, bytes, backend::Copy::H2D, stream );
+	const size_t tap_bytes = tap_snapshot_bytes( tokens );
+	if ( !kv_only ) {
+		backend::memcpy_async( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, src, gdn, backend::Copy::H2D, stream );
+		backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, src + gdn, conv, backend::Copy::H2D, stream );
+		if ( tap_bytes ) backend::memcpy_async( draft_taps_.data, src + gdn + conv, tap_bytes, backend::Copy::H2D, stream );
+	}
+	src += gdn + conv + tap_bytes;
+	const size_t bytes = static_cast<size_t>( tokens - from ) * kv_pool_.num_heads * kv_pool_.head_dim * sizeof( backend::half_t );
+	for ( int layer = 0; layer < kv_pool_.num_layers && bytes > 0; ++layer ) {
+		backend::memcpy_async( kv_pool_.get_k_ptr( slot_id, layer, from ), src, bytes, backend::Copy::H2D, stream );
 		src += bytes;
-		backend::memcpy_async( kv_pool_.get_v_ptr( slot_id, layer, 0 ), src, bytes, backend::Copy::H2D, stream );
+		backend::memcpy_async( kv_pool_.get_v_ptr( slot_id, layer, from ), src, bytes, backend::Copy::H2D, stream );
 		src += bytes;
 	}
-	if ( const size_t tap_bytes = tap_snapshot_bytes( tokens ) ) backend::memcpy_async( draft_taps_.data, src, tap_bytes, backend::Copy::H2D, stream );
 	return true;
 }
 

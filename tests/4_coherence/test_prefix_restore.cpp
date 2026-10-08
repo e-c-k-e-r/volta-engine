@@ -66,10 +66,10 @@ int main( int argc, char** argv ) {
 	cfg.model_dir = test::QWEN_DIR;
 	if ( spec ) cfg.draft_model_dir = test::QWEN_DRAFT_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
-	ENGINE_ASSERT( mc.snapshot_bytes( 1024 ) > 0, "the model cannot snapshot" );
+	ENGINE_ASSERT( mc.snapshot_bytes( 0, 1024 ) > 0, "the model cannot snapshot" );
 	mc.warm_graphs( 8 );
 	const int chunk = mc.metadata().max_rows;
-	std::printf( "[*] prompt %d tokens, prefill chunk %d, snapshot of 4096 tokens = %.1f MiB per rank\n", n, chunk, mc.snapshot_bytes( 4096 ) / 1048576.0 );
+	std::printf( "[*] prompt %d tokens, prefill chunk %d, snapshot of 4096 tokens = %.1f MiB per rank\n", n, chunk, mc.snapshot_bytes( 0, 4096 ) / 1048576.0 );
 
 	// Cold reference
 	mc.reset_slot( 0 );
@@ -86,7 +86,7 @@ int main( int argc, char** argv ) {
 		mc.prefill( ids.data(), cut, 0 );
 		ModelCluster::SeqSnapshot snap;
 		auto t0 = std::chrono::steady_clock::now();
-		ENGINE_ASSERT( mc.save_snapshot( 0, cut, &snap ), "save_snapshot failed" );
+		ENGINE_ASSERT( mc.save_snapshot( 0, 0, cut, &snap ), "save_snapshot failed" );
 		const double save_ms = test::ms_since( t0 );
 		for ( int slot : { 1, 2, 1 } ) {
 			mc.reset_slot( slot );
@@ -113,51 +113,88 @@ int main( int argc, char** argv ) {
 	{
 		ModelCluster::SeqSnapshot a, b;
 		auto t0 = std::chrono::steady_clock::now();
-		ENGINE_ASSERT( mc.save_snapshot( 0, 3000, &a ), "save_snapshot failed" );
+		ENGINE_ASSERT( mc.save_snapshot( 0, 0, 3000, &a ), "save_snapshot failed" );
 		const double cold_ms = test::ms_since( t0 );
 		mc.free_snapshot( &a );
 		t0 = std::chrono::steady_clock::now();
-		ENGINE_ASSERT( mc.save_snapshot( 0, 3000, &b ), "save_snapshot failed" );
+		ENGINE_ASSERT( mc.save_snapshot( 0, 0, 3000, &b ), "save_snapshot failed" );
 		std::printf( "[*] save 3000 tokens: %.1f ms with fresh pinned buffers, %.1f ms pooled\n", cold_ms, test::ms_since( t0 ) );
 		mc.free_snapshot( &b );
 	}
 
-	// PrefixCache: longest proper-prefix lookup, LRU eviction under a budget, pinned entries survive
+	// PrefixCache as a tree of chained snapshots: ancestors hold only their own KV segment
 	{
-		const size_t one = mc.snapshot_bytes( 1024 );
-		const size_t per_entry = ( ( one + ( size_t( 8 ) << 20 ) - 1 ) / ( size_t( 8 ) << 20 ) * ( size_t( 8 ) << 20 ) ) * mc.tp();
-		PrefixCache cache( mc, 2 * per_entry + per_entry / 2 ); // room for two entries of 1024 tokens
-		auto snap_of = [&]( int tokens ) {
-			mc.reset_slot( 0 );
-			mc.prefill( ids.data(), tokens, 0 );
-			ModelCluster::SeqSnapshot sn;
-			ENGINE_ASSERT( mc.save_snapshot( 0, tokens, &sn ), "save_snapshot failed" );
-			return sn;
-		};
 		auto prefix = [&]( int tokens ) { return std::vector<int>( ids.begin(), ids.begin() + tokens ); };
 		auto expect = [&]( bool cond, const char* what ) {
 			std::printf( "%s PrefixCache: %s\n", cond ? "[+]" : "[-]", what );
 			failures += cond ? 0 : 1;
 		};
-		expect( cache.insert( prefix( 900 ), snap_of( 900 ), true ), "insert pinned root" );
-		expect( cache.insert( prefix( 1000 ), snap_of( 1000 ), false ), "insert second" );
-		const PrefixCache::Entry* e = cache.find( ids );
-		expect( e && e->tokens.size() == 1000, "longest prefix wins" );
-		std::vector<int> other = prefix( 1000 );
-		other[500] ^= 1;
+		// One chain root(1024) -> mid(2560) -> leaf(4096) built along one prefill like the generator does
+		PrefixCache cache( mc, size_t( 64 ) << 30 );
+		mc.reset_slot( 0 );
+		PrefixCache::Entry* parent = nullptr;
+		int pos = 0;
+		for ( int cp : { 1024, 2560, 4096 } ) {
+			mc.prefill( ids.data() + pos, cp - pos, 0, 0, nullptr, pos );
+			ModelCluster::SeqSnapshot sn;
+			ENGINE_ASSERT( mc.save_snapshot( 0, parent ? static_cast<int>( parent->tokens.size() ) : 0, cp, &sn ), "save_snapshot failed" );
+			parent = cache.insert( parent, prefix( cp ), sn, cp == 1024 );
+			ENGINE_ASSERT( parent, "insert failed" );
+			pos = cp;
+		}
+		const PrefixCache::Stats chain_stats = cache.stats();
+		const size_t flat = 3 * mc.snapshot_bytes( 0, 4096 ) * mc.tp();
+		std::printf( "[*] chain of 3 snapshots holds %.0f MiB (3 flat snapshots of 4096 tokens: %.0f MiB)\n", chain_stats.bytes / 1048576.0, flat / 1048576.0 );
+		expect( chain_stats.bytes < flat, "chained storage is smaller than flat snapshots" );
+
+		PrefixCache::Entry* leaf = cache.find( ids );
+		expect( leaf && leaf->tokens.size() == 4096, "deepest prefix wins" );
+		mc.reset_slot( 3 );
+		expect( leaf && cache.restore( 3, leaf ), "restore the chain into another slot" );
+		Candidates chain_c;
+		const int chain_first = mc.prefill( ids.data() + 4096, n - 4096, 3, 0, &chain_c, 4096 );
+		const std::vector<int> chain_tokens = decode( mc, chain_first, n, 3, 48 );
+		float chain_diff = 0.0f;
+		for ( int j = 0; j < chain_c.n; ++j ) chain_diff = std::max( chain_diff, std::fabs( chain_c.logits[j] - cold_c.logits[j] ) );
+		expect( chain_tokens == cold && chain_diff < 0.25f, "a chain restore continues like the cold run" );
+		std::printf( "    chain restore: max |dlogit| %.4g\n", chain_diff );
+
+		std::vector<int> other = prefix( 4096 );
+		other[3000] ^= 1;
+		PrefixCache::Entry* e = cache.find( other );
+		expect( e && e->tokens.size() == 2560, "a diverging prompt falls back to the deepest matching ancestor" );
+		other = prefix( 2560 );
 		e = cache.find( other );
-		expect( e == nullptr, "a diverging prompt does not match a longer entry" );
-		other = prefix( 900 );
-		expect( cache.find( other ) == nullptr, "an entry equal to the whole prompt is not a hit (no token left to prefill)" );
-		expect( cache.insert( prefix( 1010 ), snap_of( 1010 ), false ), "insert third evicts the unpinned LRU" );
-		const PrefixCache::Stats st = cache.stats();
-		expect( st.entries == 2 && st.evictions == 1, "one eviction, two entries left" );
-		e = cache.find( ids );
-		expect( e && e->tokens.size() == 1010, "the new entry is found" );
-		other = prefix( 1005 );
-		e = cache.find( other );
-		expect( e && e->tokens.size() == 900 && e->pinned, "the pinned root survived eviction" );
+		expect( e && e->tokens.size() == 1024, "an entry equal to the whole prompt is not a hit (no token left to prefill)" );
+
+		// eviction: a small budget keeps the pinned root and its in-use parent chain, drops leaves LRU first
 		cache.clear();
+		auto rounded = [&]( int from, int to ) {
+			const size_t r = size_t( 8 ) << 20;
+			return ( mc.snapshot_bytes( from, to ) + r - 1 ) / r * r * mc.tp();
+		};
+		// room for the root and two children, not for a fourth node
+		PrefixCache small( mc, rounded( 0, 900 ) + rounded( 900, 950 ) + rounded( 900, 960 ) + rounded( 960, 1000 ) / 2 );
+		auto snap_at = [&]( int from, int to ) {
+			mc.reset_slot( 0 );
+			mc.prefill( ids.data(), to, 0 );
+			ModelCluster::SeqSnapshot sn;
+			ENGINE_ASSERT( mc.save_snapshot( 0, from, to, &sn ), "save_snapshot failed" );
+			return sn;
+		};
+		PrefixCache::Entry* root = small.insert( nullptr, prefix( 900 ), snap_at( 0, 900 ), true );
+		PrefixCache::Entry* a1 = small.insert( root, prefix( 950 ), snap_at( 900, 950 ), false );
+		PrefixCache::Entry* b1 = small.insert( root, prefix( 960 ), snap_at( 900, 960 ), false );
+		expect( root && a1 && b1, "root and two children fit" );
+		small.find( ids ); // touches the deepest (960) chain: a1 is now the older leaf
+		PrefixCache::Entry* c1 = small.insert( b1, prefix( 1000 ), snap_at( 960, 1000 ), false );
+		expect( c1 != nullptr, "a fourth node fits by evicting the oldest leaf" );
+		const PrefixCache::Stats st = small.stats();
+		std::printf( "    evictions %llu; present: 900 %d, 950 %d, 960 %d, 1000 %d; bytes %.0f of %.0f MiB\n", static_cast<unsigned long long>( st.evictions ),
+			small.exact( prefix( 900 ) ) != nullptr, small.exact( prefix( 950 ) ) != nullptr, small.exact( prefix( 960 ) ) != nullptr, small.exact( prefix( 1000 ) ) != nullptr,
+			st.bytes / 1048576.0, small.budget() / 1048576.0 );
+		expect( st.evictions >= 1 && small.exact( prefix( 900 ) ) && small.exact( prefix( 960 ) ) && !small.exact( prefix( 950 ) ), "the older leaf went; the pinned root and the used chain stayed" );
+		small.clear();
 	}
 	if ( spec ) {
 		std::printf( "[*] warm runs: proposed %d accepted %d (acceptance %.2f)\n", g_proposed, g_accepted, g_proposed ? static_cast<double>( g_accepted ) / g_proposed : 0.0 );

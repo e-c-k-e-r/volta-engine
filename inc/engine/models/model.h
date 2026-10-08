@@ -146,9 +146,11 @@ public:
 	// (or its KV format) cannot snapshot. Stream-ordered: the caller synchronizes the stream before using the buffer.
 	// Snapshots also carry the drafter tap ring rows of the saved prefix when on (a speculative cluster), so a restored slot keeps speculating.
 	virtual void set_snapshot_taps( bool on ) { (void) on; }
-	virtual size_t seq_state_bytes( int tokens ) const { (void) tokens; return 0; }
-	virtual bool save_seq_state( int slot_id, int tokens, void* host_dst, backend::stream_t stream = nullptr ) { (void) slot_id; (void) tokens; (void) host_dst; (void) stream; return false; }
-	virtual bool load_seq_state( int slot_id, int tokens, const void* host_src, backend::stream_t stream = nullptr ) { (void) slot_id; (void) tokens; (void) host_src; (void) stream; return false; }
+	// A snapshot covers positions [from, tokens): the recurrent state and tap rows at `tokens` plus only the KV rows of that
+	// range, so a chain of snapshots (from = the parent's tokens) stores each KV row once. load with kv_only skips the state.
+	virtual size_t seq_state_bytes( int from, int tokens ) const { (void) from; (void) tokens; return 0; }
+	virtual bool save_seq_state( int slot_id, int from, int tokens, void* host_dst, backend::stream_t stream = nullptr ) { (void) slot_id; (void) from; (void) tokens; (void) host_dst; (void) stream; return false; }
+	virtual bool load_seq_state( int slot_id, int from, int tokens, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) { (void) slot_id; (void) from; (void) tokens; (void) host_src; (void) kv_only; (void) stream; return false; }
 
 	// 6. Output descriptors & tapped states
 	virtual pod::TensorView& logits() = 0;
