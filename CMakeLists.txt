@@ -78,9 +78,17 @@ set(ENGINE_DEVICE_SOURCES
 )
 set(ENGINE_CORE_SOURCES ${ENGINE_HOST_SOURCES} ${ENGINE_DEVICE_SOURCES})
 
-file(GLOB TRELLIS_SOURCES
-	src/kernels/cuda/trellis/*.cu
-	src/kernels/cuda/trellis/comp_units/*.cu
+set(TRELLIS_SOURCES
+	src/kernels/cuda/trellis/exl3_gemm.cu
+	src/kernels/cuda/trellis/exl3_gemv.cu
+	src/kernels/cuda/trellis/exl3_gemv_int8.cu
+	src/kernels/cuda/trellis/exl3_instances.cu
+	src/kernels/cuda/trellis/exl3_kernel_map.cu
+	src/kernels/cuda/trellis/exl3_moe_coop.cu
+	src/kernels/cuda/trellis/hadamard.cu
+	src/kernels/cuda/trellis/reconstruct.cu
+	src/kernels/cuda/trellis/trellis.cu
+	src/kernels/cuda/trellis/trellis_context.cu
 )
 
 add_library(engine_kernels STATIC
