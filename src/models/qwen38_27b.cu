@@ -545,12 +545,12 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, cudaStream_t stream ) 
 	// so its launch sequence depends on m alone and is replayed from a per-m CUDA graph.
 	// Pageable source: the copy is staged before return, so `rows` may be a temporary.
 	CUDA_CHECK( cudaMemcpyAsync( d_rows_, &rows, sizeof( pod::BatchRows ), cudaMemcpyHostToDevice, stream ) );
-	// Tensor-core attention serves rows of one slot (verify blocks, single-row decode); rows of distinct slots keep the
-	// per-row kernel. The graph body differs, so the two shapes get separate graphs.
+	// Tensor-core attention shares K/V tiles across the rows of one slot (verify blocks, single-row decode); rows of
+	// distinct slots get a block each. The graph body differs, so the two shapes get separate graphs.
 	attn_tc_ = true;
 	for ( int r = 1; r < m; ++r ) attn_tc_ = attn_tc_ && rows.slot[r] == rows.slot[0];
 	static const bool tc_on = !( std::getenv( "EXL3_ATTN_TC" ) && std::atoi( std::getenv( "EXL3_ATTN_TC" ) ) == 0 );
-	attn_tc_ = attn_tc_ && tc_on;
+	attn_tc_on_ = tc_on;
 	graphs_.run( m, stream, [&]( cudaStream_t s ) { forward_body( m, s ); }, attn_tc_ ? 1 : 0 );
 }
 
@@ -623,14 +623,14 @@ void Qwen38Pipeline::forward_body( int m, cudaStream_t stream ) {
 			);
 
 			// Attend over past tokens + sigmoid gate
-			if ( ( m > pod::MAX_BATCH || attn_tc_ ) && config_.full_head_dim == 256 ) {
+			if ( ( m > pod::MAX_BATCH || attn_tc_on_ ) && config_.full_head_dim == 256 ) {
 				// Prefill chunk: tiled kernel that shares K/V tiles across queries.
 				engine::modules::Attention::forward_prefill(
 					kv, q_buf_, gate_attn_buf_,
 					attn_out_,
 					kv_slot_stride, full_attn_idx, d_rows_, m,
 					q_heads, kv_heads,
-					config_.full_head_dim, config_.max_seq, stream, m > pod::MAX_BATCH ? key_hint_ : 0
+					config_.full_head_dim, config_.max_seq, stream, m > pod::MAX_BATCH ? key_hint_ : 0, m <= pod::MAX_BATCH && !attn_tc_
 				);
 			}
 			else {

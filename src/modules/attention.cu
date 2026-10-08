@@ -444,7 +444,8 @@ void attn_prefill_tc_kernel(
 	int max_seq,
 	float scale,
 	float* __restrict__ workspace,
-	int nsplit
+	int nsplit,
+	int tile_q // query slots a block owns: PA_BQ, or G to give every row its own block (rows of distinct slots)
 ) {
 	constexpr int HD = 256;
 	extern __shared__ __align__( 16 ) unsigned char pa_smem[];
@@ -460,7 +461,8 @@ void attn_prefill_tc_kernel(
 
 	const int G = num_q_heads / num_kv_heads;
 	const int kvh = blockIdx.x;
-	const int q_base = blockIdx.y * PA_BQ;
+	const int q_base = blockIdx.y * tile_q;
+	const int q_end = min( q_base + tile_q, count * G );
 	const int tid = threadIdx.x;
 	const int warp = tid >> 5;
 	const int lane = tid & 31;
@@ -469,7 +471,7 @@ void attn_prefill_tc_kernel(
 	const int e = t + 4 * hi;
 	const int qp = ( lane >> 2 ) & 3;
 
-	const int last_row = min( ( q_base + PA_BQ - 1 ) / G, count - 1 );
+	const int last_row = ( q_end - 1 ) / G;
 	int max_pos = 0;
 	for ( int r = q_base / G; r <= last_row; ++r ) max_pos = max( max_pos, rows->pos[r] );
 	max_pos = min( max_pos, max_seq - 1 );
@@ -481,7 +483,7 @@ void attn_prefill_tc_kernel(
 	const int srow = tid >> 3;
 	const int sub = tid & 7;
 	const int sqi = q_base + srow;
-	const bool svalid = sqi < count * G;
+	const bool svalid = sqi < q_end;
 	const int spos = svalid ? rows->pos[sqi / G] : -1;
 	float m_run = -1e30f, l_run = 0.0f;
 
@@ -489,7 +491,7 @@ void attn_prefill_tc_kernel(
 		const int qq = u >> 5, c = u & 31;
 		const int qi = q_base + qq;
 		uint4 raw = make_uint4( 0, 0, 0, 0 );
-		if ( qi < count * G ) {
+		if ( qi < q_end ) {
 			raw = *reinterpret_cast<const uint4*>( q + ( static_cast<size_t>( qi / G ) * num_q_heads + kvh * G + qi % G ) * HD + c * 8 );
 		}
 		uint2* dst = reinterpret_cast<uint2*>( sQ + qq * PA_KS + c * 8 );
@@ -663,7 +665,7 @@ void attn_prefill_tc_kernel(
 		for ( int u = tid; u < PA_BQ * HD; u += 256 ) {
 			const int qq = u >> 8, d = u & 255;
 			const int qi = q_base + qq;
-			if ( qi >= count * G ) continue;
+			if ( qi >= q_end ) continue;
 			float* ws = workspace + ( ( static_cast<size_t>( qi / G ) * num_q_heads + kvh * G + qi % G ) * nsplit + blockIdx.z ) * ( ATTN_MAX_HEAD_DIM + 2 );
 			if ( d == 0 ) {
 				ws[0] = sM[qq];
@@ -695,7 +697,7 @@ void attn_prefill_tc_kernel(
 	for ( int u = tid; u < PA_BQ * ( HD / 8 ); u += 256 ) {
 		const int qq = u >> 5, c = u & 31;
 		const int qi = q_base + qq;
-		if ( qi >= count * G ) continue;
+		if ( qi >= q_end ) continue;
 		const size_t off = ( static_cast<size_t>( qi / G ) * num_q_heads + kvh * G + qi % G ) * HD + c * 8;
 		float sig[8];
 		#pragma unroll
@@ -911,13 +913,15 @@ void Attention::forward_prefill(
 	int head_dim,
 	int max_seq,
 	cudaStream_t stream,
-	int key_hint
+	int key_hint,
+	bool per_row
 ) {
 	ENGINE_ASSERT( head_dim == 256 && num_q_heads % num_kv_heads == 0, "Attention::forward_prefill: head_dim 256 and GQA only" );
 	const float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
 	const int G = num_q_heads / num_kv_heads;
 	// Spread the key tiles over extra blocks when the query tiles alone leave the GPU under two waves
-	const int base_blocks = num_kv_heads * ( ( count * G + PA_BQ - 1 ) / PA_BQ );
+	const int tile_q = per_row ? G : PA_BQ;
+	const int base_blocks = num_kv_heads * ( ( count * G + tile_q - 1 ) / tile_q );
 	int nsplit = 1;
 	if ( base_blocks < 160 ) nsplit = MIN( ( 320 + base_blocks - 1 ) / base_blocks, 32 );
 	if ( key_hint > 0 ) nsplit = MAX( 1, MIN( nsplit, key_hint / ( 4 * PA_BK ) ) );
@@ -925,7 +929,7 @@ void Attention::forward_prefill(
 	ENGINE_ASSERT( static_cast<size_t>( count ) * num_q_heads * nsplit <= static_cast<size_t>( ATTN_MAX_ROW_HEADS ) * ATTN_MAX_CHUNKS, "Attention::forward_prefill: workspace" );
 	float* workspace = attn_workspace_ptr();
 	const dim3 grid( num_kv_heads, ( count * G + PF_QPB - 1 ) / PF_QPB );
-	const dim3 grid_tc( num_kv_heads, ( count * G + PA_BQ - 1 ) / PA_BQ, nsplit );
+	const dim3 grid_tc( num_kv_heads, ( count * G + tile_q - 1 ) / tile_q, nsplit );
 	static const bool simt = std::getenv( "EXL3_PREFILL_SIMT" ) != nullptr;
 	const half* gate_ptr = gate.data != nullptr ? gate.ptr<const half>() : nullptr;
 	#define LAUNCH_PREFILL() do { \
@@ -936,7 +940,7 @@ void Attention::forward_prefill(
 		else { \
 			CUDA_CHECK( cudaFuncSetAttribute( attn_prefill_tc_kernel<KQ_, VQ_>, cudaFuncAttributeMaxDynamicSharedMemorySize, PA_SMEM ) ); \
 			attn_prefill_tc_kernel<KQ_, VQ_><<<grid_tc, 256, PA_SMEM, stream>>>( \
-				q.ptr<const half>(), kv, gate_ptr, out.ptr<half>(), slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, max_seq, scale, workspace, nsplit ); \
+				q.ptr<const half>(), kv, gate_ptr, out.ptr<half>(), slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, max_seq, scale, workspace, nsplit, tile_q ); \
 		} \
 	} while ( 0 )
 	#define KQ_ KQV_

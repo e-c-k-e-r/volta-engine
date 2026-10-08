@@ -32,9 +32,10 @@ int main() {
 	CUDA_CHECK( cudaMemcpy( v_cache, hv.data(), kv_elems * 2, cudaMemcpyHostToDevice ) );
 	auto* d_rows = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
 
-	struct Case { int rows, pos0; };
+	struct Case { int rows, pos0; bool per_row = false; };
 	const Case cases[] = { { 20, 0 }, { 33, 5 }, { 128, 0 }, { 128, 700 }, { 256, 1900 }, { 200, 4000 }, { 256, 7936 }, { 256, 7700 },
-		{ 1, 5000 }, { 2, 3000 }, { 5, 6000 }, { 8, 7000 }, { 8, 40 }, { 3, 0 } }; // decode / verify shapes (key_hint 0, as the graphs pass)
+		{ 1, 5000 }, { 2, 3000 }, { 5, 6000 }, { 8, 7000 }, { 8, 40 }, { 3, 0 },
+		{ 1, 5000, true }, { 5, 6000, true }, { 8, 7000, true }, { 8, 40, true } }; // decode / verify shapes (key_hint 0, as the graphs pass)
 	int fails = 0;
 	for ( const auto& c : cases ) {
 		const size_t qn = static_cast<size_t>( c.rows ) * qh * hd;
@@ -53,7 +54,7 @@ int main() {
 		const auto rows = pod::BatchRows::causal( c.rows, c.pos0, 0 );
 		CUDA_CHECK( cudaMemcpy( d_rows, &rows, sizeof( rows ), cudaMemcpyHostToDevice ) );
 		engine::modules::Attention::forward_decode( pod::kv_ref_f16( k_cache, v_cache ), q, g, o_ref, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s );
-		engine::modules::Attention::forward_prefill( pod::kv_ref_f16( k_cache, v_cache ), q, g, o_new, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s, c.rows <= pod::MAX_BATCH ? 0 : c.pos0 + c.rows );
+		engine::modules::Attention::forward_prefill( pod::kv_ref_f16( k_cache, v_cache ), q, g, o_new, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s, c.rows <= pod::MAX_BATCH ? 0 : c.pos0 + c.rows, c.per_row );
 		CUDA_CHECK( cudaStreamSynchronize( s ) );
 		std::vector<half> r1( qn ), r2( qn );
 		CUDA_CHECK( cudaMemcpy( r1.data(), o_ref.data, qn * 2, cudaMemcpyDeviceToHost ) );
@@ -76,7 +77,7 @@ int main() {
 		CUDA_CHECK( cudaEventRecord( e1, s ) ); CUDA_CHECK( cudaEventSynchronize( e1 ) );
 		float t_dec = 0; CUDA_CHECK( cudaEventElapsedTime( &t_dec, e0, e1 ) );
 		CUDA_CHECK( cudaEventRecord( e0, s ) );
-		for ( int i = 0; i < 5; ++i ) engine::modules::Attention::forward_prefill( pod::kv_ref_f16( k_cache, v_cache ), q, g, o_new, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s, c.rows <= pod::MAX_BATCH ? 0 : c.pos0 + c.rows );
+		for ( int i = 0; i < 5; ++i ) engine::modules::Attention::forward_prefill( pod::kv_ref_f16( k_cache, v_cache ), q, g, o_new, 0, 0, d_rows, c.rows, qh, kvh, hd, max_seq, s, c.rows <= pod::MAX_BATCH ? 0 : c.pos0 + c.rows, c.per_row );
 		CUDA_CHECK( cudaEventRecord( e1, s ) ); CUDA_CHECK( cudaEventSynchronize( e1 ) );
 		float t_pre = 0; CUDA_CHECK( cudaEventElapsedTime( &t_pre, e0, e1 ) );
 		std::printf( "  rows %3d at pos %4d: cos %.6f max|d| %.4g (max %.3g) | decode kernel %8.1f us  prefill kernel %8.1f us (%.1fx)  %s\n",

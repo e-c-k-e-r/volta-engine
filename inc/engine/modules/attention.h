@@ -72,7 +72,8 @@ struct Attention {
 		int head_dim,
 		int max_seq = 2048,
 		cudaStream_t stream = nullptr,
-		int key_hint = 0
+		int key_hint = 0,
+		bool per_row = false  // every row gets its own block, for rows that sit in distinct slots
 	);
 };
 
