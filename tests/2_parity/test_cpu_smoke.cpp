@@ -87,7 +87,7 @@ static int run_child( void ( *fn )(), std::string& err ) {
 
 static void call_trellis() {
 	pod::TensorView t{};
-	engine::modules::LinearTrellis::forward( t, t, t, t, t, 4, false, true, nullptr );
+	engine::modules::LinearNVFP4::forward( t, t, t, 1.0f, t, nullptr );
 }
 
 int main() {
@@ -231,13 +231,13 @@ int main() {
 		const int m = 3, n = 70, k = 130;
 		std::vector<float> x, w;
 		auto tx = make( x, pod::DType::FP16, { m, k }, 1.0f );
-		auto tw = make( w, pod::DType::FP16, { k, n }, 0.3f );
+		auto tw = make( w, pod::DType::FP16, { k, n }, 0.3f ); // memory is [n, k] (shape tagged [k, n]), as the loader stores it
 		int sh[2] = { m, n };
 		auto to = core::arena_alloc_tensor( g_arena, pod::DType::FP16, sh, 2 );
 		modules::LinearPlainGEMV::forward( tw.ptr<half_t>(), tx.ptr<half_t>(), to.ptr<half_t>(), m, n, k, nullptr );
 		std::vector<double> ref( m * n );
 		for ( int r = 0; r < m; ++r ) for ( int c = 0; c < n; ++c ) {
-			double a = 0; for ( int i = 0; i < k; ++i ) a += double( x[r * k + i] ) * w[i * n + c];
+			double a = 0; for ( int i = 0; i < k; ++i ) a += double( x[r * k + i] ) * w[c * k + i];
 			ref[r * n + c] = a;
 		}
 		pass = check( "LinearPlainGEMV::forward", ref, to.ptr<half_t>() ) && pass;
@@ -268,8 +268,8 @@ int main() {
 	{ // A CUDA/SM70-only entry point aborts with the named message
 		std::string err;
 		const int code = run_child( call_trellis, err );
-		const bool ok = code == 1 && err.find( "CPU backend: LinearTrellis::forward is not implemented" ) != std::string::npos;
-		std::printf( "  %-28s exit=%d %s\n", "LinearTrellis::forward stub", code, ok ? "PASS" : "FAIL" );
+		const bool ok = code == 1 && err.find( "CPU backend: LinearNVFP4::forward is not implemented" ) != std::string::npos;
+		std::printf( "  %-28s exit=%d %s\n", "LinearNVFP4::forward stub", code, ok ? "PASS" : "FAIL" );
 		pass = ok && pass;
 	}
 
