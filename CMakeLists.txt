@@ -221,6 +221,10 @@ target_link_libraries(test_output_parser PRIVATE engine_kernels)
 target_compile_definitions(test_output_parser PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
 set_target_properties(test_output_parser PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(test_tokenizer_file tests/2_parity/test_tokenizer_file.cpp)
+target_link_libraries(test_tokenizer_file PRIVATE engine_kernels)
+set_target_properties(test_tokenizer_file PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(test_tokenizer tests/2_parity/test_tokenizer.cpp)
 target_link_libraries(test_tokenizer PRIVATE engine_kernels)
 set_target_properties(test_tokenizer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

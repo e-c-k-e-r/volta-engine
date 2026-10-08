@@ -12,194 +12,307 @@
 
 namespace engine::loader {
 
-// Lightweight Unicode and BPE Pre-tokenizer Classifier
+// Pre-tokenizer: an exact matcher for the two split regexes the supported checkpoints use (tokenizer.json is checked
+// against them at load time):
+//   Qwen: (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+//   GLM:  (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// Alternatives are tried in order, each greedy with the regex's backtracking.
 namespace unicode_util {
 
+#include "unicode_tables.inc"
+
+static const char* const kQwenPattern = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+static const char* const kGlmPattern = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+template <size_t N>
+static bool in_table( const uint32_t ( &t )[N][2], uint32_t cp ) {
+	size_t lo = 0, hi = N;
+	while ( lo < hi ) {
+		const size_t mid = ( lo + hi ) / 2;
+		if ( cp < t[mid][0] ) hi = mid;
+		else if ( cp > t[mid][1] ) lo = mid + 1;
+		else return true;
+	}
+	return false;
+}
+
+static inline bool is_letter( uint32_t cp ) { return in_table( kUnicodeLetter, cp ); }
+static inline bool is_mark( uint32_t cp ) { return in_table( kUnicodeMark, cp ); }
+static inline bool is_number( uint32_t cp ) { return in_table( kUnicodeNumber, cp ); }
+static inline bool is_space( uint32_t cp ) { return in_table( kUnicodeSpace, cp ); }
+
+// Decodes the code point at text[i] and advances i; malformed bytes decode as themselves (one byte).
 static inline uint32_t utf8_next( const std::string& str, size_t& i ) {
-	if ( i >= str.size() ) return 0;
-	unsigned char c = static_cast<unsigned char>( str[i++] );
-	if ( c < 0x80 ) return c;
-	if ( ( c & 0xE0 ) == 0xC0 && i < str.size() ) {
-		return ( ( c & 0x1F ) << 6 ) | ( static_cast<unsigned char>( str[i++] ) & 0x3F );
+	const unsigned char c = static_cast<unsigned char>( str[i] );
+	auto cont = [&]( size_t k ) { return i + k < str.size() && ( static_cast<unsigned char>( str[i + k] ) & 0xC0 ) == 0x80; };
+	uint32_t cp = c;
+	size_t len = 1;
+	if ( c >= 0xC2 && c < 0xE0 && cont( 1 ) ) {
+		cp = ( ( c & 0x1Fu ) << 6 ) | ( static_cast<unsigned char>( str[i + 1] ) & 0x3Fu );
+		len = 2;
 	}
-	if ( ( c & 0xF0 ) == 0xE0 && i + 1 < str.size() ) {
-		uint32_t c1 = static_cast<unsigned char>( str[i++] ) & 0x3F;
-		uint32_t c2 = static_cast<unsigned char>( str[i++] ) & 0x3F;
-		return ( ( c & 0x0F ) << 12 ) | ( c1 << 6 ) | c2;
+	else if ( c >= 0xE0 && c < 0xF0 && cont( 1 ) && cont( 2 ) ) {
+		cp = ( ( c & 0x0Fu ) << 12 ) | ( ( static_cast<unsigned char>( str[i + 1] ) & 0x3Fu ) << 6 ) | ( static_cast<unsigned char>( str[i + 2] ) & 0x3Fu );
+		len = 3;
 	}
-	if ( ( c & 0xF8 ) == 0xF0 && i + 2 < str.size() ) {
-		uint32_t c1 = static_cast<unsigned char>( str[i++] ) & 0x3F;
-		uint32_t c2 = static_cast<unsigned char>( str[i++] ) & 0x3F;
-		uint32_t c3 = static_cast<unsigned char>( str[i++] ) & 0x3F;
-		return ( ( c & 0x07 ) << 18 ) | ( c1 << 12 ) | ( c2 << 6 ) | c3;
+	else if ( c >= 0xF0 && c < 0xF5 && cont( 1 ) && cont( 2 ) && cont( 3 ) ) {
+		cp = ( ( c & 0x07u ) << 18 ) | ( ( static_cast<unsigned char>( str[i + 1] ) & 0x3Fu ) << 12 ) | ( ( static_cast<unsigned char>( str[i + 2] ) & 0x3Fu ) << 6 ) | ( static_cast<unsigned char>( str[i + 3] ) & 0x3Fu );
+		len = 4;
 	}
-	return c;
+	i += len;
+	return cp;
 }
 
-static inline bool is_number( uint32_t cp ) {
-	if ( cp >= '0' && cp <= '9' ) return true;
-	if ( cp >= 0x0660 && cp <= 0x0669 ) return true; // Arabic-Indic digits
-	if ( cp >= 0xFF10 && cp <= 0xFF19 ) return true; // Fullwidth digits
-	return false;
-}
+struct Splitter {
+	const std::string& s;
+	bool marks_are_letters;   // Qwen: [\p{L}\p{M}]+ and no \p{M} in the symbol class
+	int max_digits;
 
-static inline bool is_letter( uint32_t cp ) {
-	if ( ( cp >= 'a' && cp <= 'z' ) || ( cp >= 'A' && cp <= 'Z' ) ) return true;
-	if ( cp >= 0x00C0 && cp <= 0x024F ) return true; // Latin extended
-	if ( cp >= 0x0370 && cp <= 0x03FF ) return true; // Greek
-	if ( cp >= 0x0400 && cp <= 0x04FF ) return true; // Cyrillic
-	if ( cp >= 0x4E00 && cp <= 0x9FFF ) return true; // CJK Unified Ideographs
-	if ( cp >= 0x3400 && cp <= 0x4DBF ) return true; // CJK Extension A
-	if ( cp >= 0x3040 && cp <= 0x309F ) return true; // Hiragana
-	if ( cp >= 0x30A0 && cp <= 0x30FF ) return true; // Katakana
-	if ( cp >= 0xAC00 && cp <= 0xD7AF ) return true; // Hangul Syllables
-	return false;
-}
+	bool letter( uint32_t cp ) const { return is_letter( cp ) || ( marks_are_letters && is_mark( cp ) ); }
 
-static inline bool is_whitespace( uint32_t cp ) {
-	return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == 0x00A0 || cp == 0x2000 || cp == 0x3000;
-}
-
-static inline bool is_punctuation_or_symbol( uint32_t cp ) {
-	return !is_letter( cp ) && !is_number( cp ) && !is_whitespace( cp );
-}
-
-static inline bool check_contraction( const std::string& text, size_t pos, size_t& len ) {
-	if ( pos + 1 >= text.size() ) return false;
-	char c0 = text[pos];
-	if ( c0 != '\'' ) return false;
-	size_t apo_len = 1;
-	if ( pos + apo_len >= text.size() ) return false;
-
-	char c1 = static_cast<char>( std::tolower( static_cast<unsigned char>( text[pos + apo_len] ) ) );
-	if ( c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd' ) {
-		len = apo_len + 1;
-		return true;
+	// code point at position p (p < size) and the position after it
+	uint32_t at( size_t p, size_t* next ) const {
+		size_t q = p;
+		const uint32_t cp = utf8_next( s, q );
+		*next = q;
+		return cp;
 	}
-	if ( pos + apo_len + 1 < text.size() ) {
-		char c2 = static_cast<char>( std::tolower( static_cast<unsigned char>( text[pos + apo_len + 1] ) ) );
-		if ( ( c1 == 'r' && c2 == 'e' ) || ( c1 == 'v' && c2 == 'e' ) || ( c1 == 'l' && c2 == 'l' ) ) {
-			len = apo_len + 2;
-			return true;
+
+	// 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+	size_t contraction( size_t i ) const {
+		if ( s[i] != '\'' || i + 1 >= s.size() ) return 0;
+		auto lc = [&]( size_t k ) { return k < s.size() ? static_cast<char>( std::tolower( static_cast<unsigned char>( s[k] ) ) ) : '\0'; };
+		const char a = lc( i + 1 ), b = lc( i + 2 );
+		if ( a == 's' || a == 't' || a == 'm' || a == 'd' ) return 2;
+		if ( ( a == 'r' && b == 'e' ) || ( a == 'v' && b == 'e' ) || ( a == 'l' && b == 'l' ) ) return 3;
+		return 0;
+	}
+
+	// run of letters starting at p; returns the end (p if none)
+	size_t letters( size_t p ) const {
+		while ( p < s.size() ) {
+			size_t nx;
+			if ( !letter( at( p, &nx ) ) ) break;
+			p = nx;
+		}
+		return p;
+	}
+
+	// 2. [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+	size_t word( size_t i ) const {
+		size_t nx;
+		const uint32_t c = at( i, &nx );
+		if ( c != '\r' && c != '\n' && !is_letter( c ) && !is_number( c ) ) {
+			const size_t e = letters( nx );
+			if ( e > nx ) return e;
+		}
+		const size_t e = letters( i );
+		return e > i ? e : 0;
+	}
+
+	// 4. ' '?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+	size_t symbols( size_t i ) const {
+		size_t p = i;
+		if ( s[p] == ' ' ) ++p;
+		const size_t start = p;
+		while ( p < s.size() ) {
+			size_t nx;
+			const uint32_t c = at( p, &nx );
+			if ( is_space( c ) || is_letter( c ) || is_number( c ) || ( marks_are_letters && is_mark( c ) ) ) break;
+			p = nx;
+		}
+		if ( p == start ) return 0;
+		while ( p < s.size() && ( s[p] == '\r' || s[p] == '\n' ) ) ++p;
+		return p;
+	}
+
+	size_t space_run_end( size_t i ) const {
+		size_t p = i;
+		while ( p < s.size() ) {
+			size_t nx;
+			if ( !is_space( at( p, &nx ) ) ) break;
+			p = nx;
+		}
+		return p;
+	}
+
+	size_t next( size_t i ) const {
+		if ( size_t n = contraction( i ) ) return i + n;
+		if ( size_t e = word( i ) ) return e;
+		size_t nx;
+		const uint32_t c = at( i, &nx );
+		if ( is_number( c ) ) {
+			size_t p = nx;
+			for ( int d = 1; d < max_digits && p < s.size(); ++d ) {
+				size_t nn;
+				if ( !is_number( at( p, &nn ) ) ) break;
+				p = nn;
+			}
+			return p;
+		}
+		if ( size_t e = symbols( i ) ) return e;
+		if ( is_space( c ) ) {
+			const size_t e = space_run_end( i );
+			// \s*[\r\n]+ : the last newline in the run is where \s* stops; newlines directly after it join the match
+			size_t last_nl = std::string::npos;
+			for ( size_t p = i; p < e; ++p ) {
+				if ( s[p] == '\r' || s[p] == '\n' ) last_nl = p;
+			}
+			if ( last_nl != std::string::npos ) {
+				size_t p = last_nl;
+				while ( p < e && ( s[p] == '\r' || s[p] == '\n' ) ) ++p;
+				return p;
+			}
+			// \s+(?!\S) : all of the run at the end of the text, else all but its last character
+			if ( e == s.size() ) return e;
+			size_t last = i, p = i;
+			while ( p < e ) {
+				last = p;
+				at( p, &p );
+			}
+			if ( last > i ) return last;
+			return e; // \s+
+		}
+		return nx; // a code point no alternative matches: the regex skips it, the splitter keeps it alone
+	}
+};
+
+// Unicode NFC (canonical decomposition, canonical reordering, canonical composition), as the Qwen tokenizer.json normalizer
+static int combining_class( uint32_t cp ) {
+	size_t lo = 0, hi = sizeof( kCombiningClass ) / sizeof( kCombiningClass[0] );
+	while ( lo < hi ) {
+		const size_t mid = ( lo + hi ) / 2;
+		if ( cp < kCombiningClass[mid][0] ) hi = mid;
+		else if ( cp > kCombiningClass[mid][1] ) lo = mid + 1;
+		else return static_cast<int>( kCombiningClass[mid][2] );
+	}
+	return 0;
+}
+
+static void append_decomposed( uint32_t cp, std::vector<uint32_t>& out ) {
+	constexpr uint32_t SBase = 0xAC00, LBase = 0x1100, VBase = 0x1161, TBase = 0x11A7, LCount = 19, VCount = 21, TCount = 28, NCount = VCount * TCount, SCount = LCount * NCount;
+	if ( cp >= SBase && cp < SBase + SCount ) {
+		const uint32_t si = cp - SBase;
+		out.push_back( LBase + si / NCount );
+		out.push_back( VBase + ( si % NCount ) / TCount );
+		if ( si % TCount ) out.push_back( TBase + si % TCount );
+		return;
+	}
+	size_t lo = 0, hi = sizeof( kNfdIndex ) / sizeof( kNfdIndex[0] );
+	while ( lo < hi ) {
+		const size_t mid = ( lo + hi ) / 2;
+		if ( cp < kNfdIndex[mid][0] ) hi = mid;
+		else if ( cp > kNfdIndex[mid][0] ) lo = mid + 1;
+		else {
+			for ( uint32_t k = 0; k < kNfdIndex[mid][2]; ++k ) out.push_back( kNfdData[kNfdIndex[mid][1] + k] );
+			return;
 		}
 	}
-	return false;
+	out.push_back( cp );
 }
 
-// BPE word-level splitting matching standard BPE regex patterns
-static std::vector<std::string> bpe_split( const std::string& text, int max_digits ) {
+static uint32_t compose_pair( uint32_t a, uint32_t b ) {
+	constexpr uint32_t SBase = 0xAC00, LBase = 0x1100, VBase = 0x1161, TBase = 0x11A7, LCount = 19, VCount = 21, TCount = 28, NCount = VCount * TCount;
+	if ( a >= LBase && a < LBase + LCount && b >= VBase && b < VBase + VCount ) return SBase + ( ( a - LBase ) * VCount + ( b - VBase ) ) * TCount;
+	if ( a >= SBase && a < SBase + LCount * NCount && ( a - SBase ) % TCount == 0 && b > TBase && b < TBase + TCount ) return a + ( b - TBase );
+	size_t lo = 0, hi = sizeof( kComposePairs ) / sizeof( kComposePairs[0] );
+	while ( lo < hi ) {
+		const size_t mid = ( lo + hi ) / 2;
+		const uint32_t* e = kComposePairs[mid];
+		if ( a < e[0] || ( a == e[0] && b < e[1] ) ) hi = mid;
+		else if ( a > e[0] || b > e[1] ) lo = mid + 1;
+		else return e[2];
+	}
+	return 0;
+}
+
+static void append_utf8( uint32_t cp, std::string& out ) {
+	if ( cp < 0x80 ) {
+		out.push_back( static_cast<char>( cp ) );
+	}
+	else if ( cp < 0x800 ) {
+		out.push_back( static_cast<char>( 0xC0 | ( cp >> 6 ) ) );
+		out.push_back( static_cast<char>( 0x80 | ( cp & 0x3F ) ) );
+	}
+	else if ( cp < 0x10000 ) {
+		out.push_back( static_cast<char>( 0xE0 | ( cp >> 12 ) ) );
+		out.push_back( static_cast<char>( 0x80 | ( ( cp >> 6 ) & 0x3F ) ) );
+		out.push_back( static_cast<char>( 0x80 | ( cp & 0x3F ) ) );
+	}
+	else {
+		out.push_back( static_cast<char>( 0xF0 | ( cp >> 18 ) ) );
+		out.push_back( static_cast<char>( 0x80 | ( ( cp >> 12 ) & 0x3F ) ) );
+		out.push_back( static_cast<char>( 0x80 | ( ( cp >> 6 ) & 0x3F ) ) );
+		out.push_back( static_cast<char>( 0x80 | ( cp & 0x3F ) ) );
+	}
+}
+
+static std::string nfc( const std::string& text ) {
+	bool ascii = true;
+	for ( unsigned char c : text ) {
+		if ( c >= 0x80 ) {
+			ascii = false;
+			break;
+		}
+	}
+	if ( ascii ) return text;
+	std::vector<uint32_t> cps;
+	cps.reserve( text.size() );
+	for ( size_t i = 0; i < text.size(); ) {
+		const size_t before = i;
+		const uint32_t cp = utf8_next( text, i );
+		if ( cp >= 0x80 && i == before + 1 ) return text; // malformed UTF-8: leave untouched
+		append_decomposed( cp, cps );
+	}
+	// canonical ordering: stable sort of each run of non-starters by combining class
+	for ( size_t i = 0; i < cps.size(); ) {
+		if ( combining_class( cps[i] ) == 0 ) {
+			++i;
+			continue;
+		}
+		size_t j = i;
+		while ( j < cps.size() && combining_class( cps[j] ) != 0 ) ++j;
+		std::stable_sort( cps.begin() + static_cast<long>( i ), cps.begin() + static_cast<long>( j ),
+			[]( uint32_t a, uint32_t b ) { return combining_class( a ) < combining_class( b ); } );
+		i = j;
+	}
+	// canonical composition
+	std::vector<uint32_t> out;
+	out.reserve( cps.size() );
+	long starter = -1;
+	int last_class = -1;
+	for ( uint32_t cp : cps ) {
+		const int cc = combining_class( cp );
+		if ( starter >= 0 && ( last_class < cc || last_class == 0 ) ) {
+			const uint32_t comp = compose_pair( out[static_cast<size_t>( starter )], cp );
+			if ( comp != 0 && ( last_class < cc || static_cast<size_t>( starter ) == out.size() - 1 ) ) {
+				out[static_cast<size_t>( starter )] = comp;
+				continue;
+			}
+		}
+		if ( cc == 0 ) {
+			starter = static_cast<long>( out.size() );
+			last_class = 0;
+		}
+		else {
+			last_class = cc;
+		}
+		out.push_back( cp );
+	}
+	std::string res;
+	res.reserve( text.size() );
+	for ( uint32_t cp : out ) append_utf8( cp, res );
+	return res;
+}
+
+static std::vector<std::string> bpe_split( const std::string& text, int max_digits, bool marks_are_letters ) {
 	std::vector<std::string> words;
+	Splitter sp{ text, marks_are_letters, max_digits };
 	size_t i = 0;
-	size_t n = text.size();
-
-	while ( i < n ) {
-		// 1. Contractions: 's|'t|'re|'ve|'m|'ll|'d
-		size_t cont_len = 0;
-		if ( check_contraction( text, i, cont_len ) ) {
-			words.push_back( text.substr( i, cont_len ) );
-			i += cont_len;
-			continue;
-		}
-
-		// 2. Whitespace runs (newlines vs spaces)
-		if ( text[i] == '\r' || text[i] == '\n' ) {
-			size_t start = i;
-			while ( i < n && ( text[i] == '\r' || text[i] == '\n' ) ) {
-				i++;
-			}
-			words.push_back( text.substr( start, i - start ) );
-			continue;
-		}
-
-		if ( text[i] == ' ' || text[i] == '\t' ) {
-			size_t space_start = i;
-			while ( i < n && ( text[i] == ' ' || text[i] == '\t' ) ) {
-				i++;
-			}
-			// Check if space followed by letter or punctuation
-			if ( i < n && ( text[i] != '\r' && text[i] != '\n' ) ) {
-				// If followed by letter or number, include single leading space with word
-				if ( i - space_start == 1 ) {
-					// Leading single space attached to next word/punctuation
-					size_t next_i = i;
-					size_t temp = i;
-					uint32_t next_cp = utf8_next( text, temp );
-					if ( is_letter( next_cp ) ) {
-						i = temp;
-						while ( i < n ) {
-							size_t chk = i;
-							uint32_t cp = utf8_next( text, chk );
-							if ( is_letter( cp ) ) i = chk;
-							else break;
-						}
-						words.push_back( text.substr( space_start, i - space_start ) );
-						continue;
-					} else if ( is_number( next_cp ) ) {
-						// Numbers: do not attach space to digits in standard BPE regex (" ?" is only for punctuation/symbols)
-						words.push_back( text.substr( space_start, 1 ) );
-						continue;
-					} else if ( is_punctuation_or_symbol( next_cp ) ) {
-						i = temp;
-						while ( i < n ) {
-							size_t chk = i;
-							uint32_t cp = utf8_next( text, chk );
-							if ( is_punctuation_or_symbol( cp ) ) i = chk;
-							else break;
-						}
-						words.push_back( text.substr( space_start, i - space_start ) );
-						continue;
-					}
-				}
-			}
-			words.push_back( text.substr( space_start, i - space_start ) );
-			continue;
-		}
-
-		// 3. Letters: [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
-		size_t letter_start = i;
-		uint32_t first_cp = utf8_next( text, i );
-		if ( is_letter( first_cp ) ) {
-			while ( i < n ) {
-				size_t chk = i;
-				uint32_t cp = utf8_next( text, chk );
-				if ( is_letter( cp ) ) i = chk;
-				else break;
-			}
-			words.push_back( text.substr( letter_start, i - letter_start ) );
-			continue;
-		}
-
-		// 4. Numbers: \p{N} or \p{N}{1,3}
-		if ( is_number( first_cp ) ) {
-			int count = 1;
-			while ( count < max_digits && i < n ) {
-				size_t chk = i;
-				uint32_t cp = utf8_next( text, chk );
-				if ( is_number( cp ) ) {
-					i = chk;
-					count++;
-				} else {
-					break;
-				}
-			}
-			words.push_back( text.substr( letter_start, i - letter_start ) );
-			continue;
-		}
-
-		// 5. Punctuation / symbols: ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
-		if ( is_punctuation_or_symbol( first_cp ) ) {
-			while ( i < n ) {
-				size_t chk = i;
-				uint32_t cp = utf8_next( text, chk );
-				if ( is_punctuation_or_symbol( cp ) ) i = chk;
-				else break;
-			}
-			words.push_back( text.substr( letter_start, i - letter_start ) );
-			continue;
-		}
-
-		// Fallback single character
-		words.push_back( text.substr( letter_start, i - letter_start ) );
+	while ( i < text.size() ) {
+		const size_t e = sp.next( i );
+		words.push_back( text.substr( i, e - i ) );
+		i = e;
 	}
 	return words;
 }
@@ -454,12 +567,31 @@ bool Tokenizer::load( const char* model_dir ) {
 		}
 	}
 
-	// Detect digit splitting from pre_tokenizer pattern: \p{N}{1,3} -> 3, else 1
+	nfc_ = false;
+	if ( has_tok_json && tok_json.contains( "normalizer" ) && !tok_json["normalizer"].is_null() ) {
+		if ( tok_json["normalizer"].value( "type", std::string() ) == "NFC" ) {
+			nfc_ = true;
+		}
+		else {
+			std::fprintf( stderr, "[-] tokenizer.json uses a normalizer this engine does not implement\n" );
+			return false;
+		}
+	}
+	// The split regex must be one the matcher implements exactly
 	max_digits_ = 1;
+	marks_are_letters_ = true;
 	if ( has_tok_json && tok_json.contains( "pre_tokenizer" ) ) {
-		std::string pt_dump = tok_json["pre_tokenizer"].dump();
-		if ( pt_dump.find( "\\p{N}{1,3}" ) != std::string::npos ) {
+		const std::string pt_dump = tok_json["pre_tokenizer"].dump();
+		// the regex appears JSON-escaped inside the dump, so compare against the escaped form
+		const std::string qwen = nlohmann::json( unicode_util::kQwenPattern ).dump();
+		const std::string glm = nlohmann::json( unicode_util::kGlmPattern ).dump();
+		if ( pt_dump.find( glm.substr( 1, glm.size() - 2 ) ) != std::string::npos ) {
 			max_digits_ = 3;
+			marks_are_letters_ = false;
+		}
+		else if ( pt_dump.find( qwen.substr( 1, qwen.size() - 2 ) ) == std::string::npos ) {
+			std::fprintf( stderr, "[-] tokenizer.json uses a pre-tokenizer pattern this engine does not implement\n" );
+			return false;
 		}
 	}
 
@@ -508,7 +640,8 @@ std::vector<int> Tokenizer::encode_text_segment( const std::string& text ) const
 	std::vector<int> result;
 	if ( text.empty() ) return result;
 
-	std::vector<std::string> words = unicode_util::bpe_split( text, max_digits_ );
+	const std::string normalized = nfc_ ? unicode_util::nfc( text ) : text;
+	std::vector<std::string> words = unicode_util::bpe_split( normalized, max_digits_, marks_are_letters_ );
 	for ( const auto& word : words ) {
 		auto piece_toks = encode_piece( word );
 		result.insert( result.end(), piece_toks.begin(), piece_toks.end() );

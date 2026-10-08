@@ -57,6 +57,8 @@ tier2() {
 	run jinja_chat_templates ./test_jinja
 	run output_parser ./test_output_parser
 	run tokenizer ./test_tokenizer
+	run tokenizer_cases_qwen ./test_tokenizer_file $VOLTA_MODEL_ROOT/Qwen3.8-27B-exl3 --cases $ROOT/tests/data/tokenizer_cases_qwen3_5.json
+	run tokenizer_cases_glm ./test_tokenizer_file $VOLTA_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
 	run backend_tiers ./test_backend_tiers $ROOT
 	run ref_linear_host ./test_ref_linear
 	run ref_linear_gpu gpu ./test_ref_linear --gpu

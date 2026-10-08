@@ -65,6 +65,8 @@ private:
 	int pad_token_id_ = -1;
 	int bos_token_id_ = -1;
 	int max_digits_ = 1; // 1 for Qwen (\p{N}), 3 for GLM (\p{N}{1,3})
+	bool nfc_ = false;               // tokenizer.json normalizer: NFC
+	bool marks_are_letters_ = true; // Qwen pattern: [\p{L}\p{M}]+, GLM: \p{L}+
 };
 
 } // namespace engine::loader
