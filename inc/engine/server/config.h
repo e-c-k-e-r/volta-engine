@@ -11,7 +11,7 @@ struct ServerConfig {
 	int default_max_tokens = 256;
 	float default_temperature = 0.0f;
 
-	std::string model_type;      // empty: read from <model_dir>/config.json; otherwise qwen3_5 | glm5_next
+	std::string model_type;      // deduced by resolve() from <model_dir>/config.json (qwen3_5 | glm5_next)
 	std::string model_dir;       // required
 	std::string draft_model_dir; // required with use_speculation
 	bool use_speculation = false;

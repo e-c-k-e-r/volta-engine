@@ -70,11 +70,9 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 	if ( j.contains( "default_temperature" ) && j["default_temperature"].is_number() ) {
 		default_temperature = j["default_temperature"].get<float>();
 	}
-	if ( j.contains( "model_type" ) && j["model_type"].is_string() ) {
-		model_type = j["model_type"].get<std::string>();
-	}
-	if ( j.contains( "model" ) && j["model"].is_string() ) {
-		model_type = j["model"].get<std::string>();
+	if ( j.contains( "model_type" ) || j.contains( "model" ) ) {
+		std::fprintf( stderr, "[-] Error: model_type is read from the checkpoint config.json; remove it from the launch config\n" );
+		return false;
 	}
 	if ( j.contains( "model_dir" ) && j["model_dir"].is_string() ) {
 		model_dir = j["model_dir"].get<std::string>();
@@ -127,8 +125,9 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 		else if ( ( std::strcmp( argv[i], "--host" ) == 0 ) && i + 1 < argc ) {
 			host = argv[++i];
 		}
-		else if ( ( std::strcmp( argv[i], "--model" ) == 0 || std::strcmp( argv[i], "--model-type" ) == 0 ) && i + 1 < argc ) {
-			model_type = argv[++i];
+		else if ( std::strcmp( argv[i], "--model" ) == 0 || std::strcmp( argv[i], "--model-type" ) == 0 ) {
+			std::fprintf( stderr, "[-] FATAL: %s was removed; model_type is read from the checkpoint config.json\n", argv[i] );
+			std::exit( 2 );
 		}
 		else if ( ( std::strcmp( argv[i], "--model-dir" ) == 0 || std::strcmp( argv[i], "--weights-dir" ) == 0 ) && i + 1 < argc ) {
 			model_dir = argv[++i];
@@ -178,11 +177,11 @@ bool ServerConfig::resolve() {
 		std::fprintf( stderr, "[-] FATAL: model_dir is required (--model-dir or \"model_dir\" in the launch config)\n" );
 		return false;
 	}
-	if ( model_type.empty() ) {
+	{
 		const std::string path = model_dir + "/config.json";
 		FILE* f = std::fopen( path.c_str(), "rb" );
 		if ( !f ) {
-			std::fprintf( stderr, "[-] FATAL: no model_type given and %s is unreadable\n", path.c_str() );
+			std::fprintf( stderr, "[-] FATAL: %s is unreadable\n", path.c_str() );
 			return false;
 		}
 		std::string text;

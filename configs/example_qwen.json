@@ -1,5 +1,4 @@
 {
-	"model_type": "qwen3_5",
 	"model_dir": "/path/to/Qwen3.8-27B-exl3",
 	"draft_model_dir": "/path/to/Qwen3.8-27B-DFlash2-EXL3",
 	"use_speculation": true,
