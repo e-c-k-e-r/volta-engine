@@ -6,6 +6,7 @@ notes/
 
 # artifacts
 build/
+build_*/
 bin/
 makefiles/defaults/*
 *.d
