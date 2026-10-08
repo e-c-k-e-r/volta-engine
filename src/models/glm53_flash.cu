@@ -885,16 +885,21 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 
 		if ( lw.hc_attn_fn.data != nullptr ) {
 			// mHC pre-step: attention
-			engine::modules::HyperConnection::collapse(
-				hidden_streams_, lw.hc_attn_fn, lw.hc_attn_base, lw.hc_attn_scale,
-				mhc_collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_logits_, mhc_pre_,
-				H, 20, 1e-6f, stream, m
-			);
-
-			// 1. Input RMSNorm: norm_hidden = rms_norm(mhc_collapsed_)
-			engine::modules::RMSNorm::forward(
-				mhc_collapsed_, lw.input_norm, norm_hidden_, 1e-5f, 0.0f, stream
-			);
+			// Collapse and the input RMSNorm (norm_hidden = rms_norm(collapsed)) in one launch when the shape allows
+			if ( !engine::modules::HyperConnection::collapse_norm(
+				hidden_streams_, lw.hc_attn_fn, lw.hc_attn_base, lw.hc_attn_scale, lw.input_norm, norm_hidden_,
+				mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_logits_, mhc_pre_,
+				H, 20, 1e-6f, 1e-5f, 0.0f, stream, m
+			) ) {
+				engine::modules::HyperConnection::collapse(
+					hidden_streams_, lw.hc_attn_fn, lw.hc_attn_base, lw.hc_attn_scale,
+					mhc_collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_logits_, mhc_pre_,
+					H, 20, 1e-6f, stream, m
+				);
+				engine::modules::RMSNorm::forward(
+					mhc_collapsed_, lw.input_norm, norm_hidden_, 1e-5f, 0.0f, stream
+				);
+			}
 		}
 		else {
 			// 1. Input RMSNorm: norm_hidden = rms_norm(hidden_states)
@@ -1105,16 +1110,21 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 
 		if ( lw.hc_ffn_fn.data != nullptr ) {
 			// mHC pre-step: FFN
-			engine::modules::HyperConnection::collapse(
-				hidden_streams_, lw.hc_ffn_fn, lw.hc_ffn_base, lw.hc_ffn_scale,
-				mhc_collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_logits_, mhc_pre_,
-				H, 20, 1e-6f, stream, m
-			);
-
-			// 3. Post-attention RMSNorm: norm_hidden = rms_norm(mhc_collapsed_)
-			engine::modules::RMSNorm::forward(
-				mhc_collapsed_, lw.post_attn_norm, norm_hidden_, 1e-5f, 0.0f, stream
-			);
+			// Collapse and the post-attention RMSNorm in one launch when the shape allows
+			if ( !engine::modules::HyperConnection::collapse_norm(
+				hidden_streams_, lw.hc_ffn_fn, lw.hc_ffn_base, lw.hc_ffn_scale, lw.post_attn_norm, norm_hidden_,
+				mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_logits_, mhc_pre_,
+				H, 20, 1e-6f, 1e-5f, 0.0f, stream, m
+			) ) {
+				engine::modules::HyperConnection::collapse(
+					hidden_streams_, lw.hc_ffn_fn, lw.hc_ffn_base, lw.hc_ffn_scale,
+					mhc_collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_logits_, mhc_pre_,
+					H, 20, 1e-6f, stream, m
+				);
+				engine::modules::RMSNorm::forward(
+					mhc_collapsed_, lw.post_attn_norm, norm_hidden_, 1e-5f, 0.0f, stream
+				);
+			}
 		}
 		else {
 			// 3. Post-attention RMSNorm: norm_hidden = rms_norm(hidden_states)

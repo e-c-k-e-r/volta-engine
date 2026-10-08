@@ -2,6 +2,7 @@
 #include "engine/core/batch.h"
 #include <cuda_fp16.h>
 #include <cmath>
+#include <cstdlib>
 #include <type_traits>
 
 namespace engine::modules {
@@ -35,8 +36,8 @@ __global__ void init_streams_kernel(
 }
 
 template <int H, int M_, typename FN_T>
-__global__ __launch_bounds__( NUM_THREADS_A )
-void hc_mix_partials_kernel(
+__device__ __forceinline__
+void hc_mix_partials_body(
 	const float* __restrict__ streams,
 	const FN_T* __restrict__ fn,
 	const int row_len,
@@ -54,7 +55,7 @@ void hc_mix_partials_kernel(
 	#pragma unroll
 	for ( int k = 0; k <= M; ++k ) acc[k] = 0.0f;
 
-	for ( int c = c0 / 4 + threadIdx.x; c < c1 / 4; c += NUM_THREADS_A ) {
+	for ( int c = c0 / 4 + threadIdx.x; threadIdx.x < NUM_THREADS_A && c < c1 / 4; c += NUM_THREADS_A ) {
 		float4 s = s4[c];
 		acc[M] = fmaf( s.x, s.x, acc[M] );
 		acc[M] = fmaf( s.y, s.y, acc[M] );
@@ -86,7 +87,7 @@ void hc_mix_partials_kernel(
 		for ( int offset = 16; offset > 0; offset >>= 1 ) {
 			v += __shfl_down_sync( 0xffffffffu, v, offset );
 		}
-		if ( lane == 0 ) red[warp][k] = v;
+		if ( lane == 0 && warp < NUM_THREADS_A / 32 ) red[warp][k] = v;
 	}
 	__syncthreads();
 
@@ -103,9 +104,22 @@ void hc_mix_partials_kernel(
 	}
 }
 
+template <int H, int M_, typename FN_T>
+__global__ __launch_bounds__( NUM_THREADS_A )
+void hc_mix_partials_kernel(
+	const float* __restrict__ streams,
+	const FN_T* __restrict__ fn,
+	const int row_len,
+	const int chunk_cols
+) {
+	hc_mix_partials_body<H, M_, FN_T>( streams, fn, row_len, chunk_cols );
+}
+
 template <int H, int M_, bool HEAD, bool HALF_OUT>
-__global__ __launch_bounds__( NUM_THREADS )
-void hc_mix_finalize_kernel(
+__device__ __forceinline__
+void hc_mix_finalize_body(
+	const int bx,
+	const size_t out_stride, // elements between rows of `collapsed` (D, or 0 for a one-row shared buffer)
 	const float* __restrict__ streams,
 	const float* __restrict__ base,
 	const float* __restrict__ scale,
@@ -155,11 +169,11 @@ void hc_mix_finalize_kernel(
 	}
 	__syncthreads();
 
-	if ( inv_rms_buf && threadIdx.x == 0 && blockIdx.x == 0 ) inv_rms_buf[r] = rmr;
-	if ( mix_logits_buf && threadIdx.x < M && blockIdx.x == 0 ) mix_logits_buf[r * M + threadIdx.x] = mix_s[threadIdx.x];
-	if ( pre_buf && threadIdx.x < H && blockIdx.x == 0 ) pre_buf[r * H + threadIdx.x] = pre_s[threadIdx.x];
+	if ( inv_rms_buf && threadIdx.x == 0 && bx == 0 ) inv_rms_buf[r] = rmr;
+	if ( mix_logits_buf && threadIdx.x < M && bx == 0 ) mix_logits_buf[r * M + threadIdx.x] = mix_s[threadIdx.x];
+	if ( pre_buf && threadIdx.x < H && bx == 0 ) pre_buf[r * H + threadIdx.x] = pre_s[threadIdx.x];
 
-	const bool sink_warp = !HEAD && blockIdx.x == 0 && threadIdx.x < 32;
+	const bool sink_warp = !HEAD && bx == 0 && threadIdx.x < 32;
 	if ( sink_warp ) {
 		if ( threadIdx.x < H ) {
 			post[static_cast<size_t>( r ) * H + threadIdx.x] =
@@ -204,10 +218,10 @@ void hc_mix_finalize_kernel(
 	#pragma unroll
 	for ( int h = 0; h < H; ++h ) pre_r[h] = pre_s[h];
 
-	const bool shrunk = !HEAD && blockIdx.x == 0;
+	const bool shrunk = !HEAD && bx == 0;
 	const int tid = shrunk ? threadIdx.x - 32 : threadIdx.x;
 	const int nth = shrunk ? NUM_THREADS - 32 : NUM_THREADS;
-	const int c0 = blockIdx.x * chunk_cols_c;
+	const int c0 = bx * chunk_cols_c;
 	const int c1 = min( c0 + chunk_cols_c, D );
 	const float4* s4 = (const float4*)( streams + static_cast<size_t>( r ) * row_len );
 	const int D4 = D / 4;
@@ -222,13 +236,111 @@ void hc_mix_finalize_kernel(
 			o.w = fmaf( pre_r[h], s.w, o.w );
 		}
 		if ( HALF_OUT ) {
-			half2* out2 = (half2*)( static_cast<half*>( collapsed ) + static_cast<size_t>( r ) * D );
+			half2* out2 = (half2*)( static_cast<half*>( collapsed ) + static_cast<size_t>( r ) * out_stride );
 			out2[c * 2] = __floats2half2_rn( o.x, o.y );
 			out2[c * 2 + 1] = __floats2half2_rn( o.z, o.w );
 		}
 		else {
-			((float4*)( static_cast<float*>( collapsed ) + static_cast<size_t>( r ) * D ))[c] = o;
+			((float4*)( static_cast<float*>( collapsed ) + static_cast<size_t>( r ) * out_stride ))[c] = o;
 		}
+	}
+}
+
+template <int H, int M_, bool HEAD, bool HALF_OUT>
+__global__ __launch_bounds__( NUM_THREADS )
+void hc_mix_finalize_kernel(
+	const float* __restrict__ streams,
+	const float* __restrict__ base,
+	const float* __restrict__ scale,
+	float* __restrict__ post,
+	float* __restrict__ comb,
+	void* __restrict__ collapsed,
+	float* __restrict__ inv_rms_buf,
+	float* __restrict__ mix_logits_buf,
+	float* __restrict__ pre_buf,
+	const int D,
+	const int chunksA,
+	const int chunk_cols_c,
+	const float rms_eps,
+	const float hc_eps,
+	const int sinkhorn_iters
+) {
+	hc_mix_finalize_body<H, M_, HEAD, HALF_OUT>( blockIdx.x, static_cast<size_t>( D ), streams, base, scale, post, comb, collapsed, inv_rms_buf,
+		mix_logits_buf, pre_buf, D, chunksA, chunk_cols_c, rms_eps, hc_eps, sinkhorn_iters );
+}
+
+// Collapse + RMSNorm in one launch. Blocks publish the mix partials; the last block of a row to arrive runs the
+// finalize for that row alone (chunk_cols_c = D), keeps the collapsed row in shared memory (half, as the separate
+// kernel stored it) and normalizes it with the same per-thread order and reduction as rms_norm_kernel, so the result
+// is bit-identical to collapse + RMSNorm::forward. The arrival counters reset themselves for graph replays.
+__device__ unsigned g_mhc_arrivals[pod::MAX_ROWS];
+
+template <int H, int M_>
+__global__ __launch_bounds__( NUM_THREADS )
+void hc_collapse_norm_kernel(
+	const float* __restrict__ streams,
+	const float* __restrict__ fn,
+	const float* __restrict__ base,
+	const float* __restrict__ scale,
+	const half* __restrict__ norm_w,
+	half* __restrict__ norm_out,
+	float* __restrict__ post,
+	float* __restrict__ comb,
+	float* __restrict__ inv_rms_buf,
+	float* __restrict__ mix_logits_buf,
+	float* __restrict__ pre_buf,
+	const int D,
+	const int chunk_cols,
+	const float rms_eps,
+	const float hc_eps,
+	const int sinkhorn_iters,
+	const float norm_eps,
+	const float norm_bias
+) {
+	extern __shared__ __align__( 16 ) unsigned char hcn_smem[];
+	half* s_col = reinterpret_cast<half*>( hcn_smem );
+	__shared__ bool last;
+	__shared__ float s_warp_sums[8];
+	const int r = blockIdx.y;
+	hc_mix_partials_body<H, M_, float>( streams, fn, H * D, chunk_cols );
+	__syncthreads();
+	if ( threadIdx.x == 0 ) {
+		__threadfence();
+		const unsigned prev = atomicAdd( &g_mhc_arrivals[r], 1u );
+		last = prev == gridDim.x - 1;
+		if ( last ) g_mhc_arrivals[r] = 0;
+	}
+	__syncthreads();
+	if ( !last ) return;
+	__threadfence();
+	hc_mix_finalize_body<H, M_, false, true>( 0, 0, streams, base, scale, post, comb, s_col, inv_rms_buf,
+		mix_logits_buf, pre_buf, D, gridDim.x, D, rms_eps, hc_eps, sinkhorn_iters );
+	__syncthreads();
+
+	// RMSNorm over the collapsed row, as rms_norm_kernel: element i is thread i % 256's, ascending
+	const int tid = threadIdx.x;
+	float local_sq = 0.0f;
+	for ( int i = tid; i < D; i += NUM_THREADS ) {
+		const float v = __half2float( s_col[i] );
+		local_sq = fmaf( v, v, local_sq );
+	}
+	#pragma unroll
+	for ( int mask = 16; mask > 0; mask >>= 1 ) local_sq += __shfl_xor_sync( 0xffffffff, local_sq, mask );
+	const int warp_id = tid >> 5, lane_id = tid & 31;
+	if ( lane_id == 0 ) s_warp_sums[warp_id] = local_sq;
+	__syncthreads();
+	if ( warp_id == 0 ) {
+		float b_sum = ( lane_id < 8 ) ? s_warp_sums[lane_id] : 0.0f;
+		#pragma unroll
+		for ( int mask = 4; mask > 0; mask >>= 1 ) b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
+		if ( lane_id == 0 ) s_warp_sums[0] = rsqrtf( b_sum / static_cast<float>( D ) + norm_eps );
+	}
+	__syncthreads();
+	const float inv = s_warp_sums[0];
+	half* dst = norm_out + static_cast<size_t>( r ) * D;
+	for ( int i = tid; i < D; i += NUM_THREADS ) {
+		const float w = __half2float( norm_w[i] ) + norm_bias;
+		dst[i] = __float2half_rn( __half2float( s_col[i] ) * w * inv );
 	}
 }
 
@@ -450,6 +562,44 @@ void HyperConnection::collapse(
 		eps,
 		sinkhorn_iters
 	);
+}
+
+bool HyperConnection::collapse_norm(
+	const pod::TensorView& streams,
+	const pod::TensorView& fn,
+	const pod::TensorView& base,
+	const pod::TensorView& scale,
+	const pod::TensorView& norm_weight,
+	pod::TensorView& norm_out,
+	pod::TensorView& post_out,
+	pod::TensorView& comb_out,
+	pod::TensorView& inv_rms_buf,
+	pod::TensorView& mix_logits_buf,
+	pod::TensorView& pre_buf,
+	int hidden_size,
+	int sinkhorn_iters,
+	float eps,
+	float norm_eps,
+	float norm_bias,
+	cudaStream_t stream,
+	int rows
+) {
+	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS, "HyperConnection::collapse_norm: rows out of range" );
+	static const bool fuse = !( std::getenv( "MHC_FUSE" ) && std::atoi( std::getenv( "MHC_FUSE" ) ) == 0 );
+	const int H = 4;
+	const int row_len = H * hidden_size;
+	const int chunksA = 64;
+	const int chunk_cols = ( ( row_len / chunksA + 4 * NUM_THREADS_A - 1 ) / ( 4 * NUM_THREADS_A ) ) * ( 4 * NUM_THREADS_A );
+	const int n_chunks_a = ( row_len + chunk_cols - 1 ) / chunk_cols;
+	// The finalize reads exactly chunksA partials per row, and the collapsed row has to fit shared memory
+	if ( !fuse || n_chunks_a != chunksA || hidden_size * static_cast<int>( sizeof( half ) ) > 48 * 1024 ) return false;
+	const size_t smem = static_cast<size_t>( hidden_size ) * sizeof( half );
+	hc_collapse_norm_kernel<4, 24><<<dim3( n_chunks_a, rows ), NUM_THREADS, smem, stream>>>(
+		streams.ptr<const float>(), fn.ptr<const float>(), base.ptr<const float>(), scale.ptr<const float>(),
+		norm_weight.ptr<const half>(), norm_out.ptr<half>(), post_out.ptr<float>(), comb_out.ptr<float>(),
+		inv_rms_buf.ptr<float>(), mix_logits_buf.ptr<float>(), pre_buf.ptr<float>(),
+		hidden_size, chunk_cols, 1e-5f, eps, sinkhorn_iters, norm_eps, norm_bias );
+	return true;
 }
 
 void HyperConnection::update(

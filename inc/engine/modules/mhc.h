@@ -60,6 +60,29 @@ struct HyperConnection {
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
+	// collapse followed by RMSNorm(weight) of the collapsed row, in one launch and bit-identical to the pair. Returns
+	// false (nothing launched) when the shape does not fit, so the caller runs collapse + RMSNorm::forward instead.
+	static bool collapse_norm(
+		const pod::TensorView& streams,
+		const pod::TensorView& fn,
+		const pod::TensorView& base,
+		const pod::TensorView& scale,
+		const pod::TensorView& norm_weight,
+		pod::TensorView& norm_out,
+		pod::TensorView& post_out,
+		pod::TensorView& comb_out,
+		pod::TensorView& inv_rms_buf,
+		pod::TensorView& mix_logits_buf,
+		pod::TensorView& pre_buf,
+		int hidden_size,
+		int sinkhorn_iters,
+		float eps,
+		float norm_eps,
+		float norm_bias,
+		cudaStream_t stream,
+		int rows
+	);
+
 	static void update(
 		pod::TensorView& streams,
 		const pod::TensorView& sublayer_out,
