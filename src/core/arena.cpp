@@ -20,6 +20,20 @@ bool arena_create( pod::MemoryArena& arena, int device_id, size_t total_bytes ) 
 	arena.base_ptr = ptr;
 	arena.total_bytes = total_bytes;
 	arena.offset_bytes = 0;
+	arena.pinned = false;
+	return true;
+}
+
+bool arena_create_pinned( pod::MemoryArena& arena, size_t total_bytes ) {
+	arena_destroy( arena );
+	void* ptr = nullptr;
+	if ( cudaHostAlloc( &ptr, total_bytes, cudaHostAllocMapped ) != cudaSuccess ) {
+		return false;
+	}
+	arena.base_ptr = ptr;
+	arena.total_bytes = total_bytes;
+	arena.offset_bytes = 0;
+	arena.pinned = true;
 	return true;
 }
 
@@ -77,7 +91,9 @@ void arena_reset( pod::MemoryArena& arena ) {
 
 void arena_destroy( pod::MemoryArena& arena ) {
 	if ( arena.base_ptr != nullptr ) {
-		cudaFree( arena.base_ptr );
+		if ( arena.pinned ) cudaFreeHost( arena.base_ptr );
+		else cudaFree( arena.base_ptr );
+		arena.pinned = false;
 		arena.base_ptr = nullptr;
 		arena.total_bytes = 0;
 		arena.offset_bytes = 0;

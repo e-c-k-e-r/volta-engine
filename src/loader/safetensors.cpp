@@ -361,7 +361,7 @@ bool safetensors_load_to_device( const pod::SafeTensorsFile& st, const pod::Safe
 		dst_device_ptr,
 		src_cpu,
 		meta->size_bytes,
-		cudaMemcpyHostToDevice,
+		cudaMemcpyDefault,
 		stream
 	);
 	if ( ENGINE_UNLIKELY( err != cudaSuccess ) ) {
@@ -599,7 +599,7 @@ pod::TensorView SafeTensorsRepo::load(
 	}
 
 	if ( out_dtype == meta->dtype ) {
-		CUDA_CHECK( cudaMemcpyAsync( tv.data, src_cpu, meta->size_bytes, cudaMemcpyHostToDevice, stream ) );
+		CUDA_CHECK( cudaMemcpyAsync( tv.data, src_cpu, meta->size_bytes, cudaMemcpyDefault, stream ) );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	}
 	else if ( meta->dtype == pod::DType::BF16 && out_dtype == pod::DType::FP16 ) {
@@ -608,7 +608,7 @@ pod::TensorView SafeTensorsRepo::load(
 		for ( size_t i = 0; i < total_elems; ++i ) {
 			h_fp16[i] = bf16_to_fp16( src_bf16[i] );
 		}
-		CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), total_elems * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+		CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), total_elems * sizeof( half ), cudaMemcpyDefault, stream ) );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	}
 	else if ( meta->dtype == pod::DType::FP32 && out_dtype == pod::DType::FP16 ) {
@@ -617,11 +617,11 @@ pod::TensorView SafeTensorsRepo::load(
 		for ( size_t i = 0; i < total_elems; ++i ) {
 			h_fp16[i] = f32_to_fp16( src_f32[i] );
 		}
-		CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), total_elems * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+		CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), total_elems * sizeof( half ), cudaMemcpyDefault, stream ) );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	}
 	else {
-		CUDA_CHECK( cudaMemcpyAsync( tv.data, src_cpu, meta->size_bytes, cudaMemcpyHostToDevice, stream ) );
+		CUDA_CHECK( cudaMemcpyAsync( tv.data, src_cpu, meta->size_bytes, cudaMemcpyDefault, stream ) );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	}
 
@@ -688,7 +688,7 @@ pod::TensorView SafeTensorsRepo::load_slice(
 
 		if ( out_dtype == meta->dtype ) {
 			const uint8_t* src_ptr = static_cast<const uint8_t*>( src_cpu ) + offset_elems * elem_size;
-			CUDA_CHECK( cudaMemcpyAsync( tv.data, src_ptr, local_elems * elem_size, cudaMemcpyHostToDevice, stream ) );
+			CUDA_CHECK( cudaMemcpyAsync( tv.data, src_ptr, local_elems * elem_size, cudaMemcpyDefault, stream ) );
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		}
 		else if ( meta->dtype == pod::DType::BF16 && out_dtype == pod::DType::FP16 ) {
@@ -697,7 +697,7 @@ pod::TensorView SafeTensorsRepo::load_slice(
 			for ( size_t i = 0; i < local_elems; ++i ) {
 				h_fp16[i] = bf16_to_fp16( src_bf16[i] );
 			}
-			CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), local_elems * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+			CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), local_elems * sizeof( half ), cudaMemcpyDefault, stream ) );
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		}
 		else if ( meta->dtype == pod::DType::FP32 && out_dtype == pod::DType::FP16 ) {
@@ -706,7 +706,7 @@ pod::TensorView SafeTensorsRepo::load_slice(
 			for ( size_t i = 0; i < local_elems; ++i ) {
 				h_fp16[i] = f32_to_fp16( src_f32[i] );
 			}
-			CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), local_elems * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+			CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), local_elems * sizeof( half ), cudaMemcpyDefault, stream ) );
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		}
 	}
@@ -721,7 +721,7 @@ pod::TensorView SafeTensorsRepo::load_slice(
 
 			if ( out_dtype == meta->dtype ) {
 				const uint8_t* src_ptr = static_cast<const uint8_t*>( src_cpu ) + offset_elems * elem_size;
-				CUDA_CHECK( cudaMemcpyAsync( tv.data, src_ptr, num_elems * elem_size, cudaMemcpyHostToDevice, stream ) );
+				CUDA_CHECK( cudaMemcpyAsync( tv.data, src_ptr, num_elems * elem_size, cudaMemcpyDefault, stream ) );
 				CUDA_CHECK( cudaStreamSynchronize( stream ) );
 			}
 			else if ( meta->dtype == pod::DType::BF16 && out_dtype == pod::DType::FP16 ) {
@@ -730,7 +730,7 @@ pod::TensorView SafeTensorsRepo::load_slice(
 				for ( size_t i = 0; i < num_elems; ++i ) {
 					h_fp16[i] = bf16_to_fp16( src_bf16[i] );
 				}
-				CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), num_elems * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+				CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), num_elems * sizeof( half ), cudaMemcpyDefault, stream ) );
 				CUDA_CHECK( cudaStreamSynchronize( stream ) );
 			}
 			else if ( meta->dtype == pod::DType::FP32 && out_dtype == pod::DType::FP16 ) {
@@ -739,7 +739,7 @@ pod::TensorView SafeTensorsRepo::load_slice(
 				for ( size_t i = 0; i < num_elems; ++i ) {
 					h_fp16[i] = f32_to_fp16( src_f32[i] );
 				}
-				CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), num_elems * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+				CUDA_CHECK( cudaMemcpyAsync( tv.data, h_fp16.data(), num_elems * sizeof( half ), cudaMemcpyDefault, stream ) );
 				CUDA_CHECK( cudaStreamSynchronize( stream ) );
 			}
 		}
@@ -755,7 +755,7 @@ pod::TensorView SafeTensorsRepo::load_slice(
 					uint8_t* dst_r = h_buf.data() + static_cast<size_t>( r ) * chunk_bytes;
 					std::memcpy( dst_r, src_r, chunk_bytes );
 				}
-				CUDA_CHECK( cudaMemcpyAsync( tv.data, h_buf.data(), h_buf.size(), cudaMemcpyHostToDevice, stream ) );
+				CUDA_CHECK( cudaMemcpyAsync( tv.data, h_buf.data(), h_buf.size(), cudaMemcpyDefault, stream ) );
 				CUDA_CHECK( cudaStreamSynchronize( stream ) );
 			}
 			else if ( meta->dtype == pod::DType::BF16 && out_dtype == pod::DType::FP16 ) {
@@ -766,7 +766,7 @@ pod::TensorView SafeTensorsRepo::load_slice(
 						h_buf[r * local_cols + c] = bf16_to_fp16( src_bf16[r * cols + rank * local_cols + c] );
 					}
 				}
-				CUDA_CHECK( cudaMemcpyAsync( tv.data, h_buf.data(), total_local * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+				CUDA_CHECK( cudaMemcpyAsync( tv.data, h_buf.data(), total_local * sizeof( half ), cudaMemcpyDefault, stream ) );
 				CUDA_CHECK( cudaStreamSynchronize( stream ) );
 			}
 		}
@@ -782,7 +782,7 @@ pod::TensorView SafeTensorsRepo::load_slice(
 			size_t slice_bytes = static_cast<size_t>( local_BK ) * BN * B * sizeof( uint16_t );
 			size_t offset_bytes = static_cast<size_t>( rank ) * slice_bytes;
 			const uint8_t* src_ptr = static_cast<const uint8_t*>( src_cpu ) + offset_bytes;
-			CUDA_CHECK( cudaMemcpyAsync( tv.data, src_ptr, slice_bytes, cudaMemcpyHostToDevice, stream ) );
+			CUDA_CHECK( cudaMemcpyAsync( tv.data, src_ptr, slice_bytes, cudaMemcpyDefault, stream ) );
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		}
 		else if ( slice_dim == 1 ) {
@@ -797,7 +797,7 @@ pod::TensorView SafeTensorsRepo::load_slice(
 				uint16_t* dst_k = h_buf.data() + static_cast<size_t>( k ) * chunk_elems;
 				std::memcpy( dst_k, src_k, chunk_elems * sizeof( uint16_t ) );
 			}
-			CUDA_CHECK( cudaMemcpyAsync( tv.data, h_buf.data(), total_elems * sizeof( uint16_t ), cudaMemcpyHostToDevice, stream ) );
+			CUDA_CHECK( cudaMemcpyAsync( tv.data, h_buf.data(), total_elems * sizeof( uint16_t ), cudaMemcpyDefault, stream ) );
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		}
 	}
@@ -805,11 +805,19 @@ pod::TensorView SafeTensorsRepo::load_slice(
 	return tv;
 }
 
+size_t SafeTensorsRepo::trellis_bytes( const char* base_name ) const {
+	char name_buf[512];
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
+	const pod::SafeTensorMeta* meta = find( name_buf );
+	return meta != nullptr ? static_cast<size_t>( meta->size_bytes ) : 0;
+}
+
 pod::LinearWeight SafeTensorsRepo::load_linear(
 	const char* base_name,
 	pod::MemoryArena& arena,
 	int bits,
-	cudaStream_t stream
+	cudaStream_t stream,
+	pod::MemoryArena* code_arena
 ) {
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
@@ -831,7 +839,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear(
 		return pod::LinearWeight::make_fp16(
 			pod::make_tensor_2d( w.data, pod::DType::FP16, k, n ) );
 	}
-	pod::TensorView tr = load( name_buf, arena, stream );
+	pod::TensorView tr = load( name_buf, code_arena ? *code_arena : arena, stream );
 
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.suh", base_name );
 	pod::TensorView suh = load( name_buf, arena, stream, pod::DType::FP16 );
@@ -959,7 +967,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_cols_padded(
 		const uint16_t* src_k = src_tr + ( static_cast<size_t>( k ) * BN + col_block_begin ) * B;
 		std::memcpy( h_tr.data() + static_cast<size_t>( k ) * padded_BN * B, src_k, chunk_elems * sizeof( uint16_t ) );
 	}
-	CUDA_CHECK( cudaMemcpyAsync( tr.data, h_tr.data(), h_tr.size() * sizeof( uint16_t ), cudaMemcpyHostToDevice, stream ) );
+	CUDA_CHECK( cudaMemcpyAsync( tr.data, h_tr.data(), h_tr.size() * sizeof( uint16_t ), cudaMemcpyDefault, stream ) );
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
 
 	// Input Hadamard scales are shared by every rank (they scale the activation, not the output).
@@ -981,7 +989,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_cols_padded(
 	int svh_shape[1] = { static_cast<int>( h_svh.size() ) };
 	pod::TensorView svh = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_shape, 1 );
 	if ( !svh.data ) return pod::LinearWeight{};
-	CUDA_CHECK( cudaMemcpyAsync( svh.data, h_svh.data(), h_svh.size() * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+	CUDA_CHECK( cudaMemcpyAsync( svh.data, h_svh.data(), h_svh.size() * sizeof( half ), cudaMemcpyDefault, stream ) );
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
 
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.mul1", base_name );
@@ -1058,7 +1066,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_fused(
 		std::memcpy( dst_k + chunk_a_elems, src_bk, chunk_b_elems * sizeof( uint16_t ) );
 	}
 
-	CUDA_CHECK( cudaMemcpyAsync( tr.data, h_fused.data(), total_fused_elems * sizeof( uint16_t ), cudaMemcpyHostToDevice, stream ) );
+	CUDA_CHECK( cudaMemcpyAsync( tr.data, h_fused.data(), total_fused_elems * sizeof( uint16_t ), cudaMemcpyDefault, stream ) );
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
 
 	std::snprintf( name_buf_a, sizeof( name_buf_a ), "%s.suh", base_name_a );
@@ -1090,7 +1098,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_fused(
 	std::memcpy( h_svh_fused.data(), h_svh_a, local_N_a * sizeof( half ) );
 	std::memcpy( h_svh_fused.data() + local_N_a, h_svh_b, local_N_b * sizeof( half ) );
 
-	CUDA_CHECK( cudaMemcpyAsync( svh.data, h_svh_fused.data(), local_N_fused * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+	CUDA_CHECK( cudaMemcpyAsync( svh.data, h_svh_fused.data(), local_N_fused * sizeof( half ), cudaMemcpyDefault, stream ) );
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
 
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( tr.shape[2] / 16 ) : bits;
@@ -1229,7 +1237,7 @@ pod::TensorView SafeTensorsRepo::load_grouped_slice(
 			}
 		}
 
-		CUDA_CHECK( cudaMemcpyAsync( tv.data, h_dst.data(), total_local_elems * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+		CUDA_CHECK( cudaMemcpyAsync( tv.data, h_dst.data(), total_local_elems * sizeof( half ), cudaMemcpyDefault, stream ) );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	}
 	else if ( out_dtype == pod::DType::FP16 && meta->dtype == pod::DType::FP32 ) {
@@ -1257,7 +1265,7 @@ pod::TensorView SafeTensorsRepo::load_grouped_slice(
 			}
 		}
 
-		CUDA_CHECK( cudaMemcpyAsync( tv.data, h_dst.data(), total_local_elems * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+		CUDA_CHECK( cudaMemcpyAsync( tv.data, h_dst.data(), total_local_elems * sizeof( half ), cudaMemcpyDefault, stream ) );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	}
 	else {
@@ -1284,7 +1292,7 @@ pod::TensorView SafeTensorsRepo::load_grouped_slice(
 			}
 		}
 
-		CUDA_CHECK( cudaMemcpyAsync( tv.data, h_dst.data(), h_dst.size(), cudaMemcpyHostToDevice, stream ) );
+		CUDA_CHECK( cudaMemcpyAsync( tv.data, h_dst.data(), h_dst.size(), cudaMemcpyDefault, stream ) );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	}
 

@@ -56,6 +56,8 @@ public:
 	// Diagnostic / test path: synchronizes and issues per-row peer copies.
 	void read_logits( int rows, half* host_dst );
 	int sample_one();
+	// Adapts the routed-expert residency (EXL3_EXPERT_CACHE) to the routing seen since the last call; false when no model tiers
+	bool rebalance_experts();
 
 	// Pre-capture decode graphs for row counts 1..max_m (two dummy forwards each on `slot`,
 	// which is reset afterwards) so serving never pays eager warm-up or capture mid-stream.

@@ -22,7 +22,8 @@ __global__ void moe_dispatch_hist_kernel(
 	int4* __restrict__ active_experts,
 	int* __restrict__ sched,
 	int num_groups,
-	int chunk_rows
+	int chunk_rows,
+	uint32_t* __restrict__ heat
 ) {
 	__shared__ int hist[128];
 	const int threads = blockDim.x;
@@ -36,6 +37,7 @@ __global__ void moe_dispatch_hist_kernel(
 	}
 	__syncthreads();
 
+	if ( heat != nullptr && threadIdx.x < num_experts && hist[threadIdx.x] > 0 ) atomicAdd( &heat[threadIdx.x], static_cast<uint32_t>( hist[threadIdx.x] ) );
 	__shared__ int scan[128];
 	scan[threadIdx.x] = ( threadIdx.x <= num_experts ) ? hist[threadIdx.x] : 0;
 	__syncthreads();
@@ -412,7 +414,8 @@ void MoERouter::exl3_moe_dispatch(
 	int4* active_experts,
 	cudaStream_t stream,
 	int rows,
-	int chunk_rows
+	int chunk_rows,
+	uint32_t* heat
 ) {
 	const int n = 8 * rows;
 	int device = 0;
@@ -432,7 +435,8 @@ void MoERouter::exl3_moe_dispatch(
 		active_experts,
 		sched,
 		num_groups,
-		chunk_rows
+		chunk_rows,
+		heat
 	);
 
 	moe_dispatch_scatter_kernel<<<dim3( ( n + 31 ) / 32 ), dim3( 32 ), 0, stream>>>(
@@ -548,7 +552,8 @@ void MoE::forward(
 				scratch.active_experts,
 				stream,
 				rows,
-				wide == 2 ? 16 : 4
+				wide == 2 ? 16 : 4,
+				weights.heat
 			);
 
 			const void** d_ptrs = static_cast<const void**>( weights.device_ptrs );

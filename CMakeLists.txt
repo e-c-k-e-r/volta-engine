@@ -36,6 +36,7 @@ set(ENGINE_CORE_SOURCES
 	src/modules/mla_latent.cu
 	src/modules/dsa.cu
 	src/modules/moe.cu
+	src/modules/expert_tier.cu
 	src/modules/mhc.cu
 	src/modules/embedding.cu
 	src/models/model.cpp
@@ -247,3 +248,7 @@ set_target_properties(test_mla_latent PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PRO
 add_executable(test_dsa tests/2_parity/test_dsa.cpp)
 target_link_libraries(test_dsa PRIVATE engine_kernels)
 set_target_properties(test_dsa PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(bench_expert_heat tests/3_bench/bench_expert_heat.cpp)
+target_link_libraries(bench_expert_heat PRIVATE engine_kernels)
+set_target_properties(bench_expert_heat PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

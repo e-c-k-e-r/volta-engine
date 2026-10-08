@@ -13,6 +13,7 @@
 #include "engine/modules/rope.h"
 #include "engine/modules/mla.h"
 #include "engine/modules/moe.h"
+#include "engine/modules/expert_tier.h"
 #include "engine/modules/mhc.h"
 #include "engine/modules/linear.h"
 #include <cuda_runtime.h>
@@ -158,6 +159,9 @@ public:
 	) override;
 
 	const DraftHooks& draft_hooks() const override { return draft_hooks_; }
+	bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) override;
+	// EXL3_EXPERT_CACHE < 1: fold the routing counters into the experts' scores and move hot experts into the device tier
+	bool rebalance_experts( cudaStream_t stream = nullptr ) override;
 	void draft_head_topk( int rows, cudaStream_t stream = nullptr ) override;
 	void set_spec_snapshot( bool on, cudaStream_t stream = nullptr ) override;
 	void commit_spec_row( int slot_id, int row, cudaStream_t stream = nullptr ) override;
@@ -192,6 +196,9 @@ private:
 	engine::runtime::KVCachePool kv_pool_;
 	// Absorbed MLA (EXL3_MLA_LATENT, default on): the cache holds the 512-wide KV latent per token, shared by all heads,
 	// instead of expanded per-head K / V (1 KiB vs 16 KiB per token per layer, so kv_pool_ is not allocated)
+	engine::modules::ExpertTier tier_;
+	pod::MemoryArena host_arena_{};     // pinned cold-expert tier
+	int tier_layers_ = 0;
 	bool latent_ = true;
 	half* latent_cache_ = nullptr;    // [slots][mla layers][max_seq][512]
 	size_t latent_slot_stride_ = 0;   // elements per slot

@@ -1,4 +1,5 @@
 #pragma once
+#include <vector>
 
 #include "engine/config.h"
 #include "engine/core/tensor.h"
@@ -97,6 +98,10 @@ public:
 	}
 
 	// 4c. This rank's local logits shard, for a vocabulary-parallel head. Null when unsharded.
+	// Routed-expert route counts since the last reset: layers x experts (this rank's partition), false when not tracked
+	virtual bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) { (void) out; (void) layers; (void) experts; (void) reset; return false; }
+	// Adapt the routed-expert residency to the routing seen so far; false when the model keeps every expert resident
+	virtual bool rebalance_experts( cudaStream_t stream = nullptr ) { (void) stream; return false; }
 	virtual const half* shard_logits_ptr() const { return nullptr; }
 	virtual int shard_logits_cols() const { return 0; }
 

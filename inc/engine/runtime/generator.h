@@ -97,6 +97,7 @@ private:
 	void scheduler_loop();
 	void admit_pending();
 	void step_batch();
+	int adapt_steps_ = 0;
 	void prefill_slot( int s );
 	// Commits `tok` to slot s's output; returns true when the request finished.
 	bool emit_token( int s, int tok );

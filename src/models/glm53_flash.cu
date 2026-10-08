@@ -310,6 +310,36 @@ bool GLM53Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::
 	return init( config, device_id, arena, ring );
 }
 
+bool GLM53Pipeline::rebalance_experts( cudaStream_t stream ) {
+	if ( !tier_.active() ) return false;
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	tier_.reset_window();
+	int moved = 0;
+	for ( int l = 0; l < tier_layers_; ++l ) moved += tier_.rebalance( l, stream );
+	if ( std::getenv( "EXL3_EXPERT_LOG" ) ) {
+		std::printf( "[experts rank %d] window hit rate %.3f over %llu routes, %d swaps (%llu total)\n", rank_, tier_.hit_rate(),
+			static_cast<unsigned long long>( tier_.window_routes ), moved, static_cast<unsigned long long>( tier_.swaps ) );
+	}
+	return true;
+}
+
+bool GLM53Pipeline::expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset ) {
+	CUDA_CHECK( cudaSetDevice( rank_ ) );
+	CUDA_CHECK( cudaDeviceSynchronize() );
+	layers = 0;
+	experts = config_.num_experts / config_.tp_size;
+	out.clear();
+	for ( auto& lw : layers_ ) {
+		if ( !lw.is_moe || lw.moe_weights.heat == nullptr ) continue;
+		const size_t at = out.size();
+		out.resize( at + experts );
+		CUDA_CHECK( cudaMemcpy( out.data() + at, lw.moe_weights.heat, static_cast<size_t>( experts ) * sizeof( uint32_t ), cudaMemcpyDeviceToHost ) );
+		if ( reset ) CUDA_CHECK( cudaMemset( lw.moe_weights.heat, 0, static_cast<size_t>( experts ) * sizeof( uint32_t ) ) );
+		++layers;
+	}
+	return layers > 0;
+}
+
 void GLM53Pipeline::reset_state( int slot_id ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "GLM53Pipeline::reset_state: slot out of range" );
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
@@ -501,19 +531,48 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 			auto& mw = lw.moe_weights;
 			mw.type = pod::QuantType::TRELLIS;
 			mw.num_local_experts = experts_per_rank;
+			// Tiered experts (EXL3_EXPERT_CACHE < 1): the codes of resident experts go to device slots, the rest to pinned host memory
+			const double tier_fraction = engine::modules::ExpertTier::env_fraction();
+			int tier_layer = -1;
+			if ( tier_fraction < 1.0 ) {
+				if ( tier_layers_ == 0 ) {
+					size_t bytes[3];
+					const char* kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+					for ( int p = 0; p < 3; ++p ) {
+						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", L, start_expert, kinds[p] );
+						bytes[p] = repo.trellis_bytes( name_buf );
+						ENGINE_ASSERT( bytes[p] > 0, "GLM53Pipeline: expert codes not found for the tier" );
+					}
+					tier_.configure( experts_per_rank, tier_fraction, bytes );
+					int moe_layers = 0;
+					for ( int ll = 0; ll < config_.num_layers; ++ll ) moe_layers += ( ll >= 3 ) ? 1 : 0;
+					const size_t host_bytes = static_cast<size_t>( moe_layers ) * tier_.cold_bytes_per_layer() + tier_.slot_bytes + 256;
+					ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "GLM53Pipeline: pinned expert tier allocation failed" );
+					tier_.allocate_staging( host_arena_ );
+				}
+				std::vector<int> resident_set( tier_.resident );
+				for ( int s = 0; s < tier_.resident; ++s ) resident_set[s] = s;
+				tier_.add_layer( &mw, *arena_, host_arena_, resident_set );
+				tier_layer = tier_layers_++;
+			}
 			for ( int e = 0; e < experts_per_rank; ++e ) {
 				int gid = start_expert + e;
+				pod::MemoryArena ca[3];
+				if ( tier_layer >= 0 ) for ( int p = 0; p < 3; ++p ) tier_.code_arena( tier_layer, e, p, ca[p] );
+				pod::MemoryArena* cp[3] = { tier_layer >= 0 ? &ca[0] : nullptr, tier_layer >= 0 ? &ca[1] : nullptr, tier_layer >= 0 ? &ca[2] : nullptr };
 
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, gid );
-				mw.gate[e] = repo.load_linear( name_buf, *arena_, 4, stream );
+				mw.gate[e] = repo.load_linear( name_buf, *arena_, 4, stream, cp[0] );
 
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, gid );
-				mw.up[e] = repo.load_linear( name_buf, *arena_, 4, stream );
+				mw.up[e] = repo.load_linear( name_buf, *arena_, 4, stream, cp[1] );
 
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, gid );
-				mw.down[e] = repo.load_linear( name_buf, *arena_, 4, stream );
+				mw.down[e] = repo.load_linear( name_buf, *arena_, 4, stream, cp[2] );
 			}
 			engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );
+			mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( experts_per_rank ) * sizeof( uint32_t ), 128 ) );
+			CUDA_CHECK( cudaMemsetAsync( mw.heat, 0, static_cast<size_t>( experts_per_rank ) * sizeof( uint32_t ), stream ) );
 
 			// Shared experts
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.gate_proj", L );
@@ -1170,6 +1229,7 @@ void GLM53Pipeline::destroy() {
 		CUDA_CHECK( cudaSetDevice( rank_ ) );
 		graphs_.reset();
 	}
+	engine::core::arena_destroy( host_arena_ );
 	if ( h_argmax_idx_ != nullptr ) {
 		engine::core::host_free_pinned( h_argmax_idx_ );
 		h_argmax_idx_ = nullptr;

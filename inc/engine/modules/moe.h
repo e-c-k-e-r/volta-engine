@@ -18,6 +18,7 @@ struct MoELayerWeights {
 	LinearWeight up[72];
 	LinearWeight down[72];
 	void* device_ptrs = nullptr;
+	uint32_t* heat = nullptr;          // [num_local_experts] routes per expert since the last reset (device), optional
 };
 
 // Device scratch for one MoE dispatch (single token, top_k routes). Allocated once at init.
@@ -92,7 +93,8 @@ struct MoERouter {
 		int4* active_experts,
 		cudaStream_t stream = nullptr,
 		int rows = 1,                   // routes = 8 * rows, token index = route / 8
-		int chunk_rows = 4              // rows per work item (the expert GEMM tile)
+		int chunk_rows = 4,             // rows per work item (the expert GEMM tile)
+		uint32_t* heat = nullptr        // optional per-expert route counters, incremented by this dispatch
 	);
 };
 

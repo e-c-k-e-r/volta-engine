@@ -14,8 +14,14 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	// EXL3_ARENA_GIB overrides the per-GPU arena. The default of 10 GiB is sized for the quantized
 	// drafter; loading the unquantized one needs roughly twice the weight bytes.
 	const char* arena_env = std::getenv( "EXL3_ARENA_GIB" );
+	// A tiered GLM (EXL3_EXPERT_CACHE < 1) keeps only that fraction of the routed experts (~26 GiB per rank in all) in the arena
+	size_t glm_gib = 31;
+	if ( is_glm && std::getenv( "EXL3_EXPERT_CACHE" ) ) {
+		const double f = std::atof( std::getenv( "EXL3_EXPERT_CACHE" ) );
+		if ( f > 0.0 && f < 1.0 ) glm_gib = static_cast<size_t>( std::ceil( 31.0 - ( 1.0 - f ) * 25.0 ) );
+	}
 	const size_t arena_bytes = cfg.arena_bytes ? cfg.arena_bytes
-		: ( arena_env ? strtoull( arena_env, nullptr, 10 ) : ( is_glm ? 31ULL : 10ULL ) )
+		: ( arena_env ? strtoull( arena_env, nullptr, 10 ) : ( is_glm ? glm_gib : 10ULL ) )
 			* 1024 * 1024 * 1024;
 
 	created_ = true;
@@ -242,6 +248,14 @@ void ModelCluster::reset_slot( int slot ) {
 	pool_.run( [&]( int d ) {
 		models_[d]->reset_state( slot );
 	} );
+}
+
+bool ModelCluster::rebalance_experts() {
+	int any[ENGINE_NUM_GPUS] = {};
+	pool_.run( [&]( int d ) {
+		any[d] = models_[d]->rebalance_experts( streams_[d] ) ? 1 : 0;
+	} );
+	return any[0] != 0;
 }
 
 void ModelCluster::checkpoint( int slot ) {

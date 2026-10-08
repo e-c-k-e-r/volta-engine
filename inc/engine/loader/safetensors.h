@@ -73,12 +73,17 @@ public:
 		pod::DType target_dtype = pod::DType::AUTO
 	);
 
+	// code_arena: where the trellis codes (the bulk of the weight) go when they should not share the scale vectors' arena
+	// (a slot of the resident-expert pool, or the pinned cold tier); suh / svh always go to `arena`
 	pod::LinearWeight load_linear(
 		const char* base_name,
 		pod::MemoryArena& arena,
 		int bits,
-		cudaStream_t stream = nullptr
+		cudaStream_t stream = nullptr,
+		pod::MemoryArena* code_arena = nullptr
 	);
+	// Bytes of the trellis codes of `base_name` (0 when it is not a trellis tensor)
+	size_t trellis_bytes( const char* base_name ) const;
 
 	pod::LinearWeight load_linear_slice(
 		const char* base_name,
