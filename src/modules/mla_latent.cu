@@ -579,7 +579,8 @@ void latent_sparse_tc_kernel(
 	const int qp = ( lane >> 2 ) & 3;
 
 	const int nsel = sel_n ? sel_n[r] : -1;
-	const int* lst = sel_idx ? sel_idx + static_cast<size_t>( r ) * DSA_KPAD : nullptr;
+	// A row below the selection threshold (nsel < 0) attends densely even though the list pointer is set
+	const int* lst = ( sel_idx && nsel >= 0 ) ? sel_idx + static_cast<size_t>( r ) * DSA_KPAD : nullptr;
 	const int n_keys = nsel >= 0 ? nsel : min( rows->pos[r] + 1, max_seq );
 	const half* kv = cache + static_cast<size_t>( rows->slot[r] ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA;
 
@@ -850,14 +851,19 @@ void MLALatent::attend( const half* cache, const pod::TensorView& q_lat, pod::Te
 		attr[device] = true;
 	}
 	static const bool simt_only = std::getenv( "EXL3_MLA_LATENT_SIMT" ) != nullptr;
-	if ( rows > pod::MAX_BATCH && !simt_only && sel_idx != nullptr ) {
+	// Decode rows (up to MAX_BATCH) take the same per-row tensor-core kernel: its blocks split the keys of a row, where
+	// the chunked kernel below walks 1024 keys per block (8 blocks at 8K keys, 540 us per layer). It resolves each
+	// row's own slot, so verify blocks and rows of distinct slots both qualify.
+	static const bool decode_tc = !( std::getenv( "EXL3_MLA_DECODE_TC" ) && std::atoi( std::getenv( "EXL3_MLA_DECODE_TC" ) ) == 0 );
+	const bool decode_rows = rows <= pod::MAX_BATCH && decode_tc && !simt_only && slot.row == 0;
+	if ( ( decode_rows || ( rows > pod::MAX_BATCH && sel_idx != nullptr ) ) && !simt_only ) {
 		ENGINE_ASSERT( slot.row == 0, "MLALatent::attend: prefill chunks start at row 0" );
 		static bool sp_attr[ENGINE_NUM_GPUS] = {};
 		if ( !sp_attr[device] ) {
 			CUDA_CHECK( cudaFuncSetAttribute( latent_sparse_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, LS_SMEM ) );
 			sp_attr[device] = true;
 		}
-		int nsplit = rows < 160 ? std::min( ( 320 + rows - 1 ) / rows, 8 ) : 1;
+		int nsplit = rows < 160 ? std::min( ( 320 + rows - 1 ) / rows, decode_rows ? 32 : 8 ) : 1;
 		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > workspace_slots( max_seq, heads ) ) --nsplit;
 		latent_sparse_tc_kernel<<<dim3( rows, nsplit ), dim3( 256 ), LS_SMEM, stream>>>(
 			q_lat.ptr<const half>(), cache, o_lat.ptr<half>(), workspace, slot.stride, layer, max_seq, slot.rows, scale, nsplit, sel_idx, sel_n );
