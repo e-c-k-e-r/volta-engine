@@ -555,8 +555,6 @@ void Qwen3_5Pipeline::forward( const pod::BatchRows& rows, backend::stream_t str
 	// distinct slots get a block each. The graph body differs, so the two shapes get separate graphs.
 	attn_tc_ = true;
 	for ( int r = 1; r < m; ++r ) attn_tc_ = attn_tc_ && rows.slot[r] == rows.slot[0];
-	const bool tc_on = runtime::options().attn_tc;
-	attn_tc_on_ = tc_on;
 	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); }, attn_tc_ ? 1 : 0 );
 }
 
@@ -629,7 +627,7 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 			);
 
 			// Attend over past tokens + sigmoid gate
-			if ( ( m > pod::MAX_BATCH || attn_tc_on_ ) && config_.full_head_dim == 256 ) {
+			if ( config_.full_head_dim == 256 ) {
 				// Prefill chunk: tiled kernel that shares K/V tiles across queries.
 				engine::modules::Attention::forward_prefill(
 					kv, q_buf_, gate_attn_buf_,

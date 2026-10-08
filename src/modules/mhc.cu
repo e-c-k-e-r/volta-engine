@@ -585,14 +585,13 @@ bool HyperConnection::collapse_norm(
 	int rows
 ) {
 	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS, "HyperConnection::collapse_norm: rows out of range" );
-	static const bool fuse = !( std::getenv( "MHC_FUSE" ) && std::atoi( std::getenv( "MHC_FUSE" ) ) == 0 );
 	const int H = 4;
 	const int row_len = H * hidden_size;
 	const int chunksA = 64;
 	const int chunk_cols = ( ( row_len / chunksA + 4 * NUM_THREADS_A - 1 ) / ( 4 * NUM_THREADS_A ) ) * ( 4 * NUM_THREADS_A );
 	const int n_chunks_a = ( row_len + chunk_cols - 1 ) / chunk_cols;
 	// The finalize reads exactly chunksA partials per row, and the collapsed row has to fit shared memory
-	if ( !fuse || n_chunks_a != chunksA || hidden_size * static_cast<int>( sizeof( half ) ) > 48 * 1024 ) return false;
+	if ( n_chunks_a != chunksA || hidden_size * static_cast<int>( sizeof( half ) ) > 48 * 1024 ) return false;
 	const size_t smem = static_cast<size_t>( hidden_size ) * sizeof( half );
 	hc_collapse_norm_kernel<4, 24><<<dim3( n_chunks_a, rows ), NUM_THREADS, smem, stream>>>(
 		streams.ptr<const float>(), fn.ptr<const float>(), base.ptr<const float>(), scale.ptr<const float>(),

@@ -955,12 +955,9 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	const int grid_a = base_a * p.ksplit_a;
 	const int grid_b = slots * ( p.H / tcols );
 
-	// Tile: 0 fp16 tensor core (EXL3_MOE_I8=0), 1 int8 dp4a for one-row decode. With more rows EXL3_MOE_I8_VERIFY picks 0 tensor
-	// core, 1 (default) dp4a for runs of up to 4 rows and tensor core above, 2 dp4a for every run (wide runs in 4-row passes,
-	// which re-read the weights and lose to the tensor core there)
-	static const bool i8_env = !std::getenv( "EXL3_MOE_I8" ) || std::atoi( std::getenv( "EXL3_MOE_I8" ) ) != 0;
-	static const int i8_verify_env = std::getenv( "EXL3_MOE_I8_VERIFY" ) ? std::atoi( std::getenv( "EXL3_MOE_I8_VERIFY" ) ) : 1;
-	const int mode = !i8_env ? 0 : ( p.bsz == 1 ? 1 : ( i8_verify_env == 0 ? 0 : ( i8_verify_env == 1 ? 3 : 2 ) ) );
+	// Tile: 1 int8 dp4a for one-row decode; with more rows 3 = dp4a for runs of up to 4 rows and fp16 tensor core above
+	// (dp4a on wider runs re-reads the weights in 4-row passes and loses to the tensor core there)
+	const int mode = p.bsz == 1 ? 1 : 3;
 	const int stage_rows = mode == 1 ? 1 : ( mode >= 2 ? 4 : 0 );
 	// int8 activation staging: 2 x 16 B per k-tile per k-slab
 	constexpr int wkk = WK / WN;

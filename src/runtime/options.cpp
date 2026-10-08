@@ -40,7 +40,6 @@ Options from_env() {
 	env_flag( "EXL3_MOE_TP", o.moe_tp );
 	env_flag( "EXL3_DSA", o.dsa );
 	env_flag( "EXL3_MLA_LATENT", o.mla_latent );
-	env_flag( "EXL3_ATTN_TC", o.attn_tc );
 	o.expert_log = std::getenv( "EXL3_EXPERT_LOG" ) != nullptr;
 	o.dsa_diag = std::getenv( "EXL3_DSA_DIAG" ) != nullptr;
 	return o;
@@ -92,7 +91,6 @@ bool set_option( const std::string& key, const std::string& value ) {
 	if ( key == "moe_tp" ) return as_bool( o.moe_tp );
 	if ( key == "dsa" ) return as_bool( o.dsa );
 	if ( key == "mla_latent" ) return as_bool( o.mla_latent );
-	if ( key == "attn_tc" ) return as_bool( o.attn_tc );
 	if ( key == "expert_log" ) return as_bool( o.expert_log );
 	if ( key == "dsa_diag" ) return as_bool( o.dsa_diag );
 	return false;

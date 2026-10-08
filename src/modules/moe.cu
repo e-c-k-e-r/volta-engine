@@ -551,8 +551,7 @@ void MoE::forward(
 	const bool sharded = weights.num_local_experts > 72;
 	const int num_groups = env_groups > 0 ? MIN( env_groups, MOE_MAX_GROUPS ) : ( sharded ? MOE_MAX_GROUPS : rows == 1 ? 1 : rows <= 16 ? 4 : MOE_MAX_GROUPS );
 	// Fused decode path: gate/up and down GEMV kernels over runs of rows that share an expert (exl3_moe_coop.cuh)
-	static const bool coop_on = std::getenv( "EXL3_MOE_COOP" ) ? std::atoi( std::getenv( "EXL3_MOE_COOP" ) ) != 0 : true;
-	if ( coop_on && weights.type == pod::QuantType::TRELLIS && rows <= MOE_COOP_MAX_ROWS && scratch.coop_ctr != nullptr
+	if ( weights.type == pod::QuantType::TRELLIS && rows <= MOE_COOP_MAX_ROWS && scratch.coop_ctr != nullptr
 		&& weights.gate[0].bits == 3 && weights.up[0].bits == 3 && weights.down[0].bits == 3 && weights.up[0].mul1 && weights.gate[0].mul1 && weights.down[0].mul1 ) {
 		const int E = weights.num_local_experts;
 		const void** d_ptrs = static_cast<const void**>( weights.device_ptrs );

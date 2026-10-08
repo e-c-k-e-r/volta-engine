@@ -22,7 +22,6 @@ struct Options {
 	bool moe_tp = true;           // GLM sharded routed experts
 	bool dsa = true;              // GLM sparse attention indexer
 	bool mla_latent = true;       // GLM latent KV path
-	bool attn_tc = true;          // Qwen tensor-core decode attention
 	bool expert_log = false;      // debug
 	bool dsa_diag = false;        // debug
 };

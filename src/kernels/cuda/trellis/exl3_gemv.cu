@@ -16,18 +16,6 @@ void exl3_gemv_reset_caches() {
 	for ( auto& m : occ_cache ) m.clear();
 }
 
-static int exl3_gemv_env_mode() {
-	const char* env = std::getenv( "EXL3_GEMV" );
-	if ( !env ) return 1;
-	return atoi( env );
-}
-
-static int exl3_gemv_env_smem() {
-	const char* env = std::getenv( "EXL3_GEMV_SMEM" );
-	if ( !env ) return -1;
-	return atoi( env );
-}
-
 static int exl3_gemv_cfg( int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident ) {
 	(void) narrow_coresident;
 	if ( mode == 0 ) return -1;
@@ -99,8 +87,7 @@ bool exl3_gemv_try_launch(
 	if ( size_m > EXL3_GEMV_MAX_M ) return false;
 	if ( size_k % 128 || size_n % 128 ) return false;
 
-	int mode = force ? 2 : exl3_gemv_env_mode();
-	if ( mode == 0 ) return false;
+	int mode = force ? 2 : 1;
 	int cc = CC_OLD;
 	int mmode = size_m == 1 ? 0 : 1;
 	int num_sms = ENGINE_SM_COUNT;
@@ -115,7 +102,7 @@ bool exl3_gemv_try_launch(
 		return blocks_per_sm;
 	};
 
-	bool smem = ( K == 5 || K == 6 ) ? true : ( exl3_gemv_env_smem() == 1 );
+	bool smem = K == 5 || K == 6;
 	void* kernel = nullptr;
 	int cfg = -1;
 

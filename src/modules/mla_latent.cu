@@ -850,13 +850,11 @@ void MLALatent::attend( const half* cache, const pod::TensorView& q_lat, pod::Te
 		CUDA_CHECK( cudaFuncSetAttribute( latent_attn_kernel<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( smem ) ) );
 		attr[device] = true;
 	}
-	static const bool simt_only = std::getenv( "EXL3_MLA_LATENT_SIMT" ) != nullptr;
 	// Decode rows (up to MAX_BATCH) take the same per-row tensor-core kernel: its blocks split the keys of a row, where
 	// the chunked kernel below walks 1024 keys per block (8 blocks at 8K keys, 540 us per layer). It resolves each
 	// row's own slot, so verify blocks and rows of distinct slots both qualify.
-	static const bool decode_tc = !( std::getenv( "EXL3_MLA_DECODE_TC" ) && std::atoi( std::getenv( "EXL3_MLA_DECODE_TC" ) ) == 0 );
-	const bool decode_rows = rows <= pod::MAX_BATCH && decode_tc && !simt_only && slot.row == 0;
-	if ( ( decode_rows || ( rows > pod::MAX_BATCH && sel_idx != nullptr ) ) && !simt_only ) {
+	const bool decode_rows = rows <= pod::MAX_BATCH && slot.row == 0;
+	if ( decode_rows || ( rows > pod::MAX_BATCH && sel_idx != nullptr ) ) {
 		ENGINE_ASSERT( slot.row == 0, "MLALatent::attend: prefill chunks start at row 0" );
 		static bool sp_attr[ENGINE_NUM_GPUS] = {};
 		if ( !sp_attr[device] ) {
@@ -872,7 +870,7 @@ void MLALatent::attend( const half* cache, const pod::TensorView& q_lat, pod::Te
 		}
 		return;
 	}
-	if ( rows > pod::MAX_BATCH && !simt_only && sel_idx == nullptr ) {
+	if ( rows > pod::MAX_BATCH && sel_idx == nullptr ) {
 		ENGINE_ASSERT( slot.row == 0, "MLALatent::attend: prefill chunks start at row 0" );
 		static bool tc_attr[ENGINE_NUM_GPUS] = {};
 		if ( !tc_attr[device] ) {

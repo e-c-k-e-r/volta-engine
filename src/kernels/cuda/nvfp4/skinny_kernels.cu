@@ -380,12 +380,6 @@ static int nvfp4_skinny_max_rows() {
 	return v;
 }
 
-// Fused dequantize + GEMM above the skinny range; EXL3_NVFP4_FUSED=0 selects dequantize + cuBLAS (A/B knob).
-static bool nvfp4_fused_gemm() {
-	static const bool v = !( std::getenv( "EXL3_NVFP4_FUSED" ) && std::atoi( std::getenv( "EXL3_NVFP4_FUSED" ) ) == 0 );
-	return v;
-}
-
 void LinearNVFP4::forward(
 	const pod::TensorView& x,
 	const pod::TensorView& codes,
@@ -443,7 +437,7 @@ void LinearNVFP4::forward(
 			);
 		}
 	}
-	else if ( nvfp4_fused_gemm() && m < 384 && ( ( n + GT_BN - 1 ) / GT_BN ) * ( ( m + GT_BM - 1 ) / GT_BM ) >= 48 ) {
+	else if ( m < 384 && ( ( n + GT_BN - 1 ) / GT_BN ) * ( ( m + GT_BM - 1 ) / GT_BM ) >= 48 ) {
 		// Mid-size chunks with enough tiles to fill the GPU; at 512 rows the cuBLAS GEMM (dequantized weight reused across
 		// the whole chunk) is as fast, and narrow outputs leave most SMs idle in the fused kernel
 		nvfp4_gemm_tc_kernel<<<dim3( ( n + GT_BN - 1 ) / GT_BN, ( m + GT_BM - 1 ) / GT_BM ), dim3( 256 ), 0, stream>>>(

@@ -88,7 +88,7 @@ void LinearTrellis::forward(
 	// GEMM tile keeps ~190 (bench_shapes cold sweep over 24 weight copies: 129 -> 82 us). Every other shape measures level or
 	// better on the GEMV with cold weights (the L2-resident loop of a single matrix says otherwise and is misleading).
 	int gemm_shape = 0;
-	if ( bits == 5 && m >= 4 && m <= 8 && mul1 && !c_fp32 && n == 6144 && ( k % 16 == 0 ) && getenv( "EXL3_GEMV_M8" ) == nullptr ) gemm_shape = 4;
+	if ( bits == 5 && m >= 4 && m <= 8 && mul1 && !c_fp32 && n == 6144 && ( k % 16 == 0 ) ) gemm_shape = 4;
 	if ( recon_threshold() > 0 && m > recon_threshold() && !c_fp32 && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 		forward_recon( x, trellis, suh, svh, out, bits, mcg, mul1, stream );
 	}

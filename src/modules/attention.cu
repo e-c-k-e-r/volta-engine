@@ -210,197 +210,6 @@ __global__ void attn_chunked_paged_kernel(
 	}
 }
 
-// Prefill attention. The decode kernel above does one block-wide reduction (two barriers) per key and re-reads K/V for
-// every query row; here a block shares each 32-key tile of K and V (staged once in shared memory) across 8 queries,
-// one warp per query. Lanes own 8 head dimensions; scores are warp-reduced, the softmax is online in FP32 once per
-// tile, and keys past a query's own position are masked. head_dim 256 only. Queries are (row, head) pairs ordered
-// row-major within a kv head's group, so the 3 heads of a row share a block.
-#define PF_TILE 32
-#define PF_QPB 8
-template <KVQ KQ, KVQ VQ>
-__global__ __launch_bounds__( 256 )
-void attn_prefill_kernel(
-	const half* __restrict__ q,
-	const pod::KVRef kv,
-	const half* __restrict__ gate,
-	half* __restrict__ out,
-	size_t slot_stride,
-	int layer_idx,
-	const pod::BatchRows* __restrict__ rows,
-	int count,
-	int num_q_heads,
-	int num_kv_heads,
-	int max_seq,
-	float scale
-) {
-	constexpr int HD = 256;
-	__shared__ __align__( 16 ) half sK[PF_TILE * HD];
-	__shared__ __align__( 16 ) half sV[PF_TILE * HD];
-
-	const int G = num_q_heads / num_kv_heads;
-	const int kvh = blockIdx.x;
-	const int q_base = blockIdx.y * PF_QPB;
-	const int warp = threadIdx.x >> 5;
-	const int lane = threadIdx.x & 31;
-	const int qi = q_base + warp;
-	const bool valid = qi < count * G;
-	const int row = valid ? qi / G : 0;
-	const int head = kvh * G + ( valid ? qi % G : 0 );
-
-	// Keys needed by any query of this block: up to the largest position among its rows (all one slot).
-	const int last_row = min( ( q_base + PF_QPB - 1 ) / G, count - 1 );
-	int max_pos = 0;
-	for ( int r = q_base / G; r <= last_row; ++r ) max_pos = max( max_pos, rows->pos[r] );
-	max_pos = min( max_pos, max_seq - 1 );
-	const size_t slot_off = static_cast<size_t>( rows->slot[valid ? row : q_base / G] ) * slot_stride;
-	const int my_pos = valid ? rows->pos[row] : -1;
-
-	float qv[8];
-	if ( valid ) {
-		const half* qh = q + ( static_cast<size_t>( row ) * num_q_heads + head ) * HD + lane * 8;
-		const uint4 raw = *reinterpret_cast<const uint4*>( qh );
-		const half2* h2 = reinterpret_cast<const half2*>( &raw );
-		#pragma unroll
-		for ( int i = 0; i < 4; ++i ) {
-			const float2 f = __half22float2( h2[i] );
-			qv[2 * i] = f.x * scale;
-			qv[2 * i + 1] = f.y * scale;
-		}
-	}
-	else {
-		#pragma unroll
-		for ( int i = 0; i < 8; ++i ) qv[i] = 0.0f;
-	}
-
-	float m_run = -1e30f, l_run = 0.0f;
-	float o[8];
-	#pragma unroll
-	for ( int i = 0; i < 8; ++i ) o[i] = 0.0f;
-
-	const size_t kv_stride = static_cast<size_t>( num_kv_heads ) * HD;
-	const size_t kv_base = slot_off + static_cast<size_t>( layer_idx ) * max_seq * kv_stride + static_cast<size_t>( kvh ) * HD;
-
-	for ( int kb = 0; kb <= max_pos; kb += PF_TILE ) {
-		// Stage the tile: 32 keys x 512 B each for K and V (1024 uint4 apiece); keys past max_pos load as zero.
-		for ( int u = threadIdx.x; u < PF_TILE * ( HD / 8 ); u += blockDim.x ) {
-			const int j = u / ( HD / 8 );
-			const int c = u % ( HD / 8 );
-			const int key = kb + j;
-			uint4 kk = make_uint4( 0, 0, 0, 0 ), vv = make_uint4( 0, 0, 0, 0 );
-			if ( key <= max_pos ) {
-				const size_t at = kv_base + static_cast<size_t>( key ) * kv_stride + c * 8;
-				float f[8];
-				half2* o2 = reinterpret_cast<half2*>( &kk );
-				kv_load8<KQ>( kv.k, kv.ks, at, f );
-				#pragma unroll
-				for ( int i = 0; i < 4; ++i ) o2[i] = __floats2half2_rn( f[2 * i], f[2 * i + 1] );
-				o2 = reinterpret_cast<half2*>( &vv );
-				kv_load8<VQ>( kv.v, kv.vs, at, f );
-				#pragma unroll
-				for ( int i = 0; i < 4; ++i ) o2[i] = __floats2half2_rn( f[2 * i], f[2 * i + 1] );
-			}
-			*reinterpret_cast<uint4*>( sK + j * HD + c * 8 ) = kk;
-			*reinterpret_cast<uint4*>( sV + j * HD + c * 8 ) = vv;
-		}
-		__syncthreads();
-
-		if ( valid && kb <= my_pos ) {
-			float my_s = -1e30f;
-			#pragma unroll
-			for ( int j = 0; j < PF_TILE; ++j ) {
-				const uint4 raw = *reinterpret_cast<const uint4*>( sK + j * HD + lane * 8 );
-				const half2* h2 = reinterpret_cast<const half2*>( &raw );
-				float d = 0.0f;
-				#pragma unroll
-				for ( int i = 0; i < 4; ++i ) {
-					const float2 f = __half22float2( h2[i] );
-					d = fmaf( qv[2 * i], f.x, d );
-					d = fmaf( qv[2 * i + 1], f.y, d );
-				}
-				#pragma unroll
-				for ( int mask = 16; mask > 0; mask >>= 1 ) d += __shfl_xor_sync( 0xffffffff, d, mask );
-				if ( lane == j ) my_s = ( kb + j <= my_pos ) ? d : -1e30f;
-			}
-			float tile_max = my_s;
-			#pragma unroll
-			for ( int mask = 16; mask > 0; mask >>= 1 ) tile_max = fmaxf( tile_max, __shfl_xor_sync( 0xffffffff, tile_max, mask ) );
-			const float m_new = fmaxf( m_run, tile_max );
-			const float alpha = __expf( m_run - m_new );
-			const float p = ( my_s > -1e29f ) ? __expf( my_s - m_new ) : 0.0f;
-			float p_sum = p;
-			#pragma unroll
-			for ( int mask = 16; mask > 0; mask >>= 1 ) p_sum += __shfl_xor_sync( 0xffffffff, p_sum, mask );
-			l_run = l_run * alpha + p_sum;
-			m_run = m_new;
-			#pragma unroll
-			for ( int i = 0; i < 8; ++i ) o[i] *= alpha;
-			#pragma unroll
-			for ( int j = 0; j < PF_TILE; ++j ) {
-				const float pj = __shfl_sync( 0xffffffff, p, j );
-				const uint4 raw = *reinterpret_cast<const uint4*>( sV + j * HD + lane * 8 );
-				const half2* h2 = reinterpret_cast<const half2*>( &raw );
-				#pragma unroll
-				for ( int i = 0; i < 4; ++i ) {
-					const float2 f = __half22float2( h2[i] );
-					o[2 * i] = fmaf( pj, f.x, o[2 * i] );
-					o[2 * i + 1] = fmaf( pj, f.y, o[2 * i + 1] );
-				}
-			}
-		}
-		__syncthreads();
-	}
-
-	if constexpr ( VQ == KVQ::Q4 ) {
-		// Undo the per-64 rotation of V: bits 0..2 of an element index are the register, bits 3..5 the lane within its group of 8
-		#pragma unroll
-		for ( int h = 1; h < 8; h <<= 1 ) {
-			#pragma unroll
-			for ( int i = 0; i < 8; ++i ) {
-				if ( ( i & h ) == 0 ) {
-					const float a = o[i], b = o[i | h];
-					o[i] = a + b;
-					o[i | h] = a - b;
-				}
-			}
-		}
-		#pragma unroll
-		for ( int h = 1; h < 8; h <<= 1 ) {
-			#pragma unroll
-			for ( int i = 0; i < 8; ++i ) {
-				const float other = __shfl_xor_sync( 0xffffffff, o[i], h );
-				o[i] = ( lane & h ) ? other - o[i] : o[i] + other;
-			}
-		}
-		#pragma unroll
-		for ( int i = 0; i < 8; ++i ) o[i] *= 0.125f;
-	}
-
-	if ( valid ) {
-		const float inv_l = ( l_run > 0.0f ) ? ( 1.0f / l_run ) : 0.0f;
-		const size_t off = ( static_cast<size_t>( row ) * num_q_heads + head ) * HD + lane * 8;
-		float sig[8];
-		#pragma unroll
-		for ( int i = 0; i < 8; ++i ) sig[i] = 1.0f;
-		if ( gate != nullptr ) {
-			const uint4 graw = *reinterpret_cast<const uint4*>( gate + off );
-			const half2* g2 = reinterpret_cast<const half2*>( &graw );
-			#pragma unroll
-			for ( int i = 0; i < 4; ++i ) {
-				const float2 f = __half22float2( g2[i] );
-				sig[2 * i] = 1.0f / ( 1.0f + __expf( -f.x ) );
-				sig[2 * i + 1] = 1.0f / ( 1.0f + __expf( -f.y ) );
-			}
-		}
-		uint4 res;
-		half2* r2 = reinterpret_cast<half2*>( &res );
-		#pragma unroll
-		for ( int i = 0; i < 4; ++i ) {
-			r2[i] = __floats2half2_rn( o[2 * i] * inv_l * sig[2 * i], o[2 * i + 1] * inv_l * sig[2 * i + 1] );
-		}
-		*reinterpret_cast<uint4*>( out + off ) = res;
-	}
-}
-
 // Tensor-core prefill attention (Volta mma.m8n8k4, FP32 accumulate). A block owns 32 queries (row, head pairs) of one
 // kv head and walks the keys in tiles of 64. S = Q K^T: warp (qg, kg) computes a 16 x 16 tile over the full head_dim, the
 // four quad-pairs of each mma being its four 8 x 8 tiles. The softmax runs on S staged through shared memory (8 lanes per
@@ -925,19 +734,12 @@ void Attention::forward_prefill(
 	int nsplit = 1;
 	if ( base_blocks < 160 ) nsplit = MIN( ( 320 + base_blocks - 1 ) / base_blocks, 32 );
 	if ( key_hint > 0 ) nsplit = MAX( 1, MIN( nsplit, key_hint / ( 4 * PA_BK ) ) );
-	if ( const char* env = std::getenv( "EXL3_PREFILL_SPLIT" ); env && count <= pod::MAX_BATCH ) nsplit = MAX( 1, MIN( std::atoi( env ), 32 ) );
 	ENGINE_ASSERT( static_cast<size_t>( count ) * num_q_heads * nsplit <= static_cast<size_t>( ATTN_MAX_ROW_HEADS ) * ATTN_MAX_CHUNKS, "Attention::forward_prefill: workspace" );
 	float* workspace = attn_workspace_ptr();
-	const dim3 grid( num_kv_heads, ( count * G + PF_QPB - 1 ) / PF_QPB );
 	const dim3 grid_tc( num_kv_heads, ( count * G + tile_q - 1 ) / tile_q, nsplit );
-	static const bool simt = std::getenv( "EXL3_PREFILL_SIMT" ) != nullptr;
 	const half* gate_ptr = gate.data != nullptr ? gate.ptr<const half>() : nullptr;
 	#define LAUNCH_PREFILL() do { \
-		if ( simt ) { \
-			attn_prefill_kernel<KQ_, VQ_><<<grid, 256, 0, stream>>>( \
-				q.ptr<const half>(), kv, gate_ptr, out.ptr<half>(), slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, max_seq, scale ); \
-		} \
-		else { \
+		{ \
 			CUDA_CHECK( cudaFuncSetAttribute( attn_prefill_tc_kernel<KQ_, VQ_>, cudaFuncAttributeMaxDynamicSharedMemorySize, PA_SMEM ) ); \
 			attn_prefill_tc_kernel<KQ_, VQ_><<<grid_tc, 256, PA_SMEM, stream>>>( \
 				q.ptr<const half>(), kv, gate_ptr, out.ptr<half>(), slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, max_seq, scale, workspace, nsplit, tile_q ); \
@@ -948,7 +750,7 @@ void Attention::forward_prefill(
 	KV_DISPATCH( KQV_, VQV_, LAUNCH_PREFILL() )
 	#undef KQ_
 	#undef VQ_
-	if ( !simt && nsplit > 1 ) {
+	if ( nsplit > 1 ) {
 		const int vrot = kv.vq == KVQ::Q4 ? 1 : 0;
 		attn_reduce_kernel<256><<<dim3( num_q_heads, count ), 256, 0, stream>>>( workspace, gate_ptr, out.ptr<half>(), num_q_heads, nsplit, vrot );
 	}
