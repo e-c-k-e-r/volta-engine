@@ -338,3 +338,8 @@ set_target_properties(test_dsa PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BI
 add_executable(bench_expert_heat tests/3_bench/bench_expert_heat.cpp)
 target_link_libraries(bench_expert_heat PRIVATE engine_kernels)
 set_target_properties(bench_expert_heat PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+# Per-lane build fragments (each owned by one Wave 2 lane; empty until the lane fills it in)
+include(${PROJECT_SOURCE_DIR}/cmake/cpu_backend.cmake OPTIONAL)
+include(${PROJECT_SOURCE_DIR}/cmake/reference_kernels.cmake OPTIONAL)
+include(${PROJECT_SOURCE_DIR}/cmake/vulkan_backend.cmake OPTIONAL)
