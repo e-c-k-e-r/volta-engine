@@ -1,5 +1,6 @@
 // Absorbed MLA parity: latent-cache attention (absorb_q -> attend -> expand_out) against an FP64 reference that expands K and V
 // per head from the same latents, on the real GLM-5.3-Flash layer-3 kv_b_proj slice (rank 0, 16 heads).
+#include "engine/runtime/test_paths.h"
 #include "engine/config.h"
 #include "engine/core/arena.h"
 #include "engine/core/batch.h"
@@ -12,7 +13,7 @@
 
 int main() {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	const char* dir = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
+	const char* dir = engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw" );
 	constexpr int H = 16, LORA = 512, HD = 256;
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	cudaStream_t stream;

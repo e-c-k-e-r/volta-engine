@@ -1,6 +1,7 @@
 // Routed-MoE prefill throughput on real GLM-5.3-Flash layer-3 experts (rank-0 partition, 72 of 288 experts):
 // rows routed uniformly over all 288 experts, time per MoE::forward at several chunk sizes.
 //   bench_moe_prefill [rows ...]
+#include "engine/runtime/test_paths.h"
 #include "engine/config.h"
 #include "engine/core/arena.h"
 #include "engine/loader/safetensors.h"
@@ -15,7 +16,7 @@
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	const char* dir = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
+	const char* dir = engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw" );
 	const bool shard = std::getenv( "BENCH_SHARD" ) != nullptr; // every expert a quarter wide (rank 0 of 4), all 288 local
 	const int H = 4096, I = 2048, E = shard ? 288 : 72, K = 8, L = 3;
 	CUDA_CHECK( cudaSetDevice( 0 ) );

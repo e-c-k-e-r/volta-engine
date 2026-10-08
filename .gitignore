@@ -24,3 +24,4 @@ results/
 /models/
 .venv*/
 venv/
+tests/local.env

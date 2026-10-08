@@ -5,6 +5,8 @@
 // lives in ModelCluster; this header only adds generation loops and timing helpers.
 
 #include "engine/runtime/cluster.h"
+#include "engine/runtime/test_paths.h"
+
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -13,19 +15,16 @@
 namespace engine::runtime::test {
 
 // EXL3_QWEN_DIR selects another Qwen checkpoint (the NVFP4 one, for instance); the loader detects the format.
-static const char* QWEN_DIR = std::getenv( "EXL3_QWEN_DIR" ) ? std::getenv( "EXL3_QWEN_DIR" ) : "/home/mrq/Documents/models/Qwen3.8-27B-exl3";
-static constexpr const char* QWEN_DRAFT_DIR_DEFAULT = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw";
+static const char* QWEN_DIR = model_path( "Qwen3.8-27B-exl3", "EXL3_QWEN_DIR" );
 // Overridable so the unquantized drafter can be A/B'd against the quantized one without a rebuild:
 // load_linear falls back to a dense <base>.weight when no trellis group is present, so
 // QWEN_DRAFT_BF16_DIR drops straight into cfg.draft_model_dir.
-static const char* QWEN_DRAFT_DIR = std::getenv( "EXL3_DRAFT_DIR" )
-	? std::getenv( "EXL3_DRAFT_DIR" )
-	: QWEN_DRAFT_DIR_DEFAULT;
+static const char* QWEN_DRAFT_DIR = model_path( "Qwen3.8-27B-DFlash2-EXL3-5.0bpw", "EXL3_DRAFT_DIR" );
 // The same drafter before quantization: 81 BF16 tensors, `fc.weight` and the 35 block projections
 // unquantized. It is the ground truth the Trellis weights are checked against.
-static constexpr const char* QWEN_DRAFT_BF16_DIR = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2";
-static const char* GLM_DIR = std::getenv( "EXL3_GLM_DIR" ) ? std::getenv( "EXL3_GLM_DIR" ) : "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
-static const char* GLM_DRAFT_DIR = std::getenv( "EXL3_GLM_DRAFT_DIR" ) ? std::getenv( "EXL3_GLM_DRAFT_DIR" ) : "/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2";
+static const char* QWEN_DRAFT_BF16_DIR = model_path( "Qwen3.8-27B-DFlash2" );
+static const char* GLM_DIR = model_path( "GLM-5.3-Flash-exl3-3.05bpw", "EXL3_GLM_DIR" );
+static const char* GLM_DRAFT_DIR = model_path( "GLM-5.3-Flash-DFlash2", "EXL3_GLM_DRAFT_DIR" );
 
 struct GenStats {
 	std::vector<int> tokens; // generated tokens (first = prefill prediction)

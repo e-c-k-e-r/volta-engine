@@ -7,18 +7,20 @@ echo "   VOLTA ENGINE: INTEGRATION TEST SUITE (PHASE 4)       "
 echo "========================================================"
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+[ -f "$DIR/tests/local.env" ] && . "$DIR/tests/local.env"
+: "${VOLTA_MODEL_ROOT:?set VOLTA_MODEL_ROOT (or tests/local.env)}"
 SERVER_BIN="$DIR/build/volta_server"
 SERVER_LOG="/tmp/volta_server_test.log"
 PORT=8000
 HOST="127.0.0.1"
-# VOLTA_TEST_MODEL=glm53 runs the same suite against GLM-5.3-Flash
+# VOLTA_TEST_MODEL=glm5_next runs the same suite against GLM-5.3-Flash
 MODEL="${VOLTA_TEST_MODEL:-qwen38}"
-if [ "$MODEL" = "glm53" ]; then
-	MODEL_DIR="${EXL3_GLM_DIR:-/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw}"
-	DRAFT_DIR="${EXL3_GLM_DRAFT_DIR:-/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2}"
+if [ "$MODEL" = "glm5_next" ]; then
+	MODEL_DIR="${EXL3_GLM_DIR:-$VOLTA_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw}"
+	DRAFT_DIR="${EXL3_GLM_DRAFT_DIR:-$VOLTA_MODEL_ROOT/GLM-5.3-Flash-DFlash2}"
 else
-	MODEL_DIR="/home/mrq/Documents/models/Qwen3.8-27B-exl3"
-	DRAFT_DIR="/home/mrq/Documents/models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw"
+	MODEL_DIR="$VOLTA_MODEL_ROOT/Qwen3.8-27B-exl3"
+	DRAFT_DIR="$VOLTA_MODEL_ROOT/Qwen3.8-27B-DFlash2-EXL3-5.0bpw"
 fi
 
 if [ ! -f "$SERVER_BIN" ]; then
@@ -29,7 +31,7 @@ fi
 rm -f "$SERVER_LOG"
 
 echo "[*] Launching volta_server detached under taskset -c 0-9 (speculative enabled)..."
-taskset -c 0-9 "$SERVER_BIN" --port "$PORT" --host "$HOST" --load-weights --model "$MODEL" --model-dir "$MODEL_DIR" --use-speculation --draft-model-dir "$DRAFT_DIR" > "$SERVER_LOG" 2>&1 &
+taskset -c 0-9 "$SERVER_BIN" --port "$PORT" --host "$HOST" --load-weights --model-dir "$MODEL_DIR" --use-speculation --draft-model-dir "$DRAFT_DIR" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 cleanup() {
@@ -52,7 +54,7 @@ trap cleanup EXIT INT TERM
 
 echo "[*] Polling http://$HOST:$PORT/health..."
 READY=0
-for i in $(seq 1 "${VOLTA_READY_TRIES:-50}"); do
+for i in $(seq 1 "${VOLTA_READY_TRIES:-600}"); do
 	if curl -s -f "http://$HOST:$PORT/health" 2>/dev/null | grep -q '"status":\s*"ok"'; then
 		READY=1
 		echo "[+] Server is ready! Health check passed."

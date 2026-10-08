@@ -45,7 +45,7 @@ int main( int argc, char** argv ) {
 	ENGINE_ASSERT( chat.load( test::GLM_DIR ), "chat template load failed" );
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = "glm53";
+	cfg.model_type = "glm5_next";
 	cfg.model_dir = test::GLM_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	mc.warm_graphs( 8 );

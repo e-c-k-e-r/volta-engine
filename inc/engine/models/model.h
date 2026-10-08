@@ -152,6 +152,8 @@ protected:
 };
 
 // Factory helper to instantiate models dynamically
+// Registered architectures use the checkpoint config.json "model_type": qwen3_5, glm5_next. Anything else is unsupported.
+bool is_known_model_type( const std::string& model_type );
 std::unique_ptr<ModelPipeline> create_model_pipeline( const std::string& model_type );
 
 } // namespace engine::models

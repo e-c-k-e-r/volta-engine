@@ -41,7 +41,7 @@ int main( int argc, char** argv ) {
 	const int chunk_b = argc > 3 ? std::atoi( argv[3] ) : 256;     // path under test
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = "qwen38";
+	cfg.model_type = "qwen3_5";
 	cfg.model_dir = test::QWEN_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	mc.warm_graphs( 8 );

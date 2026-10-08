@@ -64,12 +64,12 @@ int main( int argc, char** argv ) {
 
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm53" : "qwen38";
+	cfg.model_type = glm ? "glm5_next" : "qwen3_5";
 	cfg.model_dir = glm ? test::GLM_DIR : test::QWEN_DIR;
 	if ( spec ) cfg.draft_model_dir = glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	mc.warm_graphs( 8 );
-	std::printf( "[*] %s prompt %zu tokens, needle at %d%%, max_seq %d, %s\n", glm ? "glm53" : "qwen38", ids.size(), depth,
+	std::printf( "[*] %s prompt %zu tokens, needle at %d%%, max_seq %d, %s\n", glm ? "glm5_next" : "qwen3_5", ids.size(), depth,
 		mc.metadata().max_seq_len, spec ? "speculative" : "greedy" );
 	ENGINE_ASSERT( static_cast<int>( ids.size() ) + 24 < mc.metadata().max_seq_len, "prompt does not fit the context window" );
 	const test::GenStats st = test::generate( mc, ids, 24, spec );

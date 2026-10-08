@@ -16,7 +16,7 @@ int main( int argc, char** argv ) {
 	ModelCluster mc;
 	ClusterConfig cfg;
 	const bool glm = std::getenv( "BENCH_GLM" ) != nullptr;
-	cfg.model_type = glm ? "glm53" : "qwen38";
+	cfg.model_type = glm ? "glm5_next" : "qwen3_5";
 	cfg.model_dir = glm ? test::GLM_DIR : test::QWEN_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	if ( !glm || std::getenv( "BENCH_WARM" ) ) mc.warm_graphs( 8 );  // BENCH_WARM=1: warm the decode graphs for GLM too

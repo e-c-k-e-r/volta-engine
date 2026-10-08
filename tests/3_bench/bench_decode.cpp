@@ -107,8 +107,8 @@ int main( int argc, char** argv ) {
 		if ( !std::strcmp( argv[i], "--glm" ) || !std::strcmp( argv[i], "--glm-only" ) ) { qwen = false; glm = true; }
 		else if ( !std::strcmp( argv[i], "--all" ) ) { qwen = true; glm = true; }
 	}
-	if ( qwen ) impl::bench_model( "qwen38", test::QWEN_DIR, 50 );
-	if ( glm ) impl::bench_model( "glm53", test::GLM_DIR, 30 );
+	if ( qwen ) impl::bench_model( "qwen3_5", test::QWEN_DIR, 50 );
+	if ( glm ) impl::bench_model( "glm5_next", test::GLM_DIR, 30 );
 	std::printf( "\n[+] Benchmark complete.\n" );
 	return 0;
 }

@@ -1,5 +1,6 @@
 // MoE parity: persistent MoE::forward vs per-expert reference (Linear + SwiGLU + accumulate)
 // on real GLM-5.3-Flash layer-3 routed experts (rank-0 partition, 72 experts).
+#include "engine/runtime/test_paths.h"
 #include "engine/config.h"
 #include "engine/core/arena.h"
 #include "engine/loader/safetensors.h"
@@ -14,7 +15,7 @@
 
 int main() {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	const char* dir = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
+	const char* dir = engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw" );
 	const int H = 4096, I = 2048, E = 72, K = 8, L = 3;
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	engine::modules::trellis_context_init_all();

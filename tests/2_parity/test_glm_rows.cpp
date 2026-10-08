@@ -41,7 +41,7 @@ int main( int argc, char** argv ) {
 	if ( chunks.empty() ) chunks = { 1, 2, 4, 8, 9, 12, 16, 24 };
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = "glm53";
+	cfg.model_type = "glm5_next";
 	cfg.model_dir = test::GLM_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 

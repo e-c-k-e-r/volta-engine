@@ -14,7 +14,11 @@ namespace engine::runtime {
 
 bool ModelCluster::init( const ClusterConfig& cfg ) {
 	ENGINE_ASSERT( !initialized_, "ModelCluster::init: already initialized" );
-	const bool is_glm = ( cfg.model_type == "glm53" || cfg.model_type == "glm" );
+	if ( !engine::models::is_known_model_type( cfg.model_type ) ) {
+		std::fprintf( stderr, "[-] ModelCluster: unsupported model_type '%s'\n", cfg.model_type.c_str() );
+		return false;
+	}
+	const bool is_glm = ( cfg.model_type == "glm5_next" );
 	// EXL3_ARENA_GIB overrides the per-GPU arena. The default of 10 GiB is sized for the quantized
 	// drafter; loading the unquantized one needs roughly twice the weight bytes.
 	const auto& opt = runtime::options();

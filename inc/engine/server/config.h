@@ -11,16 +11,18 @@ struct ServerConfig {
 	int default_max_tokens = 256;
 	float default_temperature = 0.0f;
 
-	std::string model_type = "qwen38"; // "qwen38" or "glm53"
-	std::string model_dir = "/home/mrq/Documents/models/Qwen3.8-27B-exl3";
-	std::string draft_model_dir = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw";
+	std::string model_type;      // empty: read from <model_dir>/config.json; otherwise qwen3_5 | glm5_next
+	std::string model_dir;       // required
+	std::string draft_model_dir; // required with use_speculation
 	bool use_speculation = false;
 	bool load_weights = true;
 	bool benchmark_mode = false;
 	int tp_size = 4;
 
 	bool load_from_json( const char* json_path );
+	// Parses --config and the CLI, then resolves and validates (model_dir, model_type, draft dir). Exits with status 2 on error.
 	void parse_cli_args( int argc, char** argv );
+	bool resolve();
 };
 
 } // namespace engine::server

@@ -28,7 +28,7 @@ int main() {
 	ModelCluster mc;
 	ClusterConfig cfg;
 	const bool glm = std::getenv( "SPEC_STATE_MODEL" ) && !std::strcmp( std::getenv( "SPEC_STATE_MODEL" ), "glm" );
-	cfg.model_type = glm ? "glm53" : "qwen38";
+	cfg.model_type = glm ? "glm5_next" : "qwen3_5";
 	cfg.model_dir = glm ? test::GLM_DIR : test::QWEN_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	mc.warm_graphs( 8 );

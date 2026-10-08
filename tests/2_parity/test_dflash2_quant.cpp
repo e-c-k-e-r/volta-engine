@@ -5,7 +5,7 @@
 // real numbers. That is the whole reason the drafter can be structurally correct and still accept
 // poorly: a mis-decoded `fc` corrupts every context row the drafter reads.
 //
-// The reference here is /home/mrq/Documents/models/Qwen3.8-27B-DFlash2, the same drafter before
+// The reference here is $VOLTA_MODEL_ROOT/Qwen3.8-27B-DFlash2, the same drafter before
 // quantization (81 BF16 tensors, `fc.weight` plus the 35 block projections unquantized). Its weights
 // have max |w| = 20.875, comfortably inside FP16's 65504, and BF16 carries 7 mantissa bits against
 // FP16's 10, so BF16 -> FP16 is exact for normals. No new kernel is needed to read it: the loader
@@ -182,7 +182,7 @@ int main() {
 
 	engine::loader::SafeTensorsRepo bf16_repo, exl3_repo;
 	ENGINE_ASSERT( bf16_repo.open( test::QWEN_DRAFT_BF16_DIR ), "cannot open unquantized drafter" );
-	ENGINE_ASSERT( exl3_repo.open( test::QWEN_DRAFT_DIR_DEFAULT ), "cannot open EXL3 drafter" );
+	ENGINE_ASSERT( exl3_repo.open( test::model_path( "Qwen3.8-27B-DFlash2-EXL3-5.0bpw" ) ), "cannot open EXL3 drafter" );
 
 	pod::MemoryArena arena;
 	engine::core::arena_create( arena, 0, 8ULL * 1024 * 1024 * 1024 );

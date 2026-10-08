@@ -28,7 +28,7 @@ int main( int argc, char** argv ) {
 
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = "qwen38";
+	cfg.model_type = "qwen3_5";
 	cfg.model_dir = test::QWEN_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	mc.warm_graphs( rows );

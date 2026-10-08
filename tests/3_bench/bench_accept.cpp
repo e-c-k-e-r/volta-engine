@@ -43,7 +43,7 @@ int main( int argc, char** argv ) {
 	ENGINE_ASSERT( chat.load( glm ? test::GLM_DIR : test::QWEN_DIR ), "chat template load failed" );
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm53" : "qwen38";
+	cfg.model_type = glm ? "glm5_next" : "qwen3_5";
 	cfg.model_dir = glm ? test::GLM_DIR : test::QWEN_DIR;
 	cfg.draft_model_dir = glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );

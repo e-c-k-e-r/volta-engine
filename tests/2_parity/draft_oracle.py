@@ -10,6 +10,8 @@
 # engine implements. Paths below are this machine's.
 # Independent from-scratch torch version of the DFlash2 drafter (semantics from exllamav3 dflash2.py and
 # 1Cat-vLLM qwen3_dflash2.py), compared against the engine's dumped draft hidden for the same round.
+import os
+ROOT = os.environ.get("VOLTA_MODEL_ROOT", "")
 import json, struct, sys, torch, numpy as np
 from safetensors import safe_open
 dev = "cuda:0"
@@ -17,13 +19,13 @@ import os
 VAR = os.environ.get("VAR","")
 GLM = os.environ.get("MODEL", "") == "glm"
 if GLM:
-    D = "/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2/model.safetensors"
-    GDIR = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw/"
+    D = ROOT + "/GLM-5.3-Flash-DFlash2/model.safetensors"
+    GDIR = ROOT + "/GLM-5.3-Flash-exl3-3.05bpw/"
     idx = json.load(open(GDIR + "model.safetensors.index.json"))["weight_map"]
     E = GDIR + idx["model.language_model.embed_tokens.weight"]
 else:
-    D = "/home/mrq/Documents/models/Qwen3.8-27B-DFlash2/model.safetensors"
-    E = "/home/mrq/Documents/models/Qwen3.8-27B-exl3/model-00001-of-00002.safetensors"
+    D = ROOT + "/Qwen3.8-27B-DFlash2/model.safetensors"
+    E = ROOT + "/Qwen3.8-27B-exl3/model-00001-of-00002.safetensors"
 raw = open("/tmp/draft_dump.bin", "rb").read()
 pos, anchor, H, cap = struct.unpack("4i", raw[:16])
 taps = np.frombuffer(raw[16:16 + pos * 5 * H * 2], dtype=np.float16).reshape(pos, 5 * H)

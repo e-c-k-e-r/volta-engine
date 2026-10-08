@@ -1,3 +1,4 @@
+#include "engine/runtime/test_paths.h"
 #include "engine/config.h"
 #include "engine/loader/tokenizer.h"
 #include "engine/loader/chat_template.h"
@@ -10,8 +11,8 @@ int main() {
 	std::printf( "  VOLTA ENGINE: BPE TOKENIZER & CHAT TEMPLATE PARITY\n" );
 	std::printf( "========================================================\n\n" );
 
-	const char* qwen_dir = "/home/mrq/Documents/models/Qwen3.8-27B-exl3";
-	const char* glm_dir = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
+	const char* qwen_dir = engine::runtime::test::model_path( "Qwen3.8-27B-exl3" );
+	const char* glm_dir = engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw" );
 
 	bool all_passed = true;
 

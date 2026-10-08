@@ -48,7 +48,7 @@ int main( int argc, char** argv ) {
 	const bool glm = ( argc > 1 && !std::strcmp( argv[1], "--glm" ) );
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm53" : "qwen38";
+	cfg.model_type = glm ? "glm5_next" : "qwen3_5";
 	cfg.model_dir = glm ? test::GLM_DIR : test::QWEN_DIR;
 	cfg.draft_model_dir = glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );

@@ -1,6 +1,7 @@
 // End-to-end single-rank (tp=1) model forward, cross-backend: `--dump <dir>` (CUDA build) runs a short prefill and writes the last
 // row's logits; `--check <dir>` (any build, in particular CPU) repeats it and compares against the golden file (tier 2 tolerance,
 // plus argmax equality). Model directory from argv `--model <dir>` (default: the Qwen EXL3 checkpoint).
+#include "engine/runtime/test_paths.h"
 #include "engine/runtime/cluster.h"
 #include "engine/backend/numeric.h"
 #include "golden_io.h"
@@ -12,7 +13,7 @@ namespace backend = engine::backend;
 
 int main( int argc, char** argv ) {
 	GoldenArgs args( argc, argv );
-	const char* model_dir = "/home/mrq/Documents/models/Qwen3.8-27B-exl3";
+	const char* model_dir = engine::runtime::test::model_path( "Qwen3.8-27B-exl3" );
 	for ( int i = 1; i + 1 < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--model" ) ) model_dir = argv[i + 1];
 	}
@@ -27,7 +28,7 @@ int main( int argc, char** argv ) {
 #endif
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = "qwen38";
+	cfg.model_type = "qwen3_5";
 	cfg.model_dir = model_dir;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	const int vocab = mc.metadata().vocab_size;

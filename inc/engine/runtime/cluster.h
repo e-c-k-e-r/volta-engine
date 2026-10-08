@@ -17,7 +17,7 @@
 namespace engine::runtime {
 
 struct ClusterConfig {
-	std::string model_type;      // "qwen38" | "glm53"
+	std::string model_type;      // "qwen3_5" | "glm5_next"
 	std::string model_dir;
 	std::string draft_model_dir; // empty => no speculator
 	size_t arena_bytes = 0;      // 0 => per-model default

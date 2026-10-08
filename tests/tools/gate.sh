@@ -8,6 +8,7 @@
 #   compare <tag>   GPU: bench again and diff against results/baseline_<tag>.txt (flags > 1% regressions)
 # Logs go to results/gate_<mode>_<timestamp>/ (gitignored).
 set -u
+[[ -f ${0:A:h:h}/local.env ]] && source ${0:A:h:h}/local.env
 ROOT=${0:A:h:h:h}
 cd $ROOT/build || exit 2
 mode=${1:-static}

@@ -200,10 +200,10 @@ int main( int argc, char** argv ) {
 
 	int failures = 0;
 	if ( run_qwen ) {
-		failures += impl::run_model( "qwen38", test::QWEN_DIR, test::QWEN_DRAFT_DIR, impl::qwen_cases(), spec );
+		failures += impl::run_model( "qwen3_5", test::QWEN_DIR, test::QWEN_DRAFT_DIR, impl::qwen_cases(), spec );
 	}
 	if ( run_glm ) {
-		failures += impl::run_model( "glm53", test::GLM_DIR, test::GLM_DRAFT_DIR, impl::glm_cases(), spec );
+		failures += impl::run_model( "glm5_next", test::GLM_DIR, test::GLM_DRAFT_DIR, impl::glm_cases(), spec );
 	}
 	ENGINE_ASSERT( failures == 0, "coherence gate failed" );
 	std::printf( "=== COHERENCE GATE COMPLETE: ALL PASS ===\n" );

@@ -1,5 +1,6 @@
 // NVFP4 Linear parity on real Qwen3.8-27B-QUASAR-NVFP4 weights: prepacked skinny kernel vs a dense FP16 dequantization
 // of the same slice (load_nvfp4_dense) multiplied in double precision, across row counts and both TP split directions.
+#include "engine/runtime/test_paths.h"
 #include "engine/config.h"
 #include "engine/core/arena.h"
 #include "engine/loader/safetensors.h"
@@ -9,7 +10,7 @@
 #include "trellis_context.h"
 #include <vector>
 
-static const char* NVFP4_DIR = "/home/mrq/Documents/models/Qwen3.8-27B-QUASAR-NVFP4";
+static const char* NVFP4_DIR = engine::runtime::test::model_path( "Qwen3.8-27B-QUASAR-NVFP4" );
 
 int main() {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );

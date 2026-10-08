@@ -296,7 +296,7 @@ bool GLM53Pipeline::init(
 	engine::modules::trellis_get_locks( rank_ );
 #endif
 
-	metadata_.model_name = "glm53";
+	metadata_.model_name = "glm5_next";
 	metadata_.hidden_size = config_.hidden_size;
 	metadata_.vocab_size = config_.vocab_size;
 	metadata_.num_layers = config_.num_layers;

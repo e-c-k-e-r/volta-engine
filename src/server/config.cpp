@@ -1,4 +1,5 @@
 #include "engine/server/config.h"
+#include "engine/models/model.h"
 #include "engine/runtime/options.h"
 
 #define JSON_NOEXCEPTION 1
@@ -118,8 +119,6 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 		}
 	}
 
-	bool model_dir_overridden = false;
-
 	// Second pass: apply CLI overrides
 	for ( int i = 1; i < argc; ++i ) {
 		if ( ( std::strcmp( argv[i], "--port" ) == 0 ) && i + 1 < argc ) {
@@ -133,7 +132,6 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 		}
 		else if ( ( std::strcmp( argv[i], "--model-dir" ) == 0 || std::strcmp( argv[i], "--weights-dir" ) == 0 ) && i + 1 < argc ) {
 			model_dir = argv[++i];
-			model_dir_overridden = true;
 		}
 		else if ( ( std::strcmp( argv[i], "--draft-model-dir" ) == 0 || std::strcmp( argv[i], "--spec-dir" ) == 0 ) && i + 1 < argc ) {
 			draft_model_dir = argv[++i];
@@ -172,11 +170,42 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 		}
 	}
 
-	// Adjust default paths if model_type is glm53 and model_dir wasn't explicitly supplied
-	if ( !model_dir_overridden && ( model_type == "glm53" || model_type == "glm" ) ) {
-		model_dir = "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
-		draft_model_dir = "/home/mrq/Documents/models/GLM-5.3-Flash-DFlash2";
+	if ( !resolve() ) std::exit( 2 );
+}
+
+bool ServerConfig::resolve() {
+	if ( model_dir.empty() ) {
+		std::fprintf( stderr, "[-] FATAL: model_dir is required (--model-dir or \"model_dir\" in the launch config)\n" );
+		return false;
 	}
+	if ( model_type.empty() ) {
+		const std::string path = model_dir + "/config.json";
+		FILE* f = std::fopen( path.c_str(), "rb" );
+		if ( !f ) {
+			std::fprintf( stderr, "[-] FATAL: no model_type given and %s is unreadable\n", path.c_str() );
+			return false;
+		}
+		std::string text;
+		char buf[4096];
+		size_t n;
+		while ( ( n = std::fread( buf, 1, sizeof( buf ), f ) ) > 0 ) text.append( buf, n );
+		std::fclose( f );
+		auto j = nlohmann::json::parse( text, nullptr, false );
+		if ( j.is_discarded() || !j.contains( "model_type" ) || !j["model_type"].is_string() ) {
+			std::fprintf( stderr, "[-] FATAL: %s has no model_type\n", path.c_str() );
+			return false;
+		}
+		model_type = j["model_type"].get<std::string>();
+	}
+	if ( !models::is_known_model_type( model_type ) ) {
+		std::fprintf( stderr, "[-] FATAL: unsupported model_type '%s' (supported: qwen3_5, glm5_next)\n", model_type.c_str() );
+		return false;
+	}
+	if ( use_speculation && draft_model_dir.empty() ) {
+		std::fprintf( stderr, "[-] FATAL: use_speculation requires draft_model_dir\n" );
+		return false;
+	}
+	return true;
 }
 
 } // namespace engine::server
