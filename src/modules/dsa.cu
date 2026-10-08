@@ -1,7 +1,10 @@
 #include "engine/modules/dsa.h"
 #include <cmath>
+#include <mma.h>
 
 namespace engine::modules {
+
+namespace wmma = nvcuda::wmma;
 
 namespace {
 
@@ -109,47 +112,51 @@ void pool_kernel( const half* __restrict__ plane, half* __restrict__ pool_plane,
 	pool_plane[static_cast<size_t>( slot ) * pool_slot_stride + ( static_cast<size_t>( layer ) * ( max_seq / P ) + pool ) * D + d] = __float2half_rn( acc / sum );
 }
 
-// Block = (row, tile of 128 pools); the thread holds its pool key in registers and sweeps the 32 heads
+// Block = (row, tile of 128 pools), 4 warps of 2 column tiles of 16 pools. logits[h][p] = q[h] . key[p] is a 32 x 128 x 16 GEMM per
+// column tile on wmma m16n16k16 (fp16 operands, fp32 accumulate: products are exact as in the scalar form), then ReLU, head weight and
+// head sum from shared memory
 __global__ __launch_bounds__( 128 )
 void score_kernel( const half* __restrict__ q_idx, const half* __restrict__ w, const half* __restrict__ pool_plane, half* __restrict__ scores,
 	int score_stride, int layer, int max_seq, const pod::BatchRows* __restrict__ rows, size_t pool_slot_stride ) {
-	__shared__ __align__( 16 ) float sq[H * D];
+	__shared__ __align__( 32 ) half sq[H * D];
+	__shared__ __align__( 32 ) float sl[4][H * 16];
+	__shared__ float sw[H];
 	const int r = blockIdx.x;
 	const int pos = rows->pos[r];
 	const int bound = ( pos + 1 ) / P;
-	const int p = blockIdx.y * 128 + threadIdx.x;
 	if ( bound <= DSA::SEL_POOLS || blockIdx.y * 128 >= bound ) return; // dense row, or tile past the visible pools
-	for ( int i = threadIdx.x; i < H * D; i += 128 ) sq[i] = __half2float( q_idx[static_cast<size_t>( r ) * H * D + i] );
+	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+	for ( int i = threadIdx.x; i < H * D / 8; i += 128 ) reinterpret_cast<uint4*>( sq )[i] = reinterpret_cast<const uint4*>( q_idx + static_cast<size_t>( r ) * H * D )[i];
+	if ( threadIdx.x < H ) sw[threadIdx.x] = __half2float( w[static_cast<size_t>( r ) * H + threadIdx.x] );
 	__syncthreads();
-	if ( p >= bound ) return;
-	const half* key = pool_plane + static_cast<size_t>( rows->slot[r] ) * pool_slot_stride + ( static_cast<size_t>( layer ) * ( max_seq / P ) + p ) * D;
-	float kf[D];
-	#pragma unroll
-	for ( int i = 0; i < D / 8; ++i ) {
-		const uint4 raw = *reinterpret_cast<const uint4*>( key + i * 8 );
-		const half2* h2 = reinterpret_cast<const half2*>( &raw );
+	const half* keys = pool_plane + static_cast<size_t>( rows->slot[r] ) * pool_slot_stride + static_cast<size_t>( layer ) * ( max_seq / P ) * D;
+	for ( int c = 0; c < 2; ++c ) {
+		const int p0 = blockIdx.y * 128 + ( warp * 2 + c ) * 16;
+		if ( p0 >= bound ) break;
+		wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1;
+		wmma::fill_fragment( acc0, 0.0f );
+		wmma::fill_fragment( acc1, 0.0f );
 		#pragma unroll
-		for ( int j = 0; j < 4; ++j ) {
-			const float2 f = __half22float2( h2[j] );
-			kf[i * 8 + 2 * j] = f.x;
-			kf[i * 8 + 2 * j + 1] = f.y;
+		for ( int k = 0; k < D; k += 16 ) {
+			wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb;
+			wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
+			wmma::load_matrix_sync( fb, keys + static_cast<size_t>( p0 ) * D + k, D );
+			wmma::load_matrix_sync( fa, sq + k, D );
+			wmma::mma_sync( acc0, fa, fb, acc0 );
+			wmma::load_matrix_sync( fa, sq + 16 * D + k, D );
+			wmma::mma_sync( acc1, fa, fb, acc1 );
 		}
-	}
-	float acc = 0.0f;
-	for ( int h = 0; h < H; ++h ) {
-		float lg = 0.0f;
-		const float4* qh = reinterpret_cast<const float4*>( sq + h * D );
+		wmma::store_matrix_sync( sl[warp], acc0, 16, wmma::mem_row_major );
+		wmma::store_matrix_sync( sl[warp] + 16 * 16, acc1, 16, wmma::mem_row_major );
+		__syncwarp();
+		const int pl = lane & 15, h0 = ( lane >> 4 ) * 16;
+		float acc = 0.0f;
 		#pragma unroll
-		for ( int i = 0; i < D / 4; ++i ) {
-			const float4 qv = qh[i];
-			lg = fmaf( qv.x, kf[4 * i], lg );
-			lg = fmaf( qv.y, kf[4 * i + 1], lg );
-			lg = fmaf( qv.z, kf[4 * i + 2], lg );
-			lg = fmaf( qv.w, kf[4 * i + 3], lg );
-		}
-		acc = fmaf( fmaxf( lg, 0.0f ), __half2float( w[static_cast<size_t>( r ) * H + h] ), acc );
+		for ( int h = 0; h < 16; ++h ) acc = fmaf( fmaxf( sl[warp][( h0 + h ) * 16 + pl], 0.0f ), sw[h0 + h], acc );
+		acc += __shfl_xor_sync( 0xffffffffu, acc, 16 );
+		if ( lane < 16 && p0 + pl < bound ) scores[static_cast<size_t>( r ) * score_stride + p0 + pl] = __float2half_rn( acc * rsqrtf( static_cast<float>( D * H ) ) );
+		__syncwarp();
 	}
-	scores[static_cast<size_t>( r ) * score_stride + p] = __float2half_rn( acc * rsqrtf( static_cast<float>( D * H ) ) );
 }
 
 __device__ __forceinline__ unsigned score_key( half s ) {
@@ -269,6 +276,7 @@ void DSA::pool_update( const half* plane, half* pool_plane, const half* ape, int
 
 void DSA::score( const half* q_idx, const half* w, const half* pool_plane, half* scores, int score_stride, int layer, int max_seq, int rows,
 	const pod::BatchRows* d_rows, size_t pool_slot_stride, cudaStream_t stream ) {
+	ENGINE_ASSERT( max_seq % 64 == 0, "DSA score: max_seq must be a multiple of 64" );
 	const int tiles = ( max_seq / P + 127 ) / 128;
 	score_kernel<<<dim3( rows, tiles ), dim3( 128 ), 0, stream>>>( q_idx, w, pool_plane, scores, score_stride, layer, max_seq, d_rows, pool_slot_stride );
 }
