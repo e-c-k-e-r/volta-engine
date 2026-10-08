@@ -10,6 +10,7 @@
 #include "engine/modules/swiglu.h"
 #include "engine/modules/rope.h"
 #include "engine/modules/embedding.h"
+#include "engine/modules/expert_tier.h"
 #include "engine/modules/trellis.h"
 #include "engine/modules/gdn.h"
 #include "engine/modules/linear.h"
@@ -85,9 +86,8 @@ static int run_child( void ( *fn )(), std::string& err ) {
 	return WIFEXITED( status ) ? WEXITSTATUS( status ) : -1;
 }
 
-static void call_trellis() {
-	pod::TensorView t{};
-	engine::modules::LinearNVFP4::forward( t, t, t, 1.0f, t, nullptr );
+static void call_unsupported() {
+	( void ) engine::modules::ExpertTier::env_fraction();
 }
 
 int main() {
@@ -267,9 +267,9 @@ int main() {
 	}
 	{ // A CUDA/SM70-only entry point aborts with the named message
 		std::string err;
-		const int code = run_child( call_trellis, err );
-		const bool ok = code == 1 && err.find( "CPU backend: LinearNVFP4::forward is not implemented" ) != std::string::npos;
-		std::printf( "  %-28s exit=%d %s\n", "LinearNVFP4::forward stub", code, ok ? "PASS" : "FAIL" );
+		const int code = run_child( call_unsupported, err );
+		const bool ok = code == 1 && err.find( "CPU backend: ExpertTier::env_fraction is not implemented" ) != std::string::npos;
+		std::printf( "  %-28s exit=%d %s\n", "ExpertTier stub", code, ok ? "PASS" : "FAIL" );
 		pass = ok && pass;
 	}
 
