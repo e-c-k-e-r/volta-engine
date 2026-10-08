@@ -35,6 +35,9 @@ static_checks() {
 	ninja > $out/build.log 2>&1 || { echo "build FAILED"; bad=1; }
 	# CPU configuration: configures without CUDA, builds, smoke test passes
 	cmake -S $ROOT -B $ROOT/build_cpu -G Ninja -DENGINE_BACKEND=CPU > $out/cpu_cmake.log 2>&1 && ninja -C $ROOT/build_cpu test_cpu_smoke > $out/cpu_build.log 2>&1 && $ROOT/build_cpu/test_cpu_smoke > $out/cpu_smoke.log 2>&1 || { echo "CPU configuration FAILED (see $out/cpu_*.log)"; bad=1; }
+	# CPU and Vulkan configurations: build the op-level tests and smoke tests used by `parity`
+	ninja -C $ROOT/build_cpu test_cpu_smoke test_ops_linear test_ops_moe test_ops_attention > $out/cpu_ops_build.log 2>&1 || { echo "CPU op tests build FAILED"; bad=1; }
+	cmake -S $ROOT -B $ROOT/build_vk -G Ninja -DENGINE_BACKEND=VULKAN > $out/vk_cmake.log 2>&1 && ninja -C $ROOT/build_vk test_vulkan_smoke test_vulkan_ref > $out/vk_build.log 2>&1 || { echo "Vulkan configuration FAILED (see $out/vk_*.log)"; bad=1; }
 	# Slang-generated SPIR-V must validate
 	for f in slang/*.spv(N); do spirv-val $f > $out/$f:t.log 2>&1 || { echo "spirv-val FAILED: $f"; bad=1; }; done
 	return $bad
@@ -53,6 +56,14 @@ tier2() {
 	run ref_attention_host ./test_ref_attention
 	run ref_attention_gpu gpu ./test_ref_attention --gpu
 	run vulkan_kernels gpu ./test_vulkan_kernels
+	run vulkan_smoke gpu $ROOT/build_vk/test_vulkan_smoke
+	run vulkan_ref gpu $ROOT/build_vk/test_vulkan_ref
+	# Cross-backend op-level goldens: dump with the CUDA kernels, check in the CUDA build and in the CPU build
+	for t in test_ops_linear test_ops_moe test_ops_attention; do
+		run ${t}_dump gpu ./$t --dump $out/golden
+		run ${t}_check_cuda gpu ./$t --check $out/golden
+		run ${t}_check_cpu $ROOT/build_cpu/$t --check $out/golden
+	done
 	run coherence gpu ./test_coherence
 	run sampling_qwen gpu ./test_sampling_gpu
 	run sampling_glm gpu ./test_sampling_gpu --glm
