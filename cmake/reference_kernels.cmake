@@ -99,7 +99,7 @@ if(SLANGC)
 	# The main Slang launcher library globs src/shaders/cuda/*.cu: keep the reference launchers out of it
 	if(TARGET engine_slang_cuda)
 		get_target_property(REF_LIN_SLANG_SRCS engine_slang_cuda SOURCES)
-		list(FILTER REF_LIN_SLANG_SRCS EXCLUDE REGEX "/cuda/ref_[^/]*\\.cu$")
+		list(FILTER REF_LIN_SLANG_SRCS EXCLUDE REGEX "/cuda/ref_(gemm|trellis|engine)\\.cu$")
 		set_property(TARGET engine_slang_cuda PROPERTY SOURCES ${REF_LIN_SLANG_SRCS})
 	endif()
 

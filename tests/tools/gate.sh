@@ -33,6 +33,8 @@ static_checks() {
 	echo "module/spec headers with <cuda_*> includes: $(grep -rln '#include <cuda_' $ROOT/inc/engine/modules $ROOT/inc/engine/spec 2>/dev/null | wc -l)"
 	echo "kernel launches in models: $(grep -c '<<<' $ROOT/src/models/*.cpp 2>/dev/null | tr '\n' ' ')"
 	ninja > $out/build.log 2>&1 || { echo "build FAILED"; bad=1; }
+	# CPU configuration: configures without CUDA, builds, smoke test passes
+	cmake -S $ROOT -B $ROOT/build_cpu -G Ninja -DENGINE_BACKEND=CPU > $out/cpu_cmake.log 2>&1 && ninja -C $ROOT/build_cpu test_cpu_smoke > $out/cpu_build.log 2>&1 && $ROOT/build_cpu/test_cpu_smoke > $out/cpu_smoke.log 2>&1 || { echo "CPU configuration FAILED (see $out/cpu_*.log)"; bad=1; }
 	# Slang-generated SPIR-V must validate
 	for f in slang/*.spv(N); do spirv-val $f > $out/$f:t.log 2>&1 || { echo "spirv-val FAILED: $f"; bad=1; }; done
 	return $bad
@@ -46,6 +48,11 @@ tier2() {
 	# test_dflash prints a known FATAL in its geometry step (present before 2026-10-07); judged by its final line
 	run test_dflash sh -c "taskset -c 0-9 ./test_dflash | tail -3 | grep -q 'PASSED'"
 	run backend_tiers ./test_backend_tiers $ROOT
+	run ref_linear_host ./test_ref_linear
+	run ref_linear_gpu gpu ./test_ref_linear --gpu
+	run ref_attention_host ./test_ref_attention
+	run ref_attention_gpu gpu ./test_ref_attention --gpu
+	run vulkan_kernels gpu ./test_vulkan_kernels
 	run coherence gpu ./test_coherence
 	run sampling_qwen gpu ./test_sampling_gpu
 	run sampling_glm gpu ./test_sampling_gpu --glm
