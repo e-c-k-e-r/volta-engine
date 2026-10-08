@@ -52,6 +52,7 @@ set(ENGINE_HOST_SOURCES
 	src/runtime/dflash2_runner.cpp
 	src/runtime/generator.cpp
 	src/server/config.cpp
+	src/server/output_parser.cpp
 	src/server/server.cpp
 )
 
@@ -210,6 +211,11 @@ add_executable(test_jinja tests/2_parity/test_jinja.cpp)
 target_link_libraries(test_jinja PRIVATE engine_kernels)
 target_compile_definitions(test_jinja PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
 set_target_properties(test_jinja PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_output_parser tests/2_parity/test_output_parser.cpp)
+target_link_libraries(test_output_parser PRIVATE engine_kernels)
+target_compile_definitions(test_output_parser PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
+set_target_properties(test_output_parser PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_tokenizer tests/2_parity/test_tokenizer.cpp)
 target_link_libraries(test_tokenizer PRIVATE engine_kernels)
