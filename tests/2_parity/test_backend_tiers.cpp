@@ -1,0 +1,41 @@
+#include "engine/backend/tiers.h"
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
+
+// Host-only check of the capability registry: no duplicate entries, and every registered module::function is declared
+// somewhere in inc/engine/modules or inc/engine/spec (so the table cannot silently rot).
+int main( int argc, char** argv ) {
+	const std::string root = argc > 1 ? argv[1] : ".";
+	int n = 0;
+	const engine::backend::TierEntry* e = engine::backend::tier_entries( &n );
+	int counts[3] = {};
+	bool ok = true;
+	std::string headers;
+	for ( const char* h : { "attention", "dsa", "embedding", "expert_tier", "gdn", "linear", "mhc", "mla", "moe", "norm", "nvfp4", "rope", "swiglu", "trellis" } ) {
+		std::ifstream f( root + "/inc/engine/modules/" + h + ".h" );
+		std::stringstream ss; ss << f.rdbuf(); headers += ss.str();
+	}
+	for ( const char* h : { "dflash", "tap_ring" } ) {
+		std::ifstream f( root + "/inc/engine/spec/" + h + ".h" );
+		std::stringstream ss; ss << f.rdbuf(); headers += ss.str();
+	}
+	for ( int i = 0; i < n; ++i ) {
+		counts[static_cast<int>( e[i].tier )]++;
+		for ( int j = i + 1; j < n; ++j ) {
+			if ( !std::strcmp( e[i].module, e[j].module ) && !std::strcmp( e[i].function, e[j].function ) ) {
+				std::printf( "duplicate entry %s::%s\n", e[i].module, e[i].function );
+				ok = false;
+			}
+		}
+		if ( headers.find( std::string( " " ) + e[i].function + "(" ) == std::string::npos && headers.find( std::string( "\t" ) + e[i].function + "(" ) == std::string::npos ) {
+			std::printf( "%s::%s is registered but no declaration was found\n", e[i].module, e[i].function );
+			ok = false;
+		}
+	}
+	std::printf( "backend %s: %d entries (portable %d, portable-pending %d, CUDA/SM70 %d)\n", ENGINE_BACKEND_NAME, n, counts[0], counts[1], counts[2] );
+	std::printf( ok ? "[+] tier registry OK\n" : "[-] tier registry FAIL\n" );
+	return ok ? 0 : 1;
+}

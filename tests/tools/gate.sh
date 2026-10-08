@@ -29,6 +29,8 @@ static_checks() {
 		local n=$(grep -rn "$pat" $ROOT/inc/engine/core $ROOT/inc/engine/runtime $ROOT/inc/engine/models 2>/dev/null | wc -l)
 		echo "headers naming $pat (core, runtime, models): $n"
 	done
+	echo "direct <cuda_*> includes in host-only files: $(grep -rln '#include <cuda_\|#include <cublas' $ROOT/inc/engine/core $ROOT/inc/engine/runtime $ROOT/inc/engine/models $ROOT/inc/engine/loader $ROOT/inc/engine/server $ROOT/src/models/*.cpp $ROOT/src/runtime $ROOT/src/loader $ROOT/src/server $ROOT/src/core 2>/dev/null | wc -l)"
+	echo "module/spec headers with <cuda_*> includes: $(grep -rln '#include <cuda_' $ROOT/inc/engine/modules $ROOT/inc/engine/spec 2>/dev/null | wc -l)"
 	echo "kernel launches in models: $(grep -c '<<<' $ROOT/src/models/*.cpp 2>/dev/null | tr '\n' ' ')"
 	ninja > $out/build.log 2>&1 || { echo "build FAILED"; bad=1; }
 	# Slang-generated SPIR-V must validate
@@ -43,6 +45,7 @@ tier2() {
 	done
 	# test_dflash prints a known FATAL in its geometry step (present before 2026-10-07); judged by its final line
 	run test_dflash sh -c "taskset -c 0-9 ./test_dflash | tail -3 | grep -q 'PASSED'"
+	run backend_tiers ./test_backend_tiers $ROOT
 	run coherence gpu ./test_coherence
 	run sampling_qwen gpu ./test_sampling_gpu
 	run sampling_glm gpu ./test_sampling_gpu --glm

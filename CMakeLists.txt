@@ -145,6 +145,10 @@ else()
 	message(STATUS "slangc not found: Slang kernels skipped")
 endif()
 
+# Capability registry check (host only)
+add_executable(test_backend_tiers tests/2_parity/test_backend_tiers.cpp)
+set_target_properties(test_backend_tiers PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 # Test Trellis Parity
 add_executable(test_trellis tests/2_parity/test_trellis.cpp)
 target_link_libraries(test_trellis PRIVATE engine_kernels)
