@@ -1,6 +1,5 @@
 #include "engine/runtime/kv_cache.h"
 #include "engine/backend/runtime.h"
-#include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,7 +34,7 @@ bool KVCachePool::init(
 	const pod::KVQ kq = pod::kv_k_quant( format ), vq = pod::kv_v_quant( format );
 
 	slot_stride_elems = static_cast<size_t>( num_layers ) * max_seq_len * num_heads * head_dim;
-	slot_stride_bytes = slot_stride_elems * sizeof( half );
+	slot_stride_bytes = slot_stride_elems * sizeof( backend::half_t );
 	k_slot_bytes = pod::kv_data_bytes( kq, slot_stride_elems );
 	v_slot_bytes = pod::kv_data_bytes( vq, slot_stride_elems );
 	k_scale_slot_bytes = pod::kv_scale_bytes( kq, slot_stride_elems );
@@ -74,7 +73,7 @@ void* KVCachePool::get_k_ptr( int slot_id, int layer_idx, int pos ) {
 	}
 	ENGINE_ASSERT( format == pod::KVFormat::FP16 || ( slot_id == 0 && layer_idx == 0 && pos == 0 ), "KVCachePool::get_k_ptr: base pointer only" );
 	const size_t elem = static_cast<size_t>( slot_id ) * slot_stride_elems + ( static_cast<size_t>( layer_idx ) * max_seq_len + pos ) * num_heads * head_dim;
-	return static_cast<char*>( k_data ) + elem * sizeof( half );
+	return static_cast<char*>( k_data ) + elem * sizeof( backend::half_t );
 }
 
 void* KVCachePool::get_v_ptr( int slot_id, int layer_idx, int pos ) {
@@ -83,7 +82,7 @@ void* KVCachePool::get_v_ptr( int slot_id, int layer_idx, int pos ) {
 	}
 	ENGINE_ASSERT( format == pod::KVFormat::FP16 || ( slot_id == 0 && layer_idx == 0 && pos == 0 ), "KVCachePool::get_v_ptr: base pointer only" );
 	const size_t elem = static_cast<size_t>( slot_id ) * slot_stride_elems + ( static_cast<size_t>( layer_idx ) * max_seq_len + pos ) * num_heads * head_dim;
-	return static_cast<char*>( v_data ) + elem * sizeof( half );
+	return static_cast<char*>( v_data ) + elem * sizeof( backend::half_t );
 }
 
 void KVCachePool::reset_slot( int slot_id, backend::stream_t stream ) {

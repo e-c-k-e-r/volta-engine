@@ -3,7 +3,6 @@
 #include "engine/config.h"
 #include "engine/core/tensor.h"
 #include "engine/backend/types.h"
-#include <cuda_fp16.h>
 
 namespace engine::modules {
 
@@ -17,7 +16,7 @@ struct HyperConnection {
 	);
 
 	static void init_streams(
-		const half* in,
+		const backend::half_t* in,
 		float* streams,
 		int hidden_size = 4096,
 		backend::stream_t stream = nullptr,
@@ -47,7 +46,7 @@ struct HyperConnection {
 		const float* fn,
 		const float* base,
 		const float* scale,
-		half* collapsed_out,
+		backend::half_t* collapsed_out,
 		float* post_out,
 		float* comb_out,
 		float* inv_rms_buf,
@@ -106,7 +105,7 @@ struct HyperConnection {
 
 	static void update(
 		float* streams,
-		const half* sublayer_out,
+		const backend::half_t* sublayer_out,
 		const float* post,
 		const float* comb,
 		int hidden_size = 4096,
@@ -117,7 +116,7 @@ struct HyperConnection {
 	static void update(
 		float* streams_out,
 		const float* streams_in,
-		const half* sublayer_out,
+		const backend::half_t* sublayer_out,
 		const float* post,
 		const float* comb,
 		int hidden_size = 4096,
@@ -146,7 +145,7 @@ struct HyperHead {
 
 	static void mean(
 		const float* streams,
-		half* final_hidden,
+		backend::half_t* final_hidden,
 		int hidden_size = 4096,
 		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]

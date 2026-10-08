@@ -4,7 +4,6 @@
 #include "engine/core/tensor.h"
 #include "engine/modules/trellis.h"
 #include "engine/modules/nvfp4.h"
-#include <cuda_fp16.h>
 #include "engine/backend/types.h"
 #include <cstdint>
 
@@ -81,9 +80,9 @@ namespace engine::modules {
 // by tests that need a backbone they can also evaluate on the CPU.
 struct LinearPlainGEMV {
 	static void forward(
-		const half* w,
-		const half* x,
-		half* out,
+		const backend::half_t* w,
+		const backend::half_t* x,
+		backend::half_t* out,
 		int m,
 		int n,
 		int k,
@@ -136,9 +135,9 @@ struct Linear {
 				// the product and produces plausible magnitudes -- it survived every gate, because
 				// test_f16_gemv_nt calls dflash_f16_gemv_nt directly and never went through here.
 				LinearPlainGEMV::forward(
-					weight.w0.ptr<const half>(),
-					x.ptr<const half>(),
-					out.ptr<half>(),
+					weight.w0.ptr<const backend::half_t>(),
+					x.ptr<const backend::half_t>(),
+					out.ptr<backend::half_t>(),
 					rows, n, k, stream
 				);
 			} break;

@@ -5,7 +5,6 @@
 #include "engine/core/batch.h"
 #include "engine/core/kv_format.h"
 #include "engine/backend/types.h"
-#include <cuda_fp16.h>
 
 namespace engine::modules {
 
