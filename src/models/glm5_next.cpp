@@ -1,4 +1,4 @@
-#include "engine/models/glm53_flash.h"
+#include "engine/models/glm5_next.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
@@ -60,14 +60,14 @@ pod::TensorView load_router_weights_glm(
 
 } // namespace impl
 
-GLM53Pipeline::GLM53Pipeline() = default;
+Glm5NextPipeline::Glm5NextPipeline() = default;
 
-GLM53Pipeline::~GLM53Pipeline() {
+Glm5NextPipeline::~Glm5NextPipeline() {
 	destroy();
 }
 
-bool GLM53Pipeline::init(
-	const GLM53Config& config,
+bool Glm5NextPipeline::init(
+	const Glm5NextConfig& config,
 	int rank,
 	pod::MemoryArena& arena,
 	engine::comm::CollectiveRing* ring
@@ -103,7 +103,7 @@ bool GLM53Pipeline::init(
 	state_.layer_kda_floats = static_cast<size_t>( config_.kda_heads ) * config_.kda_head_dim * config_.kda_head_dim;
 	state_.layer_conv_floats = static_cast<size_t>( config_.kda_channels ) * 3;
 	const int n_lin = config_.num_layers - config_.num_mla_layers;
-	ENGINE_ASSERT( config_.num_layers == 45 && n_lin == 34, "GLM53Pipeline: linear-layer indexing assumes 45 layers with every fourth MLA" );
+	ENGINE_ASSERT( config_.num_layers == 45 && n_lin == 34, "Glm5NextPipeline: linear-layer indexing assumes 45 layers with every fourth MLA" );
 	const size_t slot_kda = state_.layer_kda_floats * n_lin;
 	const size_t slot_conv = state_.layer_conv_floats * n_lin;
 	state_.slot_kda_floats = slot_kda;
@@ -152,10 +152,10 @@ bool GLM53Pipeline::init(
 	if ( latent_ ) {
 		latent_slot_stride_ = static_cast<size_t>( config_.num_mla_layers ) * config_.max_seq * 512;
 		latent_cache_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * latent_slot_stride_ * sizeof( backend::half_t ), 128 ) );
-		ENGINE_ASSERT( latent_cache_ != nullptr, "GLM53Pipeline::init: arena exhausted allocating the latent cache" );
+		ENGINE_ASSERT( latent_cache_ != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the latent cache" );
 		backend::memset_sync( latent_cache_, 0, static_cast<size_t>( S ) * latent_slot_stride_ * sizeof( backend::half_t ) );
 		latent_ws_ = static_cast<float*>( engine::core::arena_alloc( arena, engine::modules::MLALatent::workspace_floats( config_.max_seq, 16 ) * sizeof( float ), 128 ) );
-		ENGINE_ASSERT( latent_ws_ != nullptr, "GLM53Pipeline::init: arena exhausted allocating the latent workspace" );
+		ENGINE_ASSERT( latent_ws_ != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the latent workspace" );
 		int lat_shape[2] = { R, 16 * 512 };
 		q_lat_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lat_shape, 2 );
 		o_lat_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lat_shape, 2 );
@@ -174,7 +174,7 @@ bool GLM53Pipeline::init(
 			dsa_scores_ = halves( static_cast<size_t>( R ) * NP );
 			dsa_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * engine::modules::DSA::KPAD * sizeof( int ), 128 ) );
 			dsa_nk_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * sizeof( int ), 128 ) );
-			ENGINE_ASSERT( dsa_plane_ && dsa_pool_ && dsa_proj_ && dsa_w_ && dsa_q_ && dsa_scores_ && dsa_idx_ && dsa_nk_, "GLM53Pipeline::init: arena exhausted allocating the DSA state" );
+			ENGINE_ASSERT( dsa_plane_ && dsa_pool_ && dsa_proj_ && dsa_w_ && dsa_q_ && dsa_scores_ && dsa_idx_ && dsa_nk_, "Glm5NextPipeline::init: arena exhausted allocating the DSA state" );
 			backend::memset_sync( dsa_plane_, 0, static_cast<size_t>( S ) * dsa_plane_stride_ * sizeof( backend::half_t ) );
 			backend::memset_sync( dsa_pool_, 0, static_cast<size_t>( S ) * dsa_pool_stride_ * sizeof( backend::half_t ) );
 		}
@@ -229,7 +229,7 @@ bool GLM53Pipeline::init(
 
 	// 5. Logits & argmax: the LM head is vocabulary-parallel, every rank owns vocab_size / tp_size columns padded
 	// up to a multiple of 256 (so the dp4a int8 GEMV engages); lm_shard_real_cols_ excludes the pad
-	ENGINE_ASSERT( config_.vocab_size % 128 == 0, "GLM53Pipeline: vocab_size must be a multiple of 128" );
+	ENGINE_ASSERT( config_.vocab_size % 128 == 0, "Glm5NextPipeline: vocab_size must be a multiple of 128" );
 	lm_shard_real_cols_ = 128 * lm_shard_spans( config_.vocab_size, config_.tp_size, rank_ );
 	lm_shard_offset_ = lm_shard_offset( config_.vocab_size, config_.tp_size, rank_ );
 	{
@@ -314,8 +314,8 @@ bool GLM53Pipeline::init(
 	return true;
 }
 
-bool GLM53Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
-	GLM53Config config;
+bool Glm5NextPipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
+	Glm5NextConfig config;
 	// The expanded per-head cache costs 16x the latent: without the latent path the window defaults to 2K
 	if ( !runtime::options().mla_latent ) config.max_seq = 2048;
 	if ( runtime::options().max_seq > 0 ) config.max_seq = runtime::options().max_seq;  // context window (KV pool size)
@@ -323,7 +323,7 @@ bool GLM53Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::
 	return init( config, device_id, arena, ring );
 }
 
-bool GLM53Pipeline::rebalance_experts( backend::stream_t stream ) {
+bool Glm5NextPipeline::rebalance_experts( backend::stream_t stream ) {
 	if ( !tier_.active() ) return false;
 	backend::set_device( rank_ );
 	tier_.reset_window();
@@ -336,7 +336,7 @@ bool GLM53Pipeline::rebalance_experts( backend::stream_t stream ) {
 	return true;
 }
 
-bool GLM53Pipeline::expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset ) {
+bool Glm5NextPipeline::expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset ) {
 	backend::set_device( rank_ );
 	backend::device_sync();
 	layers = 0;
@@ -353,8 +353,8 @@ bool GLM53Pipeline::expert_heat( std::vector<uint32_t>& out, int& layers, int& e
 	return layers > 0;
 }
 
-void GLM53Pipeline::reset_state( int slot_id ) {
-	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "GLM53Pipeline::reset_state: slot out of range" );
+void Glm5NextPipeline::reset_state( int slot_id ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Glm5NextPipeline::reset_state: slot out of range" );
 	backend::set_device( rank_ );
 	if ( latent_ ) {
 		backend::memset_sync( latent_cache_ + static_cast<size_t>( slot_id ) * latent_slot_stride_, 0, latent_slot_stride_ * sizeof( backend::half_t ) );
@@ -368,8 +368,8 @@ void GLM53Pipeline::reset_state( int slot_id ) {
 	backend::memset_sync( state_.conv_history + slot_id * slot_conv, 0, slot_conv * sizeof( float ) );
 }
 
-void GLM53Pipeline::checkpoint_state( int slot_id, backend::stream_t stream ) {
-	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "GLM53Pipeline::checkpoint_state: slot out of range" );
+void Glm5NextPipeline::checkpoint_state( int slot_id, backend::stream_t stream ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Glm5NextPipeline::checkpoint_state: slot out of range" );
 	backend::set_device( rank_ );
 	const size_t slot_kda = state_.slot_kda_floats;
 	const size_t slot_conv = state_.slot_conv_floats;
@@ -377,8 +377,8 @@ void GLM53Pipeline::checkpoint_state( int slot_id, backend::stream_t stream ) {
 	backend::memcpy_async( state_.conv_checkpoint, state_.conv_history + slot_id * slot_conv, slot_conv * sizeof( float ), backend::Copy::D2D, stream );
 }
 
-void GLM53Pipeline::rollback_state( int slot_id, backend::stream_t stream ) {
-	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "GLM53Pipeline::rollback_state: slot out of range" );
+void Glm5NextPipeline::rollback_state( int slot_id, backend::stream_t stream ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Glm5NextPipeline::rollback_state: slot out of range" );
 	backend::set_device( rank_ );
 	const size_t slot_kda = state_.slot_kda_floats;
 	const size_t slot_conv = state_.slot_conv_floats;
@@ -386,7 +386,7 @@ void GLM53Pipeline::rollback_state( int slot_id, backend::stream_t stream ) {
 	backend::memcpy_async( state_.conv_history + slot_id * slot_conv, state_.conv_checkpoint, slot_conv * sizeof( float ), backend::Copy::D2D, stream );
 }
 
-bool GLM53Pipeline::load_weights( const char* model_dir, backend::stream_t stream ) {
+bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t stream ) {
 	size_t bytes_before = arena_->offset_bytes;
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) {
@@ -409,7 +409,7 @@ bool GLM53Pipeline::load_weights( const char* model_dir, backend::stream_t strea
 			const void* src = engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta );
 			if ( g_embed_table.data == nullptr ) {
 				void* host = backend::host_alloc_pinned( bytes, backend::Pin::MappedPortable );
-				ENGINE_ASSERT( host != nullptr, "GLM53Pipeline: pinned embedding table allocation failed" );
+				ENGINE_ASSERT( host != nullptr, "Glm5NextPipeline: pinned embedding table allocation failed" );
 				g_embed_table = pod::make_tensor_2d( host, pod::DType::BF16, config_.vocab_size, config_.hidden_size );
 			}
 			if ( src == nullptr ) { ++missing_count; }
@@ -517,7 +517,7 @@ bool GLM53Pipeline::load_weights( const char* model_dir, backend::stream_t strea
 				for ( int i = 0; i < 3; ++i ) {
 					std::snprintf( name_buf, sizeof( name_buf ), "%s.%s", pre, parts[i] );
 					const pod::TensorView part = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
-					ENGINE_ASSERT( part.data != nullptr && part.shape[0] == part_rows[i] && part.shape[1] == 4096, "GLM53Pipeline: indexer projection shape" );
+					ENGINE_ASSERT( part.data != nullptr && part.shape[0] == part_rows[i] && part.shape[1] == 4096, "Glm5NextPipeline: indexer projection shape" );
 					backend::memcpy_async( lw.idx_dense.ptr<backend::half_t>() + static_cast<size_t>( row0 ) * 4096, part.data, static_cast<size_t>( part_rows[i] ) * 4096 * sizeof( backend::half_t ), backend::Copy::D2D, stream );
 					row0 += part_rows[i];
 				}
@@ -553,13 +553,13 @@ bool GLM53Pipeline::load_weights( const char* model_dir, backend::stream_t strea
 					for ( int p = 0; p < 3; ++p ) {
 						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", L, start_expert, kinds[p] );
 						bytes[p] = repo.trellis_bytes( name_buf );
-						ENGINE_ASSERT( bytes[p] > 0, "GLM53Pipeline: expert codes not found for the tier" );
+						ENGINE_ASSERT( bytes[p] > 0, "Glm5NextPipeline: expert codes not found for the tier" );
 					}
 					tier_.configure( experts_per_rank, tier_fraction, bytes );
 					int moe_layers = 0;
 					for ( int ll = 0; ll < config_.num_layers; ++ll ) moe_layers += ( ll >= 3 ) ? 1 : 0;
 					const size_t host_bytes = static_cast<size_t>( moe_layers ) * tier_.cold_bytes_per_layer() + tier_.slot_bytes + 256;
-					ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "GLM53Pipeline: pinned expert tier allocation failed" );
+					ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "Glm5NextPipeline: pinned expert tier allocation failed" );
 					tier_.allocate_staging( host_arena_ );
 				}
 				std::vector<int> resident_set( tier_.resident );
@@ -703,8 +703,8 @@ bool GLM53Pipeline::load_weights( const char* model_dir, backend::stream_t strea
 	return true;
 }
 
-void GLM53Pipeline::embed_tokens( const int* token_ids, int count, backend::stream_t stream ) {
-	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_ROWS, "GLM53Pipeline::embed_tokens: count out of range" );
+void Glm5NextPipeline::embed_tokens( const int* token_ids, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_ROWS, "Glm5NextPipeline::embed_tokens: count out of range" );
 	backend::set_device( rank_ );
 	set_rows( count );
 	// Rank 0 hosts the vocabulary table; other ranks contribute zeros to the all-reduce broadcast
@@ -720,7 +720,7 @@ void GLM53Pipeline::embed_tokens( const int* token_ids, int count, backend::stre
 	}
 }
 
-void GLM53Pipeline::set_rows( int m ) {
+void Glm5NextPipeline::set_rows( int m ) {
 	hidden_states_.shape[0] = m;
 	norm_hidden_.shape[0] = m;
 	mhc_collapsed_.shape[0] = m;
@@ -749,15 +749,15 @@ void GLM53Pipeline::set_rows( int m ) {
 	embed_rows_.shape[0] = m;
 }
 
-void GLM53Pipeline::sample_tokens( int* out_preds, int count, backend::stream_t stream ) {
+void Glm5NextPipeline::sample_tokens( int* out_preds, int count, backend::stream_t stream ) {
 	(void) out_preds;
 	(void) count;
 	(void) stream;
-	ENGINE_ASSERT( false, "GLM53Pipeline::sample_tokens: the vocabulary is sharded, use sample_local" );
+	ENGINE_ASSERT( false, "Glm5NextPipeline::sample_tokens: the vocabulary is sharded, use sample_local" );
 }
 
-bool GLM53Pipeline::sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream ) {
-	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "GLM53Pipeline::sample_local: count exceeds last forward rows" );
+bool Glm5NextPipeline::sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Glm5NextPipeline::sample_local: count exceeds last forward rows" );
 	backend::set_device( rank_ );
 	logits_.shape[0] = count;
 	// Scan only this rank's real columns: the pad block decodes to 0.0 and would beat a real negative logit.
@@ -776,8 +776,8 @@ bool GLM53Pipeline::sample_local( int* out_tokens, float* out_vals, int count, b
 	return true;
 }
 
-bool GLM53Pipeline::topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream ) {
-	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "GLM53Pipeline::topk_local: count exceeds last forward rows" );
+bool Glm5NextPipeline::topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Glm5NextPipeline::topk_local: count exceeds last forward rows" );
 	backend::set_device( rank_ );
 	// Real columns only (pad columns decode to 0.0), global ids via the shard offset
 	engine::spec::dflash2_topk_shard(
@@ -789,15 +789,15 @@ bool GLM53Pipeline::topk_local( float* out_vals, int* out_ids, int count, backen
 	return true;
 }
 
-const pod::TensorView& GLM53Pipeline::gather_logits(
+const pod::TensorView& Glm5NextPipeline::gather_logits(
 	int rows,
 	const backend::half_t* const* peer_shard_ptrs,
 	int peer_shard_cols,
 	backend::stream_t stream
 ) {
-	ENGINE_ASSERT( rank_ == 0, "GLM53Pipeline::gather_logits: only rank 0 materializes the full vocabulary" );
-	ENGINE_ASSERT( rows >= 1 && rows <= last_rows_, "GLM53Pipeline::gather_logits: rows exceeds last forward rows" );
-	ENGINE_ASSERT( peer_shard_cols == lm_shard_cols_, "GLM53Pipeline::gather_logits: shard width mismatch" );
+	ENGINE_ASSERT( rank_ == 0, "Glm5NextPipeline::gather_logits: only rank 0 materializes the full vocabulary" );
+	ENGINE_ASSERT( rows >= 1 && rows <= last_rows_, "Glm5NextPipeline::gather_logits: rows exceeds last forward rows" );
+	ENGINE_ASSERT( peer_shard_cols == lm_shard_cols_, "Glm5NextPipeline::gather_logits: shard width mismatch" );
 	full_logits_.shape[0] = rows;
 	// Row r of the gathered buffer is [shard 0 | shard 1 | ...]: source rows are lm_shard_cols_ apart (pad included),
 	// destination rows lm_shard_real_cols_ * tp apart
@@ -805,7 +805,7 @@ const pod::TensorView& GLM53Pipeline::gather_logits(
 		const size_t shard_elems = static_cast<size_t>( 128 * lm_shard_spans( config_.vocab_size, config_.tp_size, d ) );
 		const size_t shard_off = static_cast<size_t>( lm_shard_offset( config_.vocab_size, config_.tp_size, d ) );
 		const backend::half_t* src_base = ( d == rank_ ) ? logits_.ptr<const backend::half_t>() : peer_shard_ptrs[d];
-		ENGINE_ASSERT( src_base != nullptr, "GLM53Pipeline::gather_logits: missing peer shard pointer" );
+		ENGINE_ASSERT( src_base != nullptr, "Glm5NextPipeline::gather_logits: missing peer shard pointer" );
 		for ( int r = 0; r < rows; ++r ) {
 			const backend::half_t* src = src_base + static_cast<size_t>( r ) * lm_shard_cols_;
 			backend::half_t* dst = full_logits_.ptr<backend::half_t>() + static_cast<size_t>( r ) * config_.vocab_size + shard_off;
@@ -816,9 +816,9 @@ const pod::TensorView& GLM53Pipeline::gather_logits(
 }
 
 // Runs this rank's head shard over the drafter's hidden rows and leaves the local top-k in the hooks' cand buffers.
-void GLM53Pipeline::draft_head_topk( int rows, backend::stream_t stream ) {
-	ENGINE_ASSERT( weights_loaded_, "GLM53Pipeline::draft_head_topk: weights not loaded" );
-	ENGINE_ASSERT( rows >= 1 && rows <= kDraftM, "GLM53Pipeline::draft_head_topk: rows out of range" );
+void Glm5NextPipeline::draft_head_topk( int rows, backend::stream_t stream ) {
+	ENGINE_ASSERT( weights_loaded_, "Glm5NextPipeline::draft_head_topk: weights not loaded" );
+	ENGINE_ASSERT( rows >= 1 && rows <= kDraftM, "Glm5NextPipeline::draft_head_topk: rows out of range" );
 	backend::set_device( rank_ );
 	// All kDraftM rows, whatever `rows` is: the head's fast path only covers m in {1, 2, 4, 8}
 	pod::TensorView in = pod::make_tensor_2d( draft_hooks_.lm_in, pod::DType::FP16, kDraftM, config_.hidden_size );
@@ -829,27 +829,27 @@ void GLM53Pipeline::draft_head_topk( int rows, backend::stream_t stream ) {
 		draft_cand_part_v_, draft_cand_part_i_, draft_cand_counters_, stream );
 }
 
-void GLM53Pipeline::set_spec_snapshot( bool on, backend::stream_t stream ) {
+void Glm5NextPipeline::set_spec_snapshot( bool on, backend::stream_t stream ) {
 	backend::set_device( rank_ );
 	const int v = on ? 1 : 0;
 	backend::memcpy_async( state_.d_snap_on, &v, sizeof( int ), backend::Copy::H2D, stream );
 }
 
-void GLM53Pipeline::commit_spec_row( int slot_id, int row, backend::stream_t stream ) {
-	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "GLM53Pipeline::commit_spec_row: slot out of range" );
-	ENGINE_ASSERT( row >= 0 && row < kDraftM, "GLM53Pipeline::commit_spec_row: row out of range" );
+void Glm5NextPipeline::commit_spec_row( int slot_id, int row, backend::stream_t stream ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Glm5NextPipeline::commit_spec_row: slot out of range" );
+	ENGINE_ASSERT( row >= 0 && row < kDraftM, "Glm5NextPipeline::commit_spec_row: row out of range" );
 	backend::set_device( rank_ );
 	backend::memcpy_async( state_.kda_states + static_cast<size_t>( slot_id ) * state_.slot_kda_floats, state_.kda_snap + static_cast<size_t>( row ) * state_.slot_kda_floats, state_.slot_kda_floats * sizeof( float ), backend::Copy::D2D, stream );
 	backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, state_.conv_snap + static_cast<size_t>( row ) * state_.slot_conv_floats, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
 }
 
-void GLM53Pipeline::forward( const pod::BatchRows& rows, backend::stream_t stream ) {
-	ENGINE_ASSERT( weights_loaded_, "GLM53Pipeline::forward: weights not loaded" );
-	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_ROWS, "GLM53Pipeline::forward: row count out of range" );
+void Glm5NextPipeline::forward( const pod::BatchRows& rows, backend::stream_t stream ) {
+	ENGINE_ASSERT( weights_loaded_, "Glm5NextPipeline::forward: weights not loaded" );
+	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_ROWS, "Glm5NextPipeline::forward: row count out of range" );
 	backend::set_device( rank_ );
 	for ( int r = 0; r < rows.count; ++r ) {
-		ENGINE_ASSERT( rows.slot[r] >= 0 && rows.slot[r] < config_.max_slots, "GLM53Pipeline::forward: slot out of range" );
-		ENGINE_ASSERT( rows.pos[r] >= 0 && rows.pos[r] < config_.max_seq, "GLM53Pipeline::forward: position out of range" );
+		ENGINE_ASSERT( rows.slot[r] >= 0 && rows.slot[r] < config_.max_slots, "Glm5NextPipeline::forward: slot out of range" );
+		ENGINE_ASSERT( rows.pos[r] >= 0 && rows.pos[r] < config_.max_seq, "Glm5NextPipeline::forward: position out of range" );
 	}
 	const int m = rows.count;
 	key_hint_ = rows.pos[m - 1] + 1;
@@ -862,7 +862,7 @@ void GLM53Pipeline::forward( const pod::BatchRows& rows, backend::stream_t strea
 	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); } );
 }
 
-void GLM53Pipeline::forward_body( int m, backend::stream_t stream ) {
+void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 	// Slot-0 base pointers; slot and position of each row are resolved on device from d_rows_
 	const pod::KVRef kv = kv_pool_.ref();
 	const size_t kv_slot_stride = latent_ ? latent_slot_stride_ : kv_pool_.slot_stride_elems;
@@ -1233,7 +1233,7 @@ void GLM53Pipeline::forward_body( int m, backend::stream_t stream ) {
 	engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
 }
 
-void GLM53Pipeline::destroy() {
+void Glm5NextPipeline::destroy() {
 	if ( arena_ != nullptr ) {
 		backend::set_device( rank_ );
 		graphs_.reset();

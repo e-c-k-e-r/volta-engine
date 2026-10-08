@@ -21,7 +21,7 @@
 
 namespace engine::models {
 
-struct Qwen38Config {
+struct Qwen3_5Config {
 	int num_layers = 64;
 	int hidden_size = 5120;
 	int intermediate_size = 17408;
@@ -49,7 +49,7 @@ struct Qwen38Config {
 };
 
 // Per-rank recurrent state, laid out [slot][layer][...] so one slot is a contiguous block.
-struct Qwen38State {
+struct Qwen3_5State {
 	float* gdn_states = nullptr;      // [slots, 48, v_heads, col 128, row 128] FP32 (row fastest)
 	float* conv_history = nullptr;    // [slots, 48, channels, 3] FP32
 	float* gdn_checkpoint = nullptr;  // one-slot snapshot
@@ -63,7 +63,7 @@ struct Qwen38State {
 	size_t slot_conv_floats = 0;
 };
 
-struct Qwen38LayerWeights {
+struct Qwen3_5LayerWeights {
 	pod::TensorView input_norm;
 	pod::TensorView post_attn_norm;
 
@@ -96,15 +96,15 @@ struct Qwen38LayerWeights {
 	pod::LinearWeight down_proj;
 };
 
-class Qwen38Pipeline : public ModelPipeline {
+class Qwen3_5Pipeline : public ModelPipeline {
 public:
-	Qwen38Pipeline();
-	virtual ~Qwen38Pipeline() override;
+	Qwen3_5Pipeline();
+	virtual ~Qwen3_5Pipeline() override;
 
 	using ModelPipeline::forward;
 
 	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
-	bool init( const Qwen38Config& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
+	bool init( const Qwen3_5Config& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
 	bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) override;
 
 	void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) override;
@@ -161,11 +161,11 @@ private:
 	int last_rows_ = 0;
 
 	ModelMetadata metadata_;
-	Qwen38Config config_;
+	Qwen3_5Config config_;
 	int rank_ = 0;
 	pod::MemoryArena* arena_ = nullptr;
 	engine::comm::CollectiveRing* ring_ = nullptr;
-	Qwen38State state_;
+	Qwen3_5State state_;
 	bool weights_loaded_ = false;
 
 	backend::half_t* tapped_states_ = nullptr; // [MAX_BATCH, 5, hidden_size]
@@ -197,7 +197,7 @@ private:
 	pod::TensorView mlp_out_;
 
 	// Model level
-	Qwen38LayerWeights layers_[64];
+	Qwen3_5LayerWeights layers_[64];
 
 	// DFlash2 attachment (see DraftHooks): tap ring, head scratch and per-rank candidate top-k scratch.
 	DraftHooks draft_hooks_;

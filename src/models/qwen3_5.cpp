@@ -1,4 +1,4 @@
-#include "engine/models/qwen38_27b.h"
+#include "engine/models/qwen3_5.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #include "engine/loader/safetensors.h"
@@ -16,14 +16,14 @@
 
 namespace engine::models {
 
-Qwen38Pipeline::Qwen38Pipeline() = default;
+Qwen3_5Pipeline::Qwen3_5Pipeline() = default;
 
-Qwen38Pipeline::~Qwen38Pipeline() {
+Qwen3_5Pipeline::~Qwen3_5Pipeline() {
 	destroy();
 }
 
-bool Qwen38Pipeline::init(
-	const Qwen38Config& config,
+bool Qwen3_5Pipeline::init(
+	const Qwen3_5Config& config,
 	int rank,
 	pod::MemoryArena& arena,
 	engine::comm::CollectiveRing* ring
@@ -37,7 +37,7 @@ bool Qwen38Pipeline::init(
 	backend::set_device( rank_ );
 
 	const int tp_size = ( ring_ != nullptr ) ? requested_tp_ : 1;
-	ENGINE_ASSERT( tp_size == 1 || tp_size == 4, "Qwen38Pipeline: the grouped weight shards are laid out for 4 ranks" );
+	ENGINE_ASSERT( tp_size == 1 || tp_size == 4, "Qwen3_5Pipeline: the grouped weight shards are laid out for 4 ranks" );
 	tp_ranks_ = tp_size;
 	tp_size_ = tp_size;
 	q_heads_ = config_.full_num_q_heads / tp_size;
@@ -230,23 +230,23 @@ bool Qwen38Pipeline::init(
 	return true;
 }
 
-bool Qwen38Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
-	Qwen38Config config;
+bool Qwen3_5Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
+	Qwen3_5Config config;
 	if ( runtime::options().max_seq > 0 ) config.max_seq = runtime::options().max_seq;  // context window (KV pool size)
 	if ( runtime::options().max_slots > 0 ) config.max_slots = runtime::options().max_slots;
 	return init( config, device_id, arena, ring );
 }
 
 
-void Qwen38Pipeline::reset_state( int slot_id ) {
-	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen38Pipeline::reset_state: slot out of range" );
+void Qwen3_5Pipeline::reset_state( int slot_id ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen3_5Pipeline::reset_state: slot out of range" );
 	backend::set_device( rank_ );
 	kv_pool_.reset_slot( slot_id );
 	backend::memset_sync( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, 0, state_.slot_gdn_floats * sizeof( float ) );
 	backend::memset_sync( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, 0, state_.slot_conv_floats * sizeof( float ) );
 }
 
-bool Qwen38Pipeline::load_weights( const char* model_dir, backend::stream_t stream ) {
+bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t stream ) {
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) {
 		std::printf( "    [loader] FAILED to open model directory %s\n", model_dir );
@@ -266,7 +266,7 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, backend::stream_t stre
 
 	// 3. LM Head, sharded across the vocabulary dimension
 	if ( fp4 ) {
-		ENGINE_ASSERT( tp_size_ > 1 || tp_ranks_ == 1, "Qwen38Pipeline: the NVFP4 checkpoint needs the vocabulary-parallel head" );
+		ENGINE_ASSERT( tp_size_ > 1 || tp_ranks_ == 1, "Qwen3_5Pipeline: the NVFP4 checkpoint needs the vocabulary-parallel head" );
 		lm_head_ = repo.load_dense_rows_padded( "lm_head.weight", *arena_, rank_ * lm_shard_real_cols_, lm_shard_real_cols_,
 			lm_shard_cols_ - lm_shard_real_cols_, stream );
 	}
@@ -400,7 +400,7 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, backend::stream_t stre
 	return true;
 }
 
-void Qwen38Pipeline::set_rows( int m ) {
+void Qwen3_5Pipeline::set_rows( int m ) {
 	hidden_states_.shape[0] = m;
 	norm_hidden_.shape[0] = m;
 	q_gate_buf_.shape[0] = m;
@@ -419,8 +419,8 @@ void Qwen38Pipeline::set_rows( int m ) {
 	if ( logits_.data ) logits_.shape[0] = m;
 }
 
-void Qwen38Pipeline::embed_tokens( const int* token_ids, int count, backend::stream_t stream ) {
-	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_ROWS, "Qwen38Pipeline::embed_tokens: count out of range" );
+void Qwen3_5Pipeline::embed_tokens( const int* token_ids, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_ROWS, "Qwen3_5Pipeline::embed_tokens: count out of range" );
 	backend::set_device( rank_ );
 	// Pageable H2D: the source is staged before return, so the caller's array may be reused immediately
 	backend::memcpy_async( d_token_ids_, token_ids, count * sizeof( int ), backend::Copy::H2D, stream );
@@ -428,9 +428,9 @@ void Qwen38Pipeline::embed_tokens( const int* token_ids, int count, backend::str
 	engine::modules::Embedding::forward( embed_tokens_, d_token_ids_, count, hidden_states_, stream );
 }
 
-void Qwen38Pipeline::sample_tokens( int* out_preds, int count, backend::stream_t stream ) {
-	ENGINE_ASSERT( tp_size_ == 1, "Qwen38Pipeline::sample_tokens: vocabulary is sharded, use sample_local" );
-	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen38Pipeline::sample_tokens: count exceeds last forward rows" );
+void Qwen3_5Pipeline::sample_tokens( int* out_preds, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( tp_size_ == 1, "Qwen3_5Pipeline::sample_tokens: vocabulary is sharded, use sample_local" );
+	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen3_5Pipeline::sample_tokens: count exceeds last forward rows" );
 	backend::set_device( rank_ );
 	logits_.shape[0] = count;
 	engine::modules::Elementwise::batched_argmax( logits_, d_argmax_idx_, lm_shard_cols_, count, stream );
@@ -439,9 +439,9 @@ void Qwen38Pipeline::sample_tokens( int* out_preds, int count, backend::stream_t
 	std::memcpy( out_preds, h_argmax_idx_, count * sizeof( int ) );
 }
 
-bool Qwen38Pipeline::sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream ) {
+bool Qwen3_5Pipeline::sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream ) {
 	if ( tp_size_ <= 1 ) return false;   // single-rank head: the caller samples on rank 0
-	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen38Pipeline::sample_local: count exceeds last forward rows" );
+	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen3_5Pipeline::sample_local: count exceeds last forward rows" );
 	backend::set_device( rank_ );
 	logits_.shape[0] = count;
 	// Scan only this rank's real columns: the pad block decodes to 0.0 and would beat a real negative
@@ -467,9 +467,9 @@ bool Qwen38Pipeline::sample_local( int* out_tokens, float* out_vals, int count, 
 	return true;
 }
 
-bool Qwen38Pipeline::topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream ) {
+bool Qwen3_5Pipeline::topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream ) {
 	if ( tp_size_ <= 1 ) return false;
-	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen38Pipeline::topk_local: count exceeds last forward rows" );
+	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen3_5Pipeline::topk_local: count exceeds last forward rows" );
 	backend::set_device( rank_ );
 	// Real columns only (pad columns decode to 0.0), global ids via the shard offset.
 	engine::spec::dflash2_topk_shard(
@@ -482,18 +482,18 @@ bool Qwen38Pipeline::topk_local( float* out_vals, int* out_ids, int count, backe
 	return true;
 }
 
-const pod::TensorView& Qwen38Pipeline::gather_logits(
+const pod::TensorView& Qwen3_5Pipeline::gather_logits(
 	int rows,
 	const backend::half_t* const* peer_shard_ptrs,
 	int peer_shard_cols,
 	backend::stream_t stream
 ) {
-	ENGINE_ASSERT( tp_size_ == 1 || rank_ == 0, "Qwen38Pipeline::gather_logits: only rank 0 materializes the full vocabulary" );
+	ENGINE_ASSERT( tp_size_ == 1 || rank_ == 0, "Qwen3_5Pipeline::gather_logits: only rank 0 materializes the full vocabulary" );
 	if ( tp_size_ == 1 ) {
 		return logits_;
 	}
-	ENGINE_ASSERT( rows >= 1 && rows <= last_rows_, "Qwen38Pipeline::gather_logits: rows exceeds last forward rows" );
-	ENGINE_ASSERT( peer_shard_cols == lm_shard_cols_, "Qwen38Pipeline::gather_logits: shard width mismatch" );
+	ENGINE_ASSERT( rows >= 1 && rows <= last_rows_, "Qwen3_5Pipeline::gather_logits: rows exceeds last forward rows" );
+	ENGINE_ASSERT( peer_shard_cols == lm_shard_cols_, "Qwen3_5Pipeline::gather_logits: shard width mismatch" );
 
 	full_logits_.shape[0] = rows;
 	// Row r of the gathered buffer is [shard 0 | shard 1 | ...], so each row needs one copy per rank:
@@ -502,7 +502,7 @@ const pod::TensorView& Qwen38Pipeline::gather_logits(
 	const size_t shard_elems = static_cast<size_t>( lm_shard_real_cols_ );
 	for ( int d = 0; d < tp_ranks_; ++d ) {
 		const backend::half_t* src_base = ( d == rank_ ) ? logits_.ptr<const backend::half_t>() : peer_shard_ptrs[d];
-		ENGINE_ASSERT( src_base != nullptr, "Qwen38Pipeline::gather_logits: missing peer shard pointer" );
+		ENGINE_ASSERT( src_base != nullptr, "Qwen3_5Pipeline::gather_logits: missing peer shard pointer" );
 		for ( int r = 0; r < rows; ++r ) {
 			const backend::half_t* src = src_base + static_cast<size_t>( r ) * lm_shard_cols_;
 			backend::half_t* dst = full_logits_.ptr<backend::half_t>() + ( static_cast<size_t>( r ) * tp_ranks_ + d ) * shard_elems;
@@ -514,9 +514,9 @@ const pod::TensorView& Qwen38Pipeline::gather_logits(
 
 // Runs this rank's head shard over the drafter's hidden rows and leaves the local top-k in the hooks'
 // cand buffers. Not a target forward: the rows are the drafter's, with no slot or position.
-void Qwen38Pipeline::draft_head_topk( int rows, backend::stream_t stream ) {
-	ENGINE_ASSERT( weights_loaded_, "Qwen38Pipeline::draft_head_topk: weights not loaded" );
-	ENGINE_ASSERT( rows >= 1 && rows <= kDraftM, "Qwen38Pipeline::draft_head_topk: rows out of range" );
+void Qwen3_5Pipeline::draft_head_topk( int rows, backend::stream_t stream ) {
+	ENGINE_ASSERT( weights_loaded_, "Qwen3_5Pipeline::draft_head_topk: weights not loaded" );
+	ENGINE_ASSERT( rows >= 1 && rows <= kDraftM, "Qwen3_5Pipeline::draft_head_topk: rows out of range" );
 	backend::set_device( rank_ );
 	const int H = config_.hidden_size;
 	// All kDraftM rows, whatever `rows` is: the head's fast path only covers m in {1, 2, 4, 8}, and any
@@ -531,12 +531,12 @@ void Qwen38Pipeline::draft_head_topk( int rows, backend::stream_t stream ) {
 		draft_cand_part_v_, draft_cand_part_i_, draft_cand_counters_, stream );
 }
 
-void Qwen38Pipeline::forward( const pod::BatchRows& rows, backend::stream_t stream ) {
-	ENGINE_ASSERT( weights_loaded_, "Qwen38Pipeline::forward: weights not loaded" );
-	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_ROWS, "Qwen38Pipeline::forward: row count out of range" );
+void Qwen3_5Pipeline::forward( const pod::BatchRows& rows, backend::stream_t stream ) {
+	ENGINE_ASSERT( weights_loaded_, "Qwen3_5Pipeline::forward: weights not loaded" );
+	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_ROWS, "Qwen3_5Pipeline::forward: row count out of range" );
 	for ( int r = 0; r < rows.count; ++r ) {
-		ENGINE_ASSERT( rows.slot[r] >= 0 && rows.slot[r] < config_.max_slots, "Qwen38Pipeline::forward: slot out of range" );
-		ENGINE_ASSERT( rows.pos[r] >= 0 && rows.pos[r] < config_.max_seq, "Qwen38Pipeline::forward: position out of range" );
+		ENGINE_ASSERT( rows.slot[r] >= 0 && rows.slot[r] < config_.max_slots, "Qwen3_5Pipeline::forward: slot out of range" );
+		ENGINE_ASSERT( rows.pos[r] >= 0 && rows.pos[r] < config_.max_seq, "Qwen3_5Pipeline::forward: position out of range" );
 	}
 	backend::set_device( rank_ );
 	const int m = rows.count;
@@ -560,7 +560,7 @@ void Qwen38Pipeline::forward( const pod::BatchRows& rows, backend::stream_t stre
 	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); }, attn_tc_ ? 1 : 0 );
 }
 
-void Qwen38Pipeline::forward_body( int m, backend::stream_t stream ) {
+void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 	const pod::KVRef kv = kv_pool_.ref();
 	const size_t kv_slot_stride = kv_pool_.slot_stride_elems;
 
@@ -804,7 +804,7 @@ void Qwen38Pipeline::forward_body( int m, backend::stream_t stream ) {
 	}
 }
 
-void Qwen38Pipeline::destroy() {
+void Qwen3_5Pipeline::destroy() {
 	if ( arena_ != nullptr ) {
 		backend::set_device( rank_ );
 		graphs_.reset();
@@ -815,8 +815,8 @@ void Qwen38Pipeline::destroy() {
 	}
 }
 
-void Qwen38Pipeline::checkpoint_state( int slot_id, backend::stream_t stream ) {
-	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen38Pipeline::checkpoint_state: slot out of range" );
+void Qwen3_5Pipeline::checkpoint_state( int slot_id, backend::stream_t stream ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen3_5Pipeline::checkpoint_state: slot out of range" );
 	backend::set_device( rank_ );
 	const size_t offset_gdn = static_cast<size_t>( slot_id ) * state_.slot_gdn_floats;
 	const size_t offset_conv = static_cast<size_t>( slot_id ) * state_.slot_conv_floats;
@@ -824,8 +824,8 @@ void Qwen38Pipeline::checkpoint_state( int slot_id, backend::stream_t stream ) {
 	backend::memcpy_async( state_.conv_checkpoint, state_.conv_history + offset_conv, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
 }
 
-void Qwen38Pipeline::rollback_state( int slot_id, backend::stream_t stream ) {
-	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen38Pipeline::rollback_state: slot out of range" );
+void Qwen3_5Pipeline::rollback_state( int slot_id, backend::stream_t stream ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen3_5Pipeline::rollback_state: slot out of range" );
 	backend::set_device( rank_ );
 	const size_t offset_gdn = static_cast<size_t>( slot_id ) * state_.slot_gdn_floats;
 	const size_t offset_conv = static_cast<size_t>( slot_id ) * state_.slot_conv_floats;
@@ -833,16 +833,16 @@ void Qwen38Pipeline::rollback_state( int slot_id, backend::stream_t stream ) {
 	backend::memcpy_async( state_.conv_history + offset_conv, state_.conv_checkpoint, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
 }
 
-void Qwen38Pipeline::set_spec_snapshot( bool on, backend::stream_t stream ) {
+void Qwen3_5Pipeline::set_spec_snapshot( bool on, backend::stream_t stream ) {
 	backend::set_device( rank_ );
 	const int v = on ? 1 : 0;
 	// Pageable source: staged before return, so a stack value is fine.
 	backend::memcpy_async( state_.d_snap_on, &v, sizeof( int ), backend::Copy::H2D, stream );
 }
 
-void Qwen38Pipeline::commit_spec_row( int slot_id, int row, backend::stream_t stream ) {
-	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen38Pipeline::commit_spec_row: slot out of range" );
-	ENGINE_ASSERT( row >= 0 && row < kDraftM, "Qwen38Pipeline::commit_spec_row: row out of range" );
+void Qwen3_5Pipeline::commit_spec_row( int slot_id, int row, backend::stream_t stream ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen3_5Pipeline::commit_spec_row: slot out of range" );
+	ENGINE_ASSERT( row >= 0 && row < kDraftM, "Qwen3_5Pipeline::commit_spec_row: row out of range" );
 	backend::set_device( rank_ );
 	backend::memcpy_async( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, state_.gdn_snap + static_cast<size_t>( row ) * state_.slot_gdn_floats, state_.slot_gdn_floats * sizeof( float ), backend::Copy::D2D, stream );
 	backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, state_.conv_snap + static_cast<size_t>( row ) * state_.slot_conv_floats, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );

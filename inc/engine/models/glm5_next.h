@@ -22,7 +22,7 @@
 
 namespace engine::models {
 
-struct GLM53Config {
+struct Glm5NextConfig {
 	int num_layers = 45;
 	int hidden_size = 4096;
 	int intermediate_size = 2048; // per expert
@@ -46,7 +46,7 @@ struct GLM53Config {
 };
 
 // Per-rank recurrent state laid out [slot][layer][...] so one slot is contiguous.
-struct GLM53State {
+struct Glm5NextState {
 	float* kda_states = nullptr;      // [slots, 45, heads, 128, 128] FP32
 	float* conv_history = nullptr;    // [slots, 45, channels, 3] FP32
 	float* kda_snap = nullptr;        // [kDraftM, 45, heads, 128, 128] per-row post-state (speculative verify)
@@ -63,13 +63,13 @@ struct GLM53State {
 	pod::MoEScratch moe;
 };
 
-struct GLM53ExpertWeights {
+struct Glm5NextExpertWeights {
 	pod::LinearWeight gate;
 	pod::LinearWeight up;
 	pod::LinearWeight down;
 };
 
-struct GLM53LayerWeights {
+struct Glm5NextLayerWeights {
 	bool is_moe = false;
 	bool is_linear_attn = false;
 	bool is_mla = false;
@@ -113,14 +113,14 @@ struct GLM53LayerWeights {
 	pod::LinearWeight o_proj;
 
 	// Dense MLP (layers 0, 1, 2)
-	GLM53ExpertWeights dense_mlp;
+	Glm5NextExpertWeights dense_mlp;
 
 	// 72 local routed experts for this rank: rank * 72 .. (rank + 1) * 72 - 1
 	pod::MoELayerWeights moe_weights;
 
 	// Shared expert
 	bool has_shared_expert = false;
-	GLM53ExpertWeights shared_expert;
+	Glm5NextExpertWeights shared_expert;
 
 	// mHC (Manifold-Constrained Hyper-Connections)
 	pod::TensorView hc_attn_base;
@@ -132,15 +132,15 @@ struct GLM53LayerWeights {
 	pod::TensorView hc_ffn_fn;
 };
 
-class GLM53Pipeline : public ModelPipeline {
+class Glm5NextPipeline : public ModelPipeline {
 public:
-	GLM53Pipeline();
-	virtual ~GLM53Pipeline() override;
+	Glm5NextPipeline();
+	virtual ~Glm5NextPipeline() override;
 
 	using ModelPipeline::forward;
 
 	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
-	bool init( const GLM53Config& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
+	bool init( const Glm5NextConfig& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
 	bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) override;
 
 	void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) override;
@@ -221,11 +221,11 @@ private:
 	int key_hint_ = 0;   // keys the current chunk can attend to; sizes the prefill attention split only
 
 	ModelMetadata metadata_;
-	GLM53Config config_;
+	Glm5NextConfig config_;
 	int rank_ = 0;
 	pod::MemoryArena* arena_ = nullptr;
 	engine::comm::CollectiveRing* ring_ = nullptr;
-	GLM53State state_;
+	Glm5NextState state_;
 	bool weights_loaded_ = false;
 
 	// DFlash2 attachment (see DraftHooks): tap ring, head scratch and per-rank candidate top-k scratch
@@ -281,7 +281,7 @@ private:
 	pod::TensorView ffn_out_;
 
 	// Model level
-	GLM53LayerWeights layers_[45];
+	Glm5NextLayerWeights layers_[45];
 	pod::TensorView embed_tokens_;
 	pod::TensorView final_norm_;
 	pod::LinearWeight lm_head_;
