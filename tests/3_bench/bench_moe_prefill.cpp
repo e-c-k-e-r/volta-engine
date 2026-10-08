@@ -44,6 +44,24 @@ int main( int argc, char** argv ) {
 	std::printf( "[*] experts: bits g/u/d = %d/%d/%d, mul1 g/u/d = %d/%d/%d\n",
 		mw.gate[0].bits, mw.up[0].bits, mw.down[0].bits, mw.gate[0].mul1, mw.up[0].mul1, mw.down[0].mul1 );
 
+	// Reference: the dense decode kernels on one expert matrix (gate: 4096 -> 2048, 3 bit), rows 1..16
+	for ( int Rg : { 1, 4, 8, 16 } ) {
+		int xs[2] = { Rg, H }, ys[2] = { Rg, I };
+		auto xg = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, xs, 2 );
+		auto yg = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ys, 2 );
+		CUDA_CHECK( cudaMemset( xg.data, 0x3c, static_cast<size_t>( Rg ) * H * 2 ) );
+		cudaEvent_t g0, g1;
+		CUDA_CHECK( cudaEventCreate( &g0 ) );
+		CUDA_CHECK( cudaEventCreate( &g1 ) );
+		for ( int it = 0; it < 3; ++it ) engine::modules::Linear::forward( xg, mw.gate[0], yg, stream );
+		CUDA_CHECK( cudaEventRecord( g0, stream ) );
+		for ( int it = 0; it < 50; ++it ) engine::modules::Linear::forward( xg, mw.gate[it % E], yg, stream );
+		CUDA_CHECK( cudaEventRecord( g1, stream ) );
+		CUDA_CHECK( cudaEventSynchronize( g1 ) );
+		float gms = 0.0f;
+		CUDA_CHECK( cudaEventElapsedTime( &gms, g0, g1 ) );
+		std::printf( "  dense Linear::forward on an expert gate matrix, %2d rows: %.1f us (%.0f GB/s of 3.2 MB)\n", Rg, gms * 1000.0f / 50.0f, 3.1e6 / ( gms * 1000.0f / 50.0f ) * 1e-3 );
+	}
 	std::vector<int> row_list;
 	for ( int i = 1; i < argc; ++i ) row_list.push_back( std::atoi( argv[i] ) );
 	if ( row_list.empty() ) row_list = { 16, 64, 128, 256, 512 };
