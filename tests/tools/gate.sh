@@ -1,0 +1,106 @@
+#!/bin/zsh
+# Regression gate for refactors. Modes (GPU modes serialize: one job at a time, run under taskset -c 0-9):
+#   static          no GPU: header hygiene greps (backend abstraction) and a full build
+#   parity          GPU: tier 2 parity tests + coherence + sampling gate
+#   bench           GPU: bench_decode / bench_accept / bench_prefill for both models
+#   needle          GPU: 8K needle retrieval, greedy and speculative, both models
+#   baseline <tag>  GPU: parity + bench + needle, bench numbers saved to results/baseline_<tag>.txt
+#   compare <tag>   GPU: bench again and diff against results/baseline_<tag>.txt (flags > 1% regressions)
+# Logs go to results/gate_<mode>_<timestamp>/ (gitignored).
+set -u
+ROOT=${0:A:h:h:h}
+cd $ROOT/build || exit 2
+mode=${1:-static}
+tag=${2:-}
+stamp=$(date +%Y%m%d_%H%M%S)
+out=$ROOT/results/gate_${mode}_$stamp
+mkdir -p $out $ROOT/results
+fails=0
+run() { # name, command...
+	local name=$1; shift
+	if "$@" > $out/$name.log 2>&1; then echo "[ok]   $name"; else echo "[FAIL] $name (see $out/$name.log)"; fails=$((fails+1)); fi
+}
+gpu() { taskset -c 0-9 "$@"; }
+
+static_checks() {
+	local bad=0
+	# Headers that the host-only translation units include must not name CUDA types once the backend layer exists
+	for pat in cudaStream_t cuda_runtime.h; do
+		local n=$(grep -rn "$pat" $ROOT/inc/engine/core $ROOT/inc/engine/runtime $ROOT/inc/engine/models 2>/dev/null | wc -l)
+		echo "headers naming $pat (core, runtime, models): $n"
+	done
+	echo "kernel launches in models: $(grep -c '<<<' $ROOT/src/models/*.cu $ROOT/src/models/*.cpp 2>/dev/null | tr '\n' ' ')"
+	ninja > $out/build.log 2>&1 || { echo "build FAILED"; bad=1; }
+	return $bad
+}
+
+tier2() {
+	for t in test_trellis test_gemv_int8 test_mhc test_attention test_attention_prefill test_mla test_dsa test_gdn test_rows \
+		test_norm test_rope test_kv_quant test_all_reduce test_moe test_nvfp4_linear test_prefill_linear test_sampling test_mla_latent test_spec_state; do
+		run $t gpu ./$t
+	done
+	# test_dflash prints a known FATAL in its geometry step (present before 2026-10-07); judged by its final line
+	run test_dflash sh -c "taskset -c 0-9 ./test_dflash | tail -3 | grep -q 'PASSED'"
+	run coherence gpu ./test_coherence
+	run sampling_qwen gpu ./test_sampling_gpu
+	run sampling_glm gpu ./test_sampling_gpu --glm
+}
+
+benches() {
+	local f=$out/bench_numbers.txt; : > $f
+	for m in "" "--glm"; do
+		run bench_decode$m gpu ./bench_decode $m
+		grep -E "M=1 |Mode A|Mode B" $out/bench_decode$m.log | sed "s/^/decode$m: /" >> $f
+	done
+	run bench_accept gpu ./bench_accept
+	grep -E "regime|tok/s" $out/bench_accept.log | tail -3 | sed 's/^/accept: /' >> $f
+	run bench_prefill_qwen gpu ./bench_prefill 2048 512
+	grep chunk $out/bench_prefill_qwen.log | sed 's/^/prefill qwen: /' >> $f
+	BENCH_GLM=1 run bench_prefill_glm gpu ./bench_prefill 2048 512
+	grep chunk $out/bench_prefill_glm.log | sed 's/^/prefill glm: /' >> $f
+	echo "SASS HMMA count (>= 30000): $(cuobjdump -sass ./volta_server 2>/dev/null | grep -c HMMA)" >> $f
+}
+
+needles() {
+	run needle_qwen gpu ./test_longctx --tokens 8000 --depth 50
+	run needle_qwen_spec gpu ./test_longctx --spec --tokens 8000 --depth 70
+	run needle_glm gpu ./test_longctx --glm --tokens 8000 --depth 50
+	run needle_glm_spec gpu ./test_longctx --glm --spec --tokens 8000 --depth 30
+}
+
+case $mode in
+	static) static_checks || fails=$((fails+1)) ;;
+	parity) tier2 ;;
+	bench) benches; cat $out/bench_numbers.txt ;;
+	needle) needles ;;
+	baseline)
+		[[ -n $tag ]] || { echo "usage: gate.sh baseline <tag>"; exit 2; }
+		tier2; needles; benches
+		cp $out/bench_numbers.txt $ROOT/results/baseline_$tag.txt; echo "saved results/baseline_$tag.txt" ;;
+	compare)
+		[[ -f $ROOT/results/baseline_$tag.txt ]] || { echo "no baseline $tag"; exit 2; }
+		benches
+		python3 -I - $ROOT/results/baseline_$tag.txt $out/bench_numbers.txt <<'PY'
+import re, sys
+def load(p):
+	d = {}
+	for line in open(p):
+		m = re.match(r"(.*?):\s*(.*?)\s*:\s*([0-9.]+) ms", line)
+		if m: d[(m.group(1), m.group(2))] = float(m.group(3))
+	return d
+a, b = load(sys.argv[1]), load(sys.argv[2])
+bad = 0
+for k in sorted(a):
+	if k in b:
+		r = b[k] / a[k] - 1
+		flag = "REGRESSION" if r > 0.01 else "ok"
+		bad += flag == "REGRESSION"
+		print(f"{k[0]} {k[1]}: {a[k]:.2f} -> {b[k]:.2f} ms ({r*100:+.1f}%) {flag}")
+sys.exit(1 if bad else 0)
+PY
+		[[ $? -eq 0 ]] || fails=$((fails+1)) ;;
+	*) echo "unknown mode $mode"; exit 2 ;;
+esac
+echo "gate $mode: $fails failure(s); logs in $out"
+nvidia-smi --query-gpu=memory.used --format=csv,noheader | tr '\n' ' '; echo
+exit $((fails > 0))
