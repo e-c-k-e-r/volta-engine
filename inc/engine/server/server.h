@@ -44,6 +44,7 @@ private:
 	void handle_metrics( const ConnPtr& conn );
 	void handle_models( const ConnPtr& conn );
 	void handle_chat( const ConnPtr& conn, const Request& req, ChatProtocol& protocol );
+	void handle_count_tokens( const ConnPtr& conn, const Request& req, ChatProtocol& protocol );
 
 	ServerConfig config_;
 	int listen_fd_ = -1;

@@ -248,6 +248,10 @@ void VoltaServer::dispatch( const ConnPtr& conn, const Request& req ) {
 		if ( !post ) return send_error( conn, 405, "invalid_request_error", "use POST", true );
 		return handle_chat( conn, req, *anthropic_ );
 	}
+	if ( req.path == "/v1/messages/count_tokens" && anthropic_ ) {
+		if ( !post ) return send_error( conn, 405, "invalid_request_error", "use POST", true );
+		return handle_count_tokens( conn, req, *anthropic_ );
+	}
 	send_error( conn, 404, "not_found_error", "unknown endpoint " + req.method + " " + req.path );
 }
 
@@ -286,6 +290,16 @@ void VoltaServer::handle_chat( const ConnPtr& conn, const Request& req, ChatProt
 	if ( !start_chat( *generator_, config_, std::move( cr ), id, std::move( responder ), conn, &err ) ) {
 		send_error( conn, err.status, err.type, err.message, anthropic );
 	}
+}
+
+void VoltaServer::handle_count_tokens( const ConnPtr& conn, const Request& req, ChatProtocol& protocol ) {
+	ChatRequest cr;
+	ApiError err;
+	int tokens = 0;
+	if ( !protocol.parse( req.body, &cr, &err ) || !count_chat_tokens( *generator_, config_, cr, &tokens, &err ) ) {
+		return send_error( conn, err.status, err.type, err.message, true );
+	}
+	send_json( conn, 200, nlohmann::json( { { "input_tokens", tokens } } ).dump() );
 }
 
 void VoltaServer::run() {

@@ -99,6 +99,66 @@ try:
 except urllib.error.HTTPError as e:
     check(e.code == 404, "404 on unknown path")
 
+# ---- Anthropic /v1/messages
+A_TOOLS = [{"name": "get_weather", "description": "Get weather for a city", "cache_control": {"type": "ephemeral"},
+    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}]
+code, body = post("/v1/messages", {"model": "claude-x", "max_tokens": 16, "system": [{"type": "text", "text": "Answer in one word.", "cache_control": {"type": "ephemeral"}}],
+    "metadata": {"user_id": "u"}, "messages": [{"role": "user", "content": [{"type": "text", "text": "Capital of France?"}]}]})
+j = json.loads(body)
+check(code == 200 and j["type"] == "message" and j["role"] == "assistant" and j["content"][0]["type"] == "text" and "Paris" in j["content"][0]["text"] and j["stop_reason"] == "end_turn", "messages completion", body)
+check(j["usage"]["input_tokens"] > 0 and j["usage"]["output_tokens"] > 0 and j["model"] == "claude-x", "messages usage and model echo")
+
+code, body = post("/v1/messages", {"max_tokens": 5, "messages": [{"role": "user", "content": "Count to 100."}]})
+check(json.loads(body)["stop_reason"] == "max_tokens", "stop_reason max_tokens", body)
+code, body = post("/v1/messages", {"max_tokens": 40, "stop_sequences": ["5"], "messages": [{"role": "user", "content": "Count 1 to 9, comma separated, no spaces."}]})
+j = json.loads(body)
+check(j["stop_reason"] == "stop_sequence" and j["stop_sequence"] == "5" and j["content"][0]["text"].startswith("1,2,3,4"), "stop_sequences", body)
+
+code, body = post("/v1/messages", {"max_tokens": 400, "thinking": {"type": "enabled", "budget_tokens": 2000}, "messages": [{"role": "user", "content": "What is 2+2?"}]})
+j = json.loads(body)
+types = [b["type"] for b in j["content"]]
+check(types[:2] == ["thinking", "text"] and j["content"][0]["thinking"] and "4" in j["content"][1]["text"], "thinking block then text", body)
+
+code, resp = post("/v1/messages", {"max_tokens": 40, "stream": True, "messages": [{"role": "user", "content": "Count 1 to 5, comma separated."}]}, stream=True)
+names = []; text = ""; cur = None
+for raw in resp:
+    line = raw.decode().rstrip("\n")
+    if line.startswith("event: "): names.append(line[7:])
+    elif line.startswith("data: "):
+        d = json.loads(line[6:])
+        if d["type"] == "content_block_delta" and d["delta"]["type"] == "text_delta": text += d["delta"]["text"]
+check(names[0] == "message_start" and names[1] == "content_block_start" and names[-3:] == ["content_block_stop", "message_delta", "message_stop"], "anthropic SSE event order", names[:4] + names[-3:])
+check("1, 2, 3, 4, 5" in text, "anthropic SSE text", text)
+
+code, body = post("/v1/messages", {"max_tokens": 300, "tools": A_TOOLS, "messages": [{"role": "user", "content": "What is the weather in Paris for 3 days? Use the tool."}]})
+j = json.loads(body)
+uses = [b for b in j["content"] if b["type"] == "tool_use"]
+check(j["stop_reason"] == "tool_use" and len(uses) == 1 and uses[0]["name"] == "get_weather" and uses[0]["input"] == {"city": "Paris", "days": 3}, "tool_use block", body)
+tid = uses[0]["id"] if uses else "toolu_x"
+code, body = post("/v1/messages", {"max_tokens": 80, "tools": A_TOOLS, "messages": [
+    {"role": "user", "content": "Weather in Paris?"},
+    {"role": "assistant", "content": [{"type": "tool_use", "id": tid, "name": "get_weather", "input": {"city": "Paris"}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": [{"type": "text", "text": "18C and cloudy"}]}]}]})
+check("18" in "".join(b.get("text", "") for b in json.loads(body)["content"]), "tool_result is used", body)
+
+code, resp = post("/v1/messages", {"max_tokens": 300, "stream": True, "tools": A_TOOLS, "messages": [{"role": "user", "content": "What is the weather in Paris for 3 days? Use the tool."}]}, stream=True)
+blocks = {}; stop_reason = None
+for raw in resp:
+    line = raw.decode().rstrip("\n")
+    if not line.startswith("data: "): continue
+    d = json.loads(line[6:])
+    if d["type"] == "content_block_start": blocks[d["index"]] = {"block": d["content_block"], "json": ""}
+    elif d["type"] == "content_block_delta" and d["delta"]["type"] == "input_json_delta": blocks[d["index"]]["json"] += d["delta"]["partial_json"]
+    elif d["type"] == "message_delta": stop_reason = d["delta"]["stop_reason"]
+tu = [b for b in blocks.values() if b["block"]["type"] == "tool_use"]
+check(stop_reason == "tool_use" and len(tu) == 1 and json.loads(tu[0]["json"]) == {"city": "Paris", "days": 3}, "streamed tool_use input_json_delta", blocks)
+
+code, body = post("/v1/messages/count_tokens", {"messages": [{"role": "user", "content": "Capital of France?"}]})
+check(code == 200 and json.loads(body)["input_tokens"] > 5, "count_tokens", body)
+code, body = post("/v1/messages", {"max_tokens": 5, "messages": []})
+j = json.loads(body)
+check(code == 400 and j["type"] == "error" and j["error"]["type"] == "invalid_request_error", "anthropic error shape", body)
+
 # client disconnect frees the slot
 s = socket.create_connection((BASE.split("//")[1].split(":")[0], int(BASE.rsplit(":", 1)[1])))
 payload = json.dumps({"messages": [{"role": "user", "content": "Write a very long story."}], "max_tokens": 3000, "stream": True}).encode()

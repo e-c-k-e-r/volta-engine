@@ -49,6 +49,7 @@ class Responder {
 public:
 	virtual ~Responder() = default;
 	// Parsed pieces in order. Returning false cancels the generation.
+	virtual void on_prompt( int prompt_tokens ) { (void) prompt_tokens; }
 	virtual bool on_event( const OutputEvent& ev ) = 0;
 	virtual void on_finish( engine::runtime::FinishReason reason, const std::string& matched_stop, bool had_tool_calls, const Usage& usage ) = 0;
 };
@@ -56,6 +57,9 @@ public:
 // Renders the prompt, applies server defaults and starts the generation. On failure fills err and sends nothing.
 bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatRequest req, uint64_t request_id,
 	std::shared_ptr<Responder> responder, const ConnPtr& conn, ApiError* err );
+
+// Prompt length of a request without generating (count_tokens).
+bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, int* tokens, ApiError* err );
 
 // Protocol front ends (openai.cpp, anthropic.cpp)
 class ChatProtocol {

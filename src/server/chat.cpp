@@ -65,8 +65,9 @@ std::string normalize_tools( const std::string& tools_json, bool* ok ) {
 	return out.dump();
 }
 
-bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatRequest req, uint64_t request_id,
-	std::shared_ptr<Responder> responder, const ConnPtr& conn, ApiError* err ) {
+namespace {
+
+bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ApiError* err ) {
 	const auto family = gen.chat_template().model_family();
 
 	bool thinking = req.enable_thinking >= 0 ? req.enable_thinking != 0 : cfg.default_enable_thinking;
@@ -84,18 +85,38 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	vars["enable_thinking"] = thinking;
 	if ( !effort.empty() ) vars["reasoning_effort"] = effort;
 
-	std::string prompt, terr;
-	if ( !gen.chat_template().render_json( vars.dump(), &prompt, &terr ) ) {
+	std::string terr;
+	if ( !gen.chat_template().render_json( vars.dump(), prompt, &terr ) ) {
 		err->message = "the chat template rejected this conversation: " + terr;
 		return false;
 	}
-	std::vector<int> tokens = gen.tokenizer().encode( prompt, false );
+	*tokens = gen.tokenizer().encode( *prompt, false );
 	const int ctx = gen.max_context();
-	if ( tokens.empty() || static_cast<int>( tokens.size() ) + 1 >= ctx ) {
-		err->message = "this conversation is " + std::to_string( tokens.size() ) + " tokens; the context window is " + std::to_string( ctx );
+	if ( tokens->empty() || static_cast<int>( tokens->size() ) + 1 >= ctx ) {
+		err->message = "this conversation is " + std::to_string( tokens->size() ) + " tokens; the context window is " + std::to_string( ctx );
 		err->type = "context_length_exceeded";
 		return false;
 	}
+	return true;
+}
+
+} // namespace
+
+bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, int* tokens, ApiError* err ) {
+	std::string prompt;
+	std::vector<int> ids;
+	if ( !render_prompt( gen, cfg, req, &prompt, &ids, err ) ) return false;
+	*tokens = static_cast<int>( ids.size() );
+	return true;
+}
+
+bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatRequest req, uint64_t request_id,
+	std::shared_ptr<Responder> responder, const ConnPtr& conn, ApiError* err ) {
+	const auto family = gen.chat_template().model_family();
+	std::string prompt;
+	std::vector<int> tokens;
+	if ( !render_prompt( gen, cfg, req, &prompt, &tokens, err ) ) return false;
+	responder->on_prompt( static_cast<int>( tokens.size() ) );
 
 	const bool in_reasoning = ends_with( prompt, "<think>\n" ) || ends_with( prompt, "<think>" );
 	auto state = std::make_shared<ChatState>(
