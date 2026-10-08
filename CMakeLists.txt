@@ -7,6 +7,13 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 set(CMAKE_CUDA_ARCHITECTURES 70)
+
+# Computing backend: exactly one. Only CUDA is implemented; the backend layer (inc/engine/backend) is where the others plug in.
+set(ENGINE_BACKEND "CUDA" CACHE STRING "Computing backend: CUDA")
+if(NOT ENGINE_BACKEND STREQUAL "CUDA")
+	message(FATAL_ERROR "ENGINE_BACKEND=${ENGINE_BACKEND}: only CUDA is implemented")
+endif()
+add_compile_definitions(ENGINE_BACKEND_CUDA=1)
 find_package(CUDAToolkit REQUIRED)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION")
@@ -19,12 +26,26 @@ include_directories(
 	${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
 )
 
-set(ENGINE_CORE_SOURCES
+# Host C++ (built by the host compiler; talks to the device only through engine/backend and the module headers)
+set(ENGINE_HOST_SOURCES
 	src/core/arena.cpp
 	src/loader/safetensors.cpp
 	src/loader/nvfp4.cpp
 	src/loader/tokenizer.cpp
 	src/loader/chat_template.cpp
+	src/models/model.cpp
+	src/models/qwen38_27b.cpp
+	src/models/glm53_flash.cpp
+	src/runtime/kv_cache.cpp
+	src/runtime/cluster.cpp
+	src/runtime/dflash2_runner.cpp
+	src/runtime/generator.cpp
+	src/server/config.cpp
+	src/server/server.cpp
+)
+
+# CUDA device code and its launch drivers (compiled only for the CUDA backend)
+set(ENGINE_DEVICE_SOURCES
 	src/comm/all_reduce_ipc.cu
 	src/kernels/nvfp4/skinny_kernels.cu
 	src/modules/norm.cu
@@ -39,20 +60,12 @@ set(ENGINE_CORE_SOURCES
 	src/modules/expert_tier.cu
 	src/modules/mhc.cu
 	src/modules/embedding.cu
-	src/models/model.cpp
-	src/models/qwen38_27b.cpp
-	src/models/glm53_flash.cpp
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
 	src/spec/dflash_backbone.cu
 	src/spec/tap_ring.cu
-	src/runtime/kv_cache.cpp
-	src/runtime/cluster.cpp
-	src/runtime/dflash2_runner.cpp
-	src/runtime/generator.cpp
-	src/server/config.cpp
-	src/server/server.cpp
 )
+set(ENGINE_CORE_SOURCES ${ENGINE_HOST_SOURCES} ${ENGINE_DEVICE_SOURCES})
 
 file(GLOB TRELLIS_SOURCES
 	src/kernels/trellis/*.cu
