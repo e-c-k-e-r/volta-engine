@@ -8,6 +8,7 @@
 //   scale   the e4m3 byte of (n, g), copied raw
 // Streams are [tile][group][lane].
 #include "engine/loader/safetensors.h"
+#include "engine/backend/runtime.h"
 #include <cuda_fp16.h>
 #include <cmath>
 #include <cstring>
@@ -70,7 +71,7 @@ pod::LinearWeight SafeTensorsRepo::load_nvfp4(
 	int ranges,
 	int k0,
 	int kcount,
-	cudaStream_t stream
+	backend::stream_t stream
 ) {
 	Nvfp4Source src;
 	if ( !open_nvfp4( *this, base_name, src ) ) return pod::LinearWeight{};
@@ -124,9 +125,9 @@ pod::LinearWeight SafeTensorsRepo::load_nvfp4(
 	lw.w0 = engine::core::arena_alloc_tensor( arena, pod::DType::UINT8, cshape, 1 );
 	lw.w1 = engine::core::arena_alloc_tensor( arena, pod::DType::UINT8, sshape, 1 );
 	if ( lw.w0.data == nullptr || lw.w1.data == nullptr ) return pod::LinearWeight{};
-	CUDA_CHECK( cudaMemcpyAsync( lw.w0.data, codes.data(), codes.size(), cudaMemcpyHostToDevice, stream ) );
-	CUDA_CHECK( cudaMemcpyAsync( lw.w1.data, scales.data(), scales.size(), cudaMemcpyHostToDevice, stream ) );
-	CUDA_CHECK( cudaStreamSynchronize( stream ) );  // the host staging buffers go out of scope
+	backend::memcpy_async( lw.w0.data, codes.data(), codes.size(), backend::Copy::H2D, stream );
+	backend::memcpy_async( lw.w1.data, scales.data(), scales.size(), backend::Copy::H2D, stream );
+	backend::stream_sync( stream );  // the host staging buffers go out of scope
 	return lw;
 }
 
@@ -136,7 +137,7 @@ pod::LinearWeight SafeTensorsRepo::load_nvfp4_slice(
 	bool split_n,
 	int rank,
 	int tp_size,
-	cudaStream_t stream
+	backend::stream_t stream
 ) {
 	Nvfp4Source src;
 	if ( !open_nvfp4( *this, base_name, src ) ) return pod::LinearWeight{};
@@ -155,7 +156,7 @@ pod::TensorView SafeTensorsRepo::load_nvfp4_dense(
 	bool split_n,
 	int rank,
 	int tp_size,
-	cudaStream_t stream
+	backend::stream_t stream
 ) {
 	Nvfp4Source src;
 	if ( !open_nvfp4( *this, base_name, src ) ) return pod::TensorView{};
@@ -173,8 +174,8 @@ pod::TensorView SafeTensorsRepo::load_nvfp4_dense(
 	const int shape[2] = { n_cnt, k_cnt };
 	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
 	if ( tv.data == nullptr ) return tv;
-	CUDA_CHECK( cudaMemcpyAsync( tv.data, out.data(), out.size() * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
-	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	backend::memcpy_async( tv.data, out.data(), out.size() * sizeof( half ), backend::Copy::H2D, stream );
+	backend::stream_sync( stream );
 	return tv;
 }
 
@@ -184,7 +185,7 @@ pod::LinearWeight SafeTensorsRepo::load_dense_rows_padded(
 	int row_begin,
 	int row_count,
 	int pad_rows,
-	cudaStream_t stream
+	backend::stream_t stream
 ) {
 	int shard = -1;
 	const auto* meta = find( weight_name, &shard );
@@ -210,8 +211,8 @@ pod::LinearWeight SafeTensorsRepo::load_dense_rows_padded(
 	const int shape[2] = { static_cast<int>( rows ), static_cast<int>( K ) };
 	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
 	if ( tv.data == nullptr ) return pod::LinearWeight{};
-	CUDA_CHECK( cudaMemcpyAsync( tv.data, out.data(), out.size() * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
-	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	backend::memcpy_async( tv.data, out.data(), out.size() * sizeof( half ), backend::Copy::H2D, stream );
+	backend::stream_sync( stream );
 	return pod::LinearWeight::make_fp16( pod::make_tensor_2d( tv.data, pod::DType::FP16, static_cast<int>( K ), static_cast<int>( rows ) ) );
 }
 

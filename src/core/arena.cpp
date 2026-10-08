@@ -1,19 +1,17 @@
 #include "engine/core/arena.h"
-#include <cuda_runtime.h>
+#include "engine/backend/runtime.h"
 
 namespace engine::core {
 
 bool arena_create( pod::MemoryArena& arena, int device_id, size_t total_bytes ) {
 	arena_destroy( arena );
 
-	cudaError_t err = cudaSetDevice( device_id );
-	if ( ENGINE_UNLIKELY( err != cudaSuccess ) ) {
+	if ( ENGINE_UNLIKELY( !backend::set_device_try( device_id ) ) ) {
 		return false;
 	}
 
-	void* ptr = nullptr;
-	err = cudaMalloc( &ptr, total_bytes );
-	if ( ENGINE_UNLIKELY( err != cudaSuccess ) ) {
+	void* ptr = backend::device_malloc_try( total_bytes );
+	if ( ENGINE_UNLIKELY( ptr == nullptr ) ) {
 		return false;
 	}
 
@@ -26,8 +24,8 @@ bool arena_create( pod::MemoryArena& arena, int device_id, size_t total_bytes ) 
 
 bool arena_create_pinned( pod::MemoryArena& arena, size_t total_bytes ) {
 	arena_destroy( arena );
-	void* ptr = nullptr;
-	if ( cudaHostAlloc( &ptr, total_bytes, cudaHostAllocMapped ) != cudaSuccess ) {
+	void* ptr = backend::host_alloc_pinned( total_bytes, backend::Pin::Mapped );
+	if ( ptr == nullptr ) {
 		return false;
 	}
 	arena.base_ptr = ptr;
@@ -91,8 +89,8 @@ void arena_reset( pod::MemoryArena& arena ) {
 
 void arena_destroy( pod::MemoryArena& arena ) {
 	if ( arena.base_ptr != nullptr ) {
-		if ( arena.pinned ) cudaFreeHost( arena.base_ptr );
-		else cudaFree( arena.base_ptr );
+		if ( arena.pinned ) backend::host_free_pinned( arena.base_ptr );
+		else backend::device_free( arena.base_ptr );
 		arena.pinned = false;
 		arena.base_ptr = nullptr;
 		arena.total_bytes = 0;
@@ -101,17 +99,12 @@ void arena_destroy( pod::MemoryArena& arena ) {
 }
 
 void* host_alloc_pinned( size_t bytes ) {
-	void* ptr = nullptr;
-	cudaError_t err = cudaHostAlloc( &ptr, bytes, cudaHostAllocDefault );
-	if ( ENGINE_UNLIKELY( err != cudaSuccess ) ) {
-		return nullptr;
-	}
-	return ptr;
+	return backend::host_alloc_pinned( bytes, backend::Pin::Default );
 }
 
 void host_free_pinned( void* ptr ) {
 	if ( ptr != nullptr ) {
-		cudaFreeHost( ptr );
+		backend::host_free_pinned( ptr );
 	}
 }
 

@@ -14,7 +14,8 @@ inline cudaMemcpyKind copy_kind( Copy c ) {
 	switch ( c ) {
 		case Copy::H2D: return cudaMemcpyHostToDevice;
 		case Copy::D2H: return cudaMemcpyDeviceToHost;
-		default: return cudaMemcpyDeviceToDevice;
+		case Copy::D2D: return cudaMemcpyDeviceToDevice;
+		default: return cudaMemcpyDefault;
 	}
 }
 
@@ -42,11 +43,11 @@ inline void peer_copy_async( void* dst, int dst_device, const void* src, int src
 inline void memset_async( void* dst, int value, size_t bytes, stream_t s ) { ENGINE_CHECK( cudaMemsetAsync( dst, value, bytes, s ) ); }
 inline void memset_sync( void* dst, int value, size_t bytes ) { ENGINE_CHECK( cudaMemset( dst, value, bytes ) ); }
 
-// Pinned host memory. mapped = device-visible and portable across devices (collective flags, tap rings)
-inline void* host_alloc_pinned( size_t bytes, bool mapped ) {
+// Pinned host memory (nullptr on failure). Mapped flavors are device-visible (collective flags, tap rings, embedding table)
+inline void* host_alloc_pinned( size_t bytes, Pin mode ) {
 	void* p = nullptr;
-	cudaError_t err = cudaHostAlloc( &p, bytes, mapped ? ( cudaHostAllocMapped | cudaHostAllocPortable ) : cudaHostAllocDefault );
-	return err == cudaSuccess ? p : nullptr;
+	const unsigned flags = mode == Pin::MappedPortable ? ( cudaHostAllocMapped | cudaHostAllocPortable ) : mode == Pin::Mapped ? cudaHostAllocMapped : cudaHostAllocDefault;
+	return cudaHostAlloc( &p, bytes, flags ) == cudaSuccess ? p : nullptr;
 }
 inline void host_free_pinned( void* p ) { cudaFreeHost( p ); }
 
@@ -56,8 +57,15 @@ inline void check_last_error() { ENGINE_CHECK( cudaGetLastError() ); }
 inline void clear_last_error() { (void) cudaGetLastError(); }
 inline void device_reset() { cudaDeviceReset(); }
 
+// Non-aborting forms for callers that report failure to their own caller (arena creation, loaders)
+inline bool set_device_try( int device ) { return cudaSetDevice( device ) == cudaSuccess; }
+inline void* device_malloc_try( size_t bytes ) { void* p = nullptr; return cudaMalloc( &p, bytes ) == cudaSuccess ? p : nullptr; }
+inline bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, stream_t s ) {
+	return cudaMemcpyAsync( dst, src, bytes, copy_kind( dir ), s ) == cudaSuccess;
+}
+
 inline void* device_malloc( size_t bytes ) { void* p = nullptr; ENGINE_CHECK( cudaMalloc( &p, bytes ) ); return p; }
-inline void device_free( void* p ) { ENGINE_CHECK( cudaFree( p ) ); }
+inline void device_free( void* p ) { (void) cudaFree( p ); }
 
 // Graph capture and replay (the decode body is captured once per row count and replayed)
 inline void graph_capture_begin( stream_t s ) { ENGINE_CHECK( cudaStreamBeginCapture( s, cudaStreamCaptureModeThreadLocal ) ); }

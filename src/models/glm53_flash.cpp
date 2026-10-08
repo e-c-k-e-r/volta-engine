@@ -3,7 +3,6 @@
 #include "engine/loader/safetensors.h"
 #include "engine/modules/gdn.h"
 #include "engine/modules/dsa.h"
-#include <cublas_v2.h>
 #include "engine/modules/embedding.h"
 #include "engine/spec/dflash.h"
 #include "engine/spec/tap_ring.h"
@@ -404,7 +403,7 @@ bool GLM53Pipeline::load_weights( const char* model_dir, backend::stream_t strea
 			const size_t bytes = static_cast<size_t>( config_.vocab_size ) * config_.hidden_size * sizeof( uint16_t );
 			const void* src = engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta );
 			if ( g_embed_table.data == nullptr ) {
-				void* host = backend::host_alloc_pinned( bytes, true );
+				void* host = backend::host_alloc_pinned( bytes, backend::Pin::MappedPortable );
 				ENGINE_ASSERT( host != nullptr, "GLM53Pipeline: pinned embedding table allocation failed" );
 				g_embed_table = pod::make_tensor_2d( host, pod::DType::BF16, config_.vocab_size, config_.hidden_size );
 			}
@@ -999,14 +998,7 @@ void GLM53Pipeline::forward_body( int m, backend::stream_t stream ) {
 						DSA::project_small( lw.idx_dense.ptr<half>(), norm_hidden_.ptr<half>(), dsa_proj_, m, DSA::PROJ, 4096, stream );
 					}
 					else {
-						const int device = backend::get_device();
-						cublasHandle_t h = engine::modules::trellis_get_cublas( device );
-						cublasSetStream( h, stream );
-						const float one = 1.0f, zero = 0.0f;
-						const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, DSA::PROJ, m, 4096,
-							&one, lw.idx_dense.data, CUDA_R_16F, 4096, norm_hidden_.data, CUDA_R_16F, 4096,
-							&zero, dsa_proj_, CUDA_R_16F, DSA::PROJ, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP );
-						ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "GLM53Pipeline: indexer projection GEMM failed" );
+						DSA::project_large( lw.idx_dense.ptr<half>(), norm_hidden_.ptr<half>(), dsa_proj_, m, DSA::PROJ, 4096, stream );
 					}
 					DSA::prep( dsa_proj_, lw.idx_ln_w.ptr<half>(), lw.idx_ln_b.ptr<half>(), dsa_plane_, dsa_w_, mla_idx, config_.max_seq, m,
 						d_rows_, dsa_plane_stride_, stream );

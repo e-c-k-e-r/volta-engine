@@ -20,7 +20,11 @@ namespace engine::backend {
 	using half_t = __half;
 
 	// Direction of a copy; the call sites name it instead of the backend's enum
-	enum class Copy { H2D, D2H, D2D };
+	// Auto lets the runtime infer the direction from the pointers (unified addressing), as for loads from mapped files
+	enum class Copy { H2D, D2H, D2D, Auto };
+
+	// Pinned host allocation flavors
+	enum class Pin { Default, Mapped, MappedPortable };
 }
 #else
 	#error "engine/backend/types.h: no backend implemented for this configuration (set ENGINE_BACKEND_CUDA=1)"

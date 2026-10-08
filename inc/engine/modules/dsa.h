@@ -32,6 +32,9 @@ struct DSA {
 	// proj[r][j] = sum_k w[j][k] x[r][k] for rows <= 16 (graph-capturable); larger row counts use the caller's GEMM
 	static void project_small( const half* w, const half* x, half* proj, int rows, int n, int k, backend::stream_t stream );
 
+	// Same product for larger row counts (prefill chunks): one dense GEMM
+	static void project_large( const half* w, const half* x, half* proj, int rows, int n, int k, backend::stream_t stream );
+
 	// LayerNorm the key part of proj, append [k_norm | gate] to the plane at each row's position, copy the head weights to w_out
 	static void prep( const half* proj, const half* ln_w, const half* ln_b, half* plane, half* w_out, int layer, int max_seq, int rows,
 		const pod::BatchRows* d_rows, size_t plane_slot_stride, backend::stream_t stream );
