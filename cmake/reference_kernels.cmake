@@ -52,11 +52,13 @@ if(SLANGC)
 	target_include_directories(ref_attn_cpu PRIVATE ${SLANG_INCLUDE_DIR})
 	set_target_properties(ref_attn_cpu PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
-	add_executable(test_ref_attention tests/2_parity/test_ref_attention.cpp)
-	target_include_directories(test_ref_attention PRIVATE src/shaders/cuda)
-	target_link_libraries(test_ref_attention PRIVATE ref_attn_cpu engine_kernels engine_slang_cuda)
-	add_dependencies(test_ref_attention ref_attn_slang)
-	set_target_properties(test_ref_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	if(ENGINE_BACKEND STREQUAL "CUDA")
+		add_executable(test_ref_attention tests/2_parity/test_ref_attention.cpp)
+		target_include_directories(test_ref_attention PRIVATE src/shaders/cuda)
+		target_link_libraries(test_ref_attention PRIVATE ref_attn_cpu engine_kernels engine_slang_cuda)
+		add_dependencies(test_ref_attention ref_attn_slang)
+		set_target_properties(test_ref_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	endif()
 endif()
 # ---- E2 end
 
@@ -104,20 +106,22 @@ if(SLANGC)
 	endif()
 
 	# ref_gemm.cu / ref_trellis.cu include the generated Slang CUDA code; ref_engine.cu bridges to the engine's own Linear
-	add_library(ref_lin_cuda STATIC
-		src/shaders/cuda/ref_gemm.cu src/shaders/cuda/ref_trellis.cu src/shaders/cuda/ref_engine.cu)
-	add_dependencies(ref_lin_cuda ref_lin_slang)
-	target_include_directories(ref_lin_cuda PRIVATE ${REF_LIN_SLANG_OUT} ${REF_LIN_SLANG_INCLUDE_DIR} src/shaders/cuda src/kernels/trellis)
-	target_link_libraries(ref_lin_cuda PUBLIC engine_kernels)
-	set_source_files_properties(src/shaders/cuda/ref_gemm.cu src/shaders/cuda/ref_trellis.cu
-		PROPERTIES COMPILE_DEFINITIONS __CUDA_NO_HALF2_OPERATORS__)
-	set_target_properties(ref_lin_cuda PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	if(ENGINE_BACKEND STREQUAL "CUDA")
+		add_library(ref_lin_cuda STATIC
+			src/shaders/cuda/ref_gemm.cu src/shaders/cuda/ref_trellis.cu src/shaders/cuda/ref_engine.cu)
+		add_dependencies(ref_lin_cuda ref_lin_slang)
+		target_include_directories(ref_lin_cuda PRIVATE ${REF_LIN_SLANG_OUT} ${REF_LIN_SLANG_INCLUDE_DIR} src/shaders/cuda src/kernels/trellis)
+		target_link_libraries(ref_lin_cuda PUBLIC engine_kernels)
+		set_source_files_properties(src/shaders/cuda/ref_gemm.cu src/shaders/cuda/ref_trellis.cu
+			PROPERTIES COMPILE_DEFINITIONS __CUDA_NO_HALF2_OPERATORS__)
+		set_target_properties(ref_lin_cuda PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
-	set_source_files_properties(${REF_LIN_CPU_SOURCES} PROPERTIES GENERATED TRUE)
-	add_executable(test_ref_linear tests/2_parity/test_ref_linear.cpp ${REF_LIN_CPU_SOURCES})
-	add_dependencies(test_ref_linear ref_lin_slang)
-	target_include_directories(test_ref_linear PRIVATE ${REF_LIN_SLANG_INCLUDE_DIR} src/shaders/cuda)
-	target_link_libraries(test_ref_linear PRIVATE ref_lin_cuda)
-	set_target_properties(test_ref_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+		set_source_files_properties(${REF_LIN_CPU_SOURCES} PROPERTIES GENERATED TRUE)
+		add_executable(test_ref_linear tests/2_parity/test_ref_linear.cpp ${REF_LIN_CPU_SOURCES})
+		add_dependencies(test_ref_linear ref_lin_slang)
+		target_include_directories(test_ref_linear PRIVATE ${REF_LIN_SLANG_INCLUDE_DIR} src/shaders/cuda)
+		target_link_libraries(test_ref_linear PRIVATE ref_lin_cuda)
+		set_target_properties(test_ref_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	endif()
 endif()
 # ---- E1 end
