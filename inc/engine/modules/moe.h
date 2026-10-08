@@ -5,7 +5,6 @@
 #include "engine/core/arena.h"
 #include "engine/modules/linear.h"
 #include "engine/backend/types.h"
-#include <cuda_fp16.h>
 
 #define MOE_MAX_GROUPS 8
 #define MOE_MAX_EXPERTS 288   // experts per rank: 72 expert-parallel, all 288 with each expert sharded over the ranks
@@ -26,20 +25,20 @@ struct MoELayerWeights {
 struct MoEScratch {
 	int64_t* expert_count = nullptr;   // [num_local_experts + 1]
 	int64_t* token_sorted = nullptr;   // [top_k]
-	half*    weight_sorted = nullptr;  // [top_k]
+	engine::backend::half_t*    weight_sorted = nullptr;  // [top_k]
 	int*     cursors = nullptr;        // [num_local_experts + 1]
 	int4*    active_experts = nullptr; // [num_local_experts + 1]
-	half*    state_g = nullptr;        // [groups, top_k, hidden]
-	half*    state_u = nullptr;
-	half*    interm_g = nullptr;       // [groups, top_k, intermediate]
-	half*    interm_u = nullptr;
-	half*    planes = nullptr;         // [MOE_MAX_GROUPS, max_rows, hidden] per-group output planes
+	engine::backend::half_t*    state_g = nullptr;        // [groups, top_k, hidden]
+	engine::backend::half_t*    state_u = nullptr;
+	engine::backend::half_t*    interm_g = nullptr;       // [groups, top_k, intermediate]
+	engine::backend::half_t*    interm_u = nullptr;
+	engine::backend::half_t*    planes = nullptr;         // [MOE_MAX_GROUPS, max_rows, hidden] per-group output planes
 	// Fused decode path (exl3_moe_coop.cuh): scratch for up to 16 rows
-	half*    coop_had_g = nullptr;     // [128 slots, hidden]
-	half*    coop_had_u = nullptr;
+	engine::backend::half_t*    coop_had_g = nullptr;     // [128 slots, hidden]
+	engine::backend::half_t*    coop_had_u = nullptr;
 	float*   coop_gu_g = nullptr;      // [2 split-k, 128 slots, intermediate]
 	float*   coop_gu_u = nullptr;
-	half*    coop_act = nullptr;       // [128 slots, intermediate]
+	engine::backend::half_t*    coop_act = nullptr;       // [128 slots, intermediate]
 	float*   coop_d_out = nullptr;     // [128 slots, hidden]
 	int*     coop_ctr = nullptr;       // completion counters + run table, zero between calls
 };
@@ -54,7 +53,7 @@ struct MoERouter {
 		const pod::TensorView& router_weights,
 		const pod::TensorView& e_score_bias,
 		int* d_topk_indices,
-		half* d_topk_weights,
+		backend::half_t* d_topk_weights,
 		int hidden_size,
 		int num_experts = 288,
 		int top_k = 8,
@@ -64,19 +63,19 @@ struct MoERouter {
 	);
 
 	static void combine(
-		const half* expert_parts,
-		const half* topk_weights,
-		const half* shared_out,
-		half* output,
+		const backend::half_t* expert_parts,
+		const backend::half_t* topk_weights,
+		const backend::half_t* shared_out,
+		backend::half_t* output,
 		int hidden_size,
 		int top_k = 8,
 		backend::stream_t stream = nullptr
 	);
 
 	static void accumulate(
-		half* accum_out,
-		const half* expert_out,
-		half weight,
+		backend::half_t* accum_out,
+		const backend::half_t* expert_out,
+		backend::half_t weight,
 		int hidden_size,
 		backend::stream_t stream = nullptr
 	);
@@ -84,17 +83,17 @@ struct MoERouter {
 	static void accumulate(
 		pod::TensorView& accum_out,
 		const pod::TensorView& expert_out,
-		half weight,
+		backend::half_t weight,
 		int hidden_size,
 		backend::stream_t stream = nullptr
 	);
 
 	static void exl3_moe_dispatch(
 		const int* selected_experts,
-		const half* routing_weights,
+		const backend::half_t* routing_weights,
 		int64_t* expert_count,
 		int64_t* token_sorted,
-		half* weight_sorted,
+		backend::half_t* weight_sorted,
 		int* cursors,
 		int num_experts,
 		int routing_first,
@@ -129,7 +128,7 @@ struct MoE {
 		const pod::TensorView& x,
 		const pod::MoELayerWeights& weights,
 		const int* d_topk_indices,
-		const half* d_topk_weights,
+		const backend::half_t* d_topk_weights,
 		pod::TensorView& out,
 		int start_expert,
 		int end_expert,
@@ -148,16 +147,16 @@ void exl3_moe(
 	void* output_state,
 	const int64_t* expert_count,
 	const int64_t* token_sorted,
-	const half* weight_sorted,
-	half* temp_state_g,
-	half* temp_state_u,
-	half* temp_intermediate_g,
-	half* temp_intermediate_u,
+	const engine::backend::half_t* weight_sorted,
+	engine::backend::half_t* temp_state_g,
+	engine::backend::half_t* temp_state_u,
+	engine::backend::half_t* temp_intermediate_g,
+	engine::backend::half_t* temp_intermediate_u,
 	int act_function,
 	int K_gate, int K_up, int K_down,
-	const uint16_t** gate_trellis, const half** gate_suh, const half** gate_svh,
-	const uint16_t** up_trellis, const half** up_suh, const half** up_svh,
-	const uint16_t** down_trellis, const half** down_suh, const half** down_svh,
+	const uint16_t** gate_trellis, const engine::backend::half_t** gate_suh, const engine::backend::half_t** gate_svh,
+	const uint16_t** up_trellis, const engine::backend::half_t** up_suh, const engine::backend::half_t** up_svh,
+	const uint16_t** down_trellis, const engine::backend::half_t** down_suh, const engine::backend::half_t** down_svh,
 	bool gate_mcg, bool gate_mul1,
 	bool up_mcg, bool up_mul1,
 	bool down_mcg, bool down_mul1,

@@ -7,7 +7,6 @@
 #include "engine/loader/safetensors.h"
 #include "engine/modules/linear.h"
 #include "engine/backend/types.h"
-#include <cuda_fp16.h>
 
 namespace pod {
 
@@ -95,18 +94,18 @@ void dflash2_dynconv(
 
 // Places a [rows, src_cols] slice at column col0 of a [rows, dst_cols] matrix (the fc all-gather writes each
 // rank's slice into a zeroed full-width buffer and sums across ranks).
-void dflash_place_cols( half* dst, const half* src, int rows, int dst_cols, int src_cols, int col0, backend::stream_t stream = nullptr );
+void dflash_place_cols( backend::half_t* dst, const backend::half_t* src, int rows, int dst_cols, int src_cols, int col0, backend::stream_t stream = nullptr );
 
 // FP16 -> FP32 widening copy (the drafter widens o_proj / down_proj before their conv).
-void dflash_h2f( const half* in, float* out, int n, backend::stream_t stream = nullptr );
+void dflash_h2f( const backend::half_t* in, float* out, int n, backend::stream_t stream = nullptr );
 
 // Pure CUDA candidate selector walk (greedy chained walk)
 void dflash2_selector_walk(
 	const float* unary,       // [bsz, rows, k]
 	const int* cands,          // [bsz, rows, k]
-	const half* gate,          // [bsz, rows, rank]
-	const half* pred_cb,       // [vocab, rank]
-	const half* succ_cb,       // [vocab, rank]
+	const backend::half_t* gate,          // [bsz, rows, rank]
+	const backend::half_t* pred_cb,       // [vocab, rank]
+	const backend::half_t* succ_cb,       // [vocab, rank]
 	const int* anchor,         // [bsz]
 	int* out_tokens,           // [bsz, rows + 1] (out[0] = anchor, out[1..rows] = draft tokens)
 	float* conf,               // [bsz, rows + 1] or nullptr
@@ -119,7 +118,7 @@ void dflash2_selector_walk(
 
 // Pure CUDA Top-K extraction from logits
 void dflash2_topk(
-	const half* logits,
+	const backend::half_t* logits,
 	int bsz,
 	int rows,
 	int vocab,
@@ -136,7 +135,7 @@ void dflash2_topk(
 // token id. The scratch is caller-owned, so this is safe inside a CUDA graph and per device, unlike
 // dflash2_topk's process-global lazily-allocated scratch.
 void dflash2_topk_shard(
-	const half* logits,
+	const backend::half_t* logits,
 	int rows,
 	int row_stride,
 	int columns,
@@ -168,9 +167,9 @@ void dflash2_topk_merge(
 // Plain FP16 GEMV, out[m, n] = sum_k w[n, k] * x[m, k], for up to 8 rows. The drafter's conv kernel
 // projections and the selector's hidden projection are plain FP16 in the checkpoint, not trellis.
 void dflash_f16_gemv_nt(
-	const half* w,
-	const half* x,
-	half* out,
+	const backend::half_t* w,
+	const backend::half_t* x,
+	backend::half_t* out,
 	int m,
 	int n,
 	int k,
@@ -194,8 +193,8 @@ void dflash_rmsnorm_residual(
 // Per-head RMSNorm then NeoX RoPE, in place, on the drafter's Q or K tensor. `pairs` is
 // head_dim*rotary_fraction/2; dims at or past 2*pairs pass through unrotated.
 void dflash_qk_norm_rope(
-	half* x,
-	const half* weight,
+	backend::half_t* x,
+	const backend::half_t* weight,
 	const float* rope_cos,
 	const float* rope_sin,
 	int rows,
@@ -212,10 +211,10 @@ void dflash_qk_norm_rope(
 // starting at `first_ctx`, plus the block's own `rows` K/V starting at cache slot `own_slot`.
 // Non-causal within the block; the caller windows the context via first_ctx/nctx.
 void dflash_attn(
-	const half* q,
-	const half* kcache,
-	const half* vcache,
-	half* out,
+	const backend::half_t* q,
+	const backend::half_t* kcache,
+	const backend::half_t* vcache,
+	backend::half_t* out,
 	int rows,
 	int q_heads,
 	int kv_heads,
@@ -239,7 +238,7 @@ void dflash_attn(
 // exit side; the projection emits both contiguously.
 void dflash_conv_side_split(
 	float* side,
-	const half* proj,
+	const backend::half_t* proj,
 	int rows,
 	int taps,
 	int groups,
@@ -249,8 +248,8 @@ void dflash_conv_side_split(
 
 // Scatter a [n, heads*head_dim] projection into one layer of the ring-shaped context cache.
 void dflash_cache_store(
-	half* cache,
-	const half* src,
+	backend::half_t* cache,
+	const backend::half_t* src,
 	int n,
 	int heads,
 	int head_dim,
@@ -319,7 +318,7 @@ public:
 	void draft_backbone(
 		const pod::TensorView& embed_table,
 		int anchor_token,
-		const half* tapped_states,
+		const backend::half_t* tapped_states,
 		int block_pos0,
 		int taps_cap,
 		backend::stream_t stream = nullptr
@@ -381,7 +380,7 @@ public:
 		const pod::TensorView& embed_table,
 		const int* d_input_ids,
 		int rows,
-		const half* tapped_states,
+		const backend::half_t* tapped_states,
 		int n_ctx,
 		int ctx_pos0,
 		int block_pos0,
@@ -448,7 +447,7 @@ private:
 	float* d_topk_part_v_;          // [7 * 32 * 16]
 	int* d_topk_part_ix_;           // [7 * 32 * 16]
 	int* d_topk_counters_;          // [7]
-	half* d_gate_;                  // [7, 256]
+	backend::half_t* d_gate_;                  // [7, 256]
 	// Backbone activation scratch. Sized for block_size rows and this rank's shard widths; the
 	// residual stream is always full width and replicated.
 	pod::TensorView bb_residual_;   // [8, hidden] FP32
