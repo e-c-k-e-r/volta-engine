@@ -172,9 +172,9 @@ void trellis_linear_impl( const pod::TensorView& x, const pod::TensorView& trell
 	had_rows( y.data(), out.ptr<half>(), nullptr, svh.ptr<const half>(), m, n );
 }
 
-// ENGINE_CPU_TRACE=1: one line per call with the elapsed time and the weight elements dequantized so far
+// ENGINE_DEBUG_CPU_TRACE=1: one line per call with the elapsed time and the weight elements dequantized so far
 void trellis_linear( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1 ) {
-	static const bool trace = std::getenv( "ENGINE_CPU_TRACE" ) != nullptr;
+	static const bool trace = std::getenv( "ENGINE_DEBUG_CPU_TRACE" ) != nullptr;
 	if ( !trace ) {
 		trellis_linear_impl( x, trellis, suh, svh, out, bits, mcg, mul1 );
 		return;

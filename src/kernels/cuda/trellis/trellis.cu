@@ -12,10 +12,8 @@ namespace {
 
 // Rows above which dequantizing the weight once and running a tensor-core HGEMM beats the fused GEMM kernel, whose
 // cost is linear in M (~4.3 us per row on the Qwen MLP shapes, ~10 TFLOP/s: the trellis is re-decoded per 16-row tile).
-// EXL3_RECON_THRESHOLD overrides; 0 disables the path.
 int recon_threshold() {
-	static const int t = std::getenv( "EXL3_RECON_THRESHOLD" ) ? std::atoi( std::getenv( "EXL3_RECON_THRESHOLD" ) ) : 36;
-	return t;
+	return 36;
 }
 
 } // namespace

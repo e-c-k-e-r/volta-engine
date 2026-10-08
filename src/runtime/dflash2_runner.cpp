@@ -168,12 +168,12 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		} );
 	}
 
-	// Diagnostic: EXL3_DUMP_DRAFT=<round> writes that round's inputs and the drafter hidden to
+	// Diagnostic: ENGINE_DEBUG_DUMP_DRAFT=<round> writes that round's inputs and the drafter hidden to
 	// /tmp/draft_dump.bin for comparison against an independent implementation. Header (int32): pos, anchor,
 	// hidden, taps_cap; then the tap ring rows for positions [0, pos) as FP16 [pos, 5 * hidden]
 	// (only valid while pos <= taps_cap), then the drafter hidden FP16 [M, hidden].
 	{
-		static const int dump_round = std::getenv( "EXL3_DUMP_DRAFT" ) ? std::atoi( std::getenv( "EXL3_DUMP_DRAFT" ) ) : -1;
+		const int dump_round = runtime::options().dump_draft_round;
 		static int round_no = 0;
 		if ( dump_round >= 0 && round_no++ == dump_round ) {
 			const int H = mc.metadata().hidden_size;

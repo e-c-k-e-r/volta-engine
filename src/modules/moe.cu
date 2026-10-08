@@ -545,11 +545,10 @@ void MoE::forward(
 	const int rows = ( out.ndim >= 2 && out.shape[0] > 0 ) ? out.shape[0] : 1;
 	// Concurrent expert groups: a rank has ~2 active experts at one row, ~13 at eight, all 72 in a prefill chunk, and
 	// each group has fewer blocks, so wide grouping only pays once there are experts to run side by side.
-	static const int env_groups = std::getenv( "EXL3_MOE_GROUPS" ) ? std::atoi( std::getenv( "EXL3_MOE_GROUPS" ) ) : 0;
 	// Sharded experts (every rank runs every active expert, a quarter wide) want all groups at any row count: the active experts
 	// are few per token but each pass is short, so the fixed phase costs hide behind the other groups
 	const bool sharded = weights.num_local_experts > 72;
-	const int num_groups = env_groups > 0 ? MIN( env_groups, MOE_MAX_GROUPS ) : ( sharded ? MOE_MAX_GROUPS : rows == 1 ? 1 : rows <= 16 ? 4 : MOE_MAX_GROUPS );
+	const int num_groups = sharded ? MOE_MAX_GROUPS : rows == 1 ? 1 : rows <= 16 ? 4 : MOE_MAX_GROUPS;
 	// Fused decode path: gate/up and down GEMV kernels over runs of rows that share an expert (exl3_moe_coop.cuh)
 	if ( weights.type == pod::QuantType::TRELLIS && rows <= MOE_COOP_MAX_ROWS && scratch.coop_ctr != nullptr
 		&& weights.gate[0].bits == 3 && weights.up[0].bits == 3 && weights.down[0].bits == 3 && weights.up[0].mul1 && weights.gate[0].mul1 && weights.down[0].mul1 ) {
@@ -605,7 +604,7 @@ void MoE::forward(
 			ENGINE_ASSERT( weights.device_ptrs != nullptr, "MoE::forward: init_device_ptrs not called" );
 			ENGINE_ASSERT( K_gate == 3 && K_up == 3 && K_down == 3, "MoE::forward: persistent trellis MoE kernel is instantiated for 3-bit experts only" );
 
-			const int wide = static_cast<int>( std::getenv( "EXL3_MOE_WIDE" ) ? std::atoi( std::getenv( "EXL3_MOE_WIDE" ) ) : ( rows > 8 ? 2 : 0 ) );
+			const int wide = rows > 8 ? 2 : 0;
 			MoERouter::exl3_moe_dispatch(
 				d_topk_indices,
 				d_topk_weights,
@@ -775,21 +774,15 @@ void exl3_moe(
 	};
 
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 256, 2, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 256, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 128, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		attr_set[device] = true;
 	}
 
 	// The wide kernel carries the 16-row GEMM tile as well; keeping it out of the decode kernel preserves its registers
 	// Output-tile width of the expert GEMMs: 256 is 18-29% faster than 128 below 64 rows on both the sharded and the whole-expert
-	// layouts (fewer K-split reductions per weight decoded) and level at 512; EXL3_MOE_TILE_N=128 selects the old tile
-	static const int tile_n = std::getenv( "EXL3_MOE_TILE_N" ) ? std::atoi( std::getenv( "EXL3_MOE_TILE_N" ) ) : 256;
-	void* moe_fn = tile_n == 128
-		? ( wide == 2 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<3, 128, 2, 0> )
-		: ( wide == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0> );
+	// layouts (fewer K-split reductions per weight decoded) and level at 512
+	void* moe_fn = wide == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0>;
 	CUDA_CHECK( cudaLaunchKernel(
 		moe_fn,
 		grid_dim,

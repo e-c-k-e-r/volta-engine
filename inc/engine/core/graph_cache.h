@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/config.h"
+#include "engine/runtime/options.h"
 #include "engine/core/batch.h"
 #include "engine/backend/runtime.h"
 #include <cstdio>
@@ -15,12 +16,11 @@ namespace engine::core {
 //   call 1 for m : eager (lazy one-time setup such as smem attributes happens outside capture)
 //   call 2 for m : capture (thread-local mode, 4 ranks capture concurrently) + instantiate
 //   call 3+      : cudaGraphLaunch
-// VOLTA_NO_GRAPHS=1 forces eager execution.
+// ENGINE_DEBUG_NO_GRAPHS=1 (Options::no_graphs) forces eager execution.
 class GraphCache {
 public:
 	GraphCache() {
-		const char* env = std::getenv( "VOLTA_NO_GRAPHS" );
-		enabled_ = !( env && env[0] == '1' );
+		enabled_ = !runtime::options().no_graphs;
 	}
 	GraphCache( const GraphCache& ) = delete;
 	GraphCache& operator=( const GraphCache& ) = delete;

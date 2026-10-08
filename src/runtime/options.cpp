@@ -40,8 +40,12 @@ Options from_env() {
 	env_flag( "EXL3_MOE_TP", o.moe_tp );
 	env_flag( "EXL3_DSA", o.dsa );
 	env_flag( "EXL3_MLA_LATENT", o.mla_latent );
-	o.expert_log = std::getenv( "EXL3_EXPERT_LOG" ) != nullptr;
-	o.dsa_diag = std::getenv( "EXL3_DSA_DIAG" ) != nullptr;
+	env_flag( "VOLTA_SPEC_CTRL", o.spec_ctrl );
+	o.expert_log = std::getenv( "ENGINE_DEBUG_EXPERT_LOG" ) != nullptr;
+	o.dsa_diag = std::getenv( "ENGINE_DEBUG_DSA" ) != nullptr;
+	o.spec_ctrl_log = std::getenv( "ENGINE_DEBUG_SPEC_CTRL" ) != nullptr;
+	o.no_graphs = std::getenv( "ENGINE_DEBUG_NO_GRAPHS" ) != nullptr;
+	env_int( "ENGINE_DEBUG_DUMP_DRAFT", o.dump_draft_round );
 	return o;
 }
 
@@ -91,8 +95,12 @@ bool set_option( const std::string& key, const std::string& value ) {
 	if ( key == "moe_tp" ) return as_bool( o.moe_tp );
 	if ( key == "dsa" ) return as_bool( o.dsa );
 	if ( key == "mla_latent" ) return as_bool( o.mla_latent );
+	if ( key == "spec_ctrl" ) return as_bool( o.spec_ctrl );
 	if ( key == "expert_log" ) return as_bool( o.expert_log );
 	if ( key == "dsa_diag" ) return as_bool( o.dsa_diag );
+	if ( key == "spec_ctrl_log" ) return as_bool( o.spec_ctrl_log );
+	if ( key == "no_graphs" ) return as_bool( o.no_graphs );
+	if ( key == "dump_draft_round" ) return as_int( o.dump_draft_round );
 	return false;
 }
 

@@ -921,8 +921,6 @@ namespace {
 int tile_wk_rt( int wn ) { return exl3_moe_coop_ns::WK / wn; }
 
 int pick_ksplit( int base, int kslices, int max_split, int num_sms ) {
-	static const int forced = std::getenv( "EXL3_MOE_COOP_KSPLIT" ) ? std::atoi( std::getenv( "EXL3_MOE_COOP_KSPLIT" ) ) : 0;
-	if ( forced > 0 ) return MIN( forced, max_split );
 	const int want = CEIL_DIVIDE( num_sms, MAX( base, 1 ) );
 	const int kcap = MAX( kslices / 64, 1 );
 	return MAX( 1, MIN( MIN( want, kcap ), max_split ) );

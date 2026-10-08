@@ -2,7 +2,7 @@
 # (architecture/dflash2.py, modules/arch_specific/dflash2.py) and 1Cat-vLLM (qwen3_dflash2.py), NOT from the
 # engine, so it can catch errors a self-written reference would share (it found the interleaved-RoPE bug).
 #
-#   EXL3_DUMP_DRAFT=<round> ./build/bench_accept --prompts 1 --tokens 96     # writes /tmp/draft_dump.bin
+#   ENGINE_DEBUG_DUMP_DRAFT=<round> ./build/bench_accept --prompts 1 --tokens 96     # writes /tmp/draft_dump.bin
 #   <exllamav3>/.venv/bin/python tests/2_parity/draft_oracle.py              # per-row cosine vs the engine
 #
 # Expect cos >= ~0.998 per row against the 5-bit drafter (BF16 oracle weights, FP32 math). VAR= takes

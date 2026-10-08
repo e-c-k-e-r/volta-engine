@@ -374,11 +374,8 @@ void nvfp4_gemm_tc_kernel(
 
 namespace engine::modules {
 
-// Rows up to which the fused skinny kernel beats dequantize + HGEMM; EXL3_NVFP4_SKINNY_MAX overrides (A/B knob).
-static int nvfp4_skinny_max_rows() {
-	static const int v = std::getenv( "EXL3_NVFP4_SKINNY_MAX" ) ? std::min( 32, std::atoi( std::getenv( "EXL3_NVFP4_SKINNY_MAX" ) ) ) : 32;
-	return v;
-}
+// Rows up to which the fused skinny kernel beats dequantize + HGEMM
+static constexpr int NVFP4_SKINNY_MAX_ROWS = 32;
 
 void LinearNVFP4::forward(
 	const pod::TensorView& x,
@@ -424,7 +421,7 @@ void LinearNVFP4::forward(
 			codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale
 		);
 	}
-	else if ( m <= nvfp4_skinny_max_rows() ) {
+	else if ( m <= NVFP4_SKINNY_MAX_ROWS ) {
 		// Up to 32 rows: the decoded weights are reused across 3 or 4 row tiles of 8
 		if ( m <= 24 ) {
 			skinny_nvfp4_qpn<3><<<grid, dim3( 128 ), 0, stream>>>(
