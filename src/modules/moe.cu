@@ -11,6 +11,9 @@ namespace engine::modules {
 
 namespace {
 
+// One thread per expert bin (plus the overflow bin): up to 511 experts per rank
+constexpr int MOE_HIST_THREADS = 512;
+
 __global__ void moe_dispatch_hist_kernel(
 	const int* __restrict__ selected_experts,
 	const int n,
@@ -25,7 +28,7 @@ __global__ void moe_dispatch_hist_kernel(
 	int chunk_rows,
 	uint32_t* __restrict__ heat
 ) {
-	__shared__ int hist[128];
+	__shared__ int hist[MOE_HIST_THREADS];
 	const int threads = blockDim.x;
 	for ( int i = threadIdx.x; i <= num_experts; i += threads ) hist[i] = 0;
 	__syncthreads();
@@ -38,10 +41,10 @@ __global__ void moe_dispatch_hist_kernel(
 	__syncthreads();
 
 	if ( heat != nullptr && threadIdx.x < num_experts && hist[threadIdx.x] > 0 ) atomicAdd( &heat[threadIdx.x], static_cast<uint32_t>( hist[threadIdx.x] ) );
-	__shared__ int scan[128];
+	__shared__ int scan[MOE_HIST_THREADS];
 	scan[threadIdx.x] = ( threadIdx.x <= num_experts ) ? hist[threadIdx.x] : 0;
 	__syncthreads();
-	for ( int d = 1; d < 128; d <<= 1 ) {
+	for ( int d = 1; d < MOE_HIST_THREADS; d <<= 1 ) {
 		int v = ( threadIdx.x >= d ) ? scan[threadIdx.x - d] : 0;
 		__syncthreads();
 		scan[threadIdx.x] += v;
@@ -61,7 +64,7 @@ __global__ void moe_dispatch_hist_kernel(
 		const int nchunks = ( threadIdx.x < num_experts ) ? ( hist[threadIdx.x] + chunk_rows - 1 ) / chunk_rows : 0;
 		scan[threadIdx.x] = nchunks;
 		__syncthreads();
-		for ( int d = 1; d < 128; d <<= 1 ) {
+		for ( int d = 1; d < MOE_HIST_THREADS; d <<= 1 ) {
 			int v = ( threadIdx.x >= d ) ? scan[threadIdx.x - d] : 0;
 			__syncthreads();
 			scan[threadIdx.x] += v;
@@ -261,7 +264,7 @@ __global__ void moe_sum_planes8_kernel(
 	const uint4* p = reinterpret_cast<const uint4*>( planes );
 	float acc[8];
 	#pragma unroll
-	for ( int g = 0; g < 8; ++g ) {
+	for ( int g = 0; g < MOE_MAX_GROUPS; ++g ) {
 		if ( g >= num_groups ) break;
 		const uint4 raw = p[static_cast<size_t>( g ) * n8 + i];
 		const half2* h2 = reinterpret_cast<const half2*>( &raw );
@@ -424,7 +427,7 @@ void MoERouter::exl3_moe_dispatch(
 	int* sched = locks + MOE_SCHED_OFFSET;
 	int num_groups = 1;
 
-	moe_dispatch_hist_kernel<<<dim3( 1 ), dim3( 128 ), 0, stream>>>(
+	moe_dispatch_hist_kernel<<<dim3( 1 ), dim3( MOE_HIST_THREADS ), 0, stream>>>(
 		selected_experts,
 		n,
 		num_experts,
@@ -524,7 +527,10 @@ void MoE::forward(
 	// Concurrent expert groups: a rank has ~2 active experts at one row, ~13 at eight, all 72 in a prefill chunk, and
 	// each group has fewer blocks, so wide grouping only pays once there are experts to run side by side.
 	static const int env_groups = std::getenv( "EXL3_MOE_GROUPS" ) ? std::atoi( std::getenv( "EXL3_MOE_GROUPS" ) ) : 0;
-	const int num_groups = env_groups > 0 ? MIN( env_groups, MOE_MAX_GROUPS ) : ( rows == 1 ? 1 : rows <= 16 ? 4 : MOE_MAX_GROUPS );
+	// Sharded experts (every rank runs every active expert, a quarter wide) want all groups at any row count: the active experts
+	// are few per token but each pass is short, so the fixed phase costs hide behind the other groups
+	const bool sharded = weights.num_local_experts > 72;
+	const int num_groups = env_groups > 0 ? MIN( env_groups, MOE_MAX_GROUPS ) : ( sharded ? MOE_MAX_GROUPS : rows == 1 ? 1 : rows <= 16 ? 4 : MOE_MAX_GROUPS );
 	const size_t plane_elems = static_cast<size_t>( rows ) * out.shape[out.ndim - 1];
 	half* target = ( num_groups == 1 ) ? out.ptr<half>() : scratch.planes;
 	CUDA_CHECK( cudaMemsetAsync( target, 0, plane_elems * num_groups * sizeof( half ), stream ) );
@@ -589,6 +595,9 @@ void MoE::forward(
 				num_groups,
 				plane_elems,
 				wide,
+				weights.up[0].w1.shape[0],      // hidden: the length of suh
+				weights.up[0].w2.shape[0],      // this rank's intermediate width: the length of svh (2048, or 512 when sharded)
+				E,
 				stream
 			);
 			if ( num_groups > 1 ) {
@@ -642,6 +651,9 @@ void exl3_moe(
 	int num_groups,
 	size_t out_plane_stride,
 	int wide,
+	int hidden_dim,
+	int intermediate_dim,
+	int num_experts,
 	cudaStream_t stream
 ) {
 	(void) gate_mcg; (void) gate_mul1; (void) up_mcg; (void) up_mul1; (void) down_mcg; (void) down_mul1;
@@ -660,9 +672,6 @@ void exl3_moe(
 	const half* _hidden_state = static_cast<const half*>( hidden_state );
 	half* _output_state = static_cast<half*>( output_state );
 
-	int hidden_dim = 4096;
-	int intermediate_dim = 2048;
-	int num_experts = 72;
 	int num_experts_per_tok = 8;
 	int max_tokens_per_expert = wide == 2 ? 16 : 4; // rows per expert pass (the GEMM tile); larger batches run in chunks
 	int concurrency = num_groups;

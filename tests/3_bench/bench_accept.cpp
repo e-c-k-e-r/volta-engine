@@ -34,7 +34,8 @@ int main( int argc, char** argv ) {
 		"Prove that the square root of 2 is irrational.",
 		"Write a SQL query to find the second highest salary in an employees table and explain how it works.",
 	};
-	const int total = static_cast<int>( sizeof( prompts ) / sizeof( prompts[0] ) );
+	const char* one_prompt = std::getenv( "BENCH_PROMPT" ); // measure a single prompt of your own
+	const int total = one_prompt ? 1 : static_cast<int>( sizeof( prompts ) / sizeof( prompts[0] ) );
 
 	engine::loader::Tokenizer tok;
 	ENGINE_ASSERT( tok.load( glm ? test::GLM_DIR : test::QWEN_DIR ), "tokenizer load failed" );
@@ -59,11 +60,11 @@ int main( int argc, char** argv ) {
 		if ( glm ) {
 			engine::loader::ChatTemplateOptions opts;
 			opts.enable_thinking = think;
-			ids = tok.encode( chat.render( { { "user", prompts[pi] } }, opts ), false );
+			ids = tok.encode( chat.render( { { "user", ( one_prompt ? one_prompt : prompts[pi] ) } }, opts ), false );
 		}
 		else {
 			ids = { 248045, 846, 198 };
-			const std::vector<int> body = tok.encode( prompts[pi], false );
+			const std::vector<int> body = tok.encode( ( one_prompt ? one_prompt : prompts[pi] ), false );
 			ids.insert( ids.end(), body.begin(), body.end() );
 			const std::vector<int> tail = think
 				? std::vector<int>{ 248046, 198, 248045, 74455, 198, 248068, 198 }

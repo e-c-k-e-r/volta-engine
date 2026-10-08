@@ -80,7 +80,12 @@ bool GLM53Pipeline::init(
 
 	const int R = pod::MAX_ROWS;
 	const int S = config_.max_slots;
-	const int E_local = config_.num_experts / config_.tp_size;
+	// Routed experts: sharded over the ranks (every rank holds a quarter of every expert's intermediate width, EXL3_MOE_TP,
+	// default) or expert-parallel (72 whole experts per rank, forced by the two-tier expert cache). The sharded layout balances
+	// the load: each active expert costs every rank the same, where expert-parallel waits for the rank that drew the most.
+	moe_tp_ = !( std::getenv( "EXL3_MOE_TP" ) && std::atoi( std::getenv( "EXL3_MOE_TP" ) ) == 0 )
+		&& engine::modules::ExpertTier::env_fraction() >= 1.0 && config_.tp_size == ENGINE_NUM_GPUS;
+	const int E_local = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
 
 	// 1. Router outputs + routed-MoE dispatch scratch
 	state_.d_topk_indices = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( int ) ) );
@@ -327,7 +332,7 @@ bool GLM53Pipeline::expert_heat( std::vector<uint32_t>& out, int& layers, int& e
 	CUDA_CHECK( cudaSetDevice( rank_ ) );
 	CUDA_CHECK( cudaDeviceSynchronize() );
 	layers = 0;
-	experts = config_.num_experts / config_.tp_size;
+	experts = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
 	out.clear();
 	for ( auto& lw : layers_ ) {
 		if ( !lw.is_moe || lw.moe_weights.heat == nullptr ) continue;
@@ -412,8 +417,8 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 
 	// 2. Per-layer weights across 45 layers
 	char name_buf[256];
-	int experts_per_rank = config_.num_experts / config_.tp_size; // 288 / 4 = 72
-	int start_expert = rank_ * experts_per_rank;
+	int experts_per_rank = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size; // 288 sharded, 72 expert-parallel
+	int start_expert = moe_tp_ ? 0 : rank_ * experts_per_rank;
 
 	static constexpr int GLM_QKV_BLOCKS[3] = { 512, 512, 512 };
 	static constexpr int GLM_QKV_RANK_BLOCKS[3] = { 128, 128, 128 };
@@ -562,13 +567,13 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 				pod::MemoryArena* cp[3] = { tier_layer >= 0 ? &ca[0] : nullptr, tier_layer >= 0 ? &ca[1] : nullptr, tier_layer >= 0 ? &ca[2] : nullptr };
 
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, gid );
-				mw.gate[e] = repo.load_linear( name_buf, *arena_, 4, stream, cp[0] );
+				mw.gate[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, config_.tp_size, stream ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[0] );
 
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, gid );
-				mw.up[e] = repo.load_linear( name_buf, *arena_, 4, stream, cp[1] );
+				mw.up[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, config_.tp_size, stream ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[1] );
 
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, gid );
-				mw.down[e] = repo.load_linear( name_buf, *arena_, 4, stream, cp[2] );
+				mw.down[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 0, rank_, config_.tp_size, stream ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[2] );
 			}
 			engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );
 			mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( experts_per_rank ) * sizeof( uint32_t ), 128 ) );
@@ -867,9 +872,9 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 	// mHC: expand every row's embedding into its 4 residual streams
 	engine::modules::HyperConnection::init_streams( embed_rows_, hidden_streams_, H, stream, m );
 
-	// Routed experts are partitioned across ranks (TP=4)
-	int experts_per_rank = config_.num_experts / config_.tp_size; // 72
-	int start_expert = rank_ * experts_per_rank;
+	// Routed experts: this rank's 72 whole experts, or a quarter of all 288
+	int experts_per_rank = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
+	int start_expert = moe_tp_ ? 0 : rank_ * experts_per_rank;
 	int end_expert = start_expert + experts_per_rank;
 
 	for ( int layer = 0; layer < config_.num_layers; ++layer ) {

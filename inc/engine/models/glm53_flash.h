@@ -35,8 +35,8 @@ struct GLM53Config {
 	int dsa_top_k = 64;
 	int vocab_size = 154880;
 	int tp_size = 4;
-	int max_seq = 16384;
-	int max_slots = 1; // absorbed MLA latent cache: ~180 MiB/slot/rank at 16K (expanded K/V: 369 MiB at 2K); weights fill the 31 GiB arena and the drafter needs the last GiB (EXL3_MAX_SEQ=32768 fits without it)
+	int max_seq = 12288;
+	int max_slots = 1; // absorbed MLA latent cache: ~135 MiB/slot/rank at 12K (expanded K/V: 369 MiB at 2K); weights fill the 31 GiB arena and the FP16 drafter needs the last GiB (EXL3_MAX_SEQ=32768 fits without it, 16384 with the EXL3 drafter)
 	int num_mla_layers = 11;
 	int kda_heads = 16;
 	int kda_head_dim = 128;
@@ -196,6 +196,7 @@ private:
 	engine::runtime::KVCachePool kv_pool_;
 	// Absorbed MLA (EXL3_MLA_LATENT, default on): the cache holds the 512-wide KV latent per token, shared by all heads,
 	// instead of expanded per-head K / V (1 KiB vs 16 KiB per token per layer, so kv_pool_ is not allocated)
+	bool moe_tp_ = true;                // routed experts sharded over the ranks instead of expert-parallel
 	engine::modules::ExpertTier tier_;
 	pod::MemoryArena host_arena_{};     // pinned cold-expert tier
 	int tier_layers_ = 0;

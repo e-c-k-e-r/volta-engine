@@ -8,15 +8,16 @@
 #include <cuda_fp16.h>
 
 #define MOE_MAX_GROUPS 8
+#define MOE_MAX_EXPERTS 288   // experts per rank: 72 expert-parallel, all 288 with each expert sharded over the ranks
 
 namespace pod {
 
 struct MoELayerWeights {
 	QuantType type = QuantType::TRELLIS;
 	int num_local_experts = 72;
-	LinearWeight gate[72];
-	LinearWeight up[72];
-	LinearWeight down[72];
+	LinearWeight gate[MOE_MAX_EXPERTS];
+	LinearWeight up[MOE_MAX_EXPERTS];
+	LinearWeight down[MOE_MAX_EXPERTS];
 	void* device_ptrs = nullptr;
 	uint32_t* heat = nullptr;          // [num_local_experts] routes per expert since the last reset (device), optional
 };
@@ -158,6 +159,9 @@ void exl3_moe(
 	int num_groups,
 	size_t out_plane_stride,        // elements between the per-group output planes
 	int wide,                       // expert GEMM tile: 0: 4 rows, 2: 16 rows above 4
+	int hidden_dim,
+	int intermediate_dim,           // this rank's width of the expert intermediate
+	int num_experts,
 	cudaStream_t stream = nullptr
 );
 
