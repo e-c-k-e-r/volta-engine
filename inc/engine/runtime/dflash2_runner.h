@@ -47,6 +47,8 @@ public:
 	// Claiming a slot resets the drafter's projected context and redirects tap publication.
 	void claim( int slot );
 	bool owns( int slot ) const { return owner_ == slot; }
+	// The slot stops owning the drafter context (it was overwritten by a restored snapshot, which carries no taps).
+	void release( int slot );
 
 	// Requires owns( slot ). `anchor` is the last committed, not yet forwarded token at `pos`.
 	// With a non-greedy `sp` the round samples: each draft token is accepted with the target's probability of it

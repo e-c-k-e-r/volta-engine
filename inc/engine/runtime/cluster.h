@@ -10,7 +10,10 @@
 #include "engine/runtime/sampling.h"
 #include <functional>
 #include "engine/backend/types.h"
+#include <map>
 #include <memory>
+#include <mutex>
+#include <vector>
 #include <string>
 #include <vector>
 
@@ -43,7 +46,21 @@ public:
 	// last_cands (optional) receives the final row's top-16 candidates so the caller can sample the first token.
 	// chunk 0 = the model's largest row count (128 for Qwen). Chunks above MAX_BATCH rows run eagerly and skip the
 	// LM head except for the final row of the final chunk.
-	int prefill( const int* tokens, int count, int slot, int chunk = 0, Candidates* last_cands = nullptr );
+	// pos0: position of tokens[0] (a prefill that resumes from a restored prefix starts there)
+	int prefill( const int* tokens, int count, int slot, int chunk = 0, Candidates* last_cands = nullptr, int pos0 = 0 );
+
+	// Sequence snapshots (prefix cache): one pinned host buffer per rank holding the slot's recurrent state and the KV
+	// rows [0, tokens). Buffers are recycled through a pool, so steady-state saves allocate nothing.
+	struct SeqSnapshot {
+		int tokens = 0;
+		size_t bytes = 0;                  // per rank
+		void* host[ENGINE_NUM_GPUS] = {};
+	};
+	size_t snapshot_bytes( int tokens ) const;    // per rank; 0 when the model cannot snapshot
+	bool save_snapshot( int slot, int tokens, SeqSnapshot* snap );
+	// Overwrites the slot's state with the snapshot. The slot leaves the drafter's ownership (no taps exist for the restored prefix).
+	bool load_snapshot( int slot, const SeqSnapshot& snap );
+	void free_snapshot( SeqSnapshot* snap );
 
 	// Greedy argmax of the last forward's first `count` rows (rank 0).
 	void sample( int* out, int count );
@@ -101,6 +118,8 @@ private:
 	void* staging_ptrs_[ENGINE_NUM_GPUS] = {};
 	void* flag_ptrs_[ENGINE_NUM_GPUS] = {};
 	std::unique_ptr<DFlash2Runner> runner_;
+	std::map<size_t, std::vector<void*>> snapshot_free_[ENGINE_NUM_GPUS]; // pinned buffers by rounded size
+	std::mutex snapshot_mtx_;
 	RankPool pool_;
 };
 

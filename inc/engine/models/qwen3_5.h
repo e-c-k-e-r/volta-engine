@@ -128,6 +128,9 @@ public:
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) override;
 	void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) override;
+	size_t seq_state_bytes( int tokens ) const override;
+	bool save_seq_state( int slot_id, int tokens, void* host_dst, backend::stream_t stream = nullptr ) override;
+	bool load_seq_state( int slot_id, int tokens, const void* host_src, backend::stream_t stream = nullptr ) override;
 	void reset_state( int slot_id = 0 ) override;
 
 	pod::TensorView& logits() override { return logits_; }

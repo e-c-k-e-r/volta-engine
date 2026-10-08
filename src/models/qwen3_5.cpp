@@ -846,4 +846,52 @@ void Qwen3_5Pipeline::commit_spec_row( int slot_id, int row, backend::stream_t s
 	backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, state_.conv_snap + static_cast<size_t>( row ) * state_.slot_conv_floats, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
 }
 
+// -- Sequence snapshots (prefix cache). Host layout: [GDN states][conv history][per attention layer: K rows, V rows].
+namespace {
+constexpr size_t kSeqAlign = 256;
+}
+
+size_t Qwen3_5Pipeline::seq_state_bytes( int tokens ) const {
+	if ( kv_pool_.format != pod::KVFormat::FP16 || tokens < 0 || tokens > config_.max_seq ) return 0;
+	const size_t recurrent = ( state_.slot_gdn_floats + state_.slot_conv_floats ) * sizeof( float );
+	const size_t kv_row = static_cast<size_t>( kv_pool_.num_heads ) * kv_pool_.head_dim * sizeof( backend::half_t );
+	return recurrent + 2 * static_cast<size_t>( kv_pool_.num_layers ) * tokens * kv_row + kSeqAlign;
+}
+
+bool Qwen3_5Pipeline::save_seq_state( int slot_id, int tokens, void* host_dst, backend::stream_t stream ) {
+	if ( seq_state_bytes( tokens ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+	backend::set_device( rank_ );
+	char* dst = static_cast<char*>( host_dst );
+	const size_t gdn = state_.slot_gdn_floats * sizeof( float ), conv = state_.slot_conv_floats * sizeof( float );
+	backend::memcpy_async( dst, state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, gdn, backend::Copy::D2H, stream );
+	backend::memcpy_async( dst + gdn, state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, conv, backend::Copy::D2H, stream );
+	dst += gdn + conv;
+	const size_t bytes = static_cast<size_t>( tokens ) * kv_pool_.num_heads * kv_pool_.head_dim * sizeof( backend::half_t );
+	for ( int layer = 0; layer < kv_pool_.num_layers && tokens > 0; ++layer ) {
+		backend::memcpy_async( dst, kv_pool_.get_k_ptr( slot_id, layer, 0 ), bytes, backend::Copy::D2H, stream );
+		dst += bytes;
+		backend::memcpy_async( dst, kv_pool_.get_v_ptr( slot_id, layer, 0 ), bytes, backend::Copy::D2H, stream );
+		dst += bytes;
+	}
+	return true;
+}
+
+bool Qwen3_5Pipeline::load_seq_state( int slot_id, int tokens, const void* host_src, backend::stream_t stream ) {
+	if ( seq_state_bytes( tokens ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+	backend::set_device( rank_ );
+	const char* src = static_cast<const char*>( host_src );
+	const size_t gdn = state_.slot_gdn_floats * sizeof( float ), conv = state_.slot_conv_floats * sizeof( float );
+	backend::memcpy_async( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, src, gdn, backend::Copy::H2D, stream );
+	backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, src + gdn, conv, backend::Copy::H2D, stream );
+	src += gdn + conv;
+	const size_t bytes = static_cast<size_t>( tokens ) * kv_pool_.num_heads * kv_pool_.head_dim * sizeof( backend::half_t );
+	for ( int layer = 0; layer < kv_pool_.num_layers && tokens > 0; ++layer ) {
+		backend::memcpy_async( kv_pool_.get_k_ptr( slot_id, layer, 0 ), src, bytes, backend::Copy::H2D, stream );
+		src += bytes;
+		backend::memcpy_async( kv_pool_.get_v_ptr( slot_id, layer, 0 ), src, bytes, backend::Copy::H2D, stream );
+		src += bytes;
+	}
+	return true;
+}
+
 } // namespace engine::models

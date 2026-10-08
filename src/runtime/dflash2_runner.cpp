@@ -117,6 +117,17 @@ void DFlash2Runner::claim( int slot ) {
 	} );
 }
 
+void DFlash2Runner::release( int slot ) {
+	if ( owner_ != slot ) return;
+	owner_ = -1;
+	mc_->run_ranks( [&]( int d ) {
+		const int v = -1;
+		const auto& hk = mc_->model( d ).draft_hooks();
+		backend::memcpy_async( hk.taps_owner, &v, sizeof( int ), backend::Copy::H2D, mc_->stream( d ) );
+		backend::stream_sync( mc_->stream( d ) );
+	} );
+}
+
 void DFlash2Runner::step_stats( int* attempts, int* hits ) const {
 	for ( int i = 0; i < 8; ++i ) {
 		attempts[i] = att_[i];

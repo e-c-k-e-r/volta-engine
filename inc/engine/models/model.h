@@ -141,6 +141,13 @@ public:
 	virtual void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) { (void) on; (void) stream; ENGINE_ASSERT( false, "model has no speculative state slots" ); }
 	virtual void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) { (void) slot_id; (void) row; (void) stream; ENGINE_ASSERT( false, "model has no speculative state slots" ); }
 
+	// 5b. Sequence snapshots for the prefix cache: everything a slot needs to resume after `tokens` positions (recurrent
+	// state and the KV rows [0, tokens)) as bytes in caller-provided host memory. seq_state_bytes() == 0 means the model
+	// (or its KV format) cannot snapshot. Stream-ordered: the caller synchronizes the stream before using the buffer.
+	virtual size_t seq_state_bytes( int tokens ) const { (void) tokens; return 0; }
+	virtual bool save_seq_state( int slot_id, int tokens, void* host_dst, backend::stream_t stream = nullptr ) { (void) slot_id; (void) tokens; (void) host_dst; (void) stream; return false; }
+	virtual bool load_seq_state( int slot_id, int tokens, const void* host_src, backend::stream_t stream = nullptr ) { (void) slot_id; (void) tokens; (void) host_src; (void) stream; return false; }
+
 	// 6. Output descriptors & tapped states
 	virtual pod::TensorView& logits() = 0;
 	virtual const pod::TensorView& logits() const = 0;

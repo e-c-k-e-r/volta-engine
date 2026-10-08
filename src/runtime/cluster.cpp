@@ -92,6 +92,12 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 
 void ModelCluster::shutdown() {
 	if ( !created_ ) return;
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		for ( auto& kv : snapshot_free_[d] ) {
+			for ( void* p : kv.second ) backend::host_free_pinned( p );
+		}
+		snapshot_free_[d].clear();
+	}
 	created_ = false;
 	initialized_ = false;
 	pool_.stop();
@@ -139,7 +145,7 @@ void ModelCluster::forward( const int* tokens, int count, int pos, int slot ) {
 	forward( tokens, pod::BatchRows::causal( count, pos, slot ) );
 }
 
-int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Candidates* last_cands ) {
+int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Candidates* last_cands, int pos0 ) {
 	ENGINE_ASSERT( count >= 1, "ModelCluster::prefill: empty prompt" );
 	const int max_rows = metadata().max_rows;
 	chunk = ( chunk <= 0 ) ? max_rows : MAX( 1, MIN( chunk, max_rows ) );
@@ -147,7 +153,7 @@ int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Ca
 	for ( int pos = 0; pos < count; pos += chunk ) {
 		last_rows = MIN( chunk, count - pos );
 		const bool last = ( pos + last_rows >= count );
-		forward( tokens + pos, pod::BatchRows::causal( last_rows, pos, slot,
+		forward( tokens + pos, pod::BatchRows::causal( last_rows, pos0 + pos, slot,
 			last ? pod::BatchRows::LOGITS_LAST : pod::BatchRows::LOGITS_NONE ) );
 	}
 	// A final chunk above the decode sizes computed logits for its last row only (in row 0).
@@ -279,6 +285,74 @@ void ModelCluster::warm_graphs( int max_m, int slot ) {
 	reset_slot( slot );
 	std::printf( "[+] Decode graphs warmed for m=1..%d in %.0f ms\n", max_m,
 		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
+}
+
+size_t ModelCluster::snapshot_bytes( int tokens ) const {
+	return models_[0]->seq_state_bytes( tokens );
+}
+
+bool ModelCluster::save_snapshot( int slot, int tokens, SeqSnapshot* snap ) {
+	constexpr size_t kRound = size_t( 8 ) << 20;
+	const size_t need = snapshot_bytes( tokens );
+	if ( need == 0 ) return false;
+	const size_t cls = ( need + kRound - 1 ) / kRound * kRound;
+	snap->tokens = tokens;
+	snap->bytes = cls;
+	for ( int d = 0; d < tp_; ++d ) {
+		void* p = nullptr;
+		{
+			std::lock_guard<std::mutex> lock( snapshot_mtx_ );
+			auto& list = snapshot_free_[d][cls];
+			if ( !list.empty() ) {
+				p = list.back();
+				list.pop_back();
+			}
+		}
+		if ( !p ) {
+			backend::set_device( d );
+			p = backend::host_alloc_pinned( cls, backend::Pin::Default );
+		}
+		if ( !p ) {
+			free_snapshot( snap );
+			return false;
+		}
+		snap->host[d] = p;
+	}
+	int ok[ENGINE_NUM_GPUS] = {};
+	pool_.run( [&]( int d ) {
+		ok[d] = models_[d]->save_seq_state( slot, tokens, snap->host[d], streams_[d] ) ? 1 : 0;
+		backend::stream_sync( streams_[d] );
+	} );
+	for ( int d = 0; d < tp_; ++d ) {
+		if ( !ok[d] ) {
+			free_snapshot( snap );
+			return false;
+		}
+	}
+	return true;
+}
+
+bool ModelCluster::load_snapshot( int slot, const SeqSnapshot& snap ) {
+	if ( snap.tokens <= 0 || !snap.host[0] ) return false;
+	if ( runner_ ) runner_->release( slot );
+	int ok[ENGINE_NUM_GPUS] = {};
+	pool_.run( [&]( int d ) {
+		ok[d] = models_[d]->load_seq_state( slot, snap.tokens, snap.host[d], streams_[d] ) ? 1 : 0;
+		backend::stream_sync( streams_[d] );
+	} );
+	for ( int d = 0; d < tp_; ++d ) {
+		if ( !ok[d] ) return false;
+	}
+	return true;
+}
+
+void ModelCluster::free_snapshot( SeqSnapshot* snap ) {
+	std::lock_guard<std::mutex> lock( snapshot_mtx_ );
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		if ( snap->host[d] ) snapshot_free_[d][snap->bytes].push_back( snap->host[d] );
+		snap->host[d] = nullptr;
+	}
+	snap->tokens = 0;
 }
 
 void ModelCluster::reset_slot( int slot ) {
