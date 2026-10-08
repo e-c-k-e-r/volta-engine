@@ -1,5 +1,8 @@
 #!/bin/zsh
 # Regression gate for refactors. Modes (GPU modes serialize: one job at a time, run under taskset -c 0-9):
+#   quick           CUDA build + kernel resource fingerprint (cuobjdump -res-usage: seconds) + coherence. For moves/renames/config work.
+#   fingerprint     save the resource fingerprint of the current build (results/fingerprint.txt)
+#   sass            full SASS md5 + HMMA count of bench_decode and volta_server in one pass (~40 s per binary), vs results/sass.txt (saved if absent)
 #   static          no GPU: header hygiene greps (backend abstraction) and a full build
 #   parity          GPU: tier 2 parity tests + coherence + sampling gate
 #   bench           GPU: bench_decode / bench_accept / bench_prefill for both models
@@ -95,7 +98,33 @@ needles() {
 	run needle_glm_spec gpu ./test_longctx --glm --spec --tokens 8000 --depth 30
 }
 
+fingerprint() { # one line per binary: md5 of per-kernel registers/stack/smem
+	for b in bench_decode volta_server; do echo "$b $(cuobjdump -res-usage $b 2>/dev/null | md5sum | cut -c1-32)"; done
+}
+
+sass_fingerprint() {
+	for b in bench_decode volta_server; do
+		cuobjdump -sass $b 2>/dev/null | tee >(grep -c HMMA > $out/$b.hmma) | grep -E '^\s+/\*[0-9a-f]{4}\*/' | sed -E 's#/\*[0-9a-f]+\*/##;s#;.*##' | md5sum | cut -c1-32 > $out/$b.md5
+		echo "$b $(cat $out/$b.md5) hmma=$(cat $out/$b.hmma)"
+	done
+}
+
+compare_fp() { # name, current-file, saved-file
+	if [[ ! -f $3 ]]; then cp $2 $3; echo "saved $3"; return 0; fi
+	diff $3 $2 > $out/$1.diff && echo "[ok]   $1 identical" || { echo "[FAIL] $1 differs (see $out/$1.diff)"; return 1; }
+}
+
 case $mode in
+	quick)
+		ninja > $out/build.log 2>&1 || { echo "[FAIL] build"; fails=$((fails+1)); }
+		fingerprint > $out/fingerprint.txt
+		compare_fp fingerprint $out/fingerprint.txt $ROOT/results/fingerprint.txt || fails=$((fails+1))
+		run coherence gpu ./test_coherence ;;
+	fingerprint) fingerprint > $ROOT/results/fingerprint.txt; cat $ROOT/results/fingerprint.txt ;;
+	sass)
+		ninja > $out/build.log 2>&1 || { echo "[FAIL] build"; fails=$((fails+1)); }
+		sass_fingerprint > $out/sass.txt; cat $out/sass.txt
+		compare_fp sass $out/sass.txt $ROOT/results/sass.txt || fails=$((fails+1)) ;;
 	static) static_checks || fails=$((fails+1)) ;;
 	parity) tier2 ;;
 	bench) benches; cat $out/bench_numbers.txt ;;
