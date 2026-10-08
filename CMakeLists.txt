@@ -256,6 +256,9 @@ set_target_properties(bench_nvfp4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT
 add_executable(bench_decode tests/3_bench/bench_decode.cpp)
 target_link_libraries(bench_decode PRIVATE engine_kernels)
 set_target_properties(bench_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_cpu_forward tests/2_parity/test_cpu_forward.cpp)
+target_link_libraries(test_cpu_forward PRIVATE engine_kernels)
+set_target_properties(test_cpu_forward PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(bench_spec tests/3_bench/bench_spec.cpp)
 target_link_libraries(bench_spec PRIVATE engine_kernels)

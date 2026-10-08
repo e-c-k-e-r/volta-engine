@@ -4,6 +4,12 @@
 // src/shaders/*.slang (tests/2_parity/test_slang_cpu.cpp keeps its own copy). Kernels run serially: one call per launch.
 #include <slang-cpp-prelude.h>
 #include <cstdint>
+#include <algorithm>
+#include <functional>
+#include <cstdlib>
+#include <sched.h>
+#include <thread>
+#include <vector>
 
 extern "C" {
 void rms_norm( ComputeVaryingInput*, void*, void* );
@@ -75,6 +81,47 @@ inline void cpu_dispatch( void ( *fn )( ComputeVaryingInput*, void*, void* ), vo
 	vi.startGroupID = { 0, 0, 0 };
 	vi.endGroupID = { gx, gy, gz };
 	fn( &vi, params, nullptr );
+}
+
+// Worker count for the parallel helpers: ENGINE_CPU_THREADS, else the hardware concurrency
+inline int cpu_threads() {
+	static const int n = [] {
+		const char* e = std::getenv( "ENGINE_CPU_THREADS" );
+		cpu_set_t mask;
+		const int allowed = ( sched_getaffinity( 0, sizeof( mask ), &mask ) == 0 ) ? CPU_COUNT( &mask ) : static_cast<int>( std::thread::hardware_concurrency() );
+		const int v = e ? std::atoi( e ) : allowed;
+		return std::max( 1, v );
+	}();
+	return n;
+}
+
+// Splits [0, total) into contiguous ranges and runs fn( begin, end ) on each from its own thread. fn must be re-entrant
+inline void cpu_parallel_for( int64_t total, int64_t min_chunk, const std::function<void( int64_t, int64_t )>& fn ) {
+	const int64_t t = std::min<int64_t>( cpu_threads(), std::max<int64_t>( 1, total / std::max<int64_t>( 1, min_chunk ) ) );
+	if ( t <= 1 ) {
+		fn( 0, total );
+		return;
+	}
+	const int64_t step = ( total + t - 1 ) / t;
+	std::vector<std::thread> pool;
+	for ( int64_t i = 1; i < t; ++i ) {
+		if ( i * step >= total ) break;
+		pool.emplace_back( [&fn, i, step, total] { fn( i * step, std::min( total, ( i + 1 ) * step ) ); } );
+	}
+	fn( 0, std::min( total, step ) );
+	for ( auto& th : pool ) th.join();
+}
+
+// cpu_dispatch with the x grid split across threads. Only for kernels whose groups are independent and keep no shared
+// state (no groupshared on the host target); the Slang host entry points take a group range, so each thread gets its own
+inline void cpu_dispatch_mt( void ( *fn )( ComputeVaryingInput*, void*, void* ), void* params, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1 ) {
+	if ( gx == 0 || gy == 0 || gz == 0 ) return;
+	cpu_parallel_for( gx, 16, [&]( int64_t b, int64_t e ) {
+		ComputeVaryingInput vi = {};
+		vi.startGroupID = { static_cast<uint32_t>( b ), 0, 0 };
+		vi.endGroupID = { static_cast<uint32_t>( e ), gy, gz };
+		fn( &vi, params, nullptr );
+	} );
 }
 
 } // namespace impl

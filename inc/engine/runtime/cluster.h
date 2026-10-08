@@ -95,7 +95,7 @@ private:
 	bool initialized_ = false;
 	int tp_ = ENGINE_NUM_GPUS;
 	std::unique_ptr<engine::models::ModelPipeline> models_[ENGINE_NUM_GPUS];
-	pod::MemoryArena arenas_[ENGINE_NUM_GPUS];
+	pod::MemoryArena arenas_[ENGINE_NUM_GPUS] = {};
 	engine::comm::CollectiveRing rings_[ENGINE_NUM_GPUS];
 	backend::stream_t streams_[ENGINE_NUM_GPUS] = {};
 	void* staging_ptrs_[ENGINE_NUM_GPUS] = {};

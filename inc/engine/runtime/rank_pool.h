@@ -54,10 +54,14 @@ public:
 
 private:
 	void worker( int rank ) {
+#if ENGINE_BACKEND_CUDA
+		// One core per GPU-driving thread. Other backends keep the process mask: their kernels run on the host and spawn
+		// worker threads that inherit it, so pinning here would confine a whole rank's math to one core
 		cpu_set_t cpuset;
 		CPU_ZERO( &cpuset );
 		CPU_SET( rank, &cpuset );
 		pthread_setaffinity_np( pthread_self(), sizeof( cpu_set_t ), &cpuset );
+#endif
 		backend::set_device( rank );
 		while ( true ) {
 			pthread_barrier_wait( &barrier_ );

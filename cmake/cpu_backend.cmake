@@ -35,3 +35,7 @@ add_custom_target(run_cpu_smoke COMMAND test_cpu_smoke DEPENDS test_cpu_smoke)
 add_executable(volta_server src/server/main.cpp ${ENGINE_CPU_OBJECTS})
 target_link_libraries(volta_server PRIVATE pthread)
 set_target_properties(volta_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_cpu_forward tests/2_parity/test_cpu_forward.cpp ${ENGINE_CPU_OBJECTS})
+set_target_properties(test_cpu_forward PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+target_link_libraries(test_cpu_forward PRIVATE pthread)
