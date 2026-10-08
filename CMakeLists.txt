@@ -42,6 +42,7 @@ set(ENGINE_HOST_SOURCES
 	src/loader/nvfp4.cpp
 	src/loader/tokenizer.cpp
 	src/loader/chat_template.cpp
+	src/loader/jinja.cpp
 	src/models/model.cpp
 	src/models/qwen3_5.cpp
 	src/models/glm5_next.cpp
@@ -205,6 +206,11 @@ target_link_libraries(test_dflash PRIVATE engine_kernels)
 set_target_properties(test_dflash PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Test Tokenizer & Chat Template Parity
+add_executable(test_jinja tests/2_parity/test_jinja.cpp)
+target_link_libraries(test_jinja PRIVATE engine_kernels)
+target_compile_definitions(test_jinja PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
+set_target_properties(test_jinja PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(test_tokenizer tests/2_parity/test_tokenizer.cpp)
 target_link_libraries(test_tokenizer PRIVATE engine_kernels)
 set_target_properties(test_tokenizer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

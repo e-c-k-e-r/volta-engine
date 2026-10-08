@@ -54,6 +54,8 @@ tier2() {
 	done
 	# test_dflash prints a known FATAL in its geometry step (present before 2026-10-07); judged by its final line
 	run test_dflash sh -c "taskset -c 0-9 ./test_dflash | tail -3 | grep -q 'PASSED'"
+	run jinja_chat_templates ./test_jinja
+	run tokenizer ./test_tokenizer
 	run backend_tiers ./test_backend_tiers $ROOT
 	run ref_linear_host ./test_ref_linear
 	run ref_linear_gpu gpu ./test_ref_linear --gpu
