@@ -4,6 +4,16 @@
 // handles are pointers to opaque structs owned by src/backend/vulkan.
 #include <cstdint>
 
+// Qualifier and vector-type spellings that shared headers (core/batch.h, modules/*.h) use in declarations; no-ops / plain
+// structs for host code on this backend
+#ifndef __host__
+	#define __host__
+#endif
+#ifndef __device__
+	#define __device__
+#endif
+struct int4 { int x, y, z, w; };
+
 namespace engine::backend {
 	struct vk_stream;   // command stream: records into a command buffer, submitted on sync, ordered by a timeline semaphore
 	struct vk_graph;    // pre-recorded command buffer replayed with vkQueueSubmit
