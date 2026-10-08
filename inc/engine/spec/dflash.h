@@ -6,7 +6,7 @@
 #include "engine/core/arena.h"
 #include "engine/loader/safetensors.h"
 #include "engine/modules/linear.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cuda_fp16.h>
 
 namespace pod {
@@ -90,15 +90,15 @@ void dflash2_dynconv(
 	pod::TensorView& out,
 	int group_size,
 	bool accumulate,
-	cudaStream_t stream = nullptr
+	backend::stream_t stream = nullptr
 );
 
 // Places a [rows, src_cols] slice at column col0 of a [rows, dst_cols] matrix (the fc all-gather writes each
 // rank's slice into a zeroed full-width buffer and sums across ranks).
-void dflash_place_cols( half* dst, const half* src, int rows, int dst_cols, int src_cols, int col0, cudaStream_t stream = nullptr );
+void dflash_place_cols( half* dst, const half* src, int rows, int dst_cols, int src_cols, int col0, backend::stream_t stream = nullptr );
 
 // FP16 -> FP32 widening copy (the drafter widens o_proj / down_proj before their conv).
-void dflash_h2f( const half* in, float* out, int n, cudaStream_t stream = nullptr );
+void dflash_h2f( const half* in, float* out, int n, backend::stream_t stream = nullptr );
 
 // Pure CUDA candidate selector walk (greedy chained walk)
 void dflash2_selector_walk(
@@ -114,7 +114,7 @@ void dflash2_selector_walk(
 	int rows,
 	int k,
 	int rank,
-	cudaStream_t stream = nullptr
+	backend::stream_t stream = nullptr
 );
 
 // Pure CUDA Top-K extraction from logits
@@ -128,7 +128,7 @@ void dflash2_topk(
 	int* indices,
 	float scale = 1.0f,
 	float softcap = 0.0f,
-	cudaStream_t stream = nullptr
+	backend::stream_t stream = nullptr
 );
 
 // Per-row top-k over a *vocabulary shard*: scans the first `columns` entries of each row, whose
@@ -147,7 +147,7 @@ void dflash2_topk_shard(
 	float* part_v,
 	int* part_ix,
 	int* counters,
-	cudaStream_t stream = nullptr
+	backend::stream_t stream = nullptr
 );
 
 // Merge the per-rank local top-k into the global top-k, per row. part_vals/part_ix are
@@ -162,7 +162,7 @@ void dflash2_topk_merge(
 	float* out_vals,
 	int* out_ix,
 	int part_rows = 16,
-	cudaStream_t stream = nullptr
+	backend::stream_t stream = nullptr
 );
 
 // Plain FP16 GEMV, out[m, n] = sum_k w[n, k] * x[m, k], for up to 8 rows. The drafter's conv kernel
@@ -174,7 +174,7 @@ void dflash_f16_gemv_nt(
 	int m,
 	int n,
 	int k,
-	cudaStream_t stream = nullptr
+	backend::stream_t stream = nullptr
 );
 
 // RMSNorm with the residual split the reference uses: sum = x + residual_in, normed = rmsnorm(sum) *
@@ -188,7 +188,7 @@ void dflash_rmsnorm_residual(
 	int rows,
 	float eps,
 	float constant_bias,
-	cudaStream_t stream = nullptr
+	backend::stream_t stream = nullptr
 );
 
 // Per-head RMSNorm then NeoX RoPE, in place, on the drafter's Q or K tensor. `pairs` is
@@ -205,7 +205,7 @@ void dflash_qk_norm_rope(
 	int pos0,
 	float eps,
 	float constant_bias,
-	cudaStream_t stream = nullptr
+	backend::stream_t stream = nullptr
 );
 
 // GQA small-query attention for the drafter block: `rows` queries against `nctx` context slots
@@ -231,7 +231,7 @@ void dflash_attn(
 	// First block row that contributes a key. 1 leaves the anchor to the context (its K/V comes from
 	// the target's taps); 0 lets row 0 supply the anchor itself. See DFlashSpeculator::draft_backbone.
 	int own_first_row = 1,
-	cudaStream_t stream = nullptr
+	backend::stream_t stream = nullptr
 );
 
 // Take one side out of a conv kernel projection's [rows, 2*taps*groups] output and reinterpret it as
@@ -244,7 +244,7 @@ void dflash_conv_side_split(
 	int taps,
 	int groups,
 	int side_idx,
-	cudaStream_t stream = nullptr
+	backend::stream_t stream = nullptr
 );
 
 // Scatter a [n, heads*head_dim] projection into one layer of the ring-shaped context cache.
@@ -259,7 +259,7 @@ void dflash_cache_store(
 	int layer,
 	int stride_slot,
 	int stride_layer,
-	cudaStream_t stream = nullptr
+	backend::stream_t stream = nullptr
 );
 
 // NeoX RoPE tables for [len, head_dim/2] cos/sin, with the rotary width taken from the sum of the
@@ -271,7 +271,7 @@ void build_rope_table(
 	int head_dim,
 	float theta,
 	const int dim_sections[4],
-	cudaStream_t stream = nullptr
+	backend::stream_t stream = nullptr
 );
 
 // Columns one dflash2_topk block-tile covers (TOPK_THREADS * 16); sizes the split-partial scratch.
@@ -294,12 +294,12 @@ public:
 		const pod::DFlashConfig& config,
 		int device,
 		pod::MemoryArena& arena,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rank = 0,
 		int tp_size = 1
 	);
 
-	bool load_weights( const char* model_dir, cudaStream_t stream = nullptr );
+	bool load_weights( const char* model_dir, backend::stream_t stream = nullptr );
 
 	// ---- The real draft round, split so the per-row candidate top-k can cross the interconnect ----
 	//
@@ -322,15 +322,15 @@ public:
 		const half* tapped_states,
 		int block_pos0,
 		int taps_cap,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	// Selector gate = the candidate selector's hidden projection of the drafter's output, for the first
 	// `rows` rows. Written to d_gate_ as [rows, selector_rank].
-	void project_gate( int rows, cudaStream_t stream = nullptr );
+	void project_gate( int rows, backend::stream_t stream = nullptr );
 
 	// Seeds the walk with the anchor token (its step-0 predecessor).
-	void set_walk_anchor( int anchor, cudaStream_t stream = nullptr );
+	void set_walk_anchor( int anchor, backend::stream_t stream = nullptr );
 
 	// Drop the projected context (one slot's worth: the ring fill level, KV length and ingested count
 	// are single counters). Called when a new slot claims the drafter.
@@ -344,7 +344,7 @@ public:
 		const float* vals,
 		const int* ix,
 		int rows,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	const pod::TensorView& draft_hidden() const { return draft_hidden_; }
@@ -386,7 +386,7 @@ public:
 		int ctx_pos0,
 		int block_pos0,
 		pod::TensorView& hidden_out,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int taps_ring_cap = 0
 	);
 

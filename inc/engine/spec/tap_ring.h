@@ -2,7 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/core/batch.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cuda_fp16.h>
 
 namespace engine::spec {
@@ -18,7 +18,7 @@ void dflash_publish_taps(
 	int tap,
 	int H,
 	int cap,
-	cudaStream_t stream
+	backend::stream_t stream
 );
 
 // Reduces mHC residual streams [m, 4, H] (FP32) to one FP16 hidden row per token: mode 0 = mean of the four streams,
@@ -29,7 +29,7 @@ void dflash_reduce_streams(
 	int m,
 	int H,
 	int mode,
-	cudaStream_t stream
+	backend::stream_t stream
 );
 
 } // namespace engine::spec

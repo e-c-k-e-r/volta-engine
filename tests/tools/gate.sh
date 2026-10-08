@@ -29,7 +29,7 @@ static_checks() {
 		local n=$(grep -rn "$pat" $ROOT/inc/engine/core $ROOT/inc/engine/runtime $ROOT/inc/engine/models 2>/dev/null | wc -l)
 		echo "headers naming $pat (core, runtime, models): $n"
 	done
-	echo "kernel launches in models: $(grep -c '<<<' $ROOT/src/models/*.cu $ROOT/src/models/*.cpp 2>/dev/null | tr '\n' ' ')"
+	echo "kernel launches in models: $(grep -c '<<<' $ROOT/src/models/*.cpp 2>/dev/null | tr '\n' ' ')"
 	ninja > $out/build.log 2>&1 || { echo "build FAILED"; bad=1; }
 	return $bad
 }

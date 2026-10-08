@@ -2,7 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/core/tensor.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 
 namespace engine::modules {
 
@@ -13,7 +13,7 @@ struct LinearNVFP4 {
 		const pod::TensorView& scales,
 		float gscale,
 		pod::TensorView& out,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 };
 

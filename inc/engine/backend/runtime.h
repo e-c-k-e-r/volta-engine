@@ -52,6 +52,9 @@ inline void host_free_pinned( void* p ) { cudaFreeHost( p ); }
 
 // Last launch error (kernel launches are asynchronous; this reports configuration failures)
 inline bool last_error_ok() { return cudaGetLastError() == cudaSuccess; }
+inline void check_last_error() { ENGINE_CHECK( cudaGetLastError() ); }
+inline void clear_last_error() { (void) cudaGetLastError(); }
+inline void device_reset() { cudaDeviceReset(); }
 
 inline void* device_malloc( size_t bytes ) { void* p = nullptr; ENGINE_CHECK( cudaMalloc( &p, bytes ) ); return p; }
 inline void device_free( void* p ) { ENGINE_CHECK( cudaFree( p ) ); }

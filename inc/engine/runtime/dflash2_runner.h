@@ -5,7 +5,7 @@
 #include "engine/models/model.h"
 #include "engine/spec/dflash.h"
 #include "engine/runtime/sampling.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <string>
 
 namespace engine::runtime {

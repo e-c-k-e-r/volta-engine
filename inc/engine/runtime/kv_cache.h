@@ -3,7 +3,7 @@
 #include "engine/config.h"
 #include "engine/core/arena.h"
 #include "engine/core/kv_format.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cstddef>
 #include <cstdint>
 
@@ -30,7 +30,7 @@ struct KVCachePool {
 	pod::KVRef ref() const;
 	void* get_k_ptr( int slot_id, int layer_idx, int pos );
 	void* get_v_ptr( int slot_id, int layer_idx, int pos );
-	void reset_slot( int slot_id, cudaStream_t stream = nullptr );
+	void reset_slot( int slot_id, backend::stream_t stream = nullptr );
 };
 
 } // namespace engine::runtime

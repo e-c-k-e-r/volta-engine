@@ -3,7 +3,7 @@
 #include "engine/config.h"
 #include "engine/core/tensor.h"
 #include "engine/core/batch.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cuda_fp16.h>
 
 namespace engine::modules {
@@ -19,7 +19,7 @@ struct GDN {
 		pod::TensorView& beta_out,
 		int num_v_heads,
 		int hidden_size,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: norm_hidden [rows, hidden], gate/beta [rows, heads]
 	);
 
@@ -28,7 +28,7 @@ struct GDN {
 		pod::TensorView& conv_history,
 		const pod::TensorView& conv_weights,
 		int channels,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		const pod::SlotRef& slot = {},
 		float* snap = nullptr,          // per-row post-state copy, written only while *snap_on != 0
 		const int* snap_on = nullptr
@@ -38,7 +38,7 @@ struct GDN {
 		pod::TensorView& qkv,
 		int num_k_heads,
 		int head_dim,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		bool scale_q = false,
 		int rows = 1,
 		size_t row_stride = 0           // elements between rows of qkv
@@ -53,7 +53,7 @@ struct GDN {
 		int num_k_heads,
 		int num_v_heads,
 		int head_dim,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		const pod::SlotRef& slot = {},
 		float* snap = nullptr,          // per-row post-state copy, written only while *snap_on != 0
 		const int* snap_on = nullptr
@@ -75,7 +75,7 @@ struct GDN {
 		size_t snap_stride,
 		int snap_rows,
 		const int* snap_on,
-		cudaStream_t stream
+		backend::stream_t stream
 	);
 
 	// Prefill form (rows above the decode sizes, one slot): rows run in parallel tiles, reading src and writing a
@@ -89,7 +89,7 @@ struct GDN {
 		int rows,
 		const pod::BatchRows* d_rows,
 		size_t slot_stride,
-		cudaStream_t stream
+		backend::stream_t stream
 	);
 
 	static void recurrent_step_rows(
@@ -108,7 +108,7 @@ struct GDN {
 		size_t snap_stride,
 		int snap_rows,
 		const int* snap_on,
-		cudaStream_t stream
+		backend::stream_t stream
 	);
 
 	static void project_kda_gates(
@@ -128,7 +128,7 @@ struct GDN {
 		int num_heads = 16,
 		int head_dim = 128,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // norm_hidden [rows, hidden]; outputs are [rows, ...]
 	);
 
@@ -152,7 +152,7 @@ struct GDN {
 		size_t snap_stride,
 		int snap_rows,
 		const int* snap_on,
-		cudaStream_t stream
+		backend::stream_t stream
 	);
 
 	static void recurrent_step_kda(
@@ -163,7 +163,7 @@ struct GDN {
 		pod::TensorView& attn_out,
 		int num_heads = 16,
 		int head_dim = 128,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	static void recurrent_step_kda_fused(
@@ -177,7 +177,7 @@ struct GDN {
 		int num_heads = 16,
 		int head_dim = 128,
 		float eps = 1e-5f,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		const pod::SlotRef& slot = {}
 	);
 
@@ -187,7 +187,7 @@ struct GDN {
 		const pod::TensorView& norm_weight,
 		int num_v_heads,
 		int head_dim,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		bool use_sigmoid = false,
 		int rows = 1                    // packed [rows, num_v_heads * head_dim] attn_out and z
 	);

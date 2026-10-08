@@ -16,7 +16,7 @@
 #include "engine/modules/expert_tier.h"
 #include "engine/modules/mhc.h"
 #include "engine/modules/linear.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <vector>
@@ -142,32 +142,32 @@ public:
 
 	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
 	bool init( const GLM53Config& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
-	bool load_weights( const char* model_dir, cudaStream_t stream = nullptr ) override;
+	bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) override;
 
-	void embed_tokens( const int* token_ids, int count, cudaStream_t stream = nullptr ) override;
-	void forward( const pod::BatchRows& rows, cudaStream_t stream = nullptr ) override;
-	void sample_tokens( int* out_preds, int count, cudaStream_t stream = nullptr ) override;
-	bool sample_local( int* out_tokens, float* out_vals, int count, cudaStream_t stream = nullptr ) override;
-	bool topk_local( float* out_vals, int* out_ids, int count, cudaStream_t stream = nullptr ) override;
+	void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) override;
+	void forward( const pod::BatchRows& rows, backend::stream_t stream = nullptr ) override;
+	void sample_tokens( int* out_preds, int count, backend::stream_t stream = nullptr ) override;
+	bool sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream = nullptr ) override;
+	bool topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream = nullptr ) override;
 	const half* shard_logits_ptr() const override { return logits_.ptr<const half>(); }
 	int shard_logits_cols() const override { return lm_shard_cols_; }
 	const pod::TensorView& gather_logits(
 		int rows,
 		const half* const* peer_shard_ptrs,
 		int peer_shard_cols,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	) override;
 
 	const DraftHooks& draft_hooks() const override { return draft_hooks_; }
 	bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) override;
 	// EXL3_EXPERT_CACHE < 1: fold the routing counters into the experts' scores and move hot experts into the device tier
-	bool rebalance_experts( cudaStream_t stream = nullptr ) override;
-	void draft_head_topk( int rows, cudaStream_t stream = nullptr ) override;
-	void set_spec_snapshot( bool on, cudaStream_t stream = nullptr ) override;
-	void commit_spec_row( int slot_id, int row, cudaStream_t stream = nullptr ) override;
+	bool rebalance_experts( backend::stream_t stream = nullptr ) override;
+	void draft_head_topk( int rows, backend::stream_t stream = nullptr ) override;
+	void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) override;
+	void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) override;
 
-	void checkpoint_state( int slot_id, cudaStream_t stream = nullptr ) override;
-	void rollback_state( int slot_id, cudaStream_t stream = nullptr ) override;
+	void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) override;
+	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void reset_state( int slot_id = 0 ) override;
 
 	pod::TensorView& logits() override { return logits_; }
@@ -187,7 +187,7 @@ private:
 
 	// Layer stack over m rows at once: embed_rows_[0..m) -> logits_[0..m); slot and position of each row are
 	// read from d_rows_ on device so the launch sequence depends on m alone and is graph-replayable
-	void forward_body( int m, cudaStream_t stream );
+	void forward_body( int m, backend::stream_t stream );
 	void set_rows( int m );
 
 	pod::BatchRows* d_rows_ = nullptr;

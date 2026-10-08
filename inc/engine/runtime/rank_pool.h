@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/config.h"
-#include <cuda_runtime.h>
+#include "engine/backend/runtime.h"
 #include <pthread.h>
 #include <sched.h>
 #include <atomic>
@@ -58,7 +58,7 @@ private:
 		CPU_ZERO( &cpuset );
 		CPU_SET( rank, &cpuset );
 		pthread_setaffinity_np( pthread_self(), sizeof( cpu_set_t ), &cpuset );
-		CUDA_CHECK( cudaSetDevice( rank ) );
+		backend::set_device( rank );
 		while ( true ) {
 			pthread_barrier_wait( &barrier_ );
 			if ( stopping_ ) break;

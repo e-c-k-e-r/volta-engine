@@ -4,7 +4,7 @@
 #include "engine/core/tensor.h"
 #include "engine/core/batch.h"
 #include "engine/core/kv_format.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cuda_fp16.h>
 
 namespace engine::modules {
@@ -20,7 +20,7 @@ struct Attention {
 		pod::TensorView& gate,
 		int num_q_heads,
 		int head_dim,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	// KV tensors are addressed through a KVRef (formats and scales in kv_format.h); element offsets and slot_stride are
@@ -36,7 +36,7 @@ struct Attention {
 		int num_kv_heads,
 		int head_dim,
 		int max_seq = 2048,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	static void forward_decode(
@@ -52,7 +52,7 @@ struct Attention {
 		int num_kv_heads,
 		int head_dim,
 		int max_seq = 2048,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	// Prefill form for chunks above the decode sizes (one slot, head_dim 256): K/V tiles are shared across queries.
@@ -71,7 +71,7 @@ struct Attention {
 		int num_kv_heads,
 		int head_dim,
 		int max_seq = 2048,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int key_hint = 0,
 		bool per_row = false  // every row gets its own block, for rows that sit in distinct slots
 	);

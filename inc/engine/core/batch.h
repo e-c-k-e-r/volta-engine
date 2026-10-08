@@ -1,7 +1,7 @@
 #pragma once
 
 #include "engine/config.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 
 namespace pod {
 

@@ -10,7 +10,7 @@
 #include "engine/loader/chat_template.h"
 #include "engine/server/config.h"
 
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <string>
 #include <vector>
 #include <memory>

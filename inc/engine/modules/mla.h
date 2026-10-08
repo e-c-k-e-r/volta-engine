@@ -4,7 +4,7 @@
 #include "engine/core/tensor.h"
 #include "engine/core/batch.h"
 #include "engine/core/kv_format.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <algorithm>
@@ -22,7 +22,7 @@ struct MLADSA {
 		int mla_dc = 512,
 		int mla_dr = 64,
 		int max_seq = 2048,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	static void forward_decode(
@@ -38,7 +38,7 @@ struct MLADSA {
 		int mla_dr = 64,
 		int max_seq = 2048,
 		int out_dim = 4096,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 };
 
@@ -50,7 +50,7 @@ struct MLA {
 		pod::TensorView& v_out,
 		int num_heads = 16,
 		int head_dim = 256,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // kv_norm [rows, 512] -> k/v [rows, heads * head_dim]
 	);
 
@@ -63,7 +63,7 @@ struct MLA {
 		int pos,
 		int total_elems = 4096,
 		int max_seq = 2048,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		const pod::SlotRef& slot = {}, // if set: pos/slot read on device (graph-capturable)
 		int rows = 1                   // consecutive rows slot.row .. slot.row + rows - 1
 	);
@@ -77,7 +77,7 @@ struct MLA {
 		int num_heads = 16,
 		int head_dim = 256,
 		int max_seq = 2048,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		const pod::SlotRef& slot = {}, // if set: pos/slot read on device (graph-capturable)
 		int rows = 1,                  // consecutive rows slot.row .. slot.row + rows - 1
 		int key_hint = 0               // prefill chunks: keys the rows can attend to (sizes the split only)
@@ -95,18 +95,18 @@ struct MLALatent {
 	static constexpr int HEAD = 256;   // q_nope / v head dimension
 
 	// q [rows, heads * 256] -> q_lat [rows, heads * 512]; kv_b is this rank's dense [heads * 512, 512] FP16
-	static void absorb_q( const pod::TensorView& q, const pod::TensorView& kv_b, pod::TensorView& q_lat, int heads, int rows, cudaStream_t stream );
+	static void absorb_q( const pod::TensorView& q, const pod::TensorView& kv_b, pod::TensorView& q_lat, int heads, int rows, backend::stream_t stream );
 	// o_lat [rows, heads * 512] -> out [rows, heads * 256]
-	static void expand_out( const pod::TensorView& o_lat, const pod::TensorView& kv_b, pod::TensorView& out, int heads, int rows, cudaStream_t stream );
+	static void expand_out( const pod::TensorView& o_lat, const pod::TensorView& kv_b, pod::TensorView& out, int heads, int rows, backend::stream_t stream );
 	// c [rows, 512] -> cache rows at the positions slot.rows gives (cache layout [slot][layer][max_seq][512], slot stride in elements)
-	static void store( half* cache, const pod::TensorView& c, int layer, int max_seq, int rows, const pod::SlotRef& slot, cudaStream_t stream );
+	static void store( half* cache, const pod::TensorView& c, int layer, int max_seq, int rows, const pod::SlotRef& slot, backend::stream_t stream );
 	// Attention of every head over the latent cache; q_lat / o_lat [rows, heads * 512]. Rows beyond MAX_BATCH run in groups.
 	// workspace: MAX_BATCH * heads * n_chunks * (512 + 2) floats with n_chunks = workspace_chunks( max_seq ).
 	static void attend( const half* cache, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
-		const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream,
+		const pod::SlotRef& slot, float* workspace, int key_hint, backend::stream_t stream,
 		const int* sel_idx = nullptr, const int* sel_n = nullptr );   // DSA: per-row token lists (stride DSA::KPAD) and counts (-1 = dense row)
 	// Debug: dense logits of one row (n keys of a slot's layer cache) into scores[heads][n]
-	static void diag_scores( const half* q_lat_row, const half* cache_slot_layer, int n, int heads, float* scores, cudaStream_t stream );
+	static void diag_scores( const half* q_lat_row, const half* cache_slot_layer, int n, int heads, float* scores, backend::stream_t stream );
 	static int workspace_chunks( int max_seq ) { return ( max_seq + 1023 ) / 1024; }
 	// Partial slots (row, head, split) of 514 floats: decode rows x chunks, or a prefill chunk's key splits (at least 8192)
 	static size_t workspace_slots( int max_seq, int heads ) { return std::max<size_t>( static_cast<size_t>( pod::MAX_BATCH ) * heads * workspace_chunks( max_seq ), 8192 ); }

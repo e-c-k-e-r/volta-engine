@@ -3,7 +3,7 @@
 #include "engine/config.h"
 #include "engine/core/arena.h"
 #include "engine/modules/moe.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cstdint>
 #include <vector>
 
@@ -53,7 +53,7 @@ struct ExpertTier {
 	// After a layer's experts are loaded and its device pointer table built
 	void allocate_staging( pod::MemoryArena& host );
 	// Reads and clears the layer counters, updates the scores and performs up to max_swaps exchanges; returns swaps done
-	int rebalance( int layer, cudaStream_t stream );
+	int rebalance( int layer, backend::stream_t stream );
 	double hit_rate() const { return window_routes ? static_cast<double>( window_hits ) / static_cast<double>( window_routes ) : 1.0; }
 	void reset_window() { window_routes = window_hits = 0; }
 };

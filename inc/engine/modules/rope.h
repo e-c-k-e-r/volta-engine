@@ -3,7 +3,7 @@
 #include "engine/config.h"
 #include "engine/core/tensor.h"
 #include "engine/core/batch.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cuda_fp16.h>
 
 namespace engine::modules {
@@ -19,7 +19,7 @@ struct RoPE {
 		const pod::BatchRows* d_rows, // device-resident row descriptor (pos per row)
 		int count,                    // rows to process (grid size)
 		float freq_base = 10000000.0f,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		bool interleaved = false      // pair channels (2i, 2i+1) instead of (i, i + rot_dim/2)
 	);
 };

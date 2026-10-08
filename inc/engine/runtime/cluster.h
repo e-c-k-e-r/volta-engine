@@ -9,7 +9,7 @@
 #include "engine/runtime/dflash2_runner.h"
 #include "engine/runtime/sampling.h"
 #include <functional>
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -82,7 +82,7 @@ public:
 	void run_ranks( const std::function<void( int )>& fn ) { pool_.run( fn ); }
 	engine::models::ModelPipeline& model( int rank = 0 ) { return *models_[rank]; }
 	const engine::models::ModelMetadata& metadata() const { return models_[0]->get_metadata(); }
-	cudaStream_t stream( int rank ) const { return streams_[rank]; }
+	backend::stream_t stream( int rank ) const { return streams_[rank]; }
 	engine::comm::CollectiveRing* ring( int rank ) { return &rings_[rank]; }
 	const pod::MemoryArena& arena( int rank ) const { return arenas_[rank]; }
 	pod::MemoryArena& arena( int rank ) { return arenas_[rank]; }
@@ -94,7 +94,7 @@ private:
 	std::unique_ptr<engine::models::ModelPipeline> models_[ENGINE_NUM_GPUS];
 	pod::MemoryArena arenas_[ENGINE_NUM_GPUS];
 	engine::comm::CollectiveRing rings_[ENGINE_NUM_GPUS];
-	cudaStream_t streams_[ENGINE_NUM_GPUS] = {};
+	backend::stream_t streams_[ENGINE_NUM_GPUS] = {};
 	void* staging_ptrs_[ENGINE_NUM_GPUS] = {};
 	void* flag_ptrs_[ENGINE_NUM_GPUS] = {};
 	std::unique_ptr<DFlash2Runner> runner_;

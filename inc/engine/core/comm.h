@@ -2,7 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/core/tensor.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cstdint>
 #include <cstddef>
 
@@ -23,14 +23,14 @@ struct CollectiveRing {
 		pod::TensorView& residual,
 		const pod::TensorView& weight,
 		float eps,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		float constant_bias = 1.0f,
 		pod::TensorView* out = nullptr
 	);
 
 	void all_reduce(
 		pod::TensorView& x,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 };
 

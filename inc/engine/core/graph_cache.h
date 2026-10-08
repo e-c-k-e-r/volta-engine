@@ -2,7 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/core/batch.h"
-#include <cuda_runtime.h>
+#include "engine/backend/runtime.h"
 #include <cstdio>
 #include <cstdlib>
 
@@ -27,7 +27,7 @@ public:
 	~GraphCache() { reset(); }
 
 	template <typename Body>
-	void run( int m, cudaStream_t stream, Body&& body, int variant = 0 ) {
+	void run( int m, backend::stream_t stream, Body&& body, int variant = 0 ) {
 		ENGINE_ASSERT( variant >= 0 && variant < 2, "GraphCache::run: variant out of range" );
 		ENGINE_ASSERT( m >= 1 && m <= pod::MAX_ROWS, "GraphCache::run: row count out of range" );
 		// Prefill chunks (above the decode sizes) run eagerly: a graph per chunk size would never be replayed.
@@ -35,28 +35,24 @@ public:
 			body( stream );
 			return;
 		}
-		cudaGraphExec_t& exec = exec_[m][variant];
+		backend::graph_exec_t& exec = exec_[m][variant];
 		if ( !exec ) {
 			if ( !warm_[m][variant] ) {
 				warm_[m][variant] = true;
 				body( stream );
 				return;
 			}
-			cudaGraph_t graph = nullptr;
-			CUDA_CHECK( cudaStreamBeginCapture( stream, cudaStreamCaptureModeThreadLocal ) );
+			backend::graph_capture_begin( stream );
 			body( stream );
-			CUDA_CHECK( cudaStreamEndCapture( stream, &graph ) );
-			size_t nodes = 0;
-			CUDA_CHECK( cudaGraphGetNodes( graph, nullptr, &nodes ) );
-			CUDA_CHECK( cudaGraphInstantiate( &exec, graph, nullptr, nullptr, 0 ) );
-			CUDA_CHECK( cudaGraphDestroy( graph ) );
-			int dev = 0;
-			CUDA_CHECK( cudaGetDevice( &dev ) );
-			if ( dev == 0 ) {
+			backend::graph_t graph = backend::graph_capture_end( stream );
+			const size_t nodes = backend::graph_node_count( graph );
+			exec = backend::graph_instantiate( graph );
+			backend::graph_destroy( graph );
+			if ( backend::get_device() == 0 ) {
 				std::printf( "    [graph] captured m=%d decode body: %zu nodes\n", m, nodes );
 			}
 		}
-		CUDA_CHECK( cudaGraphLaunch( exec, stream ) );
+		backend::graph_launch( exec, stream );
 		++replays_;
 	}
 
@@ -65,7 +61,7 @@ public:
 		for ( int m = 0; m <= pod::MAX_BATCH; ++m ) {
 			for ( int v = 0; v < 2; ++v ) {
 				if ( exec_[m][v] ) {
-					cudaGraphExecDestroy( exec_[m][v] );
+					backend::graph_exec_destroy( exec_[m][v] );
 					exec_[m][v] = nullptr;
 				}
 				warm_[m][v] = false;
@@ -78,7 +74,7 @@ public:
 	void set_enabled( bool on ) { enabled_ = on; }
 
 private:
-	cudaGraphExec_t exec_[pod::MAX_BATCH + 1][2] = {};
+	backend::graph_exec_t exec_[pod::MAX_BATCH + 1][2] = {};
 	bool warm_[pod::MAX_BATCH + 1][2] = {};
 	bool enabled_ = true;
 	unsigned long long replays_ = 0;

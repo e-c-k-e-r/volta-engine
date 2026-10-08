@@ -2,7 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/core/tensor.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cuda_fp16.h>
 
 namespace engine::modules {
@@ -15,7 +15,7 @@ struct Embedding {
 		const int* token_ids,
 		int count,
 		pod::TensorView& out,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 };
 

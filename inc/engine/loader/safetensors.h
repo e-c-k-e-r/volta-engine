@@ -9,7 +9,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 
 namespace pod {
 
@@ -40,8 +40,8 @@ bool safetensors_open( pod::SafeTensorsFile& st, const char* filepath );
 void safetensors_close( pod::SafeTensorsFile& st );
 const pod::SafeTensorMeta* safetensors_find( const pod::SafeTensorsFile& st, const char* name );
 const void* safetensors_get_data_cpu( const pod::SafeTensorsFile& st, const pod::SafeTensorMeta* meta );
-bool safetensors_load_to_device( const pod::SafeTensorsFile& st, const pod::SafeTensorMeta* meta, void* dst_device_ptr, cudaStream_t stream = nullptr );
-pod::TensorView safetensors_alloc_tensor( const pod::SafeTensorsFile& st, const char* name, pod::MemoryArena& arena, cudaStream_t stream = nullptr );
+bool safetensors_load_to_device( const pod::SafeTensorsFile& st, const pod::SafeTensorMeta* meta, void* dst_device_ptr, backend::stream_t stream = nullptr );
+pod::TensorView safetensors_alloc_tensor( const pod::SafeTensorsFile& st, const char* name, pod::MemoryArena& arena, backend::stream_t stream = nullptr );
 
 class SafeTensorsRepo {
 public:
@@ -59,7 +59,7 @@ public:
 	pod::TensorView load(
 		const char* name,
 		pod::MemoryArena& arena,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		pod::DType target_dtype = pod::DType::AUTO
 	);
 
@@ -69,7 +69,7 @@ public:
 		int slice_dim,
 		int rank,
 		int tp_size,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		pod::DType target_dtype = pod::DType::AUTO
 	);
 
@@ -79,7 +79,7 @@ public:
 		const char* base_name,
 		pod::MemoryArena& arena,
 		int bits,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		pod::MemoryArena* code_arena = nullptr
 	);
 	// Bytes of the trellis codes of `base_name` (0 when it is not a trellis tensor)
@@ -92,7 +92,7 @@ public:
 		int slice_dim,
 		int rank,
 		int tp_size,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	// Vocabulary-parallel shard: this rank's columns of a [K, N] weight, padded up by pad_cols so the
@@ -108,7 +108,7 @@ public:
 		int col_block_begin,
 		int col_blocks,
 		int pad_cols,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	pod::LinearWeight load_linear_slice_padded(
@@ -118,7 +118,7 @@ public:
 		int rank,
 		int tp_size,
 		int pad_cols,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	pod::LinearWeight load_linear_slice_fused(
@@ -129,7 +129,7 @@ public:
 		int slice_dim,
 		int rank,
 		int tp_size,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	// Host pointer to a tensor's mmap'd bytes, nullptr if absent.
@@ -147,7 +147,7 @@ public:
 		int ranges,
 		int k0,
 		int kcount,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	// Tensor-parallel slice: split_n splits the output rows (column parallel), otherwise K (row parallel).
@@ -157,7 +157,7 @@ public:
 		bool split_n,
 		int rank,
 		int tp_size,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	// The same weights dequantized to dense FP16 [N_local, K] (a .weight tensor), for the few small projections
@@ -168,7 +168,7 @@ public:
 		bool split_n,
 		int rank,
 		int tp_size,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	// Dense [rows, K] weight (BF16/FP16 checkpoint tensor) rows [row_begin, row_begin + row_count) as FP16, followed by
@@ -179,7 +179,7 @@ public:
 		int row_begin,
 		int row_count,
 		int pad_rows,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	pod::LinearWeight load_grouped_trellis_slice(
@@ -189,7 +189,7 @@ public:
 		const int* rank_channel_blocks,
 		int num_groups,
 		int rank,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	pod::TensorView load_grouped_slice(
@@ -200,7 +200,7 @@ public:
 		int num_groups,
 		int rank,
 		int slice_dim = 0,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		pod::DType target_dtype = pod::DType::FP16
 	);
 

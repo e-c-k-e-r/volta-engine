@@ -2,7 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/core/tensor.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 
 namespace engine::modules {
 
@@ -16,7 +16,7 @@ struct LinearTrellis {
 		int bits,
 		bool mcg,
 		bool mul1 = false,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	// Large-M path: Hadamard, dequantize the weight to FP16, cuBLAS HGEMM (FP32 accumulate), Hadamard. FP16 output.
@@ -30,7 +30,7 @@ struct LinearTrellis {
 		int bits,
 		bool mcg,
 		bool mul1 = false,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 };
 

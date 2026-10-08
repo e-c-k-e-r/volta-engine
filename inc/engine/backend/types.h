@@ -10,7 +10,7 @@
 #endif
 
 #if defined(ENGINE_BACKEND_CUDA) && ENGINE_BACKEND_CUDA == 1
-	#include <cuda_runtime_api.h>
+	#include <cuda_runtime.h>
 	#include <cuda_fp16.h>
 
 namespace engine::backend {

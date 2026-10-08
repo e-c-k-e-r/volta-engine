@@ -2,7 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/core/tensor.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cuda_fp16.h>
 
 namespace engine::modules {
@@ -12,7 +12,7 @@ struct HyperConnection {
 		const pod::TensorView& in,
 		pod::TensorView& streams,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
@@ -20,7 +20,7 @@ struct HyperConnection {
 		const half* in,
 		float* streams,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
@@ -38,7 +38,7 @@ struct HyperConnection {
 		int hidden_size = 4096,
 		int sinkhorn_iters = 20,
 		float eps = 1e-6f,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
@@ -56,7 +56,7 @@ struct HyperConnection {
 		int hidden_size = 4096,
 		int sinkhorn_iters = 20,
 		float eps = 1e-6f,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
@@ -79,7 +79,7 @@ struct HyperConnection {
 		float eps,
 		float norm_eps,
 		float norm_bias,
-		cudaStream_t stream,
+		backend::stream_t stream,
 		int rows
 	);
 
@@ -89,7 +89,7 @@ struct HyperConnection {
 		const pod::TensorView& post,
 		const pod::TensorView& comb,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
@@ -100,7 +100,7 @@ struct HyperConnection {
 		const pod::TensorView& post,
 		const pod::TensorView& comb,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
@@ -110,7 +110,7 @@ struct HyperConnection {
 		const float* post,
 		const float* comb,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
@@ -121,7 +121,7 @@ struct HyperConnection {
 		const float* post,
 		const float* comb,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 };
@@ -132,7 +132,7 @@ struct HyperHead {
 		pod::TensorView& final_hidden,
 		int hidden_size = 4096,
 		bool mean = true,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
@@ -140,7 +140,7 @@ struct HyperHead {
 		const pod::TensorView& streams,
 		pod::TensorView& final_hidden,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 
@@ -148,7 +148,7 @@ struct HyperHead {
 		const float* streams,
 		half* final_hidden,
 		int hidden_size = 4096,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // independent rows: streams [rows, 4, hidden]
 	);
 };

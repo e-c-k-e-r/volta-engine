@@ -5,7 +5,7 @@
 #include "engine/modules/trellis.h"
 #include "engine/modules/nvfp4.h"
 #include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cstdint>
 
 namespace pod {
@@ -87,7 +87,7 @@ struct LinearPlainGEMV {
 		int m,
 		int n,
 		int k,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 };
 
@@ -96,7 +96,7 @@ struct Linear {
 		const pod::TensorView& x,
 		const pod::LinearWeight& weight,
 		pod::TensorView& out,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	) {
 		if ( !weight.is_valid() ) return;
 

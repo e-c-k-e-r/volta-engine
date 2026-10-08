@@ -6,7 +6,7 @@
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
 #include "engine/core/batch.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cuda_fp16.h>
 #include <string>
 #include <memory>
@@ -61,24 +61,24 @@ public:
 
 	// 1. Lifecycle & weight loading
 	virtual bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) = 0;
-	virtual bool load_weights( const char* model_dir, cudaStream_t stream = nullptr ) = 0;
+	virtual bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) = 0;
 
 	// 2. Token embedding: token_ids is a host array of `count` ids for rows 0..count-1
-	virtual void embed_tokens( const int* token_ids, int count, cudaStream_t stream = nullptr ) = 0;
+	virtual void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) = 0;
 
 	// 3. Forward over embedded rows
-	virtual void forward( const pod::BatchRows& rows, cudaStream_t stream = nullptr ) = 0;
-	void forward( int batch_size, int pos, int slot_id = 0, cudaStream_t stream = nullptr ) {
+	virtual void forward( const pod::BatchRows& rows, backend::stream_t stream = nullptr ) = 0;
+	void forward( int batch_size, int pos, int slot_id = 0, backend::stream_t stream = nullptr ) {
 		forward( pod::BatchRows::causal( batch_size, pos, slot_id ), stream );
 	}
 
 	// 4. Greedy sampling of the last forward's first `count` rows into host out_preds (rank 0)
-	virtual void sample_tokens( int* out_preds, int count, cudaStream_t stream = nullptr ) = 0;
+	virtual void sample_tokens( int* out_preds, int count, backend::stream_t stream = nullptr ) = 0;
 
 	// 4b. Vocabulary-parallel sampling: each rank picks the best token inside its own vocabulary
 	// shard and reports (token, logit) into caller-owned host arrays. Returns false when the model's
 	// logits are not sharded, in which case the caller falls back to sample_tokens on rank 0.
-	virtual bool sample_local( int* out_tokens, float* out_vals, int count, cudaStream_t stream = nullptr ) {
+	virtual bool sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream = nullptr ) {
 		(void) out_tokens;
 		(void) out_vals;
 		(void) count;
@@ -89,7 +89,7 @@ public:
 	// 4b'. Vocabulary-parallel top-k for sampling: this rank's top-kSampleTopK (16) logits per row over its shard of
 	// the last forward's first `count` rows, with global token ids, into caller-owned host arrays
 	// [count][16] (descending). False when the logits are not sharded.
-	virtual bool topk_local( float* out_vals, int* out_ids, int count, cudaStream_t stream = nullptr ) {
+	virtual bool topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream = nullptr ) {
 		(void) out_vals;
 		(void) out_ids;
 		(void) count;
@@ -101,7 +101,7 @@ public:
 	// Routed-expert route counts since the last reset: layers x experts (this rank's partition), false when not tracked
 	virtual bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) { (void) out; (void) layers; (void) experts; (void) reset; return false; }
 	// Adapt the routed-expert residency to the routing seen so far; false when the model keeps every expert resident
-	virtual bool rebalance_experts( cudaStream_t stream = nullptr ) { (void) stream; return false; }
+	virtual bool rebalance_experts( backend::stream_t stream = nullptr ) { (void) stream; return false; }
 	virtual const half* shard_logits_ptr() const { return nullptr; }
 	virtual int shard_logits_cols() const { return 0; }
 
@@ -111,7 +111,7 @@ public:
 	virtual const DraftHooks& draft_hooks() const { static const DraftHooks none; return none; }
 	// Runs this rank's LM head shard over hooks.lm_in[rows, hidden] and leaves the local top-k
 	// (token ids offset into the global vocabulary, sorted) in hooks.cand_vals / cand_idx.
-	virtual void draft_head_topk( int rows, cudaStream_t stream = nullptr ) { (void) rows; (void) stream; }
+	virtual void draft_head_topk( int rows, backend::stream_t stream = nullptr ) { (void) rows; (void) stream; }
 
 	// 4e. Materialize the full-vocabulary logits on rank 0 from every rank's shard. Only consumers that
 	// need the whole distribution (the DFlash2 drafter) pay for this; sampling uses sample_local.
@@ -120,7 +120,7 @@ public:
 		int rows,
 		const half* const* peer_shard_ptrs,
 		int peer_shard_cols,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	) {
 		(void) rows;
 		(void) peer_shard_ptrs;
@@ -131,14 +131,14 @@ public:
 
 	// 5. Speculative state management: snapshot / restore the recurrent state of one slot.
 	//    KV cache entries need no snapshot: rejected positions are overwritten by the next forward.
-	virtual void checkpoint_state( int slot_id, cudaStream_t stream = nullptr ) = 0;
-	virtual void rollback_state( int slot_id, cudaStream_t stream = nullptr ) = 0;
+	virtual void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) = 0;
+	virtual void rollback_state( int slot_id, backend::stream_t stream = nullptr ) = 0;
 	virtual void reset_state( int slot_id = 0 ) = 0;
 	// Per-row state slots (replace checkpoint + replay). While on, a forward also publishes the recurrent
 	// state after every row; commit_spec_row( slot, t ) makes the state after row t the slot's live state.
 	// Stream-ordered, so a flag change applies to the forwards queued after it.
-	virtual void set_spec_snapshot( bool on, cudaStream_t stream = nullptr ) { (void) on; (void) stream; ENGINE_ASSERT( false, "model has no speculative state slots" ); }
-	virtual void commit_spec_row( int slot_id, int row, cudaStream_t stream = nullptr ) { (void) slot_id; (void) row; (void) stream; ENGINE_ASSERT( false, "model has no speculative state slots" ); }
+	virtual void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) { (void) on; (void) stream; ENGINE_ASSERT( false, "model has no speculative state slots" ); }
+	virtual void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) { (void) slot_id; (void) row; (void) stream; ENGINE_ASSERT( false, "model has no speculative state slots" ); }
 
 	// 6. Output descriptors & tapped states
 	virtual pod::TensorView& logits() = 0;

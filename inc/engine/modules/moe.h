@@ -4,7 +4,7 @@
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
 #include "engine/modules/linear.h"
-#include <cuda_runtime.h>
+#include "engine/backend/types.h"
 #include <cuda_fp16.h>
 
 #define MOE_MAX_GROUPS 8
@@ -59,7 +59,7 @@ struct MoERouter {
 		int num_experts = 288,
 		int top_k = 8,
 		float routed_scaling_factor = 2.5f,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1                    // x [rows, hidden] -> indices / weights [rows, top_k]
 	);
 
@@ -70,7 +70,7 @@ struct MoERouter {
 		half* output,
 		int hidden_size,
 		int top_k = 8,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	static void accumulate(
@@ -78,7 +78,7 @@ struct MoERouter {
 		const half* expert_out,
 		half weight,
 		int hidden_size,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	static void accumulate(
@@ -86,7 +86,7 @@ struct MoERouter {
 		const pod::TensorView& expert_out,
 		half weight,
 		int hidden_size,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	static void exl3_moe_dispatch(
@@ -100,7 +100,7 @@ struct MoERouter {
 		int routing_first,
 		int routing_last,
 		int4* active_experts,
-		cudaStream_t stream = nullptr,
+		backend::stream_t stream = nullptr,
 		int rows = 1,                   // routes = 8 * rows, token index = route / 8
 		int chunk_rows = 4,             // rows per work item (the expert GEMM tile)
 		uint32_t* heat = nullptr        // optional per-expert route counters, incremented by this dispatch
@@ -111,7 +111,7 @@ struct MoE {
 	static void init_device_ptrs(
 		pod::MoELayerWeights& weights,
 		pod::MemoryArena& arena,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 
 	static pod::MoEScratch alloc_scratch(
@@ -135,7 +135,7 @@ struct MoE {
 		int end_expert,
 		const pod::MoEScratch& scratch,
 		float act_limit = 10.0f,
-		cudaStream_t stream = nullptr
+		backend::stream_t stream = nullptr
 	);
 };
 
@@ -170,7 +170,7 @@ void exl3_moe(
 	int hidden_dim,
 	int intermediate_dim,           // this rank's width of the expert intermediate
 	int num_experts,
-	cudaStream_t stream = nullptr
+	engine::backend::stream_t stream = nullptr
 );
 
 } // namespace ext
