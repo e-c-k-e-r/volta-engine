@@ -20,6 +20,10 @@ __attribute__(( weak )) void dflash2_topk_merge(
 	__builtin_unreachable();
 }
 
+__attribute__(( weak )) DFlashSpeculator::DFlashSpeculator() {
+	// Default state only: init() is unsupported on this backend
+}
+
 __attribute__(( weak )) DFlashSpeculator::~DFlashSpeculator() {
 	// Nothing was ever initialized: init() is unsupported on this backend
 }

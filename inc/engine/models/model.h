@@ -59,6 +59,8 @@ public:
 	virtual ~ModelPipeline() = default;
 
 	// 1. Lifecycle & weight loading
+	// Rank count of the tensor-parallel group; call before init(). A null ring means a group of one.
+	void set_tp_size( int tp ) { requested_tp_ = tp; }
 	virtual bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) = 0;
 	virtual bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) = 0;
 
@@ -144,6 +146,9 @@ public:
 	virtual const pod::TensorView& logits() const = 0;
 	virtual const backend::half_t* tapped_states( int row = 0 ) const = 0;
 	virtual const ModelMetadata& get_metadata() const = 0;
+
+protected:
+	int requested_tp_ = ENGINE_NUM_GPUS;
 };
 
 // Factory helper to instantiate models dynamically

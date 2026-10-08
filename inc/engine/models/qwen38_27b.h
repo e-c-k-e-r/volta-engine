@@ -224,6 +224,7 @@ private:
 	// Vocabulary-parallel head: every rank owns vocab_size / tp_size columns, padded up to a multiple
 	// of 256 so the dp4a int8 GEMV engages. lm_shard_real_cols_ excludes the pad.
 	int tp_size_ = 1;
+	int tp_ranks_ = 1;   // ranks in the group (tp_size_ is 1 when the head is not sharded)
 	bool shard_lm_ = false;   // false -> single-rank full-vocabulary head (EXL3_LM_SHARD=0)
 	int lm_shard_cols_ = 0;
 	int lm_shard_real_cols_ = 0;

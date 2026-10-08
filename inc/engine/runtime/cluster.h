@@ -21,9 +21,10 @@ struct ClusterConfig {
 	std::string model_dir;
 	std::string draft_model_dir; // empty => no speculator
 	size_t arena_bytes = 0;      // 0 => per-model default
+	int tp = ENGINE_NUM_GPUS;    // ranks: 1 (single device, no collective) or ENGINE_NUM_GPUS
 };
 
-// TP=4 model instance: per-rank arenas, streams, NVLink mesh, pipelines and a persistent
+// TP model instance (1 or 4 ranks): per-rank arenas, streams, NVLink mesh, pipelines and a persistent
 // pinned worker pool. Shared by the Generator and every test / benchmark driver.
 class ModelCluster {
 public:
@@ -87,10 +88,12 @@ public:
 	const pod::MemoryArena& arena( int rank ) const { return arenas_[rank]; }
 	pod::MemoryArena& arena( int rank ) { return arenas_[rank]; }
 	bool is_eos( int token ) const;
+	int tp() const { return tp_; }
 
 private:
 	bool created_ = false;
 	bool initialized_ = false;
+	int tp_ = ENGINE_NUM_GPUS;
 	std::unique_ptr<engine::models::ModelPipeline> models_[ENGINE_NUM_GPUS];
 	pod::MemoryArena arenas_[ENGINE_NUM_GPUS];
 	engine::comm::CollectiveRing rings_[ENGINE_NUM_GPUS];

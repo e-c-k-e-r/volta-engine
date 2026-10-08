@@ -31,6 +31,7 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 	ClusterConfig cc;
 	cc.model_type = config_.model_type;
 	cc.model_dir = config_.model_dir;
+	cc.tp = config_.tp_size;
 	if ( config_.use_speculation ) cc.draft_model_dir = config_.draft_model_dir;
 	if ( !cluster_.init( cc ) ) {
 		std::printf( "[-] Generator: model cluster init failed\n" );
@@ -264,8 +265,8 @@ EngineMetrics Generator::get_metrics() const {
 	}
 	lock.unlock();
 
-	m.gpu_vram_used_bytes.resize( ENGINE_NUM_GPUS );
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	m.gpu_vram_used_bytes.resize( cluster_.tp() );
+	for ( int d = 0; d < cluster_.tp(); ++d ) {
 		m.gpu_vram_used_bytes[d] = cluster_.arena( d ).total_bytes;
 	}
 	return m;

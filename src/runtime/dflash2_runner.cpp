@@ -60,7 +60,7 @@ void load_draft_config( const std::string& dir, pod::DFlashConfig& cfg ) {
 
 bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 	mc_ = &mc;
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < mc.tp(); ++d ) {
 		ENGINE_ASSERT( mc.model( d ).draft_hooks().valid(), "DFlash2Runner: model exposes no draft hooks" );
 	}
 	const auto& meta = mc.metadata();
@@ -80,11 +80,11 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 	ENGINE_ASSERT( cfg.selector_top_k == models::kDraftTopK, "DFlash2Runner: selector_top_k != kDraftTopK" );
 
 	const char* tp_env = std::getenv( "EXL3_DRAFT_TP" );
-	tp_ = ( tp_env && tp_env[0] == '0' ) ? 1 : ENGINE_NUM_GPUS;
+	tp_ = ( tp_env && tp_env[0] == '0' ) ? 1 : mc.tp();
 	bool loaded = true;
 	for ( int d = 0; d < tp_; ++d ) {
 		backend::set_device( d );
-		spec_[d].set_candidate_ranks( ENGINE_NUM_GPUS );
+		spec_[d].set_candidate_ranks( mc.tp() );
 		if ( tp_ > 1 ) spec_[d].set_ring( mc.ring( d ) );
 		if ( !spec_[d].init( cfg, d, mc.arena( d ), mc.stream( d ), d, tp_ ) ) return false;
 		loaded = spec_[d].load_weights( draft_dir.c_str(), mc.stream( d ) ) && loaded;
@@ -158,7 +158,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		spec_[0].draft_backbone( *hk0.embedding, anchor, hk0.taps, pos, hk0.taps_cap, s0 );
 		// Peer the hidden rows to every rank, then run each rank's head shard on its own worker/stream.
 		const pod::TensorView& dh = spec_[0].draft_hidden();
-		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		for ( int d = 0; d < mc.tp(); ++d ) {
 			backend::peer_copy_async( mc.model( d ).draft_hooks().lm_in, d, dh.ptr<const backend::half_t>(), 0, hid_bytes, s0 );
 		}
 		backend::stream_sync( s0 );
@@ -197,14 +197,14 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	const size_t val_bytes = static_cast<size_t>( M ) * models::kDraftTopK * sizeof( float );
 	const size_t idx_bytes = static_cast<size_t>( M ) * models::kDraftTopK * sizeof( int );
 	backend::set_device( 0 );
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < mc.tp(); ++d ) {
 		const auto& hk = mc.model( d ).draft_hooks();
 		backend::peer_copy_async( spec_[0].merged_cand_values_ptr( d ), 0, hk.cand_vals, d, val_bytes, s0 );
 		backend::peer_copy_async( spec_[0].merged_cand_indices_ptr( d ), 0, hk.cand_idx, d, idx_bytes, s0 );
 	}
 	engine::spec::dflash2_topk_merge(
 		spec_[0].merged_cand_values_ptr( 0 ), spec_[0].merged_cand_indices_ptr( 0 ),
-		ENGINE_NUM_GPUS, M, models::kDraftTopK,
+		mc.tp(), M, models::kDraftTopK,
 		spec_[0].merged_final_values_ptr(), spec_[0].merged_final_indices_ptr(), M, s0 );
 
 	// 3. Selector gate + bilinear lattice walk over the merged candidates.

@@ -27,29 +27,33 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		: ( arena_env ? strtoull( arena_env, nullptr, 10 ) : ( is_glm ? glm_gib : 10ULL ) )
 			* 1024 * 1024 * 1024;
 
+	tp_ = std::getenv( "EXL3_TP" ) ? std::atoi( std::getenv( "EXL3_TP" ) ) : cfg.tp;
+	ENGINE_ASSERT( tp_ == 1 || tp_ == ENGINE_NUM_GPUS, "ModelCluster::init: the collective supports tp 1 or 4 ranks" );
 	created_ = true;
-	engine::comm::init_4gpu_mesh( rings_, staging_ptrs_, flag_ptrs_, engine::comm::kMeshStagingBytes );
+	if ( tp_ > 1 ) engine::comm::init_4gpu_mesh( rings_, staging_ptrs_, flag_ptrs_, engine::comm::kMeshStagingBytes );
 #if ENGINE_BACKEND_CUDA
 	engine::modules::trellis_context_init_all();
 #endif
 
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < tp_; ++d ) {
 		backend::set_device( d );
 		streams_[d] = backend::stream_create();
 		if ( !engine::core::arena_create( arenas_[d], d, arena_bytes ) ) return false;
 		models_[d] = engine::models::create_model_pipeline( cfg.model_type );
-		if ( !models_[d] || !models_[d]->init( d, arenas_[d], &rings_[d] ) ) return false;
+		if ( !models_[d] ) return false;
+		models_[d]->set_tp_size( tp_ );
+		if ( !models_[d]->init( d, arenas_[d], ( tp_ > 1 ) ? &rings_[d] : nullptr ) ) return false;
 	}
 
-	std::printf( "[*] Loading %s weights across %d GPUs from %s...\n", cfg.model_type.c_str(), ENGINE_NUM_GPUS, cfg.model_dir.c_str() );
+	std::printf( "[*] Loading %s weights across %d GPUs from %s...\n", cfg.model_type.c_str(), tp_, cfg.model_dir.c_str() );
 	std::fflush( stdout );
-	pool_.start( ENGINE_NUM_GPUS );
+	pool_.start( tp_ );
 	bool ok[ENGINE_NUM_GPUS] = {};
 	pool_.run( [&]( int d ) {
 		ok[d] = models_[d]->load_weights( cfg.model_dir.c_str(), streams_[d] );
 		backend::stream_sync( streams_[d] );
 	} );
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < tp_; ++d ) {
 		if ( !ok[d] ) return false;
 		std::printf( "    [GPU %d] arena: %.3f / %.3f GiB\n", d,
 			arenas_[d].offset_bytes / 1073741824.0, arenas_[d].total_bytes / 1073741824.0 );
@@ -78,7 +82,7 @@ void ModelCluster::shutdown() {
 		runner_->shutdown();
 		runner_.reset();
 	}
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < tp_; ++d ) {
 		backend::set_device( d );
 		models_[d].reset();
 		if ( streams_[d] ) {
@@ -88,11 +92,11 @@ void ModelCluster::shutdown() {
 		}
 		engine::core::arena_destroy( arenas_[d] );
 	}
-	engine::comm::destroy_4gpu_mesh( staging_ptrs_, flag_ptrs_ );
+	if ( tp_ > 1 ) engine::comm::destroy_4gpu_mesh( staging_ptrs_, flag_ptrs_ );
 #if ENGINE_BACKEND_CUDA
 	engine::modules::trellis_context_destroy();
 #endif
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < tp_; ++d ) {
 		backend::set_device( d );
 		backend::device_reset();
 	}
@@ -150,7 +154,7 @@ void ModelCluster::sample_topk( int count, Candidates* out ) {
 	pool_.run( [&]( int d ) {
 		ok[d] = models_[d]->topk_local( vals[d], ids[d], count, streams_[d] ) ? 1 : 0;
 	} );
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < tp_; ++d ) {
 		ENGINE_ASSERT( ok[d] != 0, "ModelCluster::sample_topk: the model has no vocabulary-parallel top-k" );
 	}
 	// A rank's local top-16 is a superset of the global top-16 restricted to its shard, so the union holds the
@@ -159,7 +163,7 @@ void ModelCluster::sample_topk( int count, Candidates* out ) {
 		float v[ENGINE_NUM_GPUS * K];
 		int t[ENGINE_NUM_GPUS * K];
 		int n = 0;
-		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		for ( int d = 0; d < tp_; ++d ) {
 			for ( int j = 0; j < K; ++j ) {
 				v[n] = vals[d][r * K + j];
 				t[n] = ids[d][r * K + j];
@@ -199,13 +203,13 @@ void ModelCluster::sample( int* out, int count ) {
 		models_[0]->sample_tokens( out, count, streams_[0] );
 		return;
 	}
-	for ( int d = 1; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 1; d < tp_; ++d ) {
 		ENGINE_ASSERT( sharded[d] != 0, "ModelCluster::sample: vocabulary sharding must be uniform across ranks" );
 	}
 	for ( int r = 0; r < count; ++r ) {
 		int best = toks[0][r];
 		float best_val = vals[0][r];
-		for ( int d = 1; d < ENGINE_NUM_GPUS; ++d ) {
+		for ( int d = 1; d < tp_; ++d ) {
 			if ( vals[d][r] > best_val || ( vals[d][r] == best_val && toks[d][r] < best ) ) {
 				best_val = vals[d][r];
 				best = toks[d][r];
@@ -219,7 +223,7 @@ void ModelCluster::read_logits( int rows, backend::half_t* host_dst ) {
 	backend::set_device( 0 );
 	const backend::half_t* peer_shards[ENGINE_NUM_GPUS] = { nullptr };
 	int peer_cols = 0;
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < tp_; ++d ) {
 		peer_shards[d] = models_[d]->shard_logits_ptr();
 		peer_cols = models_[d]->shard_logits_cols();
 	}

@@ -72,6 +72,7 @@ bool GLM53Pipeline::init(
 	engine::comm::CollectiveRing* ring
 ) {
 	config_ = config;
+	config_.tp_size = ( ring != nullptr ) ? requested_tp_ : 1;
 	rank_ = rank;
 	arena_ = &arena;
 	ring_ = ring;
@@ -799,7 +800,7 @@ const pod::TensorView& GLM53Pipeline::gather_logits(
 	full_logits_.shape[0] = rows;
 	// Row r of the gathered buffer is [shard 0 | shard 1 | ...]: source rows are lm_shard_cols_ apart (pad included),
 	// destination rows lm_shard_real_cols_ * tp apart
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < config_.tp_size; ++d ) {
 		const size_t shard_elems = static_cast<size_t>( 128 * lm_shard_spans( config_.vocab_size, config_.tp_size, d ) );
 		const size_t shard_off = static_cast<size_t>( lm_shard_offset( config_.vocab_size, config_.tp_size, d ) );
 		const backend::half_t* src_base = ( d == rank_ ) ? logits_.ptr<const backend::half_t>() : peer_shard_ptrs[d];

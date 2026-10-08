@@ -35,7 +35,9 @@ bool Qwen38Pipeline::init(
 
 	backend::set_device( rank_ );
 
-	const int tp_size = ( ring_ != nullptr ) ? ENGINE_NUM_GPUS : 1;
+	const int tp_size = ( ring_ != nullptr ) ? requested_tp_ : 1;
+	ENGINE_ASSERT( tp_size == 1 || tp_size == 4, "Qwen38Pipeline: the grouped weight shards are laid out for 4 ranks" );
+	tp_ranks_ = tp_size;
 	tp_size_ = tp_size;
 	q_heads_ = config_.full_num_q_heads / tp_size;
 	kv_heads_ = config_.full_num_kv_heads / tp_size;
@@ -274,18 +276,18 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, backend::stream_t stre
 		lm_head_ = repo.load_linear( "lm_head", *arena_, 5, stream );
 	}
 
-	int tp_size = ( ring_ != nullptr ) ? 4 : 1;
+	const int tp_size = tp_ranks_;
 
 	// 4. Per-layer weights across 64 layers
 	char name_buf[256];
 	// Column-parallel (output split, dim 1) and row-parallel (input split, dim 0) projection loads for either format
 	auto load_col = [&]( const char* name, int bits ) {
-		if ( fp4 ) return repo.load_nvfp4_slice( name, *arena_, true, rank_, 4, stream );
-		return ( tp_size == 4 ) ? repo.load_linear_slice( name, *arena_, bits, 1, rank_, 4, stream ) : repo.load_linear( name, *arena_, bits, stream );
+		if ( fp4 ) return repo.load_nvfp4_slice( name, *arena_, true, rank_, tp_size, stream );
+		return ( tp_size > 1 ) ? repo.load_linear_slice( name, *arena_, bits, 1, rank_, tp_size, stream ) : repo.load_linear( name, *arena_, bits, stream );
 	};
 	auto load_row = [&]( const char* name, int bits ) {
-		if ( fp4 ) return repo.load_nvfp4_slice( name, *arena_, false, rank_, 4, stream );
-		return ( tp_size == 4 ) ? repo.load_linear_slice( name, *arena_, bits, 0, rank_, 4, stream ) : repo.load_linear( name, *arena_, bits, stream );
+		if ( fp4 ) return repo.load_nvfp4_slice( name, *arena_, false, rank_, tp_size, stream );
+		return ( tp_size > 1 ) ? repo.load_linear_slice( name, *arena_, bits, 0, rank_, tp_size, stream ) : repo.load_linear( name, *arena_, bits, stream );
 	};
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		auto& lw = layers_[L];
@@ -334,38 +336,38 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, backend::stream_t stre
 				lw.in_proj_qkv = repo.load_nvfp4( name_buf, *arena_, n_begin, n_count, 3, 0, 5120, stream );
 			}
 			else {
-				lw.in_proj_qkv = ( tp_size == 4 )
+				lw.in_proj_qkv = ( tp_size > 1 )
 					? repo.load_grouped_trellis_slice( name_buf, *arena_, QWEN_QKV_BLOCKS, QWEN_QKV_RANK_BLOCKS, 3, rank_, stream )
 					: repo.load_linear( name_buf, *arena_, 5, stream );
 			}
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.conv1d.weight", L );
-			lw.conv1d_w = ( tp_size == 4 )
+			lw.conv1d_w = ( tp_size > 1 )
 				? repo.load_grouped_slice( name_buf, *arena_, QWEN_CONV_CHANNELS, QWEN_CONV_RANK_CHANNELS, 3, rank_, 0, stream )
 				: repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.A_log", L );
-			lw.A_log = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
+			lw.A_log = ( tp_size > 1 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, tp_size, stream, pod::DType::FP16 )
 			                            : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.dt_bias", L );
-			lw.dt_bias = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
+			lw.dt_bias = ( tp_size > 1 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, tp_size, stream, pod::DType::FP16 )
 			                              : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", L );
 			if ( fp4 ) {
 				name_buf[std::strlen( name_buf ) - 7] = 0;  // drop ".weight"
-				lw.in_proj_a = repo.load_nvfp4_dense( name_buf, *arena_, true, rank_, 4, stream );
+				lw.in_proj_a = repo.load_nvfp4_dense( name_buf, *arena_, true, rank_, tp_size, stream );
 			}
-			else lw.in_proj_a = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
+			else lw.in_proj_a = ( tp_size > 1 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, tp_size, stream, pod::DType::FP16 )
 			                                : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", L );
 			if ( fp4 ) {
 				name_buf[std::strlen( name_buf ) - 7] = 0;
-				lw.in_proj_b = repo.load_nvfp4_dense( name_buf, *arena_, true, rank_, 4, stream );
+				lw.in_proj_b = repo.load_nvfp4_dense( name_buf, *arena_, true, rank_, tp_size, stream );
 			}
-			else lw.in_proj_b = ( tp_size == 4 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, 4, stream, pod::DType::FP16 )
+			else lw.in_proj_b = ( tp_size > 1 ) ? repo.load_slice( name_buf, *arena_, 0, rank_, tp_size, stream, pod::DType::FP16 )
 			                                : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_z", L );
@@ -497,12 +499,12 @@ const pod::TensorView& Qwen38Pipeline::gather_logits(
 	// the source rows are lm_shard_cols_ apart (pad block included), the destination rows
 	// lm_shard_real_cols_ apart.
 	const size_t shard_elems = static_cast<size_t>( lm_shard_real_cols_ );
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < tp_ranks_; ++d ) {
 		const backend::half_t* src_base = ( d == rank_ ) ? logits_.ptr<const backend::half_t>() : peer_shard_ptrs[d];
 		ENGINE_ASSERT( src_base != nullptr, "Qwen38Pipeline::gather_logits: missing peer shard pointer" );
 		for ( int r = 0; r < rows; ++r ) {
 			const backend::half_t* src = src_base + static_cast<size_t>( r ) * lm_shard_cols_;
-			backend::half_t* dst = full_logits_.ptr<backend::half_t>() + ( static_cast<size_t>( r ) * ENGINE_NUM_GPUS + d ) * shard_elems;
+			backend::half_t* dst = full_logits_.ptr<backend::half_t>() + ( static_cast<size_t>( r ) * tp_ranks_ + d ) * shard_elems;
 			backend::peer_copy_async( dst, rank_, src, d, shard_elems * sizeof( backend::half_t ), stream );
 		}
 	}
