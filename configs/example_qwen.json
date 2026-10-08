@@ -1,0 +1,9 @@
+{
+	"model_type": "qwen38",
+	"model_dir": "/path/to/Qwen3.8-27B-exl3",
+	"draft_model_dir": "/path/to/Qwen3.8-27B-DFlash2-EXL3",
+	"use_speculation": true,
+	"tp_size": 4,
+	"port": 8000,
+	"options": { "max_seq": 32768, "kv_format": "fp16" }
+}

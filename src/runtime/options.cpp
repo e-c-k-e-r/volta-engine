@@ -1,6 +1,7 @@
 #include "engine/runtime/options.h"
 
 #include <cstdlib>
+#include <cstring>
 
 namespace engine::runtime {
 
@@ -50,6 +51,51 @@ Options from_env() {
 Options& options() {
 	static Options o = from_env();
 	return o;
+}
+
+bool set_option( const std::string& key, const std::string& value ) {
+	Options& o = options();
+	const char* v = value.c_str();
+	char* end = nullptr;
+	auto as_int = [&]( int& out ) {
+		const long x = std::strtol( v, &end, 10 );
+		if ( end == v || *end ) return false;
+		out = static_cast<int>( x );
+		return true;
+	};
+	auto as_bool = [&]( bool& out ) {
+		if ( value == "true" || value == "1" ) out = true;
+		else if ( value == "false" || value == "0" ) out = false;
+		else return false;
+		return true;
+	};
+	if ( key == "tp" ) return as_int( o.tp );
+	if ( key == "arena_gib" ) return as_int( o.arena_gib );
+	if ( key == "vram_reserve_mib" ) return as_int( o.vram_reserve_mib );
+	if ( key == "max_seq" ) return as_int( o.max_seq );
+	if ( key == "max_slots" ) return as_int( o.max_slots );
+	if ( key == "kv_format" ) {
+		if ( !value.empty() && value != "fp16" && value != "fp8" && value != "k8v4" && value != "nvfp4" ) return false;
+		o.kv_format = value;
+		return true;
+	}
+	if ( key == "expert_cache" ) {
+		const double f = std::strtod( v, &end );
+		if ( end == v || *end || f <= 0.0 || f > 1.0 ) return false;
+		o.expert_cache = f;
+		return true;
+	}
+	if ( key == "expert_adapt_every" ) return as_int( o.expert_adapt_every );
+	if ( key == "expert_swaps" ) return as_int( o.expert_swaps );
+	if ( key == "draft_tp" ) return as_bool( o.draft_tp );
+	if ( key == "lm_shard" ) return as_int( o.lm_shard );
+	if ( key == "moe_tp" ) return as_bool( o.moe_tp );
+	if ( key == "dsa" ) return as_bool( o.dsa );
+	if ( key == "mla_latent" ) return as_bool( o.mla_latent );
+	if ( key == "attn_tc" ) return as_bool( o.attn_tc );
+	if ( key == "expert_log" ) return as_bool( o.expert_log );
+	if ( key == "dsa_diag" ) return as_bool( o.dsa_diag );
+	return false;
 }
 
 } // namespace engine::runtime

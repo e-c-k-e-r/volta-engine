@@ -1,4 +1,5 @@
 #include "engine/server/config.h"
+#include "engine/runtime/options.h"
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -10,6 +11,16 @@
 #include <string>
 
 namespace engine::server {
+
+namespace {
+
+bool apply_option( const std::string& key, const std::string& value ) {
+	if ( runtime::set_option( key, value ) ) return true;
+	std::fprintf( stderr, "[-] Error: unknown option or invalid value: %s = %s\n", key.c_str(), value.c_str() );
+	return false;
+}
+
+} // namespace
 
 bool ServerConfig::load_from_json( const char* json_path ) {
 	if ( !json_path ) {
@@ -85,6 +96,13 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 	if ( j.contains( "tp_size" ) && j["tp_size"].is_number_integer() ) {
 		tp_size = j["tp_size"].get<int>();
 	}
+	// "options": { "max_seq": 32768, "kv_format": "fp8", ... } -> runtime::Options fields
+	if ( j.contains( "options" ) && j["options"].is_object() ) {
+		for ( auto& [key, val] : j["options"].items() ) {
+			const std::string text = val.is_string() ? val.get<std::string>() : val.dump();
+			if ( !apply_option( key, text ) ) return false;
+		}
+	}
 
 	return true;
 }
@@ -93,7 +111,10 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 	// First pass: look for --config to load base configuration
 	for ( int i = 1; i < argc; ++i ) {
 		if ( std::strcmp( argv[i], "--config" ) == 0 && i + 1 < argc ) {
-			load_from_json( argv[++i] );
+			if ( !load_from_json( argv[++i] ) ) {
+				std::fprintf( stderr, "[-] FATAL: invalid launch config %s\n", argv[i] );
+				std::exit( 2 );
+			}
 		}
 	}
 
@@ -140,6 +161,14 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 		}
 		else if ( ( std::strcmp( argv[i], "--tp-size" ) == 0 ) && i + 1 < argc ) {
 			tp_size = std::atoi( argv[++i] );
+		}
+		else if ( std::strcmp( argv[i], "--set" ) == 0 && i + 1 < argc ) {
+			const std::string kv = argv[++i];
+			const size_t eq = kv.find( '=' );
+			if ( eq == std::string::npos || !apply_option( kv.substr( 0, eq ), kv.substr( eq + 1 ) ) ) {
+				std::fprintf( stderr, "[-] FATAL: --set expects key=value for a known option, got '%s'\n", kv.c_str() );
+				std::exit( 2 );
+			}
 		}
 	}
 

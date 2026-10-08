@@ -5,7 +5,7 @@
 namespace engine::runtime {
 
 // Runtime and model options. The only place that reads the environment is options.cpp: defaults, then the
-// legacy EXL3_* overrides, then whatever the launcher (server config, tests) assigns before the first model loads.
+// legacy EXL3_* environment (compat), then whatever the launcher (config file, CLI, tests) assigns before the first model loads.
 // Numeric fields use <0 (or 0 for sizes) for "unset: use the model's default".
 struct Options {
 	int tp = -1;                  // rank count; <0 keeps the ClusterConfig value
@@ -29,5 +29,9 @@ struct Options {
 
 // Populated from the environment on first use.
 Options& options();
+
+// Assigns one option by field name (launch config "options" object, --set key=value). False for an unknown key
+// or an unparsable value; the caller treats that as a fatal configuration error.
+bool set_option( const std::string& key, const std::string& value );
 
 } // namespace engine::runtime
