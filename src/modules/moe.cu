@@ -1,5 +1,6 @@
 #include "engine/modules/moe.h"
 #include "exl3_moe_kernel.cuh"
+#include "exl3_moe_coop.cuh"
 #include "engine/core/batch.h"
 #include <cuda_fp16.h>
 #include <cmath>
@@ -508,6 +509,20 @@ pod::MoEScratch MoE::alloc_scratch(
 	s.interm_g = static_cast<half*>( engine::core::arena_alloc( arena, interm_elems * sizeof( half ) ) );
 	s.interm_u = static_cast<half*>( engine::core::arena_alloc( arena, interm_elems * sizeof( half ) ) );
 	s.planes = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( groups ) * max_rows * hidden_size * sizeof( half ) ) );
+	// Fused decode path: the rotated inputs and the gate/up partials alias the persistent kernel's staging buffers (a call runs
+	// one path or the other, in stream order); the activation and the down partials are its own
+	if ( hidden_size % 128 == 0 && intermediate_size % 128 == 0 ) {
+		const size_t slots = MOE_COOP_MAX_SLOTS;
+		s.coop_had_g = s.state_g;
+		s.coop_had_u = s.state_u;
+		s.coop_gu_g = reinterpret_cast<float*>( s.interm_g );
+		s.coop_gu_u = reinterpret_cast<float*>( s.interm_u );
+		s.coop_act = static_cast<half*>( engine::core::arena_alloc( arena, slots * intermediate_size * sizeof( half ) ) );
+		s.coop_d_out = static_cast<float*>( engine::core::arena_alloc( arena, slots * hidden_size * sizeof( float ) ) );
+		const size_t ctr_bytes = static_cast<size_t>( moe_coop_ctr_len( hidden_size, intermediate_size ) ) * sizeof( int );
+		s.coop_ctr = static_cast<int*>( engine::core::arena_alloc( arena, ctr_bytes ) );
+		CUDA_CHECK( cudaMemset( s.coop_ctr, 0, ctr_bytes ) );
+	}
 	return s;
 }
 
@@ -531,6 +546,49 @@ void MoE::forward(
 	// are few per token but each pass is short, so the fixed phase costs hide behind the other groups
 	const bool sharded = weights.num_local_experts > 72;
 	const int num_groups = env_groups > 0 ? MIN( env_groups, MOE_MAX_GROUPS ) : ( sharded ? MOE_MAX_GROUPS : rows == 1 ? 1 : rows <= 16 ? 4 : MOE_MAX_GROUPS );
+	// Fused decode path: gate/up and down GEMV kernels over runs of rows that share an expert (exl3_moe_coop.cuh)
+	static const bool coop_on = std::getenv( "EXL3_MOE_COOP" ) ? std::atoi( std::getenv( "EXL3_MOE_COOP" ) ) != 0 : true;
+	if ( coop_on && weights.type == pod::QuantType::TRELLIS && rows <= MOE_COOP_MAX_ROWS && scratch.coop_ctr != nullptr
+		&& weights.gate[0].bits == 3 && weights.up[0].bits == 3 && weights.down[0].bits == 3 && weights.up[0].mul1 && weights.gate[0].mul1 && weights.down[0].mul1 ) {
+		const int E = weights.num_local_experts;
+		const void** d_ptrs = static_cast<const void**>( weights.device_ptrs );
+		MoeCoopParams p = {};
+		p.x = x.ptr<const half>();
+		p.sel = d_topk_indices;
+		p.rw = d_topk_weights;
+		p.out = out.ptr<half>();
+		p.heat = weights.heat;
+		p.bsz = rows;
+		p.min_expert = start_expert;
+		p.max_expert = end_expert;
+		p.H = weights.up[0].w1.shape[0];
+		p.I = weights.up[0].w2.shape[0];
+		p.topk = 8;
+		p.act_limit = act_limit;
+		p.g_trellis = reinterpret_cast<const uint16_t* const*>( d_ptrs + 0 * E );
+		p.g_suh = reinterpret_cast<const half* const*>( d_ptrs + 1 * E );
+		p.g_svh = reinterpret_cast<const half* const*>( d_ptrs + 2 * E );
+		p.u_trellis = reinterpret_cast<const uint16_t* const*>( d_ptrs + 3 * E );
+		p.u_suh = reinterpret_cast<const half* const*>( d_ptrs + 4 * E );
+		p.u_svh = reinterpret_cast<const half* const*>( d_ptrs + 5 * E );
+		p.d_trellis = reinterpret_cast<const uint16_t* const*>( d_ptrs + 6 * E );
+		p.d_suh = reinterpret_cast<const half* const*>( d_ptrs + 7 * E );
+		p.d_svh = reinterpret_cast<const half* const*>( d_ptrs + 8 * E );
+		p.had_g = scratch.coop_had_g;
+		p.had_u = scratch.coop_had_u;
+		p.gu_g = scratch.coop_gu_g;
+		p.gu_u = scratch.coop_gu_u;
+		p.act_out = scratch.coop_act;
+		p.d_out = scratch.coop_d_out;
+		p.ctr_a = scratch.coop_ctr;
+		p.ctr_b = p.ctr_a + MOE_COOP_MAX_SLOTS * ( p.I / 128 );
+		p.runs = p.ctr_b + MOE_COOP_MAX_ROWS * ( p.H / 128 );
+		int device = 0;
+		CUDA_CHECK( cudaGetDevice( &device ) );
+		CUDA_CHECK( cudaMemsetAsync( p.out, 0, static_cast<size_t>( rows ) * p.H * sizeof( half ), stream ) );
+		exl3_moe_coop_launch( p, device, stream );
+		return;
+	}
 	const size_t plane_elems = static_cast<size_t>( rows ) * out.shape[out.ndim - 1];
 	half* target = ( num_groups == 1 ) ? out.ptr<half>() : scratch.planes;
 	CUDA_CHECK( cudaMemsetAsync( target, 0, plane_elems * num_groups * sizeof( half ), stream ) );

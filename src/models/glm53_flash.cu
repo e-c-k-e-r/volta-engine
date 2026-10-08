@@ -91,6 +91,9 @@ bool GLM53Pipeline::init(
 	state_.d_topk_indices = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( int ) ) );
 	state_.d_topk_weights = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( half ) ) );
 	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R );
+	// The fused decode kernels read cold experts from host memory a little slower than the persistent kernel (6.4 vs 6.8 tok/s at a
+	// 50% tier), so the tier keeps the persistent path
+	if ( engine::modules::ExpertTier::env_fraction() < 1.0 ) state_.moe.coop_ctr = nullptr;
 
 	// KDA recurrent state + conv history per slot: [S, 45, ...] FP32, plus one-slot checkpoints
 	// Only the linear-attention layers carry state: every fourth layer (3, 7, ...) is MLA

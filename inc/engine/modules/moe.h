@@ -34,6 +34,14 @@ struct MoEScratch {
 	half*    interm_g = nullptr;       // [groups, top_k, intermediate]
 	half*    interm_u = nullptr;
 	half*    planes = nullptr;         // [MOE_MAX_GROUPS, max_rows, hidden] per-group output planes
+	// Fused decode path (exl3_moe_coop.cuh): scratch for up to 16 rows
+	half*    coop_had_g = nullptr;     // [128 slots, hidden]
+	half*    coop_had_u = nullptr;
+	float*   coop_gu_g = nullptr;      // [2 split-k, 128 slots, intermediate]
+	float*   coop_gu_u = nullptr;
+	half*    coop_act = nullptr;       // [128 slots, intermediate]
+	float*   coop_d_out = nullptr;     // [128 slots, hidden]
+	int*     coop_ctr = nullptr;       // completion counters + run table, zero between calls
 };
 
 } // namespace pod

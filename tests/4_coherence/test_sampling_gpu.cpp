@@ -10,13 +10,15 @@ using namespace engine::runtime;
 
 namespace {
 
-std::vector<int> run_sampled( ModelCluster& mc, const std::vector<int>& prompt, int n, bool spec, const SamplingParams& sp ) {
+// gaps (optional, plain decode only): per emitted token, the logit gap between the two best candidates that decided it
+std::vector<int> run_sampled( ModelCluster& mc, const std::vector<int>& prompt, int n, bool spec, const SamplingParams& sp, std::vector<float>* gaps = nullptr ) {
 	Rng rng( sp.seed );
 	mc.reset_slot( 0 );
 	Candidates c;
 	int tok = mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0, 0, &c );
 	tok = sample_token( c, sp, rng );
 	std::vector<int> out = { tok };
+	if ( gaps ) gaps->push_back( c.n > 1 ? c.logits[0] - c.logits[1] : 1e9f );
 	int pos = static_cast<int>( prompt.size() );
 	while ( static_cast<int>( out.size() ) < n && !mc.is_eos( tok ) ) {
 		if ( spec ) {
@@ -32,6 +34,7 @@ std::vector<int> run_sampled( ModelCluster& mc, const std::vector<int>& prompt, 
 			mc.forward( &tok, 1, pos++, 0 );
 			Candidates cs[1];
 			mc.sample_topk( 1, cs );
+			if ( gaps ) gaps->push_back( cs[0].n > 1 ? cs[0].logits[0] - cs[0].logits[1] : 1e9f );
 			tok = sample_token( cs[0], sp, rng );
 			out.push_back( tok );
 		}
@@ -84,12 +87,21 @@ int main( int argc, char** argv ) {
 		SamplingParams cold;
 		cold.temperature = 1e-4f;
 		cold.seed = 5;
-		const auto a = run_sampled( mc, prompt, n, false, cold );
+		std::vector<float> gaps;
+		const auto a = run_sampled( mc, prompt, n, false, cold, &gaps );
 		const auto b = run_sampled( mc, prompt, n, true, cold );
 		// The open-ended prompt (last) only checks seeds: its FP16 logits can tie exactly (GLM: two tokens at 17.73438),
 		// greedy takes the lower id and the sampler legitimately picks either.
 		const bool tie_prone = ( pi + 1 == all.size() );
-		const bool ok_a = tie_prone || ( a == g ), ok_b = tie_prone || ( b == g );
+		// A divergence is also excused where the greedy choice was decided by under 0.1 logits (a few FP16 steps at this
+		// magnitude): the verify rows and the single-row graph differ in rounding, so a near-tie can legitimately flip
+		auto matches = [&]( const std::vector<int>& v ) {
+			for ( size_t i = 0; i < g.size() && i < v.size(); ++i ) {
+				if ( g[i] != v[i] ) return i < gaps.size() && gaps[i] < 0.1f;
+			}
+			return true;
+		};
+		const bool ok_a = tie_prone || matches( a ), ok_b = tie_prone || matches( b );
 		std::printf( "  prompt %zu: T->0 plain %s | T->0 speculative %s\n", pi, ok_a ? "== greedy" : "DIFFERS", ok_b ? "== greedy" : "DIFFERS" );
 		fail += ( ok_a ? 0 : 1 ) + ( ok_b ? 0 : 1 );
 		for ( const auto* v : { &a, &b } ) {
