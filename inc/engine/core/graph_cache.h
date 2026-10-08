@@ -8,7 +8,8 @@
 
 namespace engine::core {
 
-// Per-row-count CUDA graph cache for a model's decode body.
+// Per-row-count CUDA graph cache for a model's decode body (optionally two variants per count, for bodies whose
+// launch sequence depends on a host-known row property such as all rows sharing one slot).
 // The captured body must take every step-varying value (slots, positions, token ids,
 // all-reduce sequence numbers) from device memory so a replay is valid for any step.
 //   call 1 for m : eager (lazy one-time setup such as smem attributes happens outside capture)
@@ -26,16 +27,18 @@ public:
 	~GraphCache() { reset(); }
 
 	template <typename Body>
-	void run( int m, cudaStream_t stream, Body&& body ) {
+	void run( int m, cudaStream_t stream, Body&& body, int variant = 0 ) {
+		ENGINE_ASSERT( variant >= 0 && variant < 2, "GraphCache::run: variant out of range" );
 		ENGINE_ASSERT( m >= 1 && m <= pod::MAX_ROWS, "GraphCache::run: row count out of range" );
 		// Prefill chunks (above the decode sizes) run eagerly: a graph per chunk size would never be replayed.
 		if ( !enabled_ || stream == nullptr || m > pod::MAX_BATCH ) {
 			body( stream );
 			return;
 		}
-		if ( !exec_[m] ) {
-			if ( !warm_[m] ) {
-				warm_[m] = true;
+		cudaGraphExec_t& exec = exec_[m][variant];
+		if ( !exec ) {
+			if ( !warm_[m][variant] ) {
+				warm_[m][variant] = true;
 				body( stream );
 				return;
 			}
@@ -45,7 +48,7 @@ public:
 			CUDA_CHECK( cudaStreamEndCapture( stream, &graph ) );
 			size_t nodes = 0;
 			CUDA_CHECK( cudaGraphGetNodes( graph, nullptr, &nodes ) );
-			CUDA_CHECK( cudaGraphInstantiate( &exec_[m], graph, nullptr, nullptr, 0 ) );
+			CUDA_CHECK( cudaGraphInstantiate( &exec, graph, nullptr, nullptr, 0 ) );
 			CUDA_CHECK( cudaGraphDestroy( graph ) );
 			int dev = 0;
 			CUDA_CHECK( cudaGetDevice( &dev ) );
@@ -53,18 +56,20 @@ public:
 				std::printf( "    [graph] captured m=%d decode body: %zu nodes\n", m, nodes );
 			}
 		}
-		CUDA_CHECK( cudaGraphLaunch( exec_[m], stream ) );
+		CUDA_CHECK( cudaGraphLaunch( exec, stream ) );
 		++replays_;
 	}
 
 	// Caller must have the owning device current
 	void reset() {
 		for ( int m = 0; m <= pod::MAX_BATCH; ++m ) {
-			if ( exec_[m] ) {
-				cudaGraphExecDestroy( exec_[m] );
-				exec_[m] = nullptr;
+			for ( int v = 0; v < 2; ++v ) {
+				if ( exec_[m][v] ) {
+					cudaGraphExecDestroy( exec_[m][v] );
+					exec_[m][v] = nullptr;
+				}
+				warm_[m][v] = false;
 			}
-			warm_[m] = false;
 		}
 	}
 
@@ -73,8 +78,8 @@ public:
 	void set_enabled( bool on ) { enabled_ = on; }
 
 private:
-	cudaGraphExec_t exec_[pod::MAX_BATCH + 1] = {};
-	bool warm_[pod::MAX_BATCH + 1] = {};
+	cudaGraphExec_t exec_[pod::MAX_BATCH + 1][2] = {};
+	bool warm_[pod::MAX_BATCH + 1][2] = {};
 	bool enabled_ = true;
 	unsigned long long replays_ = 0;
 };

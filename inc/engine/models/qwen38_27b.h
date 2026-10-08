@@ -156,6 +156,7 @@ private:
 
 	engine::runtime::KVCachePool kv_pool_;
 	int last_slot_ = 0;
+	bool attn_tc_ = false; // current forward: all rows share one slot, so attention can use the tensor-core kernel
 	int key_hint_ = 0;   // keys the current chunk can attend to; sizes the prefill attention split only
 	int last_rows_ = 0;
 

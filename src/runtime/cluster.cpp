@@ -236,6 +236,18 @@ void ModelCluster::warm_graphs( int max_m, int slot ) {
 		forward( tokens, m, 0, slot ); // eager warm-up
 		forward( tokens, m, 0, slot ); // capture + first replay
 	}
+	// Rows spread over several slots can take a different graph variant than a causal block in one slot
+	const int slots = MIN( metadata().max_slots, pod::MAX_BATCH );
+	if ( slots >= 2 ) {
+		for ( int m = 2; m <= max_m; ++m ) {
+			int ids[pod::MAX_BATCH], positions[pod::MAX_BATCH];
+			for ( int r = 0; r < m; ++r ) { ids[r] = r % slots; positions[r] = 0; }
+			const pod::BatchRows rows = pod::BatchRows::batched( m, ids, positions );
+			forward( tokens, rows );
+			forward( tokens, rows );
+		}
+		for ( int s = 0; s < slots; ++s ) reset_slot( s );
+	}
 	reset_slot( slot );
 	std::printf( "[+] Decode graphs warmed for m=1..%d in %.0f ms\n", max_m,
 		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );

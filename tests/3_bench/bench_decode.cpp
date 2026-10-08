@@ -23,8 +23,14 @@ void bench_model( const char* type, const char* dir, int steps ) {
 
 	// M=1 decode
 	mc.reset_slot( 0 );
-	int tok = mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0 );
-	int pos = static_cast<int>( prompt.size() );
+	// BENCH_CTX=<n> prefills n tokens first so attention reads a real context (default: the 8-token prompt)
+	std::vector<int> ctx_prompt = prompt;
+	if ( const char* env = std::getenv( "BENCH_CTX" ) ) {
+		ctx_prompt.clear();
+		for ( int i = 0; i < std::atoi( env ); ++i ) ctx_prompt.push_back( 1000 + ( i * 7919 ) % 20000 );
+	}
+	int tok = mc.prefill( ctx_prompt.data(), static_cast<int>( ctx_prompt.size() ), 0 );
+	int pos = static_cast<int>( ctx_prompt.size() );
 	for ( int i = 0; i < 4; ++i ) { mc.forward( &tok, 1, pos++, 0 ); tok = mc.sample_one(); } // warmup
 	// Profiler window (nvprof --profile-from-start off) covers steady-state M=1 decode only
 	const bool prof_a = std::getenv( "BENCH_PROF_A" ) != nullptr; // profile the M=8 block instead of M=1

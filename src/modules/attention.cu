@@ -919,9 +919,9 @@ void Attention::forward_prefill(
 	// Spread the key tiles over extra blocks when the query tiles alone leave the GPU under two waves
 	const int base_blocks = num_kv_heads * ( ( count * G + PA_BQ - 1 ) / PA_BQ );
 	int nsplit = 1;
-	if ( base_blocks < 160 ) nsplit = MIN( ( 320 + base_blocks - 1 ) / base_blocks, 8 );
+	if ( base_blocks < 160 ) nsplit = MIN( ( 320 + base_blocks - 1 ) / base_blocks, 32 );
 	if ( key_hint > 0 ) nsplit = MAX( 1, MIN( nsplit, key_hint / ( 4 * PA_BK ) ) );
-	if ( const char* env = std::getenv( "EXL3_PREFILL_SPLIT" ) ) nsplit = MAX( 1, MIN( std::atoi( env ), 8 ) );
+	if ( const char* env = std::getenv( "EXL3_PREFILL_SPLIT" ); env && count <= pod::MAX_BATCH ) nsplit = MAX( 1, MIN( std::atoi( env ), 32 ) );
 	ENGINE_ASSERT( static_cast<size_t>( count ) * num_q_heads * nsplit <= static_cast<size_t>( ATTN_MAX_ROW_HEADS ) * ATTN_MAX_CHUNKS, "Attention::forward_prefill: workspace" );
 	float* workspace = attn_workspace_ptr();
 	const dim3 grid( num_kv_heads, ( count * G + PF_QPB - 1 ) / PF_QPB );
