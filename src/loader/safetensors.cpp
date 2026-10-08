@@ -1,5 +1,6 @@
 #include "engine/loader/safetensors.h"
 #include "engine/backend/runtime.h"
+#include "engine/backend/numeric.h"
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -10,7 +11,6 @@
 #include <cctype>
 #include <cstdio>
 #include <algorithm>
-#include <cuda_fp16.h>
 
 namespace engine::loader {
 
@@ -380,14 +380,14 @@ pod::TensorView safetensors_alloc_tensor( const pod::SafeTensorsFile& st, const 
 	return tv;
 }
 
-static inline half bf16_to_fp16( uint16_t bf ) {
+static inline backend::half_t bf16_to_fp16( uint16_t bf ) {
 	uint32_t u32 = static_cast<uint32_t>( bf ) << 16;
 	float f = *reinterpret_cast<const float*>( &u32 );
-	return __float2half_rn( f );
+	return backend::from_float_half( f );
 }
 
-static inline half f32_to_fp16( float f ) {
-	return __float2half_rn( f );
+static inline backend::half_t f32_to_fp16( float f ) {
+	return backend::from_float_half( f );
 }
 
 static size_t get_dtype_size( pod::DType dt ) {
@@ -598,20 +598,20 @@ pod::TensorView SafeTensorsRepo::load(
 	}
 	else if ( meta->dtype == pod::DType::BF16 && out_dtype == pod::DType::FP16 ) {
 		const uint16_t* src_bf16 = static_cast<const uint16_t*>( src_cpu );
-		std::vector<half> h_fp16( total_elems );
+		std::vector<backend::half_t> h_fp16( total_elems );
 		for ( size_t i = 0; i < total_elems; ++i ) {
 			h_fp16[i] = bf16_to_fp16( src_bf16[i] );
 		}
-		backend::memcpy_async( tv.data, h_fp16.data(), total_elems * sizeof( half ), backend::Copy::Auto, stream );
+		backend::memcpy_async( tv.data, h_fp16.data(), total_elems * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 		backend::stream_sync( stream );
 	}
 	else if ( meta->dtype == pod::DType::FP32 && out_dtype == pod::DType::FP16 ) {
 		const float* src_f32 = static_cast<const float*>( src_cpu );
-		std::vector<half> h_fp16( total_elems );
+		std::vector<backend::half_t> h_fp16( total_elems );
 		for ( size_t i = 0; i < total_elems; ++i ) {
 			h_fp16[i] = f32_to_fp16( src_f32[i] );
 		}
-		backend::memcpy_async( tv.data, h_fp16.data(), total_elems * sizeof( half ), backend::Copy::Auto, stream );
+		backend::memcpy_async( tv.data, h_fp16.data(), total_elems * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 		backend::stream_sync( stream );
 	}
 	else {
@@ -687,20 +687,20 @@ pod::TensorView SafeTensorsRepo::load_slice(
 		}
 		else if ( meta->dtype == pod::DType::BF16 && out_dtype == pod::DType::FP16 ) {
 			const uint16_t* src_bf16 = static_cast<const uint16_t*>( src_cpu ) + offset_elems;
-			std::vector<half> h_fp16( local_elems );
+			std::vector<backend::half_t> h_fp16( local_elems );
 			for ( size_t i = 0; i < local_elems; ++i ) {
 				h_fp16[i] = bf16_to_fp16( src_bf16[i] );
 			}
-			backend::memcpy_async( tv.data, h_fp16.data(), local_elems * sizeof( half ), backend::Copy::Auto, stream );
+			backend::memcpy_async( tv.data, h_fp16.data(), local_elems * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 			backend::stream_sync( stream );
 		}
 		else if ( meta->dtype == pod::DType::FP32 && out_dtype == pod::DType::FP16 ) {
 			const float* src_f32 = static_cast<const float*>( src_cpu ) + offset_elems;
-			std::vector<half> h_fp16( local_elems );
+			std::vector<backend::half_t> h_fp16( local_elems );
 			for ( size_t i = 0; i < local_elems; ++i ) {
 				h_fp16[i] = f32_to_fp16( src_f32[i] );
 			}
-			backend::memcpy_async( tv.data, h_fp16.data(), local_elems * sizeof( half ), backend::Copy::Auto, stream );
+			backend::memcpy_async( tv.data, h_fp16.data(), local_elems * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 			backend::stream_sync( stream );
 		}
 	}
@@ -720,20 +720,20 @@ pod::TensorView SafeTensorsRepo::load_slice(
 			}
 			else if ( meta->dtype == pod::DType::BF16 && out_dtype == pod::DType::FP16 ) {
 				const uint16_t* src_bf16 = static_cast<const uint16_t*>( src_cpu ) + offset_elems;
-				std::vector<half> h_fp16( num_elems );
+				std::vector<backend::half_t> h_fp16( num_elems );
 				for ( size_t i = 0; i < num_elems; ++i ) {
 					h_fp16[i] = bf16_to_fp16( src_bf16[i] );
 				}
-				backend::memcpy_async( tv.data, h_fp16.data(), num_elems * sizeof( half ), backend::Copy::Auto, stream );
+				backend::memcpy_async( tv.data, h_fp16.data(), num_elems * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 				backend::stream_sync( stream );
 			}
 			else if ( meta->dtype == pod::DType::FP32 && out_dtype == pod::DType::FP16 ) {
 				const float* src_f32 = static_cast<const float*>( src_cpu ) + offset_elems;
-				std::vector<half> h_fp16( num_elems );
+				std::vector<backend::half_t> h_fp16( num_elems );
 				for ( size_t i = 0; i < num_elems; ++i ) {
 					h_fp16[i] = f32_to_fp16( src_f32[i] );
 				}
-				backend::memcpy_async( tv.data, h_fp16.data(), num_elems * sizeof( half ), backend::Copy::Auto, stream );
+				backend::memcpy_async( tv.data, h_fp16.data(), num_elems * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 				backend::stream_sync( stream );
 			}
 		}
@@ -753,14 +753,14 @@ pod::TensorView SafeTensorsRepo::load_slice(
 				backend::stream_sync( stream );
 			}
 			else if ( meta->dtype == pod::DType::BF16 && out_dtype == pod::DType::FP16 ) {
-				std::vector<half> h_buf( total_local );
+				std::vector<backend::half_t> h_buf( total_local );
 				const uint16_t* src_bf16 = static_cast<const uint16_t*>( src_cpu );
 				for ( int r = 0; r < rows; ++r ) {
 					for ( int c = 0; c < local_cols; ++c ) {
 						h_buf[r * local_cols + c] = bf16_to_fp16( src_bf16[r * cols + rank * local_cols + c] );
 					}
 				}
-				backend::memcpy_async( tv.data, h_buf.data(), total_local * sizeof( half ), backend::Copy::Auto, stream );
+				backend::memcpy_async( tv.data, h_buf.data(), total_local * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 				backend::stream_sync( stream );
 			}
 		}
@@ -975,15 +975,15 @@ pod::LinearWeight SafeTensorsRepo::load_linear_cols_padded(
 	if ( !meta_svh || shard < 0 ) return pod::LinearWeight{};
 	ENGINE_ASSERT( meta_svh->ndim == 1 && meta_svh->shape[0] == BN * 16, "svh must be one scale per column" );
 
-	std::vector<half> h_svh( static_cast<size_t>( local_BN ) * 16 + pad_cols, __float2half( 0.0f ) );
-	const half* src_svh = static_cast<const half*>( safetensors_get_data_cpu( shards_[shard], meta_svh ) );
+	std::vector<backend::half_t> h_svh( static_cast<size_t>( local_BN ) * 16 + pad_cols, backend::from_float_half( 0.0f ) );
+	const backend::half_t* src_svh = static_cast<const backend::half_t*>( safetensors_get_data_cpu( shards_[shard], meta_svh ) );
 	ENGINE_ASSERT( src_svh != nullptr, "Failed to get CPU data for svh" );
-	std::memcpy( h_svh.data(), src_svh + static_cast<size_t>( col_block_begin ) * 16, ( h_svh.size() - pad_cols ) * sizeof( half ) );
+	std::memcpy( h_svh.data(), src_svh + static_cast<size_t>( col_block_begin ) * 16, ( h_svh.size() - pad_cols ) * sizeof( backend::half_t ) );
 
 	int svh_shape[1] = { static_cast<int>( h_svh.size() ) };
 	pod::TensorView svh = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, svh_shape, 1 );
 	if ( !svh.data ) return pod::LinearWeight{};
-	backend::memcpy_async( svh.data, h_svh.data(), h_svh.size() * sizeof( half ), backend::Copy::Auto, stream );
+	backend::memcpy_async( svh.data, h_svh.data(), h_svh.size() * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 	backend::stream_sync( stream );
 
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.mul1", base_name );
@@ -1085,14 +1085,14 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_fused(
 	const void* src_svh_b = safetensors_get_data_cpu( shards_[svh_shard_b], meta_svh_b );
 	ENGINE_ASSERT( src_svh_a && src_svh_b, "Failed to get CPU data for svh tensors" );
 
-	const half* h_svh_a = static_cast<const half*>( src_svh_a ) + rank * local_N_a;
-	const half* h_svh_b = static_cast<const half*>( src_svh_b ) + rank * local_N_b;
+	const backend::half_t* h_svh_a = static_cast<const backend::half_t*>( src_svh_a ) + rank * local_N_a;
+	const backend::half_t* h_svh_b = static_cast<const backend::half_t*>( src_svh_b ) + rank * local_N_b;
 
-	std::vector<half> h_svh_fused( local_N_fused );
-	std::memcpy( h_svh_fused.data(), h_svh_a, local_N_a * sizeof( half ) );
-	std::memcpy( h_svh_fused.data() + local_N_a, h_svh_b, local_N_b * sizeof( half ) );
+	std::vector<backend::half_t> h_svh_fused( local_N_fused );
+	std::memcpy( h_svh_fused.data(), h_svh_a, local_N_a * sizeof( backend::half_t ) );
+	std::memcpy( h_svh_fused.data() + local_N_a, h_svh_b, local_N_b * sizeof( backend::half_t ) );
 
-	backend::memcpy_async( svh.data, h_svh_fused.data(), local_N_fused * sizeof( half ), backend::Copy::Auto, stream );
+	backend::memcpy_async( svh.data, h_svh_fused.data(), local_N_fused * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 	backend::stream_sync( stream );
 
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( tr.shape[2] / 16 ) : bits;
@@ -1208,7 +1208,7 @@ pod::TensorView SafeTensorsRepo::load_grouped_slice(
 
 	if ( out_dtype == pod::DType::FP16 && meta->dtype == pod::DType::BF16 ) {
 		const uint16_t* src_bf16 = static_cast<const uint16_t*>( src_cpu );
-		std::vector<half> h_dst( total_local_elems );
+		std::vector<backend::half_t> h_dst( total_local_elems );
 
 		for ( size_t o = 0; o < outer_size; ++o ) {
 			int src_grp_start = 0;
@@ -1231,12 +1231,12 @@ pod::TensorView SafeTensorsRepo::load_grouped_slice(
 			}
 		}
 
-		backend::memcpy_async( tv.data, h_dst.data(), total_local_elems * sizeof( half ), backend::Copy::Auto, stream );
+		backend::memcpy_async( tv.data, h_dst.data(), total_local_elems * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 		backend::stream_sync( stream );
 	}
 	else if ( out_dtype == pod::DType::FP16 && meta->dtype == pod::DType::FP32 ) {
 		const float* src_f32 = static_cast<const float*>( src_cpu );
-		std::vector<half> h_dst( total_local_elems );
+		std::vector<backend::half_t> h_dst( total_local_elems );
 
 		for ( size_t o = 0; o < outer_size; ++o ) {
 			int src_grp_start = 0;
@@ -1259,7 +1259,7 @@ pod::TensorView SafeTensorsRepo::load_grouped_slice(
 			}
 		}
 
-		backend::memcpy_async( tv.data, h_dst.data(), total_local_elems * sizeof( half ), backend::Copy::Auto, stream );
+		backend::memcpy_async( tv.data, h_dst.data(), total_local_elems * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 		backend::stream_sync( stream );
 	}
 	else {

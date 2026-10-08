@@ -9,7 +9,7 @@
 // Streams are [tile][group][lane].
 #include "engine/loader/safetensors.h"
 #include "engine/backend/runtime.h"
-#include <cuda_fp16.h>
+#include "engine/backend/numeric.h"
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -162,19 +162,19 @@ pod::TensorView SafeTensorsRepo::load_nvfp4_dense(
 	if ( !open_nvfp4( *this, base_name, src ) ) return pod::TensorView{};
 	const int n_cnt = split_n ? src.N / tp_size : src.N, n0 = split_n ? rank * n_cnt : 0;
 	const int k_cnt = split_n ? src.K : src.K / tp_size, k0 = split_n ? 0 : rank * k_cnt;
-	std::vector<half> out( static_cast<size_t>( n_cnt ) * k_cnt );
+	std::vector<backend::half_t> out( static_cast<size_t>( n_cnt ) * k_cnt );
 	for ( int n = 0; n < n_cnt; ++n ) {
 		for ( int k = 0; k < k_cnt; ++k ) {
 			const int kk = k0 + k;
 			const uint8_t b = src.packed[static_cast<size_t>( n0 + n ) * ( src.K / 2 ) + kk / 2];
 			const float sc = e4m3_to_float( src.scales[static_cast<size_t>( n0 + n ) * ( src.K / 16 ) + kk / 16] );
-			out[static_cast<size_t>( n ) * k_cnt + k] = __float2half( e2m1_to_float( ( kk & 1 ) ? ( b >> 4 ) : ( b & 15 ) ) * sc * src.inv_global );
+			out[static_cast<size_t>( n ) * k_cnt + k] = backend::from_float_half( e2m1_to_float( ( kk & 1 ) ? ( b >> 4 ) : ( b & 15 ) ) * sc * src.inv_global );
 		}
 	}
 	const int shape[2] = { n_cnt, k_cnt };
 	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
 	if ( tv.data == nullptr ) return tv;
-	backend::memcpy_async( tv.data, out.data(), out.size() * sizeof( half ), backend::Copy::H2D, stream );
+	backend::memcpy_async( tv.data, out.data(), out.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
 	backend::stream_sync( stream );
 	return tv;
 }
@@ -195,7 +195,7 @@ pod::LinearWeight SafeTensorsRepo::load_dense_rows_padded(
 	const size_t K = meta->shape[1];
 	const size_t rows = static_cast<size_t>( row_count ) + pad_rows;
 	const uint16_t* src = static_cast<const uint16_t*>( cpu_data( weight_name ) ) + static_cast<size_t>( row_begin ) * K;
-	std::vector<half> out( rows * K );
+	std::vector<backend::half_t> out( rows * K );
 	for ( size_t i = 0; i < static_cast<size_t>( row_count ) * K; ++i ) {
 		if ( meta->dtype == pod::DType::FP16 ) {
 			std::memcpy( &out[i], &src[i], 2 );
@@ -204,14 +204,14 @@ pod::LinearWeight SafeTensorsRepo::load_dense_rows_padded(
 			const uint32_t bits = static_cast<uint32_t>( src[i] ) << 16;
 			float f;
 			std::memcpy( &f, &bits, 4 );
-			out[i] = __float2half( f );
+			out[i] = backend::from_float_half( f );
 		}
 	}
-	std::memset( &out[static_cast<size_t>( row_count ) * K], 0, static_cast<size_t>( pad_rows ) * K * sizeof( half ) );
+	std::memset( &out[static_cast<size_t>( row_count ) * K], 0, static_cast<size_t>( pad_rows ) * K * sizeof( backend::half_t ) );
 	const int shape[2] = { static_cast<int>( rows ), static_cast<int>( K ) };
 	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
 	if ( tv.data == nullptr ) return pod::LinearWeight{};
-	backend::memcpy_async( tv.data, out.data(), out.size() * sizeof( half ), backend::Copy::H2D, stream );
+	backend::memcpy_async( tv.data, out.data(), out.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
 	backend::stream_sync( stream );
 	return pod::LinearWeight::make_fp16( pod::make_tensor_2d( tv.data, pod::DType::FP16, static_cast<int>( K ), static_cast<int>( rows ) ) );
 }
