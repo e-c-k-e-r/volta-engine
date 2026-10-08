@@ -7,7 +7,9 @@
 #include "engine/modules/embedding.h"
 #include "engine/spec/dflash.h"
 #include "engine/spec/tap_ring.h"
+#if ENGINE_BACKEND_CUDA
 #include "trellis_context.h"
+#endif
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -287,8 +289,10 @@ bool GLM53Pipeline::init(
 		draft_hooks_.embedding = &g_embed_table;
 	}
 
+#if ENGINE_BACKEND_CUDA
 	engine::modules::trellis_get_workspace( rank_, 16 * 1024 * 1024 );
 	engine::modules::trellis_get_locks( rank_ );
+#endif
 
 	metadata_.model_name = "glm53";
 	metadata_.hidden_size = config_.hidden_size;

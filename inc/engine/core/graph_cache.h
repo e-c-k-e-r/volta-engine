@@ -30,6 +30,11 @@ public:
 	void run( int m, backend::stream_t stream, Body&& body, int variant = 0 ) {
 		ENGINE_ASSERT( variant >= 0 && variant < 2, "GraphCache::run: variant out of range" );
 		ENGINE_ASSERT( m >= 1 && m <= pod::MAX_ROWS, "GraphCache::run: row count out of range" );
+#if !ENGINE_BACKEND_HAS_GRAPHS
+		// No capture on this backend: the body is the execution
+		body( stream );
+		return;
+#else
 		// Prefill chunks (above the decode sizes) run eagerly: a graph per chunk size would never be replayed.
 		if ( !enabled_ || stream == nullptr || m > pod::MAX_BATCH ) {
 			body( stream );
@@ -54,6 +59,7 @@ public:
 		}
 		backend::graph_launch( exec, stream );
 		++replays_;
+#endif
 	}
 
 	// Caller must have the owning device current

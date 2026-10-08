@@ -1,23 +1,30 @@
 cmake_minimum_required(VERSION 3.18)
-project(volta_engine LANGUAGES CXX CUDA)
+
+# Computing backend: exactly one (CUDA or CPU). Chosen before project() so the CPU configuration never enables the CUDA language.
+set(ENGINE_BACKEND "CUDA" CACHE STRING "Computing backend: CUDA or CPU")
+if(ENGINE_BACKEND STREQUAL "CUDA")
+	project(volta_engine LANGUAGES CXX CUDA)
+elseif(ENGINE_BACKEND STREQUAL "CPU")
+	project(volta_engine LANGUAGES CXX)
+else()
+	message(FATAL_ERROR "ENGINE_BACKEND=${ENGINE_BACKEND}: only CUDA and CPU are implemented")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-set(CMAKE_CUDA_ARCHITECTURES 70)
-
-# Computing backend: exactly one. Only CUDA is implemented; the backend layer (inc/engine/backend) is where the others plug in.
-set(ENGINE_BACKEND "CUDA" CACHE STRING "Computing backend: CUDA")
-if(NOT ENGINE_BACKEND STREQUAL "CUDA")
-	message(FATAL_ERROR "ENGINE_BACKEND=${ENGINE_BACKEND}: only CUDA is implemented")
+if(ENGINE_BACKEND STREQUAL "CUDA")
+	set(CMAKE_CUDA_STANDARD 17)
+	set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+	set(CMAKE_CUDA_ARCHITECTURES 70)
+	add_compile_definitions(ENGINE_BACKEND_CUDA=1)
+	find_package(CUDAToolkit REQUIRED)
+	set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -Xcompiler -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION -DEXL3_SM70_HMMA=1 -DEXL3_VOLTA=1 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 20012")
+else()
+	add_compile_definitions(ENGINE_BACKEND_CPU=1)
 endif()
-add_compile_definitions(ENGINE_BACKEND_CUDA=1)
-find_package(CUDAToolkit REQUIRED)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -Xcompiler -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION -DEXL3_SM70_HMMA=1 -DEXL3_VOLTA=1 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 20012")
 
 include_directories(
 	${PROJECT_SOURCE_DIR}/inc
@@ -44,6 +51,7 @@ set(ENGINE_HOST_SOURCES
 	src/server/server.cpp
 )
 
+if(ENGINE_BACKEND STREQUAL "CUDA")
 # CUDA device code and its launch drivers (compiled only for the CUDA backend)
 set(ENGINE_DEVICE_SOURCES
 	src/comm/all_reduce_ipc.cu
@@ -84,6 +92,8 @@ set_target_properties(engine_kernels PROPERTIES
 	OUTPUT_NAME "engine_kernels"
 )
 
+endif()
+
 # Slang Tier B kernels (src/shaders/*.slang): portable sources for the CUDA / Vulkan / CPU backends. The CUDA build keeps its
 # hand-tuned kernels as the default; these are generated for the parity test and as the base for the other backends.
 find_program(SLANGC slangc HINTS /opt/shader-slang/bin)
@@ -119,13 +129,15 @@ if(SLANGC)
 	endforeach()
 	add_custom_target(slang_kernels DEPENDS ${SLANG_GENERATED})
 
-	# Generated CUDA kernels live in their own translation units: the Slang prelude redefines the half2 operators
-	file(GLOB SLANG_CUDA_LAUNCHERS src/shaders/cuda/*.cu)
-	add_library(engine_slang_cuda STATIC ${SLANG_CUDA_LAUNCHERS})
-	add_dependencies(engine_slang_cuda slang_kernels)
-	target_include_directories(engine_slang_cuda PRIVATE ${SLANG_OUT} ${SLANG_INCLUDE_DIR} src/shaders/cuda)
-	target_compile_definitions(engine_slang_cuda PRIVATE __CUDA_NO_HALF2_OPERATORS__)
-	set_target_properties(engine_slang_cuda PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	if(ENGINE_BACKEND STREQUAL "CUDA")
+		# Generated CUDA kernels live in their own translation units: the Slang prelude redefines the half2 operators
+		file(GLOB SLANG_CUDA_LAUNCHERS src/shaders/cuda/*.cu)
+		add_library(engine_slang_cuda STATIC ${SLANG_CUDA_LAUNCHERS})
+		add_dependencies(engine_slang_cuda slang_kernels)
+		target_include_directories(engine_slang_cuda PRIVATE ${SLANG_OUT} ${SLANG_INCLUDE_DIR} src/shaders/cuda)
+		target_compile_definitions(engine_slang_cuda PRIVATE __CUDA_NO_HALF2_OPERATORS__)
+		set_target_properties(engine_slang_cuda PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	endif()
 
 	# Host target: the generated C++ kernels run on the CPU (no GPU involved)
 	set(SLANG_CPU_SOURCES "")
@@ -140,10 +152,12 @@ if(SLANGC)
 	target_include_directories(test_slang_cpu PRIVATE ${SLANG_INCLUDE_DIR})
 	set_target_properties(test_slang_cpu PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
-	add_executable(test_slang_kernels tests/2_parity/test_slang_kernels.cpp)
-	target_include_directories(test_slang_kernels PRIVATE src/shaders/cuda)
-	target_link_libraries(test_slang_kernels PRIVATE engine_kernels engine_slang_cuda)
-	set_target_properties(test_slang_kernels PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	if(ENGINE_BACKEND STREQUAL "CUDA")
+		add_executable(test_slang_kernels tests/2_parity/test_slang_kernels.cpp)
+		target_include_directories(test_slang_kernels PRIVATE src/shaders/cuda)
+		target_link_libraries(test_slang_kernels PRIVATE engine_kernels engine_slang_cuda)
+		set_target_properties(test_slang_kernels PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	endif()
 else()
 	message(STATUS "slangc not found: Slang kernels skipped")
 endif()
@@ -152,6 +166,7 @@ endif()
 add_executable(test_backend_tiers tests/2_parity/test_backend_tiers.cpp)
 set_target_properties(test_backend_tiers PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+if(ENGINE_BACKEND STREQUAL "CUDA")
 # Test Trellis Parity
 add_executable(test_trellis tests/2_parity/test_trellis.cpp)
 target_link_libraries(test_trellis PRIVATE engine_kernels)
@@ -338,6 +353,7 @@ set_target_properties(test_dsa PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BI
 add_executable(bench_expert_heat tests/3_bench/bench_expert_heat.cpp)
 target_link_libraries(bench_expert_heat PRIVATE engine_kernels)
 set_target_properties(bench_expert_heat PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+endif()
 
 # Per-lane build fragments (each owned by one Wave 2 lane; empty until the lane fills it in)
 include(${PROJECT_SOURCE_DIR}/cmake/cpu_backend.cmake OPTIONAL)
