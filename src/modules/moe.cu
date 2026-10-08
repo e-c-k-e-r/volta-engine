@@ -159,7 +159,7 @@ void router_logits_kernel(
 	g_router_partials[( static_cast<size_t>( m ) * ROUTER_MAX_KSLICES + ks ) * 288 + expert] = logit;
 }
 
-__global__ __launch_bounds__( 32 )
+__global__ __launch_bounds__( 288 )
 void router_select_kernel(
 	const half* __restrict__ e_score_bias,
 	int* __restrict__ topk_indices,
@@ -174,8 +174,12 @@ void router_select_kernel(
 	const int m = blockIdx.x;
 	topk_indices += m * top_k;
 	topk_weights += m * top_k;
-	for ( int expert = threadIdx.x; expert < num_experts; expert += 32 ) {
+	// One thread per expert: the k_slices partials are independent loads, all in flight at once (a lane looping over
+	// 9 experts x 32 slices serialized them, 22 us). Same ascending slice order, so the logit is bit-identical.
+	const int expert = threadIdx.x;
+	if ( expert < num_experts ) {
 		float logit = 0.0f;
+		#pragma unroll 8
 		for ( int ks = 0; ks < k_slices; ++ks ) {
 			logit += g_router_partials[( static_cast<size_t>( m ) * ROUTER_MAX_KSLICES + ks ) * 288 + expert];
 		}
@@ -187,7 +191,7 @@ void router_select_kernel(
 		s_raw[expert] = raw_score;
 		s_select[expert] = select_score;
 	}
-	__syncwarp();
+	__syncthreads();
 
 	// Top-k by warp 0: each lane owns experts lane, lane + 32, ...; k rounds of a warp argmax (ties go to the
 	// lowest expert index), removing the winner each round. Same descending order as the old selection sort.
@@ -349,7 +353,7 @@ void MoERouter::route_topk(
 		hidden_size,
 		num_experts
 	);
-	router_select_kernel<<<dim3( rows ), dim3( 32 ), 0, stream>>>(
+	router_select_kernel<<<dim3( rows ), dim3( ( num_experts + 31 ) / 32 * 32 ), 0, stream>>>(
 		e_score_bias.ptr<const half>(),
 		d_topk_indices,
 		d_topk_weights,
