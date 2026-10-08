@@ -58,7 +58,7 @@ public:
 	};
 	size_t snapshot_bytes( int tokens ) const;    // per rank; 0 when the model cannot snapshot
 	bool save_snapshot( int slot, int tokens, SeqSnapshot* snap );
-	// Overwrites the slot's state with the snapshot. The slot leaves the drafter's ownership (no taps exist for the restored prefix).
+	// Overwrites the slot's state with the snapshot (with a drafter: its tap ring rows, then the slot claims the drafter).
 	bool load_snapshot( int slot, const SeqSnapshot& snap );
 	void free_snapshot( SeqSnapshot* snap );
 

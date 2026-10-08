@@ -79,6 +79,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	if ( !cfg.draft_model_dir.empty() ) {
 		runner_ = std::make_unique<DFlash2Runner>();
 		if ( !runner_->init( *this, cfg.draft_model_dir ) ) return false;
+		for ( int d = 0; d < tp_; ++d ) models_[d]->set_snapshot_taps( true );
 	}
 
 	// arena_create on the third device leaves cudaErrorInvalidValue pending on this thread although every
@@ -334,7 +335,6 @@ bool ModelCluster::save_snapshot( int slot, int tokens, SeqSnapshot* snap ) {
 
 bool ModelCluster::load_snapshot( int slot, const SeqSnapshot& snap ) {
 	if ( snap.tokens <= 0 || !snap.host[0] ) return false;
-	if ( runner_ ) runner_->release( slot );
 	int ok[ENGINE_NUM_GPUS] = {};
 	pool_.run( [&]( int d ) {
 		ok[d] = models_[d]->load_seq_state( slot, snap.tokens, snap.host[d], streams_[d] ) ? 1 : 0;
@@ -343,6 +343,8 @@ bool ModelCluster::load_snapshot( int slot, const SeqSnapshot& snap ) {
 	for ( int d = 0; d < tp_; ++d ) {
 		if ( !ok[d] ) return false;
 	}
+	// The drafter takes the slot over: the restored tap rows are its context for the prefix, and the tail prefill publishes the rest
+	if ( runner_ ) runner_->claim( slot );
 	return true;
 }
 

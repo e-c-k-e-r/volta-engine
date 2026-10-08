@@ -13,13 +13,28 @@
 
 using namespace engine::runtime;
 
+static int g_proposed = 0, g_accepted = 0;
+
+// Greedy continuation of `count` tokens; speculative rounds (DFlash2) when the cluster has a drafter that owns the slot
 static std::vector<int> decode( ModelCluster& mc, int first, int pos, int slot, int count ) {
 	std::vector<int> out = { first };
 	int tok = first;
-	for ( int i = 1; i < count; ++i ) {
-		mc.forward( &tok, 1, pos++, slot );
-		tok = mc.sample_one();
-		out.push_back( tok );
+	while ( static_cast<int>( out.size() ) < count ) {
+		if ( mc.spec_owns( slot ) ) {
+			const SpecResult r = mc.speculate( slot, tok, pos );
+			g_proposed += r.proposed;
+			g_accepted += r.accepted;
+			pos = r.next_pos;
+			for ( int i = 0; i < r.emitted_count && static_cast<int>( out.size() ) < count; ++i ) {
+				tok = r.emitted[i];
+				out.push_back( tok );
+			}
+		}
+		else {
+			mc.forward( &tok, 1, pos++, slot );
+			tok = mc.sample_one();
+			out.push_back( tok );
+		}
 	}
 	return out;
 }
@@ -27,7 +42,9 @@ static std::vector<int> decode( ModelCluster& mc, int first, int pos, int slot, 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	int n_tokens = 6000;
+	bool spec = false;
 	for ( int i = 1; i < argc; ++i ) {
+		if ( !std::strcmp( argv[i], "--spec" ) ) spec = true;
 		if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
 	}
 	engine::loader::Tokenizer tok;
@@ -47,6 +64,7 @@ int main( int argc, char** argv ) {
 	ClusterConfig cfg;
 	cfg.model_type = "qwen3_5";
 	cfg.model_dir = test::QWEN_DIR;
+	if ( spec ) cfg.draft_model_dir = test::QWEN_DRAFT_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	ENGINE_ASSERT( mc.snapshot_bytes( 1024 ) > 0, "the model cannot snapshot" );
 	mc.warm_graphs( 8 );
@@ -57,7 +75,9 @@ int main( int argc, char** argv ) {
 	mc.reset_slot( 0 );
 	Candidates cold_c;
 	const int cold_first = mc.prefill( ids.data(), n, 0, 0, &cold_c );
-	const std::vector<int> cold = decode( mc, cold_first, n, 0, 16 );
+	const std::vector<int> cold = decode( mc, cold_first, n, 0, 48 );
+	std::printf( "[*] cold run: %s, proposed %d accepted %d\n", spec ? "speculative" : "plain", g_proposed, g_accepted );
+	g_proposed = g_accepted = 0;
 
 	int failures = 0;
 	for ( int cut : { chunk * ( ( n / 2 ) / chunk ), n / 2 + 37 } ) {
@@ -75,13 +95,15 @@ int main( int argc, char** argv ) {
 			const double load_ms = test::ms_since( t0 );
 			Candidates warm_c;
 			const int first = mc.prefill( ids.data() + cut, n - cut, slot, 0, &warm_c, cut );
-			const std::vector<int> warm = decode( mc, first, n, slot, 16 );
+			const std::vector<int> warm = decode( mc, first, n, slot, 48 );
 			float max_diff = 0.0f;
 			for ( int j = 0; j < warm_c.n; ++j ) max_diff = std::max( max_diff, std::fabs( warm_c.logits[j] - cold_c.logits[j] ) );
 			const bool same = warm == cold;
 			const bool ok = same && ( aligned ? max_diff == 0.0f : max_diff < 0.25f );
-			std::printf( "%s cut %d (%s) -> slot %d: save %.1f ms, load %.1f ms, max |dlogit| %.4g, tokens %s\n", ok ? "[+]" : "[-]", cut,
-				aligned ? "aligned" : "unaligned", slot, save_ms, load_ms, max_diff, same ? "identical" : "DIFFER" );
+			std::printf( "%s cut %d (%s) -> slot %d: save %.1f ms, load %.1f ms, max |dlogit| %.4g, tokens %s%s\n", ok ? "[+]" : "[-]", cut,
+				aligned ? "aligned" : "unaligned", slot, save_ms, load_ms, max_diff, same ? "identical" : "DIFFER",
+				spec ? ( mc.spec_owns( slot ) ? ", drafter owns the slot" : ", DRAFTER LOST" ) : "" );
+			if ( spec && !mc.spec_owns( slot ) ) failures++;
 			failures += ok ? 0 : 1;
 		}
 		mc.free_snapshot( &snap );
@@ -136,6 +158,10 @@ int main( int argc, char** argv ) {
 		e = cache.find( other );
 		expect( e && e->tokens.size() == 900 && e->pinned, "the pinned root survived eviction" );
 		cache.clear();
+	}
+	if ( spec ) {
+		std::printf( "[*] warm runs: proposed %d accepted %d (acceptance %.2f)\n", g_proposed, g_accepted, g_proposed ? static_cast<double>( g_accepted ) / g_proposed : 0.0 );
+		if ( g_proposed == 0 ) failures++;
 	}
 	std::printf( "%s\n", failures ? "[-] FAIL" : "[+] PASS prefix restore" );
 	mc.shutdown();

@@ -78,6 +78,7 @@ tier2() {
 	run test_ops_attention_check_vulkan gpu $ROOT/build_vk/test_ops_attention --check $out/golden --only attention,gdn_single
 	run coherence gpu ./test_coherence
 	run prefix_restore gpu ./test_prefix_restore
+	run prefix_restore_spec gpu ./test_prefix_restore --spec
 	run sampling_qwen gpu ./test_sampling_gpu
 	run sampling_glm gpu ./test_sampling_gpu --glm
 }

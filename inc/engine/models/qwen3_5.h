@@ -128,6 +128,7 @@ public:
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) override;
 	void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) override;
+	void set_snapshot_taps( bool on ) override { snap_taps_ = on; }
 	size_t seq_state_bytes( int tokens ) const override;
 	bool save_seq_state( int slot_id, int tokens, void* host_dst, backend::stream_t stream = nullptr ) override;
 	bool load_seq_state( int slot_id, int tokens, const void* host_src, backend::stream_t stream = nullptr ) override;
@@ -204,6 +205,8 @@ private:
 	// DFlash2 attachment (see DraftHooks): tap ring, head scratch and per-rank candidate top-k scratch.
 	DraftHooks draft_hooks_;
 	pod::TensorView draft_taps_;         // [taps_cap, 5 * hidden]
+	size_t tap_snapshot_bytes( int tokens ) const;
+	bool snap_taps_ = false;             // sequence snapshots include the tap ring rows
 	pod::TensorView draft_lm_logits_;    // [kDraftM, lm_shard_cols]
 	static constexpr int kTopkTile = 4096;   // TOPK_THREADS * 16
 	float* draft_cand_part_v_ = nullptr;
