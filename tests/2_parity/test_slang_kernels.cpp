@@ -79,6 +79,12 @@ static bool compare( const char* name, const std::vector<half>& ref, const std::
 	return ok;
 }
 
+static bool compare_ref( const char* name, const std::vector<double>& ref, const std::vector<half>& got ) {
+	std::vector<half> r( ref.size() );
+	for ( size_t i = 0; i < ref.size(); ++i ) r[i] = __float2half( static_cast<float>( ref[i] ) );
+	return compare( name, r, got );
+}
+
 int main() {
 	backend::set_device( 0 );
 	backend::stream_t s = backend::stream_create();
@@ -175,6 +181,77 @@ int main() {
 		backend::device_free( d_rows );
 	}
 
+	{ // moe_sum_planes and moe_accumulate against CPU references
+		const int n = 4096, groups = 5;
+		Buf planes( n * groups ), out( n );
+		slang_moe_sum_planes( planes.d, out.d, n, groups, s );
+		backend::stream_sync( s );
+		auto hp = planes.get();
+		std::vector<double> ref( n );
+		for ( int i = 0; i < n; ++i ) { float a = __half2float( hp[i] ); for ( int g = 1; g < groups; ++g ) a += __half2float( hp[g * n + i] ); ref[i] = a; }
+		pass = compare_ref( "moe_sum_planes", ref, out.get() ) && pass;
+		Buf acc( n ), eo( n );
+		auto ha = acc.get(); auto he = eo.get();
+		slang_moe_accumulate( acc.d, eo.d, 0.37f, n, s );
+		backend::stream_sync( s );
+		for ( int i = 0; i < n; ++i ) ref[i] = std::fma( static_cast<double>( __half2float( he[i] ) ), 0.37f, static_cast<double>( __half2float( ha[i] ) ) );
+		pass = compare_ref( "moe_accumulate", ref, acc.get() ) && pass;
+	}
+	{ // batched_argmax: lowest index among ties, offset applied
+		const int batch = 4, numel = 7000, stride = 7168, offset = 100;
+		Buf logits( batch * stride, 3.0f );
+		int* d_idx = static_cast<int*>( backend::device_malloc( batch * sizeof( int ) ) );
+		float* d_val = static_cast<float*>( backend::device_malloc( batch * sizeof( float ) ) );
+		slang_batched_argmax( logits.d, d_idx, d_val, numel, batch, offset, stride, s );
+		backend::stream_sync( s );
+		int idx[batch]; float val[batch];
+		backend::memcpy_sync( idx, d_idx, sizeof( idx ), backend::Copy::D2H );
+		backend::memcpy_sync( val, d_val, sizeof( val ), backend::Copy::D2H );
+		auto hl = logits.get();
+		bool ok = true;
+		for ( int r = 0; r < batch; ++r ) {
+			int bi = -1; float bv = -1e30f;
+			for ( int i = 0; i < numel; ++i ) { const float v = __half2float( hl[r * stride + i] ); if ( v > bv ) { bv = v; bi = i; } }
+			ok = ok && idx[r] == bi + offset && val[r] == bv;
+		}
+		std::printf( "  %-22s indices+values vs CPU (ties to lowest index)  %s\n", "batched_argmax", ok ? "PASS" : "FAIL" );
+		pass = ok && pass;
+		backend::device_free( d_idx ); backend::device_free( d_val );
+	}
+	{ // router_select vs a CPU reference
+		const int rows = 3, E = 288, K = 8, slices = 32, maxs = 32;
+		std::vector<float> partials( static_cast<size_t>( rows ) * maxs * 288 );
+		for ( auto& v : partials ) v = frand( 0.25f );
+		Buf bias( E, 0.1f );
+		float* d_part = static_cast<float*>( backend::device_malloc( partials.size() * 4 ) );
+		backend::memcpy_sync( d_part, partials.data(), partials.size() * 4, backend::Copy::H2D );
+		int* d_idx = static_cast<int*>( backend::device_malloc( rows * K * sizeof( int ) ) );
+		Buf w( rows * K );
+		slang_router_select( d_part, bias.d, d_idx, w.d, rows, E, K, slices, maxs, 2.5f, s );
+		backend::stream_sync( s );
+		std::vector<int> idx( rows * K );
+		backend::memcpy_sync( idx.data(), d_idx, idx.size() * 4, backend::Copy::D2H );
+		auto hb = bias.get();
+		std::vector<double> ref( rows * K );
+		bool ok = true;
+		for ( int r = 0; r < rows; ++r ) {
+			std::vector<float> raw( E ), sel( E );
+			for ( int e = 0; e < E; ++e ) {
+				float logit = 0; for ( int ks = 0; ks < slices; ++ks ) logit += partials[( static_cast<size_t>( r ) * maxs + ks ) * 288 + e];
+				raw[e] = 1.0f / ( 1.0f + std::exp( -logit ) );
+				sel[e] = raw[e] + __half2float( hb[e] );
+			}
+			std::vector<int> chosen; double total = 0;
+			for ( int k = 0; k < K; ++k ) {
+				int bi = -1; for ( int e = 0; e < E; ++e ) { bool taken = false; for ( int c : chosen ) taken = taken || c == e; if ( !taken && ( bi < 0 || sel[e] > sel[bi] ) ) bi = e; }
+				chosen.push_back( bi ); total += raw[bi];
+			}
+			for ( int k = 0; k < K; ++k ) { ok = ok && idx[r * K + k] == chosen[k]; ref[r * K + k] = raw[chosen[k]] * 2.5 / ( total + 1e-9 ); }
+		}
+		std::printf( "  %-22s expert ids vs CPU  %s\n", "router_select", ok ? "PASS" : "FAIL" );
+		pass = ok && compare_ref( "router_select weights", ref, w.get() ) && pass;
+		backend::device_free( d_part ); backend::device_free( d_idx );
+	}
 	{ // speed, for reference: the CUDA build keeps its own kernels unless a Slang one matches
 		const int rows = 1, hidden = 5120;
 		Buf x( rows * hidden ), w( hidden, 0.5f ), o( rows * hidden ), g( 4096 * 8, 2.0f ), u( 4096 * 8, 2.0f ), so( 4096 * 8 );

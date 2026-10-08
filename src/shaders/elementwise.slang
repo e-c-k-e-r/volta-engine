@@ -57,3 +57,29 @@ void embed_tokens(uint3 tid : SV_DispatchThreadID, uniform EmbedParams p) {
 		p.out_[int64_t(row) * p.hidden_size + col] = half(asfloat(uint(p.table[src]) << 16));
 	}
 }
+
+// out = sum over groups of planes[g][i] (planes are [groups, n]); FP32 accumulation in group order
+struct SumPlanesParams { half* planes; half* out_; int n; int groups; };
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void moe_sum_planes(uint3 tid : SV_DispatchThreadID, uniform SumPlanesParams p) {
+	let i = int(tid.x);
+	if (i < p.n) {
+		float acc = float(p.planes[i]);
+		for (int g = 1; g < p.groups; ++g)
+			acc += float(p.planes[int64_t(g) * p.n + i]);
+		p.out_[i] = half(acc);
+	}
+}
+
+// accum += weight * expert_out
+struct AccumParams { half* accum; half* expert_out; float weight; int n; };
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void moe_accumulate(uint3 tid : SV_DispatchThreadID, uniform AccumParams p) {
+	let i = int(tid.x);
+	if (i < p.n)
+		p.accum[i] = half(fma(float(p.expert_out[i]), p.weight, float(p.accum[i])));
+}

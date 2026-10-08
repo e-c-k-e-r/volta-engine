@@ -15,6 +15,10 @@ void swiglu( ComputeVaryingInput*, void*, void* );
 void swiglu_fused( ComputeVaryingInput*, void*, void* );
 void embed_tokens( ComputeVaryingInput*, void*, void* );
 void rope( ComputeVaryingInput*, void*, void* );
+void moe_sum_planes( ComputeVaryingInput*, void*, void* );
+void moe_accumulate( ComputeVaryingInput*, void*, void* );
+void batched_argmax( ComputeVaryingInput*, void*, void* );
+void router_select( ComputeVaryingInput*, void*, void* );
 }
 
 struct NormParams { half* src; half* dst; half* weight; int hidden_size; int has_weight; float eps; float bias; };
@@ -24,6 +28,11 @@ struct SwigluParams { half* gate; half* up; half* out_; int n; float limit; };
 struct SwigluFusedParams { half* gate_up; half* out_; int inter_dim; int total; float limit; };
 struct EmbedParams { uint16_t* table; int* token_ids; half* out_; int hidden_size; };
 struct RopeParams { half* q; half* k; int* pos; int num_q_heads; int num_kv_heads; int head_dim; int rot_dim; int interleaved; float freq_base; };
+
+struct SumPlanesParams { half* planes; half* out_; int n; int groups; };
+struct AccumParams { half* accum; half* expert_out; float weight; int n; };
+struct ArgmaxParams { half* logits; int* out_idx; float* out_val; int numel; int batch_size; int index_offset; int row_stride; int has_val; };
+struct RouterParams { float* partials; half* bias; int* topk_idx; half* topk_w; int num_experts; int top_k; int k_slices; int max_slices; float scale; int has_bias; };
 
 static uint32_t g_state = 777u;
 static float frand( float scale ) {
@@ -160,6 +169,65 @@ int main() {
 			ref[o + c] = v;
 		}
 		pass = check( il ? "rope interleaved q" : "rope contiguous q", ref, q ) && pass;
+	}
+	{ // moe_sum_planes + moe_accumulate
+		const int n = 1000, groups = 4;
+		auto planes = make( n * groups, 1.0f );
+		std::vector<half> out( n );
+		SumPlanesParams p{ planes.data(), out.data(), n, groups };
+		dispatch( moe_sum_planes, &p, ( n + 255 ) / 256 );
+		std::vector<double> ref( n );
+		for ( int i = 0; i < n; ++i ) { double a = 0; for ( int g = 0; g < groups; ++g ) a += h2d( planes[g * n + i] ); ref[i] = a; }
+		pass = check( "moe_sum_planes", ref, out ) && pass;
+		auto acc = make( n, 1.0f ), eo = make( n, 1.0f );
+		auto acc0 = acc;
+		AccumParams q{ acc.data(), eo.data(), 0.37f, n };
+		dispatch( moe_accumulate, &q, ( n + 255 ) / 256 );
+		for ( int i = 0; i < n; ++i ) ref[i] = h2d( acc0[i] ) + h2d( eo[i] ) * 0.37;
+		pass = check( "moe_accumulate", ref, acc ) && pass;
+	}
+	{ // batched_argmax
+		const int batch = 3, numel = 900, stride = 1024, offset = 50;
+		auto logits = make( batch * stride, 3.0f );
+		int idx[batch]; float val[batch];
+		ArgmaxParams p{ logits.data(), idx, val, numel, batch, offset, stride, 1 };
+		dispatch( batched_argmax, &p, batch );
+		bool ok = true;
+		for ( int r = 0; r < batch; ++r ) {
+			int bi = -1; float bv = -1e30f;
+			for ( int i = 0; i < numel; ++i ) { const float v = static_cast<float>( logits[r * stride + i] ); if ( v > bv ) { bv = v; bi = i; } }
+			ok = ok && idx[r] == bi + offset && val[r] == bv;
+		}
+		std::printf( "  %-22s %s\n", "batched_argmax", ok ? "PASS" : "FAIL" );
+		pass = ok && pass;
+	}
+	{ // router_select
+		const int rows = 2, E = 288, K = 8, slices = 32, maxs = 32;
+		std::vector<float> partials( static_cast<size_t>( rows ) * maxs * 288 );
+		for ( auto& v : partials ) v = frand( 0.25f );
+		auto bias = make( E, 0.1f );
+		int idx[rows * K];
+		std::vector<half> w( rows * K );
+		RouterParams p{ partials.data(), bias.data(), idx, w.data(), E, K, slices, maxs, 2.5f, 1 };
+		dispatch( router_select, &p, rows );
+		bool ok = true;
+		std::vector<double> ref( rows * K );
+		for ( int r = 0; r < rows; ++r ) {
+			std::vector<float> raw( E ), sel( E );
+			for ( int e = 0; e < E; ++e ) {
+				float logit = 0; for ( int ks = 0; ks < slices; ++ks ) logit += partials[( static_cast<size_t>( r ) * maxs + ks ) * 288 + e];
+				raw[e] = 1.0f / ( 1.0f + std::exp( -logit ) );
+				sel[e] = raw[e] + static_cast<float>( bias[e] );
+			}
+			std::vector<int> chosen; double total = 0;
+			for ( int k = 0; k < K; ++k ) {
+				int bi = -1; for ( int e = 0; e < E; ++e ) { bool taken = false; for ( int c : chosen ) taken = taken || c == e; if ( !taken && ( bi < 0 || sel[e] > sel[bi] ) ) bi = e; }
+				chosen.push_back( bi ); total += raw[bi];
+			}
+			for ( int k = 0; k < K; ++k ) { ok = ok && idx[r * K + k] == chosen[k]; ref[r * K + k] = raw[chosen[k]] * 2.5 / ( total + 1e-9 ); }
+		}
+		std::printf( "  %-22s expert ids  %s\n", "router_select", ok ? "PASS" : "FAIL" );
+		pass = ok && check( "router_select weights", ref, w ) && pass;
 	}
 	std::printf( pass ? "[+] Slang CPU target parity PASS\n" : "[-] Slang CPU target parity FAIL\n" );
 	return pass ? 0 : 1;

@@ -93,7 +93,8 @@ if(SLANGC)
 	set(SLANG_OUT ${PROJECT_BINARY_DIR}/slang)
 	file(MAKE_DIRECTORY ${SLANG_OUT})
 	set(SLANG_KERNELS rms_norm:rms_norm rms_norm:rms_norm_heads elementwise:add_residual elementwise:swiglu
-		elementwise:swiglu_fused elementwise:embed_tokens rope:rope)
+		elementwise:swiglu_fused elementwise:embed_tokens rope:rope elementwise:moe_sum_planes elementwise:moe_accumulate
+		select:batched_argmax select:router_select)
 	set(SLANG_GENERATED "")
 	foreach(item ${SLANG_KERNELS})
 		string(REPLACE ":" ";" parts ${item})
