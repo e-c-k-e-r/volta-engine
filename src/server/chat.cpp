@@ -1,6 +1,8 @@
 #include "engine/server/chat.h"
 #include "engine/runtime/options.h"
 
+#include <algorithm>
+
 #include <cstdio>
 
 #define JSON_NOEXCEPTION 1
@@ -36,30 +38,38 @@ std::string effort_for( engine::loader::ModelFamily fam, const std::string& e ) 
 }
 
 // Chat templates accept a system message only at the start, but clients (Claude Code) also send system content later in
-// the conversation. All of it is folded, in order, into one leading system message.
+// the conversation. Leading system messages are folded into one system message; a later one becomes a user message in
+// place, so the history stays append-only: the prompt of turn k+1 starts with the prompt of turn k, which is what the
+// prefix cache matches on. (Folding them all into the front would rewrite the system prompt every turn.)
 void fold_system_messages( nlohmann::ordered_json& messages ) {
-	std::string system;
-	bool any = false;
-	nlohmann::ordered_json rest = nlohmann::ordered_json::array();
-	for ( const auto& m : messages ) {
-		if ( m.value( "role", std::string() ) != "system" ) {
-			rest.push_back( m );
-			continue;
-		}
-		any = true;
+	auto text_of = []( const nlohmann::ordered_json& m ) {
 		std::string text;
 		const auto& c = m["content"];
 		if ( c.is_string() ) text = c.get<std::string>();
 		else if ( c.is_array() ) for ( const auto& p : c ) text += p.value( "text", std::string() );
-		if ( text.empty() ) continue;
-		if ( !system.empty() ) system += "\n\n";
-		system += text;
-	}
-	if ( !any ) return;
+		return text;
+	};
+	std::string system;
 	nlohmann::ordered_json out = nlohmann::ordered_json::array();
-	if ( !system.empty() ) out.push_back( { { "role", "system" }, { "content", system } } );
-	for ( auto& m : rest ) out.push_back( m );
-	messages = std::move( out );
+	bool leading = true;
+	for ( const auto& m : messages ) {
+		const bool is_system = m.value( "role", std::string() ) == "system";
+		if ( is_system && leading ) {
+			const std::string text = text_of( m );
+			if ( !text.empty() ) system += ( system.empty() ? "" : "\n\n" ) + text;
+			continue;
+		}
+		leading = false;
+		if ( is_system ) {
+			out.push_back( { { "role", "user" }, { "content", text_of( m ) } } );
+			continue;
+		}
+		out.push_back( m );
+	}
+	nlohmann::ordered_json result = nlohmann::ordered_json::array();
+	if ( !system.empty() ) result.push_back( { { "role", "system" }, { "content", system } } );
+	for ( auto& m : out ) result.push_back( m );
+	messages = std::move( result );
 }
 
 } // namespace
@@ -169,6 +179,22 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	g.top_k = req.top_k > 0 ? req.top_k : cfg.default_top_k;
 	g.seed = req.seed;
 	g.stop_strings = req.stop;
+	// Prefix cache points. Root: the end of the system block (before the first user turn), shared by every conversation of
+	// this client. Turn boundary: the start of the generation prompt; the next turn's prompt re-renders the assistant
+	// reply there, so the end of the whole prompt is never a prefix of it but this boundary is.
+	{
+		const bool glm = family == engine::loader::ModelFamily::GLM;
+		auto add = [&]( size_t at, bool pinned, size_t min_tokens ) {
+			if ( at == std::string::npos || at == 0 ) return;
+			const std::vector<int> head = gen.tokenizer().encode( prompt.substr( 0, at ), false );
+			if ( head.size() < min_tokens || head.size() >= g.prompt_tokens.size() ) return;
+			if ( !std::equal( head.begin(), head.end(), g.prompt_tokens.begin() ) ) return;
+			if ( !g.checkpoint_at.empty() && static_cast<int>( head.size() ) <= g.checkpoint_at.back().pos ) return;
+			g.checkpoint_at.push_back( { static_cast<int>( head.size() ), pinned } );
+		};
+		add( prompt.find( glm ? "<|user|>" : "<|im_start|>user" ), true, 1024 );
+		add( prompt.rfind( glm ? "<|assistant|>" : "<|im_start|>assistant" ), false, 512 );
+	}
 	g.on_text = [state]( const std::string& delta ) {
 		if ( state->conn->closed() ) return false;
 		std::vector<OutputEvent> events;

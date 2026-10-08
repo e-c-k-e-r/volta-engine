@@ -161,6 +161,21 @@ code, body = post("/v1/messages", {"max_tokens": 5, "messages": []})
 j = json.loads(body)
 check(code == 400 and j["type"] == "error" and j["error"]["type"] == "invalid_request_error", "anthropic error shape", body)
 
+# ---- prefix cache: a long shared system prompt is snapshotted once and later requests resume from it
+metrics = json.loads(urllib.request.urlopen(BASE + "/metrics").read())
+if "prefix_cache" in metrics:
+    facts = " ".join("Fact %d: the code for district %d is %d." % (i, i, i * 37 % 1000) for i in range(260))
+    def ask(q):
+        code, body = post("/v1/chat/completions", {"messages": [{"role": "system", "content": "You answer from these facts, briefly. " + facts}, {"role": "user", "content": q}], "max_tokens": 12})
+        return json.loads(body)["choices"][0]["message"]["content"]
+    h0 = json.loads(urllib.request.urlopen(BASE + "/metrics").read())["prefix_cache"]["hits"]
+    a1 = ask("What is the code for district 7? Number only.")
+    a2 = ask("What is the code for district 100? Number only.")
+    a3 = ask("What is the code for district 7? Number only.")
+    h1 = json.loads(urllib.request.urlopen(BASE + "/metrics").read())["prefix_cache"]["hits"]
+    check(h1 - h0 >= 2, "prefix cache hits on a shared system prompt", (h0, h1))
+    check("259" in a1 and a1 == a3, "answer after a prefix hit equals the cold answer", (a1, a2, a3))
+
 # client disconnect frees the slot
 s = socket.create_connection((BASE.split("//")[1].split(":")[0], int(BASE.rsplit(":", 1)[1])))
 payload = json.dumps({"messages": [{"role": "user", "content": "Write a very long story."}], "max_tokens": 3000, "stream": True}).encode()

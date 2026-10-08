@@ -44,6 +44,15 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 	cluster_.warm_graphs( MAX( num_slots_, cluster_.has_speculator() ? 7 : 1 ) );
 	std::printf( "[+] Generator ready: %d slots, speculation %s\n", num_slots_, cluster_.has_speculator() ? "on" : "off" );
 
+	const size_t cache_budget = static_cast<size_t>( std::max( 0, runtime::options().prefix_cache_gib ) ) << 30;
+	if ( cache_budget > 0 && cluster_.snapshot_bytes( 1 ) > 0 ) {
+		prefix_cache_ = std::make_unique<PrefixCache>( cluster_, cache_budget );
+		std::printf( "[+] Prefix cache: %.0f GiB pinned host budget\n", cache_budget / 1073741824.0 );
+	}
+	else {
+		std::printf( "[*] Prefix cache off\n" );
+	}
+
 	running_.store( true );
 	scheduler_thread_ = std::thread( &Generator::scheduler_loop, this );
 	cpu_set_t cpuset;
@@ -59,6 +68,7 @@ void Generator::shutdown() {
 	if ( scheduler_thread_.joinable() ) {
 		scheduler_thread_.join();
 	}
+	prefix_cache_.reset();
 	cluster_.shutdown();
 	if ( was_running ) {
 		std::printf( "[+] Generator shutdown complete. 4 GPUs reset.\n" );
@@ -202,10 +212,28 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 
 void Generator::prefill_slot( int s ) {
 	Slot& slot = slots_[s];
-	const int n = static_cast<int>( slot.req.prompt_tokens.size() );
-	cluster_.reset_slot( s );
+	const std::vector<int>& prompt = slot.req.prompt_tokens;
+	const int n = static_cast<int>( prompt.size() );
+	// Resume from the longest cached prefix of the prompt, else start cold (which also hands the drafter to this slot)
+	int pos = 0;
+	if ( prefix_cache_ && n >= kPrefixMinTokens ) {
+		if ( const PrefixCache::Entry* hit = prefix_cache_->find( prompt ) ) {
+			if ( cluster_.load_snapshot( s, hit->snap ) ) {
+				pos = hit->snap.tokens;
+				std::printf( "[prefix] slot %d resumes at token %d of %d\n", s, pos, n );
+			}
+		}
+	}
+	if ( pos == 0 ) cluster_.reset_slot( s );
+	// Pinned roots (end of the system prompt) are snapshotted on the way through
+	for ( const GenerationRequest::Checkpoint& cp : slot.req.checkpoint_at ) {
+		if ( !prefix_cache_ || cp.pos <= pos || cp.pos >= n ) continue;
+		cluster_.prefill( prompt.data() + pos, cp.pos - pos, s, 0, nullptr, pos );
+		pos = cp.pos;
+		store_prefix( s, pos, cp.pinned );
+	}
 	Candidates first_cands;
-	int first = cluster_.prefill( slot.req.prompt_tokens.data(), n, s, 0, slot.sp.greedy() ? nullptr : &first_cands );
+	int first = cluster_.prefill( prompt.data() + pos, n - pos, s, 0, slot.sp.greedy() ? nullptr : &first_cands, pos );
 	if ( !slot.sp.greedy() ) first = sample_token( first_cands, slot.sp, slot.rng );
 	slot.current_pos = n;
 	slot.prefill_done = true;
@@ -215,6 +243,15 @@ void Generator::prefill_slot( int s ) {
 	slot.metrics.prefill_tok_s = ( ttft_ms > 0.0 ) ? static_cast<float>( n / ( ttft_ms / 1000.0 ) ) : 0.0f;
 	slot.last_token = first;
 	emit_token( s, first );
+}
+
+// Snapshots the first `tokens` positions of slot s (its prompt) into the prefix cache unless an identical entry exists
+void Generator::store_prefix( int s, int tokens, bool pinned ) {
+	const std::vector<int> key( slots_[s].req.prompt_tokens.begin(), slots_[s].req.prompt_tokens.begin() + tokens );
+	if ( prefix_cache_->contains( key ) ) return;
+	ModelCluster::SeqSnapshot snap;
+	if ( !cluster_.save_snapshot( s, tokens, &snap ) ) return;
+	prefix_cache_->insert( key, snap, pinned );
 }
 
 void Generator::step_batch() {
@@ -312,6 +349,10 @@ EngineMetrics Generator::get_metrics() const {
 	}
 	lock.unlock();
 
+	if ( prefix_cache_ ) {
+		m.prefix_enabled = true;
+		m.prefix = prefix_cache_->stats();
+	}
 	m.gpu_vram_used_bytes.resize( cluster_.tp() );
 	for ( int d = 0; d < cluster_.tp(); ++d ) {
 		m.gpu_vram_used_bytes[d] = cluster_.arena( d ).total_bytes;

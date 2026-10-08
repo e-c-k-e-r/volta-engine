@@ -6,6 +6,7 @@
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
 #include "engine/runtime/cluster.h"
+#include "engine/runtime/prefix_cache.h"
 #include "engine/loader/tokenizer.h"
 #include "engine/loader/chat_template.h"
 #include "engine/server/config.h"
@@ -44,6 +45,11 @@ struct GenerationRequest {
 	float top_p = 1.0f;
 	int top_k = 16;          // capped at 16 (kSampleTopK)
 	uint64_t seed = 0;       // 0 = derive from req_id
+	struct Checkpoint {
+		int pos = 0;
+		bool pinned = false;
+	};
+	std::vector<Checkpoint> checkpoint_at;   // ascending prompt positions to snapshot into the prefix cache (system-prompt end, turn boundary)
 	std::vector<std::string> stop_strings;   // generation ends before the first match
 	std::string matched_stop;                // set when FinishReason::StopString
 	// Called from the scheduler thread with detokenized text (never the end-of-sequence token). Returning false cancels.
@@ -61,6 +67,8 @@ struct EngineMetrics {
 	double avg_decode_tok_s = 0.0;
 	double spec_acceptance_rate = 0.0;
 	std::vector<size_t> gpu_vram_used_bytes;
+	PrefixCache::Stats prefix;
+	bool prefix_enabled = false;
 };
 
 class Generator {
@@ -107,6 +115,8 @@ private:
 	void step_batch();
 	int adapt_steps_ = 0;
 	void prefill_slot( int s );
+	void store_prefix( int s, int tokens, bool pinned );
+	static constexpr int kPrefixMinTokens = 512;
 	// Commits `tok` to slot s's output; returns true when the request finished.
 	bool emit_token( int s, int tok );
 	void finish_slot( int s, FinishReason reason );
@@ -115,6 +125,7 @@ private:
 	ModelCluster cluster_;
 	engine::loader::Tokenizer tokenizer_;
 	engine::loader::ChatTemplate chat_template_;
+	std::unique_ptr<PrefixCache> prefix_cache_;
 
 	std::thread scheduler_thread_;
 	std::atomic<bool> running_{ false };

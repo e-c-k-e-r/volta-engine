@@ -277,6 +277,10 @@ void VoltaServer::handle_metrics( const ConnPtr& conn ) {
 	m["avg_decode_tok_s"] = metrics.avg_decode_tok_s;
 	m["spec_acceptance_rate"] = metrics.spec_acceptance_rate;
 	m["gpu_vram_used_bytes"] = metrics.gpu_vram_used_bytes;
+	if ( metrics.prefix_enabled ) {
+		m["prefix_cache"] = { { "lookups", metrics.prefix.lookups }, { "hits", metrics.prefix.hits }, { "hit_tokens", metrics.prefix.hit_tokens },
+			{ "inserts", metrics.prefix.inserts }, { "evictions", metrics.prefix.evictions }, { "entries", metrics.prefix.entries }, { "bytes", metrics.prefix.bytes } };
+	}
 	send_json( conn, 200, m.dump( 2 ) + "\n" );
 }
 

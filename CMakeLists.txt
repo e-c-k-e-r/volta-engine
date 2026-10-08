@@ -50,6 +50,7 @@ set(ENGINE_HOST_SOURCES
 	src/runtime/kv_cache.cpp
 	src/runtime/cluster.cpp
 	src/runtime/dflash2_runner.cpp
+	src/runtime/prefix_cache.cpp
 	src/runtime/generator.cpp
 	src/server/config.cpp
 	src/server/output_parser.cpp

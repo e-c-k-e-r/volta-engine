@@ -13,6 +13,7 @@ struct Options {
 	int vram_reserve_mib = -1;    // tp=1 arena auto-size: memory left outside the arena
 	int max_seq = 0;              // context window (KV pool); 0 = model default
 	int max_slots = 0;            // decode slots; 0 = model default
+	int prefix_cache_gib = 16;    // pinned host RAM for the prefix cache (sequence snapshots); 0 = off
 	std::string kv_format;        // "", fp16, fp8, k8v4, nvfp4
 	double expert_cache = 1.0;    // GLM resident expert fraction (<1 enables the two-tier cache)
 	int expert_adapt_every = 64;  // decode steps between expert residency rebalances (0 = never)

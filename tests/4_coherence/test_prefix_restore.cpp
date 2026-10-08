@@ -4,6 +4,7 @@
 // prefill chunk) reproduces the cold chunk boundaries and must match bit for bit.
 //   test_prefix_restore [--tokens N]
 #include "engine/runtime/test_driver.h"
+#include "engine/runtime/prefix_cache.h"
 #include "engine/loader/tokenizer.h"
 #include <cmath>
 #include <cstdlib>
@@ -84,6 +85,57 @@ int main( int argc, char** argv ) {
 			failures += ok ? 0 : 1;
 		}
 		mc.free_snapshot( &snap );
+	}
+
+	// Steady-state save cost: the second save of a size reuses the pooled pinned buffers
+	{
+		ModelCluster::SeqSnapshot a, b;
+		auto t0 = std::chrono::steady_clock::now();
+		ENGINE_ASSERT( mc.save_snapshot( 0, 3000, &a ), "save_snapshot failed" );
+		const double cold_ms = test::ms_since( t0 );
+		mc.free_snapshot( &a );
+		t0 = std::chrono::steady_clock::now();
+		ENGINE_ASSERT( mc.save_snapshot( 0, 3000, &b ), "save_snapshot failed" );
+		std::printf( "[*] save 3000 tokens: %.1f ms with fresh pinned buffers, %.1f ms pooled\n", cold_ms, test::ms_since( t0 ) );
+		mc.free_snapshot( &b );
+	}
+
+	// PrefixCache: longest proper-prefix lookup, LRU eviction under a budget, pinned entries survive
+	{
+		const size_t one = mc.snapshot_bytes( 1024 );
+		const size_t per_entry = ( ( one + ( size_t( 8 ) << 20 ) - 1 ) / ( size_t( 8 ) << 20 ) * ( size_t( 8 ) << 20 ) ) * mc.tp();
+		PrefixCache cache( mc, 2 * per_entry + per_entry / 2 ); // room for two entries of 1024 tokens
+		auto snap_of = [&]( int tokens ) {
+			mc.reset_slot( 0 );
+			mc.prefill( ids.data(), tokens, 0 );
+			ModelCluster::SeqSnapshot sn;
+			ENGINE_ASSERT( mc.save_snapshot( 0, tokens, &sn ), "save_snapshot failed" );
+			return sn;
+		};
+		auto prefix = [&]( int tokens ) { return std::vector<int>( ids.begin(), ids.begin() + tokens ); };
+		auto expect = [&]( bool cond, const char* what ) {
+			std::printf( "%s PrefixCache: %s\n", cond ? "[+]" : "[-]", what );
+			failures += cond ? 0 : 1;
+		};
+		expect( cache.insert( prefix( 900 ), snap_of( 900 ), true ), "insert pinned root" );
+		expect( cache.insert( prefix( 1000 ), snap_of( 1000 ), false ), "insert second" );
+		const PrefixCache::Entry* e = cache.find( ids );
+		expect( e && e->tokens.size() == 1000, "longest prefix wins" );
+		std::vector<int> other = prefix( 1000 );
+		other[500] ^= 1;
+		e = cache.find( other );
+		expect( e == nullptr, "a diverging prompt does not match a longer entry" );
+		other = prefix( 900 );
+		expect( cache.find( other ) == nullptr, "an entry equal to the whole prompt is not a hit (no token left to prefill)" );
+		expect( cache.insert( prefix( 1010 ), snap_of( 1010 ), false ), "insert third evicts the unpinned LRU" );
+		const PrefixCache::Stats st = cache.stats();
+		expect( st.entries == 2 && st.evictions == 1, "one eviction, two entries left" );
+		e = cache.find( ids );
+		expect( e && e->tokens.size() == 1010, "the new entry is found" );
+		other = prefix( 1005 );
+		e = cache.find( other );
+		expect( e && e->tokens.size() == 900 && e->pinned, "the pinned root survived eviction" );
+		cache.clear();
 	}
 	std::printf( "%s\n", failures ? "[-] FAIL" : "[+] PASS prefix restore" );
 	mc.shutdown();
