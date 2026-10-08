@@ -84,10 +84,10 @@ half* trellis_get_workspace( int device, size_t bytes ) {
 			int orig_dev = 0;
 			cudaGetDevice( &orig_dev );
 			cudaSetDevice( device );
-			if ( g_workspace[device] != nullptr ) {
-				CUDA_CHECK( cudaFree( g_workspace[device] ) );
-				g_workspace[device] = nullptr;
-			}
+			// A decode graph captured earlier holds the old pointer (and only ever needs its size), so the old buffer is
+			// retired, not freed: a large prefill chunk that outgrows 16 MiB must not leave graph replays dangling.
+			// Growth happens a handful of times, so the retired buffers cost a few tens of MiB at most.
+			g_workspace[device] = nullptr;
 			size_t alloc_bytes = bytes < ( 16 * 1024 * 1024 ) ? ( 16 * 1024 * 1024 ) : bytes;
 			CUDA_CHECK( cudaMalloc( &g_workspace[device], alloc_bytes ) );
 			g_workspace_size[device] = alloc_bytes;
