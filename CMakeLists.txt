@@ -30,7 +30,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fno-exceptions -DNO_EXCEPTIONS -DJS
 
 include_directories(
 	${PROJECT_SOURCE_DIR}/inc
-	${PROJECT_SOURCE_DIR}/src/kernels/trellis
+	${PROJECT_SOURCE_DIR}/src/kernels/cuda/trellis
 	${PROJECT_SOURCE_DIR}/deps/json/single_include
 	${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
 )
@@ -58,7 +58,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 # CUDA device code and its launch drivers (compiled only for the CUDA backend)
 set(ENGINE_DEVICE_SOURCES
 	src/comm/all_reduce_ipc.cu
-	src/kernels/nvfp4/skinny_kernels.cu
+	src/kernels/cuda/nvfp4/skinny_kernels.cu
 	src/modules/norm.cu
 	src/modules/swiglu.cu
 	src/modules/rope.cu
@@ -79,8 +79,8 @@ set(ENGINE_DEVICE_SOURCES
 set(ENGINE_CORE_SOURCES ${ENGINE_HOST_SOURCES} ${ENGINE_DEVICE_SOURCES})
 
 file(GLOB TRELLIS_SOURCES
-	src/kernels/trellis/*.cu
-	src/kernels/trellis/comp_units/*.cu
+	src/kernels/cuda/trellis/*.cu
+	src/kernels/cuda/trellis/comp_units/*.cu
 )
 
 add_library(engine_kernels STATIC
@@ -97,7 +97,7 @@ set_target_properties(engine_kernels PROPERTIES
 
 endif()
 
-# Slang Tier B kernels (src/shaders/*.slang): portable sources for the CUDA / Vulkan / CPU backends. The CUDA build keeps its
+# Slang Tier B kernels (src/kernels/slang/*.slang): portable sources for the CUDA / Vulkan / CPU backends. The CUDA build keeps its
 # hand-tuned kernels as the default; these are generated for the parity test and as the base for the other backends.
 find_program(SLANGC slangc HINTS /opt/shader-slang/bin)
 if(SLANGC)
@@ -116,7 +116,7 @@ if(SLANGC)
 		string(REPLACE ":" ";" parts ${item})
 		list(GET parts 0 sfile)
 		list(GET parts 1 entry)
-		set(ssrc ${PROJECT_SOURCE_DIR}/src/shaders/${sfile}.slang)
+		set(ssrc ${PROJECT_SOURCE_DIR}/src/kernels/slang/${sfile}.slang)
 		foreach(tgt cuda:cuda.cu:0 spirv:spv:0 cpp:cpp:1)
 			string(REPLACE ":" ";" tparts ${tgt})
 			list(GET tparts 0 target)
@@ -134,10 +134,10 @@ if(SLANGC)
 
 	if(ENGINE_BACKEND STREQUAL "CUDA")
 		# Generated CUDA kernels live in their own translation units: the Slang prelude redefines the half2 operators
-		file(GLOB SLANG_CUDA_LAUNCHERS src/shaders/cuda/*.cu)
+		file(GLOB SLANG_CUDA_LAUNCHERS src/kernels/slang/cuda/*.cu)
 		add_library(engine_slang_cuda STATIC ${SLANG_CUDA_LAUNCHERS})
 		add_dependencies(engine_slang_cuda slang_kernels)
-		target_include_directories(engine_slang_cuda PRIVATE ${SLANG_OUT} ${SLANG_INCLUDE_DIR} src/shaders/cuda)
+		target_include_directories(engine_slang_cuda PRIVATE ${SLANG_OUT} ${SLANG_INCLUDE_DIR} src/kernels/slang/cuda)
 		target_compile_definitions(engine_slang_cuda PRIVATE __CUDA_NO_HALF2_OPERATORS__)
 		set_target_properties(engine_slang_cuda PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 	endif()
@@ -157,7 +157,7 @@ if(SLANGC)
 
 	if(ENGINE_BACKEND STREQUAL "CUDA")
 		add_executable(test_slang_kernels tests/2_parity/test_slang_kernels.cpp)
-		target_include_directories(test_slang_kernels PRIVATE src/shaders/cuda)
+		target_include_directories(test_slang_kernels PRIVATE src/kernels/slang/cuda)
 		target_link_libraries(test_slang_kernels PRIVATE engine_kernels engine_slang_cuda)
 		set_target_properties(test_slang_kernels PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 	endif()
@@ -178,7 +178,7 @@ set_target_properties(test_trellis PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJEC
 # Test dp4a int8 GEMV Parity
 add_executable(test_gemv_int8 tests/2_parity/test_gemv_int8.cpp)
 target_link_libraries(test_gemv_int8 PRIVATE engine_kernels)
-target_include_directories(test_gemv_int8 PRIVATE src/kernels/trellis)
+target_include_directories(test_gemv_int8 PRIVATE src/kernels/cuda/trellis)
 set_target_properties(test_gemv_int8 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Test RoPE Parity
@@ -247,7 +247,7 @@ set_target_properties(bench_trellis PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJE
 
 add_executable(bench_shapes tests/3_bench/bench_shapes.cpp)
 target_link_libraries(bench_shapes PRIVATE engine_kernels)
-target_include_directories(bench_shapes PRIVATE src/kernels/trellis)
+target_include_directories(bench_shapes PRIVATE src/kernels/cuda/trellis)
 set_target_properties(bench_shapes PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(bench_nvfp4 tests/3_bench/bench_nvfp4.cpp)
@@ -325,7 +325,7 @@ target_link_libraries(test_dflash2_backbone PRIVATE engine_kernels)
 
 add_executable(test_dflash2_blocks tests/2_parity/test_dflash2_blocks.cpp)
 target_link_libraries(test_dflash2_blocks PRIVATE engine_kernels)
-target_include_directories(test_dflash2_blocks PRIVATE src/kernels/trellis)
+target_include_directories(test_dflash2_blocks PRIVATE src/kernels/cuda/trellis)
 set_target_properties(test_dflash2_blocks PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # DFlash2 Trellis weights against the unquantized BF16 checkpoint

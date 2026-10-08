@@ -1,7 +1,7 @@
 #pragma once
 #include <cuda_runtime_api.h>
 
-// Host entry points of the Slang-generated CUDA kernels (src/shaders/*.slang). Pointers are device pointers to FP16 data
+// Host entry points of the Slang-generated CUDA kernels (src/kernels/slang/*.slang). Pointers are device pointers to FP16 data
 // (BF16 bits for the embedding table); each call is one launch on the stream. Used by the parity test and as the reference
 // for new backends; the CUDA build's own kernels remain the default.
 void slang_rms_norm( void* src, void* dst, void* weight, int rows, int hidden, float eps, float bias, cudaStream_t s );

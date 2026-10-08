@@ -1,7 +1,7 @@
 #pragma once
 #include <cuda_runtime_api.h>
 
-// Launchers of the Slang-generated CUDA reference attention kernels (src/shaders/ref_attention.slang, ref_latent.slang).
+// Launchers of the Slang-generated CUDA reference attention kernels (src/kernels/slang/ref_attention.slang, ref_latent.slang).
 // Pointers are device pointers to FP16 data; slots / pos are the int arrays of BatchRows (one entry per row).
 // Caches are [slot][layer][max_seq][kv_heads * head_dim] (attention) or [slot][layer][max_seq][512] (latent); slot_stride in elements.
 // head_dim <= 256; one group per (head, row). gate may be null.

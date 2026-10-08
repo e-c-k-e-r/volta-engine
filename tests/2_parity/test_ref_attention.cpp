@@ -10,7 +10,7 @@
 #include <vector>
 #include <algorithm>
 
-// Tier 2 parity of the portable reference attention kernels (src/shaders/ref_attention.slang, ref_latent.slang).
+// Tier 2 parity of the portable reference attention kernels (src/kernels/slang/ref_attention.slang, ref_latent.slang).
 //  (a) host target (generated C++, no GPU) against an FP64 CPU reference;
 //  (b) with --gpu: the Slang-generated CUDA kernels against Attention::forward_decode and MLALatent::attend (and FP64).
 // The Slang C++ prelude is not included here (it clashes with the CUDA half types); the host entry points are declared with

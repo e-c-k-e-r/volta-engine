@@ -16,7 +16,7 @@ using namespace engine::backend;
 	#error "SLANG_SPV_DIR must point at the generated .spv directory"
 #endif
 
-// Push-constant blocks: natural C layout == Slang's std430 emission (8-byte pointers, 4-byte scalars); mirrors src/shaders/ref_*.slang
+// Push-constant blocks: natural C layout == Slang's std430 emission (8-byte pointers, 4-byte scalars); mirrors src/kernels/slang/ref_*.slang
 struct RefGemmParams { uint64_t x, w, out_; int m, k, n; };
 struct RefReconParams { uint64_t codes, out_; int k_dim, n_dim, bits, cb; };
 struct RefHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };

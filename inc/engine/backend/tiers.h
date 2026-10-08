@@ -10,7 +10,7 @@
 namespace engine::backend {
 
 enum class Tier {
-	Portable,         // a Slang kernel exists (src/shaders)
+	Portable,         // a Slang kernel exists (src/kernels/slang)
 	PortablePending,  // portable in kind, no Slang kernel yet
 	CudaSm70          // hand-tuned CUDA/SM70 only
 };

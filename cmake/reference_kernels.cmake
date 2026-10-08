@@ -1,8 +1,8 @@
 # reference_kernels: build fragment owned by one Wave 2 lane (included by the main CMakeLists.txt when present)
 
 # ---- E2 begin
-# Portable reference attention kernels (src/shaders/ref_attention.slang, ref_latent.slang): cuda / spirv / cpp outputs next to
-# the other Slang kernels. The CUDA launchers (src/shaders/cuda/ref_attn*.cu, ref_latent*.cu) are picked up by the
+# Portable reference attention kernels (src/kernels/slang/ref_attention.slang, ref_latent.slang): cuda / spirv / cpp outputs next to
+# the other Slang kernels. The CUDA launchers (src/kernels/slang/cuda/ref_attn*.cu, ref_latent*.cu) are picked up by the
 # engine_slang_cuda glob, so that library only needs the ordering dependency on the generated sources.
 if(SLANGC)
 	set(REF_ATTN_KERNELS ref_attention:ref_attn_decode ref_attention:ref_unpack_q_gate ref_latent:ref_latent_decode)
@@ -12,7 +12,7 @@ if(SLANGC)
 		string(REPLACE ":" ";" parts ${item})
 		list(GET parts 0 sfile)
 		list(GET parts 1 entry)
-		set(ssrc ${PROJECT_SOURCE_DIR}/src/shaders/${sfile}.slang)
+		set(ssrc ${PROJECT_SOURCE_DIR}/src/kernels/slang/${sfile}.slang)
 		foreach(tgt cuda:cuda.cu:0 spirv:spv:0 cpp:cpp:1)
 			string(REPLACE ":" ";" tparts ${tgt})
 			list(GET tparts 0 target)
@@ -55,7 +55,7 @@ if(SLANGC)
 
 	if(ENGINE_BACKEND STREQUAL "CUDA")
 		add_executable(test_ref_attention tests/2_parity/test_ref_attention.cpp)
-		target_include_directories(test_ref_attention PRIVATE src/shaders/cuda)
+		target_include_directories(test_ref_attention PRIVATE src/kernels/slang/cuda)
 		target_link_libraries(test_ref_attention PRIVATE ref_attn_cpu engine_kernels engine_slang_cuda)
 		add_dependencies(test_ref_attention ref_attn_slang)
 		set_target_properties(test_ref_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
@@ -78,7 +78,7 @@ if(SLANGC)
 		string(REPLACE ":" ";" parts ${item})
 		list(GET parts 0 sfile)
 		list(GET parts 1 entry)
-		set(ssrc ${PROJECT_SOURCE_DIR}/src/shaders/${sfile}.slang)
+		set(ssrc ${PROJECT_SOURCE_DIR}/src/kernels/slang/${sfile}.slang)
 		foreach(tgt cuda:cuda.cu:0 spirv:spv:0 cpp:cpp:1)
 			string(REPLACE ":" ";" tparts ${tgt})
 			list(GET tparts 0 target)
@@ -99,7 +99,7 @@ if(SLANGC)
 		COMMAND spirv-val ${REF_LIN_SLANG_OUT}/ref_trellis_reconstruct.spv
 		COMMAND spirv-val ${REF_LIN_SLANG_OUT}/ref_had128.spv)
 
-	# The main Slang launcher library globs src/shaders/cuda/*.cu: keep the reference launchers out of it
+	# The main Slang launcher library globs src/kernels/slang/cuda/*.cu: keep the reference launchers out of it
 	if(TARGET engine_slang_cuda)
 		get_target_property(REF_LIN_SLANG_SRCS engine_slang_cuda SOURCES)
 		list(FILTER REF_LIN_SLANG_SRCS EXCLUDE REGEX "/cuda/ref_(gemm|trellis|engine)\\.cu$")
@@ -109,18 +109,18 @@ if(SLANGC)
 	# ref_gemm.cu / ref_trellis.cu include the generated Slang CUDA code; ref_engine.cu bridges to the engine's own Linear
 	if(ENGINE_BACKEND STREQUAL "CUDA")
 		add_library(ref_lin_cuda STATIC
-			src/shaders/cuda/ref_gemm.cu src/shaders/cuda/ref_trellis.cu src/shaders/cuda/ref_engine.cu)
+			src/kernels/slang/cuda/ref_gemm.cu src/kernels/slang/cuda/ref_trellis.cu src/kernels/slang/cuda/ref_engine.cu)
 		add_dependencies(ref_lin_cuda ref_lin_slang)
-		target_include_directories(ref_lin_cuda PRIVATE ${REF_LIN_SLANG_OUT} ${REF_LIN_SLANG_INCLUDE_DIR} src/shaders/cuda src/kernels/trellis)
+		target_include_directories(ref_lin_cuda PRIVATE ${REF_LIN_SLANG_OUT} ${REF_LIN_SLANG_INCLUDE_DIR} src/kernels/slang/cuda src/kernels/cuda/trellis)
 		target_link_libraries(ref_lin_cuda PUBLIC engine_kernels)
-		set_source_files_properties(src/shaders/cuda/ref_gemm.cu src/shaders/cuda/ref_trellis.cu
+		set_source_files_properties(src/kernels/slang/cuda/ref_gemm.cu src/kernels/slang/cuda/ref_trellis.cu
 			PROPERTIES COMPILE_DEFINITIONS __CUDA_NO_HALF2_OPERATORS__)
 		set_target_properties(ref_lin_cuda PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 		set_source_files_properties(${REF_LIN_CPU_SOURCES} PROPERTIES GENERATED TRUE)
 		add_executable(test_ref_linear tests/2_parity/test_ref_linear.cpp ${REF_LIN_CPU_SOURCES})
 		add_dependencies(test_ref_linear ref_lin_slang)
-		target_include_directories(test_ref_linear PRIVATE ${REF_LIN_SLANG_INCLUDE_DIR} src/shaders/cuda)
+		target_include_directories(test_ref_linear PRIVATE ${REF_LIN_SLANG_INCLUDE_DIR} src/kernels/slang/cuda)
 		target_link_libraries(test_ref_linear PRIVATE ref_lin_cuda)
 		set_target_properties(test_ref_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 	endif()

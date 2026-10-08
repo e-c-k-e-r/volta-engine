@@ -3,7 +3,7 @@
 struct CUstream_st;
 typedef CUstream_st* cudaStream_t;
 
-// Host entry points of the portable reference kernels (src/shaders/ref_gemm.slang, ref_trellis.slang) built for CUDA, plus a
+// Host entry points of the portable reference kernels (src/kernels/slang/ref_gemm.slang, ref_trellis.slang) built for CUDA, plus a
 // bridge to the engine's own trellis Linear for comparison. All pointers are device pointers; FP16 data except codes (uint16).
 // Codebook id cb: 0 = 3INST, 1 = MCG, 2 = MUL1. Dimensions k and n must be multiples of 128.
 

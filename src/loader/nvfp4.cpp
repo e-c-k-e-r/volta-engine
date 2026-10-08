@@ -1,5 +1,5 @@
 // NVFP4 checkpoint loading: compressed-tensors "nvfp4-pack-quantized" weights, prepacked into the fragment order of
-// the skinny NVFP4 kernels (src/kernels/nvfp4/skinny_kernels.cu).
+// the skinny NVFP4 kernels (src/kernels/cuda/nvfp4/skinny_kernels.cu).
 //
 // Kernel layout, per 32-column tile and 16-wide K group g, per lane (8 bytes of codes, 1 byte of scale):
 //   column  n = tile * 32 + qp * 8 + r      with qp = ( lane >> 2 ) & 3, r = ( lane & 3 ) + ( ( lane & 16 ) ? 4 : 0 )

@@ -1,5 +1,5 @@
 // Capability registry: every module entry point and the tier of its implementation. X-macro: ENGINE_TIER_ENTRY( module, function, tier, note ).
-//   Portable         a Slang kernel exists in src/shaders (CUDA build still uses its own tuned kernel; other backends use the Slang one)
+//   Portable         a Slang kernel exists in src/kernels/slang (CUDA build still uses its own tuned kernel; other backends use the Slang one)
 //   PortablePending  plain elementwise/reduction work with no Slang kernel yet (Wave 1 lane C ports it)
 //   CudaSm70         hand-tuned CUDA/SM70 (tensor cores, dp4a, trellis, NVLink); other backends get a stub that aborts, until a portable reference exists
 // Overloads share one entry. Keep this file in sync with inc/engine/modules/*.h: test_backend_tiers fails on entries that do not match a declared function.

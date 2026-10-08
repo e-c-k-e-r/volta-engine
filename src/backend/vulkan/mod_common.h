@@ -1,6 +1,6 @@
 #pragma once
 
-// Vulkan module layer: SPIR-V kernel cache and the push-constant blocks of the Slang kernels (src/shaders/*.slang).
+// Vulkan module layer: SPIR-V kernel cache and the push-constant blocks of the Slang kernels (src/kernels/slang/*.slang).
 // A `uniform Params` is one push-constant block in natural C layout (8-byte device pointers, 4-byte scalars, int64 aligned to 8),
 // so the structs below mirror the Slang structs field by field with every pointer as a uint64_t device address.
 #include "engine/backend/vulkan/device.h"

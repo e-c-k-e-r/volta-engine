@@ -5,7 +5,7 @@
 #include <vector>
 
 // Tier 2 parity of the Slang CPU (host) target: the generated C++ kernels run on the host against FP64 references.
-// Struct layouts mirror the Params structs in src/shaders/*.slang.
+// Struct layouts mirror the Params structs in src/kernels/slang/*.slang.
 
 extern "C" {
 void rms_norm( ComputeVaryingInput*, void*, void* );

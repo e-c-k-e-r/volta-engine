@@ -1,7 +1,7 @@
 #pragma once
 
 // Slang host-target kernels (build/slang/<entry>.cpp) as called from the CPU backend. The Params structs mirror
-// src/shaders/*.slang (tests/2_parity/test_slang_cpu.cpp keeps its own copy). Kernels run serially: one call per launch.
+// src/kernels/slang/*.slang (tests/2_parity/test_slang_cpu.cpp keeps its own copy). Kernels run serially: one call per launch.
 #include <slang-cpp-prelude.h>
 #include <cstdint>
 #include <algorithm>

@@ -10,7 +10,7 @@ for dir in modules spec core runtime models loader server; do
 	for h in inc/engine/$dir/*.h; do
 		[ -e "$h" ] || continue
 		rel="engine/$dir/$(basename "$h")"
-		if out=$(echo "#include \"$rel\"" | c++ -std=c++17 -fsyntax-only -x c++ -I inc -I src/kernels/trellis -I deps/json/single_include -I "$CUDA_INCLUDE" - 2>&1); then
+		if out=$(echo "#include \"$rel\"" | c++ -std=c++17 -fsyntax-only -x c++ -I inc -I src/kernels/cuda/trellis -I deps/json/single_include -I "$CUDA_INCLUDE" - 2>&1); then
 			echo "PASS $rel"
 			pass=$((pass + 1))
 		else

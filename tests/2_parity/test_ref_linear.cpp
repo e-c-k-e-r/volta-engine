@@ -8,7 +8,7 @@
 #include <vector>
 #include "ref_cuda.h"
 
-// Portable reference linear algebra (src/shaders/ref_gemm.slang, ref_trellis.slang).
+// Portable reference linear algebra (src/kernels/slang/ref_gemm.slang, ref_trellis.slang).
 //  (a) host target of the Slang kernels vs FP64 CPU references: dense GEMM, trellis dequant (all bit widths and codebooks),
 //      block Hadamard, and the composed trellis Linear.
 //  (b) with --gpu: the same kernels built for CUDA, and the host-target output, vs the engine's own reconstruct_slice and

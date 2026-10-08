@@ -15,7 +15,7 @@
 #include <cstring>
 #include <vector>
 
-// Tier 2 parity of the Slang-generated CUDA kernels (src/shaders/*.slang) against the engine's hand-written kernels.
+// Tier 2 parity of the Slang-generated CUDA kernels (src/kernels/slang/*.slang) against the engine's hand-written kernels.
 // The Slang versions use a different reduction order, so the check is the tier 2 tolerance, not bit equality.
 
 using namespace engine;

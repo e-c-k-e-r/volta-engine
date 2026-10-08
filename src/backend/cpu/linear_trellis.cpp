@@ -1,5 +1,5 @@
 // CPU backend: EXL3 trellis linear (rotate, dequantize, GEMM, rotate) on the E1 reference Slang host kernels
-// (src/shaders/ref_gemm.slang, ref_trellis.slang). Bit-exact dequantization vs the engine's reconstruct; the fused CUDA
+// (src/kernels/slang/ref_gemm.slang, ref_trellis.slang). Bit-exact dequantization vs the engine's reconstruct; the fused CUDA
 // kernels and the large-M recon path differ from this only by FP16/FP32 rounding order.
 // cpu_kernels.h first: the Slang prelude defines int4, which the backend shim only declares when the prelude is absent
 #include "cpu_kernels.h"
