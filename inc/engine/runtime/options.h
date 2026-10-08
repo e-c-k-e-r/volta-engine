@@ -28,6 +28,7 @@ struct Options {
 	bool dsa_diag = false;        // ENGINE_DEBUG_DSA: indexer diagnostics
 	bool spec_ctrl_log = false;   // ENGINE_DEBUG_SPEC_CTRL: controller decisions
 	bool no_graphs = false;       // ENGINE_DEBUG_NO_GRAPHS: eager execution, no CUDA graphs
+	std::string dump_requests;    // ENGINE_DEBUG_DUMP_REQUESTS=<dir>: write every API request body to <dir>/req_<id>.json
 	int dump_draft_round = -1;    // ENGINE_DEBUG_DUMP_DRAFT=<round>: write /tmp/draft_dump.bin
 };
 

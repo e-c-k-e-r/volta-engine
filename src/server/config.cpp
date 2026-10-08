@@ -67,6 +67,8 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 	if ( j.contains( "default_max_tokens" ) && j["default_max_tokens"].is_number_integer() ) {
 		default_max_tokens = j["default_max_tokens"].get<int>();
 	}
+	if ( j.contains( "default_top_p" ) && j["default_top_p"].is_number() ) default_top_p = j["default_top_p"].get<float>();
+	if ( j.contains( "default_top_k" ) && j["default_top_k"].is_number_integer() ) default_top_k = j["default_top_k"].get<int>();
 	if ( j.contains( "default_temperature" ) && j["default_temperature"].is_number() ) {
 		default_temperature = j["default_temperature"].get<float>();
 	}
@@ -202,6 +204,27 @@ bool ServerConfig::resolve() {
 	if ( !models::is_known_model_type( model_type ) ) {
 		std::fprintf( stderr, "[-] FATAL: unsupported model_type '%s' (supported: qwen3_5, glm5_next)\n", model_type.c_str() );
 		return false;
+	}
+	// Sampling defaults: explicit config wins, then the checkpoint's generation_config.json
+	{
+		FILE* f = std::fopen( ( model_dir + "/generation_config.json" ).c_str(), "rb" );
+		if ( f ) {
+			std::string text;
+			char buf[4096];
+			size_t n;
+			while ( ( n = std::fread( buf, 1, sizeof( buf ), f ) ) > 0 ) text.append( buf, n );
+			std::fclose( f );
+			auto g = nlohmann::json::parse( text, nullptr, false );
+			if ( !g.is_discarded() && g.value( "do_sample", true ) ) {
+				if ( default_temperature < 0.0f && g.contains( "temperature" ) && g["temperature"].is_number() ) default_temperature = g["temperature"].get<float>();
+				if ( default_top_p < 0.0f && g.contains( "top_p" ) && g["top_p"].is_number() ) default_top_p = g["top_p"].get<float>();
+				if ( default_top_k < 0 && g.contains( "top_k" ) && g["top_k"].is_number_integer() ) default_top_k = g["top_k"].get<int>();
+			}
+		}
+		if ( default_temperature < 0.0f ) default_temperature = 0.0f;
+		if ( default_top_p < 0.0f ) default_top_p = 1.0f;
+		if ( default_top_k < 0 ) default_top_k = 16;
+		std::printf( "[*] Sampling defaults: temperature %.2f, top_p %.2f, top_k %d\n", default_temperature, default_top_p, default_top_k );
 	}
 	if ( use_speculation && draft_model_dir.empty() ) {
 		std::fprintf( stderr, "[-] FATAL: use_speculation requires draft_model_dir\n" );

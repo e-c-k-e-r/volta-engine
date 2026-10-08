@@ -1,4 +1,7 @@
 #include "engine/server/chat.h"
+#include "engine/runtime/options.h"
+
+#include <cstdio>
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -30,6 +33,33 @@ std::string effort_for( engine::loader::ModelFamily fam, const std::string& e ) 
 	if ( e == "minimal" || e == "low" ) return "low";
 	if ( e == "medium" ) return "medium";
 	return "xhigh";
+}
+
+// Chat templates accept a system message only at the start, but clients (Claude Code) also send system content later in
+// the conversation. All of it is folded, in order, into one leading system message.
+void fold_system_messages( nlohmann::ordered_json& messages ) {
+	std::string system;
+	bool any = false;
+	nlohmann::ordered_json rest = nlohmann::ordered_json::array();
+	for ( const auto& m : messages ) {
+		if ( m.value( "role", std::string() ) != "system" ) {
+			rest.push_back( m );
+			continue;
+		}
+		any = true;
+		std::string text;
+		const auto& c = m["content"];
+		if ( c.is_string() ) text = c.get<std::string>();
+		else if ( c.is_array() ) for ( const auto& p : c ) text += p.value( "text", std::string() );
+		if ( text.empty() ) continue;
+		if ( !system.empty() ) system += "\n\n";
+		system += text;
+	}
+	if ( !any ) return;
+	nlohmann::ordered_json out = nlohmann::ordered_json::array();
+	if ( !system.empty() ) out.push_back( { { "role", "system" }, { "content", system } } );
+	for ( auto& m : rest ) out.push_back( m );
+	messages = std::move( out );
 }
 
 } // namespace
@@ -80,6 +110,7 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 		err->message = "messages could not be normalized";
 		return false;
 	}
+	if ( vars["messages"].is_array() ) fold_system_messages( vars["messages"] );
 	if ( !req.tools_json.empty() ) vars["tools"] = nlohmann::ordered_json::parse( req.tools_json, nullptr, false );
 	vars["add_generation_prompt"] = true;
 	vars["enable_thinking"] = thinking;
@@ -117,6 +148,13 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	std::vector<int> tokens;
 	if ( !render_prompt( gen, cfg, req, &prompt, &tokens, err ) ) return false;
 	responder->on_prompt( static_cast<int>( tokens.size() ) );
+	if ( !runtime::options().dump_requests.empty() ) {
+		const std::string path = runtime::options().dump_requests + "/req_" + std::to_string( request_id ) + ".prompt.txt";
+		if ( FILE* f = std::fopen( path.c_str(), "wb" ) ) {
+			std::fwrite( prompt.data(), 1, prompt.size(), f );
+			std::fclose( f );
+		}
+	}
 
 	const bool in_reasoning = ends_with( prompt, "<think>\n" ) || ends_with( prompt, "<think>" );
 	auto state = std::make_shared<ChatState>(
@@ -127,8 +165,8 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	g.prompt_tokens = std::move( tokens );
 	g.max_tokens = req.max_tokens > 0 ? req.max_tokens : cfg.default_max_tokens;
 	g.temperature = req.temperature >= 0.0f ? req.temperature : cfg.default_temperature;
-	g.top_p = req.top_p;
-	g.top_k = req.top_k;
+	g.top_p = req.top_p >= 0.0f ? req.top_p : cfg.default_top_p;
+	g.top_k = req.top_k > 0 ? req.top_k : cfg.default_top_k;
 	g.seed = req.seed;
 	g.stop_strings = req.stop;
 	g.on_text = [state]( const std::string& delta ) {

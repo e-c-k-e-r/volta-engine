@@ -9,7 +9,11 @@ struct ServerConfig {
 	int port = 8000;
 	int max_batch_size = 8;
 	int default_max_tokens = 256;
-	float default_temperature = 0.0f;
+	// Sampling defaults for requests that do not set them; negative = take the checkpoint's generation_config.json
+	// (temperature, top_p, top_k), else greedy / 1.0 / 16.
+	float default_temperature = -1.0f;
+	float default_top_p = -1.0f;
+	int default_top_k = -1;
 	bool default_enable_thinking = false; // requests without an explicit setting (reasoning_effort / thinking enable it)
 
 	std::string model_type;      // deduced by resolve() from <model_dir>/config.json (qwen3_5 | glm5_next)

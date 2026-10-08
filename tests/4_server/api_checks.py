@@ -12,6 +12,8 @@ def check(cond, what, extra=""):
     failures += 0 if cond else 1
 
 def post(path, body, stream=False, timeout=120):
+    if isinstance(body, dict) and "temperature" not in body:
+        body = dict(body, temperature=0)  # deterministic checks; the server default follows the checkpoint
     req = urllib.request.Request(BASE + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     try:
         r = urllib.request.urlopen(req, timeout=timeout)

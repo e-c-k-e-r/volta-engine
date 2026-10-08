@@ -46,6 +46,7 @@ Options from_env() {
 	o.spec_ctrl_log = std::getenv( "ENGINE_DEBUG_SPEC_CTRL" ) != nullptr;
 	o.no_graphs = std::getenv( "ENGINE_DEBUG_NO_GRAPHS" ) != nullptr;
 	env_int( "ENGINE_DEBUG_DUMP_DRAFT", o.dump_draft_round );
+	if ( const char* e = std::getenv( "ENGINE_DEBUG_DUMP_REQUESTS" ) ) o.dump_requests = e;
 	return o;
 }
 
@@ -100,6 +101,10 @@ bool set_option( const std::string& key, const std::string& value ) {
 	if ( key == "dsa_diag" ) return as_bool( o.dsa_diag );
 	if ( key == "spec_ctrl_log" ) return as_bool( o.spec_ctrl_log );
 	if ( key == "no_graphs" ) return as_bool( o.no_graphs );
+	if ( key == "dump_requests" ) {
+		o.dump_requests = value;
+		return true;
+	}
 	if ( key == "dump_draft_round" ) return as_int( o.dump_draft_round );
 	return false;
 }

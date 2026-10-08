@@ -29,8 +29,8 @@ struct ChatRequest {
 	bool include_usage = false;  // OpenAI stream_options.include_usage
 	int max_tokens = 0;          // 0: server default
 	float temperature = -1.0f;   // <0: server default
-	float top_p = 1.0f;
-	int top_k = 16;
+	float top_p = -1.0f;         // <0: server default
+	int top_k = -1;              // <0: server default
 	uint64_t seed = 0;
 	std::vector<std::string> stop;
 	int enable_thinking = -1;    // -1: server default

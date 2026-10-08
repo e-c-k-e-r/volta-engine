@@ -44,8 +44,15 @@ bool normalize_messages( const json& j, json* out, ApiError* err ) {
 	for ( const auto& m : j["messages"] ) {
 		if ( !m.is_object() || !m.contains( "role" ) || !m["role"].is_string() ) return fail( err, "every message needs a role" );
 		const std::string role = m["role"].get<std::string>();
-		if ( role != "user" && role != "assistant" ) return fail( err, "message role must be 'user' or 'assistant'" );
+		if ( role != "user" && role != "assistant" && role != "system" ) return fail( err, "message role must be 'user' or 'assistant'" );
 		const json content = m.contains( "content" ) ? m["content"] : json( "" );
+		if ( role == "system" ) {
+			// Claude Code sends system content inside messages as well; start_chat folds it into the leading system prompt
+			std::string text;
+			if ( !text_of( content, &text, err ) ) return false;
+			out->push_back( { { "role", "system" }, { "content", text } } );
+			continue;
+		}
 		if ( content.is_string() ) {
 			out->push_back( { { "role", role }, { "content", content } } );
 			continue;

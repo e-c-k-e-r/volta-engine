@@ -1,4 +1,5 @@
 #include "engine/server/server.h"
+#include "engine/runtime/options.h"
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -283,6 +284,13 @@ void VoltaServer::handle_chat( const ConnPtr& conn, const Request& req, ChatProt
 	const bool anthropic = protocol.anthropic_errors();
 	ChatRequest cr;
 	ApiError err;
+	if ( !runtime::options().dump_requests.empty() ) {
+		const std::string path = runtime::options().dump_requests + "/req_" + std::to_string( next_req_id_.load() ) + ".json";
+		if ( FILE* f = std::fopen( path.c_str(), "wb" ) ) {
+			std::fwrite( req.body.data(), 1, req.body.size(), f );
+			std::fclose( f );
+		}
+	}
 	if ( !protocol.parse( req.body, &cr, &err ) ) return send_error( conn, err.status, err.type, err.message, anthropic );
 	if ( cr.model.empty() ) cr.model = model_name_;
 	const uint64_t id = next_req_id_++;
