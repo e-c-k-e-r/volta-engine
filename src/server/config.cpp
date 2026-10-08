@@ -70,6 +70,9 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 	if ( j.contains( "default_temperature" ) && j["default_temperature"].is_number() ) {
 		default_temperature = j["default_temperature"].get<float>();
 	}
+	if ( j.contains( "default_enable_thinking" ) && j["default_enable_thinking"].is_boolean() ) {
+		default_enable_thinking = j["default_enable_thinking"].get<bool>();
+	}
 	if ( j.contains( "model_type" ) || j.contains( "model" ) ) {
 		std::fprintf( stderr, "[-] Error: model_type is read from the checkpoint config.json; remove it from the launch config\n" );
 		return false;

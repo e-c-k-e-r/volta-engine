@@ -1,34 +1,20 @@
 #pragma once
 
 #include "engine/config.h"
-#include "engine/server/config.h"
 #include "engine/runtime/generator.h"
+#include "engine/server/chat.h"
+#include "engine/server/config.h"
+#include "engine/server/http.h"
 
-#include <string>
-#include <vector>
-#include <memory>
 #include <atomic>
-#include <mutex>
-#include <sys/epoll.h>
+#include <map>
+#include <memory>
+#include <string>
 
 namespace engine::server {
 
-constexpr int MAX_CLIENTS = 128;
-constexpr size_t CLIENT_BUF_SIZE = 65536;
-
-enum class ClientState {
-	UNUSED = 0,
-	READING_HTTP,
-	PROCESSING,
-	CLOSING
-};
-
-struct ClientContext {
-	int fd = -1;
-	ClientState state = ClientState::UNUSED;
-	char in_buf[CLIENT_BUF_SIZE];
-	size_t in_len = 0;
-};
+constexpr size_t MAX_HEADER_BYTES = 64 * 1024;
+constexpr size_t MAX_BODY_BYTES = 64u << 20;
 
 class VoltaServer {
 public:
@@ -41,17 +27,23 @@ public:
 	void stop();
 
 private:
-	bool setup_socket();
-	void set_nonblocking( int fd );
-	void handle_new_connection();
-	void handle_client_read( int fd );
-	void process_http_request( ClientContext& client );
-	void handle_health_request( int client_fd );
-	void handle_metrics_request( int client_fd );
-	void handle_chat_completion( ClientContext& client, const char* body, size_t body_len );
+	struct Request {
+		std::string method;
+		std::string path;
+		std::string body;
+	};
 
-	void write_all( int fd, const char* data, size_t len );
-	void close_client( int fd );
+	bool setup_socket();
+	void handle_new_connection();
+	void handle_readable( int fd );
+	void sweep_closed();
+	// Returns true when a complete request was parsed out of conn->in; false when more input is needed or the request was rejected.
+	bool parse_request( const ConnPtr& conn, Request* req );
+	void dispatch( const ConnPtr& conn, const Request& req );
+	void handle_health( const ConnPtr& conn );
+	void handle_metrics( const ConnPtr& conn );
+	void handle_models( const ConnPtr& conn );
+	void handle_chat( const ConnPtr& conn, const Request& req, ChatProtocol& protocol );
 
 	ServerConfig config_;
 	int listen_fd_ = -1;
@@ -59,9 +51,11 @@ private:
 	std::atomic<bool> running_{ false };
 
 	std::unique_ptr<engine::runtime::Generator> generator_;
-	std::unique_ptr<ClientContext[]> clients_;
-	std::mutex client_mtx_;
+	std::map<int, ConnPtr> conns_; // epoll thread only
+	std::unique_ptr<ChatProtocol> openai_;
+	std::unique_ptr<ChatProtocol> anthropic_;
 	std::atomic<uint64_t> next_req_id_{ 1 };
+	std::string model_name_;
 };
 
 } // namespace engine::server

@@ -119,30 +119,76 @@ bool Generator::emit_token( int s, int tok ) {
 	Slot& slot = slots_[s];
 	slot.all_tokens.push_back( tok );
 	slot.tokens_generated++;
-	const std::string& tok_str = tokenizer_.decode_token_fast( tok );
-	slot.accumulated_text += tok_str;
 
 	const bool eos = cluster_.is_eos( tok ) || tok == tokenizer_.eos_id() || tok == tokenizer_.im_end_id();
-	const bool finish = eos
-		|| slot.tokens_generated >= slot.req.max_tokens
-		|| slot.current_pos + pod::MAX_BATCH >= cluster_.metadata().max_seq_len;
-	if ( slot.req.stream_callback ) {
-		slot.req.stream_callback( tok_str, finish );
+	FinishReason reason = FinishReason::Stop;
+	bool finish = eos;
+	if ( !finish && ( slot.tokens_generated >= slot.req.max_tokens || slot.current_pos + pod::MAX_BATCH >= cluster_.metadata().max_seq_len ) ) {
+		finish = true;
+		reason = FinishReason::Length;
+	}
+
+	std::string out;
+	if ( !eos ) slot.held_text += tokenizer_.decode_token_fast( tok );
+	if ( !slot.req.stop_strings.empty() ) {
+		// earliest stop string wins; otherwise hold back a tail that could still grow into one
+		size_t hit = std::string::npos;
+		for ( const std::string& stop : slot.req.stop_strings ) {
+			const size_t p = stop.empty() ? std::string::npos : slot.held_text.find( stop );
+			if ( p != std::string::npos && p < hit ) {
+				hit = p;
+				slot.req.matched_stop = stop;
+			}
+		}
+		if ( hit != std::string::npos ) {
+			out = slot.held_text.substr( 0, hit );
+			slot.held_text.clear();
+			finish = true;
+			reason = FinishReason::StopString;
+		}
+		else {
+			size_t hold = 0;
+			if ( !finish ) {
+				for ( const std::string& stop : slot.req.stop_strings ) {
+					const size_t max = std::min( slot.held_text.size(), stop.size() - 1 );
+					for ( size_t n = max; n > hold; --n ) {
+						if ( slot.held_text.compare( slot.held_text.size() - n, n, stop, 0, n ) == 0 ) {
+							hold = n;
+							break;
+						}
+					}
+				}
+			}
+			out = slot.held_text.substr( 0, slot.held_text.size() - hold );
+			slot.held_text.erase( 0, out.size() );
+		}
+	}
+	else {
+		out = std::move( slot.held_text );
+		slot.held_text.clear();
 	}
 	if ( finish ) {
-		finish_slot( s );
+		out += slot.held_text;
+		slot.held_text.clear();
+	}
+	if ( !out.empty() && slot.req.on_text && !slot.req.on_text( out ) ) {
+		finish = true;
+		reason = FinishReason::Cancelled;
+	}
+	if ( finish ) {
+		finish_slot( s, reason );
 	}
 	return finish;
 }
 
-void Generator::finish_slot( int s ) {
+void Generator::finish_slot( int s, FinishReason reason ) {
 	Slot& slot = slots_[s];
 	auto now = std::chrono::steady_clock::now();
 	double decode_s = std::chrono::duration<double>( now - slot.metrics.first_token_time ).count();
 	slot.metrics.generated_tokens = slot.tokens_generated;
 	slot.metrics.decode_tok_s = ( decode_s > 0.0 && slot.tokens_generated > 1 ) ? static_cast<float>( ( slot.tokens_generated - 1 ) / decode_s ) : 0.0f;
-	if ( slot.req.completion_callback ) {
-		slot.req.completion_callback( slot.accumulated_text, slot.metrics );
+	if ( slot.req.on_finish ) {
+		slot.req.on_finish( reason, slot.req.matched_stop, slot.metrics );
 	}
 	{
 		std::unique_lock<std::mutex> mlock( metrics_mtx_ );

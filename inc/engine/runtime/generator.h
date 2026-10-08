@@ -33,6 +33,8 @@ struct SlotMetrics {
 	float decode_tok_s = 0.0f;
 };
 
+enum class FinishReason { Stop, Length, StopString, Cancelled };
+
 struct GenerationRequest {
 	uint64_t req_id = 0;
 	std::string prompt_text;
@@ -42,9 +44,12 @@ struct GenerationRequest {
 	float top_p = 1.0f;
 	int top_k = 16;          // capped at 16 (kSampleTopK)
 	uint64_t seed = 0;       // 0 = derive from req_id
-	bool stream = false;
-	std::function<void( const std::string& token_str, bool is_done )> stream_callback;
-	std::function<void( const std::string& full_text, const SlotMetrics& metrics )> completion_callback;
+	std::vector<std::string> stop_strings;   // generation ends before the first match
+	std::string matched_stop;                // set when FinishReason::StopString
+	// Called from the scheduler thread with detokenized text (never the end-of-sequence token). Returning false cancels.
+	std::function<bool( const std::string& delta )> on_text;
+	// Called once, from the scheduler thread, when the request leaves its slot.
+	std::function<void( FinishReason reason, const std::string& matched_stop, const SlotMetrics& metrics )> on_finish;
 };
 
 struct EngineMetrics {
@@ -78,6 +83,9 @@ public:
 		return chat_template_;
 	}
 
+	int max_context() const { return cluster_.metadata().max_seq_len; }
+	int num_slots() const { return num_slots_; }
+
 private:
 	struct Slot {
 		bool active = false;
@@ -88,7 +96,7 @@ private:
 		SamplingParams sp;
 		Rng rng;
 		bool prefill_done = false;
-		std::string accumulated_text;
+		std::string held_text;   // detokenized text withheld while it could still begin a stop string
 		std::vector<int> all_tokens;
 		SlotMetrics metrics;
 		SpecController ctrl;
@@ -101,7 +109,7 @@ private:
 	void prefill_slot( int s );
 	// Commits `tok` to slot s's output; returns true when the request finished.
 	bool emit_token( int s, int tok );
-	void finish_slot( int s );
+	void finish_slot( int s, FinishReason reason );
 
 	engine::server::ServerConfig config_;
 	ModelCluster cluster_;

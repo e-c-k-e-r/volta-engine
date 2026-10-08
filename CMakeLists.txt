@@ -53,6 +53,10 @@ set(ENGINE_HOST_SOURCES
 	src/runtime/generator.cpp
 	src/server/config.cpp
 	src/server/output_parser.cpp
+	src/server/http.cpp
+	src/server/chat.cpp
+	src/server/openai.cpp
+	src/server/anthropic.cpp
 	src/server/server.cpp
 )
 
