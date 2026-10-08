@@ -1,8 +1,6 @@
 #include "engine/runtime/cluster.h"
 #include "engine/backend/runtime.h"
-#if ENGINE_BACKEND_CUDA
 #include "trellis_context.h"
-#endif
 #include <cmath>
 #include <cstdio>
 #include <chrono>
@@ -29,9 +27,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 
 	created_ = true;
 	engine::comm::init_4gpu_mesh( rings_, staging_ptrs_, flag_ptrs_, engine::comm::kMeshStagingBytes );
-#if ENGINE_BACKEND_CUDA
 	engine::modules::trellis_context_init_all();
-#endif
 
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		backend::set_device( d );
@@ -89,9 +85,7 @@ void ModelCluster::shutdown() {
 		engine::core::arena_destroy( arenas_[d] );
 	}
 	engine::comm::destroy_4gpu_mesh( staging_ptrs_, flag_ptrs_ );
-#if ENGINE_BACKEND_CUDA
 	engine::modules::trellis_context_destroy();
-#endif
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		backend::set_device( d );
 		backend::device_reset();
