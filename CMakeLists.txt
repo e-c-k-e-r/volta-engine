@@ -34,6 +34,7 @@ set(ENGINE_CORE_SOURCES
 	src/modules/gdn.cu
 	src/modules/mla.cu
 	src/modules/mla_latent.cu
+	src/modules/dsa.cu
 	src/modules/moe.cu
 	src/modules/mhc.cu
 	src/modules/embedding.cu
@@ -242,3 +243,7 @@ set_target_properties(bench_moe_prefill PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${P
 add_executable(test_mla_latent tests/2_parity/test_mla_latent.cpp)
 target_link_libraries(test_mla_latent PRIVATE engine_kernels)
 set_target_properties(test_mla_latent PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_dsa tests/2_parity/test_dsa.cpp)
+target_link_libraries(test_dsa PRIVATE engine_kernels)
+set_target_properties(test_dsa PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

@@ -1,6 +1,8 @@
 #include "engine/models/glm53_flash.h"
 #include "engine/loader/safetensors.h"
 #include "engine/modules/gdn.h"
+#include "engine/modules/dsa.h"
+#include <cublas_v2.h>
 #include "engine/modules/embedding.h"
 #include "engine/spec/dflash.h"
 #include "engine/spec/tap_ring.h"
@@ -146,8 +148,28 @@ bool GLM53Pipeline::init(
 		int lat_shape[2] = { R, 16 * 512 };
 		q_lat_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lat_shape, 2 );
 		o_lat_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lat_shape, 2 );
+
+		dsa_ = !( std::getenv( "EXL3_DSA" ) && std::atoi( std::getenv( "EXL3_DSA" ) ) == 0 );
+		if ( dsa_ ) {
+			const int NP = config_.max_seq / engine::modules::DSA::POOL;
+			dsa_plane_stride_ = static_cast<size_t>( config_.num_mla_layers ) * engine::modules::DSA::PLANE_CAP * engine::modules::DSA::PLANE;
+			dsa_pool_stride_ = static_cast<size_t>( config_.num_mla_layers ) * NP * engine::modules::DSA::DIM;
+			auto halves = [&]( size_t n ) { return static_cast<half*>( engine::core::arena_alloc( arena, n * sizeof( half ), 128 ) ); };
+			dsa_plane_ = halves( static_cast<size_t>( S ) * dsa_plane_stride_ );
+			dsa_pool_ = halves( static_cast<size_t>( S ) * dsa_pool_stride_ );
+			dsa_proj_ = halves( static_cast<size_t>( R ) * engine::modules::DSA::PROJ );
+			dsa_w_ = halves( static_cast<size_t>( R ) * engine::modules::DSA::HEADS );
+			dsa_q_ = halves( static_cast<size_t>( R ) * engine::modules::DSA::HEADS * engine::modules::DSA::DIM );
+			dsa_scores_ = halves( static_cast<size_t>( R ) * NP );
+			dsa_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * engine::modules::DSA::KPAD * sizeof( int ), 128 ) );
+			dsa_nk_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * sizeof( int ), 128 ) );
+			ENGINE_ASSERT( dsa_plane_ && dsa_pool_ && dsa_proj_ && dsa_w_ && dsa_q_ && dsa_scores_ && dsa_idx_ && dsa_nk_, "GLM53Pipeline::init: arena exhausted allocating the DSA state" );
+			CUDA_CHECK( cudaMemset( dsa_plane_, 0, static_cast<size_t>( S ) * dsa_plane_stride_ * sizeof( half ) ) );
+			CUDA_CHECK( cudaMemset( dsa_pool_, 0, static_cast<size_t>( S ) * dsa_pool_stride_ * sizeof( half ) ) );
+		}
 	}
 	else {
+		dsa_ = false;
 		kv_pool_.init( rank_, arena, S, config_.max_seq, config_.num_mla_layers, 16, 256 );
 	}
 
@@ -437,6 +459,35 @@ bool GLM53Pipeline::load_weights( const char* model_dir, cudaStream_t stream ) {
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.o_proj", L );
 			lw.o_proj = repo.load_linear_slice( name_buf, *arena_, 5, 0, rank_, config_.tp_size, stream );
+
+			if ( latent_ && dsa_ ) {
+				char pre[160];
+				std::snprintf( pre, sizeof( pre ), "model.language_model.layers.%d.self_attn.indexer", L );
+				std::snprintf( name_buf, sizeof( name_buf ), "%s.wq_b", pre );
+				lw.idx_wq_b = repo.load_linear( name_buf, *arena_, 5, stream );
+				const int dshape[2] = { engine::modules::DSA::PROJ, 4096 };
+				lw.idx_dense = engine::core::arena_alloc_tensor( *arena_, pod::DType::FP16, dshape, 2 );
+				const size_t keep = arena_->offset_bytes;
+				const char* parts[3] = { "wk.weight", "weights_proj.weight", "index_kpool_compress_gate" };
+				const int part_rows[3] = { engine::modules::DSA::DIM, engine::modules::DSA::HEADS, engine::modules::DSA::DIM };
+				int row0 = 0;
+				for ( int i = 0; i < 3; ++i ) {
+					std::snprintf( name_buf, sizeof( name_buf ), "%s.%s", pre, parts[i] );
+					const pod::TensorView part = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
+					ENGINE_ASSERT( part.data != nullptr && part.shape[0] == part_rows[i] && part.shape[1] == 4096, "GLM53Pipeline: indexer projection shape" );
+					CUDA_CHECK( cudaMemcpyAsync( lw.idx_dense.ptr<half>() + static_cast<size_t>( row0 ) * 4096, part.data,
+						static_cast<size_t>( part_rows[i] ) * 4096 * sizeof( half ), cudaMemcpyDeviceToDevice, stream ) );
+					row0 += part_rows[i];
+				}
+				CUDA_CHECK( cudaStreamSynchronize( stream ) );
+				arena_->offset_bytes = keep; // the staging copies are dead
+				std::snprintf( name_buf, sizeof( name_buf ), "%s.k_norm.weight", pre );
+				lw.idx_ln_w = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
+				std::snprintf( name_buf, sizeof( name_buf ), "%s.k_norm.bias", pre );
+				lw.idx_ln_b = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
+				std::snprintf( name_buf, sizeof( name_buf ), "%s.index_kpool_compress_ape", pre );
+				lw.idx_ape = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
+			}
 		}
 
 		if ( lw.is_moe ) {
@@ -871,7 +922,77 @@ void GLM53Pipeline::forward_body( int m, cudaStream_t stream ) {
 				o_lat.shape[0] = m;
 				engine::modules::MLALatent::store( latent_cache_, kv_lora_norm_buf_, mla_idx, config_.max_seq, m, kv_ref, stream );
 				engine::modules::MLALatent::absorb_q( q_buf_, lw.kv_b_proj, q_lat, 16, m, stream );
-				engine::modules::MLALatent::attend( latent_cache_, q_lat, o_lat, mla_idx, config_.max_seq, m, 16, kv_ref, latent_ws_, key_hint_, stream );
+				const int* sel_idx = nullptr;
+				const int* sel_n = nullptr;
+				if ( dsa_ && lw.idx_dense.data != nullptr ) {
+					using engine::modules::DSA;
+					// Indexer keys and gates of this chunk go into the plane, finished pools into the pool plane
+					if ( m <= pod::MAX_BATCH ) {
+						DSA::project_small( lw.idx_dense.ptr<half>(), norm_hidden_.ptr<half>(), dsa_proj_, m, DSA::PROJ, 4096, stream );
+					}
+					else {
+						int device = 0;
+						cudaGetDevice( &device );
+						cublasHandle_t h = engine::modules::trellis_get_cublas( device );
+						cublasSetStream( h, stream );
+						const float one = 1.0f, zero = 0.0f;
+						const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, DSA::PROJ, m, 4096,
+							&one, lw.idx_dense.data, CUDA_R_16F, 4096, norm_hidden_.data, CUDA_R_16F, 4096,
+							&zero, dsa_proj_, CUDA_R_16F, DSA::PROJ, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP );
+						ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "GLM53Pipeline: indexer projection GEMM failed" );
+					}
+					DSA::prep( dsa_proj_, lw.idx_ln_w.ptr<half>(), lw.idx_ln_b.ptr<half>(), dsa_plane_, dsa_w_, mla_idx, config_.max_seq, m,
+						d_rows_, dsa_plane_stride_, stream );
+					DSA::pool_update( dsa_plane_, dsa_pool_, lw.idx_ape.ptr<half>(), mla_idx, config_.max_seq, m, d_rows_,
+						dsa_plane_stride_, dsa_pool_stride_, stream );
+					// Selection matters once a row sees more than topk tokens; decode graphs always run it (rows below the
+					// threshold exit early on the device), eager chunks skip it while every row is still dense
+					if ( m <= pod::MAX_BATCH || key_hint_ > DSA::TOPK + DSA::POOL - 1 ) {
+						pod::TensorView qi = pod::make_tensor_2d( dsa_q_, pod::DType::FP16, m, DSA::HEADS * DSA::DIM );
+						engine::modules::Linear::forward( q_lora_norm_buf_, lw.idx_wq_b, qi, stream );
+						DSA::score( dsa_q_, dsa_w_, dsa_pool_, dsa_scores_, config_.max_seq / DSA::POOL, mla_idx, config_.max_seq, m,
+							d_rows_, dsa_pool_stride_, stream );
+						DSA::select( dsa_scores_, config_.max_seq / DSA::POOL, dsa_idx_, dsa_nk_, m, d_rows_, stream );
+						sel_idx = dsa_idx_;
+						sel_n = dsa_nk_;
+					}
+				}
+				engine::modules::MLALatent::attend( latent_cache_, q_lat, o_lat, mla_idx, config_.max_seq, m, 16, kv_ref, latent_ws_, key_hint_, stream, sel_idx, sel_n );
+				static const bool dsa_diag = std::getenv( "EXL3_DSA_DIAG" ) != nullptr;
+				if ( dsa_diag && sel_idx != nullptr && m > pod::MAX_BATCH && rank_ == 0 ) {
+					// Recall of the dense attention mass by the selection, last row of the chunk (eager prefill only)
+					const int n = key_hint_;
+					std::vector<float> sc( static_cast<size_t>( 16 ) * n );
+					float* d_sc = nullptr;
+					CUDA_CHECK( cudaMalloc( &d_sc, sc.size() * sizeof( float ) ) );
+					engine::modules::MLALatent::diag_scores( q_lat.ptr<half>() + static_cast<size_t>( m - 1 ) * 16 * 512,
+						latent_cache_ + static_cast<size_t>( mla_idx ) * config_.max_seq * 512, n, 16, d_sc, stream );
+					std::vector<int> sel( engine::modules::DSA::KPAD );
+					int nk = 0;
+					CUDA_CHECK( cudaMemcpyAsync( &nk, dsa_nk_ + ( m - 1 ), sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
+					CUDA_CHECK( cudaMemcpyAsync( sel.data(), dsa_idx_ + static_cast<size_t>( m - 1 ) * engine::modules::DSA::KPAD, sel.size() * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
+					CUDA_CHECK( cudaMemcpyAsync( sc.data(), d_sc, sc.size() * sizeof( float ), cudaMemcpyDeviceToHost, stream ) );
+					CUDA_CHECK( cudaStreamSynchronize( stream ) );
+					CUDA_CHECK( cudaFree( d_sc ) );
+					if ( nk > 0 ) {
+						std::vector<char> in_sel( n, 0 );
+						for ( int j = 0; j < nk; ++j ) if ( sel[j] >= 0 && sel[j] < n ) in_sel[sel[j]] = 1;
+						double recall = 0.0;
+						for ( int h = 0; h < 16; ++h ) {
+							const float* s = sc.data() + static_cast<size_t>( h ) * n;
+							float mx = -1e30f;
+							for ( int t = 0; t < n; ++t ) mx = std::max( mx, s[t] );
+							double tot = 0.0, got = 0.0;
+							for ( int t = 0; t < n; ++t ) {
+								const double e = std::exp( static_cast<double>( s[t] - mx ) );
+								tot += e;
+								if ( in_sel[t] ) got += e;
+							}
+							recall += got / tot;
+						}
+						std::printf( "[dsa diag] layer %d: %d of %d tokens selected, dense-attention mass recall %.4f (mean over heads)\n", mla_idx, nk, n, recall / 16.0 );
+					}
+				}
 				engine::modules::MLALatent::expand_out( o_lat, lw.kv_b_proj, mla_heads_out_, 16, m, stream );
 			}
 			else {

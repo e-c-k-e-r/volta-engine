@@ -95,6 +95,7 @@ __global__ void store_latent_kernel( half* __restrict__ cache, const half* __res
 }
 
 constexpr int CHUNK_KEYS = 1024;
+constexpr int DSA_KPAD = 2080; // DSA::KPAD
 constexpr int TILE = 16;
 constexpr int CS = LORA + 8; // padded key row (halves) in shared memory
 
@@ -114,7 +115,9 @@ void latent_attn_kernel(
 	const pod::BatchRows* __restrict__ rows,
 	int row0,
 	int n_chunks,
-	float scale
+	float scale,
+	const int* __restrict__ sel_idx,
+	const int* __restrict__ sel_n
 ) {
 	extern __shared__ __align__( 16 ) unsigned char smem_raw[];
 	float* sq = reinterpret_cast<float*>( smem_raw );                       // [HEADS][LORA]
@@ -123,7 +126,10 @@ void latent_attn_kernel(
 	float* sal = ss + HEADS * TILE;                                         // [HEADS] rescale factors
 	const int m = blockIdx.x, chunk = blockIdx.y, t = threadIdx.x;
 	const int pos = rows->pos[row0 + m];
-	const int total = min( pos + 1, max_seq );
+	// DSA rows (sel_n >= 0) attend to a list of token indices, others to every position up to their own
+	const int nsel = sel_n ? sel_n[row0 + m] : -1;
+	const int* lst = sel_idx ? sel_idx + static_cast<size_t>( row0 + m ) * DSA_KPAD : nullptr;
+	const int total = nsel >= 0 ? nsel : min( pos + 1, max_seq );
 	const int kv_start = chunk * CHUNK_KEYS;
 	const int kv_end = min( kv_start + CHUNK_KEYS, total );
 	const size_t base = static_cast<size_t>( rows->slot[row0 + m] ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA;
@@ -141,7 +147,10 @@ void latent_attn_kernel(
 			for ( int u = t; u < TILE * ( LORA / 8 ); u += 512 ) {
 				const int k = u / ( LORA / 8 ), c8 = u % ( LORA / 8 );
 				uint4 raw = make_uint4( 0, 0, 0, 0 );
-				if ( k < nk ) raw = *reinterpret_cast<const uint4*>( cache + base + static_cast<size_t>( kb + k ) * LORA + c8 * 8 );
+				if ( k < nk ) {
+					const int key = nsel >= 0 ? lst[kb + k] : kb + k;
+					raw = *reinterpret_cast<const uint4*>( cache + base + static_cast<size_t>( key ) * LORA + c8 * 8 );
+				}
 				*reinterpret_cast<uint4*>( sc + k * CS + c8 * 8 ) = raw;
 			}
 			__syncthreads();
@@ -494,6 +503,276 @@ void latent_prefill_tc_kernel(
 	}
 }
 
+
+// Sparse (DSA) variant of the tensor-core latent attention: one block per row, its 16 heads as the 16 queries, and the row's own list
+// of key positions (nsel >= 0) or every position up to its own (nsel < 0) walked in tiles of 32 gathered keys. Tile handling, the
+// time-multiplexed K / V^T buffer and the softmax follow latent_prefill_tc_kernel; S is split four ways over the dimensions
+// (each warp 16 x 16 over 128 of them) because only 16 queries share the tile.
+#define LS_BQ 16
+#define LS_OFF_Q 36864
+#define LS_OFF_S ( LS_OFF_Q + LS_BQ * LT_KS * 2 )
+#define LS_OFF_P ( LS_OFF_S + 4 * LS_BQ * LT_SS * 4 )
+#define LS_OFF_A ( LS_OFF_P + LS_BQ * LT_VS * 2 )
+#define LS_SMEM ( LS_OFF_A + LS_BQ * 12 )
+
+__global__ __launch_bounds__( 256 )
+void latent_sparse_tc_kernel(
+	const half* __restrict__ q_lat,
+	const half* __restrict__ cache,
+	half* __restrict__ o_lat,
+	float* __restrict__ workspace,
+	size_t slot_stride,
+	int layer,
+	int max_seq,
+	const pod::BatchRows* __restrict__ rows,
+	float scale,
+	int nsplit,
+	const int* __restrict__ sel_idx,
+	const int* __restrict__ sel_n
+) {
+	constexpr int HEADS = 16;
+	extern __shared__ __align__( 16 ) unsigned char ls_smem[];
+	half* sB = reinterpret_cast<half*>( ls_smem );
+	half* sQ = reinterpret_cast<half*>( ls_smem + LS_OFF_Q );
+	float* sS = reinterpret_cast<float*>( ls_smem + LS_OFF_S );
+	half* sP = reinterpret_cast<half*>( ls_smem + LS_OFF_P );
+	float* sA = reinterpret_cast<float*>( ls_smem + LS_OFF_A );
+	float* sM = sA + LS_BQ;
+	float* sL = sM + LS_BQ;
+	float* sO = reinterpret_cast<float*>( ls_smem );
+
+	const int r = blockIdx.x;
+	const int tid = threadIdx.x;
+	const int warp = tid >> 5;
+	const int lane = tid & 31;
+	const int t = lane & 3;
+	const int hi = lane >> 4;
+	const int e = t + 4 * hi;
+	const int qp = ( lane >> 2 ) & 3;
+
+	const int nsel = sel_n ? sel_n[r] : -1;
+	const int* lst = sel_idx ? sel_idx + static_cast<size_t>( r ) * DSA_KPAD : nullptr;
+	const int n_keys = nsel >= 0 ? nsel : min( rows->pos[r] + 1, max_seq );
+	const half* kv = cache + static_cast<size_t>( rows->slot[r] ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA;
+
+	for ( int u = tid; u < LS_BQ * ( LORA / 8 ); u += 256 ) {
+		const int qq = u >> 6, c = u & 63;
+		const uint4 raw = *reinterpret_cast<const uint4*>( q_lat + ( static_cast<size_t>( r ) * HEADS + qq ) * LORA + c * 8 );
+		uint2* dst = reinterpret_cast<uint2*>( sQ + qq * LT_KS + c * 8 );
+		dst[0] = make_uint2( raw.x, raw.y );
+		dst[1] = make_uint2( raw.z, raw.w );
+	}
+
+	const int s_kg = warp & 1, dq = warp >> 1;
+	const half* s_arow = sQ + ( 8 * ( qp >> 1 ) + e ) * LT_KS + dq * 128;
+	const half* s_brow = sB + ( s_kg * 16 + 8 * ( qp & 1 ) + e ) * LT_KS + dq * 128;
+	const half* v_row0 = sB + ( 64 * warp + qp + 4 * e ) * LT_VS;
+	const half* p_row = sP + e * LT_VS;
+
+	// Softmax role: 16 lanes per query row, 2 keys each
+	const int srow = tid >> 4, sub = tid & 15;
+	float m_run = -1e30f, l_run = 0.0f;
+
+	float acc[2][2][8];
+	#pragma unroll
+	for ( int jj = 0; jj < 2; ++jj ) {
+		#pragma unroll
+		for ( int i = 0; i < 2; ++i ) {
+			#pragma unroll
+			for ( int q = 0; q < 8; ++q ) acc[jj][i][q] = 0.0f;
+		}
+	}
+
+	const int st_p = lane & 15, st_cl = lane >> 4;
+	uint4 pk[4][2];
+	auto fetch = [&]( int kb ) {
+		int kpos[2];
+		#pragma unroll
+		for ( int kk = 0; kk < 2; ++kk ) {
+			const int j = kb + 2 * st_p + kk;
+			kpos[kk] = j < n_keys ? ( lst ? lst[j] : j ) : -1;
+		}
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			const int c = 2 * warp + st_cl + 16 * j;
+			#pragma unroll
+			for ( int kk = 0; kk < 2; ++kk ) {
+				pk[j][kk] = kpos[kk] >= 0 ? *reinterpret_cast<const uint4*>( kv + static_cast<size_t>( kpos[kk] ) * LORA + c * 8 ) : make_uint4( 0, 0, 0, 0 );
+			}
+		}
+	};
+	const int ntiles = ( n_keys + LT_BK - 1 ) / LT_BK;
+	const int kb0 = ( blockIdx.y * ntiles / nsplit ) * LT_BK;
+	const int kb1 = ( ( blockIdx.y + 1 ) * ntiles / nsplit ) * LT_BK;
+	if ( kb0 < kb1 ) fetch( kb0 );
+	__syncthreads();
+
+	for ( int kb = kb0; kb < kb1; kb += LT_BK ) {
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			const int c = 2 * warp + st_cl + 16 * j;
+			#pragma unroll
+			for ( int kk = 0; kk < 2; ++kk ) {
+				uint2* kd = reinterpret_cast<uint2*>( sB + ( 2 * st_p + kk ) * LT_KS + c * 8 );
+				kd[0] = make_uint2( pk[j][kk].x, pk[j][kk].y );
+				kd[1] = make_uint2( pk[j][kk].z, pk[j][kk].w );
+			}
+		}
+		__syncthreads();
+
+		{
+			float c[8];
+			#pragma unroll
+			for ( int q = 0; q < 8; ++q ) c[q] = 0.0f;
+			#pragma unroll 16
+			for ( int ks = 0; ks < 32; ++ks ) {
+				const uint2 a = *reinterpret_cast<const uint2*>( s_arow + 4 * ks );
+				const uint2 b = *reinterpret_cast<const uint2*>( s_brow + 4 * ks );
+				lt_mma( c, a.x, a.y, b.x, b.y );
+			}
+			#pragma unroll
+			for ( int q = 0; q < 8; ++q ) {
+				const int m = ( t & 1 ) + 2 * ( ( q >> 1 ) & 1 ) + 4 * hi;
+				const int n = ( q & 1 ) + 2 * ( t >> 1 ) + 4 * ( q >> 2 );
+				sS[dq * LS_BQ * LT_SS + ( 8 * ( qp >> 1 ) + m ) * LT_SS + s_kg * 16 + 8 * ( qp & 1 ) + n] = c[q];
+			}
+		}
+		__syncthreads();
+
+		{
+			float sv[2];
+			float mx = -1e30f;
+			#pragma unroll
+			for ( int j = 0; j < 2; ++j ) {
+				const int key = sub * 2 + j;
+				float sum4 = 0.0f;
+				#pragma unroll
+				for ( int d4 = 0; d4 < 4; ++d4 ) sum4 += sS[d4 * LS_BQ * LT_SS + srow * LT_SS + key];
+				sv[j] = ( kb + key < n_keys ) ? sum4 * scale : -1e30f;
+				mx = fmaxf( mx, sv[j] );
+			}
+			#pragma unroll
+			for ( int mask = 1; mask < 16; mask <<= 1 ) mx = fmaxf( mx, __shfl_xor_sync( 0xffffffff, mx, mask ) );
+			const float m_new = fmaxf( m_run, mx );
+			const float alpha = __expf( m_run - m_new );
+			const float p0 = sv[0] > -1e29f ? __expf( sv[0] - m_new ) : 0.0f;
+			const float p1 = sv[1] > -1e29f ? __expf( sv[1] - m_new ) : 0.0f;
+			float sum = p0 + p1;
+			#pragma unroll
+			for ( int mask = 1; mask < 16; mask <<= 1 ) sum += __shfl_xor_sync( 0xffffffff, sum, mask );
+			l_run = l_run * alpha + sum;
+			m_run = m_new;
+			*reinterpret_cast<half2*>( sP + srow * LT_VS + sub * 2 ) = __floats2half2_rn( p0, p1 );
+			if ( sub == 0 ) sA[srow] = alpha;
+		}
+		__syncthreads();
+
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			const int c = 2 * warp + st_cl + 16 * j;
+			const half* v0 = reinterpret_cast<const half*>( &pk[j][0] );
+			const half* v1 = reinterpret_cast<const half*>( &pk[j][1] );
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) {
+				*reinterpret_cast<half2*>( sB + ( c * 8 + i ) * LT_VS + 2 * st_p ) = __halves2half2( v0[i], v1[i] );
+			}
+		}
+		__syncthreads();
+		if ( kb + LT_BK < kb1 ) fetch( kb + LT_BK );
+
+		#pragma unroll
+		for ( int jj = 0; jj < 2; ++jj ) {
+			#pragma unroll
+			for ( int i = 0; i < 2; ++i ) {
+				#pragma unroll
+				for ( int q = 0; q < 8; ++q ) {
+					const int m = ( t & 1 ) + 2 * ( ( q >> 1 ) & 1 ) + 4 * hi;
+					acc[jj][i][q] *= sA[8 * i + m];
+				}
+			}
+		}
+		#pragma unroll
+		for ( int kk = 0; kk < LT_BK / 4; ++kk ) {
+			uint2 b[2];
+			#pragma unroll
+			for ( int jj = 0; jj < 2; ++jj ) b[jj] = *reinterpret_cast<const uint2*>( v_row0 + 32 * jj * LT_VS + 4 * kk );
+			#pragma unroll
+			for ( int i = 0; i < 2; ++i ) {
+				const uint2 a = *reinterpret_cast<const uint2*>( p_row + 8 * i * LT_VS + 4 * kk );
+				#pragma unroll
+				for ( int jj = 0; jj < 2; ++jj ) lt_mma( acc[jj][i], a.x, a.y, b[jj].x, b[jj].y );
+			}
+		}
+		__syncthreads();
+	}
+
+	if ( sub == 0 ) {
+		sA[srow] = nsplit > 1 ? 1.0f : ( l_run > 0.0f ? 1.0f / l_run : 0.0f );
+		sM[srow] = m_run;
+		sL[srow] = l_run;
+	}
+	__syncthreads();
+	#pragma unroll
+	for ( int jj = 0; jj < 2; ++jj ) {
+		#pragma unroll
+		for ( int i = 0; i < 2; ++i ) {
+			#pragma unroll
+			for ( int q = 0; q < 8; ++q ) {
+				const int m = ( t & 1 ) + 2 * ( ( q >> 1 ) & 1 ) + 4 * hi;
+				const int n = ( q & 1 ) + 2 * ( t >> 1 ) + 4 * ( q >> 2 );
+				sO[( 8 * i + m ) * LT_KS + 64 * warp + 32 * jj + qp + 4 * n] = acc[jj][i][q] * sA[8 * i + m];
+			}
+		}
+	}
+	__syncthreads();
+
+	if ( nsplit > 1 ) {
+		for ( int u = tid; u < LS_BQ * LORA; u += 256 ) {
+			const int qq = u >> 9, d = u & 511;
+			float* ws = workspace + ( ( static_cast<size_t>( r ) * HEADS + qq ) * nsplit + blockIdx.y ) * ( LORA + 2 );
+			if ( d == 0 ) {
+				ws[0] = sM[qq];
+				ws[1] = sL[qq];
+			}
+			ws[2 + d] = sO[qq * LT_KS + d];
+		}
+		return;
+	}
+	for ( int u = tid; u < LS_BQ * ( LORA / 8 ); u += 256 ) {
+		const int qq = u >> 6, c = u & 63;
+		const float* o = sO + qq * LT_KS + c * 8;
+		uint4 res;
+		half2* r2 = reinterpret_cast<half2*>( &res );
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) r2[i] = __floats2half2_rn( o[2 * i], o[2 * i + 1] );
+		*reinterpret_cast<uint4*>( o_lat + ( static_cast<size_t>( r ) * HEADS + qq ) * LORA + c * 8 ) = res;
+	}
+}
+
+
+// Diagnostic: dense attention logits of one row, scores[h][t] = q_lat[h] . c_t * scale for t < n
+__global__ __launch_bounds__( 256 )
+void diag_scores_kernel( const half* __restrict__ q_lat, const half* __restrict__ kv, float* __restrict__ scores, int n, int heads, float scale ) {
+	__shared__ float sq[LORA];
+	const int h = blockIdx.y;
+	for ( int i = threadIdx.x; i < LORA; i += 256 ) sq[i] = __half2float( q_lat[static_cast<size_t>( h ) * LORA + i] );
+	__syncthreads();
+	const int t = blockIdx.x * 256 + threadIdx.x;
+	if ( t >= n ) return;
+	float acc = 0.0f;
+	for ( int c = 0; c < LORA; c += 8 ) {
+		const uint4 raw = *reinterpret_cast<const uint4*>( kv + static_cast<size_t>( t ) * LORA + c );
+		const half2* h2 = reinterpret_cast<const half2*>( &raw );
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const float2 f = __half22float2( h2[i] );
+			acc = fmaf( sq[c + 2 * i], f.x, acc );
+			acc = fmaf( sq[c + 2 * i + 1], f.y, acc );
+		}
+	}
+	scores[static_cast<size_t>( h ) * n + t] = acc * scale;
+}
+
 // Merge a row's chunk partials: out = sum_c exp(m_c - m) o_c / sum_c exp(m_c - m) l_c; empty chunks (l = 0) are skipped.
 __global__ __launch_bounds__( 512 )
 void latent_reduce_kernel( const float* __restrict__ workspace, half* __restrict__ o_lat, int heads, int n_chunks ) {
@@ -530,7 +809,7 @@ void MLALatent::store( half* cache, const pod::TensorView& c, int layer, int max
 }
 
 void MLALatent::attend( const half* cache, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
-	const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream ) {
+	const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream, const int* sel_idx, const int* sel_n ) {
 		ENGINE_ASSERT( heads == 16 && slot.rows != nullptr, "MLALatent::attend: 16 heads per rank, device-resolved positions" );
 	const int n_chunks = workspace_chunks( max_seq );
 	const float scale = 1.0f / sqrtf( static_cast<float>( HEAD ) );
@@ -543,7 +822,23 @@ void MLALatent::attend( const half* cache, const pod::TensorView& q_lat, pod::Te
 		attr[device] = true;
 	}
 	static const bool simt_only = std::getenv( "EXL3_MLA_LATENT_SIMT" ) != nullptr;
-	if ( rows > pod::MAX_BATCH && !simt_only ) {
+	if ( rows > pod::MAX_BATCH && !simt_only && sel_idx != nullptr ) {
+		ENGINE_ASSERT( slot.row == 0, "MLALatent::attend: prefill chunks start at row 0" );
+		static bool sp_attr[ENGINE_NUM_GPUS] = {};
+		if ( !sp_attr[device] ) {
+			CUDA_CHECK( cudaFuncSetAttribute( latent_sparse_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, LS_SMEM ) );
+			sp_attr[device] = true;
+		}
+		int nsplit = rows < 160 ? std::min( ( 320 + rows - 1 ) / rows, 8 ) : 1;
+		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > workspace_slots( max_seq, heads ) ) --nsplit;
+		latent_sparse_tc_kernel<<<dim3( rows, nsplit ), dim3( 256 ), LS_SMEM, stream>>>(
+			q_lat.ptr<const half>(), cache, o_lat.ptr<half>(), workspace, slot.stride, layer, max_seq, slot.rows, scale, nsplit, sel_idx, sel_n );
+		if ( nsplit > 1 ) {
+			latent_reduce_kernel<<<dim3( heads, rows ), dim3( 512 ), 0, stream>>>( workspace, o_lat.ptr<half>(), heads, nsplit );
+		}
+		return;
+	}
+	if ( rows > pod::MAX_BATCH && !simt_only && sel_idx == nullptr ) {
 		ENGINE_ASSERT( slot.row == 0, "MLALatent::attend: prefill chunks start at row 0" );
 		static bool tc_attr[ENGINE_NUM_GPUS] = {};
 		if ( !tc_attr[device] ) {
@@ -567,11 +862,16 @@ void MLALatent::attend( const half* cache, const pod::TensorView& q_lat, pod::Te
 		const int M = min( pod::MAX_BATCH, slot.row + rows - row0 );
 		const size_t off = static_cast<size_t>( row0 - slot.row ) * heads * LORA;
 		latent_attn_kernel<16><<<dim3( M, n_chunks ), dim3( 512 ), smem, stream>>>(
-			q_lat.ptr<const half>() + off, cache, o_lat.ptr<half>() + off, workspace, slot.stride, layer, max_seq, slot.rows, row0, n_chunks, scale );
+			q_lat.ptr<const half>() + off, cache, o_lat.ptr<half>() + off, workspace, slot.stride, layer, max_seq, slot.rows, row0, n_chunks, scale, sel_idx, sel_n );
 		if ( n_chunks > 1 ) {
 			latent_reduce_kernel<<<dim3( heads, M ), dim3( 512 ), 0, stream>>>( workspace, o_lat.ptr<half>() + off, heads, n_chunks );
 		}
 	}
+}
+
+
+void MLALatent::diag_scores( const half* q_lat_row, const half* cache_slot_layer, int n, int heads, float* scores, cudaStream_t stream ) {
+	diag_scores_kernel<<<dim3( ( n + 255 ) / 256, heads ), dim3( 256 ), 0, stream>>>( q_lat_row, cache_slot_layer, scores, n, heads, 1.0f / sqrtf( static_cast<float>( HEAD ) ) );
 }
 
 } // namespace engine::modules

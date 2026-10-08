@@ -34,8 +34,8 @@ struct GLM53Config {
 	int dsa_top_k = 64;
 	int vocab_size = 154880;
 	int tp_size = 4;
-	int max_seq = 32768;
-	int max_slots = 1; // absorbed MLA latent cache: ~360 MiB/slot/rank at 32K (expanded K/V: 369 MiB at 2K); weights fill the 31 GiB arena
+	int max_seq = 16384;
+	int max_slots = 1; // absorbed MLA latent cache: ~180 MiB/slot/rank at 16K (expanded K/V: 369 MiB at 2K); weights fill the 31 GiB arena and the drafter needs the last GiB (EXL3_MAX_SEQ=32768 fits without it)
 	int num_mla_layers = 11;
 	int kda_heads = 16;
 	int kda_head_dim = 128;
@@ -102,6 +102,12 @@ struct GLM53LayerWeights {
 	pod::TensorView   kv_a_norm;
 
 	pod::TensorView kv_b_proj; // [8192, 512] FP16
+
+	// DSA lightning indexer (every MLA layer; replicated on all ranks, the selection is shared by all heads)
+	pod::LinearWeight idx_wq_b;     // q_lora_norm [1536] -> 32 heads x 128
+	pod::TensorView   idx_dense;    // [288, 4096] FP16: wk (128) | weights_proj (32) | k-pool gate (128)
+	pod::TensorView   idx_ln_w, idx_ln_b;   // k_norm LayerNorm [128]
+	pod::TensorView   idx_ape;      // [4, 128] k-pool in-pool bias
 
 	// Attention output projection
 	pod::LinearWeight o_proj;
@@ -191,6 +197,17 @@ private:
 	size_t latent_slot_stride_ = 0;   // elements per slot
 	float* latent_ws_ = nullptr;      // split-KV partials
 	pod::TensorView q_lat_;           // [rows, 16 * 512]
+	// DSA (EXL3_DSA, default on with the latent cache): indexer planes and selection scratch
+	bool dsa_ = true;
+	half* dsa_plane_ = nullptr;       // [slots][mla layers][DSA::PLANE_CAP][256]  ring of per-token [k_norm | gate]
+	half* dsa_pool_ = nullptr;        // [slots][mla layers][max_seq / 4][128]  pooled keys
+	size_t dsa_plane_stride_ = 0, dsa_pool_stride_ = 0;
+	half* dsa_proj_ = nullptr;        // [rows, 288]
+	half* dsa_w_ = nullptr;           // [rows, 32]
+	half* dsa_q_ = nullptr;           // [rows, 32 * 128]
+	half* dsa_scores_ = nullptr;      // [rows, max_seq / 4]
+	int* dsa_idx_ = nullptr;          // [rows, DSA::KPAD]
+	int* dsa_nk_ = nullptr;           // [rows]
 	pod::TensorView o_lat_;
 	int last_rows_ = 0;
 	int lm_mode_ = pod::BatchRows::LOGITS_ALL;

@@ -522,6 +522,23 @@ bool SafeTensorsRepo::open( const char* dir_path ) {
 		}
 	}
 
+	// Tensors a checkpoint keeps outside its index (GLM-5.3 ships the DSA k-pool gate / APE in kpool_aux.safetensors)
+	{
+		char aux_path[1024];
+		std::snprintf( aux_path, sizeof( aux_path ), "%s/kpool_aux.safetensors", dir_path );
+		FILE* fa = ( num_shards_ < MAX_SHARDS ) ? std::fopen( aux_path, "rb" ) : nullptr;
+		if ( fa != nullptr ) {
+			std::fclose( fa );
+			if ( safetensors_open( shards_[num_shards_], aux_path ) ) {
+				std::strncpy( shard_names_[num_shards_], "kpool_aux.safetensors", sizeof( shard_names_[0] ) - 1 );
+				const int s_idx = num_shards_++;
+				for ( int t = 0; t < shards_[s_idx].tensor_count; ++t ) {
+					tensor_map_[shards_[s_idx].tensors[t].name] = { s_idx, &shards_[s_idx].tensors[t] };
+				}
+			}
+		}
+	}
+
 	std::printf( "    [SafeTensorsRepo] Loaded %d shards, mapped %zu tensors\n", num_shards_, tensor_map_.size() );
 	std::fflush( stdout );
 

@@ -103,7 +103,10 @@ struct MLALatent {
 	// Attention of every head over the latent cache; q_lat / o_lat [rows, heads * 512]. Rows beyond MAX_BATCH run in groups.
 	// workspace: MAX_BATCH * heads * n_chunks * (512 + 2) floats with n_chunks = workspace_chunks( max_seq ).
 	static void attend( const half* cache, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
-		const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream );
+		const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream,
+		const int* sel_idx = nullptr, const int* sel_n = nullptr );   // DSA: per-row token lists (stride DSA::KPAD) and counts (-1 = dense row)
+	// Debug: dense logits of one row (n keys of a slot's layer cache) into scores[heads][n]
+	static void diag_scores( const half* q_lat_row, const half* cache_slot_layer, int n, int heads, float* scores, cudaStream_t stream );
 	static int workspace_chunks( int max_seq ) { return ( max_seq + 1023 ) / 1024; }
 	// Partial slots (row, head, split) of 514 floats: decode rows x chunks, or a prefill chunk's key splits (at least 8192)
 	static size_t workspace_slots( int max_seq, int heads ) { return std::max<size_t>( static_cast<size_t>( pod::MAX_BATCH ) * heads * workspace_chunks( max_seq ), 8192 ); }
