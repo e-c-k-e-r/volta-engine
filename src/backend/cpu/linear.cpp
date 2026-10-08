@@ -1,5 +1,4 @@
-// CPU backend: dense FP16 GEMV/GEMM (the Linear FP16 path). Trellis is in linear_trellis.cpp; NVFP4 is in linear_nvfp4.cpp.
-#include "cpu_kernels.h"
+// CPU backend: dense FP16 GEMV/GEMM (the Linear FP16 path). Trellis is in linear_trellis.cpp; NVFP4 stays CUDA-only.
 #include "engine/modules/linear.h"
 
 namespace engine::modules {
@@ -15,17 +14,18 @@ void LinearPlainGEMV::forward(
 	int k,
 	backend::stream_t
 ) {
-	impl::cpu_parallel_for( n, 64, [&]( int64_t c0, int64_t c1 ) {
-		for ( int64_t c = c0; c < c1; ++c ) {
+	float* acc = new float[static_cast<size_t>( n )];
+	for ( int r = 0; r < m; ++r ) {
+		const backend::half_t* xr = x + static_cast<size_t>( r ) * k;
+		for ( int c = 0; c < n; ++c ) {
 			const backend::half_t* wr = w + static_cast<size_t>( c ) * k;
-			for ( int r = 0; r < m; ++r ) {
-				const backend::half_t* xr = x + static_cast<size_t>( r ) * k;
-				float a = 0.0f;
-				for ( int i = 0; i < k; ++i ) a += static_cast<float>( xr[i] ) * static_cast<float>( wr[i] );
-				out[static_cast<size_t>( r ) * n + c] = static_cast<backend::half_t>( a );
-			}
+			float a = 0.0f;
+			for ( int i = 0; i < k; ++i ) a += static_cast<float>( xr[i] ) * static_cast<float>( wr[i] );
+			acc[c] = a;
 		}
-	} );
+		for ( int c = 0; c < n; ++c ) out[static_cast<size_t>( r ) * n + c] = static_cast<backend::half_t>( acc[c] );
+	}
+	delete[] acc;
 }
 
 } // namespace engine::modules

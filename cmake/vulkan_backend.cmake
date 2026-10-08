@@ -52,6 +52,20 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	add_dependencies(test_vulkan_ref slang_kernels)
 	set_target_properties(test_vulkan_smoke test_vulkan_ref PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+	# End-to-end single-rank forward (--check against the CUDA --dump golden), same source as test_cpu_forward
+	add_executable(test_vulkan_forward tests/2_parity/test_cpu_forward.cpp ${ENGINE_VK_OBJECTS})
+	target_link_libraries(test_vulkan_forward PRIVATE engine_backend_vulkan pthread)
+	add_dependencies(test_vulkan_forward slang_kernels)
+	set_target_properties(test_vulkan_forward PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	# Op-level goldens through the module API (--check against the CUDA --dump)
+	foreach(t test_ops_linear test_ops_attention)
+		add_executable(${t} tests/2_parity/${t}.cpp ${ENGINE_VK_OBJECTS})
+		target_link_libraries(${t} PRIVATE engine_backend_vulkan pthread)
+		add_dependencies(${t} slang_kernels)
+		set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	endforeach()
+
 	# The server entry point, to show how far the host sources link (the quantized linears and attention are stubs)
 	add_executable(volta_server src/server/main.cpp ${ENGINE_VK_OBJECTS})
 	target_link_libraries(volta_server PRIVATE engine_backend_vulkan pthread)

@@ -1,4 +1,5 @@
-// Vulkan backend: Gated DeltaNet entry points with a Slang kernel (gates, L2 norm, multi-row conv and recurrence, gated norm). The KDA forms and the single-row conv / recurrence stay weak stubs (stubs_gdn.cpp).
+// Vulkan backend: Gated DeltaNet entry points with a Slang kernel (gates, L2 norm, multi-row conv and recurrence, gated norm) and the single-row
+// conv / recurrence forms composed from the rows kernels. The KDA forms stay weak stubs (stubs_gdn.cpp).
 #include "mod_common.h"
 #include "engine/modules/gdn.h"
 #include <cmath>
@@ -7,6 +8,36 @@ namespace engine::modules {
 
 namespace {
 namespace vki = ::engine::backend::impl;
+
+// Device address of the slot index for row `slot.row + m` (BatchRows lives in device memory); without a BatchRows, a zeroed int (slot 0)
+uint64_t slot_index_addr( const pod::SlotRef& slot, int m, backend::stream_t stream ) {
+	if ( slot.rows != nullptr ) return vki::rows_slot( slot.rows ) + static_cast<uint64_t>( slot.row + m ) * sizeof( int );
+	void* zero = vki::scratch( 8, sizeof( int ), stream );
+	backend::memset_async( zero, 0, sizeof( int ), stream );
+	return vki::dp( zero );
+}
+}
+
+void GDN::causal_conv1d_silu( pod::TensorView& qkv, pod::TensorView& conv_history, const pod::TensorView& conv_weights, int channels, backend::stream_t stream,
+	const pod::SlotRef& slot, float* snap, const int* snap_on ) {
+	// Snapshots are not supported on this form (as on the CPU backend)
+	vki::ConvRowsParams p{ vki::dp( qkv.data ), vki::dp( conv_history.ptr<float>() ), vki::dp( conv_weights.data ), slot_index_addr( slot, 0, stream ), 0, 0,
+		channels, 1, 0, conv_weights.data != nullptr, static_cast<int64_t>( slot.stride ), 0 };
+	vki::launch( "causal_conv1d_silu_rows", p, stream, ( channels + 255 ) / 256 );
+}
+
+void GDN::recurrent_step( float* gdn_state, const pod::TensorView& qkv, const pod::TensorView& gate, const pod::TensorView& beta, pod::TensorView& attn_out,
+	int num_k_heads, int num_v_heads, int head_dim, backend::stream_t stream, const pod::SlotRef& slot, float* snap, const int* snap_on ) {
+	ENGINE_ASSERT( head_dim == 128, "GDN::recurrent_step (Vulkan): the kernel is specialized for head_dim 128" );
+	const int tokens = ( qkv.ndim >= 1 && qkv.shape[0] > 0 ) ? qkv.shape[0] : 1;
+	const size_t qkv_stride = static_cast<size_t>( 2 * num_k_heads + num_v_heads ) * head_dim;
+	// Token by token, each resolving its own slot row
+	for ( int m = 0; m < tokens; ++m ) {
+		vki::RecurrentParams p{ vki::dp( gdn_state ), vki::dp( qkv.ptr<const backend::half_t>() + m * qkv_stride ), vki::dp( gate.ptr<const float>() + static_cast<size_t>( m ) * num_v_heads ),
+			vki::dp( beta.ptr<const float>() + static_cast<size_t>( m ) * num_v_heads ), vki::dp( attn_out.ptr<backend::half_t>() + static_cast<size_t>( m ) * num_v_heads * head_dim ),
+			slot_index_addr( slot, m, stream ), 0, 0, num_k_heads, num_v_heads, 1, 0, 1.0f / std::sqrt( static_cast<float>( head_dim ) ), static_cast<int64_t>( slot.stride ), 0 };
+		vki::launch( "recurrent_step_rows", p, stream, num_v_heads, 1, 32 );
+	}
 }
 
 void GDN::project_gates(

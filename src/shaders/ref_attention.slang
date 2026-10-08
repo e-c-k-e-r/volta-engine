@@ -133,3 +133,35 @@ void ref_attn_decode_cpu(uint3 gid : SV_GroupID, uniform RefAttnParams p) {
 	}
 }
 #endif
+
+// Q/gate split of the fused [rows][num_q_heads][2 * head_dim] projection: q and gate are [rows][num_q_heads][head_dim].
+// One invocation per output element (GPU: 128 per group; host: one group per element, entry carries the _cpu suffix).
+struct RefUnpackParams {
+	half* qg;
+	half* q;
+	half* gate;
+	int total;        // rows * num_q_heads * head_dim
+	int head_dim;
+};
+
+void ref_unpack_one(RefUnpackParams p, int64_t i) {
+	if (i >= p.total) return;
+	let hd = int64_t(p.head_dim);
+	let src = (i / hd) * 2 * hd + (i % hd);
+	p.q[i] = p.qg[src];
+	p.gate[i] = p.qg[src + hd];
+}
+
+#if !ENGINE_TARGET_CPU
+[shader("compute")]
+[numthreads(128, 1, 1)]
+void ref_unpack_q_gate(uint3 tid : SV_DispatchThreadID, uniform RefUnpackParams p) {
+	ref_unpack_one(p, int64_t(tid.x));
+}
+#else
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void ref_unpack_q_gate_cpu(uint3 gid : SV_GroupID, uniform RefUnpackParams p) {
+	ref_unpack_one(p, int64_t(gid.x));
+}
+#endif

@@ -5,7 +5,7 @@
 # the other Slang kernels. The CUDA launchers (src/shaders/cuda/ref_attn*.cu, ref_latent*.cu) are picked up by the
 # engine_slang_cuda glob, so that library only needs the ordering dependency on the generated sources.
 if(SLANGC)
-	set(REF_ATTN_KERNELS ref_attention:ref_attn_decode ref_latent:ref_latent_decode)
+	set(REF_ATTN_KERNELS ref_attention:ref_attn_decode ref_attention:ref_unpack_q_gate ref_latent:ref_latent_decode)
 	set(REF_ATTN_GENERATED "")
 	set(REF_ATTN_CPU_SOURCES "")
 	foreach(item ${REF_ATTN_KERNELS})
@@ -41,6 +41,7 @@ if(SLANGC)
 	if(REF_ATTN_SPIRV_VAL)
 		add_custom_target(ref_attn_spirv_val
 			COMMAND ${REF_ATTN_SPIRV_VAL} ${SLANG_OUT}/ref_attn_decode.spv
+			COMMAND ${REF_ATTN_SPIRV_VAL} ${SLANG_OUT}/ref_unpack_q_gate.spv
 			COMMAND ${REF_ATTN_SPIRV_VAL} ${SLANG_OUT}/ref_latent_decode.spv
 			DEPENDS ref_attn_slang)
 	endif()
@@ -70,7 +71,7 @@ if(SLANGC)
 	set(REF_LIN_SLANG_INCLUDE_DIR ${REF_LIN_SLANG_BIN_DIR}/../include)
 	set(REF_LIN_SLANG_OUT ${PROJECT_BINARY_DIR}/slang)
 	file(MAKE_DIRECTORY ${REF_LIN_SLANG_OUT})
-	set(REF_LIN_KERNELS ref_gemm:ref_gemm_f16 ref_trellis:ref_trellis_reconstruct ref_trellis:ref_had128)
+	set(REF_LIN_KERNELS ref_gemm:ref_gemm_f16 ref_gemm:ref_gemm_nt_f16 ref_trellis:ref_trellis_reconstruct ref_trellis:ref_had128)
 	set(REF_LIN_GENERATED "")
 	set(REF_LIN_CPU_SOURCES "")
 	foreach(item ${REF_LIN_KERNELS})

@@ -341,7 +341,7 @@ void test_mhc() {
 }
 
 // ---- GDN single-row forms and the KDA pieces ----
-void test_gdn() {
+void test_gdn( bool single_row_only ) {
 	std::printf( "GDN / KDA\n" );
 	GoldenRng rng( 5005 );
 	// Single-row causal conv + recurrent step (Qwen shape: 16 K heads, 32 V heads, head_dim 128), slot 2 of 3
@@ -381,6 +381,7 @@ void test_gdn() {
 		emit( "gdn_step_out", dl( dout, static_cast<size_t>( hv ) * hd ) );
 		emit( "gdn_step_state_slot2", dlf( dstate + 2 * state_stride, state_stride ) );
 	}
+	if ( single_row_only ) return;
 
 	// KDA gate projection (hidden 4096, 16 heads x 128)
 	const int H = 4096, NH = 16, KD = 128, CH = NH * KD;
@@ -474,11 +475,18 @@ int main( int argc, char** argv ) {
 	}
 	backend::set_device( 0 );
 	std::printf( "test_ops_attention (%s, dir %s)\n", args.dump ? "dump" : "check", args.dir.c_str() );
-	test_attention();
-	test_latent();
-	test_dsa();
-	test_mhc();
-	test_gdn();
+	// `--only <name>[,<name>...]` runs a subset of {attention, latent, dsa, mhc, gdn, gdn_single} (a backend that lacks some modules)
+	std::string only;
+	for ( int i = 1; i + 1 < argc; ++i ) {
+		if ( !std::strcmp( argv[i], "--only" ) ) only = std::string( "," ) + argv[i + 1] + ",";
+	}
+	auto want = [&]( const char* name ) { return only.empty() || only.find( std::string( "," ) + name + "," ) != std::string::npos; };
+	if ( want( "attention" ) ) test_attention();
+	if ( want( "latent" ) ) test_latent();
+	if ( want( "dsa" ) ) test_dsa();
+	if ( want( "mhc" ) ) test_mhc();
+	if ( want( "gdn" ) ) test_gdn( false );
+	if ( want( "gdn_single" ) ) test_gdn( true );
 	backend::device_sync();
 	for ( void* p : g_allocs ) backend::device_free( p );
 	std::printf( "%d outputs, %d failures\n", g_cases, g_fail );

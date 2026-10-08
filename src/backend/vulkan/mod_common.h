@@ -20,6 +20,9 @@ inline uint64_t rows_pos( const pod::BatchRows* r ) { return dp( r ) + offsetof(
 // Pipeline of <spv dir>/<name>.spv (env VOLTA_SPV_DIR overrides the build directory), created once. Aborts when missing
 vk::Pipeline* kernel( const char* name, uint32_t push_bytes );
 
+// Device scratch buffer of at least `bytes` for slot `slot`; grows by reallocation (syncs `stream` first: recorded commands may reference the old buffer)
+void* scratch( int slot, size_t bytes, stream_t stream );
+
 template<typename P>
 inline void launch( const char* name, const P& p, stream_t s, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1 ) {
 	static_assert( sizeof( P ) <= 256, "push-constant block exceeds the 256-byte limit" );
@@ -51,4 +54,11 @@ struct TapStoreParams { uint64_t taps, hidden, slots, positions, owner; int m, t
 struct ReduceStreamsParams { uint64_t streams, out_; int H, mode; };
 struct RefGemmParams { uint64_t x, w, out_; int m, k, n; };
 
+} // namespace engine::backend::impl
+
+namespace engine::backend::impl {
+struct RefReconParams { uint64_t codes, out_; int k_dim, n_dim, bits, cb; };
+struct RefHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };
+struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; };
+struct RefUnpackParams { uint64_t qg, q, gate; int total, head_dim; };
 } // namespace engine::backend::impl

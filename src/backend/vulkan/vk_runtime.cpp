@@ -43,7 +43,9 @@ struct Ctx {
 	VkCommandPool pool = VK_NULL_HANDLE;
 	VkPhysicalDeviceMemoryProperties mem{};
 	VkPhysicalDeviceProperties props{};
+	bool rte16 = false;   // shaderRoundingModeRTEFloat16: float -> half conversions can be made round-to-nearest-even
 	std::map<uint64_t, Alloc> allocs; // keyed by device address
+	uint64_t allocated = 0;           // bytes in allocs
 	vk_stream* default_stream = nullptr;
 	PFN_vkGetBufferDeviceAddress get_address = nullptr;
 };
@@ -60,6 +62,7 @@ struct vk_stream {
 	size_t capture_nodes = 0;
 	std::vector<VkCommandBuffer> inflight;
 	std::vector<Staging> staging;
+	size_t staging_bytes = 0;
 };
 
 struct vk_graph {
@@ -98,6 +101,12 @@ bool init_context() {
 	g.phys = devs[g.device_index];
 	vkGetPhysicalDeviceProperties( g.phys, &g.props );
 	vkGetPhysicalDeviceMemoryProperties( g.phys, &g.mem );
+	{
+		VkPhysicalDeviceFloatControlsProperties fc{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES };
+		VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &fc };
+		vkGetPhysicalDeviceProperties2( g.phys, &p2 );
+		g.rte16 = fc.shaderRoundingModeRTEFloat16 == VK_TRUE;
+	}
 
 	// Feature requirements of the Slang SPIR-V: PhysicalStorageBufferAddresses, Float16, Int64 (+ Int16 for the BF16 table)
 	VkPhysicalDeviceVulkan11Features f11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
@@ -273,6 +282,7 @@ void sync( vk_stream* s ) {
 		vkFreeMemory( g.device, st.memory, nullptr );
 	}
 	s->staging.clear();
+	s->staging_bytes = 0;
 	if ( !s->inflight.empty() ) vkFreeCommandBuffers( g.device, g.pool, uint32_t( s->inflight.size() ), s->inflight.data() );
 	s->inflight.clear();
 }
@@ -284,6 +294,45 @@ vk_stream* make_stream() {
 	VkSemaphoreCreateInfo ci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ti };
 	ENGINE_CHECK( vkCreateSemaphore( g.device, &ci, nullptr, &s->timeline ) );
 	return s;
+}
+
+
+// SPIR-V float -> half conversions without a rounding-mode decoration are round-toward-zero on NVIDIA's Vulkan driver, while the CUDA
+// kernels and the host reference round to nearest even (a 50% mismatch in the FP16 results, compounding through a model). Slang has no
+// switch for it, so the module gets OpCapability RoundingModeRTE, OpExtension "SPV_KHR_float_controls" and
+// OpExecutionMode <entry> RoundingModeRTE 16 inserted
+std::vector<uint32_t> with_rte16( const std::vector<uint32_t>& in ) {
+	constexpr uint32_t kOpExtension = 10, kOpExtInstImport = 11, kOpMemoryModel = 14, kOpEntryPoint = 15, kOpCapability = 17, kOpExecutionMode = 16;
+	std::vector<uint32_t> out( in.begin(), in.begin() + 5 );
+	size_t i = 5;
+	bool cap_done = false, ext_done = false, mode_done = false;
+	std::vector<uint32_t> entries;
+	auto emit_ext = [&]() {
+		const char name[] = "SPV_KHR_float_controls";
+		const uint32_t words = uint32_t( ( sizeof( name ) + 3 ) / 4 );
+		out.push_back( ( ( 1 + words ) << 16 ) | kOpExtension );
+		const size_t at = out.size();
+		out.resize( at + words, 0 );
+		std::memcpy( &out[at], name, sizeof( name ) );
+		ext_done = true;
+	};
+	while ( i < in.size() ) {
+		const uint32_t op = in[i] & 0xffffu, len = in[i] >> 16;
+		if ( len == 0 || i + len > in.size() ) return in;
+		if ( !cap_done && op != kOpCapability ) {
+			out.insert( out.end(), { ( 2u << 16 ) | kOpCapability, 4467u } ); // RoundingModeRTE
+			cap_done = true;
+		}
+		if ( !ext_done && cap_done && ( op == kOpExtInstImport || op == kOpMemoryModel ) ) emit_ext();
+		if ( !mode_done && op != kOpEntryPoint && !entries.empty() ) {
+			for ( uint32_t id : entries ) out.insert( out.end(), { ( 4u << 16 ) | kOpExecutionMode, id, 4462u, 16u } );
+			mode_done = true;
+		}
+		if ( op == kOpEntryPoint ) entries.push_back( in[i + 2] );
+		out.insert( out.end(), in.begin() + i, in.begin() + i + len );
+		i += len;
+	}
+	return mode_done ? out : in;
 }
 
 } // namespace
@@ -353,6 +402,8 @@ bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, strea
 		vkCmdCopyBuffer( recording( s ), sb, db, 1, &r );
 	} else {
 		ENGINE_ASSERT( !s->capture, "Vulkan backend: host transfers inside a graph capture not implemented" );
+		// Bound the host memory held by staging buffers of in-flight transfers (a weight load copies tens of GiB)
+		if ( s->staging_bytes + bytes > ( size_t( 1 ) << 29 ) && s->staging_bytes > 0 ) sync( s );
 		Staging st_buf;
 		st_buf.bytes = bytes;
 		if ( !create_buffer( bytes, true, st_buf.buffer, st_buf.memory, &st_buf.map ) ) return false;
@@ -368,6 +419,7 @@ bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, strea
 			vkCmdCopyBuffer( recording( s ), sb, st_buf.buffer, 1, &r );
 		}
 		s->staging.push_back( st_buf );
+		s->staging_bytes += bytes;
 	}
 	barrier( s->cb );
 	if ( s->capture ) ++s->capture_nodes;
@@ -427,8 +479,14 @@ bool set_device_try( int device ) {
 	return device == g.device_index;
 }
 
+// Device-local heap size less what this process allocated (no VK_EXT_memory_budget: other processes are not accounted for)
 size_t device_free_bytes( int ) {
-	return 0;   // heap budgets are not queried; callers fall back to their defaults
+	ctx();
+	uint64_t heap = 0;
+	for ( uint32_t i = 0; i < g.mem.memoryHeapCount; ++i ) {
+		if ( g.mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ) heap = MAX( heap, g.mem.memoryHeaps[i].size );
+	}
+	return heap > g.allocated ? size_t( heap - g.allocated ) : 0;
 }
 
 void* device_malloc_try( size_t bytes ) {
@@ -441,6 +499,7 @@ void* device_malloc_try( size_t bytes ) {
 	ai.buffer = a.buffer;
 	const uint64_t addr = g.get_address( g.device, &ai );
 	g.allocs[addr] = a;
+	g.allocated += a.size;
 	return reinterpret_cast<void*>( addr );
 }
 void* device_malloc( size_t bytes ) {
@@ -455,6 +514,7 @@ void device_free( void* p ) {
 	vkQueueWaitIdle( g.queue ); // cudaFree synchronizes implicitly
 	vkDestroyBuffer( g.device, it->second.buffer, nullptr );
 	vkFreeMemory( g.device, it->second.memory, nullptr );
+	g.allocated -= it->second.size;
 	g.allocs.erase( it );
 }
 
@@ -516,11 +576,12 @@ Pipeline* pipeline_create( const char* spv_path, uint32_t push_bytes ) {
 	const bool read_ok = n > 0 && std::fread( code.data(), 1, size_t( n ), f ) == size_t( n );
 	std::fclose( f );
 	if ( !read_ok ) return nullptr;
+	if ( g.rte16 && code.size() > 5 && code[0] == 0x07230203u ) code = with_rte16( code );
 
 	auto* p = new Pipeline();
 	p->push_bytes = push_bytes;
 	VkShaderModuleCreateInfo smi{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-	smi.codeSize = size_t( n );
+	smi.codeSize = code.size() * 4;
 	smi.pCode = code.data();
 	VkPushConstantRange range{ VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes };
 	VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };

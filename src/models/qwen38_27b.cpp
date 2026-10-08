@@ -265,7 +265,7 @@ bool Qwen38Pipeline::load_weights( const char* model_dir, backend::stream_t stre
 
 	// 3. LM Head, sharded across the vocabulary dimension
 	if ( fp4 ) {
-		ENGINE_ASSERT( tp_size_ > 1 || tp_ranks_ == 1, "Qwen38Pipeline: the NVFP4 checkpoint needs the vocabulary-parallel head" );
+		ENGINE_ASSERT( tp_size_ > 1, "Qwen38Pipeline: the NVFP4 checkpoint needs the vocabulary-parallel head" );
 		lm_head_ = repo.load_dense_rows_padded( "lm_head.weight", *arena_, rank_ * lm_shard_real_cols_, lm_shard_real_cols_,
 			lm_shard_cols_ - lm_shard_real_cols_, stream );
 	}
