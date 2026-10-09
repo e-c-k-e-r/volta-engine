@@ -107,7 +107,25 @@ std::string normalize_tools( const std::string& tools_json, bool* ok ) {
 
 namespace {
 
-bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ApiError* err ) {
+using ImageList = std::vector<engine::runtime::GenerationRequest::Image>;
+
+// Replaces each image placeholder token by `count` copies, consuming counts in order. Tokens of a prompt prefix expand the same
+// way (the images of the prefix come first), which is how checkpoint positions stay valid.
+std::vector<int> expand_image_tokens( const std::vector<int>& tokens, int pad_id, const ImageList& images ) {
+	if ( images.empty() || pad_id < 0 ) return tokens;
+	std::vector<int> out;
+	out.reserve( tokens.size() );
+	size_t next = 0;
+	for ( int t : tokens ) {
+		if ( t == pad_id && next < images.size() ) {
+			out.insert( out.end(), images[next++].count, pad_id );
+		}
+		else out.push_back( t );
+	}
+	return out;
+}
+
+bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ImageList* images, ApiError* err ) {
 	const auto family = gen.chat_template().model_family();
 
 	bool thinking = req.enable_thinking >= 0 ? req.enable_thinking != 0 : cfg.default_enable_thinking;
@@ -143,6 +161,47 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 	// The GLM template always opens <think>; non-thinking mode closes it right away (GLM-4.5 convention)
 	if ( !thinking && family == engine::loader::ModelFamily::GLM && ends_with( *prompt, "<think>" ) ) *prompt += "</think>";
 	*tokens = gen.tokenizer().encode( *prompt, false );
+	if ( !req.images.empty() ) {
+		const engine::loader::VisionParams* vp = gen.vision_params();
+		const int pad_id = gen.tokenizer().get_special_token( "<|image_pad|>" );
+		if ( !vp || pad_id < 0 ) {
+			err->message = "this model was loaded without a vision tower, so it cannot take image input";
+			return false;
+		}
+		for ( const std::string& bytes : req.images ) {
+			engine::loader::DecodedImage dec;
+			auto prep = std::make_shared<engine::loader::PreparedImage>();
+			std::string ierr;
+			if ( !engine::loader::decode_image( reinterpret_cast<const uint8_t*>( bytes.data() ), bytes.size(), &dec, &ierr ) ||
+			     !engine::loader::prepare_image( dec, *vp, prep.get(), &ierr ) ) {
+				err->message = ierr + " (JPEG, PNG, BMP and GIF are supported)";
+				return false;
+			}
+			engine::runtime::GenerationRequest::Image im;
+			im.grid_h = prep->grid_h / vp->merge_size;
+			im.grid_w = prep->grid_w / vp->merge_size;
+			im.count = im.grid_h * im.grid_w;
+			im.hash = prep->hash;
+			im.prepared = std::move( prep );
+			images->push_back( std::move( im ) );
+		}
+		size_t pads = 0;
+		for ( int t : *tokens ) pads += ( t == pad_id ) ? 1 : 0;
+		if ( pads != images->size() ) {
+			err->message = "the conversation holds " + std::to_string( images->size() ) + " images but the chat template placed " + std::to_string( pads ) + " (images are only allowed in user and tool messages)";
+			return false;
+		}
+		*tokens = expand_image_tokens( *tokens, pad_id, *images );
+		int at = 0, k = 0;
+		for ( size_t i = 0; i < tokens->size(); ++i ) {
+			if ( ( *tokens )[i] != pad_id ) continue;
+			if ( at == 0 ) ( *images )[k].start = static_cast<int>( i );
+			if ( ++at == ( *images )[k].count ) {
+				at = 0;
+				++k;
+			}
+		}
+	}
 	const int ctx = gen.max_context();
 	if ( tokens->empty() || static_cast<int>( tokens->size() ) + 1 >= ctx ) {
 		err->message = "this conversation is " + std::to_string( tokens->size() ) + " tokens; the context window is " + std::to_string( ctx );
@@ -157,7 +216,8 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, int* tokens, ApiError* err ) {
 	std::string prompt;
 	std::vector<int> ids;
-	if ( !render_prompt( gen, cfg, req, &prompt, &ids, err ) ) return false;
+	ImageList images;
+	if ( !render_prompt( gen, cfg, req, &prompt, &ids, &images, err ) ) return false;
 	*tokens = static_cast<int>( ids.size() );
 	return true;
 }
@@ -167,7 +227,8 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	const auto family = gen.chat_template().model_family();
 	std::string prompt;
 	std::vector<int> tokens;
-	if ( !render_prompt( gen, cfg, req, &prompt, &tokens, err ) ) return false;
+	ImageList images;
+	if ( !render_prompt( gen, cfg, req, &prompt, &tokens, &images, err ) ) return false;
 	responder->on_prompt( static_cast<int>( tokens.size() ) );
 	if ( !runtime::options().dump_requests.empty() ) {
 		const std::string path = runtime::options().dump_requests + "/req_" + std::to_string( request_id ) + ".prompt.txt";
@@ -184,6 +245,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	engine::runtime::GenerationRequest g;
 	g.req_id = request_id;
 	g.prompt_tokens = std::move( tokens );
+	g.images = std::move( images );
 	g.max_tokens = req.max_tokens > 0 ? req.max_tokens : cfg.default_max_tokens;
 	g.temperature = req.temperature >= 0.0f ? req.temperature : cfg.default_temperature;
 	g.top_p = req.top_p >= 0.0f ? req.top_p : cfg.default_top_p;
@@ -201,9 +263,10 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	// reply there, so the end of the whole prompt is never a prefix of it but this boundary is.
 	{
 		const bool glm = family == engine::loader::ModelFamily::GLM;
+		const int pad_id = gen.tokenizer().get_special_token( "<|image_pad|>" );
 		auto add = [&]( size_t at, bool pinned, size_t min_tokens ) {
 			if ( at == std::string::npos || at == 0 ) return;
-			const std::vector<int> head = gen.tokenizer().encode( prompt.substr( 0, at ), false );
+			const std::vector<int> head = expand_image_tokens( gen.tokenizer().encode( prompt.substr( 0, at ), false ), pad_id, g.images );
 			if ( head.size() < min_tokens || head.size() >= g.prompt_tokens.size() ) return;
 			if ( !std::equal( head.begin(), head.end(), g.prompt_tokens.begin() ) ) return;
 			if ( !g.checkpoint_at.empty() && static_cast<int>( head.size() ) <= g.checkpoint_at.back().pos ) return;

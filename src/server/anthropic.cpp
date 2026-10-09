@@ -1,4 +1,5 @@
 #include "engine/server/chat.h"
+#include "engine/loader/image.h"
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -33,7 +34,47 @@ bool text_of( const json& v, std::string* out, ApiError* err ) {
 	return true;
 }
 
-bool normalize_messages( const json& j, json* out, ApiError* err ) {
+// An Anthropic image block ({type: image, source: {type: base64, media_type, data}}) -> template part; the bytes go to `images`
+bool image_part( const json& b, json* part, std::vector<std::string>* images, ApiError* err ) {
+	const json src = b.contains( "source" ) && b["source"].is_object() ? b["source"] : json::object();
+	std::string bytes;
+	if ( src.value( "type", std::string() ) != "base64" || !src.contains( "data" ) || !src["data"].is_string() ) {
+		return fail( err, "image source must be {type: base64, media_type, data} (remote URLs are not fetched)" );
+	}
+	if ( !engine::loader::base64_decode( src["data"].get<std::string>(), &bytes ) || bytes.empty() ) return fail( err, "image source holds invalid base64" );
+	images->push_back( std::move( bytes ) );
+	*part = { { "type", "image" } };
+	return true;
+}
+
+// tool_result content: a string, or text and image blocks (a string when there are no images)
+bool tool_content( const json& v, json* out, std::vector<std::string>* images, ApiError* err ) {
+	bool has_image = false;
+	if ( v.is_array() ) {
+		for ( const auto& b : v ) has_image = has_image || ( b.is_object() && b.value( "type", std::string() ) == "image" );
+	}
+	if ( !has_image ) {
+		std::string text;
+		if ( !text_of( v, &text, err ) ) return false;
+		*out = text;
+		return true;
+	}
+	json parts = json::array();
+	for ( const auto& b : v ) {
+		const std::string type = b.is_object() ? b.value( "type", std::string() ) : std::string( b.is_string() ? "text" : "" );
+		if ( type == "text" ) parts.push_back( { { "type", "text" }, { "text", b.is_string() ? b.get<std::string>() : b.value( "text", std::string() ) } } );
+		else if ( type == "image" ) {
+			json part;
+			if ( !image_part( b, &part, images, err ) ) return false;
+			parts.push_back( part );
+		}
+		else return fail( err, "unsupported content block type '" + type + "' in a tool result" );
+	}
+	*out = parts;
+	return true;
+}
+
+bool normalize_messages( const json& j, json* out, std::vector<std::string>* images, ApiError* err ) {
 	*out = json::array();
 	if ( j.contains( "system" ) && !j["system"].is_null() ) {
 		std::string sys;
@@ -61,10 +102,22 @@ bool normalize_messages( const json& j, json* out, ApiError* err ) {
 		if ( role == "user" ) {
 			std::string pending;
 			bool has_pending = false;
-			auto flush = [&]() {
-				if ( has_pending ) out->push_back( { { "role", "user" }, { "content", pending } } );
+			json parts = json::array();
+			bool has_image = false;
+			auto flush_text = [&]() {
+				if ( has_pending ) parts.push_back( { { "type", "text" }, { "text", pending } } );
 				pending.clear();
 				has_pending = false;
+			};
+			// Text-only messages keep the plain string form; a message with images carries its parts in order
+			auto flush = [&]() {
+				flush_text();
+				if ( !parts.empty() ) {
+					if ( has_image ) out->push_back( { { "role", "user" }, { "content", parts } } );
+					else out->push_back( { { "role", "user" }, { "content", parts[0]["text"] } } );
+				}
+				parts = json::array();
+				has_image = false;
 			};
 			for ( const auto& b : content ) {
 				const std::string type = b.is_object() ? b.value( "type", std::string() ) : std::string( b.is_string() ? "text" : "" );
@@ -72,15 +125,25 @@ bool normalize_messages( const json& j, json* out, ApiError* err ) {
 					pending += b.is_string() ? b.get<std::string>() : b.value( "text", std::string() );
 					has_pending = true;
 				}
+				else if ( type == "image" ) {
+					flush_text();
+					json part;
+					if ( !image_part( b, &part, images, err ) ) return false;
+					parts.push_back( part );
+					has_image = true;
+				}
 				else if ( type == "tool_result" ) {
 					flush();
-					std::string text;
-					if ( !text_of( b.contains( "content" ) ? b["content"] : json(), &text, err ) ) return false;
-					if ( b.value( "is_error", false ) && !text.empty() ) text = "Error: " + text;
-					out->push_back( { { "role", "tool" }, { "tool_call_id", b.value( "tool_use_id", std::string() ) }, { "content", text } } );
+					json tc;
+					if ( !tool_content( b.contains( "content" ) ? b["content"] : json(), &tc, images, err ) ) return false;
+					if ( b.value( "is_error", false ) ) {
+						if ( tc.is_string() && !tc.get<std::string>().empty() ) tc = "Error: " + tc.get<std::string>();
+						else if ( tc.is_array() ) tc.insert( tc.begin(), { { "type", "text" }, { "text", "Error:" } } );
+					}
+					out->push_back( { { "role", "tool" }, { "tool_call_id", b.value( "tool_use_id", std::string() ) }, { "content", tc } } );
 				}
 				else {
-					return fail( err, "unsupported content block type '" + type + "' (only text and tool_result are supported)" );
+					return fail( err, "unsupported content block type '" + type + "' (text, image and tool_result are supported)" );
 				}
 			}
 			flush();
@@ -241,7 +304,7 @@ public:
 		ChatRequest r;
 		r.model = j.value( "model", std::string() );
 		json messages;
-		if ( !normalize_messages( j, &messages, err ) ) return false;
+		if ( !normalize_messages( j, &messages, &r.images, err ) ) return false;
 		r.messages_json = messages.dump();
 
 		bool tools_off = j.contains( "tool_choice" ) && j["tool_choice"].is_object() && j["tool_choice"].value( "type", std::string() ) == "none";

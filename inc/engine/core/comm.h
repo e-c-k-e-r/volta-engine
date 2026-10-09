@@ -13,10 +13,11 @@ static constexpr size_t kMeshStagingBytes = 16 * 6 * 1024 * 1024;
 
 struct CollectiveRing {
 	int   rank;
+	int   nranks = ENGINE_NUM_GPUS;   // 2 or 4
 	void* peer_ptrs[ENGINE_NUM_GPUS];
 	void* sync_flags[ENGINE_NUM_GPUS]; // flag pages; sequence counter is device-resident (graph-safe)
 
-	void init( int local_rank, void* const peer_staging[ENGINE_NUM_GPUS], void* const peer_flags[ENGINE_NUM_GPUS] );
+	void init( int local_rank, int ranks, void* const peer_staging[ENGINE_NUM_GPUS], void* const peer_flags[ENGINE_NUM_GPUS] );
 
 	void all_reduce_rms_norm(
 		pod::TensorView& x,
@@ -38,7 +39,8 @@ void init_4gpu_mesh(
 	CollectiveRing rings[ENGINE_NUM_GPUS],
 	void* staging_ptrs[ENGINE_NUM_GPUS],
 	void* flag_ptrs[ENGINE_NUM_GPUS],
-	size_t staging_bytes = kMeshStagingBytes
+	size_t staging_bytes = kMeshStagingBytes,
+	int ranks = ENGINE_NUM_GPUS
 );
 
 void destroy_4gpu_mesh(

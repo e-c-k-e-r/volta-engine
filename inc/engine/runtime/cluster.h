@@ -7,7 +7,9 @@
 #include "engine/models/model.h"
 #include "engine/runtime/rank_pool.h"
 #include "engine/runtime/dflash2_runner.h"
+#include "engine/runtime/speculator.h"
 #include "engine/runtime/sampling.h"
+#include "engine/runtime/multimodal.h"
 #include <functional>
 #include "engine/backend/types.h"
 #include <map>
@@ -25,6 +27,7 @@ struct ClusterConfig {
 	std::string draft_model_dir; // empty => no speculator
 	size_t arena_bytes = 0;      // 0 => per-model default
 	int tp = ENGINE_NUM_GPUS;    // ranks: 1 (single device, no collective) or ENGINE_NUM_GPUS
+	bool speculate = false;      // build a speculator (the MTP head, or DFlash2 when draft_model_dir is set)
 };
 
 // TP model instance (1 or ENGINE_NUM_GPUS ranks): per-rank arenas, streams, NVLink mesh, pipelines and a persistent
@@ -87,6 +90,13 @@ public:
 	void warm_graphs( int max_m, int slot = 0 );
 
 	void reset_slot( int slot );
+
+	// Multimodal input. A slot with a layout rotates its image tokens (and the text after them) with M-RoPE positions and takes the
+	// image embeddings in place of the placeholder tokens' embeddings; set it before prefilling, reset_slot clears it.
+	void set_slot_mm( int slot, MmLayout layout );
+	void apply_mrope( pod::BatchRows& rows ) const;
+	const engine::loader::VisionParams* vision_params() const { return models_[0]->vision_params(); }
+	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out );
 	void checkpoint( int slot );
 	void rollback( int slot );
 	void set_spec_snapshot( bool on );
@@ -94,12 +104,17 @@ public:
 
 	// Speculative decoding (DFlash2). The round itself lives in DFlash2Runner.
 	bool has_speculator() const { return runner_ != nullptr; }
-	DFlash2Runner& spec() { return *runner_; }
+	Speculator& speculator() { return *runner_; }
+	DFlash2Runner& spec() { ENGINE_ASSERT( dflash_ != nullptr, "ModelCluster::spec: the speculator is not DFlash2" ); return *dflash_; }
 	bool spec_owns( int slot ) const { return runner_ && runner_->owns( slot ); }
 	SpecResult speculate( int slot, int anchor, int pos, float depth_threshold = -1.0f,
 		const SamplingParams* sp = nullptr, Rng* rng = nullptr ) {
 		return runner_->speculate( slot, anchor, pos, depth_threshold, sp, rng );
 	}
+
+	// MTP head steps on all ranks (see ModelPipeline::mtp_step); positions pos0 .. pos0 + count - 1 of `slot`, tokens[j] follows position pos0 + j.
+	void mtp_step( int slot, int pos0, int count, const int* tokens, int hidden_mode, int hist_row0, bool logits_last );
+	void mtp_save_hist( int src_row, int rows, int dst_row );
 
 	// Runs fn( rank ) on every rank's pinned worker thread and waits for all of them.
 	void run_ranks( const std::function<void( int )>& fn ) { pool_.run( fn ); }
@@ -122,7 +137,10 @@ private:
 	backend::stream_t streams_[ENGINE_NUM_GPUS] = {};
 	void* staging_ptrs_[ENGINE_NUM_GPUS] = {};
 	void* flag_ptrs_[ENGINE_NUM_GPUS] = {};
-	std::unique_ptr<DFlash2Runner> runner_;
+	std::unique_ptr<Speculator> runner_;
+	DFlash2Runner* dflash_ = nullptr;   // runner_ when it is DFlash2
+	std::vector<MmLayout> slot_mm_;   // per slot
+	int mm_slots_ = 0;                // slots with a non-empty layout
 	std::map<size_t, std::vector<void*>> snapshot_free_[ENGINE_NUM_GPUS]; // pinned buffers by rounded size
 	std::mutex snapshot_mtx_;
 	RankPool pool_;

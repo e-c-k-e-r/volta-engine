@@ -31,6 +31,7 @@ mirrored implementation). Verified by `test_nvfp4_linear`, `test_ops_linear`.
 | `moe.cu`, `expert_tier.cu` | router, dispatch histogram / scatter, combine, two-tier expert residency | CudaSm70 | `test_moe`, `test_ops_moe` |
 | `mhc.cu` | hyper-connection mix, collapse + norm, update | Portable | `test_mhc`, `test_slang_kernels` |
 | `norm.cu`, `rope.cu`, `swiglu.cu`, `embedding.cu` | RMSNorm (plain, heads, gated), RoPE, SwiGLU, embedding gather | Portable | `test_norm`, `test_rope`, `test_slang_kernels` |
+| `vision.cu` | vision tower operators: patch-embedding GEMM, LayerNorm, qkv bias + 2-D rotary, tensor-core flash attention (head_dim 72), bias + GELU | CudaSm70 | `test_vision` |
 | `linear_trellis.cu` | trellis `Linear` dispatch (GEMM / GEMV / recon by M) | CudaSm70 | `test_ops_linear`, `bench_decode` |
 
 ## Portable Slang kernels: `src/kernels/slang/`

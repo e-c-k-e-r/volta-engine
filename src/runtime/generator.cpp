@@ -34,6 +34,7 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 	cc.model_type = config_.model_type;
 	cc.model_dir = config_.model_dir;
 	cc.tp = config_.tp_size;
+	cc.speculate = config_.use_speculation;
 	if ( config_.use_speculation ) cc.draft_model_dir = config_.draft_model_dir;
 	if ( !cluster_.init( cc ) ) {
 		LOG_ERROR( "Generator: model cluster init failed\n" );
@@ -99,6 +100,12 @@ void Generator::admit_pending() {
 		slot.req = std::move( pending_queue_.front() );
 		pending_queue_.erase( pending_queue_.begin() );
 		slot.all_tokens = slot.req.prompt_tokens;
+		if ( !slot.req.images.empty() ) {
+			slot.key_tokens = slot.req.prompt_tokens;
+			for ( const GenerationRequest::Image& im : slot.req.images ) {
+				for ( int i = 0; i < im.count; ++i ) slot.key_tokens[im.start + i] = mm_key_token( im.hash, i, cluster_.metadata().vocab_size );
+			}
+		}
 		slot.sp.temperature = slot.req.temperature;
 		slot.sp.top_p = slot.req.top_p;
 		slot.sp.top_k = MAX( 1, MIN( slot.req.top_k, kSampleTopK ) );
@@ -215,17 +222,48 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 		completed_requests_++;
 	}
 	slot.active = false;
+	if ( !slot.req.images.empty() ) cluster_.set_slot_mm( s, MmLayout() );
+	slot.key_tokens.clear();
+	slot.req.images.clear();
+}
+
+std::shared_ptr<const std::vector<backend::half_t>> Generator::image_embeddings( const GenerationRequest::Image& im ) {
+	auto it = image_cache_.find( im.hash );
+	if ( it != image_cache_.end() ) {
+		image_cache_lru_.remove( im.hash );
+		image_cache_lru_.push_front( im.hash );
+		return it->second;
+	}
+	if ( !im.prepared ) return nullptr;
+	auto out = std::make_shared<std::vector<backend::half_t>>();
+	const auto t0 = std::chrono::steady_clock::now();
+	if ( !cluster_.encode_image( *im.prepared, out.get() ) ) return nullptr;
+	LOG_INFO( "[vision] encoded %dx%d patches -> %d tokens in %.0f ms\n", im.prepared->grid_h, im.prepared->grid_w, im.count,
+		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
+	constexpr size_t kCacheBytes = 1024ULL << 20;
+	image_cache_bytes_ += out->size() * sizeof( backend::half_t );
+	image_cache_[im.hash] = out;
+	image_cache_lru_.push_front( im.hash );
+	while ( image_cache_bytes_ > kCacheBytes && image_cache_lru_.size() > 1 ) {
+		const uint64_t victim = image_cache_lru_.back();
+		image_cache_lru_.pop_back();
+		image_cache_bytes_ -= image_cache_[victim]->size() * sizeof( backend::half_t );
+		image_cache_.erase( victim );
+	}
+	return out;
 }
 
 void Generator::prefill_slot( int s ) {
 	Slot& slot = slots_[s];
 	const std::vector<int>& prompt = slot.req.prompt_tokens;
 	const int n = static_cast<int>( prompt.size() );
+	// Prefix-cache keys: image placeholders are keyed by the image content, so the same prompt with another picture never matches
+	const std::vector<int>& key_prompt = slot.key_tokens.empty() ? prompt : slot.key_tokens;
 	// Resume from the deepest cached prefix of the prompt, else start cold (which also hands the drafter to this slot)
 	int pos = 0;
 	PrefixCache::Entry* node = nullptr;
 	if ( prefix_cache_ && n >= kPrefixMinTokens ) {
-		if ( PrefixCache::Entry* hit = prefix_cache_->find( prompt ) ) {
+		if ( PrefixCache::Entry* hit = prefix_cache_->find( key_prompt ) ) {
 			if ( prefix_cache_->restore( s, hit ) ) {
 				node = hit;
 				pos = static_cast<int>( hit->tokens.size() );
@@ -234,6 +272,30 @@ void Generator::prefill_slot( int s ) {
 		}
 	}
 	if ( pos == 0 ) cluster_.reset_slot( s );
+	if ( !slot.req.images.empty() ) {
+		MmLayout layout;
+		for ( const GenerationRequest::Image& im : slot.req.images ) {
+			MmImage mi;
+			mi.start = im.start;
+			mi.count = im.count;
+			mi.grid_h = im.grid_h;
+			mi.grid_w = im.grid_w;
+			mi.hash = im.hash;
+			// Rows before the resume point are already in the restored KV; only images that reach past it need embeddings
+			if ( im.start + im.count > pos ) {
+				mi.embeds = image_embeddings( im );
+				if ( !mi.embeds ) {
+					LOG_ERROR( "[vision] slot %d: image encoding failed; finishing the request\n", s );
+					slot.metrics.prompt_tokens = n;
+					slot.metrics.first_token_time = std::chrono::steady_clock::now();
+					finish_slot( s, FinishReason::Cancelled );
+					return;
+				}
+			}
+			layout.images.push_back( std::move( mi ) );
+		}
+		cluster_.set_slot_mm( s, std::move( layout ) );
+	}
 	// Checkpoints on the way through: the requested ones (end of the system prompt, turn boundary) plus one every
 	// prefix_interval tokens of a long prompt. Each stores only the KV rows since the previous one.
 	if ( prefix_cache_ && n >= kPrefixMinTokens ) {
@@ -270,7 +332,8 @@ void Generator::prefill_slot( int s ) {
 // Snapshots slot s's prompt up to `tokens` as a child of `parent` (KV rows since the parent only). Returns the cache node for
 // that prefix, an existing one if present, or nullptr if it could not be stored.
 PrefixCache::Entry* Generator::store_prefix( int s, PrefixCache::Entry* parent, int tokens, bool pinned, bool with_taps ) {
-	const std::vector<int> key( slots_[s].req.prompt_tokens.begin(), slots_[s].req.prompt_tokens.begin() + tokens );
+	const std::vector<int>& full = slots_[s].key_tokens.empty() ? slots_[s].req.prompt_tokens : slots_[s].key_tokens;
+	const std::vector<int> key( full.begin(), full.begin() + tokens );
 	if ( PrefixCache::Entry* e = prefix_cache_->exact( key ) ) return e;
 	ModelCluster::SeqSnapshot snap;
 	if ( !cluster_.save_snapshot( s, parent ? static_cast<int>( parent->tokens.size() ) : 0, tokens, &snap, with_taps ) ) return nullptr;
@@ -362,6 +425,9 @@ void Generator::step_batch() {
 	}
 	if ( single_spec ) {
 		slots_[ids[0]].ctrl.observe_dense( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - dense_t0 ).count() );
+	}
+	if ( cluster_.has_speculator() ) {
+		for ( int i = 0; i < n; ++i ) cluster_.speculator().on_dense_row( ids[i], tokens[i], positions[i], i );
 	}
 	for ( int i = 0; i < n; ++i ) {
 		Slot& slot = slots_[ids[i]];

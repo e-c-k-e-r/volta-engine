@@ -44,13 +44,16 @@ set(ENGINE_HOST_SOURCES
 	src/loader/tokenizer.cpp
 	src/loader/chat_template.cpp
 	src/loader/jinja.cpp
+	src/loader/image.cpp
 	src/models/model.cpp
 	src/models/qwen3_5.cpp
+	src/models/qwen3_vision.cpp
 	src/models/glm5_next.cpp
 	src/runtime/options.cpp
 	src/runtime/kv_cache.cpp
 	src/runtime/cluster.cpp
 	src/runtime/dflash2_runner.cpp
+	src/runtime/mtp_runner.cpp
 	src/runtime/prefix_cache.cpp
 	src/runtime/generator.cpp
 	src/server/config.cpp
@@ -79,6 +82,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/expert_tier.cu
 	src/backend/cuda/modules/mhc.cu
 	src/backend/cuda/modules/embedding.cu
+	src/backend/cuda/modules/vision.cu
 	src/backend/cuda/modules/linear_trellis.cu
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
@@ -217,6 +221,10 @@ add_executable(test_jinja tests/2_parity/test_jinja.cpp)
 target_link_libraries(test_jinja PRIVATE engine_kernels)
 target_compile_definitions(test_jinja PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
 set_target_properties(test_jinja PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_image tests/2_parity/test_image.cpp)
+target_link_libraries(test_image PRIVATE engine_kernels)
+target_compile_definitions(test_image PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
+set_target_properties(test_image PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_output_parser tests/2_parity/test_output_parser.cpp)
 target_link_libraries(test_output_parser PRIVATE engine_kernels)
@@ -362,6 +370,13 @@ set_target_properties(test_dflash2_blocks PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$
 add_executable(test_dflash2_quant tests/2_parity/test_dflash2_quant.cpp)
 target_link_libraries(test_dflash2_quant PRIVATE engine_kernels)
 
+add_executable(test_vision tests/4_coherence/test_vision.cpp)
+target_link_libraries(test_vision PRIVATE engine_kernels)
+target_compile_definitions(test_vision PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
+set_target_properties(test_vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_mtp tests/4_coherence/test_mtp.cpp)
+target_link_libraries(test_mtp PRIVATE engine_kernels)
+set_target_properties(test_mtp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 add_executable(test_prefix_restore tests/4_coherence/test_prefix_restore.cpp)
 target_link_libraries(test_prefix_restore PRIVATE engine_kernels)
 set_target_properties(test_prefix_restore PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

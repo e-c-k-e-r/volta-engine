@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Black-box checks of the chat APIs against a running volta_server (OpenAI /v1/chat/completions, and /v1/messages when
 # the server routes it). Usage: python3 -I api_checks.py http://127.0.0.1:8000
-import json, sys, urllib.request, urllib.error, socket, time
+import base64, json, os, sys, urllib.request, urllib.error, socket, time
 
 BASE = sys.argv[1].rstrip("/")
 failures = 0
@@ -93,7 +93,7 @@ check(len(tcs) == 1 and tcs[0]["function"]["name"] == "get_weather" and ev[-1]["
 
 # errors
 for bad, what in (({"messages": []}, "empty messages"), ({"nope": 1}, "missing messages"), ({"messages": [{"role": "user", "content": "x"}], "temperature": 9}, "bad temperature"),
-                  ({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]}, "image part")):
+                  ({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]}, "malformed image part")):
     code, body = post("/v1/chat/completions", bad)
     check(code == 400 and "error" in json.loads(body), "400 for " + what, body)
 code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "word " * int(CTX * 1.5)}], "max_tokens": 4})
@@ -188,6 +188,29 @@ if "prefix_cache" in metrics:
     check(h1 - h0 >= 2, "prefix cache hits on a shared system prompt", (h0, h1))
     check((m1["hit_tokens"] - m0["hit_tokens"]) / max(1, h1 - h0) > 3000, "hits resume deep into the shared system prompt", (m0, m1))
     check("259" in a1 and a1 == a3, "answer after a prefix hit equals the cold answer", (a1, a2, a3))
+
+# ---- images (Qwen vision tower); GLM has none and must say so
+IMG = base64.b64encode(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "image_shapes.png"), "rb").read()).decode()
+def oai_image(q):
+    return {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + IMG}}, {"type": "text", "text": q}]}], "max_tokens": 16}
+def ant_image(q):
+    return {"model": "claude-x", "max_tokens": 16, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": IMG}}, {"type": "text", "text": q}]}]}
+if IS_GLM:
+    code, body = post("/v1/chat/completions", oai_image("What color is the circle?"))
+    check(code == 400 and "vision" in body, "image input is refused without a vision tower", body)
+else:
+    code, body = post("/v1/chat/completions", oai_image("What color is the circle? Answer with one word."))
+    a1 = json.loads(body)["choices"][0]["message"]["content"] if code == 200 else body
+    check(code == 200 and "blue" in a1.lower(), "OpenAI image_url: the model sees the circle's color", a1)
+    code, body = post("/v1/messages", ant_image("What color is the rectangle at the top left? Answer with one word."))
+    a2 = json.loads(body)["content"][0]["text"] if code == 200 else body
+    check(code == 200 and "red" in a2.lower(), "Anthropic image block: the model sees the rectangle's color", a2)
+    code, body = post("/v1/chat/completions", oai_image("What color is the circle? Answer with one word."))
+    check(code == 200 and json.loads(body)["choices"][0]["message"]["content"] == a1, "a repeated image (embedding cache) gives the same answer", body)
+    code, body = post("/v1/messages/count_tokens", ant_image("hi"))
+    check(code == 200 and json.loads(body)["input_tokens"] > 300, "count_tokens includes the image tokens", body)
+    code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}]}]})
+    check(code == 400, "remote image URLs are rejected", body)
 
 # client disconnect frees the slot
 s = socket.create_connection((BASE.split("//")[1].split(":")[0], int(BASE.rsplit(":", 1)[1])))

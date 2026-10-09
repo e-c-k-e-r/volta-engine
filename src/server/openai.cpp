@@ -1,4 +1,5 @@
 #include "engine/server/chat.h"
+#include "engine/loader/image.h"
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -19,7 +20,7 @@ bool fail( ApiError* err, const std::string& message, const char* type = "invali
 }
 
 // OpenAI content (string | null | [parts]) -> template content (string | [text parts])
-bool normalize_content( const json& c, json* out, ApiError* err ) {
+bool normalize_content( const json& c, json* out, std::vector<std::string>* images, ApiError* err ) {
 	if ( c.is_null() ) {
 		*out = "";
 		return true;
@@ -37,8 +38,20 @@ bool normalize_content( const json& c, json* out, ApiError* err ) {
 		else if ( p.is_object() && p.contains( "type" ) && p["type"] == "text" && p.contains( "text" ) && p["text"].is_string() ) {
 			parts.push_back( { { "type", "text" }, { "text", p["text"] } } );
 		}
+		else if ( p.is_object() && p.value( "type", std::string() ) == "image_url" ) {
+			const json& iu = p.contains( "image_url" ) ? p["image_url"] : json();
+			const std::string url = iu.is_string() ? iu.get<std::string>() : ( iu.is_object() ? iu.value( "url", std::string() ) : std::string() );
+			const size_t comma = url.find( ',' );
+			std::string bytes;
+			if ( url.compare( 0, 5, "data:" ) != 0 || comma == std::string::npos || url.find( ";base64" ) > comma ) {
+				return fail( err, "image_url must be a base64 data: URL (remote URLs are not fetched)" );
+			}
+			if ( !engine::loader::base64_decode( url.substr( comma + 1 ), &bytes ) || bytes.empty() ) return fail( err, "image_url holds invalid base64" );
+			images->push_back( std::move( bytes ) );
+			parts.push_back( { { "type", "image" } } );
+		}
 		else if ( p.is_object() && p.contains( "type" ) && p["type"].is_string() ) {
-			return fail( err, "unsupported content part type '" + p["type"].get<std::string>() + "' (only text is supported)" );
+			return fail( err, "unsupported content part type '" + p["type"].get<std::string>() + "' (text and image_url are supported)" );
 		}
 		else {
 			return fail( err, "malformed content part" );
@@ -48,7 +61,7 @@ bool normalize_content( const json& c, json* out, ApiError* err ) {
 	return true;
 }
 
-bool normalize_messages( const json& messages, json* out, ApiError* err ) {
+bool normalize_messages( const json& messages, json* out, std::vector<std::string>* images, ApiError* err ) {
 	if ( !messages.is_array() || messages.empty() ) return fail( err, "messages must be a non-empty array" );
 	*out = json::array();
 	for ( const auto& m : messages ) {
@@ -59,7 +72,7 @@ bool normalize_messages( const json& messages, json* out, ApiError* err ) {
 		json nm = json::object();
 		nm["role"] = role;
 		json content;
-		if ( !normalize_content( m.contains( "content" ) ? m["content"] : json(), &content, err ) ) return false;
+		if ( !normalize_content( m.contains( "content" ) ? m["content"] : json(), &content, images, err ) ) return false;
 		nm["content"] = content;
 		if ( role == "assistant" ) {
 			for ( const char* key : { "reasoning_content", "reasoning" } ) {
@@ -217,7 +230,7 @@ public:
 		r.model = j.value( "model", std::string() );
 		if ( !j.contains( "messages" ) ) return fail( err, "messages is required" );
 		json messages;
-		if ( !normalize_messages( j["messages"], &messages, err ) ) return false;
+		if ( !normalize_messages( j["messages"], &messages, &r.images, err ) ) return false;
 		r.messages_json = messages.dump();
 
 		bool tools_off = j.contains( "tool_choice" ) && j["tool_choice"].is_string() && j["tool_choice"] == "none";

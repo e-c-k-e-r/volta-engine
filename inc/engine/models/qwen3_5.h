@@ -2,6 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/models/model.h"
+#include "engine/models/qwen3_vision.h"
 #include "engine/runtime/kv_cache.h"
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
@@ -133,6 +134,12 @@ public:
 	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
 	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;
 	void reset_state( int slot_id = 0 ) override;
+	bool has_mtp() const override { return mtp_on_; }
+	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
+	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
+	bool inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream = nullptr ) override;
+	const engine::loader::VisionParams* vision_params() const override { return vision_.loaded() ? &vision_.params() : nullptr; }
+	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
 
 	pod::TensorView& logits() override { return logits_; }
 	const pod::TensorView& logits() const override { return logits_; }
@@ -143,6 +150,8 @@ public:
 
 private:
 	void set_rows( int m );
+	// One decoder layer over the m rows of d_rows_ (hidden_states_ in and out); the attention / recurrent layer counters advance
+	void layer_forward( const Qwen3_5LayerWeights& lw, int& full_attn_idx, int& linear_idx, int m, backend::stream_t stream );
 	// Layer stack + LM head for m rows; reads slots/positions from d_rows_ only (graph body)
 	void forward_body( int m, backend::stream_t stream );
 
@@ -221,6 +230,13 @@ private:
 	int* d_samp_idx_ = nullptr;
 	int* d_taps_owner_ = nullptr;
 
+	// MTP head (speculator=mtp): fc over [embedding | hidden], one full-attention decoder layer, final norm; shares the LM head
+	bool mtp_on_ = false;
+	pod::LinearWeight mtp_fc_;
+	Qwen3_5LayerWeights mtp_layer_;
+	pod::TensorView mtp_pre_norm_e_, mtp_pre_norm_h_, mtp_norm_;
+	pod::TensorView mtp_emb_, mtp_xe_, mtp_xh_, mtp_stage_, mtp_in_, mtp_out_, mtp_hist_, mtp_chain_;
+	Qwen3VisionTower vision_;   // rank 0 only
 	pod::TensorView embed_tokens_;
 	pod::TensorView final_norm_;
 	pod::LinearWeight lm_head_;

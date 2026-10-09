@@ -5,7 +5,7 @@
 // <0 (or 0 for sizes) means "unset: use the model's default" where a help text says so.
 
 OPTION( std::string, log_level, "info", "log threshold: error, warn, info or debug" )
-OPTION( int, tp, -1, "rank count, 1 or 4; <0 uses the launch's tp_size" )
+OPTION( int, tp, -1, "rank count: 1, 2 or 4 (GLM: 1 or 4); <0 uses the launch's tp_size" )
 OPTION( int, arena_gib, -1, "per-GPU arena in GiB; <=0 sizes it from the device's free memory minus vram_reserve_mib" )
 OPTION( int, vram_reserve_mib, -1, "memory left outside the arena for graphs, workspaces and the CUDA context; <0 uses the model's default (Qwen 1536, GLM 288)" )
 OPTION( int, max_seq, 0, "context window per slot in tokens (sizes the KV pool); 0 = the model default (Qwen 32768, GLM 12288)" )
@@ -16,8 +16,11 @@ OPTION( std::string, kv_format, "", "KV cache format: fp16, fp8, k8v4 or nvfp4; 
 OPTION( double, expert_cache, 1.0, "GLM resident routed-expert fraction in (0, 1]; below 1 enables the two-tier expert cache" )
 OPTION( int, expert_adapt_every, 64, "decode steps between expert residency rebalances (0 = never)" )
 OPTION( int, expert_swaps, -1, "maximum expert swaps per rebalance; <0 = the tier default" )
+OPTION( std::string, speculator, "dflash", "speculation source: dflash (needs a draft model) or mtp (the checkpoint's own multi-token-prediction head, Qwen)" )
+OPTION( int, mtp_depth, 7, "most draft tokens per round with speculator=mtp (1 to 7); the head stops chaining earlier when its recent accuracy is low" )
 OPTION( bool, draft_tp, true, "false runs the drafter on rank 0 only" )
 OPTION( bool, dsa, true, "GLM sparse attention indexer (top-2048 key selection); false attends densely" )
+OPTION( int, max_image_tokens, 1024, "largest image the vision tower accepts, in language-model tokens (4 patches each; sizes its scratch and caps the resize); 0 = image input off" )
 OPTION( bool, spec_ctrl, true, "adaptive speculation controller; false always speculates" )
 DEBUG_OPTION( bool, expert_log, false, "per-rebalance expert tier statistics" )
 DEBUG_OPTION( bool, dsa_diag, false, "sparse-attention indexer diagnostics" )

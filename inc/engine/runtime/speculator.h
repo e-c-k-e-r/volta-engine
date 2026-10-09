@@ -1,0 +1,45 @@
+#pragma once
+
+#include "engine/core/batch.h"
+#include "engine/runtime/sampling.h"
+
+namespace engine::runtime {
+
+// Outcome of one speculative round on a single slot.
+struct SpecResult {
+	int proposed = 0;                  // draft tokens submitted for verification
+	int accepted = 0;                  // draft tokens matching the target
+	int emitted[pod::MAX_BATCH] = {};  // tokens committed this round (accepted drafts + correction/bonus)
+	int emitted_count = 0;
+	int next_pos = 0;                  // position of the next anchor (== tokens committed to KV)
+};
+
+// A source of draft tokens for the target's batched verify (DFlash2: a block drafter reading tapped hidden states; MTP: the
+// checkpoint's own next-token head). One slot at a time owns the speculator's context; other slots decode normally.
+class Speculator {
+public:
+	virtual ~Speculator() = default;
+	virtual void shutdown() = 0;
+
+	virtual void claim( int slot ) = 0;     // the slot takes over the context (a cold start at position 0)
+	virtual void release( int slot ) = 0;   // the slot loses it
+	virtual bool owns( int slot ) const = 0;
+
+	// Requires owns( slot ). `anchor` is the last committed, not yet forwarded token at `pos`. With a non-greedy `sp` the round
+	// samples: each draft token is accepted with the target's probability of it (exact for a deterministic draft) and the
+	// correction / bonus token is drawn from the target's distribution.
+	virtual SpecResult speculate( int slot, int anchor, int pos, float depth_threshold, const SamplingParams* sp, Rng* rng ) = 0;
+
+	// Called after every prefill chunk of the owning slot: `rows` prompt tokens starting at position pos0 were just forwarded
+	virtual void on_prefill_chunk( int slot, const int* tokens, int rows, int pos0 ) { (void) slot; (void) tokens; (void) rows; (void) pos0; }
+	// Called after a plain (non-speculative) decode step of the owning slot: `token` was forwarded at `pos` as row `row` of the batch
+	virtual void on_dense_row( int slot, int token, int pos, int row ) { (void) slot; (void) token; (void) pos; (void) row; }
+	// Whether the target must publish drafter taps (and snapshots carry them)
+	virtual bool needs_taps() const { return true; }
+
+	// Per-step draft accuracy where the step was reached
+	virtual void step_stats( int* attempts, int* hits ) const = 0;
+	virtual void profile_dump() {}
+};
+
+} // namespace engine::runtime

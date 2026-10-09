@@ -25,6 +25,7 @@ struct ChatRequest {
 	std::string model;
 	std::string messages_json;
 	std::string tools_json;      // empty: no tools
+	std::vector<std::string> images; // encoded image files in prompt order; messages_json refers to them as {"type": "image"} parts
 	bool stream = false;
 	bool include_usage = false;  // OpenAI stream_options.include_usage
 	int max_tokens = 0;          // 0: server default

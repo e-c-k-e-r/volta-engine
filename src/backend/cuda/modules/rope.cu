@@ -23,6 +23,12 @@ __global__ void rope_kernel(
 	if ( tid >= rot_dim / 2 ) return;
 
 	int pos = rows->pos[m];
+	if ( rows->mrope ) {
+		// Qwen3-VL interleaved M-RoPE: frequency i takes the height position at i % 3 == 1 (i < 33), the width position at
+		// i % 3 == 2 (i < 30) and the temporal position otherwise
+		const int comp = ( tid % 3 == 1 && tid < 33 ) ? 1 : ( ( tid % 3 == 2 && tid < 30 ) ? 2 : 0 );
+		pos = rows->rope_pos[comp][m];
+	}
 	float theta = static_cast<float>( pos ) * powf( freq_base, -( 2.0f * tid / static_cast<float>( rot_dim ) ) );
 	float cos_val = __cosf( theta );
 	float sin_val = __sinf( theta );

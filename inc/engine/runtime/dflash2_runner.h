@@ -5,21 +5,13 @@
 #include "engine/models/model.h"
 #include "engine/spec/dflash.h"
 #include "engine/runtime/sampling.h"
+#include "engine/runtime/speculator.h"
 #include "engine/backend/types.h"
 #include <string>
 
 namespace engine::runtime {
 
 class ModelCluster;
-
-// Outcome of one speculative round on a single slot.
-struct SpecResult {
-	int proposed = 0;                  // draft tokens submitted for verification
-	int accepted = 0;                  // draft tokens matching the target
-	int emitted[pod::MAX_BATCH] = {};  // tokens committed this round (accepted drafts + correction/bonus)
-	int emitted_count = 0;
-	int next_pos = 0;                  // position of the next anchor (== tokens committed to KV)
-};
 
 // Per-stage wall time of a speculative round (host clock: several stages are host syncs whose cost a
 // device event would not attribute to them). Accumulated since the last dump.
@@ -37,29 +29,29 @@ struct SpecProfile {
 // projection, runs the whole block in lockstep (all-reduce after o_proj and down_proj, fc all-gather) and
 // ends with the full drafter hidden replicated, which feeds its own head shard with no peer copy. The walk
 // runs on rank 0. ENGINE_DRAFT_TP=0 selects the single-GPU drafter on rank 0 (A/B knob).
-class DFlash2Runner {
+class DFlash2Runner : public Speculator {
 public:
 	bool init( ModelCluster& mc, const std::string& draft_dir );
-	void shutdown();
+	void shutdown() override;
 
 	// Drafter context belongs to one slot at a time: the target publishes taps for the owner slot
 	// only (device scalar), so a slot that does not own the ring has no context to draft from.
 	// Claiming a slot resets the drafter's projected context and redirects tap publication.
-	void claim( int slot );
-	bool owns( int slot ) const { return owner_ == slot; }
+	void claim( int slot ) override;
+	bool owns( int slot ) const override { return owner_ == slot; }
 	// The slot stops owning the drafter context (it was overwritten by a restored snapshot, which carries no taps).
-	void release( int slot );
+	void release( int slot ) override;
 
 	// Requires owns( slot ). `anchor` is the last committed, not yet forwarded token at `pos`.
 	// With a non-greedy `sp` the round samples: each draft token is accepted with the target's probability of it
 	// (exact for a deterministic draft) and the correction / bonus token is drawn from the target's distribution.
 	SpecResult speculate( int slot, int anchor, int pos, float depth_threshold = -1.0f,
-		const SamplingParams* sp = nullptr, Rng* rng = nullptr );
+		const SamplingParams* sp = nullptr, Rng* rng = nullptr ) override;
 
 	// Per-step draft accuracy where the step was reached (the loop breaks at the first mismatch, so
 	// step k is sampled exactly when steps 0..k-1 were accepted).
-	void step_stats( int* attempts, int* hits ) const;
-	void profile_dump();
+	void step_stats( int* attempts, int* hits ) const override;
+	void profile_dump() override;
 	void set_profile( bool on ) { profile_on_ = on; }
 
 	// Candidate-quality diagnostics (off by default; each round then pays one extra readback). For draft

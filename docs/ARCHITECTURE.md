@@ -17,7 +17,7 @@ backend     src/backend/{cuda,cpu,vulkan}  per-backend implementation of the mod
 kernels     src/kernels/cuda  hand-tuned SM70 kernels (trellis GEMM / GEMV / MoE, NVFP4) with their launchers
             src/kernels/slang portable Slang kernels (CUDA, SPIR-V and host C++ outputs) and the ref_* reference kernels
 core/loader src/core, src/loader  arena, logger, safetensors, tokenizer, Jinja chat templates, unicode tables
-comm        src/comm          4-rank NVLink all-reduce (peer pointers, flag polling); the only 4-rank-only piece
+comm        src/comm          2- or 4-rank NVLink all-reduce (peer pointers, flag polling)
 spec        src/spec          DFlash2 drafter, tap ring
 ```
 
@@ -31,11 +31,17 @@ time (`-DENGINE_BACKEND=CUDA|CPU|VULKAN`); one build tree is one backend.
   pools, recurrent state, scratch and graph buffers are bump-allocated from it. Nothing is allocated while decoding.
 - **Tensor parallel**: ranks 0..3 run the same pipeline on their shard; one `RankPool` thread per rank pinned to a core
   (CUDA builds). Attention heads, MoE intermediate widths and the vocabulary head are sharded; the residual is all-reduced
-  over NVLink. `tp` is a runtime value (1 or 4).
+  over NVLink. `tp` is a runtime value (1, 2 or 4; GLM 1 or 4).
 - **CUDA graphs**: decode bodies are captured once per row count (`GraphCache`) and replayed; the prefill path runs eagerly in
   chunks of up to 512 rows.
 - **Speculation**: the DFlash2 drafter proposes a block, the target verifies it in one forward (per-row recurrent-state
   snapshots make rollback free); an adaptive controller falls back to plain decode when speculation loses.
+- **Speculation sources**: besides DFlash2, `speculator=mtp` drafts with the checkpoint's own one-layer MTP head (Qwen): it chains on
+  its own output, keeps a KV layer per slot next to the model's, and verifies through the same batched forward.
+- **Images** (Qwen): the checkpoint's vision tower (27 ViT blocks, 2-D rotary, patch merger) runs on rank 0; the server decodes and
+  resizes the picture (Qwen2-VL smart resize), the generator caches the embeddings by content hash, and the cluster overwrites the
+  placeholder rows after the embedding lookup. Image tokens carry 3-D M-RoPE positions (`BatchRows::rope_pos`), text after an image
+  continues from the image's largest grid extent. Prefix-cache keys use the image content, not the placeholder ids.
 - **Serving**: the scheduler thread owns the slots; the server thread parses requests, renders the chat template, and each
   response streams through a responder that parses reasoning and tool calls out of the text as it is generated. Connections
   have a non-blocking outbound queue, so a slow client cannot stall generation.

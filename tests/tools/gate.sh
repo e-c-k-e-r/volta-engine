@@ -59,7 +59,9 @@ tier2_fast() {
 		test_norm test_rope test_kv_quant test_all_reduce test_prefill_linear test_sampling test_slang_cpu test_slang_kernels; do
 		run $t gpu ./$t
 	done
+	run all_reduce_2ranks sh -c "AR_RANKS=2 taskset -c 0-9 ./test_all_reduce"
 	run jinja_chat_templates ./test_jinja
+	run image_preprocess ./test_image
 	run output_parser ./test_output_parser
 	run backend_tiers ./test_backend_tiers $ROOT
 	run ref_linear_host ./test_ref_linear
@@ -91,8 +93,11 @@ tier2_models() {
 	run tokenizer_cases_qwen ./test_tokenizer_file $ENGINE_MODEL_ROOT/Qwen3.8-27B-exl3 --cases $ROOT/tests/data/tokenizer_cases_qwen3_5.json
 	run tokenizer_cases_glm ./test_tokenizer_file $ENGINE_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
 	run coherence gpu ./test_coherence
+	run coherence_tp2 sh -c "ENGINE_TP=2 taskset -c 0-9 ./test_coherence --qwen-only --speculative"
 	run prefix_restore gpu ./test_prefix_restore
 	run prefix_restore_spec gpu ./test_prefix_restore --spec
+	run mtp_greedy gpu ./test_mtp
+	run vision_tower gpu ./test_vision
 	run prefix_restore_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore"
 	run prefix_restore_glm gpu ./test_prefix_restore --glm
 	run sampling_qwen gpu ./test_sampling_gpu

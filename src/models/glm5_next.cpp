@@ -75,6 +75,7 @@ bool Glm5NextPipeline::init(
 ) {
 	config_ = config;
 	config_.tp_size = ( ring != nullptr ) ? requested_tp_ : 1;
+	ENGINE_ASSERT( config_.tp_size == 1 || config_.tp_size == ENGINE_NUM_GPUS, "GLM runs on 1 or 4 ranks" );
 	rank_ = rank;
 	arena_ = &arena;
 	ring_ = ring;
@@ -846,7 +847,7 @@ void Glm5NextPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
 	set_rows( m );
 	// Pageable source: the copy is staged before return, so `rows` may be a temporary
-	backend::memcpy_async( d_rows_, &rows, sizeof( pod::BatchRows ), backend::Copy::H2D, stream );
+	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
 	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); } );
 }
 

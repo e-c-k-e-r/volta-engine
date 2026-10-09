@@ -8,6 +8,7 @@
 #include "engine/runtime/cluster.h"
 #include "engine/runtime/prefix_cache.h"
 #include "engine/loader/tokenizer.h"
+#include "engine/loader/image.h"
 #include "engine/loader/chat_template.h"
 #include "engine/server/config.h"
 
@@ -22,6 +23,8 @@
 #include <condition_variable>
 #include <thread>
 #include <pthread.h>
+#include <list>
+#include <unordered_map>
 
 namespace engine::runtime {
 
@@ -50,6 +53,17 @@ struct GenerationRequest {
 		bool pinned = false;
 		bool taps = true;        // snapshot the drafter taps too (a resume there keeps speculating)
 	};
+	// Images in the prompt: the placeholder run [start, start + count) of prompt_tokens belongs to one image. The generator encodes
+	// it (or takes the embeddings from its cache) when the prefill reaches it.
+	struct Image {
+		int start = 0;
+		int count = 0;
+		int grid_h = 0;   // merged-patch grid, count == grid_h * grid_w
+		int grid_w = 0;
+		uint64_t hash = 0;
+		std::shared_ptr<const engine::loader::PreparedImage> prepared;
+	};
+	std::vector<Image> images;
 	std::vector<Checkpoint> checkpoint_at;   // ascending prompt positions to snapshot into the prefix cache (system-prompt end, turn boundary)
 	// Reasoning budget: after this many reasoning tokens the generator appends reasoning_close (e.g. "\n</think>\n\n") itself
 	// and the model continues with the answer. 0 = unlimited. think_close_id ends the reasoning when the model emits it.
@@ -99,6 +113,9 @@ public:
 	}
 
 	int max_context() const { return cluster_.metadata().max_seq_len; }
+	// Image preprocessing parameters of the loaded vision tower; null when the model takes no images
+	const engine::loader::VisionParams* vision_params() const { return cluster_.vision_params(); }
+	int vocab_size() const { return cluster_.metadata().vocab_size; }
 	int num_slots() const { return num_slots_; }
 
 private:
@@ -116,6 +133,7 @@ private:
 		bool force_close = false;   // budget reached: close the reasoning block before the next step
 		std::string held_text;   // detokenized text withheld while it could still begin a stop string
 		std::vector<int> all_tokens;
+		std::vector<int> key_tokens;   // prompt_tokens with image placeholders replaced by content keys (empty without images)
 		SlotMetrics metrics;
 		SpecController ctrl;
 	};
@@ -131,6 +149,11 @@ private:
 	bool emit_token( int s, int tok );
 	void finish_slot( int s, FinishReason reason );
 	void apply_forced_close( int s );
+	// Embeddings of an image: from the cache, else the vision tower (null on failure)
+	std::shared_ptr<const std::vector<backend::half_t>> image_embeddings( const GenerationRequest::Image& im );
+	std::unordered_map<uint64_t, std::shared_ptr<const std::vector<backend::half_t>>> image_cache_;
+	std::list<uint64_t> image_cache_lru_;
+	size_t image_cache_bytes_ = 0;
 
 	engine::server::ServerConfig config_;
 	ModelCluster cluster_;

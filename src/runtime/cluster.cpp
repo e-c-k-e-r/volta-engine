@@ -1,4 +1,5 @@
 #include "engine/runtime/cluster.h"
+#include "engine/runtime/mtp_runner.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
@@ -27,9 +28,9 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	// CUDA context); vram_reserve_mib overrides the reserve. The model's own tables (KV pools, scratch) are sized by
 	// max_seq / max_slots, not by the arena, so a larger context needs no arena tuning.
 	const size_t reserve = ( opt.vram_reserve_mib >= 0 ? static_cast<size_t>( opt.vram_reserve_mib ) : ( is_glm ? 288ULL : 1536ULL ) ) * 1024 * 1024;
-	ENGINE_ASSERT( tp_ == 1 || tp_ == ENGINE_NUM_GPUS, "ModelCluster::init: the collective supports tp 1 or 4 ranks" );
+	ENGINE_ASSERT( tp_ == 1 || tp_ == 2 || tp_ == ENGINE_NUM_GPUS, "ModelCluster::init: the collective supports tp 1, 2 or 4 ranks" );
 	created_ = true;
-	if ( tp_ > 1 ) engine::comm::init_4gpu_mesh( rings_, staging_ptrs_, flag_ptrs_, engine::comm::kMeshStagingBytes );
+	if ( tp_ > 1 ) engine::comm::init_4gpu_mesh( rings_, staging_ptrs_, flag_ptrs_, engine::comm::kMeshStagingBytes, tp_ );
 #if ENGINE_BACKEND_CUDA
 	engine::modules::trellis_context_init_all();
 #endif
@@ -71,9 +72,20 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 			arenas_[d].offset_bytes / 1073741824.0, arenas_[d].total_bytes / 1073741824.0 );
 	}
 
-	if ( !cfg.draft_model_dir.empty() ) {
-		runner_ = std::make_unique<DFlash2Runner>();
-		if ( !runner_->init( *this, cfg.draft_model_dir ) ) return false;
+	if ( opt.speculator == "mtp" && cfg.speculate ) {
+		if ( !models_[0]->has_mtp() ) {
+			LOG_ERROR( "ModelCluster: speculator=mtp, but %s has no MTP head\n", cfg.model_type.c_str() );
+			return false;
+		}
+		auto mtp = std::make_unique<MtpRunner>();
+		if ( !mtp->init( *this ) ) return false;
+		runner_ = std::move( mtp );
+	}
+	else if ( !cfg.draft_model_dir.empty() ) {
+		auto dflash = std::make_unique<DFlash2Runner>();
+		if ( !dflash->init( *this, cfg.draft_model_dir ) ) return false;
+		dflash_ = dflash.get();
+		runner_ = std::move( dflash );
 		for ( int d = 0; d < tp_; ++d ) models_[d]->set_snapshot_taps( true );
 	}
 
@@ -100,6 +112,7 @@ void ModelCluster::shutdown() {
 	if ( runner_ ) {
 		runner_->shutdown();
 		runner_.reset();
+		dflash_ = nullptr;
 	}
 	for ( int d = 0; d < tp_; ++d ) {
 		backend::set_device( d );
@@ -129,16 +142,90 @@ bool ModelCluster::is_eos( int token ) const {
 	return false;
 }
 
+void ModelCluster::set_slot_mm( int slot, MmLayout layout ) {
+	if ( slot_mm_.size() <= static_cast<size_t>( slot ) ) slot_mm_.resize( slot + 1 );
+	mm_slots_ += ( layout.empty() ? 0 : 1 ) - ( slot_mm_[slot].empty() ? 0 : 1 );
+	slot_mm_[slot] = std::move( layout );
+}
+
+bool ModelCluster::encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out ) {
+	backend::set_device( 0 );
+	return models_[0]->encode_image( image, out, streams_[0] );
+}
+
+// Fills the M-RoPE positions of rows whose slot has images (and sets rows.mrope); a no-op when no slot has any
+void ModelCluster::apply_mrope( pod::BatchRows& rows ) const {
+	if ( mm_slots_ == 0 ) return;
+	bool any = false;
+	for ( int m = 0; m < rows.count; ++m ) {
+		const int slot = rows.slot[m];
+		const MmLayout* layout = ( static_cast<size_t>( slot ) < slot_mm_.size() && !slot_mm_[slot].empty() ) ? &slot_mm_[slot] : nullptr;
+		int c[3] = { rows.pos[m], rows.pos[m], rows.pos[m] };
+		if ( layout ) {
+			any = true;
+			layout->rope_at( rows.pos[m], c );
+		}
+		rows.rope_pos[0][m] = c[0];
+		rows.rope_pos[1][m] = c[1];
+		rows.rope_pos[2][m] = c[2];
+	}
+	rows.mrope = any ? 1 : 0;
+}
+
 void ModelCluster::forward( const int* tokens, const pod::BatchRows& rows ) {
+	if ( mm_slots_ == 0 ) {
+		pool_.run( [&]( int d ) {
+			models_[d]->embed_tokens( tokens, rows.count, streams_[d] );
+			models_[d]->forward( rows, streams_[d] );
+			backend::stream_sync( streams_[d] );
+		} );
+		return;
+	}
+	// Rows of slots with images: M-RoPE positions for every row of the batch, and runs of image rows to overwrite after the lookup
+	pod::BatchRows r = rows;
+	struct Run { int row; int rows; const backend::half_t* src; };
+	std::vector<Run> runs;
+	const int hidden = metadata().hidden_size;
+	apply_mrope( r );
+	for ( int m = 0; m < rows.count; ++m ) {
+		const int slot = rows.slot[m];
+		const MmLayout* layout = ( static_cast<size_t>( slot ) < slot_mm_.size() && !slot_mm_[slot].empty() ) ? &slot_mm_[slot] : nullptr;
+		const MmImage* im = layout ? layout->image_at( rows.pos[m] ) : nullptr;
+		if ( !im ) continue;
+		ENGINE_ASSERT( im->embeds != nullptr, "ModelCluster::forward: image rows without embeddings" );
+		const backend::half_t* src = im->embeds->data() + static_cast<size_t>( rows.pos[m] - im->start ) * hidden;
+		if ( !runs.empty() && runs.back().src + static_cast<size_t>( runs.back().rows ) * hidden == src && runs.back().row + runs.back().rows == m ) ++runs.back().rows;
+		else runs.push_back( { m, 1, src } );
+	}
 	pool_.run( [&]( int d ) {
-		models_[d]->embed_tokens( tokens, rows.count, streams_[d] );
-		models_[d]->forward( rows, streams_[d] );
+		models_[d]->embed_tokens( tokens, r.count, streams_[d] );
+		for ( const Run& run : runs ) {
+			const bool injected = models_[d]->inject_embeddings( run.src, run.row, run.rows, streams_[d] );
+			ENGINE_ASSERT( injected, "ModelCluster::forward: the model cannot take image embeddings" );
+		}
+		models_[d]->forward( r, streams_[d] );
 		backend::stream_sync( streams_[d] );
 	} );
 }
 
 void ModelCluster::forward( const int* tokens, int count, int pos, int slot ) {
 	forward( tokens, pod::BatchRows::causal( count, pos, slot ) );
+}
+
+void ModelCluster::mtp_step( int slot, int pos0, int count, const int* tokens, int hidden_mode, int hist_row0, bool logits_last ) {
+	pod::BatchRows rows = pod::BatchRows::causal( count, pos0, slot );
+	apply_mrope( rows );
+	pool_.run( [&]( int d ) {
+		models_[d]->mtp_step( rows, tokens, hidden_mode, hist_row0, logits_last, streams_[d] );
+		backend::stream_sync( streams_[d] );
+	} );
+}
+
+void ModelCluster::mtp_save_hist( int src_row, int rows, int dst_row ) {
+	pool_.run( [&]( int d ) {
+		models_[d]->mtp_save_hist( src_row, rows, dst_row, streams_[d] );
+		backend::stream_sync( streams_[d] );
+	} );
 }
 
 int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Candidates* last_cands, int pos0 ) {
@@ -151,6 +238,7 @@ int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Ca
 		const bool last = ( pos + last_rows >= count );
 		forward( tokens + pos, pod::BatchRows::causal( last_rows, pos0 + pos, slot,
 			last ? pod::BatchRows::LOGITS_LAST : pod::BatchRows::LOGITS_NONE ) );
+		if ( runner_ ) runner_->on_prefill_chunk( slot, tokens + pos, last_rows, pos0 + pos );
 	}
 	// A final chunk above the decode sizes computed logits for its last row only (in row 0).
 	const int rows = ( last_rows > pod::MAX_BATCH ) ? 1 : last_rows;
@@ -289,7 +377,7 @@ size_t ModelCluster::snapshot_bytes( int from, int tokens, bool with_taps ) cons
 
 bool ModelCluster::save_snapshot( int slot, int from, int tokens, SeqSnapshot* snap, bool with_taps ) {
 	constexpr size_t kRound = size_t( 8 ) << 20;
-	with_taps = with_taps && runner_ != nullptr;
+	with_taps = with_taps && runner_ != nullptr && runner_->needs_taps();
 	const size_t need = snapshot_bytes( from, tokens, with_taps );
 	if ( need == 0 ) return false;
 	const size_t cls = ( need + kRound - 1 ) / kRound * kRound;
@@ -343,7 +431,7 @@ bool ModelCluster::load_snapshot( int slot, const SeqSnapshot& snap, bool kv_onl
 	}
 	// The drafter takes the slot over: the restored tap rows are its context for the prefix, and the tail prefill publishes the rest
 	if ( runner_ && !kv_only ) {
-		if ( snap.with_taps ) runner_->claim( slot );
+		if ( snap.with_taps || !runner_->needs_taps() ) runner_->claim( slot );
 		else runner_->release( slot ); // no taps for this prefix: the slot decodes without the drafter
 	}
 	return true;
@@ -362,6 +450,7 @@ void ModelCluster::reset_slot( int slot ) {
 	// The drafter's context (tap ring, projected KV, fill level) describes one slot at a time. The
 	// slot being recycled takes it over, so its prefill publishes taps from position 0.
 	if ( runner_ ) runner_->claim( slot );
+	set_slot_mm( slot, MmLayout() );
 	pool_.run( [&]( int d ) {
 		models_[d]->reset_state( slot );
 	} );

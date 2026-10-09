@@ -20,6 +20,8 @@ static half float_to_half( float f ) {
 }
 
 int main() {
+	// AR_RANKS=2 checks the two-rank collective (the TP=2 configuration); the default is the 4-GPU mesh
+	const int R = std::getenv( "AR_RANKS" ) ? std::atoi( std::getenv( "AR_RANKS" ) ) : ENGINE_NUM_GPUS;
 	std::printf( "========================================================\n" );
 	std::printf( "   volta-engine Tier 2 Parity: NVLink AllReduce & Norm   \n" );
 	std::printf( "========================================================\n" );
@@ -27,7 +29,7 @@ int main() {
 	engine::comm::CollectiveRing rings[ENGINE_NUM_GPUS];
 	void* staging_ptrs[ENGINE_NUM_GPUS] = { nullptr };
 	void* flag_ptrs[ENGINE_NUM_GPUS] = { nullptr };
-	engine::comm::init_4gpu_mesh( rings, staging_ptrs, flag_ptrs, engine::comm::kMeshStagingBytes );
+	engine::comm::init_4gpu_mesh( rings, staging_ptrs, flag_ptrs, engine::comm::kMeshStagingBytes, R );
 
 	cudaStream_t streams[ENGINE_NUM_GPUS];
 	pod::MemoryArena arenas[ENGINE_NUM_GPUS];
@@ -36,7 +38,7 @@ int main() {
 	const int rows = std::getenv( "AR_ROWS" ) ? std::atoi( std::getenv( "AR_ROWS" ) ) : 1;
 	const size_t total_elems = static_cast<size_t>( rows ) * hidden_size;
 
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < R; ++d ) {
 		CUDA_CHECK( cudaSetDevice( d ) );
 		CUDA_CHECK( cudaStreamCreate( &streams[d] ) );
 		bool ok = engine::core::arena_create( arenas[d], d, 64ULL * 1024 * 1024 );
@@ -51,7 +53,7 @@ int main() {
 	int shape_2d[2] = { rows, hidden_size };
 	int shape_1d[1] = { hidden_size };
 
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < R; ++d ) {
 		CUDA_CHECK( cudaSetDevice( d ) );
 		d_x[d] = engine::core::arena_alloc_tensor( arenas[d], pod::DType::FP16, shape_2d, 2 );
 		d_res[d] = engine::core::arena_alloc_tensor( arenas[d], pod::DType::FP16, shape_2d, 2 );
@@ -65,7 +67,7 @@ int main() {
 		std::vector<half> h_x[ENGINE_NUM_GPUS];
 		std::vector<float> h_ref( total_elems, 0.0f );
 
-		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		for ( int d = 0; d < R; ++d ) {
 			h_x[d].resize( total_elems );
 			for ( size_t i = 0; i < total_elems; ++i ) {
 				float val = std::sin( static_cast<float>( step * 1000 + d * 100 + i ) * 0.01f );
@@ -78,14 +80,14 @@ int main() {
 
 		// Launch all_reduce concurrently across 4 threads
 		std::thread workers[ENGINE_NUM_GPUS];
-		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		for ( int d = 0; d < R; ++d ) {
 			workers[d] = std::thread( [&, d]() {
 				CUDA_CHECK( cudaSetDevice( d ) );
 				rings[d].all_reduce( d_x[d], streams[d] );
 				CUDA_CHECK( cudaStreamSynchronize( streams[d] ) );
 			} );
 		}
-		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		for ( int d = 0; d < R; ++d ) {
 			workers[d].join();
 		}
 
@@ -138,7 +140,7 @@ int main() {
 				h_res_ref[i] = r_val;
 			}
 
-			for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			for ( int d = 0; d < R; ++d ) {
 				h_x[d].resize( total_elems );
 				h_res[d].resize( total_elems );
 				for ( size_t i = 0; i < total_elems; ++i ) {
@@ -170,14 +172,14 @@ int main() {
 
 			// Launch fused all_reduce_rms_norm concurrently across 4 threads
 			std::thread workers[ENGINE_NUM_GPUS];
-			for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			for ( int d = 0; d < R; ++d ) {
 				workers[d] = std::thread( [&, d]() {
 					CUDA_CHECK( cudaSetDevice( d ) );
 					rings[d].all_reduce_rms_norm( d_x[d], d_res[d], d_w[d], 1e-6f, streams[d], bias, &d_norm_out[d] );
 					CUDA_CHECK( cudaStreamSynchronize( streams[d] ) );
 				} );
 			}
-			for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			for ( int d = 0; d < R; ++d ) {
 				workers[d].join();
 			}
 
@@ -218,7 +220,7 @@ int main() {
 	{
 		const int num_layers = 64;
 		std::vector<half> h_init_x[ENGINE_NUM_GPUS];
-		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		for ( int d = 0; d < R; ++d ) {
 			h_init_x[d].resize( total_elems );
 			for ( size_t i = 0; i < total_elems; ++i ) {
 				h_init_x[d][i] = float_to_half( 0.01f * std::sin( static_cast<float>( d * 100 + i ) * 0.05f ) );
@@ -228,7 +230,7 @@ int main() {
 		}
 
 		std::thread workers[ENGINE_NUM_GPUS];
-		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		for ( int d = 0; d < R; ++d ) {
 			workers[d] = std::thread( [&, d]() {
 				CUDA_CHECK( cudaSetDevice( d ) );
 				for ( int l = 0; l < num_layers * 2; ++l ) {
@@ -239,20 +241,20 @@ int main() {
 				CUDA_CHECK( cudaStreamSynchronize( streams[d] ) );
 			} );
 		}
-		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		for ( int d = 0; d < R; ++d ) {
 			workers[d].join();
 		}
 
 		// Read back results across all 4 ranks
 		std::vector<half> h_out[ENGINE_NUM_GPUS];
-		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		for ( int d = 0; d < R; ++d ) {
 			h_out[d].resize( total_elems );
 			CUDA_CHECK( cudaSetDevice( d ) );
 			CUDA_CHECK( cudaMemcpy( h_out[d].data(), d_x[d].data, total_elems * sizeof( half ), cudaMemcpyDeviceToHost ) );
 		}
 
 		// Verify that all 4 ranks produced identical values
-		for ( int d = 1; d < ENGINE_NUM_GPUS; ++d ) {
+		for ( int d = 1; d < R; ++d ) {
 			double dot = 0.0, norm_0 = 0.0, norm_d = 0.0;
 			for ( size_t i = 0; i < total_elems; ++i ) {
 				float v0 = half_to_float( h_out[0][i] );
@@ -270,7 +272,7 @@ int main() {
 	}
 
 	engine::comm::destroy_4gpu_mesh( staging_ptrs, flag_ptrs );
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < R; ++d ) {
 		CUDA_CHECK( cudaSetDevice( d ) );
 		CUDA_CHECK( cudaStreamDestroy( streams[d] ) );
 		engine::core::arena_destroy( arenas[d] );

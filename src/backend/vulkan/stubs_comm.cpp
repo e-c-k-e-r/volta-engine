@@ -5,7 +5,7 @@
 
 namespace engine::comm {
 
-__attribute__(( weak )) void CollectiveRing::init( int local_rank, void* const peer_staging[ENGINE_NUM_GPUS], void* const peer_flags[ENGINE_NUM_GPUS] ) {
+__attribute__(( weak )) void CollectiveRing::init( int local_rank, int ranks, void* const peer_staging[ENGINE_NUM_GPUS], void* const peer_flags[ENGINE_NUM_GPUS] ) {
 	ENGINE_UNSUPPORTED( "CollectiveRing::init" );
 	__builtin_unreachable();
 }
@@ -28,7 +28,7 @@ __attribute__(( weak )) void CollectiveRing::all_reduce( pod::TensorView& x, bac
 	__builtin_unreachable();
 }
 
-__attribute__(( weak )) void init_4gpu_mesh( CollectiveRing rings[ENGINE_NUM_GPUS], void* staging_ptrs[ENGINE_NUM_GPUS], void* flag_ptrs[ENGINE_NUM_GPUS], size_t staging_bytes ) {
+__attribute__(( weak )) void init_4gpu_mesh( CollectiveRing rings[ENGINE_NUM_GPUS], void* staging_ptrs[ENGINE_NUM_GPUS], void* flag_ptrs[ENGINE_NUM_GPUS], size_t staging_bytes, int ranks ) {
 	ENGINE_UNSUPPORTED( "init_4gpu_mesh" );
 	__builtin_unreachable();
 }

@@ -2,6 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/backend/types.h"
+#include <cstddef>
 
 namespace pod {
 
@@ -29,6 +30,12 @@ struct BatchRows {
 	int logits_mode = LOGITS_ALL;
 	int slot[MAX_ROWS] = {};
 	int pos[MAX_ROWS] = {};
+	// Multimodal rotary positions (M-RoPE). With mrope != 0, row m rotates by rope_pos[0..2][m] (time, height, width) instead of
+	// pos[m]; pos[m] stays the KV index. Only the prefix up to rope_pos is uploaded when mrope is 0.
+	int mrope = 0;
+	int rope_pos[3][MAX_ROWS];
+
+	size_t upload_bytes() const { return mrope ? sizeof( BatchRows ) : offsetof( BatchRows, rope_pos ); }
 
 	static BatchRows causal( int count, int base_pos, int slot_id, int logits_mode = LOGITS_ALL ) {
 		ENGINE_ASSERT( count >= 1 && count <= MAX_ROWS, "BatchRows::causal: count out of range" );

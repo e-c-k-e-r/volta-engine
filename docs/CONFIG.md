@@ -13,7 +13,7 @@ values are fatal errors. The model type is never configured: it is read from the
 | `model_dir` | `--model-dir` | required | checkpoint directory |
 | `draft_model_dir` | `--draft-model-dir` | none | DFlash2 drafter checkpoint; required with `use_speculation` |
 | `use_speculation` | `--speculative` | false | enable speculative decoding |
-| `tp_size` | `--tp-size` | 4 | GPUs (1 or 4) |
+| `tp_size` | `--tp-size` | 4 | GPUs (1, 2 or 4; GLM runs on 1 or 4) |
 | `host`, `port` | `--host`, `--port` | 0.0.0.0, 8000 | listen address |
 | `max_batch_size` | `--max-batch-size` | 8 | concurrent decode slots the scheduler may fill (capped by `max_slots`) |
 | `default_max_tokens` | `--max-tokens` | 256 | `max_tokens` for requests that omit it |
@@ -30,7 +30,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | Option | Type | Default | Environment | Description |
 |---|---|---|---|---|
 | `log_level` | string | `info` | `ENGINE_LOG_LEVEL` | log threshold: error, warn, info or debug |
-| `tp` | int | `-1` | `ENGINE_TP` | rank count, 1 or 4; <0 uses the launch's tp_size |
+| `tp` | int | `-1` | `ENGINE_TP` | rank count: 1, 2 or 4 (GLM: 1 or 4); <0 uses the launch's tp_size |
 | `arena_gib` | int | `-1` | `ENGINE_ARENA_GIB` | per-GPU arena in GiB; <=0 sizes it from the device's free memory minus vram_reserve_mib |
 | `vram_reserve_mib` | int | `-1` | `ENGINE_VRAM_RESERVE_MIB` | memory left outside the arena for graphs, workspaces and the CUDA context; <0 uses the model's default (Qwen 1536, GLM 288) |
 | `max_seq` | int | `0` | `ENGINE_MAX_SEQ` | context window per slot in tokens (sizes the KV pool); 0 = the model default (Qwen 32768, GLM 12288) |
@@ -41,8 +41,11 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `expert_cache` | float | `1` | `ENGINE_EXPERT_CACHE` | GLM resident routed-expert fraction in (0, 1]; below 1 enables the two-tier expert cache |
 | `expert_adapt_every` | int | `64` | `ENGINE_EXPERT_ADAPT_EVERY` | decode steps between expert residency rebalances (0 = never) |
 | `expert_swaps` | int | `-1` | `ENGINE_EXPERT_SWAPS` | maximum expert swaps per rebalance; <0 = the tier default |
+| `speculator` | string | `dflash` | `ENGINE_SPECULATOR` | speculation source: dflash (needs a draft model) or mtp (the checkpoint's own multi-token-prediction head, Qwen) |
+| `mtp_depth` | int | `7` | `ENGINE_MTP_DEPTH` | most draft tokens per round with speculator=mtp (1 to 7); the head stops chaining earlier when its recent accuracy is low |
 | `draft_tp` | bool | `true` | `ENGINE_DRAFT_TP` | false runs the drafter on rank 0 only |
 | `dsa` | bool | `true` | `ENGINE_DSA` | GLM sparse attention indexer (top-2048 key selection); false attends densely |
+| `max_image_tokens` | int | `1024` | `ENGINE_MAX_IMAGE_TOKENS` | largest image the vision tower accepts, in language-model tokens (4 patches each; sizes its scratch and caps the resize); 0 = image input off |
 | `spec_ctrl` | bool | `true` | `ENGINE_SPEC_CTRL` | adaptive speculation controller; false always speculates |
 | **Debug** | | | | |
 | `expert_log` | bool | `false` | `ENGINE_DEBUG_EXPERT_LOG` | per-rebalance expert tier statistics |

@@ -44,8 +44,9 @@ __device__ __forceinline__ void ar_retire( uint32_t* local_flags, uint32_t seq )
 	}
 }
 
+template <int NR>
 __global__ __launch_bounds__( 512 )
-void all_reduce_rms_norm_4ring_kernel(
+void all_reduce_rms_norm_ring_kernel(
 	int rank,
 	const void* __restrict__ p0,
 	const void* __restrict__ p1,
@@ -84,13 +85,13 @@ void all_reduce_rms_norm_4ring_kernel(
 	__threadfence_system();
 	__syncthreads();
 
-	// Step 2: per-row synchronization across the 4 ranks (the kernel is 4-rank only) using system-scope flags
+	// Step 2: per-row synchronization across the NR ranks using system-scope flags
 	if ( threadIdx.x == 0 ) {
 		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
 	}
 	__syncwarp();
 
-	if ( threadIdx.x < 4 ) {
+	if ( threadIdx.x < NR ) {
 		int p = threadIdx.x;
 		if ( p != rank ) {
 			uint32_t* flag_ptr = ar_flag( flags[p], stage, row, p );
@@ -104,11 +105,11 @@ void all_reduce_rms_norm_4ring_kernel(
 	}
 	__syncthreads();
 
-	// Step 3: contention-free ring accumulation across 4 peers
-	const uint4* r_ptrs[4];
+	// Step 3: contention-free ring accumulation across NR peers
+	const uint4* r_ptrs[NR];
 	#pragma unroll
-	for ( int offset = 0; offset < 4; ++offset ) {
-		int p = ( rank + offset ) & 3;
+	for ( int offset = 0; offset < NR; ++offset ) {
+		int p = ( rank + offset ) % NR;
 		uint8_t* p_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[p] ) ) + ( (size_t) stage * 4 + p ) * IPC_SLOT_BYTES;
 		r_ptrs[offset] = reinterpret_cast<const uint4*>( p_staging ) + row * n4;
 	}
@@ -118,16 +119,9 @@ void all_reduce_rms_norm_4ring_kernel(
 	half* row_x = x + row * row_elems;
 
 	for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) {
-		uint4 v0 = r_ptrs[0][i];
-		uint4 v1 = r_ptrs[1][i];
-		uint4 v2 = r_ptrs[2][i];
-		uint4 v3 = r_ptrs[3][i];
-
-		__half h0[8], h1[8], h2[8], h3[8];
-		*reinterpret_cast<uint4*>( h0 ) = v0;
-		*reinterpret_cast<uint4*>( h1 ) = v1;
-		*reinterpret_cast<uint4*>( h2 ) = v2;
-		*reinterpret_cast<uint4*>( h3 ) = v3;
+		__half hp[NR][8];
+		#pragma unroll
+		for ( int r = 0; r < NR; ++r ) *reinterpret_cast<uint4*>( hp[r] ) = r_ptrs[r][i];
 
 		uint4 vr = *( (const uint4*) ( row_res + i * 8 ) );
 		__half hr[8];
@@ -136,7 +130,9 @@ void all_reduce_rms_norm_4ring_kernel(
 		__half h_new_res[8];
 		#pragma unroll
 		for ( int k = 0; k < 8; ++k ) {
-			float sum = __half2float( h0[k] ) + __half2float( h1[k] ) + __half2float( h2[k] ) + __half2float( h3[k] );
+			float sum = __half2float( hp[0][k] );
+			#pragma unroll
+			for ( int r = 1; r < NR; ++r ) sum += __half2float( hp[r][k] );
 			float res_val = sum + __half2float( hr[k] );
 			h_new_res[k] = __float2half_rn( res_val );
 			local_sum_sq = fmaf( res_val, res_val, local_sum_sq );
@@ -197,8 +193,9 @@ void all_reduce_rms_norm_4ring_kernel(
 	ar_retire( flags[rank], seq );
 }
 
+template <int NR>
 __global__ __launch_bounds__( 256 )
-void all_reduce_4ring_kernel(
+void all_reduce_ring_kernel(
 	int rank,
 	const void* __restrict__ p0,
 	const void* __restrict__ p1,
@@ -233,7 +230,7 @@ void all_reduce_4ring_kernel(
 
 	if ( threadIdx.x == 0 ) {
 		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
-		for ( int p = 0; p < 4; ++p ) {
+		for ( int p = 0; p < NR; ++p ) {
 			if ( p == rank ) continue;
 			while ( ldg_acquire_sys_u32( ar_flag( flags[p], stage, row, p ) ) < seq ) {
 				__nanosleep( 32 );
@@ -242,30 +239,25 @@ void all_reduce_4ring_kernel(
 	}
 	__syncthreads();
 
-	const uint4* r_ptrs[4];
+	const uint4* r_ptrs[NR];
 	#pragma unroll
-	for ( int offset = 0; offset < 4; ++offset ) {
-		int p = ( rank + offset ) & 3;
+	for ( int offset = 0; offset < NR; ++offset ) {
+		int p = ( rank + offset ) % NR;
 		uint8_t* p_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[p] ) ) + ( (size_t) stage * 4 + p ) * IPC_SLOT_BYTES;
 		r_ptrs[offset] = reinterpret_cast<const uint4*>( p_staging ) + row * n4;
 	}
 
 	half* row_x = x + row * row_elems;
 	for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) {
-		uint4 v0 = r_ptrs[0][i];
-		uint4 v1 = r_ptrs[1][i];
-		uint4 v2 = r_ptrs[2][i];
-		uint4 v3 = r_ptrs[3][i];
-
-		__half h0[8], h1[8], h2[8], h3[8], h_sum[8];
-		*reinterpret_cast<uint4*>( h0 ) = v0;
-		*reinterpret_cast<uint4*>( h1 ) = v1;
-		*reinterpret_cast<uint4*>( h2 ) = v2;
-		*reinterpret_cast<uint4*>( h3 ) = v3;
+		__half hp[NR][8], h_sum[8];
+		#pragma unroll
+		for ( int r = 0; r < NR; ++r ) *reinterpret_cast<uint4*>( hp[r] ) = r_ptrs[r][i];
 
 		#pragma unroll
 		for ( int k = 0; k < 8; ++k ) {
-			float s = __half2float( h0[k] ) + __half2float( h1[k] ) + __half2float( h2[k] ) + __half2float( h3[k] );
+			float s = __half2float( hp[0][k] );
+			#pragma unroll
+			for ( int r = 1; r < NR; ++r ) s += __half2float( hp[r][k] );
 			h_sum[k] = __float2half_rn( s );
 		}
 
@@ -277,13 +269,16 @@ void all_reduce_4ring_kernel(
 
 void CollectiveRing::init(
 	int local_rank,
+	int ranks,
 	void* const peer_staging[ENGINE_NUM_GPUS],
 	void* const peer_flags[ENGINE_NUM_GPUS]
 ) {
+	ENGINE_ASSERT( ranks == 2 || ranks == 4, "CollectiveRing::init: 2 or 4 ranks" );
 	rank = local_rank;
+	nranks = ranks;
 	for ( int p = 0; p < ENGINE_NUM_GPUS; ++p ) {
-		peer_ptrs[p] = peer_staging[p];
-		sync_flags[p] = peer_flags[p];
+		peer_ptrs[p] = ( p < ranks ) ? peer_staging[p] : nullptr;
+		sync_flags[p] = ( p < ranks ) ? peer_flags[p] : nullptr;
 	}
 }
 
@@ -307,7 +302,8 @@ void CollectiveRing::all_reduce_rms_norm(
 	const half* w_ptr = weight.ptr<const half>();
 	half* out_ptr = ( out != nullptr ) ? out->ptr<half>() : nullptr;
 
-	all_reduce_rms_norm_4ring_kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>(
+	auto kernel = ( nranks == 2 ) ? all_reduce_rms_norm_ring_kernel<2> : all_reduce_rms_norm_ring_kernel<4>;
+	kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>(
 		rank,
 		peer_ptrs[0],
 		peer_ptrs[1],
@@ -339,7 +335,8 @@ void CollectiveRing::all_reduce(
 
 	half* x_ptr = x.ptr<half>();
 
-	all_reduce_4ring_kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>(
+	auto kernel = ( nranks == 2 ) ? all_reduce_ring_kernel<2> : all_reduce_ring_kernel<4>;
+	kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>(
 		rank,
 		peer_ptrs[0],
 		peer_ptrs[1],
@@ -358,11 +355,12 @@ void init_4gpu_mesh(
 	CollectiveRing rings[ENGINE_NUM_GPUS],
 	void* staging_ptrs[ENGINE_NUM_GPUS],
 	void* flag_ptrs[ENGINE_NUM_GPUS],
-	size_t staging_bytes
+	size_t staging_bytes,
+	int ranks
 ) {
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+	for ( int d = 0; d < ranks; ++d ) {
 		CUDA_CHECK( cudaSetDevice( d ) );
-		for ( int peer = 0; peer < ENGINE_NUM_GPUS; ++peer ) {
+		for ( int peer = 0; peer < ranks; ++peer ) {
 			if ( peer != d ) {
 				cudaDeviceEnablePeerAccess( peer, 0 );
 				cudaGetLastError();
@@ -376,8 +374,8 @@ void init_4gpu_mesh(
 		CUDA_CHECK( cudaMemset( flag_ptrs[d], 0, 65536 ) );
 	}
 
-	for ( int r = 0; r < ENGINE_NUM_GPUS; ++r ) {
-		rings[r].init( r, staging_ptrs, flag_ptrs );
+	for ( int r = 0; r < ranks; ++r ) {
+		rings[r].init( r, ranks, staging_ptrs, flag_ptrs );
 	}
 }
 

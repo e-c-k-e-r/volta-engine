@@ -6,6 +6,7 @@
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
 #include "engine/core/batch.h"
+#include "engine/loader/image.h"
 #include "engine/backend/types.h"
 #include <string>
 #include <memory>
@@ -155,6 +156,23 @@ public:
 	virtual size_t seq_state_bytes( int from, int tokens, bool with_taps ) const { (void) from; (void) tokens; (void) with_taps; return 0; }
 	virtual bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) { (void) slot_id; (void) from; (void) tokens; (void) with_taps; (void) host_dst; (void) stream; return false; }
 	virtual bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) { (void) slot_id; (void) from; (void) tokens; (void) with_taps; (void) host_src; (void) kv_only; (void) stream; return false; }
+
+	// 5c. Multimodal input. inject_embeddings overwrites rows [dst_row, dst_row + rows) of the last embed_tokens with
+	// precomputed embeddings (host [rows, hidden] FP16); call it between embed_tokens and forward. The image encoder runs on
+	// rank 0 only; vision_params() is null when the model has none loaded.
+	virtual bool inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream = nullptr ) { (void) host_rows; (void) dst_row; (void) rows; (void) stream; return false; }
+	virtual const engine::loader::VisionParams* vision_params() const { return nullptr; }
+	virtual bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) { (void) image; (void) out; (void) stream; return false; }
+
+	// 5d. MTP head: a one-layer next-token predictor on the target's final hidden state (checkpoints that ship mtp.*). A step runs
+	// rows.count rows of one slot: row j takes the hidden row selected by hidden_mode and the embedding of tokens[j] (the token that
+	// follows position pos[j]) and predicts the token after it. hidden_mode: 0 = the last forward's final-norm rows, 1 = saved row 0
+	// then the last forward's rows 0 .. count - 2, 2 = saved rows (both from hist_row0), 3 = the previous step's last output row. The step overwrites the
+	// target's final-norm rows (scratch), so save what later steps need first. With logits_last the
+	// last row's logits are left in row 0 of the logits buffer (sample / sample_topk read them).
+	virtual bool has_mtp() const { return false; }
+	virtual void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) { (void) rows; (void) tokens; (void) hidden_mode; (void) hist_row0; (void) logits_last; (void) stream; ENGINE_ASSERT( false, "model has no MTP head" ); }
+	virtual void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) { (void) src_row; (void) rows; (void) dst_row; (void) stream; ENGINE_ASSERT( false, "model has no MTP head" ); }
 
 	// 6. Output descriptors & tapped states
 	virtual pod::TensorView& logits() = 0;

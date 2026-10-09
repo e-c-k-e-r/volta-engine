@@ -38,7 +38,7 @@ bool Qwen3_5Pipeline::init(
 	backend::set_device( rank_ );
 
 	const int tp_size = ( ring_ != nullptr ) ? requested_tp_ : 1;
-	ENGINE_ASSERT( tp_size == 1 || tp_size == 4, "Qwen3_5Pipeline: the grouped weight shards are laid out for 4 ranks" );
+	ENGINE_ASSERT( tp_size == 1 || tp_size == 2 || tp_size == 4, "Qwen3_5Pipeline: tensor parallelism of 1, 2 or 4 ranks" );
 	tp_ranks_ = tp_size;
 	tp_size_ = tp_size;
 	q_heads_ = config_.full_num_q_heads / tp_size;
@@ -76,7 +76,9 @@ bool Qwen3_5Pipeline::init(
 	backend::memset_sync( state_.d_snap_on, 0, sizeof( int ) );
 
 	// 3. Full-attention KV cache pool: [S, 16, max_seq, kv_heads, 256] FP16
-	kv_pool_.init( rank_, arena, S, config_.max_seq, config_.num_attn_layers, full_kv_heads, config_.full_head_dim );
+	// The MTP head (speculator=mtp) has one full-attention layer of its own: one more KV layer, index num_attn_layers
+	mtp_on_ = runtime::options().speculator == "mtp";
+	kv_pool_.init( rank_, arena, S, config_.max_seq, config_.num_attn_layers + ( mtp_on_ ? 1 : 0 ), full_kv_heads, config_.full_head_dim );
 
 	// 4. Residual stream & normed activations (MAX_BATCH rows)
 	int h_shape[2] = { R, config_.hidden_size };
@@ -143,6 +145,20 @@ bool Qwen3_5Pipeline::init(
 	up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_shape, 2 );
 	mlp_inter_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_shape, 2 );
 	mlp_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+
+	if ( mtp_on_ ) {
+		mtp_emb_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+		mtp_xe_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+		mtp_xh_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+		mtp_stage_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+		mtp_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+		int fc_shape[2] = { R, 2 * config_.hidden_size / tp_size };
+		mtp_in_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, fc_shape, 2 );
+		int hist_shape[2] = { 2 * ( kDraftM + 1 ), config_.hidden_size };
+		mtp_hist_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, hist_shape, 2 );
+		int chain_shape[2] = { 1, config_.hidden_size };
+		mtp_chain_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, chain_shape, 2 );
+	}
 
 	// 8. Logits & argmax. The vocabulary is sharded the same way the rest of the head is: each rank
 	// projects only its own columns, which takes the 5120 x 248320 LM head off rank 0's critical path.
@@ -319,10 +335,11 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 			lw.o_proj = load_row( name_buf, 4 );
 		}
 		else {
+			// in_proj_qkv rows are [q | k | v] groups (128 + 128 + 384 blocks of 16); every rank takes its share of each group
 			static constexpr int QWEN_QKV_BLOCKS[3] = { 128, 128, 384 };
-			static constexpr int QWEN_QKV_RANK_BLOCKS[3] = { 32, 32, 96 };
+			const int QWEN_QKV_RANK_BLOCKS[3] = { 128 / tp_size, 128 / tp_size, 384 / tp_size };
 			static constexpr int QWEN_CONV_CHANNELS[3] = { 2048, 2048, 6144 };
-			static constexpr int QWEN_CONV_RANK_CHANNELS[3] = { 512, 512, 1536 };
+			const int QWEN_CONV_RANK_CHANNELS[3] = { 2048 / tp_size, 2048 / tp_size, 6144 / tp_size };
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_qkv", L );
 			if ( fp4 ) {
@@ -391,11 +408,49 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 		lw.down_proj = load_row( name_buf, 3 );
 	}
 
+	if ( mtp_on_ ) {
+		ENGINE_ASSERT( !fp4 && repo.find( "mtp.fc.trellis" ) != nullptr, "speculator=mtp: the checkpoint has no quantized MTP head (mtp.*)" );
+		mtp_fc_ = load_row( "mtp.fc", 4 );
+		mtp_pre_norm_e_ = repo.load( "mtp.pre_fc_norm_embedding.weight", *arena_, stream, pod::DType::FP16 );
+		mtp_pre_norm_h_ = repo.load( "mtp.pre_fc_norm_hidden.weight", *arena_, stream, pod::DType::FP16 );
+		mtp_norm_ = repo.load( "mtp.norm.weight", *arena_, stream, pod::DType::FP16 );
+		auto& lw = mtp_layer_;
+		lw.is_full_attention = true;
+		lw.input_norm = repo.load( "mtp.layers.0.input_layernorm.weight", *arena_, stream, pod::DType::FP16 );
+		lw.post_attn_norm = repo.load( "mtp.layers.0.post_attention_layernorm.weight", *arena_, stream, pod::DType::FP16 );
+		lw.q_proj = load_col( "mtp.layers.0.self_attn.q_proj", 4 );
+		lw.q_norm = repo.load( "mtp.layers.0.self_attn.q_norm.weight", *arena_, stream, pod::DType::FP16 );
+		lw.k_proj = load_col( "mtp.layers.0.self_attn.k_proj", 5 );
+		lw.k_norm = repo.load( "mtp.layers.0.self_attn.k_norm.weight", *arena_, stream, pod::DType::FP16 );
+		lw.v_proj = load_col( "mtp.layers.0.self_attn.v_proj", 5 );
+		lw.o_proj = load_row( "mtp.layers.0.self_attn.o_proj", 4 );
+		lw.gate_proj = load_col( "mtp.layers.0.mlp.gate_proj", 3 );
+		lw.up_proj = load_col( "mtp.layers.0.mlp.up_proj", 3 );
+		lw.down_proj = load_row( "mtp.layers.0.mlp.down_proj", 3 );
+	}
 	if ( stream ) {
 		backend::stream_sync( stream );
 	}
 	repo.close();
+	// Image encoder (rank 0): optional, a checkpoint without the quantized tower serves text only
+	if ( rank_ == 0 && !fp4 && runtime::options().max_image_tokens > 0 ) {
+		vision_.load( model_dir, *arena_, runtime::options().max_image_tokens * 4, stream );
+	}
 	weights_loaded_ = true;
+	return true;
+}
+
+bool Qwen3_5Pipeline::encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream ) {
+	if ( rank_ != 0 || !vision_.loaded() ) return false;
+	backend::set_device( rank_ );
+	return vision_.encode( image, out, stream );
+}
+
+bool Qwen3_5Pipeline::inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream ) {
+	ENGINE_ASSERT( dst_row >= 0 && rows >= 1 && dst_row + rows <= pod::MAX_ROWS, "Qwen3_5Pipeline::inject_embeddings: rows out of range" );
+	backend::set_device( rank_ );
+	const size_t row_bytes = static_cast<size_t>( config_.hidden_size ) * sizeof( backend::half_t );
+	backend::memcpy_async( hidden_states_.ptr<char>() + static_cast<size_t>( dst_row ) * row_bytes, host_rows, static_cast<size_t>( rows ) * row_bytes, backend::Copy::H2D, stream );
 	return true;
 }
 
@@ -549,7 +604,7 @@ void Qwen3_5Pipeline::forward( const pod::BatchRows& rows, backend::stream_t str
 	// Row descriptor goes to the device; the layer stack only reads slots/positions from there,
 	// so its launch sequence depends on m alone and is replayed from a per-m CUDA graph.
 	// Pageable source: the copy is staged before return, so `rows` may be a temporary.
-	backend::memcpy_async( d_rows_, &rows, sizeof( pod::BatchRows ), backend::Copy::H2D, stream );
+	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
 	// Tensor-core attention shares K/V tiles across the rows of one slot (verify blocks, single-row decode); rows of
 	// distinct slots get a block each. The graph body differs, so the two shapes get separate graphs.
 	attn_tc_ = true;
@@ -557,214 +612,218 @@ void Qwen3_5Pipeline::forward( const pod::BatchRows& rows, backend::stream_t str
 	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); }, attn_tc_ ? 1 : 0 );
 }
 
-void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
+// One decoder layer over the m rows of d_rows_: hidden_states_ in, hidden_states_ out.
+void Qwen3_5Pipeline::layer_forward( const Qwen3_5LayerWeights& lw, int& full_attn_idx, int& linear_idx, int m, backend::stream_t stream ) {
 	const pod::KVRef kv = kv_pool_.ref();
 	const size_t kv_slot_stride = kv_pool_.slot_stride_elems;
 
+
+	// 1. Input RMSNorm: norm_hidden = rms_norm(hidden_states)
+	engine::modules::RMSNorm::forward(
+		hidden_states_, lw.input_norm, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
+	);
+
+	// 2. Attention
+	if ( lw.is_full_attention ) {
+		const int q_heads = q_heads_;
+		const int kv_heads = kv_heads_;
+
+		// Q proj: projects norm_hidden (5120) to Q+Gate (12288 or 3072)
+		engine::modules::Linear::forward(
+			norm_hidden_, lw.q_proj, q_gate_buf_, stream
+		);
+
+		// Unpack Q and Gate
+		engine::modules::Attention::unpack_q_gate(
+			q_gate_buf_, q_buf_, gate_attn_buf_,
+			q_heads, config_.full_head_dim, stream
+		);
+
+		// RMSNorm on Q heads
+		engine::modules::RMSNorm::forward_heads(
+			q_buf_, lw.q_norm, q_heads, config_.full_head_dim, 1e-6f, 1.0f, stream
+		);
+
+		// K proj: projects norm_hidden (5120) to K (1024 or 256)
+		engine::modules::Linear::forward(
+			norm_hidden_, lw.k_proj, k_buf_, stream
+		);
+
+		// RMSNorm on K heads
+		engine::modules::RMSNorm::forward_heads(
+			k_buf_, lw.k_norm, kv_heads, config_.full_head_dim, 1e-6f, 1.0f, stream
+		);
+
+		// V proj: projects norm_hidden (5120) to V (1024 or 256)
+		engine::modules::Linear::forward(
+			norm_hidden_, lw.v_proj, v_buf_, stream
+		);
+
+		// RoPE applied to Q and K
+		engine::modules::RoPE::forward(
+			q_buf_, k_buf_,
+			q_heads, kv_heads,
+			config_.full_head_dim, config_.full_rot_dim,
+			d_rows_, m, config_.rope_theta, stream
+		);
+
+		// Store K and V to KV Cache
+		engine::modules::Attention::store_kv_cache(
+			kv,
+			k_buf_, v_buf_,
+			kv_slot_stride, full_attn_idx, d_rows_, m,
+			kv_heads, config_.full_head_dim,
+			config_.max_seq, stream
+		);
+
+		// Attend over past tokens + sigmoid gate
+		if ( config_.full_head_dim == 256 ) {
+			// Prefill chunk: tiled kernel that shares K/V tiles across queries.
+			engine::modules::Attention::forward_prefill(
+				kv, q_buf_, gate_attn_buf_,
+				attn_out_,
+				kv_slot_stride, full_attn_idx, d_rows_, m,
+				q_heads, kv_heads,
+				config_.full_head_dim, config_.max_seq, stream, m > pod::MAX_BATCH ? key_hint_ : 0, m <= pod::MAX_BATCH && !attn_tc_
+			);
+		}
+		else {
+			engine::modules::Attention::forward_decode(
+				kv, q_buf_, gate_attn_buf_,
+				attn_out_,
+				kv_slot_stride, full_attn_idx, d_rows_, m,
+				q_heads, kv_heads,
+				config_.full_head_dim, config_.max_seq, stream
+			);
+		}
+		full_attn_idx++;
+
+		// O proj: projects attn_out (6144 or 1536) to mlp_out (5120)
+		engine::modules::Linear::forward(
+			attn_out_, lw.o_proj, mlp_out_, stream
+		);
+	}
+	else {
+		const int k_heads = lin_k_heads_;
+		const int v_heads = lin_v_heads_;
+		const int lin_channels = lin_channels_;
+
+		// In proj QKV: projects norm_hidden (5120) to QKV (10240 or 2560) across all M rows
+		engine::modules::Linear::forward(
+			norm_hidden_, lw.in_proj_qkv, qkv_buf_, stream
+		);
+
+		// In proj Z: projects norm_hidden (5120) to Z (6144 or 1536) across all M rows
+		engine::modules::Linear::forward(
+			norm_hidden_, lw.in_proj_z, z_buf_, stream
+		);
+
+		// Rows advance their own slot's recurrent state in order: a causal block (Mode A) re-uses
+		// one slot row after row; independent requests (Mode B) each touch a distinct slot. Each stage
+		// runs once over all m rows (the conv and the recurrence walk rows in order inside the kernel and
+		// resolve each row's slot from d_rows_ on device).
+		float* hist_ptr = state_.conv_history + static_cast<size_t>( linear_idx ) * lin_channels * 3;
+		float* layer_gdn_state = state_.gdn_states + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
+		const int snap_rows = MIN( m, kDraftM );
+		float* conv_snap = state_.conv_snap + static_cast<size_t>( linear_idx ) * lin_channels * 3;
+		float* gdn_snap = state_.gdn_snap + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
+
+		pod::TensorView qkv_rows = pod::make_tensor_2d( qkv_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, lin_channels );
+		pod::TensorView out_rows = pod::make_tensor_2d( gdn_out_.ptr<backend::half_t>(), pod::DType::FP16, m, v_heads * 128 );
+		pod::TensorView z_rows = pod::make_tensor_2d( z_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, v_heads * 128 );
+		pod::TensorView gate_rows = pod::make_tensor_2d( gdn_gate_.ptr<float>(), pod::DType::FP32, m, v_heads );
+		pod::TensorView beta_rows = pod::make_tensor_2d( gdn_beta_.ptr<float>(), pod::DType::FP32, m, v_heads );
+
+		// Causal conv1d + SiLU. Prefill chunks run it in parallel row tiles into a separate buffer; the rest of
+		// the layer then reads that buffer instead of the in-place result.
+		if ( m > pod::MAX_BATCH ) {
+			pod::TensorView conv_rows = pod::make_tensor_2d( conv_out_.ptr<backend::half_t>(), pod::DType::FP16, m, lin_channels );
+			engine::modules::GDN::causal_conv1d_silu_tiled(
+				qkv_rows, conv_rows, hist_ptr, lw.conv1d_w, lin_channels, m, d_rows_, state_.slot_conv_floats, stream );
+			qkv_rows = conv_rows;
+		}
+		else {
+			engine::modules::GDN::causal_conv1d_silu_rows(
+				qkv_rows, hist_ptr, lw.conv1d_w, lin_channels, m, d_rows_, state_.slot_conv_floats,
+				conv_snap, state_.slot_conv_floats, snap_rows, state_.d_snap_on, stream
+			);
+		}
+
+		// L2 norm on Q and K heads
+		engine::modules::GDN::l2_norm_heads(
+			qkv_rows, k_heads, config_.linear_head_dim, stream, false, m, lin_channels
+		);
+
+		// Project gates: in_proj_a, in_proj_b -> gdn_gate, gdn_beta
+		engine::modules::GDN::project_gates(
+			norm_hidden_, lw.in_proj_a, lw.in_proj_b, lw.A_log, lw.dt_bias,
+			gate_rows, beta_rows, v_heads, config_.hidden_size, stream, m
+		);
+
+		// GDN recurrent step: advances state causally
+		engine::modules::GDN::recurrent_step_rows(
+			layer_gdn_state, qkv_rows, gate_rows, beta_rows, out_rows,
+			k_heads, v_heads, config_.linear_head_dim, m, d_rows_, state_.slot_gdn_floats,
+			gdn_snap, state_.slot_gdn_floats, snap_rows, state_.d_snap_on, stream
+		);
+
+		// Gated RMSNorm: gdn_out * rsqrt * norm_weight * silu(z)
+		engine::modules::GDN::gated_rmsnorm(
+			out_rows, z_rows, lw.linear_norm, v_heads, config_.linear_head_dim, stream, false, m
+		);
+
+		// Out proj: projects gdn_out (6144 or 1536) to mlp_out (5120) across all M rows
+		engine::modules::Linear::forward(
+			gdn_out_, lw.out_proj, mlp_out_, stream
+		);
+		linear_idx++;
+	}
+
+	if ( ring_ ) {
+		ring_->all_reduce_rms_norm(
+			mlp_out_,
+			hidden_states_,
+			lw.post_attn_norm,
+			config_.rms_norm_eps,
+			stream,
+			config_.rms_norm_bias,
+			&norm_hidden_
+		);
+	}
+	else {
+		engine::modules::Elementwise::add_residual( hidden_states_, mlp_out_, stream );
+		engine::modules::RMSNorm::forward(
+			hidden_states_, lw.post_attn_norm, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
+		);
+	}
+
+	// 4. MLP
+	engine::modules::Linear::forward(
+		norm_hidden_, lw.gate_proj, gate_buf_, stream
+	);
+
+	engine::modules::Linear::forward(
+		norm_hidden_, lw.up_proj, up_buf_, stream
+	);
+
+	engine::modules::SwiGLU::forward( gate_buf_, up_buf_, mlp_inter_, stream );
+
+	engine::modules::Linear::forward(
+		mlp_inter_, lw.down_proj, mlp_out_, stream
+	);
+
+	if ( ring_ ) {
+		ring_->all_reduce( mlp_out_, stream );
+	}
+	engine::modules::Elementwise::add_residual( hidden_states_, mlp_out_, stream );
+}
+
+void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 	int full_attn_idx = 0;
 	int linear_idx = 0;
 
 	for ( int layer = 0; layer < config_.num_layers; ++layer ) {
-		const auto& lw = layers_[layer];
-
-		// 1. Input RMSNorm: norm_hidden = rms_norm(hidden_states)
-		engine::modules::RMSNorm::forward(
-			hidden_states_, lw.input_norm, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
-		);
-
-		// 2. Attention
-		if ( lw.is_full_attention ) {
-			const int q_heads = q_heads_;
-			const int kv_heads = kv_heads_;
-
-			// Q proj: projects norm_hidden (5120) to Q+Gate (12288 or 3072)
-			engine::modules::Linear::forward(
-				norm_hidden_, lw.q_proj, q_gate_buf_, stream
-			);
-
-			// Unpack Q and Gate
-			engine::modules::Attention::unpack_q_gate(
-				q_gate_buf_, q_buf_, gate_attn_buf_,
-				q_heads, config_.full_head_dim, stream
-			);
-
-			// RMSNorm on Q heads
-			engine::modules::RMSNorm::forward_heads(
-				q_buf_, lw.q_norm, q_heads, config_.full_head_dim, 1e-6f, 1.0f, stream
-			);
-
-			// K proj: projects norm_hidden (5120) to K (1024 or 256)
-			engine::modules::Linear::forward(
-				norm_hidden_, lw.k_proj, k_buf_, stream
-			);
-
-			// RMSNorm on K heads
-			engine::modules::RMSNorm::forward_heads(
-				k_buf_, lw.k_norm, kv_heads, config_.full_head_dim, 1e-6f, 1.0f, stream
-			);
-
-			// V proj: projects norm_hidden (5120) to V (1024 or 256)
-			engine::modules::Linear::forward(
-				norm_hidden_, lw.v_proj, v_buf_, stream
-			);
-
-			// RoPE applied to Q and K
-			engine::modules::RoPE::forward(
-				q_buf_, k_buf_,
-				q_heads, kv_heads,
-				config_.full_head_dim, config_.full_rot_dim,
-				d_rows_, m, config_.rope_theta, stream
-			);
-
-			// Store K and V to KV Cache
-			engine::modules::Attention::store_kv_cache(
-				kv,
-				k_buf_, v_buf_,
-				kv_slot_stride, full_attn_idx, d_rows_, m,
-				kv_heads, config_.full_head_dim,
-				config_.max_seq, stream
-			);
-
-			// Attend over past tokens + sigmoid gate
-			if ( config_.full_head_dim == 256 ) {
-				// Prefill chunk: tiled kernel that shares K/V tiles across queries.
-				engine::modules::Attention::forward_prefill(
-					kv, q_buf_, gate_attn_buf_,
-					attn_out_,
-					kv_slot_stride, full_attn_idx, d_rows_, m,
-					q_heads, kv_heads,
-					config_.full_head_dim, config_.max_seq, stream, m > pod::MAX_BATCH ? key_hint_ : 0, m <= pod::MAX_BATCH && !attn_tc_
-				);
-			}
-			else {
-				engine::modules::Attention::forward_decode(
-					kv, q_buf_, gate_attn_buf_,
-					attn_out_,
-					kv_slot_stride, full_attn_idx, d_rows_, m,
-					q_heads, kv_heads,
-					config_.full_head_dim, config_.max_seq, stream
-				);
-			}
-			full_attn_idx++;
-
-			// O proj: projects attn_out (6144 or 1536) to mlp_out (5120)
-			engine::modules::Linear::forward(
-				attn_out_, lw.o_proj, mlp_out_, stream
-			);
-		}
-		else {
-			const int k_heads = lin_k_heads_;
-			const int v_heads = lin_v_heads_;
-			const int lin_channels = lin_channels_;
-
-			// In proj QKV: projects norm_hidden (5120) to QKV (10240 or 2560) across all M rows
-			engine::modules::Linear::forward(
-				norm_hidden_, lw.in_proj_qkv, qkv_buf_, stream
-			);
-
-			// In proj Z: projects norm_hidden (5120) to Z (6144 or 1536) across all M rows
-			engine::modules::Linear::forward(
-				norm_hidden_, lw.in_proj_z, z_buf_, stream
-			);
-
-			// Rows advance their own slot's recurrent state in order: a causal block (Mode A) re-uses
-			// one slot row after row; independent requests (Mode B) each touch a distinct slot. Each stage
-			// runs once over all m rows (the conv and the recurrence walk rows in order inside the kernel and
-			// resolve each row's slot from d_rows_ on device).
-			float* hist_ptr = state_.conv_history + static_cast<size_t>( linear_idx ) * lin_channels * 3;
-			float* layer_gdn_state = state_.gdn_states + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
-			const int snap_rows = MIN( m, kDraftM );
-			float* conv_snap = state_.conv_snap + static_cast<size_t>( linear_idx ) * lin_channels * 3;
-			float* gdn_snap = state_.gdn_snap + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
-
-			pod::TensorView qkv_rows = pod::make_tensor_2d( qkv_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, lin_channels );
-			pod::TensorView out_rows = pod::make_tensor_2d( gdn_out_.ptr<backend::half_t>(), pod::DType::FP16, m, v_heads * 128 );
-			pod::TensorView z_rows = pod::make_tensor_2d( z_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, v_heads * 128 );
-			pod::TensorView gate_rows = pod::make_tensor_2d( gdn_gate_.ptr<float>(), pod::DType::FP32, m, v_heads );
-			pod::TensorView beta_rows = pod::make_tensor_2d( gdn_beta_.ptr<float>(), pod::DType::FP32, m, v_heads );
-
-			// Causal conv1d + SiLU. Prefill chunks run it in parallel row tiles into a separate buffer; the rest of
-			// the layer then reads that buffer instead of the in-place result.
-			if ( m > pod::MAX_BATCH ) {
-				pod::TensorView conv_rows = pod::make_tensor_2d( conv_out_.ptr<backend::half_t>(), pod::DType::FP16, m, lin_channels );
-				engine::modules::GDN::causal_conv1d_silu_tiled(
-					qkv_rows, conv_rows, hist_ptr, lw.conv1d_w, lin_channels, m, d_rows_, state_.slot_conv_floats, stream );
-				qkv_rows = conv_rows;
-			}
-			else {
-				engine::modules::GDN::causal_conv1d_silu_rows(
-					qkv_rows, hist_ptr, lw.conv1d_w, lin_channels, m, d_rows_, state_.slot_conv_floats,
-					conv_snap, state_.slot_conv_floats, snap_rows, state_.d_snap_on, stream
-				);
-			}
-
-			// L2 norm on Q and K heads
-			engine::modules::GDN::l2_norm_heads(
-				qkv_rows, k_heads, config_.linear_head_dim, stream, false, m, lin_channels
-			);
-
-			// Project gates: in_proj_a, in_proj_b -> gdn_gate, gdn_beta
-			engine::modules::GDN::project_gates(
-				norm_hidden_, lw.in_proj_a, lw.in_proj_b, lw.A_log, lw.dt_bias,
-				gate_rows, beta_rows, v_heads, config_.hidden_size, stream, m
-			);
-
-			// GDN recurrent step: advances state causally
-			engine::modules::GDN::recurrent_step_rows(
-				layer_gdn_state, qkv_rows, gate_rows, beta_rows, out_rows,
-				k_heads, v_heads, config_.linear_head_dim, m, d_rows_, state_.slot_gdn_floats,
-				gdn_snap, state_.slot_gdn_floats, snap_rows, state_.d_snap_on, stream
-			);
-
-			// Gated RMSNorm: gdn_out * rsqrt * norm_weight * silu(z)
-			engine::modules::GDN::gated_rmsnorm(
-				out_rows, z_rows, lw.linear_norm, v_heads, config_.linear_head_dim, stream, false, m
-			);
-
-			// Out proj: projects gdn_out (6144 or 1536) to mlp_out (5120) across all M rows
-			engine::modules::Linear::forward(
-				gdn_out_, lw.out_proj, mlp_out_, stream
-			);
-			linear_idx++;
-		}
-
-		if ( ring_ ) {
-			ring_->all_reduce_rms_norm(
-				mlp_out_,
-				hidden_states_,
-				lw.post_attn_norm,
-				config_.rms_norm_eps,
-				stream,
-				config_.rms_norm_bias,
-				&norm_hidden_
-			);
-		}
-		else {
-			engine::modules::Elementwise::add_residual( hidden_states_, mlp_out_, stream );
-			engine::modules::RMSNorm::forward(
-				hidden_states_, lw.post_attn_norm, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
-			);
-		}
-
-		// 4. MLP
-		engine::modules::Linear::forward(
-			norm_hidden_, lw.gate_proj, gate_buf_, stream
-		);
-
-		engine::modules::Linear::forward(
-			norm_hidden_, lw.up_proj, up_buf_, stream
-		);
-
-		engine::modules::SwiGLU::forward( gate_buf_, up_buf_, mlp_inter_, stream );
-
-		engine::modules::Linear::forward(
-			mlp_inter_, lw.down_proj, mlp_out_, stream
-		);
-
-		if ( ring_ ) {
-			ring_->all_reduce( mlp_out_, stream );
-		}
-		engine::modules::Elementwise::add_residual( hidden_states_, mlp_out_, stream );
+		layer_forward( layers_[layer], full_attn_idx, linear_idx, m, stream );
 
 		// Tapped layer states for DFlash2: tapped_states_[r][tap] = hidden after layer tap_layers[tap]
 		for ( int tap = 0; tap < 5; ++tap ) {
@@ -783,6 +842,10 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 	// Final norm + LM head. Every rank projects its own vocabulary shard, so the 5120 x 248320 head is
 	// four 5120 x 62208 GEMVs running in parallel instead of one 5120 x 248320 GEMV gating rank 0.
 	if ( tp_size_ > 1 || rank_ == 0 ) {
+		// The MTP head reads the final-norm hidden of every prefill row, whether or not the chunk needs logits
+		if ( mtp_on_ && m > pod::MAX_BATCH ) {
+			engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream );
+		}
 		if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
 		if ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) {
 			// Prefill: only the final row's logits are read. A one-row head also takes the int8 GEMV path.
@@ -799,6 +862,92 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 		);
 		engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
 	}
+}
+
+// One MTP forward: row j consumes the target's final hidden at position pos[j] and the embedding of the token that follows it,
+// and predicts the token after that. The head's own attention layer keeps its KV in the slot (layer num_attn_layers).
+void Qwen3_5Pipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream ) {
+	ENGINE_ASSERT( mtp_on_ && weights_loaded_, "Qwen3_5Pipeline::mtp_step: no MTP head" );
+	backend::set_device( rank_ );
+	const int m = rows.count;
+	const int H = config_.hidden_size;
+	const size_t row_bytes = static_cast<size_t>( H ) * sizeof( backend::half_t );
+	ENGINE_ASSERT( m >= 1 && m <= pod::MAX_ROWS, "Qwen3_5Pipeline::mtp_step: rows out of range" );
+	last_slot_ = rows.slot[0];
+	key_hint_ = rows.pos[m - 1] + 1;
+	attn_tc_ = true;
+	for ( int r = 1; r < m; ++r ) attn_tc_ = attn_tc_ && rows.slot[r] == rows.slot[0];
+	set_rows( m );
+	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
+
+	// 1. Normed embedding of the following tokens
+	backend::memcpy_async( d_token_ids_, tokens, m * sizeof( int ), backend::Copy::H2D, stream );
+	pod::TensorView emb = pod::make_tensor_2d( mtp_emb_.data, pod::DType::FP16, m, H );
+	pod::TensorView xe = pod::make_tensor_2d( mtp_xe_.data, pod::DType::FP16, m, H );
+	pod::TensorView xh = pod::make_tensor_2d( mtp_xh_.data, pod::DType::FP16, m, H );
+	engine::modules::Embedding::forward( embed_tokens_, d_token_ids_, m, emb, stream );
+	engine::modules::RMSNorm::forward( emb, mtp_pre_norm_e_, xe, config_.rms_norm_eps, config_.rms_norm_bias, stream );
+
+	// 2. Normed hidden rows
+	const backend::half_t* src = nullptr;
+	switch ( hidden_mode ) {
+		case 0: {   // the last forward's final-norm rows
+			src = norm_hidden_.ptr<const backend::half_t>();
+		} break;
+		case 1: {   // saved row 0, then the last forward's rows 0 .. m - 2 (a prefill chunk continuing a previous one)
+			backend::half_t* st = mtp_stage_.ptr<backend::half_t>();
+			backend::memcpy_async( st, mtp_hist_.ptr<char>() + static_cast<size_t>( hist_row0 ) * row_bytes, row_bytes, backend::Copy::D2D, stream );
+			if ( m > 1 ) backend::memcpy_async( st + H, norm_hidden_.data, static_cast<size_t>( m - 1 ) * row_bytes, backend::Copy::D2D, stream );
+			src = st;
+		} break;
+		case 2: {   // saved rows 0 .. m - 1
+			src = mtp_hist_.ptr<const backend::half_t>() + static_cast<size_t>( hist_row0 ) * H;
+		} break;
+		default: {  // the previous MTP step's last output row
+			src = mtp_chain_.ptr<const backend::half_t>();
+		} break;
+	}
+	pod::TensorView src_view = pod::make_tensor_2d( const_cast<backend::half_t*>( src ), pod::DType::FP16, m, H );
+	engine::modules::RMSNorm::forward( src_view, mtp_pre_norm_h_, xh, config_.rms_norm_eps, config_.rms_norm_bias, stream );
+
+	// 3. fc over [embedding | hidden], row-parallel: this rank's K slice of the concatenation
+	const int K = 2 * H, k_slice = K / tp_ranks_, k0 = rank_ * k_slice;
+	for ( int part = 0; part < 2; ++part ) {
+		const int lo = MAX( k0, part * H ), hi = MIN( k0 + k_slice, ( part + 1 ) * H );
+		if ( lo >= hi ) continue;
+		const backend::half_t* from = ( part == 0 ? xe.ptr<const backend::half_t>() : xh.ptr<const backend::half_t>() ) + ( lo - part * H );
+		backend::memcpy2d_async( mtp_in_.ptr<backend::half_t>() + ( lo - k0 ), static_cast<size_t>( k_slice ) * sizeof( backend::half_t ),
+			from, row_bytes, static_cast<size_t>( hi - lo ) * sizeof( backend::half_t ), m, backend::Copy::D2D, stream );
+	}
+	pod::TensorView fc_in = pod::make_tensor_2d( mtp_in_.data, pod::DType::FP16, m, k_slice );
+	engine::modules::Linear::forward( fc_in, mtp_fc_, mlp_out_, stream );
+	if ( ring_ ) ring_->all_reduce( mlp_out_, stream );
+	backend::memcpy_async( hidden_states_.data, mlp_out_.data, static_cast<size_t>( m ) * row_bytes, backend::Copy::D2D, stream );
+
+	// 4. The head's decoder layer
+	int attn_idx = config_.num_attn_layers, lin_idx = 0;
+	layer_forward( mtp_layer_, attn_idx, lin_idx, m, stream );
+
+	// 5. Final norm; the last row stays for the next chained step and feeds the shared LM head
+	pod::TensorView out = pod::make_tensor_2d( mtp_out_.data, pod::DType::FP16, m, H );
+	engine::modules::RMSNorm::forward( hidden_states_, mtp_norm_, out, config_.rms_norm_eps, config_.rms_norm_bias, stream );
+	backend::memcpy_async( mtp_chain_.data, mtp_out_.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * H, row_bytes, backend::Copy::D2D, stream );
+	if ( logits_last && ( tp_size_ > 1 || rank_ == 0 ) ) {
+		pod::TensorView n1 = pod::make_tensor_2d( mtp_chain_.data, pod::DType::FP16, 1, H );
+		pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
+		engine::modules::Linear::forward( n1, lm_head_, l1, stream );
+		logits_.shape[0] = 1;
+		last_rows_ = 1;
+	}
+}
+
+// Keeps rows [src_row, src_row + rows) of the last forward's final-norm hidden for later MTP steps (row dst_row onwards)
+void Qwen3_5Pipeline::mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream ) {
+	ENGINE_ASSERT( mtp_on_ && rows >= 1 && dst_row + rows <= 2 * ( kDraftM + 1 ), "Qwen3_5Pipeline::mtp_save_hist: rows out of range" );
+	backend::set_device( rank_ );
+	const size_t row_bytes = static_cast<size_t>( config_.hidden_size ) * sizeof( backend::half_t );
+	backend::memcpy_async( mtp_hist_.ptr<char>() + static_cast<size_t>( dst_row ) * row_bytes, norm_hidden_.ptr<const char>() + static_cast<size_t>( src_row ) * row_bytes,
+		static_cast<size_t>( rows ) * row_bytes, backend::Copy::D2D, stream );
 }
 
 void Qwen3_5Pipeline::destroy() {

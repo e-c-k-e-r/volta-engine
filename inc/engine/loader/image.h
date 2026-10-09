@@ -1,0 +1,54 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace engine::loader {
+
+struct DecodedImage {
+	int width = 0;
+	int height = 0;
+	std::vector<uint8_t> rgb; // [height, width, 3]
+};
+
+// JPEG, PNG, BMP, GIF (first frame) from memory. Alpha is composited onto white.
+bool decode_image( const uint8_t* data, size_t size, DecodedImage* out, std::string* error );
+
+// The image processor of the checkpoint (preprocessor_config.json + vision_config).
+struct VisionParams {
+	int patch_size = 16;
+	int merge_size = 2;
+	int temporal_patch_size = 2;
+	int min_pixels = 65536;
+	int max_pixels = 1048576;
+	float mean[3] = { 0.5f, 0.5f, 0.5f };
+	float stddev[3] = { 0.5f, 0.5f, 0.5f };
+};
+
+// An image resized to the patch grid and cut into patches, ready for the vision tower.
+struct PreparedImage {
+	int grid_h = 0; // patches per column / row (multiples of merge_size)
+	int grid_w = 0;
+	uint64_t hash = 0; // of the decoded pixels and the grid
+	std::vector<float> patches; // [grid_h * grid_w, 3 * temporal * patch * patch], merge-block order
+
+	int num_patches() const { return grid_h * grid_w; }
+	int tokens( int merge_size ) const { return num_patches() / ( merge_size * merge_size ); }
+};
+
+// Qwen2-VL smart resize: dimensions rounded to multiples of patch * merge inside [min_pixels, max_pixels].
+void smart_resize( int height, int width, int factor, int min_pixels, int max_pixels, int* out_h, int* out_w );
+
+bool prepare_image( const DecodedImage& img, const VisionParams& p, PreparedImage* out, std::string* error );
+
+// Antialiased bicubic resize (PIL / torchvision antialias=True semantics), float output in [0, 255].
+std::vector<float> resize_bicubic( const uint8_t* rgb, int in_h, int in_w, int out_h, int out_w );
+
+// Standard-alphabet base64 (padding and ASCII whitespace tolerated). False on any other character.
+bool base64_decode( const std::string& in, std::string* out );
+
+uint64_t hash_bytes( const void* data, size_t size, uint64_t seed = 0xcbf29ce484222325ULL );
+
+} // namespace engine::loader
