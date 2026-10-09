@@ -274,6 +274,9 @@ set_target_properties(test_rows PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_B
 add_executable(test_moe tests/2_parity/test_moe.cpp)
 target_link_libraries(test_moe PRIVATE engine_kernels)
 set_target_properties(test_moe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_gr_tc tests/2_parity/test_gr_tc.cpp)
+target_link_libraries(test_gr_tc PRIVATE engine_kernels)
+set_target_properties(test_gr_tc PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Test Norm & Elementwise Parity
 add_executable(test_norm tests/2_parity/test_norm.cpp)

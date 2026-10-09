@@ -119,5 +119,7 @@ Rank 0's shared expert now runs on a side stream beside the router and the fused
 
 The gated add after each sublayer is deferred into the next site's norm pass (`GatedResidual::mix` prev_post / prev_y; flushed before any other stream reader and at the end of every captured body): 21.5 -> 21.3 ms/token, outputs bit-identical (decode tokens, prefix restore max |dlogit| 0, API suite with MTP).
 
+Prefill: the gated-residual gate / up projections were 37% of GPU time at 512-row chunks (fp32 row-tile kernels, FMA bound). For more than 8 rows they now run as cuBLAS tensor-core GEMM pairs on fp16 hi / lo splits of the fp32 operands (fp32 accumulation; `GatedResidual::norm / gemm_f32 / gate_act / up_epilogue`, always at the full 512-row capacity so a row's result is bit-identical whatever its position or chunk size): prefill 504 -> 713 tok/s (8K tokens, chunk 512), 12K needle 675 tok/s. `test_gr_tc`: rel L2 7e-6 against the fp32 kernels, row-shift invariance exact. A plain fp16 version was faster (752) but moved logits by up to 1.0 and was dropped. Decode rows keep the fp32 kernels. Any perturbation moves the logits by a few tenths through router flips; split-vs-cold prefill at an unaligned cut already differed by 0.28 before this change.
+
 Next: a GEMV for the N=640 shared-expert shapes, a tensor-core QSA scorer and sparse
 kernel, the SASS / bench baselines and the 256K needle.

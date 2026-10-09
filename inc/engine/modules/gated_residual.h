@@ -36,6 +36,20 @@ struct GatedResidual {
 		const backend::half_t* prev_y = nullptr
 	);
 
+	// Tensor-core variant of mix() for many rows, composed by the caller. The fp32 operands are split into fp16 hi / lo halves and every product is two fp16 GEMMs
+	// accumulated in fp32 (fp32-class accuracy):
+	//   norm():        the norm pass of mix() (with the folded deferred apply), also writing normed as fp16 hi / lo when normed_hi is set
+	//   gemm_f32 x2:   z = normed_hi @ [down; inject]^T, then z += normed_lo @ [down; inject]^T   (fp32 [rows, ld])
+	//   gate_act():    t = silu( z / hc ) over `rank` columns (as hi / lo), post = 2 * sigmoid( z / hc ) over the hc columns after them
+	//   gemm_f32 x2:   u = t_hi @ up^T, then u += t_lo @ up^T   (fp32 [rows, hc * hidden])
+	//   up_epilogue(): mixed = mean_s( sigmoid( u[s] ) * normed[s] )
+	static void norm( float* x, const backend::half_t* norm_w, float* normed, backend::half_t* normed_hi, backend::half_t* normed_lo, int rows, int hidden, int hc, float eps,
+		const float* prev_post, const backend::half_t* prev_y, backend::stream_t stream );
+	// out[m, n] (fp32) (+)= a[m, k] (fp16) @ w[n, k]^T (fp16), fp32 accumulation on the tensor cores
+	static void gemm_f32( const backend::half_t* a, const backend::half_t* w, float* out, int m, int n, int k, bool accumulate, backend::stream_t stream );
+	static void gate_act( const float* z, int ld, backend::half_t* t_hi, backend::half_t* t_lo, float* post, int rows, int rank, int hc, bool has_inject, backend::stream_t stream );
+	static void up_epilogue( const float* u, const float* normed, backend::half_t* mixed, int rows, int hidden, int hc, backend::stream_t stream );
+
 	// y[r, :] += sigmoid( x[r] . w ) * s[r, :]  (the shared expert's output gate; w [hidden] fp16)
 	static void add_sigmoid_gated( backend::half_t* y, const backend::half_t* s, const backend::half_t* x, const backend::half_t* w, int rows, int hidden, backend::stream_t stream );
 

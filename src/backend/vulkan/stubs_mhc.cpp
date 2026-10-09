@@ -47,6 +47,26 @@ __attribute__(( weak )) void GatedResidual::init_streams( const backend::half_t*
 	__builtin_unreachable();
 }
 
+__attribute__(( weak )) void GatedResidual::norm( float*, const backend::half_t*, float*, backend::half_t*, backend::half_t*, int, int, int, float, const float*, const backend::half_t*, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GatedResidual::norm" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void GatedResidual::gemm_f32( const backend::half_t*, const backend::half_t*, float*, int, int, int, bool, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GatedResidual::gemm_f32" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void GatedResidual::gate_act( const float*, int, backend::half_t*, backend::half_t*, float*, int, int, int, bool, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GatedResidual::gate_act" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void GatedResidual::up_epilogue( const float*, const float*, backend::half_t*, int, int, int, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GatedResidual::up_epilogue" );
+	__builtin_unreachable();
+}
+
 __attribute__(( weak )) void GatedResidual::mix( const float*, const backend::half_t*, const backend::half_t*, const backend::half_t*, const backend::half_t*,
 	backend::half_t*, float*, float*, int, int, int, int, float, backend::stream_t, const float*, const backend::half_t* ) {
 	ENGINE_UNSUPPORTED( "GatedResidual::mix" );

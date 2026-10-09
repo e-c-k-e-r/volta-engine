@@ -63,6 +63,8 @@ struct Qwen4ExpGatedResidual {
 	pod::TensorView down;      // [rank, hc_mult * hidden]
 	pod::TensorView up;        // [hc_mult * hidden, rank]
 	pod::TensorView inject;    // [hc_mult, hc_mult * hidden] (absent on the final mixer)
+	// Tensor-core path (many rows): [down; inject; zero pad] as one dense fp16 weight (n = rank + 8) and the up matrix as a dense fp16 weight
+	pod::LinearWeight down_lw, up_lw;
 };
 
 struct Qwen4ExpPLEWeights {
@@ -147,6 +149,7 @@ private:
 	void gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream );
 	void defer_apply();
 	void flush_apply( int m, backend::stream_t stream );
+	pod::TensorView gr16_hi_, gr16_lo_, gr16_z_, gr16_thi_, gr16_tlo_, gr16_u_;   // operands / results of the tensor-core gated residual (prefill rows)
 	bool apply_pending_ = false;   // a gated add (post_, y_) waits to be folded into the next gr_mix
 	// N-gram embedding layer: host gather of the rows for the forward (called from forward()), device gate / conv (from forward_body)
 	void ple_prepare( const pod::BatchRows& rows, int m, backend::stream_t stream );

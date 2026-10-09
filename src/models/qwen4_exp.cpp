@@ -169,6 +169,16 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	post_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.hc_mult * sizeof( float ) ) );
 	gr_scratch_ = static_cast<float*>( engine::core::arena_alloc( arena,
 		engine::modules::GatedResidual::scratch_floats( R, H, config_.hc_mult, config_.hc_rank ) * sizeof( float ) ) );
+	{
+		const int flat = config_.hc_mult * H;
+		int s_flat[2] = { R, flat }, s_z[2] = { R, config_.hc_rank + 8 }, s_t[2] = { R, config_.hc_rank };
+		gr16_hi_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, s_flat, 2 );
+		gr16_lo_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, s_flat, 2 );
+		gr16_u_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, s_flat, 2 );
+		gr16_z_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, s_z, 2 );
+		gr16_thi_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, s_t, 2 );
+		gr16_tlo_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, s_t, 2 );
+	}
 	int qg_shape[2] = { R, q_heads_ * config_.head_dim * 2 };
 	q_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qg_shape, 2 );
 	int q_shape[2] = { R, q_heads_ * config_.head_dim };
@@ -317,6 +327,20 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		std::snprintf( n2, sizeof( n2 ), "%s.input_mix_weight_down.weight", prefix ); g.down = dense( n2 );
 		std::snprintf( n2, sizeof( n2 ), "%s.input_mix_weight_up.weight", prefix ); g.up = dense( n2 );
 		if ( inject ) { std::snprintf( n2, sizeof( n2 ), "%s.block_inject_weight.weight", prefix ); g.inject = dense( n2 ); }
+		if ( g.down.data && g.up.data ) {
+			// Dense fp16 views for the tensor-core path: [rank (+ hc, padded to 8), flat] row-major = an [n, k] matrix tagged [k, n]
+			const int flat = config_.hc_mult * config_.hidden_size, rank = config_.hc_rank;
+			const int n_cat = inject ? rank + 8 : rank;
+			const size_t row_bytes = static_cast<size_t>( flat ) * sizeof( backend::half_t );
+			auto* cat = static_cast<char*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( n_cat ) * row_bytes, 128 ) );
+			backend::memcpy_async( cat, g.down.data, static_cast<size_t>( rank ) * row_bytes, backend::Copy::D2D, stream );
+			if ( inject ) {
+				backend::memcpy_async( cat + static_cast<size_t>( rank ) * row_bytes, g.inject.data, static_cast<size_t>( config_.hc_mult ) * row_bytes, backend::Copy::D2D, stream );
+				backend::memset_async( cat + static_cast<size_t>( rank + config_.hc_mult ) * row_bytes, 0, static_cast<size_t>( 8 - config_.hc_mult ) * row_bytes, stream );
+			}
+			g.down_lw = pod::LinearWeight::make_fp16( pod::make_tensor_2d( cat, pod::DType::FP16, flat, n_cat ) );
+			g.up_lw = pod::LinearWeight::make_fp16( pod::make_tensor_2d( g.up.data, pod::DType::FP16, rank, flat ) );
+		}
 		return g;
 	};
 	// Column-parallel (output split) and row-parallel (input split) trellis projections
@@ -580,6 +604,29 @@ void Qwen4ExpPipeline::trace_route( int tag, int m, backend::stream_t stream ) {
 }
 
 void Qwen4ExpPipeline::gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream ) {
+	// Prefill rows: the gate and up projections are dense fp16 GEMMs on the tensor cores (the row-tile kernels below are fp32 FMA bound at hundreds
+	// of rows); decode rows (a few) keep the fp32 kernels, whose reads of the 13 MB of weights are the floor there
+	// The GEMMs always run at the full row capacity: cuBLAS then picks one algorithm and a row's result is bit-identical whatever its position in the chunk or the
+	// chunk size (test_gr_tc); the rows past m are stale but never read.
+	// Prefill rows: the gate and up projections run on the tensor cores as fp16 hi / lo GEMM pairs with fp32 accumulation (the row-tile kernels below are fp32
+	// FMA bound at hundreds of rows); decode rows (a few) keep the fp32 kernels, whose reads of the 13 MB of weights are the floor there
+	if ( with_post && m > 8 && g.down_lw.is_valid() ) {
+		using GR = engine::modules::GatedResidual;
+		using half_t = backend::half_t;
+		const int H = config_.hidden_size, hc = config_.hc_mult, flat = hc * H, rank = config_.hc_rank;
+		GR::norm( streams_.ptr<float>(), g.norm.ptr<const half_t>(), gr_scratch_, gr16_hi_.ptr<half_t>(), gr16_lo_.ptr<half_t>(), m, H, hc, config_.rms_norm_eps,
+			apply_pending_ ? post_ : nullptr, apply_pending_ ? y_.ptr<const half_t>() : nullptr, stream );
+		apply_pending_ = false;
+		const half_t* wd = g.down_lw.w0.ptr<const half_t>();
+		const half_t* wu = g.up_lw.w0.ptr<const half_t>();
+		GR::gemm_f32( gr16_hi_.ptr<const half_t>(), wd, gr16_z_.ptr<float>(), pod::MAX_ROWS, rank + 8, flat, false, stream );
+		GR::gemm_f32( gr16_lo_.ptr<const half_t>(), wd, gr16_z_.ptr<float>(), pod::MAX_ROWS, rank + 8, flat, true, stream );
+		GR::gate_act( gr16_z_.ptr<const float>(), rank + 8, gr16_thi_.ptr<half_t>(), gr16_tlo_.ptr<half_t>(), post_, m, rank, hc, true, stream );
+		GR::gemm_f32( gr16_thi_.ptr<const half_t>(), wu, gr16_u_.ptr<float>(), pod::MAX_ROWS, flat, rank, false, stream );
+		GR::gemm_f32( gr16_tlo_.ptr<const half_t>(), wu, gr16_u_.ptr<float>(), pod::MAX_ROWS, flat, rank, true, stream );
+		GR::up_epilogue( gr16_u_.ptr<const float>(), gr_scratch_, mixed_.ptr<half_t>(), m, H, hc, stream );
+		return;
+	}
 	engine::modules::GatedResidual::mix(
 		streams_.ptr<const float>(), g.norm.ptr<const backend::half_t>(), g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(),
 		with_post ? g.inject.ptr<const backend::half_t>() : nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_,

@@ -1,5 +1,7 @@
 #include "engine/modules/gated_residual.h"
 #include "engine/config.h"
+#include "trellis_context.h"
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cmath>
 
@@ -24,7 +26,7 @@ __global__ void gr_init_kernel( const half* __restrict__ in, float* __restrict__
 // One block per (row, stream): normed[r, s, :] = x * rsqrt(mean(x^2) + eps) * (1 + w[s, :]). With prev_y the previous site's gated add
 // x += post[r, s] * y[r, :] is applied (and stored) in the same pass, so the streams are read and written once between two sites.
 __global__ void gr_norm_kernel( float* __restrict__ x, const half* __restrict__ w, float* __restrict__ normed, int hidden, int hc, float eps,
-	const float* __restrict__ prev_post, const half* __restrict__ prev_y ) {
+	const float* __restrict__ prev_post, const half* __restrict__ prev_y, half* __restrict__ normed_hi, half* __restrict__ normed_lo ) {
 	const int r = blockIdx.x, s = blockIdx.y;
 	const size_t base = ( static_cast<size_t>( r ) * hc + s ) * hidden;
 	const float p = prev_y != nullptr ? prev_post[static_cast<size_t>( r ) * hc + s] : 0.0f;
@@ -45,7 +47,13 @@ __global__ void gr_norm_kernel( float* __restrict__ x, const half* __restrict__ 
 	for ( int i = 0; i < ( blockDim.x >> 5 ); ++i ) total += ws[i];
 	const float inv = rsqrtf( total / hidden + eps );
 	for ( int d = threadIdx.x; d < hidden; d += blockDim.x ) {
-		normed[base + d] = x[base + d] * inv * ( 1.0f + __half2float( w[static_cast<size_t>( s ) * hidden + d] ) );
+		const float nv = x[base + d] * inv * ( 1.0f + __half2float( w[static_cast<size_t>( s ) * hidden + d] ) );
+		normed[base + d] = nv;
+		if ( normed_hi != nullptr ) {
+			const half hi = __float2half_rn( nv );
+			normed_hi[base + d] = hi;
+			normed_lo[base + d] = __float2half_rn( nv - __half2float( hi ) );
+		}
 	}
 }
 
@@ -231,7 +239,64 @@ __global__ void gr_add_broadcast_kernel( const half* __restrict__ h, const half*
 	streams[o] = __half2float( h[o] ) + __half2float( e[static_cast<size_t>( r ) * hidden + d] );
 }
 
+// Tensor-core path (more than a few rows). The fp32 operands are split into an fp16 hi part and an fp16 lo part (x = hi + lo to ~2^-22) and each product is two
+// fp16 GEMMs accumulated in fp32, so the result keeps the fp32 kernels' accuracy: z = fp32 [rows, ld] = normed @ [down; inject]^T. t = silu( z / hc ) over the
+// rank columns (stored as hi / lo), post = 2 * sigmoid( z / hc ) over the hc inject columns that follow
+__global__ void gr_gate_act_kernel( const float* __restrict__ z, int ld, half* __restrict__ t_hi, half* __restrict__ t_lo, float* __restrict__ post, int rank, int hc, int has_inject ) {
+	const int r = blockIdx.x;
+	const float* zr = z + static_cast<size_t>( r ) * ld;
+	for ( int j = threadIdx.x; j < rank + ( has_inject ? hc : 0 ); j += blockDim.x ) {
+		const float v = zr[j] / hc;
+		if ( j < rank ) {
+			const float tv = v / ( 1.0f + __expf( -v ) );
+			const half hi = __float2half_rn( tv );
+			t_hi[static_cast<size_t>( r ) * rank + j] = hi;
+			t_lo[static_cast<size_t>( r ) * rank + j] = __float2half_rn( tv - __half2float( hi ) );
+		}
+		else post[static_cast<size_t>( r ) * hc + ( j - rank )] = 2.0f / ( 1.0f + __expf( -v ) );
+	}
+}
+
+// mixed[r, d] = mean_s( sigmoid( u[r, s * hidden + d] ) * normed[r, s, d] )
+__global__ void gr_up_epilogue_kernel( const float* __restrict__ u, const float* __restrict__ normed, half* __restrict__ mixed, int hidden, int hc ) {
+	const int r = blockIdx.y;
+	const int d = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( d >= hidden ) return;
+	float out = 0.0f;
+	for ( int s = 0; s < hc; ++s ) {
+		const float g = 1.0f / ( 1.0f + __expf( -u[static_cast<size_t>( r ) * hc * hidden + static_cast<size_t>( s ) * hidden + d] ) );
+		out += g * normed[( static_cast<size_t>( r ) * hc + s ) * hidden + d];
+	}
+	mixed[static_cast<size_t>( r ) * hidden + d] = __float2half_rn( out / hc );
+}
+
 } // namespace
+
+void GatedResidual::norm( float* x, const backend::half_t* norm_w, float* normed, backend::half_t* normed_hi, backend::half_t* normed_lo, int rows, int hidden, int hc, float eps,
+	const float* prev_post, const backend::half_t* prev_y, backend::stream_t stream ) {
+	gr_norm_kernel<<<dim3( rows, hc ), 256, 0, stream>>>( x, reinterpret_cast<const half*>( norm_w ), normed, hidden, hc, eps, prev_post, reinterpret_cast<const half*>( prev_y ),
+		reinterpret_cast<half*>( normed_hi ), reinterpret_cast<half*>( normed_lo ) );
+}
+
+void GatedResidual::gemm_f32( const backend::half_t* a, const backend::half_t* w, float* out, int m, int n, int k, bool accumulate, backend::stream_t stream ) {
+	int device = 0;
+	cudaGetDevice( &device );
+	cublasHandle_t h = trellis_get_cublas( device );
+	cublasSetStream( h, stream );
+	const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
+	// C^T[n, m] = W[n, k] A^T with W and A row-major (k fastest)
+	const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, w, CUDA_R_16F, k, a, CUDA_R_16F, k, &beta, out, CUDA_R_32F, n, CUBLAS_COMPUTE_32F,
+		CUBLAS_GEMM_DEFAULT_TENSOR_OP );
+	ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "GatedResidual::gemm_f32: cublasGemmEx failed" );
+}
+
+void GatedResidual::gate_act( const float* z, int ld, backend::half_t* t_hi, backend::half_t* t_lo, float* post, int rows, int rank, int hc, bool has_inject, backend::stream_t stream ) {
+	gr_gate_act_kernel<<<rows, 128, 0, stream>>>( z, ld, reinterpret_cast<half*>( t_hi ), reinterpret_cast<half*>( t_lo ), post, rank, hc, has_inject ? 1 : 0 );
+}
+
+void GatedResidual::up_epilogue( const float* u, const float* normed, backend::half_t* mixed, int rows, int hidden, int hc, backend::stream_t stream ) {
+	gr_up_epilogue_kernel<<<dim3( ( hidden + 255 ) / 256, rows ), 256, 0, stream>>>( u, normed, reinterpret_cast<half*>( mixed ), hidden, hc );
+}
 
 void GatedResidual::stream_norm( const float* x, const backend::half_t* w, backend::half_t* out, int rows, int hidden, int hc, float eps, backend::stream_t stream ) {
 	gr_stream_norm_kernel<<<dim3( rows, hc ), 256, 0, stream>>>( x, reinterpret_cast<const half*>( w ), reinterpret_cast<half*>( out ), hidden, hc, eps );
@@ -259,7 +324,7 @@ void GatedResidual::mix(
 	float* normed = scratch;
 	float* t = scratch + static_cast<size_t>( rows ) * flat;
 	gr_norm_kernel<<<dim3( rows, hc ), 256, 0, stream>>>( const_cast<float*>( x ), reinterpret_cast<const half*>( norm_w ), normed, hidden, hc, eps, prev_post,
-		reinterpret_cast<const half*>( prev_y ) );
+		reinterpret_cast<const half*>( prev_y ), nullptr, nullptr );
 	const int has_inject = inject != nullptr ? 1 : 0;
 	gr_gate_kernel<<<dim3( ( rank + ( has_inject ? hc : 0 ) + GR_JT - 1 ) / GR_JT, ( rows + GR_RT - 1 ) / GR_RT ), 128, 0, stream>>>(
 		normed, reinterpret_cast<const half*>( down ), reinterpret_cast<const half*>( inject ), t, post, flat, rank, hc, rows, has_inject );
