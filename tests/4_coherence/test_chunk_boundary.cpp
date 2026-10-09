@@ -1,13 +1,15 @@
 // How much the next-token logits move when a prompt is prefilled in two parts at a different cut than the cold run's chunk
 // boundaries (GLM). No snapshot needed, so it also runs with ENGINE_DSA=0 to separate the sparse-attention selection from
 // the rest. Prints max |dlogit| of the candidate logits per cut; a cut that is a multiple of the prefill chunk must be 0.
-//   test_chunk_boundary [--tokens N] [--cuts a,b,c]
+//   test_chunk_boundary [--tokens N] [--cuts a,b,c] [--save file] [--ref file]
+// --save writes the cold run's candidates; --ref compares them with a saved run by token id (noise-floor probes: ENGINE_DEBUG_PERTURB_EMBED=eps).
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <cstdio>
 
 using namespace engine::runtime;
 
@@ -15,8 +17,12 @@ int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	int n_tokens = 6000;
 	std::vector<int> cuts = { 2560, 3008, 2572, 100 };
+	const char* save = nullptr;
+	const char* ref = nullptr;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
+		else if ( !std::strcmp( argv[i], "--save" ) && i + 1 < argc ) save = argv[++i];
+		else if ( !std::strcmp( argv[i], "--ref" ) && i + 1 < argc ) ref = argv[++i];
 		else if ( !std::strcmp( argv[i], "--cuts" ) && i + 1 < argc ) {
 			cuts.clear();
 			for ( char* p = argv[++i]; *p; ) {
@@ -49,6 +55,27 @@ int main( int argc, char** argv ) {
 	mc.reset_slot( 0 );
 	Candidates cold;
 	const int cold_first = mc.prefill( ids.data(), n, 0, 0, &cold );
+	if ( save ) {
+		if ( FILE* f = std::fopen( save, "wb" ) ) {
+			std::fwrite( &cold, sizeof( cold ), 1, f );
+			std::fclose( f );
+		}
+	}
+	if ( ref ) {
+		Candidates r;
+		FILE* f = std::fopen( ref, "rb" );
+		if ( f && std::fread( &r, sizeof( r ), 1, f ) == 1 ) {
+			float d = 0.0f;
+			int common = 0;
+			for ( int i = 0; i < cold.n; ++i ) {
+				for ( int j = 0; j < r.n; ++j ) {
+					if ( r.ids[j] == cold.ids[i] ) { d = std::max( d, std::fabs( r.logits[j] - cold.logits[i] ) ); ++common; }
+				}
+			}
+			std::printf( "[*] vs %s: %d common candidates, max |dlogit| %.4f, top-1 %s\n", ref, common, d, r.ids[0] == cold.ids[0] ? "same" : "DIFFERENT" );
+		}
+		if ( f ) std::fclose( f );
+	}
 	for ( int cut : cuts ) {
 		mc.reset_slot( 0 );
 		mc.prefill( ids.data(), cut, 0 );
