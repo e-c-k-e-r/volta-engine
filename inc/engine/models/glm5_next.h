@@ -208,8 +208,13 @@ private:
 	engine::modules::ExpertTier tier_;
 	pod::MemoryArena host_arena_{};     // pinned cold-expert tier
 	int tier_layers_ = 0;
-	backend::half_t* latent_cache_ = nullptr;    // [slots][mla layers][max_seq][512]
+	void* latent_cache_ = nullptr;    // [slots][mla layers][max_seq][512] in latent_q_ (K and V are the same latent)
+	void* latent_scales_ = nullptr;   // per-block scales of the quantized formats, same element indexing
+	pod::KVQ latent_q_ = pod::KVQ::F16;
 	size_t latent_slot_stride_ = 0;   // elements per slot
+	pod::KVRef latent_ref() const;
+	size_t latent_data_bytes( size_t elems ) const { return pod::kv_data_bytes( latent_q_, elems ); }
+	size_t latent_scale_bytes( size_t elems ) const { return pod::kv_scale_bytes( latent_q_, elems ); }
 	float* latent_ws_ = nullptr;      // split-KV partials
 	pod::TensorView q_lat_;           // [rows, 16 * 512]
 	// DSA (ENGINE_DSA, default on with the latent cache): indexer planes and selection scratch

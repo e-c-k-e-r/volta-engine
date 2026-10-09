@@ -22,7 +22,7 @@
 
 | Test | Tier | GPU | Checks |
 |---|---|---|---|
-| `test_rows`, `test_moe`, `test_nvfp4_linear`, `test_mla_latent`, `test_spec_state`, `test_dflash` | 2 | yes | layer and speculator parity with real weights |
+| `test_rows`, `test_moe`, `test_nvfp4_linear`, `test_mla_latent`, `test_spec_state`, `test_dflash` | 2 | yes | layer and speculator parity with real weights (`test_mla_latent` also covers the FP8 / int8 / NVFP4 latent caches) |
 | `test_tokenizer`, `test_tokenizer_file --cases` | 2 | no | token-exact against HF tokenizers (fixtures in `tests/data`) |
 | `test_coherence`, `test_sampling_gpu` | 4 | yes | greedy determinism, seeded sampling, speculative equivalence |
 | `test_prefix_restore` (`--spec`, `--glm`, `ENGINE_KV_FORMAT=fp8`) | 2 | yes | a restored snapshot continues exactly like the same prefill without one |

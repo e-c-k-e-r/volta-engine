@@ -35,7 +35,7 @@ __attribute__(( weak )) void MLALatent::absorb_q( const pod::TensorView& q, cons
 	__builtin_unreachable();
 }
 
-__attribute__(( weak )) void MLALatent::attend( const backend::half_t* cache, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads, const pod::SlotRef& slot, float* workspace, int key_hint, backend::stream_t stream, const int* sel_idx, const int* sel_n ) {
+__attribute__(( weak )) void MLALatent::attend( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads, const pod::SlotRef& slot, float* workspace, int key_hint, backend::stream_t stream, const int* sel_idx, const int* sel_n ) {
 	ENGINE_UNSUPPORTED( "MLALatent::attend" );
 	__builtin_unreachable();
 }
@@ -50,7 +50,7 @@ __attribute__(( weak )) void MLALatent::expand_out( const pod::TensorView& o_lat
 	__builtin_unreachable();
 }
 
-__attribute__(( weak )) void MLALatent::store( backend::half_t* cache, const pod::TensorView& c, int layer, int max_seq, int rows, const pod::SlotRef& slot, backend::stream_t stream ) {
+__attribute__(( weak )) void MLALatent::store( const pod::KVRef& kv, const pod::TensorView& c, int layer, int max_seq, int rows, const pod::SlotRef& slot, backend::stream_t stream ) {
 	ENGINE_UNSUPPORTED( "MLALatent::store" );
 	__builtin_unreachable();
 }

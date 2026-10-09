@@ -70,7 +70,9 @@ void MLALatent::expand_out( const pod::TensorView& o_lat, const pod::TensorView&
 	}
 }
 
-void MLALatent::store( backend::half_t* cache, const pod::TensorView& c, int layer, int max_seq, int rows, const pod::SlotRef& slot, backend::stream_t ) {
+void MLALatent::store( const pod::KVRef& kv, const pod::TensorView& c, int layer, int max_seq, int rows, const pod::SlotRef& slot, backend::stream_t ) {
+	ENGINE_ASSERT( kv.kq == pod::KVQ::F16, "MLALatent::store (CPU): FP16 latent cache only" );
+	backend::half_t* cache = static_cast<backend::half_t*>( kv.k );
 	ENGINE_ASSERT( slot.rows != nullptr, "MLALatent::store: device-resolved positions only" );
 	const h16* src = c.ptr<const h16>();
 	for ( int r = 0; r < rows; ++r ) {
@@ -80,8 +82,10 @@ void MLALatent::store( backend::half_t* cache, const pod::TensorView& c, int lay
 	}
 }
 
-void MLALatent::attend( const backend::half_t* cache, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
+void MLALatent::attend( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
 	const pod::SlotRef& slot, float*, int, backend::stream_t, const int* sel_idx, const int* sel_n ) {
+	ENGINE_ASSERT( kv.kq == pod::KVQ::F16, "MLALatent::attend (CPU): FP16 latent cache only" );
+	const backend::half_t* cache = static_cast<const backend::half_t*>( kv.k );
 	ENGINE_ASSERT( slot.rows != nullptr && slot.row == 0, "MLALatent::attend (CPU): device-resolved positions starting at row 0" );
 	const float scale = 1.0f / std::sqrt( static_cast<float>( HD ) );
 	const h16* q = q_lat.ptr<const h16>();

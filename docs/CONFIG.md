@@ -37,7 +37,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `max_slots` | int | `0` | `ENGINE_MAX_SLOTS` | decode slots; 0 = the model default (Qwen 8, GLM 1) |
 | `prefix_cache_gib` | int | `16` | `ENGINE_PREFIX_CACHE_GIB` | pinned host RAM for the prefix cache (sequence snapshots); 0 = off |
 | `prefix_interval` | int | `16384` | `ENGINE_PREFIX_INTERVAL` | prompt tokens between automatic prefix checkpoints inside long prompts; 0 = only the requested ones |
-| `kv_format` | string | `(empty)` | `ENGINE_KV_FORMAT` | KV cache format: fp16, fp8, k8v4 or nvfp4; empty = the model default (fp16) |
+| `kv_format` | string | `(empty)` | `ENGINE_KV_FORMAT` | KV cache format: fp16, fp8, k8v4 or nvfp4; empty = the model default (fp16). GLM stores its single latent tensor in one format (k8v4 = 8-bit) |
 | `expert_cache` | float | `1` | `ENGINE_EXPERT_CACHE` | GLM resident routed-expert fraction in (0, 1]; below 1 enables the two-tier expert cache |
 | `expert_adapt_every` | int | `64` | `ENGINE_EXPERT_ADAPT_EVERY` | decode steps between expert residency rebalances (0 = never) |
 | `expert_swaps` | int | `-1` | `ENGINE_EXPERT_SWAPS` | maximum expert swaps per rebalance; <0 = the tier default |

@@ -151,9 +151,22 @@ bool Glm5NextPipeline::init(
 	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	{
 		latent_slot_stride_ = static_cast<size_t>( config_.num_mla_layers ) * config_.max_seq * 512;
-		latent_cache_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * latent_slot_stride_ * sizeof( backend::half_t ), 128 ) );
+		// kv_format applies to the latent as one tensor: k8v4 stores it as 8-bit (K precision), the others as named
+		const std::string& fmt = engine::runtime::options().kv_format;
+		if ( fmt == "fp8" ) latent_q_ = pod::KVQ::E5M2;
+		else if ( fmt == "k8v4" ) latent_q_ = pod::KVQ::I8;
+		else if ( fmt == "nvfp4" ) latent_q_ = pod::KVQ::FP4;
+		else latent_q_ = pod::KVQ::F16;
+		const size_t data_bytes = static_cast<size_t>( S ) * latent_data_bytes( latent_slot_stride_ );
+		const size_t scale_bytes = static_cast<size_t>( S ) * latent_scale_bytes( latent_slot_stride_ );
+		latent_cache_ = engine::core::arena_alloc( arena, data_bytes, 128 );
 		ENGINE_ASSERT( latent_cache_ != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the latent cache" );
-		backend::memset_sync( latent_cache_, 0, static_cast<size_t>( S ) * latent_slot_stride_ * sizeof( backend::half_t ) );
+		backend::memset_sync( latent_cache_, 0, data_bytes );
+		if ( scale_bytes ) {
+			latent_scales_ = engine::core::arena_alloc( arena, scale_bytes, 128 );
+			ENGINE_ASSERT( latent_scales_ != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the latent scales" );
+			backend::memset_sync( latent_scales_, 0, scale_bytes );
+		}
 		latent_ws_ = static_cast<float*>( engine::core::arena_alloc( arena, engine::modules::MLALatent::workspace_floats( config_.max_seq, 16 ) * sizeof( float ), 128 ) );
 		ENGINE_ASSERT( latent_ws_ != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the latent workspace" );
 		int lat_shape[2] = { R, 16 * 512 };
@@ -347,10 +360,22 @@ bool Glm5NextPipeline::expert_heat( std::vector<uint32_t>& out, int& layers, int
 	return layers > 0;
 }
 
+pod::KVRef Glm5NextPipeline::latent_ref() const {
+	pod::KVRef r;
+	r.k = latent_cache_;
+	r.v = latent_cache_;
+	r.ks = latent_scales_;
+	r.vs = latent_scales_;
+	r.kq = latent_q_;
+	r.vq = latent_q_;
+	return r;
+}
+
 void Glm5NextPipeline::reset_state( int slot_id ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Glm5NextPipeline::reset_state: slot out of range" );
 	backend::set_device( rank_ );
-	backend::memset_sync( latent_cache_ + static_cast<size_t>( slot_id ) * latent_slot_stride_, 0, latent_slot_stride_ * sizeof( backend::half_t ) );
+	backend::memset_sync( static_cast<char*>( latent_cache_ ) + static_cast<size_t>( slot_id ) * latent_data_bytes( latent_slot_stride_ ), 0, latent_data_bytes( latent_slot_stride_ ) );
+	if ( latent_scales_ ) backend::memset_sync( static_cast<char*>( latent_scales_ ) + static_cast<size_t>( slot_id ) * latent_scale_bytes( latent_slot_stride_ ), 0, latent_scale_bytes( latent_slot_stride_ ) );
 	const size_t slot_kda = state_.slot_kda_floats;
 	const size_t slot_conv = state_.slot_conv_floats;
 	backend::memset_sync( state_.kda_states + slot_id * slot_kda, 0, slot_kda * sizeof( float ) );
@@ -1000,7 +1025,7 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 				pod::TensorView q_lat = q_lat_, o_lat = o_lat_;
 				q_lat.shape[0] = m;
 				o_lat.shape[0] = m;
-				engine::modules::MLALatent::store( latent_cache_, kv_lora_norm_buf_, mla_idx, config_.max_seq, m, kv_ref, stream );
+				engine::modules::MLALatent::store( latent_ref(), kv_lora_norm_buf_, mla_idx, config_.max_seq, m, kv_ref, stream );
 				engine::modules::MLALatent::absorb_q( q_buf_, lw.kv_b_proj, q_lat, 16, m, stream );
 				const int* sel_idx = nullptr;
 				const int* sel_n = nullptr;
@@ -1029,15 +1054,16 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 						sel_n = dsa_nk_;
 					}
 				}
-				engine::modules::MLALatent::attend( latent_cache_, q_lat, o_lat, mla_idx, config_.max_seq, m, 16, kv_ref, latent_ws_, key_hint_, stream, sel_idx, sel_n );
+				engine::modules::MLALatent::attend( latent_ref(), q_lat, o_lat, mla_idx, config_.max_seq, m, 16, kv_ref, latent_ws_, key_hint_, stream, sel_idx, sel_n );
 				static const bool dsa_diag = runtime::options().dsa_diag;
 				if ( dsa_diag && sel_idx != nullptr && m > pod::MAX_BATCH && rank_ == 0 ) {
 					// Recall of the dense attention mass by the selection, last row of the chunk (eager prefill only)
 					const int n = key_hint_;
+					ENGINE_ASSERT( latent_q_ == pod::KVQ::F16, "dsa_diag: FP16 latent cache only" );
 					std::vector<float> sc( static_cast<size_t>( 16 ) * n );
 					float* d_sc = static_cast<float*>( backend::device_malloc( sc.size() * sizeof( float ) ) );
 					engine::modules::MLALatent::diag_scores( q_lat.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * 16 * 512,
-						latent_cache_ + static_cast<size_t>( mla_idx ) * config_.max_seq * 512, n, 16, d_sc, stream );
+						static_cast<const backend::half_t*>( latent_cache_ ) + static_cast<size_t>( mla_idx ) * config_.max_seq * 512, n, 16, d_sc, stream );
 					std::vector<int> sel( engine::modules::DSA::KPAD );
 					int nk = 0;
 					backend::memcpy_async( &nk, dsa_nk_ + ( m - 1 ), sizeof( int ), backend::Copy::D2H, stream );
@@ -1253,7 +1279,8 @@ size_t Glm5NextPipeline::seq_state_bytes( int from, int tokens, bool with_taps )
 	const int pool = engine::modules::DSA::POOL;
 	const size_t recurrent = ( state_.slot_kda_floats + state_.slot_conv_floats ) * sizeof( float );
 	const size_t planes = dsa_plane_stride_ * sizeof( backend::half_t );
-	const size_t latent = static_cast<size_t>( config_.num_mla_layers ) * ( tokens - from ) * 512 * sizeof( backend::half_t );
+	const size_t lat_elems = static_cast<size_t>( tokens - from ) * 512;
+	const size_t latent = static_cast<size_t>( config_.num_mla_layers ) * ( latent_data_bytes( lat_elems ) + latent_scale_bytes( lat_elems ) );
 	const size_t pool_rows = static_cast<size_t>( ( tokens + pool - 1 ) / pool - from / pool );
 	const size_t pools = static_cast<size_t>( config_.num_mla_layers ) * pool_rows * engine::modules::DSA::DIM * sizeof( backend::half_t );
 	return recurrent + planes + ( with_taps ? tap_snapshot_bytes( tokens ) : 0 ) + latent + pools + 256;
@@ -1269,11 +1296,14 @@ void Glm5NextPipeline::copy_seq_rows( int slot_id, int from, int tokens, char* h
 		else backend::memcpy_async( dev, host, bytes, dir, stream );
 		host += bytes;
 	};
-	const size_t lat_bytes = static_cast<size_t>( tokens - from ) * 512 * sizeof( backend::half_t );
+	const size_t lat_elems = static_cast<size_t>( tokens - from ) * 512;
+	const size_t lat_bytes = latent_data_bytes( lat_elems ), lat_scale_bytes = latent_scale_bytes( lat_elems );
 	const int pool_from = from / pool, pool_to = ( tokens + pool - 1 ) / pool;
 	const size_t pool_bytes = static_cast<size_t>( pool_to - pool_from ) * engine::modules::DSA::DIM * sizeof( backend::half_t );
 	for ( int layer = 0; layer < config_.num_mla_layers; ++layer ) {
-		move( latent_cache_ + static_cast<size_t>( slot_id ) * latent_slot_stride_ + ( static_cast<size_t>( layer ) * config_.max_seq + from ) * 512, lat_bytes );
+		const size_t lat_off = static_cast<size_t>( slot_id ) * latent_slot_stride_ + ( static_cast<size_t>( layer ) * config_.max_seq + from ) * 512;
+		move( static_cast<char*>( latent_cache_ ) + latent_data_bytes( lat_off ), lat_bytes );
+		if ( lat_scale_bytes ) move( static_cast<char*>( latent_scales_ ) + latent_scale_bytes( lat_off ), lat_scale_bytes );
 		move( dsa_pool_ + static_cast<size_t>( slot_id ) * dsa_pool_stride_ + ( static_cast<size_t>( layer ) * NP + pool_from ) * engine::modules::DSA::DIM, pool_bytes );
 	}
 }

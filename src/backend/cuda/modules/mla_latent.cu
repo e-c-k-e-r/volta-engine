@@ -1,4 +1,5 @@
 #include "engine/modules/mla.h"
+#include "kv_quant.cuh"
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <algorithm>
@@ -115,11 +116,20 @@ void expand_out_kernel( const half* __restrict__ o_lat, const half* __restrict__
 	}
 }
 
-__global__ void store_latent_kernel( half* __restrict__ cache, const half* __restrict__ c, int layer, int max_seq, int rows, pod::SlotRef slot ) {
+// Eight consecutive latent elements of any cache format as packed halves
+template <KVQ Q>
+__device__ __forceinline__ uint4 latent_ld8( const void* data, const void* scales, size_t idx ) {
+	return kv_decode8_h<Q>( kv_fetch8<Q>( data, scales, idx ) );
+}
+
+// One block per row; a thread quantizes one unit (kv_unit<Q>() elements) at a time
+template <KVQ Q>
+__global__ void store_latent_kernel( void* __restrict__ data, void* __restrict__ scales, const half* __restrict__ c, int layer, int max_seq, int rows, pod::SlotRef slot ) {
+	constexpr int U = kv_unit<Q>();
 	const int r = blockIdx.x;
 	const int pos = slot.rows->pos[slot.row + r];
 	const size_t off = static_cast<size_t>( slot.rows->slot[slot.row + r] ) * slot.stride + ( static_cast<size_t>( layer ) * max_seq + pos ) * LORA;
-	for ( int i = threadIdx.x; i < LORA; i += blockDim.x ) cache[off + i] = c[static_cast<size_t>( r ) * LORA + i];
+	for ( int u = threadIdx.x; u < LORA / U; u += blockDim.x ) kv_store_unit<Q>( data, scales, off + static_cast<size_t>( u ) * U, c + static_cast<size_t>( r ) * LORA + u * U );
 }
 
 constexpr int CHUNK_KEYS = 1024;
@@ -130,11 +140,12 @@ constexpr int CS = LORA + 8; // padded key row (halves) in shared memory
 // Latent attention, one block per (row, chunk of 1024 keys), all heads of the row: a 16-key tile of c is staged once and
 // serves the 16 heads' scores and their value sums. 512 threads: scores take two threads per (head, key) pair, the value
 // sum one thread per latent dimension holding all 16 heads' accumulators.
-template <int HEADS>
+template <int HEADS, KVQ Q>
 __global__ __launch_bounds__( 512 )
 void latent_attn_kernel(
 	const half* __restrict__ q_lat,
-	const half* __restrict__ cache,
+	const void* __restrict__ cache,
+	const void* __restrict__ cscale,
 	half* __restrict__ o_lat,
 	float* __restrict__ workspace,
 	size_t slot_stride,
@@ -177,7 +188,7 @@ void latent_attn_kernel(
 				uint4 raw = make_uint4( 0, 0, 0, 0 );
 				if ( k < nk ) {
 					const int key = nsel >= 0 ? lst[kb + k] : kb + k;
-					raw = *reinterpret_cast<const uint4*>( cache + base + static_cast<size_t>( key ) * LORA + c8 * 8 );
+					raw = latent_ld8<Q>( cache, cscale, base + static_cast<size_t>( key ) * LORA + c8 * 8 );
 				}
 				*reinterpret_cast<uint4*>( sc + k * CS + c8 * 8 ) = raw;
 			}
@@ -281,10 +292,12 @@ __device__ __forceinline__ void lt_mma( float* c, uint32_t a0, uint32_t a1, uint
 	);
 }
 
+template <KVQ Q>
 __global__ __launch_bounds__( 256 )
 void latent_prefill_tc_kernel(
 	const half* __restrict__ q_lat,
-	const half* __restrict__ cache,
+	const void* __restrict__ cache,
+	const void* __restrict__ cscale,
 	half* __restrict__ o_lat,
 	float* __restrict__ workspace,
 	size_t slot_stride,
@@ -319,7 +332,7 @@ void latent_prefill_tc_kernel(
 	int max_pos = 0;
 	for ( int r = q_base / HEADS; r <= last_row; ++r ) max_pos = max( max_pos, rows->pos[r] );
 	max_pos = min( max_pos, max_seq - 1 );
-	const half* kv = cache + static_cast<size_t>( rows->slot[q_base / HEADS] ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA;
+	const size_t kvb = static_cast<size_t>( rows->slot[q_base / HEADS] ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA;
 
 	// Softmax role: 8 lanes per query row, 4 keys each
 	const int srow = tid >> 3;
@@ -365,7 +378,7 @@ void latent_prefill_tc_kernel(
 			#pragma unroll
 			for ( int kk = 0; kk < 2; ++kk ) {
 				const int key = 2 * st_p + kk;
-				pk[j][kk] = ( kb + key <= max_pos ) ? *reinterpret_cast<const uint4*>( kv + static_cast<size_t>( kb + key ) * LORA + c * 8 ) : make_uint4( 0, 0, 0, 0 );
+				pk[j][kk] = ( kb + key <= max_pos ) ? latent_ld8<Q>( cache, cscale, kvb + static_cast<size_t>( kb + key ) * LORA + c * 8 ) : make_uint4( 0, 0, 0, 0 );
 			}
 		}
 	};
@@ -543,10 +556,12 @@ void latent_prefill_tc_kernel(
 #define LS_OFF_A ( LS_OFF_P + LS_BQ * LT_VS * 2 )
 #define LS_SMEM ( LS_OFF_A + LS_BQ * 12 )
 
+template <KVQ Q>
 __global__ __launch_bounds__( 256 )
 void latent_sparse_tc_kernel(
 	const half* __restrict__ q_lat,
-	const half* __restrict__ cache,
+	const void* __restrict__ cache,
+	const void* __restrict__ cscale,
 	half* __restrict__ o_lat,
 	float* __restrict__ workspace,
 	size_t slot_stride,
@@ -582,7 +597,7 @@ void latent_sparse_tc_kernel(
 	// A row below the selection threshold (nsel < 0) attends densely even though the list pointer is set
 	const int* lst = ( sel_idx && nsel >= 0 ) ? sel_idx + static_cast<size_t>( r ) * DSA_KPAD : nullptr;
 	const int n_keys = nsel >= 0 ? nsel : min( rows->pos[r] + 1, max_seq );
-	const half* kv = cache + static_cast<size_t>( rows->slot[r] ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA;
+	const size_t kvb = static_cast<size_t>( rows->slot[r] ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA;
 
 	for ( int u = tid; u < LS_BQ * ( LORA / 8 ); u += 256 ) {
 		const int qq = u >> 6, c = u & 63;
@@ -626,7 +641,7 @@ void latent_sparse_tc_kernel(
 			const int c = 2 * warp + st_cl + 16 * j;
 			#pragma unroll
 			for ( int kk = 0; kk < 2; ++kk ) {
-				pk[j][kk] = kpos[kk] >= 0 ? *reinterpret_cast<const uint4*>( kv + static_cast<size_t>( kpos[kk] ) * LORA + c * 8 ) : make_uint4( 0, 0, 0, 0 );
+				pk[j][kk] = kpos[kk] >= 0 ? latent_ld8<Q>( cache, cscale, kvb + static_cast<size_t>( kpos[kk] ) * LORA + c * 8 ) : make_uint4( 0, 0, 0, 0 );
 			}
 		}
 	};
@@ -832,22 +847,31 @@ void MLALatent::expand_out( const pod::TensorView& o_lat, const pod::TensorView&
 	expand_out_kernel<<<dim3( heads, HEAD / 16, ( rows + RCH - 1 ) / RCH ), dim3( 128 ), 0, stream>>>( o_lat.ptr<const half>(), kv_b.ptr<const half>(), out.ptr<half>(), heads, rows );
 }
 
-void MLALatent::store( half* cache, const pod::TensorView& c, int layer, int max_seq, int rows, const pod::SlotRef& slot, cudaStream_t stream ) {
+void MLALatent::store( const pod::KVRef& kv, const pod::TensorView& c, int layer, int max_seq, int rows, const pod::SlotRef& slot, cudaStream_t stream ) {
 	ENGINE_ASSERT( slot.rows != nullptr, "MLALatent::store: device-resolved positions only" );
-	store_latent_kernel<<<dim3( rows ), dim3( 128 ), 0, stream>>>( cache, c.ptr<const half>(), layer, max_seq, rows, slot );
+	ENGINE_ASSERT( kv.kq == pod::KVQ::F16 || kv.kq == pod::KVQ::E5M2 || kv.kq == pod::KVQ::I8 || kv.kq == pod::KVQ::FP4, "MLALatent::store: cache format" );
+	switch ( kv.kq ) {
+		case pod::KVQ::E5M2: store_latent_kernel<KVQ::E5M2><<<dim3( rows ), dim3( 128 ), 0, stream>>>( kv.k, kv.ks, c.ptr<const half>(), layer, max_seq, rows, slot ); break;
+		case pod::KVQ::I8: store_latent_kernel<KVQ::I8><<<dim3( rows ), dim3( 128 ), 0, stream>>>( kv.k, kv.ks, c.ptr<const half>(), layer, max_seq, rows, slot ); break;
+		case pod::KVQ::FP4: store_latent_kernel<KVQ::FP4><<<dim3( rows ), dim3( 128 ), 0, stream>>>( kv.k, kv.ks, c.ptr<const half>(), layer, max_seq, rows, slot ); break;
+		default: store_latent_kernel<KVQ::F16><<<dim3( rows ), dim3( 128 ), 0, stream>>>( kv.k, kv.ks, c.ptr<const half>(), layer, max_seq, rows, slot ); break;
+	}
 }
 
-void MLALatent::attend( const half* cache, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
+template <KVQ Q>
+void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
 	const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream, const int* sel_idx, const int* sel_n ) {
-		ENGINE_ASSERT( heads == 16 && slot.rows != nullptr, "MLALatent::attend: 16 heads per rank, device-resolved positions" );
-	const int n_chunks = workspace_chunks( max_seq );
-	const float scale = 1.0f / sqrtf( static_cast<float>( HEAD ) );
+	const void* cache = kv.k;
+	const void* cscale = kv.ks;
+	ENGINE_ASSERT( heads == 16 && slot.rows != nullptr, "MLALatent::attend: 16 heads per rank, device-resolved positions" );
+	const int n_chunks = MLALatent::workspace_chunks( max_seq );
+	const float scale = 1.0f / sqrtf( static_cast<float>( MLALatent::HEAD ) );
 	const size_t smem = static_cast<size_t>( 16 ) * LORA * 4 + static_cast<size_t>( TILE ) * CS * 2 + ( 16 * TILE + 16 ) * 4;
 	static bool attr[ENGINE_NUM_GPUS] = {};
 	int device = 0;
 	cudaGetDevice( &device );
 	if ( !attr[device] ) {
-		CUDA_CHECK( cudaFuncSetAttribute( latent_attn_kernel<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( smem ) ) );
+		CUDA_CHECK( cudaFuncSetAttribute( latent_attn_kernel<16, Q>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( smem ) ) );
 		attr[device] = true;
 	}
 	// Decode rows (up to MAX_BATCH) take the same per-row tensor-core kernel: its blocks split the keys of a row, where
@@ -858,13 +882,13 @@ void MLALatent::attend( const half* cache, const pod::TensorView& q_lat, pod::Te
 		ENGINE_ASSERT( slot.row == 0, "MLALatent::attend: prefill chunks start at row 0" );
 		static bool sp_attr[ENGINE_NUM_GPUS] = {};
 		if ( !sp_attr[device] ) {
-			CUDA_CHECK( cudaFuncSetAttribute( latent_sparse_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, LS_SMEM ) );
+			CUDA_CHECK( cudaFuncSetAttribute( latent_sparse_tc_kernel<Q>, cudaFuncAttributeMaxDynamicSharedMemorySize, LS_SMEM ) );
 			sp_attr[device] = true;
 		}
 		int nsplit = rows < 160 ? std::min( ( 320 + rows - 1 ) / rows, decode_rows ? 32 : 8 ) : 1;
-		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > workspace_slots( max_seq, heads ) ) --nsplit;
-		latent_sparse_tc_kernel<<<dim3( rows, nsplit ), dim3( 256 ), LS_SMEM, stream>>>(
-			q_lat.ptr<const half>(), cache, o_lat.ptr<half>(), workspace, slot.stride, layer, max_seq, slot.rows, scale, nsplit, sel_idx, sel_n );
+		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > MLALatent::workspace_slots( max_seq, heads ) ) --nsplit;
+		latent_sparse_tc_kernel<Q><<<dim3( rows, nsplit ), dim3( 256 ), LS_SMEM, stream>>>(
+			q_lat.ptr<const half>(), cache, cscale, o_lat.ptr<half>(), workspace, slot.stride, layer, max_seq, slot.rows, scale, nsplit, sel_idx, sel_n );
 		if ( nsplit > 1 ) {
 			latent_reduce_kernel<<<dim3( heads, rows ), dim3( 512 ), 0, stream>>>( workspace, o_lat.ptr<half>(), heads, nsplit );
 		}
@@ -874,7 +898,7 @@ void MLALatent::attend( const half* cache, const pod::TensorView& q_lat, pod::Te
 		ENGINE_ASSERT( slot.row == 0, "MLALatent::attend: prefill chunks start at row 0" );
 		static bool tc_attr[ENGINE_NUM_GPUS] = {};
 		if ( !tc_attr[device] ) {
-			CUDA_CHECK( cudaFuncSetAttribute( latent_prefill_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, LT_SMEM ) );
+			CUDA_CHECK( cudaFuncSetAttribute( latent_prefill_tc_kernel<Q>, cudaFuncAttributeMaxDynamicSharedMemorySize, LT_SMEM ) );
 			tc_attr[device] = true;
 		}
 		// Spread the key tiles over extra blocks when the query tiles alone leave the GPU under two waves
@@ -882,9 +906,9 @@ void MLALatent::attend( const half* cache, const pod::TensorView& q_lat, pod::Te
 		int nsplit = 1;
 		if ( base_blocks < 160 ) nsplit = std::min( ( 320 + base_blocks - 1 ) / base_blocks, 8 );
 		if ( key_hint > 0 ) nsplit = std::max( 1, std::min( nsplit, key_hint / ( 4 * LT_BK ) ) );
-		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > workspace_slots( max_seq, heads ) ) --nsplit;
-		latent_prefill_tc_kernel<<<dim3( base_blocks, nsplit ), dim3( 256 ), LT_SMEM, stream>>>(
-			q_lat.ptr<const half>(), cache, o_lat.ptr<half>(), workspace, slot.stride, layer, max_seq, slot.rows, rows, scale, nsplit );
+		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > MLALatent::workspace_slots( max_seq, heads ) ) --nsplit;
+		latent_prefill_tc_kernel<Q><<<dim3( base_blocks, nsplit ), dim3( 256 ), LT_SMEM, stream>>>(
+			q_lat.ptr<const half>(), cache, cscale, o_lat.ptr<half>(), workspace, slot.stride, layer, max_seq, slot.rows, rows, scale, nsplit );
 		if ( nsplit > 1 ) {
 			latent_reduce_kernel<<<dim3( heads, rows ), dim3( 512 ), 0, stream>>>( workspace, o_lat.ptr<half>(), heads, nsplit );
 		}
@@ -893,14 +917,24 @@ void MLALatent::attend( const half* cache, const pod::TensorView& q_lat, pod::Te
 	for ( int row0 = slot.row; row0 < slot.row + rows; row0 += pod::MAX_BATCH ) {
 		const int M = min( pod::MAX_BATCH, slot.row + rows - row0 );
 		const size_t off = static_cast<size_t>( row0 - slot.row ) * heads * LORA;
-		latent_attn_kernel<16><<<dim3( M, n_chunks ), dim3( 512 ), smem, stream>>>(
-			q_lat.ptr<const half>() + off, cache, o_lat.ptr<half>() + off, workspace, slot.stride, layer, max_seq, slot.rows, row0, n_chunks, scale, sel_idx, sel_n );
+		latent_attn_kernel<16, Q><<<dim3( M, n_chunks ), dim3( 512 ), smem, stream>>>(
+			q_lat.ptr<const half>() + off, cache, cscale, o_lat.ptr<half>() + off, workspace, slot.stride, layer, max_seq, slot.rows, row0, n_chunks, scale, sel_idx, sel_n );
 		if ( n_chunks > 1 ) {
 			latent_reduce_kernel<<<dim3( heads, M ), dim3( 512 ), 0, stream>>>( workspace, o_lat.ptr<half>() + off, heads, n_chunks );
 		}
 	}
 }
 
+void MLALatent::attend( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
+	const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream, const int* sel_idx, const int* sel_n ) {
+	switch ( kv.kq ) {
+		case pod::KVQ::E5M2: attend_q<KVQ::E5M2>( kv, q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n ); break;
+		case pod::KVQ::I8: attend_q<KVQ::I8>( kv, q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n ); break;
+		case pod::KVQ::FP4: attend_q<KVQ::FP4>( kv, q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n ); break;
+		case pod::KVQ::F16: attend_q<KVQ::F16>( kv, q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n ); break;
+		default: ENGINE_ASSERT( false, "MLALatent::attend: cache format" ); break;
+	}
+}
 
 void MLALatent::diag_scores( const half* q_lat_row, const half* cache_slot_layer, int n, int heads, float* scores, cudaStream_t stream ) {
 	diag_scores_kernel<<<dim3( ( n + 255 ) / 256, heads ), dim3( 256 ), 0, stream>>>( q_lat_row, cache_slot_layer, scores, n, heads, 1.0f / sqrtf( static_cast<float>( HEAD ) ) );

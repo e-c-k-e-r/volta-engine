@@ -28,7 +28,12 @@ int main() {
 	CUDA_CHECK( cudaMemcpy( h_w.data(), kv_b.data, h_w.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
 
 	bool all_ok = true;
-	for ( int scenario = 0; scenario < ( std::getenv( "MLA_TIME" ) ? 0 : 4 ); ++scenario ) {
+	// Cache formats: scenario s runs format s / 4 (FP16 and the three quantized ones); the reference always uses the unquantized latent
+	const pod::KVQ fmts[4] = { pod::KVQ::F16, pod::KVQ::E5M2, pod::KVQ::I8, pod::KVQ::FP4 };
+	const double min_cos[4] = { 0.9999, 0.997, 0.9995, 0.98 };
+	for ( int scenario_all = 0; scenario_all < ( std::getenv( "MLA_TIME" ) ? 0 : 16 ); ++scenario_all ) {
+		const int scenario = scenario_all % 4, fi = scenario_all / 4;
+		const pod::KVQ fq = fmts[fi];
 		const int max_seq = ( scenario & 1 ) ? 3072 : 1024;
 		const int N = max_seq - 40; // tokens in the cache
 		uint32_t seed = 4242u + max_seq;
@@ -47,9 +52,16 @@ int main() {
 
 		// Device buffers: cache [slot 0][layer 0..1][max_seq][512], layer 1 used
 		const size_t slot_stride = 2ull * max_seq * LORA;
-		half* d_cache; half* d_c; half* d_q; half* d_qlat; half* d_olat; half* d_out; float* d_ws; pod::BatchRows* d_rows;
-		CUDA_CHECK( cudaMalloc( &d_cache, slot_stride * sizeof( half ) ) );
-		CUDA_CHECK( cudaMemset( d_cache, 0, slot_stride * sizeof( half ) ) );
+		void* d_cache; void* d_cache_s = nullptr; half* d_c; half* d_q; half* d_qlat; half* d_olat; half* d_out; float* d_ws; pod::BatchRows* d_rows;
+		CUDA_CHECK( cudaMalloc( &d_cache, pod::kv_data_bytes( fq, slot_stride ) ) );
+		CUDA_CHECK( cudaMemset( d_cache, 0, pod::kv_data_bytes( fq, slot_stride ) ) );
+		if ( pod::kv_scale_bytes( fq, slot_stride ) ) {
+			CUDA_CHECK( cudaMalloc( &d_cache_s, pod::kv_scale_bytes( fq, slot_stride ) ) );
+			CUDA_CHECK( cudaMemset( d_cache_s, 0, pod::kv_scale_bytes( fq, slot_stride ) ) );
+		}
+		pod::KVRef kvr = pod::kv_ref_f16( d_cache, d_cache );
+		kvr.ks = kvr.vs = d_cache_s;
+		kvr.kq = kvr.vq = fq;
 		CUDA_CHECK( cudaMalloc( &d_c, h_c.size() * sizeof( half ) ) );
 		CUDA_CHECK( cudaMalloc( &d_q, h_q.size() * sizeof( half ) ) );
 		CUDA_CHECK( cudaMalloc( &d_qlat, static_cast<size_t>( R ) * H * LORA * sizeof( half ) ) );
@@ -66,7 +78,7 @@ int main() {
 			CUDA_CHECK( cudaMemcpy( d_rows, &br, sizeof( br ), cudaMemcpyHostToDevice ) );
 			pod::SlotRef sr; sr.rows = d_rows; sr.row = 0; sr.stride = slot_stride;
 			pod::TensorView ct = pod::make_tensor_2d( d_c + static_cast<size_t>( p0 ) * LORA, pod::DType::FP16, n, LORA );
-			engine::modules::MLALatent::store( d_cache, ct, 1, max_seq, n, sr, stream );
+			engine::modules::MLALatent::store( kvr, ct, 1, max_seq, n, sr, stream );
 		}
 		std::vector<int> slots( R, 0 );
 		pod::BatchRows br = pod::BatchRows::batched( R, slots.data(), positions.data() );
@@ -77,7 +89,7 @@ int main() {
 		pod::TensorView olat = pod::make_tensor_2d( d_olat, pod::DType::FP16, R, H * LORA );
 		pod::TensorView outt = pod::make_tensor_2d( d_out, pod::DType::FP16, R, H * HD );
 		engine::modules::MLALatent::absorb_q( qt, kv_b, qlat, H, R, stream );
-		engine::modules::MLALatent::attend( d_cache + 0, qlat, olat, 1, max_seq, R, H, sr, d_ws, 0, stream );
+		engine::modules::MLALatent::attend( kvr, qlat, olat, 1, max_seq, R, H, sr, d_ws, 0, stream );
 		engine::modules::MLALatent::expand_out( olat, kv_b, outt, H, R, stream );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		std::vector<half> h_out( static_cast<size_t>( R ) * H * HD );
@@ -127,11 +139,11 @@ int main() {
 			}
 		}
 		const double cosine = dot / std::sqrt( na * nb + 1e-30 );
-		const bool ok = cosine >= 0.9999 && maxabs <= 0.01 * maxref + 1e-3;
+		const bool ok = cosine >= min_cos[fi] && ( fq != pod::KVQ::F16 || maxabs <= 0.01 * maxref + 1e-3 );
 		all_ok = all_ok && ok;
-		std::printf( "  %s max_seq %d (%d cached tokens, %d chunks): cos=%.6f max_abs=%.4f (|ref|max=%.3f) %s\n", scenario >= 2 ? "prefill" : "decode ", max_seq, N,
+		std::printf( "  %s %s max_seq %d (%d cached tokens, %d chunks): cos=%.6f max_abs=%.4f (|ref|max=%.3f) %s\n", ( const char* const[] ){ "fp16", "fp8 ", "int8", "fp4 " }[fi], scenario >= 2 ? "prefill" : "decode ", max_seq, N,
 			engine::modules::MLALatent::workspace_chunks( max_seq ), cosine, maxabs, maxref, ok ? "ok" : "FAIL" );
-		cudaFree( d_cache ); cudaFree( d_c ); cudaFree( d_q ); cudaFree( d_qlat ); cudaFree( d_olat ); cudaFree( d_out ); cudaFree( d_ws ); cudaFree( d_rows );
+		cudaFree( d_cache ); if ( d_cache_s ) cudaFree( d_cache_s ); cudaFree( d_c ); cudaFree( d_q ); cudaFree( d_qlat ); cudaFree( d_olat ); cudaFree( d_out ); cudaFree( d_ws ); cudaFree( d_rows );
 	}
 	if ( std::getenv( "MLA_TIME" ) ) {
 		half* d_a; half* d_b; half* d_c2;
