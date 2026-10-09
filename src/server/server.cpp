@@ -1,4 +1,5 @@
 #include "engine/server/server.h"
+#include "engine/core/log.h"
 #include "engine/runtime/options.h"
 
 #define JSON_NOEXCEPTION 1
@@ -56,13 +57,13 @@ bool VoltaServer::init( const ServerConfig& config ) {
 
 	std::printf( "========================================================\n" );
 	std::printf( "   VOLTA ENGINE: UNIFIED PRODUCTION HTTP/1.1 SERVER     \n" );
-	std::printf( "   Target: 4x NVIDIA Tesla V100-SXM2-32GB (SM70)        \n" );
+	std::printf( "   Target: NVIDIA Tesla V100 (SM70), tensor parallel     \n" );
 	std::printf( "========================================================\n" );
 	std::fflush( stdout );
 
 	generator_ = std::make_unique<engine::runtime::Generator>();
 	if ( !generator_->init( config_ ) ) {
-		std::fprintf( stderr, "[-] Failed to initialize Generator runtime.\n" );
+		LOG_ERROR( "Failed to initialize Generator runtime.\n" );
 		return false;
 	}
 
@@ -77,7 +78,7 @@ bool VoltaServer::init( const ServerConfig& config ) {
 		return false;
 	}
 
-	std::printf( "[+] Volta Server listening on http://%s:%d\n", config_.host.c_str(), config_.port );
+	LOG_INFO( "Volta Server listening on http://%s:%d\n", config_.host.c_str(), config_.port );
 	std::fflush( stdout );
 	return true;
 }
@@ -85,7 +86,7 @@ bool VoltaServer::init( const ServerConfig& config ) {
 bool VoltaServer::setup_socket() {
 	listen_fd_ = socket( AF_INET, SOCK_STREAM, 0 );
 	if ( listen_fd_ < 0 ) {
-		std::fprintf( stderr, "[-] socket() failed: %s\n", std::strerror( errno ) );
+		LOG_ERROR( "socket() failed: %s\n", std::strerror( errno ) );
 		return false;
 	}
 
@@ -100,13 +101,13 @@ bool VoltaServer::setup_socket() {
 	inet_pton( AF_INET, config_.host.c_str(), &addr.sin_addr );
 
 	if ( bind( listen_fd_, reinterpret_cast<sockaddr*>( &addr ), sizeof( addr ) ) < 0 ) {
-		std::fprintf( stderr, "[-] bind() failed on %s:%d: %s\n", config_.host.c_str(), config_.port, std::strerror( errno ) );
+		LOG_ERROR( "bind() failed on %s:%d: %s\n", config_.host.c_str(), config_.port, std::strerror( errno ) );
 		close( listen_fd_ );
 		listen_fd_ = -1;
 		return false;
 	}
 	if ( listen( listen_fd_, 128 ) < 0 ) {
-		std::fprintf( stderr, "[-] listen() failed: %s\n", std::strerror( errno ) );
+		LOG_ERROR( "listen() failed: %s\n", std::strerror( errno ) );
 		close( listen_fd_ );
 		listen_fd_ = -1;
 		return false;
@@ -115,7 +116,7 @@ bool VoltaServer::setup_socket() {
 
 	epoll_fd_ = epoll_create1( 0 );
 	if ( epoll_fd_ < 0 ) {
-		std::fprintf( stderr, "[-] epoll_create1() failed: %s\n", std::strerror( errno ) );
+		LOG_ERROR( "epoll_create1() failed: %s\n", std::strerror( errno ) );
 		close( listen_fd_ );
 		listen_fd_ = -1;
 		return false;
@@ -124,7 +125,7 @@ bool VoltaServer::setup_socket() {
 	ev.events = EPOLLIN;
 	ev.data.fd = listen_fd_;
 	if ( epoll_ctl( epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev ) < 0 ) {
-		std::fprintf( stderr, "[-] epoll_ctl(ADD listen_fd) failed: %s\n", std::strerror( errno ) );
+		LOG_ERROR( "epoll_ctl(ADD listen_fd) failed: %s\n", std::strerror( errno ) );
 		close( epoll_fd_ );
 		close( listen_fd_ );
 		epoll_fd_ = -1;
@@ -382,7 +383,7 @@ void VoltaServer::stop() {
 		return;
 	}
 
-	std::printf( "\n[*] Initiating Volta Server graceful shutdown...\n" );
+	LOG_INFO( "\n[*] Initiating Volta Server graceful shutdown...\n" );
 
 	for ( auto& kv : conns_ ) kv.second->close_now();
 	conns_.clear();
@@ -400,7 +401,7 @@ void VoltaServer::stop() {
 		generator_.reset();
 	}
 
-	std::printf( "[+] Server shutdown complete. All GPUs reset to 0 MiB VRAM.\n" );
+	LOG_INFO( "Server shutdown complete. All GPUs reset to 0 MiB VRAM.\n" );
 	std::fflush( stdout );
 	std::_Exit( 0 );
 }

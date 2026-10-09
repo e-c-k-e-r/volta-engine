@@ -1,4 +1,5 @@
 #include "engine/loader/safetensors.h"
+#include "engine/core/log.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
 #include <fcntl.h>
@@ -533,7 +534,7 @@ bool SafeTensorsRepo::open( const char* dir_path ) {
 		}
 	}
 
-	std::printf( "    [SafeTensorsRepo] Loaded %d shards, mapped %zu tensors\n", num_shards_, tensor_map_.size() );
+	LOG_INFO( "[SafeTensorsRepo] Loaded %d shards, mapped %zu tensors\n", num_shards_, tensor_map_.size() );
 	std::fflush( stdout );
 
 	return num_shards_ > 0;

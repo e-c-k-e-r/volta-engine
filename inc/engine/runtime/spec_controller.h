@@ -1,5 +1,6 @@
 #pragma once
 #include "engine/config.h"
+#include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include <cstdio>
 #include <cstdlib>
@@ -68,7 +69,7 @@ private:
 		const double spec_rate = e_tok_ / e_ms_;
 		const double dense_rate = 1.0 / dense_ms_;
 		if ( runtime::options().spec_ctrl_log ) {
-			std::fprintf( stderr, "[ctrl] spec %.2f tok / %.2f ms = %.1f tok/s, dense %.2f ms = %.1f tok/s, mode %d\n", e_tok_, e_ms_, spec_rate * 1000.0, dense_ms_, dense_rate * 1000.0, dense_mode_ ? 1 : 0 );
+			LOG_INFO( "[ctrl] spec %.2f tok / %.2f ms = %.1f tok/s, dense %.2f ms = %.1f tok/s, mode %d\n", e_tok_, e_ms_, spec_rate * 1000.0, dense_ms_, dense_rate * 1000.0, dense_mode_ ? 1 : 0 );
 		}
 		if ( dense_rate > spec_rate * kMargin ) {
 			// A probe that still loses backs the interval off; the first loss enters plain mode.

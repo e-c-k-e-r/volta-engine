@@ -1,0 +1,45 @@
+# Getting started
+
+## Build
+
+CUDA 12.x (13+ drops SM_70) and CMake 3.24+ with Ninja. The CUDA build is the primary one:
+
+```
+cmake -S . -B build -G Ninja && cmake --build build
+```
+
+CPU and Vulkan builds are separate build trees (no CUDA toolchain needed):
+
+```
+cmake -S . -B build_cpu -G Ninja -DENGINE_BACKEND=CPU
+cmake -S . -B build_vk  -G Ninja -DENGINE_BACKEND=VULKAN
+```
+
+A full CUDA build takes a while (the trellis kernels are template heavy); incremental builds are quick.
+
+## Run the server
+
+```
+taskset -c 0-9 build/volta_server --model-dir /path/to/Qwen3.8-27B-exl3 \
+	--speculative --draft-model-dir /path/to/Qwen3.8-27B-DFlash2-EXL3-5.0bpw --port 8000
+```
+
+The model type is read from the checkpoint (`qwen3_5` or `glm5_next`); anything else is a fatal error. Configuration (launch
+file, `--set key=value`, `ENGINE_*` variables, debug switches) is described in [CONFIG.md](CONFIG.md); `configs/` has examples.
+The server speaks the OpenAI chat API (`/v1/chat/completions`, `/v1/models`) and the Anthropic API (`/v1/messages`,
+`/v1/messages/count_tokens`), so Claude Code can use it with `ANTHROPIC_BASE_URL=http://host:8000`. `/health`, `/metrics`
+(JSON) and `/metrics/prometheus` are also served.
+
+Useful options for agent workloads: a large context (`--set max_seq=262144 --set max_slots=2`) and the prefix cache
+(`prefix_cache_gib`), which keeps the system prompt and earlier turns resident in pinned host RAM so a long conversation is
+not prefilled again on every turn.
+
+## Tests
+
+`tests/tools/gate.sh` is the regression gate (modes in its header): `static` (builds all three configurations, header and doc
+checks), `fast` (tests that need no checkpoint), `models` (tests that load checkpoints from `ENGINE_MODEL_ROOT`, or from
+`tests/local.env`), `quick` (build + kernel fingerprint + coherence, for moves and renames), `sass` (order-independent SASS
+fingerprint), `bench` and `compare <tag>`. GPU tests run under `taskset -c 0-9`. See [TESTS.md](TESTS.md) for the inventory
+and [CAPABILITIES.md](CAPABILITIES.md) for which module functions each backend implements.
+
+Benchmark baselines depend on the GPU power cap: record one per power limit (`results/baseline_<tag>.txt`).

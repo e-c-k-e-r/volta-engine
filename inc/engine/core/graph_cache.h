@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/config.h"
+#include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/core/batch.h"
 #include "engine/backend/runtime.h"
@@ -14,7 +15,7 @@ namespace engine::core {
 // The captured body must take every step-varying value (slots, positions, token ids,
 // all-reduce sequence numbers) from device memory so a replay is valid for any step.
 //   call 1 for m : eager (lazy one-time setup such as smem attributes happens outside capture)
-//   call 2 for m : capture (thread-local mode, 4 ranks capture concurrently) + instantiate
+//   call 2 for m : capture (thread-local mode, the ranks capture concurrently) + instantiate
 //   call 3+      : cudaGraphLaunch
 // ENGINE_DEBUG_NO_GRAPHS=1 (Options::no_graphs) forces eager execution.
 class GraphCache {
@@ -54,7 +55,7 @@ public:
 			exec = backend::graph_instantiate( graph );
 			backend::graph_destroy( graph );
 			if ( backend::get_device() == 0 ) {
-				std::printf( "    [graph] captured m=%d decode body: %zu nodes\n", m, nodes );
+				LOG_DEBUG( "[graph] captured m=%d decode body: %zu nodes\n", m, nodes );
 			}
 		}
 		backend::graph_launch( exec, stream );

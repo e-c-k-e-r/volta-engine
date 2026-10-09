@@ -1,4 +1,5 @@
 #include "engine/loader/tokenizer.h"
+#include "engine/core/log.h"
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -573,7 +574,7 @@ bool Tokenizer::load( const char* model_dir ) {
 			nfc_ = true;
 		}
 		else {
-			std::fprintf( stderr, "[-] tokenizer.json uses a normalizer this engine does not implement\n" );
+			LOG_ERROR( "tokenizer.json uses a normalizer this engine does not implement\n" );
 			return false;
 		}
 	}
@@ -590,7 +591,7 @@ bool Tokenizer::load( const char* model_dir ) {
 			marks_are_letters_ = false;
 		}
 		else if ( pt_dump.find( qwen.substr( 1, qwen.size() - 2 ) ) == std::string::npos ) {
-			std::fprintf( stderr, "[-] tokenizer.json uses a pre-tokenizer pattern this engine does not implement\n" );
+			LOG_ERROR( "tokenizer.json uses a pre-tokenizer pattern this engine does not implement\n" );
 			return false;
 		}
 	}

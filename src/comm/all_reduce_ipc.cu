@@ -84,7 +84,7 @@ void all_reduce_rms_norm_4ring_kernel(
 	__threadfence_system();
 	__syncthreads();
 
-	// Step 2: per-row synchronization across 4 ranks using system-scope flags
+	// Step 2: per-row synchronization across the 4 ranks (the kernel is 4-rank only) using system-scope flags
 	if ( threadIdx.x == 0 ) {
 		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
 	}

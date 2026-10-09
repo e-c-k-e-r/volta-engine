@@ -4,7 +4,9 @@
 #   fingerprint     save the resource fingerprint of the current build (results/fingerprint.txt)
 #   sass            order-independent SASS fingerprint (per-function hashes) + HMMA count of bench_decode and volta_server (~40 s per binary), vs results/sass.txt (saved if absent)
 #   static          no GPU: header hygiene greps (backend abstraction) and a full build
-#   parity          GPU: tier 2 parity tests + coherence + sampling gate
+#   fast            tier 2 tests that need no checkpoint (synthetic inputs, goldens, host logic; most need a GPU)
+#   models          tier 2 tests that load a checkpoint from $ENGINE_MODEL_ROOT (parity, coherence, prefix restore, sampling)
+#   parity          fast + models
 #   bench           GPU: bench_decode / bench_accept / bench_prefill for both models
 #   needle          GPU: 8K needle retrieval, greedy and speculative, both models
 #   baseline <tag>  GPU: parity + bench + needle, bench numbers saved to results/baseline_<tag>.txt
@@ -37,6 +39,8 @@ static_checks() {
 	echo "module/spec headers with <cuda_*> includes: $(grep -rln '#include <cuda_' $ROOT/inc/engine/modules $ROOT/inc/engine/spec 2>/dev/null | wc -l)"
 	echo "kernel launches in models: $(grep -c '<<<' $ROOT/src/models/*.cpp 2>/dev/null | tr '\n' ' ')"
 	ninja > $out/build.log 2>&1 || { echo "build FAILED"; bad=1; }
+	# docs/CAPABILITIES.md is generated from tier_table.inc
+	./test_backend_tiers $ROOT --markdown | diff -q - $ROOT/docs/CAPABILITIES.md > /dev/null || { echo "docs/CAPABILITIES.md is stale (build/test_backend_tiers . --markdown > docs/CAPABILITIES.md)"; bad=1; }
 	# docs/CONFIG.md is generated from the option table
 	./volta_server --print-config-docs | diff -q - $ROOT/docs/CONFIG.md > /dev/null || { echo "docs/CONFIG.md is stale (volta_server --print-config-docs > docs/CONFIG.md)"; bad=1; }
 	# CPU configuration: configures without CUDA, builds, smoke test passes
@@ -49,18 +53,14 @@ static_checks() {
 	return $bad
 }
 
-tier2() {
-	for t in test_trellis test_gemv_int8 test_mhc test_attention test_attention_prefill test_mla test_dsa test_gdn test_rows \
-		test_norm test_rope test_kv_quant test_all_reduce test_moe test_nvfp4_linear test_prefill_linear test_sampling test_mla_latent test_spec_state test_slang_cpu test_slang_kernels; do
+# Tests that need no checkpoint (synthetic inputs, goldens, host-only logic); some need a GPU
+tier2_fast() {
+	for t in test_trellis test_gemv_int8 test_mhc test_attention test_attention_prefill test_mla test_dsa test_gdn \
+		test_norm test_rope test_kv_quant test_all_reduce test_prefill_linear test_sampling test_slang_cpu test_slang_kernels; do
 		run $t gpu ./$t
 	done
-	# test_dflash prints a known FATAL in its geometry step (present before 2026-10-07); judged by its final line
-	run test_dflash sh -c "taskset -c 0-9 ./test_dflash | tail -3 | grep -q 'PASSED'"
 	run jinja_chat_templates ./test_jinja
 	run output_parser ./test_output_parser
-	run tokenizer ./test_tokenizer
-	run tokenizer_cases_qwen ./test_tokenizer_file $ENGINE_MODEL_ROOT/Qwen3.8-27B-exl3 --cases $ROOT/tests/data/tokenizer_cases_qwen3_5.json
-	run tokenizer_cases_glm ./test_tokenizer_file $ENGINE_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
 	run backend_tiers ./test_backend_tiers $ROOT
 	run ref_linear_host ./test_ref_linear
 	run ref_linear_gpu gpu ./test_ref_linear --gpu
@@ -78,6 +78,18 @@ tier2() {
 	# Vulkan: Linear (trellis, plain), attention and the single-row GDN forms through the module API
 	run test_ops_linear_check_vulkan gpu $ROOT/build_vk/test_ops_linear --check $out/golden
 	run test_ops_attention_check_vulkan gpu $ROOT/build_vk/test_ops_attention --check $out/golden --only attention,gdn_single
+}
+
+# Tests that load a checkpoint from $ENGINE_MODEL_ROOT (tokenizer files, weights): the model-backed set
+tier2_models() {
+	for t in test_rows test_moe test_nvfp4_linear test_mla_latent test_spec_state; do
+		run $t gpu ./$t
+	done
+	# test_dflash prints a known FATAL in its geometry step (present before 2026-10-07); judged by its final line
+	run test_dflash sh -c "taskset -c 0-9 ./test_dflash | tail -3 | grep -q 'PASSED'"
+	run tokenizer ./test_tokenizer
+	run tokenizer_cases_qwen ./test_tokenizer_file $ENGINE_MODEL_ROOT/Qwen3.8-27B-exl3 --cases $ROOT/tests/data/tokenizer_cases_qwen3_5.json
+	run tokenizer_cases_glm ./test_tokenizer_file $ENGINE_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
 	run coherence gpu ./test_coherence
 	run prefix_restore gpu ./test_prefix_restore
 	run prefix_restore_spec gpu ./test_prefix_restore --spec
@@ -86,6 +98,8 @@ tier2() {
 	run sampling_qwen gpu ./test_sampling_gpu
 	run sampling_glm gpu ./test_sampling_gpu --glm
 }
+
+tier2() { tier2_fast; tier2_models; }
 
 benches() {
 	local f=$out/bench_numbers.txt; : > $f
@@ -136,6 +150,8 @@ case $mode in
 		sass_fingerprint > $out/sass.txt; cat $out/sass.txt
 		compare_fp sass $out/sass.txt $ROOT/results/sass.txt || fails=$((fails+1)) ;;
 	static) static_checks || fails=$((fails+1)) ;;
+	fast) tier2_fast ;;
+	models) tier2_models ;;
 	parity) tier2 ;;
 	bench) benches; cat $out/bench_numbers.txt ;;
 	needle) needles ;;

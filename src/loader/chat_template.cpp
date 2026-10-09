@@ -1,4 +1,5 @@
 #include "engine/loader/chat_template.h"
+#include "engine/core/log.h"
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -71,7 +72,7 @@ bool ChatTemplate::load( const char* template_path_or_model_dir ) {
 	if ( model_family_ == ModelFamily::UNKNOWN || template_raw_.empty() ) return false;
 	std::string err;
 	if ( !template_.compile( template_raw_, &err ) ) {
-		std::fprintf( stderr, "[-] chat template does not compile: %s\n", err.c_str() );
+		LOG_ERROR( "chat template does not compile: %s\n", err.c_str() );
 		return false;
 	}
 	return true;

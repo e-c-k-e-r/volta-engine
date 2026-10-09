@@ -1,4 +1,5 @@
 #include "engine/runtime/cluster.h"
+#include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #if ENGINE_BACKEND_CUDA
@@ -15,7 +16,7 @@ namespace engine::runtime {
 bool ModelCluster::init( const ClusterConfig& cfg ) {
 	ENGINE_ASSERT( !initialized_, "ModelCluster::init: already initialized" );
 	if ( !engine::models::is_known_model_type( cfg.model_type ) ) {
-		std::fprintf( stderr, "[-] ModelCluster: unsupported model_type '%s'\n", cfg.model_type.c_str() );
+		LOG_ERROR( "ModelCluster: unsupported model_type '%s'\n", cfg.model_type.c_str() );
 		return false;
 	}
 	const bool is_glm = ( cfg.model_type == "glm5_next" );
@@ -40,12 +41,12 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		if ( arena_bytes == 0 ) {
 			const size_t free_bytes = backend::device_free_bytes( d );
 			if ( free_bytes <= reserve ) {
-				std::fprintf( stderr, "[-] ModelCluster: GPU %d has %.2f GiB free, less than the %.2f GiB reserve\n", d, free_bytes / 1073741824.0, reserve / 1073741824.0 );
+				LOG_ERROR( "ModelCluster: GPU %d has %.2f GiB free, less than the %.2f GiB reserve\n", d, free_bytes / 1073741824.0, reserve / 1073741824.0 );
 				return false;
 			}
 			arena_bytes = ( free_bytes - reserve ) & ~( ( size_t ) 0xFFFFF );
 			if ( d == 0 ) {
-				std::printf( "[*] Arena sized from free memory: %.2f GiB per GPU (%.2f GiB free, %.2f GiB reserve)\n",
+				LOG_INFO( "Arena sized from free memory: %.2f GiB per GPU (%.2f GiB free, %.2f GiB reserve)\n",
 					arena_bytes / 1073741824.0, free_bytes / 1073741824.0, reserve / 1073741824.0 );
 			}
 		}
@@ -56,7 +57,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		if ( !models_[d]->init( d, arenas_[d], ( tp_ > 1 ) ? &rings_[d] : nullptr ) ) return false;
 	}
 
-	std::printf( "[*] Loading %s weights across %d GPUs from %s...\n", cfg.model_type.c_str(), tp_, cfg.model_dir.c_str() );
+	LOG_INFO( "Loading %s weights across %d GPUs from %s...\n", cfg.model_type.c_str(), tp_, cfg.model_dir.c_str() );
 	std::fflush( stdout );
 	pool_.start( tp_ );
 	bool ok[ENGINE_NUM_GPUS] = {};
@@ -66,7 +67,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	} );
 	for ( int d = 0; d < tp_; ++d ) {
 		if ( !ok[d] ) return false;
-		std::printf( "    [GPU %d] arena: %.3f / %.3f GiB\n", d,
+		LOG_INFO( "[GPU %d] arena: %.3f / %.3f GiB\n", d,
 			arenas_[d].offset_bytes / 1073741824.0, arenas_[d].total_bytes / 1073741824.0 );
 	}
 
@@ -278,7 +279,7 @@ void ModelCluster::warm_graphs( int max_m, int slot ) {
 		for ( int s = 0; s < slots; ++s ) reset_slot( s );
 	}
 	reset_slot( slot );
-	std::printf( "[+] Decode graphs warmed for m=1..%d in %.0f ms\n", max_m,
+	LOG_INFO( "Decode graphs warmed for m=1..%d in %.0f ms\n", max_m,
 		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
 }
 

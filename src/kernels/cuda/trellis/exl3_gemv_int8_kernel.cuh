@@ -14,10 +14,10 @@
 //
 //   y[n] = k_inv * (q * acc1[n] + q2 * acc2[n]) + (1024 * k_inv + k_bias) * (q * sum1 + q2 * sum2)
 //
-// recovers the result. In residual mode (EXL3_INT8_GEMV=1) the int8 rounding error r = a - q*i, which
+// recovers the result. In residual mode (the fixed mode) the int8 rounding error r = a - q*i, which
 // has range +/-q/2 by construction, is quantized with the fixed scale q2 = q/254 and accumulated by a
 // second dp4a sharing the decoded products, for ~15-16 bit effective activation precision (KL at
-// parity with the fp16 kernel or better). EXL3_INT8_GEMV=2 is the plain int8 mode.
+// parity with the fp16 kernel or better). A plain int8 mode (no residual pass) was removed.
 //
 // The sq kernel kills all global pre-GEMV coordination: each k-slice is Hadamard-transformed, maxed
 // and quantized block-locally during staging with its own q_s = slicemax/127 (deterministic, so

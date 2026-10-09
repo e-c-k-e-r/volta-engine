@@ -1,4 +1,5 @@
 #include "engine/runtime/dflash2_runner.h"
+#include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #include "engine/runtime/cluster.h"
@@ -89,7 +90,7 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 		if ( !spec_[d].init( cfg, d, mc.arena( d ), mc.stream( d ), d, tp_ ) ) return false;
 		loaded = spec_[d].load_weights( draft_dir.c_str(), mc.stream( d ) ) && loaded;
 	}
-	std::printf( "[+] DFlash2 speculator: %s (%s), drafter tp=%d\n", loaded ? "loaded" : "STANDALONE", draft_dir.c_str(), tp_ );
+	LOG_INFO( "DFlash2 speculator: %s (%s), drafter tp=%d\n", loaded ? "loaded" : "STANDALONE", draft_dir.c_str(), tp_ );
 	return true;
 }
 
@@ -200,7 +201,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 			std::fwrite( taps.data(), sizeof( backend::half_t ), taps.size(), f );
 			std::fwrite( hid.data(), sizeof( backend::half_t ), hid.size(), f );
 			std::fclose( f );
-			std::printf( "[dump] round %d: pos %d anchor %d\n", dump_round, pos, anchor );
+			LOG_INFO( "[dump] round %d: pos %d anchor %d\n", dump_round, pos, anchor );
 		}
 	}
 
@@ -366,13 +367,13 @@ void DFlash2Runner::profile_dump() {
 	double total = 0.0;
 	for ( int i = 0; i < SpecProfile::COUNT; ++i ) total += prof_.ms[i];
 	const int n = prof_.rounds;
-	std::printf( "\n--- speculative round profile: %d rounds, %d commits (%.0f%%) ---\n",
+	LOG_INFO( "\n--- speculative round profile: %d rounds, %d commits (%.0f%%) ---\n",
 		n, prof_.commits, n ? 100.0 * prof_.commits / n : 0.0 );
 	for ( int i = 0; i < SpecProfile::COUNT; ++i ) {
-		std::printf( "  %-26s %8.2f ms total  %7.3f ms/round  %5.1f%%\n", names[i], prof_.ms[i],
+		LOG_INFO( "%-26s %8.2f ms total  %7.3f ms/round  %5.1f%%\n", names[i], prof_.ms[i],
 			n ? prof_.ms[i] / n : 0.0, total > 0.0 ? 100.0 * prof_.ms[i] / total : 0.0 );
 	}
-	std::printf( "  %-26s %8.2f ms total  %7.3f ms/round\n", "TOTAL", total, n ? total / n : 0.0 );
+	LOG_INFO( "%-26s %8.2f ms total  %7.3f ms/round\n", "TOTAL", total, n ? total / n : 0.0 );
 	std::fflush( stdout );
 	prof_ = SpecProfile{};
 }

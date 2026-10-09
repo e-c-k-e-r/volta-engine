@@ -1,4 +1,5 @@
 #include "engine/models/glm5_next.h"
+#include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
@@ -86,7 +87,7 @@ bool Glm5NextPipeline::init(
 	// Routed experts: sharded over the ranks (every rank holds a quarter of every expert's intermediate width, moe_tp,
 	// default) or expert-parallel (72 whole experts per rank, forced by the two-tier expert cache). The sharded layout balances
 	// the load: each active expert costs every rank the same, where expert-parallel waits for the rank that drew the most.
-	moe_tp_ = engine::modules::ExpertTier::env_fraction() >= 1.0 && config_.tp_size == ENGINE_NUM_GPUS;
+	moe_tp_ = engine::modules::ExpertTier::resident_fraction() >= 1.0 && config_.tp_size == ENGINE_NUM_GPUS;
 	const int E_local = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
 
 	// 1. Router outputs + routed-MoE dispatch scratch
@@ -95,7 +96,7 @@ bool Glm5NextPipeline::init(
 	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R );
 	// The fused decode kernels read cold experts from host memory a little slower than the persistent kernel (6.4 vs 6.8 tok/s at a
 	// 50% tier), so the tier keeps the persistent path
-	if ( engine::modules::ExpertTier::env_fraction() < 1.0 ) state_.moe.coop_ctr = nullptr;
+	if ( engine::modules::ExpertTier::resident_fraction() < 1.0 ) state_.moe.coop_ctr = nullptr;
 
 	// KDA recurrent state + conv history per slot: [S, 45, ...] FP32, plus one-slot checkpoints
 	// Only the linear-attention layers carry state: every fourth layer (3, 7, ...) is MLA
@@ -322,7 +323,7 @@ bool Glm5NextPipeline::rebalance_experts( backend::stream_t stream ) {
 	int moved = 0;
 	for ( int l = 0; l < tier_layers_; ++l ) moved += tier_.rebalance( l, stream );
 	if ( runtime::options().expert_log ) {
-		std::printf( "[experts rank %d] window hit rate %.3f over %llu routes, %d swaps (%llu total)\n", rank_, tier_.hit_rate(),
+		LOG_INFO( "[experts rank %d] window hit rate %.3f over %llu routes, %d swaps (%llu total)\n", rank_, tier_.hit_rate(),
 			static_cast<unsigned long long>( tier_.window_routes ), moved, static_cast<unsigned long long>( tier_.swaps ) );
 	}
 	return true;
@@ -377,7 +378,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	size_t bytes_before = arena_->offset_bytes;
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) {
-		std::printf( "    [loader] FAILED to open model directory %s\n", model_dir );
+		LOG_ERROR( "[loader] FAILED to open model directory %s\n", model_dir );
 		return false;
 	}
 
@@ -390,7 +391,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		const char* ename = "model.language_model.embed_tokens.weight";
 		int shard_idx = -1;
 		const auto* meta = repo.find( ename, &shard_idx );
-		if ( meta == nullptr || shard_idx < 0 ) { std::printf( "[RANK %d] MISSING: embed_tokens\n", rank_ ); ++missing_count; }
+		if ( meta == nullptr || shard_idx < 0 ) { LOG_ERROR( "[RANK %d] MISSING: embed_tokens\n", rank_ ); ++missing_count; }
 		else {
 			const size_t bytes = static_cast<size_t>( config_.vocab_size ) * config_.hidden_size * sizeof( uint16_t );
 			const void* src = engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta );
@@ -406,9 +407,9 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	embed_tokens_ = g_embed_table;
 	// Final norm + this rank's vocabulary shard of the LM head
 	final_norm_ = repo.load( "model.language_model.norm.weight", *arena_, stream, pod::DType::FP16 );
-	if ( !final_norm_.data ) { std::printf( "[RANK %d] MISSING: norm\n", rank_ ); ++missing_count; }
+	if ( !final_norm_.data ) { LOG_ERROR( "[RANK %d] MISSING: norm\n", rank_ ); ++missing_count; }
 	lm_head_ = repo.load_linear_cols_padded( "lm_head", *arena_, 6, lm_shard_offset_ / 16, lm_shard_real_cols_ / 16, lm_shard_cols_ - lm_shard_real_cols_, stream );
-	if ( !lm_head_.is_valid() ) { std::printf( "[RANK %d] MISSING: lm_head\n", rank_ ); ++missing_count; }
+	if ( !lm_head_.is_valid() ) { LOG_ERROR( "[RANK %d] MISSING: lm_head\n", rank_ ); ++missing_count; }
 
 	// 2. Per-layer weights across 45 layers
 	char name_buf[256];
@@ -531,7 +532,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			mw.type = pod::QuantType::TRELLIS;
 			mw.num_local_experts = experts_per_rank;
 			// Tiered experts (ENGINE_EXPERT_CACHE < 1): the codes of resident experts go to device slots, the rest to pinned host memory
-			const double tier_fraction = engine::modules::ExpertTier::env_fraction();
+			const double tier_fraction = engine::modules::ExpertTier::resident_fraction();
 			int tier_layer = -1;
 			if ( tier_fraction < 1.0 ) {
 				if ( tier_layers_ == 0 ) {
@@ -616,33 +617,33 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.hc_ffn_fn", L );
 		lw.hc_ffn_fn = repo.load( name_buf, *arena_, stream, pod::DType::FP32 );
 
-		if ( !lw.input_norm.data ) { std::printf( "[RANK %d L%d] MISSING: input_norm\n", rank_, L ); ++missing_count; }
-		if ( !lw.post_attn_norm.data ) { std::printf( "[RANK %d L%d] MISSING: post_attn_norm\n", rank_, L ); ++missing_count; }
+		if ( !lw.input_norm.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: input_norm\n", rank_, L ); ++missing_count; }
+		if ( !lw.post_attn_norm.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: post_attn_norm\n", rank_, L ); ++missing_count; }
 		if ( lw.is_linear_attn ) {
-			if ( !lw.qkv.is_valid() ) { std::printf( "[RANK %d L%d] MISSING: qkv\n", rank_, L ); ++missing_count; }
-			if ( !lw.conv1d_weights.data ) { std::printf( "[RANK %d L%d] MISSING: conv1d_weights\n", rank_, L ); ++missing_count; }
-			if ( !lw.A_log.data ) { std::printf( "[RANK %d L%d] MISSING: A_log\n", rank_, L ); ++missing_count; }
-			if ( !lw.dt_bias.data ) { std::printf( "[RANK %d L%d] MISSING: dt_bias\n", rank_, L ); ++missing_count; }
-			if ( !lw.b_proj.data ) { std::printf( "[RANK %d L%d] MISSING: b_proj\n", rank_, L ); ++missing_count; }
-			if ( !lw.f_a_proj.data ) { std::printf( "[RANK %d L%d] MISSING: f_a_proj\n", rank_, L ); ++missing_count; }
-			if ( !lw.f_b_proj.data ) { std::printf( "[RANK %d L%d] MISSING: f_b_proj\n", rank_, L ); ++missing_count; }
-			if ( !lw.g_a_proj.data ) { std::printf( "[RANK %d L%d] MISSING: g_a_proj\n", rank_, L ); ++missing_count; }
-			if ( !lw.g_b_proj.data ) { std::printf( "[RANK %d L%d] MISSING: g_b_proj\n", rank_, L ); ++missing_count; }
-			if ( !lw.o_norm.data ) { std::printf( "[RANK %d L%d] MISSING: o_norm\n", rank_, L ); ++missing_count; }
-			if ( !lw.o_proj.is_valid() ) { std::printf( "[RANK %d L%d] MISSING: o_proj (linear)\n", rank_, L ); ++missing_count; }
+			if ( !lw.qkv.is_valid() ) { LOG_ERROR( "[RANK %d L%d] MISSING: qkv\n", rank_, L ); ++missing_count; }
+			if ( !lw.conv1d_weights.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: conv1d_weights\n", rank_, L ); ++missing_count; }
+			if ( !lw.A_log.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: A_log\n", rank_, L ); ++missing_count; }
+			if ( !lw.dt_bias.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: dt_bias\n", rank_, L ); ++missing_count; }
+			if ( !lw.b_proj.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: b_proj\n", rank_, L ); ++missing_count; }
+			if ( !lw.f_a_proj.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: f_a_proj\n", rank_, L ); ++missing_count; }
+			if ( !lw.f_b_proj.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: f_b_proj\n", rank_, L ); ++missing_count; }
+			if ( !lw.g_a_proj.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: g_a_proj\n", rank_, L ); ++missing_count; }
+			if ( !lw.g_b_proj.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: g_b_proj\n", rank_, L ); ++missing_count; }
+			if ( !lw.o_norm.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: o_norm\n", rank_, L ); ++missing_count; }
+			if ( !lw.o_proj.is_valid() ) { LOG_ERROR( "[RANK %d L%d] MISSING: o_proj (linear)\n", rank_, L ); ++missing_count; }
 		}
 		if ( lw.is_mla ) {
-			if ( !lw.q_a.is_valid() ) { std::printf( "[RANK %d L%d] MISSING: q_a\n", rank_, L ); ++missing_count; }
-			if ( !lw.q_a_norm.data ) { std::printf( "[RANK %d L%d] MISSING: q_a_norm\n", rank_, L ); ++missing_count; }
-			if ( !lw.q_b.is_valid() ) { std::printf( "[RANK %d L%d] MISSING: q_b\n", rank_, L ); ++missing_count; }
-			if ( !lw.kv_a.is_valid() ) { std::printf( "[RANK %d L%d] MISSING: kv_a\n", rank_, L ); ++missing_count; }
-			if ( !lw.kv_a_norm.data ) { std::printf( "[RANK %d L%d] MISSING: kv_a_norm\n", rank_, L ); ++missing_count; }
-			if ( !lw.kv_b_proj.data ) { std::printf( "[RANK %d L%d] MISSING: kv_b_proj\n", rank_, L ); ++missing_count; }
-			if ( !lw.o_proj.is_valid() ) { std::printf( "[RANK %d L%d] MISSING: o_proj (mla)\n", rank_, L ); ++missing_count; }
+			if ( !lw.q_a.is_valid() ) { LOG_ERROR( "[RANK %d L%d] MISSING: q_a\n", rank_, L ); ++missing_count; }
+			if ( !lw.q_a_norm.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: q_a_norm\n", rank_, L ); ++missing_count; }
+			if ( !lw.q_b.is_valid() ) { LOG_ERROR( "[RANK %d L%d] MISSING: q_b\n", rank_, L ); ++missing_count; }
+			if ( !lw.kv_a.is_valid() ) { LOG_ERROR( "[RANK %d L%d] MISSING: kv_a\n", rank_, L ); ++missing_count; }
+			if ( !lw.kv_a_norm.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: kv_a_norm\n", rank_, L ); ++missing_count; }
+			if ( !lw.kv_b_proj.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: kv_b_proj\n", rank_, L ); ++missing_count; }
+			if ( !lw.o_proj.is_valid() ) { LOG_ERROR( "[RANK %d L%d] MISSING: o_proj (mla)\n", rank_, L ); ++missing_count; }
 		}
 		if ( lw.is_moe ) {
-			if ( !lw.router_weights.data ) { std::printf( "[RANK %d L%d] MISSING: router_weights\n", rank_, L ); ++missing_count; }
-			if ( !lw.e_score_bias.data ) { std::printf( "[RANK %d L%d] MISSING: e_score_bias\n", rank_, L ); ++missing_count; }
+			if ( !lw.router_weights.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: router_weights\n", rank_, L ); ++missing_count; }
+			if ( !lw.e_score_bias.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: e_score_bias\n", rank_, L ); ++missing_count; }
 			int expert_miss = 0;
 			for ( int e = 0; e < experts_per_rank; ++e ) {
 				const auto& mw = lw.moe_weights;
@@ -651,31 +652,31 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 				}
 			}
 			if ( expert_miss > 0 ) {
-				std::printf( "[RANK %d L%d] MISSING: %d/%d local experts invalid!\n", rank_, L, expert_miss, experts_per_rank );
+				LOG_ERROR( "[RANK %d L%d] MISSING: %d/%d local experts invalid!\n", rank_, L, expert_miss, experts_per_rank );
 				missing_count += expert_miss;
 			}
 			if ( !lw.shared_expert.gate.is_valid() || !lw.shared_expert.up.is_valid() || !lw.shared_expert.down.is_valid() ) {
-				std::printf( "[RANK %d L%d] MISSING: shared_expert\n", rank_, L );
+				LOG_ERROR( "[RANK %d L%d] MISSING: shared_expert\n", rank_, L );
 				++missing_count;
 			}
 		}
 		else {
 			if ( !lw.dense_mlp.gate.is_valid() || !lw.dense_mlp.up.is_valid() || !lw.dense_mlp.down.is_valid() ) {
-				std::printf( "[RANK %d L%d] MISSING: dense_mlp\n", rank_, L );
+				LOG_ERROR( "[RANK %d L%d] MISSING: dense_mlp\n", rank_, L );
 				++missing_count;
 			}
 		}
-		if ( !lw.hc_attn_base.data ) { std::printf( "[RANK %d L%d] MISSING: hc_attn_base\n", rank_, L ); ++missing_count; }
-		if ( !lw.hc_attn_scale.data ) { std::printf( "[RANK %d L%d] MISSING: hc_attn_scale\n", rank_, L ); ++missing_count; }
-		if ( !lw.hc_attn_fn.data ) { std::printf( "[RANK %d L%d] MISSING: hc_attn_fn\n", rank_, L ); ++missing_count; }
-		if ( !lw.hc_ffn_base.data ) { std::printf( "[RANK %d L%d] MISSING: hc_ffn_base\n", rank_, L ); ++missing_count; }
-		if ( !lw.hc_ffn_scale.data ) { std::printf( "[RANK %d L%d] MISSING: hc_ffn_scale\n", rank_, L ); ++missing_count; }
-		if ( !lw.hc_ffn_fn.data ) { std::printf( "[RANK %d L%d] MISSING: hc_ffn_fn\n", rank_, L ); ++missing_count; }
+		if ( !lw.hc_attn_base.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: hc_attn_base\n", rank_, L ); ++missing_count; }
+		if ( !lw.hc_attn_scale.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: hc_attn_scale\n", rank_, L ); ++missing_count; }
+		if ( !lw.hc_attn_fn.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: hc_attn_fn\n", rank_, L ); ++missing_count; }
+		if ( !lw.hc_ffn_base.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: hc_ffn_base\n", rank_, L ); ++missing_count; }
+		if ( !lw.hc_ffn_scale.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: hc_ffn_scale\n", rank_, L ); ++missing_count; }
+		if ( !lw.hc_ffn_fn.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: hc_ffn_fn\n", rank_, L ); ++missing_count; }
 	}
 
 	size_t bytes_after = arena_->offset_bytes;
 	if ( missing_count > 0 || rank_ == 0 ) {
-		std::printf( "    [RANK %d] load_weights complete: missing_count=%d | arena: before=%.3f GiB, after=%.3f GiB, loaded=%.3f GiB\n",
+		LOG_ERROR( "[RANK %d] load_weights complete: missing_count=%d | arena: before=%.3f GiB, after=%.3f GiB, loaded=%.3f GiB\n",
 			rank_, missing_count,
 			bytes_before / ( 1024.0 * 1024.0 * 1024.0 ),
 			bytes_after / ( 1024.0 * 1024.0 * 1024.0 ),
@@ -1038,13 +1039,13 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 							}
 							recall += got / tot;
 						}
-						std::printf( "[dsa diag] layer %d: %d of %d tokens selected, dense-attention mass recall %.4f (mean over heads)\n", mla_idx, nk, n, recall / 16.0 );
+						LOG_INFO( "[dsa diag] layer %d: %d of %d tokens selected, dense-attention mass recall %.4f (mean over heads)\n", mla_idx, nk, n, recall / 16.0 );
 					}
 				}
 				engine::modules::MLALatent::expand_out( o_lat, lw.kv_b_proj, mla_heads_out_, 16, m, stream );
 			}
 
-			// Project output: o_proj -> ring_->all_reduce across the 4 ranks
+			// Project output: o_proj -> ring_->all_reduce across the ranks
 			if ( lw.o_proj.is_valid() ) {
 				engine::modules::Linear::forward(
 					mla_heads_out_, lw.o_proj, attn_out_, stream

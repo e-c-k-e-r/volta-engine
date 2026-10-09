@@ -6,7 +6,7 @@
 
 namespace engine::modules {
 
-double ExpertTier::env_fraction() {
+double ExpertTier::resident_fraction() {
 	return runtime::options().expert_cache;
 }
 

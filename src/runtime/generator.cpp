@@ -1,4 +1,5 @@
 #include "engine/runtime/generator.h"
+#include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include <cstdio>
 #include <cstring>
@@ -15,18 +16,18 @@ Generator::~Generator() {
 bool Generator::init( const engine::server::ServerConfig& config ) {
 	config_ = config;
 	boot_time_ = std::chrono::steady_clock::now();
-	std::printf( "[*] Generator initializing: model=%s dir=%s\n", config_.model_type.c_str(), config_.model_dir.c_str() );
+	LOG_INFO( "Generator initializing: model=%s dir=%s\n", config_.model_type.c_str(), config_.model_dir.c_str() );
 
 	if ( !config_.load_weights ) {
-		std::printf( "[-] Generator requires real weights (load_weights=false is no longer supported)\n" );
+		LOG_ERROR( "Generator requires real weights (load_weights=false is no longer supported)\n" );
 		return false;
 	}
 	if ( tokenizer_.load( config_.model_dir.c_str() ) ) {
 		chat_template_.load( config_.model_dir.c_str() );
-		std::printf( "[+] Tokenizer loaded. Vocab size: %zu\n", tokenizer_.vocab_size() );
+		LOG_INFO( "Tokenizer loaded. Vocab size: %zu\n", tokenizer_.vocab_size() );
 	}
 	else {
-		std::printf( "[-] Warning: failed to load tokenizer from %s\n", config_.model_dir.c_str() );
+		LOG_ERROR( "Warning: failed to load tokenizer from %s\n", config_.model_dir.c_str() );
 	}
 
 	ClusterConfig cc;
@@ -35,22 +36,22 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 	cc.tp = config_.tp_size;
 	if ( config_.use_speculation ) cc.draft_model_dir = config_.draft_model_dir;
 	if ( !cluster_.init( cc ) ) {
-		std::printf( "[-] Generator: model cluster init failed\n" );
+		LOG_ERROR( "Generator: model cluster init failed\n" );
 		return false;
 	}
 	num_slots_ = MIN( MIN( config_.max_batch_size, MAX_SLOTS ), cluster_.metadata().max_slots );
 	num_slots_ = MAX( num_slots_, 1 );
 	// Mode B uses m <= num_slots_; speculative verify uses m <= 7 draft rows
 	cluster_.warm_graphs( MAX( num_slots_, cluster_.has_speculator() ? 7 : 1 ) );
-	std::printf( "[+] Generator ready: %d slots, speculation %s\n", num_slots_, cluster_.has_speculator() ? "on" : "off" );
+	LOG_INFO( "Generator ready: %d slots, speculation %s\n", num_slots_, cluster_.has_speculator() ? "on" : "off" );
 
 	const size_t cache_budget = static_cast<size_t>( std::max( 0, runtime::options().prefix_cache_gib ) ) << 30;
 	if ( cache_budget > 0 && cluster_.snapshot_bytes( 0, 1 ) > 0 ) {
 		prefix_cache_ = std::make_unique<PrefixCache>( cluster_, cache_budget );
-		std::printf( "[+] Prefix cache: %.0f GiB pinned host budget\n", cache_budget / 1073741824.0 );
+		LOG_INFO( "Prefix cache: %.0f GiB pinned host budget\n", cache_budget / 1073741824.0 );
 	}
 	else {
-		std::printf( "[*] Prefix cache off\n" );
+		LOG_INFO( "Prefix cache off\n" );
 	}
 
 	running_.store( true );
@@ -71,7 +72,7 @@ void Generator::shutdown() {
 	prefix_cache_.reset();
 	cluster_.shutdown();
 	if ( was_running ) {
-		std::printf( "[+] Generator shutdown complete. 4 GPUs reset.\n" );
+		LOG_INFO( "Generator shutdown complete.\n" );
 	}
 }
 
@@ -228,7 +229,7 @@ void Generator::prefill_slot( int s ) {
 			if ( prefix_cache_->restore( s, hit ) ) {
 				node = hit;
 				pos = static_cast<int>( hit->tokens.size() );
-				std::printf( "[prefix] slot %d resumes at token %d of %d\n", s, pos, n );
+				LOG_INFO( "[prefix] slot %d resumes at token %d of %d\n", s, pos, n );
 			}
 		}
 	}

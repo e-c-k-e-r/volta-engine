@@ -29,6 +29,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 
 | Option | Type | Default | Environment | Description |
 |---|---|---|---|---|
+| `log_level` | string | `info` | `ENGINE_LOG_LEVEL` | log threshold: error, warn, info or debug |
 | `tp` | int | `-1` | `ENGINE_TP` | rank count, 1 or 4; <0 uses the launch's tp_size |
 | `arena_gib` | int | `-1` | `ENGINE_ARENA_GIB` | per-GPU arena in GiB; <=0 sizes it from the device's free memory minus vram_reserve_mib |
 | `vram_reserve_mib` | int | `-1` | `ENGINE_VRAM_RESERVE_MIB` | memory left outside the arena for graphs, workspaces and the CUDA context; <0 uses the model's default (Qwen 1536, GLM 288) |

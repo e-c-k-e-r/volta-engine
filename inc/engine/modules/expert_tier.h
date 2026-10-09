@@ -39,7 +39,7 @@ struct ExpertTier {
 	int max_swaps = 4;
 
 	// ENGINE_EXPERT_CACHE: fraction of each layer's experts kept resident (1 or unset: tiering off)
-	static double env_fraction();
+	static double resident_fraction();
 
 	bool active() const { return resident < experts; }
 	size_t cold_bytes_per_layer() const { return static_cast<size_t>( experts - resident ) * slot_bytes; }

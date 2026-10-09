@@ -1,4 +1,5 @@
 #include "engine/models/qwen3_5.h"
+#include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #include "engine/loader/safetensors.h"
@@ -247,7 +248,7 @@ void Qwen3_5Pipeline::reset_state( int slot_id ) {
 bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t stream ) {
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) {
-		std::printf( "    [loader] FAILED to open model directory %s\n", model_dir );
+		LOG_ERROR( "[loader] FAILED to open model directory %s\n", model_dir );
 		return false;
 	}
 
@@ -260,7 +261,7 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 	// NVFP4 checkpoint (compressed-tensors): projections are W4A16 through the skinny NVFP4 kernels, the LM head is a dense
 	// BF16 matrix served as FP16.
 	const bool fp4 = repo.find( "model.language_model.layers.0.mlp.gate_proj.weight_packed" ) != nullptr;
-	if ( fp4 ) std::printf( "    [RANK %d] NVFP4 checkpoint\n", rank_ );
+	if ( fp4 ) LOG_ERROR( "[RANK %d] NVFP4 checkpoint\n", rank_ );
 
 	// 3. LM Head, sharded across the vocabulary dimension
 	if ( fp4 ) {

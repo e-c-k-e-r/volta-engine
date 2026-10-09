@@ -38,6 +38,7 @@ include_directories(
 # Host C++ (built by the host compiler; talks to the device only through engine/backend and the module headers)
 set(ENGINE_HOST_SOURCES
 	src/core/arena.cpp
+	src/core/log.cpp
 	src/loader/safetensors.cpp
 	src/loader/nvfp4.cpp
 	src/loader/tokenizer.cpp
@@ -397,6 +398,9 @@ endif()
 # Per-lane build fragments (each owned by one Wave 2 lane; empty until the lane fills it in)
 include(${PROJECT_SOURCE_DIR}/cmake/cpu_backend.cmake OPTIONAL)
 include(${PROJECT_SOURCE_DIR}/cmake/reference_kernels.cmake OPTIONAL)
-include(${PROJECT_SOURCE_DIR}/cmake/vulkan_backend.cmake OPTIONAL)
+# The CPU configuration has no Vulkan targets: they compile against the other backend definitions and break all-targets builds
+if(NOT ENGINE_BACKEND STREQUAL "CPU")
+	include(${PROJECT_SOURCE_DIR}/cmake/vulkan_backend.cmake OPTIONAL)
+endif()
 include(${PROJECT_SOURCE_DIR}/cmake/ops_tests_linear.cmake OPTIONAL)
 include(${PROJECT_SOURCE_DIR}/cmake/ops_tests_attention.cmake OPTIONAL)

@@ -5,8 +5,8 @@
 
 namespace engine::modules {
 
-__attribute__(( weak )) double ExpertTier::env_fraction() {
-	ENGINE_UNSUPPORTED( "ExpertTier::env_fraction" );
+__attribute__(( weak )) double ExpertTier::resident_fraction() {
+	ENGINE_UNSUPPORTED( "ExpertTier::resident_fraction" );
 	__builtin_unreachable();
 }
 

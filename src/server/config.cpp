@@ -1,4 +1,5 @@
 #include "engine/server/config.h"
+#include "engine/core/log.h"
 #include "engine/models/model.h"
 #include "engine/runtime/options.h"
 
@@ -17,7 +18,7 @@ namespace {
 
 bool apply_option( const std::string& key, const std::string& value ) {
 	if ( runtime::set_option( key, value ) ) return true;
-	std::fprintf( stderr, "[-] Error: unknown option or invalid value: %s = %s\n", key.c_str(), value.c_str() );
+	LOG_ERROR( "Error: unknown option or invalid value: %s = %s\n", key.c_str(), value.c_str() );
 	return false;
 }
 
@@ -30,7 +31,7 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 
 	FILE* f = std::fopen( json_path, "rb" );
 	if ( !f ) {
-		std::fprintf( stderr, "[-] Notice: Could not open config file: %s\n", json_path );
+		LOG_ERROR( "Notice: Could not open config file: %s\n", json_path );
 		return false;
 	}
 
@@ -51,7 +52,7 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 
 	auto j = nlohmann::json::parse( buffer, nullptr, false );
 	if ( j.is_discarded() ) {
-		std::fprintf( stderr, "[-] Error: Failed to parse JSON config: %s\n", json_path );
+		LOG_ERROR( "Error: Failed to parse JSON config: %s\n", json_path );
 		return false;
 	}
 
@@ -77,7 +78,7 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 		default_enable_thinking = j["default_enable_thinking"].get<bool>();
 	}
 	if ( j.contains( "model_type" ) || j.contains( "model" ) ) {
-		std::fprintf( stderr, "[-] Error: model_type is read from the checkpoint config.json; remove it from the launch config\n" );
+		LOG_ERROR( "Error: model_type is read from the checkpoint config.json; remove it from the launch config\n" );
 		return false;
 	}
 	if ( j.contains( "model_dir" ) && j["model_dir"].is_string() ) {
@@ -168,7 +169,7 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 	for ( int i = 1; i < argc; ++i ) {
 		if ( std::strcmp( argv[i], "--config" ) == 0 && i + 1 < argc ) {
 			if ( !load_from_json( argv[++i] ) ) {
-				std::fprintf( stderr, "[-] FATAL: invalid launch config %s\n", argv[i] );
+				LOG_ERROR( "FATAL: invalid launch config %s\n", argv[i] );
 				std::exit( 2 );
 			}
 		}
@@ -183,7 +184,7 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 			host = argv[++i];
 		}
 		else if ( std::strcmp( argv[i], "--model" ) == 0 || std::strcmp( argv[i], "--model-type" ) == 0 ) {
-			std::fprintf( stderr, "[-] FATAL: %s was removed; model_type is read from the checkpoint config.json\n", argv[i] );
+			LOG_ERROR( "FATAL: %s was removed; model_type is read from the checkpoint config.json\n", argv[i] );
 			std::exit( 2 );
 		}
 		else if ( ( std::strcmp( argv[i], "--model-dir" ) == 0 || std::strcmp( argv[i], "--weights-dir" ) == 0 ) && i + 1 < argc ) {
@@ -220,7 +221,7 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 			const std::string kv = argv[++i];
 			const size_t eq = kv.find( '=' );
 			if ( eq == std::string::npos || !apply_option( kv.substr( 0, eq ), kv.substr( eq + 1 ) ) ) {
-				std::fprintf( stderr, "[-] FATAL: --set expects key=value for a known option, got '%s'\n", kv.c_str() );
+				LOG_ERROR( "FATAL: --set expects key=value for a known option, got '%s'\n", kv.c_str() );
 				std::exit( 2 );
 			}
 		}
@@ -231,14 +232,14 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 
 bool ServerConfig::resolve() {
 	if ( model_dir.empty() ) {
-		std::fprintf( stderr, "[-] FATAL: model_dir is required (--model-dir or \"model_dir\" in the launch config)\n" );
+		LOG_ERROR( "FATAL: model_dir is required (--model-dir or \"model_dir\" in the launch config)\n" );
 		return false;
 	}
 	{
 		const std::string path = model_dir + "/config.json";
 		FILE* f = std::fopen( path.c_str(), "rb" );
 		if ( !f ) {
-			std::fprintf( stderr, "[-] FATAL: %s is unreadable\n", path.c_str() );
+			LOG_ERROR( "FATAL: %s is unreadable\n", path.c_str() );
 			return false;
 		}
 		std::string text;
@@ -248,13 +249,13 @@ bool ServerConfig::resolve() {
 		std::fclose( f );
 		auto j = nlohmann::json::parse( text, nullptr, false );
 		if ( j.is_discarded() || !j.contains( "model_type" ) || !j["model_type"].is_string() ) {
-			std::fprintf( stderr, "[-] FATAL: %s has no model_type\n", path.c_str() );
+			LOG_ERROR( "FATAL: %s has no model_type\n", path.c_str() );
 			return false;
 		}
 		model_type = j["model_type"].get<std::string>();
 	}
 	if ( !models::is_known_model_type( model_type ) ) {
-		std::fprintf( stderr, "[-] FATAL: unsupported model_type '%s' (supported: qwen3_5, glm5_next)\n", model_type.c_str() );
+		LOG_ERROR( "FATAL: unsupported model_type '%s' (supported: qwen3_5, glm5_next)\n", model_type.c_str() );
 		return false;
 	}
 	// Sampling defaults: explicit config wins, then the checkpoint's generation_config.json
@@ -276,10 +277,10 @@ bool ServerConfig::resolve() {
 		if ( default_temperature < 0.0f ) default_temperature = 0.0f;
 		if ( default_top_p < 0.0f ) default_top_p = 1.0f;
 		if ( default_top_k < 0 ) default_top_k = 16;
-		std::printf( "[*] Sampling defaults: temperature %.2f, top_p %.2f, top_k %d\n", default_temperature, default_top_p, default_top_k );
+		LOG_INFO( "Sampling defaults: temperature %.2f, top_p %.2f, top_k %d\n", default_temperature, default_top_p, default_top_k );
 	}
 	if ( use_speculation && draft_model_dir.empty() ) {
-		std::fprintf( stderr, "[-] FATAL: use_speculation requires draft_model_dir\n" );
+		LOG_ERROR( "FATAL: use_speculation requires draft_model_dir\n" );
 		return false;
 	}
 	return true;

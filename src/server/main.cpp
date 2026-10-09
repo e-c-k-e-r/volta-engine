@@ -1,4 +1,5 @@
 #include "engine/server/server.h"
+#include "engine/core/log.h"
 #include "engine/server/config.h"
 #include <cstdio>
 #include <memory>
@@ -25,7 +26,7 @@ int main( int argc, char** argv ) {
 
 	auto server = std::make_unique<engine::server::VoltaServer>();
 	if ( !server->init( cfg ) ) {
-		std::fprintf( stderr, "[-] FATAL: Failed to initialize Volta Server.\n" );
+		LOG_ERROR( "FATAL: Failed to initialize Volta Server.\n" );
 		return 1;
 	}
 

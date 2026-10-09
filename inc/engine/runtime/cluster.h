@@ -27,7 +27,7 @@ struct ClusterConfig {
 	int tp = ENGINE_NUM_GPUS;    // ranks: 1 (single device, no collective) or ENGINE_NUM_GPUS
 };
 
-// TP model instance (1 or 4 ranks): per-rank arenas, streams, NVLink mesh, pipelines and a persistent
+// TP model instance (1 or ENGINE_NUM_GPUS ranks): per-rank arenas, streams, NVLink mesh, pipelines and a persistent
 // pinned worker pool. Shared by the Generator and every test / benchmark driver.
 class ModelCluster {
 public:

@@ -1,4 +1,5 @@
 #include "engine/spec/dflash.h"
+#include "engine/core/log.h"
 #include "engine/modules/norm.h"
 #include "engine/modules/swiglu.h"
 #include "engine/modules/embedding.h"
@@ -419,7 +420,7 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 	}
 
 	weights_loaded_ = true;
-	std::printf( "    [dflash] backbone loaded: %d layers, hidden %d, tp %d (rank %d), conv groups %d\n",
+	LOG_INFO( "[dflash] backbone loaded: %d layers, hidden %d, tp %d (rank %d), conv groups %d\n",
 		L, H, TP, R, config_.conv_groups() );
 	return true;
 }
