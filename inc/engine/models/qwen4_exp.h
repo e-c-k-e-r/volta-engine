@@ -9,6 +9,7 @@
 #include "engine/modules/moe.h"
 #include "engine/core/graph_cache.h"
 #include "engine/loader/ngram_table.h"
+#include "engine/runtime/kv_cache.h"
 #include "engine/backend/types.h"
 #include <vector>
 
@@ -121,6 +122,8 @@ private:
 	// N-gram embedding layer: host gather of the rows for the forward (called from forward()), device gate / conv (from forward_body)
 	void ple_prepare( const pod::BatchRows& rows, int m, backend::stream_t stream );
 	void ple_forward( int m, backend::stream_t stream );
+	// Full-attention sublayer (the QSA layers): mixed_ in, the rank's partial o_proj result in y_
+	void attention_forward( const Qwen4ExpLayerWeights& lw, int attn_idx, int m, backend::stream_t stream );
 	void gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_idx, int m, backend::stream_t stream );
 	// MoE sublayer: mixed_ in, this rank's partial result (routed experts of the rank, plus the shared expert on rank 0) in y_
 	void moe_forward( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream );
@@ -174,6 +177,11 @@ private:
 	backend::half_t* topk_w_ = nullptr;
 	pod::MoEScratch moe_scratch_;
 	pod::TensorView sh_gate_buf_, sh_up_buf_, sh_inter_buf_, sh_out_;
+	// Full-attention buffers (this rank: q_heads_ query heads over kv_heads_ = 1 KV head)
+	int q_heads_ = 0, kv_heads_ = 0;
+	engine::runtime::KVCachePool kv_pool_;
+	bool attn_tc_ = false;     // all rows of the forward share one slot
+	pod::TensorView q_gate_buf_, q_buf_, gate_attn_buf_, k_buf_, v_buf_, attn_out_;
 	// GDN buffers
 	pod::TensorView qkv_buf_, conv_out_, z_buf_, gdn_out_, gdn_gate_, gdn_beta_;
 

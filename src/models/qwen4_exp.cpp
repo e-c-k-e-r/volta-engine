@@ -9,6 +9,9 @@
 #include "engine/modules/embedding.h"
 #include "engine/modules/swiglu.h"
 #include "engine/modules/ple.h"
+#include "engine/modules/attention.h"
+#include "engine/modules/norm.h"
+#include "engine/modules/rope.h"
 #include <mutex>
 #include "engine/modules/linear.h"
 #if ENGINE_BACKEND_CUDA
@@ -118,6 +121,8 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	const int R = pod::MAX_ROWS;
 	const int H = config_.hidden_size;
 	const int S = config_.max_slots;
+	q_heads_ = config_.num_q_heads / tp_;
+	kv_heads_ = 1;   // 2 KV heads over 4 ranks: ranks 2j and 2j + 1 each hold head j
 	lin_k_heads_ = config_.linear_num_k_heads / tp_;
 	lin_v_heads_ = config_.linear_num_v_heads / tp_;
 	lin_channels_ = config_.linear_channels / tp_;
@@ -136,6 +141,9 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	state_.d_snap_on = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
 	backend::memset_sync( state_.d_snap_on, 0, sizeof( int ) );
 
+	int full_layers = 0;
+	for ( int L = 0; L < config_.num_layers; ++L ) full_layers += config_.is_full_attention( L ) ? 1 : 0;
+	kv_pool_.init( rank_, arena, S, config_.max_seq, full_layers, kv_heads_, config_.head_dim );
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
 	int h_shape[2] = { R, H };
@@ -147,6 +155,15 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	post_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.hc_mult * sizeof( float ) ) );
 	gr_scratch_ = static_cast<float*>( engine::core::arena_alloc( arena,
 		engine::modules::GatedResidual::scratch_floats( R, H, config_.hc_mult, config_.hc_rank ) * sizeof( float ) ) );
+	int qg_shape[2] = { R, q_heads_ * config_.head_dim * 2 };
+	q_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qg_shape, 2 );
+	int q_shape[2] = { R, q_heads_ * config_.head_dim };
+	q_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_shape, 2 );
+	gate_attn_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_shape, 2 );
+	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_shape, 2 );
+	int kv_shape[2] = { R, kv_heads_ * config_.head_dim };
+	k_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_shape, 2 );
+	v_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_shape, 2 );
 	// N-gram embedding layer buffers and per-slot histories
 	{
 		int e_shape[2] = { R, config_.ple_embed_dim };
@@ -357,6 +374,12 @@ void Qwen4ExpPipeline::set_rows( int m ) {
 	ple_emb_.shape[0] = m;
 	ple_key_.shape[0] = m;
 	ple_value_.shape[0] = m;
+	q_gate_buf_.shape[0] = m;
+	q_buf_.shape[0] = m;
+	gate_attn_buf_.shape[0] = m;
+	attn_out_.shape[0] = m;
+	k_buf_.shape[0] = m;
+	v_buf_.shape[0] = m;
 }
 
 void Qwen4ExpPipeline::embed_tokens( const int* token_ids, int count, backend::stream_t stream ) {
@@ -376,6 +399,8 @@ void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 	key_hint_ = rows.pos[m - 1] + 1;
 	set_rows( m );
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
+	attn_tc_ = true;
+	for ( int r = 1; r < m; ++r ) attn_tc_ = attn_tc_ && rows.slot[r] == rows.slot[0];
 	ple_prepare( rows, m, stream );
 	forward_body( m, stream );
 }
@@ -437,6 +462,25 @@ void Qwen4ExpPipeline::gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, i
 		streams_.ptr<const float>(), g.norm.ptr<const backend::half_t>(), g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(),
 		with_post ? g.inject.ptr<const backend::half_t>() : nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_,
 		m, config_.hidden_size, config_.hc_mult, config_.hc_rank, config_.rms_norm_eps, stream );
+}
+
+// Full-attention sublayer: mixed_ in, the rank's partial o_proj result in y_. Dense causal attention; the QSA block selection only
+// restricts it once a row sees more than indexer_budget tokens.
+void Qwen4ExpPipeline::attention_forward( const Qwen4ExpLayerWeights& lw, int attn_idx, int m, backend::stream_t stream ) {
+	const pod::KVRef kv = kv_pool_.ref();
+	const size_t kv_slot_stride = kv_pool_.slot_stride_elems;
+	const int hd = config_.head_dim;
+	engine::modules::Linear::forward( mixed_, lw.q_proj, q_gate_buf_, stream );
+	engine::modules::Attention::unpack_q_gate( q_gate_buf_, q_buf_, gate_attn_buf_, q_heads_, hd, stream );
+	engine::modules::RMSNorm::forward_heads( q_buf_, lw.q_norm, q_heads_, hd, config_.rms_norm_eps, 1.0f, stream );
+	engine::modules::Linear::forward( mixed_, lw.k_proj, k_buf_, stream );
+	engine::modules::RMSNorm::forward_heads( k_buf_, lw.k_norm, kv_heads_, hd, config_.rms_norm_eps, 1.0f, stream );
+	engine::modules::Linear::forward( mixed_, lw.v_proj, v_buf_, stream );
+	engine::modules::RoPE::forward( q_buf_, k_buf_, q_heads_, kv_heads_, hd, config_.rot_dim, d_rows_, m, config_.rope_theta, stream );
+	engine::modules::Attention::store_kv_cache( kv, k_buf_, v_buf_, kv_slot_stride, attn_idx, d_rows_, m, kv_heads_, hd, config_.max_seq, stream );
+	engine::modules::Attention::forward_prefill( kv, q_buf_, gate_attn_buf_, attn_out_, kv_slot_stride, attn_idx, d_rows_, m, q_heads_, kv_heads_, hd,
+		config_.max_seq, stream, m > pod::MAX_BATCH ? key_hint_ : 0, m <= pod::MAX_BATCH && !attn_tc_ );
+	engine::modules::Linear::forward( attn_out_, lw.o_proj, y_, stream );
 }
 
 // Linear-attention sublayer: mixed_ in, the rank's partial out_proj result in y_
@@ -550,7 +594,7 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 	const int halt = runtime::options().qwen4_halt;
 	engine::modules::GatedResidual::init_streams( embed_rows_.ptr<const backend::half_t>(), streams_.ptr<float>(), m, H, hc, stream );
 	trace_rows( 1000, streams_.data, true, m, stream );
-	int linear_idx = 0, site = 0;
+	int linear_idx = 0, attn_idx = 0, site = 0;
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		auto& lw = layers_[L];
 		if ( L == config_.ple_layer ) {
@@ -561,7 +605,7 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 		gr_mix( lw.attn_hc, true, m, stream );
 		trace_rows( 100 + L, mixed_.data, false, m, stream );
 		if ( lw.is_full_attention ) {
-			ENGINE_ASSERT( false, "qwen4_exp: the QSA attention layer is not implemented yet" );
+			attention_forward( lw, attn_idx++, m, stream );
 		}
 		else {
 			gdn_forward( lw, linear_idx++, m, stream );
@@ -590,6 +634,7 @@ void Qwen4ExpPipeline::rollback_state( int, backend::stream_t ) {}
 void Qwen4ExpPipeline::reset_state( int slot_id ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen4ExpPipeline::reset_state: slot out of range" );
 	backend::set_device( rank_ );
+	kv_pool_.reset_slot( slot_id );
 	backend::memset_sync( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, 0, state_.slot_gdn_floats * sizeof( float ) );
 	backend::memset_sync( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, 0, state_.slot_conv_floats * sizeof( float ) );
 	const size_t ring = static_cast<size_t>( engine::modules::PLE::RING ) * config_.hc_mult * config_.hidden_size;
