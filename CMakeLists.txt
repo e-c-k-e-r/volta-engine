@@ -48,6 +48,7 @@ set(ENGINE_HOST_SOURCES
 	src/models/model.cpp
 	src/models/qwen3_5.cpp
 	src/models/qwen3_vision.cpp
+	src/models/glm5_vision.cpp
 	src/models/glm5_next.cpp
 	src/runtime/options.cpp
 	src/runtime/kv_cache.cpp

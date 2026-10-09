@@ -15,6 +15,9 @@ else
 	MODEL_DIR="$ENGINE_MODEL_ROOT/Qwen3.8-27B-exl3"
 	DRAFT_DIR="$ENGINE_MODEL_ROOT/Qwen3.8-27B-DFlash2-EXL3-5.0bpw"
 fi
+# GLM + the drafter leaves no VRAM for the vision tower: a few percent of the routed experts live in host RAM
+EXTRA_ARGS=()
+[ "${VOLTA_TEST_MODEL:-qwen3_5}" = "glm5_next" ] && EXTRA_ARGS=(--set expert_cache=0.95)
 # VOLTA_TEST_SPEC=mtp speculates with the checkpoint's own MTP head instead of the DFlash2 drafter (Qwen)
 if [ "${VOLTA_TEST_SPEC:-dflash}" = "mtp" ]; then
 	SPEC_ARGS=(--speculative --set speculator=mtp)
@@ -22,7 +25,7 @@ else
 	SPEC_ARGS=(--speculative --draft-model-dir "$DRAFT_DIR")
 fi
 taskset -c 0-9 "$DIR/build/volta_server" --port "$PORT" --host 127.0.0.1 --model-dir "$MODEL_DIR" \
-	"${SPEC_ARGS[@]}" --set prefix_interval=1024 > "$LOG" 2>&1 &
+	"${SPEC_ARGS[@]}" "${EXTRA_ARGS[@]}" --set prefix_interval=1024 > "$LOG" 2>&1 &
 PID=$!
 cleanup() { kill -TERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; }
 trap cleanup EXIT

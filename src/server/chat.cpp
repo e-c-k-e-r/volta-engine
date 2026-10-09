@@ -125,6 +125,24 @@ std::vector<int> expand_image_tokens( const std::vector<int>& tokens, int pad_id
 	return out;
 }
 
+// The image placeholder token of a model family
+const char* image_pad_name( engine::loader::ModelFamily fam ) {
+	return fam == engine::loader::ModelFamily::GLM ? "<|image|>" : "<|image_pad|>";
+}
+
+// GLM's shipped chat template only knows text (an image part renders as a "cannot process" reminder), so the image markers of
+// the model's processor are written into the conversation as text; the tokenizer turns them into the special tokens
+void inline_glm_image_markers( nlohmann::ordered_json& messages ) {
+	for ( auto& m : messages ) {
+		if ( !m.is_object() || !m.contains( "content" ) || !m["content"].is_array() ) continue;
+		for ( auto& part : m["content"] ) {
+			if ( part.is_object() && part.value( "type", std::string() ) == "image" ) {
+				part = { { "type", "text" }, { "text", "<|begin_of_image|><|image|><|end_of_image|>" } };
+			}
+		}
+	}
+}
+
 bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ImageList* images, ApiError* err ) {
 	const auto family = gen.chat_template().model_family();
 
@@ -139,6 +157,7 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 		return false;
 	}
 	if ( vars["messages"].is_array() ) fold_system_messages( vars["messages"] );
+	if ( family == engine::loader::ModelFamily::GLM && !req.images.empty() && vars["messages"].is_array() ) inline_glm_image_markers( vars["messages"] );
 	// tool_choice required / named: say so on the last user turn (not after a tool result, or the model would loop on it)
 	if ( !req.tools_json.empty() && ( req.require_tool || !req.force_tool.empty() ) && vars["messages"].is_array() && !vars["messages"].empty() &&
 		vars["messages"].back().value( "role", std::string() ) == "user" ) {
@@ -163,7 +182,7 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 	*tokens = gen.tokenizer().encode( *prompt, false );
 	if ( !req.images.empty() ) {
 		const engine::loader::VisionParams* vp = gen.vision_params();
-		const int pad_id = gen.tokenizer().get_special_token( "<|image_pad|>" );
+		const int pad_id = gen.tokenizer().get_special_token( image_pad_name( family ) );
 		if ( !vp || pad_id < 0 ) {
 			err->message = "this model was loaded without a vision tower, so it cannot take image input";
 			return false;
@@ -263,7 +282,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	// reply there, so the end of the whole prompt is never a prefix of it but this boundary is.
 	{
 		const bool glm = family == engine::loader::ModelFamily::GLM;
-		const int pad_id = gen.tokenizer().get_special_token( "<|image_pad|>" );
+		const int pad_id = gen.tokenizer().get_special_token( image_pad_name( family ) );
 		auto add = [&]( size_t at, bool pinned, size_t min_tokens ) {
 			if ( at == std::string::npos || at == 0 ) return;
 			const std::vector<int> head = expand_image_tokens( gen.tokenizer().encode( prompt.substr( 0, at ), false ), pad_id, g.images );

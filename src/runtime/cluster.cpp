@@ -89,6 +89,9 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		for ( int d = 0; d < tp_; ++d ) models_[d]->set_snapshot_taps( true );
 	}
 
+	// Image encoder last, into whatever the arena has left (rank 0)
+	models_[0]->load_vision( cfg.model_dir.c_str(), streams_[0] );
+
 	// arena_create on the third device leaves cudaErrorInvalidValue pending on this thread although every
 	// call it makes reports success (bisected with cudaPeekAtLastError; source inside the driver, not
 	// identified). Clear it so a later CUDA_CHECK( cudaGetLastError() ) on this thread, such as the
@@ -365,6 +368,15 @@ void ModelCluster::warm_graphs( int max_m, int slot ) {
 			forward( tokens, rows );
 		}
 		for ( int s = 0; s < slots; ++s ) reset_slot( s );
+	}
+	// A full prefill chunk, so every rank's lazily grown workspaces reach their steady size together. Growth frees and allocates
+	// device memory, which waits for the device to go idle: done on one rank in the middle of a forward (an image encode on rank 0
+	// had grown only its own) it blocks behind a collective that waits for the others, which wait for the allocation lock.
+	{
+		const int rows = metadata().max_rows;
+		std::vector<int> ids( rows, 0 );
+		forward( ids.data(), pod::BatchRows::causal( rows, 0, slot, pod::BatchRows::LOGITS_NONE ) );
+		forward( ids.data(), pod::BatchRows::causal( rows, 0, slot, pod::BatchRows::LOGITS_LAST ) );
 	}
 	reset_slot( slot );
 	LOG_INFO( "Decode graphs warmed for m=1..%d in %.0f ms\n", max_m,

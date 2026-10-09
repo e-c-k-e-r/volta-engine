@@ -692,6 +692,27 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	return true;
 }
 
+bool Glm5NextPipeline::load_vision( const char* model_dir, backend::stream_t stream ) {
+	if ( rank_ != 0 || runtime::options().max_image_tokens <= 0 ) return false;
+	backend::set_device( rank_ );
+	return vision_.load( model_dir, *arena_, runtime::options().max_image_tokens * 4, stream );
+}
+
+bool Glm5NextPipeline::encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream ) {
+	if ( rank_ != 0 || !vision_.loaded() ) return false;
+	backend::set_device( rank_ );
+	return vision_.encode( image, out, stream );
+}
+
+// Overwrites embedded rows (replicated on every rank after the embedding all-reduce) before the hyper-connection streams start
+bool Glm5NextPipeline::inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream ) {
+	ENGINE_ASSERT( dst_row >= 0 && rows >= 1 && dst_row + rows <= pod::MAX_ROWS, "Glm5NextPipeline::inject_embeddings: rows out of range" );
+	backend::set_device( rank_ );
+	const size_t row_bytes = static_cast<size_t>( config_.hidden_size ) * sizeof( backend::half_t );
+	backend::memcpy_async( embed_rows_.ptr<char>() + static_cast<size_t>( dst_row ) * row_bytes, host_rows, static_cast<size_t>( rows ) * row_bytes, backend::Copy::H2D, stream );
+	return true;
+}
+
 void Glm5NextPipeline::embed_tokens( const int* token_ids, int count, backend::stream_t stream ) {
 	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_ROWS, "Glm5NextPipeline::embed_tokens: count out of range" );
 	backend::set_device( rank_ );

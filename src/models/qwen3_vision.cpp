@@ -60,6 +60,10 @@ bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int
 		repo.close();
 		return false;
 	}
+	if ( !vision_fits( arena, vision_weight_bytes( repo, cfg_.depth, cfg_.hidden ) + static_cast<size_t>( max_patches ) * 48 * 1024 + ( 16u << 20 ), "the Qwen vision tower" ) ) {
+		repo.close();
+		return false;
+	}
 	max_patches_ = max_patches;
 
 	auto fp16 = [&]( const std::string& name ) { return repo.load( name.c_str(), arena, stream, pod::DType::FP16 ); };
@@ -171,8 +175,8 @@ std::vector<float> Qwen3VisionTower::position_embeddings( int gh, int gw ) const
 	return out;
 }
 
-void Qwen3VisionTower::rotary_tables( int gh, int gw, std::vector<float>* cos_t, std::vector<float>* sin_t ) const {
-	const int hd = cfg_.head_dim(), quarter = hd / 4, m = cfg_.merge_size;
+void vision_rotary_tables( int gh, int gw, int m, int hd, std::vector<float>* cos_t, std::vector<float>* sin_t ) {
+	const int quarter = hd / 4;
 	std::vector<float> inv( quarter );
 	for ( int i = 0; i < quarter; ++i ) inv[i] = 1.0f / std::pow( 10000.0f, static_cast<float>( 2 * i ) / ( hd / 2 ) );
 	cos_t->assign( static_cast<size_t>( gh ) * gw * hd, 0.0f );
@@ -197,6 +201,10 @@ void Qwen3VisionTower::rotary_tables( int gh, int gw, std::vector<float>* cos_t,
 			}
 		}
 	}
+}
+
+void Qwen3VisionTower::rotary_tables( int gh, int gw, std::vector<float>* cos_t, std::vector<float>* sin_t ) const {
+	vision_rotary_tables( gh, gw, cfg_.merge_size, cfg_.head_dim(), cos_t, sin_t );
 }
 
 bool Qwen3VisionTower::encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, backend::stream_t stream ) {

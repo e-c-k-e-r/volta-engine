@@ -22,7 +22,7 @@ __device__ __forceinline__ float gelu_erf_f( float x ) {
 __global__ void add_bias_pos_kernel( float* out, const half* bias, const half* add, int n, size_t total ) {
 	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
 	if ( i >= total ) return;
-	out[i] += __half2float( bias[i % n] ) + __half2float( add[i] );
+	out[i] += __half2float( bias[i % n] ) + ( add ? __half2float( add[i] ) : 0.0f );
 }
 
 // One block per row; block-wide mean / variance in FP32.
@@ -56,6 +56,76 @@ __global__ void layer_norm_kernel( const float* __restrict__ x, const half* __re
 	half* o = out + static_cast<size_t>( row / group ) * group * n + static_cast<size_t>( row % group ) * n;
 	for ( int i = threadIdx.x; i < n; i += blockDim.x ) {
 		o[i] = __float2half( ( xr[i] - mean ) * inv * __half2float( w[i] ) + __half2float( b[i] ) );
+	}
+}
+
+
+__global__ void rms_norm_f32_kernel( const float* __restrict__ x, const half* __restrict__ w, half* __restrict__ out, int n, float eps ) {
+	__shared__ float smem[32];
+	const int row = blockIdx.x;
+	const float* xr = x + static_cast<size_t>( row ) * n;
+	float q = 0.0f;
+	for ( int i = threadIdx.x; i < n; i += blockDim.x ) q += xr[i] * xr[i];
+	const float inv = rsqrtf( block_sum( q, smem ) / n + eps );
+	for ( int i = threadIdx.x; i < n; i += blockDim.x ) out[static_cast<size_t>( row ) * n + i] = __float2half( xr[i] * inv * __half2float( w[i] ) );
+}
+
+__global__ void layer_norm_half_kernel( const half* __restrict__ x, const half* __restrict__ w, const half* __restrict__ b, half* __restrict__ out, int n, float eps ) {
+	__shared__ float smem[32];
+	const int row = blockIdx.x;
+	const half* xr = x + static_cast<size_t>( row ) * n;
+	float s = 0.0f;
+	for ( int i = threadIdx.x; i < n; i += blockDim.x ) s += __half2float( xr[i] );
+	const float mean = block_sum( s, smem ) / n;
+	float q = 0.0f;
+	for ( int i = threadIdx.x; i < n; i += blockDim.x ) {
+		const float d = __half2float( xr[i] ) - mean;
+		q += d * d;
+	}
+	const float inv = rsqrtf( block_sum( q, smem ) / n + eps );
+	for ( int i = threadIdx.x; i < n; i += blockDim.x ) {
+		out[static_cast<size_t>( row ) * n + i] = __float2half( ( __half2float( xr[i] ) - mean ) * inv * __half2float( w[i] ) + __half2float( b[i] ) );
+	}
+}
+
+// One block per row, one warp per head, lane = rotary pair (d, d + 32) of a 64-wide head
+__global__ void qkv_norm_rope_kernel( half* __restrict__ q, half* __restrict__ k, half* __restrict__ v, const half* __restrict__ bq, const half* __restrict__ bk,
+	const half* __restrict__ bv, const half* __restrict__ qn, const half* __restrict__ kn, const float* __restrict__ cs, const float* __restrict__ sn,
+	int heads, float eps ) {
+	const int row = blockIdx.x, head = threadIdx.x >> 5, d = threadIdx.x & 31;
+	if ( head >= heads ) return;
+	const int width = heads * 64;
+	const size_t base = static_cast<size_t>( row ) * width + head * 64;
+	const int i1 = head * 64 + d, i2 = i1 + 32;
+	const float c1 = cs[static_cast<size_t>( row ) * 64 + d], s1 = sn[static_cast<size_t>( row ) * 64 + d];
+	const float c2 = cs[static_cast<size_t>( row ) * 64 + d + 32], s2 = sn[static_cast<size_t>( row ) * 64 + d + 32];
+	for ( int which = 0; which < 3; ++which ) {
+		half* t = ( which == 0 ) ? q : ( which == 1 ? k : v );
+		const half* bias = ( which == 0 ) ? bq : ( which == 1 ? bk : bv );
+		float a = __half2float( t[base + d] ) + __half2float( bias[i1] );
+		float b = __half2float( t[base + d + 32] ) + __half2float( bias[i2] );
+		if ( which < 2 ) {
+			const half* gain = ( which == 0 ) ? qn : kn;
+			float ss = a * a + b * b;
+			#pragma unroll
+			for ( int mask = 16; mask > 0; mask >>= 1 ) ss += __shfl_xor_sync( 0xffffffff, ss, mask );
+			const float inv = rsqrtf( ss / 64.0f + eps );
+			a = a * inv * __half2float( gain[d] );
+			b = b * inv * __half2float( gain[d + 32] );
+			const float ra = a * c1 - b * s1, rb = b * c2 + a * s2;
+			a = ra;
+			b = rb;
+		}
+		t[base + d] = __float2half( a );
+		t[base + d + 32] = __float2half( b );
+	}
+}
+
+__global__ void merge_gather_kernel( const half* __restrict__ h, half* __restrict__ out, int n, int group ) {
+	const int t = blockIdx.x;
+	for ( int idx = threadIdx.x; idx < n * group; idx += blockDim.x ) {
+		const int c = idx / group, j = idx % group;
+		out[static_cast<size_t>( t ) * n * group + idx] = h[( static_cast<size_t>( t ) * group + j ) * n + c];
 	}
 }
 
@@ -292,7 +362,7 @@ __global__ void __launch_bounds__( kTcWarps * 32 ) attention_tc_kernel( const ha
 __global__ void bias_act_kernel( half* x, const half* bias, int n, size_t total, int act ) {
 	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
 	if ( i >= total ) return;
-	float v = __half2float( x[i] ) + __half2float( bias[i % n] );
+	float v = __half2float( x[i] ) + ( bias ? __half2float( bias[i % n] ) : 0.0f );
 	if ( act == Vision::ACT_GELU_TANH ) v = gelu_tanh_f( v );
 	else if ( act == Vision::ACT_GELU_ERF ) v = gelu_erf_f( v );
 	x[i] = __float2half( v );
@@ -319,6 +389,35 @@ void Vision::patch_embed( const half* patches, const half* w, const half* bias, 
 	ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "Vision::patch_embed: cublasGemmEx failed" );
 	const size_t total = static_cast<size_t>( m ) * n;
 	add_bias_pos_kernel<<<static_cast<unsigned>( ( total + 255 ) / 256 ), 256, 0, stream>>>( out, bias, add, n, total );
+}
+
+void Vision::rms_norm( const float* x, const half* w, half* out, int m, int n, float eps, cudaStream_t stream ) {
+	rms_norm_f32_kernel<<<m, 256, 0, stream>>>( x, w, out, n, eps );
+}
+
+void Vision::layer_norm_half( const half* x, const half* w, const half* b, half* out, int m, int n, float eps, cudaStream_t stream ) {
+	layer_norm_half_kernel<<<m, 256, 0, stream>>>( x, w, b, out, n, eps );
+}
+
+void Vision::qkv_bias_norm_rope( half* q, half* k, half* v, const half* bq, const half* bk, const half* bv, const half* qn, const half* kn,
+	const float* cos_table, const float* sin_table, int m, int heads, int head_dim, float eps, cudaStream_t stream ) {
+	ENGINE_ASSERT( head_dim == 64 && heads <= 32, "Vision::qkv_bias_norm_rope: 64-wide heads, at most 32" );
+	qkv_norm_rope_kernel<<<m, heads * 32, 0, stream>>>( q, k, v, bq, bk, bv, qn, kn, cos_table, sin_table, heads, eps );
+}
+
+void Vision::merge_gather( const half* h, half* out, int tokens, int n, int group, cudaStream_t stream ) {
+	merge_gather_kernel<<<tokens, 256, 0, stream>>>( h, out, n, group );
+}
+
+void Vision::dense_gemm( const half* a, const half* w, half* out, int m, int n, int k, cudaStream_t stream ) {
+	int device = 0;
+	cudaGetDevice( &device );
+	cublasHandle_t h = trellis_get_cublas( device );
+	cublasSetStream( h, stream );
+	const float alpha = 1.0f, beta = 0.0f;
+	const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, w, CUDA_R_16F, k, a, CUDA_R_16F, k,
+		&beta, out, CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP );
+	ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "Vision::dense_gemm: cublasGemmEx failed" );
 }
 
 void Vision::layer_norm( const float* x, const half* w, const half* b, half* out, int m, int n, float eps, cudaStream_t stream ) {

@@ -98,6 +98,7 @@ tier2_models() {
 	run prefix_restore_spec gpu ./test_prefix_restore --spec
 	run mtp_greedy gpu ./test_mtp
 	run vision_tower gpu ./test_vision
+	run vision_tower_glm gpu ./test_vision $ENGINE_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw $ROOT/tests/data/image_wide.png --glm
 	run prefix_restore_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore"
 	run prefix_restore_glm gpu ./test_prefix_restore --glm
 	run sampling_qwen gpu ./test_sampling_gpu

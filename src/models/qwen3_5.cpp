@@ -432,12 +432,14 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 		backend::stream_sync( stream );
 	}
 	repo.close();
-	// Image encoder (rank 0): optional, a checkpoint without the quantized tower serves text only
-	if ( rank_ == 0 && !fp4 && runtime::options().max_image_tokens > 0 ) {
-		vision_.load( model_dir, *arena_, runtime::options().max_image_tokens * 4, stream );
-	}
 	weights_loaded_ = true;
 	return true;
+}
+
+bool Qwen3_5Pipeline::load_vision( const char* model_dir, backend::stream_t stream ) {
+	if ( rank_ != 0 || runtime::options().max_image_tokens <= 0 ) return false;
+	backend::set_device( rank_ );
+	return vision_.load( model_dir, *arena_, runtime::options().max_image_tokens * 4, stream );
 }
 
 bool Qwen3_5Pipeline::encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream ) {

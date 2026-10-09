@@ -1,6 +1,8 @@
 // Vision tower smoke test: encodes the golden images on one GPU and checks the output is finite, deterministic and on the scale
 // of the text embeddings. The semantic check (the model describing the image) is tests/4_server/api_checks.py.
 #include "engine/models/qwen3_vision.h"
+#include "engine/models/glm5_vision.h"
+#include <memory>
 #include <cstring>
 #include "trellis_context.h"
 #include "engine/backend/numeric.h"
@@ -62,8 +64,23 @@ int main( int argc, char** argv ) {
 			return 1;
 		}
 	}
-	models::Qwen3VisionTower tower;
-	if ( !tower.load( dir, arena, 4096, stream ) ) {
+	// --glm: the GLM checkpoint's tower; the default is Qwen's
+	bool glm = false;
+	for ( int i = 1; i < argc; ++i ) glm = glm || std::string( argv[i] ) == "--glm";
+	std::unique_ptr<models::VisionTower> tower_ptr;
+	bool loaded = false;
+	if ( glm ) {
+		auto t = std::make_unique<models::Glm5VisionTower>();
+		loaded = t->load( dir, arena, 4096, stream );
+		tower_ptr = std::move( t );
+	}
+	else {
+		auto t = std::make_unique<models::Qwen3VisionTower>();
+		loaded = t->load( dir, arena, 4096, stream );
+		tower_ptr = std::move( t );
+	}
+	models::VisionTower& tower = *tower_ptr;
+	if ( !loaded ) {
 		std::printf( "FAIL: tower did not load from %s\n", dir );
 		return 1;
 	}
@@ -84,7 +101,7 @@ int main( int argc, char** argv ) {
 		return 1;
 	}
 	const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() / 2;
-	const int tokens = prep.tokens( 2 ), dim = tower.config().out_hidden;
+	const int tokens = prep.tokens( 2 ), dim = static_cast<int>( a.size() / tokens );
 	double sq = 0.0, maxabs = 0.0;
 	bool finite = true, same = true;
 	for ( size_t i = 0; i < a.size(); ++i ) {

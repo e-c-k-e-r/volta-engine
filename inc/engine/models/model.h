@@ -161,6 +161,8 @@ public:
 	// precomputed embeddings (host [rows, hidden] FP16); call it between embed_tokens and forward. The image encoder runs on
 	// rank 0 only; vision_params() is null when the model has none loaded.
 	virtual bool inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream = nullptr ) { (void) host_rows; (void) dst_row; (void) rows; (void) stream; return false; }
+	// Loads the image encoder into what is left of the arena after everything else (rank 0); false when there is none or no room
+	virtual bool load_vision( const char* model_dir, backend::stream_t stream = nullptr ) { (void) model_dir; (void) stream; return false; }
 	virtual const engine::loader::VisionParams* vision_params() const { return nullptr; }
 	virtual bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) { (void) image; (void) out; (void) stream; return false; }
 

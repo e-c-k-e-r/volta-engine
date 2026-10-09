@@ -189,16 +189,13 @@ if "prefix_cache" in metrics:
     check((m1["hit_tokens"] - m0["hit_tokens"]) / max(1, h1 - h0) > 3000, "hits resume deep into the shared system prompt", (m0, m1))
     check("259" in a1 and a1 == a3, "answer after a prefix hit equals the cold answer", (a1, a2, a3))
 
-# ---- images (Qwen vision tower); the GLM tower is not implemented yet, so GLM must refuse
+# ---- images (both models run their checkpoint's vision tower)
 IMG = base64.b64encode(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "image_shapes.png"), "rb").read()).decode()
 def oai_image(q):
     return {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + IMG}}, {"type": "text", "text": q}]}], "max_tokens": 16}
 def ant_image(q):
     return {"model": "claude-x", "max_tokens": 16, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": IMG}}, {"type": "text", "text": q}]}]}
-if IS_GLM:
-    code, body = post("/v1/chat/completions", oai_image("What color is the circle?"))
-    check(code == 400 and "vision" in body, "image input is refused while the engine has no vision tower for the model", body)
-else:
+if True:
     code, body = post("/v1/chat/completions", oai_image("What color is the circle? Answer with one word."))
     a1 = json.loads(body)["choices"][0]["message"]["content"] if code == 200 else body
     check(code == 200 and "blue" in a1.lower(), "OpenAI image_url: the model sees the circle's color", a1)

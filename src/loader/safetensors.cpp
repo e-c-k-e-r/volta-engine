@@ -807,6 +807,19 @@ size_t SafeTensorsRepo::trellis_bytes( const char* base_name ) const {
 	return meta != nullptr ? static_cast<size_t>( meta->size_bytes ) : 0;
 }
 
+size_t SafeTensorsRepo::bytes_with_prefix( const char* prefix ) const {
+	size_t total = 0;
+	const size_t n = std::strlen( prefix );
+	for ( int i = 0; i < num_shards_; ++i ) {
+		const pod::SafeTensorsFile* st = get_shard( i );
+		if ( !st ) continue;
+		for ( int t = 0; t < st->tensor_count; ++t ) {
+			if ( std::strncmp( st->tensors[t].name, prefix, n ) == 0 ) total += st->tensors[t].size_bytes + 256;
+		}
+	}
+	return total;
+}
+
 pod::LinearWeight SafeTensorsRepo::load_linear(
 	const char* base_name,
 	pod::MemoryArena& arena,

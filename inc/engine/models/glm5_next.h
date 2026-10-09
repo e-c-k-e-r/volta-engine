@@ -2,6 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/models/model.h"
+#include "engine/models/glm5_vision.h"
 #include "engine/runtime/kv_cache.h"
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
@@ -142,6 +143,10 @@ public:
 	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
 	bool init( const Glm5NextConfig& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
 	bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) override;
+	bool inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream = nullptr ) override;
+	bool load_vision( const char* model_dir, backend::stream_t stream = nullptr ) override;
+	const engine::loader::VisionParams* vision_params() const override { return vision_.loaded() ? &vision_.params() : nullptr; }
+	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
 
 	void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) override;
 	void forward( const pod::BatchRows& rows, backend::stream_t stream = nullptr ) override;
@@ -245,6 +250,7 @@ private:
 	int* d_taps_owner_ = nullptr;
 
 	pod::TensorView embed_rows_;    // [MAX_ROWS, hidden] embedded inputs
+	Glm5VisionTower vision_;        // rank 0 only
 	int* d_token_ids_ = nullptr;    // [MAX_ROWS]
 	pod::TensorView hidden_states_; // [rows, hidden]
 	pod::TensorView norm_hidden_;

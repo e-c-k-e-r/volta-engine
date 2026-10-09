@@ -4,6 +4,7 @@
 #include "engine/core/tensor.h"
 #include "engine/modules/linear.h"
 #include "engine/loader/image.h"
+#include "engine/models/vision_tower.h"
 #include "engine/backend/types.h"
 #include <cstdint>
 #include <string>
@@ -29,17 +30,17 @@ struct Qwen3VisionConfig {
 
 // The Qwen3-VL image encoder (patch embedding, 2-D rotary ViT blocks, patch merger) on one device. Weights come from the
 // checkpoint's model.visual.* tensors (trellis-quantized projections, FP16 norms / biases / embeddings).
-class Qwen3VisionTower {
+class Qwen3VisionTower : public VisionTower {
 public:
 	// False without a vision_config or without the quantized visual tensors (the checkpoint then serves text only).
 	bool load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream );
-	bool loaded() const { return loaded_; }
+	bool loaded() const override { return loaded_; }
 	const Qwen3VisionConfig& config() const { return cfg_; }
-	const engine::loader::VisionParams& params() const { return params_; }
+	const engine::loader::VisionParams& params() const override { return params_; }
 	int max_patches() const { return max_patches_; }
 
 	// Encodes one prepared image into [tokens, out_hidden] FP16 rows (host). Blocks until done.
-	bool encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, backend::stream_t stream );
+	bool encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, backend::stream_t stream ) override;
 
 	// Host-side tables (exposed for tests)
 	std::vector<float> position_embeddings( int grid_h, int grid_w ) const;                   // [h * w, hidden] merge order

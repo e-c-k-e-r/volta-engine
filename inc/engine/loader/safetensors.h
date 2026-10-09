@@ -211,6 +211,8 @@ public:
 		return nullptr;
 	}
 
+	// Total bytes of the tensors whose name starts with `prefix`
+	size_t bytes_with_prefix( const char* prefix ) const;
 	int shard_count() const {
 		return num_shards_;
 	}
