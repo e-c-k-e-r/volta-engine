@@ -4,16 +4,20 @@
 import sys, time, os, torch, numpy as np
 sys.path.insert(0, "/home/mrq/Programs/exllamav3")
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, GreedySampler
-OUT = "/home/mrq/Programs/volta-engine/results/flash_next_ref"
+OUT = os.environ.get("FN_OUT", "/home/mrq/Programs/volta-engine/results/flash_next_ref")
+LONG = int(os.environ.get("FN_LONG", "0"))   # N > 0: a ~N-token filler prompt (QSA selection kicks in past 2052 tokens); only ids and logits are saved
 def main():
     os.makedirs(OUT, exist_ok = True)
     d = "/home/mrq/Documents/models/Swift-Qwen3.8-Flash-Next-exl3-4.00bpw"
     config = Config.from_directory(d)
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens = 4096)
+    cache = Cache(model, max_num_tokens = 12288)
     model.load(max_chunk_size = 2048)
     tok = Tokenizer.from_config(config)
     text = "<|im_start|>user\nThe quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.<|im_end|>\n<|im_start|>assistant\n"
+    if LONG:
+        body = "".join(f"Note {i}: the weather in district {i * 7 % 101} was mild on day {i % 365}. " for i in range(LONG))
+        text = "<|im_start|>user\n" + body + "The secret access code is 84920. " + "".join(f"Note {i}: the weather in district {i * 7 % 101} was mild on day {i % 365}. " for i in range(LONG // 40)) + "\n\nWhat is the secret access code? Answer with the number only.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     ids = tok.encode(text, add_bos = False)
     S = ids.shape[-1]
     np.save(f"{OUT}/ids.npy", ids.flatten().cpu().numpy().astype(np.int64))
@@ -29,7 +33,7 @@ def main():
                 np.save(f"{OUT}/mod{i:03d}_{type(m).__name__}.npy", t)
             return y
         m.forward = g
-    keep = list(range(0, 9)) + [len(model.modules) - 2, len(model.modules) - 1]
+    keep = [] if LONG else ( list(range(0, len(model.modules))) if os.environ.get("FN_ALL") else list(range(0, 9)) + [len(model.modules) - 2, len(model.modules) - 1] )
     for i in keep: wrap(i, model.modules[i])
     def grab(tag, y):
         ts = y if isinstance(y, (tuple, list)) else (y,)
@@ -46,7 +50,7 @@ def main():
                 grab(tag, y)
             return y
         setattr(obj, name, g)
-    for bi in (2, 6):
+    for bi in (() if LONG else (2, 6)):
         b = model.modules[bi]
         for sm in b.attn.modules:
             wrapm(f"b{bi}_attn_sub_{sm.key.split('.')[-1]}", sm, "forward")

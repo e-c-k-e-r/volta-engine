@@ -74,6 +74,27 @@ struct Attention {
 		int key_hint = 0,
 		bool per_row = false  // every row gets its own block, for rows that sit in distinct slots
 	);
+
+	// Attention over a per-row token list (QSA sparse selection): row r attends to the nkeys[r] positions idx[r * idx_stride + i] of its
+	// slot, or to every position up to its own when nkeys[r] < 0 (a dense row). Same K/V layouts, gate and result as forward_decode.
+	static void forward_sparse(
+		const pod::KVRef& kv,
+		const pod::TensorView& q,
+		const pod::TensorView& gate,
+		pod::TensorView& out,
+		size_t slot_stride,
+		int layer_idx,
+		const pod::BatchRows* d_rows,
+		int count,
+		int num_q_heads,
+		int num_kv_heads,
+		int head_dim,
+		int max_seq,
+		const int* idx,
+		const int* nkeys,
+		int idx_stride,
+		backend::stream_t stream = nullptr
+	);
 };
 
 } // namespace engine::modules

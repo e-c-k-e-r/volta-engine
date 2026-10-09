@@ -83,15 +83,22 @@ hc apply output, for both the attention and MLP sites.
 ## Status (2026-10-09)
 
 Working, committed: model type and loader, gated residuals, GDN layers, 512-expert MoE (softmax top-10 router, 3- and 4-bit experts, shared expert,
-expert-parallel over 4 ranks), the n-gram embedding layer, full attention (dense path), final mixer, vocabulary-sharded head, sampling; the server
-runs the checkpoint (`volta_server --model-dir <Swift-Qwen3.8-Flash-Next ...>`, tp 4 only) and passes the OpenAI / Anthropic API checks except images.
-Layers 0-3 match the oracle at bf16 level (relative error 4-9e-3); rows where the router picks a different expert set are the usual noise.
-Decode runs at about 24 tok/s: no CUDA graphs yet (the n-gram gather is a host step), 7 / 8 bpw projections go through the general GEMM, the QSA
-block selection is not implemented (attention is dense, which equals the reference up to 2048 tokens of context).
+expert-parallel over 4 ranks), the n-gram embedding layer, full attention with the QSA block selection (indexer projection, pooled keys, scoring,
+the GLM selector reused for top-512 + tail, sparse GQA attention), final mixer, vocabulary-sharded head, sampling, prefix snapshots (GDN state, conv
+history, n-gram conv ring and token context, KV rows, pooled index keys). The server runs the checkpoint (tp 4 only) and passes the OpenAI /
+Anthropic API checks except images. Needles: 8K and 32K pass (dense: prefill 311 tok/s, decode 24; QSA at 32K: 279 / 22.6).
 
-Findings worth keeping: the exllamav3 fork zeroed the GDN b/a gates (a deferred-load bug, fixed in the fork), so oracle dumps need the fix;
-the checkpoint mixes 3- and 4-bit expert layers (5, 8, 45, 46 are 3-bit) and 8 / 7 bpw shared experts and projections; the tokenizer's split
-regex differs from Qwen3.8-27B's (marks are not letters), recognised in `tokenizer.cpp`.
+Verification: the oracle is the exllamav3 fork run (`tests/tools/ref_qwen4_exp_dump.py`; needs the fork's GDN b/a fix). Layers 0-5 match at bf16 level
+(rel 4-9e-3, rows where the router picks another expert set aside), the 4.3K-token QSA prompt gets the reference's top token and the right answer.
+Drift against the oracle grows smoothly to ~0.13 by layer 38. It is reproduced by injecting bf16-sized noise (5e-3) into our own residual after every
+layer (`ENGINE_DEBUG_PERTURB_LAYERS`), so the cause is a precision-format mismatch (the reference keeps bf16 intermediates), not a localized bug; with
+`ENGINE_DEBUG_TEACHER_STREAMS` (each layer starts from the reference's streams) the isolated per-layer error is 0.2-7 permille, bursty where the
+router flips. The reference's last block dump is its prefill early exit (the input of block 47). Rounding the router logits to fp16
+(`ENGINE_DEBUG_ROUTER_FP16`) did not reduce the drift.
 
-Next: QSA selection (long context), 256K context and batch 2 (prefix snapshots are done),
-speculation (MTP head), the vision tower, CUDA graphs for decode, an 8 bpw decode GEMV, SASS / bench baselines.
+Findings worth keeping: the exllamav3 fork zeroed the GDN b/a gates (a deferred-load bug, fixed in the fork); the checkpoint mixes 3- and 4-bit expert
+layers (5, 8, 45, 46 are 3-bit) and 8 / 7 bpw shared experts and projections; the tokenizer's split regex differs from Qwen3.8-27B's (marks are not
+letters), recognised in `tokenizer.cpp`.
+
+Next: 100K / 256K context and batch 2, speculation (MTP head), the vision tower, CUDA graphs for decode (the n-gram gather is a host step), an 8 bpw
+decode GEMV, a tensor-core QSA scorer and sparse kernel, SASS / bench baselines.

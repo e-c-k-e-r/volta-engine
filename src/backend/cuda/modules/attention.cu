@@ -210,6 +210,88 @@ __global__ void attn_chunked_paged_kernel(
 	}
 }
 
+// Sparse variant of attn_chunked_paged_kernel: the keys of row r are idx[r][0 .. nkeys[r]) (or all of 0 .. pos when nkeys[r] < 0),
+// split over chunks of chunk_len list entries
+template <KVQ KQ, KVQ VQ>
+__global__ void attn_sparse_kernel(
+	const half* __restrict__ q,
+	const pod::KVRef kv,
+	const half* __restrict__ gate,
+	half* __restrict__ out,
+	float* __restrict__ workspace,
+	size_t slot_stride,
+	int layer_idx,
+	const pod::BatchRows* __restrict__ rows,
+	int num_q_heads,
+	int num_kv_heads,
+	int head_dim,
+	int max_seq,
+	int n_chunks,
+	int chunk_len,
+	int row0,
+	float scale,
+	const int* __restrict__ idx,
+	const int* __restrict__ nkeys,
+	int idx_stride
+) {
+	const int head = blockIdx.x;
+	const int m = blockIdx.y;
+	const int chunk = blockIdx.z;
+	const int tid = threadIdx.x;
+	if ( head >= num_q_heads || tid >= head_dim ) return;
+	const int heads_per_kv = max( num_q_heads / num_kv_heads, 1 );
+	const int kv_head = head / heads_per_kv;
+	const int r = row0 + m;
+	const int pos = rows->pos[r];
+	const int nk = nkeys[r];
+	const int total = nk >= 0 ? nk : min( pos + 1, max_seq );
+	const size_t slot_off = static_cast<size_t>( rows->slot[r] ) * slot_stride;
+	const int start = chunk * chunk_len;
+	const int end = min( start + chunk_len, total );
+
+	const half* q_head = q + ( static_cast<size_t>( m ) * num_q_heads + head ) * head_dim;
+	half* out_head = out + ( static_cast<size_t>( m ) * num_q_heads + head ) * head_dim;
+	const float my_q = __half2float( q_head[tid] );
+
+	__shared__ float s_warp_sums[8];
+	__shared__ float s_score;
+	const int warp_id = tid >> 5;
+	const int lane_id = tid & 31;
+	const int num_warps = ( head_dim + 31 ) >> 5;
+
+	float m_reg = -1e30f, l_reg = 0.0f, o_dim = 0.0f;
+	for ( int i = start; i < end; ++i ) {
+		const int t = nk >= 0 ? idx[static_cast<size_t>( r ) * idx_stride + i] : i;
+		const size_t kv_offset = slot_off + ( static_cast<size_t>( layer_idx ) * max_seq + t ) * ( num_kv_heads * head_dim ) + kv_head * head_dim + tid;
+		float dot = my_q * kv_load1<KQ>( kv.k, kv.ks, kv_offset );
+		#pragma unroll
+		for ( int mask = 16; mask > 0; mask >>= 1 ) dot += __shfl_xor_sync( 0xffffffff, dot, mask );
+		if ( lane_id == 0 ) s_warp_sums[warp_id] = dot;
+		__syncthreads();
+		if ( warp_id == 0 ) {
+			float b_sum = ( lane_id < num_warps ) ? s_warp_sums[lane_id] : 0.0f;
+			#pragma unroll
+			for ( int mask = 4; mask > 0; mask >>= 1 ) b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
+			if ( lane_id == 0 ) s_score = b_sum * scale;
+		}
+		__syncthreads();
+		const float my_v = kv_load1<VQ>( kv.v, kv.vs, kv_offset );
+		const float score = s_score;
+		const float m_new = fmaxf( m_reg, score );
+		const float alpha = expf( m_reg - m_new );
+		const float exp_s = expf( score - m_new );
+		o_dim = alpha * o_dim + exp_s * my_v;
+		l_reg = alpha * l_reg + exp_s;
+		m_reg = m_new;
+	}
+	float* ws = workspace + ( ( static_cast<size_t>( m ) * num_q_heads + head ) * n_chunks + chunk ) * ( ATTN_MAX_HEAD_DIM + 2 );
+	if ( tid == 0 ) {
+		ws[0] = m_reg;
+		ws[1] = l_reg;
+	}
+	ws[2 + tid] = o_dim;
+}
+
 // Tensor-core prefill attention (Volta mma.m8n8k4, FP32 accumulate). A block owns 32 queries (row, head pairs) of one
 // kv head and walks the keys in tiles of 64. S = Q K^T: warp (qg, kg) computes a 16 x 16 tile over the full head_dim, the
 // four quad-pairs of each mma being its four 8 x 8 tiles. The softmax runs on S staged through shared memory (8 lanes per
@@ -755,6 +837,49 @@ void Attention::forward_prefill(
 		attn_reduce_kernel<256><<<dim3( num_q_heads, count ), 256, 0, stream>>>( workspace, gate_ptr, out.ptr<half>(), num_q_heads, nsplit, vrot );
 	}
 	#undef LAUNCH_PREFILL
+}
+
+void Attention::forward_sparse(
+	const pod::KVRef& kv,
+	const pod::TensorView& q,
+	const pod::TensorView& gate,
+	pod::TensorView& out,
+	size_t slot_stride,
+	int layer_idx,
+	const pod::BatchRows* d_rows,
+	int count,
+	int num_q_heads,
+	int num_kv_heads,
+	int head_dim,
+	int max_seq,
+	const int* idx,
+	const int* nkeys,
+	int idx_stride,
+	cudaStream_t stream
+) {
+	ENGINE_ASSERT( kv.vq != KVQ::Q4, "Attention::forward_sparse: Q4 values are not supported" );
+	const float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
+	const int chunk_len = 256;
+	const int n_chunks = ( idx_stride + chunk_len - 1 ) / chunk_len;
+	ENGINE_ASSERT( n_chunks <= ATTN_MAX_CHUNKS, "Attention::forward_sparse: list too long" );
+	float* workspace = attn_workspace_ptr();
+	const half* gate_ptr = gate.data != nullptr ? gate.ptr<const half>() : nullptr;
+	const size_t row_elems = static_cast<size_t>( num_q_heads ) * head_dim;
+	for ( int row0 = 0; row0 < count; row0 += pod::MAX_BATCH ) {
+		const int M = MIN( pod::MAX_BATCH, count - row0 );
+		const half* g = gate_ptr ? gate_ptr + row0 * row_elems : nullptr;
+		half* o = out.ptr<half>() + row0 * row_elems;
+		#define LAUNCH_SPARSE() attn_sparse_kernel<KQ_, VQ_><<<dim3( num_q_heads, M, n_chunks ), dim3( head_dim ), 0, stream>>>( \
+			q.ptr<const half>() + row0 * row_elems, kv, g, o, workspace, slot_stride, layer_idx, d_rows, \
+			num_q_heads, num_kv_heads, head_dim, max_seq, n_chunks, chunk_len, row0, scale, idx, nkeys, idx_stride )
+		#define KQ_ KQV_
+		#define VQ_ VQV_
+		KV_DISPATCH( KQV_, VQV_, LAUNCH_SPARSE() )
+		#undef KQ_
+		#undef VQ_
+		#undef LAUNCH_SPARSE
+		attn_reduce_kernel<256><<<dim3( num_q_heads, M ), dim3( head_dim ), 0, stream>>>( workspace, g, o, num_q_heads, n_chunks, 0 );
+	}
 }
 
 } // namespace engine::modules

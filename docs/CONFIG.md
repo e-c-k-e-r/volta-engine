@@ -54,6 +54,10 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `perturb_embed` | float | `0` | `ENGINE_DEBUG_PERTURB_EMBED` | GLM: multiply every prompt embedding element by 1 + eps * u (u in [-1, 1], hashed from position and dimension, so independent of chunking); eager prefill only, a noise-floor probe |
 | `route_replay` | string | `(empty)` | `ENGINE_DEBUG_ROUTE_REPLAY` | GLM: a <trace_layers>.route file; eager prefill rows found in it use the recorded expert ids and weights (the latest record per layer and position wins), isolating router flips |
 | `qwen4_halt` | int | `-1` | `ENGINE_DEBUG_QWEN4_HALT` | qwen4_exp bring-up: stop the layer stack after this many sublayer sites (0 = after layer 0's attention half, 1 = after its MLP half, ...); <0 runs everything |
+| `qsa_off` | bool | `false` | `ENGINE_DEBUG_QSA_OFF` | qwen4_exp: attend densely past the QSA budget (A/B against the sparse selection) |
+| `teacher_streams` | string | `(empty)` | `ENGINE_DEBUG_TEACHER_STREAMS` | qwen4_exp: file of reference residual streams per layer input (int rows header, then [47][rows][4][hidden] fp32): every layer from 1 on starts from the reference's streams, isolating the per-layer error |
+| `router_fp16` | bool | `false` | `ENGINE_DEBUG_ROUTER_FP16` | qwen4_exp: round the router logits to fp16 before the top-k, as the exllamav3 router stores them |
+| `perturb_layers` | float | `0` | `ENGINE_DEBUG_PERTURB_LAYERS` | qwen4_exp: multiply the residual streams after every layer by 1 + eps * u (u hashed from position, stream, dim and layer): a model of per-layer rounding noise; eager prefill only |
 | `spec_ctrl_log` | bool | `false` | `ENGINE_DEBUG_SPEC_CTRL_LOG` | speculation controller decisions |
 | `no_graphs` | bool | `false` | `ENGINE_DEBUG_NO_GRAPHS` | eager execution, no CUDA graphs |
 | `dump_requests` | string | `(empty)` | `ENGINE_DEBUG_DUMP_REQUESTS` | directory: write every API request body and rendered prompt there |

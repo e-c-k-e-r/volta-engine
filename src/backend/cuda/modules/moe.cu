@@ -1,4 +1,5 @@
 #include "engine/modules/moe.h"
+#include "engine/runtime/options.h"
 #include "exl3_moe_kernel.cuh"
 #include "exl3_moe_coop.cuh"
 #include "engine/core/batch.h"
@@ -249,7 +250,8 @@ void router_softmax_select_kernel(
 	half* __restrict__ topk_weights,
 	int num_experts,
 	int top_k,
-	int k_slices
+	int k_slices,
+	int round_fp16
 ) {
 	__shared__ float s_logit[ROUTER_MAX_EXPERTS];
 	const int m = blockIdx.x;
@@ -262,7 +264,7 @@ void router_softmax_select_kernel(
 		for ( int ks = 0; ks < k_slices; ++ks ) {
 			logit += g_router_partials[( static_cast<size_t>( m ) * ROUTER_MAX_KSLICES + ks ) * ROUTER_MAX_EXPERTS + expert];
 		}
-		s_logit[expert] = logit;
+		s_logit[expert] = round_fp16 ? __half2float( __float2half_rn( logit ) ) : logit;
 	}
 	__syncthreads();
 	if ( threadIdx.x < 32 ) {
@@ -449,7 +451,8 @@ void MoERouter::route_softmax_topk(
 		"MoERouter::route_softmax_topk: top_k / num_experts / hidden_size out of range" );
 	router_logits_kernel<<<dim3( ( num_experts + 31 ) / 32, rows, hidden_size / 128 ), dim3( 32 ), 0, stream>>>(
 		x.ptr<const half>(), router_weights.ptr<const half>(), hidden_size, num_experts );
-	router_softmax_select_kernel<<<dim3( rows ), dim3( 512 ), 0, stream>>>( d_topk_indices, d_topk_weights, num_experts, top_k, hidden_size / 128 );
+	static const int round_fp16 = engine::runtime::options().router_fp16 ? 1 : 0;
+	router_softmax_select_kernel<<<dim3( rows ), dim3( 512 ), 0, stream>>>( d_topk_indices, d_topk_weights, num_experts, top_k, hidden_size / 128, round_fp16 );
 }
 
 void MoERouter::combine(

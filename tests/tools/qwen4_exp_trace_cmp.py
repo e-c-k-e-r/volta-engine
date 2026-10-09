@@ -32,6 +32,8 @@ cmp('L3 attn y (after allreduce)',203,'b6_attn_out_0.npy')
 cmp('L3 attn applied streams',303,'b6_attn_hc_apply_0.npy')
 cmp('L3 moe y',503,'b6_mlp_out_0.npy')
 cmp('after block 3 (mod006)',603,'mod006_TransformerBlock.npy')
+cmp('after block 4 (mod007)',604,'mod007_TransformerBlock.npy')
+cmp('after block 5 (mod008, 3-bit experts)',605,'mod008_TransformerBlock.npy')
 # GDN internals, rank 0 slice (tp=4): qkv groups [q 2048 | k 2048 | v 6144] -> rank 0 takes 512 / 512 / 1536 of each
 def rec(tag): return recs.get(tag)
 def rank0_qkv(a):  # full [m,10240] -> rank 0 slice [m,2560]

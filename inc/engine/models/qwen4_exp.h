@@ -114,6 +114,7 @@ public:
 	void reset_state( int slot_id = 0 ) override;
 	// Prefix-cache snapshots of a slot: [GDN state | conv history | n-gram conv ring | token context (3 ints)] then the KV rows [from, tokens) of every attention layer
 	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
+	int seq_align() const override { return 4; }   // pooled index keys cover 4 tokens
 	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
 	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;
 
@@ -125,6 +126,7 @@ public:
 private:
 	void set_rows( int m );
 	void forward_body( int m, backend::stream_t stream );
+	void teacher_inject( int L, int m, backend::stream_t stream );
 	// One sublayer's input: the gated-residual mix of the streams into mixed_ (and post_ when the site has an inject gate)
 	void gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream );
 	// N-gram embedding layer: host gather of the rows for the forward (called from forward()), device gate / conv (from forward_body)
@@ -136,7 +138,8 @@ private:
 	// MoE sublayer: mixed_ in, this rank's partial result (routed experts of the rank, plus the shared expert on rank 0) in y_
 	void moe_forward( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream );
 	// Debug trace (trace_layers): the first position of the forward, rows of streams or of an fp16 matrix
-	void copy_kv_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
+	size_t copy_kv_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );   // returns the bytes moved
+	void copy_pool_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	void trace_route( int tag, int m, backend::stream_t stream );
 	void trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols = 0 );
 
@@ -191,6 +194,15 @@ private:
 	engine::runtime::KVCachePool kv_pool_;
 	bool attn_tc_ = false;     // all rows of the forward share one slot
 	pod::TensorView q_gate_buf_, q_buf_, gate_attn_buf_, k_buf_, v_buf_, attn_out_;
+	// QSA indexer: raw-key ring and pooled-key plane per slot and attention layer, selection scratch
+	backend::half_t* qsa_ring_ = nullptr;     // [slots, attention layers, RING, 128]
+	backend::half_t* qsa_pool_ = nullptr;     // [slots, attention layers, max_seq / 4, 128]
+	size_t qsa_ring_slot_ = 0, qsa_pool_slot_ = 0;
+	int qsa_max_pools_ = 0;
+	pod::TensorView qsa_qk_, qsa_q_;
+	backend::half_t* qsa_scores_ = nullptr;   // [R, max_pools]
+	int* qsa_idx_ = nullptr;                  // [R, DSA::KPAD]
+	int* qsa_nkeys_ = nullptr;                // [R]
 	// GDN buffers
 	pod::TensorView qkv_buf_, conv_out_, z_buf_, gdn_out_, gdn_gate_, gdn_beta_;
 
