@@ -958,6 +958,9 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	// sums are added, and a row's result must not depend on how many other rows share the call (speculative verify == plain decode)
 	const int base_a = slots * 2 * ( p.I / tcols );
 	p.ksplit_a = pick_ksplit( p.topk * 2 * ( p.I / tcols ), p.H / 16, MOE_COOP_KSPLIT_MAX, num_sms );
+	// 4 bpw experts (Flash-Next, top 10): the base count already exceeds the SM count, but few of the slots are local to a rank, so the
+	// resident blocks sit on long serial k-loops; two k-halves cut a call from ~76 to ~50 us at 1-4 local routes
+	if ( p.bits == 4 ) p.ksplit_a = MAX( p.ksplit_a, MIN( 2, MOE_COOP_KSPLIT_MAX ) );
 	p.ksplit_b = 1;
 	const int grid_a = base_a * p.ksplit_a;
 	const int grid_b = slots * ( p.H / tcols );

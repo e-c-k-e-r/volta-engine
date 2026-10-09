@@ -113,5 +113,7 @@ The fused cooperative MoE decode kernel (`exl3_moe_coop`) now also runs 4 bpw ex
 
 The dp4a int8 decode GEMV now also serves 7 and 8 bpw (M=1, N%256): 24.9 -> 23.5 ms/token, tokens unchanged. Splitting the shared expert over ranks (5 Hadamard spans: 1,1,1,2) was tried twice and reverted: the narrow N=128 slices miss the int8 GEMV (N%256) and fall to the 85 us GEMM (decode 30.6 ms), and even padded to 256 each rank would pay the same ~25 us per 8-bit launch, since these calls are latency-bound, not bandwidth-bound. The remaining lever is overlapping the shared expert with the MoE on a second stream (needs a backend event API) or fewer launches.
 
+Fused MoE decode breakdown (`bench_moe_routes`, rank 0, 1 row, top 10): 0 local routes 6 us, 1-4 routes ~44 us (a 28 + b 16, flat in the route count: the call is latency-bound by the serial k-loops of the few resident blocks, so rank imbalance is nearly free), 5+ routes jump to ~90-160 us because the kernels are 512 threads x 106 registers (1 block/SM) and more than 80 active blocks run in two waves. Two k-splits for the gate/up stage at 4 bpw (the new default) take a call from ~76 to ~55 us: decode 23.5 -> 22.6 ms/token, tokens unchanged. Levers left: 256-thread tiles (2 blocks/SM) to remove the two-wave cliff, and a split-k for the down stage.
+
 Next: a GEMV for the N=640 shared-expert shapes, a tensor-core QSA scorer and sparse
 kernel, the SASS / bench baselines and the 256K needle.
