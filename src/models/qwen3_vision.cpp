@@ -84,10 +84,16 @@ bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int
 	{
 		const auto* meta = repo.find( "model.visual.pos_embed.weight" );
 		const void* raw = repo.cpu_data( "model.visual.pos_embed.weight" );
-		ENGINE_ASSERT( meta && raw && meta->dtype == pod::DType::FP16, "vision: pos_embed must be FP16" );
+		ENGINE_ASSERT( meta && raw && ( meta->dtype == pod::DType::FP16 || meta->dtype == pod::DType::BF16 ), "vision: pos_embed must be FP16 or BF16" );
 		const size_t count = static_cast<size_t>( cfg_.num_position_embeddings ) * cfg_.hidden;
-		d_pos_table_ = take<backend::half_t>( arena, count );
-		backend::memcpy_async( d_pos_table_, raw, count * sizeof( backend::half_t ), backend::Copy::H2D, stream );
+		if ( meta->dtype == pod::DType::FP16 ) {
+			d_pos_table_ = take<backend::half_t>( arena, count );
+			backend::memcpy_async( d_pos_table_, raw, count * sizeof( backend::half_t ), backend::Copy::H2D, stream );
+		}
+		else {
+			// BF16 table (Flash-Next): the repo converts to FP16 on load
+			d_pos_table_ = repo.load( "model.visual.pos_embed.weight", arena, stream, pod::DType::FP16 ).ptr<backend::half_t>();
+		}
 	}
 
 	blocks_.resize( cfg_.depth );

@@ -431,6 +431,26 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	return true;
 }
 
+bool Qwen4ExpPipeline::load_vision( const char* model_dir, backend::stream_t stream ) {
+	if ( rank_ != 0 || runtime::options().max_image_tokens <= 0 ) return false;
+	backend::set_device( rank_ );
+	return vision_.load( model_dir, *arena_, runtime::options().max_image_tokens * 4, stream );
+}
+
+bool Qwen4ExpPipeline::encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream ) {
+	if ( rank_ != 0 || !vision_.loaded() ) return false;
+	backend::set_device( rank_ );
+	return vision_.encode( image, out, stream );
+}
+
+bool Qwen4ExpPipeline::inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream ) {
+	ENGINE_ASSERT( dst_row >= 0 && rows >= 1 && dst_row + rows <= pod::MAX_ROWS, "Qwen4ExpPipeline::inject_embeddings: rows out of range" );
+	backend::set_device( rank_ );
+	const size_t row_bytes = static_cast<size_t>( config_.hidden_size ) * sizeof( backend::half_t );
+	backend::memcpy_async( embed_rows_.ptr<char>() + static_cast<size_t>( dst_row ) * row_bytes, host_rows, static_cast<size_t>( rows ) * row_bytes, backend::Copy::H2D, stream );
+	return true;
+}
+
 void Qwen4ExpPipeline::set_rows( int m ) {
 	embed_rows_.shape[0] = m;
 	mixed_.shape[0] = m;

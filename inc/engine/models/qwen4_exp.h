@@ -9,6 +9,7 @@
 #include "engine/modules/moe.h"
 #include "engine/core/graph_cache.h"
 #include "engine/loader/ngram_table.h"
+#include "engine/models/qwen3_vision.h"
 #include "engine/runtime/kv_cache.h"
 #include "engine/backend/types.h"
 #include <vector>
@@ -112,6 +113,11 @@ public:
 	void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) override;
 	void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) override;
 	// MTP head (speculator=mtp): one full-attention block fed by the target's pre-collapse streams and the next token's embedding
+	// Image input: the checkpoint's Qwen3-VL tower (rank 0); inject_embeddings overwrites the embedding rows of the image placeholder tokens
+	bool inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream = nullptr ) override;
+	bool load_vision( const char* model_dir, backend::stream_t stream = nullptr ) override;
+	const engine::loader::VisionParams* vision_params() const override { return vision_.loaded() ? &vision_.params() : nullptr; }
+	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
 	bool has_mtp() const override { return mtp_on_; }
 	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
 	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
@@ -237,6 +243,8 @@ private:
 	int lm_shard_cols_ = 0;
 
 	std::vector<Qwen4ExpLayerWeights> layers_;
+
+	Qwen3VisionTower vision_;   // rank 0 only
 
 	// MTP head
 	bool mtp_on_ = false;
