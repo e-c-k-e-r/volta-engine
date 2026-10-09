@@ -52,6 +52,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `dsa_diag` | bool | `false` | `ENGINE_DEBUG_DSA_DIAG` | sparse-attention indexer diagnostics |
 | `trace_layers` | string | `(empty)` | `ENGINE_DEBUG_TRACE_LAYERS` | GLM: file that receives the last row's residual streams after every layer of every eager forward (rank 0) |
 | `perturb_embed` | float | `0` | `ENGINE_DEBUG_PERTURB_EMBED` | GLM: multiply every prompt embedding element by 1 + eps * u (u in [-1, 1], hashed from position and dimension, so independent of chunking); eager prefill only, a noise-floor probe |
+| `route_replay` | string | `(empty)` | `ENGINE_DEBUG_ROUTE_REPLAY` | GLM: a <trace_layers>.route file; eager prefill rows found in it use the recorded expert ids and weights (the latest record per layer and position wins), isolating router flips |
 | `spec_ctrl_log` | bool | `false` | `ENGINE_DEBUG_SPEC_CTRL_LOG` | speculation controller decisions |
 | `no_graphs` | bool | `false` | `ENGINE_DEBUG_NO_GRAPHS` | eager execution, no CUDA graphs |
 | `dump_requests` | string | `(empty)` | `ENGINE_DEBUG_DUMP_REQUESTS` | directory: write every API request body and rendered prompt there |

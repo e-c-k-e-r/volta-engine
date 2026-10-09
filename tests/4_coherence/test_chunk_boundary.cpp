@@ -76,6 +76,7 @@ int main( int argc, char** argv ) {
 		}
 		if ( f ) std::fclose( f );
 	}
+	if ( std::getenv( "COLD_ONLY" ) ) return 0;
 	for ( int cut : cuts ) {
 		mc.reset_slot( 0 );
 		mc.prefill( ids.data(), cut, 0 );

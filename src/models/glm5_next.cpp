@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <unordered_map>
+#include <array>
 #include <algorithm>
 
 namespace engine::models {
@@ -1184,6 +1186,61 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 				state_.d_topk_indices, state_.d_topk_weights,
 				H, config_.num_experts, config_.top_k, 2.5f, stream, m
 			);
+			static const std::string& replay_path = runtime::options().route_replay;
+			if ( !replay_path.empty() && m > pod::MAX_BATCH ) {
+				// Debug: overwrite the routing of rows that have a record (key layer * 2^20 + position)
+				static std::unordered_map<int64_t, std::pair<std::array<int, 16>, std::array<backend::half_t, 16>>> table;
+				static bool loaded = false;
+				const int K = config_.top_k;
+				if ( !loaded ) {
+					loaded = true;
+					if ( FILE* f = std::fopen( replay_path.c_str(), "rb" ) ) {
+						int hdr[3];
+						while ( std::fread( hdr, sizeof( int ), 3, f ) == 3 ) {
+							std::vector<int> ids( static_cast<size_t>( hdr[1] ) * K );
+							std::vector<backend::half_t> wts( ids.size() );
+							if ( std::fread( ids.data(), sizeof( int ), ids.size(), f ) != ids.size() || std::fread( wts.data(), sizeof( backend::half_t ), wts.size(), f ) != wts.size() ) break;
+							for ( int r = 0; r < hdr[1]; ++r ) {
+								auto& e = table[( static_cast<int64_t>( hdr[0] ) << 20 ) + hdr[2] + r];
+								for ( int k = 0; k < K; ++k ) { e.first[k] = ids[static_cast<size_t>( r ) * K + k]; e.second[k] = wts[static_cast<size_t>( r ) * K + k]; }
+							}
+						}
+						std::fclose( f );
+					}
+					LOG_INFO( "route replay: %zu records\n", table.size() );
+				}
+				std::vector<int> ids( static_cast<size_t>( m ) * K );
+				std::vector<backend::half_t> wts( ids.size() );
+				backend::stream_sync( stream );
+				backend::memcpy_async( ids.data(), state_.d_topk_indices, ids.size() * sizeof( int ), backend::Copy::D2H, stream );
+				backend::memcpy_async( wts.data(), state_.d_topk_weights, wts.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+				backend::stream_sync( stream );
+				for ( int r = 0; r < m; ++r ) {
+					const auto it = table.find( ( static_cast<int64_t>( layer ) << 20 ) + key_hint_ - m + r );
+					if ( it == table.end() ) continue;
+					for ( int k = 0; k < K; ++k ) { ids[static_cast<size_t>( r ) * K + k] = it->second.first[k]; wts[static_cast<size_t>( r ) * K + k] = it->second.second[k]; }
+				}
+				backend::memcpy_async( state_.d_topk_indices, ids.data(), ids.size() * sizeof( int ), backend::Copy::H2D, stream );
+				backend::memcpy_async( state_.d_topk_weights, wts.data(), wts.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
+				backend::stream_sync( stream );
+			}
+			if ( !trace_path.empty() && rank_ == 0 && m > pod::MAX_BATCH ) {
+				// Debug: every row's selected experts and weights (header: layer, rows, first position)
+				const size_t n = static_cast<size_t>( m ) * config_.top_k;
+				std::vector<int> ids( n );
+				std::vector<backend::half_t> wts( n );
+				backend::stream_sync( stream );
+				backend::memcpy_async( ids.data(), state_.d_topk_indices, n * sizeof( int ), backend::Copy::D2H, stream );
+				backend::memcpy_async( wts.data(), state_.d_topk_weights, n * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+				backend::stream_sync( stream );
+				if ( FILE* f = std::fopen( ( trace_path + ".route" ).c_str(), "ab" ) ) {
+					const int hdr[3] = { layer, m, key_hint_ - m };
+					std::fwrite( hdr, sizeof( int ), 3, f );
+					std::fwrite( ids.data(), sizeof( int ), n, f );
+					std::fwrite( wts.data(), sizeof( backend::half_t ), n, f );
+					std::fclose( f );
+				}
+			}
 
 				// Routed experts in this rank's partition: device-resident dispatch, no host sync
 			engine::modules::MoE::forward(
