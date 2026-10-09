@@ -121,5 +121,9 @@ The gated add after each sublayer is deferred into the next site's norm pass (`G
 
 Prefill: the gated-residual gate / up projections were 37% of GPU time at 512-row chunks (fp32 row-tile kernels, FMA bound). For more than 8 rows they now run as cuBLAS tensor-core GEMM pairs on fp16 hi / lo splits of the fp32 operands (fp32 accumulation; `GatedResidual::norm / gemm_f32 / gate_act / up_epilogue`, always at the full 512-row capacity so a row's result is bit-identical whatever its position or chunk size): prefill 504 -> 713 tok/s (8K tokens, chunk 512), 12K needle 675 tok/s. `test_gr_tc`: rel L2 7e-6 against the fp32 kernels, row-shift invariance exact. A plain fp16 version was faster (752) but moved logits by up to 1.0 and was dropped. Decode rows keep the fp32 kernels. Any perturbation moves the logits by a few tenths through router flips; split-vs-cold prefill at an unaligned cut already differed by 0.28 before this change.
 
+The PLE layer's dense fp16 key / value projections (the plain GEMV behind `Linear::forward`, 20 ms per 512-row chunk) now use cuBLAS at the full row capacity for prefill rows: 713 -> 767 tok/s. The 48-token greedy test list moves at one near-tie token (index 38, 9989 -> 22157) with these prefill numerics; the text stays sensible and the API suite passes.
+
+Prefill profile after that (8K tokens, one GPU): persistent 4-bit MoE kernel 28% (3.9 ms per 512-row chunk and layer, ~10 rows per expert so the trellis dequant is not amortized), sparse QSA attention 25% (fp32 CUDA cores, ~0.5 ms per layer and chunk), all-reduce 8% (skew), router logits 4%, GDN recurrence 3%.
+
 Next: a GEMV for the N=640 shared-expert shapes, a tensor-core QSA scorer and sparse
 kernel, the SASS / bench baselines and the 256K needle.

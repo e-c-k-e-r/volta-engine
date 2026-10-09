@@ -6,6 +6,7 @@
 #include "engine/loader/safetensors.h"
 #include "engine/modules/gdn.h"
 #include "engine/modules/gated_residual.h"
+#include "engine/modules/vision.h"
 #include "engine/modules/embedding.h"
 #include "engine/modules/swiglu.h"
 #include "engine/modules/ple.h"
@@ -765,8 +766,17 @@ void Qwen4ExpPipeline::ple_prepare( const pod::BatchRows& rows, int m, backend::
 void Qwen4ExpPipeline::ple_forward( int m, backend::stream_t stream ) {
 	flush_apply( m, stream );
 	const int H = config_.hidden_size, hc = config_.hc_mult;
-	engine::modules::Linear::forward( ple_emb_, ple_.key_proj, ple_key_, stream );
-	engine::modules::Linear::forward( ple_emb_, ple_.value_proj, ple_value_, stream );
+	if ( m > 8 ) {
+		// Prefill rows: the dense fp16 projections as tensor-core GEMMs at the full row capacity (one cuBLAS algorithm, so a row does not depend on the chunking);
+		// the plain GEMV behind Linear::forward takes 20 ms per 512-row chunk here
+		const int R = pod::MAX_ROWS, H = config_.hidden_size, hc = config_.hc_mult;
+		engine::modules::Vision::dense_gemm( ple_emb_.ptr<const backend::half_t>(), ple_.key_proj.w0.ptr<const backend::half_t>(), ple_key_.ptr<backend::half_t>(), R, hc * H, config_.ple_embed_dim, stream );
+		engine::modules::Vision::dense_gemm( ple_emb_.ptr<const backend::half_t>(), ple_.value_proj.w0.ptr<const backend::half_t>(), ple_value_.ptr<backend::half_t>(), R, H, config_.ple_embed_dim, stream );
+	}
+	else {
+		engine::modules::Linear::forward( ple_emb_, ple_.key_proj, ple_key_, stream );
+		engine::modules::Linear::forward( ple_emb_, ple_.value_proj, ple_value_, stream );
+	}
 	engine::modules::PLE::gate_and_norm( ple_key_.ptr<const backend::half_t>(), ple_value_.ptr<const backend::half_t>(), streams_.ptr<const float>(),
 		ple_.norm_key.ptr<const backend::half_t>(), ple_.norm_query.ptr<const backend::half_t>(), ple_.norm_conv.ptr<const backend::half_t>(),
 		ple_gated_, ple_normed_, m, H, hc, config_.rms_norm_eps, 1.0f / std::sqrt( static_cast<float>( H ) ), stream );
