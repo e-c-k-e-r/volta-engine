@@ -8,6 +8,7 @@
 #include "engine/modules/linear.h"
 #include "engine/modules/moe.h"
 #include "engine/core/graph_cache.h"
+#include "engine/loader/ngram_table.h"
 #include "engine/backend/types.h"
 #include <vector>
 
@@ -62,6 +63,11 @@ struct Qwen4ExpGatedResidual {
 	pod::TensorView inject;    // [hc_mult, hc_mult * hidden] (absent on the final mixer)
 };
 
+struct Qwen4ExpPLEWeights {
+	pod::LinearWeight key_proj, value_proj;   // dense fp16
+	pod::TensorView norm_key, norm_query, norm_conv, conv_w;
+};
+
 struct Qwen4ExpLayerWeights {
 	bool is_full_attention = false;
 	Qwen4ExpGatedResidual attn_hc;
@@ -112,6 +118,9 @@ private:
 	void forward_body( int m, backend::stream_t stream );
 	// One sublayer's input: the gated-residual mix of the streams into mixed_ (and post_ when the site has an inject gate)
 	void gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream );
+	// N-gram embedding layer: host gather of the rows for the forward (called from forward()), device gate / conv (from forward_body)
+	void ple_prepare( const pod::BatchRows& rows, int m, backend::stream_t stream );
+	void ple_forward( int m, backend::stream_t stream );
 	void gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_idx, int m, backend::stream_t stream );
 	// MoE sublayer: mixed_ in, this rank's partial result (routed experts of the rank, plus the shared expert on rank 0) in y_
 	void moe_forward( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream );
@@ -152,6 +161,14 @@ private:
 	pod::TensorView y_;               // [R, hidden] fp16: the sublayer output
 	float* post_ = nullptr;           // [R, hc]
 	float* gr_scratch_ = nullptr;
+	// N-gram embedding (PLE) layer
+	Qwen4ExpPLEWeights ple_;
+	pod::TensorView ple_emb_, ple_key_, ple_value_;
+	float* ple_gated_ = nullptr;              // [R, hc, hidden] fp32
+	backend::half_t* ple_normed_ = nullptr;   // [R, hc * hidden]
+	backend::half_t* ple_ring_ = nullptr;     // [slots, RING, hc * hidden]
+	std::vector<int> host_tokens_;            // the ids of the last embed_tokens
+	std::vector<std::vector<int>> hist_tok_, hist_seg_;   // per slot: token at each position, start of its eos segment
 	// MoE buffers
 	int* topk_idx_ = nullptr;                 // [R, top_k]
 	backend::half_t* topk_w_ = nullptr;

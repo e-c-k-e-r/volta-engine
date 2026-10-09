@@ -2,6 +2,7 @@
 // A strong definition in another translation unit overrides these. Declarations come from engine/modules/mhc.h.
 #include "engine/modules/mhc.h"
 #include "engine/modules/gated_residual.h"
+#include "engine/modules/ple.h"
 #include "engine/backend/tiers.h"
 
 namespace engine::modules {
@@ -59,6 +60,22 @@ __attribute__(( weak )) void GatedResidual::add_sigmoid_gated( backend::half_t*,
 
 __attribute__(( weak )) void GatedResidual::apply( float*, const float*, const backend::half_t*, int, int, int, backend::stream_t ) {
 	ENGINE_UNSUPPORTED( "GatedResidual::apply" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void PLE::gate_and_norm( const backend::half_t*, const backend::half_t*, const float*, const backend::half_t*, const backend::half_t*, const backend::half_t*,
+	float*, backend::half_t*, int, int, int, float, float, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "PLE::gate_and_norm" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void PLE::conv_apply( const backend::half_t*, const backend::half_t*, const backend::half_t*, const pod::BatchRows*, const float*, float*, int, int, int, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "PLE::conv_apply" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void PLE::ring_update( const backend::half_t*, backend::half_t*, const pod::BatchRows*, int, int, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "PLE::ring_update" );
 	__builtin_unreachable();
 }
 

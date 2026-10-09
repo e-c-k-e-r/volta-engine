@@ -45,6 +45,7 @@ set(ENGINE_HOST_SOURCES
 	src/loader/chat_template.cpp
 	src/loader/jinja.cpp
 	src/loader/image.cpp
+	src/loader/ngram_table.cpp
 	src/models/model.cpp
 	src/models/qwen3_5.cpp
 	src/models/qwen3_vision.cpp
@@ -84,6 +85,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/expert_tier.cu
 	src/backend/cuda/modules/mhc.cu
 	src/backend/cuda/modules/gated_residual.cu
+	src/backend/cuda/modules/ple.cu
 	src/backend/cuda/modules/embedding.cu
 	src/backend/cuda/modules/vision.cu
 	src/backend/cuda/modules/linear_trellis.cu

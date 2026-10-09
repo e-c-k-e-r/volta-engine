@@ -7,7 +7,7 @@ H=2560
 b=open(trace,'rb').read(); o=0; recs={}
 while o<len(b):
     tag,m,p=struct.unpack_from('iii',b,o); o+=12
-    streams = tag==1000 or 300<=tag<400 or 600<=tag<700
+    streams = tag==1000 or tag==800 or 300<=tag<400 or 600<=tag<700
     cols={2000:2560,2001:1536,2002:1536,2003:1536,2004:2560,700:20}.get(tag,H)
     n=m*(4*H if streams else cols)
     a=np.frombuffer(b,dtype=np.float32,count=n,offset=o); o+=4*n
@@ -23,6 +23,10 @@ cmp('L0 attn applied streams',300,'b2_attn_hc_apply_0.npy')
 cmp('L0 mlp mixed',400,'b2_mlp_hc_mix_2.npy')
 cmp('L0 moe y (after allreduce)',500,'b2_mlp_out_0.npy')
 cmp('L0 mlp applied streams',600,'b2_mlp_hc_apply_0.npy')
+cmp('after block 0 (mod002)',600,'mod002_TransformerBlock.npy')
+cmp('after PLE (mod003)',800,'mod003_PLELayer.npy')
+cmp('after block 1 (mod004)',601,'mod004_TransformerBlock.npy')
+cmp('after block 2 (mod005)',602,'mod005_TransformerBlock.npy')
 # GDN internals, rank 0 slice (tp=4): qkv groups [q 2048 | k 2048 | v 6144] -> rank 0 takes 512 / 512 / 1536 of each
 def rec(tag): return recs.get(tag)
 def rank0_qkv(a):  # full [m,10240] -> rank 0 slice [m,2560]

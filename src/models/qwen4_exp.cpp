@@ -8,12 +8,16 @@
 #include "engine/modules/gated_residual.h"
 #include "engine/modules/embedding.h"
 #include "engine/modules/swiglu.h"
+#include "engine/modules/ple.h"
+#include <mutex>
 #include "engine/modules/linear.h"
 #if ENGINE_BACKEND_CUDA
 #include "trellis_context.h"
 #endif
 #include <vector>
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -82,6 +86,11 @@ pod::TensorView load_router_transposed( engine::loader::SafeTensorsRepo& repo, c
 	return tv;
 }
 
+engine::loader::NgramTable& ngram_table() {
+	static engine::loader::NgramTable table;
+	return table;
+}
+
 } // namespace
 
 Qwen4ExpPipeline::Qwen4ExpPipeline() = default;
@@ -138,6 +147,22 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	post_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.hc_mult * sizeof( float ) ) );
 	gr_scratch_ = static_cast<float*>( engine::core::arena_alloc( arena,
 		engine::modules::GatedResidual::scratch_floats( R, H, config_.hc_mult, config_.hc_rank ) * sizeof( float ) ) );
+	// N-gram embedding layer buffers and per-slot histories
+	{
+		int e_shape[2] = { R, config_.ple_embed_dim };
+		ple_emb_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, e_shape, 2 );
+		int k_shape[2] = { R, config_.hc_mult * H };
+		ple_key_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, k_shape, 2 );
+		int v_shape[2] = { R, H };
+		ple_value_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, v_shape, 2 );
+		ple_gated_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.hc_mult * H * sizeof( float ) ) );
+		ple_normed_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.hc_mult * H * sizeof( backend::half_t ) ) );
+		const size_t ring_bytes = static_cast<size_t>( S ) * engine::modules::PLE::RING * config_.hc_mult * H * sizeof( backend::half_t );
+		ple_ring_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, ring_bytes ) );
+		backend::memset_sync( ple_ring_, 0, ring_bytes );
+		hist_tok_.assign( S, std::vector<int>( config_.max_seq, 0 ) );
+		hist_seg_.assign( S, std::vector<int>( config_.max_seq, 0 ) );
+	}
 	// MoE: router outputs, the dispatch / expert scratch for this rank's experts, and the shared expert's buffers
 	topk_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( int ) ) );
 	topk_w_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( backend::half_t ) ) );
@@ -232,6 +257,20 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	static const int CONV_CHANNELS[3] = { 2048, 2048, 6144 };
 	const int conv_rank_channels[3] = { 2048 / tp, 2048 / tp, 6144 / tp };
 
+	{
+		char pre[160];
+		std::snprintf( pre, sizeof( pre ), "%s.layers.%d.ple", P, config_.ple_layer );
+		std::snprintf( nm, sizeof( nm ), "%s.key_proj", pre ); ple_.key_proj = check( repo.load_linear( nm, *arena_, 16, stream ), nm );
+		std::snprintf( nm, sizeof( nm ), "%s.value_proj", pre ); ple_.value_proj = check( repo.load_linear( nm, *arena_, 16, stream ), nm );
+		std::snprintf( nm, sizeof( nm ), "%s.norm_key.weight", pre ); ple_.norm_key = dense( nm );
+		std::snprintf( nm, sizeof( nm ), "%s.norm_query.weight", pre ); ple_.norm_query = dense( nm );
+		std::snprintf( nm, sizeof( nm ), "%s.norm_conv.weight", pre ); ple_.norm_conv = dense( nm );
+		std::snprintf( nm, sizeof( nm ), "%s.conv1d.weight", pre ); ple_.conv_w = dense( nm );
+		static std::once_flag once;
+		static bool table_ok = true;
+		std::call_once( once, [&]() { table_ok = ngram_table().open( std::string( model_dir ) + "/ngram_embedding.safetensors" ); } );
+		if ( !table_ok ) { LOG_ERROR( "[RANK %d] the n-gram table failed to open\n", rank_ ); ++missing; }
+	}
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		auto& lw = layers_[L];
 		char pre[160];
@@ -315,12 +354,16 @@ void Qwen4ExpPipeline::set_rows( int m ) {
 	sh_up_buf_.shape[0] = m;
 	sh_inter_buf_.shape[0] = m;
 	sh_out_.shape[0] = m;
+	ple_emb_.shape[0] = m;
+	ple_key_.shape[0] = m;
+	ple_value_.shape[0] = m;
 }
 
 void Qwen4ExpPipeline::embed_tokens( const int* token_ids, int count, backend::stream_t stream ) {
 	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_ROWS, "Qwen4ExpPipeline::embed_tokens: count out of range" );
 	backend::set_device( rank_ );
 	backend::memcpy_async( d_token_ids_, token_ids, count * sizeof( int ), backend::Copy::H2D, stream );
+	host_tokens_.assign( token_ids, token_ids + count );
 	set_rows( count );
 	engine::modules::Embedding::forward( embed_table_, d_token_ids_, count, embed_rows_, stream );
 }
@@ -333,6 +376,7 @@ void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 	key_hint_ = rows.pos[m - 1] + 1;
 	set_rows( m );
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
+	ple_prepare( rows, m, stream );
 	forward_body( m, stream );
 }
 
@@ -438,6 +482,52 @@ void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_i
 	engine::modules::Linear::forward( gdn_out_, lw.out_proj, y_, stream );
 }
 
+// Hashes each row's n-gram (token, previous tokens within the eos segment) into the table rows and uploads the decoded embedding
+void Qwen4ExpPipeline::ple_prepare( const pod::BatchRows& rows, int m, backend::stream_t stream ) {
+	auto& table = ngram_table();
+	ENGINE_ASSERT( table.is_open() && static_cast<int>( host_tokens_.size() ) >= m, "Qwen4ExpPipeline: n-gram table or token ids missing" );
+	const int eos = 248044;   // text_config eos_token_id: n-grams never span it
+	const int D = config_.ple_embed_dim;
+	std::vector<backend::half_t> emb( static_cast<size_t>( m ) * D );
+	for ( int r = 0; r < m; ++r ) {
+		const int slot = rows.slot[r], pos = rows.pos[r];
+		auto& H = hist_tok_[slot];
+		auto& S = hist_seg_[slot];
+		H[pos] = host_tokens_[r];
+		S[pos] = ( pos > 0 ) ? ( H[pos - 1] == eos ? pos : S[pos - 1] ) : 0;
+	}
+	std::vector<float> row( engine::loader::NgramTable::ROW_DIM );
+	std::vector<uint64_t> uids( table.num_heads() );
+	for ( int r = 0; r < m; ++r ) {
+		const int slot = rows.slot[r], pos = rows.pos[r];
+		int64_t tokens[8];
+		for ( int s = 0; s < table.ngram_size(); ++s ) {
+			const bool valid = ( s == 0 ) || ( pos - s >= 0 && pos - hist_seg_[slot][pos] >= s );
+			tokens[s] = valid ? hist_tok_[slot][pos - s] : eos;
+		}
+		table.row_ids( tokens, uids.data() );
+		for ( int h = 0; h < table.num_heads(); ++h ) {
+			table.decode_row( uids[h], h, row.data() );
+			for ( int i = 0; i < engine::loader::NgramTable::ROW_DIM; ++i ) {
+				emb[static_cast<size_t>( r ) * D + static_cast<size_t>( h ) * engine::loader::NgramTable::ROW_DIM + i] = backend::from_float_half( row[i] );
+			}
+		}
+	}
+	backend::memcpy_async( ple_emb_.data, emb.data(), emb.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
+	backend::stream_sync( stream );   // emb dies with this frame
+}
+
+void Qwen4ExpPipeline::ple_forward( int m, backend::stream_t stream ) {
+	const int H = config_.hidden_size, hc = config_.hc_mult;
+	engine::modules::Linear::forward( ple_emb_, ple_.key_proj, ple_key_, stream );
+	engine::modules::Linear::forward( ple_emb_, ple_.value_proj, ple_value_, stream );
+	engine::modules::PLE::gate_and_norm( ple_key_.ptr<const backend::half_t>(), ple_value_.ptr<const backend::half_t>(), streams_.ptr<const float>(),
+		ple_.norm_key.ptr<const backend::half_t>(), ple_.norm_query.ptr<const backend::half_t>(), ple_.norm_conv.ptr<const backend::half_t>(),
+		ple_gated_, ple_normed_, m, H, hc, config_.rms_norm_eps, 1.0f / std::sqrt( static_cast<float>( H ) ), stream );
+	engine::modules::PLE::conv_apply( ple_normed_, ple_.conv_w.ptr<const backend::half_t>(), ple_ring_, d_rows_, ple_gated_, streams_.ptr<float>(), m, hc * H, 3, stream );
+	engine::modules::PLE::ring_update( ple_normed_, ple_ring_, d_rows_, m, hc * H, stream );
+}
+
 void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size;
 	engine::modules::MoERouter::route_softmax_topk( mixed_, lw.router, topk_idx_, topk_w_, H, config_.num_experts, config_.top_k, stream, m );
@@ -463,6 +553,10 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 	int linear_idx = 0, site = 0;
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		auto& lw = layers_[L];
+		if ( L == config_.ple_layer ) {
+			ple_forward( m, stream );
+			trace_rows( 800, streams_.data, true, m, stream );
+		}
 		// Attention site
 		gr_mix( lw.attn_hc, true, m, stream );
 		trace_rows( 100 + L, mixed_.data, false, m, stream );
@@ -498,6 +592,10 @@ void Qwen4ExpPipeline::reset_state( int slot_id ) {
 	backend::set_device( rank_ );
 	backend::memset_sync( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, 0, state_.slot_gdn_floats * sizeof( float ) );
 	backend::memset_sync( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, 0, state_.slot_conv_floats * sizeof( float ) );
+	const size_t ring = static_cast<size_t>( engine::modules::PLE::RING ) * config_.hc_mult * config_.hidden_size;
+	backend::memset_sync( ple_ring_ + static_cast<size_t>( slot_id ) * ring, 0, ring * sizeof( backend::half_t ) );
+	std::fill( hist_tok_[slot_id].begin(), hist_tok_[slot_id].end(), 0 );
+	std::fill( hist_seg_[slot_id].begin(), hist_seg_[slot_id].end(), 0 );
 }
 
 } // namespace engine::models
