@@ -335,7 +335,7 @@ int main( int argc, char** argv ) {
 
 			// Negative case: same checkpoint, wrong geometry. ENGINE_ASSERT calls _Exit, so run it as
 			// a child process and judge by exit status -- an in-process check would take the suite down.
-			if ( std::getenv( "EXL3_DFLASH2_CHILD" ) ) {
+			if ( std::getenv( "ENGINE_TEST_DFLASH2_CHILD" ) ) {
 				pod::DFlashConfig bad;
 				bad.hidden_size = 2560;   // wrong width: head_dim, intermediate and groups all disagree
 				engine::spec::DFlashSpeculator bsp;
@@ -351,9 +351,9 @@ int main( int argc, char** argv ) {
 			{
 				char self[ 4096 ];
 				snprintf( self, sizeof( self ), "%s", argv[ 0 ] );
-				setenv( "EXL3_DFLASH2_CHILD", "1", 1 );
+				setenv( "ENGINE_TEST_DFLASH2_CHILD", "1", 1 );
 				const int rc = system( self );
-				unsetenv( "EXL3_DFLASH2_CHILD" );
+				unsetenv( "ENGINE_TEST_DFLASH2_CHILD" );
 				// Nonzero means the child hit the geometry assert, which is the point.
 				ENGINE_ASSERT( rc != 0, "geometry validation accepted a mismatched DFlashConfig" );
 				std::printf( "   [+] Mismatched DFlashConfig is rejected (child exit %d)\n", rc );

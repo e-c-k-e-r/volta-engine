@@ -19,32 +19,13 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		return false;
 	}
 	const bool is_glm = ( cfg.model_type == "glm5_next" );
-	// EXL3_ARENA_GIB overrides the per-GPU arena. The default of 16 GiB (Qwen: 8 slots x 32K FP16 KV is 4 GiB per rank) is sized for the quantized
-	// drafter; loading the unquantized one needs roughly twice the weight bytes.
 	const auto& opt = runtime::options();
-	const bool arena_env = opt.arena_gib >= 0;
-	// A tiered GLM (EXL3_EXPERT_CACHE < 1) keeps only that fraction of the routed experts (~26 GiB per rank in all) in the arena
-	size_t glm_gib = 31;
-	if ( is_glm ) {
-		const double f = opt.expert_cache;
-		if ( f > 0.0 && f < 1.0 ) glm_gib = static_cast<size_t>( std::ceil( 31.0 - ( 1.0 - f ) * 25.0 ) );
-	}
 	tp_ = opt.tp > 0 ? opt.tp : cfg.tp;
-	// A single-rank group holds the whole model, so the 4-rank defaults are meaningless: take the device's free memory
-	// less a reserve for what lives outside the arena (graphs, trellis workspace, collective scratch, CUDA context).
-	// EXL3_VRAM_RESERVE_MIB overrides the reserve; EXL3_ARENA_GIB or cfg.arena_bytes still win.
-	size_t arena_bytes = cfg.arena_bytes ? cfg.arena_bytes
-		: ( arena_env ? static_cast<size_t>( opt.arena_gib ) : ( is_glm ? glm_gib : 16ULL ) )
-			* 1024 * 1024 * 1024;
-	if ( tp_ == 1 && !cfg.arena_bytes && !arena_env ) {
-		const size_t reserve = ( opt.vram_reserve_mib >= 0 ? static_cast<size_t>( opt.vram_reserve_mib ) : 1536ULL ) * 1024 * 1024;
-		const size_t free_bytes = backend::device_free_bytes( 0 );
-		if ( free_bytes > reserve ) {
-			arena_bytes = ( free_bytes - reserve ) & ~( ( size_t ) 0xFFFFF );
-			std::printf( "[*] Arena sized from free memory: %.2f GiB (%.2f GiB free, %.2f GiB reserve)\n",
-				arena_bytes / 1073741824.0, free_bytes / 1073741824.0, reserve / 1073741824.0 );
-		}
-	}
+	// The arena is a bump allocator over one up-front allocation per GPU. Unless a size is given (cfg.arena_bytes,
+	// arena_gib) it takes the device's free memory less a reserve for what lives outside it (graphs, workspaces, the
+	// CUDA context); vram_reserve_mib overrides the reserve. The model's own tables (KV pools, scratch) are sized by
+	// max_seq / max_slots, not by the arena, so a larger context needs no arena tuning.
+	const size_t reserve = ( opt.vram_reserve_mib >= 0 ? static_cast<size_t>( opt.vram_reserve_mib ) : ( is_glm ? 288ULL : 1536ULL ) ) * 1024 * 1024;
 	ENGINE_ASSERT( tp_ == 1 || tp_ == ENGINE_NUM_GPUS, "ModelCluster::init: the collective supports tp 1 or 4 ranks" );
 	created_ = true;
 	if ( tp_ > 1 ) engine::comm::init_4gpu_mesh( rings_, staging_ptrs_, flag_ptrs_, engine::comm::kMeshStagingBytes );
@@ -55,6 +36,19 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	for ( int d = 0; d < tp_; ++d ) {
 		backend::set_device( d );
 		streams_[d] = backend::stream_create();
+		size_t arena_bytes = cfg.arena_bytes ? cfg.arena_bytes : static_cast<size_t>( std::max( opt.arena_gib, 0 ) ) * 1024 * 1024 * 1024;
+		if ( arena_bytes == 0 ) {
+			const size_t free_bytes = backend::device_free_bytes( d );
+			if ( free_bytes <= reserve ) {
+				std::fprintf( stderr, "[-] ModelCluster: GPU %d has %.2f GiB free, less than the %.2f GiB reserve\n", d, free_bytes / 1073741824.0, reserve / 1073741824.0 );
+				return false;
+			}
+			arena_bytes = ( free_bytes - reserve ) & ~( ( size_t ) 0xFFFFF );
+			if ( d == 0 ) {
+				std::printf( "[*] Arena sized from free memory: %.2f GiB per GPU (%.2f GiB free, %.2f GiB reserve)\n",
+					arena_bytes / 1073741824.0, free_bytes / 1073741824.0, reserve / 1073741824.0 );
+			}
+		}
 		if ( !engine::core::arena_create( arenas_[d], d, arena_bytes ) ) return false;
 		models_[d] = engine::models::create_model_pipeline( cfg.model_type );
 		if ( !models_[d] ) return false;

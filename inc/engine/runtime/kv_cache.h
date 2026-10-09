@@ -24,7 +24,7 @@ struct KVCachePool {
 	int num_heads = 0;
 	int head_dim = 0;
 
-	// format: EXL3_KV = fp16 | fp8 | k8v4 | nvfp4 overrides the argument.
+	// format: ENGINE_KV_FORMAT = fp16 | fp8 | k8v4 | nvfp4 overrides the argument.
 	bool init( int device_id, pod::MemoryArena& arena, int max_slots, int max_seq_len, int num_layers, int num_heads, int head_dim,
 		pod::KVFormat format = pod::KVFormat::FP16 );
 	pod::KVRef ref() const;

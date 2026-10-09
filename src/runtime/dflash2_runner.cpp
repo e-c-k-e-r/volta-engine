@@ -179,7 +179,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		} );
 	}
 
-	// Diagnostic: ENGINE_DEBUG_DUMP_DRAFT=<round> writes that round's inputs and the drafter hidden to
+	// Diagnostic: ENGINE_DEBUG_DUMP_DRAFT_ROUND=<round> writes that round's inputs and the drafter hidden to
 	// /tmp/draft_dump.bin for comparison against an independent implementation. Header (int32): pos, anchor,
 	// hidden, taps_cap; then the tap ring rows for positions [0, pos) as FP16 [pos, 5 * hidden]
 	// (only valid while pos <= taps_cap), then the drafter hidden FP16 [M, hidden].

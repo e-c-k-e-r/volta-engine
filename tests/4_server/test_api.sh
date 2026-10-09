@@ -4,16 +4,16 @@ set -uo pipefail
 # VOLTA_TEST_MODEL=glm5_next runs the same checks against GLM-5.3-Flash (no prefix cache there yet).
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ -f "$DIR/tests/local.env" ] && . "$DIR/tests/local.env"
-: "${VOLTA_MODEL_ROOT:?set VOLTA_MODEL_ROOT (or tests/local.env)}"
+: "${ENGINE_MODEL_ROOT:?set ENGINE_MODEL_ROOT (or tests/local.env)}"
 PORT="${VOLTA_TEST_PORT:-18080}"
 LOG="$(mktemp -u /tmp/volta_api_test_XXXXXX.log)"
 
 if [ "${VOLTA_TEST_MODEL:-qwen3_5}" = "glm5_next" ]; then
-	MODEL_DIR="${EXL3_GLM_DIR:-$VOLTA_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw}"
-	DRAFT_DIR="${EXL3_GLM_DRAFT_DIR:-$VOLTA_MODEL_ROOT/GLM-5.3-Flash-DFlash2}"
+	MODEL_DIR="${ENGINE_TEST_GLM_DIR:-$ENGINE_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw}"
+	DRAFT_DIR="${ENGINE_TEST_GLM_DRAFT_DIR:-$ENGINE_MODEL_ROOT/GLM-5.3-Flash-DFlash2}"
 else
-	MODEL_DIR="$VOLTA_MODEL_ROOT/Qwen3.8-27B-exl3"
-	DRAFT_DIR="$VOLTA_MODEL_ROOT/Qwen3.8-27B-DFlash2-EXL3-5.0bpw"
+	MODEL_DIR="$ENGINE_MODEL_ROOT/Qwen3.8-27B-exl3"
+	DRAFT_DIR="$ENGINE_MODEL_ROOT/Qwen3.8-27B-DFlash2-EXL3-5.0bpw"
 fi
 taskset -c 0-9 "$DIR/build/volta_server" --port "$PORT" --host 127.0.0.1 --model-dir "$MODEL_DIR" \
 	--speculative --draft-model-dir "$DRAFT_DIR" --set prefix_interval=1024 > "$LOG" 2>&1 &

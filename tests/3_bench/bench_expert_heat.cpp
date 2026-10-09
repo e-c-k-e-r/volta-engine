@@ -64,7 +64,7 @@ int main( int argc, char** argv ) {
 			ENGINE_ASSERT( mc.model( d ).expert_heat( t, layers, experts, false ), "no expert heat" );
 			heat[pi].insert( heat[pi].end(), t.begin(), t.end() );
 		}
-		mc.rebalance_experts(); // no-op unless EXL3_EXPERT_CACHE tiers the experts
+		mc.rebalance_experts(); // no-op unless ENGINE_EXPERT_CACHE tiers the experts
 	}
 	const size_t per_rank = static_cast<size_t>( layers ) * experts;
 	std::printf( "\n%d prompts, %d tokens each, %d MoE layers x %d local experts x %d ranks\n", total, n_tokens, layers, experts, ENGINE_NUM_GPUS );

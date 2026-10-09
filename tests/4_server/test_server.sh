@@ -8,7 +8,7 @@ echo "========================================================"
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ -f "$DIR/tests/local.env" ] && . "$DIR/tests/local.env"
-: "${VOLTA_MODEL_ROOT:?set VOLTA_MODEL_ROOT (or tests/local.env)}"
+: "${ENGINE_MODEL_ROOT:?set ENGINE_MODEL_ROOT (or tests/local.env)}"
 SERVER_BIN="$DIR/build/volta_server"
 SERVER_LOG="/tmp/volta_server_test.log"
 PORT=8000
@@ -16,11 +16,11 @@ HOST="127.0.0.1"
 # VOLTA_TEST_MODEL=glm5_next runs the same suite against GLM-5.3-Flash
 MODEL="${VOLTA_TEST_MODEL:-qwen3_5}"
 if [ "$MODEL" = "glm5_next" ]; then
-	MODEL_DIR="${EXL3_GLM_DIR:-$VOLTA_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw}"
-	DRAFT_DIR="${EXL3_GLM_DRAFT_DIR:-$VOLTA_MODEL_ROOT/GLM-5.3-Flash-DFlash2}"
+	MODEL_DIR="${ENGINE_TEST_GLM_DIR:-$ENGINE_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw}"
+	DRAFT_DIR="${ENGINE_TEST_GLM_DRAFT_DIR:-$ENGINE_MODEL_ROOT/GLM-5.3-Flash-DFlash2}"
 else
-	MODEL_DIR="$VOLTA_MODEL_ROOT/Qwen3.8-27B-exl3"
-	DRAFT_DIR="$VOLTA_MODEL_ROOT/Qwen3.8-27B-DFlash2-EXL3-5.0bpw"
+	MODEL_DIR="$ENGINE_MODEL_ROOT/Qwen3.8-27B-exl3"
+	DRAFT_DIR="$ENGINE_MODEL_ROOT/Qwen3.8-27B-DFlash2-EXL3-5.0bpw"
 fi
 
 if [ ! -f "$SERVER_BIN" ]; then

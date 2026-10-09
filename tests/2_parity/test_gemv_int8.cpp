@@ -162,8 +162,7 @@ int main() {
 
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	g_int8_on = exl3_gemv_int8_enabled();
-	ENGINE_ASSERT( g_int8_on || std::getenv( "EXL3_INT8_GEMV" ) != nullptr,
-		"EXL3_INT8_GEMV must be set explicitly (0 disables and turns this into a reference run)" );
+	ENGINE_ASSERT( g_int8_on, "the int8 GEMV path is disabled" );
 	std::printf( "[*] int8 GEMV enabled, max K = %d\n", exl3_gemv_int8_max_k( 0 ) );
 
 	cudaStream_t stream;

@@ -3,9 +3,7 @@
 // Host dispatch for the fused int8-activation GEMV (mul1 cb 2 tensors), ported from exllamav3's
 // exl3_gemv_int8.cu / exl3_gemv_int8.cuh and adapted to our CUDA-graph decode path.
 //
-// EXL3_INT8_GEMV selects the mode: 0 disabled, 1 int8 + error-feedback residual pass (~15-16 bit
-// effective activation precision, size_m <= 2), 2 plain int8 (lossy, size_m <= 2). EXL3_INT8_GEMV_MAX_K
-// overrides the per-arch K cap and EXL3_INT8_SMEM=0/1 forces the smem-staged unit off or on.
+// Mode 1 (fixed): int8 + error-feedback residual pass (~15-16 bit effective activation precision, size_m <= 2).
 //
 // Only the per-slice-scale kernel is ported (plain launch, fixed workspace, no grid.sync), so it
 // captures into static graphs. The kernel argument list matches exl3_gemv's, with `locks` replaced by

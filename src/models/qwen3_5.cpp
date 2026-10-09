@@ -147,9 +147,7 @@ bool Qwen3_5Pipeline::init(
 	// projects only its own columns, which takes the 5120 x 248320 LM head off rank 0's critical path.
 	// The shard is padded to a multiple of 256 columns (one extra 128-column Hadamard block for
 	// 62080 -> 62208) so the dp4a int8 GEMV engages; pad columns are excluded from the argmax.
-	// EXL3_LM_SHARD=0 restores the single-rank full-vocabulary head for A/B measurement.
 	shard_lm_ = tp_size > 1;
-	if ( runtime::options().lm_shard >= 0 ) shard_lm_ = ( runtime::options().lm_shard != 0 );
 	tp_size_ = shard_lm_ ? tp_size : 1;
 	lm_shard_real_cols_ = config_.vocab_size / tp_size_;
 	int pad_cols = 0;

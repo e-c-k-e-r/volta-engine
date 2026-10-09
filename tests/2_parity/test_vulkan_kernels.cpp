@@ -1,5 +1,5 @@
 // Slang SPIR-V kernels executed through the Vulkan backend on a real device, compared with FP64 references.
-// Skips (exit 0) when no Vulkan device with the required features exists. Device: VOLTA_VK_DEVICE (default 0).
+// Skips (exit 0) when no Vulkan device with the required features exists. Device: ENGINE_VK_DEVICE (default 0).
 #include "engine/backend/vulkan/device.h"
 #include "engine/backend/numeric.h"
 

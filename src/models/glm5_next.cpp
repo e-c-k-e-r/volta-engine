@@ -83,11 +83,10 @@ bool Glm5NextPipeline::init(
 
 	const int R = pod::MAX_ROWS;
 	const int S = config_.max_slots;
-	// Routed experts: sharded over the ranks (every rank holds a quarter of every expert's intermediate width, EXL3_MOE_TP,
+	// Routed experts: sharded over the ranks (every rank holds a quarter of every expert's intermediate width, moe_tp,
 	// default) or expert-parallel (72 whole experts per rank, forced by the two-tier expert cache). The sharded layout balances
 	// the load: each active expert costs every rank the same, where expert-parallel waits for the rank that drew the most.
-	moe_tp_ = runtime::options().moe_tp
-		&& engine::modules::ExpertTier::env_fraction() >= 1.0 && config_.tp_size == ENGINE_NUM_GPUS;
+	moe_tp_ = engine::modules::ExpertTier::env_fraction() >= 1.0 && config_.tp_size == ENGINE_NUM_GPUS;
 	const int E_local = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
 
 	// 1. Router outputs + routed-MoE dispatch scratch
@@ -148,8 +147,7 @@ bool Glm5NextPipeline::init(
 
 	// 3. MLA KV cache pool [S, 11, max_seq, 16 * 256] FP16 & execution buffers
 	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
-	latent_ = runtime::options().mla_latent;
-	if ( latent_ ) {
+	{
 		latent_slot_stride_ = static_cast<size_t>( config_.num_mla_layers ) * config_.max_seq * 512;
 		latent_cache_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * latent_slot_stride_ * sizeof( backend::half_t ), 128 ) );
 		ENGINE_ASSERT( latent_cache_ != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the latent cache" );
@@ -178,10 +176,6 @@ bool Glm5NextPipeline::init(
 			backend::memset_sync( dsa_plane_, 0, static_cast<size_t>( S ) * dsa_plane_stride_ * sizeof( backend::half_t ) );
 			backend::memset_sync( dsa_pool_, 0, static_cast<size_t>( S ) * dsa_pool_stride_ * sizeof( backend::half_t ) );
 		}
-	}
-	else {
-		dsa_ = false;
-		kv_pool_.init( rank_, arena, S, config_.max_seq, config_.num_mla_layers, 16, 256 );
 	}
 
 	int q_lora_shape[2] = { R, 1536 };
@@ -316,8 +310,6 @@ bool Glm5NextPipeline::init(
 
 bool Glm5NextPipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
 	Glm5NextConfig config;
-	// The expanded per-head cache costs 16x the latent: without the latent path the window defaults to 2K
-	if ( !runtime::options().mla_latent ) config.max_seq = 2048;
 	if ( runtime::options().max_seq > 0 ) config.max_seq = runtime::options().max_seq;  // context window (KV pool size)
 	if ( runtime::options().max_slots > 0 ) config.max_slots = runtime::options().max_slots;
 	return init( config, device_id, arena, ring );
@@ -356,12 +348,7 @@ bool Glm5NextPipeline::expert_heat( std::vector<uint32_t>& out, int& layers, int
 void Glm5NextPipeline::reset_state( int slot_id ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Glm5NextPipeline::reset_state: slot out of range" );
 	backend::set_device( rank_ );
-	if ( latent_ ) {
-		backend::memset_sync( latent_cache_ + static_cast<size_t>( slot_id ) * latent_slot_stride_, 0, latent_slot_stride_ * sizeof( backend::half_t ) );
-	}
-	else {
-		kv_pool_.reset_slot( slot_id );
-	}
+	backend::memset_sync( latent_cache_ + static_cast<size_t>( slot_id ) * latent_slot_stride_, 0, latent_slot_stride_ * sizeof( backend::half_t ) );
 	const size_t slot_kda = state_.slot_kda_floats;
 	const size_t slot_conv = state_.slot_conv_floats;
 	backend::memset_sync( state_.kda_states + slot_id * slot_kda, 0, slot_kda * sizeof( float ) );
@@ -503,7 +490,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.o_proj", L );
 			lw.o_proj = repo.load_linear_slice( name_buf, *arena_, 5, 0, rank_, config_.tp_size, stream );
 
-			if ( latent_ && dsa_ ) {
+			if ( dsa_ ) {
 				char pre[160];
 				std::snprintf( pre, sizeof( pre ), "model.language_model.layers.%d.self_attn.indexer", L );
 				std::snprintf( name_buf, sizeof( name_buf ), "%s.wq_b", pre );
@@ -543,7 +530,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			auto& mw = lw.moe_weights;
 			mw.type = pod::QuantType::TRELLIS;
 			mw.num_local_experts = experts_per_rank;
-			// Tiered experts (EXL3_EXPERT_CACHE < 1): the codes of resident experts go to device slots, the rest to pinned host memory
+			// Tiered experts (ENGINE_EXPERT_CACHE < 1): the codes of resident experts go to device slots, the rest to pinned host memory
 			const double tier_fraction = engine::modules::ExpertTier::env_fraction();
 			int tier_layer = -1;
 			if ( tier_fraction < 1.0 ) {
@@ -864,9 +851,7 @@ void Glm5NextPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 
 void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 	// Slot-0 base pointers; slot and position of each row are resolved on device from d_rows_
-	const pod::KVRef kv = kv_pool_.ref();
-	const size_t kv_slot_stride = latent_ ? latent_slot_stride_ : kv_pool_.slot_stride_elems;
-	const pod::SlotRef kv_ref{ d_rows_, 0, kv_slot_stride };
+	const pod::SlotRef kv_ref{ d_rows_, 0, latent_slot_stride_ };
 	const size_t slot_kda_floats = state_.slot_kda_floats;
 	const size_t slot_conv_floats = state_.slot_conv_floats;
 	const int snap_rows = MIN( m, kDraftM );
@@ -987,7 +972,7 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 				kv_lora_buf_, lw.kv_a_norm, kv_lora_norm_buf_, 1e-5f, 0.0f, stream
 			);
 
-			if ( latent_ ) {
+			{
 				// Absorbed: cache the normalized latent, attend in latent space, expand the value side per head
 				pod::TensorView q_lat = q_lat_, o_lat = o_lat_;
 				q_lat.shape[0] = m;
@@ -1057,23 +1042,6 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 					}
 				}
 				engine::modules::MLALatent::expand_out( o_lat, lw.kv_b_proj, mla_heads_out_, 16, m, stream );
-			}
-			else {
-				engine::modules::MLA::project_kv_b(
-					kv_lora_norm_buf_, lw.kv_b_proj, k_head_buf_, v_head_buf_,
-					16, 256, stream, m
-				);
-
-				// Store every row's K/V first, then attend: row r reads positions 0..pos[r] of its slot
-				engine::modules::MLA::store_kv_cache(
-					kv, k_head_buf_, v_head_buf_,
-					mla_idx, 0, 4096, config_.max_seq, stream, kv_ref, m
-				);
-
-				engine::modules::MLA::forward_decode(
-					q_buf_, kv, mla_heads_out_,
-					mla_idx, 0, 16, 256, config_.max_seq, stream, kv_ref, m, key_hint_
-				);
 			}
 
 			// Project output: o_proj -> ring_->all_reduce across the 4 ranks
@@ -1258,7 +1226,7 @@ size_t Glm5NextPipeline::tap_snapshot_bytes( int tokens ) const {
 }
 
 size_t Glm5NextPipeline::seq_state_bytes( int from, int tokens, bool with_taps ) const {
-	if ( !latent_ || !dsa_ || from < 0 || tokens < from || tokens > config_.max_seq ) return 0;
+	if ( !dsa_ || from < 0 || tokens < from || tokens > config_.max_seq ) return 0;
 	const int pool = engine::modules::DSA::POOL;
 	const size_t recurrent = ( state_.slot_kda_floats + state_.slot_conv_floats ) * sizeof( float );
 	const size_t planes = dsa_plane_stride_ * sizeof( backend::half_t );

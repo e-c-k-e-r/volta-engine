@@ -38,7 +38,7 @@ struct ExpertTier {
 	uint64_t swaps = 0, window_routes = 0, window_hits = 0;
 	int max_swaps = 4;
 
-	// EXL3_EXPERT_CACHE: fraction of each layer's experts kept resident (1 or unset: tiering off)
+	// ENGINE_EXPERT_CACHE: fraction of each layer's experts kept resident (1 or unset: tiering off)
 	static double env_fraction();
 
 	bool active() const { return resident < experts; }

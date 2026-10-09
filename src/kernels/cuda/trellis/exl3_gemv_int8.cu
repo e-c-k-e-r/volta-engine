@@ -26,34 +26,23 @@ void exl3_gemv_int8_reset_caches() {
 
 namespace {
 
-int env_int( const char* name, int dflt ) {
-	const char* e = std::getenv( name );
-	if ( !e ) return dflt;
-	int v = atoi( e );
-	return v;
-}
-
 // 0: disabled; 1: int8 + error-feedback residual pass (~15-16 bit activation precision);
 // 2: plain int8 (cheaper, lossy).
 int int8_mode() {
-	static int mode = env_int( "EXL3_INT8_GEMV", 1 );
-	return mode;
+	return 1;
 }
 
 // Smem-staged unit routing. Upstream measured K = 3, 5, 7 on Ampere, where cp.async hides the
 // staging cost. ptx.cuh degrades cp_async to a synchronous global->register->shared copy below
-// sm_80, so the staged unit is a net loss on Volta for K = 5 and EXL3_INT8_SMEM overrides.
+// sm_80, so the staged unit is a net loss on Volta for K = 5.
 bool int8_smem_for( int bits ) {
-	static int forced = env_int( "EXL3_INT8_SMEM", -1 );
-	if ( forced >= 0 ) return forced == 1;
 	return gemv_int8_stage_smem( bits );
 }
 
 // Highest K the int8 path accepts. Measured on V100: 4 bpw MLP 57.7 -> 51.5 us and 5 bpw 85.6 ->
 // 75.9 us in residual mode, both wins; above this the fp16 tensor-core path wins.
 int int8_max_k() {
-	static int k = env_int( "EXL3_INT8_GEMV_MAX_K", 5 );
-	return MIN( k, 8 );
+	return 5;
 }
 
 template <int bits, int M, bool c_fp32, bool residual, bool stage_smem>

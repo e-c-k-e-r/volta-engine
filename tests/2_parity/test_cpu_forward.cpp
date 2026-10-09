@@ -21,10 +21,10 @@ int main( int argc, char** argv ) {
 		std::printf( "usage: test_cpu_forward --dump|--check <dir> [--model <dir>]\n" );
 		return 2;
 	}
-	::setenv( "EXL3_TP", "1", 1 );
+	::setenv( "ENGINE_TP", "1", 1 );
 #if ENGINE_BACKEND_VULKAN
 	// The reference trellis linear dequantizes a whole weight into device scratch (2.4 GiB for the 5120 x 248320 head)
-	::setenv( "EXL3_VRAM_RESERVE_MIB", "6000", 0 );
+	::setenv( "ENGINE_VRAM_RESERVE_MIB", "6000", 0 );
 #endif
 	ModelCluster mc;
 	ClusterConfig cfg;

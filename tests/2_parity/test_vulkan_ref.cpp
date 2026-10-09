@@ -1,6 +1,6 @@
 // Portable reference kernels (ref_gemm_f16, ref_trellis_reconstruct, ref_had128, ref_attn_decode, ref_latent_decode) as SPIR-V through
 // the Vulkan layer on a real device, compared with FP64 references. Also reports each Params block against the push-constant limit.
-// Skips (exit 0) when no Vulkan device with the required features exists. Device: VOLTA_VK_DEVICE (default 0).
+// Skips (exit 0) when no Vulkan device with the required features exists. Device: ENGINE_VK_DEVICE (default 0).
 #include "engine/backend/numeric.h"
 #include "engine/backend/vulkan/device.h"
 

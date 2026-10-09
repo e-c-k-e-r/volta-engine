@@ -2,7 +2,7 @@
 # (architecture/dflash2.py, modules/arch_specific/dflash2.py) and 1Cat-vLLM (qwen3_dflash2.py), NOT from the
 # engine, so it can catch errors a self-written reference would share (it found the interleaved-RoPE bug).
 #
-#   ENGINE_DEBUG_DUMP_DRAFT=<round> ./build/bench_accept --prompts 1 --tokens 96     # writes /tmp/draft_dump.bin
+#   ENGINE_DEBUG_DUMP_DRAFT_ROUND=<round> ./build/bench_accept --prompts 1 --tokens 96     # writes /tmp/draft_dump.bin
 #   <exllamav3>/.venv/bin/python tests/2_parity/draft_oracle.py              # per-row cosine vs the engine
 #
 # Expect cos >= ~0.998 per row against the 5-bit drafter (BF16 oracle weights, FP32 math). VAR= takes
@@ -11,7 +11,7 @@
 # Independent from-scratch torch version of the DFlash2 drafter (semantics from exllamav3 dflash2.py and
 # 1Cat-vLLM qwen3_dflash2.py), compared against the engine's dumped draft hidden for the same round.
 import os
-ROOT = os.environ.get("VOLTA_MODEL_ROOT", "")
+ROOT = os.environ.get("ENGINE_MODEL_ROOT", "")
 import json, struct, sys, torch, numpy as np
 from safetensors import safe_open
 dev = "cuda:0"

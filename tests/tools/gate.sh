@@ -37,6 +37,8 @@ static_checks() {
 	echo "module/spec headers with <cuda_*> includes: $(grep -rln '#include <cuda_' $ROOT/inc/engine/modules $ROOT/inc/engine/spec 2>/dev/null | wc -l)"
 	echo "kernel launches in models: $(grep -c '<<<' $ROOT/src/models/*.cpp 2>/dev/null | tr '\n' ' ')"
 	ninja > $out/build.log 2>&1 || { echo "build FAILED"; bad=1; }
+	# docs/CONFIG.md is generated from the option table
+	./volta_server --print-config-docs | diff -q - $ROOT/docs/CONFIG.md > /dev/null || { echo "docs/CONFIG.md is stale (volta_server --print-config-docs > docs/CONFIG.md)"; bad=1; }
 	# CPU configuration: configures without CUDA, builds, smoke test passes
 	cmake -S $ROOT -B $ROOT/build_cpu -G Ninja -DENGINE_BACKEND=CPU > $out/cpu_cmake.log 2>&1 && ninja -C $ROOT/build_cpu test_cpu_smoke > $out/cpu_build.log 2>&1 && $ROOT/build_cpu/test_cpu_smoke > $out/cpu_smoke.log 2>&1 || { echo "CPU configuration FAILED (see $out/cpu_*.log)"; bad=1; }
 	# CPU and Vulkan configurations: build the op-level tests and smoke tests used by `parity`
@@ -57,8 +59,8 @@ tier2() {
 	run jinja_chat_templates ./test_jinja
 	run output_parser ./test_output_parser
 	run tokenizer ./test_tokenizer
-	run tokenizer_cases_qwen ./test_tokenizer_file $VOLTA_MODEL_ROOT/Qwen3.8-27B-exl3 --cases $ROOT/tests/data/tokenizer_cases_qwen3_5.json
-	run tokenizer_cases_glm ./test_tokenizer_file $VOLTA_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
+	run tokenizer_cases_qwen ./test_tokenizer_file $ENGINE_MODEL_ROOT/Qwen3.8-27B-exl3 --cases $ROOT/tests/data/tokenizer_cases_qwen3_5.json
+	run tokenizer_cases_glm ./test_tokenizer_file $ENGINE_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
 	run backend_tiers ./test_backend_tiers $ROOT
 	run ref_linear_host ./test_ref_linear
 	run ref_linear_gpu gpu ./test_ref_linear --gpu
@@ -79,7 +81,7 @@ tier2() {
 	run coherence gpu ./test_coherence
 	run prefix_restore gpu ./test_prefix_restore
 	run prefix_restore_spec gpu ./test_prefix_restore --spec
-	run prefix_restore_fp8 sh -c "EXL3_KV=fp8 taskset -c 0-9 ./test_prefix_restore"
+	run prefix_restore_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore"
 	run prefix_restore_glm gpu ./test_prefix_restore --glm
 	run sampling_qwen gpu ./test_sampling_gpu
 	run sampling_glm gpu ./test_sampling_gpu --glm

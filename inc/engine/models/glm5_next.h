@@ -35,7 +35,7 @@ struct Glm5NextConfig {
 	int vocab_size = 154880;
 	int tp_size = 4;
 	int max_seq = 12288;
-	int max_slots = 1; // absorbed MLA latent cache: ~135 MiB/slot/rank at 12K (expanded K/V: 369 MiB at 2K); weights fill the 31 GiB arena and the FP16 drafter needs the last GiB (EXL3_MAX_SEQ=32768 fits without it, 16384 with the EXL3 drafter)
+	int max_slots = 1; // absorbed MLA latent cache: ~135 MiB/slot/rank at 12K (expanded K/V: 369 MiB at 2K); weights fill the 31 GiB arena and the FP16 drafter needs the last GiB (ENGINE_MAX_SEQ=32768 fits without it, 16384 with the EXL3 drafter)
 	int num_mla_layers = 11;
 	int kda_heads = 16;
 	int kda_head_dim = 128;
@@ -159,7 +159,7 @@ public:
 
 	const DraftHooks& draft_hooks() const override { return draft_hooks_; }
 	bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) override;
-	// EXL3_EXPERT_CACHE < 1: fold the routing counters into the experts' scores and move hot experts into the device tier
+	// ENGINE_EXPERT_CACHE < 1: fold the routing counters into the experts' scores and move hot experts into the device tier
 	bool rebalance_experts( backend::stream_t stream = nullptr ) override;
 	void draft_head_topk( int rows, backend::stream_t stream = nullptr ) override;
 	void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) override;
@@ -197,19 +197,17 @@ private:
 	pod::BatchRows* d_rows_ = nullptr;
 	engine::core::GraphCache graphs_;
 
-	engine::runtime::KVCachePool kv_pool_;
-	// Absorbed MLA (EXL3_MLA_LATENT, default on): the cache holds the 512-wide KV latent per token, shared by all heads,
+	// Absorbed MLA: the cache holds the 512-wide KV latent per token, shared by all heads,
 	// instead of expanded per-head K / V (1 KiB vs 16 KiB per token per layer, so kv_pool_ is not allocated)
 	bool moe_tp_ = true;                // routed experts sharded over the ranks instead of expert-parallel
 	engine::modules::ExpertTier tier_;
 	pod::MemoryArena host_arena_{};     // pinned cold-expert tier
 	int tier_layers_ = 0;
-	bool latent_ = true;
 	backend::half_t* latent_cache_ = nullptr;    // [slots][mla layers][max_seq][512]
 	size_t latent_slot_stride_ = 0;   // elements per slot
 	float* latent_ws_ = nullptr;      // split-KV partials
 	pod::TensorView q_lat_;           // [rows, 16 * 512]
-	// DSA (EXL3_DSA, default on with the latent cache): indexer planes and selection scratch
+	// DSA (ENGINE_DSA, default on with the latent cache): indexer planes and selection scratch
 	bool dsa_ = true;
 	backend::half_t* dsa_plane_ = nullptr;       // [slots][mla layers][DSA::PLANE_CAP][256]  ring of per-token [k_norm | gate]
 	backend::half_t* dsa_pool_ = nullptr;        // [slots][mla layers][max_seq / 4][128]  pooled keys

@@ -5,7 +5,7 @@
 // real numbers. That is the whole reason the drafter can be structurally correct and still accept
 // poorly: a mis-decoded `fc` corrupts every context row the drafter reads.
 //
-// The reference here is $VOLTA_MODEL_ROOT/Qwen3.8-27B-DFlash2, the same drafter before
+// The reference here is $ENGINE_MODEL_ROOT/Qwen3.8-27B-DFlash2, the same drafter before
 // quantization (81 BF16 tensors, `fc.weight` plus the 35 block projections unquantized). Its weights
 // have max |w| = 20.875, comfortably inside FP16's 65504, and BF16 carries 7 mantissa bits against
 // FP16's 10, so BF16 -> FP16 is exact for normals. No new kernel is needed to read it: the loader

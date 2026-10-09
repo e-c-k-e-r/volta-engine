@@ -2,7 +2,7 @@
 // tokens, snapshots the slot (recurrent state + KV rows), restores into other slots and prefills only the tail; the
 // next-token candidates and 16 greedy continuation tokens must match the cold run. An aligned cut (a multiple of the
 // prefill chunk) reproduces the cold chunk boundaries and must match bit for bit.
-//   test_prefix_restore [--glm] [--spec] [--tokens N]   (EXL3_KV=fp8|k8v4|nvfp4 selects a quantized KV cache on Qwen)
+//   test_prefix_restore [--glm] [--spec] [--tokens N]   (ENGINE_KV_FORMAT=fp8|k8v4|nvfp4 selects a quantized KV cache on Qwen)
 #include "engine/runtime/test_driver.h"
 #include "engine/runtime/prefix_cache.h"
 #include "engine/loader/tokenizer.h"

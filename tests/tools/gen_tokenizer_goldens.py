@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Regenerates tests/data/tokenizer_cases_<model>.json with the reference HF `tokenizers` output for a corpus of
 # awkward texts (code, markdown, unicode, whitespace runs, CRLF, digits, contractions, marks, emoji).
-#   <venv with tokenizers>/python tests/tools/gen_tokenizer_goldens.py $VOLTA_MODEL_ROOT
+#   <venv with tokenizers>/python tests/tools/gen_tokenizer_goldens.py $ENGINE_MODEL_ROOT
 import json, os, random, sys
 from tokenizers import Tokenizer
 

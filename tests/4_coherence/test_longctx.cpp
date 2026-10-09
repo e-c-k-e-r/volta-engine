@@ -1,5 +1,5 @@
 // Long-context needle retrieval: a filler prompt of ~N tokens with a secret code buried at a given depth, greedy
-// (or speculative) decode, and a check that the answer carries the code. Context window set by EXL3_MAX_SEQ (Qwen).
+// (or speculative) decode, and a check that the answer carries the code. Context window set by ENGINE_MAX_SEQ (Qwen).
 //   test_longctx [--glm] [--tokens N] [--depth PCT] [--spec]
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"

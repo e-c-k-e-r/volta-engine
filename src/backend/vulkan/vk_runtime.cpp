@@ -1,5 +1,5 @@
 // Vulkan backend implementation: headless compute device, BDA allocations, streams as deferred command buffers, graphs as
-// pre-recorded command buffers. One logical device per process (selected by VOLTA_VK_DEVICE or set_device), single-threaded.
+// pre-recorded command buffers. One logical device per process (selected by ENGINE_VK_DEVICE or set_device), single-threaded.
 #include "engine/backend/vulkan/device.h"
 
 #include <vulkan/vulkan.h>
@@ -84,7 +84,7 @@ namespace {
 bool init_context() {
 	if ( g.tried ) return g.ok;
 	g.tried = true;
-	if ( const char* e = std::getenv( "VOLTA_VK_DEVICE" ) ) g.device_index = std::atoi( e );
+	if ( const char* e = std::getenv( "ENGINE_VK_DEVICE" ) ) g.device_index = std::atoi( e );
 
 	VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
 	app.pApplicationName = "volta-engine";
@@ -160,7 +160,7 @@ bool init_context() {
 }
 
 Ctx& ctx() {
-	ENGINE_ASSERT( init_context(), "Vulkan backend: no usable Vulkan device (check VOLTA_VK_DEVICE)" );
+	ENGINE_ASSERT( init_context(), "Vulkan backend: no usable Vulkan device (check ENGINE_VK_DEVICE)" );
 	return g;
 }
 
@@ -348,7 +348,7 @@ void set_device( int device ) {
 	if ( !g.tried ) {
 		g.device_index = device;
 		std::string v = std::to_string( device );
-		setenv( "VOLTA_VK_DEVICE", v.c_str(), 1 );
+		setenv( "ENGINE_VK_DEVICE", v.c_str(), 1 );
 		ctx();
 		g.default_stream = make_stream();
 		return;

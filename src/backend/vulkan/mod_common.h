@@ -17,7 +17,7 @@ inline uint64_t dp( const void* p ) { return reinterpret_cast<uint64_t>( p ); }
 inline uint64_t rows_slot( const pod::BatchRows* r ) { return dp( r ) + offsetof( pod::BatchRows, slot ); }
 inline uint64_t rows_pos( const pod::BatchRows* r ) { return dp( r ) + offsetof( pod::BatchRows, pos ); }
 
-// Pipeline of <spv dir>/<name>.spv (env VOLTA_SPV_DIR overrides the build directory), created once. Aborts when missing
+// Pipeline of <spv dir>/<name>.spv (env ENGINE_SPV_DIR overrides the build directory), created once. Aborts when missing
 vk::Pipeline* kernel( const char* name, uint32_t push_bytes );
 
 // Device scratch buffer of at least `bytes` for slot `slot`; grows by reallocation (syncs `stream` first: recorded commands may reference the old buffer)

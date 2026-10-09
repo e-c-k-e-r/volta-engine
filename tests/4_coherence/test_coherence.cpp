@@ -41,7 +41,7 @@ std::vector<Case> qwen_cases() {
 			{ 248045, 846, 198, 3710, 369, 279, 6511, 314, 6124, 30, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271 },
 			{ 760, 6511, 314, 6124, 369, 2972, 51076, 15560, 159034, 248046 }, "Tokyo", false, 0 },
 	};
-	if ( getenv( "EXL3_DFLASH2_REASONING_PROBE" ) ) {
+	if ( getenv( "ENGINE_TEST_REASONING_PROBE" ) ) {
 		// Natural-reasoning prompt: no thinking-suppression instruction, so the target stays inside the
 		// trace distribution DFlash2 was trained on. Assert only that decoding runs; we are measuring
 		// acceptance against the target, not matching a recorded golden.
@@ -68,10 +68,10 @@ std::vector<Case> glm_cases() {
 	};
 }
 
-// EXL3_KV selects a quantized KV cache. The recorded goldens are FP16-KV greedy outputs, so a quantized cache is judged
+// ENGINE_KV_FORMAT selects a quantized KV cache. The recorded goldens are FP16-KV greedy outputs, so a quantized cache is judged
 // by the expected answer in plain decoding and Mode B, and speculation must match greedy decoding in the same format.
 bool kv_quantized() {
-	const char* e = getenv( "EXL3_KV" );
+	const char* e = getenv( "ENGINE_KV_FORMAT" );
 	return e != nullptr && std::strcmp( e, "fp16" ) != 0;
 }
 
@@ -143,7 +143,7 @@ int run_model( const char* type, const char* dir, const char* draft, const std::
 	cfg.model_dir = dir;
 	if ( spec ) cfg.draft_model_dir = draft;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
-	if ( spec && getenv( "EXL3_DFLASH2_PROFILE" ) ) mc.spec().set_profile( true );
+	if ( spec && getenv( "ENGINE_TEST_DFLASH2_PROFILE" ) ) mc.spec().set_profile( true );
 	engine::loader::Tokenizer tok;
 	tok.load( dir );
 
@@ -175,7 +175,7 @@ int run_model( const char* type, const char* dir, const char* draft, const std::
 		}
 		std::printf( "\n" );
 	}
-	if ( spec && getenv( "EXL3_DFLASH2_PROFILE" ) ) mc.spec().profile_dump();
+	if ( spec && getenv( "ENGINE_TEST_DFLASH2_PROFILE" ) ) mc.spec().profile_dump();
 	if ( !spec && mc.metadata().max_slots >= static_cast<int>( cases.size() ) ) {
 		fail += run_concurrent( mc, cases, tok );
 	}

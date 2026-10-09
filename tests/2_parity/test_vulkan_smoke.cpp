@@ -1,6 +1,6 @@
 // Vulkan configuration smoke test: module entry points (the ones tagged Portable in tier_table.inc) run through the MODULE API on a
 // Vulkan device (TensorViews over device_malloc'd memory, upload / download through the runtime layer) and compared with FP64
-// references. Skips (exit 0) when no Vulkan device with the required features exists. Device: VOLTA_VK_DEVICE (default 0).
+// references. Skips (exit 0) when no Vulkan device with the required features exists. Device: ENGINE_VK_DEVICE (default 0).
 #include "engine/backend/numeric.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/vulkan/device.h"
