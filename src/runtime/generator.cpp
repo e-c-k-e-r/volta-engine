@@ -103,6 +103,7 @@ void Generator::admit_pending() {
 		slot.sp.top_k = MAX( 1, MIN( slot.req.top_k, kSampleTopK ) );
 		slot.sp.seed = slot.req.seed != 0 ? slot.req.seed : ( 0x51ED270B0F5A8C3DULL ^ slot.req.req_id );
 		slot.rng.reseed( slot.sp.seed );
+		slot.in_reasoning = slot.req.starts_in_reasoning;
 		slot.metrics.start_time = std::chrono::steady_clock::now();
 	}
 }
@@ -122,6 +123,7 @@ void Generator::scheduler_loop() {
 			continue;
 		}
 		step_batch();
+		for ( int s = 0; s < num_slots_; ++s ) apply_forced_close( s );
 	}
 }
 
@@ -138,6 +140,10 @@ bool Generator::emit_token( int s, int tok ) {
 		reason = FinishReason::Length;
 	}
 
+	if ( slot.in_reasoning && !eos ) {
+		if ( tok == slot.req.think_close_id ) slot.in_reasoning = false;
+		else if ( slot.req.reasoning_budget > 0 && ++slot.reasoning_tokens >= slot.req.reasoning_budget ) slot.force_close = true;
+	}
 	std::string out;
 	if ( !eos ) slot.held_text += tokenizer_.decode_token_fast( tok );
 	if ( !slot.req.stop_strings.empty() ) {
@@ -231,6 +237,8 @@ void Generator::prefill_slot( int s ) {
 	// prefix_interval tokens of a long prompt. Each stores only the KV rows since the previous one.
 	if ( prefix_cache_ && n >= kPrefixMinTokens ) {
 		std::vector<GenerationRequest::Checkpoint> cps = slot.req.checkpoint_at;
+		const int align = cluster_.snapshot_align();
+		for ( auto& cp : cps ) cp.pos -= cp.pos % align;
 		const int interval = runtime::options().prefix_interval;
 		for ( int p = interval; interval > 0 && p < n - kPrefixMinTokens; p += interval ) cps.push_back( { p, false, false } );
 		std::sort( cps.begin(), cps.end(), []( const GenerationRequest::Checkpoint& a, const GenerationRequest::Checkpoint& b ) { return a.pos < b.pos || ( a.pos == b.pos && a.pinned > b.pinned ); } );
@@ -266,6 +274,25 @@ PrefixCache::Entry* Generator::store_prefix( int s, PrefixCache::Entry* parent, 
 	ModelCluster::SeqSnapshot snap;
 	if ( !cluster_.save_snapshot( s, parent ? static_cast<int>( parent->tokens.size() ) : 0, tokens, &snap, with_taps ) ) return nullptr;
 	return prefix_cache_->insert( parent, key, snap, pinned );
+}
+
+// The reasoning budget ran out: feed the closing tokens as if the model had written them (anchor first, then all but the
+// last close token as a short prefill), emit them, and let the model continue with the answer.
+void Generator::apply_forced_close( int s ) {
+	Slot& slot = slots_[s];
+	if ( !slot.active || !slot.force_close ) return;
+	slot.force_close = false;
+	slot.in_reasoning = false;
+	const std::vector<int>& close = slot.req.reasoning_close;
+	if ( close.empty() || slot.current_pos + static_cast<int>( close.size() ) + pod::MAX_BATCH >= cluster_.metadata().max_seq_len ) return;
+	std::vector<int> feed = { slot.last_token };
+	feed.insert( feed.end(), close.begin(), close.end() - 1 );
+	cluster_.prefill( feed.data(), static_cast<int>( feed.size() ), s, 0, nullptr, slot.current_pos );
+	slot.current_pos += static_cast<int>( feed.size() );
+	slot.last_token = close.back();
+	for ( int t : close ) {
+		if ( emit_token( s, t ) ) return;
+	}
 }
 
 void Generator::step_batch() {

@@ -19,7 +19,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		return false;
 	}
 	const bool is_glm = ( cfg.model_type == "glm5_next" );
-	// EXL3_ARENA_GIB overrides the per-GPU arena. The default of 10 GiB is sized for the quantized
+	// EXL3_ARENA_GIB overrides the per-GPU arena. The default of 16 GiB (Qwen: 8 slots x 32K FP16 KV is 4 GiB per rank) is sized for the quantized
 	// drafter; loading the unquantized one needs roughly twice the weight bytes.
 	const auto& opt = runtime::options();
 	const bool arena_env = opt.arena_gib >= 0;
@@ -34,7 +34,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	// less a reserve for what lives outside the arena (graphs, trellis workspace, collective scratch, CUDA context).
 	// EXL3_VRAM_RESERVE_MIB overrides the reserve; EXL3_ARENA_GIB or cfg.arena_bytes still win.
 	size_t arena_bytes = cfg.arena_bytes ? cfg.arena_bytes
-		: ( arena_env ? static_cast<size_t>( opt.arena_gib ) : ( is_glm ? glm_gib : 10ULL ) )
+		: ( arena_env ? static_cast<size_t>( opt.arena_gib ) : ( is_glm ? glm_gib : 16ULL ) )
 			* 1024 * 1024 * 1024;
 	if ( tp_ == 1 && !cfg.arena_bytes && !arena_env ) {
 		const size_t reserve = ( opt.vram_reserve_mib >= 0 ? static_cast<size_t>( opt.vram_reserve_mib ) : 1536ULL ) * 1024 * 1024;

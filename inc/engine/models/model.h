@@ -148,6 +148,8 @@ public:
 	virtual void set_snapshot_taps( bool on ) { (void) on; }
 	// A snapshot covers positions [from, tokens): the recurrent state and tap rows at `tokens` plus only the KV rows of that
 	// range, so a chain of snapshots (from = the parent's tokens) stores each KV row once. load with kv_only skips the state.
+	// Snapshot positions must be multiples of this (GLM builds a pooled index key per 4 tokens; a prefill resumed mid-block would pool only part of it)
+	virtual int seq_align() const { return 1; }
 	// with_taps: also store the drafter tap rows (only meaningful after set_snapshot_taps); a snapshot without them resumes a
 	// slot that cannot speculate.
 	virtual size_t seq_state_bytes( int from, int tokens, bool with_taps ) const { (void) from; (void) tokens; (void) with_taps; return 0; }

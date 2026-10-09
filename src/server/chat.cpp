@@ -190,6 +190,12 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	g.top_k = req.top_k > 0 ? req.top_k : cfg.default_top_k;
 	g.seed = req.seed;
 	g.stop_strings = req.stop;
+	g.starts_in_reasoning = in_reasoning;
+	if ( in_reasoning && req.thinking_budget > 0 ) {
+		g.reasoning_budget = req.thinking_budget;
+		g.reasoning_close = gen.tokenizer().encode( family == engine::loader::ModelFamily::GLM ? "</think>" : "\n</think>\n\n", false );
+		g.think_close_id = gen.tokenizer().get_special_token( "</think>" );
+	}
 	// Prefix cache points. Root: the end of the system block (before the first user turn), shared by every conversation of
 	// this client. Turn boundary: the start of the generation prompt; the next turn's prompt re-renders the assistant
 	// reply there, so the end of the whole prompt is never a prefix of it but this boundary is.

@@ -39,7 +39,7 @@ struct Qwen3_5Config {
 	int linear_num_v_heads = 48;
 	int linear_head_dim = 128;
 	int linear_channels = 10240; // 16*128 + 16*128 + 48*128
-	int max_seq = 8192;
+	int max_seq = 32768;   // context window (KV pool size per slot); raise it with the max_seq option
 	int max_slots = 8;
 	int vocab_size = 248320;
 	float rms_norm_eps = 1e-6f;
@@ -206,6 +206,7 @@ private:
 	DraftHooks draft_hooks_;
 	pod::TensorView draft_taps_;         // [taps_cap, 5 * hidden]
 	size_t tap_snapshot_bytes( int tokens ) const;
+	void copy_kv_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	bool snap_taps_ = false;             // sequence snapshots include the tap ring rows
 	pod::TensorView draft_lm_logits_;    // [kDraftM, lm_shard_cols]
 	static constexpr int kTopkTile = 4096;   // TOPK_THREADS * 16

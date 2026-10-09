@@ -79,6 +79,8 @@ tier2() {
 	run coherence gpu ./test_coherence
 	run prefix_restore gpu ./test_prefix_restore
 	run prefix_restore_spec gpu ./test_prefix_restore --spec
+	run prefix_restore_fp8 sh -c "EXL3_KV=fp8 taskset -c 0-9 ./test_prefix_restore"
+	run prefix_restore_glm gpu ./test_prefix_restore --glm
 	run sampling_qwen gpu ./test_sampling_gpu
 	run sampling_glm gpu ./test_sampling_gpu --glm
 }

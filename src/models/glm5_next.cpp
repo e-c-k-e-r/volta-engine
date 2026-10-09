@@ -1249,4 +1249,75 @@ void Glm5NextPipeline::destroy() {
 	}
 }
 
+// -- Sequence snapshots (prefix cache), absorbed-MLA + DSA configuration only. Host layout: [KDA states][conv history]
+// [DSA planes][tap rows][per MLA layer: latent rows, then pooled index keys for positions [from, tokens)]. The plane is a
+// small ring of recent per-token index rows (the whole slot is stored; it is part of the state, not of the segment).
+size_t Glm5NextPipeline::tap_snapshot_bytes( int tokens ) const {
+	if ( !snap_taps_ ) return 0;
+	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * 5 * config_.hidden_size * sizeof( backend::half_t );
+}
+
+size_t Glm5NextPipeline::seq_state_bytes( int from, int tokens, bool with_taps ) const {
+	if ( !latent_ || !dsa_ || from < 0 || tokens < from || tokens > config_.max_seq ) return 0;
+	const int pool = engine::modules::DSA::POOL;
+	const size_t recurrent = ( state_.slot_kda_floats + state_.slot_conv_floats ) * sizeof( float );
+	const size_t planes = dsa_plane_stride_ * sizeof( backend::half_t );
+	const size_t latent = static_cast<size_t>( config_.num_mla_layers ) * ( tokens - from ) * 512 * sizeof( backend::half_t );
+	const size_t pool_rows = static_cast<size_t>( ( tokens + pool - 1 ) / pool - from / pool );
+	const size_t pools = static_cast<size_t>( config_.num_mla_layers ) * pool_rows * engine::modules::DSA::DIM * sizeof( backend::half_t );
+	return recurrent + planes + ( with_taps ? tap_snapshot_bytes( tokens ) : 0 ) + latent + pools + 256;
+}
+
+void Glm5NextPipeline::copy_seq_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream ) {
+	const int pool = engine::modules::DSA::POOL;
+	const int NP = config_.max_seq / pool;
+	const backend::Copy dir = to_host ? backend::Copy::D2H : backend::Copy::H2D;
+	auto move = [&]( void* dev, size_t bytes ) {
+		if ( bytes == 0 ) return;
+		if ( to_host ) backend::memcpy_async( host, dev, bytes, dir, stream );
+		else backend::memcpy_async( dev, host, bytes, dir, stream );
+		host += bytes;
+	};
+	const size_t lat_bytes = static_cast<size_t>( tokens - from ) * 512 * sizeof( backend::half_t );
+	const int pool_from = from / pool, pool_to = ( tokens + pool - 1 ) / pool;
+	const size_t pool_bytes = static_cast<size_t>( pool_to - pool_from ) * engine::modules::DSA::DIM * sizeof( backend::half_t );
+	for ( int layer = 0; layer < config_.num_mla_layers; ++layer ) {
+		move( latent_cache_ + static_cast<size_t>( slot_id ) * latent_slot_stride_ + ( static_cast<size_t>( layer ) * config_.max_seq + from ) * 512, lat_bytes );
+		move( dsa_pool_ + static_cast<size_t>( slot_id ) * dsa_pool_stride_ + ( static_cast<size_t>( layer ) * NP + pool_from ) * engine::modules::DSA::DIM, pool_bytes );
+	}
+}
+
+bool Glm5NextPipeline::save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens, with_taps ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+	backend::set_device( rank_ );
+	char* dst = static_cast<char*>( host_dst );
+	const size_t kda = state_.slot_kda_floats * sizeof( float ), conv = state_.slot_conv_floats * sizeof( float ), planes = dsa_plane_stride_ * sizeof( backend::half_t );
+	backend::memcpy_async( dst, state_.kda_states + static_cast<size_t>( slot_id ) * state_.slot_kda_floats, kda, backend::Copy::D2H, stream );
+	backend::memcpy_async( dst + kda, state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, conv, backend::Copy::D2H, stream );
+	backend::memcpy_async( dst + kda + conv, dsa_plane_ + static_cast<size_t>( slot_id ) * dsa_plane_stride_, planes, backend::Copy::D2H, stream );
+	dst += kda + conv + planes;
+	if ( const size_t tap_bytes = with_taps ? tap_snapshot_bytes( tokens ) : 0 ) {
+		backend::memcpy_async( dst, draft_taps_.data, tap_bytes, backend::Copy::D2H, stream );
+		dst += tap_bytes;
+	}
+	copy_seq_rows( slot_id, from, tokens, dst, true, stream );
+	return true;
+}
+
+bool Glm5NextPipeline::load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens, with_taps ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+	backend::set_device( rank_ );
+	const char* src = static_cast<const char*>( host_src );
+	const size_t kda = state_.slot_kda_floats * sizeof( float ), conv = state_.slot_conv_floats * sizeof( float ), planes = dsa_plane_stride_ * sizeof( backend::half_t );
+	const size_t tap_bytes = with_taps ? tap_snapshot_bytes( tokens ) : 0;
+	if ( !kv_only ) {
+		backend::memcpy_async( state_.kda_states + static_cast<size_t>( slot_id ) * state_.slot_kda_floats, src, kda, backend::Copy::H2D, stream );
+		backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, src + kda, conv, backend::Copy::H2D, stream );
+		backend::memcpy_async( dsa_plane_ + static_cast<size_t>( slot_id ) * dsa_plane_stride_, src + kda + conv, planes, backend::Copy::H2D, stream );
+		if ( tap_bytes ) backend::memcpy_async( draft_taps_.data, src + kda + conv + planes, tap_bytes, backend::Copy::H2D, stream );
+	}
+	copy_seq_rows( slot_id, from, tokens, const_cast<char*>( src ) + kda + conv + planes + tap_bytes, false, stream );
+	return true;
+}
+
 } // namespace engine::models

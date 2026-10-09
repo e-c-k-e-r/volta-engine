@@ -164,6 +164,11 @@ public:
 	void draft_head_topk( int rows, backend::stream_t stream = nullptr ) override;
 	void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) override;
 	void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) override;
+	void set_snapshot_taps( bool on ) override { snap_taps_ = on; }
+	int seq_align() const override { return 4; }   // DSA::POOL
+	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
+	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
+	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;
 
 	void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;
@@ -231,6 +236,9 @@ private:
 	// DFlash2 attachment (see DraftHooks): tap ring, head scratch and per-rank candidate top-k scratch
 	DraftHooks draft_hooks_;
 	pod::TensorView draft_taps_;         // [taps_cap, 5 * hidden]
+	bool snap_taps_ = false;             // sequence snapshots include the tap ring rows
+	size_t tap_snapshot_bytes( int tokens ) const;
+	void copy_seq_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	pod::TensorView tap_tmp_;            // [MAX_ROWS, hidden] mean of the 4 residual streams at a tapped layer
 	pod::TensorView draft_lm_logits_;    // [kDraftM, lm_shard_cols]
 	float* draft_cand_part_v_ = nullptr;

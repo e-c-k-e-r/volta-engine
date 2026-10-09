@@ -188,10 +188,13 @@ bool OutputParser::parse_tool_call( const std::string& body, ToolCallOut* out ) 
 			if ( ks == std::string::npos ) break;
 			const size_t ke = body.find( "</arg_key>", ks );
 			const size_t vs = body.find( "<arg_value>", ke == std::string::npos ? ks : ke );
-			const size_t ve = vs == std::string::npos ? std::string::npos : body.find( "</arg_value>", vs );
-			if ( ke == std::string::npos || vs == std::string::npos || ve == std::string::npos ) return false;
+			size_t ve = vs == std::string::npos ? std::string::npos : body.find( "</arg_value>", vs );
+			if ( ke == std::string::npos || vs == std::string::npos ) return false;
+			// a missing </arg_value> on the last argument is tolerated: the value runs to the end of the call
+			const bool last_open = ve == std::string::npos;
+			if ( last_open ) ve = body.size();
 			raw_args.emplace_back( body.substr( ks + 9, ke - ks - 9 ), body.substr( vs + 11, ve - vs - 11 ) );
-			pos = ve + 12;
+			pos = last_open ? body.size() : ve + 12;
 		}
 	}
 	else {
@@ -205,16 +208,23 @@ bool OutputParser::parse_tool_call( const std::string& body, ToolCallOut* out ) 
 			const size_t ps = body.find( "<parameter=", pos );
 			if ( ps == std::string::npos ) break;
 			const size_t pe = body.find( '>', ps );
-			const size_t ve = pe == std::string::npos ? std::string::npos : body.find( "</parameter>", pe );
-			if ( pe == std::string::npos || ve == std::string::npos ) return false;
+			if ( pe == std::string::npos ) return false;
+			size_t ve = body.find( "</parameter>", pe );
+			// a missing </parameter> on the last parameter is tolerated: the value runs to </function> or the end
+			bool last_open = false;
+			if ( ve == std::string::npos ) {
+				last_open = true;
+				ve = body.find( "</function>", pe );
+				if ( ve == std::string::npos ) ve = body.size();
+			}
 			std::string v = body.substr( pe + 1, ve - pe - 1 );
 			// the template wraps each value in one newline on either side
 			if ( !v.empty() && v.front() == '\n' ) v.erase( 0, 1 );
 			if ( !v.empty() && v.back() == '\n' ) v.pop_back();
 			raw_args.emplace_back( body.substr( ps + 11, pe - ps - 11 ), std::move( v ) );
+			if ( last_open ) break;
 			pos = ve + 12;
 		}
-		if ( body.find( "</function>", pos ) == std::string::npos ) return false;
 	}
 	while ( !name.empty() && is_ws( name.back() ) ) name.pop_back();
 	while ( !name.empty() && is_ws( name.front() ) ) name.erase( 0, 1 );

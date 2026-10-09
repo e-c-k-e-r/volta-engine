@@ -72,6 +72,14 @@ int main() {
 		{ "", "", { { "f", R"({"s":"line1\nline2"})" } } }, tools );
 	check_chunking( "qwen unterminated call", ModelFamily::QWEN, false, "x <tool_call>\n<function=f>", { "", "x<tool_call>\n<function=f>", {} } );
 
+	// Tolerated damage: the last closing tags missing (generation stopped early)
+	check_chunking( "qwen missing closers", ModelFamily::QWEN, false, "<tool_call>\n<function=f>\n<parameter=n>\n7\n</parameter>\n<parameter=s>\nabc\n</tool_call>",
+		{ "", "", { { "f", R"({"n":7,"s":"abc"})" } } }, tools );
+	check_chunking( "qwen no function end", ModelFamily::QWEN, false, "<tool_call>\n<function=f>\n<parameter=n>\n7\n</parameter>\n</tool_call>",
+		{ "", "", { { "f", R"({"n":7})" } } }, tools );
+	check_chunking( "glm missing arg_value end", ModelFamily::GLM, false, "<tool_call>f<arg_key>n</arg_key><arg_value>7</tool_call>",
+		{ "", "", { { "f", R"({"n":7})" } } }, tools );
+
 	// GLM
 	check_chunking( "glm think+content", ModelFamily::GLM, true, "reason</think>Answer", { "reason", "Answer", {} } );
 	check_chunking( "glm call", ModelFamily::GLM, true, "r</think>go<tool_call>f<arg_key>s</arg_key><arg_value>007</arg_value><arg_key>n</arg_key><arg_value>42</arg_value></tool_call>",

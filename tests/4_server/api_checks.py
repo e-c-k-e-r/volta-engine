@@ -39,6 +39,7 @@ TOOLS = [{"type": "function", "function": {"name": "get_weather", "description":
 code, body = urllib.request.urlopen(BASE + "/v1/models").status, json.loads(urllib.request.urlopen(BASE + "/v1/models").read())
 check(code == 200 and body["data"][0]["object"] == "model", "GET /v1/models")
 IS_GLM = "GLM" in body["data"][0]["id"]
+CTX = body["data"][0]["context_length"]
 
 # plain completion, thinking off by default
 code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "Capital of France? One word."}], "max_tokens": 16})
@@ -95,7 +96,7 @@ for bad, what in (({"messages": []}, "empty messages"), ({"nope": 1}, "missing m
                   ({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]}, "image part")):
     code, body = post("/v1/chat/completions", bad)
     check(code == 400 and "error" in json.loads(body), "400 for " + what, body)
-code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "word " * 20000}], "max_tokens": 4})
+code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "word " * int(CTX * 1.5)}], "max_tokens": 4})
 check(code == 400 and json.loads(body)["error"]["type"] == "context_length_exceeded", "context length exceeded", body[:200])
 try:
     urllib.request.urlopen(BASE + "/v1/missing")
@@ -122,6 +123,13 @@ code, body = post("/v1/messages", {"max_tokens": 400, "thinking": {"type": "enab
 j = json.loads(body)
 types = [b["type"] for b in j["content"]]
 check(types[:2] == ["thinking", "text"] and j["content"][0]["thinking"] and "4" in j["content"][1]["text"], "thinking block then text", body)
+
+# thinking budget: the reasoning is cut at the budget and the model answers
+code, body = post("/v1/messages", {"max_tokens": 700, "thinking": {"type": "enabled", "budget_tokens": 64}, "messages": [{"role": "user", "content": "Explain in detail how a hash table handles collisions."}]})
+j = json.loads(body)
+th = " ".join(b.get("thinking", "") for b in j["content"] if b["type"] == "thinking")
+tx = " ".join(b.get("text", "") for b in j["content"] if b["type"] == "text")
+check(code == 200 and len(th.split()) < 110 and len(tx.split()) > 20, "thinking budget closes the reasoning and the answer follows", (len(th.split()), len(tx.split()), body[:200]))
 
 code, resp = post("/v1/messages", {"max_tokens": 40, "stream": True, "messages": [{"role": "user", "content": "Count 1 to 5, comma separated."}]}, stream=True)
 names = []; text = ""; cur = None

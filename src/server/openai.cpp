@@ -260,6 +260,9 @@ public:
 			else if ( !j["stop"].is_null() ) return fail( err, "stop must be a string or an array of strings" );
 		}
 		if ( j.contains( "reasoning_effort" ) && j["reasoning_effort"].is_string() ) r.reasoning_effort = j["reasoning_effort"].get<std::string>();
+		for ( const char* key : { "thinking_budget_tokens", "max_reasoning_tokens" } ) {
+			if ( j.contains( key ) && j[key].is_number_integer() ) r.thinking_budget = j[key].get<int>();
+		}
 		if ( j.contains( "enable_thinking" ) && j["enable_thinking"].is_boolean() ) r.enable_thinking = j["enable_thinking"].get<bool>() ? 1 : 0;
 		if ( j.contains( "chat_template_kwargs" ) && j["chat_template_kwargs"].is_object() ) {
 			const json& k = j["chat_template_kwargs"];

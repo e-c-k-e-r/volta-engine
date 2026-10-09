@@ -51,6 +51,12 @@ struct GenerationRequest {
 		bool taps = true;        // snapshot the drafter taps too (a resume there keeps speculating)
 	};
 	std::vector<Checkpoint> checkpoint_at;   // ascending prompt positions to snapshot into the prefix cache (system-prompt end, turn boundary)
+	// Reasoning budget: after this many reasoning tokens the generator appends reasoning_close (e.g. "\n</think>\n\n") itself
+	// and the model continues with the answer. 0 = unlimited. think_close_id ends the reasoning when the model emits it.
+	int reasoning_budget = 0;
+	bool starts_in_reasoning = false;
+	std::vector<int> reasoning_close;
+	int think_close_id = -1;
 	std::vector<std::string> stop_strings;   // generation ends before the first match
 	std::string matched_stop;                // set when FinishReason::StopString
 	// Called from the scheduler thread with detokenized text (never the end-of-sequence token). Returning false cancels.
@@ -105,6 +111,9 @@ private:
 		SamplingParams sp;
 		Rng rng;
 		bool prefill_done = false;
+		bool in_reasoning = false;
+		int reasoning_tokens = 0;
+		bool force_close = false;   // budget reached: close the reasoning block before the next step
 		std::string held_text;   // detokenized text withheld while it could still begin a stop string
 		std::vector<int> all_tokens;
 		SlotMetrics metrics;
@@ -121,6 +130,7 @@ private:
 	// Commits `tok` to slot s's output; returns true when the request finished.
 	bool emit_token( int s, int tok );
 	void finish_slot( int s, FinishReason reason );
+	void apply_forced_close( int s );
 
 	engine::server::ServerConfig config_;
 	ModelCluster cluster_;

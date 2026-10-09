@@ -274,6 +274,7 @@ public:
 		}
 		if ( j.contains( "thinking" ) && j["thinking"].is_object() ) {
 			const std::string t = j["thinking"].value( "type", std::string() );
+			if ( t == "enabled" && j["thinking"].contains( "budget_tokens" ) && j["thinking"]["budget_tokens"].is_number_integer() ) r.thinking_budget = j["thinking"]["budget_tokens"].get<int>();
 			if ( t == "enabled" || t == "adaptive" ) r.enable_thinking = 1;
 			else if ( t == "disabled" ) r.enable_thinking = 0;
 		}

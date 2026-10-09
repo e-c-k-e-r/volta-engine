@@ -58,6 +58,7 @@ public:
 		size_t bytes = 0;                  // per rank
 		void* host[ENGINE_NUM_GPUS] = {};
 	};
+	int snapshot_align() const { return models_[0]->seq_align(); }
 	size_t snapshot_bytes( int from, int tokens, bool with_taps = false ) const;    // per rank; 0 when the model cannot snapshot
 	bool save_snapshot( int slot, int from, int tokens, SeqSnapshot* snap, bool with_taps = true );
 	// Writes the snapshot into the slot: its KV rows, and unless kv_only the recurrent state and tap rows (the slot then
