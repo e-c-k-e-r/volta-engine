@@ -642,8 +642,10 @@ void MoE::forward(
 	const bool sharded = weights.num_local_experts > 72;
 	const int num_groups = sharded ? MOE_MAX_GROUPS : rows == 1 ? 1 : rows <= 16 ? 4 : MOE_MAX_GROUPS;
 	// Fused decode path: gate/up and down GEMV kernels over runs of rows that share an expert (exl3_moe_coop.cuh)
-	if ( weights.type == pod::QuantType::TRELLIS && rows <= MOE_COOP_MAX_ROWS && scratch.coop_ctr != nullptr && weights.top_k == MOE_COOP_TOPK
-		&& weights.gate[0].bits == 3 && weights.up[0].bits == 3 && weights.down[0].bits == 3 && weights.up[0].mul1 && weights.gate[0].mul1 && weights.down[0].mul1 ) {
+	// 3 bpw (up to 8 routes: the integer tile) and 4 bpw experts, all mul1
+	const int ebits = weights.gate[0].bits;
+	if ( weights.type == pod::QuantType::TRELLIS && rows <= MOE_COOP_MAX_ROWS && scratch.coop_ctr != nullptr && weights.top_k <= MOE_COOP_TOPK
+		&& ( ebits == 3 || ebits == 4 ) && weights.up[0].bits == ebits && weights.down[0].bits == ebits && weights.up[0].mul1 && weights.gate[0].mul1 && weights.down[0].mul1 ) {
 		const int E = weights.num_local_experts;
 		const void** d_ptrs = static_cast<const void**>( weights.device_ptrs );
 		MoeCoopParams p = {};
@@ -658,6 +660,7 @@ void MoE::forward(
 		p.H = weights.up[0].w1.shape[0];
 		p.I = weights.up[0].w2.shape[0];
 		p.topk = weights.top_k;
+		p.bits = ebits;
 		p.act_limit = act_limit;
 		p.g_trellis = reinterpret_cast<const uint16_t* const*>( d_ptrs + 0 * E );
 		p.g_suh = reinterpret_cast<const half* const*>( d_ptrs + 1 * E );

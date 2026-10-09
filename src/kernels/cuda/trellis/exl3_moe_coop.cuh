@@ -21,7 +21,7 @@
 #define MOE_COOP_WNT 2                  // adjacent 16-column tiles per warp
 #define MOE_COOP_COLS ( MOE_COOP_WNT * 16 )
 #define MOE_COOP_MAX_ROWS 16
-#define MOE_COOP_TOPK 8
+#define MOE_COOP_TOPK 10                // the largest routes-per-token a call may have (scratch is sized by it); 3 bpw experts with 8 or fewer routes also take the int8 tile
 #define MOE_COOP_MAX_SLOTS ( MOE_COOP_MAX_ROWS * MOE_COOP_TOPK )
 
 struct MoeCoopParams {
@@ -38,6 +38,7 @@ struct MoeCoopParams {
 	int H;                              // hidden width (gate/up in_features, down out_features), multiple of 128
 	int I;                              // this rank's intermediate width, multiple of 128
 	int topk;
+	int bits;                           // 3 or 4 bits per weight
 	float act_limit;
 	const uint16_t* const* g_trellis; const half* const* g_suh; const half* const* g_svh;
 	const uint16_t* const* u_trellis; const half* const* u_suh; const half* const* u_svh;

@@ -214,7 +214,7 @@ __device__ __forceinline__ bool read_run( const MoeCoopParams& p, int run_idx, i
 // GEMV tile: one column group of an (nrows, k) x (k, n) product, the rows being the run's slots (row r reads A at
 // A2 + rows[r] * a_stride2 half2 and writes C at rows[r] * c_stride), the whole block splitting k across its warps.
 // Body follows exl3_gemv_kernel (MMODE 1, CFG 0) for 3 bpw with register dequant.
-template <int cb, int WN_>
+template <int BITS_, int cb, int WN_>
 __device__ __forceinline__ void gemv_tile(
 	const uint32_t* __restrict__ B32,
 	const half2* __restrict__ A2,
@@ -230,6 +230,8 @@ __device__ __forceinline__ void gemv_tile(
 	float* __restrict__ sh_red          // [WKK][ROWS][TCOLS]
 ) {
 	constexpr int WN = WN_;
+	constexpr int TW = 8 * BITS_;                // uint32 per 16x16 tile
+	constexpr int GW = WNT * TW;                 // uint32 per warp per k-slice
 	constexpr int WKK = tile_wk<WN_>();
 	constexpr int TCOLS = tile_cols<WN_>();
 
@@ -242,7 +244,7 @@ __device__ __forceinline__ void gemv_tile(
 	const int chunk = CEIL_DIVIDE( kslices, WKK );
 	const int ks0 = k_begin + wk * chunk;
 	const int myn = max( 0, min( chunk, k_end - ks0 ) );
-	const size_t slice_stride = static_cast<size_t>( ntiles ) * TWORDS;
+	const size_t slice_stride = static_cast<size_t>( ntiles ) * TW;
 
 	// A fragment row of this lane: rows[lane / 4] of the run
 	const int r0 = lane >> 2;
@@ -250,8 +252,8 @@ __device__ __forceinline__ void gemv_tile(
 	const size_t a_row0 = r0_ok ? static_cast<size_t>( rows[r0] ) * a_stride2 : 0;
 	const half2 hzero = __half2half2( __ushort_as_half( 0 ) );
 
-	int x_src_a, x_src_b, x_s2;
-	{
+	int x_src_a, x_src_b, x_s2 = 0;
+	if constexpr ( BITS_ == 3 ) {
 		const int t_offset = lane << 3;
 		const int b1 = ( t_offset + 257 ) * 3;
 		const int b2 = b1 + 21;
@@ -261,11 +263,16 @@ __device__ __forceinline__ void gemv_tile(
 		x_src_a = i0 % 24;
 		x_src_b = i2 % 24;
 	}
+	else {
+		// 4 bpw: a tile is 32 words, one per lane; a window spans the previous lane's word and the lane's own
+		x_src_a = ( lane + 31 ) & 31;
+		x_src_b = lane;
+	}
 
-	const uint32_t* bp = B32 + static_cast<size_t>( ks0 ) * slice_stride + ( group * WN + wn ) * GWORDS + lane;
+	const uint32_t* bp = B32 + static_cast<size_t>( ks0 ) * slice_stride + ( group * WN + wn ) * GW + lane;
 
 	auto ld_b = [&]( int i, int l ) -> uint32_t {
-		return lane < 24 ? __ldcs( bp + static_cast<size_t>( i ) * slice_stride + l * LSTRIDE ) : 0;
+		return lane < TW ? __ldcs( bp + static_cast<size_t>( i ) * slice_stride + l * TW ) : 0;
 	};
 
 	uint32_t pf[PF][LOADS];
@@ -315,7 +322,8 @@ __device__ __forceinline__ void gemv_tile(
 				FragB f0, f1;
 				const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
 				const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
-				exl3_gemv_ns::dq8_regs_3bits<cb>( awv, bwv, x_s2, f0, f1 );
+				if constexpr ( BITS_ == 3 ) exl3_gemv_ns::dq8_regs_3bits<cb>( awv, bwv, x_s2, f0, f1 );
+				else exl3_gemv_ns::dq8_regs_4bits<cb>( awv, bw[t], f0, f1 );
 				const int cv = ( lane & 3 ) + 4 * ( lane >= 16 );
 				#pragma unroll
 				for ( int s = 0; s < 4; ++s ) {
@@ -341,7 +349,8 @@ __device__ __forceinline__ void gemv_tile(
 				FragB f0, f1;
 				const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
 				const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
-				exl3_gemv_ns::dq8_regs_3bits<cb>( awv, bwv, x_s2, f0, f1 );
+				if constexpr ( BITS_ == 3 ) exl3_gemv_ns::dq8_regs_3bits<cb>( awv, bwv, x_s2, f0, f1 );
+				else exl3_gemv_ns::dq8_regs_4bits<cb>( awv, bw[t], f0, f1 );
 				exl3_gemv_ns::mma_ab_h( a01, a23, f0, ch[t][0] );
 				exl3_gemv_ns::mma_ab_h( a01, a23, f1, ch[t][1] );
 			}
@@ -707,7 +716,7 @@ void rot_kernel( const MoeCoopParams p ) {
 
 // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (output rotation, svh, activation,
 // down-input rotation) by the last arrival per (slot, chunk)
-template <int cb, int WN_, int MODE>
+template <int BITS_, int cb, int WN_, int MODE>
 __global__ __launch_bounds__( THREADS )
 void a_kernel( const MoeCoopParams p ) {
 	constexpr int TCOLS = tile_cols<WN_>();
@@ -764,15 +773,15 @@ void a_kernel( const MoeCoopParams p ) {
 		float* C = ( is_gate ? p.gu_g : p.gu_u ) + static_cast<size_t>( ks ) * ( p.bsz * p.topk ) * p.I;
 		// Tile mode: 0 tensor core, 1 int8 one row, 2 int8 any width, 3 int8 up to 4 rows and tensor core above
 		bool done = false;
-		if constexpr ( MODE > 0 ) {
+		if constexpr ( MODE > 0 && BITS_ == 3 ) {
 			if ( MODE != 3 || nrows <= 4 ) {
 				uint32_t* sh_stage = reinterpret_cast<uint32_t*>( sh_red ) + smem_red_bytes() / 4;
 				gemv_tile_i8_rows<cb, WN_, MODE == 1 ? 1 : 4>( B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red, sh_stage );
 				done = true;
 			}
 		}
-		if constexpr ( MODE == 0 || MODE == 3 ) {
-			if ( !done ) gemv_tile<cb, WN_>( B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red );
+		if constexpr ( MODE == 0 || MODE == 3 || BITS_ != 3 ) {
+			if ( !done ) gemv_tile<BITS_, cb, WN_>( B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red );
 		}
 	}
 
@@ -821,7 +830,7 @@ void a_kernel( const MoeCoopParams p ) {
 
 // Kernel B: down GEMV per (expert run, group); the last arrival of a (token, chunk) reduces the token's slots (rotation, svh,
 // routing weight) in a fixed order and stores the row
-template <int cb, int WN_, int MODE>
+template <int BITS_, int cb, int WN_, int MODE>
 __global__ __launch_bounds__( THREADS )
 void b_kernel( const MoeCoopParams p ) {
 	constexpr int TCOLS = tile_cols<WN_>();
@@ -851,7 +860,7 @@ void b_kernel( const MoeCoopParams p ) {
 	{
 		const uint32_t* B32 = reinterpret_cast<const uint32_t*>( p.d_trellis[local] );
 		bool done = false;
-		if constexpr ( MODE > 0 ) {
+		if constexpr ( MODE > 0 && BITS_ == 3 ) {
 			if ( MODE != 3 || nrows <= 4 ) {
 				uint32_t* sh_stage = reinterpret_cast<uint32_t*>( sh_part ) + smem_part_bytes() / 4;
 				gemv_tile_i8_rows<cb, WN_, MODE == 1 ? 1 : 4>( B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
@@ -859,8 +868,8 @@ void b_kernel( const MoeCoopParams p ) {
 				done = true;
 			}
 		}
-		if constexpr ( MODE == 0 || MODE == 3 ) {
-			if ( !done ) gemv_tile<cb, WN_>( B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
+		if constexpr ( MODE == 0 || MODE == 3 || BITS_ != 3 ) {
+			if ( !done ) gemv_tile<BITS_, cb, WN_>( B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
 				0, p.I / 16, p.H / 16, group, sh_red );
 		}
 	}
@@ -932,7 +941,7 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	using namespace exl3_moe_coop_ns;
 	MoeCoopParams p = p_in;
 	const int slots = p.bsz * p.topk;
-	ENGINE_ASSERT( p.topk == MOE_COOP_TOPK && p.bsz >= 1 && p.bsz <= MOE_COOP_MAX_ROWS, "exl3_moe_coop: row count" );
+	ENGINE_ASSERT( p.topk >= 1 && p.topk <= MOE_COOP_TOPK && p.bsz >= 1 && p.bsz <= MOE_COOP_MAX_ROWS && ( p.bits == 3 || p.bits == 4 ), "exl3_moe_coop: row count / topk / bits" );
 	ENGINE_ASSERT( p.H % 128 == 0 && p.I % 128 == 0, "exl3_moe_coop: widths" );
 	p.a_global = p.bsz > 1;
 	p.ctr_a_len = MOE_COOP_MAX_SLOTS * ( p.I / 128 );
@@ -948,14 +957,14 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	// The split-k factor is sized for the one-row grid and kept for every row count: it sets the order in which a row's partial
 	// sums are added, and a row's result must not depend on how many other rows share the call (speculative verify == plain decode)
 	const int base_a = slots * 2 * ( p.I / tcols );
-	p.ksplit_a = pick_ksplit( MOE_COOP_TOPK * 2 * ( p.I / tcols ), p.H / 16, MOE_COOP_KSPLIT_MAX, num_sms );
+	p.ksplit_a = pick_ksplit( p.topk * 2 * ( p.I / tcols ), p.H / 16, MOE_COOP_KSPLIT_MAX, num_sms );
 	p.ksplit_b = 1;
 	const int grid_a = base_a * p.ksplit_a;
 	const int grid_b = slots * ( p.H / tcols );
 
 	// Tile: 1 int8 dp4a for one-row decode; with more rows 3 = dp4a for runs of up to 4 rows and fp16 tensor core above
 	// (dp4a on wider runs re-reads the weights in 4-row passes and loses to the tensor core there)
-	const int mode = p.bsz == 1 ? 1 : 3;
+	const int mode = p.bits != 3 ? 0 : ( p.bsz == 1 ? 1 : 3 );
 	const int stage_rows = mode == 1 ? 1 : ( mode >= 2 ? 4 : 0 );
 	// int8 activation staging: 2 x 16 B per k-tile per k-slab
 	constexpr int wkk = WK / WN;
@@ -963,39 +972,50 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	const int stage_b = stage_rows * wkk * CEIL_DIVIDE( p.I / 16, wkk ) * 32;
 	const int smem_a = p.H * 2 + smem_red_bytes() + stage_a;
 	const int smem_b = smem_red_bytes() + smem_part_bytes() + stage_b;
-	static bool attr_set[ENGINE_NUM_GPUS] = { false };
-	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, WN, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, WN, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, WN, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, WN, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, WN, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, WN, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+	static bool attr_set[ENGINE_NUM_GPUS] = { false }, attr_set4[ENGINE_NUM_GPUS] = { false };
+	if ( p.bits == 3 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<3, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<3, 2, WN, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<3, 2, WN, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<3, 2, WN, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<3, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<3, 2, WN, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<3, 2, WN, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<3, 2, WN, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
 		attr_set[device] = true;
+	}
+	if ( p.bits == 4 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set4[device] ) {
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<4, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<4, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		attr_set4[device] = true;
 	}
 
 	if ( p.a_global ) {
 		const int rot_warps = slots * ( p.H / 128 ) * 2;
 		rot_kernel<<<dim3( MAX( 1, CEIL_DIVIDE( rot_warps, THREADS / 32 ) ) ), dim3( THREADS ), 0, stream>>>( p );
 	}
+	if ( p.bits == 4 ) {
+		a_kernel<4, 2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+		b_kernel<4, 2, WN, 0><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+		CUDA_CHECK( cudaGetLastError() );
+		return;
+	}
 	switch ( mode ) {
 		case 1: {
-			a_kernel<2, WN, 1><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
-			b_kernel<2, WN, 1><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+			a_kernel<3, 2, WN, 1><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+			b_kernel<3, 2, WN, 1><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
 		} break;
 		case 2: {
-			a_kernel<2, WN, 2><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
-			b_kernel<2, WN, 2><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+			a_kernel<3, 2, WN, 2><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+			b_kernel<3, 2, WN, 2><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
 		} break;
 		case 3: {
-			a_kernel<2, WN, 3><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
-			b_kernel<2, WN, 3><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+			a_kernel<3, 2, WN, 3><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+			b_kernel<3, 2, WN, 3><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
 		} break;
 		default: {
-			a_kernel<2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
-			b_kernel<2, WN, 0><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+			a_kernel<3, 2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+			b_kernel<3, 2, WN, 0><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
 		} break;
 	}
 	CUDA_CHECK( cudaGetLastError() );
