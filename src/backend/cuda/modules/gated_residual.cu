@@ -21,13 +21,20 @@ __global__ void gr_init_kernel( const half* __restrict__ in, float* __restrict__
 	}
 }
 
-// One block per (row, stream): normed[r, s, :] = x * rsqrt(mean(x^2) + eps) * (1 + w[s, :])
-__global__ void gr_norm_kernel( const float* __restrict__ x, const half* __restrict__ w, float* __restrict__ normed, int hidden, int hc, float eps ) {
+// One block per (row, stream): normed[r, s, :] = x * rsqrt(mean(x^2) + eps) * (1 + w[s, :]). With prev_y the previous site's gated add
+// x += post[r, s] * y[r, :] is applied (and stored) in the same pass, so the streams are read and written once between two sites.
+__global__ void gr_norm_kernel( float* __restrict__ x, const half* __restrict__ w, float* __restrict__ normed, int hidden, int hc, float eps,
+	const float* __restrict__ prev_post, const half* __restrict__ prev_y ) {
 	const int r = blockIdx.x, s = blockIdx.y;
 	const size_t base = ( static_cast<size_t>( r ) * hc + s ) * hidden;
+	const float p = prev_y != nullptr ? prev_post[static_cast<size_t>( r ) * hc + s] : 0.0f;
 	float sq = 0.0f;
 	for ( int d = threadIdx.x; d < hidden; d += blockDim.x ) {
-		const float v = x[base + d];
+		float v = x[base + d];
+		if ( prev_y != nullptr ) {
+			v += p * __half2float( prev_y[static_cast<size_t>( r ) * hidden + d] );
+			x[base + d] = v;
+		}
 		sq += v * v;
 	}
 	sq = warp_sum( sq );
@@ -244,13 +251,15 @@ void GatedResidual::init_streams( const backend::half_t* in, float* x, int rows,
 
 void GatedResidual::mix(
 	const float* x, const backend::half_t* norm_w, const backend::half_t* down, const backend::half_t* up, const backend::half_t* inject,
-	backend::half_t* mixed, float* post, float* scratch, int rows, int hidden, int hc, int rank, float eps, backend::stream_t stream
+	backend::half_t* mixed, float* post, float* scratch, int rows, int hidden, int hc, int rank, float eps, backend::stream_t stream,
+	const float* prev_post, const backend::half_t* prev_y
 ) {
 	const int flat = hc * hidden;
 	ENGINE_ASSERT( hc == 4 && flat % 1024 == 0 && hidden % GR_DT == 0 && rank % 64 == 0, "GatedResidual::mix: shape" );
 	float* normed = scratch;
 	float* t = scratch + static_cast<size_t>( rows ) * flat;
-	gr_norm_kernel<<<dim3( rows, hc ), 256, 0, stream>>>( x, reinterpret_cast<const half*>( norm_w ), normed, hidden, hc, eps );
+	gr_norm_kernel<<<dim3( rows, hc ), 256, 0, stream>>>( const_cast<float*>( x ), reinterpret_cast<const half*>( norm_w ), normed, hidden, hc, eps, prev_post,
+		reinterpret_cast<const half*>( prev_y ) );
 	const int has_inject = inject != nullptr ? 1 : 0;
 	gr_gate_kernel<<<dim3( ( rank + ( has_inject ? hc : 0 ) + GR_JT - 1 ) / GR_JT, ( rows + GR_RT - 1 ) / GR_RT ), 128, 0, stream>>>(
 		normed, reinterpret_cast<const half*>( down ), reinterpret_cast<const half*>( inject ), t, post, flat, rank, hc, rows, has_inject );

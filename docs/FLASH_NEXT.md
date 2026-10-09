@@ -117,5 +117,7 @@ Fused MoE decode breakdown (`bench_moe_routes`, rank 0, 1 row, top 10): 0 local 
 
 Rank 0's shared expert now runs on a side stream beside the router and the fused MoE decode kernels (`backend::stream_fork/stream_join`, CUDA graph edges; only when `MoE::fused_decode`, since those kernels use none of the trellis GEMM workspace the shared Linear needs): decode 22.6 -> 21.5 ms/token, tokens unchanged, API suite with MTP passes. A rewrite of the gated-residual up-mix / gate kernels with 16-byte weight loads and all loads in flight first was tried and reverted: no gain (22.8 ms) and one greedy token flipped from the changed summation order, so those kernels are not load-latency bound.
 
+The gated add after each sublayer is deferred into the next site's norm pass (`GatedResidual::mix` prev_post / prev_y; flushed before any other stream reader and at the end of every captured body): 21.5 -> 21.3 ms/token, outputs bit-identical (decode tokens, prefix restore max |dlogit| 0, API suite with MTP).
+
 Next: a GEMV for the N=640 shared-expert shapes, a tensor-core QSA scorer and sparse
 kernel, the SASS / bench baselines and the 256K needle.

@@ -529,6 +529,7 @@ void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 void Qwen4ExpPipeline::trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols ) {
 	static const std::string& path = runtime::options().trace_layers;
 	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH ) return;
+	if ( streams ) flush_apply( m, stream );
 	const int H = config_.hidden_size;
 	if ( cols <= 0 ) cols = H;
 	const size_t elems = static_cast<size_t>( m ) * ( streams ? config_.hc_mult * H : cols );
@@ -582,7 +583,21 @@ void Qwen4ExpPipeline::gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, i
 	engine::modules::GatedResidual::mix(
 		streams_.ptr<const float>(), g.norm.ptr<const backend::half_t>(), g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(),
 		with_post ? g.inject.ptr<const backend::half_t>() : nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_,
-		m, config_.hidden_size, config_.hc_mult, config_.hc_rank, config_.rms_norm_eps, stream );
+		m, config_.hidden_size, config_.hc_mult, config_.hc_rank, config_.rms_norm_eps, stream,
+		apply_pending_ ? post_ : nullptr, apply_pending_ ? y_.ptr<const backend::half_t>() : nullptr );
+	apply_pending_ = false;
+}
+
+// The gated add after a sublayer is deferred into the next mix's norm pass (one fewer launch and one fewer sweep of the streams per site); anything
+// else that reads or writes the streams flushes it first, and every captured body ends flushed
+void Qwen4ExpPipeline::defer_apply() {
+	apply_pending_ = true;
+}
+
+void Qwen4ExpPipeline::flush_apply( int m, backend::stream_t stream ) {
+	if ( !apply_pending_ ) return;
+	engine::modules::GatedResidual::apply( streams_.ptr<float>(), post_, y_.ptr<const backend::half_t>(), m, config_.hidden_size, config_.hc_mult, stream );
+	apply_pending_ = false;
 }
 
 // Full-attention sublayer: mixed_ in, the rank's partial o_proj result in y_. Dense causal attention; the QSA block selection only
@@ -701,6 +716,7 @@ void Qwen4ExpPipeline::ple_prepare( const pod::BatchRows& rows, int m, backend::
 }
 
 void Qwen4ExpPipeline::ple_forward( int m, backend::stream_t stream ) {
+	flush_apply( m, stream );
 	const int H = config_.hidden_size, hc = config_.hc_mult;
 	engine::modules::Linear::forward( ple_emb_, ple_.key_proj, ple_key_, stream );
 	engine::modules::Linear::forward( ple_emb_, ple_.value_proj, ple_value_, stream );
@@ -754,6 +770,7 @@ void Qwen4ExpPipeline::teacher_inject( int L, int m, backend::stream_t stream ) 
 	} );
 	if ( data.empty() || rows != m ) return;
 	const size_t block = static_cast<size_t>( rows ) * config_.hc_mult * config_.hidden_size;
+	flush_apply( m, stream );
 	backend::memcpy_async( streams_.data, data.data() + static_cast<size_t>( L - 1 ) * block, block * sizeof( float ), backend::Copy::H2D, stream );
 	backend::stream_sync( stream );
 }
@@ -766,7 +783,7 @@ void Qwen4ExpPipeline::attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L
 	else gdn_forward( lw, idx, m, stream );
 	if ( ring_ ) ring_->all_reduce( y_, stream );
 	if ( L >= 0 ) trace_rows( 200 + L, y_.data, false, m, stream );
-	engine::modules::GatedResidual::apply( streams_.ptr<float>(), post_, y_.ptr<const backend::half_t>(), m, H, hc, stream );
+	defer_apply();
 	if ( L >= 0 ) trace_rows( 300 + L, streams_.data, true, m, stream );
 }
 
@@ -777,12 +794,13 @@ void Qwen4ExpPipeline::mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, b
 	moe_forward( lw, m, stream );
 	if ( ring_ ) ring_->all_reduce( y_, stream );
 	if ( L >= 0 ) trace_rows( 500 + L, y_.data, false, m, stream );
-	engine::modules::GatedResidual::apply( streams_.ptr<float>(), post_, y_.ptr<const backend::half_t>(), m, H, hc, stream );
+	defer_apply();
 }
 
 void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size, hc = config_.hc_mult;
 	const int halt = runtime::options().qwen4_halt;
+	apply_pending_ = false;
 	engine::modules::GatedResidual::init_streams( embed_rows_.ptr<const backend::half_t>(), streams_.ptr<float>(), m, H, hc, stream );
 	trace_rows( 1000, streams_.data, true, m, stream );
 	int linear_idx = 0, attn_idx = 0, site = 0;
@@ -794,9 +812,10 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 		}
 		if ( L >= 1 ) teacher_inject( L, m, stream );
 		attn_site( lw, lw.is_full_attention ? attn_idx++ : linear_idx++, L, m, stream );
-		if ( halt == site++ ) return;
+		if ( halt == site++ ) { flush_apply( m, stream ); return; }
 		mlp_site( lw, L, m, stream );
 		if ( static const double eps_l = runtime::options().perturb_layers; eps_l != 0.0 && m > pod::MAX_BATCH ) {
+			flush_apply( m, stream );
 			const size_t n = static_cast<size_t>( m ) * hc * H;
 			std::vector<float> st( n );
 			backend::stream_sync( stream );
@@ -811,8 +830,9 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 			backend::stream_sync( stream );
 		}
 		trace_rows( 600 + L, streams_.data, true, m, stream );
-		if ( halt == site++ ) return;
+		if ( halt == site++ ) { flush_apply( m, stream ); return; }
 	}
+	flush_apply( m, stream );
 
 	// Final mixer (the gated residual without the post gate) collapses the streams into the head's input; every rank projects its vocabulary shard
 	if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
@@ -904,6 +924,7 @@ void Qwen4ExpPipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, 
 	// 3. the head's block (its attention is the last layer of the KV pool)
 	attn_site( mtp_layer_, attn_layers_ - 1, -1, m, stream );
 	mlp_site( mtp_layer_, -1, m, stream );
+	flush_apply( m, stream );
 
 	// 4. the output stack feeds the next step; the mixer and the shared head give the draft logits of the last row
 	backend::memcpy_async( mtp_chain_, streams_.ptr<const char>() + static_cast<size_t>( m - 1 ) * stack, stack, backend::Copy::D2D, stream );

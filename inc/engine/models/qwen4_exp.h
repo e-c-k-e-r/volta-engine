@@ -145,6 +145,9 @@ private:
 	void teacher_inject( int L, int m, backend::stream_t stream );
 	// One sublayer's input: the gated-residual mix of the streams into mixed_ (and post_ when the site has an inject gate)
 	void gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream );
+	void defer_apply();
+	void flush_apply( int m, backend::stream_t stream );
+	bool apply_pending_ = false;   // a gated add (post_, y_) waits to be folded into the next gr_mix
 	// N-gram embedding layer: host gather of the rows for the forward (called from forward()), device gate / conv (from forward_body)
 	void ple_prepare( const pod::BatchRows& rows, int m, backend::stream_t stream );
 	void ple_forward( int m, backend::stream_t stream );

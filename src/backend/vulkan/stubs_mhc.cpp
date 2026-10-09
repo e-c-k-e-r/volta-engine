@@ -48,7 +48,7 @@ __attribute__(( weak )) void GatedResidual::init_streams( const backend::half_t*
 }
 
 __attribute__(( weak )) void GatedResidual::mix( const float*, const backend::half_t*, const backend::half_t*, const backend::half_t*, const backend::half_t*,
-	backend::half_t*, float*, float*, int, int, int, int, float, backend::stream_t ) {
+	backend::half_t*, float*, float*, int, int, int, int, float, backend::stream_t, const float*, const backend::half_t* ) {
 	ENGINE_UNSUPPORTED( "GatedResidual::mix" );
 	__builtin_unreachable();
 }

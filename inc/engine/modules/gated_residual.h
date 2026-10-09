@@ -29,7 +29,11 @@ struct GatedResidual {
 		float* post,                     // [rows, hc], unused without inject
 		float* scratch,
 		int rows, int hidden, int hc, int rank, float eps,
-		backend::stream_t stream
+		backend::stream_t stream,
+		// A deferred apply() folded into the norm pass: x[r, s, :] += prev_post[r, s] * prev_y[r, :] is applied (and stored) first when prev_y is set.
+		// x must then be writable (the caller's own stream buffer).
+		const float* prev_post = nullptr,
+		const backend::half_t* prev_y = nullptr
 	);
 
 	// y[r, :] += sigmoid( x[r] . w ) * s[r, :]  (the shared expert's output gate; w [hidden] fp16)
