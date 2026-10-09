@@ -23,6 +23,8 @@ namespace unicode_util {
 #include "unicode_tables.inc"
 
 static const char* const kQwenPattern = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+// Qwen3.8-Flash-Next: the Qwen split with marks no longer part of letters (as GLM) and single digits
+static const char* const kFlashPattern = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 static const char* const kGlmPattern = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
 template <size_t N>
@@ -586,8 +588,13 @@ bool Tokenizer::load( const char* model_dir ) {
 		// the regex appears JSON-escaped inside the dump, so compare against the escaped form
 		const std::string qwen = nlohmann::json( unicode_util::kQwenPattern ).dump();
 		const std::string glm = nlohmann::json( unicode_util::kGlmPattern ).dump();
+		const std::string flash = nlohmann::json( unicode_util::kFlashPattern ).dump();
 		if ( pt_dump.find( glm.substr( 1, glm.size() - 2 ) ) != std::string::npos ) {
 			max_digits_ = 3;
+			marks_are_letters_ = false;
+		}
+		else if ( pt_dump.find( flash.substr( 1, flash.size() - 2 ) ) != std::string::npos ) {
+			max_digits_ = 1;
 			marks_are_letters_ = false;
 		}
 		else if ( pt_dump.find( qwen.substr( 1, qwen.size() - 2 ) ) == std::string::npos ) {

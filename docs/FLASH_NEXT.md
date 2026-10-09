@@ -79,3 +79,19 @@ are fp16; GDN `in_proj_a/b` `[48, 2560]` fp16; `conv1d` `[10240, 1, 4]` and `A_l
 Oracle: `tests/tools/ref_qwen4_exp_dump.py` writes per-module and block-internal activations (and the logits) for a 42-token prompt to
 `results/flash_next_ref/` (untracked). Block 0 (GDN + MoE) and block 3 (QSA + MoE) internals are included: hc mix output, sublayer output,
 hc apply output, for both the attention and MLP sites.
+
+## Status (2026-10-09)
+
+Working, committed: model type and loader, gated residuals, GDN layers, 512-expert MoE (softmax top-10 router, 3- and 4-bit experts, shared expert,
+expert-parallel over 4 ranks), the n-gram embedding layer, full attention (dense path), final mixer, vocabulary-sharded head, sampling; the server
+runs the checkpoint (`volta_server --model-dir <Swift-Qwen3.8-Flash-Next ...>`, tp 4 only) and passes the OpenAI / Anthropic API checks except images.
+Layers 0-3 match the oracle at bf16 level (relative error 4-9e-3); rows where the router picks a different expert set are the usual noise.
+Decode runs at about 24 tok/s: no CUDA graphs yet (the n-gram gather is a host step), 7 / 8 bpw projections go through the general GEMM, the QSA
+block selection is not implemented (attention is dense, which equals the reference up to 2048 tokens of context).
+
+Findings worth keeping: the exllamav3 fork zeroed the GDN b/a gates (a deferred-load bug, fixed in the fork), so oracle dumps need the fix;
+the checkpoint mixes 3- and 4-bit expert layers (5, 8, 45, 46 are 3-bit) and 8 / 7 bpw shared experts and projections; the tokenizer's split
+regex differs from Qwen3.8-27B's (marks are not letters), recognised in `tokenizer.cpp`.
+
+Next: QSA selection (long context), prefix snapshots (GDN state, KV rows, n-gram conv ring, token history), 256K context and batch 2,
+speculation (MTP head), the vision tower, CUDA graphs for decode, an 8 bpw decode GEMV, SASS / bench baselines.
