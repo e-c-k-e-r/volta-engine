@@ -56,3 +56,26 @@ GLM's mHC, same stream layout).
 - **PLE table**: 16 random 122-byte row reads per token from a 39 GB mapping; fine from page cache, a cold start reads from disk.
 - **Router sensitivity**: like GLM, expect expert-set flips between numerically different paths; compare with route replay, not exact logits.
 - **Scale of the port**: comparable to the GLM port (new block structure, new sparse attention, wider MoE).
+
+## Reference details (from exllamav3 and the checkpoint)
+
+Gated residual site (`GatedResidual._mix_ref`), `x` = fp32 streams `[R, 4, 2560]`, weights fp16 (`hc_norm` `[10240]` includes +1 at load,
+`input_mix_weight_down` `[320, 10240]`, `input_mix_weight_up` `[10240, 320]`, `block_inject_weight` `[4, 10240]`):
+
+```
+normed = x * rsqrt(mean(x^2, -1) + eps) * hc_norm.reshape(4, 2560)
+flat   = normed.reshape(R, 10240)
+t      = silu(flat @ down^T / 4)                     # [R, 320]
+w      = sigmoid(t @ up^T)                           # [R, 10240]
+mixed  = mean_over_streams(w.reshape(R,4,2560) * normed)     # sublayer input, fp16
+post   = 2 * sigmoid(flat @ inject^T / 4)            # [R, 4]
+apply  : x[:, s, :] += post[:, s] * sublayer_out      # fp32 streams
+```
+
+The final `hyper_connection_mixer` is the same without `post` and returns `mixed` as the head input. Quantization: attention and GDN
+projections are 8 bpw trellis, routed and shared experts 4 bpw; router `mlp.gate.weight` `[512, 2560]` and `shared_expert_gate` `[1, 2560]`
+are fp16; GDN `in_proj_a/b` `[48, 2560]` fp16; `conv1d` `[10240, 1, 4]` and `A_log`, `dt_bias`, `norm` are bf16.
+
+Oracle: `tests/tools/ref_qwen4_exp_dump.py` writes per-module and block-internal activations (and the logits) for a 42-token prompt to
+`results/flash_next_ref/` (untracked). Block 0 (GDN + MoE) and block 3 (QSA + MoE) internals are included: hc mix output, sublayer output,
+hc apply output, for both the attention and MLP sites.
