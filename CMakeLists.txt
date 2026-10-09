@@ -408,6 +408,9 @@ set_target_properties(test_kv_quant PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJE
 add_executable(bench_moe_prefill tests/3_bench/bench_moe_prefill.cpp)
 target_link_libraries(bench_moe_prefill PRIVATE engine_kernels)
 set_target_properties(bench_moe_prefill PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(bench_moe_routes tests/3_bench/bench_moe_routes.cpp)
+target_link_libraries(bench_moe_routes PRIVATE engine_kernels)
+set_target_properties(bench_moe_routes PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_mla_latent tests/2_parity/test_mla_latent.cpp)
 target_link_libraries(test_mla_latent PRIVATE engine_kernels)
