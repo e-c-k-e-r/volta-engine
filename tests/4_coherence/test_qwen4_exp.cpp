@@ -3,6 +3,7 @@
 //   test_qwen4_exp [ids.npy] [--rows N] [--gen N]
 // --gen N prefills the whole prompt with logits, prints the top candidates (compare with results/flash_next_ref/logits.npy) and decodes N tokens greedily.
 #include "engine/runtime/test_driver.h"
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,12 +54,14 @@ int main( int argc, char** argv ) {
 		for ( int j = 0; j < 8 && j < c.n; ++j ) std::printf( " %d:%.3f", c.ids[j], c.logits[j] );
 		std::printf( "\n[*] greedy:" );
 		int pos = n;
+		const auto t0 = std::chrono::steady_clock::now();
 		for ( int i = 0; i < gen; ++i ) {
 			std::printf( " %d", tok );
 			mc.forward( &tok, 1, pos++, 0 );
 			tok = mc.sample_one();
 		}
-		std::printf( "\n" );
+		const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
+		std::printf( "\n[*] decode %.1f ms per token (%.1f tok/s)\n", ms / gen, 1000.0 * gen / ms );
 		return 0;
 	}
 	mc.forward( ids.data(), pod::BatchRows::causal( n, 0, 0, pod::BatchRows::LOGITS_NONE ) );

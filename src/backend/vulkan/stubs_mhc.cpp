@@ -53,6 +53,16 @@ __attribute__(( weak )) void GatedResidual::mix( const float*, const backend::ha
 	__builtin_unreachable();
 }
 
+__attribute__(( weak )) void GatedResidual::stream_norm( const float*, const backend::half_t*, backend::half_t*, int, int, int, float, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GatedResidual::stream_norm" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void GatedResidual::add_broadcast( const backend::half_t*, const backend::half_t*, float*, int, int, int, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GatedResidual::add_broadcast" );
+	__builtin_unreachable();
+}
+
 __attribute__(( weak )) void GatedResidual::add_sigmoid_gated( backend::half_t*, const backend::half_t*, const backend::half_t*, const backend::half_t*, int, int, backend::stream_t ) {
 	ENGINE_UNSUPPORTED( "GatedResidual::add_sigmoid_gated" );
 	__builtin_unreachable();

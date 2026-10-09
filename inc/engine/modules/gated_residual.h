@@ -35,6 +35,12 @@ struct GatedResidual {
 	// y[r, :] += sigmoid( x[r] . w ) * s[r, :]  (the shared expert's output gate; w [hidden] fp16)
 	static void add_sigmoid_gated( backend::half_t* y, const backend::half_t* s, const backend::half_t* x, const backend::half_t* w, int rows, int hidden, backend::stream_t stream );
 
+	// out[r * hc + s, :] = fp16( x[r, s, :] * rsqrt(mean(x^2) + eps) * (1 + w[s, :]) ): the per-stream grouped RMS norm (the MTP head's hidden input)
+	static void stream_norm( const float* x, const backend::half_t* w, backend::half_t* out, int rows, int hidden, int hc, float eps, backend::stream_t stream );
+
+	// streams[r, s, :] = h[r * hc + s, :] + e[r, :]  (the embedding branch broadcast into every stream)
+	static void add_broadcast( const backend::half_t* h, const backend::half_t* e, float* streams, int rows, int hidden, int hc, backend::stream_t stream );
+
 	static void apply( float* x, const float* post, const backend::half_t* y, int rows, int hidden, int hc, backend::stream_t stream );
 };
 

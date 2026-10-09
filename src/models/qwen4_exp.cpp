@@ -100,7 +100,12 @@ engine::loader::NgramTable& ngram_table() {
 } // namespace
 
 Qwen4ExpPipeline::Qwen4ExpPipeline() = default;
-Qwen4ExpPipeline::~Qwen4ExpPipeline() = default;
+Qwen4ExpPipeline::~Qwen4ExpPipeline() {
+	if ( arena_ != nullptr ) {
+		backend::set_device( rank_ );
+		graphs_.reset();
+	}
+}
 
 bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
 	rank_ = device_id;
@@ -146,7 +151,9 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 
 	int full_layers = 0;
 	for ( int L = 0; L < config_.num_layers; ++L ) full_layers += config_.is_full_attention( L ) ? 1 : 0;
-	kv_pool_.init( rank_, arena, S, config_.max_seq, full_layers, kv_heads_, config_.head_dim );
+	mtp_on_ = runtime::options().speculator == "mtp";
+	attn_layers_ = full_layers + ( mtp_on_ ? 1 : 0 );   // the MTP block's attention is the last layer of the KV pool and the QSA state
+	kv_pool_.init( rank_, arena, S, config_.max_seq, attn_layers_, kv_heads_, config_.head_dim );
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
 	int h_shape[2] = { R, H };
@@ -167,11 +174,26 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	int kv_shape[2] = { R, kv_heads_ * config_.head_dim };
 	k_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_shape, 2 );
 	v_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_shape, 2 );
+	state_.gdn_checkpoint = static_cast<float*>( engine::core::arena_alloc( arena, state_.slot_gdn_floats * sizeof( float ) ) );
+	state_.conv_checkpoint = static_cast<float*>( engine::core::arena_alloc( arena, state_.slot_conv_floats * sizeof( float ) ) );
+	if ( mtp_on_ ) {
+		int e_shape[2] = { R, H };
+		mtp_emb_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, e_shape, 2 );
+		mtp_xe_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, e_shape, 2 );
+		mtp_e2_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, e_shape, 2 );
+		int s_shape[2] = { R * config_.hc_mult, H };
+		mtp_hn_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, s_shape, 2 );
+		mtp_h2_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, s_shape, 2 );
+		const size_t stack = static_cast<size_t>( config_.hc_mult ) * H * sizeof( float );
+		mtp_src_ = static_cast<float*>( engine::core::arena_alloc( arena, R * stack ) );
+		mtp_hist_ = static_cast<float*>( engine::core::arena_alloc( arena, 2 * ( kDraftM + 1 ) * stack ) );
+		mtp_chain_ = static_cast<float*>( engine::core::arena_alloc( arena, stack ) );
+	}
 	// QSA indexer state
 	{
 		qsa_max_pools_ = config_.max_seq / engine::modules::QSA::POOL;
-		qsa_ring_slot_ = static_cast<size_t>( full_layers ) * engine::modules::QSA::RING * engine::modules::QSA::DIM;
-		qsa_pool_slot_ = static_cast<size_t>( full_layers ) * qsa_max_pools_ * engine::modules::QSA::DIM;
+		qsa_ring_slot_ = static_cast<size_t>( attn_layers_ ) * engine::modules::QSA::RING * engine::modules::QSA::DIM;
+		qsa_pool_slot_ = static_cast<size_t>( attn_layers_ ) * qsa_max_pools_ * engine::modules::QSA::DIM;
 		qsa_ring_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * qsa_ring_slot_ * sizeof( backend::half_t ) ) );
 		qsa_pool_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * qsa_pool_slot_ * sizeof( backend::half_t ) ) );
 		backend::memset_sync( qsa_ring_, 0, static_cast<size_t>( S ) * qsa_ring_slot_ * sizeof( backend::half_t ) );
@@ -325,10 +347,8 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		std::call_once( once, [&]() { table_ok = ngram_table().open( std::string( model_dir ) + "/ngram_embedding.safetensors" ); } );
 		if ( !table_ok ) { LOG_ERROR( "[RANK %d] the n-gram table failed to open\n", rank_ ); ++missing; }
 	}
-	for ( int L = 0; L < config_.num_layers; ++L ) {
-		auto& lw = layers_[L];
-		char pre[160];
-		std::snprintf( pre, sizeof( pre ), "%s.layers.%d", P, L );
+	// One decoder block (a trunk layer or the MTP head's): gated residual sites, attention or GDN, MoE
+	auto load_block = [&]( Qwen4ExpLayerWeights& lw, const char* pre ) {
 		std::snprintf( nm, sizeof( nm ), "%s.attn_hyper_connection", pre ); lw.attn_hc = load_gr( nm, true );
 		std::snprintf( nm, sizeof( nm ), "%s.mlp_hyper_connection", pre ); lw.mlp_hc = load_gr( nm, true );
 
@@ -384,6 +404,21 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.up_proj", pre ); lw.shared_up = check( repo.load_linear( nm, *arena_, 4, stream ), nm );
 		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.down_proj", pre ); lw.shared_down = check( repo.load_linear( nm, *arena_, 4, stream ), nm );
 		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert_gate.weight", pre ); lw.shared_expert_gate = dense( nm );
+	};
+	for ( int L = 0; L < config_.num_layers; ++L ) {
+		char pre[160];
+		std::snprintf( pre, sizeof( pre ), "%s.layers.%d", P, L );
+		load_block( layers_[L], pre );
+	}
+	if ( mtp_on_ ) {
+		// MTP head: one full-attention block with its own gated-residual sites and MoE, the input combine and its own mixer
+		mtp_layer_.is_full_attention = true;
+		load_block( mtp_layer_, "mtp.layers.0" );
+		mtp_pre_norm_hidden_ = dense( "mtp.pre_fc_norm_hidden.weight" );
+		mtp_pre_norm_embedding_ = dense( "mtp.pre_fc_norm_embedding.weight" );
+		mtp_fc_hidden_ = check( repo.load_linear( "mtp.fc_hidden", *arena_, 4, stream ), "mtp.fc_hidden" );
+		mtp_fc_embedding_ = check( repo.load_linear( "mtp.fc_embedding", *arena_, 4, stream ), "mtp.fc_embedding" );
+		mtp_mixer_ = load_gr( "mtp.hyper_connection_mixer", false );
 	}
 	(void) H;
 	if ( stream ) backend::stream_sync( stream );
@@ -463,7 +498,8 @@ void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 		backend::stream_sync( stream );
 	}
 	ple_prepare( rows, m, stream );
-	forward_body( m, stream );
+	// Decode-sized forwards replay a per-row-count graph (the body reads slots, positions and the n-gram rows from device memory)
+	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); } );
 }
 
 void Qwen4ExpPipeline::trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols ) {
@@ -548,7 +584,8 @@ void Qwen4ExpPipeline::attention_forward( const Qwen4ExpLayerWeights& lw, int at
 	QSA::pool_update( qsa_ring_, qsa_pool_, lw.idx_k_norm.ptr<const backend::half_t>(), attn_idx, m, d_rows_, qsa_ring_slot_, qsa_pool_slot_, qsa_max_pools_,
 		config_.rot_dim, config_.rope_theta, config_.rms_norm_eps, stream );
 	static const bool qsa_off = runtime::options().qsa_off;
-	if ( !qsa_off && key_hint_ >= ( config_.indexer_budget / QSA::POOL + 1 ) * QSA::POOL ) {
+	// Decode-sized rows always take the sparse path (it runs rows below the budget densely): the captured graph cannot depend on the position
+	if ( !qsa_off && ( m <= pod::MAX_BATCH || key_hint_ >= ( config_.indexer_budget / QSA::POOL + 1 ) * QSA::POOL ) ) {
 		QSA::score( qsa_q_.ptr<const backend::half_t>(), qsa_pool_, qsa_scores_, qsa_max_pools_, attn_idx, qsa_max_pools_, m, d_rows_, qsa_pool_slot_, stream );
 		engine::modules::DSA::select( qsa_scores_, qsa_max_pools_, qsa_idx_, qsa_nkeys_, m, d_rows_, stream );
 		engine::modules::Attention::forward_sparse( kv, q_buf_, gate_attn_buf_, attn_out_, kv_slot_stride, attn_idx, d_rows_, m, q_heads_, kv_heads_, hd,
@@ -689,6 +726,28 @@ void Qwen4ExpPipeline::teacher_inject( int L, int m, backend::stream_t stream ) 
 	backend::stream_sync( stream );
 }
 
+void Qwen4ExpPipeline::attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L, int m, backend::stream_t stream ) {
+	const int H = config_.hidden_size, hc = config_.hc_mult;
+	gr_mix( lw.attn_hc, true, m, stream );
+	if ( L >= 0 ) trace_rows( 100 + L, mixed_.data, false, m, stream );
+	if ( lw.is_full_attention ) attention_forward( lw, idx, m, stream );
+	else gdn_forward( lw, idx, m, stream );
+	if ( ring_ ) ring_->all_reduce( y_, stream );
+	if ( L >= 0 ) trace_rows( 200 + L, y_.data, false, m, stream );
+	engine::modules::GatedResidual::apply( streams_.ptr<float>(), post_, y_.ptr<const backend::half_t>(), m, H, hc, stream );
+	if ( L >= 0 ) trace_rows( 300 + L, streams_.data, true, m, stream );
+}
+
+void Qwen4ExpPipeline::mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, backend::stream_t stream ) {
+	const int H = config_.hidden_size, hc = config_.hc_mult;
+	gr_mix( lw.mlp_hc, true, m, stream );
+	if ( L >= 0 ) trace_rows( 400 + L, mixed_.data, false, m, stream );
+	moe_forward( lw, m, stream );
+	if ( ring_ ) ring_->all_reduce( y_, stream );
+	if ( L >= 0 ) trace_rows( 500 + L, y_.data, false, m, stream );
+	engine::modules::GatedResidual::apply( streams_.ptr<float>(), post_, y_.ptr<const backend::half_t>(), m, H, hc, stream );
+}
+
 void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size, hc = config_.hc_mult;
 	const int halt = runtime::options().qwen4_halt;
@@ -702,27 +761,9 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 			trace_rows( 800, streams_.data, true, m, stream );
 		}
 		if ( L >= 1 ) teacher_inject( L, m, stream );
-		// Attention site
-		gr_mix( lw.attn_hc, true, m, stream );
-		trace_rows( 100 + L, mixed_.data, false, m, stream );
-		if ( lw.is_full_attention ) {
-			attention_forward( lw, attn_idx++, m, stream );
-		}
-		else {
-			gdn_forward( lw, linear_idx++, m, stream );
-		}
-		if ( ring_ ) ring_->all_reduce( y_, stream );
-		trace_rows( 200 + L, y_.data, false, m, stream );
-		engine::modules::GatedResidual::apply( streams_.ptr<float>(), post_, y_.ptr<const backend::half_t>(), m, H, hc, stream );
-		trace_rows( 300 + L, streams_.data, true, m, stream );
+		attn_site( lw, lw.is_full_attention ? attn_idx++ : linear_idx++, L, m, stream );
 		if ( halt == site++ ) return;
-		// MLP site
-		gr_mix( lw.mlp_hc, true, m, stream );
-		trace_rows( 400 + L, mixed_.data, false, m, stream );
-		moe_forward( lw, m, stream );
-		if ( ring_ ) ring_->all_reduce( y_, stream );
-		trace_rows( 500 + L, y_.data, false, m, stream );
-		engine::modules::GatedResidual::apply( streams_.ptr<float>(), post_, y_.ptr<const backend::half_t>(), m, H, hc, stream );
+		mlp_site( lw, L, m, stream );
 		if ( static const double eps_l = runtime::options().perturb_layers; eps_l != 0.0 && m > pod::MAX_BATCH ) {
 			const size_t n = static_cast<size_t>( m ) * hc * H;
 			std::vector<float> st( n );
@@ -751,6 +792,107 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 	pod::TensorView hin = pod::make_tensor_2d( mixed_.ptr<backend::half_t>(), pod::DType::FP16, n, H );
 	pod::TensorView lout = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, n, lm_shard_cols_ );
 	engine::modules::Linear::forward( hin, lm_head_, lout, stream );
+}
+
+void Qwen4ExpPipeline::checkpoint_state( int slot_id, backend::stream_t stream ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen4ExpPipeline::checkpoint_state: slot out of range" );
+	backend::set_device( rank_ );
+	backend::memcpy_async( state_.gdn_checkpoint, state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, state_.slot_gdn_floats * sizeof( float ), backend::Copy::D2D, stream );
+	backend::memcpy_async( state_.conv_checkpoint, state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
+}
+
+void Qwen4ExpPipeline::rollback_state( int slot_id, backend::stream_t stream ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen4ExpPipeline::rollback_state: slot out of range" );
+	backend::set_device( rank_ );
+	backend::memcpy_async( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, state_.gdn_checkpoint, state_.slot_gdn_floats * sizeof( float ), backend::Copy::D2D, stream );
+	backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, state_.conv_checkpoint, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
+}
+
+void Qwen4ExpPipeline::set_spec_snapshot( bool on, backend::stream_t stream ) {
+	backend::set_device( rank_ );
+	const int v = on ? 1 : 0;
+	backend::memcpy_async( state_.d_snap_on, &v, sizeof( int ), backend::Copy::H2D, stream );
+}
+
+void Qwen4ExpPipeline::commit_spec_row( int slot_id, int row, backend::stream_t stream ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots && row >= 0 && row < kDraftM, "Qwen4ExpPipeline::commit_spec_row: out of range" );
+	backend::set_device( rank_ );
+	backend::memcpy_async( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, state_.gdn_snap + static_cast<size_t>( row ) * state_.slot_gdn_floats,
+		state_.slot_gdn_floats * sizeof( float ), backend::Copy::D2D, stream );
+	backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, state_.conv_snap + static_cast<size_t>( row ) * state_.slot_conv_floats,
+		state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
+}
+
+// One MTP forward (see llama.cpp's qwen4exp MTP graph): per row, the target's pre-collapse stream stack h (4 x hidden) and the token that follows the row's
+// position. streams[s] = fc_hidden( rmsnorm_s( h[s] ) ) + fc_embedding( rmsnorm( embed( token ) ) ); then the usual block (attention site, MLP site) on those
+// streams with the head's own weights; the streams after the block are the next step's h and, through the head's mixer and the shared LM head, the draft logits.
+// hidden_mode: 0 = the last forward's stacks, 1 = saved row hist_row0 then the last forward's rows 0 .. m - 2, 2 = saved rows from hist_row0, 3 = the previous step's output.
+void Qwen4ExpPipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream ) {
+	ENGINE_ASSERT( mtp_on_ && weights_loaded_, "Qwen4ExpPipeline::mtp_step: no MTP head" );
+	backend::set_device( rank_ );
+	const int m = rows.count;
+	const int H = config_.hidden_size, hc = config_.hc_mult;
+	const size_t stack = static_cast<size_t>( hc ) * H * sizeof( float );
+	ENGINE_ASSERT( m >= 1 && m <= pod::MAX_ROWS, "Qwen4ExpPipeline::mtp_step: rows out of range" );
+	key_hint_ = rows.pos[m - 1] + 1;
+	set_rows( m );
+	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
+
+	// 1. embedding branch
+	backend::memcpy_async( d_token_ids_, tokens, m * sizeof( int ), backend::Copy::H2D, stream );
+	pod::TensorView emb = pod::make_tensor_2d( mtp_emb_.data, pod::DType::FP16, m, H );
+	pod::TensorView xe = pod::make_tensor_2d( mtp_xe_.data, pod::DType::FP16, m, H );
+	pod::TensorView e2 = pod::make_tensor_2d( mtp_e2_.data, pod::DType::FP16, m, H );
+	engine::modules::Embedding::forward( embed_table_, d_token_ids_, m, emb, stream );
+	engine::modules::RMSNorm::forward( emb, mtp_pre_norm_embedding_, xe, config_.rms_norm_eps, 1.0f, stream );
+	engine::modules::Linear::forward( xe, mtp_fc_embedding_, e2, stream );
+
+	// 2. hidden branch: per-stream norm, fc_hidden on every stream
+	const float* src = nullptr;
+	switch ( hidden_mode ) {
+		case 0: src = streams_.ptr<const float>(); break;
+		case 1: {
+			backend::memcpy_async( mtp_src_, mtp_hist_ + static_cast<size_t>( hist_row0 ) * hc * H, stack, backend::Copy::D2D, stream );
+			if ( m > 1 ) backend::memcpy_async( mtp_src_ + static_cast<size_t>( hc ) * H, streams_.data, static_cast<size_t>( m - 1 ) * stack, backend::Copy::D2D, stream );
+			src = mtp_src_;
+		} break;
+		case 2: src = mtp_hist_ + static_cast<size_t>( hist_row0 ) * hc * H; break;
+		default: src = mtp_chain_; break;
+	}
+	for ( int r0 = 0; r0 < m; r0 += 128 ) {   // chunks of at most 512 stream rows
+		const int n = MIN( 128, m - r0 );
+		engine::modules::GatedResidual::stream_norm( src + static_cast<size_t>( r0 ) * hc * H, mtp_pre_norm_hidden_.ptr<const backend::half_t>(),
+			mtp_hn_.ptr<backend::half_t>(), n, H, hc, config_.rms_norm_eps, stream );
+		pod::TensorView hn = pod::make_tensor_2d( mtp_hn_.data, pod::DType::FP16, n * hc, H );
+		pod::TensorView h2 = pod::make_tensor_2d( mtp_h2_.ptr<backend::half_t>() + static_cast<size_t>( r0 ) * hc * H, pod::DType::FP16, n * hc, H );
+		engine::modules::Linear::forward( hn, mtp_fc_hidden_, h2, stream );
+	}
+	engine::modules::GatedResidual::add_broadcast( mtp_h2_.ptr<const backend::half_t>(), e2.ptr<const backend::half_t>(), streams_.ptr<float>(), m, H, hc, stream );
+
+	// 3. the head's block (its attention is the last layer of the KV pool)
+	attn_site( mtp_layer_, attn_layers_ - 1, -1, m, stream );
+	mlp_site( mtp_layer_, -1, m, stream );
+
+	// 4. the output stack feeds the next step; the mixer and the shared head give the draft logits of the last row
+	backend::memcpy_async( mtp_chain_, streams_.ptr<const char>() + static_cast<size_t>( m - 1 ) * stack, stack, backend::Copy::D2D, stream );
+	if ( logits_last ) {
+		engine::modules::GatedResidual::mix( mtp_chain_, mtp_mixer_.norm.ptr<const backend::half_t>(), mtp_mixer_.down.ptr<const backend::half_t>(),
+			mtp_mixer_.up.ptr<const backend::half_t>(), nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_, 1, H, hc, config_.hc_rank, config_.rms_norm_eps, stream );
+		pod::TensorView hin = pod::make_tensor_2d( mixed_.ptr<backend::half_t>(), pod::DType::FP16, 1, H );
+		pod::TensorView lout = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
+		engine::modules::Linear::forward( hin, lm_head_, lout, stream );
+		logits_.shape[0] = 1;
+		last_rows_ = 1;
+	}
+}
+
+// Keeps the stacks of rows [src_row, src_row + rows) of the last forward for later steps (row dst_row onwards)
+void Qwen4ExpPipeline::mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream ) {
+	ENGINE_ASSERT( mtp_on_ && rows >= 1 && dst_row + rows <= 2 * ( kDraftM + 1 ), "Qwen4ExpPipeline::mtp_save_hist: rows out of range" );
+	backend::set_device( rank_ );
+	const size_t stack = static_cast<size_t>( config_.hc_mult ) * config_.hidden_size * sizeof( float );
+	backend::memcpy_async( reinterpret_cast<char*>( mtp_hist_ ) + static_cast<size_t>( dst_row ) * stack, streams_.ptr<const char>() + static_cast<size_t>( src_row ) * stack,
+		static_cast<size_t>( rows ) * stack, backend::Copy::D2D, stream );
 }
 
 void Qwen4ExpPipeline::sample_tokens( int* out_preds, int count, backend::stream_t stream ) {
@@ -785,8 +927,6 @@ bool Qwen4ExpPipeline::topk_local( float* out_vals, int* out_ids, int count, bac
 	backend::stream_sync( stream );
 	return true;
 }
-void Qwen4ExpPipeline::checkpoint_state( int, backend::stream_t ) {}
-void Qwen4ExpPipeline::rollback_state( int, backend::stream_t ) {}
 
 void Qwen4ExpPipeline::reset_state( int slot_id ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen4ExpPipeline::reset_state: slot out of range" );

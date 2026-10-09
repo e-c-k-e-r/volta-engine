@@ -109,6 +109,12 @@ public:
 	const backend::half_t* shard_logits_ptr() const override { return logits_.ptr<const backend::half_t>(); }
 	int shard_logits_cols() const override { return lm_shard_cols_; }
 
+	void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) override;
+	void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) override;
+	// MTP head (speculator=mtp): one full-attention block fed by the target's pre-collapse streams and the next token's embedding
+	bool has_mtp() const override { return mtp_on_; }
+	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
+	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
 	void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void reset_state( int slot_id = 0 ) override;
@@ -126,6 +132,10 @@ public:
 private:
 	void set_rows( int m );
 	void forward_body( int m, backend::stream_t stream );
+	// One sublayer site of a block: gated-residual mix, the sublayer, the cross-rank sum and the residual write. idx is the attention or linear layer
+	// counter of the block; L (>= 0) names the trace tags
+	void attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L, int m, backend::stream_t stream );
+	void mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, backend::stream_t stream );
 	void teacher_inject( int L, int m, backend::stream_t stream );
 	// One sublayer's input: the gated-residual mix of the streams into mixed_ (and post_ when the site has an inject gate)
 	void gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream );
@@ -163,11 +173,14 @@ private:
 		float* gdn_snap = nullptr;      // per-row post-state snapshots for speculation (kDraftM rows)
 		float* conv_snap = nullptr;
 		int* d_snap_on = nullptr;
+		float* gdn_checkpoint = nullptr;  // one-slot snapshot (checkpoint_state / rollback_state)
+		float* conv_checkpoint = nullptr;
 		size_t slot_gdn_floats = 0;
 		size_t slot_conv_floats = 0;
 	} state_;
 
 	pod::BatchRows* d_rows_ = nullptr;
+	engine::core::GraphCache graphs_;
 	int* d_token_ids_ = nullptr;
 	pod::TensorView embed_table_;
 	pod::TensorView embed_rows_;      // [R, hidden] fp16
@@ -224,6 +237,18 @@ private:
 	int lm_shard_cols_ = 0;
 
 	std::vector<Qwen4ExpLayerWeights> layers_;
+
+	// MTP head
+	bool mtp_on_ = false;
+	int attn_layers_ = 0;               // full-attention layers including the MTP block's
+	Qwen4ExpLayerWeights mtp_layer_;
+	pod::TensorView mtp_pre_norm_hidden_, mtp_pre_norm_embedding_;
+	pod::LinearWeight mtp_fc_hidden_, mtp_fc_embedding_;
+	Qwen4ExpGatedResidual mtp_mixer_;
+	pod::TensorView mtp_emb_, mtp_xe_, mtp_e2_, mtp_hn_, mtp_h2_;   // [R, H] x3, [R * hc, H] x2 (fp16)
+	float* mtp_src_ = nullptr;          // [R, hc, H] staging of the hidden stacks of a step
+	float* mtp_hist_ = nullptr;         // [2 * (kDraftM + 1), hc, H] saved stacks
+	float* mtp_chain_ = nullptr;        // [hc, H] the previous step's output stack
 };
 
 } // namespace engine::models
