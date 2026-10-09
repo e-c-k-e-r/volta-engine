@@ -255,7 +255,7 @@ bool ServerConfig::resolve() {
 		model_type = j["model_type"].get<std::string>();
 	}
 	if ( !models::is_known_model_type( model_type ) ) {
-		LOG_ERROR( "FATAL: unsupported model_type '%s' (supported: qwen3_5, glm5_next)\n", model_type.c_str() );
+		LOG_ERROR( "FATAL: unsupported model_type '%s' (supported: qwen3_5, glm5_next, qwen4_exp)\n", model_type.c_str() );
 		return false;
 	}
 	// Sampling defaults: explicit config wins, then the checkpoint's generation_config.json
