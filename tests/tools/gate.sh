@@ -2,7 +2,7 @@
 # Regression gate for refactors. Modes (GPU modes serialize: one job at a time, run under taskset -c 0-9):
 #   quick           CUDA build + kernel resource fingerprint (cuobjdump -res-usage: seconds) + coherence. For moves/renames/config work.
 #   fingerprint     save the resource fingerprint of the current build (results/fingerprint.txt)
-#   sass            full SASS md5 + HMMA count of bench_decode and volta_server in one pass (~40 s per binary), vs results/sass.txt (saved if absent)
+#   sass            order-independent SASS fingerprint (per-function hashes) + HMMA count of bench_decode and volta_server (~40 s per binary), vs results/sass.txt (saved if absent)
 #   static          no GPU: header hygiene greps (backend abstraction) and a full build
 #   parity          GPU: tier 2 parity tests + coherence + sampling gate
 #   bench           GPU: bench_decode / bench_accept / bench_prefill for both models
@@ -115,8 +115,7 @@ fingerprint() { # one line per binary: md5 of per-kernel registers/stack/smem
 
 sass_fingerprint() {
 	for b in bench_decode volta_server; do
-		cuobjdump -sass $b 2>/dev/null | tee >(grep -c HMMA > $out/$b.hmma) | grep -E '^\s+/\*[0-9a-f]{4}\*/' | sed -E 's#/\*[0-9a-f]+\*/##;s#;.*##' | md5sum | cut -c1-32 > $out/$b.md5
-		echo "$b $(cat $out/$b.md5) hmma=$(cat $out/$b.hmma)"
+		echo "$b $(cuobjdump -sass $b 2>/dev/null | python3 -I $ROOT/tests/tools/sass_fingerprint.py)"
 	done
 }
 

@@ -66,18 +66,19 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 set(ENGINE_DEVICE_SOURCES
 	src/comm/all_reduce_ipc.cu
 	src/kernels/cuda/nvfp4/skinny_kernels.cu
-	src/modules/norm.cu
-	src/modules/swiglu.cu
-	src/modules/rope.cu
-	src/modules/attention.cu
-	src/modules/gdn.cu
-	src/modules/mla.cu
-	src/modules/mla_latent.cu
-	src/modules/dsa.cu
-	src/modules/moe.cu
-	src/modules/expert_tier.cu
-	src/modules/mhc.cu
-	src/modules/embedding.cu
+	src/backend/cuda/modules/norm.cu
+	src/backend/cuda/modules/swiglu.cu
+	src/backend/cuda/modules/rope.cu
+	src/backend/cuda/modules/attention.cu
+	src/backend/cuda/modules/gdn.cu
+	src/backend/cuda/modules/mla.cu
+	src/backend/cuda/modules/mla_latent.cu
+	src/backend/cuda/modules/dsa.cu
+	src/backend/cuda/modules/moe.cu
+	src/backend/cuda/modules/expert_tier.cu
+	src/backend/cuda/modules/mhc.cu
+	src/backend/cuda/modules/embedding.cu
+	src/backend/cuda/modules/linear_trellis.cu
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
 	src/spec/dflash_backbone.cu
@@ -94,7 +95,6 @@ set(TRELLIS_SOURCES
 	src/kernels/cuda/trellis/exl3_moe_coop.cu
 	src/kernels/cuda/trellis/hadamard.cu
 	src/kernels/cuda/trellis/reconstruct.cu
-	src/kernels/cuda/trellis/trellis.cu
 	src/kernels/cuda/trellis/trellis_context.cu
 )
 
