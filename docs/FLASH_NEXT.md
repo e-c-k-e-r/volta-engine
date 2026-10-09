@@ -100,5 +100,14 @@ Findings worth keeping: the exllamav3 fork zeroed the GDN b/a gates (a deferred-
 layers (5, 8, 45, 46 are 3-bit) and 8 / 7 bpw shared experts and projections; the tokenizer's split regex differs from Qwen3.8-27B's (marks are not
 letters), recognised in `tokenizer.cpp`.
 
-Next: 100K / 256K context and batch 2, speculation (MTP head), the vision tower, CUDA graphs for decode (the n-gram gather is a host step), an 8 bpw
-decode GEMV, a tensor-core QSA scorer and sparse kernel, SASS / bench baselines.
+MTP (`--speculative --set speculator=mtp`): the head follows llama.cpp's qwen4exp MTP graph (per-stream norm of the pre-collapse streams, fc_hidden on every
+stream plus the broadcast fc_embedding branch, one block with its own KV / QSA layer, its own mixer, the shared head). Greedy output equals the plain
+decode exactly; 58 tok/s against 31.9 tok/s plain on a short chat request. Decode (plain) is 32.2 ms/token after CUDA graphs, the coalesced gated-residual
+kernels and the 3-bit MoE dispatch fix; the 100K-token needle passes (prefill 274 tok/s, decode 22.5 before those optimizations); 256K with 2 slots loads
+(arena 24.3 / 29.8 GiB per GPU), its needle is deferred to the end.
+
+Decode profile (per GPU per token, 120-step nvprof): MoE persistent kernel 9.4 ms (213 us per call, ~6x off bandwidth), all-reduce 5.2 (ranks wait for rank 0's
+shared expert), 7/8 bpw projections 6.9, gated residual ~5, sparse attention 1.1, router 1.5.
+
+Next: a 4-bit fused MoE decode kernel, the shared expert spread over ranks, the vision tower, an 8 bpw decode GEMV, a tensor-core QSA scorer and sparse
+kernel, the SASS / bench baselines and the 256K needle.
