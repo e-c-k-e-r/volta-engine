@@ -112,6 +112,10 @@ public:
 	void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void reset_state( int slot_id = 0 ) override;
+	// Prefix-cache snapshots of a slot: [GDN state | conv history | n-gram conv ring | token context (3 ints)] then the KV rows [from, tokens) of every attention layer
+	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
+	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
+	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;
 
 	pod::TensorView& logits() override { return logits_; }
 	const pod::TensorView& logits() const override { return logits_; }
@@ -132,6 +136,7 @@ private:
 	// MoE sublayer: mixed_ in, this rank's partial result (routed experts of the rank, plus the shared expert on rank 0) in y_
 	void moe_forward( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream );
 	// Debug trace (trace_layers): the first position of the forward, rows of streams or of an fp16 matrix
+	void copy_kv_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	void trace_route( int tag, int m, backend::stream_t stream );
 	void trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols = 0 );
 

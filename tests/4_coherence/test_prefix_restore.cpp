@@ -2,7 +2,7 @@
 // tokens, snapshots the slot (recurrent state + KV rows), restores into other slots and prefills only the tail; the
 // next-token candidates and 16 greedy continuation tokens must match the cold run. An aligned cut (a multiple of the
 // prefill chunk) reproduces the cold chunk boundaries and must match bit for bit.
-//   test_prefix_restore [--glm] [--spec] [--tokens N]   (ENGINE_KV_FORMAT=fp8|k8v4|nvfp4 selects a quantized KV cache; GLM stores its latent in that format)
+//   test_prefix_restore [--glm | --flash] [--spec] [--tokens N]   (ENGINE_KV_FORMAT=fp8|k8v4|nvfp4 selects a quantized KV cache; GLM stores its latent in that format)
 #include "engine/runtime/test_driver.h"
 #include "engine/runtime/prefix_cache.h"
 #include "engine/loader/tokenizer.h"
@@ -42,14 +42,16 @@ static std::vector<int> decode( ModelCluster& mc, int first, int pos, int slot, 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	int n_tokens = 6000;
-	bool spec = false, glm = false;
+	bool spec = false, glm = false, flash = false;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--spec" ) ) spec = true;
 		else if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
+		else if ( !std::strcmp( argv[i], "--flash" ) ) flash = true;
 		if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
 	}
 	engine::loader::Tokenizer tok;
-	ENGINE_ASSERT( tok.load( glm ? test::GLM_DIR : test::QWEN_DIR ), "tokenizer load failed" );
+	const char* model_dir = glm ? test::GLM_DIR : ( flash ? test::FLASH_DIR : test::QWEN_DIR );
+	ENGINE_ASSERT( tok.load( model_dir ), "tokenizer load failed" );
 	std::vector<int> ids = glm ? tok.encode( "[gMASK]<sop><|user|>", false ) : std::vector<int>{ 248045, 846, 198 };
 	for ( int i = 0; static_cast<int>( ids.size() ) < n_tokens; ++i ) {
 		const std::string s = "Note " + std::to_string( i ) + ": the weather in district " + std::to_string( i * 7 % 101 ) + " was mild on day " + std::to_string( i % 365 ) + ". ";
@@ -63,8 +65,8 @@ int main( int argc, char** argv ) {
 
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm5_next" : "qwen3_5";
-	cfg.model_dir = glm ? test::GLM_DIR : test::QWEN_DIR;
+	cfg.model_type = glm ? "glm5_next" : ( flash ? "qwen4_exp" : "qwen3_5" );
+	cfg.model_dir = model_dir;
 	if ( spec ) cfg.draft_model_dir = glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	ENGINE_ASSERT( mc.snapshot_bytes( 0, 1024 ) > 0, "the model cannot snapshot" );

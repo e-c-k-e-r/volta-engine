@@ -706,4 +706,94 @@ void Qwen4ExpPipeline::reset_state( int slot_id ) {
 	std::fill( hist_seg_[slot_id].begin(), hist_seg_[slot_id].end(), 0 );
 }
 
+namespace {
+
+constexpr size_t kSeqAlign = 256;
+constexpr size_t kCtxBytes = 16;   // two token ids and the eos segment start of the last position, padded
+
+size_t kv_segment_bytes( pod::KVQ q, size_t row_elems, int rows ) {
+	return pod::kv_data_bytes( q, row_elems * rows ) + pod::kv_scale_bytes( q, row_elems * rows );
+}
+
+} // namespace
+
+size_t Qwen4ExpPipeline::seq_state_bytes( int from, int tokens, bool with_taps ) const {
+	(void) with_taps;   // no drafter taps on this model
+	if ( !kv_pool_.k_data || from < 0 || tokens < from || tokens > config_.max_seq ) return 0;
+	const size_t recurrent = ( state_.slot_gdn_floats + state_.slot_conv_floats ) * sizeof( float );
+	const size_t ring = static_cast<size_t>( engine::modules::PLE::RING ) * config_.hc_mult * config_.hidden_size * sizeof( backend::half_t );
+	const size_t row_elems = static_cast<size_t>( kv_pool_.num_heads ) * kv_pool_.head_dim;
+	const pod::KVQ kq = pod::kv_k_quant( kv_pool_.format ), vq = pod::kv_v_quant( kv_pool_.format );
+	const size_t kv = static_cast<size_t>( kv_pool_.num_layers ) * ( kv_segment_bytes( kq, row_elems, tokens - from ) + kv_segment_bytes( vq, row_elems, tokens - from ) );
+	return recurrent + ring + kCtxBytes + kv + kSeqAlign;
+}
+
+// Host <-> device copy of every KV range of the snapshot, in layout order
+void Qwen4ExpPipeline::copy_kv_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream ) {
+	const size_t row_elems = static_cast<size_t>( kv_pool_.num_heads ) * kv_pool_.head_dim;
+	const size_t count = static_cast<size_t>( tokens - from );
+	if ( count == 0 ) return;
+	const pod::KVQ kqs[2] = { pod::kv_k_quant( kv_pool_.format ), pod::kv_v_quant( kv_pool_.format ) };
+	char* data_base[2] = { static_cast<char*>( kv_pool_.k_data ), static_cast<char*>( kv_pool_.v_data ) };
+	char* scale_base[2] = { static_cast<char*>( kv_pool_.k_scale ), static_cast<char*>( kv_pool_.v_scale ) };
+	const size_t slot_data[2] = { kv_pool_.k_slot_bytes, kv_pool_.v_slot_bytes };
+	const size_t slot_scale[2] = { kv_pool_.k_scale_slot_bytes, kv_pool_.v_scale_slot_bytes };
+	const backend::Copy dir = to_host ? backend::Copy::D2H : backend::Copy::H2D;
+	for ( int layer = 0; layer < kv_pool_.num_layers; ++layer ) {
+		const size_t elem0 = ( static_cast<size_t>( layer ) * kv_pool_.max_seq_len + from ) * row_elems;
+		for ( int kv = 0; kv < 2; ++kv ) {
+			const size_t db = pod::kv_data_bytes( kqs[kv], row_elems * count );
+			char* dev = data_base[kv] + static_cast<size_t>( slot_id ) * slot_data[kv] + pod::kv_data_bytes( kqs[kv], elem0 );
+			if ( to_host ) backend::memcpy_async( host, dev, db, dir, stream );
+			else backend::memcpy_async( dev, host, db, dir, stream );
+			host += db;
+			if ( const size_t sb = pod::kv_scale_bytes( kqs[kv], row_elems * count ) ) {
+				char* sdev = scale_base[kv] + static_cast<size_t>( slot_id ) * slot_scale[kv] + pod::kv_scale_bytes( kqs[kv], elem0 );
+				if ( to_host ) backend::memcpy_async( host, sdev, sb, dir, stream );
+				else backend::memcpy_async( sdev, host, sb, dir, stream );
+				host += sb;
+			}
+		}
+	}
+}
+
+bool Qwen4ExpPipeline::save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens, with_taps ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+	backend::set_device( rank_ );
+	char* dst = static_cast<char*>( host_dst );
+	const size_t gdn = state_.slot_gdn_floats * sizeof( float ), conv = state_.slot_conv_floats * sizeof( float );
+	const size_t ring = static_cast<size_t>( engine::modules::PLE::RING ) * config_.hc_mult * config_.hidden_size * sizeof( backend::half_t );
+	backend::memcpy_async( dst, state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, gdn, backend::Copy::D2H, stream );
+	backend::memcpy_async( dst + gdn, state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, conv, backend::Copy::D2H, stream );
+	backend::memcpy_async( dst + gdn + conv, ple_ring_ + static_cast<size_t>( slot_id ) * ( ring / sizeof( backend::half_t ) ), ring, backend::Copy::D2H, stream );
+	dst += gdn + conv + ring;
+	// Token context of the last position: what the n-gram hash of the next position reads
+	int ctx[4] = { 0, 0, 0, 0 };
+	if ( tokens >= 1 ) { ctx[0] = hist_tok_[slot_id][tokens - 1]; ctx[2] = hist_seg_[slot_id][tokens - 1]; }
+	if ( tokens >= 2 ) ctx[1] = hist_tok_[slot_id][tokens - 2];
+	std::memcpy( dst, ctx, kCtxBytes );
+	dst += kCtxBytes;
+	copy_kv_rows( slot_id, from, tokens, dst, true, stream );
+	return true;
+}
+
+bool Qwen4ExpPipeline::load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens, with_taps ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+	backend::set_device( rank_ );
+	const char* src = static_cast<const char*>( host_src );
+	const size_t gdn = state_.slot_gdn_floats * sizeof( float ), conv = state_.slot_conv_floats * sizeof( float );
+	const size_t ring = static_cast<size_t>( engine::modules::PLE::RING ) * config_.hc_mult * config_.hidden_size * sizeof( backend::half_t );
+	if ( !kv_only ) {
+		backend::memcpy_async( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, src, gdn, backend::Copy::H2D, stream );
+		backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, src + gdn, conv, backend::Copy::H2D, stream );
+		backend::memcpy_async( ple_ring_ + static_cast<size_t>( slot_id ) * ( ring / sizeof( backend::half_t ) ), src + gdn + conv, ring, backend::Copy::H2D, stream );
+		int ctx[4];
+		std::memcpy( ctx, src + gdn + conv + ring, kCtxBytes );
+		if ( tokens >= 1 ) { hist_tok_[slot_id][tokens - 1] = ctx[0]; hist_seg_[slot_id][tokens - 1] = ctx[2]; }
+		if ( tokens >= 2 ) hist_tok_[slot_id][tokens - 2] = ctx[1];
+	}
+	copy_kv_rows( slot_id, from, tokens, const_cast<char*>( src ) + gdn + conv + ring + kCtxBytes, false, stream );
+	return true;
+}
+
 } // namespace engine::models
