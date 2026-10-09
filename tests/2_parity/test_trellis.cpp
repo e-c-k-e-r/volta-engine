@@ -56,10 +56,11 @@ static void run_parity_test_k(
 	int k_dim,
 	int n_dim,
 	pod::MemoryArena& arena,
-	cudaStream_t stream
+	cudaStream_t stream,
+	bool mul1 = false
 ) {
-	std::printf( "[*] Testing K=%d (%d bpw), mcg=%s, M=%d, K=%d, N=%d...\n",
-		K, K, mcg ? "true" : "false", m, k_dim, n_dim );
+	std::printf( "[*] Testing K=%d (%d bpw), mcg=%s%s, M=%d, K=%d, N=%d...\n",
+		K, K, mcg ? "true" : "false", mul1 ? ", mul1" : "", m, k_dim, n_dim );
 
 	size_t x_numel = static_cast<size_t>( m ) * k_dim;
 	size_t w_numel = static_cast<size_t>( k_dim ) * n_dim;
@@ -127,7 +128,7 @@ static void run_parity_test_k(
 		svh_tv.ptr<const half>(),
 		K,
 		mcg,
-		false,
+		mul1,
 		k_dim,
 		n_dim,
 		0,
@@ -160,7 +161,7 @@ static void run_parity_test_k(
 		out_tv,
 		K,
 		mcg,
-		false,
+		mul1,
 		stream
 	);
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
@@ -177,7 +178,7 @@ static void run_parity_test_k(
 		out_tv,
 		K,
 		mcg,
-		false,
+		mul1,
 		stream
 	);
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
@@ -259,14 +260,19 @@ int main( int argc, char** argv ) {
 	bool ok = engine::core::arena_create( arena, dev, arena_bytes );
 	ENGINE_ASSERT( ok, "Failed to create static arena" );
 
-	// Sweep across 2, 3, 4, 5, 6 bpw
-	int bit_widths[] = { 2, 3, 4, 5, 6 };
+	// Sweep across 2 .. 8 bpw (the M <= 8 GEMV kernels exist for 2 .. 6; 1, 7 and 8 take the GEMM kernel)
+	int bit_widths[] = { 2, 3, 4, 5, 6, 7, 8 };
 	for ( int K : bit_widths ) {
 		bool mcg = ( K != 4 );
 		// Test GEMV shape (m = 1 or 4, small N)
 		run_parity_test_k( K, mcg, 4, 512, 512, arena, stream );
 		// Test GEMM shape (m = 16 or wide N)
 		run_parity_test_k( K, mcg, 16, 512, 1024, arena, stream );
+	}
+	// Multiplier codebook (cb 2): what the Flash-Next 7 / 8 bpw projections use
+	for ( int K : { 5, 7, 8 } ) {
+		run_parity_test_k( K, false, 4, 512, 512, arena, stream, true );
+		run_parity_test_k( K, false, 16, 512, 1024, arena, stream, true );
 	}
 
 	CUDA_CHECK( cudaStreamDestroy( stream ) );

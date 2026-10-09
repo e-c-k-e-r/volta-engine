@@ -9,7 +9,7 @@ namespace cg = cooperative_groups;
 #include "exl3_kernel_map.cuh"
 #include "exl3_mgemm_gv_kernel.cuh"
 
-// Stub out unused bitwidths 1, 7, 8 to avoid hundreds of unused template instantiations
+// Stub out the unused bitwidth 1 to avoid hundreds of unused template instantiations (7 and 8 are real: Flash-Next ships 8 bpw projections)
 #define STUB_K(K) \
 	fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K##_cb0[5] = {}; \
 	fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K##_cb0[5] = {}; \
@@ -25,11 +25,9 @@ namespace cg = cooperative_groups;
 	fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K##_cb2[5] = {};
 
 STUB_K(1)
-STUB_K(7)
-STUB_K(8)
 #undef STUB_K
 
-// Real instantiations for Trellis active bitwidths: 2, 3, 4, 5, 6
+// Real instantiations for Trellis active bitwidths: 2 .. 8
 #define INSTANTIATE_K(K) \
 	EXL3_KERNEL_INSTANCES_CB(K, 0) \
 	EXL3_KERNEL_INSTANCES_CB(K, 1) \
@@ -40,6 +38,8 @@ INSTANTIATE_K(3)
 INSTANTIATE_K(4)
 INSTANTIATE_K(5)
 INSTANTIATE_K(6)
+INSTANTIATE_K(7)
+INSTANTIATE_K(8)
 #undef INSTANTIATE_K
 
 // Instantiations for SM70 m=1 GEMV-class mgemm restructure (exl3_mgemm_gv_kernel)
