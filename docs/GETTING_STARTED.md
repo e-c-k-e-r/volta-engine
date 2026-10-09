@@ -38,7 +38,7 @@ Qwen extras:
 
 * **Images**: the checkpoint's vision tower loads next to the weights (`max_image_tokens`, default 1024 language-model tokens per
   image, 0 turns it off). Send OpenAI `image_url` parts (base64 `data:` URLs) or Anthropic `image` blocks (base64 sources),
-  also inside Anthropic `tool_result` blocks; remote URLs are not fetched. GLM has no vision tower and answers 400.
+  also inside Anthropic `tool_result` blocks; remote URLs are not fetched. GLM's checkpoint ships a vision tower too, but the engine does not run it yet, so GLM answers 400.
 * **MTP speculation**: `--speculative --set speculator=mtp` drafts with the checkpoint's own multi-token-prediction head and
   needs no draft model (about 1.7x plain decoding against 2.4x for DFlash2 on the same prompts, and it saves the drafter's VRAM).
 * **Two GPUs per instance**: `--tp-size 2` runs one model on two GPUs (about 0.7x the speed of four); start a second server with
