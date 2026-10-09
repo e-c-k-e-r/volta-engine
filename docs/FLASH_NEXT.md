@@ -93,5 +93,5 @@ Findings worth keeping: the exllamav3 fork zeroed the GDN b/a gates (a deferred-
 the checkpoint mixes 3- and 4-bit expert layers (5, 8, 45, 46 are 3-bit) and 8 / 7 bpw shared experts and projections; the tokenizer's split
 regex differs from Qwen3.8-27B's (marks are not letters), recognised in `tokenizer.cpp`.
 
-Next: QSA selection (long context), prefix snapshots (GDN state, KV rows, n-gram conv ring, token history), 256K context and batch 2,
+Next: QSA selection (long context), 256K context and batch 2 (prefix snapshots are done),
 speculation (MTP head), the vision tower, CUDA graphs for decode, an 8 bpw decode GEMV, SASS / bench baselines.
