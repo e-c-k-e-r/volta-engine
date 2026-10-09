@@ -42,7 +42,7 @@ bool int8_smem_for( int bits ) {
 // Highest K the int8 path accepts. Measured on V100: 4 bpw MLP 57.7 -> 51.5 us and 5 bpw 85.6 ->
 // 75.9 us in residual mode, both wins; above this the fp16 tensor-core path wins.
 int int8_max_k() {
-	return 5;
+	return 8;
 }
 
 template <int bits, int M, bool c_fp32, bool residual, bool stage_smem>
@@ -87,6 +87,8 @@ void* select_kernel( int K, int M, bool c_fp32, bool residual ) {
 		case 4: return sel_c<4, 1>( c_fp32, residual );
 		case 5: return sel_c<5, 1>( c_fp32, residual );
 		case 6: return sel_c<6, 1>( c_fp32, residual );
+		case 7: return sel_c<7, 1>( c_fp32, residual );
+		case 8: return sel_c<8, 1>( c_fp32, residual );
 		default: return nullptr;
 	}
 }
@@ -137,7 +139,7 @@ void exl3_gemv_int8_init( int device ) {
 	int cur = 0;
 	CUDA_CHECK( cudaGetDevice( &cur ) );
 	CUDA_CHECK( cudaSetDevice( device ) );
-	for ( int bits : { 2, 3, 4, 5, 6 } ) {
+	for ( int bits : { 2, 3, 4, 5, 6, 7, 8 } ) {
 		for ( int M : { 1, 2 } ) {
 			for ( bool fp32 : { false, true } ) {
 				for ( bool residual : { false, true } ) {
