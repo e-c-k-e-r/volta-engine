@@ -48,12 +48,44 @@ def main():
         setattr(obj, name, g)
     for bi in (2, 6):
         b = model.modules[bi]
+        for sm in b.attn.modules:
+            wrapm(f"b{bi}_attn_sub_{sm.key.split('.')[-1]}", sm, "forward")
         wrapm(f"b{bi}_attn_hc_mix", b.attn_hc, "mix")
         wrapm(f"b{bi}_attn_out", b.attn, "forward")
         wrapm(f"b{bi}_attn_hc_apply", b.attn_hc, "apply_")
         wrapm(f"b{bi}_mlp_hc_mix", b.mlp_hc, "mix")
         wrapm(f"b{bi}_mlp_out", b.mlp, "forward")
         wrapm(f"b{bi}_mlp_hc_apply", b.mlp_hc, "apply_")
+    # Layer 0's GDN core: conv output, gates and the delta-rule output (first call of each)
+    import exllamav3.modules.gated_delta_net as gdn_mod
+    first = {}
+    orig_conv = gdn_mod.causal_conv1d_update
+    def conv_w(*a, **k):
+        y = orig_conv(*a, **k)
+        if "conv" not in first:
+            first["conv"] = True
+            np.save(f"{OUT}/gdn0_conv_in.npy", k["mixed_qkv"].detach().float().cpu().numpy()) if "mixed_qkv" in k else None
+            np.save(f"{OUT}/gdn0_conv_out.npy", y.detach().float().cpu().numpy())
+        return y
+    gdn_mod.causal_conv1d_update = conv_w
+    orig_rule = gdn_mod.gated_delta_rule_fn
+    ncall = [0]
+    def rule_w(*a, **k):
+        y = orig_rule(*a, **k)
+        ncall[0] += 1
+        if ncall[0] <= 8 or ncall[0] % 36 == 1:
+            bt = k["beta"].detach().float(); gt = k["g"].detach().float()
+            print(f"DBG2 ba absmax {None if a0.ba_weight_t is None else float(a0.ba_weight_t.float().abs().max())} filled {a0.ba_weight_filled} | rule call {ncall[0]}: beta shape {tuple(bt.shape)} min {bt.min().item():.4f} max {bt.max().item():.4f} std-over-tokens {bt.reshape(-1, bt.shape[-1]).std(0).max().item():.5f}; g std-over-tokens {gt.reshape(-1, gt.shape[-1]).std(0).max().item():.5f}", flush = True)
+        if "rule" not in first:
+            first["rule"] = True
+            np.save(f"{OUT}/gdn0_rule_beta.npy", k["beta"].detach().float().cpu().numpy())
+            np.save(f"{OUT}/gdn0_rule_g.npy", k["g"].detach().float().cpu().numpy())
+            np.save(f"{OUT}/gdn0_rule_out.npy", y.detach().float().cpu().numpy())
+        return y
+    gdn_mod.gated_delta_rule_fn = rule_w
+    a0 = model.modules[2].attn
+    print("DBG ba_weight_filled", a0.ba_weight_filled, "ba_weight_t absmax", None if a0.ba_weight_t is None else float(a0.ba_weight_t.float().abs().max()),
+          "b weight absmax", float(a0.b_proj.inner.get_weight_tensor().float().abs().max()), "shape", tuple(a0.b_proj.inner.get_weight_tensor().shape), flush = True)
     gen = Generator(model, cache, tok)
     job = Job(input_ids = ids, max_new_tokens = 1, sampler = GreedySampler(), return_logits = True)
     gen.enqueue(job)
@@ -61,6 +93,10 @@ def main():
         for r in gen.iterate():
             if "logits" in r:
                 np.save(f"{OUT}/logits.npy", r["logits"].float().flatten().cpu().numpy())
+    job2 = Job(input_ids = ids, max_new_tokens = 1, sampler = GreedySampler())
+    gen.enqueue(job2)
+    while gen.num_remaining_jobs():
+        gen.iterate()
     print("saved", sorted(os.listdir(OUT)), flush = True)
 if __name__ == "__main__":
     main()

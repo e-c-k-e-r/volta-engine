@@ -2,7 +2,15 @@
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
+#include "engine/backend/numeric.h"
 #include "engine/loader/safetensors.h"
+#include "engine/modules/gdn.h"
+#include "engine/modules/gated_residual.h"
+#include "engine/modules/embedding.h"
+#if ENGINE_BACKEND_CUDA
+#include "trellis_context.h"
+#endif
+#include <vector>
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <cstring>
@@ -77,6 +85,52 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	// Vocabulary-parallel head, padded to a multiple of 256 columns like the other models
 	lm_shard_real_cols_ = config_.vocab_size / tp_;
 	lm_shard_cols_ = lm_shard_real_cols_ + ( 256 - lm_shard_real_cols_ % 256 ) % 256;
+
+	const int R = pod::MAX_ROWS;
+	const int H = config_.hidden_size;
+	const int S = config_.max_slots;
+	lin_k_heads_ = config_.linear_num_k_heads / tp_;
+	lin_v_heads_ = config_.linear_num_v_heads / tp_;
+	lin_channels_ = config_.linear_channels / tp_;
+	int linear_layers = 0;
+	for ( int L = 0; L < config_.num_layers; ++L ) linear_layers += config_.is_full_attention( L ) ? 0 : 1;
+
+	// Recurrent GDN state and conv history per slot
+	state_.slot_gdn_floats = static_cast<size_t>( linear_layers ) * lin_v_heads_ * 128 * 128;
+	state_.gdn_states = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * state_.slot_gdn_floats * sizeof( float ) ) );
+	backend::memset_sync( state_.gdn_states, 0, static_cast<size_t>( S ) * state_.slot_gdn_floats * sizeof( float ) );
+	state_.slot_conv_floats = static_cast<size_t>( linear_layers ) * lin_channels_ * 3;
+	state_.conv_history = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * state_.slot_conv_floats * sizeof( float ) ) );
+	backend::memset_sync( state_.conv_history, 0, static_cast<size_t>( S ) * state_.slot_conv_floats * sizeof( float ) );
+	state_.gdn_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * state_.slot_gdn_floats * sizeof( float ) ) );
+	state_.conv_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * state_.slot_conv_floats * sizeof( float ) ) );
+	state_.d_snap_on = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
+	backend::memset_sync( state_.d_snap_on, 0, sizeof( int ) );
+
+	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
+	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
+	int h_shape[2] = { R, H };
+	embed_rows_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+	mixed_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+	y_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+	int st_shape[3] = { R, config_.hc_mult, H };
+	streams_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, st_shape, 3 );
+	post_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.hc_mult * sizeof( float ) ) );
+	gr_scratch_ = static_cast<float*>( engine::core::arena_alloc( arena,
+		engine::modules::GatedResidual::scratch_floats( R, H, config_.hc_mult, config_.hc_rank ) * sizeof( float ) ) );
+	int qkv_shape[2] = { R, lin_channels_ };
+	qkv_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
+	conv_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
+	int z_shape[2] = { R, lin_v_heads_ * config_.linear_head_dim };
+	z_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
+	gdn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
+	int gp_shape[1] = { R * lin_v_heads_ };
+	gdn_gate_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, gp_shape, 1 );
+	gdn_beta_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, gp_shape, 1 );
+#if ENGINE_BACKEND_CUDA
+	engine::modules::trellis_get_workspace( rank_, 16 * 1024 * 1024 );
+	engine::modules::trellis_get_locks( rank_ );
+#endif
 
 	metadata_.model_name = "qwen4_exp";
 	metadata_.hidden_size = config_.hidden_size;
@@ -217,11 +271,147 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	return true;
 }
 
-void Qwen4ExpPipeline::embed_tokens( const int*, int, backend::stream_t ) { ENGINE_ASSERT( false, "qwen4_exp: embed_tokens is not implemented yet" ); }
-void Qwen4ExpPipeline::forward( const pod::BatchRows&, backend::stream_t ) { ENGINE_ASSERT( false, "qwen4_exp: forward is not implemented yet" ); }
+void Qwen4ExpPipeline::set_rows( int m ) {
+	embed_rows_.shape[0] = m;
+	mixed_.shape[0] = m;
+	y_.shape[0] = m;
+	streams_.shape[0] = m;
+	qkv_buf_.shape[0] = m;
+	z_buf_.shape[0] = m;
+	gdn_out_.shape[0] = m;
+}
+
+void Qwen4ExpPipeline::embed_tokens( const int* token_ids, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_ROWS, "Qwen4ExpPipeline::embed_tokens: count out of range" );
+	backend::set_device( rank_ );
+	backend::memcpy_async( d_token_ids_, token_ids, count * sizeof( int ), backend::Copy::H2D, stream );
+	set_rows( count );
+	engine::modules::Embedding::forward( embed_table_, d_token_ids_, count, embed_rows_, stream );
+}
+
+void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t stream ) {
+	ENGINE_ASSERT( weights_loaded_, "Qwen4ExpPipeline::forward: weights not loaded" );
+	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_ROWS, "Qwen4ExpPipeline::forward: row count out of range" );
+	backend::set_device( rank_ );
+	const int m = rows.count;
+	key_hint_ = rows.pos[m - 1] + 1;
+	set_rows( m );
+	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
+	forward_body( m, stream );
+}
+
+void Qwen4ExpPipeline::trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols ) {
+	static const std::string& path = runtime::options().trace_layers;
+	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH ) return;
+	const int H = config_.hidden_size;
+	if ( cols <= 0 ) cols = H;
+	const size_t elems = static_cast<size_t>( m ) * ( streams ? config_.hc_mult * H : cols );
+	std::vector<float> out( elems );
+	backend::stream_sync( stream );
+	if ( streams ) {
+		backend::memcpy_async( out.data(), dev, elems * sizeof( float ), backend::Copy::D2H, stream );
+		backend::stream_sync( stream );
+	}
+	else {
+		std::vector<backend::half_t> h( elems );
+		backend::memcpy_async( h.data(), dev, elems * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+		backend::stream_sync( stream );
+		for ( size_t i = 0; i < elems; ++i ) out[i] = backend::to_float( h[i] );
+	}
+	if ( FILE* f = std::fopen( path.c_str(), "ab" ) ) {
+		const int hdr[3] = { tag, m, key_hint_ - m };
+		std::fwrite( hdr, sizeof( int ), 3, f );
+		std::fwrite( out.data(), sizeof( float ), elems, f );
+		std::fclose( f );
+	}
+}
+
+void Qwen4ExpPipeline::gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream ) {
+	engine::modules::GatedResidual::mix(
+		streams_.ptr<const float>(), g.norm.ptr<const backend::half_t>(), g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(),
+		with_post ? g.inject.ptr<const backend::half_t>() : nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_,
+		m, config_.hidden_size, config_.hc_mult, config_.hc_rank, config_.rms_norm_eps, stream );
+}
+
+// Linear-attention sublayer: mixed_ in, the rank's partial out_proj result in y_
+void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_idx, int m, backend::stream_t stream ) {
+	const int k_heads = lin_k_heads_, v_heads = lin_v_heads_, channels = lin_channels_;
+	engine::modules::Linear::forward( mixed_, lw.in_proj_qkv, qkv_buf_, stream );
+	engine::modules::Linear::forward( mixed_, lw.in_proj_z, z_buf_, stream );
+	if ( linear_idx == 0 ) {
+		trace_rows( 2000, qkv_buf_.data, false, m, stream, channels );
+		trace_rows( 2001, z_buf_.data, false, m, stream, v_heads * 128 );
+	}
+
+	float* hist = state_.conv_history + static_cast<size_t>( linear_idx ) * channels * 3;
+	float* layer_state = state_.gdn_states + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
+	const int snap_rows = MIN( m, kDraftM );
+	float* conv_snap = state_.conv_snap + static_cast<size_t>( linear_idx ) * channels * 3;
+	float* gdn_snap = state_.gdn_snap + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
+
+	pod::TensorView qkv_rows = pod::make_tensor_2d( qkv_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, channels );
+	pod::TensorView out_rows = pod::make_tensor_2d( gdn_out_.ptr<backend::half_t>(), pod::DType::FP16, m, v_heads * 128 );
+	pod::TensorView z_rows = pod::make_tensor_2d( z_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, v_heads * 128 );
+	pod::TensorView gate_rows = pod::make_tensor_2d( gdn_gate_.ptr<float>(), pod::DType::FP32, m, v_heads );
+	pod::TensorView beta_rows = pod::make_tensor_2d( gdn_beta_.ptr<float>(), pod::DType::FP32, m, v_heads );
+
+	if ( m > pod::MAX_BATCH ) {
+		pod::TensorView conv_rows = pod::make_tensor_2d( conv_out_.ptr<backend::half_t>(), pod::DType::FP16, m, channels );
+		engine::modules::GDN::causal_conv1d_silu_tiled( qkv_rows, conv_rows, hist, lw.conv1d_w, channels, m, d_rows_, state_.slot_conv_floats, stream );
+		qkv_rows = conv_rows;
+	}
+	else {
+		engine::modules::GDN::causal_conv1d_silu_rows( qkv_rows, hist, lw.conv1d_w, channels, m, d_rows_, state_.slot_conv_floats,
+			conv_snap, state_.slot_conv_floats, snap_rows, state_.d_snap_on, stream );
+	}
+	if ( linear_idx == 0 ) trace_rows( 2004, qkv_rows.data, false, m, stream, channels );   // after conv + silu
+	engine::modules::GDN::l2_norm_heads( qkv_rows, k_heads, config_.linear_head_dim, stream, false, m, channels );
+	engine::modules::GDN::project_gates( mixed_, lw.in_proj_a, lw.in_proj_b, lw.A_log, lw.dt_bias, gate_rows, beta_rows, v_heads, config_.hidden_size, stream, m );
+	engine::modules::GDN::recurrent_step_rows( layer_state, qkv_rows, gate_rows, beta_rows, out_rows, k_heads, v_heads, config_.linear_head_dim, m, d_rows_,
+		state_.slot_gdn_floats, gdn_snap, state_.slot_gdn_floats, snap_rows, state_.d_snap_on, stream );
+	// Sigmoid-gated RMSNorm (the KDA flavor): rmsnorm(out) * w * sigmoid(z)
+	if ( linear_idx == 0 ) trace_rows( 2002, out_rows.data, false, m, stream, v_heads * 128 );   // recurrence output before the norm
+	engine::modules::GDN::gated_rmsnorm( out_rows, z_rows, lw.linear_norm, v_heads, config_.linear_head_dim, stream, true, m );
+	if ( linear_idx == 0 ) trace_rows( 2003, out_rows.data, false, m, stream, v_heads * 128 );
+	engine::modules::Linear::forward( gdn_out_, lw.out_proj, y_, stream );
+}
+
+void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
+	const int H = config_.hidden_size, hc = config_.hc_mult;
+	const int halt = runtime::options().qwen4_halt;
+	engine::modules::GatedResidual::init_streams( embed_rows_.ptr<const backend::half_t>(), streams_.ptr<float>(), m, H, hc, stream );
+	trace_rows( 1000, streams_.data, true, m, stream );
+	int linear_idx = 0, site = 0;
+	for ( int L = 0; L < config_.num_layers; ++L ) {
+		auto& lw = layers_[L];
+		// Attention site
+		gr_mix( lw.attn_hc, true, m, stream );
+		trace_rows( 100 + L, mixed_.data, false, m, stream );
+		if ( lw.is_full_attention ) {
+			ENGINE_ASSERT( false, "qwen4_exp: the QSA attention layer is not implemented yet" );
+		}
+		else {
+			gdn_forward( lw, linear_idx++, m, stream );
+		}
+		if ( ring_ ) ring_->all_reduce( y_, stream );
+		trace_rows( 200 + L, y_.data, false, m, stream );
+		engine::modules::GatedResidual::apply( streams_.ptr<float>(), post_, y_.ptr<const backend::half_t>(), m, H, hc, stream );
+		trace_rows( 300 + L, streams_.data, true, m, stream );
+		if ( halt == site++ ) return;
+		// MLP site
+		ENGINE_ASSERT( false, "qwen4_exp: the MoE sublayer is not implemented yet" );
+	}
+}
+
 void Qwen4ExpPipeline::sample_tokens( int*, int, backend::stream_t ) { ENGINE_ASSERT( false, "qwen4_exp: sampling is not implemented yet" ); }
 void Qwen4ExpPipeline::checkpoint_state( int, backend::stream_t ) {}
 void Qwen4ExpPipeline::rollback_state( int, backend::stream_t ) {}
-void Qwen4ExpPipeline::reset_state( int ) {}
+
+void Qwen4ExpPipeline::reset_state( int slot_id ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen4ExpPipeline::reset_state: slot out of range" );
+	backend::set_device( rank_ );
+	backend::memset_sync( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, 0, state_.slot_gdn_floats * sizeof( float ) );
+	backend::memset_sync( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, 0, state_.slot_conv_floats * sizeof( float ) );
+}
 
 } // namespace engine::models

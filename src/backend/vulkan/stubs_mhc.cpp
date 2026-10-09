@@ -1,6 +1,7 @@
 // Vulkan backend: weak stubs for the mhc entry points that have no Vulkan implementation (CUDA/SM70 only or not yet ported).
 // A strong definition in another translation unit overrides these. Declarations come from engine/modules/mhc.h.
 #include "engine/modules/mhc.h"
+#include "engine/modules/gated_residual.h"
 #include "engine/backend/tiers.h"
 
 namespace engine::modules {
@@ -37,6 +38,22 @@ __attribute__(( weak )) void HyperConnection::update( float* streams, const back
 
 __attribute__(( weak )) void HyperConnection::update( float* streams_out, const float* streams_in, const backend::half_t* sublayer_out, const float* post, const float* comb, int hidden_size, backend::stream_t stream, int rows ) {
 	ENGINE_UNSUPPORTED( "HyperConnection::update" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void GatedResidual::init_streams( const backend::half_t*, float*, int, int, int, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GatedResidual::init_streams" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void GatedResidual::mix( const float*, const backend::half_t*, const backend::half_t*, const backend::half_t*, const backend::half_t*,
+	backend::half_t*, float*, float*, int, int, int, int, float, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GatedResidual::mix" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void GatedResidual::apply( float*, const float*, const backend::half_t*, int, int, int, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GatedResidual::apply" );
 	__builtin_unreachable();
 }
 

@@ -83,6 +83,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/moe.cu
 	src/backend/cuda/modules/expert_tier.cu
 	src/backend/cuda/modules/mhc.cu
+	src/backend/cuda/modules/gated_residual.cu
 	src/backend/cuda/modules/embedding.cu
 	src/backend/cuda/modules/vision.cu
 	src/backend/cuda/modules/linear_trellis.cu
@@ -382,6 +383,9 @@ set_target_properties(test_mtp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BI
 add_executable(test_prefix_restore tests/4_coherence/test_prefix_restore.cpp)
 target_link_libraries(test_prefix_restore PRIVATE engine_kernels)
 set_target_properties(test_prefix_restore PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_qwen4_exp tests/4_coherence/test_qwen4_exp.cpp)
+target_link_libraries(test_qwen4_exp PRIVATE engine_kernels)
+set_target_properties(test_qwen4_exp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 add_executable(test_chunk_boundary tests/4_coherence/test_chunk_boundary.cpp)
 target_link_libraries(test_chunk_boundary PRIVATE engine_kernels)
 set_target_properties(test_chunk_boundary PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

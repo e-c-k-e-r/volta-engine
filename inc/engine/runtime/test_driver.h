@@ -24,6 +24,7 @@ static const char* QWEN_DRAFT_DIR = model_path( "Qwen3.8-27B-DFlash2-EXL3-5.0bpw
 // unquantized. It is the ground truth the Trellis weights are checked against.
 static const char* QWEN_DRAFT_BF16_DIR = model_path( "Qwen3.8-27B-DFlash2" );
 static const char* GLM_DIR = model_path( "GLM-5.3-Flash-exl3-3.05bpw", "ENGINE_TEST_GLM_DIR" );
+static const char* FLASH_DIR = model_path( "Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", "ENGINE_TEST_FLASH_DIR" );
 static const char* GLM_DRAFT_DIR = model_path( "GLM-5.3-Flash-DFlash2", "ENGINE_TEST_GLM_DRAFT_DIR" );
 
 struct GenStats {

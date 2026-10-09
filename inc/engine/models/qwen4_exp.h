@@ -7,6 +7,7 @@
 #include "engine/core/comm.h"
 #include "engine/modules/linear.h"
 #include "engine/modules/moe.h"
+#include "engine/core/graph_cache.h"
 #include "engine/backend/types.h"
 #include <vector>
 
@@ -107,6 +108,14 @@ public:
 	const ModelMetadata& get_metadata() const override { return metadata_; }
 
 private:
+	void set_rows( int m );
+	void forward_body( int m, backend::stream_t stream );
+	// One sublayer's input: the gated-residual mix of the streams into mixed_ (and post_ when the site has an inject gate)
+	void gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream );
+	void gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_idx, int m, backend::stream_t stream );
+	// Debug trace (trace_layers): the first position of the forward, rows of streams or of an fp16 matrix
+	void trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols = 0 );
+
 	Qwen4ExpConfig config_;
 	ModelMetadata metadata_;
 	int rank_ = 0;
@@ -114,8 +123,35 @@ private:
 	pod::MemoryArena* arena_ = nullptr;
 	engine::comm::CollectiveRing* ring_ = nullptr;
 	bool weights_loaded_ = false;
+	int key_hint_ = 0;
 
+	// Per-rank head counts (tensor parallel over ranks)
+	int lin_k_heads_ = 0;
+	int lin_v_heads_ = 0;
+	int lin_channels_ = 0;
+
+	struct State {
+		float* gdn_states = nullptr;    // [slots, linear layers, v heads, 128, 128] fp32
+		float* conv_history = nullptr;  // [slots, linear layers, channels, 3] fp32
+		float* gdn_snap = nullptr;      // per-row post-state snapshots for speculation (kDraftM rows)
+		float* conv_snap = nullptr;
+		int* d_snap_on = nullptr;
+		size_t slot_gdn_floats = 0;
+		size_t slot_conv_floats = 0;
+	} state_;
+
+	pod::BatchRows* d_rows_ = nullptr;
+	int* d_token_ids_ = nullptr;
 	pod::TensorView embed_table_;
+	pod::TensorView embed_rows_;      // [R, hidden] fp16
+	pod::TensorView streams_;         // [R, hc, hidden] fp32
+	pod::TensorView mixed_;           // [R, hidden] fp16: the sublayer input
+	pod::TensorView y_;               // [R, hidden] fp16: the sublayer output
+	float* post_ = nullptr;           // [R, hc]
+	float* gr_scratch_ = nullptr;
+	// GDN buffers
+	pod::TensorView qkv_buf_, conv_out_, z_buf_, gdn_out_, gdn_gate_, gdn_beta_;
+
 	Qwen4ExpGatedResidual final_mixer_;
 	pod::LinearWeight lm_head_;
 	pod::TensorView logits_;
