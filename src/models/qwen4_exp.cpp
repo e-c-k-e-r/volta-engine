@@ -10,6 +10,7 @@
 #include "engine/modules/swiglu.h"
 #include "engine/modules/ple.h"
 #include "engine/modules/attention.h"
+#include "engine/spec/dflash.h"
 #include "engine/modules/norm.h"
 #include "engine/modules/rope.h"
 #include <mutex>
@@ -164,6 +165,23 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	int kv_shape[2] = { R, kv_heads_ * config_.head_dim };
 	k_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_shape, 2 );
 	v_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_shape, 2 );
+	// Logits (vocabulary-parallel head) and the sampling scratch
+	{
+		int logit_shape[2] = { R, lm_shard_cols_ };
+		logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
+		d_argmax_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
+		d_argmax_val_ = static_cast<float*>( engine::core::arena_alloc( arena, R * sizeof( float ) ) );
+		h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( R * sizeof( int ) ) );
+		std::memset( h_argmax_idx_, 0, R * sizeof( int ) );
+		const int splits = ( lm_shard_cols_ + kTopkTile - 1 ) / kTopkTile;
+		const size_t per = static_cast<size_t>( R ) * splits * 16;
+		samp_part_v_ = static_cast<float*>( engine::core::arena_alloc( arena, per * sizeof( float ) ) );
+		samp_part_i_ = static_cast<int*>( engine::core::arena_alloc( arena, per * sizeof( int ) ) );
+		samp_counters_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
+		d_samp_vals_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * 16 * sizeof( float ) ) );
+		d_samp_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * 16 * sizeof( int ) ) );
+		backend::memset_sync( samp_counters_, 0, R * sizeof( int ) );
+	}
 	// N-gram embedding layer buffers and per-slot histories
 	{
 		int e_shape[2] = { R, config_.ple_embed_dim };
@@ -374,6 +392,7 @@ void Qwen4ExpPipeline::set_rows( int m ) {
 	ple_emb_.shape[0] = m;
 	ple_key_.shape[0] = m;
 	ple_value_.shape[0] = m;
+	if ( logits_.data ) logits_.shape[0] = m;
 	q_gate_buf_.shape[0] = m;
 	q_buf_.shape[0] = m;
 	gate_attn_buf_.shape[0] = m;
@@ -397,6 +416,8 @@ void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 	backend::set_device( rank_ );
 	const int m = rows.count;
 	key_hint_ = rows.pos[m - 1] + 1;
+	lm_mode_ = ( m > pod::MAX_BATCH ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;
+	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
 	set_rows( m );
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
 	attn_tc_ = true;
@@ -625,9 +646,51 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 		trace_rows( 600 + L, streams_.data, true, m, stream );
 		if ( halt == site++ ) return;
 	}
+
+	// Final mixer (the gated residual without the post gate) collapses the streams into the head's input; every rank projects its vocabulary shard
+	if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
+	const int first = ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) ? m - 1 : 0;
+	const int n = ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) ? 1 : m;
+	engine::modules::GatedResidual::mix(
+		streams_.ptr<const float>() + static_cast<size_t>( first ) * hc * H, final_mixer_.norm.ptr<const backend::half_t>(), final_mixer_.down.ptr<const backend::half_t>(),
+		final_mixer_.up.ptr<const backend::half_t>(), nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_, n, H, hc, config_.hc_rank, config_.rms_norm_eps, stream );
+	pod::TensorView hin = pod::make_tensor_2d( mixed_.ptr<backend::half_t>(), pod::DType::FP16, n, H );
+	pod::TensorView lout = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, n, lm_shard_cols_ );
+	engine::modules::Linear::forward( hin, lm_head_, lout, stream );
 }
 
-void Qwen4ExpPipeline::sample_tokens( int*, int, backend::stream_t ) { ENGINE_ASSERT( false, "qwen4_exp: sampling is not implemented yet" ); }
+void Qwen4ExpPipeline::sample_tokens( int* out_preds, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( false, "qwen4_exp: the vocabulary is sharded, use sample_local" );
+	(void) out_preds; (void) count; (void) stream;
+}
+
+bool Qwen4ExpPipeline::sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen4ExpPipeline::sample_local: count exceeds last forward rows" );
+	backend::set_device( rank_ );
+	logits_.shape[0] = count;
+	engine::modules::Elementwise::batched_argmax_range( logits_, d_argmax_idx_, d_argmax_val_, lm_shard_real_cols_, count, rank_ * lm_shard_real_cols_, stream );
+	backend::memcpy_async( h_argmax_idx_, d_argmax_idx_, count * sizeof( int ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
+	std::memcpy( out_tokens, h_argmax_idx_, count * sizeof( int ) );
+	if ( out_vals != nullptr ) {
+		std::vector<float> h_vals( count );
+		backend::memcpy_async( h_vals.data(), d_argmax_val_, count * sizeof( float ), backend::Copy::D2H, stream );
+		backend::stream_sync( stream );
+		std::memcpy( out_vals, h_vals.data(), count * sizeof( float ) );
+	}
+	return true;
+}
+
+bool Qwen4ExpPipeline::topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen4ExpPipeline::topk_local: count exceeds last forward rows" );
+	backend::set_device( rank_ );
+	engine::spec::dflash2_topk_shard( logits_.ptr<const backend::half_t>(), count, lm_shard_cols_, lm_shard_real_cols_, 16, d_samp_vals_, d_samp_idx_,
+		rank_ * lm_shard_real_cols_, samp_part_v_, samp_part_i_, samp_counters_, stream );
+	backend::memcpy_async( out_vals, d_samp_vals_, static_cast<size_t>( count ) * 16 * sizeof( float ), backend::Copy::D2H, stream );
+	backend::memcpy_async( out_ids, d_samp_idx_, static_cast<size_t>( count ) * 16 * sizeof( int ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
+	return true;
+}
 void Qwen4ExpPipeline::checkpoint_state( int, backend::stream_t ) {}
 void Qwen4ExpPipeline::rollback_state( int, backend::stream_t ) {}
 

@@ -772,10 +772,10 @@ void MoE::forward(
 
 namespace ext {
 
-static bool attr_set[ENGINE_NUM_GPUS] = { false };
+static bool attr_done[ENGINE_NUM_GPUS][3] = {};
 
 void exl3_moe_reset_caches() {
-	for ( auto& b : attr_set ) b = false;
+	for ( auto& d : attr_done ) for ( bool& b : d ) b = false;
 }
 
 void exl3_moe(
@@ -865,27 +865,27 @@ void exl3_moe(
 		(void*) &out_plane_stride
 	};
 
-	// 3-bit experts (GLM) run 256-wide output tiles; 4-bit experts (Flash-Next: intermediate 640) need 128-wide tiles to divide the gate/up width
+	// 3-bit experts with a 256-divisible intermediate width (GLM) run 256-wide output tiles; every other shape (4-bit experts, and
+	// 3-bit ones with Flash-Next's intermediate 640) takes the 128-wide tiles
 	ENGINE_ASSERT( K_gate == 3 || K_gate == 4, "exl3_moe: expert bits" );
-	ENGINE_ASSERT( K_gate == 3 ? intermediate_dim % 256 == 0 : intermediate_dim % 128 == 0, "exl3_moe: intermediate width vs the output tile" );
-	static bool attr_set4[ENGINE_NUM_GPUS] = { false };
-	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 256, 2, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 256, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
-		attr_set[device] = true;
-	}
-	if ( K_gate == 4 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set4[device] ) {
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<4, 128, 2, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<4, 128, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
-		attr_set4[device] = true;
+	const bool tile128 = K_gate == 4 || intermediate_dim % 256 != 0;
+	ENGINE_ASSERT( intermediate_dim % ( tile128 ? 128 : 256 ) == 0, "exl3_moe: intermediate width vs the output tile" );
+	const int variant = K_gate == 4 ? 2 : ( tile128 ? 1 : 0 );   // 0: <3,256>, 1: <3,128>, 2: <4,128>
+	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_done[device][variant] ) {
+		void* fns[2] = {
+			variant == 0 ? (void*) exl3_moe_kernel<3, 256, 2, 0> : variant == 1 ? (void*) exl3_moe_kernel<3, 128, 2, 0> : (void*) exl3_moe_kernel<4, 128, 2, 0>,
+			variant == 0 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : variant == 1 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 2> };
+		for ( void* fn : fns ) CUDA_CHECK( cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
+		attr_done[device][variant] = true;
 	}
 
 	// The wide kernel carries the 16-row GEMM tile as well; keeping it out of the decode kernel preserves its registers
 	// Output-tile width of the expert GEMMs: 256 is 18-29% faster than 128 below 64 rows on both the sharded and the whole-expert
 	// layouts (fewer K-split reductions per weight decoded) and level at 512
-	void* moe_fn = ( K_gate == 4 )
-		? ( wide == 2 ? (void*) exl3_moe_kernel<4, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 0> )
-		: ( wide == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0> );
+	void* moe_fn = nullptr;
+	if ( variant == 0 ) moe_fn = wide == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0>;
+	else if ( variant == 1 ) moe_fn = wide == 2 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<3, 128, 2, 0>;
+	else moe_fn = wide == 2 ? (void*) exl3_moe_kernel<4, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 0>;
 	CUDA_CHECK( cudaLaunchKernel(
 		moe_fn,
 		grid_dim,

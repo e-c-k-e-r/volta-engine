@@ -104,6 +104,10 @@ public:
 	void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) override;
 	void forward( const pod::BatchRows& rows, backend::stream_t stream = nullptr ) override;
 	void sample_tokens( int* out_preds, int count, backend::stream_t stream = nullptr ) override;
+	bool sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream = nullptr ) override;
+	bool topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream = nullptr ) override;
+	const backend::half_t* shard_logits_ptr() const override { return logits_.ptr<const backend::half_t>(); }
+	int shard_logits_cols() const override { return lm_shard_cols_; }
 
 	void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;
@@ -188,6 +192,17 @@ private:
 	Qwen4ExpGatedResidual final_mixer_;
 	pod::LinearWeight lm_head_;
 	pod::TensorView logits_;
+	int lm_mode_ = 0;                 // BatchRows::LogitsMode of the forward in flight
+	int last_rows_ = 0;
+	static constexpr int kTopkTile = 4096;
+	int* d_argmax_idx_ = nullptr;
+	float* d_argmax_val_ = nullptr;
+	int* h_argmax_idx_ = nullptr;
+	float* samp_part_v_ = nullptr;
+	int* samp_part_i_ = nullptr;
+	int* samp_counters_ = nullptr;
+	float* d_samp_vals_ = nullptr;
+	int* d_samp_idx_ = nullptr;
 	int lm_shard_real_cols_ = 0;
 	int lm_shard_cols_ = 0;
 
