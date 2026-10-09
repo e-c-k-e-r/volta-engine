@@ -8,7 +8,7 @@
 #   models          tier 2 tests that load a checkpoint from $ENGINE_MODEL_ROOT (parity, coherence, prefix restore, sampling)
 #   parity          fast + models
 #   bench           GPU: bench_decode / bench_accept / bench_prefill for both models
-#   needle          GPU: 8K needle retrieval, greedy and speculative, both models
+#   needle          GPU: 8K needle retrieval, greedy and speculative, all three models (Flash-Next also at 12K, past its QSA budget)
 #   baseline <tag>  GPU: parity + bench + needle, bench numbers saved to results/baseline_<tag>.txt
 #   compare <tag>   GPU: bench again and diff against results/baseline_<tag>.txt (flags > 1% regressions)
 # Logs go to results/gate_<mode>_<timestamp>/ (gitignored).
@@ -92,6 +92,7 @@ tier2_models() {
 	run tokenizer ./test_tokenizer
 	run tokenizer_cases_qwen ./test_tokenizer_file $ENGINE_MODEL_ROOT/Qwen3.8-27B-exl3 --cases $ROOT/tests/data/tokenizer_cases_qwen3_5.json
 	run tokenizer_cases_glm ./test_tokenizer_file $ENGINE_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
+	run tokenizer_cases_flash ./test_tokenizer_file $ENGINE_MODEL_ROOT/Swift-Qwen3.8-Flash-Next-exl3-4.00bpw --cases $ROOT/tests/data/tokenizer_cases_qwen4_exp.json
 	run coherence gpu ./test_coherence
 	run coherence_tp2 sh -c "ENGINE_TP=2 taskset -c 0-9 ./test_coherence --qwen-only --speculative"
 	run prefix_restore gpu ./test_prefix_restore
@@ -102,6 +103,7 @@ tier2_models() {
 	run prefix_restore_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore"
 	run prefix_restore_glm gpu ./test_prefix_restore --glm
 	run prefix_restore_glm_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore --glm"
+	run prefix_restore_flash gpu ./test_prefix_restore --flash
 	run sampling_qwen gpu ./test_sampling_gpu
 	run sampling_glm gpu ./test_sampling_gpu --glm
 }
@@ -128,6 +130,8 @@ needles() {
 	run needle_qwen_spec gpu ./test_longctx --spec --tokens 8000 --depth 70
 	run needle_glm gpu ./test_longctx --glm --tokens 8000 --depth 50
 	run needle_glm_spec gpu ./test_longctx --glm --spec --tokens 8000 --depth 30
+	run needle_flash gpu ./test_longctx --flash --tokens 8000 --depth 50
+	run needle_flash_qsa gpu ./test_longctx --flash --tokens 12000 --depth 40
 }
 
 fingerprint() { # one line per binary: md5 of per-kernel registers/stack/smem

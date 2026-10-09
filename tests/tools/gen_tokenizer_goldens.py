@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # Regenerates tests/data/tokenizer_cases_<model>.json with the reference HF `tokenizers` output for a corpus of
 # awkward texts (code, markdown, unicode, whitespace runs, CRLF, digits, contractions, marks, emoji).
-#   <venv with tokenizers>/python tests/tools/gen_tokenizer_goldens.py $ENGINE_MODEL_ROOT
+#   <venv with tokenizers>/python tests/tools/gen_tokenizer_goldens.py $ENGINE_MODEL_ROOT [qwen3_5 | glm5_next | qwen4_exp]
+# (the corpus samples the repository sources, so regenerating one model does not touch the others' files when named)
 import json, os, random, sys
 from tokenizers import Tokenizer
 
 root = sys.argv[1]
+only = sys.argv[2] if len(sys.argv) > 2 else None
 here = os.path.dirname(os.path.abspath(__file__))
 repo = os.path.join(here, "..", "..")
 rng = random.Random(1234)
@@ -40,7 +42,9 @@ alphabet = " \t\n\r.,;:'\"!?-_/\\()[]{}<>@#$%^&*+=|~`0123456789abcXYZéüñ日�
 for _ in range(60):
     texts.append("".join(rng.choice(alphabet) for _ in range(rng.randrange(1, 60))))
 
-for model, out in (("Qwen3.8-27B-exl3", "qwen3_5"), ("GLM-5.3-Flash-exl3-3.05bpw", "glm5_next")):
+for model, out in (("Qwen3.8-27B-exl3", "qwen3_5"), ("GLM-5.3-Flash-exl3-3.05bpw", "glm5_next"), ("Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", "qwen4_exp")):
+    if only and only != out:
+        continue
     tok = Tokenizer.from_file(os.path.join(root, model, "tokenizer.json"))
     cases = [{"text": t, "ids": tok.encode(t, add_special_tokens=False).ids} for t in texts]
     with open(os.path.join(repo, "tests", "data", "tokenizer_cases_%s.json" % out), "w", encoding="utf-8") as f:

@@ -27,6 +27,9 @@ mirrored implementation). Verified by `test_nvfp4_linear`, `test_ops_linear`.
 | `attention.cu` | decode / prefill tensor-core attention, KV store (FP16, FP8, K8V4, NVFP4) | Portable (FP16 KV) / CudaSm70 | `test_attention`, `test_attention_prefill`, `test_kv_quant`, `test_ops_attention` |
 | `gdn.cu` | GDN / KDA projections, conv1d, recurrent step, per-row snapshots | Portable | `test_gdn`, `test_slang_kernels`, `test_ops_attention` |
 | `mla.cu`, `mla_latent.cu` | expanded MLA (op-level reference), absorbed latent attention (dense, sparse, split-KV; latent cache FP16, FP8, int8 or NVFP4 via kv_format) | Portable / CudaSm70 | `test_mla`, `test_mla_latent`, `test_ref_attention` |
+| `gated_residual.cu` | Flash-Next gated residual (norm, low-rank gate, mix, post gate, apply), MTP stream norm / broadcast, shared-expert gate | CudaSm70 | `qwen4_exp_trace_cmp.py` against the exllamav3 oracle |
+| `ple.cu`, `ngram_table.cpp` | Flash-Next n-gram embedding layer: gate, grouped norms, dilated conv ring; host table reader (mul1 ring codec, hashing) | CudaSm70 | oracle dumps, `test_prefix_restore --flash` |
+| `qsa.cu` (+ `attention.cu` `forward_sparse`, `dsa.cu` `select`) | Flash-Next QSA indexer: q / k prep, pooled keys, scoring, token-list sparse GQA attention | CudaSm70 | 4.3K-token needle, `test_longctx --flash` |
 | `dsa.cu` | indexer projection, plane / pool update, score, top-k select | mixed | `test_dsa` (FP64 reference) |
 | `moe.cu`, `expert_tier.cu` | router, dispatch histogram / scatter, combine, two-tier expert residency | CudaSm70 | `test_moe`, `test_ops_moe` |
 | `mhc.cu` | hyper-connection mix, collapse + norm, update | Portable | `test_mhc`, `test_slang_kernels` |

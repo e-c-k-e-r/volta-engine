@@ -24,7 +24,7 @@ taskset -c 0-9 build/volta_server --model-dir /path/to/Qwen3.8-27B-exl3 \
 	--speculative --draft-model-dir /path/to/Qwen3.8-27B-DFlash2-EXL3-5.0bpw --port 8000
 ```
 
-The model type is read from the checkpoint (`qwen3_5` or `glm5_next`); anything else is a fatal error. Configuration (launch
+The model type is read from the checkpoint (`qwen3_5`, `glm5_next` or `qwen4_exp`); anything else is a fatal error. Configuration (launch
 file, `--set key=value`, `ENGINE_*` variables, debug switches) is described in [CONFIG.md](CONFIG.md); `configs/` has examples.
 The server speaks the OpenAI chat API (`/v1/chat/completions`, `/v1/models`) and the Anthropic API (`/v1/messages`,
 `/v1/messages/count_tokens`), so Claude Code can use it with `ANTHROPIC_BASE_URL=http://host:8000`. `/health`, `/metrics`
@@ -47,6 +47,10 @@ Qwen extras:
   (arena 28.9 GiB, about 2 GiB spare). `expert_cache=0.88` loads but the vision tower no longer fits (images off); 0.90 and above run
   out of memory. Without the drafter and images, 0.85 with FP16 latent and 1 slot also fits; its 250K needle passes (prefill 208 tok/s,
   decode 14.8 tok/s at the 150 W cap). `kv_format` on GLM applies to the single latent tensor: `k8v4` stores it as 8-bit.
+* **Qwen3.8-Flash-Next** (`qwen4_exp`, the 100 GB exl3 checkpoint): runs on all four GPUs only (experts are placed whole, 128 per rank), about 18 GiB of
+  the arena per GPU at an 8K window. Plain decode is about 31 tok/s; `--speculative --set speculator=mtp` drafts with the checkpoint's own MTP head and
+  roughly doubles it with identical greedy output. Full-attention layers use the model's QSA block selection past 2048 tokens of context; the 256K window
+  with 2 slots fits (24.3 of 29.8 GiB per GPU). Images use the checkpoint's own tower. Prefix caching, tools and thinking behave as for Qwen.
 * **MTP speculation**: `--speculative --set speculator=mtp` drafts with the checkpoint's own multi-token-prediction head and
   needs no draft model (about 1.7x plain decoding against 2.4x for DFlash2 on the same prompts, and it saves the drafter's VRAM).
 * **Two GPUs per instance**: `--tp-size 2` runs one model on two GPUs (about 0.7x the speed of four); start a second server with
