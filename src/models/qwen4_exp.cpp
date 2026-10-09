@@ -104,6 +104,7 @@ Qwen4ExpPipeline::~Qwen4ExpPipeline() {
 	if ( arena_ != nullptr ) {
 		backend::set_device( rank_ );
 		graphs_.reset();
+		if ( side_stream_ != nullptr ) backend::stream_destroy( side_stream_ );
 	}
 }
 
@@ -111,6 +112,9 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	rank_ = device_id;
 	arena_ = &arena;
 	ring_ = ring;
+#if defined(ENGINE_BACKEND_CUDA) && ENGINE_BACKEND_CUDA == 1
+	side_stream_ = backend::stream_create();
+#endif
 	tp_ = ( ring != nullptr ) ? requested_tp_ : 1;
 	if ( runtime::options().max_seq > 0 ) config_.max_seq = runtime::options().max_seq;
 	if ( runtime::options().max_slots > 0 ) config_.max_slots = runtime::options().max_slots;
@@ -709,16 +713,24 @@ void Qwen4ExpPipeline::ple_forward( int m, backend::stream_t stream ) {
 
 void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size;
+	// Decode rows on CUDA: the shared expert (rank 0) runs on a side stream beside the router and the fused MoE kernels; neither side touches the
+	// other's scratch (the fused kernels use no trellis workspace), and the gated add waits for both
+	const bool overlap = rank_ == 0 && side_stream_ != nullptr && engine::modules::MoE::fused_decode( lw.experts, moe_scratch_, m );
+	backend::stream_t sh_stream = overlap ? side_stream_ : stream;
+	if ( overlap ) backend::stream_fork( stream, sh_stream );
+	if ( rank_ == 0 ) {
+		engine::modules::Linear::forward( mixed_, lw.shared_gate, sh_gate_buf_, sh_stream );
+		engine::modules::Linear::forward( mixed_, lw.shared_up, sh_up_buf_, sh_stream );
+		engine::modules::SwiGLU::forward( sh_gate_buf_, sh_up_buf_, sh_inter_buf_, sh_stream );
+		engine::modules::Linear::forward( sh_inter_buf_, lw.shared_down, sh_out_, sh_stream );
+	}
 	engine::modules::MoERouter::route_softmax_topk( mixed_, lw.router, topk_idx_, topk_w_, H, config_.num_experts, config_.top_k, stream, m );
 	if ( &lw == &layers_[0] ) trace_route( 700, m, stream );
 	const int per_rank = config_.num_experts / tp_;
 	// Plain SiLU gating (no swiglu limit): act_limit 0
 	engine::modules::MoE::forward( mixed_, lw.experts, topk_idx_, topk_w_, y_, rank_ * per_rank, ( rank_ + 1 ) * per_rank, moe_scratch_, 0.0f, stream );
+	if ( overlap ) backend::stream_join( stream, sh_stream );
 	if ( rank_ == 0 ) {
-		engine::modules::Linear::forward( mixed_, lw.shared_gate, sh_gate_buf_, stream );
-		engine::modules::Linear::forward( mixed_, lw.shared_up, sh_up_buf_, stream );
-		engine::modules::SwiGLU::forward( sh_gate_buf_, sh_up_buf_, sh_inter_buf_, stream );
-		engine::modules::Linear::forward( sh_inter_buf_, lw.shared_down, sh_out_, stream );
 		engine::modules::GatedResidual::add_sigmoid_gated( y_.ptr<backend::half_t>(), sh_out_.ptr<const backend::half_t>(), mixed_.ptr<const backend::half_t>(),
 			lw.shared_expert_gate.ptr<const backend::half_t>(), m, H, stream );
 	}

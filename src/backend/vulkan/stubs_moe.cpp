@@ -5,6 +5,7 @@
 
 namespace engine::modules {
 
+__attribute__(( weak )) bool MoE::fused_decode( const pod::MoELayerWeights&, const pod::MoEScratch&, int ) { return false; }
 __attribute__(( weak )) pod::MoEScratch MoE::alloc_scratch( pod::MemoryArena& arena, int num_local_experts, int top_k, int hidden_size, int intermediate_size, int max_rows ) {
 	ENGINE_UNSUPPORTED( "MoE::alloc_scratch" );
 	__builtin_unreachable();

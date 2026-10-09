@@ -138,6 +138,10 @@ struct MoE {
 		int max_rows = 1
 	);
 
+	// True when forward() takes the fused decode kernels for this many rows: they use none of the trellis GEMM workspace (locks, int8 counters),
+	// so a dense trellis Linear may run beside them on another stream
+	static bool fused_decode( const pod::MoELayerWeights& weights, const pod::MoEScratch& scratch, int rows );
+
 	// Routed-expert FFN for one token: out = sum_k w_k * expert_k( x ) over the experts in
 	// [start_expert, end_expert). Fully device-resident (no host sync); dispatches on weights.type.
 	static void forward(

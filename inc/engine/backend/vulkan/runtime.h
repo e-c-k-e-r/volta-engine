@@ -24,6 +24,9 @@ int device_count();
 stream_t stream_create();
 void stream_destroy( stream_t s );
 void stream_sync( stream_t s );
+// One queue: side streams are the main stream, so ordering is implicit
+inline void stream_fork( stream_t, stream_t ) {}
+inline void stream_join( stream_t, stream_t ) {}
 void device_sync();
 
 void memcpy_async( void* dst, const void* src, size_t bytes, Copy dir, stream_t s );

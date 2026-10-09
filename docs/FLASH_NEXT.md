@@ -115,5 +115,7 @@ The dp4a int8 decode GEMV now also serves 7 and 8 bpw (M=1, N%256): 24.9 -> 23.5
 
 Fused MoE decode breakdown (`bench_moe_routes`, rank 0, 1 row, top 10): 0 local routes 6 us, 1-4 routes ~44 us (a 28 + b 16, flat in the route count: the call is latency-bound by the serial k-loops of the few resident blocks, so rank imbalance is nearly free), 5+ routes jump to ~90-160 us because the kernels are 512 threads x 106 registers (1 block/SM) and more than 80 active blocks run in two waves. Two k-splits for the gate/up stage at 4 bpw (the new default) take a call from ~76 to ~55 us: decode 23.5 -> 22.6 ms/token, tokens unchanged. Levers left: 256-thread tiles (2 blocks/SM) to remove the two-wave cliff, and a split-k for the down stage.
 
+Rank 0's shared expert now runs on a side stream beside the router and the fused MoE decode kernels (`backend::stream_fork/stream_join`, CUDA graph edges; only when `MoE::fused_decode`, since those kernels use none of the trellis GEMM workspace the shared Linear needs): decode 22.6 -> 21.5 ms/token, tokens unchanged, API suite with MTP passes. A rewrite of the gated-residual up-mix / gate kernels with 16-byte weight loads and all loads in flight first was tried and reverted: no gain (22.8 ms) and one greedy token flipped from the changed summation order, so those kernels are not load-latency bound.
+
 Next: a GEMV for the N=640 shared-expert shapes, a tensor-core QSA scorer and sparse
 kernel, the SASS / bench baselines and the 256K needle.

@@ -24,6 +24,14 @@ inline int device_count() { int n = 0; ENGINE_CHECK( cudaGetDeviceCount( &n ) );
 inline stream_t stream_create() { stream_t s = nullptr; ENGINE_CHECK( cudaStreamCreate( &s ) ); return s; }
 inline void stream_destroy( stream_t s ) { ENGINE_CHECK( cudaStreamDestroy( s ) ); }
 inline void stream_sync( stream_t s ) { ENGINE_CHECK( cudaStreamSynchronize( s ) ); }
+// Side-stream ordering: after stream_fork( main, side ) work queued on `side` waits for everything queued on `main` so far;
+// stream_join( main, side ) makes `main` wait for everything queued on `side`. Both capture as graph edges.
+inline cudaEvent_t& fork_event() {
+	thread_local cudaEvent_t e = [] { cudaEvent_t x = nullptr; ENGINE_CHECK( cudaEventCreateWithFlags( &x, cudaEventDisableTiming ) ); return x; }();
+	return e;
+}
+inline void stream_fork( stream_t main, stream_t side ) { ENGINE_CHECK( cudaEventRecord( fork_event(), main ) ); ENGINE_CHECK( cudaStreamWaitEvent( side, fork_event(), 0 ) ); }
+inline void stream_join( stream_t main, stream_t side ) { ENGINE_CHECK( cudaEventRecord( fork_event(), side ) ); ENGINE_CHECK( cudaStreamWaitEvent( main, fork_event(), 0 ) ); }
 inline void device_sync() { ENGINE_CHECK( cudaDeviceSynchronize() ); }
 
 inline void memcpy_async( void* dst, const void* src, size_t bytes, Copy dir, stream_t s ) {

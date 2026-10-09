@@ -622,6 +622,12 @@ pod::MoEScratch MoE::alloc_scratch(
 	return s;
 }
 
+bool MoE::fused_decode( const pod::MoELayerWeights& weights, const pod::MoEScratch& scratch, int rows ) {
+	const int ebits = weights.gate[0].bits;
+	return weights.type == pod::QuantType::TRELLIS && rows <= MOE_COOP_MAX_ROWS && scratch.coop_ctr != nullptr && weights.top_k <= MOE_COOP_TOPK
+		&& ( ebits == 3 || ebits == 4 ) && weights.up[0].bits == ebits && weights.down[0].bits == ebits && weights.up[0].mul1 && weights.gate[0].mul1 && weights.down[0].mul1;
+}
+
 void MoE::forward(
 	const pod::TensorView& x,
 	const pod::MoELayerWeights& weights,
@@ -644,8 +650,7 @@ void MoE::forward(
 	// Fused decode path: gate/up and down GEMV kernels over runs of rows that share an expert (exl3_moe_coop.cuh)
 	// 3 bpw (up to 8 routes: the integer tile) and 4 bpw experts, all mul1
 	const int ebits = weights.gate[0].bits;
-	if ( weights.type == pod::QuantType::TRELLIS && rows <= MOE_COOP_MAX_ROWS && scratch.coop_ctr != nullptr && weights.top_k <= MOE_COOP_TOPK
-		&& ( ebits == 3 || ebits == 4 ) && weights.up[0].bits == ebits && weights.down[0].bits == ebits && weights.up[0].mul1 && weights.gate[0].mul1 && weights.down[0].mul1 ) {
+	if ( MoE::fused_decode( weights, scratch, rows ) ) {
 		const int E = weights.num_local_experts;
 		const void** d_ptrs = static_cast<const void**>( weights.device_ptrs );
 		MoeCoopParams p = {};

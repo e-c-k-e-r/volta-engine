@@ -30,6 +30,8 @@ inline int device_count() { return 1; }
 inline stream_t stream_create() { return nullptr; }
 inline void stream_destroy( stream_t ) {}
 inline void stream_sync( stream_t ) {}
+inline void stream_fork( stream_t, stream_t ) {}
+inline void stream_join( stream_t, stream_t ) {}
 inline void device_sync() {}
 
 inline void memcpy_async( void* dst, const void* src, size_t bytes, Copy, stream_t ) { if ( bytes ) std::memmove( dst, src, bytes ); }
