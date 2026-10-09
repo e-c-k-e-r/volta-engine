@@ -113,7 +113,10 @@ private:
 	// One sublayer's input: the gated-residual mix of the streams into mixed_ (and post_ when the site has an inject gate)
 	void gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream );
 	void gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_idx, int m, backend::stream_t stream );
+	// MoE sublayer: mixed_ in, this rank's partial result (routed experts of the rank, plus the shared expert on rank 0) in y_
+	void moe_forward( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream );
 	// Debug trace (trace_layers): the first position of the forward, rows of streams or of an fp16 matrix
+	void trace_route( int tag, int m, backend::stream_t stream );
 	void trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols = 0 );
 
 	Qwen4ExpConfig config_;
@@ -149,6 +152,11 @@ private:
 	pod::TensorView y_;               // [R, hidden] fp16: the sublayer output
 	float* post_ = nullptr;           // [R, hc]
 	float* gr_scratch_ = nullptr;
+	// MoE buffers
+	int* topk_idx_ = nullptr;                 // [R, top_k]
+	backend::half_t* topk_w_ = nullptr;
+	pod::MoEScratch moe_scratch_;
+	pod::TensorView sh_gate_buf_, sh_up_buf_, sh_inter_buf_, sh_out_;
 	// GDN buffers
 	pod::TensorView qkv_buf_, conv_out_, z_buf_, gdn_out_, gdn_gate_, gdn_beta_;
 

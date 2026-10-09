@@ -66,8 +66,8 @@ void MoERouter::accumulate( pod::TensorView& accum_out, const pod::TensorView& e
 
 // Histogram and stable scatter of the routes by expert: expert_count/cursors [num_experts + 1] (last bin = overflow), token_sorted /
 // weight_sorted in route order per expert, active_experts = header + one item per (expert, chunk of <= chunk_rows)
-void MoERouter::exl3_moe_dispatch( const int* selected_experts, const backend::half_t* routing_weights, int64_t* expert_count, int64_t* token_sorted, backend::half_t* weight_sorted, int* cursors, int num_experts, int routing_first, int routing_last, int4* active_experts, backend::stream_t, int rows, int chunk_rows, uint32_t* heat ) {
-	const int n = kTopK * rows;
+void MoERouter::exl3_moe_dispatch( const int* selected_experts, const backend::half_t* routing_weights, int64_t* expert_count, int64_t* token_sorted, backend::half_t* weight_sorted, int* cursors, int num_experts, int routing_first, int routing_last, int4* active_experts, backend::stream_t, int rows, int chunk_rows, uint32_t* heat, int top_k ) {
+	const int n = top_k * rows;
 	std::vector<int> hist( static_cast<size_t>( num_experts ) + 1, 0 );
 	for ( int i = 0; i < n; ++i ) {
 		const int e = selected_experts[i];
@@ -97,7 +97,7 @@ void MoERouter::exl3_moe_dispatch( const int* selected_experts, const backend::h
 		if ( e >= routing_first && e < routing_last ) {
 			const int el = e - routing_first;
 			const int pos = cursors[el] + seen[el]++;
-			token_sorted[pos] = i / kTopK;
+			token_sorted[pos] = i / top_k;
 			weight_sorted[pos] = routing_weights[i];
 		}
 	}

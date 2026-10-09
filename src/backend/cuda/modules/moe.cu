@@ -124,7 +124,8 @@ __global__ void moe_dispatch_scatter_kernel(
 // Router scratch: split-K partial logits [row][k slice of 128][expert] handed from the dot-product kernel to the
 // selection kernel, which sums the slices in slice order (deterministic).
 #define ROUTER_MAX_KSLICES 32
-__device__ float g_router_partials[pod::MAX_ROWS * ROUTER_MAX_KSLICES * 288];
+#define ROUTER_MAX_EXPERTS 512
+__device__ float g_router_partials[pod::MAX_ROWS * ROUTER_MAX_KSLICES * ROUTER_MAX_EXPERTS];
 
 __global__ __launch_bounds__( 32 )
 void router_logits_kernel(
@@ -156,7 +157,7 @@ void router_logits_kernel(
 	for ( int j = 0; j < 128; ++j ) {
 		logit = fmaf( s_x[j], __half2float( w[j] ), logit );
 	}
-	g_router_partials[( static_cast<size_t>( m ) * ROUTER_MAX_KSLICES + ks ) * 288 + expert] = logit;
+	g_router_partials[( static_cast<size_t>( m ) * ROUTER_MAX_KSLICES + ks ) * ROUTER_MAX_EXPERTS + expert] = logit;
 }
 
 __global__ __launch_bounds__( 288 )
@@ -181,7 +182,7 @@ void router_select_kernel(
 		float logit = 0.0f;
 		#pragma unroll 8
 		for ( int ks = 0; ks < k_slices; ++ks ) {
-			logit += g_router_partials[( static_cast<size_t>( m ) * ROUTER_MAX_KSLICES + ks ) * 288 + expert];
+			logit += g_router_partials[( static_cast<size_t>( m ) * ROUTER_MAX_KSLICES + ks ) * ROUTER_MAX_EXPERTS + expert];
 		}
 		const float raw_score = 1.0f / ( 1.0f + __expf( -logit ) );
 		float select_score = raw_score;
@@ -236,6 +237,74 @@ void router_select_kernel(
 			for ( int i = 0; i < top_k; ++i ) {
 				topk_indices[i] = sel[i];
 				topk_weights[i] = __float2half_rn( s_raw[sel[i]] * inv_sum );
+			}
+		}
+	}
+}
+
+// Softmax routing: top_k largest raw logits (ties to the lowest expert index), weights = softmax over those logits
+__global__ __launch_bounds__( 512 )
+void router_softmax_select_kernel(
+	int* __restrict__ topk_indices,
+	half* __restrict__ topk_weights,
+	int num_experts,
+	int top_k,
+	int k_slices
+) {
+	__shared__ float s_logit[ROUTER_MAX_EXPERTS];
+	const int m = blockIdx.x;
+	topk_indices += m * top_k;
+	topk_weights += m * top_k;
+	const int expert = threadIdx.x;
+	if ( expert < num_experts ) {
+		float logit = 0.0f;
+		#pragma unroll 8
+		for ( int ks = 0; ks < k_slices; ++ks ) {
+			logit += g_router_partials[( static_cast<size_t>( m ) * ROUTER_MAX_KSLICES + ks ) * ROUTER_MAX_EXPERTS + expert];
+		}
+		s_logit[expert] = logit;
+	}
+	__syncthreads();
+	if ( threadIdx.x < 32 ) {
+		const int lane = threadIdx.x;
+		bool taken[16];
+		#pragma unroll
+		for ( int q = 0; q < 16; ++q ) taken[q] = false;
+		int sel[16];
+		float val[16];
+		for ( int i = 0; i < top_k; ++i ) {
+			float best = -INFINITY;
+			int best_idx = 0x7fffffff;
+			#pragma unroll
+			for ( int q = 0; q < 16; ++q ) {
+				const int e = lane + q * 32;
+				if ( e < num_experts && !taken[q] ) {
+					const float v = s_logit[e];
+					if ( v > best || ( v == best && e < best_idx ) ) {
+						best = v;
+						best_idx = e;
+					}
+				}
+			}
+			#pragma unroll
+			for ( int off = 16; off > 0; off >>= 1 ) {
+				const float ov = __shfl_xor_sync( 0xffffffff, best, off );
+				const int oi = __shfl_xor_sync( 0xffffffff, best_idx, off );
+				if ( ov > best || ( ov == best && oi < best_idx ) ) {
+					best = ov;
+					best_idx = oi;
+				}
+			}
+			sel[i] = best_idx;
+			val[i] = best;
+			if ( ( best_idx & 31 ) == lane ) taken[best_idx >> 5] = true;
+		}
+		if ( lane == 0 ) {
+			float sum = 0.0f;
+			for ( int i = 0; i < top_k; ++i ) sum += __expf( val[i] - val[0] );
+			for ( int i = 0; i < top_k; ++i ) {
+				topk_indices[i] = sel[i];
+				topk_weights[i] = __float2half_rn( __expf( val[i] - val[0] ) / sum );
 			}
 		}
 	}
@@ -364,6 +433,25 @@ void MoERouter::route_topk(
 	);
 }
 
+void MoERouter::route_softmax_topk(
+	const pod::TensorView& x,
+	const pod::TensorView& router_weights,
+	int* d_topk_indices,
+	half* d_topk_weights,
+	int hidden_size,
+	int num_experts,
+	int top_k,
+	cudaStream_t stream,
+	int rows
+) {
+	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS, "MoERouter::route_softmax_topk: rows out of range" );
+	ENGINE_ASSERT( top_k <= 16 && num_experts <= ROUTER_MAX_EXPERTS && hidden_size % 128 == 0 && hidden_size / 128 <= ROUTER_MAX_KSLICES,
+		"MoERouter::route_softmax_topk: top_k / num_experts / hidden_size out of range" );
+	router_logits_kernel<<<dim3( ( num_experts + 31 ) / 32, rows, hidden_size / 128 ), dim3( 32 ), 0, stream>>>(
+		x.ptr<const half>(), router_weights.ptr<const half>(), hidden_size, num_experts );
+	router_softmax_select_kernel<<<dim3( rows ), dim3( 512 ), 0, stream>>>( d_topk_indices, d_topk_weights, num_experts, top_k, hidden_size / 128 );
+}
+
 void MoERouter::combine(
 	const half* expert_parts,
 	const half* topk_weights,
@@ -423,9 +511,10 @@ void MoERouter::exl3_moe_dispatch(
 	cudaStream_t stream,
 	int rows,
 	int chunk_rows,
-	uint32_t* heat
+	uint32_t* heat,
+	int top_k
 ) {
-	const int n = 8 * rows;
+	const int n = top_k * rows;
 	int device = 0;
 	cudaGetDevice( &device );
 	int* locks = engine::modules::trellis_get_locks( device );
@@ -451,7 +540,7 @@ void MoERouter::exl3_moe_dispatch(
 		selected_experts,
 		routing_weights,
 		n,
-		8,
+		top_k,
 		num_experts,
 		routing_first,
 		routing_last,
@@ -602,7 +691,7 @@ void MoE::forward(
 			const int K_up = weights.up[0].bits;
 			const int K_down = weights.down[0].bits;
 			ENGINE_ASSERT( weights.device_ptrs != nullptr, "MoE::forward: init_device_ptrs not called" );
-			ENGINE_ASSERT( K_gate == 3 && K_up == 3 && K_down == 3, "MoE::forward: persistent trellis MoE kernel is instantiated for 3-bit experts only" );
+			ENGINE_ASSERT( K_gate == K_up && K_up == K_down && ( K_gate == 3 || K_gate == 4 ), "MoE::forward: persistent trellis MoE kernel is instantiated for 3 and 4-bit experts only" );
 
 			const int wide = rows > 8 ? 2 : 0;
 			MoERouter::exl3_moe_dispatch(
@@ -619,7 +708,8 @@ void MoE::forward(
 				stream,
 				rows,
 				wide == 2 ? 16 : 4,
-				weights.heat
+				weights.heat,
+				weights.top_k
 			);
 
 			const void** d_ptrs = static_cast<const void**>( weights.device_ptrs );
@@ -658,7 +748,8 @@ void MoE::forward(
 				weights.up[0].w1.shape[0],      // hidden: the length of suh
 				weights.up[0].w2.shape[0],      // this rank's intermediate width: the length of svh (2048, or 512 when sharded)
 				E,
-				stream
+				stream,
+				weights.top_k
 			);
 			if ( num_groups > 1 ) {
 				if ( plane_elems % 8 == 0 && num_groups <= MOE_MAX_GROUPS ) {
@@ -714,7 +805,8 @@ void exl3_moe(
 	int hidden_dim,
 	int intermediate_dim,
 	int num_experts,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int top_k
 ) {
 	(void) gate_mcg; (void) gate_mul1; (void) up_mcg; (void) up_mul1; (void) down_mcg; (void) down_mul1;
 	(void) num_active;
@@ -732,7 +824,7 @@ void exl3_moe(
 	const half* _hidden_state = static_cast<const half*>( hidden_state );
 	half* _output_state = static_cast<half*>( output_state );
 
-	int num_experts_per_tok = 8;
+	int num_experts_per_tok = top_k;
 	int max_tokens_per_expert = wide == 2 ? 16 : 4; // rows per expert pass (the GEMM tile); larger batches run in chunks
 	int concurrency = num_groups;
 	int chunk_all = 1; // experts above max_tokens_per_expert tokens are evaluated in chunks of max_tokens_per_expert
@@ -773,16 +865,27 @@ void exl3_moe(
 		(void*) &out_plane_stride
 	};
 
+	// 3-bit experts (GLM) run 256-wide output tiles; 4-bit experts (Flash-Next: intermediate 640) need 128-wide tiles to divide the gate/up width
+	ENGINE_ASSERT( K_gate == 3 || K_gate == 4, "exl3_moe: expert bits" );
+	ENGINE_ASSERT( K_gate == 3 ? intermediate_dim % 256 == 0 : intermediate_dim % 128 == 0, "exl3_moe: intermediate width vs the output tile" );
+	static bool attr_set4[ENGINE_NUM_GPUS] = { false };
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 256, 2, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<3, 256, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		attr_set[device] = true;
 	}
+	if ( K_gate == 4 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set4[device] ) {
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<4, 128, 2, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) exl3_moe_kernel<4, 128, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
+		attr_set4[device] = true;
+	}
 
 	// The wide kernel carries the 16-row GEMM tile as well; keeping it out of the decode kernel preserves its registers
 	// Output-tile width of the expert GEMMs: 256 is 18-29% faster than 128 below 64 rows on both the sharded and the whole-expert
 	// layouts (fewer K-split reductions per weight decoded) and level at 512
-	void* moe_fn = wide == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0>;
+	void* moe_fn = ( K_gate == 4 )
+		? ( wide == 2 ? (void*) exl3_moe_kernel<4, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 0> )
+		: ( wide == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0> );
 	CUDA_CHECK( cudaLaunchKernel(
 		moe_fn,
 		grid_dim,

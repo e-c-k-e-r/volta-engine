@@ -14,6 +14,7 @@ namespace pod {
 struct MoELayerWeights {
 	QuantType type = QuantType::TRELLIS;
 	int num_local_experts = 72;
+	int top_k = 8;                     // routes per token the dispatch and the expert kernel expect
 	LinearWeight gate[MOE_MAX_EXPERTS];
 	LinearWeight up[MOE_MAX_EXPERTS];
 	LinearWeight down[MOE_MAX_EXPERTS];
@@ -62,6 +63,20 @@ struct MoERouter {
 		int rows = 1                    // x [rows, hidden] -> indices / weights [rows, top_k]
 	);
 
+	// Softmax routing (Qwen family): the top_k largest raw logits, weighted by the softmax over just those logits.
+	// x [rows, hidden] -> indices / weights [rows, top_k]; no bias, no scaling.
+	static void route_softmax_topk(
+		const pod::TensorView& x,
+		const pod::TensorView& router_weights,
+		int* d_topk_indices,
+		backend::half_t* d_topk_weights,
+		int hidden_size,
+		int num_experts,
+		int top_k,
+		backend::stream_t stream = nullptr,
+		int rows = 1
+	);
+
 	static void combine(
 		const backend::half_t* expert_parts,
 		const backend::half_t* topk_weights,
@@ -102,7 +117,8 @@ struct MoERouter {
 		backend::stream_t stream = nullptr,
 		int rows = 1,                   // routes = 8 * rows, token index = route / 8
 		int chunk_rows = 4,             // rows per work item (the expert GEMM tile)
-		uint32_t* heat = nullptr        // optional per-expert route counters, incremented by this dispatch
+		uint32_t* heat = nullptr,       // optional per-expert route counters, incremented by this dispatch
+		int top_k = 8                   // routes per row
 	);
 };
 
@@ -169,7 +185,8 @@ void exl3_moe(
 	int hidden_dim,
 	int intermediate_dim,           // this rank's width of the expert intermediate
 	int num_experts,
-	engine::backend::stream_t stream = nullptr
+	engine::backend::stream_t stream = nullptr,
+	int top_k = 8                   // routes per token (the kernel argument num_experts_per_tok)
 );
 
 } // namespace ext

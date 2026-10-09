@@ -32,6 +32,9 @@ struct GatedResidual {
 		backend::stream_t stream
 	);
 
+	// y[r, :] += sigmoid( x[r] . w ) * s[r, :]  (the shared expert's output gate; w [hidden] fp16)
+	static void add_sigmoid_gated( backend::half_t* y, const backend::half_t* s, const backend::half_t* x, const backend::half_t* w, int rows, int hidden, backend::stream_t stream );
+
 	static void apply( float* x, const float* post, const backend::half_t* y, int rows, int hidden, int hc, backend::stream_t stream );
 };
 

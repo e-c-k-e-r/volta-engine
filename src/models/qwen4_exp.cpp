@@ -7,6 +7,8 @@
 #include "engine/modules/gdn.h"
 #include "engine/modules/gated_residual.h"
 #include "engine/modules/embedding.h"
+#include "engine/modules/swiglu.h"
+#include "engine/modules/linear.h"
 #if ENGINE_BACKEND_CUDA
 #include "trellis_context.h"
 #endif
@@ -60,6 +62,24 @@ bool validate_config( const char* model_dir, const Qwen4ExpConfig& c ) {
 	check( "indexer_budget", c.indexer_budget );
 	check( "indexer_compress_ratio", c.indexer_compress );
 	return ok;
+}
+
+// The router kernel reads the gate as [hidden, experts]; the checkpoint stores [experts, hidden]
+pod::TensorView load_router_transposed( engine::loader::SafeTensorsRepo& repo, const char* name, pod::MemoryArena& arena ) {
+	int shard_idx = -1;
+	const auto* meta = repo.find( name, &shard_idx );
+	if ( !meta || shard_idx < 0 ) return pod::TensorView{};
+	const int E = meta->shape[0], H = meta->shape[1];
+	const auto* src = static_cast<const backend::half_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta ) );
+	if ( !src ) return pod::TensorView{};
+	int shape[2] = { H, E };
+	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
+	if ( tv.data != nullptr ) {
+		std::vector<backend::half_t> t( static_cast<size_t>( H ) * E );
+		for ( int e = 0; e < E; ++e ) for ( int d = 0; d < H; ++d ) t[static_cast<size_t>( d ) * E + e] = src[static_cast<size_t>( e ) * H + d];
+		backend::memcpy_sync( tv.data, t.data(), t.size() * sizeof( backend::half_t ), backend::Copy::H2D );
+	}
+	return tv;
 }
 
 } // namespace
@@ -118,6 +138,15 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	post_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.hc_mult * sizeof( float ) ) );
 	gr_scratch_ = static_cast<float*>( engine::core::arena_alloc( arena,
 		engine::modules::GatedResidual::scratch_floats( R, H, config_.hc_mult, config_.hc_rank ) * sizeof( float ) ) );
+	// MoE: router outputs, the dispatch / expert scratch for this rank's experts, and the shared expert's buffers
+	topk_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( int ) ) );
+	topk_w_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( backend::half_t ) ) );
+	moe_scratch_ = engine::modules::MoE::alloc_scratch( arena, config_.num_experts / tp_, config_.top_k, H, config_.moe_intermediate, R );
+	int sh_shape[2] = { R, config_.shared_intermediate };
+	sh_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, sh_shape, 2 );
+	sh_up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, sh_shape, 2 );
+	sh_inter_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, sh_shape, 2 );
+	sh_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	int qkv_shape[2] = { R, lin_channels_ };
 	qkv_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
 	conv_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
@@ -241,11 +270,14 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		}
 
 		// MoE: replicated router, 128 whole experts per rank, shared expert (replicated, run on one rank) and its gate
-		std::snprintf( nm, sizeof( nm ), "%s.mlp.gate.weight", pre ); lw.router = dense( nm );
+		std::snprintf( nm, sizeof( nm ), "%s.mlp.gate.weight", pre );
+		lw.router = load_router_transposed( repo, nm, *arena_ );
+		if ( !lw.router.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, nm ); ++missing; }
 		auto& mw = lw.experts;
 		mw.type = pod::QuantType::TRELLIS;
 		const int per_rank = config_.num_experts / tp;
 		mw.num_local_experts = per_rank;
+		mw.top_k = config_.top_k;
 		for ( int e = 0; e < per_rank; ++e ) {
 			const int gid = rank_ * per_rank + e;
 			std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.gate_proj", pre, gid ); mw.gate[e] = check( repo.load_linear( nm, *arena_, 4, stream ), nm );
@@ -279,6 +311,10 @@ void Qwen4ExpPipeline::set_rows( int m ) {
 	qkv_buf_.shape[0] = m;
 	z_buf_.shape[0] = m;
 	gdn_out_.shape[0] = m;
+	sh_gate_buf_.shape[0] = m;
+	sh_up_buf_.shape[0] = m;
+	sh_inter_buf_.shape[0] = m;
+	sh_out_.shape[0] = m;
 }
 
 void Qwen4ExpPipeline::embed_tokens( const int* token_ids, int count, backend::stream_t stream ) {
@@ -322,6 +358,32 @@ void Qwen4ExpPipeline::trace_rows( int tag, const void* dev, bool streams, int m
 		const int hdr[3] = { tag, m, key_hint_ - m };
 		std::fwrite( hdr, sizeof( int ), 3, f );
 		std::fwrite( out.data(), sizeof( float ), elems, f );
+		std::fclose( f );
+	}
+}
+
+// Router output of the m rows: per row top_k expert ids then top_k weights, as floats
+void Qwen4ExpPipeline::trace_route( int tag, int m, backend::stream_t stream ) {
+	static const std::string& path = runtime::options().trace_layers;
+	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH ) return;
+	const int K = config_.top_k;
+	std::vector<int> ids( static_cast<size_t>( m ) * K );
+	std::vector<backend::half_t> w( ids.size() );
+	backend::stream_sync( stream );
+	backend::memcpy_async( ids.data(), topk_idx_, ids.size() * sizeof( int ), backend::Copy::D2H, stream );
+	backend::memcpy_async( w.data(), topk_w_, w.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
+	std::vector<float> out( static_cast<size_t>( m ) * 2 * K );
+	for ( int r = 0; r < m; ++r ) {
+		for ( int k = 0; k < K; ++k ) {
+			out[static_cast<size_t>( r ) * 2 * K + k] = static_cast<float>( ids[static_cast<size_t>( r ) * K + k] );
+			out[static_cast<size_t>( r ) * 2 * K + K + k] = backend::to_float( w[static_cast<size_t>( r ) * K + k] );
+		}
+	}
+	if ( FILE* f = std::fopen( path.c_str(), "ab" ) ) {
+		const int hdr[3] = { tag, m, key_hint_ - m };
+		std::fwrite( hdr, sizeof( int ), 3, f );
+		std::fwrite( out.data(), sizeof( float ), out.size(), f );
 		std::fclose( f );
 	}
 }
@@ -376,6 +438,23 @@ void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_i
 	engine::modules::Linear::forward( gdn_out_, lw.out_proj, y_, stream );
 }
 
+void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream ) {
+	const int H = config_.hidden_size;
+	engine::modules::MoERouter::route_softmax_topk( mixed_, lw.router, topk_idx_, topk_w_, H, config_.num_experts, config_.top_k, stream, m );
+	if ( &lw == &layers_[0] ) trace_route( 700, m, stream );
+	const int per_rank = config_.num_experts / tp_;
+	// Plain SiLU gating (no swiglu limit): act_limit 0
+	engine::modules::MoE::forward( mixed_, lw.experts, topk_idx_, topk_w_, y_, rank_ * per_rank, ( rank_ + 1 ) * per_rank, moe_scratch_, 0.0f, stream );
+	if ( rank_ == 0 ) {
+		engine::modules::Linear::forward( mixed_, lw.shared_gate, sh_gate_buf_, stream );
+		engine::modules::Linear::forward( mixed_, lw.shared_up, sh_up_buf_, stream );
+		engine::modules::SwiGLU::forward( sh_gate_buf_, sh_up_buf_, sh_inter_buf_, stream );
+		engine::modules::Linear::forward( sh_inter_buf_, lw.shared_down, sh_out_, stream );
+		engine::modules::GatedResidual::add_sigmoid_gated( y_.ptr<backend::half_t>(), sh_out_.ptr<const backend::half_t>(), mixed_.ptr<const backend::half_t>(),
+			lw.shared_expert_gate.ptr<const backend::half_t>(), m, H, stream );
+	}
+}
+
 void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size, hc = config_.hc_mult;
 	const int halt = runtime::options().qwen4_halt;
@@ -399,7 +478,14 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 		trace_rows( 300 + L, streams_.data, true, m, stream );
 		if ( halt == site++ ) return;
 		// MLP site
-		ENGINE_ASSERT( false, "qwen4_exp: the MoE sublayer is not implemented yet" );
+		gr_mix( lw.mlp_hc, true, m, stream );
+		trace_rows( 400 + L, mixed_.data, false, m, stream );
+		moe_forward( lw, m, stream );
+		if ( ring_ ) ring_->all_reduce( y_, stream );
+		trace_rows( 500 + L, y_.data, false, m, stream );
+		engine::modules::GatedResidual::apply( streams_.ptr<float>(), post_, y_.ptr<const backend::half_t>(), m, H, hc, stream );
+		trace_rows( 600 + L, streams_.data, true, m, stream );
+		if ( halt == site++ ) return;
 	}
 }
 
