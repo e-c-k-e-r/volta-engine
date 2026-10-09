@@ -50,6 +50,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | **Debug** | | | | |
 | `expert_log` | bool | `false` | `ENGINE_DEBUG_EXPERT_LOG` | per-rebalance expert tier statistics |
 | `dsa_diag` | bool | `false` | `ENGINE_DEBUG_DSA_DIAG` | sparse-attention indexer diagnostics |
+| `trace_layers` | string | `(empty)` | `ENGINE_DEBUG_TRACE_LAYERS` | GLM: file that receives the last row's residual streams after every layer of every eager forward (rank 0) |
 | `spec_ctrl_log` | bool | `false` | `ENGINE_DEBUG_SPEC_CTRL_LOG` | speculation controller decisions |
 | `no_graphs` | bool | `false` | `ENGINE_DEBUG_NO_GRAPHS` | eager execution, no CUDA graphs |
 | `dump_requests` | string | `(empty)` | `ENGINE_DEBUG_DUMP_REQUESTS` | directory: write every API request body and rendered prompt there |

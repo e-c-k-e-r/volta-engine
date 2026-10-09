@@ -913,6 +913,22 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 	int start_expert = moe_tp_ ? 0 : rank_ * experts_per_rank;
 	int end_expert = start_expert + experts_per_rank;
 
+	// Debug (trace_layers): header (tag, rows, first position) then the last row's four streams; tag = layer after the layer, 100 + layer after attention
+	static const std::string& trace_path = runtime::options().trace_layers;
+	auto trace_row = [&]( int tag ) {
+		if ( trace_path.empty() || rank_ != 0 || m <= pod::MAX_BATCH ) return;
+		std::vector<float> row( static_cast<size_t>( 4 ) * H );
+		backend::stream_sync( stream );
+		backend::memcpy_async( row.data(), hidden_streams_.ptr<const float>() + static_cast<size_t>( m - 1 ) * 4 * H, row.size() * sizeof( float ), backend::Copy::D2H, stream );
+		backend::stream_sync( stream );
+		if ( FILE* f = std::fopen( trace_path.c_str(), "ab" ) ) {
+			const int hdr[3] = { tag, m, key_hint_ - m };
+			std::fwrite( hdr, sizeof( int ), 3, f );
+			std::fwrite( row.data(), sizeof( float ), row.size(), f );
+			std::fclose( f );
+		}
+	};
+
 	for ( int layer = 0; layer < config_.num_layers; ++layer ) {
 		auto& lw = layers_[layer];
 
@@ -1116,6 +1132,7 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 			}
 		}
 
+		trace_row( 100 + layer );
 		if ( lw.hc_ffn_fn.data != nullptr ) {
 			// mHC pre-step: FFN
 			// Collapse and the post-attention RMSNorm in one launch when the shape allows
@@ -1227,6 +1244,8 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 				draft_taps_.ptr<backend::half_t>(), tap_tmp_.ptr<const backend::half_t>(), d_rows_, d_taps_owner_,
 				m, tap, H, draft_hooks_.taps_cap, stream );
 		}
+
+		trace_row( layer );
 	}
 
 	if ( layers_[0].hc_attn_fn.data != nullptr ) {

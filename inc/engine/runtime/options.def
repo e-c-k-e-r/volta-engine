@@ -24,6 +24,7 @@ OPTION( int, max_image_tokens, 1024, "largest image the vision tower accepts, in
 OPTION( bool, spec_ctrl, true, "adaptive speculation controller; false always speculates" )
 DEBUG_OPTION( bool, expert_log, false, "per-rebalance expert tier statistics" )
 DEBUG_OPTION( bool, dsa_diag, false, "sparse-attention indexer diagnostics" )
+DEBUG_OPTION( std::string, trace_layers, "", "GLM: file that receives the last row's residual streams after every layer of every eager forward (rank 0)" )
 DEBUG_OPTION( bool, spec_ctrl_log, false, "speculation controller decisions" )
 DEBUG_OPTION( bool, no_graphs, false, "eager execution, no CUDA graphs" )
 DEBUG_OPTION( std::string, dump_requests, "", "directory: write every API request body and rendered prompt there" )

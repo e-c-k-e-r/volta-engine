@@ -381,6 +381,9 @@ set_target_properties(test_mtp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BI
 add_executable(test_prefix_restore tests/4_coherence/test_prefix_restore.cpp)
 target_link_libraries(test_prefix_restore PRIVATE engine_kernels)
 set_target_properties(test_prefix_restore PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_chunk_boundary tests/4_coherence/test_chunk_boundary.cpp)
+target_link_libraries(test_chunk_boundary PRIVATE engine_kernels)
+set_target_properties(test_chunk_boundary PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_longctx tests/4_coherence/test_longctx.cpp)
 target_link_libraries(test_longctx PRIVATE engine_kernels)
