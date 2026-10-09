@@ -26,6 +26,16 @@ int main() {
 	const std::string dir = TEST_DATA_DIR;
 	const auto cases = nlohmann::json::parse( read_file( dir + "/image_cases.json" ) );
 	int failures = 0;
+	// GLM-5 canvas, expected values from the exllamav3 reference (glm5_vision_canvas; 16..1024 tokens of 28x28)
+	const int canvas[][4] = { { 480, 640, 504, 644 }, { 12, 20, 112, 168 }, { 1200, 1600, 756, 1008 }, { 200, 640, 224, 644 }, { 3000, 500, 2184, 364 }, { 28, 28, 112, 112 } };
+	for ( const auto& c : canvas ) {
+		int h = 0, w = 0;
+		engine::loader::glm_canvas( c[0], c[1], 28, 16 * 784, 1024 * 784, &h, &w );
+		if ( h != c[2] || w != c[3] ) {
+			std::printf( "FAIL glm_canvas %dx%d -> %dx%d, want %dx%d\n", c[0], c[1], h, w, c[2], c[3] );
+			++failures;
+		}
+	}
 	for ( const auto& c : cases ) {
 		const std::string bytes = read_file( dir + "/" + c["file"].get<std::string>() );
 		DecodedImage img;

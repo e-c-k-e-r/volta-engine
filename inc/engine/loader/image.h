@@ -23,6 +23,8 @@ struct VisionParams {
 	int temporal_patch_size = 2;
 	int min_pixels = 65536;
 	int max_pixels = 1048576;
+	// GLM-5: aspect-preserving resize onto a zero-padded canvas aligned to patch * merge (instead of the Qwen2 warp)
+	bool canvas = false;
 	float mean[3] = { 0.5f, 0.5f, 0.5f };
 	float stddev[3] = { 0.5f, 0.5f, 0.5f };
 };
@@ -40,6 +42,9 @@ struct PreparedImage {
 
 // Qwen2-VL smart resize: dimensions rounded to multiples of patch * merge inside [min_pixels, max_pixels].
 void smart_resize( int height, int width, int factor, int min_pixels, int max_pixels, int* out_h, int* out_w );
+
+// GLM-5 token-budget canvas (height, width) for a single image; budgets are single-frame pixels.
+void glm_canvas( int height, int width, int factor, int min_pixels, int max_pixels, int* out_h, int* out_w );
 
 bool prepare_image( const DecodedImage& img, const VisionParams& p, PreparedImage* out, std::string* error );
 

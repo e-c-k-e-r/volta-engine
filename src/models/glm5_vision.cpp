@@ -56,6 +56,7 @@ bool Glm5VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int 
 	params_.patch_size = cfg_.patch_size;
 	params_.merge_size = cfg_.merge_size;
 	params_.temporal_patch_size = cfg_.temporal_patch_size;
+	params_.canvas = true;
 	params_.max_pixels = max_patches * cfg_.patch_size * cfg_.patch_size;
 	const nlohmann::json pc = read_json( std::string( model_dir ) + "/processor_config.json" );
 	if ( !pc.is_discarded() && pc.contains( "image_processor" ) ) {
@@ -168,11 +169,12 @@ bool Glm5VisionTower::encode( const engine::loader::PreparedImage& img, std::vec
 	const int H = cfg_.hidden, hd = cfg_.head_dim(), I = cfg_.intermediate, O = cfg_.out_hidden, MI = cfg_.merger_intermediate;
 	const int tokens = m / 4;
 
-	std::vector<backend::half_t> patches( static_cast<size_t>( m ) * cfg_.patch_dim() );
-	for ( size_t i = 0; i < patches.size(); ++i ) patches[i] = backend::from_float_half( img.patches[i] );
+	// Patches go up as FP32 through the MLP scratch (unused until the first block) and are narrowed on the device
 	std::vector<float> cs, sn;
 	vision_rotary_tables( img.grid_h, img.grid_w, cfg_.merge_size, hd, &cs, &sn );
-	backend::memcpy_async( d_patches_, patches.data(), patches.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
+	const size_t patch_floats = static_cast<size_t>( m ) * cfg_.patch_dim();
+	ENGINE_ASSERT( patch_floats * sizeof( float ) <= static_cast<size_t>( max_patches_ ) * I * sizeof( backend::half_t ), "vision: patch staging does not fit" );
+	backend::memcpy_async( d_mlp_, img.patches.data(), patch_floats * sizeof( float ), backend::Copy::H2D, stream );
 	backend::memcpy_async( d_cos_, cs.data(), cs.size() * sizeof( float ), backend::Copy::H2D, stream );
 	backend::memcpy_async( d_sin_, sn.data(), sn.size() * sizeof( float ), backend::Copy::H2D, stream );
 	backend::stream_sync( stream );   // the staging vectors die at return
@@ -180,6 +182,7 @@ bool Glm5VisionTower::encode( const engine::loader::PreparedImage& img, std::vec
 	using engine::modules::Vision;
 	using engine::modules::Linear;
 	using H16 = const backend::half_t*;
+	Vision::f32_to_f16( reinterpret_cast<const float*>( d_mlp_ ), d_patches_, patch_floats, stream );
 	Vision::patch_embed( d_patches_, patch_w_.ptr<const backend::half_t>(), patch_b_.ptr<const backend::half_t>(), nullptr, d_hidden_, m, H, cfg_.patch_dim(), stream );
 	const float scale = 1.0f / std::sqrt( static_cast<float>( hd ) );
 	for ( const Block& b : blocks_ ) {

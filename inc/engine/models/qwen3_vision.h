@@ -43,7 +43,6 @@ public:
 	bool encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, backend::stream_t stream ) override;
 
 	// Host-side tables (exposed for tests)
-	std::vector<float> position_embeddings( int grid_h, int grid_w ) const;                   // [h * w, hidden] merge order
 	void rotary_tables( int grid_h, int grid_w, std::vector<float>* cos_t, std::vector<float>* sin_t ) const; // [h * w, head_dim]
 
 private:
@@ -59,7 +58,7 @@ private:
 	int max_patches_ = 0;
 	std::vector<Block> blocks_;
 	pod::TensorView patch_w_, patch_b_;
-	std::vector<float> pos_table_; // [num_position_embeddings, hidden]
+	backend::half_t* d_pos_table_ = nullptr; // [num_position_embeddings, hidden]
 	pod::TensorView merge_norm_w_, merge_norm_b_;
 	pod::LinearWeight merge_fc1_, merge_fc2_;
 	pod::TensorView merge_fc1_b_, merge_fc2_b_;

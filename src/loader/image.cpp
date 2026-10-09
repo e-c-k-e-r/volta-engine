@@ -164,6 +164,36 @@ std::vector<float> resize_bicubic( const uint8_t* rgb, int in_h, int in_w, int o
 	return out;
 }
 
+void glm_canvas( int height, int width, int factor, int min_pixels, int max_pixels, int* out_h, int* out_w ) {
+	const auto align = [factor]( int v ) { return ( v + factor - 1 ) / factor * factor; };
+	int ah = align( height ), aw = align( width );
+	if ( static_cast<int64_t>( ah ) * aw < min_pixels ) {
+		const double scale = std::sqrt( static_cast<double>( min_pixels ) / ( static_cast<double>( height ) * width ) );
+		ah = align( std::max( 1, static_cast<int>( std::ceil( height * scale ) ) ) );
+		aw = align( std::max( 1, static_cast<int>( std::ceil( width * scale ) ) ) );
+	}
+	if ( static_cast<int64_t>( ah ) * aw > max_pixels ) {
+		int lo = 1, hi = height, bh = factor, bw = factor;
+		while ( lo <= hi ) {
+			const int ch = ( lo + hi ) / 2;
+			const int cw = std::max( 1, static_cast<int>( std::floor( static_cast<double>( width ) * ch / height ) ) );
+			const int th = align( ch ), tw = align( cw );
+			if ( static_cast<int64_t>( th ) * tw <= max_pixels ) {
+				bh = th;
+				bw = tw;
+				lo = ch + 1;
+			}
+			else {
+				hi = ch - 1;
+			}
+		}
+		ah = bh;
+		aw = bw;
+	}
+	*out_h = ah;
+	*out_w = aw;
+}
+
 bool prepare_image( const DecodedImage& img, const VisionParams& p, PreparedImage* out, std::string* error ) {
 	if ( img.width < 1 || img.height < 1 ) {
 		if ( error ) *error = "empty image";
@@ -175,9 +205,24 @@ bool prepare_image( const DecodedImage& img, const VisionParams& p, PreparedImag
 		return false;
 	}
 	int h = 0, w = 0;
-	smart_resize( img.height, img.width, factor, p.min_pixels, p.max_pixels, &h, &w );
-	std::vector<float> px = ( h == img.height && w == img.width ) ? std::vector<float>( img.rgb.begin(), img.rgb.end() )
-	                                                              : resize_bicubic( img.rgb.data(), img.height, img.width, h, w );
+	std::vector<float> px;
+	if ( p.canvas ) {
+		glm_canvas( img.height, img.width, factor, p.min_pixels, p.max_pixels, &h, &w );
+		// Content keeps its aspect and is never upscaled once the raw pixels meet the minimum budget; the rest is black.
+		double scale = std::min( static_cast<double>( h ) / img.height, static_cast<double>( w ) / img.width );
+		if ( static_cast<int64_t>( img.height ) * img.width >= p.min_pixels ) scale = std::min( 1.0, scale );
+		const int ch = std::max( 1, std::min( h, static_cast<int>( std::floor( img.height * scale ) ) ) );
+		const int cw = std::max( 1, std::min( w, static_cast<int>( std::floor( img.width * scale ) ) ) );
+		const std::vector<float> content = ( ch == img.height && cw == img.width ) ? std::vector<float>( img.rgb.begin(), img.rgb.end() )
+		                                                                         : resize_bicubic( img.rgb.data(), img.height, img.width, ch, cw );
+		px.assign( static_cast<size_t>( h ) * w * 3, 0.0f );
+		for ( int y = 0; y < ch; ++y ) std::copy_n( &content[static_cast<size_t>( y ) * cw * 3], static_cast<size_t>( cw ) * 3, &px[static_cast<size_t>( y ) * w * 3] );
+	}
+	else {
+		smart_resize( img.height, img.width, factor, p.min_pixels, p.max_pixels, &h, &w );
+		px = ( h == img.height && w == img.width ) ? std::vector<float>( img.rgb.begin(), img.rgb.end() )
+		                                           : resize_bicubic( img.rgb.data(), img.height, img.width, h, w );
+	}
 
 	const int ps = p.patch_size, m = p.merge_size, tp = p.temporal_patch_size;
 	const int gh = h / ps, gw = w / ps;

@@ -29,8 +29,8 @@ int main( int argc, char** argv ) {
 	engine::core::arena_create( arena, 0, 2ULL << 30 );
 	auto stream = backend::stream_create();
 	// Tensor-core attention against the CUDA-core reference on random data (m not a multiple of the tile)
-	{
-		const int m = 1000, H = 16, D = 72, n = m * H * D;
+	for ( const int D : { 72, 64 } ) {
+		const int m = 1000, H = 16, n = m * H * D;
 		std::mt19937 rng( 7 );
 		std::normal_distribution<float> nd( 0.0f, 1.5f );
 		std::vector<backend::half_t> hq( n ), hk( n ), hv( n ), o1( n ), o2( n );
@@ -47,7 +47,7 @@ int main( int argc, char** argv ) {
 		backend::memcpy_sync( dq, hq.data(), n * 2, backend::Copy::H2D );
 		backend::memcpy_sync( dk, hk.data(), n * 2, backend::Copy::H2D );
 		backend::memcpy_sync( dv, hv.data(), n * 2, backend::Copy::H2D );
-		const float sc = 1.0f / std::sqrt( 72.0f );
+		const float sc = 1.0f / std::sqrt( static_cast<float>( D ) );
 		engine::modules::Vision::attention( dq, dk, dv, da, m, H, D, sc, stream );
 		engine::modules::Vision::attention_simt( dq, dk, dv, db, m, H, D, sc, stream );
 		backend::stream_sync( stream );

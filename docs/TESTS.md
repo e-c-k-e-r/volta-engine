@@ -14,7 +14,7 @@
 | `test_ref_linear`, `test_ref_attention`, `test_vulkan_kernels`, `test_vulkan_smoke`, `test_vulkan_ref` | 2 | yes | portable reference kernels on CUDA, CPU and Vulkan |
 | `test_ops_linear`, `test_ops_moe`, `test_ops_attention` | 2 | yes | cross-backend op goldens (dumped on CUDA, checked on CUDA, CPU, Vulkan) |
 | `test_jinja` | 2 | no | Jinja2 subset against reference Jinja2 renders of both chat templates |
-| `test_image` | 2 | no | image decode, smart resize and patch layout against PIL / HF-layout references (`tests/tools/gen_image_goldens.py`) |
+| `test_image` | 2 | no | image decode, smart resize and patch layout against PIL / HF-layout references, GLM canvas sizes against exllamav3's (`tests/tools/gen_image_goldens.py`) |
 | `test_output_parser` | 2 | no | reasoning / tool-call parser, chunking independence, template round trip |
 | `test_backend_tiers` | 1 | no | capability registry matches the declared module functions |
 

@@ -80,14 +80,14 @@ bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int
 	}
 	patch_b_ = fp16( "model.visual.patch_embed.proj.bias" );
 
-	// Position table on the host (interpolated per image)
+	// Position table (interpolated on the device per image)
 	{
 		const auto* meta = repo.find( "model.visual.pos_embed.weight" );
 		const void* raw = repo.cpu_data( "model.visual.pos_embed.weight" );
 		ENGINE_ASSERT( meta && raw && meta->dtype == pod::DType::FP16, "vision: pos_embed must be FP16" );
-		pos_table_.resize( static_cast<size_t>( cfg_.num_position_embeddings ) * cfg_.hidden );
-		const auto* h = static_cast<const backend::half_t*>( raw );
-		for ( size_t i = 0; i < pos_table_.size(); ++i ) pos_table_[i] = backend::to_float( h[i] );
+		const size_t count = static_cast<size_t>( cfg_.num_position_embeddings ) * cfg_.hidden;
+		d_pos_table_ = take<backend::half_t>( arena, count );
+		backend::memcpy_async( d_pos_table_, raw, count * sizeof( backend::half_t ), backend::Copy::H2D, stream );
 	}
 
 	blocks_.resize( cfg_.depth );
@@ -146,56 +146,40 @@ bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int
 	return true;
 }
 
-std::vector<float> Qwen3VisionTower::position_embeddings( int gh, int gw ) const {
-	const int side = static_cast<int>( std::lround( std::sqrt( static_cast<double>( cfg_.num_position_embeddings ) ) ) );
-	const int D = cfg_.hidden, m = cfg_.merge_size;
-	auto lin_idx = []( int i, int n, int side_ ) { return ( n == 1 ) ? 0.0f : static_cast<float>( i ) * ( side_ - 1 ) / ( n - 1 ); };
-	std::vector<float> out( static_cast<size_t>( gh ) * gw * D );
-	size_t row = 0;
-	for ( int by = 0; by < gh / m; ++by ) {
-		for ( int bx = 0; bx < gw / m; ++bx ) {
-			for ( int my = 0; my < m; ++my ) {
-				for ( int mx = 0; mx < m; ++mx, ++row ) {
-					const float hy = lin_idx( by * m + my, gh, side ), wx = lin_idx( bx * m + mx, gw, side );
-					const int hf = static_cast<int>( hy ), wf = static_cast<int>( wx );
-					const int hc = std::min( hf + 1, side - 1 ), wc = std::min( wf + 1, side - 1 );
-					const float dh = hy - hf, dw = wx - wf;
-					const float* t00 = &pos_table_[( static_cast<size_t>( hf ) * side + wf ) * D];
-					const float* t01 = &pos_table_[( static_cast<size_t>( hf ) * side + wc ) * D];
-					const float* t10 = &pos_table_[( static_cast<size_t>( hc ) * side + wf ) * D];
-					const float* t11 = &pos_table_[( static_cast<size_t>( hc ) * side + wc ) * D];
-					float* o = &out[row * D];
-					for ( int d = 0; d < D; ++d ) {
-						o[d] = ( 1 - dh ) * ( 1 - dw ) * t00[d] + ( 1 - dh ) * dw * t01[d] + dh * ( 1 - dw ) * t10[d] + dh * dw * t11[d];
-					}
-				}
-			}
-		}
-	}
-	return out;
-}
-
 void vision_rotary_tables( int gh, int gw, int m, int hd, std::vector<float>* cos_t, std::vector<float>* sin_t ) {
 	const int quarter = hd / 4;
 	std::vector<float> inv( quarter );
 	for ( int i = 0; i < quarter; ++i ) inv[i] = 1.0f / std::pow( 10000.0f, static_cast<float>( 2 * i ) / ( hd / 2 ) );
 	cos_t->assign( static_cast<size_t>( gh ) * gw * hd, 0.0f );
 	sin_t->assign( cos_t->size(), 0.0f );
+	// Row and column angles depend on one grid coordinate each: tabulate them once
+	std::vector<float> rc( static_cast<size_t>( gh ) * quarter ), rs( rc.size() ), cc( static_cast<size_t>( gw ) * quarter ), cs_( cc.size() );
+	for ( int y = 0; y < gh; ++y ) {
+		for ( int i = 0; i < quarter; ++i ) {
+			rc[y * quarter + i] = std::cos( y * inv[i] );
+			rs[y * quarter + i] = std::sin( y * inv[i] );
+		}
+	}
+	for ( int x = 0; x < gw; ++x ) {
+		for ( int i = 0; i < quarter; ++i ) {
+			cc[x * quarter + i] = std::cos( x * inv[i] );
+			cs_[x * quarter + i] = std::sin( x * inv[i] );
+		}
+	}
 	size_t row = 0;
 	for ( int by = 0; by < gh / m; ++by ) {
 		for ( int bx = 0; bx < gw / m; ++bx ) {
 			for ( int my = 0; my < m; ++my ) {
 				for ( int mx = 0; mx < m; ++mx, ++row ) {
-					const float r = static_cast<float>( by * m + my ), c = static_cast<float>( bx * m + mx );
+					const int y = by * m + my, x = bx * m + mx;
 					float* cs = &( *cos_t )[row * hd];
 					float* sn = &( *sin_t )[row * hd];
 					// emb = [row freqs | col freqs], repeated twice (rotate_half layout)
 					for ( int i = 0; i < quarter; ++i ) {
-						const float fr = r * inv[i], fc = c * inv[i];
-						cs[i] = cs[i + hd / 2] = std::cos( fr );
-						sn[i] = sn[i + hd / 2] = std::sin( fr );
-						cs[quarter + i] = cs[quarter + i + hd / 2] = std::cos( fc );
-						sn[quarter + i] = sn[quarter + i + hd / 2] = std::sin( fc );
+						cs[i] = cs[i + hd / 2] = rc[y * quarter + i];
+						sn[i] = sn[i + hd / 2] = rs[y * quarter + i];
+						cs[quarter + i] = cs[quarter + i + hd / 2] = cc[x * quarter + i];
+						sn[quarter + i] = sn[quarter + i + hd / 2] = cs_[x * quarter + i];
 					}
 				}
 			}
@@ -217,22 +201,19 @@ bool Qwen3VisionTower::encode( const engine::loader::PreparedImage& img, std::ve
 	const int H = cfg_.hidden, hd = cfg_.head_dim(), mrg = cfg_.merge_size * cfg_.merge_size;
 	const int mlp_w = blocks_[0].fc1_b.shape[0];
 
-	std::vector<backend::half_t> patches( static_cast<size_t>( m ) * cfg_.patch_dim() );
-	for ( size_t i = 0; i < patches.size(); ++i ) patches[i] = backend::from_float_half( img.patches[i] );
-	const std::vector<float> pos_f = position_embeddings( img.grid_h, img.grid_w );
-	std::vector<backend::half_t> pos( pos_f.size() );
-	for ( size_t i = 0; i < pos.size(); ++i ) pos[i] = backend::from_float_half( pos_f[i] );
+	// Patches go up as FP32 through the MLP scratch (unused until the first block) and are narrowed on the device
 	std::vector<float> cs, sn;
 	rotary_tables( img.grid_h, img.grid_w, &cs, &sn );
-	backend::memcpy_async( d_patches_, patches.data(), patches.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
-	backend::memcpy_async( d_pos_, pos.data(), pos.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
+	const size_t patch_floats = static_cast<size_t>( m ) * cfg_.patch_dim();
+	ENGINE_ASSERT( patch_floats * sizeof( float ) <= static_cast<size_t>( max_patches_ ) * mlp_w * sizeof( backend::half_t ), "vision: patch staging does not fit" );
+	backend::memcpy_async( d_mlp_, img.patches.data(), patch_floats * sizeof( float ), backend::Copy::H2D, stream );
 	backend::memcpy_async( d_cos_, cs.data(), cs.size() * sizeof( float ), backend::Copy::H2D, stream );
 	backend::memcpy_async( d_sin_, sn.data(), sn.size() * sizeof( float ), backend::Copy::H2D, stream );
-	// The staging vectors die at return; the copies must be done before then.
-	backend::stream_sync( stream );
 
 	using engine::modules::Vision;
 	using engine::modules::Linear;
+	Vision::f32_to_f16( reinterpret_cast<const float*>( d_mlp_ ), d_patches_, patch_floats, stream );
+	Vision::pos_interp( d_pos_table_, d_pos_, img.grid_h, img.grid_w, cfg_.merge_size, static_cast<int>( std::lround( std::sqrt( static_cast<double>( cfg_.num_position_embeddings ) ) ) ), H, stream );
 	Vision::patch_embed( d_patches_, patch_w_.ptr<const backend::half_t>(), patch_b_.ptr<const backend::half_t>(), d_pos_, d_hidden_, m, H, cfg_.patch_dim(), stream );
 	const float scale = 1.0f / std::sqrt( static_cast<float>( hd ) );
 	auto in_h = [&]( void* p, int rows ) { return view2d( p, rows, H ); };
@@ -266,7 +247,7 @@ bool Qwen3VisionTower::encode( const engine::loader::PreparedImage& img, std::ve
 
 	out->resize( static_cast<size_t>( tokens ) * cfg_.out_hidden );
 	backend::memcpy_async( out->data(), d_out_, out->size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
-	backend::stream_sync( stream );
+	backend::stream_sync( stream );   // also covers the staging vectors above
 	return true;
 }
 

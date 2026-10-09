@@ -4,6 +4,12 @@
 
 namespace engine::modules {
 
+void Vision::f32_to_f16( const float*, backend::half_t*, size_t, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "Vision::f32_to_f16" );
+}
+void Vision::pos_interp( const backend::half_t*, backend::half_t*, int, int, int, int, int, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "Vision::pos_interp" );
+}
 void Vision::patch_embed( const backend::half_t*, const backend::half_t*, const backend::half_t*, const backend::half_t*, float*, int, int, int, backend::stream_t ) {
 	ENGINE_UNSUPPORTED( "Vision::patch_embed" );
 }

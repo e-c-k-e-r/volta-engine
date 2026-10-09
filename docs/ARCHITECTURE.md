@@ -39,7 +39,7 @@ time (`-DENGINE_BACKEND=CUDA|CPU|VULKAN`); one build tree is one backend.
 - **Speculation sources**: besides DFlash2, `speculator=mtp` drafts with the checkpoint's own one-layer MTP head (Qwen): it chains on
   its own output, keeps a KV layer per slot next to the model's, and verifies through the same batched forward.
 - **Images**: each model's vision tower (Qwen: 27 LayerNorm / GELU blocks; GLM: 24 RMSNorm / SwiGLU blocks with q/k norm; both 2-D rotary) runs on rank 0 and loads last, into what the arena has left; the server decodes and
-  resizes the picture (Qwen2-VL smart resize), the generator caches the embeddings by content hash, and the cluster overwrites the
+  resizes the picture (Qwen: Qwen2-VL smart resize; GLM: an aspect-preserving resize onto a zero-padded canvas aligned to 28 px), the generator caches the embeddings by content hash, and the cluster overwrites the
   placeholder rows after the embedding lookup. Image tokens carry 3-D M-RoPE positions (`BatchRows::rope_pos`), text after an image
   continues from the image's largest grid extent. Prefix-cache keys use the image content, not the placeholder ids.
 - **Serving**: the scheduler thread owns the slots; the server thread parses requests, renders the chat template, and each

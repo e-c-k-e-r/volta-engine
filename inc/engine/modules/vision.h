@@ -12,6 +12,13 @@ struct Vision {
 	static void patch_embed( const backend::half_t* patches, const backend::half_t* w, const backend::half_t* bias,
 		const backend::half_t* add, float* out, int m, int n, int k, backend::stream_t stream = nullptr );
 
+	// out[i] = half( in[i] ) for n values
+	static void f32_to_f16( const float* in, backend::half_t* out, size_t n, backend::stream_t stream = nullptr );
+
+	// Qwen3-VL learned position embeddings, bilinearly interpolated from a side x side table to a gh x gw grid; rows come out in
+	// merge-block order (gh / merge, gw / merge, merge, merge). out is [gh * gw, dim] FP16.
+	static void pos_interp( const backend::half_t* table, backend::half_t* out, int gh, int gw, int merge, int side, int dim, backend::stream_t stream = nullptr );
+
 	// out = x / rms( x ) * w over rows of n (FP32 in, FP16 out; w is the plain gain, no +1)
 	static void rms_norm( const float* x, const backend::half_t* w, backend::half_t* out, int m, int n, float eps, backend::stream_t stream = nullptr );
 
