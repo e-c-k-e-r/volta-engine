@@ -12,7 +12,7 @@
 | `test_sampling` | 2 | no | top-k / top-p sampler |
 | `test_slang_cpu`, `test_slang_kernels` | 2 | partly | Slang kernels on CPU and as generated CUDA |
 | `test_ref_linear`, `test_ref_attention`, `test_vulkan_kernels`, `test_vulkan_smoke`, `test_vulkan_ref` | 2 | yes | portable reference kernels on CUDA, CPU and Vulkan |
-| `test_ops_linear`, `test_ops_moe`, `test_ops_attention` | 2 | yes | cross-backend op goldens (dumped on CUDA, checked on CUDA, CPU, Vulkan) |
+| `test_ops_linear`, `test_ops_moe` (`--softmax` for the Qwen router), `test_ops_attention`, `test_ops_flash` | 2 | yes | cross-backend op goldens (dumped on CUDA, checked on CUDA, CPU, Vulkan); `test_ops_flash` covers the Flash-Next modules (gated residual, PLE, QSA, selection, sparse attention, softmax router) |
 | `test_jinja` | 2 | no | Jinja2 subset against reference Jinja2 renders of both chat templates |
 | `test_image` | 2 | no | image decode, smart resize and patch layout against PIL / HF-layout references, GLM canvas sizes against exllamav3's (`tests/tools/gen_image_goldens.py`) |
 | `test_output_parser` | 2 | no | reasoning / tool-call parser, chunking independence, template round trip |
@@ -34,5 +34,9 @@
 | `tests/4_server/test_api.sh` | 4 | yes | OpenAI and Anthropic APIs, tool calls, reasoning, prefix cache, image input (`VOLTA_TEST_MODEL=glm5_next` for GLM, `VOLTA_TEST_SPEC=mtp` for the MTP head) |
 | `tests/4_server/test_server.sh` | 4 | yes | server integration, concurrency throughput gate |
 
-CPU and Vulkan forwards (`test_cpu_forward`, `test_vulkan_forward`) compare a whole prompt against CUDA goldens; they run by hand
-(slow on CPU).
+CPU and Vulkan forwards (`test_cpu_forward`, `test_vulkan_forward`) compare a whole prompt (`--steps N`: and N greedy decode steps) against
+CUDA goldens; they run by hand (slow on CPU). `--model <dir> --type <model_type>` selects the checkpoint; a checkpoint that does not fit one
+GPU is dumped from a CUDA tp=4 build (`ENGINE_TP=4 build/test_cpu_forward --dump <dir> --steps 6 --model <Flash-Next dir> --type qwen4_exp`) and
+checked on the CPU build, whose single rank holds all 512 experts (about 66 GiB of weights; the load takes ~3 minutes, the 4-token prefill
+~1 minute, a decode step ~15 s). Flash-Next on the CPU matches the CUDA tp=4 logits (cos 0.9999992) and decodes the same 6 greedy tokens. The
+Vulkan backend cannot hold Flash-Next (one 32 GB device); its Flash-Next modules are checked op by op (`test_ops_flash`, `test_ops_moe --softmax`).

@@ -35,6 +35,22 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 		endif()
 	endforeach()
 
+	# Vulkan-only Slang kernels (src/kernels/slang/flash.slang: Flash-Next gated residual, PLE, QSA, selection, sparse attention, router, MoE combine);
+	# the CPU backend has plain C++ for these
+	set(VK_FLASH_ENTRIES gr_init gr_norm gr_gate gr_up_mix gr_apply gr_sigmoid_gated gr_stream_norm gr_add_broadcast gr_gemm_f32 gr_gate_act gr_up_epilogue
+		ple_gate ple_conv ple_ring qsa_prep qsa_pool_update qsa_score dsa_select sparse_attn router_softmax_topk moe_combine_routes)
+	set(VK_FLASH_SPV "")
+	foreach(entry ${VK_FLASH_ENTRIES})
+		set(sout ${SLANG_OUT}/${entry}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/flash.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/flash.slang
+			COMMENT "slangc ${entry} -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
+	add_custom_target(flash_spv DEPENDS ${VK_FLASH_SPV})
+	add_dependencies(slang_kernels flash_spv)
+
 	file(GLOB ENGINE_VK_MODULE_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/src/backend/vulkan/mod_*.cpp ${PROJECT_SOURCE_DIR}/src/backend/vulkan/stubs_*.cpp)
 	add_library(engine_vk_host OBJECT ${ENGINE_HOST_SOURCES})
 	add_library(engine_vk_modules OBJECT ${ENGINE_VK_MODULE_SOURCES})
@@ -59,7 +75,7 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	set_target_properties(test_vulkan_forward PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# Op-level goldens through the module API (--check against the CUDA --dump)
-	foreach(t test_ops_linear test_ops_attention)
+	foreach(t test_ops_linear test_ops_attention test_ops_moe test_ops_flash)
 		add_executable(${t} tests/2_parity/${t}.cpp ${ENGINE_VK_OBJECTS})
 		target_link_libraries(${t} PRIVATE engine_backend_vulkan pthread)
 		add_dependencies(${t} slang_kernels)

@@ -7,7 +7,7 @@
 #include "engine/backend/types.h"
 
 #define MOE_MAX_GROUPS 8
-#define MOE_MAX_EXPERTS 288   // experts per rank: 72 expert-parallel, all 288 with each expert sharded over the ranks
+#define MOE_MAX_EXPERTS 512   // experts per rank: 72 expert-parallel (GLM), 128 whole experts of 4 ranks (Flash-Next; 512 on a single rank)
 
 namespace pod {
 

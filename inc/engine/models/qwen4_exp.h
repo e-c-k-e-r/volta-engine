@@ -221,7 +221,7 @@ private:
 	pod::MoEScratch moe_scratch_;
 	backend::stream_t side_stream_ = nullptr;   // shared expert beside the fused MoE decode kernels (CUDA)
 	pod::TensorView sh_gate_buf_, sh_up_buf_, sh_inter_buf_, sh_out_;
-	// Full-attention buffers (this rank: q_heads_ query heads over kv_heads_ = 1 KV head)
+	// Full-attention buffers (this rank: q_heads_ query heads over kv_heads_ KV heads: 1 with tp 2 or 4, 2 with tp 1)
 	int q_heads_ = 0, kv_heads_ = 0;
 	engine::runtime::KVCachePool kv_pool_;
 	bool attn_tc_ = false;     // all rows of the forward share one slot

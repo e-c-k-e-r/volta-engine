@@ -6,7 +6,9 @@
 #include "engine/modules/moe.h"
 #include "engine/modules/swiglu.h"
 #include "engine/backend/numeric.h"
+#include "engine/runtime/options.h"
 #include <algorithm>
+#include <cmath>
 #include <vector>
 #include <cstring>
 
@@ -14,7 +16,6 @@ namespace engine::modules {
 
 namespace {
 
-constexpr int kTopK = 8;           // routes per row of the dispatch / forward (as on the CUDA path)
 constexpr int kRouterStride = 288; // partials stride per k slice, fixed by router_select
 
 } // namespace
@@ -41,6 +42,43 @@ void MoERouter::route_topk( const pod::TensorView& x, const pod::TensorView& rou
 	const bool has_bias = e_score_bias.data != nullptr;
 	RouterParams p{ partials.data(), const_cast<half*>( e_score_bias.ptr<const half>() ), d_topk_indices, reinterpret_cast<half*>( d_topk_weights ), num_experts, top_k, slices, slices, routed_scaling_factor, has_bias ? 1 : 0 };
 	impl::cpu_dispatch( ::router_select, &p, static_cast<uint32_t>( rows ) );
+}
+
+// Softmax routing: top_k largest raw logits (ties to the lowest expert), weights = softmax over those logits. Logits are the fp32 dot of the row
+// with each expert's column (router_weights [hidden, num_experts])
+void MoERouter::route_softmax_topk( const pod::TensorView& x, const pod::TensorView& router_weights, int* d_topk_indices, backend::half_t* d_topk_weights, int hidden_size, int num_experts, int top_k, backend::stream_t, int rows ) {
+	ENGINE_ASSERT( rows >= 1 && top_k <= 16 && top_k <= num_experts, "MoERouter::route_softmax_topk: rows / top_k out of range" );
+	const backend::half_t* xp = x.ptr<const backend::half_t>();
+	const backend::half_t* wp = router_weights.ptr<const backend::half_t>();
+	static const bool round_fp16 = engine::runtime::options().router_fp16;
+	impl::cpu_parallel_for( rows, 1, [&]( int64_t r0, int64_t r1 ) {
+		std::vector<float> logit( num_experts );
+		for ( int64_t r = r0; r < r1; ++r ) {
+			std::fill( logit.begin(), logit.end(), 0.0f );
+			for ( int d = 0; d < hidden_size; ++d ) {
+				const float xv = backend::to_float( xp[static_cast<size_t>( r ) * hidden_size + d] );
+				const backend::half_t* wr = wp + static_cast<size_t>( d ) * num_experts;
+				for ( int e = 0; e < num_experts; ++e ) logit[e] += xv * backend::to_float( wr[e] );
+			}
+			if ( round_fp16 ) for ( int e = 0; e < num_experts; ++e ) logit[e] = backend::to_float( backend::from_float_half( logit[e] ) );
+			int sel[16];
+			float val[16];
+			std::vector<char> taken( num_experts, 0 );
+			for ( int i = 0; i < top_k; ++i ) {
+				int best = -1;
+				for ( int e = 0; e < num_experts; ++e ) if ( !taken[e] && ( best < 0 || logit[e] > logit[best] ) ) best = e;
+				taken[best] = 1;
+				sel[i] = best;
+				val[i] = logit[best];
+			}
+			float sum = 0.0f;
+			for ( int i = 0; i < top_k; ++i ) sum += std::exp( val[i] - val[0] );
+			for ( int i = 0; i < top_k; ++i ) {
+				d_topk_indices[r * top_k + i] = sel[i];
+				d_topk_weights[r * top_k + i] = backend::from_float_half( std::exp( val[i] - val[0] ) / sum );
+			}
+		}
+	} );
 }
 
 void MoERouter::combine( const backend::half_t* expert_parts, const backend::half_t* topk_weights, const backend::half_t* shared_out, backend::half_t* output, int hidden_size, int top_k, backend::stream_t ) {
@@ -122,19 +160,20 @@ void MoE::forward( const pod::TensorView& x, const pod::MoELayerWeights& weights
 	const int rows = ( out.ndim >= 2 && out.shape[0] > 0 ) ? out.shape[0] : 1;
 	const int hidden = out.shape[out.ndim - 1];
 	const int E = weights.num_local_experts;
+	const int topk = weights.top_k;
 	const pod::LinearWeight& ref = weights.up[0];
 	const int inter = ref.type == pod::QuantType::TRELLIS ? ref.w2.shape[0] : ref.w0.shape[1];
 	const backend::half_t* xp = x.ptr<const backend::half_t>();
-	std::vector<backend::half_t> route_out( static_cast<size_t>( rows ) * kTopK * hidden );
+	std::vector<backend::half_t> route_out( static_cast<size_t>( rows ) * topk * hidden );
 	for ( int le = 0; le < E; ++le ) {
-		std::vector<int> hits; // route ids r * kTopK + j routed to this expert, in route order
-		for ( int i = 0; i < rows * kTopK; ++i ) {
+		std::vector<int> hits; // route ids r * topk + j routed to this expert, in route order
+		for ( int i = 0; i < rows * topk; ++i ) {
 			if ( d_topk_indices[i] >= start_expert && d_topk_indices[i] < end_expert && d_topk_indices[i] - start_expert == le ) hits.push_back( i );
 		}
 		const int cnt = static_cast<int>( hits.size() );
 		if ( cnt == 0 ) continue;
 		std::vector<backend::half_t> xs( static_cast<size_t>( cnt ) * hidden ), g( static_cast<size_t>( cnt ) * inter ), u( g.size() ), a( g.size() ), d( static_cast<size_t>( cnt ) * hidden );
-		for ( int h = 0; h < cnt; ++h ) std::memcpy( xs.data() + static_cast<size_t>( h ) * hidden, xp + static_cast<size_t>( hits[h] / kTopK ) * hidden, hidden * sizeof( backend::half_t ) );
+		for ( int h = 0; h < cnt; ++h ) std::memcpy( xs.data() + static_cast<size_t>( h ) * hidden, xp + static_cast<size_t>( hits[h] / topk ) * hidden, hidden * sizeof( backend::half_t ) );
 		pod::TensorView tx = pod::make_tensor_2d( xs.data(), pod::DType::FP16, cnt, hidden );
 		pod::TensorView tg = pod::make_tensor_2d( g.data(), pod::DType::FP16, cnt, inter );
 		pod::TensorView tu = pod::make_tensor_2d( u.data(), pod::DType::FP16, cnt, inter );
@@ -149,12 +188,12 @@ void MoE::forward( const pod::TensorView& x, const pod::MoELayerWeights& weights
 	std::vector<float> acc( static_cast<size_t>( hidden ) );
 	for ( int r = 0; r < rows; ++r ) {
 		std::fill( acc.begin(), acc.end(), 0.0f );
-		for ( int j = 0; j < kTopK; ++j ) {
-			const int e = d_topk_indices[r * kTopK + j];
+		for ( int j = 0; j < topk; ++j ) {
+			const int e = d_topk_indices[r * topk + j];
 			if ( e < start_expert || e >= end_expert ) continue;
 			ENGINE_ASSERT( e - start_expert < E, "MoE::forward (CPU): expert index beyond num_local_experts" );
-			const float w = backend::to_float( d_topk_weights[r * kTopK + j] );
-			const backend::half_t* d = route_out.data() + static_cast<size_t>( r * kTopK + j ) * hidden;
+			const float w = backend::to_float( d_topk_weights[r * topk + j] );
+			const backend::half_t* d = route_out.data() + static_cast<size_t>( r * topk + j ) * hidden;
 			for ( int c = 0; c < hidden; ++c ) acc[c] += w * backend::to_float( d[c] );
 		}
 		backend::half_t* orow = out.ptr<backend::half_t>() + static_cast<size_t>( r ) * hidden;

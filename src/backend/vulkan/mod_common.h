@@ -62,3 +62,28 @@ struct RefHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };
 struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; };
 struct RefUnpackParams { uint64_t qg, q, gate; int total, head_dim; };
 } // namespace engine::backend::impl
+
+// Qwen4Exp kernels (src/kernels/slang/flash.slang)
+namespace engine::backend::impl {
+struct GrInitParams { uint64_t in_, x; int hidden, hc; };
+struct GrNormParams { uint64_t x, w, normed, prev_post, prev_y, hi, lo; int hidden, hc; float eps; int has_prev, has_hi; };
+struct GrGateParams { uint64_t normed, down, inject, t_out, post; int flat, rank, hc, has_inject; };
+struct GrUpMixParams { uint64_t normed, up, t_in, mixed; int hidden, hc, rank, rows; };
+struct GrApplyParams { uint64_t x, post, y; int hidden, hc; };
+struct GrSigGatedParams { uint64_t y, sh, x, w; int hidden; };
+struct GrStreamNormParams { uint64_t x, w, out_; int hidden, hc; float eps; };
+struct GrBroadcastParams { uint64_t h, e, streams; int hidden, hc; };
+struct GrGemmParams { uint64_t a, w, out_; int m, n, k, accumulate; };
+struct GrGateActParams { uint64_t z, t_hi, t_lo, post; int ld, rank, hc, has_inject; };
+struct GrUpEpilogueParams { uint64_t u, normed, mixed; int hidden, hc; };
+struct PleGateParams { uint64_t key, value, streams, wk, wq, wc, gated, normed; int hidden, hc; float eps, gate_scale; };
+struct PleConvParams { uint64_t normed, conv_w, ring, slots, pos, gated, streams; int channels, dilation; };
+struct PleRingParams { uint64_t normed, ring, slots, pos; int channels; };
+struct QsaPrepParams { uint64_t qk, qw, q_out, ring, slots, pos; int layer; int64_t ring_slot_stride; int rot_dim; float theta, eps; };
+struct QsaPoolParams { uint64_t ring, pool_plane, kw, slots, pos; int layer; int64_t ring_slot_stride, pool_slot_stride; int max_pools, rot_dim; float theta, eps; };
+struct QsaScoreParams { uint64_t q, pool_plane, scores, slots, pos; int score_stride, layer, max_pools; int64_t pool_slot_stride; float scale; };
+struct SelectParams { uint64_t scores, idx, nkeys, pos; int score_stride, kpad; };
+struct SparseAttnParams { uint64_t q, k, v, gate, out_, slots, pos, idx, nkeys; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, idx_stride, has_gate; float scale; };
+struct RouterParams { uint64_t x, w, topk_idx, topk_w; int hidden, experts, top_k, round_fp16; };
+struct MoeCombineParams { uint64_t route_out, topk_w, topk_idx, out_; int hidden, top_k, start_expert, end_expert; };
+} // namespace engine::backend::impl

@@ -839,6 +839,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear(
 		int shard = -1;
 		const pod::SafeTensorMeta* meta = find( name_buf, &shard );
 		if ( meta == nullptr || meta->ndim != 2 ) {
+			LOG_ERROR( "load_linear: no tensor group for '%s'\n", base_name );
 			ENGINE_ASSERT( false, "load_linear: neither a trellis group nor a 2-D weight for this name" );
 		}
 		pod::TensorView w = load( name_buf, arena, stream, pod::DType::FP16 );

@@ -58,12 +58,6 @@ void Attention::forward_decode( const pod::KVRef& kv, const pod::TensorView& q, 
 	ref_attention( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream );
 }
 
-void Attention::forward_sparse( const pod::KVRef&, const pod::TensorView&, const pod::TensorView&, pod::TensorView&, size_t, int, const pod::BatchRows*, int, int, int, int, int,
-	const int*, const int*, int, backend::stream_t ) {
-	ENGINE_UNSUPPORTED( "Attention::forward_sparse" );
-	__builtin_unreachable();
-}
-
 void Attention::forward_prefill( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
 	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, int, bool ) {
 	ref_attention( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream );

@@ -4,6 +4,8 @@
 //   --dump <dir>   run in the CUDA build: computes with the real kernels, writes golden outputs
 //   --check <dir>  recompute with the built backend and compare (tier 2) against the golden files
 // 3-bit MUL1 trellis experts (what the persistent / fused CUDA kernels instantiate), rows 1, 4, 17.
+// --softmax routes with MoERouter::route_softmax_topk (the Qwen family's router) instead of route_topk (GLM's sigmoid router); the case names then carry
+// an _sm suffix, so one golden directory serves both.
 #include "golden_io.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
@@ -74,6 +76,8 @@ struct Case {
 
 int main( int argc, char** argv ) {
 	GoldenArgs args( argc, argv );
+	bool softmax = false;
+	for ( int i = 1; i < argc; ++i ) if ( !std::strcmp( argv[i], "--softmax" ) ) softmax = true;
 	if ( !args.dump && !args.check ) args.dump = args.check = true;
 	ENGINE_ASSERT( core::arena_create( g_arena, 0, 256ull << 20 ), "arena" );
 	std::printf( "=== op-level routed MoE (backend %s) ===\n", ENGINE_BACKEND_NAME );
@@ -111,15 +115,16 @@ int main( int argc, char** argv ) {
 		auto x = upload_half( uniform_vec( rng, static_cast<size_t>( m ) * H, 1.0f ), { m, H } );
 		int* d_idx = static_cast<int*>( core::arena_alloc( g_arena, static_cast<size_t>( m ) * TOPK * sizeof( int ) ) );
 		half_t* d_w = static_cast<half_t*>( core::arena_alloc( g_arena, static_cast<size_t>( m ) * TOPK * sizeof( half_t ) ) );
-		modules::MoERouter::route_topk( x, router_w, router_bias, d_idx, d_w, H, E, TOPK, 2.5f, nullptr, m );
+		if ( softmax ) modules::MoERouter::route_softmax_topk( x, router_w, d_idx, d_w, H, E, TOPK, nullptr, m );
+		else modules::MoERouter::route_topk( x, router_w, router_bias, d_idx, d_w, H, E, TOPK, 2.5f, nullptr, m );
 		backend::device_sync();
 		std::vector<int> idx( static_cast<size_t>( m ) * TOPK );
 		backend::memcpy_sync( idx.data(), d_idx, idx.size() * sizeof( int ), backend::Copy::D2H );
 		std::vector<float> idxf( idx.begin(), idx.end() );
 		char nm[64];
-		std::snprintf( nm, sizeof( nm ), "route_idx_m%d", m );
+		std::snprintf( nm, sizeof( nm ), "route_idx%s_m%d", softmax ? "_sm" : "", m );
 		cases.push_back( { nm, idxf } );
-		std::snprintf( nm, sizeof( nm ), "route_w_m%d", m );
+		std::snprintf( nm, sizeof( nm ), "route_w%s_m%d", softmax ? "_sm" : "", m );
 		cases.push_back( { nm, download_half( d_w, idx.size() ) } );
 
 		for ( int shard = 0; shard < 2; ++shard ) {
@@ -127,7 +132,7 @@ int main( int argc, char** argv ) {
 			pod::TensorView out = core::arena_alloc_tensor( g_arena, pod::DType::FP16, os, 2 );
 			if ( shard ) modules::MoE::forward( x, g_shard, d_idx, d_w, out, 4, 12, sc_shard );
 			else modules::MoE::forward( x, g_full, d_idx, d_w, out, 0, E, sc_full );
-			std::snprintf( nm, sizeof( nm ), "moe_%s_m%d", shard ? "shard" : "full", m );
+			std::snprintf( nm, sizeof( nm ), "moe%s_%s_m%d", softmax ? "_sm" : "", shard ? "shard" : "full", m );
 			cases.push_back( { nm, download_half( out.data, out.numel() ) } );
 		}
 	}

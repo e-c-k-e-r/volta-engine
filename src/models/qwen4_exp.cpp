@@ -121,8 +121,8 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	tp_ = ( ring != nullptr ) ? requested_tp_ : 1;
 	if ( runtime::options().max_seq > 0 ) config_.max_seq = runtime::options().max_seq;
 	if ( runtime::options().max_slots > 0 ) config_.max_slots = runtime::options().max_slots;
-	if ( tp_ != ENGINE_NUM_GPUS ) {
-		LOG_ERROR( "Qwen4ExpPipeline: tp=%d unsupported (experts are placed whole, 128 per rank: tp 4 only)\n", tp_ );
+	if ( tp_ != 1 && tp_ != 2 && tp_ != 4 ) {
+		LOG_ERROR( "Qwen4ExpPipeline: tp=%d unsupported (experts are placed whole, num_experts / tp per rank: tp 1, 2 or 4)\n", tp_ );
 		return false;
 	}
 	backend::set_device( rank_ );
@@ -137,7 +137,7 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	const int H = config_.hidden_size;
 	const int S = config_.max_slots;
 	q_heads_ = config_.num_q_heads / tp_;
-	kv_heads_ = 1;   // 2 KV heads over 4 ranks: ranks 2j and 2j + 1 each hold head j
+	kv_heads_ = tp_ >= 2 ? 1 : 2;   // 2 KV heads: with tp 4 ranks 2j and 2j + 1 each hold head j, with tp 2 rank j holds head j, with tp 1 the one rank holds both
 	lin_k_heads_ = config_.linear_num_k_heads / tp_;
 	lin_v_heads_ = config_.linear_num_v_heads / tp_;
 	lin_channels_ = config_.linear_channels / tp_;
@@ -384,12 +384,13 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		std::snprintf( nm, sizeof( nm ), "%s.mlp_hyper_connection", pre ); lw.mlp_hc = load_gr( nm, true );
 
 		if ( lw.is_full_attention ) {
+			const int kv_slices = tp >= 2 ? 2 : 1, kv_slice = tp >= 2 ? rank_ / ( tp / 2 ) : 0;
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.q_proj", pre ); lw.q_proj = load_col( nm, 8 );
-			// 2 KV heads over 4 ranks: ranks 2j and 2j + 1 both take head j (half of the 512 columns)
+			// 2 KV heads: ranks 2j and 2j + 1 (tp 4) or rank j (tp 2) take head j (256 of the 512 columns), a single rank takes both
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.k_proj", pre );
-			lw.k_proj = check( repo.load_linear_slice( nm, *arena_, 8, 1, rank_ / 2, 2, stream ), nm );
+			lw.k_proj = check( repo.load_linear_slice( nm, *arena_, 8, 1, kv_slice, kv_slices, stream ), nm );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.v_proj", pre );
-			lw.v_proj = check( repo.load_linear_slice( nm, *arena_, 8, 1, rank_ / 2, 2, stream ), nm );
+			lw.v_proj = check( repo.load_linear_slice( nm, *arena_, 8, 1, kv_slice, kv_slices, stream ), nm );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.o_proj", pre ); lw.o_proj = load_row( nm, 8 );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.q_norm.weight", pre ); lw.q_norm = dense( nm );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.k_norm.weight", pre ); lw.k_norm = dense( nm );
@@ -420,6 +421,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		auto& mw = lw.experts;
 		mw.type = pod::QuantType::TRELLIS;
 		const int per_rank = config_.num_experts / tp;
+		ENGINE_ASSERT( per_rank <= MOE_MAX_EXPERTS, "Qwen4ExpPipeline: experts per rank exceed MOE_MAX_EXPERTS" );
 		mw.num_local_experts = per_rank;
 		mw.top_k = config_.top_k;
 		for ( int e = 0; e < per_rank; ++e ) {

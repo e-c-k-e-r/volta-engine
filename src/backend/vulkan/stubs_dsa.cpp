@@ -21,24 +21,4 @@ __attribute__(( weak )) void DSA::score( const backend::half_t* q_idx, const bac
 	__builtin_unreachable();
 }
 
-__attribute__(( weak )) void DSA::select( const backend::half_t* scores, int score_stride, int* idx, int* nkeys, int rows, const pod::BatchRows* d_rows, backend::stream_t stream ) {
-	ENGINE_UNSUPPORTED( "DSA::select" );
-	__builtin_unreachable();
-}
-
-__attribute__(( weak )) void QSA::prep( const backend::half_t*, const backend::half_t*, backend::half_t*, backend::half_t*, int, int, const pod::BatchRows*, size_t, int, float, float, backend::stream_t ) {
-	ENGINE_UNSUPPORTED( "QSA::prep" );
-	__builtin_unreachable();
-}
-
-__attribute__(( weak )) void QSA::pool_update( const backend::half_t*, backend::half_t*, const backend::half_t*, int, int, const pod::BatchRows*, size_t, size_t, int, int, float, float, backend::stream_t ) {
-	ENGINE_UNSUPPORTED( "QSA::pool_update" );
-	__builtin_unreachable();
-}
-
-__attribute__(( weak )) void QSA::score( const backend::half_t*, const backend::half_t*, backend::half_t*, int, int, int, int, const pod::BatchRows*, size_t, backend::stream_t ) {
-	ENGINE_UNSUPPORTED( "QSA::score" );
-	__builtin_unreachable();
-}
-
 } // namespace engine::modules
