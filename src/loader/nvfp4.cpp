@@ -181,11 +181,12 @@ pod::LinearWeight SafeTensorsRepo::load_nvfp4(
 	int ranges,
 	int k0,
 	int kcount,
-	backend::stream_t stream
+	backend::stream_t stream,
+	int pad_n
 ) {
 	Nvfp4Source src;
 	if ( !open_nvfp4( *this, base_name, src ) ) return pod::LinearWeight{};
-	return repack_nvfp4( src, arena, n_begin, n_count, ranges, k0, kcount, 0, stream );
+	return repack_nvfp4( src, arena, n_begin, n_count, ranges, k0, kcount, pad_n, stream );
 }
 
 pod::LinearWeight SafeTensorsRepo::quantize_nvfp4(
@@ -298,17 +299,18 @@ pod::LinearWeight SafeTensorsRepo::load_nvfp4_slice(
 	bool split_n,
 	int rank,
 	int tp_size,
-	backend::stream_t stream
+	backend::stream_t stream,
+	int pad_n
 ) {
 	Nvfp4Source src;
 	if ( !open_nvfp4( *this, base_name, src ) ) return pod::LinearWeight{};
 	if ( split_n ) {
 		const int cnt = src.N / tp_size, beg = rank * cnt;
-		return load_nvfp4( base_name, arena, &beg, &cnt, 1, 0, src.K, stream );
+		return load_nvfp4( base_name, arena, &beg, &cnt, 1, 0, src.K, stream, pad_n );
 	}
 	const int cnt = src.K / tp_size;
 	const int beg = 0;
-	return load_nvfp4( base_name, arena, &beg, &src.N, 1, rank * cnt, cnt, stream );
+	return load_nvfp4( base_name, arena, &beg, &src.N, 1, rank * cnt, cnt, stream, pad_n );
 }
 
 pod::TensorView SafeTensorsRepo::load_nvfp4_dense(

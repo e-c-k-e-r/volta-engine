@@ -96,6 +96,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/mhc.cu
 	src/backend/cuda/modules/gated_residual.cu
 	src/backend/cuda/modules/ple.cu
+	src/backend/cuda/modules/hessian.cu
 	src/backend/cuda/modules/qsa.cu
 	src/backend/cuda/modules/embedding.cu
 	src/backend/cuda/modules/vision.cu

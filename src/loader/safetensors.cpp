@@ -501,6 +501,7 @@ bool SafeTensorsRepo::open( const char* dir_path ) {
 	// 4. Open each shard and populate tensor_map_
 	for ( const auto& fname : shard_files ) {
 		if ( num_shards_ >= MAX_SHARDS ) {
+			LOG_ERROR( "[SafeTensorsRepo] %s has more than %d shard files; the rest are ignored\n", dir_path, MAX_SHARDS );
 			break;
 		}
 		char full_path[1024];

@@ -25,3 +25,4 @@ results/
 .venv*/
 venv/
 tests/local.env
+__pycache__/

@@ -15,6 +15,8 @@ OPTION( int, prefill_chunk, 256, "prompt tokens a new request prefills per sched
 OPTION( int, prefix_interval, 16384, "prompt tokens between automatic prefix checkpoints inside long prompts; 0 = only the requested ones" )
 OPTION( std::string, nvfp4_experts, "", "Flash-Next: directory of a modelopt NVFP4 checkpoint (same architecture) to load the routed experts from; everything else comes from the model directory. Empty = the model's own experts" )
 OPTION( std::string, nvfp4_dense, "", "Flash-Next: dense projection groups to quantize to NVFP4 at load (round-to-nearest from the BF16 tensors of the nvfp4_experts checkpoint): comma list of gdn, shared, attn, idx, head, or all" )
+OPTION( std::string, hessian_dir, "", "Flash-Next calibration: directory to write the input Hessians (x^T x per dense projection input, fp32) of the prefill rows that ran, one file per site at shutdown; empty = off" )
+OPTION( std::string, nvfp4_dense_dir, "", "Flash-Next: directory of calibrated NVFP4 dense tensors (tests/tools/nvfp4_ldlq.py) used instead of round-to-nearest for the groups of nvfp4_dense they cover" )
 OPTION( std::string, kv_format, "", "KV cache format: fp16, fp8, k8v4 or nvfp4; empty = the model default (fp16). GLM stores its single latent tensor in one format (k8v4 = 8-bit)" )
 OPTION( double, expert_cache, 1.0, "GLM resident routed-expert fraction in (0, 1]; below 1 enables the two-tier expert cache" )
 OPTION( int, expert_adapt_every, 64, "decode steps between expert residency rebalances (0 = never)" )

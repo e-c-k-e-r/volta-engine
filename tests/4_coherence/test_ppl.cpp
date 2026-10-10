@@ -22,7 +22,7 @@ namespace backend = engine::backend;
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	bool glm = false, flash = false;
+	bool glm = false, flash = false, calibrate = false;
 	int n_tokens = 6000, chunk = 512;
 	std::string file, nll_out, qbench;
 	for ( int i = 1; i < argc; ++i ) {
@@ -32,6 +32,7 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--chunk" ) && i + 1 < argc ) chunk = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--qbench" ) && i + 1 < argc ) qbench = argv[++i];
+		else if ( !std::strcmp( argv[i], "--calibrate" ) ) calibrate = true;
 		else if ( !std::strcmp( argv[i], "--nll" ) && i + 1 < argc ) nll_out = argv[++i];
 	}
 	const char* model_dir = glm ? test::GLM_DIR : ( flash ? test::FLASH_DIR : test::QWEN_DIR );
@@ -100,7 +101,8 @@ int main( int argc, char** argv ) {
 			for ( int off = 0; off + 1 < n; off += chunk ) {
 				const int count = std::min( chunk, n - off );
 				mc.forward( ids.data() + off, pod::BatchRows::causal( count, off, 0, pod::BatchRows::LOGITS_ALL ) );
-				mc.read_logits( count, logits.data() );
+				if ( calibrate ) continue;   // forward only (ENGINE_HESSIAN_DIR collects its statistics in the layers); the host scoring below is the slow part
+		mc.read_logits( count, logits.data() );
 				for ( int r = 0; r < count && off + r + 1 < n; ++r ) {
 					if ( off + r + 1 < n_in ) continue;
 					const backend::half_t* l = logits.data() + static_cast<size_t>( r ) * V;
@@ -139,7 +141,18 @@ int main( int argc, char** argv ) {
 			text += ss.str() + "\n\n";
 		}
 	}
-	std::vector<int> ids = tok.encode( text, false );
+	// Encode in pieces of ~4 KB cut at line ends (the tokenizer is quadratic in the length of a run of text without a split point)
+	std::vector<int> ids;
+	for ( size_t at = 0; at < text.size(); ) {
+		size_t end = std::min( text.size(), at + 4096 );
+		if ( end < text.size() ) {
+			const size_t nl = text.find( '\n', end );
+			end = nl == std::string::npos ? text.size() : nl + 1;
+		}
+		const std::vector<int> part = tok.encode( text.substr( at, end - at ), false );
+		ids.insert( ids.end(), part.begin(), part.end() );
+		at = end;
+	}
 	ENGINE_ASSERT( static_cast<int>( ids.size() ) > n_tokens, "text too short for --tokens" );
 	ids.resize( n_tokens );
 
@@ -169,6 +182,7 @@ int main( int argc, char** argv ) {
 			total += nl;
 		}
 	}
+	if ( calibrate ) { mc.shutdown(); return 0; }
 	const double mean = total / nll.size();
 	std::printf( "[*] %zu predicted tokens: mean NLL %.4f, perplexity %.3f\n", nll.size(), mean, std::exp( mean ) );
 	if ( !nll_out.empty() ) {

@@ -2,6 +2,7 @@
 #include "engine/models/qwen4_exp.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
+#include "engine/modules/hessian.h"
 #include <memory>
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
@@ -119,6 +120,7 @@ Qwen4ExpPipeline::Qwen4ExpPipeline() = default;
 Qwen4ExpPipeline::~Qwen4ExpPipeline() {
 	if ( arena_ != nullptr ) {
 		backend::set_device( rank_ );
+		hessian_dump();
 		graphs_.reset();
 		if ( side_stream_ != nullptr ) backend::stream_destroy( side_stream_ );
 		if ( full_logits_mem_ != nullptr ) backend::device_free( full_logits_mem_ );
@@ -325,11 +327,35 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		}
 		LOG_INFO( "[RANK %d] routed experts from the NVFP4 checkpoint %s\n", rank_, nv_dir.c_str() );
 	}
+	std::unique_ptr<engine::loader::SafeTensorsRepo> ov_repo;
+	if ( const std::string& ov_dir = runtime::options().nvfp4_dense_dir; !ov_dir.empty() ) {
+		ov_repo = std::make_unique<engine::loader::SafeTensorsRepo>();
+		if ( !ov_repo->open( ov_dir.c_str() ) ) {
+			LOG_ERROR( "[loader] FAILED to open the calibrated NVFP4 directory %s\n", ov_dir.c_str() );
+			return false;
+		}
+	}
 	backend::set_device( rank_ );
 	const int H = config_.hidden_size;
 	const int tp = tp_;
 	int missing = 0;
 	char nm[256];
+	if ( !runtime::options().hessian_dir.empty() ) {
+		// Calibration accumulators (sites per layer: see hessian()); the replicated sites live on rank 0, the o_proj / out_proj inputs on every rank
+		hess_.assign( static_cast<size_t>( config_.num_layers ) * 5, HessianSite{} );
+		auto site = [&]( int layer, int idx, int k ) {
+			HessianSite& hs = hess_[static_cast<size_t>( layer ) * 5 + idx];
+			hs.k = k;
+			hs.h = static_cast<float*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( k ) * k * sizeof( float ), 128 ) );
+			backend::memset_async( hs.h, 0, static_cast<size_t>( k ) * k * sizeof( float ), stream );
+		};
+		for ( int L = 0; L < config_.num_layers; ++L ) {
+			if ( rank_ == 0 ) { site( L, 0, config_.hidden_size ); site( L, 1, config_.hidden_size ); site( L, 3, config_.shared_intermediate ); }
+			site( L, 2, config_.is_full_attention( L ) ? q_heads_ * config_.head_dim : lin_v_heads_ * 128 );
+		}
+		if ( rank_ == 0 ) site( 0, 4, config_.hidden_size );
+		backend::stream_sync( stream );
+	}
 
 	auto dense = [&]( const char* name ) {
 		const pod::TensorView t = repo.load( name, *arena_, stream, pod::DType::FP16 );
@@ -375,14 +401,25 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	// Dense groups quantized to NVFP4 at load from the BF16 tensors of the NVFP4 checkpoint (ENGINE_NVFP4_DENSE); otherwise the trellis tensors
 	const std::string& nv_groups = runtime::options().nvfp4_dense;
 	auto nv_on = [&]( const char* group ) { return nv_repo && !nv_groups.empty() && ( nv_groups == "all" || ( "," + nv_groups + "," ).find( std::string( "," ) + group + "," ) != std::string::npos ); };
+	// A calibrated tensor (nvfp4_dense_dir) when the directory has one, otherwise round-to-nearest from the BF16 weight
+	int nv_calibrated = 0, nv_rtn = 0;
+	auto nv_slice = [&]( const char* name, bool split_n, int rank, int parts, int pad_n ) -> pod::LinearWeight {
+		const std::string key = std::string( name ) + ".weight_scale_2";
+		if ( ov_repo && ov_repo->find( key.c_str() ) ) {
+			++nv_calibrated;
+			return check( ov_repo->load_nvfp4_slice( name, *arena_, split_n, rank, parts, stream, pad_n ), name );
+		}
+		++nv_rtn;
+		return check( nv_repo->quantize_nvfp4_slice( name, *arena_, split_n, rank, parts, pad_n, stream ), name );
+	};
 	auto load_col_g = [&]( const char* group, const char* name, int bits ) {
-		return nv_on( group ) ? check( nv_repo->quantize_nvfp4_slice( name, *arena_, true, rank_, tp, 0, stream ), name ) : load_col( name, bits );
+		return nv_on( group ) ? nv_slice( name, true, rank_, tp, 0 ) : load_col( name, bits );
 	};
 	auto load_row_g = [&]( const char* group, const char* name, int bits ) {
-		return nv_on( group ) ? check( nv_repo->quantize_nvfp4_slice( name, *arena_, false, rank_, tp, 0, stream ), name ) : load_row( name, bits );
+		return nv_on( group ) ? nv_slice( name, false, rank_, tp, 0 ) : load_row( name, bits );
 	};
 	auto load_full_g = [&]( const char* group, const char* name, int bits ) {
-		return nv_on( group ) ? check( nv_repo->quantize_nvfp4_slice( name, *arena_, true, 0, 1, 0, stream ), name ) : check( repo.load_linear( name, *arena_, bits, stream ), name );
+		return nv_on( group ) ? nv_slice( name, true, 0, 1, 0 ) : check( repo.load_linear( name, *arena_, bits, stream ), name );
 	};
 
 	const char* P = "model.language_model";
@@ -393,7 +430,11 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	final_mixer_ = load_gr( nm, false );
 	if ( nv_on( "head" ) ) {
 		const int cnt = lm_shard_real_cols_, beg = rank_ * cnt;
-		lm_head_ = check( nv_repo->quantize_nvfp4( "lm_head", *arena_, &beg, &cnt, 1, 0, config_.hidden_size, lm_shard_cols_, stream ), "lm_head" );
+		const std::string key = "lm_head.weight_scale_2";
+		const bool cal = ov_repo && ov_repo->find( key.c_str() );
+		++( cal ? nv_calibrated : nv_rtn );
+		lm_head_ = cal ? check( ov_repo->load_nvfp4( "lm_head", *arena_, &beg, &cnt, 1, 0, config_.hidden_size, stream, lm_shard_cols_ ), "lm_head" )
+			: check( nv_repo->quantize_nvfp4( "lm_head", *arena_, &beg, &cnt, 1, 0, config_.hidden_size, lm_shard_cols_, stream ), "lm_head" );
 	}
 	else lm_head_ = check( repo.load_linear_slice_padded( "lm_head", *arena_, 6, rank_, tp, lm_shard_cols_ - lm_shard_real_cols_, stream ), "lm_head" );
 
@@ -427,9 +468,9 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.q_proj", pre ); lw.q_proj = load_col_g( "attn", nm, 8 );
 			// 2 KV heads: ranks 2j and 2j + 1 (tp 4) or rank j (tp 2) take head j (256 of the 512 columns), a single rank takes both
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.k_proj", pre );
-			lw.k_proj = nv_on( "attn" ) ? check( nv_repo->quantize_nvfp4_slice( nm, *arena_, true, kv_slice, kv_slices, 0, stream ), nm ) : check( repo.load_linear_slice( nm, *arena_, 8, 1, kv_slice, kv_slices, stream ), nm );
+			lw.k_proj = nv_on( "attn" ) ? nv_slice( nm, true, kv_slice, kv_slices, 0 ) : check( repo.load_linear_slice( nm, *arena_, 8, 1, kv_slice, kv_slices, stream ), nm );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.v_proj", pre );
-			lw.v_proj = nv_on( "attn" ) ? check( nv_repo->quantize_nvfp4_slice( nm, *arena_, true, kv_slice, kv_slices, 0, stream ), nm ) : check( repo.load_linear_slice( nm, *arena_, 8, 1, kv_slice, kv_slices, stream ), nm );
+			lw.v_proj = nv_on( "attn" ) ? nv_slice( nm, true, kv_slice, kv_slices, 0 ) : check( repo.load_linear_slice( nm, *arena_, 8, 1, kv_slice, kv_slices, stream ), nm );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.o_proj", pre ); lw.o_proj = load_row_g( "attn", nm, 8 );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.q_norm.weight", pre ); lw.q_norm = dense( nm );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.k_norm.weight", pre ); lw.k_norm = dense( nm );
@@ -443,7 +484,11 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 			if ( nv_on( "gdn" ) ) {
 				// q / k / v row groups of 2048 / 2048 / 6144, every rank takes its share of each
 				const int rows[3] = { 2048 / tp, 2048 / tp, 6144 / tp }, begin[3] = { rank_ * rows[0], 2048 + rank_ * rows[1], 4096 + rank_ * rows[2] };
-				lw.in_proj_qkv = check( nv_repo->quantize_nvfp4( nm, *arena_, begin, rows, 3, 0, config_.hidden_size, 0, stream ), nm );
+				const std::string key = std::string( nm ) + ".weight_scale_2";
+				const bool cal = ov_repo && ov_repo->find( key.c_str() );
+				++( cal ? nv_calibrated : nv_rtn );
+				lw.in_proj_qkv = cal ? check( ov_repo->load_nvfp4( nm, *arena_, begin, rows, 3, 0, config_.hidden_size, stream ), nm )
+					: check( nv_repo->quantize_nvfp4( nm, *arena_, begin, rows, 3, 0, config_.hidden_size, 0, stream ), nm );
 			}
 			else lw.in_proj_qkv = check( repo.load_grouped_trellis_slice( nm, *arena_, QKV_BLOCKS, qkv_rank_blocks, 3, rank_, stream ), nm );
 			std::snprintf( nm, sizeof( nm ), "%s.linear_attn.in_proj_z", pre ); lw.in_proj_z = load_col_g( "gdn", nm, 8 );
@@ -507,6 +552,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	(void) H;
 	if ( stream ) backend::stream_sync( stream );
 	repo.close();
+	if ( nv_calibrated + nv_rtn > 0 ) LOG_INFO( "[RANK %d] NVFP4 dense tensors: %d calibrated, %d round-to-nearest\n", rank_, nv_calibrated, nv_rtn );
 	if ( missing > 0 ) {
 		LOG_ERROR( "[RANK %d] %d tensors missing\n", rank_, missing );
 		return false;
@@ -743,6 +789,7 @@ void Qwen4ExpPipeline::attention_forward( const Qwen4ExpLayerWeights& lw, int at
 		engine::modules::Attention::forward_prefill( kv, q_buf_, gate_attn_buf_, attn_out_, kv_slot_stride, attn_idx, d_rows_, m, q_heads_, kv_heads_, hd,
 			config_.max_seq, stream, m > pod::MAX_BATCH ? key_hint_ : 0, m <= pod::MAX_BATCH && !attn_tc_ );
 	}
+	hessian( hess_layer_, 2, attn_out_.data, q_heads_ * hd, m, stream );
 	engine::modules::Linear::forward( attn_out_, lw.o_proj, y_, stream );
 }
 
@@ -786,6 +833,7 @@ void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_i
 	if ( linear_idx == 0 ) trace_rows( 2002, out_rows.data, false, m, stream, v_heads * 128 );   // recurrence output before the norm
 	engine::modules::GDN::gated_rmsnorm( out_rows, z_rows, lw.linear_norm, v_heads, config_.linear_head_dim, stream, true, m );
 	if ( linear_idx == 0 ) trace_rows( 2003, out_rows.data, false, m, stream, v_heads * 128 );
+	hessian( hess_layer_, 2, gdn_out_.data, v_heads * 128, m, stream );
 	engine::modules::Linear::forward( gdn_out_, lw.out_proj, y_, stream );
 }
 
@@ -895,6 +943,7 @@ void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backe
 		engine::modules::Linear::forward( mixed_, lw.shared_gate, sh_gate_buf_, sh_stream );
 		engine::modules::Linear::forward( mixed_, lw.shared_up, sh_up_buf_, sh_stream );
 		engine::modules::SwiGLU::forward( sh_gate_buf_, sh_up_buf_, sh_inter_buf_, sh_stream );
+		hessian( hess_layer_, 3, sh_inter_buf_.data, config_.shared_intermediate, m, sh_stream );
 		engine::modules::Linear::forward( sh_inter_buf_, lw.shared_down, sh_out_, sh_stream );
 	}
 	engine::modules::MoERouter::route_softmax_topk( mixed_, lw.router, topk_idx_, topk_w_, H, config_.num_experts, config_.top_k, stream, m );
@@ -932,9 +981,45 @@ void Qwen4ExpPipeline::teacher_inject( int L, int m, backend::stream_t stream ) 
 	backend::stream_sync( stream );
 }
 
+void Qwen4ExpPipeline::hessian( int layer, int site, const void* x, int k, int m, backend::stream_t stream ) {
+	if ( hess_.empty() || m <= pod::MAX_BATCH || layer < 0 ) return;
+	HessianSite& hs = hess_[static_cast<size_t>( layer ) * 5 + site];
+	if ( hs.h == nullptr ) return;
+	ENGINE_ASSERT( hs.k == k, "Qwen4ExpPipeline::hessian: site width changed" );
+	engine::modules::Hessian::accumulate( hs.h, static_cast<const backend::half_t*>( x ), m, k, stream );
+	hs.rows += m;
+}
+
+// One file per site: int32 magic, int32 k, int64 rows, then k * k fp32 (x^T x summed over the rows)
+void Qwen4ExpPipeline::hessian_dump() {
+	if ( hess_.empty() ) return;
+	const std::string& dir = runtime::options().hessian_dir;
+	backend::stream_sync( nullptr );
+	std::vector<float> host;
+	for ( size_t i = 0; i < hess_.size(); ++i ) {
+		const HessianSite& hs = hess_[i];
+		if ( hs.h == nullptr || hs.rows == 0 ) continue;
+		host.resize( static_cast<size_t>( hs.k ) * hs.k );
+		backend::memcpy_sync( host.data(), hs.h, host.size() * sizeof( float ), backend::Copy::D2H );
+		char path[512];
+		std::snprintf( path, sizeof( path ), "%s/L%02d_s%d_r%d.f32", dir.c_str(), static_cast<int>( i / 5 ), static_cast<int>( i % 5 ), rank_ );
+		if ( FILE* f = std::fopen( path, "wb" ) ) {
+			const int32_t hdr[2] = { 0x48455353, hs.k };
+			std::fwrite( hdr, sizeof( int32_t ), 2, f );
+			std::fwrite( &hs.rows, sizeof( int64_t ), 1, f );
+			std::fwrite( host.data(), sizeof( float ), host.size(), f );
+			std::fclose( f );
+		}
+		else LOG_ERROR( "[RANK %d] hessian: cannot write %s\n", rank_, path );
+	}
+	LOG_INFO( "[RANK %d] hessians written to %s\n", rank_, dir.c_str() );
+}
+
 void Qwen4ExpPipeline::attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L, int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size, hc = config_.hc_mult;
 	gr_mix( lw.attn_hc, true, m, stream );
+	hess_layer_ = L;
+	hessian( L, 0, mixed_.data, H, m, stream );
 	if ( L >= 0 ) trace_rows( 100 + L, mixed_.data, false, m, stream );
 	if ( lw.is_full_attention ) attention_forward( lw, idx, m, stream );
 	else gdn_forward( lw, idx, m, stream );
@@ -947,6 +1032,8 @@ void Qwen4ExpPipeline::attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L
 void Qwen4ExpPipeline::mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size, hc = config_.hc_mult;
 	gr_mix( lw.mlp_hc, true, m, stream );
+	hess_layer_ = L;
+	hessian( L, 1, mixed_.data, H, m, stream );
 	if ( L >= 0 ) trace_rows( 400 + L, mixed_.data, false, m, stream );
 	moe_forward( lw, m, stream );
 	if ( ring_ ) ring_->all_reduce( y_, stream );
@@ -1001,6 +1088,7 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 		final_mixer_.up.ptr<const backend::half_t>(), nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_, n, H, hc, config_.hc_rank, config_.rms_norm_eps, stream );
 	pod::TensorView hin = pod::make_tensor_2d( mixed_.ptr<backend::half_t>(), pod::DType::FP16, n, H );
 	pod::TensorView lout = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, n, lm_shard_cols_ );
+	hessian( 0, 4, hin.data, H, n, stream );
 	engine::modules::Linear::forward( hin, lm_head_, lout, stream );
 }
 

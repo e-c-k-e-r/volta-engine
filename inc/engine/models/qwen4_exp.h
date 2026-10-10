@@ -170,6 +170,13 @@ private:
 	void copy_pool_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	void trace_route( int tag, int m, backend::stream_t stream );
 	void trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols = 0 );
+	// Calibration (ENGINE_HESSIAN_DIR): x^T x of a projection input, accumulated over prefill rows into site `site` of layer `layer`
+	// (0 attention / GDN input, 1 MoE input, 2 o_proj / out_proj input (rank slice), 3 shared-expert down input, 4 lm_head input with layer 0)
+	void hessian( int layer, int site, const void* x, int k, int m, backend::stream_t stream );
+	void hessian_dump();
+	struct HessianSite { float* h = nullptr; int k = 0; int64_t rows = 0; };
+	std::vector<HessianSite> hess_;
+	int hess_layer_ = 0;
 
 	Qwen4ExpConfig config_;
 	ModelMetadata metadata_;
