@@ -18,7 +18,9 @@ cmake -S . -B build_vk  -G Ninja -DENGINE_BACKEND=VULKAN
 The CPU build compiles for the build host (`-march=native`: AVX2, FMA and the F16C conversions, about 2x on the reference kernels; `-DENGINE_CPU_NATIVE=OFF` for
 a portable binary) and runs Qwen and Flash-Next on one rank (Flash-Next needs ~66 GiB of host memory); the Vulkan build runs what fits one device
 (Qwen 27B) and needs `ENGINE_DEBUG_NO_GRAPHS=1` for models with a routed MoE (the MoE reads its routes back on the host). Both are slow by
-design (reference kernels); the DFlash2 speculator is CUDA only and the MTP head has not been run on them.
+design (reference kernels). Flash-Next on the CPU answers a chat request with the CUDA engine's text (a 15-token prompt: 100 s to the first token, then ~14 s
+per token; `--speculative --set speculator=mtp` works too: a verify forward of 8 rows is ~55 s). The DFlash2 speculator is CUDA only; the MTP head has not been
+run on Vulkan.
 
 A full CUDA build takes a while (the trellis kernels are template heavy); incremental builds are quick.
 
