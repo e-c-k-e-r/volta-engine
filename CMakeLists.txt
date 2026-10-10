@@ -82,6 +82,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 set(ENGINE_DEVICE_SOURCES
 	src/comm/all_reduce_ipc.cu
 	src/kernels/cuda/nvfp4/skinny_kernels.cu
+	src/kernels/cuda/nvfp4/moe_kernels.cu
 	src/backend/cuda/modules/norm.cu
 	src/backend/cuda/modules/swiglu.cu
 	src/backend/cuda/modules/rope.cu
@@ -447,6 +448,9 @@ set_target_properties(test_gr_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJ
 add_executable(bench_nvfp4_shapes tests/3_bench/bench_nvfp4_shapes.cpp)
 target_link_libraries(bench_nvfp4_shapes PRIVATE engine_kernels)
 set_target_properties(bench_nvfp4_shapes PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(bench_nvfp4_moe tests/3_bench/bench_nvfp4_moe.cpp)
+target_link_libraries(bench_nvfp4_moe PRIVATE engine_kernels)
+set_target_properties(bench_nvfp4_moe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 add_executable(test_sparse_attn tests/2_parity/test_sparse_attn.cpp)
 target_link_libraries(test_sparse_attn PRIVATE engine_kernels)
 set_target_properties(test_sparse_attn PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
