@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <vector>
 
 int main( int argc, char** argv ) {
@@ -19,11 +20,12 @@ int main( int argc, char** argv ) {
 	std::vector<std::pair<int, int>> shapes;
 	for ( int i = 1; i + 1 < argc; i += 2 ) shapes.push_back( { std::atoi( argv[i] ), std::atoi( argv[i + 1] ) } );
 	if ( shapes.empty() ) shapes = { { 2560, 640 }, { 640, 2560 }, { 2560, 2560 }, { 2560, 16384 } };
-	const int SETS = 64;
 	cudaEvent_t e0, e1;
 	CUDA_CHECK( cudaEventCreate( &e0 ) );
 	CUDA_CHECK( cudaEventCreate( &e1 ) );
 	for ( auto [K, N] : shapes ) {
+		// 64 distinct weight sets, fewer for huge matrices (the arena holds 3 GiB)
+		const int SETS = std::max( 2, std::min( 64, static_cast<int>( 2.0e9 / ( static_cast<double>( N ) * K * 0.5625 ) ) ) );
 		std::vector<pod::TensorView> codes( SETS ), scales( SETS );
 		int cs[2] = { N, K / 2 }, ss[2] = { N, K / 16 };
 		for ( int s = 0; s < SETS; ++s ) {
