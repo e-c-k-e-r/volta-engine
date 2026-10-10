@@ -129,6 +129,15 @@ private:
 		SamplingParams sp;
 		Rng rng;
 		bool prefill_done = false;
+		// A prompt fed in pieces between decode steps of the other slots
+		bool pf_started = false;
+		int pf_pos = 0;                  // next prompt position to prefill
+		int pf_resumed = 0;              // prompt tokens restored from the prefix cache
+		PrefixCache::Entry* pf_node = nullptr;   // deepest cache node of the prompt so far
+		std::vector<GenerationRequest::Checkpoint> pf_cps;
+		size_t pf_cp_next = 0;
+		int pf_last_cp = -1;
+		bool pf_chain_ok = true;
 		bool in_reasoning = false;
 		int reasoning_tokens = 0;
 		bool force_close = false;   // budget reached: close the reasoning block before the next step
@@ -143,7 +152,9 @@ private:
 	void admit_pending();
 	void step_batch();
 	int adapt_steps_ = 0;
-	void prefill_slot( int s );
+	// Feeds up to `budget` prompt tokens of slot s (0 = all of them); true once the prompt is done and the first token is out
+	bool prefill_slot( int s, int budget );
+	int pf_rr_ = 0;   // the slot after which the next prefilling slot is looked for
 	PrefixCache::Entry* store_prefix( int s, PrefixCache::Entry* parent, int tokens, bool pinned, bool with_taps );
 	static constexpr int kPrefixMinTokens = 512;
 	// Commits `tok` to slot s's output; returns true when the request finished.

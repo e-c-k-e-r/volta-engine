@@ -253,82 +253,116 @@ std::shared_ptr<const std::vector<backend::half_t>> Generator::image_embeddings(
 	return out;
 }
 
-void Generator::prefill_slot( int s ) {
+bool Generator::prefill_slot( int s, int budget ) {
 	Slot& slot = slots_[s];
 	const std::vector<int>& prompt = slot.req.prompt_tokens;
 	const int n = static_cast<int>( prompt.size() );
-	// Prefix-cache keys: image placeholders are keyed by the image content, so the same prompt with another picture never matches
-	const std::vector<int>& key_prompt = slot.key_tokens.empty() ? prompt : slot.key_tokens;
-	// Resume from the deepest cached prefix of the prompt, else start cold (which also hands the drafter to this slot)
-	int pos = 0;
-	PrefixCache::Entry* node = nullptr;
-	if ( prefix_cache_ && n >= kPrefixMinTokens ) {
-		if ( PrefixCache::Entry* hit = prefix_cache_->find( key_prompt ) ) {
-			if ( prefix_cache_->restore( s, hit ) ) {
-				node = hit;
-				pos = static_cast<int>( hit->tokens.size() );
-				LOG_INFO( "[prefix] slot %d resumes at token %d of %d\n", s, pos, n );
-			}
-		}
-	}
-	const int resumed_tokens = pos;
-	if ( pos == 0 ) cluster_.reset_slot( s );
-	if ( !slot.req.images.empty() ) {
-		MmLayout layout;
-		for ( const GenerationRequest::Image& im : slot.req.images ) {
-			MmImage mi;
-			mi.start = im.start;
-			mi.count = im.count;
-			mi.grid_h = im.grid_h;
-			mi.grid_w = im.grid_w;
-			mi.hash = im.hash;
-			// Rows before the resume point are already in the restored KV; only images that reach past it need embeddings
-			if ( im.start + im.count > pos ) {
-				mi.embeds = image_embeddings( im );
-				if ( !mi.embeds ) {
-					LOG_ERROR( "[vision] slot %d: image encoding failed; finishing the request\n", s );
-					slot.metrics.prompt_tokens = n;
-					slot.metrics.first_token_time = std::chrono::steady_clock::now();
-					finish_slot( s, FinishReason::Cancelled );
-					return;
+	if ( !slot.pf_started ) {
+		slot.pf_started = true;
+		// Prefix-cache keys: image placeholders are keyed by the image content, so the same prompt with another picture never matches
+		const std::vector<int>& key_prompt = slot.key_tokens.empty() ? prompt : slot.key_tokens;
+		// Resume from the deepest cached prefix of the prompt, else start cold (which also hands the drafter to this slot)
+		int pos = 0;
+		slot.pf_node = nullptr;
+		if ( prefix_cache_ && n >= kPrefixMinTokens ) {
+			if ( PrefixCache::Entry* hit = prefix_cache_->find( key_prompt ) ) {
+				if ( prefix_cache_->restore( s, hit ) ) {
+					slot.pf_node = hit;
+					pos = static_cast<int>( hit->tokens.size() );
+					LOG_INFO( "[prefix] slot %d resumes at token %d of %d\n", s, pos, n );
 				}
 			}
-			layout.images.push_back( std::move( mi ) );
 		}
-		cluster_.set_slot_mm( s, std::move( layout ) );
-	}
-	// Checkpoints on the way through: the requested ones (end of the system prompt, turn boundary) plus one every
-	// prefix_interval tokens of a long prompt. Each stores only the KV rows since the previous one.
-	if ( prefix_cache_ && n >= kPrefixMinTokens ) {
-		std::vector<GenerationRequest::Checkpoint> cps = slot.req.checkpoint_at;
-		const int align = cluster_.snapshot_align();
-		for ( auto& cp : cps ) cp.pos -= cp.pos % align;
-		const int interval = runtime::options().prefix_interval;
-		for ( int p = interval; interval > 0 && p < n - kPrefixMinTokens; p += interval ) cps.push_back( { p, false, false } );
-		std::sort( cps.begin(), cps.end(), []( const GenerationRequest::Checkpoint& a, const GenerationRequest::Checkpoint& b ) { return a.pos < b.pos || ( a.pos == b.pos && a.pinned > b.pinned ); } );
-		bool chain_ok = true;
-		int last = -1;
-		for ( const GenerationRequest::Checkpoint& cp : cps ) {
-			if ( cp.pos <= pos || cp.pos >= n || cp.pos == last || !chain_ok ) continue;
-			last = cp.pos;
-			cluster_.prefill( prompt.data() + pos, cp.pos - pos, s, 0, nullptr, pos );
-			pos = cp.pos;
-			node = store_prefix( s, node, pos, cp.pinned, cp.taps );
-			chain_ok = node != nullptr;
+		slot.pf_resumed = pos;
+		if ( pos == 0 ) cluster_.reset_slot( s );
+		if ( !slot.req.images.empty() ) {
+			MmLayout layout;
+			for ( const GenerationRequest::Image& im : slot.req.images ) {
+				MmImage mi;
+				mi.start = im.start;
+				mi.count = im.count;
+				mi.grid_h = im.grid_h;
+				mi.grid_w = im.grid_w;
+				mi.hash = im.hash;
+				// Rows before the resume point are already in the restored KV; only images that reach past it need embeddings
+				if ( im.start + im.count > pos ) {
+					mi.embeds = image_embeddings( im );
+					if ( !mi.embeds ) {
+						LOG_ERROR( "[vision] slot %d: image encoding failed; finishing the request\n", s );
+						slot.metrics.prompt_tokens = n;
+						slot.metrics.first_token_time = std::chrono::steady_clock::now();
+						finish_slot( s, FinishReason::Cancelled );
+						return true;
+					}
+				}
+				layout.images.push_back( std::move( mi ) );
+			}
+			cluster_.set_slot_mm( s, std::move( layout ) );
 		}
+		// Checkpoints on the way through: the requested ones (end of the system prompt, turn boundary) plus one every
+		// prefix_interval tokens of a long prompt. Each stores only the KV rows since the previous one.
+		slot.pf_cps.clear();
+		if ( prefix_cache_ && n >= kPrefixMinTokens ) {
+			slot.pf_cps = slot.req.checkpoint_at;
+			const int align = cluster_.snapshot_align();
+			for ( auto& cp : slot.pf_cps ) cp.pos -= cp.pos % align;
+			const int interval = runtime::options().prefix_interval;
+			for ( int p = interval; interval > 0 && p < n - kPrefixMinTokens; p += interval ) slot.pf_cps.push_back( { p, false, false } );
+			std::sort( slot.pf_cps.begin(), slot.pf_cps.end(), []( const GenerationRequest::Checkpoint& a, const GenerationRequest::Checkpoint& b ) { return a.pos < b.pos || ( a.pos == b.pos && a.pinned > b.pinned ); } );
+		}
+		slot.pf_cp_next = 0;
+		slot.pf_last_cp = -1;
+		slot.pf_chain_ok = true;
+		slot.pf_pos = pos;
 	}
-	Candidates first_cands;
-	int first = cluster_.prefill( prompt.data() + pos, n - pos, s, 0, slot.sp.greedy() ? nullptr : &first_cands, pos );
-	if ( !slot.sp.greedy() ) first = sample_token( first_cands, slot.sp, slot.rng );
-	slot.current_pos = n;
-	slot.prefill_done = true;
-	slot.metrics.first_token_time = std::chrono::steady_clock::now();
-	const double ttft_ms = std::chrono::duration<double, std::milli>( slot.metrics.first_token_time - slot.metrics.start_time ).count();
-	slot.metrics.prompt_tokens = n;
-	slot.metrics.cached_tokens = resumed_tokens;
-	slot.metrics.prefill_tok_s = ( ttft_ms > 0.0 ) ? static_cast<float>( n / ( ttft_ms / 1000.0 ) ) : 0.0f;
-	slot.last_token = first;
-	emit_token( s, first );
+
+	int pos = slot.pf_pos;
+	int fed = 0;
+	for ( ;; ) {
+		// The next stop: a checkpoint to store, else the end of the prompt
+		int end = n;
+		bool is_cp = false;
+		const GenerationRequest::Checkpoint* cp = nullptr;
+		while ( slot.pf_cp_next < slot.pf_cps.size() ) {
+			const GenerationRequest::Checkpoint& c = slot.pf_cps[slot.pf_cp_next];
+			if ( c.pos <= pos || c.pos >= n || c.pos == slot.pf_last_cp || !slot.pf_chain_ok ) {
+				++slot.pf_cp_next;
+				continue;
+			}
+			end = c.pos;
+			is_cp = true;
+			cp = &c;
+			break;
+		}
+		int seg_end = end;
+		if ( budget > 0 ) seg_end = MIN( end, pos + MAX( 1, budget - fed ) );
+		if ( seg_end >= n ) {
+			Candidates first_cands;
+			int first = cluster_.prefill( prompt.data() + pos, n - pos, s, 0, slot.sp.greedy() ? nullptr : &first_cands, pos );
+			if ( !slot.sp.greedy() ) first = sample_token( first_cands, slot.sp, slot.rng );
+			slot.current_pos = n;
+			slot.prefill_done = true;
+			slot.metrics.first_token_time = std::chrono::steady_clock::now();
+			const double ttft_ms = std::chrono::duration<double, std::milli>( slot.metrics.first_token_time - slot.metrics.start_time ).count();
+			slot.metrics.prompt_tokens = n;
+			slot.metrics.cached_tokens = slot.pf_resumed;
+			slot.metrics.prefill_tok_s = ( ttft_ms > 0.0 ) ? static_cast<float>( n / ( ttft_ms / 1000.0 ) ) : 0.0f;
+			slot.last_token = first;
+			emit_token( s, first );
+			return true;
+		}
+		cluster_.prefill( prompt.data() + pos, seg_end - pos, s, 0, nullptr, pos );
+		fed += seg_end - pos;
+		pos = seg_end;
+		if ( is_cp && seg_end == end ) {
+			slot.pf_last_cp = end;
+			++slot.pf_cp_next;
+			slot.pf_node = store_prefix( s, slot.pf_node, pos, cp->pinned, cp->taps );
+			slot.pf_chain_ok = slot.pf_node != nullptr;
+		}
+		slot.pf_pos = pos;
+		if ( budget > 0 && fed >= budget ) return false;
+	}
 }
 
 // Snapshots slot s's prompt up to `tokens` as a child of `parent` (KV rows since the parent only). Returns the cache node for
@@ -369,9 +403,24 @@ void Generator::step_batch() {
 		cluster_.rebalance_experts();
 	}
 
-	for ( int s = 0; s < num_slots_; ++s ) {
-		if ( slots_[s].active && !slots_[s].prefill_done ) {
-			prefill_slot( s );
+	// New prompts: while other requests are decoding (and the speculator has no single shared context that a decode step could disturb),
+	// one prompt is fed a piece per step and the decode steps run in between; otherwise every pending prompt is fed in full
+	bool decoding = false;
+	for ( int s = 0; s < num_slots_; ++s ) decoding = decoding || ( slots_[s].active && slots_[s].prefill_done );
+	const int chunk = ( decoding && ( !cluster_.has_speculator() || cluster_.speculator().per_slot() ) ) ? runtime::options().prefill_chunk : 0;
+	if ( chunk > 0 ) {
+		for ( int i = 1; i <= num_slots_; ++i ) {
+			const int s = ( pf_rr_ + i ) % num_slots_;
+			if ( slots_[s].active && !slots_[s].prefill_done ) {
+				pf_rr_ = s;
+				prefill_slot( s, chunk );
+				break;
+			}
+		}
+	}
+	else {
+		for ( int s = 0; s < num_slots_; ++s ) {
+			while ( slots_[s].active && !slots_[s].prefill_done ) prefill_slot( s, 0 );
 		}
 	}
 
