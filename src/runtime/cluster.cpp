@@ -183,7 +183,17 @@ void ModelCluster::apply_mrope( pod::BatchRows& rows ) const {
 	rows.mrope = any ? 1 : 0;
 }
 
+namespace {
+// ENGINE_LOG_LEVEL=debug: rows and wall time of every forward (a slow backend shows where a request spends its time)
+struct ForwardTimer {
+	int rows;
+	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+	~ForwardTimer() { LOG_DEBUG( "[forward] %d rows %.1f ms\n", rows, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() ); }
+};
+}
+
 void ModelCluster::forward( const int* tokens, const pod::BatchRows& rows ) {
+	ForwardTimer timer{ rows.count };
 	if ( mm_slots_ == 0 ) {
 		pool_.run( [&]( int d ) {
 			models_[d]->embed_tokens( tokens, rows.count, streams_[d] );

@@ -17,13 +17,15 @@ int main( int argc, char** argv ) {
 	const char* model_dir = engine::runtime::test::model_path( "Qwen3.8-27B-exl3" );
 	const char* model_type = "qwen3_5";
 	int steps = 0;
+	int ntokens = 4;
 	for ( int i = 1; i + 1 < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--model" ) ) model_dir = argv[i + 1];
 		if ( !std::strcmp( argv[i], "--type" ) ) model_type = argv[i + 1];
 		if ( !std::strcmp( argv[i], "--steps" ) ) steps = std::atoi( argv[i + 1] );
+		if ( !std::strcmp( argv[i], "--tokens" ) ) ntokens = std::atoi( argv[i + 1] );
 	}
 	if ( !args.dump && !args.check ) {
-		std::printf( "usage: test_cpu_forward --dump|--check <dir> [--model <dir>] [--type <model_type>] [--steps <greedy decode steps after the prefill>]\n" );
+		std::printf( "usage: test_cpu_forward --dump|--check <dir> [--model <dir>] [--type <model_type>] [--steps <greedy decode steps after the prefill>] [--tokens <prompt length, default 4>]\n" );
 		return 2;
 	}
 	::setenv( "ENGINE_TP", "1", 0 );
@@ -38,7 +40,8 @@ int main( int argc, char** argv ) {
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	const int vocab = mc.metadata().vocab_size;
 
-	const std::vector<int> prompt = { 15, 16, 17, 18 };
+	std::vector<int> prompt;
+	for ( int i = 0; i < ntokens; ++i ) prompt.push_back( 15 + i );
 	mc.reset_slot( 0 );
 	const int pred = mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0, 0 );
 	std::vector<backend::half_t> logits_h( static_cast<size_t>( vocab ) );
