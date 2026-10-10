@@ -194,6 +194,7 @@ private:
 
 	pod::BatchRows* d_rows_ = nullptr;
 	engine::core::GraphCache graphs_;
+	const pod::BatchRows* ple_rows_ = nullptr;   // prefill: rows whose n-gram embeddings are decoded at the PLE layer
 	int* d_token_ids_ = nullptr;
 	pod::TensorView embed_table_;
 	pod::TensorView embed_rows_;      // [R, hidden] fp16

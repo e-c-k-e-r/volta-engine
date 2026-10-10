@@ -548,7 +548,10 @@ void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 		backend::memcpy_async( embed_rows_.ptr<backend::half_t>(), e.data(), e.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
 		backend::stream_sync( stream );
 	}
-	ple_prepare( rows, m, stream );
+	// Prefill rows decode the n-gram embeddings on the host while the GPU runs the layers before the PLE layer (forward_body); decode rows
+	// (replayed graph) have them ready up front
+	ple_rows_ = ( m > pod::MAX_BATCH ) ? &rows : nullptr;
+	if ( !ple_rows_ ) ple_prepare( rows, m, stream );
 	// Decode-sized forwards replay a per-row-count graph (the body reads slots, positions and the n-gram rows from device memory)
 	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); } );
 }
@@ -905,6 +908,7 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		auto& lw = layers_[L];
 		if ( L == config_.ple_layer ) {
+			if ( ple_rows_ ) ple_prepare( *ple_rows_, m, stream );
 			ple_forward( m, stream );
 			trace_rows( 800, streams_.data, true, m, stream );
 		}
