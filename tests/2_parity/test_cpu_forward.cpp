@@ -6,6 +6,7 @@
 #include "engine/runtime/cluster.h"
 #include "engine/backend/numeric.h"
 #include "golden_io.h"
+#include <chrono>
 #include <cstdlib>
 #include <vector>
 
@@ -42,23 +43,29 @@ int main( int argc, char** argv ) {
 
 	std::vector<int> prompt;
 	for ( int i = 0; i < ntokens; ++i ) prompt.push_back( 15 + i );
+	auto now = [] { return std::chrono::steady_clock::now(); };
+	auto ms_since = [&]( auto t0 ) { return std::chrono::duration<double, std::milli>( now() - t0 ).count(); };
 	mc.reset_slot( 0 );
+	const auto t_prefill = now();
 	const int pred = mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0, 0 );
+	const double prefill_ms = ms_since( t_prefill );
 	std::vector<backend::half_t> logits_h( static_cast<size_t>( vocab ) );
 	mc.read_logits( 1, logits_h.data() );
 	std::vector<float> logits( logits_h.size() );
 	for ( size_t i = 0; i < logits.size(); ++i ) logits[i] = backend::to_float( logits_h[i] );
-	std::printf( "  prefill %zu tokens -> next token %d\n", prompt.size(), pred );
+	std::printf( "  prefill %zu tokens -> next token %d (%.0f ms)\n", prompt.size(), pred, prefill_ms );
 
 	// Greedy decode steps (single-row forwards: the decode paths) after the prefill
 	std::vector<int> decoded;
 	int tok = pred;
+	const auto t_decode = now();
 	for ( int i = 0; i < steps; ++i ) {
 		mc.forward( &tok, 1, static_cast<int>( prompt.size() ) + i, 0 );
 		tok = mc.sample_one();
 		decoded.push_back( tok );
 	}
 	if ( steps > 0 ) {
+		std::printf( "  decode %.0f ms per step\n", ms_since( t_decode ) / steps );
 		std::printf( "  decoded:" );
 		for ( int t : decoded ) std::printf( " %d", t );
 		std::printf( "\n" );
