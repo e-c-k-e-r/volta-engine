@@ -139,3 +139,4 @@ Next: a GEMV for the N=640 shared-expert shapes, a tensor-core QSA scorer and sp
 kernel, the SASS / bench baselines and the 256K needle.
 
 The PLE layer's host n-gram row decode of a prefill chunk now runs at the PLE layer (forward_body) instead of before the forward, so it overlaps the GPU running the layers queued before it (decode-sized rows keep the up-front decode inside the graph path): prefill 1164 -> 1189 tok/s (8K, chunk 512). Prefix restore and the API suite with MTP pass; `gate.sh compare cap150`: 0 failures (decode within 1.5
+The PLE layer's host n-gram row decode of a prefill chunk now runs at the PLE layer (`forward_body`) instead of before the forward, so it overlaps the GPU running the layers queued before it (decode-sized rows keep the up-front decode for the graph path): prefill 1164 -> 1189 tok/s (8K, chunk 512). Prefix restore and the API suite with MTP pass; `gate.sh compare cap150`: 0 failures (decode within 1.5%).
