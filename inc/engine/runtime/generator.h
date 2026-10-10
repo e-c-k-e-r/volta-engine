@@ -32,6 +32,7 @@ struct SlotMetrics {
 	std::chrono::steady_clock::time_point start_time;
 	std::chrono::steady_clock::time_point first_token_time;
 	int prompt_tokens = 0;
+	int cached_tokens = 0;   // prompt tokens restored from the prefix cache
 	int generated_tokens = 0;
 	float prefill_tok_s = 0.0f;
 	float decode_tok_s = 0.0f;

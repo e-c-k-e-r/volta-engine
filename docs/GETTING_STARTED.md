@@ -32,7 +32,7 @@ The server speaks the OpenAI chat API (`/v1/chat/completions`, `/v1/models`) and
 
 Useful options for agent workloads: a large context (`--set max_seq=262144 --set max_slots=2`) and the prefix cache
 (`prefix_cache_gib`), which keeps the system prompt and earlier turns resident in pinned host RAM so a long conversation is
-not prefilled again on every turn.
+not prefilled again on every turn. The resumed tokens show up in the usage (OpenAI `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens`, with `input_tokens` excluding them).
 
 Qwen extras:
 

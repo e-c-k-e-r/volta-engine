@@ -271,6 +271,7 @@ void Generator::prefill_slot( int s ) {
 			}
 		}
 	}
+	const int resumed_tokens = pos;
 	if ( pos == 0 ) cluster_.reset_slot( s );
 	if ( !slot.req.images.empty() ) {
 		MmLayout layout;
@@ -324,6 +325,7 @@ void Generator::prefill_slot( int s ) {
 	slot.metrics.first_token_time = std::chrono::steady_clock::now();
 	const double ttft_ms = std::chrono::duration<double, std::milli>( slot.metrics.first_token_time - slot.metrics.start_time ).count();
 	slot.metrics.prompt_tokens = n;
+	slot.metrics.cached_tokens = resumed_tokens;
 	slot.metrics.prefill_tok_s = ( ttft_ms > 0.0 ) ? static_cast<float>( n / ( ttft_ms / 1000.0 ) ) : 0.0f;
 	slot.last_token = first;
 	emit_token( s, first );

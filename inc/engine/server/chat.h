@@ -44,6 +44,7 @@ struct ChatRequest {
 
 struct Usage {
 	int prompt_tokens = 0;
+	int cached_tokens = 0;   // of prompt_tokens: resumed from the prefix cache
 	int completion_tokens = 0;
 	double ttft_ms = 0.0;
 	double decode_tok_s = 0.0;

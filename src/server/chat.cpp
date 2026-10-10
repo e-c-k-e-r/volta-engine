@@ -309,6 +309,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		for ( const OutputEvent& ev : events ) state->responder->on_event( ev );
 		Usage u;
 		u.prompt_tokens = m.prompt_tokens;
+		u.cached_tokens = m.cached_tokens;
 		u.completion_tokens = m.generated_tokens;
 		u.ttft_ms = std::chrono::duration<double, std::milli>( m.first_token_time - m.start_time ).count();
 		u.decode_tok_s = m.decode_tok_s;

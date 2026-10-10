@@ -188,6 +188,13 @@ if "prefix_cache" in metrics:
     check(h1 - h0 >= 2, "prefix cache hits on a shared system prompt", (h0, h1))
     check((m1["hit_tokens"] - m0["hit_tokens"]) / max(1, h1 - h0) > 3000, "hits resume deep into the shared system prompt", (m0, m1))
     check("259" in a1 and a1 == a3, "answer after a prefix hit equals the cold answer", (a1, a2, a3))
+    # usage reports the resumed prompt tokens (OpenAI cached_tokens, Anthropic cache_read_input_tokens with input_tokens excluding them)
+    code, body = post("/v1/chat/completions", {"messages": [{"role": "system", "content": "You answer from these facts, briefly. " + facts}, {"role": "user", "content": "What is the code for district 7? Number only."}], "max_tokens": 4})
+    u = json.loads(body)["usage"]
+    check(u["prompt_tokens_details"]["cached_tokens"] > 3000, "OpenAI usage reports cached_tokens", u)
+    code, body = post("/v1/messages", {"model": "claude-x", "max_tokens": 4, "system": "You answer from these facts, briefly. " + facts, "messages": [{"role": "user", "content": "What is the code for district 7? Number only."}]})
+    u = json.loads(body)["usage"]
+    check(code == 200 and u["cache_read_input_tokens"] > 3000 and u["input_tokens"] < 500, "Anthropic usage reports cache_read_input_tokens", u)
 
 # ---- images (both models run their checkpoint's vision tower)
 IMG = base64.b64encode(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "image_shapes.png"), "rb").read()).decode()

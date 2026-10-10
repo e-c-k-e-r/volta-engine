@@ -189,7 +189,7 @@ private:
 	}
 
 	static json usage_json( const Usage& u ) {
-		return { { "prompt_tokens", u.prompt_tokens }, { "completion_tokens", u.completion_tokens }, { "total_tokens", u.prompt_tokens + u.completion_tokens },
+		return { { "prompt_tokens", u.prompt_tokens }, { "completion_tokens", u.completion_tokens }, { "total_tokens", u.prompt_tokens + u.completion_tokens }, { "prompt_tokens_details", { { "cached_tokens", u.cached_tokens } } },
 			{ "ttft_ms", u.ttft_ms }, { "decode_tok_s", u.decode_tok_s } };
 	}
 
