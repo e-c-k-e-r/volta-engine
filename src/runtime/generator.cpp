@@ -457,7 +457,10 @@ void Generator::step_batch() {
 	const int adapt_every = runtime::options().expert_adapt_every;
 	if ( adapt_every > 0 && ++adapt_steps_ >= adapt_every ) {
 		adapt_steps_ = 0;
-		cluster_.rebalance_experts();
+		const auto t_ad = std::chrono::steady_clock::now();
+		const bool moved = cluster_.rebalance_experts();
+		const double ad_ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_ad ).count();
+		if ( ad_ms > 50.0 ) LOG_DEBUG( "[gen] expert rebalance took %.0f ms%s\n", ad_ms, moved ? "" : " (nothing moved)" );
 	}
 
 	// New prompts: while other requests are decoding (and the speculator has no single shared context that a decode step could disturb),
