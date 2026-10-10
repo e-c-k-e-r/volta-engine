@@ -319,7 +319,7 @@ __device__ __forceinline__ void pa_mma( float* c, uint32_t a0, uint32_t a1, uint
 	);
 }
 
-template <KVQ KQ, KVQ VQ>
+template <KVQ KQ, KVQ VQ, bool SP>
 __global__ __launch_bounds__( 256 )
 void attn_prefill_tc_kernel(
 	const half* __restrict__ q,
@@ -336,7 +336,10 @@ void attn_prefill_tc_kernel(
 	float scale,
 	float* __restrict__ workspace,
 	int nsplit,
-	int tile_q // query slots a block owns: PA_BQ, or G to give every row its own block (rows of distinct slots)
+	int tile_q, // query slots a block owns: PA_BQ, or G to give every row its own block (rows of distinct slots)
+	const int* __restrict__ idx,   // SP: the keys of row r are idx[r * idx_stride + i], i < nkeys[r] (all 0 .. pos when nkeys[r] < 0); tile_q == G
+	const int* __restrict__ nkeys,
+	int idx_stride
 ) {
 	constexpr int HD = 256;
 	extern __shared__ __align__( 16 ) unsigned char pa_smem[];
@@ -364,8 +367,13 @@ void attn_prefill_tc_kernel(
 
 	const int last_row = ( q_end - 1 ) / G;
 	int max_pos = 0;
-	for ( int r = q_base / G; r <= last_row; ++r ) max_pos = max( max_pos, rows->pos[r] );
-	max_pos = min( max_pos, max_seq - 1 );
+	// SP: max_pos is the last entry of the row's key list (the list position, not the token position)
+	const int sp_nk = SP ? nkeys[q_base / G] : 0;
+	if constexpr ( SP ) max_pos = ( sp_nk >= 0 ? sp_nk : min( rows->pos[q_base / G] + 1, max_seq ) ) - 1;
+	else {
+		for ( int r = q_base / G; r <= last_row; ++r ) max_pos = max( max_pos, rows->pos[r] );
+		max_pos = min( max_pos, max_seq - 1 );
+	}
 	const size_t slot_off = static_cast<size_t>( rows->slot[q_base / G] ) * slot_stride;
 	const size_t kv_stride = static_cast<size_t>( num_kv_heads ) * HD;
 	const size_t kv_base = slot_off + static_cast<size_t>( layer_idx ) * max_seq * kv_stride + static_cast<size_t>( kvh ) * HD;
@@ -375,7 +383,7 @@ void attn_prefill_tc_kernel(
 	const int sub = tid & 7;
 	const int sqi = q_base + srow;
 	const bool svalid = sqi < q_end;
-	const int spos = svalid ? rows->pos[sqi / G] : -1;
+	const int spos = svalid ? ( SP ? max_pos : rows->pos[sqi / G] ) : -1;
 	float m_run = -1e30f, l_run = 0.0f;
 
 	for ( int u = tid; u < PA_BQ * ( HD / 8 ); u += 256 ) {
@@ -418,7 +426,9 @@ void attn_prefill_tc_kernel(
 					KVRaw8 k4 = {}, v4 = {};
 					if ( kb + key <= max_pos ) {
 						const int c = ( ( tid >> 5 ) + 8 * ui ) * 2 + cc;
-						const size_t at = kv_base + static_cast<size_t>( kb + key ) * kv_stride + c * 8;
+						int tok = kb + key;
+						if constexpr ( SP ) { if ( sp_nk >= 0 ) tok = idx[static_cast<size_t>( q_base / G ) * idx_stride + kb + key]; }
+						const size_t at = kv_base + static_cast<size_t>( tok ) * kv_stride + c * 8;
 						k4 = kv_fetch8<KQ>( kv.k, kv.ks, at );
 						v4 = kv_fetch8<VQ>( kv.v, kv.vs, at );
 					}
@@ -822,9 +832,9 @@ void Attention::forward_prefill(
 	const half* gate_ptr = gate.data != nullptr ? gate.ptr<const half>() : nullptr;
 	#define LAUNCH_PREFILL() do { \
 		{ \
-			CUDA_CHECK( cudaFuncSetAttribute( attn_prefill_tc_kernel<KQ_, VQ_>, cudaFuncAttributeMaxDynamicSharedMemorySize, PA_SMEM ) ); \
-			attn_prefill_tc_kernel<KQ_, VQ_><<<grid_tc, 256, PA_SMEM, stream>>>( \
-				q.ptr<const half>(), kv, gate_ptr, out.ptr<half>(), slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, max_seq, scale, workspace, nsplit, tile_q ); \
+			CUDA_CHECK( cudaFuncSetAttribute( attn_prefill_tc_kernel<KQ_, VQ_, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, PA_SMEM ) ); \
+			attn_prefill_tc_kernel<KQ_, VQ_, false><<<grid_tc, 256, PA_SMEM, stream>>>( \
+				q.ptr<const half>(), kv, gate_ptr, out.ptr<half>(), slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, max_seq, scale, workspace, nsplit, tile_q, nullptr, nullptr, 0 ); \
 		} \
 	} while ( 0 )
 	#define KQ_ KQV_
@@ -859,6 +869,32 @@ void Attention::forward_sparse(
 ) {
 	ENGINE_ASSERT( kv.vq != KVQ::Q4, "Attention::forward_sparse: Q4 values are not supported" );
 	const float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
+	if ( count > pod::MAX_BATCH && head_dim == 256 && num_q_heads % num_kv_heads == 0 ) {
+		// Prefill rows: tensor-core kernel, one block per (row, kv head) over that row's key list (decode-sized calls keep the fp32 kernel below)
+		const int G = num_q_heads / num_kv_heads;
+		const int nlist = idx_stride;
+		const int base_blocks = num_kv_heads * count;
+		int nsplit = 1;
+		if ( base_blocks < 160 ) nsplit = MIN( ( 320 + base_blocks - 1 ) / base_blocks, 32 );
+		nsplit = MAX( 1, MIN( nsplit, nlist / ( 4 * PA_BK ) ) );
+		ENGINE_ASSERT( static_cast<size_t>( count ) * num_q_heads * nsplit <= static_cast<size_t>( ATTN_MAX_ROW_HEADS ) * ATTN_MAX_CHUNKS, "Attention::forward_sparse: workspace" );
+		float* workspace_tc = attn_workspace_ptr();
+		const dim3 grid_tc( num_kv_heads, count, nsplit );
+		const half* gate_tc = gate.data != nullptr ? gate.ptr<const half>() : nullptr;
+		#define LAUNCH_SPARSE_TC() do { \
+			CUDA_CHECK( cudaFuncSetAttribute( attn_prefill_tc_kernel<KQ_, VQ_, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, PA_SMEM ) ); \
+			attn_prefill_tc_kernel<KQ_, VQ_, true><<<grid_tc, 256, PA_SMEM, stream>>>( \
+				q.ptr<const half>(), kv, gate_tc, out.ptr<half>(), slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, max_seq, scale, workspace_tc, nsplit, G, idx, nkeys, idx_stride ); \
+		} while ( 0 )
+		#define KQ_ KQV_
+		#define VQ_ VQV_
+		KV_DISPATCH( KQV_, VQV_, LAUNCH_SPARSE_TC() )
+		#undef KQ_
+		#undef VQ_
+		#undef LAUNCH_SPARSE_TC
+		if ( nsplit > 1 ) attn_reduce_kernel<256><<<dim3( num_q_heads, count ), 256, 0, stream>>>( workspace_tc, gate_tc, out.ptr<half>(), num_q_heads, nsplit, 0 );
+		return;
+	}
 	const int chunk_len = 256;
 	const int n_chunks = ( idx_stride + chunk_len - 1 ) / chunk_len;
 	ENGINE_ASSERT( n_chunks <= ATTN_MAX_CHUNKS, "Attention::forward_sparse: list too long" );

@@ -125,5 +125,7 @@ The PLE layer's dense fp16 key / value projections (the plain GEMV behind `Linea
 
 Prefill profile after that (8K tokens, one GPU): persistent 4-bit MoE kernel 28% (3.9 ms per 512-row chunk and layer, ~10 rows per expert so the trellis dequant is not amortized), sparse QSA attention 25% (fp32 CUDA cores, ~0.5 ms per layer and chunk), all-reduce 8% (skew), router logits 4%, GDN recurrence 3%.
 
+The QSA sparse attention for prefill rows (more than 8 rows) now runs on the tensor-core prefill kernel (`attn_prefill_tc_kernel<..., SP = true>`: one block per row and kv head, the keys gathered through the row's top-k list, same fp16 P / fp32 accumulate as the dense prefill path); the fp32 one-key-at-a-time kernel (about 25% of prefill) stays for decode-sized calls: prefill 767 -> 981 tok/s (8K), 12K needle 962 tok/s, 32K needle 927 tok/s (was 279). Needles at 12K and 32K, prefix restore and the API suite with MTP pass.
+
 Next: a GEMV for the N=640 shared-expert shapes, a tensor-core QSA scorer and sparse
 kernel, the SASS / bench baselines and the 256K needle.
