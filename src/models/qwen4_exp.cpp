@@ -34,6 +34,19 @@
 namespace engine::models {
 
 namespace {
+// Row count of the dense fp16 GEMMs of a prefill chunk. CUDA runs them at the full row capacity (one cuBLAS algorithm, so a row's result does not depend on its
+// chunk); the CPU and Vulkan GEMMs have no algorithm choice and run the rows there are (the full capacity costs hundreds of times the work)
+inline int gemm_rows( int m ) {
+#if defined(ENGINE_BACKEND_CUDA) && ENGINE_BACKEND_CUDA == 1
+	( void )m;
+	return pod::MAX_ROWS;
+#else
+	return m;
+#endif
+}
+} // namespace
+
+namespace {
 
 // Checks the hard-coded defaults of Qwen4ExpConfig against the checkpoint's config.json
 bool validate_config( const char* model_dir, const Qwen4ExpConfig& c ) {
@@ -627,11 +640,11 @@ void Qwen4ExpPipeline::gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, i
 		apply_pending_ = false;
 		const half_t* wd = g.down_lw.w0.ptr<const half_t>();
 		const half_t* wu = g.up_lw.w0.ptr<const half_t>();
-		GR::gemm_f32( gr16_hi_.ptr<const half_t>(), wd, gr16_z_.ptr<float>(), pod::MAX_ROWS, rank + 8, flat, false, stream );
-		GR::gemm_f32( gr16_lo_.ptr<const half_t>(), wd, gr16_z_.ptr<float>(), pod::MAX_ROWS, rank + 8, flat, true, stream );
+		GR::gemm_f32( gr16_hi_.ptr<const half_t>(), wd, gr16_z_.ptr<float>(), gemm_rows( m ), rank + 8, flat, false, stream );
+		GR::gemm_f32( gr16_lo_.ptr<const half_t>(), wd, gr16_z_.ptr<float>(), gemm_rows( m ), rank + 8, flat, true, stream );
 		GR::gate_act( gr16_z_.ptr<const float>(), rank + 8, gr16_thi_.ptr<half_t>(), gr16_tlo_.ptr<half_t>(), post_, m, rank, hc, true, stream );
-		GR::gemm_f32( gr16_thi_.ptr<const half_t>(), wu, gr16_u_.ptr<float>(), pod::MAX_ROWS, flat, rank, false, stream );
-		GR::gemm_f32( gr16_tlo_.ptr<const half_t>(), wu, gr16_u_.ptr<float>(), pod::MAX_ROWS, flat, rank, true, stream );
+		GR::gemm_f32( gr16_thi_.ptr<const half_t>(), wu, gr16_u_.ptr<float>(), gemm_rows( m ), flat, rank, false, stream );
+		GR::gemm_f32( gr16_tlo_.ptr<const half_t>(), wu, gr16_u_.ptr<float>(), gemm_rows( m ), flat, rank, true, stream );
 		GR::up_epilogue( gr16_u_.ptr<const float>(), gr_scratch_, mixed_.ptr<half_t>(), m, H, hc, stream );
 		return;
 	}
@@ -818,7 +831,7 @@ void Qwen4ExpPipeline::ple_forward( int m, backend::stream_t stream ) {
 	if ( m > 8 ) {
 		// Prefill rows: the dense fp16 projections as tensor-core GEMMs at the full row capacity (one cuBLAS algorithm, so a row does not depend on the chunking);
 		// the plain GEMV behind Linear::forward takes 20 ms per 512-row chunk here
-		const int R = pod::MAX_ROWS, H = config_.hidden_size, hc = config_.hc_mult;
+		const int R = gemm_rows( m ), H = config_.hidden_size, hc = config_.hc_mult;
 		engine::modules::Vision::dense_gemm( ple_emb_.ptr<const backend::half_t>(), ple_.key_proj.w0.ptr<const backend::half_t>(), ple_key_.ptr<backend::half_t>(), R, hc * H, config_.ple_embed_dim, stream );
 		engine::modules::Vision::dense_gemm( ple_emb_.ptr<const backend::half_t>(), ple_.value_proj.w0.ptr<const backend::half_t>(), ple_value_.ptr<backend::half_t>(), R, H, config_.ple_embed_dim, stream );
 	}

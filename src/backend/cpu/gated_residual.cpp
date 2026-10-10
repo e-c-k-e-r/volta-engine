@@ -2,7 +2,10 @@
 // cpu_kernels.h first: the Slang prelude defines int4, which the backend shim only declares when the prelude is absent
 #include "cpu_kernels.h"
 #include "engine/modules/gated_residual.h"
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace engine::modules {
 
@@ -61,7 +64,12 @@ void GatedResidual::mix(
 	const int flat = hc * hidden;
 	float* normed = scratch;
 	float* t = scratch + static_cast<size_t>( rows ) * flat;
+	// ENGINE_DEBUG_CPU_TRACE=1: wall time of the three passes
+	static const bool trace = std::getenv( "ENGINE_DEBUG_CPU_TRACE" ) != nullptr;
+	auto tick = [&]() { return std::chrono::steady_clock::now(); };
+	auto t0 = tick();
 	norm( const_cast<float*>( x ), norm_w, normed, nullptr, nullptr, rows, hidden, hc, eps, prev_post, prev_y, stream );
+	const auto t1 = tick();
 	const int outs = rank + ( inject != nullptr ? hc : 0 );
 	// t = silu( normed . down / hc ), post = 2 * sigmoid( normed . inject / hc )
 	impl::cpu_parallel_for( outs, 8, [&]( int64_t j0, int64_t j1 ) {
@@ -77,6 +85,7 @@ void GatedResidual::mix(
 			}
 		}
 	} );
+	const auto t2 = tick();
 	// mixed[r, d] = mean_s( sigmoid( up[s * hidden + d] . t[r] ) * normed[r, s, d] )
 	impl::cpu_parallel_for( hidden, 16, [&]( int64_t d0, int64_t d1 ) {
 		for ( int64_t d = d0; d < d1; ++d ) {
@@ -93,6 +102,11 @@ void GatedResidual::mix(
 			}
 		}
 	} );
+	if ( trace ) {
+		const auto t3 = tick();
+		auto ms = []( auto a, auto b ) { return std::chrono::duration<double, std::milli>( b - a ).count(); };
+		std::fprintf( stderr, "[cpu-trace] gr_mix rows=%d norm %.1f gate %.1f up %.1f ms\n", rows, ms( t0, t1 ), ms( t1, t2 ), ms( t2, t3 ) );
+	}
 }
 
 void GatedResidual::gemm_f32( const backend::half_t* a, const backend::half_t* w, float* out, int m, int n, int k, bool accumulate, backend::stream_t ) {
