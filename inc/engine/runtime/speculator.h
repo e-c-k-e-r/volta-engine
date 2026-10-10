@@ -33,6 +33,13 @@ public:
 	// correction / bonus token is drawn from the target's distribution.
 	virtual SpecResult speculate( int slot, int anchor, int pos, float depth_threshold, const SamplingParams* sp, Rng* rng ) = 0;
 
+	// One round for several owned slots at once (a single draft chain and a single verify forward over all their blocks). Only where joint().
+	virtual bool joint() const { return false; }
+	virtual void speculate_joint( int n, const int* slots, const int* anchors, const int* poss, const SamplingParams* const* sps, Rng* const* rngs, SpecResult* out ) {
+		(void) n; (void) slots; (void) anchors; (void) poss; (void) sps; (void) rngs; (void) out;
+		ENGINE_ASSERT( false, "speculator has no joint rounds" );
+	}
+
 	// Called after every prefill chunk of the owning slot: `rows` prompt tokens starting at position pos0 were just forwarded
 	virtual void on_prefill_chunk( int slot, const int* tokens, int rows, int pos0 ) { (void) slot; (void) tokens; (void) rows; (void) pos0; }
 	// Called after a plain (non-speculative) decode step of the owning slot: `token` was forwarded at `pos` as row `row` of the batch

@@ -23,6 +23,8 @@ public:
 	bool owns( int slot ) const override { return slot >= 0 && slot < kMaxSlots && st_[slot].owned; }
 	bool per_slot() const override { return true; }
 	SpecResult speculate( int slot, int anchor, int pos, float depth_threshold, const SamplingParams* sp, Rng* rng ) override;
+	bool joint() const override;
+	void speculate_joint( int n, const int* slots, const int* anchors, const int* poss, const SamplingParams* const* sps, Rng* const* rngs, SpecResult* out ) override;
 	void on_prefill_chunk( int slot, const int* tokens, int rows, int pos0 ) override;
 	void on_dense_row( int slot, int token, int pos, int row ) override;
 	bool needs_taps() const override { return false; }

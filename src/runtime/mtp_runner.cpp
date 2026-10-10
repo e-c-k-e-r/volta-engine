@@ -169,4 +169,153 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 	return res;
 }
 
+bool MtpRunner::joint() const {
+	return mc_ != nullptr && mc_->mtp_joint();
+}
+
+// A round for several slots: one catch-up step over all their pending rows, one draft-chain step per depth for all of them, and one verify
+// forward over their blocks (mixed-slot rows; the recurrent states are snapshotted per row and committed per slot). Slots without a pending
+// hidden (cold start, a restored prefix) take their plain step through speculate().
+void MtpRunner::speculate_joint( int n, const int* slots, const int* anchors, const int* poss, const SamplingParams* const* sps, Rng* const* rngs, SpecResult* out ) {
+	ModelCluster& mc = *mc_;
+	const auto& meta = mc.metadata();
+	ENGINE_ASSERT( n >= 1 && n <= kMaxSlots, "MtpRunner::speculate_joint: slot count out of range" );
+	int J[kMaxSlots], k = 0, catch_rows = 0, depth = depth_;
+	for ( int i = 0; i < n; ++i ) {
+		ENGINE_ASSERT( owns( slots[i] ), "MtpRunner::speculate_joint: slot does not own the speculator" );
+		const SlotState& S = st_[slots[i]];
+		const int active = MIN( depth_, meta.max_seq_len - poss[i] - 2 );
+		if ( S.pend_n >= 1 && S.pend_pos + S.pend_n == poss[i] && active >= 1 ) {
+			J[k++] = i;
+			catch_rows += S.pend_n;
+			depth = MIN( depth, active );
+		}
+		else out[i] = SpecResult();
+	}
+	// Block rows: k blocks of depth + 1 in one forward
+	depth = MIN( depth, pod::MAX_BATCH / MAX( 1, k ) - 1 );
+	const bool joint_ok = k >= 2 && depth >= 1 && catch_rows <= pod::MAX_BATCH;
+	for ( int i = 0; i < n; ++i ) {
+		bool in_joint = false;
+		for ( int j = 0; j < k && joint_ok; ++j ) in_joint = in_joint || J[j] == i;
+		if ( !in_joint ) out[i] = speculate( slots[i], anchors[i], poss[i], -1.0f, sps[i], rngs[i] );
+	}
+	if ( !joint_ok ) return;
+
+	// 1. catch-up over every slot's pending rows (true hidden); the last row of a run takes the anchor as its following token and predicts its successor
+	pod::BatchRows crows;
+	crows.count = catch_rows;
+	int ctok[pod::MAX_BATCH], csrc[pod::MAX_BATCH], cout_rows[kMaxSlots], r = 0;
+	for ( int j = 0; j < k; ++j ) {
+		const int i = J[j];
+		SlotState& S = st_[slots[i]];
+		for ( int t = 0; t < S.pend_n; ++t, ++r ) {
+			crows.slot[r] = slots[i];
+			crows.pos[r] = S.pend_pos + t;
+			ctok[r] = ( t < S.pend_n - 1 ) ? S.pend_tok[t] : anchors[i];
+			csrc[r] = hist_off( slots[i] ) + S.hist_base + t;
+		}
+		cout_rows[j] = r - 1;
+	}
+	mc.mtp_gather_hist( csrc, catch_rows );
+	mc.mtp_step_rows( crows, ctok, 4, 0, cout_rows, k );
+	int cands[kMaxSlots][pod::MAX_BATCH], preds[pod::MAX_BATCH];
+	mc.sample( preds, k );
+	for ( int j = 0; j < k; ++j ) cands[j][0] = preds[j];
+
+	// 2. chain the head on its own output for the rest of the block (the depth is the same for every slot: the survival estimate is shared)
+	constexpr float kMinSurvival = 0.3f;
+	float alive = 1.0f;
+	int drafted = 1;
+	int ident[kMaxSlots];
+	for ( int j = 0; j < k; ++j ) ident[j] = j;
+	for ( int step = 1; step < depth; ++step ) {
+		alive *= cond_[step - 1];
+		if ( alive < kMinSurvival ) break;
+		pod::BatchRows drows;
+		drows.count = k;
+		int dtok[kMaxSlots];
+		for ( int j = 0; j < k; ++j ) {
+			drows.slot[j] = slots[J[j]];
+			drows.pos[j] = poss[J[j]] - 1 + step;
+			dtok[j] = cands[j][step - 1];
+		}
+		mc.mtp_step_rows( drows, dtok, 3, 0, ident, k );
+		mc.sample( preds, k );
+		for ( int j = 0; j < k; ++j ) cands[j][step] = preds[j];
+		++drafted;
+	}
+	depth = drafted;
+
+	// 3. one verify forward over [anchor, c0 .. c_{depth-1}] of every slot
+	const int B = depth + 1, total = k * B;
+	int vtok[pod::MAX_BATCH], vslot[pod::MAX_BATCH], vpos[pod::MAX_BATCH];
+	bool any_sampled = false;
+	for ( int j = 0; j < k; ++j ) {
+		const int i = J[j];
+		vtok[j * B] = anchors[i];
+		for ( int t = 0; t < depth; ++t ) vtok[j * B + 1 + t] = cands[j][t];
+		for ( int t = 0; t < B; ++t ) {
+			vslot[j * B + t] = slots[i];
+			vpos[j * B + t] = poss[i] + t;
+		}
+		any_sampled = any_sampled || ( sps[i] != nullptr && !sps[i]->greedy() );
+	}
+	mc.set_spec_snapshot( true );
+	mc.forward( vtok, pod::BatchRows::batched( total, vslot, vpos ) );
+	int vpred[pod::MAX_BATCH];
+	Candidates cs[pod::MAX_BATCH];
+	mc.sample( vpred, total );
+	if ( any_sampled ) mc.sample_topk( total, cs );
+
+	// 4. acceptance per slot (see speculate)
+	for ( int j = 0; j < k; ++j ) {
+		const int i = J[j];
+		SpecResult& res = out[i];
+		res = SpecResult();
+		const bool sampled = sps[i] != nullptr && !sps[i]->greedy();
+		ENGINE_ASSERT( !sampled || rngs[i] != nullptr, "MtpRunner::speculate_joint: sampling needs an Rng" );
+		const int base = j * B;
+		res.proposed = depth;
+		for ( int t = 0; t < depth; ++t ) {
+			++att_[t];
+			if ( sampled ) {
+				bool acc = false;
+				const int tok = spec_step( cs[base + t], *sps[i], cands[j][t], *rngs[i], &acc );
+				if ( !acc ) {
+					res.emitted[res.emitted_count++] = tok;
+					break;
+				}
+			}
+			else if ( cands[j][t] != vpred[base + t] ) {
+				res.emitted[res.emitted_count++] = vpred[base + t];
+				break;
+			}
+			++hit_[t];
+			res.emitted[res.emitted_count++] = cands[j][t];
+			res.accepted++;
+		}
+		if ( res.accepted == depth ) {
+			res.emitted[res.emitted_count++] = sampled ? sample_token( cs[base + depth], *sps[i], *rngs[i] ) : vpred[base + depth];
+		}
+		constexpr float kEma = 0.2f;
+		for ( int t = 0; t <= res.accepted && t < depth; ++t ) cond_[t] = ( 1.0f - kEma ) * cond_[t] + kEma * ( t < res.accepted ? 1.0f : 0.0f );
+		res.next_pos = poss[i] + 1 + res.accepted;
+	}
+
+	// 5. keep the committed rows' hidden for the next round's catch-up; repair the recurrent state of slots that rejected a draft
+	for ( int j = 0; j < k; ++j ) {
+		const int i = J[j];
+		SlotState& S = st_[slots[i]];
+		const SpecResult& res = out[i];
+		S.hist_base = kHalf - S.hist_base;
+		mc.mtp_save_hist( j * B, res.accepted + 1, hist_off( slots[i] ) + S.hist_base );
+		S.pend_pos = poss[i];
+		S.pend_n = res.accepted + 1;
+		for ( int t = 0; t < res.accepted; ++t ) S.pend_tok[t] = cands[j][t];
+		if ( res.accepted < depth ) mc.commit_spec_row( slots[i], j * B + res.accepted );
+	}
+	mc.set_spec_snapshot( false );
+}
+
 } // namespace engine::runtime

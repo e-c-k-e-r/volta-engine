@@ -151,8 +151,8 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	state_.slot_conv_floats = static_cast<size_t>( linear_layers ) * lin_channels_ * 3;
 	state_.conv_history = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * state_.slot_conv_floats * sizeof( float ) ) );
 	backend::memset_sync( state_.conv_history, 0, static_cast<size_t>( S ) * state_.slot_conv_floats * sizeof( float ) );
-	state_.gdn_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * state_.slot_gdn_floats * sizeof( float ) ) );
-	state_.conv_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * state_.slot_conv_floats * sizeof( float ) ) );
+	state_.gdn_snap = static_cast<float*>( engine::core::arena_alloc( arena, kSnapRows * state_.slot_gdn_floats * sizeof( float ) ) );
+	state_.conv_snap = static_cast<float*>( engine::core::arena_alloc( arena, kSnapRows * state_.slot_conv_floats * sizeof( float ) ) );
 	state_.d_snap_on = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
 	backend::memset_sync( state_.d_snap_on, 0, sizeof( int ) );
 
@@ -204,7 +204,7 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 		const size_t stack = static_cast<size_t>( config_.hc_mult ) * H * sizeof( float );
 		mtp_src_ = static_cast<float*>( engine::core::arena_alloc( arena, R * stack ) );
 		mtp_hist_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( config_.max_slots ) * 2 * ( kDraftM + 1 ) * stack ) );   // a region per slot (the runner offsets by slot)
-		mtp_chain_ = static_cast<float*>( engine::core::arena_alloc( arena, stack ) );
+		mtp_chain_ = static_cast<float*>( engine::core::arena_alloc( arena, kSnapRows * stack ) );
 	}
 	// QSA indexer state
 	{
@@ -553,7 +553,7 @@ void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 	ple_rows_ = ( m > pod::MAX_BATCH ) ? &rows : nullptr;
 	if ( !ple_rows_ ) ple_prepare( rows, m, stream );
 	// Decode-sized forwards replay a per-row-count graph (the body reads slots, positions and the n-gram rows from device memory)
-	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); } );
+	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); }, attn_tc_ ? 1 : 0 );   // the attention path differs for rows of one slot
 }
 
 void Qwen4ExpPipeline::trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols ) {
@@ -705,7 +705,7 @@ void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_i
 
 	float* hist = state_.conv_history + static_cast<size_t>( linear_idx ) * channels * 3;
 	float* layer_state = state_.gdn_states + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
-	const int snap_rows = MIN( m, kDraftM );
+	const int snap_rows = MIN( m, kSnapRows );
 	float* conv_snap = state_.conv_snap + static_cast<size_t>( linear_idx ) * channels * 3;
 	float* gdn_snap = state_.gdn_snap + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
 
@@ -972,7 +972,7 @@ void Qwen4ExpPipeline::set_spec_snapshot( bool on, backend::stream_t stream ) {
 }
 
 void Qwen4ExpPipeline::commit_spec_row( int slot_id, int row, backend::stream_t stream ) {
-	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots && row >= 0 && row < kDraftM, "Qwen4ExpPipeline::commit_spec_row: out of range" );
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots && row >= 0 && row < kSnapRows, "Qwen4ExpPipeline::commit_spec_row: out of range" );
 	backend::set_device( rank_ );
 	backend::memcpy_async( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, state_.gdn_snap + static_cast<size_t>( row ) * state_.slot_gdn_floats,
 		state_.slot_gdn_floats * sizeof( float ), backend::Copy::D2D, stream );
@@ -985,6 +985,26 @@ void Qwen4ExpPipeline::commit_spec_row( int slot_id, int row, backend::stream_t 
 // streams with the head's own weights; the streams after the block are the next step's h and, through the head's mixer and the shared LM head, the draft logits.
 // hidden_mode: 0 = the last forward's stacks, 1 = saved row hist_row0 then the last forward's rows 0 .. m - 2, 2 = saved rows from hist_row0, 3 = the previous step's output.
 void Qwen4ExpPipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream ) {
+	const int last = rows.count - 1;
+	mtp_step_impl( rows, tokens, hidden_mode, hist_row0, &last, 1, logits_last, stream );
+}
+
+void Qwen4ExpPipeline::mtp_step_rows( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, backend::stream_t stream ) {
+	mtp_step_impl( rows, tokens, hidden_mode, hist_row0, out_rows, n_out, true, stream );
+}
+
+// Stages saved stacks (rows of the history buffer, any slots) as the hidden input of the next joint step (hidden_mode 4)
+void Qwen4ExpPipeline::mtp_gather_hist( const int* src_rows, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( mtp_on_ && count >= 1 && count <= pod::MAX_BATCH, "Qwen4ExpPipeline::mtp_gather_hist: rows out of range" );
+	backend::set_device( rank_ );
+	const size_t stack = static_cast<size_t>( config_.hc_mult ) * config_.hidden_size * sizeof( float );
+	for ( int i = 0; i < count; ++i ) {
+		ENGINE_ASSERT( src_rows[i] >= 0 && src_rows[i] < config_.max_slots * 2 * ( kDraftM + 1 ), "Qwen4ExpPipeline::mtp_gather_hist: history row out of range" );
+		backend::memcpy_async( reinterpret_cast<char*>( mtp_src_ ) + static_cast<size_t>( i ) * stack, reinterpret_cast<const char*>( mtp_hist_ ) + static_cast<size_t>( src_rows[i] ) * stack, stack, backend::Copy::D2D, stream );
+	}
+}
+
+void Qwen4ExpPipeline::mtp_step_impl( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, bool logits, backend::stream_t stream ) {
 	ENGINE_ASSERT( mtp_on_ && weights_loaded_, "Qwen4ExpPipeline::mtp_step: no MTP head" );
 	backend::set_device( rank_ );
 	const int m = rows.count;
@@ -992,6 +1012,8 @@ void Qwen4ExpPipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, 
 	const size_t stack = static_cast<size_t>( hc ) * H * sizeof( float );
 	ENGINE_ASSERT( m >= 1 && m <= pod::MAX_ROWS, "Qwen4ExpPipeline::mtp_step: rows out of range" );
 	key_hint_ = rows.pos[m - 1] + 1;
+	attn_tc_ = true;
+	for ( int r = 1; r < m; ++r ) attn_tc_ = attn_tc_ && rows.slot[r] == rows.slot[0];
 	set_rows( m );
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
 
@@ -1014,6 +1036,7 @@ void Qwen4ExpPipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, 
 			src = mtp_src_;
 		} break;
 		case 2: src = mtp_hist_ + static_cast<size_t>( hist_row0 ) * hc * H; break;
+		case 4: src = mtp_src_; break;
 		default: src = mtp_chain_; break;
 	}
 	for ( int r0 = 0; r0 < m; r0 += 128 ) {   // chunks of at most 512 stream rows
@@ -1031,16 +1054,19 @@ void Qwen4ExpPipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, 
 	mlp_site( mtp_layer_, -1, m, stream );
 	flush_apply( m, stream );
 
-	// 4. the output stack feeds the next step; the mixer and the shared head give the draft logits of the last row
-	backend::memcpy_async( mtp_chain_, streams_.ptr<const char>() + static_cast<size_t>( m - 1 ) * stack, stack, backend::Copy::D2D, stream );
-	if ( logits_last ) {
+	// 4. the output stacks of the requested rows feed the next step; the mixer and the shared head give their draft logits
+	ENGINE_ASSERT( n_out >= 1 && n_out <= kSnapRows, "Qwen4ExpPipeline::mtp_step: output rows out of range" );
+	for ( int j = 0; j < n_out; ++j ) {
+		backend::memcpy_async( reinterpret_cast<char*>( mtp_chain_ ) + static_cast<size_t>( j ) * stack, streams_.ptr<const char>() + static_cast<size_t>( out_rows[j] ) * stack, stack, backend::Copy::D2D, stream );
+	}
+	if ( logits ) {
 		engine::modules::GatedResidual::mix( mtp_chain_, mtp_mixer_.norm.ptr<const backend::half_t>(), mtp_mixer_.down.ptr<const backend::half_t>(),
-			mtp_mixer_.up.ptr<const backend::half_t>(), nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_, 1, H, hc, config_.hc_rank, config_.rms_norm_eps, stream );
-		pod::TensorView hin = pod::make_tensor_2d( mixed_.ptr<backend::half_t>(), pod::DType::FP16, 1, H );
-		pod::TensorView lout = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
+			mtp_mixer_.up.ptr<const backend::half_t>(), nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_, n_out, H, hc, config_.hc_rank, config_.rms_norm_eps, stream );
+		pod::TensorView hin = pod::make_tensor_2d( mixed_.ptr<backend::half_t>(), pod::DType::FP16, n_out, H );
+		pod::TensorView lout = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, n_out, lm_shard_cols_ );
 		engine::modules::Linear::forward( hin, lm_head_, lout, stream );
-		logits_.shape[0] = 1;
-		last_rows_ = 1;
+		logits_.shape[0] = n_out;
+		last_rows_ = n_out;
 	}
 }
 

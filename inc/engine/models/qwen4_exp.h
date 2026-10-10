@@ -123,7 +123,11 @@ public:
 	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
 	bool has_mtp() const override { return mtp_on_; }
 	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
+	void mtp_step_impl( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, bool logits, backend::stream_t stream );
 	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
+	bool mtp_joint() const override { return true; }
+	void mtp_step_rows( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, backend::stream_t stream = nullptr ) override;
+	void mtp_gather_hist( const int* src_rows, int count, backend::stream_t stream = nullptr ) override;
 	void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void reset_state( int slot_id = 0 ) override;
@@ -268,7 +272,7 @@ private:
 	pod::TensorView mtp_emb_, mtp_xe_, mtp_e2_, mtp_hn_, mtp_h2_;   // [R, H] x3, [R * hc, H] x2 (fp16)
 	float* mtp_src_ = nullptr;          // [R, hc, H] staging of the hidden stacks of a step
 	float* mtp_hist_ = nullptr;         // [2 * (kDraftM + 1), hc, H] saved stacks
-	float* mtp_chain_ = nullptr;        // [hc, H] the previous step's output stack
+	float* mtp_chain_ = nullptr;        // [kSnapRows, hc, H] the previous step's output stacks (the rows a step was asked for)
 };
 
 } // namespace engine::models

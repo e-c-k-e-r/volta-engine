@@ -224,6 +224,26 @@ void ModelCluster::mtp_step( int slot, int pos0, int count, const int* tokens, i
 	} );
 }
 
+bool ModelCluster::mtp_joint() const {
+	return models_[0] != nullptr && models_[0]->mtp_joint();
+}
+
+void ModelCluster::mtp_step_rows( const pod::BatchRows& rows_in, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out ) {
+	pod::BatchRows rows = rows_in;
+	apply_mrope( rows );
+	pool_.run( [&]( int d ) {
+		models_[d]->mtp_step_rows( rows, tokens, hidden_mode, hist_row0, out_rows, n_out, streams_[d] );
+		backend::stream_sync( streams_[d] );
+	} );
+}
+
+void ModelCluster::mtp_gather_hist( const int* src_rows, int count ) {
+	pool_.run( [&]( int d ) {
+		models_[d]->mtp_gather_hist( src_rows, count, streams_[d] );
+		backend::stream_sync( streams_[d] );
+	} );
+}
+
 void ModelCluster::mtp_save_hist( int src_row, int rows, int dst_row ) {
 	pool_.run( [&]( int d ) {
 		models_[d]->mtp_save_hist( src_row, rows, dst_row, streams_[d] );

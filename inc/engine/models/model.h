@@ -17,6 +17,8 @@ namespace engine::models {
 // the three cannot disagree about how many rows a draft round has.
 static constexpr int kDraftM = 8;
 static constexpr int kDraftTopK = 16;   // dflash2.selector_top_k
+// Rows of per-row recurrent-state snapshots a speculative verify keeps: several slots' blocks share one forward (joint verify)
+static constexpr int kSnapRows = pod::MAX_BATCH;
 
 // Per-rank view of the target that the DFlash2 drafter reads. Filled once at init; every pointer is
 // stable for the model's lifetime, so a captured graph may bake them in.
@@ -174,6 +176,11 @@ public:
 	// last row's logits are left in row 0 of the logits buffer (sample / sample_topk read them).
 	virtual bool has_mtp() const { return false; }
 	virtual void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) { (void) rows; (void) tokens; (void) hidden_mode; (void) hist_row0; (void) logits_last; (void) stream; ENGINE_ASSERT( false, "model has no MTP head" ); }
+	// Joint rounds: rows of several slots in one head step, logits (and the chained stack) for the rows out_rows[0 .. n_out) only; hidden_mode 4 =
+	// the stacks staged by mtp_gather_hist. A model that cannot returns false from mtp_joint().
+	virtual bool mtp_joint() const { return false; }
+	virtual void mtp_step_rows( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, backend::stream_t stream = nullptr ) { (void) rows; (void) tokens; (void) hidden_mode; (void) hist_row0; (void) out_rows; (void) n_out; (void) stream; ENGINE_ASSERT( false, "model has no joint MTP step" ); }
+	virtual void mtp_gather_hist( const int* src_rows, int count, backend::stream_t stream = nullptr ) { (void) src_rows; (void) count; (void) stream; ENGINE_ASSERT( false, "model has no joint MTP step" ); }
 	virtual void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) { (void) src_row; (void) rows; (void) dst_row; (void) stream; ENGINE_ASSERT( false, "model has no MTP head" ); }
 
 	// 6. Output descriptors & tapped states

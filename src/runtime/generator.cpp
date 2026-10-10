@@ -43,7 +43,7 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 	num_slots_ = MIN( MIN( config_.max_batch_size, MAX_SLOTS ), cluster_.metadata().max_slots );
 	num_slots_ = MAX( num_slots_, 1 );
 	// Mode B uses m <= num_slots_; speculative verify uses m <= 7 draft rows
-	cluster_.warm_graphs( MAX( num_slots_, cluster_.has_speculator() ? 7 : 1 ) );
+	cluster_.warm_graphs( MAX( num_slots_, cluster_.has_speculator() ? ( cluster_.speculator().joint() ? pod::MAX_BATCH : 7 ) : 1 ) );   // joint rounds verify the blocks of several slots at once
 	LOG_INFO( "Generator ready: %d slots, speculation %s\n", num_slots_, cluster_.has_speculator() ? "on" : "off" );
 
 	const size_t cache_budget = static_cast<size_t>( std::max( 0, runtime::options().prefix_cache_gib ) ) << 30;
@@ -387,31 +387,42 @@ void Generator::step_batch() {
 	// decoding faster take a plain step together, alternating with the rounds.
 	const bool per_slot = cluster_.has_speculator() && cluster_.speculator().per_slot() && ( n == 1 || runtime::options().spec_interleave );
 	int spec_slot = -1;
-	// With several slots decoding, a plain step over all of them returns n tokens for little more than the cost of one, while a round returns
-	// a few tokens of one slot: compare the measured rates (and re-measure the unused side now and then)
-	bool agg_dense = false;
-	if ( per_slot && n >= 2 && n <= MAX_SLOTS ) {
-		const bool probe = ( ++agg_steps_ % 64 ) == 0;
-		agg_dense = dense_ms_n_[n] <= 0.0 || ( spec_tok_ms_ > 0.0 && n / dense_ms_n_[n] > spec_tok_ms_ * 1.1 );
-		if ( probe ) agg_dense = !agg_dense;
-	}
-	if ( per_slot && !agg_dense ) {
-		int e_ids[MAX_SLOTS], d_ids[MAX_SLOTS], ne = 0, nd = 0;
+	int e_ids[MAX_SLOTS], d_ids[MAX_SLOTS], ne = 0, nd = 0;
+	int group[MAX_SLOTS], ng = 0;   // slots of a joint round
+	if ( per_slot ) {
 		for ( int i = 0; i < n; ++i ) {
 			const int s = ids[i];
 			if ( cluster_.spec_owns( s ) && !slots_[s].ctrl.dense_mode() ) e_ids[ne++] = s;
 			else d_ids[nd++] = s;
 		}
+	}
+	const bool joint_rounds = per_slot && ne >= 2 && cluster_.speculator().joint() && runtime::options().spec_joint;
+	// With several slots decoding, a plain step over all of them returns n tokens for little more than the cost of one, while a round returns
+	// a few tokens of one slot (or of several, as a joint round): compare the measured rates (and re-measure the unused side now and then)
+	bool agg_dense = false;
+	if ( per_slot && n >= 2 && n <= MAX_SLOTS ) {
+		const bool probe = ( ++agg_steps_ % 64 ) == 0;
+		const double rate = spec_tok_ms_n_[joint_rounds ? ne : 1];
+		agg_dense = dense_ms_n_[n] <= 0.0 || ( rate > 0.0 && n / dense_ms_n_[n] > rate * 1.1 );
+		if ( probe ) agg_dense = !agg_dense;
+	}
+	if ( per_slot && !agg_dense ) {
 		// A slot in plain mode gets its probe round when its counter says so
 		for ( int i = 0; i < nd && spec_slot < 0; ++i ) {
 			if ( cluster_.spec_owns( d_ids[i] ) && slots_[d_ids[i]].ctrl.use_spec() ) spec_slot = d_ids[i];
 		}
 		if ( spec_slot < 0 && ne > 0 && ( nd == 0 || spec_turn_ ) ) {
-			spec_slot = e_ids[0];
-			for ( int i = 0; i < ne; ++i ) {
-				if ( e_ids[i] > spec_rr_ ) { spec_slot = e_ids[i]; break; }
+			if ( joint_rounds ) {
+				for ( int i = 0; i < ne; ++i ) group[ng++] = e_ids[i];
+				spec_slot = group[0];
 			}
-			spec_rr_ = spec_slot;
+			else {
+				spec_slot = e_ids[0];
+				for ( int i = 0; i < ne; ++i ) {
+					if ( e_ids[i] > spec_rr_ ) { spec_slot = e_ids[i]; break; }
+				}
+				spec_rr_ = spec_slot;
+			}
 			spec_turn_ = ( nd == 0 );
 		}
 		else if ( spec_slot < 0 ) {
@@ -427,6 +438,43 @@ void Generator::step_batch() {
 		}
 	}
 
+	if ( ng >= 2 ) {
+		// Joint round: one draft chain and one verify forward for the blocks of every eligible slot
+		int anchors[MAX_SLOTS], poss[MAX_SLOTS];
+		const SamplingParams* sps[MAX_SLOTS];
+		Rng* rngs[MAX_SLOTS];
+		SpecResult res[MAX_SLOTS];
+		for ( int i = 0; i < ng; ++i ) {
+			Slot& sl = slots_[group[i]];
+			anchors[i] = sl.last_token;
+			poss[i] = sl.current_pos;
+			sps[i] = &sl.sp;
+			rngs[i] = &sl.rng;
+		}
+		const auto t0 = std::chrono::steady_clock::now();
+		cluster_.speculator().speculate_joint( ng, group, anchors, poss, sps, rngs, res );
+		const double round_ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
+		int total_tokens = 0;
+		for ( int i = 0; i < ng; ++i ) total_tokens += res[i].emitted_count;
+		if ( round_ms > 0.0 ) spec_tok_ms_n_[ng] = spec_tok_ms_n_[ng] > 0.0 ? 0.8 * spec_tok_ms_n_[ng] + 0.2 * ( total_tokens / round_ms ) : total_tokens / round_ms;
+		for ( int i = 0; i < ng; ++i ) {
+			const int s = group[i];
+			Slot& slot = slots_[s];
+			slot.ctrl.observe_spec( res[i].emitted_count, round_ms / ng );
+			slot.current_pos = res[i].next_pos;
+			slot.last_token = res[i].emitted[res[i].emitted_count - 1];
+			{
+				std::unique_lock<std::mutex> mlock( metrics_mtx_ );
+				spec_proposals_ += res[i].proposed;
+				spec_accepted_ += res[i].accepted;
+			}
+			for ( int t = 0; t < res[i].emitted_count; ++t ) {
+				if ( emit_token( s, res[i].emitted[t] ) ) break;
+			}
+		}
+		return;
+	}
+
 	const bool single_spec = ( n == 1 && cluster_.spec_owns( ids[0] ) );
 	if ( per_slot ? ( spec_slot >= 0 ) : ( single_spec && slots_[ids[0]].ctrl.use_spec() ) ) {
 		// Case A: single request that owns the drafter context, DFlash2 speculative round (Mode A
@@ -437,7 +485,7 @@ void Generator::step_batch() {
 		const SpecResult r = cluster_.speculate( s, slot.last_token, slot.current_pos, -1.0f, &slot.sp, &slot.rng );
 		const double round_ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
 		slot.ctrl.observe_spec( r.emitted_count, round_ms );
-		if ( per_slot && round_ms > 0.0 ) spec_tok_ms_ = spec_tok_ms_ > 0.0 ? 0.8 * spec_tok_ms_ + 0.2 * ( r.emitted_count / round_ms ) : r.emitted_count / round_ms;
+		if ( per_slot && round_ms > 0.0 ) spec_tok_ms_n_[1] = spec_tok_ms_n_[1] > 0.0 ? 0.8 * spec_tok_ms_n_[1] + 0.2 * ( r.emitted_count / round_ms ) : r.emitted_count / round_ms;
 		slot.current_pos = r.next_pos;
 		slot.last_token = r.emitted[r.emitted_count - 1];
 		{

@@ -115,6 +115,10 @@ public:
 	// MTP head steps on all ranks (see ModelPipeline::mtp_step); positions pos0 .. pos0 + count - 1 of `slot`, tokens[j] follows position pos0 + j.
 	void mtp_step( int slot, int pos0, int count, const int* tokens, int hidden_mode, int hist_row0, bool logits_last );
 	void mtp_save_hist( int src_row, int rows, int dst_row );
+	// Joint rounds (see ModelPipeline::mtp_step_rows): rows of several slots in one head step, logits for rows out_rows[0 .. n_out) only
+	bool mtp_joint() const;
+	void mtp_step_rows( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out );
+	void mtp_gather_hist( const int* src_rows, int count );
 
 	// Runs fn( rank ) on every rank's pinned worker thread and waits for all of them.
 	void run_ranks( const std::function<void( int )>& fn ) { pool_.run( fn ); }
