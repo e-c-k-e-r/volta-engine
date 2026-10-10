@@ -36,6 +36,11 @@ main { display:grid; grid-template-columns:repeat(12, 1fr); gap:12px; padding:12
 .c12 { grid-column:span 12; } .c8 { grid-column:span 8; } .c6 { grid-column:span 6; } .c4 { grid-column:span 4; } .c3 { grid-column:span 3; }
 @media (max-width:1100px) { .c8,.c6,.c4,.c3 { grid-column:span 12; } }
 canvas { width:100%; display:block; }
+nav { display:flex; gap:2px; margin-left:6px; }
+nav button { border-radius:3px 3px 0 0; color:var(--dim); }
+nav button.on { color:var(--fg); border-color:var(--info); background:var(--bg); }
+.pane { display:none; grid-column:1 / -1; grid-template-columns:repeat(12, 1fr); gap:12px; align-items:start; }
+.pane.on { display:grid; }
 .big { font-size:22px; line-height:1.1; }
 .tiles { display:grid; grid-template-columns:repeat(auto-fill, minmax(118px, 1fr)); gap:8px; }
 .tile { border:1px solid var(--line); border-radius:3px; padding:5px 8px; }
@@ -72,12 +77,15 @@ tr:hover td { background:rgba(128,128,128,.08); }
 	<span class="chip" id="h-kv">kv <b>-</b></span>
 	<span class="chip" id="h-up">up <b>-</b></span>
 	<span class="chip" id="h-conn">link <b>-</b></span>
+	<span class="chip" id="h-live">now <b>-</b></span>
+	<nav id="tabs"><button data-tab="overview">overview</button><button data-tab="requests">requests</button><button data-tab="model">model</button><button data-tab="system">system</button></nav>
 	<span class="sp"></span>
 	<select id="interval" title="refresh"><option value="1000">1 s</option><option value="2000">2 s</option><option value="5000">5 s</option></select>
 	<button id="pause">pause</button>
 	<button id="theme">theme</button>
 </header>
 <main>
+	<div class="pane" id="tab-overview">
 	<section class="card c8">
 		<h2>Throughput <small id="thr-now"></small></h2>
 		<canvas id="ch-thr" height="170"></canvas>
@@ -93,25 +101,41 @@ tr:hover td { background:rgba(128,128,128,.08); }
 		<table id="slots"><thead><tr><th>slot</th><th>phase</th><th>request</th><th>context</th><th style="width:28%">fill</th><th>prompt</th><th>cached</th><th>generated</th><th>tok/s</th><th>age</th></tr></thead><tbody></tbody></table>
 	</section>
 
+	</div>
+
+	<div class="pane" id="tab-system">
 	<section class="card c12">
 		<h2>GPUs <small id="gpu-note"></small></h2>
 		<div class="gpus" id="gpus"></div>
 	</section>
+	<section class="card c12">
+		<h2>Host</h2>
+		<div class="tiles" id="host"></div>
+		<canvas id="ch-cpu" height="90" style="margin-top:8px"></canvas>
+	</section>
+	</div>
 
-	<section class="card c6">
+	<div class="pane" id="tab-requests">
+	<section class="card c8">
+		<h2>Recent requests</h2>
+		<table id="recent"><thead><tr><th>request</th><th>ago</th><th>prompt</th><th>cached</th><th>generated</th><th>ttft</th><th>total</th><th>tok/s</th><th>end</th></tr></thead><tbody></tbody></table>
+	</section>
+	<section class="card c4">
+		<h2>Prefix cache</h2>
+		<div class="tiles" id="prefix"></div>
+	</section>
+	<section class="card c12">
 		<h2>Token gap <small>time between bursts of tokens a client sees, last <span id="gap-n">0</span> samples</small></h2>
 		<div class="tiles" id="gap-tiles"></div>
 		<canvas id="ch-gap" height="110" style="margin-top:8px"></canvas>
 	</section>
-	<section class="card c3">
+	</div>
+
+	<div class="pane" id="tab-model">
+	<section class="card c12">
 		<h2>Speculation</h2>
 		<div class="tiles" id="spec"></div>
 	</section>
-	<section class="card c3">
-		<h2>Prefix cache</h2>
-		<div class="tiles" id="prefix"></div>
-	</section>
-
 	<section class="card c12">
 		<h2>Experts <small id="exp-note"></small>
 			<span><select id="exp-mode"><option value="recent">recent (about a minute)</option><option value="total">since boot</option></select></span></h2>
@@ -133,15 +157,7 @@ tr:hover td { background:rgba(128,128,128,.08); }
 		</div>
 	</section>
 
-	<section class="card c8">
-		<h2>Recent requests</h2>
-		<table id="recent"><thead><tr><th>request</th><th>ago</th><th>prompt</th><th>cached</th><th>generated</th><th>ttft</th><th>total</th><th>tok/s</th><th>end</th></tr></thead><tbody></tbody></table>
-	</section>
-	<section class="card c4">
-		<h2>Host</h2>
-		<div class="tiles" id="host"></div>
-		<canvas id="ch-cpu" height="90" style="margin-top:8px"></canvas>
-	</section>
+	</div>
 </main>
 <div id="tip"></div>
 <script>
@@ -223,6 +239,7 @@ function render(s) {
 
 	const h = s.history, last = (a) => a.length ? a[a.length - 1] : 0;
 	const nowDec = last(h.decode), nowPf = last(h.prefill);
+	$('h-live').innerHTML = 'now <b>' + fmt(nowDec, 0) + ' tok/s</b> &middot; <b>' + (s.slots.filter((x) => x.phase !== 'idle').length) + '</b> busy';
 	$('thr-now').innerHTML = '<span class="big" style="color:var(--good)">' + fmt(nowDec, 1) + '</span> decode &nbsp; <span class="big" style="color:var(--info)">' + fmt(nowPf, 0) + '</span> prefill tok/s';
 	const span = h.t.length ? h.t[h.t.length - 1] - h.t[0] : 0;
 	lineChart($('ch-thr'), [{ data: h.decode, color: '--good', fill: true }, { data: h.prefill, color: '--info' }, { data: h.active.map((v) => v * Math.max(1, Math.max(...h.decode, ...h.prefill) / Math.max(1, sv.slots)) * 0.4), color: '--dim', width: 1 }],
@@ -379,6 +396,14 @@ $('ch-heat').addEventListener('mouseleave', () => { $('tip').style.display = 'no
 $('exp-mode').addEventListener('change', renderExperts);
 
 // ---- controls ----
+function tab(name) {
+	if (!$('tab-' + name)) name = 'overview';
+	for (const p of document.querySelectorAll('.pane')) p.classList.toggle('on', p.id === 'tab-' + name);
+	for (const b of document.querySelectorAll('#tabs button')) b.classList.toggle('on', b.dataset.tab === name);
+	localStorage.setItem('volta-tab', name); history.replaceState(null, '', '#' + name);
+	if (stats) render(stats); renderExperts();   // hidden canvases have no width: draw this pane now
+}
+for (const b of document.querySelectorAll('#tabs button')) b.addEventListener('click', () => tab(b.dataset.tab));
 function schedule() {
 	clearInterval(timer); clearInterval(expTimer);
 	const iv = parseInt($('interval').value);
@@ -395,6 +420,7 @@ window.addEventListener('resize', () => { if (stats) render(stats); renderExpert
 (function init() {
 	const t = localStorage.getItem('volta-theme'); if (t) document.documentElement.setAttribute('data-theme', t);
 	const iv = localStorage.getItem('volta-interval'); if (iv) $('interval').value = iv;
+	tab(location.hash.slice(1) || localStorage.getItem('volta-tab') || 'overview');
 	schedule(); poll(); pollExperts();
 })();
 </script>
