@@ -50,6 +50,7 @@ static_checks() {
 	cmake -S $ROOT -B $ROOT/build_vk -G Ninja -DENGINE_BACKEND=VULKAN > $out/vk_cmake.log 2>&1 && ninja -C $ROOT/build_vk test_vulkan_smoke test_vulkan_ref test_ops_linear test_ops_attention test_ops_moe test_ops_flash test_ops_vision test_vulkan_forward > $out/vk_build.log 2>&1 || { echo "Vulkan configuration FAILED (see $out/vk_*.log)"; bad=1; }
 	# Slang-generated SPIR-V must validate
 	for f in slang/*.spv(N); do spirv-val $f > $out/$f:t.log 2>&1 || { echo "spirv-val FAILED: $f"; bad=1; }; done
+	for f in $ROOT/build_vk/slang/*.spv(N); do spirv-val $f > $out/vk_$f:t.log 2>&1 || { echo "spirv-val FAILED: $f"; bad=1; }; done
 	return $bad
 }
 
