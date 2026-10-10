@@ -86,6 +86,10 @@ struct KvBParams { uint64_t x, w, k_out, v_out; int num_heads, head_dim; };
 struct DsaScoreParams { uint64_t q, w, pool_plane, scores, slots, pos; int score_stride, layer, max_seq; int64_t pool_slot_stride; float norm; };
 struct KdaSmallParams { uint64_t x, b_proj, f_a_proj, g_a_proj, beta, f_a_buf, g_a_buf; int hidden, has_b, has_fa, has_ga; };
 struct KdaBigParams { uint64_t f_a_buf, g_a_buf, f_b_proj, g_b_proj, A_log, dt_bias, g_decay, z_out; int channels, has_fb, has_gb, has_a, has_dt; };
+struct RouterPartialsParams { uint64_t x, w, partials; int hidden, num_experts, slices, max_slices; };
+struct CombinePartsParams { uint64_t parts, w, shared_out, out_; int hidden, top_k, has_shared; };
+struct SelectRouterParams { uint64_t partials, bias, topk_idx, topk_w; int num_experts, top_k, k_slices, max_slices; float scale; int has_bias; };
+struct AccumParams { uint64_t accum, expert_out; float weight; int n; };
 struct KdaStepParams { uint64_t state, qkv, g_decay, beta, z, o_norm, out_, slots, snap, snap_on; int64_t slot_stride, snap_stride; int num_heads, has_norm, has_z, has_o_norm, decay_first, snap_rows, rows; float eps; };
 } // namespace engine::backend::impl
 

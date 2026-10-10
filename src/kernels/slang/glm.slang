@@ -333,3 +333,36 @@ void kda_step(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform KdaS
 		GroupMemoryBarrierWithGroupSync();
 	}
 }
+
+// ---------------------------------------------------------------- MoE router (GLM sigmoid routing) and combine
+
+struct RouterPartialsParams { half* x; half* w; float* partials; int hidden; int num_experts; int slices; int max_slices; };
+
+// partials[(row * max_slices + ks) * 288 + e] = sum over the 128 dims of slice ks of x[row][d] * w[d][e] (router_select sums the slices in ascending order). Thread (e, ks, row)
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void router_partials(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform RouterPartialsParams p) {
+	let e = int(gid.x) * 64 + int(tid.x);
+	let ks = int(gid.y);
+	let r = int(gid.z);
+	if (e >= p.num_experts) return;
+	float acc = 0.0f;
+	for (int j = 0; j < 128; ++j) {
+		let d = ks * 128 + j;
+		acc += float(p.x[int64_t(r) * p.hidden + d]) * float(p.w[int64_t(d) * p.num_experts + e]);
+	}
+	p.partials[(int64_t(r) * p.max_slices + ks) * 288 + e] = acc;
+}
+
+struct CombinePartsParams { half* parts; half* w; half* shared_out; half* out_; int hidden; int top_k; int has_shared; };
+
+// out[d] = shared[d] + sum_k parts[k][d] * w[k], in route order, rounded to fp16 once
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void moe_combine_parts(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform CombinePartsParams p) {
+	let d = int(gid.x) * 256 + int(tid.x);
+	if (d >= p.hidden) return;
+	float sum = p.has_shared != 0 ? float(p.shared_out[d]) : 0.0f;
+	for (int k = 0; k < p.top_k; ++k) sum = float(p.parts[int64_t(k) * p.hidden + d]) * float(p.w[k]) + sum;
+	p.out_[d] = half(sum);
+}

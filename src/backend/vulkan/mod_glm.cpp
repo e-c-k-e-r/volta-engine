@@ -9,6 +9,8 @@
 #include "engine/modules/gdn.h"
 #include "engine/modules/linear.h"
 #include "engine/modules/mla.h"
+#include "engine/modules/moe.h"
+#include "engine/backend/numeric.h"
 #include <cmath>
 
 namespace engine::modules {
@@ -145,6 +147,36 @@ void GDN::recurrent_step_kda_rows( float* gdn_state, const pod::TensorView& qkv,
 	float* snap, size_t snap_stride, int snap_rows, const int* snap_on, backend::stream_t stream ) {
 	ENGINE_ASSERT( head_dim == 128, "GDN::recurrent_step_kda_rows: head_dim must be 128" );
 	kda_launch( gdn_state, qkv, g_decay, beta, z, o_norm, attn_out, num_heads, eps, rows, vki::rows_slot( d_rows ), slot_stride, snap, snap_stride, snap_rows, snap_on, true, true, stream );
+}
+
+// ---------------------------------------------------------------- MoE router (sigmoid routing) and combine
+
+void MoERouter::route_topk( const pod::TensorView& x, const pod::TensorView& router_weights, const pod::TensorView& e_score_bias, int* d_topk_indices, backend::half_t* d_topk_weights,
+	int hidden_size, int num_experts, int top_k, float routed_scaling_factor, backend::stream_t stream, int rows ) {
+	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS, "MoERouter::route_topk: rows out of range" );
+	ENGINE_ASSERT( top_k <= 16 && num_experts <= 288 && hidden_size % 128 == 0, "MoERouter::route_topk: top_k / num_experts / hidden_size out of range" );
+	const int slices = hidden_size / 128;
+	float* partials = static_cast<float*>( vki::scratch( 15, static_cast<size_t>( rows ) * slices * 288 * sizeof( float ), stream ) );
+	vki::RouterPartialsParams pa{ vki::dp( x.data ), vki::dp( router_weights.data ), vki::dp( partials ), hidden_size, num_experts, slices, slices };
+	vki::launch( "router_partials", pa, stream, tiles( num_experts, 64 ), slices, rows );
+	vki::SelectRouterParams ps{ vki::dp( partials ), vki::dp( e_score_bias.data ), vki::dp( d_topk_indices ), vki::dp( d_topk_weights ), num_experts, top_k, slices, slices,
+		routed_scaling_factor, e_score_bias.data != nullptr ? 1 : 0 };
+	vki::launch( "router_select", ps, stream, rows );
+}
+
+void MoERouter::combine( const backend::half_t* expert_parts, const backend::half_t* topk_weights, const backend::half_t* shared_out, backend::half_t* output, int hidden_size, int top_k,
+	backend::stream_t stream ) {
+	vki::CombinePartsParams p{ vki::dp( expert_parts ), vki::dp( topk_weights ), vki::dp( shared_out ), vki::dp( output ), hidden_size, top_k, shared_out != nullptr ? 1 : 0 };
+	vki::launch( "moe_combine_parts", p, stream, tiles( hidden_size, 256 ) );
+}
+
+void MoERouter::accumulate( backend::half_t* accum_out, const backend::half_t* expert_out, backend::half_t weight, int hidden_size, backend::stream_t stream ) {
+	vki::AccumParams p{ vki::dp( accum_out ), vki::dp( expert_out ), backend::to_float( weight ), hidden_size };
+	vki::launch( "moe_accumulate", p, stream, tiles( hidden_size, 256 ) );
+}
+
+void MoERouter::accumulate( pod::TensorView& accum_out, const pod::TensorView& expert_out, backend::half_t weight, int hidden_size, backend::stream_t stream ) {
+	accumulate( accum_out.ptr<backend::half_t>(), expert_out.ptr<const backend::half_t>(), weight, hidden_size, stream );
 }
 
 } // namespace engine::modules

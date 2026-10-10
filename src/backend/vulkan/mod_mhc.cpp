@@ -46,6 +46,12 @@ void HyperConnection::collapse(
 	vki::launch( "hc_mix_finalize", pf, stream, 1, rows );
 }
 
+// The fused collapse + RMSNorm is a CUDA launch; false (nothing launched) makes the caller run collapse + RMSNorm::forward, which is the same arithmetic
+bool HyperConnection::collapse_norm( const pod::TensorView&, const pod::TensorView&, const pod::TensorView&, const pod::TensorView&, const pod::TensorView&, pod::TensorView&,
+	pod::TensorView&, pod::TensorView&, pod::TensorView&, pod::TensorView&, pod::TensorView&, int, int, float, float, float, backend::stream_t, int ) {
+	return false;
+}
+
 void HyperConnection::update( pod::TensorView& streams, const pod::TensorView& sublayer_out, const pod::TensorView& post, const pod::TensorView& comb, int hidden_size, backend::stream_t stream, int rows ) {
 	update( streams.ptr<float>(), streams.ptr<const float>(), sublayer_out.ptr<const backend::half_t>(), post.ptr<const float>(), comb.ptr<const float>(), hidden_size, stream, rows );
 }

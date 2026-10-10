@@ -137,6 +137,19 @@ int main( int argc, char** argv ) {
 		}
 	}
 
+	{ // accumulate (accum += w * expert_out) and combine (shared + sum_k w[k] * part[k])
+		auto accum = upload_half( uniform_vec( rng, H, 1.0f ), { H } );
+		auto eo = upload_half( uniform_vec( rng, H, 1.0f ), { H } );
+		modules::MoERouter::accumulate( accum.ptr<half_t>(), eo.ptr<const half_t>(), backend::from_float_half( 0.375f ), H, nullptr );
+		cases.push_back( { "accumulate", download_half( accum.data, H ) } );
+		auto parts = upload_half( uniform_vec( rng, static_cast<size_t>( TOPK ) * H, 1.0f ), { TOPK, H } );
+		auto wts = upload_half( uniform_vec( rng, TOPK, 0.5f ), { TOPK } );
+		auto shared = upload_half( uniform_vec( rng, H, 1.0f ), { H } );
+		auto comb = upload_half( std::vector<float>( H, 0.0f ), { H } );
+		modules::MoERouter::combine( parts.ptr<const half_t>(), wts.ptr<const half_t>(), shared.ptr<const half_t>(), comb.ptr<half_t>(), H, TOPK, nullptr );
+		cases.push_back( { "combine", download_half( comb.data, H ) } );
+	}
+
 	bool pass = true;
 	if ( args.dump ) {
 		for ( const auto& c : cases ) pass = golden_write( args.dir, "moe_" + c.name, c.out.data(), c.out.size() * sizeof( float ) ) && pass;
