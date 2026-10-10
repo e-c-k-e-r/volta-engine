@@ -127,5 +127,7 @@ Prefill profile after that (8K tokens, one GPU): persistent 4-bit MoE kernel 28%
 
 The QSA sparse attention for prefill rows (more than 8 rows) now runs on the tensor-core prefill kernel (`attn_prefill_tc_kernel<..., SP = true>`: one block per row and kv head, the keys gathered through the row's top-k list, same fp16 P / fp32 accumulate as the dense prefill path); the fp32 one-key-at-a-time kernel (about 25% of prefill) stays for decode-sized calls: prefill 767 -> 981 tok/s (8K), 12K needle 962 tok/s, 32K needle 927 tok/s (was 279). Needles at 12K and 32K, prefix restore and the API suite with MTP pass.
 
+Persistent prefill MoE kernel, looked at and left alone: 3.4 ms per call at any row count up to ~256 (128 experts x 3 matrices, all touched), 8 co-resident groups are the best split (2 groups 6.1 ms, 4 groups 4.9, 8 groups 4.7 at 512 rows); a dense GEMM of one 0.8 MB expert matrix takes ~12 us on its own (latency-bound), so 26 us per expert for three matrices is already better than serial dense calls. Cutting it further needs a grouped GEMM that schedules (expert, tile) items over all SMs; larger chunks would also amortize it (512 -> 2048 rows: 8.7 -> 5.8 us per row) but the row limit is global.
+
 Next: a GEMV for the N=640 shared-expert shapes, a tensor-core QSA scorer and sparse
 kernel, the SASS / bench baselines and the 256K needle.

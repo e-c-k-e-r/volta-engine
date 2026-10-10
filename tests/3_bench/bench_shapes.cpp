@@ -42,6 +42,7 @@ int main() {
 	engine::modules::trellis_get_locks( 0 );
 
 	const impl::Shape shapes[] = {
+		{ "flash expert g/u", 2560, 640, 4 }, { "flash expert down", 640, 2560, 4 },
 		{ "glm k4096 n6144", 4096, 6144, 5 }, { "glm k4096 n4096", 4096, 4096, 5 }, { "glm k2048 n4096", 2048, 4096, 5 },
 		{ "glm k1536 n4096", 1536, 4096, 5 }, { "glm k4096 n2048", 4096, 2048, 5 }, { "glm k4096 n1536", 4096, 1536, 5 },
 		{ "glm k4096 n512", 4096, 512, 5 },
