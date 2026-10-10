@@ -36,6 +36,13 @@ struct GatedResidual {
 		const backend::half_t* prev_y = nullptr
 	);
 
+	// mix() through the row-tile kernels whatever the row count (the CUDA decode path streams the weights with other kernels; the test compares the two)
+	static void mix_reference(
+		const float* x, const backend::half_t* norm_w, const backend::half_t* down, const backend::half_t* up, const backend::half_t* inject,
+		backend::half_t* mixed, float* post, float* scratch, int rows, int hidden, int hc, int rank, float eps, backend::stream_t stream,
+		const float* prev_post = nullptr, const backend::half_t* prev_y = nullptr
+	);
+
 	// Tensor-core variant of mix() for many rows, composed by the caller. The fp32 operands are split into fp16 hi / lo halves and every product is two fp16 GEMMs
 	// accumulated in fp32 (fp32-class accuracy):
 	//   norm():        the norm pass of mix() (with the folded deferred apply), also writing normed as fp16 hi / lo when normed_hi is set
