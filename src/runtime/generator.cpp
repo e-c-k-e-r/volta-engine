@@ -382,15 +382,62 @@ void Generator::step_batch() {
 	}
 	if ( n == 0 ) return;
 
+	// Per-slot speculators (MTP): any number of slots keep a context, and one slot's round runs per step (a round costs about a plain
+	// step, so interleaving rounds returns more tokens per GPU-ms than a batched plain step). Slots whose controller found plain
+	// decoding faster take a plain step together, alternating with the rounds.
+	const bool per_slot = cluster_.has_speculator() && cluster_.speculator().per_slot() && ( n == 1 || runtime::options().spec_interleave );
+	int spec_slot = -1;
+	// With several slots decoding, a plain step over all of them returns n tokens for little more than the cost of one, while a round returns
+	// a few tokens of one slot: compare the measured rates (and re-measure the unused side now and then)
+	bool agg_dense = false;
+	if ( per_slot && n >= 2 && n <= MAX_SLOTS ) {
+		const bool probe = ( ++agg_steps_ % 64 ) == 0;
+		agg_dense = dense_ms_n_[n] <= 0.0 || ( spec_tok_ms_ > 0.0 && n / dense_ms_n_[n] > spec_tok_ms_ * 1.1 );
+		if ( probe ) agg_dense = !agg_dense;
+	}
+	if ( per_slot && !agg_dense ) {
+		int e_ids[MAX_SLOTS], d_ids[MAX_SLOTS], ne = 0, nd = 0;
+		for ( int i = 0; i < n; ++i ) {
+			const int s = ids[i];
+			if ( cluster_.spec_owns( s ) && !slots_[s].ctrl.dense_mode() ) e_ids[ne++] = s;
+			else d_ids[nd++] = s;
+		}
+		// A slot in plain mode gets its probe round when its counter says so
+		for ( int i = 0; i < nd && spec_slot < 0; ++i ) {
+			if ( cluster_.spec_owns( d_ids[i] ) && slots_[d_ids[i]].ctrl.use_spec() ) spec_slot = d_ids[i];
+		}
+		if ( spec_slot < 0 && ne > 0 && ( nd == 0 || spec_turn_ ) ) {
+			spec_slot = e_ids[0];
+			for ( int i = 0; i < ne; ++i ) {
+				if ( e_ids[i] > spec_rr_ ) { spec_slot = e_ids[i]; break; }
+			}
+			spec_rr_ = spec_slot;
+			spec_turn_ = ( nd == 0 );
+		}
+		else if ( spec_slot < 0 ) {
+			spec_turn_ = true;
+		}
+		if ( spec_slot >= 0 ) {
+			ids[0] = spec_slot;
+			n = 1;
+		}
+		else {
+			for ( int i = 0; i < nd; ++i ) ids[i] = d_ids[i];
+			n = nd;
+		}
+	}
+
 	const bool single_spec = ( n == 1 && cluster_.spec_owns( ids[0] ) );
-	if ( single_spec && slots_[ids[0]].ctrl.use_spec() ) {
+	if ( per_slot ? ( spec_slot >= 0 ) : ( single_spec && slots_[ids[0]].ctrl.use_spec() ) ) {
 		// Case A: single request that owns the drafter context, DFlash2 speculative round (Mode A
 		// causal verify block). A slot that lost ownership to a newer request decodes normally.
 		const int s = ids[0];
 		Slot& slot = slots_[s];
 		const auto t0 = std::chrono::steady_clock::now();
 		const SpecResult r = cluster_.speculate( s, slot.last_token, slot.current_pos, -1.0f, &slot.sp, &slot.rng );
-		slot.ctrl.observe_spec( r.emitted_count, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
+		const double round_ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
+		slot.ctrl.observe_spec( r.emitted_count, round_ms );
+		if ( per_slot && round_ms > 0.0 ) spec_tok_ms_ = spec_tok_ms_ > 0.0 ? 0.8 * spec_tok_ms_ + 0.2 * ( r.emitted_count / round_ms ) : r.emitted_count / round_ms;
 		slot.current_pos = r.next_pos;
 		slot.last_token = r.emitted[r.emitted_count - 1];
 		{
@@ -425,7 +472,16 @@ void Generator::step_batch() {
 			if ( !sl.sp.greedy() ) preds[i] = sample_token( cs[i], sl.sp, sl.rng );
 		}
 	}
-	if ( single_spec ) {
+	if ( per_slot ) {
+		// Plain-step cost per token, for the slots that keep a speculator context (compared with their rounds' tokens per ms)
+		const double total_ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - dense_t0 ).count();
+		const double ms = total_ms / n;
+		for ( int i = 0; i < n; ++i ) {
+			if ( cluster_.spec_owns( ids[i] ) ) slots_[ids[i]].ctrl.observe_dense( ms );
+		}
+		if ( n <= MAX_SLOTS ) dense_ms_n_[n] = dense_ms_n_[n] > 0.0 ? 0.7 * dense_ms_n_[n] + 0.3 * total_ms : total_ms;
+	}
+	else if ( single_spec ) {
 		slots_[ids[0]].ctrl.observe_dense( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - dense_t0 ).count() );
 	}
 	if ( cluster_.has_speculator() ) {

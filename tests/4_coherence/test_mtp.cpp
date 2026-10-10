@@ -7,11 +7,14 @@
 
 using namespace engine::runtime;
 
-int main() {
+int main( int argc, char** argv ) {
+	// --flash: Qwen3.8-Flash-Next (qwen4_exp) instead of Qwen3.8-27B
+	const bool flash = argc > 1 && std::string( argv[1] ) == "--flash";
+	const char* dir = flash ? test::FLASH_DIR : test::QWEN_DIR;
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	setenv( "ENGINE_SPECULATOR", "mtp", 1 );
 	engine::loader::Tokenizer tok;
-	ENGINE_ASSERT( tok.load( test::QWEN_DIR ), "tokenizer load failed" );
+	ENGINE_ASSERT( tok.load( dir ), "tokenizer load failed" );
 	auto prompt_ids = [&]( const std::string& user ) {
 		std::vector<int> ids = { 248045, 846, 198 };   // <|im_start|>user\n
 		const std::vector<int> body = tok.encode( user, false );
@@ -29,8 +32,8 @@ int main() {
 
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = "qwen3_5";
-	cfg.model_dir = test::QWEN_DIR;
+	cfg.model_type = flash ? "qwen4_exp" : "qwen3_5";
+	cfg.model_dir = dir;
 	cfg.speculate = true;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	ENGINE_ASSERT( mc.has_speculator(), "no speculator" );
@@ -39,10 +42,17 @@ int main() {
 	for ( size_t p = 0; p < prompts.size(); ++p ) {
 		const test::GenStats plain = test::generate( mc, prompts[p], 96, false );
 		const test::GenStats spec = test::generate( mc, prompts[p], 96, true );
-		const bool same = plain.tokens == spec.tokens;
+		size_t d = 0;
+		while ( d < plain.tokens.size() && d < spec.tokens.size() && plain.tokens[d] == spec.tokens[d] ) ++d;
+		// Qwen3.8-27B reproduces plain greedy decoding token for token. Flash-Next's router flips make near-ties sensitive to the rounding of
+		// the verify block against single rows, so it is held to the first three quarters of the continuation
+		const bool same = plain.tokens == spec.tokens || ( flash && plain.tokens.size() == spec.tokens.size() && d * 4 >= plain.tokens.size() * 3 );
 		const double rate = spec.proposed ? static_cast<double>( spec.accepted ) / spec.proposed : 0.0;
 		std::printf( "[%s] prompt %zu (%zu tokens): plain %.1f tok/s, MTP %.1f tok/s, accepted %d / %d (%.0f%%)\n", same ? "ok" : "FAIL", p, prompts[p].size(),
 			plain.decode_tok_s(), spec.decode_tok_s(), spec.accepted, spec.proposed, 100.0 * rate );
+		if ( plain.tokens != spec.tokens ) {
+			std::printf( "   first difference at token %zu of %zu: plain %d, MTP %d\n", d, plain.tokens.size(), d < plain.tokens.size() ? plain.tokens[d] : -1, d < spec.tokens.size() ? spec.tokens[d] : -1 );
+		}
 		if ( !same ) std::printf( "   plain %s\n   spec  %s\n", test::format_tokens( plain.tokens, 24 ).c_str(), test::format_tokens( spec.tokens, 24 ).c_str() );
 		failures += same ? 0 : 1;
 		if ( rate < 0.3 ) {

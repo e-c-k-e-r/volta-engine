@@ -154,7 +154,7 @@ bool Qwen3_5Pipeline::init(
 		mtp_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 		int fc_shape[2] = { R, 2 * config_.hidden_size / tp_size };
 		mtp_in_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, fc_shape, 2 );
-		int hist_shape[2] = { 2 * ( kDraftM + 1 ), config_.hidden_size };
+		int hist_shape[2] = { config_.max_slots * 2 * ( kDraftM + 1 ), config_.hidden_size };   // a region per slot (the runner offsets by slot)
 		mtp_hist_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, hist_shape, 2 );
 		int chain_shape[2] = { 1, config_.hidden_size };
 		mtp_chain_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, chain_shape, 2 );
@@ -945,7 +945,7 @@ void Qwen3_5Pipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, i
 
 // Keeps rows [src_row, src_row + rows) of the last forward's final-norm hidden for later MTP steps (row dst_row onwards)
 void Qwen3_5Pipeline::mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream ) {
-	ENGINE_ASSERT( mtp_on_ && rows >= 1 && dst_row + rows <= 2 * ( kDraftM + 1 ), "Qwen3_5Pipeline::mtp_save_hist: rows out of range" );
+	ENGINE_ASSERT( mtp_on_ && rows >= 1 && dst_row + rows <= config_.max_slots * 2 * ( kDraftM + 1 ), "Qwen3_5Pipeline::mtp_save_hist: rows out of range" );
 	backend::set_device( rank_ );
 	const size_t row_bytes = static_cast<size_t>( config_.hidden_size ) * sizeof( backend::half_t );
 	backend::memcpy_async( mtp_hist_.ptr<char>() + static_cast<size_t>( dst_row ) * row_bytes, norm_hidden_.ptr<const char>() + static_cast<size_t>( src_row ) * row_bytes,

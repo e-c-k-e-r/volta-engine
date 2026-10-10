@@ -166,6 +166,11 @@ private:
 	std::atomic<bool> running_{ false };
 
 	static constexpr int MAX_SLOTS = 8;
+	int spec_rr_ = 0;          // per-slot speculators: the slot after which the next round is looked for
+	bool spec_turn_ = true;
+	double spec_tok_ms_ = 0.0;                 // per-slot speculators: EMA of tokens per ms over rounds (0 = unmeasured)
+	double dense_ms_n_[9] = {};                // per-slot speculators: EMA of a plain step over n slots (0 = unmeasured)
+	unsigned agg_steps_ = 0;    // per-slot speculators: alternate a round with a plain step of the slots that do not speculate
 	int num_slots_ = 1;
 	Slot slots_[MAX_SLOTS];
 

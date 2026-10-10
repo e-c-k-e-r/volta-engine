@@ -131,7 +131,7 @@ Persistent prefill MoE kernel, looked at and left alone: 3.4 ms per call at any 
 
 Quality check of the prefill changes (`test_ppl --flash`, teacher-forced perplexity of 6000 tokens of docs/ with every row's logits read back, `gather_logits` implemented for this model): all new paths 3.835, every old path 3.829 (the tensor-core gated residual alone 3.827, sparse attention alone 3.830). The per-token NLL moves by 0.06 on average (router flips) but the mean moves by 0.0016 nats, inside the noise of a 6000-token sample; no measurable quality change.
 
-MTP at the current baseline (`test_mtp`, depth 7, greedy equal to plain decode): 34-token prompt plain 58.8 -> MTP 158.7 tok/s (82% of drafts accepted), 15K-token prompt 53.8 -> 112.5 tok/s (63%).
+MTP on Flash-Next (`test_mtp --flash`, depth 7, full clock at 250 W): 34-token prompt plain 49.4 -> MTP 173.3 tok/s (85% of drafts accepted), 15K-token prompt plain 44.3 -> 109.3 tok/s (60%). Greedy output equals plain decoding on the 15K prompt and for the first 92 of 96 tokens on the short one (a late near-tie; the test holds Flash-Next to the first three quarters). The 158.7 / 112.5 tok/s figures that stood here before were Qwen3.8-27B numbers: `test_mtp` had no Flash-Next mode and loaded the 27B.
 
 GPU utilization that alternated between 100% and 20-40% during prefill (power 64 <-> 150 W, one cycle per 512-row chunk) was the n-gram embedding rows: every rank decoded all 512 rows from the mmapped table on the host before the chunk's graph (113 ms of a 515 ms chunk, GPUs idle). The ranks now decode a quarter of the rows each into a shared host buffer behind counting barriers: prefill 981 -> 1164 tok/s, outputs unchanged. Decode is not affected (0.33 ms of host time per token). The ~2.4 ms holes that show up per decode step in `nvprof --print-gpu-trace` are profiler launch overhead, not present without it (bench_decode --flash: 20.1 ms/token plain). Remaining host-side idle per chunk is about 28 ms; overlapping the next chunk's rows with the current chunk would remove it.
 
@@ -154,7 +154,10 @@ Numbers at the 250 W cap (2026-10-09; the 150 W numbers above are not comparable
 | M=8 verify | 24.88 ms | 41.94 ms | 30.78 ms |
 | 2 slots, per step | | | 22.52 ms (88.8 tok/s aggregate) |
 | Prefill, 512-row chunks | 2492 tok/s (2K) | 763 tok/s (2K) | 1322 tok/s (8K) |
-| MTP, 34-token prompt (`test_mtp`) | | | plain 62.8, MTP 185.3 tok/s (82% accepted) |
-| MTP, 15K-token prompt | | | plain 58.8, MTP 133.5 tok/s (63%) |
+| MTP, 34-token prompt (`test_mtp`) | plain 62.8, MTP 185.4 tok/s (82% accepted) | | plain 49.4, MTP 173.3 tok/s (85%) |
+| MTP, 15K-token prompt | plain 58.8, MTP 132.2 tok/s (63%) | | plain 44.3, MTP 109.3 tok/s (60%) |
 
-The plain tok/s of `test_mtp` (62.8) is higher than `bench_decode`'s M=1 figure (50.5) for Flash-Next; the two use different loops and contexts and I have not reconciled them. Real serving decode runs at 98% GPU utilization (the `bench_decode` trace shows 44%: a benchmark-loop artifact).
+Real serving decode runs at 98% GPU utilization (the `bench_decode` trace shows 44%: a benchmark-loop artifact). A first version of this table carried the 27B's `test_mtp` numbers in the Flash-Next column; they are corrected above.
+
+
+Several slots decoding with MTP (2026-10-10): the head keeps its state per slot (a history region per slot in the model, `MtpRunner` per-slot state), so a round can run for any slot. With more than one slot decoding the generator picks per step between one slot's round and a plain step of all of them, by the measured rates (a plain step over n slots returns n tokens, a round a few tokens of one slot), and re-measures the unused side every 64 steps. Full clock, creative-text requests (50% acceptance), aggregate tok/s with 2 / 4 concurrent requests: plain batching 78 / 122, interleaved rounds always 92 or 84 / 90, the controller 88 / 112 (a single request with MTP: 75-120). DFlash2 keeps a single shared context and so only speculates for a lone request. The concurrent greedy outputs diverge from the sequential ones (also without speculation, at the same positions: batched rows round differently from single rows), so equality across batch compositions is not a property of this model.

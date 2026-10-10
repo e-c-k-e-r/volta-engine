@@ -203,7 +203,7 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 		mtp_h2_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, s_shape, 2 );
 		const size_t stack = static_cast<size_t>( config_.hc_mult ) * H * sizeof( float );
 		mtp_src_ = static_cast<float*>( engine::core::arena_alloc( arena, R * stack ) );
-		mtp_hist_ = static_cast<float*>( engine::core::arena_alloc( arena, 2 * ( kDraftM + 1 ) * stack ) );
+		mtp_hist_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( config_.max_slots ) * 2 * ( kDraftM + 1 ) * stack ) );   // a region per slot (the runner offsets by slot)
 		mtp_chain_ = static_cast<float*>( engine::core::arena_alloc( arena, stack ) );
 	}
 	// QSA indexer state
@@ -1046,7 +1046,7 @@ void Qwen4ExpPipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, 
 
 // Keeps the stacks of rows [src_row, src_row + rows) of the last forward for later steps (row dst_row onwards)
 void Qwen4ExpPipeline::mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream ) {
-	ENGINE_ASSERT( mtp_on_ && rows >= 1 && dst_row + rows <= 2 * ( kDraftM + 1 ), "Qwen4ExpPipeline::mtp_save_hist: rows out of range" );
+	ENGINE_ASSERT( mtp_on_ && rows >= 1 && dst_row + rows <= config_.max_slots * 2 * ( kDraftM + 1 ), "Qwen4ExpPipeline::mtp_save_hist: rows out of range" );
 	backend::set_device( rank_ );
 	const size_t stack = static_cast<size_t>( config_.hc_mult ) * config_.hidden_size * sizeof( float );
 	backend::memcpy_async( reinterpret_cast<char*>( mtp_hist_ ) + static_cast<size_t>( dst_row ) * stack, streams_.ptr<const char>() + static_cast<size_t>( src_row ) * stack,

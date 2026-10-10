@@ -24,6 +24,9 @@ public:
 	virtual void claim( int slot ) = 0;     // the slot takes over the context (a cold start at position 0)
 	virtual void release( int slot ) = 0;   // the slot loses it
 	virtual bool owns( int slot ) const = 0;
+	// True when every slot keeps its own context (claim does not take it from another slot), so the generator may interleave rounds of
+	// several slots. DFlash2's tap ring / drafter KV is a single context.
+	virtual bool per_slot() const { return false; }
 
 	// Requires owns( slot ). `anchor` is the last committed, not yet forwarded token at `pos`. With a non-greedy `sp` the round
 	// samples: each draft token is accepted with the target's probability of it (exact for a deterministic draft) and the

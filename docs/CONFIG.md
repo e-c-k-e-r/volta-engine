@@ -59,6 +59,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `router_fp16` | bool | `false` | `ENGINE_DEBUG_ROUTER_FP16` | qwen4_exp: round the router logits to fp16 before the top-k, as the exllamav3 router stores them |
 | `perturb_layers` | float | `0` | `ENGINE_DEBUG_PERTURB_LAYERS` | qwen4_exp: multiply the residual streams after every layer by 1 + eps * u (u hashed from position, stream, dim and layer): a model of per-layer rounding noise; eager prefill only |
 | `spec_ctrl_log` | bool | `false` | `ENGINE_DEBUG_SPEC_CTRL_LOG` | speculation controller decisions |
+| `spec_interleave` | bool | `true` | `ENGINE_DEBUG_SPEC_INTERLEAVE` | speculators with a context per slot (MTP): interleave one slot's round per step; false steps all active slots plainly together while more than one decodes (A/B) |
 | `no_graphs` | bool | `false` | `ENGINE_DEBUG_NO_GRAPHS` | eager execution, no CUDA graphs |
 | `dump_requests` | string | `(empty)` | `ENGINE_DEBUG_DUMP_REQUESTS` | directory: write every API request body and rendered prompt there |
 | `dump_draft_round` | int | `-1` | `ENGINE_DEBUG_DUMP_DRAFT_ROUND` | speculation round whose drafter inputs are written to /tmp/draft_dump.bin; <0 = off |
