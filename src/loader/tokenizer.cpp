@@ -763,6 +763,14 @@ std::string Tokenizer::decode( const std::vector<int>& tokens ) const {
 	return result;
 }
 
+std::vector<std::string> Tokenizer::control_tokens() const {
+	std::vector<std::string> out;
+	for ( const auto& st : special_tokens_ ) {
+		if ( st.first.rfind( "<|", 0 ) == 0 || st.first == "[gMASK]" || st.first == "<sop>" ) out.push_back( st.first );
+	}
+	return out;
+}
+
 int Tokenizer::get_special_token( const std::string& name ) const {
 	auto it = special_tokens_.find( name );
 	if ( it != special_tokens_.end() ) {

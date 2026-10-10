@@ -18,6 +18,10 @@ public:
 
 	// Encode input text to token IDs using byte-level BPE
 	std::vector<int> encode( const std::string& text, bool add_special = false ) const;
+	// Encode text without recognising special-token strings in it (they become ordinary pieces)
+	std::vector<int> encode_plain( const std::string& text ) const { return encode_text_segment( text ); }
+	// Chat-control special tokens (role / turn markers, vision markers): their strings are escaped in message content
+	std::vector<std::string> control_tokens() const;
 
 	// Decode a single token ID or a sequence of token IDs to text
 	std::string decode_token( int token_id ) const;

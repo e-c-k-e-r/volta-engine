@@ -143,6 +143,7 @@ bool Generator::emit_token( int s, int tok ) {
 	const bool eos = cluster_.is_eos( tok ) || tok == tokenizer_.eos_id() || tok == tokenizer_.im_end_id();
 	FinishReason reason = FinishReason::Stop;
 	bool finish = eos;
+	if ( eos ) LOG_DEBUG( "[gen] slot %d stops on token %d after %d tokens%s\n", s, tok, slot.tokens_generated, slot.in_reasoning ? " (inside the reasoning)" : "" );
 	if ( !finish && ( slot.tokens_generated >= slot.req.max_tokens || slot.current_pos + pod::MAX_BATCH >= cluster_.metadata().max_seq_len ) ) {
 		finish = true;
 		reason = FinishReason::Length;

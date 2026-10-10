@@ -143,6 +143,59 @@ void inline_glm_image_markers( nlohmann::ordered_json& messages ) {
 	}
 }
 
+// Chat-control special tokens in message content are text, not control tokens: the escape swaps each such string in the
+// conversation for a private-use marker pair around its index before the template renders, and the tokenizer pass turns the
+// markers back into the string's ordinary (non-special) pieces. The template's own role / turn markers stay real tokens.
+constexpr const char* kEscOpen = "\xEE\x80\x80";
+constexpr const char* kEscClose = "\xEE\x80\x81";
+
+void replace_all( std::string& s, const std::string& from, const std::string& to ) {
+	for ( size_t p = s.find( from ); p != std::string::npos; p = s.find( from, p + to.size() ) ) s.replace( p, from.size(), to );
+}
+
+void escape_control_text( nlohmann::ordered_json& j, const std::vector<std::string>& toks ) {
+	if ( j.is_string() ) {
+		std::string s = j.get<std::string>();
+		replace_all( s, kEscOpen, "\xEF\xBF\xBD" );
+		replace_all( s, kEscClose, "\xEF\xBF\xBD" );
+		for ( size_t i = 0; i < toks.size(); ++i ) replace_all( s, toks[i], kEscOpen + std::to_string( i ) + kEscClose );
+		j = std::move( s );
+	} else if ( j.is_array() || j.is_object() ) {
+		for ( auto& v : j ) escape_control_text( v, toks );
+	}
+}
+
+// Visits the escaped prompt as alternating template text and escaped strings
+template <typename Text, typename Escaped>
+void split_escaped( const std::string& prompt, const std::vector<std::string>& toks, Text text, Escaped escaped ) {
+	size_t pos = 0;
+	while ( pos < prompt.size() ) {
+		const size_t o = prompt.find( kEscOpen, pos );
+		if ( o == std::string::npos ) break;
+		const size_t c = prompt.find( kEscClose, o );
+		if ( c == std::string::npos ) break;
+		text( prompt.substr( pos, o - pos ) );
+		const size_t idx = static_cast<size_t>( std::atoi( prompt.c_str() + o + 3 ) );
+		escaped( idx < toks.size() ? toks[idx] : std::string() );
+		pos = c + 3;
+	}
+	if ( pos < prompt.size() ) text( prompt.substr( pos ) );
+}
+
+std::vector<int> encode_prompt( const engine::loader::Tokenizer& tok, const std::string& prompt ) {
+	std::vector<int> out;
+	split_escaped( prompt, tok.control_tokens(),
+		[&]( const std::string& t ) { const auto v = tok.encode( t, false ); out.insert( out.end(), v.begin(), v.end() ); },
+		[&]( const std::string& t ) { const auto v = tok.encode_plain( t ); out.insert( out.end(), v.begin(), v.end() ); } );
+	return out;
+}
+
+std::string unescape_prompt( const engine::loader::Tokenizer& tok, const std::string& prompt ) {
+	std::string out;
+	split_escaped( prompt, tok.control_tokens(), [&]( const std::string& t ) { out += t; }, [&]( const std::string& t ) { out += t; } );
+	return out;
+}
+
 bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ImageList* images, ApiError* err ) {
 	const auto family = gen.chat_template().model_family();
 
@@ -172,6 +225,11 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 	vars["enable_thinking"] = thinking;
 	if ( !effort.empty() ) vars["reasoning_effort"] = effort;
 
+	{
+		const std::vector<std::string> ctl = gen.tokenizer().control_tokens();
+		escape_control_text( vars["messages"], ctl );
+		if ( vars.contains( "tools" ) ) escape_control_text( vars["tools"], ctl );
+	}
 	std::string terr;
 	if ( !gen.chat_template().render_json( vars.dump(), prompt, &terr ) ) {
 		err->message = "the chat template rejected this conversation: " + terr;
@@ -179,7 +237,7 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 	}
 	// The GLM template always opens <think>; non-thinking mode closes it right away (GLM-4.5 convention)
 	if ( !thinking && family == engine::loader::ModelFamily::GLM && ends_with( *prompt, "<think>" ) ) *prompt += "</think>";
-	*tokens = gen.tokenizer().encode( *prompt, false );
+	*tokens = encode_prompt( gen.tokenizer(), *prompt );
 	if ( !req.images.empty() ) {
 		const engine::loader::VisionParams* vp = gen.vision_params();
 		const int pad_id = gen.tokenizer().get_special_token( image_pad_name( family ) );
@@ -252,7 +310,8 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	if ( !runtime::options().dump_requests.empty() ) {
 		const std::string path = runtime::options().dump_requests + "/req_" + std::to_string( request_id ) + ".prompt.txt";
 		if ( FILE* f = std::fopen( path.c_str(), "wb" ) ) {
-			std::fwrite( prompt.data(), 1, prompt.size(), f );
+			const std::string shown = unescape_prompt( gen.tokenizer(), prompt );
+			std::fwrite( shown.data(), 1, shown.size(), f );
 			std::fclose( f );
 		}
 	}
@@ -285,7 +344,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		const int pad_id = gen.tokenizer().get_special_token( image_pad_name( family ) );
 		auto add = [&]( size_t at, bool pinned, size_t min_tokens ) {
 			if ( at == std::string::npos || at == 0 ) return;
-			const std::vector<int> head = expand_image_tokens( gen.tokenizer().encode( prompt.substr( 0, at ), false ), pad_id, g.images );
+			const std::vector<int> head = expand_image_tokens( encode_prompt( gen.tokenizer(), prompt.substr( 0, at ) ), pad_id, g.images );
 			if ( head.size() < min_tokens || head.size() >= g.prompt_tokens.size() ) return;
 			if ( !std::equal( head.begin(), head.end(), g.prompt_tokens.begin() ) ) return;
 			if ( !g.checkpoint_at.empty() && static_cast<int>( head.size() ) <= g.checkpoint_at.back().pos ) return;
