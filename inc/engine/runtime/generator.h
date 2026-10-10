@@ -266,7 +266,7 @@ private:
 	// Monitor state (metrics_mtx_ guards everything but the two atomics)
 	void publish_slots();
 	void tick_history_locked( std::chrono::steady_clock::time_point now ) const;
-	void fold_expert_heat();
+	void fold_expert_heat( bool force = false );
 	std::atomic<uint64_t> tokens_out_{ 0 };
 	std::atomic<uint64_t> tokens_prefilled_{ 0 };
 	uint64_t prompt_tokens_total_ = 0, cached_tokens_total_ = 0, finished_[4] = {}, spec_rounds_ = 0;
@@ -280,6 +280,7 @@ private:
 	mutable uint64_t hist_out_ = 0, hist_pf_ = 0;
 	ExpertStats experts_;
 	bool heat_off_ = false;
+	bool heat_pending_ = false;   // the model ran since the last fold
 	bool published_active_ = false;
 	std::chrono::steady_clock::time_point heat_last_;
 };

@@ -120,7 +120,7 @@ tr:hover td { background:rgba(128,128,128,.08); }
 			<div style="display:grid; grid-template-columns:minmax(0, 2.4fr) minmax(0, 1fr); gap:14px">
 				<div>
 					<canvas id="ch-heat" height="260"></canvas>
-					<div id="ehelp">rows are the MoE layers (top = first), columns the experts grouped by rank; brightness is log routes (relative: the counters also take speculative and padding rows). Hover for counts.</div>
+					<div id="ehelp">rows are the MoE layers (top = first), columns the experts grouped by rank; brightness is log routes (counts are exact: every prompt and generated token routes to its top-k experts in each layer; rejected drafts are not counted). Hover for counts.</div>
 				</div>
 				<div>
 					<div class="tiles" id="exp-tiles"></div>
@@ -178,10 +178,11 @@ function lineChart(canvas, series, opt) {
 	max = max <= 0 ? 1 : max * 1.1;
 	g.font = '10px ' + getComputedStyle(document.body).fontFamily;
 	g.strokeStyle = css('--line'); g.fillStyle = css('--dim'); g.lineWidth = 1;
-	for (let i = 0; i <= 4; i++) {
-		const y = T + ph * i / 4;
+	const steps = ph < 60 ? 1 : 4;   // sparklines get a top and a bottom label only
+	for (let i = 0; i <= steps; i++) {
+		const y = T + ph * i / steps;
 		g.beginPath(); g.moveTo(L, y + .5); g.lineTo(w - R, y + .5); g.stroke();
-		g.textAlign = 'right'; g.fillText(fmt(max * (1 - i / 4), max < 10 ? 1 : 0), L - 4, y + 3);
+		g.textAlign = 'right'; g.fillText(fmt(max * (1 - i / steps), max < 10 ? 1 : 0), L - 4, y + 3);
 	}
 	const n = opt.n || Math.max(...series.map((s) => s.data.length));
 	g.textAlign = 'left'; g.fillText(opt.left || '', L, h - 3);

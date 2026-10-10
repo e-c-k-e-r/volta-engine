@@ -45,6 +45,12 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 	num_slots_ = MAX( num_slots_, 1 );
 	// Mode B uses m <= num_slots_; speculative verify uses m <= 7 draft rows
 	cluster_.warm_graphs( MAX( num_slots_, cluster_.has_speculator() ? ( cluster_.speculator().joint() ? pod::MAX_BATCH : 7 ) : 1 ) );   // joint rounds verify the blocks of several slots at once
+	{
+		// the warm-up forwards route dummy rows through every expert: drop what they counted
+		std::vector<std::vector<uint32_t>> discard;
+		int layers = 0, experts = 0;
+		if ( runtime::options().expert_stats ) cluster_.expert_heat( discard, layers, experts );
+	}
 	LOG_INFO( "Generator ready: %d slots, speculation %s\n", num_slots_, cluster_.has_speculator() ? "on" : "off" );
 
 	const size_t cache_budget = static_cast<size_t>( std::max( 0, runtime::options().prefix_cache_gib ) ) << 30;
@@ -125,7 +131,9 @@ void Generator::scheduler_loop() {
 			any_active = any_active || slots_[s].active;
 		}
 		if ( !any_active ) {
+			const bool settle = published_active_ || heat_pending_;
 			if ( published_active_ ) publish_slots();
+			if ( settle ) fold_expert_heat( true );   // the last second of a short request would otherwise wait for the next one
 			std::unique_lock<std::mutex> lock( queue_mtx_ );
 			queue_cv_.wait_for( lock, std::chrono::milliseconds( 2 ), [&]() {
 				return !pending_queue_.empty() || !running_.load();
@@ -133,6 +141,7 @@ void Generator::scheduler_loop() {
 			continue;
 		}
 		step_batch();
+		heat_pending_ = true;
 		for ( int s = 0; s < num_slots_; ++s ) apply_forced_close( s );
 		publish_slots();
 		fold_expert_heat();
@@ -288,6 +297,7 @@ std::shared_ptr<const std::vector<backend::half_t>> Generator::image_embeddings(
 
 bool Generator::prefill_slot( int s, int budget ) {
 	Slot& slot = slots_[s];
+	heat_pending_ = true;
 	const std::vector<int>& prompt = slot.req.prompt_tokens;
 	const int n = static_cast<int>( prompt.size() );
 	if ( !slot.pf_started ) {
@@ -730,14 +740,12 @@ void Generator::tick_history_locked( std::chrono::steady_clock::time_point now )
 	hist_pf_ = pf;
 }
 
-void Generator::fold_expert_heat() {
+void Generator::fold_expert_heat( bool force ) {
 	if ( heat_off_ || !runtime::options().expert_stats ) return;
 	const auto now = std::chrono::steady_clock::now();
-	if ( std::chrono::duration<double>( now - heat_last_ ).count() < 1.0 ) return;
+	if ( !force && std::chrono::duration<double>( now - heat_last_ ).count() < 1.0 ) return;
 	heat_last_ = now;
-	bool any = false;
-	for ( int s = 0; s < num_slots_; ++s ) any = any || slots_[s].active;
-	if ( !any ) return;
+	heat_pending_ = false;
 	std::vector<std::vector<uint32_t>> per_rank;
 	int layers = 0, experts = 0;
 	if ( !cluster_.expert_heat( per_rank, layers, experts ) ) {
