@@ -11,7 +11,7 @@ OPTION( int, vram_reserve_mib, -1, "memory left outside the arena for graphs, wo
 OPTION( int, max_seq, 0, "context window per slot in tokens (sizes the KV pool); 0 = the model default (Qwen 32768, GLM 12288)" )
 OPTION( int, max_slots, 0, "decode slots; 0 = the model default (Qwen 8, GLM 1)" )
 OPTION( int, prefix_cache_gib, 16, "pinned host RAM for the prefix cache (sequence snapshots); 0 = off" )
-OPTION( int, prefill_chunk, 512, "prompt tokens a new request prefills per scheduler step while other requests are decoding (decode steps run between the pieces); 0 = the whole prompt at once" )
+OPTION( int, prefill_chunk, 256, "prompt tokens a new request prefills per scheduler step while other requests are decoding (decode steps run between the pieces); 0 = the whole prompt at once" )
 OPTION( int, prefix_interval, 16384, "prompt tokens between automatic prefix checkpoints inside long prompts; 0 = only the requested ones" )
 OPTION( std::string, kv_format, "", "KV cache format: fp16, fp8, k8v4 or nvfp4; empty = the model default (fp16). GLM stores its single latent tensor in one format (k8v4 = 8-bit)" )
 OPTION( double, expert_cache, 1.0, "GLM resident routed-expert fraction in (0, 1]; below 1 enables the two-tier expert cache" )
