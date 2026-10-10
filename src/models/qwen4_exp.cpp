@@ -669,6 +669,9 @@ void Qwen4ExpPipeline::attention_forward( const Qwen4ExpLayerWeights& lw, int at
 	engine::modules::Attention::store_kv_cache( kv, k_buf_, v_buf_, kv_slot_stride, attn_idx, d_rows_, m, kv_heads_, hd, config_.max_seq, stream );
 	// QSA indexer: the raw-key ring and the pooled keys are kept for every row; the selection only changes the attention once a row sees more
 	// than the budget (indexer_budget tokens = 512 complete pools): rows below it stay dense
+	// Note: the indexer ropes queries and pooled keys at the plain KV positions (rows->pos), as the exllamav3 reference does; only the attention above
+	// uses the M-RoPE positions (rope_pos). If long contexts with images (past the budget) select the wrong blocks, try the M-RoPE positions here
+	// and in qsa.cu (prep / pool_update); there is no image oracle for it yet
 	using engine::modules::QSA;
 	engine::modules::Linear::forward( mixed_, lw.idx_qk_proj, qsa_qk_, stream );
 	QSA::prep( qsa_qk_.ptr<const backend::half_t>(), lw.idx_q_norm.ptr<const backend::half_t>(), qsa_q_.ptr<backend::half_t>(), qsa_ring_, attn_idx, m, d_rows_,
