@@ -150,6 +150,30 @@ public:
 		backend::stream_t stream = nullptr
 	);
 
+	// NVFP4 from a BF16 / FP16 dense `<base_name>.weight` [N, K] (round-to-nearest with a +-2 code E4M3 scale search per 16 values; the global
+	// scale comes from the whole tensor). Same row / K ranges and layout as load_nvfp4; N is zero-padded to pad_n when larger than the rows.
+	pod::LinearWeight quantize_nvfp4(
+		const char* base_name,
+		pod::MemoryArena& arena,
+		const int* n_begin,
+		const int* n_count,
+		int ranges,
+		int k0,
+		int kcount,
+		int pad_n = 0,
+		backend::stream_t stream = nullptr
+	);
+
+	pod::LinearWeight quantize_nvfp4_slice(
+		const char* base_name,
+		pod::MemoryArena& arena,
+		bool split_n,
+		int rank,
+		int tp_size,
+		int pad_n = 0,
+		backend::stream_t stream = nullptr
+	);
+
 	// Tensor-parallel slice: split_n splits the output rows (column parallel), otherwise K (row parallel).
 	pod::LinearWeight load_nvfp4_slice(
 		const char* base_name,

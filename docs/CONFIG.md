@@ -39,6 +39,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `prefill_chunk` | int | `256` | `ENGINE_PREFILL_CHUNK` | prompt tokens a new request prefills per scheduler step while other requests are decoding (decode steps run between the pieces); 0 = the whole prompt at once |
 | `prefix_interval` | int | `16384` | `ENGINE_PREFIX_INTERVAL` | prompt tokens between automatic prefix checkpoints inside long prompts; 0 = only the requested ones |
 | `nvfp4_experts` | string | `(empty)` | `ENGINE_NVFP4_EXPERTS` | Flash-Next: directory of a modelopt NVFP4 checkpoint (same architecture) to load the routed experts from; everything else comes from the model directory. Empty = the model's own experts |
+| `nvfp4_dense` | string | `(empty)` | `ENGINE_NVFP4_DENSE` | Flash-Next: dense projection groups to quantize to NVFP4 at load (round-to-nearest from the BF16 tensors of the nvfp4_experts checkpoint): comma list of gdn, shared, attn, idx, head, or all |
 | `kv_format` | string | `(empty)` | `ENGINE_KV_FORMAT` | KV cache format: fp16, fp8, k8v4 or nvfp4; empty = the model default (fp16). GLM stores its single latent tensor in one format (k8v4 = 8-bit) |
 | `expert_cache` | float | `1` | `ENGINE_EXPERT_CACHE` | GLM resident routed-expert fraction in (0, 1]; below 1 enables the two-tier expert cache |
 | `expert_adapt_every` | int | `64` | `ENGINE_EXPERT_ADAPT_EVERY` | decode steps between expert residency rebalances (0 = never) |

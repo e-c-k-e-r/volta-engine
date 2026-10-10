@@ -10,7 +10,9 @@
 #include "engine/loader/safetensors.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
+#include <algorithm>
 #include <cmath>
+#include <thread>
 #include <cstring>
 #include <vector>
 
@@ -66,25 +68,29 @@ const void* SafeTensorsRepo::cpu_data( const char* name ) const {
 	return ( meta && shard >= 0 ) ? safetensors_get_data_cpu( shards_[shard], meta ) : nullptr;
 }
 
-pod::LinearWeight SafeTensorsRepo::load_nvfp4(
-	const char* base_name,
+namespace {
+
+// Prepacks rows / K elements of a host-side [N, K/2] + [N, K/16] source into the skinny kernel's fragment order (N zero-padded to a multiple
+// of 32, or to pad_n when larger)
+pod::LinearWeight repack_nvfp4(
+	const Nvfp4Source& src,
 	pod::MemoryArena& arena,
 	const int* n_begin,
 	const int* n_count,
 	int ranges,
 	int k0,
 	int kcount,
+	int pad_n,
 	backend::stream_t stream
 ) {
-	Nvfp4Source src;
-	if ( !open_nvfp4( *this, base_name, src ) ) return pod::LinearWeight{};
 	ENGINE_ASSERT( k0 % 16 == 0 && kcount % 64 == 0 && k0 + kcount <= src.K, "load_nvfp4: bad K range" );
 	int n_total = 0;
 	for ( int i = 0; i < ranges; ++i ) {
 		ENGINE_ASSERT( n_begin[i] >= 0 && n_begin[i] + n_count[i] <= src.N, "load_nvfp4: bad N range" );
 		n_total += n_count[i];
 	}
-	const int n_pad = ( n_total + 31 ) & ~31;
+	const int n_pad = MAX( ( n_total + 31 ) & ~31, pad_n );
+	ENGINE_ASSERT( n_pad % 32 == 0, "load_nvfp4: padded N must be a multiple of 32" );
 	const int tiles = n_pad / 32, G = kcount / 16;
 
 	// Output row (in concatenated order) -> source row, -1 for padding
@@ -132,6 +138,158 @@ pod::LinearWeight SafeTensorsRepo::load_nvfp4(
 	backend::memcpy_async( lw.w1.data, scales.data(), scales.size(), backend::Copy::H2D, stream );
 	backend::stream_sync( stream );  // the host staging buffers go out of scope
 	return lw;
+}
+
+// E4M3 positive codes 0..126 (127 / 0x7F is NaN) decoded
+const std::vector<float>& e4m3_table() {
+	static const std::vector<float> t = []() {
+		std::vector<float> v( 127 );
+		for ( int c = 0; c < 127; ++c ) v[c] = e4m3_to_float( static_cast<uint8_t>( c ) );
+		return v;
+	}();
+	return t;
+}
+
+float bf16_or_fp16_to_float( const uint8_t* p, bool bf16 ) {
+	uint16_t h;
+	std::memcpy( &h, p, 2 );
+	if ( bf16 ) {
+		const uint32_t u = static_cast<uint32_t>( h ) << 16;
+		float f;
+		std::memcpy( &f, &u, 4 );
+		return f;
+	}
+	const int e = ( h >> 10 ) & 31, m = h & 1023;
+	const float v = e == 0 ? std::ldexp( m / 1024.0f, -14 ) : e == 31 ? 65504.0f : std::ldexp( 1.0f + m / 1024.0f, e - 15 );
+	return ( h & 0x8000 ) ? -v : v;
+}
+
+// Nearest E2M1 code (sign bit 3, magnitude index 0..7) of x
+inline int e2m1_code( float x ) {
+	const float a = std::fabs( x );
+	int m = a <= 0.25f ? 0 : a < 0.75f ? 1 : a <= 1.25f ? 2 : a < 1.75f ? 3 : a <= 2.5f ? 4 : a < 3.5f ? 5 : a <= 5.0f ? 6 : 7;
+	return m | ( x < 0.0f ? 8 : 0 );
+}
+
+}  // namespace
+
+pod::LinearWeight SafeTensorsRepo::load_nvfp4(
+	const char* base_name,
+	pod::MemoryArena& arena,
+	const int* n_begin,
+	const int* n_count,
+	int ranges,
+	int k0,
+	int kcount,
+	backend::stream_t stream
+) {
+	Nvfp4Source src;
+	if ( !open_nvfp4( *this, base_name, src ) ) return pod::LinearWeight{};
+	return repack_nvfp4( src, arena, n_begin, n_count, ranges, k0, kcount, 0, stream );
+}
+
+pod::LinearWeight SafeTensorsRepo::quantize_nvfp4(
+	const char* base_name,
+	pod::MemoryArena& arena,
+	const int* n_begin,
+	const int* n_count,
+	int ranges,
+	int k0,
+	int kcount,
+	int pad_n,
+	backend::stream_t stream
+) {
+	char name[300];
+	std::snprintf( name, sizeof( name ), "%s.weight", base_name );
+	const auto* mp = find( name );
+	if ( !mp || mp->ndim != 2 || ( mp->dtype != pod::DType::BF16 && mp->dtype != pod::DType::FP16 ) ) return pod::LinearWeight{};
+	const uint8_t* w = static_cast<const uint8_t*>( cpu_data( name ) );
+	if ( !w ) return pod::LinearWeight{};
+	const bool bf16 = mp->dtype == pod::DType::BF16;
+	const int N = mp->shape[0], K = mp->shape[1];
+	ENGINE_ASSERT( k0 % 16 == 0 && kcount % 64 == 0 && k0 + kcount <= K, "quantize_nvfp4: bad K range" );
+
+	// Global scale from the whole tensor (so every rank's slice of one matrix shares it): the largest block scale maps to the E4M3 maximum
+	float amax = 0.0f;
+	for ( size_t i = 0; i < static_cast<size_t>( N ) * K; ++i ) amax = std::fmax( amax, std::fabs( bf16_or_fp16_to_float( w + i * 2, bf16 ) ) );
+	const float gs = amax > 0.0f ? amax / ( 6.0f * 448.0f ) : 1.0f;
+
+	// Compact source: the requested rows (concatenated) and K range, quantized block by block
+	int n_total = 0;
+	std::vector<int> new_begin( ranges );
+	for ( int i = 0; i < ranges; ++i ) { new_begin[i] = n_total; n_total += n_count[i]; }
+	std::vector<int> row_src( n_total );
+	for ( int i = 0, o = 0; i < ranges; ++i ) for ( int j = 0; j < n_count[i]; ++j ) row_src[o++] = n_begin[i] + j;
+	std::vector<uint8_t> packed( static_cast<size_t>( n_total ) * ( kcount / 2 ) ), bscales( static_cast<size_t>( n_total ) * ( kcount / 16 ) );
+	const std::vector<float>& et = e4m3_table();
+	static const float kGrid[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+
+	auto quantize_rows = [&]( int r0, int r1 ) {
+		float v[16];
+		for ( int r = r0; r < r1; ++r ) {
+			const uint8_t* row = w + ( static_cast<size_t>( row_src[r] ) * K + k0 ) * 2;
+			for ( int g = 0; g < kcount / 16; ++g ) {
+				float bmax = 0.0f;
+				for ( int i = 0; i < 16; ++i ) { v[i] = bf16_or_fp16_to_float( row + ( g * 16 + i ) * 2, bf16 ); bmax = std::fmax( bmax, std::fabs( v[i] ) ); }
+				// Start from the E4M3 scale nearest to amax / 6, then keep the neighbour (+-2 codes) with the smallest squared error
+				const float ideal = bmax / ( 6.0f * gs );
+				int c0 = static_cast<int>( std::lower_bound( et.begin(), et.end(), ideal ) - et.begin() );
+				if ( c0 >= 127 ) c0 = 126;
+				else if ( c0 > 0 && ideal - et[c0 - 1] < et[c0] - ideal ) --c0;
+				c0 = MIN( MAX( c0, 1 ), 126 );
+				int best = c0;
+				float best_err = 1e30f;
+				for ( int c = MAX( 1, c0 - 2 ); c <= MIN( 126, c0 + 2 ); ++c ) {
+					const float sc = et[c] * gs;
+					float err = 0.0f;
+					for ( int i = 0; i < 16; ++i ) {
+						const float d = kGrid[e2m1_code( v[i] / sc ) & 7] * sc * ( v[i] < 0.0f ? -1.0f : 1.0f ) - v[i];
+						err += d * d;
+					}
+					if ( err < best_err ) { best_err = err; best = c; }
+				}
+				const float sc = et[best] * gs;
+				uint8_t* pk = &packed[( static_cast<size_t>( r ) * ( kcount / 16 ) + g ) * 8];
+				for ( int i = 0; i < 16; i += 2 ) pk[i / 2] = static_cast<uint8_t>( e2m1_code( v[i] / sc ) | ( e2m1_code( v[i + 1] / sc ) << 4 ) );
+				bscales[static_cast<size_t>( r ) * ( kcount / 16 ) + g] = static_cast<uint8_t>( best );
+			}
+		}
+	};
+	const int workers = 4;
+	std::vector<std::thread> pool;
+	for ( int t = 0; t < workers; ++t ) pool.emplace_back( quantize_rows, static_cast<int>( static_cast<int64_t>( n_total ) * t / workers ), static_cast<int>( static_cast<int64_t>( n_total ) * ( t + 1 ) / workers ) );
+	for ( auto& t : pool ) t.join();
+
+	Nvfp4Source src;
+	src.packed = packed.data();
+	src.scales = bscales.data();
+	src.inv_global = gs;
+	src.N = n_total;
+	src.K = kcount;
+	std::vector<int> counts( n_count, n_count + ranges );
+	return repack_nvfp4( src, arena, new_begin.data(), counts.data(), ranges, 0, kcount, pad_n, stream );
+}
+
+pod::LinearWeight SafeTensorsRepo::quantize_nvfp4_slice(
+	const char* base_name,
+	pod::MemoryArena& arena,
+	bool split_n,
+	int rank,
+	int tp_size,
+	int pad_n,
+	backend::stream_t stream
+) {
+	char name[300];
+	std::snprintf( name, sizeof( name ), "%s.weight", base_name );
+	const auto* mp = find( name );
+	if ( !mp || mp->ndim != 2 ) return pod::LinearWeight{};
+	const int N = mp->shape[0], K = mp->shape[1];
+	if ( split_n ) {
+		const int cnt = N / tp_size, beg = rank * cnt;
+		return quantize_nvfp4( base_name, arena, &beg, &cnt, 1, 0, K, pad_n, stream );
+	}
+	const int cnt = K / tp_size, beg = 0;
+	return quantize_nvfp4( base_name, arena, &beg, &N, 1, rank * cnt, cnt, pad_n, stream );
 }
 
 pod::LinearWeight SafeTensorsRepo::load_nvfp4_slice(

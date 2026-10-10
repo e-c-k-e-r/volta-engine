@@ -372,6 +372,18 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	// Column-parallel (output split) and row-parallel (input split) trellis projections
 	auto load_col = [&]( const char* name, int bits ) { return check( repo.load_linear_slice( name, *arena_, bits, 1, rank_, tp, stream ), name ); };
 	auto load_row = [&]( const char* name, int bits ) { return check( repo.load_linear_slice( name, *arena_, bits, 0, rank_, tp, stream ), name ); };
+	// Dense groups quantized to NVFP4 at load from the BF16 tensors of the NVFP4 checkpoint (ENGINE_NVFP4_DENSE); otherwise the trellis tensors
+	const std::string& nv_groups = runtime::options().nvfp4_dense;
+	auto nv_on = [&]( const char* group ) { return nv_repo && !nv_groups.empty() && ( nv_groups == "all" || ( "," + nv_groups + "," ).find( std::string( "," ) + group + "," ) != std::string::npos ); };
+	auto load_col_g = [&]( const char* group, const char* name, int bits ) {
+		return nv_on( group ) ? check( nv_repo->quantize_nvfp4_slice( name, *arena_, true, rank_, tp, 0, stream ), name ) : load_col( name, bits );
+	};
+	auto load_row_g = [&]( const char* group, const char* name, int bits ) {
+		return nv_on( group ) ? check( nv_repo->quantize_nvfp4_slice( name, *arena_, false, rank_, tp, 0, stream ), name ) : load_row( name, bits );
+	};
+	auto load_full_g = [&]( const char* group, const char* name, int bits ) {
+		return nv_on( group ) ? check( nv_repo->quantize_nvfp4_slice( name, *arena_, true, 0, 1, 0, stream ), name ) : check( repo.load_linear( name, *arena_, bits, stream ), name );
+	};
 
 	const char* P = "model.language_model";
 	std::snprintf( nm, sizeof( nm ), "%s.embed_tokens.weight", P );
@@ -379,7 +391,11 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	if ( !embed_table_.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, nm ); ++missing; }
 	std::snprintf( nm, sizeof( nm ), "%s.hyper_connection_mixer", P );
 	final_mixer_ = load_gr( nm, false );
-	lm_head_ = check( repo.load_linear_slice_padded( "lm_head", *arena_, 6, rank_, tp, lm_shard_cols_ - lm_shard_real_cols_, stream ), "lm_head" );
+	if ( nv_on( "head" ) ) {
+		const int cnt = lm_shard_real_cols_, beg = rank_ * cnt;
+		lm_head_ = check( nv_repo->quantize_nvfp4( "lm_head", *arena_, &beg, &cnt, 1, 0, config_.hidden_size, lm_shard_cols_, stream ), "lm_head" );
+	}
+	else lm_head_ = check( repo.load_linear_slice_padded( "lm_head", *arena_, 6, rank_, tp, lm_shard_cols_ - lm_shard_real_cols_, stream ), "lm_head" );
 
 	// GDN projections: q / k / v row groups of 128 / 128 / 384 blocks of 16, every rank takes its share of each
 	static const int QKV_BLOCKS[3] = { 128, 128, 384 };
@@ -408,25 +424,30 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 
 		if ( lw.is_full_attention ) {
 			const int kv_slices = tp >= 2 ? 2 : 1, kv_slice = tp >= 2 ? rank_ / ( tp / 2 ) : 0;
-			std::snprintf( nm, sizeof( nm ), "%s.self_attn.q_proj", pre ); lw.q_proj = load_col( nm, 8 );
+			std::snprintf( nm, sizeof( nm ), "%s.self_attn.q_proj", pre ); lw.q_proj = load_col_g( "attn", nm, 8 );
 			// 2 KV heads: ranks 2j and 2j + 1 (tp 4) or rank j (tp 2) take head j (256 of the 512 columns), a single rank takes both
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.k_proj", pre );
-			lw.k_proj = check( repo.load_linear_slice( nm, *arena_, 8, 1, kv_slice, kv_slices, stream ), nm );
+			lw.k_proj = nv_on( "attn" ) ? check( nv_repo->quantize_nvfp4_slice( nm, *arena_, true, kv_slice, kv_slices, 0, stream ), nm ) : check( repo.load_linear_slice( nm, *arena_, 8, 1, kv_slice, kv_slices, stream ), nm );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.v_proj", pre );
-			lw.v_proj = check( repo.load_linear_slice( nm, *arena_, 8, 1, kv_slice, kv_slices, stream ), nm );
-			std::snprintf( nm, sizeof( nm ), "%s.self_attn.o_proj", pre ); lw.o_proj = load_row( nm, 8 );
+			lw.v_proj = nv_on( "attn" ) ? check( nv_repo->quantize_nvfp4_slice( nm, *arena_, true, kv_slice, kv_slices, 0, stream ), nm ) : check( repo.load_linear_slice( nm, *arena_, 8, 1, kv_slice, kv_slices, stream ), nm );
+			std::snprintf( nm, sizeof( nm ), "%s.self_attn.o_proj", pre ); lw.o_proj = load_row_g( "attn", nm, 8 );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.q_norm.weight", pre ); lw.q_norm = dense( nm );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.k_norm.weight", pre ); lw.k_norm = dense( nm );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.indexer.index_qk_proj", pre );
-			lw.idx_qk_proj = check( repo.load_linear( nm, *arena_, 8, stream ), nm );
+			lw.idx_qk_proj = load_full_g( "idx", nm, 8 );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.indexer.q_layernorm.weight", pre ); lw.idx_q_norm = dense( nm );
 			std::snprintf( nm, sizeof( nm ), "%s.self_attn.indexer.k_layernorm.weight", pre ); lw.idx_k_norm = dense( nm );
 		}
 		else {
 			std::snprintf( nm, sizeof( nm ), "%s.linear_attn.in_proj_qkv", pre );
-			lw.in_proj_qkv = check( repo.load_grouped_trellis_slice( nm, *arena_, QKV_BLOCKS, qkv_rank_blocks, 3, rank_, stream ), nm );
-			std::snprintf( nm, sizeof( nm ), "%s.linear_attn.in_proj_z", pre ); lw.in_proj_z = load_col( nm, 8 );
-			std::snprintf( nm, sizeof( nm ), "%s.linear_attn.out_proj", pre ); lw.out_proj = load_row( nm, 8 );
+			if ( nv_on( "gdn" ) ) {
+				// q / k / v row groups of 2048 / 2048 / 6144, every rank takes its share of each
+				const int rows[3] = { 2048 / tp, 2048 / tp, 6144 / tp }, begin[3] = { rank_ * rows[0], 2048 + rank_ * rows[1], 4096 + rank_ * rows[2] };
+				lw.in_proj_qkv = check( nv_repo->quantize_nvfp4( nm, *arena_, begin, rows, 3, 0, config_.hidden_size, 0, stream ), nm );
+			}
+			else lw.in_proj_qkv = check( repo.load_grouped_trellis_slice( nm, *arena_, QKV_BLOCKS, qkv_rank_blocks, 3, rank_, stream ), nm );
+			std::snprintf( nm, sizeof( nm ), "%s.linear_attn.in_proj_z", pre ); lw.in_proj_z = load_col_g( "gdn", nm, 8 );
+			std::snprintf( nm, sizeof( nm ), "%s.linear_attn.out_proj", pre ); lw.out_proj = load_row_g( "gdn", nm, 8 );
 			std::snprintf( nm, sizeof( nm ), "%s.linear_attn.conv1d.weight", pre );
 			lw.conv1d_w = repo.load_grouped_slice( nm, *arena_, CONV_CHANNELS, conv_rank_channels, 3, rank_, 0, stream );
 			if ( !lw.conv1d_w.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, nm ); ++missing; }
@@ -463,9 +484,9 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );
 		mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( per_rank ) * sizeof( uint32_t ), 128 ) );
 		backend::memset_async( mw.heat, 0, static_cast<size_t>( per_rank ) * sizeof( uint32_t ), stream );
-		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.gate_proj", pre ); lw.shared_gate = check( repo.load_linear( nm, *arena_, 4, stream ), nm );
-		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.up_proj", pre ); lw.shared_up = check( repo.load_linear( nm, *arena_, 4, stream ), nm );
-		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.down_proj", pre ); lw.shared_down = check( repo.load_linear( nm, *arena_, 4, stream ), nm );
+		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.gate_proj", pre ); lw.shared_gate = load_full_g( "shared", nm, 4 );
+		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.up_proj", pre ); lw.shared_up = load_full_g( "shared", nm, 4 );
+		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.down_proj", pre ); lw.shared_down = load_full_g( "shared", nm, 4 );
 		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert_gate.weight", pre ); lw.shared_expert_gate = dense( nm );
 	};
 	for ( int L = 0; L < config_.num_layers; ++L ) {
