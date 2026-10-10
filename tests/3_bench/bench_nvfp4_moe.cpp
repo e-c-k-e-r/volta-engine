@@ -65,6 +65,7 @@ int main() {
 	int* idx = static_cast<int*>( engine::core::arena_alloc( arena, SETS * K * sizeof( int ) ) );
 	half* hbuf = static_cast<half*>( engine::core::arena_alloc( arena, K * I * sizeof( half ) ) );
 	float* partial = static_cast<float*>( engine::core::arena_alloc( arena, K * H * sizeof( float ) ) );
+	int* disp = static_cast<int*>( engine::core::arena_alloc( arena, engine::modules::nvfp4_disp_ints( E ) * sizeof( int ) ) );
 	int* counters = static_cast<int*>( engine::core::arena_alloc( arena, H / 32 * sizeof( int ) ) );
 	half* out = static_cast<half*>( engine::core::arena_alloc( arena, H * sizeof( half ) ) );
 	CUDA_CHECK( cudaMemset( counters, 0, H / 32 * sizeof( int ) ) );
@@ -87,7 +88,7 @@ int main() {
 	// Parity (10 local routes, first set) against LinearNVFP4 chains
 	{
 		auto hi = make_routes( K );
-		engine::modules::NVFP4MoE::forward_rows( t, x, idx, w, 1, K, hbuf, partial, counters, nullptr, out, stream );
+		engine::modules::NVFP4MoE::forward_rows( t, x, idx, w, 1, K, hbuf, partial, disp, counters, nullptr, out, stream );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		std::vector<half> got( H );
 		CUDA_CHECK( cudaMemcpy( got.data(), out, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
@@ -119,6 +120,62 @@ int main() {
 		std::printf( "[parity] cosine %.6f  max |diff| %.4g  (ref rms %.4g)\n", dot / std::sqrt( na * nb ), maxabs, std::sqrt( na / H ) );
 	}
 
+	// Multi-row: routes drawn from 512 experts (rank 0 owns 0..127, the rest are skipped); rows > 1 against single-row calls, then time per layer
+	for ( int R : { 2, 4, 8, 16, 64 } ) {
+		std::vector<half> hxr( static_cast<size_t>( R ) * H ), hwr( static_cast<size_t>( R ) * K );
+		for ( auto& v : hxr ) v = __float2half( ( rnd() / 16777216.0f ) * 2.0f - 1.0f );
+		for ( auto& v : hwr ) v = __float2half( 0.05f + 0.01f * ( rnd() % 10 ) );
+		std::vector<int> hir( static_cast<size_t>( R ) * K );
+		int local = 0;
+		for ( int r = 0; r < R; ++r ) {
+			bool used[512] = {};
+			for ( int k = 0; k < K; ++k ) {
+				int e;
+				do { e = rnd() % 512; } while ( used[e] );
+				used[e] = true;
+				hir[r * K + k] = e;
+				local += e < E ? 1 : 0;
+			}
+		}
+		half* xr = static_cast<half*>( upload( hxr.data(), hxr.size() * sizeof( half ) ) );
+		half* wr = static_cast<half*>( upload( hwr.data(), hwr.size() * sizeof( half ) ) );
+		int* ir = static_cast<int*>( upload( hir.data(), hir.size() * sizeof( int ) ) );
+		half* outr = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * H * sizeof( half ) ) );
+		half* hb = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * K * I * sizeof( half ) ) );
+		float* pb = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * K * H * sizeof( float ) ) );
+		engine::modules::NVFP4MoE::forward_rows( t, xr, ir, wr, R, K, hb, pb, disp, counters, nullptr, outr, stream );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		std::vector<half> got( static_cast<size_t>( R ) * H ), one( H );
+		CUDA_CHECK( cudaMemcpy( got.data(), outr, got.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+		size_t bad = 0;
+		for ( int r = 0; r < R; ++r ) {
+			engine::modules::NVFP4MoE::forward_rows( t, xr + static_cast<size_t>( r ) * H, ir + r * K, wr + r * K, 1, K, hbuf, partial, disp, counters, nullptr, out, stream );
+			CUDA_CHECK( cudaStreamSynchronize( stream ) );
+			CUDA_CHECK( cudaMemcpy( one.data(), out, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
+			for ( int n = 0; n < H; ++n ) bad += __half_as_ushort( one[n] ) != __half_as_ushort( got[static_cast<size_t>( r ) * H + n] );
+		}
+		cudaGraph_t g;
+		cudaGraphExec_t ex;
+		CUDA_CHECK( cudaStreamBeginCapture( stream, cudaStreamCaptureModeGlobal ) );
+		for ( int s = 0; s < 16; ++s ) engine::modules::NVFP4MoE::forward_rows( t, xr, ir, wr, R, K, hb, pb, disp, counters, nullptr, outr, stream );
+		CUDA_CHECK( cudaStreamEndCapture( stream, &g ) );
+		CUDA_CHECK( cudaGraphInstantiate( &ex, g, nullptr, nullptr, 0 ) );
+		CUDA_CHECK( cudaGraphLaunch( ex, stream ) );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		cudaEvent_t a0, a1;
+		CUDA_CHECK( cudaEventCreate( &a0 ) );
+		CUDA_CHECK( cudaEventCreate( &a1 ) );
+		CUDA_CHECK( cudaEventRecord( a0, stream ) );
+		for ( int i = 0; i < 20; ++i ) CUDA_CHECK( cudaGraphLaunch( ex, stream ) );
+		CUDA_CHECK( cudaEventRecord( a1, stream ) );
+		CUDA_CHECK( cudaEventSynchronize( a1 ) );
+		float ms = 0.f;
+		CUDA_CHECK( cudaEventElapsedTime( &ms, a0, a1 ) );
+		std::printf( "  rows %2d: %d local routes, %7.1f us per layer, mismatching halves vs single-row calls: %zu\n", R, local, 1000.0 * ms / 20 / 16, bad );
+		CUDA_CHECK( cudaGraphExecDestroy( ex ) );
+		CUDA_CHECK( cudaGraphDestroy( g ) );
+	}
+
 	cudaEvent_t e0, e1;
 	CUDA_CHECK( cudaEventCreate( &e0 ) );
 	CUDA_CHECK( cudaEventCreate( &e1 ) );
@@ -129,7 +186,7 @@ int main() {
 		cudaGraph_t g;
 		cudaGraphExec_t ex;
 		CUDA_CHECK( cudaStreamBeginCapture( stream, cudaStreamCaptureModeGlobal ) );
-		for ( int s = 0; s < SETS; ++s ) engine::modules::NVFP4MoE::forward_rows( t, x, idx + s * K, w, 1, K, hbuf, partial, counters, nullptr, out, stream );
+		for ( int s = 0; s < SETS; ++s ) engine::modules::NVFP4MoE::forward_rows( t, x, idx + s * K, w, 1, K, hbuf, partial, disp, counters, nullptr, out, stream );
 		CUDA_CHECK( cudaStreamEndCapture( stream, &g ) );
 		CUDA_CHECK( cudaGraphInstantiate( &ex, g, nullptr, nullptr, 0 ) );
 		CUDA_CHECK( cudaGraphLaunch( ex, stream ) );

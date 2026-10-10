@@ -647,7 +647,8 @@ pod::MoEScratch MoE::alloc_scratch(
 	if ( nvfp4 ) {
 		s.nv_h = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( MOE_NVFP4_ROWS ) * top_k * intermediate_size * sizeof( half ) ) );
 		s.nv_partial = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( MOE_NVFP4_ROWS ) * top_k * hidden_size * sizeof( float ) ) );
-		const size_t cb = static_cast<size_t>( MOE_NVFP4_ROWS ) * ( hidden_size / 32 ) * sizeof( int );
+		s.nv_disp = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( nvfp4_disp_ints( num_local_experts ) ) * sizeof( int ) ) );
+		const size_t cb = static_cast<size_t>( hidden_size / 32 ) * sizeof( int );
 		s.nv_ctr = static_cast<int*>( engine::core::arena_alloc( arena, cb ) );
 		CUDA_CHECK( cudaMemset( s.nv_ctr, 0, cb ) );
 	}
@@ -698,7 +699,7 @@ void MoE::forward(
 		for ( int r0 = 0; r0 < rows; r0 += MOE_NVFP4_ROWS ) {
 			const int rn = MIN( MOE_NVFP4_ROWS, rows - r0 );
 			NVFP4MoE::forward_rows( t, x.ptr<const half>() + static_cast<size_t>( r0 ) * t.hidden, d_topk_indices + static_cast<size_t>( r0 ) * weights.top_k,
-				d_topk_weights + static_cast<size_t>( r0 ) * weights.top_k, rn, weights.top_k, scratch.nv_h, scratch.nv_partial, scratch.nv_ctr, weights.heat,
+				d_topk_weights + static_cast<size_t>( r0 ) * weights.top_k, rn, weights.top_k, scratch.nv_h, scratch.nv_partial, scratch.nv_disp, scratch.nv_ctr, weights.heat,
 				out.ptr<half>() + static_cast<size_t>( r0 ) * t.hidden, stream );
 		}
 		return;

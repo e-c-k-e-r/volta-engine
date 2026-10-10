@@ -46,7 +46,8 @@ struct MoEScratch {
 	// NVFP4 experts (MOE_NVFP4_ROWS rows per pass)
 	engine::backend::half_t*    nv_h = nullptr;           // [rows * top_k, intermediate]
 	float*   nv_partial = nullptr;     // [rows * top_k, hidden]
-	int*     nv_ctr = nullptr;         // [rows, hidden / 32], zero between calls
+	int*     nv_disp = nullptr;        // route grouping by expert (nvfp4_disp_ints)
+	int*     nv_ctr = nullptr;         // [hidden / 32], zero between calls
 };
 
 } // namespace pod

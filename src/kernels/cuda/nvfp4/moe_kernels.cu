@@ -1,25 +1,81 @@
 #include "engine/modules/nvfp4_moe.h"
+#include "engine/modules/moe.h"
 #include "nvfp4_common.cuh"
 #include <cstdint>
 
-// Fused NVFP4 routed-expert kernels for decode (one row): all of a layer's routes in two launches.
+// Fused NVFP4 routed-expert kernels: all of a layer's routes in three launches (dispatch, gate/up/SiLU, down + ordered weighted sum).
+// Routes are grouped by expert: a block streams one expert's weight tile once and multiplies it with up to 8 of the rows routed to it
+// (the 8 rows of the Volta m8n8k4 A operand); experts with more rows loop over chunks of 8.
 // Weight layout per matrix: tiles of 32 output columns, each [K/16 groups][32 lanes] of uint2 codes (+ one E4M3 scale byte per lane and group).
+//
+// Dispatch buffer (ints): [0] active experts, [DISP_HDR + e] routes of local expert e, [DISP_HDR + E + i] i-th active expert,
+// [DISP_HDR + 2E + e * ROWS + j] j-th route (row * topk + k) of expert e
 
-// Gate and up for one 32-column tile of one route, epilogue silu(gate) * up -> h[route][col]
-template <int WARPS>
-__global__ __launch_bounds__( WARPS * 32 )
-void nvfp4_moe_gate_up( engine::modules::NVFP4ExpertTable t, const half* __restrict__ x, const int* __restrict__ route_idx, int topk, half* __restrict__ h, uint32_t* heat ) {
-	const int route = blockIdx.y;
-	const int e = route_idx[route] - t.min_expert;
-	if ( ( unsigned ) e >= ( unsigned ) t.num_local ) return;
-	if ( heat != nullptr && blockIdx.x == 0 && threadIdx.x == 0 ) atomicAdd( heat + e, 1u );
-	x += ( size_t ) ( route / topk ) * t.hidden;
-	extern __shared__ half sx[];   // K halves
-	__shared__ float cs[WARPS][2][32];
-	const int K = t.hidden, I = t.inter;
-	for ( int i = threadIdx.x * 8; i < K; i += WARPS * 32 * 8 ) *reinterpret_cast<uint4*>( sx + i ) = *reinterpret_cast<const uint4*>( x + i );
+using engine::modules::NVFP4ExpertTable;
+
+#define DISP_HDR 4
+#define ROWS_CAP MOE_NVFP4_ROWS
+
+__global__ __launch_bounds__( 1024 )
+void nvfp4_moe_dispatch( const int* __restrict__ route_idx, int n_routes, int min_expert, int num_local, uint32_t* __restrict__ heat, int* __restrict__ disp ) {
+	__shared__ int cnt[MOE_MAX_EXPERTS];
+	__shared__ int nact;
+	for ( int e = threadIdx.x; e < num_local; e += blockDim.x ) cnt[e] = 0;
+	if ( threadIdx.x == 0 ) nact = 0;
 	__syncthreads();
+	int* list = disp + DISP_HDR + 2 * num_local;
+	for ( int r = threadIdx.x; r < n_routes; r += blockDim.x ) {
+		const int e = route_idx[r] - min_expert;
+		if ( ( unsigned ) e < ( unsigned ) num_local ) {
+			const int pos = atomicAdd( &cnt[e], 1 );
+			list[e * ROWS_CAP + pos] = r;
+		}
+	}
+	__syncthreads();
+	for ( int e = threadIdx.x; e < num_local; e += blockDim.x ) {
+		const int c = cnt[e];
+		disp[DISP_HDR + e] = c;
+		if ( c > 0 ) {
+			disp[DISP_HDR + num_local + atomicAdd( &nact, 1 )] = e;
+			if ( heat != nullptr ) atomicAdd( heat + e, ( uint32_t ) c );
+		}
+	}
+	__syncthreads();
+	if ( threadIdx.x == 0 ) disp[0] = nact;
+}
 
+// Row 0..7 accumulator element (register i of lane) -> (row, col within the 32-column tile)
+DEV_INLINE int acc_row( int i, int lane ) { return ( i & 2 ) | ( ( lane & 16 ) ? 4 : 0 ) | ( lane & 1 ); }
+DEV_INLINE int acc_col( int i, int lane ) { return ( ( lane >> 2 ) & 3 ) * 8 + ( ( i & 1 ) | ( ( ( lane >> 1 ) & 1 ) << 1 ) | ( ( i >> 2 ) << 2 ) ); }
+
+// Gate and up of one 32-column tile for the rows routed to one expert; epilogue silu(gate) * up -> h[route][col]
+template <int WARPS, bool GROUPED>
+__global__ __launch_bounds__( WARPS * 32 )
+void nvfp4_moe_gate_up( NVFP4ExpertTable t, const half* __restrict__ x, const int* __restrict__ disp, const int* __restrict__ route_idx, uint32_t* __restrict__ heat,
+	int topk, half* __restrict__ h ) {
+	// Ungrouped (one row): block row y is route y, no dispatch pass
+	const int E = t.num_local;
+	int e, cnt;
+	const int* list;
+	if ( GROUPED ) {
+		if ( ( int ) blockIdx.y >= disp[0] ) return;
+		e = disp[DISP_HDR + E + blockIdx.y];
+		cnt = disp[DISP_HDR + e];
+		list = disp + DISP_HDR + 2 * E + e * ROWS_CAP;
+	}
+	else {
+		e = route_idx[blockIdx.y] - t.min_expert;
+		if ( ( unsigned ) e >= ( unsigned ) E ) return;
+		if ( heat != nullptr && blockIdx.x == 0 && threadIdx.x == 0 ) atomicAdd( heat + e, 1u );
+		cnt = 1;
+		list = &route_idx[0];   // unused
+	}
+	#define ROUTE_OF( j ) ( GROUPED ? list[j] : ( int ) blockIdx.y )
+	extern __shared__ __align__( 16 ) unsigned char smem[];   // the chunk's input rows [8][K] halves, then (after the loop) the per-warp partial sums
+	half* sx = reinterpret_cast<half*>( smem );
+	float* cs = reinterpret_cast<float*>( smem );   // [warp][gate / up][rows * 32] (one row when ungrouped)
+	constexpr int CS = GROUPED ? 8 * 32 : 32;
+	const int K = t.hidden, I = t.inter;
 	const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 	const int tile = blockIdx.x;
 	const int G = K >> 4, Gq = G / WARPS, g0 = warp * Gq;
@@ -32,85 +88,121 @@ void nvfp4_moe_gate_up( engine::modules::NVFP4ExpertTable t, const half* __restr
 	const half2 gmg = __float2half2_rn( t.gate_g[e] * 16384.f );
 	const half2 gmu = __float2half2_rn( t.up_g[e] * 16384.f );
 
-	float cg[8], cu[8];
-	#pragma unroll
-	for ( int i = 0; i < 8; i++ ) { cg[i] = 0.f; cu[i] = 0.f; }
-
-	#pragma unroll 5
-	for ( int g = g0; g < g0 + Gq; g++ ) {
-		const uint2 qg = __ldcs( gc + ( size_t ) g * 32 );
-		const uint2 qu = __ldcs( uc + ( size_t ) g * 32 );
-		const half2 scg = __hmul2( fp8e4m3_to_half2( __ldcs( gs + ( size_t ) g * 32 ) ), gmg );
-		const half2 scu = __hmul2( fp8e4m3_to_half2( __ldcs( us + ( size_t ) g * 32 ) ), gmu );
-		uint4 a01 = make_uint4( 0, 0, 0, 0 ), a23 = make_uint4( 0, 0, 0, 0 );
-		if ( r == 0 ) {
-			a01 = *reinterpret_cast<const uint4*>( sx + g * 16 );
-			a23 = *reinterpret_cast<const uint4*>( sx + g * 16 + 8 );
+	for ( int c0 = 0; c0 < cnt; c0 += 8 ) {
+		const int m = min( 8, cnt - c0 );
+		for ( int i = threadIdx.x; i < m * ( K / 8 ); i += WARPS * 32 ) {
+			const int j = i / ( K / 8 ), c = i % ( K / 8 );
+			*reinterpret_cast<uint4*>( sx + ( size_t ) j * K + c * 8 ) = __ldg( reinterpret_cast<const uint4*>( x + ( size_t ) ( ROUTE_OF( c0 + j ) / topk ) * K ) + c );
 		}
-		const unsigned* A0 = reinterpret_cast<const unsigned*>( &a01 );
-		const unsigned* A1 = reinterpret_cast<const unsigned*>( &a23 );
-		half2 b[8];
-		dequant8_tm( qg.x, scg, b + 0 );
-		dequant8_tm( qg.y, scg, b + 4 );
-		const unsigned* B = reinterpret_cast<const unsigned*>( b );
-		MMA_8N8K4( cg, A0[0], A0[1], B[0], B[1] );
-		MMA_8N8K4( cg, A0[2], A0[3], B[2], B[3] );
-		MMA_8N8K4( cg, A1[0], A1[1], B[4], B[5] );
-		MMA_8N8K4( cg, A1[2], A1[3], B[6], B[7] );
-		dequant8_tm( qu.x, scu, b + 0 );
-		dequant8_tm( qu.y, scu, b + 4 );
-		MMA_8N8K4( cu, A0[0], A0[1], B[0], B[1] );
-		MMA_8N8K4( cu, A0[2], A0[3], B[2], B[3] );
-		MMA_8N8K4( cu, A1[0], A1[1], B[4], B[5] );
-		MMA_8N8K4( cu, A1[2], A1[3], B[6], B[7] );
-	}
+		__syncthreads();
+		const half* xr = r < m ? sx + ( size_t ) r * K : nullptr;
+		float cg[8], cu[8];
+		#pragma unroll
+		for ( int i = 0; i < 8; i++ ) { cg[i] = 0.f; cu[i] = 0.f; }
 
-	// Row 0 of the accumulator lives in lanes with (lane & 17) == 0, registers {0, 1, 4, 5}
-	if ( ( lane & 17 ) == 0 ) {
-		const int qp = ( lane >> 2 ) & 3;
-		#pragma unroll
-		for ( int j = 0; j < 4; j++ ) {
-			const int i = ( j & 1 ) | ( ( j >> 1 ) << 2 );
-			const int col = qp * 8 + ( ( i & 1 ) | ( ( ( lane >> 1 ) & 1 ) << 1 ) | ( ( i >> 2 ) << 2 ) );
-			cs[warp][0][col] = cg[i];
-			cs[warp][1][col] = cu[i];
+		#pragma unroll 5
+		for ( int g = g0; g < g0 + Gq; g++ ) {
+			const uint2 qg = __ldcs( gc + ( size_t ) g * 32 );
+			const uint2 qu = __ldcs( uc + ( size_t ) g * 32 );
+			const half2 scg = __hmul2( fp8e4m3_to_half2( __ldcs( gs + ( size_t ) g * 32 ) ), gmg );
+			const half2 scu = __hmul2( fp8e4m3_to_half2( __ldcs( us + ( size_t ) g * 32 ) ), gmu );
+			uint4 a01 = make_uint4( 0, 0, 0, 0 ), a23 = make_uint4( 0, 0, 0, 0 );
+			if ( xr != nullptr ) {
+				a01 = *reinterpret_cast<const uint4*>( xr + g * 16 );
+				a23 = *reinterpret_cast<const uint4*>( xr + g * 16 + 8 );
+			}
+			const unsigned* A0 = reinterpret_cast<const unsigned*>( &a01 );
+			const unsigned* A1 = reinterpret_cast<const unsigned*>( &a23 );
+			half2 b[8];
+			dequant8_tm( qg.x, scg, b + 0 );
+			dequant8_tm( qg.y, scg, b + 4 );
+			const unsigned* B = reinterpret_cast<const unsigned*>( b );
+			MMA_8N8K4( cg, A0[0], A0[1], B[0], B[1] );
+			MMA_8N8K4( cg, A0[2], A0[3], B[2], B[3] );
+			MMA_8N8K4( cg, A1[0], A1[1], B[4], B[5] );
+			MMA_8N8K4( cg, A1[2], A1[3], B[6], B[7] );
+			dequant8_tm( qu.x, scu, b + 0 );
+			dequant8_tm( qu.y, scu, b + 4 );
+			MMA_8N8K4( cu, A0[0], A0[1], B[0], B[1] );
+			MMA_8N8K4( cu, A0[2], A0[3], B[2], B[3] );
+			MMA_8N8K4( cu, A1[0], A1[1], B[4], B[5] );
+			MMA_8N8K4( cu, A1[2], A1[3], B[6], B[7] );
 		}
-	}
-	__syncthreads();
-	if ( threadIdx.x < 32 ) {
-		float g = 0.f, u = 0.f;
-		#pragma unroll
-		for ( int w = 0; w < WARPS; w++ ) { g += cs[w][0][threadIdx.x]; u += cs[w][1][threadIdx.x]; }
-		const float gh = __half2float( __float2half( g ) ), uh = __half2float( __float2half( u ) );
-		h[( size_t ) route * I + tile * 32 + threadIdx.x] = __float2half( gh / ( 1.0f + __expf( -gh ) ) * uh );
+
+		__syncthreads();   // every warp is done reading the input rows
+		if ( GROUPED ) {
+			#pragma unroll
+			for ( int i = 0; i < 8; i++ ) {
+				cs[( warp * 2 + 0 ) * CS + acc_row( i, lane ) * 32 + acc_col( i, lane )] = cg[i];
+				cs[( warp * 2 + 1 ) * CS + acc_row( i, lane ) * 32 + acc_col( i, lane )] = cu[i];
+			}
+		}
+		else if ( ( lane & 17 ) == 0 ) {   // row 0 only
+			#pragma unroll
+			for ( int i = 0; i < 8; i += ( i & 1 ) ? 3 : 1 ) {   // registers 0, 1, 4, 5
+				cs[( warp * 2 + 0 ) * CS + acc_col( i, lane )] = cg[i];
+				cs[( warp * 2 + 1 ) * CS + acc_col( i, lane )] = cu[i];
+			}
+		}
+		__syncthreads();
+		if ( threadIdx.x < 256 && ( threadIdx.x >> 5 ) < m ) {
+			float g = 0.f, u = 0.f;
+			#pragma unroll
+			for ( int w = 0; w < WARPS; w++ ) { g += cs[( w * 2 + 0 ) * CS + threadIdx.x]; u += cs[( w * 2 + 1 ) * CS + threadIdx.x]; }
+			const float gh = __half2float( __float2half( g ) ), uh = __half2float( __float2half( u ) );
+			h[( size_t ) ROUTE_OF( c0 + ( threadIdx.x >> 5 ) ) * I + tile * 32 + ( threadIdx.x & 31 )] = __float2half( gh / ( 1.0f + __expf( -gh ) ) * uh );
+		}
+		__syncthreads();
 	}
 }
 
-// Down projection of one route and 32-column tile into partial[route][col]; the last block to finish a tile sums the routes in order, weighted
-template <int WARPS>
+// Down projection of one expert's rows for one 32-column tile into partial[route][col]; the last block to finish a tile sums every row's routes
+// in order, weighted
+template <int WARPS, bool GROUPED>
 __global__ __launch_bounds__( WARPS * 32 )
-void nvfp4_moe_down( engine::modules::NVFP4ExpertTable t, const half* __restrict__ h, const int* __restrict__ route_idx, const half* __restrict__ route_w,
-	int n_routes, float* __restrict__ partial, int* __restrict__ counters, half* __restrict__ out ) {
-	const int route = blockIdx.y;
-	const int row = route / n_routes;
-	const int e = route_idx[route] - t.min_expert;
+void nvfp4_moe_down( NVFP4ExpertTable t, const half* __restrict__ h, const int* __restrict__ disp, const int* __restrict__ route_idx,
+	const half* __restrict__ route_w, int rows, int topk, float* __restrict__ partial, int* __restrict__ counters, half* __restrict__ out ) {
+	// Grouped: block row y is the y-th active expert; with no local route block 0 of each tile still writes the zero output.
+	// Ungrouped (one row): block row y is route y, every route's block takes part in the tile's completion count
+	const int E = t.num_local;
+	int nact, e, cnt;
+	const int* list;
+	if ( GROUPED ) {
+		nact = max( disp[0], 1 );
+		if ( ( int ) blockIdx.y >= nact ) return;
+		e = disp[0] > 0 ? disp[DISP_HDR + E + blockIdx.y] : 0;
+		cnt = disp[0] > 0 ? disp[DISP_HDR + e] : 0;
+		list = disp + DISP_HDR + 2 * E + e * ROWS_CAP;
+	}
+	else {
+		nact = topk;
+		e = route_idx[blockIdx.y] - t.min_expert;
+		cnt = ( unsigned ) e < ( unsigned ) E ? 1 : 0;
+		list = route_idx;   // unused
+	}
 	const int H = t.hidden, K = t.inter;
 	const int tile = blockIdx.x;
-	counters += row * ( H / 32 );
-	out += ( size_t ) row * H;
-	__shared__ float cs[WARPS][32];
+	extern __shared__ __align__( 16 ) unsigned char smem[];   // the chunk's input rows [8][K] halves, then the per-warp partial sums
+	half* sx = reinterpret_cast<half*>( smem );
+	float* cs = reinterpret_cast<float*>( smem );
+	constexpr int CS = GROUPED ? 8 * 32 : 32;
 	__shared__ int last;
-	if ( ( unsigned ) e < ( unsigned ) t.num_local ) {
-		extern __shared__ half sx[];
-		for ( int i = threadIdx.x * 8; i < K; i += WARPS * 32 * 8 ) *reinterpret_cast<uint4*>( sx + i ) = *reinterpret_cast<const uint4*>( h + ( size_t ) route * K + i );
+	const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+	const int G = K >> 4, Gq = G / WARPS, g0 = warp * Gq;
+	const int r = ( lane & 3 ) + ( ( lane & 16 ) ? 4 : 0 );
+	const size_t off = ( size_t ) tile * G * 32 + lane;
+	const uint2* dc = reinterpret_cast<const uint2*>( t.down_c[e] ) + off;
+	const uint8_t* ds = t.down_s[e] + off;
+	const half2 gm = __float2half2_rn( t.down_g[e] * 16384.f );
+
+	for ( int c0 = 0; c0 < cnt; c0 += 8 ) {
+		const int m = min( 8, cnt - c0 );
+		for ( int i = threadIdx.x; i < m * ( K / 8 ); i += WARPS * 32 ) {
+			const int j = i / ( K / 8 ), c = i % ( K / 8 );
+			*reinterpret_cast<uint4*>( sx + ( size_t ) j * K + c * 8 ) = *( reinterpret_cast<const uint4*>( h + ( size_t ) ROUTE_OF( c0 + j ) * K ) + c );
+		}
 		__syncthreads();
-		const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-		const int G = K >> 4, Gq = G / WARPS, g0 = warp * Gq;
-		const int r = ( lane & 3 ) + ( ( lane & 16 ) ? 4 : 0 );
-		const size_t off = ( size_t ) tile * G * 32 + lane;
-		const uint2* dc = reinterpret_cast<const uint2*>( t.down_c[e] ) + off;
-		const uint8_t* ds = t.down_s[e] + off;
-		const half2 gm = __float2half2_rn( t.down_g[e] * 16384.f );
+		const half* hr = r < m ? sx + ( size_t ) r * K : nullptr;
 		float c[8];
 		#pragma unroll
 		for ( int i = 0; i < 8; i++ ) c[i] = 0.f;
@@ -119,9 +211,9 @@ void nvfp4_moe_down( engine::modules::NVFP4ExpertTable t, const half* __restrict
 			const uint2 q = __ldcs( dc + ( size_t ) g * 32 );
 			const half2 sc = __hmul2( fp8e4m3_to_half2( __ldcs( ds + ( size_t ) g * 32 ) ), gm );
 			uint4 a01 = make_uint4( 0, 0, 0, 0 ), a23 = make_uint4( 0, 0, 0, 0 );
-			if ( r == 0 ) {
-				a01 = *reinterpret_cast<const uint4*>( sx + g * 16 );
-				a23 = *reinterpret_cast<const uint4*>( sx + g * 16 + 8 );
+			if ( hr != nullptr ) {
+				a01 = *reinterpret_cast<const uint4*>( hr + g * 16 );
+				a23 = *reinterpret_cast<const uint4*>( hr + g * 16 + 8 );
 			}
 			const unsigned* A0 = reinterpret_cast<const unsigned*>( &a01 );
 			const unsigned* A1 = reinterpret_cast<const unsigned*>( &a23 );
@@ -134,36 +226,41 @@ void nvfp4_moe_down( engine::modules::NVFP4ExpertTable t, const half* __restrict
 			MMA_8N8K4( c, A1[0], A1[1], B[4], B[5] );
 			MMA_8N8K4( c, A1[2], A1[3], B[6], B[7] );
 		}
-		if ( ( lane & 17 ) == 0 ) {
-			const int qp = ( lane >> 2 ) & 3;
+		__syncthreads();
+		#pragma unroll
+		if ( GROUPED ) {
 			#pragma unroll
-			for ( int j = 0; j < 4; j++ ) {
-				const int i = ( j & 1 ) | ( ( j >> 1 ) << 2 );
-				const int col = ( i & 1 ) | ( ( ( lane >> 1 ) & 1 ) << 1 ) | ( ( i >> 2 ) << 2 );
-				cs[warp][qp * 8 + col] = c[i];
-			}
+			for ( int i = 0; i < 8; i++ ) cs[warp * CS + acc_row( i, lane ) * 32 + acc_col( i, lane )] = c[i];
+		}
+		else if ( ( lane & 17 ) == 0 ) {   // row 0 only
+			#pragma unroll
+			for ( int i = 0; i < 8; i += ( i & 1 ) ? 3 : 1 ) cs[warp * CS + acc_col( i, lane )] = c[i];
 		}
 		__syncthreads();
-		if ( threadIdx.x < 32 ) {
+		if ( threadIdx.x < 256 && ( threadIdx.x >> 5 ) < m ) {
 			float v = 0.f;
 			#pragma unroll
-			for ( int w = 0; w < WARPS; w++ ) v += cs[w][threadIdx.x];
-			partial[( size_t ) route * H + tile * 32 + threadIdx.x] = __half2float( __float2half( v ) );
+			for ( int w = 0; w < WARPS; w++ ) v += cs[w * CS + threadIdx.x];
+			partial[( size_t ) ROUTE_OF( c0 + ( threadIdx.x >> 5 ) ) * H + tile * 32 + ( threadIdx.x & 31 )] = __half2float( __float2half( v ) );
 		}
+		__syncthreads();
 	}
 	// Last block of the tile reduces over routes (fixed order)
 	__threadfence();
 	__syncthreads();
-	if ( threadIdx.x == 0 ) last = atomicAdd( counters + tile, 1 ) == n_routes - 1;
+	if ( threadIdx.x == 0 ) last = atomicAdd( counters + tile, 1 ) == nact - 1;
 	__syncthreads();
-	if ( last && threadIdx.x < 32 ) {
+	if ( last ) {
 		__threadfence();
-		float acc = 0.f;
-		for ( int k = 0; k < n_routes; k++ ) {
-			const int r = row * n_routes + k;
-			if ( ( unsigned ) ( route_idx[r] - t.min_expert ) < ( unsigned ) t.num_local ) acc += __half2float( route_w[r] ) * __ldcg( partial + ( size_t ) r * H + tile * 32 + threadIdx.x );
+		for ( int o = threadIdx.x; o < rows * 32; o += blockDim.x ) {
+			const int row = o >> 5, col = o & 31;
+			float acc = 0.f;
+			for ( int k = 0; k < topk; k++ ) {
+				const int rt = row * topk + k;
+				if ( ( unsigned ) ( route_idx[rt] - t.min_expert ) < ( unsigned ) E ) acc += __half2float( route_w[rt] ) * __ldcg( partial + ( size_t ) rt * H + tile * 32 + col );
+			}
+			out[( size_t ) row * H + tile * 32 + col] = __float2half( acc );
 		}
-		out[tile * 32 + threadIdx.x] = __float2half( acc );
 		if ( threadIdx.x == 0 ) counters[tile] = 0;
 	}
 }
@@ -171,11 +268,18 @@ void nvfp4_moe_down( engine::modules::NVFP4ExpertTable t, const half* __restrict
 namespace engine::modules {
 
 void NVFP4MoE::forward_rows( const NVFP4ExpertTable& t, const half* x, const int* route_idx, const half* route_w, int rows, int topk,
-	half* h, float* partial, int* counters, uint32_t* heat, half* out, backend::stream_t stream ) {
+	half* h, float* partial, int* disp, int* counters, uint32_t* heat, half* out, backend::stream_t stream ) {
 	ENGINE_ASSERT( t.hidden % 64 == 0 && t.inter % 64 == 0 && t.inter % 32 == 0 && t.hidden % 32 == 0, "NVFP4 MoE: dims" );
-	ENGINE_ASSERT( ( t.hidden / 16 ) % 16 == 0 && ( t.inter / 16 ) % 8 == 0, "NVFP4 MoE: group counts" );
-	nvfp4_moe_gate_up<16><<<dim3( t.inter / 32, rows * topk ), 512, t.hidden * sizeof( half ), stream>>>( t, x, route_idx, topk, h, heat );
-	nvfp4_moe_down<8><<<dim3( t.hidden / 32, rows * topk ), 256, t.inter * sizeof( half ), stream>>>( t, h, route_idx, route_w, topk, partial, counters, out );
+	ENGINE_ASSERT( ( t.hidden / 16 ) % 16 == 0 && ( t.inter / 16 ) % 8 == 0 && rows <= ROWS_CAP && t.num_local <= MOE_MAX_EXPERTS, "NVFP4 MoE: group counts / rows" );
+	if ( rows == 1 ) {
+		nvfp4_moe_gate_up<16, false><<<dim3( t.inter / 32, topk ), 512, MAX( t.hidden * 2, 16 * 2 * 32 * 4 ), stream>>>( t, x, disp, route_idx, heat, topk, h );
+		nvfp4_moe_down<8, false><<<dim3( t.hidden / 32, topk ), 256, MAX( t.inter * 2, 8 * 32 * 4 ), stream>>>( t, h, disp, route_idx, route_w, rows, topk, partial, counters, out );
+		return;
+	}
+	const int active_max = MIN( t.num_local, rows * topk );
+	nvfp4_moe_dispatch<<<1, 1024, 0, stream>>>( route_idx, rows * topk, t.min_expert, t.num_local, heat, disp );
+	nvfp4_moe_gate_up<16, true><<<dim3( t.inter / 32, active_max ), 512, MAX( MIN( rows, 8 ) * t.hidden * 2, 16 * 2 * 8 * 32 * 4 ), stream>>>( t, x, disp, route_idx, nullptr, topk, h );
+	nvfp4_moe_down<8, true><<<dim3( t.hidden / 32, active_max ), 256, MAX( MIN( rows, 8 ) * t.inter * 2, 8 * 8 * 32 * 4 ), stream>>>( t, h, disp, route_idx, route_w, rows, topk, partial, counters, out );
 }
 
 } // namespace engine::modules
