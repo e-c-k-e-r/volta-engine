@@ -84,6 +84,8 @@ public:
 	int sample_one();
 	// Adapts the routed-expert residency (ENGINE_EXPERT_CACHE) to the routing seen since the last call; false when no model tiers
 	bool rebalance_experts();
+	// Routed-expert route counts since the previous call, per rank: layers x experts of that rank's partition; false when the model keeps none
+	bool expert_heat( std::vector<std::vector<uint32_t>>& per_rank, int& layers, int& experts );
 
 	// Pre-capture decode graphs for row counts 1..max_m (two dummy forwards each on `slot`,
 	// which is reset afterwards) so serving never pays eager warm-up or capture mid-stream.

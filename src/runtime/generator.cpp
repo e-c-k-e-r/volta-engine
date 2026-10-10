@@ -16,6 +16,7 @@ Generator::~Generator() {
 bool Generator::init( const engine::server::ServerConfig& config ) {
 	config_ = config;
 	boot_time_ = std::chrono::steady_clock::now();
+	hist_last_ = heat_last_ = boot_time_;
 	LOG_INFO( "Generator initializing: model=%s dir=%s\n", config_.model_type.c_str(), config_.model_dir.c_str() );
 
 	if ( !config_.load_weights ) {
@@ -124,6 +125,7 @@ void Generator::scheduler_loop() {
 			any_active = any_active || slots_[s].active;
 		}
 		if ( !any_active ) {
+			if ( published_active_ ) publish_slots();
 			std::unique_lock<std::mutex> lock( queue_mtx_ );
 			queue_cv_.wait_for( lock, std::chrono::milliseconds( 2 ), [&]() {
 				return !pending_queue_.empty() || !running_.load();
@@ -132,6 +134,8 @@ void Generator::scheduler_loop() {
 		}
 		step_batch();
 		for ( int s = 0; s < num_slots_; ++s ) apply_forced_close( s );
+		publish_slots();
+		fold_expert_heat();
 	}
 }
 
@@ -139,6 +143,17 @@ bool Generator::emit_token( int s, int tok ) {
 	Slot& slot = slots_[s];
 	slot.all_tokens.push_back( tok );
 	slot.tokens_generated++;
+	tokens_out_.fetch_add( 1, std::memory_order_relaxed );
+	{
+		// the gap a client sees between bursts of tokens (the tokens of one speculation round arrive together)
+		const auto now = std::chrono::steady_clock::now();
+		const double gap_ms = std::chrono::duration<double, std::milli>( now - slot.last_emit ).count();
+		if ( slot.tokens_generated > 1 && gap_ms > 1.0 ) {
+			std::unique_lock<std::mutex> mlock( metrics_mtx_ );
+			gap_ring_[gap_n_++ % gap_ring_.size()] = static_cast<float>( gap_ms );
+		}
+		slot.last_emit = now;
+	}
 
 	const bool eos = cluster_.is_eos( tok ) || tok == tokenizer_.eos_id() || tok == tokenizer_.im_end_id();
 	FinishReason reason = FinishReason::Stop;
@@ -221,6 +236,23 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 		sum_prefill_tok_s_ += slot.metrics.prefill_tok_s;
 		sum_decode_tok_s_ += slot.metrics.decode_tok_s;
 		completed_requests_++;
+		const double ttft = std::chrono::duration<double, std::milli>( slot.metrics.first_token_time - slot.metrics.start_time ).count();
+		finished_[static_cast<int>( reason )]++;
+		prompt_tokens_total_ += static_cast<uint64_t>( slot.metrics.prompt_tokens );
+		cached_tokens_total_ += static_cast<uint64_t>( slot.metrics.cached_tokens );
+		ttft_ring_[ttft_n_++ % ttft_ring_.size()] = static_cast<float>( ttft );
+		RequestRecord rec;
+		rec.req_id = slot.req.req_id;
+		rec.end_s = std::chrono::duration<double>( now - boot_time_ ).count();
+		rec.prompt_tokens = slot.metrics.prompt_tokens;
+		rec.cached_tokens = slot.metrics.cached_tokens;
+		rec.generated = slot.tokens_generated;
+		rec.ttft_ms = ttft;
+		rec.total_ms = std::chrono::duration<double, std::milli>( now - slot.metrics.start_time ).count();
+		rec.decode_tok_s = slot.metrics.decode_tok_s;
+		rec.reason = reason;
+		recent_.push_back( rec );
+		while ( recent_.size() > 40 ) recent_.pop_front();
 	}
 	slot.active = false;
 	if ( !slot.req.images.empty() ) cluster_.set_slot_mm( s, MmLayout() );
@@ -340,6 +372,7 @@ bool Generator::prefill_slot( int s, int budget ) {
 		if ( seg_end >= n ) {
 			Candidates first_cands;
 			int first = cluster_.prefill( prompt.data() + pos, n - pos, s, 0, slot.sp.greedy() ? nullptr : &first_cands, pos );
+			tokens_prefilled_.fetch_add( static_cast<uint64_t>( n - pos ), std::memory_order_relaxed );
 			if ( !slot.sp.greedy() ) first = sample_token( first_cands, slot.sp, slot.rng );
 			slot.current_pos = n;
 			slot.prefill_done = true;
@@ -353,6 +386,7 @@ bool Generator::prefill_slot( int s, int budget ) {
 			return true;
 		}
 		cluster_.prefill( prompt.data() + pos, seg_end - pos, s, 0, nullptr, pos );
+		tokens_prefilled_.fetch_add( static_cast<uint64_t>( seg_end - pos ), std::memory_order_relaxed );
 		fed += seg_end - pos;
 		pos = seg_end;
 		if ( is_cp && seg_end == end ) {
@@ -515,6 +549,7 @@ void Generator::step_batch() {
 			slot.last_token = res[i].emitted[res[i].emitted_count - 1];
 			{
 				std::unique_lock<std::mutex> mlock( metrics_mtx_ );
+				spec_rounds_++;
 				spec_proposals_ += res[i].proposed;
 				spec_accepted_ += res[i].accepted;
 			}
@@ -540,6 +575,7 @@ void Generator::step_batch() {
 		slot.last_token = r.emitted[r.emitted_count - 1];
 		{
 			std::unique_lock<std::mutex> mlock( metrics_mtx_ );
+			spec_rounds_++;
 			spec_proposals_ += r.proposed;
 			spec_accepted_ += r.accepted;
 		}
@@ -620,6 +656,146 @@ EngineMetrics Generator::get_metrics() const {
 	m.gpu_vram_used_bytes.resize( cluster_.tp() );
 	for ( int d = 0; d < cluster_.tp(); ++d ) {
 		m.gpu_vram_used_bytes[d] = cluster_.arena( d ).total_bytes;
+	}
+	return m;
+}
+
+// ---- monitor page data ----
+
+void Generator::publish_slots() {
+	const auto now = std::chrono::steady_clock::now();
+	std::unique_lock<std::mutex> lock( metrics_mtx_ );
+	bool any = false;
+	for ( int s = 0; s < MAX_SLOTS; ++s ) {
+		SlotView& v = slot_view_[s];
+		const Slot& slot = slots_[s];
+		v = SlotView();
+		if ( s >= num_slots_ || !slot.active ) continue;
+		any = true;
+		v.active = true;
+		v.prefilling = !slot.prefill_done;
+		v.reasoning = slot.in_reasoning;
+		v.req_id = slot.req.req_id;
+		v.pos = slot.prefill_done ? slot.current_pos : slot.pf_pos;
+		v.prompt_tokens = static_cast<int>( slot.req.prompt_tokens.size() );
+		v.cached_tokens = slot.pf_resumed;
+		v.generated = slot.tokens_generated;
+		v.max_tokens = slot.req.max_tokens;
+		v.age_s = std::chrono::duration<double>( now - slot.metrics.start_time ).count();
+		if ( slot.prefill_done && slot.tokens_generated > 1 ) {
+			const double d = std::chrono::duration<double>( now - slot.metrics.first_token_time ).count();
+			if ( d > 0.0 ) v.decode_tok_s = ( slot.tokens_generated - 1 ) / d;
+		}
+	}
+	published_active_ = any;
+	tick_history_locked( now );
+}
+
+void Generator::tick_history_locked( std::chrono::steady_clock::time_point now ) const {
+	int active = 0;
+	for ( int s = 0; s < MAX_SLOTS; ++s ) active += slot_view_[s].active ? 1 : 0;
+	const double behind = std::chrono::duration<double>( now - hist_last_ ).count();
+	if ( behind < 1.0 ) return;
+	const uint64_t out = tokens_out_.load( std::memory_order_relaxed ), pf = tokens_prefilled_.load( std::memory_order_relaxed );
+	// the counters moved over `behind` seconds; seconds with nothing in them are zero rate
+	const int secs = static_cast<int>( MIN( behind, 3600.0 ) );
+	for ( int i = 0; i < secs; ++i ) {
+		HistorySample h;
+		h.t = std::chrono::duration<double>( hist_last_ - boot_time_ ).count() + i + 1;
+		const bool last = i == secs - 1;
+		h.decode_tok_s = last ? static_cast<float>( ( out - hist_out_ ) / behind ) : 0.0f;
+		h.prefill_tok_s = last ? static_cast<float>( ( pf - hist_pf_ ) / behind ) : 0.0f;
+		h.active = last ? active : 0;
+		history_.push_back( h );
+	}
+	while ( history_.size() > 900 ) history_.pop_front();
+	hist_last_ += std::chrono::seconds( secs );
+	hist_out_ = out;
+	hist_pf_ = pf;
+}
+
+void Generator::fold_expert_heat() {
+	if ( heat_off_ || !runtime::options().expert_stats ) return;
+	const auto now = std::chrono::steady_clock::now();
+	if ( std::chrono::duration<double>( now - heat_last_ ).count() < 1.0 ) return;
+	heat_last_ = now;
+	bool any = false;
+	for ( int s = 0; s < num_slots_; ++s ) any = any || slots_[s].active;
+	if ( !any ) return;
+	std::vector<std::vector<uint32_t>> per_rank;
+	int layers = 0, experts = 0;
+	if ( !cluster_.expert_heat( per_rank, layers, experts ) ) {
+		heat_off_ = true;
+		return;
+	}
+	std::unique_lock<std::mutex> lock( metrics_mtx_ );
+	const size_t per = static_cast<size_t>( layers ) * experts;
+	if ( experts_.layers != layers || experts_.experts != experts || experts_.ranks != static_cast<int>( per_rank.size() ) ) {
+		experts_.ranks = static_cast<int>( per_rank.size() );
+		experts_.layers = layers;
+		experts_.experts = experts;
+		experts_.total.assign( per * per_rank.size(), 0 );
+		experts_.recent.assign( per * per_rank.size(), 0.0f );
+	}
+	for ( size_t r = 0; r < per_rank.size(); ++r ) {
+		if ( per_rank[r].size() != per ) continue;
+		for ( size_t i = 0; i < per; ++i ) {
+			experts_.total[r * per + i] += per_rank[r][i];
+			experts_.recent[r * per + i] = experts_.recent[r * per + i] * 0.95f + static_cast<float>( per_rank[r][i] );
+		}
+	}
+}
+
+ExpertStats Generator::get_expert_stats() const {
+	std::unique_lock<std::mutex> lock( metrics_mtx_ );
+	return experts_;
+}
+
+static void percentiles( std::vector<float> v, const double* q, double* out, int n ) {
+	if ( v.empty() ) return;
+	std::sort( v.begin(), v.end() );
+	for ( int i = 0; i < n; ++i ) out[i] = v[MIN( v.size() - 1, static_cast<size_t>( q[i] * ( v.size() - 1 ) + 0.5 ) )];
+}
+
+MonitorSnapshot Generator::get_monitor() const {
+	MonitorSnapshot m;
+	const auto now = std::chrono::steady_clock::now();
+	m.uptime_seconds = std::chrono::duration<double>( now - boot_time_ ).count();
+	m.num_slots = num_slots_;
+	m.max_context = cluster_.metadata().max_seq_len;
+	m.tp = cluster_.tp();
+	{
+		std::unique_lock<std::mutex> qlock( queue_mtx_ );
+		m.queued = pending_queue_.size();
+	}
+	std::unique_lock<std::mutex> lock( metrics_mtx_ );
+	tick_history_locked( now );
+	m.requests = total_requests_;
+	m.completed = completed_requests_;
+	m.tokens_out = tokens_out_.load( std::memory_order_relaxed );
+	m.tokens_prefilled = tokens_prefilled_.load( std::memory_order_relaxed );
+	m.prompt_tokens = prompt_tokens_total_;
+	m.cached_tokens = cached_tokens_total_;
+	for ( int i = 0; i < 4; ++i ) m.finished[i] = finished_[i];
+	m.spec_rounds = spec_rounds_;
+	m.spec_proposed = spec_proposals_;
+	m.spec_accepted = spec_accepted_;
+	for ( int s = 0; s < num_slots_; ++s ) m.slots.push_back( slot_view_[s] );
+	m.recent.assign( recent_.begin(), recent_.end() );
+	m.history.assign( history_.begin(), history_.end() );
+	const size_t ng = MIN( gap_n_, gap_ring_.size() ), nt = MIN( ttft_n_, ttft_ring_.size() );
+	std::vector<float> gaps( gap_ring_.begin(), gap_ring_.begin() + ng ), ttfts( ttft_ring_.begin(), ttft_ring_.begin() + nt );
+	lock.unlock();
+	m.gap_samples = ng;
+	const double gq[4] = { 0.5, 0.9, 0.99, 0.999 }, tq[3] = { 0.5, 0.9, 0.99 };
+	percentiles( gaps, gq, m.gap_ms, 4 );
+	if ( !gaps.empty() ) m.gap_ms[4] = *std::max_element( gaps.begin(), gaps.end() );
+	percentiles( ttfts, tq, m.ttft_ms, 3 );
+	m.gap_hist.assign( 12, 0.0f );
+	for ( float g : gaps ) {
+		int b = 0;
+		for ( float t = 2.0f; g >= t && b < 11; t *= 2.0f ) ++b;
+		m.gap_hist[b] += 1.0f;
 	}
 	return m;
 }

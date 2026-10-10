@@ -24,6 +24,7 @@
 #include <thread>
 #include <pthread.h>
 #include <list>
+#include <deque>
 #include <unordered_map>
 
 namespace engine::runtime {
@@ -93,6 +94,65 @@ struct EngineMetrics {
 	bool prefix_enabled = false;
 };
 
+// What the monitor page shows: live slots, the last finished requests, per-second rates, latency samples and expert routing
+struct SlotView {
+	bool active = false;
+	bool prefilling = false;
+	bool reasoning = false;
+	uint64_t req_id = 0;
+	int pos = 0;                 // tokens in the slot's context
+	int prompt_tokens = 0;
+	int cached_tokens = 0;
+	int generated = 0;
+	int max_tokens = 0;
+	double age_s = 0.0;
+	double decode_tok_s = 0.0;   // since the first token
+};
+
+struct RequestRecord {
+	uint64_t req_id = 0;
+	double end_s = 0.0;          // engine uptime at the end
+	int prompt_tokens = 0;
+	int cached_tokens = 0;
+	int generated = 0;
+	double ttft_ms = 0.0;
+	double total_ms = 0.0;
+	double decode_tok_s = 0.0;
+	FinishReason reason = FinishReason::Stop;
+};
+
+struct HistorySample {
+	double t = 0.0;              // engine uptime of the end of the second
+	float decode_tok_s = 0.0f;
+	float prefill_tok_s = 0.0f;
+	int active = 0;
+};
+
+struct ExpertStats {
+	int ranks = 0, layers = 0, experts = 0;     // experts: per rank
+	std::vector<uint64_t> total;                // [rank][layer][expert] routes since boot
+	std::vector<float> recent;                  // the same, exponentially decayed (about the last minute)
+};
+
+struct MonitorSnapshot {
+	double uptime_seconds = 0.0;
+	int num_slots = 0;
+	int max_context = 0;
+	int tp = 0;
+	size_t queued = 0;
+	uint64_t requests = 0, completed = 0;
+	uint64_t tokens_out = 0, tokens_prefilled = 0, prompt_tokens = 0, cached_tokens = 0;
+	uint64_t finished[4] = {};                  // by FinishReason
+	uint64_t spec_rounds = 0, spec_proposed = 0, spec_accepted = 0;
+	double gap_ms[5] = {};                      // token-gap percentiles: p50 p90 p99 p999 max, over the last samples
+	double ttft_ms[3] = {};                     // p50 p90 p99 over the last requests
+	size_t gap_samples = 0;
+	std::vector<SlotView> slots;
+	std::vector<RequestRecord> recent;          // newest last
+	std::vector<HistorySample> history;         // one per second, oldest first
+	std::vector<float> gap_hist;                // token-gap histogram, log2 buckets from 1 ms (counts)
+};
+
 class Generator {
 public:
 	Generator();
@@ -104,6 +164,9 @@ public:
 	bool submit_request( GenerationRequest req );
 
 	EngineMetrics get_metrics() const;
+	MonitorSnapshot get_monitor() const;
+	// Route counts of the routed experts (empty when the model keeps none); a copy, taken under the metrics lock
+	ExpertStats get_expert_stats() const;
 
 	const engine::loader::Tokenizer& tokenizer() const {
 		return tokenizer_;
@@ -146,6 +209,7 @@ private:
 		std::vector<int> key_tokens;   // prompt_tokens with image placeholders replaced by content keys (empty without images)
 		SlotMetrics metrics;
 		SpecController ctrl;
+		std::chrono::steady_clock::time_point last_emit;
 	};
 
 	void scheduler_loop();
@@ -185,7 +249,7 @@ private:
 	int num_slots_ = 1;
 	Slot slots_[MAX_SLOTS];
 
-	std::mutex queue_mtx_;
+	mutable std::mutex queue_mtx_;
 	std::condition_variable queue_cv_;
 	std::vector<GenerationRequest> pending_queue_;
 
@@ -198,6 +262,26 @@ private:
 	uint64_t completed_requests_ = 0;
 	uint64_t spec_proposals_ = 0;
 	uint64_t spec_accepted_ = 0;
+
+	// Monitor state (metrics_mtx_ guards everything but the two atomics)
+	void publish_slots();
+	void tick_history_locked( std::chrono::steady_clock::time_point now ) const;
+	void fold_expert_heat();
+	std::atomic<uint64_t> tokens_out_{ 0 };
+	std::atomic<uint64_t> tokens_prefilled_{ 0 };
+	uint64_t prompt_tokens_total_ = 0, cached_tokens_total_ = 0, finished_[4] = {}, spec_rounds_ = 0;
+	SlotView slot_view_[MAX_SLOTS];
+	std::deque<RequestRecord> recent_;
+	std::vector<float> gap_ring_ = std::vector<float>( 4096, 0.0f );
+	std::vector<float> ttft_ring_ = std::vector<float>( 256, 0.0f );
+	size_t gap_n_ = 0, ttft_n_ = 0;
+	mutable std::deque<HistorySample> history_;
+	mutable std::chrono::steady_clock::time_point hist_last_;
+	mutable uint64_t hist_out_ = 0, hist_pf_ = 0;
+	ExpertStats experts_;
+	bool heat_off_ = false;
+	bool published_active_ = false;
+	std::chrono::steady_clock::time_point heat_last_;
 };
 
 } // namespace engine::runtime

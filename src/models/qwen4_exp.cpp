@@ -1122,6 +1122,24 @@ const pod::TensorView& Qwen4ExpPipeline::gather_logits( int rows, const backend:
 	return full_logits_;
 }
 
+bool Qwen4ExpPipeline::expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset ) {
+	backend::set_device( rank_ );
+	backend::device_sync();
+	layers = 0;
+	experts = 0;
+	out.clear();
+	for ( auto& lw : layers_ ) {
+		if ( lw.experts.heat == nullptr || lw.experts.num_local_experts <= 0 ) continue;
+		experts = lw.experts.num_local_experts;
+		const size_t at = out.size();
+		out.resize( at + static_cast<size_t>( experts ) );
+		backend::memcpy_sync( out.data() + at, lw.experts.heat, static_cast<size_t>( experts ) * sizeof( uint32_t ), backend::Copy::D2H );
+		if ( reset ) backend::memset_sync( lw.experts.heat, 0, static_cast<size_t>( experts ) * sizeof( uint32_t ) );
+		++layers;
+	}
+	return layers > 0;
+}
+
 bool Qwen4ExpPipeline::sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream ) {
 	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen4ExpPipeline::sample_local: count exceeds last forward rows" );
 	backend::set_device( rank_ );

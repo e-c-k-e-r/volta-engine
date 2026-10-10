@@ -35,7 +35,7 @@ The model type is read from the checkpoint (`qwen3_5`, `glm5_next` or `qwen4_exp
 file, `--set key=value`, `ENGINE_*` variables, debug switches) is described in [CONFIG.md](CONFIG.md); `configs/` has examples.
 The server speaks the OpenAI chat API (`/v1/chat/completions`, `/v1/models`) and the Anthropic API (`/v1/messages`,
 `/v1/messages/count_tokens`), so Claude Code can use it with `ANTHROPIC_BASE_URL=http://host:8000`. `/health`, `/metrics`
-(JSON) and `/metrics/prometheus` are also served.
+(JSON) and `/metrics/prometheus` are also served. `/monitor` is a live page (Monokai or Tomorrow Night theme): throughput, slots with context fill, per-GPU power / clocks / temperature / throttle reasons (NVML, loaded at run time), token-gap and TTFT percentiles, speculation, prefix cache, recent requests, and for MoE models a layer-by-expert routing heat map with the load per rank. It reads `/api/stats` and `/api/experts` (JSON); `expert_stats=false` turns the routing counters off.
 
 Useful options for agent workloads: a large context (`--set max_seq=262144 --set max_slots=2`) and the prefix cache
 (`prefix_cache_gib`), which keeps the system prompt and earlier turns resident in pinned host RAM so a long conversation is

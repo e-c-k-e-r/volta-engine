@@ -122,6 +122,7 @@ public:
 	const engine::loader::VisionParams* vision_params() const override { return vision_.loaded() ? &vision_.params() : nullptr; }
 	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
 	bool has_mtp() const override { return mtp_on_; }
+	bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) override;
 	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
 	void mtp_step_impl( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, bool logits, backend::stream_t stream );
 	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;

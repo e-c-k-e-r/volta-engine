@@ -72,6 +72,9 @@ set(ENGINE_HOST_SOURCES
 	src/server/openai.cpp
 	src/server/anthropic.cpp
 	src/server/server.cpp
+	src/server/monitor.cpp
+	src/server/monitor_page.cpp
+	src/server/system_stats.cpp
 )
 
 if(ENGINE_BACKEND STREQUAL "CUDA")

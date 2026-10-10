@@ -47,6 +47,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `draft_tp` | bool | `true` | `ENGINE_DRAFT_TP` | false runs the drafter on rank 0 only |
 | `dsa` | bool | `true` | `ENGINE_DSA` | GLM sparse attention indexer (top-2048 key selection); false attends densely |
 | `max_image_tokens` | int | `1024` | `ENGINE_MAX_IMAGE_TOKENS` | largest image the vision tower accepts, in language-model tokens (4 patches each; sizes its scratch and caps the resize); 0 = image input off |
+| `expert_stats` | bool | `true` | `ENGINE_EXPERT_STATS` | count the routes per expert for the monitor page (a device sync per rank about once a second while serving) |
 | `spec_ctrl` | bool | `true` | `ENGINE_SPEC_CTRL` | adaptive speculation controller; false always speculates |
 | **Debug** | | | | |
 | `expert_log` | bool | `false` | `ENGINE_DEBUG_EXPERT_LOG` | per-rebalance expert tier statistics |

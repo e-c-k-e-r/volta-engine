@@ -247,6 +247,9 @@ void VoltaServer::dispatch( const ConnPtr& conn, const Request& req ) {
 	if ( get && ( req.path == "/health" || req.path == "/" ) ) return handle_health( conn );
 	if ( get && req.path == "/metrics" ) return handle_metrics( conn );
 	if ( get && req.path == "/metrics/prometheus" ) return handle_metrics_prometheus( conn );
+	if ( get && ( req.path == "/monitor" || req.path == "/monitor/" ) ) return handle_monitor( conn );
+	if ( get && req.path == "/api/stats" ) return handle_api_stats( conn );
+	if ( get && req.path == "/api/experts" ) return handle_api_experts( conn );
 	if ( get && req.path == "/v1/models" ) return handle_models( conn );
 	if ( req.path == "/v1/chat/completions" ) {
 		if ( !post ) return send_error( conn, 405, "invalid_request_error", "use POST" );

@@ -5,6 +5,7 @@
 #include "engine/server/chat.h"
 #include "engine/server/config.h"
 #include "engine/server/http.h"
+#include "engine/server/system_stats.h"
 
 #include <atomic>
 #include <map>
@@ -44,6 +45,9 @@ private:
 	void handle_metrics( const ConnPtr& conn );
 	void handle_models( const ConnPtr& conn );
 	void handle_metrics_prometheus( const ConnPtr& conn );
+	void handle_monitor( const ConnPtr& conn );
+	void handle_api_stats( const ConnPtr& conn );
+	void handle_api_experts( const ConnPtr& conn );
 	void handle_chat( const ConnPtr& conn, const Request& req, ChatProtocol& protocol );
 	void handle_count_tokens( const ConnPtr& conn, const Request& req, ChatProtocol& protocol );
 
@@ -58,6 +62,7 @@ private:
 	std::unique_ptr<ChatProtocol> anthropic_;
 	std::atomic<uint64_t> next_req_id_{ 1 };
 	std::string model_name_;
+	SystemStats sys_;
 };
 
 } // namespace engine::server

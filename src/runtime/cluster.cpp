@@ -520,6 +520,17 @@ bool ModelCluster::rebalance_experts() {
 	return any[0] != 0;
 }
 
+bool ModelCluster::expert_heat( std::vector<std::vector<uint32_t>>& per_rank, int& layers, int& experts ) {
+	per_rank.assign( tp_, {} );
+	int ok[ENGINE_NUM_GPUS] = {}, l[ENGINE_NUM_GPUS] = {}, e[ENGINE_NUM_GPUS] = {};
+	pool_.run( [&]( int d ) {
+		ok[d] = models_[d]->expert_heat( per_rank[d], l[d], e[d], true ) ? 1 : 0;
+	} );
+	layers = l[0];
+	experts = e[0];
+	return ok[0] != 0;
+}
+
 void ModelCluster::checkpoint( int slot ) {
 	pool_.run( [&]( int d ) {
 		models_[d]->checkpoint_state( slot, streams_[d] );

@@ -22,6 +22,7 @@ OPTION( int, mtp_depth, 7, "most draft tokens per round with speculator=mtp (1 t
 OPTION( bool, draft_tp, true, "false runs the drafter on rank 0 only" )
 OPTION( bool, dsa, true, "GLM sparse attention indexer (top-2048 key selection); false attends densely" )
 OPTION( int, max_image_tokens, 1024, "largest image the vision tower accepts, in language-model tokens (4 patches each; sizes its scratch and caps the resize); 0 = image input off" )
+OPTION( bool, expert_stats, true, "count the routes per expert for the monitor page (a device sync per rank about once a second while serving)" )
 OPTION( bool, spec_ctrl, true, "adaptive speculation controller; false always speculates" )
 DEBUG_OPTION( bool, expert_log, false, "per-rebalance expert tier statistics" )
 DEBUG_OPTION( bool, dsa_diag, false, "sparse-attention indexer diagnostics" )
