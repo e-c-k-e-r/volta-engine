@@ -63,6 +63,32 @@ struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_st
 struct RefUnpackParams { uint64_t qg, q, gate; int total, head_dim; };
 } // namespace engine::backend::impl
 
+// mHC mix / apply kernels (src/kernels/slang/mhc.slang)
+namespace engine::backend::impl {
+struct HcPartialsParams { uint64_t streams, fn, partials; int row_len, chunk_cols, num_chunks; };
+struct HcFinalizeParams { uint64_t streams, partials, base, scale, post, comb, collapsed, inv_rms_buf, mix_logits_buf, pre_buf; int hidden_size, num_chunks, chunk_cols_c, sinkhorn_iters; float rms_eps, hc_eps; };
+struct HcApplyParams { uint64_t x_in, x_out, y, post, comb; int hidden_size, has_comb; };
+} // namespace engine::backend::impl
+
+// NVFP4 linear (src/kernels/slang/nvfp4.slang)
+namespace engine::backend::impl {
+struct Nvfp4Params { uint64_t codes, scales, x, out_; int m, k, n; float gm; };
+} // namespace engine::backend::impl
+
+// GLM kernels (src/kernels/slang/glm.slang)
+namespace engine::backend::impl {
+struct AbsorbParams { uint64_t q, kv_b, q_lat; int heads; };
+struct ExpandParams { uint64_t o_lat, kv_b, out_; int heads; };
+struct LatentStoreParams { uint64_t c, cache, slots, pos; int64_t slot_stride; int layer, max_seq; };
+struct LatentAttnParams { uint64_t q_lat, cache, out_, slots, pos, sel_idx, sel_n; int64_t slot_stride; int layer, heads, max_seq, idx_stride, has_sel; float scale; };
+struct DiagParams { uint64_t q_row, cache, scores; int n, heads; float scale; };
+struct KvBParams { uint64_t x, w, k_out, v_out; int num_heads, head_dim; };
+struct DsaScoreParams { uint64_t q, w, pool_plane, scores, slots, pos; int score_stride, layer, max_seq; int64_t pool_slot_stride; float norm; };
+struct KdaSmallParams { uint64_t x, b_proj, f_a_proj, g_a_proj, beta, f_a_buf, g_a_buf; int hidden, has_b, has_fa, has_ga; };
+struct KdaBigParams { uint64_t f_a_buf, g_a_buf, f_b_proj, g_b_proj, A_log, dt_bias, g_decay, z_out; int channels, has_fb, has_gb, has_a, has_dt; };
+struct KdaStepParams { uint64_t state, qkv, g_decay, beta, z, o_norm, out_, slots, snap, snap_on; int64_t slot_stride, snap_stride; int num_heads, has_norm, has_z, has_o_norm, decay_first, snap_rows, rows; float eps; };
+} // namespace engine::backend::impl
+
 // Qwen4Exp kernels (src/kernels/slang/flash.slang)
 namespace engine::backend::impl {
 struct GrInitParams { uint64_t in_, x; int hidden, hc; };

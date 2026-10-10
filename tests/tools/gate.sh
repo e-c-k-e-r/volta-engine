@@ -80,9 +80,9 @@ tier2_fast() {
 	# The softmax router form of the MoE (Flash-Next), same golden directory (names carry _sm)
 	run test_ops_moe_sm_dump gpu ./test_ops_moe --dump $out/golden --softmax
 	run test_ops_moe_sm_check_cpu $ROOT/build_cpu/test_ops_moe --check $out/golden --softmax
-	# Vulkan: Linear (trellis, plain), attention and the single-row GDN forms through the module API
+	# Vulkan: Linear (trellis, plain), attention, MLA latent, mHC, DSA and the GDN / KDA forms through the module API
 	run test_ops_linear_check_vulkan gpu $ROOT/build_vk/test_ops_linear --check $out/golden
-	run test_ops_attention_check_vulkan gpu $ROOT/build_vk/test_ops_attention --check $out/golden --only attention,gdn_single
+	run test_ops_attention_check_vulkan gpu $ROOT/build_vk/test_ops_attention --check $out/golden
 	# Vulkan: the Flash-Next modules (gated residual, PLE, QSA, selection, sparse attention, router) and the softmax-routed MoE
 	run test_ops_flash_check_vulkan gpu $ROOT/build_vk/test_ops_flash --check $out/golden
 	run test_ops_moe_sm_check_vulkan gpu $ROOT/build_vk/test_ops_moe --check $out/golden --softmax

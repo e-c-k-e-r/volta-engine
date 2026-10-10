@@ -539,7 +539,15 @@ graph_t graph_capture_end( stream_t st ) {
 	s->capture = false;
 	return gr;
 }
-graph_exec_t graph_instantiate( graph_t gr ) { return gr; } // the recorded command buffer is the executable
+// The recorded command buffer is the executable: it moves to the executable object, so destroying the graph afterwards (as GraphCache does right
+// after instantiating) does not free what the executable still replays
+graph_exec_t graph_instantiate( graph_t gr ) {
+	auto* e = new vk_graph();
+	e->cb = gr->cb;
+	e->nodes = gr->nodes;
+	gr->cb = VK_NULL_HANDLE;
+	return e;
+}
 size_t graph_node_count( graph_t gr ) { return gr->nodes; }
 void graph_launch( graph_exec_t e, stream_t st ) {
 	vk_stream* s = resolve_stream( st );
@@ -549,10 +557,10 @@ void graph_launch( graph_exec_t e, stream_t st ) {
 void graph_destroy( graph_t gr ) {
 	if ( !gr ) return;
 	vkQueueWaitIdle( g.queue );
-	vkFreeCommandBuffers( g.device, g.pool, 1, &gr->cb );
+	if ( gr->cb ) vkFreeCommandBuffers( g.device, g.pool, 1, &gr->cb );
 	delete gr;
 }
-void graph_exec_destroy( graph_exec_t ) {} // owned by the graph
+void graph_exec_destroy( graph_exec_t e ) { graph_destroy( e ); }
 
 namespace vk {
 

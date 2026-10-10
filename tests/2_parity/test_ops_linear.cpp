@@ -1,4 +1,4 @@
-// Op-level golden test for the Linear module (trellis at 3/4/5/6 bits with MUL1 and MCG, rows 1/4/40, plain FP16).
+// Op-level golden test for the Linear module (trellis at 3/4/5/6 bits with MUL1 and MCG, rows 1/4/40, plain FP16, NVFP4).
 // ONE source for both configurations through the module API:
 //   --dump <dir>   run in the CUDA build: computes with the real kernels, writes golden outputs
 //   --check <dir>  recompute with the built backend and compare (tier 2) against the golden files
@@ -105,6 +105,29 @@ int main( int argc, char** argv ) {
 			modules::Linear::forward( x, lw, out );
 			char nm[64];
 			std::snprintf( nm, sizeof( nm ), "fp16_m%d", m );
+			cases.push_back( { nm, download_half( out ) } );
+		}
+	}
+
+	{ // NVFP4 W4A16 on the prepacked fragment layout: random code bytes, E4M3 block scales with exponents 5 - 9 (no NaN), a global scale
+		GoldenRng rng( 9191u );
+		const int G = k / 16, tiles = n / 32;
+		std::vector<uint8_t> hc( static_cast<size_t>( tiles ) * G * 32 * 8 ), hs( static_cast<size_t>( tiles ) * G * 32 );
+		for ( auto& v : hc ) v = static_cast<uint8_t>( rng.next() );
+		for ( auto& v : hs ) v = static_cast<uint8_t>( ( ( rng.next() & 1 ) << 7 ) | ( ( 5 + rng.next() % 5 ) << 3 ) | ( rng.next() & 7 ) );
+		int cs[3] = { tiles, G, 256 }, ss[3] = { tiles, G, 32 };
+		pod::TensorView codes = core::arena_alloc_tensor( g_arena, pod::DType::UINT8, cs, 3 );
+		pod::TensorView scales = core::arena_alloc_tensor( g_arena, pod::DType::UINT8, ss, 3 );
+		backend::memcpy_sync( codes.data, hc.data(), hc.size(), backend::Copy::H2D );
+		backend::memcpy_sync( scales.data, hs.data(), hs.size(), backend::Copy::H2D );
+		const pod::LinearWeight lw = pod::LinearWeight::make_nvfp4( codes, scales, 0.0625f );
+		for ( int m : row_list ) {
+			auto x = upload_half( uniform_vec( rng, static_cast<size_t>( m ) * k, 1.0f ), { m, k } );
+			int os[2] = { m, n };
+			pod::TensorView out = core::arena_alloc_tensor( g_arena, pod::DType::FP16, os, 2 );
+			modules::Linear::forward( x, lw, out );
+			char nm[64];
+			std::snprintf( nm, sizeof( nm ), "nvfp4_m%d", m );
 			cases.push_back( { nm, download_half( out ) } );
 		}
 	}

@@ -48,6 +48,21 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			COMMENT "slangc ${entry} -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
+	# GLM kernels (src/kernels/slang/glm.slang: MLA latent, DSA scoring, KDA)
+	foreach(entry latent_absorb_q latent_expand_out latent_store latent_attend latent_diag_scores mla_project_kv_b dsa_score kda_gates_small kda_gates_big kda_step)
+		set(sout ${SLANG_OUT}/${entry}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/glm.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/glm.slang
+			COMMENT "slangc ${entry} -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
+	# NVFP4 W4A16 linear (src/kernels/slang/nvfp4.slang)
+	add_custom_command(OUTPUT ${SLANG_OUT}/nvfp4_gemm.spv
+		COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/nvfp4.slang -target spirv -stage compute -entry nvfp4_gemm -DENGINE_TARGET_CPU=0 -o ${SLANG_OUT}/nvfp4_gemm.spv
+		DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/nvfp4.slang
+		COMMENT "slangc nvfp4_gemm -> spirv")
+	list(APPEND VK_FLASH_SPV ${SLANG_OUT}/nvfp4_gemm.spv)
 	add_custom_target(flash_spv DEPENDS ${VK_FLASH_SPV})
 	add_dependencies(slang_kernels flash_spv)
 

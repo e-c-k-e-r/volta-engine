@@ -1,4 +1,5 @@
 #include "engine/runtime/cluster.h"
+#include "engine/backend/tiers.h"
 #include "engine/runtime/mtp_runner.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
@@ -23,6 +24,13 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	const bool is_glm = ( cfg.model_type == "glm5_next" );
 	const auto& opt = runtime::options();
 	tp_ = opt.tp > 0 ? opt.tp : cfg.tp;
+#if !ENGINE_BACKEND_CUDA
+	// The CPU and Vulkan backends are single-device: one rank holds the whole model
+	if ( tp_ != 1 ) {
+		LOG_INFO( "ModelCluster: tp %d requested; the %s backend runs one rank\n", tp_, ENGINE_BACKEND_NAME );
+		tp_ = 1;
+	}
+#endif
 	// The arena is a bump allocator over one up-front allocation per GPU. Unless a size is given (cfg.arena_bytes,
 	// arena_gib) it takes the device's free memory less a reserve for what lives outside it (graphs, workspaces, the
 	// CUDA context); vram_reserve_mib overrides the reserve. The model's own tables (KV pools, scratch) are sized by
@@ -370,6 +378,12 @@ int ModelCluster::sample_one() {
 }
 
 void ModelCluster::warm_graphs( int max_m, int slot ) {
+#if !ENGINE_BACKEND_HAS_GRAPHS
+	// No capture on this backend: nothing to warm (a dummy forward only costs time)
+	( void )max_m;
+	( void )slot;
+	return;
+#endif
 	max_m = MIN( max_m, metadata().max_rows );
 	const int tokens[pod::MAX_BATCH] = {};
 	auto t0 = std::chrono::steady_clock::now();
