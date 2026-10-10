@@ -292,6 +292,121 @@ __global__ void attn_sparse_kernel(
 	ws[2 + tid] = o_dim;
 }
 
+// Warp-per-key variant of attn_sparse_kernel for head_dim 256: a warp owns a key at a time (lane i holds the 8 dimensions at 8 i, so a key row is one 16-byte
+// load per lane), the dot product is a shuffle reduction and every warp keeps its own online-softmax state over its keys (start + warp, + 8, ...), so there is no
+// block barrier per key (the serial kernel spent ~1 us per key on two barriers). Two keys are in flight per step. The 8 warps' states are merged at the end into
+// the same (m, l, o) workspace entry the serial kernel writes, so attn_reduce_kernel is unchanged.
+template <KVQ KQ, KVQ VQ>
+__global__ __launch_bounds__( 256 )
+void attn_sparse_warp_kernel(
+	const half* __restrict__ q,
+	const pod::KVRef kv,
+	float* __restrict__ workspace,
+	size_t slot_stride,
+	int layer_idx,
+	const pod::BatchRows* __restrict__ rows,
+	int num_q_heads,
+	int num_kv_heads,
+	int max_seq,
+	int n_chunks,
+	int chunk_len,
+	int row0,
+	float scale,
+	const int* __restrict__ idx,
+	const int* __restrict__ nkeys,
+	int idx_stride
+) {
+	constexpr int HD = 256;
+	const int head = blockIdx.x, m = blockIdx.y, chunk = blockIdx.z;
+	const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+	const int heads_per_kv = max( num_q_heads / num_kv_heads, 1 );
+	const int kv_head = head / heads_per_kv;
+	const int r = row0 + m;
+	const int pos = rows->pos[r];
+	const int nk = nkeys[r];
+	const int total = nk >= 0 ? nk : min( pos + 1, max_seq );
+	const size_t slot_off = static_cast<size_t>( rows->slot[r] ) * slot_stride;
+	const int start = chunk * chunk_len;
+	const int end = min( start + chunk_len, total );
+
+	const half* q_head = q + ( static_cast<size_t>( m ) * num_q_heads + head ) * HD;
+	float qv[8];
+	{
+		const uint4 raw = *reinterpret_cast<const uint4*>( q_head + lane * 8 );
+		const half2* h2 = reinterpret_cast<const half2*>( &raw );
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const float2 f = __half22float2( h2[i] );
+			qv[2 * i] = f.x * scale;
+			qv[2 * i + 1] = f.y * scale;
+		}
+	}
+	const size_t row_stride = static_cast<size_t>( num_kv_heads ) * HD;
+	const size_t layer_base = slot_off + static_cast<size_t>( layer_idx ) * max_seq * row_stride + static_cast<size_t>( kv_head ) * HD + lane * 8;
+
+	float m_reg = -1e30f, l_reg = 0.0f, o[8];
+	#pragma unroll
+	for ( int i = 0; i < 8; ++i ) o[i] = 0.0f;
+	constexpr int U = 2;
+	for ( int i0 = start + warp; i0 < end; i0 += 8 * U ) {
+		float kf[U][8], vf[U][8];
+		bool ok[U];
+		#pragma unroll
+		for ( int u = 0; u < U; ++u ) {
+			const int i = i0 + u * 8;
+			ok[u] = i < end;
+			if ( ok[u] ) {
+				const int t = nk >= 0 ? idx[static_cast<size_t>( r ) * idx_stride + i] : i;
+				const size_t off = layer_base + static_cast<size_t>( t ) * row_stride;
+				kv_load8<KQ>( kv.k, kv.ks, off, kf[u] );
+				kv_load8<VQ>( kv.v, kv.vs, off, vf[u] );
+			}
+		}
+		#pragma unroll
+		for ( int u = 0; u < U; ++u ) {
+			if ( !ok[u] ) continue;
+			float dot = 0.0f;
+			#pragma unroll
+			for ( int j = 0; j < 8; ++j ) dot = fmaf( qv[j], kf[u][j], dot );
+			#pragma unroll
+			for ( int mask = 16; mask > 0; mask >>= 1 ) dot += __shfl_xor_sync( 0xffffffff, dot, mask );
+			const float m_new = fmaxf( m_reg, dot );
+			const float alpha = expf( m_reg - m_new );
+			const float p = expf( dot - m_new );
+			#pragma unroll
+			for ( int j = 0; j < 8; ++j ) o[j] = alpha * o[j] + p * vf[u][j];
+			l_reg = alpha * l_reg + p;
+			m_reg = m_new;
+		}
+	}
+	// merge the 8 warps' states: M = max m, o = sum exp( m_w - M ) o_w, l likewise
+	__shared__ float s_m[8], s_l[8];
+	__shared__ __align__( 16 ) float s_o[8][HD];
+	if ( lane == 0 ) {
+		s_m[warp] = m_reg;
+		s_l[warp] = l_reg;
+	}
+	#pragma unroll
+	for ( int j = 0; j < 8; j += 4 ) *reinterpret_cast<float4*>( &s_o[warp][lane * 8 + j] ) = make_float4( o[j], o[j + 1], o[j + 2], o[j + 3] );
+	__syncthreads();
+	float M = s_m[0];
+	#pragma unroll
+	for ( int w = 1; w < 8; ++w ) M = fmaxf( M, s_m[w] );
+	float acc = 0.0f, lsum = 0.0f;
+	#pragma unroll
+	for ( int w = 0; w < 8; ++w ) {
+		const float e = expf( s_m[w] - M );
+		acc += e * s_o[w][tid];
+		lsum += e * s_l[w];
+	}
+	float* ws = workspace + ( ( static_cast<size_t>( m ) * num_q_heads + head ) * n_chunks + chunk ) * ( ATTN_MAX_HEAD_DIM + 2 );
+	if ( tid == 0 ) {
+		ws[0] = M;
+		ws[1] = lsum;
+	}
+	ws[2 + tid] = acc;
+}
+
 // Tensor-core prefill attention (Volta mma.m8n8k4, FP32 accumulate). A block owns 32 queries (row, head pairs) of one
 // kv head and walks the keys in tiles of 64. S = Q K^T: warp (qg, kg) computes a 16 x 16 tile over the full head_dim, the
 // four quad-pairs of each mma being its four 8 x 8 tiles. The softmax runs on S staged through shared memory (8 lanes per
@@ -905,9 +1020,14 @@ void Attention::forward_sparse(
 		const int M = MIN( pod::MAX_BATCH, count - row0 );
 		const half* g = gate_ptr ? gate_ptr + row0 * row_elems : nullptr;
 		half* o = out.ptr<half>() + row0 * row_elems;
-		#define LAUNCH_SPARSE() attn_sparse_kernel<KQ_, VQ_><<<dim3( num_q_heads, M, n_chunks ), dim3( head_dim ), 0, stream>>>( \
-			q.ptr<const half>() + row0 * row_elems, kv, g, o, workspace, slot_stride, layer_idx, d_rows, \
-			num_q_heads, num_kv_heads, head_dim, max_seq, n_chunks, chunk_len, row0, scale, idx, nkeys, idx_stride )
+		#define LAUNCH_SPARSE() do { \
+			if ( head_dim == 256 ) attn_sparse_warp_kernel<KQ_, VQ_><<<dim3( num_q_heads, M, n_chunks ), dim3( 256 ), 0, stream>>>( \
+				q.ptr<const half>() + row0 * row_elems, kv, workspace, slot_stride, layer_idx, d_rows, \
+				num_q_heads, num_kv_heads, max_seq, n_chunks, chunk_len, row0, scale, idx, nkeys, idx_stride ); \
+			else attn_sparse_kernel<KQ_, VQ_><<<dim3( num_q_heads, M, n_chunks ), dim3( head_dim ), 0, stream>>>( \
+				q.ptr<const half>() + row0 * row_elems, kv, g, o, workspace, slot_stride, layer_idx, d_rows, \
+				num_q_heads, num_kv_heads, head_dim, max_seq, n_chunks, chunk_len, row0, scale, idx, nkeys, idx_stride ); \
+		} while ( 0 )
 		#define KQ_ KQV_
 		#define VQ_ VQV_
 		KV_DISPATCH( KQV_, VQV_, LAUNCH_SPARSE() )
