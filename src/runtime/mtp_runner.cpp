@@ -1,3 +1,4 @@
+#include <chrono>
 #include "engine/runtime/mtp_runner.h"
 #include "engine/runtime/cluster.h"
 #include "engine/runtime/options.h"
@@ -102,9 +103,12 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 	int toks[models::kDraftM + 1];
 	for ( int j = 0; j < S.pend_n - 1; ++j ) toks[j] = S.pend_tok[j];
 	toks[S.pend_n - 1] = anchor;
+	const int catch_rows = S.pend_n;
+	const auto t_round = std::chrono::steady_clock::now();
 	mc.mtp_step( slot, S.pend_pos, S.pend_n, toks, 2, off + S.hist_base, true );
 	int cands[pod::MAX_BATCH];
 	cands[0] = mc.sample_one();
+	const auto t_catch = std::chrono::steady_clock::now();
 	// A draft step costs about as much as 1/6 of a token; stop chaining once the chance that the block is still alive drops below that
 	constexpr float kMinSurvival = 0.3f;
 	float alive = 1.0f;
@@ -118,6 +122,7 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 	}
 	active = drafted;
 	res.proposed = active;
+	const auto t_draft = std::chrono::steady_clock::now();
 
 	// 2. Batched verify of [anchor, c0 .. c_{active-1}] at [pos, pos + active]: row j's logits predict position pos + j + 1
 	int block[pod::MAX_BATCH];
@@ -130,6 +135,7 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 	if ( sampled ) mc.sample_topk( active + 1, cs );
 	else mc.sample( preds, active + 1 );
 
+	const auto t_verify = std::chrono::steady_clock::now();
 	// 3. Acceptance (see DFlash2Runner::speculate)
 	for ( int k = 0; k < active; ++k ) {
 		++att_[k];
@@ -166,6 +172,12 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 	if ( res.accepted < active ) mc.commit_spec_row( slot, res.accepted );
 	mc.set_spec_snapshot( false );
 	res.next_pos = pos + 1 + res.accepted;
+	{
+		const auto t_end = std::chrono::steady_clock::now();
+		auto ms = []( auto a, auto b ) { return std::chrono::duration<double, std::milli>( b - a ).count(); };
+		LOG_DEBUG( "[mtp] round: catch-up %.1f ms (%d rows), %d draft steps %.1f ms, verify %.1f ms, tail %.1f ms; accepted %d of %d\n", ms( t_round, t_catch ), catch_rows, active - 1,
+			ms( t_catch, t_draft ), ms( t_draft, t_verify ), ms( t_verify, t_end ), res.accepted, active );
+	}
 	return res;
 }
 
