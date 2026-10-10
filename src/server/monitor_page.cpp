@@ -36,7 +36,7 @@ main { display:grid; grid-template-columns:repeat(12, 1fr); gap:12px; padding:12
 .c12 { grid-column:span 12; } .c8 { grid-column:span 8; } .c6 { grid-column:span 6; } .c4 { grid-column:span 4; } .c3 { grid-column:span 3; }
 @media (max-width:1100px) { .c8,.c6,.c4,.c3 { grid-column:span 12; } }
 canvas { width:100%; display:block; }
-nav { display:flex; gap:2px; margin-left:6px; }
+nav { display:flex; gap:2px; margin-right:10px; }
 nav button { border-radius:3px 3px 0 0; color:var(--dim); }
 nav button.on { color:var(--fg); border-color:var(--info); background:var(--bg); }
 .pane { display:none; grid-column:1 / -1; grid-template-columns:repeat(12, 1fr); gap:12px; align-items:start; }
@@ -70,6 +70,7 @@ tr:hover td { background:rgba(128,128,128,.08); }
 <body>
 <header>
 	<h1>volta engine</h1>
+	<nav id="tabs"><button data-tab="overview">overview</button><button data-tab="requests">requests</button><button data-tab="model">model</button><button data-tab="system">system</button></nav>
 	<span class="chip" id="h-model"><b>-</b></span>
 	<span class="chip" id="h-tp">tp <b>-</b></span>
 	<span class="chip" id="h-ctx">context <b>-</b></span>
@@ -78,7 +79,6 @@ tr:hover td { background:rgba(128,128,128,.08); }
 	<span class="chip" id="h-up">up <b>-</b></span>
 	<span class="chip" id="h-conn">link <b>-</b></span>
 	<span class="chip" id="h-live">now <b>-</b></span>
-	<nav id="tabs"><button data-tab="overview">overview</button><button data-tab="requests">requests</button><button data-tab="model">model</button><button data-tab="system">system</button></nav>
 	<span class="sp"></span>
 	<select id="interval" title="refresh"><option value="1000">1 s</option><option value="2000">2 s</option><option value="5000">5 s</option></select>
 	<button id="pause">pause</button>
@@ -108,6 +108,15 @@ tr:hover td { background:rgba(128,128,128,.08); }
 		<h2>GPUs <small id="gpu-note"></small></h2>
 		<div class="gpus" id="gpus"></div>
 	</section>
+	<section class="card c6">
+		<h2>GPU power <small>W per GPU, last two minutes</small></h2>
+		<canvas id="ch-gpw" height="130"></canvas>
+		<div class="legend" id="gpu-legend"></div>
+	</section>
+	<section class="card c6">
+		<h2>GPU SM clock <small>MHz per GPU, last two minutes</small></h2>
+		<canvas id="ch-gclk" height="130"></canvas>
+	</section>
 	<section class="card c12">
 		<h2>Host</h2>
 		<div class="tiles" id="host"></div>
@@ -119,6 +128,14 @@ tr:hover td { background:rgba(128,128,128,.08); }
 	<section class="card c8">
 		<h2>Recent requests</h2>
 		<table id="recent"><thead><tr><th>request</th><th>ago</th><th>prompt</th><th>cached</th><th>generated</th><th>ttft</th><th>total</th><th>tok/s</th><th>end</th></tr></thead><tbody></tbody></table>
+	</section>
+	<section class="card c6">
+		<h2>Slowest to first token <small>of the last 40 requests</small></h2>
+		<table id="slow-ttft"><thead><tr><th>request</th><th>prompt</th><th>cached</th><th>ttft</th><th>total</th></tr></thead><tbody></tbody></table>
+	</section>
+	<section class="card c6">
+		<h2>Slowest decode <small>of the last 40 requests (at least 20 tokens)</small></h2>
+		<table id="slow-dec"><thead><tr><th>request</th><th>generated</th><th>tok/s</th><th>total</th><th>end</th></tr></thead><tbody></tbody></table>
 	</section>
 	<section class="card c4">
 		<h2>Prefix cache</h2>
@@ -157,6 +174,10 @@ tr:hover td { background:rgba(128,128,128,.08); }
 		</div>
 	</section>
 
+	<section class="card c12">
+		<h2>Layer imbalance <small>hottest expert over the layer's mean, per layer (1 = even)</small></h2>
+		<canvas id="ch-limb" height="120"></canvas>
+	</section>
 	</div>
 </main>
 <div id="tip"></div>
@@ -173,7 +194,7 @@ const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt
 const tile = (label, value, cls) => '<div class="tile"><span>' + label + '</span><b' + (cls ? ' style="color:var(--' + cls + ')"' : '') + '>' + value + '</b></div>';
 const bar = (frac, cls) => '<div class="bar"><i class="' + (cls || '') + '" style="width:' + Math.max(0, Math.min(100, frac * 100)).toFixed(1) + '%"></i></div>';
 
-let paused = false, timer = null, expTimer = null, stats = null, gpuHist = [], cpuHist = [], failures = 0;
+let paused = false, timer = null, expTimer = null, stats = null, gpuHist = [], clkHist = [], cpuHist = [], failures = 0;
 
 // ---- charts ----
 function setup(canvas) {
@@ -266,6 +287,7 @@ function render(s) {
 
 	// gpus (history is kept here)
 	gpuHist.push(s.gpus.map((g) => g.power_w)); if (gpuHist.length > 120) gpuHist.shift();
+	clkHist.push(s.gpus.map((g) => g.sm_mhz)); if (clkHist.length > 120) clkHist.shift();
 	cpuHist.push(s.host.cpu_pct); if (cpuHist.length > 120) cpuHist.shift();
 	if (!s.gpus.length) $('gpus').innerHTML = '<div class="dim">NVML not available</div>';
 	else {
@@ -284,6 +306,11 @@ function render(s) {
 		$('gpus').innerHTML = html;
 		s.gpus.forEach((g, i) => lineChart($('ch-gpu' + i), [{ data: gpuHist.map((p) => p[i]), color: '--warn', fill: true }], { max: Math.max(g.power_limit_w, 1), left: '', right: '' }));
 		$('gpu-note').textContent = fmt(totalW, 0) + ' W total';
+		const cols = ['--good', '--info', '--warn', '--alt', '--bad', '--hl'];
+		const per = (hist) => s.gpus.map((g, i) => ({ data: hist.map((p) => p[i]), color: cols[i % cols.length], width: 1.5 }));
+		lineChart($('ch-gpw'), per(gpuHist), { max: Math.max(...s.gpus.map((g) => g.power_limit_w), 1), n: 120, left: '-2m' });
+		lineChart($('ch-gclk'), per(clkHist), { max: Math.max(...clkHist.flat(), 1), n: 120, left: '-2m' });
+		$('gpu-legend').innerHTML = s.gpus.map((g, i) => '<span><i style="background:var(' + cols[i % cols.length] + ')"></i>GPU ' + i + '</span>').join('');
 	}
 
 	// token gap
@@ -304,6 +331,12 @@ function render(s) {
 	// recent
 	document.querySelector('#recent tbody').innerHTML = s.recent.slice(0, 14).map((r) => '<tr><td>#' + r.req_id + '</td><td>' + dur(r.age_s) + '</td><td>' + fmt(r.prompt_tokens) + '</td><td>' + fmt(r.cached_tokens) + '</td><td>' + fmt(r.generated) +
 		'</td><td>' + ms(r.ttft_ms) + '</td><td>' + ms(r.total_ms) + '</td><td>' + fmt(r.decode_tok_s, 1) + '</td><td class="' + (r.reason === 'stop' ? '' : 'dim') + '">' + r.reason + '</td></tr>').join('') || '<tr><td class="dim" colspan="9">no finished requests yet</td></tr>';
+
+	const slowRows = (arr, row) => arr.slice(0, 5).map(row).join('') || '<tr><td class="dim" colspan="5">no finished requests yet</td></tr>';
+	document.querySelector('#slow-ttft tbody').innerHTML = slowRows([...s.recent].sort((a, b) => b.ttft_ms - a.ttft_ms),
+		(r) => '<tr><td>#' + r.req_id + '</td><td>' + fmt(r.prompt_tokens) + '</td><td>' + fmt(r.cached_tokens) + '</td><td>' + ms(r.ttft_ms) + '</td><td>' + ms(r.total_ms) + '</td></tr>');
+	document.querySelector('#slow-dec tbody').innerHTML = slowRows(s.recent.filter((r) => r.generated >= 20).sort((a, b) => a.decode_tok_s - b.decode_tok_s),
+		(r) => '<tr><td>#' + r.req_id + '</td><td>' + fmt(r.generated) + '</td><td>' + fmt(r.decode_tok_s, 1) + '</td><td>' + ms(r.total_ms) + '</td><td class="' + (r.reason === 'stop' ? '' : 'dim') + '">' + r.reason + '</td></tr>');
 
 	// host
 	const ho = s.host;
@@ -356,6 +389,7 @@ function renderExperts() {
 	}
 	for (let i = 0; i < cols; i++) if (perExpert[i] > 0) live++;
 	const imb = perLayerImb.reduce((a, b) => a + b, 0) / Math.max(1, perLayerImb.filter((x) => x > 0).length);
+	lineChart($('ch-limb'), [{ data: perLayerImb, color: '--warn', fill: true }], { n: Math.max(2, Lc), left: 'layer 0', right: 'layer ' + (Lc - 1) });
 	$('exp-note').textContent = fmt(sum) + ' routes, ' + Lc + ' layers x ' + cols + ' experts' + (R > 1 ? ' on ' + R + ' ranks' : '');
 	// heatmap
 	const canvas = $('ch-heat'), { g, w, h } = setup(canvas);
