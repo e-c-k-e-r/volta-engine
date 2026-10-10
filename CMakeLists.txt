@@ -399,6 +399,9 @@ set_target_properties(test_chunk_boundary PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$
 add_executable(test_longctx tests/4_coherence/test_longctx.cpp)
 target_link_libraries(test_longctx PRIVATE engine_kernels)
 set_target_properties(test_longctx PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_ppl tests/4_coherence/test_ppl.cpp)
+target_link_libraries(test_ppl PRIVATE engine_kernels)
+set_target_properties(test_ppl PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_nvfp4_linear tests/2_parity/test_nvfp4_linear.cpp)
 target_link_libraries(test_nvfp4_linear PRIVATE engine_kernels)

@@ -106,6 +106,7 @@ Qwen4ExpPipeline::~Qwen4ExpPipeline() {
 		backend::set_device( rank_ );
 		graphs_.reset();
 		if ( side_stream_ != nullptr ) backend::stream_destroy( side_stream_ );
+		if ( full_logits_mem_ != nullptr ) backend::device_free( full_logits_mem_ );
 	}
 }
 
@@ -1008,6 +1009,29 @@ void Qwen4ExpPipeline::mtp_save_hist( int src_row, int rows, int dst_row, backen
 void Qwen4ExpPipeline::sample_tokens( int* out_preds, int count, backend::stream_t stream ) {
 	ENGINE_ASSERT( false, "qwen4_exp: the vocabulary is sharded, use sample_local" );
 	(void) out_preds; (void) count; (void) stream;
+}
+
+const pod::TensorView& Qwen4ExpPipeline::gather_logits( int rows, const backend::half_t* const* peer_shard_ptrs, int peer_shard_cols, backend::stream_t stream ) {
+	ENGINE_ASSERT( rank_ == 0, "Qwen4ExpPipeline::gather_logits: only rank 0 materializes the full vocabulary" );
+	ENGINE_ASSERT( rows >= 1 && rows <= last_rows_ && peer_shard_cols == lm_shard_cols_, "Qwen4ExpPipeline::gather_logits: rows or shard width" );
+	backend::set_device( rank_ );
+	const size_t V = config_.vocab_size;
+	if ( rows > full_logits_rows_ ) {
+		if ( full_logits_mem_ != nullptr ) backend::device_free( full_logits_mem_ );
+		full_logits_mem_ = backend::device_malloc( static_cast<size_t>( rows ) * V * sizeof( backend::half_t ) );
+		full_logits_rows_ = rows;
+		const int shape[2] = { rows, config_.vocab_size };
+		full_logits_ = pod::make_tensor_2d( full_logits_mem_, pod::DType::FP16, shape[0], shape[1] );
+	}
+	full_logits_.shape[0] = rows;
+	for ( int d = 0; d < tp_; ++d ) {
+		const backend::half_t* src_base = ( d == rank_ ) ? logits_.ptr<const backend::half_t>() : peer_shard_ptrs[d];
+		ENGINE_ASSERT( src_base != nullptr, "Qwen4ExpPipeline::gather_logits: missing peer shard pointer" );
+		// 2-D copy: rows are lm_shard_cols_ apart at the source, vocab_size apart at the destination
+		backend::memcpy2d_async( full_logits_.ptr<backend::half_t>() + static_cast<size_t>( d ) * lm_shard_real_cols_, V * sizeof( backend::half_t ), src_base, static_cast<size_t>( lm_shard_cols_ ) * sizeof( backend::half_t ),
+			static_cast<size_t>( lm_shard_real_cols_ ) * sizeof( backend::half_t ), rows, backend::Copy::D2D, stream );
+	}
+	return full_logits_;
 }
 
 bool Qwen4ExpPipeline::sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream ) {

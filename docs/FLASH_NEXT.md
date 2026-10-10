@@ -129,5 +129,7 @@ The QSA sparse attention for prefill rows (more than 8 rows) now runs on the ten
 
 Persistent prefill MoE kernel, looked at and left alone: 3.4 ms per call at any row count up to ~256 (128 experts x 3 matrices, all touched), 8 co-resident groups are the best split (2 groups 6.1 ms, 4 groups 4.9, 8 groups 4.7 at 512 rows); a dense GEMM of one 0.8 MB expert matrix takes ~12 us on its own (latency-bound), so 26 us per expert for three matrices is already better than serial dense calls. Cutting it further needs a grouped GEMM that schedules (expert, tile) items over all SMs; larger chunks would also amortize it (512 -> 2048 rows: 8.7 -> 5.8 us per row) but the row limit is global.
 
+Quality check of the prefill changes (`test_ppl --flash`, teacher-forced perplexity of 6000 tokens of docs/ with every row's logits read back, `gather_logits` implemented for this model): all new paths 3.835, every old path 3.829 (the tensor-core gated residual alone 3.827, sparse attention alone 3.830). The per-token NLL moves by 0.06 on average (router flips) but the mean moves by 0.0016 nats, inside the noise of a 6000-token sample; no measurable quality change.
+
 Next: a GEMV for the N=640 shared-expert shapes, a tensor-core QSA scorer and sparse
 kernel, the SASS / bench baselines and the 256K needle.

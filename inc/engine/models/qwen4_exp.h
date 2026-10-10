@@ -111,6 +111,7 @@ public:
 	bool topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream = nullptr ) override;
 	const backend::half_t* shard_logits_ptr() const override { return logits_.ptr<const backend::half_t>(); }
 	int shard_logits_cols() const override { return lm_shard_cols_; }
+	const pod::TensorView& gather_logits( int rows, const backend::half_t* const* peer_shard_ptrs, int peer_shard_cols, backend::stream_t stream ) override;
 
 	void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) override;
 	void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) override;
@@ -237,6 +238,9 @@ private:
 	pod::TensorView logits_;
 	int lm_mode_ = 0;                 // BatchRows::LogitsMode of the forward in flight
 	int last_rows_ = 0;
+	pod::TensorView full_logits_;     // rank 0, allocated on the first gather_logits (the perplexity test; serving samples on the shards)
+	void* full_logits_mem_ = nullptr;
+	int full_logits_rows_ = 0;
 	static constexpr int kTopkTile = 4096;
 	int* d_argmax_idx_ = nullptr;
 	float* d_argmax_val_ = nullptr;
