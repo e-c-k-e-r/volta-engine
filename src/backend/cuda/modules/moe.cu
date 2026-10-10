@@ -1,4 +1,5 @@
 #include "engine/modules/moe.h"
+#include "engine/modules/nvfp4_moe.h"
 #include "engine/runtime/options.h"
 #include "exl3_moe_kernel.cuh"
 #include "exl3_moe_coop.cuh"
@@ -579,6 +580,29 @@ void MoE::init_device_ptrs(
 		}
 		weights.device_ptrs = d_ptrs;
 	}
+	if ( weights.type == pod::QuantType::NVFP4 ) {
+		// 6 pointer arrays (gate c/s, up c/s, down c/s) then 3 float arrays (global scales)
+		const int E = weights.num_local_experts;
+		std::vector<const void*> h_ptrs( 6 * E );
+		std::vector<float> h_g( 3 * E );
+		for ( int e = 0; e < E; ++e ) {
+			h_ptrs[0 * E + e] = weights.gate[e].w0.data;
+			h_ptrs[1 * E + e] = weights.gate[e].w1.data;
+			h_ptrs[2 * E + e] = weights.up[e].w0.data;
+			h_ptrs[3 * E + e] = weights.up[e].w1.data;
+			h_ptrs[4 * E + e] = weights.down[e].w0.data;
+			h_ptrs[5 * E + e] = weights.down[e].w1.data;
+			h_g[0 * E + e] = weights.gate[e].alpha;
+			h_g[1 * E + e] = weights.up[e].alpha;
+			h_g[2 * E + e] = weights.down[e].alpha;
+		}
+		const size_t pb = 6 * E * sizeof( const void* );
+		char* d = static_cast<char*>( engine::core::arena_alloc( arena, pb + 3 * E * sizeof( float ) ) );
+		CUDA_CHECK( cudaMemcpyAsync( d, h_ptrs.data(), pb, cudaMemcpyHostToDevice, stream ) );
+		CUDA_CHECK( cudaMemcpyAsync( d + pb, h_g.data(), 3 * E * sizeof( float ), cudaMemcpyHostToDevice, stream ) );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		weights.device_ptrs = d;
+	}
 }
 
 pod::MoEScratch MoE::alloc_scratch(
@@ -587,7 +611,8 @@ pod::MoEScratch MoE::alloc_scratch(
 	int top_k,
 	int hidden_size,
 	int intermediate_size,
-	int max_rows
+	int max_rows,
+	bool nvfp4
 ) {
 	const int groups = MOE_MAX_GROUPS;
 	const size_t E1 = static_cast<size_t>( num_local_experts ) + 1;
@@ -619,11 +644,19 @@ pod::MoEScratch MoE::alloc_scratch(
 		s.coop_ctr = static_cast<int*>( engine::core::arena_alloc( arena, ctr_bytes ) );
 		CUDA_CHECK( cudaMemset( s.coop_ctr, 0, ctr_bytes ) );
 	}
+	if ( nvfp4 ) {
+		s.nv_h = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( MOE_NVFP4_ROWS ) * top_k * intermediate_size * sizeof( half ) ) );
+		s.nv_partial = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( MOE_NVFP4_ROWS ) * top_k * hidden_size * sizeof( float ) ) );
+		const size_t cb = static_cast<size_t>( MOE_NVFP4_ROWS ) * ( hidden_size / 32 ) * sizeof( int );
+		s.nv_ctr = static_cast<int*>( engine::core::arena_alloc( arena, cb ) );
+		CUDA_CHECK( cudaMemset( s.nv_ctr, 0, cb ) );
+	}
 	return s;
 }
 
 bool MoE::fused_decode( const pod::MoELayerWeights& weights, const pod::MoEScratch& scratch, int rows ) {
 	const int ebits = weights.gate[0].bits;
+	if ( weights.type == pod::QuantType::NVFP4 ) return true;   // no trellis workspace
 	return weights.type == pod::QuantType::TRELLIS && rows <= MOE_COOP_MAX_ROWS && scratch.coop_ctr != nullptr && weights.top_k <= MOE_COOP_TOPK
 		&& ( ebits == 3 || ebits == 4 ) && weights.up[0].bits == ebits && weights.down[0].bits == ebits && weights.up[0].mul1 && weights.gate[0].mul1 && weights.down[0].mul1;
 }
@@ -649,6 +682,27 @@ void MoE::forward(
 	const int num_groups = sharded ? MOE_MAX_GROUPS : rows == 1 ? 1 : rows <= 16 ? 4 : MOE_MAX_GROUPS;
 	// Fused decode path: gate/up and down GEMV kernels over runs of rows that share an expert (exl3_moe_coop.cuh)
 	// 3 bpw (up to 8 routes: the integer tile) and 4 bpw experts, all mul1
+	if ( weights.type == pod::QuantType::NVFP4 ) {
+		ENGINE_ASSERT( scratch.nv_ctr != nullptr && weights.device_ptrs != nullptr && act_limit <= 0.0f, "MoE::forward: NVFP4 experts need nvfp4 scratch, init_device_ptrs and no activation clamp" );
+		const int E = weights.num_local_experts;
+		const char* base = static_cast<const char*>( weights.device_ptrs );
+		const uint8_t* const* pp = reinterpret_cast<const uint8_t* const*>( base );
+		const float* gg = reinterpret_cast<const float*>( base + 6 * E * sizeof( const void* ) );
+		NVFP4ExpertTable t;
+		t.gate_c = pp + 0 * E; t.gate_s = pp + 1 * E; t.up_c = pp + 2 * E; t.up_s = pp + 3 * E; t.down_c = pp + 4 * E; t.down_s = pp + 5 * E;
+		t.gate_g = gg; t.up_g = gg + E; t.down_g = gg + 2 * E;
+		t.num_local = E;
+		t.min_expert = start_expert;
+		t.hidden = x.shape[x.ndim - 1];
+		t.inter = static_cast<int>( weights.up[0].w0.shape[0] * 2 / t.hidden );   // up is [inter, hidden], packed 2 codes per byte
+		for ( int r0 = 0; r0 < rows; r0 += MOE_NVFP4_ROWS ) {
+			const int rn = MIN( MOE_NVFP4_ROWS, rows - r0 );
+			NVFP4MoE::forward_rows( t, x.ptr<const half>() + static_cast<size_t>( r0 ) * t.hidden, d_topk_indices + static_cast<size_t>( r0 ) * weights.top_k,
+				d_topk_weights + static_cast<size_t>( r0 ) * weights.top_k, rn, weights.top_k, scratch.nv_h, scratch.nv_partial, scratch.nv_ctr, weights.heat,
+				out.ptr<half>() + static_cast<size_t>( r0 ) * t.hidden, stream );
+		}
+		return;
+	}
 	const int ebits = weights.gate[0].bits;
 	if ( MoE::fused_decode( weights, scratch, rows ) ) {
 		const int E = weights.num_local_experts;

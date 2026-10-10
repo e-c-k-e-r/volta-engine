@@ -2,6 +2,7 @@
 #include "engine/models/qwen4_exp.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
+#include <memory>
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
 #include "engine/loader/safetensors.h"
@@ -272,7 +273,7 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	// MoE: router outputs, the dispatch / expert scratch for this rank's experts, and the shared expert's buffers
 	topk_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( int ) ) );
 	topk_w_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( backend::half_t ) ) );
-	moe_scratch_ = engine::modules::MoE::alloc_scratch( arena, config_.num_experts / tp_, config_.top_k, H, config_.moe_intermediate, R );
+	moe_scratch_ = engine::modules::MoE::alloc_scratch( arena, config_.num_experts / tp_, config_.top_k, H, config_.moe_intermediate, R, !runtime::options().nvfp4_experts.empty() );
 	int sh_shape[2] = { R, config_.shared_intermediate };
 	sh_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, sh_shape, 2 );
 	sh_up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, sh_shape, 2 );
@@ -314,6 +315,15 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	if ( !repo.open( model_dir ) ) {
 		LOG_ERROR( "[loader] FAILED to open model directory %s\n", model_dir );
 		return false;
+	}
+	std::unique_ptr<engine::loader::SafeTensorsRepo> nv_repo;
+	if ( const std::string& nv_dir = runtime::options().nvfp4_experts; !nv_dir.empty() ) {
+		nv_repo = std::make_unique<engine::loader::SafeTensorsRepo>();
+		if ( !nv_repo->open( nv_dir.c_str() ) ) {
+			LOG_ERROR( "[loader] FAILED to open the NVFP4 expert directory %s\n", nv_dir.c_str() );
+			return false;
+		}
+		LOG_INFO( "[RANK %d] routed experts from the NVFP4 checkpoint %s\n", rank_, nv_dir.c_str() );
 	}
 	backend::set_device( rank_ );
 	const int H = config_.hidden_size;
@@ -432,13 +442,20 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		lw.router = load_router_transposed( repo, nm, *arena_ );
 		if ( !lw.router.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, nm ); ++missing; }
 		auto& mw = lw.experts;
-		mw.type = pod::QuantType::TRELLIS;
+		mw.type = nv_repo ? pod::QuantType::NVFP4 : pod::QuantType::TRELLIS;
 		const int per_rank = config_.num_experts / tp;
 		ENGINE_ASSERT( per_rank <= MOE_MAX_EXPERTS, "Qwen4ExpPipeline: experts per rank exceed MOE_MAX_EXPERTS" );
 		mw.num_local_experts = per_rank;
 		mw.top_k = config_.top_k;
 		for ( int e = 0; e < per_rank; ++e ) {
 			const int gid = rank_ * per_rank + e;
+			if ( nv_repo ) {
+				// modelopt NVFP4 experts: [N, K/2] codes, E4M3 block scales, one FP32 global scale per matrix
+				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.gate_proj", pre, gid ); mw.gate[e] = check( nv_repo->load_nvfp4_slice( nm, *arena_, true, 0, 1, stream ), nm );
+				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.up_proj", pre, gid ); mw.up[e] = check( nv_repo->load_nvfp4_slice( nm, *arena_, true, 0, 1, stream ), nm );
+				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.down_proj", pre, gid ); mw.down[e] = check( nv_repo->load_nvfp4_slice( nm, *arena_, true, 0, 1, stream ), nm );
+				continue;
+			}
 			std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.gate_proj", pre, gid ); mw.gate[e] = check( repo.load_linear( nm, *arena_, 4, stream ), nm );
 			std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.up_proj", pre, gid ); mw.up[e] = check( repo.load_linear( nm, *arena_, 4, stream ), nm );
 			std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.down_proj", pre, gid ); mw.down[e] = check( repo.load_linear( nm, *arena_, 4, stream ), nm );

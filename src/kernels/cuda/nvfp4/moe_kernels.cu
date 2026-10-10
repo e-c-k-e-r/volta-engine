@@ -8,10 +8,12 @@
 // Gate and up for one 32-column tile of one route, epilogue silu(gate) * up -> h[route][col]
 template <int WARPS>
 __global__ __launch_bounds__( WARPS * 32 )
-void nvfp4_moe_gate_up( engine::modules::NVFP4ExpertTable t, const half* __restrict__ x, const int* __restrict__ route_idx, half* __restrict__ h ) {
+void nvfp4_moe_gate_up( engine::modules::NVFP4ExpertTable t, const half* __restrict__ x, const int* __restrict__ route_idx, int topk, half* __restrict__ h, uint32_t* heat ) {
 	const int route = blockIdx.y;
-	const int e = route_idx[route];
-	if ( e >= t.num_local ) return;
+	const int e = route_idx[route] - t.min_expert;
+	if ( ( unsigned ) e >= ( unsigned ) t.num_local ) return;
+	if ( heat != nullptr && blockIdx.x == 0 && threadIdx.x == 0 ) atomicAdd( heat + e, 1u );
+	x += ( size_t ) ( route / topk ) * t.hidden;
 	extern __shared__ half sx[];   // K halves
 	__shared__ float cs[WARPS][2][32];
 	const int K = t.hidden, I = t.inter;
@@ -90,12 +92,15 @@ __global__ __launch_bounds__( WARPS * 32 )
 void nvfp4_moe_down( engine::modules::NVFP4ExpertTable t, const half* __restrict__ h, const int* __restrict__ route_idx, const half* __restrict__ route_w,
 	int n_routes, float* __restrict__ partial, int* __restrict__ counters, half* __restrict__ out ) {
 	const int route = blockIdx.y;
-	const int e = route_idx[route];
+	const int row = route / n_routes;
+	const int e = route_idx[route] - t.min_expert;
 	const int H = t.hidden, K = t.inter;
 	const int tile = blockIdx.x;
+	counters += row * ( H / 32 );
+	out += ( size_t ) row * H;
 	__shared__ float cs[WARPS][32];
 	__shared__ int last;
-	if ( e < t.num_local ) {
+	if ( ( unsigned ) e < ( unsigned ) t.num_local ) {
 		extern __shared__ half sx[];
 		for ( int i = threadIdx.x * 8; i < K; i += WARPS * 32 * 8 ) *reinterpret_cast<uint4*>( sx + i ) = *reinterpret_cast<const uint4*>( h + ( size_t ) route * K + i );
 		__syncthreads();
@@ -155,7 +160,8 @@ void nvfp4_moe_down( engine::modules::NVFP4ExpertTable t, const half* __restrict
 		__threadfence();
 		float acc = 0.f;
 		for ( int k = 0; k < n_routes; k++ ) {
-			if ( route_idx[k] < t.num_local ) acc += __half2float( route_w[k] ) * __ldcg( partial + ( size_t ) k * H + tile * 32 + threadIdx.x );
+			const int r = row * n_routes + k;
+			if ( ( unsigned ) ( route_idx[r] - t.min_expert ) < ( unsigned ) t.num_local ) acc += __half2float( route_w[r] ) * __ldcg( partial + ( size_t ) r * H + tile * 32 + threadIdx.x );
 		}
 		out[tile * 32 + threadIdx.x] = __float2half( acc );
 		if ( threadIdx.x == 0 ) counters[tile] = 0;
@@ -164,12 +170,12 @@ void nvfp4_moe_down( engine::modules::NVFP4ExpertTable t, const half* __restrict
 
 namespace engine::modules {
 
-void NVFP4MoE::forward_row( const NVFP4ExpertTable& t, const half* x, const int* route_idx, const half* route_w, int n_routes,
-	half* h, float* partial, int* counters, half* out, backend::stream_t stream ) {
+void NVFP4MoE::forward_rows( const NVFP4ExpertTable& t, const half* x, const int* route_idx, const half* route_w, int rows, int topk,
+	half* h, float* partial, int* counters, uint32_t* heat, half* out, backend::stream_t stream ) {
 	ENGINE_ASSERT( t.hidden % 64 == 0 && t.inter % 64 == 0 && t.inter % 32 == 0 && t.hidden % 32 == 0, "NVFP4 MoE: dims" );
 	ENGINE_ASSERT( ( t.hidden / 16 ) % 16 == 0 && ( t.inter / 16 ) % 8 == 0, "NVFP4 MoE: group counts" );
-	nvfp4_moe_gate_up<16><<<dim3( t.inter / 32, n_routes ), 512, t.hidden * sizeof( half ), stream>>>( t, x, route_idx, h );
-	nvfp4_moe_down<8><<<dim3( t.hidden / 32, n_routes ), 256, t.inter * sizeof( half ), stream>>>( t, h, route_idx, route_w, n_routes, partial, counters, out );
+	nvfp4_moe_gate_up<16><<<dim3( t.inter / 32, rows * topk ), 512, t.hidden * sizeof( half ), stream>>>( t, x, route_idx, topk, h, heat );
+	nvfp4_moe_down<8><<<dim3( t.hidden / 32, rows * topk ), 256, t.inter * sizeof( half ), stream>>>( t, h, route_idx, route_w, topk, partial, counters, out );
 }
 
 } // namespace engine::modules

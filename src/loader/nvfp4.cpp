@@ -40,7 +40,10 @@ struct Nvfp4Source {
 bool open_nvfp4( const SafeTensorsRepo& repo, const char* base, Nvfp4Source& src ) {
 	char name[300];
 	int shard = -1;
+	// compressed-tensors: weight_packed / weight_scale / weight_global_scale (a divisor); modelopt: weight / weight_scale / weight_scale_2 (a multiplier)
 	std::snprintf( name, sizeof( name ), "%s.weight_packed", base );
+	const bool modelopt = repo.find( name, &shard ) == nullptr;
+	std::snprintf( name, sizeof( name ), modelopt ? "%s.weight" : "%s.weight_packed", base );
 	const auto* mp = repo.find( name, &shard );
 	if ( !mp ) return false;
 	src.packed = static_cast<const uint8_t*>( repo.cpu_data( name ) );
@@ -48,10 +51,10 @@ bool open_nvfp4( const SafeTensorsRepo& repo, const char* base, Nvfp4Source& src
 	src.K = mp->shape[1] * 2;
 	std::snprintf( name, sizeof( name ), "%s.weight_scale", base );
 	src.scales = static_cast<const uint8_t*>( repo.cpu_data( name ) );
-	std::snprintf( name, sizeof( name ), "%s.weight_global_scale", base );
+	std::snprintf( name, sizeof( name ), modelopt ? "%s.weight_scale_2" : "%s.weight_global_scale", base );
 	const float* g = static_cast<const float*>( repo.cpu_data( name ) );
 	if ( !src.packed || !src.scales || !g ) return false;
-	src.inv_global = 1.0f / g[0];
+	src.inv_global = modelopt ? g[0] : 1.0f / g[0];
 	return true;
 }
 

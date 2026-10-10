@@ -7,6 +7,7 @@
 #include "engine/backend/types.h"
 
 #define MOE_MAX_GROUPS 8
+#define MOE_NVFP4_ROWS 64   // rows per pass of the NVFP4 expert kernels (scratch is sized for this many)
 #define MOE_MAX_EXPERTS 512   // experts per rank: 72 expert-parallel (GLM), 128 whole experts of 4 ranks (Flash-Next; 512 on a single rank)
 
 namespace pod {
@@ -42,6 +43,10 @@ struct MoEScratch {
 	engine::backend::half_t*    coop_act = nullptr;       // [128 slots, intermediate]
 	float*   coop_d_out = nullptr;     // [128 slots, hidden]
 	int*     coop_ctr = nullptr;       // completion counters + run table, zero between calls
+	// NVFP4 experts (MOE_NVFP4_ROWS rows per pass)
+	engine::backend::half_t*    nv_h = nullptr;           // [rows * top_k, intermediate]
+	float*   nv_partial = nullptr;     // [rows * top_k, hidden]
+	int*     nv_ctr = nullptr;         // [rows, hidden / 32], zero between calls
 };
 
 } // namespace pod
@@ -135,7 +140,8 @@ struct MoE {
 		int top_k,
 		int hidden_size,
 		int intermediate_size,
-		int max_rows = 1
+		int max_rows = 1,
+		bool nvfp4 = false              // also allocate the NVFP4 expert kernels' scratch
 	);
 
 	// True when forward() takes the fused decode kernels for this many rows: they use none of the trellis GEMM workspace (locks, int8 counters),

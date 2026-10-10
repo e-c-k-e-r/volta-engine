@@ -54,7 +54,7 @@ int main() {
 	t.gate_g = static_cast<const float*>( upload( gg.data(), E * sizeof( float ) ) );
 	t.up_g = static_cast<const float*>( upload( ug.data(), E * sizeof( float ) ) );
 	t.down_g = static_cast<const float*>( upload( dg.data(), E * sizeof( float ) ) );
-	t.num_local = E; t.hidden = H; t.inter = I;
+	t.num_local = E; t.min_expert = 0; t.hidden = H; t.inter = I;
 
 	std::vector<half> hx( H );
 	for ( auto& v : hx ) v = __float2half( ( rnd() / 16777216.0f ) * 2.0f - 1.0f );
@@ -87,7 +87,7 @@ int main() {
 	// Parity (10 local routes, first set) against LinearNVFP4 chains
 	{
 		auto hi = make_routes( K );
-		engine::modules::NVFP4MoE::forward_row( t, x, idx, w, K, hbuf, partial, counters, out, stream );
+		engine::modules::NVFP4MoE::forward_rows( t, x, idx, w, 1, K, hbuf, partial, counters, nullptr, out, stream );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		std::vector<half> got( H );
 		CUDA_CHECK( cudaMemcpy( got.data(), out, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
@@ -129,7 +129,7 @@ int main() {
 		cudaGraph_t g;
 		cudaGraphExec_t ex;
 		CUDA_CHECK( cudaStreamBeginCapture( stream, cudaStreamCaptureModeGlobal ) );
-		for ( int s = 0; s < SETS; ++s ) engine::modules::NVFP4MoE::forward_row( t, x, idx + s * K, w, K, hbuf, partial, counters, out, stream );
+		for ( int s = 0; s < SETS; ++s ) engine::modules::NVFP4MoE::forward_rows( t, x, idx + s * K, w, 1, K, hbuf, partial, counters, nullptr, out, stream );
 		CUDA_CHECK( cudaStreamEndCapture( stream, &g ) );
 		CUDA_CHECK( cudaGraphInstantiate( &ex, g, nullptr, nullptr, 0 ) );
 		CUDA_CHECK( cudaGraphLaunch( ex, stream ) );
