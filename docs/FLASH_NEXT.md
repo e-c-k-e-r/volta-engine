@@ -145,3 +145,16 @@ Parallelism design (decision, 2026-10-09). Today: TP=4 for GDN / attention / den
 - Batch 2 on TP=4 already shares every launch between the slots (rows are per-slot in one step), so a second slot costs the extra rows, not a second pass.
 - What is left inside TP=4 is latency, not layout: 2 all-reduces per layer (96 per token, ~11 us floor plus the wait for the slowest rank), 8-bit projection launches (~25 us each), the gated-residual kernels. None of these change with a different split; they change with fewer launches (fusing the apply + norm further, a one-shot all-reduce that also applies the residual) and are per-kernel work, not a parallelism change.
 - NVFP4 Flash-Next (skips the trellis dequant cost) needs a new checkpoint (download) and a perplexity check; on hold until there is disk space.
+
+Numbers at the 250 W cap (2026-10-09; the 150 W numbers above are not comparable; baselines: `results/baseline_cap150.txt`, `results/baseline_cap250.txt`, local files):
+
+| | Qwen3.8-27B | GLM-5.3-Flash | Flash-Next |
+|---|---|---|---|
+| M=1 decode (`bench_decode`) | 15.91 ms (62.8 tok/s) | 18.98 ms (52.7 tok/s) | 19.81 ms (50.5 tok/s) |
+| M=8 verify | 24.88 ms | 41.94 ms | 30.78 ms |
+| 2 slots, per step | | | 22.52 ms (88.8 tok/s aggregate) |
+| Prefill, 512-row chunks | 2492 tok/s (2K) | 763 tok/s (2K) | 1322 tok/s (8K) |
+| MTP, 34-token prompt (`test_mtp`) | | | plain 62.8, MTP 185.3 tok/s (82% accepted) |
+| MTP, 15K-token prompt | | | plain 58.8, MTP 133.5 tok/s (63%) |
+
+The plain tok/s of `test_mtp` (62.8) is higher than `bench_decode`'s M=1 figure (50.5) for Flash-Next; the two use different loops and contexts and I have not reconciled them. Real serving decode runs at 98% GPU utilization (the `bench_decode` trace shows 44%: a benchmark-loop artifact).
