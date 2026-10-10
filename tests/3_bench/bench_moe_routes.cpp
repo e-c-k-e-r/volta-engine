@@ -1,6 +1,6 @@
 // Flash-Next decode MoE: time of one MoE::forward (1 row, top 10) on rank 0's 128 experts as the number of routes that
 // land on this rank varies (the rest point to experts of other ranks), plus the router-free floor of 0 local routes.
-//   bench_moe_routes [layer]
+//   bench_moe_routes [layer] [rows ...]   (with rows: prefill-sized calls, tokens routed uniformly over all 512 experts, rank 0's 128 are local)
 #include "engine/runtime/test_paths.h"
 #include "engine/config.h"
 #include "engine/core/arena.h"
@@ -23,7 +23,7 @@ int main( int argc, char** argv ) {
 	cudaStream_t stream;
 	CUDA_CHECK( cudaStreamCreate( &stream ) );
 	pod::MemoryArena arena;
-	ENGINE_ASSERT( engine::core::arena_create( arena, 0, 1ULL * 1024 * 1024 * 1024 ), "arena" );
+	ENGINE_ASSERT( engine::core::arena_create( arena, 0, 4ULL * 1024 * 1024 * 1024 ), "arena" );
 	engine::loader::SafeTensorsRepo repo;
 	ENGINE_ASSERT( repo.open( dir ), "open model dir" );
 	pod::MoELayerWeights mw;
@@ -83,6 +83,42 @@ int main( int argc, char** argv ) {
 		float ms = 0.0f;
 		CUDA_CHECK( cudaEventElapsedTime( &ms, e0, e1 ) );
 		std::printf( "  %2d local routes: %7.1f us per forward\n", n, 1000.0f * ms / iters );
+	}
+	for ( int ai = 2; ai < argc; ++ai ) {
+		const int Rn = std::atoi( argv[ai] );
+		int xs[2] = { Rn, H };
+		auto xr = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, xs, 2 );
+		auto outr = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, xs, 2 );
+		std::vector<half> hxr( static_cast<size_t>( Rn ) * H );
+		for ( auto& v : hxr ) { seed = seed * 1664525u + 1013904223u; v = __float2half( ( ( seed >> 8 ) / 16777216.0f ) * 2.0f - 1.0f ); }
+		CUDA_CHECK( cudaMemcpy( xr.data, hxr.data(), hxr.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
+		int* ri = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( Rn ) * K * sizeof( int ) ) );
+		half* rw = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( Rn ) * K * sizeof( half ) ) );
+		std::vector<int> hri( static_cast<size_t>( Rn ) * K );
+		std::vector<half> hrw( static_cast<size_t>( Rn ) * K, __float2half( 0.1f ) );
+		int local = 0;
+		for ( int r = 0; r < Rn; ++r ) {
+			int used[512] = {};
+			for ( int k = 0; k < K; ++k ) {
+				int e;
+				do { seed = seed * 1664525u + 1013904223u; e = ( seed >> 8 ) % 512; } while ( used[e] );
+				used[e] = 1;
+				hri[static_cast<size_t>( r ) * K + k] = e;
+				local += e < E ? 1 : 0;
+			}
+		}
+		CUDA_CHECK( cudaMemcpy( ri, hri.data(), hri.size() * sizeof( int ), cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMemcpy( rw, hrw.data(), hrw.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
+		auto sc = engine::modules::MoE::alloc_scratch( arena, E, K, H, I, Rn );
+		for ( int it = 0; it < 2; ++it ) engine::modules::MoE::forward( xr, mw, ri, rw, outr, 0, E, sc, 0.0f, stream );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		CUDA_CHECK( cudaEventRecord( e0, stream ) );
+		for ( int it = 0; it < 8; ++it ) engine::modules::MoE::forward( xr, mw, ri, rw, outr, 0, E, sc, 0.0f, stream );
+		CUDA_CHECK( cudaEventRecord( e1, stream ) );
+		CUDA_CHECK( cudaEventSynchronize( e1 ) );
+		float ms = 0.0f;
+		CUDA_CHECK( cudaEventElapsedTime( &ms, e0, e1 ) );
+		std::printf( "  rows %5d: %7.3f ms per layer (%d local routes, %.1f us per route, %.2f us per row)\n", Rn, ms / 8, local, 1000.0 * ms / 8 / MAX( 1, local ), 1000.0 * ms / 8 / Rn );
 	}
 	return 0;
 }
