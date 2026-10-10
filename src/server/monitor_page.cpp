@@ -161,7 +161,9 @@ let paused = false, timer = null, expTimer = null, stats = null, gpuHist = [], c
 
 // ---- charts ----
 function setup(canvas) {
-	const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = parseInt(canvas.getAttribute('height'));
+	// the logical height is kept in data-h: the height attribute becomes the backing-store size, which must not feed back into the layout
+	if (!canvas.dataset.h) { canvas.dataset.h = canvas.getAttribute('height'); canvas.style.height = canvas.dataset.h + 'px'; }
+	const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = parseInt(canvas.dataset.h);
 	if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) { canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr); }
 	const g = canvas.getContext('2d');
 	g.setTransform(dpr, 0, 0, dpr, 0, 0);
