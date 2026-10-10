@@ -297,11 +297,28 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 	// 4. Per-layer weights across 64 layers
 	char name_buf[256];
 	// Column-parallel (output split, dim 1) and row-parallel (input split, dim 0) projection loads for either format
+	// Mixed NVFP4 checkpoints keep some projections dense (the Swift one leaves the linear-attention projections in BF16): without a weight_packed tensor
+	// the projection loads as a dense FP16 matrix, sliced along its output rows (column parallel) or its input columns (row parallel)
+	auto has_packed = [&]( const char* base ) {
+		char b[320];
+		std::snprintf( b, sizeof( b ), "%s.weight_packed", base );
+		return repo.find( b ) != nullptr;
+	};
+	auto dense_proj = [&]( const char* base, int slice_dim ) {
+		char b[320];
+		std::snprintf( b, sizeof( b ), "%s.weight", base );
+		pod::TensorView w = tp_size > 1 ? repo.load_slice( b, *arena_, slice_dim, rank_, tp_size, stream, pod::DType::FP16 ) : repo.load( b, *arena_, stream, pod::DType::FP16 );
+		ENGINE_ASSERT( w.data != nullptr && w.ndim == 2, "Qwen3_5Pipeline: projection has neither weight_packed nor a dense weight" );
+		std::swap( w.shape[0], w.shape[1] );   // [n, k] in memory, tagged [k, n] for make_fp16
+		return pod::LinearWeight::make_fp16( w );
+	};
 	auto load_col = [&]( const char* name, int bits ) {
+		if ( fp4 && !has_packed( name ) ) return dense_proj( name, 0 );
 		if ( fp4 ) return repo.load_nvfp4_slice( name, *arena_, true, rank_, tp_size, stream );
 		return ( tp_size > 1 ) ? repo.load_linear_slice( name, *arena_, bits, 1, rank_, tp_size, stream ) : repo.load_linear( name, *arena_, bits, stream );
 	};
 	auto load_row = [&]( const char* name, int bits ) {
+		if ( fp4 && !has_packed( name ) ) return dense_proj( name, 1 );
 		if ( fp4 ) return repo.load_nvfp4_slice( name, *arena_, false, rank_, tp_size, stream );
 		return ( tp_size > 1 ) ? repo.load_linear_slice( name, *arena_, bits, 0, rank_, tp_size, stream ) : repo.load_linear( name, *arena_, bits, stream );
 	};
@@ -342,7 +359,16 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 			const int QWEN_CONV_RANK_CHANNELS[3] = { 2048 / tp_size, 2048 / tp_size, 6144 / tp_size };
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_qkv", L );
-			if ( fp4 ) {
+			if ( fp4 && !has_packed( name_buf ) ) {
+				char wname[320];
+				std::snprintf( wname, sizeof( wname ), "%s.weight", name_buf );
+				pod::TensorView w = tp_size > 1 ? repo.load_grouped_slice( wname, *arena_, QWEN_CONV_CHANNELS, QWEN_CONV_RANK_CHANNELS, 3, rank_, 0, stream, pod::DType::FP16 )
+				                                : repo.load( wname, *arena_, stream, pod::DType::FP16 );
+				ENGINE_ASSERT( w.data != nullptr && w.ndim == 2, "Qwen3_5Pipeline: in_proj_qkv has neither weight_packed nor a dense weight" );
+				std::swap( w.shape[0], w.shape[1] );
+				lw.in_proj_qkv = pod::LinearWeight::make_fp16( w );
+			}
+			else if ( fp4 ) {
 				// Rows are [q | k | v] groups; each rank takes its share of every group
 				int n_begin[3], n_count[3], start = 0;
 				for ( int g = 0; g < 3; ++g ) {
@@ -372,7 +398,7 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 			                              : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", L );
-			if ( fp4 ) {
+			if ( fp4 && has_packed( std::string( name_buf, std::strlen( name_buf ) - 7 ).c_str() ) ) {
 				name_buf[std::strlen( name_buf ) - 7] = 0;  // drop ".weight"
 				lw.in_proj_a = repo.load_nvfp4_dense( name_buf, *arena_, true, rank_, tp_size, stream );
 			}
@@ -380,7 +406,7 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 			                                : repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", L );
-			if ( fp4 ) {
+			if ( fp4 && has_packed( std::string( name_buf, std::strlen( name_buf ) - 7 ).c_str() ) ) {
 				name_buf[std::strlen( name_buf ) - 7] = 0;
 				lw.in_proj_b = repo.load_nvfp4_dense( name_buf, *arena_, true, rank_, tp_size, stream );
 			}
