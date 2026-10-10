@@ -1,3 +1,4 @@
+#include <condition_variable>
 #include "engine/models/qwen4_exp.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
@@ -730,12 +731,42 @@ void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_i
 }
 
 // Hashes each row's n-gram (token, previous tokens within the eos segment) into the table rows and uploads the decoded embedding
+namespace {
+
+// The n-gram rows are the same for every rank (the layer is replicated), so the ranks split the decode of a forward's rows between them (row r by rank r % tp)
+// and share the host buffer through a few counting barriers instead of each decoding all rows
+struct PleHostShare {
+	std::mutex mu;
+	std::condition_variable cv;
+	int arrived = 0;
+	unsigned generation = 0;
+	std::vector<backend::half_t> emb;
+
+	void barrier( int parties ) {
+		std::unique_lock<std::mutex> lk( mu );
+		const unsigned gen = generation;
+		if ( ++arrived == parties ) {
+			arrived = 0;
+			++generation;
+			cv.notify_all();
+		}
+		else cv.wait( lk, [&] { return generation != gen; } );
+	}
+};
+
+PleHostShare& ple_share() {
+	static PleHostShare share;
+	return share;
+}
+
+} // namespace
+
 void Qwen4ExpPipeline::ple_prepare( const pod::BatchRows& rows, int m, backend::stream_t stream ) {
 	auto& table = ngram_table();
 	ENGINE_ASSERT( table.is_open() && static_cast<int>( host_tokens_.size() ) >= m, "Qwen4ExpPipeline: n-gram table or token ids missing" );
 	const int eos = 248044;   // text_config eos_token_id: n-grams never span it
 	const int D = config_.ple_embed_dim;
-	std::vector<backend::half_t> emb( static_cast<size_t>( m ) * D );
+	std::vector<backend::half_t> emb( tp_ > 1 ? 0 : static_cast<size_t>( m ) * D );
 	for ( int r = 0; r < m; ++r ) {
 		const int slot = rows.slot[r], pos = rows.pos[r];
 		auto& H = hist_tok_[slot];
@@ -743,9 +774,16 @@ void Qwen4ExpPipeline::ple_prepare( const pod::BatchRows& rows, int m, backend::
 		H[pos] = host_tokens_[r];
 		S[pos] = ( pos > 0 ) ? ( H[pos - 1] == eos ? pos : S[pos - 1] ) : 0;
 	}
+	auto& share = ple_share();
+	if ( tp_ > 1 && share.emb.size() < static_cast<size_t>( pod::MAX_ROWS ) * D ) {
+		// Sized once, before any rank writes: the first barrier below also publishes the size
+		std::lock_guard<std::mutex> lk( share.mu );
+		if ( share.emb.size() < static_cast<size_t>( pod::MAX_ROWS ) * D ) share.emb.resize( static_cast<size_t>( pod::MAX_ROWS ) * D );
+	}
+	backend::half_t* shared_emb = tp_ > 1 ? share.emb.data() : emb.data();
 	std::vector<float> row( engine::loader::NgramTable::ROW_DIM );
 	std::vector<uint64_t> uids( table.num_heads() );
-	for ( int r = 0; r < m; ++r ) {
+	for ( int r = ( tp_ > 1 ? rank_ : 0 ); r < m; r += ( tp_ > 1 ? tp_ : 1 ) ) {
 		const int slot = rows.slot[r], pos = rows.pos[r];
 		int64_t tokens[8];
 		for ( int s = 0; s < table.ngram_size(); ++s ) {
@@ -756,12 +794,14 @@ void Qwen4ExpPipeline::ple_prepare( const pod::BatchRows& rows, int m, backend::
 		for ( int h = 0; h < table.num_heads(); ++h ) {
 			table.decode_row( uids[h], h, row.data() );
 			for ( int i = 0; i < engine::loader::NgramTable::ROW_DIM; ++i ) {
-				emb[static_cast<size_t>( r ) * D + static_cast<size_t>( h ) * engine::loader::NgramTable::ROW_DIM + i] = backend::from_float_half( row[i] );
+				shared_emb[static_cast<size_t>( r ) * D + static_cast<size_t>( h ) * engine::loader::NgramTable::ROW_DIM + i] = backend::from_float_half( row[i] );
 			}
 		}
 	}
-	backend::memcpy_async( ple_emb_.data, emb.data(), emb.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
-	backend::stream_sync( stream );   // emb dies with this frame
+	if ( tp_ > 1 ) share.barrier( tp_ );   // every rank's rows are in
+	backend::memcpy_async( ple_emb_.data, shared_emb, static_cast<size_t>( m ) * D * sizeof( backend::half_t ), backend::Copy::H2D, stream );
+	backend::stream_sync( stream );   // the host buffer is reused by the next call
+	if ( tp_ > 1 ) share.barrier( tp_ );   // every rank has copied it
 }
 
 void Qwen4ExpPipeline::ple_forward( int m, backend::stream_t stream ) {

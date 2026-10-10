@@ -102,13 +102,15 @@ void bench_model( const char* type, const char* dir, int steps ) {
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	bool qwen = true;
-	bool glm = false;
+	bool glm = false, flash = false;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--glm" ) || !std::strcmp( argv[i], "--glm-only" ) ) { qwen = false; glm = true; }
-		else if ( !std::strcmp( argv[i], "--all" ) ) { qwen = true; glm = true; }
+		else if ( !std::strcmp( argv[i], "--flash" ) ) { qwen = false; flash = true; }
+		else if ( !std::strcmp( argv[i], "--all" ) ) { qwen = true; glm = true; flash = true; }
 	}
 	if ( qwen ) impl::bench_model( "qwen3_5", test::QWEN_DIR, 50 );
 	if ( glm ) impl::bench_model( "glm5_next", test::GLM_DIR, 30 );
+	if ( flash ) impl::bench_model( "qwen4_exp", test::FLASH_DIR, 50 );
 	std::printf( "\n[+] Benchmark complete.\n" );
 	return 0;
 }

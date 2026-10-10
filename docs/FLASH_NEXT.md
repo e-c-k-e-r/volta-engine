@@ -133,5 +133,7 @@ Quality check of the prefill changes (`test_ppl --flash`, teacher-forced perplex
 
 MTP at the current baseline (`test_mtp`, depth 7, greedy equal to plain decode): 34-token prompt plain 58.8 -> MTP 158.7 tok/s (82% of drafts accepted), 15K-token prompt 53.8 -> 112.5 tok/s (63%).
 
+GPU utilization that alternated between 100% and 20-40% during prefill (power 64 <-> 150 W, one cycle per 512-row chunk) was the n-gram embedding rows: every rank decoded all 512 rows from the mmapped table on the host before the chunk's graph (113 ms of a 515 ms chunk, GPUs idle). The ranks now decode a quarter of the rows each into a shared host buffer behind counting barriers: prefill 981 -> 1164 tok/s, outputs unchanged. Decode is not affected (0.33 ms of host time per token). The ~2.4 ms holes that show up per decode step in `nvprof --print-gpu-trace` are profiler launch overhead, not present without it (bench_decode --flash: 20.1 ms/token plain). Remaining host-side idle per chunk is about 28 ms; overlapping the next chunk's rows with the current chunk would remove it.
+
 Next: a GEMV for the N=640 shared-expert shapes, a tensor-core QSA scorer and sparse
 kernel, the SASS / bench baselines and the 256K needle.
