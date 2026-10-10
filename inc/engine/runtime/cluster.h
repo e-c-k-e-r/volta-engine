@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <string>
 #include <vector>
@@ -64,6 +65,10 @@ public:
 	int snapshot_align() const { return models_[0]->seq_align(); }
 	size_t snapshot_bytes( int from, int tokens, bool with_taps = false ) const;    // per rank; 0 when the model cannot snapshot
 	bool save_snapshot( int slot, int from, int tokens, SeqSnapshot* snap, bool with_taps = true );
+	// Pins the host buffers of snapshots that a long prompt is about to store (cudaHostAlloc costs ~0.75 s per GiB, which would stall every
+	// decoding slot when done inside a checkpoint) on a helper thread, so the store finds them in the free list.
+	struct SnapshotPlan { int from, tokens; bool with_taps; };
+	void prewarm_snapshots( const std::vector<SnapshotPlan>& plan );
 	// Writes the snapshot into the slot: its KV rows, and unless kv_only the recurrent state and tap rows (the slot then
 	// claims the drafter, which re-reads its window from the restored taps). A chain is restored ancestors first (kv_only),
 	// then the node being resumed from.
@@ -149,6 +154,7 @@ private:
 	int mm_slots_ = 0;                // slots with a non-empty layout
 	std::map<size_t, std::vector<void*>> snapshot_free_[ENGINE_NUM_GPUS]; // pinned buffers by rounded size
 	std::mutex snapshot_mtx_;
+	std::thread snapshot_prewarm_;
 	RankPool pool_;
 };
 

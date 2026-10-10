@@ -343,6 +343,16 @@ bool Generator::prefill_slot( int s, int budget ) {
 			for ( int p = interval; interval > 0 && p < n - kPrefixMinTokens; p += interval ) slot.pf_cps.push_back( { p, false, false } );
 			std::sort( slot.pf_cps.begin(), slot.pf_cps.end(), []( const GenerationRequest::Checkpoint& a, const GenerationRequest::Checkpoint& b ) { return a.pos < b.pos || ( a.pos == b.pos && a.pinned > b.pinned ); } );
 		}
+		if ( prefix_cache_ && !slot.pf_cps.empty() ) {
+			std::vector<ModelCluster::SnapshotPlan> plan;
+			int from = pos;
+			for ( const auto& c : slot.pf_cps ) {
+				if ( c.pos <= from || c.pos >= n ) continue;
+				plan.push_back( { from, c.pos, c.taps } );
+				from = c.pos;
+			}
+			cluster_.prewarm_snapshots( plan );
+		}
 		slot.pf_cp_next = 0;
 		slot.pf_last_cp = -1;
 		slot.pf_chain_ok = true;
@@ -392,7 +402,9 @@ bool Generator::prefill_slot( int s, int budget ) {
 		if ( is_cp && seg_end == end ) {
 			slot.pf_last_cp = end;
 			++slot.pf_cp_next;
+			const auto t_cp = std::chrono::steady_clock::now();
 			slot.pf_node = store_prefix( s, slot.pf_node, pos, cp->pinned, cp->taps );
+			LOG_DEBUG( "[gen] slot %d checkpoint at %d stored in %.0f ms\n", s, pos, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_cp ).count() );
 			slot.pf_chain_ok = slot.pf_node != nullptr;
 		}
 		slot.pf_pos = pos;
@@ -448,7 +460,11 @@ void Generator::step_batch() {
 			const int s = ( pf_rr_ + i ) % num_slots_;
 			if ( slots_[s].active && !slots_[s].prefill_done ) {
 				pf_rr_ = s;
+				const auto t0 = std::chrono::steady_clock::now();
+				const int pos0 = slots_[s].pf_pos;
 				prefill_slot( s, chunk );
+				const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
+				if ( ms > 300.0 ) LOG_DEBUG( "[gen] slot %d prefill piece at %d (%d rows) took %.0f ms\n", s, pos0, slots_[s].pf_pos - pos0, ms );
 				break;
 			}
 		}

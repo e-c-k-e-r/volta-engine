@@ -111,6 +111,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 
 void ModelCluster::shutdown() {
 	if ( !created_ ) return;
+	if ( snapshot_prewarm_.joinable() ) snapshot_prewarm_.join();
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		for ( auto& kv : snapshot_free_[d] ) {
 			for ( void* p : kv.second ) backend::host_free_pinned( p );
@@ -441,6 +442,7 @@ bool ModelCluster::save_snapshot( int slot, int from, int tokens, SeqSnapshot* s
 	snap->with_taps = with_taps;
 	snap->tokens = tokens;
 	snap->bytes = cls;
+	const auto t_alloc = std::chrono::steady_clock::now();
 	for ( int d = 0; d < tp_; ++d ) {
 		void* p = nullptr;
 		{
@@ -461,6 +463,7 @@ bool ModelCluster::save_snapshot( int slot, int from, int tokens, SeqSnapshot* s
 		}
 		snap->host[d] = p;
 	}
+	const auto t_copy = std::chrono::steady_clock::now();
 	int ok[ENGINE_NUM_GPUS] = {};
 	pool_.run( [&]( int d ) {
 		ok[d] = models_[d]->save_seq_state( slot, from, tokens, with_taps, snap->host[d], streams_[d] ) ? 1 : 0;
@@ -472,7 +475,42 @@ bool ModelCluster::save_snapshot( int slot, int from, int tokens, SeqSnapshot* s
 			return false;
 		}
 	}
+	LOG_DEBUG( "[snapshot] %zu MiB per rank: host buffers %.0f ms, copy %.0f ms\n", cls >> 20,
+		std::chrono::duration<double, std::milli>( t_copy - t_alloc ).count(), std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_copy ).count() );
 	return true;
+}
+
+void ModelCluster::prewarm_snapshots( const std::vector<SnapshotPlan>& plan ) {
+	constexpr size_t kRound = size_t( 8 ) << 20;
+	std::map<size_t, int> want;   // rounded size -> buffers needed per rank
+	for ( const SnapshotPlan& sp : plan ) {
+		const bool taps = sp.with_taps && runner_ != nullptr && runner_->needs_taps();
+		const size_t need = snapshot_bytes( sp.from, sp.tokens, taps );
+		if ( need > 0 ) ++want[( need + kRound - 1 ) / kRound * kRound];
+	}
+	if ( want.empty() ) return;
+	if ( snapshot_prewarm_.joinable() ) snapshot_prewarm_.join();
+	snapshot_prewarm_ = std::thread( [this, want]() {
+		for ( int d = 0; d < tp_; ++d ) {
+			backend::set_device( d );
+			for ( const auto& w : want ) {
+				for ( ;; ) {
+					{
+						std::lock_guard<std::mutex> lock( snapshot_mtx_ );
+						if ( static_cast<int>( snapshot_free_[d][w.first].size() ) >= w.second ) break;
+					}
+					void* p = backend::host_alloc_pinned( w.first, backend::Pin::Default );
+					if ( !p ) break;
+					{
+						std::lock_guard<std::mutex> lock( snapshot_mtx_ );
+						snapshot_free_[d][w.first].push_back( p );
+					}
+					// each pin holds the driver for ~0.2 s: leave room for the scheduler's decode steps in between
+					std::this_thread::sleep_for( std::chrono::milliseconds( 250 ) );
+				}
+			}
+		}
+	} );
 }
 
 bool ModelCluster::load_snapshot( int slot, const SeqSnapshot& snap, bool kv_only ) {
