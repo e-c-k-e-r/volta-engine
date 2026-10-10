@@ -131,5 +131,7 @@ Persistent prefill MoE kernel, looked at and left alone: 3.4 ms per call at any 
 
 Quality check of the prefill changes (`test_ppl --flash`, teacher-forced perplexity of 6000 tokens of docs/ with every row's logits read back, `gather_logits` implemented for this model): all new paths 3.835, every old path 3.829 (the tensor-core gated residual alone 3.827, sparse attention alone 3.830). The per-token NLL moves by 0.06 on average (router flips) but the mean moves by 0.0016 nats, inside the noise of a 6000-token sample; no measurable quality change.
 
+MTP at the current baseline (`test_mtp`, depth 7, greedy equal to plain decode): 34-token prompt plain 58.8 -> MTP 158.7 tok/s (82% of drafts accepted), 15K-token prompt 53.8 -> 112.5 tok/s (63%).
+
 Next: a GEMV for the N=640 shared-expert shapes, a tensor-core QSA scorer and sparse
 kernel, the SASS / bench baselines and the 256K needle.
