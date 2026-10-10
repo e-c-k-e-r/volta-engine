@@ -15,7 +15,8 @@ cmake -S . -B build_cpu -G Ninja -DENGINE_BACKEND=CPU
 cmake -S . -B build_vk  -G Ninja -DENGINE_BACKEND=VULKAN
 ```
 
-The CPU build runs Qwen and Flash-Next on one rank (Flash-Next needs ~66 GiB of host memory); the Vulkan build runs what fits one device
+The CPU build compiles for the build host (`-march=native`: AVX2, FMA and the F16C conversions, about 2x on the reference kernels; `-DENGINE_CPU_NATIVE=OFF` for
+a portable binary) and runs Qwen and Flash-Next on one rank (Flash-Next needs ~66 GiB of host memory); the Vulkan build runs what fits one device
 (Qwen 27B) and needs `ENGINE_DEBUG_NO_GRAPHS=1` for models with a routed MoE (the MoE reads its routes back on the host). Both are slow by
 design (reference kernels); the DFlash2 speculator is CUDA only and the MTP head has not been run on them.
 

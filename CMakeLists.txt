@@ -28,6 +28,12 @@ endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION")
 
+# The CPU backend is the speed of the host's FP16 conversions and FMAs (the reference kernels convert every operand); the baseline x86-64 target has neither
+option(ENGINE_CPU_NATIVE "CPU backend: compile for the build host (-march=native)" ON)
+if(ENGINE_BACKEND STREQUAL "CPU" AND ENGINE_CPU_NATIVE)
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
+endif()
+
 include_directories(
 	${PROJECT_SOURCE_DIR}/inc
 	${PROJECT_SOURCE_DIR}/src/kernels/cuda/trellis

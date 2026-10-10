@@ -37,6 +37,6 @@
 CPU and Vulkan forwards (`test_cpu_forward`, `test_vulkan_forward`) compare a whole prompt (`--steps N`: and N greedy decode steps) against
 CUDA goldens; they run by hand (slow on CPU). `--model <dir> --type <model_type>` selects the checkpoint; a checkpoint that does not fit one
 GPU is dumped from a CUDA tp=4 build (`ENGINE_TP=4 build/test_cpu_forward --dump <dir> --steps 6 --model <Flash-Next dir> --type qwen4_exp`) and
-checked on the CPU build, whose single rank holds all 512 experts (about 66 GiB of weights; the load takes ~3 minutes, the 4-token prefill
-~1 minute, a decode step ~15 s). Flash-Next on the CPU matches the CUDA tp=4 logits (cos 0.9999992) and decodes the same 6 greedy tokens. The
+checked on the CPU build, whose single rank holds all 512 experts (about 66 GiB of weights; the whole run, load + 4-token prefill + 6 decode
+steps, takes 3.5 minutes on the build host's 10 cores). Flash-Next on the CPU matches the CUDA tp=4 logits (cos 0.9999992) and decodes the same 6 greedy tokens. The
 Vulkan backend cannot hold Flash-Next (one 32 GB device); its Flash-Next modules are checked op by op (`test_ops_flash`, `test_ops_moe --softmax`).
