@@ -57,6 +57,15 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			COMMENT "slangc ${entry} -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
+	# Vision tower operators (src/kernels/slang/vision.slang)
+	foreach(entry vision_f32_to_f16 vision_pos_interp vision_patch_embed vision_norm vision_qkv_rope vision_merge_gather vision_attention vision_bias_act vision_bias_residual)
+		set(sout ${SLANG_OUT}/${entry}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/vision.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/vision.slang
+			COMMENT "slangc ${entry} -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
 	# NVFP4 W4A16 linear (src/kernels/slang/nvfp4.slang)
 	add_custom_command(OUTPUT ${SLANG_OUT}/nvfp4_gemm.spv
 		COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/nvfp4.slang -target spirv -stage compute -entry nvfp4_gemm -DENGINE_TARGET_CPU=0 -o ${SLANG_OUT}/nvfp4_gemm.spv
@@ -90,7 +99,7 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	set_target_properties(test_vulkan_forward PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# Op-level goldens through the module API (--check against the CUDA --dump)
-	foreach(t test_ops_linear test_ops_attention test_ops_moe test_ops_flash)
+	foreach(t test_ops_linear test_ops_attention test_ops_moe test_ops_flash test_ops_vision)
 		add_executable(${t} tests/2_parity/${t}.cpp ${ENGINE_VK_OBJECTS})
 		target_link_libraries(${t} PRIVATE engine_backend_vulkan pthread)
 		add_dependencies(${t} slang_kernels)

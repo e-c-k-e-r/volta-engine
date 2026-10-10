@@ -70,6 +70,19 @@ struct HcFinalizeParams { uint64_t streams, partials, base, scale, post, comb, c
 struct HcApplyParams { uint64_t x_in, x_out, y, post, comb; int hidden_size, has_comb; };
 } // namespace engine::backend::impl
 
+// Vision tower (src/kernels/slang/vision.slang)
+namespace engine::backend::impl {
+struct F32ToF16Params { uint64_t in_, out_; int64_t n; };
+struct PosInterpParams { uint64_t table, out_; int gh, gw, merge, side, dim; };
+struct PatchEmbedParams { uint64_t patches, w, bias, add, out_; int m, n, k, has_add; };
+struct VNormParams { uint64_t x32, x16, w, b, out_; int n, group, kind; float eps; };
+struct QkvRopeParams { uint64_t q, k, v, bq, bk, bv, qn, kn, cs, sn; int heads, head_dim; float eps; int norm; };
+struct MergeGatherParams { uint64_t h, out_; int n, group; };
+struct VAttnParams { uint64_t q, k, v, out_; int m, heads, head_dim; float scale; };
+struct BiasActParams { uint64_t x, bias; int64_t total; int n, act, has_bias; };
+struct BiasResidualParams { uint64_t hidden, y, bias; int64_t total; int n; };
+} // namespace engine::backend::impl
+
 // NVFP4 linear (src/kernels/slang/nvfp4.slang)
 namespace engine::backend::impl {
 struct Nvfp4Params { uint64_t codes, scales, x, out_; int m, k, n; float gm; };

@@ -12,7 +12,7 @@
 | `test_sampling` | 2 | no | top-k / top-p sampler |
 | `test_slang_cpu`, `test_slang_kernels` | 2 | partly | Slang kernels on CPU and as generated CUDA |
 | `test_ref_linear`, `test_ref_attention`, `test_vulkan_kernels`, `test_vulkan_smoke`, `test_vulkan_ref` | 2 | yes | portable reference kernels on CUDA, CPU and Vulkan |
-| `test_ops_linear`, `test_ops_moe` (`--softmax` for the Qwen router), `test_ops_attention`, `test_ops_flash` | 2 | yes | cross-backend op goldens (dumped on CUDA, checked on CUDA, CPU, Vulkan); `test_ops_flash` covers the Flash-Next modules (gated residual, PLE, QSA, selection, sparse attention, softmax router) |
+| `test_ops_linear`, `test_ops_moe` (`--softmax` for the Qwen router), `test_ops_attention`, `test_ops_flash`, `test_ops_vision` | 2 | yes | cross-backend op goldens (dumped on CUDA, checked on CUDA, CPU, Vulkan); `test_ops_flash` covers the Flash-Next modules (gated residual, PLE, QSA, selection, sparse attention, softmax router); `test_ops_vision` the vision-tower operators |
 | `test_jinja` | 2 | no | Jinja2 subset against reference Jinja2 renders of both chat templates |
 | `test_image` | 2 | no | image decode, smart resize and patch layout against PIL / HF-layout references, GLM canvas sizes against exllamav3's (`tests/tools/gen_image_goldens.py`) |
 | `test_output_parser` | 2 | no | reasoning / tool-call parser, chunking independence, template round trip |
