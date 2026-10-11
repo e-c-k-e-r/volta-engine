@@ -278,9 +278,9 @@ keep whole 256-groups: out-projection K 7168/4 = 7 groups, MLP-down K 14336/4 = 
 summed over NCCL, two all-reduces of 741 MB per layer (7.4 ms each as FP16, `bench_allreduce`); the SiLU row scale is the maximum over the whole MLP width (a small max
 all-reduce between a max pass and the apply pass); adapters are sliced the same way (column-parallel: B rows; row-parallel: A columns). Measured at 1280x736x124: goldens match
 sequence parallelism (cosine 0.999999 video / 0.999996 audio), a full 4-step job with the turbo adapter has velocity norms within 4e-4 and 39 dB PSNR against the
-sequence-parallel video; step 16.6 s against 15.6 s, transformer load 7.1 s against 9.6 s (each GPU reads a quarter of the file), peak 21 GB per GPU against 30 GB, with the
-activation scratch still sized for full rows (it could shrink to the shard sizes). The point is VRAM (a quarter of the weights per GPU) so that the text tower and the VAEs
-can stay resident. Not yet: a config flag (`video.tensor_parallel`) instead of the environment variable, server integration, a smaller scratch, FP16 or overlapped
+sequence-parallel video; step 16.6 s against 15.6 s, transformer load 7.1 s against 9.6 s (each GPU reads a quarter of the file), 14.2 GB per GPU while denoising (21.3 with the full
+transformer per GPU) and a decode peak of 17.6 GB (19.2 on GPU 0) against 30 GB; the activation scratch is sized per mode (shard-width activations, no K/V gather buffers). The point is VRAM (a quarter of the weights per GPU) so that the text tower and the VAEs
+can stay resident. Not yet: a config flag (`video.tensor_parallel`) instead of the environment variable, server integration, FP16 or overlapped
 reductions, tensor-parallel text tower and VAEs.
 
 Left on the table: a fused SiLU epilogue in the GEMM, an attention kernel with explicit MMA instructions instead of WMMA (the P round trip through shared memory is the
