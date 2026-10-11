@@ -53,7 +53,7 @@ struct Job {
 	double progress = 0, created = 0, started = 0, finished = 0, t_text = 0, t_load = 0, t_denoise = 0, t_decode = 0, t_total = 0;
 	std::atomic<bool> cancel{ false };
 	std::vector<H3Lora> loras;
-	std::vector<std::string> images, ref_images, ref_audios;
+	std::vector<std::string> images, ref_images, ref_videos, ref_audios;
 	std::vector<int> frame_indices;
 	int steps_total = 0;
 };
@@ -222,6 +222,7 @@ void run_job( const std::shared_ptr<Job>& j ) {
 	r.loras = j->loras;
 	r.images = j->images;
 	r.ref_images = j->ref_images;
+	r.ref_videos = j->ref_videos;
 	r.ref_audios = j->ref_audios;
 	r.frame_indices = j->frame_indices;
 	r.out = j->dir + "/result.mp4";
@@ -260,6 +261,7 @@ void run_job( const std::shared_ptr<Job>& j ) {
 	}
 	for ( const std::string& im : j->images ) { std::remove( im.c_str() ); }
 	for ( const std::string& im : j->ref_images ) { std::remove( im.c_str() ); }
+	for ( const std::string& im : j->ref_videos ) { std::remove( im.c_str() ); }
 	for ( const std::string& im : j->ref_audios ) { std::remove( im.c_str() ); }
 	save_meta( *j );
 }
@@ -423,28 +425,29 @@ void handle_submit( int fd, const Request& rq ) {
 	}
 	if ( image_data.size() > 2 ) { respond_error( fd, 400, "at most two keyframe images" ); return; }
 	// Ref2VA references (the Ref2VA transformer): images (up to 9) and audio clips (up to 3)
-	std::vector<std::string> ref_image_data, ref_audio_data;
-	for ( const char* key : { "ref_images", "ref_audios" } ) {
+	std::vector<std::string> ref_image_data, ref_video_data, ref_audio_data;
+	for ( const char* key : { "ref_images", "ref_videos", "ref_audios" } ) {
 		if ( !b.contains( key ) || !b[key].is_array() ) { continue; }
 		for ( const json& im : b[key] ) {
 			if ( !im.is_object() ) { continue; }
 			std::string d = str_field( im, "data" );
 			const size_t comma = d.find( "base64," );
 			if ( comma != std::string::npos ) { d = d.substr( comma + 7 ); }
-			( key[4] == 'i' ? ref_image_data : ref_audio_data ).push_back( b64_decode( d ) );
+			( key[4] == 'i' ? ref_image_data : key[4] == 'v' ? ref_video_data : ref_audio_data ).push_back( b64_decode( d ) );
 		}
 	}
-	const bool ref_task = !ref_image_data.empty() || !ref_audio_data.empty();
+	const bool ref_task = !ref_image_data.empty() || !ref_video_data.empty() || !ref_audio_data.empty();
 	if ( ref_task ) {
 		if ( g_cfg.dit_ref2va.empty() ) { respond_error( fd, 400, "this server has no Ref2VA transformer (start it with --dit-ref2va)" ); return; }
 		if ( !image_data.empty() ) { respond_error( fd, 400, "keyframes and references are different tasks" ); return; }
-		if ( ref_image_data.empty() ) { respond_error( fd, 400, "reference audio needs at least one reference image" ); return; }
-		if ( ref_image_data.size() > 9 || ref_audio_data.size() > 3 ) { respond_error( fd, 400, "at most 9 reference images and 3 reference audio clips" ); return; }
+		if ( ref_image_data.empty() && ref_video_data.empty() ) { respond_error( fd, 400, "reference audio needs a reference image or video" ); return; }
+		if ( ref_image_data.size() > 9 || ref_video_data.size() > 3 || ref_audio_data.size() > 3 || ref_image_data.size() + ref_video_data.size() + ref_audio_data.size() > 12 ) { respond_error( fd, 400, "at most 9 reference images, 3 videos and 3 audio clips (12 in all)" ); return; }
 	}
 	if ( !turbo.empty() ) {
 		const LoraInfo* t = find_lora( turbo );
 		if ( t && ( t->task == "ref2v" ) != ref_task ) { respond_error( fd, 400, std::string( "the " ) + t->task + " adapter does not fit this task" ); return; }
 	}
+	const long lat_t_ref = frames <= 5 ? 2 : ( ( frames - 5 ) / 17 ) * 5 + 2;
 	long ref_rows = 0; // reference visual rows plus the same number of prompt tokens for each image
 	for ( const std::string& bytes : ref_image_data ) {
 		engine::loader::DecodedImage di;
@@ -453,6 +456,8 @@ void handle_submit( int fd, const Request& rq ) {
 		const double sc = 2048.0 / std::min( di.width, di.height );
 		ref_rows += 2L * std::lround( di.width * sc / 32 ) * std::lround( di.height * sc / 32 );
 	}
+	// a reference video: latent frames x 1008 rows (768 x 1344 canvas) plus one 1008-token block per two sampled frames
+	ref_rows += static_cast<long>( ref_video_data.size() ) * ( lat_t_ref + frames / 24 / 2 + 1 ) * 1008L;
 	ref_rows += 1200L * static_cast<long>( ref_audio_data.size() );
 	// token budget: text + audio + video rows (+ one frame of rows per keyframe image)
 	const int lat_t = frames <= 5 ? 2 : ( ( frames - 5 ) / 17 ) * 5 + 2;
@@ -476,6 +481,11 @@ void handle_submit( int fd, const Request& rq ) {
 		std::ofstream( path, std::ios::binary ) << ref_image_data[i];
 		j->ref_images.push_back( path );
 	}
+	for ( size_t i = 0; i < ref_video_data.size(); ++i ) {
+		const std::string path = j->dir + "/refvideo" + std::to_string( i ) + ".mp4";
+		std::ofstream( path, std::ios::binary ) << ref_video_data[i];
+		j->ref_videos.push_back( path );
+	}
 	for ( size_t i = 0; i < ref_audio_data.size(); ++i ) {
 		const std::string path = j->dir + "/refaudio" + std::to_string( i ) + ".bin";
 		std::ofstream( path, std::ios::binary ) << ref_audio_data[i];
@@ -485,7 +495,7 @@ void handle_submit( int fd, const Request& rq ) {
 	j->steps_total = steps;
 	j->steps = steps;
 	j->created = now_s();
-	json params = { { "prompt", prompt }, { "width", width }, { "height", height }, { "frames", frames }, { "steps", steps }, { "seed", seed }, { "turbo", turbo }, { "images", image_data.size() }, { "ref_images", ref_image_data.size() }, { "ref_audios", ref_audio_data.size() } };
+	json params = { { "prompt", prompt }, { "width", width }, { "height", height }, { "frames", frames }, { "steps", steps }, { "seed", seed }, { "turbo", turbo }, { "images", image_data.size() }, { "ref_images", ref_image_data.size() }, { "ref_videos", ref_video_data.size() }, { "ref_audios", ref_audio_data.size() } };
 	json ls = json::array();
 	for ( const json& l : b.value( "loras", json::array() ) ) { if ( l.is_object() ) { ls.push_back( { { "file", str_field( l, "file" ) }, { "scale", num_field( l, "scale", 1.0 ) } } ); } }
 	params["loras"] = ls;

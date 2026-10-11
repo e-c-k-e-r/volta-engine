@@ -262,6 +262,13 @@ The server has no authentication and binds to localhost by default. A build need
 
 ### Ref2VA (references)
 
+Reference videos (up to 3, MP4 / MOV, 2 to 15 s each and in total, 23.976 to 60 fps) are decoded by ffmpeg onto the canvas (768 px short edge, at most 768 x 1344, 32 px
+multiples, 24 fps, at most the clip's frame count), encoded by the causal 3-D video VAE in 17-frame clips (trimmed to 17 n + 5 frames, last 3 latent frames dropped;
+`test_h3_vae_enc` on `h3_vae_enc_video_golden.py`: cosine 1.000000) and shown to the language model as every 12th frame in temporal blocks of two frames with
+`<t seconds>` timestamps (`<Video k>: ` label; the Qwen3-VL video smart-resize budget of 24M pixels applies). Each video's soundtrack becomes an audio reference
+(`<Audio j>: ` label before the video). Measured: a 3 s 1280x736 reference costs ~157 s to encode (FP32 convolutions, 4 clips x 18 tiles; the first optimization target),
+then the clip generated at 640x384 / 56 frames carries the reference's subject, setting and gait (`--ref-video`; refer to it as "Video 1" in the prompt).
+
 Reference images (up to 9, resized to a 2048 px short edge, 32 px multiples, aspect ratio 0.4 to 2.5) and reference audio (up to 3 clips, 2 to 15 s each and in
 total, cut to the clip duration) work on the Ref2VA transformer (`--dit-ref2va`, the `minimax_h3_ref2va_pruned_int8_convrot` checkpoint; use the `ref2v` turbo
 adapters). Prompt presentation is `<Picture i>: ` + vision block per image, `<Audio j>: ` label per clip, then the prompt; refer to them that way in the prompt.
@@ -273,10 +280,9 @@ reference), 36 s denoise, 8 s decode; the output reproduces the reference subjec
 
 ```
 build/h3_generate --root ... --dit-ref2va <ref2va ckpt> --lora <h3-turbo/minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors> --prompt "The dog from Picture 1 ..." \
-    --ref-image a.png [--ref-image b.png] [--ref-audio voice.wav] --devices 0,1,2,3 --out out.mp4
+    --ref-image a.png [--ref-image b.png] [--ref-video clip.mp4] [--ref-audio voice.wav] --devices 0,1,2,3 --out out.mp4
 ```
 
-Not yet built: reference videos (the causal 3-D video encoder over time, the Qwen video presentation with `<t seconds>` timestamps and video mRoPE, audio taken from
-the video), keeping the models resident between jobs (each job reloads them: ~20 s), splitting the VAE decode over the GPUs (63 s now on one), quantization of the
+Not yet built: keeping the models resident between jobs (each job reloads them: ~20 s), splitting the VAE decode over the GPUs (63 s now on one), quantization of the
 text encoder, FP8/INT8 attention, a FP16-range audit for long clips, and the benchmark matrix. Reference noise is drawn from the engine's own RNG, not torch's, so
 runs are not bit-comparable with 1Cat's for the same seed.
