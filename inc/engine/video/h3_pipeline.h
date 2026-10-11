@@ -18,7 +18,18 @@ struct H3Layout {
 	std::vector<int> img_pos, audio_pos, text_pos, tags;
 	std::vector<float> position_ids; // [used, 3]
 	std::vector<uint8_t> update_mask; // per video row: 1 = target, 0 = condition
+	std::vector<uint8_t> audio_update; // per audio row: 1 = target, 0 = reference audio (Ref2VA); empty = all targets
 };
+
+// A Ref2VA reference block, in request order (images, then videos, then standalone audio): packed before the target audio and video rows
+struct H3RefBlock {
+	enum Kind { Image, Audio, Video } kind = Image;
+	int ref_audio_t = 0;  // Audio / Video: audio latent frames (a video without sound: 0)
+	int latent_t = 1, latent_h = 0, latent_w = 0; // Image / Video: latent grid (an image has latent_t 1)
+};
+
+// Port of minimax_h3_packed_sequence_ref2va_blocks: [text | reference blocks | target audio | target video]; a video block packs its audio rows first
+H3Layout h3_build_layout_ref( int text_len, int latent_t, int latent_h, int latent_w, int audio_t, const std::vector<H3RefBlock>& blocks );
 
 // Port of minimax_h3_packed_sequence for T2VA (and FL2VA keyframe condition rows when `keyframes` is non-empty: -1 = last frame, 0 = first)
 H3Layout h3_build_layout( int text_len, int latent_t, int latent_h, int latent_w, int audio_t, const std::vector<int>& keyframes = {}, int frame_count = 0 );

@@ -158,6 +158,101 @@ H3Layout h3_build_layout( int text_len, int latent_t, int latent_h, int latent_w
 	return L;
 }
 
+H3Layout h3_build_layout_ref( int text_len, int latent_t, int latent_h, int latent_w, int audio_t, const std::vector<H3RefBlock>& blocks ) {
+	H3Layout L;
+	L.text_len = text_len; L.latent_t = latent_t; L.latent_h = latent_h; L.latent_w = latent_w; L.audio_t = audio_t;
+	const int ph = latent_h / 2, pw = latent_w / 2, frame_rows = ph * pw;
+	int ref_visual = 0, ref_audio = 0;
+	for ( const H3RefBlock& b : blocks ) {
+		if ( b.kind != H3RefBlock::Audio ) { ref_visual += b.latent_t * ( b.latent_h / 2 ) * ( b.latent_w / 2 ); }
+		if ( b.kind != H3RefBlock::Image ) { ref_audio += b.ref_audio_t * 2; }
+	}
+	const int video_rows = latent_t * frame_rows, audio_rows = audio_t * 2;
+	L.used = text_len + ref_visual + ref_audio + audio_rows + video_rows;
+	L.n_img = ref_visual + video_rows;
+	L.n_audio = ref_audio + audio_rows;
+	L.tags.assign( L.used, 0 );
+	std::vector<double> g( static_cast<size_t>( L.used ) * 3, 0.0 );
+	for ( int i = 0; i < text_len; ++i ) { L.text_pos.push_back( i ); L.tags[i] = 1; g[static_cast<size_t>( i ) * 3] = i; }
+	const double target_area = std::sqrt( static_cast<double>( latent_h ) * latent_w );
+	const std::vector<double> hg = axis_from_sqrt_area( latent_h, 2, target_area ), wg = axis_from_sqrt_area( latent_w, 2, target_area );
+	auto t_grid = [&]( int n, double origin ) {
+		std::vector<double> v( n );
+		double acc = origin;
+		for ( int k = 0; k < n; ++k ) { v[k] = acc; acc += kFrameRescale * kFramePerToken[k % 5]; }
+		return v;
+	};
+	auto video_rows_at = [&]( int row0, int T, int h, int w, double origin ) {
+		const double area = std::sqrt( static_cast<double>( h ) * w );
+		const std::vector<double> rh = axis_from_sqrt_area( h, 2, area ), rw = axis_from_sqrt_area( w, 2, area ), tg = t_grid( T, origin );
+		const int rph = h / 2, rpw = w / 2;
+		for ( int t = 0; t < T; ++t ) {
+			for ( int y = 0; y < rph; ++y ) {
+				for ( int x = 0; x < rpw; ++x ) {
+					const size_t r = static_cast<size_t>( row0 ) + ( static_cast<size_t>( t ) * rph + y ) * rpw + x;
+					g[r * 3] = tg[t]; g[r * 3 + 1] = rh[y]; g[r * 3 + 2] = rw[x];
+					L.img_pos.push_back( static_cast<int>( r ) );
+					L.update_mask.push_back( 0 );
+				}
+			}
+		}
+	};
+	auto audio_rows_at = [&]( int row0, int T, double origin, double w_first, double w_last, bool target ) {
+		for ( int c = 0; c < 2; ++c ) {
+			for ( int t = 0; t < T; ++t ) {
+				const size_t r = static_cast<size_t>( row0 ) + static_cast<size_t>( c ) * T + t;
+				g[r * 3] = origin + t;
+				g[r * 3 + 2] = c == 0 ? w_first : w_last;
+				L.audio_pos.push_back( static_cast<int>( r ) );
+				L.audio_update.push_back( target ? 1 : 0 );
+				L.tags[r] = 2;
+			}
+		}
+	};
+	double t_cursor = text_len;
+	int cursor = text_len;
+	for ( const H3RefBlock& b : blocks ) {
+		if ( b.kind == H3RefBlock::Image ) {
+			video_rows_at( cursor, 1, b.latent_h, b.latent_w, t_cursor );
+			cursor += ( b.latent_h / 2 ) * ( b.latent_w / 2 );
+			t_cursor += 1.0;
+		} else if ( b.kind == H3RefBlock::Audio ) {
+			if ( b.ref_audio_t > 0 ) { audio_rows_at( cursor, b.ref_audio_t, t_cursor, wg.front(), wg.back(), false ); }
+			cursor += b.ref_audio_t * 2;
+			t_cursor += b.ref_audio_t;
+		} else {
+			const double area = std::sqrt( static_cast<double>( b.latent_h ) * b.latent_w );
+			const std::vector<double> rw = axis_from_sqrt_area( b.latent_w, 2, area );
+			if ( b.ref_audio_t > 0 ) { audio_rows_at( cursor, b.ref_audio_t, t_cursor, rw.front(), rw.back(), false ); }
+			cursor += b.ref_audio_t * 2;
+			video_rows_at( cursor, b.latent_t, b.latent_h, b.latent_w, t_cursor );
+			cursor += b.latent_t * ( b.latent_h / 2 ) * ( b.latent_w / 2 );
+			double span = 0;
+			for ( int k = 0; k < b.latent_t; ++k ) { span += kFrameRescale * kFramePerToken[k % 5]; }
+			t_cursor += std::max( static_cast<double>( b.ref_audio_t ), span );
+		}
+	}
+	// the target audio and video (the tail of img_pos / audio_pos)
+	audio_rows_at( cursor, audio_t, t_cursor, wg.front(), wg.back(), true );
+	cursor += audio_rows;
+	{
+		const std::vector<double> tg = t_grid( latent_t, t_cursor );
+		for ( int t = 0; t < latent_t; ++t ) {
+			for ( int y = 0; y < ph; ++y ) {
+				for ( int x = 0; x < pw; ++x ) {
+					const size_t r = static_cast<size_t>( cursor ) + ( static_cast<size_t>( t ) * ph + y ) * pw + x;
+					g[r * 3] = tg[t]; g[r * 3 + 1] = hg[y]; g[r * 3 + 2] = wg[x];
+					L.img_pos.push_back( static_cast<int>( r ) );
+					L.update_mask.push_back( 1 );
+				}
+			}
+		}
+	}
+	L.position_ids.resize( g.size() );
+	for ( size_t i = 0; i < g.size(); ++i ) { L.position_ids[i] = static_cast<float>( g[i] ); }
+	return L;
+}
+
 bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* result ) {
 	H3GenResult res;
 	auto report = [&]( const char* stage, int done, int total ) { if ( req.progress ) { req.progress( stage, done, total ); } };
