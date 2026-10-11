@@ -63,6 +63,29 @@ the token refiner (624 tensors, alpha 8, rank 128). They are small (one is 1.4 G
 cheap relative to the base GEMM and keeps the INT8 base intact; merging into INT8 weights is not possible. Multi-LoRA is therefore
 a sum of staged deltas with per-request scales.
 
+### 2.1 Measured kernel baseline (2026-10-11, one V100 at the 150 W cap, 1Cat's built kernels, single runs)
+
+"W8A16" in 1Cat means the INT8 weights are dequantized to FP16 at load (`dequantize`, `rotate` for the ConvRot butterfly) and the
+projections then run as plain FP16 GEMMs (`ops.gemm` is cuBLAS; `ColumnMajorGemmPlan` is a CUTLASS-style plan for column-major
+weights). Weights are resident as FP16: 38.6 GB, 9.7 GB per card at TP4. No INT8 compute kernel is needed.
+
+M = 29,440 tokens, TP4 per-card shapes (script: `tests/3_bench/h3_kernel_baseline.py`):
+
+| Op | N x K | cuBLAS | 1Cat column-major plan |
+|---|---|---|---|
+| qkv | 5376 x 5376 | 42.2 ms, 40.3 TF | 35.9 ms, 47.5 TF |
+| out | 5376 x 1792 | 14.2 ms, 39.9 TF | 12.3 ms, 46.3 TF |
+| fc1 | 7168 x 5376 | 55.5 ms, 40.9 TF | 48.2 ms, 47.1 TF |
+| fc2 | 5376 x 3584 | 28.3 ms, 40.1 TF | 24.4 ms, 46.5 TF |
+
+Non-causal attention, d=128, 14 heads per card: 170 ms (36.5 TF, query tile 128 / key tile 128), 197 ms with key tile 64, 202 ms
+with query tile 64. A full-head (56) run gives 689 ms.
+
+Per layer per card: GEMMs ~121 ms (column-major) + attention ~170 ms, so ~14.5 s per step over 50 layers, which matches 1Cat's
+14.57 s per step. Attention is about 58% of the step. Consequences: cuBLAS is the baseline for the engine's GEMMs (the column-major
+plan is worth ~15% and can come later); attention is where a better kernel pays most; the card is at 40-47 TF of a 125 TF peak,
+and the 150 W cap limits what any kernel can reach, so absolute figures here are caps, not kernel limits.
+
 ## 3. Inventory of the 1Cat source
 
 Python sources (branch `backup/sm70-skinny-port-20260925`; the SM70 kernels are byte-identical to `main`, the difference is
@@ -127,8 +150,8 @@ kernel is optimized.
 
 | Need | Engine today | Work |
 |---|---|---|
-| Large-M INT8xFP16 GEMM | cuBLAS FP16 for prefill-class shapes; trellis and NVFP4 kernels are skinny-M | new: port `h3_w8a16.cu` (or INT8 dequant into a cuBLAS-class tile loop); this is the performance-critical kernel |
-| Non-causal FlashAttention, d=128, ~30K tokens | `attention.cu` is causal/decode-oriented | new: port `flash-attention-v100` h3 forward; keep parity test against an FP32 reference |
+| Large-M projection GEMM | cuBLAS is linked; weights are dequantized INT8 -> FP16 at load (section 2.1) | cuBLAS first; later optionally port the column-major plan (~15%); INT8 dequant + ConvRot at load is a small kernel |
+| Non-causal FlashAttention, d=128, ~30K tokens | `attention.cu` is causal/decode-oriented | new: port `flash-attention-v100` h3 forward (the dominant cost, ~58% of a step); keep parity test against an FP32 reference |
 | AdaLN indexed norm/scale/shift/gate kernels | `norm.cu`, `gated_residual.cu` are close | small new kernels |
 | 3D RoPE + QK norm | `rope.cu` has 1D/mRoPE variants | new rope table + fused qk-norm-rope |
 | ConvRot Hadamard (group 256) | `hadamard.cu` (EXL3) | verify reuse; otherwise new |
