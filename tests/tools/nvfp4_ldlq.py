@@ -104,7 +104,14 @@ def block_ldl(H, sigma_reg=0.025, b=16):
 def ldlq(W, H, q, gs, chunk=16384, use_h=True):
     """W [N, K] float32 (cuda) -> (codes [N, K] u8, scale codes [N, K/16] u8, Wq [N, K], proxy errors (rtn, ldlq))."""
     N, K = W.shape
-    L = block_ldl(H)[0] if use_h else None
+    L = None
+    if use_h:
+        try:
+            L = block_ldl(H)[0]
+        except RuntimeError:
+            # A Hessian that is not positive definite (GLM layer 0's captured input has a negative diagonal): round-to-nearest for this matrix
+            print("  !! Cholesky failed, falling back to round-to-nearest for this matrix", flush=True)
+            use_h = False
     codes = torch.empty((N, K), dtype=torch.uint8, device=W.device)
     scs = torch.empty((N, K // 16), dtype=torch.uint8, device=W.device)
     Wq = torch.empty_like(W)
@@ -196,6 +203,22 @@ def main():
         out[name + ".weight_scale_2"] = g
         print(f"  {label:34s} N {W.shape[0]:6d} K {W.shape[1]:5d}  proxy err rtn {pr:.5f} -> ldlq {pe:.5f}  ({time.time() - t0:.1f}s)", flush=True)
         del W, Wq, codes, scs
+        torch.cuda.empty_cache()
+
+    def do_multi(out, names, H, label):
+        """Several tensors of one input width that the engine stacks into one weight (q / k / v): one global scale over all of them."""
+        t0 = time.time()
+        Ws = [get(n + ".weight").to(torch.float32).to(dev) for n in names]
+        gs = max(float(W.abs().max()) for W in Ws) / (6.0 * 448.0)
+        pes = []
+        for n, W in zip(names, Ws):
+            codes, scs, Wq = ldlq(W, H, q, gs, use_h=not a.rtn)
+            pes.append(proxy(W, Wq, H))
+            w, s_, g = pack(codes, scs, gs)
+            out[n + ".weight"], out[n + ".weight_scale"], out[n + ".weight_scale_2"] = w, s_, g
+            del Wq, codes, scs
+        print(f"  {label:34s} {len(names)} tensors K {Ws[0].shape[1]:5d}  proxy err ldlq {np.mean(pes):.5f}  ({time.time() - t0:.1f}s)", flush=True)
+        del Ws
         torch.cuda.empty_cache()
 
     # The engine's loader opens at most 32 shard files: eight layers per file

@@ -60,6 +60,14 @@ Qwen extras:
   with 2 slots fits (24.3 of 29.8 GiB per GPU). Images use the checkpoint's own tower. Prefix caching, tools and thinking behave as for Qwen.
 * **MTP speculation**: `--speculative --set speculator=mtp` drafts with the checkpoint's own multi-token-prediction head and
   needs no draft model (about 1.7x plain decoding against 2.4x for DFlash2 on the same prompts, and it saves the drafter's VRAM).
+* **NVFP4 weights** (modelopt NVFP4 checkpoints of the same models; details and numbers in [FLASH_NEXT.md](FLASH_NEXT.md), examples `configs/flash_next_nvfp4.json`
+  and `configs/glm_nvfp4_dense.json`): the EXL3 directory stays the model directory and supplies everything not replaced. Flash-Next:
+  `nvfp4_experts=<NVFP4 dir>` takes the routed experts from the NVFP4 checkpoint (and is also the BF16 source for dense tensors), `nvfp4_dense=<groups>`
+  (`gdn,attn,idx,head,shared_gate,shared_up` recommended; `all` adds `shared_down`, which costs perplexity) quantizes those dense groups at load, and
+  `nvfp4_dense_dir=<dir>` loads calibrated tensors made by `tests/tools/nvfp4_ldlq.py` instead of round-to-nearest. GLM-5.3-Flash: `nvfp4_dense_src=<NVFP4 dir>` plus
+  `nvfp4_dense=kda,mla,idx,head,dense,shared` (experts stay EXL3: the NVFP4 experts do not fit in VRAM and the offload penalty rules them out). Calibration: run
+  `ENGINE_HESSIAN_DIR=<dir> test_ppl --flash|--glm --calibrate --file <text>` (GLM: `ENGINE_HESSIAN_LAYERS=lo-hi`, a third of the layers per pass) and then
+  `nvfp4_ldlq.py --model flash|glm`. Speed figures there are indicative (150 W cap, single runs).
 * **Two GPUs per instance**: `--tp-size 2` runs one model on two GPUs (about 0.7x the speed of four); start a second server with
   `CUDA_VISIBLE_DEVICES=2,3` on the other pair for twice the aggregate throughput. GLM runs on 1 or 4 GPUs only.
 

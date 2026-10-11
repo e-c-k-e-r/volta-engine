@@ -1,0 +1,18 @@
+{
+	"model_dir": "/path/to/Swift-Qwen3.8-Flash-Next-exl3-4.00bpw",
+	"use_speculation": true,
+	"tp_size": 4,
+	"port": 8000,
+	"max_batch_size": 2,
+	"request_timeout_s": 30,
+	"options": {
+		"speculator": "mtp",
+		"max_seq": 262144,
+		"max_slots": 2,
+		"prefix_cache_gib": 48,
+		"prefix_interval": 16384,
+		"nvfp4_experts": "/path/to/Qwen3.8-Flash-Next-NVFP4",
+		"nvfp4_dense_dir": "/path/to/Qwen3.8-Flash-Next-NVFP4-dense",
+		"nvfp4_dense": "gdn,attn,idx,head,shared_gate,shared_up"
+	}
+}
