@@ -123,7 +123,6 @@ set(ENGINE_DEVICE_SOURCES
 	src/video/h3_stage_text.cpp
 	src/video/h3_stage_denoise.cpp
 	src/video/h3_stage_decode.cu
-	src/kernels/cuda/h3/h3_fmha.cu
 	src/kernels/cuda/h3/h3_attn.cu
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
@@ -143,15 +142,6 @@ set(TRELLIS_SOURCES
 	src/kernels/cuda/trellis/reconstruct.cu
 	src/kernels/cuda/trellis/trellis_context.cu
 )
-
-# H3 attention (SM70 CUTLASS FMHA): needs the CUTLASS headers at the revision 1Cat pins (v4.4.2); without them the DiT falls back to a slow kernel
-set(ENGINE_CUTLASS_DIR "$ENV{HOME}/Programs/1Cat-vLLM/.deps/cutlass-src" CACHE PATH "CUTLASS source tree for the H3 attention kernel")
-if(EXISTS "${ENGINE_CUTLASS_DIR}/include/cutlass/cutlass.h")
-	set_source_files_properties(src/kernels/cuda/h3/h3_fmha.cu PROPERTIES
-		COMPILE_DEFINITIONS ENGINE_HAVE_CUTLASS=1
-		COMPILE_OPTIONS "-Xcompiler=-fexceptions" # the vendored CUTLASS headers contain throw statements
-		INCLUDE_DIRECTORIES "${ENGINE_CUTLASS_DIR}/include;${ENGINE_CUTLASS_DIR}/examples/41_fused_multi_head_attention;${PROJECT_SOURCE_DIR}/src/kernels/cuda/h3")
-endif()
 
 add_library(engine_kernels STATIC
 	${ENGINE_CORE_SOURCES}
@@ -553,9 +543,6 @@ set_target_properties(test_h3_image PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJE
 add_executable(test_h3_dit_sp tests/2_parity/test_h3_dit_sp.cpp)
 target_link_libraries(test_h3_dit_sp PRIVATE engine_kernels)
 set_target_properties(test_h3_dit_sp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_fmha tests/2_parity/test_h3_fmha.cpp)
-target_link_libraries(test_h3_fmha PRIVATE engine_kernels)
-set_target_properties(test_h3_fmha PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 add_executable(test_h3_attn tests/2_parity/test_h3_attn.cpp)
 target_link_libraries(test_h3_attn PRIVATE engine_kernels)
 set_target_properties(test_h3_attn PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

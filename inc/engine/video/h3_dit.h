@@ -35,7 +35,7 @@ struct H3Config {
 	float qk_eps = 1e-5f;
 	float final_eps = 1e-5f;
 	int sp_ranks = 1;              // sequence-parallel ranks the instance will run with (sizes the per-rank scratch)
-	bool simple_attention = false; // bring-up kernel instead of the CUTLASS FMHA (tiny sequences only)
+	bool simple_attention = false; // bring-up kernel instead of the WMMA attention (tiny sequences only)
 };
 
 // One packed request in "used" coordinates (padding rows are dropped: they form their own attention document).

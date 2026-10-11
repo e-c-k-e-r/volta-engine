@@ -1,6 +1,8 @@
 // H3 attention for V100 on WMMA (HMMA.884 underneath): a warp owns 16 query rows, keeps its Q tile as A fragments and its output as FP32 accumulators in registers, and
 // walks the keys in tiles of 64: S = Q K^T in registers, the online softmax on the accumulators (using the Volta accumulator layout), P through shared memory as the A
 // operand of O += P V. No mask logic outside the last key tile, no GQA, no paging: only what the H3 transformer, its VAE decoder and its text tower need.
+#include <bitset>
+#include <mutex>
 #include "engine/video/h3_attn.h"
 #include "engine/config.h"
 #include <mma.h>
@@ -213,11 +215,18 @@ bool h3_attention( const half* q, const half* k, const half* v, half* out, int q
 	if ( q_rows <= 0 ) { return true; }
 	if ( k_rows <= 0 || heads <= 0 ) { return false; }
 	const size_t smem = sizeof( Smem );
-	static bool configured = false;
-	if ( !configured ) {
-		CUDA_CHECK( cudaFuncSetAttribute( h3_attn_d128<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( smem ) ) );
-		CUDA_CHECK( cudaFuncSetAttribute( h3_attn_d128<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( smem ) ) );
-		configured = true;
+	// the shared-memory opt-in is per device (the DiT runs one thread per GPU)
+	static std::mutex mu;
+	static std::bitset<64> configured;
+	int dev = 0;
+	CUDA_CHECK( cudaGetDevice( &dev ) );
+	{
+		std::lock_guard<std::mutex> lock( mu );
+		if ( !configured.test( dev & 63 ) ) {
+			CUDA_CHECK( cudaFuncSetAttribute( h3_attn_d128<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( smem ) ) );
+			CUDA_CHECK( cudaFuncSetAttribute( h3_attn_d128<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( smem ) ) );
+			configured.set( dev & 63 );
+		}
 	}
 	const dim3 grid( ( q_rows + kBQ - 1 ) / kBQ, heads );
 	const float scale_log2 = scale * 1.4426950408889634f;

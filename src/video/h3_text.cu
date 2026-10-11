@@ -1,6 +1,6 @@
 // Streaming Qwen3 text tower for the H3 conditioning (see h3_text.h).
 #include "engine/video/h3_text.h"
-#include "engine/video/h3_fmha.h"
+#include "engine/video/h3_attn.h"
 #include "h3_util.h"
 #include "engine/core/arena.h"
 #include "engine/core/log.h"
@@ -68,7 +68,7 @@ __global__ void k_qwen_qk( half* q, half* k, const float* qw, const float* kw, c
 }
 
 // causal GQA attention, one block per (query, head); fine for short prompts
-// GQA: [S, kNkv, kHd] K and V -> [S, kNh, kHd] with every kv head repeated for its group of query heads (the FMHA kernel has equal head counts)
+// GQA: [S, kNkv, kHd] K and V -> [S, kNh, kHd] with every kv head repeated for its group of query heads (the attention kernel has equal head counts)
 __global__ void k_expand_kv( const half* k, const half* v, half* kx, half* vx, int S ) {
 	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
 	const size_t total = static_cast<size_t>( S ) * kNh * kHd;
@@ -175,7 +175,7 @@ struct H3TextEncoder::Impl {
 	float *x = nullptr, *br = nullptr, *rowscale = nullptr;
 	int* d_pos = nullptr; // [3, max_tokens]
 	half *h16 = nullptr, *q16 = nullptr, *k16 = nullptr, *v16 = nullptr, *o16 = nullptr, *g16 = nullptr, *u16 = nullptr, *f16 = nullptr;
-	half *kx16 = nullptr, *vx16 = nullptr; // K / V repeated to all query heads for the FMHA kernel
+	half *kx16 = nullptr, *vx16 = nullptr; // K / V repeated to all query heads for the attention kernel
 	bool use_fmha = false;
 	std::string embed_name = "model.language_model.embed_tokens.weight";
 
@@ -261,7 +261,7 @@ struct H3TextEncoder::Impl {
 		k_qwen_qk<<<dim3( S, ( kNh + kNkv + 7 ) / 8 ), 256, 0, s>>>( q16, k16, w.qn, w.kn, d_pos, S );
 		if ( use_fmha ) {
 			k_expand_kv<<<( static_cast<size_t>( S ) * kNh * kHd + 255 ) / 256, 256, 0, s>>>( k16, v16, kx16, vx16, S );
-			h3_flash_attention( q16, kx16, vx16, o16, S, kNh, 0.08838834764831845f, 0, S >= 1024 ? 128 : 64, s, true );
+			h3_attention( q16, kx16, vx16, o16, S, S, kNh, 0.08838834764831845f, true, s );
 		} else {
 			k_attn_causal<<<dim3( S, kNh ), 128, static_cast<size_t>( S + 8 ) * sizeof( float ), s>>>( q16, k16, v16, o16 );
 		}
@@ -334,7 +334,7 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	s.v16 = s.alloc<half>( s.sarena, S * kNkv * kHd );
 	s.kx16 = s.alloc<half>( s.sarena, S * kNh * kHd );
 	s.vx16 = s.alloc<half>( s.sarena, S * kNh * kHd );
-	s.use_fmha = h3_fmha_available();
+	s.use_fmha = true;
 	s.g16 = s.alloc<half>( s.sarena, S * kFfn );
 	s.u16 = s.alloc<half>( s.sarena, S * kFfn );
 	s.f16 = s.alloc<half>( s.sarena, S * kFfn );

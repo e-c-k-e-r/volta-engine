@@ -110,7 +110,7 @@ SM70 kernels in 1Cat:
 
 | File | Lines | Role |
 |---|---|---|
-| `flash-attention-v100/kernel/h3/{fmha.h,forward.cu,prefetch_mma.h,default_fmha.h}` | ~1630 | non-causal FlashAttention forward for SM70, head_dim 128; the retained default, +4.4% denoise over FlashInfer |
+| `flash-attention-v100/kernel/h3/{fmha.h,forward.cu,prefetch_mma.h,default_fmha.h}` | ~1630 | non-causal FlashAttention forward for SM70, head_dim 128; used as the reference while bringing up the engine's own `src/kernels/cuda/h3/h3_attn.cu`, then dropped |
 | `flashinfer-sm70/csrc/h3_noncausal_sm70.cu` | 353 | alternative non-causal kernel (register P); 1Cat keeps it as the fallback |
 | `csrc/sm70_turbomind/ops/h3_w8a16.cu`, `h3_column_major_gemm.h` | ~410 | INT8-weight x FP16-activation GEMM for large M (CUTLASS/TurboMind derived) |
 | `csrc/minimax_reduce_rms_kernel.cu` | | TP reduce + RMS fusion |
@@ -235,7 +235,7 @@ tool and a job server with a web UI are implemented. Every model component was c
 
 | Component | Files | Check |
 |---|---|---|
-| DiT forward (INT8 ConvRot weights resident, per-matrix dequant + un-rotate to FP16, FP32 residual, CUTLASS FMHA) | `src/video/h3_dit.cu` | 50 layers: video cosine 0.999998 vs an FP32 reference that matches 1Cat's `MiniMaxH3DiTModel` (cosine 1.000000 on a tiny config) |
+| DiT forward (INT8 ConvRot weights resident, per-matrix dequant + un-rotate to FP16, FP32 residual, own WMMA attention) | `src/video/h3_dit.cu` | 50 layers: video cosine 0.999998 vs an FP32 reference that matches 1Cat's `MiniMaxH3DiTModel` (cosine 1.000000 on a tiny config) |
 | LoRA adapters (diffusers, kohya, ai-toolkit layouts; staged A/B, per-adapter scale, several at once) | same | 2-layer match improves 10x with the adapter; all nine local adapters parse |
 | Sequence-parallel group (full weights per GPU, row shards, K/V pulled over NVLink per layer) | `h3_dit_group.cpp` | 1, 2 and 4 GPUs match the single-GPU golden (cosine 0.999998 per rank); 2-GPU output vs 1-GPU 39 dB PSNR |
 | Video VAE decoder (ViT3D, tiling, temporal chunks) | `h3_vae.cu` | tile cosine 1.000000; tiled/chunked video 59 dB |
@@ -252,7 +252,7 @@ job also loads the transformer, 9.5 s). At 150 W the same job took 175 s. Where 
 What brought it down from the first working version (single GPU, per-stage loads): sequence parallelism over four GPUs, tile-parallel video decode (62.8 -> ~12 s of
 compute, 24.7 s with the load), the causal FMHA in the text tower (language model 46 -> 19 s for a 7K-token prompt), pinned/prefetched text-weight streaming
 (9.8 -> 5.2 s for a short prompt), the four-GPU reference-video encode on tensor cores (157 -> 18.7 s), parallel decoder loads, a resident transformer (load 15 -> 0 s),
-and per-peer K/V copy streams. Left on the table: a faster attention kernel (the CUTLASS FMHA is at ~45% of the V100's FP16 peak), an EXL3 text encoder (streaming
+and per-peer K/V copy streams. Left on the table: a faster attention kernel (`h3_attn.cu` replaced the CUTLASS FMHA at about the same speed, 54.5 vs 56 TF/s, ~44% of the V100's FP16 peak; ideas: BQ=64 two blocks per SM, 32-row warp tiles, a stateful key-range variant that overlaps the K/V exchange), an EXL3 text encoder (streaming
 49 GB of BF16 per job is the remaining text cost for short prompts), overlapping the decode's peer copies with the next clip, and pinned loads for the decoders.
 Every run logs fingerprints (prompt, noise, each step's velocity, the final latents) so a change that should not alter results can be checked from the log.
 
@@ -273,8 +273,7 @@ queue with one worker thread that owns the GPUs (`tp_size` GPUs, or `--devices`)
 A job body is `{prompt, width, height, frames, steps, seed, turbo, loras:[{file,scale}], images:[{data,frame_index}], ref_images, ref_videos, ref_audios}` with
 base64 uploads. Code: `src/server/video/` (`adapters`, `jobs`, `service`, `api`, `metrics`, `page`) on the shared `Router` and `Connection` of `src/server/`.
 
-The server has no authentication and binds to localhost by default. A build needs the CUTLASS headers (`ENGINE_CUTLASS_DIR`, default
-`~/Programs/1Cat-vLLM/.deps/cutlass-src`) for the attention kernel.
+The server has no authentication and binds to localhost by default. The build has no CUTLASS dependency: attention is the engine's own WMMA kernel.
 
 ### Ref2VA (references)
 

@@ -1,7 +1,6 @@
-// Throughput of the H3 FMHA tile variants at the DiT's sequence-parallel shape.   bench_h3_fmha [q_rows=8618] [k_rows=34471] [heads=56] [causal=0]
+// Throughput of the H3 attention kernel at the DiT's sequence-parallel shape.   bench_h3_fmha [q_rows=8618] [k_rows=34471] [heads=56] [causal=0]
 #include "engine/config.h"
 #include "engine/video/h3_attn.h"
-#include "engine/video/h3_fmha.h"
 #include <cuda_fp16.h>
 #include <chrono>
 #include <cmath>
@@ -21,18 +20,6 @@ int main( int argc, char** argv ) {
 	CUDA_CHECK( cudaMemset( dk, 0x2a, static_cast<size_t>( kr ) * heads * 128 * 2 ) );
 	CUDA_CHECK( cudaMemset( dv, 0x2a, static_cast<size_t>( kr ) * heads * 128 * 2 ) );
 	const double flops = 4.0 * qr * static_cast<double>( kr ) * 128 * heads * ( causal ? 0.5 : 1.0 );
-	for ( int qt : { 64, 128 } ) {
-		for ( int kt : { 64, 128 } ) {
-			engine::video::h3_flash_attention_qk( dq, dk, dv, dout, qr, kr, heads, 0.088f, kt, qt, nullptr, causal );
-			CUDA_CHECK( cudaDeviceSynchronize() );
-			const auto t0 = std::chrono::steady_clock::now();
-			const int reps = 3;
-			for ( int r = 0; r < reps; ++r ) { engine::video::h3_flash_attention_qk( dq, dk, dv, dout, qr, kr, heads, 0.088f, kt, qt, nullptr, causal ); }
-			CUDA_CHECK( cudaDeviceSynchronize() );
-			const double s = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() / reps;
-			std::printf( "q %d k %d heads %d tiles q%d k%d: %.1f ms, %.1f TFLOP/s\n", qr, kr, heads, qt, kt, s * 1e3, flops / s / 1e12 );
-		}
-	}
 	{
 		engine::video::h3_attention( dq, dk, dv, dout, qr, kr, heads, 0.088f, causal, nullptr );
 		CUDA_CHECK( cudaDeviceSynchronize() );
@@ -41,7 +28,7 @@ int main( int argc, char** argv ) {
 		for ( int r = 0; r < reps; ++r ) { engine::video::h3_attention( dq, dk, dv, dout, qr, kr, heads, 0.088f, causal, nullptr ); }
 		CUDA_CHECK( cudaDeviceSynchronize() );
 		const double s = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() / reps;
-		std::printf( "q %d k %d heads %d own WMMA kernel: %.1f ms, %.1f TFLOP/s\n", qr, kr, heads, s * 1e3, flops / s / 1e12 );
+		std::printf( "q %d k %d heads %d H3 WMMA attention: %.1f ms, %.1f TFLOP/s\n", qr, kr, heads, s * 1e3, flops / s / 1e12 );
 	}
 	return 0;
 }

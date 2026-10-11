@@ -3,7 +3,7 @@
 #include "engine/core/arena.h"
 #include "engine/core/log.h"
 #include "engine/loader/safetensors.h"
-#include "engine/video/h3_fmha.h"
+#include "engine/video/h3_attn.h"
 #include "h3_kernels.cuh"
 #include "h3_util.h"
 #include <cublas_v2.h>
@@ -405,10 +405,10 @@ struct H3DiT::Impl {
 		if ( sp ) {
 			CUDA_CHECK( cudaMemcpy2DAsync( vfull + static_cast<size_t>( row0 ) * qd, qd * sizeof( half ), qkv16 + 2 * qd, 3 * qd * sizeof( half ), qd * sizeof( half ), rows, cudaMemcpyDeviceToDevice, stream ) );
 			gather( total_rows, stream );
-			h3_flash_attention_qk( q16, kfull, vfull, o16, rows, total_rows, nh, 1.0f / std::sqrt( static_cast<float>( cfg.head_dim ) ), 0, 128, stream );
+			h3_attention( q16, kfull, vfull, o16, rows, total_rows, nh, 1.0f / std::sqrt( static_cast<float>( cfg.head_dim ) ), false, stream );
 		} else if ( use_fmha ) {
 			CUDA_CHECK( cudaMemcpy2DAsync( v16, qd * sizeof( half ), qkv16 + 2 * qd, 3 * qd * sizeof( half ), qd * sizeof( half ), rows, cudaMemcpyDeviceToDevice, stream ) );
-			h3_flash_attention( q16, k16, v16, o16, rows, nh, 1.0f / std::sqrt( static_cast<float>( cfg.head_dim ) ), 0, rows >= 1024 ? 128 : 64, stream );
+			h3_attention( q16, k16, v16, o16, rows, rows, nh, 1.0f / std::sqrt( static_cast<float>( cfg.head_dim ) ), false, stream );
 		} else {
 			const size_t smem = static_cast<size_t>( rows + 8 ) * sizeof( float );
 			k_attn_simple<<<dim3( rows, nh ), 128, smem, stream>>>( q16, k16, qkv16 + 2 * qd, 3 * qd, o16, rows, nh );
@@ -483,8 +483,8 @@ bool H3DiT::load( const char* checkpoint, int device, int max_rows, const H3Conf
 	s.table.assign( static_cast<const float*>( engine::loader::safetensors_get_data_cpu( s.st, tm ) ), static_cast<const float*>( engine::loader::safetensors_get_data_cpu( s.st, tm ) ) + s.numel( tm ) );
 	ENGINE_ASSERT( tm->shape[0] == cfg.adaln_grid && tm->shape[1] == cfg.adaln_dim, "H3: adaln table shape" );
 	s.wbytes = s.warena.offset_bytes;
-	s.use_fmha = h3_fmha_available() && !cfg.simple_attention;
-	LOG_INFO( "H3: attention kernel %s", s.use_fmha ? "CUTLASS FMHA" : "simple (slow)" );
+	s.use_fmha = !cfg.simple_attention;
+	LOG_INFO( "H3: attention kernel %s", s.use_fmha ? "H3 WMMA attention" : "simple (slow)" );
 	CUDA_CHECK( cudaFuncSetAttribute( k_attn_simple, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304 - 1024 ) );
 
 	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against

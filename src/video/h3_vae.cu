@@ -4,7 +4,7 @@
 #include "engine/core/arena.h"
 #include "engine/core/log.h"
 #include "engine/loader/safetensors.h"
-#include "engine/video/h3_fmha.h"
+#include "engine/video/h3_attn.h"
 #include "h3_kernels.cuh"
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -384,7 +384,7 @@ struct H3VideoVAE::Impl {
 			k_norm_mod<half><<<S, 256, 0, s>>>( x, nullptr, nullptr, 0, b.n1, nullptr, nullptr, 0, nullptr, kDim, 1e-5f, h16 );
 			gemm_h( h16, b.qkv, qkv16, S, 3 * kDim, kDim, false );
 			k_vit_qkv<<<dim3( S, kHeads / 8 ), 256, 0, s>>>( qkv16, b.qkv_b, cosb, sinb, qp, kp, vp, S );
-			h3_flash_attention( qp, kp, vp, op, S, kHeads, 0.125f, 0, S >= 1024 ? 128 : 64, s );
+			h3_attention( qp, kp, vp, op, S, S, kHeads, 0.125f, false, s );
 			k_unpad<<<( static_cast<size_t>( S ) * kDim + 255 ) / 256, 256, 0, s>>>( op, o16, S );
 			gemm_h( o16, b.out, br, S, kDim, kDim, true );
 			k_add_gated<<<S, 256, 0, s>>>( x, br, nullptr, b.s1, 0, nullptr, kDim, b.out_b );
@@ -559,7 +559,7 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens ) {
 	CUDA_CHECK( cudaMemset( s.kp, 0, S * kHeads * 128 * 2 ) );
 	CUDA_CHECK( cudaMemset( s.vp, 0, S * kHeads * 128 * 2 ) );
 	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against
-	return h3_fmha_available();
+	return true;
 }
 
 void H3VideoVAE::decode_tile( const float* d_z, int T, int H, int W, float* d_pix ) {
