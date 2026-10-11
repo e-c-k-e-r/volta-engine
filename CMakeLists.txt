@@ -50,6 +50,7 @@ set(ENGINE_HOST_SOURCES
 	src/loader/tokenizer.cpp
 	src/video/h3_vae_config.cpp
 	src/video/h3_image.cpp
+	src/video/h3_refs.cpp
 	src/video/h3_dit_group.cpp
 	src/loader/chat_template.cpp
 	src/loader/jinja.cpp

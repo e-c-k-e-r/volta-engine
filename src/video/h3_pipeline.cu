@@ -7,6 +7,7 @@
 #include "engine/video/h3_dit.h"
 #include "engine/video/h3_dit_group.h"
 #include "engine/video/h3_image.h"
+#include "engine/video/h3_refs.h"
 #include "engine/video/h3_text.h"
 #include "engine/video/h3_vae.h"
 #include "engine/video/h3_vae_enc.h"
@@ -19,6 +20,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <random>
 
@@ -262,7 +264,7 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 	// ---- shape ----
 	// reference images: decoded here. FL2VA keyframes follow the caller's canvas size (the CLI derives it from the first image's aspect ratio);
 	// Ref2VA references are resized to a 2048 px short edge and keep their own size
-	const bool ref2va = !req.ref_images.empty() || !req.ref_audios.empty();
+	const bool ref2va = !req.ref_images.empty() || !req.ref_audios.empty() || !req.ref_videos.empty();
 	auto read_image = [&]( const std::string& path, engine::loader::DecodedImage* img ) {
 		std::ifstream f( path, std::ios::binary );
 		std::stringstream ss;
@@ -283,8 +285,11 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 	}
 	if ( refs.size() > 2 ) { LOG_ERROR( "H3: FL2VA takes at most two images (first and last frame)" ); return false; }
 	if ( ref2va && !refs.empty() ) { LOG_ERROR( "H3: keyframe images (FL2VA) and reference images / audio (Ref2VA) are different tasks" ); return false; }
-	if ( ref2va && req.ref_images.empty() ) { LOG_ERROR( "H3: reference audio needs at least one reference image" ); return false; }
-	if ( req.ref_images.size() > 9 || req.ref_audios.size() > 3 ) { LOG_ERROR( "H3: Ref2VA takes at most 9 reference images and 3 reference audio clips" ); return false; }
+	if ( ref2va && req.ref_images.empty() && req.ref_videos.empty() ) { LOG_ERROR( "H3: reference audio needs a reference image or video" ); return false; }
+	if ( req.ref_images.size() > 9 || req.ref_videos.size() > 3 || req.ref_audios.size() > 3 || req.ref_images.size() + req.ref_videos.size() + req.ref_audios.size() > 12 ) {
+		LOG_ERROR( "H3: Ref2VA takes at most 9 reference images, 3 videos and 3 audio clips (12 references in all)" );
+		return false;
+	}
 	std::vector<engine::loader::DecodedImage> ref_src;
 	for ( const std::string& path : req.ref_images ) {
 		engine::loader::DecodedImage img;
@@ -333,7 +338,35 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 		ci.px = h3_resize_lanczos( img.rgb.data(), img.height, img.width, ci.h, ci.w );
 		canvas.push_back( std::move( ci ) );
 	}
-	if ( !canvas.empty() ) {
+	struct SampledVideo {
+		H3VideoBlocks vb;
+		std::vector<double> stamps;
+		bool has_audio = false;
+	};
+	std::vector<SampledVideo> vids;
+	std::unique_ptr<H3AudioVAE> avae;
+	double audio_budget = 15.0; // seconds of reference audio left
+	// audio: encodes `path`'s sound (cut to `max_seconds`, 0 = whole) and appends its latent rows; returns the latent frame count or 0
+	auto encode_audio = [&]( const std::string& path, double max_seconds, bool standalone ) -> int {
+		if ( !avae ) {
+			avae.reset( new H3AudioVAE );
+			if ( !avae->load( ( paths.root + "/audio_vae" ).c_str(), paths.device, 16 ) ) { return 0; }
+		}
+		std::vector<float> planar;
+		int samples = 0;
+		double full = 0;
+		if ( !h3_load_ref_audio( path, max_seconds, &planar, &samples, &full ) ) { LOG_ERROR( "H3: cannot read the audio of %s", path.c_str() ); return 0; }
+		if ( standalone && ( full < 2.0 || full > 15.0 ) ) { LOG_ERROR( "H3: reference audio %s must be 2 to 15 seconds long (got %.2f)", path.c_str(), full ); return 0; }
+		std::vector<float> rows;
+		int fr = 0;
+		if ( !avae->encode( planar, samples, &rows, &fr ) ) { LOG_ERROR( "H3: audio encode failed" ); return 0; }
+		if ( fr < 80 || fr > 600 ) { LOG_ERROR( "H3: the audio of %s is %d latent frames after trimming to the clip duration (2 to 15 seconds are required)", path.c_str(), fr ); return 0; }
+		audio_budget -= fr / 40.0;
+		if ( audio_budget < -1e-6 ) { LOG_ERROR( "H3: reference audio must be at most 15 seconds in total" ); return 0; }
+		ref_audio_rows.insert( ref_audio_rows.end(), rows.begin(), rows.end() );
+		return fr;
+	};
+	if ( !canvas.empty() || !req.ref_videos.empty() ) {
 		H3ImageEncoder enc;
 		H3VaeParams vp;
 		if ( !h3_read_vae_params( ( paths.root + "/video_vae" ).c_str(), vp ) || !enc.load( ( paths.root + "/video_vae" ).c_str(), paths.device ) ) { return false; }
@@ -353,42 +386,52 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 			cond_rows.insert( cond_rows.end(), rows.begin(), rows.end() );
 			if ( ref2va ) { blocks.push_back( { H3RefBlock::Image, 0, 1, ih, iw } ); }
 		}
-		LOG_INFO( "H3: %zu %s image(s) encoded in %.1f s", canvas.size(), ref2va ? "reference" : "keyframe", seconds_since( t0 ) );
-	}
-	if ( !req.ref_audios.empty() ) {
-		const int max_samples = static_cast<int>( std::lround( frames / 24.0 * 32000.0 ) ); // a reference is cut to the clip's duration
-		H3AudioVAE avae;
-		if ( !avae.load( ( paths.root + "/audio_vae" ).c_str(), paths.device, 16 ) ) { return false; }
-		int total = 0;
-		for ( const std::string& path : req.ref_audios ) {
-			std::vector<float> wave; // interleaved stereo f32 at 32 kHz
-			{
-				const std::string cmd = "ffmpeg -nostdin -loglevel error -i '" + path + "' -f f32le -ar 32000 -ac 2 - 2>/dev/null";
-				FILE* p = popen( cmd.c_str(), "r" );
-				if ( !p ) { return false; }
-				std::vector<float> buf( 1 << 16 );
-				size_t n;
-				while ( ( n = std::fread( buf.data(), sizeof( float ), buf.size(), p ) ) > 0 ) { wave.insert( wave.end(), buf.begin(), buf.begin() + n ); }
-				pclose( p );
+		if ( !canvas.empty() ) { LOG_INFO( "H3: %zu %s image(s) encoded in %.1f s", canvas.size(), ref2va ? "reference" : "keyframe", seconds_since( t0 ) ); }
+		double video_budget = 15.0;
+		for ( const std::string& path : req.ref_videos ) {
+			H3RefVideo rv;
+			if ( !h3_load_ref_video( path, frames, &video_budget, &rv ) ) { return false; }
+			const size_t fsz = static_cast<size_t>( rv.width ) * rv.height * 3;
+			// the language model sees every 12th frame
+			SampledVideo sv;
+			const std::vector<int> idx = h3_video_sample_indices( rv.frames );
+			std::vector<const uint8_t*> sampled;
+			for ( int i : idx ) { sampled.push_back( rv.rgb.data() + static_cast<size_t>( i ) * fsz ); }
+			sv.vb = h3_video_blocks( sampled, rv.height, rv.width );
+			sv.stamps = h3_video_block_timestamps( static_cast<int>( idx.size() ) );
+			sv.has_audio = rv.has_audio;
+			// the VAE sees all frames
+			std::vector<float> norm( static_cast<size_t>( rv.frames ) * fsz );
+			for ( int f = 0; f < rv.frames; ++f ) {
+				const std::vector<float> one = h3_vae_input( rv.rgb.data() + static_cast<size_t>( f ) * fsz, rv.height, rv.width );
+				std::memcpy( &norm[static_cast<size_t>( f ) * fsz], one.data(), fsz * sizeof( float ) );
 			}
-			const int samples_full = static_cast<int>( wave.size() / 2 );
-			const double secs = samples_full / 32000.0;
-			if ( samples_full == 0 || secs < 2.0 || secs > 15.0 ) { LOG_ERROR( "H3: reference audio %s must be 2 to 15 seconds long (got %.2f)", path.c_str(), secs ); return false; }
-			const int samples = std::min( samples_full, max_samples );
-			std::vector<float> planar( static_cast<size_t>( 2 ) * samples );
-			for ( int i = 0; i < samples; ++i ) { planar[i] = wave[2 * static_cast<size_t>( i )]; planar[static_cast<size_t>( samples ) + i] = wave[2 * static_cast<size_t>( i ) + 1]; }
-			std::vector<float> rows;
-			int fr = 0;
-			if ( !avae.encode( planar, samples, &rows, &fr ) ) { LOG_ERROR( "H3: audio encode failed" ); return false; }
-			if ( fr < 80 || fr > 600 ) { LOG_ERROR( "H3: reference audio %s is %d latent frames after trimming to the clip duration (2 to 15 seconds are required)", path.c_str(), fr ); return false; }
-			total += fr;
-			ref_audio_rows.insert( ref_audio_rows.end(), rows.begin(), rows.end() );
-			ref_audio_frames.push_back( fr );
-			blocks.push_back( { H3RefBlock::Audio, fr, 1, 0, 0 } );
+			float* d_vid = upload( norm );
+			norm = std::vector<float>();
+			std::vector<float> moments;
+			int tl = 0;
+			if ( !enc.encode_video( d_vid, rv.frames, rv.height, rv.width, &moments, &tl ) ) { LOG_ERROR( "H3: video encode failed" ); return false; }
+			cudaFree( d_vid );
+			const std::vector<float> rows = h3_condition_rows( moments, tl, rv.height / 16, rv.width / 16, vp.mean, vp.stdev, req.seed, 0.999f );
+			cond_rows.insert( cond_rows.end(), rows.begin(), rows.end() );
+			int ref_audio_t = 0;
+			if ( rv.has_audio ) {
+				ref_audio_t = encode_audio( path, std::min( rv.duration, frames / 24.0 ), false );
+				if ( ref_audio_t == 0 ) { return false; }
+			}
+			blocks.push_back( { H3RefBlock::Video, ref_audio_t, tl, rv.height / 16, rv.width / 16 } );
+			vids.push_back( std::move( sv ) );
+			LOG_INFO( "H3: reference video %s: %d frames %dx%d -> %d latent frames%s, %.1f s elapsed", path.c_str(), rv.frames, rv.width, rv.height, tl, rv.has_audio ? " + audio" : "", seconds_since( t0 ) );
 		}
-		if ( total > 600 ) { LOG_ERROR( "H3: reference audio must be at most 15 seconds in total" ); return false; }
-		LOG_INFO( "H3: %zu reference audio clip(s) encoded (%d latent frames) in %.1f s", req.ref_audios.size(), total, seconds_since( t0 ) );
 	}
+	for ( const std::string& path : req.ref_audios ) {
+		const int fr = encode_audio( path, frames / 24.0, true );
+		if ( fr == 0 ) { return false; }
+		ref_audio_frames.push_back( fr );
+		blocks.push_back( { H3RefBlock::Audio, fr, 1, 0, 0 } );
+	}
+	if ( !req.ref_audios.empty() ) { LOG_INFO( "H3: %zu reference audio clip(s) encoded in %.1f s", req.ref_audios.size(), seconds_since( t0 ) ); }
+	avae.reset();
 
 	if ( cancelled() ) { return false; }
 	// ---- stage 1: text conditioning ----
@@ -400,13 +443,14 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 	std::vector<int> text_tags;
 	std::vector<H3ImageFeatures> feats;
 	const int image_pad = tok.get_special_token( "<|image_pad|>" );
-	if ( canvas.empty() ) {
+	if ( canvas.empty() && vids.empty() ) {
 		ids = tok.encode( req.prompt, false );
 		text_tags.assign( ids.size(), 1 );
 	} else {
 		H3VisionTower tower;
 		int max_patches = 8192;
 		for ( const CanvasImage& ci : canvas ) { max_patches = std::max( max_patches, ( ci.h / 16 ) * ( ci.w / 16 ) ); }
+		for ( const SampledVideo& v : vids ) { max_patches = std::max( max_patches, v.vb.grid_h * v.vb.grid_w ); }
 		if ( !tower.load( ( paths.root + "/text_encoder" ).c_str(), paths.device, max_patches ) ) { return false; }
 		engine::loader::VisionParams vparams;
 		vparams.min_pixels = 65536;
@@ -414,6 +458,19 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 		auto push = [&]( const std::vector<int>& v, int tag ) {
 			ids.insert( ids.end(), v.begin(), v.end() );
 			text_tags.insert( text_tags.end(), v.size(), tag );
+		};
+		// one vision block: <|vision_start|> <|image_pad|> x n <|vision_end|>; video blocks use the same placeholder (the features replace it either way)
+		auto vision = [&]( const std::vector<float>& patches, int gh, int gw ) -> bool {
+			H3ImageFeatures f;
+			f.grid_h = gh;
+			f.grid_w = gw;
+			if ( !tower.encode( patches, gh, gw, &f.merged, f.deepstack ) ) { LOG_ERROR( "H3: vision tower failed" ); return false; }
+			const int n = static_cast<int>( f.merged.size() / 5120 );
+			push( { tok.get_special_token( "<|vision_start|>" ) }, 0 );
+			push( std::vector<int>( n, image_pad ), 0 );
+			push( { tok.get_special_token( "<|vision_end|>" ) }, 0 );
+			feats.push_back( std::move( f ) );
+			return true;
 		};
 		for ( size_t i = 0; i < canvas.size(); ++i ) {
 			engine::loader::DecodedImage di;
@@ -423,18 +480,21 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 			engine::loader::PreparedImage prep;
 			std::string err;
 			if ( !engine::loader::prepare_image( di, vparams, &prep, &err ) ) { LOG_ERROR( "H3: image preparation failed: %s", err.c_str() ); return false; }
-			H3ImageFeatures f;
-			f.grid_h = prep.grid_h;
-			f.grid_w = prep.grid_w;
-			if ( !tower.encode( prep.patches, prep.grid_h, prep.grid_w, &f.merged, f.deepstack ) ) { LOG_ERROR( "H3: vision tower failed" ); return false; }
-			const int n = static_cast<int>( f.merged.size() / 5120 );
 			push( tok.encode( "<Picture " + std::to_string( i + 1 ) + ">: ", false ), 1 );
-			push( { tok.get_special_token( "<|vision_start|>" ) }, 0 );
-			push( std::vector<int>( n, image_pad ), 0 );
-			push( { tok.get_special_token( "<|vision_end|>" ) }, 0 );
-			feats.push_back( std::move( f ) );
+			if ( !vision( prep.patches, prep.grid_h, prep.grid_w ) ) { return false; }
 		}
-		for ( size_t j = 0; j < req.ref_audios.size(); ++j ) { push( tok.encode( "<Audio " + std::to_string( j + 1 ) + ">: ", false ), 1 ); } // audio never enters the language model: label only
+		int audio_label = 0;
+		for ( size_t k = 0; k < vids.size(); ++k ) {
+			if ( vids[k].has_audio ) { push( tok.encode( "<Audio " + std::to_string( ++audio_label ) + ">: ", false ), 1 ); } // audio never enters the language model: label only
+			push( tok.encode( "<Video " + std::to_string( k + 1 ) + ">: ", false ), 1 );
+			for ( size_t b = 0; b < vids[k].vb.patches.size(); ++b ) {
+				char stamp[64];
+				std::snprintf( stamp, sizeof( stamp ), "<%.1f seconds>", vids[k].stamps[b] );
+				push( tok.encode( stamp, false ), 1 );
+				if ( !vision( vids[k].vb.patches[b], vids[k].vb.grid_h, vids[k].vb.grid_w ) ) { return false; }
+			}
+		}
+		for ( size_t j = 0; j < req.ref_audios.size(); ++j ) { push( tok.encode( "<Audio " + std::to_string( ++audio_label ) + ">: ", false ), 1 ); }
 		push( tok.encode( req.prompt, false ), 1 );
 	}
 	if ( ids.empty() ) { return false; }

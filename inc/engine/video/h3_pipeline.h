@@ -66,6 +66,7 @@ struct H3GenRequest {
 	std::vector<std::string> images; // FL2VA keyframe images (1 or 2: first / last frame); empty = text-to-video
 	std::vector<int> frame_indices;  // per image: 0 (first) or -1 (last); empty = [0] for one image, [0, -1] for two
 	std::vector<std::string> ref_images; // Ref2VA reference images (up to 9; resized to a 2048 px short edge)
+	std::vector<std::string> ref_videos; // Ref2VA reference videos (up to 3; MP4 / MOV, 2 to 15 s each and in total; their soundtrack is a reference too)
 	std::vector<std::string> ref_audios; // Ref2VA reference audio clips (up to 3; 2 to 15 s each, 15 s in total; cut to the clip duration)
 	std::string out;             // .mp4 path
 	bool keep_pcm = false;

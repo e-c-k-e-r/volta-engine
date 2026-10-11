@@ -146,28 +146,31 @@ float to_fp16_and_back( float v ) {
 }
 } // namespace
 
-std::vector<float> h3_keyframe_rows( const std::vector<float>& moments, int h, int w, const std::vector<float>& mean, const std::vector<float>& stdev, uint64_t seed, float noise_aug ) {
-	ENGINE_ASSERT( moments.size() == static_cast<size_t>( 48 ) * h * w && h % 2 == 0 && w % 2 == 0, "keyframe rows: moments shape" );
+std::vector<float> h3_condition_rows( const std::vector<float>& moments, int T, int h, int w, const std::vector<float>& mean, const std::vector<float>& stdev, uint64_t seed, float noise_aug ) {
+	ENGINE_ASSERT( moments.size() == static_cast<size_t>( T ) * 48 * h * w && h % 2 == 0 && w % 2 == 0, "condition rows: moments shape" );
 	std::mt19937_64 rng( seed );
 	std::normal_distribution<float> nd( 0.0f, 1.0f );
 	const size_t hw = static_cast<size_t>( h ) * w;
-	std::vector<float> z( 24 * hw );
-	for ( int c = 0; c < 24; ++c ) {
-		for ( size_t p = 0; p < hw; ++p ) {
-			const float lv = std::min( 20.0f, std::max( -30.0f, moments[static_cast<size_t>( 24 + c ) * hw + p] ) );
-			const float v = moments[static_cast<size_t>( c ) * hw + p] + std::exp( 0.5f * lv ) * nd( rng );
-			z[static_cast<size_t>( c ) * hw + p] = ( to_fp16_and_back( v ) - mean[c] ) / stdev[c];
-		}
-	}
-	// patchify (1, 2, 2): row = (hh, ww), col = c * 4 + ph * 2 + pw
 	const int h2 = h / 2, w2 = w / 2;
-	std::vector<float> rows( static_cast<size_t>( h2 ) * w2 * 96 ), noise( rows.size() );
-	for ( int hh = 0; hh < h2; ++hh ) {
-		for ( int ww = 0; ww < w2; ++ww ) {
-			for ( int c = 0; c < 24; ++c ) {
-				for ( int ph = 0; ph < 2; ++ph ) {
-					for ( int pw = 0; pw < 2; ++pw ) {
-						rows[( static_cast<size_t>( hh ) * w2 + ww ) * 96 + c * 4 + ph * 2 + pw] = z[static_cast<size_t>( c ) * hw + static_cast<size_t>( hh * 2 + ph ) * w + ww * 2 + pw];
+	std::vector<float> rows( static_cast<size_t>( T ) * h2 * w2 * 96 ), noise( rows.size() );
+	std::vector<float> z( 24 * hw );
+	for ( int t = 0; t < T; ++t ) {
+		const float* m = &moments[static_cast<size_t>( t ) * 48 * hw];
+		for ( int c = 0; c < 24; ++c ) {
+			for ( size_t p = 0; p < hw; ++p ) {
+				const float lv = std::min( 20.0f, std::max( -30.0f, m[static_cast<size_t>( 24 + c ) * hw + p] ) );
+				const float v = m[static_cast<size_t>( c ) * hw + p] + std::exp( 0.5f * lv ) * nd( rng );
+				z[static_cast<size_t>( c ) * hw + p] = ( to_fp16_and_back( v ) - mean[c] ) / stdev[c];
+			}
+		}
+		// patchify (1, 2, 2): row = (t, hh, ww), col = c * 4 + ph * 2 + pw
+		for ( int hh = 0; hh < h2; ++hh ) {
+			for ( int ww = 0; ww < w2; ++ww ) {
+				for ( int c = 0; c < 24; ++c ) {
+					for ( int ph = 0; ph < 2; ++ph ) {
+						for ( int pw = 0; pw < 2; ++pw ) {
+							rows[( ( static_cast<size_t>( t ) * h2 + hh ) * w2 + ww ) * 96 + c * 4 + ph * 2 + pw] = z[static_cast<size_t>( c ) * hw + static_cast<size_t>( hh * 2 + ph ) * w + ww * 2 + pw];
+						}
 					}
 				}
 			}
@@ -179,6 +182,63 @@ std::vector<float> h3_keyframe_rows( const std::vector<float>& moments, int h, i
 		for ( size_t i = 0; i < rows.size(); ++i ) { rows[i] = noise_aug * rows[i] + ( 1.0f - noise_aug ) * noise[i]; }
 	}
 	return rows;
+}
+
+std::vector<float> h3_keyframe_rows( const std::vector<float>& moments, int h, int w, const std::vector<float>& mean, const std::vector<float>& stdev, uint64_t seed, float noise_aug ) {
+	return h3_condition_rows( moments, 1, h, w, mean, stdev, seed, noise_aug );
+}
+
+H3VideoBlocks h3_video_blocks( const std::vector<const uint8_t*>& frames, int h, int w ) {
+	// Qwen3-VL video processor: smart_resize(num_frames, h, w, temporal 2, factor 32, min 4096, max 25165824), bicubic resize, 0.5 / 0.5 normalization,
+	// frames padded to a multiple of 2 by repeating the last one, patches in (t, h/m, w/m, m, m) block order with (channel, 2 frames, 16, 16) inside
+	const int n = static_cast<int>( frames.size() );
+	const int factor = 32, tf = 2;
+	const double min_pixels = 4096, max_pixels = 25165824;
+	auto rnd = []( double v ) { return std::nearbyint( v ); }; // Python round(): half to even
+	int hb = std::max( factor, static_cast<int>( rnd( static_cast<double>( h ) / factor ) ) * factor ), wb = std::max( factor, static_cast<int>( rnd( static_cast<double>( w ) / factor ) ) * factor );
+	const int tb = static_cast<int>( rnd( static_cast<double>( n ) / tf ) ) * tf;
+	if ( static_cast<double>( tb ) * hb * wb > max_pixels ) {
+		const double beta = std::sqrt( static_cast<double>( n ) * h * w / max_pixels );
+		hb = std::max( factor, static_cast<int>( std::floor( h / beta / factor ) ) * factor );
+		wb = std::max( factor, static_cast<int>( std::floor( w / beta / factor ) ) * factor );
+	} else if ( static_cast<double>( tb ) * hb * wb < min_pixels ) {
+		const double beta = std::sqrt( min_pixels / ( static_cast<double>( n ) * h * w ) );
+		hb = static_cast<int>( std::ceil( h * beta / factor ) ) * factor;
+		wb = static_cast<int>( std::ceil( w * beta / factor ) ) * factor;
+	}
+	std::vector<std::vector<float>> px; // resized frames, float [0, 255], RGB
+	for ( int i = 0; i < n + ( n % tf ); ++i ) {
+		const uint8_t* f = frames[std::min( i, n - 1 )];
+		px.push_back( hb == h && wb == w ? std::vector<float>( f, f + static_cast<size_t>( h ) * w * 3 ) : engine::loader::resize_bicubic( f, h, w, hb, wb ) );
+	}
+	H3VideoBlocks out;
+	const int ps = 16, m = 2, gh = hb / ps, gw = wb / ps, dim = 3 * tf * ps * ps;
+	out.grid_h = gh;
+	out.grid_w = gw;
+	for ( size_t b = 0; 2 * b < px.size(); ++b ) {
+		std::vector<float> patches( static_cast<size_t>( gh ) * gw * dim );
+		size_t row = 0;
+		for ( int by = 0; by < gh / m; ++by ) {
+			for ( int bx = 0; bx < gw / m; ++bx ) {
+				for ( int my = 0; my < m; ++my ) {
+					for ( int mx = 0; mx < m; ++mx, ++row ) {
+						float* dst = &patches[row * dim];
+						const int y0 = ( by * m + my ) * ps, x0 = ( bx * m + mx ) * ps;
+						for ( int c = 0; c < 3; ++c ) {
+							for ( int t = 0; t < tf; ++t ) {
+								const std::vector<float>& f = px[2 * b + t];
+								for ( int y = 0; y < ps; ++y ) {
+									for ( int x = 0; x < ps; ++x ) { *dst++ = ( f[( static_cast<size_t>( y0 + y ) * wb + x0 + x ) * 3 + c] * ( 1.0f / 255.0f ) - 0.5f ) / 0.5f; }
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		out.patches.push_back( std::move( patches ) );
+	}
+	return out;
 }
 
 } // namespace engine::video

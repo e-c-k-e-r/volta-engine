@@ -36,6 +36,7 @@ int main( int argc, char** argv ) {
 		else if ( a == "--size" ) { std::sscanf( next(), "%dx%d", &req.width, &req.height ); size_given = true; }
 		else if ( a == "--image" ) { req.images.push_back( next() ); }
 		else if ( a == "--ref-image" ) { req.ref_images.push_back( next() ); }
+		else if ( a == "--ref-video" ) { req.ref_videos.push_back( next() ); }
 		else if ( a == "--ref-audio" ) { req.ref_audios.push_back( next() ); }
 		else if ( a == "--frame-index" ) { req.frame_indices.push_back( std::atoi( next() ) ); }
 		else if ( a == "--lora" ) {
@@ -48,7 +49,7 @@ int main( int argc, char** argv ) {
 		}
 		else { std::fprintf( stderr, "unknown argument %s\n", a.c_str() ); return 1; }
 	}
-	const bool ref_task = !req.ref_images.empty() || !req.ref_audios.empty();
+	const bool ref_task = !req.ref_images.empty() || !req.ref_audios.empty() || !req.ref_videos.empty();
 	if ( paths.root.empty() || ( paths.dit.empty() && !( ref_task && !paths.dit_ref2va.empty() ) ) || req.prompt.empty() || req.out.empty() ) {
 		std::fprintf( stderr, "usage: h3_generate --root DIR --dit CKPT --prompt TEXT --out FILE.mp4 [--lora PATH[:scale]] [--steps N] [--size WxH] [--frames N] [--seed N] [--devices 0,1,2,3]\n" );
 		return 1;
