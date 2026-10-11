@@ -42,7 +42,7 @@ __device__ __forceinline__ float block_max( float v, float* red ) {
 }
 
 template <typename Tin, typename Tout>
-__global__ void k_convert( const Tin* src, Tout* dst, size_t n ) {
+static __global__ void k_convert( const Tin* src, Tout* dst, size_t n ) {
 	for ( size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x; i < n; i += static_cast<size_t>( gridDim.x ) * blockDim.x ) {
 		dst[i] = static_cast<Tout>( static_cast<float>( src[i] ) );
 	}
@@ -55,7 +55,7 @@ constexpr int kMaxPerThread = 24; // hidden <= 256 * 24
 
 // x[row] (+= gate[idx] * branch[row]) -> normalized, optionally scale/shift modulated, written as Tout.
 template <typename Tout>
-__global__ void k_norm_mod( float* x, const float* branch, const float* gate, long gstride, const float* w, const float* shift, const float* scale, long mstride,
+static __global__ void k_norm_mod( float* x, const float* branch, const float* gate, long gstride, const float* w, const float* shift, const float* scale, long mstride,
 	const int* idx, int H, float eps, Tout* out ) {
 	__shared__ float red[32];
 	const int row = blockIdx.x;
@@ -91,7 +91,7 @@ __global__ void k_norm_mod( float* x, const float* branch, const float* gate, lo
 }
 
 // x += gate[idx] * (branch * rowscale)
-__global__ void k_add_gated( float* x, const float* branch, const float* rowscale, const float* gate, long gstride, const int* idx, int H, const float* bias = nullptr ) {
+static __global__ void k_add_gated( float* x, const float* branch, const float* rowscale, const float* gate, long gstride, const int* idx, int H, const float* bias = nullptr ) {
 	const int row = blockIdx.x;
 	const long ii = idx ? idx[row] : 0;
 	const float rs = rowscale ? rowscale[row] : 1.0f;
@@ -101,7 +101,7 @@ __global__ void k_add_gated( float* x, const float* branch, const float* rowscal
 	}
 }
 
-__global__ void k_add_bias( float* y, const float* b, int rows, int cols ) {
+static __global__ void k_add_bias( float* y, const float* b, int rows, int cols ) {
 	const size_t n = static_cast<size_t>( rows ) * cols;
 	for ( size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x; i < n; i += static_cast<size_t>( gridDim.x ) * blockDim.x ) {
 		y[i] += b[i % cols];
@@ -109,7 +109,7 @@ __global__ void k_add_bias( float* y, const float* b, int rows, int cols ) {
 }
 
 // silu(gate) * up with a per-row power-of-two scale that keeps the FP16 result in range (restored after the down projection).
-__global__ void k_silu_mul( const half* f1, half* f2, float* rowscale, int F, const float* bias = nullptr ) {
+static __global__ void k_silu_mul( const half* f1, half* f2, float* rowscale, int F, const float* bias = nullptr ) {
 	__shared__ float red[32];
 	const int row = blockIdx.x;
 	const half* g = f1 + static_cast<size_t>( row ) * 2 * F;
