@@ -104,6 +104,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/linear_trellis.cu
 	src/video/h3_dit.cu
 	src/video/h3_vae.cu
+	src/video/h3_audio.cu
 	src/kernels/cuda/h3/h3_fmha.cu
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
@@ -491,3 +492,6 @@ set_target_properties(bench_h3_dit PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJEC
 add_executable(test_h3_vae tests/2_parity/test_h3_vae.cpp)
 target_link_libraries(test_h3_vae PRIVATE engine_kernels)
 set_target_properties(test_h3_vae PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_h3_audio tests/2_parity/test_h3_audio.cpp)
+target_link_libraries(test_h3_audio PRIVATE engine_kernels)
+set_target_properties(test_h3_audio PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
