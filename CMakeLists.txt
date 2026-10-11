@@ -528,3 +528,6 @@ set_target_properties(test_h3_dit_sp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJ
 add_executable(test_h3_fmha tests/2_parity/test_h3_fmha.cpp)
 target_link_libraries(test_h3_fmha PRIVATE engine_kernels)
 set_target_properties(test_h3_fmha PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(p2p_check tests/3_bench/p2p_check.cpp)
+target_link_libraries(p2p_check PRIVATE engine_kernels)
+set_target_properties(p2p_check PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

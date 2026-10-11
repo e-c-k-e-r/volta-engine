@@ -83,9 +83,9 @@ public:
 	size_t weight_bytes() const;
 
 	// Sequence parallelism over several GPUs, each holding the full weights: this instance owns rows [row0, row0 + rows) of every packed sequence and
-	// all-gathers K and V per layer through `gather(row0, rows)` (called after the local K/V slice is written to kfull / vfull; it must return once the
-	// slices of every rank are present in every rank's buffers). With n == 1 the instance runs the whole sequence as before.
-	void set_sp( int rank, int n, std::function<void( int row0, int rows )> gather );
+	// all-gathers K and V per layer through `gather(total_rows, stream)` (called after the local K/V slice is enqueued on `stream`; it must return, with the
+	// copies complete on `stream`, once the slices of every rank are present in this rank's kfull / vfull). With n == 1 the instance runs the whole sequence as before.
+	void set_sp( int rank, int n, std::function<void( int total_rows, void* stream )> gather );
 	half_ptr_pair kv_buffers() const;
 	int device() const;
 	// Sequence-parallel forward: outputs for the local rows only, as the full-width heads before row selection (vall [U, 96] and aall [U, 32] on the host,

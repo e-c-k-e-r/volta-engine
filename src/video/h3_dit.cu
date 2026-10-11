@@ -233,7 +233,7 @@ struct H3DiT::Impl {
 	half* lora_t = nullptr;
 	// sequence parallelism
 	int sp_rank = 0, sp_n = 1;
-	std::function<void( int, int )> gather;
+	std::function<void( int, void* )> gather;
 	half *kfull = nullptr, *vfull = nullptr;
 	int total_rows = 0, max_local = 0;
 
@@ -402,7 +402,7 @@ struct H3DiT::Impl {
 			rope ? sinb + static_cast<size_t>( row0 ) * 48 : nullptr, q16, sp ? kfull + static_cast<size_t>( row0 ) * qd : k16, nh, cfg.qk_eps );
 		if ( sp ) {
 			CUDA_CHECK( cudaMemcpy2DAsync( vfull + static_cast<size_t>( row0 ) * qd, qd * sizeof( half ), qkv16 + 2 * qd, 3 * qd * sizeof( half ), qd * sizeof( half ), rows, cudaMemcpyDeviceToDevice, stream ) );
-			gather( row0, rows );
+			gather( total_rows, stream );
 			h3_flash_attention_qk( q16, kfull, vfull, o16, rows, total_rows, nh, 1.0f / std::sqrt( static_cast<float>( cfg.head_dim ) ), 0, 128, stream );
 		} else if ( use_fmha ) {
 			CUDA_CHECK( cudaMemcpy2DAsync( v16, qd * sizeof( half ), qkv16 + 2 * qd, 3 * qd * sizeof( half ), qd * sizeof( half ), rows, cudaMemcpyDeviceToDevice, stream ) );
@@ -605,7 +605,7 @@ void H3DiT::set_lora_scale( int id, float scale ) {
 	if ( id >= 0 && id < static_cast<int>( p_->adapters.size() ) ) { p_->adapters[static_cast<size_t>( id )]->scale = scale; }
 }
 
-void H3DiT::set_sp( int rank, int n, std::function<void( int, int )> gather ) {
+void H3DiT::set_sp( int rank, int n, std::function<void( int, void* )> gather ) {
 	p_->sp_rank = rank;
 	p_->sp_n = n;
 	p_->gather = std::move( gather );
@@ -678,7 +678,7 @@ void H3DiT::run_forward( const H3Request& r, float* video_out, float* audio_out,
 		const BlockW& b = s.blocks[i];
 		k_adaln<<<( 6 * kModalities * H + 255 ) / 256, 256, 0, st>>>( s.temb, b.aw, b.ab, s.ada, M, 6 * kModalities * H, c.adaln_dim );
 		if ( lrows > 0 ) { s.run_block( b, s.x + static_cast<size_t>( row0 ) * H, lrows, s.ada, s.comb + row0, true, i, row0 ); }
-		else if ( s.sp_n > 1 ) { for ( int pass = 0; pass < 1; ++pass ) { s.gather( row0, 0 ); } }
+		else if ( s.sp_n > 1 ) { s.gather( U, st ); }
 		if ( probe ) {
 			for ( int pb : probe_blocks ) {
 				if ( pb == i ) {

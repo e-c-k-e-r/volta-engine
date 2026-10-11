@@ -20,6 +20,10 @@ int main( int argc, char** argv ) {
 		if ( a == "--root" ) { paths.root = next(); }
 		else if ( a == "--dit" ) { paths.dit = next(); }
 		else if ( a == "--device" ) { paths.device = std::atoi( next() ); }
+		else if ( a == "--devices" ) {
+			paths.devices.clear();
+			for ( const char* p = next(); *p; ) { paths.devices.push_back( std::atoi( p ) ); while ( *p && *p != ',' ) { ++p; } if ( *p == ',' ) { ++p; } }
+		}
 		else if ( a == "--prompt" ) { req.prompt = next(); }
 		else if ( a == "--out" ) { req.out = next(); }
 		else if ( a == "--steps" ) { req.steps = std::atoi( next() ); }
@@ -41,7 +45,7 @@ int main( int argc, char** argv ) {
 		else { std::fprintf( stderr, "unknown argument %s\n", a.c_str() ); return 1; }
 	}
 	if ( paths.root.empty() || paths.dit.empty() || req.prompt.empty() || req.out.empty() ) {
-		std::fprintf( stderr, "usage: h3_generate --root DIR --dit CKPT --prompt TEXT --out FILE.mp4 [--lora PATH[:scale]] [--steps N] [--size WxH] [--frames N] [--seed N]\n" );
+		std::fprintf( stderr, "usage: h3_generate --root DIR --dit CKPT --prompt TEXT --out FILE.mp4 [--lora PATH[:scale]] [--steps N] [--size WxH] [--frames N] [--seed N] [--devices 0,1,2,3]\n" );
 		return 1;
 	}
 	if ( !req.images.empty() && !size_given ) {

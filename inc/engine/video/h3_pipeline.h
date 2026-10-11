@@ -33,7 +33,8 @@ int h3_audio_latent_t( double seconds );
 struct H3Paths {
 	std::string root; // FL2VA / Ref2VA component directory (text_encoder, video_vae, audio_vae, tokenizer)
 	std::string dit;  // Comfy INT8 ConvRot transformer checkpoint
-	int device = 0;
+	int device = 0;               // GPU for the encoders and decoders
+	std::vector<int> devices;     // GPUs for the DiT (sequence parallel); empty = {device}
 };
 
 struct H3Lora {

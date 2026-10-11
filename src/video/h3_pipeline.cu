@@ -5,6 +5,7 @@
 #include "engine/loader/tokenizer.h"
 #include "engine/video/h3_audio.h"
 #include "engine/video/h3_dit.h"
+#include "engine/video/h3_dit_group.h"
 #include "engine/video/h3_image.h"
 #include "engine/video/h3_text.h"
 #include "engine/video/h3_vae.h"
@@ -290,30 +291,31 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 		sa[i] = req.audio_shift * u / ( 1.0 + ( req.audio_shift - 1.0 ) * u );
 	}
 
-	// ---- stage 2: DiT ----
+	// ---- stage 2: DiT (one or several GPUs, sequence parallel) ----
 	t0 = std::chrono::steady_clock::now();
-	float *d_vrows = upload( vrows ), *d_arows = upload( arows ), *d_vout = nullptr, *d_aout = nullptr;
-	CUDA_CHECK( cudaMalloc( &d_vout, vrows.size() * sizeof( float ) ) );
-	CUDA_CHECK( cudaMalloc( &d_aout, arows.size() * sizeof( float ) ) );
+	std::vector<float> host_prompt( ids.size() * 5120 );
+	CUDA_CHECK( cudaMemcpy( host_prompt.data(), d_prompt, host_prompt.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
+	cudaFree( d_prompt );
+	std::vector<int> devices = paths.devices;
+	if ( devices.empty() ) { devices.push_back( paths.device ); }
 	{
-		H3DiT dit;
-		if ( !dit.load( paths.dit.c_str(), paths.device, lay.used ) ) { LOG_ERROR( "H3: cannot load %s", paths.dit.c_str() ); return false; }
+		H3DiTGroup dit;
+		if ( !dit.load( paths.dit.c_str(), devices, lay.used ) ) { LOG_ERROR( "H3: cannot load %s", paths.dit.c_str() ); return false; }
 		for ( const H3Lora& l : req.loras ) {
 			if ( dit.add_lora( l.path.c_str(), l.scale ) < 0 ) { LOG_ERROR( "H3: cannot use LoRA %s", l.path.c_str() ); return false; }
 		}
 		res.t_load = seconds_since( t0 );
-		LOG_INFO( "H3: DiT and %zu adapter(s) ready in %.1f s; %d rows (%d video, %d audio, %d text), %d steps, shifts %g/%g", req.loras.size(), res.t_load, lay.used, lay.n_img,
-			lay.n_audio, lay.text_len, req.steps, video_shift, req.audio_shift );
-		H3Request r;
+		LOG_INFO( "H3: DiT and %zu adapter(s) ready on %zu GPU(s) in %.1f s; %d rows (%d video, %d audio, %d text), %d steps, shifts %g/%g", req.loras.size(), devices.size(), res.t_load, lay.used,
+			lay.n_img, lay.n_audio, lay.text_len, req.steps, video_shift, req.audio_shift );
+		H3HostRequest r;
 		r.used = lay.used; r.text_len = lay.text_len; r.n_img = lay.n_img; r.n_audio = lay.n_audio;
-		r.video_rows = d_vrows; r.audio_rows = d_arows; r.prompt = d_prompt;
-		r.position_ids = upload( lay.position_ids );
-		r.img_pos = upload( lay.img_pos ); r.audio_pos = upload( lay.audio_pos ); r.text_pos = upload( lay.text_pos );
-		r.update_mask = upload( lay.update_mask ); r.tags = upload( lay.tags );
-		int* d_inv = nullptr;
-		CUDA_CHECK( cudaMalloc( &d_inv, static_cast<size_t>( lay.used ) * sizeof( int ) ) );
-		r.inverse = d_inv;
+		r.prompt = std::move( host_prompt );
+		r.position_ids = lay.position_ids;
+		r.img_pos = lay.img_pos; r.audio_pos = lay.audio_pos; r.text_pos = lay.text_pos;
+		r.update_mask = lay.update_mask; r.tags = lay.tags;
+		r.inverse.resize( lay.used );
 		t0 = std::chrono::steady_clock::now();
+		std::vector<float> vout, aout;
 		for ( int step = 0; step < req.steps; ++step ) {
 			const double tv = 1.0 - sv[step], ta = 1.0 - sa[step];
 			// per-row timesteps: text rows inherit the video timestep, condition rows sit at the condition timestep, audio rows at the audio one
@@ -327,20 +329,24 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 				if ( std::find( uniq.begin(), uniq.end(), f ) == uniq.end() ) { uniq.push_back( f ); }
 			}
 			std::sort( uniq.begin(), uniq.end() );
-			std::vector<int> inv( lay.used );
-			for ( int i = 0; i < lay.used; ++i ) { inv[i] = static_cast<int>( std::lower_bound( uniq.begin(), uniq.end(), static_cast<float>( row_t[i] ) ) - uniq.begin() ); }
-			CUDA_CHECK( cudaMemcpy( d_inv, inv.data(), inv.size() * sizeof( int ), cudaMemcpyHostToDevice ) );
+			for ( int i = 0; i < lay.used; ++i ) { r.inverse[i] = static_cast<int>( std::lower_bound( uniq.begin(), uniq.end(), static_cast<float>( row_t[i] ) ) - uniq.begin() ); }
 			r.unique_t = uniq;
-			dit.forward( r, d_vout, d_aout );
+			r.video_rows = vrows;
+			r.audio_rows = arows;
+			if ( !dit.forward( r, &vout, &aout ) ) { return false; }
+			{ double sum = 0, sa2 = 0; size_t bad = 0; for ( float v : vout ) { if ( !std::isfinite( v ) ) { ++bad; } else { sum += std::fabs( v ); } } for ( float v : aout ) { if ( std::isfinite( v ) ) { sa2 += std::fabs( v ); } }
+				LOG_INFO( "H3: step %d velocity |v|_1 %.6f |a|_1 %.6f, %zu non-finite", step, sum, sa2, bad ); }
+			// Euler (eta 0): x += (sigma_curr - sigma_next) * v; condition rows stay at their anchors
 			const float cv = static_cast<float>( sv[step] - sv[step + 1] ), ca = static_cast<float>( sa[step] - sa[step + 1] );
-			const size_t off = static_cast<size_t>( n_cond ) * 96, cnt = vrows.size() - off;
-			k_euler<<<( cnt + 255 ) / 256, 256>>>( d_vrows + off, d_vout + off, cv, cnt );
-			k_euler<<<( arows.size() + 255 ) / 256, 256>>>( d_arows, d_aout, ca, arows.size() );
-			CUDA_CHECK( cudaDeviceSynchronize() );
+			for ( size_t i = static_cast<size_t>( n_cond ) * 96; i < vrows.size(); ++i ) { vrows[i] += cv * vout[i]; }
+			for ( size_t i = 0; i < arows.size(); ++i ) { arows[i] += ca * aout[i]; }
 			LOG_INFO( "H3: step %d/%d done (%.1f s elapsed)", step + 1, req.steps, seconds_since( t0 ) );
 		}
 		res.t_denoise = seconds_since( t0 );
 	}
+	CUDA_CHECK( cudaSetDevice( paths.device ) );
+	float* d_vrows = upload( vrows );
+	float* d_arows = upload( arows );
 
 	// ---- stage 3: decoders ----
 	t0 = std::chrono::steady_clock::now();

@@ -2,6 +2,7 @@
 #include "engine/core/log.h"
 #include "engine/video/h3_dit.h"
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -55,6 +56,8 @@ bool H3DiTGroup::load( const char* checkpoint, const std::vector<int>& devices, 
 	Impl& s = *p_;
 	const int n = static_cast<int>( devices.size() );
 	if ( n < 1 ) { return false; }
+	int caller_device = 0;
+	CUDA_CHECK( cudaGetDevice( &caller_device ) );
 	s.devices = devices;
 	s.max_rows = max_rows;
 	s.barrier.reset( new Barrier( n ) );
@@ -84,27 +87,29 @@ bool H3DiTGroup::load( const char* checkpoint, const std::vector<int>& devices, 
 		} );
 	}
 	for ( auto& t : threads ) { t.join(); }
+	CUDA_CHECK( cudaSetDevice( caller_device ) ); // the peer-access setup walked over all GPUs; leave the caller where it was
 	for ( int r = 0; r < n; ++r ) { if ( !ok[r] ) { return false; } }
 	for ( int r = 0; r < n; ++r ) {
 		Impl* sp = p_;
-		s.dits[r]->set_sp( r, n, [sp, r, n]( int row0, int rows ) {
-			// every rank's K / V slice is final once the device is idle; push it into all peers' full buffers, then wait for everyone
-			// first barrier: every rank has finished the previous layer's attention, so nobody is still reading its K / V buffers
-			CUDA_CHECK( cudaDeviceSynchronize() );
+		s.dits[r]->set_sp( r, n, [sp, r, n]( int total, void* stream_ptr ) {
+			// Pull model: each rank copies its peers' K / V slices into its own buffers on its own compute stream (so stream order makes them visible to the
+			// attention that follows). Barrier 1: every rank's own slice is final. Barrier 2: every rank has finished pulling, so slices may be rewritten.
+			cudaStream_t stream = static_cast<cudaStream_t>( stream_ptr );
+			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 			sp->barrier->wait();
-			if ( rows > 0 ) {
-				const size_t qd = 7168;
-				const half_ptr_pair mine = sp->dits[r]->kv_buffers();
-				for ( int q = 0; q < n; ++q ) {
-					if ( q == r ) { continue; }
-					const half_ptr_pair theirs = sp->dits[q]->kv_buffers();
-					const size_t off = static_cast<size_t>( row0 ) * qd * 2, bytes = static_cast<size_t>( rows ) * qd * 2;
-					CUDA_CHECK( cudaMemcpyPeer( static_cast<char*>( theirs.k ) + off, sp->devices[q], static_cast<char*>( mine.k ) + off, sp->devices[r], bytes ) );
-					CUDA_CHECK( cudaMemcpyPeer( static_cast<char*>( theirs.v ) + off, sp->devices[q], static_cast<char*>( mine.v ) + off, sp->devices[r], bytes ) );
-				}
+			const size_t qd = 7168;
+			const int chunk = ( total + n - 1 ) / n;
+			const half_ptr_pair mine = sp->dits[r]->kv_buffers();
+			for ( int q = 0; q < n; ++q ) {
+				if ( q == r ) { continue; }
+				const int q0 = std::min( total, q * chunk ), q1 = std::min( total, q0 + chunk );
+				if ( q1 <= q0 ) { continue; }
+				const half_ptr_pair theirs = sp->dits[q]->kv_buffers();
+				const size_t off = static_cast<size_t>( q0 ) * qd * 2, bytes = static_cast<size_t>( q1 - q0 ) * qd * 2;
+				CUDA_CHECK( cudaMemcpyPeerAsync( static_cast<char*>( mine.k ) + off, sp->devices[r], static_cast<char*>( theirs.k ) + off, sp->devices[q], bytes, stream ) );
+				CUDA_CHECK( cudaMemcpyPeerAsync( static_cast<char*>( mine.v ) + off, sp->devices[r], static_cast<char*>( theirs.v ) + off, sp->devices[q], bytes, stream ) );
 			}
-			// peer copies are asynchronous with respect to the host: wait for them before telling the others the slices have arrived
-			CUDA_CHECK( cudaDeviceSynchronize() );
+			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 			sp->barrier->wait();
 		} );
 	}
