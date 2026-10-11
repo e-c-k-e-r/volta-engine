@@ -252,8 +252,25 @@ job also loads the transformer, 9.5 s). At 150 W the same job took 175 s. Where 
 What brought it down from the first working version (single GPU, per-stage loads): sequence parallelism over four GPUs, tile-parallel video decode (62.8 -> ~12 s of
 compute, 24.7 s with the load), the causal FMHA in the text tower (language model 46 -> 19 s for a 7K-token prompt), pinned/prefetched text-weight streaming
 (9.8 -> 5.2 s for a short prompt), the four-GPU reference-video encode on tensor cores (157 -> 18.7 s), parallel decoder loads, a resident transformer (load 15 -> 0 s),
-and per-peer K/V copy streams. Left on the table: a faster attention kernel (`h3_attn.cu` replaced the CUTLASS FMHA at about the same speed, 54.5 vs 56 TF/s, ~44% of the V100's FP16 peak; ideas: BQ=64 two blocks per SM, 32-row warp tiles, a stateful key-range variant that overlaps the K/V exchange), an EXL3 text encoder (streaming
-49 GB of BF16 per job is the remaining text cost for short prompts), overlapping the decode's peer copies with the next clip, and pinned loads for the decoders.
+and per-peer K/V copy streams.
+
+Attention is the engine's own kernel (`src/kernels/cuda/h3/h3_attn.cu`, WMMA, no CUTLASS): a warp owns 16 query rows, Q and the FP32 output live in registers, K/V
+tiles are double buffered through shared memory with row padding (D + 16 halves; the padding is worth 15%), the online softmax runs on the accumulators. 54.5 TF/s on
+the DiT shape (CUTLASS's best tile was 56), head_dim 128 (full and causal) and 64 (the VAE decoder, no zero padding). A key-range variant carries the running
+(max, sum, output) between calls; the sequence-parallel exchange uses it: each rank attends to its own keys while the peers' slices arrive, and nothing waits on the
+host (events and two host barriers per layer). Measured: the copies are hidden (stalls at most 0.75 s per step) but the step stays at 15.6 s, because the chunked
+kernel runs ~7% slower and shares HBM with the pulls; the attention sections are 10.3 s of the 15.2 s of layer time, so the kernel itself is now the bottleneck
+(the GEMMs, 85 to 97 TF/s, are not). Registers are at the 255 limit and the code generation is fragile: small source edits cost up to 12% (use unsigned index
+arithmetic, keep the plain variant separate from the state-carrying ones).
+
+Decode (16 s at 1280x736x124, 3.9 s of it loading the four decoders): 10.3 s are the tiles of the seven clips (28 tiles each, 7 per GPU, ~0.19 s per tile: GEMMs 125 ms
+at 62 to 80 TF/s, attention 26 ms with the native head_dim-64 kernel, was 52 ms padded), placement 0.5 s, audio 0.6 s. The decoder weights go through a pinned-chunk
+stager on a load stream (one decoder: 4.9 GB in 1.3 s); four in parallel are host-memory-bandwidth bound (~4 s). `test_h3_vae_det` checks run-to-run determinism of
+the tile and full decode.
+
+Left on the table: GEMM batching of two tiles per forward (M 1605 -> 3210 is worth ~5% of the tile), a fused SiLU epilogue, an attention kernel at BQ=64 with two blocks
+per SM or 32-row warp tiles, one host copy broadcast to all four decoder loads, an EXL3 text encoder (streaming 49 GB of BF16 per job is the remaining text cost for
+short prompts), and the overlap of the decode's peer copies with the next clip (placement is only 0.5 s, so little to win).
 Every run logs fingerprints (prompt, noise, each step's velocity, the final latents) so a change that should not alter results can be checked from the log.
 
 Running it:
