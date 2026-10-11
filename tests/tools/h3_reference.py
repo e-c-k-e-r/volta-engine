@@ -39,6 +39,7 @@ class H3Ref:
         self.eps = cfg["norm_eps"]
         self.qkeps = cfg["qk_norm_eps"]
         self.cache = {}
+        self.loras = []  # (tensors dict, alpha/rank * scale)
 
     def t(self, name):
         return self.f.get_tensor(name).to(self.dev)
@@ -56,11 +57,45 @@ class H3Ref:
             w = convrot(w, meta.get("convrot_groupsize", 256))
         return w
 
+    def add_lora(self, path, scale=1.0):
+        """Diffusers-layout PEFT adapter (turbo / community): delta = scale * alpha/rank * (x A^T) B^T on the linear's input."""
+        from safetensors import safe_open as so
+        with so(path, framework="pt", device="cpu") as f:
+            alpha = float((f.metadata() or {}).get("alpha", 8.0))
+            t = {k: f.get_tensor(k) for k in f.keys()}
+        rank = next(v.shape[0] for k, v in t.items() if k.endswith("lora_A.default.weight"))
+        self.loras.append((t, scale * alpha / rank))
+
+    def lin(self, prefix, x):
+        """x @ W^T for the (INT8) linear `prefix` plus the active adapters' deltas."""
+        y = x @ self.weight(prefix).t()
+        if not self.loras:
+            return y
+        # native name -> diffusers targets (and output offsets)
+        parts = prefix.split(".")
+        if parts[0] == "token_refiner":
+            base = f"token_refiner.refiner_blocks.{parts[2]}"
+            sub = ".".join(parts[3:])
+        else:
+            base = f"transformer_blocks.{parts[1]}"
+            sub = ".".join(parts[2:])
+        targets = {"attn.qkv_proj": [("attn.to_q", 0), ("attn.to_k", 7168), ("attn.to_v", 14336)], "attn.out_proj": [("attn.to_out.0", 0)],
+                   "mlp.fc1": [("ff.net.0.proj", 0)], "mlp.fc2": [("ff.net.2", 0)]}[sub]
+        for t, s in self.loras:
+            for name, off in targets:
+                A = t.get(f"{base}.{name}.lora_A.default.weight")
+                if A is None:
+                    continue
+                B = t[f"{base}.{name}.lora_B.default.weight"]
+                d = (x @ A.to(self.dev).float().t()) @ B.to(self.dev).float().t()
+                y[:, off:off + B.shape[0]] += s * d
+        return y
+
     # --- pieces -------------------------------------------------------------------------
     def attention(self, prefix, x, rope, rope_cols=96):
         """x [U, H] fp32. rope: (cos, sin) [U, 48] or None. Full bidirectional attention."""
         U = x.shape[0]
-        qkv = x @ self.weight(prefix + ".qkv_proj").t()
+        qkv = self.lin(prefix + ".qkv_proj", x)
         q, k, v = qkv.split(self.nh * self.hd, dim=-1)
         q = q.view(U, self.nh, self.hd)
         k = k.view(U, self.nh, self.hd)
@@ -81,12 +116,12 @@ class H3Ref:
             q.transpose(0, 1).unsqueeze(0), k.transpose(0, 1).unsqueeze(0),
             v.transpose(0, 1).unsqueeze(0), scale=self.hd ** -0.5)
         o = o.squeeze(0).transpose(0, 1).reshape(U, self.nh * self.hd)
-        return o @ self.weight(prefix + ".out_proj").t()
+        return self.lin(prefix + ".out_proj", o)
 
     def mlp(self, prefix, x):
-        h = x @ self.weight(prefix + ".fc1").t()
+        h = self.lin(prefix + ".fc1", x)
         g, u = h.chunk(2, dim=-1)
-        return (F.silu(g) * u) @ self.weight(prefix + ".fc2").t()
+        return self.lin(prefix + ".fc2", F.silu(g) * u)
 
     def refiner(self, text):
         x = text

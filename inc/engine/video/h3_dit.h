@@ -62,6 +62,11 @@ public:
 
 	// Opens the Comfy checkpoint, allocates weights and scratch for at most max_rows packed rows.
 	bool load( const char* checkpoint, int device, int max_rows, const H3Config& cfg = H3Config() );
+	// Staged LoRA adapter in the diffusers key layout (transformer_blocks.N.attn.to_q ... lora_A/B.default.weight); the INT8 base is untouched.
+	// scale multiplies alpha / rank (0 bypasses the adapter). Returns the adapter id, or -1 when the file does not match.
+	int add_lora( const char* path, float scale = 1.0f );
+	void set_lora_scale( int id, float scale );
+
 	// Outputs: video_out [n_img, 96], audio_out [n_audio, 32] (device, fp32).
 	void forward( const H3Request& req, float* video_out, float* audio_out, void* stream = nullptr );
 

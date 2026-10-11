@@ -216,6 +216,22 @@ struct H3DiT::Impl {
 	const float *vout_w = nullptr, *vout_b = nullptr, *aout_w = nullptr, *aout_b = nullptr;
 	std::vector<float> table; // [grid, dim] adaln interpolation table (host)
 
+	// Staged LoRA adapters (PEFT A/B pairs, kept apart from the INT8 base): parts of each linear, [layer * 4 + slot], layers 0..49 DiT, 50..51 refiner
+	struct LoraPart {
+		const half* a = nullptr;
+		const half* b = nullptr;
+		int offset = 0, width = 0, rank = 0;
+	};
+	struct Adapter {
+		std::string name;
+		std::vector<std::vector<LoraPart>> parts;
+		float alpha_over_rank = 0.0625f;
+		float scale = 0.0f; // request multiplier; 0 = bypassed
+		pod::MemoryArena arena{};
+	};
+	std::vector<Adapter*> adapters;
+	half* lora_t = nullptr;
+
 	// scratch
 	float *x = nullptr, *br = nullptr, *tx = nullptr, *rowscale = nullptr, *ada = nullptr, *temb = nullptr, *cosb = nullptr, *sinb = nullptr, *vall = nullptr, *aall = nullptr;
 	half *h16 = nullptr, *v16 = nullptr, *qkv16 = nullptr, *q16 = nullptr, *k16 = nullptr, *o16 = nullptr, *f1 = nullptr, *f2 = nullptr, *wscratch = nullptr;
@@ -338,6 +354,25 @@ struct H3DiT::Impl {
 		CUBLAS_CHECK( cublasSgemm( blas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, W, K, A, K, &beta, C, N ) );
 	}
 
+	// C[:, offset : offset + N] (+)= alpha * A @ W^T with ldc = full width; beta 1 accumulates into an existing result
+	void gemm_acc( const half* A, const half* W, void* C, int M, int N, int K, int ldc, int offset, float alpha, bool c32 ) {
+		const float beta = 1.0f;
+		void* cp = c32 ? static_cast<void*>( static_cast<float*>( C ) + offset ) : static_cast<void*>( static_cast<half*>( C ) + offset );
+		CUBLAS_CHECK( cublasGemmEx( blas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, W, CUDA_R_16F, K, A, CUDA_R_16F, K, &beta, cp, c32 ? CUDA_R_32F : CUDA_R_16F, ldc,
+			CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP ) );
+	}
+
+	// add every active adapter's delta of linear (layer, slot) to `out`; in: the FP16 input of the base GEMM [rows, K]
+	void lora_apply( int layer, int slot, const half* in, void* out, int rows, int K, int ldc, bool c32 ) {
+		for ( Adapter* ad : adapters ) {
+			if ( ad->scale == 0.0f || layer < 0 ) { continue; }
+			for ( const LoraPart& part : ad->parts[static_cast<size_t>( layer ) * 4 + slot] ) {
+				gemm_h( in, part.a, lora_t, rows, part.rank, K, false );
+				gemm_acc( lora_t, part.b, out, rows, part.width, part.rank, ldc, part.offset, ad->scale * ad->alpha_over_rank, c32 );
+			}
+		}
+	}
+
 	const half* matrix( const Mat& m ) {
 		if ( m.h ) { return m.h; }
 		dim3 grid( m.k / 256, m.n );
@@ -347,7 +382,7 @@ struct H3DiT::Impl {
 
 	// One pre-norm transformer block over `rows` packed rows of the FP32 stream `xs`. ada != null selects the AdaLN variant
 	// (6 chunks per modality row, rows indexed by comb) with rotary tables; otherwise the plain refiner block.
-	void run_block( const BlockW& b, float* xs, int rows, const float* adab, const int* idx, bool rope ) {
+	void run_block( const BlockW& b, float* xs, int rows, const float* adab, const int* idx, bool rope, int lora_layer ) {
 		const int H = cfg.hidden, nh = cfg.heads, qd = nh * cfg.head_dim, F = cfg.ffn;
 		const long st6 = 6L * H;
 		const float *sh_a = nullptr, *sc_a = nullptr, *g_a = nullptr, *sh_m = nullptr, *sc_m = nullptr, *g_m = nullptr;
@@ -356,6 +391,7 @@ struct H3DiT::Impl {
 		}
 		k_norm_mod<half><<<rows, 256, 0, stream>>>( xs, nullptr, nullptr, 0, b.n1, sh_a, sc_a, st6, idx, H, cfg.eps, h16 );
 		gemm_h( h16, matrix( b.qkv ), qkv16, rows, 3 * qd, H, false );
+		lora_apply( lora_layer, 0, h16, qkv16, rows, H, 3 * qd, false );
 		k_qk_norm_rope<<<dim3( rows, ( 2 * nh + 7 ) / 8 ), 256, 0, stream>>>( qkv16, 3 * qd, b.qn, b.kn, rope ? cosb : nullptr, rope ? sinb : nullptr, q16, k16, nh, cfg.qk_eps );
 		if ( use_fmha ) {
 			CUDA_CHECK( cudaMemcpy2DAsync( v16, qd * sizeof( half ), qkv16 + 2 * qd, 3 * qd * sizeof( half ), qd * sizeof( half ), rows, cudaMemcpyDeviceToDevice, stream ) );
@@ -365,10 +401,13 @@ struct H3DiT::Impl {
 			k_attn_simple<<<dim3( rows, nh ), 128, smem, stream>>>( q16, k16, qkv16 + 2 * qd, 3 * qd, o16, rows, nh );
 		}
 		gemm_h( o16, matrix( b.out ), br, rows, H, qd, true );
+		lora_apply( lora_layer, 1, o16, br, rows, qd, H, true );
 		k_norm_mod<half><<<rows, 256, 0, stream>>>( xs, br, g_a, st6, b.n2, sh_m, sc_m, st6, idx, H, cfg.eps, h16 );
 		gemm_h( h16, matrix( b.fc1 ), f1, rows, 2 * F, H, false );
+		lora_apply( lora_layer, 2, h16, f1, rows, H, 2 * F, false );
 		k_silu_mul<<<rows, 256, 0, stream>>>( f1, f2, rowscale, F );
 		gemm_h( f2, matrix( b.fc2 ), br, rows, H, F, true );
+		lora_apply( lora_layer, 3, f2, br, rows, F, H, true );
 		k_add_gated<<<rows, 256, 0, stream>>>( xs, br, rowscale, g_m, st6, idx, H );
 	}
 };
@@ -380,6 +419,10 @@ H3DiT::~H3DiT() {
 		if ( p_->blas ) { cublasDestroy( p_->blas ); }
 		if ( p_->warena.base_ptr ) { engine::core::arena_destroy( p_->warena ); }
 		if ( p_->sarena.base_ptr ) { engine::core::arena_destroy( p_->sarena ); }
+		for ( Impl::Adapter* a : p_->adapters ) {
+			if ( a->arena.base_ptr ) { engine::core::arena_destroy( a->arena ); }
+			delete a;
+		}
 		engine::loader::safetensors_close( p_->st );
 		delete p_;
 	}
@@ -457,7 +500,93 @@ bool H3DiT::load( const char* checkpoint, int device, int max_rows, const H3Conf
 	s.f2 = s.alloc<half>( s.sarena, U * F );
 	s.wscratch = s.alloc<half>( s.sarena, 28672ull * 5376 );
 	s.comb = s.alloc<int>( s.sarena, U );
+	s.lora_t = s.alloc<half>( s.sarena, U * 256 );
 	return true;
+}
+
+int H3DiT::add_lora( const char* path, float scale ) {
+	Impl& s = *p_;
+	CUDA_CHECK( cudaSetDevice( s.device ) );
+	pod::SafeTensorsFile f{};
+	if ( !engine::loader::safetensors_open( f, path ) ) { return -1; }
+	auto* ad = new Impl::Adapter();
+	ad->name = path;
+	ad->scale = scale;
+	// alpha from the file's __metadata__ ("alpha":"8"); default 8
+	float alpha = 8.0f;
+	{
+		FILE* fp = std::fopen( path, "rb" );
+		uint64_t len = 0;
+		if ( fp && std::fread( &len, 8, 1, fp ) == 1 && len < ( 64ull << 20 ) ) {
+			std::string hdr( len, '\0' );
+			if ( std::fread( hdr.data(), 1, len, fp ) == len ) {
+				const size_t pos = hdr.find( "\"alpha\"" );
+				if ( pos != std::string::npos ) {
+					const size_t q = hdr.find( ':', pos );
+					if ( q != std::string::npos ) { alpha = static_cast<float>( std::atof( hdr.c_str() + q + 2 ) ); }
+				}
+			}
+		}
+		if ( fp ) { std::fclose( fp ); }
+	}
+	size_t bytes = 0;
+	for ( int i = 0; i < f.tensor_count; ++i ) { bytes += f.tensors[i].size_bytes; }
+	if ( !engine::core::arena_create( ad->arena, s.device, bytes + ( 64ull << 20 ) ) ) { engine::loader::safetensors_close( f ); delete ad; return -1; }
+	ad->parts.assign( static_cast<size_t>( s.cfg.layers + s.cfg.refiner_layers ) * 4, {} );
+	int rank = 0;
+	auto up = [&]( const std::string& name ) -> const half* {
+		const pod::SafeTensorMeta* m = engine::loader::safetensors_find( f, name.c_str() );
+		if ( !m ) { return nullptr; }
+		const size_t n = s.numel( m );
+		half* d = static_cast<half*>( engine::core::arena_alloc( ad->arena, n * sizeof( half ) ) );
+		void* tmp = nullptr;
+		CUDA_CHECK( cudaMalloc( &tmp, m->size_bytes ) );
+		CUDA_CHECK( cudaMemcpy( tmp, engine::loader::safetensors_get_data_cpu( f, m ), m->size_bytes, cudaMemcpyHostToDevice ) );
+		if ( m->dtype == pod::DType::BF16 ) {
+			k_convert<__nv_bfloat16, half><<<1024, 256>>>( static_cast<const __nv_bfloat16*>( tmp ), d, n );
+		} else if ( m->dtype == pod::DType::FP16 ) {
+			CUDA_CHECK( cudaMemcpy( d, tmp, m->size_bytes, cudaMemcpyDeviceToDevice ) );
+		} else if ( m->dtype == pod::DType::FP32 ) {
+			k_convert<float, half><<<1024, 256>>>( static_cast<const float*>( tmp ), d, n );
+		} else {
+			d = nullptr;
+		}
+		CUDA_CHECK( cudaDeviceSynchronize() );
+		CUDA_CHECK( cudaFree( tmp ) );
+		return d;
+	};
+	struct Target { const char* suffix; int slot; int offset; };
+	const Target targets[] = { { "attn.to_q", 0, 0 }, { "attn.to_k", 0, 7168 }, { "attn.to_v", 0, 14336 }, { "attn.to_out.0", 1, 0 }, { "ff.net.0.proj", 2, 0 }, { "ff.net.2", 3, 0 } };
+	int found = 0;
+	for ( int L = 0; L < s.cfg.layers + s.cfg.refiner_layers; ++L ) {
+		const std::string prefix = L < s.cfg.layers ? "transformer_blocks." + std::to_string( L ) + "." : "token_refiner.refiner_blocks." + std::to_string( L - s.cfg.layers ) + ".";
+		for ( const Target& t : targets ) {
+			const std::string base = prefix + t.suffix;
+			const pod::SafeTensorMeta* am = engine::loader::safetensors_find( f, ( base + ".lora_A.default.weight" ).c_str() );
+			const pod::SafeTensorMeta* bm = engine::loader::safetensors_find( f, ( base + ".lora_B.default.weight" ).c_str() );
+			if ( !am || !bm ) { continue; }
+			Impl::LoraPart part;
+			part.a = up( base + ".lora_A.default.weight" );
+			part.b = up( base + ".lora_B.default.weight" );
+			part.rank = am->shape[0];
+			part.width = bm->shape[0];
+			part.offset = t.offset;
+			rank = part.rank;
+			if ( !part.a || !part.b || bm->shape[1] != am->shape[0] ) { engine::loader::safetensors_close( f ); engine::core::arena_destroy( ad->arena ); delete ad; return -1; }
+			ad->parts[static_cast<size_t>( L ) * 4 + t.slot].push_back( part );
+			++found;
+		}
+	}
+	engine::loader::safetensors_close( f );
+	if ( found == 0 || rank <= 0 || rank > 256 ) { engine::core::arena_destroy( ad->arena ); delete ad; return -1; }
+	ad->alpha_over_rank = alpha / static_cast<float>( rank );
+	s.adapters.push_back( ad );
+	LOG_INFO( "H3: LoRA %s: %d targets, rank %d, alpha %g, scale %g", path, found, rank, alpha, scale );
+	return static_cast<int>( s.adapters.size() ) - 1;
+}
+
+void H3DiT::set_lora_scale( int id, float scale ) {
+	if ( id >= 0 && id < static_cast<int>( p_->adapters.size() ) ) { p_->adapters[static_cast<size_t>( id )]->scale = scale; }
 }
 
 void H3DiT::forward( const H3Request& r, float* video_out, float* audio_out, void* stream_ptr ) {
@@ -493,7 +622,7 @@ void H3DiT::forward( const H3Request& r, float* video_out, float* audio_out, voi
 	// text: condition projection (+bias) -> refiner -> scatter
 	s.gemm_f( r.prompt, s.cond_w, s.tx, r.text_len, H, c.text_dim );
 	k_add_bias<<<1024, 256, 0, st>>>( s.tx, s.cond_b, r.text_len, H );
-	for ( const BlockW& b : s.refiner ) { s.run_block( b, s.tx, r.text_len, nullptr, nullptr, false ); }
+	for ( size_t ri = 0; ri < s.refiner.size(); ++ri ) { s.run_block( s.refiner[ri], s.tx, r.text_len, nullptr, nullptr, false, s.cfg.layers + static_cast<int>( ri ) ); }
 	k_norm_mod<float><<<r.text_len, 256, 0, st>>>( s.tx, nullptr, nullptr, 0, s.ref_final, nullptr, nullptr, 0, nullptr, H, c.final_eps, s.br );
 	k_scatter_add<<<r.text_len, 256, 0, st>>>( s.x, s.br, nullptr, r.text_pos, H );
 	// video and audio rows
@@ -506,7 +635,7 @@ void H3DiT::forward( const H3Request& r, float* video_out, float* audio_out, voi
 	for ( int i = 0; i < c.layers; ++i ) {
 		const BlockW& b = s.blocks[i];
 		k_adaln<<<( 6 * kModalities * H + 255 ) / 256, 256, 0, st>>>( s.temb, b.aw, b.ab, s.ada, M, 6 * kModalities * H, c.adaln_dim );
-		s.run_block( b, s.x, U, s.ada, s.comb, true );
+		s.run_block( b, s.x, U, s.ada, s.comb, true, i );
 		if ( probe ) {
 			for ( int pb : probe_blocks ) {
 				if ( pb == i ) {

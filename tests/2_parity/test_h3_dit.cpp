@@ -1,6 +1,6 @@
 // H3 DiT parity: runs the packed forward on a golden file made by tests/tools/h3_golden.py and compares the stream after the
 // embedding / selected blocks / the final layer and both outputs against the FP32 reference.
-//   test_h3_dit <comfy checkpoint> <golden.safetensors> [step count]
+//   test_h3_dit <comfy checkpoint> <golden.safetensors> [lora.safetensors]   (the golden must have been made with the same adapter)
 #include "engine/config.h"
 #include "engine/loader/safetensors.h"
 #include "engine/video/h3_dit.h"
@@ -72,6 +72,7 @@ int main( int argc, char** argv ) {
 	std::printf( "loaded %.2f GB of weights in %.1f s\n", dit.weight_bytes() / 1e9, std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() );
 
 	// inputs (device)
+	if ( argc > 3 ) { ENGINE_ASSERT( dit.add_lora( argv[3], 1.0f ) >= 0, "lora" ); }
 	float* d_video = to_device<float>( "x" ); // [S,96]: gather the video rows on the host to match the request contract
 	const float* h_x = static_cast<const float*>( engine::loader::safetensors_get_data_cpu( g_st, need( "x" ) ) );
 	const float* h_ax = static_cast<const float*>( engine::loader::safetensors_get_data_cpu( g_st, need( "audio_x" ) ) );

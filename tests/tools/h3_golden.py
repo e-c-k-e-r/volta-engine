@@ -25,6 +25,8 @@ ap.add_argument("--w", type=int, default=320)
 ap.add_argument("--text", type=int, default=32)
 ap.add_argument("--seed", type=int, default=1)
 ap.add_argument("--keyframe", default="")  # "", "0", "-1", "0,-1"
+ap.add_argument("--lora", default="")
+ap.add_argument("--lora-scale", type=float, default=1.0)
 ap.add_argument("--layers", type=int, default=0, help="limit block count (0 = all)")
 a = ap.parse_args()
 
@@ -55,6 +57,8 @@ tags = packed["token_tags"]
 
 outs = {}
 ref = H3Ref(a.ckpt, cfg)
+if a.lora:
+    ref.add_lora(a.lora, a.lora_scale)
 steps = [(0.9, 0.85, 0.01, 0.01), (0.5, 0.45, 0.01, 0.01)]  # t_video, t_audio, imgvid_cond_t, audio_ref_t
 for si, (tv, ta, tc, tr) in enumerate(steps):
     ts = torch.full((S,), tv)
