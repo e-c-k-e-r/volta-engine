@@ -221,6 +221,7 @@ struct H3DiT::Impl {
 		const half* a = nullptr;
 		const half* b = nullptr;
 		int offset = 0, width = 0, rank = 0;
+		float alpha_scale = 0.0625f; // alpha / rank of this tensor pair
 	};
 	struct Adapter {
 		std::string name;
@@ -373,7 +374,7 @@ struct H3DiT::Impl {
 			if ( ad->scale == 0.0f || layer < 0 ) { continue; }
 			for ( const LoraPart& part : ad->parts[static_cast<size_t>( layer ) * 4 + slot] ) {
 				gemm_h( in, part.a, lora_t, rows, part.rank, K, false );
-				gemm_acc( lora_t, part.b, out, rows, part.width, part.rank, ldc, part.offset, ad->scale * ad->alpha_over_rank, c32 );
+				gemm_acc( lora_t, part.b, out, rows, part.width, part.rank, ldc, part.offset, ad->scale * part.alpha_scale, c32 );
 			}
 		}
 	}
@@ -571,31 +572,61 @@ int H3DiT::add_lora( const char* path, float scale ) {
 		CUDA_CHECK( cudaFree( tmp ) );
 		return d;
 	};
+	// Three key layouts: diffusers (turbo: separate q/k/v, alpha in the file metadata), kohya (lora_unet_blocks_N_attn_qkv_proj.lora_down / lora_up / alpha) and
+	// ai-toolkit (diffusion_model.blocks.N.attn.qkv_proj.lora_A / lora_B, alpha = rank); the last two address the fused native projections directly.
 	struct Target { const char* suffix; int slot; int offset; };
-	const Target targets[] = { { "attn.to_q", 0, 0 }, { "attn.to_k", 0, 7168 }, { "attn.to_v", 0, 14336 }, { "attn.to_out.0", 1, 0 }, { "ff.net.0.proj", 2, 0 }, { "ff.net.2", 3, 0 } };
+	const Target dtargets[] = { { "attn.to_q", 0, 0 }, { "attn.to_k", 0, 7168 }, { "attn.to_v", 0, 14336 }, { "attn.to_out.0", 1, 0 }, { "ff.net.0.proj", 2, 0 }, { "ff.net.2", 3, 0 } };
+	const char* native[4] = { "attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2" };
+	auto scalar = [&]( const std::string& name, float def ) -> float {
+		const pod::SafeTensorMeta* m = engine::loader::safetensors_find( f, name.c_str() );
+		if ( !m || m->size_bytes == 0 ) { return def; }
+		const void* d = engine::loader::safetensors_get_data_cpu( f, m );
+		if ( m->dtype == pod::DType::FP32 ) { return *static_cast<const float*>( d ); }
+		if ( m->dtype == pod::DType::FP16 ) { return __half2float( *static_cast<const half*>( d ) ); }
+		if ( m->dtype == pod::DType::BF16 ) { const uint32_t bits = static_cast<uint32_t>( *static_cast<const uint16_t*>( d ) ) << 16; float v; std::memcpy( &v, &bits, 4 ); return v; }
+		return def;
+	};
 	int found = 0;
+	auto add_part = [&]( int L, int slot, const std::string& an, const std::string& bn, int offset, float alpha_scale_in, bool alpha_from_rank ) -> bool {
+		const pod::SafeTensorMeta* am = engine::loader::safetensors_find( f, an.c_str() );
+		const pod::SafeTensorMeta* bm = engine::loader::safetensors_find( f, bn.c_str() );
+		if ( !am || !bm ) { return true; }
+		Impl::LoraPart part;
+		part.a = up( an );
+		part.b = up( bn );
+		part.rank = am->shape[0];
+		part.width = bm->shape[0];
+		part.offset = offset;
+		part.alpha_scale = alpha_from_rank ? 1.0f : alpha_scale_in / static_cast<float>( part.rank );
+		rank = std::max( rank, part.rank );
+		if ( !part.a || !part.b || bm->shape[1] != am->shape[0] || am->shape[0] > 256 ) {
+			LOG_ERROR( "H3: LoRA tensor pair %s / %s unusable (A %dx%d, B %dx%d)", an.c_str(), bn.c_str(), am->shape[0], am->shape[1], bm->shape[0], bm->shape[1] );
+			return false;
+		}
+		ad->parts[static_cast<size_t>( L ) * 4 + slot].push_back( part );
+		++found;
+		return true;
+	};
 	for ( int L = 0; L < s.cfg.layers + s.cfg.refiner_layers; ++L ) {
-		const std::string prefix = L < s.cfg.layers ? "transformer_blocks." + std::to_string( L ) + "." : "token_refiner.refiner_blocks." + std::to_string( L - s.cfg.layers ) + ".";
-		for ( const Target& t : targets ) {
-			const std::string base = prefix + t.suffix;
-			const pod::SafeTensorMeta* am = engine::loader::safetensors_find( f, ( base + ".lora_A.default.weight" ).c_str() );
-			const pod::SafeTensorMeta* bm = engine::loader::safetensors_find( f, ( base + ".lora_B.default.weight" ).c_str() );
-			if ( !am || !bm ) { continue; }
-			Impl::LoraPart part;
-			part.a = up( base + ".lora_A.default.weight" );
-			part.b = up( base + ".lora_B.default.weight" );
-			part.rank = am->shape[0];
-			part.width = bm->shape[0];
-			part.offset = t.offset;
-			rank = part.rank;
-			if ( !part.a || !part.b || bm->shape[1] != am->shape[0] ) { engine::loader::safetensors_close( f ); engine::core::arena_destroy( ad->arena ); delete ad; return -1; }
-			ad->parts[static_cast<size_t>( L ) * 4 + t.slot].push_back( part );
-			++found;
+		const bool refiner = L >= s.cfg.layers;
+		const std::string dprefix = refiner ? "token_refiner.refiner_blocks." + std::to_string( L - s.cfg.layers ) + "." : "transformer_blocks." + std::to_string( L ) + ".";
+		const std::string nprefix = refiner ? "token_refiner.blocks." + std::to_string( L - s.cfg.layers ) + "." : "blocks." + std::to_string( L ) + ".";
+		for ( const Target& t : dtargets ) {
+			if ( !add_part( L, t.slot, dprefix + t.suffix + ".lora_A.default.weight", dprefix + t.suffix + ".lora_B.default.weight", t.offset, alpha, false ) ) { engine::loader::safetensors_close( f ); engine::core::arena_destroy( ad->arena ); delete ad; return -1; }
+		}
+		for ( int slot = 0; slot < 4; ++slot ) {
+			std::string kohya = std::string( "lora_unet_" ) + nprefix + native[slot];
+			for ( char& ch : kohya ) { if ( ch == '.' ) { ch = '_'; } }
+			const float ka = scalar( kohya + ".alpha", -1.0f );
+			if ( !add_part( L, slot, kohya + ".lora_down.weight", kohya + ".lora_up.weight", 0, ka > 0 ? ka : 0.0f, ka <= 0 ) ||
+				!add_part( L, slot, "diffusion_model." + nprefix + native[slot] + ".lora_A.weight", "diffusion_model." + nprefix + native[slot] + ".lora_B.weight", 0, 0.0f, true ) ) {
+				engine::loader::safetensors_close( f ); engine::core::arena_destroy( ad->arena ); delete ad; return -1;
+			}
 		}
 	}
 	engine::loader::safetensors_close( f );
-	if ( found == 0 || rank <= 0 || rank > 256 ) { engine::core::arena_destroy( ad->arena ); delete ad; return -1; }
-	ad->alpha_over_rank = alpha / static_cast<float>( rank );
+	if ( found == 0 || rank <= 0 || rank > 256 ) {
+		LOG_ERROR( "H3: LoRA %s: no usable targets (found %d, rank %d)", path, found, rank ); engine::core::arena_destroy( ad->arena ); delete ad; return -1; }
 	s.adapters.push_back( ad );
 	LOG_INFO( "H3: LoRA %s: %d targets, rank %d, alpha %g, scale %g", path, found, rank, alpha, scale );
 	return static_cast<int>( s.adapters.size() ) - 1;

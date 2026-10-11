@@ -202,6 +202,7 @@ static bool parse_header( pod::SafeTensorsFile& st ) {
 					if ( pos < len && json[pos] == '"' ) {
 						++pos;
 						while ( pos < len && json[pos] != '"' ) {
+							if ( json[pos] == '\\' && pos + 1 < len ) { ++pos; } // escaped character (metadata values carry JSON strings)
 							++pos;
 						}
 						if ( pos < len ) {
