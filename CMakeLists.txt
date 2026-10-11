@@ -51,7 +51,6 @@ set(ENGINE_HOST_SOURCES
 	src/video/h3_vae_config.cpp
 	src/video/h3_image.cpp
 	src/video/h3_refs.cpp
-	src/video/h3_dit_group.cpp
 	src/loader/chat_template.cpp
 	src/loader/jinja.cpp
 	src/loader/image.cpp
@@ -78,18 +77,18 @@ set(ENGINE_HOST_SOURCES
 	src/server/server.cpp
 	src/server/monitor.cpp
 	src/server/monitor_page.cpp
-	src/server/video/adapters.cpp
-	src/server/video/jobs.cpp
-	src/server/video/service.cpp
-	src/server/video/api.cpp
-	src/server/video/metrics.cpp
-	src/server/video/page.cpp
 	src/server/system_stats.cpp
 )
 
 if(ENGINE_BACKEND STREQUAL "CUDA")
 # CUDA device code and its launch drivers (compiled only for the CUDA backend)
 set(ENGINE_DEVICE_SOURCES
+	src/server/video/adapters.cpp
+	src/server/video/jobs.cpp
+	src/server/video/service.cpp
+	src/server/video/api.cpp
+	src/server/video/metrics.cpp
+	src/server/video/page.cpp
 	src/comm/all_reduce_ipc.cu
 	src/kernels/cuda/nvfp4/skinny_kernels.cu
 	src/kernels/cuda/nvfp4/moe_kernels.cu
@@ -117,6 +116,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/video/h3_vae_enc.cu
 	src/video/h3_text.cu
 	src/video/h3_vision.cu
+	src/video/h3_dit_group.cpp
 	src/video/h3_pipeline.cu
 	src/video/h3_stage_refs.cpp
 	src/video/h3_stage_text.cpp

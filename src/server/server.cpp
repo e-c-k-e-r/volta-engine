@@ -1,7 +1,6 @@
 #include "engine/server/server.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
-#include "engine/server/video.h"
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -68,11 +67,7 @@ bool VoltaServer::init( const ServerConfig& config ) {
 	model_name_ = slash == std::string::npos ? dir : dir.substr( slash + 1 );
 	if ( config_.model_type == "minimax_h3" ) {
 		// video + audio generation: the job service owns the GPUs, there is no language-model runtime
-		video_ = std::make_unique<VideoService>();
-		if ( !video_->init( config_ ) ) {
-			LOG_ERROR( "Failed to initialize the video service.\n" );
-			return false;
-		}
+		if ( !init_video() ) return false;
 	} else {
 		generator_ = std::make_unique<engine::runtime::Generator>();
 		if ( !generator_->init( config_ ) ) {
@@ -91,6 +86,17 @@ bool VoltaServer::init( const ServerConfig& config ) {
 	LOG_INFO( "Volta Server listening on http://%s:%d\n", config_.host.c_str(), config_.port );
 	std::fflush( stdout );
 	return true;
+}
+
+bool VoltaServer::init_video() {
+#ifdef ENGINE_BACKEND_CUDA
+	video_ = std::make_unique<VideoService>();
+	if ( video_->init( config_ ) ) return true;
+	LOG_ERROR( "Failed to initialize the video service.\n" );
+#else
+	LOG_ERROR( "MiniMax-H3 video generation needs the CUDA backend.\n" );
+#endif
+	return false;
 }
 
 bool VoltaServer::setup_socket() {
@@ -256,10 +262,12 @@ bool VoltaServer::parse_request( const ConnPtr& conn, HttpRequest* req ) {
 }
 
 void VoltaServer::register_routes() {
+#ifdef ENGINE_BACKEND_CUDA
 	if ( video_ ) { // the video service answers /health and /metrics itself; the chat and monitor routes need a language-model runtime
 		video_->register_routes( router_ );
 		return;
 	}
+#endif
 	router_.add( "GET", "/health", [this]( const ConnPtr& c, const HttpRequest& ) { handle_health( c ); } );
 	router_.add( "GET", "/", [this]( const ConnPtr& c, const HttpRequest& ) { handle_health( c ); } );
 	router_.add( "GET", "/metrics", [this]( const ConnPtr& c, const HttpRequest& ) { handle_metrics( c ); } );
@@ -422,7 +430,9 @@ void VoltaServer::stop() {
 		listen_fd_ = -1;
 	}
 
+#ifdef ENGINE_BACKEND_CUDA
 	if ( video_ ) video_->stop();
+#endif
 	if ( generator_ ) {
 		generator_->shutdown();
 		generator_.reset();

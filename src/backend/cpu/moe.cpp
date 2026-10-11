@@ -148,7 +148,7 @@ void MoE::init_device_ptrs( pod::MoELayerWeights& weights, pod::MemoryArena&, ba
 
 bool MoE::fused_decode( const pod::MoELayerWeights&, const pod::MoEScratch&, int ) { return false; }
 
-pod::MoEScratch MoE::alloc_scratch( pod::MemoryArena&, int, int, int, int, int ) {
+pod::MoEScratch MoE::alloc_scratch( pod::MemoryArena&, int, int, int, int, int, bool ) {
 	return pod::MoEScratch{};
 }
 

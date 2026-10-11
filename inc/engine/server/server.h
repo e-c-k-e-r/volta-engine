@@ -6,7 +6,9 @@
 #include "engine/server/config.h"
 #include "engine/server/http.h"
 #include "engine/server/system_stats.h"
+#ifdef ENGINE_BACKEND_CUDA
 #include "engine/server/video.h"
+#endif
 
 #include <atomic>
 #include <map>
@@ -29,6 +31,7 @@ public:
 	void stop();
 
 private:
+	bool init_video();
 	bool setup_socket();
 	void handle_new_connection();
 	void handle_readable( int fd );
@@ -53,7 +56,9 @@ private:
 	std::atomic<bool> running_{ false };
 
 	std::unique_ptr<engine::runtime::Generator> generator_;
+#ifdef ENGINE_BACKEND_CUDA
 	std::unique_ptr<VideoService> video_; // minimax_h3 checkpoints: the generation service instead of the language-model runtime
+#endif
 	std::map<int, ConnPtr> conns_; // epoll thread only
 	Router router_;
 	std::unique_ptr<ChatProtocol> openai_;
