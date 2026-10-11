@@ -7,6 +7,7 @@
 #include "engine/core/comm.h"
 #include "engine/modules/linear.h"
 #include "engine/modules/moe.h"
+#include "engine/modules/expert_tier.h"
 #include "engine/core/graph_cache.h"
 #include "engine/loader/ngram_table.h"
 #include "engine/models/qwen3_vision.h"
@@ -123,6 +124,7 @@ public:
 	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
 	bool has_mtp() const override { return mtp_on_; }
 	bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) override;
+	bool rebalance_experts( backend::stream_t stream = nullptr ) override;
 	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
 	void mtp_step_impl( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, bool logits, backend::stream_t stream );
 	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
@@ -177,6 +179,9 @@ private:
 	struct HessianSite { float* h = nullptr; int k = 0; int64_t rows = 0; };
 	std::vector<HessianSite> hess_;
 	int hess_layer_ = 0;
+	engine::modules::ExpertTier tier_;   // ENGINE_EXPERT_CACHE < 1: resident experts' codes in device slots, the rest in pinned host memory
+	pod::MemoryArena host_arena_{};
+	int tier_layers_ = 0;
 
 	Qwen4ExpConfig config_;
 	ModelMetadata metadata_;

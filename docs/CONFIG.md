@@ -43,7 +43,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `hessian_dir` | string | `(empty)` | `ENGINE_HESSIAN_DIR` | Flash-Next calibration: directory to write the input Hessians (x^T x per dense projection input, fp32) of the prefill rows that ran, one file per site at shutdown; empty = off |
 | `nvfp4_dense_dir` | string | `(empty)` | `ENGINE_NVFP4_DENSE_DIR` | Flash-Next: directory of calibrated NVFP4 dense tensors (tests/tools/nvfp4_ldlq.py) used instead of round-to-nearest for the groups of nvfp4_dense they cover |
 | `kv_format` | string | `(empty)` | `ENGINE_KV_FORMAT` | KV cache format: fp16, fp8, k8v4 or nvfp4; empty = the model default (fp16). GLM stores its single latent tensor in one format (k8v4 = 8-bit) |
-| `expert_cache` | float | `1` | `ENGINE_EXPERT_CACHE` | GLM resident routed-expert fraction in (0, 1]; below 1 enables the two-tier expert cache |
+| `expert_cache` | float | `1` | `ENGINE_EXPERT_CACHE` | resident routed-expert fraction in (0, 1] (GLM, Flash-Next); below 1 enables the two-tier expert cache: the codes of the cold experts live in pinned host memory and are read over PCIe |
 | `expert_adapt_every` | int | `64` | `ENGINE_EXPERT_ADAPT_EVERY` | decode steps between expert residency rebalances (0 = never) |
 | `expert_swaps` | int | `-1` | `ENGINE_EXPERT_SWAPS` | maximum expert swaps per rebalance; <0 = the tier default |
 | `speculator` | string | `dflash` | `ENGINE_SPECULATOR` | speculation source: dflash (needs a draft model) or mtp (the checkpoint's own multi-token-prediction head, Qwen) |

@@ -124,6 +124,7 @@ Qwen4ExpPipeline::~Qwen4ExpPipeline() {
 		graphs_.reset();
 		if ( side_stream_ != nullptr ) backend::stream_destroy( side_stream_ );
 		if ( full_logits_mem_ != nullptr ) backend::device_free( full_logits_mem_ );
+		engine::core::arena_destroy( host_arena_ );
 	}
 }
 
@@ -400,8 +401,14 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	auto load_row = [&]( const char* name, int bits ) { return check( repo.load_linear_slice( name, *arena_, bits, 0, rank_, tp, stream ), name ); };
 	// Dense groups quantized to NVFP4 at load from the BF16 tensors of the NVFP4 checkpoint (ENGINE_NVFP4_DENSE); otherwise the trellis tensors
 	const std::string& nv_groups = runtime::options().nvfp4_dense;
-	auto nv_on = [&]( const char* group ) { return nv_repo && !nv_groups.empty() && ( nv_groups == "all" || ( "," + nv_groups + "," ).find( std::string( "," ) + group + "," ) != std::string::npos ); };
-	// A calibrated tensor (nvfp4_dense_dir) when the directory has one, otherwise round-to-nearest from the BF16 weight
+	bool in_mtp = false;   // the MTP head keeps its own (EXL3) tensors
+	// A group is on when named in the list, or "all"; `shared` also covers its parts shared_gate / shared_up / shared_down
+	auto nv_listed = [&]( const std::string& g ) { return ( "," + nv_groups + "," ).find( "," + g + "," ) != std::string::npos; };
+	auto nv_on = [&]( const char* group ) {
+		if ( !nv_repo || in_mtp || nv_groups.empty() ) return false;
+		const std::string g = group;
+		return nv_groups == "all" || nv_listed( g ) || ( g.rfind( "shared_", 0 ) == 0 && nv_listed( "shared" ) );
+	};
 	int nv_calibrated = 0, nv_rtn = 0;
 	auto nv_slice = [&]( const char* name, bool split_n, int rank, int parts, int pad_n ) -> pod::LinearWeight {
 		const std::string key = std::string( name ) + ".weight_scale_2";
@@ -508,30 +515,60 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		lw.router = load_router_transposed( repo, nm, *arena_ );
 		if ( !lw.router.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, nm ); ++missing; }
 		auto& mw = lw.experts;
-		mw.type = nv_repo ? pod::QuantType::NVFP4 : pod::QuantType::TRELLIS;
+		const bool nv_experts = nv_repo && !in_mtp;
+		mw.type = nv_experts ? pod::QuantType::NVFP4 : pod::QuantType::TRELLIS;
 		const int per_rank = config_.num_experts / tp;
 		ENGINE_ASSERT( per_rank <= MOE_MAX_EXPERTS, "Qwen4ExpPipeline: experts per rank exceed MOE_MAX_EXPERTS" );
 		mw.num_local_experts = per_rank;
 		mw.top_k = config_.top_k;
+		// Tiered experts (ENGINE_EXPERT_CACHE < 1): the codes of resident experts go to device slots, the rest to pinned host memory; the scales
+		// (NVFP4) and sign vectors (trellis) stay on the device
+		const double tier_fraction = engine::modules::ExpertTier::resident_fraction();
+		int tier_layer = -1;
+		if ( tier_fraction < 1.0 && !in_mtp ) {
+			if ( tier_layers_ == 0 ) {
+				size_t bytes[3];
+				const char* kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+				for ( int p = 0; p < 3; ++p ) {
+					if ( nv_experts ) bytes[p] = static_cast<size_t>( config_.hidden_size ) * config_.moe_intermediate / 2;
+					else {
+						std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.%s", pre, rank_ * per_rank, kinds[p] );
+						bytes[p] = repo.trellis_bytes( nm );
+						ENGINE_ASSERT( bytes[p] > 0, "Qwen4ExpPipeline: expert codes not found for the tier" );
+					}
+				}
+				tier_.configure( per_rank, tier_fraction, bytes );
+				const size_t host_bytes = static_cast<size_t>( config_.num_layers ) * tier_.cold_bytes_per_layer() + tier_.slot_bytes + 256;
+				ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "Qwen4ExpPipeline: pinned expert tier allocation failed" );
+				tier_.allocate_staging( host_arena_ );
+			}
+			std::vector<int> resident_set( tier_.resident );
+			for ( int s = 0; s < tier_.resident; ++s ) resident_set[s] = s;
+			tier_.add_layer( &mw, *arena_, host_arena_, resident_set );
+			tier_layer = tier_layers_++;
+		}
 		for ( int e = 0; e < per_rank; ++e ) {
 			const int gid = rank_ * per_rank + e;
-			if ( nv_repo ) {
+			pod::MemoryArena ca[3];
+			if ( tier_layer >= 0 ) for ( int p = 0; p < 3; ++p ) tier_.code_arena( tier_layer, e, p, ca[p] );
+			pod::MemoryArena* cp[3] = { tier_layer >= 0 ? &ca[0] : nullptr, tier_layer >= 0 ? &ca[1] : nullptr, tier_layer >= 0 ? &ca[2] : nullptr };
+			if ( nv_experts ) {
 				// modelopt NVFP4 experts: [N, K/2] codes, E4M3 block scales, one FP32 global scale per matrix
-				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.gate_proj", pre, gid ); mw.gate[e] = check( nv_repo->load_nvfp4_slice( nm, *arena_, true, 0, 1, stream ), nm );
-				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.up_proj", pre, gid ); mw.up[e] = check( nv_repo->load_nvfp4_slice( nm, *arena_, true, 0, 1, stream ), nm );
-				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.down_proj", pre, gid ); mw.down[e] = check( nv_repo->load_nvfp4_slice( nm, *arena_, true, 0, 1, stream ), nm );
+				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.gate_proj", pre, gid ); mw.gate[e] = check( nv_repo->load_nvfp4_slice( nm, *arena_, true, 0, 1, stream, 0, cp[0] ), nm );
+				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.up_proj", pre, gid ); mw.up[e] = check( nv_repo->load_nvfp4_slice( nm, *arena_, true, 0, 1, stream, 0, cp[1] ), nm );
+				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.down_proj", pre, gid ); mw.down[e] = check( nv_repo->load_nvfp4_slice( nm, *arena_, true, 0, 1, stream, 0, cp[2] ), nm );
 				continue;
 			}
-			std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.gate_proj", pre, gid ); mw.gate[e] = check( repo.load_linear( nm, *arena_, 4, stream ), nm );
-			std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.up_proj", pre, gid ); mw.up[e] = check( repo.load_linear( nm, *arena_, 4, stream ), nm );
-			std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.down_proj", pre, gid ); mw.down[e] = check( repo.load_linear( nm, *arena_, 4, stream ), nm );
+			std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.gate_proj", pre, gid ); mw.gate[e] = check( repo.load_linear( nm, *arena_, 4, stream, cp[0] ), nm );
+			std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.up_proj", pre, gid ); mw.up[e] = check( repo.load_linear( nm, *arena_, 4, stream, cp[1] ), nm );
+			std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.down_proj", pre, gid ); mw.down[e] = check( repo.load_linear( nm, *arena_, 4, stream, cp[2] ), nm );
 		}
 		engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );
 		mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( per_rank ) * sizeof( uint32_t ), 128 ) );
 		backend::memset_async( mw.heat, 0, static_cast<size_t>( per_rank ) * sizeof( uint32_t ), stream );
-		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.gate_proj", pre ); lw.shared_gate = load_full_g( "shared", nm, 4 );
-		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.up_proj", pre ); lw.shared_up = load_full_g( "shared", nm, 4 );
-		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.down_proj", pre ); lw.shared_down = load_full_g( "shared", nm, 4 );
+		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.gate_proj", pre ); lw.shared_gate = load_full_g( "shared_gate", nm, 4 );
+		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.up_proj", pre ); lw.shared_up = load_full_g( "shared_up", nm, 4 );
+		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.down_proj", pre ); lw.shared_down = load_full_g( "shared_down", nm, 4 );
 		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert_gate.weight", pre ); lw.shared_expert_gate = dense( nm );
 	};
 	for ( int L = 0; L < config_.num_layers; ++L ) {
@@ -542,6 +579,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	if ( mtp_on_ ) {
 		// MTP head: one full-attention block with its own gated-residual sites and MoE, the input combine and its own mixer
 		mtp_layer_.is_full_attention = true;
+		in_mtp = true;
 		load_block( mtp_layer_, "mtp.layers.0" );
 		mtp_pre_norm_hidden_ = dense( "mtp.pre_fc_norm_hidden.weight" );
 		mtp_pre_norm_embedding_ = dense( "mtp.pre_fc_norm_embedding.weight" );
@@ -979,6 +1017,19 @@ void Qwen4ExpPipeline::teacher_inject( int L, int m, backend::stream_t stream ) 
 	flush_apply( m, stream );
 	backend::memcpy_async( streams_.data, data.data() + static_cast<size_t>( L - 1 ) * block, block * sizeof( float ), backend::Copy::H2D, stream );
 	backend::stream_sync( stream );
+}
+
+bool Qwen4ExpPipeline::rebalance_experts( backend::stream_t stream ) {
+	if ( !tier_.active() ) return false;
+	backend::set_device( rank_ );
+	tier_.reset_window();
+	int moved = 0;
+	for ( int l = 0; l < tier_layers_; ++l ) moved += tier_.rebalance( l, stream );
+	if ( runtime::options().expert_log ) {
+		LOG_INFO( "[experts rank %d] window hit rate %.3f over %llu routes, %d swaps (%llu total)\n", rank_, tier_.hit_rate(),
+			static_cast<unsigned long long>( tier_.window_routes ), moved, static_cast<unsigned long long>( tier_.swaps ) );
+	}
+	return true;
 }
 
 void Qwen4ExpPipeline::hessian( int layer, int site, const void* x, int k, int m, backend::stream_t stream ) {

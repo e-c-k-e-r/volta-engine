@@ -89,14 +89,16 @@ int ExpertTier::rebalance( int layer, cudaStream_t stream ) {
 		l.slot_of[hot] = slot;
 		l.slot_of[cold_res] = -1;
 		l.owner[slot] = hot;
-		// Point the kernels' tables at the new homes (gate, up, down codes are rows 0, 3, 6 of the 9 x E pointer table)
+		// Point the kernels' tables at the new homes (gate, up, down codes: rows 0, 3, 6 of the trellis 9 x E pointer table, rows 0, 2, 4 of the
+		// NVFP4 6 x E table, where the scales are the rows between)
+		const int row_step = l.mw->type == pod::QuantType::NVFP4 ? 2 : 3;
 		const void* ptrs_hot[3], *ptrs_cold[3];
 		size_t off = 0;
 		for ( int p = 0; p < 3; ++p ) {
 			ptrs_hot[p] = slot_ptr + off;
 			ptrs_cold[p] = l.host[cold_res] + off;
 			off += part_bytes[p];
-			const size_t row = static_cast<size_t>( 3 * p ) * experts;
+			const size_t row = static_cast<size_t>( row_step * p ) * experts;
 			CUDA_CHECK( cudaMemcpy( static_cast<const void**>( table ) + row + hot, &ptrs_hot[p], sizeof( void* ), cudaMemcpyHostToDevice ) );
 			CUDA_CHECK( cudaMemcpy( static_cast<const void**>( table ) + row + cold_res, &ptrs_cold[p], sizeof( void* ), cudaMemcpyHostToDevice ) );
 		}

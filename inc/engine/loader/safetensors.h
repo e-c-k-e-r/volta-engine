@@ -148,7 +148,8 @@ public:
 		int k0,
 		int kcount,
 		backend::stream_t stream = nullptr,
-		int pad_n = 0
+		int pad_n = 0,
+		pod::MemoryArena* codes_arena = nullptr   // the packed codes are placed here (the expert tier's slots), the scales stay in `arena`
 	);
 
 	// NVFP4 from a BF16 / FP16 dense `<base_name>.weight` [N, K] (round-to-nearest with a +-2 code E4M3 scale search per 16 values; the global
@@ -183,7 +184,8 @@ public:
 		int rank,
 		int tp_size,
 		backend::stream_t stream = nullptr,
-		int pad_n = 0
+		int pad_n = 0,
+		pod::MemoryArena* codes_arena = nullptr
 	);
 
 	// The same weights dequantized to dense FP16 [N_local, K] (a .weight tensor), for the few small projections

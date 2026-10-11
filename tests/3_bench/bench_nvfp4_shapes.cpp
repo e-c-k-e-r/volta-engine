@@ -1,9 +1,11 @@
 // NVFP4 skinny GEMV at expert / dense decode shapes: time per call over distinct weight sets (cold L2) in graph replay, and the GB/s of packed weights + scales.
+//   BENCH_FP16=1 also times the plain FP16 GEMV (LinearPlainGEMV) on the same shapes, M = 1 / 4 / 8 / 256
 //   bench_nvfp4_shapes [K N ...]   default: the Flash-Next expert shapes (gate / up 2560 -> 640, down 640 -> 2560) and two dense ones
 #include "engine/config.h"
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
 #include "engine/modules/nvfp4.h"
+#include "engine/modules/linear.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdio>
@@ -60,6 +62,41 @@ int main( int argc, char** argv ) {
 			const double us = 1000.0 * ms / iters / SETS;
 			const double bytes = static_cast<double>( N ) * K / 2 + static_cast<double>( N ) * K / 16;
 			std::printf( "K %5d N %5d M %d: %6.2f us per call, %6.1f GB/s (packed %.2f MB)\n", K, N, m, us, bytes / ( us * 1e-6 ) / 1e9, bytes / 1e6 );
+		}
+		if ( std::getenv( "BENCH_FP16" ) ) {
+			// Plain FP16 GEMV on the same shape: weights as dense [N, K] halves, 2 GB budget of distinct copies
+			const int WS = std::max( 2, std::min( 64, static_cast<int>( 2.0e9 / ( static_cast<double>( N ) * K * 2.0 ) ) ) );
+			std::vector<pod::TensorView> ws( WS );
+			int wsh[2] = { N, K };
+			for ( int s = 0; s < WS; ++s ) {
+				ws[s] = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, wsh, 2 );
+				CUDA_CHECK( cudaMemsetAsync( ws[s].data, 0x11, static_cast<size_t>( N ) * K * 2, stream ) );
+			}
+			for ( int m : { 1, 4, 8, 256 } ) {
+				int xs[2] = { m, K }, os[2] = { m, N };
+				pod::TensorView x = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, xs, 2 );
+				pod::TensorView o = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, os, 2 );
+				CUDA_CHECK( cudaMemsetAsync( x.data, 0x3c, static_cast<size_t>( m ) * K * 2, stream ) );
+				auto run = [&]() { for ( int s = 0; s < WS; ++s ) engine::modules::LinearPlainGEMV::forward( ws[s].ptr<const half>(), x.ptr<const half>(), o.ptr<half>(), m, N, K, stream ); };
+				run();
+				CUDA_CHECK( cudaStreamSynchronize( stream ) );
+				cudaGraph_t g;
+				cudaGraphExec_t ex;
+				CUDA_CHECK( cudaStreamBeginCapture( stream, cudaStreamCaptureModeGlobal ) );
+				run();
+				CUDA_CHECK( cudaStreamEndCapture( stream, &g ) );
+				CUDA_CHECK( cudaGraphInstantiate( &ex, g, nullptr, nullptr, 0 ) );
+				CUDA_CHECK( cudaGraphLaunch( ex, stream ) );
+				CUDA_CHECK( cudaStreamSynchronize( stream ) );
+				CUDA_CHECK( cudaEventRecord( e0, stream ) );
+				for ( int i = 0; i < 10; ++i ) CUDA_CHECK( cudaGraphLaunch( ex, stream ) );
+				CUDA_CHECK( cudaEventRecord( e1, stream ) );
+				CUDA_CHECK( cudaEventSynchronize( e1 ) );
+				float ms = 0.0f;
+				CUDA_CHECK( cudaEventElapsedTime( &ms, e0, e1 ) );
+				const double us = 1000.0 * ms / 10 / WS;
+				std::printf( "K %5d N %5d M %3d: fp16 %6.2f us per call, %6.1f GB/s\n", K, N, m, us, static_cast<double>( N ) * K * 2 / ( us * 1e-6 ) / 1e9 );
+			}
 		}
 	}
 	return 0;
