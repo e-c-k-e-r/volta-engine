@@ -236,6 +236,7 @@ struct H3DiT::Impl {
 	// sequence parallelism
 	int sp_rank = 0, sp_n = 1;
 	H3SpExchange exchange;
+	H3TpComm tp_comm;
 	std::vector<cudaEvent_t> tev; // layer timing (sequence parallel): [3 * layer + {0: attention section start, 1: end, 2: layer end}]
 	int tev_layer = -1;
 	std::vector<cudaEvent_t> wev; // per layer and peer slot: stream time before / after waiting for the slice to arrive
@@ -329,6 +330,49 @@ struct H3DiT::Impl {
 		return true;
 	}
 
+	// Row ranges (concatenated) and the column range [c0, c1) of an INT8 ConvRot matrix: a tensor-parallel shard. Row scales belong to rows, so they travel with them; a column
+	// range must cover whole 256-groups (the rotation acts inside a group) and the partial products over the column shards add up to the full one.
+	bool load_mat_i8_sub( const std::string& base, Mat& m, const std::vector<std::pair<int, int>>& row_ranges, int c0, int c1 ) {
+		const pod::SafeTensorMeta* w = find( base + ".weight" );
+		const pod::SafeTensorMeta* sc = find( base + ".weight_scale" );
+		const pod::SafeTensorMeta* q = find( base + ".comfy_quant" );
+		if ( !w || !sc || !q ) { return false; }
+		ENGINE_ASSERT( w->dtype == pod::DType::INT8 && w->ndim == 2, "H3: expected an INT8 matrix" );
+		ENGINE_ASSERT( c0 % 256 == 0 && c1 % 256 == 0 && c1 > c0 && c1 <= w->shape[1], "H3: a column shard must cover whole 256-groups" );
+		const int K = w->shape[1], kl = c1 - c0;
+		int nl = 0;
+		for ( const auto& r : row_ranges ) { nl += r.second - r.first; }
+		std::vector<int8_t> buf( static_cast<size_t>( nl ) * kl );
+		std::vector<float> scales( nl );
+		const int8_t* src = static_cast<const int8_t*>( engine::loader::safetensors_get_data_cpu( st, w ) );
+		const void* sp = engine::loader::safetensors_get_data_cpu( st, sc );
+		auto scale_at = [&]( int row ) -> float {
+			if ( sc->dtype == pod::DType::FP32 ) { return static_cast<const float*>( sp )[row]; }
+			if ( sc->dtype == pod::DType::FP16 ) { return __half2float( static_cast<const half*>( sp )[row] ); }
+			ENGINE_ASSERT( sc->dtype == pod::DType::BF16, "H3: unsupported scale dtype" );
+			const uint32_t bits = static_cast<uint32_t>( static_cast<const uint16_t*>( sp )[row] ) << 16;
+			float f;
+			std::memcpy( &f, &bits, 4 );
+			return f;
+		};
+		int o = 0;
+		for ( const auto& r : row_ranges ) {
+			for ( int row = r.first; row < r.second; ++row, ++o ) {
+				std::memcpy( buf.data() + static_cast<size_t>( o ) * kl, src + static_cast<size_t>( row ) * K + c0, kl );
+				scales[o] = scale_at( row );
+			}
+		}
+		int8_t* d = static_cast<int8_t*>( engine::core::arena_alloc( warena, buf.size() ) );
+		float* ds = static_cast<float*>( engine::core::arena_alloc( warena, scales.size() * sizeof( float ) ) );
+		CUDA_CHECK( cudaMemcpy( d, buf.data(), buf.size(), cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMemcpy( ds, scales.data(), scales.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+		m.i8 = d;
+		m.scale = ds;
+		m.n = nl;
+		m.k = kl;
+		return true;
+	}
+
 	bool load_block( int i, bool refiner_block ) {
 		BlockW b;
 		const std::string p = refiner_block ? "token_refiner.blocks." + std::to_string( i ) : "blocks." + std::to_string( i );
@@ -338,7 +382,18 @@ struct H3DiT::Impl {
 			b.fc1.h = upload_f16( p + ".mlp.fc1.weight", &b.fc1.n, &b.fc1.k );
 			b.fc2.h = upload_f16( p + ".mlp.fc2.weight", &b.fc2.n, &b.fc2.k );
 		} else {
-			if ( !load_mat_i8( p + ".attn.qkv_proj", b.qkv ) || !load_mat_i8( p + ".attn.out_proj", b.out ) || !load_mat_i8( p + ".mlp.fc1", b.fc1 ) ||
+			if ( cfg.tp_ranks > 1 ) {
+				const int T = cfg.tp_ranks, r = cfg.tp_rank, qd = cfg.heads * cfg.head_dim;
+				ENGINE_ASSERT( cfg.heads % T == 0 && ( qd / T ) % 256 == 0 && ( cfg.ffn / T ) % 256 == 0, "H3: the tensor-parallel shards must align to the 256-groups of the rotation" );
+				const int ql = qd / T, fl = cfg.ffn / T;
+				const int H = cfg.hidden;
+				if ( !load_mat_i8_sub( p + ".attn.qkv_proj", b.qkv, { { r * ql, ( r + 1 ) * ql }, { qd + r * ql, qd + ( r + 1 ) * ql }, { 2 * qd + r * ql, 2 * qd + ( r + 1 ) * ql } }, 0, H ) ||
+					!load_mat_i8_sub( p + ".attn.out_proj", b.out, { { 0, H } }, r * ql, ( r + 1 ) * ql ) ||
+					!load_mat_i8_sub( p + ".mlp.fc1", b.fc1, { { r * fl, ( r + 1 ) * fl }, { cfg.ffn + r * fl, cfg.ffn + ( r + 1 ) * fl } }, 0, H ) ||
+					!load_mat_i8_sub( p + ".mlp.fc2", b.fc2, { { 0, H } }, r * fl, ( r + 1 ) * fl ) ) {
+					return false;
+				}
+			} else if ( !load_mat_i8( p + ".attn.qkv_proj", b.qkv ) || !load_mat_i8( p + ".attn.out_proj", b.out ) || !load_mat_i8( p + ".mlp.fc1", b.fc1 ) ||
 				!load_mat_i8( p + ".mlp.fc2", b.fc2 ) ) {
 				return false;
 			}
@@ -395,7 +450,32 @@ struct H3DiT::Impl {
 
 	// One pre-norm transformer block over `rows` packed rows of the FP32 stream `xs`. ada != null selects the AdaLN variant
 	// (6 chunks per modality row, rows indexed by comb) with rotary tables; otherwise the plain refiner block.
+	// The tensor-parallel block: every rank runs all rows with 1/T of the heads and of the MLP width; the attention-output and MLP-down projections produce partial sums
+	// (FP32, the wide-range ones) that are added over the ranks before they enter the residual stream.
+	void run_block_tp( const BlockW& b, float* xs, int rows, const float* adab, const int* idx ) {
+		const int T = cfg.tp_ranks, H = cfg.hidden, nh = cfg.heads / T, ql = nh * cfg.head_dim, Fl = cfg.ffn / T;
+		const long st6 = 6L * H;
+		const float *sh_a = adab, *sc_a = adab + H, *g_a = adab + 2 * H, *sh_m = adab + 3 * H, *sc_m = adab + 4 * H, *g_m = adab + 5 * H;
+		for ( Adapter* ad : adapters ) { ENGINE_ASSERT( ad->scale == 0.0f, "H3: adapters are not supported with tensor parallelism yet" ); }
+		k_norm_mod<half><<<rows, 256, 0, stream>>>( xs, nullptr, nullptr, 0, b.n1, sh_a, sc_a, st6, idx, H, cfg.eps, h16 );
+		gemm_h( h16, matrix( b.qkv ), qkv16, rows, 3 * ql, H, false );
+		k_qk_norm_rope<<<dim3( rows, ( 2 * nh + 7 ) / 8 ), 256, 0, stream>>>( qkv16, 3 * ql, b.qn, b.kn, cosb, sinb, q16, k16, nh, cfg.qk_eps );
+		CUDA_CHECK( cudaMemcpy2DAsync( v16, ql * sizeof( half ), qkv16 + 2 * ql, 3 * ql * sizeof( half ), ql * sizeof( half ), rows, cudaMemcpyDeviceToDevice, stream ) );
+		h3_attention( q16, k16, v16, o16, rows, rows, nh, 1.0f / std::sqrt( static_cast<float>( cfg.head_dim ) ), false, stream );
+		gemm_h( o16, matrix( b.out ), br, rows, H, ql, true );
+		tp_comm.sum_f32( br, static_cast<size_t>( rows ) * H, stream );
+		k_norm_mod<half><<<rows, 256, 0, stream>>>( xs, br, g_a, st6, b.n2, sh_m, sc_m, st6, idx, H, cfg.eps, h16 );
+		gemm_h( h16, matrix( b.fc1 ), f1, rows, 2 * Fl, H, false );
+		k_silu_amax<<<rows, 256, 0, stream>>>( f1, rowscale, Fl );
+		tp_comm.max_f32( rowscale, rows, stream );
+		k_silu_apply<<<rows, 256, 0, stream>>>( f1, f2, rowscale, Fl );
+		gemm_h( f2, matrix( b.fc2 ), br, rows, H, Fl, true );
+		tp_comm.sum_f32( br, static_cast<size_t>( rows ) * H, stream );
+		k_add_gated<<<rows, 256, 0, stream>>>( xs, br, rowscale, g_m, st6, idx, H );
+	}
+
 	void run_block( const BlockW& b, float* xs, int rows, const float* adab, const int* idx, bool rope, int lora_layer, int row0 = 0 ) {
+		if ( cfg.tp_ranks > 1 && rope ) { run_block_tp( b, xs, rows, adab, idx ); return; }
 		const int H = cfg.hidden, nh = cfg.heads, qd = nh * cfg.head_dim, F = cfg.ffn;
 		const long st6 = 6L * H;
 		const float *sh_a = nullptr, *sc_a = nullptr, *g_a = nullptr, *sh_m = nullptr, *sc_m = nullptr, *g_m = nullptr;
@@ -478,7 +558,7 @@ bool H3DiT::load( const char* checkpoint, int device, int max_rows, const H3Conf
 	CUBLAS_CHECK( cublasSetStream( s.blas, s.stream ) );
 	CUBLAS_CHECK( cublasSetMathMode( s.blas, CUBLAS_DEFAULT_MATH ) );
 	if ( !engine::loader::safetensors_open( s.st, checkpoint ) ) { return false; }
-	if ( !engine::core::arena_create( s.warena, device, s.st.file_size + ( 1ULL << 30 ) ) ) { return false; }
+	if ( !engine::core::arena_create( s.warena, device, cfg.tp_ranks > 1 ? s.st.file_size / cfg.tp_ranks + ( 3ULL << 30 ) : s.st.file_size + ( 1ULL << 30 ) ) ) { return false; }
 
 	const int H = cfg.hidden;
 	for ( int i = 0; i < cfg.refiner_layers; ++i ) {
@@ -693,6 +773,8 @@ void H3DiT::clear_loras() {
 void H3DiT::set_lora_scale( int id, float scale ) {
 	if ( id >= 0 && id < static_cast<int>( p_->adapters.size() ) ) { p_->adapters[static_cast<size_t>( id )]->scale = scale; }
 }
+
+void H3DiT::set_tp( H3TpComm comm ) { p_->tp_comm = std::move( comm ); }
 
 void H3DiT::set_sp( int rank, int n, H3SpExchange exchange ) {
 	p_->sp_rank = rank;

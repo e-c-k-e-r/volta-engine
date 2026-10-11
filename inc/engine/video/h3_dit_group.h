@@ -24,7 +24,9 @@ public:
 	H3DiTGroup( const H3DiTGroup& ) = delete;
 	H3DiTGroup& operator=( const H3DiTGroup& ) = delete;
 
-	bool load( const char* checkpoint, const std::vector<int>& devices, int max_rows );
+	// tensor_parallel: instead of sequence parallelism, every GPU runs all rows with 1/n of the heads and of the MLP width (a quarter of the weights per GPU), the partial
+	// projections summed over NCCL (needs a build with NCCL). No adapters yet.
+	bool load( const char* checkpoint, const std::vector<int>& devices, int max_rows, bool tensor_parallel = false );
 	int add_lora( const char* path, float scale = 1.0f );
 	void set_lora_scale( int id, float scale );
 	void clear_loras();

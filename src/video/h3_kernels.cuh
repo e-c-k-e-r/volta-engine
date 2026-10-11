@@ -152,5 +152,53 @@ static __global__ void k_silu_mul( const half* f1, half* f2, float* rowscale, in
 }
 
 
+// Tensor-parallel SiLU-mul: the per-row power-of-two scale must come from the whole F, so the max over this rank's slice is written to amax[row], reduced (max) over the
+// ranks, and k_silu_apply then derives the scale from the global value (same arithmetic as k_silu_mul).
+static __global__ void k_silu_amax( const half* f1, float* amax, int F ) {
+	__shared__ float red[32];
+	const int row = blockIdx.x;
+	const half* g = f1 + static_cast<size_t>( row ) * 2 * F;
+	const half* u = g + F;
+	float mx = 0.0f;
+	for ( int c0 = threadIdx.x * 8; c0 < F; c0 += blockDim.x * 8 ) {
+		const uint4 gv = *reinterpret_cast<const uint4*>( g + c0 ), uv = *reinterpret_cast<const uint4*>( u + c0 );
+		const half* gh = reinterpret_cast<const half*>( &gv );
+		const half* uh = reinterpret_cast<const half*>( &uv );
+		#pragma unroll
+		for ( int e = 0; e < 8; ++e ) {
+			const float a = __half2float( gh[e] ), b = __half2float( uh[e] );
+			mx = fmaxf( mx, fabsf( a / ( 1.0f + __expf( -a ) ) * b ) );
+		}
+	}
+	mx = block_max( mx, red );
+	if ( threadIdx.x == 0 ) { amax[row] = mx; }
+}
+
+static __global__ void k_silu_apply( const half* f1, half* f2, float* rowscale, int F ) {
+	const int row = blockIdx.x;
+	const half* g = f1 + static_cast<size_t>( row ) * 2 * F;
+	const half* u = g + F;
+	const float mx = rowscale[row];
+	int e2 = 0;
+	if ( isfinite( mx ) ) { frexpf( mx, &e2 ); }
+	const float s = ldexpf( 1.0f, max( e2 - 11, 0 ) );
+	__syncthreads(); // every thread has read the maximum before it is replaced by the scale
+	if ( threadIdx.x == 0 ) { rowscale[row] = s; }
+	for ( int c0 = threadIdx.x * 8; c0 < F; c0 += blockDim.x * 8 ) {
+		const uint4 gv = *reinterpret_cast<const uint4*>( g + c0 ), uv = *reinterpret_cast<const uint4*>( u + c0 );
+		const half* gh = reinterpret_cast<const half*>( &gv );
+		const half* uh = reinterpret_cast<const half*>( &uv );
+		uint4 ov;
+		half* oh = reinterpret_cast<half*>( &ov );
+		#pragma unroll
+		for ( int e = 0; e < 8; ++e ) {
+			const float a = __half2float( gh[e] ), b = __half2float( uh[e] );
+			oh[e] = __float2half_rn( a / ( 1.0f + __expf( -a ) ) * b / s );
+		}
+		*reinterpret_cast<uint4*>( f2 + static_cast<size_t>( row ) * F + c0 ) = ov;
+	}
+}
+
+
 } // namespace kern
 } // namespace engine::video

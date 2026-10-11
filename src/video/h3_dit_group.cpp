@@ -2,6 +2,9 @@
 #include "engine/core/log.h"
 #include "engine/video/h3_dit.h"
 #include <cuda_runtime.h>
+#if defined( ENGINE_HAVE_NCCL )
+#include <nccl.h>
+#endif
 #include <algorithm>
 #include <condition_variable>
 #include <mutex>
@@ -50,15 +53,28 @@ struct H3DiTGroup::Impl {
 	std::vector<std::vector<cudaStream_t>> pull_streams; // [rank][peer]: one copy stream per peer, so a rank pulls from all its peers at once (one NVLink each)
 	std::vector<std::vector<cudaEvent_t>> pull_done; // [rank][peer]: the pull of the peer's slice into rank has completed
 	std::vector<cudaEvent_t> kv_ready;              // per rank: its K/V slice of the current layer is final
+	bool tp = false;                                // tensor parallel instead of sequence parallel
+#if defined( ENGINE_HAVE_NCCL )
+	std::vector<ncclComm_t> comms;
+#endif
 	std::vector<double> t_sync;                     // per rank: host time at the two barriers per layer, summed over a forward
 };
 
 H3DiTGroup::H3DiTGroup() : p_( new Impl ) {}
-H3DiTGroup::~H3DiTGroup() { delete p_; }
+H3DiTGroup::~H3DiTGroup() {
+#if defined( ENGINE_HAVE_NCCL )
+	for ( ncclComm_t c : p_->comms ) { if ( c ) { ncclCommDestroy( c ); } }
+#endif
+	delete p_;
+}
 int H3DiTGroup::size() const { return static_cast<int>( p_->dits.size() ); }
 
-bool H3DiTGroup::load( const char* checkpoint, const std::vector<int>& devices, int max_rows ) {
+bool H3DiTGroup::load( const char* checkpoint, const std::vector<int>& devices, int max_rows, bool tensor_parallel ) {
 	Impl& s = *p_;
+	s.tp = tensor_parallel && devices.size() > 1;
+#if !defined( ENGINE_HAVE_NCCL )
+	if ( s.tp ) { LOG_ERROR( "H3: tensor parallelism needs a build with NCCL" ); return false; }
+#endif
 	const int n = static_cast<int>( devices.size() );
 	if ( n < 1 ) { return false; }
 	int caller_device = 0;
@@ -87,13 +103,31 @@ bool H3DiTGroup::load( const char* checkpoint, const std::vector<int>& devices, 
 			CUDA_CHECK( cudaSetDevice( devices[r] ) );
 			s.dits[r].reset( new H3DiT() );
 			H3Config cfg;
-			cfg.sp_ranks = n;
+			cfg.sp_ranks = s.tp ? 1 : n;
+			cfg.tp_ranks = s.tp ? n : 1;
+			cfg.tp_rank = r;
 			ok[r] = s.dits[r]->load( checkpoint, devices[r], max_rows, cfg ) ? 1 : 0;
 		} );
 	}
 	for ( auto& t : threads ) { t.join(); }
 	CUDA_CHECK( cudaSetDevice( caller_device ) ); // the peer-access setup walked over all GPUs; leave the caller where it was
 	for ( int r = 0; r < n; ++r ) { if ( !ok[r] ) { return false; } }
+#if defined( ENGINE_HAVE_NCCL )
+	if ( s.tp ) {
+		s.comms.assign( n, nullptr );
+		std::vector<int> devs = devices;
+		if ( ncclCommInitAll( s.comms.data(), n, devs.data() ) != ncclSuccess ) { LOG_ERROR( "H3: NCCL init failed" ); return false; }
+		for ( int r = 0; r < n; ++r ) {
+			ncclComm_t comm = s.comms[r];
+			H3TpComm tc;
+			tc.sum_f32 = [comm]( float* buf, size_t count, void* stream ) { if ( ncclAllReduce( buf, buf, count, ncclFloat, ncclSum, comm, static_cast<cudaStream_t>( stream ) ) != ncclSuccess ) { LOG_ERROR( "H3: NCCL all-reduce failed" ); } };
+			tc.max_f32 = [comm]( float* buf, size_t count, void* stream ) { if ( ncclAllReduce( buf, buf, count, ncclFloat, ncclMax, comm, static_cast<cudaStream_t>( stream ) ) != ncclSuccess ) { LOG_ERROR( "H3: NCCL all-reduce failed" ); } };
+			s.dits[r]->set_tp( std::move( tc ) );
+		}
+		s.t_sync.assign( n, 0.0 );
+		return true;
+	}
+#endif
 	s.pull_streams.assign( n, std::vector<cudaStream_t>( n, nullptr ) );
 	s.pull_done.assign( n, std::vector<cudaEvent_t>( n, nullptr ) );
 	s.t_sync.assign( n, 0.0 );
@@ -178,7 +212,8 @@ bool H3DiTGroup::forward( const H3HostRequest& hr, std::vector<float>* video_out
 	Impl& s = *p_;
 	const int n = static_cast<int>( s.dits.size() );
 	const int U = hr.used;
-	std::vector<float> vall( n > 1 ? static_cast<size_t>( U ) * 96 : 0 ), aall( n > 1 ? static_cast<size_t>( U ) * 32 : 0 );
+	const bool sp = n > 1 && !s.tp;
+	std::vector<float> vall( sp ? static_cast<size_t>( U ) * 96 : 0 ), aall( sp ? static_cast<size_t>( U ) * 32 : 0 );
 	video_out->assign( static_cast<size_t>( hr.n_img ) * 96, 0.0f );
 	audio_out->assign( static_cast<size_t>( hr.n_audio ) * 32, 0.0f );
 	std::vector<std::thread> threads;
@@ -195,13 +230,16 @@ bool H3DiTGroup::forward( const H3HostRequest& hr, std::vector<float>* video_out
 			q.video_rows = d_v; q.audio_rows = d_a; q.prompt = d_p; q.position_ids = d_pos;
 			q.img_pos = d_img; q.audio_pos = d_aud; q.text_pos = d_txt; q.update_mask = d_mask; q.tags = d_tags; q.inverse = d_inv;
 			q.unique_t = hr.unique_t;
-			if ( n == 1 ) {
+			if ( !sp ) { // one GPU, or tensor parallel (every rank computes all rows; rank 0's outputs are returned)
 				float *d_vo = nullptr, *d_ao = nullptr;
 				CUDA_CHECK( cudaMalloc( &d_vo, video_out->size() * sizeof( float ) ) );
 				CUDA_CHECK( cudaMalloc( &d_ao, audio_out->size() * sizeof( float ) ) );
-				s.dits[0]->forward( q, d_vo, d_ao );
-				CUDA_CHECK( cudaMemcpy( video_out->data(), d_vo, video_out->size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
-				CUDA_CHECK( cudaMemcpy( audio_out->data(), d_ao, audio_out->size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
+				s.dits[r]->forward( q, d_vo, d_ao );
+				CUDA_CHECK( cudaDeviceSynchronize() );
+				if ( r == 0 ) {
+					CUDA_CHECK( cudaMemcpy( video_out->data(), d_vo, video_out->size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
+					CUDA_CHECK( cudaMemcpy( audio_out->data(), d_ao, audio_out->size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
+				}
 				cudaFree( d_vo ); cudaFree( d_ao );
 			} else {
 				s.dits[r]->forward_sp( q, vall.data(), aall.data() );
@@ -218,10 +256,10 @@ bool H3DiTGroup::forward( const H3HostRequest& hr, std::vector<float>* video_out
 			sync_max = std::max( sync_max, s.t_sync[r] );
 			s.t_sync[r] = 0;
 		}
-		if ( n > 1 ) { LOG_INFO( "H3: sequence-parallel forward: %.2f s of host time at the layer barriers (maximum over ranks)", sync_max ); }
+		if ( sp ) { LOG_INFO( "H3: sequence-parallel forward: %.2f s of host time at the layer barriers (maximum over ranks)", sync_max ); }
 	}
 
-	if ( n > 1 ) {
+	if ( sp ) {
 		for ( int i = 0; i < hr.n_img; ++i ) {
 			const float m = hr.update_mask[i] ? 1.0f : 0.0f;
 			for ( int c = 0; c < 96; ++c ) { ( *video_out )[static_cast<size_t>( i ) * 96 + c] = vall[static_cast<size_t>( hr.img_pos[i] ) * 96 + c] * m; }

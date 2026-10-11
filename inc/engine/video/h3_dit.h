@@ -28,6 +28,12 @@ struct H3SpExchange {
 	std::function<void( void* )> end;
 };
 
+// Collectives of a tensor-parallel group, enqueued on the DiT's compute stream (the group provides them, e.g. over NCCL)
+struct H3TpComm {
+	std::function<void( float* buf, size_t count, void* stream )> sum_f32; // in place, summed over the ranks
+	std::function<void( float* buf, size_t count, void* stream )> max_f32; // in place, maximum over the ranks
+};
+
 struct H3Config {
 	int hidden = 5376;
 	int layers = 50;
@@ -44,6 +50,7 @@ struct H3Config {
 	float eps = 1e-5f;
 	float qk_eps = 1e-5f;
 	float final_eps = 1e-5f;
+	int tp_rank = 0, tp_ranks = 1; // tensor parallelism: this instance holds the rank-th shard of every projection (heads, MLP width) of the main blocks
 	int sp_ranks = 1;              // sequence-parallel ranks the instance will run with (sizes the per-rank scratch)
 	bool simple_attention = false; // bring-up kernel instead of the WMMA attention (tiny sequences only)
 };
@@ -102,6 +109,8 @@ public:
 	// instance runs the whole sequence as before.
 	void set_sp( int rank, int n, H3SpExchange exchange );
 	half_ptr_pair kv_buffers() const;
+	// Tensor parallelism (cfg.tp_ranks > 1 at load): every rank runs all rows with its shard of the weights and sums the partial projections through `comm`
+	void set_tp( H3TpComm comm );
 	int device() const;
 	// Sequence-parallel forward: outputs for the local rows only, as the full-width heads before row selection (vall [U, 96] and aall [U, 32] on the host,
 	// rows [row0, row0 + rows) written).
