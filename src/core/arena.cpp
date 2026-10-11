@@ -1,4 +1,6 @@
+#include <cstdio>
 #include "engine/core/arena.h"
+#include <cstdio>
 #include "engine/backend/runtime.h"
 
 namespace engine::core {
@@ -43,6 +45,7 @@ void* arena_alloc( pod::MemoryArena& arena, size_t bytes, size_t alignment ) {
 	size_t new_offset = aligned_offset + bytes;
 
 	if ( ENGINE_UNLIKELY( new_offset > arena.total_bytes ) ) {
+		std::fprintf( stderr, "arena: need %zu more bytes at offset %zu of %zu\n", bytes, arena.offset_bytes, arena.total_bytes );
 		ENGINE_ASSERT( false, "MemoryArena out of memory" );
 		return nullptr;
 	}

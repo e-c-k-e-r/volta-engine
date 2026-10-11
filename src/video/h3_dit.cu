@@ -452,30 +452,33 @@ struct H3DiT::Impl {
 	// (6 chunks per modality row, rows indexed by comb) with rotary tables; otherwise the plain refiner block.
 	// The tensor-parallel block: every rank runs all rows with 1/T of the heads and of the MLP width; the attention-output and MLP-down projections produce partial sums
 	// (FP32, the wide-range ones) that are added over the ranks before they enter the residual stream.
-	void run_block_tp( const BlockW& b, float* xs, int rows, const float* adab, const int* idx ) {
+	void run_block_tp( const BlockW& b, float* xs, int rows, const float* adab, const int* idx, int lora_layer ) {
 		const int T = cfg.tp_ranks, H = cfg.hidden, nh = cfg.heads / T, ql = nh * cfg.head_dim, Fl = cfg.ffn / T;
 		const long st6 = 6L * H;
 		const float *sh_a = adab, *sc_a = adab + H, *g_a = adab + 2 * H, *sh_m = adab + 3 * H, *sc_m = adab + 4 * H, *g_m = adab + 5 * H;
-		for ( Adapter* ad : adapters ) { ENGINE_ASSERT( ad->scale == 0.0f, "H3: adapters are not supported with tensor parallelism yet" ); }
 		k_norm_mod<half><<<rows, 256, 0, stream>>>( xs, nullptr, nullptr, 0, b.n1, sh_a, sc_a, st6, idx, H, cfg.eps, h16 );
 		gemm_h( h16, matrix( b.qkv ), qkv16, rows, 3 * ql, H, false );
+		lora_apply( lora_layer, 0, h16, qkv16, rows, H, 3 * ql, false );
 		k_qk_norm_rope<<<dim3( rows, ( 2 * nh + 7 ) / 8 ), 256, 0, stream>>>( qkv16, 3 * ql, b.qn, b.kn, cosb, sinb, q16, k16, nh, cfg.qk_eps );
 		CUDA_CHECK( cudaMemcpy2DAsync( v16, ql * sizeof( half ), qkv16 + 2 * ql, 3 * ql * sizeof( half ), ql * sizeof( half ), rows, cudaMemcpyDeviceToDevice, stream ) );
 		h3_attention( q16, k16, v16, o16, rows, rows, nh, 1.0f / std::sqrt( static_cast<float>( cfg.head_dim ) ), false, stream );
 		gemm_h( o16, matrix( b.out ), br, rows, H, ql, true );
+		lora_apply( lora_layer, 1, o16, br, rows, ql, H, true ); // partial, like the base product: the sum over the ranks is the full delta
 		tp_comm.sum_f32( br, static_cast<size_t>( rows ) * H, stream );
 		k_norm_mod<half><<<rows, 256, 0, stream>>>( xs, br, g_a, st6, b.n2, sh_m, sc_m, st6, idx, H, cfg.eps, h16 );
 		gemm_h( h16, matrix( b.fc1 ), f1, rows, 2 * Fl, H, false );
+		lora_apply( lora_layer, 2, h16, f1, rows, H, 2 * Fl, false );
 		k_silu_amax<<<rows, 256, 0, stream>>>( f1, rowscale, Fl );
 		tp_comm.max_f32( rowscale, rows, stream );
 		k_silu_apply<<<rows, 256, 0, stream>>>( f1, f2, rowscale, Fl );
 		gemm_h( f2, matrix( b.fc2 ), br, rows, H, Fl, true );
+		lora_apply( lora_layer, 3, f2, br, rows, Fl, H, true );
 		tp_comm.sum_f32( br, static_cast<size_t>( rows ) * H, stream );
 		k_add_gated<<<rows, 256, 0, stream>>>( xs, br, rowscale, g_m, st6, idx, H );
 	}
 
 	void run_block( const BlockW& b, float* xs, int rows, const float* adab, const int* idx, bool rope, int lora_layer, int row0 = 0 ) {
-		if ( cfg.tp_ranks > 1 && rope ) { run_block_tp( b, xs, rows, adab, idx ); return; }
+		if ( cfg.tp_ranks > 1 && rope ) { run_block_tp( b, xs, rows, adab, idx, lora_layer ); return; }
 		const int H = cfg.hidden, nh = cfg.heads, qd = nh * cfg.head_dim, F = cfg.ffn;
 		const long st6 = 6L * H;
 		const float *sh_a = nullptr, *sc_a = nullptr, *g_a = nullptr, *sh_m = nullptr, *sc_m = nullptr, *g_m = nullptr;
@@ -674,7 +677,7 @@ int H3DiT::add_lora( const char* path, float scale ) {
 	}
 	size_t bytes = 0;
 	for ( int i = 0; i < f.tensor_count; ++i ) { bytes += f.tensors[i].size_bytes; }
-	if ( !engine::core::arena_create( ad->arena, s.device, bytes + ( 64ull << 20 ) ) ) { engine::loader::safetensors_close( f ); delete ad; return -1; }
+	if ( !engine::core::arena_create( ad->arena, s.device, bytes + ( s.cfg.tp_ranks > 1 ? 512ull << 20 : 64ull << 20 ) ) ) { engine::loader::safetensors_close( f ); delete ad; return -1; }
 	ad->parts.assign( static_cast<size_t>( s.cfg.layers + s.cfg.refiner_layers ) * 4, {} );
 	int rank = 0;
 	auto up = [&]( const std::string& name ) -> const half* {
@@ -728,6 +731,36 @@ int H3DiT::add_lora( const char* path, float scale ) {
 		if ( !part.a || !part.b || bm->shape[1] != am->shape[0] || am->shape[0] > 256 ) {
 			LOG_ERROR( "H3: LoRA tensor pair %s / %s unusable (A %dx%d, B %dx%d)", an.c_str(), bn.c_str(), am->shape[0], am->shape[1], bm->shape[0], bm->shape[1] );
 			return false;
+		}
+		if ( s.cfg.tp_ranks > 1 && L < s.cfg.layers ) {
+			// This rank's shard of the delta. Column-parallel projections (qkv, fc1): A is shared, B keeps the rows of this rank's heads / MLP slice (a row block of B is
+			// contiguous), a fused part is cut into its q / k / v (gate / up) segments. Row-parallel ones (out, fc2): B is shared, A keeps the columns of this rank's
+			// slice; the partial products add up to the full delta after the all-reduce.
+			const int T = s.cfg.tp_ranks, tr = s.cfg.tp_rank, qd = s.cfg.heads * s.cfg.head_dim, ql = qd / T, Fl = s.cfg.ffn / T;
+			ENGINE_ASSERT( part.rank % 8 == 0, "H3: tensor-parallel adapters need a rank that is a multiple of 8" );
+			auto& dst = ad->parts[static_cast<size_t>( L ) * 4 + slot];
+			if ( slot == 0 || slot == 2 ) {
+				const int seg = slot == 0 ? qd : s.cfg.ffn, segl = slot == 0 ? ql : Fl;
+				ENGINE_ASSERT( offset % seg == 0 && part.width % seg == 0, "H3: a tensor-parallel adapter part must cover whole q / k / v (gate / up) segments" );
+				for ( int g = 0; g < part.width / seg; ++g ) {
+					Impl::LoraPart sub = part;
+					sub.b = part.b + static_cast<size_t>( g * seg + tr * segl ) * part.rank;
+					sub.width = segl;
+					sub.offset = ( offset / seg + g ) * segl;
+					dst.push_back( sub );
+					++found;
+				}
+			} else {
+				const int K = slot == 1 ? qd : s.cfg.ffn, kl = slot == 1 ? ql : Fl;
+				ENGINE_ASSERT( am->shape[1] == K && offset == 0, "H3: unexpected adapter shape for a row-parallel projection" );
+				half* a2 = static_cast<half*>( engine::core::arena_alloc( ad->arena, static_cast<size_t>( part.rank ) * kl * sizeof( half ) ) );
+				CUDA_CHECK( cudaMemcpy2D( a2, kl * sizeof( half ), part.a + static_cast<size_t>( tr ) * kl, K * sizeof( half ), kl * sizeof( half ), part.rank, cudaMemcpyDeviceToDevice ) );
+				Impl::LoraPart sub = part;
+				sub.a = a2;
+				dst.push_back( sub );
+				++found;
+			}
+			return true;
 		}
 		ad->parts[static_cast<size_t>( L ) * 4 + slot].push_back( part );
 		++found;
