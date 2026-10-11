@@ -39,6 +39,7 @@ A `model_dir` that is a MiniMax-H3 pipeline directory (it holds `model_index.jso
 | `max_rows` | `--max-rows` | 36000 | largest packed sequence one job may need (a resident transformer is sized for it) |
 | `resident` | `--resident` / `--no-resident` | true | keep the transformer (weights and adapters, on every GPU) loaded between jobs; off loads it for each job and frees it after (about 10 to 15 s slower per job, for machines that share the GPUs). The VAEs, the image encoder and the language-model stack are always loaded per stage: next to the transformer the first GPU has room for one at a time |
 | `resident_idle_s` | `--resident-idle-s` | 0 | with `resident`: free the transformer after this many idle seconds (0 = never) |
+| `tensor_parallel` | `--tensor-parallel` / `--no-tensor-parallel` | false | shard the transformer over `devices` by attention heads and MLP width (a quarter of the weights and of the activations per GPU, so the VAEs and the language model fit next to it) instead of by rows; about 1 s slower per step, needs a build with NCCL; text prompts up to about 8.6K tokens |
 
 ## Options
 

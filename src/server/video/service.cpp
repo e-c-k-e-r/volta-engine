@@ -24,6 +24,13 @@ bool VideoService::init( const ServerConfig& config ) {
 	paths.devices = s.cfg.video.devices;
 	paths.device = s.cfg.video.devices.empty() ? 0 : s.cfg.video.devices[0];
 	paths.resident_rows = s.cfg.video.max_rows;
+	paths.tensor_parallel = s.cfg.video.tensor_parallel && s.cfg.video.devices.size() > 1;
+#if !defined( ENGINE_HAVE_NCCL )
+	if ( paths.tensor_parallel ) {
+		LOG_WARN( "MiniMax-H3 service: tensor_parallel needs a build with NCCL; using sequence parallelism\n" );
+		paths.tensor_parallel = false;
+	}
+#endif
 	s.engine = std::make_unique<engine::video::H3Engine>( paths, s.cfg.video.resident );
 	s.worker = std::thread( [this] { p_->run_loop(); } );
 	LOG_INFO( "MiniMax-H3 service: %zu adapter(s), %zu GPU(s), references %s, models %s, jobs in %s\n", s.adapters.all().size(), s.cfg.video.devices.size(),

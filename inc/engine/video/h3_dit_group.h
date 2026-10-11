@@ -33,6 +33,7 @@ public:
 	void trim();     // frees the activation scratch on every GPU (see H3DiT::trim)
 	bool reserve();
 	int size() const;
+	int max_text_rows() const; // the smallest over the GPUs; 0 before load
 
 	// video_out [n_img, 96] (condition rows zeroed), audio_out [n_audio, 32], host fp32
 	bool forward( const H3HostRequest& req, std::vector<float>* video_out, std::vector<float>* audio_out );

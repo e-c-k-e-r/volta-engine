@@ -50,6 +50,7 @@ struct H3Paths {
 	bool trim_scratch = true;     // H3Engine with a resident transformer: free its activation scratch while the text and decode stages run
 	int resident_rows = 0;        // H3Engine with resident models: packed rows the resident transformer has room for (0 = what the first job needs)
 	std::vector<int> devices;     // GPUs for the DiT (sequence parallel); empty = {device}
+	bool tensor_parallel = false; // shard the DiT over `devices` by heads / MLP width instead of by rows (needs NCCL; less VRAM per GPU, a little slower)
 };
 
 struct H3Lora {

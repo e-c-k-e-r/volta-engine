@@ -68,6 +68,11 @@ H3DiTGroup::~H3DiTGroup() {
 	delete p_;
 }
 int H3DiTGroup::size() const { return static_cast<int>( p_->dits.size() ); }
+int H3DiTGroup::max_text_rows() const {
+	int m = 0;
+	for ( const auto& d : p_->dits ) { m = m == 0 ? d->max_text_rows() : std::min( m, d->max_text_rows() ); }
+	return m;
+}
 
 bool H3DiTGroup::load( const char* checkpoint, const std::vector<int>& devices, int max_rows, bool tensor_parallel ) {
 	Impl& s = *p_;

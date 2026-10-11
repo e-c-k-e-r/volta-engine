@@ -552,8 +552,10 @@ set_target_properties(p2p_check PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_B
 add_executable(test_h3_vae_det tests/2_parity/test_h3_vae_det.cpp)
 target_link_libraries(test_h3_vae_det PRIVATE engine_kernels)
 set_target_properties(test_h3_vae_det PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-find_library(NCCL_LIBRARY nccl)
-if(NCCL_LIBRARY)
+if(ENGINE_BACKEND STREQUAL "CUDA")
+	find_library(NCCL_LIBRARY nccl) # optional: tensor-parallel H3 transformer and bench_allreduce
+endif()
+if(NCCL_LIBRARY AND ENGINE_BACKEND STREQUAL "CUDA")
 	target_compile_definitions(engine_kernels PUBLIC ENGINE_HAVE_NCCL=1)
 	target_link_libraries(engine_kernels PUBLIC ${NCCL_LIBRARY})
 	add_executable(bench_allreduce tests/3_bench/bench_allreduce.cpp)

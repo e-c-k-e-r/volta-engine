@@ -272,7 +272,7 @@ uploads on the legacy stream must be ordered before the decoder's non-blocking s
 Tried and dropped for attention: four warps per block with single-buffered K/V and two blocks per SM (41 TF/s against 54: the extra barriers cost more than the
 occupancy gains), 32-row warp tiles (the FP32 output alone is 64 registers per 16 rows, Q another 64: over the 255 limit), a lazy softmax rescale (-2%).
 
-Tensor parallelism (experimental, `H3_TP=1`, needs NCCL at build time: `ENGINE_HAVE_NCCL` is set when CMake finds it; `H3DiTGroup::load(..., tensor_parallel)`): instead of
+Tensor parallelism (experimental; server option `video.tensor_parallel` / `--tensor-parallel`, `h3_generate --tp`, `H3DiTGroup::load(..., tensor_parallel)`; needs NCCL at build time, `ENGINE_HAVE_NCCL` is set when CMake finds it, otherwise the server warns and keeps sequence parallelism; a prompt longer than the configuration takes, about 8.6K text rows at the default `max_rows`, fails the job with a message): instead of
 every GPU holding the full INT8 transformer and a quarter of the rows, every GPU holds a quarter of the heads and of the MLP width (shards of the ConvRot matrices that
 keep whole 256-groups: out-projection K 7168/4 = 7 groups, MLP-down K 14336/4 = 14 groups) and runs all rows. The attention-output and MLP-down partial products (FP32) are
 summed over NCCL, two all-reduces of 741 MB per layer (7.4 ms each as FP16, `bench_allreduce`); the SiLU row scale is the maximum over the whole MLP width (a small max

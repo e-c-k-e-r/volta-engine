@@ -92,8 +92,7 @@ H3Lease<H3DiTGroup> H3Components::dit( const std::string& checkpoint, const std:
 	// a resident transformer is sized for the largest job the server accepts (paths.resident_rows), so a bigger one never forces a reload
 	const int capacity = resident_ ? std::max( rows, paths_.resident_rows ) : rows;
 	auto group = std::make_unique<H3DiTGroup>();
-	const bool tp = std::getenv( "H3_TP" ) && std::string( std::getenv( "H3_TP" ) ) == "1"; // tensor parallel (experimental: no adapters yet)
-	if ( !group->load( checkpoint.c_str(), devices, capacity, tp ) ) { return {}; }
+	if ( !group->load( checkpoint.c_str(), devices, capacity, paths_.tensor_parallel ) ) { return {}; }
 	if ( resident_ ) {
 		dit_checkpoint_ = checkpoint;
 		dit_devices_ = devices;

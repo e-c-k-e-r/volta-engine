@@ -55,6 +55,10 @@ bool H3Run::denoise() {
 		}
 		H3Lease<H3DiTGroup> dit = comp.dit( dit_path, devices, lay.used );
 		if ( !dit ) { LOG_ERROR( "H3: cannot load %s", dit_path.c_str() ); return false; }
+		if ( lay.text_len > dit->max_text_rows() ) {
+			LOG_ERROR( "H3: the prompt has %d text rows but this transformer configuration takes at most %d (raise max_rows, or use fewer references / a shorter prompt)", lay.text_len, dit->max_text_rows() );
+			return false;
+		}
 		if ( !comp.set_adapters( dit, req.loras ) ) { return false; }
 		res.t_load = seconds_since( t0 );
 		LOG_INFO( "H3: DiT and %zu adapter(s) ready on %zu GPU(s) in %.1f s; %d rows (%d video, %d audio, %d text), %d steps, shifts %g/%g", req.loras.size(), devices.size(), res.t_load, lay.used,

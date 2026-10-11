@@ -549,6 +549,7 @@ H3DiT::~H3DiT() {
 }
 
 size_t H3DiT::weight_bytes() const { return p_->warena.offset_bytes; }
+int H3DiT::max_text_rows() const { return std::min( p_->max_local, 16384 ); }
 
 bool H3DiT::load( const char* checkpoint, int device, int max_rows, const H3Config& cfg ) {
 	Impl& s = *p_;

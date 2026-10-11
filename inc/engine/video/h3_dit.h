@@ -103,6 +103,7 @@ public:
 	std::vector<int> probe_blocks;
 
 	size_t weight_bytes() const;
+	int max_text_rows() const; // most text rows a request may have (the full-width token refiner runs on them)
 
 	// Sequence parallelism over several GPUs, each holding the full weights: this instance owns rows [row0, row0 + rows) of every packed sequence and
 	// all-gathers K and V per layer through `exchange`; the attention runs over the local keys first and then over each peer's slice as it arrives. With n == 1 the
