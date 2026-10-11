@@ -8,6 +8,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <thread>
+
 namespace engine::server {
 
 void Connection::close_locked() {
@@ -152,6 +154,35 @@ void send_error( const ConnPtr& c, int status, const std::string& type, const st
 bool start_sse( const ConnPtr& c ) {
 	static const char head[] = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n";
 	return c->write_all( head, sizeof( head ) - 1 );
+}
+
+void Router::add( const std::string& method, const std::string& path, RouteHandler h, bool blocking ) {
+	routes_.push_back( { method, path, false, blocking, std::move( h ) } );
+}
+
+void Router::add_prefix( const std::string& method, const std::string& prefix, RouteHandler h, bool blocking ) {
+	routes_.push_back( { method, prefix, true, blocking, std::move( h ) } );
+}
+
+bool Router::dispatch( const ConnPtr& conn, const HttpRequest& req ) const {
+	const Route* hit = nullptr;
+	for ( const Route& r : routes_ ) {
+		if ( r.method != "*" && r.method != req.method ) continue;
+		if ( r.prefix ? req.path.compare( 0, r.path.size(), r.path ) != 0 : r.path != req.path ) continue;
+		if ( !r.prefix ) {
+			hit = &r;
+			break;
+		}
+		if ( !hit || r.path.size() > hit->path.size() ) hit = &r; // the longest prefix
+	}
+	if ( !hit ) return false;
+	if ( hit->blocking ) {
+		RouteHandler h = hit->handler;
+		std::thread( [h, conn, req]() { h( conn, req ); } ).detach();
+	} else {
+		hit->handler( conn, req );
+	}
+	return true;
 }
 
 } // namespace engine::server

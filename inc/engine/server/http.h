@@ -2,9 +2,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace engine::server {
 
@@ -52,6 +55,40 @@ private:
 };
 
 using ConnPtr = std::shared_ptr<Connection>;
+
+// A parsed request: the query string is split off the path, header names are lower-cased.
+struct HttpRequest {
+	std::string method;
+	std::string path;
+	std::string query;
+	std::string body;
+	std::map<std::string, std::string> headers;
+
+	std::string header( const std::string& name ) const {
+		auto it = headers.find( name );
+		return it == headers.end() ? std::string() : it->second;
+	}
+};
+
+using RouteHandler = std::function<void( const ConnPtr&, const HttpRequest& )>;
+
+// Method + path table of a server. Exact paths win over prefixes; a method of "*" matches any (the handler answers 405 itself). Handlers run on the epoll thread unless the route
+// is added with blocking = true, which hands the request to a short-lived thread (decoding a large upload, reading a file): the Connection is safe to use from any thread.
+class Router {
+public:
+	void add( const std::string& method, const std::string& path, RouteHandler h, bool blocking = false );
+	void add_prefix( const std::string& method, const std::string& prefix, RouteHandler h, bool blocking = false );
+	// False when no route matches (the caller answers 404).
+	bool dispatch( const ConnPtr& conn, const HttpRequest& req ) const;
+
+private:
+	struct Route {
+		std::string method, path;
+		bool prefix = false, blocking = false;
+		RouteHandler handler;
+	};
+	std::vector<Route> routes_;
+};
 
 const char* http_reason( int status );
 

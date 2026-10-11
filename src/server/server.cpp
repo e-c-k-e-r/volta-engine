@@ -73,6 +73,7 @@ bool VoltaServer::init( const ServerConfig& config ) {
 	model_name_ = slash == std::string::npos ? dir : dir.substr( slash + 1 );
 	openai_ = make_openai_protocol();
 	anthropic_ = make_anthropic_protocol();
+	register_routes();
 
 	if ( !setup_socket() ) {
 		return false;
@@ -174,7 +175,7 @@ void VoltaServer::handle_readable( int fd ) {
 		conn->in.clear();
 		return;
 	}
-	Request req;
+	HttpRequest req;
 	if ( parse_request( conn, &req ) ) {
 		conn->dispatched = true;
 		conn->in.clear();
@@ -182,7 +183,7 @@ void VoltaServer::handle_readable( int fd ) {
 	}
 }
 
-bool VoltaServer::parse_request( const ConnPtr& conn, Request* req ) {
+bool VoltaServer::parse_request( const ConnPtr& conn, HttpRequest* req ) {
 	const size_t header_end = conn->in.find( "\r\n\r\n" );
 	if ( header_end == std::string::npos ) {
 		if ( conn->in.size() > MAX_HEADER_BYTES ) send_error( conn, 413, "invalid_request_error", "request headers too large" );
@@ -210,6 +211,7 @@ bool VoltaServer::parse_request( const ConnPtr& conn, Request* req ) {
 		size_t vb = colon + 1;
 		while ( vb < h.size() && ( h[vb] == ' ' || h[vb] == '\t' ) ) ++vb;
 		const std::string value = h.substr( vb );
+		req->headers[key] = value;
 		if ( key == "content-length" ) {
 			content_length = static_cast<size_t>( std::strtoull( value.c_str(), nullptr, 10 ) );
 		}
@@ -236,34 +238,42 @@ bool VoltaServer::parse_request( const ConnPtr& conn, Request* req ) {
 	req->method = method;
 	req->path = target;
 	const size_t q = req->path.find( '?' );
-	if ( q != std::string::npos ) req->path.erase( q );
+	if ( q != std::string::npos ) {
+		req->query = req->path.substr( q + 1 );
+		req->path.erase( q );
+	}
 	req->body = conn->in.substr( body_start, content_length );
 	return true;
 }
 
-void VoltaServer::dispatch( const ConnPtr& conn, const Request& req ) {
-	const bool get = req.method == "GET";
-	const bool post = req.method == "POST";
-	if ( get && ( req.path == "/health" || req.path == "/" ) ) return handle_health( conn );
-	if ( get && req.path == "/metrics" ) return handle_metrics( conn );
-	if ( get && req.path == "/metrics/prometheus" ) return handle_metrics_prometheus( conn );
-	if ( get && ( req.path == "/monitor" || req.path == "/monitor/" ) ) return handle_monitor( conn );
-	if ( get && req.path == "/api/stats" ) return handle_api_stats( conn );
-	if ( get && req.path == "/api/experts" ) return handle_api_experts( conn );
-	if ( get && req.path == "/v1/models" ) return handle_models( conn );
-	if ( req.path == "/v1/chat/completions" ) {
-		if ( !post ) return send_error( conn, 405, "invalid_request_error", "use POST" );
-		return handle_chat( conn, req, *openai_ );
+void VoltaServer::register_routes() {
+	router_.add( "GET", "/health", [this]( const ConnPtr& c, const HttpRequest& ) { handle_health( c ); } );
+	router_.add( "GET", "/", [this]( const ConnPtr& c, const HttpRequest& ) { handle_health( c ); } );
+	router_.add( "GET", "/metrics", [this]( const ConnPtr& c, const HttpRequest& ) { handle_metrics( c ); } );
+	router_.add( "GET", "/metrics/prometheus", [this]( const ConnPtr& c, const HttpRequest& ) { handle_metrics_prometheus( c ); } );
+	router_.add( "GET", "/monitor", [this]( const ConnPtr& c, const HttpRequest& ) { handle_monitor( c ); } );
+	router_.add( "GET", "/monitor/", [this]( const ConnPtr& c, const HttpRequest& ) { handle_monitor( c ); } );
+	router_.add( "GET", "/api/stats", [this]( const ConnPtr& c, const HttpRequest& ) { handle_api_stats( c ); } );
+	router_.add( "GET", "/api/experts", [this]( const ConnPtr& c, const HttpRequest& ) { handle_api_experts( c ); } );
+	router_.add( "GET", "/v1/models", [this]( const ConnPtr& c, const HttpRequest& ) { handle_models( c ); } );
+	router_.add( "*", "/v1/chat/completions", [this]( const ConnPtr& c, const HttpRequest& r ) {
+		if ( r.method != "POST" ) return send_error( c, 405, "invalid_request_error", "use POST" );
+		handle_chat( c, r, *openai_ );
+	} );
+	if ( anthropic_ ) {
+		router_.add( "*", "/v1/messages", [this]( const ConnPtr& c, const HttpRequest& r ) {
+			if ( r.method != "POST" ) return send_error( c, 405, "invalid_request_error", "use POST", true );
+			handle_chat( c, r, *anthropic_ );
+		} );
+		router_.add( "*", "/v1/messages/count_tokens", [this]( const ConnPtr& c, const HttpRequest& r ) {
+			if ( r.method != "POST" ) return send_error( c, 405, "invalid_request_error", "use POST", true );
+			handle_count_tokens( c, r, *anthropic_ );
+		} );
 	}
-	if ( req.path == "/v1/messages" && anthropic_ ) {
-		if ( !post ) return send_error( conn, 405, "invalid_request_error", "use POST", true );
-		return handle_chat( conn, req, *anthropic_ );
-	}
-	if ( req.path == "/v1/messages/count_tokens" && anthropic_ ) {
-		if ( !post ) return send_error( conn, 405, "invalid_request_error", "use POST", true );
-		return handle_count_tokens( conn, req, *anthropic_ );
-	}
-	send_error( conn, 404, "not_found_error", "unknown endpoint " + req.method + " " + req.path );
+}
+
+void VoltaServer::dispatch( const ConnPtr& conn, const HttpRequest& req ) {
+	if ( !router_.dispatch( conn, req ) ) send_error( conn, 404, "not_found_error", "unknown endpoint " + req.method + " " + req.path );
 }
 
 void VoltaServer::handle_health( const ConnPtr& conn ) {
@@ -319,7 +329,7 @@ void VoltaServer::handle_metrics_prometheus( const ConnPtr& conn ) {
 	send_response( conn, 200, "text/plain; version=0.0.4", std::string( buf, static_cast<size_t>( n ) ) );
 }
 
-void VoltaServer::handle_chat( const ConnPtr& conn, const Request& req, ChatProtocol& protocol ) {
+void VoltaServer::handle_chat( const ConnPtr& conn, const HttpRequest& req, ChatProtocol& protocol ) {
 	const bool anthropic = protocol.anthropic_errors();
 	ChatRequest cr;
 	ApiError err;
@@ -339,7 +349,7 @@ void VoltaServer::handle_chat( const ConnPtr& conn, const Request& req, ChatProt
 	}
 }
 
-void VoltaServer::handle_count_tokens( const ConnPtr& conn, const Request& req, ChatProtocol& protocol ) {
+void VoltaServer::handle_count_tokens( const ConnPtr& conn, const HttpRequest& req, ChatProtocol& protocol ) {
 	ChatRequest cr;
 	ApiError err;
 	int tokens = 0;

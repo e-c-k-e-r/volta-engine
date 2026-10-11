@@ -28,19 +28,14 @@ public:
 	void stop();
 
 private:
-	struct Request {
-		std::string method;
-		std::string path;
-		std::string body;
-	};
-
 	bool setup_socket();
 	void handle_new_connection();
 	void handle_readable( int fd );
 	void sweep_closed();
 	// Returns true when a complete request was parsed out of conn->in; false when more input is needed or the request was rejected.
-	bool parse_request( const ConnPtr& conn, Request* req );
-	void dispatch( const ConnPtr& conn, const Request& req );
+	bool parse_request( const ConnPtr& conn, HttpRequest* req );
+	void register_routes();
+	void dispatch( const ConnPtr& conn, const HttpRequest& req );
 	void handle_health( const ConnPtr& conn );
 	void handle_metrics( const ConnPtr& conn );
 	void handle_models( const ConnPtr& conn );
@@ -48,8 +43,8 @@ private:
 	void handle_monitor( const ConnPtr& conn );
 	void handle_api_stats( const ConnPtr& conn );
 	void handle_api_experts( const ConnPtr& conn );
-	void handle_chat( const ConnPtr& conn, const Request& req, ChatProtocol& protocol );
-	void handle_count_tokens( const ConnPtr& conn, const Request& req, ChatProtocol& protocol );
+	void handle_chat( const ConnPtr& conn, const HttpRequest& req, ChatProtocol& protocol );
+	void handle_count_tokens( const ConnPtr& conn, const HttpRequest& req, ChatProtocol& protocol );
 
 	ServerConfig config_;
 	int listen_fd_ = -1;
@@ -58,6 +53,7 @@ private:
 
 	std::unique_ptr<engine::runtime::Generator> generator_;
 	std::map<int, ConnPtr> conns_; // epoll thread only
+	Router router_;
 	std::unique_ptr<ChatProtocol> openai_;
 	std::unique_ptr<ChatProtocol> anthropic_;
 	std::atomic<uint64_t> next_req_id_{ 1 };
