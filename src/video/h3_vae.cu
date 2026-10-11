@@ -300,6 +300,7 @@ H3Tiles h3_split_tiles( int input_len, int tile_size, int overlap_min, int ratio
 
 struct H3VideoVAE::Impl {
 	H3VaeParams par;
+	H3StageGroup* group = nullptr;
 	int device = 0, max_tokens = 0, batch = 1; // batch: tiles the scratch holds at once
 	pod::SafeTensorsFile st{};
 	pod::MemoryArena warena{}, sarena{};
@@ -325,7 +326,10 @@ struct H3VideoVAE::Impl {
 
 	const pod::SafeTensorMeta* find( const std::string& name ) {
 		const pod::SafeTensorMeta* m = engine::loader::safetensors_find( st, name.c_str() );
-		if ( !m ) { LOG_ERROR( "H3 VAE: missing tensor %s", name.c_str() ); }
+		if ( !m ) {
+			LOG_ERROR( "H3 VAE: missing tensor %s", name.c_str() );
+			if ( group ) { group->abort(); }
+		}
 		return m;
 	}
 
@@ -511,8 +515,14 @@ H3VideoVAE::~H3VideoVAE() {
 const H3VaeParams& H3VideoVAE::params() const { return p_->par; }
 size_t H3VideoVAE::weight_bytes() const { return p_->warena.offset_bytes; }
 
-bool H3VideoVAE::load( const char* dir, int device, int max_tokens ) {
+bool H3VideoVAE::load( const char* dir, int device, int max_tokens, H3StageGroup* group, int rank ) {
 	Impl& s = *p_;
+	struct Guard { // a member that fails must release the others from the group's barriers
+		H3StageGroup* g;
+		bool ok = false;
+		~Guard() { if ( g && !ok ) { g->abort(); } }
+	} guard{ group };
+	s.group = group;
 	s.device = device;
 	s.max_tokens = max_tokens;
 	if ( !h3_read_vae_params( dir, s.par ) ) { return false; }
@@ -525,7 +535,7 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens ) {
 	// decoder weights: 36 x 67M parameters as FP16, small tensors as FP32
 	if ( !engine::core::arena_create( s.warena, device, 6ULL << 30 ) ) { return false; }
 	CUDA_CHECK( cudaStreamCreateWithFlags( &s.lstream, cudaStreamNonBlocking ) );
-	s.stager = new H3Stager( s.lstream );
+	s.stager = new H3Stager( s.lstream, group, rank );
 	CUDA_CHECK( cudaMalloc( &s.staging, 16384ull * 2048 * 4 ) );
 	for ( int i = 0; i < kLayers; ++i ) {
 		const std::string p = "decoder.transformer_blocks." + std::to_string( i );
@@ -604,6 +614,7 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens ) {
 	s.staging = nullptr;
 	cudaStreamDestroy( s.lstream );
 	s.lstream = nullptr;
+	guard.ok = true;
 	return true;
 }
 

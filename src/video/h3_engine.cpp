@@ -1,6 +1,7 @@
 // H3Engine: generation with the models kept loaded between jobs (H3Components) or loaded per job.
 #include "engine/core/log.h"
 #include "h3_components.h"
+#include "h3_stager.h"
 #include "h3_run.h"
 #include <cuda_runtime.h>
 #include <thread>
@@ -54,10 +55,11 @@ std::vector<H3Lease<H3VideoVAE>> H3Components::video_vaes( const std::vector<int
 	for ( int d : devices ) { if ( d != paths_.device ) { order.push_back( d ); } }
 	std::vector<std::unique_ptr<H3VideoVAE>> made( order.size() );
 	std::vector<std::thread> threads;
+	H3StageGroup group( static_cast<int>( order.size() ) ); // one read of the weight file for all GPUs
 	for ( size_t i = 0; i < order.size(); ++i ) {
 		threads.emplace_back( [&, i] {
 			auto vae = std::make_unique<H3VideoVAE>();
-			if ( vae->load( ( paths_.root + "/video_vae" ).c_str(), order[i] ) ) { made[i] = std::move( vae ); }
+			if ( vae->load( ( paths_.root + "/video_vae" ).c_str(), order[i], 4096, &group, static_cast<int>( i ) ) ) { made[i] = std::move( vae ); }
 		} );
 	}
 	for ( std::thread& t : threads ) { t.join(); }

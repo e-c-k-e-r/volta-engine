@@ -10,6 +10,8 @@
 // temporal chunks of 5 latent frames with 2 tokens of overlap, ImageNet pixel de-normalization.
 namespace engine::video {
 
+class H3StageGroup;
+
 struct H3VaeParams {
 	int vae_ratio = 16;
 	int vae_ratio_t = 4;
@@ -37,7 +39,9 @@ public:
 	H3VideoVAE& operator=( const H3VideoVAE& ) = delete;
 
 	// dir: the video_vae component directory (config.json, source/model.safetensors)
-	bool load( const char* dir, int device, int max_tokens = 4096 );
+	// `group` (optional): the decoders of several GPUs loading in parallel share one read of the weight file (see h3_stager.h); every member must be loaded
+	// by its own thread with its own rank, and all must succeed or fail together
+	bool load( const char* dir, int device, int max_tokens = 4096, H3StageGroup* group = nullptr, int rank = 0 );
 
 	// Raw ViT decoder on one tile of denormalized latents d_z [24, T, H, W] (device, fp32); pixels [3, 4T, 16H, 16W] (device, fp32) in the
 	// network's normalized space (before the ImageNet de-normalization).
