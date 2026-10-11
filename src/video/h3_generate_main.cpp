@@ -1,6 +1,7 @@
 // h3_generate: MiniMax-H3 text-to-video-and-audio from the command line.
 //   h3_generate --root <FL2VA dir> --dit <comfy int8 checkpoint> --prompt TEXT --out out.mp4 [--lora PATH[:scale]]... [--steps 4] [--size WxH]
 //               [--frames 124] [--seed 1] [--video-shift S] [--audio-shift S] [--device 0]
+//   keyframes (FL2VA): --image PATH [--frame-index 0|-1]; references (Ref2VA): --dit-ref2va <ref2va checkpoint> --ref-image PATH ... [--ref-audio PATH ...]
 #include "engine/core/log.h"
 #include "engine/loader/image.h"
 #include "engine/video/h3_pipeline.h"
@@ -19,6 +20,7 @@ int main( int argc, char** argv ) {
 		auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
 		if ( a == "--root" ) { paths.root = next(); }
 		else if ( a == "--dit" ) { paths.dit = next(); }
+		else if ( a == "--dit-ref2va" ) { paths.dit_ref2va = next(); }
 		else if ( a == "--device" ) { paths.device = std::atoi( next() ); }
 		else if ( a == "--devices" ) {
 			paths.devices.clear();
@@ -33,6 +35,8 @@ int main( int argc, char** argv ) {
 		else if ( a == "--audio-shift" ) { req.audio_shift = static_cast<float>( std::atof( next() ) ); }
 		else if ( a == "--size" ) { std::sscanf( next(), "%dx%d", &req.width, &req.height ); size_given = true; }
 		else if ( a == "--image" ) { req.images.push_back( next() ); }
+		else if ( a == "--ref-image" ) { req.ref_images.push_back( next() ); }
+		else if ( a == "--ref-audio" ) { req.ref_audios.push_back( next() ); }
 		else if ( a == "--frame-index" ) { req.frame_indices.push_back( std::atoi( next() ) ); }
 		else if ( a == "--lora" ) {
 			std::string v = next();
@@ -44,13 +48,15 @@ int main( int argc, char** argv ) {
 		}
 		else { std::fprintf( stderr, "unknown argument %s\n", a.c_str() ); return 1; }
 	}
-	if ( paths.root.empty() || paths.dit.empty() || req.prompt.empty() || req.out.empty() ) {
+	const bool ref_task = !req.ref_images.empty() || !req.ref_audios.empty();
+	if ( paths.root.empty() || ( paths.dit.empty() && !( ref_task && !paths.dit_ref2va.empty() ) ) || req.prompt.empty() || req.out.empty() ) {
 		std::fprintf( stderr, "usage: h3_generate --root DIR --dit CKPT --prompt TEXT --out FILE.mp4 [--lora PATH[:scale]] [--steps N] [--size WxH] [--frames N] [--seed N] [--devices 0,1,2,3]\n" );
 		return 1;
 	}
-	if ( !req.images.empty() && !size_given ) {
-		// FL2VA: the canvas follows the first image's aspect ratio
-		FILE* f = std::fopen( req.images[0].c_str(), "rb" );
+	const std::string* first_image = !req.images.empty() ? &req.images[0] : ( !req.ref_images.empty() ? &req.ref_images[0] : nullptr );
+	if ( first_image && !size_given ) {
+		// the canvas follows the first image's aspect ratio
+		FILE* f = std::fopen( first_image->c_str(), "rb" );
 		if ( f ) {
 			std::vector<uint8_t> bytes;
 			uint8_t buf[65536];

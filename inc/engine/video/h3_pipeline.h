@@ -44,7 +44,8 @@ int h3_audio_latent_t( double seconds );
 
 struct H3Paths {
 	std::string root; // FL2VA / Ref2VA component directory (text_encoder, video_vae, audio_vae, tokenizer)
-	std::string dit;  // Comfy INT8 ConvRot transformer checkpoint
+	std::string dit;  // Comfy INT8 ConvRot transformer checkpoint (FL2VA: text-to-video and keyframes)
+	std::string dit_ref2va; // the Ref2VA transformer checkpoint (reference images / audio); empty = use `dit`
 	int device = 0;               // GPU for the encoders and decoders
 	std::vector<int> devices;     // GPUs for the DiT (sequence parallel); empty = {device}
 };
@@ -64,6 +65,8 @@ struct H3GenRequest {
 	std::vector<H3Lora> loras;
 	std::vector<std::string> images; // FL2VA keyframe images (1 or 2: first / last frame); empty = text-to-video
 	std::vector<int> frame_indices;  // per image: 0 (first) or -1 (last); empty = [0] for one image, [0, -1] for two
+	std::vector<std::string> ref_images; // Ref2VA reference images (up to 9; resized to a 2048 px short edge)
+	std::vector<std::string> ref_audios; // Ref2VA reference audio clips (up to 3; 2 to 15 s each, 15 s in total; cut to the clip duration)
 	std::string out;             // .mp4 path
 	bool keep_pcm = false;
 	// progress(stage, done, total): stages "images", "text", "load", "denoise" (step done of steps), "decode", "mux"

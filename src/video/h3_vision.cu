@@ -140,7 +140,7 @@ bool H3VisionTower::load( const char* dir, int device, int max_patches ) {
 	for ( int i = 0; i < 3; ++i ) { s.deep[i] = s.load_merger( "model.visual.deepstack_merger_list." + std::to_string( i ) ); }
 	if ( !s.deep[2].fc2_b ) { return false; }
 	const size_t M = static_cast<size_t>( max_patches ), T = M / kMerge;
-	const size_t need = M * kPatchDim * 4 + M * kPatchDim * 2 + M * kH * 4 + M * kHd * 4 * 2 + M * kH * 2 * 6 + M * kMlp * 2 + T * kH * kMerge * 2 * 2 + T * kOut * 2 + ( 32ULL << 20 );
+	const size_t need = M * kPatchDim * 4 + M * kPatchDim * 2 + M * kH * 4 + M * kHd * 4 * 2 + M * kH * 2 * 8 + M * kMlp * 2 + T * kH * kMerge * 2 * 2 + T * kOut * 2 + ( 32ULL << 20 );
 	if ( !engine::core::arena_create( s.sarena, device, need ) ) { return false; }
 	s.d_patch32 = s.alloc<float>( s.sarena, M * kPatchDim );
 	s.d_patches = s.alloc<half>( s.sarena, M * kPatchDim );
