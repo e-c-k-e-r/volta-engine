@@ -263,14 +263,18 @@ kernel runs ~7% slower and shares HBM with the pulls; the attention sections are
 (the GEMMs, 85 to 97 TF/s, are not). Registers are at the 255 limit and the code generation is fragile: small source edits cost up to 12% (use unsigned index
 arithmetic, keep the plain variant separate from the state-carrying ones).
 
-Decode (16 s at 1280x736x124, 3.9 s of it loading the four decoders): 10.3 s are the tiles of the seven clips (28 tiles each, 7 per GPU, ~0.19 s per tile: GEMMs 125 ms
-at 62 to 80 TF/s, attention 26 ms with the native head_dim-64 kernel, was 52 ms padded), placement 0.5 s, audio 0.6 s. The decoder weights go through a pinned-chunk
-stager on a load stream (one decoder: 4.9 GB in 1.3 s); four in parallel are host-memory-bandwidth bound (~4 s). `test_h3_vae_det` checks run-to-run determinism of
-the tile and full decode.
+Decode (14.7 s at 1280x736x124, 3.6 s of it loading the four decoders): ~9.4 s are the tiles of the seven clips (28 tiles each, 7 per GPU: two tiles share a transformer
+pass when the card has the room, so the GEMMs see 3.2K rows; the native head_dim-64 attention kernel; a SiLU-mul that reads its input once), placement 0.5 s, audio 0.6 s.
+The decoder weights go through pinned-chunk stagers on a load stream; the four loads share one ring (`h3_stager.h`: one thread reads each chunk out of the page cache
+once, every GPU DMAs it), 4.2 -> 3.6 s (one decoder alone: 1.3 s). `test_h3_vae_det` checks run-to-run determinism of the tile and full decode (callers' latent
+uploads on the legacy stream must be ordered before the decoder's non-blocking streams: `decode_video` / `decode_tile` synchronize the default stream first).
 
-Left on the table: GEMM batching of two tiles per forward (M 1605 -> 3210 is worth ~5% of the tile), a fused SiLU epilogue, an attention kernel at BQ=64 with two blocks
-per SM or 32-row warp tiles, one host copy broadcast to all four decoder loads, an EXL3 text encoder (streaming 49 GB of BF16 per job is the remaining text cost for
-short prompts), and the overlap of the decode's peer copies with the next clip (placement is only 0.5 s, so little to win).
+Tried and dropped for attention: four warps per block with single-buffered K/V and two blocks per SM (41 TF/s against 54: the extra barriers cost more than the
+occupancy gains), 32-row warp tiles (the FP32 output alone is 64 registers per 16 rows, Q another 64: over the 255 limit), a lazy softmax rescale (-2%).
+
+Left on the table: a fused SiLU epilogue in the GEMM, an attention kernel with explicit MMA instructions instead of WMMA (the P round trip through shared memory is the
+likely limit), an EXL3 text encoder (streaming 49 GB of BF16 per job is the remaining text cost for short prompts) and tensor-parallel sharding of the transformer and
+text tower to free VRAM so the VAEs and the text tower can stay resident (the K/V exchange is already hidden, so TP is a memory project, not a speed one).
 Every run logs fingerprints (prompt, noise, each step's velocity, the final latents) so a change that should not alter results can be checked from the log.
 
 Running it:
