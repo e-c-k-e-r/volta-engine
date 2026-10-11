@@ -1,5 +1,6 @@
 // MiniMax-H3 video VAE decoder (ViT3D) with the checkpoint's spatial tiling and temporal chunking.
 #include "engine/video/h3_vae.h"
+#include "h3_util.h"
 #include "engine/core/arena.h"
 #include "engine/core/log.h"
 #include "engine/loader/safetensors.h"
@@ -231,6 +232,21 @@ __global__ void k_blend_frames( const float* a, const float* src, int Fs, int f0
 	const float w = static_cast<float>( f ) / n;
 	const float b = src[( static_cast<size_t>( c ) * Fs + f0 + f ) * plane + p];
 	dst[( static_cast<size_t>( c ) * Fd + d0 + f ) * plane + p] = a[i] * ( 1.0f - w ) + b * w;
+}
+
+// frames [0, n) of pix [3, Fs, plane] -> RGB8 frames [dst0, dst0 + n) of out [F, H, W, 3] (same conversion as k_to_rgb8)
+__global__ void k_to_rgb8_seg( const float* pix, int Fs, int n, uint8_t* out, int dst0, size_t plane ) {
+	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
+	if ( i >= static_cast<size_t>( n ) * plane ) { return; }
+	const size_t p = i % plane;
+	const int f = static_cast<int>( i / plane );
+	const float mean[3] = { 0.485f, 0.456f, 0.406f }, sd[3] = { 0.229f, 0.224f, 0.225f };
+	#pragma unroll
+	for ( int c = 0; c < 3; ++c ) {
+		float v = pix[( static_cast<size_t>( c ) * Fs + f ) * plane + p] * sd[c] + mean[c];
+		v = fminf( fmaxf( v, 0.0f ), 1.0f );
+		out[( static_cast<size_t>( dst0 + f ) * plane + p ) * 3 + c] = static_cast<uint8_t>( lrintf( v * 255.0f ) );
+	}
 }
 
 // pixel space -> RGB8: clamp(x * std + mean, 0, 1), frames-last layout [F, H, W, 3]
@@ -489,7 +505,7 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens ) {
 	}
 	const size_t S = static_cast<size_t>( max_tokens );
 	size_t need = S * kDim * 4 * 3 + S * 24 * 4 * 4 + S * 4 + S * kPatchPix * 4 + S * kDim * 2 * 2 + S * 3 * kDim * 2 + S * kHeads * 128 * 2 * 4 + S * 2 * kFf * 2 + S * kFf * 2 + ( 64ULL << 20 );
-	if ( !engine::core::arena_create( s.sarena, device, need ) ) { return false; }
+	if ( !h3_scratch_arena_create( s.sarena, device, need ) ) { return false; }
 	s.x = s.alloc<float>( s.sarena, S * kDim );
 	s.br = s.alloc<float>( s.sarena, S * kDim );
 	s.xn = s.alloc<float>( s.sarena, S * kDim );
@@ -512,6 +528,7 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens ) {
 	CUDA_CHECK( cudaMemset( s.qp, 0, S * kHeads * 128 * 2 ) );
 	CUDA_CHECK( cudaMemset( s.kp, 0, S * kHeads * 128 * 2 ) );
 	CUDA_CHECK( cudaMemset( s.vp, 0, S * kHeads * 128 * 2 ) );
+	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against
 	return h3_fmha_available();
 }
 
@@ -536,7 +553,8 @@ bool H3VideoVAE::decode_video( const float* d_z, int T, int H, int W, std::vecto
 	// denormalized copy of the latent
 	float* zd = nullptr;
 	CUDA_CHECK( cudaMalloc( &zd, static_cast<size_t>( 24 ) * T * HW * sizeof( float ) ) );
-	CUDA_CHECK( cudaMemcpy( zd, d_z, static_cast<size_t>( 24 ) * T * HW * sizeof( float ), cudaMemcpyDeviceToDevice ) );
+	// the copy and the kernels below must share one stream: a plain cudaMemcpy runs on the default stream, which is not ordered against the non-blocking stream
+	CUDA_CHECK( cudaMemcpyAsync( zd, d_z, static_cast<size_t>( 24 ) * T * HW * sizeof( float ), cudaMemcpyDeviceToDevice, s.stream ) );
 	k_denorm_latent<<<( 24 * static_cast<size_t>( T ) * HW + 255 ) / 256, 256, 0, s.stream>>>( zd, s.d_mean, s.d_std, static_cast<size_t>( T ) * HW );
 
 	// temporal plan (decode_temporal, non-isolated config)
@@ -555,10 +573,16 @@ bool H3VideoVAE::decode_video( const float* d_z, int T, int H, int W, std::vecto
 			}
 		}
 	}
-	// upper bound of the produced frames: each chunk yields <= chunk_dec - pre_padding frames per part
+	// upper bound of the produced frames: each chunk yields <= chunk_dec - pre_padding frames per part. The frames are blended one segment (at most chunk_dec frames)
+	// at a time and converted to RGB8 right away, so the decode holds no float copy of the whole clip.
 	const int max_frames = num_chunks * chunk_dec + 16;
-	float* dec = nullptr;
-	CUDA_CHECK( cudaMalloc( &dec, static_cast<size_t>( 3 ) * max_frames * plane * sizeof( float ) ) );
+	uint8_t* d8 = nullptr;
+	CUDA_CHECK( cudaMalloc( &d8, static_cast<size_t>( max_frames ) * plane * 3 ) );
+	float* seg = nullptr; // [3, chunk_dec, plane] float scratch of one segment
+	CUDA_CHECK( cudaMalloc( &seg, static_cast<size_t>( 3 ) * chunk_dec * plane * sizeof( float ) ) );
+	auto emit = [&]( int n, int dst0 ) { // seg frames [0, n) -> d8 frames [dst0, dst0 + n)
+		k_to_rgb8_seg<<<( static_cast<size_t>( n ) * plane + 255 ) / 256, 256, 0, s.stream>>>( seg, chunk_dec, n, d8, dst0, plane );
+	};
 	float* overlap = nullptr; // [3, frame_overlap.., H, W]: the previous clip's second part
 	int overlap_frames = 0;
 	int write = 0;
@@ -581,15 +605,17 @@ bool H3VideoVAE::decode_video( const float* d_z, int T, int H, int W, std::vecto
 				if ( overlap ) {
 					const int nb = std::min( frame_overlap, std::min( overlap_frames, nf ) );
 					ENGINE_ASSERT( nb == overlap_frames, "H3 VAE: temporal overlap must equal the blend extent" );
-					k_blend_frames<<<( static_cast<size_t>( 3 ) * nb * plane + 255 ) / 256, 256, 0, s.stream>>>( overlap, cd, Fc, a, dec, max_frames, write, nb, plane );
+					k_blend_frames<<<( static_cast<size_t>( 3 ) * nb * plane + 255 ) / 256, 256, 0, s.stream>>>( overlap, cd, Fc, a, seg, chunk_dec, 0, nb, plane );
 					if ( nb < nf ) {
-						k_copy_frames<<<( static_cast<size_t>( 3 ) * ( nf - nb ) * plane + 255 ) / 256, 256, 0, s.stream>>>( cd, Fc, a + nb, dec, max_frames, write + nb, nf - nb, plane );
+						k_copy_frames<<<( static_cast<size_t>( 3 ) * ( nf - nb ) * plane + 255 ) / 256, 256, 0, s.stream>>>( cd, Fc, a + nb, seg, chunk_dec, nb, nf - nb, plane );
 					}
+					emit( nf, write );
 					CUDA_CHECK( cudaStreamSynchronize( s.stream ) );
 					CUDA_CHECK( cudaFree( overlap ) );
 					overlap = nullptr;
 				} else {
-					k_copy_frames<<<( static_cast<size_t>( 3 ) * nf * plane + 255 ) / 256, 256, 0, s.stream>>>( cd, Fc, a, dec, max_frames, write, nf, plane );
+					k_copy_frames<<<( static_cast<size_t>( 3 ) * nf * plane + 255 ) / 256, 256, 0, s.stream>>>( cd, Fc, a, seg, chunk_dec, 0, nf, plane );
+					emit( nf, write );
 				}
 				write += nf;
 			} else {
@@ -603,28 +629,22 @@ bool H3VideoVAE::decode_video( const float* d_z, int T, int H, int W, std::vecto
 		CUDA_CHECK( cudaFree( cd ) );
 	}
 	if ( overlap ) {
-		k_copy_frames<<<( static_cast<size_t>( 3 ) * overlap_frames * plane + 255 ) / 256, 256, 0, s.stream>>>( overlap, overlap_frames, 0, dec, max_frames, write, overlap_frames, plane );
+		k_copy_frames<<<( static_cast<size_t>( 3 ) * overlap_frames * plane + 255 ) / 256, 256, 0, s.stream>>>( overlap, overlap_frames, 0, seg, chunk_dec, 0, overlap_frames, plane );
+		emit( overlap_frames, write );
 		write += overlap_frames;
 		CUDA_CHECK( cudaStreamSynchronize( s.stream ) );
 		CUDA_CHECK( cudaFree( overlap ) );
 	}
 	frames = write - pad_frames;
-	if ( frames <= 0 ) { return false; }
-	// dec is [3, max_frames, ...]; compact to [3, frames, ...] for the converter
-	float* comp = nullptr;
-	CUDA_CHECK( cudaMalloc( &comp, static_cast<size_t>( 3 ) * frames * plane * sizeof( float ) ) );
-	k_copy_frames<<<( static_cast<size_t>( 3 ) * frames * plane + 255 ) / 256, 256, 0, s.stream>>>( dec, max_frames, 0, comp, frames, 0, frames, plane );
-	uint8_t* d8 = nullptr;
-	CUDA_CHECK( cudaMalloc( &d8, static_cast<size_t>( frames ) * plane * 3 ) );
-	k_to_rgb8<<<( static_cast<size_t>( frames ) * plane + 255 ) / 256, 256, 0, s.stream>>>( comp, d8, frames, plane );
-	rgb.resize( static_cast<size_t>( frames ) * plane * 3 );
-	CUDA_CHECK( cudaMemcpyAsync( rgb.data(), d8, rgb.size(), cudaMemcpyDeviceToHost, s.stream ) );
+	if ( frames > 0 ) {
+		rgb.resize( static_cast<size_t>( frames ) * plane * 3 );
+		CUDA_CHECK( cudaMemcpyAsync( rgb.data(), d8, rgb.size(), cudaMemcpyDeviceToHost, s.stream ) );
+	}
 	CUDA_CHECK( cudaStreamSynchronize( s.stream ) );
+	CUDA_CHECK( cudaFree( seg ) );
 	CUDA_CHECK( cudaFree( d8 ) );
-	CUDA_CHECK( cudaFree( comp ) );
-	CUDA_CHECK( cudaFree( dec ) );
 	CUDA_CHECK( cudaFree( zd ) );
-	return true;
+	return frames > 0;
 }
 
 } // namespace engine::video

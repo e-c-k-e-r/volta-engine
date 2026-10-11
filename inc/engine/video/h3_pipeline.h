@@ -47,6 +47,8 @@ struct H3Paths {
 	std::string dit;  // Comfy INT8 ConvRot transformer checkpoint (FL2VA: text-to-video and keyframes)
 	std::string dit_ref2va; // the Ref2VA transformer checkpoint (reference images / audio); empty = use `dit`
 	int device = 0;               // GPU for the encoders and decoders
+	bool trim_scratch = true;     // H3Engine with a resident transformer: free its activation scratch while the text and decode stages run
+	int resident_rows = 0;        // H3Engine with resident models: packed rows the resident transformer has room for (0 = what the first job needs)
 	std::vector<int> devices;     // GPUs for the DiT (sequence parallel); empty = {device}
 };
 
@@ -81,6 +83,25 @@ struct H3GenResult {
 	double t_text = 0, t_load = 0, t_denoise = 0, t_decode = 0, t_mux = 0;
 };
 
+// One generation with the models loaded for the run and freed stage by stage
 bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* result = nullptr );
+
+// Generation that can keep the transformer loaded between jobs: with `resident` it stays on every GPU of paths.devices (weights and staged adapters; its activation
+// scratch is freed during the text and decode stages) and a following job with the same checkpoint skips the ~15 s load. The VAEs, the image encoder and the
+// language-model stack are loaded per stage: next to the transformer the first GPU has room for one of them at a time. Not thread safe: one job at a time.
+class H3Engine {
+public:
+	H3Engine( const H3Paths& paths, bool resident );
+	~H3Engine();
+	H3Engine( const H3Engine& ) = delete;
+	H3Engine& operator=( const H3Engine& ) = delete;
+
+	bool generate( const H3GenRequest& req, H3GenResult* result = nullptr );
+	void release(); // frees the resident transformer (the next job loads it again)
+
+private:
+	struct Impl;
+	Impl* p_;
+};
 
 } // namespace engine::video

@@ -2,6 +2,7 @@
 #include "engine/core/log.h"
 #include "engine/video/h3_dit_group.h"
 #include "h3_run.h"
+#include "h3_util.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -46,20 +47,19 @@ bool H3Run::denoise() {
 	std::vector<int> devices = paths.devices;
 	if ( devices.empty() ) { devices.push_back( paths.device ); }
 	{
-		H3DiTGroup dit;
 		const std::string& dit_path = ref2va && !paths.dit_ref2va.empty() ? paths.dit_ref2va : paths.dit;
 		if ( ref2va ) {
 			std::string low = dit_path;
 			std::transform( low.begin(), low.end(), low.begin(), []( unsigned char c ) { return static_cast<char>( std::tolower( c ) ); } );
 			if ( low.find( "ref2va" ) == std::string::npos ) { LOG_WARN( "H3: Ref2VA needs the Ref2VA transformer, but %s does not look like one (set dit_ref2va / --dit-ref2va)", dit_path.c_str() ); }
 		}
-		if ( !dit.load( dit_path.c_str(), devices, lay.used ) ) { LOG_ERROR( "H3: cannot load %s", dit_path.c_str() ); return false; }
-		for ( const H3Lora& l : req.loras ) {
-			if ( dit.add_lora( l.path.c_str(), l.scale ) < 0 ) { LOG_ERROR( "H3: cannot use LoRA %s", l.path.c_str() ); return false; }
-		}
+		H3Lease<H3DiTGroup> dit = comp.dit( dit_path, devices, lay.used );
+		if ( !dit ) { LOG_ERROR( "H3: cannot load %s", dit_path.c_str() ); return false; }
+		if ( !comp.set_adapters( dit, req.loras ) ) { return false; }
 		res.t_load = seconds_since( t0 );
 		LOG_INFO( "H3: DiT and %zu adapter(s) ready on %zu GPU(s) in %.1f s; %d rows (%d video, %d audio, %d text), %d steps, shifts %g/%g", req.loras.size(), devices.size(), res.t_load, lay.used,
 			lay.n_img, lay.n_audio, lay.text_len, req.steps, video_shift, req.audio_shift );
+		LOG_INFO( "H3: inputs fingerprint noise %016llx prompt %016llx", static_cast<unsigned long long>( h3_fingerprint( arows, h3_fingerprint( vrows ) ) ), static_cast<unsigned long long>( h3_fingerprint( prompt ) ) );
 		H3HostRequest r;
 		r.used = lay.used; r.text_len = lay.text_len; r.n_img = lay.n_img; r.n_audio = lay.n_audio;
 		r.prompt = std::move( prompt );
@@ -89,9 +89,9 @@ bool H3Run::denoise() {
 			r.unique_t = uniq;
 			r.video_rows = vrows;
 			r.audio_rows = arows;
-			if ( !dit.forward( r, &vout, &aout ) ) { return false; }
+			if ( !dit->forward( r, &vout, &aout ) ) { return false; }
 			{ double sum = 0, sa2 = 0; size_t bad = 0; for ( float v : vout ) { if ( !std::isfinite( v ) ) { ++bad; } else { sum += std::fabs( v ); } } for ( float v : aout ) { if ( std::isfinite( v ) ) { sa2 += std::fabs( v ); } }
-				LOG_INFO( "H3: step %d velocity |v|_1 %.6f |a|_1 %.6f, %zu non-finite", step, sum, sa2, bad ); }
+				LOG_INFO( "H3: step %d velocity |v|_1 %.6f |a|_1 %.6f, %zu non-finite, fingerprint %016llx", step, sum, sa2, bad, static_cast<unsigned long long>( h3_fingerprint( aout, h3_fingerprint( vout ) ) ) ); }
 			// Euler (eta 0): x += (sigma_curr - sigma_next) * v; condition rows stay at their anchors
 			const float cv = static_cast<float>( sv[step] - sv[step + 1] ), ca = static_cast<float>( sa[step] - sa[step + 1] );
 			for ( size_t i = static_cast<size_t>( n_cond ) * 96; i < vrows.size(); ++i ) { vrows[i] += cv * vout[i]; }

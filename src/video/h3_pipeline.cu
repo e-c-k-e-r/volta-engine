@@ -263,21 +263,4 @@ bool H3Run::plan_shape() {
 	return true;
 }
 
-bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* result ) {
-	CUDA_CHECK( cudaSetDevice( paths.device ) );
-	H3Run run( paths, req );
-	bool ok = false;
-	do {
-		if ( !run.plan_shape() ) { break; }
-		if ( !run.encode_references() || run.cancelled() ) { break; }
-		if ( !run.encode_prompt() ) { break; }
-		run.plan_denoise();
-		if ( run.cancelled() || !run.denoise() || run.cancelled() ) { break; }
-		if ( !run.decode() || !run.mux() ) { break; }
-		ok = true;
-	} while ( false );
-	if ( result ) { *result = run.res; }
-	return ok;
-}
-
 } // namespace engine::video

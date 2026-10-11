@@ -17,6 +17,7 @@ struct VideoService::Impl {
 	JobStore jobs;
 	SystemStats sys;
 	double started_at = 0;
+	std::unique_ptr<engine::video::H3Engine> engine; // the models, resident between jobs unless video.resident is off
 	std::thread worker;
 
 	void run_loop();                 // the worker: takes queued jobs one at a time

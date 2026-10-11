@@ -5,6 +5,7 @@
 #include "engine/loader/safetensors.h"
 #include "engine/video/h3_fmha.h"
 #include "h3_kernels.cuh"
+#include "h3_util.h"
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -486,14 +487,24 @@ bool H3DiT::load( const char* checkpoint, int device, int max_rows, const H3Conf
 	LOG_INFO( "H3: attention kernel %s", s.use_fmha ? "CUTLASS FMHA" : "simple (slow)" );
 	CUDA_CHECK( cudaFuncSetAttribute( k_attn_simple, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304 - 1024 ) );
 
+	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against
+	return reserve();
+}
+
+// Activation scratch sized for max_rows (allocated by load; a resident transformer frees it after a job with trim() and takes it back with reserve())
+bool H3DiT::reserve() {
+	Impl& s = *p_;
+	if ( s.sarena.base_ptr ) { return true; }
+	CUDA_CHECK( cudaSetDevice( s.device ) );
+	const int H = s.cfg.hidden;
 	// scratch sized for max_rows
-	const size_t U = static_cast<size_t>( max_rows ), qd = static_cast<size_t>( cfg.heads ) * cfg.head_dim, F = cfg.ffn;
+	const size_t U = static_cast<size_t>( s.max_rows ), qd = static_cast<size_t>( s.cfg.heads ) * s.cfg.head_dim, F = s.cfg.ffn;
 	// rows owned by one rank (row-local activations); the residual stream, rope tables and the K/V all-gather buffers cover the whole sequence
-	const size_t UL = cfg.sp_ranks > 1 ? std::max<size_t>( ( U + cfg.sp_ranks - 1 ) / cfg.sp_ranks, 8192 ) : U;
+	const size_t UL = s.cfg.sp_ranks > 1 ? std::max<size_t>( ( U + s.cfg.sp_ranks - 1 ) / s.cfg.sp_ranks, 8192 ) : U;
 	size_t need = U * H * 4 + UL * H * 4 + U * 4 + UL * 4 + UL * 3 * qd * 2 + UL * qd * 2 * 4 + UL * 2 * F * 2 + UL * F * 2 + UL * H * 2 + U * 48 * 4 * 2 + UL * 128 * 4 + 64ull * 3 * 6 * H * 4 +
 		static_cast<size_t>( 28672 ) * 5376 * 2 + U * qd * 2 * 2 + UL * 256 * 2 + ( 64ull << 20 );
 	need += 16384ull * H * 4; // refiner stream (text rows)
-	if ( !engine::core::arena_create( s.sarena, device, need ) ) { return false; }
+	if ( !h3_scratch_arena_create( s.sarena, s.device, need ) ) { return false; }
 	s.x = s.alloc<float>( s.sarena, U * H );
 	s.br = s.alloc<float>( s.sarena, UL * H );
 	s.tx = s.alloc<float>( s.sarena, 16384ull * H );
@@ -519,6 +530,15 @@ bool H3DiT::load( const char* checkpoint, int device, int max_rows, const H3Conf
 	s.kfull = s.alloc<half>( s.sarena, U * qd );
 	s.vfull = s.alloc<half>( s.sarena, U * qd );
 	return true;
+}
+
+void H3DiT::trim() {
+	Impl& s = *p_;
+	if ( !s.sarena.base_ptr ) { return; }
+	CUDA_CHECK( cudaSetDevice( s.device ) );
+	CUDA_CHECK( cudaDeviceSynchronize() );
+	engine::core::arena_destroy( s.sarena );
+	s.sarena = pod::MemoryArena{};
 }
 
 int H3DiT::add_lora( const char* path, float scale ) {
@@ -630,6 +650,17 @@ int H3DiT::add_lora( const char* path, float scale ) {
 	s.adapters.push_back( ad );
 	LOG_INFO( "H3: LoRA %s: %d targets, rank %d, alpha %g, scale %g", path, found, rank, alpha, scale );
 	return static_cast<int>( s.adapters.size() ) - 1;
+}
+
+void H3DiT::clear_loras() {
+	Impl& s = *p_;
+	CUDA_CHECK( cudaSetDevice( s.device ) );
+	CUDA_CHECK( cudaDeviceSynchronize() );
+	for ( Impl::Adapter* a : s.adapters ) {
+		if ( a->arena.base_ptr ) { engine::core::arena_destroy( a->arena ); }
+		delete a;
+	}
+	s.adapters.clear();
 }
 
 void H3DiT::set_lora_scale( int id, float scale ) {

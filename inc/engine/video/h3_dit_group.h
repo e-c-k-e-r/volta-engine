@@ -27,6 +27,9 @@ public:
 	bool load( const char* checkpoint, const std::vector<int>& devices, int max_rows );
 	int add_lora( const char* path, float scale = 1.0f );
 	void set_lora_scale( int id, float scale );
+	void clear_loras();
+	void trim();     // frees the activation scratch on every GPU (see H3DiT::trim)
+	bool reserve();
 	int size() const;
 
 	// video_out [n_img, 96] (condition rows zeroed), audio_out [n_audio, 32], host fp32

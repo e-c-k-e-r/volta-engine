@@ -4,6 +4,7 @@
 #include "engine/video/h3_text.h"
 #include "engine/video/h3_vision.h"
 #include "h3_run.h"
+#include "h3_util.h"
 #include <algorithm>
 #include <cstdio>
 
@@ -81,6 +82,7 @@ bool H3Run::encode_prompt() {
 	prompt.resize( ids.size() * 5120 );
 	CUDA_CHECK( cudaMemcpy( prompt.data(), d_prompt, prompt.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
 	cudaFree( d_prompt );
+	LOG_INFO( "H3: prompt fingerprint %016llx", static_cast<unsigned long long>( h3_fingerprint( prompt ) ) );
 	LOG_INFO( "H3: prompt %d tokens (%zu image(s)) encoded in %.1f s", static_cast<int>( ids.size() ), feats.size(), res.t_text );
 	return true;
 }

@@ -162,10 +162,19 @@ bool JobStore::remove( const JobPtr& j, std::string* error ) {
 	return true;
 }
 
-JobPtr JobStore::next() {
+JobPtr JobStore::next( double idle_s, bool* idle ) {
 	std::unique_lock<std::mutex> lk( mu_ );
+	if ( idle ) *idle = false;
 	for ( ;; ) {
-		cv_.wait( lk, [this] { return stopping_ || !queue_.empty(); } );
+		const auto ready = [this] { return stopping_ || !queue_.empty(); };
+		if ( idle_s > 0 ) {
+			if ( !cv_.wait_for( lk, std::chrono::duration<double>( idle_s ), ready ) ) {
+				if ( idle ) *idle = true;
+				return nullptr;
+			}
+		} else {
+			cv_.wait( lk, ready );
+		}
 		if ( stopping_ ) return nullptr;
 		const int id = queue_.front();
 		queue_.pop_front();

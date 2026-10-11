@@ -3,6 +3,7 @@
 #include "engine/config.h"
 #include <cstddef>
 #include <string>
+#include <functional>
 #include <vector>
 
 // MiniMax-H3 text conditioning: the Qwen3-VL text tower's first 50 decoder layers (no final norm) over plain prompt tokens.
@@ -34,6 +35,9 @@ public:
 	bool encode_mm( const std::vector<int>& ids, int image_token_id, const std::vector<H3ImageFeatures>& images, float* d_out );
 
 	int hidden() const { return 5120; }
+
+	// Debug hook: called after every decoder layer with the residual stream [S, 5120] (device, fp32)
+	std::function<void( int layer, const float* d_x, int S )> probe;
 
 private:
 	struct Impl;

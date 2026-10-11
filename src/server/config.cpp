@@ -116,6 +116,8 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 			else if ( k == "dit_ref2va" && it->is_string() ) video.dit_ref2va = it->get<std::string>();
 			else if ( k == "out_dir" && it->is_string() ) video.out_dir = it->get<std::string>();
 			else if ( k == "max_rows" && it->is_number_integer() ) video.max_rows = it->get<int>();
+			else if ( k == "resident" && it->is_boolean() ) video.resident = it->get<bool>();
+			else if ( k == "resident_idle_s" && it->is_number_integer() ) video.resident_idle_s = it->get<int>();
 			else if ( k == "lora_dirs" && it->is_array() ) {
 				for ( const auto& d : *it ) if ( d.is_string() ) video.lora_dirs.push_back( d.get<std::string>() );
 			}
@@ -178,7 +180,9 @@ A `model_dir` that is a MiniMax-H3 pipeline directory (it holds `model_index.jso
 | `lora_dirs` | `--lora-dir` (repeatable) | none | directories scanned for adapters (turbo and community LoRAs) |
 | `out_dir` | `--out-dir` | `h3_jobs` | job history and results |
 | `devices` | `--devices 0,1,2,3` | the first `tp_size` GPUs | GPUs of the transformer |
-| `max_rows` | `--max-rows` | 36000 | largest packed sequence one job may need |
+| `max_rows` | `--max-rows` | 36000 | largest packed sequence one job may need (a resident transformer is sized for it) |
+| `resident` | `--resident` / `--no-resident` | true | keep the transformer (weights and adapters, on every GPU) loaded between jobs; off loads it for each job and frees it after (about 10 to 15 s slower per job, for machines that share the GPUs). The VAEs, the image encoder and the language-model stack are always loaded per stage: next to the transformer the first GPU has room for one at a time |
+| `resident_idle_s` | `--resident-idle-s` | 0 | with `resident`: free the transformer after this many idle seconds (0 = never) |
 
 ## Options
 
@@ -270,6 +274,15 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 		}
 		else if ( std::strcmp( argv[i], "--out-dir" ) == 0 && i + 1 < argc ) {
 			video.out_dir = argv[++i];
+		}
+		else if ( std::strcmp( argv[i], "--resident" ) == 0 ) {
+			video.resident = true;
+		}
+		else if ( std::strcmp( argv[i], "--no-resident" ) == 0 ) {
+			video.resident = false;
+		}
+		else if ( std::strcmp( argv[i], "--resident-idle-s" ) == 0 && i + 1 < argc ) {
+			video.resident_idle_s = std::atoi( argv[++i] );
 		}
 		else if ( std::strcmp( argv[i], "--max-rows" ) == 0 && i + 1 < argc ) {
 			video.max_rows = std::atoi( argv[++i] );

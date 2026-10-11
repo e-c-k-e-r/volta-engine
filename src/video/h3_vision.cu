@@ -1,5 +1,6 @@
 // H3 vision tower (see h3_vision.h).
 #include "engine/video/h3_vision.h"
+#include "h3_util.h"
 #include "engine/core/arena.h"
 #include "engine/core/log.h"
 #include "engine/loader/safetensors.h"
@@ -141,7 +142,7 @@ bool H3VisionTower::load( const char* dir, int device, int max_patches ) {
 	if ( !s.deep[2].fc2_b ) { return false; }
 	const size_t M = static_cast<size_t>( max_patches ), T = M / kMerge;
 	const size_t need = M * kPatchDim * 4 + M * kPatchDim * 2 + M * kH * 4 + M * kHd * 4 * 2 + M * kH * 2 * 8 + M * kMlp * 2 + T * kH * kMerge * 2 * 2 + T * kOut * 2 + ( 32ULL << 20 );
-	if ( !engine::core::arena_create( s.sarena, device, need ) ) { return false; }
+	if ( !h3_scratch_arena_create( s.sarena, device, need ) ) { return false; }
 	s.d_patch32 = s.alloc<float>( s.sarena, M * kPatchDim );
 	s.d_patches = s.alloc<half>( s.sarena, M * kPatchDim );
 	s.d_pos = s.alloc<half>( s.sarena, M * kH );
@@ -158,6 +159,7 @@ bool H3VisionTower::load( const char* dir, int device, int max_patches ) {
 	s.d_merged = s.alloc<half>( s.sarena, T * kH * kMerge );
 	s.d_f1 = s.alloc<half>( s.sarena, T * kH * kMerge );
 	s.d_o = s.alloc<half>( s.sarena, T * kOut );
+	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against
 	return true;
 }
 

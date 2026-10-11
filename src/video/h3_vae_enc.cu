@@ -268,6 +268,7 @@ bool H3ImageEncoder::load( const char* dir, int device ) {
 	s.norm_out = s.load_norm( "encoder.norm_out" );
 	s.conv_out = s.load_conv( "encoder.conv_out", 3 );
 	s.quant = s.load_conv( "quant_conv", 1 );
+	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against
 	return s.conv_in.w && s.quant.w;
 }
 

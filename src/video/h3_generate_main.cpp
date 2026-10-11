@@ -5,6 +5,7 @@
 #include "engine/core/log.h"
 #include "engine/loader/image.h"
 #include "engine/video/h3_pipeline.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,12 +15,16 @@
 int main( int argc, char** argv ) {
 	engine::video::H3Paths paths;
 	engine::video::H3GenRequest req;
-	bool size_given = false;
+	bool size_given = false, resident = false;
+	int repeat = 1;
 	for ( int i = 1; i < argc; ++i ) {
 		const std::string a = argv[i];
 		auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
 		if ( a == "--root" ) { paths.root = next(); }
 		else if ( a == "--dit" ) { paths.dit = next(); }
+		else if ( a == "--resident" ) { resident = true; }
+		else if ( a == "--no-trim" ) { paths.trim_scratch = false; }
+		else if ( a == "--repeat" ) { repeat = std::max( 1, std::atoi( next() ) ); }
 		else if ( a == "--dit-ref2va" ) { paths.dit_ref2va = next(); }
 		else if ( a == "--device" ) { paths.device = std::atoi( next() ); }
 		else if ( a == "--devices" ) {
@@ -69,11 +74,18 @@ int main( int argc, char** argv ) {
 			if ( engine::loader::decode_image( bytes.data(), bytes.size(), &di, &err ) ) { engine::video::h3_output_canvas( static_cast<double>( di.width ) / di.height, &req.height, &req.width ); }
 		}
 	}
+	// --repeat N runs the same job N times in this process (with --resident the transformer stays loaded in between): a regression check for the resident path
+	engine::video::H3Engine engine( paths, resident );
 	engine::video::H3GenResult r;
-	const bool ok = engine::video::h3_generate( paths, req, &r );
-	if ( ok ) {
-		std::printf( "done: %d frames %dx%d, %d rows; text %.1f s, load %.1f s, denoise %.1f s, decode %.1f s, mux %.1f s\n", r.frames, r.width, r.height, r.rows, r.t_text, r.t_load,
-			r.t_denoise, r.t_decode, r.t_mux );
+	bool ok = true;
+	const std::string out = req.out;
+	for ( int i = 0; i < repeat && ok; ++i ) {
+		if ( repeat > 1 ) { req.out = out.substr( 0, out.rfind( '.' ) ) + "_" + std::to_string( i ) + out.substr( out.rfind( '.' ) ); }
+		ok = engine.generate( req, &r );
+		if ( ok ) {
+			std::printf( "done: %d frames %dx%d, %d rows; text %.1f s, load %.1f s, denoise %.1f s, decode %.1f s, mux %.1f s\n", r.frames, r.width, r.height, r.rows, r.t_text, r.t_load,
+				r.t_denoise, r.t_decode, r.t_mux );
+		}
 	}
 	return ok ? 0 : 1;
 }

@@ -1,5 +1,6 @@
 // Streaming Qwen3 text tower for the H3 conditioning (see h3_text.h).
 #include "engine/video/h3_text.h"
+#include "h3_util.h"
 #include "engine/core/arena.h"
 #include "engine/core/log.h"
 #include "engine/loader/safetensors.h"
@@ -167,6 +168,7 @@ struct H3TextEncoder::Impl {
 		half* d = alloc<half>( slot_arena[s], n );
 		CUDA_CHECK( cudaMemcpyAsync( staging, repo.cpu_data( name.c_str() ), m->size_bytes, cudaMemcpyHostToDevice, ps ) );
 		k_convert<__nv_bfloat16, half><<<2048, 256, 0, ps>>>( static_cast<const __nv_bfloat16*>( staging ), d, n );
+		CUDA_CHECK( cudaGetLastError() );
 		CUDA_CHECK( cudaStreamSynchronize( ps ) ); // the staging buffer is reused by the next tensor
 		return d;
 	}
@@ -256,13 +258,15 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	if ( !s.repo.open( dir ) ) { return false; }
 	const size_t layer_bytes = ( static_cast<size_t>( kNh * kHd ) * kH * 2 + static_cast<size_t>( kNkv * kHd ) * kH * 2 + static_cast<size_t>( kFfn ) * kH * 3 ) * sizeof( half ) + ( 4ULL << 20 );
 	for ( int i = 0; i < 2; ++i ) {
-		if ( !engine::core::arena_create( s.slot_arena[i], device, layer_bytes ) ) { return false; }
+		if ( !h3_scratch_arena_create( s.slot_arena[i], device, layer_bytes ) ) { return false; }
 	}
 	s.staging_bytes = static_cast<size_t>( kFfn ) * kH * 2;
 	CUDA_CHECK( cudaMalloc( &s.staging, s.staging_bytes ) );
+	CUDA_CHECK( cudaMemset( s.staging, 0, s.staging_bytes ) );
+	CUDA_CHECK( cudaStreamSynchronize( nullptr ) );
 	const size_t S = static_cast<size_t>( max_tokens );
 	const size_t need = S * kH * 4 * 2 + S * 4 * 4 + S * kH * 2 + S * kNh * kHd * 2 * 2 + S * kNkv * kHd * 2 * 2 + S * kFfn * 2 * 3 + ( 16ULL << 20 );
-	if ( !engine::core::arena_create( s.sarena, device, need ) ) { return false; }
+	if ( !h3_scratch_arena_create( s.sarena, device, need ) ) { return false; }
 	s.x = s.alloc<float>( s.sarena, S * kH );
 	s.br = s.alloc<float>( s.sarena, S * kH );
 	s.rowscale = s.alloc<float>( s.sarena, S );
@@ -276,6 +280,7 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	s.u16 = s.alloc<half>( s.sarena, S * kFfn );
 	s.f16 = s.alloc<half>( s.sarena, S * kFfn );
 	CUDA_CHECK( cudaFuncSetAttribute( k_attn_causal, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304 - 1024 ) );
+	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against
 	return s.repo.find( s.embed_name.c_str() ) != nullptr;
 }
 
@@ -367,6 +372,7 @@ bool H3TextEncoder::encode_mm( const std::vector<int>& ids, int image_token_id, 
 		}
 		CUDA_CHECK( cudaEventRecord( s.consumed[cur], s.cs ) );
 		CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
+		if ( probe ) { probe( i, s.x, S ); }
 	}
 	CUDA_CHECK( cudaMemcpyAsync( d_out, s.x, static_cast<size_t>( S ) * kH * sizeof( float ), cudaMemcpyDeviceToDevice, s.cs ) );
 	CUDA_CHECK( cudaStreamSynchronize( s.cs ) );

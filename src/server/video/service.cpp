@@ -17,9 +17,17 @@ bool VideoService::init( const ServerConfig& config ) {
 	s.started_at = wall_seconds();
 	s.adapters.scan( s.cfg.video.lora_dirs, !s.cfg.video.dit_ref2va.empty() );
 	s.jobs.init( s.cfg.video.out_dir );
+	engine::video::H3Paths paths;
+	paths.root = s.cfg.model_dir;
+	paths.dit = s.cfg.video.dit;
+	paths.dit_ref2va = s.cfg.video.dit_ref2va;
+	paths.devices = s.cfg.video.devices;
+	paths.device = s.cfg.video.devices.empty() ? 0 : s.cfg.video.devices[0];
+	paths.resident_rows = s.cfg.video.max_rows;
+	s.engine = std::make_unique<engine::video::H3Engine>( paths, s.cfg.video.resident );
 	s.worker = std::thread( [this] { p_->run_loop(); } );
-	LOG_INFO( "MiniMax-H3 service: %zu adapter(s), %zu GPU(s), references %s, jobs in %s\n", s.adapters.all().size(), s.cfg.video.devices.size(),
-		s.cfg.video.dit_ref2va.empty() ? "off" : "on", s.cfg.video.out_dir.c_str() );
+	LOG_INFO( "MiniMax-H3 service: %zu adapter(s), %zu GPU(s), references %s, models %s, jobs in %s\n", s.adapters.all().size(), s.cfg.video.devices.size(),
+		s.cfg.video.dit_ref2va.empty() ? "off" : "on", s.cfg.video.resident ? "resident" : "loaded per job", s.cfg.video.out_dir.c_str() );
 	return true;
 }
 
@@ -47,18 +55,26 @@ void VideoService::Impl::register_routes( Router& router ) {
 }
 
 void VideoService::Impl::run_loop() {
-	while ( JobPtr j = jobs.next() ) run_job( j );
+	const double idle_s = cfg.video.resident ? cfg.video.resident_idle_s : 0;
+	double wait_s = idle_s;
+	for ( ;; ) {
+		bool idle = false;
+		JobPtr j = jobs.next( wait_s, &idle );
+		if ( idle ) { // nothing queued for resident_idle_s: give the GPUs back, then wait for the next job without a timeout
+			LOG_INFO( "MiniMax-H3 service: idle for %d s, freeing the resident transformer\n", cfg.video.resident_idle_s );
+			engine->release();
+			wait_s = 0;
+			continue;
+		}
+		if ( !j ) break;
+		run_job( j );
+		wait_s = idle_s;
+	}
 }
 
 void VideoService::Impl::run_job( const JobPtr& j ) {
 	using namespace engine::video;
 	const double t0 = wall_seconds();
-	H3Paths paths;
-	paths.root = cfg.model_dir;
-	paths.dit = cfg.video.dit;
-	paths.dit_ref2va = cfg.video.dit_ref2va;
-	paths.devices = cfg.video.devices;
-	paths.device = cfg.video.devices.empty() ? 0 : cfg.video.devices[0];
 	H3GenRequest r;
 	const nlohmann::json& p = j->params;
 	r.prompt = p["prompt"].get<std::string>();
@@ -90,7 +106,7 @@ void VideoService::Impl::run_job( const JobPtr& j ) {
 		} );
 	};
 	H3GenResult res;
-	const bool ok = h3_generate( paths, r, &res );
+	const bool ok = engine->generate( r, &res );
 	if ( ok ) {
 		const std::string cmd = "ffmpeg -y -loglevel error -i '" + j->dir + "/result.mp4' -vf \"select=eq(n\\,12),scale=640:-1\" -frames:v 1 '" + j->dir + "/thumb.jpg' 2>/dev/null";
 		( void )!std::system( cmd.c_str() );

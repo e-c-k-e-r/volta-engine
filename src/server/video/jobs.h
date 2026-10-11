@@ -49,8 +49,9 @@ public:
 	void cancel( const JobPtr& j );
 	bool remove( const JobPtr& j, std::string* error );
 
-	// Worker side: blocks until a job is queued (nullptr after stop()); marks it running.
-	JobPtr next();
+	// Worker side: blocks until a job is queued (nullptr after stop()); marks it running. With idle_s > 0 it also returns nullptr (and *idle = true) when nothing
+	// was queued for that long.
+	JobPtr next( double idle_s = 0, bool* idle = nullptr );
 	template <typename F>
 	void update( const JobPtr& j, F fn ) {
 		std::lock_guard<std::mutex> lk( mu_ );

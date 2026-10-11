@@ -72,6 +72,11 @@ public:
 	// scale multiplies alpha / rank (0 bypasses the adapter). Returns the adapter id, or -1 when the file does not match.
 	int add_lora( const char* path, float scale = 1.0f );
 	void set_lora_scale( int id, float scale );
+	void clear_loras(); // frees every staged adapter
+	// Activation scratch: load() allocates it for max_rows; trim() frees it (the weights and adapters stay) so a stage that runs beside the transformer has the memory,
+	// reserve() allocates it again (no-op while allocated).
+	void trim();
+	bool reserve();
 
 	// Outputs: video_out [n_img, 96], audio_out [n_audio, 32] (device, fp32).
 	void forward( const H3Request& req, float* video_out, float* audio_out, void* stream = nullptr );

@@ -13,6 +13,8 @@ struct VideoConfig {
 	std::string out_dir = "h3_jobs";    // job history and results
 	std::vector<int> devices;           // GPUs of the DiT (sequence parallel); empty = the first tp_size GPUs
 	int max_rows = 36000;               // largest packed sequence a job may need (text + references + audio + video rows)
+	bool resident = true;               // keep the transformer on the GPUs between jobs (off: load it for each job, free it after)
+	int resident_idle_s = 0;            // with resident: free it after this many idle seconds (0 = never)
 };
 
 struct ServerConfig {

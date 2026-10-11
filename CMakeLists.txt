@@ -118,6 +118,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/video/h3_vision.cu
 	src/video/h3_dit_group.cpp
 	src/video/h3_pipeline.cu
+	src/video/h3_engine.cpp
 	src/video/h3_stage_refs.cpp
 	src/video/h3_stage_text.cpp
 	src/video/h3_stage_denoise.cpp
@@ -518,6 +519,9 @@ set_target_properties(test_h3_audio_enc PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${P
 add_executable(test_h3_text tests/2_parity/test_h3_text.cpp)
 target_link_libraries(test_h3_text PRIVATE engine_kernels)
 set_target_properties(test_h3_text PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(h3_text_repeat tests/3_bench/h3_text_repeat.cpp)
+target_link_libraries(h3_text_repeat PRIVATE engine_kernels)
+set_target_properties(h3_text_repeat PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 add_executable(h3_generate src/video/h3_generate_main.cpp)
 target_link_libraries(h3_generate PRIVATE engine_kernels)
 set_target_properties(h3_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

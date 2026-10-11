@@ -1,5 +1,6 @@
 // MiniMax-H3 audio VAE decoder: dec_in_proj (1x1) -> BigVGAN (7 transposed-conv upsamplers, 3 AMP resblocks each).
 #include "engine/video/h3_audio.h"
+#include "h3_util.h"
 #include "engine/core/arena.h"
 #include "engine/core/log.h"
 #include "engine/loader/safetensors.h"
@@ -416,13 +417,14 @@ bool H3AudioVAE::load( const char* dir, int device, int max_frames ) {
 	s.post_w = s.wn( "decoder.conv_post" );
 	if ( !s.post_w ) { return false; }
 	const size_t elems = static_cast<size_t>( 2 ) * max_frames * 6400 + 4096;
-	if ( !engine::core::arena_create( s.sarena, device, elems * 4 * 6 + ( 64ULL << 20 ) ) ) { return false; }
+	if ( !h3_scratch_arena_create( s.sarena, device, elems * 4 * 6 + ( 64ULL << 20 ) ) ) { return false; }
 	s.bufA = s.alloc<float>( s.sarena, elems );
 	s.bufB = s.alloc<float>( s.sarena, elems );
 	s.bufC = s.alloc<float>( s.sarena, elems );
 	s.bufD = s.alloc<float>( s.sarena, elems );
 	s.acc = s.alloc<float>( s.sarena, elems );
 	s.z = s.alloc<float>( s.sarena, static_cast<size_t>( 2 ) * 2048 * max_frames );
+	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against
 	return true;
 }
 

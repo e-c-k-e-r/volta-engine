@@ -122,6 +122,19 @@ int H3DiTGroup::add_lora( const char* path, float scale ) {
 	return id;
 }
 
+void H3DiTGroup::trim() {
+	for ( auto& d : p_->dits ) { d->trim(); }
+}
+
+bool H3DiTGroup::reserve() {
+	for ( auto& d : p_->dits ) { if ( !d->reserve() ) { return false; } }
+	return true;
+}
+
+void H3DiTGroup::clear_loras() {
+	for ( auto& d : p_->dits ) { d->clear_loras(); }
+}
+
 void H3DiTGroup::set_lora_scale( int id, float scale ) {
 	for ( auto& d : p_->dits ) { d->set_lora_scale( id, scale ); }
 }

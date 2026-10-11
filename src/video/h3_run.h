@@ -6,6 +6,7 @@
 #include "engine/loader/image.h"
 #include "engine/video/h3_image.h"
 #include "engine/video/h3_pipeline.h"
+#include "h3_components.h"
 #include <chrono>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -39,10 +40,11 @@ struct H3SampledVideo {
 };
 
 struct H3Run {
-	H3Run( const H3Paths& p, const H3GenRequest& r ) : paths( p ), req( r ) {}
+	H3Run( const H3Paths& p, const H3GenRequest& r, H3Components& c ) : paths( p ), req( r ), comp( c ) {}
 
 	const H3Paths& paths;
 	const H3GenRequest& req;
+	H3Components& comp; // the loaded models (resident between jobs or per job)
 	H3GenResult res;
 
 	// ---- plan_shape: the task and the sizes ----
