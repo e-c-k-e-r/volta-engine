@@ -254,12 +254,14 @@ struct VBlock {
 	const float *qkv_b = nullptr, *out_b = nullptr, *w1_b = nullptr, *w2_b = nullptr, *n1 = nullptr, *n2 = nullptr, *s1 = nullptr, *s2 = nullptr;
 };
 
-struct Tiles {
-	std::vector<int> start, len, overlap;
-};
+using Tiles = H3Tiles;
 
-Tiles split_tiles( int input_len, int tile_size, int overlap_min, int ratio ) {
-	Tiles t;
+Tiles split_tiles( int input_len, int tile_size, int overlap_min, int ratio ) { return h3_split_tiles( input_len, tile_size, overlap_min, ratio ); }
+
+} // namespace
+
+H3Tiles h3_split_tiles( int input_len, int tile_size, int overlap_min, int ratio ) {
+	H3Tiles t;
 	if ( tile_size >= input_len ) {
 		t.start = { 0 };
 		t.len = { input_len };
@@ -284,7 +286,6 @@ Tiles split_tiles( int input_len, int tile_size, int overlap_min, int ratio ) {
 	return t;
 }
 
-} // namespace
 
 struct H3VideoVAE::Impl {
 	H3VaeParams par;

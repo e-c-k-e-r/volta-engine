@@ -20,6 +20,12 @@ struct H3VaeParams {
 	std::vector<float> mean, stdev; // latents_mean / latents_std (24)
 };
 
+// Spatial tiling of the checkpoint (shared by the decoder and the image encoder): tile starts / lengths / overlaps along one axis, in pixels
+struct H3Tiles {
+	std::vector<int> start, len, overlap;
+};
+H3Tiles h3_split_tiles( int input_len, int tile_size, int overlap_min, int ratio );
+
 // Reads <dir>/config.json (vae_* fields, latent statistics)
 bool h3_read_vae_params( const char* dir, H3VaeParams& out );
 

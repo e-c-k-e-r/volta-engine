@@ -20,9 +20,11 @@ public:
 
 	// rgb: [3, H, W] fp32 (device), already normalized with the ImageNet mean / std; H and W multiples of 16.
 	// moments: [48, H/16, W/16] (device, fp32): 24 mean channels followed by 24 log-variance channels.
+	// Images larger than 256 px are encoded in overlapping 256 px tiles with linearly blended moments, as the checkpoint does.
 	bool encode( const float* d_rgb, int H, int W, float* d_moments );
 
 private:
+	bool encode_tile( const float* d_rgb, int H, int W, float* d_moments );
 	struct Impl;
 	Impl* p_;
 };

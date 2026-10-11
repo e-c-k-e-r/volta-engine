@@ -3,6 +3,7 @@
 #include "engine/core/arena.h"
 #include "engine/core/log.h"
 #include "engine/loader/safetensors.h"
+#include "engine/video/h3_vae.h"
 #include "h3_kernels.cuh"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -245,7 +246,7 @@ bool H3ImageEncoder::load( const char* dir, int device ) {
 	return s.conv_in.w && s.quant.w;
 }
 
-bool H3ImageEncoder::encode( const float* d_rgb, int H, int W, float* d_moments ) {
+bool H3ImageEncoder::encode_tile( const float* d_rgb, int H, int W, float* d_moments ) {
 	Impl& s = *p_;
 	if ( H % 16 || W % 16 ) { return false; }
 	// activation buffers: the first level is the largest: 128 channels at H x W
@@ -301,6 +302,81 @@ bool H3ImageEncoder::encode( const float* d_rgb, int H, int W, float* d_moments 
 	CUDA_CHECK( cudaStreamSynchronize( st ) );
 	CUDA_CHECK( cudaGetLastError() );
 	return h == H / 16 && w == W / 16;
+}
+
+bool H3ImageEncoder::encode( const float* d_rgb, int H, int W, float* d_moments ) {
+	Impl& s = *p_;
+	constexpr int kRatio = 16, kTile = 256, kOverlap = 64;
+	if ( H % kRatio || W % kRatio ) { return false; }
+	if ( H <= kTile && W <= kTile ) { return encode_tile( d_rgb, H, W, d_moments ); }
+	// the checkpoint tiles the encoder (256 px tiles, >= 64 px overlap) and blends the moments linearly: rows first, then columns against the unblended left tile
+	const H3Tiles ty = h3_split_tiles( H, kTile, kOverlap, kRatio ), tx = h3_split_tiles( W, kTile, kOverlap, kRatio );
+	const int ni = static_cast<int>( ty.start.size() ), nj = static_cast<int>( tx.start.size() );
+	std::vector<int> th( ni ), tw( nj );
+	for ( int i = 0; i < ni; ++i ) { th[i] = std::min( ty.len[i], H - ty.start[i] ); }
+	for ( int j = 0; j < nj; ++j ) { tw[j] = std::min( tx.len[j], W - tx.start[j] ); }
+	std::vector<std::vector<float>> raw( static_cast<size_t>( ni ) * nj );
+	float *d_tile = nullptr, *d_tm = nullptr;
+	CUDA_CHECK( cudaMalloc( &d_tile, static_cast<size_t>( 3 ) * kTile * kTile * sizeof( float ) ) );
+	CUDA_CHECK( cudaMalloc( &d_tm, static_cast<size_t>( 48 ) * ( kTile / kRatio ) * ( kTile / kRatio ) * sizeof( float ) ) );
+	for ( int i = 0; i < ni; ++i ) {
+		for ( int j = 0; j < nj; ++j ) {
+			for ( int c = 0; c < 3; ++c ) {
+				CUDA_CHECK( cudaMemcpy2DAsync( d_tile + static_cast<size_t>( c ) * th[i] * tw[j], tw[j] * sizeof( float ), d_rgb + ( static_cast<size_t>( c ) * H + ty.start[i] ) * W + tx.start[j],
+					W * sizeof( float ), tw[j] * sizeof( float ), th[i], cudaMemcpyDeviceToDevice, s.stream ) );
+			}
+			CUDA_CHECK( cudaStreamSynchronize( s.stream ) );
+			if ( !encode_tile( d_tile, th[i], tw[j], d_tm ) ) { return false; }
+			std::vector<float>& r = raw[static_cast<size_t>( i ) * nj + j];
+			r.resize( static_cast<size_t>( 48 ) * ( th[i] / kRatio ) * ( tw[j] / kRatio ) );
+			CUDA_CHECK( cudaMemcpy( r.data(), d_tm, r.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
+		}
+	}
+	cudaFree( d_tile );
+	cudaFree( d_tm );
+	const int LH = H / kRatio, LW = W / kRatio;
+	std::vector<float> out( static_cast<size_t>( 48 ) * LH * LW );
+	for ( int i = 0; i < ni; ++i ) {
+		for ( int j = 0; j < nj; ++j ) {
+			const int lh = th[i] / kRatio, lw = tw[j] / kRatio;
+			std::vector<float> tile = raw[static_cast<size_t>( i ) * nj + j];
+			if ( i > 0 ) { // blend the top rows with the bottom rows of the raw tile above
+				const std::vector<float>& a = raw[static_cast<size_t>( i - 1 ) * nj + j];
+				const int ah = th[i - 1] / kRatio, ext = std::min( { ah, lh, ty.overlap[i - 1] / kRatio } );
+				for ( int c = 0; c < 48; ++c ) {
+					for ( int y = 0; y < ext; ++y ) {
+						const float wb = static_cast<float>( y ) / ext, wa = 1.0f - wb;
+						for ( int x = 0; x < lw; ++x ) {
+							float& dst = tile[( static_cast<size_t>( c ) * lh + y ) * lw + x];
+							dst = a[( static_cast<size_t>( c ) * ah + ( ah - ext + y ) ) * lw + x] * wa + dst * wb;
+						}
+					}
+				}
+			}
+			if ( j > 0 ) { // then the left columns with the raw tile to the left
+				const std::vector<float>& a = raw[static_cast<size_t>( i ) * nj + j - 1];
+				const int aw = tw[j - 1] / kRatio, ext = std::min( { aw, lw, tx.overlap[j - 1] / kRatio } );
+				for ( int c = 0; c < 48; ++c ) {
+					for ( int y = 0; y < lh; ++y ) {
+						for ( int x = 0; x < ext; ++x ) {
+							const float wb = static_cast<float>( x ) / ext, wa = 1.0f - wb;
+							float& dst = tile[( static_cast<size_t>( c ) * lh + y ) * lw + x];
+							dst = a[( static_cast<size_t>( c ) * lh + y ) * aw + ( aw - ext + x )] * wa + dst * wb;
+						}
+					}
+				}
+			}
+			const int keep_h = i < ni - 1 ? lh - ty.overlap[i] / kRatio : lh, keep_w = j < nj - 1 ? lw - tx.overlap[j] / kRatio : lw;
+			const int y0 = ty.start[i] / kRatio, x0 = tx.start[j] / kRatio;
+			for ( int c = 0; c < 48; ++c ) {
+				for ( int y = 0; y < keep_h; ++y ) {
+					std::memcpy( &out[( static_cast<size_t>( c ) * LH + y0 + y ) * LW + x0], &tile[( static_cast<size_t>( c ) * lh + y ) * lw], static_cast<size_t>( keep_w ) * sizeof( float ) );
+				}
+			}
+		}
+	}
+	CUDA_CHECK( cudaMemcpy( d_moments, out.data(), out.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+	return true;
 }
 
 } // namespace engine::video
