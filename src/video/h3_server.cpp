@@ -1,5 +1,5 @@
 // h3_server: job server and web UI for MiniMax-H3 generation.
-//   h3_server --root <FL2VA dir> --dit <comfy int8 checkpoint> [--lora-dir DIR]... [--out-dir DIR] [--devices 0,1,2,3] [--port 8200] [--host 127.0.0.1]
+//   h3_server --root <FL2VA dir> --dit <comfy int8 checkpoint> [--dit-ref2va <ref2va checkpoint>] [--lora-dir DIR]... [--out-dir DIR] [--devices 0,1,2,3] [--port 8200] [--host 127.0.0.1]
 // One worker thread owns the GPUs and runs the queued jobs one after the other; the API is JSON over HTTP (no authentication: keep it on localhost or a
 // trusted network).
 #include "engine/core/log.h"
@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -52,13 +53,13 @@ struct Job {
 	double progress = 0, created = 0, started = 0, finished = 0, t_text = 0, t_load = 0, t_denoise = 0, t_decode = 0, t_total = 0;
 	std::atomic<bool> cancel{ false };
 	std::vector<H3Lora> loras;
-	std::vector<std::string> images;
+	std::vector<std::string> images, ref_images, ref_audios;
 	std::vector<int> frame_indices;
 	int steps_total = 0;
 };
 
 struct Config {
-	std::string root, dit, out_dir = "h3_jobs", host = "127.0.0.1";
+	std::string root, dit, dit_ref2va, out_dir = "h3_jobs", host = "127.0.0.1";
 	std::vector<std::string> lora_dirs;
 	std::vector<int> devices{ 0 };
 	int port = 8200;
@@ -108,9 +109,10 @@ void scan_loras() {
 			li.mb = static_cast<long>( st.st_size >> 20 );
 			std::smatch m;
 			if ( std::regex_match( name, m, turbo_re ) ) {
-				if ( m[1] != "fl2v" ) { continue; } // Ref2V adapters need the Ref2VA transformer
+				if ( m[1] == "ref2v" && g_cfg.dit_ref2va.empty() ) { continue; } // Ref2V adapters need the Ref2VA transformer
 				li.turbo = true;
-				li.label = m[2].str() + "-step turbo v" + m[3].str() + ( m[4].matched ? " (768p)" : "" ) + " - fast";
+				li.task = m[1].str();
+				li.label = m[1].str() + " " + m[2].str() + "-step turbo v" + m[3].str() + ( m[4].matched ? " (768p)" : "" ) + " - fast";
 				li.format = "diffusers";
 			} else {
 				li.label = name.substr( 0, name.size() - 12 );
@@ -206,6 +208,7 @@ void run_job( const std::shared_ptr<Job>& j ) {
 	H3Paths paths;
 	paths.root = g_cfg.root;
 	paths.dit = g_cfg.dit;
+	paths.dit_ref2va = g_cfg.dit_ref2va;
 	paths.devices = g_cfg.devices;
 	paths.device = g_cfg.devices.empty() ? 0 : g_cfg.devices[0];
 	H3GenRequest r;
@@ -218,6 +221,8 @@ void run_job( const std::shared_ptr<Job>& j ) {
 	r.seed = p["seed"].get<uint64_t>();
 	r.loras = j->loras;
 	r.images = j->images;
+	r.ref_images = j->ref_images;
+	r.ref_audios = j->ref_audios;
 	r.frame_indices = j->frame_indices;
 	r.out = j->dir + "/result.mp4";
 	r.cancel = &j->cancel;
@@ -254,6 +259,8 @@ void run_job( const std::shared_ptr<Job>& j ) {
 		j->error = "generation failed; see the server log";
 	}
 	for ( const std::string& im : j->images ) { std::remove( im.c_str() ); }
+	for ( const std::string& im : j->ref_images ) { std::remove( im.c_str() ); }
+	for ( const std::string& im : j->ref_audios ) { std::remove( im.c_str() ); }
 	save_meta( *j );
 }
 
@@ -415,9 +422,41 @@ void handle_submit( int fd, const Request& rq ) {
 		}
 	}
 	if ( image_data.size() > 2 ) { respond_error( fd, 400, "at most two keyframe images" ); return; }
+	// Ref2VA references (the Ref2VA transformer): images (up to 9) and audio clips (up to 3)
+	std::vector<std::string> ref_image_data, ref_audio_data;
+	for ( const char* key : { "ref_images", "ref_audios" } ) {
+		if ( !b.contains( key ) || !b[key].is_array() ) { continue; }
+		for ( const json& im : b[key] ) {
+			if ( !im.is_object() ) { continue; }
+			std::string d = str_field( im, "data" );
+			const size_t comma = d.find( "base64," );
+			if ( comma != std::string::npos ) { d = d.substr( comma + 7 ); }
+			( key[4] == 'i' ? ref_image_data : ref_audio_data ).push_back( b64_decode( d ) );
+		}
+	}
+	const bool ref_task = !ref_image_data.empty() || !ref_audio_data.empty();
+	if ( ref_task ) {
+		if ( g_cfg.dit_ref2va.empty() ) { respond_error( fd, 400, "this server has no Ref2VA transformer (start it with --dit-ref2va)" ); return; }
+		if ( !image_data.empty() ) { respond_error( fd, 400, "keyframes and references are different tasks" ); return; }
+		if ( ref_image_data.empty() ) { respond_error( fd, 400, "reference audio needs at least one reference image" ); return; }
+		if ( ref_image_data.size() > 9 || ref_audio_data.size() > 3 ) { respond_error( fd, 400, "at most 9 reference images and 3 reference audio clips" ); return; }
+	}
+	if ( !turbo.empty() ) {
+		const LoraInfo* t = find_lora( turbo );
+		if ( t && ( t->task == "ref2v" ) != ref_task ) { respond_error( fd, 400, std::string( "the " ) + t->task + " adapter does not fit this task" ); return; }
+	}
+	long ref_rows = 0; // reference visual rows plus the same number of prompt tokens for each image
+	for ( const std::string& bytes : ref_image_data ) {
+		engine::loader::DecodedImage di;
+		std::string err;
+		if ( !engine::loader::decode_image( reinterpret_cast<const uint8_t*>( bytes.data() ), bytes.size(), &di, &err ) ) { respond_error( fd, 400, "cannot decode a reference image: " + err ); return; }
+		const double sc = 2048.0 / std::min( di.width, di.height );
+		ref_rows += 2L * std::lround( di.width * sc / 32 ) * std::lround( di.height * sc / 32 );
+	}
+	ref_rows += 1200L * static_cast<long>( ref_audio_data.size() );
 	// token budget: text + audio + video rows (+ one frame of rows per keyframe image)
 	const int lat_t = frames <= 5 ? 2 : ( ( frames - 5 ) / 17 ) * 5 + 2;
-	const long rows = 512 + static_cast<long>( lat_t + static_cast<int>( image_data.size() ) ) * ( width / 32 ) * ( height / 32 ) + static_cast<long>( frames / 24.0 * 80 ) + 1400L * static_cast<long>( image_data.size() );
+	const long rows = 512 + static_cast<long>( lat_t + static_cast<int>( image_data.size() ) ) * ( width / 32 ) * ( height / 32 ) + static_cast<long>( frames / 24.0 * 80 ) + 1400L * static_cast<long>( image_data.size() ) + ref_rows;
 	if ( rows > g_cfg.max_rows ) { respond_error( fd, 400, "this size and duration need about " + std::to_string( rows ) + " tokens; the limit is " + std::to_string( g_cfg.max_rows ) ); return; }
 	{
 		std::lock_guard<std::mutex> lk( g_mu );
@@ -432,11 +471,21 @@ void handle_submit( int fd, const Request& rq ) {
 		j->images.push_back( path );
 		j->frame_indices.push_back( frame_idx[i] == 0 ? 0 : -1 );
 	}
+	for ( size_t i = 0; i < ref_image_data.size(); ++i ) {
+		const std::string path = j->dir + "/ref" + std::to_string( i ) + ".img";
+		std::ofstream( path, std::ios::binary ) << ref_image_data[i];
+		j->ref_images.push_back( path );
+	}
+	for ( size_t i = 0; i < ref_audio_data.size(); ++i ) {
+		const std::string path = j->dir + "/refaudio" + std::to_string( i ) + ".bin";
+		std::ofstream( path, std::ios::binary ) << ref_audio_data[i];
+		j->ref_audios.push_back( path );
+	}
 	j->loras = loras;
 	j->steps_total = steps;
 	j->steps = steps;
 	j->created = now_s();
-	json params = { { "prompt", prompt }, { "width", width }, { "height", height }, { "frames", frames }, { "steps", steps }, { "seed", seed }, { "turbo", turbo }, { "images", image_data.size() } };
+	json params = { { "prompt", prompt }, { "width", width }, { "height", height }, { "frames", frames }, { "steps", steps }, { "seed", seed }, { "turbo", turbo }, { "images", image_data.size() }, { "ref_images", ref_image_data.size() }, { "ref_audios", ref_audio_data.size() } };
 	json ls = json::array();
 	for ( const json& l : b.value( "loras", json::array() ) ) { if ( l.is_object() ) { ls.push_back( { { "file", str_field( l, "file" ) }, { "scale", num_field( l, "scale", 1.0 ) } } ); } }
 	params["loras"] = ls;
@@ -462,6 +511,7 @@ void handle( int fd ) {
 		o["model"] = "MiniMax-H3 FL2VA (INT8 ConvRot)";
 		o["devices"] = g_cfg.devices;
 		o["max_rows"] = g_cfg.max_rows;
+		o["ref2va"] = !g_cfg.dit_ref2va.empty();
 		json ls = json::array();
 		for ( const LoraInfo& l : g_loras ) { ls.push_back( { { "file", l.file }, { "label", l.label }, { "turbo", l.turbo }, { "format", l.format }, { "mb", l.mb }, { "task", l.task } } ); }
 		o["loras"] = ls;
@@ -520,6 +570,7 @@ int main( int argc, char** argv ) {
 		auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
 		if ( a == "--root" ) { g_cfg.root = next(); }
 		else if ( a == "--dit" ) { g_cfg.dit = next(); }
+		else if ( a == "--dit-ref2va" ) { g_cfg.dit_ref2va = next(); }
 		else if ( a == "--lora-dir" ) { g_cfg.lora_dirs.push_back( next() ); }
 		else if ( a == "--out-dir" ) { g_cfg.out_dir = next(); }
 		else if ( a == "--port" ) { g_cfg.port = std::atoi( next().c_str() ); }

@@ -42,6 +42,11 @@ input[type=range]{width:100%;accent-color:var(--acc)}
   <h2 style="margin-top:14px">Keyframes <span class="small">(optional: image to video)</span></h2>
   <div class="row"><div><div class="drop" id="d0">First frame<button class="x" title="clear">&times;</button></div></div><div><div class="drop" id="d1">Last frame<button class="x" title="clear">&times;</button></div></div></div>
   <input type="file" id="file" accept="image/*" hidden>
+  <div id="refcard" style="display:none"><h2 style="margin-top:14px">References <span class="small">(Ref2VA: reuse a subject, a scene or a voice; replaces keyframes)</span></h2>
+   <div id="refs" class="row" style="flex-wrap:wrap"></div>
+   <div class="row" style="margin-top:6px"><button id="addimg">+ image (up to 9)</button><button id="addaud">+ audio (up to 3, 2-15 s)</button></div>
+   <input type="file" id="rfile" accept="image/*" multiple hidden><input type="file" id="afile" accept="audio/*,video/*" hidden>
+   <div class="small">Refer to them in the prompt as &lt;Picture 1&gt;, &lt;Audio 1&gt;, ...</div></div>
  </div>
  <div class="card"><h2>Video</h2>
   <div class="row"><div><label>Aspect ratio</label><select id="aspect"><option value="16:9">16:9 landscape</option><option value="9:16">9:16 portrait</option><option value="1:1">1:1 square</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="21:9">21:9 wide</option></select></div>
@@ -57,12 +62,14 @@ input[type=range]{width:100%;accent-color:var(--acc)}
 <section id="jobs"></section>
 </main>
 <script>
-const $=s=>document.querySelector(s);let info=null,imgs=[null,null],pick=0;
+const $=s=>document.querySelector(s);let info=null,imgs=[null,null],pick=0,rimgs=[],raud=[];
 const api=async(p,o)=>{const r=await fetch(p,o);if(!r.ok){let t=await r.text();throw new Error(t||r.status)}return r};
 function canvas(aspect){let w,h;if(aspect>=1){w=768*aspect;h=768}else{w=768;h=768/aspect}const a=w*h,c=768*1344;if(a>c){const s=Math.sqrt(c/a);w*=s;h*=s}const al=v=>Math.max(32,Math.round(v/32)*32);return[al(w),al(h)]}
 function fillRes(){const [r,c]=$('#aspect').value.split(':').map(Number);const asp=r/c;const sizes=[];let [w,h]=canvas(asp);sizes.push([w,h,'full']);const f=[0.75,0.5,0.34];for(const k of f){const sw=Math.max(32,Math.round(w*k/32)*32),sh=Math.max(32,Math.round(h*k/32)*32);sizes.push([sw,sh,Math.round(k*100)+'%'])}
  $('#res').innerHTML=sizes.map(s=>`<option value="${s[0]}x${s[1]}">${s[0]}x${s[1]} (${s[2]})</option>`).join('');plan()}
 function frames(){const want=Math.round(parseFloat($('#dur').value)*24);let f=Math.max(22,want);while(f%17!=5)f++;return f}
+function renderTurbo(){if(!info)return;const ref=rimgs.length>0;const cur=$('#turbo').value;const turbos=info.loras.filter(l=>l.turbo&&((l.task==='ref2v')===ref));$('#turbo').innerHTML='<option value="">Base model (50 steps, slow)</option>'+turbos.map(l=>`<option value="${l.file}">${l.label}</option>`).join('');const keep=turbos.find(l=>l.file===cur);const def=keep||turbos.find(l=>/4step_v1\.2_768p|4step/.test(l.file))||turbos[0];if(def)$('#turbo').value=def.file}
+function renderRefs(){$('#refs').innerHTML=rimgs.map((d,i)=>`<div class="drop has" style="min-height:0;height:80px;width:110px;flex:0 0 110px"><img src="${d}"><button class="x" data-ri="${i}">&times;</button><span class="small">Picture ${i+1}</span></div>`).join('')+raud.map((a,i)=>`<div class="drop has" style="min-height:0;height:80px;width:110px;flex:0 0 110px"><span class="small">Audio ${i+1}<br>${a.name}</span><button class="x" data-ai="${i}">&times;</button></div>`).join('');document.querySelectorAll('[data-ri]').forEach(b=>b.onclick=()=>{rimgs.splice(+b.dataset.ri,1);renderRefs();renderTurbo();plan()});document.querySelectorAll('[data-ai]').forEach(b=>b.onclick=()=>{raud.splice(+b.dataset.ai,1);renderRefs()});renderTurbo();plan()}
 function turboInfo(){const t=$('#turbo').value;if(!t)return{steps:50,shift:12,name:'base model, 50 steps'};const m=t.match(/_(\d)step/);return{steps:m?+m[1]:4,shift:/_768p/.test(t)?6:12,name:t}}
 function plan(){const [w,h]=$('#res').value.split('x').map(Number);const f=frames(),ti=turboInfo();const lat=((f-5)/17|0)*5+2;const rows=64+lat*(w/32)*(h/32)+Math.round(f/24*40)*2+(imgs[0]?1:0)*(w/32)*(h/32)+(imgs[1]?1:0)*(w/32)*(h/32);
  $('#durv').textContent=(f/24).toFixed(2)+' s ('+f+' frames)';$('#plan').textContent=`${ti.steps} denoising steps, flow shift ${ti.shift}, ~${rows.toLocaleString()} tokens`+(imgs[0]||imgs[1]?', keyframe conditioning':'')}
@@ -76,18 +83,17 @@ $('#file').onchange=e=>{if(e.target.files[0])load(pick,e.target.files[0]);e.targ
 function load(i,f){const r=new FileReader();r.onload=()=>setImg(i,r.result);r.readAsDataURL(f)}
 function setImg(i,data){imgs[i]=data;const d=$('#d'+i);d.querySelector('img')?.remove();d.classList.toggle('has',!!data);d.classList.toggle('on',false);
  if(data){const im=new Image();im.src=data;d.prepend(im);if(i===0){im.onload=()=>{const a=im.naturalWidth/im.naturalHeight;let best='16:9',bd=9;for(const [k,v] of Object.entries({'16:9':16/9,'9:16':9/16,'1:1':1,'4:3':4/3,'3:4':3/4,'21:9':21/9})){const dd=Math.abs(Math.log(a/v));if(dd<bd){bd=dd;best=k}}$('#aspect').value=best;fillRes()}}}plan()}
-async function boot(){info=await (await api('/api/info')).json();$('#hw').textContent=info.devices.length+' GPU(s): '+info.devices.join(', ')+' | '+info.model;
- const turbos=info.loras.filter(l=>l.turbo);$('#turbo').innerHTML='<option value="">Base model (50 steps, slow)</option>'+turbos.map(l=>`<option value="${l.file}">${l.label}</option>`).join('');
- const def=turbos.find(l=>/4step_v1\.2_768p/.test(l.file))||turbos[0];if(def)$('#turbo').value=def.file;
+async function boot(){info=await (await api('/api/info')).json();if(info.ref2va){$('#refcard').style.display='block';$('#addimg').onclick=()=>$('#rfile').click();$('#addaud').onclick=()=>$('#afile').click();$('#rfile').onchange=e=>{for(const f of e.target.files){if(rimgs.length>=9)break;const r=new FileReader();r.onload=()=>{rimgs.push(r.result);renderRefs()};r.readAsDataURL(f)}e.target.value=''};$('#afile').onchange=e=>{const f=e.target.files[0];if(f&&raud.length<3){const r=new FileReader();r.onload=()=>{raud.push({name:f.name.slice(0,14),data:r.result});renderRefs()};r.readAsDataURL(f)}e.target.value=''}}$('#hw').textContent=info.devices.length+' GPU(s): '+info.devices.join(', ')+' | '+info.model;
+ renderTurbo();
  const ex=info.loras.filter(l=>!l.turbo);$('#loras').innerHTML=ex.length?ex.map((l,i)=>`<div class="lora"><input type="checkbox" id="lc${i}" data-f="${l.file}"><div class="n" title="${l.file}">${l.label}<div class="m">${l.format}, rank ${l.rank||'?'}, ${l.mb} MB${l.task?' , '+l.task:''}</div></div><input type="range" id="ls${i}" min="-2" max="2" step="0.05" value="1"><span id="lv${i}">1.00</span></div>`).join(''):'no adapters found';
  ex.forEach((l,i)=>{$('#ls'+i).oninput=e=>{$('#lv'+i).textContent=(+e.target.value).toFixed(2);$('#lc'+i).checked=true}});
  fillRes();plan();poll()}
 $('#go').onclick=async()=>{const [w,h]=$('#res').value.split('x').map(Number);const ti=turboInfo();const loras=[];document.querySelectorAll('.lora').forEach((r,i)=>{const c=r.querySelector('input[type=checkbox]');if(c.checked)loras.push({file:c.dataset.f,scale:+$('#ls'+i).value})});
  const images=[];if(imgs[0])images.push({data:imgs[0],frame_index:0});if(imgs[1])images.push({data:imgs[1],frame_index:imgs[0]?-1:-1});
  if(!$('#prompt').value.trim()){$('#msg').textContent='Enter a prompt.';return}
- const body={prompt:$('#prompt').value,width:w,height:h,frames:frames(),steps:ti.steps,seed:+$('#seed').value,turbo:$('#turbo').value,loras,images};
+ const body={prompt:$('#prompt').value,width:w,height:h,frames:frames(),steps:ti.steps,seed:+$('#seed').value,turbo:$('#turbo').value,loras,images:rimgs.length?[]:images,ref_images:rimgs.map(data=>({data})),ref_audios:raud.map(a=>({data:a.data}))};
  $('#go').disabled=true;$('#msg').textContent='';try{await api('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('#seed').value=Math.floor(Math.random()*2**31)}catch(e){$('#msg').textContent=e.message}$('#go').disabled=false;poll(true)};
-const stageName={images:'encoding keyframes',text:'encoding the prompt',load:'loading the model',denoise:'denoising',decode:'decoding video and audio',mux:'writing the file'};
+const stageName={images:'encoding images and audio',text:'encoding the prompt',load:'loading the model',denoise:'denoising',decode:'decoding video and audio',mux:'writing the file'};
 function fmt(s){s=Math.round(s);return s>=60?Math.floor(s/60)+'m '+(s%60)+'s':s+'s'}
 let last='';async function poll(force){try{const j=await (await api('/api/jobs')).json();const q=j.filter(x=>x.state==='queued'||x.state==='running').length;$('#qinfo').textContent=q?q+' job(s) active':'idle';
  const html=j.map(x=>{const p=x.params||{};const pct=x.state==='done'?100:x.state==='running'?Math.round(x.progress*100):0;
