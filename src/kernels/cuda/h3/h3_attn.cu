@@ -13,13 +13,13 @@ namespace {
 
 using namespace nvcuda;
 
-constexpr int kD = 128, kBQ = 128, kBK = 64, kWarps = 8, kThreads = kWarps * 32;
-constexpr int kKV = kD + 16;  // shared row stride of K / V tiles (halves): the +8 spreads the fragment loads over the banks
+constexpr int kBQ = 128, kBK = 64, kWarps = 8, kThreads = kWarps * 32;
 constexpr int kPS = kBK + 8; // shared row stride of a warp's P tile
 
+template <int D>
 struct Smem {
-	half k[2][kBK * kKV]; // double buffered: the next tile is stored while this one is read
-	half v[2][kBK * kKV];
+	half k[2][kBK * ( D + 16 )]; // double buffered: the next tile is stored while this one is read; the row stride D + 16 spreads the fragment loads over the banks
+	half v[2][kBK * ( D + 16 )];
 	half p[kWarps][16 * kPS];
 };
 
@@ -34,18 +34,19 @@ __device__ __forceinline__ float warp_row_sum( float x ) {
 }
 
 // q: [q_rows, heads, 128] ...; one block = 128 query rows of one head
-template <bool Causal, bool Load, bool Store>
-__global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __restrict__ q, const half* __restrict__ k, const half* __restrict__ v, half* __restrict__ out, int q_rows,
+template <int D, bool Causal, bool Load, bool Store>
+__global__ void __launch_bounds__( kThreads, D == 64 ? 2 : 1 ) h3_attn( const half* __restrict__ q, const half* __restrict__ k, const half* __restrict__ v, half* __restrict__ out, int q_rows,
 	int k_rows, int heads, float scale_log2, float* __restrict__ ostate, float2* __restrict__ mlstate ) {
 	extern __shared__ __align__( 16 ) unsigned char smem_raw[];
-	Smem& sm = *reinterpret_cast<Smem*>( smem_raw );
+	Smem<D>& sm = *reinterpret_cast<Smem<D>*>( smem_raw );
+	constexpr int kKV = D + 16, kC = D / 8, kNd = D / 16, kLd = kC / 4; // shared row stride; 16-byte pieces per row; 16-wide fragments per row; pieces per thread per tile
 	const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-	const size_t stride = static_cast<size_t>( heads ) * kD;
+	const size_t stride = static_cast<size_t>( heads ) * D;
 	const int head = blockIdx.y;
-	const half* qh = q + static_cast<size_t>( head ) * kD;
-	const half* kh = k + static_cast<size_t>( head ) * kD;
-	const half* vh = v + static_cast<size_t>( head ) * kD;
-	half* oh = out + static_cast<size_t>( head ) * kD;
+	const half* qh = q + static_cast<size_t>( head ) * D;
+	const half* kh = k + static_cast<size_t>( head ) * D;
+	const half* vh = v + static_cast<size_t>( head ) * D;
+	half* oh = out + static_cast<size_t>( head ) * D;
 	const int q0 = blockIdx.x * kBQ;
 	const int wrow0 = q0 + warp * 16;
 
@@ -56,22 +57,22 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 	// Q fragments: staged through shared memory (rows past q_rows read as zeros)
 	{
 		half* stage = &sm.k[0][0] + warp * 16 * kKV; // both K buffers: 8 warps x 16 rows x 136 halves
-		for ( int idx = lane; idx < 16 * 16; idx += 32 ) {
-			const int r = idx >> 4, c = idx & 15;
+		for ( unsigned idx = lane; idx < 16u * kC; idx += 32 ) {
+			const unsigned r = idx / kC, c = idx % kC;
 			uint4 val = make_uint4( 0, 0, 0, 0 );
 			if ( wrow0 + r < q_rows ) { val = __ldg( reinterpret_cast<const uint4*>( qh + static_cast<size_t>( wrow0 + r ) * stride ) + c ); }
 			*reinterpret_cast<uint4*>( stage + r * kKV + c * 8 ) = val;
 		}
 		__syncwarp();
 	}
-	wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qa[8];
+	wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qa[kNd];
 	#pragma unroll
-	for ( int kk = 0; kk < 8; ++kk ) { wmma::load_matrix_sync( qa[kk], &sm.k[0][0] + warp * 16 * kKV + kk * 16, kKV ); }
+	for ( int kk = 0; kk < kNd; ++kk ) { wmma::load_matrix_sync( qa[kk], &sm.k[0][0] + warp * 16 * kKV + kk * 16, kKV ); }
 	__syncthreads(); // the staging area is K buffer storage
 
-	wmma::fragment<wmma::accumulator, 16, 16, 16, float> o[8];
+	wmma::fragment<wmma::accumulator, 16, 16, 16, float> o[kNd];
 	#pragma unroll
-	for ( int dn = 0; dn < 8; ++dn ) { wmma::fill_fragment( o[dn], 0.0f ); }
+	for ( int dn = 0; dn < kNd; ++dn ) { wmma::fill_fragment( o[dn], 0.0f ); }
 	float m[2] = { -INFINITY, -INFINITY }, l[2] = { 0.0f, 0.0f };
 	// partial passes (mode bit 0: continue from the saved state, bit 1: save the state instead of finishing): the accumulators of earlier key ranges
 	if constexpr ( Load ) {
@@ -85,12 +86,12 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 			}
 		}
 		#pragma unroll
-		for ( int dn = 0; dn < 8; ++dn ) {
+		for ( int dn = 0; dn < kNd; ++dn ) {
 			#pragma unroll
 			for ( int e = 0; e < 8; e += 2 ) {
 				const int row = wrow0 + row_base + ( ( e >> 1 ) & 1 ) * 2, col = dn * 16 + col_base + ( ( e >> 2 ) & 1 ) * 4;
 				if ( row < q_rows ) {
-					const float2 v2 = *reinterpret_cast<const float2*>( ostate + static_cast<size_t>( row ) * stride + head * kD + col );
+					const float2 v2 = *reinterpret_cast<const float2*>( ostate + static_cast<size_t>( row ) * stride + head * D + col );
 					o[dn].x[e] = v2.x;
 					o[dn].x[e + 1] = v2.y;
 				}
@@ -102,12 +103,12 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 	int ntiles = ( k_rows + kBK - 1 ) / kBK;
 	if constexpr ( Causal ) { ntiles = min( ntiles, ( q0 + kBQ + kBK - 1 ) / kBK ); }
 	// each thread moves 4 uint4 of K and 4 of V per tile: global -> registers (issued before the math of the previous tile) -> shared (after it)
-	uint4 kreg[4], vreg[4];
+	uint4 kreg[kLd], vreg[kLd];
 	auto fetch = [&]( int t ) {
 		const int k0 = t * kBK, valid = min( kBK, k_rows - k0 );
 		#pragma unroll
-		for ( int u = 0; u < 4; ++u ) {
-			const int idx = tid + u * kThreads, r = idx >> 4, c = idx & 15;
+		for ( int u = 0; u < kLd; ++u ) {
+			const unsigned idx = tid + u * kThreads, r = idx / kC, c = idx % kC;
 			kreg[u] = make_uint4( 0, 0, 0, 0 );
 			vreg[u] = make_uint4( 0, 0, 0, 0 );
 			if ( r < valid ) {
@@ -118,8 +119,8 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 	};
 	auto stash = [&]( int buf ) {
 		#pragma unroll
-		for ( int u = 0; u < 4; ++u ) {
-			const int idx = tid + u * kThreads, r = idx >> 4, c = idx & 15;
+		for ( int u = 0; u < kLd; ++u ) {
+			const unsigned idx = tid + u * kThreads, r = idx / kC, c = idx % kC;
 			*reinterpret_cast<uint4*>( &sm.k[buf][r * kKV + c * 8] ) = kreg[u];
 			*reinterpret_cast<uint4*>( &sm.v[buf][r * kKV + c * 8] ) = vreg[u];
 		}
@@ -136,7 +137,7 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 		#pragma unroll
 		for ( int j = 0; j < 4; ++j ) { wmma::fill_fragment( s[j], 0.0f ); }
 		#pragma unroll
-		for ( int kk = 0; kk < 8; ++kk ) {
+		for ( int kk = 0; kk < kNd; ++kk ) {
 			#pragma unroll
 			for ( int j = 0; j < 4; ++j ) {
 				wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kb;
@@ -184,7 +185,7 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 			m[r] = mnew[r];
 		}
 		#pragma unroll
-		for ( int dn = 0; dn < 8; ++dn ) {
+		for ( int dn = 0; dn < kNd; ++dn ) {
 			#pragma unroll
 			for ( int i = 0; i < 8; ++i ) { o[dn].x[i] *= factor[( i >> 1 ) & 1]; }
 		}
@@ -202,7 +203,7 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 		#pragma unroll
 		for ( int kk = 0; kk < 4; ++kk ) { wmma::load_matrix_sync( pa[kk], sp + kk * 16, kPS ); }
 		#pragma unroll
-		for ( int dn = 0; dn < 8; ++dn ) {
+		for ( int dn = 0; dn < kNd; ++dn ) {
 			#pragma unroll
 			for ( int kk = 0; kk < 4; ++kk ) {
 				wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vb;
@@ -215,11 +216,11 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 
 	if constexpr ( Store ) {
 		#pragma unroll
-		for ( int dn = 0; dn < 8; ++dn ) {
+		for ( int dn = 0; dn < kNd; ++dn ) {
 			#pragma unroll
 			for ( int e = 0; e < 8; e += 2 ) {
 				const int row = wrow0 + row_base + ( ( e >> 1 ) & 1 ) * 2, col = dn * 16 + col_base + ( ( e >> 2 ) & 1 ) * 4;
-				if ( row < q_rows ) { *reinterpret_cast<float2*>( ostate + static_cast<size_t>( row ) * stride + head * kD + col ) = make_float2( o[dn].x[e], o[dn].x[e + 1] ); }
+				if ( row < q_rows ) { *reinterpret_cast<float2*>( ostate + static_cast<size_t>( row ) * stride + head * D + col ) = make_float2( o[dn].x[e], o[dn].x[e + 1] ); }
 			}
 		}
 		#pragma unroll
@@ -238,7 +239,7 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 		inv[r] = ls > 0.0f ? 1.0f / ls : 0.0f;
 	}
 	#pragma unroll
-	for ( int dn = 0; dn < 8; ++dn ) {
+	for ( int dn = 0; dn < kNd; ++dn ) {
 		#pragma unroll
 		for ( int e = 0; e < 8; e += 2 ) {
 			const int r = ( e >> 1 ) & 1;
@@ -253,33 +254,36 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 } // namespace
 
 // the shared-memory opt-in is per device (the DiT runs one thread per GPU)
-template <bool Causal, bool Load, bool Store>
-static void configure() {
+template <int D, bool Causal, bool Load, bool Store>
+static void run( int q_rows, int k_rows, int heads, const half* q, const half* k, const half* v, half* out, float scale_log2, float* so, float2* sml, cudaStream_t stream ) {
 	static std::mutex mu;
-	static std::bitset<64> configured;
+	static std::bitset<64> configured; // the shared-memory opt-in is per device (the DiT runs one thread per GPU)
 	int dev = 0;
 	CUDA_CHECK( cudaGetDevice( &dev ) );
-	std::lock_guard<std::mutex> lock( mu );
-	if ( !configured.test( dev & 63 ) ) {
-		CUDA_CHECK( cudaFuncSetAttribute( h3_attn_d128<Causal, Load, Store>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( sizeof( Smem ) ) ) );
-		configured.set( dev & 63 );
+	{
+		std::lock_guard<std::mutex> lock( mu );
+		if ( !configured.test( dev & 63 ) ) {
+			CUDA_CHECK( cudaFuncSetAttribute( h3_attn<D, Causal, Load, Store>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( sizeof( Smem<D> ) ) ) );
+			configured.set( dev & 63 );
+		}
 	}
+	const dim3 grid( ( q_rows + kBQ - 1 ) / kBQ, heads );
+	h3_attn<D, Causal, Load, Store><<<grid, kThreads, sizeof( Smem<D> ), stream>>>( q, k, v, out, q_rows, k_rows, heads, scale_log2, so, sml );
+	CUDA_CHECK( cudaGetLastError() );
 }
 
-bool h3_attention( const half* q, const half* k, const half* v, half* out, int q_rows, int k_rows, int heads, float scale, bool causal, cudaStream_t stream ) {
+bool h3_attention( const half* q, const half* k, const half* v, half* out, int q_rows, int k_rows, int heads, float scale, bool causal, cudaStream_t stream, int head_dim ) {
 	if ( q_rows <= 0 ) { return true; }
-	if ( k_rows <= 0 || heads <= 0 ) { return false; }
-	const size_t smem = sizeof( Smem );
-	const dim3 grid( ( q_rows + kBQ - 1 ) / kBQ, heads );
-	const float scale_log2 = scale * 1.4426950408889634f;
-	if ( causal ) {
-		configure<true, false, false>();
-		h3_attn_d128<true, false, false><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, scale_log2, nullptr, nullptr );
+	if ( k_rows <= 0 || heads <= 0 || ( head_dim != 128 && head_dim != 64 ) ) { return false; }
+	const float sl = scale * 1.4426950408889634f;
+	if ( head_dim == 64 ) {
+		if ( causal ) { return false; }
+		run<64, false, false, false>( q_rows, k_rows, heads, q, k, v, out, sl, nullptr, nullptr, stream );
+	} else if ( causal ) {
+		run<128, true, false, false>( q_rows, k_rows, heads, q, k, v, out, sl, nullptr, nullptr, stream );
 	} else {
-		configure<false, false, false>();
-		h3_attn_d128<false, false, false><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, scale_log2, nullptr, nullptr );
+		run<128, false, false, false>( q_rows, k_rows, heads, q, k, v, out, sl, nullptr, nullptr, stream );
 	}
-	CUDA_CHECK( cudaGetLastError() );
 	return true;
 }
 
@@ -287,23 +291,16 @@ bool h3_attention_partial( const half* q, const half* k, const half* v, half* ou
 	cudaStream_t stream ) {
 	if ( q_rows <= 0 ) { return true; }
 	if ( k_rows <= 0 || heads <= 0 || !state_o || !state_ml || ( last && !out ) ) { return false; }
-	const size_t smem = sizeof( Smem );
-	const dim3 grid( ( q_rows + kBQ - 1 ) / kBQ, heads );
 	const float sl = scale * 1.4426950408889634f;
 	if ( first && last ) {
-		configure<false, false, false>();
-		h3_attn_d128<false, false, false><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, sl, nullptr, nullptr );
+		run<128, false, false, false>( q_rows, k_rows, heads, q, k, v, out, sl, nullptr, nullptr, stream );
 	} else if ( first ) {
-		configure<false, false, true>();
-		h3_attn_d128<false, false, true><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, sl, state_o, state_ml );
+		run<128, false, false, true>( q_rows, k_rows, heads, q, k, v, out, sl, state_o, state_ml, stream );
 	} else if ( last ) {
-		configure<false, true, false>();
-		h3_attn_d128<false, true, false><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, sl, state_o, state_ml );
+		run<128, false, true, false>( q_rows, k_rows, heads, q, k, v, out, sl, state_o, state_ml, stream );
 	} else {
-		configure<false, true, true>();
-		h3_attn_d128<false, true, true><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, sl, state_o, state_ml );
+		run<128, false, true, true>( q_rows, k_rows, heads, q, k, v, out, sl, state_o, state_ml, stream );
 	}
-	CUDA_CHECK( cudaGetLastError() );
 	return true;
 }
 

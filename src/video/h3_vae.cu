@@ -78,7 +78,7 @@ __global__ void k_vit_rope( float* cosb, float* sinb, int T, int H, int W, int S
 	}
 }
 
-// qkv [S, 32 heads, (q|k|v) x 64] + bias -> q/k RMSNorm (no weight) + rotary on the first 48 dims -> zero-padded [S, 32, 128] q/k/v
+// qkv [S, 32 heads, (q|k|v) x 64] + bias -> q/k RMSNorm (no weight) + rotary on the first 48 dims -> [S, 32, 64] q/k/v
 __global__ void k_vit_qkv( const half* qkv, const float* bias, const float* cosb, const float* sinb, half* qo, half* ko, half* vo, int S ) {
 	__shared__ float sm[8][2][64];
 	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -107,7 +107,7 @@ __global__ void k_vit_qkv( const half* qkv, const float* bias, const float* cosb
 		sm[warp][1][lane + 32 * i] = k[i] * ik;
 	}
 	__syncwarp();
-	const size_t ob = ( static_cast<size_t>( s ) * kHeads + head ) * 128;
+	const size_t ob = ( static_cast<size_t>( s ) * kHeads + head ) * kHd;
 	#pragma unroll
 	for ( int i = 0; i < 2; ++i ) {
 		const int d = lane + 32 * i;
@@ -127,14 +127,6 @@ __global__ void k_vit_qkv( const half* qkv, const float* bias, const float* cosb
 		ko[ob + d] = __float2half_rn( ok );
 		vo[ob + d] = __float2half_rn( v[i] );
 	}
-}
-
-__global__ void k_unpad( const half* o, half* out, int S ) {
-	const size_t n = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
-	if ( n >= static_cast<size_t>( S ) * kDim ) { return; }
-	const size_t s = n / kDim;
-	const int c = static_cast<int>( n % kDim );
-	out[n] = o[( s * kHeads + c / 64 ) * 128 + c % 64];
 }
 
 __global__ void k_layernorm( const float* x, const float* w, const float* b, float* out, int H, float eps ) {
@@ -384,9 +376,8 @@ struct H3VideoVAE::Impl {
 			k_norm_mod<half><<<S, 256, 0, s>>>( x, nullptr, nullptr, 0, b.n1, nullptr, nullptr, 0, nullptr, kDim, 1e-5f, h16 );
 			gemm_h( h16, b.qkv, qkv16, S, 3 * kDim, kDim, false );
 			k_vit_qkv<<<dim3( S, kHeads / 8 ), 256, 0, s>>>( qkv16, b.qkv_b, cosb, sinb, qp, kp, vp, S );
-			h3_attention( qp, kp, vp, op, S, S, kHeads, 0.125f, false, s );
-			k_unpad<<<( static_cast<size_t>( S ) * kDim + 255 ) / 256, 256, 0, s>>>( op, o16, S );
-			gemm_h( o16, b.out, br, S, kDim, kDim, true );
+			h3_attention( qp, kp, vp, op, S, S, kHeads, 0.125f, false, s, kHd );
+			gemm_h( op, b.out, br, S, kDim, kDim, true ); // the attention output is already [S, 32 x 64]
 			k_add_gated<<<S, 256, 0, s>>>( x, br, nullptr, b.s1, 0, nullptr, kDim, b.out_b );
 			k_norm_mod<half><<<S, 256, 0, s>>>( x, nullptr, nullptr, 0, b.n2, nullptr, nullptr, 0, nullptr, kDim, 1e-5f, h16 );
 			gemm_h( h16, b.w1, f1, S, 2 * kFf, kDim, false );
@@ -534,7 +525,7 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens ) {
 		s.d_std = ds;
 	}
 	const size_t S = static_cast<size_t>( max_tokens );
-	size_t need = S * kDim * 4 * 3 + S * 24 * 4 * 4 + S * 4 + S * kPatchPix * 4 + S * kDim * 2 * 2 + S * 3 * kDim * 2 + S * kHeads * 128 * 2 * 4 + S * 2 * kFf * 2 + S * kFf * 2 + ( 64ULL << 20 );
+	size_t need = S * kDim * 4 * 3 + S * 24 * 4 * 4 + S * 4 + S * kPatchPix * 4 + S * kDim * 2 * 2 + S * 3 * kDim * 2 + S * kHeads * kHd * 2 * 4 + S * 2 * kFf * 2 + S * kFf * 2 + ( 64ULL << 20 );
 	if ( !h3_scratch_arena_create( s.sarena, device, need ) ) { return false; }
 	s.x = s.alloc<float>( s.sarena, S * kDim );
 	s.br = s.alloc<float>( s.sarena, S * kDim );
@@ -548,16 +539,12 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens ) {
 	s.h16 = s.alloc<half>( s.sarena, S * kDim );
 	s.o16 = s.alloc<half>( s.sarena, S * kDim );
 	s.qkv16 = s.alloc<half>( s.sarena, S * 3 * kDim );
-	s.qp = s.alloc<half>( s.sarena, S * kHeads * 128 );
-	s.kp = s.alloc<half>( s.sarena, S * kHeads * 128 );
-	s.vp = s.alloc<half>( s.sarena, S * kHeads * 128 );
-	s.op = s.alloc<half>( s.sarena, S * kHeads * 128 );
+	s.qp = s.alloc<half>( s.sarena, S * kHeads * kHd );
+	s.kp = s.alloc<half>( s.sarena, S * kHeads * kHd );
+	s.vp = s.alloc<half>( s.sarena, S * kHeads * kHd );
+	s.op = s.alloc<half>( s.sarena, S * kHeads * kHd );
 	s.f1 = s.alloc<half>( s.sarena, S * 2 * kFf );
 	s.f2 = s.alloc<half>( s.sarena, S * kFf );
-	// padded head dims stay zero: the kernel writes only dims 0..63
-	CUDA_CHECK( cudaMemset( s.qp, 0, S * kHeads * 128 * 2 ) );
-	CUDA_CHECK( cudaMemset( s.kp, 0, S * kHeads * 128 * 2 ) );
-	CUDA_CHECK( cudaMemset( s.vp, 0, S * kHeads * 128 * 2 ) );
 	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against
 	return true;
 }
