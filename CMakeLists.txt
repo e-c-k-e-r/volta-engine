@@ -101,6 +101,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/embedding.cu
 	src/backend/cuda/modules/vision.cu
 	src/backend/cuda/modules/linear_trellis.cu
+	src/video/h3_dit.cu
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
 	src/spec/dflash_backbone.cu
@@ -469,3 +470,6 @@ if(NOT ENGINE_BACKEND STREQUAL "CPU")
 endif()
 include(${PROJECT_SOURCE_DIR}/cmake/ops_tests_linear.cmake OPTIONAL)
 include(${PROJECT_SOURCE_DIR}/cmake/ops_tests_attention.cmake OPTIONAL)
+add_executable(test_h3_dit tests/2_parity/test_h3_dit.cpp)
+target_link_libraries(test_h3_dit PRIVATE engine_kernels)
+set_target_properties(test_h3_dit PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
