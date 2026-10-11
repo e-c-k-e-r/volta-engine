@@ -46,6 +46,8 @@ public:
 	// Full decode of a DiT latent z [24, T, H, W] (device, fp32, as produced by unpatchifying the denoised rows): returns RGB uint8 frames
 	// [F, 16H, 16W, 3] on the host.
 	bool decode_video( const float* d_z, int T, int H, int W, std::vector<uint8_t>& rgb, int& frames );
+	// The same with the tiles of every temporal clip decoded by several decoders (vaes[0] on the GPU that holds d_z and assembles the frames, the others on other GPUs).
+	static bool decode_video( const std::vector<H3VideoVAE*>& vaes, const float* d_z, int T, int H, int W, std::vector<uint8_t>& rgb, int& frames );
 
 	const H3VaeParams& params() const;
 	size_t weight_bytes() const;

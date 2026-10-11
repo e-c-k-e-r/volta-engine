@@ -44,8 +44,12 @@ bool H3Run::decode() {
 	k_unpatchify<<<( target_floats + 255 ) / 256, 256>>>( d_vrows + static_cast<size_t>( n_cond ) * 96, d_z, latent_t, lh / 2, lw / 2 );
 	CUDA_CHECK( cudaDeviceSynchronize() );
 	{
-		H3Lease<H3VideoVAE> vae = comp.video_vae();
-		if ( !vae || !vae->decode_video( d_z, latent_t, lh, lw, rgb, out_frames ) ) { LOG_ERROR( "H3: video decode failed" ); return false; }
+		std::vector<int> devices = paths.devices;
+		if ( devices.empty() ) { devices.push_back( paths.device ); }
+		std::vector<H3Lease<H3VideoVAE>> leases = comp.video_vaes( devices );
+		std::vector<H3VideoVAE*> vaes;
+		for ( auto& l : leases ) { vaes.push_back( &*l ); }
+		if ( vaes.empty() || !H3VideoVAE::decode_video( vaes, d_z, latent_t, lh, lw, rgb, out_frames ) ) { LOG_ERROR( "H3: video decode failed" ); return false; }
 	}
 	{
 		H3Lease<H3AudioVAE> avae = comp.audio_vae();

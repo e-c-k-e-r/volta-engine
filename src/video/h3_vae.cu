@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
+#include <thread>
 #include <cstring>
 #include <string>
 
@@ -367,6 +368,7 @@ struct H3VideoVAE::Impl {
 	}
 
 	void tile( const float* z, int T, int H, int W, float* pix ) {
+		CUDA_CHECK( cudaSetDevice( device ) );
 		const int N = T * H * W, S = N + kSuffix;
 		if ( S > max_tokens ) { std::fprintf( stderr, "H3 VAE: tile %dx%dx%d (%d tokens) exceeds scratch %d\n", T, H, W, S, max_tokens ); std::_Exit( 1 ); }
 		cudaStream_t s = stream;
@@ -398,31 +400,59 @@ struct H3VideoVAE::Impl {
 		k_unpatch<<<( static_cast<size_t>( N ) * kPatchPix + 255 ) / 256, 256, 0, s>>>( proj, pix, T, H, W );
 	}
 
-	// One temporal clip (denormalized z_clip [24, Tc, H, W]) -> pixels [3, 4 Tc, Hp, Wp] with spatial tiling and blending
-	void clip( const float* z_clip, int Tc, int H, int W, float* out ) {
+	// One temporal clip (denormalized z_clip [24, Tc, H, W], on this instance's device) -> pixels [3, 4 Tc, Hp, Wp] (on this device) with spatial tiling and blending.
+	// The tiles are decoded by `workers` (this instance first, one per GPU, one thread each, tile k on worker k % n) and gathered here to be placed.
+	void clip( const std::vector<Impl*>& workers, const float* z_clip, int Tc, int H, int W, float* out ) {
 		const int ratio = par.vae_ratio;
 		const int Hp = H * ratio, Wp = W * ratio, F = Tc * par.vae_ratio_t;
 		const Tiles ty = split_tiles( Hp, par.tile_size, par.tile_overlap_min, ratio ), tx = split_tiles( Wp, par.tile_size, par.tile_overlap_min, ratio );
 		const int ni = static_cast<int>( ty.start.size() ), nj = static_cast<int>( tx.start.size() );
+		const int nw = static_cast<int>( workers.size() );
 		std::vector<float*> tiles( static_cast<size_t>( ni ) * nj, nullptr );
 		std::vector<int> th( ni ), tw( nj );
 		for ( int i = 0; i < ni; ++i ) { th[i] = ty.len[i]; }
 		for ( int j = 0; j < nj; ++j ) { tw[j] = tx.len[j]; }
+		CUDA_CHECK( cudaSetDevice( device ) );
 		for ( int i = 0; i < ni; ++i ) {
-			for ( int j = 0; j < nj; ++j ) {
-				const int ih = th[i] / ratio, iw = tw[j] / ratio, y0 = ty.start[i] / ratio, x0 = tx.start[j] / ratio;
-				float* sub = nullptr;
-				const size_t sub_n = static_cast<size_t>( 24 ) * Tc * ih * iw;
-				CUDA_CHECK( cudaMalloc( &sub, sub_n * sizeof( float ) ) );
-				k_crop_latent<<<( sub_n + 255 ) / 256, 256, 0, stream>>>( z_clip, sub, Tc, H, W, y0, x0, ih, iw );
-				float* pix = nullptr;
-				CUDA_CHECK( cudaMalloc( &pix, static_cast<size_t>( 3 ) * F * th[i] * tw[j] * sizeof( float ) ) );
-				tile( sub, Tc, ih, iw, pix );
-				CUDA_CHECK( cudaStreamSynchronize( stream ) );
-				CUDA_CHECK( cudaFree( sub ) );
-				tiles[static_cast<size_t>( i ) * nj + j] = pix;
-			}
+			for ( int j = 0; j < nj; ++j ) { CUDA_CHECK( cudaMalloc( &tiles[static_cast<size_t>( i ) * nj + j], static_cast<size_t>( 3 ) * F * th[i] * tw[j] * sizeof( float ) ) ); }
 		}
+		// the latent chunk on every worker's device
+		const size_t zbytes = static_cast<size_t>( 24 ) * Tc * H * W * sizeof( float );
+		std::vector<float*> zl( nw, nullptr );
+		zl[0] = const_cast<float*>( z_clip );
+		for ( int w = 1; w < nw; ++w ) {
+			CUDA_CHECK( cudaSetDevice( workers[w]->device ) );
+			CUDA_CHECK( cudaMalloc( &zl[w], zbytes ) );
+			CUDA_CHECK( cudaMemcpyPeer( zl[w], workers[w]->device, z_clip, device, zbytes ) );
+		}
+		std::vector<std::thread> threads;
+		for ( int w = 0; w < nw; ++w ) {
+			threads.emplace_back( [&, w] {
+				Impl& me = *workers[w];
+				CUDA_CHECK( cudaSetDevice( me.device ) );
+				for ( int k = w; k < ni * nj; k += nw ) {
+					const int i = k / nj, j = k % nj;
+					const int ih = th[i] / ratio, iw = tw[j] / ratio, y0 = ty.start[i] / ratio, x0 = tx.start[j] / ratio;
+					const size_t sub_n = static_cast<size_t>( 24 ) * Tc * ih * iw, pix_n = static_cast<size_t>( 3 ) * F * th[i] * tw[j];
+					float* sub = nullptr;
+					CUDA_CHECK( cudaMalloc( &sub, sub_n * sizeof( float ) ) );
+					k_crop_latent<<<( sub_n + 255 ) / 256, 256, 0, me.stream>>>( zl[w], sub, Tc, H, W, y0, x0, ih, iw );
+					float* pix = tiles[k];
+					if ( w != 0 ) { CUDA_CHECK( cudaMalloc( &pix, pix_n * sizeof( float ) ) ); }
+					me.tile( sub, Tc, ih, iw, pix );
+					if ( w != 0 ) { CUDA_CHECK( cudaMemcpyPeerAsync( tiles[k], device, pix, me.device, pix_n * sizeof( float ), me.stream ) ); }
+					CUDA_CHECK( cudaStreamSynchronize( me.stream ) );
+					CUDA_CHECK( cudaFree( sub ) );
+					if ( w != 0 ) { CUDA_CHECK( cudaFree( pix ) ); }
+				}
+			} );
+		}
+		for ( std::thread& t : threads ) { t.join(); }
+		for ( int w = 1; w < nw; ++w ) {
+			CUDA_CHECK( cudaSetDevice( workers[w]->device ) );
+			CUDA_CHECK( cudaFree( zl[w] ) );
+		}
+		CUDA_CHECK( cudaSetDevice( device ) );
 		for ( int i = 0; i < ni; ++i ) {
 			for ( int j = 0; j < nj; ++j ) {
 				const float* t = tiles[static_cast<size_t>( i ) * nj + j];
@@ -538,7 +568,14 @@ void H3VideoVAE::decode_tile( const float* d_z, int T, int H, int W, float* d_pi
 }
 
 bool H3VideoVAE::decode_video( const float* d_z, int T, int H, int W, std::vector<uint8_t>& rgb, int& frames ) {
-	Impl& s = *p_;
+	return decode_video( { this }, d_z, T, H, W, rgb, frames );
+}
+
+bool H3VideoVAE::decode_video( const std::vector<H3VideoVAE*>& vaes, const float* d_z, int T, int H, int W, std::vector<uint8_t>& rgb, int& frames ) {
+	Impl& s = *vaes[0]->p_;
+	std::vector<Impl*> workers;
+	for ( H3VideoVAE* v : vaes ) { workers.push_back( v->p_ ); }
+	CUDA_CHECK( cudaSetDevice( s.device ) );
 	const H3VaeParams& P = s.par;
 	const int rt = P.vae_ratio_t, ratio = P.vae_ratio;
 	const int tokens_chunk = ( P.clip_length + rt - 1 ) / rt;                          // 5
@@ -594,7 +631,7 @@ bool H3VideoVAE::decode_video( const float* d_z, int T, int H, int W, std::vecto
 		const int Fc = n * rt;
 		float* cd = nullptr;
 		CUDA_CHECK( cudaMalloc( &cd, static_cast<size_t>( 3 ) * Fc * plane * sizeof( float ) ) );
-		s.clip( zc, n, H, W, cd );
+		s.clip( workers, zc, n, H, W, cd );
 		CUDA_CHECK( cudaFree( zc ) );
 		for ( int j = 0; j < split_count; ++j ) {
 			const int f_start = j * chunk_dec;

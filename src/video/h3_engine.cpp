@@ -41,6 +41,23 @@ H3Lease<H3VideoVAE> H3Components::video_vae() {
 	return H3Lease<H3VideoVAE>( std::move( vae ) );
 }
 
+std::vector<H3Lease<H3VideoVAE>> H3Components::video_vaes( const std::vector<int>& devices ) {
+	std::vector<int> order{ paths_.device };
+	for ( int d : devices ) { if ( d != paths_.device ) { order.push_back( d ); } }
+	std::vector<H3Lease<H3VideoVAE>> out;
+	for ( int d : order ) {
+		CUDA_CHECK( cudaSetDevice( d ) );
+		auto vae = std::make_unique<H3VideoVAE>();
+		if ( !vae->load( ( paths_.root + "/video_vae" ).c_str(), d ) ) {
+			if ( d == paths_.device ) { out.clear(); break; } // the primary is required
+			continue;
+		}
+		out.push_back( H3Lease<H3VideoVAE>( std::move( vae ) ) );
+	}
+	CUDA_CHECK( cudaSetDevice( paths_.device ) );
+	return out;
+}
+
 H3Lease<H3AudioVAE> H3Components::audio_vae() {
 	CUDA_CHECK( cudaSetDevice( paths_.device ) );
 	auto vae = std::make_unique<H3AudioVAE>();
