@@ -9,4 +9,10 @@ namespace engine::video {
 
 bool h3_attention( const half* q, const half* k, const half* v, half* out, int q_rows, int k_rows, int heads, float scale, bool causal, cudaStream_t stream );
 
+// The same attention over a key range, continued across calls so that keys can be processed as they arrive (sequence-parallel K/V exchange). `state_o` is FP32
+// [q_rows, heads, 128] and `state_ml` float2 [q_rows, heads] (running max in log2 units, running sum); `first` starts from nothing, `last` writes the normalized `out`
+// (earlier calls may pass out = nullptr). Not causal.
+bool h3_attention_partial( const half* q, const half* k, const half* v, half* out, float* state_o, float2* state_ml, int q_rows, int k_rows, int heads, float scale, bool first, bool last,
+	cudaStream_t stream );
+
 } // namespace engine::video

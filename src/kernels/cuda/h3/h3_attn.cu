@@ -34,9 +34,9 @@ __device__ __forceinline__ float warp_row_sum( float x ) {
 }
 
 // q: [q_rows, heads, 128] ...; one block = 128 query rows of one head
-template <bool Causal>
+template <bool Causal, bool Load, bool Store>
 __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __restrict__ q, const half* __restrict__ k, const half* __restrict__ v, half* __restrict__ out, int q_rows,
-	int k_rows, int heads, float scale_log2 ) {
+	int k_rows, int heads, float scale_log2, float* __restrict__ ostate, float2* __restrict__ mlstate ) {
 	extern __shared__ __align__( 16 ) unsigned char smem_raw[];
 	Smem& sm = *reinterpret_cast<Smem*>( smem_raw );
 	const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -73,6 +73,30 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 	#pragma unroll
 	for ( int dn = 0; dn < 8; ++dn ) { wmma::fill_fragment( o[dn], 0.0f ); }
 	float m[2] = { -INFINITY, -INFINITY }, l[2] = { 0.0f, 0.0f };
+	// partial passes (mode bit 0: continue from the saved state, bit 1: save the state instead of finishing): the accumulators of earlier key ranges
+	if constexpr ( Load ) {
+		#pragma unroll
+		for ( int r = 0; r < 2; ++r ) {
+			const int row = wrow0 + row_base + r * 2;
+			if ( row < q_rows ) {
+				const float2 ml = mlstate[static_cast<size_t>( row ) * heads + head];
+				m[r] = ml.x;
+				l[r] = ( lane & 0xa ) == 0 ? ml.y : 0.0f; // l is a per-lane partial sum until the row reduction; one lane of the row group carries the saved total
+			}
+		}
+		#pragma unroll
+		for ( int dn = 0; dn < 8; ++dn ) {
+			#pragma unroll
+			for ( int e = 0; e < 8; e += 2 ) {
+				const int row = wrow0 + row_base + ( ( e >> 1 ) & 1 ) * 2, col = dn * 16 + col_base + ( ( e >> 2 ) & 1 ) * 4;
+				if ( row < q_rows ) {
+					const float2 v2 = *reinterpret_cast<const float2*>( ostate + static_cast<size_t>( row ) * stride + head * kD + col );
+					o[dn].x[e] = v2.x;
+					o[dn].x[e + 1] = v2.y;
+				}
+			}
+		}
+	}
 	half* sp = sm.p[warp];
 
 	int ntiles = ( k_rows + kBK - 1 ) / kBK;
@@ -189,6 +213,23 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 		if ( t + 1 < ntiles ) { stash( buf ^ 1 ); }
 	}
 
+	if constexpr ( Store ) {
+		#pragma unroll
+		for ( int dn = 0; dn < 8; ++dn ) {
+			#pragma unroll
+			for ( int e = 0; e < 8; e += 2 ) {
+				const int row = wrow0 + row_base + ( ( e >> 1 ) & 1 ) * 2, col = dn * 16 + col_base + ( ( e >> 2 ) & 1 ) * 4;
+				if ( row < q_rows ) { *reinterpret_cast<float2*>( ostate + static_cast<size_t>( row ) * stride + head * kD + col ) = make_float2( o[dn].x[e], o[dn].x[e + 1] ); }
+			}
+		}
+		#pragma unroll
+		for ( int r = 0; r < 2; ++r ) {
+			const float ls = warp_row_sum( l[r] );
+			const int row = wrow0 + row_base + r * 2;
+			if ( ( lane & 0xa ) == 0 && row < q_rows ) { mlstate[static_cast<size_t>( row ) * heads + head] = make_float2( m[r], ls ); }
+		}
+		return;
+	}
 	// epilogue: O / l
 	float inv[2];
 	#pragma unroll
@@ -211,29 +252,56 @@ __global__ void __launch_bounds__( kThreads, 1 ) h3_attn_d128( const half* __res
 
 } // namespace
 
-bool h3_attention( const half* q, const half* k, const half* v, half* out, int q_rows, int k_rows, int heads, float scale, bool causal, cudaStream_t stream ) {
-	if ( q_rows <= 0 ) { return true; }
-	if ( k_rows <= 0 || heads <= 0 ) { return false; }
-	const size_t smem = sizeof( Smem );
-	// the shared-memory opt-in is per device (the DiT runs one thread per GPU)
+// the shared-memory opt-in is per device (the DiT runs one thread per GPU)
+template <bool Causal, bool Load, bool Store>
+static void configure() {
 	static std::mutex mu;
 	static std::bitset<64> configured;
 	int dev = 0;
 	CUDA_CHECK( cudaGetDevice( &dev ) );
-	{
-		std::lock_guard<std::mutex> lock( mu );
-		if ( !configured.test( dev & 63 ) ) {
-			CUDA_CHECK( cudaFuncSetAttribute( h3_attn_d128<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( smem ) ) );
-			CUDA_CHECK( cudaFuncSetAttribute( h3_attn_d128<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( smem ) ) );
-			configured.set( dev & 63 );
-		}
+	std::lock_guard<std::mutex> lock( mu );
+	if ( !configured.test( dev & 63 ) ) {
+		CUDA_CHECK( cudaFuncSetAttribute( h3_attn_d128<Causal, Load, Store>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( sizeof( Smem ) ) ) );
+		configured.set( dev & 63 );
 	}
+}
+
+bool h3_attention( const half* q, const half* k, const half* v, half* out, int q_rows, int k_rows, int heads, float scale, bool causal, cudaStream_t stream ) {
+	if ( q_rows <= 0 ) { return true; }
+	if ( k_rows <= 0 || heads <= 0 ) { return false; }
+	const size_t smem = sizeof( Smem );
 	const dim3 grid( ( q_rows + kBQ - 1 ) / kBQ, heads );
 	const float scale_log2 = scale * 1.4426950408889634f;
 	if ( causal ) {
-		h3_attn_d128<true><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, scale_log2 );
+		configure<true, false, false>();
+		h3_attn_d128<true, false, false><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, scale_log2, nullptr, nullptr );
 	} else {
-		h3_attn_d128<false><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, scale_log2 );
+		configure<false, false, false>();
+		h3_attn_d128<false, false, false><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, scale_log2, nullptr, nullptr );
+	}
+	CUDA_CHECK( cudaGetLastError() );
+	return true;
+}
+
+bool h3_attention_partial( const half* q, const half* k, const half* v, half* out, float* state_o, float2* state_ml, int q_rows, int k_rows, int heads, float scale, bool first, bool last,
+	cudaStream_t stream ) {
+	if ( q_rows <= 0 ) { return true; }
+	if ( k_rows <= 0 || heads <= 0 || !state_o || !state_ml || ( last && !out ) ) { return false; }
+	const size_t smem = sizeof( Smem );
+	const dim3 grid( ( q_rows + kBQ - 1 ) / kBQ, heads );
+	const float sl = scale * 1.4426950408889634f;
+	if ( first && last ) {
+		configure<false, false, false>();
+		h3_attn_d128<false, false, false><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, sl, nullptr, nullptr );
+	} else if ( first ) {
+		configure<false, false, true>();
+		h3_attn_d128<false, false, true><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, sl, state_o, state_ml );
+	} else if ( last ) {
+		configure<false, true, false>();
+		h3_attn_d128<false, true, false><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, sl, state_o, state_ml );
+	} else {
+		configure<false, true, true>();
+		h3_attn_d128<false, true, true><<<grid, kThreads, smem, stream>>>( q, k, v, out, q_rows, k_rows, heads, sl, state_o, state_ml );
 	}
 	CUDA_CHECK( cudaGetLastError() );
 	return true;

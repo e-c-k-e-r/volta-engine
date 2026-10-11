@@ -18,6 +18,16 @@ struct half_ptr_pair {
 	void* v = nullptr;
 };
 
+// The K/V exchange of a sequence-parallel layer, driven by the group; everything is enqueued on the DiT's compute stream (nothing blocks the GPU):
+//   begin(total_rows, stream): the local K/V slice is enqueued; publishes it and starts the pulls of every peer's slice into this rank's kfull / vfull
+//   wait_peer(peer, stream):   the compute stream waits until `peer`'s slice has arrived (the attention over it may follow)
+//   end(stream):               after the attention: this rank's slice may be rewritten once every peer has finished pulling it
+struct H3SpExchange {
+	std::function<void( int, void* )> begin;
+	std::function<void( int, void* )> wait_peer;
+	std::function<void( void* )> end;
+};
+
 struct H3Config {
 	int hidden = 5376;
 	int layers = 50;
@@ -88,9 +98,9 @@ public:
 	size_t weight_bytes() const;
 
 	// Sequence parallelism over several GPUs, each holding the full weights: this instance owns rows [row0, row0 + rows) of every packed sequence and
-	// all-gathers K and V per layer through `gather(total_rows, stream)` (called after the local K/V slice is enqueued on `stream`; it must return, with the
-	// copies complete on `stream`, once the slices of every rank are present in this rank's kfull / vfull). With n == 1 the instance runs the whole sequence as before.
-	void set_sp( int rank, int n, std::function<void( int total_rows, void* stream )> gather );
+	// all-gathers K and V per layer through `exchange`; the attention runs over the local keys first and then over each peer's slice as it arrives. With n == 1 the
+	// instance runs the whole sequence as before.
+	void set_sp( int rank, int n, H3SpExchange exchange );
 	half_ptr_pair kv_buffers() const;
 	int device() const;
 	// Sequence-parallel forward: outputs for the local rows only, as the full-width heads before row selection (vall [U, 96] and aall [U, 32] on the host,
