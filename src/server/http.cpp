@@ -8,6 +8,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <thread>
 
 namespace engine::server {
@@ -99,6 +103,11 @@ void Connection::on_writable() {
 	}
 }
 
+size_t Connection::queued() {
+	std::lock_guard<std::mutex> lock( mtx_ );
+	return out_.size();
+}
+
 void Connection::finish() {
 	std::lock_guard<std::mutex> lock( mtx_ );
 	if ( closed_.load() ) return;
@@ -114,6 +123,7 @@ void Connection::close_now() {
 const char* http_reason( int status ) {
 	switch ( status ) {
 		case 200: return "OK";
+		case 206: return "Partial Content";
 		case 400: return "Bad Request";
 		case 404: return "Not Found";
 		case 405: return "Method Not Allowed";
@@ -128,9 +138,9 @@ const char* http_reason( int status ) {
 	}
 }
 
-void send_response( const ConnPtr& c, int status, const std::string& content_type, const std::string& body ) {
+void send_response( const ConnPtr& c, int status, const std::string& content_type, const std::string& body, const std::string& extra_headers ) {
 	std::string head = "HTTP/1.1 " + std::to_string( status ) + " " + http_reason( status ) + "\r\nContent-Type: " + content_type +
-		"\r\nContent-Length: " + std::to_string( body.size() ) + "\r\nConnection: close\r\n\r\n";
+		"\r\nContent-Length: " + std::to_string( body.size() ) + "\r\nConnection: close\r\n" + extra_headers + "\r\n";
 	c->write_all( head + body );
 	c->finish();
 }
@@ -149,6 +159,44 @@ void send_error( const ConnPtr& c, int status, const std::string& type, const st
 		e["error"] = { { "message", message }, { "type", type }, { "param", nullptr }, { "code", nullptr } };
 	}
 	send_json( c, status, e.dump() );
+}
+
+void send_file( const ConnPtr& c, const HttpRequest& req, const std::string& path, const std::string& content_type ) {
+	std::ifstream f( path, std::ios::binary | std::ios::ate );
+	if ( !f ) return send_error( c, 404, "not_found_error", "no such file" );
+	const size_t size = static_cast<size_t>( f.tellg() );
+	size_t a = 0, b = size ? size - 1 : 0;
+	bool range = false;
+	const std::string spec = req.header( "range" );
+	if ( spec.compare( 0, 6, "bytes=" ) == 0 && size > 0 ) {
+		const size_t dash = spec.find( '-' );
+		if ( dash != std::string::npos ) {
+			if ( dash > 6 ) a = std::strtoull( spec.c_str() + 6, nullptr, 10 );
+			if ( dash + 1 < spec.size() ) b = std::min<size_t>( std::strtoull( spec.c_str() + dash + 1, nullptr, 10 ), size - 1 );
+			range = a <= b && a < size;
+		}
+	}
+	if ( !range ) {
+		a = 0;
+		b = size ? size - 1 : 0;
+	}
+	const size_t length = size ? b - a + 1 : 0;
+	std::string head = std::string( "HTTP/1.1 " ) + ( range ? "206 Partial Content" : "200 OK" ) + "\r\nContent-Type: " + content_type + "\r\nContent-Length: " + std::to_string( length ) +
+		"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n";
+	if ( range ) head += "Content-Range: bytes " + std::to_string( a ) + "-" + std::to_string( b ) + "/" + std::to_string( size ) + "\r\n";
+	head += "\r\n";
+	c->write_all( head );
+	constexpr size_t kChunk = size_t( 1 ) << 20, kHighWater = size_t( 4 ) << 20;
+	std::string chunk;
+	f.seekg( static_cast<std::streamoff>( a ) );
+	for ( size_t left = length; left > 0 && !c->closed(); ) {
+		while ( c->queued() > kHighWater && !c->closed() ) std::this_thread::sleep_for( std::chrono::milliseconds( 2 ) );
+		chunk.resize( std::min( kChunk, left ) );
+		f.read( chunk.data(), static_cast<std::streamsize>( chunk.size() ) );
+		if ( !c->write_all( chunk ) ) return;
+		left -= chunk.size();
+	}
+	c->finish();
 }
 
 bool start_sse( const ConnPtr& c ) {

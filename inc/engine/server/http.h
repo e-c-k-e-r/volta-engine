@@ -24,6 +24,8 @@ public:
 	~Connection() { close_now(); }
 
 	bool closed() const { return closed_.load(); }
+	// Bytes accepted by write_all() that the socket has not taken yet (for callers that stream a large body and wait for the queue to drain).
+	size_t queued();
 
 	// Appends whatever is readable to in. Returns false when the peer is gone (the connection is then closed).
 	bool read_some( std::string& in );
@@ -93,7 +95,10 @@ private:
 const char* http_reason( int status );
 
 // Complete response with Content-Length; closes the connection afterwards.
-void send_response( const ConnPtr& c, int status, const std::string& content_type, const std::string& body );
+void send_response( const ConnPtr& c, int status, const std::string& content_type, const std::string& body, const std::string& extra_headers = "" );
+// A file, honouring a single-range "Range: bytes=a-b" request (206 + Content-Range). Streams in chunks and waits for the socket, so it blocks the calling
+// thread: use it from a blocking route. 404 when the file cannot be opened.
+void send_file( const ConnPtr& c, const HttpRequest& req, const std::string& path, const std::string& content_type );
 void send_json( const ConnPtr& c, int status, const std::string& json );
 // OpenAI/Anthropic-shaped error body: {"error": {"message", "type"}} / {"type":"error","error":{...}}
 void send_error( const ConnPtr& c, int status, const std::string& type, const std::string& message, bool anthropic = false );

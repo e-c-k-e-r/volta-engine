@@ -78,6 +78,11 @@ set(ENGINE_HOST_SOURCES
 	src/server/server.cpp
 	src/server/monitor.cpp
 	src/server/monitor_page.cpp
+	src/server/video/adapters.cpp
+	src/server/video/jobs.cpp
+	src/server/video/service.cpp
+	src/server/video/api.cpp
+	src/server/video/page.cpp
 	src/server/system_stats.cpp
 )
 
@@ -538,7 +543,3 @@ set_target_properties(test_h3_fmha PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJEC
 add_executable(p2p_check tests/3_bench/p2p_check.cpp)
 target_link_libraries(p2p_check PRIVATE engine_kernels)
 set_target_properties(p2p_check PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(h3_server src/video/h3_server.cpp src/video/h3_ui.cpp)
-target_include_directories(h3_server PRIVATE src/video)
-target_link_libraries(h3_server PRIVATE engine_kernels pthread)
-set_target_properties(h3_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

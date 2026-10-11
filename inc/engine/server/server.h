@@ -6,6 +6,7 @@
 #include "engine/server/config.h"
 #include "engine/server/http.h"
 #include "engine/server/system_stats.h"
+#include "engine/server/video.h"
 
 #include <atomic>
 #include <map>
@@ -52,6 +53,7 @@ private:
 	std::atomic<bool> running_{ false };
 
 	std::unique_ptr<engine::runtime::Generator> generator_;
+	std::unique_ptr<VideoService> video_; // minimax_h3 checkpoints: the generation service instead of the language-model runtime
 	std::map<int, ConnPtr> conns_; // epoll thread only
 	Router router_;
 	std::unique_ptr<ChatProtocol> openai_;

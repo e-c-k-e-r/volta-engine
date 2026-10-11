@@ -1,6 +1,7 @@
 #include "engine/server/server.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
+#include "engine/server/video.h"
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -61,18 +62,26 @@ bool VoltaServer::init( const ServerConfig& config ) {
 	std::printf( "========================================================\n" );
 	std::fflush( stdout );
 
-	generator_ = std::make_unique<engine::runtime::Generator>();
-	if ( !generator_->init( config_ ) ) {
-		LOG_ERROR( "Failed to initialize Generator runtime.\n" );
-		return false;
-	}
-
 	std::string dir = config_.model_dir;
 	while ( dir.size() > 1 && dir.back() == '/' ) dir.pop_back();
 	const size_t slash = dir.find_last_of( '/' );
 	model_name_ = slash == std::string::npos ? dir : dir.substr( slash + 1 );
-	openai_ = make_openai_protocol();
-	anthropic_ = make_anthropic_protocol();
+	if ( config_.model_type == "minimax_h3" ) {
+		// video + audio generation: the job service owns the GPUs, there is no language-model runtime
+		video_ = std::make_unique<VideoService>();
+		if ( !video_->init( config_ ) ) {
+			LOG_ERROR( "Failed to initialize the video service.\n" );
+			return false;
+		}
+	} else {
+		generator_ = std::make_unique<engine::runtime::Generator>();
+		if ( !generator_->init( config_ ) ) {
+			LOG_ERROR( "Failed to initialize Generator runtime.\n" );
+			return false;
+		}
+		openai_ = make_openai_protocol();
+		anthropic_ = make_anthropic_protocol();
+	}
 	register_routes();
 
 	if ( !setup_socket() ) {
@@ -247,6 +256,11 @@ bool VoltaServer::parse_request( const ConnPtr& conn, HttpRequest* req ) {
 }
 
 void VoltaServer::register_routes() {
+	if ( video_ ) {
+		router_.add( "GET", "/health", [this]( const ConnPtr& c, const HttpRequest& ) { handle_health( c ); } );
+		video_->register_routes( router_ );
+		return;
+	}
 	router_.add( "GET", "/health", [this]( const ConnPtr& c, const HttpRequest& ) { handle_health( c ); } );
 	router_.add( "GET", "/", [this]( const ConnPtr& c, const HttpRequest& ) { handle_health( c ); } );
 	router_.add( "GET", "/metrics", [this]( const ConnPtr& c, const HttpRequest& ) { handle_metrics( c ); } );
@@ -409,6 +423,7 @@ void VoltaServer::stop() {
 		listen_fd_ = -1;
 	}
 
+	if ( video_ ) video_->stop();
 	if ( generator_ ) {
 		generator_->shutdown();
 		generator_.reset();

@@ -1,7 +1,9 @@
-// Single-page UI of h3_server (served at /).
-#include "h3_ui.h"
+// Single-page UI of the video service (served at /).
+#include "page.h"
 
-const char* h3_ui_html() {
+namespace engine::server {
+
+const char* video_page_html() {
 	return R"HTML(<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MiniMax-H3 on Volta</title>
@@ -63,7 +65,7 @@ input[type=range]{width:100%;accent-color:var(--acc)}
 </main>
 <script>
 const $=s=>document.querySelector(s);let info=null,imgs=[null,null],pick=0,rimgs=[],raud=[],rvid=[];
-const api=async(p,o)=>{const r=await fetch(p,o);if(!r.ok){let t=await r.text();throw new Error(t||r.status)}return r};
+const api=async(p,o)=>{const r=await fetch(p,o);if(!r.ok){let t=await r.text();try{const e=JSON.parse(t).error;t=(e&&e.message)||e||t}catch(_){}throw new Error(t||r.status)}return r};
 function canvas(aspect){let w,h;if(aspect>=1){w=768*aspect;h=768}else{w=768;h=768/aspect}const a=w*h,c=768*1344;if(a>c){const s=Math.sqrt(c/a);w*=s;h*=s}const al=v=>Math.max(32,Math.round(v/32)*32);return[al(w),al(h)]}
 function fillRes(){const [r,c]=$('#aspect').value.split(':').map(Number);const asp=r/c;const sizes=[];let [w,h]=canvas(asp);sizes.push([w,h,'full']);const f=[0.75,0.5,0.34];for(const k of f){const sw=Math.max(32,Math.round(w*k/32)*32),sh=Math.max(32,Math.round(h*k/32)*32);sizes.push([sw,sh,Math.round(k*100)+'%'])}
  $('#res').innerHTML=sizes.map(s=>`<option value="${s[0]}x${s[1]}">${s[0]}x${s[1]} (${s[2]})</option>`).join('');plan()}
@@ -112,3 +114,5 @@ function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','
 boot();
 </script></body></html>)HTML";
 }
+
+} // namespace engine::server
