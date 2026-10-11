@@ -1,8 +1,19 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace engine::server {
+
+// MiniMax-H3 (video + audio generation) settings; used when the checkpoint directory is an H3 pipeline (model_type "minimax_h3")
+struct VideoConfig {
+	std::string dit;                    // Comfy INT8 ConvRot transformer checkpoint of the FL2VA partition (text, keyframes)
+	std::string dit_ref2va;             // the Ref2VA partition (references); empty = no reference tasks
+	std::vector<std::string> lora_dirs; // directories scanned for adapters (turbo and community LoRAs)
+	std::string out_dir = "h3_jobs";    // job history and results
+	std::vector<int> devices;           // GPUs of the DiT (sequence parallel); empty = the first tp_size GPUs
+	int max_rows = 36000;               // largest packed sequence a job may need (text + references + audio + video rows)
+};
 
 struct ServerConfig {
 	std::string host = "0.0.0.0";
@@ -24,6 +35,7 @@ struct ServerConfig {
 	bool load_weights = true;
 	bool benchmark_mode = false;
 	int tp_size = 4;
+	VideoConfig video;
 
 	bool load_from_json( const char* json_path );
 	// Parses --config and the CLI, then resolves and validates (model_dir, model_type, draft dir). Exits with status 2 on error.

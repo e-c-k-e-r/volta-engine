@@ -20,7 +20,23 @@ values are fatal errors. The model type is never configured: it is read from the
 | `default_temperature`, `default_top_p`, `default_top_k` | `--temperature` | from the checkpoint's `generation_config.json` | sampling defaults for requests that omit them |
 | `default_enable_thinking` | | false | thinking on for requests that do not say |
 | `request_timeout_s` | | 30 | seconds a connection may stay silent before its request is complete |
+| `video` | see below | | MiniMax-H3 settings |
 | `options` | `--set key=value` | | the options below |
+
+## MiniMax-H3 (video and audio generation)
+
+A `model_dir` that is a MiniMax-H3 pipeline directory (it holds `model_index.json`; the FL2VA or Ref2VA component directory with `text_encoder`, `video_vae`,
+`audio_vae`, `tokenizer`) starts the generation service instead of the language-model runtime: a job queue with one worker that owns the GPUs, the job API
+(`/api/jobs`, `/api/info`) and a web page at `/`. `tp_size` is the number of GPUs the transformer is split over unless `devices` is given.
+
+| `video` key | CLI flag | Default | Description |
+|---|---|---|---|
+| `dit` | `--dit` | required | INT8 ConvRot transformer checkpoint of the FL2VA partition (text and keyframe tasks) |
+| `dit_ref2va` | `--dit-ref2va` | none | the Ref2VA partition; enables reference images, videos and audio |
+| `lora_dirs` | `--lora-dir` (repeatable) | none | directories scanned for adapters (turbo and community LoRAs) |
+| `out_dir` | `--out-dir` | `h3_jobs` | job history and results |
+| `devices` | `--devices 0,1,2,3` | the first `tp_size` GPUs | GPUs of the transformer |
+| `max_rows` | `--max-rows` | 36000 | largest packed sequence one job may need |
 
 ## Options
 

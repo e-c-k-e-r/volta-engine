@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <string>
 
 namespace engine::server {
@@ -102,6 +103,31 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 	if ( j.contains( "tp_size" ) && j["tp_size"].is_number_integer() ) {
 		tp_size = j["tp_size"].get<int>();
 	}
+	// "video": { "dit": ..., "dit_ref2va": ..., "lora_dirs": [...], "out_dir": ..., "devices": [...], "max_rows": N }
+	if ( j.contains( "video" ) ) {
+		if ( !j["video"].is_object() ) {
+			LOG_ERROR( "Error: \"video\" must be an object\n" );
+			return false;
+		}
+		const auto& v = j["video"];
+		for ( auto it = v.begin(); it != v.end(); ++it ) {
+			const std::string& k = it.key();
+			if ( k == "dit" && it->is_string() ) video.dit = it->get<std::string>();
+			else if ( k == "dit_ref2va" && it->is_string() ) video.dit_ref2va = it->get<std::string>();
+			else if ( k == "out_dir" && it->is_string() ) video.out_dir = it->get<std::string>();
+			else if ( k == "max_rows" && it->is_number_integer() ) video.max_rows = it->get<int>();
+			else if ( k == "lora_dirs" && it->is_array() ) {
+				for ( const auto& d : *it ) if ( d.is_string() ) video.lora_dirs.push_back( d.get<std::string>() );
+			}
+			else if ( k == "devices" && it->is_array() ) {
+				for ( const auto& d : *it ) if ( d.is_number_integer() ) video.devices.push_back( d.get<int>() );
+			}
+			else {
+				LOG_ERROR( "Error: unknown or invalid \"video\" key: %s\n", k.c_str() );
+				return false;
+			}
+		}
+	}
 	// "options": { "max_seq": 32768, "kv_format": "fp8", ... } -> runtime::Options fields
 	if ( j.contains( "options" ) && j["options"].is_object() ) {
 		for ( auto& [key, val] : j["options"].items() ) {
@@ -136,7 +162,23 @@ values are fatal errors. The model type is never configured: it is read from the
 | `default_temperature`, `default_top_p`, `default_top_k` | `--temperature` | from the checkpoint's `generation_config.json` | sampling defaults for requests that omit them |
 | `default_enable_thinking` | | false | thinking on for requests that do not say |
 | `request_timeout_s` | | 30 | seconds a connection may stay silent before its request is complete |
+| `video` | see below | | MiniMax-H3 settings |
 | `options` | `--set key=value` | | the options below |
+
+## MiniMax-H3 (video and audio generation)
+
+A `model_dir` that is a MiniMax-H3 pipeline directory (it holds `model_index.json`; the FL2VA or Ref2VA component directory with `text_encoder`, `video_vae`,
+`audio_vae`, `tokenizer`) starts the generation service instead of the language-model runtime: a job queue with one worker that owns the GPUs, the job API
+(`/api/jobs`, `/api/info`) and a web page at `/`. `tp_size` is the number of GPUs the transformer is split over unless `devices` is given.
+
+| `video` key | CLI flag | Default | Description |
+|---|---|---|---|
+| `dit` | `--dit` | required | INT8 ConvRot transformer checkpoint of the FL2VA partition (text and keyframe tasks) |
+| `dit_ref2va` | `--dit-ref2va` | none | the Ref2VA partition; enables reference images, videos and audio |
+| `lora_dirs` | `--lora-dir` (repeatable) | none | directories scanned for adapters (turbo and community LoRAs) |
+| `out_dir` | `--out-dir` | `h3_jobs` | job history and results |
+| `devices` | `--devices 0,1,2,3` | the first `tp_size` GPUs | GPUs of the transformer |
+| `max_rows` | `--max-rows` | 36000 | largest packed sequence one job may need |
 
 ## Options
 
@@ -217,6 +259,31 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 		else if ( ( std::strcmp( argv[i], "--tp-size" ) == 0 ) && i + 1 < argc ) {
 			tp_size = std::atoi( argv[++i] );
 		}
+		else if ( std::strcmp( argv[i], "--dit" ) == 0 && i + 1 < argc ) {
+			video.dit = argv[++i];
+		}
+		else if ( std::strcmp( argv[i], "--dit-ref2va" ) == 0 && i + 1 < argc ) {
+			video.dit_ref2va = argv[++i];
+		}
+		else if ( std::strcmp( argv[i], "--lora-dir" ) == 0 && i + 1 < argc ) {
+			video.lora_dirs.push_back( argv[++i] );
+		}
+		else if ( std::strcmp( argv[i], "--out-dir" ) == 0 && i + 1 < argc ) {
+			video.out_dir = argv[++i];
+		}
+		else if ( std::strcmp( argv[i], "--max-rows" ) == 0 && i + 1 < argc ) {
+			video.max_rows = std::atoi( argv[++i] );
+		}
+		else if ( std::strcmp( argv[i], "--devices" ) == 0 && i + 1 < argc ) {
+			video.devices.clear();
+			const std::string v = argv[++i];
+			for ( size_t p = 0; p < v.size(); ) {
+				video.devices.push_back( std::atoi( v.c_str() + p ) );
+				p = v.find( ',', p );
+				if ( p == std::string::npos ) break;
+				++p;
+			}
+		}
 		else if ( std::strcmp( argv[i], "--set" ) == 0 && i + 1 < argc ) {
 			const std::string kv = argv[++i];
 			const size_t eq = kv.find( '=' );
@@ -234,6 +301,30 @@ bool ServerConfig::resolve() {
 	if ( model_dir.empty() ) {
 		LOG_ERROR( "FATAL: model_dir is required (--model-dir or \"model_dir\" in the launch config)\n" );
 		return false;
+	}
+	// a MiniMax-H3 pipeline directory (diffusers layout) is recognized by its model_index.json
+	{
+		std::ifstream mi( model_dir + "/model_index.json" );
+		if ( mi ) {
+			std::stringstream ss;
+			ss << mi.rdbuf();
+			auto j = nlohmann::json::parse( ss.str(), nullptr, false );
+			if ( !j.is_discarded() && j.value( "_class_name", std::string() ) == "MiniMaxH3Pipeline" ) {
+				model_type = "minimax_h3";
+				if ( video.dit.empty() ) {
+					LOG_ERROR( "FATAL: a MiniMax-H3 server needs the transformer checkpoint (--dit or video.dit in the launch config)\n" );
+					return false;
+				}
+				if ( video.devices.empty() ) {
+					for ( int d = 0; d < tp_size; ++d ) video.devices.push_back( d );
+				}
+				if ( video.max_rows < 1024 ) {
+					LOG_ERROR( "FATAL: video.max_rows must be at least 1024\n" );
+					return false;
+				}
+				return true;
+			}
+		}
 	}
 	{
 		const std::string path = model_dir + "/config.json";
