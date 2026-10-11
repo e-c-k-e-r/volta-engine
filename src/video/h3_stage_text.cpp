@@ -55,7 +55,9 @@ bool H3Run::encode_prompt() {
 			std::string err;
 			if ( !engine::loader::prepare_image( di, vparams, &prep, &err ) ) { LOG_ERROR( "H3: image preparation failed: %s", err.c_str() ); return false; }
 			push( tok.encode( "<Picture " + std::to_string( i + 1 ) + ">: ", false ), 1 );
+			const auto tv0 = std::chrono::steady_clock::now();
 			if ( !vision( prep.patches, prep.grid_h, prep.grid_w ) ) { return false; }
+			LOG_INFO( "H3: vision tower %dx%d patches in %.1f s", prep.grid_h, prep.grid_w, seconds_since( tv0 ) );
 		}
 		int audio_label = 0;
 		for ( size_t k = 0; k < vids.size(); ++k ) {
@@ -74,11 +76,13 @@ bool H3Run::encode_prompt() {
 	if ( ids.empty() ) { return false; }
 	float* d_prompt = nullptr;
 	CUDA_CHECK( cudaMalloc( &d_prompt, ids.size() * 5120 * sizeof( float ) ) );
+	const auto tl0 = std::chrono::steady_clock::now();
 	{
 		H3TextEncoder enc;
 		if ( !enc.load( ( paths.root + "/text_encoder" ).c_str(), paths.device, std::max<int>( 8192, static_cast<int>( ids.size() ) ), 50 ) || !enc.encode_mm( ids, image_pad, feats, d_prompt ) ) { return false; }
 	}
 	res.t_text = seconds_since( t0 );
+	LOG_INFO( "H3: language model (%zu tokens) in %.1f s", ids.size(), seconds_since( tl0 ) );
 	prompt.resize( ids.size() * 5120 );
 	CUDA_CHECK( cudaMemcpy( prompt.data(), d_prompt, prompt.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
 	cudaFree( d_prompt );

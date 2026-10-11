@@ -1,5 +1,6 @@
 // Streaming Qwen3 text tower for the H3 conditioning (see h3_text.h).
 #include "engine/video/h3_text.h"
+#include "engine/video/h3_fmha.h"
 #include "h3_util.h"
 #include "engine/core/arena.h"
 #include "engine/core/log.h"
@@ -66,6 +67,20 @@ __global__ void k_qwen_qk( half* q, half* k, const float* qw, const float* kw, c
 }
 
 // causal GQA attention, one block per (query, head); fine for short prompts
+// GQA: [S, kNkv, kHd] K and V -> [S, kNh, kHd] with every kv head repeated for its group of query heads (the FMHA kernel has equal head counts)
+__global__ void k_expand_kv( const half* k, const half* v, half* kx, half* vx, int S ) {
+	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
+	const size_t total = static_cast<size_t>( S ) * kNh * kHd;
+	if ( i >= total ) { return; }
+	const int d = static_cast<int>( i % kHd );
+	const size_t sh = i / kHd;
+	const int h = static_cast<int>( sh % kNh );
+	const size_t s = sh / kNh;
+	const size_t src = ( s * kNkv + h / ( kNh / kNkv ) ) * kHd + d;
+	kx[i] = k[src];
+	vx[i] = v[src];
+}
+
 __global__ void k_attn_causal( const half* q, const half* k, const half* v, half* o ) {
 	extern __shared__ float sc[];
 	__shared__ float red[32];
@@ -155,6 +170,8 @@ struct H3TextEncoder::Impl {
 	float *x = nullptr, *br = nullptr, *rowscale = nullptr;
 	int* d_pos = nullptr; // [3, max_tokens]
 	half *h16 = nullptr, *q16 = nullptr, *k16 = nullptr, *v16 = nullptr, *o16 = nullptr, *g16 = nullptr, *u16 = nullptr, *f16 = nullptr;
+	half *kx16 = nullptr, *vx16 = nullptr; // K / V repeated to all query heads for the FMHA kernel
+	bool use_fmha = false;
 	std::string embed_name = "model.language_model.embed_tokens.weight";
 
 	template <typename T>
@@ -214,7 +231,12 @@ struct H3TextEncoder::Impl {
 		gemm( h16, w.k, k16, S, kNkv * kHd, kH, false );
 		gemm( h16, w.v, v16, S, kNkv * kHd, kH, false );
 		k_qwen_qk<<<dim3( S, ( kNh + kNkv + 7 ) / 8 ), 256, 0, s>>>( q16, k16, w.qn, w.kn, d_pos, S );
-		k_attn_causal<<<dim3( S, kNh ), 128, static_cast<size_t>( S + 8 ) * sizeof( float ), s>>>( q16, k16, v16, o16 );
+		if ( use_fmha ) {
+			k_expand_kv<<<( static_cast<size_t>( S ) * kNh * kHd + 255 ) / 256, 256, 0, s>>>( k16, v16, kx16, vx16, S );
+			h3_flash_attention( q16, kx16, vx16, o16, S, kNh, 0.08838834764831845f, 0, S >= 1024 ? 128 : 64, s, true );
+		} else {
+			k_attn_causal<<<dim3( S, kNh ), 128, static_cast<size_t>( S + 8 ) * sizeof( float ), s>>>( q16, k16, v16, o16 );
+		}
 		gemm( o16, w.o, br, S, kH, kNh * kHd, true );
 		k_add_gated<<<S, 256, 0, s>>>( x, br, nullptr, nullptr, 0, nullptr, kH );
 		k_norm_mod<half><<<S, 256, 0, s>>>( x, nullptr, nullptr, 0, w.post_norm, nullptr, nullptr, 0, nullptr, kH, kEps, h16 );
@@ -265,7 +287,7 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	CUDA_CHECK( cudaMemset( s.staging, 0, s.staging_bytes ) );
 	CUDA_CHECK( cudaStreamSynchronize( nullptr ) );
 	const size_t S = static_cast<size_t>( max_tokens );
-	const size_t need = S * kH * 4 * 2 + S * 4 * 4 + S * kH * 2 + S * kNh * kHd * 2 * 2 + S * kNkv * kHd * 2 * 2 + S * kFfn * 2 * 3 + ( 16ULL << 20 );
+	const size_t need = S * kH * 4 * 2 + S * 4 * 4 + S * kH * 2 + S * kNh * kHd * 2 * 2 + S * kNkv * kHd * 2 * 2 + S * kNh * kHd * 2 * 2 + S * kFfn * 2 * 3 + ( 16ULL << 20 );
 	if ( !h3_scratch_arena_create( s.sarena, device, need ) ) { return false; }
 	s.x = s.alloc<float>( s.sarena, S * kH );
 	s.br = s.alloc<float>( s.sarena, S * kH );
@@ -276,6 +298,9 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	s.o16 = s.alloc<half>( s.sarena, S * kNh * kHd );
 	s.k16 = s.alloc<half>( s.sarena, S * kNkv * kHd );
 	s.v16 = s.alloc<half>( s.sarena, S * kNkv * kHd );
+	s.kx16 = s.alloc<half>( s.sarena, S * kNh * kHd );
+	s.vx16 = s.alloc<half>( s.sarena, S * kNh * kHd );
+	s.use_fmha = h3_fmha_available();
 	s.g16 = s.alloc<half>( s.sarena, S * kFfn );
 	s.u16 = s.alloc<half>( s.sarena, S * kFfn );
 	s.f16 = s.alloc<half>( s.sarena, S * kFfn );

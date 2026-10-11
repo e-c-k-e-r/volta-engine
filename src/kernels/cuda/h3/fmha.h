@@ -453,7 +453,7 @@ struct H3FMHAKernel {
     const int* block_counts = nullptr;
     const int* block_sizes = nullptr;
     int blocks = 0;
-    static constexpr bool causal = false;
+    bool causal = false;  // lower-triangular mask (the queries are the first `queries` rows of the same sequence as the keys)
   };
 
   /// Executes one GEMM

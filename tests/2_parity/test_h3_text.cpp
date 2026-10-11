@@ -5,6 +5,7 @@
 #include "engine/loader/tokenizer.h"
 #include "engine/video/h3_text.h"
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -31,7 +32,7 @@ int main( int argc, char** argv ) {
 	}
 	engine::video::H3TextEncoder enc;
 	auto t0 = std::chrono::steady_clock::now();
-	ENGINE_ASSERT( enc.load( argv[1], 0, 2048, layers ), "load" );
+	ENGINE_ASSERT( enc.load( argv[1], 0, std::max<int>( 2048, static_cast<int>( ids.size() ) ), layers ), "load" );
 	float* d;
 	CUDA_CHECK( cudaMalloc( &d, hm->size_bytes ) );
 	auto t1 = std::chrono::steady_clock::now();
