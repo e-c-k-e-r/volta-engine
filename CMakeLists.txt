@@ -105,6 +105,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/video/h3_dit.cu
 	src/video/h3_vae.cu
 	src/video/h3_audio.cu
+	src/video/h3_text.cu
 	src/kernels/cuda/h3/h3_fmha.cu
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
@@ -495,3 +496,6 @@ set_target_properties(test_h3_vae PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT
 add_executable(test_h3_audio tests/2_parity/test_h3_audio.cpp)
 target_link_libraries(test_h3_audio PRIVATE engine_kernels)
 set_target_properties(test_h3_audio PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_h3_text tests/2_parity/test_h3_text.cpp)
+target_link_libraries(test_h3_text PRIVATE engine_kernels)
+set_target_properties(test_h3_text PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
