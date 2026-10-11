@@ -1,8 +1,6 @@
-# intentionally untracked
-AGENTS.md
-.agents/
-notes/
-*.notes.md
+# "hidden"/dot files
+.*/
+!.gitignore
 
 # artifacts
 build/
