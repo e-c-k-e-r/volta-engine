@@ -23,8 +23,14 @@ public:
 	// Images larger than 256 px are encoded in overlapping 256 px tiles with linearly blended moments, as the checkpoint does.
 	bool encode( const float* d_rgb, int H, int W, float* d_moments );
 
+	// Reference video: rgb [T][3][H][W] fp32 (device, ImageNet-normalized, H and W multiples of 32). Frames are trimmed to 17 n + 5, encoded in 17-frame clips
+	// (the last repeats the final frame; causal 3-D convs, time-isolated GroupNorm, spatial tiling) and the last 3 latent frames are dropped.
+	// moments (host): [T'][48][H/16][W/16] with T' = 5 n + 2 = latent_frames.
+	bool encode_video( const float* d_rgb, int T, int H, int W, std::vector<float>* moments, int* latent_frames );
+
 private:
-	bool encode_tile( const float* d_rgb, int H, int W, float* d_moments );
+	bool encode_tile( const float* d_rgb, int T, int H, int W, float* d_moments );
+	bool encode_tiled( const float* d_rgb, int T, int H, int W, std::vector<float>* moments );
 	struct Impl;
 	Impl* p_;
 };

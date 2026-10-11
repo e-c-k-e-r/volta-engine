@@ -93,9 +93,9 @@ static __global__ void k_add_eq( float* y, const float* x, size_t n ) {
 }
 
 struct Conv {
-	const float* w = nullptr; // [Co, Ci * 9] (3x3) or [Co, Ci] (1x1)
+	const float* w[3] = {}; // per temporal tap (the causal 3x3x3 convs reach frames t - 2, t - 1, t): [Co, Ci * 9]; a 1x1x1 conv has one entry [Co, Ci]
 	const float* b = nullptr;
-	int co = 0, ci = 0, k = 3;
+	int co = 0, ci = 0, k = 3, kt = 1;
 };
 
 struct Norm {
@@ -134,7 +134,7 @@ struct H3ImageEncoder::Impl {
 		return d;
 	}
 
-	// 3-D conv weight [Co, Ci, 3, 3, 3] -> its last temporal tap [Co, Ci * 9]; [Co, Ci, 1, 1, 1] -> [Co, Ci]
+	// 3-D conv weight [Co, Ci, kt, k, k] -> kt arrays [Co, Ci * k * k]
 	Conv load_conv( const std::string& base, int k ) {
 		Conv c;
 		c.k = k;
@@ -142,21 +142,24 @@ struct H3ImageEncoder::Impl {
 		if ( !m ) { LOG_ERROR( "H3 encoder: missing %s.weight", base.c_str() ); return c; }
 		c.co = m->shape[0];
 		c.ci = m->shape[1];
-				const float* src = static_cast<const float*>( engine::loader::safetensors_get_data_cpu( st, m ) );
+		const float* src = static_cast<const float*>( engine::loader::safetensors_get_data_cpu( st, m ) );
 		const size_t taps = static_cast<size_t>( k ) * k;
-		std::vector<float> w( static_cast<size_t>( c.co ) * c.ci * taps );
 		// the loader keeps at most 4 dims, so the temporal kernel size comes from the element count
 		const size_t kt = m->size_bytes / sizeof( float ) / ( static_cast<size_t>( c.co ) * c.ci * taps );
 		ENGINE_ASSERT( kt >= 1 && kt <= 3, "H3 encoder: temporal kernel size" );
-		for ( int o = 0; o < c.co; ++o ) {
-			for ( int i = 0; i < c.ci; ++i ) {
-				const float* s = src + ( static_cast<size_t>( o ) * c.ci + i ) * kt * taps + ( kt - 1 ) * taps;
-				std::memcpy( &w[( static_cast<size_t>( o ) * c.ci + i ) * taps], s, taps * sizeof( float ) );
+		c.kt = static_cast<int>( kt );
+		std::vector<float> w( static_cast<size_t>( c.co ) * c.ci * taps );
+		for ( size_t t = 0; t < kt; ++t ) {
+			for ( int o = 0; o < c.co; ++o ) {
+				for ( int i = 0; i < c.ci; ++i ) {
+					const float* sp = src + ( static_cast<size_t>( o ) * c.ci + i ) * kt * taps + t * taps;
+					std::memcpy( &w[( static_cast<size_t>( o ) * c.ci + i ) * taps], sp, taps * sizeof( float ) );
+				}
 			}
+			float* d = static_cast<float*>( engine::core::arena_alloc( warena, w.size() * sizeof( float ) ) );
+			CUDA_CHECK( cudaMemcpy( d, w.data(), w.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+			c.w[t] = d;
 		}
-		float* d = static_cast<float*>( engine::core::arena_alloc( warena, w.size() * sizeof( float ) ) );
-		CUDA_CHECK( cudaMemcpy( d, w.data(), w.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
-		c.w = d;
 		c.b = f32( base + ".bias" );
 		return c;
 	}
@@ -168,13 +171,13 @@ struct H3ImageEncoder::Impl {
 		return n;
 	}
 
-	// out [co, Ho * Wo] = conv(in [ci, H, W])  (3x3 reflect-padded with the given stride / asymmetric pad, or 1x1)
-	void run_conv( const Conv& c, const float* in, float* out, int H, int W, int stride, int pad_t, int pad_b, int pad_l, int pad_r ) {
+	// out [co, Ho * Wo] (+)= conv of one frame in [ci, H, W] with the weights `w` (3x3 reflect-padded with the given stride / asymmetric pad, or 1x1); no bias
+	void run_tap( const Conv& c, const float* w, const float* in, float* out, int H, int W, int stride, int pad_t, int pad_b, int pad_l, int pad_r, bool accumulate ) {
 		const int Ho = ( H + pad_t + pad_b - c.k ) / stride + 1, Wo = ( W + pad_l + pad_r - c.k ) / stride + 1;
-		const float alpha = 1.0f, beta = 0.0f;
+		const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
 		if ( c.k == 1 ) {
 			const int P = H * W;
-			CUBLAS_CHECK( cublasSgemm( blas, CUBLAS_OP_N, CUBLAS_OP_N, P, c.co, c.ci, &alpha, in, P, c.w, c.ci, &beta, out, P ) );
+			CUBLAS_CHECK( cublasSgemm( blas, CUBLAS_OP_N, CUBLAS_OP_N, P, c.co, c.ci, &alpha, in, P, w, c.ci, &beta, out, P ) );
 		} else {
 			const int K = c.ci * 9;
 			const int rows_per = std::max( 1, static_cast<int>( im2col_elems / ( static_cast<size_t>( K ) * Wo ) ) );
@@ -182,11 +185,33 @@ struct H3ImageEncoder::Impl {
 				const int rows = std::min( rows_per, Ho - r0 ), P = rows * Wo;
 				const size_t total = static_cast<size_t>( K ) * P;
 				k_im2col<<<( total + 255 ) / 256, 256, 0, stream>>>( in, im2col, c.ci, H, W, Wo, stride, pad_t, pad_l, r0, P );
-				CUBLAS_CHECK( cublasSgemm( blas, CUBLAS_OP_N, CUBLAS_OP_N, P, c.co, K, &alpha, im2col, P, c.w, K, &beta, out + static_cast<size_t>( r0 ) * Wo, Ho * Wo ) );
+				CUBLAS_CHECK( cublasSgemm( blas, CUBLAS_OP_N, CUBLAS_OP_N, P, c.co, K, &alpha, im2col, P, w, K, &beta, out + static_cast<size_t>( r0 ) * Wo, Ho * Wo ) );
 			}
 		}
-		const size_t HW = static_cast<size_t>( Ho ) * Wo;
-		if ( c.b ) { k_add_bias_ch<<<( c.co * HW + 255 ) / 256, 256, 0, stream>>>( out, c.b, c.co, HW ); }
+	}
+
+	// Causal 3-D conv over T frames [T][ci][H][W] -> [To][co][Ho][Wo], To = (T - 1) / ts + 1: output frame j sums the taps over input frames j * ts - 2 + dt (frames before the clip are zeros)
+	int conv3d( const Conv& c, const float* in, float* out, int T, int H, int W, int ts, int stride, int pad_t, int pad_b, int pad_l, int pad_r ) {
+		const int Ho = ( H + pad_t + pad_b - c.k ) / stride + 1, Wo = ( W + pad_l + pad_r - c.k ) / stride + 1;
+		const size_t fin = static_cast<size_t>( c.ci ) * H * W, fout = static_cast<size_t>( c.co ) * Ho * Wo;
+		const int To = c.kt == 1 ? T : ( T - 1 ) / ts + 1;
+		for ( int j = 0; j < To; ++j ) {
+			bool first = true;
+			for ( int dt = 0; dt < c.kt; ++dt ) {
+				const int fi = c.kt == 1 ? j : j * ts + dt - 2;
+				if ( fi < 0 ) { continue; }
+				run_tap( c, c.w[dt], in + fi * fin, out + j * fout, H, W, stride, pad_t, pad_b, pad_l, pad_r, !first );
+				first = false;
+			}
+			const size_t HW = static_cast<size_t>( Ho ) * Wo;
+			if ( c.b ) { k_add_bias_ch<<<( c.co * HW + 255 ) / 256, 256, 0, stream>>>( out + j * fout, c.b, c.co, HW ); }
+		}
+		return To;
+	}
+
+	// GroupNorm (+ SiLU) per frame: the checkpoint's norms are time-isolated
+	void gn_frames( const Norm& n, const float* in, float* out, int T, int C, size_t HW, bool silu ) {
+		for ( int t = 0; t < T; ++t ) { gn_silu( n, in + t * C * HW, out + t * C * HW, C, HW, silu ); }
 	}
 
 	void gn_silu( const Norm& n, const float* in, float* out, int C, size_t HW, bool silu ) {
@@ -215,7 +240,7 @@ bool H3ImageEncoder::load( const char* dir, int device ) {
 	CUBLAS_CHECK( cublasSetStream( s.blas, s.stream ) );
 	CUBLAS_CHECK( cublasSetMathMode( s.blas, CUBLAS_DEFAULT_MATH ) );
 	if ( !engine::loader::safetensors_open( s.st, ( std::string( dir ) + "/source/model.safetensors" ).c_str() ) ) { return false; }
-	if ( !engine::core::arena_create( s.warena, device, 2ULL << 30 ) ) { return false; }
+	if ( !engine::core::arena_create( s.warena, device, 5ULL << 30 ) ) { return false; }
 	s.conv_in = s.load_conv( "encoder.conv_in", 3 );
 	int prev = kCh * kMult[0];
 	for ( int l = 0; l < 6; ++l ) {
@@ -246,11 +271,12 @@ bool H3ImageEncoder::load( const char* dir, int device ) {
 	return s.conv_in.w && s.quant.w;
 }
 
-bool H3ImageEncoder::encode_tile( const float* d_rgb, int H, int W, float* d_moments ) {
+// T frames [T][3][H][W] -> moments [T'][48][H/16][W/16] (T' = 1 + (T - 1) / 4 after the two time downsamplers)
+bool H3ImageEncoder::encode_tile( const float* d_rgb, int T, int H, int W, float* d_moments ) {
 	Impl& s = *p_;
 	if ( H % 16 || W % 16 ) { return false; }
-	// activation buffers: the first level is the largest: 128 channels at H x W
-	const size_t need = static_cast<size_t>( kCh ) * H * W;
+	// activation buffers: the first level is the largest: 128 channels at H x W per frame
+	const size_t need = static_cast<size_t>( T ) * kCh * H * W;
 	if ( s.buf_elems < need ) {
 		if ( s.a ) { cudaFree( s.a ); }
 		s.im2col_elems = 64ull << 20; // 256 MB
@@ -263,9 +289,9 @@ bool H3ImageEncoder::encode_tile( const float* d_rgb, int H, int W, float* d_mom
 		s.buf_elems = need;
 	}
 	cudaStream_t st = s.stream;
-	int h = H, w = W, ch = kCh * kMult[0];
+	int h = H, w = W, t = T, ch = kCh * kMult[0];
 	float* x = s.bufA;
-	s.run_conv( s.conv_in, d_rgb, x, h, w, 1, 1, 1, 1, 1 );
+	s.conv3d( s.conv_in, d_rgb, x, t, h, w, 1, 1, 1, 1, 1, 1 );
 	float* t1 = s.bufB;
 	float* t2 = s.bufC;
 	for ( int l = 0; l < 6; ++l ) {
@@ -273,42 +299,52 @@ bool H3ImageEncoder::encode_tile( const float* d_rgb, int H, int W, float* d_mom
 		for ( size_t i = 0; i < s.blocks[l].size(); ++i ) {
 			const ResBlk& b = s.blocks[l][i];
 			const size_t HW = static_cast<size_t>( h ) * w;
-			s.gn_silu( b.n1, x, t1, ch, HW, true );
-			s.run_conv( b.c1, t1, t2, h, w, 1, 1, 1, 1, 1 );
-			s.gn_silu( b.n2, t2, t1, mid, HW, true );
-			s.run_conv( b.c2, t1, t2, h, w, 1, 1, 1, 1, 1 );
+			s.gn_frames( b.n1, x, t1, t, ch, HW, true );
+			s.conv3d( b.c1, t1, t2, t, h, w, 1, 1, 1, 1, 1, 1 );
+			s.gn_frames( b.n2, t2, t1, t, mid, HW, true );
+			s.conv3d( b.c2, t1, t2, t, h, w, 1, 1, 1, 1, 1, 1 );
+			const size_t n = static_cast<size_t>( t ) * mid * HW;
 			if ( b.has_sc ) {
-				s.run_conv( b.sc, x, t1, h, w, 1, 0, 0, 0, 0 );
-				k_add_eq<<<( mid * HW + 255 ) / 256, 256, 0, st>>>( t2, t1, mid * HW );
+				s.conv3d( b.sc, x, t1, t, h, w, 1, 1, 0, 0, 0, 0 );
+				k_add_eq<<<( n + 255 ) / 256, 256, 0, st>>>( t2, t1, n );
 			} else {
-				k_add_eq<<<( mid * HW + 255 ) / 256, 256, 0, st>>>( t2, x, mid * HW );
+				k_add_eq<<<( n + 255 ) / 256, 256, 0, st>>>( t2, x, n );
 			}
 			std::swap( x, t2 );
 			ch = mid;
 		}
 		if ( s.has_down[l] ) {
-			// reflect pad (0, 1, 0, 1) then a 3x3 stride-2 conv without spatial padding
+			// reflect pad (0, 1, 0, 1) then a 3x3x3 conv (spatial stride ds without spatial padding, temporal stride 1 or 2)
 			const int ds = kSpaceDown[l];
-			s.run_conv( s.down[l], x, t2, h, w, ds, 0, 1, 0, 1 );
+			t = s.conv3d( s.down[l], x, t2, t, h, w, kTimeDown[l], ds, 0, 1, 0, 1 );
 			h = ( h + 1 - 3 ) / ds + 1;
 			w = ( w + 1 - 3 ) / ds + 1;
 			std::swap( x, t2 );
 		}
 	}
 	const size_t HW = static_cast<size_t>( h ) * w;
-	s.gn_silu( s.norm_out, x, t1, ch, HW, true );
-	s.run_conv( s.conv_out, t1, t2, h, w, 1, 1, 1, 1, 1 );
-	s.run_conv( s.quant, t2, d_moments, h, w, 1, 0, 0, 0, 0 );
+	s.gn_frames( s.norm_out, x, t1, t, ch, HW, true );
+	s.conv3d( s.conv_out, t1, t2, t, h, w, 1, 1, 1, 1, 1, 1 );
+	s.conv3d( s.quant, t2, d_moments, t, h, w, 1, 1, 0, 0, 0, 0 );
 	CUDA_CHECK( cudaStreamSynchronize( st ) );
 	CUDA_CHECK( cudaGetLastError() );
-	return h == H / 16 && w == W / 16;
+	return h == H / 16 && w == W / 16 && t == 1 + ( T - 1 ) / 4;
 }
 
-bool H3ImageEncoder::encode( const float* d_rgb, int H, int W, float* d_moments ) {
+bool H3ImageEncoder::encode_tiled( const float* d_rgb, int T, int H, int W, std::vector<float>* moments ) {
 	Impl& s = *p_;
 	constexpr int kRatio = 16, kTile = 256, kOverlap = 64;
 	if ( H % kRatio || W % kRatio ) { return false; }
-	if ( H <= kTile && W <= kTile ) { return encode_tile( d_rgb, H, W, d_moments ); }
+	const int Tl = 1 + ( T - 1 ) / 4, NC = 48 * Tl; // latent frames; moment channels per cell (frame-major: [T'][48])
+	if ( H <= kTile && W <= kTile ) {
+		float* d_m = nullptr;
+		CUDA_CHECK( cudaMalloc( &d_m, static_cast<size_t>( NC ) * ( H / kRatio ) * ( W / kRatio ) * sizeof( float ) ) );
+		const bool ok = encode_tile( d_rgb, T, H, W, d_m );
+		moments->resize( static_cast<size_t>( NC ) * ( H / kRatio ) * ( W / kRatio ) );
+		CUDA_CHECK( cudaMemcpy( moments->data(), d_m, moments->size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
+		cudaFree( d_m );
+		return ok;
+	}
 	// the checkpoint tiles the encoder (256 px tiles, >= 64 px overlap) and blends the moments linearly: rows first, then columns against the unblended left tile
 	const H3Tiles ty = h3_split_tiles( H, kTile, kOverlap, kRatio ), tx = h3_split_tiles( W, kTile, kOverlap, kRatio );
 	const int ni = static_cast<int>( ty.start.size() ), nj = static_cast<int>( tx.start.size() );
@@ -317,25 +353,26 @@ bool H3ImageEncoder::encode( const float* d_rgb, int H, int W, float* d_moments 
 	for ( int j = 0; j < nj; ++j ) { tw[j] = std::min( tx.len[j], W - tx.start[j] ); }
 	std::vector<std::vector<float>> raw( static_cast<size_t>( ni ) * nj );
 	float *d_tile = nullptr, *d_tm = nullptr;
-	CUDA_CHECK( cudaMalloc( &d_tile, static_cast<size_t>( 3 ) * kTile * kTile * sizeof( float ) ) );
-	CUDA_CHECK( cudaMalloc( &d_tm, static_cast<size_t>( 48 ) * ( kTile / kRatio ) * ( kTile / kRatio ) * sizeof( float ) ) );
+	CUDA_CHECK( cudaMalloc( &d_tile, static_cast<size_t>( T ) * 3 * kTile * kTile * sizeof( float ) ) );
+	CUDA_CHECK( cudaMalloc( &d_tm, static_cast<size_t>( NC ) * ( kTile / kRatio ) * ( kTile / kRatio ) * sizeof( float ) ) );
 	for ( int i = 0; i < ni; ++i ) {
 		for ( int j = 0; j < nj; ++j ) {
-			for ( int c = 0; c < 3; ++c ) {
+			for ( int c = 0; c < 3 * T; ++c ) { // frame-major [T][3] planes
 				CUDA_CHECK( cudaMemcpy2DAsync( d_tile + static_cast<size_t>( c ) * th[i] * tw[j], tw[j] * sizeof( float ), d_rgb + ( static_cast<size_t>( c ) * H + ty.start[i] ) * W + tx.start[j],
 					W * sizeof( float ), tw[j] * sizeof( float ), th[i], cudaMemcpyDeviceToDevice, s.stream ) );
 			}
 			CUDA_CHECK( cudaStreamSynchronize( s.stream ) );
-			if ( !encode_tile( d_tile, th[i], tw[j], d_tm ) ) { return false; }
+			if ( !encode_tile( d_tile, T, th[i], tw[j], d_tm ) ) { return false; }
 			std::vector<float>& r = raw[static_cast<size_t>( i ) * nj + j];
-			r.resize( static_cast<size_t>( 48 ) * ( th[i] / kRatio ) * ( tw[j] / kRatio ) );
+			r.resize( static_cast<size_t>( NC ) * ( th[i] / kRatio ) * ( tw[j] / kRatio ) );
 			CUDA_CHECK( cudaMemcpy( r.data(), d_tm, r.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
 		}
 	}
 	cudaFree( d_tile );
 	cudaFree( d_tm );
 	const int LH = H / kRatio, LW = W / kRatio;
-	std::vector<float> out( static_cast<size_t>( 48 ) * LH * LW );
+	std::vector<float>& out = *moments;
+	out.assign( static_cast<size_t>( NC ) * LH * LW, 0.0f );
 	for ( int i = 0; i < ni; ++i ) {
 		for ( int j = 0; j < nj; ++j ) {
 			const int lh = th[i] / kRatio, lw = tw[j] / kRatio;
@@ -343,7 +380,7 @@ bool H3ImageEncoder::encode( const float* d_rgb, int H, int W, float* d_moments 
 			if ( i > 0 ) { // blend the top rows with the bottom rows of the raw tile above
 				const std::vector<float>& a = raw[static_cast<size_t>( i - 1 ) * nj + j];
 				const int ah = th[i - 1] / kRatio, ext = std::min( { ah, lh, ty.overlap[i - 1] / kRatio } );
-				for ( int c = 0; c < 48; ++c ) {
+				for ( int c = 0; c < NC; ++c ) {
 					for ( int y = 0; y < ext; ++y ) {
 						const float wb = static_cast<float>( y ) / ext, wa = 1.0f - wb;
 						for ( int x = 0; x < lw; ++x ) {
@@ -356,7 +393,7 @@ bool H3ImageEncoder::encode( const float* d_rgb, int H, int W, float* d_moments 
 			if ( j > 0 ) { // then the left columns with the raw tile to the left
 				const std::vector<float>& a = raw[static_cast<size_t>( i ) * nj + j - 1];
 				const int aw = tw[j - 1] / kRatio, ext = std::min( { aw, lw, tx.overlap[j - 1] / kRatio } );
-				for ( int c = 0; c < 48; ++c ) {
+				for ( int c = 0; c < NC; ++c ) {
 					for ( int y = 0; y < lh; ++y ) {
 						for ( int x = 0; x < ext; ++x ) {
 							const float wb = static_cast<float>( x ) / ext, wa = 1.0f - wb;
@@ -368,14 +405,45 @@ bool H3ImageEncoder::encode( const float* d_rgb, int H, int W, float* d_moments 
 			}
 			const int keep_h = i < ni - 1 ? lh - ty.overlap[i] / kRatio : lh, keep_w = j < nj - 1 ? lw - tx.overlap[j] / kRatio : lw;
 			const int y0 = ty.start[i] / kRatio, x0 = tx.start[j] / kRatio;
-			for ( int c = 0; c < 48; ++c ) {
+			for ( int c = 0; c < NC; ++c ) {
 				for ( int y = 0; y < keep_h; ++y ) {
 					std::memcpy( &out[( static_cast<size_t>( c ) * LH + y0 + y ) * LW + x0], &tile[( static_cast<size_t>( c ) * lh + y ) * lw], static_cast<size_t>( keep_w ) * sizeof( float ) );
 				}
 			}
 		}
 	}
-	CUDA_CHECK( cudaMemcpy( d_moments, out.data(), out.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+	return true;
+}
+
+bool H3ImageEncoder::encode( const float* d_rgb, int H, int W, float* d_moments ) {
+	std::vector<float> m;
+	if ( !encode_tiled( d_rgb, 1, H, W, &m ) ) { return false; }
+	CUDA_CHECK( cudaMemcpy( d_moments, m.data(), m.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+	return true;
+}
+
+bool H3ImageEncoder::encode_video( const float* d_rgb, int T, int H, int W, std::vector<float>* moments, int* latent_frames ) {
+	constexpr int kClip = 17, kTail = 5, kTokens = 5, kDrop = 3;
+	if ( T < kClip + kTail ) { LOG_ERROR( "H3 encoder: a reference video needs at least %d frames", kClip + kTail ); return false; }
+	const int used = std::max( ( T - kTail ) / kClip, 1 ) * kClip + kTail; // trim to 17 n + 5 frames
+	const int chunks = ( used + kClip - 1 ) / kClip;                      // the last chunk repeats the final frame
+	const size_t frame = static_cast<size_t>( 3 ) * H * W;
+	float* d_clip = nullptr;
+	CUDA_CHECK( cudaMalloc( &d_clip, frame * kClip * sizeof( float ) ) );
+	const int cells = ( H / 16 ) * ( W / 16 );
+	moments->clear();
+	for ( int c = 0; c < chunks; ++c ) {
+		for ( int f = 0; f < kClip; ++f ) {
+			const int src = std::min( c * kClip + f, used - 1 );
+			CUDA_CHECK( cudaMemcpy( d_clip + f * frame, d_rgb + src * frame, frame * sizeof( float ), cudaMemcpyDeviceToDevice ) );
+		}
+		std::vector<float> m;
+		if ( !encode_tiled( d_clip, kClip, H, W, &m ) ) { cudaFree( d_clip ); return false; }
+		moments->insert( moments->end(), m.begin(), m.end() );
+	}
+	cudaFree( d_clip );
+	*latent_frames = chunks * kTokens - kDrop;
+	moments->resize( static_cast<size_t>( *latent_frames ) * 48 * cells );
 	return true;
 }
 
