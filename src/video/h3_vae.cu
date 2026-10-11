@@ -81,10 +81,10 @@ __global__ void k_vit_rope( float* cosb, float* sinb, int T, int H, int W, int S
 }
 
 // qkv [S, 32 heads, (q|k|v) x 64] + bias -> q/k RMSNorm (no weight) + rotary on the first 48 dims -> [S, 32, 64] q/k/v
-__global__ void k_vit_qkv( const half* qkv, const float* bias, const float* cosb, const float* sinb, half* qo, half* ko, half* vo, int S ) {
+__global__ void k_vit_qkv( const half* qkv, const float* bias, const float* cosb, const float* sinb, half* qo, half* ko, half* vo, int S ) { // S: tokens of one tile (rows past S are the next tile of a batch and share the rope tables)
 	__shared__ float sm[8][2][64];
 	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-	const int s = blockIdx.x, head = blockIdx.y * 8 + warp;
+	const int s = blockIdx.x, head = blockIdx.y * 8 + warp, st = s % S;
 	const half* base = qkv + static_cast<size_t>( s ) * 3 * kDim + head * 192;
 	const float* bb = bias + head * 192;
 	float q[2], k[2], v[2];
@@ -116,7 +116,7 @@ __global__ void k_vit_qkv( const half* qkv, const float* bias, const float* cosb
 		float oq = sm[warp][0][d], ok = sm[warp][1][d];
 		if ( d < 48 ) {
 			const int j = d % 24;
-			const float c = cosb[static_cast<size_t>( s ) * 24 + j], sn = sinb[static_cast<size_t>( s ) * 24 + j];
+			const float c = cosb[static_cast<size_t>( st ) * 24 + j], sn = sinb[static_cast<size_t>( st ) * 24 + j];
 			if ( d < 24 ) {
 				oq = sm[warp][0][d] * c - sm[warp][0][d + 24] * sn;
 				ok = sm[warp][1][d] * c - sm[warp][1][d + 24] * sn;
@@ -300,7 +300,7 @@ H3Tiles h3_split_tiles( int input_len, int tile_size, int overlap_min, int ratio
 
 struct H3VideoVAE::Impl {
 	H3VaeParams par;
-	int device = 0, max_tokens = 0;
+	int device = 0, max_tokens = 0, batch = 1; // batch: tiles the scratch holds at once
 	pod::SafeTensorsFile st{};
 	pod::MemoryArena warena{}, sarena{};
 	cublasHandle_t blas = nullptr;
@@ -361,36 +361,48 @@ struct H3VideoVAE::Impl {
 		CUBLAS_CHECK( cublasSgemm( blas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, W, K, A, K, &beta, C, N ) );
 	}
 
-	void tile( const float* z, int T, int H, int W, float* pix ) {
+	void tile( const float* z, int T, int H, int W, float* pix ) { tile_batch( &z, &pix, 1, T, H, W ); }
+
+	// B tiles of the same shape through the transformer together: their rows are stacked so that the GEMMs see B times the rows (cuBLAS reaches 5 to 15% more of the
+	// tensor-core peak at 3200 rows than at 1600); attention stays per tile
+	void tile_batch( const float* const* z, float* const* pix, int B, int T, int H, int W ) {
 		CUDA_CHECK( cudaSetDevice( device ) );
-		const int N = T * H * W, S = N + kSuffix;
-		if ( S > max_tokens ) { std::fprintf( stderr, "H3 VAE: tile %dx%dx%d (%d tokens) exceeds scratch %d\n", T, H, W, S, max_tokens ); std::_Exit( 1 ); }
+		const int N = T * H * W, S = N + kSuffix, R = B * S;
+		if ( S > max_tokens || B > batch ) { std::fprintf( stderr, "H3 VAE: %d tile(s) of %dx%dx%d (%d tokens) exceed the scratch (%d tokens x %d)\n", B, T, H, W, S, max_tokens, batch ); std::_Exit( 1 ); }
 		cudaStream_t s = stream;
-		k_pack_latent<<<( N + 255 ) / 256, 256, 0, s>>>( z, rows, T, H * W );
-		gemm_f( rows, pq_w, rows2, N, 24, 24 );
-		k_add_bias<<<256, 256, 0, s>>>( rows2, pq_b, N, 24 );
-		gemm_f( rows2, emb_w, x, N, kDim, 24 );
-		k_add_bias<<<1024, 256, 0, s>>>( x, emb_b, N, kDim );
-		k_set_suffix<<<kSuffix, 256, 0, s>>>( x, reg, N );
+		for ( int b = 0; b < B; ++b ) {
+			k_pack_latent<<<( N + 255 ) / 256, 256, 0, s>>>( z[b], rows + static_cast<size_t>( b ) * S * 24, T, H * W );
+		}
+		// the latent projection runs on whole rows: the suffix rows of each tile hold stale values that k_set_suffix overwrites afterwards
+		gemm_f( rows, pq_w, rows2, R, 24, 24 );
+		k_add_bias<<<256, 256, 0, s>>>( rows2, pq_b, R, 24 );
+		gemm_f( rows2, emb_w, x, R, kDim, 24 );
+		k_add_bias<<<1024, 256, 0, s>>>( x, emb_b, R, kDim );
+		for ( int b = 0; b < B; ++b ) { k_set_suffix<<<kSuffix, 256, 0, s>>>( x + static_cast<size_t>( b ) * S * kDim, reg, N ); }
 		k_vit_rope<<<( S + 127 ) / 128, 128, 0, s>>>( cosb, sinb, T, H, W, S );
 		for ( int i = 0; i < kLayers; ++i ) {
 			const VBlock& b = blocks[i];
-			k_norm_mod<half><<<S, 256, 0, s>>>( x, nullptr, nullptr, 0, b.n1, nullptr, nullptr, 0, nullptr, kDim, 1e-5f, h16 );
-			gemm_h( h16, b.qkv, qkv16, S, 3 * kDim, kDim, false );
-			k_vit_qkv<<<dim3( S, kHeads / 8 ), 256, 0, s>>>( qkv16, b.qkv_b, cosb, sinb, qp, kp, vp, S );
-			h3_attention( qp, kp, vp, op, S, S, kHeads, 0.125f, false, s, kHd );
-			gemm_h( op, b.out, br, S, kDim, kDim, true ); // the attention output is already [S, 32 x 64]
-			k_add_gated<<<S, 256, 0, s>>>( x, br, nullptr, b.s1, 0, nullptr, kDim, b.out_b );
-			k_norm_mod<half><<<S, 256, 0, s>>>( x, nullptr, nullptr, 0, b.n2, nullptr, nullptr, 0, nullptr, kDim, 1e-5f, h16 );
-			gemm_h( h16, b.w1, f1, S, 2 * kFf, kDim, false );
-			k_silu_mul<<<S, 256, 0, s>>>( f1, f2, rowscale, kFf, b.w1_b );
-			gemm_h( f2, b.w2, br, S, kDim, kFf, true );
-			k_add_gated<<<S, 256, 0, s>>>( x, br, rowscale, b.s2, 0, nullptr, kDim, b.w2_b );
+			k_norm_mod<half><<<R, 256, 0, s>>>( x, nullptr, nullptr, 0, b.n1, nullptr, nullptr, 0, nullptr, kDim, 1e-5f, h16 );
+			gemm_h( h16, b.qkv, qkv16, R, 3 * kDim, kDim, false );
+			k_vit_qkv<<<dim3( R, kHeads / 8 ), 256, 0, s>>>( qkv16, b.qkv_b, cosb, sinb, qp, kp, vp, S );
+			for ( int t = 0; t < B; ++t ) {
+				const size_t off = static_cast<size_t>( t ) * S * kHeads * kHd;
+				h3_attention( qp + off, kp + off, vp + off, op + off, S, S, kHeads, 0.125f, false, s, kHd );
+			}
+			gemm_h( op, b.out, br, R, kDim, kDim, true ); // the attention output is already [S, 32 x 64]
+			k_add_gated<<<R, 256, 0, s>>>( x, br, nullptr, b.s1, 0, nullptr, kDim, b.out_b );
+			k_norm_mod<half><<<R, 256, 0, s>>>( x, nullptr, nullptr, 0, b.n2, nullptr, nullptr, 0, nullptr, kDim, 1e-5f, h16 );
+			gemm_h( h16, b.w1, f1, R, 2 * kFf, kDim, false );
+			k_silu_mul<<<R, 256, 0, s>>>( f1, f2, rowscale, kFf, b.w1_b );
+			gemm_h( f2, b.w2, br, R, kDim, kFf, true );
+			k_add_gated<<<R, 256, 0, s>>>( x, br, rowscale, b.s2, 0, nullptr, kDim, b.w2_b );
 		}
-		k_layernorm<<<N, 256, 0, s>>>( x, no_w, no_b, xn, kDim, 1e-5f );
-		gemm_f( xn, po_w, proj, N, kPatchPix, kDim );
-		k_add_bias<<<1024, 256, 0, s>>>( proj, po_b, N, kPatchPix );
-		k_unpatch<<<( static_cast<size_t>( N ) * kPatchPix + 255 ) / 256, 256, 0, s>>>( proj, pix, T, H, W );
+		for ( int b = 0; b < B; ++b ) {
+			k_layernorm<<<N, 256, 0, s>>>( x + static_cast<size_t>( b ) * S * kDim, no_w, no_b, xn, kDim, 1e-5f );
+			gemm_f( xn, po_w, proj, N, kPatchPix, kDim );
+			k_add_bias<<<1024, 256, 0, s>>>( proj, po_b, N, kPatchPix );
+			k_unpatch<<<( static_cast<size_t>( N ) * kPatchPix + 255 ) / 256, 256, 0, s>>>( proj, pix[b], T, H, W );
+		}
 	}
 
 	// One temporal clip (denormalized z_clip [24, Tc, H, W], on this instance's device) -> pixels [3, 4 Tc, Hp, Wp] (on this device) with spatial tiling and blending.
@@ -424,20 +436,38 @@ struct H3VideoVAE::Impl {
 			threads.emplace_back( [&, w] {
 				Impl& me = *workers[w];
 				CUDA_CHECK( cudaSetDevice( me.device ) );
-				for ( int k = w; k < ni * nj; k += nw ) {
-					const int i = k / nj, j = k % nj;
-					const int ih = th[i] / ratio, iw = tw[j] / ratio, y0 = ty.start[i] / ratio, x0 = tx.start[j] / ratio;
-					const size_t sub_n = static_cast<size_t>( 24 ) * Tc * ih * iw, pix_n = static_cast<size_t>( 3 ) * F * th[i] * tw[j];
-					float* sub = nullptr;
-					CUDA_CHECK( cudaMalloc( &sub, sub_n * sizeof( float ) ) );
-					k_crop_latent<<<( sub_n + 255 ) / 256, 256, 0, me.stream>>>( zl[w], sub, Tc, H, W, y0, x0, ih, iw );
-					float* pix = tiles[k];
-					if ( w != 0 ) { CUDA_CHECK( cudaMalloc( &pix, pix_n * sizeof( float ) ) ); }
-					me.tile( sub, Tc, ih, iw, pix );
-					if ( w != 0 ) { CUDA_CHECK( cudaMemcpyPeerAsync( tiles[k], device, pix, me.device, pix_n * sizeof( float ), me.stream ) ); }
+				std::vector<int> mine;
+				for ( int k = w; k < ni * nj; k += nw ) { mine.push_back( k ); }
+				// groups of up to me.batch tiles share one transformer pass (all tiles have the same size)
+				for ( size_t g = 0; g < mine.size(); g += static_cast<size_t>( me.batch ) ) {
+					const int B = static_cast<int>( std::min<size_t>( me.batch, mine.size() - g ) );
+					std::vector<float*> subs( B, nullptr ), pixs( B, nullptr );
+					std::vector<const float*> zin( B, nullptr );
+					int ih = 0, iw = 0;
+					for ( int b = 0; b < B; ++b ) {
+						const int k = mine[g + b];
+						const int i = k / nj, j = k % nj;
+						ih = th[i] / ratio;
+						iw = tw[j] / ratio;
+						const int y0 = ty.start[i] / ratio, x0 = tx.start[j] / ratio;
+						const size_t sub_n = static_cast<size_t>( 24 ) * Tc * ih * iw, pix_n = static_cast<size_t>( 3 ) * F * th[i] * tw[j];
+						CUDA_CHECK( cudaMalloc( &subs[b], sub_n * sizeof( float ) ) );
+						k_crop_latent<<<( sub_n + 255 ) / 256, 256, 0, me.stream>>>( zl[w], subs[b], Tc, H, W, y0, x0, ih, iw );
+						pixs[b] = tiles[k];
+						if ( w != 0 ) { CUDA_CHECK( cudaMalloc( &pixs[b], pix_n * sizeof( float ) ) ); }
+						zin[b] = subs[b];
+					}
+					me.tile_batch( zin.data(), pixs.data(), B, Tc, ih, iw );
+					for ( int b = 0; b < B; ++b ) {
+						const int k = mine[g + b];
+						const size_t pix_n = static_cast<size_t>( 3 ) * F * th[k / nj] * tw[k % nj];
+						if ( w != 0 ) { CUDA_CHECK( cudaMemcpyPeerAsync( tiles[k], device, pixs[b], me.device, pix_n * sizeof( float ), me.stream ) ); }
+					}
 					CUDA_CHECK( cudaStreamSynchronize( me.stream ) );
-					CUDA_CHECK( cudaFree( sub ) );
-					if ( w != 0 ) { CUDA_CHECK( cudaFree( pix ) ); }
+					for ( int b = 0; b < B; ++b ) {
+						CUDA_CHECK( cudaFree( subs[b] ) );
+						if ( w != 0 ) { CUDA_CHECK( cudaFree( pixs[b] ) ); }
+					}
 				}
 			} );
 		}
@@ -534,18 +564,30 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens ) {
 		s.d_mean = dm;
 		s.d_std = ds;
 	}
-	const size_t S = static_cast<size_t>( max_tokens );
-	size_t need = S * kDim * 4 * 3 + S * 24 * 4 * 4 + S * 4 + S * kPatchPix * 4 + S * kDim * 2 * 2 + S * 3 * kDim * 2 + S * kHeads * kHd * 2 * 4 + S * 2 * kFf * 2 + S * kFf * 2 + ( 64ULL << 20 );
+	const size_t S1 = static_cast<size_t>( max_tokens );
+	auto scratch_bytes = [&]( size_t B ) {
+		const size_t S = S1 * B;
+		return S * kDim * 4 * 2 + S1 * kDim * 4 + S * 24 * 4 * 2 + S1 * 24 * 4 * 2 + S * 4 + S1 * kPatchPix * 4 + S * kDim * 2 * 2 + S * 3 * kDim * 2 + S * kHeads * kHd * 2 * 4 + S * 2 * kFf * 2 + S * kFf * 2 + ( 64ULL << 20 );
+	};
+	// two tiles per transformer pass when the card has the room (a resident transformer may leave none)
+	{
+		size_t free_b = 0, total_b = 0;
+		CUDA_CHECK( cudaMemGetInfo( &free_b, &total_b ) );
+		s.batch = free_b > scratch_bytes( 2 ) + ( 1536ULL << 20 ) ? 2 : 1;
+	}
+	LOG_INFO( "H3 VAE: GPU %d decodes %d tile(s) per transformer pass", device, s.batch );
+	const size_t S = S1 * s.batch;
+	size_t need = scratch_bytes( s.batch );
 	if ( !h3_scratch_arena_create( s.sarena, device, need ) ) { return false; }
 	s.x = s.alloc<float>( s.sarena, S * kDim );
 	s.br = s.alloc<float>( s.sarena, S * kDim );
-	s.xn = s.alloc<float>( s.sarena, S * kDim );
+	s.xn = s.alloc<float>( s.sarena, S1 * kDim );
 	s.rows = s.alloc<float>( s.sarena, S * 24 );
 	s.rows2 = s.alloc<float>( s.sarena, S * 24 );
-	s.cosb = s.alloc<float>( s.sarena, S * 24 );
-	s.sinb = s.alloc<float>( s.sarena, S * 24 );
+	s.cosb = s.alloc<float>( s.sarena, S1 * 24 );
+	s.sinb = s.alloc<float>( s.sarena, S1 * 24 );
 	s.rowscale = s.alloc<float>( s.sarena, S );
-	s.proj = s.alloc<float>( s.sarena, S * kPatchPix );
+	s.proj = s.alloc<float>( s.sarena, S1 * kPatchPix );
 	s.h16 = s.alloc<half>( s.sarena, S * kDim );
 	s.o16 = s.alloc<half>( s.sarena, S * kDim );
 	s.qkv16 = s.alloc<half>( s.sarena, S * 3 * kDim );

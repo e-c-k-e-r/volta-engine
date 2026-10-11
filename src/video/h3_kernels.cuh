@@ -110,25 +110,44 @@ static __global__ void k_add_bias( float* y, const float* b, int rows, int cols 
 
 // silu(gate) * up with a per-row power-of-two scale that keeps the FP16 result in range (restored after the down projection).
 static __global__ void k_silu_mul( const half* f1, half* f2, float* rowscale, int F, const float* bias = nullptr ) {
+	// F a multiple of 8 and at most 16384: each thread holds its 8-wide pieces of the activation between the max pass and the write pass (one read of f1)
 	__shared__ float red[32];
 	const int row = blockIdx.x;
 	const half* g = f1 + static_cast<size_t>( row ) * 2 * F;
 	const half* u = g + F;
 	const float* bg = bias;
 	const float* bu = bias ? bias + F : nullptr;
+	float val[8][8];
 	float mx = 0.0f;
-	for ( int c = threadIdx.x; c < F; c += blockDim.x ) {
-		const float a = __half2float( g[c] ) + ( bg ? bg[c] : 0.0f ), b = __half2float( u[c] ) + ( bu ? bu[c] : 0.0f );
-		mx = fmaxf( mx, fabsf( a / ( 1.0f + __expf( -a ) ) * b ) );
+	#pragma unroll
+	for ( int it = 0; it < 8; ++it ) {
+		const int c0 = ( it * blockDim.x + threadIdx.x ) * 8;
+		if ( c0 >= F ) { break; }
+		const uint4 gv = *reinterpret_cast<const uint4*>( g + c0 ), uv = *reinterpret_cast<const uint4*>( u + c0 );
+		const half* gh = reinterpret_cast<const half*>( &gv );
+		const half* uh = reinterpret_cast<const half*>( &uv );
+		#pragma unroll
+		for ( int e = 0; e < 8; ++e ) {
+			const float a = __half2float( gh[e] ) + ( bg ? bg[c0 + e] : 0.0f ), b = __half2float( uh[e] ) + ( bu ? bu[c0 + e] : 0.0f );
+			const float v = a / ( 1.0f + __expf( -a ) ) * b;
+			val[it][e] = v;
+			mx = fmaxf( mx, fabsf( v ) );
+		}
 	}
 	mx = block_max( mx, red );
-	int e = 0;
-	if ( isfinite( mx ) ) { frexpf( mx, &e ); }
-	const float s = ldexpf( 1.0f, max( e - 11, 0 ) );
+	int e2 = 0;
+	if ( isfinite( mx ) ) { frexpf( mx, &e2 ); }
+	const float s = ldexpf( 1.0f, max( e2 - 11, 0 ) );
 	if ( threadIdx.x == 0 ) { rowscale[row] = s; }
-	for ( int c = threadIdx.x; c < F; c += blockDim.x ) {
-		const float a = __half2float( g[c] ) + ( bg ? bg[c] : 0.0f ), b = __half2float( u[c] ) + ( bu ? bu[c] : 0.0f );
-		f2[static_cast<size_t>( row ) * F + c] = __float2half_rn( a / ( 1.0f + __expf( -a ) ) * b / s );
+	#pragma unroll
+	for ( int it = 0; it < 8; ++it ) {
+		const int c0 = ( it * blockDim.x + threadIdx.x ) * 8;
+		if ( c0 >= F ) { break; }
+		uint4 ov;
+		half* oh = reinterpret_cast<half*>( &ov );
+		#pragma unroll
+		for ( int e = 0; e < 8; ++e ) { oh[e] = __float2half_rn( val[it][e] / s ); }
+		*reinterpret_cast<uint4*>( f2 + static_cast<size_t>( row ) * F + c0 ) = ov;
 	}
 }
 
