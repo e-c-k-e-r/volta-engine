@@ -117,6 +117,10 @@ set(ENGINE_DEVICE_SOURCES
 	src/video/h3_text.cu
 	src/video/h3_vision.cu
 	src/video/h3_pipeline.cu
+	src/video/h3_stage_refs.cpp
+	src/video/h3_stage_text.cpp
+	src/video/h3_stage_denoise.cu
+	src/video/h3_stage_decode.cu
 	src/kernels/cuda/h3/h3_fmha.cu
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
