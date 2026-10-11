@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <mutex>
+#include <chrono>
 #include <thread>
 
 namespace engine::video {
@@ -46,6 +47,9 @@ struct H3DiTGroup::Impl {
 	std::vector<std::unique_ptr<H3DiT>> dits;
 	std::unique_ptr<Barrier> barrier;
 	int max_rows = 0;
+	std::vector<std::vector<cudaStream_t>> pull_streams; // [rank][peer]: one copy stream per peer, so a rank pulls from all its peers at once (one NVLink each)
+	std::vector<std::vector<cudaEvent_t>> pull_done;
+	std::vector<double> t_comp, t_sync, t_xfer; // per rank: host time spent waiting for the slowest rank (before the exchange) and in the exchange itself, summed over a forward
 };
 
 H3DiTGroup::H3DiTGroup() : p_( new Impl ) {}
@@ -89,14 +93,22 @@ bool H3DiTGroup::load( const char* checkpoint, const std::vector<int>& devices, 
 	for ( auto& t : threads ) { t.join(); }
 	CUDA_CHECK( cudaSetDevice( caller_device ) ); // the peer-access setup walked over all GPUs; leave the caller where it was
 	for ( int r = 0; r < n; ++r ) { if ( !ok[r] ) { return false; } }
+	s.pull_streams.assign( n, std::vector<cudaStream_t>( n, nullptr ) );
+	s.pull_done.assign( n, std::vector<cudaEvent_t>( n, nullptr ) );
+	s.t_comp.assign( n, 0.0 );
+	s.t_sync.assign( n, 0.0 );
+	s.t_xfer.assign( n, 0.0 );
 	for ( int r = 0; r < n; ++r ) {
 		Impl* sp = p_;
 		s.dits[r]->set_sp( r, n, [sp, r, n]( int total, void* stream_ptr ) {
 			// Pull model: each rank copies its peers' K / V slices into its own buffers on its own compute stream (so stream order makes them visible to the
 			// attention that follows). Barrier 1: every rank's own slice is final. Barrier 2: every rank has finished pulling, so slices may be rewritten.
 			cudaStream_t stream = static_cast<cudaStream_t>( stream_ptr );
+			const auto t0 = std::chrono::steady_clock::now();
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
+			const auto t05 = std::chrono::steady_clock::now();
 			sp->barrier->wait();
+			const auto t1 = std::chrono::steady_clock::now();
 			const size_t qd = 7168;
 			const int chunk = ( total + n - 1 ) / n;
 			const half_ptr_pair mine = sp->dits[r]->kv_buffers();
@@ -104,13 +116,25 @@ bool H3DiTGroup::load( const char* checkpoint, const std::vector<int>& devices, 
 				if ( q == r ) { continue; }
 				const int q0 = std::min( total, q * chunk ), q1 = std::min( total, q0 + chunk );
 				if ( q1 <= q0 ) { continue; }
+				if ( !sp->pull_streams[r][q] ) {
+					CUDA_CHECK( cudaStreamCreateWithFlags( &sp->pull_streams[r][q], cudaStreamNonBlocking ) );
+					CUDA_CHECK( cudaEventCreateWithFlags( &sp->pull_done[r][q], cudaEventDisableTiming ) );
+				}
 				const half_ptr_pair theirs = sp->dits[q]->kv_buffers();
 				const size_t off = static_cast<size_t>( q0 ) * qd * 2, bytes = static_cast<size_t>( q1 - q0 ) * qd * 2;
-				CUDA_CHECK( cudaMemcpyPeerAsync( static_cast<char*>( mine.k ) + off, sp->devices[r], static_cast<char*>( theirs.k ) + off, sp->devices[q], bytes, stream ) );
-				CUDA_CHECK( cudaMemcpyPeerAsync( static_cast<char*>( mine.v ) + off, sp->devices[r], static_cast<char*>( theirs.v ) + off, sp->devices[q], bytes, stream ) );
+				cudaStream_t ps = sp->pull_streams[r][q];
+				CUDA_CHECK( cudaMemcpyPeerAsync( static_cast<char*>( mine.k ) + off, sp->devices[r], static_cast<char*>( theirs.k ) + off, sp->devices[q], bytes, ps ) );
+				CUDA_CHECK( cudaMemcpyPeerAsync( static_cast<char*>( mine.v ) + off, sp->devices[r], static_cast<char*>( theirs.v ) + off, sp->devices[q], bytes, ps ) );
+				CUDA_CHECK( cudaEventRecord( sp->pull_done[r][q], ps ) );
+			}
+			for ( int q = 0; q < n; ++q ) { // the attention that follows (compute stream) starts when every pull is in
+				if ( q != r && sp->pull_streams[r][q] ) { CUDA_CHECK( cudaStreamWaitEvent( stream, sp->pull_done[r][q], 0 ) ); }
 			}
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 			sp->barrier->wait();
+			sp->t_comp[r] += std::chrono::duration<double>( t05 - t0 ).count();
+			sp->t_sync[r] += std::chrono::duration<double>( t1 - t05 ).count();
+			sp->t_xfer[r] += std::chrono::duration<double>( std::chrono::steady_clock::now() - t1 ).count();
 		} );
 	}
 	return true;
@@ -177,6 +201,15 @@ bool H3DiTGroup::forward( const H3HostRequest& hr, std::vector<float>* video_out
 		} );
 	}
 	for ( auto& t : threads ) { t.join(); }
+	{
+		double comp_max = 0, sync_max = 0, xfer_max = 0;
+		for ( int r = 0; r < n; ++r ) {
+			comp_max = std::max( comp_max, s.t_comp[r] ); sync_max = std::max( sync_max, s.t_sync[r] ); xfer_max = std::max( xfer_max, s.t_xfer[r] );
+			s.t_comp[r] = s.t_sync[r] = s.t_xfer[r] = 0;
+		}
+		LOG_INFO( "H3: sequence-parallel forward (maximum over ranks): %.2f s of GPU compute before the exchanges, %.2f s at the barriers waiting for the slowest rank, %.2f s copying K/V", comp_max, sync_max, xfer_max );
+	}
+
 	if ( n > 1 ) {
 		for ( int i = 0; i < hr.n_img; ++i ) {
 			const float m = hr.update_mask[i] ? 1.0f : 0.0f;
