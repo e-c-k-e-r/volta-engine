@@ -29,6 +29,7 @@ struct H3Config {
 	float eps = 1e-5f;
 	float qk_eps = 1e-5f;
 	float final_eps = 1e-5f;
+	bool simple_attention = false; // bring-up kernel instead of the CUTLASS FMHA (tiny sequences only)
 };
 
 // One packed request in "used" coordinates (padding rows are dropped: they form their own attention document).

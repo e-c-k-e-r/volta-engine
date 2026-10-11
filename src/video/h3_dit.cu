@@ -3,6 +3,7 @@
 #include "engine/core/arena.h"
 #include "engine/core/log.h"
 #include "engine/loader/safetensors.h"
+#include "engine/video/h3_fmha.h"
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -335,9 +336,10 @@ struct H3DiT::Impl {
 
 	// scratch
 	float *x = nullptr, *br = nullptr, *tx = nullptr, *rowscale = nullptr, *ada = nullptr, *temb = nullptr, *cosb = nullptr, *sinb = nullptr, *vall = nullptr, *aall = nullptr;
-	half *h16 = nullptr, *qkv16 = nullptr, *q16 = nullptr, *k16 = nullptr, *o16 = nullptr, *f1 = nullptr, *f2 = nullptr, *wscratch = nullptr;
+	half *h16 = nullptr, *v16 = nullptr, *qkv16 = nullptr, *q16 = nullptr, *k16 = nullptr, *o16 = nullptr, *f1 = nullptr, *f2 = nullptr, *wscratch = nullptr;
 	int* comb = nullptr;
 	size_t wbytes = 0;
+	bool use_fmha = false;
 
 	template <typename T>
 	T* alloc( pod::MemoryArena& a, size_t n ) { return static_cast<T*>( engine::core::arena_alloc( a, n * sizeof( T ) ) ); }
@@ -473,8 +475,13 @@ struct H3DiT::Impl {
 		k_norm_mod<half><<<rows, 256, 0, stream>>>( xs, nullptr, nullptr, 0, b.n1, sh_a, sc_a, st6, idx, H, cfg.eps, h16 );
 		gemm_h( h16, matrix( b.qkv ), qkv16, rows, 3 * qd, H, false );
 		k_qk_norm_rope<<<dim3( rows, ( 2 * nh + 7 ) / 8 ), 256, 0, stream>>>( qkv16, 3 * qd, b.qn, b.kn, rope ? cosb : nullptr, rope ? sinb : nullptr, q16, k16, nh, cfg.qk_eps );
-		const size_t smem = static_cast<size_t>( rows + 8 ) * sizeof( float );
-		k_attn_simple<<<dim3( rows, nh ), 128, smem, stream>>>( q16, k16, qkv16 + 2 * qd, 3 * qd, o16, rows, nh );
+		if ( use_fmha ) {
+			CUDA_CHECK( cudaMemcpy2DAsync( v16, qd * sizeof( half ), qkv16 + 2 * qd, 3 * qd * sizeof( half ), qd * sizeof( half ), rows, cudaMemcpyDeviceToDevice, stream ) );
+			h3_flash_attention( q16, k16, v16, o16, rows, nh, 1.0f / std::sqrt( static_cast<float>( cfg.head_dim ) ), 0, rows >= 1024 ? 128 : 64, stream );
+		} else {
+			const size_t smem = static_cast<size_t>( rows + 8 ) * sizeof( float );
+			k_attn_simple<<<dim3( rows, nh ), 128, smem, stream>>>( q16, k16, qkv16 + 2 * qd, 3 * qd, o16, rows, nh );
+		}
 		gemm_h( o16, matrix( b.out ), br, rows, H, qd, true );
 		k_norm_mod<half><<<rows, 256, 0, stream>>>( xs, br, g_a, st6, b.n2, sh_m, sc_m, st6, idx, H, cfg.eps, h16 );
 		gemm_h( h16, matrix( b.fc1 ), f1, rows, 2 * F, H, false );
@@ -538,11 +545,13 @@ bool H3DiT::load( const char* checkpoint, int device, int max_rows, const H3Conf
 	s.table.assign( static_cast<const float*>( engine::loader::safetensors_get_data_cpu( s.st, tm ) ), static_cast<const float*>( engine::loader::safetensors_get_data_cpu( s.st, tm ) ) + s.numel( tm ) );
 	ENGINE_ASSERT( tm->shape[0] == cfg.adaln_grid && tm->shape[1] == cfg.adaln_dim, "H3: adaln table shape" );
 	s.wbytes = s.warena.offset_bytes;
+	s.use_fmha = h3_fmha_available() && !cfg.simple_attention;
+	LOG_INFO( "H3: attention kernel %s", s.use_fmha ? "CUTLASS FMHA" : "simple (slow)" );
 	CUDA_CHECK( cudaFuncSetAttribute( k_attn_simple, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304 - 1024 ) );
 
 	// scratch sized for max_rows
 	const size_t U = static_cast<size_t>( max_rows ), qd = static_cast<size_t>( cfg.heads ) * cfg.head_dim, F = cfg.ffn;
-	size_t need = U * H * 4 * 3 + U * 4 * 2 + U * 3 * qd * 2 + U * qd * 2 * 3 + U * 2 * F * 2 + U * F * 2 + U * H * 2 + U * 48 * 4 * 2 + U * 128 * 4 + 64ull * 3 * 6 * H * 4 +
+	size_t need = U * H * 4 * 3 + U * 4 * 2 + U * 3 * qd * 2 + U * qd * 2 * 4 + U * 2 * F * 2 + U * F * 2 + U * H * 2 + U * 48 * 4 * 2 + U * 128 * 4 + 64ull * 3 * 6 * H * 4 +
 		static_cast<size_t>( 28672 ) * 5376 * 2 + ( 64ull << 20 );
 	need += 4096ull * H * 4; // refiner stream (text rows)
 	if ( !engine::core::arena_create( s.sarena, device, need ) ) { return false; }
@@ -557,6 +566,7 @@ bool H3DiT::load( const char* checkpoint, int device, int max_rows, const H3Conf
 	s.vall = s.alloc<float>( s.sarena, U * 96 );
 	s.aall = s.alloc<float>( s.sarena, U * 32 );
 	s.h16 = s.alloc<half>( s.sarena, U * H );
+	s.v16 = s.alloc<half>( s.sarena, U * qd );
 	s.qkv16 = s.alloc<half>( s.sarena, U * 3 * qd );
 	s.q16 = s.alloc<half>( s.sarena, U * qd );
 	s.k16 = s.alloc<half>( s.sarena, U * qd );
