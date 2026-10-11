@@ -52,7 +52,7 @@ DEV_INLINE int acc_col( int i, int lane ) { return ( ( lane >> 2 ) & 3 ) * 8 + (
 template <int WARPS, bool GROUPED>
 __global__ __launch_bounds__( WARPS * 32 )
 void nvfp4_moe_gate_up( NVFP4ExpertTable t, const half* __restrict__ x, const int* __restrict__ disp, const int* __restrict__ route_idx, uint32_t* __restrict__ heat,
-	int topk, half* __restrict__ h ) {
+	int topk, float act_limit, half* __restrict__ h ) {
 	// Ungrouped (one row): block row y is route y, no dispatch pass
 	const int E = t.num_local;
 	int e, cnt;
@@ -150,7 +150,10 @@ void nvfp4_moe_gate_up( NVFP4ExpertTable t, const half* __restrict__ x, const in
 			#pragma unroll
 			for ( int w = 0; w < WARPS; w++ ) { g += cs[( w * 2 + 0 ) * CS + threadIdx.x]; u += cs[( w * 2 + 1 ) * CS + threadIdx.x]; }
 			const float gh = __half2float( __float2half( g ) ), uh = __half2float( __float2half( u ) );
-			h[( size_t ) ROUTE_OF( c0 + ( threadIdx.x >> 5 ) ) * I + tile * 32 + ( threadIdx.x & 31 )] = __float2half( gh / ( 1.0f + __expf( -gh ) ) * uh );
+			// act_limit > 0 (GLM): up clamped both ways, the activated gate from above (as exl3_moe_coop's act_gate)
+		float act = gh / ( 1.0f + __expf( -gh ) ), up = uh;
+		if ( act_limit > 0.0f ) { up = fminf( fmaxf( up, -act_limit ), act_limit ); act = fminf( act, act_limit ); }
+		h[( size_t ) ROUTE_OF( c0 + ( threadIdx.x >> 5 ) ) * I + tile * 32 + ( threadIdx.x & 31 )] = __float2half( act * up );
 		}
 		__syncthreads();
 	}
@@ -268,17 +271,27 @@ void nvfp4_moe_down( NVFP4ExpertTable t, const half* __restrict__ h, const int* 
 namespace engine::modules {
 
 void NVFP4MoE::forward_rows( const NVFP4ExpertTable& t, const half* x, const int* route_idx, const half* route_w, int rows, int topk,
-	half* h, float* partial, int* disp, int* counters, uint32_t* heat, half* out, backend::stream_t stream ) {
+	half* h, float* partial, int* disp, int* counters, uint32_t* heat, float act_limit, half* out, backend::stream_t stream ) {
 	ENGINE_ASSERT( t.hidden % 64 == 0 && t.inter % 64 == 0 && t.inter % 32 == 0 && t.hidden % 32 == 0, "NVFP4 MoE: dims" );
 	ENGINE_ASSERT( ( t.hidden / 16 ) % 16 == 0 && ( t.inter / 16 ) % 8 == 0 && rows <= ROWS_CAP && t.num_local <= MOE_MAX_EXPERTS, "NVFP4 MoE: group counts / rows" );
+	// Up to 8 staged rows of K halves: 64 KB at GLM's K = 4096, above the 48 KB default
+	static bool opted[ENGINE_NUM_GPUS] = {};
+	int device = 0;
+	CUDA_CHECK( cudaGetDevice( &device ) );
+	if ( !opted[device] ) {
+		CUDA_CHECK( cudaFuncSetAttribute( nvfp4_moe_gate_up<16, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( nvfp4_moe_gate_up<16, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( nvfp4_moe_down<8, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536 ) );
+		opted[device] = true;
+	}
 	if ( rows == 1 ) {
-		nvfp4_moe_gate_up<16, false><<<dim3( t.inter / 32, topk ), 512, MAX( t.hidden * 2, 16 * 2 * 32 * 4 ), stream>>>( t, x, disp, route_idx, heat, topk, h );
+		nvfp4_moe_gate_up<16, false><<<dim3( t.inter / 32, topk ), 512, MAX( t.hidden * 2, 16 * 2 * 32 * 4 ), stream>>>( t, x, disp, route_idx, heat, topk, act_limit, h );
 		nvfp4_moe_down<8, false><<<dim3( t.hidden / 32, topk ), 256, MAX( t.inter * 2, 8 * 32 * 4 ), stream>>>( t, h, disp, route_idx, route_w, rows, topk, partial, counters, out );
 		return;
 	}
 	const int active_max = MIN( t.num_local, rows * topk );
 	nvfp4_moe_dispatch<<<1, 1024, 0, stream>>>( route_idx, rows * topk, t.min_expert, t.num_local, heat, disp );
-	nvfp4_moe_gate_up<16, true><<<dim3( t.inter / 32, active_max ), 512, MAX( MIN( rows, 8 ) * t.hidden * 2, 16 * 2 * 8 * 32 * 4 ), stream>>>( t, x, disp, route_idx, nullptr, topk, h );
+	nvfp4_moe_gate_up<16, true><<<dim3( t.inter / 32, active_max ), 512, MAX( MIN( rows, 8 ) * t.hidden * 2, 16 * 2 * 8 * 32 * 4 ), stream>>>( t, x, disp, route_idx, nullptr, topk, act_limit, h );
 	nvfp4_moe_down<8, true><<<dim3( t.hidden / 32, active_max ), 256, MAX( MIN( rows, 8 ) * t.inter * 2, 8 * 8 * 32 * 4 ), stream>>>( t, h, disp, route_idx, route_w, rows, topk, partial, counters, out );
 }
 

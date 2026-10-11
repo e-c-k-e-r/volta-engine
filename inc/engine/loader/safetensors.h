@@ -166,6 +166,32 @@ public:
 		backend::stream_t stream = nullptr
 	);
 
+	// Prepared (modelopt-named) tensors stacked along the output rows, which must share K and the global scale
+	pod::LinearWeight load_nvfp4_concat(
+		const char* const* base_names,
+		const int* n_begin,
+		const int* n_count,
+		int parts,
+		int k0,
+		int kcount,
+		int pad_n,
+		pod::MemoryArena& arena,
+		backend::stream_t stream = nullptr
+	);
+
+	// The same for several tensors of one input width stacked along the output rows (a fused q / k / v), one global scale over all of them
+	pod::LinearWeight quantize_nvfp4_concat(
+		const char* const* base_names,
+		const int* n_begin,
+		const int* n_count,
+		int parts,
+		int k0,
+		int kcount,
+		int pad_n,
+		pod::MemoryArena& arena,
+		backend::stream_t stream = nullptr
+	);
+
 	pod::LinearWeight quantize_nvfp4_slice(
 		const char* base_name,
 		pod::MemoryArena& arena,
@@ -250,7 +276,7 @@ public:
 	}
 
 private:
-	static constexpr int MAX_SHARDS = 32;
+	static constexpr int MAX_SHARDS = 128;
 	pod::SafeTensorsFile shards_[MAX_SHARDS];
 	char shard_names_[MAX_SHARDS][256];
 	int num_shards_ = 0;

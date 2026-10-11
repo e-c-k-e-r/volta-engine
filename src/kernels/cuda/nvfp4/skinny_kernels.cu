@@ -356,9 +356,16 @@ void LinearNVFP4::forward(
 	pod::TensorView& out,
 	cudaStream_t stream
 ) {
+	// N and K come from the packed codes ([N, K/2] bytes) when they carry a shape: the model's shared scratch tensors are as wide as the widest
+	// consumer (GLM's expert buffers match the 12288-wide dense MLP), and rows of x and out are packed K and N apart as for every other weight format
 	const int m = x.shape[0];
-	const int k = x.shape[1];
-	const int n = out.shape[1];
+	int k = x.shape[1];
+	int n = out.shape[1];
+	if ( codes.ndim == 2 ) {
+		n = codes.shape[0];
+		k = codes.shape[1] * 2;
+	}
+	ENGINE_ASSERT( x.shape[1] >= k && out.shape[1] >= n, "NVFP4: input or output narrower than the weight" );
 
 	ENGINE_ASSERT( k % 64 == 0, "NVFP4: K must be multiple of 64" );
 	ENGINE_ASSERT( n % 32 == 0, "NVFP4: N must be multiple of 32" );

@@ -1,6 +1,8 @@
 #include "engine/models/glm5_next.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
+#include "engine/modules/hessian.h"
+#include <memory>
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
 #include "engine/loader/safetensors.h"
@@ -412,6 +414,69 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 
 	int missing_count = 0;
 
+	// Dense groups quantized to NVFP4 at load from the BF16 tensors of a modelopt checkpoint (ENGINE_NVFP4_DENSE_SRC, ENGINE_NVFP4_DENSE); the
+	// routed experts stay EXL3. The dense MLP layers are NVFP4 in that checkpoint already and load as they are (group `dense`)
+	std::unique_ptr<engine::loader::SafeTensorsRepo> nv_repo;
+	if ( const std::string& nv_dir = runtime::options().nvfp4_dense_src; !nv_dir.empty() && !runtime::options().nvfp4_dense.empty() ) {
+		nv_repo = std::make_unique<engine::loader::SafeTensorsRepo>();
+		if ( !nv_repo->open( nv_dir.c_str() ) ) {
+			LOG_ERROR( "[loader] FAILED to open the NVFP4 directory %s\n", nv_dir.c_str() );
+			return false;
+		}
+	}
+	const std::string& nv_groups = runtime::options().nvfp4_dense;
+	auto nv_listed = [&]( const std::string& g ) { return ( "," + nv_groups + "," ).find( "," + g + "," ) != std::string::npos; };
+	auto nv_on = [&]( const char* group ) {
+		if ( !nv_repo ) return false;
+		const std::string g = group;
+		return nv_groups == "all" || nv_listed( g ) || ( g.rfind( "shared_", 0 ) == 0 && nv_listed( "shared" ) );
+	};
+	int nv_count = 0, nv_calibrated = 0;
+	auto nv_check = [&]( pod::LinearWeight lw, const char* name ) {
+		if ( !lw.is_valid() ) { LOG_ERROR( "[RANK %d] MISSING (NVFP4): %s\n", rank_, name ); ++missing_count; }
+		++nv_count;
+		return lw;
+	};
+	// Calibrated tensors (tests/tools/nvfp4_ldlq.py --model glm) when the directory has them, otherwise round-to-nearest from the BF16 weight
+	std::unique_ptr<engine::loader::SafeTensorsRepo> ov_repo;
+	if ( const std::string& ov_dir = runtime::options().nvfp4_dense_dir; !ov_dir.empty() && nv_repo ) {
+		ov_repo = std::make_unique<engine::loader::SafeTensorsRepo>();
+		if ( !ov_repo->open( ov_dir.c_str() ) ) {
+			LOG_ERROR( "[loader] FAILED to open the calibrated NVFP4 directory %s\n", ov_dir.c_str() );
+			return false;
+		}
+	}
+	auto has_ov = [&]( const char* name ) { return ov_repo && ov_repo->find( ( std::string( name ) + ".weight_scale_2" ).c_str() ); };
+	auto nv_slice = [&]( const char* name, bool split_n, int rank, int parts ) {
+		if ( has_ov( name ) ) { ++nv_calibrated; return nv_check( ov_repo->load_nvfp4_slice( name, *arena_, split_n, rank, parts, stream ), name ); }
+		return nv_check( nv_repo->quantize_nvfp4_slice( name, *arena_, split_n, rank, parts, 0, stream ), name );
+	};
+
+	if ( !runtime::options().hessian_dir.empty() ) {
+		// Calibration accumulators (sites: see hessian()); replicated inputs live on rank 0, the o_proj inputs on every rank
+		hess_.assign( static_cast<size_t>( config_.num_layers ) * 6, HessianSite{} );
+		auto site = [&]( int layer, int idx, int k ) {
+			HessianSite& hs = hess_[static_cast<size_t>( layer ) * 6 + idx];
+			hs.k = k;
+			hs.h = static_cast<float*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( k ) * k * sizeof( float ), 128 ) );
+			backend::memset_async( hs.h, 0, static_cast<size_t>( k ) * k * sizeof( float ), stream );
+		};
+		int hl_lo = 0, hl_hi = config_.num_layers - 1;
+		if ( const std::string& hl = runtime::options().hessian_layers; !hl.empty() ) std::sscanf( hl.c_str(), "%d-%d", &hl_lo, &hl_hi );
+		for ( int L = 0; L < config_.num_layers; ++L ) {
+			if ( L < hl_lo || L > hl_hi ) continue;
+			const bool mla = ( L % 4 == 3 ) && L < 44;
+			if ( rank_ == 0 ) {
+				site( L, 0, config_.hidden_size );
+				if ( L >= 3 ) { site( L, 1, config_.hidden_size ); site( L, 3, 2048 ); }
+				if ( mla ) site( L, 4, 1536 );
+			}
+			site( L, 2, mla ? 16384 / config_.tp_size : 8192 / config_.tp_size );
+		}
+		if ( rank_ == 0 && hl_lo == 0 ) site( 0, 5, config_.hidden_size );
+		backend::stream_sync( stream );
+	}
+
 	// 1. Embedding table: 1.27 GB of BF16 kept in portable pinned host memory instead of rank 0's arena (which has
 	// no room for the drafter beside it). Lookups touch a few rows per forward and read over the link; every rank
 	// shares the one table (the drafter looks up its anchor token on all four).
@@ -436,7 +501,12 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	// Final norm + this rank's vocabulary shard of the LM head
 	final_norm_ = repo.load( "model.language_model.norm.weight", *arena_, stream, pod::DType::FP16 );
 	if ( !final_norm_.data ) { LOG_ERROR( "[RANK %d] MISSING: norm\n", rank_ ); ++missing_count; }
-	lm_head_ = repo.load_linear_cols_padded( "lm_head", *arena_, 6, lm_shard_offset_ / 16, lm_shard_real_cols_ / 16, lm_shard_cols_ - lm_shard_real_cols_, stream );
+	if ( nv_on( "head" ) ) {
+		const int begin = lm_shard_offset_, count = lm_shard_real_cols_;
+		if ( has_ov( "lm_head" ) ) { ++nv_calibrated; lm_head_ = nv_check( ov_repo->load_nvfp4( "lm_head", *arena_, &begin, &count, 1, 0, config_.hidden_size, stream, lm_shard_cols_ ), "lm_head" ); }
+		else lm_head_ = nv_check( nv_repo->quantize_nvfp4( "lm_head", *arena_, &begin, &count, 1, 0, config_.hidden_size, lm_shard_cols_, stream ), "lm_head" );
+	}
+	else lm_head_ = repo.load_linear_cols_padded( "lm_head", *arena_, 6, lm_shard_offset_ / 16, lm_shard_real_cols_ / 16, lm_shard_cols_ - lm_shard_real_cols_, stream );
 	if ( !lm_head_.is_valid() ) { LOG_ERROR( "[RANK %d] MISSING: lm_head\n", rank_ ); ++missing_count; }
 
 	// 2. Per-layer weights across 45 layers
@@ -460,7 +530,26 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		lw.post_attn_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.qkv_proj", L );
-		lw.qkv = repo.load_grouped_trellis_slice( name_buf, *arena_, GLM_QKV_BLOCKS, GLM_QKV_RANK_BLOCKS, 3, rank_, stream );
+		{
+			char trellis_name[300];
+			std::snprintf( trellis_name, sizeof( trellis_name ), "%s.trellis", name_buf );
+			if ( nv_on( "kda" ) && repo.find( trellis_name ) ) {
+				// q / k / v are three [8192, 4096] BF16 tensors in the NVFP4 checkpoint; every rank takes 2048 rows of each, stacked into one weight
+				char qn[3][300];
+				const char* parts[3] = { "q_proj", "k_proj", "v_proj" };
+				const char* qp[3];
+				int begin[3], count[3];
+				for ( int i = 0; i < 3; ++i ) {
+					std::snprintf( qn[i], sizeof( qn[i] ), "model.language_model.layers.%d.self_attn.%s", L, parts[i] );
+					qp[i] = qn[i];
+					count[i] = 8192 / config_.tp_size;
+					begin[i] = rank_ * count[i];
+				}
+				if ( has_ov( qp[0] ) ) { ++nv_calibrated; lw.qkv = nv_check( ov_repo->load_nvfp4_concat( qp, begin, count, 3, 0, config_.hidden_size, 0, *arena_, stream ), name_buf ); }
+				else lw.qkv = nv_check( nv_repo->quantize_nvfp4_concat( qp, begin, count, 3, 0, config_.hidden_size, 0, *arena_, stream ), name_buf );
+			}
+			else lw.qkv = repo.load_grouped_trellis_slice( name_buf, *arena_, GLM_QKV_BLOCKS, GLM_QKV_RANK_BLOCKS, 3, rank_, stream );
+		}
 		lw.is_linear_attn = lw.qkv.is_valid();
 
 		if ( lw.is_linear_attn ) {
@@ -492,23 +581,25 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			lw.o_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.o_proj", L );
-			lw.o_proj = repo.load_linear_slice( name_buf, *arena_, 5, 0, rank_, config_.tp_size, stream );
+			lw.o_proj = nv_on( "kda" ) ? nv_slice( name_buf, false, rank_, config_.tp_size )
+				: repo.load_linear_slice( name_buf, *arena_, 5, 0, rank_, config_.tp_size, stream );
 		}
 
 		bool is_mla = ( ( L % 4 == 3 ) && L < 44 );
 		lw.is_mla = is_mla;
 		if ( lw.is_mla ) {
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.q_a_proj", L );
-			lw.q_a = repo.load_linear( name_buf, *arena_, 5, stream );
+			lw.q_a = nv_on( "mla" ) ? nv_slice( name_buf, true, 0, 1 ) : repo.load_linear( name_buf, *arena_, 5, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.q_a_layernorm.weight", L );
 			lw.q_a_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.q_b_proj", L );
-			lw.q_b = repo.load_linear_slice( name_buf, *arena_, 5, 1, rank_, config_.tp_size, stream );
+			lw.q_b = nv_on( "mla" ) ? nv_slice( name_buf, true, rank_, config_.tp_size )
+				: repo.load_linear_slice( name_buf, *arena_, 5, 1, rank_, config_.tp_size, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.kv_a_proj_with_mqa", L );
-			lw.kv_a = repo.load_linear( name_buf, *arena_, 5, stream );
+			lw.kv_a = nv_on( "mla" ) ? nv_slice( name_buf, true, 0, 1 ) : repo.load_linear( name_buf, *arena_, 5, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.kv_a_layernorm.weight", L );
 			lw.kv_a_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
@@ -517,13 +608,14 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			lw.kv_b_proj = repo.load_slice( name_buf, *arena_, 0, rank_, config_.tp_size, stream, pod::DType::FP16 );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.o_proj", L );
-			lw.o_proj = repo.load_linear_slice( name_buf, *arena_, 5, 0, rank_, config_.tp_size, stream );
+			lw.o_proj = nv_on( "mla" ) ? nv_slice( name_buf, false, rank_, config_.tp_size )
+				: repo.load_linear_slice( name_buf, *arena_, 5, 0, rank_, config_.tp_size, stream );
 
 			if ( dsa_ ) {
 				char pre[160];
 				std::snprintf( pre, sizeof( pre ), "model.language_model.layers.%d.self_attn.indexer", L );
 				std::snprintf( name_buf, sizeof( name_buf ), "%s.wq_b", pre );
-				lw.idx_wq_b = repo.load_linear( name_buf, *arena_, 5, stream );
+				lw.idx_wq_b = nv_on( "idx" ) ? nv_slice( name_buf, true, 0, 1 ) : repo.load_linear( name_buf, *arena_, 5, stream );
 				const int dshape[2] = { engine::modules::DSA::PROJ, 4096 };
 				lw.idx_dense = engine::core::arena_alloc_tensor( *arena_, pod::DType::FP16, dshape, 2 );
 				const size_t keep = arena_->offset_bytes;
@@ -604,27 +696,27 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 
 			// Shared experts
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.gate_proj", L );
-			lw.shared_expert.gate = repo.load_linear( name_buf, *arena_, 4, stream );
+			lw.shared_expert.gate = nv_on( "shared_gate" ) ? nv_slice( name_buf, true, 0, 1 ) : repo.load_linear( name_buf, *arena_, 4, stream );
 			lw.has_shared_expert = lw.shared_expert.gate.is_valid();
 
 			if ( lw.has_shared_expert ) {
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.up_proj", L );
-				lw.shared_expert.up = repo.load_linear( name_buf, *arena_, 4, stream );
+				lw.shared_expert.up = nv_on( "shared_up" ) ? nv_slice( name_buf, true, 0, 1 ) : repo.load_linear( name_buf, *arena_, 4, stream );
 
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.down_proj", L );
-				lw.shared_expert.down = repo.load_linear( name_buf, *arena_, 4, stream );
+				lw.shared_expert.down = nv_on( "shared_down" ) ? nv_slice( name_buf, true, 0, 1 ) : repo.load_linear( name_buf, *arena_, 4, stream );
 			}
 		}
 		else {
 			// Dense layer
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.gate_proj", L );
-			lw.dense_mlp.gate = repo.load_linear( name_buf, *arena_, 4, stream );
+			lw.dense_mlp.gate = nv_on( "dense" ) ? nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, true, 0, 1, stream ), name_buf ) : repo.load_linear( name_buf, *arena_, 4, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.up_proj", L );
-			lw.dense_mlp.up = repo.load_linear( name_buf, *arena_, 4, stream );
+			lw.dense_mlp.up = nv_on( "dense" ) ? nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, true, 0, 1, stream ), name_buf ) : repo.load_linear( name_buf, *arena_, 4, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.down_proj", L );
-			lw.dense_mlp.down = repo.load_linear( name_buf, *arena_, 4, stream );
+			lw.dense_mlp.down = nv_on( "dense" ) ? nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, true, 0, 1, stream ), name_buf ) : repo.load_linear( name_buf, *arena_, 4, stream );
 		}
 
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.hc_attn_base", L );
@@ -703,6 +795,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	}
 
 	size_t bytes_after = arena_->offset_bytes;
+	if ( nv_count > 0 ) LOG_INFO( "[RANK %d] NVFP4 dense tensors: %d, %d calibrated (groups %s)\n", rank_, nv_count, nv_calibrated, nv_groups.c_str() );
 	if ( missing_count > 0 || rank_ == 0 ) {
 		LOG_ERROR( "[RANK %d] load_weights complete: missing_count=%d | arena: before=%.3f GiB, after=%.3f GiB, loaded=%.3f GiB\n",
 			rank_, missing_count,
@@ -978,6 +1071,7 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 		}
 
 		// 2. Attention
+		hessian( layer, 0, norm_hidden_.data, H, m, stream );
 		if ( lw.is_linear_attn && lw.qkv.is_valid() ) {
 			// Linear layers are every layer but the MLA ones (3, 7, ...): ordinal = layer - (layer + 1) / 4
 			const size_t lin = static_cast<size_t>( layer - ( layer + 1 ) / 4 );
@@ -1010,6 +1104,7 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 				16, 128, 1e-5f, m, d_rows_, slot_kda_floats, kda_snap, slot_kda_floats, snap_rows, state_.d_snap_on, stream
 			);
 
+			hessian( layer, 2, attn_head_out_.data, 8192 / config_.tp_size, m, stream );
 			if ( lw.o_proj.is_valid() ) {
 				engine::modules::Linear::forward(
 					attn_head_out_, lw.o_proj, attn_out_, stream
@@ -1043,6 +1138,7 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 				q_lora_buf_, lw.q_a_norm, q_lora_norm_buf_, 1e-5f, 0.0f, stream
 			);
 
+			hessian( layer, 4, q_lora_norm_buf_.data, 1536, m, stream );
 			engine::modules::Linear::forward(
 				q_lora_norm_buf_, lw.q_b, q_buf_, stream
 			);
@@ -1130,6 +1226,7 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 			}
 
 			// Project output: o_proj -> ring_->all_reduce across the ranks
+			hessian( layer, 2, mla_heads_out_.data, 16384 / config_.tp_size, m, stream );
 			if ( lw.o_proj.is_valid() ) {
 				engine::modules::Linear::forward(
 					mla_heads_out_, lw.o_proj, attn_out_, stream
@@ -1179,6 +1276,7 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 		}
 
 		// 4. MoE FFN
+		hessian( layer, 1, norm_hidden_.data, H, m, stream );
 		if ( lw.is_moe ) {
 			// Replicated Top-K Router: 288 experts, top-8 selection evaluated on all ranks
 			engine::modules::MoERouter::route_topk(
@@ -1259,6 +1357,7 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 					norm_hidden_, lw.shared_expert.up, moe_up_buf_, stream
 				);
 				engine::modules::SwiGLU::forward( moe_gate_buf_, moe_up_buf_, moe_inter_buf_, stream, 10.0f );
+				hessian( layer, 3, moe_inter_buf_.data, 2048, m, stream );
 				engine::modules::Linear::forward(
 					moe_inter_buf_, lw.shared_expert.down, moe_expert_out_, stream
 				);
@@ -1329,6 +1428,11 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 	}
 
 	// Final norm + this rank's vocabulary shard of the LM head
+	if ( !hess_.empty() && m > pod::MAX_BATCH && hess_[5].h != nullptr ) {
+		// Calibration passes skip the head (its logits buffer holds MAX_BATCH rows); the head's input statistics need the normed rows only
+		engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, 1e-5f, 0.0f, stream );
+		hessian( 0, 5, norm_hidden_.data, config_.hidden_size, m, stream );
+	}
 	if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
 	if ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) {
 		// Prefill: only the final row's logits are read
@@ -1344,9 +1448,44 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 	engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
 }
 
+void Glm5NextPipeline::hessian( int layer, int site, const void* x, int k, int m, backend::stream_t stream ) {
+	if ( hess_.empty() || m <= pod::MAX_BATCH ) return;
+	HessianSite& hs = hess_[static_cast<size_t>( layer ) * 6 + site];
+	if ( hs.h == nullptr ) return;
+	ENGINE_ASSERT( hs.k == k, "Glm5NextPipeline::hessian: site width changed" );
+	engine::modules::Hessian::accumulate( hs.h, static_cast<const backend::half_t*>( x ), m, k, stream );
+	hs.rows += m;
+}
+
+// One file per site: int32 magic, int32 k, int64 rows, then k * k fp32 (x^T x summed over the rows)
+void Glm5NextPipeline::hessian_dump() {
+	if ( hess_.empty() ) return;
+	const std::string& dir = runtime::options().hessian_dir;
+	backend::stream_sync( nullptr );
+	std::vector<float> host;
+	for ( size_t i = 0; i < hess_.size(); ++i ) {
+		const HessianSite& hs = hess_[i];
+		if ( hs.h == nullptr || hs.rows == 0 ) continue;
+		host.resize( static_cast<size_t>( hs.k ) * hs.k );
+		backend::memcpy_sync( host.data(), hs.h, host.size() * sizeof( float ), backend::Copy::D2H );
+		char path[512];
+		std::snprintf( path, sizeof( path ), "%s/L%02d_s%d_r%d.f32", dir.c_str(), static_cast<int>( i / 6 ), static_cast<int>( i % 6 ), rank_ );
+		if ( FILE* f = std::fopen( path, "wb" ) ) {
+			const int32_t hdr[2] = { 0x48455353, hs.k };
+			std::fwrite( hdr, sizeof( int32_t ), 2, f );
+			std::fwrite( &hs.rows, sizeof( int64_t ), 1, f );
+			std::fwrite( host.data(), sizeof( float ), host.size(), f );
+			std::fclose( f );
+		}
+		else LOG_ERROR( "[RANK %d] hessian: cannot write %s\n", rank_, path );
+	}
+	LOG_INFO( "[RANK %d] hessians written to %s\n", rank_, dir.c_str() );
+}
+
 void Glm5NextPipeline::destroy() {
 	if ( arena_ != nullptr ) {
 		backend::set_device( rank_ );
+		hessian_dump();
 		graphs_.reset();
 	}
 	engine::core::arena_destroy( host_arena_ );

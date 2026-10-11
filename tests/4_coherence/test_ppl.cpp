@@ -100,7 +100,7 @@ int main( int argc, char** argv ) {
 			int row_count = 0;
 			for ( int off = 0; off + 1 < n; off += chunk ) {
 				const int count = std::min( chunk, n - off );
-				mc.forward( ids.data() + off, pod::BatchRows::causal( count, off, 0, pod::BatchRows::LOGITS_ALL ) );
+				mc.forward( ids.data() + off, pod::BatchRows::causal( count, off, 0, glm && calibrate ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );   // GLM's logits buffer holds a decode batch
 				if ( calibrate ) continue;   // forward only (ENGINE_HESSIAN_DIR collects its statistics in the layers); the host scoring below is the slow part
 		mc.read_logits( count, logits.data() );
 				for ( int r = 0; r < count && off + r + 1 < n; ++r ) {

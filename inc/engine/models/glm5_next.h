@@ -208,6 +208,12 @@ private:
 	engine::modules::ExpertTier tier_;
 	pod::MemoryArena host_arena_{};     // pinned cold-expert tier
 	int tier_layers_ = 0;
+	// Calibration (ENGINE_HESSIAN_DIR): x^T x of a projection input over the prefill rows, per layer and site (0 attention input, 1 FFN input,
+	// 2 o_proj input (rank slice), 3 shared-expert down input, 4 q-lora norm output (MLA), 5 lm_head input with layer 0)
+	struct HessianSite { float* h = nullptr; int k = 0; int64_t rows = 0; };
+	std::vector<HessianSite> hess_;
+	void hessian( int layer, int site, const void* x, int k, int m, backend::stream_t stream );
+	void hessian_dump();
 	void* latent_cache_ = nullptr;    // [slots][mla layers][max_seq][512] in latent_q_ (K and V are the same latent)
 	void* latent_scales_ = nullptr;   // per-block scales of the quantized formats, same element indexing
 	pod::KVQ latent_q_ = pod::KVQ::F16;

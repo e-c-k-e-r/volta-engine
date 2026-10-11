@@ -88,7 +88,7 @@ int main() {
 	// Parity (10 local routes, first set) against LinearNVFP4 chains
 	{
 		auto hi = make_routes( K );
-		engine::modules::NVFP4MoE::forward_rows( t, x, idx, w, 1, K, hbuf, partial, disp, counters, nullptr, out, stream );
+		engine::modules::NVFP4MoE::forward_rows( t, x, idx, w, 1, K, hbuf, partial, disp, counters, nullptr, 0.0f, out, stream );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		std::vector<half> got( H );
 		CUDA_CHECK( cudaMemcpy( got.data(), out, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
@@ -143,13 +143,13 @@ int main() {
 		half* outr = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * H * sizeof( half ) ) );
 		half* hb = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * K * I * sizeof( half ) ) );
 		float* pb = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * K * H * sizeof( float ) ) );
-		engine::modules::NVFP4MoE::forward_rows( t, xr, ir, wr, R, K, hb, pb, disp, counters, nullptr, outr, stream );
+		engine::modules::NVFP4MoE::forward_rows( t, xr, ir, wr, R, K, hb, pb, disp, counters, nullptr, 0.0f, outr, stream );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		std::vector<half> got( static_cast<size_t>( R ) * H ), one( H );
 		CUDA_CHECK( cudaMemcpy( got.data(), outr, got.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
 		size_t bad = 0;
 		for ( int r = 0; r < R; ++r ) {
-			engine::modules::NVFP4MoE::forward_rows( t, xr + static_cast<size_t>( r ) * H, ir + r * K, wr + r * K, 1, K, hbuf, partial, disp, counters, nullptr, out, stream );
+			engine::modules::NVFP4MoE::forward_rows( t, xr + static_cast<size_t>( r ) * H, ir + r * K, wr + r * K, 1, K, hbuf, partial, disp, counters, nullptr, 0.0f, out, stream );
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 			CUDA_CHECK( cudaMemcpy( one.data(), out, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
 			for ( int n = 0; n < H; ++n ) bad += __half_as_ushort( one[n] ) != __half_as_ushort( got[static_cast<size_t>( r ) * H + n] );
@@ -157,7 +157,7 @@ int main() {
 		cudaGraph_t g;
 		cudaGraphExec_t ex;
 		CUDA_CHECK( cudaStreamBeginCapture( stream, cudaStreamCaptureModeGlobal ) );
-		for ( int s = 0; s < 16; ++s ) engine::modules::NVFP4MoE::forward_rows( t, xr, ir, wr, R, K, hb, pb, disp, counters, nullptr, outr, stream );
+		for ( int s = 0; s < 16; ++s ) engine::modules::NVFP4MoE::forward_rows( t, xr, ir, wr, R, K, hb, pb, disp, counters, nullptr, 0.0f, outr, stream );
 		CUDA_CHECK( cudaStreamEndCapture( stream, &g ) );
 		CUDA_CHECK( cudaGraphInstantiate( &ex, g, nullptr, nullptr, 0 ) );
 		CUDA_CHECK( cudaGraphLaunch( ex, stream ) );
@@ -186,7 +186,7 @@ int main() {
 		cudaGraph_t g;
 		cudaGraphExec_t ex;
 		CUDA_CHECK( cudaStreamBeginCapture( stream, cudaStreamCaptureModeGlobal ) );
-		for ( int s = 0; s < SETS; ++s ) engine::modules::NVFP4MoE::forward_rows( t, x, idx + s * K, w, 1, K, hbuf, partial, disp, counters, nullptr, out, stream );
+		for ( int s = 0; s < SETS; ++s ) engine::modules::NVFP4MoE::forward_rows( t, x, idx + s * K, w, 1, K, hbuf, partial, disp, counters, nullptr, 0.0f, out, stream );
 		CUDA_CHECK( cudaStreamEndCapture( stream, &g ) );
 		CUDA_CHECK( cudaGraphInstantiate( &ex, g, nullptr, nullptr, 0 ) );
 		CUDA_CHECK( cudaGraphLaunch( ex, stream ) );

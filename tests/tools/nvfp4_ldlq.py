@@ -142,13 +142,16 @@ def main():
     ap.add_argument("--src", required=True)
     ap.add_argument("--hess", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--groups", default="gdn,shared,attn,idx,head")
-    ap.add_argument("--layers", default="0-47")
+    ap.add_argument("--groups", default=None)
+    ap.add_argument("--layers", default=None)
     ap.add_argument("--tp", type=int, default=4)
+    ap.add_argument("--model", default="flash", choices=["flash", "glm"], help="flash: Qwen3.8-Flash-Next; glm: GLM-5.3-Flash (groups kda, mla, idx, shared, head)")
     ap.add_argument("--rtn", action="store_true", help="no Hessian (round-to-nearest with the scale search), for comparison")
     ap.add_argument("--device", default="cuda:0")
     a = ap.parse_args()
     dev = torch.device(a.device)
+    if a.groups is None: a.groups = "gdn,shared,attn,idx,head" if a.model == "flash" else "kda,mla,idx,shared,head"
+    if a.layers is None: a.layers = "0-47" if a.model == "flash" else "0-44"
     groups = set(a.groups.split(","))
     lo, hi = (int(x) for x in a.layers.split("-"))
     os.makedirs(a.out, exist_ok=True)
@@ -200,34 +203,56 @@ def main():
     for L in range(lo, hi + 1):
         out = pending
         pre = f"{P}.layers.{L}"
-        full = f"{pre}.self_attn.q_proj.weight" in idx
-        print(f"layer {L} ({'attn' if full else 'gdn'})", flush=True)
-        if full:
-            H0 = hess_for(L, 0)
-            if "attn" in groups:
-                for n in ("q_proj", "k_proj", "v_proj"):
-                    do(out, f"{pre}.self_attn.{n}", H0, n)
-                do(out, f"{pre}.self_attn.o_proj", hess_for(L, 2, True), "o_proj")
-            if "idx" in groups:
-                do(out, f"{pre}.self_attn.indexer.index_qk_proj", H0, "index_qk_proj")
+        if a.model == "glm":
+            mla = f"{pre}.self_attn.q_a_proj.weight" in idx
+            print(f"layer {L} ({'mla' if mla else 'kda'})", flush=True)
+            sa = f"{pre}.self_attn"
+            if mla:
+                if "mla" in groups:
+                    H0 = hess_for(L, 0)
+                    do(out, f"{sa}.q_a_proj", H0, "q_a_proj")
+                    do(out, f"{sa}.kv_a_proj_with_mqa", H0, "kv_a_proj_with_mqa")
+                    do(out, f"{sa}.q_b_proj", hess_for(L, 4), "q_b_proj")
+                    do(out, f"{sa}.o_proj", hess_for(L, 2, True), "o_proj (mla)")
+                if "idx" in groups:
+                    do(out, f"{sa}.indexer.wq_b", hess_for(L, 4), "indexer wq_b")
+            elif "kda" in groups:
+                do_multi(out, [f"{sa}.q_proj", f"{sa}.k_proj", f"{sa}.v_proj"], hess_for(L, 0), "q / k / v")
+                do(out, f"{sa}.o_proj", hess_for(L, 2, True), "o_proj (kda)")
+            if "shared" in groups and L >= 3:
+                H1 = hess_for(L, 1)
+                do(out, f"{pre}.mlp.shared_experts.gate_proj", H1, "shared gate")
+                do(out, f"{pre}.mlp.shared_experts.up_proj", H1, "shared up")
+                do(out, f"{pre}.mlp.shared_experts.down_proj", hess_for(L, 3), "shared down")
         else:
-            if "gdn" in groups:
+            full = f"{pre}.self_attn.q_proj.weight" in idx
+            print(f"layer {L} ({'attn' if full else 'gdn'})", flush=True)
+            if full:
                 H0 = hess_for(L, 0)
-                do(out, f"{pre}.linear_attn.in_proj_qkv", H0, "in_proj_qkv")
-                do(out, f"{pre}.linear_attn.in_proj_z", H0, "in_proj_z")
-                do(out, f"{pre}.linear_attn.out_proj", hess_for(L, 2, True), "out_proj")
-        if "shared" in groups:
-            H1 = hess_for(L, 1)
-            do(out, f"{pre}.mlp.shared_expert.gate_proj", H1, "shared gate")
-            do(out, f"{pre}.mlp.shared_expert.up_proj", H1, "shared up")
-            do(out, f"{pre}.mlp.shared_expert.down_proj", hess_for(L, 3), "shared down")
+                if "attn" in groups:
+                    for n in ("q_proj", "k_proj", "v_proj"):
+                        do(out, f"{pre}.self_attn.{n}", H0, n)
+                    do(out, f"{pre}.self_attn.o_proj", hess_for(L, 2, True), "o_proj")
+                if "idx" in groups:
+                    do(out, f"{pre}.self_attn.indexer.index_qk_proj", H0, "index_qk_proj")
+            else:
+                if "gdn" in groups:
+                    H0 = hess_for(L, 0)
+                    do(out, f"{pre}.linear_attn.in_proj_qkv", H0, "in_proj_qkv")
+                    do(out, f"{pre}.linear_attn.in_proj_z", H0, "in_proj_z")
+                    do(out, f"{pre}.linear_attn.out_proj", hess_for(L, 2, True), "out_proj")
+            if "shared" in groups:
+                H1 = hess_for(L, 1)
+                do(out, f"{pre}.mlp.shared_expert.gate_proj", H1, "shared gate")
+                do(out, f"{pre}.mlp.shared_expert.up_proj", H1, "shared up")
+                do(out, f"{pre}.mlp.shared_expert.down_proj", hess_for(L, 3), "shared down")
         if (L - lo + 1) % 8 == 0 or L == hi:
             if out:
                 save_file(out, os.path.join(a.out, f"dense-L{first:02d}-{L:02d}.safetensors"))
             pending, first = {}, L + 1
     if "head" in groups and lo == 0:
         out = {}
-        do(out, "lm_head", hess_for(0, 4), "lm_head")
+        do(out, "lm_head", hess_for(0, 4 if a.model == "flash" else 5), "lm_head")
         save_file(out, os.path.join(a.out, "dense-head.safetensors"))
     write_index(a.out)
 

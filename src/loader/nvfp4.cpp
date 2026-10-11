@@ -130,9 +130,9 @@ pod::LinearWeight repack_nvfp4(
 	lw.type = pod::QuantType::NVFP4;
 	lw.bits = 4;
 	lw.alpha = src.inv_global;
-	const int cshape[1] = { static_cast<int>( codes.size() ) };
+	const int cshape[2] = { n_pad, kcount / 2 };   // [N, K/2] bytes in the prepacked tile order: the shape carries N and K for the kernels
 	const int sshape[1] = { static_cast<int>( scales.size() ) };
-	lw.w0 = engine::core::arena_alloc_tensor( codes_arena ? *codes_arena : arena, pod::DType::UINT8, cshape, 1 );
+	lw.w0 = engine::core::arena_alloc_tensor( codes_arena ? *codes_arena : arena, pod::DType::UINT8, cshape, 2 );
 	lw.w1 = engine::core::arena_alloc_tensor( arena, pod::DType::UINT8, sshape, 1 );
 	if ( lw.w0.data == nullptr || lw.w1.data == nullptr ) return pod::LinearWeight{};
 	backend::memcpy_async( lw.w0.data, codes.data(), codes.size(), codes_arena ? backend::Copy::Auto : backend::Copy::H2D, stream );
@@ -191,38 +191,80 @@ pod::LinearWeight SafeTensorsRepo::load_nvfp4(
 	return repack_nvfp4( src, arena, n_begin, n_count, ranges, k0, kcount, pad_n, stream, codes_arena );
 }
 
-pod::LinearWeight SafeTensorsRepo::quantize_nvfp4(
-	const char* base_name,
-	pod::MemoryArena& arena,
+pod::LinearWeight SafeTensorsRepo::load_nvfp4_concat(
+	const char* const* base_names,
 	const int* n_begin,
 	const int* n_count,
-	int ranges,
+	int parts,
 	int k0,
 	int kcount,
 	int pad_n,
+	pod::MemoryArena& arena,
 	backend::stream_t stream
 ) {
-	char name[300];
-	std::snprintf( name, sizeof( name ), "%s.weight", base_name );
-	const auto* mp = find( name );
-	if ( !mp || mp->ndim != 2 || ( mp->dtype != pod::DType::BF16 && mp->dtype != pod::DType::FP16 ) ) return pod::LinearWeight{};
-	const uint8_t* w = static_cast<const uint8_t*>( cpu_data( name ) );
-	if ( !w ) return pod::LinearWeight{};
-	const bool bf16 = mp->dtype == pod::DType::BF16;
-	const int N = mp->shape[0], K = mp->shape[1];
-	ENGINE_ASSERT( k0 % 16 == 0 && kcount % 64 == 0 && k0 + kcount <= K, "quantize_nvfp4: bad K range" );
+	// Rows of several prepared tensors (same width, same global scale) stacked into one source
+	std::vector<Nvfp4Source> srcs( parts );
+	int n_total = 0;
+	for ( int i = 0; i < parts; ++i ) {
+		if ( !open_nvfp4( *this, base_names[i], srcs[i] ) ) return pod::LinearWeight{};
+		ENGINE_ASSERT( srcs[i].K == srcs[0].K && srcs[i].inv_global == srcs[0].inv_global, "load_nvfp4_concat: parts must share K and the global scale" );
+		ENGINE_ASSERT( n_begin[i] >= 0 && n_begin[i] + n_count[i] <= srcs[i].N, "load_nvfp4_concat: bad N range" );
+		n_total += n_count[i];
+	}
+	const int K = srcs[0].K;
+	std::vector<uint8_t> packed( static_cast<size_t>( n_total ) * ( K / 2 ) ), bscales( static_cast<size_t>( n_total ) * ( K / 16 ) );
+	std::vector<int> new_begin( parts ), counts( n_count, n_count + parts );
+	for ( int i = 0, o = 0; i < parts; ++i ) {
+		new_begin[i] = o;
+		std::memcpy( &packed[static_cast<size_t>( o ) * ( K / 2 )], srcs[i].packed + static_cast<size_t>( n_begin[i] ) * ( K / 2 ), static_cast<size_t>( n_count[i] ) * ( K / 2 ) );
+		std::memcpy( &bscales[static_cast<size_t>( o ) * ( K / 16 )], srcs[i].scales + static_cast<size_t>( n_begin[i] ) * ( K / 16 ), static_cast<size_t>( n_count[i] ) * ( K / 16 ) );
+		o += n_count[i];
+	}
+	Nvfp4Source src;
+	src.packed = packed.data();
+	src.scales = bscales.data();
+	src.inv_global = srcs[0].inv_global;
+	src.N = n_total;
+	src.K = K;
+	return repack_nvfp4( src, arena, new_begin.data(), counts.data(), parts, k0, kcount, pad_n, stream );
+}
 
-	// Global scale from the whole tensor (so every rank's slice of one matrix shares it): the largest block scale maps to the E4M3 maximum
+pod::LinearWeight SafeTensorsRepo::quantize_nvfp4_concat(
+	const char* const* base_names,
+	const int* n_begin,
+	const int* n_count,
+	int parts,
+	int k0,
+	int kcount,
+	int pad_n,
+	pod::MemoryArena& arena,
+	backend::stream_t stream
+) {
+	struct Part { const uint8_t* w; bool bf16; int N, K; };
+	std::vector<Part> src_parts( parts );
+	char name[300];
 	float amax = 0.0f;
-	for ( size_t i = 0; i < static_cast<size_t>( N ) * K; ++i ) amax = std::fmax( amax, std::fabs( bf16_or_fp16_to_float( w + i * 2, bf16 ) ) );
+	for ( int i = 0; i < parts; ++i ) {
+		std::snprintf( name, sizeof( name ), "%s.weight", base_names[i] );
+		const auto* mp = find( name );
+		if ( !mp || mp->ndim != 2 || ( mp->dtype != pod::DType::BF16 && mp->dtype != pod::DType::FP16 ) ) return pod::LinearWeight{};
+		const uint8_t* w = static_cast<const uint8_t*>( cpu_data( name ) );
+		if ( !w ) return pod::LinearWeight{};
+		src_parts[i] = { w, mp->dtype == pod::DType::BF16, mp->shape[0], mp->shape[1] };
+		ENGINE_ASSERT( src_parts[i].K == src_parts[0].K && k0 % 16 == 0 && kcount % 64 == 0 && k0 + kcount <= src_parts[i].K, "quantize_nvfp4: bad K range" );
+		ENGINE_ASSERT( n_begin[i] >= 0 && n_begin[i] + n_count[i] <= src_parts[i].N, "quantize_nvfp4: bad N range" );
+		// Global scale from the whole tensors (so every rank's slice of one matrix shares it): the largest block scale maps to the E4M3 maximum
+		for ( size_t e = 0; e < static_cast<size_t>( src_parts[i].N ) * src_parts[i].K; ++e ) amax = std::fmax( amax, std::fabs( bf16_or_fp16_to_float( w + e * 2, src_parts[i].bf16 ) ) );
+	}
 	const float gs = amax > 0.0f ? amax / ( 6.0f * 448.0f ) : 1.0f;
 
-	// Compact source: the requested rows (concatenated) and K range, quantized block by block
+	// Compact source: the requested rows (concatenated over the parts) and K range, quantized block by block
 	int n_total = 0;
-	std::vector<int> new_begin( ranges );
-	for ( int i = 0; i < ranges; ++i ) { new_begin[i] = n_total; n_total += n_count[i]; }
-	std::vector<int> row_src( n_total );
-	for ( int i = 0, o = 0; i < ranges; ++i ) for ( int j = 0; j < n_count[i]; ++j ) row_src[o++] = n_begin[i] + j;
+	std::vector<int> new_begin( parts );
+	for ( int i = 0; i < parts; ++i ) { new_begin[i] = n_total; n_total += n_count[i]; }
+	struct RowRef { int part, row; };
+	std::vector<RowRef> row_src( n_total );
+	for ( int i = 0, o = 0; i < parts; ++i ) for ( int j = 0; j < n_count[i]; ++j ) row_src[o++] = { i, n_begin[i] + j };
 	std::vector<uint8_t> packed( static_cast<size_t>( n_total ) * ( kcount / 2 ) ), bscales( static_cast<size_t>( n_total ) * ( kcount / 16 ) );
 	const std::vector<float>& et = e4m3_table();
 	static const float kGrid[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
@@ -230,10 +272,11 @@ pod::LinearWeight SafeTensorsRepo::quantize_nvfp4(
 	auto quantize_rows = [&]( int r0, int r1 ) {
 		float v[16];
 		for ( int r = r0; r < r1; ++r ) {
-			const uint8_t* row = w + ( static_cast<size_t>( row_src[r] ) * K + k0 ) * 2;
+			const Part& pt = src_parts[row_src[r].part];
+			const uint8_t* row = pt.w + ( static_cast<size_t>( row_src[r].row ) * pt.K + k0 ) * 2;
 			for ( int g = 0; g < kcount / 16; ++g ) {
 				float bmax = 0.0f;
-				for ( int i = 0; i < 16; ++i ) { v[i] = bf16_or_fp16_to_float( row + ( g * 16 + i ) * 2, bf16 ); bmax = std::fmax( bmax, std::fabs( v[i] ) ); }
+				for ( int i = 0; i < 16; ++i ) { v[i] = bf16_or_fp16_to_float( row + ( g * 16 + i ) * 2, pt.bf16 ); bmax = std::fmax( bmax, std::fabs( v[i] ) ); }
 				// Start from the E4M3 scale nearest to amax / 6, then keep the neighbour (+-2 codes) with the smallest squared error
 				const float ideal = bmax / ( 6.0f * gs );
 				int c0 = static_cast<int>( std::lower_bound( et.begin(), et.end(), ideal ) - et.begin() );
@@ -269,8 +312,23 @@ pod::LinearWeight SafeTensorsRepo::quantize_nvfp4(
 	src.inv_global = gs;
 	src.N = n_total;
 	src.K = kcount;
-	std::vector<int> counts( n_count, n_count + ranges );
-	return repack_nvfp4( src, arena, new_begin.data(), counts.data(), ranges, 0, kcount, pad_n, stream );
+	std::vector<int> counts( n_count, n_count + parts );
+	return repack_nvfp4( src, arena, new_begin.data(), counts.data(), parts, 0, kcount, pad_n, stream );
+}
+
+pod::LinearWeight SafeTensorsRepo::quantize_nvfp4(
+	const char* base_name,
+	pod::MemoryArena& arena,
+	const int* n_begin,
+	const int* n_count,
+	int ranges,
+	int k0,
+	int kcount,
+	int pad_n,
+	backend::stream_t stream
+) {
+	std::vector<const char*> names( ranges, base_name );
+	return quantize_nvfp4_concat( names.data(), n_begin, n_count, ranges, k0, kcount, pad_n, arena, stream );
 }
 
 pod::LinearWeight SafeTensorsRepo::quantize_nvfp4_slice(

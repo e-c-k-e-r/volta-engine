@@ -30,10 +30,10 @@ struct NVFP4MoE {
 	// rows x topk routes: h[r][k] = silu(x[r] @ gate[e]^T) * (x[r] @ up[e]^T), then out[r] = sum_k w[r][k] * (h[r][k] @ down[e]^T) in fixed route order.
 	// Routes are grouped by expert (a dispatch pass), so an expert's weights are read once for up to 8 rows (more rows: once per chunk of 8).
 	// rows <= MOE_NVFP4_ROWS. disp: nvfp4_disp_ints(num_local) ints; counters: hidden/32 zero-initialised ints (left zero); partial: rows * topk * hidden floats;
-	// h: rows * topk * inter halves; heat optional.
+	// h: rows * topk * inter halves; heat optional. act_limit > 0: the swiglu limit (up clamped both ways, the activated gate from above).
 	static void forward_rows(
 		const NVFP4ExpertTable& t, const half* x, const int* route_idx, const half* route_w, int rows, int topk,
-		half* h, float* partial, int* disp, int* counters, uint32_t* heat, half* out, backend::stream_t stream
+		half* h, float* partial, int* disp, int* counters, uint32_t* heat, float act_limit, half* out, backend::stream_t stream
 	);
 };
 
