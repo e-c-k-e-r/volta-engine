@@ -288,6 +288,28 @@ likely limit), an EXL3 text encoder (streaming 49 GB of BF16 per job is the rema
 text tower to free VRAM so the VAEs and the text tower can stay resident (the K/V exchange is already hidden, so TP is a memory project, not a speed one).
 Every run logs fingerprints (prompt, noise, each step's velocity, the final latents) so a change that should not alter results can be checked from the log.
 
+### EXL3 text tower (plan)
+
+The text tower is Qwen3-VL's language model (dense, 64 layers in the checkpoint, 5120 hidden, 64 heads / 8 KV heads of 128, MLP 25600); H3 runs its first 50 layers
+(24.4 B parameters, 48.7 GB of BF16 streamed from disk per job). Target: the 50 layers as EXL3, resident and tensor-parallel over the four GPUs.
+
+* Size: 4 bpw is 12.2 GB (3.1 GB per GPU sharded), 5 bpw 15.2 GB, 6 bpw 18.3 GB. The vision tower (27 blocks, ~1 GB) stays BF16; the embedding table (1.55 GB) stays on the host
+  (only the prompt's rows are gathered); the final norm and `lm_head` are not used.
+* Quantizer: our `exllamav3_sm70` fork already has the `qwen3_vl` architecture and a multi-GPU `convert.py` (`-b 4.0 -d 0,1,2,3 -vb 16`, 250 x 2048 calibration rows;
+  `~/Documents/models/corpus_exl3.bin` is the calibration corpus used for the other models). Convert a copy of `text_encoder` whose `config.json` says 50 layers so
+  the 14 unused layers cost nothing. Cost: not measured on this machine for a model this size; the layer loop is the usual Hessian / LDLQ / trellis search, so budget
+  several hours with all four GPUs busy (about 6 to 12 h for 24 B parameters is my estimate). Measure first: convert a two-layer truncation (a few minutes) and extrapolate.
+* Loader: `SafeTensorsRepo::load_linear` / `load_linear_slice(name, arena, bits, dim, rank, size, stream)` (the Qwen TP path, `src/models/qwen3_5.cpp:299`) loads a trellis
+  linear whole or as a column-parallel (output) / row-parallel (input, K slice) shard; `LinearTrellis::forward` runs it (fused kernels for few rows, Hadamard + dequantize +
+  HGEMM above a row threshold).
+* Forward: `h3_text.cu` already has the Qwen3 block (q/k norm, interleaved mRoPE, DeepStack injection, causal attention on the engine's kernel). Change: weights resident per
+  rank as trellis shards (16 query heads, 2 KV heads, 6400 MLP width), the same two FP32 all-reduces per layer as the tensor-parallel DiT (`H3TpComm`), no weight streaming. A
+  13-token prompt then costs well under a second instead of ~7 s, and a 7K-token prompt about 2 s instead of 19 s.
+* Validation: hidden-state cosine against the existing BF16 golden (`test_h3_text`, `encoder_golden`), then the effect on the DiT (velocity norms, a fixed-seed video
+  A/B); fall back to 5 or 6 bpw if the conditioning drifts.
+* Order: (1) two-layer conversion for speed and quality numbers; (2) full conversion on GPUs 1 to 3 in the background; (3) the resident TP forward in `h3_text.cu` developed on
+  GPU 0 against the two-layer file; (4) full-model validation; (5) the residency policy (what stays loaded).
+
 Running it:
 
 ```
