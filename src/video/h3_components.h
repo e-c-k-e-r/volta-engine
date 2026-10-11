@@ -38,6 +38,8 @@ public:
 
 	// Each returns an empty lease when the component cannot be loaded
 	H3Lease<H3ImageEncoder> image_encoder();
+	// One encoder per GPU of `devices` (the reference video encode spreads its tiles over them); fewer when a GPU cannot take one
+	std::vector<H3Lease<H3ImageEncoder>> image_encoders( const std::vector<int>& devices );
 	H3Lease<H3VideoVAE> video_vae();
 	H3Lease<H3AudioVAE> audio_vae();
 	// The transformer for `checkpoint` on `devices`, with room for `rows` packed rows. A resident one is reused while its checkpoint matches and its room is enough;

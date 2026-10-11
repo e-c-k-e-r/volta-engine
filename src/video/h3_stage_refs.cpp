@@ -54,20 +54,18 @@ bool H3Run::encode_references() {
 	};
 	if ( !canvas.empty() || !req.ref_videos.empty() ) {
 		const H3VaeParams& vp = comp.video_params();
-		H3Lease<H3ImageEncoder> enc = comp.image_encoder();
-		if ( vp.mean.empty() || !enc ) { return false; }
+		// one encoder per GPU of the DiT: the tiles of every image and clip are spread over them
+		std::vector<int> devices = paths.devices;
+		if ( devices.empty() ) { devices.push_back( paths.device ); }
+		std::vector<H3Lease<H3ImageEncoder>> leases = comp.image_encoders( devices );
+		std::vector<H3ImageEncoder*> encs;
+		for ( auto& l : leases ) { encs.push_back( &*l ); }
+		if ( vp.mean.empty() || encs.empty() ) { return false; }
 		for ( const H3CanvasImage& ci : canvas ) {
 			const int ih = ci.h / 16, iw = ci.w / 16;
-			float *d_in = nullptr, *d_m = nullptr;
-			CUDA_CHECK( cudaMalloc( &d_in, static_cast<size_t>( 3 ) * ci.h * ci.w * sizeof( float ) ) );
-			CUDA_CHECK( cudaMalloc( &d_m, static_cast<size_t>( 48 ) * ih * iw * sizeof( float ) ) );
 			const std::vector<float> in = h3_vae_input( ci.px.data(), ci.h, ci.w );
-			CUDA_CHECK( cudaMemcpy( d_in, in.data(), in.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
-			if ( !enc->encode( d_in, ci.h, ci.w, d_m ) ) { LOG_ERROR( "H3: image encode failed" ); return false; }
-			std::vector<float> moments( static_cast<size_t>( 48 ) * ih * iw );
-			CUDA_CHECK( cudaMemcpy( moments.data(), d_m, moments.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
-			cudaFree( d_in );
-			cudaFree( d_m );
+			std::vector<float> moments;
+			if ( !H3ImageEncoder::encode( encs, in.data(), ci.h, ci.w, &moments ) ) { LOG_ERROR( "H3: image encode failed" ); return false; }
 			const std::vector<float> rows = h3_keyframe_rows( moments, ih, iw, vp.mean, vp.stdev, ref2va ? req.seed : 42, 0.999f );
 			cond_rows.insert( cond_rows.end(), rows.begin(), rows.end() );
 			if ( ref2va ) { blocks.push_back( { H3RefBlock::Image, 0, 1, ih, iw } ); }
@@ -92,12 +90,10 @@ bool H3Run::encode_references() {
 				const std::vector<float> one = h3_vae_input( rv.rgb.data() + static_cast<size_t>( f ) * fsz, rv.height, rv.width );
 				std::memcpy( &norm[static_cast<size_t>( f ) * fsz], one.data(), fsz * sizeof( float ) );
 			}
-			float* d_vid = upload( norm );
-			norm = std::vector<float>();
 			std::vector<float> moments;
 			int tl = 0;
-			if ( !enc->encode_video( d_vid, rv.frames, rv.height, rv.width, &moments, &tl ) ) { LOG_ERROR( "H3: video encode failed" ); return false; }
-			cudaFree( d_vid );
+			if ( !H3ImageEncoder::encode_video( encs, norm.data(), rv.frames, rv.height, rv.width, &moments, &tl ) ) { LOG_ERROR( "H3: video encode failed" ); return false; }
+			norm = std::vector<float>();
 			const std::vector<float> rows = h3_condition_rows( moments, tl, rv.height / 16, rv.width / 16, vp.mean, vp.stdev, req.seed, 0.999f );
 			cond_rows.insert( cond_rows.end(), rows.begin(), rows.end() );
 			int ref_audio_t = 0;

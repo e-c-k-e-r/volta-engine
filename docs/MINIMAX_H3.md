@@ -274,8 +274,9 @@ Reference videos (up to 3, MP4 / MOV, 2 to 15 s each and in total, 23.976 to 60 
 multiples, 24 fps, at most the clip's frame count), encoded by the causal 3-D video VAE in 17-frame clips (trimmed to 17 n + 5 frames, last 3 latent frames dropped;
 `test_h3_vae_enc` on `h3_vae_enc_video_golden.py`: cosine 1.000000) and shown to the language model as every 12th frame in temporal blocks of two frames with
 `<t seconds>` timestamps (`<Video k>: ` label; the Qwen3-VL video smart-resize budget of 24M pixels applies). Each video's soundtrack becomes an audio reference
-(`<Audio j>: ` label before the video). Measured: a 3 s 1280x736 reference costs ~157 s to encode (FP32 convolutions, 4 clips x 18 tiles; the first optimization target),
-then the clip generated at 640x384 / 56 frames carries the reference's subject, setting and gait (`--ref-video`; refer to it as "Video 1" in the prompt).
+(`<Audio j>: ` label before the video). Measured: a 3 s reference (1344x768 canvas, 56 frames, 4 clips x 18 tiles) took ~157 s to encode with FP32 convolutions; with FP16 tensor-core GEMMs (one per frame
+over the valid temporal taps, FP32 accumulation, moments cosine 1.000000 against the checkpoint's encoder) and the tiles spread over the four GPUs the whole reference
+stage (encode + soundtrack) takes 18.7 s. The clip generated at 640x384 / 56 frames carries the reference's subject, setting and gait (`--ref-video`; refer to it as "Video 1" in the prompt).
 
 Reference images (up to 9, resized to a 2048 px short edge, 32 px multiples, aspect ratio 0.4 to 2.5) and reference audio (up to 3 clips, 2 to 15 s each and in
 total, cut to the clip duration) work on the Ref2VA transformer (`--dit-ref2va`, the `minimax_h3_ref2va_pruned_int8_convrot` checkpoint; use the `ref2v` turbo

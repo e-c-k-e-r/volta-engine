@@ -649,6 +649,7 @@ int H3DiT::add_lora( const char* path, float scale ) {
 		LOG_ERROR( "H3: LoRA %s: no usable targets (found %d, rank %d)", path, found, rank ); engine::core::arena_destroy( ad->arena ); delete ad; return -1; }
 	s.adapters.push_back( ad );
 	LOG_INFO( "H3: LoRA %s: %d targets, rank %d, alpha %g, scale %g", path, found, rank, alpha, scale );
+	CUDA_CHECK( cudaDeviceSynchronize() ); // staging ran on the default stream; the forward runs on a non-blocking one
 	return static_cast<int>( s.adapters.size() ) - 1;
 }
 

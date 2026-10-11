@@ -154,6 +154,7 @@ bool H3DiTGroup::forward( const H3HostRequest& hr, std::vector<float>* video_out
 			float *d_v = up( hr.video_rows ), *d_a = up( hr.audio_rows ), *d_p = up( hr.prompt ), *d_pos = up( hr.position_ids );
 			int *d_img = up( hr.img_pos ), *d_aud = up( hr.audio_pos ), *d_txt = up( hr.text_pos ), *d_tags = up( hr.tags ), *d_inv = up( hr.inverse );
 			uint8_t* d_mask = up( hr.update_mask );
+			CUDA_CHECK( cudaStreamSynchronize( nullptr ) ); // the uploads ran on the default stream; the DiT runs on a non-blocking one that is not ordered against it
 			H3Request q;
 			q.used = U; q.text_len = hr.text_len; q.n_img = hr.n_img; q.n_audio = hr.n_audio;
 			q.video_rows = d_v; q.audio_rows = d_a; q.prompt = d_p; q.position_ids = d_pos;

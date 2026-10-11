@@ -22,6 +22,18 @@ H3Lease<H3ImageEncoder> H3Components::image_encoder() {
 	return H3Lease<H3ImageEncoder>( std::move( enc ) );
 }
 
+std::vector<H3Lease<H3ImageEncoder>> H3Components::image_encoders( const std::vector<int>& devices ) {
+	std::vector<H3Lease<H3ImageEncoder>> out;
+	for ( int d : devices ) {
+		CUDA_CHECK( cudaSetDevice( d ) );
+		auto enc = std::make_unique<H3ImageEncoder>();
+		if ( !enc->load( ( paths_.root + "/video_vae" ).c_str(), d ) ) { continue; }
+		out.push_back( H3Lease<H3ImageEncoder>( std::move( enc ) ) );
+	}
+	CUDA_CHECK( cudaSetDevice( paths_.device ) );
+	return out;
+}
+
 H3Lease<H3VideoVAE> H3Components::video_vae() {
 	CUDA_CHECK( cudaSetDevice( paths_.device ) );
 	auto vae = std::make_unique<H3VideoVAE>();

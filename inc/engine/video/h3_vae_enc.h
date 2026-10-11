@@ -18,19 +18,22 @@ public:
 	// dir: the video_vae component directory (source/model.safetensors)
 	bool load( const char* dir, int device );
 
-	// rgb: [3, H, W] fp32 (device), already normalized with the ImageNet mean / std; H and W multiples of 16.
-	// moments: [48, H/16, W/16] (device, fp32): 24 mean channels followed by 24 log-variance channels.
+	// One image: rgb [3, H, W] fp32 (host), already normalized with the ImageNet mean / std; H and W multiples of 16.
+	// moments (host): [48, H/16, W/16]: 24 mean channels followed by 24 log-variance channels.
 	// Images larger than 256 px are encoded in overlapping 256 px tiles with linearly blended moments, as the checkpoint does.
-	bool encode( const float* d_rgb, int H, int W, float* d_moments );
+	// Like encode_video the tiles are spread over `encs`.
+	static bool encode( const std::vector<H3ImageEncoder*>& encs, const float* h_rgb, int H, int W, std::vector<float>* moments );
 
-	// Reference video: rgb [T][3][H][W] fp32 (device, ImageNet-normalized, H and W multiples of 32). Frames are trimmed to 17 n + 5, encoded in 17-frame clips
-	// (the last repeats the final frame; causal 3-D convs, time-isolated GroupNorm, spatial tiling) and the last 3 latent frames are dropped.
+	// Reference video: rgb [T][3][H][W] fp32 (host, ImageNet-normalized, H and W multiples of 32). Frames are trimmed to 17 n + 5, encoded in 17-frame clips (the last
+	// repeats the final frame; causal 3-D convs, time-isolated GroupNorm, spatial tiling) and the last 3 latent frames are dropped. The tiles of all clips are spread over
+	// `encs` (one loaded encoder per GPU, one thread each; a single encoder works too).
 	// moments (host): [T'][48][H/16][W/16] with T' = 5 n + 2 = latent_frames.
-	bool encode_video( const float* d_rgb, int T, int H, int W, std::vector<float>* moments, int* latent_frames );
+	static bool encode_video( const std::vector<H3ImageEncoder*>& encs, const float* h_rgb, int T, int H, int W, std::vector<float>* moments, int* latent_frames );
 
 private:
 	bool encode_tile( const float* d_rgb, int T, int H, int W, float* d_moments );
-	bool encode_tiled( const float* d_rgb, int T, int H, int W, std::vector<float>* moments );
+	bool encode_crop( const std::vector<const float*>& frames, int Hfull, int Wfull, int y0, int x0, int th, int tw, std::vector<float>* moments );
+	static bool encode_clips( const std::vector<H3ImageEncoder*>& encs, const std::vector<std::vector<const float*>>& clips, int H, int W, std::vector<std::vector<float>>* out );
 	struct Impl;
 	Impl* p_;
 };
