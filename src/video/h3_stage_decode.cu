@@ -53,10 +53,12 @@ bool H3Run::decode() {
 		for ( auto& l : leases ) { vaes.push_back( &*l ); }
 		if ( vaes.empty() || !H3VideoVAE::decode_video( vaes, d_z, latent_t, lh, lw, rgb, out_frames ) ) { LOG_ERROR( "H3: video decode failed" ); return false; }
 	}
+	const auto tav = std::chrono::steady_clock::now();
 	{
 		H3Lease<H3AudioVAE> avae = comp.audio_vae();
 		if ( !avae || !avae->decode( d_arows + static_cast<size_t>( n_aref ) * 32, audio_t, pcm ) ) { LOG_ERROR( "H3: audio decode failed" ); return false; }
 	}
+	LOG_INFO( "H3: audio decoder load and decode %.1f s", seconds_since( tav ) );
 	res.t_decode = seconds_since( t0 );
 	cudaFree( d_z );
 	cudaFree( d_vrows );

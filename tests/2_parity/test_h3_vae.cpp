@@ -66,13 +66,16 @@ int main( int argc, char** argv ) {
 			double se = 0, mx = 0;
 			const size_t plane = static_cast<size_t>( RH ) * RW;
 			for ( int f = 0; f < frames; ++f ) {
+				double fse = 0;
 				for ( size_t p = 0; p < plane; ++p ) {
 					for ( int c = 0; c < 3; ++c ) {
 						const double a = rgb[( static_cast<size_t>( f ) * plane + p ) * 3 + c] / 255.0, b = ref[( static_cast<size_t>( c ) * RF + f ) * plane + p];
 						se += ( a - b ) * ( a - b );
+						fse += ( a - b ) * ( a - b );
 						mx = std::fmax( mx, std::fabs( a - b ) );
 					}
 				}
+				if ( 10.0 * std::log10( 1.0 / ( fse / ( plane * 3 ) + 1e-12 ) ) < 40.0 ) { std::printf( "  frame %d is wrong (PSNR %.1f dB)\n", f, 10.0 * std::log10( 1.0 / ( fse / ( plane * 3 ) + 1e-12 ) ) ); }
 			}
 			const double mse = se / ( static_cast<double>( frames ) * plane * 3 );
 			const double psnr = 10.0 * std::log10( 1.0 / ( mse + 1e-12 ) );

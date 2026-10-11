@@ -5,7 +5,9 @@
 #include "engine/core/log.h"
 #include "engine/loader/safetensors.h"
 #include "engine/video/h3_attn.h"
+#include "h3_stager.h"
 #include "h3_kernels.cuh"
+#include <chrono>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -303,6 +305,9 @@ struct H3VideoVAE::Impl {
 	pod::MemoryArena warena{}, sarena{};
 	cublasHandle_t blas = nullptr;
 	cudaStream_t stream = nullptr;
+	cudaStream_t lstream = nullptr; // weight loading (stager, staging buffer: the largest FP32 matrix)
+	H3Stager* stager = nullptr;
+	void* staging = nullptr;
 	std::vector<VBlock> blocks;
 	const float *pq_w = nullptr, *pq_b = nullptr, *emb_w = nullptr, *emb_b = nullptr, *reg = nullptr, *no_w = nullptr, *no_b = nullptr, *po_w = nullptr, *po_b = nullptr;
 	const float *d_mean = nullptr, *d_std = nullptr;
@@ -329,7 +334,7 @@ struct H3VideoVAE::Impl {
 		if ( !m ) { return nullptr; }
 		ENGINE_ASSERT( m->dtype == pod::DType::FP32, "H3 VAE: expected FP32 tensors" );
 		void* d = engine::core::arena_alloc( warena, m->size_bytes );
-		CUDA_CHECK( cudaMemcpy( d, engine::loader::safetensors_get_data_cpu( st, m ), m->size_bytes, cudaMemcpyHostToDevice ) );
+		stager->upload( d, engine::loader::safetensors_get_data_cpu( st, m ), m->size_bytes );
 		return static_cast<const float*>( d );
 	}
 
@@ -338,13 +343,10 @@ struct H3VideoVAE::Impl {
 		if ( !m ) { return nullptr; }
 		ENGINE_ASSERT( m->dtype == pod::DType::FP32, "H3 VAE: expected FP32 tensors" );
 		const size_t n = numel( m );
-		void* tmp = nullptr;
-		CUDA_CHECK( cudaMalloc( &tmp, m->size_bytes ) );
-		CUDA_CHECK( cudaMemcpy( tmp, engine::loader::safetensors_get_data_cpu( st, m ), m->size_bytes, cudaMemcpyHostToDevice ) );
 		half* d = alloc<half>( warena, n );
-		k_convert<float, half><<<1024, 256>>>( static_cast<const float*>( tmp ), d, n );
-		CUDA_CHECK( cudaDeviceSynchronize() );
-		CUDA_CHECK( cudaFree( tmp ) );
+		// everything runs on the load stream, so the next tensor's upload into the staging buffer is ordered after this conversion
+		stager->upload( staging, engine::loader::safetensors_get_data_cpu( st, m ), m->size_bytes );
+		k_convert<float, half><<<1024, 256, 0, lstream>>>( static_cast<const float*>( staging ), d, n );
 		return d;
 	}
 
@@ -399,6 +401,7 @@ struct H3VideoVAE::Impl {
 		const Tiles ty = split_tiles( Hp, par.tile_size, par.tile_overlap_min, ratio ), tx = split_tiles( Wp, par.tile_size, par.tile_overlap_min, ratio );
 		const int ni = static_cast<int>( ty.start.size() ), nj = static_cast<int>( tx.start.size() );
 		const int nw = static_cast<int>( workers.size() );
+		const auto tc0 = std::chrono::steady_clock::now();
 		std::vector<float*> tiles( static_cast<size_t>( ni ) * nj, nullptr );
 		std::vector<int> th( ni ), tw( nj );
 		for ( int i = 0; i < ni; ++i ) { th[i] = ty.len[i]; }
@@ -439,6 +442,7 @@ struct H3VideoVAE::Impl {
 			} );
 		}
 		for ( std::thread& t : threads ) { t.join(); }
+		const auto tc1 = std::chrono::steady_clock::now();
 		for ( int w = 1; w < nw; ++w ) {
 			CUDA_CHECK( cudaSetDevice( workers[w]->device ) );
 			CUDA_CHECK( cudaFree( zl[w] ) );
@@ -457,6 +461,8 @@ struct H3VideoVAE::Impl {
 		}
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		for ( float* p : tiles ) { CUDA_CHECK( cudaFree( p ) ); }
+		const auto tc2 = std::chrono::steady_clock::now();
+		LOG_INFO( "H3 VAE: clip of %d latent frames, %zu tiles: tiles %.2f s, placement %.2f s", Tc, tiles.size(), std::chrono::duration<double>( tc1 - tc0 ).count(), std::chrono::duration<double>( tc2 - tc1 ).count() );
 	}
 };
 
@@ -488,6 +494,9 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens ) {
 	if ( !engine::loader::safetensors_open( s.st, ( std::string( dir ) + "/source/model.safetensors" ).c_str() ) ) { return false; }
 	// decoder weights: 36 x 67M parameters as FP16, small tensors as FP32
 	if ( !engine::core::arena_create( s.warena, device, 6ULL << 30 ) ) { return false; }
+	CUDA_CHECK( cudaStreamCreateWithFlags( &s.lstream, cudaStreamNonBlocking ) );
+	s.stager = new H3Stager( s.lstream );
+	CUDA_CHECK( cudaMalloc( &s.staging, 16384ull * 2048 * 4 ) );
 	for ( int i = 0; i < kLayers; ++i ) {
 		const std::string p = "decoder.transformer_blocks." + std::to_string( i );
 		VBlock b;
@@ -517,6 +526,7 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens ) {
 	s.po_b = s.f32( "decoder.proj_out.bias" );
 	if ( !s.po_b ) { return false; }
 	{
+		CUDA_CHECK( cudaStreamSynchronize( s.lstream ) );
 		float* dm = s.alloc<float>( s.warena, 24 );
 		float* ds = s.alloc<float>( s.warena, 24 );
 		CUDA_CHECK( cudaMemcpy( dm, s.par.mean.data(), 24 * 4, cudaMemcpyHostToDevice ) );
@@ -546,10 +556,17 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens ) {
 	s.f1 = s.alloc<half>( s.sarena, S * 2 * kFf );
 	s.f2 = s.alloc<half>( s.sarena, S * kFf );
 	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against
+	delete s.stager;
+	s.stager = nullptr;
+	cudaFree( s.staging );
+	s.staging = nullptr;
+	cudaStreamDestroy( s.lstream );
+	s.lstream = nullptr;
 	return true;
 }
 
 void H3VideoVAE::decode_tile( const float* d_z, int T, int H, int W, float* d_pix ) {
+	CUDA_CHECK( cudaStreamSynchronize( nullptr ) ); // the caller's uploads ran on the default stream, which is not ordered against this instance's non-blocking one
 	p_->tile( d_z, T, H, W, d_pix );
 	CUDA_CHECK( cudaStreamSynchronize( p_->stream ) );
 }
@@ -560,6 +577,8 @@ bool H3VideoVAE::decode_video( const float* d_z, int T, int H, int W, std::vecto
 
 bool H3VideoVAE::decode_video( const std::vector<H3VideoVAE*>& vaes, const float* d_z, int T, int H, int W, std::vector<uint8_t>& rgb, int& frames ) {
 	Impl& s = *vaes[0]->p_;
+	CUDA_CHECK( cudaSetDevice( s.device ) );
+	CUDA_CHECK( cudaStreamSynchronize( nullptr ) ); // the caller's uploads of the latent ran on the default stream, which is not ordered against the non-blocking streams (a pageable cudaMemcpy may return before its DMA completes)
 	std::vector<Impl*> workers;
 	for ( H3VideoVAE* v : vaes ) { workers.push_back( v->p_ ); }
 	CUDA_CHECK( cudaSetDevice( s.device ) );

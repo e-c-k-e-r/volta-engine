@@ -1,15 +1,19 @@
-// cuBLAS algorithm sweep for the DiT's four GEMM shapes at one rank's rows (FP16 operands, FP16 or FP32 output, FP32 accumulation).   bench_h3_gemm [rows=8618]
+// cuBLAS algorithm sweep for the DiT's four GEMM shapes at one rank's rows (FP16 operands, FP16 or FP32 output, FP32 accumulation).   bench_h3_gemm [rows=8618] [vae]  (vae: the video VAE decoder's shapes)
 #include "engine/config.h"
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 int main( int argc, char** argv ) {
 	const int M = argc > 1 ? std::atoi( argv[1] ) : 8618;
 	struct Shape { const char* name; int N, K; bool c32; };
-	const Shape shapes[] = { { "qkv", 16128, 5376, false }, { "out_proj", 5376, 7168, true }, { "fc1", 28672, 5376, false }, { "fc2", 5376, 14336, true } };
+	const bool vae = argc > 2 && std::string( argv[2] ) == "vae";
+	const Shape dit[] = { { "qkv", 16128, 5376, false }, { "out_proj", 5376, 7168, true }, { "fc1", 28672, 5376, false }, { "fc2", 5376, 14336, true } };
+	const Shape dec[] = { { "qkv", 6144, 2048, false }, { "out_proj", 2048, 2048, true }, { "w1", 16384, 2048, false }, { "w2", 2048, 8192, true } };
+	const Shape* shapes = vae ? dec : dit;
 	cublasHandle_t h;
 	cublasCreate( &h );
 	void *A, *W, *C;
@@ -19,7 +23,8 @@ int main( int argc, char** argv ) {
 	CUDA_CHECK( cudaMemset( A, 0x2a, static_cast<size_t>( M ) * 14336 * 2 ) );
 	CUDA_CHECK( cudaMemset( W, 0x2a, static_cast<size_t>( 28672 ) * 5376 * 2 ) );
 	const float alpha = 1.0f, beta = 0.0f;
-	for ( const Shape& s : shapes ) {
+	for ( int si = 0; si < 4; ++si ) {
+		const Shape& s = shapes[si];
 		const double flops = 2.0 * M * s.N * s.K;
 		double best = 0;
 		int best_algo = -99;

@@ -549,3 +549,6 @@ set_target_properties(test_h3_attn PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJEC
 add_executable(p2p_check tests/3_bench/p2p_check.cpp)
 target_link_libraries(p2p_check PRIVATE engine_kernels)
 set_target_properties(p2p_check PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_h3_vae_det tests/2_parity/test_h3_vae_det.cpp)
+target_link_libraries(test_h3_vae_det PRIVATE engine_kernels)
+set_target_properties(test_h3_vae_det PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
