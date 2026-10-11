@@ -231,6 +231,11 @@ struct H3DiT::Impl {
 	};
 	std::vector<Adapter*> adapters;
 	half* lora_t = nullptr;
+	// sequence parallelism
+	int sp_rank = 0, sp_n = 1;
+	std::function<void( int, int )> gather;
+	half *kfull = nullptr, *vfull = nullptr;
+	int total_rows = 0, max_local = 0;
 
 	// scratch
 	float *x = nullptr, *br = nullptr, *tx = nullptr, *rowscale = nullptr, *ada = nullptr, *temb = nullptr, *cosb = nullptr, *sinb = nullptr, *vall = nullptr, *aall = nullptr;
@@ -382,7 +387,7 @@ struct H3DiT::Impl {
 
 	// One pre-norm transformer block over `rows` packed rows of the FP32 stream `xs`. ada != null selects the AdaLN variant
 	// (6 chunks per modality row, rows indexed by comb) with rotary tables; otherwise the plain refiner block.
-	void run_block( const BlockW& b, float* xs, int rows, const float* adab, const int* idx, bool rope, int lora_layer ) {
+	void run_block( const BlockW& b, float* xs, int rows, const float* adab, const int* idx, bool rope, int lora_layer, int row0 = 0 ) {
 		const int H = cfg.hidden, nh = cfg.heads, qd = nh * cfg.head_dim, F = cfg.ffn;
 		const long st6 = 6L * H;
 		const float *sh_a = nullptr, *sc_a = nullptr, *g_a = nullptr, *sh_m = nullptr, *sc_m = nullptr, *g_m = nullptr;
@@ -392,8 +397,14 @@ struct H3DiT::Impl {
 		k_norm_mod<half><<<rows, 256, 0, stream>>>( xs, nullptr, nullptr, 0, b.n1, sh_a, sc_a, st6, idx, H, cfg.eps, h16 );
 		gemm_h( h16, matrix( b.qkv ), qkv16, rows, 3 * qd, H, false );
 		lora_apply( lora_layer, 0, h16, qkv16, rows, H, 3 * qd, false );
-		k_qk_norm_rope<<<dim3( rows, ( 2 * nh + 7 ) / 8 ), 256, 0, stream>>>( qkv16, 3 * qd, b.qn, b.kn, rope ? cosb : nullptr, rope ? sinb : nullptr, q16, k16, nh, cfg.qk_eps );
-		if ( use_fmha ) {
+		const bool sp = sp_n > 1 && rope;
+		k_qk_norm_rope<<<dim3( rows, ( 2 * nh + 7 ) / 8 ), 256, 0, stream>>>( qkv16, 3 * qd, b.qn, b.kn, rope ? cosb + static_cast<size_t>( row0 ) * 48 : nullptr,
+			rope ? sinb + static_cast<size_t>( row0 ) * 48 : nullptr, q16, sp ? kfull + static_cast<size_t>( row0 ) * qd : k16, nh, cfg.qk_eps );
+		if ( sp ) {
+			CUDA_CHECK( cudaMemcpy2DAsync( vfull + static_cast<size_t>( row0 ) * qd, qd * sizeof( half ), qkv16 + 2 * qd, 3 * qd * sizeof( half ), qd * sizeof( half ), rows, cudaMemcpyDeviceToDevice, stream ) );
+			gather( row0, rows );
+			h3_flash_attention_qk( q16, kfull, vfull, o16, rows, total_rows, nh, 1.0f / std::sqrt( static_cast<float>( cfg.head_dim ) ), 0, 128, stream );
+		} else if ( use_fmha ) {
 			CUDA_CHECK( cudaMemcpy2DAsync( v16, qd * sizeof( half ), qkv16 + 2 * qd, 3 * qd * sizeof( half ), qd * sizeof( half ), rows, cudaMemcpyDeviceToDevice, stream ) );
 			h3_flash_attention( q16, k16, v16, o16, rows, nh, 1.0f / std::sqrt( static_cast<float>( cfg.head_dim ) ), 0, rows >= 1024 ? 128 : 64, stream );
 		} else {
@@ -476,31 +487,36 @@ bool H3DiT::load( const char* checkpoint, int device, int max_rows, const H3Conf
 
 	// scratch sized for max_rows
 	const size_t U = static_cast<size_t>( max_rows ), qd = static_cast<size_t>( cfg.heads ) * cfg.head_dim, F = cfg.ffn;
-	size_t need = U * H * 4 * 3 + U * 4 * 2 + U * 3 * qd * 2 + U * qd * 2 * 4 + U * 2 * F * 2 + U * F * 2 + U * H * 2 + U * 48 * 4 * 2 + U * 128 * 4 + 64ull * 3 * 6 * H * 4 +
-		static_cast<size_t>( 28672 ) * 5376 * 2 + ( 64ull << 20 );
-	need += 4096ull * H * 4; // refiner stream (text rows)
+	// rows owned by one rank (row-local activations); the residual stream, rope tables and the K/V all-gather buffers cover the whole sequence
+	const size_t UL = cfg.sp_ranks > 1 ? std::max<size_t>( ( U + cfg.sp_ranks - 1 ) / cfg.sp_ranks, 8192 ) : U;
+	size_t need = U * H * 4 + UL * H * 4 + U * 4 + UL * 4 + UL * 3 * qd * 2 + UL * qd * 2 * 4 + UL * 2 * F * 2 + UL * F * 2 + UL * H * 2 + U * 48 * 4 * 2 + UL * 128 * 4 + 64ull * 3 * 6 * H * 4 +
+		static_cast<size_t>( 28672 ) * 5376 * 2 + U * qd * 2 * 2 + UL * 256 * 2 + ( 64ull << 20 );
+	need += 16384ull * H * 4; // refiner stream (text rows)
 	if ( !engine::core::arena_create( s.sarena, device, need ) ) { return false; }
 	s.x = s.alloc<float>( s.sarena, U * H );
-	s.br = s.alloc<float>( s.sarena, U * H );
-	s.tx = s.alloc<float>( s.sarena, 4096ull * H );
-	s.rowscale = s.alloc<float>( s.sarena, U );
+	s.br = s.alloc<float>( s.sarena, UL * H );
+	s.tx = s.alloc<float>( s.sarena, 16384ull * H );
+	s.rowscale = s.alloc<float>( s.sarena, UL );
 	s.ada = s.alloc<float>( s.sarena, 16ull * kModalities * 6 * H );
 	s.temb = s.alloc<float>( s.sarena, 16 * 8 );
 	s.cosb = s.alloc<float>( s.sarena, U * 48 );
 	s.sinb = s.alloc<float>( s.sarena, U * 48 );
-	s.vall = s.alloc<float>( s.sarena, U * 96 );
-	s.aall = s.alloc<float>( s.sarena, U * 32 );
-	s.h16 = s.alloc<half>( s.sarena, U * H );
-	s.v16 = s.alloc<half>( s.sarena, U * qd );
-	s.qkv16 = s.alloc<half>( s.sarena, U * 3 * qd );
-	s.q16 = s.alloc<half>( s.sarena, U * qd );
-	s.k16 = s.alloc<half>( s.sarena, U * qd );
-	s.o16 = s.alloc<half>( s.sarena, U * qd );
-	s.f1 = s.alloc<half>( s.sarena, U * 2 * F );
-	s.f2 = s.alloc<half>( s.sarena, U * F );
+	s.vall = s.alloc<float>( s.sarena, UL * 96 );
+	s.aall = s.alloc<float>( s.sarena, UL * 32 );
+	s.h16 = s.alloc<half>( s.sarena, UL * H );
+	s.v16 = s.alloc<half>( s.sarena, UL * qd );
+	s.qkv16 = s.alloc<half>( s.sarena, UL * 3 * qd );
+	s.q16 = s.alloc<half>( s.sarena, UL * qd );
+	s.k16 = s.alloc<half>( s.sarena, UL * qd );
+	s.o16 = s.alloc<half>( s.sarena, UL * qd );
+	s.f1 = s.alloc<half>( s.sarena, UL * 2 * F );
+	s.f2 = s.alloc<half>( s.sarena, UL * F );
 	s.wscratch = s.alloc<half>( s.sarena, 28672ull * 5376 );
 	s.comb = s.alloc<int>( s.sarena, U );
-	s.lora_t = s.alloc<half>( s.sarena, U * 256 );
+	s.max_local = static_cast<int>( UL );
+	s.lora_t = s.alloc<half>( s.sarena, UL * 256 );
+	s.kfull = s.alloc<half>( s.sarena, U * qd );
+	s.vfull = s.alloc<half>( s.sarena, U * qd );
 	return true;
 }
 
@@ -589,12 +605,32 @@ void H3DiT::set_lora_scale( int id, float scale ) {
 	if ( id >= 0 && id < static_cast<int>( p_->adapters.size() ) ) { p_->adapters[static_cast<size_t>( id )]->scale = scale; }
 }
 
+void H3DiT::set_sp( int rank, int n, std::function<void( int, int )> gather ) {
+	p_->sp_rank = rank;
+	p_->sp_n = n;
+	p_->gather = std::move( gather );
+}
+
+half_ptr_pair H3DiT::kv_buffers() const { return { p_->kfull, p_->vfull }; }
+int H3DiT::device() const { return p_->device; }
+
+void H3DiT::forward_sp( const H3Request& r, float* host_vall, float* host_aall ) { run_forward( r, nullptr, nullptr, host_vall, host_aall ); }
+
 void H3DiT::forward( const H3Request& r, float* video_out, float* audio_out, void* stream_ptr ) {
+	( void )stream_ptr;
+	run_forward( r, video_out, audio_out, nullptr, nullptr );
+}
+
+void H3DiT::run_forward( const H3Request& r, float* video_out, float* audio_out, float* host_vall, float* host_aall ) {
 	Impl& s = *p_;
-	(void)stream_ptr;
+	CUDA_CHECK( cudaSetDevice( s.device ) );
 	const H3Config& c = s.cfg;
 	const int H = c.hidden, U = r.used;
-	ENGINE_ASSERT( U <= s.max_rows && r.text_len <= 4096, "H3: request larger than the allocated scratch" );
+	ENGINE_ASSERT( U <= s.max_rows && r.text_len <= s.max_local && r.text_len <= 16384, "H3: request larger than the allocated scratch" );
+	s.total_rows = U;
+	// this rank's rows (sequence parallel); one rank owns everything
+	const int chunk = ( U + s.sp_n - 1 ) / s.sp_n;
+	const int row0 = std::min( U, s.sp_rank * chunk ), row1 = std::min( U, row0 + chunk ), lrows = row1 - row0;
 	cudaStream_t st = s.stream;
 	const int M = static_cast<int>( r.unique_t.size() );
 	ENGINE_ASSERT( M >= 1 && M <= 16, "H3: unique timestep count" );
@@ -626,16 +662,23 @@ void H3DiT::forward( const H3Request& r, float* video_out, float* audio_out, voi
 	k_norm_mod<float><<<r.text_len, 256, 0, st>>>( s.tx, nullptr, nullptr, 0, s.ref_final, nullptr, nullptr, 0, nullptr, H, c.final_eps, s.br );
 	k_scatter_add<<<r.text_len, 256, 0, st>>>( s.x, s.br, nullptr, r.text_pos, H );
 	// video and audio rows
-	s.gemm_f( r.video_rows, s.vproj_w, s.br, r.n_img, H, c.latents );
-	k_scatter_add<<<r.n_img, 256, 0, st>>>( s.x, s.br, s.vproj_b, r.img_pos, H );
-	s.gemm_f( r.audio_rows, s.aproj_w, s.br, r.n_audio, H, c.audio_latents );
-	k_scatter_add<<<r.n_audio, 256, 0, st>>>( s.x, s.br, s.aproj_b, r.audio_pos, H );
+	for ( int off = 0; off < r.n_img; off += s.max_local ) {
+		const int n = std::min( s.max_local, r.n_img - off );
+		s.gemm_f( r.video_rows + static_cast<size_t>( off ) * c.latents, s.vproj_w, s.br, n, H, c.latents );
+		k_scatter_add<<<n, 256, 0, st>>>( s.x, s.br, s.vproj_b, r.img_pos + off, H );
+	}
+	for ( int off = 0; off < r.n_audio; off += s.max_local ) {
+		const int n = std::min( s.max_local, r.n_audio - off );
+		s.gemm_f( r.audio_rows + static_cast<size_t>( off ) * c.audio_latents, s.aproj_w, s.br, n, H, c.audio_latents );
+		k_scatter_add<<<n, 256, 0, st>>>( s.x, s.br, s.aproj_b, r.audio_pos + off, H );
+	}
 	if ( probe ) { CUDA_CHECK( cudaStreamSynchronize( st ) ); probe( "embed", s.x, U ); }
 
 	for ( int i = 0; i < c.layers; ++i ) {
 		const BlockW& b = s.blocks[i];
 		k_adaln<<<( 6 * kModalities * H + 255 ) / 256, 256, 0, st>>>( s.temb, b.aw, b.ab, s.ada, M, 6 * kModalities * H, c.adaln_dim );
-		s.run_block( b, s.x, U, s.ada, s.comb, true, i );
+		if ( lrows > 0 ) { s.run_block( b, s.x + static_cast<size_t>( row0 ) * H, lrows, s.ada, s.comb + row0, true, i, row0 ); }
+		else if ( s.sp_n > 1 ) { for ( int pass = 0; pass < 1; ++pass ) { s.gather( row0, 0 ); } }
 		if ( probe ) {
 			for ( int pb : probe_blocks ) {
 				if ( pb == i ) {
@@ -650,14 +693,21 @@ void H3DiT::forward( const H3Request& r, float* video_out, float* audio_out, voi
 
 	// final layer
 	k_adaln<<<( 2 * H + 255 ) / 256, 256, 0, st>>>( s.temb, s.fin_aw, s.fin_ab, s.ada, M, 2 * H, c.adaln_dim );
-	k_norm_mod<float><<<U, 256, 0, st>>>( s.x, nullptr, nullptr, 0, s.fin_norm, s.ada, s.ada + H, 2L * H, r.inverse, H, c.final_eps, s.br );
+	if ( lrows > 0 ) { k_norm_mod<float><<<lrows, 256, 0, st>>>( s.x + static_cast<size_t>( row0 ) * H, nullptr, nullptr, 0, s.fin_norm, s.ada, s.ada + H, 2L * H, r.inverse + row0, H, c.final_eps, s.br ); }
 	if ( probe ) { CUDA_CHECK( cudaStreamSynchronize( st ) ); probe( "final_hidden", s.br, U ); }
-	s.gemm_f( s.br, s.vout_w, s.vall, U, c.latents, H );
-	k_add_bias<<<1024, 256, 0, st>>>( s.vall, s.vout_b, U, c.latents );
-	s.gemm_f( s.br, s.aout_w, s.aall, U, c.audio_latents, H );
-	k_add_bias<<<1024, 256, 0, st>>>( s.aall, s.aout_b, U, c.audio_latents );
-	k_gather_out<<<r.n_img, 96, 0, st>>>( s.vall, r.img_pos, r.update_mask, video_out, c.latents );
-	k_gather_out<<<r.n_audio, 32, 0, st>>>( s.aall, r.audio_pos, nullptr, audio_out, c.audio_latents );
+	if ( lrows > 0 ) {
+		s.gemm_f( s.br, s.vout_w, s.vall, lrows, c.latents, H );
+		k_add_bias<<<1024, 256, 0, st>>>( s.vall, s.vout_b, lrows, c.latents );
+		s.gemm_f( s.br, s.aout_w, s.aall, lrows, c.audio_latents, H );
+		k_add_bias<<<1024, 256, 0, st>>>( s.aall, s.aout_b, lrows, c.audio_latents );
+	}
+	if ( s.sp_n == 1 ) {
+		k_gather_out<<<r.n_img, 96, 0, st>>>( s.vall, r.img_pos, r.update_mask, video_out, c.latents );
+		k_gather_out<<<r.n_audio, 32, 0, st>>>( s.aall, r.audio_pos, nullptr, audio_out, c.audio_latents );
+	} else if ( lrows > 0 ) {
+		CUDA_CHECK( cudaMemcpyAsync( host_vall + static_cast<size_t>( row0 ) * c.latents, s.vall, static_cast<size_t>( lrows ) * c.latents * sizeof( float ), cudaMemcpyDeviceToHost, st ) );
+		CUDA_CHECK( cudaMemcpyAsync( host_aall + static_cast<size_t>( row0 ) * c.audio_latents, s.aall, static_cast<size_t>( lrows ) * c.audio_latents * sizeof( float ), cudaMemcpyDeviceToHost, st ) );
+	}
 	CUDA_CHECK( cudaStreamSynchronize( st ) );
 	CUDA_CHECK( cudaGetLastError() );
 }

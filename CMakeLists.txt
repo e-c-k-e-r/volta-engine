@@ -50,6 +50,7 @@ set(ENGINE_HOST_SOURCES
 	src/loader/tokenizer.cpp
 	src/video/h3_vae_config.cpp
 	src/video/h3_image.cpp
+	src/video/h3_dit_group.cpp
 	src/loader/chat_template.cpp
 	src/loader/jinja.cpp
 	src/loader/image.cpp
@@ -521,3 +522,9 @@ set_target_properties(test_h3_text_mm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PRO
 add_executable(test_h3_image tests/2_parity/test_h3_image.cpp)
 target_link_libraries(test_h3_image PRIVATE engine_kernels)
 set_target_properties(test_h3_image PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_h3_dit_sp tests/2_parity/test_h3_dit_sp.cpp)
+target_link_libraries(test_h3_dit_sp PRIVATE engine_kernels)
+set_target_properties(test_h3_dit_sp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_h3_fmha tests/2_parity/test_h3_fmha.cpp)
+target_link_libraries(test_h3_fmha PRIVATE engine_kernels)
+set_target_properties(test_h3_fmha PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

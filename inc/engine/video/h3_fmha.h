@@ -10,5 +10,7 @@ namespace engine::video {
 // build has no CUTLASS (ENGINE_CUTLASS_DIR) and the caller must use another path.
 bool h3_fmha_available();
 bool h3_flash_attention( const half* q, const half* k, const half* v, half* out, int rows, int heads, float scale, int key_tile, int query_tile, cudaStream_t stream );
+// Different query and key lengths (sequence-parallel shards: local queries against all keys)
+bool h3_flash_attention_qk( const half* q, const half* k, const half* v, half* out, int q_rows, int k_rows, int heads, float scale, int key_tile, int query_tile, cudaStream_t stream );
 
 } // namespace engine::video

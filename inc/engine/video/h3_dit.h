@@ -13,6 +13,11 @@
 // the wide-range projections (attention out, MLP down), pow-2 row scaling of the gated MLP activation.
 namespace engine::video {
 
+struct half_ptr_pair {
+	void* k = nullptr;
+	void* v = nullptr;
+};
+
 struct H3Config {
 	int hidden = 5376;
 	int layers = 50;
@@ -29,6 +34,7 @@ struct H3Config {
 	float eps = 1e-5f;
 	float qk_eps = 1e-5f;
 	float final_eps = 1e-5f;
+	int sp_ranks = 1;              // sequence-parallel ranks the instance will run with (sizes the per-rank scratch)
 	bool simple_attention = false; // bring-up kernel instead of the CUTLASS FMHA (tiny sequences only)
 };
 
@@ -76,7 +82,18 @@ public:
 
 	size_t weight_bytes() const;
 
+	// Sequence parallelism over several GPUs, each holding the full weights: this instance owns rows [row0, row0 + rows) of every packed sequence and
+	// all-gathers K and V per layer through `gather(row0, rows)` (called after the local K/V slice is written to kfull / vfull; it must return once the
+	// slices of every rank are present in every rank's buffers). With n == 1 the instance runs the whole sequence as before.
+	void set_sp( int rank, int n, std::function<void( int row0, int rows )> gather );
+	half_ptr_pair kv_buffers() const;
+	int device() const;
+	// Sequence-parallel forward: outputs for the local rows only, as the full-width heads before row selection (vall [U, 96] and aall [U, 32] on the host,
+	// rows [row0, row0 + rows) written).
+	void forward_sp( const H3Request& req, float* host_vall, float* host_aall );
+
 private:
+	void run_forward( const H3Request& r, float* video_out, float* audio_out, float* host_vall, float* host_aall );
 	struct Impl;
 	Impl* p_;
 };
