@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <thread>
 #include <string>
 
 #define CUBLAS_CHECK( call ) \
@@ -167,6 +168,10 @@ struct H3TextEncoder::Impl {
 	cublasHandle_t blas = nullptr;
 	cudaStream_t cs = nullptr, ps = nullptr; // compute, prefetch
 	cudaEvent_t loaded[2], consumed[2];
+	static constexpr size_t kChunk = size_t( 16 ) << 20;
+	static constexpr int kPinned = 4;
+	void* pinned[kPinned] = {};  // pinned host chunks (the page-cache copy of a tensor is staged through them)
+	cudaEvent_t chunk_free[kPinned];
 	float *x = nullptr, *br = nullptr, *rowscale = nullptr;
 	int* d_pos = nullptr; // [3, max_tokens]
 	half *h16 = nullptr, *q16 = nullptr, *k16 = nullptr, *v16 = nullptr, *o16 = nullptr, *g16 = nullptr, *u16 = nullptr, *f16 = nullptr;
@@ -177,13 +182,36 @@ struct H3TextEncoder::Impl {
 	template <typename T>
 	T* alloc( pod::MemoryArena& a, size_t n ) { return static_cast<T*>( engine::core::arena_alloc( a, n * sizeof( T ) ) ); }
 
+	// Copies `bytes` of (page cache) host memory to the device staging buffer through pinned chunks: the CPU copy of one chunk overlaps the DMA of the previous ones.
+	void stage_bytes( const void* src, size_t bytes ) {
+		const char* p = static_cast<const char*>( src );
+		for ( size_t off = 0, k = 0; off < bytes; off += kChunk, ++k ) {
+			const int slot = static_cast<int>( k % kPinned );
+			const size_t n = std::min( kChunk, bytes - off );
+			CUDA_CHECK( cudaEventSynchronize( chunk_free[slot] ) ); // the DMA that last read this pinned chunk is done
+			{ // the page-cache copy (page faults included) runs on several threads: one thread reaches only ~5 GB/s
+				constexpr int kCopyThreads = 4;
+				const size_t part = ( n + kCopyThreads - 1 ) / kCopyThreads;
+				std::thread helpers[kCopyThreads - 1];
+				for ( int t = 1; t < kCopyThreads; ++t ) {
+					const size_t b = std::min( n, part * t ), e = std::min( n, part * ( t + 1 ) );
+					helpers[t - 1] = std::thread( [this, slot, p, off, b, e] { std::memcpy( static_cast<char*>( pinned[slot] ) + b, p + off + b, e - b ); } );
+				}
+				std::memcpy( pinned[slot], p + off, std::min( n, part ) );
+				for ( std::thread& h : helpers ) { h.join(); }
+			}
+			CUDA_CHECK( cudaMemcpyAsync( static_cast<char*>( staging ) + off, pinned[slot], n, cudaMemcpyHostToDevice, ps ) );
+			CUDA_CHECK( cudaEventRecord( chunk_free[slot], ps ) );
+		}
+	}
+
 	// BF16 tensor -> device FP16 matrix through the staging buffer (prefetch stream)
 	half* upload_mat( int s, const std::string& name ) {
 		const pod::SafeTensorMeta* m = repo.find( name.c_str() );
 		ENGINE_ASSERT( m && m->dtype == pod::DType::BF16, "H3 text: missing or non-BF16 matrix" );
 		const size_t n = m->size_bytes / 2;
 		half* d = alloc<half>( slot_arena[s], n );
-		CUDA_CHECK( cudaMemcpyAsync( staging, repo.cpu_data( name.c_str() ), m->size_bytes, cudaMemcpyHostToDevice, ps ) );
+		stage_bytes( repo.cpu_data( name.c_str() ), m->size_bytes );
 		k_convert<__nv_bfloat16, half><<<2048, 256, 0, ps>>>( static_cast<const __nv_bfloat16*>( staging ), d, n );
 		CUDA_CHECK( cudaGetLastError() );
 		CUDA_CHECK( cudaStreamSynchronize( ps ) ); // the staging buffer is reused by the next tensor
@@ -195,7 +223,7 @@ struct H3TextEncoder::Impl {
 		ENGINE_ASSERT( m && m->dtype == pod::DType::BF16, "H3 text: missing or non-BF16 vector" );
 		const size_t n = m->size_bytes / 2;
 		float* d = alloc<float>( slot_arena[s], n );
-		CUDA_CHECK( cudaMemcpyAsync( staging, repo.cpu_data( name.c_str() ), m->size_bytes, cudaMemcpyHostToDevice, ps ) );
+		stage_bytes( repo.cpu_data( name.c_str() ), m->size_bytes );
 		k_convert<__nv_bfloat16, float><<<64, 256, 0, ps>>>( static_cast<const __nv_bfloat16*>( staging ), d, n );
 		CUDA_CHECK( cudaStreamSynchronize( ps ) );
 		return d;
@@ -257,6 +285,7 @@ H3TextEncoder::~H3TextEncoder() {
 			if ( p_->slot_arena[i].base_ptr ) { engine::core::arena_destroy( p_->slot_arena[i] ); }
 		}
 		if ( p_->sarena.base_ptr ) { engine::core::arena_destroy( p_->sarena ); }
+		for ( int i = 0; i < Impl::kPinned; ++i ) { if ( p_->pinned[i] ) { cudaFreeHost( p_->pinned[i] ); } }
 		if ( p_->staging ) { cudaFree( p_->staging ); }
 		delete p_;
 	}
@@ -284,6 +313,11 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	}
 	s.staging_bytes = static_cast<size_t>( kFfn ) * kH * 2;
 	CUDA_CHECK( cudaMalloc( &s.staging, s.staging_bytes ) );
+	for ( int i = 0; i < Impl::kPinned; ++i ) {
+		CUDA_CHECK( cudaHostAlloc( &s.pinned[i], Impl::kChunk, cudaHostAllocDefault ) );
+		CUDA_CHECK( cudaEventCreateWithFlags( &s.chunk_free[i], cudaEventDisableTiming ) );
+		CUDA_CHECK( cudaEventRecord( s.chunk_free[i], s.ps ) ); // recorded, so the first wait returns at once
+	}
 	CUDA_CHECK( cudaMemset( s.staging, 0, s.staging_bytes ) );
 	CUDA_CHECK( cudaStreamSynchronize( nullptr ) );
 	const size_t S = static_cast<size_t>( max_tokens );
@@ -381,13 +415,17 @@ bool H3TextEncoder::encode_mm( const std::vector<int>& ids, int image_token_id, 
 		CUDA_CHECK( cudaMemcpyAsync( d_rows, pad_rows.data(), pad_rows.size() * sizeof( int ), cudaMemcpyHostToDevice, s.cs ) );
 	}
 	CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
-	// layer pipeline: slot (i % 2) holds layer i; layer i + 1 is uploaded while layer i computes
+	// layer pipeline: slot (i % 2) holds layer i; a thread uploads layer i + 1 while layer i computes (slot (i + 1) % 2 held layer i - 1, whose compute ended in the
+	// previous iteration)
 	s.load_layer( 0, 0 );
 	for ( int i = 0; i < s.layers; ++i ) {
 		const int cur = i % 2, nxt = 1 - cur;
+		std::thread prefetch;
 		if ( i + 1 < s.layers ) {
-			if ( i >= 1 ) { CUDA_CHECK( cudaStreamWaitEvent( s.ps, s.consumed[nxt], 0 ) ); }
-			s.load_layer( nxt, i + 1 );
+			prefetch = std::thread( [&s, nxt, i] {
+				CUDA_CHECK( cudaSetDevice( s.device ) );
+				s.load_layer( nxt, i + 1 );
+			} );
 		}
 		s.run_layer( s.slot[cur], S );
 		if ( d_feat && i < 3 ) {
@@ -395,8 +433,8 @@ bool H3TextEncoder::encode_mm( const std::vector<int>& ids, int image_token_id, 
 			CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
 			k_add_rows<<<static_cast<int>( pad_rows.size() ), 256, 0, s.cs>>>( s.x, d_feat, d_rows, kH );
 		}
-		CUDA_CHECK( cudaEventRecord( s.consumed[cur], s.cs ) );
 		CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
+		if ( prefetch.joinable() ) { prefetch.join(); }
 		if ( probe ) { probe( i, s.x, S ); }
 	}
 	CUDA_CHECK( cudaMemcpyAsync( d_out, s.x, static_cast<size_t>( S ) * kH * sizeof( float ), cudaMemcpyDeviceToDevice, s.cs ) );

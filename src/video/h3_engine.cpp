@@ -3,6 +3,7 @@
 #include "h3_components.h"
 #include "h3_run.h"
 #include <cuda_runtime.h>
+#include <thread>
 
 namespace engine::video {
 
@@ -23,12 +24,19 @@ H3Lease<H3ImageEncoder> H3Components::image_encoder() {
 }
 
 std::vector<H3Lease<H3ImageEncoder>> H3Components::image_encoders( const std::vector<int>& devices ) {
+	// one thread per GPU: the weight loads (disk to device) overlap
+	std::vector<std::unique_ptr<H3ImageEncoder>> made( devices.size() );
+	std::vector<std::thread> threads;
+	for ( size_t i = 0; i < devices.size(); ++i ) {
+		threads.emplace_back( [&, i] {
+			auto enc = std::make_unique<H3ImageEncoder>();
+			if ( enc->load( ( paths_.root + "/video_vae" ).c_str(), devices[i] ) ) { made[i] = std::move( enc ); }
+		} );
+	}
+	for ( std::thread& t : threads ) { t.join(); }
 	std::vector<H3Lease<H3ImageEncoder>> out;
-	for ( int d : devices ) {
-		CUDA_CHECK( cudaSetDevice( d ) );
-		auto enc = std::make_unique<H3ImageEncoder>();
-		if ( !enc->load( ( paths_.root + "/video_vae" ).c_str(), d ) ) { continue; }
-		out.push_back( H3Lease<H3ImageEncoder>( std::move( enc ) ) );
+	for ( auto& m : made ) {
+		if ( m ) { out.push_back( H3Lease<H3ImageEncoder>( std::move( m ) ) ); }
 	}
 	CUDA_CHECK( cudaSetDevice( paths_.device ) );
 	return out;
@@ -44,15 +52,20 @@ H3Lease<H3VideoVAE> H3Components::video_vae() {
 std::vector<H3Lease<H3VideoVAE>> H3Components::video_vaes( const std::vector<int>& devices ) {
 	std::vector<int> order{ paths_.device };
 	for ( int d : devices ) { if ( d != paths_.device ) { order.push_back( d ); } }
+	std::vector<std::unique_ptr<H3VideoVAE>> made( order.size() );
+	std::vector<std::thread> threads;
+	for ( size_t i = 0; i < order.size(); ++i ) {
+		threads.emplace_back( [&, i] {
+			auto vae = std::make_unique<H3VideoVAE>();
+			if ( vae->load( ( paths_.root + "/video_vae" ).c_str(), order[i] ) ) { made[i] = std::move( vae ); }
+		} );
+	}
+	for ( std::thread& t : threads ) { t.join(); }
 	std::vector<H3Lease<H3VideoVAE>> out;
-	for ( int d : order ) {
-		CUDA_CHECK( cudaSetDevice( d ) );
-		auto vae = std::make_unique<H3VideoVAE>();
-		if ( !vae->load( ( paths_.root + "/video_vae" ).c_str(), d ) ) {
-			if ( d == paths_.device ) { out.clear(); break; } // the primary is required
-			continue;
+	if ( made[0] ) { // the primary (paths.device, first) is required
+		for ( auto& m : made ) {
+			if ( m ) { out.push_back( H3Lease<H3VideoVAE>( std::move( m ) ) ); }
 		}
-		out.push_back( H3Lease<H3VideoVAE>( std::move( vae ) ) );
 	}
 	CUDA_CHECK( cudaSetDevice( paths_.device ) );
 	return out;

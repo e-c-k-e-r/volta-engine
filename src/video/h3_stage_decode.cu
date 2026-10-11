@@ -46,7 +46,9 @@ bool H3Run::decode() {
 	{
 		std::vector<int> devices = paths.devices;
 		if ( devices.empty() ) { devices.push_back( paths.device ); }
+		const auto tvl = std::chrono::steady_clock::now();
 		std::vector<H3Lease<H3VideoVAE>> leases = comp.video_vaes( devices );
+		LOG_INFO( "H3: %zu video decoder(s) loaded in %.1f s", leases.size(), seconds_since( tvl ) );
 		std::vector<H3VideoVAE*> vaes;
 		for ( auto& l : leases ) { vaes.push_back( &*l ); }
 		if ( vaes.empty() || !H3VideoVAE::decode_video( vaes, d_z, latent_t, lh, lw, rgb, out_frames ) ) { LOG_ERROR( "H3: video decode failed" ); return false; }
