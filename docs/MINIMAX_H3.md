@@ -245,8 +245,16 @@ tool and a job server with a web UI are implemented. Every model component was c
 | Layout, schedule, Euler loop, Lanczos resize, keyframe rows, MP4 mux (stages of `H3Run`: `h3_pipeline.cu`, `h3_stage_*.cpp/.cu`) | `h3_pipeline.cu`, `h3_run.h`, `h3_stage_*`, `h3_image.cpp` | layout identical to 1Cat's; Lanczos within 1 level of PIL |
 | `h3_generate` CLI; the video service of `volta_server` (job queue, API, page) | `h3_generate_main.cpp`; `src/server/video/` | end to end; the stage split is bit-identical to the monolithic version |
 
-Measured (150 W cap, V100, 1280x736 x 124 frames, 4-step turbo adapter, 34,472 rows): one GPU 334 s denoise (83 s per step) + 64 s decode; four GPUs
-88 s denoise (22 s per step) + 63 s decode, about 3 minutes in all including the 11 s text encode and 9 s model load. A 640x384 x 39-frame clip takes 35 s on four GPUs.
+Measured, 4x V100 at a 225 W power limit (at the earlier 150 W limit the cards ran at ~680 MHz and every number below was 30 to 50% slower), 1280x736 x 124 frames, 4-step
+turbo adapter, 34,472 rows, transformer resident (`video.resident`): text 7 s, denoise 61 s (15.2 s per step), decode 16.6 s, mux 2.4 s, about 96 s per job (the first
+job also loads the transformer, 9.5 s). At 150 W the same job took 175 s. Where the step goes: 13.4 s GPU compute (attention ~7.6 s at ~56 TF/s, GEMMs ~5.7 s at 85 to
+92 TF/s: cuBLAS's default algorithm is already within 10% of its best on these shapes), 0.8 s waiting at the barriers, 1.1 s copying K/V over NVLink.
+What brought it down from the first working version (single GPU, per-stage loads): sequence parallelism over four GPUs, tile-parallel video decode (62.8 -> ~12 s of
+compute, 24.7 s with the load), the causal FMHA in the text tower (language model 46 -> 19 s for a 7K-token prompt), pinned/prefetched text-weight streaming
+(9.8 -> 5.2 s for a short prompt), the four-GPU reference-video encode on tensor cores (157 -> 18.7 s), parallel decoder loads, a resident transformer (load 15 -> 0 s),
+and per-peer K/V copy streams. Left on the table: a faster attention kernel (the CUTLASS FMHA is at ~45% of the V100's FP16 peak), an EXL3 text encoder (streaming
+49 GB of BF16 per job is the remaining text cost for short prompts), overlapping the decode's peer copies with the next clip, and pinned loads for the decoders.
+Every run logs fingerprints (prompt, noise, each step's velocity, the final latents) so a change that should not alter results can be checked from the log.
 
 Running it:
 
