@@ -260,6 +260,23 @@ build/h3_server --root ... --dit ... --lora-dir <h3-turbo> --lora-dir <h3-loras>
 The server has no authentication and binds to localhost by default. A build needs the CUTLASS headers (`ENGINE_CUTLASS_DIR`, default
 `~/Programs/1Cat-vLLM/.deps/cutlass-src`) for the attention kernel.
 
-Not yet built: Ref2VA (reference images at a 2048 short edge, reference video and audio: the causal 3-D video encoder, the audio encoder, the reference-block
-layouts and prompt presentation), keeping the models resident between jobs (each job reloads them: ~20 s), splitting the VAE decode over the GPUs (63 s now on
-one), quantization of the text encoder, FP8/INT8 attention, a FP16-range audit for long clips, and the benchmark matrix.
+### Ref2VA (references)
+
+Reference images (up to 9, resized to a 2048 px short edge, 32 px multiples, aspect ratio 0.4 to 2.5) and reference audio (up to 3 clips, 2 to 15 s each and in
+total, cut to the clip duration) work on the Ref2VA transformer (`--dit-ref2va`, the `minimax_h3_ref2va_pruned_int8_convrot` checkpoint; use the `ref2v` turbo
+adapters). Prompt presentation is `<Picture i>: ` + vision block per image, `<Audio j>: ` label per clip, then the prompt; refer to them that way in the prompt.
+Layout `[text | reference blocks | target audio | target video]` matches 1Cat's builder exactly (`test_h3_ref_layout`); image references sit at timestep 0.999,
+audio references at 1.0 (clean latents). The audio encoder matches the remote-code reference (`test_h3_audio_enc`, cosine 1.000000).
+The image encoder tiles like the checkpoint (256 px tiles, >= 64 px overlap, linear moment blend; `h3_vae_enc_tiled_golden.py`), which also corrected the FL2VA
+keyframe encode at tile seams. Measured: 640x384, 56 frames, one reference image and one audio clip, 4 GPUs: ~52 s text (14K prompt tokens from a 2048 px
+reference), 36 s denoise, 8 s decode; the output reproduces the reference subject when the prompt refers to it. Server and UI take `ref_images` / `ref_audios`.
+
+```
+build/h3_generate --root ... --dit-ref2va <ref2va ckpt> --lora <h3-turbo/minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors> --prompt "The dog from Picture 1 ..." \
+    --ref-image a.png [--ref-image b.png] [--ref-audio voice.wav] --devices 0,1,2,3 --out out.mp4
+```
+
+Not yet built: reference videos (the causal 3-D video encoder over time, the Qwen video presentation with `<t seconds>` timestamps and video mRoPE, audio taken from
+the video), keeping the models resident between jobs (each job reloads them: ~20 s), splitting the VAE decode over the GPUs (63 s now on one), quantization of the
+text encoder, FP8/INT8 attention, a FP16-range audit for long clips, and the benchmark matrix. Reference noise is drawn from the engine's own RNG, not torch's, so
+runs are not bit-comparable with 1Cat's for the same seed.
