@@ -33,7 +33,7 @@ constexpr float kEps = 1e-6f;
 constexpr float kTheta = 5.0e6f;
 
 // per (token, head) RMSNorm with a 128-weight, then neox rotary over all 128 dims (pairs i, i+64); q heads then k heads
-__global__ void k_qwen_qk( half* q, half* k, const float* qw, const float* kw, int S ) {
+__global__ void k_qwen_qk( half* q, half* k, const float* qw, const float* kw, const int* pos, int S ) {
 	__shared__ float sm[8][128];
 	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
 	const int s = blockIdx.x, task = blockIdx.y * 8 + warp;
@@ -55,7 +55,9 @@ __global__ void k_qwen_qk( half* q, half* k, const float* qw, const float* kw, i
 	#pragma unroll
 	for ( int i = 0; i < 4; ++i ) {
 		const int e = lane * 4 + i, f = e & 63;
-		const float ang = static_cast<float>( s ) * powf( kTheta, -static_cast<float>( f ) / 64.0f );
+		// interleaved mRoPE: frequency f takes the height position when f % 3 == 1 and f < 60, the width position when f % 3 == 2 and f < 60, else time
+		const int axis = f < 60 && f % 3 == 1 ? 1 : ( f < 60 && f % 3 == 2 ? 2 : 0 );
+		const float ang = static_cast<float>( pos[axis * S + s] ) * powf( kTheta, -static_cast<float>( f ) / 64.0f );
 		const float c = cosf( ang ), sn = sinf( ang );
 		const float o = e < 64 ? sm[warp][e] * c - sm[warp][e + 64] * sn : sm[warp][e] * c + sm[warp][e - 64] * sn;
 		p[e] = __float2half_rn( o );
@@ -126,6 +128,12 @@ __global__ void k_silu_mul2( const half* g, const half* u, half* out, float* row
 	}
 }
 
+// x[rows[i]] += feat[i] (DeepStack injection)
+static __global__ void k_add_rows( float* x, const float* feat, const int* rows, int H ) {
+	const int i = blockIdx.x;
+	for ( int c = threadIdx.x; c < H; c += blockDim.x ) { x[static_cast<size_t>( rows[i] ) * H + c] += feat[static_cast<size_t>( i ) * H + c]; }
+}
+
 struct LayerW {
 	half *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
 	float *in_norm = nullptr, *post_norm = nullptr, *qn = nullptr, *kn = nullptr;
@@ -144,6 +152,7 @@ struct H3TextEncoder::Impl {
 	cudaStream_t cs = nullptr, ps = nullptr; // compute, prefetch
 	cudaEvent_t loaded[2], consumed[2];
 	float *x = nullptr, *br = nullptr, *rowscale = nullptr;
+	int* d_pos = nullptr; // [3, max_tokens]
 	half *h16 = nullptr, *q16 = nullptr, *k16 = nullptr, *v16 = nullptr, *o16 = nullptr, *g16 = nullptr, *u16 = nullptr, *f16 = nullptr;
 	std::string embed_name = "model.language_model.embed_tokens.weight";
 
@@ -202,7 +211,7 @@ struct H3TextEncoder::Impl {
 		gemm( h16, w.q, q16, S, kNh * kHd, kH, false );
 		gemm( h16, w.k, k16, S, kNkv * kHd, kH, false );
 		gemm( h16, w.v, v16, S, kNkv * kHd, kH, false );
-		k_qwen_qk<<<dim3( S, ( kNh + kNkv + 7 ) / 8 ), 256, 0, s>>>( q16, k16, w.qn, w.kn, S );
+		k_qwen_qk<<<dim3( S, ( kNh + kNkv + 7 ) / 8 ), 256, 0, s>>>( q16, k16, w.qn, w.kn, d_pos, S );
 		k_attn_causal<<<dim3( S, kNh ), 128, static_cast<size_t>( S + 8 ) * sizeof( float ), s>>>( q16, k16, v16, o16 );
 		gemm( o16, w.o, br, S, kH, kNh * kHd, true );
 		k_add_gated<<<S, 256, 0, s>>>( x, br, nullptr, nullptr, 0, nullptr, kH );
@@ -252,11 +261,12 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	s.staging_bytes = static_cast<size_t>( kFfn ) * kH * 2;
 	CUDA_CHECK( cudaMalloc( &s.staging, s.staging_bytes ) );
 	const size_t S = static_cast<size_t>( max_tokens );
-	const size_t need = S * kH * 4 * 2 + S * 4 + S * kH * 2 + S * kNh * kHd * 2 * 2 + S * kNkv * kHd * 2 * 2 + S * kFfn * 2 * 3 + ( 16ULL << 20 );
+	const size_t need = S * kH * 4 * 2 + S * 4 * 4 + S * kH * 2 + S * kNh * kHd * 2 * 2 + S * kNkv * kHd * 2 * 2 + S * kFfn * 2 * 3 + ( 16ULL << 20 );
 	if ( !engine::core::arena_create( s.sarena, device, need ) ) { return false; }
 	s.x = s.alloc<float>( s.sarena, S * kH );
 	s.br = s.alloc<float>( s.sarena, S * kH );
 	s.rowscale = s.alloc<float>( s.sarena, S );
+	s.d_pos = s.alloc<int>( s.sarena, 3 * S );
 	s.h16 = s.alloc<half>( s.sarena, S * kH );
 	s.q16 = s.alloc<half>( s.sarena, S * kNh * kHd );
 	s.o16 = s.alloc<half>( s.sarena, S * kNh * kHd );
@@ -269,22 +279,77 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	return s.repo.find( s.embed_name.c_str() ) != nullptr;
 }
 
-bool H3TextEncoder::encode( const std::vector<int>& ids, float* d_out ) {
+bool H3TextEncoder::encode( const std::vector<int>& ids, float* d_out ) { return encode_mm( ids, -1, {}, d_out ); }
+
+bool H3TextEncoder::encode_mm( const std::vector<int>& ids, int image_token_id, const std::vector<H3ImageFeatures>& images, float* d_out ) {
 	Impl& s = *p_;
 	const int S = static_cast<int>( ids.size() );
 	if ( S <= 0 || S > s.max_tokens ) { return false; }
-	// embedding rows (BF16 table on disk) -> FP32 on the device
+	// embedding rows (BF16 table on disk) -> FP32; image placeholders take the vision features
 	const pod::SafeTensorMeta* em = s.repo.find( s.embed_name.c_str() );
 	const uint16_t* table = static_cast<const uint16_t*>( s.repo.cpu_data( s.embed_name.c_str() ) );
 	std::vector<float> rows( static_cast<size_t>( S ) * kH );
+	std::vector<int> pad_rows;
+	std::vector<int> mm( S, 0 );
 	for ( int i = 0; i < S; ++i ) {
 		if ( ids[i] < 0 || ids[i] >= em->shape[0] ) { return false; }
+		if ( ids[i] == image_token_id ) { mm[i] = 1; pad_rows.push_back( i ); }
 		for ( int c = 0; c < kH; ++c ) {
 			const uint32_t bits = static_cast<uint32_t>( table[static_cast<size_t>( ids[i] ) * kH + c] ) << 16;
 			std::memcpy( &rows[static_cast<size_t>( i ) * kH + c], &bits, 4 );
 		}
 	}
+	size_t total_tokens = 0;
+	for ( const H3ImageFeatures& f : images ) { total_tokens += f.merged.size() / kH; }
+	if ( total_tokens != pad_rows.size() ) {
+		LOG_ERROR( "H3 text: %zu image placeholders but %zu image tokens of features", pad_rows.size(), total_tokens );
+		return false;
+	}
+	std::vector<float> ds[3];
+	{
+		size_t at = 0;
+		for ( const H3ImageFeatures& f : images ) {
+			const size_t n = f.merged.size() / kH;
+			for ( size_t t = 0; t < n; ++t ) { std::memcpy( &rows[static_cast<size_t>( pad_rows[at + t] ) * kH], &f.merged[t * kH], kH * sizeof( float ) ); }
+			for ( int d = 0; d < 3; ++d ) { ds[d].insert( ds[d].end(), f.deepstack[d].begin(), f.deepstack[d].end() ); }
+			at += n;
+		}
+	}
+	// 3-D positions (Qwen3-VL get_rope_index): text runs advance all axes, an image run lays its merged grid out from the current position
+	std::vector<int> pos( static_cast<size_t>( 3 ) * S, 0 );
+	{
+		int cur = 0, i = 0;
+		size_t img = 0;
+		while ( i < S ) {
+			int j = i;
+			while ( j < S && mm[j] == mm[i] ) { ++j; }
+			if ( mm[i] == 0 ) {
+				for ( int k = i; k < j; ++k ) { for ( int a = 0; a < 3; ++a ) { pos[static_cast<size_t>( a ) * S + k] = cur + ( k - i ); } }
+				cur += j - i;
+			} else {
+				const H3ImageFeatures& f = images[std::min( img, images.size() - 1 )];
+				const int gh = f.grid_h / 2, gw = f.grid_w / 2;
+				for ( int k = i; k < j; ++k ) {
+					const int n = k - i;
+					pos[static_cast<size_t>( 0 ) * S + k] = cur;
+					pos[static_cast<size_t>( 1 ) * S + k] = cur + n / gw;
+					pos[static_cast<size_t>( 2 ) * S + k] = cur + n % gw;
+				}
+				cur += std::max( gh, gw );
+				++img;
+			}
+			i = j;
+		}
+	}
+	CUDA_CHECK( cudaMemcpyAsync( s.d_pos, pos.data(), pos.size() * sizeof( int ), cudaMemcpyHostToDevice, s.cs ) );
 	CUDA_CHECK( cudaMemcpyAsync( s.x, rows.data(), rows.size() * sizeof( float ), cudaMemcpyHostToDevice, s.cs ) );
+	float* d_feat = nullptr;
+	int* d_rows = nullptr;
+	if ( !pad_rows.empty() ) {
+		CUDA_CHECK( cudaMalloc( &d_feat, pad_rows.size() * kH * sizeof( float ) ) );
+		CUDA_CHECK( cudaMalloc( &d_rows, pad_rows.size() * sizeof( int ) ) );
+		CUDA_CHECK( cudaMemcpyAsync( d_rows, pad_rows.data(), pad_rows.size() * sizeof( int ), cudaMemcpyHostToDevice, s.cs ) );
+	}
 	CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
 	// layer pipeline: slot (i % 2) holds layer i; layer i + 1 is uploaded while layer i computes
 	s.load_layer( 0, 0 );
@@ -292,14 +357,20 @@ bool H3TextEncoder::encode( const std::vector<int>& ids, float* d_out ) {
 		const int cur = i % 2, nxt = 1 - cur;
 		if ( i + 1 < s.layers ) {
 			if ( i >= 1 ) { CUDA_CHECK( cudaStreamWaitEvent( s.ps, s.consumed[nxt], 0 ) ); }
-			s.load_layer( nxt, i + 1 ); // host-side copies run now; the compute stream is busy with layer i meanwhile only if enqueued first
+			s.load_layer( nxt, i + 1 );
 		}
 		s.run_layer( s.slot[cur], S );
+		if ( d_feat && i < 3 ) {
+			CUDA_CHECK( cudaMemcpyAsync( d_feat, ds[i].data(), pad_rows.size() * kH * sizeof( float ), cudaMemcpyHostToDevice, s.cs ) );
+			CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
+			k_add_rows<<<static_cast<int>( pad_rows.size() ), 256, 0, s.cs>>>( s.x, d_feat, d_rows, kH );
+		}
 		CUDA_CHECK( cudaEventRecord( s.consumed[cur], s.cs ) );
 		CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
 	}
 	CUDA_CHECK( cudaMemcpyAsync( d_out, s.x, static_cast<size_t>( S ) * kH * sizeof( float ), cudaMemcpyDeviceToDevice, s.cs ) );
 	CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
+	if ( d_feat ) { cudaFree( d_feat ); cudaFree( d_rows ); }
 	CUDA_CHECK( cudaGetLastError() );
 	return true;
 }
