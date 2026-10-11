@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/config.h"
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -54,10 +55,14 @@ struct H3GenRequest {
 	std::vector<int> frame_indices;  // per image: 0 (first) or -1 (last); empty = [0] for one image, [0, -1] for two
 	std::string out;             // .mp4 path
 	bool keep_pcm = false;
+	// progress(stage, done, total): stages "images", "text", "load", "denoise" (step done of steps), "decode", "mux"
+	std::function<void( const char* stage, int done, int total )> progress;
+	const std::atomic<bool>* cancel = nullptr; // checked between stages and denoising steps
 };
 
 struct H3GenResult {
 	int frames = 0, width = 0, height = 0, latent_t = 0, rows = 0;
+	bool cancelled = false;
 	double t_text = 0, t_load = 0, t_denoise = 0, t_decode = 0, t_mux = 0;
 };
 

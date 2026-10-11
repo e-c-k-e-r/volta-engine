@@ -160,6 +160,8 @@ H3Layout h3_build_layout( int text_len, int latent_t, int latent_h, int latent_w
 
 bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* result ) {
 	H3GenResult res;
+	auto report = [&]( const char* stage, int done, int total ) { if ( req.progress ) { req.progress( stage, done, total ); } };
+	auto cancelled = [&]() { if ( req.cancel && req.cancel->load() ) { res.cancelled = true; if ( result ) { *result = res; } return true; } return false; };
 	CUDA_CHECK( cudaSetDevice( paths.device ) );
 	// ---- shape ----
 	// reference images (FL2VA): decoded here; the canvas follows the caller's size (the CLI derives it from the first image's aspect ratio)
@@ -189,6 +191,7 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 	const int lh = height / 16, lw = width / 16;
 
 	// ---- stage 0: keyframe latents (video VAE image encoder) ----
+	report( "images", 0, 1 );
 	auto t0 = std::chrono::steady_clock::now();
 	std::vector<std::vector<uint8_t>> canvas; // images resized to the canvas
 	std::vector<float> cond_rows;             // [n_cond, 96] anchors
@@ -214,7 +217,9 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 		LOG_INFO( "H3: %zu keyframe image(s) encoded in %.1f s", refs.size(), seconds_since( t0 ) );
 	}
 
+	if ( cancelled() ) { return false; }
 	// ---- stage 1: text conditioning ----
+	report( "text", 0, 1 );
 	t0 = std::chrono::steady_clock::now();
 	engine::loader::Tokenizer tok;
 	if ( !tok.load( ( paths.root + "/tokenizer" ).c_str() ) ) { LOG_ERROR( "H3: tokenizer not found under %s", paths.root.c_str() ); return false; }
@@ -291,7 +296,9 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 		sa[i] = req.audio_shift * u / ( 1.0 + ( req.audio_shift - 1.0 ) * u );
 	}
 
+	if ( cancelled() ) { return false; }
 	// ---- stage 2: DiT (one or several GPUs, sequence parallel) ----
+	report( "load", 0, 1 );
 	t0 = std::chrono::steady_clock::now();
 	std::vector<float> host_prompt( ids.size() * 5120 );
 	CUDA_CHECK( cudaMemcpy( host_prompt.data(), d_prompt, host_prompt.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
@@ -316,7 +323,9 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 		r.inverse.resize( lay.used );
 		t0 = std::chrono::steady_clock::now();
 		std::vector<float> vout, aout;
+		report( "denoise", 0, req.steps );
 		for ( int step = 0; step < req.steps; ++step ) {
+			if ( cancelled() ) { return false; }
 			const double tv = 1.0 - sv[step], ta = 1.0 - sa[step];
 			// per-row timesteps: text rows inherit the video timestep, condition rows sit at the condition timestep, audio rows at the audio one
 			const double tc = std::max( tv, 0.999 );
@@ -341,6 +350,7 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 			for ( size_t i = static_cast<size_t>( n_cond ) * 96; i < vrows.size(); ++i ) { vrows[i] += cv * vout[i]; }
 			for ( size_t i = 0; i < arows.size(); ++i ) { arows[i] += ca * aout[i]; }
 			LOG_INFO( "H3: step %d/%d done (%.1f s elapsed)", step + 1, req.steps, seconds_since( t0 ) );
+			report( "denoise", step + 1, req.steps );
 		}
 		res.t_denoise = seconds_since( t0 );
 	}
@@ -348,7 +358,9 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 	float* d_vrows = upload( vrows );
 	float* d_arows = upload( arows );
 
+	if ( cancelled() ) { return false; }
 	// ---- stage 3: decoders ----
+	report( "decode", 0, 1 );
 	t0 = std::chrono::steady_clock::now();
 	std::vector<uint8_t> rgb;
 	int out_frames = 0;
@@ -370,6 +382,7 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 	LOG_INFO( "H3: decoded %d frames (%dx%d) and %zu audio samples in %.1f s", out_frames, width, height, pcm.size() / 2, res.t_decode );
 
 	// ---- mux ----
+	report( "mux", 0, 1 );
 	t0 = std::chrono::steady_clock::now();
 	const std::string pcm_path = req.out + ".f32";
 	{
