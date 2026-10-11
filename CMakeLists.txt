@@ -82,6 +82,7 @@ set(ENGINE_HOST_SOURCES
 	src/server/video/jobs.cpp
 	src/server/video/service.cpp
 	src/server/video/api.cpp
+	src/server/video/metrics.cpp
 	src/server/video/page.cpp
 	src/server/system_stats.cpp
 )
@@ -119,7 +120,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/video/h3_pipeline.cu
 	src/video/h3_stage_refs.cpp
 	src/video/h3_stage_text.cpp
-	src/video/h3_stage_denoise.cu
+	src/video/h3_stage_denoise.cpp
 	src/video/h3_stage_decode.cu
 	src/kernels/cuda/h3/h3_fmha.cu
 	src/spec/dflash_kernels.cu

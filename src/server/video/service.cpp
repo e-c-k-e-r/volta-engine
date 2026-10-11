@@ -14,6 +14,7 @@ VideoService::~VideoService() {
 bool VideoService::init( const ServerConfig& config ) {
 	Impl& s = *p_;
 	s.cfg = config;
+	s.started_at = wall_seconds();
 	s.adapters.scan( s.cfg.video.lora_dirs, !s.cfg.video.dit_ref2va.empty() );
 	s.jobs.init( s.cfg.video.out_dir );
 	s.worker = std::thread( [this] { p_->run_loop(); } );
@@ -33,12 +34,10 @@ void VideoService::stop() {
 	if ( p_->worker.joinable() ) p_->worker.detach();
 }
 
-VideoService::Stats VideoService::stats() const {
-	const JobStore::Counts c = p_->jobs.counts();
-	return { c.queued, c.running, c.done, c.failed, c.cancelled, c.last_total_s, c.last_denoise_s };
-}
-
 void VideoService::Impl::register_routes( Router& router ) {
+	router.add( "GET", "/health", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_health( c, r ); } );
+	router.add( "GET", "/metrics", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_metrics( c, r ); } );
+	router.add( "GET", "/metrics/prometheus", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_metrics_prometheus( c, r ); } );
 	router.add( "GET", "/", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_page( c, r ); } );
 	router.add( "GET", "/api/info", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_info( c, r ); } );
 	router.add( "GET", "/api/jobs", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_list( c, r ); } );

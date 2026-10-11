@@ -3,6 +3,7 @@
 // Internal declarations of the video service (shared by service.cpp and api.cpp).
 #include "adapters.h"
 #include "engine/server/config.h"
+#include "engine/server/system_stats.h"
 #include "engine/server/video.h"
 #include "jobs.h"
 #include <atomic>
@@ -14,6 +15,8 @@ struct VideoService::Impl {
 	ServerConfig cfg;
 	AdapterCatalog adapters;
 	JobStore jobs;
+	SystemStats sys;
+	double started_at = 0;
 	std::thread worker;
 
 	void run_loop();                 // the worker: takes queued jobs one at a time
@@ -21,6 +24,9 @@ struct VideoService::Impl {
 	void register_routes( Router& router );
 
 	// handlers (api.cpp)
+	void handle_health( const ConnPtr& c, const HttpRequest& r );
+	void handle_metrics( const ConnPtr& c, const HttpRequest& r );
+	void handle_metrics_prometheus( const ConnPtr& c, const HttpRequest& r );
 	void handle_page( const ConnPtr& c, const HttpRequest& r );
 	void handle_info( const ConnPtr& c, const HttpRequest& r );
 	void handle_list( const ConnPtr& c, const HttpRequest& r );

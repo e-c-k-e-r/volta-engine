@@ -242,8 +242,8 @@ tool and a job server with a web UI are implemented. Every model component was c
 | Video VAE image encoder (single frame) | `h3_vae_enc.cu` | moments cosine 1.000000 |
 | Audio VAE decoder (BigVGAN) | `h3_audio.cu` | cosine 1.000000 |
 | Text encoder (Qwen3 tower, 50 layers, BF16 streamed from disk) with image tokens (vision tower, DeepStack, interleaved mRoPE) | `h3_text.cu`, `h3_vision.cu` | text 1.000000, image-conditioned 0.999991 (reference matches HF transformers); vision tower 0.99999 vs HF |
-| Layout, schedule, Euler loop, Lanczos resize, keyframe rows, MP4 mux | `h3_pipeline.cu`, `h3_image.cpp` | layout identical to 1Cat's; Lanczos within 1 level of PIL |
-| `h3_generate` CLI, `h3_server` + UI | `h3_generate_main.cpp`, `h3_server.cpp`, `h3_ui.cpp` | end to end |
+| Layout, schedule, Euler loop, Lanczos resize, keyframe rows, MP4 mux (stages of `H3Run`: `h3_pipeline.cu`, `h3_stage_*.cpp/.cu`) | `h3_pipeline.cu`, `h3_run.h`, `h3_stage_*`, `h3_image.cpp` | layout identical to 1Cat's; Lanczos within 1 level of PIL |
+| `h3_generate` CLI; the video service of `volta_server` (job queue, API, page) | `h3_generate_main.cpp`; `src/server/video/` | end to end; the stage split is bit-identical to the monolithic version |
 
 Measured (150 W cap, V100, 1280x736 x 124 frames, 4-step turbo adapter, 34,472 rows): one GPU 334 s denoise (83 s per step) + 64 s decode; four GPUs
 88 s denoise (22 s per step) + 63 s decode, about 3 minutes in all including the 11 s text encode and 9 s model load. A 640x384 x 39-frame clip takes 35 s on four GPUs.
@@ -254,8 +254,16 @@ Running it:
 build/h3_generate --root <MiniMax-H3/FL2VA> --dit <Comfy-H3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors> \
     --lora <h3-turbo/minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors> --prompt "..." --size 1280x736 --frames 124 --steps 4 \
     --devices 0,1,2,3 --out out.mp4 [--image first.png [--image last.png]] [--lora other.safetensors:0.8]
-build/h3_server --root ... --dit ... --lora-dir <h3-turbo> --lora-dir <h3-loras> --out-dir <jobs dir> --devices 0,1,2,3 --port 8200
+build/volta_server --model-dir <MiniMax-H3/FL2VA> --dit <fl2va checkpoint> [--dit-ref2va <ref2va checkpoint>] --lora-dir <h3-turbo> --lora-dir <h3-loras> \
+    --out-dir <jobs dir> --host 127.0.0.1 --port 8200
 ```
+
+`volta_server` treats a `model_dir` with a `model_index.json` of class `MiniMaxH3Pipeline` as the `minimax_h3` model family: no language-model runtime, a job
+queue with one worker thread that owns the GPUs (`tp_size` GPUs, or `--devices`), and these routes: `GET /` (the page), `GET /api/info`, `GET`/`POST /api/jobs`,
+`GET`/`DELETE /api/jobs/<id>`, `GET /api/jobs/<id>/video` (Range) and `/thumb`, `POST /api/jobs/<id>/cancel`, plus `/health`, `/metrics` and `/metrics/prometheus`
+(queue and job counters, last job timings, VRAM of the transformer's GPUs). Settings are in the launch config's `video` object (see [CONFIG.md](CONFIG.md)).
+A job body is `{prompt, width, height, frames, steps, seed, turbo, loras:[{file,scale}], images:[{data,frame_index}], ref_images, ref_videos, ref_audios}` with
+base64 uploads. Code: `src/server/video/` (`adapters`, `jobs`, `service`, `api`, `metrics`, `page`) on the shared `Router` and `Connection` of `src/server/`.
 
 The server has no authentication and binds to localhost by default. A build needs the CUTLASS headers (`ENGINE_CUTLASS_DIR`, default
 `~/Programs/1Cat-vLLM/.deps/cutlass-src`) for the attention kernel.

@@ -256,8 +256,7 @@ bool VoltaServer::parse_request( const ConnPtr& conn, HttpRequest* req ) {
 }
 
 void VoltaServer::register_routes() {
-	if ( video_ ) {
-		router_.add( "GET", "/health", [this]( const ConnPtr& c, const HttpRequest& ) { handle_health( c ); } );
+	if ( video_ ) { // the video service answers /health and /metrics itself; the chat and monitor routes need a language-model runtime
 		video_->register_routes( router_ );
 		return;
 	}

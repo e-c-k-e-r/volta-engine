@@ -19,13 +19,6 @@ public:
 	void register_routes( Router& router );
 	void stop();
 
-	// Counters for /health and /metrics
-	struct Stats {
-		int queued = 0, running = 0, done = 0, failed = 0, cancelled = 0;
-		double last_total_s = 0, last_denoise_s = 0;
-	};
-	Stats stats() const;
-
 private:
 	struct Impl;
 	std::unique_ptr<Impl> p_;
