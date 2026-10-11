@@ -606,23 +606,29 @@ bool H3DiT::reserve() {
 	const int H = s.cfg.hidden;
 	// scratch sized for max_rows
 	const size_t U = static_cast<size_t>( s.max_rows ), qd = static_cast<size_t>( s.cfg.heads ) * s.cfg.head_dim, F = s.cfg.ffn;
-	// rows owned by one rank (row-local activations); the residual stream, rope tables and the K/V all-gather buffers cover the whole sequence
-	const size_t UL = s.cfg.sp_ranks > 1 ? std::max<size_t>( ( U + s.cfg.sp_ranks - 1 ) / s.cfg.sp_ranks, 8192 ) : U;
-	size_t need = U * H * 4 + UL * H * 4 + U * 4 + UL * 4 + UL * 3 * qd * 2 + UL * qd * 2 * 4 + UL * 2 * F * 2 + UL * F * 2 + UL * H * 2 + U * 48 * 4 * 2 + UL * 128 * 4 + 64ull * 3 * 6 * H * 4 +
-		static_cast<size_t>( 28672 ) * 5376 * 2 + U * qd * 2 * 2 + UL * 256 * 2 + UL * qd * 4 + UL * s.cfg.heads * 8 + ( 64ull << 20 );
+	// UL: rows of the activations that are narrower than the model (sequence parallel: this rank's rows; tensor parallel: all rows at 1/T of the width, which is the
+	// same number of elements, and also the most text rows the full-width refiner can take); UF: rows of the full-width activations (the residual stream, the norm
+	// output, the projection partial sums)
+	const size_t T = static_cast<size_t>( std::max( 1, s.cfg.tp_ranks ) ), sp = static_cast<size_t>( std::max( 1, s.cfg.sp_ranks ) );
+	const size_t UL = sp > 1 ? std::max<size_t>( ( U + sp - 1 ) / sp, 8192 ) : ( T > 1 ? std::max<size_t>( ( U + T - 1 ) / T, 8192 ) : U );
+	const size_t UF = T > 1 ? U : UL;
+	const size_t wmat = T > 1 ? std::max( 3 * qd / T, 2 * F / T ) * H : static_cast<size_t>( 28672 ) * 5376; // largest dequantized matrix of this rank
+	const size_t kv_rows = sp > 1 ? U : 1, state_rows = sp > 1 ? UL : 1; // the K/V gather buffers and the partial-attention state exist only for sequence parallelism
+	size_t need = U * H * 4 + UF * H * 4 + U * 4 + UF * 4 + UL * 3 * qd * 2 + UL * qd * 2 * 3 + UL * 2 * F * 2 + UL * F * 2 + UF * H * 2 + U * 48 * 4 * 2 + UF * 128 * 4 + 64ull * 3 * 6 * H * 4 +
+		wmat * 2 + kv_rows * qd * 2 * 2 + UL * qd * 2 + UF * 256 * 2 + state_rows * qd * 4 + state_rows * s.cfg.heads * 8 + ( 64ull << 20 );
 	need += 16384ull * H * 4; // refiner stream (text rows)
 	if ( !h3_scratch_arena_create( s.sarena, s.device, need ) ) { return false; }
 	s.x = s.alloc<float>( s.sarena, U * H );
-	s.br = s.alloc<float>( s.sarena, UL * H );
+	s.br = s.alloc<float>( s.sarena, UF * H );
 	s.tx = s.alloc<float>( s.sarena, 16384ull * H );
-	s.rowscale = s.alloc<float>( s.sarena, UL );
+	s.rowscale = s.alloc<float>( s.sarena, UF );
 	s.ada = s.alloc<float>( s.sarena, 16ull * kModalities * 6 * H );
 	s.temb = s.alloc<float>( s.sarena, 16 * 8 );
 	s.cosb = s.alloc<float>( s.sarena, U * 48 );
 	s.sinb = s.alloc<float>( s.sarena, U * 48 );
-	s.vall = s.alloc<float>( s.sarena, UL * 96 );
-	s.aall = s.alloc<float>( s.sarena, UL * 32 );
-	s.h16 = s.alloc<half>( s.sarena, UL * H );
+	s.vall = s.alloc<float>( s.sarena, UF * 96 );
+	s.aall = s.alloc<float>( s.sarena, UF * 32 );
+	s.h16 = s.alloc<half>( s.sarena, UF * H );
 	s.v16 = s.alloc<half>( s.sarena, UL * qd );
 	s.qkv16 = s.alloc<half>( s.sarena, UL * 3 * qd );
 	s.q16 = s.alloc<half>( s.sarena, UL * qd );
@@ -630,14 +636,14 @@ bool H3DiT::reserve() {
 	s.o16 = s.alloc<half>( s.sarena, UL * qd );
 	s.f1 = s.alloc<half>( s.sarena, UL * 2 * F );
 	s.f2 = s.alloc<half>( s.sarena, UL * F );
-	s.wscratch = s.alloc<half>( s.sarena, 28672ull * 5376 );
+	s.wscratch = s.alloc<half>( s.sarena, wmat );
 	s.comb = s.alloc<int>( s.sarena, U );
 	s.max_local = static_cast<int>( UL );
-	s.lora_t = s.alloc<half>( s.sarena, UL * 256 );
-	s.attn_o = s.alloc<float>( s.sarena, UL * qd );
-	s.attn_ml = reinterpret_cast<float2*>( s.alloc<float>( s.sarena, UL * s.cfg.heads * 2 ) );
-	s.kfull = s.alloc<half>( s.sarena, U * qd );
-	s.vfull = s.alloc<half>( s.sarena, U * qd );
+	s.lora_t = s.alloc<half>( s.sarena, UF * 256 );
+	s.attn_o = s.alloc<float>( s.sarena, state_rows * qd );
+	s.attn_ml = reinterpret_cast<float2*>( s.alloc<float>( s.sarena, state_rows * s.cfg.heads * 2 ) );
+	s.kfull = s.alloc<half>( s.sarena, kv_rows * qd );
+	s.vfull = s.alloc<half>( s.sarena, kv_rows * qd );
 	return true;
 }
 
