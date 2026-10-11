@@ -42,5 +42,6 @@ with torch.inference_mode():
     print("revert", tuple(frames.shape), frames.dtype, float(frames.min()), float(frames.max()))
     out["decoded"] = dec.float().cpu().contiguous()
     out["frames"] = frames.float().cpu().contiguous()
+out = {k: v[0].contiguous() for k, v in out.items()}  # drop the batch axis (the engine loader reads at most 4 dims)
 save_file(out, a.out)
 print("saved", a.out, {k: tuple(v.shape) for k, v in out.items()})
