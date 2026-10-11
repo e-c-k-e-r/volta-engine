@@ -5,18 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <random>
 
 namespace engine::video {
-
-namespace {
-
-void gaussian( std::mt19937_64& rng, std::vector<float>& out ) {
-	std::normal_distribution<float> nd( 0.0f, 1.0f );
-	for ( float& v : out ) { v = nd( rng ); }
-}
-
-} // namespace
 
 void H3Run::plan_denoise() {
 	lay = ref2va ? h3_build_layout_ref( static_cast<int>( ids.size() ), latent_t, lh, lw, audio_t, blocks ) : h3_build_layout( static_cast<int>( ids.size() ), latent_t, lh, lw, audio_t, keyframes, frames );
@@ -24,11 +14,11 @@ void H3Run::plan_denoise() {
 	const int target_rows = latent_t * ( lh / 2 ) * ( lw / 2 );
 	n_cond = lay.n_img - target_rows;       // leading video rows that are conditions (keyframes / reference images)
 	n_aref = lay.n_audio - 2 * audio_t;     // leading audio rows that are reference audio
-	std::mt19937_64 rng( req.seed );
+	H3Gaussian gauss( req.seed );
 	vrows.assign( static_cast<size_t>( lay.n_img ) * 96, 0.0f );
 	arows.assign( static_cast<size_t>( lay.n_audio ) * 32, 0.0f );
-	gaussian( rng, vrows );
-	gaussian( rng, arows );
+	gauss.fill( vrows );
+	gauss.fill( arows );
 	// condition rows are the fixed (noised) anchors; only the target rows are denoised
 	std::copy( cond_rows.begin(), cond_rows.end(), vrows.begin() );
 	std::copy( ref_audio_rows.begin(), ref_audio_rows.end(), arows.begin() ); // the audio reference is pinned at timestep 1: its clean latents

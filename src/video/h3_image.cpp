@@ -7,6 +7,21 @@
 #include <random>
 
 namespace engine::video {
+
+float H3Gaussian::next() {
+	if ( has_spare_ ) {
+		has_spare_ = false;
+		return static_cast<float>( spare_ );
+	}
+	// (0, 1) uniforms from 53 random bits; each statement is a single multiply or add, so there is nothing for the compiler to contract
+	const double inv = 1.0 / 9007199254740992.0;
+	const double u1 = ( static_cast<double>( rng_() >> 11 ) + 0.5 ) * inv, u2 = static_cast<double>( rng_() >> 11 ) * inv;
+	const double r = std::sqrt( -2.0 * std::log( u1 ) ), a = 6.283185307179586 * u2;
+	spare_ = r * std::sin( a );
+	has_spare_ = true;
+	return static_cast<float>( r * std::cos( a ) );
+}
+
 namespace {
 
 double sinc( double x ) {
@@ -148,8 +163,7 @@ float to_fp16_and_back( float v ) {
 
 std::vector<float> h3_condition_rows( const std::vector<float>& moments, int T, int h, int w, const std::vector<float>& mean, const std::vector<float>& stdev, uint64_t seed, float noise_aug ) {
 	ENGINE_ASSERT( moments.size() == static_cast<size_t>( T ) * 48 * h * w && h % 2 == 0 && w % 2 == 0, "condition rows: moments shape" );
-	std::mt19937_64 rng( seed );
-	std::normal_distribution<float> nd( 0.0f, 1.0f );
+	H3Gaussian gauss( seed );
 	const size_t hw = static_cast<size_t>( h ) * w;
 	const int h2 = h / 2, w2 = w / 2;
 	std::vector<float> rows( static_cast<size_t>( T ) * h2 * w2 * 96 ), noise( rows.size() );
@@ -159,7 +173,7 @@ std::vector<float> h3_condition_rows( const std::vector<float>& moments, int T, 
 		for ( int c = 0; c < 24; ++c ) {
 			for ( size_t p = 0; p < hw; ++p ) {
 				const float lv = std::min( 20.0f, std::max( -30.0f, m[static_cast<size_t>( 24 + c ) * hw + p] ) );
-				const float v = m[static_cast<size_t>( c ) * hw + p] + std::exp( 0.5f * lv ) * nd( rng );
+				const float v = m[static_cast<size_t>( c ) * hw + p] + std::exp( 0.5f * lv ) * gauss.next();
 				z[static_cast<size_t>( c ) * hw + p] = ( to_fp16_and_back( v ) - mean[c] ) / stdev[c];
 			}
 		}
@@ -177,8 +191,8 @@ std::vector<float> h3_condition_rows( const std::vector<float>& moments, int T, 
 		}
 	}
 	if ( noise_aug < 1.0f ) {
-		std::mt19937_64 rng2( seed );
-		for ( float& v : noise ) { v = nd( rng2 ); }
+		H3Gaussian noise_gen( seed );
+		noise_gen.fill( noise );
 		for ( size_t i = 0; i < rows.size(); ++i ) { rows[i] = noise_aug * rows[i] + ( 1.0f - noise_aug ) * noise[i]; }
 	}
 	return rows;

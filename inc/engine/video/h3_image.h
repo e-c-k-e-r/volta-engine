@@ -1,11 +1,28 @@
 #pragma once
 
 #include <cstdint>
+#include <random>
 #include <string>
 #include <vector>
 
 // Reference-image helpers of the H3 pipeline (host side).
 namespace engine::video {
+
+// Standard normal samples from a seeded generator by Box-Muller in double precision, so that a seed gives the same noise whatever flags the translation unit
+// is compiled with (std::normal_distribution<float> rounds differently under -march=native, and the denoiser is sensitive to that).
+class H3Gaussian {
+public:
+	explicit H3Gaussian( uint64_t seed ) : rng_( seed ) {}
+	float next();
+	void fill( std::vector<float>& out ) {
+		for ( float& v : out ) { v = next(); }
+	}
+
+private:
+	std::mt19937_64 rng_;
+	double spare_ = 0.0;
+	bool has_spare_ = false;
+};
 
 // PIL-compatible Lanczos resize (support 3, antialiased on downscale, 8-bit intermediate between the horizontal and vertical pass); rgb [h, w, 3]
 std::vector<uint8_t> h3_resize_lanczos( const uint8_t* rgb, int in_h, int in_w, int out_h, int out_w );
