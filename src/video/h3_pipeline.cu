@@ -1,11 +1,17 @@
 // H3 T2VA pipeline orchestration (see h3_pipeline.h).
 #include "engine/video/h3_pipeline.h"
 #include "engine/core/log.h"
+#include "engine/loader/image.h"
 #include "engine/loader/tokenizer.h"
 #include "engine/video/h3_audio.h"
 #include "engine/video/h3_dit.h"
+#include "engine/video/h3_image.h"
 #include "engine/video/h3_text.h"
 #include "engine/video/h3_vae.h"
+#include "engine/video/h3_vae_enc.h"
+#include "engine/video/h3_vision.h"
+#include <fstream>
+#include <sstream>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <chrono>
@@ -74,6 +80,16 @@ void gaussian( std::mt19937_64& rng, std::vector<float>& out ) {
 }
 
 } // namespace
+
+void h3_output_canvas( double aspect, int* height, int* width ) {
+	double w, h;
+	if ( aspect >= 1.0 ) { w = 768.0 * aspect; h = 768.0; } else { w = 768.0; h = 768.0 / aspect; }
+	const double area = w * h, cap = 768.0 * 1344.0;
+	if ( area > cap ) { const double s = std::sqrt( cap / area ); w *= s; h *= s; }
+	auto align = []( double v ) { return std::max( 32, static_cast<int>( std::lround( v / 32.0 ) ) * 32 ); };
+	*height = align( h );
+	*width = align( w );
+}
 
 int h3_align_frames( int frames ) {
 	if ( frames <= 0 ) { return 1; }
@@ -145,34 +161,120 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 	H3GenResult res;
 	CUDA_CHECK( cudaSetDevice( paths.device ) );
 	// ---- shape ----
+	// reference images (FL2VA): decoded here; the canvas follows the caller's size (the CLI derives it from the first image's aspect ratio)
+	std::vector<engine::loader::DecodedImage> refs;
+	for ( const std::string& path : req.images ) {
+		std::ifstream f( path, std::ios::binary );
+		std::stringstream ss;
+		ss << f.rdbuf();
+		const std::string bytes = ss.str();
+		engine::loader::DecodedImage img;
+		std::string err;
+		if ( bytes.empty() || !engine::loader::decode_image( reinterpret_cast<const uint8_t*>( bytes.data() ), bytes.size(), &img, &err ) ) {
+			LOG_ERROR( "H3: cannot read image %s: %s", path.c_str(), err.c_str() );
+			return false;
+		}
+		refs.push_back( std::move( img ) );
+	}
+	if ( refs.size() > 2 ) { LOG_ERROR( "H3: FL2VA takes at most two images (first and last frame)" ); return false; }
+	std::vector<int> keyframes = req.frame_indices;
+	if ( !refs.empty() && keyframes.empty() ) { keyframes = refs.size() == 1 ? std::vector<int>{ 0 } : std::vector<int>{ 0, -1 }; }
+	if ( keyframes.size() != refs.size() ) { LOG_ERROR( "H3: one frame index per image" ); return false; }
 	const int width = req.width / 32 * 32, height = req.height / 32 * 32;
 	const int frames = h3_align_frames( req.frames );
 	const int latent_t = h3_video_latent_t( frames );
 	const int audio_t = h3_audio_latent_t( frames / 24.0 );
-	const int lh = height / 16, lw = width / 16;
 	if ( width <= 0 || height <= 0 || req.steps < 1 ) { return false; }
+	const int lh = height / 16, lw = width / 16;
+
+	// ---- stage 0: keyframe latents (video VAE image encoder) ----
+	auto t0 = std::chrono::steady_clock::now();
+	std::vector<std::vector<uint8_t>> canvas; // images resized to the canvas
+	std::vector<float> cond_rows;             // [n_cond, 96] anchors
+	for ( const auto& img : refs ) { canvas.push_back( h3_resize_lanczos( img.rgb.data(), img.height, img.width, height, width ) ); }
+	if ( !refs.empty() ) {
+		H3ImageEncoder enc;
+		H3VaeParams vp;
+		if ( !h3_read_vae_params( ( paths.root + "/video_vae" ).c_str(), vp ) || !enc.load( ( paths.root + "/video_vae" ).c_str(), paths.device ) ) { return false; }
+		float *d_in = nullptr, *d_m = nullptr;
+		CUDA_CHECK( cudaMalloc( &d_in, static_cast<size_t>( 3 ) * height * width * sizeof( float ) ) );
+		CUDA_CHECK( cudaMalloc( &d_m, static_cast<size_t>( 48 ) * lh * lw * sizeof( float ) ) );
+		for ( const auto& px : canvas ) {
+			const std::vector<float> in = h3_vae_input( px.data(), height, width );
+			CUDA_CHECK( cudaMemcpy( d_in, in.data(), in.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+			if ( !enc.encode( d_in, height, width, d_m ) ) { LOG_ERROR( "H3: image encode failed" ); return false; }
+			std::vector<float> moments( static_cast<size_t>( 48 ) * lh * lw );
+			CUDA_CHECK( cudaMemcpy( moments.data(), d_m, moments.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
+			const std::vector<float> rows = h3_keyframe_rows( moments, lh, lw, vp.mean, vp.stdev, 42, 0.999f );
+			cond_rows.insert( cond_rows.end(), rows.begin(), rows.end() );
+		}
+		cudaFree( d_in );
+		cudaFree( d_m );
+		LOG_INFO( "H3: %zu keyframe image(s) encoded in %.1f s", refs.size(), seconds_since( t0 ) );
+	}
 
 	// ---- stage 1: text conditioning ----
-	auto t0 = std::chrono::steady_clock::now();
+	t0 = std::chrono::steady_clock::now();
 	engine::loader::Tokenizer tok;
 	if ( !tok.load( ( paths.root + "/tokenizer" ).c_str() ) ) { LOG_ERROR( "H3: tokenizer not found under %s", paths.root.c_str() ); return false; }
-	const std::vector<int> ids = tok.encode( req.prompt, false );
+	std::vector<int> ids;
+	std::vector<int> text_tags;
+	std::vector<H3ImageFeatures> feats;
+	const int image_pad = tok.get_special_token( "<|image_pad|>" );
+	if ( refs.empty() ) {
+		ids = tok.encode( req.prompt, false );
+		text_tags.assign( ids.size(), 1 );
+	} else {
+		H3VisionTower tower;
+		if ( !tower.load( ( paths.root + "/text_encoder" ).c_str(), paths.device, 8192 ) ) { return false; }
+		engine::loader::VisionParams vparams;
+		vparams.min_pixels = 65536;
+		vparams.max_pixels = 16777216;
+		auto push = [&]( const std::vector<int>& v, int tag ) {
+			ids.insert( ids.end(), v.begin(), v.end() );
+			text_tags.insert( text_tags.end(), v.size(), tag );
+		};
+		for ( size_t i = 0; i < canvas.size(); ++i ) {
+			engine::loader::DecodedImage di;
+			di.width = width;
+			di.height = height;
+			di.rgb = canvas[i];
+			engine::loader::PreparedImage prep;
+			std::string err;
+			if ( !engine::loader::prepare_image( di, vparams, &prep, &err ) ) { LOG_ERROR( "H3: image preparation failed: %s", err.c_str() ); return false; }
+			H3ImageFeatures f;
+			f.grid_h = prep.grid_h;
+			f.grid_w = prep.grid_w;
+			if ( !tower.encode( prep.patches, prep.grid_h, prep.grid_w, &f.merged, f.deepstack ) ) { LOG_ERROR( "H3: vision tower failed" ); return false; }
+			const int n = static_cast<int>( f.merged.size() / 5120 );
+			push( tok.encode( "<Picture " + std::to_string( i + 1 ) + ">: ", false ), 1 );
+			push( { tok.get_special_token( "<|vision_start|>" ) }, 0 );
+			push( std::vector<int>( n, image_pad ), 0 );
+			push( { tok.get_special_token( "<|vision_end|>" ) }, 0 );
+			feats.push_back( std::move( f ) );
+		}
+		push( tok.encode( req.prompt, false ), 1 );
+	}
 	if ( ids.empty() ) { return false; }
 	float* d_prompt = nullptr;
 	CUDA_CHECK( cudaMalloc( &d_prompt, ids.size() * 5120 * sizeof( float ) ) );
 	{
 		H3TextEncoder enc;
-		if ( !enc.load( ( paths.root + "/text_encoder" ).c_str(), paths.device, 2048, 50 ) || !enc.encode( ids, d_prompt ) ) { return false; }
+		if ( !enc.load( ( paths.root + "/text_encoder" ).c_str(), paths.device, 8192, 50 ) || !enc.encode_mm( ids, image_pad, feats, d_prompt ) ) { return false; }
 	}
 	res.t_text = seconds_since( t0 );
-	LOG_INFO( "H3: prompt %d tokens encoded in %.1f s", static_cast<int>( ids.size() ), res.t_text );
+	LOG_INFO( "H3: prompt %d tokens (%zu image(s)) encoded in %.1f s", static_cast<int>( ids.size() ), feats.size(), res.t_text );
 
 	// ---- layout, noise, schedule ----
-	const H3Layout lay = h3_build_layout( static_cast<int>( ids.size() ), latent_t, lh, lw, audio_t );
+	H3Layout lay = h3_build_layout( static_cast<int>( ids.size() ), latent_t, lh, lw, audio_t, keyframes, frames );
+	for ( size_t i = 0; i < ids.size(); ++i ) { lay.tags[i] = text_tags[i]; }
+	const int n_cond = static_cast<int>( keyframes.size() ) * ( lh / 2 ) * ( lw / 2 );
 	std::mt19937_64 rng( req.seed );
 	std::vector<float> vrows( static_cast<size_t>( lay.n_img ) * 96 ), arows( static_cast<size_t>( lay.n_audio ) * 32 );
 	gaussian( rng, vrows );
 	gaussian( rng, arows );
+	// condition rows are the fixed (noised) anchors; only the target rows are denoised
+	std::copy( cond_rows.begin(), cond_rows.end(), vrows.begin() );
 	float video_shift = req.video_shift;
 	if ( video_shift <= 0.0f ) {
 		video_shift = 12.0f;
@@ -214,18 +316,25 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 		t0 = std::chrono::steady_clock::now();
 		for ( int step = 0; step < req.steps; ++step ) {
 			const double tv = 1.0 - sv[step], ta = 1.0 - sa[step];
-			// text rows inherit the video timestep; unique timesteps ascending
+			// per-row timesteps: text rows inherit the video timestep, condition rows sit at the condition timestep, audio rows at the audio one
+			const double tc = std::max( tv, 0.999 );
+			std::vector<double> row_t( lay.used, tv );
+			for ( int i = 0; i < lay.n_audio; ++i ) { row_t[lay.audio_pos[i]] = ta; }
+			for ( int i = 0; i < n_cond; ++i ) { row_t[lay.img_pos[i]] = tc; }
 			std::vector<float> uniq;
-			uniq.push_back( static_cast<float>( std::min( tv, ta ) ) );
-			if ( std::fabs( tv - ta ) > 1e-7 ) { uniq.push_back( static_cast<float>( std::max( tv, ta ) ) ); }
-			auto index_of = [&]( double t ) { return std::fabs( t - uniq[0] ) < 1e-7 || uniq.size() == 1 ? 0 : 1; };
+			for ( double t : row_t ) {
+				const float f = static_cast<float>( t );
+				if ( std::find( uniq.begin(), uniq.end(), f ) == uniq.end() ) { uniq.push_back( f ); }
+			}
+			std::sort( uniq.begin(), uniq.end() );
 			std::vector<int> inv( lay.used );
-			for ( int i = 0; i < lay.used; ++i ) { inv[i] = lay.tags[i] == 2 ? index_of( ta ) : index_of( tv ); }
+			for ( int i = 0; i < lay.used; ++i ) { inv[i] = static_cast<int>( std::lower_bound( uniq.begin(), uniq.end(), static_cast<float>( row_t[i] ) ) - uniq.begin() ); }
 			CUDA_CHECK( cudaMemcpy( d_inv, inv.data(), inv.size() * sizeof( int ), cudaMemcpyHostToDevice ) );
 			r.unique_t = uniq;
 			dit.forward( r, d_vout, d_aout );
 			const float cv = static_cast<float>( sv[step] - sv[step + 1] ), ca = static_cast<float>( sa[step] - sa[step + 1] );
-			k_euler<<<( vrows.size() + 255 ) / 256, 256>>>( d_vrows, d_vout, cv, vrows.size() );
+			const size_t off = static_cast<size_t>( n_cond ) * 96, cnt = vrows.size() - off;
+			k_euler<<<( cnt + 255 ) / 256, 256>>>( d_vrows + off, d_vout + off, cv, cnt );
 			k_euler<<<( arows.size() + 255 ) / 256, 256>>>( d_arows, d_aout, ca, arows.size() );
 			CUDA_CHECK( cudaDeviceSynchronize() );
 			LOG_INFO( "H3: step %d/%d done (%.1f s elapsed)", step + 1, req.steps, seconds_since( t0 ) );
@@ -239,7 +348,8 @@ bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* re
 	int out_frames = 0;
 	float* d_z = nullptr;
 	CUDA_CHECK( cudaMalloc( &d_z, static_cast<size_t>( 24 ) * latent_t * lh * lw * sizeof( float ) ) );
-	k_unpatchify<<<( vrows.size() + 255 ) / 256, 256>>>( d_vrows, d_z, latent_t, lh / 2, lw / 2 );
+	const size_t target_floats = vrows.size() - static_cast<size_t>( n_cond ) * 96;
+	k_unpatchify<<<( target_floats + 255 ) / 256, 256>>>( d_vrows + static_cast<size_t>( n_cond ) * 96, d_z, latent_t, lh / 2, lw / 2 );
 	CUDA_CHECK( cudaDeviceSynchronize() );
 	{
 		H3VideoVAE vae;

@@ -22,6 +22,9 @@ struct H3Layout {
 // Port of minimax_h3_packed_sequence for T2VA (and FL2VA keyframe condition rows when `keyframes` is non-empty: -1 = last frame, 0 = first)
 H3Layout h3_build_layout( int text_len, int latent_t, int latent_h, int latent_w, int audio_t, const std::vector<int>& keyframes = {}, int frame_count = 0 );
 
+// Output canvas (height, width) of the checkpoint's policy for an aspect ratio: 768 short edge, at most 768 x 1344 pixels, multiples of 32
+void h3_output_canvas( double aspect, int* height, int* width );
+
 // Frame / latent bookkeeping of the checkpoint (17n + 5 frames, 5n + 2 latent frames, 40 Hz audio latents)
 int h3_align_frames( int frames );
 int h3_video_latent_t( int frames );
@@ -46,6 +49,8 @@ struct H3GenRequest {
 	float video_shift = 0.0f;    // <= 0: 6 when a 768p adapter is loaded, else 12
 	float audio_shift = 3.0f;
 	std::vector<H3Lora> loras;
+	std::vector<std::string> images; // FL2VA keyframe images (1 or 2: first / last frame); empty = text-to-video
+	std::vector<int> frame_indices;  // per image: 0 (first) or -1 (last); empty = [0] for one image, [0, -1] for two
 	std::string out;             // .mp4 path
 	bool keep_pcm = false;
 };
