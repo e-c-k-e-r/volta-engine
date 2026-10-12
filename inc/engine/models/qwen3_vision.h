@@ -22,6 +22,7 @@ struct Qwen3VisionConfig {
 	int merge_size = 2;
 	int temporal_patch_size = 2;
 	int num_position_embeddings = 2304;
+	std::vector<int> deepstack_blocks; // blocks after which a DeepStack feature map is taken (vision_config.deepstack_visual_indexes), empty without DeepStack
 	float eps = 1e-6f;
 
 	int head_dim() const { return hidden / heads; }
@@ -32,8 +33,9 @@ struct Qwen3VisionConfig {
 // checkpoint's model.visual.* tensors (trellis-quantized projections, FP16 norms / biases / embeddings).
 class Qwen3VisionTower : public VisionTower {
 public:
-	// False without a vision_config or without the quantized visual tensors (the checkpoint then serves text only).
-	bool load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream );
+	// False without a vision_config or without the quantized visual tensors (the checkpoint then serves text only). allow_dense also accepts an unquantized
+	// checkpoint (BF16 / FP16 `.weight` tensors, the fused `attn.qkv` of the original release): the projections run as FP16 matrices.
+	bool load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream, bool allow_dense = false );
 	bool loaded() const override { return loaded_; }
 	const Qwen3VisionConfig& config() const { return cfg_; }
 	const engine::loader::VisionParams& params() const override { return params_; }
@@ -41,6 +43,8 @@ public:
 
 	// Encodes one prepared image into [tokens, out_hidden] FP16 rows (host). Blocks until done.
 	bool encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, backend::stream_t stream ) override;
+	// With DeepStack: deepstack[i] gets the [tokens, out_hidden] rows of the merger tapped after cfg.deepstack_blocks[i]
+	bool encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, std::vector<std::vector<backend::half_t>>* deepstack, backend::stream_t stream );
 
 	// Host-side tables (exposed for tests)
 	void rotary_tables( int grid_h, int grid_w, std::vector<float>* cos_t, std::vector<float>* sin_t ) const; // [h * w, head_dim]
@@ -53,6 +57,7 @@ private:
 	};
 
 	bool loaded_ = false;
+	bool fused_qkv_ = false; // dense checkpoint with the fused attn.qkv tensor
 	Qwen3VisionConfig cfg_;
 	engine::loader::VisionParams params_;
 	int max_patches_ = 0;
@@ -62,6 +67,8 @@ private:
 	pod::TensorView merge_norm_w_, merge_norm_b_;
 	pod::LinearWeight merge_fc1_, merge_fc2_;
 	pod::TensorView merge_fc1_b_, merge_fc2_b_;
+	struct DeepMerger { pod::TensorView norm_w, norm_b, fc1_b, fc2_b; pod::LinearWeight fc1, fc2; };
+	std::vector<DeepMerger> deep_; // one per DeepStack tap: the norm runs over the merged width
 
 	// Scratch (max_patches rows)
 	backend::half_t* d_patches_ = nullptr;

@@ -29,7 +29,7 @@ T* take( pod::MemoryArena& arena, size_t count ) {
 
 } // namespace
 
-bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream ) {
+bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream, bool allow_dense ) {
 	std::ifstream cf( std::string( model_dir ) + "/config.json" );
 	if ( !cf ) return false;
 	const auto cfg_json = nlohmann::json::parse( std::string( std::istreambuf_iterator<char>( cf ), std::istreambuf_iterator<char>() ), nullptr, false );
@@ -44,10 +44,8 @@ bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int
 	cfg_.merge_size = vc.value( "spatial_merge_size", cfg_.merge_size );
 	cfg_.temporal_patch_size = vc.value( "temporal_patch_size", cfg_.temporal_patch_size );
 	cfg_.num_position_embeddings = vc.value( "num_position_embeddings", cfg_.num_position_embeddings );
-	if ( !vc.value( "deepstack_visual_indexes", nlohmann::json::array() ).empty() ) {
-		LOG_WARN( "[vision] deepstack vision features are not supported\n" );
-		return false;
-	}
+	cfg_.deepstack_blocks.clear();
+	for ( const auto& d : vc.value( "deepstack_visual_indexes", nlohmann::json::array() ) ) { cfg_.deepstack_blocks.push_back( d.get<int>() ); }
 	params_.patch_size = cfg_.patch_size;
 	params_.merge_size = cfg_.merge_size;
 	params_.temporal_patch_size = cfg_.temporal_patch_size;
@@ -55,12 +53,18 @@ bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int
 
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) return false;
-	if ( !repo.find( "model.visual.merger.linear_fc1.trellis" ) || !repo.find( "model.visual.blocks.0.attn.q_proj.trellis" ) ) {
+	const bool trellis = repo.find( "model.visual.merger.linear_fc1.trellis" ) && repo.find( "model.visual.blocks.0.attn.q_proj.trellis" );
+	// an unquantized tower: dense `.weight` tensors, with either separate q / k / v projections or the fused `attn.qkv` of the original release
+	fused_qkv_ = false;
+	const bool dense = !trellis && allow_dense && repo.find( "model.visual.merger.linear_fc1.weight" ) &&
+		( repo.find( "model.visual.blocks.0.attn.q_proj.weight" ) || ( fused_qkv_ = repo.find( "model.visual.blocks.0.attn.qkv.weight" ) != nullptr ) );
+	if ( !trellis && !dense ) {
 		LOG_WARN( "[vision] checkpoint has no quantized vision tower; image input disabled\n" );
 		repo.close();
 		return false;
 	}
-	if ( !vision_fits( arena, vision_weight_bytes( repo, cfg_.depth, cfg_.hidden ) + static_cast<size_t>( max_patches ) * 48 * 1024 + ( 16u << 20 ), "the Qwen vision tower" ) ) {
+	const size_t weight_bytes = dense ? repo.bytes_with_prefix( "model.visual." ) : vision_weight_bytes( repo, cfg_.depth, cfg_.hidden );
+	if ( !vision_fits( arena, weight_bytes + static_cast<size_t>( max_patches ) * 48 * 1024 + ( 16u << 20 ), "the Qwen vision tower" ) ) {
 		repo.close();
 		return false;
 	}
@@ -73,9 +77,22 @@ bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int
 		const auto* meta = repo.find( "model.visual.patch_embed.proj.weight" );
 		const void* raw = repo.cpu_data( "model.visual.patch_embed.proj.weight" );
 		const size_t bytes = static_cast<size_t>( cfg_.hidden ) * cfg_.patch_dim() * sizeof( backend::half_t );
-		ENGINE_ASSERT( meta && raw && meta->dtype == pod::DType::FP16 && meta->size_bytes == bytes, "vision: patch embedding must be FP16 [hidden, 3, T, P, P]" );
+		ENGINE_ASSERT( meta && raw && ( ( meta->dtype == pod::DType::FP16 && meta->size_bytes == bytes ) || ( meta->dtype == pod::DType::BF16 && meta->size_bytes == bytes ) ), "vision: patch embedding must be FP16 or BF16 [hidden, 3, T, P, P]" );
 		void* dev = engine::core::arena_alloc( arena, bytes );
-		backend::memcpy_async( dev, raw, bytes, backend::Copy::H2D, stream );
+		if ( meta->dtype == pod::DType::BF16 ) { // converted on the host (the repo's views stop at 4 dimensions)
+			std::vector<backend::half_t> conv( bytes / sizeof( backend::half_t ) );
+			const uint16_t* src = static_cast<const uint16_t*>( raw );
+			for ( size_t i = 0; i < conv.size(); ++i ) {
+				const uint32_t bits = static_cast<uint32_t>( src[i] ) << 16;
+				float f;
+				std::memcpy( &f, &bits, 4 );
+				conv[i] = backend::from_float_half( f );
+			}
+			backend::memcpy_async( dev, conv.data(), bytes, backend::Copy::H2D, stream );
+			backend::stream_sync( stream ); // the host buffer goes out of scope
+		} else {
+			backend::memcpy_async( dev, raw, bytes, backend::Copy::H2D, stream );
+		}
 		patch_w_ = pod::make_tensor_2d( dev, pod::DType::FP16, cfg_.hidden, cfg_.patch_dim() );
 	}
 	patch_b_ = fp16( "model.visual.patch_embed.proj.bias" );
@@ -106,13 +123,23 @@ bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int
 		b.norm1_b = fp16( p + "norm1.bias" );
 		b.norm2_w = fp16( p + "norm2.weight" );
 		b.norm2_b = fp16( p + "norm2.bias" );
-		b.q = lin( p + "attn.q_proj" );
-		b.k = lin( p + "attn.k_proj" );
-		b.v = lin( p + "attn.v_proj" );
+		if ( fused_qkv_ ) { // the fused [3 hidden, hidden] projection and its bias, cut into thirds
+			pod::LinearWeight* part[3] = { &b.q, &b.k, &b.v };
+			pod::TensorView* bias[3] = { &b.q_b, &b.k_b, &b.v_b };
+			for ( int t = 0; t < 3; ++t ) {
+				pod::TensorView w = repo.load_slice( ( p + "attn.qkv.weight" ).c_str(), arena, 0, t, 3, stream, pod::DType::FP16 );
+				*part[t] = pod::LinearWeight::make_fp16( pod::make_tensor_2d( w.data, pod::DType::FP16, w.shape[1], w.shape[0] ) ); // [n, k] in memory, tagged [k, n]
+				*bias[t] = repo.load_slice( ( p + "attn.qkv.bias" ).c_str(), arena, 0, t, 3, stream, pod::DType::FP16 );
+			}
+		} else {
+			b.q = lin( p + "attn.q_proj" );
+			b.k = lin( p + "attn.k_proj" );
+			b.v = lin( p + "attn.v_proj" );
+			b.q_b = fp16( p + "attn.q_proj.bias" );
+			b.k_b = fp16( p + "attn.k_proj.bias" );
+			b.v_b = fp16( p + "attn.v_proj.bias" );
+		}
 		b.proj = lin( p + "attn.proj" );
-		b.q_b = fp16( p + "attn.q_proj.bias" );
-		b.k_b = fp16( p + "attn.k_proj.bias" );
-		b.v_b = fp16( p + "attn.v_proj.bias" );
 		b.proj_b = fp16( p + "attn.proj.bias" );
 		b.fc1 = lin( p + "mlp.linear_fc1" );
 		b.fc2 = lin( p + "mlp.linear_fc2" );
@@ -125,6 +152,16 @@ bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int
 	merge_fc2_ = lin( "model.visual.merger.linear_fc2" );
 	merge_fc1_b_ = fp16( "model.visual.merger.linear_fc1.bias" );
 	merge_fc2_b_ = fp16( "model.visual.merger.linear_fc2.bias" );
+	deep_.resize( cfg_.deepstack_blocks.size() );
+	for ( size_t i = 0; i < deep_.size(); ++i ) {
+		const std::string p = "model.visual.deepstack_merger_list." + std::to_string( i ) + ".";
+		deep_[i].norm_w = fp16( p + "norm.weight" );
+		deep_[i].norm_b = fp16( p + "norm.bias" );
+		deep_[i].fc1 = lin( p + "linear_fc1" );
+		deep_[i].fc2 = lin( p + "linear_fc2" );
+		deep_[i].fc1_b = fp16( p + "linear_fc1.bias" );
+		deep_[i].fc2_b = fp16( p + "linear_fc2.bias" );
+	}
 	repo.close();
 
 	const size_t M = static_cast<size_t>( max_patches );
@@ -198,7 +235,12 @@ void Qwen3VisionTower::rotary_tables( int gh, int gw, std::vector<float>* cos_t,
 }
 
 bool Qwen3VisionTower::encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, backend::stream_t stream ) {
+	return encode( img, out, nullptr, stream );
+}
+
+bool Qwen3VisionTower::encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, std::vector<std::vector<backend::half_t>>* deepstack, backend::stream_t stream ) {
 	if ( !loaded_ ) return false;
+	if ( deepstack ) deepstack->assign( cfg_.deepstack_blocks.size(), std::vector<backend::half_t>() );
 	const int m = img.num_patches();
 	if ( m < 1 || m > max_patches_ ) {
 		LOG_WARN( "[vision] image has %d patches, limit is %d\n", m, max_patches_ );
@@ -223,7 +265,9 @@ bool Qwen3VisionTower::encode( const engine::loader::PreparedImage& img, std::ve
 	Vision::patch_embed( d_patches_, patch_w_.ptr<const backend::half_t>(), patch_b_.ptr<const backend::half_t>(), d_pos_, d_hidden_, m, H, cfg_.patch_dim(), stream );
 	const float scale = 1.0f / std::sqrt( static_cast<float>( hd ) );
 	auto in_h = [&]( void* p, int rows ) { return view2d( p, rows, H ); };
-	for ( const Block& b : blocks_ ) {
+	const int mrg_tokens = m / mrg, mrg_w = H * mrg;
+	for ( size_t bi = 0; bi < blocks_.size(); ++bi ) {
+		const Block& b = blocks_[bi];
 		Vision::layer_norm( d_hidden_, b.norm1_w.ptr<const backend::half_t>(), b.norm1_b.ptr<const backend::half_t>(), d_ln_, m, H, cfg_.eps, stream );
 		pod::TensorView ln = in_h( d_ln_, m ), qv = in_h( d_q_, m ), kv = in_h( d_k_, m ), vv = in_h( d_v_, m );
 		Linear::forward( ln, b.q, qv, stream );
@@ -242,6 +286,22 @@ bool Qwen3VisionTower::encode( const engine::loader::PreparedImage& img, std::ve
 		Vision::bias_act( d_mlp_, b.fc1_b.ptr<const backend::half_t>(), m, mlp_w, Vision::ACT_GELU_TANH, stream );
 		Linear::forward( mlp, b.fc2, tmp, stream );
 		Vision::bias_residual( d_hidden_, d_tmp_, b.fc2_b.ptr<const backend::half_t>(), m, H, stream );
+		for ( size_t d = 0; d < cfg_.deepstack_blocks.size(); ++d ) {
+			if ( cfg_.deepstack_blocks[d] != static_cast<int>( bi ) ) continue;
+			// DeepStack tap: the merger with its norm over the merged width ("post shuffle")
+			const DeepMerger& g = deep_[d];
+			Vision::layer_norm( d_hidden_, g.norm_w.ptr<const backend::half_t>(), g.norm_b.ptr<const backend::half_t>(), d_merged_, mrg_tokens, mrg_w, cfg_.eps, stream );
+			pod::TensorView dm = view2d( d_merged_, mrg_tokens, mrg_w ), df = view2d( d_merged_fc1_, mrg_tokens, mrg_w ), dout = view2d( d_out_, mrg_tokens, cfg_.out_hidden );
+			Linear::forward( dm, g.fc1, df, stream );
+			Vision::bias_act( d_merged_fc1_, g.fc1_b.ptr<const backend::half_t>(), mrg_tokens, mrg_w, Vision::ACT_GELU_ERF, stream );
+			Linear::forward( df, g.fc2, dout, stream );
+			Vision::bias_act( d_out_, g.fc2_b.ptr<const backend::half_t>(), mrg_tokens, cfg_.out_hidden, Vision::ACT_NONE, stream );
+			if ( deepstack ) {
+				( *deepstack )[d].resize( static_cast<size_t>( mrg_tokens ) * cfg_.out_hidden );
+				backend::memcpy_async( ( *deepstack )[d].data(), d_out_, ( *deepstack )[d].size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+				backend::stream_sync( stream ); // d_out_ is reused by the next tap and the final merger
+			}
+		}
 	}
 	Vision::layer_norm_merge( d_hidden_, merge_norm_w_.ptr<const backend::half_t>(), merge_norm_b_.ptr<const backend::half_t>(), d_merged_, m, H, mrg, cfg_.eps, stream );
 	const int tokens = m / mrg, mw = H * mrg;
