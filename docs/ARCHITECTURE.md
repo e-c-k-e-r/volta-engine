@@ -3,7 +3,8 @@
 Volta Engine is a from-scratch inference engine for tensor-parallel decoding on 4x Tesla V100 (SM70), with CPU and Vulkan
 backends for the portable parts. Models: Qwen3.8-27B (`qwen3_5`: GDN linear attention + full attention, EXL3 trellis or NVFP4
 weights) and GLM-5.3-Flash (`glm5_next`: KDA linear attention + absorbed MLA with a sparse indexer, routed MoE), each with a
-DFlash2 speculative drafter. See [GETTING_STARTED.md](GETTING_STARTED.md) to build and run, [CONFIG.md](CONFIG.md) for options.
+DFlash2 speculative drafter, plus Qwen3.8-Flash-Next (`qwen4_exp`, see [FLASH_NEXT.md](FLASH_NEXT.md)). The same server also runs MiniMax-H3 video + audio generation, which is
+a separate path (`src/video/`, [video.md](video.md)) that does not use the language-model runtime. See [GETTING_STARTED.md](GETTING_STARTED.md) to build and run, [CONFIG.md](CONFIG.md) for options.
 
 ## Layers
 
@@ -19,7 +20,11 @@ kernels     src/kernels/cuda  hand-tuned SM70 kernels (trellis GEMM / GEMV / MoE
 core/loader src/core, src/loader  arena, logger, safetensors, tokenizer, Jinja chat templates, unicode tables
 comm        src/comm          2- or 4-rank NVLink all-reduce (peer pointers, flag polling)
 spec        src/spec          DFlash2 drafter, tap ring
+video       src/video         MiniMax-H3 (CUDA only): staged pipeline, transformer, text tower, VAEs; src/server/video is its job service
 ```
+
+`video` sits beside the language-model stack rather than under it: it has its own components (`H3Components`), its own multi-GPU groups (sequence- or tensor-parallel, the latter over NCCL
+when the build has it) and its own attention kernel (`src/kernels/cuda/h3/`), and borrows the arena, the safetensors loader, the tokenizer, the vision tower and the trellis / NVFP4 linears.
 
 Headers under `inc/engine/` are the contracts between layers. Models, runtime and server never include CUDA headers: they
 use `engine/backend/runtime.h` (streams, memcpy, pinned memory, graphs) and the module API. The backend is chosen at configure
@@ -52,6 +57,6 @@ time (`-DENGINE_BACKEND=CUDA|CPU|VULKAN`); one build tree is one backend.
 
 Each module entry point has a tier in `inc/engine/backend/tier_table.inc` (generated view: [CAPABILITIES.md](CAPABILITIES.md)):
 *Portable* (Slang kernel, usable by every backend), *PortablePending* (plain reference on CPU) and *CudaSm70* (hand-tuned,
-CUDA only). Verification follows AGENTS.md: SASS audit (`gate.sh sass`), parity against FP32 references, bandwidth benches,
+CUDA only). Verification is layered: SASS audit (`gate.sh sass`), parity against FP32 references, bandwidth benches,
 multi-GPU coherence. [TESTS.md](TESTS.md) lists every test; [KERNEL_MAP.md](KERNEL_MAP.md) maps kernels to files and tests.
 Hardware notes: [HARDWARE_SM70.md](HARDWARE_SM70.md).

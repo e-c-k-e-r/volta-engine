@@ -37,6 +37,20 @@ mirrored implementation). Verified by `test_nvfp4_linear`, `test_ops_linear`.
 | `vision.cu` | vision tower operators: patch-embedding GEMM, LayerNorm, qkv bias + 2-D rotary, register-resident mma.m8n8k4 flash attention (head_dim 64 / 72; WMMA fallback up to 80), bias + GELU, position-embedding interpolation | CudaSm70 | `test_vision` |
 | `linear_trellis.cu` | trellis `Linear` dispatch (GEMM / GEMV / recon by M) | CudaSm70 | `test_ops_linear`, `bench_decode` |
 
+## MiniMax-H3: `src/kernels/cuda/h3/`, `src/video/`
+
+| File | Kernels | Tier | Verified by |
+|---|---|---|---|
+| `src/kernels/cuda/h3/h3_attn.cu` | WMMA flash attention for head_dim 128 (full, causal) and 64: register Q / output, double-buffered K / V, online softmax on the accumulators; key-range variants carrying (max, sum, output) | CudaSm70 | `test_h3_attn`, `bench_h3_attn` |
+| `src/video/h3_kernels.cuh` | AdaLN indexed norm / modulation, gated residuals, SiLU-mul with row scale (and its tensor-parallel split into max and apply passes), QK norm + 3-D RoPE, dtype conversion | CudaSm70 | `test_h3_dit`, `test_h3_dit_sp`, `test_h3_dit_tp` |
+| `src/video/h3_dit.cu` | ConvRot INT8 dequantization + un-rotation to FP16 per matrix, then cuBLAS GEMMs; staged LoRA deltas; sequence- and tensor-parallel blocks | CudaSm70 | `test_h3_dit*`, `bench_h3_dit` |
+| `src/video/h3_vae.cu` | video decoder (ViT) tiles, placement / blending, RGB8 conversion | CudaSm70 | `test_h3_vae`, `test_h3_vae_det` |
+| `src/video/h3_vae_enc.cu`, `h3_audio.cu` | causal 3-D conv encoder as FP16 im2col + GEMM; audio conv1d, snake, alias-free resampling | CudaSm70 | `test_h3_vae_enc`, `test_h3_audio`, `test_h3_audio_enc` |
+| `src/video/h3_text.cu` | Qwen3-VL text tower: interleaved mRoPE, causal attention on `h3_attn.cu`, resident EXL3 / NVFP4 projections through `Linear::forward`, tensor-parallel shards | CudaSm70 | `test_h3_text`, `test_h3_text_mm`, `test_h3_text_tp` |
+| `src/video/h3_vision.cu` | adapter around `Qwen3VisionTower` (dense BF16 tower, fused qkv, DeepStack taps) | n/a | `test_h3_vision` |
+
+The H3 tests need the checkpoints and the goldens in `~/Documents/h3` (`tests/tools/h3_*.py`); see [video.md](video.md).
+
 ## Portable Slang kernels: `src/kernels/slang/`
 
 `*.slang` compile to CUDA (launchers in `slang/cuda`), SPIR-V and host C++. Reference kernels (`ref_gemm`, `ref_trellis`,

@@ -1,6 +1,6 @@
 # Test inventory
 
-`tests/tools/gate.sh fast` runs the first group, `models` the second (`parity` runs both). Tier numbers follow AGENTS.md.
+`tests/tools/gate.sh fast` runs the first group, `models` the second (`parity` runs both). The tier column orders the checks from structural (1) through parity against references (2) to end-to-end behavior (4).
 
 ## Fast: no checkpoint needed
 
@@ -33,6 +33,20 @@
 | `test_longctx` | 4 | yes | needle retrieval at long context (run by hand) |
 | `tests/4_server/test_api.sh` | 4 | yes | OpenAI and Anthropic APIs, tool calls, reasoning, prefix cache, image input (`VOLTA_TEST_MODEL=glm5_next` for GLM, `VOLTA_TEST_SPEC=mtp` for the MTP head) |
 | `tests/4_server/test_server.sh` | 4 | yes | server integration, concurrency throughput gate |
+
+## MiniMax-H3: checkpoints and goldens
+
+Not part of `gate.sh`: these need the H3 checkpoints and the goldens that `tests/tools/h3_*.py` write to `~/Documents/h3`, and several need four GPUs. Each prints a cosine or PSNR and `ok` / `FAIL`;
+the expected values are listed in [video.md](video.md#tests).
+
+| Test | GPU | Checks |
+|---|---|---|
+| `test_h3_dit`, `test_h3_dit_sp`, `test_h3_dit_tp` | 1 / 1-4 | the transformer forward against the golden: one GPU, sequence-parallel, tensor-parallel (with and without the turbo adapter) |
+| `test_h3_attn` | 1 | the attention kernel against a CPU softmax (full, causal, key ranges, head_dim 64 / 128, odd tails) |
+| `test_h3_vae`, `test_h3_vae_det`, `test_h3_vae_enc`, `test_h3_audio`, `test_h3_audio_enc` | 1 | VAE decoder, run-to-run determinism, the encoders, the audio decoder |
+| `test_h3_text`, `test_h3_text_mm`, `test_h3_text_tp`, `test_h3_vision` | 1 / 1-4 | the text tower (BF16, EXL3, NVFP4) and the vision tower against the BF16 reference |
+| `test_h3_layout`, `test_h3_ref_layout`, `test_h3_image` | no | packed layouts, resize, keyframe rows |
+| `test_h3_text_identity`, `test_h3_text_layers` | 1 | diagnostics: are two text checkpoints the same model, and where do two quantizations of it drift apart |
 
 CPU and Vulkan forwards (`test_cpu_forward`, `test_vulkan_forward`) compare a whole prompt (`--steps N`: and N greedy decode steps) against
 CUDA goldens; they run by hand (slow on CPU). `--model <dir> --type <model_type>` selects the checkpoint; a checkpoint that does not fit one
