@@ -95,7 +95,6 @@ struct ExpandParams { uint64_t o_lat, kv_b, out_; int heads; };
 struct LatentStoreParams { uint64_t c, cache, slots, pos; int64_t slot_stride; int layer, max_seq; };
 struct LatentAttnParams { uint64_t q_lat, cache, out_, slots, pos, sel_idx, sel_n; int64_t slot_stride; int layer, heads, max_seq, idx_stride, has_sel; float scale; };
 struct DiagParams { uint64_t q_row, cache, scores; int n, heads; float scale; };
-struct KvBParams { uint64_t x, w, k_out, v_out; int num_heads, head_dim; };
 struct DsaScoreParams { uint64_t q, w, pool_plane, scores, slots, pos; int score_stride, layer, max_seq; int64_t pool_slot_stride; float norm; };
 struct KdaSmallParams { uint64_t x, b_proj, f_a_proj, g_a_proj, beta, f_a_buf, g_a_buf; int hidden, has_b, has_fa, has_ga; };
 struct KdaBigParams { uint64_t f_a_buf, g_a_buf, f_b_proj, g_b_proj, A_log, dt_bias, g_decay, z_out; int channels, has_fb, has_gb, has_a, has_dt; };

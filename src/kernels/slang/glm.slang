@@ -165,24 +165,6 @@ void latent_diag_scores(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, un
 	p.scores[int64_t(h) * p.n + t] = acc * p.scale;
 }
 
-struct KvBParams { half* x; half* w; half* k_out; half* v_out; int num_heads; int head_dim; };
-
-// Expanded-cache path: rows of kv_b alternate K block / V block per head. Thread (row of kv_b, m)
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void mla_project_kv_b(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform KvBParams p) {
-	let row = int(gid.x) * 64 + int(tid.x);
-	let m = int(gid.y);
-	if (row >= p.num_heads * p.head_dim * 2) return;
-	float sum = 0.0f;
-	for (int i = 0; i < 512; ++i) sum += float(p.w[int64_t(row) * 512 + i]) * float(p.x[int64_t(m) * 512 + i]);
-	let h = row / (p.head_dim * 2);
-	let rem = row % (p.head_dim * 2);
-	let stride = p.num_heads * p.head_dim;
-	if (rem < p.head_dim) p.k_out[int64_t(m) * stride + h * p.head_dim + rem] = half(sum);
-	else p.v_out[int64_t(m) * stride + h * p.head_dim + rem - p.head_dim] = half(sum);
-}
-
 // ---------------------------------------------------------------- DSA indexer scoring
 
 struct DsaScoreParams { half* q; half* w; half* pool_plane; half* scores; int* slots; int* pos; int score_stride; int layer; int max_seq; int64_t pool_slot_stride; float norm; };

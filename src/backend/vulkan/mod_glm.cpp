@@ -56,29 +56,6 @@ void MLALatent::diag_scores( const backend::half_t* q_lat_row, const backend::ha
 	vki::launch( "latent_diag_scores", p, stream, tiles( n, 64 ), heads );
 }
 
-// ---------------------------------------------------------------- expanded-cache MLA
-
-void MLA::project_kv_b( const pod::TensorView& kv_norm, const pod::TensorView& kv_b_proj, pod::TensorView& k_out, pod::TensorView& v_out, int num_heads, int head_dim, backend::stream_t stream, int rows ) {
-	vki::KvBParams p{ vki::dp( kv_norm.data ), vki::dp( kv_b_proj.data ), vki::dp( k_out.data ), vki::dp( v_out.data ), num_heads, head_dim };
-	vki::launch( "mla_project_kv_b", p, stream, tiles( num_heads * head_dim * 2, 64 ), rows );
-}
-
-void MLA::store_kv_cache( const pod::KVRef& kv, const pod::TensorView& k, const pod::TensorView& v, int mla_layer_idx, int, int total_elems, int max_seq, backend::stream_t stream,
-	const pod::SlotRef& slot, int rows ) {
-	if ( !slot.rows ) ENGINE_UNSUPPORTED( "MLA::store_kv_cache (host-resolved position)" );
-	ENGINE_ASSERT( slot.row == 0, "MLA::store_kv_cache: row offset unsupported" );
-	Attention::store_kv_cache( kv, k, v, slot.stride, mla_layer_idx, slot.rows, rows, total_elems / 256, 256, max_seq, stream );
-}
-
-void MLA::forward_decode( const pod::TensorView& q, const pod::KVRef& kv, pod::TensorView& out, int mla_layer_idx, int, int num_heads, int head_dim, int max_seq, backend::stream_t stream,
-	const pod::SlotRef& slot, int rows, int key_hint ) {
-	if ( !slot.rows ) ENGINE_UNSUPPORTED( "MLA::forward_decode (host-resolved position)" );
-	ENGINE_ASSERT( slot.row == 0, "MLA::forward_decode: row offset unsupported" );
-	pod::TensorView no_gate{};
-	Attention::forward_decode( kv, q, no_gate, out, slot.stride, mla_layer_idx, slot.rows, rows, num_heads, num_heads, head_dim, max_seq, stream );
-	( void )key_hint;
-}
-
 // ---------------------------------------------------------------- DSA
 
 void DSA::project_small( const backend::half_t* w, const backend::half_t* x, backend::half_t* proj, int rows, int n, int k, backend::stream_t stream ) {

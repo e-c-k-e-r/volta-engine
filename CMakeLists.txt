@@ -97,7 +97,6 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/rope.cu
 	src/backend/cuda/modules/attention.cu
 	src/backend/cuda/modules/gdn.cu
-	src/backend/cuda/modules/mla.cu
 	src/backend/cuda/modules/mla_latent.cu
 	src/backend/cuda/modules/dsa.cu
 	src/backend/cuda/modules/moe.cu
@@ -293,9 +292,6 @@ target_link_libraries(test_attention PRIVATE engine_kernels)
 set_target_properties(test_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Test MLA Module Parity
-add_executable(test_mla tests/2_parity/test_mla.cpp)
-target_link_libraries(test_mla PRIVATE engine_kernels)
-set_target_properties(test_mla PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Test GDN Linear Attention Parity
 add_executable(test_gdn tests/2_parity/test_gdn.cpp)

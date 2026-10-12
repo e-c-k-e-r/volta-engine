@@ -1,7 +1,6 @@
 // CPU backend: MLA entry points the GLM model calls. Dense latent attention runs the portable reference kernel (ref_latent.slang, host
-// target, bound weakly like the attention one); DSA-selected rows, the latent absorb / expand products, the latent store, the
-// kv_b projection and the score diagnostic are plain C++ (FP32 accumulate, FP16 storage). The expanded-cache MLA entry points map
-// onto the Attention ones (every head is its own KV head). The old MLADSA pair stays a stub (the model no longer calls it).
+// target, bound weakly like the attention one); DSA-selected rows, the latent absorb / expand products, the latent store and
+// the score diagnostic are plain C++ (FP32 accumulate, FP16 storage).
 // cpu_kernels.h first: the Slang prelude defines int4, which the backend shim only declares when the prelude is absent
 #include "cpu_kernels.h"
 #include "engine/modules/mla.h"
@@ -147,42 +146,6 @@ void MLALatent::diag_scores( const backend::half_t* q_lat_row, const backend::ha
 			scores[static_cast<size_t>( h ) * n + t] = acc * scale;
 		}
 	}
-}
-
-// Expanded-cache path: kv_norm [rows, 512] x kv_b [heads * 2 * head_dim, 512]^T, rows alternate K block / V block per head
-void MLA::project_kv_b( const pod::TensorView& kv_norm, const pod::TensorView& kv_b_proj, pod::TensorView& k_out, pod::TensorView& v_out, int num_heads, int head_dim, backend::stream_t, int rows ) {
-	const h16* w = kv_b_proj.ptr<const h16>();
-	const h16* x = kv_norm.ptr<const h16>();
-	const int out_stride = num_heads * head_dim;
-	for ( int m = 0; m < rows; ++m ) {
-		for ( int row = 0; row < num_heads * head_dim * 2; ++row ) {
-			float sum = 0.0f;
-			for ( int i = 0; i < 512; ++i ) sum += static_cast<float>( w[static_cast<size_t>( row ) * 512 + i] ) * static_cast<float>( x[static_cast<size_t>( m ) * 512 + i] );
-			const int h = row / ( head_dim * 2 ), rem = row % ( head_dim * 2 );
-			if ( rem < head_dim ) k_out.ptr<h16>()[static_cast<size_t>( m ) * out_stride + h * head_dim + rem] = static_cast<h16>( sum );
-			else v_out.ptr<h16>()[static_cast<size_t>( m ) * out_stride + h * head_dim + rem - head_dim] = static_cast<h16>( sum );
-		}
-	}
-}
-
-void MLA::store_kv_cache( const pod::KVRef& kv, const pod::TensorView& k, const pod::TensorView& v, int mla_layer_idx, int, int total_elems, int max_seq, backend::stream_t stream,
-	const pod::SlotRef& slot, int rows ) {
-	if ( !slot.rows ) {
-		ENGINE_UNSUPPORTED( "MLA::store_kv_cache (host-resolved position)" );
-	}
-	ENGINE_ASSERT( slot.row == 0, "MLA::store_kv_cache: row offset unsupported" );
-	Attention::store_kv_cache( kv, k, v, slot.stride, mla_layer_idx, slot.rows, rows, total_elems / 256, 256, max_seq, stream );
-}
-
-void MLA::forward_decode( const pod::TensorView& q, const pod::KVRef& kv, pod::TensorView& out, int mla_layer_idx, int, int num_heads, int head_dim, int max_seq, backend::stream_t stream,
-	const pod::SlotRef& slot, int rows, int key_hint ) {
-	if ( !slot.rows ) {
-		ENGINE_UNSUPPORTED( "MLA::forward_decode (host-resolved position)" );
-	}
-	ENGINE_ASSERT( slot.row == 0, "MLA::forward_decode: row offset unsupported" );
-	pod::TensorView no_gate{};
-	Attention::forward_decode( kv, q, no_gate, out, slot.stride, mla_layer_idx, slot.rows, rows, num_heads, num_heads, head_dim, max_seq, stream );
-	( void )key_hint;
 }
 
 } // namespace engine::modules

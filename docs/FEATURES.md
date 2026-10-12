@@ -40,7 +40,7 @@ The model type is read from the checkpoint, never configured. Anything else is a
 |---|---|---|---|
 | FP16 KV cache | default | | `test_attention`, `test_attention_prefill` |
 | FP8 / int8 (`k8v4`) / NVFP4 KV | opt-in | `kv_format` | `test_kv_quant`, `test_mla_latent` |
-| Tensor-core attention for prefill, decode and verify rows (Qwen); tensor-core latent attention (GLM) | default | | `test_attention*`, `test_mla`, `bench_decode` |
+| Tensor-core attention for prefill, decode and verify rows (Qwen); tensor-core latent attention (GLM) | default | | `test_attention*`, `test_mla_latent`, `bench_decode` |
 | GLM absorbed MLA latent cache (512 halves per token and layer) | default | | `test_mla_latent` |
 | GLM DSA indexer with k-pool compression (top 2048 keys + raw tail, tensor-core scorer) | default | `dsa` | `test_dsa` |
 | Flash-Next QSA block selection past 2048 tokens of context | default | `qsa_off` (debug, dense) | `test_sparse_attn`, `test_ops_flash` |

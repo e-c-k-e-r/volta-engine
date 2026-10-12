@@ -7,7 +7,7 @@
 | Test | Tier | GPU | Checks |
 |---|---|---|---|
 | `test_trellis`, `test_gemv_int8` | 2 | yes | trellis and int8 GEMV kernels against FP32 references |
-| `test_mhc`, `test_attention`, `test_attention_prefill`, `test_mla`, `test_dsa`, `test_gdn`, `test_norm`, `test_rope`, `test_kv_quant`, `test_prefill_linear` | 2 | yes | module operations against CPU references |
+| `test_mhc`, `test_attention`, `test_attention_prefill`, `test_dsa`, `test_gdn`, `test_norm`, `test_rope`, `test_kv_quant`, `test_prefill_linear` | 2 | yes | module operations against CPU references |
 | `test_all_reduce` | 2 | yes (4) | NVLink all-reduce |
 | `test_sampling` | 2 | no | top-k / top-p sampler |
 | `test_slang_cpu`, `test_slang_kernels` | 2 | partly | Slang kernels on CPU and as generated CUDA |
