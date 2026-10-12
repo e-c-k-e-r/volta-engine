@@ -1,3 +1,4 @@
+#include "engine/core/utf8.h"
 #include "engine/runtime/generator.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
@@ -215,6 +216,14 @@ bool Generator::emit_token( int s, int tok ) {
 	else {
 		out = std::move( slot.held_text );
 		slot.held_text.clear();
+	}
+	if ( !finish ) {
+		// A token can end inside a multi-byte character: send up to the boundary and keep the rest for the next token
+		const size_t cut = engine::core::utf8_incomplete_tail( out );
+		if ( cut > 0 ) {
+			slot.held_text.insert( 0, out, out.size() - cut, cut );
+			out.erase( out.size() - cut );
+		}
 	}
 	if ( finish ) {
 		out += slot.held_text;

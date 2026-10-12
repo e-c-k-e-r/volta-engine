@@ -1,6 +1,8 @@
 // Tier 2: OutputParser splits model output into reasoning, content and tool calls identically for any chunking, and
 // recovers what the checkpoint chat templates render for assistant turns (template -> text -> parser round trip).
 #include "engine/server/output_parser.h"
+#include "engine/server/json_safe.h"
+#include "engine/core/utf8.h"
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -132,6 +134,16 @@ int main() {
 		}
 	}
 	CHECK( round_trips >= 4, "only %d template round trips ran", round_trips );
+	// Streaming safety: a character split across tokens is held back, and JSON of invalid UTF-8 is replaced instead of aborting the process
+	{
+		const std::string han = "\xE4\xBD\xA0";   // U+4F60
+		CHECK( engine::core::utf8_incomplete_tail( "ab" ) == 0 && engine::core::utf8_incomplete_tail( "ab" + han ) == 0, "utf8 tail: complete text" );
+		CHECK( engine::core::utf8_incomplete_tail( "ab" + han.substr( 0, 1 ) ) == 1 && engine::core::utf8_incomplete_tail( "ab" + han.substr( 0, 2 ) ) == 2, "utf8 tail: split character" );
+		CHECK( engine::core::utf8_incomplete_tail( "\xF0\x9F\x98" ) == 3 && engine::core::utf8_incomplete_tail( "\xF0\x9F\x98\x80" ) == 0, "utf8 tail: four-byte character" );
+		nlohmann::ordered_json j = { { "text", "ok " + han.substr( 0, 2 ) } };
+		const std::string d = engine::server::dump_safe( j );
+		CHECK( d.find( "ok " ) != std::string::npos && d.find( "\xEF\xBF\xBD" ) != std::string::npos, "dump_safe replaces invalid UTF-8: %s", d.c_str() );
+	}
 	std::printf( "%d round trips, %d failed checks\n", round_trips, g_failed );
 	return g_failed ? 1 : 0;
 }

@@ -2,7 +2,7 @@
 #include "engine/loader/image.h"
 
 #define JSON_NOEXCEPTION 1
-#include <nlohmann/json.hpp>
+#include "engine/server/json_safe.h"
 
 namespace engine::server {
 
@@ -243,14 +243,14 @@ public:
 		json msg = { { "id", message_id_ }, { "type", "message" }, { "role", "assistant" }, { "model", model_ }, { "content", blocks_.empty() ? json::array() : blocks_ },
 			{ "stop_reason", stop }, { "stop_sequence", stop_seq },
 			{ "usage", { { "input_tokens", usage.prompt_tokens - usage.cached_tokens }, { "cache_read_input_tokens", usage.cached_tokens }, { "output_tokens", usage.completion_tokens } } } };
-		send_json( conn_, 200, msg.dump() );
+		send_json( conn_, 200, dump_safe( msg ) );
 	}
 
 private:
 	enum class Kind { None, Thinking, Text, Tool };
 
 	bool event( const char* name, const json& data ) {
-		return conn_->write_all( std::string( "event: " ) + name + "\ndata: " + data.dump() + "\n\n" );
+		return conn_->write_all( std::string( "event: " ) + name + "\ndata: " + dump_safe( data ) + "\n\n" );
 	}
 
 	bool ensure_started() {

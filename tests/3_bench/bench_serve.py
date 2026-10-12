@@ -18,6 +18,7 @@ import argparse, json, statistics, subprocess, sys, threading, time, urllib.requ
 
 SENTENCE = ("This fixed benchmark prompt is used to create a deterministic tokenized input "
             "for single-request decode measurement. ")
+COPY_TASK = "\n\nRepeat the text above word for word, over and over, until you are stopped. No commentary."
 FILLER_HEAD = "Context document. The following repeated reference text contains no instructions. Use the question at the end.\n"
 QUESTIONS = [
 	"一辆车先以每小时60公里行驶2小时，再以每小时80公里行驶1.5小时。总路程和全程平均速度分别是多少？说明计算过程。",
@@ -72,7 +73,9 @@ def cases(counter, names):
 	for name in names:
 		if name.startswith("fixed"):
 			target = int(name[5:].rstrip("kK")) * (1024 if name.lower().endswith("k") else 1)
-			text, t = counter.fit(lambda n: tile(n), target)
+			# 1Cat's fixed fixture is raw token ids the model keeps repeating; the chat API has no raw prompt, so the tiled text is followed by a copy
+			# instruction: the answer is the same repetition, and it runs to the token limit (without the instruction the model answers in a few tokens)
+			text, t = counter.fit(lambda n: tile(n) + COPY_TASK, target)
 			out.append((name, [{"role": "user", "content": text}], t))
 		elif name == "natural8k":
 			for i, q in enumerate(QUESTIONS):
@@ -167,6 +170,8 @@ def run_case(base, model, name, messages, tokens, sampling, max_tokens, thinking
 		rows.append({
 			"decode_tok_s": statistics.mean(r["decode_tok_s"] for r in res),
 			"aggregate_tok_s": sum(r["decode_tok_s"] for r in res),
+			"gen_tokens": statistics.mean(r["completion_tokens"] for r in res),
+			"short": any(r["completion_tokens"] < max_tokens // 2 for r in res),
 			"ttft_s": statistics.mean(r["ttft_s"] or 0 for r in res),
 			"prompt_tokens": res[0]["prompt_tokens"], "completion_tokens": res[0]["completion_tokens"],
 			"rounds": rounds, "tokens_per_round": (toks / rounds) if rounds else None,
@@ -180,14 +185,16 @@ def report(results, meta):
 	for g in meta["gpus"]:
 		print("  gpu", g)
 	print(f"  peak draw per GPU (W): {meta.get('peak_w')}\n")
-	print("| case | prompt tok | TTFT s | decode tok/s | aggregate | tok/round | accept | runs |")
-	print("|---|---:|---:|---:|---:|---:|---:|---:|")
+	print("| case | prompt tok | gen tok | TTFT s | decode tok/s | aggregate | tok/round | accept | runs |")
+	print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
 	for r in results:
 		R = r["runs"]
+		short = sum(1 for x in R if x["short"])
+		R = [x for x in R if not x["short"]] or R   # a generation that ended early says nothing about the decode rate: leave it out
 		m = lambda k: statistics.mean(x[k] for x in R if x[k] is not None) if any(x[k] is not None for x in R) else None
 		f = lambda v, p=1: "-" if v is None else f"{v:.{p}f}"
 		sd = statistics.pstdev([x["decode_tok_s"] for x in R]) if len(R) > 1 else 0
-		print(f"| {r['case']} | {R[0]['prompt_tokens']} | {f(m('ttft_s'), 2)} | {f(m('decode_tok_s'))} ±{sd:.1f} | {f(m('aggregate_tok_s'))} | {f(m('tokens_per_round'), 2)} | {f(m('accept_rate'), 2)} | {len(R)} |")
+		print(f"| {r['case']} | {R[0]['prompt_tokens']} | {f(m('gen_tokens'), 0)} | {f(m('ttft_s'), 2)} | {f(m('decode_tok_s'))} ±{sd:.1f} | {f(m('aggregate_tok_s'))} | {f(m('tokens_per_round'), 2)} | {f(m('accept_rate'), 2)} | {len(R)}{f' (+{short} short)' if short else ''} |")
 
 
 def selftest():

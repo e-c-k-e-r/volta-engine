@@ -2,7 +2,7 @@
 #include "engine/loader/image.h"
 
 #define JSON_NOEXCEPTION 1
-#include <nlohmann/json.hpp>
+#include "engine/server/json_safe.h"
 
 #include <ctime>
 
@@ -180,7 +180,7 @@ public:
 		}
 		json resp = { { "id", completion_id_ }, { "object", "chat.completion" }, { "created", created_ }, { "model", model_ },
 			{ "choices", json::array( { { { "index", 0 }, { "message", msg }, { "finish_reason", finish } } } ) }, { "usage", usage_json( usage ) } };
-		send_json( conn_, 200, resp.dump() );
+		send_json( conn_, 200, dump_safe( resp ) );
 	}
 
 private:
@@ -193,7 +193,7 @@ private:
 			{ "ttft_ms", u.ttft_ms }, { "decode_tok_s", u.decode_tok_s } };
 	}
 
-	bool sse( const json& j ) { return conn_->write_all( "data: " + j.dump() + "\n\n" ); }
+	bool sse( const json& j ) { return conn_->write_all( "data: " + dump_safe( j ) + "\n\n" ); }
 
 	bool ensure_started() {
 		if ( started_ ) return true;

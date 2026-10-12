@@ -9,6 +9,10 @@
 #   qwen_dflash_bf  the same with the BF16 drafter (as theirs)
 #   qwen_nvfp4      Qwen3.8-27B QUASAR NVFP4 + BF16 DFlash2 drafter (their checkpoint pair)
 #   qwen_plain      Qwen3.8-27B EXL3, no speculation (the sampled-step cost without acceptance effects)
+#   glm_plain       GLM-5.3-Flash EXL3 3.05 bpw, NVFP4 dense groups (calibrated), no speculation, 12K window
+#   glm_dflash      the same with the EXL3 DFlash2 drafter
+#   glm_dflash_fp16 the same with the FP16 DFlash2 drafter
+#   glm_256k        GLM at 256K, 2 slots: fp8 latent cache, 85% of the experts resident, drafter (docs/GETTING_STARTED.md)
 #   qwen_mtp        Qwen3.8-27B EXL3 + its own MTP head
 #   flash_mtp7      Flash-Next EXL3 4.0 bpw + NVFP4 experts / dense groups, MTP depth 7 (default)
 #   flash_mtp4      the same at MTP depth 4 (their contract: 5-row verify)
@@ -18,7 +22,7 @@ set -u
 ARM=${1:?arm}; shift
 M=${MODELS:-$HOME/Documents/models}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-PORT=${PORT:-8300}
+PORT=${PORT:-$((8300 + RANDOM % 600))}   # a fresh port per run: the previous arm's server may still be shutting down on the last one
 TAG=$(date +%Y%m%d_%H%M%S)
 CAP=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits | head -1 | cut -d. -f1)
 LOG=$ROOT/results/serve_${ARM}_cap${CAP}_$TAG
@@ -34,6 +38,16 @@ case $ARM in
 		args=(--model-dir $M/Swift-Qwen3.8-Flash-Next-exl3-4.00bpw --speculative --set speculator=mtp --set mtp_depth=$depth)
 		[ $ARM != flash_exl3 ] && args+=(--set nvfp4_experts=$M/Qwen3.8-Flash-Next-NVFP4 --set nvfp4_dense_dir=$M/Qwen3.8-Flash-Next-NVFP4-dense
 			--set nvfp4_dense=gdn,attn,idx,head,shared_gate,shared_up) ;;
+	glm_plain|glm_dflash|glm_dflash_fp16|glm_256k)
+		common=(--tp-size 4 --port $PORT --host 127.0.0.1 --set prefix_cache_gib=0 --set max_seq=12288 --set max_slots=1)
+		args=(--model-dir $M/GLM-5.3-Flash-exl3-3.05bpw --set nvfp4_dense_src=$M/GLM-5.3-Flash-NVFP4 --set nvfp4_dense_dir=$M/GLM-5.3-Flash-NVFP4-dense
+			--set nvfp4_dense=kda,mla,idx,head,dense,shared --set max_image_tokens=0)
+		case $ARM in
+			glm_dflash) args+=(--speculative --draft-model-dir $M/GLM-5.3-Flash-DFlash2-exl3-calibrated-v2) ;;
+			glm_dflash_fp16) args+=(--speculative --draft-model-dir $M/GLM-5.3-Flash-DFlash2) ;;
+			glm_256k) args+=(--speculative --draft-model-dir $M/GLM-5.3-Flash-DFlash2-exl3-calibrated-v2 --set expert_cache=0.85 --set kv_format=fp8)
+				common=(--tp-size 4 --port $PORT --host 127.0.0.1 --set prefix_cache_gib=0 --set max_seq=262144 --set max_slots=2) ;;
+		esac ;;
 	*) echo "unknown arm $ARM"; exit 2 ;;
 esac
 mkdir -p "$ROOT/results"
@@ -43,8 +57,8 @@ setsid nohup taskset -c 0-9 build/volta_server "${args[@]}" "${common[@]}" > "$L
 SP=$!
 trap 'kill $SP 2>/dev/null; wait $SP 2>/dev/null' EXIT
 for i in $(seq 1 240); do
-	curl -s -m 2 http://127.0.0.1:$PORT/health >/dev/null && break
 	kill -0 $SP 2>/dev/null || { echo "server exited; see $LOG.server.log"; exit 1; }
+	curl -s -m 2 http://127.0.0.1:$PORT/health >/dev/null && break
 	sleep 5
 done
 python3 tests/3_bench/bench_serve.py --url http://127.0.0.1:$PORT --out "$LOG.json" "$@" | tee "$LOG.txt"
