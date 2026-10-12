@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 #include <fstream>
 #include <sstream>
 
@@ -97,8 +98,22 @@ pod::TensorView load_router_transposed( engine::loader::SafeTensorsRepo& repo, c
 	const auto* meta = repo.find( name, &shard_idx );
 	if ( !meta || shard_idx < 0 ) return pod::TensorView{};
 	const int E = meta->shape[0], H = meta->shape[1];
-	const auto* src = static_cast<const backend::half_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta ) );
-	if ( !src ) return pod::TensorView{};
+	const void* raw = engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta );
+	if ( !raw || ( meta->dtype != pod::DType::FP16 && meta->dtype != pod::DType::BF16 ) ) return pod::TensorView{};
+	// FP16 as stored, or BF16 (the NVFP4 checkpoint) converted: a BF16 gate read as FP16 routes every token to the wrong experts
+	std::vector<backend::half_t> conv;
+	const backend::half_t* src = static_cast<const backend::half_t*>( raw );
+	if ( meta->dtype == pod::DType::BF16 ) {
+		conv.resize( static_cast<size_t>( E ) * H );
+		const uint16_t* bf = static_cast<const uint16_t*>( raw );
+		for ( size_t i = 0; i < conv.size(); ++i ) {
+			const uint32_t u = static_cast<uint32_t>( bf[i] ) << 16;
+			float f;
+			std::memcpy( &f, &u, 4 );
+			conv[i] = backend::from_float_half( f );
+		}
+		src = conv.data();
+	}
 	int shape[2] = { H, E };
 	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
 	if ( tv.data != nullptr ) {
@@ -471,7 +486,16 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		std::snprintf( nm, sizeof( nm ), "%s.conv1d.weight", pre ); ple_.conv_w = dense( nm );
 		static std::once_flag once;
 		static bool table_ok = true;
-		std::call_once( once, [&]() { table_ok = ngram_table().open( std::string( model_dir ) + "/ngram_embedding.safetensors" ); } );
+		std::call_once( once, [&]() {
+			// The conversion's own file (trellis rows), or, for the normal NVFP4 checkpoint used as the model directory, its FP8 rows
+			const std::string file = std::string( model_dir ) + "/ngram_embedding.safetensors";
+			if ( ::access( file.c_str(), R_OK ) == 0 ) table_ok = ngram_table().open( file );
+			else {
+				// The rows stay mapped for the life of the process, like the trellis file: a repo of their own that is never closed
+				static engine::loader::SafeTensorsRepo table_repo;
+				table_ok = table_repo.open( model_dir ) && ngram_table().open_fp8( table_repo, std::string( P ) + ".layers." + std::to_string( config_.ple_layer ) + ".ple.ple_embedding" );
+			}
+		} );
 		if ( !table_ok ) { LOG_ERROR( "[RANK %d] the n-gram table failed to open\n", rank_ ); ++missing; }
 	}
 	// One decoder block (a trunk layer or the MTP head's): gated residual sites, attention or GDN, MoE

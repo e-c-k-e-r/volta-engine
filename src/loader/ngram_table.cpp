@@ -1,7 +1,9 @@
 #include "engine/loader/ngram_table.h"
+#include "engine/loader/safetensors.h"
 #include "engine/core/log.h"
 #include "engine/backend/numeric.h"
 #include <nlohmann/json.hpp>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -14,6 +16,20 @@ namespace engine::loader {
 namespace {
 
 constexpr uint32_t MUL1 = 0x83DCD12Du;
+
+float bf16_bits_to_float( uint16_t bits ) {
+	const uint32_t u = static_cast<uint32_t>( bits ) << 16;
+	float f;
+	std::memcpy( &f, &u, 4 );
+	return f;
+}
+
+// E4M3 (bias 7, no infinity) byte -> float
+float e4m3_byte_to_float( uint8_t b ) {
+	const int e = ( b >> 3 ) & 15, m = b & 7;
+	const float v = e == 0 ? std::ldexp( m / 8.0f, -6 ) : std::ldexp( 1.0f + m / 8.0f, e - 7 );
+	return ( b & 0x80 ) ? -v : v;
+}
 
 float half_bits_to_float( uint16_t bits ) {
 	backend::half_t h;
@@ -101,6 +117,43 @@ bool NgramTable::open( const std::string& path ) {
 	return true;
 }
 
+bool NgramTable::open_fp8( const SafeTensorsRepo& repo, const std::string& prefix ) {
+	auto aux = [&]( const char* suffix, std::vector<int64_t>& out ) {
+		const std::string name = prefix + suffix;
+		const auto* m = repo.find( name.c_str() );
+		const void* p = repo.cpu_data( name.c_str() );
+		if ( !m || !p || m->ndim != 1 ) return false;
+		out.assign( static_cast<const int64_t*>( p ), static_cast<const int64_t*>( p ) + m->shape[0] );
+		return true;
+	};
+	if ( !aux( ".ngram_heads_offsets", head_offsets_ ) || !aux( ".ngram_heads_vocab_sizes", head_sizes_ ) || !aux( ".layer_multipliers", multipliers_ ) ) {
+		LOG_ERROR( "NgramTable: hash parameters not found under %s\n", prefix.c_str() );
+		return false;
+	}
+	num_heads_ = static_cast<int>( head_offsets_.size() );
+	ngram_size_ = static_cast<int>( multipliers_.size() );
+	heads_per_ngram_ = num_heads_ / ( ngram_size_ - 1 );
+	head_bias_.assign( static_cast<size_t>( num_heads_ ) * ROW_DIM, 0.0f );
+	const std::string sc = prefix + ".ngram_embedding.weight_scale";
+	if ( const void* s = repo.cpu_data( sc.c_str() ) ) fp8_scale_ = bf16_bits_to_float( *static_cast<const uint16_t*>( s ) );
+	for ( int s = 0;; ++s ) {
+		char suffix[64];
+		std::snprintf( suffix, sizeof( suffix ), ".ngram_embedding.shard_%d.weight", s );
+		const std::string name = prefix + suffix;
+		const auto* m = repo.find( name.c_str() );
+		if ( !m ) break;
+		ENGINE_ASSERT( m->ndim == 2 && m->shape[1] == ROW_DIM, "NgramTable: FP8 shard shape" );
+		if ( s == 0 ) rows_per_shard_ = m->shape[0];
+		const void* p = repo.cpu_data( name.c_str() );
+		if ( !p ) return false;
+		shards8_.push_back( static_cast<const uint8_t*>( p ) );
+	}
+	ENGINE_ASSERT( !shards8_.empty() && rows_per_shard_ > 0, "NgramTable: no FP8 shards" );
+	fp8_ = true;
+	LOG_INFO( "NgramTable: %zu FP8 shards x %lld rows, %d heads, ngram %d, scale %g\n", shards8_.size(), static_cast<long long>( rows_per_shard_ ), num_heads_, ngram_size_, fp8_scale_ );
+	return true;
+}
+
 void NgramTable::row_ids( const int64_t* tokens, uint64_t* uids ) const {
 	for ( int n = 2; n <= ngram_size_; ++n ) {
 		const int lo = ( n - 2 ) * heads_per_ngram_;
@@ -117,6 +170,17 @@ void NgramTable::row_ids( const int64_t* tokens, uint64_t* uids ) const {
 void NgramTable::decode_row( uint64_t uid, int head, float* out ) const {
 	const int64_t shard = static_cast<int64_t>( uid ) / rows_per_shard_;
 	const int64_t local = static_cast<int64_t>( uid ) - shard * rows_per_shard_;
+	if ( fp8_ ) {
+		static const std::vector<float> lut = []() {
+			std::vector<float> t( 256 );
+			for ( int b = 0; b < 256; ++b ) t[b] = e4m3_byte_to_float( static_cast<uint8_t>( b ) );
+			return t;
+		}();
+		const uint8_t* row8 = shards8_[shard] + local * ROW_DIM;
+		for ( int i = 0; i < ROW_DIM; ++i ) out[i] = lut[row8[i]] * fp8_scale_;
+		(void) head;
+		return;
+	}
 	const uint16_t* row = shards_[shard] + local * words_;
 	const float scale = half_bits_to_float( row[0] );
 	const uint16_t* w = row + 1;

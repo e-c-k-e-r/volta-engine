@@ -6,6 +6,8 @@
 
 namespace engine::loader {
 
+class SafeTensorsRepo;
+
 // Hashed n-gram embedding table of Qwen3.8-Flash-Next (ngram_embedding.safetensors, format exl3_ngram_trellis): 128 shards of
 // 160-wide rows, each a tail-biting trellis ring over the mul1 codebook with a per-row fp16 scale and a per-head fp16 bias.
 // The file is memory-mapped (39 GB); lookups touch a handful of rows per token. Thread safe once open.
@@ -13,7 +15,11 @@ class NgramTable {
 public:
 	~NgramTable();
 	bool open( const std::string& path );
-	bool is_open() const { return base_ != nullptr; }
+	// The same table as FP8 E4M3 rows (the normal Flash-Next NVFP4 checkpoint: `<prefix>.ngram_embedding.shard_N.weight` [rows, 160] and a BF16
+	// `weight_scale`, with the hash parameters `<prefix>.ngram_heads_offsets`, `.ngram_heads_vocab_sizes` and `.layer_multipliers` in the repo); no bias.
+	// The repo's mapping is used as it is: it has to outlive the table.
+	bool open_fp8( const SafeTensorsRepo& repo, const std::string& prefix );
+	bool is_open() const { return base_ != nullptr || fp8_; }
 
 	int ngram_size() const { return ngram_size_; }
 	int heads_per_ngram() const { return heads_per_ngram_; }
@@ -34,6 +40,9 @@ private:
 	int ngram_size_ = 3, heads_per_ngram_ = 8, num_heads_ = 16, K_ = 6, words_ = 61;
 	int64_t rows_per_shard_ = 0;
 	std::vector<const uint16_t*> shards_;
+	std::vector<const uint8_t*> shards8_;   // FP8 mode
+	bool fp8_ = false;
+	float fp8_scale_ = 1.0f;
 	std::vector<float> head_bias_;       // [num_heads, 160]
 	std::vector<int64_t> head_offsets_, head_sizes_, multipliers_;
 	std::vector<float> codebook_;        // 65536 decoded mul1 values (fp16 rounded)

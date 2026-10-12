@@ -18,6 +18,7 @@
 #   flash_mtp4      the same at MTP depth 4 (their contract: 5-row verify)
 #   flash_mtp7_nv   flash_mtp7 with the MTP head from the NVFP4 checkpoint (mtp_nvfp4: FP8 / BF16 head requantized to NVFP4) instead of the Swift one
 #   flash_mtp4_nv   the same at depth 4
+#   flash_nvfp4     Flash-Next entirely from the normal NVFP4 checkpoint (nothing from a conversion: experts, dense groups and MTP head quantized/loaded from it, FP8 n-gram table), MTP depth 7
 #   flash_exl3      Flash-Next EXL3 4.0 bpw only, MTP depth 7
 # defaults for the benchmark: --cases fixed4k,fixed8k,natural8k --repeats 3 (add --cases fixed32k, fixed128k, --concurrency 4 for the rest)
 set -u
@@ -41,6 +42,9 @@ case $ARM in
 		[ $ARM != flash_exl3 ] && args+=(--set nvfp4_experts=$M/Qwen3.8-Flash-Next-NVFP4 --set nvfp4_dense_dir=$M/Qwen3.8-Flash-Next-NVFP4-dense
 			--set nvfp4_dense=gdn,attn,idx,head,shared_gate,shared_up)
 		[[ $ARM == *_nv ]] && args+=(--set mtp_nvfp4=true) ;;
+	flash_nvfp4)
+		args=(--model-dir $M/Qwen3.8-Flash-Next-NVFP4 --speculative --set speculator=mtp --set mtp_depth=7 --set nvfp4_experts=$M/Qwen3.8-Flash-Next-NVFP4
+			--set nvfp4_dense_dir=$M/Qwen3.8-Flash-Next-NVFP4-dense --set nvfp4_dense=all --set mtp_nvfp4=true) ;;
 	glm_plain|glm_dflash|glm_dflash_fp16|glm_256k)
 		common=(--tp-size 4 --port $PORT --host 127.0.0.1 --set prefix_cache_gib=0 --set max_seq=12288 --set max_slots=1)
 		args=(--model-dir $M/GLM-5.3-Flash-exl3-3.05bpw --set nvfp4_dense_src=$M/GLM-5.3-Flash-NVFP4 --set nvfp4_dense_dir=$M/GLM-5.3-Flash-NVFP4-dense

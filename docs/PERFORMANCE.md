@@ -9,7 +9,7 @@ Reference numbers for the three model families on the target machine, how they w
 * speculation on where a model has it: DFlash2 drafter (Qwen, GLM) or the checkpoint's MTP head (Qwen, Flash-Next)
 * weights
   * Qwen3.8-27B: EXL3 4.0 bpw (`Qwen3.8-27B-exl3`), or the NVFP4 checkpoint (`Qwen3.8-27B-QUASAR-NVFP4`) with the BF16 DFlash2 drafter
-  * Flash-Next: the recommended mix of [FLASH_NEXT.md](FLASH_NEXT.md): routed experts and the dense groups `gdn,attn,idx,head,shared_gate,shared_up` from the NVFP4 checkpoint (calibrated), everything else, including the MTP head and the n-gram table, from the Swift EXL3 4.0 bpw conversion
+  * Flash-Next: the normal NVFP4 checkpoint on its own (`configs/flash_next_nvfp4_only.json`: routed experts as shipped, every dense group and the FP8 MTP head quantized to NVFP4 at load, the FP8 n-gram table read in place), or the mix of [FLASH_NEXT.md](FLASH_NEXT.md) (NVFP4 experts and dense groups with the Swift EXL3 4.0 bpw conversion's trunk, head and n-gram table)
   * GLM-5.3-Flash: EXL3 3.05 bpw experts with the calibrated NVFP4 dense groups `kda,mla,idx,head,dense,shared`, all experts resident, 12K window
 
 ## Serving speed
@@ -23,8 +23,9 @@ The natural prompts are four real questions (two in Chinese) behind about 8K tok
 | Qwen3.8-27B NVFP4, DFlash2 | 252, 263, 182, 81 | 195 | 4.1 to 6.0 |
 | Qwen3.8-27B EXL3, DFlash2 | 163, 169, 138, 93 | 141 | 3.1 to 5.8 |
 | Qwen3.8-27B EXL3, MTP | 169, 124, 116, 84 | 123 | 2.7 to 6.0 |
-| Flash-Next, MTP depth 7 | 218, 182, 172, 130 | 175 | 3.2 to 5.8 |
-| Flash-Next, MTP depth 4 | 177, 160, 135, 121 | 148 | 2.9 to 4.2 |
+| Flash-Next (NVFP4 checkpoint only), MTP depth 7 | 235, 210, 181, 136 | 191 | 3.4 to 5.7 |
+| Flash-Next (NVFP4 experts and dense, Swift trunk and head), MTP depth 7 | 213, 186, 179, 123 | 175 | 3.0 to 5.7 |
+| Flash-Next (the same), MTP depth 4 | 199, 172, 176, 127 | 169 | 2.9 to 4.4 |
 | GLM-5.3-Flash, DFlash2 (EXL3 drafter) | 116, 109, 108, 72 | 101 | 3.1 to 5.0 |
 | GLM-5.3-Flash, no speculation | 64, 64, 64, 64 | 64 | 1 |
 
@@ -97,10 +98,10 @@ Plain token:
 | | 1Cat-vLLM (published) | This engine |
 |---|---|---|
 | Qwen3.8-27B NVFP4 + DFlash2, one request | 229 tok/s at 4K, 201 at 32K, 171 at 128K (T=1, top-p 0.95, repetitive prompt) | 316 tok/s at 32K (copy prompt); natural prompts 81 to 263, mean 195 |
-| Flash-Next MTP4, 8K | 17.4 to 18.5 ms per round, 4.9 tokens per round on the repetitive prompt (about 264 tok/s); natural prompts 3.0 tokens per round, 117 tok/s (NVFP4 target) | MTP depth 4: 233 tok/s on the copy prompt (5.0 tokens per round); natural prompts mean 148; depth 7: 175 |
+| Flash-Next MTP4, 8K | 17.4 to 18.5 ms per round, 4.9 tokens per round on the repetitive prompt (about 264 tok/s); natural prompts 3.0 tokens per round, 117 tok/s (NVFP4 target) | MTP depth 4: 233 tok/s on the copy prompt (5.0 tokens per round); natural prompts mean 169 (Swift trunk and head); depth 7: 175 to 191 |
 | GLM-5.3-Flash NVFP4, no speculation, 1K prompt | 53 tok/s on 8 V100s (TP4 and PP2, an earlier measurement) | 64 tok/s on 4 V100s (EXL3 3.05 bpw experts) |
 
-The Flash-Next rows use the Swift conversion's trunk and MTP head, which are finetuned for less overthinking, so acceptance is not directly comparable with the base model's.
+The Flash-Next rows of the first kind run the normal model end to end, so acceptance is comparable with theirs; the head from the NVFP4 checkpoint drafts as well as the conversion's own (the second and third rows).
 
 ## Reproducing
 
