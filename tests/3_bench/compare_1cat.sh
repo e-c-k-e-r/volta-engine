@@ -8,6 +8,7 @@
 #   qwen_dflash     Qwen3.8-27B EXL3 + DFlash2 (EXL3 5.0 bpw drafter)          their: 229 tok/s at 4K, 201 at 32K, 171 at 128K (NVFP4 + DFlash2 q7)
 #   qwen_dflash_bf  the same with the BF16 drafter (as theirs)
 #   qwen_nvfp4      Qwen3.8-27B QUASAR NVFP4 + BF16 DFlash2 drafter (their checkpoint pair)
+#   qwen_plain      Qwen3.8-27B EXL3, no speculation (the sampled-step cost without acceptance effects)
 #   qwen_mtp        Qwen3.8-27B EXL3 + its own MTP head
 #   flash_mtp7      Flash-Next EXL3 4.0 bpw + NVFP4 experts / dense groups, MTP depth 7 (default)
 #   flash_mtp4      the same at MTP depth 4 (their contract: 5-row verify)
@@ -26,6 +27,7 @@ case $ARM in
 	qwen_dflash)    args=(--model-dir $M/Qwen3.8-27B-exl3 --speculative --draft-model-dir $M/Qwen3.8-27B-DFlash2-EXL3-5.0bpw) ;;
 	qwen_dflash_bf) args=(--model-dir $M/Qwen3.8-27B-exl3 --speculative --draft-model-dir $M/Qwen3.8-27B-DFlash2) ;;
 	qwen_nvfp4)     args=(--model-dir $M/Qwen3.8-27B-QUASAR-NVFP4 --speculative --draft-model-dir $M/Qwen3.8-27B-DFlash2) ;;
+	qwen_plain)     args=(--model-dir $M/Qwen3.8-27B-exl3) ;;
 	qwen_mtp)       args=(--model-dir $M/Qwen3.8-27B-exl3 --speculative --set speculator=mtp) ;;
 	flash_mtp7|flash_mtp4|flash_exl3)
 		depth=7; [ $ARM = flash_mtp4 ] && depth=4
