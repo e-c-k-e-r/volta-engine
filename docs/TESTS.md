@@ -9,6 +9,7 @@
 | `test_trellis`, `test_gemv_int8` | 2 | yes | trellis and int8 GEMV kernels against FP32 references |
 | `test_mhc`, `test_attention`, `test_attention_prefill`, `test_dsa`, `test_gdn`, `test_norm`, `test_rope`, `test_kv_quant`, `test_prefill_linear` | 2 | yes | module operations against CPU references |
 | `test_all_reduce` | 2 | yes (4) | NVLink all-reduce |
+| `test_vulkan_comm` | 2 | yes (2-4) | the Vulkan build's host-staged all-reduce and all-reduce + RMSNorm on 2 and 4 devices, one thread per rank (skips with fewer devices) |
 | `test_sampling` | 2 | no | top-k / top-p sampler |
 | `test_slang_cpu`, `test_slang_kernels` | 2 | partly | Slang kernels on CPU and as generated CUDA |
 | `test_ref_linear`, `test_ref_attention`, `test_vulkan_kernels`, `test_vulkan_smoke`, `test_vulkan_ref` | 2 | yes | portable reference kernels on CUDA, CPU and Vulkan |
@@ -61,4 +62,4 @@ CUDA goldens; they run by hand (slow on CPU). `--model <dir> --type <model_type>
 GPU is dumped from a CUDA tp=4 build (`ENGINE_TP=4 build/test_cpu_forward --dump <dir> --steps 6 --model <Flash-Next dir> --type qwen4_exp`) and
 checked on the CPU build, whose single rank holds all 512 experts (about 66 GiB of weights; the whole run, load + 4-token prefill + 6 decode
 steps, takes 2.5 minutes on the build host's 10 cores: a 4-token prefill ~26 s, a decode step ~10 s). Flash-Next on the CPU matches the CUDA tp=4 logits (cos 0.9999992) and decodes the same 6 greedy tokens. The
-Vulkan backend cannot hold Flash-Next (one 32 GB device); its Flash-Next modules are checked op by op (`test_ops_flash`, `test_ops_moe --softmax`).
+Vulkan backend holds Flash-Next on four devices: `ENGINE_TP=4 build_vk/test_vulkan_forward --check <dir> --steps 4 --model <Flash-Next dir> --type qwen4_exp` against the CUDA tp=4 dump matches (cosine 0.999999, same tokens, about 1 s per decoded token); Qwen at `ENGINE_TP=1`, 2 and 4 matches the CUDA tp=1 dump (cosine 0.999999) and its FP8 KV cache too. The K8V4 and NVFP4 caches amplify rounding differences between tensor-parallel layouts (cosine 0.9998 and 0.99995 between CUDA tp=4 and CUDA tp=1 as well); the tokens still match.

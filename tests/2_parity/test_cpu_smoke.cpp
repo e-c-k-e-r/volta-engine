@@ -87,7 +87,8 @@ static int run_child( void ( *fn )(), std::string& err ) {
 }
 
 static void call_unsupported() {
-	( void ) engine::modules::ExpertTier::resident_fraction();
+	engine::modules::ExpertTier tier;
+	( void ) tier.rebalance( 0, nullptr );
 }
 
 int main() {
@@ -268,9 +269,15 @@ int main() {
 	{ // A CUDA/SM70-only entry point aborts with the named message
 		std::string err;
 		const int code = run_child( call_unsupported, err );
-		const bool ok = code == 1 && err.find( "CPU backend: ExpertTier::resident_fraction is not implemented" ) != std::string::npos;
+		const bool ok = code == 1 && err.find( "CPU backend: ExpertTier::rebalance is not implemented" ) != std::string::npos;
 		std::printf( "  %-28s exit=%d %s\n", "ExpertTier stub", code, ok ? "PASS" : "FAIL" );
 		pass = ok && pass;
+	}
+
+	{ // No host-memory tier here: every expert counts as resident
+		const double f = engine::modules::ExpertTier::resident_fraction();
+		std::printf( "  %-28s %.1f %s\n", "ExpertTier fraction", f, f == 1.0 ? "PASS" : "FAIL" );
+		pass = f == 1.0 && pass;
 	}
 
 	core::arena_destroy( g_arena );

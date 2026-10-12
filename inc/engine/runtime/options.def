@@ -5,7 +5,7 @@
 // <0 (or 0 for sizes) means "unset: use the model's default" where a help text says so.
 
 OPTION( std::string, log_level, "info", "log threshold: error, warn, info or debug" )
-OPTION( int, tp, -1, "rank count: 1, 2 or 4 (GLM: 1 or 4); <0 uses the launch's tp_size" )
+OPTION( int, tp, -1, "rank count: 1, 2 or 4 (GLM: 1 or 4; the CPU build runs one rank, the Vulkan build one device per rank); <0 uses the launch's tp_size" )
 OPTION( int, arena_gib, -1, "per-GPU arena in GiB; <=0 sizes it from the device's free memory minus vram_reserve_mib" )
 OPTION( int, vram_reserve_mib, -1, "memory left outside the arena for graphs, workspaces and the CUDA context; <0 uses the model's default (Qwen 1536, GLM 288)" )
 OPTION( int, max_seq, 0, "context window per slot in tokens (sizes the KV pool); 0 = the model default (Qwen 32768, GLM 12288)" )

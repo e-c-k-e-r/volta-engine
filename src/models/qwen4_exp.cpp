@@ -1292,9 +1292,12 @@ const pod::TensorView& Qwen4ExpPipeline::gather_logits( int rows, const backend:
 	for ( int d = 0; d < tp_; ++d ) {
 		const backend::half_t* src_base = ( d == rank_ ) ? logits_.ptr<const backend::half_t>() : peer_shard_ptrs[d];
 		ENGINE_ASSERT( src_base != nullptr, "Qwen4ExpPipeline::gather_logits: missing peer shard pointer" );
-		// 2-D copy: rows are lm_shard_cols_ apart at the source, vocab_size apart at the destination
-		backend::memcpy2d_async( full_logits_.ptr<backend::half_t>() + static_cast<size_t>( d ) * lm_shard_real_cols_, V * sizeof( backend::half_t ), src_base, static_cast<size_t>( lm_shard_cols_ ) * sizeof( backend::half_t ),
-			static_cast<size_t>( lm_shard_real_cols_ ) * sizeof( backend::half_t ), rows, backend::Copy::D2D, stream );
+		// One copy per row and rank: rows are lm_shard_cols_ apart at the source, vocab_size apart at the destination. A peer copy, not a 2-D
+		// copy by address: another rank's pointer is only meaningful on its own device (Vulkan devices share an address space layout)
+		for ( int r = 0; r < rows; ++r ) {
+			backend::peer_copy_async( full_logits_.ptr<backend::half_t>() + static_cast<size_t>( r ) * V + static_cast<size_t>( d ) * lm_shard_real_cols_, rank_,
+				src_base + static_cast<size_t>( r ) * lm_shard_cols_, d, static_cast<size_t>( lm_shard_real_cols_ ) * sizeof( backend::half_t ), stream );
+		}
 	}
 	return full_logits_;
 }

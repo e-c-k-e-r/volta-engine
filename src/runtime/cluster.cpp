@@ -24,12 +24,20 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	const bool is_glm = ( cfg.model_type == "glm5_next" );
 	const auto& opt = runtime::options();
 	tp_ = opt.tp > 0 ? opt.tp : cfg.tp;
-#if !ENGINE_BACKEND_CUDA
-	// The CPU and Vulkan backends are single-device: one rank holds the whole model
+#if ENGINE_BACKEND_CPU
+	// The CPU backend is single-device: one rank holds the whole model
 	if ( tp_ != 1 ) {
 		LOG_INFO( "ModelCluster: tp %d requested; the %s backend runs one rank\n", tp_, ENGINE_BACKEND_NAME );
 		tp_ = 1;
 	}
+#endif
+#if ENGINE_BACKEND_VULKAN
+	// Several Vulkan devices share nothing but the host: the all-reduce goes through it (src/backend/vulkan/mod_comm.cpp), which a graph cannot contain
+	if ( tp_ > backend::device_count() ) {
+		LOG_ERROR( "ModelCluster: tp %d requested, %d Vulkan devices available\n", tp_, backend::device_count() );
+		return false;
+	}
+	if ( tp_ > 1 ) runtime::options().no_graphs = true;
 #endif
 	// The arena is a bump allocator over one up-front allocation per GPU. Unless a size is given (cfg.arena_bytes,
 	// arena_gib) it takes the device's free memory less a reserve for what lives outside it (graphs, workspaces, the

@@ -5,9 +5,9 @@
 
 namespace engine::modules {
 
-__attribute__(( weak )) double ExpertTier::resident_fraction() {
-	ENGINE_UNSUPPORTED( "ExpertTier::resident_fraction" );
-	__builtin_unreachable();
+// No host-memory tier on this backend: every expert is resident (the models ask before they decide how to place the expert codes)
+double ExpertTier::resident_fraction() {
+	return 1.0;
 }
 
 __attribute__(( weak )) void ExpertTier::configure( int experts_per_layer, double fraction, const size_t bytes[3] ) {

@@ -8,8 +8,10 @@
 // in src/backend/vulkan. Streams record command buffers that are submitted on sync; a "graph" is a pre-recorded command
 // buffer. Device pointers are buffer device addresses (BDA) carried in void*.
 //
-// Not implemented (asserts): peer_copy_async (single-device layer), mapped pinned host memory (returns nullptr), memset with
-// unaligned address/size, host transfers inside a graph capture. Single-threaded use only.
+// Several devices: set_device(d) makes device d current for the calling thread (one context per device). A device pointer is only valid on the
+// device that allocated it, and other devices may hand out the same addresses, so a copy between devices must be peer_copy_async (through the host)
+// and never a plain memcpy_async of a foreign pointer. Not implemented (asserts): mapped pinned host memory (returns nullptr), memset with
+// unaligned address/size, host transfers inside a graph capture.
 #define ENGINE_CHECK( call ) ::engine::backend::check_result( int( call ), #call, __FILE__, __LINE__ )
 
 namespace engine::backend {

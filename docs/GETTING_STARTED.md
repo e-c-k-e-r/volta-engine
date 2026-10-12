@@ -18,7 +18,7 @@ cmake -S . -B build_vk  -G Ninja -DENGINE_BACKEND=VULKAN
 The CPU and Vulkan builds run the portable parts on reference kernels, so they are slow by design:
 * the CPU build compiles for the build host (`-march=native`: AVX2, FMA, F16C, about 2x on the reference kernels; `-DENGINE_CPU_NATIVE=OFF` for a portable binary) and runs Qwen and Flash-Next on one rank
   * Flash-Next needs ~66 GiB of host memory, and answers a chat request with the CUDA engine's text (see [TESTS.md](TESTS.md) for timings)
-* the Vulkan build runs what fits one device (Qwen 27B), and needs `ENGINE_DEBUG_NO_GRAPHS=1` for models with a routed MoE (the MoE reads its routes back on the host)
+* the Vulkan build runs Qwen on one device, or tensor-parallel over several (`tp` 2 or 4: one Vulkan device per rank, the all-reduce goes through host memory, execution is eager, about 2 s per Qwen token); Flash-Next needs the four devices. Models with a routed MoE need `ENGINE_DEBUG_NO_GRAPHS=1` on one device (the MoE reads its routes back on the host; with `tp` above 1 graphs are off anyway)
 * the DFlash2 speculator is CUDA only, and the MTP head has not been run on Vulkan
 * MiniMax-H3 is CUDA only
 

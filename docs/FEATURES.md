@@ -70,7 +70,7 @@ Validated contexts:
 
 ## Parallelism and scheduling
 
-* tensor parallel over NVLink with a 2- or 4-rank all-reduce (`tp`, `--tp-size`): Qwen 1/2/4, GLM 1 or 4, Flash-Next 4
+* tensor parallel over NVLink with a 2- or 4-rank all-reduce (`tp`, `--tp-size`): Qwen 1/2/4, GLM 1 or 4, Flash-Next 4; the Vulkan build does the same over several Vulkan devices with the all-reduce staged through host memory
   * `--tp-size 2` is about 0.7x the speed of four; a second server on the other pair doubles the aggregate (`CUDA_VISIBLE_DEVICES`)
 * one arena per GPU, allocated at boot from the free memory minus a reserve (`arena_gib`, `vram_reserve_mib`); nothing allocates while decoding
 * up to `max_slots` concurrent sequences, `max_batch_size` of them stepped together; the scheduler thread owns the slots
@@ -117,7 +117,7 @@ Not parsed: repetition / presence / frequency penalties, `logprobs`, `n` above 1
 |---|---|
 | CUDA SM70 | the primary build: everything above |
 | CPU | Qwen and Flash-Next on one rank, reference kernels, slow by design (Flash-Next needs ~66 GiB and matches the CUDA logits to cosine 0.9999992) |
-| Vulkan | what fits one device (Qwen 27B); models with a routed MoE need `ENGINE_DEBUG_NO_GRAPHS=1`; Flash-Next is checked op by op |
+| Vulkan | Qwen on one device or tensor-parallel over 2 or 4 devices (all-reduce through the host, eager); Flash-Next on four devices (cosine 0.999999 against CUDA tp=4); quantized KV; models with a routed MoE need `ENGINE_DEBUG_NO_GRAPHS=1` on one device |
 
 The DFlash2 drafter is CUDA only, the MTP head has not run on Vulkan, and the video service is CUDA only. The per-function table is [CAPABILITIES.md](CAPABILITIES.md).
 

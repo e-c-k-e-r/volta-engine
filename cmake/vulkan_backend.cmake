@@ -92,6 +92,12 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	add_dependencies(test_vulkan_ref slang_kernels)
 	set_target_properties(test_vulkan_smoke test_vulkan_ref PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+	# Multi-device collective through the host (one thread per rank, each on its own device)
+	add_executable(test_vulkan_comm tests/2_parity/test_vulkan_comm.cpp ${ENGINE_VK_OBJECTS})
+	target_link_libraries(test_vulkan_comm PRIVATE engine_backend_vulkan pthread)
+	add_dependencies(test_vulkan_comm slang_kernels)
+	set_target_properties(test_vulkan_comm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 	# End-to-end single-rank forward (--check against the CUDA --dump golden), same source as test_cpu_forward
 	add_executable(test_vulkan_forward tests/2_parity/test_cpu_forward.cpp ${ENGINE_VK_OBJECTS})
 	target_link_libraries(test_vulkan_forward PRIVATE engine_backend_vulkan pthread)
