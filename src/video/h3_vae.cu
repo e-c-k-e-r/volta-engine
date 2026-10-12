@@ -417,7 +417,6 @@ struct H3VideoVAE::Impl {
 		const Tiles ty = split_tiles( Hp, par.tile_size, par.tile_overlap_min, ratio ), tx = split_tiles( Wp, par.tile_size, par.tile_overlap_min, ratio );
 		const int ni = static_cast<int>( ty.start.size() ), nj = static_cast<int>( tx.start.size() );
 		const int nw = static_cast<int>( workers.size() );
-		const auto tc0 = std::chrono::steady_clock::now();
 		std::vector<float*> tiles( static_cast<size_t>( ni ) * nj, nullptr );
 		std::vector<int> th( ni ), tw( nj );
 		for ( int i = 0; i < ni; ++i ) { th[i] = ty.len[i]; }
@@ -476,7 +475,6 @@ struct H3VideoVAE::Impl {
 			} );
 		}
 		for ( std::thread& t : threads ) { t.join(); }
-		const auto tc1 = std::chrono::steady_clock::now();
 		for ( int w = 1; w < nw; ++w ) {
 			CUDA_CHECK( cudaSetDevice( workers[w]->device ) );
 			CUDA_CHECK( cudaFree( zl[w] ) );
@@ -495,8 +493,6 @@ struct H3VideoVAE::Impl {
 		}
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		for ( float* p : tiles ) { CUDA_CHECK( cudaFree( p ) ); }
-		const auto tc2 = std::chrono::steady_clock::now();
-		LOG_INFO( "H3 VAE: clip of %d latent frames, %zu tiles: tiles %.2f s, placement %.2f s", Tc, tiles.size(), std::chrono::duration<double>( tc1 - tc0 ).count(), std::chrono::duration<double>( tc2 - tc1 ).count() );
 	}
 };
 
@@ -585,7 +581,6 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens, H3StageGroup
 		CUDA_CHECK( cudaMemGetInfo( &free_b, &total_b ) );
 		s.batch = free_b > scratch_bytes( 2 ) + ( 1536ULL << 20 ) ? 2 : 1;
 	}
-	LOG_INFO( "H3 VAE: GPU %d decodes %d tile(s) per transformer pass", device, s.batch );
 	const size_t S = S1 * s.batch;
 	size_t need = scratch_bytes( s.batch );
 	if ( !h3_scratch_arena_create( s.sarena, device, need ) ) { return false; }

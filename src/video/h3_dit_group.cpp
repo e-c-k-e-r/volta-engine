@@ -57,7 +57,6 @@ struct H3DiTGroup::Impl {
 #if defined( ENGINE_HAVE_NCCL )
 	std::vector<ncclComm_t> comms;
 #endif
-	std::vector<double> t_sync;                     // per rank: host time at the two barriers per layer, summed over a forward
 };
 
 H3DiTGroup::H3DiTGroup() : p_( new Impl ) {}
@@ -129,13 +128,11 @@ bool H3DiTGroup::load( const char* checkpoint, const std::vector<int>& devices, 
 			tc.max_f32 = [comm]( float* buf, size_t count, void* stream ) { if ( ncclAllReduce( buf, buf, count, ncclFloat, ncclMax, comm, static_cast<cudaStream_t>( stream ) ) != ncclSuccess ) { LOG_ERROR( "H3: NCCL all-reduce failed" ); } };
 			s.dits[r]->set_tp( std::move( tc ) );
 		}
-		s.t_sync.assign( n, 0.0 );
 		return true;
 	}
 #endif
 	s.pull_streams.assign( n, std::vector<cudaStream_t>( n, nullptr ) );
 	s.pull_done.assign( n, std::vector<cudaEvent_t>( n, nullptr ) );
-	s.t_sync.assign( n, 0.0 );
 	s.kv_ready.assign( n, nullptr );
 	for ( int r = 0; r < n; ++r ) {
 		CUDA_CHECK( cudaSetDevice( devices[r] ) );
@@ -152,9 +149,7 @@ bool H3DiTGroup::load( const char* checkpoint, const std::vector<int>& devices, 
 		ex.begin = [sp, r, n]( int total, void* stream_ptr ) {
 			cudaStream_t stream = static_cast<cudaStream_t>( stream_ptr );
 			CUDA_CHECK( cudaEventRecord( sp->kv_ready[r], stream ) );
-			const auto t0 = std::chrono::steady_clock::now();
 			sp->barrier->wait();
-			sp->t_sync[r] += std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
 			const size_t qd = 7168;
 			const int chunk = ( total + n - 1 ) / n;
 			const half_ptr_pair mine = sp->dits[r]->kv_buffers();
@@ -178,9 +173,7 @@ bool H3DiTGroup::load( const char* checkpoint, const std::vector<int>& devices, 
 		};
 		ex.wait_peer = [sp, r]( int peer, void* stream_ptr ) { CUDA_CHECK( cudaStreamWaitEvent( static_cast<cudaStream_t>( stream_ptr ), sp->pull_done[r][peer], 0 ) ); };
 		ex.end = [sp, r, n]( void* stream_ptr ) {
-			const auto t0 = std::chrono::steady_clock::now();
 			sp->barrier->wait();
-			sp->t_sync[r] += std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
 			for ( int q = 0; q < n; ++q ) {
 				if ( q != r && sp->pull_done[q][r] ) { CUDA_CHECK( cudaStreamWaitEvent( static_cast<cudaStream_t>( stream_ptr ), sp->pull_done[q][r], 0 ) ); }
 			}
@@ -255,14 +248,6 @@ bool H3DiTGroup::forward( const H3HostRequest& hr, std::vector<float>* video_out
 		} );
 	}
 	for ( auto& t : threads ) { t.join(); }
-	{
-		double sync_max = 0;
-		for ( int r = 0; r < n; ++r ) {
-			sync_max = std::max( sync_max, s.t_sync[r] );
-			s.t_sync[r] = 0;
-		}
-		if ( sp ) { LOG_INFO( "H3: sequence-parallel forward: %.2f s of host time at the layer barriers (maximum over ranks)", sync_max ); }
-	}
 
 	if ( sp ) {
 		for ( int i = 0; i < hr.n_img; ++i ) {

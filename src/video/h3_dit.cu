@@ -237,10 +237,6 @@ struct H3DiT::Impl {
 	int sp_rank = 0, sp_n = 1;
 	H3SpExchange exchange;
 	H3TpComm tp_comm;
-	std::vector<cudaEvent_t> tev; // layer timing (sequence parallel): [3 * layer + {0: attention section start, 1: end, 2: layer end}]
-	int tev_layer = -1;
-	std::vector<cudaEvent_t> wev; // per layer and peer slot: stream time before / after waiting for the slice to arrive
-	double wait_ms = 0;
 	float* attn_o = nullptr; // running attention output of the partial passes (FP32) and its row maxima / sums
 	float2* attn_ml = nullptr;
 	half *kfull = nullptr, *vfull = nullptr;
@@ -493,7 +489,6 @@ struct H3DiT::Impl {
 			rope ? sinb + static_cast<size_t>( row0 ) * 48 : nullptr, q16, sp ? kfull + static_cast<size_t>( row0 ) * qd : k16, nh, cfg.qk_eps );
 		if ( sp ) {
 			CUDA_CHECK( cudaMemcpy2DAsync( vfull + static_cast<size_t>( row0 ) * qd, qd * sizeof( half ), qkv16 + 2 * qd, 3 * qd * sizeof( half ), qd * sizeof( half ), rows, cudaMemcpyDeviceToDevice, stream ) );
-			if ( tev_layer >= 0 ) { CUDA_CHECK( cudaEventRecord( tev[3 * tev_layer], stream ) ); }
 			exchange.begin( total_rows, stream );
 			const float scale = 1.0f / std::sqrt( static_cast<float>( cfg.head_dim ) );
 			// own keys first, then every peer's slice as its copy completes
@@ -506,12 +501,9 @@ struct H3DiT::Impl {
 			h3_attention_partial( q16, kfull + static_cast<size_t>( row0 ) * qd, vfull + static_cast<size_t>( row0 ) * qd, o16, attn_o, attn_ml, rows, rows, nh, scale, true, peers.empty(), stream );
 			for ( size_t pi = 0; pi < peers.size(); ++pi ) {
 				const int q0 = std::min( total_rows, peers[pi] * chunk ), q1 = std::min( total_rows, q0 + chunk );
-				if ( tev_layer >= 0 && pi < 3 ) { CUDA_CHECK( cudaEventRecord( wev[( 3 * tev_layer + pi ) * 2], stream ) ); }
 				exchange.wait_peer( peers[pi], stream );
-				if ( tev_layer >= 0 && pi < 3 ) { CUDA_CHECK( cudaEventRecord( wev[( 3 * tev_layer + pi ) * 2 + 1], stream ) ); }
 				h3_attention_partial( q16, kfull + static_cast<size_t>( q0 ) * qd, vfull + static_cast<size_t>( q0 ) * qd, o16, attn_o, attn_ml, rows, q1 - q0, nh, scale, false, pi + 1 == peers.size(), stream );
 			}
-			if ( tev_layer >= 0 ) { CUDA_CHECK( cudaEventRecord( tev[3 * tev_layer + 1], stream ) ); }
 			exchange.end( stream );
 		} else if ( use_fmha ) {
 			CUDA_CHECK( cudaMemcpy2DAsync( v16, qd * sizeof( half ), qkv16 + 2 * qd, 3 * qd * sizeof( half ), qd * sizeof( half ), rows, cudaMemcpyDeviceToDevice, stream ) );
@@ -888,14 +880,8 @@ void H3DiT::run_forward( const H3Request& r, float* video_out, float* audio_out,
 	for ( int i = 0; i < c.layers; ++i ) {
 		const BlockW& b = s.blocks[i];
 		k_adaln<<<( 6 * kModalities * H + 255 ) / 256, 256, 0, st>>>( s.temb, b.aw, b.ab, s.ada, M, 6 * kModalities * H, c.adaln_dim );
-		if ( s.sp_n > 1 ) {
-			if ( s.tev.empty() ) { s.tev.resize( 3 * static_cast<size_t>( c.layers ) ); for ( auto& e : s.tev ) { CUDA_CHECK( cudaEventCreate( &e ) ); }
-				s.wev.resize( 6 * static_cast<size_t>( c.layers ) ); for ( auto& e : s.wev ) { CUDA_CHECK( cudaEventCreate( &e ) ); } }
-			s.tev_layer = i;
-		}
 		if ( lrows > 0 ) { s.run_block( b, s.x + static_cast<size_t>( row0 ) * H, lrows, s.ada, s.comb + row0, true, i, row0 ); }
 		else if ( s.sp_n > 1 ) { s.exchange.begin( U, st ); s.exchange.end( st ); }
-		if ( s.sp_n > 1 && lrows > 0 ) { CUDA_CHECK( cudaEventRecord( s.tev[3 * i + 2], st ) ); }
 		if ( probe ) {
 			for ( int pb : probe_blocks ) {
 				if ( pb == i ) {
@@ -926,32 +912,6 @@ void H3DiT::run_forward( const H3Request& r, float* video_out, float* audio_out,
 		CUDA_CHECK( cudaMemcpyAsync( host_aall + static_cast<size_t>( row0 ) * c.audio_latents, s.aall, static_cast<size_t>( lrows ) * c.audio_latents * sizeof( float ), cudaMemcpyDeviceToHost, st ) );
 	}
 	CUDA_CHECK( cudaStreamSynchronize( st ) );
-	if ( s.sp_n > 1 && lrows > 0 ) { // where a layer's time goes on rank 0: the attention section (own keys, waits for the peers' slices, their keys) and the rest
-		float attn = 0, total = 0, prev_end = 0;
-		for ( int i = 0; i < c.layers; ++i ) {
-			float a01 = 0, a02 = 0;
-			CUDA_CHECK( cudaEventElapsedTime( &a01, s.tev[3 * i], s.tev[3 * i + 1] ) );
-			attn += a01;
-			if ( i > 0 ) { CUDA_CHECK( cudaEventElapsedTime( &a02, s.tev[3 * ( i - 1 ) + 2], s.tev[3 * i + 2] ) ); total += a02; }
-		}
-		( void )prev_end;
-		float w[3] = { 0, 0, 0 };
-		for ( int i = 0; i < c.layers; ++i ) {
-			for ( int pi = 0; pi < 3; ++pi ) { float ms = 0; if ( cudaEventElapsedTime( &ms, s.wev[( 3 * i + pi ) * 2], s.wev[( 3 * i + pi ) * 2 + 1] ) == cudaSuccess ) { w[pi] += ms; } else { cudaGetLastError(); } }
-		}
-		float kern[4] = { 0, 0, 0, 0 };
-		for ( int i = 0; i < c.layers; ++i ) {
-			float ms = 0;
-			auto at = [&]( cudaEvent_t x, cudaEvent_t y, int slot ) { if ( cudaEventElapsedTime( &ms, x, y ) == cudaSuccess ) { kern[slot] += ms; } else { cudaGetLastError(); } };
-			at( s.tev[3 * i], s.wev[( 3 * i ) * 2], 0 );
-			at( s.wev[( 3 * i ) * 2 + 1], s.wev[( 3 * i + 1 ) * 2], 1 );
-			at( s.wev[( 3 * i + 1 ) * 2 + 1], s.wev[( 3 * i + 2 ) * 2], 2 );
-			at( s.wev[( 3 * i + 2 ) * 2 + 1], s.tev[3 * i + 1], 3 );
-		}
-		LOG_INFO( "H3: rank %d attention kernels per range (own keys / peers in arrival order): %.2f / %.2f / %.2f / %.2f s", s.sp_rank, kern[0] / 1000.0f, kern[1] / 1000.0f, kern[2] / 1000.0f, kern[3] / 1000.0f );
-		LOG_INFO( "H3: rank %d stalls waiting for the peers' slices: %.2f / %.2f / %.2f s (first / second / third peer)", s.sp_rank, w[0] / 1000.0f, w[1] / 1000.0f, w[2] / 1000.0f );
-		LOG_INFO( "H3: rank %d layers 1..%d: %.2f s, of which the attention sections %.2f s", s.sp_rank, c.layers - 1, total / 1000.0f, attn / 1000.0f );
-	}
 	CUDA_CHECK( cudaGetLastError() );
 }
 

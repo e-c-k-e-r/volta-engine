@@ -494,85 +494,50 @@ if(NOT ENGINE_BACKEND STREQUAL "CPU")
 endif()
 include(${PROJECT_SOURCE_DIR}/cmake/ops_tests_linear.cmake OPTIONAL)
 include(${PROJECT_SOURCE_DIR}/cmake/ops_tests_attention.cmake OPTIONAL)
-add_executable(test_h3_dit tests/2_parity/test_h3_dit.cpp)
-target_link_libraries(test_h3_dit PRIVATE engine_kernels)
-set_target_properties(test_h3_dit PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(bench_h3_dit tests/3_bench/bench_h3_dit.cpp)
-target_link_libraries(bench_h3_dit PRIVATE engine_kernels)
-set_target_properties(bench_h3_dit PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_vae tests/2_parity/test_h3_vae.cpp)
-target_link_libraries(test_h3_vae PRIVATE engine_kernels)
-set_target_properties(test_h3_vae PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_audio tests/2_parity/test_h3_audio.cpp)
-target_link_libraries(test_h3_audio PRIVATE engine_kernels)
-set_target_properties(test_h3_audio PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_audio_enc tests/2_parity/test_h3_audio_enc.cpp)
-target_link_libraries(test_h3_audio_enc PRIVATE engine_kernels)
-set_target_properties(test_h3_audio_enc PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_text tests/2_parity/test_h3_text.cpp)
-target_link_libraries(test_h3_text PRIVATE engine_kernels)
-set_target_properties(test_h3_text PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(h3_text_repeat tests/3_bench/h3_text_repeat.cpp)
-target_link_libraries(h3_text_repeat PRIVATE engine_kernels)
-set_target_properties(h3_text_repeat PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(bench_h3_fmha tests/3_bench/bench_h3_fmha.cpp)
-target_link_libraries(bench_h3_fmha PRIVATE engine_kernels)
-set_target_properties(bench_h3_fmha PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(bench_h3_gemm tests/3_bench/bench_h3_gemm.cpp)
-target_link_libraries(bench_h3_gemm PRIVATE engine_kernels)
-set_target_properties(bench_h3_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(h3_generate src/video/h3_generate_main.cpp)
-target_link_libraries(h3_generate PRIVATE engine_kernels)
-set_target_properties(h3_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_layout tests/2_parity/test_h3_layout.cpp)
-target_link_libraries(test_h3_layout PRIVATE engine_kernels)
-set_target_properties(test_h3_layout PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_ref_layout tests/2_parity/test_h3_ref_layout.cpp)
-target_link_libraries(test_h3_ref_layout PRIVATE engine_kernels)
-set_target_properties(test_h3_ref_layout PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_vae_enc tests/2_parity/test_h3_vae_enc.cpp)
-target_link_libraries(test_h3_vae_enc PRIVATE engine_kernels)
-set_target_properties(test_h3_vae_enc PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_vision tests/2_parity/test_h3_vision.cpp)
-target_link_libraries(test_h3_vision PRIVATE engine_kernels)
-set_target_properties(test_h3_vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_text_mm tests/2_parity/test_h3_text_mm.cpp)
-target_link_libraries(test_h3_text_mm PRIVATE engine_kernels)
-set_target_properties(test_h3_text_mm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_image tests/2_parity/test_h3_image.cpp)
-target_link_libraries(test_h3_image PRIVATE engine_kernels)
-set_target_properties(test_h3_image PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_dit_sp tests/2_parity/test_h3_dit_sp.cpp)
-target_link_libraries(test_h3_dit_sp PRIVATE engine_kernels)
-set_target_properties(test_h3_dit_sp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_attn tests/2_parity/test_h3_attn.cpp)
-target_link_libraries(test_h3_attn PRIVATE engine_kernels)
-set_target_properties(test_h3_attn PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(p2p_check tests/3_bench/p2p_check.cpp)
-target_link_libraries(p2p_check PRIVATE engine_kernels)
-set_target_properties(p2p_check PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_vae_det tests/2_parity/test_h3_vae_det.cpp)
-target_link_libraries(test_h3_vae_det PRIVATE engine_kernels)
-set_target_properties(test_h3_vae_det PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+# MiniMax-H3: parity tests, benches and the CLI (CUDA only)
 if(ENGINE_BACKEND STREQUAL "CUDA")
-	find_library(NCCL_LIBRARY nccl) # optional: tensor-parallel H3 transformer and bench_allreduce
+	set(H3_TOOLS
+		tests/3_bench/bench_h3_attn.cpp
+		tests/3_bench/bench_h3_dit.cpp
+		tests/3_bench/bench_h3_gemm.cpp
+		tests/3_bench/h3_text_repeat.cpp
+		tests/3_bench/p2p_check.cpp
+		tests/2_parity/test_h3_attn.cpp
+		tests/2_parity/test_h3_audio.cpp
+		tests/2_parity/test_h3_audio_enc.cpp
+		tests/2_parity/test_h3_dit.cpp
+		tests/2_parity/test_h3_dit_sp.cpp
+		tests/2_parity/test_h3_dit_tp.cpp
+		tests/2_parity/test_h3_image.cpp
+		tests/2_parity/test_h3_layout.cpp
+		tests/2_parity/test_h3_ref_layout.cpp
+		tests/2_parity/test_h3_text.cpp
+		tests/2_parity/test_h3_text_identity.cpp
+		tests/2_parity/test_h3_text_layers.cpp
+		tests/2_parity/test_h3_text_mm.cpp
+		tests/2_parity/test_h3_text_tp.cpp
+		tests/2_parity/test_h3_vae.cpp
+		tests/2_parity/test_h3_vae_det.cpp
+		tests/2_parity/test_h3_vae_enc.cpp
+		tests/2_parity/test_h3_vision.cpp
+	)
+	foreach(src IN LISTS H3_TOOLS)
+		get_filename_component(tool ${src} NAME_WE)
+		add_executable(${tool} ${src})
+		target_link_libraries(${tool} PRIVATE engine_kernels)
+		set_target_properties(${tool} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	endforeach()
+	add_executable(h3_generate src/video/h3_generate_main.cpp)
+	target_link_libraries(h3_generate PRIVATE engine_kernels)
+	set_target_properties(h3_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	# NCCL is optional: it enables tensor parallelism (the transformer and the text tower over several GPUs) and bench_allreduce
+	find_library(NCCL_LIBRARY nccl)
+	if(NCCL_LIBRARY)
+		target_compile_definitions(engine_kernels PUBLIC ENGINE_HAVE_NCCL=1)
+		target_link_libraries(engine_kernels PUBLIC ${NCCL_LIBRARY})
+		add_executable(bench_allreduce tests/3_bench/bench_allreduce.cpp)
+		target_link_libraries(bench_allreduce PRIVATE engine_kernels ${NCCL_LIBRARY})
+		set_target_properties(bench_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	endif()
 endif()
-if(NCCL_LIBRARY AND ENGINE_BACKEND STREQUAL "CUDA")
-	target_compile_definitions(engine_kernels PUBLIC ENGINE_HAVE_NCCL=1)
-	target_link_libraries(engine_kernels PUBLIC ${NCCL_LIBRARY})
-	add_executable(bench_allreduce tests/3_bench/bench_allreduce.cpp)
-	target_link_libraries(bench_allreduce PRIVATE engine_kernels ${NCCL_LIBRARY})
-	set_target_properties(bench_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-endif()
-add_executable(test_h3_dit_tp tests/2_parity/test_h3_dit_tp.cpp)
-target_link_libraries(test_h3_dit_tp PRIVATE engine_kernels)
-set_target_properties(test_h3_dit_tp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_text_identity tests/2_parity/test_h3_text_identity.cpp)
-target_link_libraries(test_h3_text_identity PRIVATE engine_kernels)
-set_target_properties(test_h3_text_identity PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_text_tp tests/2_parity/test_h3_text_tp.cpp)
-target_link_libraries(test_h3_text_tp PRIVATE engine_kernels)
-set_target_properties(test_h3_text_tp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-add_executable(test_h3_text_layers tests/2_parity/test_h3_text_layers.cpp)
-target_link_libraries(test_h3_text_layers PRIVATE engine_kernels)
-set_target_properties(test_h3_text_layers PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

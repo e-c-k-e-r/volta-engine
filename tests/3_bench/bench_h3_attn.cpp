@@ -1,4 +1,4 @@
-// Throughput of the H3 attention kernel at the DiT's sequence-parallel shape.   bench_h3_fmha [q_rows=8618] [k_rows=34471] [heads=56] [causal=0]
+// Throughput of the H3 attention kernel at the DiT's sequence-parallel shape.   bench_h3_attn [q_rows=8618] [k_rows=34471] [heads=56] [causal=0]
 #include "engine/config.h"
 #include "engine/video/h3_attn.h"
 #include <cuda_fp16.h>
