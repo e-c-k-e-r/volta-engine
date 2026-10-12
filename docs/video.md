@@ -100,6 +100,7 @@ Routes:
 * `/health`, `/metrics`, `/metrics/prometheus`
 
 A job body is `{prompt, width, height, frames, steps, seed, turbo, loras:[{file,scale}], images:[{data,frame_index}], ref_images, ref_videos, ref_audios}` with base64 uploads.
+Optional `video_shift` / `audio_shift` (0 or absent = the defaults: video 6 with a 768p adapter else 12, audio 3; otherwise 0.5 to 40) set the flow shift of each modality's sigma schedule. A larger audio shift spends more of a few-step schedule at low noise, which cleans up the audio of the 4-step turbo adapters (a shift of 6 gives about the high-frequency energy of the 8-step adapter). The page has the two inputs under the video settings.
 
 Settings live in the launch config's `video` object, documented in [CONFIG.md](CONFIG.md): `dit`, `dit_ref2va`, `lora_dirs`, `out_dir`, `devices`, `max_rows`, `resident`, `resident_idle_s`, `tensor_parallel`, `text_encoder`, and `resident_decoders`.
 
