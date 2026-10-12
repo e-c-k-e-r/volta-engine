@@ -6,6 +6,7 @@
 #include "engine/core/log.h"
 #include "engine/loader/safetensors.h"
 #include "engine/modules/linear.h"
+#include "../kernels/cuda/trellis/trellis_context.h"
 #include "h3_kernels.cuh"
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -13,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <chrono>
+#include <initializer_list>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -205,7 +207,8 @@ struct H3TextEncoder::Impl {
 	int device = 0, max_tokens = 0, layers = 0;
 	pod::MemoryArena slot_arena[2]{}, sarena{};
 	LayerW slot[2];
-	bool exl3 = false;          // resident EXL3 projections instead of streamed BF16 matrices
+	bool exl3 = false;          // resident quantized projections (EXL3 trellis or NVFP4) instead of streamed BF16 matrices
+	bool nvfp4 = false;         // ... of the NVFP4 kind
 	pod::MemoryArena warena{};  // EXL3 weights
 	std::vector<ExlLayer> xl;
 	half* br16 = nullptr;       // FP16 branch output of the EXL3 projections
@@ -417,7 +420,8 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	CUBLAS_CHECK( cublasSetStream( s.blas, s.cs ) );
 	CUBLAS_CHECK( cublasSetMathMode( s.blas, CUBLAS_DEFAULT_MATH ) );
 	if ( !s.repo.open( dir ) ) { return false; }
-	s.exl3 = s.repo.find( "model.language_model.layers.0.self_attn.q_proj.trellis" ) != nullptr;
+	s.nvfp4 = s.repo.find( "model.language_model.layers.0.self_attn.q_proj.weight_packed" ) != nullptr; // compressed-tensors NVFP4
+	s.exl3 = s.nvfp4 || s.repo.find( "model.language_model.layers.0.self_attn.q_proj.trellis" ) != nullptr; // resident quantized projections (EXL3 trellis or NVFP4)
 	if ( s.tp_n > 1 ) {
 		ENGINE_ASSERT( s.exl3, "H3 text: tensor parallelism needs an EXL3 checkpoint" );
 		ENGINE_ASSERT( kNh % s.tp_n == 0 && kNkv % s.tp_n == 0 && ( kFfn / s.tp_n ) % 128 == 0, "H3 text: the shards must keep whole 128-column Hadamard blocks" );
@@ -432,10 +436,12 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 		for ( int i = 0; i < layers; ++i ) {
 			const std::string p = "model.language_model.layers." + std::to_string( i ) + ".";
 			for ( const char* pr : proj ) {
-				for ( const char* part : { ".trellis", ".suh", ".svh" } ) {
+				static const char* const kNvfp4Parts[] = { ".weight_packed", ".weight_scale" };
+				static const char* const kExl3Parts[] = { ".trellis", ".suh", ".svh" };
+				for ( const char* part : s.nvfp4 ? std::vector<const char*>( std::begin( kNvfp4Parts ), std::end( kNvfp4Parts ) ) : std::vector<const char*>( std::begin( kExl3Parts ), std::end( kExl3Parts ) ) ) {
 					const pod::SafeTensorMeta* m = s.repo.find( ( p + pr + part ).c_str() );
-					if ( !m ) { LOG_ERROR( "H3 text: EXL3 tensor %s%s%s missing", p.c_str(), pr, part ); return false; }
-					bytes += m->size_bytes + 512;
+					if ( !m ) { LOG_ERROR( "H3 text: quantized tensor %s%s%s missing", p.c_str(), pr, part ); return false; }
+					bytes += m->size_bytes + 512 + ( s.nvfp4 ? m->size_bytes / 8 : 0 ); // NVFP4 pads the rows to a multiple of 32 and prepacks
 				}
 			}
 			bytes += 4ULL * kH * 4 + 4096;
@@ -450,6 +456,7 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 			for ( int j = 0; j < 7; ++j ) {
 				// q, k, v, gate, up split their outputs (column parallel); o and down split their inputs (row parallel)
 				const bool row_parallel = j == 3 || j == 6;
+				if ( s.nvfp4 ) { *dst[j] = s.repo.load_nvfp4_slice( ( p + proj[j] ).c_str(), s.warena, !row_parallel, s.tp_rank, s.tp_n, s.cs ); continue; }
 				*dst[j] = s.tp_n > 1 ? s.repo.load_linear_slice( ( p + proj[j] ).c_str(), s.warena, 6, row_parallel ? 0 : 1, s.tp_rank, s.tp_n, s.cs ) : s.repo.load_linear( ( p + proj[j] ).c_str(), s.warena, 6, s.cs );
 			}
 			w.in_norm = s.upload_vec_resident( p + "input_layernorm.weight" );
@@ -457,8 +464,13 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 			w.qn = s.upload_vec_resident( p + "self_attn.q_norm.weight" );
 			w.kn = s.upload_vec_resident( p + "self_attn.k_norm.weight" );
 		}
+		// The quantized kernels grow their per-device workspaces lazily, under a global lock, with cudaFree / cudaMalloc. Doing that on one rank in the middle of a forward
+		// deadlocks the all-reduces (the other ranks spin in NCCL, the cudaFree waits for their kernels), so every workspace is sized here, before any collective.
+		engine::modules::trellis_context_init_all();
+		engine::modules::trellis_get_recon_ws( device, static_cast<size_t>( std::max( kH * s.ffn_l, kH * s.nh_l * kHd ) ) * sizeof( half ) );
+		engine::modules::trellis_get_cublas( device );
 		CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
-		LOG_INFO( "H3 text: %d EXL3 layers resident, %.2f GB", layers, s.warena.offset_bytes / 1e9 );
+		LOG_INFO( "H3 text: %d %s layers resident, %.2f GB", layers, s.nvfp4 ? "NVFP4" : "EXL3", s.warena.offset_bytes / 1e9 );
 	} else {
 		const size_t layer_bytes = ( static_cast<size_t>( kNh * kHd ) * kH * 2 + static_cast<size_t>( kNkv * kHd ) * kH * 2 + static_cast<size_t>( kFfn ) * kH * 3 ) * sizeof( half ) + ( 4ULL << 20 );
 		for ( int i = 0; i < 2; ++i ) {

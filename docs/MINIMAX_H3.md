@@ -304,6 +304,17 @@ peak 25.0 GB on GPU 0 and 23.4 GB on the others with the decoders loaded per job
 against its video, visually the same frames. It does not fit next to the full-weight sequence-parallel transformer (that run ran out of memory on GPUs 1 to 3 while loading
 the DiT): use it with `tensor_parallel`. Not tried: the 4.0 and 5.0 bpw branches (they would save 1.5 and 0.8 GB per GPU).
 
+NVFP4 checkpoints (`Qwen3-VL-32B-Instruct-NVFP4`, compressed-tensors `weight_packed` / `weight_scale` / `weight_global_scale`; its norms and embedding are bit-identical to the MiniMax
+encoder too) load through the same path (`load_nvfp4_slice`, the engine's W4A16 kernels: activations stay FP16, `input_global_scale` is unused): 13.7 GB for 50 layers on one GPU,
+3.43 GB per GPU on four, load 6.3 s. Text only: cosine 0.999913 (rel 2.2e-2) against the BF16 golden, 20 times the error of EXL3 6 bpw but fine. With an image the result is
+0.9737 (rel 0.23), on one and on four GPUs and with the BF16 vision tower, so it is the language-model weights: `test_h3_text_layers` (per-layer comparison of two
+checkpoints) shows both quantizations within ~2% of each other until layer 42, then at layer 43 the EXL3 run (which matches the BF16 golden) creates a massive activation on
+one token (token 82: channel 731 jumps to 7400, channel 2994 to 1050) that the NVFP4 run does not (92 and 2). The NVFP4 weights are uniformly 9.5% off in relative error (no
+outlier rows; `down_proj` row 731 included), so this looks like a threshold event that FP4 noise cannot reproduce, not a kernel bug. EXL3 6 bpw stays the recommended
+checkpoint; NVFP4 is a smaller option (1.2 GB per GPU less) whose effect on the DiT with image prompts is untested. The quantized kernels grow per-device workspaces lazily
+under a global lock; a rank doing that mid-forward deadlocks the NCCL all-reduces (this hung the first four-GPU NVFP4 run), so `H3TextEncoder::load` sizes them before any
+collective.
+
 Running it:
 
 ```

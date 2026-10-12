@@ -572,3 +572,6 @@ set_target_properties(test_h3_text_identity PROPERTIES RUNTIME_OUTPUT_DIRECTORY 
 add_executable(test_h3_text_tp tests/2_parity/test_h3_text_tp.cpp)
 target_link_libraries(test_h3_text_tp PRIVATE engine_kernels)
 set_target_properties(test_h3_text_tp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_h3_text_layers tests/2_parity/test_h3_text_layers.cpp)
+target_link_libraries(test_h3_text_layers PRIVATE engine_kernels)
+set_target_properties(test_h3_text_layers PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
