@@ -1,373 +1,173 @@
-# MiniMax-H3 port: inventory and roadmap
+# MiniMax-H3 (video + audio generation)
 
-Status (2026-10-11): text-to-video-and-audio runs end to end on one GPU (section 9). Written from a read of 1Cat-vLLM (`~/Programs/1Cat-vLLM`, branch
-`backup/sm70-skinny-port-20260925`, commit 5efdba966) and the checkpoints under `~/Documents/models`. Numbers marked (est) are
-back-of-envelope from the configs, not measurements. Numbers quoted from 1Cat are theirs (TP4, 4x V100, single request).
+MiniMax-H3 is a rectified-flow diffusion transformer that denoises video and audio latents jointly. The engine runs it on SM70 (V100) GPUs through `h3_generate`
+(command line) and through the video service of `volta_server` (job queue, HTTP API, web page). CUDA only. Supported tasks: text to video and audio (T2VA),
+first / last / both keyframes (FL2VA), and references (Ref2VA: images, videos, audio), with the distilled turbo adapters and community LoRAs.
 
-Scope: CUDA only, SM70, the video+audio generation path (T2VA, FL2VA with first / last / both keyframes, Ref2VA), the distilled
-turbo LoRAs, multi-LoRA. Not in scope: ComfyUI integration, 1Cat's web UI (the engine gets its own), FP8/SAGE/Skip-Softmax recipes,
-TeaCache/Cache-DiT, FastH3 VSA (fails 1Cat's own numerical diagnostic), CPU and Vulkan.
+Not supported: ComfyUI integration, FP8 / sparse-attention recipes, TeaCache / Cache-DiT, CPU and Vulkan.
 
-## 1. What H3 is
+## 1. How a job runs
 
-A rectified-flow diffusion transformer that denoises video and audio latents jointly. Text, image/video/audio references and the
-two latent streams are packed into one token sequence; the model is CFG-distilled, so there is one DiT forward per step and no
-guidance batch. There is no KV cache, no causal mask and no token streaming. A request is minutes of batch compute, then an MP4.
+Text, reference rows and the two latent streams are packed into one token sequence. The model is CFG-distilled: one transformer forward per step, no guidance batch, no
+KV cache, no causal mask. A request is minutes of batch compute, then an MP4.
 
-Pipeline (`MiniMaxH3Pipeline`, `pipeline.py`):
+| Stage | Component | Notes |
+|---|---|---|
+| plan | layout, sigma schedule, noise | `h3_pipeline.cu`, `h3_image.cpp`; the noise generator is the engine's own (`H3Gaussian`), so a seed does not reproduce 1Cat's torch noise |
+| references | video VAE encoder (3-D conv, causal), image encoder, audio VAE encoder | only FL2VA keyframes and Ref2VA; tiles are spread over the GPUs |
+| text | Qwen3-VL language model, first 50 decoder layers, plus its vision tower for images and video frames | BF16 layers streamed from disk, or an EXL3 / NVFP4 conversion resident on the GPUs (section 4.3) |
+| denoise | the transformer: 50 blocks + 2 token-refiner blocks, hidden 5376, 56 heads x 128, MLP 14336 (fc1 28672 wide, gated), patch (1,2,2), 24 video / 32 audio latent channels | 4 or 8 Euler steps (eta 0), flow shift 12 / 3 (video / audio) with the turbo adapters, per-step reset of the condition rows |
+| decode | video VAE decoder (ViT, 36 blocks of dim 2048, spatial 16x, temporal 4x, tiled), audio VAE decoder (BigVGAN-style 1-D conv stack, 32 kHz stereo) | |
+| mux | MP4, 24 fps video + PCM audio, through the `ffmpeg` binary | |
 
-| Stage | Component | Size on disk | Runs |
-|---|---|---|---|
-| 1 | Qwen3-VL text encoder (64-layer dense LM, hidden 5120, FFN 25600, 64 heads / 8 KV, head_dim 128, mRoPE interleaved [24,20,20], 27-layer vision tower with deepstack at 8/16/24) | 114 GB BF16, 14 shards | once per request (prompt cache keyed by prompt+media) |
-| 2 | Reference conditioning: video VAE encoder (3D conv, causal), audio VAE encoder, image/video preprocessing | in the VAE files | only FL2VA keyframes and Ref2VA |
-| 3 | DiT: 50 blocks + 2 token-refiner blocks, hidden 5376, 56 heads x 128, FFN 14336 (fc1 28672 wide, gated), patch (1,2,2), 24 video / 32 audio latent channels | 21 GB INT8 (Comfy "pruned convrot") | 4 or 8 steps with turbo LoRA, 49 without |
-| 4 | Euler (eta 0) rectified-flow update, sigma schedule with flow shift (video 12.0, audio 3.0), per-step reset of conditioning rows | none | per step |
-| 5 | Video VAE decode: ViT decoder (36 blocks, dim 2048 = 32 heads x 64, gated SiLU FFN, RMSNorm, RoPE), spatial 16x, temporal 4x | 10.4 GB (source file) | once, tiled |
-| 6 | Audio VAE decode: DAC / BigVGAN style 1D conv stack (snake activations, alias-free resampling), 32 kHz stereo | 0.6 GB | once |
-| 7 | Mux to MP4 (24 fps video + PCM audio) | | once |
+At 1280x736 and 124 frames the sequence is about 34,500 rows (80x46 latent per frame, patch 2x2, ~32 latent frames, plus audio, text and condition rows); one forward is
+about 2.3 PFLOP, split roughly evenly between the linear layers and attention.
 
-The video decoder is a ViT, not a 3D conv stack. The 3D convolutions (35 five-dimensional weights, ch 128, ch_mult 1,2,2,4,4,8,
-reflect padding, time-isolated GroupNorm) are in the encoder only, which matters for keyframes and Ref2VA but not for plain T2VA.
-This reduces the VAE risk compared with a first read.
+## 2. Files you need
 
-### Sequence length and cost (est)
-
-1280x736 canvas, 124 frames at 24 fps: latent 80x46 per frame, patch 2x2 gives 920 tokens/frame; ~31-32 latent frames gives about
-29K video tokens, plus audio, text and condition tokens. Per DiT forward: linear layers 2 x 19.3B x 29K = ~1.1 PFLOP, attention
-4 x N^2 x 7168 x 50 layers = ~1.2 PFLOP; ~2.3 PFLOP/step. 1Cat measures 58 s for four steps at ~53 TFLOP/s per card on four cards,
-so the workload is compute-bound and the target is HMMA efficiency, not bandwidth. Ref2VA sequences are longer (181 s for four steps).
-
-## 2. Checkpoints on this machine
-
-| Path | Content |
+| Path (example) | Content |
 |---|---|
-| `MiniMax-H3/FL2VA`, `MiniMax-H3/Ref2VA` | diffusers layout: text_encoder (114 GB, shared), video_vae, audio_vae, tokenizer, processor, `transformer/config.json` only (no DiT weights) |
-| `Comfy-H3/diffusion_models/minimax_h3_{fl2va,ref2va}_pruned_int8_convrot.safetensors` | the only DiT weights on disk: 20.97 GB each |
-| `h3-turbo/*.safetensors` | six LightX2V turbo LoRAs (rank 128, BF16, 1.4 GB each; 4-step v1.2 768p, 8-step v1.0 768p and non-768p, Ref2V 4-step v0.1 and 8-step v1.0 768p) |
-| `h3-loras/*.safetensors` | five community LoRAs (1.2 GB total) |
+| `MiniMax-H3/FL2VA`, `MiniMax-H3/Ref2VA` | diffusers layout: `text_encoder` (BF16, 14 shards, shared), `video_vae`, `audio_vae`, `tokenizer`, `processor`, `model_index.json` of class `MiniMaxH3Pipeline` |
+| `Comfy-H3/diffusion_models/minimax_h3_{fl2va,ref2va}_pruned_int8_convrot.safetensors` | the transformer, 21 GB each (the only transformer weights the engine reads) |
+| `h3-turbo/*.safetensors`, `h3-loras/*.safetensors` | turbo LoRAs (LightX2V, rank 128) and community LoRAs |
+| optional: an EXL3 or NVFP4 conversion of Qwen3-VL-32B-Instruct | resident text tower, section 4.3 |
 
-DiT checkpoint layout (FL2VA file, 932 tensors): 200 INT8 weight matrices (19.27 GB; qkv_proj [21504,5376], out_proj [5376,7168],
-fc1 [28672,5376], fc2 [5376,14336] per block) each with a per-output-row FP32 scale `[N,1]` and a `.comfy_quant` metadata blob
-(format `int8_tensorwise`, `convrot`, `convrot_groupsize` 256); the two token-refiner blocks, norms, and q/k norms are BF16; the
-patch/condition/time projections are FP32. The AdaLN is "pruned": `blocks.N.adaln_proj.linear` is [96768, 8] (18 x 5376 outputs
-from an 8-dim coordinate) fed by `adaln_t_table` [1025, 8], instead of the dense time embedder. The pruned DiT is the only base
-available locally, which fixes the reference for every parity gate: W8A16 convrot, not the original floating weights (1Cat's
-original-floating runs are not reproducible here without a download).
+**Transformer format.** INT8 matrices (`qkv_proj`, `out_proj`, `fc1`, `fc2` of every block) with a per-output-row FP32 scale and a ConvRot `.comfy_quant` blob (Hadamard-rotated
+in groups of 256 along K, then row-quantized); the token-refiner blocks, norms and q/k norms are BF16, the patch / condition / time projections FP32. The AdaLN is "pruned":
+`blocks.N.adaln_proj.linear` maps an 8-dimensional coordinate fed by `adaln_t_table` to the shift / scale / gate of three modalities. Each projection is dequantized and
+un-rotated to FP16 right before its cuBLAS GEMM (FP32 accumulation); the residual stream is FP32.
 
-ConvRot means the stored weight is already Hadamard-rotated (groups of 256 along K) and row-quantized, so the activation must be
-rotated with the same Hadamard before the FP16 GEMM. The engine has `hadamard.cu` (EXL3 trellis) which may be reusable for the
-256-group rotation; that needs checking, the sign conventions will not match automatically.
+**Adapters.** PEFT-style A/B pairs on `to_q / to_k / to_v / to_out.0` and `ff.net.0.proj / ff.net.2` (diffusers, kohya and ai-toolkit key layouts are read). They are applied
+unmerged (`x A^T B` per target, per-adapter scale, several at once), which keeps the INT8 base intact.
 
-Turbo / community LoRAs are PEFT-style A/B pairs on `to_q/to_k/to_v/to_out.0` and `ff.net.0.proj / ff.net.2` for all 50 blocks and
-the token refiner (624 tensors, alpha 8, rank 128). They are small (one is 1.4 GB), so unmerged staged application (x A^T B) is
-cheap relative to the base GEMM and keeps the INT8 base intact; merging into INT8 weights is not possible. Multi-LoRA is therefore
-a sum of staged deltas with per-request scales.
-
-### 2.1 Measured kernel baseline (2026-10-11, one V100 at the 150 W cap, 1Cat's built kernels, single runs)
-
-"W8A16" in 1Cat means the INT8 weights are dequantized to FP16 at load (`dequantize`, `rotate` for the ConvRot butterfly) and the
-projections then run as plain FP16 GEMMs (`ops.gemm` is cuBLAS; `ColumnMajorGemmPlan` is a CUTLASS-style plan for column-major
-weights). Weights are resident as FP16: 38.6 GB, 9.7 GB per card at TP4. No INT8 compute kernel is needed.
-
-M = 29,440 tokens, TP4 per-card shapes (script: `tests/3_bench/h3_kernel_baseline.py`):
-
-| Op | N x K | cuBLAS | 1Cat column-major plan |
-|---|---|---|---|
-| qkv | 5376 x 5376 | 42.2 ms, 40.3 TF | 35.9 ms, 47.5 TF |
-| out | 5376 x 1792 | 14.2 ms, 39.9 TF | 12.3 ms, 46.3 TF |
-| fc1 | 7168 x 5376 | 55.5 ms, 40.9 TF | 48.2 ms, 47.1 TF |
-| fc2 | 5376 x 3584 | 28.3 ms, 40.1 TF | 24.4 ms, 46.5 TF |
-
-Non-causal attention, d=128, 14 heads per card: 170 ms (36.5 TF, query tile 128 / key tile 128), 197 ms with key tile 64, 202 ms
-with query tile 64. A full-head (56) run gives 689 ms.
-
-Per layer per card: GEMMs ~121 ms (column-major) + attention ~170 ms, so ~14.5 s per step over 50 layers, which matches 1Cat's
-14.57 s per step. Attention is about 58% of the step. Consequences: cuBLAS is the baseline for the engine's GEMMs (the column-major
-plan is worth ~15% and can come later); attention is where a better kernel pays most; the card is at 40-47 TF of a 125 TF peak,
-and the 150 W cap limits what any kernel can reach, so absolute figures here are caps, not kernel limits.
-
-## 3. Inventory of the 1Cat source
-
-Python sources (branch `backup/sm70-skinny-port-20260925`; the SM70 kernels are byte-identical to `main`, the difference is
-Python: this branch has the LoRA, protocol and UI work, `main` has `prepared_weights.py`):
-
-| 1Cat file | Lines | Role | Engine disposition |
-|---|---|---|---|
-| `transformer.py` | 1737 | DiT model, token refiner, final layer, SP/residual-parallel paths | rewrite as C++ module; the block is simple (section 4) |
-| `pipeline.py` | 2311 | request lifecycle, shape resolution, conditioning, residency, adapters | rewrite; mostly orchestration |
-| `denoise_loop.py` | 399 | Euler loop with per-step condition reset | port directly (short) |
-| `scheduling_*euler_ancestral.py`, `sigma_schedule.py`, `time_request.py` | ~410 | sigma schedules, DMD2 turbo schedule, flow shift | port; golden-compare the schedule arrays |
-| `encoder.py` | 1751 | Qwen3-VL encoder with TP layers, vision tower, mRoPE index | reuse engine Qwen3 vision tower (`vision.cu`) and a new dense-Qwen3 text stack; mRoPE index is new |
-| `vae.py`, `reference_video.py`, `preprocessing.py` | ~1900 | tiled VAE wrappers, reference video/image preprocessing | port logic; the VAE math is in the checkpoint's `video_vae/*.py` |
-| `lora.py` | 1040 | adapter formats (LightX2V, FlashGen grouped QKV, FastH3 fusion), staged A/B | port LightX2V + generic PEFT; FlashGen and FastH3 are optional later |
-| `quantization.py`, `ops.py`, `weights.py`, `comfy_checkpoint.py` | ~940 | ConvRot INT8 handling, Comfy key mapping | port the key mapping and rotation contract |
-| `modulation.py`, `conditioning.py`, `condition_noise.py`, `packed_*.py`, `attention.py`, `qk_norm_rope.py`, `activation.py` | ~1700 | AdaLN modulation, token tagging and packing, 3D RoPE, QK norm | port as small kernels plus host packing |
-| `residency.py`, `weight_cache.py`, `collectives.py`, `prepared_weights.py` | ~1300 | CPU/GPU residency, peer reduction | replaced by the engine's arena and NVLink comm layer |
-| `vllm/video/{engine,server,protocol,media,gpu,fastpath}.py` | ~900 | request/task API, media IO | replace with a job API in the engine's HTTP server; the 187-line `protocol.py` addition is the field list for multi-LoRA requests |
-| `web_ui_html.py`, `tools/minimax_h3/web_ui.py` | ~1440 | web UI | not ported (new UI, section 6) |
-
-SM70 kernels in 1Cat:
-
-| File | Lines | Role |
-|---|---|---|
-| `flash-attention-v100/kernel/h3/{fmha.h,forward.cu,prefetch_mma.h,default_fmha.h}` | ~1630 | non-causal FlashAttention forward for SM70, head_dim 128; used as the reference while bringing up the engine's own `src/kernels/cuda/h3/h3_attn.cu`, then dropped |
-| `flashinfer-sm70/csrc/h3_noncausal_sm70.cu` | 353 | alternative non-causal kernel (register P); 1Cat keeps it as the fallback |
-| `csrc/sm70_turbomind/ops/h3_w8a16.cu`, `h3_column_major_gemm.h` | ~410 | INT8-weight x FP16-activation GEMM for large M (CUTLASS/TurboMind derived) |
-| `csrc/minimax_reduce_rms_kernel.cu` | | TP reduce + RMS fusion |
-| `forward_sparse.cu`, `vsa_layout.h`, `h3_vsa_fp32.cu` | | FastH3 VSA, out of scope |
-
-Tests worth lifting as parity references (they define expected behavior): `test_h3_numerics.py` (536), `test_h3_lora.py` (611),
-`test_h3_workflows.py`, `test_h3_flashattn.py`, `test_h3_qk_norm_rope.py`, `test_h3_column_major.py`.
-
-Licensing: the model code is adapted from Apache-2.0 vLLM-Omni (provenance in `UPSTREAM.md`); keep the SPDX notices on anything
-derived and write the C++ from the algorithm, not by transliteration, where practical.
-
-## 4. DiT block (what has to exist)
-
-Per block, tokens T x 5376, tags per token (video / text / audio, padding -1):
-
-1. `adaln_proj(t_emb)` yields shift/scale/gate for attention and MLP per modality (3 modalities, 18 x 5376 outputs; per-token
-   selection through `combined_indices = timestep_index * 3 + modality`).
-2. RMSNorm(norm1) fused with indexed scale/shift, FP16 output.
-3. Hadamard rotation (ConvRot) of the activation, then qkv_proj (INT8 W, FP16 A) -> [T, 3 x 7168]. The grouped-QKV reorder
-   (`_reorder_grouped_qkv_to_qkv`) applies to some adapter layouts.
-4. Per-head RMSNorm of q and k, 3D RoPE (rope table of `rope_inv_freq_len` 16 over frame/row/col positions), non-causal attention
-   (56 heads x 128, full sequence; segment isolation for packed requests only matters if batching, which is out of scope).
-5. out_proj (INT8, K = 7168), then residual `indexed_gate_rms_norm_scale_shift` (gate*h + residual, norm2, scale/shift).
-6. fc1 (28672 wide, gated SiLU -> 14336), fc2, `indexed_gate` residual.
-7. Residual stream in FP32 under sequence-parallel (1Cat found NCCL reduce-scatter's summation order fails their latent gate and
-   uses a custom peer reduction that keeps the replicated FP32 order; the engine's own all-reduce is deterministic, which should
-   be checked against this).
-
-Outside the blocks: video/audio patch projections and condition projection (FP32), time embedding table lookup, final layer
-(AdaLN + linear to 24x4 video / 32 audio channels, FP32), the 2-block token refiner over text tokens, rope table construction.
-
-Numerics warning from the source: H3 has outlier activations (per-element amax in the hundreds), so FP16 QK^T can exceed 65504;
-1Cat keeps FP32 for several projections and for the residual. Parity has to be checked with the same precision choices before any
-kernel is optimized.
-
-## 5. Gap analysis against the engine
-
-| Need | Engine today | Work |
-|---|---|---|
-| Large-M projection GEMM | cuBLAS is linked; weights are dequantized INT8 -> FP16 at load (section 2.1) | cuBLAS first; later optionally port the column-major plan (~15%); INT8 dequant + ConvRot at load is a small kernel |
-| Non-causal FlashAttention, d=128, ~30K tokens | `attention.cu` is causal/decode-oriented | new: port `flash-attention-v100` h3 forward (the dominant cost, ~58% of a step); keep parity test against an FP32 reference |
-| AdaLN indexed norm/scale/shift/gate kernels | `norm.cu`, `gated_residual.cu` are close | small new kernels |
-| 3D RoPE + QK norm | `rope.cu` has 1D/mRoPE variants | new rope table + fused qk-norm-rope |
-| ConvRot Hadamard (group 256) | `hadamard.cu` (EXL3) | verify reuse; otherwise new |
-| TP4 / sequence-parallel, deterministic FP32 residual | NVLink all-reduce exists (decode-sized) | extend to large payloads (T x 5376 FP16/FP32, reduce-scatter/all-gather); correctness before speed |
-| Dense Qwen3-VL text stack (64 layers, 5120 hidden) | `qwen3_5` is the hybrid GDN model; no plain dense Qwen3 | new model class or generalize `qwen3_5` attention-only layers; weights via EXL3 |
-| Vision tower | `vision.cu`, `qwen3_vision.h` | reuse; check deepstack taps and 16-px patches vs Qwen3 27B tower |
-| mRoPE position index for text+image+video tokens | present for Qwen vision input | verify equivalence with `_get_rope_index` |
-| Video VAE decoder ViT (36 blocks, 2048) | none | new: reuses the same GEMM/attention/RoPE/RMSNorm primitives; plus unpatchify and tiling with overlap blending |
-| Video VAE encoder (3D conv, reflect pad, time-isolated GN) | none (no conv3d at all) | new conv3d kernels (implicit-GEMM); needed only for keyframes and Ref2VA |
-| Audio VAE (snake, alias-free resample, conv1d, BigVGAN) | none | new conv1d / transposed-conv1d kernels and activations; decoder first, encoder for audio references |
-| LoRA staged delta | none | two skinny-rank GEMMs per target; trivial next to the base GEMM |
-| Job/task API, MP4 mux, image/video decode | HTTP server speaks chat protocols | new `engine::video` target; ffmpeg/libav for IO is the pragmatic exception to "no framework", to be decided |
-| Memory plan | static arena, one model | DiT and encoder cannot be resident together with activations; load order and offload need a plan (section 7) |
-
-## 6. Architecture proposal
-
-* New namespace `engine::video`, separate from the LM generator: `H3Pipeline` owns components and a request state machine; the
-  existing `Model`/slot machinery is not reused. Reuse the arena, comm layer, safetensors loader, tokenizer and vision tower.
-* No CUDA graphs for the DiT: at M ~ 30K each kernel runs for milliseconds, so launch overhead is negligible. The static-arena
-  rule still applies.
-* Parallelism: TP4 with sequence-parallel FP32 residual (as 1Cat measured), unless single-GPU data-parallel wins on throughput:
-  the INT8 DiT is 21 GB and fits one 32 GB card with ~8 GiB left, tight for a 30K-token sequence (est: fc1 output alone is
-  30K x 28672 x 2 B = 1.7 GB, attention workspace, FP32 residual 0.6 GB). Measure both before committing.
-* Text encoder: quantize to EXL3 (about 4 bpw gives ~30 GB) with the exllamav3 pipeline so the existing trellis kernels run it;
-  it runs once per request on a few hundred tokens (skinny GEMMs, the engine's strength). Check output drift against the BF16
-  hidden states that feed `condition_proj`; the DiT may be sensitive to it, so this is a quality gate, not a given.
-* Own web UI: a single static page plus job endpoints (submit, progress via SSE with per-step latents preview optional, list,
-  download, delete) with LoRA picker, per-LoRA scale, seed, resolution, frame count, keyframe and reference uploads. Replaces
-  1Cat's; designed after the API settles.
-
-## 7. Roadmap
-
-Each phase ends with a gate; phases are ordered so something runs end-to-end as early as possible. Session counts are guesses for
-focused work.
-
-| Phase | Deliverable | Gate | Sessions |
-|---|---|---|---|
-| H0 | Golden capture: run 1Cat's pipeline once at a small shape (e.g. 33 frames, 512x320) and dump fixed-seed tensors: encoder hidden + tags, patch-embedded rows, outputs of block 0, 1, 49, token refiner, final velocity per step, final latents, decoded RGB and PCM; also sigma arrays | files on disk, reproducible from a script in `tests/tools/` | 0.5 (needs the vLLM environment working) |
-| H1 | DiT core, single GPU, small shape: loader for the Comfy INT8 file + key map, ConvRot rotation, W8A16 GEMM, AdaLN kernels, QK-norm + 3D RoPE, non-causal attention, token refiner, final layer | per-block cosine >= 0.9999 vs H0 golden; velocity of step 0 within 1Cat's own numeric tolerance | 2-3 |
-| H2 | Full-size DiT on 4 GPUs: TP4 + SP, FP32 residual order, memory plan, T2VA 4-step loop with the Euler scheduler fed H0's encoder hidden and decoded by 1Cat's VAE offline | final latents match golden; denoise time vs 1Cat's 58 s at 1280x736x124 (target: within 10%, then beat it) | 2 |
-| H3 | Turbo LoRA (LightX2V) + multi-LoRA staging, per-request scales, DMD2 schedule; FL2VA keyframes need H5 for the encoder side | latents match golden with and without adapters; `test_h3_lora.py` cases | 1 |
-| H4 | Decoders: video VAE ViT decoder + tiling, audio VAE decoder, mux to MP4 | decoded RGB/PCM match golden (PSNR / cosine gates), full T2VA request produces a watchable file | 1-2 |
-| H5 | Encoder side: EXL3 quantization of the text encoder, dense Qwen3-VL stack in the engine, tower + mRoPE, prompt cache; then conv3d and conv1d encoders for keyframes and references | hidden-state cosine vs BF16 reference; FL2VA first/last/both and Ref2VA parity vs 1Cat | 2-3 |
-| H6 | Job API + new web UI; benchmark matrix (as for the LM models) at a fixed stated power cap with repeats | end-to-end request via UI; documented numbers (cap stated, repeats) | 1-2 |
-
-Total about 10-14 sessions; H0-H4 (T2VA with turbo LoRA, no references) is the first useful milestone at roughly 6-8.
-
-### Overnight-safe pieces (no judgment needed, scripted, GPUs free)
-
-* H0 golden capture, once the 1Cat environment is verified to run a small shape.
-* Microbenchmarks of the large-M INT8 GEMM and non-causal attention on the real shapes (M 29K, K 5376, N 21504 / 28672; 56 heads
-  x 128): establishes the achievable TFLOP/s on this machine's power cap before writing the engine versions, and decides whether
-  porting 1Cat's kernels is enough or the existing `mma.m8n8k4` building blocks are better.
-* EXL3 quantization of the text encoder (long exllamav3 job), followed by a hidden-state drift measurement.
-
-## 8. Risks and open questions
-
-1. Sustained throughput: 1Cat's 53 TFLOP/s per card is under the usual 150 W cap here? Their power setup is unknown; the same
-   cap caveat as the Flash-Next numbers applies.
-2. Text-encoder quantization: DiT quality sensitivity to a 4-bit encoder is untested. Fallback: 8-bit EXL3 (~60 GB) or keep BF16
-   in pinned host RAM and stream layers (114 GB does not fit in 128 GB VRAM alongside the DiT).
-3. ConvRot reproducibility: the exact Hadamard layout (group 256, ordering, scaling) must be read from `ops.py` and
-   `quantization.py`; getting it wrong gives plausible-looking garbage rather than an error.
-4. Memory at full shape: 1Cat reports 20.5 GB/card live at TP4 including IPC; the engine arena adds its own reservation. VAE
-   decode memory (ViT over the whole latent grid, tiled) is the likely peak.
-5. Determinism requirements of 1Cat's residual path (summation order) may constrain the all-reduce design.
-6. Video VAE encoder conv3d: reflect padding in time, GroupNorm isolated per frame, causal; the spec is in
-   `video_vae/{klvae,vae_cnn,conv}.py` in the checkpoint directory (remote code, 1258 lines in `klvae.py`).
-7. The original floating-point DiT is not on disk; parity can only be against the INT8-convrot checkpoint. If original-weight
-   quality ever matters, it is a 38 GB download.
-8. Not read in detail yet: `modulation.py`, `condition_noise.py`, `packed_sequence.py` (token tagging and layout), `reference_video.py`,
-   the audio VAE sources, and the diff between this branch and `main` for `pipeline.py` (270 lines) and `config.py`.
-9. Branch divergence: this branch is 1701 commits behind `main`; the kernels are identical, so port from here, but re-diff the
-   Python before treating any behavior as final.
-
-## 9. Implementation status (2026-10-11)
-
-Text-to-video-and-audio, first/last-frame image conditioning (FL2VA), the turbo adapters and community LoRAs, four-GPU sequence parallelism, a command-line
-tool and a job server with a web UI are implemented. Every model component was checked against the official code (goldens in `~/Documents/h3`, produced by
-`tests/tools/h3_*.py`).
-
-| Component | Files | Check |
-|---|---|---|
-| DiT forward (INT8 ConvRot weights resident, per-matrix dequant + un-rotate to FP16, FP32 residual, own WMMA attention) | `src/video/h3_dit.cu` | 50 layers: video cosine 0.999998 vs an FP32 reference that matches 1Cat's `MiniMaxH3DiTModel` (cosine 1.000000 on a tiny config) |
-| LoRA adapters (diffusers, kohya, ai-toolkit layouts; staged A/B, per-adapter scale, several at once) | same | 2-layer match improves 10x with the adapter; all nine local adapters parse |
-| Sequence-parallel group (full weights per GPU, row shards, K/V pulled over NVLink per layer) | `h3_dit_group.cpp` | 1, 2 and 4 GPUs match the single-GPU golden (cosine 0.999998 per rank); 2-GPU output vs 1-GPU 39 dB PSNR |
-| Video VAE decoder (ViT3D, tiling, temporal chunks) | `h3_vae.cu` | tile cosine 1.000000; tiled/chunked video 59 dB |
-| Video VAE image encoder (single frame) | `h3_vae_enc.cu` | moments cosine 1.000000 |
-| Audio VAE decoder (BigVGAN) | `h3_audio.cu` | cosine 1.000000 |
-| Text encoder (Qwen3 tower, 50 layers, BF16 streamed from disk) with image tokens (vision tower, DeepStack, interleaved mRoPE) | `h3_text.cu`, `h3_vision.cu` | text 1.000000, image-conditioned 0.999991 (reference matches HF transformers); vision tower 0.99999 vs HF |
-| Layout, schedule, Euler loop, Lanczos resize, keyframe rows, MP4 mux (stages of `H3Run`: `h3_pipeline.cu`, `h3_stage_*.cpp/.cu`) | `h3_pipeline.cu`, `h3_run.h`, `h3_stage_*`, `h3_image.cpp` | layout identical to 1Cat's; Lanczos within 1 level of PIL |
-| `h3_generate` CLI; the video service of `volta_server` (job queue, API, page) | `h3_generate_main.cpp`; `src/server/video/` | end to end; the stage split is bit-identical to the monolithic version |
-
-Measured, 4x V100 at a 225 W power limit (at the earlier 150 W limit the cards ran at ~680 MHz and every number below was 30 to 50% slower), 1280x736 x 124 frames, 4-step
-turbo adapter, 34,472 rows, transformer resident (`video.resident`): text 7 s, denoise 61 s (15.2 s per step), decode 16.6 s, mux 2.4 s, about 96 s per job (the first
-job also loads the transformer, 9.5 s). At 150 W the same job took 175 s. Where the step goes: 13.4 s GPU compute (attention ~7.6 s at ~56 TF/s, GEMMs ~5.7 s at 85 to
-92 TF/s: cuBLAS's default algorithm is already within 10% of its best on these shapes), 0.8 s waiting at the barriers, 1.1 s copying K/V over NVLink.
-What brought it down from the first working version (single GPU, per-stage loads): sequence parallelism over four GPUs, tile-parallel video decode (62.8 -> ~12 s of
-compute, 24.7 s with the load), the causal FMHA in the text tower (language model 46 -> 19 s for a 7K-token prompt), pinned/prefetched text-weight streaming
-(9.8 -> 5.2 s for a short prompt), the four-GPU reference-video encode on tensor cores (157 -> 18.7 s), parallel decoder loads, a resident transformer (load 15 -> 0 s),
-and per-peer K/V copy streams.
-
-Attention is the engine's own kernel (`src/kernels/cuda/h3/h3_attn.cu`, WMMA, no CUTLASS): a warp owns 16 query rows, Q and the FP32 output live in registers, K/V
-tiles are double buffered through shared memory with row padding (D + 16 halves; the padding is worth 15%), the online softmax runs on the accumulators. 54.5 TF/s on
-the DiT shape (CUTLASS's best tile was 56), head_dim 128 (full and causal) and 64 (the VAE decoder, no zero padding). A key-range variant carries the running
-(max, sum, output) between calls; the sequence-parallel exchange uses it: each rank attends to its own keys while the peers' slices arrive, and nothing waits on the
-host (events and two host barriers per layer). Measured: the copies are hidden (stalls at most 0.75 s per step) but the step stays at 15.6 s, because the chunked
-kernel runs ~7% slower and shares HBM with the pulls; the attention sections are 10.3 s of the 15.2 s of layer time, so the kernel itself is now the bottleneck
-(the GEMMs, 85 to 97 TF/s, are not). Registers are at the 255 limit and the code generation is fragile: small source edits cost up to 12% (use unsigned index
-arithmetic, keep the plain variant separate from the state-carrying ones).
-
-Decode (14.7 s at 1280x736x124, 3.6 s of it loading the four decoders): ~9.4 s are the tiles of the seven clips (28 tiles each, 7 per GPU: two tiles share a transformer
-pass when the card has the room, so the GEMMs see 3.2K rows; the native head_dim-64 attention kernel; a SiLU-mul that reads its input once), placement 0.5 s, audio 0.6 s.
-The decoder weights go through pinned-chunk stagers on a load stream; the four loads share one ring (`h3_stager.h`: one thread reads each chunk out of the page cache
-once, every GPU DMAs it), 4.2 -> 3.6 s (one decoder alone: 1.3 s). `test_h3_vae_det` checks run-to-run determinism of the tile and full decode (callers' latent
-uploads on the legacy stream must be ordered before the decoder's non-blocking streams: `decode_video` / `decode_tile` synchronize the default stream first).
-
-Tried and dropped for attention: four warps per block with single-buffered K/V and two blocks per SM (41 TF/s against 54: the extra barriers cost more than the
-occupancy gains), 32-row warp tiles (the FP32 output alone is 64 registers per 16 rows, Q another 64: over the 255 limit), a lazy softmax rescale (-2%).
-
-Tensor parallelism (experimental; server option `video.tensor_parallel` / `--tensor-parallel`, `h3_generate --tp`, `H3DiTGroup::load(..., tensor_parallel)`; needs NCCL at build time, `ENGINE_HAVE_NCCL` is set when CMake finds it, otherwise the server warns and keeps sequence parallelism; a prompt longer than the configuration takes, about 8.6K text rows at the default `max_rows`, fails the job with a message): instead of
-every GPU holding the full INT8 transformer and a quarter of the rows, every GPU holds a quarter of the heads and of the MLP width (shards of the ConvRot matrices that
-keep whole 256-groups: out-projection K 7168/4 = 7 groups, MLP-down K 14336/4 = 14 groups) and runs all rows. The attention-output and MLP-down partial products (FP32) are
-summed over NCCL, two all-reduces of 741 MB per layer (7.4 ms each as FP16, `bench_allreduce`); the SiLU row scale is the maximum over the whole MLP width (a small max
-all-reduce between a max pass and the apply pass); adapters are sliced the same way (column-parallel: B rows; row-parallel: A columns). Measured at 1280x736x124: goldens match
-sequence parallelism (cosine 0.999999 video / 0.999996 audio), a full 4-step job with the turbo adapter has velocity norms within 4e-4 and 39 dB PSNR against the
-sequence-parallel video; step 16.6 s against 15.6 s, transformer load 7.1 s against 9.6 s (each GPU reads a quarter of the file), 14.2 GB per GPU while denoising (21.3 with the full
-transformer per GPU) and a decode peak of 17.6 GB (19.2 on GPU 0) against 30 GB; the activation scratch is sized per mode (shard-width activations, no K/V gather buffers). The point is VRAM (a quarter of the weights per GPU) so that the text tower and the VAEs
-can stay resident. Not yet: a config flag (`video.tensor_parallel`) instead of the environment variable, server integration, FP16 or overlapped
-reductions, tensor-parallel text tower and VAEs.
-
-Left on the table: a fused SiLU epilogue in the GEMM, an attention kernel with explicit MMA instructions instead of WMMA (the P round trip through shared memory is the
-likely limit), resident VAEs (the decoder load is 3.6 s per job) now that the transformer and the text tower are sharded.
-Every run logs fingerprints (prompt, noise, each step's velocity, the final latents) so a change that should not alter results can be checked from the log.
-
-### EXL3 text tower (done)
-
-The text tower is Qwen3-VL-32B-Instruct's language model (dense, 5120 hidden, 64 heads / 8 KV heads of 128, MLP 25600); H3 runs its first 50 layers. The MiniMax
-encoder is the stock model: `test_h3_text_identity` finds the RMSNorm weights and the embedding table bit-identical to `turboderp/Qwen3-VL-32B-Instruct-exl3` (the 30B-A3B repo
-is the MoE model and does not fit). `H3TextEncoder` loads such a checkpoint (trellis projections, detected from the tensor names) resident and runs it through
-`LinearTrellis` (fused kernels for few rows, dequantize + HGEMM above a threshold); `H3TextGroup` shards it over the GPUs the way the DiT is sharded: 16 of the 64 query
-heads, 2 of the 8 KV heads and 6400 of the 25600 MLP columns per GPU (`load_linear_slice`, column-parallel q/k/v/gate/up, row-parallel o/down), FP16 all-reduces of the two
-partial products per layer over NCCL, and the MLP row scale taken from a max all-reduce. Config: `video.text_encoder` / `--text-encoder DIR` (server and `h3_generate`);
-the vision tower still loads from the model directory.
-
-Measured with the 6.0 bpw branch (18.3 GB for 50 layers, 4.6 GB per GPU on four): hidden-state cosine against the BF16 goldens 0.999999 (text only, rel 1.5e-3) and
-0.999958 (with an image, rel 1.0e-2), identical on one and on four GPUs; load 4.0 s once per process; encode 0.15 to 0.2 s for 18 to 97 tokens (streamed BF16: 5.5 s). A
-full job (tensor-parallel DiT with the turbo adapter, 1280x736x124) has the text stage at 4.7 s the first time (it includes the load) and 0.5 s afterwards (was 7.1 s),
-peak 25.0 GB on GPU 0 and 23.4 GB on the others with the decoders loaded per job; velocity norms within 1.5e-3 of the BF16-text run (audio norms within 1%), 30.9 dB PSNR
-against its video, visually the same frames. It does not fit next to the full-weight sequence-parallel transformer (that run ran out of memory on GPUs 1 to 3 while loading
-the DiT): use it with `tensor_parallel`. Not tried: the 4.0 and 5.0 bpw branches (they would save 1.5 and 0.8 GB per GPU).
-
-Resident decoders (`video.resident_decoders`, default on with `resident` + `tensor_parallel`; `h3_generate --resident-decoders`): the video decoders (4.9 GB of weights plus scratch
-per GPU) and the audio VAE stay loaded between jobs; sequence parallelism leaves no room for them. A second job in the same process: decode 10.9 s (14.8 s with the decoders
-loaded per job), text 0.4 s, no load; about 80 s per job at 1280x736x124 with the turbo adapter (it was 96 to 99 s before the optimization work), videos bit-identical to the
-per-job loads. Peak memory 28.6 GB on GPU 0 and 27.3 GB on the others (transformer shard + its scratch, the sharded text tower, the decoders), so there are about 4 GB of headroom.
-
-`h3_check_paths` (the server at startup, `h3_generate` before it loads anything) refuses configurations that cannot work and says why: a device that does not exist or is
-listed twice, a first device that is not the primary one, a tensor-parallel device count that cannot shard the transformer (2, 4 or 7) or the text tower (2, 4 or 8), a
-`text_encoder` that is not an EXL3 or NVFP4 conversion of the 5120-wide Qwen3-VL language model with at least 50 layers, and a `text_encoder` without `tensor_parallel` when the
-sequence-parallel transformer plus the tower exceed the GPU memory (this used to die silently out of memory at the transformer load). It warns when resident decoders would not fit.
-
-NVFP4 checkpoints (`Qwen3-VL-32B-Instruct-NVFP4`, compressed-tensors `weight_packed` / `weight_scale` / `weight_global_scale`; its norms and embedding are bit-identical to the MiniMax
-encoder too) load through the same path (`load_nvfp4_slice`, the engine's W4A16 kernels: activations stay FP16, `input_global_scale` is unused): 13.7 GB for 50 layers on one GPU,
-3.43 GB per GPU on four, load 6.3 s. Text only: cosine 0.999913 (rel 2.2e-2) against the BF16 golden, 20 times the error of EXL3 6 bpw but fine. With an image the result is
-0.9737 (rel 0.23), on one and on four GPUs and with the BF16 vision tower, so it is the language-model weights: `test_h3_text_layers` (per-layer comparison of two
-checkpoints) shows both quantizations within ~2% of each other until layer 42, then at layer 43 the EXL3 run (which matches the BF16 golden) creates a massive activation on
-one token (token 82: channel 731 jumps to 7400, channel 2994 to 1050) that the NVFP4 run does not (92 and 2). The NVFP4 weights are uniformly 9.5% off in relative error (no
-outlier rows; `down_proj` row 731 included), so this looks like a threshold event that FP4 noise cannot reproduce, not a kernel bug. EXL3 6 bpw stays the recommended
-checkpoint; NVFP4 is a smaller option (1.2 GB per GPU less) whose effect on the DiT with image prompts is untested. The quantized kernels grow per-device workspaces lazily
-under a global lock; a rank doing that mid-forward deadlocks the NCCL all-reduces (this hung the first four-GPU NVFP4 run), so `H3TextEncoder::load` sizes them before any
-collective.
-
-Running it:
+## 3. Running it
 
 ```
-build/h3_generate --root <MiniMax-H3/FL2VA> --dit <Comfy-H3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors> \
+build/h3_generate --root <MiniMax-H3/FL2VA> --dit <fl2va checkpoint> \
     --lora <h3-turbo/minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors> --prompt "..." --size 1280x736 --frames 124 --steps 4 \
     --devices 0,1,2,3 --out out.mp4 [--image first.png [--image last.png]] [--lora other.safetensors:0.8]
+build/h3_generate --root ... --dit-ref2va <ref2va checkpoint> --lora <h3-turbo/minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors> \
+    --prompt "The dog from Picture 1 ..." --ref-image a.png [--ref-image b.png] [--ref-video clip.mp4] [--ref-audio voice.wav] --devices 0,1,2,3 --out out.mp4
 build/volta_server --model-dir <MiniMax-H3/FL2VA> --dit <fl2va checkpoint> [--dit-ref2va <ref2va checkpoint>] --lora-dir <h3-turbo> --lora-dir <h3-loras> \
-    --out-dir <jobs dir> --host 127.0.0.1 --port 8200
+    --out-dir <jobs dir> --host 127.0.0.1 --port 8200 [--devices 0,1,2,3] [--tensor-parallel] [--text-encoder <exl3 dir>]
 ```
 
-`volta_server` treats a `model_dir` with a `model_index.json` of class `MiniMaxH3Pipeline` as the `minimax_h3` model family: no language-model runtime, a job
-queue with one worker thread that owns the GPUs (`tp_size` GPUs, or `--devices`), and these routes: `GET /` (the page), `GET /api/info`, `GET`/`POST /api/jobs`,
-`GET`/`DELETE /api/jobs/<id>`, `GET /api/jobs/<id>/video` (Range) and `/thumb`, `POST /api/jobs/<id>/cancel`, plus `/health`, `/metrics` and `/metrics/prometheus`
-(queue and job counters, last job timings, VRAM of the transformer's GPUs). Settings are in the launch config's `video` object (see [CONFIG.md](CONFIG.md)).
-A job body is `{prompt, width, height, frames, steps, seed, turbo, loras:[{file,scale}], images:[{data,frame_index}], ref_images, ref_videos, ref_audios}` with
-base64 uploads. Code: `src/server/video/` (`adapters`, `jobs`, `service`, `api`, `metrics`, `page`) on the shared `Router` and `Connection` of `src/server/`.
+`h3_generate` also takes `--resident` (keep the models loaded between `--repeat N` runs), `--resident-decoders`, `--tp`, `--text-encoder DIR`, `--seed`, `--video-shift`,
+`--audio-shift`. The configuration is checked before anything loads (section 5).
 
-The server has no authentication and binds to localhost by default. The build has no CUTLASS dependency: attention is the engine's own WMMA kernel.
+**Server.** A `model_dir` with a `model_index.json` of class `MiniMaxH3Pipeline` selects the `minimax_h3` model family: no language-model runtime, a job queue with one worker
+thread that owns the GPUs, and these routes: `GET /` (the page), `GET /api/info`, `GET` / `POST /api/jobs`, `GET` / `DELETE /api/jobs/<id>`, `GET /api/jobs/<id>/video` (Range)
+and `/thumb`, `POST /api/jobs/<id>/cancel`, `/health`, `/metrics`, `/metrics/prometheus`. A job body is
+`{prompt, width, height, frames, steps, seed, turbo, loras:[{file,scale}], images:[{data,frame_index}], ref_images, ref_videos, ref_audios}` with base64 uploads. Settings are in the
+launch config's `video` object (see [CONFIG.md](CONFIG.md)). There is no authentication; the server binds to localhost by default. Code: `src/server/video/`.
 
-### Ref2VA (references)
+**References (Ref2VA).** Up to 9 reference images (resized to a 2048 px short edge, 32 px multiples, aspect ratio 0.4 to 2.5), 3 reference videos and 3 audio clips (12 in all;
+videos and audio 2 to 15 s each and in total), on the Ref2VA transformer. In the prompt they are `Picture i`, `Video k`, `Audio j`. Reference videos are decoded by ffmpeg onto a
+768 px canvas (at most 768 x 1344, 24 fps), encoded by the causal 3-D video VAE in 17-frame clips and shown to the language model as every 12th frame with timestamps; a
+video's soundtrack becomes an audio reference. Image references sit at timestep 0.999, audio references at 1.0 (clean latents). Layout:
+`[text | reference blocks | target audio | target video]`.
 
-Reference videos (up to 3, MP4 / MOV, 2 to 15 s each and in total, 23.976 to 60 fps) are decoded by ffmpeg onto the canvas (768 px short edge, at most 768 x 1344, 32 px
-multiples, 24 fps, at most the clip's frame count), encoded by the causal 3-D video VAE in 17-frame clips (trimmed to 17 n + 5 frames, last 3 latent frames dropped;
-`test_h3_vae_enc` on `h3_vae_enc_video_golden.py`: cosine 1.000000) and shown to the language model as every 12th frame in temporal blocks of two frames with
-`<t seconds>` timestamps (`<Video k>: ` label; the Qwen3-VL video smart-resize budget of 24M pixels applies). Each video's soundtrack becomes an audio reference
-(`<Audio j>: ` label before the video). Measured: a 3 s reference (1344x768 canvas, 56 frames, 4 clips x 18 tiles) took ~157 s to encode with FP32 convolutions; with FP16 tensor-core GEMMs (one per frame
-over the valid temporal taps, FP32 accumulation, moments cosine 1.000000 against the checkpoint's encoder) and the tiles spread over the four GPUs the whole reference
-stage (encode + soundtrack) takes 18.7 s. The clip generated at 640x384 / 56 frames carries the reference's subject, setting and gait (`--ref-video`; refer to it as "Video 1" in the prompt).
+## 4. Architecture
 
-Reference images (up to 9, resized to a 2048 px short edge, 32 px multiples, aspect ratio 0.4 to 2.5) and reference audio (up to 3 clips, 2 to 15 s each and in
-total, cut to the clip duration) work on the Ref2VA transformer (`--dit-ref2va`, the `minimax_h3_ref2va_pruned_int8_convrot` checkpoint; use the `ref2v` turbo
-adapters). Prompt presentation is `<Picture i>: ` + vision block per image, `<Audio j>: ` label per clip, then the prompt; refer to them that way in the prompt.
-Layout `[text | reference blocks | target audio | target video]` matches 1Cat's builder exactly (`test_h3_ref_layout`); image references sit at timestep 0.999,
-audio references at 1.0 (clean latents). The audio encoder matches the remote-code reference (`test_h3_audio_enc`, cosine 1.000000).
-The image encoder tiles like the checkpoint (256 px tiles, >= 64 px overlap, linear moment blend; `h3_vae_enc_tiled_golden.py`), which also corrected the FL2VA
-keyframe encode at tile seams. Measured: 640x384, 56 frames, one reference image and one audio clip, 4 GPUs: ~52 s text (14K prompt tokens from a 2048 px
-reference), 36 s denoise, 8 s decode; the output reproduces the reference subject when the prompt refers to it. Server and UI take `ref_images` / `ref_audios`.
+### 4.1 The transformer (`src/video/h3_dit.cu`, `h3_dit_group.cpp`)
 
-```
-build/h3_generate --root ... --dit-ref2va <ref2va ckpt> --lora <h3-turbo/minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors> --prompt "The dog from Picture 1 ..." \
-    --ref-image a.png [--ref-image b.png] [--ref-video clip.mp4] [--ref-audio voice.wav] --devices 0,1,2,3 --out out.mp4
-```
+Per block: AdaLN-indexed RMSNorm (shift / scale per modality and timestep), qkv projection, per-head RMSNorm of q and k, 3-D RoPE, non-causal attention over the whole
+sequence, out projection with a gated residual, fc1 (gated SiLU), fc2 with a gated residual. The SiLU product carries a per-row power-of-two scale that keeps the FP16 value
+in range; it is undone after the down projection. There are no CUDA graphs: each kernel runs for milliseconds.
 
-Not yet built: keeping the models resident between jobs (each job reloads them: ~20 s), splitting the VAE decode over the GPUs (63 s now on one), quantization of the
-text encoder, FP8/INT8 attention, a FP16-range audit for long clips, and the benchmark matrix. Reference noise is drawn from the engine's own RNG, not torch's, so
-runs are not bit-comparable with 1Cat's for the same seed.
+**Attention** is the engine's own kernel (`src/kernels/cuda/h3/h3_attn.cu`, WMMA on Volta): a warp owns 16 query rows with Q and the FP32 output in registers, K / V tiles are
+double buffered through shared memory with padded rows, the online softmax runs on the accumulators. head_dim 128 (full and causal) and 64 (the VAE decoder). It reaches about
+54 TF/s on the DiT shape. A key-range variant carries the running (max, sum, output) between calls. Register use is at the limit of 255, so small source changes can cost
+10% or more: check `bench_h3_attn` after touching it.
+
+**Sequence parallelism (default).** Every GPU holds the full INT8 weights and owns a quarter of the rows. Per layer each rank attends to its own keys while the peers'
+K / V slices arrive over NVLink (one copy stream per peer, ordered with events, no host waits on the GPU), then to each peer's slice as it lands. Needs about 21 GB of weights
+plus 6 GB of scratch per GPU.
+
+**Tensor parallelism** (`video.tensor_parallel`, `--tensor-parallel`, `h3_generate --tp`; needs NCCL at build time, found by CMake as `ENGINE_HAVE_NCCL`). Every GPU holds a
+quarter of the heads and of the MLP width and runs all rows. The ConvRot rotation works in groups of 256 along K, so the K-sharded matrices keep whole groups (out
+projection 7168 / 4 = 7 groups, MLP down 14336 / 4 = 14). The attention-output and MLP-down partial products are summed over NCCL in FP32 (two all-reduces per layer); the SiLU
+row scale is the maximum over the whole MLP width. Adapters are sliced the same way (column-parallel projections keep the B rows of the rank's slice, row-parallel ones the A
+columns). Usable GPU counts: 2, 4 or 7. The point is memory: 14 GB per GPU while denoising instead of 27, so that the text tower and the VAEs can stay loaded. Cost: about 1 s
+per step more than sequence parallelism. A prompt may have at most about 8.6K text rows (the full-width token refiner runs on them); longer ones fail the job with a message.
+
+### 4.2 VAEs
+
+*Decoder* (`h3_vae.cu`): a ViT, run on 256 px tiles of every temporal chunk (7 latent frames, 28 tiles at 1280x736), the tiles spread over the GPUs (one decoder per GPU), two tiles
+per transformer pass when the card has room, blended with the checkpoint's overlap rules and streamed to RGB8. *Image / video encoder* (`h3_vae_enc.cu`): causal 3-D convolutions
+as FP16 im2col + GEMM with valid-tap skipping, tiled like the checkpoint (256 px tiles, at least 64 px overlap), tiles spread over the GPUs. *Audio VAE* (`h3_audio.cu`): a
+DAC-style encoder and the BigVGAN decoder (snake activations, alias-free resampling) on conv1d kernels. The decoder weights are read once and broadcast to all GPUs through a
+shared pinned ring (`h3_stager.h`).
+
+### 4.3 The text tower (`h3_text.cu`, `h3_text_group.cpp`, `h3_vision.cu`)
+
+Qwen3-VL-32B-Instruct's language model (dense, 5120 hidden, 64 heads / 8 KV heads of 128, MLP 25600, interleaved mRoPE), first 50 layers, no final norm; the MiniMax encoder is the
+stock model (`test_h3_text_identity` finds its norms and embedding bit-identical to the public EXL3 and NVFP4 conversions). Three ways to run it:
+
+* **Streamed BF16** (default): layers are read from the `text_encoder` shards through pinned chunks and converted to FP16 on the GPU, one layer ahead of the compute. 5 to 7 s for
+  a short prompt.
+* **Resident EXL3** (`video.text_encoder`, `--text-encoder DIR` with a conversion such as `turboderp/Qwen3-VL-32B-Instruct-exl3`): the trellis projections stay on the GPUs and
+  run through `LinearTrellis`; `H3TextGroup` shards them over the GPUs (16 query heads, 2 KV heads and 6400 MLP columns per GPU on four; column-parallel q/k/v/gate/up,
+  row-parallel o/down; FP16 all-reduces of the two partial products per layer; the MLP row scale from a max all-reduce). 6.0 bpw is 18.3 GB for 50 layers, 4.6 GB per GPU on four.
+  A short prompt takes about 0.2 s. Hidden-state cosine against the BF16 reference: 0.999999 text only, 0.999958 with an image.
+* **Resident NVFP4** (a compressed-tensors conversion such as `Qwen3-VL-32B-Instruct-NVFP4`): same path through the engine's W4A16 kernels, 3.4 GB per GPU on four. Text only
+  0.99991, but with an image 0.974: at layer 43 the BF16 and EXL3 runs create a very large activation on one token (channel 731 reaches about 7400) that the 4-bit weights do not
+  reproduce (`test_h3_text_layers` shows the divergence layer by layer). Prefer EXL3 6 bpw for image or reference prompts.
+
+The resident tower does not fit next to the full-weight sequence-parallel transformer in 32 GB; use it with `tensor_parallel`. The vision tower is the engine's
+`Qwen3VisionTower` (`src/models/qwen3_vision.cpp`), loaded from the BF16 `text_encoder` directory as a dense tower (fused qkv, DeepStack taps after blocks 8 / 16 / 24);
+`h3_vision.cu` only adapts it to the H3 interface.
+
+### 4.4 Memory and residency
+
+`video.resident` (default on) keeps the transformer and its adapters loaded between jobs; the activation scratch is released while the text and decode stages run
+(`trim`) and taken back for the next job. With `tensor_parallel` the resident text tower (when `text_encoder` is set) and, by default, the video decoders and the audio VAE
+(`video.resident_decoders`) stay loaded too. Image / video / audio reference encoders load for the stage that needs them.
+
+| Configuration, 4 GPUs | peak per GPU | step | per job (1280x736x124, turbo 4 steps) |
+|---|---|---|---|
+| sequence parallel, BF16 text streamed, decoders per job | 30 GB | 15.6 s | text 7 s + denoise 62 s + decode 15 s + mux 2 s |
+| tensor parallel, EXL3 text resident, resident decoders | 28.6 / 27.3 GB | 16.6 s | text 0.4 s + denoise 66 s + decode 11 s + mux 2 s |
+
+Measured on four V100 at a 225 W power limit (at 150 W the cards run at about 680 MHz and every figure is 30 to 50% slower). The first job also pays the loads (transformer
+7 to 9 s, text tower 4 s, decoders 3.6 s). Where a sequence-parallel step goes: attention about two thirds (54 TF/s), the GEMMs (cuBLAS, 85 to 97 TF/s) the rest.
+
+### 4.5 Determinism and numerics
+
+Every run logs fingerprints (prompt, noise, each step's velocity, the final latents), so a change that should not alter results can be checked from the log. H3 has outlier
+activations (per-element magnitudes in the hundreds), so FP16 QK^T can exceed the FP16 range in principle: the residual stream and the wide-range projections stay FP32.
+Work that touches a non-blocking stream must order itself against default-stream uploads (`cudaStreamSynchronize(nullptr)` first); the quantized text kernels grow per-device
+workspaces lazily under a global lock, so they are sized at load, before any collective (a rank growing one mid-forward deadlocks the others in NCCL).
+
+## 5. Configuration checks
+
+`h3_check_paths` (the server at startup, `h3_generate` before it loads anything) refuses configurations that cannot work and says why: a device that does not exist or is listed
+twice, a first device that is not the primary one, a tensor-parallel device count that cannot shard the transformer (2, 4 or 7) or the text tower (2, 4 or 8), a `text_encoder`
+that is not an EXL3 or NVFP4 conversion of the 5120-wide Qwen3-VL language model with at least 50 layers, and a `text_encoder` without `tensor_parallel` when the transformer
+plus the tower exceed the GPU memory. It warns when resident decoders would not fit. Without NCCL the server keeps sequence parallelism and the BF16 text path and says so.
+
+## 6. Validation
+
+Goldens come from the official code (`tests/tools/h3_*.py`, written to `~/Documents/h3`); each test prints a cosine or PSNR and `ok` / `FAIL`.
+
+| Test | Checks | Expected |
+|---|---|---|
+| `test_h3_dit`, `test_h3_dit_sp`, `test_h3_dit_tp` | transformer forward on 1 GPU, sequence-parallel and tensor-parallel (2 and 4 GPUs, with and without the turbo adapter) | video cosine >= 0.999996, audio >= 0.99997 |
+| `test_h3_attn`, `bench_h3_attn` | attention against a CPU softmax (full, causal, key ranges, head_dim 64 / 128), TF/s at the DiT shape | max error 3e-4 |
+| `test_h3_vae`, `test_h3_vae_det` | decoder tile and full tiled decode (59 dB), run-to-run determinism | identical hashes |
+| `test_h3_vae_enc`, `test_h3_audio`, `test_h3_audio_enc` | image / video / audio encoders and the audio decoder | cosine 1.000000 |
+| `test_h3_text`, `test_h3_text_mm`, `test_h3_text_tp` | text tower (BF16, EXL3, NVFP4; text only and with an image; 1 and 4 GPUs) against the BF16 reference | see 4.3 |
+| `test_h3_vision` | vision tower, merged rows and the three DeepStack taps | cosine >= 0.99998 |
+| `test_h3_layout`, `test_h3_ref_layout`, `test_h3_image` | packed layouts (identical to the reference builder), Lanczos resize, keyframe rows | exact / PSNR gates |
+| `test_h3_text_identity`, `test_h3_text_layers` | whether two text checkpoints are the same model; per-layer drift between two quantizations | |
+| `bench_h3_dit`, `bench_h3_gemm`, `bench_allreduce`, `p2p_check` | DiT layer timing, cuBLAS algorithm sweep on the DiT and VAE shapes, NCCL all-reduce, NVLink copy integrity | |
+
+## 7. Limits and known issues
+
+* A prompt of more than about 8.6K text rows is rejected under tensor parallelism and with the resident text tower; the packed sequence is limited by `video.max_rows`
+  (default 36000).
+* Adapters are applied unmerged and cost a little compute per step; more than six per job are rejected.
+* NVFP4 text conditioning degrades on image-conditioned prompts (4.3); its effect on generated video is untested.
+* MP4 muxing, reference-video decoding and thumbnails call the `ffmpeg` / `ffprobe` binaries.
+* The reference noise comes from the engine's generator, not torch's, so a seed does not reproduce 1Cat's output; results are deterministic per configuration.
+* The web page has had little browser testing.
