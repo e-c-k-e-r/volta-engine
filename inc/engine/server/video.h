@@ -5,7 +5,7 @@
 #include <memory>
 
 // MiniMax-H3 generation service of volta_server: a job queue with one worker thread that owns the GPUs, the job API and the web page. Started for checkpoint
-// directories that are an H3 pipeline (model_type "minimax_h3"); see docs/MINIMAX_H3.md.
+// directories that are an H3 pipeline (model_type "minimax_h3"); see docs/video.md.
 namespace engine::server {
 
 class VideoService {

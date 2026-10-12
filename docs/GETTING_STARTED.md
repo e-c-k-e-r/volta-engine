@@ -31,7 +31,7 @@ taskset -c 0-9 build/volta_server --model-dir /path/to/Qwen3.8-27B-exl3 \
 	--speculative --draft-model-dir /path/to/Qwen3.8-27B-DFlash2-EXL3-5.0bpw --port 8000
 ```
 
-The model type is read from the checkpoint (`qwen3_5`, `glm5_next` or `qwen4_exp`; a MiniMax-H3 pipeline directory starts the video service, see [MINIMAX_H3.md](MINIMAX_H3.md)); anything else is a fatal error. Configuration (launch
+The model type is read from the checkpoint (`qwen3_5`, `glm5_next` or `qwen4_exp`; a MiniMax-H3 pipeline directory starts the video service, see [video.md](video.md)); anything else is a fatal error. Configuration (launch
 file, `--set key=value`, `ENGINE_*` variables, debug switches) is described in [CONFIG.md](CONFIG.md); `configs/` has examples.
 The server speaks the OpenAI chat API (`/v1/chat/completions`, `/v1/models`) and the Anthropic API (`/v1/messages`,
 `/v1/messages/count_tokens`), so Claude Code can use it with `ANTHROPIC_BASE_URL=http://host:8000`. `/health`, `/metrics`
