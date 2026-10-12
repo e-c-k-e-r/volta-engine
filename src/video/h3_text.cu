@@ -5,6 +5,7 @@
 #include "engine/core/arena.h"
 #include "engine/core/log.h"
 #include "engine/loader/safetensors.h"
+#include "engine/modules/linear.h"
 #include "h3_kernels.cuh"
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -151,8 +152,21 @@ static __global__ void k_add_rows( float* x, const float* feat, const int* rows,
 	for ( int c = threadIdx.x; c < H; c += blockDim.x ) { x[static_cast<size_t>( rows[i] ) * H + c] += feat[static_cast<size_t>( i ) * H + c]; }
 }
 
+// FP16 branch output [S, H] added to the FP32 stream, optionally scaled per row (the EXL3 projections produce FP16)
+__global__ void k_add_half( float* x, const half* branch, const float* rowscale, int H ) {
+	const int row = blockIdx.x;
+	const float rs = rowscale ? rowscale[row] : 1.0f;
+	for ( int c = threadIdx.x; c < H; c += blockDim.x ) { x[static_cast<size_t>( row ) * H + c] += __half2float( branch[static_cast<size_t>( row ) * H + c] ) * rs; }
+}
+
 struct LayerW {
 	half *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
+	float *in_norm = nullptr, *post_norm = nullptr, *qn = nullptr, *kn = nullptr;
+};
+
+// The same layer with EXL3 (trellis) projections, resident on the device
+struct ExlLayer {
+	pod::LinearWeight q, k, v, o, gate, up, down;
 	float *in_norm = nullptr, *post_norm = nullptr, *qn = nullptr, *kn = nullptr;
 };
 
@@ -163,6 +177,10 @@ struct H3TextEncoder::Impl {
 	int device = 0, max_tokens = 0, layers = 0;
 	pod::MemoryArena slot_arena[2]{}, sarena{};
 	LayerW slot[2];
+	bool exl3 = false;          // resident EXL3 projections instead of streamed BF16 matrices
+	pod::MemoryArena warena{};  // EXL3 weights
+	std::vector<ExlLayer> xl;
+	half* br16 = nullptr;       // FP16 branch output of the EXL3 projections
 	void* staging = nullptr;
 	size_t staging_bytes = 0;
 	cublasHandle_t blas = nullptr;
@@ -229,6 +247,53 @@ struct H3TextEncoder::Impl {
 		return d;
 	}
 
+	// small norm vector -> FP32 on the device (resident EXL3 mode), from BF16 / FP16 / FP32 storage
+	float* upload_vec_resident( const std::string& name ) {
+		const pod::SafeTensorMeta* m = repo.find( name.c_str() );
+		ENGINE_ASSERT( m, "H3 text: missing norm vector" );
+		const void* src = repo.cpu_data( name.c_str() );
+		size_t n = 1;
+		for ( int i = 0; i < m->ndim; ++i ) { n *= static_cast<size_t>( m->shape[i] ); }
+		std::vector<float> host( n );
+		for ( size_t i = 0; i < n; ++i ) {
+			if ( m->dtype == pod::DType::FP32 ) { host[i] = static_cast<const float*>( src )[i]; }
+			else if ( m->dtype == pod::DType::FP16 ) { host[i] = __half2float( static_cast<const half*>( src )[i] ); }
+			else {
+				const uint32_t bits = static_cast<uint32_t>( static_cast<const uint16_t*>( src )[i] ) << 16;
+				std::memcpy( &host[i], &bits, 4 );
+			}
+		}
+		float* d = alloc<float>( warena, n );
+		CUDA_CHECK( cudaMemcpy( d, host.data(), n * sizeof( float ), cudaMemcpyHostToDevice ) );
+		return d;
+	}
+
+	// x [S, K] FP16 -> out [S, N] FP16 through the trellis kernels (fused for few rows, dequantize + HGEMM for many)
+	void lin( const pod::LinearWeight& w, const half* in, half* out, int S, int K, int N ) {
+		pod::TensorView xv = pod::make_tensor_2d( const_cast<half*>( in ), pod::DType::FP16, S, K );
+		pod::TensorView ov = pod::make_tensor_2d( out, pod::DType::FP16, S, N );
+		engine::modules::Linear::forward( xv, w, ov, cs );
+	}
+
+	void run_layer_x( const ExlLayer& w, int S ) {
+		cudaStream_t s = cs;
+		k_norm_mod<half><<<S, 256, 0, s>>>( x, nullptr, nullptr, 0, w.in_norm, nullptr, nullptr, 0, nullptr, kH, kEps, h16 );
+		lin( w.q, h16, q16, S, kH, kNh * kHd );
+		lin( w.k, h16, k16, S, kH, kNkv * kHd );
+		lin( w.v, h16, v16, S, kH, kNkv * kHd );
+		k_qwen_qk<<<dim3( S, ( kNh + kNkv + 7 ) / 8 ), 256, 0, s>>>( q16, k16, w.qn, w.kn, d_pos, S );
+		k_expand_kv<<<( static_cast<size_t>( S ) * kNh * kHd + 255 ) / 256, 256, 0, s>>>( k16, v16, kx16, vx16, S );
+		h3_attention( q16, kx16, vx16, o16, S, S, kNh, 0.08838834764831845f, true, s );
+		lin( w.o, o16, br16, S, kNh * kHd, kH );
+		k_add_half<<<S, 256, 0, s>>>( x, br16, nullptr, kH );
+		k_norm_mod<half><<<S, 256, 0, s>>>( x, nullptr, nullptr, 0, w.post_norm, nullptr, nullptr, 0, nullptr, kH, kEps, h16 );
+		lin( w.gate, h16, g16, S, kH, kFfn );
+		lin( w.up, h16, u16, S, kH, kFfn );
+		k_silu_mul2<<<S, 256, 0, s>>>( g16, u16, f16, rowscale, kFfn );
+		lin( w.down, f16, br16, S, kFfn, kH );
+		k_add_half<<<S, 256, 0, s>>>( x, br16, rowscale, kH );
+	}
+
 	void load_layer( int s, int i ) {
 		engine::core::arena_reset( slot_arena[s] );
 		const std::string p = "model.language_model.layers." + std::to_string( i ) + ".";
@@ -285,6 +350,7 @@ H3TextEncoder::~H3TextEncoder() {
 			if ( p_->slot_arena[i].base_ptr ) { engine::core::arena_destroy( p_->slot_arena[i] ); }
 		}
 		if ( p_->sarena.base_ptr ) { engine::core::arena_destroy( p_->sarena ); }
+		if ( p_->warena.base_ptr ) { engine::core::arena_destroy( p_->warena ); }
 		for ( int i = 0; i < Impl::kPinned; ++i ) { if ( p_->pinned[i] ) { cudaFreeHost( p_->pinned[i] ); } }
 		if ( p_->staging ) { cudaFree( p_->staging ); }
 		delete p_;
@@ -307,21 +373,54 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	CUBLAS_CHECK( cublasSetStream( s.blas, s.cs ) );
 	CUBLAS_CHECK( cublasSetMathMode( s.blas, CUBLAS_DEFAULT_MATH ) );
 	if ( !s.repo.open( dir ) ) { return false; }
-	const size_t layer_bytes = ( static_cast<size_t>( kNh * kHd ) * kH * 2 + static_cast<size_t>( kNkv * kHd ) * kH * 2 + static_cast<size_t>( kFfn ) * kH * 3 ) * sizeof( half ) + ( 4ULL << 20 );
-	for ( int i = 0; i < 2; ++i ) {
-		if ( !h3_scratch_arena_create( s.slot_arena[i], device, layer_bytes ) ) { return false; }
+	s.exl3 = s.repo.find( "model.language_model.layers.0.self_attn.q_proj.trellis" ) != nullptr;
+	if ( s.exl3 ) {
+		// resident EXL3 projections: 7 trellis linears and 4 norm vectors per layer
+		const char* proj[7] = { "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" };
+		size_t bytes = 64ULL << 20;
+		for ( int i = 0; i < layers; ++i ) {
+			const std::string p = "model.language_model.layers." + std::to_string( i ) + ".";
+			for ( const char* pr : proj ) {
+				for ( const char* part : { ".trellis", ".suh", ".svh" } ) {
+					const pod::SafeTensorMeta* m = s.repo.find( ( p + pr + part ).c_str() );
+					if ( !m ) { LOG_ERROR( "H3 text: EXL3 tensor %s%s%s missing", p.c_str(), pr, part ); return false; }
+					bytes += m->size_bytes + 512;
+				}
+			}
+			bytes += 4ULL * kH * 4 + 4096;
+		}
+		if ( !h3_scratch_arena_create( s.warena, device, bytes ) ) { return false; }
+		s.xl.assign( layers, ExlLayer() );
+		for ( int i = 0; i < layers; ++i ) {
+			const std::string p = "model.language_model.layers." + std::to_string( i ) + ".";
+			ExlLayer& w = s.xl[i];
+			pod::LinearWeight* dst[7] = { &w.q, &w.k, &w.v, &w.o, &w.gate, &w.up, &w.down };
+			for ( int j = 0; j < 7; ++j ) { *dst[j] = s.repo.load_linear( ( p + proj[j] ).c_str(), s.warena, 6, s.cs ); }
+			w.in_norm = s.upload_vec_resident( p + "input_layernorm.weight" );
+			w.post_norm = s.upload_vec_resident( p + "post_attention_layernorm.weight" );
+			w.qn = s.upload_vec_resident( p + "self_attn.q_norm.weight" );
+			w.kn = s.upload_vec_resident( p + "self_attn.k_norm.weight" );
+		}
+		CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
+		LOG_INFO( "H3 text: %d EXL3 layers resident, %.2f GB", layers, s.warena.offset_bytes / 1e9 );
+	} else {
+		const size_t layer_bytes = ( static_cast<size_t>( kNh * kHd ) * kH * 2 + static_cast<size_t>( kNkv * kHd ) * kH * 2 + static_cast<size_t>( kFfn ) * kH * 3 ) * sizeof( half ) + ( 4ULL << 20 );
+		for ( int i = 0; i < 2; ++i ) {
+			if ( !h3_scratch_arena_create( s.slot_arena[i], device, layer_bytes ) ) { return false; }
+		}
+		s.staging_bytes = static_cast<size_t>( kFfn ) * kH * 2;
+		CUDA_CHECK( cudaMalloc( &s.staging, s.staging_bytes ) );
+		for ( int i = 0; i < Impl::kPinned; ++i ) {
+			CUDA_CHECK( cudaHostAlloc( &s.pinned[i], Impl::kChunk, cudaHostAllocDefault ) );
+			CUDA_CHECK( cudaEventCreateWithFlags( &s.chunk_free[i], cudaEventDisableTiming ) );
+			CUDA_CHECK( cudaEventRecord( s.chunk_free[i], s.ps ) ); // recorded, so the first wait returns at once
+		}
+		CUDA_CHECK( cudaMemset( s.staging, 0, s.staging_bytes ) );
+		CUDA_CHECK( cudaStreamSynchronize( nullptr ) );
+
 	}
-	s.staging_bytes = static_cast<size_t>( kFfn ) * kH * 2;
-	CUDA_CHECK( cudaMalloc( &s.staging, s.staging_bytes ) );
-	for ( int i = 0; i < Impl::kPinned; ++i ) {
-		CUDA_CHECK( cudaHostAlloc( &s.pinned[i], Impl::kChunk, cudaHostAllocDefault ) );
-		CUDA_CHECK( cudaEventCreateWithFlags( &s.chunk_free[i], cudaEventDisableTiming ) );
-		CUDA_CHECK( cudaEventRecord( s.chunk_free[i], s.ps ) ); // recorded, so the first wait returns at once
-	}
-	CUDA_CHECK( cudaMemset( s.staging, 0, s.staging_bytes ) );
-	CUDA_CHECK( cudaStreamSynchronize( nullptr ) );
 	const size_t S = static_cast<size_t>( max_tokens );
-	const size_t need = S * kH * 4 * 2 + S * 4 * 4 + S * kH * 2 + S * kNh * kHd * 2 * 2 + S * kNkv * kHd * 2 * 2 + S * kNh * kHd * 2 * 2 + S * kFfn * 2 * 3 + ( 16ULL << 20 );
+	const size_t need = S * kH * 4 * 2 + S * 4 * 4 + S * kH * 2 + S * kNh * kHd * 2 * 2 + S * kNkv * kHd * 2 * 2 + S * kNh * kHd * 2 * 2 + S * kFfn * 2 * 3 + S * kH * 2 + ( 16ULL << 20 );
 	if ( !h3_scratch_arena_create( s.sarena, device, need ) ) { return false; }
 	s.x = s.alloc<float>( s.sarena, S * kH );
 	s.br = s.alloc<float>( s.sarena, S * kH );
@@ -338,6 +437,7 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	s.g16 = s.alloc<half>( s.sarena, S * kFfn );
 	s.u16 = s.alloc<half>( s.sarena, S * kFfn );
 	s.f16 = s.alloc<half>( s.sarena, S * kFfn );
+	s.br16 = s.alloc<half>( s.sarena, S * kH );
 	CUDA_CHECK( cudaFuncSetAttribute( k_attn_causal, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304 - 1024 ) );
 	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against
 	return s.repo.find( s.embed_name.c_str() ) != nullptr;
@@ -352,6 +452,7 @@ bool H3TextEncoder::encode_mm( const std::vector<int>& ids, int image_token_id, 
 	// embedding rows (BF16 table on disk) -> FP32; image placeholders take the vision features
 	const pod::SafeTensorMeta* em = s.repo.find( s.embed_name.c_str() );
 	const uint16_t* table = static_cast<const uint16_t*>( s.repo.cpu_data( s.embed_name.c_str() ) );
+	const bool table_fp16 = em->dtype == pod::DType::FP16; // EXL3 conversions keep the embedding in FP16, the source in BF16
 	std::vector<float> rows( static_cast<size_t>( S ) * kH );
 	std::vector<int> pad_rows;
 	std::vector<int> mm( S, 0 );
@@ -359,8 +460,15 @@ bool H3TextEncoder::encode_mm( const std::vector<int>& ids, int image_token_id, 
 		if ( ids[i] < 0 || ids[i] >= em->shape[0] ) { return false; }
 		if ( ids[i] == image_token_id ) { mm[i] = 1; pad_rows.push_back( i ); }
 		for ( int c = 0; c < kH; ++c ) {
-			const uint32_t bits = static_cast<uint32_t>( table[static_cast<size_t>( ids[i] ) * kH + c] ) << 16;
-			std::memcpy( &rows[static_cast<size_t>( i ) * kH + c], &bits, 4 );
+			const uint16_t raw = table[static_cast<size_t>( ids[i] ) * kH + c];
+			if ( table_fp16 ) {
+				half hv;
+				std::memcpy( &hv, &raw, 2 );
+				rows[static_cast<size_t>( i ) * kH + c] = __half2float( hv );
+			} else {
+				const uint32_t bits = static_cast<uint32_t>( raw ) << 16;
+				std::memcpy( &rows[static_cast<size_t>( i ) * kH + c], &bits, 4 );
+			}
 		}
 	}
 	size_t total_tokens = 0;
@@ -417,17 +525,17 @@ bool H3TextEncoder::encode_mm( const std::vector<int>& ids, int image_token_id, 
 	CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
 	// layer pipeline: slot (i % 2) holds layer i; a thread uploads layer i + 1 while layer i computes (slot (i + 1) % 2 held layer i - 1, whose compute ended in the
 	// previous iteration)
-	s.load_layer( 0, 0 );
+	if ( !s.exl3 ) { s.load_layer( 0, 0 ); }
 	for ( int i = 0; i < s.layers; ++i ) {
 		const int cur = i % 2, nxt = 1 - cur;
 		std::thread prefetch;
-		if ( i + 1 < s.layers ) {
+		if ( !s.exl3 && i + 1 < s.layers ) {
 			prefetch = std::thread( [&s, nxt, i] {
 				CUDA_CHECK( cudaSetDevice( s.device ) );
 				s.load_layer( nxt, i + 1 );
 			} );
 		}
-		s.run_layer( s.slot[cur], S );
+		if ( s.exl3 ) { s.run_layer_x( s.xl[i], S ); } else { s.run_layer( s.slot[cur], S ); }
 		if ( d_feat && i < 3 ) {
 			CUDA_CHECK( cudaMemcpyAsync( d_feat, ds[i].data(), pad_rows.size() * kH * sizeof( float ), cudaMemcpyHostToDevice, s.cs ) );
 			CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
