@@ -25,6 +25,7 @@ int main( int argc, char** argv ) {
 		else if ( a == "--resident" ) { resident = true; }
 		else if ( a == "--no-trim" ) { paths.trim_scratch = false; }
 		else if ( a == "--tp" ) { paths.tensor_parallel = true; }
+		else if ( a == "--text-encoder" ) { paths.text_encoder = next(); }
 		else if ( a == "--repeat" ) { repeat = std::max( 1, std::atoi( next() ) ); }
 		else if ( a == "--dit-ref2va" ) { paths.dit_ref2va = next(); }
 		else if ( a == "--device" ) { paths.device = std::atoi( next() ); }
@@ -57,7 +58,7 @@ int main( int argc, char** argv ) {
 	}
 	const bool ref_task = !req.ref_images.empty() || !req.ref_audios.empty() || !req.ref_videos.empty();
 	if ( paths.root.empty() || ( paths.dit.empty() && !( ref_task && !paths.dit_ref2va.empty() ) ) || req.prompt.empty() || req.out.empty() ) {
-		std::fprintf( stderr, "usage: h3_generate --root DIR --dit CKPT --prompt TEXT --out FILE.mp4 [--lora PATH[:scale]] [--steps N] [--size WxH] [--frames N] [--seed N] [--devices 0,1,2,3] [--tp]\n" );
+		std::fprintf( stderr, "usage: h3_generate --root DIR --dit CKPT --prompt TEXT --out FILE.mp4 [--lora PATH[:scale]] [--steps N] [--size WxH] [--frames N] [--seed N] [--devices 0,1,2,3] [--tp] [--text-encoder EXL3_DIR]\n" );
 		return 1;
 	}
 	const std::string* first_image = !req.images.empty() ? &req.images[0] : ( !req.ref_images.empty() ? &req.ref_images[0] : nullptr );

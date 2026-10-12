@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <string>
+#include <chrono>
 #include <thread>
 
 namespace engine::video {
@@ -75,6 +76,27 @@ std::vector<H3Lease<H3VideoVAE>> H3Components::video_vaes( const std::vector<int
 	return out;
 }
 
+H3Lease<H3TextGroup> H3Components::text_group( const std::vector<int>& devices, int tokens ) {
+	if ( paths_.text_encoder.empty() ) { return {}; }
+	if ( resident_ && text_ && text_devices_ == devices && text_tokens_ >= tokens ) { return H3Lease<H3TextGroup>( text_.get() ); }
+	text_.reset();
+	const int capacity = std::max( 8192, tokens );
+	auto group = std::make_unique<H3TextGroup>();
+	const auto t0 = std::chrono::steady_clock::now();
+	if ( !group->load( paths_.text_encoder.c_str(), devices, capacity, 50 ) ) {
+		LOG_ERROR( "H3: cannot load the EXL3 text tower from %s", paths_.text_encoder.c_str() );
+		CUDA_CHECK( cudaSetDevice( paths_.device ) );
+		return {};
+	}
+	LOG_INFO( "H3: EXL3 text tower resident on %zu GPU(s) in %.1f s", devices.size(), std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() );
+	CUDA_CHECK( cudaSetDevice( paths_.device ) );
+	if ( resident_ ) {
+		text_devices_ = devices;
+		text_tokens_ = capacity;
+	}
+	return lease( text_, std::move( group ) );
+}
+
 H3Lease<H3AudioVAE> H3Components::audio_vae() {
 	CUDA_CHECK( cudaSetDevice( paths_.device ) );
 	auto vae = std::make_unique<H3AudioVAE>();
@@ -128,6 +150,7 @@ void H3Components::trim_transformer() {
 }
 
 void H3Components::release() {
+	text_.reset();
 	dit_.reset();
 	dit_checkpoint_.clear();
 	adapter_paths_.clear();

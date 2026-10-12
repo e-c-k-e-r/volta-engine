@@ -50,6 +50,7 @@ struct H3Paths {
 	bool trim_scratch = true;     // H3Engine with a resident transformer: free its activation scratch while the text and decode stages run
 	int resident_rows = 0;        // H3Engine with resident models: packed rows the resident transformer has room for (0 = what the first job needs)
 	std::vector<int> devices;     // GPUs for the DiT (sequence parallel); empty = {device}
+	std::string text_encoder;     // optional: an EXL3 conversion of the Qwen3-VL language model; kept resident and sharded over `devices` instead of streaming the BF16 layers from root/text_encoder for every job
 	bool tensor_parallel = false; // shard the DiT over `devices` by heads / MLP width instead of by rows (needs NCCL; less VRAM per GPU, a little slower)
 };
 

@@ -117,6 +117,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/video/h3_text.cu
 	src/video/h3_vision.cu
 	src/video/h3_dit_group.cpp
+	src/video/h3_text_group.cpp
 	src/video/h3_pipeline.cu
 	src/video/h3_engine.cpp
 	src/video/h3_stage_refs.cpp
@@ -568,3 +569,6 @@ set_target_properties(test_h3_dit_tp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJ
 add_executable(test_h3_text_identity tests/2_parity/test_h3_text_identity.cpp)
 target_link_libraries(test_h3_text_identity PRIVATE engine_kernels)
 set_target_properties(test_h3_text_identity PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_h3_text_tp tests/2_parity/test_h3_text_tp.cpp)
+target_link_libraries(test_h3_text_tp PRIVATE engine_kernels)
+set_target_properties(test_h3_text_tp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

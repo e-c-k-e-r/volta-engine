@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/config.h"
+#include "engine/video/h3_tp.h"
 #include <cstddef>
 #include <string>
 #include <functional>
@@ -26,7 +27,10 @@ public:
 	H3TextEncoder& operator=( const H3TextEncoder& ) = delete;
 
 	// dir: the text_encoder component directory (config.json, model.safetensors.index.json, shards)
-	bool load( const char* dir, int device, int max_tokens = 2048, int layers = 50 );
+	// With an EXL3 checkpoint (trellis projections) the layers stay resident; tp_ranks > 1 loads this rank's shard (16 of 64 query heads, 2 of 8 KV heads and a quarter
+	// of the MLP width at four ranks) and needs set_tp() before encode (see H3TextGroup).
+	bool load( const char* dir, int device, int max_tokens = 2048, int layers = 50, int tp_rank = 0, int tp_ranks = 1 );
+	void set_tp( H3TpComm comm );
 
 	// Hidden states after `layers` decoder layers for the token ids: d_out [ids.size(), 5120] (device, fp32).
 	bool encode( const std::vector<int>& ids, float* d_out );

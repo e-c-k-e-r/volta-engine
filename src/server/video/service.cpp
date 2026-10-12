@@ -24,8 +24,13 @@ bool VideoService::init( const ServerConfig& config ) {
 	paths.devices = s.cfg.video.devices;
 	paths.device = s.cfg.video.devices.empty() ? 0 : s.cfg.video.devices[0];
 	paths.resident_rows = s.cfg.video.max_rows;
+	paths.text_encoder = s.cfg.video.text_encoder;
 	paths.tensor_parallel = s.cfg.video.tensor_parallel && s.cfg.video.devices.size() > 1;
 #if !defined( ENGINE_HAVE_NCCL )
+	if ( !paths.text_encoder.empty() && s.cfg.video.devices.size() > 1 ) {
+		LOG_WARN( "MiniMax-H3 service: the sharded text_encoder needs a build with NCCL; streaming the BF16 text tower\n" );
+		paths.text_encoder.clear();
+	}
 	if ( paths.tensor_parallel ) {
 		LOG_WARN( "MiniMax-H3 service: tensor_parallel needs a build with NCCL; using sequence parallelism\n" );
 		paths.tensor_parallel = false;

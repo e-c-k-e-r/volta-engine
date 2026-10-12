@@ -37,13 +37,13 @@ constexpr float kEps = 1e-6f;
 constexpr float kTheta = 5.0e6f;
 
 // per (token, head) RMSNorm with a 128-weight, then neox rotary over all 128 dims (pairs i, i+64); q heads then k heads
-__global__ void k_qwen_qk( half* q, half* k, const float* qw, const float* kw, const int* pos, int S ) {
+__global__ void k_qwen_qk( half* q, half* k, const float* qw, const float* kw, const int* pos, int S, int nh, int nkv ) {
 	__shared__ float sm[8][128];
 	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
 	const int s = blockIdx.x, task = blockIdx.y * 8 + warp;
-	if ( task >= kNh + kNkv ) { return; }
-	half* p = task < kNh ? q + ( static_cast<size_t>( s ) * kNh + task ) * kHd : k + ( static_cast<size_t>( s ) * kNkv + ( task - kNh ) ) * kHd;
-	const float* w = task < kNh ? qw : kw;
+	if ( task >= nh + nkv ) { return; }
+	half* p = task < nh ? q + ( static_cast<size_t>( s ) * nh + task ) * kHd : k + ( static_cast<size_t>( s ) * nkv + ( task - nh ) ) * kHd;
+	const float* w = task < nh ? qw : kw;
 	float v[4];
 	float ss = 0.0f;
 	#pragma unroll
@@ -70,15 +70,15 @@ __global__ void k_qwen_qk( half* q, half* k, const float* qw, const float* kw, c
 
 // causal GQA attention, one block per (query, head); fine for short prompts
 // GQA: [S, kNkv, kHd] K and V -> [S, kNh, kHd] with every kv head repeated for its group of query heads (the attention kernel has equal head counts)
-__global__ void k_expand_kv( const half* k, const half* v, half* kx, half* vx, int S ) {
+__global__ void k_expand_kv( const half* k, const half* v, half* kx, half* vx, int S, int nh, int nkv ) {
 	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
-	const size_t total = static_cast<size_t>( S ) * kNh * kHd;
+	const size_t total = static_cast<size_t>( S ) * nh * kHd;
 	if ( i >= total ) { return; }
 	const int d = static_cast<int>( i % kHd );
 	const size_t sh = i / kHd;
-	const int h = static_cast<int>( sh % kNh );
-	const size_t s = sh / kNh;
-	const size_t src = ( s * kNkv + h / ( kNh / kNkv ) ) * kHd + d;
+	const int h = static_cast<int>( sh % nh );
+	const size_t s = sh / nh;
+	const size_t src = ( s * nkv + h / ( nh / nkv ) ) * kHd + d;
 	kx[i] = k[src];
 	vx[i] = v[src];
 }
@@ -146,6 +146,34 @@ __global__ void k_silu_mul2( const half* g, const half* u, half* out, float* row
 	}
 }
 
+// tensor-parallel version of the above: the row scale comes from the whole F, so the max over this rank's slice goes to amax[row] (reduced over the ranks by the caller)
+// and k_silu2_apply derives the scale from the global value
+__global__ void k_silu2_amax( const half* g, const half* u, float* amax, int F ) {
+	__shared__ float red[32];
+	const int row = blockIdx.x;
+	float mx = 0.0f;
+	for ( int c = threadIdx.x; c < F; c += blockDim.x ) {
+		const float a = __half2float( g[static_cast<size_t>( row ) * F + c] ), b = __half2float( u[static_cast<size_t>( row ) * F + c] );
+		mx = fmaxf( mx, fabsf( a / ( 1.0f + __expf( -a ) ) * b ) );
+	}
+	mx = block_max( mx, red );
+	if ( threadIdx.x == 0 ) { amax[row] = mx; }
+}
+
+__global__ void k_silu2_apply( const half* g, const half* u, half* out, float* rowscale, int F ) {
+	const int row = blockIdx.x;
+	const float mx = rowscale[row];
+	int e = 0;
+	if ( isfinite( mx ) ) { frexpf( mx, &e ); }
+	const float s = ldexpf( 1.0f, max( e - 11, 0 ) );
+	__syncthreads(); // every thread has read the maximum before it is replaced by the scale
+	if ( threadIdx.x == 0 ) { rowscale[row] = s; }
+	for ( int c = threadIdx.x; c < F; c += blockDim.x ) {
+		const float a = __half2float( g[static_cast<size_t>( row ) * F + c] ), b = __half2float( u[static_cast<size_t>( row ) * F + c] );
+		out[static_cast<size_t>( row ) * F + c] = __float2half_rn( a / ( 1.0f + __expf( -a ) ) * b / s );
+	}
+}
+
 // x[rows[i]] += feat[i] (DeepStack injection)
 static __global__ void k_add_rows( float* x, const float* feat, const int* rows, int H ) {
 	const int i = blockIdx.x;
@@ -181,6 +209,9 @@ struct H3TextEncoder::Impl {
 	pod::MemoryArena warena{};  // EXL3 weights
 	std::vector<ExlLayer> xl;
 	half* br16 = nullptr;       // FP16 branch output of the EXL3 projections
+	int tp_rank = 0, tp_n = 1;  // tensor parallelism of the resident EXL3 mode
+	int nh_l = kNh, nkv_l = kNkv, ffn_l = kFfn; // this rank's query heads, KV heads, MLP width
+	H3TpComm tp_comm;
 	void* staging = nullptr;
 	size_t staging_bytes = 0;
 	cublasHandle_t blas = nullptr;
@@ -277,20 +308,29 @@ struct H3TextEncoder::Impl {
 
 	void run_layer_x( const ExlLayer& w, int S ) {
 		cudaStream_t s = cs;
+		const int qd = nh_l * kHd, kd = nkv_l * kHd;
 		k_norm_mod<half><<<S, 256, 0, s>>>( x, nullptr, nullptr, 0, w.in_norm, nullptr, nullptr, 0, nullptr, kH, kEps, h16 );
-		lin( w.q, h16, q16, S, kH, kNh * kHd );
-		lin( w.k, h16, k16, S, kH, kNkv * kHd );
-		lin( w.v, h16, v16, S, kH, kNkv * kHd );
-		k_qwen_qk<<<dim3( S, ( kNh + kNkv + 7 ) / 8 ), 256, 0, s>>>( q16, k16, w.qn, w.kn, d_pos, S );
-		k_expand_kv<<<( static_cast<size_t>( S ) * kNh * kHd + 255 ) / 256, 256, 0, s>>>( k16, v16, kx16, vx16, S );
-		h3_attention( q16, kx16, vx16, o16, S, S, kNh, 0.08838834764831845f, true, s );
-		lin( w.o, o16, br16, S, kNh * kHd, kH );
+		lin( w.q, h16, q16, S, kH, qd );
+		lin( w.k, h16, k16, S, kH, kd );
+		lin( w.v, h16, v16, S, kH, kd );
+		k_qwen_qk<<<dim3( S, ( nh_l + nkv_l + 7 ) / 8 ), 256, 0, s>>>( q16, k16, w.qn, w.kn, d_pos, S, nh_l, nkv_l );
+		k_expand_kv<<<( static_cast<size_t>( S ) * qd + 255 ) / 256, 256, 0, s>>>( k16, v16, kx16, vx16, S, nh_l, nkv_l );
+		h3_attention( q16, kx16, vx16, o16, S, S, nh_l, 0.08838834764831845f, true, s );
+		lin( w.o, o16, br16, S, qd, kH );
+		if ( tp_n > 1 ) { tp_comm.sum_f16( br16, static_cast<size_t>( S ) * kH, s ); } // partial products of the rank's heads
 		k_add_half<<<S, 256, 0, s>>>( x, br16, nullptr, kH );
 		k_norm_mod<half><<<S, 256, 0, s>>>( x, nullptr, nullptr, 0, w.post_norm, nullptr, nullptr, 0, nullptr, kH, kEps, h16 );
-		lin( w.gate, h16, g16, S, kH, kFfn );
-		lin( w.up, h16, u16, S, kH, kFfn );
-		k_silu_mul2<<<S, 256, 0, s>>>( g16, u16, f16, rowscale, kFfn );
-		lin( w.down, f16, br16, S, kFfn, kH );
+		lin( w.gate, h16, g16, S, kH, ffn_l );
+		lin( w.up, h16, u16, S, kH, ffn_l );
+		if ( tp_n > 1 ) {
+			k_silu2_amax<<<S, 256, 0, s>>>( g16, u16, rowscale, ffn_l );
+			tp_comm.max_f32( rowscale, S, s );
+			k_silu2_apply<<<S, 256, 0, s>>>( g16, u16, f16, rowscale, ffn_l );
+		} else {
+			k_silu_mul2<<<S, 256, 0, s>>>( g16, u16, f16, rowscale, ffn_l );
+		}
+		lin( w.down, f16, br16, S, ffn_l, kH );
+		if ( tp_n > 1 ) { tp_comm.sum_f16( br16, static_cast<size_t>( S ) * kH, s ); }
 		k_add_half<<<S, 256, 0, s>>>( x, br16, rowscale, kH );
 	}
 
@@ -323,9 +363,9 @@ struct H3TextEncoder::Impl {
 		gemm( h16, w.q, q16, S, kNh * kHd, kH, false );
 		gemm( h16, w.k, k16, S, kNkv * kHd, kH, false );
 		gemm( h16, w.v, v16, S, kNkv * kHd, kH, false );
-		k_qwen_qk<<<dim3( S, ( kNh + kNkv + 7 ) / 8 ), 256, 0, s>>>( q16, k16, w.qn, w.kn, d_pos, S );
+		k_qwen_qk<<<dim3( S, ( kNh + kNkv + 7 ) / 8 ), 256, 0, s>>>( q16, k16, w.qn, w.kn, d_pos, S, kNh, kNkv );
 		if ( use_fmha ) {
-			k_expand_kv<<<( static_cast<size_t>( S ) * kNh * kHd + 255 ) / 256, 256, 0, s>>>( k16, v16, kx16, vx16, S );
+			k_expand_kv<<<( static_cast<size_t>( S ) * kNh * kHd + 255 ) / 256, 256, 0, s>>>( k16, v16, kx16, vx16, S, kNh, kNkv );
 			h3_attention( q16, kx16, vx16, o16, S, S, kNh, 0.08838834764831845f, true, s );
 		} else {
 			k_attn_causal<<<dim3( S, kNh ), 128, static_cast<size_t>( S + 8 ) * sizeof( float ), s>>>( q16, k16, v16, o16 );
@@ -357,8 +397,12 @@ H3TextEncoder::~H3TextEncoder() {
 	}
 }
 
-bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layers ) {
+void H3TextEncoder::set_tp( H3TpComm comm ) { p_->tp_comm = std::move( comm ); }
+
+bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layers, int tp_rank, int tp_ranks ) {
 	Impl& s = *p_;
+	s.tp_rank = tp_rank;
+	s.tp_n = std::max( 1, tp_ranks );
 	s.device = device;
 	s.max_tokens = max_tokens;
 	s.layers = layers;
@@ -374,6 +418,13 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	CUBLAS_CHECK( cublasSetMathMode( s.blas, CUBLAS_DEFAULT_MATH ) );
 	if ( !s.repo.open( dir ) ) { return false; }
 	s.exl3 = s.repo.find( "model.language_model.layers.0.self_attn.q_proj.trellis" ) != nullptr;
+	if ( s.tp_n > 1 ) {
+		ENGINE_ASSERT( s.exl3, "H3 text: tensor parallelism needs an EXL3 checkpoint" );
+		ENGINE_ASSERT( kNh % s.tp_n == 0 && kNkv % s.tp_n == 0 && ( kFfn / s.tp_n ) % 128 == 0, "H3 text: the shards must keep whole 128-column Hadamard blocks" );
+		s.nh_l = kNh / s.tp_n;
+		s.nkv_l = kNkv / s.tp_n;
+		s.ffn_l = kFfn / s.tp_n;
+	}
 	if ( s.exl3 ) {
 		// resident EXL3 projections: 7 trellis linears and 4 norm vectors per layer
 		const char* proj[7] = { "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" };
@@ -389,13 +440,18 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 			}
 			bytes += 4ULL * kH * 4 + 4096;
 		}
+		if ( s.tp_n > 1 ) { bytes = bytes / s.tp_n + ( 256ULL << 20 ); }
 		if ( !h3_scratch_arena_create( s.warena, device, bytes ) ) { return false; }
 		s.xl.assign( layers, ExlLayer() );
 		for ( int i = 0; i < layers; ++i ) {
 			const std::string p = "model.language_model.layers." + std::to_string( i ) + ".";
 			ExlLayer& w = s.xl[i];
 			pod::LinearWeight* dst[7] = { &w.q, &w.k, &w.v, &w.o, &w.gate, &w.up, &w.down };
-			for ( int j = 0; j < 7; ++j ) { *dst[j] = s.repo.load_linear( ( p + proj[j] ).c_str(), s.warena, 6, s.cs ); }
+			for ( int j = 0; j < 7; ++j ) {
+				// q, k, v, gate, up split their outputs (column parallel); o and down split their inputs (row parallel)
+				const bool row_parallel = j == 3 || j == 6;
+				*dst[j] = s.tp_n > 1 ? s.repo.load_linear_slice( ( p + proj[j] ).c_str(), s.warena, 6, row_parallel ? 0 : 1, s.tp_rank, s.tp_n, s.cs ) : s.repo.load_linear( ( p + proj[j] ).c_str(), s.warena, 6, s.cs );
+			}
 			w.in_norm = s.upload_vec_resident( p + "input_layernorm.weight" );
 			w.post_norm = s.upload_vec_resident( p + "post_attention_layernorm.weight" );
 			w.qn = s.upload_vec_resident( p + "self_attn.q_norm.weight" );
@@ -420,23 +476,23 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 
 	}
 	const size_t S = static_cast<size_t>( max_tokens );
-	const size_t need = S * kH * 4 * 2 + S * 4 * 4 + S * kH * 2 + S * kNh * kHd * 2 * 2 + S * kNkv * kHd * 2 * 2 + S * kNh * kHd * 2 * 2 + S * kFfn * 2 * 3 + S * kH * 2 + ( 16ULL << 20 );
+	const size_t need = S * kH * 4 * 2 + S * 4 * 4 + S * kH * 2 + S * s.nh_l * kHd * 2 * 2 + S * s.nkv_l * kHd * 2 * 2 + S * s.nh_l * kHd * 2 * 2 + S * s.ffn_l * 2 * 3 + S * kH * 2 + ( 16ULL << 20 );
 	if ( !h3_scratch_arena_create( s.sarena, device, need ) ) { return false; }
 	s.x = s.alloc<float>( s.sarena, S * kH );
 	s.br = s.alloc<float>( s.sarena, S * kH );
 	s.rowscale = s.alloc<float>( s.sarena, S );
 	s.d_pos = s.alloc<int>( s.sarena, 3 * S );
 	s.h16 = s.alloc<half>( s.sarena, S * kH );
-	s.q16 = s.alloc<half>( s.sarena, S * kNh * kHd );
-	s.o16 = s.alloc<half>( s.sarena, S * kNh * kHd );
-	s.k16 = s.alloc<half>( s.sarena, S * kNkv * kHd );
-	s.v16 = s.alloc<half>( s.sarena, S * kNkv * kHd );
-	s.kx16 = s.alloc<half>( s.sarena, S * kNh * kHd );
-	s.vx16 = s.alloc<half>( s.sarena, S * kNh * kHd );
+	s.q16 = s.alloc<half>( s.sarena, S * s.nh_l * kHd );
+	s.o16 = s.alloc<half>( s.sarena, S * s.nh_l * kHd );
+	s.k16 = s.alloc<half>( s.sarena, S * s.nkv_l * kHd );
+	s.v16 = s.alloc<half>( s.sarena, S * s.nkv_l * kHd );
+	s.kx16 = s.alloc<half>( s.sarena, S * s.nh_l * kHd );
+	s.vx16 = s.alloc<half>( s.sarena, S * s.nh_l * kHd );
 	s.use_fmha = true;
-	s.g16 = s.alloc<half>( s.sarena, S * kFfn );
-	s.u16 = s.alloc<half>( s.sarena, S * kFfn );
-	s.f16 = s.alloc<half>( s.sarena, S * kFfn );
+	s.g16 = s.alloc<half>( s.sarena, S * s.ffn_l );
+	s.u16 = s.alloc<half>( s.sarena, S * s.ffn_l );
+	s.f16 = s.alloc<half>( s.sarena, S * s.ffn_l );
 	s.br16 = s.alloc<half>( s.sarena, S * kH );
 	CUDA_CHECK( cudaFuncSetAttribute( k_attn_causal, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304 - 1024 ) );
 	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against

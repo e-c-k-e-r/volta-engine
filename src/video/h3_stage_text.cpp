@@ -77,7 +77,13 @@ bool H3Run::encode_prompt() {
 	float* d_prompt = nullptr;
 	CUDA_CHECK( cudaMalloc( &d_prompt, ids.size() * 5120 * sizeof( float ) ) );
 	const auto tl0 = std::chrono::steady_clock::now();
-	{
+	if ( !paths.text_encoder.empty() ) {
+		std::vector<int> devices = paths.devices;
+		if ( devices.empty() ) { devices.push_back( paths.device ); }
+		H3Lease<H3TextGroup> group = comp.text_group( devices, static_cast<int>( ids.size() ) );
+		if ( !group ) { return false; }
+		if ( !group->encode_mm( ids, image_pad, feats, d_prompt ) ) { return false; }
+	} else {
 		H3TextEncoder enc;
 		if ( !enc.load( ( paths.root + "/text_encoder" ).c_str(), paths.device, std::max<int>( 8192, static_cast<int>( ids.size() ) ), 50 ) || !enc.encode_mm( ids, image_pad, feats, d_prompt ) ) { return false; }
 	}

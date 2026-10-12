@@ -5,6 +5,7 @@
 #include "engine/video/h3_audio.h"
 #include "engine/video/h3_dit_group.h"
 #include "engine/video/h3_pipeline.h"
+#include "engine/video/h3_text_group.h"
 #include "engine/video/h3_vae.h"
 #include "engine/video/h3_vae_enc.h"
 #include <memory>
@@ -46,6 +47,9 @@ public:
 	H3Lease<H3AudioVAE> audio_vae();
 	// The transformer for `checkpoint` on `devices`, with room for `rows` packed rows. A resident one is reused while its checkpoint matches and its room is enough;
 	// otherwise it is freed first (two transformers do not fit together) and loaded again.
+	// The resident EXL3 text tower (paths.text_encoder) on `devices`, with room for `tokens` tokens; empty when paths.text_encoder is not set or it cannot be loaded.
+	// Kept loaded between jobs when resident (reloaded if a longer prompt needs more room).
+	H3Lease<H3TextGroup> text_group( const std::vector<int>& devices, int tokens );
 	H3Lease<H3DiTGroup> dit( const std::string& checkpoint, const std::vector<int>& devices, int rows );
 	// Makes `loras` the adapters of `dit`: a resident transformer keeps the staged adapters when the list is unchanged and only updates their scales.
 	bool set_adapters( H3Lease<H3DiTGroup>& dit, const std::vector<H3Lora>& loras );
@@ -69,6 +73,9 @@ private:
 	bool resident_;
 	bool have_params_ = false;
 	H3VaeParams params_;
+	std::unique_ptr<H3TextGroup> text_;
+	std::vector<int> text_devices_;
+	int text_tokens_ = 0;
 	std::unique_ptr<H3DiTGroup> dit_;
 	std::string dit_checkpoint_;
 	std::vector<int> dit_devices_;

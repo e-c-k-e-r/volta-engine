@@ -11,6 +11,8 @@
 // un-rotated (the 256-group Hadamard folded into the stored matrix) into an FP16 scratch right before its GEMM.
 // Numerics follow 1Cat's reference: FP32 residual stream, FP16 tensor-core GEMMs with FP32 accumulation, FP32 outputs for
 // the wide-range projections (attention out, MLP down), pow-2 row scaling of the gated MLP activation.
+#include "engine/video/h3_tp.h"
+
 namespace engine::video {
 
 struct half_ptr_pair {
@@ -26,12 +28,6 @@ struct H3SpExchange {
 	std::function<void( int, void* )> begin;
 	std::function<void( int, void* )> wait_peer;
 	std::function<void( void* )> end;
-};
-
-// Collectives of a tensor-parallel group, enqueued on the DiT's compute stream (the group provides them, e.g. over NCCL)
-struct H3TpComm {
-	std::function<void( float* buf, size_t count, void* stream )> sum_f32; // in place, summed over the ranks
-	std::function<void( float* buf, size_t count, void* stream )> max_f32; // in place, maximum over the ranks
 };
 
 struct H3Config {
