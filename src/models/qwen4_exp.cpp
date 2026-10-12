@@ -358,13 +358,20 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		backend::stream_sync( stream );
 	}
 
+	// The MTP head comes from the NVFP4 checkpoint when mtp_nvfp4 is set: its dense tensors are BF16 there and its experts FP8 with block scales
+	const bool mtp_nv = mtp_on_ && runtime::options().mtp_nvfp4;
+	if ( mtp_nv && !nv_repo ) {
+		LOG_ERROR( "[RANK %d] mtp_nvfp4 needs nvfp4_experts (the checkpoint that holds the head)\n", rank_ );
+		return false;
+	}
+	engine::loader::SafeTensorsRepo* src = &repo;   // where dense tensors are read from: the model directory, or the NVFP4 checkpoint for the MTP head
 	auto dense = [&]( const char* name ) {
-		const pod::TensorView t = repo.load( name, *arena_, stream, pod::DType::FP16 );
+		const pod::TensorView t = src->load( name, *arena_, stream, pod::DType::FP16 );
 		if ( !t.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, name ); ++missing; }
 		return t;
 	};
 	auto dense_slice = [&]( const char* name ) {
-		const pod::TensorView t = repo.load_slice( name, *arena_, 0, rank_, tp, stream, pod::DType::FP16 );
+		const pod::TensorView t = src->load_slice( name, *arena_, 0, rank_, tp, stream, pod::DType::FP16 );
 		if ( !t.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, name ); ++missing; }
 		return t;
 	};
@@ -401,11 +408,13 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	auto load_row = [&]( const char* name, int bits ) { return check( repo.load_linear_slice( name, *arena_, bits, 0, rank_, tp, stream ), name ); };
 	// Dense groups quantized to NVFP4 at load from the BF16 tensors of the NVFP4 checkpoint (ENGINE_NVFP4_DENSE); otherwise the trellis tensors
 	const std::string& nv_groups = runtime::options().nvfp4_dense;
-	bool in_mtp = false;   // the MTP head keeps its own (EXL3) tensors
+	bool in_mtp = false;   // the MTP head keeps its own tensors: EXL3, or (mtp_nvfp4) quantized from the NVFP4 checkpoint's FP8 / BF16 ones
 	// A group is on when named in the list, or "all"; `shared` also covers its parts shared_gate / shared_up / shared_down
 	auto nv_listed = [&]( const std::string& g ) { return ( "," + nv_groups + "," ).find( "," + g + "," ) != std::string::npos; };
 	auto nv_on = [&]( const char* group ) {
-		if ( !nv_repo || in_mtp || nv_groups.empty() ) return false;
+		if ( !nv_repo ) return false;
+		if ( in_mtp ) return mtp_nv && std::strcmp( group, "head" ) != 0;   // the whole head, every projection
+		if ( nv_groups.empty() ) return false;
 		const std::string g = group;
 		return nv_groups == "all" || nv_listed( g ) || ( g.rfind( "shared_", 0 ) == 0 && nv_listed( "shared" ) );
 	};
@@ -512,10 +521,10 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 
 		// MoE: replicated router, 128 whole experts per rank, shared expert (replicated, run on one rank) and its gate
 		std::snprintf( nm, sizeof( nm ), "%s.mlp.gate.weight", pre );
-		lw.router = load_router_transposed( repo, nm, *arena_ );
+		lw.router = load_router_transposed( *src, nm, *arena_ );
 		if ( !lw.router.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, nm ); ++missing; }
 		auto& mw = lw.experts;
-		const bool nv_experts = nv_repo && !in_mtp;
+		const bool nv_experts = nv_repo && ( !in_mtp || mtp_nv );
 		mw.type = nv_experts ? pod::QuantType::NVFP4 : pod::QuantType::TRELLIS;
 		const int per_rank = config_.num_experts / tp;
 		ENGINE_ASSERT( per_rank <= MOE_MAX_EXPERTS, "Qwen4ExpPipeline: experts per rank exceed MOE_MAX_EXPERTS" );
@@ -552,6 +561,13 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 			pod::MemoryArena ca[3];
 			if ( tier_layer >= 0 ) for ( int p = 0; p < 3; ++p ) tier_.code_arena( tier_layer, e, p, ca[p] );
 			pod::MemoryArena* cp[3] = { tier_layer >= 0 ? &ca[0] : nullptr, tier_layer >= 0 ? &ca[1] : nullptr, tier_layer >= 0 ? &ca[2] : nullptr };
+			if ( nv_experts && in_mtp ) {
+				// The head's experts are FP8 with 128 x 128 block scales: dequantized and quantized to NVFP4 (round to nearest) here
+				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.gate_proj", pre, gid ); mw.gate[e] = check( nv_repo->quantize_nvfp4_slice( nm, *arena_, true, 0, 1, 0, stream ), nm );
+				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.up_proj", pre, gid ); mw.up[e] = check( nv_repo->quantize_nvfp4_slice( nm, *arena_, true, 0, 1, 0, stream ), nm );
+				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.down_proj", pre, gid ); mw.down[e] = check( nv_repo->quantize_nvfp4_slice( nm, *arena_, true, 0, 1, 0, stream ), nm );
+				continue;
+			}
 			if ( nv_experts ) {
 				// modelopt NVFP4 experts: [N, K/2] codes, E4M3 block scales, one FP32 global scale per matrix
 				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.gate_proj", pre, gid ); mw.gate[e] = check( nv_repo->load_nvfp4_slice( nm, *arena_, true, 0, 1, stream, 0, cp[0] ), nm );
@@ -580,11 +596,15 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		// MTP head: one full-attention block with its own gated-residual sites and MoE, the input combine and its own mixer
 		mtp_layer_.is_full_attention = true;
 		in_mtp = true;
+		if ( mtp_nv ) {
+			src = nv_repo.get();
+			LOG_INFO( "[RANK %d] MTP head from the NVFP4 checkpoint (FP8 experts and BF16 dense tensors quantized to NVFP4)\n", rank_ );
+		}
 		load_block( mtp_layer_, "mtp.layers.0" );
 		mtp_pre_norm_hidden_ = dense( "mtp.pre_fc_norm_hidden.weight" );
 		mtp_pre_norm_embedding_ = dense( "mtp.pre_fc_norm_embedding.weight" );
-		mtp_fc_hidden_ = check( repo.load_linear( "mtp.fc_hidden", *arena_, 4, stream ), "mtp.fc_hidden" );
-		mtp_fc_embedding_ = check( repo.load_linear( "mtp.fc_embedding", *arena_, 4, stream ), "mtp.fc_embedding" );
+		mtp_fc_hidden_ = mtp_nv ? check( nv_repo->quantize_nvfp4_slice( "mtp.fc_hidden", *arena_, true, 0, 1, 0, stream ), "mtp.fc_hidden" ) : check( repo.load_linear( "mtp.fc_hidden", *arena_, 4, stream ), "mtp.fc_hidden" );
+		mtp_fc_embedding_ = mtp_nv ? check( nv_repo->quantize_nvfp4_slice( "mtp.fc_embedding", *arena_, true, 0, 1, 0, stream ), "mtp.fc_embedding" ) : check( repo.load_linear( "mtp.fc_embedding", *arena_, 4, stream ), "mtp.fc_embedding" );
 		mtp_mixer_ = load_gr( "mtp.hyper_connection_mixer", false );
 	}
 	(void) H;

@@ -16,6 +16,8 @@
 #   qwen_mtp        Qwen3.8-27B EXL3 + its own MTP head
 #   flash_mtp7      Flash-Next EXL3 4.0 bpw + NVFP4 experts / dense groups, MTP depth 7 (default)
 #   flash_mtp4      the same at MTP depth 4 (their contract: 5-row verify)
+#   flash_mtp7_nv   flash_mtp7 with the MTP head from the NVFP4 checkpoint (mtp_nvfp4: FP8 / BF16 head requantized to NVFP4) instead of the Swift one
+#   flash_mtp4_nv   the same at depth 4
 #   flash_exl3      Flash-Next EXL3 4.0 bpw only, MTP depth 7
 # defaults for the benchmark: --cases fixed4k,fixed8k,natural8k --repeats 3 (add --cases fixed32k, fixed128k, --concurrency 4 for the rest)
 set -u
@@ -33,11 +35,12 @@ case $ARM in
 	qwen_nvfp4)     args=(--model-dir $M/Qwen3.8-27B-QUASAR-NVFP4 --speculative --draft-model-dir $M/Qwen3.8-27B-DFlash2) ;;
 	qwen_plain)     args=(--model-dir $M/Qwen3.8-27B-exl3) ;;
 	qwen_mtp)       args=(--model-dir $M/Qwen3.8-27B-exl3 --speculative --set speculator=mtp) ;;
-	flash_mtp7|flash_mtp4|flash_exl3)
-		depth=7; [ $ARM = flash_mtp4 ] && depth=4
+	flash_mtp7|flash_mtp4|flash_exl3|flash_mtp7_nv|flash_mtp4_nv)
+		depth=7; [[ $ARM == flash_mtp4* ]] && depth=4
 		args=(--model-dir $M/Swift-Qwen3.8-Flash-Next-exl3-4.00bpw --speculative --set speculator=mtp --set mtp_depth=$depth)
 		[ $ARM != flash_exl3 ] && args+=(--set nvfp4_experts=$M/Qwen3.8-Flash-Next-NVFP4 --set nvfp4_dense_dir=$M/Qwen3.8-Flash-Next-NVFP4-dense
-			--set nvfp4_dense=gdn,attn,idx,head,shared_gate,shared_up) ;;
+			--set nvfp4_dense=gdn,attn,idx,head,shared_gate,shared_up)
+		[[ $ARM == *_nv ]] && args+=(--set mtp_nvfp4=true) ;;
 	glm_plain|glm_dflash|glm_dflash_fp16|glm_256k)
 		common=(--tp-size 4 --port $PORT --host 127.0.0.1 --set prefix_cache_gib=0 --set max_seq=12288 --set max_slots=1)
 		args=(--model-dir $M/GLM-5.3-Flash-exl3-3.05bpw --set nvfp4_dense_src=$M/GLM-5.3-Flash-NVFP4 --set nvfp4_dense_dir=$M/GLM-5.3-Flash-NVFP4-dense

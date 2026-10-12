@@ -229,6 +229,17 @@ pod::LinearWeight SafeTensorsRepo::load_nvfp4_concat(
 	return repack_nvfp4( src, arena, new_begin.data(), counts.data(), parts, k0, kcount, pad_n, stream );
 }
 
+namespace {
+
+// Element (r, c) of a quantization source, in float: BF16 / FP16 as stored, FP8 E4M3 times the block scale of its 128 x 128 block
+template <typename Part>
+float part_value( const Part& p, int r, int c ) {
+	if ( !p.fp8 ) return bf16_or_fp16_to_float( p.w + ( static_cast<size_t>( r ) * p.K + c ) * 2, p.bf16 );
+	return e4m3_to_float( p.w[static_cast<size_t>( r ) * p.K + c] ) * bf16_or_fp16_to_float( p.sc + ( static_cast<size_t>( r / 128 ) * p.sK + c / 128 ) * 2, true );
+}
+
+}  // namespace
+
 pod::LinearWeight SafeTensorsRepo::quantize_nvfp4_concat(
 	const char* const* base_names,
 	const int* n_begin,
@@ -240,21 +251,28 @@ pod::LinearWeight SafeTensorsRepo::quantize_nvfp4_concat(
 	pod::MemoryArena& arena,
 	backend::stream_t stream
 ) {
-	struct Part { const uint8_t* w; bool bf16; int N, K; };
+	// A source is BF16 / FP16, or FP8 E4M3 with 128 x 128 block scales (<base>.weight_scale_inv, BF16, the multiplier of the dequantized block)
+	struct Part { const uint8_t* w; bool bf16; int N, K; bool fp8; const uint8_t* sc; int sK; };
 	std::vector<Part> src_parts( parts );
 	char name[300];
 	float amax = 0.0f;
 	for ( int i = 0; i < parts; ++i ) {
 		std::snprintf( name, sizeof( name ), "%s.weight", base_names[i] );
 		const auto* mp = find( name );
-		if ( !mp || mp->ndim != 2 || ( mp->dtype != pod::DType::BF16 && mp->dtype != pod::DType::FP16 ) ) return pod::LinearWeight{};
+		if ( !mp || mp->ndim != 2 ) return pod::LinearWeight{};
+		std::snprintf( name, sizeof( name ), "%s.weight_scale_inv", base_names[i] );
+		const bool fp8 = mp->dtype == pod::DType::UINT8 && find( name ) != nullptr;
+		if ( !fp8 && mp->dtype != pod::DType::BF16 && mp->dtype != pod::DType::FP16 ) return pod::LinearWeight{};
+		const uint8_t* sc = fp8 ? static_cast<const uint8_t*>( cpu_data( name ) ) : nullptr;
+		std::snprintf( name, sizeof( name ), "%s.weight", base_names[i] );
 		const uint8_t* w = static_cast<const uint8_t*>( cpu_data( name ) );
-		if ( !w ) return pod::LinearWeight{};
-		src_parts[i] = { w, mp->dtype == pod::DType::BF16, mp->shape[0], mp->shape[1] };
+		if ( !w || ( fp8 && !sc ) ) return pod::LinearWeight{};
+		ENGINE_ASSERT( !fp8 || ( mp->shape[0] % 128 == 0 && mp->shape[1] % 128 == 0 ), "quantize_nvfp4: FP8 sources need 128-multiple dimensions" );
+		src_parts[i] = { w, mp->dtype == pod::DType::BF16, mp->shape[0], mp->shape[1], fp8, sc, mp->shape[1] / 128 };
 		ENGINE_ASSERT( src_parts[i].K == src_parts[0].K && k0 % 16 == 0 && kcount % 64 == 0 && k0 + kcount <= src_parts[i].K, "quantize_nvfp4: bad K range" );
 		ENGINE_ASSERT( n_begin[i] >= 0 && n_begin[i] + n_count[i] <= src_parts[i].N, "quantize_nvfp4: bad N range" );
 		// Global scale from the whole tensors (so every rank's slice of one matrix shares it): the largest block scale maps to the E4M3 maximum
-		for ( size_t e = 0; e < static_cast<size_t>( src_parts[i].N ) * src_parts[i].K; ++e ) amax = std::fmax( amax, std::fabs( bf16_or_fp16_to_float( w + e * 2, src_parts[i].bf16 ) ) );
+		for ( int r = 0; r < src_parts[i].N; ++r ) for ( int c = 0; c < src_parts[i].K; ++c ) amax = std::fmax( amax, std::fabs( part_value( src_parts[i], r, c ) ) );
 	}
 	const float gs = amax > 0.0f ? amax / ( 6.0f * 448.0f ) : 1.0f;
 
@@ -273,10 +291,10 @@ pod::LinearWeight SafeTensorsRepo::quantize_nvfp4_concat(
 		float v[16];
 		for ( int r = r0; r < r1; ++r ) {
 			const Part& pt = src_parts[row_src[r].part];
-			const uint8_t* row = pt.w + ( static_cast<size_t>( row_src[r].row ) * pt.K + k0 ) * 2;
+			const int src_row = row_src[r].row;
 			for ( int g = 0; g < kcount / 16; ++g ) {
 				float bmax = 0.0f;
-				for ( int i = 0; i < 16; ++i ) { v[i] = bf16_or_fp16_to_float( row + ( g * 16 + i ) * 2, pt.bf16 ); bmax = std::fmax( bmax, std::fabs( v[i] ) ); }
+				for ( int i = 0; i < 16; ++i ) { v[i] = part_value( pt, src_row, k0 + g * 16 + i ); bmax = std::fmax( bmax, std::fabs( v[i] ) ); }
 				// Start from the E4M3 scale nearest to amax / 6, then keep the neighbour (+-2 codes) with the smallest squared error
 				const float ideal = bmax / ( 6.0f * gs );
 				int c0 = static_cast<int>( std::lower_bound( et.begin(), et.end(), ideal ) - et.begin() );

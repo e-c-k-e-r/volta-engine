@@ -28,7 +28,7 @@ The model type is read from the checkpoint, never configured. Anything else is a
 | int8 dp4a GEMV and MoE tiles for short runs (the 7 / 8-bit projections, GLM experts up to 4 rows) | default | | `test_gemv_int8`, `bench_decode` |
 | NVFP4 (compressed-tensors and modelopt), software-unpacked FP16 `m8n8k4` kernels | opt-in | `nvfp4_experts`, `nvfp4_dense`, `nvfp4_dense_src` | `test_nvfp4_linear`, `bench_nvfp4*` |
 | NVFP4 dense groups from a calibrated (LDLQ) directory instead of round-to-nearest | opt-in | `nvfp4_dense_dir`, `hessian_dir`, `hessian_layers` | `test_ppl`, `tests/tools/nvfp4_ldlq.py` |
-| Mixed checkpoints: EXL3 directory stays the model, NVFP4 pieces swapped in at load | opt-in | as above | `configs/flash_next_nvfp4.json`, `configs/glm_nvfp4_dense.json` |
+| Mixed checkpoints: EXL3 directory stays the model, NVFP4 pieces swapped in at load | opt-in | as above | `configs/flash_next_nvfp4.json`, `configs/qwen_nvfp4.json`, `configs/glm_nvfp4_dense.json`, `configs/glm_256k.json` |
 | Two-tier expert residency (hot experts on the GPU, the rest in pinned host RAM, rebalanced online) | opt-in | `expert_cache`, `expert_adapt_every`, `expert_swaps` | `test_moe`, `bench_expert_heat` |
 
 * NVFP4 experts for GLM are not built: they do not fit in VRAM and the offload penalty rules them out. Dense NVFP4 groups on GLM take the 8-row verify from 48 to about 34 ms.

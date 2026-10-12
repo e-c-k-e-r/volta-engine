@@ -62,8 +62,8 @@ Qwen extras:
   with 2 slots fits (24.3 of 29.8 GiB per GPU). Images use the checkpoint's own tower. Prefix caching, tools and thinking behave as for Qwen.
 * **MTP speculation**: `--speculative --set speculator=mtp` drafts with the checkpoint's own multi-token-prediction head and
   needs no draft model (about 1.7x plain decoding against 2.4x for DFlash2 on the same prompts, and it saves the drafter's VRAM).
-* **NVFP4 weights** (modelopt NVFP4 checkpoints of the same models; details and numbers in [FLASH_NEXT.md](FLASH_NEXT.md), examples `configs/flash_next_nvfp4.json`
-  and `configs/glm_nvfp4_dense.json`): the EXL3 directory stays the model directory and supplies everything not replaced. Flash-Next:
+* **NVFP4 weights** (modelopt NVFP4 checkpoints of the same models; details and numbers in [FLASH_NEXT.md](FLASH_NEXT.md), examples `configs/flash_next_nvfp4.json`,
+  `configs/glm_nvfp4_dense.json` for the 12K window and `configs/glm_256k.json` for 256K with two slots; the Qwen NVFP4 checkpoint runs as it is, `configs/qwen_nvfp4.json`): the EXL3 directory stays the model directory and supplies everything not replaced. Flash-Next:
   `nvfp4_experts=<NVFP4 dir>` takes the routed experts from the NVFP4 checkpoint (and is also the BF16 source for dense tensors), `nvfp4_dense=<groups>`
   (`gdn,attn,idx,head,shared_gate,shared_up` recommended; `all` adds `shared_down`, which costs perplexity) quantizes those dense groups at load, and
   `nvfp4_dense_dir=<dir>` loads calibrated tensors made by `tests/tools/nvfp4_ldlq.py` instead of round-to-nearest. GLM-5.3-Flash: `nvfp4_dense_src=<NVFP4 dir>` plus
