@@ -89,3 +89,12 @@ Per GPU specifications:
   $$\text{Max Cooperative Blocks} = 80 \times 1 = \mathbf{80\text{ blocks}}$$
 - Launching $\ge 81$ blocks will cause the first 80 blocks to wait at `grid.sync()` for the 81st block, which cannot be scheduled until one of the first 80 exits $\rightarrow$ **Permanent hardware deadlock**.
 - **Rule**: Never use cooperative grid sync for layers where grid size exceeds resident capacity (e.g. wide MLP layers where $N / 128 > 80$).
+
+### 5.5 Tensor-core fragment layouts (probed, for kernels that bypass WMMA's opaque fragments)
+- **`mma.m8n8k4`**: four independent 8 x 8 x 4 products per warp, one per octet (lanes {0-3, 16-19} + 4 * o). In an octet, lane (t = lane & 3, h = lane >> 4) supplies A row t + 4 h and
+  B column t + 4 h (four k values each, a0 = k0 k1, a1 = k2 k3; only the k order must agree on both sides) and holds D[m][n] with m = (t & 1) + 2 ((reg >> 1) & 1) + 4 h, n = (reg & 1) + 2 (t >> 1) + 4 (reg >> 2).
+- **WMMA 16 x 16 FP32 accumulator** (what `h3_attn.cu` does its online softmax on): element `i` (0..7) of lane `lane` sits at
+  row = (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4 + 2 * ((i >> 1) & 1) and col = ((lane >> 1) & 1) * 2 + ((lane >> 3) & 1) * 8 + (i & 1) + 4 * ((i >> 2) & 1). A row's elements are spread over
+  lanes that differ in bits 1 and 3, so a row reduction is two `shfl_xor` steps (2 and 8). The accumulator layout is not the `matrix_a` layout: P goes through shared memory between the two products.
+- Register budget: a head_dim-128 attention warp holds Q (64 registers), the FP32 output (64) and the score tile (32) and sits at the 255-register limit; padding shared-memory rows by 16 halves removes
+  most bank conflicts (worth ~15%).
