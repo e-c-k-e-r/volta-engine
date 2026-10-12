@@ -1,10 +1,13 @@
-// Portable reference attention over the paged FP16 KV cache (decode semantics of attn_chunked_paged_kernel; slow but simple).
+// Portable reference attention over the paged KV cache (FP16, or any quantized format of kv_codec.slang through ks / vs / kq / vq) (decode semantics of attn_chunked_paged_kernel; slow but simple).
 // Row m of the call reads slot slots[m] at position pos[m] and attends causally to positions 0..pos[m], so the same kernel is
 // the decode form and the causal prefill form (a chunk is a run of rows whose pos values ascend within one slot).
 // Cache layout [slot][layer][max_seq][num_kv_heads * head_dim]; q, gate and out are [rows][num_q_heads][head_dim].
 // One thread group per (head, row): x = head, y = row. head_dim <= 256. FP32 softmax with the running-max subtraction.
 // The GPU entry streams keys in tiles of 256 (scores in shared memory, tree reductions); the host target has no group
 // barriers, so it gets a serial two-pass entry under ENGINE_TARGET_CPU.
+// kq / vq are the KVQ codes (0 = FP16, where k / v are read as halves and ks / vs are unused). Q4 values are stored Hadamard-rotated per
+// 64 elements, so the attended output is rotated back per 64 (head_dim must be a multiple of 64 then).
+#include "kv_codec.slang"
 
 struct RefAttnParams {
 	half* q;
@@ -22,7 +25,19 @@ struct RefAttnParams {
 	int max_seq;
 	int has_gate;
 	float scale;
+	uint8_t* ks;      // K / V scales for the quantized formats
+	uint8_t* vs;
+	int kq;
+	int vq;
 };
+
+float ref_kv_k(RefAttnParams p, int64_t i) {
+	return p.kq == 0 ? float(p.k[i]) : kv_load((uint8_t*)p.k, p.ks, p.kq, i);
+}
+
+float ref_kv_v(RefAttnParams p, int64_t i) {
+	return p.vq == 0 ? float(p.v[i]) : kv_load((uint8_t*)p.v, p.vs, p.vq, i);
+}
 
 float ref_attn_gate(RefAttnParams p, int64_t idx) {
 	if (p.has_gate == 0) return 1.0f;
@@ -59,7 +74,7 @@ void ref_attn_decode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, unifo
 		if (t < nk) {
 			let kp = base + int64_t(t0 + t) * row_elems;
 			float dot = 0.0f;
-			for (int d = 0; d < p.head_dim; ++d) dot = fma(s_q[d], float(p.k[kp + d]), dot);
+			for (int d = 0; d < p.head_dim; ++d) dot = fma(s_q[d], ref_kv_k(p, kp + d), dot);
 			score = dot * p.scale;
 		}
 		s_red[t] = score;
@@ -83,14 +98,22 @@ void ref_attn_decode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, unifo
 		m_run = m_new;
 		o *= alpha;
 		if (active) {
-			for (int k = 0; k < nk; ++k) o = fma(s_s[k], float(p.v[base + int64_t(t0 + k) * row_elems + t]), o);
+			for (int k = 0; k < nk; ++k) o = fma(s_s[k], ref_kv_v(p, base + int64_t(t0 + k) * row_elems + t), o);
 		}
 		GroupMemoryBarrierWithGroupSync();   // s_s / s_red are rewritten by the next tile
 	}
-	if (active) {
-		let val = l_run > 0.0f ? o / l_run : 0.0f;
-		p.out_[qo + t] = half(val * ref_attn_gate(p, qo + t));
+	float val = l_run > 0.0f ? o / l_run : 0.0f;
+	if (p.vq == 3) {
+		// undo the per-64 Walsh-Hadamard rotation of the stored values: out[d] = 0.125 * sum_j (-1)^popcount(d & j) * o[j]
+		s_red[t] = val;
+		GroupMemoryBarrierWithGroupSync();
+		let chunk = t & ~63;
+		let dl = uint(t & 63);
+		float acc = 0.0f;
+		for (int j = 0; j < 64; ++j) acc += (countbits(dl & uint(j)) & 1u) != 0u ? -s_red[chunk + j] : s_red[chunk + j];
+		val = acc * 0.125f;
 	}
+	if (active) p.out_[qo + t] = half(val * ref_attn_gate(p, qo + t));
 }
 #else
 // Host target: one invocation per (head, row); pass 1 finds the max, pass 2 accumulates
@@ -115,22 +138,28 @@ void ref_attn_decode_cpu(uint3 gid : SV_GroupID, uniform RefAttnParams p) {
 	for (int t = 0; t < total; ++t) {
 		let kp = base + int64_t(t) * row_elems;
 		float dot = 0.0f;
-		for (int d = 0; d < p.head_dim; ++d) dot = fma(qf[d], float(p.k[kp + d]), dot);
+		for (int d = 0; d < p.head_dim; ++d) dot = fma(qf[d], ref_kv_k(p, kp + d), dot);
 		mx = max(mx, dot * p.scale);
 	}
 	float l = 0.0f;
 	for (int t = 0; t < total; ++t) {
 		let kp = base + int64_t(t) * row_elems;
 		float dot = 0.0f;
-		for (int d = 0; d < p.head_dim; ++d) dot = fma(qf[d], float(p.k[kp + d]), dot);
+		for (int d = 0; d < p.head_dim; ++d) dot = fma(qf[d], ref_kv_k(p, kp + d), dot);
 		let pk = exp(dot * p.scale - mx);
 		l += pk;
-		for (int d = 0; d < p.head_dim; ++d) o[d] = fma(pk, float(p.v[kp + d]), o[d]);
+		for (int d = 0; d < p.head_dim; ++d) o[d] = fma(pk, ref_kv_v(p, kp + d), o[d]);
 	}
-	for (int d = 0; d < p.head_dim; ++d) {
-		let val = l > 0.0f ? o[d] / l : 0.0f;
-		p.out_[qo + d] = half(val * ref_attn_gate(p, qo + d));
+	for (int d = 0; d < p.head_dim; ++d) o[d] = l > 0.0f ? o[d] / l : 0.0f;
+	if (p.vq == 3) {
+		for (int c = 0; c < p.head_dim; c += 64) {
+			float w[64];
+			for (int j = 0; j < 64; ++j) w[j] = o[c + j];
+			kv_fwht64(w);
+			for (int j = 0; j < 64; ++j) o[c + j] = w[j];
+		}
 	}
+	for (int d = 0; d < p.head_dim; ++d) p.out_[qo + d] = half(o[d] * ref_attn_gate(p, qo + d));
 }
 #endif
 

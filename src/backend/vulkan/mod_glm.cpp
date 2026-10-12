@@ -35,8 +35,15 @@ void MLALatent::expand_out( const pod::TensorView& o_lat, const pod::TensorView&
 }
 
 void MLALatent::store( const pod::KVRef& kv, const pod::TensorView& c, int layer, int max_seq, int rows, const pod::SlotRef& slot, backend::stream_t stream ) {
-	ENGINE_ASSERT( kv.kq == pod::KVQ::F16, "MLALatent::store (Vulkan): FP16 latent cache only" );
 	ENGINE_ASSERT( slot.rows != nullptr, "MLALatent::store: device-resolved positions only" );
+	if ( kv.kq != pod::KVQ::F16 ) {
+		// Quantized latent cache (one tensor, K's format): one invocation per quantization unit
+		const int unit = ( kv.kq == pod::KVQ::I8 || kv.kq == pod::KVQ::Q4 ) ? 64 : ( kv.kq == pod::KVQ::FP4 ? 16 : 1 );
+		vki::KvStoreQParams q{ vki::dp( kv.k ), vki::dp( kv.ks ), vki::dp( c.data ), rows_slot_at( slot, slot.row ), vki::rows_pos( slot.rows ) + sizeof( int ) * static_cast<uint64_t>( slot.row ),
+			static_cast<int64_t>( slot.stride ), layer, rows, LORA, max_seq, static_cast<int>( kv.kq ) };
+		vki::launch( "kv_store_q", q, stream, ( rows * ( LORA / unit ) + 127 ) / 128 );
+		return;
+	}
 	vki::LatentStoreParams p{ vki::dp( c.data ), vki::dp( kv.k ), rows_slot_at( slot, slot.row ), vki::rows_pos( slot.rows ) + sizeof( int ) * static_cast<uint64_t>( slot.row ),
 		static_cast<int64_t>( slot.stride ), layer, max_seq };
 	vki::launch( "latent_store", p, stream, tiles( LORA, 256 ), rows );
@@ -44,10 +51,10 @@ void MLALatent::store( const pod::KVRef& kv, const pod::TensorView& c, int layer
 
 void MLALatent::attend( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads, const pod::SlotRef& slot,
 	float*, int, backend::stream_t stream, const int* sel_idx, const int* sel_n ) {
-	ENGINE_ASSERT( kv.kq == pod::KVQ::F16, "MLALatent::attend (Vulkan): FP16 latent cache only" );
 	ENGINE_ASSERT( slot.rows != nullptr && slot.row == 0, "MLALatent::attend (Vulkan): device-resolved positions starting at row 0" );
 	vki::LatentAttnParams p{ vki::dp( q_lat.data ), vki::dp( kv.k ), vki::dp( o_lat.data ), vki::rows_slot( slot.rows ), vki::rows_pos( slot.rows ), vki::dp( sel_idx ), vki::dp( sel_n ),
-		static_cast<int64_t>( slot.stride ), layer, heads, max_seq, DSA::KPAD, ( sel_idx != nullptr && sel_n != nullptr ) ? 1 : 0, 1.0f / std::sqrt( static_cast<float>( HEAD ) ) };
+		static_cast<int64_t>( slot.stride ), layer, heads, max_seq, DSA::KPAD, ( sel_idx != nullptr && sel_n != nullptr ) ? 1 : 0, 1.0f / std::sqrt( static_cast<float>( HEAD ) ),
+		vki::dp( kv.ks ), static_cast<int>( kv.kq ) };
 	vki::launch( "latent_attend", p, stream, heads, rows );
 }
 

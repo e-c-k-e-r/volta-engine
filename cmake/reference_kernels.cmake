@@ -26,7 +26,7 @@ if(SLANGC)
 			set(sout ${SLANG_OUT}/${eentry}.${ext})
 			add_custom_command(OUTPUT ${sout}
 				COMMAND ${SLANGC} ${ssrc} -target ${target} -stage compute -entry ${eentry} -DENGINE_TARGET_CPU=${cpu} -o ${sout}
-				DEPENDS ${ssrc}
+				DEPENDS ${ssrc} ${SLANG_COMMON}
 				COMMENT "slangc ${entry} -> ${target}")
 			list(APPEND REF_ATTN_GENERATED ${sout})
 		endforeach()

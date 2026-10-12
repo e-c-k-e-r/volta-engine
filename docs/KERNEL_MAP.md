@@ -24,7 +24,7 @@ mirrored implementation). Verified by `test_nvfp4_linear`, `test_ops_linear`.
 
 | File | Kernels | Tier | Verified by |
 |---|---|---|---|
-| `attention.cu` | decode / prefill tensor-core attention, KV store (FP16, FP8, K8V4, NVFP4) | Portable (FP16 KV) / CudaSm70 | `test_attention`, `test_attention_prefill`, `test_kv_quant`, `test_ops_attention` |
+| `attention.cu` | decode / prefill tensor-core attention, KV store (FP16, FP8, K8V4, NVFP4) | Portable / CudaSm70 | `test_attention`, `test_attention_prefill`, `test_kv_quant`, `test_ops_attention` |
 | `gdn.cu` | GDN / KDA projections, conv1d, recurrent step, per-row snapshots | Portable | `test_gdn`, `test_slang_kernels`, `test_ops_attention` |
 | `mla_latent.cu` | absorbed latent attention (dense, sparse, split-KV; latent cache FP16, FP8, int8 or NVFP4 via kv_format) | Portable / CudaSm70 | `test_mla_latent`, `test_ref_attention` |
 | `gated_residual.cu` | Flash-Next gated residual (norm, low-rank gate, mix, post gate, apply), MTP stream norm / broadcast, shared-expert gate | CudaSm70 | `qwen4_exp_trace_cmp.py` against the exllamav3 oracle |
@@ -56,6 +56,7 @@ The H3 tests need the checkpoints and the goldens in `~/Documents/h3` (`tests/to
 `*.slang` compile to CUDA (launchers in `slang/cuda`), SPIR-V and host C++. Reference kernels (`ref_gemm`, `ref_trellis`,
 `ref_attention`, `ref_latent`) are the parity oracle for the CPU and Vulkan backends. Verified by `test_slang_kernels` (CUDA),
 `test_slang_cpu` (host), `test_ref_linear`, `test_ref_attention`, `test_vulkan_kernels`, `test_vulkan_ref`.
+`kv_codec.slang` holds the KV cache element codecs (FP8, int8, Q4, NVFP4 with their scales) that `kv_store_q` and the attention kernels (`ref_attention`, the QSA sparse attention in `flash`, the latent attention in `glm`) share; the stored bytes and scales are checked bit for bit against the CUDA kernels by `test_ops_attention` and `test_ops_flash` (dumped on CUDA, checked on CPU and Vulkan).
 
 ## Speculation and communication
 

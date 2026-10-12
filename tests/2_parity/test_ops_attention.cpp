@@ -172,6 +172,72 @@ void test_attention() {
 	emit( "attn_unpack_gate", dl( ug, hq.size() ) );
 }
 
+// ---- quantized KV cache: store, decode and prefill in the FP8 / K8V4 / NVFP4 formats ----
+std::vector<float> dlb( const void* d, size_t n ) {
+	std::vector<uint8_t> h( n );
+	backend::memcpy_sync( h.data(), d, n, backend::Copy::D2H );
+	return std::vector<float>( h.begin(), h.end() );
+}
+
+void test_attention_quant( pod::KVFormat fmt, const char* tag ) {
+	std::printf( "attention, %s KV cache\n", tag );
+	GoldenRng rng( 1501 );
+	const size_t slot_stride = static_cast<size_t>( A_LAYERS ) * A_SEQ * HKV * HD;
+	const size_t elems = slot_stride * A_SLOTS;
+	const pod::KVQ kq = pod::kv_k_quant( fmt ), vq = pod::kv_v_quant( fmt );
+	auto zero_bytes = [&]( size_t n ) { return n ? zeros<uint8_t>( n ) : nullptr; };
+	pod::KVRef kv;
+	kv.k = zero_bytes( pod::kv_data_bytes( kq, elems ) );
+	kv.v = zero_bytes( pod::kv_data_bytes( vq, elems ) );
+	kv.ks = zero_bytes( pod::kv_scale_bytes( kq, elems ) );
+	kv.vs = zero_bytes( pod::kv_scale_bytes( vq, elems ) );
+	kv.kq = kq;
+	kv.vq = vq;
+	// Fill layer A_LAYER of every slot position by position through the store (64-row causal chunks)
+	const int CH = 64;
+	for ( int slot = 0; slot < A_SLOTS; ++slot ) {
+		for ( int p0 = 0; p0 < A_SEQ; p0 += CH ) {
+			std::vector<half_t> rk = rh( rng, static_cast<size_t>( CH ) * HKV * HD, 1.5f ), rv = rh( rng, rk.size(), 1.5f );
+			half_t* dk = up( rk );
+			half_t* dv = up( rv );
+			pod::BatchRows* rows = up_rows( pod::BatchRows::causal( CH, p0, slot ) );
+			Attention::store_kv_cache( kv, tv( dk, pod::DType::FP16, CH, HKV * HD ), tv( dv, pod::DType::FP16, CH, HKV * HD ), slot_stride, A_LAYER, rows, CH, HKV, HD, A_SEQ );
+		}
+	}
+	backend::device_sync();
+	emit( ( std::string( "kvq_" ) + tag + "_k" ).c_str(), dlb( kv.k, pod::kv_data_bytes( kq, elems ) ) );
+	emit( ( std::string( "kvq_" ) + tag + "_v" ).c_str(), dlb( kv.v, pod::kv_data_bytes( vq, elems ) ) );
+	if ( kv.ks ) emit( ( std::string( "kvq_" ) + tag + "_ks" ).c_str(), dlb( kv.ks, pod::kv_scale_bytes( kq, elems ) ) );
+	if ( kv.vs ) emit( ( std::string( "kvq_" ) + tag + "_vs" ).c_str(), dlb( kv.vs, pod::kv_scale_bytes( vq, elems ) ) );
+
+	const int slots[4] = { 0, 2, 1, 0 };
+	const int pos[4] = { 100, 37, 5, 127 };
+	const int R = 4;
+	pod::BatchRows* drows = up_rows( pod::BatchRows::batched( R, slots, pos ) );
+	std::vector<half_t> hq = rh( rng, static_cast<size_t>( R ) * HQ * HD, 1.0f ), hg = rh( rng, hq.size(), 2.0f );
+	half_t* dq = up( hq );
+	half_t* dg = up( hg );
+	half_t* dout = zeros<half_t>( hq.size() );
+	pod::TensorView q = tv( dq, pod::DType::FP16, R, HQ * HD ), out = tv( dout, pod::DType::FP16, R, HQ * HD );
+	pod::TensorView gate = tv( dg, pod::DType::FP16, R, HQ * HD ), no_gate{};
+	Attention::forward_decode( kv, q, no_gate, out, slot_stride, A_LAYER, drows, R, HQ, HKV, HD, A_SEQ );
+	backend::device_sync();
+	emit( ( std::string( "kvq_" ) + tag + "_decode" ).c_str(), dl( dout, hq.size() ) );
+	Attention::forward_decode( kv, q, gate, out, slot_stride, A_LAYER, drows, R, HQ, HKV, HD, A_SEQ );
+	backend::device_sync();
+	emit( ( std::string( "kvq_" ) + tag + "_decode_gate" ).c_str(), dl( dout, hq.size() ) );
+	const int C = 40;
+	pod::BatchRows* dprows = up_rows( pod::BatchRows::causal( C, 20, 1 ) );
+	std::vector<half_t> pq = rh( rng, static_cast<size_t>( C ) * HQ * HD, 1.0f ), pg = rh( rng, pq.size(), 2.0f );
+	half_t* dpq = up( pq );
+	half_t* dpg = up( pg );
+	half_t* dpout = zeros<half_t>( pq.size() );
+	pod::TensorView pqt = tv( dpq, pod::DType::FP16, C, HQ * HD ), pgt = tv( dpg, pod::DType::FP16, C, HQ * HD ), pot = tv( dpout, pod::DType::FP16, C, HQ * HD );
+	Attention::forward_prefill( kv, pqt, pgt, pot, slot_stride, A_LAYER, dprows, C, HQ, HKV, HD, A_SEQ );
+	backend::device_sync();
+	emit( ( std::string( "kvq_" ) + tag + "_prefill" ).c_str(), dl( dpout, pq.size() ) );
+}
+
 // ---- MLA latent: 16 heads, 512 latent ----
 constexpr int LH = 16, LORA = 512, LHD = 256;
 
@@ -219,6 +285,52 @@ void test_latent() {
 	emit( "latent_absorb_q", dl( dqlat, static_cast<size_t>( R ) * LH * LORA ) );
 	emit( "latent_attend", dl( dolat, static_cast<size_t>( R ) * LH * LORA ) );
 	emit( "latent_expand_out", dl( dout, static_cast<size_t>( R ) * LH * LHD ) );
+}
+
+// ---- MLA latent cache in the FP8 / int8 / NVFP4 formats (GLM stores the one latent tensor in kv_format's K type) ----
+void test_latent_quant( pod::KVQ q, const char* tag ) {
+	std::printf( "MLA latent, %s cache\n", tag );
+	GoldenRng rng( 2502 );
+	const int max_seq = 256, N = 200, layers = 2, layer = 1;
+	const size_t slot_stride = static_cast<size_t>( layers ) * max_seq * LORA;
+	auto zb = [&]( size_t n ) { return n ? zeros<uint8_t>( n ) : nullptr; };
+	pod::KVRef kv;
+	kv.k = zb( pod::kv_data_bytes( q, slot_stride ) );
+	kv.ks = zb( pod::kv_scale_bytes( q, slot_stride ) );
+	kv.kq = q;
+	pod::BatchRows* srows = up_rows( pod::BatchRows::causal( N, 0, 0 ) );
+	pod::SlotRef ssr;
+	ssr.rows = srows;
+	ssr.row = 0;
+	ssr.stride = slot_stride;
+	half_t* dc = up( rh( rng, static_cast<size_t>( N ) * LORA, 1.7f ) );
+	MLALatent::store( kv, tv( dc, pod::DType::FP16, N, LORA ), layer, max_seq, N, ssr, nullptr );
+	backend::device_sync();
+	const std::string t( tag );
+	emit( ( "latentq_" + t + "_k" ).c_str(), dlb( kv.k, pod::kv_data_bytes( q, slot_stride ) ) );
+	if ( kv.ks ) emit( ( "latentq_" + t + "_ks" ).c_str(), dlb( kv.ks, pod::kv_scale_bytes( q, slot_stride ) ) );
+
+	// Row 0 attends to a listed selection, row 1 densely, row 2 to a short list
+	const int R = 3;
+	const int positions[3] = { 199, 100, 7 };
+	const int slots[3] = { 0, 0, 0 };
+	pod::BatchRows* drows = up_rows( pod::BatchRows::batched( R, slots, positions ) );
+	pod::SlotRef sr;
+	sr.rows = drows;
+	sr.row = 0;
+	sr.stride = slot_stride;
+	std::vector<int> sel( static_cast<size_t>( R ) * DSA::KPAD, 0 ), nsel = { 40, -1, 5 };
+	for ( int i = 0; i < 40; ++i ) sel[i] = i * 5 + 1;
+	for ( int i = 0; i < 5; ++i ) sel[static_cast<size_t>( 2 ) * DSA::KPAD + i] = i + 2;
+	int* dsel = up( sel );
+	int* dn = up( nsel );
+	half_t* dq = up( rh( rng, static_cast<size_t>( R ) * LH * LORA, 1.0f ) );
+	half_t* dolat = zeros<half_t>( static_cast<size_t>( R ) * LH * LORA );
+	float* ws = zeros<float>( MLALatent::workspace_floats( max_seq, LH ) );
+	pod::TensorView qlat = tv( dq, pod::DType::FP16, R, LH * LORA ), olat = tv( dolat, pod::DType::FP16, R, LH * LORA );
+	MLALatent::attend( kv, qlat, olat, layer, max_seq, R, LH, sr, ws, 0, nullptr, dsel, dn );
+	backend::device_sync();
+	emit( ( "latentq_" + t + "_attend" ).c_str(), dl( dolat, static_cast<size_t>( R ) * LH * LORA ) );
 }
 
 // ---- DSA: projection, scoring, selection, and latent attention over the selected tokens ----
@@ -475,14 +587,24 @@ int main( int argc, char** argv ) {
 	}
 	backend::set_device( 0 );
 	std::printf( "test_ops_attention (%s, dir %s)\n", args.dump ? "dump" : "check", args.dir.c_str() );
-	// `--only <name>[,<name>...]` runs a subset of {attention, latent, dsa, mhc, gdn, gdn_single} (a backend that lacks some modules)
+	// `--only <name>[,<name>...]` runs a subset of {attention, kvq, latent, latentq, dsa, mhc, gdn, gdn_single} (a backend that lacks some modules)
 	std::string only;
 	for ( int i = 1; i + 1 < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--only" ) ) only = std::string( "," ) + argv[i + 1] + ",";
 	}
 	auto want = [&]( const char* name ) { return only.empty() || only.find( std::string( "," ) + name + "," ) != std::string::npos; };
 	if ( want( "attention" ) ) test_attention();
+	if ( want( "kvq" ) ) {
+		test_attention_quant( pod::KVFormat::FP8, "fp8" );
+		test_attention_quant( pod::KVFormat::K8V4, "k8v4" );
+		test_attention_quant( pod::KVFormat::NVFP4, "nvfp4" );
+	}
 	if ( want( "latent" ) ) test_latent();
+	if ( want( "latentq" ) ) {
+		test_latent_quant( pod::KVQ::E5M2, "fp8" );
+		test_latent_quant( pod::KVQ::I8, "int8" );
+		test_latent_quant( pod::KVQ::FP4, "nvfp4" );
+	}
 	if ( want( "dsa" ) ) test_dsa();
 	if ( want( "mhc" ) ) test_mhc();
 	if ( want( "gdn" ) ) test_gdn( false );

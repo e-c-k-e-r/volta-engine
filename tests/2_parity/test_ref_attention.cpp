@@ -34,6 +34,8 @@ struct RefAttnParams {
 	int64_t slot_stride;
 	int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate;
 	float scale;
+	uint8_t *ks, *vs;
+	int kq, vq;
 };
 struct RefLatentParams {
 	__half *q_lat, *cache, *out_;

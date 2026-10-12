@@ -171,8 +171,9 @@ if(SLANGC)
 		elementwise:swiglu_fused elementwise:embed_tokens rope:rope elementwise:moe_sum_planes elementwise:moe_accumulate
 		select:batched_argmax select:router_select gdn:l2_norm_heads gdn:gated_rmsnorm
 		gdn_rows:project_gates gdn_rows:causal_conv1d_silu_rows gdn_rows:causal_conv1d_silu_tiled gdn_rows:causal_conv1d_history
-		gdn_rows:recurrent_step_rows kv_store:kv_store_f16 mhc:init_streams mhc:hc_apply mhc:hc_mix_partials mhc:hc_mix_finalize
+		gdn_rows:recurrent_step_rows kv_store:kv_store_f16 kv_store:kv_store_q mhc:init_streams mhc:hc_apply mhc:hc_mix_partials mhc:hc_mix_finalize
 		mhc:hyperhead_mean dsa:dsa_prep dsa:dsa_pool_update tap_ring:dflash_store_taps tap_ring:reduce_streams)
+	set(SLANG_COMMON ${PROJECT_SOURCE_DIR}/src/kernels/slang/kv_codec.slang)
 	set(SLANG_GENERATED "")
 	foreach(item ${SLANG_KERNELS})
 		string(REPLACE ":" ";" parts ${item})
@@ -187,7 +188,7 @@ if(SLANGC)
 			set(sout ${SLANG_OUT}/${entry}.${ext})
 			add_custom_command(OUTPUT ${sout}
 				COMMAND ${SLANGC} ${ssrc} -target ${target} -stage compute -entry ${entry} -DENGINE_TARGET_CPU=${cpu} -o ${sout}
-				DEPENDS ${ssrc}
+				DEPENDS ${ssrc} ${SLANG_COMMON}
 				COMMENT "slangc ${entry} -> ${target}")
 			list(APPEND SLANG_GENERATED ${sout})
 		endforeach()

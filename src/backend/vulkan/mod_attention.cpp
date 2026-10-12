@@ -24,10 +24,20 @@ void Attention::store_kv_cache(
 	int max_seq,
 	backend::stream_t stream
 ) {
-	if ( kv.kq != pod::KVQ::F16 || kv.vq != pod::KVQ::F16 ) {
-		ENGINE_UNSUPPORTED( "Attention::store_kv_cache (quantized KV cache)" );
-	}
 	const int total_elems = num_kv_heads * head_dim;
+	if ( kv.kq != pod::KVQ::F16 || kv.vq != pod::KVQ::F16 ) {
+		// Quantized formats: one invocation per quantization unit (kv_codec.slang), K and V each in their own format
+		auto store = [&]( void* data, void* scales, const pod::TensorView& src, pod::KVQ q ) {
+			const int unit = ( q == pod::KVQ::I8 || q == pod::KVQ::Q4 ) ? 64 : ( q == pod::KVQ::FP4 ? 16 : 1 );
+			ENGINE_ASSERT( total_elems % unit == 0, "KV store: row width must be a multiple of the quantization group" );
+			vki::KvStoreQParams p{ vki::dp( data ), vki::dp( scales ), vki::dp( src.data ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ),
+				static_cast<int64_t>( slot_stride ), layer_idx, count, total_elems, max_seq, static_cast<int>( q ) };
+			vki::launch( "kv_store_q", p, stream, ( count * ( total_elems / unit ) + 127 ) / 128 );
+		};
+		store( kv.k, kv.ks, k, kv.kq );
+		store( kv.v, kv.vs, v, kv.vq );
+		return;
+	}
 	const int groups = ( count * total_elems + 127 ) / 128;
 	vki::KvStoreParams pk{ vki::dp( kv.k ), vki::dp( k.data ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ),
 		static_cast<int64_t>( slot_stride ), layer_idx, count, total_elems, max_seq };
@@ -42,12 +52,11 @@ namespace {
 
 void ref_attention( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
 	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream ) {
-	if ( kv.kq != pod::KVQ::F16 || kv.vq != pod::KVQ::F16 ) {
-		ENGINE_UNSUPPORTED( "Attention decode/prefill (quantized KV cache)" );
-	}
 	ENGINE_ASSERT( head_dim <= 256 && num_kv_heads > 0 && num_q_heads % num_kv_heads == 0, "Attention (Vulkan): head_dim <= 256 and GQA only" );
 	vki::RefAttnParams p{ vki::dp( q.data ), vki::dp( kv.k ), vki::dp( kv.v ), vki::dp( gate.data ), vki::dp( out.data ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ),
-		static_cast<int64_t>( slot_stride ), layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, gate.data != nullptr ? 1 : 0, 1.0f / std::sqrt( static_cast<float>( head_dim ) ) };
+		static_cast<int64_t>( slot_stride ), layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, gate.data != nullptr ? 1 : 0, 1.0f / std::sqrt( static_cast<float>( head_dim ) ),
+		vki::dp( kv.ks ), vki::dp( kv.vs ), static_cast<int>( kv.kq ), static_cast<int>( kv.vq ) };
+	ENGINE_ASSERT( kv.vq != pod::KVQ::Q4 || head_dim % 64 == 0, "Attention (Vulkan): Q4 values need head_dim % 64 == 0" );
 	vki::launch( "ref_attn_decode", p, stream, num_q_heads, count );
 }
 

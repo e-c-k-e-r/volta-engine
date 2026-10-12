@@ -4,6 +4,7 @@
 // cpu_kernels.h first: the Slang prelude defines int4, which the backend shim only declares when the prelude is absent
 #include "cpu_kernels.h"
 #include "engine/modules/mla.h"
+#include "kv_codec.h"
 #include "engine/modules/attention.h"
 #include "engine/backend/tiers.h"
 #include <cmath>
@@ -70,9 +71,16 @@ void MLALatent::expand_out( const pod::TensorView& o_lat, const pod::TensorView&
 }
 
 void MLALatent::store( const pod::KVRef& kv, const pod::TensorView& c, int layer, int max_seq, int rows, const pod::SlotRef& slot, backend::stream_t ) {
-	ENGINE_ASSERT( kv.kq == pod::KVQ::F16, "MLALatent::store (CPU): FP16 latent cache only" );
-	backend::half_t* cache = static_cast<backend::half_t*>( kv.k );
 	ENGINE_ASSERT( slot.rows != nullptr, "MLALatent::store: device-resolved positions only" );
+	if ( kv.kq != pod::KVQ::F16 ) {
+		// Quantized latent cache (one tensor, K's format): one invocation per quantization unit
+		const int unit = ( kv.kq == pod::KVQ::I8 || kv.kq == pod::KVQ::Q4 ) ? 64 : ( kv.kq == pod::KVQ::FP4 ? 16 : 1 );
+		KvStoreQParams p{ static_cast<uint8_t*>( kv.k ), static_cast<uint8_t*>( kv.ks ), const_cast<half*>( c.ptr<const half>() ), const_cast<int*>( slot.rows->slot ) + slot.row,
+			const_cast<int*>( slot.rows->pos ) + slot.row, static_cast<int64_t>( slot.stride ), layer, rows, LORA, max_seq, static_cast<int>( kv.kq ) };
+		impl::cpu_dispatch( ::kv_store_q, &p, ( rows * ( LORA / unit ) + 127 ) / 128 );
+		return;
+	}
+	backend::half_t* cache = static_cast<backend::half_t*>( kv.k );
 	const h16* src = c.ptr<const h16>();
 	for ( int r = 0; r < rows; ++r ) {
 		const int pos = slot.rows->pos[slot.row + r];
@@ -83,8 +91,8 @@ void MLALatent::store( const pod::KVRef& kv, const pod::TensorView& c, int layer
 
 void MLALatent::attend( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
 	const pod::SlotRef& slot, float*, int, backend::stream_t, const int* sel_idx, const int* sel_n ) {
-	ENGINE_ASSERT( kv.kq == pod::KVQ::F16, "MLALatent::attend (CPU): FP16 latent cache only" );
 	const backend::half_t* cache = static_cast<const backend::half_t*>( kv.k );
+	const bool quant = kv.kq != pod::KVQ::F16;   // a quantized cache is read in plain C++ for every row (the reference kernel is FP16 only)
 	ENGINE_ASSERT( slot.rows != nullptr && slot.row == 0, "MLALatent::attend (CPU): device-resolved positions starting at row 0" );
 	const float scale = 1.0f / std::sqrt( static_cast<float>( HD ) );
 	const h16* q = q_lat.ptr<const h16>();
@@ -104,20 +112,25 @@ void MLALatent::attend( const pod::KVRef& kv, const pod::TensorView& q_lat, pod:
 		dense_run = end;
 	};
 	for ( int r = 0; r < rows; ++r ) {
-		const int nsel = ( sel_idx != nullptr && sel_n != nullptr ) ? sel_n[r] : -1;
-		if ( nsel < 0 ) continue;
+		int nsel = ( sel_idx != nullptr && sel_n != nullptr ) ? sel_n[r] : -1;
+		if ( nsel < 0 && !quant ) continue;
 		flush_dense( r );
 		dense_run = r + 1; // skip this row in the next dense run
-		const h16* kv = cache + static_cast<size_t>( slot.rows->slot[r] ) * slot.stride + static_cast<size_t>( layer ) * max_seq * LORA;
-		const int* lst = sel_idx + static_cast<size_t>( r ) * KPAD;
+		const bool listed = nsel >= 0;
+		if ( !listed ) nsel = std::min( slot.rows->pos[r] + 1, max_seq );
+		const size_t kbase = static_cast<size_t>( slot.rows->slot[r] ) * slot.stride + static_cast<size_t>( layer ) * max_seq * LORA;
+		const int* lst = listed ? sel_idx + static_cast<size_t>( r ) * KPAD : nullptr;
+		auto elem = [&]( int i, int d ) {
+			const size_t e = kbase + static_cast<size_t>( lst ? lst[i] : i ) * LORA + d;
+			return quant ? kv_load( kv.k, kv.ks, kv.kq, e ) : static_cast<float>( cache[e] );
+		};
 		std::vector<float> s( nsel ), o( LORA );
 		for ( int h = 0; h < heads; ++h ) {
 			const h16* qh = q + ( static_cast<size_t>( r ) * heads + h ) * LORA;
 			float mx = -1e30f;
 			for ( int i = 0; i < nsel; ++i ) {
-				const h16* c = kv + static_cast<size_t>( lst[i] ) * LORA;
 				float dot = 0.0f;
-				for ( int d = 0; d < LORA; ++d ) dot += static_cast<float>( qh[d] ) * static_cast<float>( c[d] );
+				for ( int d = 0; d < LORA; ++d ) dot += static_cast<float>( qh[d] ) * elem( i, d );
 				s[i] = dot * scale;
 				mx = std::fmax( mx, s[i] );
 			}
@@ -126,8 +139,7 @@ void MLALatent::attend( const pod::KVRef& kv, const pod::TensorView& q_lat, pod:
 			for ( int i = 0; i < nsel; ++i ) {
 				const float pk = std::exp( s[i] - mx );
 				l += pk;
-				const h16* c = kv + static_cast<size_t>( lst[i] ) * LORA;
-				for ( int d = 0; d < LORA; ++d ) o[d] += pk * static_cast<float>( c[d] );
+				for ( int d = 0; d < LORA; ++d ) o[d] += pk * elem( i, d );
 			}
 			const float inv = l > 0.0f ? 1.0f / l : 0.0f;
 			h16* oh = out + ( static_cast<size_t>( r ) * heads + h ) * LORA;

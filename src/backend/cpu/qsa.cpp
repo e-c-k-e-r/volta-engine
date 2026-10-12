@@ -3,6 +3,7 @@
 // densely to 0..pos when nkeys[r] < 0
 // cpu_kernels.h first: the Slang prelude defines int4, which the backend shim only declares when the prelude is absent
 #include "cpu_kernels.h"
+#include "kv_codec.h"
 #include "engine/modules/qsa.h"
 #include "engine/modules/dsa.h"
 #include "engine/modules/attention.h"
@@ -106,11 +107,9 @@ void QSA::score( const backend::half_t* q, const backend::half_t* pool_plane, ba
 
 void Attention::forward_sparse( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
 	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, const int* idx, const int* nkeys, int idx_stride, backend::stream_t ) {
-	if ( kv.kq != pod::KVQ::F16 || kv.vq != pod::KVQ::F16 ) ENGINE_UNSUPPORTED( "Attention::forward_sparse (quantized KV cache)" );
+	ENGINE_ASSERT( kv.vq != pod::KVQ::Q4, "Attention::forward_sparse: Q4 values are not supported" );
 	const float scale = 1.0f / std::sqrt( static_cast<float>( head_dim ) );
 	const int heads_per_kv = std::max( num_q_heads / num_kv_heads, 1 );
-	const backend::half_t* kp = static_cast<const backend::half_t*>( kv.k );
-	const backend::half_t* vp = static_cast<const backend::half_t*>( kv.v );
 	const backend::half_t* qp = q.ptr<const backend::half_t>();
 	const backend::half_t* gp = gate.data != nullptr ? gate.ptr<const backend::half_t>() : nullptr;
 	backend::half_t* op = out.ptr<backend::half_t>();
@@ -127,9 +126,9 @@ void Attention::forward_sparse( const pod::KVRef& kv, const pod::TensorView& q, 
 			float mx = -1e30f;
 			for ( int j = 0; j < total; ++j ) {
 				const int t = nk >= 0 ? idx[static_cast<size_t>( r ) * idx_stride + j] : j;
-				const backend::half_t* kr = kp + slot_off + ( static_cast<size_t>( layer_idx ) * max_seq + t ) * ( num_kv_heads * head_dim ) + kvh * head_dim;
+				const size_t kr = slot_off + ( static_cast<size_t>( layer_idx ) * max_seq + t ) * ( num_kv_heads * head_dim ) + kvh * head_dim;
 				float dot = 0.0f;
-				for ( int d = 0; d < head_dim; ++d ) dot += h2f( qh[d] ) * h2f( kr[d] );
+				for ( int d = 0; d < head_dim; ++d ) dot += h2f( qh[d] ) * kv_load( kv.k, kv.ks, kv.kq, kr + d );
 				sc[j] = dot * scale;
 				mx = std::fmax( mx, sc[j] );
 			}
@@ -137,10 +136,10 @@ void Attention::forward_sparse( const pod::KVRef& kv, const pod::TensorView& q, 
 			float l = 0.0f;
 			for ( int j = 0; j < total; ++j ) {
 				const int t = nk >= 0 ? idx[static_cast<size_t>( r ) * idx_stride + j] : j;
-				const backend::half_t* vr = vp + slot_off + ( static_cast<size_t>( layer_idx ) * max_seq + t ) * ( num_kv_heads * head_dim ) + kvh * head_dim;
+				const size_t vr = slot_off + ( static_cast<size_t>( layer_idx ) * max_seq + t ) * ( num_kv_heads * head_dim ) + kvh * head_dim;
 				const float e = std::exp( sc[j] - mx );
 				l += e;
-				for ( int d = 0; d < head_dim; ++d ) acc[d] += e * h2f( vr[d] );
+				for ( int d = 0; d < head_dim; ++d ) acc[d] += e * kv_load( kv.v, kv.vs, kv.vq, vr + d );
 			}
 			const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
 			for ( int d = 0; d < head_dim; ++d ) {

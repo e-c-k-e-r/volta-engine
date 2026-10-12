@@ -315,6 +315,31 @@ void test_sparse() {
 	pod::TensorView qt = tv( q, pod::DType::FP16, R, HQ * HD ), gt = tv( gate, pod::DType::FP16, R, HQ * HD ), ot = tv( out, pod::DType::FP16, R, HQ * HD );
 	Attention::forward_sparse( kv, qt, gt, ot, slot_stride, LAYER, drows, R, HQ, HKV, HD, MAXSEQ, idx, nkeys, DSA::KPAD, nullptr );
 	emit( "sparse_attention", dl( out, static_cast<size_t>( R ) * HQ * HD ) );
+
+	// The same attention over the cache quantized to FP8 and NVFP4 (Q4 values are not supported by the sparse kernels)
+	const struct { pod::KVFormat f; const char* tag; } fmts[2] = { { pod::KVFormat::FP8, "sparse_attention_fp8" }, { pod::KVFormat::NVFP4, "sparse_attention_nvfp4" } };
+	const size_t row = static_cast<size_t>( HKV ) * HD, elems = SLOTS * slot_stride;
+	for ( const auto& fm : fmts ) {
+		const pod::KVQ q8 = pod::kv_k_quant( fm.f );
+		auto zb = [&]( size_t n ) { return n ? zeros<uint8_t>( n ) : nullptr; };
+		pod::KVRef qkv;
+		qkv.k = zb( pod::kv_data_bytes( q8, elems ) );
+		qkv.v = zb( pod::kv_data_bytes( q8, elems ) );
+		qkv.ks = zb( pod::kv_scale_bytes( q8, elems ) );
+		qkv.vs = zb( pod::kv_scale_bytes( q8, elems ) );
+		qkv.kq = qkv.vq = q8;
+		const int CH = 512;
+		for ( int slot = 0; slot < SLOTS; ++slot ) {
+			for ( int p0 = 0; p0 < MAXSEQ; p0 += CH ) {
+				pod::BatchRows* rows = up_rows( pod::BatchRows::causal( CH, p0, slot ) );
+				const size_t off = static_cast<size_t>( slot ) * slot_stride + ( static_cast<size_t>( LAYER ) * MAXSEQ + p0 ) * row;
+				Attention::store_kv_cache( qkv, tv( dk + off, pod::DType::FP16, CH, static_cast<int>( row ) ), tv( dv + off, pod::DType::FP16, CH, static_cast<int>( row ) ), slot_stride, LAYER, rows, CH, HKV, HD, MAXSEQ );
+			}
+		}
+		Attention::forward_sparse( qkv, qt, gt, ot, slot_stride, LAYER, drows, R, HQ, HKV, HD, MAXSEQ, idx, nkeys, DSA::KPAD, nullptr );
+		backend::device_sync();
+		emit( fm.tag, dl( out, static_cast<size_t>( R ) * HQ * HD ) );
+	}
 }
 
 // ---- softmax top-k router: 512 experts, 10 routes ----

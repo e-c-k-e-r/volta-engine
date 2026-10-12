@@ -46,6 +46,7 @@ struct ConvTiledParams { uint64_t src, dst, history, weights, slots; int channel
 struct RecurrentParams { uint64_t state, qkv, gate, beta, output, slots, snap, snap_on; int h_k, h_v, rows, snap_rows; float scale; int64_t slot_stride, snap_stride; };
 struct GatedNormParams { uint64_t attn_out, z, norm_weight; int num_v_heads, head_dim, use_sigmoid, has_z, has_weight; };
 struct KvStoreParams { uint64_t data, src, slots, positions; int64_t slot_stride; int layer_idx, count, total_elems, max_seq; };
+struct KvStoreQParams { uint64_t data, scales, src, slots, positions; int64_t slot_stride; int layer_idx, count, total_elems, max_seq, q; };
 struct InitStreamsParams { uint64_t in_, streams; int hidden_size; };
 struct HeadMeanParams { uint64_t streams, final_hidden; int hidden_size; };
 struct PrepParams { uint64_t proj, ln_w, ln_b, plane, w_out, slots, positions; int layer; int64_t plane_slot_stride; };
@@ -59,7 +60,7 @@ struct RefGemmParams { uint64_t x, w, out_; int m, k, n; };
 namespace engine::backend::impl {
 struct RefReconParams { uint64_t codes, out_; int k_dim, n_dim, bits, cb; };
 struct RefHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };
-struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; };
+struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq; };
 struct RefUnpackParams { uint64_t qg, q, gate; int total, head_dim; };
 } // namespace engine::backend::impl
 
@@ -93,7 +94,7 @@ namespace engine::backend::impl {
 struct AbsorbParams { uint64_t q, kv_b, q_lat; int heads; };
 struct ExpandParams { uint64_t o_lat, kv_b, out_; int heads; };
 struct LatentStoreParams { uint64_t c, cache, slots, pos; int64_t slot_stride; int layer, max_seq; };
-struct LatentAttnParams { uint64_t q_lat, cache, out_, slots, pos, sel_idx, sel_n; int64_t slot_stride; int layer, heads, max_seq, idx_stride, has_sel; float scale; };
+struct LatentAttnParams { uint64_t q_lat, cache, out_, slots, pos, sel_idx, sel_n; int64_t slot_stride; int layer, heads, max_seq, idx_stride, has_sel; float scale; uint64_t cache_scales; int kq; };
 struct DiagParams { uint64_t q_row, cache, scores; int n, heads; float scale; };
 struct DsaScoreParams { uint64_t q, w, pool_plane, scores, slots, pos; int score_stride, layer, max_seq; int64_t pool_slot_stride; float norm; };
 struct KdaSmallParams { uint64_t x, b_proj, f_a_proj, g_a_proj, beta, f_a_buf, g_a_buf; int hidden, has_b, has_fa, has_ga; };
@@ -125,7 +126,7 @@ struct QsaPrepParams { uint64_t qk, qw, q_out, ring, slots, pos; int layer; int6
 struct QsaPoolParams { uint64_t ring, pool_plane, kw, slots, pos; int layer; int64_t ring_slot_stride, pool_slot_stride; int max_pools, rot_dim; float theta, eps; };
 struct QsaScoreParams { uint64_t q, pool_plane, scores, slots, pos; int score_stride, layer, max_pools; int64_t pool_slot_stride; float scale; };
 struct SelectParams { uint64_t scores, idx, nkeys, pos; int score_stride, kpad; };
-struct SparseAttnParams { uint64_t q, k, v, gate, out_, slots, pos, idx, nkeys; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, idx_stride, has_gate; float scale; };
+struct SparseAttnParams { uint64_t q, k, v, gate, out_, slots, pos, idx, nkeys; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, idx_stride, has_gate; float scale; uint64_t ks, vs; int kq, vq; };
 struct RouterParams { uint64_t x, w, topk_idx, topk_w; int hidden, experts, top_k, round_fp16; };
 struct MoeCombineParams { uint64_t route_out, topk_w, topk_idx, out_; int hidden, top_k, start_expert, end_expert; };
 } // namespace engine::backend::impl

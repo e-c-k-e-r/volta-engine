@@ -143,11 +143,11 @@ void DSA::select( const backend::half_t* scores, int score_stride, int* idx, int
 
 void Attention::forward_sparse( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
 	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, const int* idx, const int* nkeys, int idx_stride, backend::stream_t stream ) {
-	if ( kv.kq != pod::KVQ::F16 || kv.vq != pod::KVQ::F16 ) ENGINE_UNSUPPORTED( "Attention::forward_sparse (quantized KV cache)" );
+	ENGINE_ASSERT( kv.vq != pod::KVQ::Q4, "Attention::forward_sparse: Q4 values are not supported" );
 	ENGINE_ASSERT( head_dim <= 256 && num_kv_heads > 0 && num_q_heads % num_kv_heads == 0, "Attention::forward_sparse (Vulkan): head_dim <= 256 and GQA only" );
 	vki::SparseAttnParams p{ vki::dp( q.data ), vki::dp( kv.k ), vki::dp( kv.v ), vki::dp( gate.data ), vki::dp( out.data ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ),
 		vki::dp( idx ), vki::dp( nkeys ), static_cast<int64_t>( slot_stride ), layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, idx_stride, gate.data != nullptr ? 1 : 0,
-		1.0f / std::sqrt( static_cast<float>( head_dim ) ) };
+		1.0f / std::sqrt( static_cast<float>( head_dim ) ), vki::dp( kv.ks ), vki::dp( kv.vs ), static_cast<int>( kv.kq ), static_cast<int>( kv.vq ) };
 	vki::launch( "sparse_attn", p, stream, num_q_heads, count );
 }
 

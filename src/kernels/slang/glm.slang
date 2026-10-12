@@ -2,6 +2,8 @@
 // rows and DSA-selected rows in one kernel), the kv_b projection, the DSA indexer scoring and the KDA gate projections and recurrence. Same arithmetic as
 // src/backend/cuda/modules/{mla_latent,mla,dsa,gdn}.cu and the CPU references (mla_ref.cpp, dsa_ref.cpp, gdn_ref.cpp); slow but simple.
 
+#include "kv_codec.slang"
+
 static const int LORA = 512;
 static const int LHEAD = 256;
 static const int DSA_D = 128;
@@ -83,7 +85,7 @@ void latent_store(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform 
 	p.cache[off + i] = p.c[int64_t(r) * LORA + i];
 }
 
-struct LatentAttnParams { half* q_lat; half* cache; half* out_; int* slots; int* pos; int* sel_idx; int* sel_n; int64_t slot_stride; int layer; int heads; int max_seq; int idx_stride; int has_sel; float scale; };
+struct LatentAttnParams { half* q_lat; half* cache; half* out_; int* slots; int* pos; int* sel_idx; int* sel_n; int64_t slot_stride; int layer; int heads; int max_seq; int idx_stride; int has_sel; float scale; uint8_t* cache_scales; int kq; };
 
 groupshared float l_q[LORA];
 groupshared float l_s[256];
@@ -97,7 +99,7 @@ void latent_attend(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform
 	let r = int(gid.y);
 	let nsel = p.has_sel != 0 ? p.sel_n[r] : -1;
 	let total = nsel >= 0 ? nsel : p.pos[r] + 1;
-	half* kv = p.cache + int64_t(p.slots[r]) * p.slot_stride + int64_t(p.layer) * p.max_seq * LORA;
+	let kbase = int64_t(p.slots[r]) * p.slot_stride + int64_t(p.layer) * p.max_seq * LORA;   // flat element index of the slot's layer
 	half* qh = p.q_lat + (int64_t(r) * p.heads + h) * LORA;
 	l_q[t] = float(qh[t]);
 	l_q[t + 256] = float(qh[t + 256]);
@@ -111,9 +113,9 @@ void latent_attend(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform
 		float score = -1e30f;
 		if (t < n) {
 			let tok = nsel >= 0 ? p.sel_idx[int64_t(r) * p.idx_stride + t0 + t] : t0 + t;
-			half* c = kv + int64_t(tok) * LORA;
+			let ce = kbase + int64_t(tok) * LORA;
 			float dot = 0.0f;
-			for (int d = 0; d < LORA; ++d) dot = fma(l_q[d], float(c[d]), dot);
+			for (int d = 0; d < LORA; ++d) dot = fma(l_q[d], p.kq == 0 ? float(p.cache[ce + d]) : kv_load((uint8_t*)p.cache, p.cache_scales, p.kq, ce + d), dot);
 			score = dot * p.scale;
 		}
 		g_red[t] = score;
@@ -139,9 +141,9 @@ void latent_attend(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform
 		o1 *= alpha;
 		for (int k = 0; k < n; ++k) {
 			let tok = nsel >= 0 ? p.sel_idx[int64_t(r) * p.idx_stride + t0 + k] : t0 + k;
-			half* c = kv + int64_t(tok) * LORA;
-			o0 = fma(l_s[k], float(c[t]), o0);
-			o1 = fma(l_s[k], float(c[t + 256]), o1);
+			let ce = kbase + int64_t(tok) * LORA;
+			o0 = fma(l_s[k], p.kq == 0 ? float(p.cache[ce + t]) : kv_load((uint8_t*)p.cache, p.cache_scales, p.kq, ce + t), o0);
+			o1 = fma(l_s[k], p.kq == 0 ? float(p.cache[ce + t + 256]) : kv_load((uint8_t*)p.cache, p.cache_scales, p.kq, ce + t + 256), o1);
 		}
 		GroupMemoryBarrierWithGroupSync();
 	}

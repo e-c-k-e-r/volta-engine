@@ -44,7 +44,7 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 		set(sout ${SLANG_OUT}/${entry}.spv)
 		add_custom_command(OUTPUT ${sout}
 			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/flash.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
-			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/flash.slang
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/flash.slang ${SLANG_COMMON}
 			COMMENT "slangc ${entry} -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
@@ -53,7 +53,7 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 		set(sout ${SLANG_OUT}/${entry}.spv)
 		add_custom_command(OUTPUT ${sout}
 			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/glm.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
-			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/glm.slang
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/glm.slang ${SLANG_COMMON}
 			COMMENT "slangc ${entry} -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()

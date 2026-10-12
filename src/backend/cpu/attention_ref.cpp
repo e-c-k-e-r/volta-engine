@@ -1,6 +1,6 @@
-// CPU backend: Attention decode / prefill over the FP16 KV cache through the portable reference kernel (ref_attention.slang, host
+// CPU backend: Attention decode / prefill over the KV cache through the portable reference kernel (ref_attention.slang, host
 // target) and the Q/gate unpack as plain C++. Row m attends causally to positions 0..pos[m] of slot slot[m], so the prefill form
-// is the same call over a run of ascending positions. Quantized KV formats stay unsupported.
+// is the same call over a run of ascending positions. Quantized KV formats are decoded inside the kernel (kv_codec.slang).
 // The reference kernel lives in the ref_attn_cpu library (cmake/reference_kernels.cmake); it is bound weakly so binaries that do not
 // link that library still link (and abort with ENGINE_UNSUPPORTED if they reach it).
 // cpu_kernels.h first: the Slang prelude defines int4, which the backend shim only declares when the prelude is absent
@@ -15,6 +15,7 @@ struct RefAttnParams {
 	int64_t slot_stride;
 	int layer_idx; int num_q_heads; int num_kv_heads; int head_dim; int max_seq; int has_gate;
 	float scale;
+	uint8_t* ks; uint8_t* vs; int kq; int vq;
 };
 
 extern "C" void ref_attn_decode_cpu( ComputeVaryingInput*, void*, void* ) __attribute__(( weak ));
@@ -25,16 +26,15 @@ namespace {
 
 void ref_attention( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride,
 	int layer_idx, const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq ) {
-	if ( kv.kq != pod::KVQ::F16 || kv.vq != pod::KVQ::F16 ) {
-		ENGINE_UNSUPPORTED( "Attention decode/prefill (quantized KV cache)" );
-	}
 	if ( ref_attn_decode_cpu == nullptr ) {
 		ENGINE_UNSUPPORTED( "Attention decode/prefill (ref_attn_cpu library not linked)" );
 	}
 	ENGINE_ASSERT( head_dim <= 256 && num_kv_heads > 0 && num_q_heads % num_kv_heads == 0, "Attention (CPU): head_dim <= 256 and GQA only" );
 	RefAttnParams p{ const_cast<half*>( q.ptr<const half>() ), static_cast<half*>( kv.k ), static_cast<half*>( kv.v ), gate.data != nullptr ? const_cast<half*>( gate.ptr<const half>() ) : nullptr, out.ptr<half>(),
 		const_cast<int*>( d_rows->slot ), const_cast<int*>( d_rows->pos ), static_cast<int64_t>( slot_stride ), layer_idx, num_q_heads, num_kv_heads,
-		head_dim, max_seq, gate.data != nullptr ? 1 : 0, 1.0f / std::sqrt( static_cast<float>( head_dim ) ) };
+		head_dim, max_seq, gate.data != nullptr ? 1 : 0, 1.0f / std::sqrt( static_cast<float>( head_dim ) ),
+		static_cast<uint8_t*>( kv.ks ), static_cast<uint8_t*>( kv.vs ), static_cast<int>( kv.kq ), static_cast<int>( kv.vq ) };
+	ENGINE_ASSERT( kv.vq != pod::KVQ::Q4 || head_dim % 64 == 0, "Attention (CPU): Q4 values need head_dim % 64 == 0" );
 	impl::cpu_dispatch( ref_attn_decode_cpu, &p, num_q_heads, count );
 }
 

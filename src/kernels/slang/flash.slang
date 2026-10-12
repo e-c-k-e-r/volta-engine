@@ -3,6 +3,8 @@
 // MoE gather / combine. Same arithmetic as src/backend/cuda/modules/{gated_residual,ple,qsa,dsa,attention,moe}.cu; slow but simple: one
 // thread per output where the reduction is short, one group per row / stream where it is long (shared-memory trees, no wave ops).
 
+#include "kv_codec.slang"
+
 static const int QSA_DIM = 128;
 static const int QSA_HEADS = 4;
 static const int QSA_POOL = 4;
@@ -484,6 +486,7 @@ struct SparseAttnParams {
 	int64_t slot_stride;
 	int layer_idx; int num_q_heads; int num_kv_heads; int head_dim; int max_seq; int idx_stride; int has_gate;
 	float scale;
+	uint8_t* ks; uint8_t* vs; int kq; int vq;   // quantized K / V (kv_codec.slang; 0 = FP16, Q4 values are not supported)
 };
 
 groupshared float s_aq[256];
@@ -516,7 +519,7 @@ void sparse_attn(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform S
 			let tok = nk >= 0 ? p.idx[int64_t(m) * p.idx_stride + t0 + t] : t0 + t;
 			let kp = base + int64_t(tok) * row_elems;
 			float dot = 0.0f;
-			for (int d = 0; d < p.head_dim; ++d) dot = fma(s_aq[d], float(p.k[kp + d]), dot);
+			for (int d = 0; d < p.head_dim; ++d) dot = fma(s_aq[d], p.kq == 0 ? float(p.k[kp + d]) : kv_load((uint8_t*)p.k, p.ks, p.kq, kp + d), dot);
 			score = dot * p.scale;
 		}
 		s_red[t] = score;
@@ -542,7 +545,7 @@ void sparse_attn(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform S
 		if (active) {
 			for (int kk = 0; kk < n; ++kk) {
 				let tok = nk >= 0 ? p.idx[int64_t(m) * p.idx_stride + t0 + kk] : t0 + kk;
-				o = fma(s_as[kk], float(p.v[base + int64_t(tok) * row_elems + t]), o);
+				o = fma(s_as[kk], p.vq == 0 ? float(p.v[base + int64_t(tok) * row_elems + t]) : kv_load((uint8_t*)p.v, p.vs, p.vq, base + int64_t(tok) * row_elems + t), o);
 			}
 		}
 		GroupMemoryBarrierWithGroupSync();
