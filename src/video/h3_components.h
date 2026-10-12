@@ -73,6 +73,9 @@ private:
 	bool resident_;
 	bool have_params_ = false;
 	H3VaeParams params_;
+	std::vector<std::unique_ptr<H3VideoVAE>> vaes_; // resident decoders (paths.resident_decoders)
+	std::vector<int> vaes_devices_;
+	std::unique_ptr<H3AudioVAE> avae_;
 	std::unique_ptr<H3TextGroup> text_;
 	std::vector<int> text_devices_;
 	int text_tokens_ = 0;

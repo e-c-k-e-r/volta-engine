@@ -51,8 +51,14 @@ struct H3Paths {
 	int resident_rows = 0;        // H3Engine with resident models: packed rows the resident transformer has room for (0 = what the first job needs)
 	std::vector<int> devices;     // GPUs for the DiT (sequence parallel); empty = {device}
 	std::string text_encoder;     // optional: an EXL3 conversion of the Qwen3-VL language model; kept resident and sharded over `devices` instead of streaming the BF16 layers from root/text_encoder for every job
+	bool resident_decoders = false; // H3Engine with resident models: keep the video decoders and the audio VAE loaded between jobs too (about 6 GB per GPU; needs the room tensor parallelism leaves)
 	bool tensor_parallel = false; // shard the DiT over `devices` by heads / MLP width instead of by rows (needs NCCL; less VRAM per GPU, a little slower)
 };
+
+// Up-front checks of a configuration (GPUs, tensor parallelism, the text tower checkpoint, whether the resident models fit in the GPU memory): returns false and sets
+// `error` for a configuration that cannot work (the server refuses to start with it, h3_generate exits), and appends advice for ones that merely waste something to
+// `warnings` (may be null). CUDA only.
+bool h3_check_paths( const H3Paths& paths, std::string* error, std::vector<std::string>* warnings );
 
 struct H3Lora {
 	std::string path;

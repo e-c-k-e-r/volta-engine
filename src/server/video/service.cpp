@@ -36,6 +36,16 @@ bool VideoService::init( const ServerConfig& config ) {
 		paths.tensor_parallel = false;
 	}
 #endif
+	paths.resident_decoders = s.cfg.video.resident && s.cfg.video.resident_decoders && paths.tensor_parallel;
+	{
+		std::string err;
+		std::vector<std::string> warnings;
+		if ( !engine::video::h3_check_paths( paths, &err, &warnings ) ) {
+			LOG_ERROR( "MiniMax-H3 service: invalid configuration: %s\n", err.c_str() );
+			return false;
+		}
+		for ( const std::string& w : warnings ) { LOG_WARN( "MiniMax-H3 service: %s\n", w.c_str() ); }
+	}
 	s.engine = std::make_unique<engine::video::H3Engine>( paths, s.cfg.video.resident );
 	s.worker = std::thread( [this] { p_->run_loop(); } );
 	LOG_INFO( "MiniMax-H3 service: %zu adapter(s), %zu GPU(s), references %s, models %s, jobs in %s\n", s.adapters.all().size(), s.cfg.video.devices.size(),

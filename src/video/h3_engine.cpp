@@ -54,6 +54,13 @@ H3Lease<H3VideoVAE> H3Components::video_vae() {
 }
 
 std::vector<H3Lease<H3VideoVAE>> H3Components::video_vaes( const std::vector<int>& devices ) {
+	const bool keep = resident_ && paths_.resident_decoders;
+	if ( keep && !vaes_.empty() && vaes_devices_ == devices ) {
+		std::vector<H3Lease<H3VideoVAE>> shared;
+		for ( auto& v : vaes_ ) { shared.push_back( H3Lease<H3VideoVAE>( v.get() ) ); }
+		return shared;
+	}
+	vaes_.clear();
 	std::vector<int> order{ paths_.device };
 	for ( int d : devices ) { if ( d != paths_.device ) { order.push_back( d ); } }
 	std::vector<std::unique_ptr<H3VideoVAE>> made( order.size() );
@@ -69,8 +76,15 @@ std::vector<H3Lease<H3VideoVAE>> H3Components::video_vaes( const std::vector<int
 	std::vector<H3Lease<H3VideoVAE>> out;
 	if ( made[0] ) { // the primary (paths.device, first) is required
 		for ( auto& m : made ) {
-			if ( m ) { out.push_back( H3Lease<H3VideoVAE>( std::move( m ) ) ); }
+			if ( !m ) { continue; }
+			if ( keep ) {
+				out.push_back( H3Lease<H3VideoVAE>( m.get() ) );
+				vaes_.push_back( std::move( m ) );
+			} else {
+				out.push_back( H3Lease<H3VideoVAE>( std::move( m ) ) );
+			}
 		}
+		if ( keep ) { vaes_devices_ = devices; }
 	}
 	CUDA_CHECK( cudaSetDevice( paths_.device ) );
 	return out;
@@ -98,9 +112,15 @@ H3Lease<H3TextGroup> H3Components::text_group( const std::vector<int>& devices, 
 }
 
 H3Lease<H3AudioVAE> H3Components::audio_vae() {
+	const bool keep = resident_ && paths_.resident_decoders;
+	if ( keep && avae_ ) { return H3Lease<H3AudioVAE>( avae_.get() ); }
 	CUDA_CHECK( cudaSetDevice( paths_.device ) );
 	auto vae = std::make_unique<H3AudioVAE>();
 	if ( !vae->load( ( paths_.root + "/audio_vae" ).c_str(), paths_.device, 704 ) ) { return {}; } // 15 s of audio latents (600) and some slack
+	if ( keep ) {
+		avae_ = std::move( vae );
+		return H3Lease<H3AudioVAE>( avae_.get() );
+	}
 	return H3Lease<H3AudioVAE>( std::move( vae ) );
 }
 
@@ -150,6 +170,8 @@ void H3Components::trim_transformer() {
 }
 
 void H3Components::release() {
+	vaes_.clear();
+	avae_.reset();
 	text_.reset();
 	dit_.reset();
 	dit_checkpoint_.clear();

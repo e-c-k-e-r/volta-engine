@@ -304,6 +304,16 @@ peak 25.0 GB on GPU 0 and 23.4 GB on the others with the decoders loaded per job
 against its video, visually the same frames. It does not fit next to the full-weight sequence-parallel transformer (that run ran out of memory on GPUs 1 to 3 while loading
 the DiT): use it with `tensor_parallel`. Not tried: the 4.0 and 5.0 bpw branches (they would save 1.5 and 0.8 GB per GPU).
 
+Resident decoders (`video.resident_decoders`, default on with `resident` + `tensor_parallel`; `h3_generate --resident-decoders`): the video decoders (4.9 GB of weights plus scratch
+per GPU) and the audio VAE stay loaded between jobs; sequence parallelism leaves no room for them. A second job in the same process: decode 10.9 s (14.8 s with the decoders
+loaded per job), text 0.4 s, no load; about 80 s per job at 1280x736x124 with the turbo adapter (it was 96 to 99 s before the optimization work), videos bit-identical to the
+per-job loads. Peak memory 28.6 GB on GPU 0 and 27.3 GB on the others (transformer shard + its scratch, the sharded text tower, the decoders), so there are about 4 GB of headroom.
+
+`h3_check_paths` (the server at startup, `h3_generate` before it loads anything) refuses configurations that cannot work and says why: a device that does not exist or is
+listed twice, a first device that is not the primary one, a tensor-parallel device count that cannot shard the transformer (2, 4 or 7) or the text tower (2, 4 or 8), a
+`text_encoder` that is not an EXL3 or NVFP4 conversion of the 5120-wide Qwen3-VL language model with at least 50 layers, and a `text_encoder` without `tensor_parallel` when the
+sequence-parallel transformer plus the tower exceed the GPU memory (this used to die silently out of memory at the transformer load). It warns when resident decoders would not fit.
+
 NVFP4 checkpoints (`Qwen3-VL-32B-Instruct-NVFP4`, compressed-tensors `weight_packed` / `weight_scale` / `weight_global_scale`; its norms and embedding are bit-identical to the MiniMax
 encoder too) load through the same path (`load_nvfp4_slice`, the engine's W4A16 kernels: activations stay FP16, `input_global_scale` is unused): 13.7 GB for 50 layers on one GPU,
 3.43 GB per GPU on four, load 6.3 s. Text only: cosine 0.999913 (rel 2.2e-2) against the BF16 golden, 20 times the error of EXL3 6 bpw but fine. With an image the result is

@@ -118,6 +118,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/video/h3_vision.cu
 	src/video/h3_dit_group.cpp
 	src/video/h3_text_group.cpp
+	src/video/h3_check.cpp
 	src/video/h3_pipeline.cu
 	src/video/h3_engine.cpp
 	src/video/h3_stage_refs.cpp

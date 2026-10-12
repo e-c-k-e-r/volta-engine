@@ -16,6 +16,7 @@ struct VideoConfig {
 	bool resident = true;               // keep the transformer on the GPUs between jobs (off: load it for each job, free it after)
 	int resident_idle_s = 0;            // with resident: free it after this many idle seconds (0 = never)
 	std::string text_encoder;           // EXL3 conversion of the Qwen3-VL language model (resident, sharded over `devices`); empty = stream the BF16 layers for every job
+	bool resident_decoders = true;      // with resident and tensor_parallel: keep the video decoders and the audio VAE loaded between jobs too (about 6 GB per GPU)
 	bool tensor_parallel = false;       // shard the transformer over the GPUs by heads / MLP width (a quarter of the weights each) instead of by rows (needs NCCL)
 };
 
