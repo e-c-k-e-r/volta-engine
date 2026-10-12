@@ -34,6 +34,13 @@
 | `tests/4_server/test_api.sh` | 4 | yes | OpenAI and Anthropic APIs, tool calls, reasoning, prefix cache, image input (`VOLTA_TEST_MODEL=glm5_next` for GLM, `VOLTA_TEST_SPEC=mtp` for the MTP head) |
 | `tests/4_server/test_server.sh` | 4 | yes | server integration, concurrency throughput gate |
 
+## Serving benchmarks
+
+Not part of `gate.sh`. `tests/3_bench/bench_serve.py` measures decode speed through a running server's streaming API (`--selftest` checks the plumbing against a mock server, no GPU) and `tests/3_bench/compare_1cat.sh <arm>` starts a server for one configuration, runs it and stops it.
+The workloads are 1Cat-vLLM's published SM70 ones, so numbers can sit beside theirs: `fixedN` tiles one sentence to about N prompt tokens (repetitive, so speculation accepts almost everything), `natural8k` puts four real questions behind 8K tokens of the same filler;
+sampling is their contract (T=1, top-p 0.95, top-k 20, seed 0, 256 tokens) or `--greedy`; `--concurrency 4` is their C4 shape. It reports TTFT, decode tok/s from the stream (prefill excluded), speculation tokens per round and acceptance from `/api/stats`,
+and the GPUs' power limit, clocks and peak draw: compare runs only at the same power cap.
+
 ## MiniMax-H3: checkpoints and goldens
 
 Not part of `gate.sh`: these need the H3 checkpoints and the goldens that `tests/tools/h3_*.py` write to `~/Documents/h3`, and several need four GPUs. Each prints a cosine or PSNR and `ok` / `FAIL`;
