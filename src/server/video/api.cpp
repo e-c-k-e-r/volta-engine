@@ -79,10 +79,13 @@ void VideoService::Impl::handle_submit( const ConnPtr& c, const HttpRequest& r )
 	const int width = static_cast<int>( num_field( b, "width", 1280 ) ), height = static_cast<int>( num_field( b, "height", 736 ) ), frames = static_cast<int>( num_field( b, "frames", 124 ) );
 	int steps = static_cast<int>( num_field( b, "steps", 4 ) );
 	const uint64_t seed = static_cast<uint64_t>( num_field( b, "seed", 1 ) );
+	// optional flow shifts of the sigma schedule (0 = the default: video 6 with a 768p adapter else 12, audio 3); a larger audio shift spends more of the few steps at low noise
+	const double video_shift = num_field( b, "video_shift", 0 ), audio_shift = num_field( b, "audio_shift", 0 );
 	if ( prompt.empty() || prompt.size() > 8000 ) return bad_request( c, "prompt must be 1 to 8000 characters" );
 	if ( width < 256 || height < 256 || width > 2048 || height > 2048 || width % 32 || height % 32 ) return bad_request( c, "width and height must be multiples of 32 in [256, 2048]" );
 	if ( frames < 22 || frames > 362 ) return bad_request( c, "frames must be in [22, 362]" );
 	if ( steps < 1 || steps > 60 ) return bad_request( c, "steps must be in [1, 60]" );
+	if ( ( video_shift != 0 && ( video_shift < 0.5 || video_shift > 40 ) ) || ( audio_shift != 0 && ( audio_shift < 0.5 || audio_shift > 40 ) ) ) return bad_request( c, "video_shift and audio_shift must be 0 (default) or in [0.5, 40]" );
 
 	// ---- uploads: keyframes (FL2VA) or references (Ref2VA) ----
 	std::vector<std::string> key_data, ref_image_data, ref_video_data, ref_audio_data;
@@ -174,6 +177,8 @@ void VideoService::Impl::handle_submit( const ConnPtr& c, const HttpRequest& r )
 		if ( l.is_object() ) ls.push_back( { { "file", str_field( l, "file" ) }, { "scale", num_field( l, "scale", 1.0 ) } } );
 	}
 	params["loras"] = ls;
+	if ( video_shift > 0 ) params["video_shift"] = video_shift;
+	if ( audio_shift > 0 ) params["audio_shift"] = audio_shift;
 	j->params = params;
 	jobs.enqueue( j );
 	LOG_INFO( "Video job %d queued (%dx%d, %d frames, %d steps, %zu adapter(s), %zu keyframe(s), %zu reference(s))\n", j->id, width, height, frames, steps, loras.size(), key_data.size(),

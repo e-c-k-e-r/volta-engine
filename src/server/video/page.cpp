@@ -55,6 +55,8 @@ input[type=range]{width:100%;accent-color:var(--acc)}
   <div><label>Resolution</label><select id="res"></select></div></div>
   <label>Duration: <b id="durv"></b></label><input type="range" id="dur" min="1" max="15" step="0.5" value="5">
   <div class="row"><div><label>Speed / quality</label><select id="turbo"></select></div><div><label>Seed</label><div class="row"><input type="number" id="seed" value="1"><button id="rnd" title="random seed" style="flex:0 0 40px">&#9856;</button></div></div></div>
+  <div class="row"><div><label>Audio shift</label><input type="number" id="ashift" step="0.5" min="0.5" max="40" placeholder="3 (default)"></div><div><label>Video shift</label><input type="number" id="vshift" step="0.5" min="0.5" max="40" placeholder="auto"></div></div>
+  <div class="small">Flow shift of the sigma schedule; empty uses the default. A higher audio shift cleans up the few-step audio.</div>
   <div class="small" id="plan" style="margin-top:8px"></div>
  </div>
  <div class="card"><h2>LoRA</h2><div id="loras" class="small">no adapters found</div></div>
@@ -93,13 +95,13 @@ async function boot(){info=await (await api('/api/info')).json();if(info.ref2va)
 $('#go').onclick=async()=>{const [w,h]=$('#res').value.split('x').map(Number);const ti=turboInfo();const loras=[];document.querySelectorAll('.lora').forEach((r,i)=>{const c=r.querySelector('input[type=checkbox]');if(c.checked)loras.push({file:c.dataset.f,scale:+$('#ls'+i).value})});
  const images=[];if(imgs[0])images.push({data:imgs[0],frame_index:0});if(imgs[1])images.push({data:imgs[1],frame_index:imgs[0]?-1:-1});
  if(!$('#prompt').value.trim()){$('#msg').textContent='Enter a prompt.';return}
- const body={prompt:$('#prompt').value,width:w,height:h,frames:frames(),steps:ti.steps,seed:+$('#seed').value,turbo:$('#turbo').value,loras,images:(rimgs.length||rvid.length)?[]:images,ref_images:rimgs.map(data=>({data})),ref_videos:rvid.map(a=>({data:a.data})),ref_audios:raud.map(a=>({data:a.data}))};
+ const body={prompt:$('#prompt').value,width:w,height:h,frames:frames(),steps:ti.steps,seed:+$('#seed').value,video_shift:+$('#vshift').value||0,audio_shift:+$('#ashift').value||0,turbo:$('#turbo').value,loras,images:(rimgs.length||rvid.length)?[]:images,ref_images:rimgs.map(data=>({data})),ref_videos:rvid.map(a=>({data:a.data})),ref_audios:raud.map(a=>({data:a.data}))};
  $('#go').disabled=true;$('#msg').textContent='';try{await api('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});$('#seed').value=Math.floor(Math.random()*2**31)}catch(e){$('#msg').textContent=e.message}$('#go').disabled=false;poll(true)};
 const stageName={images:'encoding images and audio',text:'encoding the prompt',load:'loading the model',denoise:'denoising',decode:'decoding video and audio',mux:'writing the file'};
 function fmt(s){s=Math.round(s);return s>=60?Math.floor(s/60)+'m '+(s%60)+'s':s+'s'}
 let last='';async function poll(force){try{const j=await (await api('/api/jobs')).json();const q=j.filter(x=>x.state==='queued'||x.state==='running').length;$('#qinfo').textContent=q?q+' job(s) active':'idle';
  const html=j.map(x=>{const p=x.params||{};const pct=x.state==='done'?100:x.state==='running'?Math.round(x.progress*100):0;
-  let body=`<div class="top"><span class="pill ${x.state}">${x.state}</span><span class="meta">#${x.id} ${p.width}x${p.height}, ${p.frames} frames, seed ${p.seed}${p.turbo?'':' , base'}</span><span class="sp"></span>`;
+  let body=`<div class="top"><span class="pill ${x.state}">${x.state}</span><span class="meta">#${x.id} ${p.width}x${p.height}, ${p.frames} frames, seed ${p.seed}${p.turbo?'':', base'}${p.audio_shift?', audio shift '+p.audio_shift:''}${p.video_shift?', video shift '+p.video_shift:''}</span><span class="sp"></span>`;
   body+=x.state==='running'||x.state==='queued'?`<button data-c="${x.id}">cancel</button>`:`<button data-d="${x.id}">delete</button>`;body+='</div>';
   body+=`<div class="pr">${esc(p.prompt||'')}</div>`;
   if(x.state==='running'||x.state==='queued'){body+=`<div class="bar"><i style="width:${pct}%"></i></div><div class="meta">${x.state==='queued'?'waiting in the queue':(stageName[x.stage]||x.stage)+(x.stage==='denoise'?' (step '+x.step+' of '+x.steps+')':'')+', '+fmt(x.elapsed)+' elapsed'}</div>`}
@@ -108,7 +110,7 @@ let last='';async function poll(force){try{const j=await (await api('/api/jobs')
  if(html!==last||force){const vids=[...document.querySelectorAll('video')].some(v=>!v.paused);if(!vids){$('#jobs').innerHTML=html;last=html}}window._jobs=j;
  document.querySelectorAll('[data-c]').forEach(b=>b.onclick=()=>api('/api/jobs/'+b.dataset.c+'/cancel',{method:'POST'}).then(()=>poll(true)));
  document.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>api('/api/jobs/'+b.dataset.d,{method:'DELETE'}).then(()=>poll(true)));
- document.querySelectorAll('[data-r]').forEach(b=>b.onclick=()=>{const x=window._jobs.find(y=>y.id==b.dataset.r);if(!x)return;const p=x.params;$('#prompt').value=p.prompt;$('#seed').value=p.seed;$('#turbo').value=p.turbo||'';$('#dur').value=Math.round(p.frames/24*2)/2;plan()})}catch(e){}
+ document.querySelectorAll('[data-r]').forEach(b=>b.onclick=()=>{const x=window._jobs.find(y=>y.id==b.dataset.r);if(!x)return;const p=x.params;$('#prompt').value=p.prompt;$('#seed').value=p.seed;$('#ashift').value=p.audio_shift||'';$('#vshift').value=p.video_shift||'';$('#turbo').value=p.turbo||'';$('#dur').value=Math.round(p.frames/24*2)/2;plan()})}catch(e){}
  setTimeout(poll,1500)}
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 boot();

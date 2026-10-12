@@ -105,6 +105,8 @@ void VideoService::Impl::run_job( const JobPtr& j ) {
 	r.frames = p["frames"].get<int>();
 	r.steps = j->steps_total;
 	r.seed = p["seed"].get<uint64_t>();
+	if ( p.contains( "video_shift" ) ) r.video_shift = p["video_shift"].get<float>();
+	if ( p.contains( "audio_shift" ) ) r.audio_shift = p["audio_shift"].get<float>();
 	r.loras = j->loras;
 	r.images = j->images;
 	r.ref_images = j->ref_images;
