@@ -106,8 +106,14 @@ let last='';async function poll(force){try{const j=await (await api('/api/jobs')
   body+=`<div class="pr">${esc(p.prompt||'')}</div>`;
   if(x.state==='running'||x.state==='queued'){body+=`<div class="bar"><i style="width:${pct}%"></i></div><div class="meta">${x.state==='queued'?'waiting in the queue':(stageName[x.stage]||x.stage)+(x.stage==='denoise'?' (step '+x.step+' of '+x.steps+')':'')+', '+fmt(x.elapsed)+' elapsed'}</div>`}
   if(x.state==='done')body+=`<video src="/api/jobs/${x.id}/video" controls loop preload="metadata" poster="/api/jobs/${x.id}/thumb"></video><div class="meta">${x.t_total?'generated in '+fmt(x.t_total)+' (text '+fmt(x.t_text)+', denoise '+fmt(x.t_denoise)+', decode '+fmt(x.t_decode)+')':''}</div><div class="acts"><a href="/api/jobs/${x.id}/video" download="h3_${x.id}.mp4"><button>download</button></a><button data-r="${x.id}">reuse settings</button></div>`;
-  if(x.error)body+=`<div class="err">${esc(x.error)}</div>`;return `<div class="job">${body}</div>`}).join('');
- if(html!==last||force){const vids=[...document.querySelectorAll('video')].some(v=>!v.paused);if(!vids){$('#jobs').innerHTML=html;last=html}}window._jobs=j;
+  if(x.error)body+=`<div class="err">${esc(x.error)}</div>`;return {id:x.id,h:`<div class="job">${body}</div>`}});
+ const box=$('#jobs');const have=new Map([...box.children].map(e=>[e.dataset.id,e]));let prev=null,changed=false;
+ for(const it of html){let el=have.get(String(it.id));have.delete(String(it.id));
+  if(!el||el.dataset.h!==it.h){if(el&&el.querySelector('video')&&[...el.querySelectorAll('video')].some(v=>!v.paused)){prev=el;continue}const n=document.createElement('div');n.innerHTML=it.h;const nn=n.firstChild;nn.dataset.id=it.id;nn.dataset.h=it.h;if(el)el.replaceWith(nn);else box.insertBefore(nn,prev?prev.nextSibling:box.firstChild);el=nn;changed=true}
+  else if(el.previousSibling!==prev&&!(prev===null&&el===box.firstChild))box.insertBefore(el,prev?prev.nextSibling:box.firstChild);
+  prev=el}
+ have.forEach(e=>{e.remove();changed=true});
+ window._jobs=j;
  document.querySelectorAll('[data-c]').forEach(b=>b.onclick=()=>api('/api/jobs/'+b.dataset.c+'/cancel',{method:'POST'}).then(()=>poll(true)));
  document.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>api('/api/jobs/'+b.dataset.d,{method:'DELETE'}).then(()=>poll(true)));
  document.querySelectorAll('[data-r]').forEach(b=>b.onclick=()=>{const x=window._jobs.find(y=>y.id==b.dataset.r);if(!x)return;const p=x.params;$('#prompt').value=p.prompt;$('#seed').value=p.seed;$('#ashift').value=p.audio_shift||'';$('#vshift').value=p.video_shift||'';$('#turbo').value=p.turbo||'';$('#dur').value=Math.round(p.frames/24*2)/2;plan()})}catch(e){}
