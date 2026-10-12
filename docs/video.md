@@ -103,7 +103,7 @@ A job body is `{prompt, width, height, frames, steps, seed, turbo, loras:[{file,
 
 Settings live in the launch config's `video` object, documented in [CONFIG.md](CONFIG.md): `dit`, `dit_ref2va`, `lora_dirs`, `out_dir`, `devices`, `max_rows`, `resident`, `resident_idle_s`, `tensor_parallel`, `text_encoder`, and `resident_decoders`.
 
-There is no authentication, and the server binds to localhost by default. The page has had very little browser testing.
+There is no authentication, and the default `host` is `0.0.0.0`: pass `--host 127.0.0.1` unless the server should be reachable from the network. The page has had very little browser testing.
 
 ## `h3_pipeline.cu`, `h3_engine.cpp`, `h3_stage_*`, `h3_check.cpp`
 

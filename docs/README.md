@@ -24,6 +24,7 @@
 ## Docs
 
 * [GETTING_STARTED.md](GETTING_STARTED.md): building, running the server, and per-model notes
+* [server.md](server.md): the HTTP server, the OpenAI / Anthropic front ends, the output parser, and the monitor page
 * [CONFIG.md](CONFIG.md): every option (generated from the option table, do not edit by hand)
 * [ARCHITECTURE.md](ARCHITECTURE.md): the layers, the execution model, and how requests flow
 * [CAPABILITIES.md](CAPABILITIES.md): which module functions each backend implements (generated)
