@@ -814,6 +814,14 @@ void Qwen4ExpPipeline::gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, i
 		GR::up_epilogue( gr16_u_.ptr<const float>(), gr_scratch_, mixed_.ptr<half_t>(), m, H, hc, stream );
 		return;
 	}
+#if ENGINE_BACKEND_CUDA
+	if ( normed_ready_ ) {
+		engine::modules::GatedResidual::mix_prenormed( g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(), with_post ? g.inject.ptr<const backend::half_t>() : nullptr,
+			mixed_.ptr<backend::half_t>(), post_, gr_scratch_, m, config_.hidden_size, config_.hc_mult, config_.hc_rank, stream );
+		normed_ready_ = false;
+		return;
+	}
+#endif
 	engine::modules::GatedResidual::mix(
 		streams_.ptr<const float>(), g.norm.ptr<const backend::half_t>(), g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(),
 		with_post ? g.inject.ptr<const backend::half_t>() : nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_,
@@ -1110,7 +1118,23 @@ void Qwen4ExpPipeline::hessian_dump() {
 	LOG_INFO( "[RANK %d] hessians written to %s\n", rank_, dir.c_str() );
 }
 
-void Qwen4ExpPipeline::attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L, int m, backend::stream_t stream ) {
+// The all-reduce of a sublayer's output y_ (after which the gated add is deferred into the next site's norm). With a ring, decode-sized rows and the next
+// site's norm weight, one kernel reduces y_, adds it to the streams and writes the next site's normed streams; the next gr_mix then starts at the gate
+void Qwen4ExpPipeline::site_reduce( int m, const backend::half_t* next_norm, backend::stream_t stream ) {
+	if ( !ring_ ) return;
+#if ENGINE_BACKEND_CUDA
+	static const bool fuse = runtime::options().gr_fuse && runtime::options().trace_layers.empty() && runtime::options().teacher_streams.empty() &&
+		runtime::options().hessian_dir.empty();
+	if ( fuse && next_norm != nullptr && m <= 8 && !apply_pending_ ) {
+		ring_->all_reduce_gated_norm( y_, streams_.ptr<float>(), post_, next_norm, gr_scratch_, config_.hc_mult, config_.rms_norm_eps, stream );
+		normed_ready_ = true;
+		return;
+	}
+#endif
+	ring_->all_reduce( y_, stream );
+}
+
+void Qwen4ExpPipeline::attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L, int m, backend::stream_t stream, const backend::half_t* next_norm ) {
 	const int H = config_.hidden_size, hc = config_.hc_mult;
 	gr_mix( lw.attn_hc, true, m, stream );
 	hess_layer_ = L;
@@ -1118,22 +1142,22 @@ void Qwen4ExpPipeline::attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L
 	if ( L >= 0 ) trace_rows( 100 + L, mixed_.data, false, m, stream );
 	if ( lw.is_full_attention ) attention_forward( lw, idx, m, stream );
 	else gdn_forward( lw, idx, m, stream );
-	if ( ring_ ) ring_->all_reduce( y_, stream );
+	site_reduce( m, next_norm, stream );
 	if ( L >= 0 ) trace_rows( 200 + L, y_.data, false, m, stream );
-	defer_apply();
+	if ( !normed_ready_ ) defer_apply();
 	if ( L >= 0 ) trace_rows( 300 + L, streams_.data, true, m, stream );
 }
 
-void Qwen4ExpPipeline::mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, backend::stream_t stream ) {
+void Qwen4ExpPipeline::mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, backend::stream_t stream, const backend::half_t* next_norm ) {
 	const int H = config_.hidden_size, hc = config_.hc_mult;
 	gr_mix( lw.mlp_hc, true, m, stream );
 	hess_layer_ = L;
 	hessian( L, 1, mixed_.data, H, m, stream );
 	if ( L >= 0 ) trace_rows( 400 + L, mixed_.data, false, m, stream );
 	moe_forward( lw, m, stream );
-	if ( ring_ ) ring_->all_reduce( y_, stream );
+	site_reduce( m, next_norm, stream );
 	if ( L >= 0 ) trace_rows( 500 + L, y_.data, false, m, stream );
-	defer_apply();
+	if ( !normed_ready_ ) defer_apply();
 }
 
 void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
@@ -1151,9 +1175,11 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 			trace_rows( 800, streams_.data, true, m, stream );
 		}
 		if ( L >= 1 ) teacher_inject( L, m, stream );
-		attn_site( lw, lw.is_full_attention ? attn_idx++ : linear_idx++, L, m, stream );
+		attn_site( lw, lw.is_full_attention ? attn_idx++ : linear_idx++, L, m, stream, lw.mlp_hc.norm.ptr<const backend::half_t>() );
 		if ( halt == site++ ) { flush_apply( m, stream ); return; }
-		mlp_site( lw, L, m, stream );
+		// The next site is the next layer's attention, unless the PLE layer comes first (it changes the streams) or this is the last layer (the head's mixer follows)
+		const bool next_is_site = L + 1 < config_.num_layers && L + 1 != config_.ple_layer;
+		mlp_site( lw, L, m, stream, next_is_site ? layers_[L + 1].attn_hc.norm.ptr<const backend::half_t>() : nullptr );
 		if ( static const double eps_l = runtime::options().perturb_layers; eps_l != 0.0 && m > pod::MAX_BATCH ) {
 			flush_apply( m, stream );
 			const size_t n = static_cast<size_t>( m ) * hc * H;
@@ -1286,7 +1312,7 @@ void Qwen4ExpPipeline::mtp_step_impl( const pod::BatchRows& rows, const int* tok
 	engine::modules::GatedResidual::add_broadcast( mtp_h2_.ptr<const backend::half_t>(), e2.ptr<const backend::half_t>(), streams_.ptr<float>(), m, H, hc, stream );
 
 	// 3. the head's block (its attention is the last layer of the KV pool)
-	attn_site( mtp_layer_, attn_layers_ - 1, -1, m, stream );
+	attn_site( mtp_layer_, attn_layers_ - 1, -1, m, stream, mtp_layer_.mlp_hc.norm.ptr<const backend::half_t>() );
 	mlp_site( mtp_layer_, -1, m, stream );
 	flush_apply( m, stream );
 

@@ -33,6 +33,20 @@ struct CollectiveRing {
 		pod::TensorView& x,
 		backend::stream_t stream = nullptr
 	);
+
+	// Flash-Next decode: y = all_reduce(y), then the gated add x[r, s, :] += post[r, s] * y[r, :] over the fp32 streams x [rows, hc, hidden]
+	// and the next site's per-stream norm normed[r, s, :] = x * rsqrt(mean(x^2) + eps) * (1 + norm_w[s, :]) (what GatedResidual::apply and
+	// ::norm do one after the other), in the one kernel that reduces y. hc is 4; y is left holding the reduced rows.
+	void all_reduce_gated_norm(
+		pod::TensorView& y,
+		float* streams,
+		const float* post,
+		const backend::half_t* norm_w,
+		float* normed,
+		int hc,
+		float eps,
+		backend::stream_t stream = nullptr
+	);
 };
 
 void init_4gpu_mesh(

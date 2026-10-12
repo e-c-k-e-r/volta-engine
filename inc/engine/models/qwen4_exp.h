@@ -150,14 +150,18 @@ private:
 	void forward_body( int m, backend::stream_t stream );
 	// One sublayer site of a block: gated-residual mix, the sublayer, the cross-rank sum and the residual write. idx is the attention or linear layer
 	// counter of the block; L (>= 0) names the trace tags
-	void attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L, int m, backend::stream_t stream );
-	void mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, backend::stream_t stream );
+	// next_norm: the norm weight of the gated-residual site that follows (decode-sized rows with a ring: the all-reduce kernel then adds the sublayer
+	// output to the streams and norms them for that site, which skips its own norm pass); null = the plain all-reduce and a deferred add
+	void attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L, int m, backend::stream_t stream, const backend::half_t* next_norm = nullptr );
+	void mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, backend::stream_t stream, const backend::half_t* next_norm = nullptr );
+	void site_reduce( int m, const backend::half_t* next_norm, backend::stream_t stream );
 	void teacher_inject( int L, int m, backend::stream_t stream );
 	// One sublayer's input: the gated-residual mix of the streams into mixed_ (and post_ when the site has an inject gate)
 	void gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream );
 	void defer_apply();
 	void flush_apply( int m, backend::stream_t stream );
 	pod::TensorView gr16_hi_, gr16_lo_, gr16_z_, gr16_thi_, gr16_tlo_, gr16_u_;   // operands / results of the tensor-core gated residual (prefill rows)
+	bool normed_ready_ = false;    // gr_scratch_ already holds the next gr_mix's normed streams (the fused all-reduce wrote them)
 	bool apply_pending_ = false;   // a gated add (post_, y_) waits to be folded into the next gr_mix
 	// N-gram embedding layer: host gather of the rows for the forward (called from forward()), device gate / conv (from forward_body)
 	void ple_prepare( const pod::BatchRows& rows, int m, backend::stream_t stream );

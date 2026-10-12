@@ -267,6 +267,126 @@ void all_reduce_ring_kernel(
 	ar_retire( flags[rank], seq );
 }
 
+// Last block to finish publishes seq as consumed (a grid of `blocks` blocks)
+__device__ __forceinline__ void ar_retire_n( uint32_t* local_flags, uint32_t seq, unsigned blocks ) {
+	__syncthreads();
+	if ( threadIdx.x == 0 ) {
+		if ( atomicAdd( local_flags + AR_RETIRE_WORD, 1u ) == blocks - 1 ) {
+			local_flags[AR_RETIRE_WORD] = 0;
+			local_flags[AR_SEQ_WORD] = seq;
+			__threadfence();
+		}
+	}
+}
+
+// all_reduce_ring_kernel followed by the Flash-Next gated add and the per-stream norm for the next site. Grid (rows, hc): the block (row, s) reduces the
+// whole row of y (every block of a row publishes the same bytes to the staging slot, so the flags are idempotent) and then owns stream s alone: it adds
+// post[row, s] * y to the fp32 stream, reduces its sum of squares and writes the normed stream. y itself is not written back (it is dead after the add).
+// The summation of the squares differs in order from GatedResidual::norm; the streams are updated identically.
+constexpr int AR_GN_CHUNKS = 2;   // 8-value chunks per thread: hidden <= 2 * 256 * 8 = 4096
+template <int NR>
+__global__ __launch_bounds__( 256 )
+void all_reduce_gated_norm_kernel(
+	int rank,
+	const void* __restrict__ p0, const void* __restrict__ p1, const void* __restrict__ p2, const void* __restrict__ p3,
+	uint32_t* __restrict__ f0, uint32_t* __restrict__ f1, uint32_t* __restrict__ f2, uint32_t* __restrict__ f3,
+	const half* __restrict__ y,
+	float* __restrict__ x,
+	const float* __restrict__ post,
+	const half* __restrict__ w,
+	float* __restrict__ normed,
+	int hidden_size,
+	int hc,
+	float eps
+) {
+	const int row = blockIdx.x, s = blockIdx.y;
+	const size_t row_elems = static_cast<size_t>( hidden_size );
+	const size_t n4 = row_elems / 8;
+
+	const void* peer_slots[4] = { p0, p1, p2, p3 };
+	uint32_t* flags[4] = { f0, f1, f2, f3 };
+	const uint32_t seq = ar_next_seq( flags[rank] );
+	const uint32_t stage = seq & 3;
+	uint8_t* my_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[rank] ) ) + ( (size_t) stage * 4 + rank ) * IPC_SLOT_BYTES;
+	uint4* my_slot = reinterpret_cast<uint4*>( my_staging ) + row * n4;
+	const uint4* src_y = ( (const uint4*) ( y + row * row_elems ) );
+	for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) my_slot[i] = src_y[i];
+	__threadfence_system();
+	__syncthreads();
+	if ( threadIdx.x == 0 ) {
+		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
+		for ( int p = 0; p < NR; ++p ) {
+			if ( p == rank ) continue;
+			while ( ldg_acquire_sys_u32( ar_flag( flags[p], stage, row, p ) ) < seq ) __nanosleep( 32 );
+		}
+	}
+	__syncthreads();
+
+	const uint4* r_ptrs[NR];
+	#pragma unroll
+	for ( int offset = 0; offset < NR; ++offset ) {
+		const int p = ( rank + offset ) % NR;
+		uint8_t* p_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[p] ) ) + ( (size_t) stage * 4 + p ) * IPC_SLOT_BYTES;
+		r_ptrs[offset] = reinterpret_cast<const uint4*>( p_staging ) + row * n4;
+	}
+
+	const float pv = post[static_cast<size_t>( row ) * hc + s];
+	float xv[AR_GN_CHUNKS][8];
+	float sq = 0.0f;
+	float* xs_row = x + ( static_cast<size_t>( row ) * hc + s ) * row_elems;
+	#pragma unroll
+	for ( int c = 0; c < AR_GN_CHUNKS; ++c ) {
+		const size_t i = threadIdx.x + static_cast<size_t>( c ) * blockDim.x;
+		if ( i >= n4 ) continue;
+		__half hp[NR][8];
+		#pragma unroll
+		for ( int r = 0; r < NR; ++r ) *reinterpret_cast<uint4*>( hp[r] ) = r_ptrs[r][i];
+		float* xs = xs_row + i * 8;
+		const float4 a0 = *reinterpret_cast<const float4*>( xs ), a1 = *reinterpret_cast<const float4*>( xs + 4 );
+		float v[8] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w };
+		#pragma unroll
+		for ( int k = 0; k < 8; ++k ) {
+			float sum = __half2float( hp[0][k] );
+			#pragma unroll
+			for ( int r = 1; r < NR; ++r ) sum += __half2float( hp[r][k] );
+			const float yk = __half2float( __float2half_rn( sum ) );   // y is stored as fp16 between the reduction and the add
+			v[k] += pv * yk;
+			xv[c][k] = v[k];
+			sq += v[k] * v[k];
+		}
+		*reinterpret_cast<float4*>( xs ) = make_float4( v[0], v[1], v[2], v[3] );
+		*reinterpret_cast<float4*>( xs + 4 ) = make_float4( v[4], v[5], v[6], v[7] );
+	}
+	#pragma unroll
+	for ( int mask = 16; mask > 0; mask >>= 1 ) sq += __shfl_xor_sync( 0xffffffff, sq, mask );
+	__shared__ float s_part[8];
+	__shared__ float s_inv;
+	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+	if ( lane == 0 ) s_part[warp] = sq;
+	__syncthreads();
+	if ( threadIdx.x == 0 ) {
+		float total = 0.0f;
+		#pragma unroll
+		for ( int wi = 0; wi < 8; ++wi ) total += s_part[wi];
+		s_inv = rsqrtf( total / hidden_size + eps );
+	}
+	__syncthreads();
+	float* ns_row = normed + ( static_cast<size_t>( row ) * hc + s ) * row_elems;
+	#pragma unroll
+	for ( int c = 0; c < AR_GN_CHUNKS; ++c ) {
+		const size_t i = threadIdx.x + static_cast<size_t>( c ) * blockDim.x;
+		if ( i >= n4 ) continue;
+		__half hw[8];
+		*reinterpret_cast<uint4*>( hw ) = *reinterpret_cast<const uint4*>( w + static_cast<size_t>( s ) * row_elems + i * 8 );
+		float o[8];
+		#pragma unroll
+		for ( int k = 0; k < 8; ++k ) o[k] = xv[c][k] * s_inv * ( 1.0f + __half2float( hw[k] ) );
+		*reinterpret_cast<float4*>( ns_row + i * 8 ) = make_float4( o[0], o[1], o[2], o[3] );
+		*reinterpret_cast<float4*>( ns_row + i * 8 + 4 ) = make_float4( o[4], o[5], o[6], o[7] );
+	}
+	ar_retire_n( flags[rank], seq, gridDim.x * gridDim.y );
+}
+
 void CollectiveRing::init(
 	int local_rank,
 	int ranks,
@@ -349,6 +469,27 @@ void CollectiveRing::all_reduce(
 		x_ptr,
 		hidden_size
 	);
+}
+
+void CollectiveRing::all_reduce_gated_norm(
+	pod::TensorView& y,
+	float* streams,
+	const float* post,
+	const backend::half_t* norm_w,
+	float* normed,
+	int hc,
+	float eps,
+	cudaStream_t stream
+) {
+	const int rows = y.shape[0];
+	const int hidden_size = y.shape[1];
+	ENGINE_ASSERT( hc == 4 && rows >= 1 && rows <= AR_MAX_ROWS && static_cast<size_t>( rows ) * hidden_size * sizeof( half ) <= IPC_SLOT_BYTES, "all_reduce_gated_norm: rows out of range" );
+	ENGINE_ASSERT( hidden_size % 128 == 0 && hidden_size / 8 <= AR_GN_CHUNKS * 256, "all_reduce_gated_norm: hidden_size" );
+	auto kernel = ( nranks == 2 ) ? all_reduce_gated_norm_kernel<2> : all_reduce_gated_norm_kernel<4>;
+	kernel<<<dim3( rows, hc ), dim3( 256 ), 0, stream>>>(
+		rank, peer_ptrs[0], peer_ptrs[1], peer_ptrs[2], peer_ptrs[3],
+		static_cast<uint32_t*>( sync_flags[0] ), static_cast<uint32_t*>( sync_flags[1] ), static_cast<uint32_t*>( sync_flags[2] ), static_cast<uint32_t*>( sync_flags[3] ),
+		y.ptr<const half>(), streams, post, reinterpret_cast<const half*>( norm_w ), normed, hidden_size, hc, eps );
 }
 
 void init_4gpu_mesh(

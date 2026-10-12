@@ -268,47 +268,62 @@ void router_softmax_select_kernel(
 		s_logit[expert] = round_fp16 ? __half2float( __float2half_rn( logit ) ) : logit;
 	}
 	__syncthreads();
-	if ( threadIdx.x < 32 ) {
-		const int lane = threadIdx.x;
-		bool taken[16];
+	// Two-stage rank selection, no sequential rounds: (1) every warp ranks its 32 logits against each other (an element with top_k better ones in its own warp
+	// cannot be in the top_k), (2) the surviving candidates (at most top_k per warp, in fixed slots) are ranked against each other. A rank counts the
+	// elements that beat the element (larger, or equal with the lower index), so the first top_k ranks are the selection in order, ties to the lower index
+	__shared__ __align__( 16 ) float s_cval[16 * 16];
+	__shared__ __align__( 16 ) int s_cidx[16 * 16];
+	__shared__ int s_sel[16];
+	__shared__ float s_val[16];
+	for ( int c = threadIdx.x; c < 16 * 16; c += blockDim.x ) {
+		s_cval[c] = -INFINITY;
+		s_cidx[c] = 0x7fffffff;
+	}
+	__syncthreads();
+	{
+		const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+		float v = expert < num_experts ? s_logit[expert] : -INFINITY;
+		v = v != v ? -INFINITY : v;
+		int rank = 0;
 		#pragma unroll
-		for ( int q = 0; q < 16; ++q ) taken[q] = false;
-		int sel[16];
-		float val[16];
-		for ( int i = 0; i < top_k; ++i ) {
-			float best = -INFINITY;
-			int best_idx = 0x7fffffff;
-			#pragma unroll
-			for ( int q = 0; q < 16; ++q ) {
-				const int e = lane + q * 32;
-				if ( e < num_experts && !taken[q] ) {
-					const float v = s_logit[e];
-					if ( v > best || ( v == best && e < best_idx ) ) {
-						best = v;
-						best_idx = e;
-					}
-				}
-			}
-			#pragma unroll
-			for ( int off = 16; off > 0; off >>= 1 ) {
-				const float ov = __shfl_xor_sync( 0xffffffff, best, off );
-				const int oi = __shfl_xor_sync( 0xffffffff, best_idx, off );
-				if ( ov > best || ( ov == best && oi < best_idx ) ) {
-					best = ov;
-					best_idx = oi;
-				}
-			}
-			sel[i] = best_idx;
-			val[i] = best;
-			if ( ( best_idx & 31 ) == lane ) taken[best_idx >> 5] = true;
+		for ( int jj = 0; jj < 32; ++jj ) {
+			const float u = __shfl_sync( 0xffffffff, v, jj );
+			rank += ( u > v ) || ( u == v && jj < lane );
 		}
-		if ( lane == 0 ) {
-			float sum = 0.0f;
-			for ( int i = 0; i < top_k; ++i ) sum += __expf( val[i] - val[0] );
-			for ( int i = 0; i < top_k; ++i ) {
-				topk_indices[i] = sel[i];
-				topk_weights[i] = __float2half_rn( __expf( val[i] - val[0] ) / sum );
-			}
+		if ( rank < top_k && expert < num_experts ) {
+			s_cval[warp * 16 + rank] = v;
+			s_cidx[warp * 16 + rank] = expert;
+		}
+	}
+	__syncthreads();
+	if ( threadIdx.x < 16 * 16 ) {
+		const float v = s_cval[threadIdx.x];
+		const int vi = s_cidx[threadIdx.x];
+		int rank = 0;
+		// Four candidates per load, two independent counters: the shared-memory latency is what this loop costs
+		int rank2 = 0;
+		#pragma unroll 8
+		for ( int c = 0; c < 16 * 16; c += 4 ) {
+			const float4 u = *reinterpret_cast<const float4*>( &s_cval[c] );
+			const int4 ui = *reinterpret_cast<const int4*>( &s_cidx[c] );
+			rank += ( u.x > v ) || ( u.x == v && ui.x < vi );
+			rank2 += ( u.y > v ) || ( u.y == v && ui.y < vi );
+			rank += ( u.z > v ) || ( u.z == v && ui.z < vi );
+			rank2 += ( u.w > v ) || ( u.w == v && ui.w < vi );
+		}
+		rank += rank2;
+		if ( rank < top_k && vi != 0x7fffffff ) {
+			s_sel[rank] = vi;
+			s_val[rank] = v;
+		}
+	}
+	__syncthreads();
+	if ( threadIdx.x == 0 ) {
+		float sum = 0.0f;
+		for ( int i = 0; i < top_k; ++i ) sum += __expf( s_val[i] - s_val[0] );
+		for ( int i = 0; i < top_k; ++i ) {
+			topk_indices[i] = s_sel[i];
+			topk_weights[i] = __float2half_rn( __expf( s_val[i] - s_val[0] ) / sum );
 		}
 	}
 }

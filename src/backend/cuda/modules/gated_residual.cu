@@ -749,6 +749,17 @@ void GatedResidual::mix(
 		reinterpret_cast<half*>( mixed ), post, scratch, rows, hidden, hc, rank, eps, stream, prev_post, reinterpret_cast<const half*>( prev_y ), fast );
 }
 
+void GatedResidual::mix_prenormed(
+	const backend::half_t* down, const backend::half_t* up, const backend::half_t* inject, backend::half_t* mixed, float* post, float* scratch,
+	int rows, int hidden, int hc, int rank, backend::stream_t stream
+) {
+	ENGINE_ASSERT( hc == 4 && ( hc * hidden ) % 1024 == 0 && hidden % GR_DT == 0 && rank % 64 == 0, "GatedResidual::mix_prenormed: shape" );
+	ENGINE_ASSERT( rows <= 8 && hc * hidden <= 8 * GRD_CHUNKS * GRD_THREADS && hidden % GRD_CH == 0 && rank <= 384, "GatedResidual::mix_prenormed: decode-sized calls only" );
+	float* t = scratch + static_cast<size_t>( rows ) * hc * hidden;
+	mix_fast( scratch, reinterpret_cast<const half*>( down ), reinterpret_cast<const half*>( up ), reinterpret_cast<const half*>( inject ), reinterpret_cast<half*>( mixed ),
+		post, t, rows, hidden, hc, rank, stream );
+}
+
 void GatedResidual::mix_reference(
 	const float* x, const backend::half_t* norm_w, const backend::half_t* down, const backend::half_t* up, const backend::half_t* inject,
 	backend::half_t* mixed, float* post, float* scratch, int rows, int hidden, int hc, int rank, float eps, backend::stream_t stream,

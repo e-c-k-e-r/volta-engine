@@ -36,6 +36,13 @@ struct GatedResidual {
 		const backend::half_t* prev_y = nullptr
 	);
 
+	// mix() with the norm pass already done: `scratch` holds normed [rows, hc * hidden] (written by CollectiveRing::all_reduce_gated_norm) and the room for t;
+	// decode-sized calls only (rows <= 8, the streaming kernels)
+	static void mix_prenormed(
+		const backend::half_t* down, const backend::half_t* up, const backend::half_t* inject, backend::half_t* mixed, float* post, float* scratch,
+		int rows, int hidden, int hc, int rank, backend::stream_t stream
+	);
+
 	// mix() through the row-tile kernels whatever the row count (the CUDA decode path streams the weights with other kernels; the test compares the two)
 	static void mix_reference(
 		const float* x, const backend::half_t* norm_w, const backend::half_t* down, const backend::half_t* up, const backend::half_t* inject,
