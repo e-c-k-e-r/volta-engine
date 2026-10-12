@@ -90,7 +90,8 @@ void CollectiveRing::all_reduce_rms_norm(
 }
 
 // The reduction, then the gated add and the next norm as the two module calls they are on the NVLink path's fused kernel
-void CollectiveRing::all_reduce_gated_norm( pod::TensorView& y, float* streams, const float* post, const backend::half_t* norm_w, float* normed, int hc, float eps, backend::stream_t stream ) {
+void CollectiveRing::all_reduce_gated_norm( pod::TensorView& y, float* streams, const float* post, const backend::half_t* norm_w, float* normed, int hc, float eps, backend::stream_t stream, const backend::half_t* addend, const float* ) {
+	ENGINE_ASSERT( addend == nullptr, "CollectiveRing::all_reduce_gated_norm: the shared-expert addend is CUDA only" );
 	all_reduce( y, stream );
 	const int rows = y.shape[0], hidden = y.shape[1];
 	modules::GatedResidual::apply( streams, post, y.ptr<const backend::half_t>(), rows, hidden, hc, stream );

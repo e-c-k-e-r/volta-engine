@@ -180,36 +180,47 @@ void hc_mix_finalize_body(
 				2.0f * sigmoidf_( fmaf( mix_s[H + threadIdx.x] * rmr, scale[1], base[H + threadIdx.x] ) );
 		}
 
-		if ( threadIdx.x < H * H ) {
-			const unsigned mask = ( H * H == 32 ) ? 0xffffffffu : ( ( 1u << ( H * H ) ) - 1u );
-			float v = fmaf( mix_s[2 * H + threadIdx.x] * rmr, scale[2], base[2 * H + threadIdx.x] );
-
-			// softmax over rows
-			float m = v;
+		// One thread runs the whole H x H Sinkhorn in registers (the shuffle version spent ~0.3 us per iteration on its dependent chains);
+		// the sums are taken in the butterfly order of the shuffle reductions, so the bits are the same
+		static_assert( H == 4, "the register Sinkhorn is written for 4 streams" );
+		if ( threadIdx.x == 0 ) {
+			float v[H][H];
 			#pragma unroll
-			for ( int o = 1; o < H; o <<= 1 ) m = fmaxf( m, __shfl_xor_sync( mask, m, o ) );
-			v = __expf( v - m );
-			float s = v;
-			#pragma unroll
-			for ( int o = 1; o < H; o <<= 1 ) s += __shfl_xor_sync( mask, s, o );
-			v = __fdividef( v, s ) + hc_eps;
-
-			// column normalize, then (iters - 1) x (row, column)
-			float cs = v;
-			#pragma unroll
-			for ( int o = H; o < H * H; o <<= 1 ) cs += __shfl_xor_sync( mask, cs, o );
-			v = __fdividef( v, cs + hc_eps );
-			for ( int it = 0; it < sinkhorn_iters - 1; ++it ) {
-				float rs = v;
+			for ( int g = 0; g < H; ++g ) {
+				float e[H];
 				#pragma unroll
-				for ( int o = 1; o < H; o <<= 1 ) rs += __shfl_xor_sync( mask, rs, o );
-				v = __fdividef( v, rs + hc_eps );
-				cs = v;
+				for ( int k = 0; k < H; ++k ) e[k] = fmaf( mix_s[2 * H + g * H + k] * rmr, scale[2], base[2 * H + g * H + k] );
+				const float m = fmaxf( fmaxf( e[0], e[1] ), fmaxf( e[2], e[3] ) );   // softmax over a group of H
 				#pragma unroll
-				for ( int o = H; o < H * H; o <<= 1 ) cs += __shfl_xor_sync( mask, cs, o );
-				v = __fdividef( v, cs + hc_eps );
+				for ( int k = 0; k < H; ++k ) e[k] = __expf( e[k] - m );
+				const float sum = ( e[0] + e[1] ) + ( e[2] + e[3] );
+				#pragma unroll
+				for ( int k = 0; k < H; ++k ) v[g][k] = __fdividef( e[k], sum ) + hc_eps;
 			}
-			comb[static_cast<size_t>( r ) * H * H + threadIdx.x] = v;
+			// column normalize, then (iters - 1) x (row, column)
+			#pragma unroll
+			for ( int k = 0; k < H; ++k ) {
+				const float cs = ( v[0][k] + v[1][k] ) + ( v[2][k] + v[3][k] );
+				#pragma unroll
+				for ( int g = 0; g < H; ++g ) v[g][k] = __fdividef( v[g][k], cs + hc_eps );
+			}
+			for ( int it = 0; it < sinkhorn_iters - 1; ++it ) {
+				#pragma unroll
+				for ( int g = 0; g < H; ++g ) {
+					const float rs = ( v[g][0] + v[g][1] ) + ( v[g][2] + v[g][3] );
+					#pragma unroll
+					for ( int k = 0; k < H; ++k ) v[g][k] = __fdividef( v[g][k], rs + hc_eps );
+				}
+				#pragma unroll
+				for ( int k = 0; k < H; ++k ) {
+					const float cs = ( v[0][k] + v[1][k] ) + ( v[2][k] + v[3][k] );
+					#pragma unroll
+					for ( int g = 0; g < H; ++g ) v[g][k] = __fdividef( v[g][k], cs + hc_eps );
+				}
+			}
+			float4* out = reinterpret_cast<float4*>( comb + static_cast<size_t>( r ) * H * H );
+			#pragma unroll
+			for ( int g = 0; g < H; ++g ) out[g] = make_float4( v[g][0], v[g][1], v[g][2], v[g][3] );
 		}
 		return;
 	}

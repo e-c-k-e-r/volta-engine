@@ -154,7 +154,9 @@ private:
 	// output to the streams and norms them for that site, which skips its own norm pass); null = the plain all-reduce and a deferred add
 	void attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L, int m, backend::stream_t stream, const backend::half_t* next_norm = nullptr );
 	void mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, backend::stream_t stream, const backend::half_t* next_norm = nullptr );
-	void site_reduce( int m, const backend::half_t* next_norm, backend::stream_t stream );
+	bool fuses_site( int m, const backend::half_t* next_norm ) const;
+	// shared_deferred: rank 0 adds gate * sh_out_ inside the fused all-reduce (moe_forward left only the gate in sh_gate_)
+	void site_reduce( int m, const backend::half_t* next_norm, backend::stream_t stream, bool shared_deferred = false );
 	void teacher_inject( int L, int m, backend::stream_t stream );
 	// One sublayer's input: the gated-residual mix of the streams into mixed_ (and post_ when the site has an inject gate)
 	void gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream );
@@ -170,7 +172,7 @@ private:
 	void attention_forward( const Qwen4ExpLayerWeights& lw, int attn_idx, int m, backend::stream_t stream );
 	void gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_idx, int m, backend::stream_t stream );
 	// MoE sublayer: mixed_ in, this rank's partial result (routed experts of the rank, plus the shared expert on rank 0) in y_
-	void moe_forward( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream );
+	void moe_forward( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream, bool defer_shared = false );
 	// Debug trace (trace_layers): the first position of the forward, rows of streams or of an fp16 matrix
 	size_t copy_kv_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );   // returns the bytes moved
 	void copy_pool_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
@@ -237,7 +239,7 @@ private:
 	backend::half_t* topk_w_ = nullptr;
 	pod::MoEScratch moe_scratch_;
 	backend::stream_t side_stream_ = nullptr;   // shared expert beside the fused MoE decode kernels (CUDA)
-	pod::TensorView sh_gate_buf_, sh_up_buf_, sh_inter_buf_, sh_out_;
+	pod::TensorView sh_gate_buf_, sh_up_buf_, sh_inter_buf_, sh_out_, sh_gate_;
 	// Full-attention buffers (this rank: q_heads_ query heads over kv_heads_ KV heads: 1 with tp 2 or 4, 2 with tp 1)
 	int q_heads_ = 0, kv_heads_ = 0;
 	engine::runtime::KVCachePool kv_pool_;

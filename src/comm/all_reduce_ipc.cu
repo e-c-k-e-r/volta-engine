@@ -297,7 +297,9 @@ void all_reduce_gated_norm_kernel(
 	float* __restrict__ normed,
 	int hidden_size,
 	int hc,
-	float eps
+	float eps,
+	const half* __restrict__ addend,
+	const float* __restrict__ addend_gate
 ) {
 	const int row = blockIdx.x, s = blockIdx.y;
 	const size_t row_elems = static_cast<size_t>( hidden_size );
@@ -310,7 +312,22 @@ void all_reduce_gated_norm_kernel(
 	uint8_t* my_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[rank] ) ) + ( (size_t) stage * 4 + rank ) * IPC_SLOT_BYTES;
 	uint4* my_slot = reinterpret_cast<uint4*>( my_staging ) + row * n4;
 	const uint4* src_y = ( (const uint4*) ( y + row * row_elems ) );
-	for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) my_slot[i] = src_y[i];
+	if ( addend == nullptr ) {
+		for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) my_slot[i] = src_y[i];
+	}
+	else {
+		const uint4* src_a = reinterpret_cast<const uint4*>( addend + row * row_elems );
+		const float g = addend_gate[row];
+		for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) {
+			uint4 yv = src_y[i];
+			const uint4 av = src_a[i];
+			__half* yh = reinterpret_cast<__half*>( &yv );
+			const __half* ah = reinterpret_cast<const __half*>( &av );
+			#pragma unroll
+			for ( int k = 0; k < 8; ++k ) yh[k] = __float2half_rn( __half2float( yh[k] ) + g * __half2float( ah[k] ) );
+			my_slot[i] = yv;
+		}
+	}
 	__threadfence_system();
 	__syncthreads();
 	if ( threadIdx.x == 0 ) {
@@ -479,7 +496,9 @@ void CollectiveRing::all_reduce_gated_norm(
 	float* normed,
 	int hc,
 	float eps,
-	cudaStream_t stream
+	cudaStream_t stream,
+	const backend::half_t* addend,
+	const float* addend_gate
 ) {
 	const int rows = y.shape[0];
 	const int hidden_size = y.shape[1];
@@ -489,7 +508,8 @@ void CollectiveRing::all_reduce_gated_norm(
 	kernel<<<dim3( rows, hc ), dim3( 256 ), 0, stream>>>(
 		rank, peer_ptrs[0], peer_ptrs[1], peer_ptrs[2], peer_ptrs[3],
 		static_cast<uint32_t*>( sync_flags[0] ), static_cast<uint32_t*>( sync_flags[1] ), static_cast<uint32_t*>( sync_flags[2] ), static_cast<uint32_t*>( sync_flags[3] ),
-		y.ptr<const half>(), streams, post, reinterpret_cast<const half*>( norm_w ), normed, hidden_size, hc, eps );
+		y.ptr<const half>(), streams, post, reinterpret_cast<const half*>( norm_w ), normed, hidden_size, hc, eps,
+		reinterpret_cast<const half*>( addend ), addend_gate );
 }
 
 void init_4gpu_mesh(

@@ -582,6 +582,22 @@ __global__ void gr_sigmoid_gated_kernel( half* __restrict__ y, const half* __res
 	}
 }
 
+// One block per row: gate[r] = sigmoid( x[r] . w )
+__global__ void gr_shared_gate_kernel( const half* __restrict__ x, const half* __restrict__ w, float* __restrict__ gate, int hidden ) {
+	const half* xr = x + static_cast<size_t>( blockIdx.x ) * hidden;
+	float acc = 0.0f;
+	for ( int i = threadIdx.x; i < hidden; i += blockDim.x ) acc = fmaf( __half2float( xr[i] ), __half2float( w[i] ), acc );
+	acc = warp_sum( acc );
+	__shared__ float ws[32];
+	if ( ( threadIdx.x & 31 ) == 0 ) ws[threadIdx.x >> 5] = acc;
+	__syncthreads();
+	if ( threadIdx.x == 0 ) {
+		float total = 0.0f;
+		for ( int i = 0; i < ( blockDim.x >> 5 ); ++i ) total += ws[i];
+		gate[blockIdx.x] = 1.0f / ( 1.0f + __expf( -total ) );
+	}
+}
+
 // One block per (row, stream)
 __global__ void gr_stream_norm_kernel( const float* __restrict__ x, const half* __restrict__ w, half* __restrict__ out, int hidden, int hc, float eps ) {
 	const int r = blockIdx.x, s = blockIdx.y;
@@ -680,6 +696,10 @@ void GatedResidual::add_broadcast( const backend::half_t* h, const backend::half
 
 void GatedResidual::add_sigmoid_gated( backend::half_t* y, const backend::half_t* s, const backend::half_t* x, const backend::half_t* w, int rows, int hidden, backend::stream_t stream ) {
 	gr_sigmoid_gated_kernel<<<rows, 256, 0, stream>>>( reinterpret_cast<half*>( y ), reinterpret_cast<const half*>( s ), reinterpret_cast<const half*>( x ), reinterpret_cast<const half*>( w ), hidden );
+}
+
+void GatedResidual::shared_gate( const backend::half_t* x, const backend::half_t* w, float* gate, int rows, int hidden, backend::stream_t stream ) {
+	gr_shared_gate_kernel<<<rows, 256, 0, stream>>>( reinterpret_cast<const half*>( x ), reinterpret_cast<const half*>( w ), gate, hidden );
 }
 
 void GatedResidual::init_streams( const backend::half_t* in, float* x, int rows, int hidden, int hc, backend::stream_t stream ) {

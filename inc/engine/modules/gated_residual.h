@@ -65,6 +65,8 @@ struct GatedResidual {
 	static void up_epilogue( const float* u, const float* normed, backend::half_t* mixed, int rows, int hidden, int hc, backend::stream_t stream );
 
 	// y[r, :] += sigmoid( x[r] . w ) * s[r, :]  (the shared expert's output gate; w [hidden] fp16)
+	// gate[r] = sigmoid( x[r] . w ): the shared expert's scalar gate, for a consumer that applies y += gate * s itself (CUDA only)
+	static void shared_gate( const backend::half_t* x, const backend::half_t* w, float* gate, int rows, int hidden, backend::stream_t stream );
 	static void add_sigmoid_gated( backend::half_t* y, const backend::half_t* s, const backend::half_t* x, const backend::half_t* w, int rows, int hidden, backend::stream_t stream );
 
 	// out[r * hc + s, :] = fp16( x[r, s, :] * rsqrt(mean(x^2) + eps) * (1 + w[s, :]) ): the per-stream grouped RMS norm (the MTP head's hidden input)

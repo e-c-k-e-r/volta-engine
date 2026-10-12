@@ -297,6 +297,7 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	sh_up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, sh_shape, 2 );
 	sh_inter_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, sh_shape, 2 );
 	sh_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+	sh_gate_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, h_shape, 1 );
 	int qkv_shape[2] = { R, lin_channels_ };
 	qkv_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
 	conv_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
@@ -1022,7 +1023,7 @@ void Qwen4ExpPipeline::ple_forward( int m, backend::stream_t stream ) {
 	engine::modules::PLE::ring_update( ple_normed_, ple_ring_, d_rows_, m, hc * H, stream );
 }
 
-void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream ) {
+void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream, bool defer_shared ) {
 	const int H = config_.hidden_size;
 	// Decode rows on CUDA: the shared expert (rank 0) runs on a side stream beside the router and the fused MoE kernels; neither side touches the
 	// other's scratch (the fused kernels use no trellis workspace), and the gated add waits for both
@@ -1035,6 +1036,10 @@ void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backe
 		engine::modules::SwiGLU::forward( sh_gate_buf_, sh_up_buf_, sh_inter_buf_, sh_stream );
 		hessian( hess_layer_, 3, sh_inter_buf_.data, config_.shared_intermediate, m, sh_stream );
 		engine::modules::Linear::forward( sh_inter_buf_, lw.shared_down, sh_out_, sh_stream );
+		// the fused all-reduce adds gate * shared output when it reduces y_, so only the gate is computed here (beside the experts)
+#if ENGINE_BACKEND_CUDA
+		if ( defer_shared ) engine::modules::GatedResidual::shared_gate( mixed_.ptr<const backend::half_t>(), lw.shared_expert_gate.ptr<const backend::half_t>(), sh_gate_.ptr<float>(), m, H, sh_stream );
+#endif
 	}
 	engine::modules::MoERouter::route_softmax_topk( mixed_, lw.router, topk_idx_, topk_w_, H, config_.num_experts, config_.top_k, stream, m );
 	if ( &lw == &layers_[0] ) trace_route( 700, m, stream );
@@ -1042,7 +1047,7 @@ void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backe
 	// Plain SiLU gating (no swiglu limit): act_limit 0
 	engine::modules::MoE::forward( mixed_, lw.experts, topk_idx_, topk_w_, y_, rank_ * per_rank, ( rank_ + 1 ) * per_rank, moe_scratch_, 0.0f, stream );
 	if ( overlap ) backend::stream_join( stream, sh_stream );
-	if ( rank_ == 0 ) {
+	if ( rank_ == 0 && !defer_shared ) {
 		engine::modules::GatedResidual::add_sigmoid_gated( y_.ptr<backend::half_t>(), sh_out_.ptr<const backend::half_t>(), mixed_.ptr<const backend::half_t>(),
 			lw.shared_expert_gate.ptr<const backend::half_t>(), m, H, stream );
 	}
@@ -1120,13 +1125,23 @@ void Qwen4ExpPipeline::hessian_dump() {
 
 // The all-reduce of a sublayer's output y_ (after which the gated add is deferred into the next site's norm). With a ring, decode-sized rows and the next
 // site's norm weight, one kernel reduces y_, adds it to the streams and writes the next site's normed streams; the next gr_mix then starts at the gate
-void Qwen4ExpPipeline::site_reduce( int m, const backend::half_t* next_norm, backend::stream_t stream ) {
-	if ( !ring_ ) return;
+// Whether site_reduce will run the fused all-reduce (so the shared expert's gated add can ride in it)
+bool Qwen4ExpPipeline::fuses_site( int m, const backend::half_t* next_norm ) const {
 #if ENGINE_BACKEND_CUDA
 	static const bool fuse = runtime::options().gr_fuse && runtime::options().trace_layers.empty() && runtime::options().teacher_streams.empty() &&
 		runtime::options().hessian_dir.empty();
-	if ( fuse && next_norm != nullptr && m <= 8 && !apply_pending_ ) {
-		ring_->all_reduce_gated_norm( y_, streams_.ptr<float>(), post_, next_norm, gr_scratch_, config_.hc_mult, config_.rms_norm_eps, stream );
+	return ring_ != nullptr && fuse && next_norm != nullptr && m <= 8 && !apply_pending_;
+#else
+	return false;
+#endif
+}
+
+void Qwen4ExpPipeline::site_reduce( int m, const backend::half_t* next_norm, backend::stream_t stream, bool shared_deferred ) {
+	if ( !ring_ ) return;
+#if ENGINE_BACKEND_CUDA
+	if ( fuses_site( m, next_norm ) ) {
+		ring_->all_reduce_gated_norm( y_, streams_.ptr<float>(), post_, next_norm, gr_scratch_, config_.hc_mult, config_.rms_norm_eps, stream,
+			shared_deferred ? sh_out_.ptr<const backend::half_t>() : nullptr, sh_gate_.ptr<const float>() );
 		normed_ready_ = true;
 		return;
 	}
@@ -1154,8 +1169,9 @@ void Qwen4ExpPipeline::mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, b
 	hess_layer_ = L;
 	hessian( L, 1, mixed_.data, H, m, stream );
 	if ( L >= 0 ) trace_rows( 400 + L, mixed_.data, false, m, stream );
-	moe_forward( lw, m, stream );
-	site_reduce( m, next_norm, stream );
+	const bool defer_shared = fuses_site( m, next_norm );
+	moe_forward( lw, m, stream, defer_shared );
+	site_reduce( m, next_norm, stream, defer_shared && rank_ == 0 );
 	if ( L >= 0 ) trace_rows( 500 + L, y_.data, false, m, stream );
 	if ( !normed_ready_ ) defer_apply();
 }

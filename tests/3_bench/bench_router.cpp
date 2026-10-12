@@ -9,7 +9,8 @@
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	const int H = 2560, E = 512, K = 10, LAYERS = 48;
+	const bool glm = std::getenv( "GLM" ) != nullptr;   // GLM: sigmoid scores with a selection bias (route_topk)
+	const int H = glm ? 4096 : 2560, E = glm ? 256 : 512, K = glm ? 8 : 10, LAYERS = 48;
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	cudaStream_t stream;
 	CUDA_CHECK( cudaStreamCreate( &stream ) );
@@ -39,7 +40,19 @@ int main( int argc, char** argv ) {
 		CUDA_CHECK( cudaMemcpy( x.data, hx.data(), hx.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
 		int* idx = static_cast<int*>( engine::core::arena_alloc( arena, rows * K * sizeof( int ) ) );
 		half* wt = static_cast<half*>( engine::core::arena_alloc( arena, rows * K * sizeof( half ) ) );
-		auto run = [&]() { for ( int l = 0; l < LAYERS; ++l ) engine::modules::MoERouter::route_softmax_topk( x, w[l], idx, wt, H, E, K, stream, rows ); };
+		int bs[1] = { E };
+		auto bias = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, bs, 1 );
+		{
+			std::vector<half> hb( E );
+			for ( auto& v : hb ) v = __float2half( rnd() * 0.1f );
+			CUDA_CHECK( cudaMemcpy( bias.data, hb.data(), hb.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
+		}
+		auto run = [&]() {
+			for ( int l = 0; l < LAYERS; ++l ) {
+				if ( glm ) engine::modules::MoERouter::route_topk( x, w[l], bias, idx, wt, H, E, K, 2.5f, stream, rows );
+				else engine::modules::MoERouter::route_softmax_topk( x, w[l], idx, wt, H, E, K, stream, rows );
+			}
+		};
 		for ( int i = 0; i < 5; ++i ) run();
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		const int iters = 50;

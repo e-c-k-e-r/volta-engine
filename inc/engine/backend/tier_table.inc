@@ -80,6 +80,7 @@ ENGINE_TIER_ENTRY( GatedResidual, mix_prenormed, CudaSm70, "CUDA only: the mix a
 ENGINE_TIER_ENTRY( GatedResidual, mix, CudaSm70, "CPU: plain C++ (gated_residual.cpp); Vulkan: flash.slang" )
 ENGINE_TIER_ENTRY( GatedResidual, stream_norm, CudaSm70, "CPU: plain C++ (gated_residual.cpp); Vulkan: flash.slang" )
 ENGINE_TIER_ENTRY( GatedResidual, add_broadcast, CudaSm70, "CPU: plain C++ (gated_residual.cpp); Vulkan: flash.slang" )
+ENGINE_TIER_ENTRY( GatedResidual, shared_gate, CudaSm70, "CUDA only: the shared expert's gate, applied inside CollectiveRing::all_reduce_gated_norm" )
 ENGINE_TIER_ENTRY( GatedResidual, add_sigmoid_gated, CudaSm70, "CPU: plain C++ (gated_residual.cpp); Vulkan: flash.slang" )
 ENGINE_TIER_ENTRY( GatedResidual, apply, CudaSm70, "CPU: plain C++ (gated_residual.cpp); Vulkan: flash.slang" )
 ENGINE_TIER_ENTRY( GatedResidual, norm, CudaSm70, "CPU: plain C++ (gated_residual.cpp); Vulkan: flash.slang" )
