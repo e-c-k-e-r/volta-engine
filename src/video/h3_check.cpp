@@ -39,6 +39,7 @@ bool h3_check_paths( const H3Paths& paths, std::string* error, std::vector<std::
 	if ( devices[0] != paths.device ) { return fail( "the first device must be the primary one (encoders and decoders run there)" ); }
 	const int n = static_cast<int>( devices.size() );
 	const bool tp = paths.tensor_parallel && n > 1;
+	if ( paths.captioner && paths.text_encoder.empty() ) { return fail( "captioner needs text_encoder (the resident EXL3 text tower)" ); }
 	if ( paths.tensor_parallel && n == 1 ) { warn( "tensor_parallel with one GPU has nothing to shard; sequence parallelism (a single GPU) is used" ); }
 	if ( tp ) {
 		// the transformer's shards: 56 heads of 128; the ConvRot rotation works in 256-groups along K, and K is sharded in the attention output (7168) and the MLP down projection (14336)
@@ -61,6 +62,11 @@ bool h3_check_paths( const H3Paths& paths, std::string* error, std::vector<std::
 		}
 		const pod::SafeTensorMeta* emb = repo.find( "model.language_model.embed_tokens.weight" );
 		if ( !emb || emb->ndim != 2 || emb->shape[1] != 5120 ) { return fail( "text_encoder " + dir + " is not the 5120-wide Qwen3-VL-32B language model MiniMax-H3 uses" ); }
+		if ( paths.captioner ) {
+			if ( !exl3 || !repo.find( "model.language_model.layers.63.mlp.down_proj.trellis" ) || !repo.find( "lm_head.trellis" ) ) {
+				return fail( "captioner needs an EXL3 text_encoder with all 64 decoder layers and the lm_head (turboderp/Qwen3-VL-32B-Instruct-exl3)" );
+			}
+		}
 		if ( n > 1 && ( 8 % n != 0 ) ) { return fail( std::to_string( n ) + " GPUs cannot shard the text tower (8 key-value heads: use 2, 4 or 8)" ); }
 		// the model's files are 64 layers, the tower runs 50; per GPU: its share of the quantized layers + activations
 		double text_gb = 0;
@@ -78,7 +84,7 @@ bool h3_check_paths( const H3Paths& paths, std::string* error, std::vector<std::
 				}
 			}
 		}
-		const double tower_gb = text_gb * 50.0 / 64.0 / ( n > 1 ? n : 1 ) + 1.5; // 50 of 64 layers, sharded, plus the scratch for 8192 tokens
+		const double tower_gb = text_gb * ( paths.captioner ? 1.0 : 50.0 / 64.0 ) / ( n > 1 ? n : 1 ) + 1.5 + ( paths.captioner ? 0.6 : 0.0 ); // 50 of 64 layers, sharded, plus the scratch for 8192 tokens
 		const double dit_gpu_gb = ( tp ? dit_gb / n + 9.0 : dit_gb + 6.5 );       // weights + activation scratch (a resident transformer keeps both while denoising)
 		if ( !tp && dit_gpu_gb + tower_gb > total_gb * 0.97 ) {
 			return fail( fmt( "text_encoder needs tensor_parallel: next to the full-weight sequence-parallel transformer (about %.0f GB per GPU) the text tower (about %.0f GB) does not fit in %.0f GB. Set tensor_parallel (and 2, 4 or 8 devices)", dit_gpu_gb, tower_gb, total_gb ) );

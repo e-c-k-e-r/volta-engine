@@ -58,6 +58,7 @@ void VideoService::Impl::handle_info( const ConnPtr& c, const HttpRequest& ) {
 	o["devices"] = cfg.video.devices;
 	o["max_rows"] = cfg.video.max_rows;
 	o["ref2va"] = !cfg.video.dit_ref2va.empty();
+	o["captioner"] = cfg.video.captioner;
 	json ls = json::array();
 	for ( const AdapterInfo& a : adapters.all() ) {
 		ls.push_back( { { "file", a.file }, { "label", a.label }, { "turbo", a.turbo }, { "format", a.format }, { "mb", a.mb }, { "task", a.task } } );
@@ -184,6 +185,43 @@ void VideoService::Impl::handle_submit( const ConnPtr& c, const HttpRequest& r )
 	LOG_INFO( "Video job %d queued (%dx%d, %d frames, %d steps, %zu adapter(s), %zu keyframe(s), %zu reference(s))\n", j->id, width, height, frames, steps, loras.size(), key_data.size(),
 		ref_image_data.size() + ref_video_data.size() + ref_audio_data.size() );
 	send_json( c, 200, json{ { "id", j->id } }.dump() );
+}
+
+// POST /api/caption {image: data URL or base64, prompt?: the user's idea for the video}: queues a caption and answers {id}; GET /api/caption/<id> -> {state, text, error}
+void VideoService::Impl::handle_caption_submit( const ConnPtr& c, const HttpRequest& r ) {
+	if ( !cfg.video.captioner ) return bad_request( c, "this server was started without the captioner (video.captioner)" );
+	const json b = json::parse( r.body, nullptr, false );
+	if ( b.is_discarded() || !b.is_object() ) return bad_request( c, "invalid JSON" );
+	const std::string bytes = upload_bytes( b.contains( "image" ) && b["image"].is_string() ? json{ { "data", b["image"] } } : json::object() );
+	engine::loader::DecodedImage di;
+	std::string err;
+	if ( bytes.empty() || !engine::loader::decode_image( reinterpret_cast<const uint8_t*>( bytes.data() ), bytes.size(), &di, &err ) ) return bad_request( c, "cannot decode the image: " + err );
+	const std::string guidance = str_field( b, "prompt" );
+	if ( guidance.size() > 8000 ) return bad_request( c, "prompt must be at most 8000 characters" );
+	auto t = std::make_shared<CaptionTask>();
+	t->image = bytes;
+	t->guidance = guidance;
+	t->seed = static_cast<uint32_t>( num_field( b, "seed", 1 ) );
+	t->created = wall_seconds();
+	{
+		std::lock_guard<std::mutex> lk( caption_mu );
+		for ( auto it = captions.begin(); it != captions.end(); ) { // forget the old ones
+			it = t->created - it->second->created > 3600 && it->second->state != "running" ? captions.erase( it ) : std::next( it );
+		}
+		t->id = next_caption_id++;
+		captions[t->id] = t;
+		caption_queue.push_back( t->id );
+	}
+	jobs.poke();
+	send_json( c, 200, json{ { "id", t->id } }.dump() );
+}
+
+void VideoService::Impl::handle_caption_status( const ConnPtr& c, const HttpRequest& r ) {
+	const int id = std::atoi( r.path.substr( std::strlen( "/api/caption/" ) ).c_str() );
+	std::lock_guard<std::mutex> lk( caption_mu );
+	auto it = captions.find( id );
+	if ( it == captions.end() ) return send_error( c, 404, "not_found_error", "no such caption" );
+	send_json( c, 200, json{ { "state", it->second->state }, { "text", it->second->text }, { "error", it->second->error } }.dump() );
 }
 
 void VideoService::Impl::handle_job( const ConnPtr& c, const HttpRequest& r ) {

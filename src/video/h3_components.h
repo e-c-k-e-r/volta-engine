@@ -86,4 +86,7 @@ private:
 	std::vector<std::string> adapter_paths_; // staged on the resident transformer, in order
 };
 
+// The caption flow behind H3Engine::caption (h3_caption.cpp)
+bool h3_caption( const H3Paths& paths, H3Components& comp, const std::string& image_bytes, const std::string& guidance, uint32_t seed, std::string* text );
+
 } // namespace engine::video

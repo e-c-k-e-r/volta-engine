@@ -6,6 +6,9 @@
 #include "engine/core/log.h"
 #include "engine/loader/safetensors.h"
 #include "engine/modules/linear.h"
+#include "engine/modules/attention.h"
+#include "engine/runtime/kv_cache.h"
+#include "engine/core/batch.h"
 #include "../kernels/cuda/trellis/trellis_context.h"
 #include "h3_kernels.cuh"
 #include <cublas_v2.h>
@@ -15,6 +18,8 @@
 #include <algorithm>
 #include <chrono>
 #include <initializer_list>
+#include <numeric>
+#include <random>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -229,6 +234,19 @@ struct H3TextEncoder::Impl {
 	half *h16 = nullptr, *q16 = nullptr, *k16 = nullptr, *v16 = nullptr, *o16 = nullptr, *g16 = nullptr, *u16 = nullptr, *f16 = nullptr;
 	half *kx16 = nullptr, *vx16 = nullptr; // K / V repeated to all query heads for the attention kernel
 	bool use_fmha = false;
+	// captioner (load(captioner = true)): all decoder layers, the LM head on rank 0, and a KV cache the decode steps attend to
+	bool cap = false;
+	int total_layers = 0;       // layers loaded (layers = depth of the hidden states encode() returns)
+	int kv_max_seq = 0;
+	engine::runtime::KVCachePool kv;
+	pod::MemoryArena karena{};
+	pod::BatchRows* d_brows = nullptr; // device: one BatchRows per 512-row chunk of the prompt, then the decode row
+	int n_chunks = 0;
+	pod::LinearWeight head;
+	float* final_norm = nullptr;
+	half* logits16 = nullptr;   // [vocab]
+	float* d_tok = nullptr;     // sampled token broadcast to the ranks
+	int vocab = 0;
 	std::string embed_name = "model.language_model.embed_tokens.weight";
 
 	template <typename T>
@@ -309,7 +327,8 @@ struct H3TextEncoder::Impl {
 		engine::modules::Linear::forward( xv, w, ov, cs );
 	}
 
-	void run_layer_x( const ExlLayer& w, int S ) {
+	// mode 0: plain; 1: prompt rows, K/V also stored in the cache (layer `layer`); 2: one decode row that attends to the cache
+	void run_layer_x( const ExlLayer& w, int S, int layer = 0, int mode = 0 ) {
 		cudaStream_t s = cs;
 		const int qd = nh_l * kHd, kd = nkv_l * kHd;
 		k_norm_mod<half><<<S, 256, 0, s>>>( x, nullptr, nullptr, 0, w.in_norm, nullptr, nullptr, 0, nullptr, kH, kEps, h16 );
@@ -317,8 +336,23 @@ struct H3TextEncoder::Impl {
 		lin( w.k, h16, k16, S, kH, kd );
 		lin( w.v, h16, v16, S, kH, kd );
 		k_qwen_qk<<<dim3( S, ( nh_l + nkv_l + 7 ) / 8 ), 256, 0, s>>>( q16, k16, w.qn, w.kn, d_pos, S, nh_l, nkv_l );
-		k_expand_kv<<<( static_cast<size_t>( S ) * qd + 255 ) / 256, 256, 0, s>>>( k16, v16, kx16, vx16, S, nh_l, nkv_l );
-		h3_attention( q16, kx16, vx16, o16, S, S, nh_l, 0.08838834764831845f, true, s );
+		if ( mode == 2 ) {
+			pod::TensorView kt = pod::make_tensor_2d( k16, pod::DType::FP16, 1, kd ), vt = pod::make_tensor_2d( v16, pod::DType::FP16, 1, kd );
+			pod::TensorView qt = pod::make_tensor_2d( q16, pod::DType::FP16, 1, qd ), ot = pod::make_tensor_2d( o16, pod::DType::FP16, 1, qd ), nogate{};
+			engine::modules::Attention::store_kv_cache( kv.ref(), kt, vt, kv.slot_stride_elems, layer, d_brows + n_chunks, 1, nkv_l, kHd, kv_max_seq, s );
+			engine::modules::Attention::forward_decode( kv.ref(), qt, nogate, ot, kv.slot_stride_elems, layer, d_brows + n_chunks, 1, nh_l, nkv_l, kHd, kv_max_seq, s );
+		} else {
+			if ( mode == 1 ) {
+				for ( int c = 0; c * pod::MAX_ROWS < S; ++c ) {
+					const int r0 = c * pod::MAX_ROWS, n = std::min( pod::MAX_ROWS, S - r0 );
+					pod::TensorView kt = pod::make_tensor_2d( k16 + static_cast<size_t>( r0 ) * kd, pod::DType::FP16, n, kd );
+					pod::TensorView vt = pod::make_tensor_2d( v16 + static_cast<size_t>( r0 ) * kd, pod::DType::FP16, n, kd );
+					engine::modules::Attention::store_kv_cache( kv.ref(), kt, vt, kv.slot_stride_elems, layer, d_brows + c, n, nkv_l, kHd, kv_max_seq, s );
+				}
+			}
+			k_expand_kv<<<( static_cast<size_t>( S ) * qd + 255 ) / 256, 256, 0, s>>>( k16, v16, kx16, vx16, S, nh_l, nkv_l );
+			h3_attention( q16, kx16, vx16, o16, S, S, nh_l, 0.08838834764831845f, true, s );
+		}
 		lin( w.o, o16, br16, S, qd, kH );
 		if ( tp_n > 1 ) { tp_comm.sum_f16( br16, static_cast<size_t>( S ) * kH, s ); } // partial products of the rank's heads
 		k_add_half<<<S, 256, 0, s>>>( x, br16, nullptr, kH );
@@ -402,13 +436,15 @@ H3TextEncoder::~H3TextEncoder() {
 
 void H3TextEncoder::set_tp( H3TpComm comm ) { p_->tp_comm = std::move( comm ); }
 
-bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layers, int tp_rank, int tp_ranks ) {
+bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layers, int tp_rank, int tp_ranks, bool captioner ) {
 	Impl& s = *p_;
 	s.tp_rank = tp_rank;
 	s.tp_n = std::max( 1, tp_ranks );
 	s.device = device;
 	s.max_tokens = max_tokens;
 	s.layers = layers;
+	s.cap = captioner;
+	s.total_layers = captioner ? std::max( layers, 64 ) : layers;
 	CUDA_CHECK( cudaSetDevice( device ) );
 	CUDA_CHECK( cudaStreamCreateWithFlags( &s.cs, cudaStreamNonBlocking ) );
 	CUDA_CHECK( cudaStreamCreateWithFlags( &s.ps, cudaStreamNonBlocking ) );
@@ -422,6 +458,7 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	if ( !s.repo.open( dir ) ) { return false; }
 	s.nvfp4 = s.repo.find( "model.language_model.layers.0.self_attn.q_proj.weight_packed" ) != nullptr; // compressed-tensors NVFP4
 	s.exl3 = s.nvfp4 || s.repo.find( "model.language_model.layers.0.self_attn.q_proj.trellis" ) != nullptr; // resident quantized projections (EXL3 trellis or NVFP4)
+	if ( captioner && ( !s.exl3 || s.nvfp4 ) ) { LOG_ERROR( "H3 text: the captioner needs an EXL3 text_encoder" ); return false; }
 	if ( s.tp_n > 1 ) {
 		ENGINE_ASSERT( s.exl3, "H3 text: tensor parallelism needs an EXL3 checkpoint" );
 		ENGINE_ASSERT( kNh % s.tp_n == 0 && kNkv % s.tp_n == 0 && ( kFfn / s.tp_n ) % 128 == 0, "H3 text: the shards must keep whole 128-column Hadamard blocks" );
@@ -433,7 +470,7 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 		// resident EXL3 projections: 7 trellis linears and 4 norm vectors per layer
 		const char* proj[7] = { "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" };
 		size_t bytes = 64ULL << 20;
-		for ( int i = 0; i < layers; ++i ) {
+		for ( int i = 0; i < s.total_layers; ++i ) {
 			const std::string p = "model.language_model.layers." + std::to_string( i ) + ".";
 			for ( const char* pr : proj ) {
 				static const char* const kNvfp4Parts[] = { ".weight_packed", ".weight_scale" };
@@ -447,9 +484,14 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 			bytes += 4ULL * kH * 4 + 4096;
 		}
 		if ( s.tp_n > 1 ) { bytes = bytes / s.tp_n + ( 256ULL << 20 ); }
+		if ( captioner && tp_rank == 0 ) { // LM head (rank 0 only) and the final norm
+			const pod::SafeTensorMeta* hm = s.repo.find( "lm_head.trellis" );
+			if ( !hm ) { LOG_ERROR( "H3 text: the checkpoint has no lm_head (captioner)" ); return false; }
+			bytes += hm->size_bytes + ( 64ULL << 20 );
+		}
 		if ( !h3_scratch_arena_create( s.warena, device, bytes ) ) { return false; }
-		s.xl.assign( layers, ExlLayer() );
-		for ( int i = 0; i < layers; ++i ) {
+		s.xl.assign( s.total_layers, ExlLayer() );
+		for ( int i = 0; i < s.total_layers; ++i ) {
 			const std::string p = "model.language_model.layers." + std::to_string( i ) + ".";
 			ExlLayer& w = s.xl[i];
 			pod::LinearWeight* dst[7] = { &w.q, &w.k, &w.v, &w.o, &w.gate, &w.up, &w.down };
@@ -464,13 +506,17 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 			w.qn = s.upload_vec_resident( p + "self_attn.q_norm.weight" );
 			w.kn = s.upload_vec_resident( p + "self_attn.k_norm.weight" );
 		}
+		if ( captioner ) {
+			s.final_norm = s.upload_vec_resident( "model.language_model.norm.weight" );
+			if ( tp_rank == 0 ) { s.head = s.repo.load_linear( "lm_head", s.warena, 6, s.cs ); }
+		}
 		// The quantized kernels grow their per-device workspaces lazily, under a global lock, with cudaFree / cudaMalloc. Doing that on one rank in the middle of a forward
 		// deadlocks the all-reduces (the other ranks spin in NCCL, the cudaFree waits for their kernels), so every workspace is sized here, before any collective.
 		engine::modules::trellis_context_init_all();
 		engine::modules::trellis_get_recon_ws( device, static_cast<size_t>( std::max( kH * s.ffn_l, kH * s.nh_l * kHd ) ) * sizeof( half ) );
 		engine::modules::trellis_get_cublas( device );
 		CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
-		LOG_INFO( "H3 text: %d %s layers resident, %.2f GB", layers, s.nvfp4 ? "NVFP4" : "EXL3", s.warena.offset_bytes / 1e9 );
+		LOG_INFO( "H3 text: %d %s layers resident, %.2f GB", s.total_layers, s.nvfp4 ? "NVFP4" : "EXL3", s.warena.offset_bytes / 1e9 );
 	} else {
 		const size_t layer_bytes = ( static_cast<size_t>( kNh * kHd ) * kH * 2 + static_cast<size_t>( kNkv * kHd ) * kH * 2 + static_cast<size_t>( kFfn ) * kH * 3 ) * sizeof( half ) + ( 4ULL << 20 );
 		for ( int i = 0; i < 2; ++i ) {
@@ -506,6 +552,29 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 	s.u16 = s.alloc<half>( s.sarena, S * s.ffn_l );
 	s.f16 = s.alloc<half>( s.sarena, S * s.ffn_l );
 	s.br16 = s.alloc<half>( s.sarena, S * kH );
+	if ( captioner ) {
+		const pod::SafeTensorMeta* em = s.repo.find( s.embed_name.c_str() );
+		s.vocab = em ? em->shape[0] : 151936;
+		s.kv_max_seq = max_tokens + 1024; // the prompt and the answer
+		const size_t kv_bytes = 2 * static_cast<size_t>( s.total_layers ) * s.kv_max_seq * s.nkv_l * kHd * sizeof( half ) + ( 8ULL << 20 );
+		if ( !h3_scratch_arena_create( s.karena, device, kv_bytes ) ) { return false; }
+		if ( !s.kv.init( device, s.karena, 1, s.kv_max_seq, s.total_layers, s.nkv_l, kHd ) ) { return false; }
+		s.n_chunks = ( max_tokens + pod::MAX_ROWS - 1 ) / pod::MAX_ROWS;
+		CUDA_CHECK( cudaMalloc( &s.d_brows, static_cast<size_t>( s.n_chunks + 1 ) * sizeof( pod::BatchRows ) ) );
+		CUDA_CHECK( cudaMalloc( &s.d_tok, sizeof( float ) ) );
+		if ( tp_rank == 0 ) { CUDA_CHECK( cudaMalloc( &s.logits16, static_cast<size_t>( s.vocab ) * sizeof( half ) ) ); }
+		// every lazily grown workspace of the M = 1 paths is created here, before the first collective (see the note above): one local pass through the projections
+		if ( s.exl3 ) {
+			const ExlLayer& w = s.xl[0];
+			s.lin( w.q, s.h16, s.q16, 1, kH, s.nh_l * kHd );
+			s.lin( w.k, s.h16, s.k16, 1, kH, s.nkv_l * kHd );
+			s.lin( w.o, s.q16, s.br16, 1, s.nh_l * kHd, kH );
+			s.lin( w.gate, s.h16, s.g16, 1, kH, s.ffn_l );
+			s.lin( w.down, s.g16, s.br16, 1, s.ffn_l, kH );
+			if ( tp_rank == 0 ) { s.lin( s.head, s.h16, s.logits16, 1, kH, s.vocab ); }
+			CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
+		}
+	}
 	CUDA_CHECK( cudaFuncSetAttribute( k_attn_causal, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304 - 1024 ) );
 	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against
 	return s.repo.find( s.embed_name.c_str() ) != nullptr;
@@ -514,6 +583,12 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 bool H3TextEncoder::encode( const std::vector<int>& ids, float* d_out ) { return encode_mm( ids, -1, {}, d_out ); }
 
 bool H3TextEncoder::encode_mm( const std::vector<int>& ids, int image_token_id, const std::vector<H3ImageFeatures>& images, float* d_out ) {
+	return run_mm( ids, image_token_id, images, p_->layers, false, nullptr, d_out );
+}
+
+// The decoder stack over the prompt rows. d_out (optional) receives the stream after `nlayers` layers; store_kv fills the KV cache (needs the captioner); next_pos
+// receives the rotary position of the token that follows the prompt.
+bool H3TextEncoder::run_mm( const std::vector<int>& ids, int image_token_id, const std::vector<H3ImageFeatures>& images, int nlayers, bool store_kv, int* next_pos, float* d_out ) {
 	Impl& s = *p_;
 	const int S = static_cast<int>( ids.size() );
 	if ( S <= 0 || S > s.max_tokens ) { return false; }
@@ -557,29 +632,38 @@ bool H3TextEncoder::encode_mm( const std::vector<int>& ids, int image_token_id, 
 	}
 	// 3-D positions (Qwen3-VL get_rope_index): text runs advance all axes, an image run lays its merged grid out from the current position
 	std::vector<int> pos( static_cast<size_t>( 3 ) * S, 0 );
+	int rope_cur = 0;
 	{
-		int cur = 0, i = 0;
+		int i = 0;
 		size_t img = 0;
 		while ( i < S ) {
 			int j = i;
 			while ( j < S && mm[j] == mm[i] ) { ++j; }
 			if ( mm[i] == 0 ) {
-				for ( int k = i; k < j; ++k ) { for ( int a = 0; a < 3; ++a ) { pos[static_cast<size_t>( a ) * S + k] = cur + ( k - i ); } }
-				cur += j - i;
+				for ( int k = i; k < j; ++k ) { for ( int a = 0; a < 3; ++a ) { pos[static_cast<size_t>( a ) * S + k] = rope_cur + ( k - i ); } }
+				rope_cur += j - i;
 			} else {
 				const H3ImageFeatures& f = images[std::min( img, images.size() - 1 )];
 				const int gh = f.grid_h / 2, gw = f.grid_w / 2;
 				for ( int k = i; k < j; ++k ) {
 					const int n = k - i;
-					pos[static_cast<size_t>( 0 ) * S + k] = cur;
-					pos[static_cast<size_t>( 1 ) * S + k] = cur + n / gw;
-					pos[static_cast<size_t>( 2 ) * S + k] = cur + n % gw;
+					pos[static_cast<size_t>( 0 ) * S + k] = rope_cur;
+					pos[static_cast<size_t>( 1 ) * S + k] = rope_cur + n / gw;
+					pos[static_cast<size_t>( 2 ) * S + k] = rope_cur + n % gw;
 				}
-				cur += std::max( gh, gw );
+				rope_cur += std::max( gh, gw );
 				++img;
 			}
 			i = j;
 		}
+	}
+	if ( next_pos ) { *next_pos = rope_cur; }
+	if ( store_kv ) {
+		ENGINE_ASSERT( s.cap, "H3 text: the KV cache needs load(captioner = true)" );
+		std::vector<pod::BatchRows> chunks;
+		for ( int r0 = 0; r0 < S; r0 += pod::MAX_ROWS ) { chunks.push_back( pod::BatchRows::causal( std::min( pod::MAX_ROWS, S - r0 ), r0, 0 ) ); }
+		CUDA_CHECK( cudaMemcpyAsync( s.d_brows, chunks.data(), chunks.size() * sizeof( pod::BatchRows ), cudaMemcpyHostToDevice, s.cs ) );
+		CUDA_CHECK( cudaStreamSynchronize( s.cs ) ); // `chunks` goes out of scope
 	}
 	CUDA_CHECK( cudaMemcpyAsync( s.d_pos, pos.data(), pos.size() * sizeof( int ), cudaMemcpyHostToDevice, s.cs ) );
 	CUDA_CHECK( cudaMemcpyAsync( s.x, rows.data(), rows.size() * sizeof( float ), cudaMemcpyHostToDevice, s.cs ) );
@@ -594,16 +678,16 @@ bool H3TextEncoder::encode_mm( const std::vector<int>& ids, int image_token_id, 
 	// layer pipeline: slot (i % 2) holds layer i; a thread uploads layer i + 1 while layer i computes (slot (i + 1) % 2 held layer i - 1, whose compute ended in the
 	// previous iteration)
 	if ( !s.exl3 ) { s.load_layer( 0, 0 ); }
-	for ( int i = 0; i < s.layers; ++i ) {
+	for ( int i = 0; i < nlayers; ++i ) {
 		const int cur = i % 2, nxt = 1 - cur;
 		std::thread prefetch;
-		if ( !s.exl3 && i + 1 < s.layers ) {
+		if ( !s.exl3 && i + 1 < nlayers ) {
 			prefetch = std::thread( [&s, nxt, i] {
 				CUDA_CHECK( cudaSetDevice( s.device ) );
 				s.load_layer( nxt, i + 1 );
 			} );
 		}
-		if ( s.exl3 ) { s.run_layer_x( s.xl[i], S ); } else { s.run_layer( s.slot[cur], S ); }
+		if ( s.exl3 ) { s.run_layer_x( s.xl[i], S, i, store_kv ? 1 : 0 ); } else { s.run_layer( s.slot[cur], S ); }
 		if ( d_feat && i < 3 ) {
 			CUDA_CHECK( cudaMemcpyAsync( d_feat, ds[i].data(), pad_rows.size() * kH * sizeof( float ), cudaMemcpyHostToDevice, s.cs ) );
 			CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
@@ -613,9 +697,112 @@ bool H3TextEncoder::encode_mm( const std::vector<int>& ids, int image_token_id, 
 		if ( prefetch.joinable() ) { prefetch.join(); }
 		if ( probe ) { probe( i, s.x, S ); }
 	}
-	CUDA_CHECK( cudaMemcpyAsync( d_out, s.x, static_cast<size_t>( S ) * kH * sizeof( float ), cudaMemcpyDeviceToDevice, s.cs ) );
+	if ( d_out ) { CUDA_CHECK( cudaMemcpyAsync( d_out, s.x, static_cast<size_t>( S ) * kH * sizeof( float ), cudaMemcpyDeviceToDevice, s.cs ) ); }
 	CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
 	if ( d_feat ) { cudaFree( d_feat ); cudaFree( d_rows ); }
+	CUDA_CHECK( cudaGetLastError() );
+	return true;
+}
+
+namespace {
+
+// Qwen3's special tokens end at <|im_end|> (151645); <|endoftext|> (151643) and <|im_end|> end an answer, the other specials never appear in one
+constexpr int kEndOfText = 151643, kImEnd = 151645;
+
+int sample_logits( const std::vector<half>& h, const H3CaptionOptions& o, std::mt19937& rng ) {
+	std::vector<std::pair<float, int>> c;
+	c.reserve( 160000 );
+	for ( int i = 0; i < static_cast<int>( h.size() ); ++i ) {
+		if ( i < kEndOfText || i == kEndOfText || i == kImEnd ) { c.emplace_back( __half2float( h[i] ), i ); }
+	}
+	auto top = []( const std::pair<float, int>& a, const std::pair<float, int>& b ) { return a.first > b.first; };
+	if ( o.temperature <= 0.0f ) { return std::min_element( c.begin(), c.end(), top )->second; }
+	const size_t k = std::min<size_t>( c.size(), o.top_k > 0 ? static_cast<size_t>( o.top_k ) : c.size() );
+	std::partial_sort( c.begin(), c.begin() + k, c.end(), top );
+	std::vector<double> p( k );
+	double sum = 0.0;
+	for ( size_t i = 0; i < k; ++i ) {
+		p[i] = std::exp( ( c[i].first - c[0].first ) / o.temperature );
+		sum += p[i];
+	}
+	size_t keep = k;
+	if ( o.top_p > 0.0f && o.top_p < 1.0f ) { // smallest prefix whose probability reaches top_p
+		double acc = 0.0;
+		for ( size_t i = 0; i < k; ++i ) {
+			acc += p[i] / sum;
+			if ( acc >= o.top_p ) { keep = i + 1; break; }
+		}
+	}
+	double kept = 0.0;
+	for ( size_t i = 0; i < keep; ++i ) { kept += p[i]; }
+	double r = std::uniform_real_distribution<double>( 0.0, kept )( rng );
+	for ( size_t i = 0; i < keep; ++i ) {
+		r -= p[i];
+		if ( r <= 0.0 ) { return c[i].second; }
+	}
+	return c[keep - 1].second;
+}
+
+} // namespace
+
+bool H3TextEncoder::generate( const std::vector<int>& ids, int image_token_id, const std::vector<H3ImageFeatures>& images, const H3CaptionOptions& opt, std::vector<int>* out_tokens ) {
+	Impl& s = *p_;
+	if ( !s.cap || !out_tokens ) { return false; }
+	CUDA_CHECK( cudaSetDevice( s.device ) );
+	out_tokens->clear();
+	const int S = static_cast<int>( ids.size() );
+	if ( S <= 0 || S + opt.max_new_tokens > s.kv_max_seq ) { return false; }
+	int next_pos = 0;
+	if ( !run_mm( ids, image_token_id, images, s.total_layers, true, &next_pos, nullptr ) ) { return false; }
+	const pod::SafeTensorMeta* em = s.repo.find( s.embed_name.c_str() );
+	const uint16_t* table = static_cast<const uint16_t*>( s.repo.cpu_data( s.embed_name.c_str() ) );
+	std::mt19937 rng( opt.seed );
+	std::vector<half> logits;
+	std::vector<float> row( kH );
+	int kv_pos = S;
+	const float* last = s.x + static_cast<size_t>( S - 1 ) * kH;
+	for ( int step = 0; step < opt.max_new_tokens; ++step ) {
+		float tok = 0.0f;
+		if ( s.tp_rank == 0 ) { // the head and the sampling live on rank 0; the others only learn the token
+			k_norm_mod<half><<<1, 256, 0, s.cs>>>( const_cast<float*>( last ), nullptr, nullptr, 0, s.final_norm, nullptr, nullptr, 0, nullptr, kH, kEps, s.h16 );
+			s.lin( s.head, s.h16, s.logits16, 1, kH, s.vocab );
+			logits.resize( s.vocab );
+			CUDA_CHECK( cudaMemcpyAsync( logits.data(), s.logits16, logits.size() * sizeof( half ), cudaMemcpyDeviceToHost, s.cs ) );
+			CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
+			tok = static_cast<float>( sample_logits( logits, opt, rng ) );
+		}
+		CUDA_CHECK( cudaMemcpyAsync( s.d_tok, &tok, sizeof( float ), cudaMemcpyHostToDevice, s.cs ) );
+		if ( s.tp_n > 1 ) { s.tp_comm.sum_f32( s.d_tok, 1, s.cs ); }
+		CUDA_CHECK( cudaMemcpyAsync( &tok, s.d_tok, sizeof( float ), cudaMemcpyDeviceToHost, s.cs ) );
+		CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
+		const int id = static_cast<int>( std::lround( tok ) );
+		if ( id == kImEnd || id == kEndOfText ) { break; }
+		out_tokens->push_back( id );
+		if ( step + 1 == opt.max_new_tokens ) { break; }
+		// the new token's embedding is the one row of the stream; its rotary position is the next text position on all three axes
+		for ( int c = 0; c < kH; ++c ) {
+			const uint16_t raw = table[static_cast<size_t>( id ) * kH + c];
+			if ( em->dtype == pod::DType::FP16 ) {
+				half hv;
+				std::memcpy( &hv, &raw, 2 );
+				row[c] = __half2float( hv );
+			} else {
+				const uint32_t bits = static_cast<uint32_t>( raw ) << 16;
+				std::memcpy( &row[c], &bits, 4 );
+			}
+		}
+		const int pos3[3] = { next_pos, next_pos, next_pos };
+		pod::BatchRows br = pod::BatchRows::causal( 1, kv_pos, 0 );
+		CUDA_CHECK( cudaMemcpyAsync( s.x, row.data(), kH * sizeof( float ), cudaMemcpyHostToDevice, s.cs ) );
+		CUDA_CHECK( cudaMemcpyAsync( s.d_pos, pos3, sizeof( pos3 ), cudaMemcpyHostToDevice, s.cs ) );
+		CUDA_CHECK( cudaMemcpyAsync( s.d_brows + s.n_chunks, &br, br.upload_bytes(), cudaMemcpyHostToDevice, s.cs ) );
+		CUDA_CHECK( cudaStreamSynchronize( s.cs ) ); // the host buffers are reused next step
+		for ( int i = 0; i < s.total_layers; ++i ) { s.run_layer_x( s.xl[i], 1, i, 2 ); }
+		last = s.x;
+		++kv_pos;
+		++next_pos;
+	}
+	CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
 	CUDA_CHECK( cudaGetLastError() );
 	return true;
 }

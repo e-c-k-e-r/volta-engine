@@ -118,6 +118,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/video/h3_vision.cu
 	src/video/h3_dit_group.cpp
 	src/video/h3_text_group.cpp
+	src/video/h3_caption.cpp
 	src/video/h3_check.cpp
 	src/video/h3_pipeline.cu
 	src/video/h3_engine.cpp
@@ -511,6 +512,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 		tests/2_parity/test_h3_image.cpp
 		tests/2_parity/test_h3_layout.cpp
 		tests/2_parity/test_h3_ref_layout.cpp
+		tests/2_parity/test_h3_caption.cpp
 		tests/2_parity/test_h3_text.cpp
 		tests/2_parity/test_h3_text_identity.cpp
 		tests/2_parity/test_h3_text_layers.cpp

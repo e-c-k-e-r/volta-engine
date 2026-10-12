@@ -1,6 +1,7 @@
 // h3_generate: MiniMax-H3 text-to-video-and-audio from the command line.
 //   h3_generate --root <FL2VA dir> --dit <comfy int8 checkpoint> --prompt TEXT --out out.mp4 [--lora PATH[:scale]]... [--steps 4] [--size WxH]
 //               [--frames 124] [--seed 1] [--video-shift S] [--audio-shift S] [--device 0]
+//   caption: --caption IMAGE [--prompt GUIDANCE] --text-encoder EXL3_DIR --captioner [--devices 0,1,2,3 --tp] [--seed N]: the language model describes the picture as a video prompt
 //   keyframes (FL2VA): --image PATH [--frame-index 0|-1]; references (Ref2VA): --dit-ref2va <ref2va checkpoint> --ref-image PATH ... [--ref-audio PATH ...]
 #include "engine/core/log.h"
 #include "engine/loader/image.h"
@@ -17,6 +18,7 @@ int main( int argc, char** argv ) {
 	engine::video::H3GenRequest req;
 	bool size_given = false, resident = false;
 	int repeat = 1;
+	std::string caption_image;
 	for ( int i = 1; i < argc; ++i ) {
 		const std::string a = argv[i];
 		auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
@@ -28,6 +30,8 @@ int main( int argc, char** argv ) {
 		else if ( a == "--keep-pcm" ) { req.keep_pcm = true; } // leave <out>.f32 (the interleaved FP32 stereo PCM before the AAC encode) next to the video
 		else if ( a == "--resident-decoders" ) { paths.resident_decoders = true; }
 		else if ( a == "--text-encoder" ) { paths.text_encoder = next(); }
+		else if ( a == "--captioner" ) { paths.captioner = true; }
+		else if ( a == "--caption" ) { caption_image = next(); }
 		else if ( a == "--repeat" ) { repeat = std::max( 1, std::atoi( next() ) ); }
 		else if ( a == "--dit-ref2va" ) { paths.dit_ref2va = next(); }
 		else if ( a == "--device" ) { paths.device = std::atoi( next() ); }
@@ -59,6 +63,24 @@ int main( int argc, char** argv ) {
 		else { std::fprintf( stderr, "unknown argument %s\n", a.c_str() ); return 1; }
 	}
 	const bool ref_task = !req.ref_images.empty() || !req.ref_audios.empty() || !req.ref_videos.empty();
+	if ( !caption_image.empty() ) {
+		if ( paths.root.empty() || paths.text_encoder.empty() ) { std::fprintf( stderr, "usage: h3_generate --root DIR --text-encoder EXL3_DIR --captioner --caption IMAGE [--prompt GUIDANCE] [--devices 0,1,2,3] [--seed N]\n" ); return 1; }
+		paths.captioner = true;
+		std::string err;
+		if ( !engine::video::h3_check_paths( paths, &err, nullptr ) ) { std::fprintf( stderr, "invalid configuration: %s\n", err.c_str() ); return 2; }
+		std::string bytes;
+		if ( FILE* f = std::fopen( caption_image.c_str(), "rb" ) ) {
+			char buf[65536];
+			size_t n;
+			while ( ( n = std::fread( buf, 1, sizeof( buf ), f ) ) > 0 ) { bytes.append( buf, n ); }
+			std::fclose( f );
+		} else { std::fprintf( stderr, "cannot read %s\n", caption_image.c_str() ); return 1; }
+		engine::video::H3Engine engine( paths, true );
+		std::string text;
+		if ( !engine.caption( bytes, req.prompt, static_cast<uint32_t>( req.seed ), &text ) ) { return 1; }
+		std::printf( "%s\n", text.c_str() );
+		return 0;
+	}
 	if ( paths.root.empty() || ( paths.dit.empty() && !( ref_task && !paths.dit_ref2va.empty() ) ) || req.prompt.empty() || req.out.empty() ) {
 		std::fprintf( stderr, "usage: h3_generate --root DIR --dit CKPT --prompt TEXT --out FILE.mp4 [--lora PATH[:scale]] [--steps N] [--size WxH] [--frames N] [--seed N] [--devices 0,1,2,3] [--tp] [--text-encoder EXL3_DIR] [--resident] [--resident-decoders]\n" );
 		return 1;

@@ -30,7 +30,7 @@ H3TextGroup::~H3TextGroup() {
 int H3TextGroup::size() const { return static_cast<int>( p_->encs.size() ); }
 int H3TextGroup::max_tokens() const { return p_->max_tokens; }
 
-bool H3TextGroup::load( const char* dir, const std::vector<int>& devices, int max_tokens, int layers ) {
+bool H3TextGroup::load( const char* dir, const std::vector<int>& devices, int max_tokens, int layers, bool captioner ) {
 	Impl& s = *p_;
 	const int n = static_cast<int>( devices.size() );
 	if ( n < 1 ) { return false; }
@@ -48,7 +48,7 @@ bool H3TextGroup::load( const char* dir, const std::vector<int>& devices, int ma
 		threads.emplace_back( [&, r] {
 			CUDA_CHECK( cudaSetDevice( devices[r] ) );
 			s.encs[r].reset( new H3TextEncoder() );
-			if ( !s.encs[r]->load( dir, devices[r], max_tokens, layers, r, n ) ) { ok = 0; }
+			if ( !s.encs[r]->load( dir, devices[r], max_tokens, layers, r, n, captioner ) ) { ok = 0; }
 		} );
 	}
 	for ( auto& t : threads ) { t.join(); }
@@ -91,6 +91,27 @@ bool H3TextGroup::encode_mm( const std::vector<int>& ids, int image_token_id, co
 	}
 	for ( auto& t : threads ) { t.join(); }
 	CUDA_CHECK( cudaSetDevice( caller ) );
+	return ok;
+}
+
+bool H3TextGroup::generate( const std::vector<int>& ids, int image_token_id, const std::vector<H3ImageFeatures>& images, const H3CaptionOptions& opt, std::vector<int>* out_tokens ) {
+	Impl& s = *p_;
+	const int n = static_cast<int>( s.encs.size() );
+	if ( n == 0 || !out_tokens ) { return false; }
+	int caller = 0;
+	CUDA_CHECK( cudaGetDevice( &caller ) );
+	std::atomic<int> ok{ 1 };
+	std::vector<std::vector<int>> toks( n );
+	std::vector<std::thread> threads;
+	for ( int r = 0; r < n; ++r ) {
+		threads.emplace_back( [&, r] {
+			CUDA_CHECK( cudaSetDevice( s.devices[r] ) );
+			if ( !s.encs[r]->generate( ids, image_token_id, images, opt, &toks[r] ) ) { ok = 0; }
+		} );
+	}
+	for ( auto& t : threads ) { t.join(); }
+	CUDA_CHECK( cudaSetDevice( caller ) );
+	*out_tokens = toks[0];
 	return ok;
 }
 

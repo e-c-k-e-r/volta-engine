@@ -52,6 +52,7 @@ struct H3Paths {
 	std::vector<int> devices;     // GPUs for the DiT (sequence parallel); empty = {device}
 	std::string text_encoder;     // optional: an EXL3 conversion of the Qwen3-VL language model; kept resident and sharded over `devices` instead of streaming the BF16 layers from root/text_encoder for every job
 	bool resident_decoders = false; // H3Engine with resident models: keep the video decoders and the audio VAE loaded between jobs too (about 6 GB per GPU; needs the room tensor parallelism leaves)
+	bool captioner = false;       // the resident text tower also writes text (picture captions): loads its last 14 layers, the LM head and a KV cache, about 2 GB more per GPU; needs text_encoder
 	bool tensor_parallel = false; // shard the DiT over `devices` by heads / MLP width instead of by rows (needs NCCL; less VRAM per GPU, a little slower)
 };
 
@@ -106,6 +107,10 @@ public:
 
 	bool generate( const H3GenRequest& req, H3GenResult* result = nullptr );
 	void release(); // frees the resident transformer (the next job loads it again)
+
+	// The language model's description of a picture (encoded JPEG / PNG bytes) as a video prompt; `guidance` (the user's own prompt, may be empty) steers it. Needs
+	// paths.captioner. Not thread safe with generate(): one call at a time.
+	bool caption( const std::string& image_bytes, const std::string& guidance, uint32_t seed, std::string* text );
 
 private:
 	struct Impl;

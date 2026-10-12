@@ -51,7 +51,9 @@ public:
 
 	// Worker side: blocks until a job is queued (nullptr after stop()); marks it running. With idle_s > 0 it also returns nullptr (and *idle = true) when nothing
 	// was queued for that long.
-	JobPtr next( double idle_s = 0, bool* idle = nullptr );
+	// poke() makes it return nullptr with *poked = true once (ahead of queued jobs): the worker has other work (caption requests).
+	JobPtr next( double idle_s = 0, bool* idle = nullptr, bool* poked = nullptr );
+	void poke();
 	template <typename F>
 	void update( const JobPtr& j, F fn ) {
 		std::lock_guard<std::mutex> lk( mu_ );
@@ -78,6 +80,7 @@ private:
 	std::deque<int> queue_;
 	int next_id_ = 1;
 	bool stopping_ = false;
+	bool poked_ = false;
 };
 
 } // namespace engine::server

@@ -45,6 +45,7 @@ the expected values are listed in [video.md](video.md#tests).
 | `test_h3_attn` | 1 | the attention kernel against a CPU softmax (full, causal, key ranges, head_dim 64 / 128, odd tails) |
 | `test_h3_vae`, `test_h3_vae_det`, `test_h3_vae_enc`, `test_h3_audio`, `test_h3_audio_enc` | 1 | VAE decoder, run-to-run determinism, the encoders, the audio decoder |
 | `test_h3_text`, `test_h3_text_mm`, `test_h3_text_tp`, `test_h3_vision` | 1 / 1-4 | the text tower (BF16, EXL3, NVFP4) and the vision tower against the BF16 reference |
+| `test_h3_caption` | 1-4 | the captioner: greedy decoding continues the same whether half of the answer is decoded or prefilled |
 | `test_h3_layout`, `test_h3_ref_layout`, `test_h3_image` | no | packed layouts, resize, keyframe rows |
 | `test_h3_text_identity`, `test_h3_text_layers` | 1 | diagnostics: are two text checkpoints the same model, and where do two quantizations of it drift apart |
 

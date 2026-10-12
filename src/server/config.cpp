@@ -120,6 +120,7 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 			else if ( k == "resident_idle_s" && it->is_number_integer() ) video.resident_idle_s = it->get<int>();
 			else if ( k == "tensor_parallel" && it->is_boolean() ) video.tensor_parallel = it->get<bool>();
 			else if ( k == "resident_decoders" && it->is_boolean() ) video.resident_decoders = it->get<bool>();
+			else if ( k == "captioner" && it->is_boolean() ) video.captioner = it->get<bool>();
 			else if ( k == "text_encoder" && it->is_string() ) video.text_encoder = it->get<std::string>();
 			else if ( k == "lora_dirs" && it->is_array() ) {
 				for ( const auto& d : *it ) if ( d.is_string() ) video.lora_dirs.push_back( d.get<std::string>() );
@@ -188,6 +189,7 @@ A `model_dir` that is a MiniMax-H3 pipeline directory (it holds `model_index.jso
 | `resident_idle_s` | `--resident-idle-s` | 0 | with `resident`: free the transformer after this many idle seconds (0 = never) |
 | `resident_decoders` | `--resident-decoders` / `--no-resident-decoders` | true | with `resident` and `tensor_parallel`: keep the video decoders and the audio VAE loaded between jobs too (about 6 GB per GPU; saves the 3.6 s decoder load of every job). Ignored with sequence parallelism, where the full-weight transformer leaves no room |
 | `text_encoder` | `--text-encoder` | none | directory of an EXL3 conversion of the Qwen3-VL-32B-Instruct language model (e.g. `turboderp/Qwen3-VL-32B-Instruct-exl3`): its 50 layers stay resident, sharded over `devices` (about 4.6 GB per GPU at 6 bpw on four), instead of streaming 49 GB of BF16 per job; the text stage of a short prompt drops from about 7 s to under a second. The vision tower still loads from the model directory. Use it with `tensor_parallel`: next to the full-weight sequence-parallel transformer it does not fit in 32 GB |
+| `captioner` | `--captioner` / `--no-captioner` | false | the resident text tower also writes text: the page's Caption button has the Qwen3-VL language model describe a reference image as a video prompt (the prompt box, if filled, steers it). Loads the last 14 layers, the LM head and a KV cache: about 1.3 GB more per GPU on four (1.9 GB on the first, which holds the head); needs `text_encoder` with all 64 layers (an EXL3 conversion) |
 | `tensor_parallel` | `--tensor-parallel` / `--no-tensor-parallel` | false | shard the transformer over `devices` by attention heads and MLP width (a quarter of the weights and of the activations per GPU, so the VAEs and the language model fit next to it) instead of by rows; about 1 s slower per step, needs a build with NCCL; text prompts up to about 8.6K tokens |
 
 ## Options
@@ -292,6 +294,12 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 		}
 		else if ( std::strcmp( argv[i], "--no-resident-decoders" ) == 0 ) {
 			video.resident_decoders = false;
+		}
+		else if ( std::strcmp( argv[i], "--captioner" ) == 0 ) {
+			video.captioner = true;
+		}
+		else if ( std::strcmp( argv[i], "--no-captioner" ) == 0 ) {
+			video.captioner = false;
 		}
 		else if ( std::strcmp( argv[i], "--text-encoder" ) == 0 && i + 1 < argc ) {
 			video.text_encoder = argv[++i];

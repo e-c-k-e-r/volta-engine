@@ -97,12 +97,13 @@ Routes:
 * `GET` / `POST /api/jobs`, and `GET` / `DELETE /api/jobs/<id>`
 * `GET /api/jobs/<id>/video` (supports Range) and `/thumb`
 * `POST /api/jobs/<id>/cancel`
+* `POST /api/caption` and `GET /api/caption/<id>`, with `video.captioner` (see the text tower below)
 * `/health`, `/metrics`, `/metrics/prometheus`
 
 A job body is `{prompt, width, height, frames, steps, seed, turbo, loras:[{file,scale}], images:[{data,frame_index}], ref_images, ref_videos, ref_audios}` with base64 uploads.
 Optional `video_shift` / `audio_shift` (0 or absent = the defaults: video 6 with a 768p adapter else 12, audio 3; otherwise 0.5 to 40) set the flow shift of each modality's sigma schedule. A larger audio shift spends more of a few-step schedule at low noise, which cleans up the audio of the 4-step turbo adapters (a shift of 6 gives about the high-frequency energy of the 8-step adapter). The page has the two inputs under the video settings.
 
-Settings live in the launch config's `video` object, documented in [CONFIG.md](CONFIG.md): `dit`, `dit_ref2va`, `lora_dirs`, `out_dir`, `devices`, `max_rows`, `resident`, `resident_idle_s`, `tensor_parallel`, `text_encoder`, and `resident_decoders`.
+Settings live in the launch config's `video` object, documented in [CONFIG.md](CONFIG.md): `dit`, `dit_ref2va`, `lora_dirs`, `out_dir`, `devices`, `max_rows`, `resident`, `resident_idle_s`, `tensor_parallel`, `text_encoder`, and `resident_decoders`, `captioner`.
 
 There is no authentication, and the default `host` is `0.0.0.0`: pass `--host 127.0.0.1` unless the server should be reachable from the network. The page has had very little browser testing.
 
@@ -172,6 +173,24 @@ Three ways to run it:
   * prefer EXL3 6 bpw for image or reference prompts
 
 The resident tower does not fit next to the full-weight sequence-parallel transformer in 32 GB, so use it with `tensor_parallel`.
+
+### Captions (`video.captioner`, `--captioner`)
+
+The same tower can write text, so the page can turn a picture into a detailed video prompt (the model follows short prompts less well than detailed ones).
+* opt-in: it also loads the last 14 decoder layers, the final norm, the `lm_head` (on the first GPU only) and a KV cache, about 1.3 GB per GPU more at 6 bpw on four GPUs (1.9 GB on the first, which holds the head); `h3_check_paths` requires an EXL3 `text_encoder` with all 64 layers and the head
+* `H3TextEncoder::generate` reuses the tower's layer code
+  * the prompt runs through the usual prefill (the 64 layers, image rows and DeepStack included) and stores its K and V in the engine's `KVCachePool`
+  * each answer token is a one-row pass of the same layers, attending to the cache through `Attention::forward_decode` (head_dim 128)
+  * the rotary position of a generated token continues after the largest prompt position, on all three axes
+  * rank 0 runs the head and samples (temperature 0.7, top-k 20, top-p 0.8, the model's recommended settings; the test uses greedy), and broadcasts the token to the other ranks with the group's all-reduce
+  * the answer ends at `<|im_end|>` or after 400 tokens; it runs at about 25 tokens/s on four GPUs, so a caption takes 10 to 15 s
+* `h3_caption.cpp` builds the chat prompt (the picture at up to 1 MP, then the instruction) and the answer is a single paragraph
+  * with an empty prompt box the instruction is a fixed one (subject, clothing, setting, light and colors, camera)
+  * with text in the prompt box, the text is passed as the user's idea for the video, to be kept and filled in with what the picture shows
+* the page shows a pencil button on every picture tile (keyframes and references) and replaces the prompt box's text with the caption (undo restores it)
+* the request is queued for the GPU worker and runs between jobs (ahead of queued ones, after the running one)
+* `h3_generate --caption IMAGE [--prompt GUIDANCE] --text-encoder DIR --captioner` runs it from the command line
+* the image and prompt tokens are limited to the tower's 8192 rows; `test_h3_caption` checks that greedy decoding gives the same continuation whether the first half of an answer is decoded or prefilled
 
 The vision tower is the engine's `Qwen3VisionTower` (`src/models/qwen3_vision.cpp`), loaded from the BF16 `text_encoder` directory as a dense tower (fused qkv, DeepStack taps after blocks 8 / 16 / 24). `h3_vision.cu` only adapts it to the H3 interface (arena sizing, FP32 rows).
 

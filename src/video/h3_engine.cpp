@@ -97,7 +97,7 @@ H3Lease<H3TextGroup> H3Components::text_group( const std::vector<int>& devices, 
 	const int capacity = std::max( 8192, tokens );
 	auto group = std::make_unique<H3TextGroup>();
 	const auto t0 = std::chrono::steady_clock::now();
-	if ( !group->load( paths_.text_encoder.c_str(), devices, capacity, 50 ) ) {
+	if ( !group->load( paths_.text_encoder.c_str(), devices, capacity, 50, paths_.captioner ) ) {
 		LOG_ERROR( "H3: cannot load the EXL3 text tower from %s", paths_.text_encoder.c_str() );
 		CUDA_CHECK( cudaSetDevice( paths_.device ) );
 		return {};
@@ -210,6 +210,11 @@ bool H3Engine::generate( const H3GenRequest& req, H3GenResult* result ) {
 	} while ( false );
 	if ( result ) { *result = run.res; }
 	return ok;
+}
+
+bool H3Engine::caption( const std::string& image_bytes, const std::string& guidance, uint32_t seed, std::string* text ) {
+	CUDA_CHECK( cudaSetDevice( p_->paths.device ) );
+	return h3_caption( p_->paths, p_->components, image_bytes, guidance, seed, text );
 }
 
 bool h3_generate( const H3Paths& paths, const H3GenRequest& req, H3GenResult* result ) {

@@ -62,4 +62,4 @@ The `/monitor` page: one self-contained HTML string (Monokai or Tomorrow Night t
 
 ## `src/server/video/`
 
-The MiniMax-H3 service: `adapters` (LoRA scan and labels), `jobs` (the queue and the on-disk job history), `service` (the worker thread that owns the GPUs), `api` (the routes), `metrics`, and `page` (the web page). See [video.md](video.md).
+The MiniMax-H3 service: `adapters` (LoRA scan and labels), `jobs` (the queue and the on-disk job history), `service` (the worker thread that owns the GPUs), `api` (the routes), `metrics`, and `page` (the web page). Picture caption requests (`POST /api/caption`, with `video.captioner`) are queued beside the jobs and run by the same worker between jobs. See [video.md](video.md).

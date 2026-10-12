@@ -25,6 +25,7 @@ bool VideoService::init( const ServerConfig& config ) {
 	paths.device = s.cfg.video.devices.empty() ? 0 : s.cfg.video.devices[0];
 	paths.resident_rows = s.cfg.video.max_rows;
 	paths.text_encoder = s.cfg.video.text_encoder;
+	paths.captioner = s.cfg.video.captioner;
 	paths.tensor_parallel = s.cfg.video.tensor_parallel && s.cfg.video.devices.size() > 1;
 #if !defined( ENGINE_HAVE_NCCL )
 	if ( !paths.text_encoder.empty() && s.cfg.video.devices.size() > 1 ) {
@@ -70,6 +71,8 @@ void VideoService::Impl::register_routes( Router& router ) {
 	router.add( "GET", "/metrics/prometheus", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_metrics_prometheus( c, r ); } );
 	router.add( "GET", "/", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_page( c, r ); } );
 	router.add( "GET", "/api/info", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_info( c, r ); } );
+	router.add( "POST", "/api/caption", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_caption_submit( c, r ); }, true );
+	router.add_prefix( "GET", "/api/caption/", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_caption_status( c, r ); } );
 	router.add( "GET", "/api/jobs", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_list( c, r ); } );
 	// uploads are decoded and written to disk, videos are streamed: neither belongs on the epoll thread
 	router.add( "POST", "/api/jobs", [this]( const ConnPtr& c, const HttpRequest& r ) { handle_submit( c, r ); }, true );
@@ -80,8 +83,12 @@ void VideoService::Impl::run_loop() {
 	const double idle_s = cfg.video.resident ? cfg.video.resident_idle_s : 0;
 	double wait_s = idle_s;
 	for ( ;; ) {
-		bool idle = false;
-		JobPtr j = jobs.next( wait_s, &idle );
+		bool idle = false, poked = false;
+		JobPtr j = jobs.next( wait_s, &idle, &poked );
+		if ( poked ) {
+			run_captions();
+			continue;
+		}
 		if ( idle ) { // nothing queued for resident_idle_s: give the GPUs back, then wait for the next job without a timeout
 			LOG_INFO( "MiniMax-H3 service: idle for %d s, freeing the resident transformer\n", cfg.video.resident_idle_s );
 			engine->release();
@@ -91,6 +98,28 @@ void VideoService::Impl::run_loop() {
 		if ( !j ) break;
 		run_job( j );
 		wait_s = idle_s;
+	}
+}
+
+void VideoService::Impl::run_captions() {
+	for ( ;; ) {
+		std::shared_ptr<CaptionTask> t;
+		{
+			std::lock_guard<std::mutex> lk( caption_mu );
+			if ( caption_queue.empty() ) return;
+			auto it = captions.find( caption_queue.front() );
+			caption_queue.pop_front();
+			if ( it == captions.end() ) continue;
+			t = it->second;
+			t->state = "running";
+		}
+		std::string text;
+		const bool ok = engine->caption( t->image, t->guidance, t->seed, &text );
+		std::lock_guard<std::mutex> lk( caption_mu );
+		t->image.clear();
+		t->state = ok ? "done" : "failed";
+		if ( ok ) t->text = text;
+		else t->error = "the captioner failed (see the server log)";
 	}
 }
 

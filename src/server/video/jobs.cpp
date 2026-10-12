@@ -162,11 +162,20 @@ bool JobStore::remove( const JobPtr& j, std::string* error ) {
 	return true;
 }
 
-JobPtr JobStore::next( double idle_s, bool* idle ) {
+void JobStore::poke() {
+	{
+		std::lock_guard<std::mutex> lk( mu_ );
+		poked_ = true;
+	}
+	cv_.notify_all();
+}
+
+JobPtr JobStore::next( double idle_s, bool* idle, bool* poked ) {
 	std::unique_lock<std::mutex> lk( mu_ );
 	if ( idle ) *idle = false;
+	if ( poked ) *poked = false;
 	for ( ;; ) {
-		const auto ready = [this] { return stopping_ || !queue_.empty(); };
+		const auto ready = [this] { return stopping_ || poked_ || !queue_.empty(); };
 		if ( idle_s > 0 ) {
 			if ( !cv_.wait_for( lk, std::chrono::duration<double>( idle_s ), ready ) ) {
 				if ( idle ) *idle = true;
@@ -176,6 +185,11 @@ JobPtr JobStore::next( double idle_s, bool* idle ) {
 			cv_.wait( lk, ready );
 		}
 		if ( stopping_ ) return nullptr;
+		if ( poked_ ) {
+			poked_ = false;
+			if ( poked ) *poked = true;
+			return nullptr;
+		}
 		const int id = queue_.front();
 		queue_.pop_front();
 		auto it = jobs_.find( id );
