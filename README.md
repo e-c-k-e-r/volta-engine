@@ -42,6 +42,7 @@ Decode speed through the streaming API, one request, 4x V100-SXM2-32GB at a 250 
 | Qwen3.8-27B (EXL3 4.0 bpw) | DFlash2 | 163, 169, 138, 93 (141) |
 | Qwen3.8-Flash-Next (NVFP4 checkpoint) | MTP | 235, 210, 181, 136 (191) |
 | GLM-5.3-Flash (EXL3 3.05 bpw, NVFP4 dense) | DFlash2 | 116, 109, 108, 72 (101) |
+| GLM-5.3-Flash (the same) | MTP | 109, 102, 106, 87 (101) |
 | GLM-5.3-Flash | none | 64 |
 
 A plain token takes 12 ms (Qwen NVFP4), 14 ms (Flash-Next), 15 ms (GLM) or 16 ms (Qwen EXL3). Repetitive output peaks at over 300 tok/s on Qwen NVFP4. Perplexity per configuration and the bit widths of the EXL3 checkpoints are in [docs/QUANTIZATION.md](/docs/QUANTIZATION.md). Everything else, including where the time goes per kernel and how this compares with 1Cat-vLLM's published figures (different cards, clocks and prompts), is in [docs/PERFORMANCE.md](/docs/PERFORMANCE.md).

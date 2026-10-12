@@ -6,11 +6,11 @@ Reference numbers for the three model families on the target machine, how they w
 
 * 4x Tesla V100-SXM2-32GB, power limit 250 W (the cards still peak at 255 to 270 W in bursts), SM clock free up to 1530 MHz (they run at 1290 to 1530 MHz)
 * CUDA 12.8, `taskset -c 0-9`, tensor parallel over all four GPUs, CUDA graphs on, prefix cache off, one request at a time
-* speculation on where a model has it: DFlash2 drafter (Qwen, GLM) or the checkpoint's MTP head (Qwen, Flash-Next)
+* speculation on where a model has it: DFlash2 drafter (Qwen, GLM) or the checkpoint's MTP head (Qwen, Flash-Next, GLM)
 * weights
   * Qwen3.8-27B: EXL3 4.0 bpw (`Qwen3.8-27B-exl3`), or the NVFP4 checkpoint (`Qwen3.8-27B-QUASAR-NVFP4`) with the BF16 DFlash2 drafter
   * Flash-Next: the normal NVFP4 checkpoint on its own (`configs/flash_next_nvfp4_only.json`: routed experts as shipped, every dense group and the FP8 MTP head quantized to NVFP4 at load, the FP8 n-gram table read in place), or the mix of [FLASH_NEXT.md](FLASH_NEXT.md) (NVFP4 experts and dense groups with the Swift EXL3 4.0 bpw conversion's trunk, head and n-gram table)
-  * GLM-5.3-Flash: EXL3 3.05 bpw experts with the calibrated NVFP4 dense groups `kda,mla,idx,head,dense,shared`, all experts resident, 12K window
+  * GLM-5.3-Flash: EXL3 3.05 bpw experts with the calibrated NVFP4 dense groups `kda,mla,idx,head,dense,shared`, all experts resident, 12K window; the MTP head comes from the NVFP4 checkpoint (`configs/glm_mtp.json`)
 
 ## Serving speed
 
@@ -27,6 +27,7 @@ The natural prompts are four real questions (two in Chinese) behind about 8K tok
 | Flash-Next (NVFP4 experts and dense, Swift trunk and head), MTP depth 7 | 213, 186, 179, 123 | 175 | 3.0 to 5.7 |
 | Flash-Next (the same), MTP depth 4 | 199, 172, 176, 127 | 169 | 2.9 to 4.4 |
 | GLM-5.3-Flash, DFlash2 (EXL3 drafter) | 116, 109, 108, 72 | 101 | 3.1 to 5.0 |
+| GLM-5.3-Flash, MTP depth 7 (NVFP4 checkpoint's head) | 109, 102, 106, 87 | 101 | 2.6 to 4.0 |
 | GLM-5.3-Flash, no speculation | 64, 64, 64, 64 | 64 | 1 |
 
 * repetitive output (a long text the model is told to copy) is the best case for a drafter: Qwen NVFP4 + DFlash2 reaches 316 tok/s at 32K context, 7.8 tokens per round, 97% accepted; Qwen EXL3 + MTP reaches 212 to 225 tok/s; Flash-Next MTP depth 4 233 tok/s. These runs end early now and then, and the output (and so the speed) depends on the model's wording, so they are listed as peaks and not as typical speed

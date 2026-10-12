@@ -48,6 +48,19 @@ pod::TensorView load_router_weights_glm(
 	int hidden_size = meta->shape[1]; // 4096
 	const backend::half_t* src = static_cast<const backend::half_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta ) );
 	if ( !src ) return pod::TensorView{};
+	// The NVFP4 checkpoint stores the gate in BF16 (a BF16 gate read as FP16 routes every token wrongly)
+	std::vector<backend::half_t> converted;
+	if ( meta->dtype == pod::DType::BF16 ) {
+		converted.resize( static_cast<size_t>( num_experts ) * hidden_size );
+		const uint16_t* bf = reinterpret_cast<const uint16_t*>( src );
+		for ( size_t i = 0; i < converted.size(); ++i ) {
+			const uint32_t u = static_cast<uint32_t>( bf[i] ) << 16;
+			float f;
+			std::memcpy( &f, &u, 4 );
+			converted[i] = backend::from_float_half( f );
+		}
+		src = converted.data();
+	}
 
 	int shape[2] = { hidden_size, num_experts };
 	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
@@ -89,6 +102,9 @@ bool Glm5NextPipeline::init(
 
 	const int R = pod::MAX_ROWS;
 	const int S = config_.max_slots;
+	// The MTP head (speculator=mtp) is one more MLA layer with its own latent cache and indexer state
+	mtp_on_ = runtime::options().speculator == "mtp";
+	mla_slots_ = config_.num_mla_layers + ( mtp_on_ ? 1 : 0 );
 	// Routed experts: sharded over the ranks (every rank holds a quarter of every expert's intermediate width, moe_tp,
 	// default) or expert-parallel (72 whole experts per rank, forced by the two-tier expert cache). The sharded layout balances
 	// the load: each active expert costs every rank the same, where expert-parallel waits for the rank that drew the most.
@@ -98,7 +114,7 @@ bool Glm5NextPipeline::init(
 	// 1. Router outputs + routed-MoE dispatch scratch
 	state_.d_topk_indices = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( int ) ) );
 	state_.d_topk_weights = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( backend::half_t ) ) );
-	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R );
+	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R, mtp_on_ );
 	// The fused decode kernels read cold experts from host memory a little slower than the persistent kernel (6.4 vs 6.8 tok/s at a
 	// 50% tier), so the tier keeps the persistent path
 	if ( engine::modules::ExpertTier::resident_fraction() < 1.0 ) state_.moe.coop_ctr = nullptr;
@@ -154,7 +170,7 @@ bool Glm5NextPipeline::init(
 	// 3. MLA KV cache pool [S, 11, max_seq, 16 * 256] FP16 & execution buffers
 	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	{
-		latent_slot_stride_ = static_cast<size_t>( config_.num_mla_layers ) * config_.max_seq * 512;
+		latent_slot_stride_ = static_cast<size_t>( mla_slots_ ) * config_.max_seq * 512;
 		// kv_format applies to the latent as one tensor: k8v4 stores it as 8-bit (K precision), the others as named
 		const std::string& fmt = engine::runtime::options().kv_format;
 		if ( fmt == "fp8" ) latent_q_ = pod::KVQ::E5M2;
@@ -180,8 +196,8 @@ bool Glm5NextPipeline::init(
 		dsa_ = runtime::options().dsa;
 		if ( dsa_ ) {
 			const int NP = config_.max_seq / engine::modules::DSA::POOL;
-			dsa_plane_stride_ = static_cast<size_t>( config_.num_mla_layers ) * engine::modules::DSA::PLANE_CAP * engine::modules::DSA::PLANE;
-			dsa_pool_stride_ = static_cast<size_t>( config_.num_mla_layers ) * NP * engine::modules::DSA::DIM;
+			dsa_plane_stride_ = static_cast<size_t>( mla_slots_ ) * engine::modules::DSA::PLANE_CAP * engine::modules::DSA::PLANE;
+			dsa_pool_stride_ = static_cast<size_t>( mla_slots_ ) * NP * engine::modules::DSA::DIM;
 			auto halves = [&]( size_t n ) { return static_cast<backend::half_t*>( engine::core::arena_alloc( arena, n * sizeof( backend::half_t ), 128 ) ); };
 			dsa_plane_ = halves( static_cast<size_t>( S ) * dsa_plane_stride_ );
 			dsa_pool_ = halves( static_cast<size_t>( S ) * dsa_pool_stride_ );
@@ -304,6 +320,21 @@ bool Glm5NextPipeline::init(
 		draft_hooks_.embedding = &g_embed_table;
 	}
 
+	if ( mtp_on_ ) {
+		const int H = config_.hidden_size;
+		mtp_emb_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+		mtp_xe_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+		mtp_xh_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+		mtp_stage_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+		mtp_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+		int in_shape[2] = { R, 2 * H };
+		mtp_in_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, in_shape, 2 );
+		int hist_shape[2] = { S * 2 * ( kDraftM + 1 ), H };   // a region per slot (the runner offsets by slot)
+		mtp_hist_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, hist_shape, 2 );
+		int chain_shape[2] = { 1, H };
+		mtp_chain_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, chain_shape, 2 );
+	}
+
 #if ENGINE_BACKEND_CUDA
 	engine::modules::trellis_get_workspace( rank_, 16 * 1024 * 1024 );
 	engine::modules::trellis_get_locks( rank_ );
@@ -417,7 +448,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	// Dense groups quantized to NVFP4 at load from the BF16 tensors of a modelopt checkpoint (ENGINE_NVFP4_DENSE_SRC, ENGINE_NVFP4_DENSE); the
 	// routed experts stay EXL3. The dense MLP layers are NVFP4 in that checkpoint already and load as they are (group `dense`)
 	std::unique_ptr<engine::loader::SafeTensorsRepo> nv_repo;
-	if ( const std::string& nv_dir = runtime::options().nvfp4_dense_src; !nv_dir.empty() && !runtime::options().nvfp4_dense.empty() ) {
+	if ( const std::string& nv_dir = runtime::options().nvfp4_dense_src; !nv_dir.empty() && ( !runtime::options().nvfp4_dense.empty() || mtp_on_ ) ) {
 		nv_repo = std::make_unique<engine::loader::SafeTensorsRepo>();
 		if ( !nv_repo->open( nv_dir.c_str() ) ) {
 			LOG_ERROR( "[loader] FAILED to open the NVFP4 directory %s\n", nv_dir.c_str() );
@@ -794,6 +825,84 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		if ( !lw.hc_ffn_fn.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: hc_ffn_fn\n", rank_, L ); ++missing_count; }
 	}
 
+	// 3. MTP head (speculator=mtp): layer 45 of the NVFP4 checkpoint, a plain MLA + MoE layer without hyper-connections. Every dense tensor is
+	// quantized to NVFP4 at load from the BF16 weights; the 288 routed experts too, as this rank's slice of each (gate / up rows, down columns)
+	if ( mtp_on_ ) {
+		if ( !nv_repo ) {
+			LOG_ERROR( "[RANK %d] speculator=mtp needs nvfp4_dense_src (the NVFP4 checkpoint that holds the head)\n", rank_ );
+			return false;
+		}
+		const int L = 45;
+		auto& lw = mtp_layer_;
+		char pre[160];
+		std::snprintf( pre, sizeof( pre ), "model.language_model.layers.%d", L );
+		auto nm = [&]( const char* tail ) { std::snprintf( name_buf, sizeof( name_buf ), "%s.%s", pre, tail ); return name_buf; };
+		auto bf = [&]( const char* tail ) {
+			const pod::TensorView t = nv_repo->load( nm( tail ), *arena_, stream, pod::DType::FP16 );
+			if ( !t.data ) { LOG_ERROR( "[RANK %d] MISSING (MTP): %s\n", rank_, name_buf ); ++missing_count; }
+			return t;
+		};
+		mtp_eh_ = nv_check( nv_repo->quantize_nvfp4_slice( nm( "eh_proj" ), *arena_, true, 0, 1, 0, stream ), name_buf );
+		mtp_enorm_ = bf( "enorm.weight" );
+		mtp_hnorm_ = bf( "hnorm.weight" );
+		mtp_norm_ = bf( "shared_head.norm.weight" );
+		lw.is_moe = true;
+		lw.is_mla = true;
+		lw.input_norm = bf( "input_layernorm.weight" );
+		lw.post_attn_norm = bf( "post_attention_layernorm.weight" );
+		lw.q_a = nv_check( nv_repo->quantize_nvfp4_slice( nm( "self_attn.q_a_proj" ), *arena_, true, 0, 1, 0, stream ), name_buf );
+		lw.q_a_norm = bf( "self_attn.q_a_layernorm.weight" );
+		lw.q_b = nv_check( nv_repo->quantize_nvfp4_slice( nm( "self_attn.q_b_proj" ), *arena_, true, rank_, config_.tp_size, 0, stream ), name_buf );
+		lw.kv_a = nv_check( nv_repo->quantize_nvfp4_slice( nm( "self_attn.kv_a_proj_with_mqa" ), *arena_, true, 0, 1, 0, stream ), name_buf );
+		lw.kv_a_norm = bf( "self_attn.kv_a_layernorm.weight" );
+		lw.kv_b_proj = nv_repo->load_slice( nm( "self_attn.kv_b_proj.weight" ), *arena_, 0, rank_, config_.tp_size, stream, pod::DType::FP16 );
+		if ( !lw.kv_b_proj.data ) { LOG_ERROR( "[RANK %d] MISSING (MTP): %s\n", rank_, name_buf ); ++missing_count; }
+		lw.o_proj = nv_check( nv_repo->quantize_nvfp4_slice( nm( "self_attn.o_proj" ), *arena_, false, rank_, config_.tp_size, 0, stream ), name_buf );
+		if ( dsa_ ) {
+			lw.idx_wq_b = nv_check( nv_repo->quantize_nvfp4_slice( nm( "self_attn.indexer.wq_b" ), *arena_, true, 0, 1, 0, stream ), name_buf );
+			const int dshape[2] = { engine::modules::DSA::PROJ, 4096 };
+			lw.idx_dense = engine::core::arena_alloc_tensor( *arena_, pod::DType::FP16, dshape, 2 );
+			const size_t keep = arena_->offset_bytes;
+			const char* parts[3] = { "self_attn.indexer.wk.weight", "self_attn.indexer.weights_proj.weight", "self_attn.indexer.index_kpool_compress_gate" };
+			const int part_rows[3] = { engine::modules::DSA::DIM, engine::modules::DSA::HEADS, engine::modules::DSA::DIM };
+			int row0 = 0;
+			for ( int i = 0; i < 3; ++i ) {
+				const pod::TensorView part = nv_repo->load( nm( parts[i] ), *arena_, stream, pod::DType::FP16 );
+				ENGINE_ASSERT( part.data != nullptr && part.shape[0] == part_rows[i] && part.shape[1] == 4096, "Glm5NextPipeline: MTP indexer projection shape" );
+				backend::memcpy_async( lw.idx_dense.ptr<backend::half_t>() + static_cast<size_t>( row0 ) * 4096, part.data, static_cast<size_t>( part_rows[i] ) * 4096 * sizeof( backend::half_t ), backend::Copy::D2D, stream );
+				row0 += part_rows[i];
+			}
+			backend::stream_sync( stream );
+			arena_->offset_bytes = keep;
+			lw.idx_ln_w = bf( "self_attn.indexer.k_norm.weight" );
+			lw.idx_ln_b = bf( "self_attn.indexer.k_norm.bias" );
+			lw.idx_ape = bf( "self_attn.indexer.index_kpool_compress_ape" );
+		}
+		lw.router_weights = impl::load_router_weights_glm( *nv_repo, nm( "mlp.gate.weight" ), *arena_, stream );
+		if ( !lw.router_weights.data ) { LOG_ERROR( "[RANK %d] MISSING (MTP): %s\n", rank_, name_buf ); ++missing_count; }
+		lw.e_score_bias = bf( "mlp.gate.e_score_correction_bias" );
+		auto& mw = lw.moe_weights;
+		mw.type = pod::QuantType::NVFP4;
+		mw.num_local_experts = config_.num_experts;
+		mw.top_k = config_.top_k;
+		for ( int e = 0; e < config_.num_experts; ++e ) {
+			std::snprintf( name_buf, sizeof( name_buf ), "%s.mlp.experts.%d.gate_proj", pre, e );
+			mw.gate[e] = nv_check( nv_repo->quantize_nvfp4_slice( name_buf, *arena_, true, rank_, config_.tp_size, 0, stream ), name_buf );
+			std::snprintf( name_buf, sizeof( name_buf ), "%s.mlp.experts.%d.up_proj", pre, e );
+			mw.up[e] = nv_check( nv_repo->quantize_nvfp4_slice( name_buf, *arena_, true, rank_, config_.tp_size, 0, stream ), name_buf );
+			std::snprintf( name_buf, sizeof( name_buf ), "%s.mlp.experts.%d.down_proj", pre, e );
+			mw.down[e] = nv_check( nv_repo->quantize_nvfp4_slice( name_buf, *arena_, false, rank_, config_.tp_size, 0, stream ), name_buf );
+		}
+		engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );
+		mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( config_.num_experts ) * sizeof( uint32_t ), 128 ) );
+		backend::memset_async( mw.heat, 0, static_cast<size_t>( config_.num_experts ) * sizeof( uint32_t ), stream );
+		lw.shared_expert.gate = nv_check( nv_repo->quantize_nvfp4_slice( nm( "mlp.shared_experts.gate_proj" ), *arena_, true, 0, 1, 0, stream ), name_buf );
+		lw.shared_expert.up = nv_check( nv_repo->quantize_nvfp4_slice( nm( "mlp.shared_experts.up_proj" ), *arena_, true, 0, 1, 0, stream ), name_buf );
+		lw.shared_expert.down = nv_check( nv_repo->quantize_nvfp4_slice( nm( "mlp.shared_experts.down_proj" ), *arena_, true, 0, 1, 0, stream ), name_buf );
+		lw.has_shared_expert = true;
+		if ( rank_ == 0 ) LOG_INFO( "[RANK 0] MTP head from the NVFP4 checkpoint: layer %d, %d experts quantized to NVFP4 (this rank's slice)\n", L, config_.num_experts );
+	}
+
 	size_t bytes_after = arena_->offset_bytes;
 	if ( nv_count > 0 ) LOG_INFO( "[RANK %d] NVFP4 dense tensors: %d, %d calibrated (groups %s)\n", rank_, nv_count, nv_calibrated, nv_groups.c_str() );
 	if ( missing_count > 0 || rank_ == 0 ) {
@@ -994,10 +1103,6 @@ void Glm5NextPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 
 void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 	// Slot-0 base pointers; slot and position of each row are resolved on device from d_rows_
-	const pod::SlotRef kv_ref{ d_rows_, 0, latent_slot_stride_ };
-	const size_t slot_kda_floats = state_.slot_kda_floats;
-	const size_t slot_conv_floats = state_.slot_conv_floats;
-	const int snap_rows = MIN( m, kDraftM );
 	const int H = config_.hidden_size;
 
 	// mHC: expand every row's embedding into its 4 residual streams
@@ -1021,6 +1126,50 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 	}
 	engine::modules::HyperConnection::init_streams( embed_rows_, hidden_streams_, H, stream, m );
 
+
+
+	for ( int layer = 0; layer < config_.num_layers; ++layer ) layer_body( layer, layers_[layer], m, stream );
+
+	if ( layers_[0].hc_attn_fn.data != nullptr ) {
+		// HyperHead unweighted mean across 4 streams
+		engine::modules::HyperHead::mean( hidden_streams_, hidden_states_, H, stream, m );
+	}
+
+	// Final norm + this rank's vocabulary shard of the LM head
+	if ( !hess_.empty() && m > pod::MAX_BATCH && hess_[5].h != nullptr ) {
+		// Calibration passes skip the head (its logits buffer holds MAX_BATCH rows); the head's input statistics need the normed rows only
+		engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, 1e-5f, 0.0f, stream );
+		hessian( 0, 5, norm_hidden_.data, config_.hidden_size, m, stream );
+	}
+	// The MTP head reads the final-norm hidden of every prefill row, whether or not the chunk needs logits
+	const bool norm_all = mtp_on_ && m > pod::MAX_BATCH;
+	if ( norm_all ) engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, 1e-5f, 0.0f, stream );
+	if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
+	if ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) {
+		// Prefill: only the final row's logits are read
+		pod::TensorView h1 = pod::make_tensor_2d( hidden_states_.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * H, pod::DType::FP16, 1, H );
+		pod::TensorView n1 = pod::make_tensor_2d( norm_hidden_.ptr<backend::half_t>() + ( norm_all ? static_cast<size_t>( m - 1 ) * H : 0 ), pod::DType::FP16, 1, H );
+		if ( norm_all ) {   // already normed above (n1 is the last row of norm_hidden_, which the head step still needs whole)
+			pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
+			engine::modules::Linear::forward( n1, lm_head_, l1, stream );
+			return;
+		}
+		pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
+		engine::modules::RMSNorm::forward( h1, final_norm_, n1, 1e-5f, 0.0f, stream );
+		engine::modules::Linear::forward( n1, lm_head_, l1, stream );
+		return;
+	}
+	logits_.shape[0] = m;
+	engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, 1e-5f, 0.0f, stream );
+	engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
+}
+
+void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, backend::stream_t stream ) {
+	const pod::SlotRef kv_ref{ d_rows_, 0, latent_slot_stride_ };
+	const size_t slot_kda_floats = state_.slot_kda_floats;
+	const size_t slot_conv_floats = state_.slot_conv_floats;
+	const int snap_rows = MIN( m, kDraftM );
+	const int H = config_.hidden_size;
 	// Routed experts: this rank's 72 whole experts, or a quarter of all 288
 	int experts_per_rank = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
 	int start_expert = moe_tp_ ? 0 : rank_ * experts_per_rank;
@@ -1042,8 +1191,6 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 		}
 	};
 
-	for ( int layer = 0; layer < config_.num_layers; ++layer ) {
-		auto& lw = layers_[layer];
 
 		if ( lw.hc_attn_fn.data != nullptr ) {
 			// mHC pre-step: attention
@@ -1420,32 +1567,6 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 		}
 
 		trace_row( layer );
-	}
-
-	if ( layers_[0].hc_attn_fn.data != nullptr ) {
-		// HyperHead unweighted mean across 4 streams
-		engine::modules::HyperHead::mean( hidden_streams_, hidden_states_, H, stream, m );
-	}
-
-	// Final norm + this rank's vocabulary shard of the LM head
-	if ( !hess_.empty() && m > pod::MAX_BATCH && hess_[5].h != nullptr ) {
-		// Calibration passes skip the head (its logits buffer holds MAX_BATCH rows); the head's input statistics need the normed rows only
-		engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, 1e-5f, 0.0f, stream );
-		hessian( 0, 5, norm_hidden_.data, config_.hidden_size, m, stream );
-	}
-	if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
-	if ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) {
-		// Prefill: only the final row's logits are read
-		pod::TensorView h1 = pod::make_tensor_2d( hidden_states_.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * H, pod::DType::FP16, 1, H );
-		pod::TensorView n1 = pod::make_tensor_2d( norm_hidden_.ptr<backend::half_t>(), pod::DType::FP16, 1, H );
-		pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
-		engine::modules::RMSNorm::forward( h1, final_norm_, n1, 1e-5f, 0.0f, stream );
-		engine::modules::Linear::forward( n1, lm_head_, l1, stream );
-		return;
-	}
-	logits_.shape[0] = m;
-	engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, 1e-5f, 0.0f, stream );
-	engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
 }
 
 void Glm5NextPipeline::hessian( int layer, int site, const void* x, int k, int m, backend::stream_t stream ) {
@@ -1482,6 +1603,79 @@ void Glm5NextPipeline::hessian_dump() {
 	LOG_INFO( "[RANK %d] hessians written to %s\n", rank_, dir.c_str() );
 }
 
+// One MTP forward (DeepSeek-style head): row j takes the target's final-norm hidden at its position and the embedding of the token that
+// follows, x = eh_proj( [enorm(embedding) | hnorm(hidden)] ), runs the head's MLA + MoE layer on x and predicts the token after that.
+// The head's latent cache and indexer state are the last slot of the sequence (layer 45).
+void Glm5NextPipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream ) {
+	ENGINE_ASSERT( mtp_on_ && weights_loaded_, "Glm5NextPipeline::mtp_step: no MTP head" );
+	backend::set_device( rank_ );
+	const int m = rows.count;
+	const int H = config_.hidden_size;
+	const size_t row_bytes = static_cast<size_t>( H ) * sizeof( backend::half_t );
+	ENGINE_ASSERT( m >= 1 && m <= pod::MAX_ROWS, "Glm5NextPipeline::mtp_step: rows out of range" );
+	for ( int r = 0; r < m; ++r ) {
+		ENGINE_ASSERT( rows.slot[r] >= 0 && rows.slot[r] < config_.max_slots && rows.pos[r] >= 0 && rows.pos[r] < config_.max_seq, "Glm5NextPipeline::mtp_step: slot or position out of range" );
+	}
+	key_hint_ = rows.pos[m - 1] + 1;
+	lm_mode_ = pod::BatchRows::LOGITS_ALL;
+	set_rows( m );
+	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
+
+	// 1. Normed embedding of the following tokens
+	embed_tokens( tokens, m, stream );
+	pod::TensorView emb = pod::make_tensor_2d( embed_rows_.data, pod::DType::FP16, m, H );
+	pod::TensorView xe = pod::make_tensor_2d( mtp_xe_.data, pod::DType::FP16, m, H );
+	pod::TensorView xh = pod::make_tensor_2d( mtp_xh_.data, pod::DType::FP16, m, H );
+	engine::modules::RMSNorm::forward( emb, mtp_enorm_, xe, 1e-5f, 0.0f, stream );
+
+	// 2. Normed hidden rows
+	const backend::half_t* src = nullptr;
+	switch ( hidden_mode ) {
+		case 0: src = norm_hidden_.ptr<const backend::half_t>(); break;   // the last forward's final-norm rows
+		case 1: {   // saved row 0, then the last forward's rows 0 .. m - 2 (a prefill chunk continuing a previous one)
+			backend::half_t* st = mtp_stage_.ptr<backend::half_t>();
+			backend::memcpy_async( st, mtp_hist_.ptr<char>() + static_cast<size_t>( hist_row0 ) * row_bytes, row_bytes, backend::Copy::D2D, stream );
+			if ( m > 1 ) backend::memcpy_async( st + H, norm_hidden_.data, static_cast<size_t>( m - 1 ) * row_bytes, backend::Copy::D2D, stream );
+			src = st;
+		} break;
+		case 2: src = mtp_hist_.ptr<const backend::half_t>() + static_cast<size_t>( hist_row0 ) * H; break;   // saved rows 0 .. m - 1
+		default: src = mtp_chain_.ptr<const backend::half_t>(); break;   // the previous MTP step's last output row
+	}
+	pod::TensorView src_view = pod::make_tensor_2d( const_cast<backend::half_t*>( src ), pod::DType::FP16, m, H );
+	engine::modules::RMSNorm::forward( src_view, mtp_hnorm_, xh, 1e-5f, 0.0f, stream );
+
+	// 3. eh_proj over [embedding | hidden] (replicated on every rank), into the head layer's input
+	backend::memcpy2d_async( mtp_in_.ptr<backend::half_t>(), 2 * row_bytes, xe.data, row_bytes, row_bytes, m, backend::Copy::D2D, stream );
+	backend::memcpy2d_async( mtp_in_.ptr<backend::half_t>() + H, 2 * row_bytes, xh.data, row_bytes, row_bytes, m, backend::Copy::D2D, stream );
+	pod::TensorView in2 = pod::make_tensor_2d( mtp_in_.data, pod::DType::FP16, m, 2 * H );
+	pod::TensorView x0 = pod::make_tensor_2d( hidden_states_.data, pod::DType::FP16, m, H );
+	engine::modules::Linear::forward( in2, mtp_eh_, x0, stream );
+
+	// 4. The head's layer (MLA + MoE on the single residual stream)
+	layer_body( config_.num_layers, mtp_layer_, m, stream );
+
+	// 5. Final norm; the last row stays for the next chained step and feeds the shared LM head
+	pod::TensorView out = pod::make_tensor_2d( mtp_out_.data, pod::DType::FP16, m, H );
+	engine::modules::RMSNorm::forward( x0, mtp_norm_, out, 1e-5f, 0.0f, stream );
+	backend::memcpy_async( mtp_chain_.data, mtp_out_.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * H, row_bytes, backend::Copy::D2D, stream );
+	if ( logits_last ) {
+		pod::TensorView n1 = pod::make_tensor_2d( mtp_chain_.data, pod::DType::FP16, 1, H );
+		pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
+		engine::modules::Linear::forward( n1, lm_head_, l1, stream );
+		logits_.shape[0] = 1;
+		last_rows_ = 1;
+	}
+}
+
+// Keeps rows [src_row, src_row + rows) of the last forward's final-norm hidden for later MTP steps (row dst_row onwards)
+void Glm5NextPipeline::mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream ) {
+	ENGINE_ASSERT( mtp_on_ && rows >= 1 && dst_row + rows <= config_.max_slots * 2 * ( kDraftM + 1 ), "Glm5NextPipeline::mtp_save_hist: rows out of range" );
+	backend::set_device( rank_ );
+	const size_t row_bytes = static_cast<size_t>( config_.hidden_size ) * sizeof( backend::half_t );
+	backend::memcpy_async( mtp_hist_.ptr<char>() + static_cast<size_t>( dst_row ) * row_bytes, norm_hidden_.ptr<const char>() + static_cast<size_t>( src_row ) * row_bytes,
+		static_cast<size_t>( rows ) * row_bytes, backend::Copy::D2D, stream );
+}
+
 void Glm5NextPipeline::destroy() {
 	if ( arena_ != nullptr ) {
 		backend::set_device( rank_ );
@@ -1513,9 +1707,9 @@ size_t Glm5NextPipeline::seq_state_bytes( int from, int tokens, bool with_taps )
 	const size_t recurrent = ( state_.slot_kda_floats + state_.slot_conv_floats ) * sizeof( float );
 	const size_t planes = dsa_plane_stride_ * sizeof( backend::half_t );
 	const size_t lat_elems = static_cast<size_t>( tokens - from ) * 512;
-	const size_t latent = static_cast<size_t>( config_.num_mla_layers ) * ( latent_data_bytes( lat_elems ) + latent_scale_bytes( lat_elems ) );
+	const size_t latent = static_cast<size_t>( mla_slots_ ) * ( latent_data_bytes( lat_elems ) + latent_scale_bytes( lat_elems ) );
 	const size_t pool_rows = static_cast<size_t>( ( tokens + pool - 1 ) / pool - from / pool );
-	const size_t pools = static_cast<size_t>( config_.num_mla_layers ) * pool_rows * engine::modules::DSA::DIM * sizeof( backend::half_t );
+	const size_t pools = static_cast<size_t>( mla_slots_ ) * pool_rows * engine::modules::DSA::DIM * sizeof( backend::half_t );
 	return recurrent + planes + ( with_taps ? tap_snapshot_bytes( tokens ) : 0 ) + latent + pools + 256;
 }
 
@@ -1533,7 +1727,7 @@ void Glm5NextPipeline::copy_seq_rows( int slot_id, int from, int tokens, char* h
 	const size_t lat_bytes = latent_data_bytes( lat_elems ), lat_scale_bytes = latent_scale_bytes( lat_elems );
 	const int pool_from = from / pool, pool_to = ( tokens + pool - 1 ) / pool;
 	const size_t pool_bytes = static_cast<size_t>( pool_to - pool_from ) * engine::modules::DSA::DIM * sizeof( backend::half_t );
-	for ( int layer = 0; layer < config_.num_mla_layers; ++layer ) {
+	for ( int layer = 0; layer < mla_slots_; ++layer ) {
 		const size_t lat_off = static_cast<size_t>( slot_id ) * latent_slot_stride_ + ( static_cast<size_t>( layer ) * config_.max_seq + from ) * 512;
 		move( static_cast<char*>( latent_cache_ ) + latent_data_bytes( lat_off ), lat_bytes );
 		if ( lat_scale_bytes ) move( static_cast<char*>( latent_scales_ ) + latent_scale_bytes( lat_off ), lat_scale_bytes );

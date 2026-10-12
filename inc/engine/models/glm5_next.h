@@ -184,6 +184,11 @@ public:
 	const backend::half_t* tapped_states( int row = 0 ) const override { (void) row; return nullptr; }
 	const ModelMetadata& get_metadata() const override { return metadata_; }
 
+	// MTP head (speculator=mtp, from the NVFP4 checkpoint's layer 45): see model.h 5d. The history rows are the final-norm hidden rows
+	bool has_mtp() const override { return mtp_on_; }
+	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
+	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
+
 	void destroy();
 
 private:
@@ -197,6 +202,9 @@ private:
 	// Layer stack over m rows at once: embed_rows_[0..m) -> logits_[0..m); slot and position of each row are
 	// read from d_rows_ on device so the launch sequence depends on m alone and is graph-replayable
 	void forward_body( int m, backend::stream_t stream );
+	// One decoder layer over the m rows of hidden_streams_ (mHC layers) or hidden_states_ (the MTP head's, which has no hyper-connection);
+	// `layer` picks the recurrent and latent state (45 = the MTP head's MLA layer, the last latent slot)
+	void layer_body( int layer, Glm5NextLayerWeights& lw, int m, backend::stream_t stream );
 	void set_rows( int m );
 
 	pod::BatchRows* d_rows_ = nullptr;
@@ -236,6 +244,12 @@ private:
 	int* dsa_nk_ = nullptr;           // [rows]
 	pod::TensorView o_lat_;
 	int last_rows_ = 0;
+	int mla_slots_ = 11;              // latent / indexer layers per slot: the MLA layers, plus the MTP head's
+	bool mtp_on_ = false;
+	Glm5NextLayerWeights mtp_layer_;
+	pod::LinearWeight mtp_eh_;        // [hidden, 2 * hidden] over [normed embedding | normed hidden]
+	pod::TensorView mtp_enorm_, mtp_hnorm_, mtp_norm_;
+	pod::TensorView mtp_emb_, mtp_xe_, mtp_xh_, mtp_in_, mtp_stage_, mtp_out_, mtp_chain_, mtp_hist_;
 	int lm_mode_ = pod::BatchRows::LOGITS_ALL;
 	int key_hint_ = 0;   // keys the current chunk can attend to; sizes the prefill attention split only
 
