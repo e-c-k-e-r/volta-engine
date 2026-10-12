@@ -34,7 +34,17 @@ Most inference engines treat Volta (SM_70) as a second class citizen and fall ba
 
 ### Metrics
 
-*to-do: fill out later*
+Decode speed through the streaming API, one request, 4x V100-SXM2-32GB at a 250 W cap (clocks free up to 1530 MHz), T=1 sampling, 256 new tokens. The numbers are real questions behind 8K tokens of filler, not a best case: the four prompts are listed because speculation speed depends on how predictable the answer is.
+
+| Model | Speculator | tok/s, 4 prompts (mean) |
+|---|---|---|
+| Qwen3.8-27B (NVFP4) | DFlash2 | 252, 263, 182, 81 (195) |
+| Qwen3.8-27B (EXL3 4.0 bpw) | DFlash2 | 163, 169, 138, 93 (141) |
+| Qwen3.8-Flash-Next (NVFP4 experts, EXL3 trunk) | MTP | 218, 182, 172, 130 (175) |
+| GLM-5.3-Flash (EXL3 3.05 bpw, NVFP4 dense) | DFlash2 | 116, 109, 108, 72 (101) |
+| GLM-5.3-Flash | none | 64 |
+
+A plain token takes 12 ms (Qwen NVFP4), 14 ms (Flash-Next), 15 ms (GLM) or 16 ms (Qwen EXL3). Repetitive output peaks at over 300 tok/s on Qwen NVFP4. Everything else, including where the time goes per kernel and how this compares with 1Cat-vLLM's published figures (different cards, clocks and prompts), is in [docs/PERFORMANCE.md](/docs/PERFORMANCE.md).
 
 ### Why not?
 
