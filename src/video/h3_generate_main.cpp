@@ -25,6 +25,7 @@ int main( int argc, char** argv ) {
 		else if ( a == "--resident" ) { resident = true; }
 		else if ( a == "--no-trim" ) { paths.trim_scratch = false; }
 		else if ( a == "--tp" ) { paths.tensor_parallel = true; }
+		else if ( a == "--keep-pcm" ) { req.keep_pcm = true; } // leave <out>.f32 (the interleaved FP32 stereo PCM before the AAC encode) next to the video
 		else if ( a == "--resident-decoders" ) { paths.resident_decoders = true; }
 		else if ( a == "--text-encoder" ) { paths.text_encoder = next(); }
 		else if ( a == "--repeat" ) { repeat = std::max( 1, std::atoi( next() ) ); }

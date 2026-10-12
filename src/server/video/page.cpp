@@ -33,7 +33,7 @@ input[type=range]{width:100%;accent-color:var(--acc)}
 .job{border:1px solid var(--bg3);border-radius:6px;padding:12px;margin-bottom:12px;background:var(--bg)}
 .job .top{display:flex;gap:8px;align-items:center;margin-bottom:6px}.job .top .sp{flex:1}.job .pr{color:var(--fg);margin:4px 0 8px;max-height:3.9em;overflow:hidden}
 .bar{height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;margin:6px 0}.bar>i{display:block;height:100%;background:var(--acc);transition:width .4s}
-.meta{color:var(--dim);font-size:12px}video{width:100%;border-radius:4px;background:#000;margin:8px 0}
+.meta{color:var(--dim);font-size:12px}video{display:block;width:100%;height:auto;max-height:72vh;object-fit:contain;border-radius:4px;background:#000;margin:8px 0}
 .acts{display:flex;gap:8px;flex-wrap:wrap}.err{color:var(--err);white-space:pre-wrap}.small{font-size:12px;color:var(--dim)}
 </style></head><body>
 <header><h1>MiniMax-H3 on Volta</h1><span class="tag" id="hw"></span><span class="sp"></span><span class="tag" id="qinfo"></span></header>
