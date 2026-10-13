@@ -33,6 +33,7 @@
 * [CAPABILITIES.md](CAPABILITIES.md): which module functions each backend implements (generated)
 * [KERNEL_MAP.md](KERNEL_MAP.md): kernel family -> file -> what verifies it
 * [TESTS.md](TESTS.md): the test inventory and what `tests/tools/gate.sh` runs
+* [ROCM.md](ROCM.md): the AMD RDNA (ROCm) build, how the CUDA sources run there, and what is left
 * [HARDWARE_SM70.md](HARDWARE_SM70.md): Volta notes (no `cp.async`, no FP4, fragment layouts, cooperative launch limits, NVLink)
 * [FLASH_NEXT.md](FLASH_NEXT.md): Qwen3.8-Flash-Next and the NVFP4 paths, with the numbers
 * [video.md](video.md): MiniMax-H3
@@ -41,6 +42,7 @@
 
 * Linux with CUDA 12.x (13+ drops SM_70) and 4xV100 SXM2 for the full experience
   * smaller setups work for the smaller models, and two GPUs can run one model per pair (`tp_size`)
+* NVIDIA SM_86 / SM_89 from the same CUDA build; AMD RDNA (RX 7000 / 9000) through the ROCm build (correct first, untuned: [ROCM.md](ROCM.md))
 * the CPU and Vulkan builds run what fits (slowly, on reference kernels)
 
 ## Notices and Citations

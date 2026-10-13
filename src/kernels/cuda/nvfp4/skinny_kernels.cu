@@ -41,6 +41,29 @@ __global__ void skinny_nvfp4_qpn(
 		for ( int i = 0; i < 8; i++ ) c[t][i] = 0.f;
 	}
 
+#if NVFP4_MMA_SM80
+	const int xr0 = nvfp4_x_row( lane );
+	#pragma unroll 4
+	for ( int g = g0; g < g0 + Gq; g++ ) {
+		unsigned aw[2][4];
+		nvfp4_wfrag<false>( cb + (size_t) g * 32, sb + (size_t) g * 32, gm2, aw );
+		#pragma unroll
+		for ( int t = 0; t < MT; t++ ) {
+			const int ar = t * 8 + xr0;
+			unsigned bx[2];
+			nvfp4_xfrag( ar < M ? x + (size_t) ar * K + g * 16 : nullptr, bx );
+			nvfp4_step( c[t], aw, bx );
+		}
+	}
+	(void) qp;
+	(void) r;
+
+	#pragma unroll
+	for ( int t = 0; t < MT; t++ ) {
+		#pragma unroll
+		for ( int i = 0; i < 8; i++ ) cs[warp][( t * 8 + nvfp4_acc_row( i, lane ) ) * 32 + nvfp4_acc_col( i, lane )] = c[t][i];
+	}
+#else
 	#pragma unroll 4
 	for ( int g = g0; g < g0 + Gq; g++ ) {
 		const uint2 q2 = __ldcs( cb + (size_t) g * 32 );
@@ -77,6 +100,7 @@ __global__ void skinny_nvfp4_qpn(
 			cs[warp][( t * 8 + row ) * 32 + qp * 8 + col] = c[t][i];
 		}
 	}
+#endif
 	__syncthreads();
 
 	for ( int e = threadIdx.x; e < MT * 256; e += blockDim.x ) {
@@ -118,6 +142,21 @@ __global__ void skinny_nvfp4_qpn2(
 		for ( int i = 0; i < 8; i++ ) c[a][i] = 0.f;
 	}
 
+#if NVFP4_MMA_SM80
+	const int xr0 = nvfp4_x_row( lane );
+	const half* xrow = ( xr0 < M ) ? ( x + (size_t) xr0 * K ) : nullptr;
+	(void) qp;
+	(void) r;
+
+	// One step per k16 group into c[0] (its two MMAs are already independent chains); the NACC split below then adds zeros
+	#pragma unroll 4
+	for ( int g = g0; g < g0 + Gq; g++ ) {
+		unsigned aw[2][4], bx[2];
+		nvfp4_wfrag<true>( cb + (size_t) g * 32, sb + (size_t) g * 32, gm2, aw );
+		nvfp4_xfrag( xrow != nullptr ? xrow + g * 16 : nullptr, bx );
+		nvfp4_step( c[0], aw, bx );
+	}
+#else
 	const half* xrow = ( r < M ) ? ( x + (size_t) r * K ) : nullptr;
 
 	#pragma unroll 4
@@ -140,6 +179,7 @@ __global__ void skinny_nvfp4_qpn2(
 		MMA_8N8K4( c[2 % NACC], A1[0], A1[1], B[4], B[5] );
 		MMA_8N8K4( c[3 % NACC], A1[2], A1[3], B[6], B[7] );
 	}
+#endif
 
 	#pragma unroll
 	for ( int a = 1; a < NACC; a++ ) {
@@ -147,6 +187,19 @@ __global__ void skinny_nvfp4_qpn2(
 		for ( int i = 0; i < 8; i++ ) c[0][i] += c[a][i];
 	}
 
+#if NVFP4_MMA_SM80
+	if ( SPLITK == 1 ) {
+		#pragma unroll
+		for ( int i = 0; i < 8; i++ ) {
+			const int row = nvfp4_acc_row( i, lane );
+			if ( row < M ) y[(size_t) row * N + (size_t) tile * 32 + nvfp4_acc_col( i, lane )] = __float2half( c[0][i] );
+		}
+		return;
+	}
+
+	#pragma unroll
+	for ( int i = 0; i < 8; i++ ) cs[warp][nvfp4_acc_row( i, lane ) * 32 + nvfp4_acc_col( i, lane )] = c[0][i];
+#else
 	if ( SPLITK == 1 ) {
 		#pragma unroll
 		for ( int i = 0; i < 8; i++ ) {
@@ -165,6 +218,7 @@ __global__ void skinny_nvfp4_qpn2(
 		const int col = ( i & 1 ) | ( ( ( lane >> 1 ) & 1 ) << 1 ) | ( ( i >> 2 ) << 2 );
 		cs[warp][row * 32 + qp * 8 + col] = c[0][i];
 	}
+#endif
 	__syncthreads();
 
 	for ( int e = threadIdx.x; e < 256; e += blockDim.x ) {
@@ -177,6 +231,119 @@ __global__ void skinny_nvfp4_qpn2(
 		}
 	}
 }
+
+#if defined(USE_ROCM)
+// c + the FP32 dot of two half pairs (v_dot2_f32_f16 on RDNA)
+DEV_INLINE float rocm_dot2( unsigned a, unsigned b, float c ) {
+#if defined(__HIP_DEVICE_COMPILE__)
+	typedef _Float16 h2v __attribute__( ( ext_vector_type( 2 ) ) );
+	return __builtin_amdgcn_fdot2( __builtin_bit_cast( h2v, a ), __builtin_bit_cast( h2v, b ), c, false );
+#else
+	const float2 fa = __half22float2( *reinterpret_cast<const half2*>( &a ) ), fb = __half22float2( *reinterpret_cast<const half2*>( &b ) );
+	return fmaf( fa.x, fb.x, fmaf( fa.y, fb.y, c ) );
+#endif
+}
+
+static constexpr int ROCM_GEMV_BATCH = 8;
+
+// ROCm decode GEMV (M <= MR rows) without the tensor-core step, which RDNA has no NVIDIA-layout form of: one block per 32-column tile,
+// WARPS warps splitting its k groups. Each lane decodes the 16 codes of its own slot (column n of the prepacked map, the same FP16
+// values as nvfp4_dequant_kernel) and dots them with each token row; the packed weight is read once, against the dequantize + GEMM
+// path's FP16 write and re-read of the whole matrix
+template <int MR, int WARPS>
+__global__ __launch_bounds__( 32 * WARPS ) void rocm_nvfp4_gemv(
+	const uint8_t* __restrict__ qcodes,
+	const uint8_t* __restrict__ qscales,
+	const half* __restrict__ x,
+	half* __restrict__ y,
+	int N,
+	int K,
+	int M,
+	float gscale
+) {
+	__shared__ float cs[WARPS][MR][32];
+	const int lane = threadIdx.x & 31;
+	const int warp = __builtin_amdgcn_readfirstlane( threadIdx.x >> 5 );
+	const int tile = blockIdx.x;
+	const int G = K >> 4, per = ( G + WARPS - 1 ) / WARPS;
+	const int g0 = warp * per, g1 = min( G, g0 + per );
+	const uint2* cb = reinterpret_cast<const uint2*>( qcodes ) + (size_t) tile * G * 32 + lane;
+	const uint8_t* sb = qscales + (size_t) tile * G * 32 + lane;
+	const half2 gm2 = __float2half2_rn( gscale * 16384.f );
+
+	float acc[MR];
+	#pragma unroll
+	for ( int m = 0; m < MR; ++m ) acc[m] = 0.f;
+
+	// Rows past M re-read the last row (branch-free, their sums are dropped): a guard would split the loop body and keep the loads
+	// from being issued ahead, leaving one load in flight per wave
+	const half* xr[MR];
+	#pragma unroll
+	for ( int m = 0; m < MR; ++m ) xr[m] = x + (size_t) min( m, M - 1 ) * K;
+
+	auto step = [&]( uint2 q2, uint8_t s8, int g ) {
+		const half2 sc2 = __hmul2( fp8e4m3_to_half2( s8 ), gm2 );
+		half2 w[8];
+		dequant8_tm( q2.x, sc2, w + 0 );
+		dequant8_tm( q2.y, sc2, w + 4 );
+		const unsigned* W = reinterpret_cast<const unsigned*>( w );
+		#pragma unroll
+		for ( int m = 0; m < MR; ++m ) {
+			const uint4* xp = reinterpret_cast<const uint4*>( xr[m] + g * 16 );
+			const uint4 x0 = xp[0], x1 = xp[1];
+			float a = acc[m];
+			a = rocm_dot2( W[0], x0.x, a );
+			a = rocm_dot2( W[1], x0.y, a );
+			a = rocm_dot2( W[2], x0.z, a );
+			a = rocm_dot2( W[3], x0.w, a );
+			a = rocm_dot2( W[4], x1.x, a );
+			a = rocm_dot2( W[5], x1.y, a );
+			a = rocm_dot2( W[6], x1.z, a );
+			a = rocm_dot2( W[7], x1.w, a );
+			acc[m] = a;
+		}
+	};
+
+	// ROCM_GEMV_BATCH groups' loads issued together, then their math
+	int g = g0;
+	for ( ; g + ROCM_GEMV_BATCH <= g1; g += ROCM_GEMV_BATCH ) {
+		uint2 q[ROCM_GEMV_BATCH];
+		uint8_t sc[ROCM_GEMV_BATCH];
+		#pragma unroll
+		for ( int u = 0; u < ROCM_GEMV_BATCH; ++u ) {
+			q[u] = __ldcs( cb + (size_t) ( g + u ) * 32 );
+			sc[u] = __ldcs( sb + (size_t) ( g + u ) * 32 );
+		}
+		#pragma unroll
+		for ( int u = 0; u < ROCM_GEMV_BATCH; ++u ) step( q[u], sc[u], g + u );
+	}
+	for ( ; g < g1; ++g ) step( __ldcs( cb + (size_t) g * 32 ), __ldcs( sb + (size_t) g * 32 ), g );
+
+	#pragma unroll
+	for ( int m = 0; m < MR; ++m ) cs[warp][m][lane] = acc[m];
+	__syncthreads();
+
+	for ( int e = threadIdx.x; e < MR * 32; e += blockDim.x ) {
+		const int m = e >> 5, l = e & 31;
+		if ( m >= M ) continue;
+		float v = 0.f;
+		#pragma unroll
+		for ( int w = 0; w < WARPS; ++w ) v += cs[w][m][l];
+		const int col = ( ( l >> 2 ) & 3 ) * 8 + ( l & 3 ) + ( ( l & 16 ) ? 4 : 0 );
+		y[(size_t) m * N + (size_t) tile * 32 + col] = __float2half( v );
+	}
+}
+
+// Rows the ROCm GEMV covers; above, dequantize + hipBLAS (the weight decoded once serves every row)
+static constexpr int ROCM_NVFP4_GEMV_MAX_ROWS = 16;
+
+template <int MR>
+static void rocm_nvfp4_gemv_launch( const uint8_t* q, const uint8_t* s, const half* x, half* y, int n, int k, int m, float gscale, cudaStream_t stream ) {
+	// Narrow outputs (few tiles) split k over more waves to keep the GPU's memory system busy
+	if ( n / 32 < 256 ) rocm_nvfp4_gemv<MR, 16><<<n / 32, 32 * 16, 0, stream>>>( q, s, x, y, n, k, m, gscale );
+	else rocm_nvfp4_gemv<MR, 8><<<n / 32, 32 * 8, 0, stream>>>( q, s, x, y, n, k, m, gscale );
+}
+#endif
 
 // Dequantize the prepacked weight into dense FP16 W[N, K] (row n = output column n): one thread per (tile, group, lane).
 __global__ void nvfp4_dequant_kernel(
@@ -377,7 +544,22 @@ void LinearNVFP4::forward(
 
 	dim3 grid( n / 32 );
 
-	if ( m <= 8 ) {
+#if defined(USE_ROCM)
+	// ROCm: the skinny and fused kernels run on emulated mma (1-5 ms per call at M <= 32 on a 7900 XTX, gate_proj shape). Decode rows
+	// take the SIMT GEMV, which reads the packed weight once; the rest dequantize once into FP16 for one hipBLAS GEMM (the last branch)
+	if ( m <= ROCM_NVFP4_GEMV_MAX_ROWS ) {
+		if ( m == 1 ) rocm_nvfp4_gemv_launch<1>( codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale, stream );
+		else if ( m == 2 ) rocm_nvfp4_gemv_launch<2>( codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale, stream );
+		else if ( m <= 4 ) rocm_nvfp4_gemv_launch<4>( codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale, stream );
+		else if ( m <= 8 ) rocm_nvfp4_gemv_launch<8>( codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale, stream );
+		else rocm_nvfp4_gemv_launch<16>( codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale, stream );
+		return;
+	}
+	constexpr bool fused = false;
+#else
+	constexpr bool fused = true;
+#endif
+	if ( fused && m <= 8 ) {
 		if ( ( k / 16 ) % 16 == 0 ) {
 			skinny_nvfp4_qpn2<16, 2><<<grid, dim3( 32 * 16 ), 0, stream>>>(
 				codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale
@@ -394,12 +576,12 @@ void LinearNVFP4::forward(
 			);
 		}
 	}
-	else if ( m <= 16 ) {
+	else if ( fused && m <= 16 ) {
 		skinny_nvfp4_qpn<2><<<grid, dim3( 128 ), 0, stream>>>(
 			codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale
 		);
 	}
-	else if ( m <= NVFP4_SKINNY_MAX_ROWS ) {
+	else if ( fused && m <= NVFP4_SKINNY_MAX_ROWS ) {
 		// Up to 32 rows: the decoded weights are reused across 3 or 4 row tiles of 8
 		if ( m <= 24 ) {
 			skinny_nvfp4_qpn<3><<<grid, dim3( 128 ), 0, stream>>>(
@@ -412,7 +594,7 @@ void LinearNVFP4::forward(
 			);
 		}
 	}
-	else if ( m < 384 && ( ( n + GT_BN - 1 ) / GT_BN ) * ( ( m + GT_BM - 1 ) / GT_BM ) >= 48 ) {
+	else if ( fused && m < 384 && ( ( n + GT_BN - 1 ) / GT_BN ) * ( ( m + GT_BM - 1 ) / GT_BM ) >= 48 ) {
 		// Mid-size chunks with enough tiles to fill the GPU; at 512 rows the cuBLAS GEMM (dequantized weight reused across
 		// the whole chunk) is as fast, and narrow outputs leave most SMs idle in the fused kernel
 		nvfp4_gemm_tc_kernel<<<dim3( ( n + GT_BN - 1 ) / GT_BN, ( m + GT_BM - 1 ) / GT_BM ), dim3( 256 ), 0, stream>>>(
@@ -421,7 +603,7 @@ void LinearNVFP4::forward(
 	else {
 		// Dequantize once into FP16 and run a tensor-core HGEMM: C[m, n] = X[m, k] @ W[n, k]^T
 		int device = 0;
-		cudaGetDevice( &device );
+		(void) cudaGetDevice( &device );
 		half* w = trellis_get_recon_ws( device, static_cast<size_t>( n ) * k * sizeof( half ) );
 		const size_t threads_total = static_cast<size_t>( n / 32 ) * ( k / 16 ) * 32;
 		nvfp4_dequant_kernel<<<static_cast<unsigned>( ( threads_total + 255 ) / 256 ), 256, 0, stream>>>(

@@ -130,8 +130,8 @@ int main( int argc, char** argv ) {
 	engine::comm::destroy_4gpu_mesh( staging_ptrs, flag_ptrs );
 
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		cudaSetDevice( d );
-		cudaDeviceReset();
+		(void) cudaSetDevice( d );
+		(void) cudaDeviceReset();
 	}
 
 	ENGINE_ASSERT( max_latency <= 12.0, "Latency exceeds 12.0 us limit" );

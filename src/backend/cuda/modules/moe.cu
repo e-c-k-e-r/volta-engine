@@ -535,7 +535,7 @@ void MoERouter::exl3_moe_dispatch(
 ) {
 	const int n = top_k * rows;
 	int device = 0;
-	cudaGetDevice( &device );
+	(void) cudaGetDevice( &device );
 	int* locks = engine::modules::trellis_get_locks( device );
 	int* sched = locks + MOE_SCHED_OFFSET;
 	int num_groups = 1;
@@ -892,7 +892,7 @@ void exl3_moe(
 	(void) gate_mcg; (void) gate_mul1; (void) up_mcg; (void) up_mul1; (void) down_mcg; (void) down_mul1;
 	(void) num_active;
 	int device = 0;
-	cudaGetDevice( &device );
+	(void) cudaGetDevice( &device );
 	int num_sms = engine::modules::trellis_get_num_sms( device );
 	int* locks = engine::modules::trellis_get_locks( device );
 
@@ -967,12 +967,20 @@ void exl3_moe(
 	if ( variant == 0 ) moe_fn = wide == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0>;
 	else if ( variant == 1 ) moe_fn = wide == 2 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<3, 128, 2, 0>;
 	else moe_fn = wide == 2 ? (void*) exl3_moe_kernel<4, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 0>;
+#if defined(USE_ROCM)
+	// RDNA grants a workgroup 64 KB, below the 90 KB cap the CUDA launch reserves: request what the tile uses (the 16-row tile's
+	// footprint, ~22 KB at most; the decode variant's 4-row tile needs less)
+	const size_t moe_smem = static_cast<size_t>( exl3_gemm_smem_bytes( 16, MOE_TILESIZE_K, tile128 ? 128 : 256, MOE_SH_STAGES, MOE_FRAG_STAGES, K_gate, false ) );
+	ENGINE_ASSERT( moe_smem <= static_cast<size_t>( rocm_smem_optin_max() ), "exl3_moe: tile shared memory above the device limit" );
+#else
+	const size_t moe_smem = SMEM_MAX;
+#endif
 	CUDA_CHECK( cudaLaunchKernel(
 		moe_fn,
 		grid_dim,
 		dim3( block_dim ),
 		kernel_args,
-		SMEM_MAX,
+		moe_smem,
 		stream
 	) );
 }

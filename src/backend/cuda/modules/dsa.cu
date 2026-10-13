@@ -268,7 +268,7 @@ void DSA::project_small( const half* w, const half* x, half* proj, int rows, int
 
 void DSA::project_large( const half* w, const half* x, half* proj, int rows, int n, int k, cudaStream_t stream ) {
 	int device = 0;
-	cudaGetDevice( &device );
+	(void) cudaGetDevice( &device );
 	cublasHandle_t h = trellis_get_cublas( device );
 	cublasSetStream( h, stream );
 	const float one = 1.0f, zero = 0.0f;

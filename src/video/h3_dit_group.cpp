@@ -96,7 +96,7 @@ bool H3DiTGroup::load( const char* checkpoint, const std::vector<int>& devices, 
 			if ( !can ) { LOG_ERROR( "H3: GPU %d cannot access GPU %d", devices[a], devices[b] ); return false; }
 			const cudaError_t e = cudaDeviceEnablePeerAccess( devices[b], 0 );
 			if ( e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled ) { LOG_ERROR( "H3: peer access failed" ); return false; }
-			cudaGetLastError();
+			(void) cudaGetLastError();
 		}
 	}
 	s.dits.resize( n );
@@ -238,13 +238,13 @@ bool H3DiTGroup::forward( const H3HostRequest& hr, std::vector<float>* video_out
 					CUDA_CHECK( cudaMemcpy( video_out->data(), d_vo, video_out->size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
 					CUDA_CHECK( cudaMemcpy( audio_out->data(), d_ao, audio_out->size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
 				}
-				cudaFree( d_vo ); cudaFree( d_ao );
+				(void) cudaFree( d_vo ); (void) cudaFree( d_ao );
 			} else {
 				s.dits[r]->forward_sp( q, vall.data(), aall.data() );
 				CUDA_CHECK( cudaDeviceSynchronize() );
 			}
 			for ( void* ptr : { static_cast<void*>( d_v ), static_cast<void*>( d_a ), static_cast<void*>( d_p ), static_cast<void*>( d_pos ), static_cast<void*>( d_img ),
-				static_cast<void*>( d_aud ), static_cast<void*>( d_txt ), static_cast<void*>( d_tags ), static_cast<void*>( d_inv ), static_cast<void*>( d_mask ) } ) { cudaFree( ptr ); }
+				static_cast<void*>( d_aud ), static_cast<void*>( d_txt ), static_cast<void*>( d_tags ), static_cast<void*>( d_inv ), static_cast<void*>( d_mask ) } ) { (void) cudaFree( ptr ); }
 		} );
 	}
 	for ( auto& t : threads ) { t.join(); }

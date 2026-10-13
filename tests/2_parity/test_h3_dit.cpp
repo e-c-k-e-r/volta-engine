@@ -81,7 +81,7 @@ int main( int argc, char** argv ) {
 	std::vector<float> vrows( static_cast<size_t>( n_img ) * 96 ), arows( static_cast<size_t>( n_audio ) * 32 );
 	for ( int i = 0; i < n_img; ++i ) { std::memcpy( &vrows[static_cast<size_t>( i ) * 96], h_x + static_cast<size_t>( h_img[i] ) * 96, 96 * sizeof( float ) ); }
 	for ( int i = 0; i < n_audio; ++i ) { std::memcpy( &arows[static_cast<size_t>( i ) * 32], h_ax + static_cast<size_t>( h_aud[i] ) * 32, 32 * sizeof( float ) ); }
-	cudaFree( d_video );
+	(void) cudaFree( d_video );
 	float *d_vrows, *d_arows;
 	CUDA_CHECK( cudaMalloc( &d_vrows, vrows.size() * 4 ) );
 	CUDA_CHECK( cudaMalloc( &d_arows, arows.size() * 4 ) );

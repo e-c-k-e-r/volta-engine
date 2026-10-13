@@ -4,6 +4,9 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#if defined(USE_ROCM)
+	#include "../../../kernels/cuda/mma_emu.h"
+#endif
 #include <cmath>
 
 namespace engine::modules {
@@ -370,12 +373,17 @@ constexpr int kMmaKeys = 64;
 constexpr int kMmaVs = 80;   // halves per transposed V row: 40 words, 8 mod 32, so a half-warp's 8-byte reads hit distinct banks
 
 __device__ __forceinline__ void vis_mma( float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1 ) {
+#if defined(USE_ROCM)
+	const uint32_t a[2] = { a0, a1 }, b[2] = { b0, b1 };
+	mma_emu_m8n8k4_f32( a, b, c, threadIdx.x & 31, rocm_shfl() );
+#else
 	asm volatile (
 		"mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
 		"{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
 		: "+f"( c[0] ), "+f"( c[1] ), "+f"( c[2] ), "+f"( c[3] ), "+f"( c[4] ), "+f"( c[5] ), "+f"( c[6] ), "+f"( c[7] )
 		: "r"( a0 ), "r"( a1 ), "r"( b0 ), "r"( b1 )
 	);
+#endif
 }
 
 template <int HD>
@@ -587,7 +595,7 @@ void Vision::pos_interp( const backend::half_t* table, backend::half_t* out, int
 void Vision::patch_embed( const half* patches, const half* w, const half* bias, const half* add, float* out,
 	int m, int n, int k, cudaStream_t stream ) {
 	int device = 0;
-	cudaGetDevice( &device );
+	(void) cudaGetDevice( &device );
 	// FP32 output straight from the tensor-core GEMM: C^T[n, m] = W[n, k] A^T with W and A row-major (k fastest).
 	cublasHandle_t h = trellis_get_cublas( device );
 	cublasSetStream( h, stream );
@@ -619,7 +627,7 @@ void Vision::merge_gather( const half* h, half* out, int tokens, int n, int grou
 
 void Vision::dense_gemm( const half* a, const half* w, half* out, int m, int n, int k, cudaStream_t stream ) {
 	int device = 0;
-	cudaGetDevice( &device );
+	(void) cudaGetDevice( &device );
 	cublasHandle_t h = trellis_get_cublas( device );
 	cublasSetStream( h, stream );
 	const float alpha = 1.0f, beta = 0.0f;
@@ -643,20 +651,39 @@ void Vision::qkv_bias_rope( half* q, half* k, half* v, const half* bq, const hal
 	qkv_bias_rope_kernel<<<m, 256, 0, stream>>>( q, k, v, bq, bk, bv, cos_table, sin_table, heads, head_dim );
 }
 
+// Compute capability major of the current device (cached per device)
+static int vision_cc_major() {
+	static int major[ENGINE_NUM_GPUS] = {};
+	int device = 0;
+	(void) cudaGetDevice( &device );
+	if ( device < 0 || device >= ENGINE_NUM_GPUS ) device = 0;
+	if ( major[device] == 0 ) (void) cudaDeviceGetAttribute( &major[device], cudaDevAttrComputeCapabilityMajor, device );
+	return major[device];
+}
+
 void Vision::attention( const half* q, const half* k, const half* v, half* out, int m, int heads, int head_dim, float scale, cudaStream_t stream ) {
 	ENGINE_ASSERT( head_dim <= kTcDim, "Vision::attention: head_dim too large" );
 	const dim3 mgrid( ( m + kMmaWarps * 16 - 1 ) / ( kMmaWarps * 16 ), heads );
-	if ( head_dim == 64 ) {
+	// attention_mma_kernel is built on the Volta m8n8k4; SM_80+ runs the wmma kernel, native there
+	const bool volta_mma = vision_cc_major() < 8;
+	if ( volta_mma && head_dim == 64 ) {
 		attention_mma_kernel<64><<<mgrid, kMmaWarps * 32, 0, stream>>>( q, k, v, out, m, heads, scale );
 		return;
 	}
-	if ( head_dim == 72 ) {
+	if ( volta_mma && head_dim == 72 ) {
 		attention_mma_kernel<72><<<mgrid, kMmaWarps * 32, 0, stream>>>( q, k, v, out, m, heads, scale );
 		return;
 	}
+#if defined(USE_ROCM)
+	// The WMMA kernel stages ~75 KB; RDNA grants a workgroup 64 KB
+	if ( kTcSmemBytes > static_cast<size_t>( rocm_smem_optin_max() ) ) {
+		attention_simt( q, k, v, out, m, heads, head_dim, scale, stream );
+		return;
+	}
+#endif
 	static bool opted_in = false;
 	if ( !opted_in ) {
-		cudaFuncSetAttribute( attention_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( kTcSmemBytes ) );
+		(void) cudaFuncSetAttribute( attention_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( kTcSmemBytes ) );
 		opted_in = true;
 	}
 	const dim3 grid( ( m + kTcQ - 1 ) / kTcQ, heads );

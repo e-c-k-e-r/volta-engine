@@ -1,6 +1,6 @@
 # ops_tests_attention: op-level golden test targets for one Wave 3 lane (built in the CUDA configuration for --dump and in the CPU configuration for --check)
 # test_ops_attention: attention, MLA latent, mHC, DSA, GDN / KDA through the module API (tests/2_parity/test_ops_attention.cpp)
-if(ENGINE_BACKEND STREQUAL "CUDA")
+if(ENGINE_GPU)
 	add_executable(test_ops_attention tests/2_parity/test_ops_attention.cpp)
 	target_link_libraries(test_ops_attention PRIVATE engine_kernels)
 	set_target_properties(test_ops_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

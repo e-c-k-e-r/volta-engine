@@ -19,25 +19,25 @@ void exl3_gemm_reset_caches() {
 void exl3_gemm_init_all_attrs( int device ) {
 	if ( device < 0 || device >= ENGINE_NUM_GPUS ) device = 0;
 	int orig_dev = 0;
-	cudaGetDevice( &orig_dev );
-	cudaSetDevice( device );
+	(void) cudaGetDevice( &orig_dev );
+	(void) cudaSetDevice( device );
 	for ( int K = 1; K <= 8; ++K ) {
 		for ( int cb = 0; cb <= 2; ++cb ) {
 			for ( int shape_idx = 1; shape_idx <= 4; ++shape_idx ) {
 				fp_exl3_gemm_kernel k_fp16 = get_gemm_kernel_ptr( K, shape_idx, false, cb );
 				if ( k_fp16 && g_gemm_attr_set[device].find( (void*) k_fp16 ) == g_gemm_attr_set[device].end() ) {
-					cudaFuncSetAttribute( (void*) k_fp16, cudaFuncAttributeMaxDynamicSharedMemorySize, ENGINE_MAX_SMEM );
+					(void) cudaFuncSetAttribute( (void*) k_fp16, cudaFuncAttributeMaxDynamicSharedMemorySize, ENGINE_MAX_SMEM );
 					g_gemm_attr_set[device].insert( (void*) k_fp16 );
 				}
 				fp_exl3_gemm_kernel k_fp32 = get_gemm_kernel_ptr( K, shape_idx, true, cb );
 				if ( k_fp32 && g_gemm_attr_set[device].find( (void*) k_fp32 ) == g_gemm_attr_set[device].end() ) {
-					cudaFuncSetAttribute( (void*) k_fp32, cudaFuncAttributeMaxDynamicSharedMemorySize, ENGINE_MAX_SMEM );
+					(void) cudaFuncSetAttribute( (void*) k_fp32, cudaFuncAttributeMaxDynamicSharedMemorySize, ENGINE_MAX_SMEM );
 					g_gemm_attr_set[device].insert( (void*) k_fp32 );
 				}
 			}
 		}
 	}
-	cudaSetDevice( orig_dev );
+	(void) cudaSetDevice( orig_dev );
 }
 
 void exl3_gemm(
@@ -58,9 +58,9 @@ void exl3_gemm(
 	int force_shape
 ) {
 	int device = 0;
-	cudaGetDevice( &device );
-	int num_sms = ENGINE_SM_COUNT;
-	int cc = CC_OLD;
+	(void) cudaGetDevice( &device );
+	int num_sms = engine::modules::trellis_get_num_sms( device );
+	int cc = engine::modules::trellis_get_cc( device );
 	int* locks = engine::modules::trellis_get_locks( device );
 
 	int cb = 0;

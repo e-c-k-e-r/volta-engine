@@ -8,6 +8,34 @@ CUDA 12.x (13+ drops SM_70) and CMake 3.24+ with Ninja. The CUDA build is the pr
 cmake -S . -B build -G Ninja && cmake --build build
 ```
 
+### Other GPUs (SM_86, SM_89)
+
+The CUDA build targets SM_70 (V100) by default. Ampere (SM_86: RTX 30xx, A10, A40) and Ada (SM_89: RTX 40xx, L4, L40) build from the
+same sources; pick the targets with `CMAKE_CUDA_ARCHITECTURES` (several at once give one binary for all of them):
+
+```
+cmake -S . -B build -G Ninja -DCMAKE_CUDA_ARCHITECTURES="70;86;89"   # or 86, 89, native
+```
+
+CUDA 12.x builds all three; CUDA 13 builds 86 / 89 only (configuration fails if 70 is in the list). On SM_86 / SM_89:
+* the EXL3 GEMM / GEMV and the cooperative MoE decode kernel take their native `mma.m16n8k16` / `ldmatrix` / `cp.async` paths (the
+  upstream exllamav3 ones). Fallbacks if a native path misbehaves on a card: `-DENGINE_EXL3_FORCE_VOLTA_MMA=ON` keeps the Volta
+  `m8n8k4` GEMM inner loop everywhere, `-DCMAKE_CUDA_FLAGS=-DMOE_COOP_M8N8K4=1` the Volta MoE tile
+* the NVFP4 skinny / MoE kernels and the prefill attention kernels (dense, MLA latent, sparse latent) have `mma.m16n8k16` paths
+  over the same tiles and shared-memory staging as their Volta `m8n8k4` forms; the vision tower takes its WMMA attention kernel. No
+  `m8n8k4` (which SM_80+ only emulates, at ~80 instructions each) runs there. The fragment maps are checked on the CPU by
+  `test_mma_frag`; numerics match the Volta path up to FP32 summation order
+* the EXL3 launch choices follow the card: GEMM tile shapes, GEMV configurations and the int8 GEMV's highest bit rate use upstream
+  exllamav3's per-architecture tables on SM_86 / SM_89 (the V100 ones are this engine's own measurements); the GEMV kernels for 5 and
+  6 bpw are V100-only, as upstream runs those rates through the GEMM
+* the SM count is read from the device at startup (cooperative / persistent grids are sized to it). `-DENGINE_SM_COUNT=N` caps it,
+  `-DENGINE_MAX_SMEM=bytes` changes the opt-in shared memory the big kernels request (default 98304, allowed by all three)
+* startup prints each GPU's architecture and SM count, and warns when the build has no code for a card
+* tensor parallelism needs peer access between the cards (NVLink, or PCIe P2P where the driver allows it; GeForce 40xx cards do
+  not), so a single consumer card runs `tp` 1
+
+AMD RDNA GPUs (RX 7000 / 9000) build with `-DENGINE_BACKEND=ROCM`: see [ROCM.md](ROCM.md).
+
 CPU and Vulkan builds are separate build trees (no CUDA toolchain needed):
 
 ```

@@ -1,6 +1,16 @@
 #pragma once
 #include <cuda/atomic>
 #include "arch.cuh"
+#if defined(USE_ROCM)
+	// ROCm forms of the PTX below: tensor-core operations emulated in NVIDIA's fragment layouts (mma_emu.h, checked on the CPU by
+	// test_mma_frag), memory-model operations as HIP atomics with the matching scope, cp.async as a synchronous copy (as on SM_70)
+	#include "../mma_emu.h"
+	#define PTX_SYNC_COPY 1
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+	#define PTX_SYNC_COPY 1
+#else
+	#define PTX_SYNC_COPY 0
+#endif
 
 template <typename T, int n>
 struct Vec {
@@ -21,6 +31,9 @@ __device__ inline void ptx_mma_m8n8k4(
 	const uint32_t* a = reinterpret_cast<const uint32_t*>( &frag_a );
 	const uint32_t* b = reinterpret_cast<const uint32_t*>( &frag_b );
 	float* c = reinterpret_cast<float*>( &frag_c );
+#if defined(USE_ROCM)
+	mma_emu_m8n8k4_f32( a, b, c, threadIdx.x & 31, rocm_shfl() );
+#else
 	const float* d = reinterpret_cast<const float*>( &frag_c );
 
 	asm (
@@ -31,6 +44,7 @@ __device__ inline void ptx_mma_m8n8k4(
 		  "r"( b[0] ), "r"( b[1] ),
 		  "f"( d[0] ), "f"( d[1] ), "f"( d[2] ), "f"( d[3] ), "f"( d[4] ), "f"( d[5] ), "f"( d[6] ), "f"( d[7] )
 	);
+#endif
 }
 
 __device__ inline void volta_mma_m8n8k4(
@@ -40,6 +54,10 @@ __device__ inline void volta_mma_m8n8k4(
 	uint32_t b1,
 	float* d
 ) {
+#if defined(USE_ROCM)
+	const uint32_t a[2] = { a0, a1 }, b[2] = { b0, b1 };
+	mma_emu_m8n8k4_f32( a, b, d, threadIdx.x & 31, rocm_shfl() );
+#else
 	asm (
 		"mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
 		"{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%12,%13,%14,%15,%16,%17,%18,%19};\n"
@@ -50,6 +68,7 @@ __device__ inline void volta_mma_m8n8k4(
 		  "f"( d[0] ), "f"( d[1] ), "f"( d[2] ), "f"( d[3] ),
 		  "f"( d[4] ), "f"( d[5] ), "f"( d[6] ), "f"( d[7] )
 	);
+#endif
 }
 
 __device__ inline void volta_d_slot( int lane, int reg, int* m, int* n ) {
@@ -67,7 +86,10 @@ __device__ inline void ptx_mma_m16n8k16(
 	const FragB& frag_b,
 	FragC& frag_c
 ) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+#if defined(USE_ROCM)
+	mma_emu_m16n8k16_f32( reinterpret_cast<const uint32_t*>( &frag_a ), reinterpret_cast<const uint32_t*>( &frag_b ),
+		reinterpret_cast<float*>( &frag_c ), threadIdx.x & 31, rocm_shfl() );
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
 	const int lane = threadIdx.x & 31;
 	const int g = lane >> 2, tig = lane & 3;
 	const half2* fa = reinterpret_cast<const half2*>( &frag_a );
@@ -133,7 +155,10 @@ __device__ inline void ptx_mma_m16n8k16(
 	const FragB& frag_b,
 	FragC_h& frag_c
 ) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+#if defined(USE_ROCM)
+	mma_emu_m16n8k16_f16( reinterpret_cast<const uint32_t*>( &frag_a ), reinterpret_cast<const uint32_t*>( &frag_b ),
+		reinterpret_cast<uint32_t*>( &frag_c ), threadIdx.x & 31, rocm_shfl() );
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
 	const int lane = threadIdx.x & 31;
 	const int g = lane >> 2, tig = lane & 3;
 	const half2* fa = reinterpret_cast<const half2*>( &frag_a );
@@ -188,7 +213,11 @@ __device__ inline void barrier_acquire( int* lock, int stage ) {
 	if ( threadIdx.x == 0 ) {
 		volatile int state = -1;
 		do {
+#if defined(USE_ROCM)
+			state = __hip_atomic_load( lock, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT );
+#else
 			asm volatile ( "ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"( state ) : "l"( lock ) );
+#endif
 		} while ( state != stage );
 	}
 	__syncthreads();
@@ -201,13 +230,17 @@ __device__ inline void barrier_release( int* lock, int val, bool reset ) {
 			*lock = 0;
 			return;
 		}
+#if defined(USE_ROCM)
+		__hip_atomic_fetch_add( lock, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT );
+#else
 		asm volatile ( "fence.acq_rel.gpu;\n" );
 		asm volatile ( "red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"( lock ), "r"( val ) );
+#endif
 	}
 }
 
 __device__ inline void cp_async_pred( void* smem_ptr, const void* glob_ptr, bool pred = true ) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+#if PTX_SYNC_COPY
 	if ( pred ) {
 		uint4 v = *reinterpret_cast<const uint4*>( glob_ptr );
 		*reinterpret_cast<uint4*>( smem_ptr ) = v;
@@ -226,7 +259,7 @@ __device__ inline void cp_async_pred( void* smem_ptr, const void* glob_ptr, bool
 }
 
 __device__ inline void cp_async( void* smem_ptr, const void* glob_ptr ) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+#if PTX_SYNC_COPY
 	uint4 v = *reinterpret_cast<const uint4*>( glob_ptr );
 	*reinterpret_cast<uint4*>( smem_ptr ) = v;
 #else
@@ -241,7 +274,7 @@ __device__ inline void cp_async( void* smem_ptr, const void* glob_ptr ) {
 }
 
 __device__ inline void cp_async_stream( void* smem_ptr, const void* glob_ptr ) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+#if PTX_SYNC_COPY
 	uint4 v = *reinterpret_cast<const uint4*>( glob_ptr );
 	*reinterpret_cast<uint4*>( smem_ptr ) = v;
 #else
@@ -271,7 +304,18 @@ __device__ inline void cp_async_wait() {
 }
 
 __device__ inline void ldsm4( FragA& frag_a, const void* smem_ptr ) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 750)
+#if defined(USE_ROCM)
+	// ldmatrix.x4: lanes 8i..8i+7 supply the row addresses of matrix i; lane l takes, of each, row l / 4, halves 2 (l % 4) and + 1
+	const int lane = threadIdx.x & 31;
+	const unsigned long long base = reinterpret_cast<unsigned long long>( smem_ptr );
+	uint32_t* r = reinterpret_cast<uint32_t*>( &frag_a );
+	#pragma unroll
+	for ( int j = 0; j < 4; ++j ) {
+		const unsigned long long row = __shfl( base, j * 8 + ( lane >> 2 ) );
+		r[j] = *reinterpret_cast<const uint32_t*>( row + ( lane & 3 ) * 4 );
+	}
+	return;
+#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 750)
 	uint32_t addr = static_cast<uint32_t>( __cvta_generic_to_shared( smem_ptr ) );
 	const int lane = threadIdx.x & 31;
 	uint32_t* r = reinterpret_cast<uint32_t*>( &frag_a );
@@ -291,6 +335,41 @@ __device__ inline void ldsm4( FragA& frag_a, const void* smem_ptr ) {
 #endif
 }
 
+#if defined(USE_ROCM)
+__device__ inline uint32_t mul_lo_u32( uint32_t x, uint32_t y ) { return x * y; }
+__device__ inline uint32_t mul_hi_u32( uint32_t x, uint32_t y ) { return __umulhi( x, y ); }
+// Write-through / volatile (st.wt, ld.cv) and acquire / release at system scope: the cross-device flags of the collectives
+__device__ __forceinline__ void stg_wt_u32( uint32_t* p, uint32_t v ) { __hip_atomic_store( p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM ); }
+__device__ __forceinline__ void stg_wt_u128( uint4* p, const uint4 v ) {
+	uint32_t* q = reinterpret_cast<uint32_t*>( p );
+	__hip_atomic_store( q + 0, v.x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM );
+	__hip_atomic_store( q + 1, v.y, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM );
+	__hip_atomic_store( q + 2, v.z, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM );
+	__hip_atomic_store( q + 3, v.w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM );
+}
+__device__ __forceinline__ uint32_t ldg_cv_u32( const uint32_t* p ) { return __hip_atomic_load( p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM ); }
+__device__ __forceinline__ uint4 ldg_cv_u128( const uint4* p ) {
+	const uint32_t* q = reinterpret_cast<const uint32_t*>( p );
+	uint4 v;
+	v.x = __hip_atomic_load( q + 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM );
+	v.y = __hip_atomic_load( q + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM );
+	v.z = __hip_atomic_load( q + 2, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM );
+	v.w = __hip_atomic_load( q + 3, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM );
+	return v;
+}
+__device__ __forceinline__ uint32_t ldg_acquire_sys_u32( const uint32_t* p ) { return __hip_atomic_load( p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM ); }
+__device__ __forceinline__ uint64_t ldg_acquire_sys_u64( const uint64_t* p ) { return __hip_atomic_load( p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM ); }
+__device__ __forceinline__ void stg_release_sys_u32( uint32_t* p, uint32_t v ) { __hip_atomic_store( p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM ); }
+__device__ __forceinline__ void stg_release_sys_u64( uint64_t* p, uint64_t v ) { __hip_atomic_store( p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM ); }
+// Nanoseconds from the constant-rate counter (100 MHz on RDNA: hipDeviceAttributeWallClockRate). Diagnostics only
+__device__ __forceinline__ uint64_t globaltimer_ns() { return wall_clock64() * 10ull; }
+static __forceinline__ __device__ uint32_t bfe64( uint32_t lo, uint32_t hi, int offset, int length ) {
+	const uint64_t value = ( static_cast<uint64_t>( hi ) << 32 ) | static_cast<uint64_t>( lo );
+	return static_cast<uint32_t>( ( value >> offset ) & ( length >= 64 ? ~0ull : ( ( 1ull << length ) - 1 ) ) );
+}
+#define FSHF_IMM(dst, lo, hi, imm) ( (dst) = __funnelshift_r( (lo), (hi), (imm) ) )
+#define BFE16_IMM(dst, src, imm) ( (dst) = ( (uint32_t) (src) >> (imm) ) & 0xffffu )
+#else
 __device__ inline uint32_t mul_lo_u32( uint32_t x, uint32_t y ) {
 	uint32_t w;
 	asm volatile (
@@ -375,6 +454,7 @@ static __forceinline__ __device__ uint32_t bfe64( uint32_t lo, uint32_t hi, int 
 
 #define FSHF_IMM(dst, lo, hi, imm) asm("shf.r.wrap.b32 %0, %1, %2, " #imm ";" : "=r"(dst) : "r"(lo), "r"(hi))
 #define BFE16_IMM(dst, src, imm) asm("bfe.u32 %0, %1, " #imm ", 16;" : "=r"(dst) : "r"(src))
+#endif // USE_ROCM
 
 __device__ inline void group_barrier(
 	int group_id,

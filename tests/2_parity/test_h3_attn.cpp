@@ -33,7 +33,7 @@ static int check( int qr, int kr, int heads, bool causal, int chunks = 1, int D 
 			engine::video::h3_attention_partial( dq, dk + off, dv + off, dout, so, sml, qr, k1 - k0, heads, scale, c == 0, k1 == kr, nullptr );
 		}
 		CUDA_CHECK( cudaDeviceSynchronize() );
-		cudaFree( so ); cudaFree( sml );
+		(void) cudaFree( so ); (void) cudaFree( sml );
 	}
 	CUDA_CHECK( cudaDeviceSynchronize() );
 	CUDA_CHECK( cudaMemcpy( o.data(), dout, o.size() * 2, cudaMemcpyDeviceToHost ) );
@@ -59,7 +59,7 @@ static int check( int qr, int kr, int heads, bool causal, int chunks = 1, int D 
 		}
 	}
 	std::printf( "q %5d k %5d heads %d %-7s: D %d max abs error %.4g\n", qr, kr, heads, chunks > 1 ? "chunked" : causal ? "causal" : "full", D, worst );
-	cudaFree( dq ); cudaFree( dk ); cudaFree( dv ); cudaFree( dout );
+	(void) cudaFree( dq ); (void) cudaFree( dk ); (void) cudaFree( dv ); (void) cudaFree( dout );
 	return worst > 0.01 ? 1 : 0;
 }
 

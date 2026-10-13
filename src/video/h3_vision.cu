@@ -20,9 +20,9 @@ H3VisionTower::H3VisionTower() : p_( new Impl ) {}
 
 H3VisionTower::~H3VisionTower() {
 	if ( p_ ) {
-		if ( p_->stream ) { cudaStreamSynchronize( p_->stream ); }
+		if ( p_->stream ) { (void) cudaStreamSynchronize( p_->stream ); }
 		if ( p_->arena.base_ptr ) { engine::core::arena_destroy( p_->arena ); }
-		if ( p_->stream ) { cudaStreamDestroy( p_->stream ); }
+		if ( p_->stream ) { (void) cudaStreamDestroy( p_->stream ); }
 		delete p_;
 	}
 }

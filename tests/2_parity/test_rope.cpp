@@ -29,7 +29,7 @@ static bool run( bool interleaved, cudaStream_t stream, pod::MemoryArena& arena 
 	std::vector<half> oq( hq.size() ), ok( hk.size() );
 	CUDA_CHECK( cudaMemcpy( oq.data(), dq.data, oq.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
 	CUDA_CHECK( cudaMemcpy( ok.data(), dk.data, ok.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
-	cudaFree( d_rows );
+	(void) cudaFree( d_rows );
 
 	auto check = [&]( const std::vector<half>& in, const std::vector<half>& out, int heads ) {
 		double dot = 0, na = 0, nb = 0, worst = 0;

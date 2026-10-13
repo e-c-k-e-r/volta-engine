@@ -605,9 +605,9 @@ bool H3VideoVAE::load( const char* dir, int device, int max_tokens, H3StageGroup
 	CUDA_CHECK( cudaDeviceSynchronize() ); // loading ran on the default stream; the models run on non-blocking streams, which it does not order against
 	delete s.stager;
 	s.stager = nullptr;
-	cudaFree( s.staging );
+	(void) cudaFree( s.staging );
 	s.staging = nullptr;
-	cudaStreamDestroy( s.lstream );
+	(void) cudaStreamDestroy( s.lstream );
 	s.lstream = nullptr;
 	guard.ok = true;
 	return true;

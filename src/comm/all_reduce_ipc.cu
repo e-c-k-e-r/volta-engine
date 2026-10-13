@@ -7,6 +7,10 @@ namespace engine::comm {
 // One staging slot per (stage, rank). Sized for a 512-row prefill chunk at hidden 5120 (5 MiB); 16 slots per device.
 #define IPC_SLOT_BYTES ( 6 * 1024 * 1024 )
 
+#if defined(USE_ROCM)
+__device__ __forceinline__ uint32_t ldg_acquire_sys_u32( const uint32_t* p ) { return __hip_atomic_load( p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM ); }
+__device__ __forceinline__ void stg_release_sys_u32( uint32_t* p, uint32_t v ) { __hip_atomic_store( p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM ); }
+#else
 __device__ __forceinline__ uint32_t ldg_acquire_sys_u32( const uint32_t* p ) {
 	uint32_t v;
 	asm volatile ( "ld.global.acquire.sys.u32 %0, [%1];" : "=r"( v ) : "l"( p ) : "memory" );
@@ -16,6 +20,7 @@ __device__ __forceinline__ uint32_t ldg_acquire_sys_u32( const uint32_t* p ) {
 __device__ __forceinline__ void stg_release_sys_u32( uint32_t* p, uint32_t v ) {
 	asm volatile ( "st.global.release.sys.u32 [%0], %1;" :: "l"( p ), "r"( v ) : "memory" );
 }
+#endif
 
 // Flag page layout (per rank, uint32 words): [stage(4)][row(512)][rank(4)] publish flags,
 // then a device-resident sequence counter and a block-retire counter. Sequence numbers live
@@ -523,8 +528,8 @@ void init_4gpu_mesh(
 		CUDA_CHECK( cudaSetDevice( d ) );
 		for ( int peer = 0; peer < ranks; ++peer ) {
 			if ( peer != d ) {
-				cudaDeviceEnablePeerAccess( peer, 0 );
-				cudaGetLastError();
+				(void) cudaDeviceEnablePeerAccess( peer, 0 );
+				(void) cudaGetLastError();
 			}
 		}
 		ENGINE_ASSERT( staging_bytes >= kMeshStagingBytes, "init_4gpu_mesh: staging too small for 16 slots" );

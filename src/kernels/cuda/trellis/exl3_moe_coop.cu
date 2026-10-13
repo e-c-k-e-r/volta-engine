@@ -12,9 +12,14 @@ namespace cg = cooperative_groups;
 #include "exl3_moe_coop.cuh"
 #include "trellis_context.h"
 
-// 1: real Volta m8n8k4 tile (FP32 accumulate); 0: shuffle/HFMA2 emulation of m16n8k16
+// 1: real Volta m8n8k4 tile (FP32 accumulate); 0: m16n8k16 (native on SM_80+, shuffle/HFMA2 emulation on SM_70). Per device pass:
+// SM_80+ has no native m8n8k4 (ptxas expands each into ~80 FFMA / SHFL instructions)
 #ifndef MOE_COOP_M8N8K4
-#define MOE_COOP_M8N8K4 1
+	#if defined(USE_ROCM) || ( defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) )
+		#define MOE_COOP_M8N8K4 0
+	#else
+		#define MOE_COOP_M8N8K4 1
+	#endif
 #endif
 
 namespace exl3_moe_coop_ns {
@@ -418,9 +423,13 @@ __device__ __forceinline__ void gemv_tile(
 }
 
 __device__ __forceinline__ int dp4a_us_c( uint32_t a, uint32_t b, int c ) {
+#if defined(USE_ROCM)
+	return static_cast<int>( rocm_dp4a_us( a, b, static_cast<unsigned int>( c ) ) );
+#else
 	int d;
 	asm ( "dp4a.u32.s32 %0, %1, %2, %3;" : "=r"( d ) : "r"( a ), "r"( b ), "r"( c ) );
 	return d;
+#endif
 }
 
 // GEMV tile on int8 activations for runs of up to R rows (the mul1 codebook is affine in the byte sum of x * 0x83DCD12D, so one

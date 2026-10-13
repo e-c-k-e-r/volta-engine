@@ -86,7 +86,7 @@ bool H3TextGroup::encode_mm( const std::vector<int>& ids, int image_token_id, co
 			float* out = d_out;
 			if ( r > 0 ) { CUDA_CHECK( cudaMalloc( &out, ids.size() * 5120 * sizeof( float ) ) ); } // the other ranks end with the same hidden states; only rank 0's are returned
 			if ( !s.encs[r]->encode_mm( ids, image_token_id, images, out ) ) { ok = 0; }
-			if ( r > 0 ) { cudaFree( out ); }
+			if ( r > 0 ) { (void) cudaFree( out ); }
 		} );
 	}
 	for ( auto& t : threads ) { t.join(); }

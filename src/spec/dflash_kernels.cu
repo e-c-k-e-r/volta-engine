@@ -1004,13 +1004,13 @@ void dflash2_topk(
 
 	int required_capacity = num_rows * splits * k;
 	if ( required_capacity > s_alloc_capacity ) {
-		if ( s_part_v ) cudaFree( s_part_v );
-		if ( s_part_ix ) cudaFree( s_part_ix );
-		if ( s_counters ) cudaFree( s_counters );
-		cudaMalloc( &s_part_v, required_capacity * sizeof( float ) );
-		cudaMalloc( &s_part_ix, required_capacity * sizeof( int ) );
-		cudaMalloc( &s_counters, num_rows * sizeof( int ) );
-		cudaMemset( s_counters, 0, num_rows * sizeof( int ) );
+		if ( s_part_v ) (void) cudaFree( s_part_v );
+		if ( s_part_ix ) (void) cudaFree( s_part_ix );
+		if ( s_counters ) (void) cudaFree( s_counters );
+		(void) cudaMalloc( &s_part_v, required_capacity * sizeof( float ) );
+		(void) cudaMalloc( &s_part_ix, required_capacity * sizeof( int ) );
+		(void) cudaMalloc( &s_counters, num_rows * sizeof( int ) );
+		(void) cudaMemset( s_counters, 0, num_rows * sizeof( int ) );
 		s_alloc_capacity = required_capacity;
 	}
 
@@ -1173,7 +1173,7 @@ void engine::modules::LinearPlainGEMV::forward(
 	if ( m >= 128 ) {
 		// Many rows (an unquantized vision tower, prefill chunks): the tensor-core HGEMM; the skinny GEMV reads the whole weight once per few rows
 		int device = 0;
-		cudaGetDevice( &device );
+		(void) cudaGetDevice( &device );
 		cublasHandle_t h = engine::modules::trellis_get_cublas( device );
 		cublasSetStream( h, stream );
 		const float one = 1.0f, zero = 0.0f;

@@ -103,7 +103,7 @@ void Generator::admit_pending() {
 	for ( int s = 0; s < num_slots_ && !pending_queue_.empty(); ++s ) {
 		Slot& slot = slots_[s];
 		if ( slot.active ) continue;
-		slot = Slot{};
+		slot = Slot();
 		slot.active = true;
 		slot.req = std::move( pending_queue_.front() );
 		pending_queue_.erase( pending_queue_.begin() );

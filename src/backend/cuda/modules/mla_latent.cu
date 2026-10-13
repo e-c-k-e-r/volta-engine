@@ -1,5 +1,6 @@
 #include "engine/modules/mla.h"
 #include "kv_quant.cuh"
+#include "../../../kernels/cuda/mma_sm80.cuh"
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <algorithm>
@@ -272,6 +273,8 @@ void latent_attn_kernel(
 // gives each warp 64 of the 512 latent dimensions (interleaved d = 64w + 32jj + qp + 4n, so the transposed rows are bank
 // conflict free). K and V are the same data, so one shared buffer holds the tile first as c[key][d] (for S) and then as
 // c^T[d][key] (for PV), refilled from the raw words the thread keeps in registers; the next tile is fetched during PV.
+// SM_80+ (MMA_SM80): the same tiles on mma.m16n8k16 read from the same shared buffers. S: warp (dh, qg, kg) is one 16-row A tile of Q
+// against two 8-key B tiles of c. PV: each warp's 64 dimensions are 64w + 8j + n (j = 0..7), the 32 queries two 16-row tiles.
 #define LT_BQ 32
 #define LT_BK 32
 #define LT_KS 516
@@ -284,12 +287,17 @@ void latent_attn_kernel(
 #define LT_SMEM ( LT_OFF_A + LT_BQ * 12 )
 
 __device__ __forceinline__ void lt_mma( float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1 ) {
+#if defined(USE_ROCM)
+	const uint32_t a[2] = { a0, a1 }, b[2] = { b0, b1 };
+	mma_emu_m8n8k4_f32( a, b, c, threadIdx.x & 31, rocm_shfl() );
+#else
 	asm volatile (
 		"mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
 		"{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
 		: "+f"( c[0] ), "+f"( c[1] ), "+f"( c[2] ), "+f"( c[3] ), "+f"( c[4] ), "+f"( c[5] ), "+f"( c[6] ), "+f"( c[7] )
 		: "r"( a0 ), "r"( a1 ), "r"( b0 ), "r"( b1 )
 	);
+#endif
 }
 
 template <KVQ Q>
@@ -358,6 +366,18 @@ void latent_prefill_tc_kernel(
 	const half* v_row0 = sB + ( 64 * warp + qp + 4 * e ) * LT_VS;
 	const half* p_row = sP + e * LT_VS;
 
+#if MMA_SM80
+	float acc[2][8][4];   // [query tile][dimension tile][frag_c]
+	#pragma unroll
+	for ( int i = 0; i < 2; ++i ) {
+		#pragma unroll
+		for ( int j = 0; j < 8; ++j ) {
+			#pragma unroll
+			for ( int r = 0; r < 4; ++r ) acc[i][j][r] = 0.0f;
+		}
+	}
+	(void) s_arow; (void) s_brow; (void) v_row0; (void) p_row;
+#else
 	float acc[2][4][8];
 	#pragma unroll
 	for ( int jj = 0; jj < 2; ++jj ) {
@@ -367,6 +387,7 @@ void latent_prefill_tc_kernel(
 			for ( int r = 0; r < 8; ++r ) acc[jj][i][r] = 0.0f;
 		}
 	}
+#endif
 
 	// Staging role: lane = (key pair p, chunk parity cl); 4 chunks of 8 dimensions per thread, each for two keys
 	const int st_p = lane & 15, st_cl = lane >> 4;
@@ -403,6 +424,31 @@ void latent_prefill_tc_kernel(
 		__syncthreads();
 
 		// S partial: this warp's 16 x 16 tile over its 256 dimensions
+#if MMA_SM80
+		{
+			float c[2][4] = {};
+			const half* qa = sQ + s_qg * 16 * LT_KS + dh * 256;
+			const half* kt = sB + s_kg * 16 * LT_KS + dh * 256;
+			#pragma unroll 4
+			for ( int ks = 0; ks < 16; ++ks ) {
+				uint32_t a[4];
+				lds_frag_a( qa + 16 * ks, LT_KS, a );
+				#pragma unroll
+				for ( int j = 0; j < 2; ++j ) {
+					uint32_t b[2];
+					lds_frag_b( kt + 8 * j * LT_KS + 16 * ks, LT_KS, b );
+					mma16816( c[j], a, b );
+				}
+			}
+			#pragma unroll
+			for ( int j = 0; j < 2; ++j ) {
+				#pragma unroll
+				for ( int r = 0; r < 4; ++r ) {
+					sS[dh * LT_BQ * LT_SS + ( s_qg * 16 + frag_c_row( r, lane ) ) * LT_SS + s_kg * 16 + 8 * j + frag_c_col( r, lane )] = c[j][r];
+				}
+			}
+		}
+#else
 		{
 			float c[8];
 			#pragma unroll
@@ -420,6 +466,7 @@ void latent_prefill_tc_kernel(
 				sS[dh * LT_BQ * LT_SS + ( s_qg * 16 + 8 * ( qp >> 1 ) + m ) * LT_SS + s_kg * 16 + 8 * ( qp & 1 ) + n] = c[r];
 			}
 		}
+#endif
 		__syncthreads();
 
 		// Online softmax of the tile, one query row per 8 lanes
@@ -470,6 +517,29 @@ void latent_prefill_tc_kernel(
 		if ( kb + LT_BK < kb1 ) fetch( kb + LT_BK );
 
 		// O = O * alpha + P c for this warp's 64 dimensions
+#if MMA_SM80
+		#pragma unroll
+		for ( int i = 0; i < 2; ++i ) {
+			#pragma unroll
+			for ( int j = 0; j < 8; ++j ) {
+				#pragma unroll
+				for ( int r = 0; r < 4; ++r ) acc[i][j][r] *= sA[16 * i + frag_c_row( r, lane )];
+			}
+		}
+		#pragma unroll
+		for ( int kk = 0; kk < LT_BK / 16; ++kk ) {
+			uint32_t a[2][4];
+			#pragma unroll
+			for ( int i = 0; i < 2; ++i ) lds_frag_a( sP + 16 * i * LT_VS + 16 * kk, LT_VS, a[i] );
+			#pragma unroll
+			for ( int j = 0; j < 8; ++j ) {
+				uint32_t b[2];
+				lds_frag_b( sB + ( 64 * warp + 8 * j ) * LT_VS + 16 * kk, LT_VS, b );
+				#pragma unroll
+				for ( int i = 0; i < 2; ++i ) mma16816( acc[i][j], a[i], b );
+			}
+		}
+#else
 		#pragma unroll
 		for ( int jj = 0; jj < 2; ++jj ) {
 			#pragma unroll
@@ -493,6 +563,7 @@ void latent_prefill_tc_kernel(
 				for ( int jj = 0; jj < 2; ++jj ) lt_mma( acc[jj][i], a.x, a.y, b[jj].x, b[jj].y );
 			}
 		}
+#endif
 		__syncthreads();
 	}
 
@@ -502,6 +573,19 @@ void latent_prefill_tc_kernel(
 		sL[srow] = l_run;
 	}
 	__syncthreads();
+#if MMA_SM80
+	#pragma unroll
+	for ( int i = 0; i < 2; ++i ) {
+		#pragma unroll
+		for ( int j = 0; j < 8; ++j ) {
+			#pragma unroll
+			for ( int r = 0; r < 4; ++r ) {
+				const int m = 16 * i + frag_c_row( r, lane );
+				sO[m * LT_KS + 64 * warp + 8 * j + frag_c_col( r, lane )] = acc[i][j][r] * sA[m];
+			}
+		}
+	}
+#else
 	#pragma unroll
 	for ( int jj = 0; jj < 2; ++jj ) {
 		#pragma unroll
@@ -514,6 +598,7 @@ void latent_prefill_tc_kernel(
 			}
 		}
 	}
+#endif
 	__syncthreads();
 
 	if ( nsplit > 1 ) {
@@ -617,6 +702,15 @@ void latent_sparse_tc_kernel(
 	const int srow = tid >> 4, sub = tid & 15;
 	float m_run = -1e30f, l_run = 0.0f;
 
+#if MMA_SM80
+	float acc[8][4];   // [dimension tile][frag_c], the 16 queries one row tile
+	#pragma unroll
+	for ( int j = 0; j < 8; ++j ) {
+		#pragma unroll
+		for ( int q = 0; q < 4; ++q ) acc[j][q] = 0.0f;
+	}
+	(void) s_arow; (void) s_brow; (void) v_row0; (void) p_row;
+#else
 	float acc[2][2][8];
 	#pragma unroll
 	for ( int jj = 0; jj < 2; ++jj ) {
@@ -626,6 +720,7 @@ void latent_sparse_tc_kernel(
 			for ( int q = 0; q < 8; ++q ) acc[jj][i][q] = 0.0f;
 		}
 	}
+#endif
 
 	const int st_p = lane & 15, st_cl = lane >> 4;
 	uint4 pk[4][2];
@@ -664,6 +759,31 @@ void latent_sparse_tc_kernel(
 		}
 		__syncthreads();
 
+#if MMA_SM80
+		{
+			float c[2][4] = {};
+			const half* qa = sQ + dq * 128;
+			const half* kt = sB + s_kg * 16 * LT_KS + dq * 128;
+			#pragma unroll
+			for ( int ks = 0; ks < 8; ++ks ) {
+				uint32_t a[4];
+				lds_frag_a( qa + 16 * ks, LT_KS, a );
+				#pragma unroll
+				for ( int j = 0; j < 2; ++j ) {
+					uint32_t b[2];
+					lds_frag_b( kt + 8 * j * LT_KS + 16 * ks, LT_KS, b );
+					mma16816( c[j], a, b );
+				}
+			}
+			#pragma unroll
+			for ( int j = 0; j < 2; ++j ) {
+				#pragma unroll
+				for ( int q = 0; q < 4; ++q ) {
+					sS[dq * LS_BQ * LT_SS + frag_c_row( q, lane ) * LT_SS + s_kg * 16 + 8 * j + frag_c_col( q, lane )] = c[j][q];
+				}
+			}
+		}
+#else
 		{
 			float c[8];
 			#pragma unroll
@@ -681,6 +801,7 @@ void latent_sparse_tc_kernel(
 				sS[dq * LS_BQ * LT_SS + ( 8 * ( qp >> 1 ) + m ) * LT_SS + s_kg * 16 + 8 * ( qp & 1 ) + n] = c[q];
 			}
 		}
+#endif
 		__syncthreads();
 
 		{
@@ -724,6 +845,24 @@ void latent_sparse_tc_kernel(
 		__syncthreads();
 		if ( kb + LT_BK < kb1 ) fetch( kb + LT_BK );
 
+#if MMA_SM80
+		#pragma unroll
+		for ( int j = 0; j < 8; ++j ) {
+			#pragma unroll
+			for ( int q = 0; q < 4; ++q ) acc[j][q] *= sA[frag_c_row( q, lane )];
+		}
+		#pragma unroll
+		for ( int kk = 0; kk < LT_BK / 16; ++kk ) {
+			uint32_t a[4];
+			lds_frag_a( sP + 16 * kk, LT_VS, a );
+			#pragma unroll
+			for ( int j = 0; j < 8; ++j ) {
+				uint32_t b[2];
+				lds_frag_b( sB + ( 64 * warp + 8 * j ) * LT_VS + 16 * kk, LT_VS, b );
+				mma16816( acc[j], a, b );
+			}
+		}
+#else
 		#pragma unroll
 		for ( int jj = 0; jj < 2; ++jj ) {
 			#pragma unroll
@@ -747,6 +886,7 @@ void latent_sparse_tc_kernel(
 				for ( int jj = 0; jj < 2; ++jj ) lt_mma( acc[jj][i], a.x, a.y, b[jj].x, b[jj].y );
 			}
 		}
+#endif
 		__syncthreads();
 	}
 
@@ -756,6 +896,16 @@ void latent_sparse_tc_kernel(
 		sL[srow] = l_run;
 	}
 	__syncthreads();
+#if MMA_SM80
+	#pragma unroll
+	for ( int j = 0; j < 8; ++j ) {
+		#pragma unroll
+		for ( int q = 0; q < 4; ++q ) {
+			const int m = frag_c_row( q, lane );
+			sO[m * LT_KS + 64 * warp + 8 * j + frag_c_col( q, lane )] = acc[j][q] * sA[m];
+		}
+	}
+#else
 	#pragma unroll
 	for ( int jj = 0; jj < 2; ++jj ) {
 		#pragma unroll
@@ -768,6 +918,7 @@ void latent_sparse_tc_kernel(
 			}
 		}
 	}
+#endif
 	__syncthreads();
 
 	if ( nsplit > 1 ) {
@@ -869,7 +1020,7 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 	const size_t smem = static_cast<size_t>( 16 ) * LORA * 4 + static_cast<size_t>( TILE ) * CS * 2 + ( 16 * TILE + 16 ) * 4;
 	static bool attr[ENGINE_NUM_GPUS] = {};
 	int device = 0;
-	cudaGetDevice( &device );
+	(void) cudaGetDevice( &device );
 	if ( !attr[device] ) {
 		CUDA_CHECK( cudaFuncSetAttribute( latent_attn_kernel<16, Q>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( smem ) ) );
 		attr[device] = true;
@@ -878,7 +1029,14 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 	// the chunked kernel below walks 1024 keys per block (8 blocks at 8K keys, 540 us per layer). It resolves each
 	// row's own slot, so verify blocks and rows of distinct slots both qualify.
 	const bool decode_rows = rows <= pod::MAX_BATCH && slot.row == 0;
-	if ( decode_rows || ( rows > pod::MAX_BATCH && sel_idx != nullptr ) ) {
+#if defined(USE_ROCM)
+	// RDNA grants a workgroup 64 KB: the two-row prefill tile (~80 KB) does not fit, the per-row kernel (~62 KB, dense when sel_idx is
+	// null) does and computes the same attention
+	const bool prefill_per_row = rows > pod::MAX_BATCH && LT_SMEM > rocm_smem_optin_max();
+#else
+	const bool prefill_per_row = false;
+#endif
+	if ( decode_rows || ( rows > pod::MAX_BATCH && ( sel_idx != nullptr || prefill_per_row ) ) ) {
 		ENGINE_ASSERT( slot.row == 0, "MLALatent::attend: prefill chunks start at row 0" );
 		static bool sp_attr[ENGINE_NUM_GPUS] = {};
 		if ( !sp_attr[device] ) {

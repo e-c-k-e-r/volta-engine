@@ -2,6 +2,7 @@
 #include "exl3_gemv_int8.cuh"
 #include "exl3_gemv_int8_kernel.cuh"
 #include "trellis_context.h"
+#include "exl3_kernel_map.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -40,9 +41,13 @@ bool int8_smem_for( int bits ) {
 }
 
 // Highest K the int8 path accepts. Measured on V100: 4 bpw MLP 57.7 -> 51.5 us and 5 bpw 85.6 ->
-// 75.9 us in residual mode, both wins; above this the fp16 tensor-core path wins.
-int int8_max_k() {
-	return 8;
+// 75.9 us in residual mode, both wins; above this the fp16 tensor-core path wins. Newer parts follow
+// upstream exllamav3's measurements: Ampere is DRAM-bound from K = 6 up (3090) and Ada marginal there
+// (4090), so 5; Hopper / Blackwell are INT-throughput-bound in the fp16 kernel at K = 6, so 6.
+int int8_max_k( int device ) {
+	const int cc = engine::modules::trellis_get_cc( device );
+	if ( cc == CC_OLD ) return 8;
+	return ( cc == CC_HOPPER || cc == CC_BLACKWELL ) ? 6 : 5;
 }
 
 template <int bits, int M, bool c_fp32, bool residual, bool stage_smem>
@@ -121,8 +126,7 @@ size_t smem_for( int rows_per, int size_n, int M, bool residual, bool smem, int 
 } // namespace
 
 int exl3_gemv_int8_max_k( int device ) {
-	(void) device;
-	return int8_max_k();
+	return int8_max_k( device );
 }
 
 bool exl3_gemv_int8_enabled() {
@@ -133,6 +137,8 @@ void exl3_gemv_int8_init( int device ) {
 	if ( device < 0 || device >= ENGINE_NUM_GPUS ) return;
 	engine::modules::trellis_get_int8_ws( device );
 	if ( int8_mode() == 0 ) return;
+	// The launcher declines the path below ~80 KB of opt-in shared memory (RDNA's 64 KB): no kernel to prepare
+	if ( ENGINE_MAX_SMEM < 80 * 1024 ) return;
 	// Shared-memory opt-in is a per-device property, and wide shapes (the 248320-column LM head needs
 	// ~52 KB) launch above the 48 KB default. Without the attribute on the right device the launch
 	// fails, the error is swallowed and the fallback kernel inherits a poisoned capture stream.
@@ -150,11 +156,11 @@ void exl3_gemv_int8_init( int device ) {
 						bool smem = gemv_int8_stage_smem( bits );
 						int rows_max = gemv_int8_sq_rows_max( M, residual );
 						size_t smem_max = smem_for( rows_max, 0, M, residual, smem, bits );
-						cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_max );
+						(void) cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_max );
 						// Match the tensor-core kernels' shared-memory carveout: these interleave with them
 						// (hundreds of launches per decoded token), and a smaller carveout makes the GPU
 						// drain and reconfigure the SMs on every transition.
-						cudaFuncSetAttribute( fn, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared );
+						(void) cudaFuncSetAttribute( fn, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared );
 						int8_attr_set[device].insert( fn );
 						CUDA_CHECK( cudaPeekAtLastError() );
 					}
@@ -188,7 +194,7 @@ bool exl3_gemv_int8(
 	if ( suh == nullptr || svh == nullptr ) return false;
 	if ( size_n % 256 ) return false;          // 256-column work unit
 	if ( size_k % 128 ) return false;
-	if ( K < 1 || K > int8_max_k() ) return false;
+	if ( K < 1 || K > int8_max_k( device ) ) return false;
 	if ( size_m < 1 || size_m > 2 ) return false;
 
 	bool residual = ( int8_mode() == 1 );
@@ -230,7 +236,7 @@ bool exl3_gemv_int8(
 	}
 	else {
 		maxb = 1;
-		cudaOccupancyMaxActiveBlocksPerMultiprocessor( &maxb, fn1, NUM_THREADS, smem_guess );
+		(void) cudaOccupancyMaxActiveBlocksPerMultiprocessor( &maxb, fn1, NUM_THREADS, smem_guess );
 		int8_occ_cache[device][occ_key] = maxb;
 	}
 	int grid = MIN( MAX( maxb, 1 ) * num_sms, 1024 );
@@ -265,7 +271,7 @@ bool exl3_gemv_int8(
 		std::printf( "[int8] launch failed (K=%d M=%d n=%d k=%d smem=%zu grid=%d): %s\n",
 			K, M, size_n, size_k, smem_bytes, grid, cudaGetErrorString( err ) );
 		std::fflush( stdout );
-		cudaGetLastError();
+		(void) cudaGetLastError();
 		return false;
 	}
 	return true;

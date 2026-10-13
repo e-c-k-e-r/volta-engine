@@ -97,8 +97,8 @@ int main( int argc, char** argv ) {
 	engine::core::arena_destroy( arena );
 
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		cudaSetDevice( d );
-		cudaDeviceReset();
+		(void) cudaSetDevice( d );
+		(void) cudaDeviceReset();
 	}
 
 	std::printf( "--------------------------------------------------------\n" );

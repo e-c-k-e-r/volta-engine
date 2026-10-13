@@ -143,7 +143,7 @@ int main() {
 		all_ok = all_ok && ok;
 		std::printf( "  %s %s max_seq %d (%d cached tokens, %d chunks): cos=%.6f max_abs=%.4f (|ref|max=%.3f) %s\n", ( const char* const[] ){ "fp16", "fp8 ", "int8", "fp4 " }[fi], scenario >= 2 ? "prefill" : "decode ", max_seq, N,
 			engine::modules::MLALatent::workspace_chunks( max_seq ), cosine, maxabs, maxref, ok ? "ok" : "FAIL" );
-		cudaFree( d_cache ); if ( d_cache_s ) cudaFree( d_cache_s ); cudaFree( d_c ); cudaFree( d_q ); cudaFree( d_qlat ); cudaFree( d_olat ); cudaFree( d_out ); cudaFree( d_ws ); cudaFree( d_rows );
+		(void) cudaFree( d_cache ); if ( d_cache_s ) (void) cudaFree( d_cache_s ); (void) cudaFree( d_c ); (void) cudaFree( d_q ); (void) cudaFree( d_qlat ); (void) cudaFree( d_olat ); (void) cudaFree( d_out ); (void) cudaFree( d_ws ); (void) cudaFree( d_rows );
 	}
 	if ( std::getenv( "MLA_TIME" ) ) {
 		half* d_a; half* d_b; half* d_c2;
@@ -152,7 +152,7 @@ int main() {
 		CUDA_CHECK( cudaMalloc( &d_c2, 512ull * H * LORA * sizeof( half ) ) );
 		CUDA_CHECK( cudaMemset( d_a, 0, 512ull * H * LORA * sizeof( half ) ) );
 		cudaEvent_t e0, e1;
-		cudaEventCreate( &e0 ); cudaEventCreate( &e1 );
+		(void) cudaEventCreate( &e0 ); (void) cudaEventCreate( &e1 );
 		for ( int R : { 1, 8, 64, 512 } ) {
 			pod::TensorView qt = pod::make_tensor_2d( d_a, pod::DType::FP16, R, H * HD );
 			pod::TensorView ql = pod::make_tensor_2d( d_b, pod::DType::FP16, R, H * LORA );
@@ -160,12 +160,12 @@ int main() {
 			float ms[2];
 			for ( int k = 0; k < 2; ++k ) {
 				for ( int it = 0; it < 22; ++it ) {
-					if ( it == 2 ) cudaEventRecord( e0, stream );
+					if ( it == 2 ) (void) cudaEventRecord( e0, stream );
 					if ( k == 0 ) engine::modules::MLALatent::absorb_q( qt, kv_b, ql, H, R, stream );
 					else engine::modules::MLALatent::expand_out( ql, kv_b, ot, H, R, stream );
 				}
-				cudaEventRecord( e1, stream ); cudaEventSynchronize( e1 );
-				cudaEventElapsedTime( &ms[k], e0, e1 );
+				(void) cudaEventRecord( e1, stream ); (void) cudaEventSynchronize( e1 );
+				(void) cudaEventElapsedTime( &ms[k], e0, e1 );
 			}
 			std::printf( "  rows %3d: absorb_q %.1f us  expand_out %.1f us\n", R, ms[0] * 50.0f, ms[1] * 50.0f );
 		}

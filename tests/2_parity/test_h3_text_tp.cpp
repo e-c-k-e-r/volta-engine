@@ -50,7 +50,7 @@ int main( int argc, char** argv ) {
 		const double cos = cosine( got, static_cast<const float*>( engine::loader::safetensors_get_data_cpu( g1, hm ) ), &rel );
 		std::printf( "text only, %zu tokens: %.2f s, cosine %.6f rel %.4g\n", ids.size(), secs, cos, rel );
 		if ( cos < 0.999 ) { ++bad; }
-		cudaFree( d );
+		(void) cudaFree( d );
 	}
 	{ // with an image
 		const int* gid = static_cast<const int*>( engine::loader::safetensors_get_data_cpu( g2, get( g2, "ids" ) ) );

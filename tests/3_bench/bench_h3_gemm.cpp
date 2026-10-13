@@ -31,7 +31,7 @@ int main( int argc, char** argv ) {
 		for ( int algo = -1; algo <= 23; ++algo ) {
 			const cublasGemmAlgo_t a = algo < 0 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : static_cast<cublasGemmAlgo_t>( CUBLAS_GEMM_ALGO0_TENSOR_OP + algo );
 			auto run = [&]() { return cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, s.N, M, s.K, &alpha, W, CUDA_R_16F, s.K, A, CUDA_R_16F, s.K, &beta, C, s.c32 ? CUDA_R_32F : CUDA_R_16F, s.N, CUBLAS_COMPUTE_32F, a ); };
-			if ( run() != CUBLAS_STATUS_SUCCESS ) { cudaGetLastError(); continue; }
+			if ( run() != CUBLAS_STATUS_SUCCESS ) { (void) cudaGetLastError(); continue; }
 			CUDA_CHECK( cudaDeviceSynchronize() );
 			const auto t0 = std::chrono::steady_clock::now();
 			const int reps = 6;

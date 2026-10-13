@@ -428,8 +428,8 @@ H3TextEncoder::~H3TextEncoder() {
 		}
 		if ( p_->sarena.base_ptr ) { engine::core::arena_destroy( p_->sarena ); }
 		if ( p_->warena.base_ptr ) { engine::core::arena_destroy( p_->warena ); }
-		for ( int i = 0; i < Impl::kPinned; ++i ) { if ( p_->pinned[i] ) { cudaFreeHost( p_->pinned[i] ); } }
-		if ( p_->staging ) { cudaFree( p_->staging ); }
+		for ( int i = 0; i < Impl::kPinned; ++i ) { if ( p_->pinned[i] ) { (void) cudaFreeHost( p_->pinned[i] ); } }
+		if ( p_->staging ) { (void) cudaFree( p_->staging ); }
 		delete p_;
 	}
 }
@@ -699,7 +699,7 @@ bool H3TextEncoder::run_mm( const std::vector<int>& ids, int image_token_id, con
 	}
 	if ( d_out ) { CUDA_CHECK( cudaMemcpyAsync( d_out, s.x, static_cast<size_t>( S ) * kH * sizeof( float ), cudaMemcpyDeviceToDevice, s.cs ) ); }
 	CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
-	if ( d_feat ) { cudaFree( d_feat ); cudaFree( d_rows ); }
+	if ( d_feat ) { (void) cudaFree( d_feat ); (void) cudaFree( d_rows ); }
 	CUDA_CHECK( cudaGetLastError() );
 	return true;
 }

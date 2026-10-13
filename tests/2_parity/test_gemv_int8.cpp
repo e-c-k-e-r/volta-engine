@@ -187,8 +187,8 @@ int main() {
 	engine::core::arena_destroy( arena );
 	engine::modules::trellis_context_destroy();
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		cudaSetDevice( d );
-		cudaDeviceReset();
+		(void) cudaSetDevice( d );
+		(void) cudaDeviceReset();
 	}
 
 	std::printf( "========================================================\n" );

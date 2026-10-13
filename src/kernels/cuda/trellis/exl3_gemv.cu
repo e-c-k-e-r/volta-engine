@@ -16,8 +16,8 @@ void exl3_gemv_reset_caches() {
 	for ( auto& m : occ_cache ) m.clear();
 }
 
+// -1: not eligible, 0: narrow config, 1: wide config. narrow_coresident = narrow-config blocks that fit on the device at once
 static int exl3_gemv_cfg( int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident ) {
-	(void) narrow_coresident;
 	if ( mode == 0 ) return -1;
 	if ( K < 2 || K > 6 ) return -1;
 	if ( K != 4 && K != 6 && cb == 0 ) return -1;
@@ -29,14 +29,19 @@ static int exl3_gemv_cfg( int cc, int size_m, int size_k, int size_n, int K, int
 		if ( K == 2 || K == 3 || K == 4 || K == 6 ) return ( size_n <= 8192 ) ? 0 : 1;
 		return -1;
 	}
+	// Above Volta: upstream exllamav3's exl3_gemv_cfg. Its kernels cover K = 2..4 (the K = 5 / 6 variants here were measured on V100
+	// only; upstream runs those rates through the GEMM). The narrow config wins whenever its grid fits in one co-resident wave
+	if ( K > 4 ) return -1;
 	if ( mode == 2 ) return size_n <= 8192 ? 0 : 1;
 	if ( mode == 3 ) return 0;
 	if ( mode == 4 ) return 1;
 	if ( K == 2 ) return size_n <= 8192 ? 0 : 1;
-	if ( K == 5 ) return 1;
+	if ( K == 3 && cc == CC_ADA ) return size_n <= 8192 ? 0 : 1;
+	if ( size_n / 32 <= narrow_coresident ) return 0;
 	if ( size_k <= 2048 && size_n <= 8192 ) return 0;
 	if ( K == 3 ) return -1;
 	if ( size_n >= 8192 && size_k <= 4096 ) return 1;
+	if ( size_n >= 8192 && size_n <= 10240 && size_k <= 5120 && cc == CC_AMPERE ) return 1;
 	return -1;
 }
 
@@ -88,16 +93,16 @@ bool exl3_gemv_try_launch(
 	if ( size_k % 128 || size_n % 128 ) return false;
 
 	int mode = force ? 2 : 1;
-	int cc = CC_OLD;
+	int cc = engine::modules::trellis_get_cc( device );
 	int mmode = size_m == 1 ? 0 : 1;
-	int num_sms = ENGINE_SM_COUNT;
+	int num_sms = engine::modules::trellis_get_num_sms( device );
 
 	auto& cache = occ_cache[device < ENGINE_NUM_GPUS ? device : 0];
 	auto occupancy = [&]( void* kern, int bdim ) -> int {
 		auto it = cache.find( kern );
 		if ( it != cache.end() ) return it->second;
 		int blocks_per_sm = 1;
-		cudaOccupancyMaxActiveBlocksPerMultiprocessor( &blocks_per_sm, kern, bdim, 0 );
+		(void) cudaOccupancyMaxActiveBlocksPerMultiprocessor( &blocks_per_sm, kern, bdim, 0 );
 		cache[kern] = blocks_per_sm;
 		return blocks_per_sm;
 	};
@@ -125,7 +130,14 @@ bool exl3_gemv_try_launch(
 	int block_dim = ( cfg == 0 ) ? 512 : 256;
 	int cols = ( cfg == 0 ) ? 32 : 64;
 
+#if defined(USE_ROCM)
+	// ROCm: one block per CU. The grid.sync's need every block resident at once, and a grid at HIP's occupancy figure (what the
+	// full-width projections reach: N / cols exceeds it) hung a 7900 XTX in the first decode forward. The kernel loops over its
+	// column tiles, so a smaller grid only changes how many each block takes
+	int max_blocks = num_sms;
+#else
 	int max_blocks = occupancy( kernel, block_dim ) * num_sms;
+#endif
 	int gx = MIN( size_n / cols, max_blocks );
 	int gy = 1;
 
@@ -180,7 +192,11 @@ void exl3_gemv(
 	if ( mul1 ) cb = 2;
 
 	int device = 0;
-	cudaGetDevice( &device );
+	(void) cudaGetDevice( &device );
+
+#if defined(USE_ROCM)
+	if ( exl3_gemv_rocm( A, B, C, suh, A_had, svh, size_m, size_k, size_n, K, mcg, mul1, c_fp32, stream ) ) return;
+#endif
 
 	// dp4a int8 path first: at M=1 it beats both the fp16 GEMV and the Shape 4 GEMM on every
 	// per-rank Qwen shape, and it is a plain launch with a fixed workspace, so it captures cleanly.

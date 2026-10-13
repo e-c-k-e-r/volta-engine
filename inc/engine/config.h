@@ -7,8 +7,15 @@
 
 #define ENGINE_ARCH_SM70 1
 #define ENGINE_NUM_GPUS  4
-#define ENGINE_SM_COUNT  80
-#define ENGINE_MAX_SMEM  98304
+// SM count the persistent / cooperative launches size their grids to. 0 (default): ask the device at startup (80 on a V100, 82 on a
+// 3090, 60 on a 4070 Ti; the architecture alone does not fix it). Nonzero: use this count, capped at the device's (CMake -DENGINE_SM_COUNT=N)
+#ifndef ENGINE_SM_COUNT
+	#define ENGINE_SM_COUNT 0
+#endif
+// Opt-in dynamic shared memory per block the big kernels request: V100 allows 96 KB, SM_86 / SM_89 99 KB, so the default fits all three
+#ifndef ENGINE_MAX_SMEM
+	#define ENGINE_MAX_SMEM 98304
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 	#define ENGINE_LIKELY(x)   __builtin_expect(!!(x), 1)

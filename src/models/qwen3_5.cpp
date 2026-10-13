@@ -179,8 +179,8 @@ bool Qwen3_5Pipeline::init(
 		d_argmax_val_ = static_cast<float*>( engine::core::arena_alloc( arena, R * sizeof( float ) ) );
 		h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( R * sizeof( int ) ) );
 		std::memset( h_argmax_idx_, 0, R * sizeof( int ) );
-		if ( tp_size_ > 1 ) {
-			// Top-k sampling scratch over the target logits (up to R rows).
+		{
+			// Top-k sampling scratch over the target logits (up to R rows): every tp size, as at tp 1 the "shard" is the whole vocabulary
 			const int splits = ( lm_shard_cols_ + kTopkTile - 1 ) / kTopkTile;
 			const size_t per = static_cast<size_t>( R ) * splits * 16;
 			samp_part_v_ = static_cast<float*>( engine::core::arena_alloc( arena, per * sizeof( float ) ) );
@@ -550,7 +550,6 @@ bool Qwen3_5Pipeline::sample_local( int* out_tokens, float* out_vals, int count,
 }
 
 bool Qwen3_5Pipeline::topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream ) {
-	if ( tp_size_ <= 1 ) return false;
 	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Qwen3_5Pipeline::topk_local: count exceeds last forward rows" );
 	backend::set_device( rank_ );
 	// Real columns only (pad columns decode to 0.0), global ids via the shard offset.

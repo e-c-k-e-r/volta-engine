@@ -58,9 +58,9 @@ bool H3Run::decode() {
 		if ( !avae || !avae->decode( d_arows + static_cast<size_t>( n_aref ) * 32, audio_t, pcm ) ) { LOG_ERROR( "H3: audio decode failed" ); return false; }
 	}
 	res.t_decode = seconds_since( t0 );
-	cudaFree( d_z );
-	cudaFree( d_vrows );
-	cudaFree( d_arows );
+	(void) cudaFree( d_z );
+	(void) cudaFree( d_vrows );
+	(void) cudaFree( d_arows );
 	LOG_INFO( "H3: decoded %d frames (%dx%d) and %zu audio samples in %.1f s", out_frames, width, height, pcm.size() / 2, res.t_decode );
 	return true;
 }

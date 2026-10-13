@@ -15,7 +15,7 @@ int main( int argc, char** argv ) {
 	for ( int i = 0; i < n; ++i ) {
 		CUDA_CHECK( cudaSetDevice( i ) );
 		CUDA_CHECK( cudaMalloc( &buf[i], bytes ) );
-		for ( int j = 0; j < n; ++j ) { if ( i != j ) { cudaDeviceEnablePeerAccess( j, 0 ); cudaGetLastError(); } }
+		for ( int j = 0; j < n; ++j ) { if ( i != j ) { (void) cudaDeviceEnablePeerAccess( j, 0 ); (void) cudaGetLastError(); } }
 	}
 	std::vector<unsigned char> pat( bytes ), back( bytes );
 	for ( size_t i = 0; i < bytes; ++i ) { pat[i] = static_cast<unsigned char>( ( i * 2654435761u ) >> 24 ); }
@@ -37,7 +37,7 @@ int main( int argc, char** argv ) {
 				CUDA_CHECK( cudaMemcpyPeerAsync( buf[b], b, buf[a], a, bytes, s ) );
 				CUDA_CHECK( cudaStreamSynchronize( s ) );
 				secs += std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
-				cudaStreamDestroy( s );
+				(void) cudaStreamDestroy( s );
 				CUDA_CHECK( cudaSetDevice( b ) );
 				CUDA_CHECK( cudaMemcpy( back.data(), buf[b], bytes, cudaMemcpyDeviceToHost ) );
 				for ( size_t i = 0; i < bytes; ++i ) { if ( back[i] != pat[i] ) { ++errors; } }

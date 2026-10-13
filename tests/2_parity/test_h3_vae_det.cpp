@@ -39,8 +39,8 @@ int main( int argc, char** argv ) {
 		}
 		std::printf( "tile %dx%dx%d: %d of %d repeats differ from the first\n", T, H, W, diffs, repeats - 1 );
 		bad += diffs ? 1 : 0;
-		cudaFree( d_z );
-		cudaFree( d_p );
+		(void) cudaFree( d_z );
+		(void) cudaFree( d_p );
 	}
 	if ( argc > 3 ) { // the full tiled decode of a golden latent, repeatedly: which frames and which pixels change
 		pod::SafeTensorsFile st;

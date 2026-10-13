@@ -1,5 +1,6 @@
 #include "engine/modules/attention.h"
 #include "kv_quant.cuh"
+#include "../../../kernels/cuda/mma_sm80.cuh"
 #include <cuda_fp16.h>
 #include <cmath>
 #include <cstdlib>
@@ -413,6 +414,8 @@ void attn_sparse_warp_kernel(
 // query row), P is written as FP16, and O += P V gives each warp 32 head dimensions (interleaved: d = 32w + dn + 4c so the
 // transposed V rows are bank conflict free) for all 32 queries. V is staged transposed so a B fragment (4 consecutive
 // keys of one dimension) is one 8-byte load. head_dim 256 only; keys past a query's own position are masked.
+// SM_80+ (MMA_SM80): the same tiles and staging on mma.m16n8k16 read from the same shared buffers. S: warp (qg, kg) is one 16-row A
+// tile of Q against two 8-key B tiles of K. PV: each warp's 32 dimensions are 32w + 8j + n (j = 0..3), the 32 queries two 16-row tiles.
 #define PA_BQ 32
 #define PA_BK 64
 #define PA_KS 260
@@ -426,12 +429,17 @@ void attn_sparse_warp_kernel(
 #define PA_SMEM ( PA_OFF_A + PA_BQ * 12 )
 
 __device__ __forceinline__ void pa_mma( float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1 ) {
+#if defined(USE_ROCM)
+	const uint32_t a[2] = { a0, a1 }, b[2] = { b0, b1 };
+	mma_emu_m8n8k4_f32( a, b, c, threadIdx.x & 31, rocm_shfl() );
+#else
 	asm volatile (
 		"mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
 		"{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
 		: "+f"( c[0] ), "+f"( c[1] ), "+f"( c[2] ), "+f"( c[3] ), "+f"( c[4] ), "+f"( c[5] ), "+f"( c[6] ), "+f"( c[7] )
 		: "r"( a0 ), "r"( a1 ), "r"( b0 ), "r"( b1 )
 	);
+#endif
 }
 
 template <KVQ KQ, KVQ VQ, bool SP>
@@ -519,12 +527,25 @@ void attn_prefill_tc_kernel(
 	const half* v_row = sVt + ( 32 * warp + qp + 4 * e ) * PA_VS;
 	const half* p_row = sP + e * PA_VS;
 
+#if MMA_SM80
+	float acc[2][4][4];   // [query tile][dimension tile][frag_c]
+	#pragma unroll
+	for ( int i = 0; i < 2; ++i ) {
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			#pragma unroll
+			for ( int r = 0; r < 4; ++r ) acc[i][j][r] = 0.0f;
+		}
+	}
+	(void) s_arow; (void) s_brow; (void) v_row; (void) p_row;
+#else
 	float acc[4][8];
 	#pragma unroll
 	for ( int i = 0; i < 4; ++i ) {
 		#pragma unroll
 		for ( int r = 0; r < 8; ++r ) acc[i][r] = 0.0f;
 	}
+#endif
 
 	// Each thread stages two keys (2 kp) x a 32-byte pair of chunks, twice; the next tile is fetched into registers while
 	// the current one is computed on, and V is written transposed two keys at a time
@@ -585,6 +606,31 @@ void attn_prefill_tc_kernel(
 		if ( kb + PA_BK < kb1 ) fetch( kb + PA_BK );
 
 		// S = Q K^T for this warp's 16 x 16 tile
+#if MMA_SM80
+		{
+			float c[2][4] = {};
+			const half* qa = sQ + s_qg * 16 * PA_KS;
+			const half* kt = sK + s_kg * 16 * PA_KS;
+			#pragma unroll 4
+			for ( int ks = 0; ks < HD / 16; ++ks ) {
+				uint32_t a[4];
+				lds_frag_a( qa + 16 * ks, PA_KS, a );
+				#pragma unroll
+				for ( int j = 0; j < 2; ++j ) {
+					uint32_t b[2];
+					lds_frag_b( kt + 8 * j * PA_KS + 16 * ks, PA_KS, b );
+					mma16816( c[j], a, b );
+				}
+			}
+			#pragma unroll
+			for ( int j = 0; j < 2; ++j ) {
+				#pragma unroll
+				for ( int r = 0; r < 4; ++r ) {
+					sS[( s_qg * 16 + frag_c_row( r, lane ) ) * PA_SS + s_kg * 16 + 8 * j + frag_c_col( r, lane )] = c[j][r];
+				}
+			}
+		}
+#else
 		{
 			float c[8];
 			#pragma unroll
@@ -602,6 +648,7 @@ void attn_prefill_tc_kernel(
 				sS[( s_qg * 16 + 8 * ( qp >> 1 ) + m ) * PA_SS + s_kg * 16 + 8 * ( qp & 1 ) + n] = c[r];
 			}
 		}
+#endif
 		__syncthreads();
 
 		// Online softmax of this tile for one query row per 8 lanes
@@ -639,6 +686,29 @@ void attn_prefill_tc_kernel(
 		__syncthreads();
 
 		// O = O * alpha + P V for this warp's 32 dimensions
+#if MMA_SM80
+		#pragma unroll
+		for ( int i = 0; i < 2; ++i ) {
+			#pragma unroll
+			for ( int j = 0; j < 4; ++j ) {
+				#pragma unroll
+				for ( int r = 0; r < 4; ++r ) acc[i][j][r] *= sA[16 * i + frag_c_row( r, lane )];
+			}
+		}
+		#pragma unroll
+		for ( int kk = 0; kk < PA_BK / 16; ++kk ) {
+			uint32_t a[2][4];
+			#pragma unroll
+			for ( int i = 0; i < 2; ++i ) lds_frag_a( sP + 16 * i * PA_VS + 16 * kk, PA_VS, a[i] );
+			#pragma unroll
+			for ( int j = 0; j < 4; ++j ) {
+				uint32_t b[2];
+				lds_frag_b( sVt + ( 32 * warp + 8 * j ) * PA_VS + 16 * kk, PA_VS, b );
+				#pragma unroll
+				for ( int i = 0; i < 2; ++i ) mma16816( acc[i][j], a[i], b );
+			}
+		}
+#else
 		#pragma unroll
 		for ( int i = 0; i < 4; ++i ) {
 			#pragma unroll
@@ -656,6 +726,7 @@ void attn_prefill_tc_kernel(
 				pa_mma( acc[i], a.x, a.y, b.x, b.y );
 			}
 		}
+#endif
 		__syncthreads();
 	}
 
@@ -665,6 +736,19 @@ void attn_prefill_tc_kernel(
 		sL[srow] = l_run;
 	}
 	__syncthreads();
+#if MMA_SM80
+	#pragma unroll
+	for ( int i = 0; i < 2; ++i ) {
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			#pragma unroll
+			for ( int r = 0; r < 4; ++r ) {
+				const int m = 16 * i + frag_c_row( r, lane );
+				sO[m * PA_KS + 32 * warp + 8 * j + frag_c_col( r, lane )] = acc[i][j][r] * sA[m];
+			}
+		}
+	}
+#else
 	#pragma unroll
 	for ( int i = 0; i < 4; ++i ) {
 		#pragma unroll
@@ -674,6 +758,7 @@ void attn_prefill_tc_kernel(
 			sO[( 8 * i + m ) * PA_KS + 32 * warp + qp + 4 * n] = acc[i][r] * sA[8 * i + m];
 		}
 	}
+#endif
 	__syncthreads();
 
 	if ( nsplit > 1 ) {
@@ -933,6 +1018,15 @@ void Attention::forward_prefill(
 	bool per_row
 ) {
 	ENGINE_ASSERT( head_dim == 256 && num_q_heads % num_kv_heads == 0, "Attention::forward_prefill: head_dim 256 and GQA only" );
+#if defined(USE_ROCM)
+	// The tiled kernel stages ~96 KB of shared memory; RDNA grants a workgroup 64 KB. The decode kernel gives the same result
+	if ( PA_SMEM > rocm_smem_optin_max() ) {
+		(void) key_hint;
+		(void) per_row;
+		forward_decode( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream );
+		return;
+	}
+#endif
 	const float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
 	const int G = num_q_heads / num_kv_heads;
 	// Spread the key tiles over extra blocks when the query tiles alone leave the GPU under two waves
@@ -984,7 +1078,12 @@ void Attention::forward_sparse(
 ) {
 	ENGINE_ASSERT( kv.vq != KVQ::Q4, "Attention::forward_sparse: Q4 values are not supported" );
 	const float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
-	if ( count > pod::MAX_BATCH && head_dim == 256 && num_q_heads % num_kv_heads == 0 ) {
+#if defined(USE_ROCM)
+	const bool tc_fits = PA_SMEM <= rocm_smem_optin_max();   // RDNA: 64 KB per workgroup, the tiled kernel stages ~96 KB
+#else
+	const bool tc_fits = true;
+#endif
+	if ( tc_fits && count > pod::MAX_BATCH && head_dim == 256 && num_q_heads % num_kv_heads == 0 ) {
 		// Prefill rows: tensor-core kernel, one block per (row, kv head) over that row's key list (decode-sized calls keep the fp32 kernel below)
 		const int G = num_q_heads / num_kv_heads;
 		const int nlist = idx_stride;

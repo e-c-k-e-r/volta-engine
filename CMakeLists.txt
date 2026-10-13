@@ -1,13 +1,34 @@
 cmake_minimum_required(VERSION 3.18)
 
-# Computing backend: exactly one (CUDA, CPU or VULKAN). Chosen before project() so the CPU and Vulkan configurations never enable the CUDA language.
-set(ENGINE_BACKEND "CUDA" CACHE STRING "Computing backend: CUDA, CPU or VULKAN")
+# Computing backend: exactly one (CUDA, ROCM, CPU or VULKAN). Chosen before project() so the CPU and Vulkan configurations never enable the CUDA language.
+# ROCM compiles the CUDA sources as HIP (src/backend/rocm: compat.h, force-included, and stand-ins for the CUDA headers).
+set(ENGINE_BACKEND "CUDA" CACHE STRING "Computing backend: CUDA, ROCM, CPU or VULKAN")
+
+# CUDA targets, set before project() so CMake does not substitute the compiler's default. 70 (V100) is the tuned target; 86 (RTX 30xx /
+# A10 / A40) and 89 (RTX 40xx / L4 / L40) build the same sources, taking the native mma.m16n8k16 / ldmatrix / cp.async paths where the
+# kernels have them. Several at once give one fat binary: -DCMAKE_CUDA_ARCHITECTURES="70;86;89". CUDA 13 dropped 70.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+	set(CMAKE_CUDA_ARCHITECTURES 70 CACHE STRING "CUDA architectures to build for (70, 86, 89, a ;-list of them, or native)")
+endif()
+# ROCM targets: RDNA, wave32 (every kernel is written for 32-lane warps). gfx1100 = RX 7900 XT / XTX; also gfx1101 / gfx1102 (RX 7800 /
+# 7600), gfx1200 / gfx1201 (RX 9000 series). A ;-list builds one binary for several
+if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+	set(CMAKE_HIP_ARCHITECTURES gfx1100 CACHE STRING "ROCm targets to build for (RDNA, wave32: gfx1100, gfx1101, gfx1201, ...)")
+endif()
 if(ENGINE_BACKEND STREQUAL "CUDA")
 	project(volta_engine LANGUAGES CXX CUDA)
+elseif(ENGINE_BACKEND STREQUAL "ROCM")
+	project(volta_engine LANGUAGES CXX HIP)
 elseif(ENGINE_BACKEND STREQUAL "CPU" OR ENGINE_BACKEND STREQUAL "VULKAN")
 	project(volta_engine LANGUAGES CXX)
 else()
-	message(FATAL_ERROR "ENGINE_BACKEND=${ENGINE_BACKEND}: only CUDA, CPU and VULKAN are implemented")
+	message(FATAL_ERROR "ENGINE_BACKEND=${ENGINE_BACKEND}: only CUDA, ROCM, CPU and VULKAN are implemented")
+endif()
+# The GPU configurations share every target below; ENGINE_BACKEND_CUDA (the code's switch for that path) is defined for both
+if(ENGINE_BACKEND STREQUAL "CUDA" OR ENGINE_BACKEND STREQUAL "ROCM")
+	set(ENGINE_GPU ON)
+else()
+	set(ENGINE_GPU OFF)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -16,10 +37,56 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(ENGINE_BACKEND STREQUAL "CUDA")
 	set(CMAKE_CUDA_STANDARD 17)
 	set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-	set(CMAKE_CUDA_ARCHITECTURES 70)
 	add_compile_definitions(ENGINE_BACKEND_CUDA=1)
 	find_package(CUDAToolkit REQUIRED)
-	set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -Xcompiler -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION -DEXL3_SM70_HMMA=1 -DEXL3_VOLTA=1 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 20012")
+	if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13 AND "70" IN_LIST CMAKE_CUDA_ARCHITECTURES)
+		message(FATAL_ERROR "CUDA ${CUDAToolkit_VERSION} cannot target SM_70: use CUDA 12.x, or drop 70 from CMAKE_CUDA_ARCHITECTURES")
+	endif()
+	message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+	# The EXL3 GEMM uses the Volta m8n8k4 HMMA inner loop on SM_70 and the upstream m16n8k16 one on SM_80+ (trellis/arch.cuh). ON forces the
+	# Volta loop on every architecture (m8n8k4 is legal PTX on SM_80+, just not native): a fallback if the native loop misbehaves on a card
+	option(ENGINE_EXL3_FORCE_VOLTA_MMA "EXL3 GEMM: use the Volta m8n8k4 inner loop on every architecture" OFF)
+	set(ENGINE_EXL3_DEFS "-DEXL3_SM70_HMMA=1")
+	if(ENGINE_EXL3_FORCE_VOLTA_MMA)
+		set(ENGINE_EXL3_DEFS "${ENGINE_EXL3_DEFS} -DEXL3_VOLTA=1")
+	endif()
+	# Hardware overrides (0: query the device at startup). ENGINE_SM_COUNT caps the SMs the persistent / cooperative kernels spread over;
+	# ENGINE_MAX_SMEM is the opt-in shared memory per block the big kernels request (default 98304, which V100, SM_86 and SM_89 all allow)
+	set(ENGINE_SM_COUNT 0 CACHE STRING "SMs to size persistent / cooperative grids to (0: the device's own count)")
+	set(ENGINE_MAX_SMEM 0 CACHE STRING "Opt-in dynamic shared memory per block in bytes (0: the default 98304)")
+	if(NOT ENGINE_SM_COUNT EQUAL 0)
+		add_compile_definitions(ENGINE_SM_COUNT=${ENGINE_SM_COUNT})
+	endif()
+	if(NOT ENGINE_MAX_SMEM EQUAL 0)
+		add_compile_definitions(ENGINE_MAX_SMEM=${ENGINE_MAX_SMEM})
+	endif()
+	set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -Xcompiler -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION ${ENGINE_EXL3_DEFS} --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 20012")
+elseif(ENGINE_BACKEND STREQUAL "ROCM")
+	set(CMAKE_HIP_STANDARD 17)
+	set(CMAKE_HIP_STANDARD_REQUIRED ON)
+	foreach(arch ${CMAKE_HIP_ARCHITECTURES})
+		if(NOT arch MATCHES "^gfx1[0-9]")
+			message(FATAL_ERROR "ROCM target ${arch}: the kernels assume wave32, which only RDNA (gfx10xx / gfx11xx / gfx12xx) runs; CDNA / GCN (gfx9xx) are wave64")
+		endif()
+	endforeach()
+	message(STATUS "ROCm targets: ${CMAKE_HIP_ARCHITECTURES}")
+	find_package(hip REQUIRED)
+	find_package(hipblas REQUIRED)
+	# Every target: the CUDA path's code with the HIP runtime under it. compat.h maps the CUDA names, src/backend/rocm/include stands
+	# in for the CUDA headers; hip::host gives host translation units the HIP headers and platform definitions
+	add_compile_definitions(ENGINE_BACKEND_CUDA=1 ENGINE_BACKEND_ROCM=1 USE_ROCM=1)
+	include_directories(BEFORE ${PROJECT_SOURCE_DIR}/src/backend/rocm/include)
+	add_compile_options(-include ${PROJECT_SOURCE_DIR}/src/backend/rocm/compat.h)
+	link_libraries(hip::host)
+	# RDNA grants a workgroup 64 KB of LDS (V100 96 KB): the kernels that need more are routed to smaller ones on ROCm, and the EXL3
+	# GEMM picks among the shapes that fit
+	set(ENGINE_SM_COUNT 0 CACHE STRING "Compute units to size persistent / cooperative grids to (0: the device's own count)")
+	set(ENGINE_MAX_SMEM 65536 CACHE STRING "Opt-in dynamic shared memory per block in bytes")
+	if(NOT ENGINE_SM_COUNT EQUAL 0)
+		add_compile_definitions(ENGINE_SM_COUNT=${ENGINE_SM_COUNT})
+	endif()
+	add_compile_definitions(ENGINE_MAX_SMEM=${ENGINE_MAX_SMEM})
+	set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -O3 -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION -DEXL3_SM70_HMMA=1 -Wno-unused-result -Wno-register")
 elseif(ENGINE_BACKEND STREQUAL "VULKAN")
 	add_compile_definitions(ENGINE_BACKEND_VULKAN=1)
 else()
@@ -80,8 +147,8 @@ set(ENGINE_HOST_SOURCES
 	src/server/system_stats.cpp
 )
 
-if(ENGINE_BACKEND STREQUAL "CUDA")
-# CUDA device code and its launch drivers (compiled only for the CUDA backend)
+if(ENGINE_GPU)
+# CUDA device code and its launch drivers (compiled only for the GPU backends; as HIP in the ROCM configuration)
 set(ENGINE_DEVICE_SOURCES
 	src/server/video/adapters.cpp
 	src/server/video/jobs.cpp
@@ -136,6 +203,7 @@ set(ENGINE_CORE_SOURCES ${ENGINE_HOST_SOURCES} ${ENGINE_DEVICE_SOURCES})
 set(TRELLIS_SOURCES
 	src/kernels/cuda/trellis/exl3_gemm.cu
 	src/kernels/cuda/trellis/exl3_gemv.cu
+	src/kernels/cuda/trellis/exl3_gemv_rocm.cu
 	src/kernels/cuda/trellis/exl3_gemv_int8.cu
 	src/kernels/cuda/trellis/exl3_instances.cu
 	src/kernels/cuda/trellis/exl3_kernel_map.cu
@@ -145,12 +213,21 @@ set(TRELLIS_SOURCES
 	src/kernels/cuda/trellis/trellis_context.cu
 )
 
+if(ENGINE_BACKEND STREQUAL "ROCM")
+	set(ENGINE_ROCM_HIP_SOURCES ${ENGINE_CORE_SOURCES} ${TRELLIS_SOURCES})
+	list(FILTER ENGINE_ROCM_HIP_SOURCES INCLUDE REGEX "\\.cu$")
+	set_source_files_properties(${ENGINE_ROCM_HIP_SOURCES} PROPERTIES LANGUAGE HIP)
+endif()
 add_library(engine_kernels STATIC
 	${ENGINE_CORE_SOURCES}
 	${TRELLIS_SOURCES}
 )
-# cuBLAS for the large-M prefill path (dequantize once, then a tensor-core HGEMM).
-target_link_libraries(engine_kernels PUBLIC CUDA::cublas)
+# cuBLAS (hipBLAS on ROCm) for the large-M prefill path (dequantize once, then a tensor-core HGEMM).
+if(ENGINE_BACKEND STREQUAL "ROCM")
+	target_link_libraries(engine_kernels PUBLIC roc::hipblas hip::host)
+else()
+	target_link_libraries(engine_kernels PUBLIC CUDA::cublas)
+endif()
 
 set_target_properties(engine_kernels PROPERTIES
 	ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
@@ -232,7 +309,11 @@ endif()
 add_executable(test_backend_tiers tests/2_parity/test_backend_tiers.cpp)
 set_target_properties(test_backend_tiers PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
-if(ENGINE_BACKEND STREQUAL "CUDA")
+# Tensor-core fragment maps (mma.m16n8k16 / m8n8k4 on a simulated warp; host only, no GPU)
+add_executable(test_mma_frag tests/2_parity/test_mma_frag.cpp)
+set_target_properties(test_mma_frag PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+if(ENGINE_GPU)
 # Test Trellis Parity
 add_executable(test_trellis tests/2_parity/test_trellis.cpp)
 target_link_libraries(test_trellis PRIVATE engine_kernels)
@@ -495,8 +576,8 @@ if(NOT ENGINE_BACKEND STREQUAL "CPU")
 endif()
 include(${PROJECT_SOURCE_DIR}/cmake/ops_tests_linear.cmake OPTIONAL)
 include(${PROJECT_SOURCE_DIR}/cmake/ops_tests_attention.cmake OPTIONAL)
-# MiniMax-H3: parity tests, benches and the CLI (CUDA only)
-if(ENGINE_BACKEND STREQUAL "CUDA")
+# MiniMax-H3: parity tests, benches and the CLI (GPU configurations; on ROCm it builds but is not supported, see docs/GETTING_STARTED.md)
+if(ENGINE_GPU)
 	set(H3_TOOLS
 		tests/3_bench/bench_h3_attn.cpp
 		tests/3_bench/bench_h3_dit.cpp
@@ -534,7 +615,9 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	set_target_properties(h3_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# NCCL is optional: it enables tensor parallelism (the transformer and the text tower over several GPUs) and bench_allreduce
-	find_library(NCCL_LIBRARY nccl)
+	if(ENGINE_BACKEND STREQUAL "CUDA")
+		find_library(NCCL_LIBRARY nccl)
+	endif()
 	if(NCCL_LIBRARY)
 		target_compile_definitions(engine_kernels PUBLIC ENGINE_HAVE_NCCL=1)
 		target_link_libraries(engine_kernels PUBLIC ${NCCL_LIBRARY})

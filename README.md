@@ -4,13 +4,12 @@ Yet another (slopped) inference engine, tailored in C++ for Volta, specifically 
 
 ## Build
 
-CUDA 12.x is required, as 13+ drops SM_70 support. *Could* run on SM_75+, but no kernels would make use of instructions / specifications introduced later.
+CUDA 12.x is required for SM_70, as 13+ drops SM_70 support.
 * Additional backends are in place (CPU/Vulkan), but are untuned and merely for scaffolding, not performance.
-* Experimental SM_86 (Ampere, RTX 30X0) and SM_89 (Ada, RTX 40X0) support is provided under the `experimental` branch, but needs testing (via my 4070Ti, when I can supplant it).
-* Experimental ROCm support is also provided under the `experimental` branch. Currently only `gfx1100` (7900XTX) is tested (`gfx1030` support might also be tested in the future).
 
-To compile, run `cmake -B build && cmake --build build`.
-* *to-do*: report flags for other backends
+To compile, run `cmake -B build && cmake --build build`. SM_86 (RTX 30xx) and SM_89 (RTX 40xx) are built with `-DCMAKE_CUDA_ARCHITECTURES="86;89"` (or `"70;86;89"` for one binary covering all three); the tensor-core kernels take native `mma.m16n8k16` paths there (the Volta `m8n8k4` is only emulated on newer cards). Details in [docs/GETTING_STARTED.md](/docs/GETTING_STARTED.md).
+
+AMD RDNA GPUs (e.g. RX 7900 XTX, gfx1100) build with ROCm: `cmake -B build_rocm -DENGINE_BACKEND=ROCM -DCMAKE_HIP_ARCHITECTURES=gfx1100`. The port runs every kernel with the tensor-core instructions emulated, so it is correct before it is fast; see [docs/ROCM.md](/docs/ROCM.md).
 
 ## Run
 

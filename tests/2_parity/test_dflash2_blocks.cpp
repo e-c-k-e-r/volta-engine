@@ -755,8 +755,8 @@ int main() {
 
 	engine::core::arena_destroy( arena );
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		cudaSetDevice( d );
-		cudaDeviceReset();
+		(void) cudaSetDevice( d );
+		(void) cudaDeviceReset();
 	}
 	std::printf( "========================================================\n" );
 	std::printf( "[+] DFLASH2 BACKBONE BLOCK PARITY PASSED\n" );

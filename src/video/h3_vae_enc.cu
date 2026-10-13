@@ -248,8 +248,8 @@ H3ImageEncoder::~H3ImageEncoder() {
 	if ( p_ ) {
 		if ( p_->blas ) { cublasDestroy( p_->blas ); }
 		if ( p_->warena.base_ptr ) { engine::core::arena_destroy( p_->warena ); }
-		if ( p_->a ) { cudaFree( p_->a ); }
-		if ( p_->im2col ) { cudaFree( p_->im2col ); }
+		if ( p_->a ) { (void) cudaFree( p_->a ); }
+		if ( p_->im2col ) { (void) cudaFree( p_->im2col ); }
 		engine::loader::safetensors_close( p_->st );
 		delete p_;
 	}
@@ -304,8 +304,8 @@ bool H3ImageEncoder::encode_tile( const float* d_rgb, int T, int H, int W, float
 	// activation buffers: the first level is the largest: 128 channels at H x W per frame
 	const size_t need = static_cast<size_t>( T ) * kCh * H * W;
 	if ( s.buf_elems < need ) {
-		if ( s.a ) { cudaFree( s.a ); }
-		if ( s.im2col ) { cudaFree( s.im2col ); }
+		if ( s.a ) { (void) cudaFree( s.a ); }
+		if ( s.im2col ) { (void) cudaFree( s.im2col ); }
 		s.im2col_elems = 320ull << 20; // 640 MB of FP16: a whole 256 px frame of the widest 3x3 conv (128 channels x 27 taps) at once
 		CUDA_CHECK( cudaMalloc( &s.im2col, s.im2col_elems * sizeof( half ) ) );
 		CUDA_CHECK( cudaMalloc( &s.a, ( need * 3 + 1024 ) * sizeof( float ) ) );
@@ -438,8 +438,8 @@ bool H3ImageEncoder::encode_crop( const std::vector<const float*>& frames, int H
 	const bool ok = encode_tile( d_in, T, th, tw, d_m );
 	moments->resize( static_cast<size_t>( Tl ) * 48 * ( th / kRatio ) * ( tw / kRatio ) );
 	CUDA_CHECK( cudaMemcpy( moments->data(), d_m, moments->size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
-	cudaFree( d_in );
-	cudaFree( d_m );
+	(void) cudaFree( d_in );
+	(void) cudaFree( d_m );
 	return ok;
 }
 

@@ -65,6 +65,7 @@ tier2_fast() {
 	run image_preprocess ./test_image
 	run output_parser ./test_output_parser
 	run backend_tiers ./test_backend_tiers $ROOT
+	run mma_frag ./test_mma_frag
 	run ref_linear_host ./test_ref_linear
 	run ref_linear_gpu gpu ./test_ref_linear --gpu
 	run ref_attention_host ./test_ref_attention

@@ -18,6 +18,7 @@
 | `test_image` | 2 | no | image decode, smart resize and patch layout against PIL / HF-layout references, GLM canvas sizes against exllamav3's (`tests/tools/gen_image_goldens.py`) |
 | `test_output_parser` | 2 | no | reasoning / tool-call parser, chunking independence, template round trip |
 | `test_backend_tiers` | 1 | no | capability registry matches the declared module functions |
+| `test_mma_frag` | 1 | no | on a simulated warp, against the PTX m16n8k16 / m8n8k4 layouts: the tensor-core fragment maps of the SM_80+ paths (`mma_frag.h`, `nvfp4_frag.h`) and the ROCm `mma` emulations (`mma_emu.h`) |
 
 ## Model-backed: checkpoints from `ENGINE_MODEL_ROOT`
 

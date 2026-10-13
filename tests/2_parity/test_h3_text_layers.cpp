@@ -22,7 +22,7 @@ static std::vector<std::vector<float>> run( const char* dir, const std::vector<i
 	float* d;
 	CUDA_CHECK( cudaMalloc( &d, ids.size() * 5120 * 4 ) );
 	ENGINE_ASSERT( enc.encode_mm( ids, 151655, { feat }, d ), "encode" );
-	cudaFree( d );
+	(void) cudaFree( d );
 	return layers;
 }
 

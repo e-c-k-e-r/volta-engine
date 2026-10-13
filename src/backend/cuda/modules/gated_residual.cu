@@ -668,7 +668,7 @@ void GatedResidual::norm( float* x, const backend::half_t* norm_w, float* normed
 
 void GatedResidual::gemm_f32( const backend::half_t* a, const backend::half_t* w, float* out, int m, int n, int k, bool accumulate, backend::stream_t stream ) {
 	int device = 0;
-	cudaGetDevice( &device );
+	(void) cudaGetDevice( &device );
 	cublasHandle_t h = trellis_get_cublas( device );
 	cublasSetStream( h, stream );
 	const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;

@@ -55,13 +55,13 @@ inline void* host_alloc_pinned( size_t bytes, Pin mode ) {
 	const unsigned flags = mode == Pin::MappedPortable ? ( cudaHostAllocMapped | cudaHostAllocPortable ) : mode == Pin::Mapped ? cudaHostAllocMapped : cudaHostAllocDefault;
 	return cudaHostAlloc( &p, bytes, flags ) == cudaSuccess ? p : nullptr;
 }
-inline void host_free_pinned( void* p ) { cudaFreeHost( p ); }
+inline void host_free_pinned( void* p ) { (void) cudaFreeHost( p ); }
 
 // Last launch error (kernel launches are asynchronous; this reports configuration failures)
 inline bool last_error_ok() { return cudaGetLastError() == cudaSuccess; }
 inline void check_last_error() { ENGINE_CHECK( cudaGetLastError() ); }
 inline void clear_last_error() { (void) cudaGetLastError(); }
-inline void device_reset() { cudaDeviceReset(); }
+inline void device_reset() { (void) cudaDeviceReset(); }
 
 // Non-aborting forms for callers that report failure to their own caller (arena creation, loaders)
 inline bool set_device_try( int device ) { return cudaSetDevice( device ) == cudaSuccess; }
@@ -86,6 +86,6 @@ inline graph_exec_t graph_instantiate( graph_t g ) {
 inline size_t graph_node_count( graph_t g ) { size_t n = 0; ENGINE_CHECK( cudaGraphGetNodes( g, nullptr, &n ) ); return n; }
 inline void graph_launch( graph_exec_t e, stream_t s ) { ENGINE_CHECK( cudaGraphLaunch( e, s ) ); }
 inline void graph_destroy( graph_t g ) { ENGINE_CHECK( cudaGraphDestroy( g ) ); }
-inline void graph_exec_destroy( graph_exec_t e ) { cudaGraphExecDestroy( e ); }
+inline void graph_exec_destroy( graph_exec_t e ) { (void) cudaGraphExecDestroy( e ); }
 
 } // namespace engine::backend

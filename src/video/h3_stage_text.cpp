@@ -91,7 +91,7 @@ bool H3Run::encode_prompt() {
 	LOG_INFO( "H3: language model (%zu tokens) in %.1f s", ids.size(), seconds_since( tl0 ) );
 	prompt.resize( ids.size() * 5120 );
 	CUDA_CHECK( cudaMemcpy( prompt.data(), d_prompt, prompt.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
-	cudaFree( d_prompt );
+	(void) cudaFree( d_prompt );
 	LOG_INFO( "H3: prompt fingerprint %016llx", static_cast<unsigned long long>( h3_fingerprint( prompt ) ) );
 	LOG_INFO( "H3: prompt %d tokens (%zu image(s)) encoded in %.1f s", static_cast<int>( ids.size() ), feats.size(), res.t_text );
 	return true;

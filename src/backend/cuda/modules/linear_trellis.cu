@@ -35,7 +35,7 @@ void LinearTrellis::forward_recon(
 	ENGINE_ASSERT( out.dtype == pod::DType::FP16, "LinearTrellis::forward_recon: FP16 output only" );
 	ENGINE_ASSERT( k % 128 == 0 && n % 128 == 0, "LinearTrellis::forward_recon: dims must be multiples of 128" );
 	int device = 0;
-	cudaGetDevice( &device );
+	(void) cudaGetDevice( &device );
 
 	// xh = H(x * suh); W = dequantized weight in the rotated basis; y = H((xh @ W) * svh). The standalone
 	// Hadamard's scale is the final one, so 1/sqrt(128) as in the fused kernels.
@@ -72,7 +72,7 @@ void LinearTrellis::forward(
 	const int n = trellis.shape[1] * 16;
 
 	int device = 0;
-	cudaGetDevice( &device );
+	(void) cudaGetDevice( &device );
 	half* A_had = trellis_get_workspace( device, static_cast<size_t>( m ) * k * sizeof( half ) );
 
 	bool c_fp32 = ( out.dtype == pod::DType::FP32 );
@@ -87,13 +87,25 @@ void LinearTrellis::forward(
 	// better on the GEMV with cold weights (the L2-resident loop of a single matrix says otherwise and is misleading).
 	int gemm_shape = 0;
 	if ( bits == 5 && m >= 4 && m <= 8 && mul1 && !c_fp32 && n == 6144 && ( k % 16 == 0 ) ) gemm_shape = 4;
-	if ( recon_threshold() > 0 && m > recon_threshold() && !c_fp32 && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
+#if defined(USE_ROCM)
+	// ROCm: the fused GEMM runs on emulated mma, 15-125x slower than reconstruct + hipBLAS at M = 16..64 (test_prefill_linear on a
+	// 7900 XTX). Up to EXL3_GEMV_ROCM_MAX_M rows the v_dot2 GEMV (exl3_gemv_rocm.cu), above that reconstruct
+	const bool recon = m > EXL3_GEMV_ROCM_MAX_M;
+	gemm_shape = 0;
+#else
+	const bool recon = recon_threshold() > 0 && m > recon_threshold();
+#endif
+	if ( recon && !c_fp32 && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 		forward_recon( x, trellis, suh, svh, out, bits, mcg, mul1, stream );
 	}
 	else if ( gemm_shape > 0 ) {
 		exl3_gemm( x_ptr, trellis_ptr, out_ptr, suh_ptr, A_had, svh_ptr, m, k, n, bits, mcg, mul1, c_fp32, stream, gemm_shape );
 	}
+#if defined(USE_ROCM)
+	else if ( m <= EXL3_GEMV_ROCM_MAX_M && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
+#else
 	else if ( m <= 8 && ( m == 1 || m == 2 || m == 4 || m == 8 ) && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
+#endif
 		exl3_gemv(
 			x_ptr,
 			trellis_ptr,

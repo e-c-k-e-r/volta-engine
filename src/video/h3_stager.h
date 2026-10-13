@@ -33,7 +33,7 @@ public:
 	explicit H3StageGroup( int n ) : n_( n ) {
 		for ( int i = 0; i < kStageSlots; ++i ) { CUDA_CHECK( cudaHostAlloc( &pinned_[i], kStageChunk, cudaHostAllocPortable ) ); }
 	}
-	~H3StageGroup() { for ( int i = 0; i < kStageSlots; ++i ) { cudaFreeHost( pinned_[i] ); } }
+	~H3StageGroup() { for ( int i = 0; i < kStageSlots; ++i ) { (void) cudaFreeHost( pinned_[i] ); } }
 	H3StageGroup( const H3StageGroup& ) = delete;
 	H3StageGroup& operator=( const H3StageGroup& ) = delete;
 
@@ -82,8 +82,8 @@ public:
 	}
 	~H3Stager() {
 		for ( int i = 0; i < kStageSlots; ++i ) {
-			cudaEventDestroy( free_[i] );
-			if ( own_[i] ) { cudaFreeHost( own_[i] ); }
+			(void) cudaEventDestroy( free_[i] );
+			if ( own_[i] ) { (void) cudaFreeHost( own_[i] ); }
 		}
 	}
 	H3Stager( const H3Stager& ) = delete;

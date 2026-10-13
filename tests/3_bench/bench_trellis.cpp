@@ -107,8 +107,8 @@ int main( int argc, char** argv ) {
 	engine::modules::trellis_context_destroy();
 
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		cudaSetDevice( d );
-		cudaDeviceReset();
+		(void) cudaSetDevice( d );
+		(void) cudaDeviceReset();
 	}
 
 	// Gate is on physical packed bytes. 4-bit trellis dequant is instruction-bound

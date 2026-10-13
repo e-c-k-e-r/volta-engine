@@ -187,6 +187,6 @@ int main() {
 	repo.close();
 	engine::core::arena_destroy( arena );
 	engine::modules::trellis_context_destroy();
-	cudaDeviceReset();
+	(void) cudaDeviceReset();
 	return 0;
 }

@@ -330,7 +330,7 @@ int main() {
 					CUDA_CHECK( cudaStreamSynchronize( streams[d] ) );
 					CUDA_CHECK( cudaMemcpy( got_x[d].data(), dx, nx * sizeof( float ), cudaMemcpyDeviceToHost ) );
 					CUDA_CHECK( cudaMemcpy( got_n[d].data(), dn, nx * sizeof( float ), cudaMemcpyDeviceToHost ) );
-					cudaFree( dx ); cudaFree( dn ); cudaFree( dp ); cudaFree( dw );
+					(void) cudaFree( dx ); (void) cudaFree( dn ); (void) cudaFree( dp ); (void) cudaFree( dw );
 				} );
 			}
 			for ( int d = 0; d < R; ++d ) workers[d].join();

@@ -632,7 +632,7 @@ bool H3AudioVAE::encode( const std::vector<float>& wave, int samples, std::vecto
 	CUDA_CHECK( cudaMemcpyAsync( rows->data(), lat, R * 32 * 4, cudaMemcpyDeviceToHost, st ) );
 	CUDA_CHECK( cudaStreamSynchronize( st ) );
 	CUDA_CHECK( cudaGetLastError() );
-	for ( float* p : { x, t1, t2, in, n1, qkv, ao, lat, pooled, a2, p3, xo, nn2, h0, h1, g, mo } ) { cudaFree( p ); }
+	for ( float* p : { x, t1, t2, in, n1, qkv, ao, lat, pooled, a2, p3, xo, nn2, h0, h1, g, mo } ) { (void) cudaFree( p ); }
 	*frames = T;
 	return true;
 }

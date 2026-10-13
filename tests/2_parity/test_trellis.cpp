@@ -13,6 +13,15 @@
 #include <atomic>
 
 static bool g_tracking_allocations = false;
+// Zero host heap allocations per forward is a property of the CUDA runtime. HIP's launch path allocates a command object on the host
+// for every kernel launch, so on ROCm the count is reported, not asserted
+#if defined(USE_ROCM)
+	#define ASSERT_NO_ALLOCS( n, msg ) ( (void) ( n ) )
+	#define ALLOCS_TARGET "HIP runtime launch objects, not checked on ROCm"
+#else
+	#define ASSERT_NO_ALLOCS( n, msg ) ENGINE_ASSERT( ( n ) == 0, msg )
+	#define ALLOCS_TARGET "target == 0"
+#endif
 static std::atomic<size_t> g_allocation_count{ 0 };
 
 void* operator new( size_t size ) {
@@ -185,7 +194,7 @@ static void run_parity_test_k(
 
 	g_tracking_allocations = false;
 	size_t dynamic_allocs = g_allocation_count.load();
-	ENGINE_ASSERT( dynamic_allocs == 0, "Execution pass performed dynamic heap allocations!" );
+	ASSERT_NO_ALLOCS( dynamic_allocs, "Execution pass performed dynamic heap allocations!" );
 
 	CUDA_CHECK( cudaMemcpy( h_out_gpu.data(), out_tv.data, out_numel * sizeof( half ), cudaMemcpyDeviceToHost ) );
 
@@ -222,7 +231,7 @@ static void run_parity_test_k(
 	std::printf( "    -> Cosine Similarity: %.6f (target >= 0.99990)\n", cos_sim );
 	std::printf( "    -> RMS Relative Error: %.6f (target <= 0.0050)\n", rms_rel_err );
 	std::printf( "    -> Max Relative Error: %.6f\n", max_rel_err );
-	std::printf( "    -> Dynamic Allocations: %zu (target == 0)\n", dynamic_allocs );
+	std::printf( "    -> Dynamic Allocations: %zu (" ALLOCS_TARGET ")\n", dynamic_allocs );
 	for ( int dbg = 0; dbg < 5; ++dbg ) {
 		std::printf( "       [%d] GPU: %f, REF: %f\n", dbg, host_half_to_float( h_out_gpu[dbg] ), h_out_ref[dbg] );
 	}
@@ -230,7 +239,7 @@ static void run_parity_test_k(
 
 	ENGINE_ASSERT( cos_sim >= 0.99990, "Cosine similarity below 0.9999" );
 	ENGINE_ASSERT( rms_rel_err <= 0.0050, "RMS relative error exceeds 0.005" );
-	ENGINE_ASSERT( dynamic_allocs == 0, "Non-zero dynamic allocations during execution" );
+	ASSERT_NO_ALLOCS( dynamic_allocs, "Non-zero dynamic allocations during execution" );
 
 	std::printf( "[+] K=%d PASS.\n", K );
 }
@@ -269,6 +278,13 @@ int main( int argc, char** argv ) {
 		// Test GEMM shape (m = 16 or wide N)
 		run_parity_test_k( K, mcg, 16, 512, 1024, arena, stream );
 	}
+	// Full-width GEMV (a model projection's N): the grid reaches the device's co-resident limit, where the cooperative kernel's
+	// grid.sync needs every block resident (the N = 512 cases above launch 16 blocks)
+	run_parity_test_k( 4, false, 1, 4096, 8192, arena, stream );
+	run_parity_test_k( 3, true, 1, 4096, 8192, arena, stream );
+	// Odd row counts (ROCm's GEMV takes every M <= 8; CUDA the GEMM)
+	run_parity_test_k( 4, false, 3, 4096, 1024, arena, stream );
+	run_parity_test_k( 6, true, 7, 2048, 1024, arena, stream );
 	// Multiplier codebook (cb 2): what the Flash-Next 7 / 8 bpw projections use
 	for ( int K : { 5, 7, 8 } ) {
 		run_parity_test_k( K, false, 4, 512, 512, arena, stream, true );
@@ -282,8 +298,8 @@ int main( int argc, char** argv ) {
 	engine::modules::trellis_context_destroy();
 
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		cudaSetDevice( d );
-		cudaDeviceReset();
+		(void) cudaSetDevice( d );
+		(void) cudaDeviceReset();
 	}
 
 	std::printf( "========================================================\n" );

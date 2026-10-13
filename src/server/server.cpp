@@ -57,7 +57,11 @@ bool VoltaServer::init( const ServerConfig& config ) {
 
 	std::printf( "========================================================\n" );
 	std::printf( "   VOLTA ENGINE: UNIFIED PRODUCTION HTTP/1.1 SERVER     \n" );
-	std::printf( "   Target: NVIDIA Tesla V100 (SM70), tensor parallel     \n" );
+#if defined(USE_ROCM)
+	std::printf( "   Target: AMD RDNA (ROCm), tensor parallel              \n" );
+#else
+	std::printf( "   Target: NVIDIA SM70 / SM86 / SM89, tensor parallel    \n" );
+#endif
 	std::printf( "========================================================\n" );
 	std::fflush( stdout );
 

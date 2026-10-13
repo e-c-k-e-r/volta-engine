@@ -95,7 +95,10 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
     const uint32_t* a1 = reinterpret_cast<const uint32_t*>(&a23);
     const uint32_t* bb = reinterpret_cast<const uint32_t*>(&b);
     uint32_t* cc = reinterpret_cast<uint32_t*>(&c);
-#if EXL3_SM75
+#if defined(USE_ROCM)
+    const uint32_t aa[4] = { a0[0], a0[1], a1[0], a1[1] };
+    mma_emu_m16n8k16_f16(aa, bb, cc, threadIdx.x & 31, rocm_shfl());
+#elif EXL3_SM75
     asm
     (
         "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "
@@ -270,11 +273,17 @@ __device__ __forceinline__ void dq8_regs_3bits(uint32_t a, uint32_t b, int s2, F
 
 inline __device__ uint4 ld_cs_v4(const uint4* ptr)
 {
+#if defined(USE_ROCM)
+    typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
+    const u32x4 v = __builtin_nontemporal_load(reinterpret_cast<const u32x4*>(ptr));
+    return make_uint4(v.x, v.y, v.z, v.w);
+#else
     uint4 ret;
     asm volatile ("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
         : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w)
         : "l"(ptr));
     return ret;
+#endif
 }
 
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE>

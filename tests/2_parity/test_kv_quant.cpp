@@ -53,7 +53,7 @@ Cache make_cache( pod::KVFormat f, size_t elems ) {
 }
 
 void free_cache( Cache& c ) {
-	cudaFree( c.ref.k ); cudaFree( c.ref.v ); cudaFree( c.ref.ks ); cudaFree( c.ref.vs );
+	(void) cudaFree( c.ref.k ); (void) cudaFree( c.ref.v ); (void) cudaFree( c.ref.ks ); (void) cudaFree( c.ref.vs );
 }
 
 pod::TensorView view( void* p, int rows, int cols ) {
@@ -182,7 +182,7 @@ int main( int argc, char** argv ) {
 			free_cache( c );
 		}
 		free_cache( ref );
-		cudaFree( d_k ); cudaFree( d_v ); cudaFree( d_q ); cudaFree( d_o_ref ); cudaFree( d_o ); cudaFree( d_rows );
+		(void) cudaFree( d_k ); (void) cudaFree( d_v ); (void) cudaFree( d_q ); (void) cudaFree( d_o_ref ); (void) cudaFree( d_o ); (void) cudaFree( d_rows );
 	}
 	std::printf( "%s KV quantization accuracy\n", all_ok ? "[+] PASS" : "[-] FAIL" );
 	return all_ok ? 0 : 1;

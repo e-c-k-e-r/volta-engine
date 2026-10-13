@@ -9,6 +9,7 @@
 #endif
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <thread>
@@ -38,6 +39,19 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		return false;
 	}
 	if ( tp_ > 1 ) runtime::options().no_graphs = true;
+#endif
+#if ENGINE_BACKEND_CUDA
+	// The configs in configs/ are written for four GPUs: on a smaller machine say so here, not from inside the collective's setup
+	if ( tp_ > backend::device_count() ) {
+		LOG_ERROR( "ModelCluster: tp %d requested, %d GPU(s) visible: set \"tp_size\" in the config (or --tp-size) to %d or fewer\n", tp_,
+			backend::device_count(), backend::device_count() );
+		return false;
+	}
+#endif
+#if defined(USE_ROCM)
+	// ROCm: eager by default. The decode graphs hold cooperative launches (the EXL3 GEMV), whose capture HIP may not support;
+	// ENGINE_DEBUG_NO_GRAPHS=0 turns graphs back on
+	if ( std::getenv( "ENGINE_DEBUG_NO_GRAPHS" ) == nullptr ) runtime::options().no_graphs = true;
 #endif
 	// The arena is a bump allocator over one up-front allocation per GPU. Unless a size is given (cfg.arena_bytes,
 	// arena_gib) it takes the device's free memory less a reserve for what lives outside it (graphs, workspaces, the

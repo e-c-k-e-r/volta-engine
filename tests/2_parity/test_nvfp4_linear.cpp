@@ -64,8 +64,8 @@ int main() {
 				CUDA_CHECK( cudaEventSynchronize( e1 ) );
 				CUDA_CHECK( cudaEventElapsedTime( &us, e0, e1 ) );
 				us *= 1000.0f / 20.0f;
-				cudaEventDestroy( e0 );
-				cudaEventDestroy( e1 );
+				(void) cudaEventDestroy( e0 );
+				(void) cudaEventDestroy( e1 );
 			}
 			std::vector<half> h_y( static_cast<size_t>( M ) * N );
 			CUDA_CHECK( cudaMemcpy( h_y.data(), d_y, h_y.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
