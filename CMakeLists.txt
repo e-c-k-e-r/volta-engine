@@ -203,7 +203,6 @@ set(ENGINE_CORE_SOURCES ${ENGINE_HOST_SOURCES} ${ENGINE_DEVICE_SOURCES})
 set(TRELLIS_SOURCES
 	src/kernels/cuda/trellis/exl3_gemm.cu
 	src/kernels/cuda/trellis/exl3_gemv.cu
-	src/kernels/cuda/trellis/exl3_gemv_rocm.cu
 	src/kernels/cuda/trellis/exl3_gemv_int8.cu
 	src/kernels/cuda/trellis/exl3_instances.cu
 	src/kernels/cuda/trellis/exl3_kernel_map.cu
@@ -212,6 +211,9 @@ set(TRELLIS_SOURCES
 	src/kernels/cuda/trellis/reconstruct.cu
 	src/kernels/cuda/trellis/trellis_context.cu
 )
+if(ENGINE_BACKEND STREQUAL "ROCM")
+	list(APPEND TRELLIS_SOURCES src/kernels/rocm/trellis/exl3_gemv.cu)
+endif()
 
 if(ENGINE_BACKEND STREQUAL "ROCM")
 	set(ENGINE_ROCM_HIP_SOURCES ${ENGINE_CORE_SOURCES} ${TRELLIS_SOURCES})

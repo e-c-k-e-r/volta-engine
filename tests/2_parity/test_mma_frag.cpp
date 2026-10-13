@@ -10,7 +10,7 @@
 //   2. SM_80+ path (operands swapped, 2 x m16n8k16) through the nvfp4_afrag / bfrag / acc maps: reproduces the reference
 //   3. nvfp4_pair_bits(q, p) equals dequant8_tm's element p (the same bit operations on the unshifted word)
 #include "../../src/kernels/cuda/mma_frag.h"
-#include "../../src/kernels/cuda/mma_emu.h"
+#include "../../src/kernels/rocm/mma_emu.h"
 #include "../../src/kernels/cuda/nvfp4/nvfp4_frag.h"
 #include <cstdio>
 #include <cstdlib>

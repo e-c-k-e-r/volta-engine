@@ -48,11 +48,6 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		return false;
 	}
 #endif
-#if defined(USE_ROCM)
-	// ROCm: eager by default. The decode graphs hold cooperative launches (the EXL3 GEMV), whose capture HIP may not support;
-	// ENGINE_DEBUG_NO_GRAPHS=0 turns graphs back on
-	if ( std::getenv( "ENGINE_DEBUG_NO_GRAPHS" ) == nullptr ) runtime::options().no_graphs = true;
-#endif
 	// The arena is a bump allocator over one up-front allocation per GPU. Unless a size is given (cfg.arena_bytes,
 	// arena_gib) it takes the device's free memory less a reserve for what lives outside it (graphs, workspaces, the
 	// CUDA context); vram_reserve_mib overrides the reserve. The model's own tables (KV pools, scratch) are sized by

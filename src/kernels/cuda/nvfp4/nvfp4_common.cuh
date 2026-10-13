@@ -4,7 +4,7 @@
 #include <cuda_fp16.h>
 #include "nvfp4_frag.h"
 #if defined(USE_ROCM)
-	#include "../mma_emu.h"
+	#include "../../rocm/mma_emu.h"
 #endif
 #define DEV_INLINE __device__ __forceinline__
 

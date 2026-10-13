@@ -278,6 +278,10 @@ __global__ void batched_argmax_kernel(
 	}
 }
 
+#if defined(USE_ROCM)
+#include "../../../kernels/rocm/rms_norm_vec.cuh"
+#endif
+
 } // namespace
 
 void RMSNorm::forward(
@@ -293,6 +297,13 @@ void RMSNorm::forward(
 	for ( int i = 0; i < x.ndim - 1; ++i ) {
 		rows *= x.shape[i];
 	}
+#if defined(USE_ROCM)
+	if ( hidden_size % 8 == 0 && hidden_size <= 8192 && ( reinterpret_cast<uintptr_t>( x.data ) & 15 ) == 0 && ( reinterpret_cast<uintptr_t>( out.data ) & 15 ) == 0
+		&& ( weight.data == nullptr || ( reinterpret_cast<uintptr_t>( weight.data ) & 15 ) == 0 ) ) {
+		rms_norm_vec_kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>( x.ptr<const half>(), out.ptr<half>(), weight.ptr<const half>(), hidden_size, eps, constant_bias );
+		return;
+	}
+#endif
 	rms_norm_kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>(
 		x.ptr<const half>(),
 		out.ptr<half>(),

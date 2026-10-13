@@ -4,7 +4,7 @@
 #if defined(USE_ROCM)
 	// ROCm forms of the PTX below: tensor-core operations emulated in NVIDIA's fragment layouts (mma_emu.h, checked on the CPU by
 	// test_mma_frag), memory-model operations as HIP atomics with the matching scope, cp.async as a synchronous copy (as on SM_70)
-	#include "../mma_emu.h"
+	#include "../../rocm/mma_emu.h"
 	#define PTX_SYNC_COPY 1
 #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
 	#define PTX_SYNC_COPY 1

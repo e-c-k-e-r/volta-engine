@@ -786,6 +786,10 @@ void dflash_qk_norm_rope(
 		x, weight, rope_cos, rope_sin, rows, heads, head_dim, pairs, pos0, eps, constant_bias );
 }
 
+#if defined(USE_ROCM)
+#include "../kernels/rocm/dflash_attn_wmma.cuh"
+#endif
+
 void dflash_attn(
 	const half* q, const half* kcache, const half* vcache, half* out,
 	int rows, int q_heads, int kv_heads, int head_dim,
@@ -796,6 +800,14 @@ void dflash_attn(
 	cudaStream_t stream
 ) {
 	if ( rows <= 0 || q_heads <= 0 ) return;
+#if defined(USE_ROCM)
+	// RDNA3: the WMMA kernel (the scalar one below spends 0.8 ms per layer on a 2048-key window)
+	if ( ( head_dim == 128 || head_dim == 256 ) && kv_heads > 0 && q_heads % kv_heads == 0 && rows <= 16 && q_heads <= 64 ) {
+		if ( head_dim == 128 ) dflash_attn_wmma_launch<128>( q, kcache, vcache, out, rows, q_heads, kv_heads, nctx, first_ctx, ring_slots, ctx_layer, stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream );
+		else dflash_attn_wmma_launch<256>( q, kcache, vcache, out, rows, q_heads, kv_heads, nctx, first_ctx, ring_slots, ctx_layer, stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream );
+		return;
+	}
+#endif
 	const int nkeys = nctx + MAX( rows - own_first_row, 0 );
 	const float scale = rsqrtf( static_cast<float>( head_dim ) );
 	dim3 grid( q_heads, rows );

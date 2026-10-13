@@ -33,19 +33,19 @@ __global__ __launch_bounds__( 32 * ROCM_GEMV_MAX_WARPS ) void exl3_gemv_rocm_ker
 	int K,
 	int N
 ) {
+	// The warp's slice of the input rows is staged through shared memory a chunk of CH k tiles at a time, laid out [tile][lane & 3][row] with
+	// a lane's two half pairs (k = r0, r0 + 1 and r0 + 8, r0 + 9) adjacent: one 8-byte LDS read per row and tile instead of two global loads,
+	// which at 8 rows cost more than decoding the weights (86 against 36 ms for a Qwen3.8-27B 8-row block)
+	constexpr int CH = 8;
 	__shared__ float red[ROCM_GEMV_MAX_WARPS][MR][16];
+	__shared__ __align__( 16 ) half as_[ROCM_GEMV_MAX_WARPS][MR][CH * 16];
 	const int lane = threadIdx.x & 31;
 	const int warp = __builtin_amdgcn_readfirstlane( threadIdx.x >> 5 );
 	const int warps = blockDim.x >> 5;
 	const int tile_n = blockIdx.x, n_tiles = N >> 4, k_tiles = K >> 4;
 	const int per = ( k_tiles + warps - 1 ) / warps;
 	const int kb0 = warp * per, kb1 = min( k_tiles, kb0 + per );
-	const int r0 = ( lane & 3 ) * 2;
-
-	// Rows past M re-read the last row (sums dropped at the store): branch-free, so the loads of later k tiles can issue early
-	const half2* ar[MR];
-	#pragma unroll
-	for ( int m = 0; m < MR; ++m ) ar[m] = reinterpret_cast<const half2*>( A + (size_t) min( m, M - 1 ) * K ) + ( r0 >> 1 );
+	const int nchunks = ( per + CH - 1 ) / CH;
 
 	float acc_a[MR], acc_b[MR];
 	#pragma unroll
@@ -53,18 +53,37 @@ __global__ __launch_bounds__( 32 * ROCM_GEMV_MAX_WARPS ) void exl3_gemv_rocm_ker
 
 	const uint32_t* bt = reinterpret_cast<const uint32_t*>( B + ( (size_t) kb0 * n_tiles + tile_n ) * ( 16 * bits ) );
 	const size_t bstep = (size_t) n_tiles * 16 * bits / 2;   // uint32 words from one k tile to the next
-	#pragma unroll 4
-	for ( int kt = kb0; kt < kb1; ++kt, bt += bstep ) {
-		FragB f0, f1;
-		dq_dispatch<bits, cb>( bt, lane << 3, f0, f1 );
-		#pragma unroll
-		for ( int m = 0; m < MR; ++m ) {
-			const half2 a01 = ar[m][kt * 8], a89 = ar[m][kt * 8 + 4];
-			acc_a[m] = rocm_fdot2( a01, f0[0], acc_a[m] );
-			acc_a[m] = rocm_fdot2( a89, f0[1], acc_a[m] );
-			acc_b[m] = rocm_fdot2( a01, f1[0], acc_b[m] );
-			acc_b[m] = rocm_fdot2( a89, f1[1], acc_b[m] );
+	const uint2* alane = reinterpret_cast<const uint2*>( &as_[warp][0][0] ) + ( lane & 3 ) * MR;
+	for ( int c = 0; c < nchunks; ++c ) {
+		const int kc = kb0 + c * CH;
+		const int n = max( 0, min( CH, kb1 - kc ) );
+		// Rows past M re-read the last row (sums dropped at the store)
+		for ( int e = lane; e < MR * CH * 2; e += 32 ) {
+			const int m = e / ( CH * 2 ), v = e % ( CH * 2 );
+			if ( ( v >> 1 ) >= n ) continue;
+			const uint4 val = *reinterpret_cast<const uint4*>( A + (size_t) min( m, M - 1 ) * K + (size_t) kc * 16 + v * 8 );
+			half2* dst = reinterpret_cast<half2*>( &as_[warp][0][0] ) + ( ( v >> 1 ) * 4 * MR + m ) * 2 + ( v & 1 );
+			dst[0 * MR * 2] = __builtin_bit_cast( half2, val.x );
+			dst[1 * MR * 2] = __builtin_bit_cast( half2, val.y );
+			dst[2 * MR * 2] = __builtin_bit_cast( half2, val.z );
+			dst[3 * MR * 2] = __builtin_bit_cast( half2, val.w );
 		}
+		__syncthreads();
+		#pragma unroll 4
+		for ( int j = 0; j < n; ++j, bt += bstep ) {
+			FragB f0, f1;
+			dq_dispatch<bits, cb>( bt, lane << 3, f0, f1 );
+			#pragma unroll
+			for ( int m = 0; m < MR; ++m ) {
+				const uint2 av = alane[j * 4 * MR + m];
+				const half2 a01 = __builtin_bit_cast( half2, av.x ), a89 = __builtin_bit_cast( half2, av.y );
+				acc_a[m] = rocm_fdot2( a01, f0[0], acc_a[m] );
+				acc_a[m] = rocm_fdot2( a89, f0[1], acc_a[m] );
+				acc_b[m] = rocm_fdot2( a01, f1[0], acc_b[m] );
+				acc_b[m] = rocm_fdot2( a89, f1[1], acc_b[m] );
+			}
+		}
+		__syncthreads();
 	}
 
 	const int q = lane >> 2;

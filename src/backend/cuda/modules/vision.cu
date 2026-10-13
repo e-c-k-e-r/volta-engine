@@ -5,7 +5,7 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #if defined(USE_ROCM)
-	#include "../../../kernels/cuda/mma_emu.h"
+	#include "../../../kernels/rocm/mma_emu.h"
 #endif
 #include <cmath>
 

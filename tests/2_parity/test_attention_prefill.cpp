@@ -1,5 +1,5 @@
 // Prefill attention kernel against the decode kernel on random K/V: a chunk of rows at consecutive positions over a
-// cache that already holds earlier positions, GQA 6 q-heads / 2 kv-heads at head_dim 256 (the per-rank Qwen shape).
+// cache that already holds earlier positions, GQA at head_dim 256: 6 q-heads / 2 kv-heads (the per-rank Qwen shape) and 24 / 4.
 //   pass: cosine >= 0.9999 and max relative error <= 0.5% per case.
 #include "engine/config.h"
 #include "engine/core/tensor.h"
@@ -16,10 +16,10 @@ int main() {
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	cudaStream_t s;
 	CUDA_CHECK( cudaStreamCreate( &s ) );
-	const int qh = 6, kvh = 2, hd = 256, max_seq = 8192;  // cases keep pos0 + rows <= max_seq
+	const int hd = 256, max_seq = 8192;  // cases keep pos0 + rows <= max_seq
 	pod::MemoryArena arena;
 	ENGINE_ASSERT( engine::core::arena_create( arena, 0, 1ULL << 30 ), "arena" );
-	const size_t kv_elems = static_cast<size_t>( max_seq ) * kvh * hd;   // one layer, one slot
+	const size_t kv_elems = static_cast<size_t>( max_seq ) * 4 * hd;   // one layer, one slot, up to 4 kv heads
 	auto* k_cache = static_cast<half*>( engine::core::arena_alloc( arena, kv_elems * 2 ) );
 	auto* v_cache = static_cast<half*>( engine::core::arena_alloc( arena, kv_elems * 2 ) );
 	std::vector<half> hk( kv_elems ), hv( kv_elems );
@@ -37,6 +37,9 @@ int main() {
 		{ 1, 5000 }, { 2, 3000 }, { 5, 6000 }, { 8, 7000 }, { 8, 40 }, { 3, 0 },
 		{ 1, 5000, true }, { 5, 6000, true }, { 8, 7000, true }, { 8, 40, true } }; // decode / verify shapes (key_hint 0, as the graphs pass)
 	int fails = 0;
+	for ( const int shape : { 0, 1 } ) {
+	const int qh = shape ? 24 : 6, kvh = shape ? 4 : 2;   // per-rank TP4 shape, and the whole model on one GPU
+	std::printf( "q heads %d, kv heads %d\n", qh, kvh );
 	for ( const auto& c : cases ) {
 		const size_t qn = static_cast<size_t>( c.rows ) * qh * hd;
 		std::vector<half> hq( qn ), hg( qn );
@@ -82,6 +85,7 @@ int main() {
 		float t_pre = 0; CUDA_CHECK( cudaEventElapsedTime( &t_pre, e0, e1 ) );
 		std::printf( "  rows %3d at pos %4d: cos %.6f max|d| %.4g (max %.3g) | decode kernel %8.1f us  prefill kernel %8.1f us (%.1fx)  %s\n",
 			c.rows, c.pos0, cosv, maxd, maxabs, t_dec * 200.0f, t_pre * 200.0f, t_dec / t_pre, ok ? "PASS" : "FAIL" );
+	}
 	}
 	std::printf( "=== ATTENTION PREFILL: %s ===\n", fails ? "FAIL" : "PASS" );
 	return fails ? 1 : 0;

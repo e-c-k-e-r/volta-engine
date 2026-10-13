@@ -167,9 +167,14 @@ __device__ __forceinline__ void __nanosleep( unsigned int ) {
 #endif
 }
 
-// __dp4a, unsigned form (byte sums against 0x01010101, the codebook decode): v_dot4_u32_u8 on RDNA3 / RDNA4
+// __dp4a, unsigned form (byte sums against 0x01010101, the codebook decode): v_sad_u8 on RDNA3, v_dot4_u32_u8 on RDNA4
 __device__ __forceinline__ unsigned int __dp4a( unsigned int a, unsigned int b, unsigned int c ) {
-#if defined(__HIP_DEVICE_COMPILE__) && ( defined(__GFX11__) || defined(__GFX12__) )
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__)
+	// The byte sum (b all ones, the only use) is a SAD against 0: about full rate on RDNA3, where v_dot4_u32_u8 issues at a quarter
+	// (measured on gfx1100 only: tests/tools/int_rates.cu is the CUDA twin of that micro-benchmark)
+	if ( b == 0x01010101u ) return __builtin_amdgcn_sad_u8( a, 0u, c );
+	return __builtin_amdgcn_udot4( a, b, c, false );
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__GFX12__)
 	return __builtin_amdgcn_udot4( a, b, c, false );
 #endif
 	#pragma unroll

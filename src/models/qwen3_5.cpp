@@ -282,8 +282,17 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 	// 3. LM Head, sharded across the vocabulary dimension
 	if ( fp4 ) {
 		ENGINE_ASSERT( tp_size_ > 1 || tp_ranks_ == 1, "Qwen3_5Pipeline: the NVFP4 checkpoint needs the vocabulary-parallel head" );
-		lm_head_ = repo.load_dense_rows_padded( "lm_head.weight", *arena_, rank_ * lm_shard_real_cols_, lm_shard_real_cols_,
-			lm_shard_cols_ - lm_shard_real_cols_, stream );
+		const std::string& nv_groups = runtime::options().nvfp4_dense;
+		if ( nv_groups == "all" || ( "," + nv_groups + "," ).find( ",head," ) != std::string::npos ) {
+			// The head quantized to NVFP4 at load (round-to-nearest from the BF16 tensor): a quarter of the bytes of the FP16 head, which is
+			// the largest single read of a decode step on one GPU
+			const int beg = rank_ * lm_shard_real_cols_, cnt = lm_shard_real_cols_;
+			lm_head_ = repo.quantize_nvfp4( "lm_head", *arena_, &beg, &cnt, 1, 0, config_.hidden_size, lm_shard_cols_, stream );
+		}
+		else {
+			lm_head_ = repo.load_dense_rows_padded( "lm_head.weight", *arena_, rank_ * lm_shard_real_cols_, lm_shard_real_cols_,
+				lm_shard_cols_ - lm_shard_real_cols_, stream );
+		}
 	}
 	else if ( tp_size_ > 1 ) {
 		lm_head_ = repo.load_linear_slice_padded( "lm_head", *arena_, 5, rank_, tp_size_, lm_shard_cols_ - lm_shard_real_cols_, stream );

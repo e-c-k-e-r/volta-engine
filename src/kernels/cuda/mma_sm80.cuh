@@ -5,7 +5,7 @@
 #include <cstdint>
 #include "mma_frag.h"
 #if defined(USE_ROCM)
-	#include "mma_emu.h"
+	#include "../rocm/mma_emu.h"
 #endif
 
 // ROCm takes these paths too, with the m16n8k16 emulated (mma_emu.h)

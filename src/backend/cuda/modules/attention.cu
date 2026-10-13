@@ -5,6 +5,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
+#if defined(USE_ROCM)
+#include "../../../kernels/rocm/wmma.cuh"
+#endif
 
 namespace engine::modules {
 
@@ -875,6 +878,10 @@ __global__ void attn_reduce_kernel(
 	output[out_off] = __float2half_rn( val * sig );
 }
 
+#if defined(USE_ROCM)
+#include "../../../kernels/rocm/attn_wmma.cuh"
+#endif
+
 } // namespace
 
 void Attention::unpack_q_gate(
@@ -1019,11 +1026,35 @@ void Attention::forward_prefill(
 ) {
 	ENGINE_ASSERT( head_dim == 256 && num_q_heads % num_kv_heads == 0, "Attention::forward_prefill: head_dim 256 and GQA only" );
 #if defined(USE_ROCM)
-	// The tiled kernel stages ~96 KB of shared memory; RDNA grants a workgroup 64 KB. The decode kernel gives the same result
+	// The tiled kernel stages ~96 KB of shared memory; RDNA grants a workgroup 64 KB. The WMMA kernel fits in 64 KB
 	if ( PA_SMEM > rocm_smem_optin_max() ) {
 		(void) key_hint;
-		(void) per_row;
-		forward_decode( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream );
+		const float scale_w = 1.0f / sqrtf( static_cast<float>( head_dim ) );
+		const int Gw = num_q_heads / num_kv_heads;
+		const int tile_w = per_row ? Gw : WM_BQ;
+		const int base_w = num_kv_heads * ( ( count * Gw + tile_w - 1 ) / tile_w );
+		int nsplit_w = 1;
+		if ( base_w < 96 ) nsplit_w = MIN( ( 192 + base_w - 1 ) / base_w, 32 );
+		if ( key_hint > 0 ) nsplit_w = MAX( 1, MIN( nsplit_w, key_hint / ( 4 * WM_BK ) ) );
+		ENGINE_ASSERT( static_cast<size_t>( count ) * num_q_heads * nsplit_w <= static_cast<size_t>( ATTN_MAX_ROW_HEADS ) * ATTN_MAX_CHUNKS, "Attention::forward_prefill: workspace" );
+		float* ws_w = attn_workspace_ptr();
+		const dim3 grid_w( num_kv_heads, ( count * Gw + tile_w - 1 ) / tile_w, nsplit_w );
+		const half* gate_w = gate.data != nullptr ? gate.ptr<const half>() : nullptr;
+		#define LAUNCH_WMMA() do { \
+			CUDA_CHECK( cudaFuncSetAttribute( attn_wmma_kernel<KQ_, VQ_>, cudaFuncAttributeMaxDynamicSharedMemorySize, WM_SMEM ) ); \
+			attn_wmma_kernel<KQ_, VQ_><<<grid_w, 32 * WM_W, WM_SMEM, stream>>>( q.ptr<const half>(), kv, gate_w, out.ptr<half>(), slot_stride, layer_idx, d_rows, \
+				count, num_q_heads, num_kv_heads, max_seq, scale_w, ws_w, nsplit_w, tile_w ); \
+		} while ( 0 )
+		#define KQ_ KQV_
+		#define VQ_ VQV_
+		KV_DISPATCH( KQV_, VQV_, LAUNCH_WMMA() )
+		#undef KQ_
+		#undef VQ_
+		#undef LAUNCH_WMMA
+		if ( nsplit_w > 1 ) {
+			const int vrot_w = kv.vq == KVQ::Q4 ? 1 : 0;
+			attn_reduce_kernel<256><<<dim3( num_q_heads, count ), 256, 0, stream>>>( ws_w, gate_w, out.ptr<half>(), num_q_heads, nsplit_w, vrot_w );
+		}
 		return;
 	}
 #endif

@@ -393,7 +393,12 @@ void test_attn( pod::MemoryArena& arena, int rows, int q_heads, int kv_heads, in
 	std::printf( "  attn      rows=%d qh=%d kvh=%d hd=%d nctx=%-4d | max %.3e rms %.3e ulp %.2f\n",
 		rows, q_heads, kv_heads, head_dim, nctx, d.max_abs, d.rms, d.max_ulp );
 	std::fflush( stdout );
+#if defined(USE_ROCM)
+	// The WMMA kernel multiplies FP16 probabilities (the scalar kernel's are FP32): near-zero outputs sit many ulp off but under 1e-3 absolute
+	ENGINE_ASSERT( d.max_ulp <= 8.0 || d.max_abs <= 1e-3, "drafter attention deviates from softmax reference" );
+#else
 	ENGINE_ASSERT( d.max_ulp <= 8.0, "drafter attention deviates from softmax reference" );
+#endif
 }
 
 // Per-row top-k over a padded vocabulary shard: scans [0, columns) of a row whose stride is
