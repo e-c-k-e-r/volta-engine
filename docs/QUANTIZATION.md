@@ -7,6 +7,18 @@ Which weight formats the checkpoints use, at how many bits, and what that costs 
 * **EXL3** (trellis): the `exl3` conversions of turboderp's exllamav3. `bits` is the average over the tensors; the head, the MTP head and the vision tower have their own widths. Loaded as they are, decoded in the GEMV / GEMM kernels.
 * **NVFP4** (modelopt): E2M1 values with an E4M3 scale per 16 and one FP32 scale per matrix. Software-unpacked on Volta (no FP4 hardware). Either read from a modelopt checkpoint (the routed experts), or made at load by the engine's quantizer from BF16 tensors (round to nearest with a +-2 code search per block, or the calibrated tensors from `tests/tools/nvfp4_ldlq.py`). FP8 sources (the Flash-Next MTP experts: E4M3 with 128 x 128 block scales) are dequantized first.
 
+### Models
+
+This document tries its best to continuously reference a model by its quantization, but providers also matter to an extent. Below is a collated table mapping their names to their source:
+* [thelastspark/Swift-Qwen3.8-Flash-Next-exl3 (4.00bpw)](https://huggingface.co/thelastspark/Swift-Qwen3.8-Flash-Next-exl3)
+* [turboderp/GLM-5.3-Flash-exl3 (3.05bpw)](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3)
+* [incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2) (self-quantized as `*-exl3-calibrated-v2`)
+* [Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3 (5.0bpw)](https://huggingface.co/Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw)
+* [turboderp/Qwen3-VL-32B-Instruct-exl3 (6bpw)](https://huggingface.co/turboderp/Qwen3-VL-32B-Instruct-exl3)
+* [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)
+* [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
+* [nvidia/GLM-5.3-Flash-NVFP4](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4)
+
 ## Bit widths of the EXL3 checkpoints
 
 | Checkpoint | Average bits | Head | MTP head | Vision | Notes |
@@ -14,12 +26,13 @@ Which weight formats the checkpoints use, at how many bits, and what that costs 
 | Swift-Qwen3.8-Flash-Next-exl3-4.00bpw | 4.0 | 6 | 4 | 6 | attention and GDN projections 7 / 8 bit, routed and shared experts 3 / 4 bit (layers 5, 8, 45 and 46 are 3-bit); router, `shared_expert_gate` and the GDN `in_proj_a/b` FP16 |
 | GLM-5.3-Flash-exl3-3.05bpw | 3.05 | 6 | | 6 | |
 | Qwen3.8-27B-DFlash2-EXL3-5.0bpw (drafter) | 5.0 | 6 | | | |
-| GLM-5.3-Flash-DFlash2-exl3-calibrated-v2 (drafter) | not recorded in its config | | | | |
 | Qwen3-VL-32B-Instruct-exl3-6bpw (MiniMax-H3 text tower) | 6.0 | 6 | | | `mcg` codebook, the others `mul1`; each conversion calibrated on 250 rows of 2048 tokens |
 
 The NVFP4 checkpoints: `Qwen3.8-Flash-Next-NVFP4` is modelopt `MIXED_PRECISION`: routed experts NVFP4 (group 16), the MTP head's experts FP8 E4M3 (128 x 128 blocks), the n-gram table FP8, everything else BF16. `GLM-5.3-Flash-NVFP4` is the same idea for GLM (experts NVFP4, the rest BF16); its layer 45, the MTP head, is all BF16 (experts included) and is quantized to NVFP4 at load when `speculator=mtp`; the EXL3 conversion has no head. The engine uses the NVFP4 experts as they are and quantizes the dense tensors it is told to (`nvfp4_dense`) from the BF16 ones.
 
 ## Perplexity
+
+Perplexity values are reported in their mean NLL forms.
 
 ### Flash-Next
 

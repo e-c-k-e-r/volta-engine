@@ -5,8 +5,12 @@ Yet another (slopped) inference engine, tailored in C++ for Volta, specifically 
 ## Build
 
 CUDA 12.x is required, as 13+ drops SM_70 support. *Could* run on SM_75+, but no kernels would make use of instructions / specifications introduced later.
+* Additional backends are in place (CPU/Vulkan), but are untuned and merely for scaffolding, not performance.
+* Experimental SM_86 (Ampere, RTX 30X0) and SM_89 (Ada, RTX 40X0) support is provided under the `experimental` branch, but needs testing (via my 4070Ti, when I can supplant it).
+* Experimental ROCm support is also provided under the `experimental` branch. Currently only `gfx1100` (7900XTX) is tested (`gfx1030` support might also be tested in the future).
 
 To compile, run `cmake -B build && cmake --build build`.
+* *to-do*: report flags for other backends
 
 ## Run
 
@@ -47,6 +51,8 @@ Decode speed through the streaming API, one request, 4x V100-SXM2-32GB at a 250 
 
 A plain token takes 12 ms (Qwen NVFP4), 14 ms (Flash-Next), 15 ms (GLM) or 16 ms (Qwen EXL3). Repetitive output peaks at over 300 tok/s on Qwen NVFP4. Perplexity per configuration and the bit widths of the EXL3 checkpoints are in [docs/QUANTIZATION.md](/docs/QUANTIZATION.md). Everything else, including where the time goes per kernel and how this compares with 1Cat-vLLM's published figures (different cards, clocks and prompts), is in [docs/PERFORMANCE.md](/docs/PERFORMANCE.md).
 
+A model's weight format heavily predicates its performance (NVFP4 will always win out over EXL3 trellis, but a smaller EXL3 quant should win over bigger ones), at the cost of perplexity.
+
 ### Why not?
 
 This project was slopped up over a weekend. CUDA is NOT my expertise (Vulkan is).
@@ -54,6 +60,8 @@ This project was slopped up over a weekend. CUDA is NOT my expertise (Vulkan is)
 I don't intend to turn this into an actual project beyond a side-hobby, as existing solutions should be servicable enough for most people's usecases (in other words, I don't indend to extend this as a competitive engine).
 
 A slim amount of [models](/src/models/) and weight formats (EXL3, NVFP4) are supported, but extending them shouldn't be too much of a hassle.
+
+Supported, tested configurations are narrow, as it's limited to what I currently have on hand, so gaps in coverage may exist.
 
 ## Notices
 
