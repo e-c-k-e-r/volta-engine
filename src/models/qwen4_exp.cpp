@@ -572,14 +572,12 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 						ENGINE_ASSERT( bytes[p] > 0, "Qwen4ExpPipeline: expert codes not found for the tier" );
 					}
 				}
-				tier_.configure( per_rank, tier_fraction, bytes );
+				tier_.configure( per_rank, tier_fraction, bytes, runtime::options().expert_heat_file.empty() ? std::string() : runtime::options().expert_heat_file + ( tp_ > 1 ? ".r" + std::to_string( rank_ ) : std::string() ) );
 				const size_t host_bytes = ( runtime::options().expert_synth ? 0 : static_cast<size_t>( config_.num_layers ) * tier_.cold_bytes_per_layer() ) + tier_.slot_bytes + 256;
 				ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "Qwen4ExpPipeline: pinned expert tier allocation failed" );
 				tier_.allocate_staging( host_arena_ );
 			}
-			std::vector<int> resident_set( tier_.resident );
-			for ( int s = 0; s < tier_.resident; ++s ) resident_set[s] = s;
-			tier_.add_layer( &mw, *arena_, host_arena_, resident_set );
+			tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_ ) );
 			tier_layer = tier_layers_++;
 		}
 		for ( int e = 0; e < per_rank; ++e ) {
@@ -784,6 +782,26 @@ void Qwen4ExpPipeline::trace_rows( int tag, const void* dev, bool streams, int m
 }
 
 // Router output of the m rows: per row top_k expert ids then top_k weights, as floats
+// Debug (route_dump): record {layer, rows, first position, K}, the rows' expert ids (int32) and the router's input rows (FP16)
+void Qwen4ExpPipeline::dump_router( int m, backend::stream_t stream ) {
+	static const std::string& path = runtime::options().route_dump;
+	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH ) return;
+	const int K = config_.top_k, H = config_.hidden_size;
+	std::vector<int> ids( static_cast<size_t>( m ) * K );
+	std::vector<backend::half_t> x( static_cast<size_t>( m ) * H );
+	backend::stream_sync( stream );
+	backend::memcpy_async( ids.data(), topk_idx_, ids.size() * sizeof( int ), backend::Copy::D2H, stream );
+	backend::memcpy_async( x.data(), mixed_.data, x.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
+	if ( FILE* f = std::fopen( path.c_str(), "ab" ) ) {
+		const int hdr[4] = { hess_layer_, m, key_hint_ - m, K };
+		std::fwrite( hdr, sizeof( int ), 4, f );
+		std::fwrite( ids.data(), sizeof( int ), ids.size(), f );
+		std::fwrite( x.data(), sizeof( backend::half_t ), x.size(), f );
+		std::fclose( f );
+	}
+}
+
 void Qwen4ExpPipeline::trace_route( int tag, int m, backend::stream_t stream ) {
 	static const std::string& path = runtime::options().trace_layers;
 	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH ) return;
@@ -1061,6 +1079,7 @@ void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backe
 	}
 	engine::modules::MoERouter::route_softmax_topk( mixed_, lw.router, topk_idx_, topk_w_, H, config_.num_experts, config_.top_k, stream, m );
 	if ( &lw == &layers_[0] ) trace_route( 700, m, stream );
+	dump_router( m, stream );
 	const int per_rank = config_.num_experts / tp_;
 	// Plain SiLU gating (no swiglu limit): act_limit 0
 	engine::modules::MoE::forward( mixed_, lw.experts, topk_idx_, topk_w_, y_, rank_ * per_rank, ( rank_ + 1 ) * per_rank, moe_scratch_, 0.0f, stream );
@@ -1100,6 +1119,7 @@ bool Qwen4ExpPipeline::rebalance_experts( backend::stream_t stream ) {
 	tier_.reset_window();
 	int moved = 0;
 	for ( int l = 0; l < tier_layers_; ++l ) moved += tier_.rebalance( l, stream );
+	if ( ++tier_.rebalances % 8 == 0 ) tier_.save_heat();
 	if ( runtime::options().expert_log ) {
 		LOG_INFO( "[experts rank %d] window hit rate %.3f over %llu routes, %d swaps (%llu total)\n", rank_, tier_.hit_rate(),
 			static_cast<unsigned long long>( tier_.window_routes ), moved, static_cast<unsigned long long>( tier_.swaps ) );

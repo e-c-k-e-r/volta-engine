@@ -378,6 +378,7 @@ bool Glm5NextPipeline::rebalance_experts( backend::stream_t stream ) {
 	tier_.reset_window();
 	int moved = 0;
 	for ( int l = 0; l < tier_layers_; ++l ) moved += tier_.rebalance( l, stream );
+	if ( ++tier_.rebalances % 8 == 0 ) tier_.save_heat();
 	if ( runtime::options().expert_log ) {
 		LOG_INFO( "[experts rank %d] window hit rate %.3f over %llu routes, %d swaps (%llu total)\n", rank_, tier_.hit_rate(),
 			static_cast<unsigned long long>( tier_.window_routes ), moved, static_cast<unsigned long long>( tier_.swaps ) );
@@ -702,16 +703,14 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 						if ( bytes[p] == 0 && runtime::options().expert_synth >= 2 ) bytes[p] = repo.synth_trellis_bytes( name_buf );
 						ENGINE_ASSERT( bytes[p] > 0, "Glm5NextPipeline: expert codes not found for the tier" );
 					}
-					tier_.configure( experts_per_rank, tier_fraction, bytes );
+					tier_.configure( experts_per_rank, tier_fraction, bytes, runtime::options().expert_heat_file.empty() ? std::string() : runtime::options().expert_heat_file + ( config_.tp_size > 1 ? ".r" + std::to_string( rank_ ) : std::string() ) );
 					int moe_layers = 0;
 					for ( int ll = 0; ll < config_.num_layers; ++ll ) moe_layers += ( ll >= 3 ) ? 1 : 0;
 					const size_t host_bytes = ( runtime::options().expert_synth ? 0 : runtime::options().expert_stream ? tier_.cold_bytes_per_layer() + 256 : static_cast<size_t>( moe_layers ) * tier_.cold_bytes_per_layer() ) + tier_.slot_bytes + 256;
 					ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "Glm5NextPipeline: pinned expert tier allocation failed" );
 					tier_.allocate_staging( host_arena_ );
 				}
-				std::vector<int> resident_set( tier_.resident );
-				for ( int s = 0; s < tier_.resident; ++s ) resident_set[s] = s;
-				tier_.add_layer( &mw, *arena_, host_arena_, resident_set );
+				tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_ ) );
 				tier_layer = tier_layers_++;
 			}
 			for ( int e = 0; e < experts_per_rank; ++e ) {
@@ -1474,6 +1473,24 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				state_.d_topk_indices, state_.d_topk_weights,
 				H, config_.num_experts, config_.top_k, 2.5f, stream, m
 			);
+			static const std::string& dump_path = runtime::options().route_dump;
+			if ( !dump_path.empty() && rank_ == 0 && m > pod::MAX_BATCH ) {
+				// Debug (route_dump): {layer, rows, first position, K}, the rows' expert ids (int32), the router's input rows (FP16)
+				const int K = config_.top_k;
+				std::vector<int> ids( static_cast<size_t>( m ) * K );
+				std::vector<backend::half_t> xr( static_cast<size_t>( m ) * H );
+				backend::stream_sync( stream );
+				backend::memcpy_async( ids.data(), state_.d_topk_indices, ids.size() * sizeof( int ), backend::Copy::D2H, stream );
+				backend::memcpy_async( xr.data(), norm_hidden_.data, xr.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+				backend::stream_sync( stream );
+				if ( FILE* f = std::fopen( dump_path.c_str(), "ab" ) ) {
+					const int hdr[4] = { layer, m, key_hint_ - m, K };
+					std::fwrite( hdr, sizeof( int ), 4, f );
+					std::fwrite( ids.data(), sizeof( int ), ids.size(), f );
+					std::fwrite( xr.data(), sizeof( backend::half_t ), xr.size(), f );
+					std::fclose( f );
+				}
+			}
 			static const std::string& replay_path = runtime::options().route_replay;
 			if ( !replay_path.empty() && m > pod::MAX_BATCH ) {
 				// Debug: overwrite the routing of rows that have a record (key layer * 2^20 + position)

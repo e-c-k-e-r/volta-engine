@@ -1,4 +1,5 @@
 #include "engine/modules/expert_tier.h"
+#include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include <algorithm>
 #include <cstdlib>
@@ -7,6 +8,8 @@
 #include <cerrno>
 #include <thread>
 #include <unistd.h>
+#include <fstream>
+#include <numeric>
 
 namespace engine::modules {
 
@@ -14,7 +17,7 @@ double ExpertTier::resident_fraction() {
 	return runtime::options().expert_cache;
 }
 
-void ExpertTier::configure( int experts_per_layer, double fraction, const size_t bytes[3] ) {
+void ExpertTier::configure( int experts_per_layer, double fraction, const size_t bytes[3], const std::string& heat_file ) {
 	experts = experts_per_layer;
 	resident = std::max( 1, std::min( experts, static_cast<int>( fraction * experts_per_layer + 0.5 ) ) );
 	slot_bytes = 0;
@@ -23,7 +26,64 @@ void ExpertTier::configure( int experts_per_layer, double fraction, const size_t
 		slot_bytes += bytes[i];
 	}
 	ENGINE_ASSERT( slot_bytes % 256 == 0, "ExpertTier: expert code bytes must be a multiple of 256" );
-	if ( runtime::options().expert_swaps >= 0 ) max_swaps = runtime::options().expert_swaps;
+	max_swaps = runtime::options().expert_swaps;
+	heat_path = heat_file;
+	seed.clear();
+	if ( !heat_path.empty() ) {
+		// File: "VEH1", layers, experts (int32 each), then layers x experts uint64 counts. Older runs count half, so the latest workload leads
+		std::ifstream f( heat_path, std::ios::binary );
+		char magic[4] = {};
+		int32_t nl = 0, ne = 0;
+		if ( f && f.read( magic, 4 ) && std::string( magic, 4 ) == "VEH1" && f.read( reinterpret_cast<char*>( &nl ), 4 ) && f.read( reinterpret_cast<char*>( &ne ), 4 ) && ne == experts_per_layer && nl > 0 ) {
+			seed.resize( static_cast<size_t>( nl ) * ne );
+			if ( !f.read( reinterpret_cast<char*>( seed.data() ), static_cast<std::streamsize>( seed.size() * sizeof( uint64_t ) ) ) ) seed.clear();
+			for ( auto& v : seed ) v /= 2;
+		}
+		LOG_INFO( "[experts] heat file %s: %s\n", heat_path.c_str(), seed.empty() ? "none usable, starting from experts 0..N-1" : "seeding the resident sets" );
+	}
+}
+
+int ExpertTier::swap_cap() const {
+	if ( max_swaps >= 0 ) return max_swaps;
+	// A swap moves two experts' bytes: the budget per rebalance pass is spread over the layers
+	const size_t budget = static_cast<size_t>( std::max( 1, runtime::options().expert_swap_mib ) ) << 20;
+	const size_t per_layer = budget / ( std::max<size_t>( 1, layers.size() ) * 2 * slot_bytes );
+	return static_cast<int>( std::max<size_t>( 1, std::min<size_t>( 64, per_layer ) ) );
+}
+
+std::vector<int> ExpertTier::initial_set( int layer ) const {
+	std::vector<int> set( resident );
+	if ( seed.size() >= static_cast<size_t>( layer + 1 ) * experts ) {
+		const uint64_t* c = seed.data() + static_cast<size_t>( layer ) * experts;
+		std::vector<int> order( experts );
+		std::iota( order.begin(), order.end(), 0 );
+		std::stable_sort( order.begin(), order.end(), [&]( int a, int b ) { return c[a] > c[b]; } );
+		order.resize( resident );
+		std::sort( order.begin(), order.end() );
+		return order;
+	}
+	std::iota( set.begin(), set.end(), 0 );
+	return set;
+}
+
+void ExpertTier::save_heat() {
+	if ( heat_path.empty() || layers.empty() || !heat_dirty ) return;
+	const std::string tmp = heat_path + ".tmp";
+	{
+		std::ofstream f( tmp, std::ios::binary );
+		const int32_t nl = static_cast<int32_t>( layers.size() ), ne = experts;
+		f.write( "VEH1", 4 );
+		f.write( reinterpret_cast<const char*>( &nl ), 4 );
+		f.write( reinterpret_cast<const char*>( &ne ), 4 );
+		for ( const Layer& l : layers ) f.write( reinterpret_cast<const char*>( l.total.data() ), static_cast<std::streamsize>( l.total.size() * sizeof( uint64_t ) ) );
+		if ( !f ) return;
+	}
+	std::rename( tmp.c_str(), heat_path.c_str() );
+	heat_dirty = false;
+}
+
+ExpertTier::~ExpertTier() {
+	save_heat();
 }
 
 void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, pod::MemoryArena& host, std::vector<int> resident_set ) {
@@ -34,6 +94,8 @@ void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, 
 	l.owner.assign( resident, -1 );
 	l.host.assign( experts, nullptr );
 	l.score.assign( experts, 0 );
+	l.total.assign( experts, 0 );
+	if ( seed.size() >= ( layers.size() + 1 ) * static_cast<size_t>( experts ) ) std::copy_n( seed.begin() + layers.size() * experts, experts, l.total.begin() );
 	ENGINE_ASSERT( static_cast<int>( resident_set.size() ) == resident, "ExpertTier::add_layer: resident set size" );
 	for ( int s = 0; s < resident; ++s ) {
 		l.slot_of[resident_set[s]] = s;
@@ -124,16 +186,19 @@ int ExpertTier::rebalance( int layer, cudaStream_t stream ) {
 		window_routes += heat[e];
 		if ( l.slot_of[e] >= 0 ) window_hits += heat[e];
 		l.score[e] = l.score[e] / 2 + heat[e];
+		l.total[e] += heat[e];
 	}
 	int done = 0;
 	void* table = l.mw->device_ptrs;
-	for ( ; done < max_swaps; ++done ) {
+	heat_dirty = true;
+	const int cap = swap_cap();
+	for ( ; done < cap; ++done ) {
 		int hot = -1, cold_res = -1; // hottest cold expert, coldest resident one
 		for ( int e = 0; e < experts; ++e ) {
 			if ( l.slot_of[e] < 0 ) { if ( hot < 0 || l.score[e] > l.score[hot] ) hot = e; }
 			else { if ( cold_res < 0 || l.score[e] < l.score[cold_res] ) cold_res = e; }
 		}
-		if ( hot < 0 || cold_res < 0 || l.score[hot] < l.score[cold_res] + l.score[cold_res] / 2 + 8 ) break;
+		if ( hot < 0 || cold_res < 0 || l.score[hot] < l.score[cold_res] + l.score[cold_res] / 2 + static_cast<uint64_t>( std::max( 0, runtime::options().expert_swap_margin ) ) ) break;
 		const int slot = l.slot_of[cold_res];
 		uint8_t* slot_ptr = l.slots + static_cast<size_t>( slot ) * slot_bytes;
 		uint8_t* hot_buf = l.host[hot];

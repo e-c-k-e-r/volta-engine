@@ -70,7 +70,10 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `kv_format` | string | `(empty)` | `ENGINE_KV_FORMAT` | KV cache format: fp16, fp8, k8v4 or nvfp4; empty = the model default (fp16). GLM stores its single latent tensor in one format (k8v4 = 8-bit) |
 | `expert_cache` | float | `1` | `ENGINE_EXPERT_CACHE` | resident routed-expert fraction in (0, 1] (GLM, Flash-Next); below 1 enables the two-tier expert cache: the codes of the cold experts live in pinned host memory and are read over PCIe |
 | `expert_adapt_every` | int | `64` | `ENGINE_EXPERT_ADAPT_EVERY` | decode steps between expert residency rebalances (0 = never) |
-| `expert_swaps` | int | `-1` | `ENGINE_EXPERT_SWAPS` | maximum expert swaps per rebalance; <0 = the tier default |
+| `expert_swap_margin` | int | `2` | `ENGINE_EXPERT_SWAP_MARGIN` | a cold expert replaces the coldest resident one only when its decayed route score exceeds 1.5 x the resident one's plus this margin (scores are route counts per rebalance window, folded as score / 2 + count); lower values adapt faster and flip more |
+| `expert_swaps` | int | `-1` | `ENGINE_EXPERT_SWAPS` | maximum expert swaps per layer per rebalance; <0 = derived from expert_swap_mib |
+| `expert_swap_mib` | int | `1024` | `ENGINE_EXPERT_SWAP_MIB` | bytes the swaps of one rebalance pass may move (MiB; a swap moves two experts), spread over the layers, when expert_swaps is not set |
+| `expert_heat_file` | string | `(empty)` | `ENGINE_EXPERT_HEAT_FILE` | file the tiered experts' per-layer route counts are saved to (every few rebalances and at exit) and read from at start: the resident sets then start with the hottest experts instead of experts 0..N-1 (one file per rank: .r<rank> is appended with more than one rank) |
 | `speculator` | string | `dflash` | `ENGINE_SPECULATOR` | speculation source: dflash (needs a draft model) or mtp (the checkpoint's own multi-token-prediction head, Qwen) |
 | `mtp_depth` | int | `7` | `ENGINE_MTP_DEPTH` | most draft tokens per round with speculator=mtp (1 to 7); the head stops chaining earlier when its recent accuracy is low |
 | `draft_tp` | bool | `true` | `ENGINE_DRAFT_TP` | false runs the drafter on rank 0 only |
@@ -86,6 +89,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `dsa_diag` | bool | `false` | `ENGINE_DEBUG_DSA_DIAG` | sparse-attention indexer diagnostics |
 | `trace_layers` | string | `(empty)` | `ENGINE_DEBUG_TRACE_LAYERS` | GLM: file that receives the last row's residual streams after every layer of every eager forward (rank 0) |
 | `perturb_embed` | float | `0` | `ENGINE_DEBUG_PERTURB_EMBED` | GLM: multiply every prompt embedding element by 1 + eps * u (u in [-1, 1], hashed from position and dimension, so independent of chunking); eager prefill only, a noise-floor probe |
+| `route_dump` | string | `(empty)` | `ENGINE_DEBUG_ROUTE_DUMP` | Flash-Next, GLM: file that receives, for every MoE layer of every eager prefill chunk (rank 0), the router input rows (FP16) and the routed expert ids, to measure how well a layer's routing can be predicted from the layer before it (offline) |
 | `route_replay` | string | `(empty)` | `ENGINE_DEBUG_ROUTE_REPLAY` | GLM: a <trace_layers>.route file; eager prefill rows found in it use the recorded expert ids and weights (the latest record per layer and position wins), isolating router flips |
 | `qwen4_halt` | int | `-1` | `ENGINE_DEBUG_QWEN4_HALT` | qwen4_exp bring-up: stop the layer stack after this many sublayer sites (0 = after layer 0's attention half, 1 = after its MLP half, ...); <0 runs everything |
 | `gr_fuse` | bool | `true` | `ENGINE_DEBUG_GR_FUSE` | qwen4_exp: decode-sized rows reduce the sublayer output, add it to the streams and norm them for the next site in one kernel (false = three launches, for A/B) |

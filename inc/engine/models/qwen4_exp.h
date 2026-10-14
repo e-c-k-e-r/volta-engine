@@ -177,6 +177,7 @@ private:
 	size_t copy_kv_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );   // returns the bytes moved
 	void copy_pool_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	void trace_route( int tag, int m, backend::stream_t stream );
+	void dump_router( int m, backend::stream_t stream );
 	void trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols = 0 );
 	// Calibration (ENGINE_HESSIAN_DIR): x^T x of a projection input, accumulated over prefill rows into site `site` of layer `layer`
 	// (0 attention / GDN input, 1 MoE input, 2 o_proj / out_proj input (rank slice), 3 shared-expert down input, 4 lm_head input with layer 0)
