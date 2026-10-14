@@ -35,4 +35,19 @@ __attribute__(( weak )) int ExpertTier::rebalance( int layer, backend::stream_t 
 	__builtin_unreachable();
 }
 
+// No cold experts to stream on this backend
+bool ExpertTier::stream_mode() {
+	return false;
+}
+
+__attribute__(( weak )) void ExpertTier::set_source( int layer, int expert, int part, int fd, size_t off, size_t bytes ) {
+	ENGINE_UNSUPPORTED( "ExpertTier::set_source" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void ExpertTier::stream_fill( int layer, backend::stream_t stream ) {
+	ENGINE_UNSUPPORTED( "ExpertTier::stream_fill" );
+	__builtin_unreachable();
+}
+
 } // namespace engine::modules

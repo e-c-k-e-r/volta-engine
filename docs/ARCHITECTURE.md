@@ -36,7 +36,7 @@ time (`-DENGINE_BACKEND=CUDA|CPU|VULKAN`); one build tree is one backend.
   pools, recurrent state, scratch and graph buffers are bump-allocated from it. Nothing is allocated while decoding.
 - **Tensor parallel**: ranks 0..3 run the same pipeline on their shard; one `RankPool` thread per rank pinned to a core
   (CUDA builds). Attention heads, MoE intermediate widths and the vocabulary head are sharded; the residual is all-reduced
-  over NVLink. `tp` is a runtime value (1, 2 or 4; GLM 1 or 4).
+  over NVLink. `tp` is a runtime value (1, 2 or 4; GLM 1, 2 or 4).
 - **CUDA graphs**: decode bodies are captured once per row count (`GraphCache`) and replayed; the prefill path runs eagerly in
   chunks of up to 512 rows.
 - **Speculation**: the DFlash2 drafter proposes a block, the target verifies it in one forward (per-row recurrent-state

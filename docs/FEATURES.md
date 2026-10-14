@@ -15,7 +15,7 @@ Speed figures are indicative: the GPUs run power-capped (150 to 225 W depending 
 | Model | Type | Layers | GPUs | Notes |
 |---|---|---|---|---|
 | Qwen3.8-27B | `qwen3_5` | GDN linear attention + full attention | 1, 2 or 4 | EXL3 or NVFP4; the DFlash2 drafter or the MTP head |
-| GLM-5.3-Flash | `glm5_next` | KDA linear attention (34 layers) + absorbed MLA with a DSA indexer (11 layers), routed MoE (288 experts, top 8) | 1 or 4 | EXL3 experts; NVFP4 for the dense groups |
+| GLM-5.3-Flash | `glm5_next` | KDA linear attention (34 layers) + absorbed MLA with a DSA indexer (11 layers), routed MoE (288 experts, top 8) | 1, 2 or 4 | EXL3 experts; NVFP4 for the dense groups |
 | Qwen3.8-Flash-Next | `qwen4_exp` | GDN + QSA block-sparse attention, 512-expert MoE, gated residual streams, one n-gram embedding layer | 4 only | EXL3 3/4 bpw experts with 7/8 bpw projections; NVFP4 experts and dense groups |
 
 The model type is read from the checkpoint, never configured. Anything else is a fatal error at start.
@@ -71,7 +71,7 @@ Validated contexts:
 
 ## Parallelism and scheduling
 
-* tensor parallel over NVLink with a 2- or 4-rank all-reduce (`tp`, `--tp-size`): Qwen 1/2/4, GLM 1 or 4, Flash-Next 4; the Vulkan build does the same over several Vulkan devices with the all-reduce staged through host memory
+* tensor parallel over NVLink with a 2- or 4-rank all-reduce (`tp`, `--tp-size`): Qwen 1/2/4, GLM 1, 2 or 4, Flash-Next 4; the Vulkan build does the same over several Vulkan devices with the all-reduce staged through host memory
   * `--tp-size 2` is about 0.7x the speed of four; a second server on the other pair doubles the aggregate (`CUDA_VISIBLE_DEVICES`)
 * one arena per GPU, allocated at boot from the free memory minus a reserve (`arena_gib`, `vram_reserve_mib`); nothing allocates while decoding
 * up to `max_slots` concurrent sequences, `max_batch_size` of them stepped together; the scheduler thread owns the slots

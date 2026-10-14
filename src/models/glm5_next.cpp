@@ -92,8 +92,8 @@ bool Glm5NextPipeline::init(
 ) {
 	config_ = config;
 	config_.tp_size = ( ring != nullptr ) ? requested_tp_ : 1;
-	ENGINE_ASSERT( config_.tp_size == 1 || config_.tp_size == ENGINE_NUM_GPUS, "GLM runs on 1 or 4 ranks" );
-	// 64 attention heads (MLA and KDA alike) split over the ranks: 16 per rank on four, all 64 on one
+	ENGINE_ASSERT( config_.tp_size == 1 || config_.tp_size == 2 || config_.tp_size == ENGINE_NUM_GPUS, "GLM runs on 1, 2 or 4 ranks" );
+	// 64 attention heads (MLA and KDA alike) split over the ranks: 16 per rank on four, 32 on two, all 64 on one
 	lh_ = 64 / config_.tp_size;
 	config_.kda_heads = lh_;
 	config_.kda_channels = lh_ * 3 * config_.kda_head_dim;
@@ -918,24 +918,30 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		lw.e_score_bias = bf( "mlp.gate.e_score_correction_bias" );
 		auto& mw = lw.moe_weights;
 		mw.type = pod::QuantType::NVFP4;
-		mw.num_local_experts = config_.num_experts;
+		// The head's experts follow the layer layout of the trunk: every expert's intermediate width sliced over the ranks (moe_tp_), or
+		// this rank's whole experts (expert-parallel, the tier)
+		const int head_experts = moe_tp_ ? config_.num_experts : experts_per_rank;
+		const int head_first = moe_tp_ ? 0 : start_expert;
+		const int head_rank = moe_tp_ ? rank_ : 0, head_tp = moe_tp_ ? config_.tp_size : 1;
+		mw.num_local_experts = head_experts;
 		mw.top_k = config_.top_k;
-		for ( int e = 0; e < config_.num_experts; ++e ) {
-			std::snprintf( name_buf, sizeof( name_buf ), "%s.mlp.experts.%d.gate_proj", pre, e );
-			mw.gate[e] = nv_check( nv_repo->quantize_nvfp4_slice( name_buf, *arena_, true, rank_, config_.tp_size, 0, stream ), name_buf );
-			std::snprintf( name_buf, sizeof( name_buf ), "%s.mlp.experts.%d.up_proj", pre, e );
-			mw.up[e] = nv_check( nv_repo->quantize_nvfp4_slice( name_buf, *arena_, true, rank_, config_.tp_size, 0, stream ), name_buf );
-			std::snprintf( name_buf, sizeof( name_buf ), "%s.mlp.experts.%d.down_proj", pre, e );
-			mw.down[e] = nv_check( nv_repo->quantize_nvfp4_slice( name_buf, *arena_, false, rank_, config_.tp_size, 0, stream ), name_buf );
+		for ( int e = 0; e < head_experts; ++e ) {
+			const int gid = head_first + e;
+			std::snprintf( name_buf, sizeof( name_buf ), "%s.mlp.experts.%d.gate_proj", pre, gid );
+			mw.gate[e] = nv_check( nv_repo->quantize_nvfp4_slice( name_buf, *arena_, true, head_rank, head_tp, 0, stream ), name_buf );
+			std::snprintf( name_buf, sizeof( name_buf ), "%s.mlp.experts.%d.up_proj", pre, gid );
+			mw.up[e] = nv_check( nv_repo->quantize_nvfp4_slice( name_buf, *arena_, true, head_rank, head_tp, 0, stream ), name_buf );
+			std::snprintf( name_buf, sizeof( name_buf ), "%s.mlp.experts.%d.down_proj", pre, gid );
+			mw.down[e] = nv_check( nv_repo->quantize_nvfp4_slice( name_buf, *arena_, false, head_rank, head_tp, 0, stream ), name_buf );
 		}
 		engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );
-		mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( config_.num_experts ) * sizeof( uint32_t ), 128 ) );
-		backend::memset_async( mw.heat, 0, static_cast<size_t>( config_.num_experts ) * sizeof( uint32_t ), stream );
+		mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( head_experts ) * sizeof( uint32_t ), 128 ) );
+		backend::memset_async( mw.heat, 0, static_cast<size_t>( head_experts ) * sizeof( uint32_t ), stream );
 		lw.shared_expert.gate = nv_check( nv_repo->quantize_nvfp4_slice( nm( "mlp.shared_experts.gate_proj" ), *arena_, true, 0, 1, 0, stream ), name_buf );
 		lw.shared_expert.up = nv_check( nv_repo->quantize_nvfp4_slice( nm( "mlp.shared_experts.up_proj" ), *arena_, true, 0, 1, 0, stream ), name_buf );
 		lw.shared_expert.down = nv_check( nv_repo->quantize_nvfp4_slice( nm( "mlp.shared_experts.down_proj" ), *arena_, true, 0, 1, 0, stream ), name_buf );
 		lw.has_shared_expert = true;
-		if ( rank_ == 0 ) LOG_INFO( "[RANK 0] MTP head from the NVFP4 checkpoint: layer %d, %d experts quantized to NVFP4 (this rank's slice)\n", L, config_.num_experts );
+		if ( rank_ == 0 ) LOG_INFO( "[RANK 0] MTP head from the NVFP4 checkpoint: layer %d, %d experts quantized to NVFP4 (this rank's %s)\n", L, head_experts, moe_tp_ ? "slice" : "whole experts" );
 	}
 
 	size_t bytes_after = arena_->offset_bytes;

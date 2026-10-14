@@ -161,7 +161,7 @@ values are fatal errors. The model type is never configured: it is read from the
 | `model_dir` | `--model-dir` | required | checkpoint directory |
 | `draft_model_dir` | `--draft-model-dir` | none | DFlash2 drafter checkpoint; required with `use_speculation` |
 | `use_speculation` | `--speculative` | false | enable speculative decoding |
-| `tp_size` | `--tp-size` | 4 | GPUs (1, 2 or 4; GLM runs on 1 or 4) |
+| `tp_size` | `--tp-size` | 4 | GPUs (1, 2 or 4; GLM runs on 1, 2 or 4) |
 | `host`, `port` | `--host`, `--port` | 0.0.0.0, 8000 | listen address |
 | `max_batch_size` | `--max-batch-size` | 8 | concurrent decode slots the scheduler may fill (capped by `max_slots`) |
 | `default_max_tokens` | `--max-tokens` | 256 | `max_tokens` for requests that omit it |
