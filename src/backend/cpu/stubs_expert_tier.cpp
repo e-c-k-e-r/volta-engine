@@ -10,10 +10,25 @@ double ExpertTier::resident_fraction() {
 	return 1.0;
 }
 
-__attribute__(( weak )) void ExpertTier::configure( int experts_per_layer, double fraction, const size_t bytes[3] ) {
+__attribute__(( weak )) void ExpertTier::configure( int experts_per_layer, double fraction, const size_t bytes[3], const std::string& heat_file ) {
 	ENGINE_UNSUPPORTED( "ExpertTier::configure" );
 	__builtin_unreachable();
 }
+
+__attribute__(( weak )) std::vector<int> ExpertTier::initial_set( int layer ) const {
+	ENGINE_UNSUPPORTED( "ExpertTier::initial_set" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) int ExpertTier::swap_cap() const {
+	ENGINE_UNSUPPORTED( "ExpertTier::swap_cap" );
+	__builtin_unreachable();
+}
+
+// Nothing is tiered on this backend, so there is nothing to save
+__attribute__(( weak )) void ExpertTier::save_heat() {}
+
+__attribute__(( weak )) ExpertTier::~ExpertTier() {}
 
 __attribute__(( weak )) void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, pod::MemoryArena& host, std::vector<int> resident_set ) {
 	ENGINE_UNSUPPORTED( "ExpertTier::add_layer" );

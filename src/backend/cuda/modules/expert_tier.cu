@@ -188,6 +188,19 @@ int ExpertTier::rebalance( int layer, cudaStream_t stream ) {
 		l.score[e] = l.score[e] / 2 + heat[e];
 		l.total[e] += heat[e];
 	}
+	// What the swap decision compares: the recent window scores blended with the long-run distribution of the layer's routes, so a good
+	// resident set (a seeded one, or one the layer has settled into) is not churned by a window's noise. The weight of the history grows
+	// with how much of it there is (a cold start follows the first windows), up to expert_history_pct.
+	std::vector<uint64_t> eff( l.score );
+	{
+		double s_sum = 0.0, t_sum = 0.0;
+		for ( int e = 0; e < experts; ++e ) { s_sum += static_cast<double>( l.score[e] ); t_sum += static_cast<double>( l.total[e] ); }
+		const double cap_w = std::min( 100, std::max( 0, runtime::options().expert_history_pct ) ) / 100.0;
+		const double w = ( s_sum > 0.0 && t_sum > 0.0 ) ? cap_w * t_sum / ( t_sum + 4.0 * s_sum ) : 0.0;
+		if ( w > 0.0 ) {
+			for ( int e = 0; e < experts; ++e ) eff[e] = static_cast<uint64_t>( ( 1.0 - w ) * static_cast<double>( l.score[e] ) + w * static_cast<double>( l.total[e] ) * s_sum / t_sum + 0.5 );
+		}
+	}
 	int done = 0;
 	void* table = l.mw->device_ptrs;
 	heat_dirty = true;
@@ -195,10 +208,10 @@ int ExpertTier::rebalance( int layer, cudaStream_t stream ) {
 	for ( ; done < cap; ++done ) {
 		int hot = -1, cold_res = -1; // hottest cold expert, coldest resident one
 		for ( int e = 0; e < experts; ++e ) {
-			if ( l.slot_of[e] < 0 ) { if ( hot < 0 || l.score[e] > l.score[hot] ) hot = e; }
-			else { if ( cold_res < 0 || l.score[e] < l.score[cold_res] ) cold_res = e; }
+			if ( l.slot_of[e] < 0 ) { if ( hot < 0 || eff[e] > eff[hot] ) hot = e; }
+			else { if ( cold_res < 0 || eff[e] < eff[cold_res] ) cold_res = e; }
 		}
-		if ( hot < 0 || cold_res < 0 || l.score[hot] < l.score[cold_res] + l.score[cold_res] / 2 + static_cast<uint64_t>( std::max( 0, runtime::options().expert_swap_margin ) ) ) break;
+		if ( hot < 0 || cold_res < 0 || eff[hot] < eff[cold_res] + eff[cold_res] / 2 + static_cast<uint64_t>( std::max( 0, runtime::options().expert_swap_margin ) ) ) break;
 		const int slot = l.slot_of[cold_res];
 		uint8_t* slot_ptr = l.slots + static_cast<size_t>( slot ) * slot_bytes;
 		uint8_t* hot_buf = l.host[hot];
