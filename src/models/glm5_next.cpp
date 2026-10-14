@@ -93,6 +93,10 @@ bool Glm5NextPipeline::init(
 	config_ = config;
 	config_.tp_size = ( ring != nullptr ) ? requested_tp_ : 1;
 	ENGINE_ASSERT( config_.tp_size == 1 || config_.tp_size == ENGINE_NUM_GPUS, "GLM runs on 1 or 4 ranks" );
+	// 64 attention heads (MLA and KDA alike) split over the ranks: 16 per rank on four, all 64 on one
+	lh_ = 64 / config_.tp_size;
+	config_.kda_heads = lh_;
+	config_.kda_channels = lh_ * 3 * config_.kda_head_dim;
 	rank_ = rank;
 	arena_ = &arena;
 	ring_ = ring;
@@ -117,7 +121,9 @@ bool Glm5NextPipeline::init(
 	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R, mtp_on_ );
 	// The fused decode kernels read cold experts from host memory a little slower than the persistent kernel (6.4 vs 6.8 tok/s at a
 	// 50% tier), so the tier keeps the persistent path
+#if !defined(USE_ROCM)
 	if ( engine::modules::ExpertTier::resident_fraction() < 1.0 ) state_.moe.coop_ctr = nullptr;
+#endif   // the ROCm build has no persistent kernel (its tensor-core path is emulated, 70 ms a layer): the fused launch serves the tier too
 
 	// KDA recurrent state + conv history per slot: [S, 45, ...] FP32, plus one-slot checkpoints
 	// Only the linear-attention layers carry state: every fourth layer (3, 7, ...) is MLA
@@ -187,9 +193,9 @@ bool Glm5NextPipeline::init(
 			ENGINE_ASSERT( latent_scales_ != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the latent scales" );
 			backend::memset_sync( latent_scales_, 0, scale_bytes );
 		}
-		latent_ws_ = static_cast<float*>( engine::core::arena_alloc( arena, engine::modules::MLALatent::workspace_floats( config_.max_seq, 16 ) * sizeof( float ), 128 ) );
+		latent_ws_ = static_cast<float*>( engine::core::arena_alloc( arena, engine::modules::MLALatent::workspace_floats( config_.max_seq, lh_ ) * sizeof( float ), 128 ) );
 		ENGINE_ASSERT( latent_ws_ != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the latent workspace" );
-		int lat_shape[2] = { R, 16 * 512 };
+		int lat_shape[2] = { R, lh_ * 512 };
 		q_lat_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lat_shape, 2 );
 		o_lat_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lat_shape, 2 );
 
@@ -217,33 +223,33 @@ bool Glm5NextPipeline::init(
 	q_lora_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_lora_shape, 2 );
 	q_lora_norm_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_lora_shape, 2 );
 
-	int q_shape[2] = { R, 4096 };
+	int q_shape[2] = { R, lh_ * 256 };
 	q_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, q_shape, 2 );
 
 	int kv_lora_shape[2] = { R, 512 };
 	kv_lora_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_lora_shape, 2 );
 	kv_lora_norm_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_lora_shape, 2 );
 
-	int kv_head_shape[2] = { R, 4096 };
+	int kv_head_shape[2] = { R, lh_ * 256 };
 	k_head_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_head_shape, 2 );
 	v_head_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_head_shape, 2 );
 	mla_heads_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_head_shape, 2 );
 
 	// KDA linear attention buffers
-	int qkv_shape[2] = { R, 6144 };
+	int qkv_shape[2] = { R, config_.kda_channels };
 	qkv_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
 
 	int fa_shape[2] = { R, 128 };
 	f_a_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, fa_shape, 2 );
 	g_a_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, fa_shape, 2 );
 
-	int beta_shape[2] = { R, 16 };
+	int beta_shape[2] = { R, lh_ };
 	beta_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, beta_shape, 2 );
 
-	int gdec_shape[2] = { R, 2048 };
+	int gdec_shape[2] = { R, lh_ * 128 };
 	g_decay_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, gdec_shape, 2 );
 
-	int z_shape[2] = { R, 2048 };
+	int z_shape[2] = { R, lh_ * 128 };
 	z_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
 	attn_head_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
 
@@ -344,8 +350,8 @@ bool Glm5NextPipeline::init(
 	metadata_.hidden_size = config_.hidden_size;
 	metadata_.vocab_size = config_.vocab_size;
 	metadata_.num_layers = config_.num_layers;
-	metadata_.num_heads = 16;
-	metadata_.num_kv_heads = 16;
+	metadata_.num_heads = lh_;
+	metadata_.num_kv_heads = lh_;
 	metadata_.head_dim = 256;
 	metadata_.max_seq_len = config_.max_seq;
 	metadata_.tp_size = config_.tp_size;
@@ -546,9 +552,9 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	int start_expert = moe_tp_ ? 0 : rank_ * experts_per_rank;
 
 	static constexpr int GLM_QKV_BLOCKS[3] = { 512, 512, 512 };
-	static constexpr int GLM_QKV_RANK_BLOCKS[3] = { 128, 128, 128 };
+	const int GLM_QKV_RANK_BLOCKS[3] = { 512 / config_.tp_size, 512 / config_.tp_size, 512 / config_.tp_size };
 	static constexpr int GLM_CONV_CHANNELS[3] = { 8192, 8192, 8192 };
-	static constexpr int GLM_CONV_RANK_CHANNELS[3] = { 2048, 2048, 2048 };
+	const int GLM_CONV_RANK_CHANNELS[3] = { 8192 / config_.tp_size, 8192 / config_.tp_size, 8192 / config_.tp_size };
 
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		auto& lw = layers_[L];
@@ -1237,18 +1243,18 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 			);
 
 			engine::modules::GDN::l2_norm_heads(
-				qkv_buf_, 16, 128, stream, true, m, config_.kda_channels
+				qkv_buf_, lh_, 128, stream, true, m, config_.kda_channels
 			);
 
 			engine::modules::GDN::project_kda_gates(
 				norm_hidden_, lw.b_proj, lw.f_a_proj, lw.f_b_proj, lw.g_a_proj, lw.g_b_proj,
 				lw.A_log, lw.dt_bias, beta_buf_, g_decay_buf_, z_buf_, f_a_buf_, g_a_buf_,
-				16, 128, H, stream, m
+				lh_, 128, H, stream, m
 			);
 
 			engine::modules::GDN::recurrent_step_kda_rows(
 				layer_kda, qkv_buf_, g_decay_buf_, beta_buf_, z_buf_, lw.o_norm, attn_head_out_,
-				16, 128, 1e-5f, m, d_rows_, slot_kda_floats, kda_snap, slot_kda_floats, snap_rows, state_.d_snap_on, stream
+				lh_, 128, 1e-5f, m, d_rows_, slot_kda_floats, kda_snap, slot_kda_floats, snap_rows, state_.d_snap_on, stream
 			);
 
 			hessian( layer, 2, attn_head_out_.data, 8192 / config_.tp_size, m, stream );
@@ -1305,7 +1311,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				q_lat.shape[0] = m;
 				o_lat.shape[0] = m;
 				engine::modules::MLALatent::store( latent_ref(), kv_lora_norm_buf_, mla_idx, config_.max_seq, m, kv_ref, stream );
-				engine::modules::MLALatent::absorb_q( q_buf_, lw.kv_b_proj, q_lat, 16, m, stream );
+				engine::modules::MLALatent::absorb_q( q_buf_, lw.kv_b_proj, q_lat, lh_, m, stream );
 				const int* sel_idx = nullptr;
 				const int* sel_n = nullptr;
 				if ( dsa_ && lw.idx_dense.data != nullptr ) {
@@ -1333,9 +1339,9 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 						sel_n = dsa_nk_;
 					}
 				}
-				engine::modules::MLALatent::attend( latent_ref(), q_lat, o_lat, mla_idx, config_.max_seq, m, 16, kv_ref, latent_ws_, key_hint_, stream, sel_idx, sel_n );
+				engine::modules::MLALatent::attend( latent_ref(), q_lat, o_lat, mla_idx, config_.max_seq, m, lh_, kv_ref, latent_ws_, key_hint_, stream, sel_idx, sel_n );
 				static const bool dsa_diag = runtime::options().dsa_diag;
-				if ( dsa_diag && sel_idx != nullptr && m > pod::MAX_BATCH && rank_ == 0 ) {
+				if ( dsa_diag && sel_idx != nullptr && m > pod::MAX_BATCH && rank_ == 0 && lh_ == 16 ) {
 					// Recall of the dense attention mass by the selection, last row of the chunk (eager prefill only)
 					const int n = key_hint_;
 					ENGINE_ASSERT( latent_q_ == pod::KVQ::F16, "dsa_diag: FP16 latent cache only" );
@@ -1369,7 +1375,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 						LOG_INFO( "[dsa diag] layer %d: %d of %d tokens selected, dense-attention mass recall %.4f (mean over heads)\n", mla_idx, nk, n, recall / 16.0 );
 					}
 				}
-				engine::modules::MLALatent::expand_out( o_lat, lw.kv_b_proj, mla_heads_out_, 16, m, stream );
+				engine::modules::MLALatent::expand_out( o_lat, lw.kv_b_proj, mla_heads_out_, lh_, m, stream );
 			}
 
 			// Project output: o_proj -> ring_->all_reduce across the ranks

@@ -1,5 +1,5 @@
 // Absorbed MLA parity: latent-cache attention (absorb_q -> attend -> expand_out) against an FP64 reference that expands K and V
-// per head from the same latents, on the real GLM-5.3-Flash layer-3 kv_b_proj slice (rank 0, 16 heads).
+// per head from the same latents, on the real GLM-5.3-Flash layer-3 kv_b_proj slice (rank 0 of 64 / MLA_HEADS; 16 heads by default, MLA_HEADS=64 is one rank).
 #include "engine/runtime/test_paths.h"
 #include "engine/config.h"
 #include "engine/core/arena.h"
@@ -13,8 +13,9 @@
 
 int main() {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	const char* dir = engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw" );
-	constexpr int H = 16, LORA = 512, HD = 256;
+	const char* dir = engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw", "ENGINE_TEST_GLM_DIR" );
+	constexpr int LORA = 512, HD = 256;
+	const int H = std::getenv( "MLA_HEADS" ) ? std::atoi( std::getenv( "MLA_HEADS" ) ) : 16;
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	cudaStream_t stream;
 	CUDA_CHECK( cudaStreamCreate( &stream ) );
@@ -22,7 +23,7 @@ int main() {
 	ENGINE_ASSERT( engine::core::arena_create( arena, 0, 1ULL * 1024 * 1024 * 1024 ), "arena" );
 	engine::loader::SafeTensorsRepo repo;
 	ENGINE_ASSERT( repo.open( dir ), "open model dir" );
-	pod::TensorView kv_b = repo.load_slice( "model.language_model.layers.3.self_attn.kv_b_proj.weight", arena, 0, 0, 4, stream, pod::DType::FP16 );
+	pod::TensorView kv_b = repo.load_slice( "model.language_model.layers.3.self_attn.kv_b_proj.weight", arena, 0, 0, 64 / H, stream, pod::DType::FP16 );
 	ENGINE_ASSERT( kv_b.data && kv_b.shape[0] == H * 2 * HD && kv_b.shape[1] == LORA, "kv_b slice shape" );
 	std::vector<half> h_w( static_cast<size_t>( kv_b.shape[0] ) * LORA );
 	CUDA_CHECK( cudaMemcpy( h_w.data(), kv_b.data, h_w.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
@@ -90,6 +91,20 @@ int main() {
 		pod::TensorView outt = pod::make_tensor_2d( d_out, pod::DType::FP16, R, H * HD );
 		engine::modules::MLALatent::absorb_q( qt, kv_b, qlat, H, R, stream );
 		engine::modules::MLALatent::attend( kvr, qlat, olat, 1, max_seq, R, H, sr, d_ws, 0, stream );
+		if ( std::getenv( "MLA_ATT_TIME" ) ) {
+			// Latency of the attention launch alone (no reference): MLA_ATT_TIME=1
+			cudaEvent_t t0, t1;
+			(void) cudaEventCreate( &t0 ); (void) cudaEventCreate( &t1 );
+			for ( int it = 0; it < 25; ++it ) {
+				if ( it == 5 ) (void) cudaEventRecord( t0, stream );
+				engine::modules::MLALatent::attend( kvr, qlat, olat, 1, max_seq, R, H, sr, d_ws, 0, stream );
+			}
+			(void) cudaEventRecord( t1, stream ); (void) cudaEventSynchronize( t1 );
+			float ms = 0;
+			(void) cudaEventElapsedTime( &ms, t0, t1 );
+			std::printf( "  attend: %s %d rows %d heads, %d cached tokens: %.1f us\n", scenario >= 2 ? "prefill" : "decode", R, H, N, ms * 50.0f );
+			continue;
+		}
 		engine::modules::MLALatent::expand_out( olat, kv_b, outt, H, R, stream );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		std::vector<half> h_out( static_cast<size_t>( R ) * H * HD );

@@ -3,6 +3,9 @@
 #include "../../../kernels/cuda/mma_sm80.cuh"
 #include <cuda_fp16.h>
 #include <mma.h>
+#if defined(USE_ROCM)
+#include "../../../kernels/rocm/wmma.cuh"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -23,6 +26,7 @@ constexpr int ROWG = 16; // rows per pass of the projection kernels
 constexpr int RCH = 64; // rows per block
 constexpr int APAD = 8;
 
+// q_lat and o_lat are stored in groups of 16 heads (the attention kernels' width): [h / 16][row][h % 16][c], which for 16 heads is [row][h][c]
 // q_lat[r][h][c] = sum_d q[r][h][d] * W_UK[h][d][c]  (W_UK rows d, row-major over c; K rows come first in kv_b)
 __global__ __launch_bounds__( 128 )
 void absorb_q_kernel( const half* __restrict__ q, const half* __restrict__ kv_b, half* __restrict__ q_lat, int heads, int rows ) {
@@ -64,11 +68,66 @@ void absorb_q_kernel( const half* __restrict__ q, const half* __restrict__ kv_b,
 			if ( r < nr ) {
 				const float x = sc[0][idx] + sc[1][idx] + sc[2][idx] + sc[3][idx];
 				const float y = sc[0][idx + 1] + sc[1][idx + 1] + sc[2][idx + 1] + sc[3][idx + 1];
-				*reinterpret_cast<half2*>( q_lat + ( static_cast<size_t>( r0 + r ) * heads + h ) * LORA + c0 + c ) = __floats2half2_rn( x, y );
+				*reinterpret_cast<half2*>( q_lat + ( ( static_cast<size_t>( h >> 4 ) * rows + r0 + r ) * 16 + ( h & 15 ) ) * LORA + c0 + c ) = __floats2half2_rn( x, y );
 			}
 		}
 	}
 }
+
+#if defined(USE_ROCM)
+// Decode-sized absorb_q (rows <= 8): a GEMV per head that streams W_UK row by row (a 16 x 16 WMMA tile of it is 32 byte segments, a 5x slower
+// read). A block owns (head, 128 columns): 16 column groups of 8 (one 16-byte load) x 16 interleaved d subsets, partial sums added through shared memory.
+__global__ __launch_bounds__( 256 )
+void absorb_q_small_kernel( const half* __restrict__ q, const half* __restrict__ kv_b, half* __restrict__ q_lat, int heads, int rows ) {
+	__shared__ float sq[8][HD];
+	__shared__ float sred[16][16][9];
+	const int h = blockIdx.x, c0 = blockIdx.y * 128;
+	const int t = threadIdx.x, cg = t & 15, ds = t >> 4;
+	for ( int i = t; i < 8 * HD; i += 256 ) {
+		const int r = i / HD, d = i % HD;
+		sq[r][d] = r < rows ? __half2float( q[( static_cast<size_t>( r ) * heads + h ) * HD + d] ) : 0.0f;
+	}
+	__syncthreads();
+	float acc[8][8];
+	#pragma unroll
+	for ( int r = 0; r < 8; ++r ) {
+		#pragma unroll
+		for ( int j = 0; j < 8; ++j ) acc[r][j] = 0.0f;
+	}
+	const half* w = kv_b + static_cast<size_t>( h ) * 2 * HD * LORA + c0 + cg * 8;
+	#pragma unroll 4
+	for ( int d = ds; d < HD; d += 16 ) {
+		const uint4 raw = *reinterpret_cast<const uint4*>( w + static_cast<size_t>( d ) * LORA );
+		const half2* h2 = reinterpret_cast<const half2*>( &raw );
+		float f[8];
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const float2 v = __half22float2( h2[i] );
+			f[2 * i] = v.x;
+			f[2 * i + 1] = v.y;
+		}
+		#pragma unroll
+		for ( int r = 0; r < 8; ++r ) {
+			const float a = sq[r][d];
+			#pragma unroll
+			for ( int j = 0; j < 8; ++j ) acc[r][j] = fmaf( a, f[j], acc[r][j] );
+		}
+	}
+	for ( int r = 0; r < rows; ++r ) {
+		#pragma unroll
+		for ( int j = 0; j < 8; ++j ) sred[ds][cg][j] = acc[r][j];
+		__syncthreads();
+		if ( t < 128 ) {
+			const int g = t >> 3, j = t & 7;
+			float sum = 0.0f;
+			#pragma unroll
+			for ( int k = 0; k < 16; ++k ) sum += sred[k][g][j];
+			q_lat[( ( static_cast<size_t>( h >> 4 ) * rows + r ) * 16 + ( h & 15 ) ) * LORA + c0 + g * 8 + j] = __float2half_rn( sum );
+		}
+		__syncthreads();
+	}
+}
+#endif
 
 // out[r][h][v] = sum_c W_UV[h][v][c] * o_lat[r][h][c]  (V rows follow the K rows; B read column-major: element (c, v) at v * LORA + c)
 __global__ __launch_bounds__( 128 )
@@ -87,7 +146,7 @@ void expand_out_kernel( const half* __restrict__ o_lat, const half* __restrict__
 		for ( int i = threadIdx.x; i < ROWG * ( LORA / 8 ); i += 128 ) {
 			const int r = i / ( LORA / 8 ), v = i % ( LORA / 8 );
 			uint4 val = make_uint4( 0, 0, 0, 0 );
-			if ( r < nr ) val = *reinterpret_cast<const uint4*>( o_lat + ( static_cast<size_t>( r0 + r ) * heads + h ) * LORA + v * 8 );
+			if ( r < nr ) val = *reinterpret_cast<const uint4*>( o_lat + ( ( static_cast<size_t>( h >> 4 ) * rows + r0 + r ) * 16 + ( h & 15 ) ) * LORA + v * 8 );
 			*reinterpret_cast<uint4*>( &so[r][v * 8] ) = val;
 		}
 		__syncthreads();
@@ -656,7 +715,9 @@ void latent_sparse_tc_kernel(
 	float scale,
 	int nsplit,
 	const int* __restrict__ sel_idx,
-	const int* __restrict__ sel_n
+	const int* __restrict__ sel_n,
+	int heads_total,
+	size_t gstride
 ) {
 	constexpr int HEADS = 16;
 	extern __shared__ __align__( 16 ) unsigned char ls_smem[];
@@ -670,6 +731,9 @@ void latent_sparse_tc_kernel(
 	float* sO = reinterpret_cast<float*>( ls_smem );
 
 	const int r = blockIdx.x;
+	const int grp = blockIdx.z;   // group of 16 heads
+	q_lat += grp * gstride;
+	o_lat += grp * gstride;
 	const int tid = threadIdx.x;
 	const int warp = tid >> 5;
 	const int lane = tid & 31;
@@ -702,13 +766,18 @@ void latent_sparse_tc_kernel(
 	const int srow = tid >> 4, sub = tid & 15;
 	float m_run = -1e30f, l_run = 0.0f;
 
-#if MMA_SM80
+#if MMA_SM80 && !defined(USE_ROCM)   // ROCm: native WMMA below, not the m16n8k16 emulation
 	float acc[8][4];   // [dimension tile][frag_c], the 16 queries one row tile
 	#pragma unroll
 	for ( int j = 0; j < 8; ++j ) {
 		#pragma unroll
 		for ( int q = 0; q < 4; ++q ) acc[j][q] = 0.0f;
 	}
+	(void) s_arow; (void) s_brow; (void) v_row0; (void) p_row;
+#elif defined(USE_ROCM)
+	wm_v8f acc[4];   // 16 heads x this warp's 64 dimensions
+	#pragma unroll
+	for ( int j = 0; j < 4; ++j ) acc[j] = wm_v8f{ 0, 0, 0, 0, 0, 0, 0, 0 };
 	(void) s_arow; (void) s_brow; (void) v_row0; (void) p_row;
 #else
 	float acc[2][2][8];
@@ -759,7 +828,7 @@ void latent_sparse_tc_kernel(
 		}
 		__syncthreads();
 
-#if MMA_SM80
+#if MMA_SM80 && !defined(USE_ROCM)   // ROCm: native WMMA below, not the m16n8k16 emulation
 		{
 			float c[2][4] = {};
 			const half* qa = sQ + dq * 128;
@@ -782,6 +851,17 @@ void latent_sparse_tc_kernel(
 					sS[dq * LS_BQ * LT_SS + frag_c_row( q, lane ) * LT_SS + s_kg * 16 + 8 * j + frag_c_col( q, lane )] = c[j][q];
 				}
 			}
+		}
+#elif defined(USE_ROCM)
+		{
+			// A = the 16 queries (row = lane & 15), B = the keys (column = lane & 15), 8 k steps over this warp's 128 dimensions
+			wm_v8f c = wm_v8f{ 0, 0, 0, 0, 0, 0, 0, 0 };
+			const half* qa = sQ + ( lane & 15 ) * LT_KS + dq * 128;
+			const half* kt = sB + ( s_kg * 16 + ( lane & 15 ) ) * LT_KS + dq * 128;
+			#pragma unroll
+			for ( int ks = 0; ks < 8; ++ks ) c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32( wm_ld16u( qa + 16 * ks ), wm_ld16u( kt + 16 * ks ), c );
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) sS[dq * LS_BQ * LT_SS + ( 2 * i + hi ) * LT_SS + s_kg * 16 + ( lane & 15 )] = c[i];
 		}
 #else
 		{
@@ -845,7 +925,7 @@ void latent_sparse_tc_kernel(
 		__syncthreads();
 		if ( kb + LT_BK < kb1 ) fetch( kb + LT_BK );
 
-#if MMA_SM80
+#if MMA_SM80 && !defined(USE_ROCM)   // ROCm: native WMMA below, not the m16n8k16 emulation
 		#pragma unroll
 		for ( int j = 0; j < 8; ++j ) {
 			#pragma unroll
@@ -861,6 +941,18 @@ void latent_sparse_tc_kernel(
 				lds_frag_b( sB + ( 64 * warp + 8 * j ) * LT_VS + 16 * kk, LT_VS, b );
 				mma16816( acc[j], a, b );
 			}
+		}
+#elif defined(USE_ROCM)
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) acc[j][i] *= sA[2 * i + hi];
+		}
+		#pragma unroll
+		for ( int kk = 0; kk < LT_BK / 16; ++kk ) {
+			const wm_v16h a = wm_ld16u( sP + ( lane & 15 ) * LT_VS + 16 * kk );
+			#pragma unroll
+			for ( int j = 0; j < 4; ++j ) acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32( a, wm_ld16u( sB + ( 64 * warp + 16 * j + ( lane & 15 ) ) * LT_VS + 16 * kk ), acc[j] );
 		}
 #else
 		#pragma unroll
@@ -896,7 +988,7 @@ void latent_sparse_tc_kernel(
 		sL[srow] = l_run;
 	}
 	__syncthreads();
-#if MMA_SM80
+#if MMA_SM80 && !defined(USE_ROCM)   // ROCm: native WMMA below, not the m16n8k16 emulation
 	#pragma unroll
 	for ( int j = 0; j < 8; ++j ) {
 		#pragma unroll
@@ -904,6 +996,12 @@ void latent_sparse_tc_kernel(
 			const int m = frag_c_row( q, lane );
 			sO[m * LT_KS + 64 * warp + 8 * j + frag_c_col( q, lane )] = acc[j][q] * sA[m];
 		}
+	}
+#elif defined(USE_ROCM)
+	#pragma unroll
+	for ( int j = 0; j < 4; ++j ) {
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) sO[( 2 * i + hi ) * LT_KS + 64 * warp + 16 * j + ( lane & 15 )] = acc[j][i] * sA[2 * i + hi];
 	}
 #else
 	#pragma unroll
@@ -924,7 +1022,7 @@ void latent_sparse_tc_kernel(
 	if ( nsplit > 1 ) {
 		for ( int u = tid; u < LS_BQ * LORA; u += 256 ) {
 			const int qq = u >> 9, d = u & 511;
-			float* ws = workspace + ( ( static_cast<size_t>( r ) * HEADS + qq ) * nsplit + blockIdx.y ) * ( LORA + 2 );
+			float* ws = workspace + ( ( static_cast<size_t>( r ) * heads_total + grp * HEADS + qq ) * nsplit + blockIdx.y ) * ( LORA + 2 );
 			if ( d == 0 ) {
 				ws[0] = sM[qq];
 				ws[1] = sL[qq];
@@ -985,12 +1083,18 @@ void latent_reduce_kernel( const float* __restrict__ workspace, half* __restrict
 		l += w * lc;
 		acc += w * ws[c * ( LORA + 2 ) + 2 + t];
 	}
-	o_lat[( static_cast<size_t>( m ) * heads + h ) * LORA + t] = __float2half_rn( l > 0.0f ? acc / l : 0.0f );
+	o_lat[( ( static_cast<size_t>( h >> 4 ) * gridDim.y + m ) * 16 + ( h & 15 ) ) * LORA + t] = __float2half_rn( l > 0.0f ? acc / l : 0.0f );   // grouped like q_lat
 }
 
 } // namespace
 
 void MLALatent::absorb_q( const pod::TensorView& q, const pod::TensorView& kv_b, pod::TensorView& q_lat, int heads, int rows, cudaStream_t stream ) {
+#if defined(USE_ROCM)
+	if ( rows <= 8 ) {
+		absorb_q_small_kernel<<<dim3( heads, LORA / 128 ), dim3( 256 ), 0, stream>>>( q.ptr<const half>(), kv_b.ptr<const half>(), q_lat.ptr<half>(), heads, rows );
+		return;
+	}
+#endif
 	absorb_q_kernel<<<dim3( heads, LORA / 16, ( rows + RCH - 1 ) / RCH ), dim3( 128 ), 0, stream>>>( q.ptr<const half>(), kv_b.ptr<const half>(), q_lat.ptr<half>(), heads, rows );
 }
 
@@ -1014,7 +1118,7 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 	const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream, const int* sel_idx, const int* sel_n ) {
 	const void* cache = kv.k;
 	const void* cscale = kv.ks;
-	ENGINE_ASSERT( heads == 16 && slot.rows != nullptr, "MLALatent::attend: 16 heads per rank, device-resolved positions" );
+	ENGINE_ASSERT( heads % 16 == 0 && slot.rows != nullptr, "MLALatent::attend: a multiple of 16 heads, device-resolved positions" );
 	const int n_chunks = MLALatent::workspace_chunks( max_seq );
 	const float scale = 1.0f / sqrtf( static_cast<float>( MLALatent::HEAD ) );
 	const size_t smem = static_cast<size_t>( 16 ) * LORA * 4 + static_cast<size_t>( TILE ) * CS * 2 + ( 16 * TILE + 16 ) * 4;
@@ -1036,7 +1140,19 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 #else
 	const bool prefill_per_row = false;
 #endif
-	if ( decode_rows || ( rows > pod::MAX_BATCH && ( sel_idx != nullptr || prefill_per_row ) ) ) {
+	const bool sparse_path = decode_rows || ( rows > pod::MAX_BATCH && ( sel_idx != nullptr || prefill_per_row ) );
+	if ( heads > 16 && !sparse_path ) {
+		// The other kernels take 16 heads: one group of 16 at a time (q_lat / o_lat are stored by group, the workspace is reused)
+		for ( int g = 0; g < heads / 16; ++g ) {
+			pod::TensorView qg = q_lat, og = o_lat;
+			const size_t off = static_cast<size_t>( g ) * rows * 16 * LORA * sizeof( half );
+			qg.data = static_cast<char*>( q_lat.data ) + off;
+			og.data = static_cast<char*>( o_lat.data ) + off;
+			attend_q<Q>( kv, qg, og, layer, max_seq, rows, 16, slot, workspace, key_hint, stream, sel_idx, sel_n );
+		}
+		return;
+	}
+	if ( sparse_path ) {
 		ENGINE_ASSERT( slot.row == 0, "MLALatent::attend: prefill chunks start at row 0" );
 		static bool sp_attr[ENGINE_NUM_GPUS] = {};
 		if ( !sp_attr[device] ) {
@@ -1045,8 +1161,9 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 		}
 		int nsplit = rows < 160 ? std::min( ( 320 + rows - 1 ) / rows, decode_rows ? 32 : 8 ) : 1;
 		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > MLALatent::workspace_slots( max_seq, heads ) ) --nsplit;
-		latent_sparse_tc_kernel<Q><<<dim3( rows, nsplit ), dim3( 256 ), LS_SMEM, stream>>>(
-			q_lat.ptr<const half>(), cache, cscale, o_lat.ptr<half>(), workspace, slot.stride, layer, max_seq, slot.rows, scale, nsplit, sel_idx, sel_n );
+		latent_sparse_tc_kernel<Q><<<dim3( rows, nsplit, heads / 16 ), dim3( 256 ), LS_SMEM, stream>>>(
+			q_lat.ptr<const half>(), cache, cscale, o_lat.ptr<half>(), workspace, slot.stride, layer, max_seq, slot.rows, scale, nsplit, sel_idx, sel_n,
+			heads, static_cast<size_t>( rows ) * 16 * LORA );
 		if ( nsplit > 1 ) {
 			latent_reduce_kernel<<<dim3( heads, rows ), dim3( 512 ), 0, stream>>>( workspace, o_lat.ptr<half>(), heads, nsplit );
 		}

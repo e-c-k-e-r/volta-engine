@@ -256,6 +256,7 @@ private:
 	ModelMetadata metadata_;
 	Glm5NextConfig config_;
 	int rank_ = 0;
+	int lh_ = 16;   // attention heads of this rank (MLA and KDA): 64 / tp_size
 	pod::MemoryArena* arena_ = nullptr;
 	engine::comm::CollectiveRing* ring_ = nullptr;
 	Glm5NextState state_;

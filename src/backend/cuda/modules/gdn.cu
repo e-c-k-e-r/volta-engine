@@ -529,27 +529,28 @@ __global__ void project_kda_stage1_kernel(
 	float* __restrict__ beta_out,
 	half* __restrict__ f_a_buf,
 	half* __restrict__ g_a_buf,
-	int hidden_size
+	int hidden_size,
+	int num_heads
 ) {
 	int row = blockIdx.x;
-	if ( row >= 272 ) return;
+	if ( row >= num_heads + 256 ) return;
 	norm_hidden += static_cast<size_t>( blockIdx.y ) * hidden_size;
-	beta_out += blockIdx.y * 16;
+	beta_out += blockIdx.y * num_heads;
 	f_a_buf += blockIdx.y * 128;
 	g_a_buf += blockIdx.y * 128;
 
 	const half* weight_row = nullptr;
-	if ( row < 16 ) {
+	if ( row < num_heads ) {
 		if ( b_proj == nullptr ) return;
 		weight_row = b_proj + row * hidden_size;
 	}
-	else if ( row < 144 ) {
+	else if ( row < num_heads + 128 ) {
 		if ( f_a_proj == nullptr ) return;
-		weight_row = f_a_proj + ( row - 16 ) * hidden_size;
+		weight_row = f_a_proj + ( row - num_heads ) * hidden_size;
 	}
 	else {
 		if ( g_a_proj == nullptr ) return;
-		weight_row = g_a_proj + ( row - 144 ) * hidden_size;
+		weight_row = g_a_proj + ( row - num_heads - 128 ) * hidden_size;
 	}
 
 	int tid = threadIdx.x;
@@ -594,14 +595,14 @@ __global__ void project_kda_stage1_kernel(
 			b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
 		}
 		if ( lane_id == 0 ) {
-			if ( row < 16 ) {
+			if ( row < num_heads ) {
 				beta_out[row] = 1.0f / ( 1.0f + __expf( -b_sum ) );
 			}
-			else if ( row < 144 ) {
-				f_a_buf[row - 16] = __float2half_rn( b_sum );
+			else if ( row < num_heads + 128 ) {
+				f_a_buf[row - num_heads] = __float2half_rn( b_sum );
 			}
 			else {
-				g_a_buf[row - 144] = __float2half_rn( b_sum );
+				g_a_buf[row - num_heads - 128] = __float2half_rn( b_sum );
 			}
 		}
 	}
@@ -1142,9 +1143,8 @@ void GDN::project_kda_gates(
 	cudaStream_t stream,
 	int rows
 ) {
-	(void) num_heads;
 	(void) head_dim;
-	project_kda_stage1_kernel<<<dim3( 272, rows ), dim3( 256 ), 0, stream>>>(
+	project_kda_stage1_kernel<<<dim3( num_heads + 256, rows ), dim3( 256 ), 0, stream>>>(
 		norm_hidden.ptr<const half>(),
 		b_proj.ptr<const half>(),
 		f_a_proj.ptr<const half>(),
@@ -1152,7 +1152,8 @@ void GDN::project_kda_gates(
 		beta_out.ptr<float>(),
 		f_a_buf.ptr<half>(),
 		g_a_buf.ptr<half>(),
-		hidden_size
+		hidden_size,
+		num_heads
 	);
 
 	int num_channels = num_heads * head_dim; // 2048
