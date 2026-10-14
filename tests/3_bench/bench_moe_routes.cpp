@@ -16,7 +16,8 @@
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	const bool glm = std::getenv( "BENCH_GLM" ) != nullptr;
-	const char* dir = engine::runtime::test::model_path( glm ? "GLM-5.3-Flash-exl3-3.05bpw" : "Swift-Qwen3.8-Flash-Next-exl3-4.00bpw" );
+	const char* dir = engine::runtime::test::model_path( glm ? "GLM-5.3-Flash-exl3-3.05bpw" : "Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", glm ? nullptr : "ENGINE_TEST_FLASH_DIR" );
+	const int BITS = std::getenv( "BENCH_BITS" ) ? std::atoi( std::getenv( "BENCH_BITS" ) ) : 4;   // the experts' bit width (Qwen3.8-Flash-Next-exl3: 2)
 	const int L = argc > 1 ? std::atoi( argv[1] ) : ( glm ? 3 : 10 );
 	const int H = glm ? 4096 : 2560, I = glm ? 2048 : 640, E = glm ? 72 : 128, K = glm ? 8 : 10;
 	const int TOTAL = glm ? 288 : 512;
@@ -36,9 +37,9 @@ int main( int argc, char** argv ) {
 	mw.top_k = K;
 	char name[256];
 	for ( int e = 0; e < E; ++e ) {
-		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, e ); mw.gate[e] = repo.load_linear( name, arena, 4, stream );
-		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, e ); mw.up[e] = repo.load_linear( name, arena, 4, stream );
-		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, e ); mw.down[e] = repo.load_linear( name, arena, 4, stream );
+		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, e ); mw.gate[e] = repo.load_linear( name, arena, BITS, stream );
+		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, e ); mw.up[e] = repo.load_linear( name, arena, BITS, stream );
+		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, e ); mw.down[e] = repo.load_linear( name, arena, BITS, stream );
 	}
 	engine::modules::MoE::init_device_ptrs( mw, arena, stream );
 	std::printf( "[*] layer %d experts: bits %d, mul1 %d\n", L, mw.gate[0].bits, mw.gate[0].mul1 );

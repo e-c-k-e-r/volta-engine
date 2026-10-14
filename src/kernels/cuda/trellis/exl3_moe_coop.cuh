@@ -59,6 +59,9 @@ struct MoeCoopParams {
 	bool a_global;                      // rows > 1: the gate/up blocks read had_g / had_u
 	int ctr_a_len;
 	int ctr_b_len;
+	// ROCm expert-grouped prefill (exl3_moe.cu): memory for its per-wave buffers
+	void* grp_ws;
+	size_t grp_ws_bytes;
 };
 
 inline int moe_coop_ctr_len( int H, int I ) {
@@ -69,3 +72,9 @@ inline int moe_coop_ctr_len( int H, int I ) {
 #define MOE_COOP_KSPLIT_MAX 2
 
 void exl3_moe_coop_launch( const MoeCoopParams& p, int device, cudaStream_t stream );
+#if defined(USE_ROCM)
+// The ROCm form (src/kernels/rocm/trellis/exl3_moe.cu): the same parameters and scratch, plain launches, 1 to 8 bpw mul1 experts
+void exl3_moe_rocm_launch( const MoeCoopParams& p, cudaStream_t stream );
+// Many rows (a prefill chunk): the routes sorted by expert, each expert's weights decoded once for up to 8 of its rows; false when grp_ws is too small
+bool exl3_moe_rocm_grouped_launch( const MoeCoopParams& p, cudaStream_t stream );
+#endif

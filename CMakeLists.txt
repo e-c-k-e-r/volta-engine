@@ -212,7 +212,7 @@ set(TRELLIS_SOURCES
 	src/kernels/cuda/trellis/trellis_context.cu
 )
 if(ENGINE_BACKEND STREQUAL "ROCM")
-	list(APPEND TRELLIS_SOURCES src/kernels/rocm/trellis/exl3_gemv.cu)
+	list(APPEND TRELLIS_SOURCES src/kernels/rocm/trellis/exl3_gemv.cu src/kernels/rocm/trellis/exl3_moe.cu)
 endif()
 
 if(ENGINE_BACKEND STREQUAL "ROCM")

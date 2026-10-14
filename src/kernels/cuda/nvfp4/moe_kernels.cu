@@ -321,7 +321,12 @@ void NVFP4MoE::forward_rows( const NVFP4ExpertTable& t, const half* x, const int
 	if ( !opted[device] ) {
 		CUDA_CHECK( cudaFuncSetAttribute( nvfp4_moe_gate_up<16, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304 ) );
 		CUDA_CHECK( cudaFuncSetAttribute( nvfp4_moe_gate_up<16, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304 ) );
+#if defined(USE_ROCM)
+		// RDNA grants a workgroup 64 KB in all, static included (the down kernel keeps a flag): the Flash-Next shapes stage well under that
+		CUDA_CHECK( cudaFuncSetAttribute( nvfp4_moe_down<8, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536 - 64 ) );
+#else
 		CUDA_CHECK( cudaFuncSetAttribute( nvfp4_moe_down<8, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536 ) );
+#endif
 		opted[device] = true;
 	}
 	if ( rows == 1 ) {

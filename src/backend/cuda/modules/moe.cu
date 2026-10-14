@@ -644,7 +644,8 @@ pod::MoEScratch MoE::alloc_scratch(
 	s.state_u = static_cast<half*>( engine::core::arena_alloc( arena, state_elems * sizeof( half ) ) );
 	s.interm_g = static_cast<half*>( engine::core::arena_alloc( arena, interm_elems * sizeof( half ) ) );
 	s.interm_u = static_cast<half*>( engine::core::arena_alloc( arena, interm_elems * sizeof( half ) ) );
-	s.planes = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( groups ) * max_rows * hidden_size * sizeof( half ) ) );
+	s.planes_bytes = static_cast<size_t>( groups ) * max_rows * hidden_size * sizeof( half );
+	s.planes = static_cast<half*>( engine::core::arena_alloc( arena, s.planes_bytes ) );
 	// Fused decode path: the rotated inputs and the gate/up partials alias the persistent kernel's staging buffers (a call runs
 	// one path or the other, in stream order); the activation and the down partials are its own
 	if ( hidden_size % 128 == 0 && intermediate_size % 128 == 0 ) {
@@ -673,8 +674,18 @@ pod::MoEScratch MoE::alloc_scratch(
 bool MoE::fused_decode( const pod::MoELayerWeights& weights, const pod::MoEScratch& scratch, int rows ) {
 	const int ebits = weights.gate[0].bits;
 	if ( weights.type == pod::QuantType::NVFP4 ) return true;   // no trellis workspace
-	return weights.type == pod::QuantType::TRELLIS && rows <= MOE_COOP_MAX_ROWS && scratch.coop_ctr != nullptr && weights.top_k <= MOE_COOP_TOPK
-		&& ( ebits == 3 || ebits == 4 ) && weights.up[0].bits == ebits && weights.down[0].bits == ebits && weights.up[0].mul1 && weights.gate[0].mul1 && weights.down[0].mul1;
+#if defined(USE_ROCM)
+	const bool bits_ok = ebits >= 1 && ebits <= 8;   // the ROCm launch (exl3_moe.cu) takes any width
+#else
+	const bool bits_ok = ebits == 3 || ebits == 4;
+#endif
+#if defined(USE_ROCM)
+	const bool rows_ok = true;   // blocks of MOE_COOP_MAX_ROWS rows
+#else
+	const bool rows_ok = rows <= MOE_COOP_MAX_ROWS;
+#endif
+	return weights.type == pod::QuantType::TRELLIS && rows_ok && scratch.coop_ctr != nullptr && weights.top_k <= MOE_COOP_TOPK
+		&& bits_ok && weights.up[0].bits == ebits && weights.down[0].bits == ebits && weights.up[0].mul1 && weights.gate[0].mul1 && weights.down[0].mul1;
 }
 
 void MoE::forward(
@@ -758,7 +769,24 @@ void MoE::forward(
 		int device = 0;
 		CUDA_CHECK( cudaGetDevice( &device ) );
 		CUDA_CHECK( cudaMemsetAsync( p.out, 0, static_cast<size_t>( rows ) * p.H * sizeof( half ), stream ) );
+#if defined(USE_ROCM)
+		// Prefill chunks: the routes grouped by expert (the planes buffer, unused here, is its workspace); else blocks of MOE_COOP_MAX_ROWS rows
+		// (the scratch holds that many slots)
+		p.grp_ws = scratch.planes;
+		p.grp_ws_bytes = scratch.planes_bytes;
+		if ( rows > MOE_COOP_MAX_ROWS && exl3_moe_rocm_grouped_launch( p, stream ) ) return;
+		for ( int r0 = 0; r0 < rows; r0 += MOE_COOP_MAX_ROWS ) {
+			MoeCoopParams pc = p;
+			pc.bsz = MIN( MOE_COOP_MAX_ROWS, rows - r0 );
+			pc.x += static_cast<size_t>( r0 ) * p.H;
+			pc.sel += static_cast<size_t>( r0 ) * p.topk;
+			pc.rw += static_cast<size_t>( r0 ) * p.topk;
+			pc.out += static_cast<size_t>( r0 ) * p.H;
+			exl3_moe_rocm_launch( pc, stream );
+		}
+#else
 		exl3_moe_coop_launch( p, device, stream );
+#endif
 		return;
 	}
 	const size_t plane_elems = static_cast<size_t>( rows ) * out.shape[out.ndim - 1];
