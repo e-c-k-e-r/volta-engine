@@ -18,7 +18,7 @@ int main() {
 	// MOE_FLASH=1: Flash-Next's experts (ENGINE_TEST_FLASH_DIR; MOE_BITS gives their bit width, 2 for Qwen3.8-Flash-Next-exl3) instead of GLM's
 	const bool flash = std::getenv( "MOE_FLASH" ) != nullptr;
 	const int EBITS = std::getenv( "MOE_BITS" ) ? std::atoi( std::getenv( "MOE_BITS" ) ) : 4;
-	const char* dir = flash ? engine::runtime::test::model_path( "Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", "ENGINE_TEST_FLASH_DIR" ) : engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw" );
+	const char* dir = flash ? engine::runtime::test::model_path( "Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", "ENGINE_TEST_FLASH_DIR" ) : engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw", "ENGINE_TEST_GLM_DIR" );
 	const int H = flash ? 2560 : 4096, I = flash ? 640 : 2048, E = flash ? 128 : 72, K = flash ? 10 : 8, L = 3;
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	engine::modules::trellis_context_init_all();

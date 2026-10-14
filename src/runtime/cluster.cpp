@@ -25,6 +25,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	const bool is_glm = ( cfg.model_type == "glm5_next" );
 	const auto& opt = runtime::options();
 	tp_ = opt.tp > 0 ? opt.tp : cfg.tp;
+	if ( opt.expert_stream ) runtime::options().no_graphs = true;   // the layers' expert reads are host work between kernels
 #if ENGINE_BACKEND_CPU
 	// The CPU backend is single-device: one rank holds the whole model
 	if ( tp_ != 1 ) {

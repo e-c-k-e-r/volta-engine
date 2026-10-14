@@ -27,6 +27,8 @@ struct ExpertTier {
 		std::vector<int> owner;              // slot -> expert
 		std::vector<uint8_t*> host;          // expert -> its pinned buffer when cold
 		std::vector<uint64_t> score;         // decayed route counts
+		struct Src { int fd = -1; size_t off = 0, bytes = 0; };
+		std::vector<Src> src;                // expert * 3 + part: where a cold expert's codes are in the checkpoint (expert_stream)
 	};
 
 	int experts = 0;
@@ -34,6 +36,7 @@ struct ExpertTier {
 	size_t part_bytes[3] = {};
 	size_t slot_bytes = 0;
 	std::vector<Layer> layers;
+	uint8_t* ring = nullptr;                 // expert_stream: the one pinned buffer every layer's cold experts are read into before the layer runs
 	uint8_t* staging = nullptr;              // one pinned expert-sized buffer that rotates through the swaps
 	uint64_t swaps = 0, window_routes = 0, window_hits = 0;
 	int max_swaps = 4;
@@ -50,6 +53,11 @@ struct ExpertTier {
 	// returned views are where expert `e`'s three code tensors are to be loaded
 	void add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, pod::MemoryArena& host, std::vector<int> resident_set );
 	void code_arena( int layer, int expert, int part, pod::MemoryArena& out ) const;
+	// ENGINE_DEBUG_EXPERT_STREAM: the cold experts are not kept in host memory: before each layer's MoE `stream_fill` reads them from the
+	// checkpoint (parallel pread, so NVMe speed) into one pinned buffer shared by all layers, where the kernels read them in place
+	static bool stream_mode();
+	void set_source( int layer, int expert, int part, int fd, size_t off, size_t bytes );
+	void stream_fill( int layer, backend::stream_t stream );
 	// After a layer's experts are loaded and its device pointer table built
 	void allocate_staging( pod::MemoryArena& host );
 	// Reads and clears the layer counters, updates the scores and performs up to max_swaps exchanges; returns swaps done

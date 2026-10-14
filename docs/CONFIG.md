@@ -80,6 +80,9 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `spec_ctrl` | bool | `true` | `ENGINE_SPEC_CTRL` | adaptive speculation controller; false always speculates |
 | **Debug** | | | | |
 | `expert_log` | bool | `false` | `ENGINE_DEBUG_EXPERT_LOG` | per-rebalance expert tier statistics |
+| `glm_logit_rows` | int | `0` | `ENGINE_DEBUG_GLM_LOGIT_ROWS` | GLM: rows of logits a forward can keep; <= 0 = one decode batch (16). Scoring tools (test_ppl) that read the logits of every row of a prefill chunk need the chunk size here (rows x vocabulary x 2 bytes, twice) |
+| `expert_stream` | bool | `false` | `ENGINE_DEBUG_EXPERT_STREAM` | for checkpoints larger than host RAM (needs expert_cache < 1, one rank, GLM): the cold experts live in the checkpoint and are read (parallel pread, NVMe speed) into one pinned layer-sized buffer before each layer's MoE, then read in place as usual; eager forwards only (no graphs), prefill speed is the disk's |
+| `expert_synth` | int | `0` | `ENGINE_DEBUG_EXPERT_SYNTH` | timing only, outputs are wrong. 1: the cold experts of the expert tier alias the device slots of resident ones (no host memory, no PCIe reads, no rebalancing), to time the kernels apart from the link. 2: also no expert tensor is read from the checkpoint (a copy made without them works): the resident slots are generated, with expert_cache < 1 (trellis experts, one rank) |
 | `dsa_diag` | bool | `false` | `ENGINE_DEBUG_DSA_DIAG` | sparse-attention indexer diagnostics |
 | `trace_layers` | string | `(empty)` | `ENGINE_DEBUG_TRACE_LAYERS` | GLM: file that receives the last row's residual streams after every layer of every eager forward (rank 0) |
 | `perturb_embed` | float | `0` | `ENGINE_DEBUG_PERTURB_EMBED` | GLM: multiply every prompt embedding element by 1 + eps * u (u in [-1, 1], hashed from position and dimension, so independent of chunking); eager prefill only, a noise-floor probe |

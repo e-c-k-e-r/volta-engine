@@ -12,6 +12,10 @@
 #include <cctype>
 #include <cstdio>
 #include <algorithm>
+#include <array>
+#include <map>
+#include <string>
+#include <vector>
 
 namespace engine::loader {
 
@@ -581,7 +585,7 @@ pod::TensorView SafeTensorsRepo::load(
 	}
 
 	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, out_dtype, meta->shape, meta->ndim );
-	if ( tv.data == nullptr ) {
+	if ( tv.data == nullptr || arena.stream_skip ) {
 		return tv;
 	}
 
@@ -802,11 +806,107 @@ pod::TensorView SafeTensorsRepo::load_slice(
 	return tv;
 }
 
+bool SafeTensorsRepo::file_ref( const char* tensor_name, int* fd, size_t* offset, size_t* bytes ) const {
+	int shard = -1;
+	const pod::SafeTensorMeta* meta = find( tensor_name, &shard );
+	if ( meta == nullptr || shard < 0 || shards_[shard].fd < 0 ) return false;
+	*fd = shards_[shard].fd;
+	*offset = meta->data_offset_bytes;
+	*bytes = meta->size_bytes;
+	return true;
+}
+
 size_t SafeTensorsRepo::trellis_bytes( const char* base_name ) const {
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
 	const pod::SafeTensorMeta* meta = find( name_buf );
 	return meta != nullptr ? static_cast<size_t>( meta->size_bytes ) : 0;
+}
+
+
+namespace {
+
+// The [k/16, n/16, 16 * bits] shape the quantization_config.json of `dir` lists for the trellis of `base_name` (an expert tensor: the entry of expert 0
+// of the same layer and projection stands for all of them, they share a width). Searches the file's text; nothing is parsed.
+bool synth_trellis_shape( const char* dir, const char* base_name, std::array<int, 3>& shape ) {
+	static std::map<std::string, std::array<int, 3>> cache;
+	std::string key = base_name;
+	const size_t at = key.find( ".experts." );
+	if ( at != std::string::npos ) {
+		const size_t d0 = at + 9;
+		size_t d1 = d0;
+		while ( d1 < key.size() && std::isdigit( static_cast<unsigned char>( key[d1] ) ) ) ++d1;
+		key.replace( d0, d1 - d0, "0" );
+	}
+	if ( auto it = cache.find( key ); it != cache.end() ) { shape = it->second; return true; }
+	char path[1200];
+	std::snprintf( path, sizeof( path ), "%s/quantization_config.json", dir );
+	const int fd = ::open( path, O_RDONLY );
+	if ( fd < 0 ) return false;
+	struct stat st;
+	if ( fstat( fd, &st ) != 0 || st.st_size <= 0 ) { ::close( fd ); return false; }
+	void* map = mmap( nullptr, static_cast<size_t>( st.st_size ), PROT_READ, MAP_PRIVATE, fd, 0 );
+	::close( fd );
+	if ( map == MAP_FAILED ) return false;
+	const std::string needle = "\"" + key + ".trellis\"";
+	const char* text = static_cast<const char*>( map );
+	const size_t n = static_cast<size_t>( st.st_size );
+	bool ok = false;
+	if ( const void* hit = memmem( text, n, needle.data(), needle.size() ) ) {
+		const char* p = static_cast<const char*>( hit ) + needle.size();
+		const char* end = text + n;
+		const char* sh = static_cast<const char*>( memmem( p, static_cast<size_t>( std::min<ptrdiff_t>( end - p, 400 ) ), "\"shape\"", 7 ) );
+		if ( sh != nullptr ) {
+			const char* q = static_cast<const char*>( memchr( sh, '[', 40 ) );
+			if ( q != nullptr && std::sscanf( q, "[%d, %d, %d]", &shape[0], &shape[1], &shape[2] ) == 3 ) { cache[key] = shape; ok = true; }
+		}
+	}
+	munmap( map, n );
+	return ok;
+}
+
+} // namespace
+
+size_t SafeTensorsRepo::synth_trellis_bytes( const char* base_name ) const {
+	std::array<int, 3> sh;
+	if ( !synth_trellis_shape( dir_path_, base_name, sh ) ) return 0;
+	return static_cast<size_t>( sh[0] ) * sh[1] * sh[2] * 2;
+}
+
+pod::LinearWeight SafeTensorsRepo::synth_linear( const char* base_name, pod::MemoryArena& arena, backend::stream_t stream, pod::MemoryArena* code_arena ) const {
+	std::array<int, 3> sh;
+	if ( !synth_trellis_shape( dir_path_, base_name, sh ) ) return pod::LinearWeight{};
+	const int bits = sh[2] / 16, k = sh[0] * 16, n = sh[1] * 16;
+	const size_t code_bytes = static_cast<size_t>( sh[0] ) * sh[1] * sh[2] * 2;
+	static std::vector<uint16_t> pattern;   // one pseudo-random buffer, copied into every generated expert (the decode cost does not depend on the values)
+	if ( pattern.size() * 2 < code_bytes ) {
+		pattern.resize( code_bytes / 2 );
+		uint64_t x = 0x9E3779B97F4A7C15ull;
+		for ( auto& v : pattern ) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; v = static_cast<uint16_t>( x >> 24 ); }
+	}
+	// Signs for suh (+-1) and a small scale for svh (+-0.02: unit-variance codes with +-1 on both sides would make every expert output as large as
+	// the hidden state, and the generated model would overflow to NaN, whose argmax is not a token id)
+	static std::vector<uint16_t> signs, small;
+	if ( signs.size() < static_cast<size_t>( std::max( k, n ) ) ) {
+		signs.resize( std::max( k, n ) );
+		small.resize( signs.size() );
+		for ( size_t i = 0; i < signs.size(); ++i ) {
+			const bool neg = ( ( i * 2654435761u ) >> 7 ) & 1;
+			signs[i] = neg ? 0xBC00 : 0x3C00;    // -1 / +1 in FP16
+			small[i] = neg ? 0xA51E : 0x251E;    // -0.02 / +0.02
+		}
+	}
+	int tshape[3] = { sh[0], sh[1], sh[2] };
+	pod::TensorView tr = engine::core::arena_alloc_tensor( code_arena ? *code_arena : arena, pod::DType::UINT16, tshape, 3 );
+	const int kshape[1] = { k }, nshape[1] = { n };
+	pod::TensorView suh = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kshape, 1 );
+	pod::TensorView svh = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, nshape, 1 );
+	if ( tr.data == nullptr || suh.data == nullptr || svh.data == nullptr ) return pod::LinearWeight{};
+	backend::memcpy_async( tr.data, pattern.data(), code_bytes, backend::Copy::H2D, stream );
+	backend::memcpy_async( suh.data, signs.data(), static_cast<size_t>( k ) * 2, backend::Copy::H2D, stream );
+	backend::memcpy_async( svh.data, small.data(), static_cast<size_t>( n ) * 2, backend::Copy::H2D, stream );
+	backend::stream_sync( stream );   // the host buffers are reused by the next call
+	return pod::LinearWeight::make_trellis( tr, suh, svh, bits, true, false );
 }
 
 size_t SafeTensorsRepo::bytes_with_prefix( const char* prefix ) const {

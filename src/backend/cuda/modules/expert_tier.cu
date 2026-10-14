@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
+#include <cerrno>
+#include <thread>
+#include <unistd.h>
 
 namespace engine::modules {
 
@@ -35,21 +39,74 @@ void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, 
 		l.slot_of[resident_set[s]] = s;
 		l.owner[s] = resident_set[s];
 	}
+	if ( stream_mode() && ring == nullptr ) ring = static_cast<uint8_t*>( engine::core::arena_alloc( host, cold_bytes_per_layer(), 256 ) );
+	l.src.assign( static_cast<size_t>( experts ) * 3, Layer::Src{} );
+	size_t cold_i = 0;
 	for ( int e = 0; e < experts; ++e ) {
-		if ( l.slot_of[e] < 0 ) l.host[e] = static_cast<uint8_t*>( engine::core::arena_alloc( host, slot_bytes, 256 ) );
+		if ( l.slot_of[e] >= 0 || runtime::options().expert_synth ) continue;
+		l.host[e] = stream_mode() ? ring + cold_i * slot_bytes : static_cast<uint8_t*>( engine::core::arena_alloc( host, slot_bytes, 256 ) );
+		++cold_i;
 	}
 	layers.push_back( std::move( l ) );
 }
 
 void ExpertTier::code_arena( int layer, int expert, int part, pod::MemoryArena& out ) const {
 	const Layer& l = layers[layer];
-	uint8_t* base = l.slot_of[expert] >= 0 ? l.slots + static_cast<size_t>( l.slot_of[expert] ) * slot_bytes : l.host[expert];
+	// ENGINE_DEBUG_EXPERT_SYNTH: a cold expert shares the device slot of resident slot (expert mod resident), so every read is a device read
+	const bool synth = runtime::options().expert_synth && l.slot_of[expert] < 0;
+	uint8_t* base = l.slot_of[expert] >= 0 ? l.slots + static_cast<size_t>( l.slot_of[expert] ) * slot_bytes
+		: synth ? l.slots + static_cast<size_t>( expert % resident ) * slot_bytes : l.host[expert];
 	size_t off = 0;
 	for ( int i = 0; i < part; ++i ) off += part_bytes[i];
 	out.base_ptr = base + off;
 	out.total_bytes = part_bytes[part];
 	out.offset_bytes = 0;
-	out.pinned = l.slot_of[expert] < 0;
+	out.pinned = l.slot_of[expert] < 0 && !synth;
+	out.stream_skip = out.pinned && runtime::options().expert_stream;
+}
+
+bool ExpertTier::stream_mode() {
+	return runtime::options().expert_stream;
+}
+
+void ExpertTier::set_source( int layer, int expert, int part, int fd, size_t off, size_t bytes ) {
+	// The repository that opened the shard closes it when loading ends: keep one duplicate per shard for the whole run
+	static std::vector<std::pair<int, int>> dups;
+	int mine = -1;
+	for ( const auto& d : dups ) if ( d.first == fd ) mine = d.second;
+	if ( mine < 0 ) { mine = dup( fd ); dups.emplace_back( fd, mine ); }
+	layers[layer].src[static_cast<size_t>( expert ) * 3 + part] = Layer::Src{ mine, off, bytes };
+}
+
+void ExpertTier::stream_fill( int layer, cudaStream_t stream ) {
+	// The previous layer's kernels still read the shared buffer
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	const Layer& l = layers[layer];
+	std::vector<int> cold;
+	for ( int e = 0; e < experts; ++e ) if ( l.host[e] != nullptr ) cold.push_back( e );
+	const int nthreads = 8;
+	std::vector<std::thread> pool;
+	for ( int t = 0; t < nthreads; ++t ) {
+		pool.emplace_back( [&, t]() {
+			for ( size_t i = t; i < cold.size(); i += nthreads ) {
+				const int e = cold[i];
+				size_t dst_off = 0;
+				for ( int p = 0; p < 3; ++p ) {
+					const Layer::Src& s = l.src[static_cast<size_t>( e ) * 3 + p];
+					ENGINE_ASSERT( s.fd >= 0 && s.bytes == part_bytes[p], "ExpertTier::stream_fill: no source for a cold expert" );
+					size_t done = 0;
+					while ( done < s.bytes ) {
+						const ssize_t n = pread( s.fd, l.host[e] + dst_off + done, s.bytes - done, static_cast<off_t>( s.off + done ) );
+						if ( n <= 0 ) std::fprintf( stderr, "stream_fill: pread n=%zd errno=%d fd=%d off=%zu bytes=%zu done=%zu\n", n, errno, s.fd, s.off, s.bytes, done );
+						ENGINE_ASSERT( n > 0, "ExpertTier::stream_fill: read failed" );
+						done += static_cast<size_t>( n );
+					}
+					dst_off += part_bytes[p];
+				}
+			}
+		} );
+	}
+	for ( auto& th : pool ) th.join();
 }
 
 void ExpertTier::allocate_staging( pod::MemoryArena& host ) {
@@ -57,6 +114,7 @@ void ExpertTier::allocate_staging( pod::MemoryArena& host ) {
 }
 
 int ExpertTier::rebalance( int layer, cudaStream_t stream ) {
+	if ( runtime::options().expert_synth || runtime::options().expert_stream ) return 0;   // the cold experts alias resident slots: nothing to swap
 	Layer& l = layers[layer];
 	std::vector<uint32_t> heat( experts );
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );

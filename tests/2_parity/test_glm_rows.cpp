@@ -47,6 +47,26 @@ int main( int argc, char** argv ) {
 
 	engine::loader::Tokenizer tok;
 	ENGINE_ASSERT( tok.load( test::GLM_DIR ), "tokenizer load failed" );
+	if ( const char* probe = std::getenv( "GLM_PROBE" ) ) {
+		// GLM_PROBE="text": prefill the text in one chunk, print the top candidates of the last row and a short greedy continuation
+		const std::vector<int> pids = tok.encode( probe, false );
+		Candidates c;
+		mc.reset_slot( 0 );
+		int t = mc.prefill( pids.data(), static_cast<int>( pids.size() ), 0, static_cast<int>( pids.size() ), &c );
+		std::printf( "  %zu prompt tokens, top candidates:\n", pids.size() );
+		for ( int i = 0; i < std::min( c.n, 8 ); ++i ) std::printf( "    %8.3f  id %6d  '%s'\n", c.logits[i], c.ids[i], tok.decode( { c.ids[i] } ).c_str() );
+		std::string text = tok.decode( { t } );
+		int pos = static_cast<int>( pids.size() );
+		const int n_cont = std::getenv( "GLM_PROBE_TOKENS" ) ? std::atoi( std::getenv( "GLM_PROBE_TOKENS" ) ) : 3;
+		for ( int i = 0; i < n_cont; ++i ) {
+			mc.forward( &t, 1, pos++, 0 );
+			t = mc.sample_one();
+			text += tok.decode( { t } );
+		}
+		std::printf( "  continuation: '%s'\n", text.c_str() );
+		mc.shutdown();
+		return 0;
+	}
 	const std::vector<int> para = tok.encode( " The history of computing is a story of increasingly abstract machines: from mechanical looms and difference engines, through vacuum tubes and transistors, to the integrated circuits that now sit in every pocket. Each generation traded raw physical effort for a layer of symbolic description, and each layer made the one below it easier to forget.", false );
 	std::vector<int> ids;
 	for ( int i = 0; static_cast<int>( ids.size() ) < n; ++i ) ids.push_back( para[i % para.size()] );

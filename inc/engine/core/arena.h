@@ -11,6 +11,7 @@ struct MemoryArena {
 	size_t total_bytes;    // Total allocated VRAM (e.g. 30,720 MiB)
 	size_t offset_bytes;   // Bump offset for static reservations
 	bool   pinned;         // base_ptr is mapped pinned host memory (the cold-expert tier), not device memory
+	bool   stream_skip = false;   // allocate the tensors but do not copy them from the checkpoint (expert_stream fills them before use)
 };
 
 } // namespace pod

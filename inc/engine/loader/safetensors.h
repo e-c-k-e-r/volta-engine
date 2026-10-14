@@ -84,6 +84,12 @@ public:
 	);
 	// Bytes of the trellis codes of `base_name` (0 when it is not a trellis tensor)
 	size_t trellis_bytes( const char* base_name ) const;
+	// Where a tensor's bytes are in its shard file (an open descriptor, absolute offset), for reads that bypass the mmap
+	bool file_ref( const char* tensor_name, int* fd, size_t* offset, size_t* bytes ) const;
+	// ENGINE_DEBUG_EXPERT_SYNTH=2 (timing only): an expert linear that is not in the checkpoint, generated with the shape and bit width the
+	// directory's quantization_config.json lists for it (suh / svh of +-1, pseudo-random codes). Both return 0 / an empty weight when that file has no entry
+	size_t synth_trellis_bytes( const char* base_name ) const;
+	pod::LinearWeight synth_linear( const char* base_name, pod::MemoryArena& arena, backend::stream_t stream, pod::MemoryArena* code_arena = nullptr ) const;
 
 	pod::LinearWeight load_linear_slice(
 		const char* base_name,

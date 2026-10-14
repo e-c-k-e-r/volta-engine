@@ -568,11 +568,12 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 					else {
 						std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.%s", pre, rank_ * per_rank, kinds[p] );
 						bytes[p] = repo.trellis_bytes( nm );
+						if ( bytes[p] == 0 && runtime::options().expert_synth >= 2 ) bytes[p] = repo.synth_trellis_bytes( nm );
 						ENGINE_ASSERT( bytes[p] > 0, "Qwen4ExpPipeline: expert codes not found for the tier" );
 					}
 				}
 				tier_.configure( per_rank, tier_fraction, bytes );
-				const size_t host_bytes = static_cast<size_t>( config_.num_layers ) * tier_.cold_bytes_per_layer() + tier_.slot_bytes + 256;
+				const size_t host_bytes = ( runtime::options().expert_synth ? 0 : static_cast<size_t>( config_.num_layers ) * tier_.cold_bytes_per_layer() ) + tier_.slot_bytes + 256;
 				ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "Qwen4ExpPipeline: pinned expert tier allocation failed" );
 				tier_.allocate_staging( host_arena_ );
 			}
@@ -586,6 +587,23 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 			pod::MemoryArena ca[3];
 			if ( tier_layer >= 0 ) for ( int p = 0; p < 3; ++p ) tier_.code_arena( tier_layer, e, p, ca[p] );
 			pod::MemoryArena* cp[3] = { tier_layer >= 0 ? &ca[0] : nullptr, tier_layer >= 0 ? &ca[1] : nullptr, tier_layer >= 0 ? &ca[2] : nullptr };
+			if ( runtime::options().expert_synth >= 2 && !nv_experts && tier_layer >= 0 ) {
+				// Timing only: experts that are not in the checkpoint. The resident ones are generated, a cold one is a copy of a resident one
+				if ( e >= tier_.resident ) {
+					mw.gate[e] = mw.gate[e % tier_.resident];
+					mw.up[e] = mw.up[e % tier_.resident];
+					mw.down[e] = mw.down[e % tier_.resident];
+					continue;
+				}
+				static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+				pod::LinearWeight* dst[3] = { &mw.gate[e], &mw.up[e], &mw.down[e] };
+				for ( int p = 0; p < 3; ++p ) {
+					std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.%s", pre, gid, kinds[p] );
+					*dst[p] = repo.synth_linear( nm, *arena_, stream, cp[p] );
+					ENGINE_ASSERT( dst[p]->w0.data != nullptr, "Qwen4ExpPipeline: no entry for a generated expert in quantization_config.json" );
+				}
+				continue;
+			}
 			if ( nv_experts && in_mtp ) {
 				// The head's experts are FP8 with 128 x 128 block scales: dequantized and quantized to NVFP4 (round to nearest) here
 				std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.gate_proj", pre, gid ); mw.gate[e] = check( nv_repo->quantize_nvfp4_slice( nm, *arena_, true, 0, 1, 0, stream ), nm );

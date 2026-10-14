@@ -273,7 +273,8 @@ bool Glm5NextPipeline::init(
 	}
 	{
 		const int B = pod::MAX_BATCH;
-		int logit_shape[2] = { B, lm_shard_cols_ };
+		logit_rows_ = std::max( B, runtime::options().glm_logit_rows );
+		int logit_shape[2] = { logit_rows_, lm_shard_cols_ };
 		logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
 		d_argmax_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, B * sizeof( int ) ) );
 		d_argmax_val_ = static_cast<float*>( engine::core::arena_alloc( arena, B * sizeof( float ) ) );
@@ -289,7 +290,7 @@ bool Glm5NextPipeline::init(
 		backend::memset_sync( samp_counters_, 0, B * sizeof( int ) );
 		if ( rank_ == 0 ) {
 			// Only whole-distribution consumers (the drafter's tests) need the gathered logits
-			int full_shape[2] = { B, config_.vocab_size };
+			int full_shape[2] = { logit_rows_, config_.vocab_size };
 			full_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, full_shape, 2 );
 		}
 	}
@@ -698,12 +699,13 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 					for ( int p = 0; p < 3; ++p ) {
 						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", L, start_expert, kinds[p] );
 						bytes[p] = repo.trellis_bytes( name_buf );
+						if ( bytes[p] == 0 && runtime::options().expert_synth >= 2 ) bytes[p] = repo.synth_trellis_bytes( name_buf );
 						ENGINE_ASSERT( bytes[p] > 0, "Glm5NextPipeline: expert codes not found for the tier" );
 					}
 					tier_.configure( experts_per_rank, tier_fraction, bytes );
 					int moe_layers = 0;
 					for ( int ll = 0; ll < config_.num_layers; ++ll ) moe_layers += ( ll >= 3 ) ? 1 : 0;
-					const size_t host_bytes = static_cast<size_t>( moe_layers ) * tier_.cold_bytes_per_layer() + tier_.slot_bytes + 256;
+					const size_t host_bytes = ( runtime::options().expert_synth ? 0 : runtime::options().expert_stream ? tier_.cold_bytes_per_layer() + 256 : static_cast<size_t>( moe_layers ) * tier_.cold_bytes_per_layer() ) + tier_.slot_bytes + 256;
 					ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "Glm5NextPipeline: pinned expert tier allocation failed" );
 					tier_.allocate_staging( host_arena_ );
 				}
@@ -717,7 +719,34 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 				pod::MemoryArena ca[3];
 				if ( tier_layer >= 0 ) for ( int p = 0; p < 3; ++p ) tier_.code_arena( tier_layer, e, p, ca[p] );
 				pod::MemoryArena* cp[3] = { tier_layer >= 0 ? &ca[0] : nullptr, tier_layer >= 0 ? &ca[1] : nullptr, tier_layer >= 0 ? &ca[2] : nullptr };
+				if ( runtime::options().expert_synth >= 2 ) {
+					// Timing only: experts that are not in the checkpoint. The resident ones are generated, a cold one is a copy of a resident one
+					ENGINE_ASSERT( tier_layer >= 0 && !moe_tp_, "Glm5NextPipeline: ENGINE_DEBUG_EXPERT_SYNTH=2 needs expert_cache < 1 on one rank" );
+					if ( e >= tier_.resident ) {
+						mw.gate[e] = mw.gate[e % tier_.resident];
+						mw.up[e] = mw.up[e % tier_.resident];
+						mw.down[e] = mw.down[e % tier_.resident];
+						continue;
+					}
+					static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+					pod::LinearWeight* dst[3] = { &mw.gate[e], &mw.up[e], &mw.down[e] };
+					for ( int p = 0; p < 3; ++p ) {
+						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", L, gid, kinds[p] );
+						*dst[p] = repo.synth_linear( name_buf, *arena_, stream, cp[p] );
+						ENGINE_ASSERT( dst[p]->w0.data != nullptr, "Glm5NextPipeline: no entry for a generated expert in quantization_config.json" );
+					}
+					continue;
+				}
 
+				if ( tier_layer >= 0 && runtime::options().expert_stream ) {
+					static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+					for ( int p = 0; p < 3; ++p ) {
+						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s.trellis", L, gid, kinds[p] );
+						int fd = -1; size_t off = 0, nb = 0;
+						ENGINE_ASSERT( repo.file_ref( name_buf, &fd, &off, &nb ), "Glm5NextPipeline: expert_stream: tensor not found" );
+						tier_.set_source( tier_layer, e, p, fd, off, nb );
+					}
+				}
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, gid );
 				mw.gate[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, config_.tp_size, stream ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[0] );
 
@@ -1101,6 +1130,7 @@ void Glm5NextPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 	// Logits selection applies to eager prefill chunks only (decode graphs are keyed on m alone)
 	lm_mode_ = ( m > pod::MAX_BATCH ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;
 	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
+	ENGINE_ASSERT( last_rows_ <= logit_rows_, "Glm5NextPipeline::forward: more logit rows than the buffer holds (ENGINE_DEBUG_GLM_LOGIT_ROWS)" );
 	set_rows( m );
 	// Pageable source: the copy is staged before return, so `rows` may be a temporary
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
@@ -1431,6 +1461,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 		// 4. MoE FFN
 		hessian( layer, 1, norm_hidden_.data, H, m, stream );
 		if ( lw.is_moe ) {
+			if ( tier_.active() && engine::modules::ExpertTier::stream_mode() ) tier_.stream_fill( layer - 3, stream );   // tier layers are the MoE layers from 3 on
 			// Replicated Top-K Router: 288 experts, top-8 selection evaluated on all ranks
 			engine::modules::MoERouter::route_topk(
 				norm_hidden_, lw.router_weights, lw.e_score_bias,
