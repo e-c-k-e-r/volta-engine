@@ -53,7 +53,7 @@ void VoltaServer::handle_api_stats( const ConnPtr& conn ) {
 	json recent = json::array();
 	for ( auto it = mon.recent.rbegin(); it != mon.recent.rend(); ++it ) {
 		recent.push_back( { { "req_id", it->req_id }, { "age_s", mon.uptime_seconds - it->end_s }, { "prompt_tokens", it->prompt_tokens }, { "cached_tokens", it->cached_tokens },
-			{ "generated", it->generated }, { "ttft_ms", it->ttft_ms }, { "total_ms", it->total_ms }, { "decode_tok_s", it->decode_tok_s }, { "reason", reason_name( it->reason ) } } );
+			{ "generated", it->generated }, { "queue_ms", it->queue_ms }, { "ttft_ms", it->ttft_ms }, { "restore_ms", it->restore_ms }, { "prefill_ms", it->prefill_ms }, { "store_ms", it->store_ms }, { "total_ms", it->total_ms }, { "decode_tok_s", it->decode_tok_s }, { "reason", reason_name( it->reason ) } } );
 	}
 	j["recent"] = recent;
 	json t = json::array(), dec = json::array(), pf = json::array(), act = json::array();

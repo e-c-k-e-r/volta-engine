@@ -90,6 +90,7 @@ bool Generator::submit_request( GenerationRequest req ) {
 	if ( req.prompt_tokens.empty() || static_cast<int>( req.prompt_tokens.size() ) >= cluster_.metadata().max_seq_len ) return false;
 	{
 		std::unique_lock<std::mutex> lock( queue_mtx_ );
+		req.submit_time = std::chrono::steady_clock::now();
 		pending_queue_.push_back( std::move( req ) );
 	}
 	queue_cv_.notify_one();
@@ -121,6 +122,7 @@ void Generator::admit_pending() {
 		slot.rng.reseed( slot.sp.seed );
 		slot.in_reasoning = slot.req.starts_in_reasoning;
 		slot.metrics.start_time = std::chrono::steady_clock::now();
+		slot.metrics.queue_ms = std::chrono::duration<double, std::milli>( slot.metrics.start_time - slot.req.submit_time ).count();
 	}
 }
 
@@ -266,6 +268,21 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 		rec.cached_tokens = slot.metrics.cached_tokens;
 		rec.generated = slot.tokens_generated;
 		rec.ttft_ms = ttft;
+		rec.queue_ms = slot.metrics.queue_ms;
+		rec.restore_ms = slot.metrics.restore_ms;
+		rec.prefill_ms = slot.metrics.prefill_ms;
+		rec.store_ms = slot.metrics.store_ms;
+		const char* why = reason == FinishReason::Stop ? "stop" : reason == FinishReason::Length ? "length" : reason == FinishReason::StopString ? "stop string" : "cancelled";
+		if ( slot.prefill_done ) {
+			LOG_INFO( "[req %llu] slot %d %s: %d tokens in %.1f s (%.0f tok/s) | first token after %.1f s = restore %.2f + prefill %.2f + checkpoints %.2f + other slots %.2f\n",
+				static_cast<unsigned long long>( rec.req_id ), s, why, slot.tokens_generated, std::chrono::duration<double>( now - slot.metrics.first_token_time ).count(),
+				slot.metrics.decode_tok_s, ttft / 1000.0, rec.restore_ms / 1000.0, rec.prefill_ms / 1000.0, rec.store_ms / 1000.0,
+				( ttft - rec.restore_ms - rec.prefill_ms - rec.store_ms ) / 1000.0 );
+		}
+		else {
+			LOG_INFO( "[req %llu] slot %d %s before the first token (%.1f s after admission)\n", static_cast<unsigned long long>( rec.req_id ), s, why,
+				std::chrono::duration<double>( now - slot.metrics.start_time ).count() );
+		}
 		rec.total_ms = std::chrono::duration<double, std::milli>( now - slot.metrics.start_time ).count();
 		rec.decode_tok_s = slot.metrics.decode_tok_s;
 		rec.reason = reason;
@@ -318,14 +335,18 @@ bool Generator::prefill_slot( int s, int budget ) {
 		slot.pf_node = nullptr;
 		if ( prefix_cache_ && n >= kPrefixMinTokens ) {
 			if ( PrefixCache::Entry* hit = prefix_cache_->find( key_prompt ) ) {
-				if ( prefix_cache_->restore( s, hit ) ) {
+				const auto t_restore = std::chrono::steady_clock::now();
+				const bool restored = prefix_cache_->restore( s, hit );
+				slot.metrics.restore_ms += std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_restore ).count();
+				if ( restored ) {
 					slot.pf_node = hit;
 					pos = static_cast<int>( hit->tokens.size() );
-					LOG_INFO( "[prefix] slot %d resumes at token %d of %d\n", s, pos, n );
 				}
 			}
 		}
 		slot.pf_resumed = pos;
+		LOG_INFO( "[req %llu] slot %d: %d prompt tokens, %d from the prefix cache, waited %.1f s for the slot\n", static_cast<unsigned long long>( slot.req.req_id ), s, n, pos,
+			slot.metrics.queue_ms / 1000.0 );
 		if ( pos == 0 ) cluster_.reset_slot( s );
 		if ( !slot.req.images.empty() ) {
 			MmLayout layout;
@@ -400,7 +421,9 @@ bool Generator::prefill_slot( int s, int budget ) {
 		if ( budget > 0 ) seg_end = MIN( end, pos + MAX( 1, budget - fed ) );
 		if ( seg_end >= n ) {
 			Candidates first_cands;
+			const auto t_pf = std::chrono::steady_clock::now();
 			int first = cluster_.prefill( prompt.data() + pos, n - pos, s, 0, slot.sp.greedy() ? nullptr : &first_cands, pos );
+			slot.metrics.prefill_ms += std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_pf ).count();
 			tokens_prefilled_.fetch_add( static_cast<uint64_t>( n - pos ), std::memory_order_relaxed );
 			if ( !slot.sp.greedy() ) first = sample_token( first_cands, slot.sp, slot.rng );
 			slot.current_pos = n;
@@ -414,7 +437,9 @@ bool Generator::prefill_slot( int s, int budget ) {
 			emit_token( s, first );
 			return true;
 		}
+		const auto t_pf = std::chrono::steady_clock::now();
 		cluster_.prefill( prompt.data() + pos, seg_end - pos, s, 0, nullptr, pos );
+		slot.metrics.prefill_ms += std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_pf ).count();
 		tokens_prefilled_.fetch_add( static_cast<uint64_t>( seg_end - pos ), std::memory_order_relaxed );
 		fed += seg_end - pos;
 		pos = seg_end;
@@ -423,7 +448,9 @@ bool Generator::prefill_slot( int s, int budget ) {
 			++slot.pf_cp_next;
 			const auto t_cp = std::chrono::steady_clock::now();
 			slot.pf_node = store_prefix( s, slot.pf_node, pos, cp->pinned, cp->taps );
-			LOG_DEBUG( "[gen] slot %d checkpoint at %d stored in %.0f ms\n", s, pos, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_cp ).count() );
+			const double cp_ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_cp ).count();
+			slot.metrics.store_ms += cp_ms;
+			LOG_DEBUG( "[gen] slot %d checkpoint at %d stored in %.0f ms\n", s, pos, cp_ms );
 			slot.pf_chain_ok = slot.pf_node != nullptr;
 		}
 		slot.pf_pos = pos;

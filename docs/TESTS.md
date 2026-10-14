@@ -38,7 +38,7 @@
 
 ## Serving benchmarks
 
-Not part of `gate.sh`. `tests/3_bench/bench_serve.py` measures decode speed through a running server's streaming API (`--selftest` checks the plumbing against a mock server, no GPU) and `tests/3_bench/compare_1cat.sh <arm>` starts a server for one configuration, runs it and stops it.
+Not part of `gate.sh`. `tests/3_bench/bench_serve.py` measures decode speed through a running server's streaming API (`--selftest` checks the plumbing against a mock server, no GPU) `tests/3_bench/bench_agent.py` replays an agent-shaped load (a main agent and parallel subagents whose prompts grow by a tool result every turn, so each request resumes from the prefix cache) and reports the time to the first token as the client sees it next to the server's split of it (queue, prefix restore, prefill kernels, checkpoint stores, other slots' steps), and `tests/3_bench/compare_1cat.sh <arm>` starts a server for one configuration, runs it and stops it.
 The workloads are 1Cat-vLLM's published SM70 ones, so numbers can sit beside theirs: `fixedN` tiles one sentence to about N prompt tokens (repetitive, so speculation accepts almost everything), `natural8k` puts four real questions behind 8K tokens of the same filler;
 sampling is their contract (T=1, top-p 0.95, top-k 20, seed 0, 256 tokens) or `--greedy`; `--concurrency 4` is their C4 shape. It reports TTFT, decode tok/s from the stream (prefill excluded), speculation tokens per round and acceptance from `/api/stats`,
 and the GPUs' power limit, clocks and peak draw: compare runs only at the same power cap.

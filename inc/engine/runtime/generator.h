@@ -37,12 +37,16 @@ struct SlotMetrics {
 	int generated_tokens = 0;
 	float prefill_tok_s = 0.0f;
 	float decode_tok_s = 0.0f;
+	// Where the time before the first token went (ms): waiting for a slot, restoring a cached prefix, the prefill kernels, storing
+	// checkpoints; what is left of the time to first token (start_time to first_token_time) went to other slots' decode steps
+	double queue_ms = 0.0, restore_ms = 0.0, prefill_ms = 0.0, store_ms = 0.0;
 };
 
 enum class FinishReason { Stop, Length, StopString, Cancelled };
 
 struct GenerationRequest {
 	uint64_t req_id = 0;
+	std::chrono::steady_clock::time_point submit_time;
 	std::string prompt_text;
 	std::vector<int> prompt_tokens;
 	int max_tokens = 64;
@@ -116,6 +120,7 @@ struct RequestRecord {
 	int cached_tokens = 0;
 	int generated = 0;
 	double ttft_ms = 0.0;
+	double queue_ms = 0.0, restore_ms = 0.0, prefill_ms = 0.0, store_ms = 0.0;   // see SlotMetrics
 	double total_ms = 0.0;
 	double decode_tok_s = 0.0;
 	FinishReason reason = FinishReason::Stop;
