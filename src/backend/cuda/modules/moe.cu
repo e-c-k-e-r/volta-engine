@@ -162,6 +162,58 @@ void router_logits_kernel(
 	g_router_partials[( static_cast<size_t>( m ) * ROUTER_MAX_KSLICES + ks ) * ROUTER_MAX_EXPERTS + expert] = logit;
 }
 
+// Many rows (prefill): the same sums, but a block takes ROUTER_ROW_GROUP rows, so the weight slice it holds in registers is read once for
+// all of them instead of once per row (the per-row kernel above re-reads the weights 2048 times for a 2048-row chunk). Each row's
+// logit accumulates in the same order, so the results are bit-identical.
+constexpr int ROUTER_ROW_GROUP = 16;
+
+__global__ __launch_bounds__( 32 )
+void router_logits_rows_kernel(
+	const half* __restrict__ x,
+	const half* __restrict__ router_weights,
+	int hidden_size,
+	int num_experts,
+	int rows
+) {
+	__shared__ float s_x[ROUTER_ROW_GROUP][128];
+	const int m0 = blockIdx.y * ROUTER_ROW_GROUP;
+	const int nrows = min( ROUTER_ROW_GROUP, rows - m0 );
+	const int ks = blockIdx.z;
+	const int d0 = ks * 128;
+	for ( int i = threadIdx.x; i < nrows * 128; i += 32 ) {
+		const int r = i >> 7, d = i & 127;
+		s_x[r][d] = __half2float( x[static_cast<size_t>( m0 + r ) * hidden_size + d0 + d] );
+	}
+	__syncwarp();
+
+	const int expert = blockIdx.x * 32 + threadIdx.x;
+	if ( expert >= num_experts ) return;
+	const half* wcol = router_weights + static_cast<size_t>( d0 ) * num_experts + expert;
+	half w[128];
+	#pragma unroll
+	for ( int j = 0; j < 128; ++j ) {
+		w[j] = __ldg( wcol + static_cast<size_t>( j ) * num_experts );
+	}
+	for ( int r = 0; r < nrows; ++r ) {
+		float logit = 0.0f;
+		#pragma unroll
+		for ( int j = 0; j < 128; ++j ) {
+			logit = fmaf( s_x[r][j], __half2float( w[j] ), logit );
+		}
+		g_router_partials[( static_cast<size_t>( m0 + r ) * ROUTER_MAX_KSLICES + ks ) * ROUTER_MAX_EXPERTS + expert] = logit;
+	}
+}
+
+static void launch_router_logits( const half* x, const half* router_weights, int hidden_size, int num_experts, int rows, cudaStream_t stream ) {
+	if ( rows > ROUTER_ROW_GROUP ) {
+		router_logits_rows_kernel<<<dim3( ( num_experts + 31 ) / 32, ( rows + ROUTER_ROW_GROUP - 1 ) / ROUTER_ROW_GROUP, hidden_size / 128 ), dim3( 32 ), 0, stream>>>(
+			x, router_weights, hidden_size, num_experts, rows );
+	}
+	else {
+		router_logits_kernel<<<dim3( ( num_experts + 31 ) / 32, rows, hidden_size / 128 ), dim3( 32 ), 0, stream>>>( x, router_weights, hidden_size, num_experts );
+	}
+}
+
 __global__ __launch_bounds__( 288 )
 void router_select_kernel(
 	const half* __restrict__ e_score_bias,
@@ -434,12 +486,7 @@ void MoERouter::route_topk(
 	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS, "MoERouter::route_topk: rows out of range" );
 	ENGINE_ASSERT( top_k <= 16 && num_experts <= 288 && hidden_size % 128 == 0, "MoERouter::route_topk: top_k / num_experts / hidden_size out of range" );
 	ENGINE_ASSERT( hidden_size / 128 <= ROUTER_MAX_KSLICES, "MoERouter::route_topk: hidden_size exceeds the router k slices" );
-	router_logits_kernel<<<dim3( ( num_experts + 31 ) / 32, rows, hidden_size / 128 ), dim3( 32 ), 0, stream>>>(
-		x.ptr<const half>(),
-		router_weights.ptr<const half>(),
-		hidden_size,
-		num_experts
-	);
+	launch_router_logits( x.ptr<const half>(), router_weights.ptr<const half>(), hidden_size, num_experts, rows, stream );
 	router_select_kernel<<<dim3( rows ), dim3( ( num_experts + 31 ) / 32 * 32 ), 0, stream>>>(
 		e_score_bias.ptr<const half>(),
 		d_topk_indices,
@@ -465,8 +512,7 @@ void MoERouter::route_softmax_topk(
 	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS, "MoERouter::route_softmax_topk: rows out of range" );
 	ENGINE_ASSERT( top_k <= 16 && num_experts <= ROUTER_MAX_EXPERTS && hidden_size % 128 == 0 && hidden_size / 128 <= ROUTER_MAX_KSLICES,
 		"MoERouter::route_softmax_topk: top_k / num_experts / hidden_size out of range" );
-	router_logits_kernel<<<dim3( ( num_experts + 31 ) / 32, rows, hidden_size / 128 ), dim3( 32 ), 0, stream>>>(
-		x.ptr<const half>(), router_weights.ptr<const half>(), hidden_size, num_experts );
+	launch_router_logits( x.ptr<const half>(), router_weights.ptr<const half>(), hidden_size, num_experts, rows, stream );
 	static const int round_fp16 = engine::runtime::options().router_fp16 ? 1 : 0;
 	router_softmax_select_kernel<<<dim3( rows ), dim3( 512 ), 0, stream>>>( d_topk_indices, d_topk_weights, num_experts, top_k, hidden_size / 128, round_fp16 );
 }
