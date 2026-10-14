@@ -159,7 +159,7 @@ void ExpertTier::stream_fill( int layer, cudaStream_t stream ) {
 					size_t done = 0;
 					while ( done < s.bytes ) {
 						const ssize_t n = pread( s.fd, l.host[e] + dst_off + done, s.bytes - done, static_cast<off_t>( s.off + done ) );
-						if ( n <= 0 ) std::fprintf( stderr, "stream_fill: pread n=%zd errno=%d fd=%d off=%zu bytes=%zu done=%zu\n", n, errno, s.fd, s.off, s.bytes, done );
+						if ( n <= 0 ) LOG_ERROR( "ExpertTier::stream_fill: pread returned %zd (errno %d) at offset %zu of %zu bytes\n", n, errno, s.off + done, s.bytes );
 						ENGINE_ASSERT( n > 0, "ExpertTier::stream_fill: read failed" );
 						done += static_cast<size_t>( n );
 					}

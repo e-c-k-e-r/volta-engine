@@ -71,19 +71,66 @@ typedef void (*fp_exl3_mgemm_kernel)( EXL3_MGEMM_ARGS );
 
 #define EXL3_GEMM_NUM_SHAPES 4
 
+// Shapes a build instantiates. All of them by default; ENGINE_EXL3_PRUNE leaves out those the target architectures never select
+// (select_gemm_shape: shape 1 is chosen on Hopper and newer only, shape 4 at 7 and 8 bits on Ada and newer only)
+#ifndef EXL3_BUILD_SHAPE1
+#define EXL3_BUILD_SHAPE1 1
+#endif
+#ifndef EXL3_BUILD_SHAPE4_HIGH_K
+#define EXL3_BUILD_SHAPE4_HIGH_K 1
+#endif
+constexpr bool exl3_shape_built( int bits, int shape_idx ) {
+	return ( shape_idx != 1 || EXL3_BUILD_SHAPE1 ) && ( shape_idx != 4 || bits <= 6 || EXL3_BUILD_SHAPE4_HIGH_K );
+}
+
+#if EXL3_BUILD_SHAPE1
+#define EXL3_GEMM_S1(_bits, _c_fp32, cb) exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>
+#define EXL3_MGEMM_S1(_bits, _c_fp32, cb) exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>
+#else
+#define EXL3_GEMM_S1(_bits, _c_fp32, cb) nullptr
+#define EXL3_MGEMM_S1(_bits, _c_fp32, cb) nullptr
+#endif
+#define EXL3_GEMM_S4_REAL(_bits, _c_fp32, cb) exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+#define EXL3_MGEMM_S4_REAL(_bits, _c_fp32, cb) exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+#define EXL3_GEMM_S4_1 EXL3_GEMM_S4_REAL
+#define EXL3_GEMM_S4_2 EXL3_GEMM_S4_REAL
+#define EXL3_GEMM_S4_3 EXL3_GEMM_S4_REAL
+#define EXL3_GEMM_S4_4 EXL3_GEMM_S4_REAL
+#define EXL3_GEMM_S4_5 EXL3_GEMM_S4_REAL
+#define EXL3_GEMM_S4_6 EXL3_GEMM_S4_REAL
+#define EXL3_MGEMM_S4_1 EXL3_MGEMM_S4_REAL
+#define EXL3_MGEMM_S4_2 EXL3_MGEMM_S4_REAL
+#define EXL3_MGEMM_S4_3 EXL3_MGEMM_S4_REAL
+#define EXL3_MGEMM_S4_4 EXL3_MGEMM_S4_REAL
+#define EXL3_MGEMM_S4_5 EXL3_MGEMM_S4_REAL
+#define EXL3_MGEMM_S4_6 EXL3_MGEMM_S4_REAL
+#if EXL3_BUILD_SHAPE4_HIGH_K
+#define EXL3_GEMM_S4_7 EXL3_GEMM_S4_REAL
+#define EXL3_GEMM_S4_8 EXL3_GEMM_S4_REAL
+#define EXL3_MGEMM_S4_7 EXL3_MGEMM_S4_REAL
+#define EXL3_MGEMM_S4_8 EXL3_MGEMM_S4_REAL
+#else
+#define EXL3_GEMM_S4_7( _bits, _c_fp32, cb ) nullptr
+#define EXL3_GEMM_S4_8( _bits, _c_fp32, cb ) nullptr
+#define EXL3_MGEMM_S4_7( _bits, _c_fp32, cb ) nullptr
+#define EXL3_MGEMM_S4_8( _bits, _c_fp32, cb ) nullptr
+#endif
+#define EXL3_GEMM_S4(_bits, _c_fp32, cb) EXL3_GEMM_S4_##_bits( _bits, _c_fp32, cb )
+#define EXL3_MGEMM_S4(_bits, _c_fp32, cb) EXL3_MGEMM_S4_##_bits( _bits, _c_fp32, cb )
+
 #define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
 	nullptr, \
-	exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
+	EXL3_GEMM_S1( _bits, _c_fp32, cb ), \
 	exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
 	exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
-	exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+	EXL3_GEMM_S4( _bits, _c_fp32, cb )
 
 #define EXL3_MGEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
 	nullptr, \
-	exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
+	EXL3_MGEMM_S1( _bits, _c_fp32, cb ), \
 	exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
 	exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
-	exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+	EXL3_MGEMM_S4( _bits, _c_fp32, cb )
 
 #define EXL3_GEMM_BASE_THREADS 256
 

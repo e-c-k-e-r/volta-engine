@@ -11,6 +11,7 @@
 #if defined(USE_ROCM)
 #include <cuda_fp16.h>
 #include "engine/config.h"
+#include "engine/runtime/options.h"
 #include "exl3_dq.cuh"
 #include "exl3_moe_coop.cuh"
 #include "hadamard_inner.cuh"
@@ -633,7 +634,7 @@ void grp_gemv_launch( const uint16_t* const* t0, const uint16_t* const* t1, cons
 	const size_t base = static_cast<size_t>( MR ) * K * sizeof( half ) + static_cast<size_t>( GEMV_WARPS ) * MR * 16 * sizeof( float );
 	const size_t staged = base + static_cast<size_t>( K >> 4 ) * 32 * bits;
 	// Staging needs the weight column (<= 8 uint4 per thread) and the shared memory for it next to the rows
-	const bool stage = staged <= 65000 && static_cast<size_t>( K >> 4 ) * 2 * bits <= 8 * 32 * GEMV_WARPS && std::getenv( "ENGINE_MOE_NOSTAGE" ) == nullptr;
+	const bool stage = staged <= 65000 && static_cast<size_t>( K >> 4 ) * 2 * bits <= 8 * 32 * GEMV_WARPS;
 	if ( stage ) {
 		CUDA_CHECK( cudaFuncSetAttribute( grp_gemv_kernel<bits, MR, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( staged ) ) );
 		grp_gemv_kernel<bits, MR, true><<<dim3( N / 16, W, nproj ), 32 * GEMV_WARPS, staged, stream>>>( t0, t1, in0, in1, out0, out1, runs, K, N );
@@ -692,7 +693,7 @@ bool exl3_moe_rocm_grouped_launch( const MoeCoopParams& p, cudaStream_t stream )
 	float* d_out = reinterpret_cast<float*>( take( static_cast<size_t>( W ) * p.H * sizeof( float ) ) );
 	if ( off > p.grp_ws_bytes ) return false;
 
-	static const bool use_wmma = std::getenv( "ENGINE_MOE_NOWMMA" ) == nullptr;   // the v_dot2 form is kept for comparison
+	static const bool use_wmma = !engine::runtime::options().moe_gemv;
 	CUDA_CHECK( cudaMemsetAsync( acc, 0, static_cast<size_t>( p.bsz ) * p.H * sizeof( float ), stream ) );
 	grp_group_kernel<<<1, GRP_THREADS, 0, stream>>>( p, E, order, inv, ex_start );
 	const int waves = ( n + W - 1 ) / W;

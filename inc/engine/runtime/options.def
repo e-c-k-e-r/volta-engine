@@ -35,6 +35,8 @@ OPTION( bool, dsa, true, "GLM sparse attention indexer (top-2048 key selection);
 OPTION( int, max_image_tokens, 1024, "largest image the vision tower accepts, in language-model tokens (4 patches each; sizes its scratch and caps the resize); 0 = image input off" )
 OPTION( bool, expert_stats, true, "count the routes per expert for the monitor page (a device sync per rank about once a second while serving)" )
 OPTION( bool, spec_ctrl, true, "adaptive speculation controller; false always speculates" )
+DEBUG_OPTION( bool, moe_gemv, false, "ROCm: the expert-grouped EXL3 MoE runs its projections on the v_dot2 GEMV instead of the WMMA kernels" )
+DEBUG_OPTION( bool, nvfp4_hipblas, false, "ROCm: NVFP4 linears of more than 16 rows dequantize into FP16 and run one hipBLAS GEMM instead of the fused WMMA GEMM (the FP16 scratch can move as it grows, which a captured graph cannot follow)" )
 DEBUG_OPTION( bool, expert_log, false, "per-rebalance expert tier statistics" )
 DEBUG_OPTION( int, glm_logit_rows, 0, "GLM: rows of logits a forward can keep; <= 0 = one decode batch (16). Scoring tools (test_ppl) that read the logits of every row of a prefill chunk need the chunk size here (rows x vocabulary x 2 bytes, twice)" )
 DEBUG_OPTION( bool, expert_stream, false, "for checkpoints larger than host RAM (needs expert_cache < 1, one rank, GLM): the cold experts live in the checkpoint and are read (parallel pread, NVMe speed) into one pinned layer-sized buffer before each layer's MoE, then read in place as usual; eager forwards only (no graphs), prefill speed is the disk's" )

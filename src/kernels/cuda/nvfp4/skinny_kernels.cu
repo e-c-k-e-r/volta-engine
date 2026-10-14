@@ -1,4 +1,5 @@
 #include "engine/modules/nvfp4.h"
+#include "engine/runtime/options.h"
 #include "trellis_context.h"
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -450,8 +451,8 @@ void LinearNVFP4::forward(
 		else rocm_nvfp4_gemv_launch<16>( codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale, stream );
 		return;
 	}
-	// More rows: the fused dequantize + WMMA GEMM (ENGINE_NVFP4_GEMM=0 takes dequantize + hipBLAS instead)
-	static const bool rocm_gemm = std::getenv( "ENGINE_NVFP4_GEMM" ) == nullptr || std::atoi( std::getenv( "ENGINE_NVFP4_GEMM" ) ) != 0;
+	// More rows: the fused dequantize + WMMA GEMM (the option nvfp4_hipblas takes dequantize + hipBLAS instead)
+	static const bool rocm_gemm = !engine::runtime::options().nvfp4_hipblas;
 	if ( rocm_gemm ) {
 		rocm_nvfp4_gemm_kernel<<<dim3( ( n + RG_BN - 1 ) / RG_BN, ( m + RG_BM - 1 ) / RG_BM ), dim3( 256 ), 0, stream>>>(
 			codes_ptr, scales_ptr, x_ptr, y_ptr, m, n, k, gscale );

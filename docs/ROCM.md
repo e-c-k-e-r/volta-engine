@@ -1,7 +1,8 @@
 # ROCm (AMD RDNA)
 
 The `ROCM` configuration builds the CUDA backend's sources as HIP for AMD RDNA GPUs (wave32: RX 7000 / RX 9000 series). It is a
-port for correctness first: every kernel runs, the tensor-core instructions are emulated, and nothing is tuned for RDNA yet.
+port: every kernel runs. The attention kernels, the NVFP4 GEMV and GEMM and the EXL3 MoE run on RDNA3's native WMMA; the remaining kernels
+that use NVIDIA's `mma.sync` run on its emulation (see "Still on the vector ALUs or the emulation").
 
 ## Build
 
@@ -33,10 +34,11 @@ code for.
   FP32. The kernels built on them run unchanged; numerics match the tensor cores up to summation order. `test_mma_frag` runs every
   emulation on a simulated warp on the CPU against the PTX layouts (no GPU needed).
 * ROCm takes the SM_80+ code paths (the native-`mma` forms of the EXL3, NVFP4 and attention kernels), with the emulated instructions
-  under them. Host-side EXL3 choices use the oldest architecture class, as upstream exllamav3 does on ROCm.
+  under them, except where a kernel has a native WMMA form. Host-side EXL3 choices use the oldest architecture class, as upstream
+  exllamav3 does on ROCm. `MMA_SM80` is 1 on ROCm, so a `#elif defined(USE_ROCM)` after `#if MMA_SM80` is never compiled: a ROCm form
+  goes in the `#if` itself (`#if MMA_SM80 && !defined(USE_ROCM)` for the CUDA one).
 
-Decode graphs work on ROCm (HIP graphs; the EXL3 GEMV is a plain launch) and are on by default: Qwen3.8-27B NVFP4 plain token 23.0 to 21.6 ms,
-speculative rounds 1 to 3% faster, and the speculative target / state equivalence gates pass with them. `ENGINE_DEBUG_NO_GRAPHS=1` runs eager.
+Decode graphs work on ROCm (HIP graphs; the EXL3 GEMV is a plain launch) and are on by default. `ENGINE_DEBUG_NO_GRAPHS=1` runs eager.
 
 ## Shared memory
 
@@ -53,23 +55,22 @@ device's limit:
 | EXL3 GEMM | 22-90 KB by shape | upstream's RDNA scorer picks among the shapes that fit |
 | EXL3 int8 GEMV | ~80 KB | declined (the FP16 GEMV runs) |
 
-## Routing on measurements
+## Kernel routing
 
-Until the tensor-core kernels have RDNA forms, dequantizing a weight once into FP16 and running one hipBLAS GEMM beats the emulated
-kernels (7900 XTX: NVFP4 gate_proj 1-5 ms fused against ~0.2 ms; EXL3 prefill 15-125x at M = 16..64). On ROCm every NVFP4 linear takes
-that path from 17 rows up, and every EXL3 linear from 9 rows up.
+The emulated `mma` kernels are slow on RDNA, so by row count a linear takes another route. Every EXL3 linear from 9 rows up dequantizes its
+weight once into FP16 and runs one hipBLAS GEMM.
 
 Up to 8 rows, EXL3 linears take a plain-launch GEMV (`src/kernels/rocm/trellis/exl3_gemv.cu`, after upstream exllamav3's RDNA GEMV): the input and output
 Hadamard transforms as their own launches, and between them a kernel that accumulates `v_dot2_f32_f16` straight from the trellis
 decoder's fragments (each lane quad owns two output columns), one block per 16 columns with its warps splitting K. The CUDA GEMV is
 one cooperative kernel on `mma.sync`, emulated on ROCm (under 1 tok/s on Qwen3.8-27B-exl3).
 
-Decode is the exception for NVFP4: the dequantize + GEMM path writes and re-reads the whole weight as FP16 on every call, about 8x the
-packed bytes (a 27B model measured 5 tok/s). Up to 16 rows, NVFP4 linears take a SIMT GEMV (`rocm_nvfp4_gemv`, skinny_kernels.cu)
+NVFP4 linears are routed by rows too: the dequantize + GEMM path writes and re-reads the whole weight as FP16 on every call, about 8x the
+packed bytes, so up to 16 rows they take a SIMT GEMV (`rocm_nvfp4_gemv`, skinny_kernels.cu)
 that decodes each lane's codes in registers and accumulates with `v_dot2_f32_f16`, reading the packed weight once. Above 16 rows (prefill chunks) a fused dequantize + GEMM on the native WMMA (`rocm_nvfp4_gemm_kernel`, 128 x 128 x 32 tiles) decodes the
-weight straight into shared memory, reaching about 73 TFLOP/s of the ~96 the card's WMMA peaks at (Qwen3.8-27B NVFP4 prefill 847 to 1123 tok/s);
-`ENGINE_NVFP4_GEMM=0` takes dequantize + hipBLAS instead, whose FP16 scratch can move as it grows (which a captured graph cannot follow;
-decode graphs, at most 8 rows, never take that path).
+weight straight into shared memory. `ENGINE_DEBUG_NVFP4_HIPBLAS=1` takes dequantize + hipBLAS instead, whose FP16 scratch can move as it
+grows (which a captured graph cannot follow; decode graphs, at most 8 rows, never take that path). `ENGINE_DEBUG_MOE_GEMV=1` runs the
+expert-grouped EXL3 MoE on the v_dot2 GEMV instead of its WMMA kernels.
 
 A config's `tp_size` must not exceed the GPUs present (the files in configs/ are written for four).
 
@@ -91,16 +92,11 @@ the host for each kernel launch, so on ROCm they report the count instead of fai
 * NCCL tensor parallelism for MiniMax-H3 (RCCL is not wired in). The language models' own collective builds; tensor parallelism needs
   peer access between the cards.
 
-## Performance work left
+## Still on the vector ALUs or the emulation
 
-The attention kernels (full-attention and the DFlash2 drafter's) and the NVFP4 prefill GEMM run on the native WMMA. What still runs on the vector
-ALUs or the emulated `mma`, in order of payoff:
-
-1. The EXL3 GEMV and GEMM. The GEMV's per-row products use `v_dot2` and its trellis decode is ALU-bound; a WMMA form would bring the 8-row verify
-   from 2.3 to roughly 1.4 times a token. Upstream exllamav3 has RDNA kernels for EXL3 (`exllamav3_ext/rocm/quant`: the GEMM inner, GEMV,
-   multi-row GEMV and MoE) on WMMA's own layout (whole rows and columns per lane).
-2. The MoE kernels (`moe_kernels.cu`, `exl3_moe_coop.cu`) and the int8 GEMV within 64 KB.
-3. The linear-attention (GDN) prefill recurrence, which is serial per head.
+* The EXL3 GEMV and GEMM: the GEMV's per-row products use `v_dot2` and its trellis decode is ALU-bound, so an 8-row verify costs 2.3 times a token on EXL3.
+* The MoE kernels other than the expert-grouped one (`moe_kernels.cu`, `exl3_moe_coop.cu`) and the int8 GEMV.
+* The linear-attention (GDN) prefill recurrence, which is serial per head.
 
 ## Performance
 

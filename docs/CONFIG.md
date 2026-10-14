@@ -83,6 +83,8 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `expert_stats` | bool | `true` | `ENGINE_EXPERT_STATS` | count the routes per expert for the monitor page (a device sync per rank about once a second while serving) |
 | `spec_ctrl` | bool | `true` | `ENGINE_SPEC_CTRL` | adaptive speculation controller; false always speculates |
 | **Debug** | | | | |
+| `moe_gemv` | bool | `false` | `ENGINE_DEBUG_MOE_GEMV` | ROCm: the expert-grouped EXL3 MoE runs its projections on the v_dot2 GEMV instead of the WMMA kernels |
+| `nvfp4_hipblas` | bool | `false` | `ENGINE_DEBUG_NVFP4_HIPBLAS` | ROCm: NVFP4 linears of more than 16 rows dequantize into FP16 and run one hipBLAS GEMM instead of the fused WMMA GEMM (the FP16 scratch can move as it grows, which a captured graph cannot follow) |
 | `expert_log` | bool | `false` | `ENGINE_DEBUG_EXPERT_LOG` | per-rebalance expert tier statistics |
 | `glm_logit_rows` | int | `0` | `ENGINE_DEBUG_GLM_LOGIT_ROWS` | GLM: rows of logits a forward can keep; <= 0 = one decode batch (16). Scoring tools (test_ppl) that read the logits of every row of a prefill chunk need the chunk size here (rows x vocabulary x 2 bytes, twice) |
 | `expert_stream` | bool | `false` | `ENGINE_DEBUG_EXPERT_STREAM` | for checkpoints larger than host RAM (needs expert_cache < 1, one rank, GLM): the cold experts live in the checkpoint and are read (parallel pread, NVMe speed) into one pinned layer-sized buffer before each layer's MoE, then read in place as usual; eager forwards only (no graphs), prefill speed is the disk's |

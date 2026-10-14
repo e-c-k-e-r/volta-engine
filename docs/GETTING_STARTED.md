@@ -8,6 +8,17 @@ CUDA 12.x (13+ drops SM_70) and CMake 3.24+ with Ninja. The CUDA build is the pr
 cmake -S . -B build -G Ninja && cmake --build build
 ```
 
+### Build time
+
+The EXL3 GEMM kernels are the bulk of a from-scratch CUDA build: each (bit width, codebook) pair is its own generated translation unit, so the
+build runs them in parallel. Two options leave out kernels a setup does not use:
+
+* `ENGINE_EXL3_PRUNE` (`AUTO`, `ON`, `OFF`) skips the tile shapes the built architectures never select: shape 1 below SM_90, shape 4 at 7 and 8 bits
+  below SM_89. `AUTO`, the default, prunes when SM_70 is the only target (the default target; `native` is resolved to the installed
+  GPUs) and builds everything otherwise; `ON` prunes for whatever is built. The selection steps down to a shape that exists
+* `ENGINE_EXL3_CODEBOOKS` (default `0;1;2`: 3inst, mcg, mul1; the codebook is in the checkpoint's `config.json`) lists the codebooks to build.
+  `-DENGINE_EXL3_CODEBOOKS=2` builds `mul1` only; a checkpoint using a codebook left out stops at its first GEMM with a message naming the option
+
 ### Other GPUs (SM_86, SM_89)
 
 The CUDA build targets SM_70 (V100) by default. Ampere (SM_86: RTX 30xx, A10, A40) and Ada (SM_89: RTX 40xx, L4, L40) build from the

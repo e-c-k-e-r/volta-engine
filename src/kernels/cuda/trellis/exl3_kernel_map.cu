@@ -74,7 +74,7 @@ int select_gemm_shape( int cc, int size_m, int size_k, int size_n, int K, bool m
 int select_gemm_shape_cuda_tables( int cc, int size_m, int size_k, int size_n, int K, bool multi, int bszm_in, int bszm_out );
 int select_gemm_shape_cuda_tables( int cc, int size_m, int size_k, int size_n, int K, bool multi, int bszm_in, int bszm_out ) {
 #else
-int select_gemm_shape( int cc, int size_m, int size_k, int size_n, int K, bool multi, int bszm_in, int bszm_out ) {
+static int select_gemm_shape_tables( int cc, int size_m, int size_k, int size_n, int K, bool multi, int bszm_in, int bszm_out ) {
 #endif
 	bool mod_256 = ( size_n % 256 == 0 );
 	bool mod_512 = ( size_n % 512 == 0 );
@@ -138,6 +138,15 @@ int select_gemm_shape( int cc, int size_m, int size_k, int size_n, int K, bool m
 		} break;
 	}
 }
+
+#if !defined(USE_ROCM)
+// A build that skips the shapes its architectures never select (ENGINE_EXL3_PRUNE) steps down to the nearest narrower shape that exists
+int select_gemm_shape( int cc, int size_m, int size_k, int size_n, int K, bool multi, int bszm_in, int bszm_out ) {
+	int shape = select_gemm_shape_tables( cc, size_m, size_k, size_n, K, multi, bszm_in, bszm_out );
+	while ( shape > 1 && !exl3_shape_built( K, shape ) ) --shape;
+	return shape;
+}
+#endif
 
 int exl3_gemm_num_kernel_shapes() {
 	return EXL3_GEMM_NUM_SHAPES;
@@ -219,7 +228,11 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel(
 	}
 
 	ENGINE_ASSERT( K >= 1 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for GEMM shape" );
-	return ( c_fp32 ? tab_gemm_fp32 : tab_gemm_fp16 )[K][cb][shape_idx];
+	fp_exl3_gemm_kernel k = ( c_fp32 ? tab_gemm_fp32 : tab_gemm_fp16 )[K][cb][shape_idx];
+#if !defined(USE_ROCM)
+	ENGINE_ASSERT( k != nullptr, "exl3_gemm: no kernel was built for this bit width and codebook (build options ENGINE_EXL3_CODEBOOKS, ENGINE_EXL3_PRUNE)" );
+#endif
+	return k;
 }
 
 fp_exl3_gemm_kernel get_gemm_kernel_ptr( int K, int shape_idx, bool c_fp32, int cb ) {
@@ -229,5 +242,9 @@ fp_exl3_gemm_kernel get_gemm_kernel_ptr( int K, int shape_idx, bool c_fp32, int 
 
 fp_exl3_mgemm_kernel get_mgemm_kernel_ptr( int K, int shape_idx, bool c_fp32, int cb ) {
 	ENGINE_ASSERT( K >= 1 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for GEMM shape" );
-	return ( c_fp32 ? tab_mgemm_fp32 : tab_mgemm_fp16 )[K][cb][shape_idx];
+	fp_exl3_mgemm_kernel k = ( c_fp32 ? tab_mgemm_fp32 : tab_mgemm_fp16 )[K][cb][shape_idx];
+#if !defined(USE_ROCM)
+	ENGINE_ASSERT( k != nullptr, "exl3_mgemm: no kernel was built for this bit width and codebook (build options ENGINE_EXL3_CODEBOOKS, ENGINE_EXL3_PRUNE)" );
+#endif
+	return k;
 }
