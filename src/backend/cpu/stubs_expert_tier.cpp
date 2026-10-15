@@ -15,7 +15,7 @@ __attribute__(( weak )) void ExpertTier::configure( int experts_per_layer, doubl
 	__builtin_unreachable();
 }
 
-__attribute__(( weak )) std::vector<int> ExpertTier::initial_set( int layer ) const {
+__attribute__(( weak )) std::vector<int> ExpertTier::initial_set( int layer, int count ) const {
 	ENGINE_UNSUPPORTED( "ExpertTier::initial_set" );
 	__builtin_unreachable();
 }

@@ -95,6 +95,9 @@ Qwen extras:
   (`configs/glm_256k.json`; images off). Per GPU the arena holds 2.8 GiB of buffers and caches (the latent cache and attention workspaces
   2.2 of them), 27.3 GiB of weights at 95% of the experts resident and the 0.7 GiB drafter, leaving 0.2 GiB; the startup log prints this
   as `[mem]` lines. Each point of `expert_cache` costs 0.26 GiB, and the FP8 cache (`kv_format=fp8`, 1.2 GiB more) fits only up to about 0.85.
+  `--set expert_cache=0` picks the fraction itself: the largest the arena holds after the other weights, the drafter (its file size) and a 0.25 GiB
+  margin; the first MoE layer starts from a conservative estimate and each later layer re-estimates from what was actually loaded, so the last
+  layers take up the slack (the log prints the plan and the resident range). GLM only; it uses the expert tier on any rank count.
   `--set kv_pool=262144` lets the two slots share one pool of that many tokens instead of owning 256K each (0.95 GiB per GPU less at the 4-bit
   cache, which the expert cache or the drafter can use): a request starts once the pool holds its prompt, otherwise it queues, and one that
   grows past the pool ends with finish reason `length`.

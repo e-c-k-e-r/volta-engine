@@ -34,7 +34,7 @@ struct ExpertTier {
 	};
 
 	int experts = 0;
-	int resident = 0;
+	int resident = 0;                        // the base count per layer; add_layer takes the size of the set it is given
 	size_t part_bytes[3] = {};
 	size_t slot_bytes = 0;
 	std::vector<Layer> layers;
@@ -60,7 +60,8 @@ struct ExpertTier {
 	// `layers` MoE layers' cold experts (one layer's worth when `streamed`) and the staging; host is created here
 	void start( int experts_per_layer, double fraction, const size_t bytes[3], int rank, int tp, int layers, bool streamed, pod::MemoryArena& host );
 	// The experts a layer starts with: the hottest ones of the saved counts when there are any, experts 0..resident - 1 otherwise
-	std::vector<int> initial_set( int layer ) const;
+	// (`count` of them; the tier's `resident` when 0 - a layer may hold more than the base count, never fewer)
+	std::vector<int> initial_set( int layer, int count = 0 ) const;
 	void save_heat();
 	int swap_cap() const;
 	// Backing for one layer: its device slots (from `device`) and the pinned buffers of its cold experts (from `host`); the

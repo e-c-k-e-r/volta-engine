@@ -6,6 +6,7 @@
 #include "engine/modules/linear.h"
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -82,6 +83,8 @@ public:
 		backend::stream_t stream = nullptr,
 		pod::MemoryArena* code_arena = nullptr
 	);
+	// Checkpoint bytes of the tensors whose names start with `prefix` and contain none of the `skip` substrings
+	size_t bytes_of( const std::string& prefix, std::initializer_list<const char*> skip = {} ) const;
 	// Bytes of the trellis codes of `base_name` (0 when it is not a trellis tensor)
 	size_t trellis_bytes( const char* base_name ) const;
 	// Where a tensor's bytes are in its shard file (an open descriptor, absolute offset), for reads that bypass the mmap

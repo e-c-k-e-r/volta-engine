@@ -483,6 +483,38 @@ void Glm5NextPipeline::release_tokens( int slot_id ) {
 	kv_dirty_ = true;
 }
 
+int Glm5NextPipeline::auto_resident( const engine::loader::SafeTensorsRepo& repo, int layer, size_t layers_begin, size_t experts_cost, int layers_done, int experts, size_t slot_bytes, int moe_layers ) const {
+	constexpr double kGiB = 1073741824.0;
+	auto prefix = []( int l ) { return "model.language_model.layers." + std::to_string( l ) + "."; };
+	// What the layers loaded so far took in the arena (less their experts) against their checkpoint bytes, applied to the checkpoint bytes still to
+	// come: this layer's shared expert and the layers after it. The first estimate rests on the dense layers and one attention block; every
+	// later layer refines it
+	size_t counted = repo.bytes_of( prefix( layer ), { ".mlp.experts.", ".mlp.shared_experts." } ), total = 0;
+	for ( int l = 0; l < layer; ++l ) counted += repo.bytes_of( prefix( l ), { ".mlp.experts." } );
+	for ( int l = 0; l < config_.num_layers; ++l ) total += repo.bytes_of( prefix( l ), { ".mlp.experts." } );
+	const size_t used = arena_->offset_bytes - layers_begin - experts_cost;
+	const double per_ckpt_byte = counted ? static_cast<double>( used ) / static_cast<double>( counted ) : 1.0;
+	const size_t rest = static_cast<size_t>( per_ckpt_byte * static_cast<double>( total > counted ? total - counted : 0 ) );
+	// The device-side tensors every expert keeps (signs, scales), resident or not
+	const size_t expert_all = repo.bytes_of( prefix( layer ) + "mlp.experts.0." );
+	const int layers_left = moe_layers - layers_done;
+	const size_t extras = ( expert_all > slot_bytes ? expert_all - slot_bytes : 0 ) * static_cast<size_t>( experts ) * static_cast<size_t>( layers_left );
+	// The speculator (rank 0 holds the selector codebooks, the others about half of the file), the MTP head, and a margin for what the estimate misses
+	const size_t speculator = rank_ == 0 ? reserve_after_weights_ : reserve_after_weights_ / 2;
+	const size_t head = mtp_on_ ? ( 768ULL << 20 ) : 0, margin = 256ULL << 20;
+	const size_t free_now = arena_->total_bytes - arena_->offset_bytes;
+	const size_t other = rest + extras + speculator + head + margin;
+	ENGINE_ASSERT( free_now > other, "Glm5NextPipeline: expert_cache=0 (auto): the arena cannot hold the other weights; set max_seq / kv_format smaller or give expert_cache" );
+	// The remaining layers share what is left evenly; the estimate only improves, so the last layers take up the slack
+	const size_t per_resident = static_cast<size_t>( layers_left ) * slot_bytes;
+	const int resident = std::max( std::max( 1, experts / 10 ), std::min( experts, static_cast<int>( ( free_now - other ) / per_resident ) ) );
+	if ( rank_ == 0 && layers_done == 0 ) {
+		LOG_INFO( "[experts] expert_cache auto: %d of %d experts per layer resident to start (%.1f%%), later layers take what the refined estimate leaves. Arena free %.2f GiB; still to load: other weights %.2f, expert scales %.2f, speculator %.2f%s; margin %.2f\n",
+			resident, experts, 100.0 * resident / experts, free_now / kGiB, rest / kGiB, extras / kGiB, speculator / kGiB, mtp_on_ ? " + MTP head 0.75" : "", margin / kGiB );
+	}
+	return resident;
+}
+
 void Glm5NextPipeline::kv_prepare( const pod::BatchRows& rows, backend::stream_t stream ) {
 	if ( kv_pool_tokens_ == 0 ) return;
 	for ( int r = 0; r < rows.count; ++r ) {
@@ -650,6 +682,9 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	static constexpr int GLM_CONV_CHANNELS[3] = { 8192, 8192, 8192 };
 	const int GLM_CONV_RANK_CHANNELS[3] = { 8192 / config_.tp_size, 8192 / config_.tp_size, 8192 / config_.tp_size };
 
+	const size_t layers_begin = arena_->offset_bytes;
+	size_t experts_cost = 0;   // arena bytes the experts took so far (codes in device slots, signs and scales)
+	int auto_base = 0;
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		auto& lw = layers_[L];
 		lw.is_moe = ( L >= 3 );
@@ -783,7 +818,9 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			mw.type = pod::QuantType::TRELLIS;
 			mw.num_local_experts = experts_per_rank;
 			// Tiered experts (ENGINE_EXPERT_CACHE < 1): the codes of resident experts go to device slots, the rest to pinned host memory
-			const double tier_fraction = engine::modules::ExpertTier::resident_fraction();
+			double tier_fraction = engine::modules::ExpertTier::resident_fraction();
+			const bool resident_fraction_auto = tier_fraction <= 0.0;
+			size_t experts_cost_from = arena_->offset_bytes;
 			int tier_layer = -1;
 			if ( tier_fraction < 1.0 ) {
 				if ( tier_layers_ == 0 ) {
@@ -797,9 +834,18 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 					}
 					int moe_layers = 0;
 					for ( int ll = 0; ll < config_.num_layers; ++ll ) moe_layers += ( ll >= 3 ) ? 1 : 0;
+					if ( tier_fraction <= 0.0 ) {
+						auto_base = auto_resident( repo, L, layers_begin, experts_cost, 0, experts_per_rank, bytes[0] + bytes[1] + bytes[2], moe_layers );
+						tier_fraction = ( auto_base + 0.25 ) / experts_per_rank;
+					}
 					tier_.start( experts_per_rank, tier_fraction, bytes, rank_, config_.tp_size, moe_layers, runtime::options().expert_stream, host_arena_ );
 				}
-				tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_ ) );
+				experts_cost_from = arena_->offset_bytes;
+				int layer_resident = tier_.resident;
+				if ( resident_fraction_auto && tier_layers_ > 0 ) {
+					layer_resident = std::max( tier_.resident, auto_resident( repo, L, layers_begin, experts_cost, tier_layers_, experts_per_rank, tier_.slot_bytes, config_.num_layers - 3 ) );
+				}
+				tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_, layer_resident ) );
 				tier_layer = tier_layers_++;
 			}
 			for ( int e = 0; e < experts_per_rank; ++e ) {
@@ -847,6 +893,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );
 			mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( experts_per_rank ) * sizeof( uint32_t ), 128 ) );
 			backend::memset_async( mw.heat, 0, static_cast<size_t>( experts_per_rank ) * sizeof( uint32_t ), stream );
+			experts_cost += arena_->offset_bytes - experts_cost_from;
 
 			// Shared experts
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.gate_proj", L );
@@ -1033,6 +1080,17 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	}
 
 	size_t bytes_after = arena_->offset_bytes;
+	if ( rank_ == 0 && !tier_.layers.empty() ) {
+		int lo = tier_.experts, hi = 0;
+		double sum = 0.0;
+		for ( const auto& l : tier_.layers ) {
+			const int r = static_cast<int>( l.owner.size() );
+			lo = std::min( lo, r );
+			hi = std::max( hi, r );
+			sum += r;
+		}
+		LOG_INFO( "[experts] resident per layer: %d to %d of %d (mean %.1f, %.1f%%)\n", lo, hi, tier_.experts, sum / tier_.layers.size(), 100.0 * sum / tier_.layers.size() / tier_.experts );
+	}
 	if ( nv_count > 0 ) LOG_INFO( "[RANK %d] NVFP4 dense tensors: %d, %d calibrated (groups %s)\n", rank_, nv_count, nv_calibrated, nv_groups.c_str() );
 	if ( missing_count > 0 || rank_ == 0 ) {
 		LOG_ERROR( "[RANK %d] load_weights complete: missing_count=%d | arena: before=%.3f GiB, after=%.3f GiB, loaded=%.3f GiB\n",

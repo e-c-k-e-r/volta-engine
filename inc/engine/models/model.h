@@ -64,6 +64,8 @@ public:
 	// 1. Lifecycle & weight loading
 	// Rank count of the tensor-parallel group; call before init(). A null ring means a group of one.
 	void set_tp_size( int tp ) { requested_tp_ = tp; }
+	// Bytes the arena must still hold after the weights (the speculator's); a model sizing something from the free arena keeps them back. Before load_weights
+	virtual void set_reserve_after_weights( size_t bytes ) { (void) bytes; }
 	virtual bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) = 0;
 	virtual bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) = 0;
 

@@ -59,14 +59,15 @@ int ExpertTier::swap_cap() const {
 	return static_cast<int>( std::max<size_t>( 1, std::min<size_t>( 64, per_layer ) ) );
 }
 
-std::vector<int> ExpertTier::initial_set( int layer ) const {
-	std::vector<int> set( resident );
+std::vector<int> ExpertTier::initial_set( int layer, int count ) const {
+	if ( count <= 0 ) count = resident;
+	std::vector<int> set( count );
 	if ( seed.size() >= static_cast<size_t>( layer + 1 ) * experts ) {
 		const uint64_t* c = seed.data() + static_cast<size_t>( layer ) * experts;
 		std::vector<int> order( experts );
 		std::iota( order.begin(), order.end(), 0 );
 		std::stable_sort( order.begin(), order.end(), [&]( int a, int b ) { return c[a] > c[b]; } );
-		order.resize( resident );
+		order.resize( count );
 		std::sort( order.begin(), order.end() );
 		return order;
 	}
@@ -97,15 +98,16 @@ ExpertTier::~ExpertTier() {
 void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, pod::MemoryArena& host, std::vector<int> resident_set ) {
 	Layer l;
 	l.mw = mw;
-	l.slots = static_cast<uint8_t*>( engine::core::arena_alloc( device, static_cast<size_t>( resident ) * slot_bytes, 256 ) );
+	const int res = static_cast<int>( resident_set.size() );
+	ENGINE_ASSERT( res >= resident && res <= experts, "ExpertTier::add_layer: resident set size" );
+	l.slots = static_cast<uint8_t*>( engine::core::arena_alloc( device, static_cast<size_t>( res ) * slot_bytes, 256 ) );
 	l.slot_of.assign( experts, -1 );
-	l.owner.assign( resident, -1 );
+	l.owner.assign( res, -1 );
 	l.host.assign( experts, nullptr );
 	l.score.assign( experts, 0 );
 	l.total.assign( experts, 0 );
 	if ( seed.size() >= ( layers.size() + 1 ) * static_cast<size_t>( experts ) ) std::copy_n( seed.begin() + layers.size() * experts, experts, l.total.begin() );
-	ENGINE_ASSERT( static_cast<int>( resident_set.size() ) == resident, "ExpertTier::add_layer: resident set size" );
-	for ( int s = 0; s < resident; ++s ) {
+	for ( int s = 0; s < res; ++s ) {
 		l.slot_of[resident_set[s]] = s;
 		l.owner[s] = resident_set[s];
 	}

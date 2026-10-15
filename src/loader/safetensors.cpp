@@ -816,6 +816,18 @@ bool SafeTensorsRepo::file_ref( const char* tensor_name, int* fd, size_t* offset
 	return true;
 }
 
+size_t SafeTensorsRepo::bytes_of( const std::string& prefix, std::initializer_list<const char*> skip ) const {
+	size_t total = 0;
+	for ( const auto& kv : tensor_map_ ) {
+		const std::string& name = kv.first;
+		if ( name.compare( 0, prefix.size(), prefix ) != 0 ) continue;
+		bool skipped = false;
+		for ( const char* s : skip ) skipped = skipped || name.find( s ) != std::string::npos;
+		if ( !skipped ) total += static_cast<size_t>( kv.second.second->size_bytes );
+	}
+	return total;
+}
+
 size_t SafeTensorsRepo::trellis_bytes( const char* base_name ) const {
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );

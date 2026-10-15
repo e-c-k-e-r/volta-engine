@@ -558,6 +558,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		// Tiered experts (ENGINE_EXPERT_CACHE < 1): the codes of resident experts go to device slots, the rest to pinned host memory; the scales
 		// (NVFP4) and sign vectors (trellis) stay on the device
 		const double tier_fraction = engine::modules::ExpertTier::resident_fraction();
+		ENGINE_ASSERT( tier_fraction > 0.0, "Qwen4Exp: expert_cache=0 (auto) is for GLM; give the resident fraction" );
 		int tier_layer = -1;
 		if ( tier_fraction < 1.0 && !in_mtp ) {
 			if ( tier_layers_ == 0 ) {

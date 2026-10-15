@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
+#include <filesystem>
 #include <cstring>
 #include <thread>
 
@@ -90,6 +91,15 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	LOG_INFO( "Loading %s weights across %d GPUs from %s...\n", cfg.model_type.c_str(), tp_, cfg.model_dir.c_str() );
 	std::fflush( stdout );
 	pool_.start( tp_ );
+	// What a model sizing itself from the free arena (expert_cache=0) has to leave for the drafter
+	size_t draft_bytes = 0;
+	if ( !cfg.draft_model_dir.empty() && !( opt.speculator == "mtp" && cfg.speculate ) ) {
+		std::error_code ec;
+		for ( const auto& f : std::filesystem::directory_iterator( cfg.draft_model_dir, ec ) ) {
+			if ( f.path().extension() == ".safetensors" ) draft_bytes += static_cast<size_t>( f.file_size( ec ) );
+		}
+	}
+	for ( int d = 0; d < tp_; ++d ) models_[d]->set_reserve_after_weights( draft_bytes );
 	bool ok[ENGINE_NUM_GPUS] = {};
 	pool_.run( [&]( int d ) {
 		ok[d] = models_[d]->load_weights( cfg.model_dir.c_str(), streams_[d] );
