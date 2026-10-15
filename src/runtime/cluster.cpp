@@ -639,6 +639,14 @@ void ModelCluster::set_spec_snapshot( bool on ) {
 	} );
 }
 
+bool ModelCluster::spec_commit_always() const {
+	return models_[0] && models_[0]->spec_commit_always();
+}
+
+void ModelCluster::commit_spec_rows( int slot, int first_row, int last_row ) {
+	for ( int d = 0; d < tp_; ++d ) models_[d]->commit_spec_rows( slot, first_row, last_row, streams_[d] );
+}
+
 void ModelCluster::commit_spec_row( int slot, int row ) {
 	pool_.run( [&]( int d ) {
 		models_[d]->commit_spec_row( slot, row, streams_[d] );

@@ -113,6 +113,8 @@ public:
 	void rollback( int slot );
 	void set_spec_snapshot( bool on );
 	void commit_spec_row( int slot, int row );
+	void commit_spec_rows( int slot, int first_row, int last_row );
+	bool spec_commit_always() const;
 
 	// Speculative decoding (DFlash2). The round itself lives in DFlash2Runner.
 	bool has_speculator() const { return runner_ != nullptr; }

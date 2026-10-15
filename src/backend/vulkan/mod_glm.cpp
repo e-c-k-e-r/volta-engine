@@ -127,6 +127,16 @@ void GDN::recurrent_step_kda_fused( float* gdn_state, const pod::TensorView& qkv
 	kda_launch( gdn_state, qkv, g_decay, beta, z, o_norm, attn_out, num_heads, eps, 1, rows_slot_at( slot, slot.row ), slot.stride, nullptr, 0, 0, nullptr, true, true, stream );
 }
 
+bool GDN::kda_journal_supported() { return false; }
+size_t GDN::kda_journal_row_bytes( int ) { return 0; }
+void GDN::recurrent_step_kda_rows_journal( float*, const pod::TensorView&, const pod::TensorView&, const pod::TensorView&, const pod::TensorView&, const pod::TensorView&,
+	pod::TensorView&, int, int, float, int, const pod::BatchRows*, size_t, unsigned char*, size_t, int, const int*, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GDN::recurrent_step_kda_rows_journal" );
+}
+void GDN::kda_replay( float*, size_t, size_t, int, int, const unsigned char*, size_t, size_t, int, int, int, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GDN::kda_replay" );
+}
+
 void GDN::recurrent_step_kda_rows( float* gdn_state, const pod::TensorView& qkv, const pod::TensorView& g_decay, const pod::TensorView& beta, const pod::TensorView& z,
 	const pod::TensorView& o_norm, pod::TensorView& attn_out, int num_heads, int head_dim, float eps, int rows, const pod::BatchRows* d_rows, size_t slot_stride,
 	float* snap, size_t snap_stride, int snap_rows, const int* snap_on, backend::stream_t stream ) {

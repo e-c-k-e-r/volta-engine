@@ -4,6 +4,7 @@
 // cpu_kernels.h first: the Slang prelude defines int4, which the backend shim only declares when the prelude is absent
 #include "cpu_kernels.h"
 #include "engine/modules/gdn.h"
+#include "engine/backend/tiers.h"
 #include <cmath>
 #include <vector>
 
@@ -167,6 +168,16 @@ void GDN::recurrent_step_kda_fused( float* gdn_state, const pod::TensorView& qkv
 			g_decay.ptr<const float>() + h * 128, beta.ptr<const float>()[h], y );
 		gate_norm_out( y, o_norm.data != nullptr ? o_norm.ptr<const h16>() : nullptr, z.data != nullptr ? z.ptr<const h16>() + h * 128 : nullptr, eps, attn_out.ptr<h16>() + h * 128 );
 	}
+}
+
+bool GDN::kda_journal_supported() { return false; }
+size_t GDN::kda_journal_row_bytes( int ) { return 0; }
+void GDN::recurrent_step_kda_rows_journal( float*, const pod::TensorView&, const pod::TensorView&, const pod::TensorView&, const pod::TensorView&, const pod::TensorView&,
+	pod::TensorView&, int, int, float, int, const pod::BatchRows*, size_t, unsigned char*, size_t, int, const int*, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GDN::recurrent_step_kda_rows_journal" );
+}
+void GDN::kda_replay( float*, size_t, size_t, int, int, const unsigned char*, size_t, size_t, int, int, int, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "GDN::kda_replay" );
 }
 
 void GDN::recurrent_step_kda_rows( float* gdn_state, const pod::TensorView& qkv, const pod::TensorView& g_decay, const pod::TensorView& beta, const pod::TensorView& z,

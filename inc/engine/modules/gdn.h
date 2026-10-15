@@ -154,6 +154,48 @@ struct GDN {
 		backend::stream_t stream
 	);
 
+	// Speculative verify without a state snapshot per row (36 MiB each): while *journal_on is set the rows step leaves the slot state as it was before
+	// the block and records each row's k, v, decay and beta (kda_journal_row_bytes( heads ) bytes at journal + row * journal_row_stride, rows
+	// below journal_rows); kda_replay then applies rows [first_row, first_row + nrows) of the journal to a slot's state of every linear layer
+	// (layer l at gdn_state + l * layer_stride, its journal at journal + l * journal_layer_stride), bit-identical to having stepped them.
+	// Where kda_journal_supported() is false (CPU, Vulkan) the models keep the snapshots.
+	static bool kda_journal_supported();
+	static size_t kda_journal_row_bytes( int num_heads );
+	static void recurrent_step_kda_rows_journal(
+		float* gdn_state,
+		const pod::TensorView& qkv,
+		const pod::TensorView& g_decay,
+		const pod::TensorView& beta,
+		const pod::TensorView& z,
+		const pod::TensorView& o_norm,
+		pod::TensorView& attn_out,
+		int num_heads,
+		int head_dim,
+		float eps,
+		int rows,
+		const pod::BatchRows* d_rows,
+		size_t slot_stride,
+		unsigned char* journal,
+		size_t journal_row_stride,
+		int journal_rows,
+		const int* journal_on,
+		backend::stream_t stream
+	);
+	static void kda_replay(
+		float* gdn_state,
+		size_t slot_stride,
+		size_t layer_stride,
+		int layers,
+		int slot,
+		const unsigned char* journal,
+		size_t journal_layer_stride,
+		size_t journal_row_stride,
+		int first_row,
+		int nrows,
+		int num_heads,
+		backend::stream_t stream
+	);
+
 	static void recurrent_step_kda(
 		float* gdn_state,
 		const pod::TensorView& qkv,

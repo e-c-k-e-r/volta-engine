@@ -338,10 +338,8 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	// 6. State repair. The next round expects exactly accepted + 1 rows consumed ([anchor, c1..c_accepted]),
 	// which is the snapshot published after row `accepted` of the verify forward. A full accept already
 	// leaves the live state there, so only a partial accept copies it in. No re-forward.
-	if ( res.accepted < active ) {
-		++prof_.commits;
-		mc.commit_spec_row( slot, res.accepted );
-	}
+	if ( res.accepted < active ) ++prof_.commits;
+	if ( res.accepted < active || mc.spec_commit_always() ) mc.commit_spec_rows( slot, 0, res.accepted );
 	mc.set_spec_snapshot( false );
 	res.next_pos = pos + 1 + res.accepted;
 	// Close the round: account the trailing segment and rewind the cursor.

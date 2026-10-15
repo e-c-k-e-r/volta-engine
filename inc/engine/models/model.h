@@ -151,6 +151,14 @@ public:
 	// state after every row; commit_spec_row( slot, t ) makes the state after row t the slot's live state.
 	// Stream-ordered, so a flag change applies to the forwards queued after it.
 	virtual void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) { (void) on; (void) stream; ENGINE_ASSERT( false, "model has no speculative state slots" ); }
+	// The rows [first_row, last_row] of a verify batch belong to one slot (a joint verify puts several slots' blocks in one batch): make the state
+	// after row last_row its live state. spec_commit_always: a verify forward does not advance the slot state itself (the state is replayed from a
+	// journal of the rows), so every round commits, a full accept included.
+	virtual void commit_spec_rows( int slot_id, int first_row, int last_row, backend::stream_t stream = nullptr ) {
+		ENGINE_ASSERT( first_row == 0, "model has no joint speculative state" );
+		commit_spec_row( slot_id, last_row, stream );
+	}
+	virtual bool spec_commit_always() const { return false; }
 	virtual void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) { (void) slot_id; (void) row; (void) stream; ENGINE_ASSERT( false, "model has no speculative state slots" ); }
 
 	// 5b. Sequence snapshots for the prefix cache: everything a slot needs to resume after `tokens` positions (recurrent

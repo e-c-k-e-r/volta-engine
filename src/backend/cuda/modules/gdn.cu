@@ -750,12 +750,18 @@ kda_recurrent_rows_kernel(
 	float* __restrict__ snap,
 	size_t snap_stride,
 	int snap_rows,
-	const int* __restrict__ snap_on
+	const int* __restrict__ snap_on,
+	unsigned char* __restrict__ journal,
+	size_t journal_row_stride,
+	int journal_rows
 ) {
 	const int h = blockIdx.x;
 	const int c = threadIdx.x;
 	const int channels = num_heads * 128;
 	const bool do_snap = snap && *snap_on;
+	// Journal mode (speculative verify): each row's k, v, decay and beta are recorded and the slot state in memory is left at its value before
+	// the block; kda_replay_kernel applies the accepted rows afterwards with the same arithmetic
+	const bool jmode = journal && *snap_on;
 
 	__shared__ float s_g_exp[128];
 	__shared__ float s_k[128];
@@ -766,7 +772,7 @@ kda_recurrent_rows_kernel(
 	for ( int m = 0; m < rows; ++m ) {
 		const int slot = d_rows->slot[m];
 		if ( slot != cur ) {
-			if ( cur >= 0 ) {
+			if ( cur >= 0 && !jmode ) {
 				float* st = state + static_cast<size_t>( cur ) * slot_stride + static_cast<size_t>( h ) * 128 * 128;
 				#pragma unroll
 				for ( int r = 0; r < 128; ++r ) st[r * 128 + c] = s[r];
@@ -783,6 +789,13 @@ kda_recurrent_rows_kernel(
 		s_g_exp[c] = __expf( g_decay[static_cast<size_t>( m ) * channels + h * 128 + c] );
 		s_k[c] = __half2float( k_ptr[c] );
 		s_q[c] = __half2float( q_ptr[c] );
+		if ( jmode && m < journal_rows ) {
+			unsigned char* rec = journal + static_cast<size_t>( m ) * journal_row_stride;
+			reinterpret_cast<half*>( rec )[h * 128 + c] = k_ptr[c];
+			reinterpret_cast<half*>( rec + static_cast<size_t>( channels ) * 2 )[h * 128 + c] = v_ptr[c];
+			reinterpret_cast<float*>( rec + static_cast<size_t>( channels ) * 4 )[h * 128 + c] = g_decay[static_cast<size_t>( m ) * channels + h * 128 + c];
+			if ( c == 0 ) reinterpret_cast<float*>( rec + static_cast<size_t>( channels ) * 8 )[h] = beta[m * num_heads + h];
+		}
 		__syncthreads();
 
 		float kv_mem = 0.0f;
@@ -814,7 +827,56 @@ kda_recurrent_rows_kernel(
 		output[static_cast<size_t>( m ) * channels + h * 128 + c] = __float2half_rn( y_core * inv_rms * gamma * gate_val );
 		__syncthreads();
 	}
-	float* st = state + static_cast<size_t>( cur ) * slot_stride + static_cast<size_t>( h ) * 128 * 128;
+	if ( !jmode ) {
+		float* st = state + static_cast<size_t>( cur ) * slot_stride + static_cast<size_t>( h ) * 128 * 128;
+		#pragma unroll
+		for ( int r = 0; r < 128; ++r ) st[r * 128 + c] = s[r];
+	}
+}
+
+// Applies rows [first_row, first_row + nrows) of a journal to one slot's state, for every linear layer (blockIdx.y): the same update, in the same
+// order and with the same fused operations, as kda_recurrent_rows_kernel, so the result is its state after those rows bit for bit
+__global__ void __launch_bounds__( 128 )
+kda_replay_kernel(
+	float* __restrict__ state,
+	size_t slot_stride,
+	size_t layer_stride,
+	const unsigned char* __restrict__ journal,
+	size_t journal_layer_stride,
+	size_t journal_row_stride,
+	int slot,
+	int first_row,
+	int nrows,
+	int num_heads
+) {
+	const int h = blockIdx.x;
+	const int lin = blockIdx.y;
+	const int c = threadIdx.x;
+	const int channels = num_heads * 128;
+	__shared__ float s_g_exp[128];
+	__shared__ float s_k[128];
+
+	float* st = state + static_cast<size_t>( slot ) * slot_stride + static_cast<size_t>( lin ) * layer_stride + static_cast<size_t>( h ) * 128 * 128;
+	float s[128];
+	#pragma unroll
+	for ( int r = 0; r < 128; ++r ) s[r] = st[r * 128 + c];
+	for ( int i = 0; i < nrows; ++i ) {
+		const unsigned char* rec = journal + static_cast<size_t>( lin ) * journal_layer_stride + static_cast<size_t>( first_row + i ) * journal_row_stride;
+		s_g_exp[c] = __expf( reinterpret_cast<const float*>( rec + static_cast<size_t>( channels ) * 4 )[h * 128 + c] );
+		s_k[c] = __half2float( reinterpret_cast<const half*>( rec )[h * 128 + c] );
+		__syncthreads();
+		float kv_mem = 0.0f;
+		#pragma unroll
+		for ( int r = 0; r < 128; ++r ) {
+			s[r] = s[r] * s_g_exp[r];
+			kv_mem = fmaf( s[r], s_k[r], kv_mem );
+		}
+		const float delta = ( __half2float( reinterpret_cast<const half*>( rec + static_cast<size_t>( channels ) * 2 )[h * 128 + c] ) - kv_mem )
+			* reinterpret_cast<const float*>( rec + static_cast<size_t>( channels ) * 8 )[h];
+		#pragma unroll
+		for ( int r = 0; r < 128; ++r ) s[r] = fmaf( s_k[r], delta, s[r] );
+		__syncthreads();
+	}
 	#pragma unroll
 	for ( int r = 0; r < 128; ++r ) st[r * 128 + c] = s[r];
 }
@@ -1162,8 +1224,34 @@ void GDN::recurrent_step_kda_rows(
 	kda_recurrent_rows_kernel<<<dim3( num_heads ), dim3( 128 ), 0, stream>>>(
 		gdn_state, qkv.ptr<const half>(), g_decay.ptr<const float>(), beta.ptr<const float>(), z.ptr<const half>(),
 		o_norm.ptr<const half>(), attn_out.ptr<half>(), num_heads, eps, rows, d_rows, slot_stride,
-		snap, snap_stride, snap_rows, snap_on
+		snap, snap_stride, snap_rows, snap_on, nullptr, 0, 0
 	);
+}
+
+bool GDN::kda_journal_supported() { return true; }
+
+size_t GDN::kda_journal_row_bytes( int num_heads ) {
+	return static_cast<size_t>( num_heads ) * 128 * 8 + static_cast<size_t>( num_heads ) * sizeof( float );   // k, v (half), decay (float), beta
+}
+
+void GDN::recurrent_step_kda_rows_journal(
+	float* gdn_state, const pod::TensorView& qkv, const pod::TensorView& g_decay, const pod::TensorView& beta, const pod::TensorView& z,
+	const pod::TensorView& o_norm, pod::TensorView& attn_out, int num_heads, int head_dim, float eps, int rows, const pod::BatchRows* d_rows,
+	size_t slot_stride, unsigned char* journal, size_t journal_row_stride, int journal_rows, const int* journal_on, backend::stream_t stream
+) {
+	ENGINE_ASSERT( head_dim == 128, "GDN::recurrent_step_kda_rows_journal: head_dim must be 128" );
+	kda_recurrent_rows_kernel<<<dim3( num_heads ), dim3( 128 ), 0, stream>>>(
+		gdn_state, qkv.ptr<const half>(), g_decay.ptr<const float>(), beta.ptr<const float>(), z.ptr<const half>(),
+		o_norm.ptr<const half>(), attn_out.ptr<half>(), num_heads, eps, rows, d_rows, slot_stride,
+		nullptr, 0, 0, journal_on, journal, journal_row_stride, journal_rows
+	);
+}
+
+void GDN::kda_replay( float* gdn_state, size_t slot_stride, size_t layer_stride, int layers, int slot, const unsigned char* journal,
+	size_t journal_layer_stride, size_t journal_row_stride, int first_row, int nrows, int num_heads, backend::stream_t stream ) {
+	if ( nrows <= 0 ) return;
+	kda_replay_kernel<<<dim3( num_heads, layers ), dim3( 128 ), 0, stream>>>(
+		gdn_state, slot_stride, layer_stride, journal, journal_layer_stride, journal_row_stride, slot, first_row, nrows, num_heads );
 }
 
 } // namespace engine::modules

@@ -151,9 +151,21 @@ bool Glm5NextPipeline::init(
 	state_.conv_checkpoint = static_cast<float*>( engine::core::arena_alloc( arena, slot_conv * sizeof( float ) ) );
 	backend::memset_sync( state_.kda_states, 0, S * slot_kda * sizeof( float ) );
 	backend::memset_sync( state_.conv_history, 0, S * slot_conv * sizeof( float ) );
-	// Per-row post-state slots written during a speculative verify forward (replace checkpoint + replay)
-	state_.kda_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * slot_kda * sizeof( float ) ) );
-	state_.conv_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * slot_conv * sizeof( float ) ) );
+	// Speculative verify (DFlash2). Journal mode: the recurrent state is left alone by the verify forward and each row's k, v, decay and beta are
+	// recorded (16 KB a layer and row); the commit replays the accepted rows. It replaces a 36 MiB state snapshot per row and holds the blocks of two slots
+	// (a joint round). The MTP speculator and the backends without the kernels keep the per-row snapshots
+	use_journal_ = !mtp_on_ && engine::modules::GDN::kda_journal_supported();
+	state_.snap_rows_cap = use_journal_ ? 2 * kDraftM : kDraftM;
+	if ( use_journal_ ) {
+		state_.journal_row_stride = engine::modules::GDN::kda_journal_row_bytes( config_.kda_heads );
+		state_.journal_layer_stride = static_cast<size_t>( state_.snap_rows_cap ) * state_.journal_row_stride;
+		state_.kda_journal = static_cast<unsigned char*>( engine::core::arena_alloc( arena, static_cast<size_t>( n_lin ) * state_.journal_layer_stride, 128 ) );
+		ENGINE_ASSERT( state_.kda_journal != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the KDA journal" );
+	}
+	else {
+		state_.kda_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * slot_kda * sizeof( float ) ) );
+	}
+	state_.conv_snap = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( state_.snap_rows_cap ) * slot_conv * sizeof( float ) ) );
 	state_.d_snap_on = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
 	backend::memset_sync( state_.d_snap_on, 0, sizeof( int ) );
 
@@ -1315,9 +1327,28 @@ void Glm5NextPipeline::set_spec_snapshot( bool on, backend::stream_t stream ) {
 	backend::memcpy_async( state_.d_snap_on, &v, sizeof( int ), backend::Copy::H2D, stream );
 }
 
+void Glm5NextPipeline::commit_spec_rows( int slot_id, int first_row, int last_row, backend::stream_t stream ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Glm5NextPipeline::commit_spec_rows: slot out of range" );
+	ENGINE_ASSERT( first_row >= 0 && last_row >= first_row && last_row < state_.snap_rows_cap, "Glm5NextPipeline::commit_spec_rows: rows out of range" );
+	if ( !use_journal_ ) {
+		ENGINE_ASSERT( first_row == 0, "Glm5NextPipeline::commit_spec_rows: per-row snapshots cover one block" );
+		commit_spec_row( slot_id, last_row, stream );
+		return;
+	}
+	backend::set_device( rank_ );
+	// The slot's state still holds its value before the block: apply the accepted rows from the journal, and take the conv history after the last one
+	engine::modules::GDN::kda_replay( state_.kda_states, state_.slot_kda_floats, state_.layer_kda_floats, config_.num_layers - config_.num_mla_layers, slot_id,
+		state_.kda_journal, state_.journal_layer_stride, state_.journal_row_stride, first_row, last_row - first_row + 1, config_.kda_heads, stream );
+	backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, state_.conv_snap + static_cast<size_t>( last_row ) * state_.slot_conv_floats, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
+}
+
 void Glm5NextPipeline::commit_spec_row( int slot_id, int row, backend::stream_t stream ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Glm5NextPipeline::commit_spec_row: slot out of range" );
 	ENGINE_ASSERT( row >= 0 && row < kDraftM, "Glm5NextPipeline::commit_spec_row: row out of range" );
+	if ( use_journal_ ) {
+		commit_spec_rows( slot_id, 0, row, stream );
+		return;
+	}
 	backend::set_device( rank_ );
 	backend::memcpy_async( state_.kda_states + static_cast<size_t>( slot_id ) * state_.slot_kda_floats, state_.kda_snap + static_cast<size_t>( row ) * state_.slot_kda_floats, state_.slot_kda_floats * sizeof( float ), backend::Copy::D2D, stream );
 	backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, state_.conv_snap + static_cast<size_t>( row ) * state_.slot_conv_floats, state_.slot_conv_floats * sizeof( float ), backend::Copy::D2D, stream );
@@ -1411,7 +1442,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 	const pod::SlotRef kv_ref{ d_rows_, 0, latent_slot_stride_ };
 	const size_t slot_kda_floats = state_.slot_kda_floats;
 	const size_t slot_conv_floats = state_.slot_conv_floats;
-	const int snap_rows = MIN( m, kDraftM );
+	const int snap_rows = MIN( m, state_.snap_rows_cap );
 	const int H = config_.hidden_size;
 	// Routed experts: this rank's 72 whole experts, or a quarter of all 288
 	int experts_per_rank = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
@@ -1467,7 +1498,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 			const size_t lin = static_cast<size_t>( layer - ( layer + 1 ) / 4 );
 			float* layer_kda = state_.kda_states + lin * state_.layer_kda_floats;
 			float* layer_conv = state_.conv_history + lin * state_.layer_conv_floats;
-			float* kda_snap = state_.kda_snap + lin * state_.layer_kda_floats;
+			float* kda_snap = state_.kda_snap != nullptr ? state_.kda_snap + lin * state_.layer_kda_floats : nullptr;
 			float* conv_snap = state_.conv_snap + lin * state_.layer_conv_floats;
 
 			engine::modules::Linear::forward(
@@ -1489,10 +1520,20 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				lh_, 128, H, stream, m
 			);
 
-			engine::modules::GDN::recurrent_step_kda_rows(
-				layer_kda, qkv_buf_, g_decay_buf_, beta_buf_, z_buf_, lw.o_norm, attn_head_out_,
-				lh_, 128, 1e-5f, m, d_rows_, slot_kda_floats, kda_snap, slot_kda_floats, snap_rows, state_.d_snap_on, stream
-			);
+			if ( use_journal_ ) {
+				ENGINE_ASSERT( lh_ == config_.kda_heads, "Glm5NextPipeline: the KDA journal is sized for the configured head count" );
+				engine::modules::GDN::recurrent_step_kda_rows_journal(
+					layer_kda, qkv_buf_, g_decay_buf_, beta_buf_, z_buf_, lw.o_norm, attn_head_out_,
+					lh_, 128, 1e-5f, m, d_rows_, slot_kda_floats, state_.kda_journal + lin * state_.journal_layer_stride, state_.journal_row_stride, snap_rows,
+					state_.d_snap_on, stream
+				);
+			}
+			else {
+				engine::modules::GDN::recurrent_step_kda_rows(
+					layer_kda, qkv_buf_, g_decay_buf_, beta_buf_, z_buf_, lw.o_norm, attn_head_out_,
+					lh_, 128, 1e-5f, m, d_rows_, slot_kda_floats, kda_snap, slot_kda_floats, snap_rows, state_.d_snap_on, stream
+				);
+			}
 
 			hessian( layer, 2, attn_head_out_.data, 8192 / config_.tp_size, m, stream );
 			if ( lw.o_proj.is_valid() ) {

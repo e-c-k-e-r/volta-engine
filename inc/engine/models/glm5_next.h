@@ -52,8 +52,11 @@ struct Glm5NextConfig {
 struct Glm5NextState {
 	float* kda_states = nullptr;      // [slots, 45, heads, 128, 128] FP32
 	float* conv_history = nullptr;    // [slots, 45, channels, 3] FP32
-	float* kda_snap = nullptr;        // [kDraftM, 45, heads, 128, 128] per-row post-state (speculative verify)
-	float* conv_snap = nullptr;       // [kDraftM, 45, channels, 3]
+	float* kda_snap = nullptr;        // [kDraftM, 45, heads, 128, 128] per-row post-state (speculative verify); null in journal mode
+	unsigned char* kda_journal = nullptr;   // journal mode: [34, snap_rows_cap, record] the verify rows' k, v, decay, beta (GDN::kda_journal_row_bytes)
+	size_t journal_row_stride = 0, journal_layer_stride = 0;
+	int snap_rows_cap = 0;            // verify rows the snapshots / the journal hold
+	float* conv_snap = nullptr;       // [snap_rows_cap, 45, channels, 3]
 	int* d_snap_on = nullptr;         // device flag: forwards publish the per-row snapshots while non-zero
 	float* kda_checkpoint = nullptr;
 	float* conv_checkpoint = nullptr;
@@ -173,6 +176,8 @@ public:
 	void draft_head_topk( int rows, backend::stream_t stream = nullptr ) override;
 	void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) override;
 	void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) override;
+	void commit_spec_rows( int slot_id, int first_row, int last_row, backend::stream_t stream = nullptr ) override;
+	bool spec_commit_always() const override { return use_journal_; }
 	void set_snapshot_taps( bool on ) override { snap_taps_ = on; }
 	int seq_align() const override { return 4; }   // DSA::POOL
 	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
@@ -258,6 +263,7 @@ private:
 	size_t latent_scale_bytes( size_t elems ) const { return pod::kv_scale_bytes( latent_q_, elems ); }
 	float* latent_ws_ = nullptr;      // split-KV partials
 	int ws_seq_ = 0;                  // context the workspace is sized for
+	bool use_journal_ = false;        // speculative verify journals the KDA rows and replays the accepted ones instead of keeping a state snapshot per row
 	pod::TensorView q_lat_;           // [rows, 16 * 512]
 	// DSA (ENGINE_DSA, default on with the latent cache): indexer planes and selection scratch
 	bool dsa_ = true;
