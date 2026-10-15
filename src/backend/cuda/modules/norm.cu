@@ -45,26 +45,7 @@ __global__ void rms_norm_kernel(
 		}
 	}
 
-	local_sq = engine::math::warp_sum( local_sq );
-
-	__shared__ float s_warp_sums[8];
-	int warp_id = tid >> 5;
-	int lane_id = tid & 31;
-	if ( lane_id == 0 ) {
-		s_warp_sums[warp_id] = local_sq;
-	}
-	__syncthreads();
-
-	if ( warp_id == 0 ) {
-		float b_sum = ( lane_id < 8 ) ? s_warp_sums[lane_id] : 0.0f;
-		b_sum = engine::math::warp_sum<4>( b_sum );
-		if ( lane_id == 0 ) {
-			s_warp_sums[0] = rsqrtf( b_sum / static_cast<float>( hidden_size ) + eps );
-		}
-	}
-	__syncthreads();
-
-	float inv_rms = s_warp_sums[0];
+	float inv_rms = rsqrtf( engine::math::block_sum<8>( local_sq ) / static_cast<float>( hidden_size ) + eps );
 
 	if ( per <= kMaxPer ) {
 		float w[kMaxPer];
@@ -105,27 +86,7 @@ __global__ void rms_norm_heads_kernel(
 	float val = __half2float( ptr[tid] );
 	float sq = val * val;
 
-	sq = engine::math::warp_sum( sq );
-
-	__shared__ float s_warp_sums[8];
-	int warp_id = tid >> 5;
-	int lane_id = tid & 31;
-	if ( lane_id == 0 ) {
-		s_warp_sums[warp_id] = sq;
-	}
-	__syncthreads();
-
-	int num_warps = ( head_dim + 31 ) >> 5;
-	if ( warp_id == 0 ) {
-		float b_sum = ( lane_id < num_warps ) ? s_warp_sums[lane_id] : 0.0f;
-		b_sum = engine::math::warp_sum<4>( b_sum );
-		if ( lane_id == 0 ) {
-			s_warp_sums[0] = rsqrtf( b_sum / static_cast<float>( head_dim ) + eps );
-		}
-	}
-	__syncthreads();
-
-	float inv_rms = s_warp_sums[0];
+	float inv_rms = rsqrtf( engine::math::block_sum<8>( sq ) / static_cast<float>( head_dim ) + eps );
 	float w = ( weight != nullptr ) ? ( __half2float( weight[tid] ) + constant_bias ) : 1.0f;
 	ptr[tid] = __float2half_rn( val * w * inv_rms );
 }

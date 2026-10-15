@@ -54,13 +54,7 @@ __global__ void gr_norm_kernel( float* __restrict__ x, const half* __restrict__ 
 		}
 		sq += v * v;
 	}
-	sq = warp_sum( sq );
-	__shared__ float ws[32];
-	if ( ( threadIdx.x & 31 ) == 0 ) ws[threadIdx.x >> 5] = sq;
-	__syncthreads();
-	float total = 0.0f;
-	for ( int i = 0; i < ( blockDim.x >> 5 ); ++i ) total += ws[i];
-	const float inv = rsqrtf( total / hidden + eps );
+	const float inv = rsqrtf( engine::math::block_sum_ordered<32>( sq ) / hidden + eps );
 	#pragma unroll
 	for ( int i = 0; i < GR_NORM_CACHE; ++i ) {
 		const int d = threadIdx.x + i * blockDim.x;
@@ -563,17 +557,7 @@ __global__ void gr_sigmoid_gated_kernel( half* __restrict__ y, const half* __res
 	const half* xr = x + static_cast<size_t>( r ) * hidden;
 	float acc = 0.0f;
 	for ( int i = threadIdx.x; i < hidden; i += blockDim.x ) acc = fmaf( __half2float( xr[i] ), __half2float( w[i] ), acc );
-	acc = warp_sum( acc );
-	__shared__ float ws[32];
-	__shared__ float gate;
-	if ( ( threadIdx.x & 31 ) == 0 ) ws[threadIdx.x >> 5] = acc;
-	__syncthreads();
-	if ( threadIdx.x == 0 ) {
-		float total = 0.0f;
-		for ( int i = 0; i < ( blockDim.x >> 5 ); ++i ) total += ws[i];
-		gate = engine::math::sigmoid( total );
-	}
-	__syncthreads();
+	const float gate = engine::math::sigmoid( engine::math::block_sum_ordered<32>( acc ) );
 	for ( int i = threadIdx.x; i < hidden; i += blockDim.x ) {
 		const size_t o = static_cast<size_t>( r ) * hidden + i;
 		y[o] = __float2half_rn( __half2float( y[o] ) + gate * __half2float( sh[o] ) );
@@ -585,15 +569,8 @@ __global__ void gr_shared_gate_kernel( const half* __restrict__ x, const half* _
 	const half* xr = x + static_cast<size_t>( blockIdx.x ) * hidden;
 	float acc = 0.0f;
 	for ( int i = threadIdx.x; i < hidden; i += blockDim.x ) acc = fmaf( __half2float( xr[i] ), __half2float( w[i] ), acc );
-	acc = warp_sum( acc );
-	__shared__ float ws[32];
-	if ( ( threadIdx.x & 31 ) == 0 ) ws[threadIdx.x >> 5] = acc;
-	__syncthreads();
-	if ( threadIdx.x == 0 ) {
-		float total = 0.0f;
-		for ( int i = 0; i < ( blockDim.x >> 5 ); ++i ) total += ws[i];
-		gate[blockIdx.x] = engine::math::sigmoid( total );
-	}
+	const float total = engine::math::block_sum_ordered<32>( acc );
+	if ( threadIdx.x == 0 ) gate[blockIdx.x] = engine::math::sigmoid( total );
 }
 
 // One block per (row, stream)
@@ -605,13 +582,7 @@ __global__ void gr_stream_norm_kernel( const float* __restrict__ x, const half* 
 		const float v = x[base + d];
 		sq += v * v;
 	}
-	sq = warp_sum( sq );
-	__shared__ float ws[32];
-	if ( ( threadIdx.x & 31 ) == 0 ) ws[threadIdx.x >> 5] = sq;
-	__syncthreads();
-	float total = 0.0f;
-	for ( int i = 0; i < ( blockDim.x >> 5 ); ++i ) total += ws[i];
-	const float inv = rsqrtf( total / hidden + eps );
+	const float inv = rsqrtf( engine::math::block_sum_ordered<32>( sq ) / hidden + eps );
 	for ( int d = threadIdx.x; d < hidden; d += blockDim.x ) {
 		out[base + d] = __float2half_rn( x[base + d] * inv * ( 1.0f + __half2float( w[static_cast<size_t>( s ) * hidden + d] ) ) );
 	}

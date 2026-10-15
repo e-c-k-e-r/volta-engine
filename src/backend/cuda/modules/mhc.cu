@@ -309,7 +309,6 @@ void hc_collapse_norm_kernel(
 	extern __shared__ __align__( 16 ) unsigned char hcn_smem[];
 	half* s_col = reinterpret_cast<half*>( hcn_smem );
 	__shared__ bool last;
-	__shared__ float s_warp_sums[8];
 	const int r = blockIdx.y;
 	hc_mix_partials_body<H, M_, float>( streams, fn, H * D, chunk_cols );
 	__syncthreads();
@@ -333,17 +332,7 @@ void hc_collapse_norm_kernel(
 		const float v = __half2float( s_col[i] );
 		local_sq = fmaf( v, v, local_sq );
 	}
-	local_sq = engine::math::warp_sum( local_sq );
-	const int warp_id = tid >> 5, lane_id = tid & 31;
-	if ( lane_id == 0 ) s_warp_sums[warp_id] = local_sq;
-	__syncthreads();
-	if ( warp_id == 0 ) {
-		float b_sum = ( lane_id < 8 ) ? s_warp_sums[lane_id] : 0.0f;
-		b_sum = engine::math::warp_sum<4>( b_sum );
-		if ( lane_id == 0 ) s_warp_sums[0] = rsqrtf( b_sum / static_cast<float>( D ) + norm_eps );
-	}
-	__syncthreads();
-	const float inv = s_warp_sums[0];
+	const float inv = rsqrtf( engine::math::block_sum<8>( local_sq ) / static_cast<float>( D ) + norm_eps );
 	half* dst = norm_out + static_cast<size_t>( r ) * D;
 	for ( int i = tid; i < D; i += NUM_THREADS ) {
 		const float w = __half2float( norm_w[i] ) + norm_bias;

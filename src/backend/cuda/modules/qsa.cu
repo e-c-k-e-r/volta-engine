@@ -11,13 +11,10 @@ namespace {
 
 constexpr int D = QSA::DIM;
 
+// 128 threads; two calls in a row, hence the opening barrier
 __device__ __forceinline__ float block_sum128( float v ) {
-	__shared__ float ws[4];
-	v = engine::math::warp_sum( v );
 	__syncthreads();
-	if ( ( threadIdx.x & 31 ) == 0 ) ws[threadIdx.x >> 5] = v;
-	__syncthreads();
-	return ws[0] + ws[1] + ws[2] + ws[3];
+	return engine::math::block_sum_ordered<4>( v );
 }
 
 // Rotate-half rope on the first rot_dim dims of a 128-wide vector held one element per thread

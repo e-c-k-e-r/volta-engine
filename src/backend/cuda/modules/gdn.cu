@@ -263,29 +263,7 @@ __global__ void l2_norm_heads_kernel(
 	float val = __half2float( ptr[tid] );
 	float sq = val * val;
 
-	sq = engine::math::warp_sum( sq );
-
-	__shared__ float s_warp_sums[4];
-	int warp_id = tid >> 5;
-	int lane_id = tid & 31;
-	if ( lane_id == 0 ) {
-		s_warp_sums[warp_id] = sq;
-	}
-	__syncthreads();
-
-	if ( warp_id == 0 ) {
-		float b_sum = ( lane_id < 4 ) ? s_warp_sums[lane_id] : 0.0f;
-		#pragma unroll
-		for ( int mask = 2; mask > 0; mask >>= 1 ) {
-			b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
-		}
-		if ( lane_id == 0 ) {
-			s_warp_sums[0] = rsqrtf( b_sum + 1e-6f );
-		}
-	}
-	__syncthreads();
-
-	float inv_l2 = s_warp_sums[0];
+	float inv_l2 = rsqrtf( engine::math::block_sum<4>( sq ) + 1e-6f );
 	if ( scale_q && block < num_k_heads ) {
 		inv_l2 *= 1.0f / sqrtf( static_cast<float>( head_dim ) );
 	}
@@ -475,29 +453,7 @@ __global__ void gated_rmsnorm_kernel(
 	float val = __half2float( head_out[tid] );
 	float sq = val * val;
 
-	sq = engine::math::warp_sum( sq );
-
-	__shared__ float s_warp_sums[4];
-	int warp_id = tid >> 5;
-	int lane_id = tid & 31;
-	if ( lane_id == 0 ) {
-		s_warp_sums[warp_id] = sq;
-	}
-	__syncthreads();
-
-	if ( warp_id == 0 ) {
-		float b_sum = ( lane_id < 4 ) ? s_warp_sums[lane_id] : 0.0f;
-		#pragma unroll
-		for ( int mask = 2; mask > 0; mask >>= 1 ) {
-			b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
-		}
-		if ( lane_id == 0 ) {
-			s_warp_sums[0] = rsqrtf( b_sum / static_cast<float>( head_dim ) + 1e-6f );
-		}
-	}
-	__syncthreads();
-
-	float inv_rms = s_warp_sums[0];
+	float inv_rms = rsqrtf( engine::math::block_sum<4>( sq ) / static_cast<float>( head_dim ) + 1e-6f );
 	float gamma = ( norm_weight != nullptr ) ? __half2float( norm_weight[tid] ) : 1.0f;
 	float z_val = ( z != nullptr ) ? __half2float( z[head * head_dim + tid] ) : 0.0f;
 	float gate_val;
@@ -765,29 +721,7 @@ __global__ void kda_recurrent_step_and_norm_kernel(
 
 	// 4. In-register Gated RMSNorm across 128 threads of this head
 	float sq = y_core * y_core;
-	sq = engine::math::warp_sum( sq );
-
-	__shared__ float s_warp_sums[4];
-	int warp_id = c >> 5;
-	int lane_id = c & 31;
-	if ( lane_id == 0 ) {
-		s_warp_sums[warp_id] = sq;
-	}
-	__syncthreads();
-
-	if ( warp_id == 0 ) {
-		float b_sum = ( lane_id < 4 ) ? s_warp_sums[lane_id] : 0.0f;
-		#pragma unroll
-		for ( int mask = 2; mask > 0; mask >>= 1 ) {
-			b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
-		}
-		if ( lane_id == 0 ) {
-			s_warp_sums[0] = rsqrtf( b_sum / static_cast<float>( head_dim ) + eps );
-		}
-	}
-	__syncthreads();
-
-	float inv_rms = s_warp_sums[0];
+	float inv_rms = rsqrtf( engine::math::block_sum<4>( sq ) / static_cast<float>( head_dim ) + eps );
 	float gamma = ( o_norm != nullptr ) ? __half2float( o_norm[c] ) : 1.0f;
 	float z_val = ( z != nullptr ) ? __half2float( z[h * head_dim + c] ) : 0.0f;
 	float gate_val = engine::math::sigmoid( z_val );
@@ -826,7 +760,6 @@ kda_recurrent_rows_kernel(
 	__shared__ float s_g_exp[128];
 	__shared__ float s_k[128];
 	__shared__ float s_q[128];
-	__shared__ float s_warp_sums[4];
 
 	float s[128];
 	int cur = -1;
@@ -874,22 +807,7 @@ kda_recurrent_rows_kernel(
 		}
 
 		float sq = y_core * y_core;
-		sq = engine::math::warp_sum( sq );
-		const int warp_id = c >> 5;
-		const int lane_id = c & 31;
-		if ( lane_id == 0 ) s_warp_sums[warp_id] = sq;
-		__syncthreads();
-		if ( warp_id == 0 ) {
-			float b_sum = ( lane_id < 4 ) ? s_warp_sums[lane_id] : 0.0f;
-			#pragma unroll
-			for ( int mask = 2; mask > 0; mask >>= 1 ) {
-				b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
-			}
-			if ( lane_id == 0 ) s_warp_sums[0] = rsqrtf( b_sum / 128.0f + eps );
-		}
-		__syncthreads();
-
-		const float inv_rms = s_warp_sums[0];
+		const float inv_rms = rsqrtf( engine::math::block_sum<4>( sq ) / 128.0f + eps );
 		const float gamma = ( o_norm != nullptr ) ? __half2float( o_norm[c] ) : 1.0f;
 		const float z_val = ( z != nullptr ) ? __half2float( z[static_cast<size_t>( m ) * channels + h * 128 + c] ) : 0.0f;
 		const float gate_val = engine::math::sigmoid( z_val );

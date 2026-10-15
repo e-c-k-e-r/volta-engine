@@ -31,13 +31,9 @@ __global__ void add_bias_pos_kernel( float* out, const half* bias, const half* a
 }
 
 // One block per row; block-wide mean / variance in FP32.
-__device__ float block_sum( float v, float* smem ) {
-	v = engine::math::warp_sum( v );
-	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-	if ( lane == 0 ) smem[warp] = v;
-	__syncthreads();
-	float t = 0.0f;
-	for ( int w = 0; w < static_cast<int>( blockDim.x >> 5 ); ++w ) t += smem[w];
+// (called twice in a row by the norm kernels, hence the closing barrier)
+__device__ float block_sum( float v, float* ) {
+	const float t = engine::math::block_sum_ordered<32>( v );
 	__syncthreads();
 	return t;
 }
