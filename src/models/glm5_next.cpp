@@ -1515,6 +1515,16 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 			float* kda_snap = state_.kda_snap != nullptr ? state_.kda_snap + lin * state_.layer_kda_floats : nullptr;
 			float* conv_snap = state_.conv_snap + lin * state_.layer_conv_floats;
 
+			// The gate projections read only the normed input: decode rows run them on the side stream beside the qkv projection, conv and l2 norm,
+			// and the recurrent step waits for both
+			const bool kda_overlap = side_stream_ != nullptr && m <= pod::MAX_BATCH;
+			if ( kda_overlap ) backend::stream_fork( stream, side_stream_ );
+			engine::modules::GDN::project_kda_gates(
+				norm_hidden_, lw.b_proj, lw.f_a_proj, lw.f_b_proj, lw.g_a_proj, lw.g_b_proj,
+				lw.A_log, lw.dt_bias, beta_buf_, g_decay_buf_, z_buf_, f_a_buf_, g_a_buf_,
+				lh_, 128, H, kda_overlap ? side_stream_ : stream, m
+			);
+
 			engine::modules::Linear::forward(
 				norm_hidden_, lw.qkv, qkv_buf_, stream
 			);
@@ -1528,11 +1538,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				qkv_buf_, lh_, 128, stream, true, m, config_.kda_channels
 			);
 
-			engine::modules::GDN::project_kda_gates(
-				norm_hidden_, lw.b_proj, lw.f_a_proj, lw.f_b_proj, lw.g_a_proj, lw.g_b_proj,
-				lw.A_log, lw.dt_bias, beta_buf_, g_decay_buf_, z_buf_, f_a_buf_, g_a_buf_,
-				lh_, 128, H, stream, m
-			);
+			if ( kda_overlap ) backend::stream_join( stream, side_stream_ );
 
 			if ( use_journal_ ) {
 				ENGINE_ASSERT( lh_ == config_.kda_heads, "Glm5NextPipeline: the KDA journal is sized for the configured head count" );
