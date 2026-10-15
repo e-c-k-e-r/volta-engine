@@ -1,4 +1,5 @@
 #include "engine/modules/gdn.h"
+#include "engine/backend/cuda/activation.cuh"
 #include "engine/backend/cuda/reduce.cuh"
 #include <cuda_fp16.h>
 #include <cmath>
@@ -66,7 +67,7 @@ __global__ void project_gates_kernel(
 		}
 
 		if ( lane_id == 0 ) {
-			float beta_val = 1.0f / ( 1.0f + __expf( -total_b ) );
+			float beta_val = engine::math::sigmoid( total_b );
 			float dt_val = ( dt_bias != nullptr ) ? __half2float( dt_bias[head] ) : 0.0f;
 			float a_val = ( A_log != nullptr ) ? __half2float( A_log[head] ) : -2.0f;
 
@@ -104,7 +105,7 @@ __global__ void causal_conv1d_silu_kernel(
 	float w3 = ( weights != nullptr ) ? __half2float( weights[c * 4 + 3] ) : 1.0f;
 
 	float sum = v0 * w0 + v1 * w1 + v2 * w2 + in_val * w3;
-	float silu = sum / ( 1.0f + __expf( -sum ) );
+	float silu = engine::math::silu( sum );
 
 	qkv[c] = __float2half_rn( silu );
 
@@ -163,7 +164,7 @@ __global__ void causal_conv1d_silu_rows_kernel(
 		}
 		float in_val = __half2float( qkv[static_cast<size_t>( m ) * channels + c] );
 		float sum = v0 * w0 + v1 * w1 + v2 * w2 + in_val * w3;
-		float silu = sum / ( 1.0f + __expf( -sum ) );
+		float silu = engine::math::silu( sum );
 		qkv[static_cast<size_t>( m ) * channels + c] = __float2half_rn( silu );
 		v0 = v1;
 		v1 = v2;
@@ -217,7 +218,7 @@ __global__ void causal_conv1d_silu_tiled_kernel(
 	for ( int t = r0; t < r1; ++t ) {
 		const float in_val = __half2float( src[static_cast<size_t>( t ) * channels + c] );
 		const float sum = v0 * w0 + v1 * w1 + v2 * w2 + in_val * w3;
-		dst[static_cast<size_t>( t ) * channels + c] = __float2half_rn( sum / ( 1.0f + __expf( -sum ) ) );
+		dst[static_cast<size_t>( t ) * channels + c] = __float2half_rn( engine::math::silu( sum ) );
 		v0 = v1;
 		v1 = v2;
 		v2 = in_val;
@@ -262,10 +263,7 @@ __global__ void l2_norm_heads_kernel(
 	float val = __half2float( ptr[tid] );
 	float sq = val * val;
 
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) {
-		sq += __shfl_xor_sync( 0xffffffff, sq, mask );
-	}
+	sq = engine::math::warp_sum( sq );
 
 	__shared__ float s_warp_sums[4];
 	int warp_id = tid >> 5;
@@ -477,10 +475,7 @@ __global__ void gated_rmsnorm_kernel(
 	float val = __half2float( head_out[tid] );
 	float sq = val * val;
 
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) {
-		sq += __shfl_xor_sync( 0xffffffff, sq, mask );
-	}
+	sq = engine::math::warp_sum( sq );
 
 	__shared__ float s_warp_sums[4];
 	int warp_id = tid >> 5;
@@ -507,10 +502,10 @@ __global__ void gated_rmsnorm_kernel(
 	float z_val = ( z != nullptr ) ? __half2float( z[head * head_dim + tid] ) : 0.0f;
 	float gate_val;
 	if ( use_sigmoid ) {
-		gate_val = 1.0f / ( 1.0f + __expf( -z_val ) );
+		gate_val = engine::math::sigmoid( z_val );
 	}
 	else {
-		gate_val = z_val / ( 1.0f + __expf( -z_val ) );
+		gate_val = engine::math::silu( z_val );
 	}
 
 	head_out[tid] = __float2half_rn( val * inv_rms * gamma * gate_val );
@@ -569,10 +564,7 @@ __global__ void project_kda_stage1_kernel(
 		}
 	}
 
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) {
-		sum += __shfl_xor_sync( 0xffffffff, sum, mask );
-	}
+	sum = engine::math::warp_sum( sum );
 
 	__shared__ float s_warp_sums[8];
 	int warp_id = tid >> 5;
@@ -585,13 +577,10 @@ __global__ void project_kda_stage1_kernel(
 
 	if ( warp_id == 0 ) {
 		float b_sum = ( lane_id < ( blockDim.x >> 5 ) ) ? s_warp_sums[lane_id] : 0.0f;
-		#pragma unroll
-		for ( int mask = 4; mask > 0; mask >>= 1 ) {
-			b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
-		}
+		b_sum = engine::math::warp_sum<4>( b_sum );
 		if ( lane_id == 0 ) {
 			if ( row < num_heads ) {
-				beta_out[row] = 1.0f / ( 1.0f + __expf( -b_sum ) );
+				beta_out[row] = engine::math::sigmoid( b_sum );
 			}
 			else if ( row < num_heads + 128 ) {
 				f_a_buf[row - num_heads] = __float2half_rn( b_sum );
@@ -776,10 +765,7 @@ __global__ void kda_recurrent_step_and_norm_kernel(
 
 	// 4. In-register Gated RMSNorm across 128 threads of this head
 	float sq = y_core * y_core;
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) {
-		sq += __shfl_xor_sync( 0xffffffff, sq, mask );
-	}
+	sq = engine::math::warp_sum( sq );
 
 	__shared__ float s_warp_sums[4];
 	int warp_id = c >> 5;
@@ -804,7 +790,7 @@ __global__ void kda_recurrent_step_and_norm_kernel(
 	float inv_rms = s_warp_sums[0];
 	float gamma = ( o_norm != nullptr ) ? __half2float( o_norm[c] ) : 1.0f;
 	float z_val = ( z != nullptr ) ? __half2float( z[h * head_dim + c] ) : 0.0f;
-	float gate_val = 1.0f / ( 1.0f + __expf( -z_val ) );
+	float gate_val = engine::math::sigmoid( z_val );
 
 	output[h * head_dim + c] = __float2half_rn( y_core * inv_rms * gamma * gate_val );
 }
@@ -888,10 +874,7 @@ kda_recurrent_rows_kernel(
 		}
 
 		float sq = y_core * y_core;
-		#pragma unroll
-		for ( int mask = 16; mask > 0; mask >>= 1 ) {
-			sq += __shfl_xor_sync( 0xffffffff, sq, mask );
-		}
+		sq = engine::math::warp_sum( sq );
 		const int warp_id = c >> 5;
 		const int lane_id = c & 31;
 		if ( lane_id == 0 ) s_warp_sums[warp_id] = sq;
@@ -909,7 +892,7 @@ kda_recurrent_rows_kernel(
 		const float inv_rms = s_warp_sums[0];
 		const float gamma = ( o_norm != nullptr ) ? __half2float( o_norm[c] ) : 1.0f;
 		const float z_val = ( z != nullptr ) ? __half2float( z[static_cast<size_t>( m ) * channels + h * 128 + c] ) : 0.0f;
-		const float gate_val = 1.0f / ( 1.0f + __expf( -z_val ) );
+		const float gate_val = engine::math::sigmoid( z_val );
 		output[static_cast<size_t>( m ) * channels + h * 128 + c] = __float2half_rn( y_core * inv_rms * gamma * gate_val );
 		__syncthreads();
 	}

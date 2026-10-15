@@ -1,4 +1,5 @@
 #include "engine/modules/gated_residual.h"
+#include "engine/backend/cuda/activation.cuh"
 #include "engine/backend/cuda/reduce.cuh"
 #include "engine/config.h"
 #include "trellis_context.h"
@@ -156,7 +157,7 @@ void gr_gate_kernel( const float* __restrict__ normed, const half* __restrict__ 
 		const int j = j0 + a;
 		if ( r < nr && j < total_out ) {
 			const float z = ( sh[0][a][r] + sh[1][a][r] + sh[2][a][r] + sh[3][a][r] ) / hc;
-			if ( j < rank ) t[static_cast<size_t>( r0 + r ) * rank + j] = z / ( 1.0f + __expf( -z ) );
+			if ( j < rank ) t[static_cast<size_t>( r0 + r ) * rank + j] = engine::math::silu( z );
 			else post[static_cast<size_t>( r0 + r ) * hc + ( j - rank )] = 2.0f / ( 1.0f + __expf( -z ) );
 		}
 	}
@@ -192,7 +193,7 @@ void gr_up_mix_kernel( const float* __restrict__ normed, const half* __restrict_
 		#pragma unroll
 		for ( int r = 0; r < GR_RT; ++r ) {
 			const float v = warp_sum( acc[r] );
-			if ( lane == 0 ) sg[s][dl][r] = 1.0f / ( 1.0f + __expf( -v ) );
+			if ( lane == 0 ) sg[s][dl][r] = engine::math::sigmoid( v );
 		}
 	}
 	__syncthreads();
@@ -281,7 +282,7 @@ void gr_gate_decode_kernel( const float* __restrict__ normed, const half* __rest
 			#pragma unroll
 			for ( int wi = 0; wi < GRD_THREADS / 32; ++wi ) sum += sh[wi][a][r];
 			const float z = sum / hc;
-			if ( j < rank ) t[static_cast<size_t>( r ) * rank + j] = z / ( 1.0f + __expf( -z ) );
+			if ( j < rank ) t[static_cast<size_t>( r ) * rank + j] = engine::math::silu( z );
 			else post[static_cast<size_t>( r ) * hc + ( j - rank )] = 2.0f / ( 1.0f + __expf( -z ) );
 		}
 	}
@@ -376,7 +377,7 @@ __global__ void gr_gate_reduce_kernel( float* __restrict__ t, float* __restrict_
 	#pragma unroll 16
 	for ( int b = 0; b < GRS_SK; ++b ) sum += g_gr_partials[( static_cast<size_t>( b ) * 8 + r ) * GRS_MAX_OUT + j];
 	const float z = sum / hc;
-	if ( j < rank ) t[static_cast<size_t>( r ) * rank + j] = z / ( 1.0f + __expf( -z ) );
+	if ( j < rank ) t[static_cast<size_t>( r ) * rank + j] = engine::math::silu( z );
 	else post[static_cast<size_t>( r ) * hc + ( j - rank )] = 2.0f / ( 1.0f + __expf( -z ) );
 }
 
@@ -447,7 +448,7 @@ void gr_up_mix_decode_kernel( const float* __restrict__ normed, const half* __re
 		v += __shfl_xor_sync( 0xffffffff, v, 1 );
 		v += __shfl_xor_sync( 0xffffffff, v, 2 );
 		v += __shfl_xor_sync( 0xffffffff, v, 4 );
-		if ( l8 == 0 ) sg[s][dl][r] = 1.0f / ( 1.0f + __expf( -v ) );
+		if ( l8 == 0 ) sg[s][dl][r] = engine::math::sigmoid( v );
 	}
 	__syncthreads();
 	if ( threadIdx.x < GRD_CH * NR ) {
@@ -535,7 +536,7 @@ void gr_up_mix_rows_kernel( const float* __restrict__ normed, const half* __rest
 	}
 	__shared__ float sg[4][CB][8];   // sigmoid gate per stream, channel, row
 	#pragma unroll
-	for ( int m = 0; m < M; ++m ) sg[s][cq * M + m][l8] = 1.0f / ( 1.0f + __expf( -v[m] ) );
+	for ( int m = 0; m < M; ++m ) sg[s][cq * M + m][l8] = engine::math::sigmoid( v[m] );
 	__syncthreads();
 	if ( threadIdx.x < 8 * CB ) {
 		const int r = threadIdx.x / CB, dl = threadIdx.x % CB;
@@ -570,7 +571,7 @@ __global__ void gr_sigmoid_gated_kernel( half* __restrict__ y, const half* __res
 	if ( threadIdx.x == 0 ) {
 		float total = 0.0f;
 		for ( int i = 0; i < ( blockDim.x >> 5 ); ++i ) total += ws[i];
-		gate = 1.0f / ( 1.0f + __expf( -total ) );
+		gate = engine::math::sigmoid( total );
 	}
 	__syncthreads();
 	for ( int i = threadIdx.x; i < hidden; i += blockDim.x ) {
@@ -591,7 +592,7 @@ __global__ void gr_shared_gate_kernel( const half* __restrict__ x, const half* _
 	if ( threadIdx.x == 0 ) {
 		float total = 0.0f;
 		for ( int i = 0; i < ( blockDim.x >> 5 ); ++i ) total += ws[i];
-		gate[blockIdx.x] = 1.0f / ( 1.0f + __expf( -total ) );
+		gate[blockIdx.x] = engine::math::sigmoid( total );
 	}
 }
 
@@ -633,7 +634,7 @@ __global__ void gr_gate_act_kernel( const float* __restrict__ z, int ld, half* _
 	for ( int j = threadIdx.x; j < rank + ( has_inject ? hc : 0 ); j += blockDim.x ) {
 		const float v = zr[j] / hc;
 		if ( j < rank ) {
-			const float tv = v / ( 1.0f + __expf( -v ) );
+			const float tv = engine::math::silu( v );
 			const half hi = __float2half_rn( tv );
 			t_hi[static_cast<size_t>( r ) * rank + j] = hi;
 			t_lo[static_cast<size_t>( r ) * rank + j] = __float2half_rn( tv - __half2float( hi ) );
@@ -649,7 +650,7 @@ __global__ void gr_up_epilogue_kernel( const float* __restrict__ u, const float*
 	if ( d >= hidden ) return;
 	float out = 0.0f;
 	for ( int s = 0; s < hc; ++s ) {
-		const float g = 1.0f / ( 1.0f + __expf( -u[static_cast<size_t>( r ) * hc * hidden + static_cast<size_t>( s ) * hidden + d] ) );
+		const float g = engine::math::sigmoid( u[static_cast<size_t>( r ) * hc * hidden + static_cast<size_t>( s ) * hidden + d] );
 		out += g * normed[( static_cast<size_t>( r ) * hc + s ) * hidden + d];
 	}
 	mixed[static_cast<size_t>( r ) * hidden + d] = __float2half_rn( out / hc );

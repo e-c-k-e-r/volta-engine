@@ -1,4 +1,5 @@
 #include "engine/modules/vision.h"
+#include "engine/backend/cuda/reduce.cuh"
 #include "trellis_context.h"
 
 #include <cublas_v2.h>
@@ -31,8 +32,7 @@ __global__ void add_bias_pos_kernel( float* out, const half* bias, const half* a
 
 // One block per row; block-wide mean / variance in FP32.
 __device__ float block_sum( float v, float* smem ) {
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) v += __shfl_xor_sync( 0xffffffff, v, mask );
+	v = engine::math::warp_sum( v );
 	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
 	if ( lane == 0 ) smem[warp] = v;
 	__syncthreads();
@@ -111,8 +111,7 @@ __global__ void qkv_norm_rope_kernel( half* __restrict__ q, half* __restrict__ k
 		if ( which < 2 ) {
 			const half* gain = ( which == 0 ) ? qn : kn;
 			float ss = a * a + b * b;
-			#pragma unroll
-			for ( int mask = 16; mask > 0; mask >>= 1 ) ss += __shfl_xor_sync( 0xffffffff, ss, mask );
+			ss = engine::math::warp_sum( ss );
 			const float inv = rsqrtf( ss / 64.0f + eps );
 			a = a * inv * __half2float( gain[d] );
 			b = b * inv * __half2float( gain[d + 32] );
@@ -210,15 +209,13 @@ __global__ void attention_kernel( const half* __restrict__ q, const half* __rest
 			s[h] = dot;
 		}
 		float tmax = fmaxf( s[0], s[1] );
-		#pragma unroll
-		for ( int mask = 16; mask > 0; mask >>= 1 ) tmax = fmaxf( tmax, __shfl_xor_sync( 0xffffffff, tmax, mask ) );
+		tmax = engine::math::warp_max( tmax );
 		const float new_max = fmaxf( run_max, tmax );
 		const float corr = __expf( run_max - new_max );
 		const float p0 = ( s[0] == -INFINITY ) ? 0.0f : __expf( s[0] - new_max );
 		const float p1 = ( s[1] == -INFINITY ) ? 0.0f : __expf( s[1] - new_max );
 		float psum = p0 + p1;
-		#pragma unroll
-		for ( int mask = 16; mask > 0; mask >>= 1 ) psum += __shfl_xor_sync( 0xffffffff, psum, mask );
+		psum = engine::math::warp_sum( psum );
 		run_sum = run_sum * corr + psum;
 		run_max = new_max;
 		acc[0] *= corr;

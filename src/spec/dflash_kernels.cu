@@ -1,4 +1,5 @@
 #include "engine/spec/dflash.h"
+#include "engine/backend/cuda/reduce.cuh"
 #include "engine/modules/norm.h"
 #include "engine/modules/swiglu.h"
 #include "engine/modules/embedding.h"
@@ -148,8 +149,7 @@ void dflash_f16_gemv_skinny_kernel(
 	#pragma unroll
 	for ( int r = 0; r < MR; ++r ) {
 		float a = acc[r];
-		#pragma unroll
-		for ( int mask = 16; mask > 0; mask >>= 1 ) a += __shfl_xor_sync( 0xffffffff, a, mask );
+		a = engine::math::warp_sum( a );
 		if ( lane == 0 && r < m ) out[static_cast<int64_t>( r ) * n + col] = __float2half_rn( a );
 	}
 }
@@ -195,8 +195,7 @@ __global__ void dflash_rmsnorm_residual_kernel(
 		local_sq = fmaf( val, val, local_sq );
 	}
 
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) local_sq += __shfl_xor_sync( 0xffffffff, local_sq, mask );
+	local_sq = engine::math::warp_sum( local_sq );
 	__shared__ float s_warp_sums[8];
 	const int warp_id = tid >> 5;
 	const int lane_id = tid & 31;
@@ -204,8 +203,7 @@ __global__ void dflash_rmsnorm_residual_kernel(
 	__syncthreads();
 	if ( warp_id == 0 ) {
 		float b_sum = ( lane_id < ( blockDim.x >> 5 ) ) ? s_warp_sums[lane_id] : 0.0f;
-		#pragma unroll
-		for ( int mask = 4; mask > 0; mask >>= 1 ) b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
+		b_sum = engine::math::warp_sum<4>( b_sum );
 		if ( lane_id == 0 ) s_warp_sums[0] = rsqrtf( b_sum / static_cast<float>( hidden_size ) + eps );
 	}
 	__syncthreads();
@@ -500,8 +498,7 @@ void dflash_qk_norm_rope_kernel(
 		const float v = __half2float( hrow[i] );
 		local_sq = fmaf( v, v, local_sq );
 	}
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) local_sq += __shfl_xor_sync( 0xffffffff, local_sq, mask );
+	local_sq = engine::math::warp_sum( local_sq );
 	__shared__ float s_warp_sums[8];
 	__shared__ float s_inv;
 	const int warp_id = tid >> 5;
@@ -615,8 +612,7 @@ void dflash_attn_kernel(
 		float dot = 0.0f;
 		for ( int d = lane; d < head_dim; d += 32 )
 			dot = fmaf( __half2float( qrow[d] ), __half2float( krow[d] ), dot );
-		#pragma unroll
-		for ( int mask = 16; mask > 0; mask >>= 1 ) dot += __shfl_xor_sync( 0xffffffff, dot, mask );
+		dot = engine::math::warp_sum( dot );
 		__syncwarp();
 		if ( lane == 0 ) s_scores[kk] = dot * scale;
 	}
@@ -624,8 +620,7 @@ void dflash_attn_kernel(
 
 	float m = -INFINITY;
 	for ( int kk = threadIdx.x; kk < nkeys; kk += blockDim.x ) m = fmaxf( m, s_scores[kk] );
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) m = fmaxf( m, __shfl_xor_sync( 0xffffffff, m, mask ) );
+	m = engine::math::warp_max( m );
 	__shared__ float s_warp_max[4];
 	__shared__ float s_max;
 	if ( ( threadIdx.x & 31 ) == 0 ) s_warp_max[threadIdx.x >> 5] = m;
@@ -659,8 +654,7 @@ void dflash_attn_kernel(
 
 	float l = 0.0f;
 	for ( int kk = threadIdx.x; kk < nkeys; kk += blockDim.x ) l += s_scores[kk];
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) l += __shfl_xor_sync( 0xffffffff, l, mask );
+	l = engine::math::warp_sum( l );
 	__shared__ float s_warp_sum[4];
 	__shared__ float s_sum;
 	if ( ( threadIdx.x & 31 ) == 0 ) s_warp_sum[threadIdx.x >> 5] = l;

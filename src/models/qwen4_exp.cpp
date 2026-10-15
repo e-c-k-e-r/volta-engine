@@ -572,10 +572,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 						ENGINE_ASSERT( bytes[p] > 0, "Qwen4ExpPipeline: expert codes not found for the tier" );
 					}
 				}
-				tier_.configure( per_rank, tier_fraction, bytes, runtime::options().expert_heat_file.empty() ? std::string() : runtime::options().expert_heat_file + ( tp_ > 1 ? ".r" + std::to_string( rank_ ) : std::string() ) );
-				const size_t host_bytes = ( runtime::options().expert_synth ? 0 : static_cast<size_t>( config_.num_layers ) * tier_.cold_bytes_per_layer() ) + tier_.slot_bytes + 256;
-				ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "Qwen4ExpPipeline: pinned expert tier allocation failed" );
-				tier_.allocate_staging( host_arena_ );
+				tier_.start( per_rank, tier_fraction, bytes, rank_, tp_, config_.num_layers, false, host_arena_ );
 			}
 			tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_ ) );
 			tier_layer = tier_layers_++;

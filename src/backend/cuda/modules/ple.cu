@@ -1,4 +1,5 @@
 #include "engine/modules/ple.h"
+#include "engine/backend/cuda/activation.cuh"
 #include "engine/backend/cuda/reduce.cuh"
 #include <cuda_fp16.h>
 #include <cmath>
@@ -52,7 +53,7 @@ __global__ void ple_gate_kernel(
 	const float g = dot * gate_scale;
 	const float sign = ( g > 0.0f ) ? 1.0f : ( g < 0.0f ? -1.0f : 0.0f );
 	const float ss = sign * sqrtf( fmaxf( fabsf( g ), 1e-6f ) );
-	const float sg = 1.0f / ( 1.0f + __expf( -ss ) );
+	const float sg = engine::math::sigmoid( ss );
 	// rms of gated = |sg| * rms(value)
 	const float ig = rsqrtf( sg * sg * sv / hidden + eps );
 	for ( int d = threadIdx.x; d < hidden; d += blockDim.x ) {
@@ -87,7 +88,7 @@ __global__ void ple_conv_kernel(
 		}
 		acc = fmaf( __half2float( conv_w[static_cast<size_t>( c ) * 4 + j] ), xv, acc );
 	}
-	const float act = acc / ( 1.0f + __expf( -acc ) );
+	const float act = engine::math::silu( acc );
 	const size_t o = static_cast<size_t>( r ) * channels + c;
 	streams[o] += gated[o] + act;
 }

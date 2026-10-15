@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cuda_fp16.h>
+#include "engine/backend/cuda/activation.cuh"
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
@@ -129,7 +130,7 @@ static __global__ void k_silu_mul( const half* f1, half* f2, float* rowscale, in
 		#pragma unroll
 		for ( int e = 0; e < 8; ++e ) {
 			const float a = __half2float( gh[e] ) + ( bg ? bg[c0 + e] : 0.0f ), b = __half2float( uh[e] ) + ( bu ? bu[c0 + e] : 0.0f );
-			const float v = a / ( 1.0f + __expf( -a ) ) * b;
+			const float v = engine::math::silu( a ) * b;
 			val[it][e] = v;
 			mx = fmaxf( mx, fabsf( v ) );
 		}
@@ -167,7 +168,7 @@ static __global__ void k_silu_amax( const half* f1, float* amax, int F ) {
 		#pragma unroll
 		for ( int e = 0; e < 8; ++e ) {
 			const float a = __half2float( gh[e] ), b = __half2float( uh[e] );
-			mx = fmaxf( mx, fabsf( a / ( 1.0f + __expf( -a ) ) * b ) );
+			mx = fmaxf( mx, fabsf( engine::math::silu( a ) * b ) );
 		}
 	}
 	mx = block_max( mx, red );
@@ -193,7 +194,7 @@ static __global__ void k_silu_apply( const half* f1, half* f2, float* rowscale, 
 		#pragma unroll
 		for ( int e = 0; e < 8; ++e ) {
 			const float a = __half2float( gh[e] ), b = __half2float( uh[e] );
-			oh[e] = __float2half_rn( a / ( 1.0f + __expf( -a ) ) * b / s );
+			oh[e] = __float2half_rn( engine::math::silu( a ) * b / s );
 		}
 		*reinterpret_cast<uint4*>( f2 + static_cast<size_t>( row ) * F + c0 ) = ov;
 	}

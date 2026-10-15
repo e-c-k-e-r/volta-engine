@@ -1,4 +1,5 @@
 #include "engine/modules/qsa.h"
+#include "engine/backend/cuda/reduce.cuh"
 #include "engine/modules/dsa.h"
 #include "engine/backend/cuda/rope_math.cuh"
 #include <cuda_fp16.h>
@@ -12,8 +13,7 @@ constexpr int D = QSA::DIM;
 
 __device__ __forceinline__ float block_sum128( float v ) {
 	__shared__ float ws[4];
-	#pragma unroll
-	for ( int o = 16; o > 0; o >>= 1 ) v += __shfl_xor_sync( 0xffffffff, v, o );
+	v = engine::math::warp_sum( v );
 	__syncthreads();
 	if ( ( threadIdx.x & 31 ) == 0 ) ws[threadIdx.x >> 5] = v;
 	__syncthreads();

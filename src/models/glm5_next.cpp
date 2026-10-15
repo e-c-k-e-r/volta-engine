@@ -715,12 +715,9 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 						if ( bytes[p] == 0 && runtime::options().expert_synth >= 2 ) bytes[p] = repo.synth_trellis_bytes( name_buf );
 						ENGINE_ASSERT( bytes[p] > 0, "Glm5NextPipeline: expert codes not found for the tier" );
 					}
-					tier_.configure( experts_per_rank, tier_fraction, bytes, runtime::options().expert_heat_file.empty() ? std::string() : runtime::options().expert_heat_file + ( config_.tp_size > 1 ? ".r" + std::to_string( rank_ ) : std::string() ) );
 					int moe_layers = 0;
 					for ( int ll = 0; ll < config_.num_layers; ++ll ) moe_layers += ( ll >= 3 ) ? 1 : 0;
-					const size_t host_bytes = ( runtime::options().expert_synth ? 0 : runtime::options().expert_stream ? tier_.cold_bytes_per_layer() + 256 : static_cast<size_t>( moe_layers ) * tier_.cold_bytes_per_layer() ) + tier_.slot_bytes + 256;
-					ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "Glm5NextPipeline: pinned expert tier allocation failed" );
-					tier_.allocate_staging( host_arena_ );
+					tier_.start( experts_per_rank, tier_fraction, bytes, rank_, config_.tp_size, moe_layers, runtime::options().expert_stream, host_arena_ );
 				}
 				tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_ ) );
 				tier_layer = tier_layers_++;

@@ -1,4 +1,5 @@
 #include "engine/modules/dsa.h"
+#include "engine/backend/cuda/reduce.cuh"
 #include "trellis_context.h"
 #include <cublas_v2.h>
 #include <cmath>
@@ -50,8 +51,7 @@ void project_small_kernel( const half* __restrict__ w, const half* __restrict__ 
 	for ( int r = 0; r < 16; ++r ) {
 		if ( r >= rows ) break;
 		float v = acc[r];
-		#pragma unroll
-		for ( int off = 16; off > 0; off >>= 1 ) v += __shfl_xor_sync( 0xffffffff, v, off );
+		v = engine::math::warp_sum( v );
 		if ( lane == 0 ) out[static_cast<size_t>( r ) * n + j] = __float2half_rn( v );
 	}
 }
@@ -66,14 +66,14 @@ void prep_kernel( const half* __restrict__ proj, const half* __restrict__ ln_w, 
 	const float kv = __half2float( pr[d] );
 	// mean and variance over the 128 key dimensions (two-pass, fp32)
 	float s = kv;
-	for ( int off = 16; off > 0; off >>= 1 ) s += __shfl_xor_sync( 0xffffffff, s, off );
+	s = engine::math::warp_sum( s );
 	if ( ( d & 31 ) == 0 ) red[d >> 5] = s;
 	__syncthreads();
 	const float mean = ( red[0] + red[1] + red[2] + red[3] ) * ( 1.0f / D );
 	__syncthreads();
 	const float dv = kv - mean;
 	float v = dv * dv;
-	for ( int off = 16; off > 0; off >>= 1 ) v += __shfl_xor_sync( 0xffffffff, v, off );
+	v = engine::math::warp_sum( v );
 	if ( ( d & 31 ) == 0 ) red[4 + ( d >> 5 )] = v;
 	__syncthreads();
 	const float var = ( red[4] + red[5] + red[6] + red[7] ) * ( 1.0f / D );

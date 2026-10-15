@@ -1,4 +1,5 @@
 #include "engine/modules/moe.h"
+#include "engine/backend/cuda/activation.cuh"
 #include "engine/modules/nvfp4_moe.h"
 #include "engine/runtime/options.h"
 #include "exl3_moe_kernel.cuh"
@@ -238,7 +239,7 @@ void router_select_kernel(
 		for ( int ks = 0; ks < k_slices; ++ks ) {
 			logit += g_router_partials[( static_cast<size_t>( m ) * ROUTER_MAX_KSLICES + ks ) * ROUTER_MAX_EXPERTS + expert];
 		}
-		const float raw_score = 1.0f / ( 1.0f + __expf( -logit ) );
+		const float raw_score = engine::math::sigmoid( logit );
 		float select_score = raw_score;
 		if ( e_score_bias != nullptr ) {
 			select_score += __half2float( e_score_bias[expert] );

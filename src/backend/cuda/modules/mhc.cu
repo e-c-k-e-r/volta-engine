@@ -1,4 +1,6 @@
 #include "engine/modules/mhc.h"
+#include "engine/backend/cuda/activation.cuh"
+#include "engine/backend/cuda/reduce.cuh"
 #include "engine/core/batch.h"
 #include <cuda_fp16.h>
 #include <cmath>
@@ -14,10 +16,6 @@ namespace {
 
 // Per-row partial sums: up to MAX_ROWS rows x 64 chunks x (M + 1) values
 __device__ float g_mhc_partials[pod::MAX_ROWS * 64 * 25];
-
-__device__ __forceinline__ float sigmoidf_( float x ) {
-	return 1.0f / ( 1.0f + __expf( -x ) );
-}
 
 __global__ void init_streams_kernel(
 	const half* __restrict__ in,
@@ -165,7 +163,7 @@ void hc_mix_finalize_body(
 	__syncthreads();
 	float rmr = rsqrtf( mix_s[M] / static_cast<float>( row_len ) + rms_eps );
 	if ( threadIdx.x < H ) {
-		pre_s[threadIdx.x] = sigmoidf_( fmaf( mix_s[threadIdx.x] * rmr, scale[0], base[threadIdx.x] ) ) + hc_eps;
+		pre_s[threadIdx.x] = engine::math::sigmoid( fmaf( mix_s[threadIdx.x] * rmr, scale[0], base[threadIdx.x] ) ) + hc_eps;
 	}
 	__syncthreads();
 
@@ -177,7 +175,7 @@ void hc_mix_finalize_body(
 	if ( sink_warp ) {
 		if ( threadIdx.x < H ) {
 			post[static_cast<size_t>( r ) * H + threadIdx.x] =
-				2.0f * sigmoidf_( fmaf( mix_s[H + threadIdx.x] * rmr, scale[1], base[H + threadIdx.x] ) );
+				2.0f * engine::math::sigmoid( fmaf( mix_s[H + threadIdx.x] * rmr, scale[1], base[H + threadIdx.x] ) );
 		}
 
 		// One thread runs the whole H x H Sinkhorn in registers (the shuffle version spent ~0.3 us per iteration on its dependent chains);
@@ -335,15 +333,13 @@ void hc_collapse_norm_kernel(
 		const float v = __half2float( s_col[i] );
 		local_sq = fmaf( v, v, local_sq );
 	}
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) local_sq += __shfl_xor_sync( 0xffffffff, local_sq, mask );
+	local_sq = engine::math::warp_sum( local_sq );
 	const int warp_id = tid >> 5, lane_id = tid & 31;
 	if ( lane_id == 0 ) s_warp_sums[warp_id] = local_sq;
 	__syncthreads();
 	if ( warp_id == 0 ) {
 		float b_sum = ( lane_id < 8 ) ? s_warp_sums[lane_id] : 0.0f;
-		#pragma unroll
-		for ( int mask = 4; mask > 0; mask >>= 1 ) b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
+		b_sum = engine::math::warp_sum<4>( b_sum );
 		if ( lane_id == 0 ) s_warp_sums[0] = rsqrtf( b_sum / static_cast<float>( D ) + norm_eps );
 	}
 	__syncthreads();

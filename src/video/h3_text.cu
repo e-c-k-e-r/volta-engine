@@ -1,5 +1,6 @@
 // Streaming Qwen3 text tower for the H3 conditioning (see h3_text.h).
 #include "engine/video/h3_text.h"
+#include "engine/backend/cuda/activation.cuh"
 #include "engine/video/h3_attn.h"
 #include "h3_util.h"
 #include "engine/core/arena.h"
@@ -140,7 +141,7 @@ __global__ void k_silu_mul2( const half* g, const half* u, half* out, float* row
 	float mx = 0.0f;
 	for ( int c = threadIdx.x; c < F; c += blockDim.x ) {
 		const float a = __half2float( gr[c] ), b = __half2float( ur[c] );
-		mx = fmaxf( mx, fabsf( a / ( 1.0f + __expf( -a ) ) * b ) );
+		mx = fmaxf( mx, fabsf( engine::math::silu( a ) * b ) );
 	}
 	mx = block_max( mx, red );
 	int e = 0;
@@ -149,7 +150,7 @@ __global__ void k_silu_mul2( const half* g, const half* u, half* out, float* row
 	if ( threadIdx.x == 0 ) { rowscale[row] = s; }
 	for ( int c = threadIdx.x; c < F; c += blockDim.x ) {
 		const float a = __half2float( gr[c] ), b = __half2float( ur[c] );
-		out[static_cast<size_t>( row ) * F + c] = __float2half_rn( a / ( 1.0f + __expf( -a ) ) * b / s );
+		out[static_cast<size_t>( row ) * F + c] = __float2half_rn( engine::math::silu( a ) * b / s );
 	}
 }
 
@@ -161,7 +162,7 @@ __global__ void k_silu2_amax( const half* g, const half* u, float* amax, int F )
 	float mx = 0.0f;
 	for ( int c = threadIdx.x; c < F; c += blockDim.x ) {
 		const float a = __half2float( g[static_cast<size_t>( row ) * F + c] ), b = __half2float( u[static_cast<size_t>( row ) * F + c] );
-		mx = fmaxf( mx, fabsf( a / ( 1.0f + __expf( -a ) ) * b ) );
+		mx = fmaxf( mx, fabsf( engine::math::silu( a ) * b ) );
 	}
 	mx = block_max( mx, red );
 	if ( threadIdx.x == 0 ) { amax[row] = mx; }
@@ -177,7 +178,7 @@ __global__ void k_silu2_apply( const half* g, const half* u, half* out, float* r
 	if ( threadIdx.x == 0 ) { rowscale[row] = s; }
 	for ( int c = threadIdx.x; c < F; c += blockDim.x ) {
 		const float a = __half2float( g[static_cast<size_t>( row ) * F + c] ), b = __half2float( u[static_cast<size_t>( row ) * F + c] );
-		out[static_cast<size_t>( row ) * F + c] = __float2half_rn( a / ( 1.0f + __expf( -a ) ) * b / s );
+		out[static_cast<size_t>( row ) * F + c] = __float2half_rn( engine::math::silu( a ) * b / s );
 	}
 }
 

@@ -1,4 +1,5 @@
 #include "engine/modules/swiglu.h"
+#include "engine/backend/cuda/activation.cuh"
 #include <cuda_fp16.h>
 #include <cmath>
 
@@ -21,7 +22,7 @@ __global__ void swiglu_kernel(
 			g = fminf( g, limit );
 			u = fmaxf( -limit, fminf( u, limit ) );
 		}
-		float silu_g = g / ( 1.0f + __expf( -g ) );
+		float silu_g = engine::math::silu( g );
 		out[idx] = __float2half_rn( silu_g * u );
 	}
 }
@@ -44,7 +45,7 @@ __global__ void swiglu_fused_kernel(
 			g = fminf( g, limit );
 			u = fmaxf( -limit, fminf( u, limit ) );
 		}
-		float silu_g = g / ( 1.0f + __expf( -g ) );
+		float silu_g = engine::math::silu( g );
 		out[idx] = __float2half_rn( silu_g * u );
 	}
 }

@@ -110,6 +110,23 @@ int main() {
 			ENGINE_ASSERT( h_gpu_argmax[b] == expected_argmax[b], "Batched argmax mismatch" );
 		}
 	}
+	// Ties: the same maximum at several positions resolves to the lowest index, whatever the thread layout
+	for ( int count = 1; count <= 8; count += 7 ) {
+		std::vector<half> h_logits( count * vocab_size, float_to_half( -3.0f ) );
+		std::vector<int> expected_argmax( count );
+		for ( int b = 0; b < count; ++b ) {
+			const int lowest = ( b * 977 + 1234 ) % 100000;
+			expected_argmax[b] = lowest;
+			for ( int idx : { lowest, lowest + 31, lowest + 512, lowest + 7777, vocab_size - 5 - b, 150000 + b } )
+				h_logits[b * vocab_size + idx] = float_to_half( 9.0f );
+		}
+		CUDA_CHECK( cudaMemcpyAsync( d_logits.data, h_logits.data(), count * vocab_size * sizeof( half ), cudaMemcpyHostToDevice, stream ) );
+		engine::modules::Elementwise::batched_argmax( d_logits, d_argmax_out, vocab_size, count, stream );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		std::vector<int> h_gpu_argmax( count );
+		CUDA_CHECK( cudaMemcpy( h_gpu_argmax.data(), d_argmax_out, count * sizeof( int ), cudaMemcpyDeviceToHost ) );
+		for ( int b = 0; b < count; ++b ) ENGINE_ASSERT( h_gpu_argmax[b] == expected_argmax[b], "Batched argmax tie is not the lowest index" );
+	}
 	std::printf( "    -> Elementwise::argmax and batched_argmax PASS.\n" );
 
 	CUDA_CHECK( cudaStreamDestroy( stream ) );

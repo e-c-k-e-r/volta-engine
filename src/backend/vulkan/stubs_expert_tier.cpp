@@ -30,6 +30,11 @@ __attribute__(( weak )) void ExpertTier::save_heat() {}
 
 __attribute__(( weak )) ExpertTier::~ExpertTier() {}
 
+__attribute__(( weak )) void ExpertTier::start( int experts_per_layer, double fraction, const size_t bytes[3], int rank, int tp, int layers, bool streamed, pod::MemoryArena& host ) {
+	ENGINE_UNSUPPORTED( "ExpertTier::start" );
+	__builtin_unreachable();
+}
+
 __attribute__(( weak )) void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, pod::MemoryArena& host, std::vector<int> resident_set ) {
 	ENGINE_UNSUPPORTED( "ExpertTier::add_layer" );
 	__builtin_unreachable();

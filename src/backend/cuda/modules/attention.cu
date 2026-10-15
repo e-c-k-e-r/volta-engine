@@ -1,4 +1,6 @@
 #include "engine/modules/attention.h"
+#include "engine/backend/cuda/activation.cuh"
+#include "engine/backend/cuda/reduce.cuh"
 #include "kv_quant.cuh"
 #include "../../../kernels/cuda/mma_sm80.cuh"
 #include <cuda_fp16.h>
@@ -155,10 +157,7 @@ __global__ void attn_chunked_paged_kernel(
 			float my_k = kv_load1<KQ>( kv.k, kv.ks, kv_offset );
 			float dot = my_q * my_k;
 
-			#pragma unroll
-			for ( int mask = 16; mask > 0; mask >>= 1 ) {
-				dot += __shfl_xor_sync( 0xffffffff, dot, mask );
-			}
+			dot = engine::math::warp_sum( dot );
 
 			if ( lane_id == 0 ) {
 				s_warp_sums[warp_id] = dot;
@@ -167,10 +166,7 @@ __global__ void attn_chunked_paged_kernel(
 
 			if ( warp_id == 0 ) {
 				float b_sum = ( lane_id < num_warps ) ? s_warp_sums[lane_id] : 0.0f;
-				#pragma unroll
-				for ( int mask = 4; mask > 0; mask >>= 1 ) {
-					b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
-				}
+				b_sum = engine::math::warp_sum<4>( b_sum );
 				if ( lane_id == 0 ) {
 					s_score = b_sum * scale;
 				}
@@ -200,7 +196,7 @@ __global__ void attn_chunked_paged_kernel(
 		if ( gate != nullptr ) {
 			size_t g_off = ( static_cast<size_t>( m ) * num_q_heads + head ) * head_dim + tid;
 			float g_val = __half2float( gate[g_off] );
-			sig = 1.0f / ( 1.0f + __expf( -g_val ) );
+			sig = engine::math::sigmoid( g_val );
 		}
 		out_head[tid] = __float2half_rn( val * sig );
 	}
@@ -268,14 +264,12 @@ __global__ void attn_sparse_kernel(
 		const int t = nk >= 0 ? idx[static_cast<size_t>( r ) * idx_stride + i] : i;
 		const size_t kv_offset = slot_off + ( static_cast<size_t>( layer_idx ) * max_seq + t ) * ( num_kv_heads * head_dim ) + kv_head * head_dim + tid;
 		float dot = my_q * kv_load1<KQ>( kv.k, kv.ks, kv_offset );
-		#pragma unroll
-		for ( int mask = 16; mask > 0; mask >>= 1 ) dot += __shfl_xor_sync( 0xffffffff, dot, mask );
+		dot = engine::math::warp_sum( dot );
 		if ( lane_id == 0 ) s_warp_sums[warp_id] = dot;
 		__syncthreads();
 		if ( warp_id == 0 ) {
 			float b_sum = ( lane_id < num_warps ) ? s_warp_sums[lane_id] : 0.0f;
-			#pragma unroll
-			for ( int mask = 4; mask > 0; mask >>= 1 ) b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
+			b_sum = engine::math::warp_sum<4>( b_sum );
 			if ( lane_id == 0 ) s_score = b_sum * scale;
 		}
 		__syncthreads();
@@ -372,8 +366,7 @@ void attn_sparse_warp_kernel(
 			float dot = 0.0f;
 			#pragma unroll
 			for ( int j = 0; j < 8; ++j ) dot = fmaf( qv[j], kf[u][j], dot );
-			#pragma unroll
-			for ( int mask = 16; mask > 0; mask >>= 1 ) dot += __shfl_xor_sync( 0xffffffff, dot, mask );
+			dot = engine::math::warp_sum( dot );
 			const float m_new = fmaxf( m_reg, dot );
 			const float alpha = expf( m_reg - m_new );
 			const float p = expf( dot - m_new );
@@ -798,8 +791,8 @@ void attn_prefill_tc_kernel(
 			#pragma unroll
 			for ( int i = 0; i < 4; ++i ) {
 				const float2 f = __half22float2( g2[i] );
-				sig[2 * i] = 1.0f / ( 1.0f + __expf( -f.x ) );
-				sig[2 * i + 1] = 1.0f / ( 1.0f + __expf( -f.y ) );
+				sig[2 * i] = engine::math::sigmoid( f.x );
+				sig[2 * i + 1] = engine::math::sigmoid( f.y );
 			}
 		}
 		const float* o = sO + qq * PA_KS + c * 8;
@@ -858,7 +851,7 @@ __global__ void attn_reduce_kernel(
 	if ( gate != nullptr ) {
 		size_t g_off = ( static_cast<size_t>( token_idx ) * num_q_heads + q_head ) * D + tid;
 		float g_val = __half2float( gate[g_off] );
-		sig = 1.0f / ( 1.0f + __expf( -g_val ) );
+		sig = engine::math::sigmoid( g_val );
 	}
 	size_t out_off = ( static_cast<size_t>( token_idx ) * num_q_heads + q_head ) * D + tid;
 	output[out_off] = __float2half_rn( val * sig );

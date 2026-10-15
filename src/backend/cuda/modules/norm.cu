@@ -1,4 +1,5 @@
 #include "engine/modules/norm.h"
+#include "engine/backend/cuda/reduce.cuh"
 #include <cuda_fp16.h>
 #include <cmath>
 
@@ -44,10 +45,7 @@ __global__ void rms_norm_kernel(
 		}
 	}
 
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) {
-		local_sq += __shfl_xor_sync( 0xffffffff, local_sq, mask );
-	}
+	local_sq = engine::math::warp_sum( local_sq );
 
 	__shared__ float s_warp_sums[8];
 	int warp_id = tid >> 5;
@@ -59,10 +57,7 @@ __global__ void rms_norm_kernel(
 
 	if ( warp_id == 0 ) {
 		float b_sum = ( lane_id < 8 ) ? s_warp_sums[lane_id] : 0.0f;
-		#pragma unroll
-		for ( int mask = 4; mask > 0; mask >>= 1 ) {
-			b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
-		}
+		b_sum = engine::math::warp_sum<4>( b_sum );
 		if ( lane_id == 0 ) {
 			s_warp_sums[0] = rsqrtf( b_sum / static_cast<float>( hidden_size ) + eps );
 		}
@@ -110,10 +105,7 @@ __global__ void rms_norm_heads_kernel(
 	float val = __half2float( ptr[tid] );
 	float sq = val * val;
 
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) {
-		sq += __shfl_xor_sync( 0xffffffff, sq, mask );
-	}
+	sq = engine::math::warp_sum( sq );
 
 	__shared__ float s_warp_sums[8];
 	int warp_id = tid >> 5;
@@ -126,10 +118,7 @@ __global__ void rms_norm_heads_kernel(
 	int num_warps = ( head_dim + 31 ) >> 5;
 	if ( warp_id == 0 ) {
 		float b_sum = ( lane_id < num_warps ) ? s_warp_sums[lane_id] : 0.0f;
-		#pragma unroll
-		for ( int mask = 4; mask > 0; mask >>= 1 ) {
-			b_sum += __shfl_xor_sync( 0xffffffff, b_sum, mask );
-		}
+		b_sum = engine::math::warp_sum<4>( b_sum );
 		if ( lane_id == 0 ) {
 			s_warp_sums[0] = rsqrtf( b_sum / static_cast<float>( head_dim ) + eps );
 		}
@@ -154,12 +143,59 @@ __global__ void add_residual_kernel(
 	}
 }
 
+// Does (ov, oi) beat (v, i)? Larger value wins; on equal values the lower index wins (ties resolve to the first maximum, as the CPU and
+// Vulkan references do), and an empty slot (index -1) loses to any real one.
+__device__ __forceinline__ bool argmax_better( float ov, int oi, float v, int i ) {
+	return ov > v || ( ov == v && oi >= 0 && ( i < 0 || oi < i ) );
+}
+
+// Block-wide argmax of the per-thread (val, idx) pairs: a butterfly inside each warp, then the warp results through shared memory. True on
+// thread 0, where val / idx hold the block's winner.
+__device__ __forceinline__ bool block_argmax( float& max_val, int& max_idx ) {
+	const int tid = threadIdx.x;
+	#pragma unroll
+	for ( int mask = 16; mask > 0; mask >>= 1 ) {
+		float other_val = __shfl_xor_sync( 0xffffffff, max_val, mask );
+		int other_idx = __shfl_xor_sync( 0xffffffff, max_idx, mask );
+		if ( argmax_better( other_val, other_idx, max_val, max_idx ) ) {
+			max_val = other_val;
+			max_idx = other_idx;
+		}
+	}
+
+	__shared__ float s_max_vals[32];
+	__shared__ int s_max_idxs[32];
+	const int warp_id = tid >> 5;
+	const int lane_id = tid & 31;
+
+	if ( lane_id == 0 ) {
+		s_max_vals[warp_id] = max_val;
+		s_max_idxs[warp_id] = max_idx;
+	}
+	__syncthreads();
+
+	if ( warp_id != 0 ) return false;
+	float b_max = ( lane_id < ( blockDim.x >> 5 ) ) ? s_max_vals[lane_id] : -1e30f;
+	int b_idx = ( lane_id < ( blockDim.x >> 5 ) ) ? s_max_idxs[lane_id] : -1;
+	#pragma unroll
+	for ( int mask = 16; mask > 0; mask >>= 1 ) {
+		float other_val = __shfl_xor_sync( 0xffffffff, b_max, mask );
+		int other_idx = __shfl_xor_sync( 0xffffffff, b_idx, mask );
+		if ( argmax_better( other_val, other_idx, b_max, b_idx ) ) {
+			b_max = other_val;
+			b_idx = other_idx;
+		}
+	}
+	max_val = b_max;
+	max_idx = b_idx;
+	return lane_id == 0;
+}
+
 __global__ void argmax_kernel(
 	const half* __restrict__ logits,
 	int* __restrict__ out_idx,
 	int numel
 ) {
-	int tid = threadIdx.x;
 	int gid = blockIdx.x * blockDim.x + threadIdx.x;
 
 	float max_val = -1e30f;
@@ -173,43 +209,7 @@ __global__ void argmax_kernel(
 		}
 	}
 
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) {
-		float other_val = __shfl_xor_sync( 0xffffffff, max_val, mask );
-		int other_idx = __shfl_xor_sync( 0xffffffff, max_idx, mask );
-		if ( other_val > max_val ) {
-			max_val = other_val;
-			max_idx = other_idx;
-		}
-	}
-
-	__shared__ float s_max_vals[32];
-	__shared__ int s_max_idxs[32];
-	int warp_id = tid >> 5;
-	int lane_id = tid & 31;
-
-	if ( lane_id == 0 ) {
-		s_max_vals[warp_id] = max_val;
-		s_max_idxs[warp_id] = max_idx;
-	}
-	__syncthreads();
-
-	if ( warp_id == 0 ) {
-		float b_max = ( lane_id < ( blockDim.x >> 5 ) ) ? s_max_vals[lane_id] : -1e30f;
-		int b_idx = ( lane_id < ( blockDim.x >> 5 ) ) ? s_max_idxs[lane_id] : -1;
-		#pragma unroll
-		for ( int mask = 16; mask > 0; mask >>= 1 ) {
-			float other_val = __shfl_xor_sync( 0xffffffff, b_max, mask );
-			int other_idx = __shfl_xor_sync( 0xffffffff, b_idx, mask );
-			if ( other_val > b_max ) {
-				b_max = other_val;
-				b_idx = other_idx;
-			}
-		}
-		if ( lane_id == 0 ) {
-			out_idx[0] = b_idx;
-		}
-	}
+	if ( block_argmax( max_val, max_idx ) ) out_idx[0] = max_idx;
 }
 
 __global__ void batched_argmax_kernel(
@@ -238,43 +238,9 @@ __global__ void batched_argmax_kernel(
 		}
 	}
 
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) {
-		float other_val = __shfl_xor_sync( 0xffffffff, max_val, mask );
-		int other_idx = __shfl_xor_sync( 0xffffffff, max_idx, mask );
-		if ( other_val > max_val ) {
-			max_val = other_val;
-			max_idx = other_idx;
-		}
-	}
-
-	__shared__ float s_max_vals[32];
-	__shared__ int s_max_idxs[32];
-	int warp_id = tid >> 5;
-	int lane_id = tid & 31;
-
-	if ( lane_id == 0 ) {
-		s_max_vals[warp_id] = max_val;
-		s_max_idxs[warp_id] = max_idx;
-	}
-	__syncthreads();
-
-	if ( warp_id == 0 ) {
-		float b_max = ( lane_id < ( blockDim.x >> 5 ) ) ? s_max_vals[lane_id] : -1e30f;
-		int b_idx = ( lane_id < ( blockDim.x >> 5 ) ) ? s_max_idxs[lane_id] : -1;
-		#pragma unroll
-		for ( int mask = 16; mask > 0; mask >>= 1 ) {
-			float other_val = __shfl_xor_sync( 0xffffffff, b_max, mask );
-			int other_idx = __shfl_xor_sync( 0xffffffff, b_idx, mask );
-			if ( other_val > b_max ) {
-				b_max = other_val;
-				b_idx = other_idx;
-			}
-		}
-		if ( lane_id == 0 ) {
-			out_idx[row] = b_idx < 0 ? -1 : b_idx + index_offset;
-			if ( out_val ) out_val[row] = b_max;
-		}
+	if ( block_argmax( max_val, max_idx ) ) {
+		out_idx[row] = max_idx < 0 ? -1 : max_idx + index_offset;
+		if ( out_val ) out_val[row] = max_val;
 	}
 }
 

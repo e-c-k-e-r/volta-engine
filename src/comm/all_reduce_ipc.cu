@@ -1,4 +1,5 @@
 #include "engine/core/comm.h"
+#include "engine/backend/cuda/reduce.cuh"
 #include <cuda_fp16.h>
 #include <cstdio>
 
@@ -147,10 +148,7 @@ void all_reduce_rms_norm_ring_kernel(
 	}
 
 	// Step 4: block-level reduction of sum_sq
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) {
-		local_sum_sq += __shfl_xor_sync( 0xffffffff, local_sum_sq, mask );
-	}
+	local_sum_sq = engine::math::warp_sum( local_sum_sq );
 
 	__shared__ float s_block_sum_sq;
 	__shared__ float s_warp_sums[8];
@@ -164,10 +162,7 @@ void all_reduce_rms_norm_ring_kernel(
 
 	if ( warp_id == 0 ) {
 		float warp_sum = ( lane_id < 8 ) ? s_warp_sums[lane_id] : 0.0f;
-		#pragma unroll
-		for ( int mask = 4; mask > 0; mask >>= 1 ) {
-			warp_sum += __shfl_xor_sync( 0xffffffff, warp_sum, mask );
-		}
+		warp_sum = engine::math::warp_sum<4>( warp_sum );
 		if ( lane_id == 0 ) {
 			s_block_sum_sq = rsqrtf( warp_sum / static_cast<float>( hidden_size ) + eps );
 		}
@@ -379,8 +374,7 @@ void all_reduce_gated_norm_kernel(
 		*reinterpret_cast<float4*>( xs ) = make_float4( v[0], v[1], v[2], v[3] );
 		*reinterpret_cast<float4*>( xs + 4 ) = make_float4( v[4], v[5], v[6], v[7] );
 	}
-	#pragma unroll
-	for ( int mask = 16; mask > 0; mask >>= 1 ) sq += __shfl_xor_sync( 0xffffffff, sq, mask );
+	sq = engine::math::warp_sum( sq );
 	__shared__ float s_part[8];
 	__shared__ float s_inv;
 	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;

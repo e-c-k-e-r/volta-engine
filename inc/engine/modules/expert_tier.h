@@ -56,6 +56,9 @@ struct ExpertTier {
 
 	// Sizes the tier for `experts` local experts per layer and the byte sizes of one expert's gate / up / down codes
 	void configure( int experts_per_layer, double fraction, const size_t bytes[3], const std::string& heat_file = std::string() );
+	// configure() for rank `rank` of `tp` (the heat file gets a .r<rank> suffix with more than one rank), plus the pinned host buffer for
+	// `layers` MoE layers' cold experts (one layer's worth when `streamed`) and the staging; host is created here
+	void start( int experts_per_layer, double fraction, const size_t bytes[3], int rank, int tp, int layers, bool streamed, pod::MemoryArena& host );
 	// The experts a layer starts with: the hottest ones of the saved counts when there are any, experts 0..resident - 1 otherwise
 	std::vector<int> initial_set( int layer ) const;
 	void save_heat();

@@ -17,6 +17,14 @@ double ExpertTier::resident_fraction() {
 	return runtime::options().expert_cache;
 }
 
+void ExpertTier::start( int experts_per_layer, double fraction, const size_t bytes[3], int rank, int tp, int layers, bool streamed, pod::MemoryArena& host ) {
+	const std::string& heat = runtime::options().expert_heat_file;
+	configure( experts_per_layer, fraction, bytes, heat.empty() ? std::string() : heat + ( tp > 1 ? ".r" + std::to_string( rank ) : std::string() ) );
+	const size_t cold = runtime::options().expert_synth ? 0 : streamed ? cold_bytes_per_layer() + 256 : static_cast<size_t>( layers ) * cold_bytes_per_layer();
+	ENGINE_ASSERT( engine::core::arena_create_pinned( host, cold + slot_bytes + 256 ), "ExpertTier: pinned expert tier allocation failed" );
+	allocate_staging( host );
+}
+
 void ExpertTier::configure( int experts_per_layer, double fraction, const size_t bytes[3], const std::string& heat_file ) {
 	experts = experts_per_layer;
 	resident = std::max( 1, std::min( experts, static_cast<int>( fraction * experts_per_layer + 0.5 ) ) );

@@ -1,4 +1,5 @@
 #include "engine/modules/nvfp4_moe.h"
+#include "engine/backend/cuda/activation.cuh"
 #include "engine/modules/moe.h"
 #include "nvfp4_common.cuh"
 #include <cstdint>
@@ -174,7 +175,7 @@ void nvfp4_moe_gate_up( NVFP4ExpertTable t, const half* __restrict__ x, const in
 			for ( int w = 0; w < WARPS; w++ ) { g += cs[( w * 2 + 0 ) * CS + threadIdx.x]; u += cs[( w * 2 + 1 ) * CS + threadIdx.x]; }
 			const float gh = __half2float( __float2half( g ) ), uh = __half2float( __float2half( u ) );
 			// act_limit > 0 (GLM): up clamped both ways, the activated gate from above (as exl3_moe_coop's act_gate)
-		float act = gh / ( 1.0f + __expf( -gh ) ), up = uh;
+		float act = engine::math::silu( gh ), up = uh;
 		if ( act_limit > 0.0f ) { up = fminf( fmaxf( up, -act_limit ), act_limit ); act = fminf( act, act_limit ); }
 		h[( size_t ) ROUTE_OF( c0 + ( threadIdx.x >> 5 ) ) * I + tile * 32 + ( threadIdx.x & 31 )] = __float2half( act * up );
 		}
