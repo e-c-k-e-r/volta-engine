@@ -10,7 +10,7 @@
 		"max_seq": 262144,
 		"max_slots": 2,
 		"kv_format": "nvfp4",
-		"expert_cache": 0,
+		"expert_cache": "auto",
 		"kv_pool": 262144,
 		"max_image_tokens": 0,
 		"nvfp4_dense_src": "/path/to/GLM-5.3-Flash-NVFP4",

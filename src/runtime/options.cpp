@@ -62,7 +62,7 @@ struct OptionInfo {
 // Range / enum checks that a plain parse cannot express
 bool valid( const char* name, const Options& o ) {
 	if ( !std::strcmp( name, "kv_format" ) ) return o.kv_format.empty() || o.kv_format == "fp16" || o.kv_format == "fp8" || o.kv_format == "k8v4" || o.kv_format == "nvfp4";
-	if ( !std::strcmp( name, "expert_cache" ) ) return o.expert_cache >= 0.0 && o.expert_cache <= 1.0;
+	if ( !std::strcmp( name, "expert_cache" ) ) return ( o.expert_cache > 0.0 && o.expert_cache <= 1.0 ) || o.expert_cache < 0.0;   // < 0 is "auto"
 	if ( !std::strcmp( name, "speculator" ) ) return o.speculator == "dflash" || o.speculator == "mtp";
 	if ( !std::strcmp( name, "mtp_depth" ) ) return o.mtp_depth >= 1 && o.mtp_depth <= 7;
 	if ( !std::strcmp( name, "log_level" ) ) return o.log_level == "error" || o.log_level == "warn" || o.log_level == "info" || o.log_level == "debug";
@@ -120,7 +120,8 @@ bool set_option( const std::string& key, const std::string& value ) {
 		// The launch file and --set come after the environment: say so when a variable that is set loses to them
 		const char* e = std::getenv( info.env.c_str() );
 		if ( e && value != e ) LOG_WARN( "[config] %s=%s is overridden by the launch file or --set (%s=%s)\n", info.env.c_str(), e, key.c_str(), value.c_str() );
-		return info.set( options(), value );
+		// "auto" for the expert cache is stored as -1 (a bare 0 would read as "no experts resident" and is rejected)
+		return info.set( options(), key == "expert_cache" && value == "auto" ? std::string( "-1" ) : value );
 	}
 	return false;
 }

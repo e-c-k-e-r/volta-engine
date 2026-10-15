@@ -129,7 +129,7 @@ bool Glm5NextPipeline::init(
 	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R, mtp_on_ );
 	// The fused decode kernels read cold experts from host memory a little slower than the persistent kernel (6.4 vs 6.8 tok/s at a
 	// 50% tier), but with most experts resident they are far faster (the persistent kernel costs ~11 ms a token more at 99% resident): only a
-	// small resident set keeps the persistent path. expert_cache=0 (auto) decides when the fraction is known
+	// small resident set keeps the persistent path. expert_cache=auto decides when the fraction is known
 #if !defined(USE_ROCM)
 	if ( const double f = engine::modules::ExpertTier::resident_fraction(); f > 0.0 && f < kFusedTierMinFraction ) state_.moe.coop_ctr = nullptr;
 #endif   // the ROCm build has no persistent kernel (its tensor-core path is emulated, 70 ms a layer): the fused launch serves the tier too
@@ -521,7 +521,7 @@ int Glm5NextPipeline::auto_resident( const engine::loader::SafeTensorsRepo& repo
 	const size_t head = mtp_on_ ? ( 768ULL << 20 ) : 0, margin = 256ULL << 20;
 	const size_t free_now = arena_->total_bytes - arena_->offset_bytes;
 	const size_t other = rest + extras + speculator + head + margin;
-	ENGINE_ASSERT( free_now > other, "Glm5NextPipeline: expert_cache=0 (auto): the arena cannot hold the other weights; set max_seq / kv_format smaller or give expert_cache" );
+	ENGINE_ASSERT( free_now > other, "Glm5NextPipeline: expert_cache=auto: the arena cannot hold the other weights; set max_seq / kv_format smaller or give expert_cache" );
 	// The remaining layers share what is left evenly; the estimate only improves, so the last layers take up the slack
 	const size_t per_resident = static_cast<size_t>( layers_left ) * slot_bytes;
 	const int floor_res = std::max( 1, experts / 10 );

@@ -91,7 +91,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	LOG_INFO( "Loading %s weights across %d GPUs from %s...\n", cfg.model_type.c_str(), tp_, cfg.model_dir.c_str() );
 	std::fflush( stdout );
 	pool_.start( tp_ );
-	// What a model sizing itself from the free arena (expert_cache=0) has to leave for the drafter
+	// What a model sizing itself from the free arena (expert_cache=auto) has to leave for the drafter
 	size_t draft_bytes = 0;
 	if ( !cfg.draft_model_dir.empty() && !( opt.speculator == "mtp" && cfg.speculate ) ) {
 		std::error_code ec;

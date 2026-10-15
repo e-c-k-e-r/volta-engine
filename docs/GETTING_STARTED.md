@@ -95,9 +95,9 @@ Qwen extras:
   buffers and caches (the latent cache 0.8 of them), 28.6 GiB of weights and the 0.6 GiB drafter, leaving 0.08 GiB; the startup log prints this
   as `[mem]` lines. The shared expert is cut over the ranks (`shared_slice`), which saves 0.4 GiB a GPU, and the attention workspace is sized
   for the 2K keys a row attends to once the indexer selects, not for the whole context. Verified at 200K (a 200K prompt: first token after 248 s;
-  two 128K prompts do not fit the pool together, so the second waits for the first) with GPU memory at 32.4 of 32.5 GiB. `configs/glm_256k.json` uses `expert_cache=0` instead, which leaves a margin
+  two 128K prompts do not fit the pool together, so the second waits for the first) with GPU memory at 32.4 of 32.5 GiB. `configs/glm_256k.json` uses `expert_cache=auto` instead, which leaves a margin
   on a different machine; each point of `expert_cache` costs 0.26 GiB, and the FP8 cache (`kv_format=fp8`, 1.2 GiB more) needs it below 1.
-  `--set expert_cache=0` picks the fraction itself: the largest the arena holds after the other weights, the drafter (its file size) and a 0.25 GiB
+  `--set expert_cache=auto` picks the fraction itself: the largest the arena holds after the other weights, the drafter (its file size) and a 0.25 GiB
   margin; the first MoE layer starts from a conservative estimate and each later layer re-estimates from what was actually loaded, so the last
   layers take up the slack (the log prints the plan and the resident range). GLM only; it uses the expert tier on any rank count.
   Prefill chunks (above 16 rows) copy each layer's cold experts once into device scratch, a layer ahead of the compute (`expert_stage`, on by

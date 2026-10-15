@@ -247,7 +247,7 @@ private:
 	int* d_kv_table_ = nullptr;
 	bool kv_dirty_ = false;
 	pod::KVPages kv_pages() const;
-	// expert_cache = 0, before the experts of a MoE layer: the experts per layer the arena can hold for this and the layers after it, from the
+	// expert_cache=auto, before the experts of a MoE layer: the experts per layer the arena can hold for this and the layers after it, from the
 	// bytes the layers loaded so far took, the checkpoint size of the layers still to come, the speculator and a margin
 	int auto_resident( const engine::loader::SafeTensorsRepo& repo, int layer, size_t layers_begin, size_t experts_cost, int layers_done, int experts, size_t slot_bytes, int moe_layers ) const;
 	void kv_prepare( const pod::BatchRows& rows, backend::stream_t stream );   // pages for the rows' positions, table on the device
