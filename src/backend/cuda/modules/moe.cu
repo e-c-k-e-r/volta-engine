@@ -249,50 +249,59 @@ void router_select_kernel(
 	}
 	__syncthreads();
 
-	// Top-k by warp 0: each lane owns experts lane, lane + 32, ...; k rounds of a warp argmax (ties go to the
-	// lowest expert index), removing the winner each round. Same descending order as the old selection sort.
-	if ( threadIdx.x < 32 ) {
-		const int lane = threadIdx.x;
-		bool taken[9];
+	// Top-k by rank, no sequential rounds (the selection of router_softmax_select_kernel): every warp ranks its 32 scores against each other,
+	// then the surviving candidates (at most top_k per warp) are ranked against each other. A rank counts the elements that beat the element
+	// (larger, or equal with the lower index), so the first top_k ranks are the selection, best first, ties to the lowest expert index
+	__shared__ __align__( 16 ) float s_cval[16 * 16];
+	__shared__ __align__( 16 ) int s_cidx[16 * 16];
+	__shared__ int s_sel[16];
+	for ( int c = threadIdx.x; c < 16 * 16; c += blockDim.x ) {
+		s_cval[c] = -INFINITY;
+		s_cidx[c] = 0x7fffffff;
+	}
+	__syncthreads();
+	{
+		const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+		float v = expert < num_experts ? s_select[expert] : -INFINITY;
+		v = v != v ? -INFINITY : v;
+		int rank = 0;
 		#pragma unroll
-		for ( int q = 0; q < 9; ++q ) taken[q] = false;
-		int sel[16];
-		for ( int i = 0; i < top_k; ++i ) {
-			float best = -INFINITY;
-			int best_idx = 0x7fffffff;
-			#pragma unroll
-			for ( int q = 0; q < 9; ++q ) {
-				const int e = lane + q * 32;
-				if ( e < num_experts && !taken[q] ) {
-					const float v = s_select[e];
-					if ( v > best || ( v == best && e < best_idx ) ) {
-						best = v;
-						best_idx = e;
-					}
-				}
-			}
-			#pragma unroll
-			for ( int off = 16; off > 0; off >>= 1 ) {
-				const float ov = __shfl_xor_sync( 0xffffffff, best, off );
-				const int oi = __shfl_xor_sync( 0xffffffff, best_idx, off );
-				if ( ov > best || ( ov == best && oi < best_idx ) ) {
-					best = ov;
-					best_idx = oi;
-				}
-			}
-			sel[i] = best_idx;
-			if ( ( best_idx & 31 ) == lane ) taken[best_idx >> 5] = true;
+		for ( int jj = 0; jj < 32; ++jj ) {
+			const float u = __shfl_sync( 0xffffffff, v, jj );
+			rank += ( u > v ) || ( u == v && jj < lane );
 		}
-		if ( lane == 0 ) {
-			float sum_scores = 0.0f;
-			for ( int i = 0; i < top_k; ++i ) {
-				sum_scores += s_raw[sel[i]];
-			}
-			const float inv_sum = routed_scaling_factor / ( sum_scores + 1e-9f );
-			for ( int i = 0; i < top_k; ++i ) {
-				topk_indices[i] = sel[i];
-				topk_weights[i] = __float2half_rn( s_raw[sel[i]] * inv_sum );
-			}
+		if ( rank < top_k && expert < num_experts ) {
+			s_cval[warp * 16 + rank] = v;
+			s_cidx[warp * 16 + rank] = expert;
+		}
+	}
+	__syncthreads();
+	if ( threadIdx.x < 16 * 16 ) {
+		const float v = s_cval[threadIdx.x];
+		const int vi = s_cidx[threadIdx.x];
+		int rank = 0, rank2 = 0;
+		#pragma unroll 8
+		for ( int c = 0; c < 16 * 16; c += 4 ) {
+			const float4 u = *reinterpret_cast<const float4*>( &s_cval[c] );
+			const int4 ui = *reinterpret_cast<const int4*>( &s_cidx[c] );
+			rank += ( u.x > v ) || ( u.x == v && ui.x < vi );
+			rank2 += ( u.y > v ) || ( u.y == v && ui.y < vi );
+			rank += ( u.z > v ) || ( u.z == v && ui.z < vi );
+			rank2 += ( u.w > v ) || ( u.w == v && ui.w < vi );
+		}
+		rank += rank2;
+		if ( rank < top_k && vi != 0x7fffffff ) s_sel[rank] = vi;
+	}
+	__syncthreads();
+	if ( threadIdx.x == 0 ) {
+		float sum_scores = 0.0f;
+		for ( int i = 0; i < top_k; ++i ) {
+			sum_scores += s_raw[s_sel[i]];
+		}
+		const float inv_sum = routed_scaling_factor / ( sum_scores + 1e-9f );
+		for ( int i = 0; i < top_k; ++i ) {
+			topk_indices[i] = s_sel[i];
+			topk_weights[i] = __float2half_rn( s_raw[s_sel[i]] * inv_sum );
 		}
 	}
 }
