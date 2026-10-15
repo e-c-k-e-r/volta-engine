@@ -34,21 +34,22 @@ void bench_model( const char* type, const char* dir, int steps ) {
 	for ( int i = 0; i < 4; ++i ) { mc.forward( &tok, 1, pos++, 0 ); tok = mc.sample_one(); } // warmup
 	// Profiler window (nvprof --profile-from-start off) covers steady-state M=1 decode only
 	const bool prof_a = std::getenv( "BENCH_PROF_A" ) != nullptr; // profile the M=8 block instead of M=1
-	if ( !prof_a ) CUDA_CHECK( cudaProfilerStart() );
+	const bool prof_b = std::getenv( "BENCH_PROF_B" ) != nullptr; // profile the multi-slot steps (Mode B) instead
+	if ( !prof_a && !prof_b ) CUDA_CHECK( cudaProfilerStart() );
 	auto t0 = std::chrono::steady_clock::now();
 	for ( int i = 0; i < steps; ++i ) {
 		mc.forward( &tok, 1, pos++, 0 );
 		tok = mc.sample_one();
 	}
 	const double m1_ms = test::ms_since( t0 ) / steps;
-	if ( !prof_a ) CUDA_CHECK( cudaProfilerStop() );
+	if ( !prof_a && !prof_b ) CUDA_CHECK( cudaProfilerStop() );
 
 	// Mode A: M=8 causal block (state rolled back each iteration)
 	const int iters = 16;
 	int block[8];
 	for ( int i = 0; i < 8; ++i ) block[i] = prompt[i];
 	int preds[pod::MAX_BATCH];
-	if ( prof_a ) CUDA_CHECK( cudaProfilerStart() );
+	if ( prof_a && !prof_b ) CUDA_CHECK( cudaProfilerStart() );
 	t0 = std::chrono::steady_clock::now();
 	// BENCH_SNAP=1 runs the block the way a speculative round does (per-row state snapshots on, a commit after).
 	const bool snap = std::getenv( "BENCH_SNAP" ) != nullptr;
@@ -68,7 +69,7 @@ void bench_model( const char* type, const char* dir, int steps ) {
 		}
 	}
 	const double m8_ms = test::ms_since( t0 ) / iters;
-	if ( prof_a ) CUDA_CHECK( cudaProfilerStop() );
+	if ( prof_a && !prof_b ) CUDA_CHECK( cudaProfilerStop() );
 
 	std::printf( "\n=== %s decode benchmark (TP=4) ===\n", type );
 	std::printf( "   M=1 decode        : %.2f ms/token (%.2f tok/s)\n", m1_ms, 1000.0 / m1_ms );
@@ -84,6 +85,7 @@ void bench_model( const char* type, const char* dir, int steps ) {
 			ids[s] = s;
 			positions[s] = static_cast<int>( prompt.size() );
 		}
+		if ( prof_b ) CUDA_CHECK( cudaProfilerStart() );
 		t0 = std::chrono::steady_clock::now();
 		const int b_steps = steps / 2;
 		for ( int i = 0; i < b_steps; ++i ) {
@@ -92,6 +94,7 @@ void bench_model( const char* type, const char* dir, int steps ) {
 			for ( int s = 0; s < slots; ++s ) positions[s]++;
 		}
 		const double b_ms = test::ms_since( t0 ) / b_steps;
+		if ( prof_b ) CUDA_CHECK( cudaProfilerStop() );
 		std::printf( "   Mode B x%d slots   : %.2f ms/step (%.1f aggregate tok/s)\n", slots, b_ms, slots * 1000.0 / b_ms );
 	}
 	mc.shutdown();
