@@ -198,17 +198,6 @@ bool DFlashSpeculator::init(
 	int ctx_res_shape[2] = { ctx_chunk_, H };
 	bb_ctx_resid_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, ctx_res_shape, 2 );
 
-	// 5. RoPE tables for the drafter's own query positions.
-	// The drafter's query positions are absolute sequence positions, so the table has to reach the
-	// target's whole context, not just one sliding window. Sized from sliding_window it ran off the
-	// end past ~2050 and fed q/k garbage cosines.
-	rope_len_ = MAX( MIN( config_.sliding_window + M + 8, 4096 ), 262144 );
-	int rope_shape[2] = { rope_len_, config_.head_dim / 2 };
-	d_rope_cos_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, rope_shape, 2 );
-	d_rope_sin_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, rope_shape, 2 );
-	build_rope_table( d_rope_cos_.ptr<float>(), d_rope_sin_.ptr<float>(), rope_len_,
-		config_.head_dim, config_.rope_theta, config_.rope_dim_sections, stream );
-
 	// Default dummy codebooks (for standalone benchmarks or tests without weights on disk)
 	// Only the output rank (0) runs the selector walk, so the other ranks of a TP drafter skip the 254 MiB.
 	if ( rank_ == 0 ) {
@@ -217,6 +206,11 @@ bool DFlashSpeculator::init(
 		succ_codebook_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, cb_shape, 2 );
 	}
 
+	if ( rank_ == 0 ) {
+		const size_t kv_bytes = 2 * static_cast<size_t>( kv_total ) * config_.num_hidden_layers * kv_heads_local * config_.head_dim * sizeof( half );
+		const size_t book_bytes = 2 * static_cast<size_t>( config_.vocab_size ) * sel_rank * sizeof( half );
+		LOG_INFO( "[mem] drafter rank 0: KV ring %.0f MiB, selector codebooks %.0f MiB (rank 0 only)\n", kv_bytes / 1048576.0, book_bytes / 1048576.0 );
+	}
 	initialized_ = true;
 	return true;
 }
@@ -240,6 +234,7 @@ __global__ void transpose_chunk_kernel( const half* src, half* dst, int N, int K
 
 // Dense FP16 [N, K] weight from an EXL3 tensor, by pushing the identity through the same Linear path the model uses (so
 // Hadamards, scales and the codebook come out exactly as at run time).
+static size_t g_dense_proj_bytes = 0;   // FP16 projections dequantized at load (the [mem] startup line reports them)
 static pod::TensorView dequant_dense( const pod::LinearWeight& lw, pod::MemoryArena& arena, cudaStream_t stream ) {
 	ENGINE_ASSERT( lw.is_valid() && lw.type == pod::QuantType::TRELLIS, "dflash2: projection is not an EXL3 tensor" );
 	const int K = lw.w1.shape[0]; // suh
@@ -247,6 +242,7 @@ static pod::TensorView dequant_dense( const pod::LinearWeight& lw, pod::MemoryAr
 	const int shape[2] = { N, K };
 	pod::TensorView dense = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
 	ENGINE_ASSERT( dense.data != nullptr, "dflash2: arena exhausted dequantizing a projection" );
+	g_dense_proj_bytes += static_cast<size_t>( N ) * K * sizeof( half );
 	constexpr int R = 256; // above the fused-GEMM row limit, so it takes the same dequantize + cuBLAS path as prefill
 	half *x = nullptr, *y = nullptr;
 	CUDA_CHECK( cudaMalloc( &x, (size_t) R * K * sizeof( half ) ) );
@@ -422,6 +418,7 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 	weights_loaded_ = true;
 	LOG_INFO( "[dflash] backbone loaded: %d layers, hidden %d, tp %d (rank %d), conv groups %d\n",
 		L, H, TP, R, config_.conv_groups() );
+	if ( rank_ == 0 ) LOG_INFO( "[mem] drafter rank 0: weights include %.0f MiB of dense FP16 projections (dequantized at load)\n", g_dense_proj_bytes / 1048576.0 );
 	return true;
 }
 

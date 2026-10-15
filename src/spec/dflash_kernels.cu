@@ -3,6 +3,7 @@
 #include "engine/modules/swiglu.h"
 #include "engine/modules/embedding.h"
 #include "engine/modules/linear.h"
+#include "engine/backend/cuda/rope_math.cuh"
 #include "../kernels/cuda/trellis/trellis_context.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -477,8 +478,7 @@ __global__ __launch_bounds__(256)
 void dflash_qk_norm_rope_kernel(
 	half* __restrict__ x,               // [rows, heads, head_dim]
 	const half* __restrict__ weight,    // [head_dim]
-	const float* __restrict__ rope_cos, // [max_pos, pairs]
-	const float* __restrict__ rope_sin,
+	float rope_theta,
 	int rows,
 	int heads,
 	int head_dim,
@@ -493,8 +493,6 @@ void dflash_qk_norm_rope_kernel(
 	const int pos = pos0 + row;
 
 	half* hrow = x + ( static_cast<int64_t>( row ) * heads + head ) * head_dim;
-	const float* cos_p = rope_cos + static_cast<int64_t>( pos ) * pairs;
-	const float* sin_p = rope_sin + static_cast<int64_t>( pos ) * pairs;
 	const int tid = threadIdx.x;
 
 	float local_sq = 0.0f;
@@ -538,8 +536,8 @@ void dflash_qk_norm_rope_kernel(
 		// checkpoint declares no other layout and both reference implementations (exllamav3 RopeStyle.NEOX,
 		// vLLM is_neox_style=True) default to this one; adjacent-pair rotation halves later-row acceptance.
 		const int p = ( i < pairs ) ? i : i - pairs;
-		const float c = cos_p[p];
-		const float s = sin_p[p];
+		float c, s;
+		engine::math::rope_cos_sin<false>( pos, p, 2 * pairs, rope_theta, c, s );
 		hrow[i] = __float2half_rn( ( i < pairs ) ? ( s_norm[i] * c - s_norm[i + pairs] * s )
 		                                         : ( s_norm[i] * c + s_norm[i - pairs] * s ) );
 	}
@@ -769,8 +767,7 @@ void dflash_cache_store(
 void dflash_qk_norm_rope(
 	half* x,
 	const half* weight,
-	const float* rope_cos,
-	const float* rope_sin,
+	float rope_theta,
 	int rows,
 	int heads,
 	int head_dim,
@@ -783,7 +780,7 @@ void dflash_qk_norm_rope(
 	if ( rows <= 0 || heads <= 0 ) return;
 	dim3 grid( heads, rows );
 	dflash_qk_norm_rope_kernel<<<grid, 256, 0, stream >>>(
-		x, weight, rope_cos, rope_sin, rows, heads, head_dim, pairs, pos0, eps, constant_bias );
+		x, weight, rope_theta, rows, heads, head_dim, pairs, pos0, eps, constant_bias );
 }
 
 #if defined(USE_ROCM)
@@ -1134,41 +1131,6 @@ void dflash2_topk_merge(
 		case 32: dflash2_topk_merge_kernel<32><<<rows, 32, 0, stream>>>( part_vals, part_ix, tp_size, rows, k, out_vals, out_ix, part_rows ); break;
 		default: ENGINE_ASSERT( false, "dflash2_topk_merge: unsupported k" );
 	}
-}
-
-// NeoX RoPE tables for the drafter's own query positions. rope_dim comes from the config's dimension
-// sections (Qwen3.8-27B drafter: [64,0,0,0] -> 64 rotary dims = 32 pairs out of head_dim 128).
-__global__ void build_rope_kernel( float* cos_table, float* sin_table, int len, int pairs, float theta ) {
-	int idx = blockIdx.x * blockDim.x + threadIdx.x;
-	const int total = len * pairs;
-	if ( idx >= total ) return;
-	const int pos = idx / pairs;
-	const int i = idx % pairs;
-	const float inv_freq = powf( theta, -2.0f * (float) i / (float) ( 2 * pairs ) );
-	const float angle = (float) pos * inv_freq;
-	cos_table[idx] = cosf( angle );
-	sin_table[idx] = sinf( angle );
-}
-
-void build_rope_table(
-	float* cos_table,
-	float* sin_table,
-	int len,
-	int head_dim,
-	float theta,
-	const int dim_sections[4],
-	cudaStream_t stream
-) {
-	// Sum the non-zero sections; a zero section means "not rotary" (pass-through dims).
-	int rope_dim = 0;
-	for ( int i = 0; i < 4; ++i ) rope_dim += dim_sections[i];
-	if ( rope_dim <= 0 ) rope_dim = head_dim;
-	rope_dim = MIN( rope_dim, head_dim );
-	const int pairs = rope_dim / 2;
-	const int total = len * pairs;
-	const int threads = 256;
-	build_rope_kernel<<<( total + threads - 1 ) / threads, threads, 0, stream >>>(
-		cos_table, sin_table, len, pairs, theta );
 }
 
 } // namespace engine::spec

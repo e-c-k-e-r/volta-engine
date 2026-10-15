@@ -1,5 +1,6 @@
 #include "engine/modules/qsa.h"
 #include "engine/modules/dsa.h"
+#include "engine/backend/cuda/rope_math.cuh"
 #include <cuda_fp16.h>
 #include <cmath>
 
@@ -25,7 +26,7 @@ __device__ __forceinline__ float rope_elem( float x, float partner_x, int d, int
 	if ( d >= rot_dim ) return x;
 	const int i = d % half_rot;
 	float s, c;
-	sincosf( static_cast<float>( pos ) * powf( theta, -( 2.0f * i / static_cast<float>( rot_dim ) ) ), &s, &c );
+	engine::math::rope_cos_sin<false>( pos, i, rot_dim, theta, c, s );
 	return d < half_rot ? x * c - partner_x * s : x * c + partner_x * s;
 }
 

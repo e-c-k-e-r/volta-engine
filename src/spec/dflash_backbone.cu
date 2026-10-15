@@ -39,8 +39,6 @@ void DFlashSpeculator::forward_backbone(
 	const int kv_total = ring_len_ + config_.block_size;
 	const int stride_slot = drafter_k_.shape[1] * drafter_k_.shape[2] * hd;
 	const int stride_layer = drafter_k_.shape[2] * hd;
-	const float* rc = d_rope_cos_.ptr<const float>();
-	const float* rs = d_rope_sin_.ptr<const float>();
 
 	// The cache ring's own K/V live in a separate tail, so passing kv_total as the "ring" keeps the
 	// single conditional subtract in the attention kernel correct for the context part while the own
@@ -97,7 +95,7 @@ void DFlashSpeculator::forward_backbone(
 				engine::modules::Linear::forward( ctx_n, ly.k_proj, kv_stage, stream );
 				dflash_qk_norm_rope( kv_stage.ptr<half>(),
 					( ly.k_norm.data != nullptr ) ? ly.k_norm.ptr<const half>() : nullptr,
-					rc, rs, cnt, kvh_local, hd, rope_pairs, ctx_pos0 + base,
+					config_.rope_theta, cnt, kvh_local, hd, rope_pairs, ctx_pos0 + base,
 					config_.rms_norm_eps, 0.0f, stream );
 				dflash_cache_store( drafter_k_.ptr<half>(), kv_stage.ptr<const half>(), cnt, kvh_local, hd,
 					slot0, ctx_ring, l, ctx_strides_slot, ctx_strides_layer, stream );
@@ -166,7 +164,7 @@ void DFlashSpeculator::forward_backbone(
 			engine::modules::Linear::forward( stage, ly.q_proj, q_out, stream );
 			dflash_qk_norm_rope( bb_q_.ptr<half>(),
 				( ly.q_norm.data != nullptr ) ? ly.q_norm.ptr<const half>() : nullptr,
-				rc, rs, rows, qh_local, hd, rope_pairs, block_pos0,
+				config_.rope_theta, rows, qh_local, hd, rope_pairs, block_pos0,
 				config_.rms_norm_eps, 0.0f, stream );
 
 			pod::TensorView kv_stage = pod::make_tensor_2d(
@@ -174,7 +172,7 @@ void DFlashSpeculator::forward_backbone(
 			engine::modules::Linear::forward( stage, ly.k_proj, kv_stage, stream );
 			dflash_qk_norm_rope( kv_stage.ptr<half>(),
 				( ly.k_norm.data != nullptr ) ? ly.k_norm.ptr<const half>() : nullptr,
-				rc, rs, rows, kvh_local, hd, rope_pairs, block_pos0,
+				config_.rope_theta, rows, kvh_local, hd, rope_pairs, block_pos0,
 				config_.rms_norm_eps, 0.0f, stream );
 			dflash_cache_store( drafter_k_.ptr<half>(), kv_stage.ptr<const half>(), rows, kvh_local, hd,
 				own_slot_, kv_total, l, stride_slot, stride_layer, stream );

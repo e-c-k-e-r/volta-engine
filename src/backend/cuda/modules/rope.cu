@@ -1,4 +1,5 @@
 #include "engine/modules/rope.h"
+#include "engine/backend/cuda/rope_math.cuh"
 #include <cuda_fp16.h>
 #include <cmath>
 
@@ -29,9 +30,8 @@ __global__ void rope_kernel(
 		const int comp = ( tid % 3 == 1 && tid < 33 ) ? 1 : ( ( tid % 3 == 2 && tid < 30 ) ? 2 : 0 );
 		pos = rows->rope_pos[comp][m];
 	}
-	float theta = static_cast<float>( pos ) * powf( freq_base, -( 2.0f * tid / static_cast<float>( rot_dim ) ) );
-	float cos_val = __cosf( theta );
-	float sin_val = __sinf( theta );
+	float cos_val, sin_val;
+	engine::math::rope_cos_sin<true>( pos, tid, rot_dim, freq_base, cos_val, sin_val );
 	int half_rot = rot_dim / 2;
 
 	half* q_m = q + static_cast<size_t>( m ) * num_q_heads * head_dim;

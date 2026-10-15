@@ -292,15 +292,10 @@ void test_qk_norm_rope( pod::MemoryArena& arena, int rows, int heads, int head_d
 	pod::TensorView x = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, xs, 3 );
 	int ws[1] = { head_dim };
 	pod::TensorView w = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ws, 1 );
-	int cs[2] = { pos0 + rows, pairs };
-	pod::TensorView rc = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, cs, 2 );
-	pod::TensorView rs = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, cs, 2 );
 	CUDA_CHECK( cudaMemcpy( x.data, h_x.data(), h_x.size() * 2, cudaMemcpyHostToDevice ) );
 	CUDA_CHECK( cudaMemcpy( w.data, h_w.data(), h_w.size() * 2, cudaMemcpyHostToDevice ) );
-	CUDA_CHECK( cudaMemcpy( rc.data, cos_t.data(), cos_t.size() * 4, cudaMemcpyHostToDevice ) );
-	CUDA_CHECK( cudaMemcpy( rs.data, sin_t.data(), sin_t.size() * 4, cudaMemcpyHostToDevice ) );
 
-	dflash_qk_norm_rope( x.ptr<half>(), w.ptr<const half>(), rc.ptr<const float>(), rs.ptr<const float>(),
+	dflash_qk_norm_rope( x.ptr<half>(), w.ptr<const half>(), theta,
 		rows, heads, head_dim, pairs, pos0, eps, 0.0f, nullptr );
 	CUDA_CHECK( cudaDeviceSynchronize() );
 	std::vector<half> h_out( h_x.size() );

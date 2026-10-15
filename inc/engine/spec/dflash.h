@@ -191,12 +191,12 @@ void dflash_rmsnorm_residual(
 );
 
 // Per-head RMSNorm then NeoX RoPE, in place, on the drafter's Q or K tensor. `pairs` is
-// head_dim*rotary_fraction/2; dims at or past 2*pairs pass through unrotated.
+// head_dim*rotary_fraction/2; dims at or past 2*pairs pass through unrotated. The rotation of position pos0 + row is computed in
+// the kernel from rope_theta (engine::math::rope_cos_sin), so no table is kept.
 void dflash_qk_norm_rope(
 	backend::half_t* x,
 	const backend::half_t* weight,
-	const float* rope_cos,
-	const float* rope_sin,
+	float rope_theta,
 	int rows,
 	int heads,
 	int head_dim,
@@ -258,18 +258,6 @@ void dflash_cache_store(
 	int layer,
 	int stride_slot,
 	int stride_layer,
-	backend::stream_t stream = nullptr
-);
-
-// NeoX RoPE tables for [len, head_dim/2] cos/sin, with the rotary width taken from the sum of the
-// non-zero dimension sections.
-void build_rope_table(
-	float* cos_table,
-	float* sin_table,
-	int len,
-	int head_dim,
-	float theta,
-	const int dim_sections[4],
 	backend::stream_t stream = nullptr
 );
 
@@ -469,8 +457,6 @@ private:
 	pod::TensorView bb_ctx_normed_; // [CTX_CHUNK, hidden] FP16
 	pod::TensorView bb_ctx_resid_;  // [CTX_CHUNK, hidden] FP32, discarded
 	// rope tables for the drafter's own positions
-	pod::TensorView d_rope_cos_, d_rope_sin_;   // [max_pos, head_dim/2]
-	int rope_len_ = 0;
 	// The projected context is a ring of ring_len_ slots; kv_pos0_ is the absolute position of
 	// logical slot 0. The block's own transient K/V live in the reserved tail starting at own_slot_.
 	int ring_len_ = 0;
