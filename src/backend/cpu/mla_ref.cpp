@@ -90,7 +90,7 @@ void MLALatent::store( const pod::KVRef& kv, const pod::TensorView& c, int layer
 }
 
 void MLALatent::attend( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
-	const pod::SlotRef& slot, float*, int, backend::stream_t, const int* sel_idx, const int* sel_n ) {
+	const pod::SlotRef& slot, float*, int, backend::stream_t, const int* sel_idx, const int* sel_n, int ) {
 	const backend::half_t* cache = static_cast<const backend::half_t*>( kv.k );
 	const bool quant = kv.kq != pod::KVQ::F16;   // a quantized cache is read in plain C++ for every row (the reference kernel is FP16 only)
 	ENGINE_ASSERT( slot.rows != nullptr && slot.row == 0, "MLALatent::attend (CPU): device-resolved positions starting at row 0" );

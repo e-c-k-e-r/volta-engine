@@ -223,8 +223,13 @@ bool Glm5NextPipeline::init(
 			ENGINE_ASSERT( latent_scales_ != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the latent scales" );
 			backend::memset_sync( latent_scales_, 0, scale_bytes );
 		}
-		latent_ws_ = static_cast<float*>( engine::core::arena_alloc( arena, engine::modules::MLALatent::workspace_floats( config_.max_seq, lh_ ) * sizeof( float ), 128 ) );
+		mem( "latent cache" );
+		// With the indexer on, a row attends to at most DSA::KPAD (~2.1K) keys: dense below the selection threshold, a selected list above it. The
+		// split-KV partials then need chunks for ~4K keys, not for the whole context
+		ws_seq_ = runtime::options().dsa ? std::min( config_.max_seq, 4096 ) : config_.max_seq;
+		latent_ws_ = static_cast<float*>( engine::core::arena_alloc( arena, engine::modules::MLALatent::workspace_floats( ws_seq_, lh_ ) * sizeof( float ), 128 ) );
 		ENGINE_ASSERT( latent_ws_ != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the latent workspace" );
+		mem( "attention split-KV workspace" );
 		int lat_shape[2] = { R, lh_ * 512 };
 		q_lat_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lat_shape, 2 );
 		o_lat_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, lat_shape, 2 );
@@ -246,6 +251,7 @@ bool Glm5NextPipeline::init(
 			ENGINE_ASSERT( dsa_plane_ && dsa_pool_ && dsa_proj_ && dsa_w_ && dsa_q_ && dsa_scores_ && dsa_idx_ && dsa_nk_, "Glm5NextPipeline::init: arena exhausted allocating the DSA state" );
 			backend::memset_sync( dsa_plane_, 0, static_cast<size_t>( S ) * dsa_plane_stride_ * sizeof( backend::half_t ) );
 			backend::memset_sync( dsa_pool_, 0, cache_slots * dsa_pool_stride_ * sizeof( backend::half_t ) );
+			mem( "DSA indexer planes, pooled keys and scratch" );
 		}
 	}
 
@@ -498,7 +504,14 @@ int Glm5NextPipeline::auto_resident( const engine::loader::SafeTensorsRepo& repo
 	for ( int l = 0; l < config_.num_layers; ++l ) total += repo.bytes_of( prefix( l ), { ".mlp.experts." } );
 	const size_t used = arena_->offset_bytes - layers_begin - experts_cost;
 	const double per_ckpt_byte = counted ? static_cast<double>( used ) / static_cast<double>( counted ) : 1.0;
-	const size_t rest = static_cast<size_t>( per_ckpt_byte * static_cast<double>( total > counted ? total - counted : 0 ) );
+	// The shared experts are cut over the ranks (shared_slice): only 1/tp of their checkpoint bytes land here
+	size_t shared_left = 0;
+	if ( hess_.empty() && runtime::options().shared_slice && config_.tp_size > 1 ) {
+		for ( int l = layer; l < config_.num_layers; ++l ) shared_left += repo.bytes_of( prefix( l ) + "mlp.shared_experts." );
+	}
+	const double shared_saved = static_cast<double>( shared_left ) * ( 1.0 - 1.0 / config_.tp_size );
+	const double rest_ckpt = std::max( 0.0, static_cast<double>( total > counted ? total - counted : 0 ) - shared_saved );
+	const size_t rest = static_cast<size_t>( per_ckpt_byte * rest_ckpt );
 	// The device-side tensors every expert keeps (signs, scales), resident or not
 	const size_t expert_all = repo.bytes_of( prefix( layer ) + "mlp.experts.0." );
 	const int layers_left = moe_layers - layers_done;
@@ -696,11 +709,14 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	const int GLM_CONV_RANK_CHANNELS[3] = { 8192 / config_.tp_size, 8192 / config_.tp_size, 8192 / config_.tp_size };
 
 	const size_t layers_begin = arena_->offset_bytes;
+	size_t wb_attn = 0, wb_router = 0, wb_shared = 0, wb_dense = 0;   // [mem] weights breakdown (rank 0 log)
 	size_t experts_cost = 0;   // arena bytes the experts took so far (codes in device slots, signs and scales)
 	int auto_base = 0;
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		auto& lw = layers_[L];
 		lw.is_moe = ( L >= 3 );
+		const size_t wb_layer0 = arena_->offset_bytes;
+		size_t wb_shared_start = 0;
 
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.input_layernorm.weight", L );
 		lw.input_norm = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
@@ -819,6 +835,8 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			}
 		}
 
+		const size_t wb_attn_end = arena_->offset_bytes;
+		wb_attn += wb_attn_end - wb_layer0;
 		if ( lw.is_moe ) {
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.gate.weight", L );
 			lw.router_weights = impl::load_router_weights_glm( repo, name_buf, *arena_, stream );
@@ -826,6 +844,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.gate.e_score_correction_bias", L );
 			lw.e_score_bias = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
 
+			wb_router += arena_->offset_bytes - wb_attn_end;
 			// 72 local experts for this rank
 			auto& mw = lw.moe_weights;
 			mw.type = pod::QuantType::TRELLIS;
@@ -912,16 +931,22 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			experts_cost += arena_->offset_bytes - experts_cost_from;
 
 			// Shared experts
+			wb_shared_start = arena_->offset_bytes;
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.gate_proj", L );
-			lw.shared_expert.gate = nv_on( "shared_gate" ) ? nv_slice( name_buf, true, 0, 1 ) : repo.load_linear( name_buf, *arena_, 4, stream );
+			// Sliced over the ranks like the tensor-parallel experts (gate / up by output width, down by input width): 1/tp of the weights on each
+			// rank instead of the whole shared expert on every rank for rank 0 to run. Hessian calibration keeps it whole on rank 0
+			const bool sh_slice = hess_.empty() && runtime::options().shared_slice;
+			const int sh_parts = sh_slice ? config_.tp_size : 1, sh_rank = sh_slice ? rank_ : 0;
+			lw.shared_sliced = sh_parts > 1;
+			lw.shared_expert.gate = nv_on( "shared_gate" ) ? nv_slice( name_buf, true, sh_rank, sh_parts ) : repo.load_linear_slice( name_buf, *arena_, 4, 1, sh_rank, sh_parts, stream );
 			lw.has_shared_expert = lw.shared_expert.gate.is_valid();
 
 			if ( lw.has_shared_expert ) {
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.up_proj", L );
-				lw.shared_expert.up = nv_on( "shared_up" ) ? nv_slice( name_buf, true, 0, 1 ) : repo.load_linear( name_buf, *arena_, 4, stream );
+				lw.shared_expert.up = nv_on( "shared_up" ) ? nv_slice( name_buf, true, sh_rank, sh_parts ) : repo.load_linear_slice( name_buf, *arena_, 4, 1, sh_rank, sh_parts, stream );
 
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.shared_experts.down_proj", L );
-				lw.shared_expert.down = nv_on( "shared_down" ) ? nv_slice( name_buf, true, 0, 1 ) : repo.load_linear( name_buf, *arena_, 4, stream );
+				lw.shared_expert.down = nv_on( "shared_down" ) ? nv_slice( name_buf, false, sh_rank, sh_parts ) : repo.load_linear_slice( name_buf, *arena_, 4, 0, sh_rank, sh_parts, stream );
 			}
 		}
 		else {
@@ -978,6 +1003,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			if ( !lw.kv_b_proj.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: kv_b_proj\n", rank_, L ); ++missing_count; }
 			if ( !lw.o_proj.is_valid() ) { LOG_ERROR( "[RANK %d L%d] MISSING: o_proj (mla)\n", rank_, L ); ++missing_count; }
 		}
+		( lw.is_moe ? wb_shared : wb_dense ) += arena_->offset_bytes - ( lw.is_moe ? wb_shared_start : wb_attn_end );
 		if ( lw.is_moe ) {
 			if ( !lw.router_weights.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: router_weights\n", rank_, L ); ++missing_count; }
 			if ( !lw.e_score_bias.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: e_score_bias\n", rank_, L ); ++missing_count; }
@@ -1097,6 +1123,12 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 
 	tier_.stage_init( *arena_ );
 	size_t bytes_after = arena_->offset_bytes;
+	if ( rank_ <= 1 ) {
+		constexpr double kGiB = 1073741824.0;
+		LOG_INFO( "[mem] rank %d weights: before the layers (lm_head, final norm) %.3f GiB, attention + norms + hyper-connections %.3f, routers %.3f, shared experts %.3f, dense MLPs %.3f, experts %.3f (codes, signs, scales), MTP head and the rest %.3f\n",
+			rank_, ( layers_begin - bytes_before ) / kGiB, wb_attn / kGiB, wb_router / kGiB, wb_shared / kGiB, wb_dense / kGiB, experts_cost / kGiB,
+			( bytes_after - layers_begin - wb_attn - wb_router - wb_shared - wb_dense - experts_cost ) / kGiB );
+	}
 	if ( rank_ == 0 && !tier_.layers.empty() ) {
 		int lo = tier_.experts, hi = 0;
 		double sum = 0.0;
@@ -1539,7 +1571,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 						sel_n = dsa_nk_;
 					}
 				}
-				engine::modules::MLALatent::attend( latent_ref(), q_lat, o_lat, mla_idx, config_.max_seq, m, lh_, kv_ref, latent_ws_, key_hint_, stream, sel_idx, sel_n );
+				engine::modules::MLALatent::attend( latent_ref(), q_lat, o_lat, mla_idx, config_.max_seq, m, lh_, kv_ref, latent_ws_, key_hint_, stream, sel_idx, sel_n, ws_seq_ );
 				static const bool dsa_diag = runtime::options().dsa_diag;
 				if ( dsa_diag && sel_idx != nullptr && m > pod::MAX_BATCH && rank_ == 0 && lh_ == 16 ) {
 					// Recall of the dense attention mass by the selection, last row of the chunk (eager prefill only)
@@ -1724,18 +1756,21 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 			);
 			if ( staged ) tier_.stage_end( layer - 3, stream );
 
-				// Shared expert (executed on rank 0, or partitioned)
-			if ( lw.has_shared_expert && rank_ == 0 ) {
+				// Shared expert: every rank runs its slice (the partial outputs meet in the all-reduce below), or rank 0 the whole of it
+			if ( lw.has_shared_expert && ( lw.shared_sliced || rank_ == 0 ) ) {
+				pod::TensorView sh_g = moe_gate_buf_, sh_u = moe_up_buf_, sh_i = moe_inter_buf_;
+				const int sh_n = lw.shared_sliced ? config_.intermediate_size / config_.tp_size : config_.intermediate_size;
+				sh_g.shape[1] = sh_u.shape[1] = sh_i.shape[1] = sh_n;
 				engine::modules::Linear::forward(
-					norm_hidden_, lw.shared_expert.gate, moe_gate_buf_, stream
+					norm_hidden_, lw.shared_expert.gate, sh_g, stream
 				);
 				engine::modules::Linear::forward(
-					norm_hidden_, lw.shared_expert.up, moe_up_buf_, stream
+					norm_hidden_, lw.shared_expert.up, sh_u, stream
 				);
-				engine::modules::SwiGLU::forward( moe_gate_buf_, moe_up_buf_, moe_inter_buf_, stream, 10.0f );
-				hessian( layer, 3, moe_inter_buf_.data, 2048, m, stream );
+				engine::modules::SwiGLU::forward( sh_g, sh_u, sh_i, stream, 10.0f );
+				hessian( layer, 3, sh_i.data, 2048, m, stream );
 				engine::modules::Linear::forward(
-					moe_inter_buf_, lw.shared_expert.down, moe_expert_out_, stream
+					sh_i, lw.shared_expert.down, moe_expert_out_, stream
 				);
 
 				engine::modules::MoERouter::accumulate(

@@ -33,11 +33,12 @@ struct MLALatent {
 	// workspace: MAX_BATCH * 16 * n_chunks * (512 + 2) floats with n_chunks = workspace_chunks( max_seq ).
 	static void attend( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
 		const pod::SlotRef& slot, float* workspace, int key_hint, backend::stream_t stream,
-		const int* sel_idx = nullptr, const int* sel_n = nullptr );   // DSA: per-row token lists (stride DSA::KPAD) and counts (-1 = dense row)
+		const int* sel_idx = nullptr, const int* sel_n = nullptr,   // DSA: per-row token lists (stride DSA::KPAD) and counts (-1 = dense row)
+		int ws_seq = 0 );   // context the workspace was sized for (workspace_floats( ws_seq ...)); 0 = max_seq. With DSA a dense row never has more than ~2.1K keys
 	static void attend( const backend::half_t* cache, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
 		const pod::SlotRef& slot, float* workspace, int key_hint, backend::stream_t stream,
-		const int* sel_idx = nullptr, const int* sel_n = nullptr ) {
-		attend( pod::kv_ref_f16( cache, cache ), q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n );
+		const int* sel_idx = nullptr, const int* sel_n = nullptr, int ws_seq = 0 ) {
+		attend( pod::kv_ref_f16( cache, cache ), q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n, ws_seq );
 	}
 	// Debug: dense logits of one row (n keys of a slot's layer cache) into scores[heads][n]
 	static void diag_scores( const backend::half_t* q_lat_row, const backend::half_t* cache_slot_layer, int n, int heads, float* scores, backend::stream_t stream );

@@ -123,6 +123,7 @@ struct Glm5NextLayerWeights {
 
 	// Shared expert
 	bool has_shared_expert = false;
+	bool shared_sliced = false;   // each rank holds 1/tp of the shared expert's width and adds its partial output before the all-reduce; otherwise rank 0 runs all of it
 	Glm5NextExpertWeights shared_expert;
 
 	// mHC (Manifold-Constrained Hyper-Connections)
@@ -255,6 +256,7 @@ private:
 	size_t latent_data_bytes( size_t elems ) const { return pod::kv_data_bytes( latent_q_, elems ); }
 	size_t latent_scale_bytes( size_t elems ) const { return pod::kv_scale_bytes( latent_q_, elems ); }
 	float* latent_ws_ = nullptr;      // split-KV partials
+	int ws_seq_ = 0;                  // context the workspace is sized for
 	pod::TensorView q_lat_;           // [rows, 16 * 512]
 	// DSA (ENGINE_DSA, default on with the latent cache): indexer planes and selection scratch
 	bool dsa_ = true;

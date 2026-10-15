@@ -50,7 +50,7 @@ void MLALatent::store( const pod::KVRef& kv, const pod::TensorView& c, int layer
 }
 
 void MLALatent::attend( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads, const pod::SlotRef& slot,
-	float*, int, backend::stream_t stream, const int* sel_idx, const int* sel_n ) {
+	float*, int, backend::stream_t stream, const int* sel_idx, const int* sel_n, int ) {
 	ENGINE_ASSERT( slot.rows != nullptr && slot.row == 0, "MLALatent::attend (Vulkan): device-resolved positions starting at row 0" );
 	vki::LatentAttnParams p{ vki::dp( q_lat.data ), vki::dp( kv.k ), vki::dp( o_lat.data ), vki::rows_slot( slot.rows ), vki::rows_pos( slot.rows ), vki::dp( sel_idx ), vki::dp( sel_n ),
 		static_cast<int64_t>( slot.stride ), layer, heads, max_seq, DSA::KPAD, ( sel_idx != nullptr && sel_n != nullptr ) ? 1 : 0, 1.0f / std::sqrt( static_cast<float>( HEAD ) ),

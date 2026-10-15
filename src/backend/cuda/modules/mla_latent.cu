@@ -1118,11 +1118,12 @@ void MLALatent::store( const pod::KVRef& kv, const pod::TensorView& c, int layer
 
 template <KVQ Q>
 void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
-	const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream, const int* sel_idx, const int* sel_n ) {
+	const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream, const int* sel_idx, const int* sel_n, int ws_seq ) {
 	const void* cache = kv.k;
 	const void* cscale = kv.ks;
 	ENGINE_ASSERT( heads % 16 == 0 && slot.rows != nullptr, "MLALatent::attend: a multiple of 16 heads, device-resolved positions" );
-	const int n_chunks = MLALatent::workspace_chunks( max_seq );
+	const int wseq = ws_seq > 0 ? ws_seq : max_seq;   // the context the workspace was sized for
+	const int n_chunks = MLALatent::workspace_chunks( wseq );
 	const float scale = 1.0f / sqrtf( static_cast<float>( MLALatent::HEAD ) );
 	const size_t smem = static_cast<size_t>( 16 ) * LORA * 4 + static_cast<size_t>( TILE ) * CS * 2 + ( 16 * TILE + 16 ) * 4;
 	static bool attr[ENGINE_NUM_GPUS] = {};
@@ -1151,7 +1152,7 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 			const size_t off = static_cast<size_t>( g ) * rows * 16 * LORA * sizeof( half );
 			qg.data = static_cast<char*>( q_lat.data ) + off;
 			og.data = static_cast<char*>( o_lat.data ) + off;
-			attend_q<Q>( kv, qg, og, layer, max_seq, rows, 16, slot, workspace, key_hint, stream, sel_idx, sel_n );
+			attend_q<Q>( kv, qg, og, layer, max_seq, rows, 16, slot, workspace, key_hint, stream, sel_idx, sel_n, ws_seq );
 		}
 		return;
 	}
@@ -1163,7 +1164,7 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 			sp_attr[device] = true;
 		}
 		int nsplit = rows < 160 ? std::min( ( 320 + rows - 1 ) / rows, decode_rows ? 32 : 8 ) : 1;
-		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > MLALatent::workspace_slots( max_seq, heads ) ) --nsplit;
+		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > MLALatent::workspace_slots( wseq, heads ) ) --nsplit;
 		latent_sparse_tc_kernel<Q><<<dim3( rows, nsplit, heads / 16 ), dim3( 256 ), LS_SMEM, stream>>>(
 			q_lat.ptr<const half>(), cache, cscale, o_lat.ptr<half>(), workspace, slot.stride, kv.pages, layer, max_seq, slot.rows, scale, nsplit, sel_idx, sel_n,
 			heads, static_cast<size_t>( rows ) * 16 * LORA );
@@ -1184,7 +1185,7 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 		int nsplit = 1;
 		if ( base_blocks < 160 ) nsplit = std::min( ( 320 + base_blocks - 1 ) / base_blocks, 8 );
 		if ( key_hint > 0 ) nsplit = std::max( 1, std::min( nsplit, key_hint / ( 4 * LT_BK ) ) );
-		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > MLALatent::workspace_slots( max_seq, heads ) ) --nsplit;
+		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > MLALatent::workspace_slots( wseq, heads ) ) --nsplit;
 		latent_prefill_tc_kernel<Q><<<dim3( base_blocks, nsplit ), dim3( 256 ), LT_SMEM, stream>>>(
 			q_lat.ptr<const half>(), cache, cscale, o_lat.ptr<half>(), workspace, slot.stride, kv.pages, layer, max_seq, slot.rows, rows, scale, nsplit );
 		if ( nsplit > 1 ) {
@@ -1204,12 +1205,12 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 }
 
 void MLALatent::attend( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorView& o_lat, int layer, int max_seq, int rows, int heads,
-	const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream, const int* sel_idx, const int* sel_n ) {
+	const pod::SlotRef& slot, float* workspace, int key_hint, cudaStream_t stream, const int* sel_idx, const int* sel_n, int ws_seq ) {
 	switch ( kv.kq ) {
-		case pod::KVQ::E5M2: attend_q<KVQ::E5M2>( kv, q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n ); break;
-		case pod::KVQ::I8: attend_q<KVQ::I8>( kv, q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n ); break;
-		case pod::KVQ::FP4: attend_q<KVQ::FP4>( kv, q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n ); break;
-		case pod::KVQ::F16: attend_q<KVQ::F16>( kv, q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n ); break;
+		case pod::KVQ::E5M2: attend_q<KVQ::E5M2>( kv, q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n, ws_seq ); break;
+		case pod::KVQ::I8: attend_q<KVQ::I8>( kv, q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n, ws_seq ); break;
+		case pod::KVQ::FP4: attend_q<KVQ::FP4>( kv, q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n, ws_seq ); break;
+		case pod::KVQ::F16: attend_q<KVQ::F16>( kv, q_lat, o_lat, layer, max_seq, rows, heads, slot, workspace, key_hint, stream, sel_idx, sel_n, ws_seq ); break;
 		default: ENGINE_ASSERT( false, "MLALatent::attend: cache format" ); break;
 	}
 }

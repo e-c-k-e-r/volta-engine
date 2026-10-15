@@ -89,12 +89,14 @@ Qwen extras:
   also inside Anthropic `tool_result` blocks; remote URLs are not fetched. GLM has its own tower (24 blocks, RMSNorm / SwiGLU, 2x2 conv merge); it is loaded last, into what is
   left of the arena. GLM with the DFlash2 drafter leaves about 5 MiB, so images stay off (the log says so and requests answer 400)
   unless memory is freed, for example `--set expert_cache=0.95` keeps 5% of the routed experts in host RAM.
-* **GLM at 256K context, 2 slots and the drafter** (4x 32 GB): the weights alone take 29.2 of the 31 GiB arena, so part of the routed
-  experts live in host RAM and the latent cache is stored in 4 bits:
-  `--set max_seq=262144 --set max_slots=2 --set kv_format=nvfp4 --set expert_cache=0.95 --speculative --draft-model-dir <DFlash2>`
-  (`configs/glm_256k.json`; images off). Per GPU the arena holds 2.8 GiB of buffers and caches (the latent cache and attention workspaces
-  2.2 of them), 27.3 GiB of weights at 95% of the experts resident and the 0.7 GiB drafter, leaving 0.2 GiB; the startup log prints this
-  as `[mem]` lines. Each point of `expert_cache` costs 0.26 GiB, and the FP8 cache (`kv_format=fp8`, 1.2 GiB more) fits only up to about 0.85.
+* **GLM at 256K context, 2 slots and the drafter** (4x 32 GB): the latent cache is stored in 4 bits and the two slots share one pool of 262144
+  tokens (`kv_pool`, below), and every routed expert fits on the GPUs: `--set max_seq=262144 --set max_slots=2 --set kv_format=nvfp4
+  --set kv_pool=262144 --set expert_cache=1.0 --speculative --draft-model-dir <DFlash2>` (images off). Per GPU the arena holds 1.7 GiB of
+  buffers and caches (the latent cache 0.8 of them), 28.6 GiB of weights and the 0.6 GiB drafter, leaving 0.08 GiB; the startup log prints this
+  as `[mem]` lines. The shared expert is cut over the ranks (`shared_slice`), which saves 0.4 GiB a GPU, and the attention workspace is sized
+  for the 2K keys a row attends to once the indexer selects, not for the whole context. Verified at 200K (a 200K prompt: first token after 248 s;
+  two 128K prompts do not fit the pool together, so the second waits for the first) with GPU memory at 32.4 of 32.5 GiB. `configs/glm_256k.json` uses `expert_cache=0` instead, which leaves a margin
+  on a different machine; each point of `expert_cache` costs 0.26 GiB, and the FP8 cache (`kv_format=fp8`, 1.2 GiB more) needs it below 1.
   `--set expert_cache=0` picks the fraction itself: the largest the arena holds after the other weights, the drafter (its file size) and a 0.25 GiB
   margin; the first MoE layer starts from a conservative estimate and each later layer re-estimates from what was actually loaded, so the last
   layers take up the slack (the log prints the plan and the resident range). GLM only; it uses the expert tier on any rank count.
