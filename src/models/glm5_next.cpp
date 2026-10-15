@@ -101,6 +101,10 @@ bool Glm5NextPipeline::init(
 	config_.kda_heads = lh_;
 	config_.kda_channels = lh_ * 3 * config_.kda_head_dim;
 	rank_ = rank;
+#if ENGINE_BACKEND_CUDA
+	backend::set_device( rank_ );
+	side_stream_ = backend::stream_create();
+#endif
 	arena_ = &arena;
 	ring_ = ring;
 	weights_loaded_ = false;
@@ -1792,6 +1796,30 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				}
 			}
 
+				// Shared expert: every rank runs its slice (the partial outputs meet in the all-reduce below), or rank 0 the whole of it. Decode rows on
+				// CUDA run it on a side stream beside the fused MoE kernels (they use no trellis workspace and the chain has its own buffers: the
+				// shared GEMVs fill 16 to 128 blocks, the experts the rest of the machine); the accumulate below waits for both
+			const bool shared_here = lw.has_shared_expert && ( lw.shared_sliced || rank_ == 0 );
+			const bool overlap = shared_here && side_stream_ != nullptr && m <= pod::MAX_BATCH && engine::modules::MoE::fused_decode( lw.moe_weights, state_.moe, m );
+			backend::stream_t sh_stream = overlap ? side_stream_ : stream;
+			if ( overlap ) backend::stream_fork( stream, sh_stream );
+			if ( shared_here ) {
+				pod::TensorView sh_g = moe_gate_buf_, sh_u = moe_up_buf_, sh_i = moe_inter_buf_;
+				const int sh_n = lw.shared_sliced ? config_.intermediate_size / config_.tp_size : config_.intermediate_size;
+				sh_g.shape[1] = sh_u.shape[1] = sh_i.shape[1] = sh_n;
+				engine::modules::Linear::forward(
+					norm_hidden_, lw.shared_expert.gate, sh_g, sh_stream
+				);
+				engine::modules::Linear::forward(
+					norm_hidden_, lw.shared_expert.up, sh_u, sh_stream
+				);
+				engine::modules::SwiGLU::forward( sh_g, sh_u, sh_i, sh_stream, 10.0f );
+				hessian( layer, 3, sh_i.data, 2048, m, sh_stream );
+				engine::modules::Linear::forward(
+					sh_i, lw.shared_expert.down, moe_expert_out_, sh_stream
+				);
+			}
+
 				// Routed experts in this rank's partition: device-resident dispatch, no host sync. A prefill chunk reads the layer's cold experts from device
 				// scratch, copied a layer ahead
 			const bool staged = m > pod::MAX_BATCH && tier_.prefill_staging() && tier_.stage_begin( layer - 3, stream );
@@ -1803,24 +1831,9 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				state_.moe, 10.0f, stream
 			);
 			if ( staged ) tier_.stage_end( layer - 3, stream );
+			if ( overlap ) backend::stream_join( stream, sh_stream );
 
-				// Shared expert: every rank runs its slice (the partial outputs meet in the all-reduce below), or rank 0 the whole of it
-			if ( lw.has_shared_expert && ( lw.shared_sliced || rank_ == 0 ) ) {
-				pod::TensorView sh_g = moe_gate_buf_, sh_u = moe_up_buf_, sh_i = moe_inter_buf_;
-				const int sh_n = lw.shared_sliced ? config_.intermediate_size / config_.tp_size : config_.intermediate_size;
-				sh_g.shape[1] = sh_u.shape[1] = sh_i.shape[1] = sh_n;
-				engine::modules::Linear::forward(
-					norm_hidden_, lw.shared_expert.gate, sh_g, stream
-				);
-				engine::modules::Linear::forward(
-					norm_hidden_, lw.shared_expert.up, sh_u, stream
-				);
-				engine::modules::SwiGLU::forward( sh_g, sh_u, sh_i, stream, 10.0f );
-				hessian( layer, 3, sh_i.data, 2048, m, stream );
-				engine::modules::Linear::forward(
-					sh_i, lw.shared_expert.down, moe_expert_out_, stream
-				);
-
+			if ( shared_here ) {
 				engine::modules::MoERouter::accumulate(
 					local_moe_out_.ptr<backend::half_t>(),
 					moe_expert_out_.ptr<const backend::half_t>(),
@@ -1997,6 +2010,8 @@ void Glm5NextPipeline::destroy() {
 		backend::set_device( rank_ );
 		hessian_dump();
 		graphs_.reset();
+		if ( side_stream_ != nullptr ) backend::stream_destroy( side_stream_ );
+		side_stream_ = nullptr;
 	}
 	engine::core::arena_destroy( host_arena_ );
 	if ( h_argmax_idx_ != nullptr ) {
