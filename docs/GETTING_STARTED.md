@@ -98,6 +98,9 @@ Qwen extras:
   `--set expert_cache=0` picks the fraction itself: the largest the arena holds after the other weights, the drafter (its file size) and a 0.25 GiB
   margin; the first MoE layer starts from a conservative estimate and each later layer re-estimates from what was actually loaded, so the last
   layers take up the slack (the log prints the plan and the resident range). GLM only; it uses the expert tier on any rank count.
+  Prefill chunks (above 16 rows) copy each layer's cold experts once into device scratch, a layer ahead of the compute (`expert_stage`, on by
+  default; 2 x the cold experts of a layer, 126 MiB at 90% resident), instead of reading them over PCIe from every row tile: 4096 tokens in chunks of
+  1024 ran at 534 tok/s against 306 at `expert_cache=0.9`, and 721 against 589 at 0.97.
   `--set kv_pool=262144` lets the two slots share one pool of that many tokens instead of owning 256K each (0.95 GiB per GPU less at the 4-bit
   cache, which the expert cache or the drafter can use): a request starts once the pool holds its prompt, otherwise it queues, and one that
   grows past the pool ends with finish reason `length`.

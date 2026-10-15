@@ -95,6 +95,84 @@ ExpertTier::~ExpertTier() {
 	save_heat();
 }
 
+void ExpertTier::stage_init( pod::MemoryArena& device ) {
+	if ( !active() || layers.empty() || runtime::options().expert_synth || runtime::options().expert_stream || !runtime::options().expert_stage ) return;
+	for ( const Layer& l : layers ) cold_max = std::max( cold_max, experts - static_cast<int>( l.owner.size() ) );
+	const size_t tables = layers.size() * 9 * static_cast<size_t>( experts ) * sizeof( void* );
+	const size_t need = 2 * static_cast<size_t>( cold_max ) * slot_bytes + tables + 4096;
+	if ( cold_max == 0 || device.total_bytes - device.offset_bytes < need ) {
+		if ( cold_max > 0 ) LOG_WARN( "[experts] prefill staging off: it needs %.2f GiB of the arena, %.2f GiB are free\n", need / 1073741824.0, ( device.total_bytes - device.offset_bytes ) / 1073741824.0 );
+		return;
+	}
+	for ( int i = 0; i < 2; ++i ) stage_buf[i] = static_cast<uint8_t*>( engine::core::arena_alloc( device, static_cast<size_t>( cold_max ) * slot_bytes, 256 ) );
+	for ( Layer& l : layers ) {
+		l.staged_dev = engine::core::arena_alloc( device, 9 * static_cast<size_t>( experts ) * sizeof( void* ), 256 );
+		CUDA_CHECK( cudaMemcpy( l.staged_dev, l.mw->device_ptrs, 9 * static_cast<size_t>( experts ) * sizeof( void* ), cudaMemcpyDeviceToDevice ) );
+	}
+	cudaStream_t cs = nullptr;
+	CUDA_CHECK( cudaStreamCreateWithFlags( &cs, cudaStreamNonBlocking ) );
+	copy_stream = cs;
+	for ( size_t i = 0; i < layers.size() + 2; ++i ) {
+		cudaEvent_t ev = nullptr;
+		CUDA_CHECK( cudaEventCreateWithFlags( &ev, cudaEventDisableTiming ) );
+		( i < layers.size() ? ev_ready : ev_free ).push_back( ev );
+	}
+	staging_on = true;
+	LOG_INFO( "[experts] prefill staging on: 2 x %d cold experts (%.0f MiB) in device scratch\n", cold_max, 2.0 * cold_max * slot_bytes / 1048576.0 );
+}
+
+void ExpertTier::stage_prefetch( int layer, cudaStream_t stream ) {
+	if ( !staging_on || layer < 0 || layer >= static_cast<int>( layers.size() ) ) return;
+	Layer& l = layers[layer];
+	if ( l.queued ) return;
+	std::vector<int> cold;
+	for ( int e = 0; e < experts; ++e ) if ( l.slot_of[e] < 0 ) cold.push_back( e );
+	if ( cold.empty() ) return;
+	const int parity = layer & 1;
+	if ( l.built != l.version ) {
+		// Gate, up and down code pointers (rows 0, 3, 6 of the table): resident experts keep their slots, cold ones go to their place in the stage buffer
+		std::vector<const void*> row( experts );
+		std::vector<int> rank( experts, -1 );
+		for ( size_t k = 0; k < cold.size(); ++k ) rank[cold[k]] = static_cast<int>( k );
+		size_t off = 0;
+		for ( int p = 0; p < 3; ++p ) {
+			for ( int e = 0; e < experts; ++e ) {
+				row[e] = l.slot_of[e] >= 0 ? static_cast<const void*>( l.slots + static_cast<size_t>( l.slot_of[e] ) * slot_bytes + off )
+				                           : static_cast<const void*>( stage_buf[parity] + static_cast<size_t>( rank[e] ) * slot_bytes + off );
+			}
+			CUDA_CHECK( cudaMemcpyAsync( static_cast<const void**>( l.staged_dev ) + static_cast<size_t>( 3 * p ) * experts, row.data(), experts * sizeof( void* ), cudaMemcpyHostToDevice, stream ) );
+			off += part_bytes[p];
+		}
+		l.built = l.version;
+	}
+	cudaStream_t cs = static_cast<cudaStream_t>( copy_stream );
+	CUDA_CHECK( cudaStreamWaitEvent( cs, static_cast<cudaEvent_t>( ev_free[parity] ), 0 ) );
+	for ( size_t k = 0; k < cold.size(); ++k ) {
+		CUDA_CHECK( cudaMemcpyAsync( stage_buf[parity] + k * slot_bytes, l.host[cold[k]], slot_bytes, cudaMemcpyHostToDevice, cs ) );
+	}
+	CUDA_CHECK( cudaEventRecord( static_cast<cudaEvent_t>( ev_ready[layer] ), cs ) );
+	l.queued = true;
+}
+
+bool ExpertTier::stage_begin( int layer, cudaStream_t stream ) {
+	if ( !staging_on ) return false;
+	stage_prefetch( layer, stream );
+	Layer& l = layers[layer];
+	if ( !l.queued ) return false;
+	CUDA_CHECK( cudaStreamWaitEvent( stream, static_cast<cudaEvent_t>( ev_ready[layer] ), 0 ) );
+	l.mw->staged_ptrs = l.staged_dev;
+	return true;
+}
+
+void ExpertTier::stage_end( int layer, cudaStream_t stream ) {
+	if ( !staging_on ) return;
+	Layer& l = layers[layer];
+	if ( !l.queued ) return;
+	CUDA_CHECK( cudaEventRecord( static_cast<cudaEvent_t>( ev_free[layer & 1] ), stream ) );
+	l.queued = false;
+	l.mw->staged_ptrs = nullptr;
+}
+
 void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, pod::MemoryArena& host, std::vector<int> resident_set ) {
 	Layer l;
 	l.mw = mw;
@@ -257,6 +335,7 @@ int ExpertTier::rebalance( int layer, cudaStream_t stream ) {
 			off += part_bytes[p];
 		}
 		++swaps;
+		++l.version;
 	}
 	return done;
 }

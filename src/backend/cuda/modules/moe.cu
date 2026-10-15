@@ -868,7 +868,7 @@ void MoE::forward(
 				weights.top_k
 			);
 
-			const void** d_ptrs = static_cast<const void**>( weights.device_ptrs );
+			const void** d_ptrs = static_cast<const void**>( weights.staged_ptrs != nullptr ? weights.staged_ptrs : weights.device_ptrs );
 			const uint16_t** gate_trellis = reinterpret_cast<const uint16_t**>( d_ptrs + 0 * E );
 			const half** gate_suh = reinterpret_cast<const half**>( d_ptrs + 1 * E );
 			const half** gate_svh = reinterpret_cast<const half**>( d_ptrs + 2 * E );

@@ -28,6 +28,12 @@ __attribute__(( weak )) int ExpertTier::swap_cap() const {
 // Nothing is tiered on this backend, so there is nothing to save
 __attribute__(( weak )) void ExpertTier::save_heat() {}
 
+// Staging is part of the host-memory tier: nothing to stage here
+__attribute__(( weak )) void ExpertTier::stage_init( pod::MemoryArena& ) {}
+__attribute__(( weak )) void ExpertTier::stage_prefetch( int, backend::stream_t ) {}
+__attribute__(( weak )) bool ExpertTier::stage_begin( int, backend::stream_t ) { return false; }
+__attribute__(( weak )) void ExpertTier::stage_end( int, backend::stream_t ) {}
+
 __attribute__(( weak )) ExpertTier::~ExpertTier() {}
 
 __attribute__(( weak )) void ExpertTier::start( int experts_per_layer, double fraction, const size_t bytes[3], int rank, int tp, int layers, bool streamed, pod::MemoryArena& host ) {

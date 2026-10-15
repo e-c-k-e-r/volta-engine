@@ -507,7 +507,16 @@ int Glm5NextPipeline::auto_resident( const engine::loader::SafeTensorsRepo& repo
 	ENGINE_ASSERT( free_now > other, "Glm5NextPipeline: expert_cache=0 (auto): the arena cannot hold the other weights; set max_seq / kv_format smaller or give expert_cache" );
 	// The remaining layers share what is left evenly; the estimate only improves, so the last layers take up the slack
 	const size_t per_resident = static_cast<size_t>( layers_left ) * slot_bytes;
-	const int resident = std::max( std::max( 1, experts / 10 ), std::min( experts, static_cast<int>( ( free_now - other ) / per_resident ) ) );
+	const int floor_res = std::max( 1, experts / 10 );
+	auto fit = [&]( size_t reserved ) { return std::max( floor_res, std::min( experts, static_cast<int>( free_now > other + reserved ? ( free_now - other - reserved ) / per_resident : 0 ) ) ); };
+	// Prefill staging keeps two layers' cold experts in device scratch (sized by the first layer's count): leave room for it
+	const bool stage = runtime::options().expert_stage && !runtime::options().expert_stream;
+	int resident = fit( 0 );
+	if ( stage ) {
+		const int base = tier_.resident > 0 ? tier_.resident : resident;
+		resident = fit( 2 * static_cast<size_t>( experts - base ) * slot_bytes );
+		if ( tier_.resident == 0 ) resident = fit( 2 * static_cast<size_t>( experts - resident ) * slot_bytes );
+	}
 	if ( rank_ == 0 && layers_done == 0 ) {
 		LOG_INFO( "[experts] expert_cache auto: %d of %d experts per layer resident to start (%.1f%%), later layers take what the refined estimate leaves. Arena free %.2f GiB; still to load: other weights %.2f, expert scales %.2f, speculator %.2f%s; margin %.2f\n",
 			resident, experts, 100.0 * resident / experts, free_now / kGiB, rest / kGiB, extras / kGiB, speculator / kGiB, mtp_on_ ? " + MTP head 0.75" : "", margin / kGiB );
@@ -1079,6 +1088,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		if ( rank_ == 0 ) LOG_INFO( "[RANK 0] MTP head from the NVFP4 checkpoint: layer %d, %d experts quantized to NVFP4 (this rank's %s)\n", L, head_experts, moe_tp_ ? "slice" : "whole experts" );
 	}
 
+	tier_.stage_init( *arena_ );
 	size_t bytes_after = arena_->offset_bytes;
 	if ( rank_ == 0 && !tier_.layers.empty() ) {
 		int lo = tier_.experts, hi = 0;
@@ -1695,13 +1705,17 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				}
 			}
 
-				// Routed experts in this rank's partition: device-resident dispatch, no host sync
+				// Routed experts in this rank's partition: device-resident dispatch, no host sync. A prefill chunk reads the layer's cold experts from device
+				// scratch, copied a layer ahead
+			const bool staged = m > pod::MAX_BATCH && tier_.prefill_staging() && tier_.stage_begin( layer - 3, stream );
+			if ( staged && layer + 1 < config_.num_layers ) tier_.stage_prefetch( layer - 2, stream );
 			engine::modules::MoE::forward(
 				norm_hidden_, lw.moe_weights,
 				state_.d_topk_indices, state_.d_topk_weights,
 				local_moe_out_, start_expert, end_expert,
 				state_.moe, 10.0f, stream
 			);
+			if ( staged ) tier_.stage_end( layer - 3, stream );
 
 				// Shared expert (executed on rank 0, or partitioned)
 			if ( lw.has_shared_expert && rank_ == 0 ) {

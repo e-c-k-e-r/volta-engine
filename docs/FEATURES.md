@@ -39,6 +39,7 @@ The model type is read from the checkpoint, never configured. Anything else is a
 | Feature | Status | Option | Covered by |
 |---|---|---|---|
 | FP16 KV cache | default | | `test_attention`, `test_attention_prefill` |
+| Prefill staging of cold experts (device scratch, copied a layer ahead) | on | `expert_stage` | `test_glm_rows`, `bench_prefill` |
 | Shared KV token pool for all slots (GLM: latent cache and indexer keys in pages of 512 tokens, admission by free pages, length finish when full) | opt-in | `kv_pool` | `test_kv_pages` |
 | FP8 / int8 (`k8v4`) / NVFP4 KV (CPU and Vulkan builds included) | opt-in | `kv_format` | `test_kv_quant`, `test_mla_latent`, `test_ops_attention`, `test_ops_flash` |
 | Tensor-core attention for prefill, decode and verify rows (Qwen); tensor-core latent attention (GLM) | default | | `test_attention*`, `test_mla_latent`, `bench_decode` |

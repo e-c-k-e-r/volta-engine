@@ -31,6 +31,9 @@ struct ExpertTier {
 		std::vector<uint64_t> total;         // route counts since the first run (saved to / seeded from expert_heat_file)
 		struct Src { int fd = -1; size_t off = 0, bytes = 0; };
 		std::vector<Src> src;                // expert * 3 + part: where a cold expert's codes are in the checkpoint (expert_stream)
+		void* staged_dev = nullptr;          // prefill: the 9 x experts pointer table with the cold experts' codes pointing into the stage buffer
+		int version = 0, built = -1;         // residency changes (swaps) against the version staged_dev was built for
+		bool queued = false;                 // the stage copy of this layer is issued and not yet consumed
 	};
 
 	int experts = 0;
@@ -46,7 +49,20 @@ struct ExpertTier {
 	std::vector<uint64_t> seed;              // [layer][expert] counts read from heat_path
 	int rebalances = 0;
 	bool heat_dirty = false;
+	// Prefill staging: a prefill chunk's MoE kernel reads every cold expert's codes once per row tile, over the shared PCIe link. With staging a
+	// layer's cold experts are copied once into one of two device buffers (on a copy stream, a layer ahead of the compute) and the kernel reads
+	// them from there. stage_init after all layers are added and their pointer tables built; it turns itself off when the arena has no room
+	std::vector<void*> ev_ready, ev_free;
+	void* copy_stream = nullptr;
+	uint8_t* stage_buf[2] = {};
+	int cold_max = 0;
+	bool staging_on = false;
 	~ExpertTier();
+	void stage_init( pod::MemoryArena& device );
+	bool prefill_staging() const { return staging_on; }
+	void stage_prefetch( int layer, backend::stream_t stream );   // issue the copy of the layer's cold experts (idempotent until stage_end)
+	bool stage_begin( int layer, backend::stream_t stream );      // the layer's MoE then reads the staged copy; false: nothing cold, run as usual
+	void stage_end( int layer, backend::stream_t stream );        // after the layer's MoE kernel
 
 	// ENGINE_EXPERT_CACHE: fraction of each layer's experts kept resident (1 or unset: tiering off)
 	static double resident_fraction();
