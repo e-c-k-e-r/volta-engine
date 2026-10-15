@@ -113,6 +113,15 @@ void hc_mix_partials_kernel(
 	hc_mix_partials_body<H, M_, FN_T>( streams, fn, row_len, chunk_cols );
 }
 
+// 1 / x without __fdividef's scaling of tiny operands: the same bits whenever the operand is a normal float, which every
+// divisor of the Sinkhorn is (sums of positive terms and hc_eps); the chain on one thread is a third shorter
+__device__ __forceinline__
+float rcp_ftz( const float x ) {
+	float r;
+	asm( "rcp.approx.ftz.f32 %0, %1;" : "=f"( r ) : "f"( x ) );
+	return r;
+}
+
 template <int H, int M_, bool HEAD, bool HALF_OUT>
 __device__ __forceinline__
 void hc_mix_finalize_body(
@@ -193,27 +202,27 @@ void hc_mix_finalize_body(
 				for ( int k = 0; k < H; ++k ) e[k] = __expf( e[k] - m );
 				const float sum = ( e[0] + e[1] ) + ( e[2] + e[3] );
 				#pragma unroll
-				for ( int k = 0; k < H; ++k ) v[g][k] = __fdividef( e[k], sum ) + hc_eps;
+				for ( int k = 0; k < H; ++k ) v[g][k] = e[k] * rcp_ftz( sum ) + hc_eps;
 			}
 			// column normalize, then (iters - 1) x (row, column)
 			#pragma unroll
 			for ( int k = 0; k < H; ++k ) {
 				const float cs = ( v[0][k] + v[1][k] ) + ( v[2][k] + v[3][k] );
 				#pragma unroll
-				for ( int g = 0; g < H; ++g ) v[g][k] = __fdividef( v[g][k], cs + hc_eps );
+				for ( int g = 0; g < H; ++g ) v[g][k] = v[g][k] * rcp_ftz( cs + hc_eps );
 			}
 			for ( int it = 0; it < sinkhorn_iters - 1; ++it ) {
 				#pragma unroll
 				for ( int g = 0; g < H; ++g ) {
 					const float rs = ( v[g][0] + v[g][1] ) + ( v[g][2] + v[g][3] );
 					#pragma unroll
-					for ( int k = 0; k < H; ++k ) v[g][k] = __fdividef( v[g][k], rs + hc_eps );
+					for ( int k = 0; k < H; ++k ) v[g][k] = v[g][k] * rcp_ftz( rs + hc_eps );
 				}
 				#pragma unroll
 				for ( int k = 0; k < H; ++k ) {
 					const float cs = ( v[0][k] + v[1][k] ) + ( v[2][k] + v[3][k] );
 					#pragma unroll
-					for ( int g = 0; g < H; ++g ) v[g][k] = __fdividef( v[g][k], cs + hc_eps );
+					for ( int g = 0; g < H; ++g ) v[g][k] = v[g][k] * rcp_ftz( cs + hc_eps );
 				}
 			}
 			float4* out = reinterpret_cast<float4*>( comb + static_cast<size_t>( r ) * H * H );
