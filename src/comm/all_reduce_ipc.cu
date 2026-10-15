@@ -403,6 +403,100 @@ void all_reduce_gated_norm_kernel(
 	ar_retire_n( flags[rank], seq, gridDim.x * gridDim.y );
 }
 
+// all_reduce_ring_kernel followed by the mHC post-step (HyperConnection::update with a comb matrix): x[r, h, :] = post[r, h] * y[r, :] + sum_g comb[r, g, h] *
+// x[r, g, :] over the fp32 streams x [rows, 4, hidden], in the same fma order as hc_apply_kernel. Grid (rows, column groups): every block publishes the whole row
+// (idempotent, as in all_reduce_gated_norm_kernel), then updates its own columns of all four streams, so the in-place update never crosses a block. y is not
+// written back.
+constexpr int AR_HC_GROUPS = 4;
+template <int NR>
+__global__ __launch_bounds__( 256 )
+void all_reduce_hc_apply_kernel(
+	int rank,
+	const void* __restrict__ p0, const void* __restrict__ p1, const void* __restrict__ p2, const void* __restrict__ p3,
+	uint32_t* __restrict__ f0, uint32_t* __restrict__ f1, uint32_t* __restrict__ f2, uint32_t* __restrict__ f3,
+	const half* __restrict__ y,
+	float* __restrict__ x,
+	const float* __restrict__ post,
+	const float* __restrict__ comb,
+	int hidden_size
+) {
+	const int row = blockIdx.x;
+	const size_t row_elems = static_cast<size_t>( hidden_size );
+	const size_t n4 = row_elems / 8;
+
+	const void* peer_slots[4] = { p0, p1, p2, p3 };
+	uint32_t* flags[4] = { f0, f1, f2, f3 };
+	const uint32_t seq = ar_next_seq( flags[rank] );
+	const uint32_t stage = seq & 3;
+	uint8_t* my_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[rank] ) ) + ( (size_t) stage * 4 + rank ) * IPC_SLOT_BYTES;
+	uint4* my_slot = reinterpret_cast<uint4*>( my_staging ) + row * n4;
+	const uint4* src_y = ( (const uint4*) ( y + row * row_elems ) );
+	for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) my_slot[i] = src_y[i];
+	__threadfence_system();
+	__syncthreads();
+	if ( threadIdx.x == 0 ) {
+		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
+		for ( int p = 0; p < NR; ++p ) {
+			if ( p == rank ) continue;
+			while ( ldg_acquire_sys_u32( ar_flag( flags[p], stage, row, p ) ) < seq ) __nanosleep( 32 );
+		}
+	}
+	__syncthreads();
+
+	const uint4* r_ptrs[NR];
+	#pragma unroll
+	for ( int offset = 0; offset < NR; ++offset ) {
+		const int p = ( rank + offset ) % NR;
+		uint8_t* p_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[p] ) ) + ( (size_t) stage * 4 + p ) * IPC_SLOT_BYTES;
+		r_ptrs[offset] = reinterpret_cast<const uint4*>( p_staging ) + row * n4;
+	}
+
+	float post_r[4], comb_r[4][4];
+	#pragma unroll
+	for ( int h = 0; h < 4; ++h ) {
+		post_r[h] = post[static_cast<size_t>( row ) * 4 + h];
+		#pragma unroll
+		for ( int g = 0; g < 4; ++g ) comb_r[h][g] = comb[( static_cast<size_t>( row ) * 4 + h ) * 4 + g];
+	}
+	const size_t per = ( n4 + gridDim.y - 1 ) / gridDim.y;
+	const size_t u_end = min( n4, ( blockIdx.y + 1 ) * per );
+	float* x_row = x + static_cast<size_t>( row ) * 4 * row_elems;
+	for ( size_t i = blockIdx.y * per + threadIdx.x; i < u_end; i += blockDim.x ) {
+		__half hp[NR][8];
+		#pragma unroll
+		for ( int r = 0; r < NR; ++r ) *reinterpret_cast<uint4*>( hp[r] ) = r_ptrs[r][i];
+		float yk[8];
+		#pragma unroll
+		for ( int k = 0; k < 8; ++k ) {
+			float sum = __half2float( hp[0][k] );
+			#pragma unroll
+			for ( int r = 1; r < NR; ++r ) sum += __half2float( hp[r][k] );
+			yk[k] = __half2float( __float2half_rn( sum ) );   // y is stored as fp16 between the reduction and the update
+		}
+		float xv[4][8];
+		#pragma unroll
+		for ( int g = 0; g < 4; ++g ) {
+			const float4 a0 = *reinterpret_cast<const float4*>( x_row + g * row_elems + i * 8 );
+			const float4 a1 = *reinterpret_cast<const float4*>( x_row + g * row_elems + i * 8 + 4 );
+			xv[g][0] = a0.x; xv[g][1] = a0.y; xv[g][2] = a0.z; xv[g][3] = a0.w;
+			xv[g][4] = a1.x; xv[g][5] = a1.y; xv[g][6] = a1.z; xv[g][7] = a1.w;
+		}
+		#pragma unroll
+		for ( int h = 0; h < 4; ++h ) {
+			float o[8];
+			#pragma unroll
+			for ( int k = 0; k < 8; ++k ) {
+				o[k] = post_r[h] * yk[k];
+				#pragma unroll
+				for ( int g = 0; g < 4; ++g ) o[k] = fmaf( comb_r[g][h], xv[g][k], o[k] );
+			}
+			*reinterpret_cast<float4*>( x_row + h * row_elems + i * 8 ) = make_float4( o[0], o[1], o[2], o[3] );
+			*reinterpret_cast<float4*>( x_row + h * row_elems + i * 8 + 4 ) = make_float4( o[4], o[5], o[6], o[7] );
+		}
+	}
+	ar_retire_n( flags[rank], seq, gridDim.x * gridDim.y );
+}
+
 void CollectiveRing::init(
 	int local_rank,
 	int ranks,
@@ -509,6 +603,24 @@ void CollectiveRing::all_reduce_gated_norm(
 		static_cast<uint32_t*>( sync_flags[0] ), static_cast<uint32_t*>( sync_flags[1] ), static_cast<uint32_t*>( sync_flags[2] ), static_cast<uint32_t*>( sync_flags[3] ),
 		y.ptr<const half>(), streams, post, reinterpret_cast<const half*>( norm_w ), normed, hidden_size, hc, eps,
 		reinterpret_cast<const half*>( addend ), addend_gate );
+}
+
+void CollectiveRing::all_reduce_hc_apply(
+	pod::TensorView& y,
+	float* streams,
+	const float* post,
+	const float* comb,
+	cudaStream_t stream
+) {
+	const int rows = y.shape[0];
+	const int hidden_size = y.shape[1];
+	ENGINE_ASSERT( rows >= 1 && rows <= AR_MAX_ROWS && static_cast<size_t>( rows ) * hidden_size * sizeof( half ) <= IPC_SLOT_BYTES, "all_reduce_hc_apply: rows out of range" );
+	ENGINE_ASSERT( hidden_size % 128 == 0, "all_reduce_hc_apply: hidden_size" );
+	auto kernel = ( nranks == 2 ) ? all_reduce_hc_apply_kernel<2> : all_reduce_hc_apply_kernel<4>;
+	kernel<<<dim3( rows, AR_HC_GROUPS ), dim3( 256 ), 0, stream>>>(
+		rank, peer_ptrs[0], peer_ptrs[1], peer_ptrs[2], peer_ptrs[3],
+		static_cast<uint32_t*>( sync_flags[0] ), static_cast<uint32_t*>( sync_flags[1] ), static_cast<uint32_t*>( sync_flags[2] ), static_cast<uint32_t*>( sync_flags[3] ),
+		y.ptr<const half>(), streams, post, comb, hidden_size );
 }
 
 void init_4gpu_mesh(

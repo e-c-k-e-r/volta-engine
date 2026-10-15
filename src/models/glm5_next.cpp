@@ -1454,6 +1454,14 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 	int experts_per_rank = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
 	int start_expert = moe_tp_ ? 0 : rank_ * experts_per_rank;
 	int end_expert = start_expert + experts_per_rank;
+#if ENGINE_BACKEND_CUDA
+	// Decode-sized rows: the all-reduce of a sublayer output and the mHC post-step that consumes it run as one kernel
+	static const bool hc_fuse = runtime::options().hc_fuse && runtime::options().trace_layers.empty() && runtime::options().hessian_dir.empty();
+	const bool fuse_reduce_update = hc_fuse && m <= pod::MAX_BATCH;
+#else
+	const bool fuse_reduce_update = false;
+#endif
+	const bool fuse_ffn_reduce = fuse_reduce_update && ring_ != nullptr && lw.hc_ffn_fn.data != nullptr && ( lw.is_moe || lw.dense_sliced );
 
 	// Debug (trace_layers): header (tag, rows, first position) then the last row's four streams; tag = layer after the layer, 100 + layer after attention
 	static const std::string& trace_path = runtime::options().trace_layers;
@@ -1548,19 +1556,25 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				);
 			}
 
-			if ( ring_ ) {
-				ring_->all_reduce( attn_out_, stream );
-			}
-
-			if ( lw.hc_attn_fn.data != nullptr ) {
-				// mHC post-step: attention update
-				engine::modules::HyperConnection::update(
-					hidden_streams_, attn_out_, mhc_post_, mhc_comb_, H, stream, m
-				);
+			if ( ring_ && lw.hc_attn_fn.data != nullptr && fuse_reduce_update ) {
+				// the all-reduce and the mHC post-step (attention update) in one kernel
+				ring_->all_reduce_hc_apply( attn_out_, hidden_streams_.ptr<float>(), mhc_post_.ptr<const float>(), mhc_comb_.ptr<const float>(), stream );
 			}
 			else {
-				// Residual connection: hidden_states += attn_out
-				engine::modules::Elementwise::add_residual( hidden_states_, attn_out_, stream );
+				if ( ring_ ) {
+					ring_->all_reduce( attn_out_, stream );
+				}
+
+				if ( lw.hc_attn_fn.data != nullptr ) {
+					// mHC post-step: attention update
+					engine::modules::HyperConnection::update(
+						hidden_streams_, attn_out_, mhc_post_, mhc_comb_, H, stream, m
+					);
+				}
+				else {
+					// Residual connection: hidden_states += attn_out
+					engine::modules::Elementwise::add_residual( hidden_states_, attn_out_, stream );
+				}
 			}
 		}
 		else if ( lw.is_mla && lw.q_a.is_valid() ) {
@@ -1670,19 +1684,25 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				);
 			}
 
-			if ( ring_ ) {
-				ring_->all_reduce( attn_out_, stream );
-			}
-
-			if ( lw.hc_attn_fn.data != nullptr ) {
-				// mHC post-step: attention update
-				engine::modules::HyperConnection::update(
-					hidden_streams_, attn_out_, mhc_post_, mhc_comb_, H, stream, m
-				);
+			if ( ring_ && lw.hc_attn_fn.data != nullptr && fuse_reduce_update ) {
+				// the all-reduce and the mHC post-step (attention update) in one kernel
+				ring_->all_reduce_hc_apply( attn_out_, hidden_streams_.ptr<float>(), mhc_post_.ptr<const float>(), mhc_comb_.ptr<const float>(), stream );
 			}
 			else {
-				// Residual connection: hidden_states += attn_out
-				engine::modules::Elementwise::add_residual( hidden_states_, attn_out_, stream );
+				if ( ring_ ) {
+					ring_->all_reduce( attn_out_, stream );
+				}
+
+				if ( lw.hc_attn_fn.data != nullptr ) {
+					// mHC post-step: attention update
+					engine::modules::HyperConnection::update(
+						hidden_streams_, attn_out_, mhc_post_, mhc_comb_, H, stream, m
+					);
+				}
+				else {
+					// Residual connection: hidden_states += attn_out
+					engine::modules::Elementwise::add_residual( hidden_states_, attn_out_, stream );
+				}
 			}
 		}
 
@@ -1844,7 +1864,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 			}
 
 				// Sum local expert contributions across NVLink mesh
-			if ( ring_ ) {
+			if ( ring_ && !fuse_ffn_reduce ) {
 				ring_->all_reduce( local_moe_out_, stream );
 			}
 		}
@@ -1863,17 +1883,22 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				engine::modules::Linear::forward(
 					dn_i, lw.dense_mlp.down, ffn_out_, stream
 				);
-				if ( lw.dense_sliced ) ring_->all_reduce( ffn_out_, stream );
+				if ( lw.dense_sliced && !fuse_ffn_reduce ) ring_->all_reduce( ffn_out_, stream );
 			}
 		}
 
 		const pod::TensorView& ffn_res = lw.is_moe ? local_moe_out_ : ffn_out_;
 
 		if ( lw.hc_ffn_fn.data != nullptr ) {
-			// mHC post-step: FFN update
-			engine::modules::HyperConnection::update(
-				hidden_streams_, ffn_res, mhc_post_, mhc_comb_, H, stream, m
-			);
+			// mHC post-step: FFN update (with the all-reduce of the output, when that is fused)
+			if ( fuse_ffn_reduce ) {
+				ring_->all_reduce_hc_apply( const_cast<pod::TensorView&>( ffn_res ), hidden_streams_.ptr<float>(), mhc_post_.ptr<const float>(), mhc_comb_.ptr<const float>(), stream );
+			}
+			else {
+				engine::modules::HyperConnection::update(
+					hidden_streams_, ffn_res, mhc_post_, mhc_comb_, H, stream, m
+				);
+			}
 		}
 		else {
 			if ( lw.is_moe ) {

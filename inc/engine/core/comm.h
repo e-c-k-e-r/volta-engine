@@ -38,6 +38,16 @@ struct CollectiveRing {
 	// and the next site's per-stream norm normed[r, s, :] = x * rsqrt(mean(x^2) + eps) * (1 + norm_w[s, :]) (what GatedResidual::apply and
 	// ::norm do one after the other), in the one kernel that reduces y. hc is 4; y is not written back.
 	// With `addend` (this rank's shared expert output [rows, hidden]) and `addend_gate` [rows], the rank contributes y + gate * addend.
+	// GLM decode (hyper-connections): y = all_reduce(y), then the post-step x[r, h, :] = post[r, h] * y[r, :] + sum_g comb[r, g, h] * x[r, g, :] over the fp32 streams
+	// x [rows, 4, hidden] (what HyperConnection::update does after the reduction, bit for bit), in the one kernel that reduces y. y is not written back.
+	void all_reduce_hc_apply(
+		pod::TensorView& y,
+		float* streams,
+		const float* post,
+		const float* comb,
+		backend::stream_t stream = nullptr
+	);
+
 	void all_reduce_gated_norm(
 		pod::TensorView& y,
 		float* streams,

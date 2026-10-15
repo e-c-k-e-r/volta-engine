@@ -52,6 +52,7 @@ DEBUG_OPTION( std::string, route_dump, "", "Flash-Next, GLM: file that receives,
 DEBUG_OPTION( std::string, route_replay, "", "GLM: a <trace_layers>.route file; eager prefill rows found in it use the recorded expert ids and weights (the latest record per layer and position wins), isolating router flips" )
 DEBUG_OPTION( int, qwen4_halt, -1, "qwen4_exp bring-up: stop the layer stack after this many sublayer sites (0 = after layer 0's attention half, 1 = after its MLP half, ...); <0 runs everything" )
 DEBUG_OPTION( bool, gr_fuse, true, "qwen4_exp: decode-sized rows reduce the sublayer output, add it to the streams and norm them for the next site in one kernel (false = three launches, for A/B)" )
+DEBUG_OPTION( bool, hc_fuse, true, "GLM: decode-sized rows reduce the attention or FFN output and apply the hyper-connection post-step in one kernel (false = all-reduce and update as two launches, for A/B)" )
 DEBUG_OPTION( bool, qsa_off, false, "qwen4_exp: attend densely past the QSA budget (A/B against the sparse selection)" )
 DEBUG_OPTION( std::string, teacher_streams, "", "qwen4_exp: file of reference residual streams per layer input (int rows header, then [47][rows][4][hidden] fp32): every layer from 1 on starts from the reference's streams, isolating the per-layer error" )
 DEBUG_OPTION( bool, router_fp16, false, "qwen4_exp: round the router logits to fp16 before the top-k, as the exllamav3 router stores them" )

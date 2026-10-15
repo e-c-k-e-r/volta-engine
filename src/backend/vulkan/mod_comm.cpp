@@ -7,6 +7,7 @@
 #include "engine/backend/numeric.h"
 #include "engine/modules/norm.h"
 #include "engine/modules/gated_residual.h"
+#include "engine/modules/mhc.h"
 #include <pthread.h>
 #include <cstdlib>
 #include <cstring>
@@ -87,6 +88,12 @@ void CollectiveRing::all_reduce_rms_norm(
 ) {
 	reduce_through_host( *this, x, &residual, stream );
 	modules::RMSNorm::forward( residual, weight, out != nullptr ? *out : x, eps, constant_bias, stream );
+}
+
+// The reduction, then the post-step as the module call it is on the NVLink path's fused kernel
+void CollectiveRing::all_reduce_hc_apply( pod::TensorView& y, float* streams, const float* post, const float* comb, backend::stream_t stream ) {
+	all_reduce( y, stream );
+	modules::HyperConnection::update( streams, streams, y.ptr<const backend::half_t>(), post, comb, y.shape[1], stream, y.shape[0] );
 }
 
 // The reduction, then the gated add and the next norm as the two module calls they are on the NVLink path's fused kernel
