@@ -48,7 +48,7 @@ The final `hyper_connection_mixer` is the same without `post` and returns `mixed
   decode kernels stream the 6.5 MB gate / up weights with all loads in flight (rows <= 8); the gated add after a sublayer is deferred into the next site's norm pass.
 * **Prefill**: the gated-residual projections run as cuBLAS GEMM pairs on fp16 hi / lo splits of the fp32 operands at a fixed row capacity (a row's result is bit-identical whatever
   its position or chunk size); QSA sparse attention for prefill rows runs on a tensor-core kernel (keys gathered through the row's top-k list); the PLE row decode overlaps the layers
-  queued before it. Interleaved prefill (`prefill_chunk`, default 256): while other requests decode, a new prompt is fed in pieces and the decode steps run between them; snapshot
+  queued before it. Interleaved prefill (`prefill_chunk`, default 512): while other requests decode, a new prompt is fed in pieces and the decode steps run between them; snapshot
   buffers for the prompt's planned prefix checkpoints are pinned on a helper thread when its prefill starts, so a checkpoint store does not stall the streams.
 * **Context**: QSA block selection past 2048 tokens of context (top-512 + tail, pooled keys, the GLM selector reused); decode is nearly flat in context (a warp-per-key sparse
   attention kernel for decode rows); the 256K window with 2 slots fits (24.3 of 29.8 GiB per GPU).
@@ -143,8 +143,7 @@ power cap in single runs, so they are directional; a benchmark matrix with repea
   text, which ends the generation with `end_turn` and the client sees no visible output. Candidate fixes, none applied: mask the EOS logits while a thinking block is open and no tool call has
   started (GPU sampler and MTP verify), or treat the token as literal text there. The model sometimes goes from thinking to a tool call without `</think>`, so "reasoning open" alone does not
   mean a stop is wrong.
-* **Prefill gaps**: `prefill_chunk` is global. 256 meets a ~0.5 s stream-gap target on Flash-Next (0.49 s with a 19K-token prompt arriving mid-stream; 128 gives 0.33 s at a slower prompt); on GLM a
-  256-row piece costs ~0.72 s, so the stream sees a steady 0.77 s gap (128: 0.53 s). Models with a DFlash2 drafter keep the whole-prompt prefill.
+* **Prefill gaps**: `prefill_chunk` is global, and the stall a piece puts into the other streams grows with its size. On Flash-Next 256 rows gave a ~0.5 s stream gap (0.49 s with a 19K-token prompt arriving mid-stream; 128 gave 0.33 s at a slower prompt); the default 512 about doubles that and prefills faster (1783 against 1492 tok/s in `bench_prefill`; an agent load of a main agent and five subagents on two slots, `bench_agent.py`: mean time to first token 10.4 s against 12.1 s, wall time 116 s against 128 s). On GLM a 256-row piece costs ~0.72 s, so 512 gives a stream gap of about 1.5 s: set `prefill_chunk` to 256 or 128 where smooth streaming matters more. Models with a DFlash2 drafter keep the whole-prompt prefill.
 * **Batch composition**: batched rows round differently from single rows, so concurrent greedy outputs can diverge from sequential ones; any numerics change moves the logits by a few tenths
   through router flips.
 * **`bench_decode` with `BENCH_CTX`** needs `ENGINE_MAX_SEQ` above it (at exactly `max_seq` it writes past the cache). `test_ppl --glm` cannot score chunks above 8 rows (GLM's logits buffer holds a

@@ -58,7 +58,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `max_seq` | int | `0` | `ENGINE_MAX_SEQ` | context window per slot in tokens (sizes the KV pool); 0 = the model default (Qwen 32768, GLM 12288) |
 | `max_slots` | int | `0` | `ENGINE_MAX_SLOTS` | decode slots; 0 = the model default (Qwen 8, GLM 1) |
 | `prefix_cache_gib` | int | `16` | `ENGINE_PREFIX_CACHE_GIB` | pinned host RAM for the prefix cache (sequence snapshots); 0 = off |
-| `prefill_chunk` | int | `256` | `ENGINE_PREFILL_CHUNK` | prompt tokens a new request prefills per scheduler step while other requests are decoding (decode steps run between the pieces); 0 = the whole prompt at once |
+| `prefill_chunk` | int | `512` | `ENGINE_PREFILL_CHUNK` | prompt tokens a new request prefills per scheduler step while other requests are decoding (decode steps run between the pieces); 0 = the whole prompt at once |
 | `prefix_interval` | int | `16384` | `ENGINE_PREFIX_INTERVAL` | prompt tokens between automatic prefix checkpoints inside long prompts; 0 = only the requested ones |
 | `nvfp4_experts` | string | `(empty)` | `ENGINE_NVFP4_EXPERTS` | Flash-Next: directory of a modelopt NVFP4 checkpoint (same architecture) to load the routed experts from; everything else comes from the model directory. Empty = the model's own experts |
 | `nvfp4_dense` | string | `(empty)` | `ENGINE_NVFP4_DENSE` | dense projection groups to quantize to NVFP4 at load (round-to-nearest from the BF16 tensors of the nvfp4_experts checkpoint): Flash-Next: gdn, shared (or shared_gate / shared_up / shared_down), attn, idx, head; GLM: kda, mla, idx, shared, dense, head; Qwen NVFP4 checkpoint: head (a quarter of the bytes of the FP16 head); or all |
