@@ -123,6 +123,7 @@ struct Glm5NextLayerWeights {
 
 	// Shared expert
 	bool has_shared_expert = false;
+	bool dense_sliced = false;    // the dense MLP of layers 0-2 is cut over the ranks (all-reduce after the down projection) instead of replicated
 	bool shared_sliced = false;   // each rank holds 1/tp of the shared expert's width and adds its partial output before the all-reduce; otherwise rank 0 runs all of it
 	Glm5NextExpertWeights shared_expert;
 

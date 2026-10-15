@@ -86,7 +86,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `spec_ctrl` | bool | `true` | `ENGINE_SPEC_CTRL` | adaptive speculation controller; false always speculates |
 | **Debug** | | | | |
 | `moe_prefill_tile` | bool | `true` | `ENGINE_DEBUG_MOE_PREFILL_TILE` | trellis MoE, prefill chunks of more than 128 rows: the 32-row expert tile with two resident blocks per SM; false runs the 16-row tile of the decode kernels (A/B) |
-| `shared_slice` | bool | `true` | `ENGINE_DEBUG_SHARED_SLICE` | GLM: the shared expert is cut over the ranks (each holds and runs 1/tp of its width, the partial outputs meet in the MoE all-reduce); false loads it whole on every rank and runs it on rank 0 (A/B) |
+| `shared_slice` | bool | `true` | `ENGINE_DEBUG_SHARED_SLICE` | GLM: the shared expert is cut over the ranks (each holds and runs 1/tp of its width, the partial outputs meet in the MoE all-reduce) and so is the dense MLP of layers 0-2 (an all-reduce after its down projection); false loads the shared expert whole on every rank, run on rank 0, and the dense MLP whole on every rank (A/B) |
 | `moe_gemv` | bool | `false` | `ENGINE_DEBUG_MOE_GEMV` | ROCm: the expert-grouped EXL3 MoE runs its projections on the v_dot2 GEMV instead of the WMMA kernels |
 | `nvfp4_hipblas` | bool | `false` | `ENGINE_DEBUG_NVFP4_HIPBLAS` | ROCm: NVFP4 linears of more than 16 rows dequantize into FP16 and run one hipBLAS GEMM instead of the fused WMMA GEMM (the FP16 scratch can move as it grows, which a captured graph cannot follow) |
 | `expert_log` | bool | `false` | `ENGINE_DEBUG_EXPERT_LOG` | per-rebalance expert tier statistics |

@@ -952,13 +952,18 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		else {
 			// Dense layer
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.gate_proj", L );
-			lw.dense_mlp.gate = nv_on( "dense" ) ? nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, true, 0, 1, stream ), name_buf ) : repo.load_linear( name_buf, *arena_, 4, stream );
+			// Cut over the ranks like the shared expert (gate / up by output width, down by input width), a partial sum per rank that one all-reduce
+			// completes: 1/tp of the weights on each rank instead of a copy on every rank computing the same product
+			const bool dn_slice = hess_.empty() && runtime::options().shared_slice && config_.tp_size > 1 && ring_ != nullptr;
+			const int dn_parts = dn_slice ? config_.tp_size : 1, dn_rank = dn_slice ? rank_ : 0;
+			lw.dense_sliced = dn_slice;
+			lw.dense_mlp.gate = nv_on( "dense" ) ? nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, true, dn_rank, dn_parts, stream ), name_buf ) : repo.load_linear_slice( name_buf, *arena_, 4, 1, dn_rank, dn_parts, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.up_proj", L );
-			lw.dense_mlp.up = nv_on( "dense" ) ? nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, true, 0, 1, stream ), name_buf ) : repo.load_linear( name_buf, *arena_, 4, stream );
+			lw.dense_mlp.up = nv_on( "dense" ) ? nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, true, dn_rank, dn_parts, stream ), name_buf ) : repo.load_linear_slice( name_buf, *arena_, 4, 1, dn_rank, dn_parts, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.down_proj", L );
-			lw.dense_mlp.down = nv_on( "dense" ) ? nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, true, 0, 1, stream ), name_buf ) : repo.load_linear( name_buf, *arena_, 4, stream );
+			lw.dense_mlp.down = nv_on( "dense" ) ? nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, false, dn_rank, dn_parts, stream ), name_buf ) : repo.load_linear_slice( name_buf, *arena_, 4, 0, dn_rank, dn_parts, stream );
 		}
 
 		std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.hc_attn_base", L );
@@ -1790,16 +1795,19 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 		else {
 			// Dense layer
 			if ( lw.dense_mlp.gate.is_valid() ) {
+				pod::TensorView dn_g = moe_gate_buf_, dn_u = moe_up_buf_, dn_i = moe_inter_buf_;
+				if ( lw.dense_sliced ) dn_g.shape[1] = dn_u.shape[1] = dn_i.shape[1] = config_.dense_intermediate_size / config_.tp_size;
 				engine::modules::Linear::forward(
-					norm_hidden_, lw.dense_mlp.gate, moe_gate_buf_, stream
+					norm_hidden_, lw.dense_mlp.gate, dn_g, stream
 				);
 				engine::modules::Linear::forward(
-					norm_hidden_, lw.dense_mlp.up, moe_up_buf_, stream
+					norm_hidden_, lw.dense_mlp.up, dn_u, stream
 				);
-				engine::modules::SwiGLU::forward( moe_gate_buf_, moe_up_buf_, moe_inter_buf_, stream, 10.0f );
+				engine::modules::SwiGLU::forward( dn_g, dn_u, dn_i, stream, 10.0f );
 				engine::modules::Linear::forward(
-					moe_inter_buf_, lw.dense_mlp.down, ffn_out_, stream
+					dn_i, lw.dense_mlp.down, ffn_out_, stream
 				);
+				if ( lw.dense_sliced ) ring_->all_reduce( ffn_out_, stream );
 			}
 		}
 

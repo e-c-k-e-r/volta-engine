@@ -93,7 +93,7 @@ Qwen extras:
   tokens (`kv_pool`, below), and every routed expert fits on the GPUs: `--set max_seq=262144 --set max_slots=2 --set kv_format=nvfp4
   --set kv_pool=262144 --set expert_cache=1.0 --speculative --draft-model-dir <DFlash2>` (images off). Per GPU the arena holds 1.7 GiB of
   buffers and caches (the latent cache 0.8 of them), 28.6 GiB of weights and the 0.6 GiB drafter, leaving 0.08 GiB; the startup log prints this
-  as `[mem]` lines. The shared expert is cut over the ranks (`shared_slice`), which saves 0.4 GiB a GPU, and the attention workspace is sized
+  as `[mem]` lines. The shared expert and the dense MLP of the first three layers are cut over the ranks (`shared_slice`), which saves 0.6 GiB a GPU, and the attention workspace is sized
   for the 2K keys a row attends to once the indexer selects, not for the whole context. Verified at 200K (a 200K prompt: first token after 248 s;
   two 128K prompts do not fit the pool together, so the second waits for the first) with GPU memory at 32.4 of 32.5 GiB. `configs/glm_256k.json` uses `expert_cache=auto` instead, which leaves a margin
   on a different machine; each point of `expert_cache` costs 0.26 GiB, and the FP8 cache (`kv_format=fp8`, 1.2 GiB more) needs it below 1.
