@@ -25,6 +25,9 @@
 
 namespace engine::models {
 
+// Resident fraction of the expert tier from which decode keeps the fused (exl3_moe_coop) kernels; below it the persistent kernel reads the cold experts a little faster
+constexpr double kFusedTierMinFraction = 0.75;
+
 namespace {
 
 // Host-resident embedding table shared by all ranks (see load_weights)
@@ -125,9 +128,10 @@ bool Glm5NextPipeline::init(
 	state_.d_topk_weights = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( backend::half_t ) ) );
 	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R, mtp_on_ );
 	// The fused decode kernels read cold experts from host memory a little slower than the persistent kernel (6.4 vs 6.8 tok/s at a
-	// 50% tier), so the tier keeps the persistent path
+	// 50% tier), but with most experts resident they are far faster (the persistent kernel costs ~11 ms a token more at 99% resident): only a
+	// small resident set keeps the persistent path. expert_cache=0 (auto) decides when the fraction is known
 #if !defined(USE_ROCM)
-	if ( engine::modules::ExpertTier::resident_fraction() < 1.0 ) state_.moe.coop_ctr = nullptr;
+	if ( const double f = engine::modules::ExpertTier::resident_fraction(); f > 0.0 && f < kFusedTierMinFraction ) state_.moe.coop_ctr = nullptr;
 #endif   // the ROCm build has no persistent kernel (its tensor-core path is emulated, 70 ms a layer): the fused launch serves the tier too
 
 	mem( "router outputs and MoE scratch" );
@@ -846,6 +850,9 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 					if ( tier_fraction <= 0.0 ) {
 						auto_base = auto_resident( repo, L, layers_begin, experts_cost, 0, experts_per_rank, bytes[0] + bytes[1] + bytes[2], moe_layers );
 						tier_fraction = ( auto_base + 0.25 ) / experts_per_rank;
+#if !defined(USE_ROCM)
+						if ( tier_fraction < kFusedTierMinFraction ) state_.moe.coop_ctr = nullptr;
+#endif
 					}
 					tier_.start( experts_per_rank, tier_fraction, bytes, rank_, config_.tp_size, moe_layers, runtime::options().expert_stream, host_arena_ );
 				}
