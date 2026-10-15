@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cuda_fp16.h>
+#include "engine/backend/cuda/reduce.cuh"
 #include "engine/backend/cuda/activation.cuh"
 #include <cuda_runtime.h>
 #include <cstddef>
@@ -10,36 +11,15 @@
 namespace engine::video {
 namespace kern {
 
-__device__ __forceinline__ float block_sum( float v, float* red ) {
-	for ( int d = 16; d; d >>= 1 ) {
-		v += __shfl_xor_sync( 0xffffffffu, v, d );
-	}
-	const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+// Block sum / max with a barrier first, as the callers use them back to back (red is unused: the shared array lives in the helper)
+__device__ __forceinline__ float block_sum( float v, float* ) {
 	__syncthreads();
-	if ( l == 0 ) { red[w] = v; }
-	__syncthreads();
-	const int nw = ( blockDim.x + 31 ) >> 5;
-	float r = l < nw ? red[l] : 0.0f;
-	for ( int d = 16; d; d >>= 1 ) {
-		r += __shfl_xor_sync( 0xffffffffu, r, d );
-	}
-	return r;
+	return engine::math::block_sum<32>( v );
 }
 
-__device__ __forceinline__ float block_max( float v, float* red ) {
-	for ( int d = 16; d; d >>= 1 ) {
-		v = fmaxf( v, __shfl_xor_sync( 0xffffffffu, v, d ) );
-	}
-	const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+__device__ __forceinline__ float block_max( float v, float* ) {
 	__syncthreads();
-	if ( l == 0 ) { red[w] = v; }
-	__syncthreads();
-	const int nw = ( blockDim.x + 31 ) >> 5;
-	float r = l < nw ? red[l] : 0.0f;
-	for ( int d = 16; d; d >>= 1 ) {
-		r = fmaxf( r, __shfl_xor_sync( 0xffffffffu, r, d ) );
-	}
-	return r;
+	return engine::math::block_max<32>( v );
 }
 
 template <typename Tin, typename Tout>
