@@ -555,13 +555,16 @@ void Generator::step_batch() {
 			else d_ids[nd++] = s;
 		}
 	}
-	const bool joint_rounds = per_slot && ne >= 2 && cluster_.speculator().joint() && runtime::options().spec_joint;
+	// Joint rounds: the speculator's own default unless spec_joint says otherwise (-1: its default, 0 off, 1 on), at most joint_max slots to a round
+	const bool joint_on = per_slot && cluster_.speculator().joint() && ( runtime::options().spec_joint > 0 || ( runtime::options().spec_joint < 0 && cluster_.speculator().joint_default() ) );
+	const int nj = per_slot ? MIN( ne, cluster_.speculator().joint_max() ) : 0;
+	const bool joint_rounds = joint_on && nj >= 2;
 	// With several slots decoding, a plain step over all of them returns n tokens for little more than the cost of one, while a round returns
 	// a few tokens of one slot (or of several, as a joint round): compare the measured rates (and re-measure the unused side now and then)
 	bool agg_dense = false;
 	if ( per_slot && n >= 2 && n <= MAX_SLOTS ) {
 		const bool probe = ( ++agg_steps_ % 64 ) == 0;
-		const double rate = spec_tok_ms_n_[joint_rounds ? ne : 1];
+		const double rate = spec_tok_ms_n_[joint_rounds ? nj : 1];
 		agg_dense = dense_ms_n_[n] <= 0.0 || ( rate > 0.0 && n / dense_ms_n_[n] > rate * 1.1 );
 		if ( probe ) agg_dense = !agg_dense;
 	}
@@ -572,7 +575,7 @@ void Generator::step_batch() {
 		}
 		if ( spec_slot < 0 && ne > 0 && ( nd == 0 || spec_turn_ ) ) {
 			if ( joint_rounds ) {
-				for ( int i = 0; i < ne; ++i ) group[ng++] = e_ids[i];
+				for ( int i = 0; i < nj; ++i ) group[ng++] = e_ids[i];
 				spec_slot = group[0];
 			}
 			else {

@@ -186,8 +186,14 @@ bool DFlashSpeculator::init(
 
 	const int kv_total = ring_len_ + M;
 	int kv_cache_shape[4] = { kv_total, config_.num_hidden_layers, kv_heads_local, config_.head_dim };
-	drafter_k_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_cache_shape, 4 );
-	drafter_v_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_cache_shape, 4 );
+	ctxs_.assign( static_cast<size_t>( num_contexts_ ), Ctx{} );
+	for ( Ctx& c : ctxs_ ) {
+		c.k = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_cache_shape, 4 );
+		c.v = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_cache_shape, 4 );
+	}
+	ctx_cur_ = 0;
+	drafter_k_ = ctxs_[0].k;
+	drafter_v_ = ctxs_[0].v;
 	kv_len_ = 0;
 	kv_pos0_ = 0;
 

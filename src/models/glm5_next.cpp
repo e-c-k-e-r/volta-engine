@@ -346,10 +346,12 @@ bool Glm5NextPipeline::init(
 	}
 
 	mem( "logits" );
-	// 6. DFlash2 attachment: position-indexed tap ring (one slot publishes), head scratch, candidate top-k scratch
+	// 6. DFlash2 attachment: a position-indexed tap ring per slot (every slot's rows publish to its own, so each can feed the drafter), head scratch,
+	// candidate top-k scratch
 	{
 		draft_hooks_.taps_cap = MAX( MIN( config_.max_seq, 2048 ), 256 );
-		int wtap_shape[2] = { draft_hooks_.taps_cap, 5 * config_.hidden_size };
+		int wtap_shape[2] = { S * draft_hooks_.taps_cap, 5 * config_.hidden_size };
+		draft_hooks_.taps_slot_stride = static_cast<size_t>( draft_hooks_.taps_cap ) * 5 * config_.hidden_size;
 		draft_taps_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, wtap_shape, 2 );
 		backend::memset_sync( draft_taps_.data, 0, static_cast<size_t>( wtap_shape[0] ) * wtap_shape[1] * sizeof( backend::half_t ) );
 		d_taps_owner_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
@@ -1874,9 +1876,9 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 		for ( int tap = 0; tap < 5; ++tap ) {
 			if ( layer != config_.tap_layers[tap] ) continue;
 			engine::spec::dflash_reduce_streams( hidden_streams_.ptr<const float>(), tap_tmp_.ptr<backend::half_t>(), m, H, 0, stream );
-			engine::spec::dflash_publish_taps(
-				draft_taps_.ptr<backend::half_t>(), tap_tmp_.ptr<const backend::half_t>(), d_rows_, d_taps_owner_,
-				m, tap, H, draft_hooks_.taps_cap, stream );
+			engine::spec::dflash_publish_taps_slots(
+				draft_taps_.ptr<backend::half_t>(), tap_tmp_.ptr<const backend::half_t>(), d_rows_,
+				m, tap, H, draft_hooks_.taps_cap, draft_hooks_.taps_slot_stride, stream );
 		}
 
 		trace_row( layer );
@@ -2079,7 +2081,7 @@ bool Glm5NextPipeline::save_seq_state( int slot_id, int from, int tokens, bool w
 	backend::memcpy_async( dst + kda + conv, dsa_plane_ + static_cast<size_t>( slot_id ) * dsa_plane_stride_, planes, backend::Copy::D2H, stream );
 	dst += kda + conv + planes;
 	if ( const size_t tap_bytes = with_taps ? tap_snapshot_bytes( tokens ) : 0 ) {
-		backend::memcpy_async( dst, draft_taps_.data, tap_bytes, backend::Copy::D2H, stream );
+		backend::memcpy_async( dst, draft_taps_.ptr<backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride, tap_bytes, backend::Copy::D2H, stream );
 		dst += tap_bytes;
 	}
 	copy_seq_rows( slot_id, from, tokens, dst, true, stream );
@@ -2097,7 +2099,7 @@ bool Glm5NextPipeline::load_seq_state( int slot_id, int from, int tokens, bool w
 		backend::memcpy_async( state_.kda_states + static_cast<size_t>( slot_id ) * state_.slot_kda_floats, src, kda, backend::Copy::H2D, stream );
 		backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, src + kda, conv, backend::Copy::H2D, stream );
 		backend::memcpy_async( dsa_plane_ + static_cast<size_t>( slot_id ) * dsa_plane_stride_, src + kda + conv, planes, backend::Copy::H2D, stream );
-		if ( tap_bytes ) backend::memcpy_async( draft_taps_.data, src + kda + conv + planes, tap_bytes, backend::Copy::H2D, stream );
+		if ( tap_bytes ) backend::memcpy_async( draft_taps_.ptr<backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride, src + kda + conv + planes, tap_bytes, backend::Copy::H2D, stream );
 	}
 	copy_seq_rows( slot_id, from, tokens, const_cast<char*>( src ) + kda + conv + planes + tap_bytes, false, stream );
 	return true;

@@ -61,15 +61,15 @@ Validated contexts:
 
 | Feature | Status | Option | Covered by |
 |---|---|---|---|
-| DFlash2 drafter (Qwen, GLM), verified in one forward with per-row recurrent-state snapshots | opt-in | `--speculative`, `--draft-model-dir`, `draft_tp` | `test_dflash*`, `test_spec_state`, `test_spec_target_equiv`, `test_coherence` |
+| DFlash2 drafter (Qwen, GLM), verified in one forward (per-row recurrent-state snapshots; GLM journals the KDA rows and replays the accepted ones), a context and tap ring per slot on GLM | opt-in | `--speculative`, `--draft-model-dir`, `draft_tp` | `test_dflash*`, `test_spec_state`, `test_spec_target_equiv`, `test_coherence` |
 | MTP: the checkpoint's own head (Qwen, Flash-Next, GLM) | opt-in | `speculator=mtp`, `mtp_depth` | `test_mtp` |
 | Adaptive controller that falls back to plain decode when speculation loses | default | `spec_ctrl` | `bench_accept`, `bench_spec` |
-| One draft chain and one verify forward for all speculating slots | debug | `spec_joint` | `test_api.sh` |
+| One verify forward for the blocks of all speculating slots (DFlash2: on, drafted in turn; MTP: off, one draft chain too) | on (DFlash2) | `spec_joint` | `test_api.sh` |
 
 * Greedy output with speculation is identical to plain decoding; this is what `test_mtp` and `test_coherence` check.
 * Qwen: MTP about 1.7x plain decoding against 2.4x for DFlash2, and it needs no draft model. Flash-Next with MTP: 185 tok/s on a short prompt, 132 tok/s on a 15K prompt (82% and 63% accepted).
 * GLM's head is layer 45 of the NVFP4 checkpoint (a plain MLA + MoE layer without hyper-connections; its BF16 weights and 288 experts are quantized to NVFP4 at load, this rank's slice), so it needs `nvfp4_dense_src`. It matches the DFlash2 drafter's mean speed on the natural prompts (101 tok/s, 45 to 56% of drafts accepted) without the drafter's VRAM, and takes about 1 GiB per GPU, which leaves the 12K window about 0.1 GiB of spare arena. Greedy output matches plain decoding for the first tokens; later ones can differ at near-ties, as with the DFlash2 drafter.
-* `spec_joint` is about even with the per-slot rounds at two requests and ahead at four, so it stays off.
+* `spec_joint` is about even with the per-slot rounds at two requests for MTP and ahead at four, so MTP keeps it off; DFlash2 on GLM has it on (+2 to +9% aggregate over interleaved rounds at two high-acceptance streams, within the run-to-run spread).
 * After a prefix restore the MTP head does one plain step first, because it does not hold the hidden state of the last restored position.
 
 ## Parallelism and scheduling

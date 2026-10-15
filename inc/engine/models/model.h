@@ -27,6 +27,7 @@ struct DraftHooks {
 	const backend::half_t* taps = nullptr;                 // [taps_cap, 5 * hidden] position-indexed tap ring
 	int taps_cap = 0;
 	int* taps_owner = nullptr;                  // device scalar: slot whose rows publish taps (-1: none)
+	size_t taps_slot_stride = 0;                // elements between the slots' rings when every slot has its own (taps_owner is then unused); 0: one ring, one owner
 	backend::half_t* lm_in = nullptr;                      // [kDraftM, hidden] drafter hidden, written by the runner
 	float* cand_vals = nullptr;                 // [kDraftM, kDraftTopK] local top-k logits
 	int* cand_idx = nullptr;                    // [kDraftM, kDraftTopK] global token ids

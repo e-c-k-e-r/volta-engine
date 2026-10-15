@@ -82,9 +82,11 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 	ENGINE_ASSERT( cfg.selector_top_k == models::kDraftTopK, "DFlash2Runner: selector_top_k != kDraftTopK" );
 
 	tp_ = runtime::options().draft_tp ? mc.tp() : 1;
+	per_slot_ = runtime::options().draft_per_slot && mc.model( 0 ).draft_hooks().taps_slot_stride > 0 && meta.max_slots <= kMaxSlots;
 	bool loaded = true;
 	for ( int d = 0; d < tp_; ++d ) {
 		backend::set_device( d );
+		if ( per_slot_ ) spec_[d].set_contexts( meta.max_slots );
 		spec_[d].set_candidate_ranks( mc.tp() );
 		if ( tp_ > 1 ) spec_[d].set_ring( mc.ring( d ) );
 		const size_t mem0 = mc.arena( d ).offset_bytes;
@@ -105,9 +107,20 @@ void DFlash2Runner::shutdown() {
 	}
 	mc_ = nullptr;
 	owner_ = -1;
+	for ( bool& o : owned_ ) o = false;
 }
 
 void DFlash2Runner::claim( int slot ) {
+	if ( per_slot_ ) {
+		ENGINE_ASSERT( slot >= 0 && slot < kMaxSlots, "DFlash2Runner::claim: slot out of range" );
+		owned_[slot] = true;
+		for ( int d = 0; d < tp_; ++d ) {
+			spec_[d].set_context( slot );
+			spec_[d].reset_context();
+		}
+		for ( int i = 0; i < 8; ++i ) att_[i] = hit_[i] = 0;
+		return;   // every slot's rows publish to its own tap ring: nothing to redirect
+	}
 	owner_ = slot;
 	for ( int d = 0; d < tp_; ++d ) spec_[d].reset_context();
 	for ( int i = 0; i < 8; ++i ) att_[i] = hit_[i] = 0;
@@ -123,6 +136,10 @@ void DFlash2Runner::claim( int slot ) {
 }
 
 void DFlash2Runner::release( int slot ) {
+	if ( per_slot_ ) {
+		if ( slot >= 0 && slot < kMaxSlots ) owned_[slot] = false;
+		return;
+	}
 	if ( owner_ != slot ) return;
 	owner_ = -1;
 	mc_->run_ranks( [&]( int d ) {
@@ -140,19 +157,14 @@ void DFlash2Runner::step_stats( int* attempts, int* hits ) const {
 	}
 }
 
-SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_threshold,
-	const SamplingParams* sp, Rng* rng ) {
-	ENGINE_ASSERT( owner_ == slot, "DFlash2Runner::speculate: slot does not own the drafter context" );
+// The draft half of a round: the drafter backbone over the block [anchor, mask x K] and the slot's tapped context, each rank's head shard and local top-k,
+// the merge, the selector walk. h_draft receives [anchor, draft tokens...]; returns how many drafts the verify block carries (below 1: no room)
+int DFlash2Runner::draft_block( int slot, int anchor, int pos, float depth_threshold, int* h_draft ) {
 	constexpr int M = models::kDraftM;
 	constexpr int K = M - 1;
 	ModelCluster& mc = *mc_;
 	const auto& meta = mc.metadata();
 	const backend::stream_t s0 = mc.stream( 0 );
-	SpecResult res;
-	const bool sampled = sp != nullptr && !sp->greedy();
-	ENGINE_ASSERT( !sampled || rng != nullptr, "DFlash2Runner::speculate: sampling needs an Rng" );
-	prof_last_ = SpecProfile::DRAFT;
-	prof_t0_ = impl::now_ms();
 
 	// 1. Drafter backbone over the block [anchor, mask x K] and the target's tapped context, then each rank's
 	// head shard + local top-k over the drafter hidden. Every rank's candidate set is the top-k of its
@@ -163,7 +175,8 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		// Sharded drafter: all ranks run the backbone in lockstep and end with the same full hidden.
 		mc.run_ranks( [&]( int d ) {
 			const auto& hk = mc.model( d ).draft_hooks();
-			spec_[d].draft_backbone( *hk.embedding, anchor, hk.taps, pos, hk.taps_cap, mc.stream( d ) );
+			if ( per_slot_ ) spec_[d].set_context( slot );
+			spec_[d].draft_backbone( *hk.embedding, anchor, hk.taps + static_cast<size_t>( per_slot_ ? slot : 0 ) * hk.taps_slot_stride, pos, hk.taps_cap, mc.stream( d ) );
 			backend::memcpy_async( hk.lm_in, spec_[d].draft_hidden().data, hid_bytes, backend::Copy::D2D, mc.stream( d ) );
 			mc.model( d ).draft_head_topk( M, mc.stream( d ) );
 			backend::stream_sync( mc.stream( d ) );
@@ -171,7 +184,8 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	}
 	else {
 		backend::set_device( 0 );
-		spec_[0].draft_backbone( *hk0.embedding, anchor, hk0.taps, pos, hk0.taps_cap, s0 );
+		if ( per_slot_ ) spec_[0].set_context( slot );
+		spec_[0].draft_backbone( *hk0.embedding, anchor, hk0.taps + static_cast<size_t>( per_slot_ ? slot : 0 ) * hk0.taps_slot_stride, pos, hk0.taps_cap, s0 );
 		// Peer the hidden rows to every rank, then run each rank's head shard on its own worker/stream.
 		const pod::TensorView& dh = spec_[0].draft_hidden();
 		for ( int d = 0; d < mc.tp(); ++d ) {
@@ -228,8 +242,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	spec_[0].project_gate( M, s0 );
 	spec_[0].set_walk_anchor( anchor, s0 );
 	spec_[0].draft_select( spec_[0].merged_final_values_ptr(), spec_[0].merged_final_indices_ptr(), K, s0 );
-	int h_draft[M];
-	backend::memcpy_async( h_draft, spec_[0].d_draft_tokens(), sizeof( h_draft ), backend::Copy::D2H, s0 );
+	backend::memcpy_async( h_draft, spec_[0].d_draft_tokens(), M * sizeof( int ), backend::Copy::D2H, s0 );
 	backend::stream_sync( s0 );
 	backend::check_last_error();
 
@@ -245,6 +258,25 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		}
 	}
 	active = MIN( MAX( active, 1 ), meta.max_seq_len - pos - 2 );
+	return active;
+}
+
+SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_threshold,
+	const SamplingParams* sp, Rng* rng ) {
+	ENGINE_ASSERT( owns( slot ), "DFlash2Runner::speculate: slot does not own the drafter context" );
+	constexpr int M = models::kDraftM;
+	constexpr int K = M - 1;
+	ModelCluster& mc = *mc_;
+	const auto& meta = mc.metadata();
+	const backend::stream_t s0 = mc.stream( 0 );
+	SpecResult res;
+	const bool sampled = sp != nullptr && !sp->greedy();
+	ENGINE_ASSERT( !sampled || rng != nullptr, "DFlash2Runner::speculate: sampling needs an Rng" );
+	prof_last_ = SpecProfile::DRAFT;
+	prof_t0_ = impl::now_ms();
+
+	int h_draft[M];
+	int active = draft_block( slot, anchor, pos, depth_threshold, h_draft );
 	if ( active < 1 ) {
 		// No room to verify a block: fall back to the target's own prediction for the anchor.
 		mc.forward( &anchor, 1, pos, slot );
@@ -350,6 +382,94 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		prof_t0_ = now;
 	}
 	return res;
+}
+
+bool DFlash2Runner::joint() const {
+	return per_slot_ && mc_ != nullptr && mc_->spec_commit_always();
+}
+
+void DFlash2Runner::speculate_joint( int n, const int* slots, const int* anchors, const int* poss, const SamplingParams* const* sps, Rng* const* rngs, SpecResult* out ) {
+	constexpr int M = models::kDraftM;
+	constexpr int K = M - 1;
+	constexpr int kMaxJoint = pod::MAX_BATCH / M;
+	ModelCluster& mc = *mc_;
+	const auto& meta = mc.metadata();
+	ENGINE_ASSERT( joint() && n >= 1 && n <= kMaxJoint, "DFlash2Runner::speculate_joint: needs per-slot contexts, the journaled commit and at most MAX_BATCH / kDraftM slots" );
+
+	// 1. Draft each slot's block in turn. A slot too close to the end of the context for a block takes a round of its own.
+	int hd[kMaxJoint][M], active[kMaxJoint], base[kMaxJoint], who[kMaxJoint], k = 0, total = 0;
+	for ( int i = 0; i < n; ++i ) {
+		ENGINE_ASSERT( owns( slots[i] ), "DFlash2Runner::speculate_joint: slot does not own the drafter context" );
+		if ( poss[i] + K + 2 >= meta.max_seq_len ) {
+			out[i] = speculate( slots[i], anchors[i], poss[i], -1.0f, sps[i], rngs[i] );
+			continue;
+		}
+		active[k] = draft_block( slots[i], anchors[i], poss[i], -1.0f, hd[k] );
+		who[k] = i;
+		base[k] = total;
+		total += active[k] + 1;
+		++k;
+	}
+	if ( k == 0 ) return;
+	ENGINE_ASSERT( total <= pod::MAX_BATCH, "DFlash2Runner::speculate_joint: the blocks exceed one forward" );
+
+	// 2. One verify forward over [anchor, c1 .. c_active] of every slot, the blocks one after the other
+	int vtok[pod::MAX_BATCH], vslot[pod::MAX_BATCH], vpos[pod::MAX_BATCH];
+	bool any_sampled = false;
+	for ( int j = 0; j < k; ++j ) {
+		const int i = who[j];
+		vtok[base[j]] = anchors[i];
+		for ( int t = 0; t < active[j]; ++t ) vtok[base[j] + 1 + t] = hd[j][1 + t];
+		for ( int t = 0; t <= active[j]; ++t ) {
+			vslot[base[j] + t] = slots[i];
+			vpos[base[j] + t] = poss[i] + t;
+		}
+		any_sampled = any_sampled || ( sps[i] != nullptr && !sps[i]->greedy() );
+	}
+	mc.set_spec_snapshot( true );
+	mc.forward( vtok, pod::BatchRows::batched( total, vslot, vpos ) );
+	int vpred[pod::MAX_BATCH];
+	Candidates cs[pod::MAX_BATCH];
+	mc.sample( vpred, total );
+	if ( any_sampled ) mc.sample_topk( total, cs );
+	++prof_.rounds;
+
+	// 3. Acceptance per slot (as in speculate), then the slot's state is the one after its last accepted row
+	for ( int j = 0; j < k; ++j ) {
+		const int i = who[j];
+		SpecResult& res = out[i];
+		res = SpecResult();
+		const bool sampled = sps[i] != nullptr && !sps[i]->greedy();
+		ENGINE_ASSERT( !sampled || rngs[i] != nullptr, "DFlash2Runner::speculate_joint: sampling needs an Rng" );
+		const int* cands = hd[j] + 1;
+		const int b = base[j], act = active[j];
+		res.proposed = act;
+		for ( int t = 0; t < act; ++t ) {
+			++att_[t];
+			if ( sampled ) {
+				bool acc = false;
+				const int tok = spec_step( cs[b + t], *sps[i], cands[t], *rngs[i], &acc );
+				if ( !acc ) {
+					res.emitted[res.emitted_count++] = tok;
+					break;
+				}
+			}
+			else if ( cands[t] != vpred[b + t] ) {
+				res.emitted[res.emitted_count++] = vpred[b + t];
+				break;
+			}
+			++hit_[t];
+			res.emitted[res.emitted_count++] = cands[t];
+			res.accepted++;
+		}
+		constexpr float kEma = 0.25f;
+		for ( int t = 0; t < res.proposed; ++t ) cond_[t] = ( 1.0f - kEma ) * cond_[t] + kEma * ( t < res.accepted ? 1.0f : 0.0f );
+		if ( res.accepted == act ) res.emitted[res.emitted_count++] = sampled ? sample_token( cs[b + act], *sps[i], *rngs[i] ) : vpred[b + act];
+		if ( res.accepted < act ) ++prof_.commits;
+		mc.commit_spec_rows( slots[i], b, b + res.accepted );
+		res.next_pos = poss[i] + 1 + res.accepted;
+	}
+	mc.set_spec_snapshot( false );
 }
 
 // Closes the segment that began at the previous mark, attributing it to the stage just finished, and

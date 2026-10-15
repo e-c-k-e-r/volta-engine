@@ -37,8 +37,11 @@ public:
 	// Drafter context belongs to one slot at a time: the target publishes taps for the owner slot
 	// only (device scalar), so a slot that does not own the ring has no context to draft from.
 	// Claiming a slot resets the drafter's projected context and redirects tap publication.
+	// Where the model publishes a tap ring per slot (DraftHooks::taps_slot_stride) every slot keeps its own drafter context and ring, so any number
+	// of slots can speculate (per_slot()); otherwise one slot owns the single context at a time.
 	void claim( int slot ) override;
-	bool owns( int slot ) const override { return owner_ == slot; }
+	bool owns( int slot ) const override { return per_slot_ ? ( slot >= 0 && slot < kMaxSlots && owned_[slot] ) : owner_ == slot; }
+	bool per_slot() const override { return per_slot_; }
 	// The slot stops owning the drafter context (it was overwritten by a restored snapshot, which carries no taps).
 	void release( int slot ) override;
 
@@ -50,6 +53,13 @@ public:
 
 	// Per-step draft accuracy where the step was reached (the loop breaks at the first mismatch, so
 	// step k is sampled exactly when steps 0..k-1 were accepted).
+	// A joint round: every slot's block is drafted in turn (the drafter scratch is shared), then one target forward verifies all the blocks, so the
+	// experts and weights that rows of different slots share are read once. Needs the journaled KDA commit (spec_commit_always).
+	bool joint() const override;
+	bool joint_default() const override { return true; }
+	int joint_max() const override { return pod::MAX_BATCH / models::kDraftM; }
+	void speculate_joint( int n, const int* slots, const int* anchors, const int* poss, const SamplingParams* const* sps, Rng* const* rngs, SpecResult* out ) override;
+
 	void step_stats( int* attempts, int* hits ) const override;
 	void profile_dump() override;
 	void set_profile( bool on ) { profile_on_ = on; }
@@ -69,6 +79,7 @@ public:
 	void diag_reset() { diag_ = DiagStats{}; }
 
 private:
+	int draft_block( int slot, int anchor, int pos, float depth_threshold, int* h_draft );
 	void mark( SpecProfile::Stage stage );
 	bool diag_on_ = false;
 	DiagStats diag_;
@@ -77,6 +88,9 @@ private:
 	engine::spec::DFlashSpeculator spec_[ENGINE_NUM_GPUS];  // [0] only when tp_ == 1
 	int tp_ = 1;                                            // drafter tensor-parallel width
 	int owner_ = -1;
+	static constexpr int kMaxSlots = 8;
+	bool per_slot_ = false;
+	bool owned_[kMaxSlots] = {};
 
 	int att_[8] = {};
 	int hit_[8] = {};

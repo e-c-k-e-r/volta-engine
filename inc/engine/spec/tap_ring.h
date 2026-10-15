@@ -20,6 +20,20 @@ void dflash_publish_taps(
 	backend::stream_t stream
 );
 
+// The same with one ring per slot (taps [slots, cap, 5 * H], slot_stride elements apart): every row publishes to its own slot's ring, so several slots can
+// feed a drafter at once. CUDA only (the backends without it keep the single owner ring).
+void dflash_publish_taps_slots(
+	backend::half_t* taps,
+	const backend::half_t* hidden,
+	const pod::BatchRows* d_rows,
+	int m,
+	int tap,
+	int H,
+	int cap,
+	size_t slot_stride,
+	backend::stream_t stream
+);
+
 // Reduces mHC residual streams [m, 4, H] (FP32) to one FP16 hidden row per token: mode 0 = mean of the four streams,
 // mode k in 1..4 = stream k - 1 (diagnostic selectors for matching the drafter's training-time tap).
 void dflash_reduce_streams(

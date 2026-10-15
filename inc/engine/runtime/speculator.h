@@ -33,6 +33,9 @@ public:
 	// correction / bonus token is drawn from the target's distribution.
 	virtual SpecResult speculate( int slot, int anchor, int pos, float depth_threshold, const SamplingParams* sp, Rng* rng ) = 0;
 
+	// Joint rounds are on by default for this speculator (the option spec_joint overrides), and at most this many slots share one
+	virtual bool joint_default() const { return false; }
+	virtual int joint_max() const { return 1 << 20; }
 	// One round for several owned slots at once (a single draft chain and a single verify forward over all their blocks). Only where joint().
 	virtual bool joint() const { return false; }
 	virtual void speculate_joint( int n, const int* slots, const int* anchors, const int* poss, const SamplingParams* const* sps, Rng* const* rngs, SpecResult* out ) {

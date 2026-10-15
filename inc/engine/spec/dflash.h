@@ -1,5 +1,6 @@
 #pragma once
 
+#include <vector>
 #include "engine/core/comm.h"
 #include "engine/config.h"
 #include "engine/core/tensor.h"
@@ -319,8 +320,25 @@ public:
 	// Seeds the walk with the anchor token (its step-0 predecessor).
 	void set_walk_anchor( int anchor, backend::stream_t stream = nullptr );
 
-	// Drop the projected context (one slot's worth: the ring fill level, KV length and ingested count
-	// are single counters). Called when a new slot claims the drafter.
+	// Contexts: the projected context (the K/V ring, its fill level, KV length and ingested count) belongs to one slot. With set_contexts( n ) before
+	// init the speculator keeps n of them and set_context( i ) switches the one the next draft_backbone reads and extends; reset_context drops the
+	// selected one. The scratch is shared, so only one context drafts at a time.
+	void set_contexts( int n ) { num_contexts_ = MAX( n, 1 ); }
+	void set_context( int i ) {
+		if ( i == ctx_cur_ || i < 0 || i >= static_cast<int>( ctxs_.size() ) ) return;
+		ctxs_[ctx_cur_].kv_len = kv_len_;
+		ctxs_[ctx_cur_].kv_pos0 = kv_pos0_;
+		ctxs_[ctx_cur_].ingested = ctx_ingested_;
+		ctx_cur_ = i;
+		drafter_k_ = ctxs_[i].k;
+		drafter_v_ = ctxs_[i].v;
+		kv_len_ = ctxs_[i].kv_len;
+		kv_pos0_ = ctxs_[i].kv_pos0;
+		ctx_ingested_ = ctxs_[i].ingested;
+	}
+
+	// Drop the projected context (the selected one's ring fill level, KV length and ingested count).
+	// Called when a slot claims the drafter.
 	void reset_context() {
 		ctx_ingested_ = 0;
 		kv_len_ = 0;
@@ -413,8 +431,15 @@ private:
 	// backbone runs, exactly as the reference implementations do: the drafter attends to the real
 	// target context rather than re-reading the target's KV cache. Context occupies a ring of
 	// ring_len_ slots; the block's own transient K/V occupy the reserved tail from own_slot_.
-	pod::TensorView drafter_k_;     // [ring_len + block_size, num_layers, kv_heads_local, head_dim]
-	pod::TensorView drafter_v_;     // [ring_len + block_size, num_layers, kv_heads_local, head_dim]
+	pod::TensorView drafter_k_;     // [ring_len + block_size, num_layers, kv_heads_local, head_dim]; the selected context's
+	pod::TensorView drafter_v_;
+	struct Ctx {
+		pod::TensorView k, v;
+		int kv_len = 0, kv_pos0 = 0, ingested = 0;   // the counters of a context that is not selected
+	};
+	std::vector<Ctx> ctxs_;
+	int num_contexts_ = 1;
+	int ctx_cur_ = 0;
 
 	// Pointers allocated once at boot in static arena
 	int cand_ranks_ = 1;         // contributing target-head ranks for the candidate merge

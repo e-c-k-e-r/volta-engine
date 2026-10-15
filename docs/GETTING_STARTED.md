@@ -115,6 +115,13 @@ Qwen extras:
   the arena per GPU at an 8K window. Plain decode is about 31 tok/s; `--speculative --set speculator=mtp` drafts with the checkpoint's own MTP head and
   roughly doubles it with identical greedy output. Full-attention layers use the model's QSA block selection past 2048 tokens of context; the 256K window
   with 2 slots fits (24.3 of 29.8 GiB per GPU). Images use the checkpoint's own tower. Prefix caching, tools and thinking behave as for Qwen.
+* **DFlash2 with several slots (GLM)**: every slot keeps its own drafter context and tap ring (80 MiB of taps and 10 MiB of drafter K/V per slot on each
+  GPU), so concurrent requests all speculate. With two slots a round drafts each slot's block in turn and verifies both in one target forward, which reads the
+  weights and the experts the rows share once (`spec_joint`, on by default for DFlash2; `spec_joint=0` runs one slot's round per step, `draft_per_slot=false` goes
+  back to one context that the newest request takes over). The speculative verify records each KDA row's inputs and replays the accepted rows
+  instead of keeping a 36 MiB state snapshot per row. Two concurrent streams of repetitive text: 149 tok/s aggregate with joint rounds, 137 interleaved,
+  122 with one speculating slot and 97 for plain batched decode; on typical agent text (about 3 tokens a round) the controller keeps plain batched decode
+  with two streams, which is the faster choice there.
 * **MTP speculation**: `--speculative --set speculator=mtp` drafts with the checkpoint's own multi-token-prediction head and
   needs no draft model (about 1.7x plain decoding against 2.4x for DFlash2 on the same prompts, and it saves the drafter's VRAM). GLM-5.3-Flash takes its head from the
   NVFP4 checkpoint (`nvfp4_dense_src`, quantized to NVFP4 at load; example `configs/glm_mtp.json`) and runs as fast as with the DFlash2 drafter.
