@@ -7,6 +7,7 @@
 #include "engine/loader/safetensors.h"
 #include "engine/modules/linear.h"
 #include "engine/modules/moe.h"
+#include "engine/runtime/options.h"
 #include "engine/modules/swiglu.h"
 #include "trellis_context.h"
 #include <cmath>
@@ -102,16 +103,29 @@ int main( int argc, char** argv ) {
 		CUDA_CHECK( cudaMemcpy( d_idx, hi.data(), hi.size() * sizeof( int ), cudaMemcpyHostToDevice ) );
 		CUDA_CHECK( cudaMemcpy( d_w, hw.data(), hw.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
 		auto scratch = engine::modules::MoE::alloc_scratch( arena, E, K, H, I, R );
-		for ( int it = 0; it < 2; ++it ) engine::modules::MoE::forward( xr, mw, d_idx, d_w, outr, 0, E, scratch, 10.0f, stream );
-		CUDA_CHECK( cudaStreamSynchronize( stream ) );
-		const int iters = 10;
-		CUDA_CHECK( cudaEventRecord( e0, stream ) );
-		for ( int it = 0; it < iters; ++it ) engine::modules::MoE::forward( xr, mw, d_idx, d_w, outr, 0, E, scratch, 10.0f, stream );
-		CUDA_CHECK( cudaEventRecord( e1, stream ) );
-		CUDA_CHECK( cudaEventSynchronize( e1 ) );
-		float ms = 0.0f;
-		CUDA_CHECK( cudaEventElapsedTime( &ms, e0, e1 ) );
-		std::printf( "  rows %4d: %7.3f ms per layer (%d local routes, %.2f us per local route)\n", R, ms / iters, local_routes, 1000.0 * ms / iters / MAX( 1, local_routes ) );
+		// The 32-row prefill tile (moe_prefill_tile) against the 16-row tile on the same routes: time and agreement
+		std::vector<half> res[2];
+		for ( int new_tile = 1; new_tile >= 0; --new_tile ) {
+			engine::runtime::options().moe_prefill_tile = new_tile != 0;
+			for ( int it = 0; it < 2; ++it ) engine::modules::MoE::forward( xr, mw, d_idx, d_w, outr, 0, E, scratch, 10.0f, stream );
+			CUDA_CHECK( cudaStreamSynchronize( stream ) );
+			const int iters = 10;
+			CUDA_CHECK( cudaEventRecord( e0, stream ) );
+			for ( int it = 0; it < iters; ++it ) engine::modules::MoE::forward( xr, mw, d_idx, d_w, outr, 0, E, scratch, 10.0f, stream );
+			CUDA_CHECK( cudaEventRecord( e1, stream ) );
+			CUDA_CHECK( cudaEventSynchronize( e1 ) );
+			float ms = 0.0f;
+			CUDA_CHECK( cudaEventElapsedTime( &ms, e0, e1 ) );
+			res[new_tile].resize( static_cast<size_t>( R ) * H );
+			CUDA_CHECK( cudaMemcpy( res[new_tile].data(), outr.data, res[new_tile].size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+			std::printf( "  rows %4d, %s tile: %7.3f ms per layer (%d local routes, %.2f us per local route)\n", R, new_tile ? "32-row" : "16-row", ms / iters, local_routes, 1000.0 * ms / iters / MAX( 1, local_routes ) );
+		}
+		double dot = 0, na = 0, nb = 0, maxd = 0;
+		for ( size_t i = 0; i < res[0].size(); ++i ) {
+			const double x = __half2float( res[0][i] ), y = __half2float( res[1][i] );
+			dot += x * y; na += x * x; nb += y * y; maxd = std::max( maxd, std::fabs( x - y ) );
+		}
+		std::printf( "    agreement: cos %.7f, max |diff| %.5f (rms %.4f)\n", dot / std::sqrt( na * nb + 1e-30 ), maxd, std::sqrt( na / res[0].size() ) );
 	}
 	return 0;
 }

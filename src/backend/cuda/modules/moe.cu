@@ -849,7 +849,7 @@ void MoE::forward(
 			ENGINE_ASSERT( weights.device_ptrs != nullptr, "MoE::forward: init_device_ptrs not called" );
 			ENGINE_ASSERT( K_gate == K_up && K_up == K_down && ( K_gate == 3 || K_gate == 4 ), "MoE::forward: persistent trellis MoE kernel is instantiated for 3 and 4-bit experts only" );
 
-			const int wide = rows > 8 ? 2 : 0;
+			const int wide = rows > 128 && runtime::options().moe_prefill_tile ? 3 : rows > 8 ? 2 : 0;
 			MoERouter::exl3_moe_dispatch(
 				d_topk_indices,
 				d_topk_weights,
@@ -863,7 +863,7 @@ void MoE::forward(
 				scratch.active_experts,
 				stream,
 				rows,
-				wide == 2 ? 16 : 4,
+				wide == 3 ? 32 : wide == 2 ? 16 : 4,
 				weights.heat,
 				weights.top_k
 			);
@@ -973,7 +973,8 @@ void exl3_moe(
 
 	// num_groups experts run concurrently on num_sms / num_groups blocks each, all co-resident
 	ENGINE_ASSERT( num_groups >= 1 && num_groups <= MOE_MAX_GROUPS, "exl3_moe: bad group count" );
-	int group_size = num_sms / num_groups;
+	const int blocks_per_sm = wide == 3 ? MOE_PREFILL_BLOCKS_PER_SM : 1;
+	int group_size = num_sms * blocks_per_sm / num_groups;
 	dim3 grid_dim( group_size, 1, num_groups );
 	int block_dim = 256 * MOE_TILESIZE_K / 16;
 
@@ -981,7 +982,7 @@ void exl3_moe(
 	half* _output_state = static_cast<half*>( output_state );
 
 	int num_experts_per_tok = top_k;
-	int max_tokens_per_expert = wide == 2 ? 16 : 4; // rows per expert pass (the GEMM tile); larger batches run in chunks
+	int max_tokens_per_expert = wide == 3 ? 32 : wide == 2 ? 16 : 4; // rows per expert pass (the GEMM tile); larger batches run in chunks
 	int concurrency = num_groups;
 	int chunk_all = 1; // experts above max_tokens_per_expert tokens are evaluated in chunks of max_tokens_per_expert
 
@@ -1028,9 +1029,10 @@ void exl3_moe(
 	ENGINE_ASSERT( intermediate_dim % ( tile128 ? 128 : 256 ) == 0, "exl3_moe: intermediate width vs the output tile" );
 	const int variant = K_gate == 4 ? 2 : ( tile128 ? 1 : 0 );   // 0: <3,256>, 1: <3,128>, 2: <4,128>
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_done[device][variant] ) {
-		void* fns[2] = {
+		void* fns[3] = {
 			variant == 0 ? (void*) exl3_moe_kernel<3, 256, 2, 0> : variant == 1 ? (void*) exl3_moe_kernel<3, 128, 2, 0> : (void*) exl3_moe_kernel<4, 128, 2, 0>,
-			variant == 0 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : variant == 1 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 2> };
+			variant == 0 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : variant == 1 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 2>,
+			variant == 0 ? (void*) exl3_moe_kernel<3, 256, 2, 3> : variant == 1 ? (void*) exl3_moe_kernel<3, 128, 2, 3> : (void*) exl3_moe_kernel<4, 128, 2, 3> };
 		for ( void* fn : fns ) CUDA_CHECK( cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		attr_done[device][variant] = true;
 	}
@@ -1039,7 +1041,8 @@ void exl3_moe(
 	// Output-tile width of the expert GEMMs: 256 is 18-29% faster than 128 below 64 rows on both the sharded and the whole-expert
 	// layouts (fewer K-split reductions per weight decoded) and level at 512
 	void* moe_fn = nullptr;
-	if ( variant == 0 ) moe_fn = wide == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0>;
+	if ( wide == 3 ) moe_fn = variant == 0 ? (void*) exl3_moe_kernel<3, 256, 2, 3> : variant == 1 ? (void*) exl3_moe_kernel<3, 128, 2, 3> : (void*) exl3_moe_kernel<4, 128, 2, 3>;
+	else if ( variant == 0 ) moe_fn = wide == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0>;
 	else if ( variant == 1 ) moe_fn = wide == 2 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<3, 128, 2, 0>;
 	else moe_fn = wide == 2 ? (void*) exl3_moe_kernel<4, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 0>;
 #if defined(USE_ROCM)
@@ -1048,7 +1051,7 @@ void exl3_moe(
 	const size_t moe_smem = static_cast<size_t>( exl3_gemm_smem_bytes( 16, MOE_TILESIZE_K, tile128 ? 128 : 256, MOE_SH_STAGES, MOE_FRAG_STAGES, K_gate, false ) );
 	ENGINE_ASSERT( moe_smem <= static_cast<size_t>( rocm_smem_optin_max() ), "exl3_moe: tile shared memory above the device limit" );
 #else
-	const size_t moe_smem = SMEM_MAX;
+	const size_t moe_smem = blocks_per_sm > 1 ? static_cast<size_t>( exl3_gemm_smem_bytes( 32, MOE_TILESIZE_K, tile128 ? 128 : 256, MOE_SH_STAGES, MOE_PREFILL_FRAG_STAGES, K_gate, false ) ) : SMEM_MAX;
 #endif
 	CUDA_CHECK( cudaLaunchKernel(
 		moe_fn,

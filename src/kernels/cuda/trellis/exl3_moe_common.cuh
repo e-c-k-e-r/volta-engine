@@ -13,6 +13,12 @@
 #define MOE_TILESIZE_M 16
 #define MOE_SH_STAGES 3
 #define MOE_FRAG_STAGES 3
+// The prefill variant (wide == 3, chunks of more than 128 rows) trades pipeline depth for registers: 2 fragment stages fit 128 registers, so two
+// blocks share an SM and the warps of one hide the barrier and shuffle stalls of the other (1 block of 230 registers left 8 warps per SM)
+#define MOE_PREFILL_FRAG_STAGES 2
+#ifndef MOE_PREFILL_BLOCKS_PER_SM
+#define MOE_PREFILL_BLOCKS_PER_SM 2
+#endif
 
 inline int get_moe_num_groups( int bsz, int concurrency ) {
 	return (int) concurrency;

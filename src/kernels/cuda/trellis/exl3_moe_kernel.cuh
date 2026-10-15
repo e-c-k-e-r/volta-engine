@@ -14,7 +14,7 @@
 #include "ptx.cuh"
 #include "trellis_context.h"
 
-template<int t_bits, int MOE_TILESIZE_N, int cb>
+template<int t_bits, int MOE_TILESIZE_N, int cb, int TK, int FS>
 __device__ __noinline__ void moe_gemm_m16(
 	const half* in_addr,
 	const uint16_t* trellis,
@@ -24,12 +24,12 @@ __device__ __noinline__ void moe_gemm_m16(
 	int dim_n,
 	int* locks
 ) {
-	exl3_gemm_kernel_inner<t_bits, false, cb, 16, MOE_TILESIZE_K, MOE_TILESIZE_N, MOE_SH_STAGES, MOE_FRAG_STAGES, false>(
+	exl3_gemm_kernel_inner<t_bits, false, cb, 16, TK, MOE_TILESIZE_N, MOE_SH_STAGES, FS, false>(
 		in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, nullptr
 	);
 }
 
-template<int t_bits, int MOE_TILESIZE_N, int cb>
+template<int t_bits, int MOE_TILESIZE_N, int cb, int TK, int FS>
 __device__ __noinline__ void moe_gemm_m4(
 	const half* in_addr,
 	const uint16_t* trellis,
@@ -39,12 +39,24 @@ __device__ __noinline__ void moe_gemm_m4(
 	int dim_n,
 	int* locks
 ) {
-	exl3_gemm_kernel_inner<t_bits, false, cb, 4, MOE_TILESIZE_K, MOE_TILESIZE_N, MOE_SH_STAGES, MOE_FRAG_STAGES, false>(
+	exl3_gemm_kernel_inner<t_bits, false, cb, 4, TK, MOE_TILESIZE_N, MOE_SH_STAGES, FS, false>(
 		in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, nullptr
 	);
 }
 
-// Expert GEMM over `rows` gathered tokens. wide = 0: the 4-row tile only (decode); 2: 16-row tile above 4 rows (prefill chunks).
+#if EXL3_VOLTA && EXL3_SM70_HMMA
+template<int t_bits, int MOE_TILESIZE_N, int cb, int TK, int TM, int FS>
+__device__ __noinline__ void moe_gemm_m64(
+	const half* in_addr, const uint16_t* trellis, half* out_addr, int rows, int dim_k, int dim_n, int* locks
+) {
+	exl3_gemm_kernel_inner_m64<t_bits, false, cb, TM, TK, MOE_TILESIZE_N, MOE_SH_STAGES, FS, false>(
+		in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, nullptr
+	);
+}
+#endif
+
+// Expert GEMM over `rows` gathered tokens. wide = 0: the 4-row tile only (decode); 2: 16-row tile above 4 rows; 3 (prefill chunks): 16-row tile
+// for 5..16 rows and a 32-row tile above, which decodes each weight tile once for both row blocks.
 // (exl3_gemm_kernel_inner_m64 exists but disagrees with the 16-row kernel: cos 0.96 on expert batches above 4 rows.)
 template<int t_bits, int MOE_TILESIZE_N, int cb, int wide>
 __device__ inline void moe_gemm(
@@ -56,11 +68,18 @@ __device__ inline void moe_gemm(
 	int dim_n,
 	int* locks
 ) {
-	if constexpr ( wide == 2 ) if ( rows > 4 ) {
-		moe_gemm_m16<t_bits, MOE_TILESIZE_N, cb>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks );
+#if EXL3_VOLTA && EXL3_SM70_HMMA
+	if constexpr ( wide == 3 ) if ( rows > 16 ) {
+		if ( rows > 32 ) moe_gemm_m64<t_bits, MOE_TILESIZE_N, cb, MOE_TILESIZE_K, 64, MOE_PREFILL_FRAG_STAGES>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks );
+		else moe_gemm_m64<t_bits, MOE_TILESIZE_N, cb, MOE_TILESIZE_K, 32, MOE_PREFILL_FRAG_STAGES>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks );
 		return;
 	}
-	moe_gemm_m4<t_bits, MOE_TILESIZE_N, cb>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks );
+#endif
+	if constexpr ( wide >= 2 ) if ( rows > 4 ) {
+		moe_gemm_m16<t_bits, MOE_TILESIZE_N, cb, MOE_TILESIZE_K, ( wide == 3 ? MOE_PREFILL_FRAG_STAGES : MOE_FRAG_STAGES )>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks );
+		return;
+	}
+	moe_gemm_m4<t_bits, MOE_TILESIZE_N, cb, MOE_TILESIZE_K, ( wide == 3 ? MOE_PREFILL_FRAG_STAGES : MOE_FRAG_STAGES )>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks );
 }
 
 template<bool gated>
@@ -166,7 +185,7 @@ __device__ inline void moe_had_d_out(
 }
 
 template<int t_bits, int MOE_TILESIZE_N, int cb, int wide>
-__global__ __launch_bounds__( EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16 )
+__global__ __launch_bounds__( EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16, ( wide == 3 ? MOE_PREFILL_BLOCKS_PER_SM : 1 ) )
 void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
 	const int group_idx = blockIdx.z;
 	const int block_idx = blockIdx.x;

@@ -65,7 +65,7 @@ void exl3_gemm_kernel_inner_m64
     const half* post_scale
 )
 {
-    constexpr int TM = 64;
+    constexpr int TM = TILESIZE_M;   // 32 or 64 rows: 2 or 4 row-blocks sharing one decode of the B fragments
     constexpr int ROW_BLOCKS = TM / 16;
     const int TILEBLOCKS_K = TILESIZE_K / 16;
     const int TILEBLOCKS_N = TILESIZE_N / 16;
@@ -80,9 +80,9 @@ void exl3_gemm_kernel_inner_m64
     const int A_SWIZZLE_SHIFT = (A_COLS <= 2) ? 2 : 1;
 
     static_assert(EXL3_GEMM_BASE_THREADS == 256);
-    static_assert(TILESIZE_M == 64, "m64 inner requires TILESIZE_M == 64");
-    static_assert(TILESIZE_K == 32, "m64 inner requires TILESIZE_K == 32");
-    static_assert(TILESIZE_N == 128, "m64 inner requires TILESIZE_N == 128");
+    static_assert(TILESIZE_M == 32 || TILESIZE_M == 64, "m64 inner requires TILESIZE_M == 32 or 64");
+    static_assert(TILESIZE_K == 16 || TILESIZE_K == 32, "m64 inner requires TILESIZE_K == 16 or 32");
+    static_assert(TILESIZE_N == 128 || TILESIZE_N == 256, "m64 inner requires TILESIZE_N == 128 or 256");
     static_assert(!shmem_out_had, "m64 inner: shmem_out_had not supported");
     static_assert(!c_fp32, "m64 inner: c_fp32 not supported");
     static_assert
@@ -355,6 +355,7 @@ void exl3_gemm_kernel_inner_m64
 
         // Threadblock reduction across the two sub_k groups, per row-block.
         // Same scratch region and store/add pattern as the M=16 kernel.
+        if constexpr (TILEBLOCKS_K == 2) {
         for (int rb = 0; rb < ROW_BLOCKS; ++rb)
         {
             if (sub_k == 1)
@@ -376,6 +377,7 @@ void exl3_gemm_kernel_inner_m64
             }
             // sh_red is reused by the next row block: sub_k 1 must not overwrite it before sub_k 0 has read it
             __syncthreads();
+        }
         }
 
         int lock_i = tiles_k - slice2_k - 1;

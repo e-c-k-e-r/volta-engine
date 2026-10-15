@@ -37,6 +37,7 @@ OPTION( bool, dsa, true, "GLM sparse attention indexer (top-2048 key selection);
 OPTION( int, max_image_tokens, 1024, "largest image the vision tower accepts, in language-model tokens (4 patches each; sizes its scratch and caps the resize); 0 = image input off" )
 OPTION( bool, expert_stats, true, "count the routes per expert for the monitor page (a device sync per rank about once a second while serving)" )
 OPTION( bool, spec_ctrl, true, "adaptive speculation controller; false always speculates" )
+DEBUG_OPTION( bool, moe_prefill_tile, true, "trellis MoE, prefill chunks of more than 128 rows: the 32-row expert tile with two resident blocks per SM; false runs the 16-row tile of the decode kernels (A/B)" )
 DEBUG_OPTION( bool, moe_gemv, false, "ROCm: the expert-grouped EXL3 MoE runs its projections on the v_dot2 GEMV instead of the WMMA kernels" )
 DEBUG_OPTION( bool, nvfp4_hipblas, false, "ROCm: NVFP4 linears of more than 16 rows dequantize into FP16 and run one hipBLAS GEMM instead of the fused WMMA GEMM (the FP16 scratch can move as it grows, which a captured graph cannot follow)" )
 DEBUG_OPTION( bool, expert_log, false, "per-rebalance expert tier statistics" )
