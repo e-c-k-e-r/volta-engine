@@ -1,4 +1,5 @@
 #include "engine/modules/ple.h"
+#include "engine/backend/cuda/reduce.cuh"
 #include <cuda_fp16.h>
 #include <cmath>
 
@@ -6,16 +7,10 @@ namespace engine::modules {
 
 namespace {
 
-__device__ __forceinline__ float warp_sum_p( float v ) {
-	#pragma unroll
-	for ( int o = 16; o > 0; o >>= 1 ) v += __shfl_xor_sync( 0xffffffff, v, o );
-	return v;
-}
-
 // Sum over the block of up to 3 values at once (blockDim.x <= 1024)
 __device__ __forceinline__ void block_sum3( float& a, float& b, float& c ) {
 	__shared__ float sh[3][32];
-	a = warp_sum_p( a ); b = warp_sum_p( b ); c = warp_sum_p( c );
+	a = engine::math::warp_sum( a ); b = engine::math::warp_sum( b ); c = engine::math::warp_sum( c );
 	const int w = threadIdx.x >> 5;
 	__syncthreads();
 	if ( ( threadIdx.x & 31 ) == 0 ) { sh[0][w] = a; sh[1][w] = b; sh[2][w] = c; }

@@ -3,6 +3,7 @@
 // (fragment maps and their CPU check: nvfp4_frag.h, tests/2_parity/test_nvfp4_frag.cpp)
 #include <cuda_fp16.h>
 #include "nvfp4_frag.h"
+#include "../mma_sm80.cuh"
 #if defined(USE_ROCM)
 	#include "../../rocm/mma_emu.h"
 #endif
@@ -24,15 +25,7 @@
 	#define NVFP4_MMA_SM80 0
 #endif
 
-#define MMA_8N8K4(C, A0, A1, B0, B1) \
-	asm volatile ( \
-		"mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 " \
-		"{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, " \
-		"{%0,%1,%2,%3,%4,%5,%6,%7};\n" \
-		: "+f"( C[0] ), "+f"( C[1] ), "+f"( C[2] ), "+f"( C[3] ), "+f"( C[4] ), \
-		  "+f"( C[5] ), "+f"( C[6] ), "+f"( C[7] ) \
-		: "r"( A0 ), "r"( A1 ), "r"( B0 ), "r"( B1 ) \
-	)
+#define MMA_8N8K4(C, A0, A1, B0, B1) mma884( C, A0, A1, B0, B1 )
 
 DEV_INLINE half2 fp8e4m3_to_half2( unsigned char b ) {
 	const unsigned short hb =

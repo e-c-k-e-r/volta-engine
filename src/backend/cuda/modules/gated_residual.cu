@@ -1,4 +1,5 @@
 #include "engine/modules/gated_residual.h"
+#include "engine/backend/cuda/reduce.cuh"
 #include "engine/config.h"
 #include "trellis_context.h"
 #include <cublas_v2.h>
@@ -9,11 +10,7 @@ namespace engine::modules {
 
 namespace {
 
-__device__ __forceinline__ float warp_sum( float v ) {
-	#pragma unroll
-	for ( int o = 16; o > 0; o >>= 1 ) v += __shfl_xor_sync( 0xffffffff, v, o );
-	return v;
-}
+using engine::math::warp_sum;
 
 __global__ void gr_init_kernel( const half* __restrict__ in, float* __restrict__ x, int hidden, int hc ) {
 	const int r = blockIdx.y;

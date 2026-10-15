@@ -7,6 +7,7 @@
 #if defined(USE_ROCM)
 	#include "../../../kernels/rocm/mma_emu.h"
 #endif
+#include "../../../kernels/cuda/mma_sm80.cuh"
 #include <cmath>
 
 namespace engine::modules {
@@ -372,20 +373,6 @@ constexpr int kMmaWarps = 4;
 constexpr int kMmaKeys = 64;
 constexpr int kMmaVs = 80;   // halves per transposed V row: 40 words, 8 mod 32, so a half-warp's 8-byte reads hit distinct banks
 
-__device__ __forceinline__ void vis_mma( float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1 ) {
-#if defined(USE_ROCM)
-	const uint32_t a[2] = { a0, a1 }, b[2] = { b0, b1 };
-	mma_emu_m8n8k4_f32( a, b, c, threadIdx.x & 31, rocm_shfl() );
-#else
-	asm volatile (
-		"mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
-		"{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
-		: "+f"( c[0] ), "+f"( c[1] ), "+f"( c[2] ), "+f"( c[3] ), "+f"( c[4] ), "+f"( c[5] ), "+f"( c[6] ), "+f"( c[7] )
-		: "r"( a0 ), "r"( a1 ), "r"( b0 ), "r"( b1 )
-	);
-#endif
-}
-
 template <int HD>
 __global__ void __launch_bounds__( kMmaWarps * 32, 2 ) attention_mma_kernel( const half* __restrict__ q, const half* __restrict__ k, const half* __restrict__ v,
 	half* __restrict__ out, int m, int heads, float scale ) {
@@ -451,7 +438,7 @@ __global__ void __launch_bounds__( kMmaWarps * 32, 2 ) attention_mma_kernel( con
 			#pragma unroll
 			for ( int j = 0; j < 4; ++j ) {
 				const uint2 b = *reinterpret_cast<const uint2*>( sK + ( 16 * j + 8 * ( qp & 1 ) + e ) * KS + 4 * ks );
-				vis_mma( c[j], qa[ks].x, qa[ks].y, b.x, b.y );
+				mma884( c[j], qa[ks].x, qa[ks].y, b.x, b.y );
 			}
 		}
 		// Scale into the log2 domain and mask keys past the end
@@ -504,7 +491,7 @@ __global__ void __launch_bounds__( kMmaWarps * 32, 2 ) attention_mma_kernel( con
 				#pragma unroll
 				for ( int g = 0; g < NG; ++g ) {
 					const uint2 b = *reinterpret_cast<const uint2*>( sVt + ( 8 * g + e ) * kMmaVs + 16 * j + 8 * ( qp & 1 ) + 4 * sidx );
-					vis_mma( o[g], a0[sidx], a1[sidx], b.x, b.y );
+					mma884( o[g], a0[sidx], a1[sidx], b.x, b.y );
 				}
 			}
 		}

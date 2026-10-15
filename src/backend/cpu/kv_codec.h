@@ -3,6 +3,7 @@
 #pragma once
 
 #include "engine/core/kv_format.h"
+#include "engine/quant/fp4_fp8.h"
 #include "engine/backend/types.h"
 #include <cmath>
 #include <cstdint>
@@ -17,14 +18,11 @@ inline float kv_h2f( uint16_t bits ) {
 }
 
 inline float kv_e2m1( unsigned nib ) {
-	static const float mag[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
-	return ( nib & 8u ) ? -mag[nib & 7u] : mag[nib & 7u];
+	return quant::e2m1_to_float( static_cast<int>( nib ) );
 }
 
 inline float kv_e4m3( unsigned b ) {
-	const unsigned e = ( b >> 3 ) & 15u, m = b & 7u;
-	const float v = ( e == 0 ) ? m * 0.001953125f : std::ldexp( 1.0f + m * 0.125f, static_cast<int>( e ) - 7 );
-	return ( b & 0x80u ) ? -v : v;
+	return quant::e4m3_to_float( b );
 }
 
 // Element i (flat within the pool) of a cache tensor of format q; scales as in kv_format.h

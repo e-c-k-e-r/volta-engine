@@ -345,20 +345,6 @@ void latent_attn_kernel(
 #define LT_OFF_A ( LT_OFF_P + LT_BQ * LT_VS * 2 )
 #define LT_SMEM ( LT_OFF_A + LT_BQ * 12 )
 
-__device__ __forceinline__ void lt_mma( float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1 ) {
-#if defined(USE_ROCM)
-	const uint32_t a[2] = { a0, a1 }, b[2] = { b0, b1 };
-	mma_emu_m8n8k4_f32( a, b, c, threadIdx.x & 31, rocm_shfl() );
-#else
-	asm volatile (
-		"mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
-		"{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
-		: "+f"( c[0] ), "+f"( c[1] ), "+f"( c[2] ), "+f"( c[3] ), "+f"( c[4] ), "+f"( c[5] ), "+f"( c[6] ), "+f"( c[7] )
-		: "r"( a0 ), "r"( a1 ), "r"( b0 ), "r"( b1 )
-	);
-#endif
-}
-
 template <KVQ Q>
 __global__ __launch_bounds__( 256 )
 void latent_prefill_tc_kernel(
@@ -516,7 +502,7 @@ void latent_prefill_tc_kernel(
 			for ( int ks = 0; ks < 64; ++ks ) {
 				const uint2 a = *reinterpret_cast<const uint2*>( s_arow + 4 * ks );
 				const uint2 b = *reinterpret_cast<const uint2*>( s_brow + 4 * ks );
-				lt_mma( c, a.x, a.y, b.x, b.y );
+				mma884( c, a.x, a.y, b.x, b.y );
 			}
 			#pragma unroll
 			for ( int r = 0; r < 8; ++r ) {
@@ -619,7 +605,7 @@ void latent_prefill_tc_kernel(
 			for ( int i = 0; i < 4; ++i ) {
 				const uint2 a = *reinterpret_cast<const uint2*>( p_row + 8 * i * LT_VS + 4 * kk );
 				#pragma unroll
-				for ( int jj = 0; jj < 2; ++jj ) lt_mma( acc[jj][i], a.x, a.y, b[jj].x, b[jj].y );
+				for ( int jj = 0; jj < 2; ++jj ) mma884( acc[jj][i], a.x, a.y, b[jj].x, b[jj].y );
 			}
 		}
 #endif
@@ -872,7 +858,7 @@ void latent_sparse_tc_kernel(
 			for ( int ks = 0; ks < 32; ++ks ) {
 				const uint2 a = *reinterpret_cast<const uint2*>( s_arow + 4 * ks );
 				const uint2 b = *reinterpret_cast<const uint2*>( s_brow + 4 * ks );
-				lt_mma( c, a.x, a.y, b.x, b.y );
+				mma884( c, a.x, a.y, b.x, b.y );
 			}
 			#pragma unroll
 			for ( int q = 0; q < 8; ++q ) {
@@ -975,7 +961,7 @@ void latent_sparse_tc_kernel(
 			for ( int i = 0; i < 2; ++i ) {
 				const uint2 a = *reinterpret_cast<const uint2*>( p_row + 8 * i * LT_VS + 4 * kk );
 				#pragma unroll
-				for ( int jj = 0; jj < 2; ++jj ) lt_mma( acc[jj][i], a.x, a.y, b[jj].x, b[jj].y );
+				for ( int jj = 0; jj < 2; ++jj ) mma884( acc[jj][i], a.x, a.y, b[jj].x, b[jj].y );
 			}
 		}
 #endif

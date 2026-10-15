@@ -431,20 +431,6 @@ void attn_sparse_warp_kernel(
 #define PA_OFF_A ( PA_OFF_P + PA_BQ * PA_VS * 2 )
 #define PA_SMEM ( PA_OFF_A + PA_BQ * 12 )
 
-__device__ __forceinline__ void pa_mma( float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1 ) {
-#if defined(USE_ROCM)
-	const uint32_t a[2] = { a0, a1 }, b[2] = { b0, b1 };
-	mma_emu_m8n8k4_f32( a, b, c, threadIdx.x & 31, rocm_shfl() );
-#else
-	asm volatile (
-		"mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
-		"{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
-		: "+f"( c[0] ), "+f"( c[1] ), "+f"( c[2] ), "+f"( c[3] ), "+f"( c[4] ), "+f"( c[5] ), "+f"( c[6] ), "+f"( c[7] )
-		: "r"( a0 ), "r"( a1 ), "r"( b0 ), "r"( b1 )
-	);
-#endif
-}
-
 template <KVQ KQ, KVQ VQ, bool SP>
 __global__ __launch_bounds__( 256 )
 void attn_prefill_tc_kernel(
@@ -642,7 +628,7 @@ void attn_prefill_tc_kernel(
 			for ( int ks = 0; ks < HD / 4; ++ks ) {
 				const uint2 a = *reinterpret_cast<const uint2*>( s_arow + 4 * ks );
 				const uint2 b = *reinterpret_cast<const uint2*>( s_brow + 4 * ks );
-				pa_mma( c, a.x, a.y, b.x, b.y );
+				mma884( c, a.x, a.y, b.x, b.y );
 			}
 			#pragma unroll
 			for ( int r = 0; r < 8; ++r ) {
@@ -726,7 +712,7 @@ void attn_prefill_tc_kernel(
 			#pragma unroll
 			for ( int i = 0; i < 4; ++i ) {
 				const uint2 a = *reinterpret_cast<const uint2*>( p_row + 8 * i * PA_VS + 4 * kk );
-				pa_mma( acc[i], a.x, a.y, b.x, b.y );
+				mma884( acc[i], a.x, a.y, b.x, b.y );
 			}
 		}
 #endif

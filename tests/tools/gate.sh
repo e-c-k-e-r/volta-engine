@@ -46,8 +46,8 @@ static_checks() {
 	# CPU configuration: configures without CUDA, builds, smoke test passes
 	cmake -S $ROOT -B $ROOT/build_cpu -G Ninja -DENGINE_BACKEND=CPU > $out/cpu_cmake.log 2>&1 && ninja -C $ROOT/build_cpu test_cpu_smoke > $out/cpu_build.log 2>&1 && $ROOT/build_cpu/test_cpu_smoke > $out/cpu_smoke.log 2>&1 || { echo "CPU configuration FAILED (see $out/cpu_*.log)"; bad=1; }
 	# CPU and Vulkan configurations: build the op-level tests and smoke tests used by `parity`
-	ninja -C $ROOT/build_cpu test_cpu_smoke test_ops_linear test_ops_moe test_ops_attention test_ops_flash test_ops_vision > $out/cpu_ops_build.log 2>&1 || { echo "CPU op tests build FAILED"; bad=1; }
-	cmake -S $ROOT -B $ROOT/build_vk -G Ninja -DENGINE_BACKEND=VULKAN > $out/vk_cmake.log 2>&1 && ninja -C $ROOT/build_vk test_vulkan_smoke test_vulkan_ref test_vulkan_comm test_ops_linear test_ops_attention test_ops_moe test_ops_flash test_ops_vision test_vulkan_forward > $out/vk_build.log 2>&1 || { echo "Vulkan configuration FAILED (see $out/vk_*.log)"; bad=1; }
+	ninja -C $ROOT/build_cpu slang_kernels > $out/cpu_slang.log 2>&1 && ninja -C $ROOT/build_cpu test_cpu_smoke test_ops_linear test_ops_moe test_ops_attention test_ops_flash test_ops_vision > $out/cpu_ops_build.log 2>&1 || { echo "CPU op tests build FAILED"; bad=1; }
+	cmake -S $ROOT -B $ROOT/build_vk -G Ninja -DENGINE_BACKEND=VULKAN > $out/vk_cmake.log 2>&1 && ninja -C $ROOT/build_vk slang_kernels > $out/vk_slang.log 2>&1 && ninja -C $ROOT/build_vk test_vulkan_smoke test_vulkan_ref test_vulkan_comm test_ops_linear test_ops_attention test_ops_moe test_ops_flash test_ops_vision test_vulkan_forward > $out/vk_build.log 2>&1 || { echo "Vulkan configuration FAILED (see $out/vk_*.log)"; bad=1; }
 	# Slang-generated SPIR-V must validate
 	for f in slang/*.spv(N); do spirv-val $f > $out/$f:t.log 2>&1 || { echo "spirv-val FAILED: $f"; bad=1; }; done
 	for f in $ROOT/build_vk/slang/*.spv(N); do spirv-val $f > $out/vk_$f:t.log 2>&1 || { echo "spirv-val FAILED: $f"; bad=1; }; done

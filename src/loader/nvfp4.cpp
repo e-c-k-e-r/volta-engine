@@ -8,6 +8,7 @@
 //   scale   the e4m3 byte of (n, g), copied raw
 // Streams are [tile][group][lane].
 #include "engine/loader/safetensors.h"
+#include "engine/quant/fp4_fp8.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
 #include <algorithm>
@@ -20,16 +21,9 @@ namespace engine::loader {
 
 namespace {
 
-float e4m3_to_float( uint8_t b ) {
-	const int e = ( b >> 3 ) & 15, m = b & 7;
-	const float v = ( e == 0 ) ? std::ldexp( m / 8.0f, -6 ) : std::ldexp( 1.0f + m / 8.0f, e - 7 );
-	return ( b & 0x80 ) ? -v : v;
-}
-
-float e2m1_to_float( int c ) {
-	static const float lut[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
-	return ( c & 8 ) ? -lut[c & 7] : lut[c & 7];
-}
+using quant::e2m1_code;
+using quant::e2m1_to_float;
+using quant::e4m3_to_float;
 
 struct Nvfp4Source {
 	const uint8_t* packed = nullptr;  // [N, K/2]
@@ -163,13 +157,6 @@ float bf16_or_fp16_to_float( const uint8_t* p, bool bf16 ) {
 	const int e = ( h >> 10 ) & 31, m = h & 1023;
 	const float v = e == 0 ? std::ldexp( m / 1024.0f, -14 ) : e == 31 ? 65504.0f : std::ldexp( 1.0f + m / 1024.0f, e - 15 );
 	return ( h & 0x8000 ) ? -v : v;
-}
-
-// Nearest E2M1 code (sign bit 3, magnitude index 0..7) of x
-inline int e2m1_code( float x ) {
-	const float a = std::fabs( x );
-	int m = a <= 0.25f ? 0 : a < 0.75f ? 1 : a <= 1.25f ? 2 : a < 1.75f ? 3 : a <= 2.5f ? 4 : a < 3.5f ? 5 : a <= 5.0f ? 6 : 7;
-	return m | ( x < 0.0f ? 8 : 0 );
 }
 
 }  // namespace

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "engine/core/kv_format.h"
+#include "engine/quant/fp4_fp8.h"
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cstdint>
@@ -11,21 +12,17 @@ namespace engine::modules {
 using pod::KVQ;
 
 __device__ __forceinline__ float kv_e2m1_value( int nib ) {
-	const float mag[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
-	const float v = mag[nib & 7];
-	return ( nib & 8 ) ? -v : v;
+	return engine::quant::e2m1_to_float( nib );
 }
 
+// The cache keeps no negative zero: a negative value that rounds to zero is code 0
 __device__ __forceinline__ int kv_e2m1_encode( float x ) {
-	const float a = fabsf( x );
-	int idx = a < 0.25f ? 0 : a < 0.75f ? 1 : a < 1.25f ? 2 : a < 1.75f ? 3 : a < 2.5f ? 4 : a < 3.5f ? 5 : a < 5.0f ? 6 : 7;
+	const int idx = engine::quant::e2m1_index( fabsf( x ) );
 	return idx | ( ( x < 0.0f && idx != 0 ) ? 8 : 0 );
 }
 
 __device__ __forceinline__ float kv_e4m3_value( uint8_t b ) {
-	const int e = ( b >> 3 ) & 15, m = b & 7;
-	const float v = ( e == 0 ) ? ldexpf( m * 0.125f, -6 ) : ldexpf( 1.0f + m * 0.125f, e - 7 );
-	return ( b & 0x80 ) ? -v : v;
+	return engine::quant::e4m3_to_float( b );
 }
 
 __device__ __forceinline__ uint8_t kv_e4m3_encode( float x ) {

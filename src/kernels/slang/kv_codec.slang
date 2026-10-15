@@ -24,7 +24,8 @@ float kv_e2m1_value(uint nib) {
 
 uint kv_e2m1_encode(float x) {
 	let a = abs(x);
-	uint idx = a < 0.25f ? 0u : a < 0.75f ? 1u : a < 1.25f ? 2u : a < 1.75f ? 3u : a < 2.5f ? 4u : a < 3.5f ? 5u : a < 5.0f ? 6u : 7u;
+	// ties to the even code, as engine::quant::e2m1_index (inc/engine/quant/fp4_fp8.h): 0.25, 1.25, 2.5 and 5.0 round down, 0.75, 1.75 and 3.5 up
+	uint idx = a <= 0.25f ? 0u : a < 0.75f ? 1u : a <= 1.25f ? 2u : a < 1.75f ? 3u : a <= 2.5f ? 4u : a < 3.5f ? 5u : a <= 5.0f ? 6u : 7u;
 	return idx | ((x < 0.0f && idx != 0u) ? 8u : 0u);
 }
 

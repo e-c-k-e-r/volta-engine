@@ -1,4 +1,5 @@
 #include "engine/loader/ngram_table.h"
+#include "engine/quant/fp4_fp8.h"
 #include "engine/loader/safetensors.h"
 #include "engine/core/log.h"
 #include "engine/backend/numeric.h"
@@ -22,13 +23,6 @@ float bf16_bits_to_float( uint16_t bits ) {
 	float f;
 	std::memcpy( &f, &u, 4 );
 	return f;
-}
-
-// E4M3 (bias 7, no infinity) byte -> float
-float e4m3_byte_to_float( uint8_t b ) {
-	const int e = ( b >> 3 ) & 15, m = b & 7;
-	const float v = e == 0 ? std::ldexp( m / 8.0f, -6 ) : std::ldexp( 1.0f + m / 8.0f, e - 7 );
-	return ( b & 0x80 ) ? -v : v;
 }
 
 float half_bits_to_float( uint16_t bits ) {
@@ -173,7 +167,7 @@ void NgramTable::decode_row( uint64_t uid, int head, float* out ) const {
 	if ( fp8_ ) {
 		static const std::vector<float> lut = []() {
 			std::vector<float> t( 256 );
-			for ( int b = 0; b < 256; ++b ) t[b] = e4m3_byte_to_float( static_cast<uint8_t>( b ) );
+			for ( int b = 0; b < 256; ++b ) t[b] = quant::e4m3_to_float( static_cast<unsigned>( b ) );
 			return t;
 		}();
 		const uint8_t* row8 = shards8_[shard] + local * ROW_DIM;

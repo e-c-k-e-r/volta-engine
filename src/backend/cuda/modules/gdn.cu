@@ -1,4 +1,5 @@
 #include "engine/modules/gdn.h"
+#include "engine/backend/cuda/reduce.cuh"
 #include <cuda_fp16.h>
 #include <cmath>
 
@@ -6,13 +7,7 @@ namespace engine::modules {
 
 namespace {
 
-__device__ __forceinline__ float warp_sum( float value ) {
-	#pragma unroll
-	for ( int offset = 16; offset > 0; offset >>= 1 ) {
-		value += __shfl_xor_sync( 0xffffffff, value, offset, 32 );
-	}
-	return value;
-}
+using engine::math::warp_sum;
 
 __global__ void project_gates_kernel(
 	const half* __restrict__ norm_hidden,

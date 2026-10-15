@@ -3,6 +3,7 @@
 // and dotted with every activation row; FP32 accumulation, FP16 result.
 #include "cpu_kernels.h"
 #include "engine/modules/nvfp4.h"
+#include "engine/quant/fp4_fp8.h"
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -12,13 +13,6 @@ namespace engine::modules {
 
 namespace {
 
-float e4m3_value( int b ) {
-	const int e = ( b >> 3 ) & 15, m = b & 7;
-	const float v = ( e == 0 ) ? std::ldexp( m / 8.0f, -6 ) : std::ldexp( 1.0f + m / 8.0f, e - 7 );
-	return ( b & 0x80 ) ? -v : v;
-}
-
-constexpr float kE2M1[16] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
 
 float r16( float f ) {
 	return static_cast<float>( static_cast<backend::half_t>( f ) );
@@ -27,7 +21,7 @@ float r16( float f ) {
 const float* scale_lut() {
 	static const std::vector<float> lut = [] {
 		std::vector<float> v( 256 );
-		for ( int i = 0; i < 256; ++i ) v[i] = e4m3_value( i );
+		for ( int i = 0; i < 256; ++i ) v[i] = quant::e4m3_to_float( static_cast<unsigned>( i ) );
 		return v;
 	}();
 	return lut.data();
@@ -73,8 +67,8 @@ void LinearNVFP4::forward(
 				float* wg = &w[g * 16];
 				for ( int h = 0; h < 2; ++h ) {
 					for ( int i = 0; i < 4; ++i ) {
-						wg[h * 8 + 2 * i] = r16( kE2M1[( cw[h] >> ( 4 * i ) ) & 15] * s ) * ( 1.0f / 16384.0f );
-						wg[h * 8 + 2 * i + 1] = r16( kE2M1[( cw[h] >> ( 16 + 4 * i ) ) & 15] * s ) * ( 1.0f / 16384.0f );
+						wg[h * 8 + 2 * i] = r16( quant::e2m1_to_float( static_cast<int>( ( cw[h] >> ( 4 * i ) ) & 15 ) ) * s ) * ( 1.0f / 16384.0f );
+						wg[h * 8 + 2 * i + 1] = r16( quant::e2m1_to_float( static_cast<int>( ( cw[h] >> ( 16 + 4 * i ) ) & 15 ) ) * s ) * ( 1.0f / 16384.0f );
 					}
 				}
 			}
