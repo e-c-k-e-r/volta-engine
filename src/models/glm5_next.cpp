@@ -185,14 +185,32 @@ bool Glm5NextPipeline::init(
 	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	{
 		latent_slot_stride_ = static_cast<size_t>( mla_slots_ ) * config_.max_seq * 512;
+		const int pool_opt = runtime::options().kv_pool;
+		// Latent and indexer arrays: one per slot, or one pool of pages for all of them
+		size_t cache_slots = S;
+		if ( pool_opt > 0 ) {
+			ENGINE_ASSERT( runtime::options().dsa, "Glm5NextPipeline::init: kv_pool needs the DSA indexer pools (dsa) in the same paged layout" );
+			const int page = 1 << kKvPageShift;
+			kv_pool_tokens_ = ( pool_opt + page - 1 ) / page * page;
+			kv_pages_per_slot_ = ( config_.max_seq + page - 1 ) / page;
+			kv_table_.assign( static_cast<size_t>( S ) * kv_pages_per_slot_, 0 );
+			kv_slot_pages_.assign( S, 0 );
+			for ( int p = kv_pool_tokens_ / page - 1; p >= 0; --p ) kv_free_.push_back( p );
+			d_kv_table_ = static_cast<int*>( engine::core::arena_alloc( arena, kv_table_.size() * sizeof( int ), 128 ) );
+			ENGINE_ASSERT( d_kv_table_ != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the page table" );
+			backend::memset_sync( d_kv_table_, 0, kv_table_.size() * sizeof( int ) );
+			latent_slot_stride_ = static_cast<size_t>( mla_slots_ ) * kv_pool_tokens_ * 512;
+			cache_slots = 1;
+			if ( rank_ == 0 ) LOG_INFO( "[kv] shared token pool: %d tokens in pages of %d for %d slots of up to %d tokens\n", kv_pool_tokens_, page, S, config_.max_seq );
+		}
 		// kv_format applies to the latent as one tensor: k8v4 stores it as 8-bit (K precision), the others as named
 		const std::string& fmt = engine::runtime::options().kv_format;
 		if ( fmt == "fp8" ) latent_q_ = pod::KVQ::E5M2;
 		else if ( fmt == "k8v4" ) latent_q_ = pod::KVQ::I8;
 		else if ( fmt == "nvfp4" ) latent_q_ = pod::KVQ::FP4;
 		else latent_q_ = pod::KVQ::F16;
-		const size_t data_bytes = static_cast<size_t>( S ) * latent_data_bytes( latent_slot_stride_ );
-		const size_t scale_bytes = static_cast<size_t>( S ) * latent_scale_bytes( latent_slot_stride_ );
+		const size_t data_bytes = cache_slots * latent_data_bytes( latent_slot_stride_ );
+		const size_t scale_bytes = cache_slots * latent_scale_bytes( latent_slot_stride_ );
 		latent_cache_ = engine::core::arena_alloc( arena, data_bytes, 128 );
 		ENGINE_ASSERT( latent_cache_ != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the latent cache" );
 		backend::memset_sync( latent_cache_, 0, data_bytes );
@@ -211,10 +229,10 @@ bool Glm5NextPipeline::init(
 		if ( dsa_ ) {
 			const int NP = config_.max_seq / engine::modules::DSA::POOL;
 			dsa_plane_stride_ = static_cast<size_t>( mla_slots_ ) * engine::modules::DSA::PLANE_CAP * engine::modules::DSA::PLANE;
-			dsa_pool_stride_ = static_cast<size_t>( mla_slots_ ) * NP * engine::modules::DSA::DIM;
+			dsa_pool_stride_ = static_cast<size_t>( mla_slots_ ) * ( kv_pool_tokens_ > 0 ? kv_pool_tokens_ / engine::modules::DSA::POOL : NP ) * engine::modules::DSA::DIM;
 			auto halves = [&]( size_t n ) { return static_cast<backend::half_t*>( engine::core::arena_alloc( arena, n * sizeof( backend::half_t ), 128 ) ); };
 			dsa_plane_ = halves( static_cast<size_t>( S ) * dsa_plane_stride_ );
-			dsa_pool_ = halves( static_cast<size_t>( S ) * dsa_pool_stride_ );
+			dsa_pool_ = halves( cache_slots * dsa_pool_stride_ );
 			dsa_proj_ = halves( static_cast<size_t>( R ) * engine::modules::DSA::PROJ );
 			dsa_w_ = halves( static_cast<size_t>( R ) * engine::modules::DSA::HEADS );
 			dsa_q_ = halves( static_cast<size_t>( R ) * engine::modules::DSA::HEADS * engine::modules::DSA::DIM );
@@ -223,7 +241,7 @@ bool Glm5NextPipeline::init(
 			dsa_nk_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * sizeof( int ), 128 ) );
 			ENGINE_ASSERT( dsa_plane_ && dsa_pool_ && dsa_proj_ && dsa_w_ && dsa_q_ && dsa_scores_ && dsa_idx_ && dsa_nk_, "Glm5NextPipeline::init: arena exhausted allocating the DSA state" );
 			backend::memset_sync( dsa_plane_, 0, static_cast<size_t>( S ) * dsa_plane_stride_ * sizeof( backend::half_t ) );
-			backend::memset_sync( dsa_pool_, 0, static_cast<size_t>( S ) * dsa_pool_stride_ * sizeof( backend::half_t ) );
+			backend::memset_sync( dsa_pool_, 0, cache_slots * dsa_pool_stride_ * sizeof( backend::half_t ) );
 		}
 	}
 
@@ -423,14 +441,76 @@ pod::KVRef Glm5NextPipeline::latent_ref() const {
 	r.vs = latent_scales_;
 	r.kq = latent_q_;
 	r.vq = latent_q_;
+	r.pages = kv_pages();
 	return r;
+}
+
+pod::KVPages Glm5NextPipeline::kv_pages() const {
+	pod::KVPages pg;
+	if ( kv_pool_tokens_ == 0 ) return pg;
+	pg.table = d_kv_table_;
+	pg.shift = kKvPageShift;
+	pg.per_slot = kv_pages_per_slot_;
+	pg.pool_tokens = static_cast<size_t>( kv_pool_tokens_ );
+	return pg;
+}
+
+bool Glm5NextPipeline::reserve_tokens( int slot_id, int tokens ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Glm5NextPipeline::reserve_tokens: slot out of range" );
+	if ( kv_pool_tokens_ == 0 ) return true;
+	const int need = ( std::min( tokens, config_.max_seq ) + ( 1 << kKvPageShift ) - 1 ) >> kKvPageShift;
+	int& have = kv_slot_pages_[slot_id];
+	if ( need <= have ) return true;
+	if ( static_cast<int>( kv_free_.size() ) < need - have ) return false;
+	for ( ; have < need; ++have ) {
+		kv_table_[static_cast<size_t>( slot_id ) * kv_pages_per_slot_ + have] = kv_free_.back();
+		kv_free_.pop_back();
+	}
+	kv_dirty_ = true;
+	return true;
+}
+
+void Glm5NextPipeline::release_tokens( int slot_id ) {
+	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Glm5NextPipeline::release_tokens: slot out of range" );
+	if ( kv_pool_tokens_ == 0 ) return;
+	// Highest page first, so a slot that starts again takes the pool's lowest pages in order
+	for ( int i = kv_slot_pages_[slot_id] - 1; i >= 0; --i ) {
+		int& e = kv_table_[static_cast<size_t>( slot_id ) * kv_pages_per_slot_ + i];
+		kv_free_.push_back( e );
+		e = 0;
+	}
+	kv_slot_pages_[slot_id] = 0;
+	kv_dirty_ = true;
+}
+
+void Glm5NextPipeline::kv_prepare( const pod::BatchRows& rows, backend::stream_t stream ) {
+	if ( kv_pool_tokens_ == 0 ) return;
+	for ( int r = 0; r < rows.count; ++r ) {
+		ENGINE_ASSERT( reserve_tokens( rows.slot[r], rows.pos[r] + 1 ), "Glm5NextPipeline: the shared token pool (option kv_pool) is full" );
+	}
+	if ( !kv_dirty_ ) return;
+	backend::memcpy_async( d_kv_table_, kv_table_.data(), kv_table_.size() * sizeof( int ), backend::Copy::H2D, stream );
+	kv_dirty_ = false;
+}
+
+template <typename F>
+void Glm5NextPipeline::for_kv_ranges( int slot_id, int from, int tokens, F&& fn ) const {
+	const int page = 1 << kKvPageShift;
+	for ( int t = from; t < tokens; ) {
+		const int n = std::min( tokens - t, page - ( t & ( page - 1 ) ) );
+		fn( t, n, static_cast<size_t>( kv_table_[static_cast<size_t>( slot_id ) * kv_pages_per_slot_ + ( t >> kKvPageShift )] ) * page + ( t & ( page - 1 ) ) );
+		t += n;
+	}
 }
 
 void Glm5NextPipeline::reset_state( int slot_id ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Glm5NextPipeline::reset_state: slot out of range" );
 	backend::set_device( rank_ );
-	backend::memset_sync( static_cast<char*>( latent_cache_ ) + static_cast<size_t>( slot_id ) * latent_data_bytes( latent_slot_stride_ ), 0, latent_data_bytes( latent_slot_stride_ ) );
-	if ( latent_scales_ ) backend::memset_sync( static_cast<char*>( latent_scales_ ) + static_cast<size_t>( slot_id ) * latent_scale_bytes( latent_slot_stride_ ), 0, latent_scale_bytes( latent_slot_stride_ ) );
+	// A pooled slot keeps its pages (the request that owns them ends with release_tokens); every position is written before it is read
+	if ( kv_pool_tokens_ == 0 ) {
+		backend::memset_sync( static_cast<char*>( latent_cache_ ) + static_cast<size_t>( slot_id ) * latent_data_bytes( latent_slot_stride_ ), 0, latent_data_bytes( latent_slot_stride_ ) );
+		if ( latent_scales_ ) backend::memset_sync( static_cast<char*>( latent_scales_ ) + static_cast<size_t>( slot_id ) * latent_scale_bytes( latent_slot_stride_ ), 0, latent_scale_bytes( latent_slot_stride_ ) );
+	}
 	const size_t slot_kda = state_.slot_kda_floats;
 	const size_t slot_conv = state_.slot_conv_floats;
 	backend::memset_sync( state_.kda_states + slot_id * slot_kda, 0, slot_kda * sizeof( float ) );
@@ -1146,6 +1226,7 @@ void Glm5NextPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
 	ENGINE_ASSERT( last_rows_ <= logit_rows_, "Glm5NextPipeline::forward: more logit rows than the buffer holds (ENGINE_DEBUG_GLM_LOGIT_ROWS)" );
 	set_rows( m );
+	kv_prepare( rows, stream );
 	// Pageable source: the copy is staged before return, so `rows` may be a temporary
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
 	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); } );
@@ -1370,14 +1451,14 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 					DSA::prep( dsa_proj_, lw.idx_ln_w.ptr<backend::half_t>(), lw.idx_ln_b.ptr<backend::half_t>(), dsa_plane_, dsa_w_, mla_idx, config_.max_seq, m,
 						d_rows_, dsa_plane_stride_, stream );
 					DSA::pool_update( dsa_plane_, dsa_pool_, lw.idx_ape.ptr<backend::half_t>(), mla_idx, config_.max_seq, m, d_rows_,
-						dsa_plane_stride_, dsa_pool_stride_, stream );
+						dsa_plane_stride_, dsa_pool_stride_, stream, kv_pages() );
 					// Selection matters once a row sees more than topk tokens; decode graphs always run it (rows below the
 					// threshold exit early on the device), eager chunks skip it while every row is still dense
 					if ( m <= pod::MAX_BATCH || key_hint_ > DSA::TOPK + DSA::POOL - 1 ) {
 						pod::TensorView qi = pod::make_tensor_2d( dsa_q_, pod::DType::FP16, m, DSA::HEADS * DSA::DIM );
 						engine::modules::Linear::forward( q_lora_norm_buf_, lw.idx_wq_b, qi, stream );
 						DSA::score( dsa_q_, dsa_w_, dsa_pool_, dsa_scores_, config_.max_seq / DSA::POOL, mla_idx, config_.max_seq, m,
-							d_rows_, dsa_pool_stride_, stream );
+							d_rows_, dsa_pool_stride_, stream, kv_pages() );
 						DSA::select( dsa_scores_, config_.max_seq / DSA::POOL, dsa_idx_, dsa_nk_, m, d_rows_, stream );
 						sel_idx = dsa_idx_;
 						sel_n = dsa_nk_;
@@ -1388,7 +1469,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				if ( dsa_diag && sel_idx != nullptr && m > pod::MAX_BATCH && rank_ == 0 && lh_ == 16 ) {
 					// Recall of the dense attention mass by the selection, last row of the chunk (eager prefill only)
 					const int n = key_hint_;
-					ENGINE_ASSERT( latent_q_ == pod::KVQ::F16, "dsa_diag: FP16 latent cache only" );
+					ENGINE_ASSERT( latent_q_ == pod::KVQ::F16 && kv_pool_tokens_ == 0, "dsa_diag: FP16 latent cache without kv_pool only" );
 					std::vector<float> sc( static_cast<size_t>( 16 ) * n );
 					float* d_sc = static_cast<float*>( backend::device_malloc( sc.size() * sizeof( float ) ) );
 					engine::modules::MLALatent::diag_scores( q_lat.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * 16 * 512,
@@ -1688,6 +1769,7 @@ void Glm5NextPipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, 
 	key_hint_ = rows.pos[m - 1] + 1;
 	lm_mode_ = pod::BatchRows::LOGITS_ALL;
 	set_rows( m );
+	kv_prepare( rows, stream );
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
 
 	// 1. Normed embedding of the following tokens
@@ -1786,21 +1868,41 @@ void Glm5NextPipeline::copy_seq_rows( int slot_id, int from, int tokens, char* h
 	const int pool = engine::modules::DSA::POOL;
 	const int NP = config_.max_seq / pool;
 	const backend::Copy dir = to_host ? backend::Copy::D2H : backend::Copy::H2D;
-	auto move = [&]( void* dev, size_t bytes ) {
+	auto move = [&]( void* dev, char* at, size_t bytes ) {
 		if ( bytes == 0 ) return;
-		if ( to_host ) backend::memcpy_async( host, dev, bytes, dir, stream );
-		else backend::memcpy_async( dev, host, bytes, dir, stream );
-		host += bytes;
+		if ( to_host ) backend::memcpy_async( at, dev, bytes, dir, stream );
+		else backend::memcpy_async( dev, at, bytes, dir, stream );
 	};
 	const size_t lat_elems = static_cast<size_t>( tokens - from ) * 512;
 	const size_t lat_bytes = latent_data_bytes( lat_elems ), lat_scale_bytes = latent_scale_bytes( lat_elems );
 	const int pool_from = from / pool, pool_to = ( tokens + pool - 1 ) / pool;
 	const size_t pool_bytes = static_cast<size_t>( pool_to - pool_from ) * engine::modules::DSA::DIM * sizeof( backend::half_t );
+	const size_t D = engine::modules::DSA::DIM;
 	for ( int layer = 0; layer < mla_slots_; ++layer ) {
-		const size_t lat_off = static_cast<size_t>( slot_id ) * latent_slot_stride_ + ( static_cast<size_t>( layer ) * config_.max_seq + from ) * 512;
-		move( static_cast<char*>( latent_cache_ ) + latent_data_bytes( lat_off ), lat_bytes );
-		if ( lat_scale_bytes ) move( static_cast<char*>( latent_scales_ ) + latent_scale_bytes( lat_off ), lat_scale_bytes );
-		move( dsa_pool_ + static_cast<size_t>( slot_id ) * dsa_pool_stride_ + ( static_cast<size_t>( layer ) * NP + pool_from ) * engine::modules::DSA::DIM, pool_bytes );
+		// Host layout of one layer: latent rows, their scales, pooled keys (the same in both cache layouts)
+		char* h_lat = host;
+		char* h_scale = h_lat + lat_bytes;
+		char* h_pool = h_scale + lat_scale_bytes;
+		host = h_pool + pool_bytes;
+		if ( kv_pool_tokens_ == 0 ) {
+			const size_t lat_off = static_cast<size_t>( slot_id ) * latent_slot_stride_ + ( static_cast<size_t>( layer ) * config_.max_seq + from ) * 512;
+			move( static_cast<char*>( latent_cache_ ) + latent_data_bytes( lat_off ), h_lat, lat_bytes );
+			if ( lat_scale_bytes ) move( static_cast<char*>( latent_scales_ ) + latent_scale_bytes( lat_off ), h_scale, lat_scale_bytes );
+			move( dsa_pool_ + static_cast<size_t>( slot_id ) * dsa_pool_stride_ + ( static_cast<size_t>( layer ) * NP + pool_from ) * D, h_pool, pool_bytes );
+			continue;
+		}
+		// Pooled: one range per page. The pooled key of tokens [4p, 4p + 4) sits in the page of token 4p.
+		for_kv_ranges( slot_id, from, tokens, [&]( int t, int n, size_t phys ) {
+			const size_t lat_off = ( static_cast<size_t>( layer ) * kv_pool_tokens_ + phys ) * 512;
+			const size_t rel = static_cast<size_t>( t - from ) * 512;
+			move( static_cast<char*>( latent_cache_ ) + latent_data_bytes( lat_off ), h_lat + latent_data_bytes( rel ), latent_data_bytes( static_cast<size_t>( n ) * 512 ) );
+			if ( lat_scale_bytes ) move( static_cast<char*>( latent_scales_ ) + latent_scale_bytes( lat_off ), h_scale + latent_scale_bytes( rel ), latent_scale_bytes( static_cast<size_t>( n ) * 512 ) );
+			const int p0 = t / pool, p1 = ( t + n + pool - 1 ) / pool;   // pools touching [t, t + n)
+			if ( p1 > p0 ) {
+				const size_t pool_off = ( static_cast<size_t>( layer ) * ( kv_pool_tokens_ / pool ) + ( phys - static_cast<size_t>( t - p0 * pool ) ) / pool ) * D;
+				move( dsa_pool_ + pool_off, h_pool + static_cast<size_t>( p0 - pool_from ) * D * sizeof( backend::half_t ), static_cast<size_t>( p1 - p0 ) * D * sizeof( backend::half_t ) );
+			}
+		} );
 	}
 }
 
@@ -1823,6 +1925,7 @@ bool Glm5NextPipeline::save_seq_state( int slot_id, int from, int tokens, bool w
 
 bool Glm5NextPipeline::load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream ) {
 	if ( seq_state_bytes( from, tokens, with_taps ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+	if ( !reserve_tokens( slot_id, tokens ) ) return false;
 	backend::set_device( rank_ );
 	const char* src = static_cast<const char*>( host_src );
 	const size_t kda = state_.slot_kda_floats * sizeof( float ), conv = state_.slot_conv_floats * sizeof( float ), planes = dsa_plane_stride_ * sizeof( backend::half_t );

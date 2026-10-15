@@ -7,7 +7,7 @@
 | Test | Tier | GPU | Checks |
 |---|---|---|---|
 | `test_trellis`, `test_gemv_int8` | 2 | yes | trellis and int8 GEMV kernels against FP32 references |
-| `test_mhc`, `test_attention`, `test_attention_prefill`, `test_dsa`, `test_gdn`, `test_norm`, `test_rope`, `test_kv_quant`, `test_prefill_linear` | 2 | yes | module operations against CPU references |
+| `test_mhc`, `test_attention`, `test_attention_prefill`, `test_dsa`, `test_kv_pages`, `test_gdn`, `test_norm`, `test_rope`, `test_kv_quant`, `test_prefill_linear` | 2 | yes | module operations against CPU references |
 | `test_all_reduce` | 2 | yes (4) | NVLink all-reduce |
 | `test_vulkan_comm` | 2 | yes (2-4) | the Vulkan build's host-staged all-reduce and all-reduce + RMSNorm on 2 and 4 devices, one thread per rank (skips with fewer devices) |
 | `test_sampling` | 2 | no | top-k / top-p sampler |

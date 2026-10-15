@@ -16,8 +16,9 @@ void DSA::prep(
 
 void DSA::pool_update(
 	const backend::half_t* plane, backend::half_t* pool_plane, const backend::half_t* ape, int layer, int max_seq, int rows,
-	const pod::BatchRows* d_rows, size_t plane_slot_stride, size_t pool_slot_stride, backend::stream_t
+	const pod::BatchRows* d_rows, size_t plane_slot_stride, size_t pool_slot_stride, backend::stream_t, const pod::KVPages& pages
 ) {
+	ENGINE_ASSERT( pages.table == nullptr, "DSA::pool_update (CPU): no shared token pool" );
 	PoolParams p{ const_cast<half*>( plane ), pool_plane, const_cast<half*>( ape ), const_cast<int*>( d_rows->slot ), const_cast<int*>( d_rows->pos ),
 		layer, max_seq, static_cast<int64_t>( plane_slot_stride ), static_cast<int64_t>( pool_slot_stride ) };
 	impl::cpu_dispatch( ::dsa_pool_update, &p, rows );

@@ -138,6 +138,13 @@ public:
 	virtual void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) = 0;
 	virtual void rollback_state( int slot_id, backend::stream_t stream = nullptr ) = 0;
 	virtual void reset_state( int slot_id = 0 ) = 0;
+	// Shared token pool (GLM option kv_pool): the cache of a slot grows by pages out of one pool. reserve_tokens makes room for
+	// positions [0, tokens) of the slot and reports whether the pool had it (nothing is taken when it did not); release_tokens
+	// returns the slot's pages. Models with a cache per slot always have room.
+	virtual bool reserve_tokens( int slot_id, int tokens ) { (void) slot_id; (void) tokens; return true; }
+	virtual void release_tokens( int slot_id ) { (void) slot_id; }
+	virtual int pool_tokens() const { return 0; }        // 0 = no shared pool
+	virtual int free_pool_tokens() const { return 0; }
 	// Per-row state slots (replace checkpoint + replay). While on, a forward also publishes the recurrent
 	// state after every row; commit_spec_row( slot, t ) makes the state after row t the slot's live state.
 	// Stream-ordered, so a flag change applies to the forwards queued after it.

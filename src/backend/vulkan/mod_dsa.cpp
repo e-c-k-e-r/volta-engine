@@ -19,8 +19,9 @@ void DSA::prep(
 
 void DSA::pool_update(
 	const backend::half_t* plane, backend::half_t* pool_plane, const backend::half_t* ape, int layer, int max_seq, int rows,
-	const pod::BatchRows* d_rows, size_t plane_slot_stride, size_t pool_slot_stride, backend::stream_t stream
+	const pod::BatchRows* d_rows, size_t plane_slot_stride, size_t pool_slot_stride, backend::stream_t stream, const pod::KVPages& pages
 ) {
+	ENGINE_ASSERT( pages.table == nullptr, "DSA::pool_update (Vulkan): no shared token pool" );
 	vki::PoolParams p{ vki::dp( plane ), vki::dp( pool_plane ), vki::dp( ape ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ),
 		layer, max_seq, static_cast<int64_t>( plane_slot_stride ), static_cast<int64_t>( pool_slot_stride ) };
 	vki::launch( "dsa_pool_update", p, stream, rows );

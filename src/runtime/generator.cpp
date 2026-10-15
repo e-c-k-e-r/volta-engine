@@ -85,9 +85,14 @@ void Generator::shutdown() {
 	}
 }
 
+// Tokens a request is given beyond its prompt when it starts out of a shared KV pool; it takes more as it decodes
+static constexpr int kPoolHeadroom = 1024;
+
 bool Generator::submit_request( GenerationRequest req ) {
 	if ( !running_.load() ) return false;
 	if ( req.prompt_tokens.empty() || static_cast<int>( req.prompt_tokens.size() ) >= cluster_.metadata().max_seq_len ) return false;
+	// A prompt the whole pool cannot hold would wait for room forever
+	if ( const int pool = cluster_.pool_tokens(); pool > 0 && static_cast<int>( req.prompt_tokens.size() ) + kPoolHeadroom > pool ) return false;
 	{
 		std::unique_lock<std::mutex> lock( queue_mtx_ );
 		req.submit_time = std::chrono::steady_clock::now();
@@ -104,6 +109,8 @@ void Generator::admit_pending() {
 	for ( int s = 0; s < num_slots_ && !pending_queue_.empty(); ++s ) {
 		Slot& slot = slots_[s];
 		if ( slot.active ) continue;
+		// With a shared KV pool the request starts when the pool has room for its prompt; until a running request frees pages it stays queued
+		if ( cluster_.pool_tokens() > 0 && !cluster_.reserve_tokens( s, static_cast<int>( pending_queue_.front().prompt_tokens.size() ) + kPoolHeadroom ) ) break;
 		slot = Slot();
 		slot.active = true;
 		slot.req = std::move( pending_queue_.front() );
@@ -171,7 +178,9 @@ bool Generator::emit_token( int s, int tok ) {
 	FinishReason reason = FinishReason::Stop;
 	bool finish = eos;
 	if ( eos ) LOG_DEBUG( "[gen] slot %d stops on token %d after %d tokens%s\n", s, tok, slot.tokens_generated, slot.in_reasoning ? " (inside the reasoning)" : "" );
-	if ( !finish && ( slot.tokens_generated >= slot.req.max_tokens || slot.current_pos + pod::MAX_BATCH >= cluster_.metadata().max_seq_len ) ) {
+	// The next round writes up to MAX_BATCH positions past current_pos (a draft chain a few more); a full KV pool ends the request like a full context
+	if ( !finish && ( slot.tokens_generated >= slot.req.max_tokens || slot.current_pos + pod::MAX_BATCH >= cluster_.metadata().max_seq_len ||
+		( cluster_.pool_tokens() > 0 && !cluster_.reserve_tokens( s, slot.current_pos + 2 * pod::MAX_BATCH ) ) ) ) {
 		finish = true;
 		reason = FinishReason::Length;
 	}
@@ -290,6 +299,7 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 		while ( recent_.size() > 40 ) recent_.pop_front();
 	}
 	slot.active = false;
+	cluster_.release_tokens( s );
 	if ( !slot.req.images.empty() ) cluster_.set_slot_mm( s, MmLayout() );
 	slot.key_tokens.clear();
 	slot.req.images.clear();

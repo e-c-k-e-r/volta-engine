@@ -574,6 +574,24 @@ void ModelCluster::reset_slot( int slot ) {
 	} );
 }
 
+bool ModelCluster::reserve_tokens( int slot, int tokens ) {
+	bool ok = true;
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		if ( models_[d] && !models_[d]->reserve_tokens( slot, tokens ) ) ok = false;
+	}
+	return ok;
+}
+
+void ModelCluster::release_tokens( int slot ) {
+	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+		if ( models_[d] ) models_[d]->release_tokens( slot );
+	}
+}
+
+int ModelCluster::pool_tokens() const {
+	return models_[0] ? models_[0]->pool_tokens() : 0;
+}
+
 bool ModelCluster::rebalance_experts() {
 	int any[ENGINE_NUM_GPUS] = {};
 	pool_.run( [&]( int d ) {

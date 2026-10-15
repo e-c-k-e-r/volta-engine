@@ -178,6 +178,10 @@ public:
 	void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void reset_state( int slot_id = 0 ) override;
+	bool reserve_tokens( int slot_id, int tokens ) override;
+	void release_tokens( int slot_id ) override;
+	int pool_tokens() const override { return kv_pool_tokens_; }
+	int free_pool_tokens() const override { return static_cast<int>( kv_free_.size() ) << kKvPageShift; }
 
 	pod::TensorView& logits() override { return logits_; }
 	const pod::TensorView& logits() const override { return logits_; }
@@ -227,6 +231,20 @@ private:
 	pod::KVQ latent_q_ = pod::KVQ::F16;
 	size_t latent_slot_stride_ = 0;   // elements per slot
 	pod::KVRef latent_ref() const;
+	// Shared token pool (option kv_pool > 0): the latent cache and the pooled indexer keys of all slots are [layer][pool tokens]
+	// arrays cut into pages of 1 << kKvPageShift tokens, handed to a slot as its positions grow and returned when its request ends
+	static constexpr int kKvPageShift = 9;
+	int kv_pool_tokens_ = 0;          // 0 = the per-slot layout
+	int kv_pages_per_slot_ = 0;
+	std::vector<int> kv_table_;       // [slots][pages per slot]: physical page of each logical page (0 where none)
+	std::vector<int> kv_slot_pages_;  // pages held per slot
+	std::vector<int> kv_free_;        // free physical pages
+	int* d_kv_table_ = nullptr;
+	bool kv_dirty_ = false;
+	pod::KVPages kv_pages() const;
+	void kv_prepare( const pod::BatchRows& rows, backend::stream_t stream );   // pages for the rows' positions, table on the device
+	// One contiguous device range per page of the tokens [from, tokens) of a slot: fn( first token, tokens in the range )
+	template <typename F> void for_kv_ranges( int slot_id, int from, int tokens, F&& fn ) const;
 	size_t latent_data_bytes( size_t elems ) const { return pod::kv_data_bytes( latent_q_, elems ); }
 	size_t latent_scale_bytes( size_t elems ) const { return pod::kv_scale_bytes( latent_q_, elems ); }
 	float* latent_ws_ = nullptr;      // split-KV partials

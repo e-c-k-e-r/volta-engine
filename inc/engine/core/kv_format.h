@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/backend/types.h"
 #include <cstddef>
 #include <cstdint>
 
@@ -54,6 +55,21 @@ inline size_t kv_scale_bytes( KVQ q, size_t elems ) {
 	}
 }
 
+// Shared token pool (a model option): the cache of every layer is one [layer][pool_tokens] array, and the logical page
+// pos >> shift of a slot lives in the physical page table[slot * per_slot + (pos >> shift)]. A null table is the per-slot
+// layout, [slot][layer][max_seq], addressed by the callers' slot stride.
+struct KVPages {
+	const int* table = nullptr;
+	int shift = 0;            // log2(tokens per page)
+	int per_slot = 0;         // logical pages of one slot
+	size_t pool_tokens = 0;   // tokens of one layer in the pool (the layer stride)
+
+	// Token index of (slot, pos) within one layer's array
+	__host__ __device__ size_t token( int slot, int pos ) const {
+		return ( static_cast<size_t>( table[static_cast<size_t>( slot ) * per_slot + ( pos >> shift )] ) << shift ) + ( pos & ( ( 1 << shift ) - 1 ) );
+	}
+};
+
 // Device-visible view of the KV pool. Element offsets (slot stride, layer, position) are format independent;
 // k / v point at slot 0, ks / vs at the matching scales (null for the unscaled formats).
 struct KVRef {
@@ -63,6 +79,7 @@ struct KVRef {
 	void* vs = nullptr;
 	KVQ kq = KVQ::F16;
 	KVQ vq = KVQ::F16;
+	KVPages pages;            // the latent cache of GLM only
 };
 
 inline KVRef kv_ref_f16( const void* k, const void* v ) {

@@ -95,6 +95,9 @@ Qwen extras:
   (`configs/glm_256k.json`; images off). Per GPU the arena holds 2.8 GiB of buffers and caches (the latent cache and attention workspaces
   2.2 of them), 27.3 GiB of weights at 95% of the experts resident and the 0.7 GiB drafter, leaving 0.2 GiB; the startup log prints this
   as `[mem]` lines. Each point of `expert_cache` costs 0.26 GiB, and the FP8 cache (`kv_format=fp8`, 1.2 GiB more) fits only up to about 0.85.
+  `--set kv_pool=262144` lets the two slots share one pool of that many tokens instead of owning 256K each (0.95 GiB per GPU less at the 4-bit
+  cache, which the expert cache or the drafter can use): a request starts once the pool holds its prompt, otherwise it queues, and one that
+  grows past the pool ends with finish reason `length`.
   The 4-bit cache moves the perplexity of GLM by +0.008 NLL against FP16 on 3000 tokens (FP8: +0.001). `kv_format` on GLM applies to the
   single latent tensor: `k8v4` stores it as 8-bit. With images on, the vision tower takes its memory from the same arena.
 * **Qwen3.8-Flash-Next** (`qwen4_exp`, the 100 GB exl3 checkpoint): runs on all four GPUs only (experts are placed whole, 128 per rank), about 18 GiB of

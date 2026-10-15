@@ -182,13 +182,27 @@ __device__ __forceinline__ uint4 latent_ld8( const void* data, const void* scale
 	return kv_decode8_h<Q>( kv_fetch8<Q>( data, scales, idx ) );
 }
 
+// Element offset of key `pos` of one (slot, layer): the per-slot layout, or the shared pool's pages (pod::KVPages)
+struct LatentAddr {
+	pod::KVPages pg;
+	size_t base;
+	int slot;
+	__device__ __forceinline__ size_t operator()( int pos ) const {
+		return pg.table ? base + pg.token( slot, pos ) * LORA : base + static_cast<size_t>( pos ) * LORA;
+	}
+};
+
+__device__ __forceinline__ LatentAddr latent_addr( const pod::KVPages& pg, int slot, size_t slot_stride, int layer, int max_seq ) {
+	return { pg, pg.table ? static_cast<size_t>( layer ) * pg.pool_tokens * LORA : static_cast<size_t>( slot ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA, slot };
+}
+
 // One block per row; a thread quantizes one unit (kv_unit<Q>() elements) at a time
 template <KVQ Q>
-__global__ void store_latent_kernel( void* __restrict__ data, void* __restrict__ scales, const half* __restrict__ c, int layer, int max_seq, int rows, pod::SlotRef slot ) {
+__global__ void store_latent_kernel( void* __restrict__ data, void* __restrict__ scales, const half* __restrict__ c, int layer, int max_seq, int rows, pod::SlotRef slot, pod::KVPages pg ) {
 	constexpr int U = kv_unit<Q>();
 	const int r = blockIdx.x;
 	const int pos = slot.rows->pos[slot.row + r];
-	const size_t off = static_cast<size_t>( slot.rows->slot[slot.row + r] ) * slot.stride + ( static_cast<size_t>( layer ) * max_seq + pos ) * LORA;
+	const size_t off = latent_addr( pg, slot.rows->slot[slot.row + r], slot.stride, layer, max_seq )( pos );
 	for ( int u = threadIdx.x; u < LORA / U; u += blockDim.x ) kv_store_unit<Q>( data, scales, off + static_cast<size_t>( u ) * U, c + static_cast<size_t>( r ) * LORA + u * U );
 }
 
@@ -209,6 +223,7 @@ void latent_attn_kernel(
 	half* __restrict__ o_lat,
 	float* __restrict__ workspace,
 	size_t slot_stride,
+	pod::KVPages pg,
 	int layer,
 	int max_seq,
 	const pod::BatchRows* __restrict__ rows,
@@ -231,7 +246,7 @@ void latent_attn_kernel(
 	const int total = nsel >= 0 ? nsel : min( pos + 1, max_seq );
 	const int kv_start = chunk * CHUNK_KEYS;
 	const int kv_end = min( kv_start + CHUNK_KEYS, total );
-	const size_t base = static_cast<size_t>( rows->slot[row0 + m] ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA;
+	const LatentAddr kaddr = latent_addr( pg, rows->slot[row0 + m], slot_stride, layer, max_seq );
 
 	float o[HEADS];
 	#pragma unroll
@@ -248,7 +263,7 @@ void latent_attn_kernel(
 				uint4 raw = make_uint4( 0, 0, 0, 0 );
 				if ( k < nk ) {
 					const int key = nsel >= 0 ? lst[kb + k] : kb + k;
-					raw = latent_ld8<Q>( cache, cscale, base + static_cast<size_t>( key ) * LORA + c8 * 8 );
+					raw = latent_ld8<Q>( cache, cscale, kaddr( key ) + c8 * 8 );
 				}
 				*reinterpret_cast<uint4*>( sc + k * CS + c8 * 8 ) = raw;
 			}
@@ -354,6 +369,7 @@ void latent_prefill_tc_kernel(
 	half* __restrict__ o_lat,
 	float* __restrict__ workspace,
 	size_t slot_stride,
+	pod::KVPages pg,
 	int layer,
 	int max_seq,
 	const pod::BatchRows* __restrict__ rows,
@@ -385,7 +401,7 @@ void latent_prefill_tc_kernel(
 	int max_pos = 0;
 	for ( int r = q_base / HEADS; r <= last_row; ++r ) max_pos = max( max_pos, rows->pos[r] );
 	max_pos = min( max_pos, max_seq - 1 );
-	const size_t kvb = static_cast<size_t>( rows->slot[q_base / HEADS] ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA;
+	const LatentAddr kaddr = latent_addr( pg, rows->slot[q_base / HEADS], slot_stride, layer, max_seq );
 
 	// Softmax role: 8 lanes per query row, 4 keys each
 	const int srow = tid >> 3;
@@ -444,7 +460,7 @@ void latent_prefill_tc_kernel(
 			#pragma unroll
 			for ( int kk = 0; kk < 2; ++kk ) {
 				const int key = 2 * st_p + kk;
-				pk[j][kk] = ( kb + key <= max_pos ) ? latent_ld8<Q>( cache, cscale, kvb + static_cast<size_t>( kb + key ) * LORA + c * 8 ) : make_uint4( 0, 0, 0, 0 );
+				pk[j][kk] = ( kb + key <= max_pos ) ? latent_ld8<Q>( cache, cscale, kaddr( kb + key ) + c * 8 ) : make_uint4( 0, 0, 0, 0 );
 			}
 		}
 	};
@@ -695,6 +711,7 @@ void latent_sparse_tc_kernel(
 	half* __restrict__ o_lat,
 	float* __restrict__ workspace,
 	size_t slot_stride,
+	pod::KVPages pg,
 	int layer,
 	int max_seq,
 	const pod::BatchRows* __restrict__ rows,
@@ -732,7 +749,7 @@ void latent_sparse_tc_kernel(
 	// A row below the selection threshold (nsel < 0) attends densely even though the list pointer is set
 	const int* lst = ( sel_idx && nsel >= 0 ) ? sel_idx + static_cast<size_t>( r ) * DSA_KPAD : nullptr;
 	const int n_keys = nsel >= 0 ? nsel : min( rows->pos[r] + 1, max_seq );
-	const size_t kvb = static_cast<size_t>( rows->slot[r] ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA;
+	const LatentAddr kaddr = latent_addr( pg, rows->slot[r], slot_stride, layer, max_seq );
 
 	for ( int u = tid; u < LS_BQ * ( LORA / 8 ); u += 256 ) {
 		const int qq = u >> 6, c = u & 63;
@@ -791,7 +808,7 @@ void latent_sparse_tc_kernel(
 			const int c = 2 * warp + st_cl + 16 * j;
 			#pragma unroll
 			for ( int kk = 0; kk < 2; ++kk ) {
-				pk[j][kk] = kpos[kk] >= 0 ? latent_ld8<Q>( cache, cscale, kvb + static_cast<size_t>( kpos[kk] ) * LORA + c * 8 ) : make_uint4( 0, 0, 0, 0 );
+				pk[j][kk] = kpos[kk] >= 0 ? latent_ld8<Q>( cache, cscale, kaddr( kpos[kk] ) + c * 8 ) : make_uint4( 0, 0, 0, 0 );
 			}
 		}
 	};
@@ -1092,10 +1109,10 @@ void MLALatent::store( const pod::KVRef& kv, const pod::TensorView& c, int layer
 	ENGINE_ASSERT( slot.rows != nullptr, "MLALatent::store: device-resolved positions only" );
 	ENGINE_ASSERT( kv.kq == pod::KVQ::F16 || kv.kq == pod::KVQ::E5M2 || kv.kq == pod::KVQ::I8 || kv.kq == pod::KVQ::FP4, "MLALatent::store: cache format" );
 	switch ( kv.kq ) {
-		case pod::KVQ::E5M2: store_latent_kernel<KVQ::E5M2><<<dim3( rows ), dim3( 128 ), 0, stream>>>( kv.k, kv.ks, c.ptr<const half>(), layer, max_seq, rows, slot ); break;
-		case pod::KVQ::I8: store_latent_kernel<KVQ::I8><<<dim3( rows ), dim3( 128 ), 0, stream>>>( kv.k, kv.ks, c.ptr<const half>(), layer, max_seq, rows, slot ); break;
-		case pod::KVQ::FP4: store_latent_kernel<KVQ::FP4><<<dim3( rows ), dim3( 128 ), 0, stream>>>( kv.k, kv.ks, c.ptr<const half>(), layer, max_seq, rows, slot ); break;
-		default: store_latent_kernel<KVQ::F16><<<dim3( rows ), dim3( 128 ), 0, stream>>>( kv.k, kv.ks, c.ptr<const half>(), layer, max_seq, rows, slot ); break;
+		case pod::KVQ::E5M2: store_latent_kernel<KVQ::E5M2><<<dim3( rows ), dim3( 128 ), 0, stream>>>( kv.k, kv.ks, c.ptr<const half>(), layer, max_seq, rows, slot, kv.pages ); break;
+		case pod::KVQ::I8: store_latent_kernel<KVQ::I8><<<dim3( rows ), dim3( 128 ), 0, stream>>>( kv.k, kv.ks, c.ptr<const half>(), layer, max_seq, rows, slot, kv.pages ); break;
+		case pod::KVQ::FP4: store_latent_kernel<KVQ::FP4><<<dim3( rows ), dim3( 128 ), 0, stream>>>( kv.k, kv.ks, c.ptr<const half>(), layer, max_seq, rows, slot, kv.pages ); break;
+		default: store_latent_kernel<KVQ::F16><<<dim3( rows ), dim3( 128 ), 0, stream>>>( kv.k, kv.ks, c.ptr<const half>(), layer, max_seq, rows, slot, kv.pages ); break;
 	}
 }
 
@@ -1148,7 +1165,7 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 		int nsplit = rows < 160 ? std::min( ( 320 + rows - 1 ) / rows, decode_rows ? 32 : 8 ) : 1;
 		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > MLALatent::workspace_slots( max_seq, heads ) ) --nsplit;
 		latent_sparse_tc_kernel<Q><<<dim3( rows, nsplit, heads / 16 ), dim3( 256 ), LS_SMEM, stream>>>(
-			q_lat.ptr<const half>(), cache, cscale, o_lat.ptr<half>(), workspace, slot.stride, layer, max_seq, slot.rows, scale, nsplit, sel_idx, sel_n,
+			q_lat.ptr<const half>(), cache, cscale, o_lat.ptr<half>(), workspace, slot.stride, kv.pages, layer, max_seq, slot.rows, scale, nsplit, sel_idx, sel_n,
 			heads, static_cast<size_t>( rows ) * 16 * LORA );
 		if ( nsplit > 1 ) {
 			latent_reduce_kernel<<<dim3( heads, rows ), dim3( 512 ), 0, stream>>>( workspace, o_lat.ptr<half>(), heads, nsplit );
@@ -1169,7 +1186,7 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 		if ( key_hint > 0 ) nsplit = std::max( 1, std::min( nsplit, key_hint / ( 4 * LT_BK ) ) );
 		while ( nsplit > 1 && static_cast<size_t>( rows ) * heads * nsplit > MLALatent::workspace_slots( max_seq, heads ) ) --nsplit;
 		latent_prefill_tc_kernel<Q><<<dim3( base_blocks, nsplit ), dim3( 256 ), LT_SMEM, stream>>>(
-			q_lat.ptr<const half>(), cache, cscale, o_lat.ptr<half>(), workspace, slot.stride, layer, max_seq, slot.rows, rows, scale, nsplit );
+			q_lat.ptr<const half>(), cache, cscale, o_lat.ptr<half>(), workspace, slot.stride, kv.pages, layer, max_seq, slot.rows, rows, scale, nsplit );
 		if ( nsplit > 1 ) {
 			latent_reduce_kernel<<<dim3( heads, rows ), dim3( 512 ), 0, stream>>>( workspace, o_lat.ptr<half>(), heads, nsplit );
 		}
@@ -1179,7 +1196,7 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 		const int M = min( pod::MAX_BATCH, slot.row + rows - row0 );
 		const size_t off = static_cast<size_t>( row0 - slot.row ) * heads * LORA;
 		latent_attn_kernel<16, Q><<<dim3( M, n_chunks ), dim3( 512 ), smem, stream>>>(
-			q_lat.ptr<const half>() + off, cache, cscale, o_lat.ptr<half>() + off, workspace, slot.stride, layer, max_seq, slot.rows, row0, n_chunks, scale, sel_idx, sel_n );
+			q_lat.ptr<const half>() + off, cache, cscale, o_lat.ptr<half>() + off, workspace, slot.stride, kv.pages, layer, max_seq, slot.rows, row0, n_chunks, scale, sel_idx, sel_n );
 		if ( n_chunks > 1 ) {
 			latent_reduce_kernel<<<dim3( heads, M ), dim3( 512 ), 0, stream>>>( workspace, o_lat.ptr<half>() + off, heads, n_chunks );
 		}

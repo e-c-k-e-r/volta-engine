@@ -49,7 +49,8 @@ void DSA::project_large( const backend::half_t* w, const backend::half_t* x, bac
 }
 
 void DSA::score( const backend::half_t* q_idx, const backend::half_t* w, const backend::half_t* pool_plane, backend::half_t* scores, int score_stride, int layer, int max_seq, int rows,
-	const pod::BatchRows* d_rows, size_t pool_slot_stride, backend::stream_t ) {
+	const pod::BatchRows* d_rows, size_t pool_slot_stride, backend::stream_t, const pod::KVPages& pages ) {
+	ENGINE_ASSERT( pages.table == nullptr, "DSA::score (CPU): no shared token pool" );
 	ENGINE_ASSERT( max_seq % 64 == 0, "DSA score: max_seq must be a multiple of 64" );
 	const float norm = 1.0f / std::sqrt( static_cast<float>( D * H ) );
 	for ( int r = 0; r < rows; ++r ) {

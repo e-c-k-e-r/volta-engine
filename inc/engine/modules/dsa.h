@@ -3,6 +3,7 @@
 #include "engine/config.h"
 #include "engine/core/tensor.h"
 #include "engine/core/batch.h"
+#include "engine/core/kv_format.h"
 #include "engine/backend/types.h"
 
 namespace engine::modules {
@@ -38,13 +39,14 @@ struct DSA {
 	static void prep( const backend::half_t* proj, const backend::half_t* ln_w, const backend::half_t* ln_b, backend::half_t* plane, backend::half_t* w_out, int layer, int max_seq, int rows,
 		const pod::BatchRows* d_rows, size_t plane_slot_stride, backend::stream_t stream );
 
+	// With a shared token pool (pages.table set) pool_plane is [layer][pool_tokens / kpool][128] and the stride arguments are ignored
 	// Build the pool each row completes (position % kpool == kpool - 1) from the plane
 	static void pool_update( const backend::half_t* plane, backend::half_t* pool_plane, const backend::half_t* ape, int layer, int max_seq, int rows,
-		const pod::BatchRows* d_rows, size_t plane_slot_stride, size_t pool_slot_stride, backend::stream_t stream );
+		const pod::BatchRows* d_rows, size_t plane_slot_stride, size_t pool_slot_stride, backend::stream_t stream, const pod::KVPages& pages = {} );
 
 	// scores[r][p] for p < (pos + 1) / kpool (fp16); rows already dense (<= SEL_POOLS pools) are skipped
 	static void score( const backend::half_t* q_idx, const backend::half_t* w, const backend::half_t* pool_plane, backend::half_t* scores, int score_stride, int layer, int max_seq, int rows,
-		const pod::BatchRows* d_rows, size_t pool_slot_stride, backend::stream_t stream );
+		const pod::BatchRows* d_rows, size_t pool_slot_stride, backend::stream_t stream, const pod::KVPages& pages = {} );
 
 	// Top SEL_POOLS pools per row, expanded to token indices + tail: idx[r][0 .. nkeys[r]); nkeys[r] = -1 marks a dense row
 	static void select( const backend::half_t* scores, int score_stride, int* idx, int* nkeys, int rows, const pod::BatchRows* d_rows, backend::stream_t stream );

@@ -97,6 +97,11 @@ public:
 	void warm_graphs( int max_m, int slot = 0 );
 
 	void reset_slot( int slot );
+	// Shared token pool (model option kv_pool; always roomy without it): reserve room for positions [0, tokens) of a slot on every rank, or
+	// take nothing and return false; release_tokens hands the slot's pages back. Host bookkeeping only.
+	bool reserve_tokens( int slot, int tokens );
+	void release_tokens( int slot );
+	int pool_tokens() const;   // 0 = every slot owns max_seq tokens
 
 	// Multimodal input. A slot with a layout rotates its image tokens (and the text after them) with M-RoPE positions and takes the
 	// image embeddings in place of the placeholder tokens' embeddings; set it before prefilling, reset_slot clears it.

@@ -88,7 +88,7 @@ void prep_kernel( const half* __restrict__ proj, const half* __restrict__ ln_w, 
 // One block per row, 128 threads; only the row that completes a pool does work
 __global__ __launch_bounds__( 128 )
 void pool_kernel( const half* __restrict__ plane, half* __restrict__ pool_plane, const half* __restrict__ ape, int layer, int max_seq,
-	const pod::BatchRows* __restrict__ rows, size_t plane_slot_stride, size_t pool_slot_stride ) {
+	const pod::BatchRows* __restrict__ rows, size_t plane_slot_stride, size_t pool_slot_stride, pod::KVPages pg ) {
 	const int r = blockIdx.x, d = threadIdx.x;
 	const int pos = rows->pos[r];
 	if ( ( pos & ( P - 1 ) ) != P - 1 ) return;
@@ -110,8 +110,10 @@ void pool_kernel( const half* __restrict__ plane, half* __restrict__ pool_plane,
 		sum += e;
 		acc += e * k[j];
 	}
-	const int pool = pos / P;
-	pool_plane[static_cast<size_t>( slot ) * pool_slot_stride + ( static_cast<size_t>( layer ) * ( max_seq / P ) + pool ) * D + d] = __float2half_rn( acc / sum );
+	// The pooled key of tokens [pool * P, pool * P + P): the page holding them is that of the pool's first token
+	const size_t at = pg.table ? static_cast<size_t>( layer ) * ( pg.pool_tokens / P ) + pg.token( slot, pos - ( P - 1 ) ) / P
+	                           : static_cast<size_t>( layer ) * ( max_seq / P ) + pos / P;
+	pool_plane[( pg.table ? 0 : static_cast<size_t>( slot ) * pool_slot_stride ) + at * D + d] = __float2half_rn( acc / sum );
 }
 
 // Block = (row, tile of 128 pools), 4 warps of 2 column tiles of 16 pools. logits[h][p] = q[h] . key[p] is a 32 x 128 x 16 GEMM per
@@ -119,7 +121,7 @@ void pool_kernel( const half* __restrict__ plane, half* __restrict__ pool_plane,
 // head sum from shared memory
 __global__ __launch_bounds__( 128 )
 void score_kernel( const half* __restrict__ q_idx, const half* __restrict__ w, const half* __restrict__ pool_plane, half* __restrict__ scores,
-	int score_stride, int layer, int max_seq, const pod::BatchRows* __restrict__ rows, size_t pool_slot_stride ) {
+	int score_stride, int layer, int max_seq, const pod::BatchRows* __restrict__ rows, size_t pool_slot_stride, pod::KVPages pg ) {
 	__shared__ __align__( 32 ) half sq[H * D];
 	__shared__ __align__( 32 ) float sl[4][H * 16];
 	__shared__ float sw[H];
@@ -131,10 +133,14 @@ void score_kernel( const half* __restrict__ q_idx, const half* __restrict__ w, c
 	for ( int i = threadIdx.x; i < H * D / 8; i += 128 ) reinterpret_cast<uint4*>( sq )[i] = reinterpret_cast<const uint4*>( q_idx + static_cast<size_t>( r ) * H * D )[i];
 	if ( threadIdx.x < H ) sw[threadIdx.x] = __half2float( w[static_cast<size_t>( r ) * H + threadIdx.x] );
 	__syncthreads();
-	const half* keys = pool_plane + static_cast<size_t>( rows->slot[r] ) * pool_slot_stride + static_cast<size_t>( layer ) * ( max_seq / P ) * D;
+	const int slot = rows->slot[r];
+	const half* keys = pg.table ? pool_plane + static_cast<size_t>( layer ) * ( pg.pool_tokens / P ) * D
+	                            : pool_plane + static_cast<size_t>( slot ) * pool_slot_stride + static_cast<size_t>( layer ) * ( max_seq / P ) * D;
 	for ( int c = 0; c < 2; ++c ) {
 		const int p0 = blockIdx.y * 128 + ( warp * 2 + c ) * 16;
 		if ( p0 >= bound ) break;
+		// A 16-pool tile is 64 tokens, inside one page
+		const half* kt = keys + ( pg.table ? pg.token( slot, p0 * P ) / P : static_cast<size_t>( p0 ) ) * D;
 		wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1;
 		wmma::fill_fragment( acc0, 0.0f );
 		wmma::fill_fragment( acc1, 0.0f );
@@ -142,7 +148,7 @@ void score_kernel( const half* __restrict__ q_idx, const half* __restrict__ w, c
 		for ( int k = 0; k < D; k += 16 ) {
 			wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb;
 			wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
-			wmma::load_matrix_sync( fb, keys + static_cast<size_t>( p0 ) * D + k, D );
+			wmma::load_matrix_sync( fb, kt + k, D );
 			wmma::load_matrix_sync( fa, sq + k, D );
 			wmma::mma_sync( acc0, fa, fb, acc0 );
 			wmma::load_matrix_sync( fa, sq + 16 * D + k, D );
@@ -283,15 +289,15 @@ void DSA::prep( const half* proj, const half* ln_w, const half* ln_b, half* plan
 }
 
 void DSA::pool_update( const half* plane, half* pool_plane, const half* ape, int layer, int max_seq, int rows,
-	const pod::BatchRows* d_rows, size_t plane_slot_stride, size_t pool_slot_stride, cudaStream_t stream ) {
-	pool_kernel<<<dim3( rows ), dim3( 128 ), 0, stream>>>( plane, pool_plane, ape, layer, max_seq, d_rows, plane_slot_stride, pool_slot_stride );
+	const pod::BatchRows* d_rows, size_t plane_slot_stride, size_t pool_slot_stride, cudaStream_t stream, const pod::KVPages& pages ) {
+	pool_kernel<<<dim3( rows ), dim3( 128 ), 0, stream>>>( plane, pool_plane, ape, layer, max_seq, d_rows, plane_slot_stride, pool_slot_stride, pages );
 }
 
 void DSA::score( const half* q_idx, const half* w, const half* pool_plane, half* scores, int score_stride, int layer, int max_seq, int rows,
-	const pod::BatchRows* d_rows, size_t pool_slot_stride, cudaStream_t stream ) {
+	const pod::BatchRows* d_rows, size_t pool_slot_stride, cudaStream_t stream, const pod::KVPages& pages ) {
 	ENGINE_ASSERT( max_seq % 64 == 0, "DSA score: max_seq must be a multiple of 64" );
 	const int tiles = ( max_seq / P + 127 ) / 128;
-	score_kernel<<<dim3( rows, tiles ), dim3( 128 ), 0, stream>>>( q_idx, w, pool_plane, scores, score_stride, layer, max_seq, d_rows, pool_slot_stride );
+	score_kernel<<<dim3( rows, tiles ), dim3( 128 ), 0, stream>>>( q_idx, w, pool_plane, scores, score_stride, layer, max_seq, d_rows, pool_slot_stride, pages );
 }
 
 void DSA::select( const half* scores, int score_stride, int* idx, int* nkeys, int rows, const pod::BatchRows* d_rows, cudaStream_t stream ) {
