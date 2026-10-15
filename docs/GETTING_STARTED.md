@@ -89,12 +89,14 @@ Qwen extras:
   also inside Anthropic `tool_result` blocks; remote URLs are not fetched. GLM has its own tower (24 blocks, RMSNorm / SwiGLU, 2x2 conv merge); it is loaded last, into what is
   left of the arena. GLM with the DFlash2 drafter leaves about 5 MiB, so images stay off (the log says so and requests answer 400)
   unless memory is freed, for example `--set expert_cache=0.95` keeps 5% of the routed experts in host RAM.
-* **GLM at 256K context, 2 slots, drafter and images** (4x 32 GB): the weights alone take 29.2 of the 31 GiB arena, so part of the routed
-  experts live in host RAM and the latent cache is stored as FP8:
-  `--set max_seq=262144 --set max_slots=2 --set kv_format=fp8 --set expert_cache=0.85 --speculative --draft-model-dir <DFlash2>`
-  (arena 28.9 GiB, about 2 GiB spare). `expert_cache=0.88` loads but the vision tower no longer fits (images off); 0.90 and above run
-  out of memory. Without the drafter and images, 0.85 with FP16 latent and 1 slot also fits; its 250K needle passes (prefill 208 tok/s,
-  decode 14.8 tok/s at the 150 W cap). `kv_format` on GLM applies to the single latent tensor: `k8v4` stores it as 8-bit.
+* **GLM at 256K context, 2 slots and the drafter** (4x 32 GB): the weights alone take 29.2 of the 31 GiB arena, so part of the routed
+  experts live in host RAM and the latent cache is stored in 4 bits:
+  `--set max_seq=262144 --set max_slots=2 --set kv_format=nvfp4 --set expert_cache=0.95 --speculative --draft-model-dir <DFlash2>`
+  (`configs/glm_256k.json`; images off). Per GPU the arena holds 2.8 GiB of buffers and caches (the latent cache and attention workspaces
+  2.2 of them), 27.3 GiB of weights at 95% of the experts resident and the 0.7 GiB drafter, leaving 0.2 GiB; the startup log prints this
+  as `[mem]` lines. Each point of `expert_cache` costs 0.26 GiB, and the FP8 cache (`kv_format=fp8`, 1.2 GiB more) fits only up to about 0.85.
+  The 4-bit cache moves the perplexity of GLM by +0.006 NLL against FP16 on 3000 tokens (FP8: +0.001). `kv_format` on GLM applies to the
+  single latent tensor: `k8v4` stores it as 8-bit. With images on, the vision tower takes its memory from the same arena.
 * **Qwen3.8-Flash-Next** (`qwen4_exp`, the 100 GB exl3 checkpoint): runs on all four GPUs only (experts are placed whole, 128 per rank), about 18 GiB of
   the arena per GPU at an 8K window. Plain decode is about 31 tok/s; `--speculative --set speculator=mtp` drafts with the checkpoint's own MTP head and
   roughly doubles it with identical greedy output. Full-attention layers use the model's QSA block selection past 2048 tokens of context; the 256K window

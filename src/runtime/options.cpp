@@ -1,4 +1,5 @@
 #include "engine/runtime/options.h"
+#include "engine/core/log.h"
 
 #include <cctype>
 #include <cstdio>
@@ -115,7 +116,11 @@ Options& options() {
 
 bool set_option( const std::string& key, const std::string& value ) {
 	for ( const OptionInfo& info : table() ) {
-		if ( key == info.name ) return info.set( options(), value );
+		if ( key != info.name ) continue;
+		// The launch file and --set come after the environment: say so when a variable that is set loses to them
+		const char* e = std::getenv( info.env.c_str() );
+		if ( e && value != e ) LOG_WARN( "[config] %s=%s is overridden by the launch file or --set (%s=%s)\n", info.env.c_str(), e, key.c_str(), value.c_str() );
+		return info.set( options(), value );
 	}
 	return false;
 }

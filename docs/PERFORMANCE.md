@@ -32,7 +32,7 @@ The natural prompts are four real questions (two in Chinese) behind about 8K tok
 
 * repetitive output (a long text the model is told to copy) is the best case for a drafter: Qwen NVFP4 + DFlash2 reaches 316 tok/s at 32K context, 7.8 tokens per round, 97% accepted; Qwen EXL3 + MTP reaches 212 to 225 tok/s; Flash-Next MTP depth 4 233 tok/s. These runs end early now and then, and the output (and so the speed) depends on the model's wording, so they are listed as peaks and not as typical speed
 * the DFlash2 drafter format does not matter: the BF16 file and the EXL3 5.0 bpw conversion run the same speed (natural 8K, four prompts: 157, 154, 143, 94 tok/s with BF16 against 163, 169, 138, 93)
-* GLM-5.3-Flash at 256K context with two slots (FP8 latent cache, 85% of the experts resident, drafter): a 32K prompt takes 131 s to prefill and decodes at 20 tok/s; the 15% of experts that live in host memory are read over PCIe, so this is a capacity configuration, not a fast one ([GETTING_STARTED.md](GETTING_STARTED.md))
+* GLM-5.3-Flash at 256K context with two slots (4-bit latent cache, 95% of the experts resident, drafter): a 32K prompt takes 68 s to prefill and decodes at 53 tok/s (T=1, 7.1 tokens per round); the 5% of experts that live in host memory are read over PCIe, which the four GPUs share at 12 GB/s in total (`tests/tools/pcie_bw.cu`). With 85% resident and an FP8 cache the same prompt took 123 s and decoded at 16 tok/s ([GETTING_STARTED.md](GETTING_STARTED.md))
 * a sampling temperature above zero lowers the tokens per round (the drafter proposes its most likely chain), not the cost of a step: plain decode runs the same speed greedy and sampled
 
 ### Prefill
@@ -43,7 +43,7 @@ Time to first token for a cold prompt (no prefix cache), which is the prefill ti
 |---|---|---|---|
 | Qwen3.8-27B | 1.7 s | 3.4 s | 15.2 to 15.9 s |
 | Flash-Next | | 5.0 s | |
-| GLM-5.3-Flash | 5.2 s | 10.0 s | 131 s (256K configuration) |
+| GLM-5.3-Flash | 5.2 s | 10.0 s | 68 s (256K configuration) |
 
 ## Step latency
 

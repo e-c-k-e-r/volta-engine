@@ -106,6 +106,11 @@ bool Glm5NextPipeline::init(
 
 	const int R = pod::MAX_ROWS;
 	const int S = config_.max_slots;
+	size_t mem_mark = arena.offset_bytes;
+	const auto mem = [&]( const char* what ) {
+		if ( rank_ == 0 ) LOG_INFO( "[mem] rank 0: %s %.2f GiB\n", what, ( arena.offset_bytes - mem_mark ) / 1073741824.0 );
+		mem_mark = arena.offset_bytes;
+	};
 	// The MTP head (speculator=mtp) is one more MLA layer with its own latent cache and indexer state
 	mtp_on_ = runtime::options().speculator == "mtp";
 	mla_slots_ = config_.num_mla_layers + ( mtp_on_ ? 1 : 0 );
@@ -125,6 +130,7 @@ bool Glm5NextPipeline::init(
 	if ( engine::modules::ExpertTier::resident_fraction() < 1.0 ) state_.moe.coop_ctr = nullptr;
 #endif   // the ROCm build has no persistent kernel (its tensor-core path is emulated, 70 ms a layer): the fused launch serves the tier too
 
+	mem( "router outputs and MoE scratch" );
 	// KDA recurrent state + conv history per slot: [S, 45, ...] FP32, plus one-slot checkpoints
 	// Only the linear-attention layers carry state: every fourth layer (3, 7, ...) is MLA
 	state_.layer_kda_floats = static_cast<size_t>( config_.kda_heads ) * config_.kda_head_dim * config_.kda_head_dim;
@@ -147,6 +153,7 @@ bool Glm5NextPipeline::init(
 	state_.d_snap_on = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
 	backend::memset_sync( state_.d_snap_on, 0, sizeof( int ) );
 
+	mem( "KDA states, checkpoint and per-row snapshots" );
 	// 2. Activations: [R, ...] row buffers, viewed as [m, ...] per forward
 	int rows_shape[2] = { R, config_.hidden_size };
 	embed_rows_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rows_shape, 2 );
@@ -173,6 +180,7 @@ bool Glm5NextPipeline::init(
 	int comb_shape[2] = { 4 * R, 4 };
 	mhc_comb_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, comb_shape, 2 );
 
+	mem( "activations" );
 	// 3. MLA KV cache pool [S, 11, max_seq, 16 * 256] FP16 & execution buffers
 	attn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	{
@@ -253,6 +261,7 @@ bool Glm5NextPipeline::init(
 	z_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
 	attn_head_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
 
+	mem( "latent cache, attention workspaces" );
 	// 4. Dense / shared-expert FFN buffers
 	int moe_inter_shape[2] = { R, config_.dense_intermediate_size };
 	moe_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, moe_inter_shape, 2 );
@@ -262,6 +271,7 @@ bool Glm5NextPipeline::init(
 	local_moe_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	ffn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 
+	mem( "FFN buffers" );
 	// 5. Logits & argmax: the LM head is vocabulary-parallel, every rank owns vocab_size / tp_size columns padded
 	// up to a multiple of 256 (so the dp4a int8 GEMV engages); lm_shard_real_cols_ excludes the pad
 	ENGINE_ASSERT( config_.vocab_size % 128 == 0, "Glm5NextPipeline: vocab_size must be a multiple of 128" );
@@ -295,6 +305,7 @@ bool Glm5NextPipeline::init(
 		}
 	}
 
+	mem( "logits" );
 	// 6. DFlash2 attachment: position-indexed tap ring (one slot publishes), head scratch, candidate top-k scratch
 	{
 		draft_hooks_.taps_cap = MAX( MIN( config_.max_seq, 2048 ), 256 );
@@ -362,6 +373,7 @@ bool Glm5NextPipeline::init(
 	metadata_.eos_ids[1] = 154827;
 	metadata_.eos_ids[2] = 154829;
 
+	mem( "DFlash2 taps, MTP and the rest" );
 	return true;
 }
 

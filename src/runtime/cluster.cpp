@@ -84,6 +84,9 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		if ( !models_[d]->init( d, arenas_[d], ( tp_ > 1 ) ? &rings_[d] : nullptr ) ) return false;
 	}
 
+	constexpr double kGiB = 1073741824.0;
+	const size_t mem_buffers = arenas_[0].offset_bytes;
+	LOG_INFO( "[mem] GPU 0 arena: %.2f GiB of %.2f GiB: buffers, caches and workspaces %.2f GiB\n", mem_buffers / kGiB, arenas_[0].total_bytes / kGiB, mem_buffers / kGiB );
 	LOG_INFO( "Loading %s weights across %d GPUs from %s...\n", cfg.model_type.c_str(), tp_, cfg.model_dir.c_str() );
 	std::fflush( stdout );
 	pool_.start( tp_ );
@@ -98,6 +101,8 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 			arenas_[d].offset_bytes / 1073741824.0, arenas_[d].total_bytes / 1073741824.0 );
 	}
 
+	const size_t mem_weights = arenas_[0].offset_bytes;
+	LOG_INFO( "[mem] GPU 0 arena: weights %.2f GiB (%.2f GiB free)\n", ( mem_weights - mem_buffers ) / kGiB, ( arenas_[0].total_bytes - mem_weights ) / kGiB );
 	if ( opt.speculator == "mtp" && cfg.speculate ) {
 		if ( !models_[0]->has_mtp() ) {
 			LOG_ERROR( "ModelCluster: speculator=mtp, but %s has no MTP head\n", cfg.model_type.c_str() );
@@ -115,6 +120,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		for ( int d = 0; d < tp_; ++d ) models_[d]->set_snapshot_taps( true );
 	}
 
+	LOG_INFO( "[mem] GPU 0 arena: speculator %.2f GiB (%.2f GiB free)\n", ( arenas_[0].offset_bytes - mem_weights ) / kGiB, ( arenas_[0].total_bytes - arenas_[0].offset_bytes ) / kGiB );
 	// Image encoder last, into whatever the arena has left (rank 0)
 	models_[0]->load_vision( cfg.model_dir.c_str(), streams_[0] );
 

@@ -52,7 +52,7 @@ The model type is read from the checkpoint, never configured. Anything else is a
 Validated contexts:
 * Qwen: needle retrieval to 258K with 2 slots, TP4 and speculation (25 GiB per GPU); the 258K cold prefill takes about 5 minutes, a cached repeat 1 to 2 s
 * Flash-Next: needles at 12K, 32K, 100K and 250K pass (250K: prefill 848 tok/s, decode 42 tok/s); 256K with 2 slots fits
-* GLM: 256K with 2 slots needs `kv_format=fp8 expert_cache=0.85` and passes the API checks; the 256K needle itself is verified at FP16, 1 slot, no drafter (prefill 208 tok/s, decode 14.8 tok/s)
+* GLM: 256K with 2 slots runs with `kv_format=nvfp4 expert_cache=0.95` (a 32K prompt: 68 s prefill, 53 tok/s decode; the API checks were run with `kv_format=fp8 expert_cache=0.85`); the 256K needle itself is verified at FP16, 1 slot, no drafter (prefill 208 tok/s, decode 14.8 tok/s)
 
 ## Speculation
 
