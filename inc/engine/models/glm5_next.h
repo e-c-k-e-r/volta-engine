@@ -222,7 +222,8 @@ private:
 	void set_rows( int m );
 
 	pod::BatchRows* d_rows_ = nullptr;
-	backend::stream_t side_stream_ = nullptr;   // shared expert beside the fused MoE decode kernels (CUDA)
+	backend::stream_t side_stream_ = nullptr;   // shared expert beside the fused MoE decode kernels, KDA gates, MLA kv / indexer chains (CUDA)
+	backend::stream_t side_stream2_ = nullptr;  // the MLA indexer scores
 	engine::core::GraphCache graphs_;
 
 	// Absorbed MLA: the cache holds the 512-wide KV latent per token, shared by all heads,

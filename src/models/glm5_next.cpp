@@ -104,6 +104,7 @@ bool Glm5NextPipeline::init(
 #if ENGINE_BACKEND_CUDA
 	backend::set_device( rank_ );
 	side_stream_ = backend::stream_create();
+	side_stream2_ = backend::stream_create();
 #endif
 	arena_ = &arena;
 	ring_ = ring;
@@ -1586,6 +1587,17 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 		else if ( lw.is_mla && lw.q_a.is_valid() ) {
 			int mla_idx = layer / 4;
 
+			// Decode rows with the DSA indexer: three chains run side by side. Main: q_a -> q_a_norm -> q_b -> absorb_q. First side stream: kv_a -> kv_a_norm ->
+			// store, then the indexer keys (project, prep, pool). Second side stream: the indexer query (needs q_a_norm and the pool) -> score -> select.
+			// Attention waits for all three; the buffers of the chains are disjoint
+			// The trellis projections share one workspace per device, so the chains overlap only for NVFP4 / FP16 projections (the NVFP4 dense checkpoint)
+			const auto no_workspace = []( const pod::LinearWeight& w ) { return w.type != pod::QuantType::TRELLIS; };
+			const bool mla_overlap = side_stream_ != nullptr && side_stream2_ != nullptr && m <= pod::MAX_BATCH && dsa_ && lw.idx_dense.data != nullptr &&
+				no_workspace( lw.q_a ) && no_workspace( lw.q_b ) && no_workspace( lw.kv_a ) && no_workspace( lw.idx_wq_b );
+			backend::stream_t sk = mla_overlap ? side_stream_ : stream;
+			backend::stream_t sx = mla_overlap ? side_stream2_ : stream;
+			if ( mla_overlap ) backend::stream_fork( stream, sk );
+
 			// Project Q: q_a_proj -> q_a_norm -> q_b_proj
 			engine::modules::Linear::forward(
 				norm_hidden_, lw.q_a, q_lora_buf_, stream
@@ -1602,11 +1614,11 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 
 			// Project KV: kv_a_proj_with_mqa -> kv_a_norm -> kv_b_proj
 			engine::modules::Linear::forward(
-				norm_hidden_, lw.kv_a, kv_lora_buf_, stream
+				norm_hidden_, lw.kv_a, kv_lora_buf_, sk
 			);
 
 			engine::modules::RMSNorm::forward(
-				kv_lora_buf_, lw.kv_a_norm, kv_lora_norm_buf_, 1e-5f, 0.0f, stream
+				kv_lora_buf_, lw.kv_a_norm, kv_lora_norm_buf_, 1e-5f, 0.0f, sk
 			);
 
 			{
@@ -1614,7 +1626,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				pod::TensorView q_lat = q_lat_, o_lat = o_lat_;
 				q_lat.shape[0] = m;
 				o_lat.shape[0] = m;
-				engine::modules::MLALatent::store( latent_ref(), kv_lora_norm_buf_, mla_idx, config_.max_seq, m, kv_ref, stream );
+				engine::modules::MLALatent::store( latent_ref(), kv_lora_norm_buf_, mla_idx, config_.max_seq, m, kv_ref, sk );
 				engine::modules::MLALatent::absorb_q( q_buf_, lw.kv_b_proj, q_lat, lh_, m, stream );
 				const int* sel_idx = nullptr;
 				const int* sel_n = nullptr;
@@ -1622,26 +1634,34 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 					using engine::modules::DSA;
 					// Indexer keys and gates of this chunk go into the plane, finished pools into the pool plane
 					if ( m <= pod::MAX_BATCH ) {
-						DSA::project_small( lw.idx_dense.ptr<backend::half_t>(), norm_hidden_.ptr<backend::half_t>(), dsa_proj_, m, DSA::PROJ, 4096, stream );
+						DSA::project_small( lw.idx_dense.ptr<backend::half_t>(), norm_hidden_.ptr<backend::half_t>(), dsa_proj_, m, DSA::PROJ, 4096, sk );
 					}
 					else {
-						DSA::project_large( lw.idx_dense.ptr<backend::half_t>(), norm_hidden_.ptr<backend::half_t>(), dsa_proj_, m, DSA::PROJ, 4096, stream );
+						DSA::project_large( lw.idx_dense.ptr<backend::half_t>(), norm_hidden_.ptr<backend::half_t>(), dsa_proj_, m, DSA::PROJ, 4096, sk );
 					}
 					DSA::prep( dsa_proj_, lw.idx_ln_w.ptr<backend::half_t>(), lw.idx_ln_b.ptr<backend::half_t>(), dsa_plane_, dsa_w_, mla_idx, config_.max_seq, m,
-						d_rows_, dsa_plane_stride_, stream );
+						d_rows_, dsa_plane_stride_, sk );
 					DSA::pool_update( dsa_plane_, dsa_pool_, lw.idx_ape.ptr<backend::half_t>(), mla_idx, config_.max_seq, m, d_rows_,
-						dsa_plane_stride_, dsa_pool_stride_, stream, kv_pages() );
+						dsa_plane_stride_, dsa_pool_stride_, sk, kv_pages() );
 					// Selection matters once a row sees more than topk tokens; decode graphs always run it (rows below the
 					// threshold exit early on the device), eager chunks skip it while every row is still dense
 					if ( m <= pod::MAX_BATCH || key_hint_ > DSA::TOPK + DSA::POOL - 1 ) {
 						pod::TensorView qi = pod::make_tensor_2d( dsa_q_, pod::DType::FP16, m, DSA::HEADS * DSA::DIM );
-						engine::modules::Linear::forward( q_lora_norm_buf_, lw.idx_wq_b, qi, stream );
+						if ( mla_overlap ) {
+							backend::stream_fork( stream, sx );   // the indexer query reads q_a_norm
+							backend::stream_fork( sk, sx );       // the scores read the pool
+						}
+						engine::modules::Linear::forward( q_lora_norm_buf_, lw.idx_wq_b, qi, sx );
 						DSA::score( dsa_q_, dsa_w_, dsa_pool_, dsa_scores_, config_.max_seq / DSA::POOL, mla_idx, config_.max_seq, m,
-							d_rows_, dsa_pool_stride_, stream, kv_pages() );
-						DSA::select( dsa_scores_, config_.max_seq / DSA::POOL, dsa_idx_, dsa_nk_, m, d_rows_, stream );
+							d_rows_, dsa_pool_stride_, sx, kv_pages() );
+						DSA::select( dsa_scores_, config_.max_seq / DSA::POOL, dsa_idx_, dsa_nk_, m, d_rows_, sx );
 						sel_idx = dsa_idx_;
 						sel_n = dsa_nk_;
 					}
+				}
+				if ( mla_overlap ) {
+					backend::stream_join( stream, sk );
+					backend::stream_join( stream, sx );
 				}
 				engine::modules::MLALatent::attend( latent_ref(), q_lat, o_lat, mla_idx, config_.max_seq, m, lh_, kv_ref, latent_ws_, key_hint_, stream, sel_idx, sel_n, ws_seq_ );
 				static const bool dsa_diag = runtime::options().dsa_diag;
@@ -2042,7 +2062,8 @@ void Glm5NextPipeline::destroy() {
 		hessian_dump();
 		graphs_.reset();
 		if ( side_stream_ != nullptr ) backend::stream_destroy( side_stream_ );
-		side_stream_ = nullptr;
+		if ( side_stream2_ != nullptr ) backend::stream_destroy( side_stream2_ );
+		side_stream_ = side_stream2_ = nullptr;
 	}
 	engine::core::arena_destroy( host_arena_ );
 	if ( h_argmax_idx_ != nullptr ) {
