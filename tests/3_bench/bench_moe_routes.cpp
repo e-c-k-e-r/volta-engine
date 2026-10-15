@@ -65,7 +65,9 @@ int main( int argc, char** argv ) {
 	cudaEvent_t e0, e1;
 	CUDA_CHECK( cudaEventCreate( &e0 ) );
 	CUDA_CHECK( cudaEventCreate( &e1 ) );
-	for ( int n : { 0, 1, 2, 3, 4, 5, 6, 8, 10 } ) {
+	std::vector<int> counts = { 0, 1, 2, 3, 4, 5, 6, 8, 10 };
+	if ( const char* only = std::getenv( "BENCH_ROUTES" ) ) counts = { std::atoi( only ) };   // a single route count (for a profiler)
+	for ( int n : counts ) {
 		std::vector<int> hi( SETS * K );
 		for ( int s = 0; s < SETS; ++s ) {
 			int used[512] = {};   // TOTAL <= 512
