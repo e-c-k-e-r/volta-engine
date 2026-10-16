@@ -680,3 +680,7 @@ if(ENGINE_GPU)
 		set_target_properties(bench_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 	endif()
 endif()
+
+add_executable(diag_logits tests/4_coherence/diag_logits.cpp)
+target_link_libraries(diag_logits PRIVATE engine_kernels pthread)
+set_target_properties(diag_logits PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
