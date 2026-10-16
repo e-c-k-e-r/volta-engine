@@ -145,6 +145,7 @@ Qwen4ExpPipeline::~Qwen4ExpPipeline() {
 }
 
 bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
+	const size_t mem_start = arena.offset_bytes;
 	rank_ = device_id;
 	arena_ = &arena;
 	ring_ = ring;
@@ -329,11 +330,16 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	metadata_.max_rows = pod::MAX_ROWS;
 	metadata_.eos_ids[0] = 248044;
 	metadata_.eos_ids[1] = 248046;
+	if ( runtime::options().mem_log && rank_ <= 1 ) {
+		LOG_INFO( "[mem] rank %d: buffers, caches and workspaces %.2f GiB (KV and QSA pools, states, activations, scratch)\n", rank_, ( arena.offset_bytes - mem_start ) / 1073741824.0 );
+	}
 	return true;
 }
 
 bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t stream ) {
 	if ( !validate_config( model_dir, config_ ) ) return false;
+	const size_t mem_weights_start = arena_->offset_bytes;
+	size_t wb_experts = 0, wb_shared = 0;   // [mem] weights breakdown (mem_log)
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) {
 		LOG_ERROR( "[loader] FAILED to open model directory %s\n", model_dir );
@@ -582,6 +588,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 			tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_ ) );
 			tier_layer = tier_layers_++;
 		}
+		const size_t wb_experts_start = arena_->offset_bytes;
 		for ( int e = 0; e < per_rank; ++e ) {
 			const int gid = rank_ * per_rank + e;
 			pod::MemoryArena ca[3];
@@ -623,12 +630,15 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 			std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.down_proj", pre, gid ); mw.down[e] = check( repo.load_linear( nm, *arena_, 4, stream, cp[2] ), nm );
 		}
 		engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );
+		wb_experts += arena_->offset_bytes - wb_experts_start;
 		mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( per_rank ) * sizeof( uint32_t ), 128 ) );
 		backend::memset_async( mw.heat, 0, static_cast<size_t>( per_rank ) * sizeof( uint32_t ), stream );
+		const size_t wb_shared_start = arena_->offset_bytes;
 		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.gate_proj", pre ); lw.shared_gate = load_full_g( "shared_gate", nm, 4 );
 		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.up_proj", pre ); lw.shared_up = load_full_g( "shared_up", nm, 4 );
 		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.down_proj", pre ); lw.shared_down = load_full_g( "shared_down", nm, 4 );
 		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert_gate.weight", pre ); lw.shared_expert_gate = dense( nm );
+		wb_shared += arena_->offset_bytes - wb_shared_start;
 	};
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		char pre[160];
@@ -657,6 +667,12 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	if ( missing > 0 ) {
 		LOG_ERROR( "[RANK %d] %d tensors missing\n", rank_, missing );
 		return false;
+	}
+	if ( runtime::options().mem_log && rank_ <= 1 ) {
+		constexpr double kGiB = 1073741824.0;
+		const size_t total = arena_->offset_bytes - mem_weights_start;
+		LOG_INFO( "[mem] rank %d weights %.3f GiB: experts %.3f (codes, scales, tier slots), shared experts %.3f, attention, router, norms, hyper-connections, embeddings and the rest %.3f\n",
+			rank_, total / kGiB, wb_experts / kGiB, wb_shared / kGiB, ( total - wb_experts - wb_shared ) / kGiB );
 	}
 	weights_loaded_ = true;
 	return true;

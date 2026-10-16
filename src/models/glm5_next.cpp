@@ -118,7 +118,7 @@ bool Glm5NextPipeline::init(
 	const int S = config_.max_slots;
 	size_t mem_mark = arena.offset_bytes;
 	const auto mem = [&]( const char* what ) {
-		if ( rank_ == 0 ) LOG_INFO( "[mem] rank 0: %s %.2f GiB\n", what, ( arena.offset_bytes - mem_mark ) / 1073741824.0 );
+		if ( rank_ == 0 && runtime::options().mem_log ) LOG_INFO( "[mem] rank 0: %s %.2f GiB\n", what, ( arena.offset_bytes - mem_mark ) / 1073741824.0 );
 		mem_mark = arena.offset_bytes;
 	};
 	// The MTP head (speculator=mtp) is one more MLA layer with its own latent cache and indexer state
@@ -1149,7 +1149,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 
 	tier_.stage_init( *arena_ );
 	size_t bytes_after = arena_->offset_bytes;
-	if ( rank_ <= 1 ) {
+	if ( rank_ <= 1 && runtime::options().mem_log ) {
 		constexpr double kGiB = 1073741824.0;
 		LOG_INFO( "[mem] rank %d weights: before the layers (lm_head, final norm) %.3f GiB, attention + norms + hyper-connections %.3f, routers %.3f, shared experts %.3f, dense MLPs %.3f, experts %.3f (codes, signs, scales), MTP head and the rest %.3f\n",
 			rank_, ( layers_begin - bytes_before ) / kGiB, wb_attn / kGiB, wb_router / kGiB, wb_shared / kGiB, wb_dense / kGiB, experts_cost / kGiB,

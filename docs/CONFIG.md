@@ -84,6 +84,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `max_image_tokens` | int | `1024` | `ENGINE_MAX_IMAGE_TOKENS` | largest image the vision tower accepts, in language-model tokens (4 patches each; sizes its scratch and caps the resize); 0 = image input off |
 | `expert_stats` | bool | `true` | `ENGINE_EXPERT_STATS` | count the routes per expert for the monitor page (a device sync per rank about once a second while serving) |
 | `spec_ctrl` | bool | `true` | `ENGINE_SPEC_CTRL` | adaptive speculation controller; false always speculates |
+| `mem_log` | bool | `false` | `ENGINE_MEM_LOG` | log the per-pipeline [mem] breakdown at startup (GLM: buffers by kind, weights by kind, drafter; Flash-Next: buffers, weights by kind); the arena summary lines stay on |
 | **Debug** | | | | |
 | `moe_prefill_tile` | bool | `true` | `ENGINE_DEBUG_MOE_PREFILL_TILE` | trellis MoE, prefill chunks of more than 128 rows: the 32-row expert tile with two resident blocks per SM; false runs the 16-row tile of the decode kernels (A/B) |
 | `shared_slice` | bool | `true` | `ENGINE_DEBUG_SHARED_SLICE` | GLM: the shared expert is cut over the ranks (each holds and runs 1/tp of its width, the partial outputs meet in the MoE all-reduce) and so is the dense MLP of layers 0-2 (an all-reduce after its down projection); false loads the shared expert whole on every rank, run on rank 0, and the dense MLP whole on every rank (A/B) |

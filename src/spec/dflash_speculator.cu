@@ -1,4 +1,5 @@
 #include "engine/spec/dflash.h"
+#include "engine/runtime/options.h"
 #include "engine/core/log.h"
 #include "engine/modules/norm.h"
 #include "engine/modules/swiglu.h"
@@ -215,7 +216,7 @@ bool DFlashSpeculator::init(
 	if ( rank_ == 0 ) {
 		const size_t kv_bytes = 2 * static_cast<size_t>( kv_total ) * config_.num_hidden_layers * kv_heads_local * config_.head_dim * sizeof( half );
 		const size_t book_bytes = 2 * static_cast<size_t>( config_.vocab_size ) * sel_rank * sizeof( half );
-		LOG_INFO( "[mem] drafter rank 0: KV ring %.0f MiB, selector codebooks %.0f MiB (rank 0 only)\n", kv_bytes / 1048576.0, book_bytes / 1048576.0 );
+		if ( engine::runtime::options().mem_log ) LOG_INFO( "[mem] drafter rank 0: KV ring %.0f MiB, selector codebooks %.0f MiB (rank 0 only)\n", kv_bytes / 1048576.0, book_bytes / 1048576.0 );
 	}
 	initialized_ = true;
 	return true;
@@ -424,7 +425,7 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 	weights_loaded_ = true;
 	LOG_INFO( "[dflash] backbone loaded: %d layers, hidden %d, tp %d (rank %d), conv groups %d\n",
 		L, H, TP, R, config_.conv_groups() );
-	if ( rank_ == 0 ) LOG_INFO( "[mem] drafter rank 0: weights include %.0f MiB of dense FP16 projections (dequantized at load)\n", g_dense_proj_bytes / 1048576.0 );
+	if ( rank_ == 0 && engine::runtime::options().mem_log ) LOG_INFO( "[mem] drafter rank 0: weights include %.0f MiB of dense FP16 projections (dequantized at load)\n", g_dense_proj_bytes / 1048576.0 );
 	return true;
 }
 

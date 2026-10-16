@@ -93,7 +93,7 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 		if ( !spec_[d].init( cfg, d, mc.arena( d ), mc.stream( d ), d, tp_ ) ) return false;
 		const size_t mem1 = mc.arena( d ).offset_bytes;
 		loaded = spec_[d].load_weights( draft_dir.c_str(), mc.stream( d ) ) && loaded;
-		if ( d <= 1 ) LOG_INFO( "[mem] drafter rank %d: scratch, KV ring and codebooks %.3f GiB, weights %.3f GiB\n", d, ( mem1 - mem0 ) / 1073741824.0,
+		if ( d <= 1 && runtime::options().mem_log ) LOG_INFO( "[mem] drafter rank %d: scratch, KV ring and codebooks %.3f GiB, weights %.3f GiB\n", d, ( mem1 - mem0 ) / 1073741824.0,
 			( mc.arena( d ).offset_bytes - mem1 ) / 1073741824.0 );
 	}
 	LOG_INFO( "DFlash2 speculator: %s (%s), drafter tp=%d\n", loaded ? "loaded" : "STANDALONE", draft_dir.c_str(), tp_ );
