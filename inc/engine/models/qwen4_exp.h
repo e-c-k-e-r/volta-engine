@@ -239,7 +239,8 @@ private:
 	int* topk_idx_ = nullptr;                 // [R, top_k]
 	backend::half_t* topk_w_ = nullptr;
 	pod::MoEScratch moe_scratch_;
-	backend::stream_t side_stream_ = nullptr;   // shared expert beside the fused MoE decode kernels (CUDA)
+	backend::stream_t side_stream_ = nullptr;   // shared expert beside the fused MoE decode kernels; independent projections of the attention sublayers (CUDA)
+	backend::stream_t side_stream2_ = nullptr;  // the QSA indexer chain
 	pod::TensorView sh_gate_buf_, sh_up_buf_, sh_inter_buf_, sh_out_, sh_gate_;
 	// Full-attention buffers (this rank: q_heads_ query heads over kv_heads_ KV heads: 1 with tp 2 or 4, 2 with tp 1)
 	int q_heads_ = 0, kv_heads_ = 0;

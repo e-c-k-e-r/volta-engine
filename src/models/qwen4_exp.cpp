@@ -138,6 +138,7 @@ Qwen4ExpPipeline::~Qwen4ExpPipeline() {
 		hessian_dump();
 		graphs_.reset();
 		if ( side_stream_ != nullptr ) backend::stream_destroy( side_stream_ );
+		if ( side_stream2_ != nullptr ) backend::stream_destroy( side_stream2_ );
 		if ( full_logits_mem_ != nullptr ) backend::device_free( full_logits_mem_ );
 		engine::core::arena_destroy( host_arena_ );
 	}
@@ -148,7 +149,10 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	arena_ = &arena;
 	ring_ = ring;
 #if defined(ENGINE_BACKEND_CUDA) && ENGINE_BACKEND_CUDA == 1
-	side_stream_ = backend::stream_create();
+	if ( runtime::options().side_streams ) {
+		side_stream_ = backend::stream_create();
+		side_stream2_ = backend::stream_create();
+	}
 #endif
 	tp_ = ( ring != nullptr ) ? requested_tp_ : 1;
 	if ( runtime::options().max_seq > 0 ) config_.max_seq = runtime::options().max_seq;
@@ -883,30 +887,49 @@ void Qwen4ExpPipeline::attention_forward( const Qwen4ExpLayerWeights& lw, int at
 	const pod::KVRef kv = kv_pool_.ref();
 	const size_t kv_slot_stride = kv_pool_.slot_stride_elems;
 	const int hd = config_.head_dim;
-	engine::modules::Linear::forward( mixed_, lw.q_proj, q_gate_buf_, stream );
-	engine::modules::Attention::unpack_q_gate( q_gate_buf_, q_buf_, gate_attn_buf_, q_heads_, hd, stream );
-	engine::modules::RMSNorm::forward_heads( q_buf_, lw.q_norm, q_heads_, hd, config_.rms_norm_eps, 1.0f, stream );
-	engine::modules::Linear::forward( mixed_, lw.k_proj, k_buf_, stream );
-	engine::modules::RMSNorm::forward_heads( k_buf_, lw.k_norm, kv_heads_, hd, config_.rms_norm_eps, 1.0f, stream );
-	engine::modules::Linear::forward( mixed_, lw.v_proj, v_buf_, stream );
-	engine::modules::RoPE::forward( q_buf_, k_buf_, q_heads_, kv_heads_, hd, config_.rot_dim, d_rows_, m, config_.rope_theta, stream );
-	engine::modules::Attention::store_kv_cache( kv, k_buf_, v_buf_, kv_slot_stride, attn_idx, d_rows_, m, kv_heads_, hd, config_.max_seq, stream );
+	using engine::modules::QSA;
+	static const bool qsa_off = runtime::options().qsa_off;
+	// Decode rows: three chains that read only the normed input run side by side, the way GLM's MLA layers do. Main: q_proj, q norm. First side stream: k_proj,
+	// k norm, v_proj (joined before the rope). Second side stream: the QSA indexer (queries and ring, pooled keys, scores, selection; joined before the
+	// sparse attention). The trellis projections share one workspace per device, so only NVFP4 / FP16 projections overlap
+	const auto no_workspace = []( const pod::LinearWeight& w ) { return w.type != pod::QuantType::TRELLIS; };
+	static const bool overlap_on = runtime::options().hessian_dir.empty();
+	const bool overlap = overlap_on && side_stream_ != nullptr && side_stream2_ != nullptr && m <= pod::MAX_BATCH && !qsa_off &&
+		no_workspace( lw.q_proj ) && no_workspace( lw.k_proj ) && no_workspace( lw.v_proj ) && no_workspace( lw.idx_qk_proj );
+	backend::stream_t sk = overlap ? side_stream_ : stream;
+	backend::stream_t sx = overlap ? side_stream2_ : stream;
+	if ( overlap ) {
+		backend::stream_fork( stream, sk );
+		backend::stream_fork( stream, sx );
+	}
 	// QSA indexer: the raw-key ring and the pooled keys are kept for every row; the selection only changes the attention once a row sees more
 	// than the budget (indexer_budget tokens = 512 complete pools): rows below it stay dense
 	// Note: the indexer ropes queries and pooled keys at the plain KV positions (rows->pos), as the exllamav3 reference does; only the attention above
 	// uses the M-RoPE positions (rope_pos). If long contexts with images (past the budget) select the wrong blocks, try the M-RoPE positions here
 	// and in qsa.cu (prep / pool_update); there is no image oracle for it yet
-	using engine::modules::QSA;
-	engine::modules::Linear::forward( mixed_, lw.idx_qk_proj, qsa_qk_, stream );
+	engine::modules::Linear::forward( mixed_, lw.idx_qk_proj, qsa_qk_, sx );
 	QSA::prep( qsa_qk_.ptr<const backend::half_t>(), lw.idx_q_norm.ptr<const backend::half_t>(), qsa_q_.ptr<backend::half_t>(), qsa_ring_, attn_idx, m, d_rows_,
-		qsa_ring_slot_, config_.rot_dim, config_.rope_theta, config_.rms_norm_eps, stream );
+		qsa_ring_slot_, config_.rot_dim, config_.rope_theta, config_.rms_norm_eps, sx );
 	QSA::pool_update( qsa_ring_, qsa_pool_, lw.idx_k_norm.ptr<const backend::half_t>(), attn_idx, m, d_rows_, qsa_ring_slot_, qsa_pool_slot_, qsa_max_pools_,
-		config_.rot_dim, config_.rope_theta, config_.rms_norm_eps, stream );
-	static const bool qsa_off = runtime::options().qsa_off;
+		config_.rot_dim, config_.rope_theta, config_.rms_norm_eps, sx );
 	// Decode-sized rows always take the sparse path (it runs rows below the budget densely): the captured graph cannot depend on the position
-	if ( !qsa_off && ( m <= pod::MAX_BATCH || key_hint_ >= ( config_.indexer_budget / QSA::POOL + 1 ) * QSA::POOL ) ) {
-		QSA::score( qsa_q_.ptr<const backend::half_t>(), qsa_pool_, qsa_scores_, qsa_max_pools_, attn_idx, qsa_max_pools_, m, d_rows_, qsa_pool_slot_, stream );
-		engine::modules::DSA::select( qsa_scores_, qsa_max_pools_, qsa_idx_, qsa_nkeys_, m, d_rows_, stream );
+	const bool sparse = !qsa_off && ( m <= pod::MAX_BATCH || key_hint_ >= ( config_.indexer_budget / QSA::POOL + 1 ) * QSA::POOL );
+	if ( sparse ) {
+		QSA::score( qsa_q_.ptr<const backend::half_t>(), qsa_pool_, qsa_scores_, qsa_max_pools_, attn_idx, qsa_max_pools_, m, d_rows_, qsa_pool_slot_, sx );
+		engine::modules::DSA::select( qsa_scores_, qsa_max_pools_, qsa_idx_, qsa_nkeys_, m, d_rows_, sx );
+	}
+	engine::modules::Linear::forward( mixed_, lw.k_proj, k_buf_, sk );
+	engine::modules::RMSNorm::forward_heads( k_buf_, lw.k_norm, kv_heads_, hd, config_.rms_norm_eps, 1.0f, sk );
+	engine::modules::Linear::forward( mixed_, lw.v_proj, v_buf_, sk );
+	engine::modules::Linear::forward( mixed_, lw.q_proj, q_gate_buf_, stream );
+	engine::modules::Attention::unpack_q_gate( q_gate_buf_, q_buf_, gate_attn_buf_, q_heads_, hd, stream );
+	engine::modules::RMSNorm::forward_heads( q_buf_, lw.q_norm, q_heads_, hd, config_.rms_norm_eps, 1.0f, stream );
+	if ( overlap ) backend::stream_join( stream, sk );
+	engine::modules::RoPE::forward( q_buf_, k_buf_, q_heads_, kv_heads_, hd, config_.rot_dim, d_rows_, m, config_.rope_theta, stream );
+	engine::modules::Attention::store_kv_cache( kv, k_buf_, v_buf_, kv_slot_stride, attn_idx, d_rows_, m, kv_heads_, hd, config_.max_seq, stream );
+	// The indexer chain is ready before the attention reads its selection
+	if ( overlap ) backend::stream_join( stream, sx );
+	if ( sparse ) {
 		engine::modules::Attention::forward_sparse( kv, q_buf_, gate_attn_buf_, attn_out_, kv_slot_stride, attn_idx, d_rows_, m, q_heads_, kv_heads_, hd,
 			config_.max_seq, qsa_idx_, qsa_nkeys_, engine::modules::DSA::KPAD, stream );
 	}
@@ -921,8 +944,17 @@ void Qwen4ExpPipeline::attention_forward( const Qwen4ExpLayerWeights& lw, int at
 // Linear-attention sublayer: mixed_ in, the rank's partial out_proj result in y_
 void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_idx, int m, backend::stream_t stream ) {
 	const int k_heads = lin_k_heads_, v_heads = lin_v_heads_, channels = lin_channels_;
+	// Decode rows: the z projection and the gate projections read only the normed input, so they run on the side stream beside the qkv projection, conv and
+	// l2 norm; the recurrent step waits for both. The trellis projections share one workspace per device, so only NVFP4 / FP16 weights overlap
+	static const bool overlap_on = runtime::options().hessian_dir.empty();
+	const bool overlap = overlap_on && side_stream_ != nullptr && m <= pod::MAX_BATCH && lw.in_proj_z.type != pod::QuantType::TRELLIS && lw.in_proj_qkv.type != pod::QuantType::TRELLIS;
+	backend::stream_t sk = overlap ? side_stream_ : stream;
+	if ( overlap ) backend::stream_fork( stream, sk );
+	engine::modules::Linear::forward( mixed_, lw.in_proj_z, z_buf_, sk );
+	pod::TensorView gate_rows = pod::make_tensor_2d( gdn_gate_.ptr<float>(), pod::DType::FP32, m, v_heads );
+	pod::TensorView beta_rows = pod::make_tensor_2d( gdn_beta_.ptr<float>(), pod::DType::FP32, m, v_heads );
+	engine::modules::GDN::project_gates( mixed_, lw.in_proj_a, lw.in_proj_b, lw.A_log, lw.dt_bias, gate_rows, beta_rows, v_heads, config_.hidden_size, sk, m );
 	engine::modules::Linear::forward( mixed_, lw.in_proj_qkv, qkv_buf_, stream );
-	engine::modules::Linear::forward( mixed_, lw.in_proj_z, z_buf_, stream );
 	if ( linear_idx == 0 ) {
 		trace_rows( 2000, qkv_buf_.data, false, m, stream, channels );
 		trace_rows( 2001, z_buf_.data, false, m, stream, v_heads * 128 );
@@ -937,8 +969,6 @@ void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_i
 	pod::TensorView qkv_rows = pod::make_tensor_2d( qkv_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, channels );
 	pod::TensorView out_rows = pod::make_tensor_2d( gdn_out_.ptr<backend::half_t>(), pod::DType::FP16, m, v_heads * 128 );
 	pod::TensorView z_rows = pod::make_tensor_2d( z_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, v_heads * 128 );
-	pod::TensorView gate_rows = pod::make_tensor_2d( gdn_gate_.ptr<float>(), pod::DType::FP32, m, v_heads );
-	pod::TensorView beta_rows = pod::make_tensor_2d( gdn_beta_.ptr<float>(), pod::DType::FP32, m, v_heads );
 
 	if ( m > pod::MAX_BATCH ) {
 		pod::TensorView conv_rows = pod::make_tensor_2d( conv_out_.ptr<backend::half_t>(), pod::DType::FP16, m, channels );
@@ -951,7 +981,7 @@ void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_i
 	}
 	if ( linear_idx == 0 ) trace_rows( 2004, qkv_rows.data, false, m, stream, channels );   // after conv + silu
 	engine::modules::GDN::l2_norm_heads( qkv_rows, k_heads, config_.linear_head_dim, stream, false, m, channels );
-	engine::modules::GDN::project_gates( mixed_, lw.in_proj_a, lw.in_proj_b, lw.A_log, lw.dt_bias, gate_rows, beta_rows, v_heads, config_.hidden_size, stream, m );
+	if ( overlap ) backend::stream_join( stream, sk );
 	engine::modules::GDN::recurrent_step_rows( layer_state, qkv_rows, gate_rows, beta_rows, out_rows, k_heads, v_heads, config_.linear_head_dim, m, d_rows_,
 		state_.slot_gdn_floats, gdn_snap, state_.slot_gdn_floats, snap_rows, state_.d_snap_on, stream );
 	// Sigmoid-gated RMSNorm (the KDA flavor): rmsnorm(out) * w * sigmoid(z)

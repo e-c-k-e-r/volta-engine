@@ -103,8 +103,10 @@ bool Glm5NextPipeline::init(
 	rank_ = rank;
 #if ENGINE_BACKEND_CUDA
 	backend::set_device( rank_ );
-	side_stream_ = backend::stream_create();
-	side_stream2_ = backend::stream_create();
+	if ( runtime::options().side_streams ) {
+		side_stream_ = backend::stream_create();
+		side_stream2_ = backend::stream_create();
+	}
 #endif
 	arena_ = &arena;
 	ring_ = ring;
