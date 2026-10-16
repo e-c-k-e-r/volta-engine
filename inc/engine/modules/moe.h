@@ -20,7 +20,7 @@ struct MoELayerWeights {
 	LinearWeight up[MOE_MAX_EXPERTS];
 	LinearWeight down[MOE_MAX_EXPERTS];
 	void* device_ptrs = nullptr;
-	void* staged_ptrs = nullptr;       // trellis tier: a table of the same layout whose cold experts point at device scratch; set by ExpertTier for the length of a prefill layer
+	void* staged_ptrs = nullptr;       // tier (trellis or NVFP4): a table of the same layout whose cold experts point at device scratch; set by ExpertTier for the length of a prefill layer
 	uint32_t* heat = nullptr;          // [num_local_experts] routes per expert since the last reset (device), optional
 };
 

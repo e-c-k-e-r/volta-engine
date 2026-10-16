@@ -668,6 +668,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		LOG_ERROR( "[RANK %d] %d tensors missing\n", rank_, missing );
 		return false;
 	}
+	tier_.stage_init( *arena_ );   // prefill staging scratch for the cold experts (turns itself off when the arena has no room)
 	if ( runtime::options().mem_log && rank_ <= 1 ) {
 		constexpr double kGiB = 1073741824.0;
 		const size_t total = arena_->offset_bytes - mem_weights_start;
@@ -1126,7 +1127,13 @@ void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backe
 	dump_router( m, stream );
 	const int per_rank = config_.num_experts / tp_;
 	// Plain SiLU gating (no swiglu limit): act_limit 0
+	// A prefill chunk reads the layer's cold experts from device scratch, copied a layer ahead (the tier's explicit copy; reading them from host memory per
+	// tile of rows re-reads every cold expert once per tile)
+	const int tier_li = ( &lw >= layers_.data() && &lw < layers_.data() + layers_.size() ) ? static_cast<int>( &lw - layers_.data() ) : -1;
+	const bool staged = m > pod::MAX_BATCH && tier_li >= 0 && tier_.prefill_staging() && tier_.stage_begin( tier_li, stream );
+	if ( staged && tier_li + 1 < tier_layers_ ) tier_.stage_prefetch( tier_li + 1, stream );
 	engine::modules::MoE::forward( mixed_, lw.experts, topk_idx_, topk_w_, y_, rank_ * per_rank, ( rank_ + 1 ) * per_rank, moe_scratch_, 0.0f, stream );
+	if ( staged ) tier_.stage_end( tier_li, stream );
 	if ( overlap ) backend::stream_join( stream, sh_stream );
 	if ( rank_ == 0 && !defer_shared ) {
 		engine::modules::GatedResidual::add_sigmoid_gated( y_.ptr<backend::half_t>(), sh_out_.ptr<const backend::half_t>(), mixed_.ptr<const backend::half_t>(),

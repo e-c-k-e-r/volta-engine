@@ -768,7 +768,7 @@ void MoE::forward(
 	if ( weights.type == pod::QuantType::NVFP4 ) {
 		ENGINE_ASSERT( scratch.nv_ctr != nullptr && weights.device_ptrs != nullptr && act_limit >= 0.0f, "MoE::forward: NVFP4 experts need nvfp4 scratch and init_device_ptrs" );
 		const int E = weights.num_local_experts;
-		const char* base = static_cast<const char*>( weights.device_ptrs );
+		const char* base = static_cast<const char*>( weights.staged_ptrs != nullptr ? weights.staged_ptrs : weights.device_ptrs );   // a prefill layer reads its cold experts from the stage buffer
 		const uint8_t* const* pp = reinterpret_cast<const uint8_t* const*>( base );
 		const float* gg = reinterpret_cast<const float*>( base + 6 * E * sizeof( const void* ) );
 		NVFP4ExpertTable t;

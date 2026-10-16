@@ -106,8 +106,11 @@ void ExpertTier::stage_init( pod::MemoryArena& device ) {
 	}
 	for ( int i = 0; i < 2; ++i ) stage_buf[i] = static_cast<uint8_t*>( engine::core::arena_alloc( device, static_cast<size_t>( cold_max ) * slot_bytes, 256 ) );
 	for ( Layer& l : layers ) {
+		// The pointer table of the layer's experts: trellis 9 pointer rows, NVFP4 6 pointer rows then 3 rows of float global scales
+		const size_t table_bytes = l.mw->type == pod::QuantType::NVFP4 ? 6 * static_cast<size_t>( experts ) * sizeof( void* ) + 3 * static_cast<size_t>( experts ) * sizeof( float )
+		                                                              : 9 * static_cast<size_t>( experts ) * sizeof( void* );
 		l.staged_dev = engine::core::arena_alloc( device, 9 * static_cast<size_t>( experts ) * sizeof( void* ), 256 );
-		CUDA_CHECK( cudaMemcpy( l.staged_dev, l.mw->device_ptrs, 9 * static_cast<size_t>( experts ) * sizeof( void* ), cudaMemcpyDeviceToDevice ) );
+		CUDA_CHECK( cudaMemcpy( l.staged_dev, l.mw->device_ptrs, table_bytes, cudaMemcpyDeviceToDevice ) );
 	}
 	cudaStream_t cs = nullptr;
 	CUDA_CHECK( cudaStreamCreateWithFlags( &cs, cudaStreamNonBlocking ) );
@@ -130,7 +133,9 @@ void ExpertTier::stage_prefetch( int layer, cudaStream_t stream ) {
 	if ( cold.empty() ) return;
 	const int parity = layer & 1;
 	if ( l.built != l.version ) {
-		// Gate, up and down code pointers (rows 0, 3, 6 of the table): resident experts keep their slots, cold ones go to their place in the stage buffer
+		// Gate, up and down code pointers (trellis rows 0, 3, 6 of the table; NVFP4 rows 0, 2, 4, the scales being rows 1, 3, 5): resident experts keep their
+		// slots, cold ones go to their place in the stage buffer
+		const int row_step = l.mw->type == pod::QuantType::NVFP4 ? 2 : 3;
 		std::vector<const void*> row( experts );
 		std::vector<int> rank( experts, -1 );
 		for ( size_t k = 0; k < cold.size(); ++k ) rank[cold[k]] = static_cast<int>( k );
@@ -140,7 +145,7 @@ void ExpertTier::stage_prefetch( int layer, cudaStream_t stream ) {
 				row[e] = l.slot_of[e] >= 0 ? static_cast<const void*>( l.slots + static_cast<size_t>( l.slot_of[e] ) * slot_bytes + off )
 				                           : static_cast<const void*>( stage_buf[parity] + static_cast<size_t>( rank[e] ) * slot_bytes + off );
 			}
-			CUDA_CHECK( cudaMemcpyAsync( static_cast<const void**>( l.staged_dev ) + static_cast<size_t>( 3 * p ) * experts, row.data(), experts * sizeof( void* ), cudaMemcpyHostToDevice, stream ) );
+			CUDA_CHECK( cudaMemcpyAsync( static_cast<const void**>( l.staged_dev ) + static_cast<size_t>( row_step * p ) * experts, row.data(), experts * sizeof( void* ), cudaMemcpyHostToDevice, stream ) );
 			off += part_bytes[p];
 		}
 		l.built = l.version;
