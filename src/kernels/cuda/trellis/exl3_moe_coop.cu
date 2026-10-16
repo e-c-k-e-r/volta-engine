@@ -239,6 +239,10 @@ __device__ __forceinline__ void gemv_tile(
 	constexpr int GW = WNT * TW;                 // uint32 per warp per k-slice
 	constexpr int WKK = tile_wk<WN_>();
 	constexpr int TCOLS = tile_cols<WN_>();
+	// 2 bpw: a tile is 16 words, so one warp load (32 lanes) covers two adjacent tiles; the other widths load one tile per load, 24 or 32 lanes of it
+	constexpr int NL = BITS_ == 2 ? WNT / 2 : WNT;
+	constexpr int LW = BITS_ == 2 ? 32 : TW;
+	static_assert( BITS_ != 2 || WNT % 2 == 0, "2 bpw packs two tiles per warp load" );
 
 	const int warp = threadIdx.x / 32;
 	const int lane = threadIdx.x % 32;
@@ -268,6 +272,12 @@ __device__ __forceinline__ void gemv_tile(
 		x_src_a = i0 % 24;
 		x_src_b = i2 % 24;
 	}
+	else if constexpr ( BITS_ == 2 ) {
+		// 2 bpw: the 16 words of a tile; a window spans the previous word and the lane's own, the funnel shift being lane dependent
+		const int i1 = lane >> 1;
+		x_src_b = i1;
+		x_src_a = ( i1 + 15 ) & 15;
+	}
 	else {
 		// 4 bpw: a tile is 32 words, one per lane; a window spans the previous lane's word and the lane's own
 		x_src_a = ( lane + 31 ) & 31;
@@ -277,15 +287,15 @@ __device__ __forceinline__ void gemv_tile(
 	const uint32_t* bp = B32 + static_cast<size_t>( ks0 ) * slice_stride + ( group * WN + wn ) * GW + lane;
 
 	auto ld_b = [&]( int i, int l ) -> uint32_t {
-		return lane < TW ? __ldcs( bp + static_cast<size_t>( i ) * slice_stride + l * TW ) : 0;
+		return ( BITS_ == 2 || lane < TW ) ? __ldcs( bp + static_cast<size_t>( i ) * slice_stride + l * LW ) : 0;
 	};
 
-	uint32_t pf[PF][LOADS];
+	uint32_t pf[PF][NL];
 	#pragma unroll
 	for ( int d = 0; d < PF; ++d ) {
 		if ( d < myn ) {
 			#pragma unroll
-			for ( int l = 0; l < LOADS; ++l ) pf[d][l] = ld_b( d, l );
+			for ( int l = 0; l < NL; ++l ) pf[d][l] = ld_b( d, l );
 		}
 	}
 
@@ -305,13 +315,13 @@ __device__ __forceinline__ void gemv_tile(
 			const int i = ib + d;
 			if ( i >= myn ) break;
 
-			uint32_t bw[LOADS];
+			uint32_t bw[NL];
 			#pragma unroll
-			for ( int l = 0; l < LOADS; ++l ) bw[l] = pf[d][l];
+			for ( int l = 0; l < NL; ++l ) bw[l] = pf[d][l];
 
 			if ( i + PF < myn ) {
 				#pragma unroll
-				for ( int l = 0; l < LOADS; ++l ) pf[d][l] = ld_b( i + PF, l );
+				for ( int l = 0; l < NL; ++l ) pf[d][l] = ld_b( i + PF, l );
 			}
 
 #if MOE_COOP_M8N8K4
@@ -325,10 +335,23 @@ __device__ __forceinline__ void gemv_tile(
 			#pragma unroll
 			for ( int t = 0; t < WNT; ++t ) {
 				FragB f0, f1;
-				const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
-				const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
-				if constexpr ( BITS_ == 3 ) exl3_gemv_ns::dq8_regs_3bits<cb>( awv, bwv, x_s2, f0, f1 );
-				else exl3_gemv_ns::dq8_regs_4bits<cb>( awv, bw[t], f0, f1 );
+				if constexpr ( BITS_ == 3 ) {
+					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+					const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
+					exl3_gemv_ns::dq8_regs_3bits<cb>( awv, bwv, x_s2, f0, f1 );
+				}
+				else if constexpr ( BITS_ == 2 ) {
+					// tile t lives in lanes (t & 1) * 16 .. + 15 of load t / 2
+					const uint32_t w = bw[t >> 1];
+					const int base = ( t & 1 ) << 4;
+					const uint32_t awv = __shfl_sync( 0xffffffffu, w, base + x_src_a );
+					const uint32_t bwv = __shfl_sync( 0xffffffffu, w, base + x_src_b );
+					exl3_gemv_ns::dq8_regs_2bits<cb>( awv, bwv, lane << 3, f0, f1 );
+				}
+				else {
+					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+					exl3_gemv_ns::dq8_regs_4bits<cb>( awv, bw[t], f0, f1 );
+				}
 				const int cv = ( lane & 3 ) + 4 * ( lane >= 16 );
 				#pragma unroll
 				for ( int s = 0; s < 4; ++s ) {
@@ -352,10 +375,23 @@ __device__ __forceinline__ void gemv_tile(
 			#pragma unroll
 			for ( int t = 0; t < WNT; ++t ) {
 				FragB f0, f1;
-				const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
-				const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
-				if constexpr ( BITS_ == 3 ) exl3_gemv_ns::dq8_regs_3bits<cb>( awv, bwv, x_s2, f0, f1 );
-				else exl3_gemv_ns::dq8_regs_4bits<cb>( awv, bw[t], f0, f1 );
+				if constexpr ( BITS_ == 3 ) {
+					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+					const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
+					exl3_gemv_ns::dq8_regs_3bits<cb>( awv, bwv, x_s2, f0, f1 );
+				}
+				else if constexpr ( BITS_ == 2 ) {
+					// tile t lives in lanes (t & 1) * 16 .. + 15 of load t / 2
+					const uint32_t w = bw[t >> 1];
+					const int base = ( t & 1 ) << 4;
+					const uint32_t awv = __shfl_sync( 0xffffffffu, w, base + x_src_a );
+					const uint32_t bwv = __shfl_sync( 0xffffffffu, w, base + x_src_b );
+					exl3_gemv_ns::dq8_regs_2bits<cb>( awv, bwv, lane << 3, f0, f1 );
+				}
+				else {
+					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+					exl3_gemv_ns::dq8_regs_4bits<cb>( awv, bw[t], f0, f1 );
+				}
 				exl3_gemv_ns::mma_ab_h( a01, a23, f0, ch[t][0] );
 				exl3_gemv_ns::mma_ab_h( a01, a23, f1, ch[t][1] );
 			}
@@ -950,7 +986,7 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	using namespace exl3_moe_coop_ns;
 	MoeCoopParams p = p_in;
 	const int slots = p.bsz * p.topk;
-	ENGINE_ASSERT( p.topk >= 1 && p.topk <= MOE_COOP_TOPK && p.bsz >= 1 && p.bsz <= MOE_COOP_MAX_ROWS && ( p.bits == 3 || p.bits == 4 ), "exl3_moe_coop: row count / topk / bits" );
+	ENGINE_ASSERT( p.topk >= 1 && p.topk <= MOE_COOP_TOPK && p.bsz >= 1 && p.bsz <= MOE_COOP_MAX_ROWS && ( p.bits == 2 || p.bits == 3 || p.bits == 4 ), "exl3_moe_coop: row count / topk / bits" );
 	ENGINE_ASSERT( p.H % 128 == 0 && p.I % 128 == 0, "exl3_moe_coop: widths" );
 	p.a_global = p.bsz > 1;
 	p.ctr_a_len = MOE_COOP_MAX_SLOTS * ( p.I / 128 );
@@ -984,7 +1020,7 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	const int stage_b = stage_rows * wkk * CEIL_DIVIDE( p.I / 16, wkk ) * 32;
 	const int smem_a = p.H * 2 + smem_red_bytes() + stage_a;
 	const int smem_b = smem_red_bytes() + smem_part_bytes() + stage_b;
-	static bool attr_set[ENGINE_NUM_GPUS] = { false }, attr_set4[ENGINE_NUM_GPUS] = { false };
+	static bool attr_set[ENGINE_NUM_GPUS] = { false }, attr_set4[ENGINE_NUM_GPUS] = { false }, attr_set2[ENGINE_NUM_GPUS] = { false };
 	if ( p.bits == 3 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<3, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<3, 2, WN, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
@@ -996,6 +1032,11 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<3, 2, WN, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
 		attr_set[device] = true;
 	}
+	if ( p.bits == 2 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set2[device] ) {
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		attr_set2[device] = true;
+	}
 	if ( p.bits == 4 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set4[device] ) {
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<4, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
 		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<4, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
@@ -1005,6 +1046,12 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	if ( p.a_global ) {
 		const int rot_warps = slots * ( p.H / 128 ) * 2;
 		rot_kernel<<<dim3( MAX( 1, CEIL_DIVIDE( rot_warps, THREADS / 32 ) ) ), dim3( THREADS ), 0, stream>>>( p );
+	}
+	if ( p.bits == 2 ) {
+		a_kernel<2, 2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+		b_kernel<2, 2, WN, 0><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+		CUDA_CHECK( cudaGetLastError() );
+		return;
 	}
 	if ( p.bits == 4 ) {
 		a_kernel<4, 2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );

@@ -733,7 +733,7 @@ bool MoE::fused_decode( const pod::MoELayerWeights& weights, const pod::MoEScrat
 #if defined(USE_ROCM)
 	const bool bits_ok = ebits >= 1 && ebits <= 8;   // the ROCm launch (exl3_moe.cu) takes any width
 #else
-	const bool bits_ok = ebits == 3 || ebits == 4;
+	const bool bits_ok = ebits == 2 || ebits == 3 || ebits == 4;
 #endif
 #if defined(USE_ROCM)
 	const bool rows_ok = true;   // blocks of MOE_COOP_MAX_ROWS rows
