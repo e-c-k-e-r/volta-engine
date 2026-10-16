@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
+#include "engine/modules/mhc.h"
 #include "engine/core/tensor.h"
 #include "engine/modules/norm.h"
 #include <cuda_runtime.h>
@@ -8,6 +9,7 @@
 #include <cstdio>
 #include <vector>
 #include <cmath>
+#include <cstring>
 #include <thread>
 #include <atomic>
 
@@ -345,6 +347,63 @@ int main() {
 			ENGINE_ASSERT( worst_x < 1e-5 && worst_n < 2e-5, "Fused all-reduce + gated add + norm differs from the reference" );
 		}
 		std::printf( "    -> fused gated add + norm PASS on all ranks.\n" );
+	}
+
+	// Test 4: the all-reduce fused with the hyper-connection post-step (GLM decode, hidden 4096, 4 streams) against the two launches it replaces
+	// (all_reduce, then HyperConnection::update): the streams must be bit-identical on every rank
+	std::printf( "[*] Test 4: AllReduce + hyper-connection post-step (GLM decode, hidden 4096, 4 streams)...\n" );
+	{
+		const int H = 4096, HC = 4;
+		for ( int rows4 : { 1, 2, 4, 8 } ) {
+			const size_t ny = static_cast<size_t>( rows4 ) * H, nx = static_cast<size_t>( rows4 ) * HC * H;
+			std::vector<half> h_y[ENGINE_NUM_GPUS];
+			std::vector<float> h_x( nx ), h_post( static_cast<size_t>( rows4 ) * HC ), h_comb( static_cast<size_t>( rows4 ) * HC * HC );
+			for ( size_t i = 0; i < nx; ++i ) h_x[i] = std::sin( static_cast<float>( i ) * 0.0021f ) * 1.5f;
+			for ( size_t i = 0; i < h_post.size(); ++i ) h_post[i] = 0.6f + 0.3f * std::cos( static_cast<float>( i ) );
+			for ( size_t i = 0; i < h_comb.size(); ++i ) h_comb[i] = 0.25f + 0.2f * std::sin( static_cast<float>( i ) * 1.7f );
+			for ( int d = 0; d < R; ++d ) {
+				h_y[d].resize( ny );
+				for ( size_t i = 0; i < ny; ++i ) h_y[d][i] = float_to_half( std::sin( static_cast<float>( d * 9000 + i ) * 0.011f ) );
+			}
+			std::vector<std::vector<float>> got_fused( R, std::vector<float>( nx ) ), got_split( R, std::vector<float>( nx ) );
+			std::thread workers[ENGINE_NUM_GPUS];
+			for ( int d = 0; d < R; ++d ) {
+				workers[d] = std::thread( [&, d]() {
+					CUDA_CHECK( cudaSetDevice( d ) );
+					int sh_y[2] = { rows4, H };
+					pod::TensorView ty1 = engine::core::arena_alloc_tensor( arenas[d], pod::DType::FP16, sh_y, 2 );
+					pod::TensorView ty2 = engine::core::arena_alloc_tensor( arenas[d], pod::DType::FP16, sh_y, 2 );
+					float *dxa = nullptr, *dxb = nullptr, *dp = nullptr, *dc = nullptr;
+					CUDA_CHECK( cudaMalloc( &dxa, nx * sizeof( float ) ) );
+					CUDA_CHECK( cudaMalloc( &dxb, nx * sizeof( float ) ) );
+					CUDA_CHECK( cudaMalloc( &dp, h_post.size() * sizeof( float ) ) );
+					CUDA_CHECK( cudaMalloc( &dc, h_comb.size() * sizeof( float ) ) );
+					CUDA_CHECK( cudaMemcpy( ty1.data, h_y[d].data(), ny * sizeof( half ), cudaMemcpyHostToDevice ) );
+					CUDA_CHECK( cudaMemcpy( ty2.data, h_y[d].data(), ny * sizeof( half ), cudaMemcpyHostToDevice ) );
+					CUDA_CHECK( cudaMemcpy( dxa, h_x.data(), nx * sizeof( float ), cudaMemcpyHostToDevice ) );
+					CUDA_CHECK( cudaMemcpy( dxb, h_x.data(), nx * sizeof( float ), cudaMemcpyHostToDevice ) );
+					CUDA_CHECK( cudaMemcpy( dp, h_post.data(), h_post.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+					CUDA_CHECK( cudaMemcpy( dc, h_comb.data(), h_comb.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+					rings[d].all_reduce_hc_apply( ty1, dxa, dp, dc, streams[d] );
+					rings[d].all_reduce( ty2, streams[d] );
+					engine::modules::HyperConnection::update( dxb, ty2.ptr<const engine::backend::half_t>(), dp, dc, H, streams[d], rows4 );
+					CUDA_CHECK( cudaStreamSynchronize( streams[d] ) );
+					CUDA_CHECK( cudaMemcpy( got_fused[d].data(), dxa, nx * sizeof( float ), cudaMemcpyDeviceToHost ) );
+					CUDA_CHECK( cudaMemcpy( got_split[d].data(), dxb, nx * sizeof( float ), cudaMemcpyDeviceToHost ) );
+					(void) cudaFree( dxa ); (void) cudaFree( dxb ); (void) cudaFree( dp ); (void) cudaFree( dc );
+				} );
+			}
+			for ( int d = 0; d < R; ++d ) workers[d].join();
+			size_t mismatches = 0;
+			for ( int d = 0; d < R; ++d ) {
+				for ( size_t i = 0; i < nx; ++i ) {
+					if ( std::memcmp( &got_fused[d][i], &got_split[d][i], sizeof( float ) ) != 0 ) ++mismatches;
+				}
+			}
+			std::printf( "    rows %d: %zu of %zu stream values differ between the fused kernel and all_reduce + update\n", rows4, mismatches, static_cast<size_t>( R ) * nx ); std::fflush( stdout );
+			ENGINE_ASSERT( mismatches == 0, "Fused all-reduce + hyper-connection post-step is not bit-identical to the two launches" );
+		}
+		std::printf( "    -> fused post-step PASS (bit-identical on all ranks).\n" );
 	}
 
 	engine::comm::destroy_4gpu_mesh( staging_ptrs, flag_ptrs );

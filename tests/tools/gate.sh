@@ -1,8 +1,8 @@
 #!/bin/zsh
 # Regression gate for refactors. Modes (GPU modes serialize: one job at a time, run under taskset -c 0-9):
 #   quick           CUDA build + kernel resource fingerprint (cuobjdump -res-usage: seconds) + coherence. For moves/renames/config work.
-#   fingerprint     save the resource fingerprint of the current build (results/fingerprint.txt)
-#   sass            order-independent SASS fingerprint (per-function hashes) + HMMA count of bench_decode and volta_server (~40 s per binary), vs results/sass.txt (saved if absent)
+#   fingerprint     save the resource fingerprint of the current build (tests/baselines/fingerprint.txt)
+#   sass            order-independent SASS fingerprint (per-function hashes) + HMMA count of bench_decode and volta_server (~40 s per binary), vs tests/baselines/sass.txt (saved if absent)
 #   static          no GPU: header hygiene greps (backend abstraction) and a full build
 #   fast            tier 2 tests that need no checkpoint (synthetic inputs, goldens, host logic; most need a GPU)
 #   models          tier 2 tests that load a checkpoint from $ENGINE_MODEL_ROOT (parity, coherence, prefix restore, sampling)
@@ -163,13 +163,13 @@ case $mode in
 	quick)
 		ninja > $out/build.log 2>&1 || { echo "[FAIL] build"; fails=$((fails+1)); }
 		fingerprint > $out/fingerprint.txt
-		compare_fp fingerprint $out/fingerprint.txt $ROOT/results/fingerprint.txt || fails=$((fails+1))
+		compare_fp fingerprint $out/fingerprint.txt $ROOT/tests/baselines/fingerprint.txt || fails=$((fails+1))
 		run coherence gpu ./test_coherence ;;
-	fingerprint) fingerprint > $ROOT/results/fingerprint.txt; cat $ROOT/results/fingerprint.txt ;;
+	fingerprint) fingerprint > $ROOT/tests/baselines/fingerprint.txt; cat $ROOT/tests/baselines/fingerprint.txt ;;
 	sass)
 		ninja > $out/build.log 2>&1 || { echo "[FAIL] build"; fails=$((fails+1)); }
 		sass_fingerprint > $out/sass.txt; cat $out/sass.txt
-		compare_fp sass $out/sass.txt $ROOT/results/sass.txt || fails=$((fails+1)) ;;
+		compare_fp sass $out/sass.txt $ROOT/tests/baselines/sass.txt || fails=$((fails+1)) ;;
 	static) static_checks || fails=$((fails+1)) ;;
 	fast) tier2_fast ;;
 	models) tier2_models ;;
