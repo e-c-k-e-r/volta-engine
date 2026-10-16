@@ -8,7 +8,8 @@
 |---|---|---|---|
 | `test_trellis`, `test_gemv_int8` | 2 | yes | trellis and int8 GEMV kernels against FP32 references |
 | `test_mhc`, `test_attention`, `test_attention_prefill`, `test_dsa`, `test_kv_pages`, `test_gdn`, `test_norm`, `test_rope`, `test_kv_quant`, `test_prefill_linear` | 2 | yes | module operations against CPU references |
-| `test_all_reduce` | 2 | yes (4) | NVLink all-reduce |
+| `test_all_reduce` | 2 | yes (4; `AR_RANKS=2` runs two) | NVLink all-reduce: single, asynchronous multi-layer, fused with the gated add and stream norm (Flash-Next), fused with the hyper-connection post-step (GLM; bit-identical to the all-reduce followed by `HyperConnection::update`) |
+| `test_sparse_attn` | 2 | yes | `Attention::forward_sparse` (decode-sized sparse-list attention, head_dim 256) against an FP64 softmax over the same keys |
 | `test_vulkan_comm` | 2 | yes (2-4) | the Vulkan build's host-staged all-reduce and all-reduce + RMSNorm on 2 and 4 devices, one thread per rank (skips with fewer devices) |
 | `test_sampling` | 2 | no | top-k / top-p sampler |
 | `test_slang_cpu`, `test_slang_kernels` | 2 | partly | Slang kernels on CPU and as generated CUDA |
@@ -31,10 +32,35 @@
 | `test_qwen4_exp` (`--gen N`, `ENGINE_DEBUG_TRACE_LAYERS`, `ENGINE_DEBUG_QWEN4_HALT`, `ENGINE_DEBUG_TEACHER_STREAMS`) | 4 | yes | Flash-Next bring-up driver: traces compared with `tests/tools/ref_qwen4_exp_dump.py` oracle dumps by `qwen4_exp_trace_cmp.py`; greedy decode speed |
 | `test_chunk_boundary` (`--cuts a,b`, `ENGINE_DSA=0`, `ENGINE_DEBUG_TRACE_LAYERS=<file>`) | 2 | yes | diagnostic, no pass/fail: GLM logit shift when the prompt is prefilled split at a non-chunk-aligned cut (aligned = 0); the trace file holds the last row after every layer and attention half |
 | `test_vision` (`--glm` for GLM's tower) | 2 | yes | vision tower: tensor-core attention against the CUDA-core reference, finite deterministic embeddings (the semantic check is `test_api.sh`) |
-| `test_mtp` | 4 | yes | greedy decoding with the MTP head reproduces plain greedy decoding, short and long prompt, and accepts drafts |
+| `test_mtp` (`--flash`, `--glm`) | 4 | yes | greedy decoding with the MTP head reproduces plain greedy decoding, short and long prompt, and accepts drafts. The logits are FP16, so a first difference is accepted when it is plain decoding's runner-up within one FP16 ulp of its pick (the top-2 logits are printed); Flash-Next is held to the first three quarters of the continuation and GLM to the first 8 tokens |
+| `test_glm_rows` | 2 | yes | GLM prefill in chunks of 1 (the M=1 graph) against wider chunks: the M=1 rerun is bit-identical, the pairwise logit spread, the greedy continuation. `tests/tools/glm_option_identity.sh` hashes its output with `side_streams` and `hc_fuse` off and on (NVFP4 dense configuration) |
+| `test_prefill_equiv` | 2 | yes | Qwen prefill in 16-row chunks (fused GEMM) against 256-row chunks (dequantize + cuBLAS): final-row logits, next 32 greedy tokens, bit-reproducible rerun |
+| `test_ppl` (`--glm`, `--flash`, `--chunk N`, `--file`, `--tokens`, `--calibrate`) | 4 | yes | mean NLL and perplexity of a text file, scored in chunks of N rows; with `ENGINE_HESSIAN_DIR` it collects calibration statistics. Not run by a gate: used to compare configurations |
+| `diag_logits` | 4 | yes | diagnostic, no pass/fail: the top-2 logits that decide a continuation token of `test_mtp`'s Qwen prompt 0 in single-row decoding and in causal verify blocks built from single rows or from blocks |
 | `test_longctx` | 4 | yes | needle retrieval at long context (run by hand) |
 | `tests/4_server/test_api.sh` | 4 | yes | OpenAI and Anthropic APIs, tool calls, reasoning, prefix cache, image input (`VOLTA_TEST_MODEL=glm5_next` for GLM, `VOLTA_TEST_SPEC=mtp` for the MTP head) |
 | `tests/4_server/test_server.sh` | 4 | yes | server integration, concurrency throughput gate |
+
+## Benchmarks and profiler brackets
+
+Not part of `gate.sh` (except `bench_decode`, `bench_accept` and `bench_prefill` in `gate.sh bench`). Single-GPU ones can be profiled with ncu; the model benches run all ranks.
+
+| Benchmark | Measures |
+|---|---|
+| `bench_decode` (`--glm`, `--flash`; `BENCH_CTX`) | graph-captured decode body on real weights: a plain token, an 8-row verify block, two slots decoding together. `BENCH_PROF_A=1` brackets the 8-row block and `BENCH_PROF_B=1` the two-slot steps with `cudaProfilerStart/Stop` (default: the plain token) |
+| `bench_prefill` (`BENCH_GLM=1`, `BENCH_FLASH=1`; `[tokens] [chunk ...]`) | prefill tok/s for a synthetic prompt at several chunk sizes |
+| `bench_accept` | draft acceptance of speculative decoding on a spread of prompts (per-position candidates; `--nothink`) |
+| `bench_spec` | DFlash2 rounds against plain greedy decoding on the same prompts (output must be token-identical) |
+| `bench_mhc` | `HyperConnection::collapse_norm` per site for 1 to 8 rows (`SINK` sets the Sinkhorn iterations) |
+| `bench_router` (`GLM=1` for the sigmoid router) | router logits and top-k per layer over 48 cycled weight copies |
+| `bench_kda` | the KDA recurrent step (`GDN::recurrent_step_kda_rows`) per layer for 1 to 8 rows over cycled layer states; `BENCH_ITERS=1` for a profiler |
+| `bench_moe_prefill` | routed-MoE prefill time per `MoE::forward` on real GLM layer-3 experts (rank-0 partition), rows routed uniformly, at several chunk sizes |
+| `bench_moe_routes` (`BENCH_GLM=1`, `BENCH_ROUTES=<n>` for one route count) | the fused decode MoE kernels at a given number of local routes |
+| `bench_nvfp4_shapes` (`K N ...`) | NVFP4 skinny GEMV at decode shapes: time per call and GB/s of the packed weights |
+| `bench_nvfp4_moe` | the fused NVFP4 routed-expert path on Flash-Next's expert shapes (synthetic weights): parity with the chained calls, then time per layer |
+| `bench_nvfp4`, `bench_trellis` | NVFP4 and trellis linear kernels |
+| `bench_allreduce` | NCCL all-reduce of an activation-sized FP16 tensor next to the sequence-parallel alternative (the H3 transformer) |
+| `bench_all_reduce` | the engine's own all-reduce kernels |
 
 ## Serving benchmarks
 

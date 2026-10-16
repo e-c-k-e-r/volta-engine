@@ -16,7 +16,7 @@ Speed figures are indicative: the GPUs run power-capped (150 to 225 W depending 
 |---|---|---|---|---|
 | Qwen3.8-27B | `qwen3_5` | GDN linear attention + full attention | 1, 2 or 4 | EXL3 or NVFP4; the DFlash2 drafter or the MTP head |
 | GLM-5.3-Flash | `glm5_next` | KDA linear attention (34 layers) + absorbed MLA with a DSA indexer (11 layers), routed MoE (288 experts, top 8) | 1, 2 or 4 | EXL3 experts; NVFP4 for the dense groups |
-| Qwen3.8-Flash-Next | `qwen4_exp` | GDN + QSA block-sparse attention, 512-expert MoE, gated residual streams, one n-gram embedding layer | 4 only | EXL3 3/4 bpw experts with 7/8 bpw projections; NVFP4 experts and dense groups |
+| Qwen3.8-Flash-Next | `qwen4_exp` | GDN + QSA block-sparse attention, 512-expert MoE, gated residual streams, one n-gram embedding layer | 1, 2 or 4 | EXL3 2/3/4 bpw experts with 7/8 bpw projections; NVFP4 experts and dense groups |
 
 The model type is read from the checkpoint, never configured. Anything else is a fatal error at start.
 
@@ -51,11 +51,16 @@ The model type is read from the checkpoint, never configured. Anything else is a
 | Prefix cache: snapshots in pinned host RAM as a tree keyed by exact token prefixes, automatic checkpoints inside long prompts | default | `prefix_cache_gib`, `prefix_interval` | `test_prefix_restore`, `tests/4_server/test_api.sh` |
 | Chunked prefill interleaved with the other slots' decode steps | default | `prefill_chunk` | `test_prefill_equiv`, `test_server.sh` |
 | CUDA graphs for decode, one per row count | default | `no_graphs` (debug) | `test_coherence` |
+| Side streams: independent chains of a decode layer run side by side (GLM: shared expert beside the MoE, KDA gate projections, the MLA kv, indexer-key and indexer-query chains; Flash-Next: shared expert, GDN z and gate projections, attention k / v projections and the QSA indexer); NVFP4 and FP16 projections only, trellis ones share one workspace per device | default | `side_streams` (A/B) | `test_glm_rows` with the option on and off |
+| One kernel for the all-reduce and the hyper-connection post-step (GLM, rows up to 8) | default | `hc_fuse` (A/B) | `test_all_reduce` (bit-identical to the two launches) |
+| 2-bit trellis experts: persistent kernel and fused cooperative decode kernels (Flash-Next 2.0 bpw EXL3) | default | | `bench_decode --flash` on the checkpoint; no unit test |
+| Per-pipeline startup memory breakdown (buffers, weights by kind, drafter) | opt-in | `mem_log` | |
 
 Validated contexts:
 * Qwen: needle retrieval to 258K with 2 slots, TP4 and speculation (25 GiB per GPU); the 258K cold prefill takes about 5 minutes, a cached repeat 1 to 2 s
 * Flash-Next: needles at 12K, 32K, 100K and 250K pass (250K: prefill 848 tok/s, decode 42 tok/s); 256K with 2 slots fits
 * GLM: 256K with 2 slots runs with `kv_format=nvfp4 expert_cache=0.95` (a 32K prompt: 68 s prefill, 53 tok/s decode; the API checks were run with `kv_format=fp8 expert_cache=0.85`); the 256K needle itself is verified at FP16, 1 slot, no drafter (prefill 208 tok/s, decode 14.8 tok/s)
+* GLM with NVFP4 dense groups, EXL3 experts all resident, `kv_format=nvfp4`, `kv_pool=262144` and 2 slots: needles at 100K and 250K pass greedy, and at 250K with the DFlash2 drafter (250K prefill 498 tok/s at a 150 W power cap, decode 46 tok/s greedy and 34 tok/s speculative on a short generation)
 
 ## Speculation
 
@@ -74,7 +79,7 @@ Validated contexts:
 
 ## Parallelism and scheduling
 
-* tensor parallel over NVLink with a 2- or 4-rank all-reduce (`tp`, `--tp-size`): Qwen 1/2/4, GLM 1, 2 or 4, Flash-Next 4; the Vulkan build does the same over several Vulkan devices with the all-reduce staged through host memory
+* tensor parallel over NVLink with a 2- or 4-rank all-reduce (`tp`, `--tp-size`): Qwen 1/2/4, GLM 1, 2 or 4, Flash-Next 1, 2 or 4; the Vulkan build does the same over several Vulkan devices with the all-reduce staged through host memory
   * `--tp-size 2` is about 0.7x the speed of four; a second server on the other pair doubles the aggregate (`CUDA_VISIBLE_DEVICES`)
 * one arena per GPU, allocated at boot from the free memory minus a reserve (`arena_gib`, `vram_reserve_mib`); nothing allocates while decoding
 * up to `max_slots` concurrent sequences, `max_batch_size` of them stepped together; the scheduler thread owns the slots

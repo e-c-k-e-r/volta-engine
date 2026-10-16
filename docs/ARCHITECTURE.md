@@ -41,7 +41,7 @@ time (`-DENGINE_BACKEND=CUDA|CPU|VULKAN`); one build tree is one backend.
   chunks of up to 512 rows.
 - **Speculation**: the DFlash2 drafter proposes a block, the target verifies it in one forward (per-row recurrent-state
   snapshots make rollback free); an adaptive controller falls back to plain decode when speculation loses.
-- **Speculation sources**: besides DFlash2, `speculator=mtp` drafts with the checkpoint's own one-layer MTP head (Qwen): it chains on
+- **Speculation sources**: besides DFlash2, `speculator=mtp` drafts with the checkpoint's own one-layer MTP head (Qwen, Flash-Next, GLM): it chains on
   its own output, keeps a KV layer per slot next to the model's, and verifies through the same batched forward.
 - **Images**: each model's vision tower (Qwen: 27 LayerNorm / GELU blocks; GLM: 24 RMSNorm / SwiGLU blocks with q/k norm; both 2-D rotary) runs on rank 0 and loads last, into what the arena has left; the server decodes and
   resizes the picture (Qwen: Qwen2-VL smart resize; GLM: an aspect-preserving resize onto a zero-padded canvas aligned to 28 px), the generator caches the embeddings by content hash, and the cluster overwrites the

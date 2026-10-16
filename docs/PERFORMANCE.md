@@ -53,10 +53,11 @@ Time to first token for a cold prompt (no prefix cache), which is the prefill ti
 |---|---|---|---|
 | Qwen3.8-27B EXL3 | 15.9 / 16.5 ms (63 / 61 tok/s) | 24.9 / 25.6 ms (1.6x a token) | 20.6 ms |
 | Qwen3.8-27B NVFP4 | 11.7 / 12.0 ms (86 / 84 tok/s) | 13.4 / 13.8 ms (1.15x) | 12.0 ms |
-| GLM-5.3-Flash, NVFP4 dense | 15.0 / 15.5 ms (67 / 65 tok/s) | 31.0 / 31.6 ms (2.0x) | 18.0 ms |
-| Flash-Next, NVFP4 experts and dense | 15.5 / 14.2 ms (65 / 70 tok/s) | 18.4 / 19.1 ms (1.2 to 1.3x) | 16.8 / 15.3 ms |
+| GLM-5.3-Flash, NVFP4 dense, every expert resident | not measured / 13.6 ms (74 tok/s) | not measured / 29.2 ms (2.2x) | 16.0 ms |
+| Flash-Next, NVFP4 experts and dense | not measured / 10.5 ms (95 tok/s) | not measured / 17.5 ms (1.7x) | 11.5 ms |
+| Flash-Next 2.0 bpw EXL3, every expert resident | not measured / 16.3 ms (62 tok/s) | not measured / 25.3 ms (1.6x) | 18.2 ms |
 
-A verify block costs little over a plain token on the NVFP4 models, which is what lets a speculative round pay off; on GLM it costs twice a token, because 8 rows touch many more experts than one.
+A verify block costs little over a plain token on the NVFP4 models, which is what lets a speculative round pay off; on GLM it costs more than twice a token, because 8 rows touch many more experts than one.
 
 ## Where the time goes
 

@@ -44,7 +44,7 @@ The final `hyper_connection_mixer` is the same without `post` and returns `mixed
   the host by all ranks, a quarter each into a shared buffer, overlapped with the GPU. A pair of GPUs per slot (TP = 2 x 2 replicas) does not fit: 61 GB of GPU-resident
   weights is 15.3 GiB per GPU at TP = 4 (arena 19.3 GiB with the default KV and scratch). Batch 2 on TP = 4 shares every launch between the slots. What remains is latency
   (two all-reduces per layer, ~25 us per 8-bit projection launch), not layout.
-* **Decode**: CUDA graphs; a fused cooperative MoE kernel (`exl3_moe_coop`, 3 and 4 bpw, up to 10 routes); the dp4a int8 GEMV serves the 7 / 8-bit projections at M = 1; gated-residual
+* **Decode**: CUDA graphs; a fused cooperative MoE kernel (`exl3_moe_coop`, 2, 3 and 4 bpw, up to 10 routes); the dp4a int8 GEMV serves the 7 / 8-bit projections at M = 1; gated-residual
   decode kernels stream the 6.5 MB gate / up weights with all loads in flight (rows <= 8); the gated add after a sublayer is deferred into the next site's norm pass.
 * **Prefill**: the gated-residual projections run as cuBLAS GEMM pairs on fp16 hi / lo splits of the fp32 operands at a fixed row capacity (a row's result is bit-identical whatever
   its position or chunk size); QSA sparse attention for prefill rows runs on a tensor-core kernel (keys gathered through the row's top-k list); the PLE row decode overlaps the layers
