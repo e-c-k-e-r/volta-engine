@@ -668,6 +668,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		LOG_ERROR( "[RANK %d] %d tensors missing\n", rank_, missing );
 		return false;
 	}
+	tier_.stage_auto_off = !layers_.empty() && layers_[0].experts.type != pod::QuantType::NVFP4;   // trellis experts: the persistent kernel's tiles read each cold expert about once, staging does not pay
 	tier_.stage_init( *arena_ );   // prefill staging scratch for the cold experts (turns itself off when the arena has no room)
 	if ( runtime::options().mem_log && rank_ <= 1 ) {
 		constexpr double kGiB = 1073741824.0;

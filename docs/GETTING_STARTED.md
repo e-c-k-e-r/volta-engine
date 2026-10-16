@@ -100,8 +100,9 @@ Qwen extras:
   `--set expert_cache=auto` picks the fraction itself: the largest the arena holds after the other weights, the drafter (its file size) and a 0.25 GiB
   margin; the first MoE layer starts from a conservative estimate and each later layer re-estimates from what was actually loaded, so the last
   layers take up the slack (the log prints the plan and the resident range). GLM only; it uses the expert tier on any rank count.
-  Prefill chunks (above 16 rows) copy each layer's cold experts once into device scratch, a layer ahead of the compute (`expert_stage`, on by
-  default; 2 x the cold experts of a layer, 126 MiB at 90% resident), instead of reading them over PCIe from every row tile: 4096 tokens in chunks of
+  Prefill chunks (above 16 rows) copy each layer's cold experts once into device scratch, a layer ahead of the compute (`expert_stage`: auto = on, except for Flash-Next's
+  trellis experts, where the persistent kernel's tiles read each cold expert about once and staging measured 15-25% slower at 256-row chunks and level at 512;
+  2 x the cold experts of a layer, 126 MiB at 90% resident), instead of reading them over PCIe from every row tile: 4096 tokens in chunks of
   1024 ran at 534 tok/s against 306 at `expert_cache=0.9`, and 721 against 589 at 0.97.
   Decode keeps the fused MoE kernels while at least 75% of the experts are resident (below that the persistent kernel reads the cold experts a
   little faster): at 99% resident a token takes 19.0 ms against 15.5 ms with every expert resident (16.3 ms with the PCIe reads taken out; the

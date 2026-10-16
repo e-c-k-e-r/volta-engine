@@ -548,7 +548,7 @@ int Glm5NextPipeline::auto_resident( const engine::loader::SafeTensorsRepo& repo
 	const int floor_res = std::max( 1, experts / 10 );
 	auto fit = [&]( size_t reserved ) { return std::max( floor_res, std::min( experts, static_cast<int>( free_now > other + reserved ? ( free_now - other - reserved ) / per_resident : 0 ) ) ); };
 	// Prefill staging keeps two layers' cold experts in device scratch (sized by the first layer's count): leave room for it
-	const bool stage = runtime::options().expert_stage && !runtime::options().expert_stream;
+	const bool stage = runtime::options().expert_stage != 0 && !runtime::options().expert_stream;
 	int resident = fit( 0 );
 	if ( stage ) {
 		const int base = tier_.resident > 0 ? tier_.resident : resident;

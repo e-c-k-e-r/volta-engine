@@ -59,6 +59,7 @@ struct ExpertTier {
 	bool staging_on = false;
 	~ExpertTier();
 	void stage_init( pod::MemoryArena& device );
+	bool stage_auto_off = false;   // the owner's default for expert_stage = -1 (auto): staging off
 	bool prefill_staging() const { return staging_on; }
 	void stage_prefetch( int layer, backend::stream_t stream );   // issue the copy of the layer's cold experts (idempotent until stage_end)
 	bool stage_begin( int layer, backend::stream_t stream );      // the layer's MoE then reads the staged copy; false: nothing cold, run as usual

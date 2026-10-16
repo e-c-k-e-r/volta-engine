@@ -96,7 +96,8 @@ ExpertTier::~ExpertTier() {
 }
 
 void ExpertTier::stage_init( pod::MemoryArena& device ) {
-	if ( !active() || layers.empty() || runtime::options().expert_synth || runtime::options().expert_stream || !runtime::options().expert_stage ) return;
+	if ( !active() || layers.empty() || runtime::options().expert_synth || runtime::options().expert_stream || runtime::options().expert_stage == 0 ) return;
+	if ( runtime::options().expert_stage < 0 && stage_auto_off ) return;
 	for ( const Layer& l : layers ) cold_max = std::max( cold_max, experts - static_cast<int>( l.owner.size() ) );
 	const size_t tables = layers.size() * 9 * static_cast<size_t>( experts ) * sizeof( void* );
 	const size_t need = 2 * static_cast<size_t>( cold_max ) * slot_bytes + tables + 4096;
