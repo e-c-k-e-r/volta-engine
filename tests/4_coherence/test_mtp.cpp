@@ -2,10 +2,30 @@
 // on a long one (several prefill chunks, so the head's prompt KV and the carried hidden row are exercised), and it accepts drafts.
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"
+#include <cmath>
 #include <cstdlib>
 #include <string>
 
 using namespace engine::runtime;
+
+
+// The logits are FP16, so two candidates within one ulp are common (an ulp is 0.0156 at |logit| 16..32), and a verify block rounds differently from a single
+// row: the same near-tie then breaks one way in plain decoding and the other in a round (ties keep the lower id). A first difference is accepted when it is
+// exactly that: plain decoding's runner-up at that step, within one FP16 ulp of its pick. Replays the plain run's tokens as single rows to read the step's logits.
+static bool one_ulp_tie( ModelCluster& mc, const std::vector<int>& prompt, const std::vector<int>& plain, size_t d, int spec_token ) {
+	if ( d == 0 || d >= plain.size() ) return false;
+	mc.reset_slot( 0 );
+	mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0 );
+	int pos = static_cast<int>( prompt.size() );
+	for ( size_t i = 0; i < d; ++i ) mc.forward( &plain[i], 1, pos++, 0 );
+	Candidates cs[1];
+	mc.sample_topk( 1, cs );
+	if ( cs[0].ids[0] != plain[d] || cs[0].ids[1] != spec_token ) return false;
+	const float top = cs[0].logits[0], gap = top - cs[0].logits[1];
+	const float ulp = std::ldexp( 1.0f, std::ilogb( std::fabs( top ) ) - 10 );
+	std::printf( "   at that step plain's top-2 logits are %.5f (id %d) and %.5f (id %d): gap %.5f, one FP16 ulp %.5f\n", top, cs[0].ids[0], cs[0].logits[1], cs[0].ids[1], gap, ulp );
+	return gap <= ulp * 1.001f;
+}
 
 int main( int argc, char** argv ) {
 	// --flash: Qwen3.8-Flash-Next (qwen4_exp) instead of Qwen3.8-27B; --glm: GLM-5.3-Flash (the head comes from the NVFP4 checkpoint named by
@@ -54,7 +74,8 @@ int main( int argc, char** argv ) {
 		// Qwen3.8-27B reproduces plain greedy decoding token for token. Flash-Next's router flips make near-ties sensitive to the rounding of
 		// the verify block against single rows, so it is held to the first three quarters of the continuation
 		// GLM's single-row and verify-block numerics differ by a few tenths of a logit, so it only has to agree for the first tokens
-		const bool same = plain.tokens == spec.tokens || ( flash && plain.tokens.size() == spec.tokens.size() && d * 4 >= plain.tokens.size() * 3 ) || ( glm && d >= 8 );
+		bool same = plain.tokens == spec.tokens || ( flash && plain.tokens.size() == spec.tokens.size() && d * 4 >= plain.tokens.size() * 3 ) || ( glm && d >= 8 );
+		if ( !same && d < spec.tokens.size() ) same = one_ulp_tie( mc, prompts[p], plain.tokens, d, spec.tokens[d] );
 		const double rate = spec.proposed ? static_cast<double>( spec.accepted ) / spec.proposed : 0.0;
 		std::printf( "[%s] prompt %zu (%zu tokens): plain %.1f tok/s, MTP %.1f tok/s, accepted %d / %d (%.0f%%)\n", same ? "ok" : "FAIL", p, prompts[p].size(),
 			plain.decode_tok_s(), spec.decode_tok_s(), spec.accepted, spec.proposed, 100.0 * rate );
