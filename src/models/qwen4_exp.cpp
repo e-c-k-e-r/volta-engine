@@ -567,6 +567,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		mw.top_k = config_.top_k;
 		// Tiered experts (ENGINE_EXPERT_CACHE < 1): the codes of resident experts go to device slots, the rest to pinned host memory; the scales
 		// (NVFP4) and sign vectors (trellis) stay on the device
+		const size_t wb_experts_start = arena_->offset_bytes;   // [mem]: the tier slots count as experts
 		const double tier_fraction = engine::modules::ExpertTier::resident_fraction();
 		ENGINE_ASSERT( tier_fraction > 0.0, "Qwen4Exp: expert_cache=auto is for GLM; give the resident fraction" );
 		int tier_layer = -1;
@@ -588,7 +589,6 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 			tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_ ) );
 			tier_layer = tier_layers_++;
 		}
-		const size_t wb_experts_start = arena_->offset_bytes;
 		for ( int e = 0; e < per_rank; ++e ) {
 			const int gid = rank_ * per_rank + e;
 			pod::MemoryArena ca[3];
