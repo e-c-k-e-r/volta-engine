@@ -161,7 +161,7 @@ void ExpertTier::stage_prefetch( int layer, cudaStream_t stream ) {
 }
 
 bool ExpertTier::stage_begin( int layer, cudaStream_t stream ) {
-	if ( !staging_on ) return false;
+	if ( !staging_on || layer < 0 || layer >= static_cast<int>( layers.size() ) ) return false;   // the MTP head's MoE has no tier layer
 	stage_prefetch( layer, stream );
 	Layer& l = layers[layer];
 	if ( !l.queued ) return false;
@@ -171,7 +171,7 @@ bool ExpertTier::stage_begin( int layer, cudaStream_t stream ) {
 }
 
 void ExpertTier::stage_end( int layer, cudaStream_t stream ) {
-	if ( !staging_on ) return;
+	if ( !staging_on || layer < 0 || layer >= static_cast<int>( layers.size() ) ) return;
 	Layer& l = layers[layer];
 	if ( !l.queued ) return;
 	CUDA_CHECK( cudaEventRecord( static_cast<cudaEvent_t>( ev_free[layer & 1] ), stream ) );

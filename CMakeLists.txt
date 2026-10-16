@@ -432,6 +432,9 @@ set_target_properties(test_gdn PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BI
 add_executable(test_rows tests/2_parity/test_rows.cpp)
 target_link_libraries(test_rows PRIVATE engine_kernels pthread)
 set_target_properties(test_rows PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(diag_logits tests/4_coherence/diag_logits.cpp)
+target_link_libraries(diag_logits PRIVATE engine_kernels pthread)
+set_target_properties(diag_logits PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Test routed MoE (persistent kernel) parity against per-expert reference
 add_executable(test_moe tests/2_parity/test_moe.cpp)
@@ -680,7 +683,3 @@ if(ENGINE_GPU)
 		set_target_properties(bench_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 	endif()
 endif()
-
-add_executable(diag_logits tests/4_coherence/diag_logits.cpp)
-target_link_libraries(diag_logits PRIVATE engine_kernels pthread)
-set_target_properties(diag_logits PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
