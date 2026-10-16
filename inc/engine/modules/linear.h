@@ -25,6 +25,9 @@ struct LinearWeight {
 	bool       mul1 = false;
 	bool       mcg = false;   // MCG codebook (the quantized DFlash2 drafters); everything else decodes as mul1
 
+	// Trellis projections run through one workspace per device (rotated activations, split-K partials): two of them must not run on different streams at once
+	bool shares_workspace() const { return type == QuantType::TRELLIS; }
+
 	static LinearWeight make_trellis(
 		const TensorView& codes,
 		const TensorView& suh,

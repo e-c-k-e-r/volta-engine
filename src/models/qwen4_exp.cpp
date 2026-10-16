@@ -910,10 +910,9 @@ void Qwen4ExpPipeline::attention_forward( const Qwen4ExpLayerWeights& lw, int at
 	// Decode rows: three chains that read only the normed input run side by side, the way GLM's MLA layers do. Main: q_proj, q norm. First side stream: k_proj,
 	// k norm, v_proj (joined before the rope). Second side stream: the QSA indexer (queries and ring, pooled keys, scores, selection; joined before the
 	// sparse attention). The trellis projections share one workspace per device, so only NVFP4 / FP16 projections overlap
-	const auto no_workspace = []( const pod::LinearWeight& w ) { return w.type != pod::QuantType::TRELLIS; };
 	static const bool overlap_on = runtime::options().hessian_dir.empty();
 	const bool overlap = overlap_on && side_stream_ != nullptr && side_stream2_ != nullptr && m <= pod::MAX_BATCH && !qsa_off &&
-		no_workspace( lw.q_proj ) && no_workspace( lw.k_proj ) && no_workspace( lw.v_proj ) && no_workspace( lw.idx_qk_proj );
+		!lw.q_proj.shares_workspace() && !lw.k_proj.shares_workspace() && !lw.v_proj.shares_workspace() && !lw.idx_qk_proj.shares_workspace();
 	backend::stream_t sk = overlap ? side_stream_ : stream;
 	backend::stream_t sx = overlap ? side_stream2_ : stream;
 	if ( overlap ) {
@@ -965,7 +964,7 @@ void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_i
 	// Decode rows: the z projection and the gate projections read only the normed input, so they run on the side stream beside the qkv projection, conv and
 	// l2 norm; the recurrent step waits for both. The trellis projections share one workspace per device, so only NVFP4 / FP16 weights overlap
 	static const bool overlap_on = runtime::options().hessian_dir.empty();
-	const bool overlap = overlap_on && side_stream_ != nullptr && m <= pod::MAX_BATCH && lw.in_proj_z.type != pod::QuantType::TRELLIS && lw.in_proj_qkv.type != pod::QuantType::TRELLIS;
+	const bool overlap = overlap_on && side_stream_ != nullptr && m <= pod::MAX_BATCH && !lw.in_proj_z.shares_workspace() && !lw.in_proj_qkv.shares_workspace();
 	backend::stream_t sk = overlap ? side_stream_ : stream;
 	if ( overlap ) backend::stream_fork( stream, sk );
 	engine::modules::Linear::forward( mixed_, lw.in_proj_z, z_buf_, sk );

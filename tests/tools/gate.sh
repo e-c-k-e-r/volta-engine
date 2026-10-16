@@ -57,7 +57,7 @@ static_checks() {
 # Tests that need no checkpoint (synthetic inputs, goldens, host-only logic); some need a GPU
 tier2_fast() {
 	for t in test_trellis test_gemv_int8 test_mhc test_attention test_attention_prefill test_dsa test_kv_pages test_gdn \
-		test_norm test_rope test_kv_quant test_all_reduce test_prefill_linear test_sampling test_slang_cpu test_slang_kernels; do
+		test_norm test_rope test_kv_quant test_all_reduce test_prefill_linear test_sampling test_sparse_attn test_slang_cpu test_slang_kernels; do
 		run $t gpu ./$t
 	done
 	run all_reduce_2ranks sh -c "AR_RANKS=2 taskset -c 0-9 ./test_all_reduce"
@@ -94,7 +94,7 @@ tier2_fast() {
 
 # Tests that load a checkpoint from $ENGINE_MODEL_ROOT (tokenizer files, weights): the model-backed set
 tier2_models() {
-	for t in test_rows test_moe test_nvfp4_linear test_mla_latent test_spec_state; do
+	for t in test_rows test_glm_rows test_prefill_equiv test_moe test_nvfp4_linear test_mla_latent test_spec_state; do
 		run $t gpu ./$t
 	done
 	# test_dflash prints a known FATAL in its geometry step (present before 2026-10-07); judged by its final line
@@ -108,6 +108,9 @@ tier2_models() {
 	run prefix_restore gpu ./test_prefix_restore
 	run prefix_restore_spec gpu ./test_prefix_restore --spec
 	run mtp_greedy gpu ./test_mtp
+	run mtp_greedy_flash gpu ./test_mtp --flash
+	# the GLM decode options (side_streams, hc_fuse) must not change the output of test_glm_rows in the NVFP4 dense configuration
+	run glm_option_identity $ROOT/tests/tools/glm_option_identity.sh
 	run vision_tower gpu ./test_vision
 	run vision_tower_glm gpu ./test_vision $ENGINE_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw $ROOT/tests/data/image_wide.png --glm
 	run prefix_restore_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore"

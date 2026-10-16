@@ -1593,9 +1593,8 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 			// store, then the indexer keys (project, prep, pool). Second side stream: the indexer query (needs q_a_norm and the pool) -> score -> select.
 			// Attention waits for all three; the buffers of the chains are disjoint
 			// The trellis projections share one workspace per device, so the chains overlap only for NVFP4 / FP16 projections (the NVFP4 dense checkpoint)
-			const auto no_workspace = []( const pod::LinearWeight& w ) { return w.type != pod::QuantType::TRELLIS; };
 			const bool mla_overlap = side_stream_ != nullptr && side_stream2_ != nullptr && m <= pod::MAX_BATCH && dsa_ && lw.idx_dense.data != nullptr &&
-				no_workspace( lw.q_a ) && no_workspace( lw.q_b ) && no_workspace( lw.kv_a ) && no_workspace( lw.idx_wq_b );
+				!lw.q_a.shares_workspace() && !lw.q_b.shares_workspace() && !lw.kv_a.shares_workspace() && !lw.idx_wq_b.shares_workspace();
 			backend::stream_t sk = mla_overlap ? side_stream_ : stream;
 			backend::stream_t sx = mla_overlap ? side_stream2_ : stream;
 			if ( mla_overlap ) backend::stream_fork( stream, sk );
