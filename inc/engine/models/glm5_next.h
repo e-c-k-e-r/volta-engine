@@ -218,7 +218,9 @@ private:
 	void forward_body( int m, backend::stream_t stream );
 	// One decoder layer over the m rows of hidden_streams_ (mHC layers) or hidden_states_ (the MTP head's, which has no hyper-connection);
 	// `layer` picks the recurrent and latent state (45 = the MTP head's MLA layer, the last latent slot)
-	void layer_body( int layer, Glm5NextLayerWeights& lw, int m, backend::stream_t stream );
+	// phase: which parts of the layer run (a mask of the three below); the window prefill runs them apart
+	enum : int { kPhaseFront = 1, kPhaseFfn = 2, kPhasePost = 4, kPhaseAll = 7 };
+	void layer_body( int layer, Glm5NextLayerWeights& lw, int m, backend::stream_t stream, int phase = kPhaseAll );
 	void set_rows( int m );
 
 	pod::BatchRows* d_rows_ = nullptr;

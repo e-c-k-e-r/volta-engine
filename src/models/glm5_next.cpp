@@ -1447,7 +1447,7 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 	engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
 }
 
-void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, backend::stream_t stream ) {
+void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, backend::stream_t stream, int phase ) {
 	const pod::SlotRef kv_ref{ d_rows_, 0, latent_slot_stride_ };
 	const size_t slot_kda_floats = state_.slot_kda_floats;
 	const size_t slot_conv_floats = state_.slot_conv_floats;
@@ -1483,6 +1483,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 	};
 
 
+	if ( phase & kPhaseFront ) {   // the attention sublayer and the input of the FFN: mHC collapse, norm
 		if ( lw.hc_attn_fn.data != nullptr ) {
 			// mHC pre-step: attention
 			// Collapse and the input RMSNorm (norm_hidden = rms_norm(collapsed)) in one launch when the shape allows
@@ -1764,6 +1765,9 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 			);
 		}
 
+	}
+
+	if ( phase & kPhaseFfn ) {   // the FFN: router, experts, shared expert, reduction
 		// 4. MoE FFN
 		hessian( layer, 1, norm_hidden_.data, H, m, stream );
 		if ( lw.is_moe ) {
@@ -1919,6 +1923,9 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 			}
 		}
 
+	}
+
+	if ( phase & kPhasePost ) {   // the mHC update with the FFN output, tapped states
 		const pod::TensorView& ffn_res = lw.is_moe ? local_moe_out_ : ffn_out_;
 
 		if ( lw.hc_ffn_fn.data != nullptr ) {
@@ -1952,6 +1959,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 		}
 
 		trace_row( layer );
+	}
 }
 
 void Glm5NextPipeline::hessian( int layer, int site, const void* x, int k, int m, backend::stream_t stream ) {
