@@ -1,5 +1,6 @@
 #include "engine/core/utf8.h"
 #include "engine/runtime/generator.h"
+#include "engine/runtime/cand_log.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include <cstdio>
@@ -54,6 +55,7 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 	}
 	LOG_INFO( "Generator ready: %d slots, speculation %s\n", num_slots_, cluster_.has_speculator() ? "on" : "off" );
 
+	if ( !runtime::options().spec_cand_log.empty() ) CandLog::get().open( runtime::options().spec_cand_log );
 	const size_t cache_budget = static_cast<size_t>( std::max( 0, runtime::options().prefix_cache_gib ) ) << 30;
 	if ( cache_budget > 0 && cluster_.snapshot_bytes( 0, 1 ) > 0 ) {
 		prefix_cache_ = std::make_unique<PrefixCache>( cluster_, cache_budget );
@@ -256,6 +258,12 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 	double decode_s = std::chrono::duration<double>( now - slot.metrics.first_token_time ).count();
 	slot.metrics.generated_tokens = slot.tokens_generated;
 	slot.metrics.decode_tok_s = ( decode_s > 0.0 && slot.tokens_generated > 1 ) ? static_cast<float>( ( slot.tokens_generated - 1 ) / decode_s ) : 0.0f;
+	if ( CandLog::get().on() ) {
+		const int32_t head[3] = { static_cast<int32_t>( 0xC0DE0002 ), s, static_cast<int32_t>( slot.all_tokens.size() ) };
+		CandLog::get().write( head, sizeof( head ) );
+		CandLog::get().write( slot.all_tokens.data(), slot.all_tokens.size() * sizeof( int ) );
+		CandLog::get().flush();
+	}
 	if ( slot.req.on_finish ) {
 		slot.req.on_finish( reason, slot.req.matched_stop, slot.metrics );
 	}

@@ -1,6 +1,7 @@
 #include "engine/runtime/dflash2_runner.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
+#include "engine/runtime/cand_log.h"
 #include "engine/backend/runtime.h"
 #include "engine/runtime/cluster.h"
 #include <chrono>
@@ -359,6 +360,23 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		if ( !offered ) ++hit_[k];
 		res.emitted[res.emitted_count++] = cands[k];
 		res.accepted++;
+	}
+	if ( !sampled && !offered && CandLog::get().on() ) {
+		constexpr int kTop = models::kDraftTopK;
+		float hv[M * kTop];
+		int hi[M * kTop];
+		backend::set_device( 0 );
+		backend::memcpy_sync( hv, spec_[0].merged_final_values_ptr(), sizeof( hv ), backend::Copy::D2H );
+		backend::memcpy_sync( hi, spec_[0].merged_final_indices_ptr(), sizeof( hi ), backend::Copy::D2H );
+		const int valid = MIN( active, res.accepted + 1 );
+		const int32_t head[6] = { static_cast<int32_t>( 0xC0DE0001 ), slot, pos, anchor, active, valid };
+		CandLog::get().write( head, sizeof( head ) );
+		for ( int k = 0; k < valid; ++k ) {
+			const int32_t tk[2] = { cands[k], preds[k] };
+			CandLog::get().write( tk, sizeof( tk ) );
+			CandLog::get().write( hv + ( k + 1 ) * kTop, kTop * sizeof( float ) );
+			CandLog::get().write( hi + ( k + 1 ) * kTop, kTop * sizeof( int ) );
+		}
 	}
 	if ( diag_on_ && !sampled && !offered ) {
 		constexpr int kTop = models::kDraftTopK;
