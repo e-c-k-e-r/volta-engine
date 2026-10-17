@@ -16,6 +16,7 @@ int main( int argc, char** argv ) {
 	int n_tokens = 256;
 	int n_prompts = 100;
 	float temp = 0.0f;
+	std::vector<float> depths = { -1.0f };   // --depths a,b,c: the survival threshold of the depth policy for each pass (-1 = the whole block)
 	bool glm = false;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--nothink" ) ) think = false;
@@ -23,6 +24,14 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--prompts" ) && i + 1 < argc ) n_prompts = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--temp" ) && i + 1 < argc ) temp = static_cast<float>( std::atof( argv[++i] ) );
+		else if ( !std::strcmp( argv[i], "--depths" ) && i + 1 < argc ) {
+			depths.clear();
+			for ( const char* q = argv[++i]; *q; ) {
+				depths.push_back( static_cast<float>( std::atof( q ) ) );
+				while ( *q && *q != ',' ) ++q;
+				if ( *q == ',' ) ++q;
+			}
+		}
 	}
 	const char* prompts[] = {
 		"Solve step by step: what is 17 * 23 + 144 / 12? Show your reasoning.",
@@ -53,6 +62,8 @@ int main( int argc, char** argv ) {
 		if ( !std::strcmp( argv[i], "--profile" ) ) mc.spec().set_profile( true );
 	}
 
+	for ( const float depth : depths ) {
+	std::printf( "\n--- depth threshold %.2f ---\n", depth );
 	int rounds = 0, proposed = 0, accepted = 0, produced = 0;
 	double ms = 0.0;
 	for ( int pi = 0; pi < total && pi < n_prompts; ++pi ) {
@@ -73,7 +84,7 @@ int main( int argc, char** argv ) {
 		}
 		test::GenStats st;
 		if ( temp <= 0.0f ) {
-			st = test::generate( mc, ids, n_tokens, true );
+			st = test::generate( mc, ids, n_tokens, true, 0, 0, depth );
 		}
 		else {
 			SamplingParams sp;
@@ -89,7 +100,7 @@ int main( int argc, char** argv ) {
 			int pos = static_cast<int>( ids.size() );
 			t0 = std::chrono::steady_clock::now();
 			while ( static_cast<int>( st.tokens.size() ) < n_tokens && !mc.is_eos( tok ) ) {
-				const SpecResult r = mc.speculate( 0, tok, pos, -1.0f, &sp, &rng );
+				const SpecResult r = mc.speculate( 0, tok, pos, depth, &sp, &rng );
 				st.rounds++;
 				st.proposed += r.proposed;
 				st.accepted += r.accepted;
@@ -114,6 +125,7 @@ int main( int argc, char** argv ) {
 	std::printf( "\n=== %s regime: %d rounds, acceptance %d/%d (%.1f%%), %.2f tokens/round, %.1f tok/s ===\n",
 		think ? "thinking" : "no-think", rounds, accepted, proposed, proposed ? 100.0 * accepted / proposed : 0.0,
 		rounds ? static_cast<double>( produced ) / rounds : 0.0, ms > 0.0 ? produced * 1000.0 / ms : 0.0 );
+	}
 	const auto& d = mc.spec().diag();
 	std::printf( "  pos |  seen | best==target | target in top-16 | walk==target\n" );
 	for ( int k = 0; k < 7; ++k ) {

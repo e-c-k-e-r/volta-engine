@@ -280,7 +280,9 @@ int DFlash2Runner::round_block( int slot, int anchor, int pos, float depth_thres
 		*offered = true;
 		return MIN( n, mc_->metadata().max_seq_len - pos - 2 );
 	}
-	return draft_block( slot, anchor, pos, depth_threshold, h_draft );
+	// An explicit threshold from the caller wins; otherwise the option
+	const float dt = depth_threshold > 0.0f ? depth_threshold : static_cast<float>( runtime::options().spec_depth );
+	return draft_block( slot, anchor, pos, dt, h_draft );
 }
 
 SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_threshold,
