@@ -541,7 +541,10 @@ void Generator::step_batch() {
 	// one prompt is fed a piece per step and the decode steps run in between; otherwise every pending prompt is fed in full
 	bool decoding = false;
 	for ( int s = 0; s < num_slots_; ++s ) decoding = decoding || ( slots_[s].active && slots_[s].prefill_done );
-	const int chunk = ( decoding && ( !cluster_.has_speculator() || cluster_.speculator().per_slot() ) ) ? runtime::options().prefill_chunk : 0;
+	const int chunk_max = runtime::options().prefill_chunk;
+	const double budget_ms = runtime::options().prefill_budget_ms;
+	if ( budget_ms > 0.0 && pf_rows_ <= 0.0 ) pf_rows_ = chunk_max;
+	const int chunk = ( decoding && ( !cluster_.has_speculator() || cluster_.speculator().per_slot() ) ) ? ( budget_ms > 0.0 ? static_cast<int>( pf_rows_ ) : chunk_max ) : 0;
 	if ( chunk > 0 ) {
 		for ( int i = 1; i <= num_slots_; ++i ) {
 			const int s = ( pf_rr_ + i ) % num_slots_;
@@ -551,6 +554,12 @@ void Generator::step_batch() {
 				const int pos0 = slots_[s].pf_pos;
 				prefill_slot( s, chunk );
 				const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
+				// A full piece tells how long this many rows take: steer the next one toward the budget (a short piece, cut at a checkpoint or the end
+				// of a prompt, says nothing)
+				if ( budget_ms > 0.0 && slots_[s].pf_pos - pos0 >= chunk && ms > 1.0 ) {
+					const double step = std::min( 1.3, std::max( 0.7, budget_ms / ms ) );
+					pf_rows_ = std::min( static_cast<double>( chunk_max ), std::max( 64.0, pf_rows_ * step ) );
+				}
 				if ( ms > 300.0 ) LOG_DEBUG( "[gen] slot %d prefill piece at %d (%d rows) took %.0f ms\n", s, pos0, slots_[s].pf_pos - pos0, ms );
 				break;
 			}
