@@ -2256,6 +2256,23 @@ void Glm5NextPipeline::copy_seq_rows( int slot_id, int from, int tokens, char* h
 	}
 }
 
+bool Glm5NextPipeline::read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream ) {
+	const int cap = draft_hooks_.taps_cap;
+	if ( draft_hooks_.taps == nullptr || slot_id < 0 || slot_id >= config_.max_slots || first_pos < 0 || count <= 0 || count > cap ) return false;
+	backend::set_device( rank_ );
+	const size_t row = static_cast<size_t>( 5 ) * config_.hidden_size;
+	const backend::half_t* ring = draft_taps_.ptr<const backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride;
+	// Position p lives in ring row p % cap: at most two contiguous runs
+	for ( int done = 0; done < count; ) {
+		const int r = ( first_pos + done ) % cap;
+		const int n = std::min( count - done, cap - r );
+		backend::memcpy_async( host_dst + static_cast<size_t>( done ) * row, ring + static_cast<size_t>( r ) * row, static_cast<size_t>( n ) * row * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+		done += n;
+	}
+	backend::stream_sync( stream );
+	return true;
+}
+
 bool Glm5NextPipeline::save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream ) {
 	if ( seq_state_bytes( from, tokens, with_taps ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
 	backend::set_device( rank_ );

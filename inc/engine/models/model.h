@@ -128,6 +128,12 @@ public:
 	// reads this rank's embedding, the tap ring and a head-shard top-k through one descriptor, and
 	// asks the model to run the head over caller-provided hidden rows.
 	virtual const DraftHooks& draft_hooks() const { static const DraftHooks none; return none; }
+	// Copies the drafter taps of positions [first_pos, first_pos + count) of a slot (count rows of 5 * hidden halves) to host memory; false without a tap ring
+	// or when count exceeds the ring
+	virtual bool read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream = nullptr ) {
+		(void) slot_id; (void) first_pos; (void) count; (void) host_dst; (void) stream;
+		return false;
+	}
 	// Runs this rank's LM head shard over hooks.lm_in[rows, hidden] and leaves the local top-k
 	// (token ids offset into the global vocabulary, sorted) in hooks.cand_vals / cand_idx.
 	virtual void draft_head_topk( int rows, backend::stream_t stream = nullptr ) { (void) rows; (void) stream; }

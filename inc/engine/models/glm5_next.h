@@ -184,6 +184,7 @@ public:
 	int seq_align() const override { return 4; }   // DSA::POOL
 	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
 	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
+	bool read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream = nullptr ) override;
 	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;
 
 	void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) override;

@@ -258,6 +258,24 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 	double decode_s = std::chrono::duration<double>( now - slot.metrics.first_token_time ).count();
 	slot.metrics.generated_tokens = slot.tokens_generated;
 	slot.metrics.decode_tok_s = ( decode_s > 0.0 && slot.tokens_generated > 1 ) ? static_cast<float>( ( slot.tokens_generated - 1 ) / decode_s ) : 0.0f;
+	// Tap spool: int32 0x7A950001, request id, prompt tokens, n tokens, first position, count W; then the tokens [first, n) (int32), then the taps of
+	// positions [first, first + W) (W x 5 x hidden FP16). The last token is not forwarded yet, so taps exist up to n - 2
+	if ( const std::string& spool = runtime::options().tap_spool; !spool.empty() && cluster_.has_speculator() ) {
+		static std::FILE* f = std::fopen( spool.c_str(), "ab" );
+		const int n = static_cast<int>( slot.all_tokens.size() );
+		const int W = std::max( 0, std::min( std::min( runtime::options().tap_spool_window, n - 1 ), 2048 ) );
+		const int first = n - 1 - W;
+		if ( f && W > 0 && slot.prefill_done ) {
+			std::vector<backend::half_t> taps( static_cast<size_t>( W ) * 5 * cluster_.metadata().hidden_size );
+			if ( cluster_.read_taps( s, first, W, taps.data() ) ) {
+				const int32_t head[6] = { static_cast<int32_t>( 0x7A950001 ), static_cast<int32_t>( slot.req.req_id ), static_cast<int32_t>( slot.req.prompt_tokens.size() ), n, first, W };
+				std::fwrite( head, sizeof( int32_t ), 6, f );
+				std::fwrite( slot.all_tokens.data() + first, sizeof( int ), static_cast<size_t>( n - first ), f );
+				std::fwrite( taps.data(), sizeof( backend::half_t ), taps.size(), f );
+				std::fflush( f );
+			}
+		}
+	}
 	if ( CandLog::get().on() ) {
 		const int32_t head[3] = { static_cast<int32_t>( 0xC0DE0002 ), s, static_cast<int32_t>( slot.all_tokens.size() ) };
 		CandLog::get().write( head, sizeof( head ) );

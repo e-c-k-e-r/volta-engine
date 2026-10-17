@@ -489,6 +489,10 @@ void ModelCluster::warm_graphs( int max_m, int slot ) {
 		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
 }
 
+bool ModelCluster::read_taps( int slot, int first_pos, int count, backend::half_t* host_dst ) {
+	return models_[0]->read_taps( slot, first_pos, count, host_dst, streams_[0] );
+}
+
 size_t ModelCluster::snapshot_bytes( int from, int tokens, bool with_taps ) const {
 	return models_[0]->seq_state_bytes( from, tokens, with_taps );
 }
