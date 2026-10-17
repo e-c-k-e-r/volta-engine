@@ -44,6 +44,7 @@ Time to first token for a cold prompt (no prefix cache), which is the prefill ti
 | Qwen3.8-27B | 1.7 s | 3.4 s | 15.2 to 15.9 s |
 | Flash-Next | | 5.0 s | |
 | GLM-5.3-Flash | 5.2 s | 10.0 s | 68 s (256K configuration) |
+| Flash-Next, NVFP4 experts and dense | | 4.2 s | |
 
 GLM-5.3-Flash prefill with `prefill_window`, 8192 tokens, 512-row chunks, all experts resident, 4-bit latent cache, 250 W: the routed experts of a layer run once over the window's rows instead of once per chunk.
 

@@ -4,6 +4,12 @@
 #include "engine/backend/types.h"
 #include <cstdint>
 
+// Rows per pass of the NVFP4 expert kernels: the dispatch lists, the hidden-state scratch and the route partials are sized for this many. A pass
+// reads each active expert's weights again, so the larger it is the fewer times a prefill chunk streams them (512 = one pass per chunk)
+#ifndef MOE_NVFP4_ROWS
+#define MOE_NVFP4_ROWS 512
+#endif
+
 namespace engine::modules {
 
 // Per-rank NVFP4 expert table. Pointer arrays are device-resident, indexed by local expert id; a route whose id is >= num_local is skipped.
@@ -24,7 +30,7 @@ struct NVFP4ExpertTable {
 	int inter;        // I
 };
 
-inline int nvfp4_disp_ints( int num_local ) { return 4 + 2 * num_local + num_local * 64; }
+inline int nvfp4_disp_ints( int num_local ) { return 4 + 2 * num_local + num_local * MOE_NVFP4_ROWS; }
 
 struct NVFP4MoE {
 	// rows x topk routes: h[r][k] = silu(x[r] @ gate[e]^T) * (x[r] @ up[e]^T), then out[r] = sum_k w[r][k] * (h[r][k] @ down[e]^T) in fixed route order.

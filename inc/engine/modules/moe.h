@@ -4,10 +4,10 @@
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
 #include "engine/modules/linear.h"
+#include "engine/modules/nvfp4_moe.h"   // MOE_NVFP4_ROWS
 #include "engine/backend/types.h"
 
 #define MOE_MAX_GROUPS 8
-#define MOE_NVFP4_ROWS 64   // rows per pass of the NVFP4 expert kernels (scratch is sized for this many)
 #define MOE_MAX_EXPERTS 512   // experts per rank: 72 expert-parallel (GLM), 128 whole experts of 4 ranks (Flash-Next; 512 on a single rank)
 
 namespace pod {

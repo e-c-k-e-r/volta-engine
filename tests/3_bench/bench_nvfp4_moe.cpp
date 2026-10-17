@@ -121,7 +121,7 @@ int main() {
 	}
 
 	// Multi-row: routes drawn from 512 experts (rank 0 owns 0..127, the rest are skipped); rows > 1 against single-row calls, then time per layer
-	for ( int R : { 2, 4, 8, 16, 64 } ) {
+	for ( int R : { 2, 4, 8, 16, 64, 128, 256, 512 } ) {
 		std::vector<half> hxr( static_cast<size_t>( R ) * H ), hwr( static_cast<size_t>( R ) * K );
 		for ( auto& v : hxr ) v = __float2half( ( rnd() / 16777216.0f ) * 2.0f - 1.0f );
 		for ( auto& v : hwr ) v = __float2half( 0.05f + 0.01f * ( rnd() % 10 ) );
