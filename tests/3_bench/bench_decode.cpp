@@ -81,9 +81,9 @@ void bench_model( const char* type, const char* dir, int steps ) {
 		int ids[8], positions[8], toks[8];
 		for ( int s = 0; s < slots; ++s ) {
 			mc.reset_slot( s );
-			toks[s] = mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), s );
+			toks[s] = mc.prefill( ctx_prompt.data(), static_cast<int>( ctx_prompt.size() ), s );
 			ids[s] = s;
-			positions[s] = static_cast<int>( prompt.size() );
+			positions[s] = static_cast<int>( ctx_prompt.size() );
 		}
 		if ( prof_b ) CUDA_CHECK( cudaProfilerStart() );
 		t0 = std::chrono::steady_clock::now();
