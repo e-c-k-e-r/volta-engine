@@ -506,7 +506,7 @@ void Generator::offer_suffix( int s ) {
 	slot.suffix.sync( slot.all_tokens, k );
 	int toks[8], len = 0;
 	// A match must reach k tokens (the index is hashed) and continue for a few: a short continuation would cost the drafter's longer block
-	constexpr int kMinTokens = 3;
+	const int kMinTokens = std::max( 1, std::min( 7, runtime::options().spec_suffix_min ) );
 	const int n = slot.suffix.propose( 7, 64, toks, &len );
 	if ( n < kMinTokens || len < k ) {
 		cluster_.speculator().offer_draft( s, nullptr, 0 );

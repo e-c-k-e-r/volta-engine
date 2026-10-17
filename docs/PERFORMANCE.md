@@ -92,6 +92,8 @@ What the settings change, measured on one request (`bench_serve.py` style, greed
 | `spec_suffix=8` | 170-line code edit | 130.0 | 205.7 |
 | `spec_suffix=8` | prose | 70.9 | 70.8 |
 
+On a replay of 30 turns of a recorded Claude Code session (each turn's prompt is the recorded history, about 11K tokens, and the server writes the next turn, greedy, 400 tokens at most), with `spec_depth=0.25`: `spec_suffix` 6 to 12 gives about +5% decode tokens per second over off (92.7 against 88.1 tok/s over six and two runs; two runs of the same setting differ by up to 5%), 58% of the proposed suffix tokens are accepted, and 22% of the rounds use a suffix block. 4 proposes too eagerly (+2%) and 16 rarely fires (no gain). The minimum continuation (`spec_suffix_min`, 3) makes no measurable difference from 2 to 5.
+
 A prompt of about 11K tokens arriving while another request decodes (`prefill_budget_ms`): the decoding request's 90th-percentile token gap and the new prompt's time to first token.
 
 | `prefill_budget_ms` | Token gap p90 | Prompt TTFT |
