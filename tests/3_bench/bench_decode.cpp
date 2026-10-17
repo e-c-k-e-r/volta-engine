@@ -71,6 +71,25 @@ void bench_model( const char* type, const char* dir, int steps ) {
 	const double m8_ms = test::ms_since( t0 ) / iters;
 	if ( prof_a && !prof_b ) CUDA_CHECK( cudaProfilerStop() );
 
+	// BENCH_VL=2,3,4 times causal verify blocks of those widths (checkpoint, forward, sample, rollback) after the M=8 block
+	if ( const char* vl = std::getenv( "BENCH_VL" ) ) {
+		for ( const char* q = vl; *q; ) {
+			const int L = std::atoi( q );
+			if ( L >= 1 && L <= 8 ) {
+				auto tv = std::chrono::steady_clock::now();
+				for ( int i = 0; i < iters; ++i ) {
+					mc.checkpoint( 0 );
+					mc.forward( block, L, pos, 0 );
+					mc.sample( preds, L );
+					mc.rollback( 0 );
+				}
+				std::printf( "   verify block L=%d : %.2f ms/block\n", L, test::ms_since( tv ) / iters );
+			}
+			while ( *q && *q != ',' ) ++q;
+			if ( *q == ',' ) ++q;
+		}
+	}
+
 	std::printf( "\n=== %s decode benchmark (TP=4) ===\n", type );
 	std::printf( "   M=1 decode        : %.2f ms/token (%.2f tok/s)\n", m1_ms, 1000.0 / m1_ms );
 	std::printf( "   Mode A M=8 verify : %.2f ms/block (%.2fx M=1)\n", m8_ms, m8_ms / m1_ms );
