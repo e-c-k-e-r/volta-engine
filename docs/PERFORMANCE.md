@@ -53,6 +53,16 @@ GLM-5.3-Flash prefill with `prefill_window`, 8192 tokens, 512-row chunks, all ex
 | 2 | 943 tok/s | 0.08 GiB |
 | 4 | 1004 tok/s | 0.22 GiB |
 
+With part of the experts in host memory (`expert_cache` below 1) the window also streams each cold expert once per window instead of once per chunk:
+
+| `expert_cache` | Window off | Window 4 |
+|---|---|---|
+| 1.0 | 842 tok/s | 1004 tok/s |
+| 0.95 | 843 tok/s | 1046 tok/s |
+| 0.9 | 535 tok/s | 1015 tok/s |
+
+A 30K-token needle at `expert_cache=0.9` with a window of 4 passes (prefill 989 tok/s). Decode is not helped: with 10% of the experts in host memory it runs at 26 tok/s, against 70 with all resident.
+
 A window changes the rounding of the batched expert kernels the way a different chunk size does: the logits move by the amount two chunk sizes differ by (about 0.7 on the top logit at 1400 tokens), and needles at 14K (depths 10 and 90) and 100K pass with a window of 4 (prefill 990 and 906 tok/s at those lengths).
 
 ### Concurrent requests
