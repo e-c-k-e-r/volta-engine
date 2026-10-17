@@ -118,9 +118,13 @@ void hc_mix_partials_kernel(
 // divisor of the Sinkhorn is (sums of positive terms and hc_eps); the chain on one thread is a third shorter
 __device__ __forceinline__
 float rcp_ftz( const float x ) {
+#if defined(USE_ROCM)
+	return __builtin_amdgcn_rcpf( x ); // v_rcp_f32
+#else
 	float r;
 	asm( "rcp.approx.ftz.f32 %0, %1;" : "=f"( r ) : "f"( x ) );
 	return r;
+#endif
 }
 
 template <int H, int M_, bool HEAD, bool HALF_OUT>
