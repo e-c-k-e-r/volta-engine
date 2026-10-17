@@ -309,12 +309,39 @@ int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Ca
 	const int max_rows = metadata().max_rows;
 	chunk = ( chunk <= 0 ) ? max_rows : MAX( 1, MIN( chunk, max_rows ) );
 	int last_rows = 1;
-	for ( int pos = 0; pos < count; pos += chunk ) {
+	// A model that prefills several chunks layer by layer (prefill_window) takes up to that many consecutive chunks at once; a chunk at the decode
+	// sizes (the tail of a prompt) and prompts with images go the ordinary way
+	const int window = ( mm_slots_ == 0 && chunk > pod::MAX_BATCH ) ? models_[0]->window_chunks() : 1;
+	for ( int pos = 0; pos < count; ) {
+		int n = 0;
+		pod::BatchRows win[8];
+		for ( int p = pos; window > 1 && n < MIN( window, 8 ) && p < count; ) {
+			const int rows = MIN( chunk, count - p );
+			if ( rows <= pod::MAX_BATCH ) break;
+			win[n++] = pod::BatchRows::causal( rows, pos0 + p, slot, ( p + rows >= count ) ? pod::BatchRows::LOGITS_LAST : pod::BatchRows::LOGITS_NONE );
+			p += rows;
+		}
+		if ( n >= 2 ) {
+			ForwardTimer timer{ win[n - 1].count };
+			pool_.run( [&]( int d ) {
+				models_[d]->forward_window( tokens + pos, win, n, streams_[d] );
+				backend::stream_sync( streams_[d] );
+			} );
+			int p = pos;
+			for ( int c = 0; c < n; ++c ) {
+				if ( runner_ ) runner_->on_prefill_chunk( slot, tokens + p, win[c].count, pos0 + p );
+				p += win[c].count;
+			}
+			last_rows = win[n - 1].count;
+			pos = p;
+			continue;
+		}
 		last_rows = MIN( chunk, count - pos );
 		const bool last = ( pos + last_rows >= count );
 		forward( tokens + pos, pod::BatchRows::causal( last_rows, pos0 + pos, slot,
 			last ? pod::BatchRows::LOGITS_LAST : pod::BatchRows::LOGITS_NONE ) );
 		if ( runner_ ) runner_->on_prefill_chunk( slot, tokens + pos, last_rows, pos0 + pos );
+		pos += last_rows;
 	}
 	// A final chunk above the decode sizes computed logits for its last row only (in row 0).
 	const int rows = ( last_rows > pod::MAX_BATCH ) ? 1 : last_rows;

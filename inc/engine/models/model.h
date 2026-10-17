@@ -73,6 +73,18 @@ public:
 	// 2. Token embedding: token_ids is a host array of `count` ids for rows 0..count-1
 	virtual void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) = 0;
 
+	// Prefill chunks run layer by layer as one window (a model that supports it returns more than 1): the chunks are consecutive causal rows of one
+	// slot, each above the decode sizes; only the last one's logits are kept (as LOGITS_LAST). Default: one chunk after the other
+	virtual int window_chunks() const { return 1; }
+	virtual void forward_window( const int* tokens, const pod::BatchRows* chunks, int n, backend::stream_t stream = nullptr ) {
+		int off = 0;
+		for ( int c = 0; c < n; ++c ) {
+			embed_tokens( tokens + off, chunks[c].count, stream );
+			forward( chunks[c], stream );
+			off += chunks[c].count;
+		}
+	}
+
 	// 3. Forward over embedded rows
 	virtual void forward( const pod::BatchRows& rows, backend::stream_t stream = nullptr ) = 0;
 	void forward( int batch_size, int pos, int slot_id = 0, backend::stream_t stream = nullptr ) {

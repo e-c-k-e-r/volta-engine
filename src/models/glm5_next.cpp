@@ -124,6 +124,8 @@ bool Glm5NextPipeline::init(
 	// The MTP head (speculator=mtp) is one more MLA layer with its own latent cache and indexer state
 	mtp_on_ = runtime::options().speculator == "mtp";
 	mla_slots_ = config_.num_mla_layers + ( mtp_on_ ? 1 : 0 );
+	// Window prefill: chunks run layer by layer, the routed experts once over all their rows (not with the MTP head, which reads every prefill row)
+	window_ = ( !mtp_on_ && runtime::options().prefill_window > 1 ) ? std::min( runtime::options().prefill_window, 8 ) : 1;
 	// Routed experts: sharded over the ranks (every rank holds a quarter of every expert's intermediate width, moe_tp,
 	// default) or expert-parallel (72 whole experts per rank, forced by the two-tier expert cache). The sharded layout balances
 	// the load: each active expert costs every rank the same, where expert-parallel waits for the rank that drew the most.
@@ -133,7 +135,7 @@ bool Glm5NextPipeline::init(
 	// 1. Router outputs + routed-MoE dispatch scratch
 	state_.d_topk_indices = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( int ) ) );
 	state_.d_topk_weights = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( backend::half_t ) ) );
-	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R, mtp_on_ );
+	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R * window_, mtp_on_ );
 	// The fused decode kernels read cold experts from host memory a little slower than the persistent kernel (6.4 vs 6.8 tok/s at a
 	// 50% tier), but with most experts resident they are far faster (the persistent kernel costs ~11 ms a token more at 99% resident): only a
 	// small resident set keeps the persistent path. expert_cache=auto decides when the fraction is known
@@ -319,6 +321,19 @@ bool Glm5NextPipeline::init(
 	ffn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 
 	mem( "FFN buffers" );
+	if ( window_ > 1 ) {
+		const size_t W = static_cast<size_t>( window_ );
+		win_hs_ = static_cast<float*>( engine::core::arena_alloc( arena, ( W - 1 ) * 4 * R * config_.hidden_size * sizeof( float ) ) );
+		int win_shape[2] = { window_ * R, config_.hidden_size };
+		win_norm_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, win_shape, 2 );
+		win_moe_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, win_shape, 2 );
+		win_topk_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, W * R * config_.top_k * sizeof( int ) ) );
+		win_topk_w_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, W * R * config_.top_k * sizeof( backend::half_t ) ) );
+		win_post_ = static_cast<float*>( engine::core::arena_alloc( arena, W * 4 * R * sizeof( float ) ) );
+		win_comb_ = static_cast<float*>( engine::core::arena_alloc( arena, W * 4 * R * 4 * sizeof( float ) ) );
+		ENGINE_ASSERT( win_hs_ && win_topk_w_ && win_post_ && win_comb_, "Glm5NextPipeline::init: arena exhausted allocating the prefill window" );
+		mem( "prefill window" );
+	}
 	// 5. Logits & argmax: the LM head is vocabulary-parallel, every rank owns vocab_size / tp_size columns padded
 	// up to a multiple of 256 (so the dp4a int8 GEMV engages); lm_shard_real_cols_ excludes the pad
 	ENGINE_ASSERT( config_.vocab_size % 128 == 0, "Glm5NextPipeline: vocab_size must be a multiple of 128" );
@@ -1413,6 +1428,11 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 
 	for ( int layer = 0; layer < config_.num_layers; ++layer ) layer_body( layer, layers_[layer], m, stream );
 
+	forward_head( m, stream );
+}
+
+void Glm5NextPipeline::forward_head( int m, backend::stream_t stream ) {
+	const int H = config_.hidden_size;
 	if ( layers_[0].hc_attn_fn.data != nullptr ) {
 		// HyperHead unweighted mean across 4 streams
 		engine::modules::HyperHead::mean( hidden_streams_, hidden_states_, H, stream, m );
@@ -1445,6 +1465,79 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 	logits_.shape[0] = m;
 	engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, 1e-5f, 0.0f, stream );
 	engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
+}
+
+// A window of consecutive prefill chunks of one slot, layer by layer: every chunk runs its attention and router, the routed experts run once over all
+// the window's rows (a layer's experts cost far less per row at 1024 rows than at 512), then every chunk finishes the layer. Each chunk keeps its own
+// residual streams, normed FFN input (a slice of one window buffer) and mHC weights; the views that name them are rebound per chunk.
+void Glm5NextPipeline::forward_window( const int* tokens, const pod::BatchRows* chunks, int n, backend::stream_t stream ) {
+	ENGINE_ASSERT( weights_loaded_ && window_ > 1 && n >= 1 && n <= window_, "Glm5NextPipeline::forward_window: no window configured" );
+	ENGINE_ASSERT( layers_[0].hc_attn_fn.data != nullptr, "Glm5NextPipeline::forward_window: needs the hyper-connection layers" );
+	backend::set_device( rank_ );
+	const int H = config_.hidden_size;
+	const int R = pod::MAX_ROWS;
+	const int K = config_.top_k;
+	int off[9] = {};
+	for ( int c = 0; c < n; ++c ) {
+		ENGINE_ASSERT( chunks[c].count > pod::MAX_BATCH && chunks[c].count <= R, "Glm5NextPipeline::forward_window: chunk size out of range" );
+		off[c + 1] = off[c] + chunks[c].count;
+		kv_prepare( chunks[c], stream );
+	}
+	const int total = off[n];
+	const pod::TensorView hs0 = hidden_streams_, nh0 = norm_hidden_, mo0 = local_moe_out_, post0 = mhc_post_, comb0 = mhc_comb_;
+	int* const ti0 = state_.d_topk_indices;
+	backend::half_t* const tw0 = state_.d_topk_weights;
+	const size_t row_bytes = static_cast<size_t>( H ) * sizeof( backend::half_t );
+	auto bind = [&]( int c ) {
+		const int m = chunks[c].count;
+		hidden_streams_.data = c == 0 ? hs0.data : static_cast<void*>( win_hs_ + static_cast<size_t>( c - 1 ) * 4 * R * H );
+		norm_hidden_.data = win_norm_.ptr<char>() + static_cast<size_t>( off[c] ) * row_bytes;
+		local_moe_out_.data = win_moe_out_.ptr<char>() + static_cast<size_t>( off[c] ) * row_bytes;
+		mhc_post_.data = win_post_ + static_cast<size_t>( c ) * 4 * R;
+		mhc_comb_.data = win_comb_ + static_cast<size_t>( c ) * 4 * R * 4;
+		state_.d_topk_indices = win_topk_idx_ + static_cast<size_t>( off[c] ) * K;
+		state_.d_topk_weights = win_topk_w_ + static_cast<size_t>( off[c] ) * K;
+		set_rows( m );
+		key_hint_ = chunks[c].pos[m - 1] + 1;
+		backend::memcpy_async( d_rows_, &chunks[c], chunks[c].upload_bytes(), backend::Copy::H2D, stream );
+		return m;
+	};
+	const pod::BatchRows& last = chunks[n - 1];
+	lm_mode_ = last.logits_mode;
+	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : last.count );
+	ENGINE_ASSERT( last_rows_ <= logit_rows_, "Glm5NextPipeline::forward_window: more logit rows than the buffer holds" );
+
+	for ( int c = 0; c < n; ++c ) {
+		const int m = bind( c );
+		embed_tokens( tokens + off[c], m, stream );
+		engine::modules::HyperConnection::init_streams( embed_rows_, hidden_streams_, H, stream, m );
+	}
+	for ( int layer = 0; layer < config_.num_layers; ++layer ) {
+		Glm5NextLayerWeights& lw = layers_[layer];
+		if ( !lw.is_moe ) {
+			for ( int c = 0; c < n; ++c ) layer_body( layer, lw, bind( c ), stream, kPhaseAll );
+			continue;
+		}
+		for ( int c = 0; c < n; ++c ) layer_body( layer, lw, bind( c ), stream, kPhaseFront | kPhaseRoute );
+		// the routed experts over the whole window
+		norm_hidden_.data = win_norm_.data;
+		norm_hidden_.shape[0] = total;
+		local_moe_out_.data = win_moe_out_.data;
+		local_moe_out_.shape[0] = total;
+		state_.d_topk_indices = win_topk_idx_;
+		state_.d_topk_weights = win_topk_w_;
+		layer_body( layer, lw, total, stream, kPhaseExperts );
+		for ( int c = 0; c < n; ++c ) layer_body( layer, lw, bind( c ), stream, kPhaseShared | kPhaseCombine | kPhasePost );
+	}
+	forward_head( bind( n - 1 ), stream );
+
+	hidden_streams_ = hs0;
+	norm_hidden_ = nh0;
+	local_moe_out_ = mo0;
+	mhc_post_ = post0;
+	mhc_comb_ = comb0;
+	state_.d_topk_indices = ti0;
+	state_.d_topk_weights = tw0;
 }
 
 void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, backend::stream_t stream, int phase ) {
@@ -1769,87 +1862,90 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 
 	if ( phase & kPhaseFfn ) {   // the FFN: router, experts, shared expert, reduction
 		// 4. MoE FFN
-		hessian( layer, 1, norm_hidden_.data, H, m, stream );
+		if ( phase & kPhaseRoute ) hessian( layer, 1, norm_hidden_.data, H, m, stream );
 		if ( lw.is_moe ) {
-			if ( tier_.active() && engine::modules::ExpertTier::stream_mode() ) tier_.stream_fill( layer - 3, stream );   // tier layers are the MoE layers from 3 on
-			// Replicated Top-K Router: 288 experts, top-8 selection evaluated on all ranks
-			engine::modules::MoERouter::route_topk(
-				norm_hidden_, lw.router_weights, lw.e_score_bias,
-				state_.d_topk_indices, state_.d_topk_weights,
-				H, config_.num_experts, config_.top_k, 2.5f, stream, m
-			);
-			static const std::string& dump_path = runtime::options().route_dump;
-			if ( !dump_path.empty() && rank_ == 0 && m > pod::MAX_BATCH ) {
-				// Debug (route_dump): {layer, rows, first position, K}, the rows' expert ids (int32), the router's input rows (FP16)
-				const int K = config_.top_k;
-				std::vector<int> ids( static_cast<size_t>( m ) * K );
-				std::vector<backend::half_t> xr( static_cast<size_t>( m ) * H );
-				backend::stream_sync( stream );
-				backend::memcpy_async( ids.data(), state_.d_topk_indices, ids.size() * sizeof( int ), backend::Copy::D2H, stream );
-				backend::memcpy_async( xr.data(), norm_hidden_.data, xr.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
-				backend::stream_sync( stream );
-				if ( FILE* f = std::fopen( dump_path.c_str(), "ab" ) ) {
-					const int hdr[4] = { layer, m, key_hint_ - m, K };
-					std::fwrite( hdr, sizeof( int ), 4, f );
-					std::fwrite( ids.data(), sizeof( int ), ids.size(), f );
-					std::fwrite( xr.data(), sizeof( backend::half_t ), xr.size(), f );
-					std::fclose( f );
-				}
-			}
-			static const std::string& replay_path = runtime::options().route_replay;
-			if ( !replay_path.empty() && m > pod::MAX_BATCH ) {
-				// Debug: overwrite the routing of rows that have a record (key layer * 2^20 + position)
-				static std::unordered_map<int64_t, std::pair<std::array<int, 16>, std::array<backend::half_t, 16>>> table;
-				static bool loaded = false;
-				const int K = config_.top_k;
-				if ( !loaded ) {
-					loaded = true;
-					if ( FILE* f = std::fopen( replay_path.c_str(), "rb" ) ) {
-						int hdr[3];
-						while ( std::fread( hdr, sizeof( int ), 3, f ) == 3 ) {
-							std::vector<int> ids( static_cast<size_t>( hdr[1] ) * K );
-							std::vector<backend::half_t> wts( ids.size() );
-							if ( std::fread( ids.data(), sizeof( int ), ids.size(), f ) != ids.size() || std::fread( wts.data(), sizeof( backend::half_t ), wts.size(), f ) != wts.size() ) break;
-							for ( int r = 0; r < hdr[1]; ++r ) {
-								auto& e = table[( static_cast<int64_t>( hdr[0] ) << 20 ) + hdr[2] + r];
-								for ( int k = 0; k < K; ++k ) { e.first[k] = ids[static_cast<size_t>( r ) * K + k]; e.second[k] = wts[static_cast<size_t>( r ) * K + k]; }
-							}
-						}
+			if ( ( phase & kPhaseExperts ) && tier_.active() && engine::modules::ExpertTier::stream_mode() ) tier_.stream_fill( layer - 3, stream );   // tier layers are the MoE layers from 3 on
+			if ( phase & kPhaseRoute ) {
+				// Replicated Top-K Router: 288 experts, top-8 selection evaluated on all ranks
+				engine::modules::MoERouter::route_topk(
+					norm_hidden_, lw.router_weights, lw.e_score_bias,
+					state_.d_topk_indices, state_.d_topk_weights,
+					H, config_.num_experts, config_.top_k, 2.5f, stream, m
+				);
+				static const std::string& dump_path = runtime::options().route_dump;
+				if ( !dump_path.empty() && rank_ == 0 && m > pod::MAX_BATCH ) {
+					// Debug (route_dump): {layer, rows, first position, K}, the rows' expert ids (int32), the router's input rows (FP16)
+					const int K = config_.top_k;
+					std::vector<int> ids( static_cast<size_t>( m ) * K );
+					std::vector<backend::half_t> xr( static_cast<size_t>( m ) * H );
+					backend::stream_sync( stream );
+					backend::memcpy_async( ids.data(), state_.d_topk_indices, ids.size() * sizeof( int ), backend::Copy::D2H, stream );
+					backend::memcpy_async( xr.data(), norm_hidden_.data, xr.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+					backend::stream_sync( stream );
+					if ( FILE* f = std::fopen( dump_path.c_str(), "ab" ) ) {
+						const int hdr[4] = { layer, m, key_hint_ - m, K };
+						std::fwrite( hdr, sizeof( int ), 4, f );
+						std::fwrite( ids.data(), sizeof( int ), ids.size(), f );
+						std::fwrite( xr.data(), sizeof( backend::half_t ), xr.size(), f );
 						std::fclose( f );
 					}
-					LOG_INFO( "route replay: %zu records\n", table.size() );
 				}
-				std::vector<int> ids( static_cast<size_t>( m ) * K );
-				std::vector<backend::half_t> wts( ids.size() );
-				backend::stream_sync( stream );
-				backend::memcpy_async( ids.data(), state_.d_topk_indices, ids.size() * sizeof( int ), backend::Copy::D2H, stream );
-				backend::memcpy_async( wts.data(), state_.d_topk_weights, wts.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
-				backend::stream_sync( stream );
-				for ( int r = 0; r < m; ++r ) {
-					const auto it = table.find( ( static_cast<int64_t>( layer ) << 20 ) + key_hint_ - m + r );
-					if ( it == table.end() ) continue;
-					for ( int k = 0; k < K; ++k ) { ids[static_cast<size_t>( r ) * K + k] = it->second.first[k]; wts[static_cast<size_t>( r ) * K + k] = it->second.second[k]; }
+				static const std::string& replay_path = runtime::options().route_replay;
+				if ( !replay_path.empty() && m > pod::MAX_BATCH ) {
+					// Debug: overwrite the routing of rows that have a record (key layer * 2^20 + position)
+					static std::unordered_map<int64_t, std::pair<std::array<int, 16>, std::array<backend::half_t, 16>>> table;
+					static bool loaded = false;
+					const int K = config_.top_k;
+					if ( !loaded ) {
+						loaded = true;
+						if ( FILE* f = std::fopen( replay_path.c_str(), "rb" ) ) {
+							int hdr[3];
+							while ( std::fread( hdr, sizeof( int ), 3, f ) == 3 ) {
+								std::vector<int> ids( static_cast<size_t>( hdr[1] ) * K );
+								std::vector<backend::half_t> wts( ids.size() );
+								if ( std::fread( ids.data(), sizeof( int ), ids.size(), f ) != ids.size() || std::fread( wts.data(), sizeof( backend::half_t ), wts.size(), f ) != wts.size() ) break;
+								for ( int r = 0; r < hdr[1]; ++r ) {
+									auto& e = table[( static_cast<int64_t>( hdr[0] ) << 20 ) + hdr[2] + r];
+									for ( int k = 0; k < K; ++k ) { e.first[k] = ids[static_cast<size_t>( r ) * K + k]; e.second[k] = wts[static_cast<size_t>( r ) * K + k]; }
+								}
+							}
+							std::fclose( f );
+						}
+						LOG_INFO( "route replay: %zu records\n", table.size() );
+					}
+					std::vector<int> ids( static_cast<size_t>( m ) * K );
+					std::vector<backend::half_t> wts( ids.size() );
+					backend::stream_sync( stream );
+					backend::memcpy_async( ids.data(), state_.d_topk_indices, ids.size() * sizeof( int ), backend::Copy::D2H, stream );
+					backend::memcpy_async( wts.data(), state_.d_topk_weights, wts.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+					backend::stream_sync( stream );
+					for ( int r = 0; r < m; ++r ) {
+						const auto it = table.find( ( static_cast<int64_t>( layer ) << 20 ) + key_hint_ - m + r );
+						if ( it == table.end() ) continue;
+						for ( int k = 0; k < K; ++k ) { ids[static_cast<size_t>( r ) * K + k] = it->second.first[k]; wts[static_cast<size_t>( r ) * K + k] = it->second.second[k]; }
+					}
+					backend::memcpy_async( state_.d_topk_indices, ids.data(), ids.size() * sizeof( int ), backend::Copy::H2D, stream );
+					backend::memcpy_async( state_.d_topk_weights, wts.data(), wts.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
+					backend::stream_sync( stream );
 				}
-				backend::memcpy_async( state_.d_topk_indices, ids.data(), ids.size() * sizeof( int ), backend::Copy::H2D, stream );
-				backend::memcpy_async( state_.d_topk_weights, wts.data(), wts.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
-				backend::stream_sync( stream );
-			}
-			if ( !trace_path.empty() && rank_ == 0 && m > pod::MAX_BATCH ) {
-				// Debug: every row's selected experts and weights (header: layer, rows, first position)
-				const size_t n = static_cast<size_t>( m ) * config_.top_k;
-				std::vector<int> ids( n );
-				std::vector<backend::half_t> wts( n );
-				backend::stream_sync( stream );
-				backend::memcpy_async( ids.data(), state_.d_topk_indices, n * sizeof( int ), backend::Copy::D2H, stream );
-				backend::memcpy_async( wts.data(), state_.d_topk_weights, n * sizeof( backend::half_t ), backend::Copy::D2H, stream );
-				backend::stream_sync( stream );
-				if ( FILE* f = std::fopen( ( trace_path + ".route" ).c_str(), "ab" ) ) {
-					const int hdr[3] = { layer, m, key_hint_ - m };
-					std::fwrite( hdr, sizeof( int ), 3, f );
-					std::fwrite( ids.data(), sizeof( int ), n, f );
-					std::fwrite( wts.data(), sizeof( backend::half_t ), n, f );
-					std::fclose( f );
+				if ( !trace_path.empty() && rank_ == 0 && m > pod::MAX_BATCH ) {
+					// Debug: every row's selected experts and weights (header: layer, rows, first position)
+					const size_t n = static_cast<size_t>( m ) * config_.top_k;
+					std::vector<int> ids( n );
+					std::vector<backend::half_t> wts( n );
+					backend::stream_sync( stream );
+					backend::memcpy_async( ids.data(), state_.d_topk_indices, n * sizeof( int ), backend::Copy::D2H, stream );
+					backend::memcpy_async( wts.data(), state_.d_topk_weights, n * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+					backend::stream_sync( stream );
+					if ( FILE* f = std::fopen( ( trace_path + ".route" ).c_str(), "ab" ) ) {
+						const int hdr[3] = { layer, m, key_hint_ - m };
+						std::fwrite( hdr, sizeof( int ), 3, f );
+						std::fwrite( ids.data(), sizeof( int ), n, f );
+						std::fwrite( wts.data(), sizeof( backend::half_t ), n, f );
+						std::fclose( f );
+					}
 				}
+
 			}
 
 				// Shared expert: every rank runs its slice (the partial outputs meet in the all-reduce below), or rank 0 the whole of it. Decode rows on
@@ -1858,50 +1954,58 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 			const bool shared_here = lw.has_shared_expert && ( lw.shared_sliced || rank_ == 0 );
 			const bool overlap = shared_here && side_stream_ != nullptr && m <= pod::MAX_BATCH && engine::modules::MoE::fused_decode( lw.moe_weights, state_.moe, m );
 			backend::stream_t sh_stream = overlap ? side_stream_ : stream;
-			if ( overlap ) backend::stream_fork( stream, sh_stream );
-			if ( shared_here ) {
-				pod::TensorView sh_g = moe_gate_buf_, sh_u = moe_up_buf_, sh_i = moe_inter_buf_;
-				const int sh_n = lw.shared_sliced ? config_.intermediate_size / config_.tp_size : config_.intermediate_size;
-				sh_g.shape[1] = sh_u.shape[1] = sh_i.shape[1] = sh_n;
-				engine::modules::Linear::forward(
-					norm_hidden_, lw.shared_expert.gate, sh_g, sh_stream
-				);
-				engine::modules::Linear::forward(
-					norm_hidden_, lw.shared_expert.up, sh_u, sh_stream
-				);
-				engine::modules::SwiGLU::forward( sh_g, sh_u, sh_i, sh_stream, 10.0f );
-				hessian( layer, 3, sh_i.data, 2048, m, sh_stream );
-				engine::modules::Linear::forward(
-					sh_i, lw.shared_expert.down, moe_expert_out_, sh_stream
-				);
+			if ( phase & kPhaseShared ) {
+				if ( overlap ) backend::stream_fork( stream, sh_stream );
+				if ( shared_here ) {
+					pod::TensorView sh_g = moe_gate_buf_, sh_u = moe_up_buf_, sh_i = moe_inter_buf_;
+					const int sh_n = lw.shared_sliced ? config_.intermediate_size / config_.tp_size : config_.intermediate_size;
+					sh_g.shape[1] = sh_u.shape[1] = sh_i.shape[1] = sh_n;
+					engine::modules::Linear::forward(
+						norm_hidden_, lw.shared_expert.gate, sh_g, sh_stream
+					);
+					engine::modules::Linear::forward(
+						norm_hidden_, lw.shared_expert.up, sh_u, sh_stream
+					);
+					engine::modules::SwiGLU::forward( sh_g, sh_u, sh_i, sh_stream, 10.0f );
+					hessian( layer, 3, sh_i.data, 2048, m, sh_stream );
+					engine::modules::Linear::forward(
+						sh_i, lw.shared_expert.down, moe_expert_out_, sh_stream
+					);
+				}
+
 			}
 
 				// Routed experts in this rank's partition: device-resident dispatch, no host sync. A prefill chunk reads the layer's cold experts from device
 				// scratch, copied a layer ahead
-			const bool staged = m > pod::MAX_BATCH && tier_.prefill_staging() && tier_.stage_begin( layer - 3, stream );
-			if ( staged && layer + 1 < config_.num_layers ) tier_.stage_prefetch( layer - 2, stream );
-			engine::modules::MoE::forward(
-				norm_hidden_, lw.moe_weights,
-				state_.d_topk_indices, state_.d_topk_weights,
-				local_moe_out_, start_expert, end_expert,
-				state_.moe, 10.0f, stream
-			);
-			if ( staged ) tier_.stage_end( layer - 3, stream );
-			if ( overlap ) backend::stream_join( stream, sh_stream );
-
-			if ( shared_here ) {
-				engine::modules::MoERouter::accumulate(
-					local_moe_out_.ptr<backend::half_t>(),
-					moe_expert_out_.ptr<const backend::half_t>(),
-					backend::from_float_half( 1.0f ),
-					m * H,
-					stream
+			if ( phase & kPhaseExperts ) {
+				const bool staged = m > pod::MAX_BATCH && tier_.prefill_staging() && tier_.stage_begin( layer - 3, stream );
+				if ( staged && layer + 1 < config_.num_layers ) tier_.stage_prefetch( layer - 2, stream );
+				engine::modules::MoE::forward(
+					norm_hidden_, lw.moe_weights,
+					state_.d_topk_indices, state_.d_topk_weights,
+					local_moe_out_, start_expert, end_expert,
+					state_.moe, 10.0f, stream
 				);
+				if ( staged ) tier_.stage_end( layer - 3, stream );
+				if ( overlap ) backend::stream_join( stream, sh_stream );
+
 			}
 
-				// Sum local expert contributions across NVLink mesh
-			if ( ring_ && !fuse_ffn_reduce ) {
-				ring_->all_reduce( local_moe_out_, stream );
+			if ( phase & kPhaseCombine ) {
+				if ( shared_here ) {
+					engine::modules::MoERouter::accumulate(
+						local_moe_out_.ptr<backend::half_t>(),
+						moe_expert_out_.ptr<const backend::half_t>(),
+						backend::from_float_half( 1.0f ),
+						m * H,
+						stream
+					);
+				}
+
+					// Sum local expert contributions across NVLink mesh
+				if ( ring_ && !fuse_ffn_reduce ) {
+					ring_->all_reduce( local_moe_out_, stream );
+				}
 			}
 		}
 		else {

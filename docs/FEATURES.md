@@ -49,6 +49,7 @@ The model type is read from the checkpoint, never configured. Anything else is a
 | Flash-Next QSA block selection past 2048 tokens of context | default | `qsa_off` (debug, dense) | `test_sparse_attn`, `test_ops_flash` |
 | Context window per slot | default 32K (Qwen), 12K (GLM) | `max_seq`, `max_slots` | `test_longctx`, `test_long_context` |
 | Prefix cache: snapshots in pinned host RAM as a tree keyed by exact token prefixes, automatic checkpoints inside long prompts | default | `prefix_cache_gib`, `prefix_interval` | `test_prefix_restore`, `tests/4_server/test_api.sh` |
+| GLM prefill of several 512-row chunks layer by layer, the routed experts running once over all their rows | opt-in | `prefill_window` | `needle_glm_window` (gate) |
 | Chunked prefill interleaved with the other slots' decode steps; `prefill_budget_ms` sizes each piece from its measured time so a decoding request waits about that long | default | `prefill_chunk`, `prefill_budget_ms` | `test_prefill_equiv`, `test_server.sh` |
 | CUDA graphs for decode, one per row count | default | `no_graphs` (debug) | `test_coherence` |
 | Side streams: independent chains of a decode layer run side by side (GLM: shared expert beside the MoE, KDA gate projections, the MLA kv, indexer-key and indexer-query chains; Flash-Next: shared expert, GDN z and gate projections, attention k / v projections and the QSA indexer); NVFP4 and FP16 projections only, trellis ones share one workspace per device | default | `side_streams` (A/B) | `test_glm_rows` with the option on and off |

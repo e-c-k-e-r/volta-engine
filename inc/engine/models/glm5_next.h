@@ -157,6 +157,8 @@ public:
 
 	void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) override;
 	void forward( const pod::BatchRows& rows, backend::stream_t stream = nullptr ) override;
+	int window_chunks() const override { return window_; }
+	void forward_window( const int* tokens, const pod::BatchRows* chunks, int n, backend::stream_t stream = nullptr ) override;
 	void sample_tokens( int* out_preds, int count, backend::stream_t stream = nullptr ) override;
 	bool sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream = nullptr ) override;
 	bool topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream = nullptr ) override;
@@ -216,10 +218,14 @@ private:
 	// Layer stack over m rows at once: embed_rows_[0..m) -> logits_[0..m); slot and position of each row are
 	// read from d_rows_ on device so the launch sequence depends on m alone and is graph-replayable
 	void forward_body( int m, backend::stream_t stream );
+	void forward_head( int m, backend::stream_t stream );   // hyper-head mean, final norm, LM head over hidden_streams_
 	// One decoder layer over the m rows of hidden_streams_ (mHC layers) or hidden_states_ (the MTP head's, which has no hyper-connection);
 	// `layer` picks the recurrent and latent state (45 = the MTP head's MLA layer, the last latent slot)
 	// phase: which parts of the layer run (a mask of the three below); the window prefill runs them apart
-	enum : int { kPhaseFront = 1, kPhaseFfn = 2, kPhasePost = 4, kPhaseAll = 7 };
+	// The FFN part is four steps (router, shared expert, routed experts, accumulate and reduce) so a window prefill can run the routed experts once
+	// over several chunks
+	enum : int { kPhaseFront = 1, kPhaseRoute = 2, kPhasePost = 4, kPhaseShared = 8, kPhaseExperts = 16, kPhaseCombine = 32,
+		kPhaseFfn = kPhaseRoute | kPhaseShared | kPhaseExperts | kPhaseCombine, kPhaseAll = kPhaseFront | kPhaseFfn | kPhasePost };
 	void layer_body( int layer, Glm5NextLayerWeights& lw, int m, backend::stream_t stream, int phase = kPhaseAll );
 	void set_rows( int m );
 
@@ -355,6 +361,15 @@ private:
 	pod::TensorView moe_inter_buf_;
 	pod::TensorView moe_expert_out_;
 	pod::TensorView local_moe_out_;
+	// Window prefill (prefill_window > 1): per-chunk residual streams beyond the first, the window's normed FFN input and routed output, its router
+	// results, and the per-chunk mHC post/comb weights that live from the FFN's input to its update
+	int window_ = 1;
+	float* win_hs_ = nullptr;                 // [(window_ - 1) * 4 * MAX_ROWS, hidden] FP32
+	pod::TensorView win_norm_, win_moe_out_;  // [window_ * MAX_ROWS, hidden] FP16
+	int* win_topk_idx_ = nullptr;
+	backend::half_t* win_topk_w_ = nullptr;
+	float* win_post_ = nullptr;               // [window_, 4 * MAX_ROWS]
+	float* win_comb_ = nullptr;               // [window_, 4 * MAX_ROWS, 4]
 	pod::TensorView ffn_out_;
 
 	// Model level

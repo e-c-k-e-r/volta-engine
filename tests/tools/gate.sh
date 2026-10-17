@@ -143,6 +143,7 @@ needles() {
 	run needle_qwen_spec gpu ./test_longctx --spec --tokens 8000 --depth 70
 	run needle_glm gpu ./test_longctx --glm --tokens 8000 --depth 50
 	run needle_glm_spec gpu ./test_longctx --glm --spec --tokens 8000 --depth 30
+	ENGINE_PREFILL_WINDOW=4 run needle_glm_window gpu ./test_longctx --glm --tokens 14000 --depth 10
 	run needle_flash gpu ./test_longctx --flash --tokens 8000 --depth 50
 	run needle_flash_qsa gpu ./test_longctx --flash --tokens 12000 --depth 40
 }

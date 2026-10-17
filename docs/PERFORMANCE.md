@@ -45,6 +45,16 @@ Time to first token for a cold prompt (no prefix cache), which is the prefill ti
 | Flash-Next | | 5.0 s | |
 | GLM-5.3-Flash | 5.2 s | 10.0 s | 68 s (256K configuration) |
 
+GLM-5.3-Flash prefill with `prefill_window`, 8192 tokens, 512-row chunks, all experts resident, 4-bit latent cache, 250 W: the routed experts of a layer run once over the window's rows instead of once per chunk.
+
+| `prefill_window` | Prefill | Buffers added (rank 0) |
+|---|---|---|
+| off | 842 tok/s | |
+| 2 | 943 tok/s | 0.08 GiB |
+| 4 | 1004 tok/s | 0.22 GiB |
+
+A window changes the rounding of the batched expert kernels the way a different chunk size does: the logits move by the amount two chunk sizes differ by (about 0.7 on the top logit at 1400 tokens), and needles at 14K (depths 10 and 90) and 100K pass with a window of 4 (prefill 990 and 906 tok/s at those lengths).
+
 ### Concurrent requests
 
 GLM-5.3-Flash, `configs/glm_256k.json` settings with all experts resident, `max_slots=4`, `kv_pool=262144` (one pool shared by the slots), DFlash2 drafter, 250 W, greedy.
