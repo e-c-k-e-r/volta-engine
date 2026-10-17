@@ -261,6 +261,28 @@ int DFlash2Runner::draft_block( int slot, int anchor, int pos, float depth_thres
 	return active;
 }
 
+void DFlash2Runner::offer_draft( int slot, const int* tokens, int n ) {
+	constexpr int K = models::kDraftM - 1;
+	if ( slot < 0 || slot >= kMaxSlots ) return;
+	offer_n_[slot] = MIN( MAX( n, 0 ), K );
+	for ( int i = 0; i < offer_n_[slot]; ++i ) offer_tok_[slot][i] = tokens[i];
+}
+
+int DFlash2Runner::round_block( int slot, int anchor, int pos, float depth_threshold, int* h_draft, bool* offered ) {
+	*offered = false;
+	if ( slot >= 0 && slot < kMaxSlots && offer_n_[slot] > 0 ) {
+		const int n = offer_n_[slot];
+		offer_n_[slot] = 0;
+		// The offered tokens follow the anchor; the target verifies them like the drafter's. The tap ring of the skipped rounds is
+		// written by the verify forward, so the drafter's context stays whole.
+		h_draft[0] = anchor;
+		for ( int i = 0; i < n; ++i ) h_draft[1 + i] = offer_tok_[slot][i];
+		*offered = true;
+		return MIN( n, mc_->metadata().max_seq_len - pos - 2 );
+	}
+	return draft_block( slot, anchor, pos, depth_threshold, h_draft );
+}
+
 SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_threshold,
 	const SamplingParams* sp, Rng* rng ) {
 	ENGINE_ASSERT( owns( slot ), "DFlash2Runner::speculate: slot does not own the drafter context" );
@@ -276,7 +298,8 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	prof_t0_ = impl::now_ms();
 
 	int h_draft[M];
-	int active = draft_block( slot, anchor, pos, depth_threshold, h_draft );
+	bool offered = false;
+	int active = round_block( slot, anchor, pos, depth_threshold, h_draft, &offered );
 	if ( active < 1 ) {
 		// No room to verify a block: fall back to the target's own prediction for the anchor.
 		mc.forward( &anchor, 1, pos, slot );
@@ -318,7 +341,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	// probability of the draft token (speculative sampling against a point-mass proposal), else draw the
 	// correction from the target's distribution with that token removed.
 	for ( int k = 0; k < active; ++k ) {
-		++att_[k];
+		if ( !offered ) ++att_[k];
 		if ( sampled ) {
 			bool acc = false;
 			const int tok = spec_step( cs[k], *sp, cands[k], *rng, &acc );
@@ -331,11 +354,11 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 			res.emitted[res.emitted_count++] = preds[k]; // correction token
 			break;
 		}
-		++hit_[k];
+		if ( !offered ) ++hit_[k];
 		res.emitted[res.emitted_count++] = cands[k];
 		res.accepted++;
 	}
-	if ( diag_on_ && !sampled ) {
+	if ( diag_on_ && !sampled && !offered ) {
 		constexpr int kTop = models::kDraftTopK;
 		float hv[M * kTop];
 		int hi[M * kTop];
@@ -359,7 +382,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	}
 	// Per-step survival EMA, observed only where the step was proposed.
 	constexpr float kEma = 0.25f;
-	for ( int k = 0; k < res.proposed; ++k ) {
+	for ( int k = 0; k < res.proposed && !offered; ++k ) {
 		cond_[k] = ( 1.0f - kEma ) * cond_[k] + kEma * ( k < res.accepted ? 1.0f : 0.0f );
 	}
 	// Bonus token: the target's prediction just past the accepted prefix.
@@ -398,13 +421,14 @@ void DFlash2Runner::speculate_joint( int n, const int* slots, const int* anchors
 
 	// 1. Draft each slot's block in turn. A slot too close to the end of the context for a block takes a round of its own.
 	int hd[kMaxJoint][M], active[kMaxJoint], base[kMaxJoint], who[kMaxJoint], k = 0, total = 0;
+	bool offered[kMaxJoint] = {};
 	for ( int i = 0; i < n; ++i ) {
 		ENGINE_ASSERT( owns( slots[i] ), "DFlash2Runner::speculate_joint: slot does not own the drafter context" );
 		if ( poss[i] + K + 2 >= meta.max_seq_len ) {
 			out[i] = speculate( slots[i], anchors[i], poss[i], -1.0f, sps[i], rngs[i] );
 			continue;
 		}
-		active[k] = draft_block( slots[i], anchors[i], poss[i], -1.0f, hd[k] );
+		active[k] = round_block( slots[i], anchors[i], poss[i], -1.0f, hd[k], &offered[k] );
 		who[k] = i;
 		base[k] = total;
 		total += active[k] + 1;
@@ -445,7 +469,7 @@ void DFlash2Runner::speculate_joint( int n, const int* slots, const int* anchors
 		const int b = base[j], act = active[j];
 		res.proposed = act;
 		for ( int t = 0; t < act; ++t ) {
-			++att_[t];
+			if ( !offered[j] ) ++att_[t];
 			if ( sampled ) {
 				bool acc = false;
 				const int tok = spec_step( cs[b + t], *sps[i], cands[t], *rngs[i], &acc );
@@ -458,12 +482,12 @@ void DFlash2Runner::speculate_joint( int n, const int* slots, const int* anchors
 				res.emitted[res.emitted_count++] = vpred[b + t];
 				break;
 			}
-			++hit_[t];
+			if ( !offered[j] ) ++hit_[t];
 			res.emitted[res.emitted_count++] = cands[t];
 			res.accepted++;
 		}
 		constexpr float kEma = 0.25f;
-		for ( int t = 0; t < res.proposed; ++t ) cond_[t] = ( 1.0f - kEma ) * cond_[t] + kEma * ( t < res.accepted ? 1.0f : 0.0f );
+		for ( int t = 0; t < res.proposed && !offered[j]; ++t ) cond_[t] = ( 1.0f - kEma ) * cond_[t] + kEma * ( t < res.accepted ? 1.0f : 0.0f );
 		if ( res.accepted == act ) res.emitted[res.emitted_count++] = sampled ? sample_token( cs[b + act], *sps[i], *rngs[i] ) : vpred[b + act];
 		if ( res.accepted < act ) ++prof_.commits;
 		mc.commit_spec_rows( slots[i], b, b + res.accepted );

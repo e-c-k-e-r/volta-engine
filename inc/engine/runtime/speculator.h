@@ -33,6 +33,11 @@ public:
 	// correction / bonus token is drawn from the target's distribution.
 	virtual SpecResult speculate( int slot, int anchor, int pos, float depth_threshold, const SamplingParams* sp, Rng* rng ) = 0;
 
+	// Draft tokens from outside the speculator (a suffix match over the request's own text) for the slot's next round: used in place of drafting
+	// when n >= 1, then dropped. `n` is at most the speculator's block length
+	virtual void offer_draft( int slot, const int* tokens, int n ) { (void) slot; (void) tokens; (void) n; }
+	virtual bool takes_offered_draft() const { return false; }
+
 	// Joint rounds are on by default for this speculator (the option spec_joint overrides), and at most this many slots share one
 	virtual bool joint_default() const { return false; }
 	virtual int joint_max() const { return 1 << 20; }

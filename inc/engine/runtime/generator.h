@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/runtime/spec_controller.h"
+#include "engine/runtime/suffix_index.h"
 #include "engine/runtime/sampling.h"
 #include "engine/config.h"
 #include "engine/core/arena.h"
@@ -149,6 +150,7 @@ struct MonitorSnapshot {
 	uint64_t tokens_out = 0, tokens_prefilled = 0, prompt_tokens = 0, cached_tokens = 0;
 	uint64_t finished[4] = {};                  // by FinishReason
 	uint64_t spec_rounds = 0, spec_proposed = 0, spec_accepted = 0;
+	uint64_t suffix_rounds = 0, suffix_proposed = 0, suffix_accepted = 0;   // the rounds whose block came from a suffix match (also counted above)
 	double gap_ms[5] = {};                      // token-gap percentiles: p50 p90 p99 p999 max, over the last samples
 	double ttft_ms[3] = {};                     // p50 p90 p99 over the last requests
 	size_t gap_samples = 0;
@@ -211,6 +213,8 @@ private:
 		bool force_close = false;   // budget reached: close the reasoning block before the next step
 		std::string held_text;   // detokenized text withheld while it could still begin a stop string
 		std::vector<int> all_tokens;
+		SuffixIndex suffix;            // all_tokens indexed for spec_suffix
+		bool suffix_offered = false;   // this round's block was offered from the index
 		std::vector<int> key_tokens;   // prompt_tokens with image placeholders replaced by content keys (empty without images)
 		SlotMetrics metrics;
 		SpecController ctrl;
@@ -220,6 +224,9 @@ private:
 	void scheduler_loop();
 	void admit_pending();
 	void step_batch();
+	// Offers the slot's next speculation round the tokens that followed the last earlier occurrence of its current suffix (spec_suffix)
+	void offer_suffix( int s );
+	void note_round( int s, const SpecResult& r );
 	int adapt_steps_ = 0;
 	// Feeds up to `budget` prompt tokens of slot s (0 = all of them); true once the prompt is done and the first token is out
 	bool prefill_slot( int s, int budget );
@@ -266,6 +273,7 @@ private:
 	double sum_decode_tok_s_ = 0.0;
 	uint64_t completed_requests_ = 0;
 	uint64_t spec_proposals_ = 0;
+	uint64_t suffix_rounds_ = 0, suffix_proposed_ = 0, suffix_accepted_ = 0;
 	uint64_t spec_accepted_ = 0;
 
 	// Monitor state (metrics_mtx_ guards everything but the two atomics)

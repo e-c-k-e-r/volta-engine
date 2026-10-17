@@ -498,6 +498,34 @@ void Generator::apply_forced_close( int s ) {
 	}
 }
 
+void Generator::offer_suffix( int s ) {
+	Slot& slot = slots_[s];
+	slot.suffix_offered = false;
+	const int k = runtime::options().spec_suffix;
+	if ( k <= 0 || !cluster_.has_speculator() || !cluster_.speculator().takes_offered_draft() ) return;
+	slot.suffix.sync( slot.all_tokens, k );
+	int toks[8], len = 0;
+	// A match must reach k tokens (the index is hashed) and continue for a few: a short continuation would cost the drafter's longer block
+	constexpr int kMinTokens = 3;
+	const int n = slot.suffix.propose( 7, 64, toks, &len );
+	if ( n < kMinTokens || len < k ) {
+		cluster_.speculator().offer_draft( s, nullptr, 0 );
+		return;
+	}
+	cluster_.speculator().offer_draft( s, toks, n );
+	slot.suffix_offered = true;
+}
+
+void Generator::note_round( int s, const SpecResult& r ) {
+	Slot& slot = slots_[s];
+	if ( !slot.suffix_offered ) return;
+	slot.suffix_offered = false;
+	std::unique_lock<std::mutex> mlock( metrics_mtx_ );
+	suffix_rounds_++;
+	suffix_proposed_ += r.proposed;
+	suffix_accepted_ += r.accepted;
+}
+
 void Generator::step_batch() {
 	// Tiered experts: fold the routing since the last pass into the residency every so often (a device sync per rank)
 	const int adapt_every = runtime::options().expert_adapt_every;
@@ -613,6 +641,7 @@ void Generator::step_batch() {
 			sps[i] = &sl.sp;
 			rngs[i] = &sl.rng;
 		}
+		for ( int i = 0; i < ng; ++i ) offer_suffix( group[i] );
 		const auto t0 = std::chrono::steady_clock::now();
 		cluster_.speculator().speculate_joint( ng, group, anchors, poss, sps, rngs, res );
 		const double round_ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
@@ -623,6 +652,7 @@ void Generator::step_batch() {
 			const int s = group[i];
 			Slot& slot = slots_[s];
 			slot.ctrl.observe_spec( res[i].emitted_count, round_ms / ng );
+			note_round( s, res[i] );
 			slot.current_pos = res[i].next_pos;
 			slot.last_token = res[i].emitted[res[i].emitted_count - 1];
 			{
@@ -644,10 +674,12 @@ void Generator::step_batch() {
 		// causal verify block). A slot that lost ownership to a newer request decodes normally.
 		const int s = ids[0];
 		Slot& slot = slots_[s];
+		offer_suffix( s );
 		const auto t0 = std::chrono::steady_clock::now();
 		const SpecResult r = cluster_.speculate( s, slot.last_token, slot.current_pos, -1.0f, &slot.sp, &slot.rng );
 		const double round_ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
 		slot.ctrl.observe_spec( r.emitted_count, round_ms );
+		note_round( s, r );
 		if ( per_slot && round_ms > 0.0 ) spec_tok_ms_n_[1] = spec_tok_ms_n_[1] > 0.0 ? 0.8 * spec_tok_ms_n_[1] + 0.2 * ( r.emitted_count / round_ms ) : r.emitted_count / round_ms;
 		slot.current_pos = r.next_pos;
 		slot.last_token = r.emitted[r.emitted_count - 1];
@@ -856,6 +888,9 @@ MonitorSnapshot Generator::get_monitor() const {
 	m.spec_rounds = spec_rounds_;
 	m.spec_proposed = spec_proposals_;
 	m.spec_accepted = spec_accepted_;
+	m.suffix_rounds = suffix_rounds_;
+	m.suffix_proposed = suffix_proposed_;
+	m.suffix_accepted = suffix_accepted_;
 	for ( int s = 0; s < num_slots_; ++s ) m.slots.push_back( slot_view_[s] );
 	m.recent.assign( recent_.begin(), recent_.end() );
 	m.history.assign( history_.begin(), history_.end() );

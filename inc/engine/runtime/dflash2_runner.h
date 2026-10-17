@@ -50,11 +50,15 @@ public:
 	// (exact for a deterministic draft) and the correction / bonus token is drawn from the target's distribution.
 	SpecResult speculate( int slot, int anchor, int pos, float depth_threshold = -1.0f,
 		const SamplingParams* sp = nullptr, Rng* rng = nullptr ) override;
+	// The block of a round: the offered tokens when there are some (`offered` set), else the drafter's
+	int round_block( int slot, int anchor, int pos, float depth_threshold, int* h_draft, bool* offered );
 
 	// Per-step draft accuracy where the step was reached (the loop breaks at the first mismatch, so
 	// step k is sampled exactly when steps 0..k-1 were accepted).
 	// A joint round: every slot's block is drafted in turn (the drafter scratch is shared), then one target forward verifies all the blocks, so the
 	// experts and weights that rows of different slots share are read once. Needs the journaled KDA commit (spec_commit_always).
+	void offer_draft( int slot, const int* tokens, int n ) override;
+	bool takes_offered_draft() const override { return true; }
 	bool joint() const override;
 	bool joint_default() const override { return true; }
 	int joint_max() const override { return pod::MAX_BATCH / models::kDraftM; }
@@ -91,6 +95,8 @@ private:
 	static constexpr int kMaxSlots = 8;
 	bool per_slot_ = false;
 	bool owned_[kMaxSlots] = {};
+	int offer_n_[kMaxSlots] = {};          // draft tokens offered for the slot's next round (offer_draft)
+	int offer_tok_[kMaxSlots][8] = {};
 
 	int att_[8] = {};
 	int hit_[8] = {};

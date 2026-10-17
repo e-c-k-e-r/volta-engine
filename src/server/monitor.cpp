@@ -41,7 +41,8 @@ void VoltaServer::handle_api_stats( const ConnPtr& conn ) {
 		{ "ttft_ms", { mon.ttft_ms[0], mon.ttft_ms[1], mon.ttft_ms[2] } }, { "gap_hist", mon.gap_hist } };
 	j["speculation"] = { { "rounds", mon.spec_rounds }, { "proposed", mon.spec_proposed }, { "accepted", mon.spec_accepted },
 		{ "accept_rate", mon.spec_proposed ? static_cast<double>( mon.spec_accepted ) / mon.spec_proposed : 0.0 },
-		{ "tokens_per_round", mon.spec_rounds ? 1.0 + static_cast<double>( mon.spec_accepted ) / mon.spec_rounds : 0.0 } };
+		{ "tokens_per_round", mon.spec_rounds ? 1.0 + static_cast<double>( mon.spec_accepted ) / mon.spec_rounds : 0.0 },
+		{ "suffix", { { "rounds", mon.suffix_rounds }, { "proposed", mon.suffix_proposed }, { "accepted", mon.suffix_accepted } } } };
 	json slots = json::array();
 	for ( size_t i = 0; i < mon.slots.size(); ++i ) {
 		const auto& s = mon.slots[i];

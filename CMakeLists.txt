@@ -435,6 +435,9 @@ set_target_properties(test_rows PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_B
 add_executable(diag_logits tests/4_coherence/diag_logits.cpp)
 target_link_libraries(diag_logits PRIVATE engine_kernels pthread)
 set_target_properties(diag_logits PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(diag_glm_tie tests/4_coherence/diag_glm_tie.cpp)
+target_link_libraries(diag_glm_tie PRIVATE engine_kernels pthread)
+set_target_properties(diag_glm_tie PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Test routed MoE (persistent kernel) parity against per-expert reference
 add_executable(test_moe tests/2_parity/test_moe.cpp)
