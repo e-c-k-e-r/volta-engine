@@ -2,6 +2,7 @@
 #include "engine/backend/cuda/activation.cuh"
 #include "engine/backend/cuda/reduce.cuh"
 #include "engine/core/batch.h"
+#include "engine/runtime/options.h"
 #include <cuda_fp16.h>
 #include <cmath>
 #include <cstdlib>
@@ -349,6 +350,122 @@ void hc_collapse_norm_kernel(
 	}
 }
 
+// Prefill form of the mix partials: RB rows share each load of the mixing matrix fn (the one-row blocks above re-read all 24 x 16384 floats of it
+// per row, which is what bounds the kernel at 512 rows). Every row keeps the arithmetic of hc_mix_partials_body: the same per-thread order over its
+// columns, the same fused multiply-add chains and the same reductions, so the partials are bit-identical.
+template <int H, int M_, int RB>
+__global__ __launch_bounds__( NUM_THREADS_A )
+void hc_mix_partials_rows_kernel(
+	const float* __restrict__ streams,
+	const float* __restrict__ fn,
+	const int row_len,
+	const int chunk_cols,
+	const int rows
+) {
+	constexpr int M = M_;
+	const int r0 = blockIdx.y * RB;
+	const int c0 = blockIdx.x * chunk_cols;
+	const int c1 = min( c0 + chunk_cols, row_len );
+	const int row_len4 = row_len / 4;
+
+	float acc[RB][M + 1];
+	#pragma unroll
+	for ( int b = 0; b < RB; ++b ) {
+		#pragma unroll
+		for ( int k = 0; k <= M; ++k ) acc[b][k] = 0.0f;
+	}
+	for ( int c = c0 / 4 + threadIdx.x; c < c1 / 4; c += NUM_THREADS_A ) {
+		float4 sv[RB];
+		#pragma unroll
+		for ( int b = 0; b < RB; ++b ) {
+			sv[b] = ( r0 + b < rows ) ? ( (const float4*)( streams + static_cast<size_t>( r0 + b ) * row_len ) )[c] : make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
+			acc[b][M] = fmaf( sv[b].x, sv[b].x, acc[b][M] );
+			acc[b][M] = fmaf( sv[b].y, sv[b].y, acc[b][M] );
+			acc[b][M] = fmaf( sv[b].z, sv[b].z, acc[b][M] );
+			acc[b][M] = fmaf( sv[b].w, sv[b].w, acc[b][M] );
+		}
+		#pragma unroll
+		for ( int j = 0; j < M; ++j ) {
+			const float4 w = ((const float4*) fn)[static_cast<size_t>( j ) * row_len4 + c];
+			#pragma unroll
+			for ( int b = 0; b < RB; ++b ) {
+				const float d = fmaf( sv[b].x, w.x, fmaf( sv[b].y, w.y, fmaf( sv[b].z, w.z, sv[b].w * w.w ) ) );
+				acc[b][j] += d;
+			}
+		}
+	}
+
+	__shared__ float red[NUM_THREADS_A / 32][M + 1];
+	const int lane = threadIdx.x % 32;
+	const int warp = threadIdx.x / 32;
+	#pragma unroll
+	for ( int b = 0; b < RB; ++b ) {
+		#pragma unroll
+		for ( int k = 0; k <= M; ++k ) {
+			float v = acc[b][k];
+			for ( int offset = 16; offset > 0; offset >>= 1 ) {
+				v += __shfl_down_sync( 0xffffffffu, v, offset );
+			}
+			if ( lane == 0 && warp < NUM_THREADS_A / 32 ) red[warp][k] = v;
+		}
+		__syncthreads();
+		if ( warp == 0 && r0 + b < rows ) {
+			float* out = g_mhc_partials + ( static_cast<size_t>( r0 + b ) * gridDim.x + blockIdx.x ) * ( M + 1 );
+			for ( int k = lane; k <= M; k += 32 ) {
+				float v = 0.0f;
+				#pragma unroll
+				for ( int w = 0; w < NUM_THREADS_A / 32; ++w ) {
+					v += red[w][k];
+				}
+				out[k] = v;
+			}
+		}
+		__syncthreads();
+	}
+}
+
+// The rest of hc_collapse_norm_kernel for one row once its partials are written: finalize (sinkhorn, collapse) and the RMSNorm, as that kernel's last block does
+template <int H, int M_>
+__global__ __launch_bounds__( NUM_THREADS )
+void hc_finalize_norm_kernel(
+	const float* __restrict__ streams,
+	const float* __restrict__ base,
+	const float* __restrict__ scale,
+	const half* __restrict__ norm_w,
+	half* __restrict__ norm_out,
+	float* __restrict__ post,
+	float* __restrict__ comb,
+	float* __restrict__ inv_rms_buf,
+	float* __restrict__ mix_logits_buf,
+	float* __restrict__ pre_buf,
+	const int D,
+	const int chunksA,
+	const float rms_eps,
+	const float hc_eps,
+	const int sinkhorn_iters,
+	const float norm_eps,
+	const float norm_bias
+) {
+	extern __shared__ __align__( 16 ) unsigned char hcn_smem[];
+	half* s_col = reinterpret_cast<half*>( hcn_smem );
+	const int r = blockIdx.y;
+	hc_mix_finalize_body<H, M_, false, true>( 0, 0, streams, base, scale, post, comb, s_col, inv_rms_buf,
+		mix_logits_buf, pre_buf, D, chunksA, D, rms_eps, hc_eps, sinkhorn_iters );
+	__syncthreads();
+	const int tid = threadIdx.x;
+	float local_sq = 0.0f;
+	for ( int i = tid; i < D; i += NUM_THREADS ) {
+		const float v = __half2float( s_col[i] );
+		local_sq = fmaf( v, v, local_sq );
+	}
+	const float inv = rsqrtf( engine::math::block_sum<8>( local_sq ) / static_cast<float>( D ) + norm_eps );
+	half* dst = norm_out + static_cast<size_t>( r ) * D;
+	for ( int i = tid; i < D; i += NUM_THREADS ) {
+		const float w = __half2float( norm_w[i] ) + norm_bias;
+		dst[i] = __float2half_rn( __half2float( s_col[i] ) * w * inv );
+	}
+}
+
 template <int H, typename Y_T, bool HAS_COMB>
 __global__ __launch_bounds__( NUM_THREADS )
 void hc_apply_kernel(
@@ -598,6 +715,18 @@ bool HyperConnection::collapse_norm(
 	// The finalize reads exactly chunksA partials per row, and the collapsed row has to fit shared memory
 	if ( n_chunks_a != chunksA || hidden_size * static_cast<int>( sizeof( half ) ) > 48 * 1024 ) return false;
 	const size_t smem = static_cast<size_t>( hidden_size ) * sizeof( half );
+	if ( rows > pod::MAX_BATCH && runtime::options().hc_rows ) {
+		// Prefill: row-blocked partials, then the finalize and norm of each row (bit-identical to the fused kernel below)
+		constexpr int RB = 4;
+		hc_mix_partials_rows_kernel<4, 24, RB><<<dim3( n_chunks_a, ( rows + RB - 1 ) / RB ), NUM_THREADS_A, 0, stream>>>(
+			streams.ptr<const float>(), fn.ptr<const float>(), row_len, chunk_cols, rows );
+		hc_finalize_norm_kernel<4, 24><<<dim3( 1, rows ), NUM_THREADS, smem, stream>>>(
+			streams.ptr<const float>(), base.ptr<const float>(), scale.ptr<const float>(),
+			norm_weight.ptr<const half>(), norm_out.ptr<half>(), post_out.ptr<float>(), comb_out.ptr<float>(),
+			inv_rms_buf.ptr<float>(), mix_logits_buf.ptr<float>(), pre_buf.ptr<float>(),
+			hidden_size, n_chunks_a, 1e-5f, eps, sinkhorn_iters, norm_eps, norm_bias );
+		return true;
+	}
 	hc_collapse_norm_kernel<4, 24><<<dim3( n_chunks_a, rows ), NUM_THREADS, smem, stream>>>(
 		streams.ptr<const float>(), fn.ptr<const float>(), base.ptr<const float>(), scale.ptr<const float>(),
 		norm_weight.ptr<const half>(), norm_out.ptr<half>(), post_out.ptr<float>(), comb_out.ptr<float>(),
