@@ -58,6 +58,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `max_seq` | int | `0` | `ENGINE_MAX_SEQ` | context window per slot in tokens (sizes the KV pool); 0 = the model default (Qwen 32768, GLM 12288) |
 | `max_slots` | int | `0` | `ENGINE_MAX_SLOTS` | decode slots; 0 = the model default (Qwen 8, GLM 1) |
 | `prefix_cache_gib` | int | `16` | `ENGINE_PREFIX_CACHE_GIB` | pinned host RAM for the prefix cache (sequence snapshots); 0 = off |
+| `prefill_budget_ms` | float | `0` | `ENGINE_PREFILL_BUDGET_MS` | while other requests are decoding, the longest (ms) a prompt piece may run before the decoding requests step again: the piece size adapts between 64 and prefill_chunk rows from the measured piece time (a 512-row GLM piece takes about 610 ms, 256 rows 370, 128 rows 270; smaller pieces lower the prompt's speed); 0 = pieces of prefill_chunk rows |
 | `prefill_chunk` | int | `512` | `ENGINE_PREFILL_CHUNK` | prompt tokens a new request prefills per scheduler step while other requests are decoding (decode steps run between the pieces); 0 = the whole prompt at once |
 | `prefix_interval` | int | `16384` | `ENGINE_PREFIX_INTERVAL` | prompt tokens between automatic prefix checkpoints inside long prompts; 0 = only the requested ones |
 | `nvfp4_experts` | string | `(empty)` | `ENGINE_NVFP4_EXPERTS` | Flash-Next: directory of a modelopt NVFP4 checkpoint (same architecture) to load the routed experts from; everything else comes from the model directory. Empty = the model's own experts |
@@ -83,6 +84,8 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `dsa` | bool | `true` | `ENGINE_DSA` | GLM sparse attention indexer (top-2048 key selection); false attends densely |
 | `max_image_tokens` | int | `1024` | `ENGINE_MAX_IMAGE_TOKENS` | largest image the vision tower accepts, in language-model tokens (4 patches each; sizes its scratch and caps the resize); 0 = image input off |
 | `expert_stats` | bool | `true` | `ENGINE_EXPERT_STATS` | count the routes per expert for the monitor page (a device sync per rank about once a second while serving) |
+| `spec_depth` | float | `0` | `ENGINE_SPEC_DEPTH` | DFlash2: shorten each round's block where the drafter's recent per-position accuracy says the chance of reaching a position is below this (0 = always the whole block; 0.15 to 0.3 measured +3 to +5% on GLM) |
+| `spec_suffix` | int | `0` | `ENGINE_SPEC_SUFFIX` | DFlash2: propose the tokens that followed the last earlier occurrence of the current suffix of this request's prompt and output (copied text: file contents, tool arguments, identifiers) instead of drafting when that suffix matches at least this many tokens; 0 = always draft |
 | `spec_ctrl` | bool | `true` | `ENGINE_SPEC_CTRL` | adaptive speculation controller; false always speculates |
 | `mem_log` | bool | `false` | `ENGINE_MEM_LOG` | log the per-pipeline [mem] breakdown at startup (GLM: buffers by kind, weights by kind, drafter; Flash-Next: buffers, weights by kind); the arena summary lines stay on |
 | **Debug** | | | | |
@@ -109,6 +112,8 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `perturb_layers` | float | `0` | `ENGINE_DEBUG_PERTURB_LAYERS` | qwen4_exp: multiply the residual streams after every layer by 1 + eps * u (u hashed from position, stream, dim and layer): a model of per-layer rounding noise; eager prefill only |
 | `spec_ctrl_log` | bool | `false` | `ENGINE_DEBUG_SPEC_CTRL_LOG` | speculation controller decisions |
 | `draft_per_slot` | bool | `true` | `ENGINE_DEBUG_DRAFT_PER_SLOT` | DFlash2 on GLM: every slot keeps its own drafter context and tap ring, so several slots speculate; false keeps one context that the newest request takes over (A/B; slot 0 only) |
+| `spec_agg_dense` | int | `-1` | `ENGINE_DEBUG_SPEC_AGG_DENSE` | per-slot speculators with several requests decoding: -1 picks plain batched steps or speculative rounds from their measured rates, 0 always speculates, 1 always steps plainly (A/B) |
+| `spec_joint_max` | int | `2` | `ENGINE_DEBUG_SPEC_JOINT_MAX` | DFlash2 joint rounds: most slots verified together; their blocks share one forward of 16 rows, so with more than 2 the longest blocks are cut to fit (spec_depth shortens them first) |
 | `spec_joint` | int | `-1` | `ENGINE_DEBUG_SPEC_JOINT` | per-slot speculators: one verify forward for the blocks of the speculating slots (MTP: one draft chain too; measured no gain over one slot per round at 2 requests, up to ~+6-25% at 4; DFlash2: the blocks are drafted in turn and verified together); 1 on, 0 one slot per round, -1 the speculator's default (DFlash2 on, MTP off) |
 | `spec_interleave` | bool | `true` | `ENGINE_DEBUG_SPEC_INTERLEAVE` | speculators with a context per slot (MTP): interleave one slot's round per step; false steps all active slots plainly together while more than one decodes (A/B) |
 | `no_graphs` | bool | `false` | `ENGINE_DEBUG_NO_GRAPHS` | eager execution, no CUDA graphs |

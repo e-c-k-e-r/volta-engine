@@ -45,6 +45,45 @@ Time to first token for a cold prompt (no prefix cache), which is the prefill ti
 | Flash-Next | | 5.0 s | |
 | GLM-5.3-Flash | 5.2 s | 10.0 s | 68 s (256K configuration) |
 
+### Concurrent requests
+
+GLM-5.3-Flash, `configs/glm_256k.json` settings with all experts resident, `max_slots=4`, `kv_pool=262144` (one pool shared by the slots), DFlash2 drafter, 250 W, greedy.
+
+Several requests decoding at once, each a 8K-token prompt and 400 new tokens (`bench_serve.py --concurrency`):
+
+| Streams | Per stream, tok/s | Aggregate, tok/s | Step |
+|---|---|---|---|
+| 1 | 70.9 (plain), 87.4 with `spec_depth=0.25` | | 14.1 ms |
+| 2 | 53 to 55 | 106 to 109 | 16.9 ms |
+| 4 | 39 to 41 | 158 to 163 | 21.9 ms |
+
+With two or more requests decoding the controller steps them together plainly: four streams of copied code (700 tokens each) finish in 31.1 s that way, 29.4 to 30.3 s when speculation is forced (`spec_agg_dense=0`), and four prose streams finish in 17.6 s against 21.3 to 25.4 s forced.
+
+What the settings change, measured on one request (`bench_serve.py` style, greedy, 900 tokens, 1 to 2K-token prompts):
+
+| Setting | Case | Off | On |
+|---|---|---|---|
+| `spec_depth=0.25` | prose | 70.9 tok/s | 87.4 |
+| `spec_depth=0.25` | 170-line code edit | 133.0 | 138.0 |
+| `spec_suffix=8` | 75-line code edit | 171.8 | 192.0 |
+| `spec_suffix=8` | 170-line code edit | 130.0 | 205.7 |
+| `spec_suffix=8` | prose | 70.9 | 70.8 |
+
+A prompt of about 11K tokens arriving while another request decodes (`prefill_budget_ms`): the decoding request's 90th-percentile token gap and the new prompt's time to first token.
+
+| `prefill_budget_ms` | Token gap p90 | Prompt TTFT |
+|---|---|---|
+| 0 (512-row pieces) | 0.59 s | 8.2 s |
+| 300 | 0.33 s | 10.0 s |
+
+Settings for how many requests run at once:
+
+| Requests at once | `max_slots` | Other settings |
+|---|---|---|
+| 1 | 1 or 2 | `spec_depth=0.25`; `spec_suffix=8` when the output copies its input |
+| 2 | 2 | the same, `prefill_budget_ms=300` if token gaps matter more than prompt speed |
+| 3 to 4 | 4 | the same; the slots share the KV pool, so their contexts add up to `kv_pool` tokens |
+
 ## Step latency
 
 `build/bench_decode` replays the graph-captured decode body on real weights: a plain token, a block of 8 rows (what a speculative round verifies), and two slots decoding together. The context is 8 tokens or 8192 tokens.

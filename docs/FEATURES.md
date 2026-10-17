@@ -49,7 +49,7 @@ The model type is read from the checkpoint, never configured. Anything else is a
 | Flash-Next QSA block selection past 2048 tokens of context | default | `qsa_off` (debug, dense) | `test_sparse_attn`, `test_ops_flash` |
 | Context window per slot | default 32K (Qwen), 12K (GLM) | `max_seq`, `max_slots` | `test_longctx`, `test_long_context` |
 | Prefix cache: snapshots in pinned host RAM as a tree keyed by exact token prefixes, automatic checkpoints inside long prompts | default | `prefix_cache_gib`, `prefix_interval` | `test_prefix_restore`, `tests/4_server/test_api.sh` |
-| Chunked prefill interleaved with the other slots' decode steps | default | `prefill_chunk` | `test_prefill_equiv`, `test_server.sh` |
+| Chunked prefill interleaved with the other slots' decode steps; `prefill_budget_ms` sizes each piece from its measured time so a decoding request waits about that long | default | `prefill_chunk`, `prefill_budget_ms` | `test_prefill_equiv`, `test_server.sh` |
 | CUDA graphs for decode, one per row count | default | `no_graphs` (debug) | `test_coherence` |
 | Side streams: independent chains of a decode layer run side by side (GLM: shared expert beside the MoE, KDA gate projections, the MLA kv, indexer-key and indexer-query chains; Flash-Next: shared expert, GDN z and gate projections, attention k / v projections and the QSA indexer); NVFP4 and FP16 projections only, trellis ones share one workspace per device | default | `side_streams` (A/B) | `test_glm_rows` with the option on and off |
 | One kernel for the all-reduce and the hyper-connection post-step (GLM, rows up to 8) | default | `hc_fuse` (A/B) | `test_all_reduce` (bit-identical to the two launches) |
@@ -68,6 +68,8 @@ Validated contexts:
 |---|---|---|---|
 | DFlash2 drafter (Qwen, GLM), verified in one forward (per-row recurrent-state snapshots; GLM journals the KDA rows and replays the accepted ones), a context and tap ring per slot on GLM | opt-in | `--speculative`, `--draft-model-dir`, `draft_tp` | `test_dflash*`, `test_spec_state`, `test_spec_target_equiv`, `test_coherence` |
 | MTP: the checkpoint's own head (Qwen, Flash-Next, GLM) | opt-in | `speculator=mtp`, `mtp_depth` | `test_mtp` |
+| DFlash2 blocks shortened where the drafter's recent per-position accuracy makes the later rows unlikely to be reached | opt-in | `spec_depth` | `bench_accept --depths` |
+| DFlash2 rounds whose block is the continuation of the last earlier occurrence of the current suffix of the request's own text (copied code, tool arguments), no draft pass | opt-in | `spec_suffix` | |
 | Adaptive controller that falls back to plain decode when speculation loses | default | `spec_ctrl` | `bench_accept`, `bench_spec` |
 | One verify forward for the blocks of all speculating slots (DFlash2: on, drafted in turn; MTP: off, one draft chain too) | on (DFlash2) | `spec_joint` | `test_api.sh` |
 
