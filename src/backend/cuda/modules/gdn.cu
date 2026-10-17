@@ -1,6 +1,7 @@
 #include "engine/modules/gdn.h"
 #include "engine/backend/cuda/activation.cuh"
 #include "engine/backend/cuda/reduce.cuh"
+#include "engine/runtime/options.h"
 #include <cuda_fp16.h>
 #include <cmath>
 
@@ -616,6 +617,178 @@ __global__ void project_kda_stage2_kernel(
 	}
 }
 
+// Prefill forms of the two projection kernels above: RB rows share each load of a weight row (the one-row kernels re-read all the weights per
+// row, which bounds them at 512 rows). Every row keeps the one-row kernels' arithmetic and reduction order, so the results are bit-identical.
+template <int RB>
+__global__ void project_kda_stage1_rows_kernel(
+	const half* __restrict__ norm_hidden,
+	const half* __restrict__ b_proj,
+	const half* __restrict__ f_a_proj,
+	const half* __restrict__ g_a_proj,
+	float* __restrict__ beta_out,
+	half* __restrict__ f_a_buf,
+	half* __restrict__ g_a_buf,
+	int hidden_size,
+	int num_heads,
+	int rows
+) {
+	int row = blockIdx.x;
+	if ( row >= num_heads + 256 ) return;
+	const int r0 = blockIdx.y * RB;
+
+	const half* weight_row = nullptr;
+	if ( row < num_heads ) {
+		if ( b_proj == nullptr ) return;
+		weight_row = b_proj + row * hidden_size;
+	}
+	else if ( row < num_heads + 128 ) {
+		if ( f_a_proj == nullptr ) return;
+		weight_row = f_a_proj + ( row - num_heads ) * hidden_size;
+	}
+	else {
+		if ( g_a_proj == nullptr ) return;
+		weight_row = g_a_proj + ( row - num_heads - 128 ) * hidden_size;
+	}
+
+	int tid = threadIdx.x;
+	float sum[RB];
+	#pragma unroll
+	for ( int b = 0; b < RB; ++b ) sum[b] = 0.0f;
+
+	const float4* w4 = reinterpret_cast<const float4*>( weight_row );
+	int num_float4 = hidden_size / 8;
+
+	for ( int i = tid; i < num_float4; i += blockDim.x ) {
+		const float4 vw = w4[i];
+		const half2* hw = reinterpret_cast<const half2*>( &vw );
+		#pragma unroll
+		for ( int b = 0; b < RB; ++b ) {
+			float4 vx = make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
+			if ( r0 + b < rows ) vx = reinterpret_cast<const float4*>( norm_hidden + static_cast<size_t>( r0 + b ) * hidden_size )[i];
+			const half2* hx = reinterpret_cast<const half2*>( &vx );
+			#pragma unroll
+			for ( int j = 0; j < 4; ++j ) {
+				float2 fx = __half22float2( hx[j] );
+				float2 fw = __half22float2( hw[j] );
+				sum[b] = fmaf( fx.x, fw.x, sum[b] );
+				sum[b] = fmaf( fx.y, fw.y, sum[b] );
+			}
+		}
+	}
+
+	__shared__ float s_warp_sums[RB][8];
+	int warp_id = tid >> 5;
+	int lane_id = tid & 31;
+	#pragma unroll
+	for ( int b = 0; b < RB; ++b ) {
+		const float t = engine::math::warp_sum( sum[b] );
+		if ( lane_id == 0 ) s_warp_sums[b][warp_id] = t;
+	}
+	__syncthreads();
+
+	if ( warp_id == 0 ) {
+		#pragma unroll
+		for ( int b = 0; b < RB; ++b ) {
+			float b_sum = ( lane_id < ( blockDim.x >> 5 ) ) ? s_warp_sums[b][lane_id] : 0.0f;
+			b_sum = engine::math::warp_sum<4>( b_sum );
+			if ( lane_id == 0 && r0 + b < rows ) {
+				const int rr = r0 + b;
+				if ( row < num_heads ) {
+					beta_out[rr * num_heads + row] = engine::math::sigmoid( b_sum );
+				}
+				else if ( row < num_heads + 128 ) {
+					f_a_buf[rr * 128 + row - num_heads] = __float2half_rn( b_sum );
+				}
+				else {
+					g_a_buf[rr * 128 + row - num_heads - 128] = __float2half_rn( b_sum );
+				}
+			}
+		}
+	}
+}
+
+template <int RB>
+__global__ void project_kda_stage2_rows_kernel(
+	const half* __restrict__ f_a_buf,
+	const half* __restrict__ g_a_buf,
+	const half* __restrict__ f_b_proj,
+	const half* __restrict__ g_b_proj,
+	const half* __restrict__ A_log,
+	const half* __restrict__ dt_bias,
+	float* __restrict__ g_decay_out,
+	half* __restrict__ z_out,
+	int num_channels,
+	int rows
+) {
+	int j = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( j >= num_channels ) return;
+	const int r0 = blockIdx.y * RB;
+	int h = j / 128;
+
+	if ( f_b_proj != nullptr ) {
+		float f_val[RB];
+		#pragma unroll
+		for ( int b = 0; b < RB; ++b ) f_val[b] = 0.0f;
+		const float4* fb4 = reinterpret_cast<const float4*>( f_b_proj + j * 128 );
+		#pragma unroll
+		for ( int i = 0; i < 16; ++i ) {
+			const float4 vfb = fb4[i];
+			const half2* hfb = reinterpret_cast<const half2*>( &vfb );
+			#pragma unroll
+			for ( int b = 0; b < RB; ++b ) {
+				float4 vfa = make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
+				if ( r0 + b < rows ) vfa = reinterpret_cast<const float4*>( f_a_buf + static_cast<size_t>( r0 + b ) * 128 )[i];
+				const half2* hfa = reinterpret_cast<const half2*>( &vfa );
+				#pragma unroll
+				for ( int k = 0; k < 4; ++k ) {
+					float2 f1 = __half22float2( hfa[k] );
+					float2 f2 = __half22float2( hfb[k] );
+					f_val[b] = fmaf( f1.x, f2.x, f_val[b] );
+					f_val[b] = fmaf( f1.y, f2.y, f_val[b] );
+				}
+			}
+		}
+		float dt = ( dt_bias != nullptr ) ? __half2float( dt_bias[j] ) : 0.0f;
+		float a_val = ( A_log != nullptr ) ? __half2float( A_log[h] ) : 0.0f;
+		float decay = __expf( a_val );
+		#pragma unroll
+		for ( int b = 0; b < RB; ++b ) {
+			if ( r0 + b >= rows ) continue;
+			float gf = f_val[b] + dt;
+			g_decay_out[static_cast<size_t>( r0 + b ) * num_channels + j] = -5.0f / ( 1.0f + __expf( -decay * gf ) );
+		}
+	}
+
+	if ( g_b_proj != nullptr ) {
+		float z_val[RB];
+		#pragma unroll
+		for ( int b = 0; b < RB; ++b ) z_val[b] = 0.0f;
+		const float4* gb4 = reinterpret_cast<const float4*>( g_b_proj + j * 128 );
+		#pragma unroll
+		for ( int i = 0; i < 16; ++i ) {
+			const float4 vgb = gb4[i];
+			const half2* hgb = reinterpret_cast<const half2*>( &vgb );
+			#pragma unroll
+			for ( int b = 0; b < RB; ++b ) {
+				float4 vga = make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
+				if ( r0 + b < rows ) vga = reinterpret_cast<const float4*>( g_a_buf + static_cast<size_t>( r0 + b ) * 128 )[i];
+				const half2* hga = reinterpret_cast<const half2*>( &vga );
+				#pragma unroll
+				for ( int k = 0; k < 4; ++k ) {
+					float2 g1 = __half22float2( hga[k] );
+					float2 g2 = __half22float2( hgb[k] );
+					z_val[b] = fmaf( g1.x, g2.x, z_val[b] );
+					z_val[b] = fmaf( g1.y, g2.y, z_val[b] );
+				}
+			}
+		}
+		#pragma unroll
+		for ( int b = 0; b < RB; ++b ) {
+			if ( r0 + b < rows ) z_out[static_cast<size_t>( r0 + b ) * num_channels + j] = __float2half_rn( z_val[b] );
+		}
+	}
+}
+
 __global__ void kda_recurrent_step_kernel(
 	float* __restrict__ state,
 	const half* __restrict__ qkv,
@@ -1102,6 +1275,17 @@ void GDN::project_kda_gates(
 	int rows
 ) {
 	(void) head_dim;
+	if ( rows > pod::MAX_BATCH && runtime::options().kda_rows ) {
+		constexpr int RB = 8;
+		project_kda_stage1_rows_kernel<RB><<<dim3( num_heads + 256, ( rows + RB - 1 ) / RB ), dim3( 256 ), 0, stream>>>(
+			norm_hidden.ptr<const half>(), b_proj.ptr<const half>(), f_a_proj.ptr<const half>(), g_a_proj.ptr<const half>(),
+			beta_out.ptr<float>(), f_a_buf.ptr<half>(), g_a_buf.ptr<half>(), hidden_size, num_heads, rows );
+		const int channels = num_heads * head_dim;
+		project_kda_stage2_rows_kernel<RB><<<dim3( ( channels + 255 ) / 256, ( rows + RB - 1 ) / RB ), dim3( 256 ), 0, stream>>>(
+			f_a_buf.ptr<const half>(), g_a_buf.ptr<const half>(), f_b_proj.ptr<const half>(), g_b_proj.ptr<const half>(),
+			A_log.ptr<const half>(), dt_bias.ptr<const half>(), g_decay_out.ptr<float>(), z_out.ptr<half>(), channels, rows );
+		return;
+	}
 	project_kda_stage1_kernel<<<dim3( num_heads + 256, rows ), dim3( 256 ), 0, stream>>>(
 		norm_hidden.ptr<const half>(),
 		b_proj.ptr<const half>(),
