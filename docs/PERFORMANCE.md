@@ -55,7 +55,7 @@ GLM-5.3-Flash prefill with `prefill_window`, 8192 tokens, 512-row chunks, all ex
 
 The hyper-connection mix of a prefill chunk (`hc_collapse_norm`, 8% of GLM prefill time) reads its mixing matrix once per four rows instead of once per row (`hc_rows`, on): that kernel goes from 561 to 229 us at 512 rows with identical output, and prefill from 841 to 880 tok/s with the window off. The two gate projections of the linear-attention layers (`project_kda` stage 1 and 2) take eight rows to a block the same way (`kda_rows`, on, identical output): prefill 881 to 901 tok/s. The window table below has both on.
 
-With part of the experts in host memory (`expert_cache` below 1) the window also streams each cold expert once per window instead of once per chunk (this table was taken without the two row-blocked kernels above, so its rows are about 7% below what the first table's):
+With part of the experts in host memory (`expert_cache` below 1) the window also streams each cold expert once per window instead of once per chunk (this table was taken before the two row-blocked kernels above, so every row is about 7% below what it would be now):
 
 | `expert_cache` | Window off | Window 4 |
 |---|---|---|
