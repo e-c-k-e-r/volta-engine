@@ -114,9 +114,11 @@ Settings for how many requests run at once:
 |---|---|---|---|
 | Qwen3.8-27B EXL3 | 15.9 / 16.5 ms (63 / 61 tok/s) | 24.9 / 25.6 ms (1.6x a token) | 20.6 ms |
 | Qwen3.8-27B NVFP4 | 11.7 / 12.0 ms (86 / 84 tok/s) | 13.4 / 13.8 ms (1.15x) | 12.0 ms |
-| GLM-5.3-Flash, NVFP4 dense, every expert resident | not measured / 13.6 ms (74 tok/s) | not measured / 29.2 ms (2.2x) | 16.0 ms |
-| Flash-Next, NVFP4 experts and dense | not measured / 10.5 ms (95 tok/s) | not measured / 17.5 ms (1.7x) | 11.5 ms |
-| Flash-Next 2.0 bpw EXL3, every expert resident | not measured / 16.3 ms (62 tok/s) | not measured / 25.3 ms (1.6x) | 18.2 ms |
+| GLM-5.3-Flash, NVFP4 dense, every expert resident | 13.1 / 13.5 ms (76 / 74 tok/s) | 28.6 / 29.2 ms (2.2x) | 16.0 / 16.4 ms |
+| Flash-Next, NVFP4 experts and dense | 10.1 / 10.5 ms (99 / 95 tok/s) | 16.8 / 17.6 ms (1.7x) | 11.6 / 12.1 ms |
+| Flash-Next 2.0 bpw EXL3, every expert resident | 14.9 / 15.6 ms (67 / 64 tok/s) | 24.5 / 25.3 ms (1.6x) | 17.3 / 18.0 ms |
+
+The GLM and Flash-Next rows were taken at the 250 W limit with the SM clocks at 1530 MHz and no throttling, three runs each (GLM within 0.05 ms of each other). The first run after a Flash-Next model loads is about 2.5 ms slower per plain token than the runs after it; the table has the second and third runs, which agree within 0.02 ms.
 
 A verify block costs little over a plain token on the NVFP4 models, which is what lets a speculative round pay off; on GLM it costs more than twice a token, because 8 rows touch many more experts than one.
 
