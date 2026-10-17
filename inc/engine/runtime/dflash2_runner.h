@@ -61,7 +61,7 @@ public:
 	bool takes_offered_draft() const override { return true; }
 	bool joint() const override;
 	bool joint_default() const override { return true; }
-	int joint_max() const override { return pod::MAX_BATCH / models::kDraftM; }
+	int joint_max() const override;
 	void speculate_joint( int n, const int* slots, const int* anchors, const int* poss, const SamplingParams* const* sps, Rng* const* rngs, SpecResult* out ) override;
 
 	void step_stats( int* attempts, int* hits ) const override;

@@ -409,6 +409,10 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	return res;
 }
 
+int DFlash2Runner::joint_max() const {
+	return MIN( MAX( runtime::options().spec_joint_max, 1 ), pod::MAX_BATCH / 2 );
+}
+
 bool DFlash2Runner::joint() const {
 	return per_slot_ && mc_ != nullptr && mc_->spec_commit_always();
 }
@@ -416,10 +420,10 @@ bool DFlash2Runner::joint() const {
 void DFlash2Runner::speculate_joint( int n, const int* slots, const int* anchors, const int* poss, const SamplingParams* const* sps, Rng* const* rngs, SpecResult* out ) {
 	constexpr int M = models::kDraftM;
 	constexpr int K = M - 1;
-	constexpr int kMaxJoint = pod::MAX_BATCH / M;
+	constexpr int kMaxJoint = pod::MAX_BATCH / 2;   // every block keeps its anchor and one draft token
 	ModelCluster& mc = *mc_;
 	const auto& meta = mc.metadata();
-	ENGINE_ASSERT( joint() && n >= 1 && n <= kMaxJoint, "DFlash2Runner::speculate_joint: needs per-slot contexts, the journaled commit and at most MAX_BATCH / kDraftM slots" );
+	ENGINE_ASSERT( joint() && n >= 1 && n <= kMaxJoint, "DFlash2Runner::speculate_joint: needs per-slot contexts, the journaled commit and at most MAX_BATCH / 2 slots" );
 
 	// 1. Draft each slot's block in turn. A slot too close to the end of the context for a block takes a round of its own.
 	int hd[kMaxJoint][M], active[kMaxJoint], base[kMaxJoint], who[kMaxJoint], k = 0, total = 0;
@@ -437,7 +441,18 @@ void DFlash2Runner::speculate_joint( int n, const int* slots, const int* anchors
 		++k;
 	}
 	if ( k == 0 ) return;
-	ENGINE_ASSERT( total <= pod::MAX_BATCH, "DFlash2Runner::speculate_joint: the blocks exceed one forward" );
+	// The blocks share one forward of at most MAX_BATCH rows: cut the longest blocks (down to one draft token) until they fit
+	while ( total > pod::MAX_BATCH ) {
+		int longest = 0;
+		for ( int j = 1; j < k; ++j ) longest = active[j] > active[longest] ? j : longest;
+		ENGINE_ASSERT( active[longest] > 1, "DFlash2Runner::speculate_joint: the blocks exceed one forward" );
+		--active[longest];
+		--total;
+	}
+	for ( int j = 0, b = 0; j < k; ++j ) {
+		base[j] = b;
+		b += active[j] + 1;
+	}
 
 	// 2. One verify forward over [anchor, c1 .. c_active] of every slot, the blocks one after the other
 	int vtok[pod::MAX_BATCH], vslot[pod::MAX_BATCH], vpos[pod::MAX_BATCH];

@@ -604,6 +604,7 @@ void Generator::step_batch() {
 		const double rate = spec_tok_ms_n_[joint_rounds ? nj : 1];
 		agg_dense = dense_ms_n_[n] <= 0.0 || ( rate > 0.0 && n / dense_ms_n_[n] > rate * 1.1 );
 		if ( probe ) agg_dense = !agg_dense;
+		if ( runtime::options().spec_agg_dense >= 0 ) agg_dense = runtime::options().spec_agg_dense > 0;
 	}
 	if ( per_slot && !agg_dense ) {
 		// A slot in plain mode gets its probe round when its counter says so
