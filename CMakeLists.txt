@@ -128,6 +128,7 @@ set(ENGINE_HOST_SOURCES
 	src/models/glm5_vision.cpp
 	src/models/glm5_next.cpp
 	src/models/qwen4_exp.cpp
+	src/models/deepseek_v41.cpp
 	src/runtime/options.cpp
 	src/runtime/kv_cache.cpp
 	src/runtime/cluster.cpp
@@ -181,6 +182,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/ple.cu
 	src/backend/cuda/modules/hessian.cu
 	src/backend/cuda/modules/qsa.cu
+	src/backend/cuda/modules/dsv4.cu
 	src/backend/cuda/modules/embedding.cu
 	src/backend/cuda/modules/vision.cu
 	src/backend/cuda/modules/linear_trellis.cu
@@ -527,6 +529,10 @@ set_target_properties(bench_accept PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJEC
 add_executable(test_coherence tests/4_coherence/test_coherence.cpp)
 target_link_libraries(test_coherence PRIVATE engine_kernels)
 set_target_properties(test_coherence PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_dsv41 tests/4_coherence/test_dsv41.cpp)
+target_link_libraries(test_dsv41 PRIVATE engine_kernels)
+set_target_properties(test_dsv41 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_long_context tests/4_coherence/test_long_context.cpp)
 target_link_libraries(test_long_context PRIVATE engine_kernels)
