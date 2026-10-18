@@ -51,6 +51,17 @@ void ExpertTier::configure( int experts_per_layer, double fraction, const size_t
 	}
 }
 
+int ExpertTier::assign_cpu( pod::MemoryArena& device ) {
+	int total = 0;
+	for ( Layer& l : layers ) {
+		l.cpu_owned.assign( experts, 0 );
+		for ( int e = 0; e < experts; ++e ) if ( l.slot_of[e] < 0 ) { l.cpu_owned[e] = 1; ++total; }
+		l.cpu_owner_dev = static_cast<uint8_t*>( engine::core::arena_alloc( device, static_cast<size_t>( experts ), 256 ) );
+		CUDA_CHECK( cudaMemcpy( l.cpu_owner_dev, l.cpu_owned.data(), static_cast<size_t>( experts ), cudaMemcpyHostToDevice ) );
+	}
+	return total;
+}
+
 int ExpertTier::swap_cap() const {
 	if ( max_swaps >= 0 ) return max_swaps;
 	// A swap moves two experts' bytes: the budget per rebalance pass is spread over the layers
@@ -339,6 +350,12 @@ int ExpertTier::rebalance( int layer, cudaStream_t stream ) {
 			set[p][hot].w0.data = slot_ptr + off;
 			set[p][cold_res].w0.data = l.host[cold_res] + off;
 			off += part_bytes[p];
+		}
+		if ( !l.cpu_owned.empty() ) {
+			if ( on_cold ) on_cold( layer, cold_res );
+			l.cpu_owned[hot] = 0; l.cpu_owned[cold_res] = 1;
+			CUDA_CHECK( cudaMemcpy( l.cpu_owner_dev + hot, &l.cpu_owned[hot], 1, cudaMemcpyHostToDevice ) );
+			CUDA_CHECK( cudaMemcpy( l.cpu_owner_dev + cold_res, &l.cpu_owned[cold_res], 1, cudaMemcpyHostToDevice ) );
 		}
 		++swaps;
 		++l.version;

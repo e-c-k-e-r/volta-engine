@@ -3,6 +3,7 @@
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/modules/hessian.h"
+#include "engine/modules/cpu_experts.h"
 #include <memory>
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
@@ -669,6 +670,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		return false;
 	}
 	tier_.stage_auto_off = !layers_.empty() && layers_[0].experts.type != pod::QuantType::NVFP4;   // trellis experts: the persistent kernel's tiles read each cold expert about once, staging does not pay
+	if ( tier_.active() && runtime::options().cpu_experts > 0.0 ) cpu_ = engine::cpu_moe::attach_cpu_experts( tier_, rank_, rank_ * ( config_.num_experts / tp_ ), config_.hidden_size, 0.0f, *arena_, stream );
 	tier_.stage_init( *arena_ );   // prefill staging scratch for the cold experts (turns itself off when the arena has no room)
 	if ( runtime::options().mem_log && rank_ <= 1 ) {
 		constexpr double kGiB = 1073741824.0;
@@ -1132,7 +1134,11 @@ void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backe
 	const int tier_li = ( &lw >= layers_.data() && &lw < layers_.data() + layers_.size() ) ? static_cast<int>( &lw - layers_.data() ) : -1;
 	const bool staged = m > pod::MAX_BATCH && tier_li >= 0 && tier_.prefill_staging() && tier_.stage_begin( tier_li, stream );
 	if ( staged && tier_li + 1 < tier_layers_ ) tier_.stage_prefetch( tier_li + 1, stream );
+	const bool on_cpu = cpu_.usable( tier_, tier_li, m );
+	if ( on_cpu ) engine::modules::CpuExperts::post( mixed_.ptr<const backend::half_t>(), topk_idx_, topk_w_, m, config_.top_k, H, rank_ * per_rank, ( rank_ + 1 ) * per_rank,
+		tier_.layers[tier_li].cpu_owner_dev, cpu_.frac, lw.experts.heat, cpu_.mb, cpu_.ctl, tier_li, stream );
 	engine::modules::MoE::forward( mixed_, lw.experts, topk_idx_, topk_w_, y_, rank_ * per_rank, ( rank_ + 1 ) * per_rank, moe_scratch_, 0.0f, stream );
+	if ( on_cpu ) engine::modules::CpuExperts::wait_add( y_.ptr<backend::half_t>(), m, H, cpu_.mb, cpu_.ctl, stream );
 	if ( staged ) tier_.stage_end( tier_li, stream );
 	if ( overlap ) backend::stream_join( stream, sh_stream );
 	if ( rank_ == 0 && !defer_shared ) {

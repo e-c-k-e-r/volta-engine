@@ -15,6 +15,7 @@
 #include "engine/modules/mla.h"
 #include "engine/modules/moe.h"
 #include "engine/modules/expert_tier.h"
+#include "engine/runtime/cpu_expert_attach.h"
 #include "engine/modules/mhc.h"
 #include "engine/modules/linear.h"
 #include "engine/backend/types.h"
@@ -242,6 +243,7 @@ private:
 	engine::modules::ExpertTier tier_;
 	pod::MemoryArena host_arena_{};     // pinned cold-expert tier
 	int tier_layers_ = 0;
+	engine::cpu_moe::CpuExpertHandle cpu_;   // cpu_experts: cold experts computed on the host CPU
 	// Calibration (ENGINE_HESSIAN_DIR): x^T x of a projection input over the prefill rows, per layer and site (0 attention input, 1 FFN input,
 	// 2 o_proj input (rank slice), 3 shared-expert down input, 4 q-lora norm output (MLA), 5 lm_head input with layer 0)
 	struct HessianSite { float* h = nullptr; int k = 0; int64_t rows = 0; };

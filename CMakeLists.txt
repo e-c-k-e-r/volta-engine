@@ -134,6 +134,13 @@ set(ENGINE_HOST_SOURCES
 	src/runtime/dflash2_runner.cpp
 	src/runtime/mtp_runner.cpp
 	src/runtime/prefix_cache.cpp
+	src/runtime/cpu_experts.cpp
+	src/runtime/cpu_expert_service.cpp
+	src/runtime/cpu_expert_attach.cpp
+	src/kernels/cpu/cpu_util.cpp
+	src/kernels/cpu/pool.cpp
+	src/kernels/cpu/trellis_linear.cpp
+	src/kernels/cpu/nvfp4_linear.cpp
 	src/runtime/generator.cpp
 	src/server/config.cpp
 	src/server/output_parser.cpp
@@ -168,6 +175,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/dsa.cu
 	src/backend/cuda/modules/moe.cu
 	src/backend/cuda/modules/expert_tier.cu
+	src/backend/cuda/modules/cpu_experts.cu
 	src/backend/cuda/modules/mhc.cu
 	src/backend/cuda/modules/gated_residual.cu
 	src/backend/cuda/modules/ple.cu
@@ -597,6 +605,22 @@ set_target_properties(test_mla_latent PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PRO
 add_executable(test_dsa tests/2_parity/test_dsa.cpp)
 target_link_libraries(test_dsa PRIVATE engine_kernels)
 set_target_properties(test_dsa PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_cpu_experts tests/2_parity/test_cpu_experts.cpp)
+target_link_libraries(test_cpu_experts PRIVATE engine_kernels)
+set_target_properties(test_cpu_experts PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_cpu_bridge tests/2_parity/test_cpu_bridge.cpp)
+target_link_libraries(test_cpu_bridge PRIVATE engine_kernels)
+set_target_properties(test_cpu_bridge PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_cpu_nvfp4_vs_gpu tests/2_parity/test_cpu_nvfp4_vs_gpu.cpp)
+target_link_libraries(test_cpu_nvfp4_vs_gpu PRIVATE engine_kernels)
+set_target_properties(test_cpu_nvfp4_vs_gpu PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_cpu_trellis_vs_gpu tests/2_parity/test_cpu_trellis_vs_gpu.cpp)
+target_link_libraries(test_cpu_trellis_vs_gpu PRIVATE engine_kernels)
+set_target_properties(test_cpu_trellis_vs_gpu PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(test_kv_pages tests/2_parity/test_kv_pages.cpp)
 target_link_libraries(test_kv_pages PRIVATE engine_kernels)
 set_target_properties(test_kv_pages PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

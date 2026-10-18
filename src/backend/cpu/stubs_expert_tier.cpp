@@ -1,6 +1,7 @@
 // CPU backend: weak stubs for the expert_tier entry points that have no CPU implementation (CUDA/SM70 only or not yet ported).
 // A strong definition in another translation unit overrides these. Declarations come from engine/modules/expert_tier.h.
 #include "engine/modules/expert_tier.h"
+#include "engine/modules/cpu_experts.h"
 #include "engine/backend/tiers.h"
 
 namespace engine::modules {
@@ -27,6 +28,8 @@ __attribute__(( weak )) int ExpertTier::swap_cap() const {
 
 // Nothing is tiered on this backend, so there is nothing to save
 __attribute__(( weak )) void ExpertTier::save_heat() {}
+
+__attribute__(( weak )) int ExpertTier::assign_cpu( pod::MemoryArena& ) { return 0; }
 
 // Staging is part of the host-memory tier: nothing to stage here
 __attribute__(( weak )) void ExpertTier::stage_init( pod::MemoryArena& ) {}
@@ -73,6 +76,16 @@ __attribute__(( weak )) void ExpertTier::set_source( int layer, int expert, int 
 
 __attribute__(( weak )) void ExpertTier::stream_fill( int layer, backend::stream_t stream ) {
 	ENGINE_UNSUPPORTED( "ExpertTier::stream_fill" );
+	__builtin_unreachable();
+}
+
+// The CPU expert path needs a GPU backend
+__attribute__(( weak )) void CpuExperts::post( const backend::half_t*, int*, const backend::half_t*, int, int, int, int, int, const uint8_t*, float, uint32_t*, cpu_moe::Mailbox*, uint64_t*, int, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "CpuExperts::post" );
+	__builtin_unreachable();
+}
+__attribute__(( weak )) void CpuExperts::wait_add( backend::half_t*, int, int, cpu_moe::Mailbox*, const uint64_t*, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "CpuExperts::wait_add" );
 	__builtin_unreachable();
 }
 

@@ -8,6 +8,7 @@
 #include "engine/modules/linear.h"
 #include "engine/modules/moe.h"
 #include "engine/modules/expert_tier.h"
+#include "engine/runtime/cpu_expert_attach.h"
 #include "engine/core/graph_cache.h"
 #include "engine/loader/ngram_table.h"
 #include "engine/models/qwen3_vision.h"
@@ -189,6 +190,7 @@ private:
 	engine::modules::ExpertTier tier_;   // ENGINE_EXPERT_CACHE < 1: resident experts' codes in device slots, the rest in pinned host memory
 	pod::MemoryArena host_arena_{};
 	int tier_layers_ = 0;
+	engine::cpu_moe::CpuExpertHandle cpu_;   // cpu_experts: cold experts computed on the host CPU
 
 	Qwen4ExpConfig config_;
 	ModelMetadata metadata_;

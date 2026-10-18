@@ -9,6 +9,8 @@
 #include "engine/modules/gdn.h"
 #include "engine/modules/dsa.h"
 #include "engine/modules/embedding.h"
+#include "engine/modules/cpu_experts.h"
+#include "engine/runtime/cpu_expert_attach.h"
 #include "engine/spec/dflash.h"
 #include "engine/spec/tap_ring.h"
 #if ENGINE_BACKEND_CUDA
@@ -1163,6 +1165,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	}
 
 	tier_.stage_init( *arena_ );
+	if ( tier_.active() && runtime::options().cpu_experts > 0.0 ) cpu_ = engine::cpu_moe::attach_cpu_experts( tier_, rank_, start_expert, config_.hidden_size, 10.0f, *arena_, stream );
 	size_t bytes_after = arena_->offset_bytes;
 	if ( rank_ <= 1 && runtime::options().mem_log ) {
 		constexpr double kGiB = 1073741824.0;
@@ -1978,6 +1981,11 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				// Routed experts in this rank's partition: device-resident dispatch, no host sync. A prefill chunk reads the layer's cold experts from device
 				// scratch, copied a layer ahead
 			if ( phase & kPhaseExperts ) {
+				const bool on_cpu = cpu_.usable( tier_, layer - 3, m );
+				if ( on_cpu ) {
+					engine::modules::CpuExperts::post( norm_hidden_.ptr<const backend::half_t>(), state_.d_topk_indices, state_.d_topk_weights, m, config_.top_k, H, start_expert, end_expert,
+						tier_.layers[layer - 3].cpu_owner_dev, cpu_.frac, lw.moe_weights.heat, cpu_.mb, cpu_.ctl, layer - 3, stream );
+				}
 				const bool staged = m > pod::MAX_BATCH && tier_.prefill_staging() && tier_.stage_begin( layer - 3, stream );
 				if ( staged && layer + 1 < config_.num_layers ) tier_.stage_prefetch( layer - 2, stream );
 				engine::modules::MoE::forward(
@@ -1987,6 +1995,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 					state_.moe, 10.0f, stream
 				);
 				if ( staged ) tier_.stage_end( layer - 3, stream );
+				if ( on_cpu ) engine::modules::CpuExperts::wait_add( local_moe_out_.ptr<backend::half_t>(), m, H, cpu_.mb, cpu_.ctl, stream );
 				if ( overlap ) backend::stream_join( stream, sh_stream );
 
 			}
@@ -2306,5 +2315,6 @@ bool Glm5NextPipeline::load_seq_state( int slot_id, int from, int tokens, bool w
 	copy_seq_rows( slot_id, from, tokens, const_cast<char*>( src ) + kda + conv + planes + tap_bytes, false, stream );
 	return true;
 }
+
 
 } // namespace engine::models

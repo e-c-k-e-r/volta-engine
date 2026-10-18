@@ -38,8 +38,8 @@ struct NVFP4MoE {
 	// rows <= MOE_NVFP4_ROWS. disp: nvfp4_disp_ints(num_local) ints; counters: hidden/32 zero-initialised ints (left zero); partial: rows * topk * hidden floats;
 	// h: rows * topk * inter halves; heat optional. act_limit > 0: the swiglu limit (up clamped both ways, the activated gate from above).
 	static void forward_rows(
-		const NVFP4ExpertTable& t, const half* x, const int* route_idx, const half* route_w, int rows, int topk,
-		half* h, float* partial, int* disp, int* counters, uint32_t* heat, float act_limit, half* out, backend::stream_t stream
+		const NVFP4ExpertTable& t, const backend::half_t* x, const int* route_idx, const backend::half_t* route_w, int rows, int topk,
+		backend::half_t* h, float* partial, int* disp, int* counters, uint32_t* heat, float act_limit, backend::half_t* out, backend::stream_t stream
 	);
 };
 

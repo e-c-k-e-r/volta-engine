@@ -5,6 +5,7 @@
 #include "engine/modules/moe.h"
 #include "engine/backend/types.h"
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,8 @@ struct ExpertTier {
 		void* staged_dev = nullptr;          // prefill: the 9 x experts pointer table with the cold experts' codes pointing into the stage buffer
 		int version = 0, built = -1;         // residency changes (swaps) against the version staged_dev was built for
 		bool queued = false;                 // the stage copy of this layer is issued and not yet consumed
+		std::vector<uint8_t> cpu_owned;      // expert -> 1 when it is cold and has a CPU copy; empty without cpu_experts
+		uint8_t* cpu_owner_dev = nullptr;    // the same flags on the device (the CPU post kernel)
 	};
 
 	int experts = 0;
@@ -80,6 +83,10 @@ struct ExpertTier {
 	// (`count` of them; the tier's `resident` when 0 - a layer may hold more than the base count, never fewer)
 	std::vector<int> initial_set( int layer, int count = 0 ) const;
 	void save_heat();
+	// cpu_experts: flags every cold expert of every layer as CPU-capable (cpu_owned, mirrored on the device for the post kernel) and returns how many;
+	// a swap keeps the flags current and calls on_cold for the expert that left its slot, so the owner can give it a CPU copy
+	int assign_cpu( pod::MemoryArena& device );
+	std::function<void( int layer, int expert )> on_cold;
 	int swap_cap() const;
 	// Backing for one layer: its device slots (from `device`) and the pinned buffers of its cold experts (from `host`); the
 	// returned views are where expert `e`'s three code tensors are to be loaded
