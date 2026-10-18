@@ -50,7 +50,17 @@ ToolSchemas tool_schemas_from_json( const std::string& tools_json ) {
 }
 
 OutputParser::OutputParser( engine::loader::ModelFamily family, bool starts_in_reasoning, ToolSchemas schemas )
-	: family_( family ), schemas_( std::move( schemas ) ), state_( starts_in_reasoning ? State::Reasoning : State::Content ) {}
+	: family_( family ), schemas_( std::move( schemas ) ), state_( starts_in_reasoning ? State::Reasoning : State::Content ) {
+	if ( family_ == engine::loader::ModelFamily::DEEPSEEK ) {
+		call_open_ = "<｜DSML｜ invoke";
+		call_close_ = "</｜DSML｜ invoke>";
+		wrappers_ = { "<｜DSML｜ calls>", "</｜DSML｜ calls>" };
+	}
+	else {
+		call_open_ = kCallOpen;
+		call_close_ = kCallClose;
+	}
+}
 
 void OutputParser::feed( const std::string& text, std::vector<OutputEvent>& events ) {
 	buf_ += text;
@@ -105,8 +115,19 @@ void OutputParser::process( std::vector<OutputEvent>& events, bool final ) {
 			return;
 		}
 		if ( state_ == State::Content ) {
-			const size_t pc = buf_.find( kCallOpen );
+			const size_t pc = buf_.find( call_open_ );
 			const size_t pt = emitted_any_ || saw_tool_call_ ? std::string::npos : buf_.find( kThinkOpen );
+			// a calls-block wrapper: the text before it is content, the marker itself is dropped
+			size_t pw = std::string::npos, wlen = 0;
+			for ( const std::string& w : wrappers_ ) {
+				const size_t p = buf_.find( w );
+				if ( p < pw ) { pw = p; wlen = w.size(); }
+			}
+			if ( pw != std::string::npos && pw < pc && pw < pt ) {
+				emit_text( OutputEvent::Type::Content, buf_.substr( 0, pw ), events );
+				buf_.erase( 0, pw + wlen );
+				continue;
+			}
 			if ( pt != std::string::npos && ( pc == std::string::npos || pt < pc ) ) {
 				emit_text( OutputEvent::Type::Content, buf_.substr( 0, pt ), events );
 				buf_.erase( 0, pt + std::char_traits<char>::length( kThinkOpen ) );
@@ -116,12 +137,13 @@ void OutputParser::process( std::vector<OutputEvent>& events, bool final ) {
 			}
 			if ( pc != std::string::npos ) {
 				emit_text( OutputEvent::Type::Content, buf_.substr( 0, pc ), events );
-				buf_.erase( 0, pc + std::char_traits<char>::length( kCallOpen ) );
+				buf_.erase( 0, pc + call_open_.size() );
 				end_section();
 				state_ = State::ToolCall;
 				continue;
 			}
-			size_t hold = partial_suffix( buf_, kCallOpen );
+			size_t hold = partial_suffix( buf_, call_open_ );
+			for ( const std::string& w : wrappers_ ) hold = std::max( hold, partial_suffix( buf_, w ) );
 			if ( !emitted_any_ && !saw_tool_call_ ) hold = std::max( hold, partial_suffix( buf_, kThinkOpen ) );
 			const size_t safe = final ? buf_.size() : buf_.size() - hold;
 			emit_text( OutputEvent::Type::Content, buf_.substr( 0, safe ), events );
@@ -129,18 +151,18 @@ void OutputParser::process( std::vector<OutputEvent>& events, bool final ) {
 			return;
 		}
 		// State::ToolCall
-		const size_t p = buf_.find( kCallClose );
+		const size_t p = buf_.find( call_close_ );
 		if ( p == std::string::npos ) {
 			if ( final ) {
 				// unterminated call: hand the raw text back as content rather than dropping it
-				emit_text( OutputEvent::Type::Content, std::string( kCallOpen ) + buf_, events );
+				emit_text( OutputEvent::Type::Content, call_open_ + buf_, events );
 				buf_.clear();
 			}
 			return;
 		}
 		ToolCallOut call;
 		const std::string body = buf_.substr( 0, p );
-		buf_.erase( 0, p + std::char_traits<char>::length( kCallClose ) );
+		buf_.erase( 0, p + call_close_.size() );
 		if ( parse_tool_call( body, &call ) ) {
 			OutputEvent ev;
 			ev.type = OutputEvent::Type::ToolCall;
@@ -149,7 +171,7 @@ void OutputParser::process( std::vector<OutputEvent>& events, bool final ) {
 			saw_tool_call_ = true;
 		}
 		else {
-			emit_text( OutputEvent::Type::Content, std::string( kCallOpen ) + body + kCallClose, events );
+			emit_text( OutputEvent::Type::Content, call_open_ + body + call_close_, events );
 		}
 		end_section();
 		state_ = State::Content;
@@ -179,6 +201,42 @@ std::string OutputParser::decode_value( const std::string& tool, const std::stri
 bool OutputParser::parse_tool_call( const std::string& body, ToolCallOut* out ) const {
 	std::string name;
 	std::vector<std::pair<std::string, std::string>> raw_args;
+	if ( family_ == engine::loader::ModelFamily::DEEPSEEK ) {
+		// body: ` name="n">\n<｜DSML｜ parameter name="k" string="true|false">v</｜DSML｜ parameter>\n...`; string="false" values are JSON
+		const std::string popen = "<｜DSML｜ parameter name=\"", pclose = "</｜DSML｜ parameter>";
+		const size_t ns = body.find( "name=\"" );
+		const size_t ne = ns == std::string::npos ? ns : body.find( '"', ns + 6 );
+		if ( ns == std::string::npos || ne == std::string::npos ) return false;
+		name = body.substr( ns + 6, ne - ns - 6 );
+		std::string args = "{";
+		size_t pos = ne;
+		for ( int k = 0;; ++k ) {
+			const size_t ps = body.find( popen, pos );
+			if ( ps == std::string::npos ) break;
+			const size_t ke = body.find( '"', ps + popen.size() );
+			if ( ke == std::string::npos ) return false;
+			const std::string key = body.substr( ps + popen.size(), ke - ps - popen.size() );
+			const size_t ss = body.find( "string=\"", ke );
+			const size_t gt = body.find( '>', ke );
+			if ( gt == std::string::npos ) return false;
+			const bool is_str = ss != std::string::npos && ss < gt && body.compare( ss + 8, 4, "true" ) == 0;
+			size_t ve = body.find( pclose, gt );
+			const bool last_open = ve == std::string::npos;   // a missing close on the last parameter: the value runs to the end
+			if ( last_open ) ve = body.size();
+			const std::string raw = body.substr( gt + 1, ve - gt - 1 );
+			std::string value = nlohmann::json( raw ).dump();
+			if ( !is_str ) {
+				const auto j = nlohmann::json::parse( raw, nullptr, false );
+				if ( !j.is_discarded() ) value = j.dump();
+			}
+			args += ( k ? "," : "" ) + nlohmann::json( key ).dump() + ":" + value;
+			if ( last_open ) break;
+			pos = ve + pclose.size();
+		}
+		out->name = name;
+		out->arguments = args + "}";
+		return !name.empty();
+	}
 	if ( family_ == engine::loader::ModelFamily::GLM ) {
 		const size_t k = body.find( "<arg_key>" );
 		name = body.substr( 0, k );

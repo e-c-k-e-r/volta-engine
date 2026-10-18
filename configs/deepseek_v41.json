@@ -1,0 +1,12 @@
+{
+	"model_dir": "/path/to/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw",
+	"tp_size": 4,
+	"port": 8000,
+	"max_batch_size": 1,
+	"request_timeout_s": 600,
+	"options": {
+		"max_seq": 16384,
+		"max_slots": 1,
+		"prefix_cache_gib": 0
+	}
+}

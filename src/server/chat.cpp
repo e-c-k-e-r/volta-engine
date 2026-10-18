@@ -27,6 +27,13 @@ bool ends_with( const std::string& s, const char* suffix ) {
 // Maps the API-level effort names onto what each template accepts; empty leaves the template default.
 std::string effort_for( engine::loader::ModelFamily fam, const std::string& e ) {
 	if ( e.empty() ) return e;
+	if ( fam == engine::loader::ModelFamily::DEEPSEEK ) {
+		// DeepSeek-V4.1 takes a 1-100 budget or low (50) / high (75) / max (100)
+		if ( e == "minimal" || e == "low" ) return "low";
+		if ( e == "medium" ) return "60";
+		if ( e == "high" ) return "high";
+		return "max";
+	}
 	if ( fam == engine::loader::ModelFamily::GLM ) {
 		if ( e == "minimal" || e == "low" ) return "low";
 		if ( e == "medium" || e == "high" ) return "high";

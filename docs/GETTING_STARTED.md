@@ -72,7 +72,7 @@ taskset -c 0-9 build/volta_server --model-dir /path/to/Qwen3.8-27B-exl3 \
 	--speculative --draft-model-dir /path/to/Qwen3.8-27B-DFlash2-EXL3-5.0bpw --port 8000
 ```
 
-The model type is read from the checkpoint (`qwen3_5`, `glm5_next` or `qwen4_exp`; a MiniMax-H3 pipeline directory starts the video service, see [video.md](video.md)); anything else is a fatal error. Configuration (launch
+The model type is read from the checkpoint (`qwen3_5`, `glm5_next`, `qwen4_exp` or `deepseek_v41`; a MiniMax-H3 pipeline directory starts the video service, see [video.md](video.md)); anything else is a fatal error. Configuration (launch
 file, `--set key=value`, `ENGINE_*` variables, debug switches) is described in [CONFIG.md](CONFIG.md); `configs/` has examples.
 The server speaks the OpenAI chat API (`/v1/chat/completions`, `/v1/models`) and the Anthropic API (`/v1/messages`,
 `/v1/messages/count_tokens`), so Claude Code can use it with `ANTHROPIC_BASE_URL=http://host:8000`. `/health`, `/metrics`
@@ -134,6 +134,14 @@ Qwen extras:
   `nvfp4_dense=kda,mla,idx,head,dense,shared` (experts stay EXL3: the NVFP4 experts do not fit in VRAM and the offload penalty rules them out). Calibration: run
   `ENGINE_HESSIAN_DIR=<dir> test_ppl --flash|--glm --calibrate --file <text>` (GLM: `ENGINE_HESSIAN_LAYERS=lo-hi`, a third of the layers per pass) and then
   `nvfp4_ldlq.py --model flash|glm`. Speed figures there are indicative (150 W cap, single runs).
+* **DeepSeek-V4.1-Flash** (`deepseek_v41`, EXL3 checkpoints of the sudoingX / 0xSero layout, for example `DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw`;
+  example `configs/deepseek_v41.json`): the Engram tables are not in those repositories, so `model-00047-of-00048.safetensors` and
+  `model-00048-of-00048.safetensors` of `deepseek-ai/DeepSeek-V4.1-Flash-1017` go into the model directory, and
+  `python tests/tools/dsv41/engram_hash_tables.py <model dir>` (a venv with `torch`, `transformers` and `sympy`) writes the hashing tables the
+  engine reads, `engram_hash.bin`, once per directory. The routed experts that do not fit the arena stay in pinned host memory and are read in
+  place (62% resident for the 2.7 bpw checkpoint on four 32 GB GPUs). The prompt format is the checkpoint's `encoding/encoding.py`, built in
+  (no chat template): thinking and reasoning effort (low 50, medium 60, high 75, max 100), tools as DSML tool calls. Not yet: the prefix cache
+  (`prefix_cache_gib` must be 0), speculation, images.
 * **Two GPUs per instance**: `--tp-size 2` runs one model on two GPUs (about 0.7x the speed of four); start a second server with
   `CUDA_VISIBLE_DEVICES=2,3` on the other pair for twice the aggregate throughput. GLM runs on 1, 2 or 4 GPUs (on two, the experts need the expert tier, `expert_cache` below 1, to fit).
 

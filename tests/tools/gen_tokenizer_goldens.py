@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Regenerates tests/data/tokenizer_cases_<model>.json with the reference HF `tokenizers` output for a corpus of
 # awkward texts (code, markdown, unicode, whitespace runs, CRLF, digits, contractions, marks, emoji).
-#   <venv with tokenizers>/python tests/tools/gen_tokenizer_goldens.py $ENGINE_MODEL_ROOT [qwen3_5 | glm5_next | qwen4_exp]
+#   <venv with tokenizers>/python tests/tools/gen_tokenizer_goldens.py $ENGINE_MODEL_ROOT [qwen3_5 | glm5_next | qwen4_exp | deepseek_v41]
 # (the corpus samples the repository sources, so regenerating one model does not touch the others' files when named)
 import json, os, random, sys
 from tokenizers import Tokenizer
@@ -42,11 +42,17 @@ alphabet = " \t\n\r.,;:'\"!?-_/\\()[]{}<>@#$%^&*+=|~`0123456789abcXYZéüñ日�
 for _ in range(60):
     texts.append("".join(rng.choice(alphabet) for _ in range(rng.randrange(1, 60))))
 
-for model, out in (("Qwen3.8-27B-exl3", "qwen3_5"), ("GLM-5.3-Flash-exl3-3.05bpw", "glm5_next"), ("Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", "qwen4_exp")):
+for model, out in (("Qwen3.8-27B-exl3", "qwen3_5"), ("GLM-5.3-Flash-exl3-3.05bpw", "glm5_next"), ("Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", "qwen4_exp"),
+                   ("DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw", "deepseek_v41")):
     if only and only != out:
         continue
     tok = Tokenizer.from_file(os.path.join(root, model, "tokenizer.json"))
-    cases = [{"text": t, "ids": tok.encode(t, add_special_tokens=False).ids} for t in texts]
+    extra = []
+    if out == "deepseek_v41":   # the rendered prompts of encoding/tests (special tokens, DSML, CJK) and a DSML tool call
+        enc = os.path.join(root, model, "encoding", "tests")
+        extra = [open(os.path.join(enc, f), encoding="utf-8").read() for f in sorted(os.listdir(enc)) if f.startswith("test_output_")]
+        extra.append('summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="lookup">\n<｜DSML｜ parameter name="query" string="true">value</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>')
+    cases = [{"text": t, "ids": tok.encode(t, add_special_tokens=False).ids} for t in texts + extra]
     with open(os.path.join(repo, "tests", "data", "tokenizer_cases_%s.json" % out), "w", encoding="utf-8") as f:
         json.dump(cases, f, ensure_ascii=False)
     print(out, len(cases), "cases", sum(len(c["ids"]) for c in cases), "tokens")

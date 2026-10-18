@@ -134,6 +134,24 @@ int main() {
 		}
 	}
 	CHECK( round_trips >= 4, "only %d template round trips ran", round_trips );
+	// DeepSeek-V4.1 DSML (encoding.py's format, test_encoding.py's V41_TOOL_CALL_OUTPUT) after a prompt that opened <think>; string="false"
+	// values are JSON, string="true" ones stay strings even when they look like numbers
+	{
+		const std::string call1 = "<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n"
+			"<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>";
+		Result want;
+		want.reasoning = "reason";
+		want.content = "summary";
+		want.calls = { { "lookup", "{\"query\":\"value\",\"limit\":2}" } };
+		check_chunking( "deepseek: one call", ModelFamily::DEEPSEEK, true, "  reason  </think>summary\n\n<｜DSML｜ calls>\n" + call1 + "\n</｜DSML｜ calls>", want );
+		const std::string call2 = "<｜DSML｜ invoke name=\"search::find\">\n<｜DSML｜ parameter name=\"opts\" string=\"false\">{\"a\": [1, 2]}</｜DSML｜ parameter>\n"
+			"<｜DSML｜ parameter name=\"id\" string=\"true\">42</｜DSML｜ parameter>\n</｜DSML｜ invoke>";
+		want.calls.push_back( { "search::find", "{\"opts\":{\"a\":[1,2]},\"id\":\"42\"}" } );
+		check_chunking( "deepseek: two calls", ModelFamily::DEEPSEEK, true, "reason</think>summary\n\n<｜DSML｜ calls>\n" + call1 + "\n" + call2 + "\n</｜DSML｜ calls>", want );
+		Result plain;
+		plain.content = "No tools needed: 2 < 3.";
+		check_chunking( "deepseek: chat mode, plain text", ModelFamily::DEEPSEEK, false, "No tools needed: 2 < 3.", plain );
+	}
 	// Streaming safety: a character split across tokens is held back, and JSON of invalid UTF-8 is replaced instead of aborting the process
 	{
 		const std::string han = "\xE4\xBD\xA0";   // U+4F60

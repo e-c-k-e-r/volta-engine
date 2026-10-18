@@ -119,6 +119,7 @@ set(ENGINE_HOST_SOURCES
 	src/video/h3_image.cpp
 	src/video/h3_refs.cpp
 	src/loader/chat_template.cpp
+	src/loader/deepseek_encoding.cpp
 	src/loader/jinja.cpp
 	src/loader/image.cpp
 	src/loader/ngram_table.cpp
@@ -399,6 +400,10 @@ target_link_libraries(test_dflash PRIVATE engine_kernels)
 set_target_properties(test_dflash PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Test Tokenizer & Chat Template Parity
+add_executable(test_dsv41_encoding tests/2_parity/test_dsv41_encoding.cpp)
+target_link_libraries(test_dsv41_encoding PRIVATE engine_kernels)
+set_target_properties(test_dsv41_encoding PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(test_jinja tests/2_parity/test_jinja.cpp)
 target_link_libraries(test_jinja PRIVATE engine_kernels)
 target_compile_definitions(test_jinja PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")

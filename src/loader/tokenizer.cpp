@@ -43,6 +43,8 @@ static inline bool is_letter( uint32_t cp ) { return in_table( kUnicodeLetter, c
 static inline bool is_mark( uint32_t cp ) { return in_table( kUnicodeMark, cp ); }
 static inline bool is_number( uint32_t cp ) { return in_table( kUnicodeNumber, cp ); }
 static inline bool is_space( uint32_t cp ) { return in_table( kUnicodeSpace, cp ); }
+static inline bool is_punct( uint32_t cp ) { return in_table( kUnicodePunct, cp ); }
+static inline bool is_symbol( uint32_t cp ) { return in_table( kUnicodeSymbol, cp ); }
 
 // Decodes the code point at text[i] and advances i; malformed bytes decode as themselves (one byte).
 static inline uint32_t utf8_next( const std::string& str, size_t& i ) {
@@ -320,6 +322,131 @@ static std::vector<std::string> bpe_split( const std::string& text, int max_digi
 	return words;
 }
 
+// DeepSeek-V4.1's pre-tokenizer: a Sequence of three Split(behavior=Isolated) regexes, each applied to every piece the previous one left
+// (matches and the text between them both become pieces):
+//   1. \p{N}{1,3}
+//   2. [一-龥぀-ゟ゠-ヿ]+
+//   3. [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+static const char* const kDeepseekPattern = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+
+// Splits each piece at the matches `match( piece, i )` returns (the end of a match at i, or i for none), keeping the gaps
+template <typename Match>
+static std::vector<std::string> split_isolated( const std::vector<std::string>& pieces, Match match ) {
+	std::vector<std::string> out;
+	for ( const std::string& p : pieces ) {
+		size_t gap = 0, i = 0;
+		while ( i < p.size() ) {
+			const size_t e = match( p, i );
+			if ( e > i ) {
+				if ( i > gap ) out.push_back( p.substr( gap, i - gap ) );
+				out.push_back( p.substr( i, e - i ) );
+				i = gap = e;
+			}
+			else {
+				utf8_next( p, i );
+			}
+		}
+		if ( p.size() > gap ) out.push_back( p.substr( gap ) );
+	}
+	return out;
+}
+
+static inline bool is_cjk_run_char( uint32_t cp ) { return ( cp >= 0x4E00 && cp <= 0x9FA5 ) || ( cp >= 0x3040 && cp <= 0x309F ) || ( cp >= 0x30A0 && cp <= 0x30FF ); }
+
+static std::vector<std::string> deepseek_split( const std::string& text ) {
+	auto cp_at = []( const std::string& s, size_t p, size_t* next ) { size_t q = p; const uint32_t cp = utf8_next( s, q ); *next = q; return cp; };
+	// 1. \p{N}{1,3}
+	std::vector<std::string> pieces = split_isolated( { text }, [&]( const std::string& s, size_t i ) {
+		size_t p = i;
+		for ( int d = 0; d < 3 && p < s.size(); ++d ) {
+			size_t nx;
+			if ( !is_number( cp_at( s, p, &nx ) ) ) break;
+			p = nx;
+		}
+		return p;
+	} );
+	// 2. CJK runs
+	pieces = split_isolated( pieces, [&]( const std::string& s, size_t i ) {
+		size_t p = i;
+		while ( p < s.size() ) {
+			size_t nx;
+			if ( !is_cjk_run_char( cp_at( s, p, &nx ) ) ) break;
+			p = nx;
+		}
+		return p;
+	} );
+	// 3. the word pattern, alternatives in order (leftmost-first)
+	return split_isolated( pieces, [&]( const std::string& s, size_t i ) -> size_t {
+		auto lm_run = [&]( size_t p ) {
+			while ( p < s.size() ) {
+				size_t nx;
+				const uint32_t c = cp_at( s, p, &nx );
+				if ( !is_letter( c ) && !is_mark( c ) ) break;
+				p = nx;
+			}
+			return p;
+		};
+		auto ps_run = [&]( size_t p ) {
+			while ( p < s.size() ) {
+				size_t nx;
+				const uint32_t c = cp_at( s, p, &nx );
+				if ( !is_punct( c ) && !is_symbol( c ) ) break;
+				p = nx;
+			}
+			return p;
+		};
+		size_t nx;
+		const uint32_t c = cp_at( s, i, &nx );
+		// [ASCII punctuation][A-Za-z]+
+		if ( c < 0x80 && std::strchr( "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", static_cast<int>( c ) ) != nullptr && c != 0 ) {
+			size_t p = nx;
+			while ( p < s.size() && std::isalpha( static_cast<unsigned char>( s[p] ) ) ) ++p;
+			if ( p > nx ) return p;
+		}
+		// [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+		if ( c != '\r' && c != '\n' && !is_letter( c ) && !is_punct( c ) && !is_symbol( c ) ) {
+			const size_t e = lm_run( nx );
+			if ( e > nx ) return e;
+		}
+		if ( const size_t e = lm_run( i ); e > i ) return e;
+		// ' '?[\p{P}\p{S}]+[\r\n]*
+		{
+			size_t p = s[i] == ' ' ? i + 1 : i;
+			size_t e = ps_run( p );
+			if ( e == p && p != i ) e = ps_run( p = i );
+			if ( e > p ) {
+				while ( e < s.size() && ( s[e] == '\r' || s[e] == '\n' ) ) ++e;
+				return e;
+			}
+		}
+		if ( is_space( c ) ) {
+			size_t e = i;
+			while ( e < s.size() ) {
+				size_t nn;
+				if ( !is_space( cp_at( s, e, &nn ) ) ) break;
+				e = nn;
+			}
+			// \s*[\r\n]+ : up to the end of the run's last newline group
+			size_t last_nl = std::string::npos;
+			for ( size_t p = i; p < e; ++p ) if ( s[p] == '\r' || s[p] == '\n' ) last_nl = p;
+			if ( last_nl != std::string::npos ) {
+				size_t p = last_nl;
+				while ( p < e && ( s[p] == '\r' || s[p] == '\n' ) ) ++p;
+				return p;
+			}
+			// \s+(?!\S) : the whole run at the end of the piece, else all but its last character; \s+ otherwise
+			if ( e == s.size() ) return e;
+			size_t last = i, p = i;
+			while ( p < e ) {
+				last = p;
+				cp_at( s, p, &p );
+			}
+			return last > i ? last : e;
+		}
+		return i;
+	} );
+}
+
 } // namespace unicode_util
 
 Tokenizer::Tokenizer() {
@@ -572,8 +699,12 @@ bool Tokenizer::load( const char* model_dir ) {
 
 	nfc_ = false;
 	if ( has_tok_json && tok_json.contains( "normalizer" ) && !tok_json["normalizer"].is_null() ) {
-		if ( tok_json["normalizer"].value( "type", std::string() ) == "NFC" ) {
+		const nlohmann::json& nz = tok_json["normalizer"];
+		if ( nz.value( "type", std::string() ) == "NFC" ) {
 			nfc_ = true;
+		}
+		else if ( nz.value( "type", std::string() ) == "Sequence" && nz.contains( "normalizers" ) && nz["normalizers"].is_array() && nz["normalizers"].empty() ) {
+			// an empty sequence (DeepSeek-V4.1): no normalization
 		}
 		else {
 			LOG_ERROR( "tokenizer.json uses a normalizer this engine does not implement\n" );
@@ -589,7 +720,12 @@ bool Tokenizer::load( const char* model_dir ) {
 		const std::string qwen = nlohmann::json( unicode_util::kQwenPattern ).dump();
 		const std::string glm = nlohmann::json( unicode_util::kGlmPattern ).dump();
 		const std::string flash = nlohmann::json( unicode_util::kFlashPattern ).dump();
-		if ( pt_dump.find( glm.substr( 1, glm.size() - 2 ) ) != std::string::npos ) {
+		const std::string deepseek = nlohmann::json( unicode_util::kDeepseekPattern ).dump();
+		deepseek_split_ = false;
+		if ( pt_dump.find( deepseek.substr( 1, deepseek.size() - 2 ) ) != std::string::npos && pt_dump.find( "\\\\p{N}{1,3}" ) != std::string::npos ) {
+			deepseek_split_ = true;
+		}
+		else if ( pt_dump.find( glm.substr( 1, glm.size() - 2 ) ) != std::string::npos ) {
 			max_digits_ = 3;
 			marks_are_letters_ = false;
 		}
@@ -649,7 +785,7 @@ std::vector<int> Tokenizer::encode_text_segment( const std::string& text ) const
 	if ( text.empty() ) return result;
 
 	const std::string normalized = nfc_ ? unicode_util::nfc( text ) : text;
-	std::vector<std::string> words = unicode_util::bpe_split( normalized, max_digits_, marks_are_letters_ );
+	std::vector<std::string> words = deepseek_split_ ? unicode_util::deepseek_split( normalized ) : unicode_util::bpe_split( normalized, max_digits_, marks_are_letters_ );
 	for ( const auto& word : words ) {
 		auto piece_toks = encode_piece( word );
 		result.insert( result.end(), piece_toks.begin(), piece_toks.end() );

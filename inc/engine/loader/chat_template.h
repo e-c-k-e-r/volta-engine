@@ -21,7 +21,8 @@ struct ChatTemplateOptions {
 enum class ModelFamily {
 	UNKNOWN,
 	QWEN,
-	GLM
+	GLM,
+	DEEPSEEK   // DeepSeek-V4.1: no chat template; the built-in port of its encoding.py renders (deepseek_encoding.h)
 };
 
 class ChatTemplate {
