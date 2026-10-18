@@ -123,8 +123,34 @@ Nvfp4Linear::Nvfp4Linear( const uint8_t* codes, const uint8_t* scales, float glo
 	}
 }
 
+#if CPUX_X86
+// The block's largest magnitude, then the values scaled, rounded and stored as int16 in the kernel's pair order (K values 0 2 4 6 1 3 5 7 of each half)
+CPUX_AVX2 void quantize_block_avx2( const float* x, float* xin ) {
+	const __m256 absmask = _mm256_castsi256_ps( _mm256_set1_epi32( 0x7fffffff ) );
+	__m256 mx = _mm256_setzero_ps();
+	for ( int i = 0; i < kBlock; i += 8 ) mx = _mm256_max_ps( mx, _mm256_and_ps( _mm256_loadu_ps( x + i ), absmask ) );
+	__m128 m4 = _mm_max_ps( _mm256_castps256_ps128( mx ), _mm256_extractf128_ps( mx, 1 ) );
+	m4 = _mm_max_ps( m4, _mm_movehl_ps( m4, m4 ) );
+	m4 = _mm_max_ss( m4, _mm_shuffle_ps( m4, m4, 1 ) );
+	const float mxs = _mm_cvtss_f32( m4 );
+	const float scale = mxs > 0.0f ? mxs / kQMax : 1.0f;
+	xin[0] = scale;
+	const __m256 inv = _mm256_set1_ps( 1.0f / scale );
+	const __m256i slot = _mm256_setr_epi32( 0, 2, 4, 6, 1, 3, 5, 7 );   // slot j takes K value slot[j] of the half
+	int16_t* q = reinterpret_cast<int16_t*>( xin + kDataOffsetFloats );
+	for ( int g = 0; g < kGroupsPerBlock; ++g ) {
+		const __m256i a = _mm256_permutevar8x32_epi32( _mm256_cvtps_epi32( _mm256_mul_ps( _mm256_loadu_ps( x + g * kGroup ), inv ) ), slot );
+		const __m256i b = _mm256_permutevar8x32_epi32( _mm256_cvtps_epi32( _mm256_mul_ps( _mm256_loadu_ps( x + g * kGroup + 8 ), inv ) ), slot );
+		_mm256_storeu_si256( reinterpret_cast<__m256i*>( q + g * 16 ), _mm256_permute4x64_epi64( _mm256_packs_epi32( a, b ), 0xD8 ) );
+	}
+}
+#endif
+
 // 128 activations -> a scale and int16 values (15 bits of the block's largest), in the pair order of the kernel
 void Nvfp4Linear::prepare_block( const float* x, int, float* xin ) const {
+#if CPUX_X86
+	if ( avx2_available() ) { quantize_block_avx2( x, xin ); return; }
+#endif
 	float mx = 0.0f;
 	for ( int i = 0; i < kBlock; ++i ) mx = std::fmax( mx, std::fabs( x[i] ) );
 	const float scale = mx > 0.0f ? mx / kQMax : 1.0f, inv = 1.0f / scale;

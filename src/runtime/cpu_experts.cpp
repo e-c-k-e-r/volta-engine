@@ -1,6 +1,7 @@
 // Routed expert on the host CPU (see cpu_experts.h)
 #include "engine/runtime/cpu_experts.h"
 #include "engine/kernels/cpu/cpu_util.h"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -15,6 +16,7 @@ namespace {
 
 constexpr int kUnitsPerBlock = kBlock / 16;
 constexpr int kJobs = 8;
+constexpr int kPieceWeights = 40000;
 // A piece of work (a unit of 16 columns takes about 10 us, a block's finishing step a few) that has been held longer than this by a thread is taken
 // over: that thread was most likely descheduled
 constexpr uint64_t kUnitStaleNs = 80000, kFinishStaleNs = 40000;
@@ -36,6 +38,7 @@ struct ExpertJob : kernels::cpu::Task {
 	// inputs
 	Expert e;
 	int rows = 0, H = 0, I = 0, nu = 0, nb_gu = 0, nu_d = 0, nb_d = 0;
+	int cg_gu = 1, cg_d = 1, nch_gu = 0, nch_d = 0;   // units per piece (a piece is about 40k weights), pieces per matrix
 	float act_limit = 0.0f, wts[kMaxRows] = {};
 	// work memory (resized by prepare())
 	std::vector<float> xf, xg, xu, raw_g, raw_u, act_in, raw_d, bsum, out_tmp;
@@ -53,6 +56,12 @@ struct ExpertJob : kernels::cpu::Task {
 		e = ex; rows = r; act_limit = limit;
 		H = e.hidden(); I = e.inter();
 		nu = e.gate->units(); nb_gu = I / kBlock; nu_d = e.down->units(); nb_d = H / kBlock;
+		{
+			// pieces of about the same work whatever the matrix: 16 columns of K = 2560 are 41k weights
+			auto chunk = [&]( int k ) { int c = 1; while ( c < kUnitsPerBlock && c * 16 * k < kPieceWeights ) c *= 2; return c; };
+			cg_gu = chunk( H ); cg_d = chunk( I );
+			nch_gu = nu / cg_gu; nch_d = ( nu_d + cg_d - 1 ) / cg_d;
+		}
 		if ( rows < 1 || rows > kMaxRows || e.up->out() != I || e.down->in() != I || e.down->out() != H ) std::abort();
 		for ( int i = 0; i < rows; ++i ) wts[i] = w[i];
 		const size_t rH = static_cast<size_t>( rows ) * H, rI = static_cast<size_t>( rows ) * I;
@@ -71,7 +80,7 @@ struct ExpertJob : kernels::cpu::Task {
 			}
 			xsum[rr] = static_cast<float>( a ); xsum[rows + rr] = static_cast<float>( b );
 		}
-		const size_t total_units = static_cast<size_t>( 2 * nu + nu_d ), total_fin = static_cast<size_t>( nb_gu + nb_d );
+		const size_t total_units = static_cast<size_t>( 2 * nch_gu + nch_d ), total_fin = static_cast<size_t>( nb_gu + nb_d );
 		if ( unit.size() != total_units ) { std::vector<Piece> u( total_units ); unit.swap( u ); }
 		if ( fin.size() != total_fin ) { std::vector<Piece> f( total_fin ); fin.swap( f ); }
 		if ( unit_done_b.size() != total_fin ) { std::vector<std::atomic<int>> c( total_fin ); unit_done_b.swap( c ); }
@@ -139,37 +148,39 @@ struct ExpertJob : kernels::cpu::Task {
 	}
 
 	void run_unit( int u ) {
-		const bool down = u >= 2 * nu;
-		const int idx = down ? u - 2 * nu : ( u >= nu ? u - nu : u );
-		if ( down ) e.down->run( rows, act_in.data(), dsum, idx, idx + 1, raw_d.data() );
-		else if ( u >= nu ) e.up->run( rows, xu.data(), &xsum[rows], idx, idx + 1, raw_u.data() );
-		else e.gate->run( rows, xg.data(), xsum, idx, idx + 1, raw_g.data() );
+		if ( u >= 2 * nch_gu ) {
+			const int c = u - 2 * nch_gu;
+			e.down->run( rows, act_in.data(), dsum, c * cg_d, std::min( nu_d, ( c + 1 ) * cg_d ), raw_d.data() );
+		}
+		else if ( u >= nch_gu ) e.up->run( rows, xu.data(), &xsum[rows], ( u - nch_gu ) * cg_gu, ( u - nch_gu + 1 ) * cg_gu, raw_u.data() );
+		else e.gate->run( rows, xg.data(), xsum, u * cg_gu, ( u + 1 ) * cg_gu, raw_g.data() );
+	}
+
+	// The finishing step of block `blk` (indices as unit_done_b: gate/up blocks, then down blocks), if its units are all done and nobody holds it
+	bool try_finish( int blk, uint64_t now ) {
+		const bool down = blk >= nb_gu;
+		const int b = down ? blk - nb_gu : blk;
+		if ( unit_done_b[blk].load( std::memory_order_acquire ) < ( down ? 1 : 2 ) * kUnitsPerBlock || !claim( fin[blk], kFinishStaleNs, now ) ) return false;
+		if ( !down ) {
+			finish_gu( b );
+			if ( complete( fin[blk] ) && gu_blocks_done.fetch_add( 1, std::memory_order_acq_rel ) + 1 == nb_gu ) {
+				// the down input's row sums (a few adds), then the down units become available
+				for ( int r = 0; r < rows; ++r ) { float t = 0; for ( int bb = 0; bb < nb_gu; ++bb ) t += bsum[static_cast<size_t>( r ) * nb_gu + bb]; dsum[r] = t; }
+				dsum_ready.store( true, std::memory_order_release );
+			}
+		}
+		else {
+			finish_d( b );
+			if ( complete( fin[blk] ) && d_blocks_done.fetch_add( 1, std::memory_order_acq_rel ) + 1 == nb_d ) done.store( true, std::memory_order_release );
+		}
+		return true;
 	}
 
 	bool work() override {
 		if ( finished() ) return false;
 		const uint64_t now = now_ns();
-		// finishing steps whose units are all done
-		for ( int b = 0; b < nb_gu; ++b ) {
-			if ( unit_done_b[b].load( std::memory_order_acquire ) < 2 * kUnitsPerBlock || !claim( fin[b], kFinishStaleNs, now ) ) continue;
-			finish_gu( b );
-			if ( complete( fin[b] ) ) gu_blocks_done.fetch_add( 1, std::memory_order_acq_rel );
-			return true;
-		}
-		for ( int b = 0; b < nb_d; ++b ) {
-			if ( unit_done_b[nb_gu + b].load( std::memory_order_acquire ) < kUnitsPerBlock || !claim( fin[nb_gu + b], kFinishStaleNs, now ) ) continue;
-			finish_d( b );
-			if ( complete( fin[nb_gu + b] ) && d_blocks_done.fetch_add( 1, std::memory_order_acq_rel ) + 1 == nb_d ) done.store( true, std::memory_order_release );
-			return true;
-		}
-		const bool gu_ready = gu_blocks_done.load( std::memory_order_acquire ) == nb_gu;
-		if ( gu_ready && !dsum_ready.load( std::memory_order_acquire ) ) {
-			// the down input's row sums (a few adds); idempotent
-			for ( int r = 0; r < rows; ++r ) { float t = 0; for ( int b = 0; b < nb_gu; ++b ) t += bsum[static_cast<size_t>( r ) * nb_gu + b]; dsum[r] = t; }
-			dsum_ready.store( true, std::memory_order_release );
-		}
-		const int total = 2 * nu + ( dsum_ready.load( std::memory_order_acquire ) ? nu_d : 0 );
-		// a fresh unit in order
+		const int total = 2 * nch_gu + ( dsum_ready.load( std::memory_order_acquire ) ? nch_d : 0 );
+		// a fresh unit in order (the common case: no scanning)
 		int u = next_unit.load( std::memory_order_relaxed );
 		while ( u < total ) {
 			if ( next_unit.compare_exchange_weak( u, u + 1, std::memory_order_acq_rel ) ) {
@@ -177,18 +188,24 @@ struct ExpertJob : kernels::cpu::Task {
 				u = next_unit.load( std::memory_order_relaxed );
 			}
 		}
-		// otherwise the units a thread has held for too long
-		for ( int i = 0; i < total; ++i ) {
+		// nothing fresh: finishing steps that nobody took (or took too long ago), then units held too long
+		for ( int blk = 0; blk < nb_gu + nb_d; ++blk )
+			if ( try_finish( blk, now ) ) return true;
+		for ( int i = 0; i < total; ++i )
 			if ( unit[i].state.load( std::memory_order_acquire ) == 1 && claim( unit[i], kUnitStaleNs, now ) ) { do_unit( i ); return true; }
-		}
 		return false;
 	}
 
 	void do_unit( int u ) {
 		run_unit( u );
 		if ( complete( unit[u] ) ) {
-			const int blk = u >= 2 * nu ? nb_gu + ( u - 2 * nu ) / kUnitsPerBlock : ( ( u >= nu ? u - nu : u ) / kUnitsPerBlock );
-			unit_done_b[blk].fetch_add( 1, std::memory_order_acq_rel );
+			// the block of this piece and how many 16-column units the piece holds
+			int blk, units;
+			if ( u >= 2 * nch_gu ) { const int c = u - 2 * nch_gu; blk = nb_gu + ( c * cg_d ) / kUnitsPerBlock; units = std::min( nu_d, ( c + 1 ) * cg_d ) - c * cg_d; }
+			else { const int c = u >= nch_gu ? u - nch_gu : u; blk = ( c * cg_gu ) / kUnitsPerBlock; units = cg_gu; }
+			// the thread that completes a block's last unit finishes the block at once
+			const int need = ( blk >= nb_gu ? 1 : 2 ) * kUnitsPerBlock;
+			if ( unit_done_b[blk].fetch_add( units, std::memory_order_acq_rel ) + units == need ) try_finish( blk, now_ns() );
 		}
 	}
 
