@@ -264,7 +264,7 @@ def make_args(seqlen: int) -> M.ModelArgs:
 
 
 @torch.inference_mode()
-def forward(ids: torch.Tensor, args, idx, tokenizer, use_engram: bool, n_layers: int, out: str | None):
+def forward(ids: torch.Tensor, args, idx, tokenizer, use_engram: bool, n_layers: int, out: str | None, internals=()):
     M.world_size, M.rank, M.default_dtype = 1, 0, torch.float8_e4m3fn
     M.shared_attn = M.SharedAttentionRuntime()
     layout = M.EngramLayout.from_args(args) if use_engram else None
@@ -280,6 +280,9 @@ def forward(ids: torch.Tensor, args, idx, tokenizer, use_engram: bool, n_layers:
     for i in range(n_layers):
         t0 = time.time()
         block = build_block(i, args, layout, idx, use_engram)
+        if out is not None and i in internals:   # sublayer outputs of this layer: attn_LNN.npy, ffn_LNN.npy
+            for name, mod in (("attn", block.attn), ("ffn", block.ffn)):
+                mod.register_forward_hook(lambda m, a, y, name=name, i=i: np.save(f"{out}/{name}_L{i:02d}.npy", y[0].float().cpu().numpy()))
         t1 = time.time()
         if block.engram is not None:
             h = block.engram(h, hashes[:, :, block.engram.layer_hash_index, :])
@@ -313,6 +316,7 @@ def main():
     ap.add_argument("--layers", type=int, default=0, help="stop after this many blocks (0: all)")
     ap.add_argument("--no-engram", action="store_true")
     ap.add_argument("--gen", type=int, default=0)
+    ap.add_argument("--dump-internals", default="", help="comma-separated layers whose attention / FFN outputs are saved")
     a = ap.parse_args()
 
     torch.set_default_dtype(torch.bfloat16)
@@ -350,7 +354,8 @@ def main():
         np.save(f"{a.out}/ids.npy", np.array(ids, dtype=np.int64))
 
     t0 = time.time()
-    logits = forward(torch.tensor([ids]), args, idx, tokenizer, use_engram, n_layers, a.out)
+    internals = {int(x) for x in a.dump_internals.split(",") if x}
+    logits = forward(torch.tensor([ids]), args, idx, tokenizer, use_engram, n_layers, a.out, internals)
     if logits is None:
         print(f"stopped after {n_layers} blocks ({time.time() - t0:.0f} s)")
         return

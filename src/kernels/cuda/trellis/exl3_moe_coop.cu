@@ -982,6 +982,13 @@ int pick_ksplit( int base, int kslices, int max_split, int num_sms ) {
 
 } // namespace
 
+// Lets a kernel take dynamic shared memory up to the per-block opt-in limit (96 KB on SM70, less the kernel's static shared memory)
+static void coop_smem_optin( void* fn ) {
+	cudaFuncAttributes a;
+	CUDA_CHECK( cudaFuncGetAttributes( &a, fn ) );
+	CUDA_CHECK( cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( 96 * 1024 - a.sharedSizeBytes ) ) );
+}
+
 void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t stream ) {
 	using namespace exl3_moe_coop_ns;
 	MoeCoopParams p = p_in;
@@ -1020,26 +1027,28 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	const int stage_b = stage_rows * wkk * CEIL_DIVIDE( p.I / 16, wkk ) * 32;
 	const int smem_a = p.H * 2 + smem_red_bytes() + stage_a;
 	const int smem_b = smem_red_bytes() + smem_part_bytes() + stage_b;
+	// The opt-in limit (96 KB on SM70): DeepSeek-V4.1's hidden 5120 with the 4-row int8 stage needs more than 64 KB for stage A
+	ENGINE_ASSERT( smem_a <= 96 * 1024 && smem_b <= 96 * 1024, "exl3_moe_coop: shared memory above the opt-in limit" );
 	static bool attr_set[ENGINE_NUM_GPUS] = { false }, attr_set4[ENGINE_NUM_GPUS] = { false }, attr_set2[ENGINE_NUM_GPUS] = { false };
 	if ( p.bits == 3 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<3, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<3, 2, WN, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<3, 2, WN, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<3, 2, WN, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<3, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<3, 2, WN, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<3, 2, WN, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<3, 2, WN, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		coop_smem_optin( (void*) a_kernel<3, 2, WN, 0> );
+		coop_smem_optin( (void*) a_kernel<3, 2, WN, 1> );
+		coop_smem_optin( (void*) a_kernel<3, 2, WN, 2> );
+		coop_smem_optin( (void*) a_kernel<3, 2, WN, 3> );
+		coop_smem_optin( (void*) b_kernel<3, 2, WN, 0> );
+		coop_smem_optin( (void*) b_kernel<3, 2, WN, 1> );
+		coop_smem_optin( (void*) b_kernel<3, 2, WN, 2> );
+		coop_smem_optin( (void*) b_kernel<3, 2, WN, 3> );
 		attr_set[device] = true;
 	}
 	if ( p.bits == 2 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set2[device] ) {
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<2, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<2, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		coop_smem_optin( (void*) a_kernel<2, 2, WN, 0> );
+		coop_smem_optin( (void*) b_kernel<2, 2, WN, 0> );
 		attr_set2[device] = true;
 	}
 	if ( p.bits == 4 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set4[device] ) {
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) a_kernel<4, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
-		CUDA_CHECK( cudaFuncSetAttribute( (void*) b_kernel<4, 2, WN, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024 ) );
+		coop_smem_optin( (void*) a_kernel<4, 2, WN, 0> );
+		coop_smem_optin( (void*) b_kernel<4, 2, WN, 0> );
 		attr_set4[device] = true;
 	}
 

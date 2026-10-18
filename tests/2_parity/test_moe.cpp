@@ -12,14 +12,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <algorithm>
 
 int main() {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	// MOE_FLASH=1: Flash-Next's experts (ENGINE_TEST_FLASH_DIR; MOE_BITS gives their bit width, 2 for Qwen3.8-Flash-Next-exl3) instead of GLM's
+	// MOE_DSV41=1: DeepSeek-V4.1-Flash's experts of bit width MOE_BITS (2 to 5; ENGINE_TEST_DSV41_DIR), from the layer that has the most of them
 	const bool flash = std::getenv( "MOE_FLASH" ) != nullptr;
+	const bool dsv41 = std::getenv( "MOE_DSV41" ) != nullptr;
 	const int EBITS = std::getenv( "MOE_BITS" ) ? std::atoi( std::getenv( "MOE_BITS" ) ) : 4;
-	const char* dir = flash ? engine::runtime::test::model_path( "Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", "ENGINE_TEST_FLASH_DIR" ) : engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw", "ENGINE_TEST_GLM_DIR" );
-	const int H = flash ? 2560 : 4096, I = flash ? 640 : 2048, E = flash ? 128 : 72, K = flash ? 10 : 8, L = 3;
+	const char* dir = dsv41 ? engine::runtime::test::model_path( "DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw", "ENGINE_TEST_DSV41_DIR" )
+		: flash ? engine::runtime::test::model_path( "Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", "ENGINE_TEST_FLASH_DIR" ) : engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw", "ENGINE_TEST_GLM_DIR" );
+	const int H = dsv41 ? 5120 : flash ? 2560 : 4096, I = dsv41 ? 2304 : flash ? 640 : 2048, K = dsv41 ? 6 : flash ? 10 : 8;
+	int E = flash ? 128 : 72, L = 3;
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	engine::modules::trellis_context_init_all();
 	engine::modules::trellis_get_workspace( 0, 16 * 1024 * 1024 );
@@ -36,7 +41,33 @@ int main() {
 	mw.num_local_experts = E;
 	mw.top_k = K;
 	char name[256];
+	std::vector<int> dsv_ids;   // DeepSeek: the checkpoint ids of the chosen width's experts in the chosen layer
+	if ( dsv41 ) {
+		size_t best = 0;
+		for ( int l = 0; l < 40; ++l ) {
+			std::vector<int> ids;
+			for ( int e = 0; e < 384; ++e ) {
+				std::snprintf( name, sizeof( name ), "layers.%d.ffn.experts.%d.w1.trellis", l, e );
+				const auto* m = repo.find( name );
+				if ( m != nullptr && m->shape[2] / 16 == EBITS && ids.size() < 96 ) ids.push_back( e );
+			}
+			if ( ids.size() > best ) { best = ids.size(); dsv_ids = ids; L = l; }
+		}
+		ENGINE_ASSERT( !dsv_ids.empty(), "test_moe: no expert of that width" );
+		E = static_cast<int>( dsv_ids.size() );
+		mw.num_local_experts = E;
+		std::printf( "[*] DeepSeek-V4.1: %d experts of %d bits in layer %d\n", E, EBITS, L );
+	}
 	for ( int e = 0; e < E; ++e ) {
+		if ( dsv41 ) {
+			const char* parts[3] = { "w1", "w3", "w2" };
+			pod::LinearWeight* dst[3] = { &mw.gate[e], &mw.up[e], &mw.down[e] };
+			for ( int p = 0; p < 3; ++p ) {
+				std::snprintf( name, sizeof( name ), "layers.%d.ffn.experts.%d.%s", L, dsv_ids[e], parts[p] );
+				*dst[p] = repo.load_linear( name, arena, EBITS, stream );
+			}
+			continue;
+		}
 		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, e );
 		mw.gate[e] = repo.load_linear( name, arena, EBITS, stream );
 		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, e );
@@ -50,6 +81,7 @@ int main() {
 
 	// Inputs: x ~ U(-1, 1); routes include out-of-partition experts (>= 72) that must be skipped
 	int h_idx[10] = { 3, 17, 40, 71, 100, 5, 250, 66 };
+	if ( dsv41 ) for ( int k = 0; k < K; ++k ) h_idx[k] = k * 7 < E ? k * 7 : E + k;   // in-range ids where the group is large enough
 	if ( flash ) { const int fi[10] = { 3, 17, 40, 71, 127, 5, 250, 66, 9, 300 }; for ( int k = 0; k < K; ++k ) h_idx[k] = fi[k]; }
 	// MOE_ACTIVE=n keeps only the first n routes (others moved out of partition) for bisection
 	if ( const char* env = std::getenv( "MOE_ACTIVE" ) ) {
@@ -142,7 +174,7 @@ int main() {
 				int e;
 				do {
 					seed = seed * 1664525u + 1013904223u;
-					e = ( ( seed >> 12 ) % 4 == 0 ) ? E + ( ( seed >> 4 ) % 200 ) : ( ( seed >> 4 ) % ( flash ? 14 : 10 ) );
+					e = ( ( seed >> 12 ) % 4 == 0 ) ? E + ( ( seed >> 4 ) % 200 ) : ( ( seed >> 4 ) % ( flash ? 14 : dsv41 ? std::max( E, 1 ) : 10 ) );
 				} while ( used[e] );
 				used[e] = 1;
 				hir[r * K + k] = e;
