@@ -50,6 +50,9 @@ static pod::DType parse_dtype_str( const char* str, size_t len ) {
 	if ( len == 7 && std::strncmp( str, "F8_E4M3", 7 ) == 0 ) {
 		return pod::DType::UINT8;  // raw bytes; the NVFP4 loader decodes them
 	}
+	if ( len == 7 && std::strncmp( str, "F8_E8M0", 7 ) == 0 ) {
+		return pod::DType::UINT8;  // raw bytes: power-of-two block scales (DeepSeek-V4.1's FP8 / FP4 tensors)
+	}
 	return pod::DType::FP16;
 }
 

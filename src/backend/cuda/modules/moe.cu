@@ -856,7 +856,7 @@ void MoE::forward(
 			const int K_up = weights.up[0].bits;
 			const int K_down = weights.down[0].bits;
 			ENGINE_ASSERT( weights.device_ptrs != nullptr, "MoE::forward: init_device_ptrs not called" );
-			ENGINE_ASSERT( K_gate == K_up && K_up == K_down && ( K_gate == 2 || K_gate == 3 || K_gate == 4 ), "MoE::forward: persistent trellis MoE kernel is instantiated for 2, 3 and 4-bit experts only" );
+			ENGINE_ASSERT( K_gate == K_up && K_up == K_down && K_gate >= 2 && K_gate <= 5, "MoE::forward: persistent trellis MoE kernel is instantiated for 2 to 5-bit experts" );
 
 			const int wide = rows > 128 && runtime::options().moe_prefill_tile ? 3 : rows > 8 ? 2 : 0;
 			MoERouter::exl3_moe_dispatch(
@@ -937,7 +937,18 @@ void MoE::forward(
 
 namespace ext {
 
-static bool attr_done[ENGINE_NUM_GPUS][4] = {};
+// The persistent kernel of a (bits, output tile) variant and row mode (0: 4-row tile, 2: 16 rows, 3: the wide prefill tile)
+static void* moe_kernel_fn( int variant, int mode ) {
+	switch ( variant ) {
+		case 0: return mode == 3 ? (void*) exl3_moe_kernel<3, 256, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0>;
+		case 1: return mode == 3 ? (void*) exl3_moe_kernel<3, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<3, 128, 2, 0>;
+		case 3: return mode == 3 ? (void*) exl3_moe_kernel<2, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<2, 128, 2, 2> : (void*) exl3_moe_kernel<2, 128, 2, 0>;
+		case 4: return mode == 3 ? (void*) exl3_moe_kernel<5, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<5, 128, 2, 2> : (void*) exl3_moe_kernel<5, 128, 2, 0>;
+		default: return mode == 3 ? (void*) exl3_moe_kernel<4, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<4, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 0>;
+	}
+}
+
+static bool attr_done[ENGINE_NUM_GPUS][5] = {};
 
 void exl3_moe_reset_caches() {
 	for ( auto& d : attr_done ) for ( bool& b : d ) b = false;
@@ -1033,15 +1044,12 @@ void exl3_moe(
 
 	// 3-bit experts with a 256-divisible intermediate width (GLM) run 256-wide output tiles; every other shape (4-bit experts, and
 	// 3-bit ones with Flash-Next's intermediate 640) takes the 128-wide tiles
-	ENGINE_ASSERT( K_gate == 2 || K_gate == 3 || K_gate == 4, "exl3_moe: expert bits" );
+	ENGINE_ASSERT( K_gate >= 2 && K_gate <= 5, "exl3_moe: expert bits" );
 	const bool tile128 = K_gate != 3 || intermediate_dim % 256 != 0;
 	ENGINE_ASSERT( intermediate_dim % ( tile128 ? 128 : 256 ) == 0, "exl3_moe: intermediate width vs the output tile" );
-	const int variant = K_gate == 4 ? 2 : K_gate == 2 ? 3 : ( tile128 ? 1 : 0 );   // 0: <3,256>, 1: <3,128>, 2: <4,128>, 3: <2,128>
+	const int variant = K_gate == 5 ? 4 : K_gate == 4 ? 2 : K_gate == 2 ? 3 : ( tile128 ? 1 : 0 );   // 0: <3,256>, 1: <3,128>, 2: <4,128>, 3: <2,128>, 4: <5,128> (DeepSeek-V4.1's few 5-bit experts)
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_done[device][variant] ) {
-		void* fns[3] = {
-			variant == 0 ? (void*) exl3_moe_kernel<3, 256, 2, 0> : variant == 1 ? (void*) exl3_moe_kernel<3, 128, 2, 0> : variant == 3 ? (void*) exl3_moe_kernel<2, 128, 2, 0> : (void*) exl3_moe_kernel<4, 128, 2, 0>,
-			variant == 0 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : variant == 1 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : variant == 3 ? (void*) exl3_moe_kernel<2, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 2>,
-			variant == 0 ? (void*) exl3_moe_kernel<3, 256, 2, 3> : variant == 1 ? (void*) exl3_moe_kernel<3, 128, 2, 3> : variant == 3 ? (void*) exl3_moe_kernel<2, 128, 2, 3> : (void*) exl3_moe_kernel<4, 128, 2, 3> };
+		void* fns[3] = { moe_kernel_fn( variant, 0 ), moe_kernel_fn( variant, 2 ), moe_kernel_fn( variant, 3 ) };
 		for ( void* fn : fns ) CUDA_CHECK( cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
 		attr_done[device][variant] = true;
 	}
@@ -1049,12 +1057,7 @@ void exl3_moe(
 	// The wide kernel carries the 16-row GEMM tile as well; keeping it out of the decode kernel preserves its registers
 	// Output-tile width of the expert GEMMs: 256 is 18-29% faster than 128 below 64 rows on both the sharded and the whole-expert
 	// layouts (fewer K-split reductions per weight decoded) and level at 512
-	void* moe_fn = nullptr;
-	if ( wide == 3 ) moe_fn = variant == 0 ? (void*) exl3_moe_kernel<3, 256, 2, 3> : variant == 1 ? (void*) exl3_moe_kernel<3, 128, 2, 3> : variant == 3 ? (void*) exl3_moe_kernel<2, 128, 2, 3> : (void*) exl3_moe_kernel<4, 128, 2, 3>;
-	else if ( variant == 0 ) moe_fn = wide == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0>;
-	else if ( variant == 1 ) moe_fn = wide == 2 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<3, 128, 2, 0>;
-	else if ( variant == 3 ) moe_fn = wide == 2 ? (void*) exl3_moe_kernel<2, 128, 2, 2> : (void*) exl3_moe_kernel<2, 128, 2, 0>;
-	else moe_fn = wide == 2 ? (void*) exl3_moe_kernel<4, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 0>;
+	void* moe_fn = moe_kernel_fn( variant, wide == 3 ? 3 : wide == 2 ? 2 : 0 );
 #if defined(USE_ROCM)
 	// RDNA grants a workgroup 64 KB, below the 90 KB cap the CUDA launch reserves: request what the tile uses (the 16-row tile's
 	// footprint, ~22 KB at most; the decode variant's 4-row tile needs less)

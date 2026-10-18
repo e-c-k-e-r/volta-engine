@@ -25,7 +25,7 @@ int main( int argc, char** argv ) {
 	int counts[3] = {};
 	bool ok = true;
 	std::string headers;
-	for ( const char* h : { "attention", "dsa", "embedding", "expert_tier", "gated_residual", "gdn", "linear", "mhc", "mla", "moe", "norm", "nvfp4", "ple", "qsa", "rope", "swiglu", "trellis" } ) {
+	for ( const char* h : { "attention", "dsa", "dsv4", "embedding", "expert_tier", "gated_residual", "gdn", "linear", "mhc", "mla", "moe", "norm", "nvfp4", "ple", "qsa", "rope", "swiglu", "trellis" } ) {
 		std::ifstream f( root + "/inc/engine/modules/" + h + ".h" );
 		std::stringstream ss; ss << f.rdbuf(); headers += ss.str();
 	}

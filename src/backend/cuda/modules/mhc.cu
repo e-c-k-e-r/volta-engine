@@ -682,7 +682,7 @@ void HyperConnection::collapse(
 		mix_logits_buf,
 		pre_buf,
 		hidden_size,
-		chunksA,
+		n_chunks_a,   // the partials written per row: 64 for hidden 4096, fewer for wider rows (5120: 40 chunks of 512)
 		chunk_cols_c,
 		1e-5f,
 		eps,
