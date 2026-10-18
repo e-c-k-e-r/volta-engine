@@ -15,7 +15,8 @@ using namespace engine::kernels::cpu;
 namespace {
 
 constexpr int kUnitsPerBlock = kBlock / 16;
-constexpr int kJobs = 8;
+constexpr int kJobs = 16;      // experts evaluated at once
+constexpr int kManyTasks = 4;
 constexpr int kPieceWeights = 40000;
 // A piece of work (a unit of 16 columns takes about 10 us, a block's finishing step a few) that has been held longer than this by a thread is taken
 // over: that thread was most likely descheduled
@@ -212,24 +213,75 @@ struct ExpertJob : kernels::cpu::Task {
 	std::atomic<bool> dsum_ready{ false };
 };
 
-Scratch::Scratch() { for ( int i = 0; i < kJobs; ++i ) jobs.emplace_back( new ExpertJob ); }
+// Several experts' jobs as one task: a thread takes a piece from the first job that has one, starting at a different job each time, so the tail of one
+// expert (its last pieces, the barrier before its down projection) is filled with the pieces of the others
+struct ManyTask : kernels::cpu::Task {
+	ExpertJob* jobs[kJobs] = {};
+	int n = 0;
+	std::atomic<uint32_t> rr{ 0 };
+	bool finished() const override {
+		for ( int i = 0; i < n; ++i ) if ( !jobs[i]->finished() ) return false;
+		return true;
+	}
+	bool work() override {
+		const uint32_t start = rr.fetch_add( 1, std::memory_order_relaxed );
+		for ( int i = 0; i < n; ++i ) {
+			ExpertJob* j = jobs[( start + i ) % n];
+			if ( j->finished() ) continue;
+			j->refs.fetch_add( 1, std::memory_order_acq_rel );   // the job may not be reused while this thread is inside it
+			const bool did = j->work();
+			j->refs.fetch_sub( 1, std::memory_order_acq_rel );
+			if ( did ) return true;
+		}
+		return false;
+	}
+};
+
+Scratch::Scratch() {
+	for ( int i = 0; i < kJobs; ++i ) jobs.emplace_back( new ExpertJob );
+	for ( int i = 0; i < kManyTasks; ++i ) many.emplace_back( new ManyTask );
+}
 Scratch::~Scratch() {}
 
-void expert_forward( Pool& pool, const Expert& e, int rows, const uint16_t* x, const float* wts, float* out, Scratch& s, float act_limit ) {
-	// the next job nobody holds (a descheduled pool thread may still hold an old one)
-	ExpertJob* job = nullptr;
+namespace {
+// The next object of a ring that nobody holds (a descheduled pool thread may still hold an old one)
+template <class T>
+T* acquire( std::vector<std::unique_ptr<T>>& ring, size_t& next ) {
 	for ( ;; ) {
-		for ( int tries = 0; tries < kJobs && !job; ++tries ) {
-			ExpertJob* c = s.jobs[s.next++ % kJobs].get();
-			if ( c->refs.load( std::memory_order_acquire ) == 0 ) job = c;
+		for ( size_t tries = 0; tries < ring.size(); ++tries ) {
+			T* c = ring[next++ % ring.size()].get();
+			if ( c->refs.load( std::memory_order_acquire ) == 0 ) return c;
 		}
-		if ( job ) break;
 		std::this_thread::yield();
 	}
-	job->prepare( e, rows, x, wts, act_limit );
-	pool.run( *job );
-	const size_t n = static_cast<size_t>( rows ) * job->H;
-	for ( size_t i = 0; i < n; ++i ) out[i] += job->out_tmp[i];
+}
+}   // namespace
+
+void expert_forward_many( Pool& pool, const ExpertCall* calls, int count, Scratch& s, float act_limit ) {
+	for ( int base = 0; base < count; base += kJobs ) {
+		const int n = std::min( kJobs, count - base );
+		ManyTask* task = acquire( s.many, s.next_many );
+		task->n = n;
+		for ( int i = 0; i < n; ++i ) {
+			// the jobs of a wave stay distinct: take them in order, not holding two of the same
+			ExpertJob* j = acquire( s.jobs, s.next );
+			for ( int k = 0; k < i && task->jobs[k] == j; ++k ) j = acquire( s.jobs, s.next );
+			const ExpertCall& c = calls[base + i];
+			j->prepare( c.e, c.rows, c.x, c.wts, act_limit );
+			task->jobs[i] = j;
+		}
+		pool.run( *task );
+		for ( int i = 0; i < n; ++i ) {
+			const ExpertCall& c = calls[base + i];
+			const size_t m = static_cast<size_t>( c.rows ) * task->jobs[i]->H;
+			for ( size_t q = 0; q < m; ++q ) c.out[q] += task->jobs[i]->out_tmp[q];
+		}
+	}
+}
+
+void expert_forward( Pool& pool, const Expert& e, int rows, const uint16_t* x, const float* wts, float* out, Scratch& s, float act_limit ) {
+	const ExpertCall c = { e, rows, x, wts, out };
+	expert_forward_many( pool, &c, 1, s, act_limit );
 }
 
 }   // namespace engine::cpu_moe

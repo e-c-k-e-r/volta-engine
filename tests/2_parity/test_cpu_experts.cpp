@@ -7,6 +7,7 @@
 #include "engine/kernels/cpu/nvfp4_linear.h"
 #include "engine/quant/fp4_fp8.h"
 #include "engine/loader/safetensors.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -311,6 +312,43 @@ static void part3() {
 	}
 }
 
+// Experts evaluated together give the same sums as one after the other
+static void part3_many() {
+	const int H = 512, I = 256, E = 6;
+	std::vector<Fp4Mat> m;
+	m.reserve( 3 * E );
+	std::vector<std::unique_ptr<Nvfp4Linear>> lin;
+	for ( int e = 0; e < E; ++e ) {
+		m.push_back( make_fp4( H, I ) ); m.push_back( make_fp4( H, I ) ); m.push_back( make_fp4( I, H ) );
+		lin.emplace_back( new Nvfp4Linear( m[3 * e].codes.data(), m[3 * e].scales.data(), m[3 * e].gs, H, I ) );
+		lin.emplace_back( new Nvfp4Linear( m[3 * e + 1].codes.data(), m[3 * e + 1].scales.data(), m[3 * e + 1].gs, H, I ) );
+		lin.emplace_back( new Nvfp4Linear( m[3 * e + 2].codes.data(), m[3 * e + 2].scales.data(), m[3 * e + 2].gs, I, H ) );
+	}
+	std::vector<std::vector<uint16_t>> xh( E );
+	std::vector<std::vector<float>> w( E ), one( E ), many( E );
+	std::vector<ExpertCall> calls;
+	Pool pool( 4, {} );
+	Scratch sc;
+	for ( int e = 0; e < E; ++e ) {
+		const int rows = 1 + e % 3;
+		std::vector<float> xf( static_cast<size_t>( rows ) * H );
+		for ( auto& v : xf ) v = rnd();
+		xh[e].resize( xf.size() );
+		float_to_half( xf.data(), xh[e].data(), xf.size() );
+		w[e].assign( rows, 0.5f );
+		one[e].assign( xf.size(), 0.0f ); many[e].assign( xf.size(), 0.0f );
+		Expert ex; ex.gate = lin[3 * e].get(); ex.up = lin[3 * e + 1].get(); ex.down = lin[3 * e + 2].get();
+		expert_forward( pool, ex, rows, xh[e].data(), w[e].data(), one[e].data(), sc, 0.0f );
+		calls.push_back( ExpertCall{ ex, rows, xh[e].data(), w[e].data(), many[e].data() } );
+	}
+	for ( int rep = 0; rep < 50; ++rep ) {
+		for ( auto& v : many ) std::fill( v.begin(), v.end(), 0.0f );
+		expert_forward_many( pool, calls.data(), E, sc, 0.0f );
+		for ( int e = 0; e < E; ++e ) CHECK( one[e] == many[e], "many: expert %d differs from the single call (rep %d)", e, rep );
+	}
+	std::printf( "many: done\n" );
+}
+
 static void part3_speed() {
 	const int H = 4096, I = 2048;
 	Fp4Mat mg = make_fp4( H, I ), mu = make_fp4( H, I ), md = make_fp4( I, H );
@@ -392,6 +430,7 @@ int main( int argc, char** argv ) {
 	pool_stress();
 	part1();
 	part3();
+	part3_many();
 	part3_speed();
 	const std::string dir = argc > 1 ? argv[1] : "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
 	part2( dir, argc > 2 ? std::atoi( argv[2] ) : 10, argc > 3 ? std::atoi( argv[3] ) : 0 );

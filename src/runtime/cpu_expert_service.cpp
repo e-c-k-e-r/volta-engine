@@ -166,9 +166,8 @@ void Service::handle( Rank& r ) {
 	std::vector<int> order( n );
 	for ( int i = 0; i < n; ++i ) order[i] = i;
 	std::stable_sort( order.begin(), order.end(), [&]( int a, int b ) { return mb->routes[a].expert < mb->routes[b].expert; } );
-	std::vector<uint16_t> xg;
-	std::vector<float> wts, tmp;
-	int experts = 0;
+	// one group per expert: the rows routed to it, gathered; all groups are evaluated together
+	int groups = 0;
 	for ( int i = 0; i < n; ) {
 		int j = i;
 		const int e = mb->routes[order[i]].expert;
@@ -183,25 +182,36 @@ void Service::handle( Rank& r ) {
 			}
 		}
 		if ( o ) {
-			xg.resize( static_cast<size_t>( m ) * H );
-			wts.resize( m );
-			tmp.assign( static_cast<size_t>( m ) * H, 0.0f );
+			if ( groups == static_cast<int>( groups_.size() ) ) groups_.emplace_back();
+			Group& g = groups_[groups++];
+			g.o = o; g.first = i; g.m = m;
+			g.xg.resize( static_cast<size_t>( m ) * H );
+			g.wts.resize( m );
+			g.tmp.assign( static_cast<size_t>( m ) * H, 0.0f );
 			for ( int k = 0; k < m; ++k ) {
 				const MailboxRoute& rt = mb->routes[order[i + k]];
-				std::memcpy( &xg[static_cast<size_t>( k ) * H], x + static_cast<size_t>( rt.row ) * H, static_cast<size_t>( H ) * 2 );
-				wts[k] = rt.weight;
+				std::memcpy( &g.xg[static_cast<size_t>( k ) * H], x + static_cast<size_t>( rt.row ) * H, static_cast<size_t>( H ) * 2 );
+				g.wts[k] = rt.weight;
 			}
-			Expert ex; ex.gate = o->gate.get(); ex.up = o->up.get(); ex.down = o->down.get();
-			expert_forward( *pool_, ex, m, xg.data(), wts.data(), tmp.data(), scratch_, r.act_limit );
-			for ( int k = 0; k < m; ++k ) {
-				float* dst = out + static_cast<size_t>( mb->routes[order[i + k]].row ) * H;
-				const float* src = &tmp[static_cast<size_t>( k ) * H];
-				for ( int c = 0; c < H; ++c ) dst[c] += src[c];
-			}
-			++experts;
 		}
 		i = j;
 	}
+	calls_.resize( groups );
+	for ( int gi = 0; gi < groups; ++gi ) {
+		const Group& g = groups_[gi];
+		Expert ex; ex.gate = g.o->gate.get(); ex.up = g.o->up.get(); ex.down = g.o->down.get();
+		calls_[gi] = ExpertCall{ ex, g.m, g.xg.data(), g.wts.data(), groups_[gi].tmp.data() };
+	}
+	if ( groups ) expert_forward_many( *pool_, calls_.data(), groups, scratch_, r.act_limit );
+	for ( int gi = 0; gi < groups; ++gi ) {
+		const Group& g = groups_[gi];
+		for ( int k = 0; k < g.m; ++k ) {
+			float* dst = out + static_cast<size_t>( mb->routes[order[g.first + k]].row ) * H;
+			const float* src = &g.tmp[static_cast<size_t>( k ) * H];
+			for ( int c = 0; c < H; ++c ) dst[c] += src[c];
+		}
+	}
+	const int experts = groups;
 	std::atomic_thread_fence( std::memory_order_release );
 	r.seen = seq;
 	mb->done_seq = seq;

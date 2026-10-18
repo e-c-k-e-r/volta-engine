@@ -58,6 +58,9 @@ private:
 	std::vector<std::pair<void*, size_t>> maps_;
 	std::atomic<size_t> host_bytes_{ 0 };
 	std::atomic<uint32_t> ranks_version_{ 0 };   // bumped when a rank's mailbox appears, so the dispatcher refreshes its list only then
+	struct Group { const Owned* o = nullptr; int first = 0, m = 0; std::vector<uint16_t> xg; std::vector<float> wts, tmp; };
+	std::vector<Group> groups_;       // the experts of the request being served
+	std::vector<ExpertCall> calls_;
 	Scratch scratch_;
 	std::atomic<uint64_t> requests_{ 0 }, experts_{ 0 }, rows_{ 0 };
 	std::atomic<uint64_t> busy_ns_{ 0 };
