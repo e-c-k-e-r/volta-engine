@@ -113,6 +113,12 @@ public:
 	void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) override { (void) slot_id; (void) stream; }
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override { (void) slot_id; (void) stream; }
 	void reset_state( int slot_id = 0 ) override { (void) slot_id; }
+	// Prefix-cache snapshots: positions [from, tokens) store their compressed KV and index-key entries and their Engram ids; the state at `tokens`
+	// is the last WINDOW rows of every layer's window ring. Positions are even, so no 2:1 compression group is ever half filled at a boundary
+	int seq_align() const override { return 2; }
+	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
+	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
+	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;
 
 	pod::TensorView& logits() override { return logits_; }
 	const pod::TensorView& logits() const override { return logits_; }
@@ -129,6 +135,8 @@ private:
 
 	bool read_config( const char* model_dir );
 	bool load_engram( const char* model_dir );
+	// moves the snapshot rows of [from, tokens) of a slot between the caches and host memory (layout: see seq_state_bytes)
+	void copy_seq_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	void engram_prepare( const pod::BatchRows& rows, backend::stream_t stream );
 	void set_rows( int m );
 	void forward_body( int m, backend::stream_t stream );

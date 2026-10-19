@@ -35,6 +35,7 @@ int main( int argc, char** argv ) {
 	int gen = 8, a = 3;
 	if ( argc > 3 && std::string( argv[3] ).find( '=' ) == std::string::npos ) { gen = std::atoi( argv[3] ); a = 4; }
 	std::string turns;
+	int snap_at = 0;   // snap=<P>: prefix-cache round trip with a snapshot chain ending near position P
 	int turns_first = 0, turns_count = 1 << 30;
 	std::string dump;   // dump=<file>: teacher-forced prefill in chunks of 512 rows, every row's FP16 logits appended (needs glm_logit_rows=512)
 	for ( ; a < argc; ++a ) {
@@ -43,6 +44,7 @@ int main( int argc, char** argv ) {
 		ENGINE_ASSERT( eq != std::string::npos, "test_dsv41: options are key=value" );
 		if ( kv.substr( 0, eq ) == "dump" ) { dump = kv.substr( eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "turns" ) { turns = kv.substr( eq + 1 ); continue; }
+		if ( kv.substr( 0, eq ) == "snap" ) { snap_at = std::atoi( kv.c_str() + eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "turns_first" ) { turns_first = std::atoi( kv.c_str() + eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "turns_count" ) { turns_count = std::atoi( kv.c_str() + eq + 1 ); continue; }
 		ENGINE_ASSERT( set_option( kv.substr( 0, eq ), kv.substr( eq + 1 ) ), "test_dsv41: bad option" );
@@ -98,6 +100,34 @@ int main( int argc, char** argv ) {
 	}
 	const auto t0 = std::chrono::steady_clock::now();
 	const test::GenStats st = test::generate( mc, prompt, gen, false );
+	if ( snap_at > 0 ) {
+		// prefix-cache round trip: snapshots [0, P1) and [P1, P2), the caches overwritten by another prompt, the chain restored (the parent
+		// kv-only), the rest of the prompt prefilled from P2: the continuation must equal the plain run's
+		const int P2 = ( std::min<int>( snap_at, static_cast<int>( prompt.size() ) - 2 ) / 2 ) * 2, P1 = ( P2 / 4 ) * 2;
+		ModelCluster::SeqSnapshot s1, s2;
+		mc.reset_slot( 0 );
+		mc.prefill( prompt.data(), P1, 0 );
+		ENGINE_ASSERT( mc.save_snapshot( 0, 0, P1, &s1, false ), "test_dsv41: save [0, P1)" );
+		mc.prefill( prompt.data() + P1, P2 - P1, 0, 0, nullptr, P1 );
+		ENGINE_ASSERT( mc.save_snapshot( 0, P1, P2, &s2, false ), "test_dsv41: save [P1, P2)" );
+		std::vector<int> other( prompt.rbegin(), prompt.rend() );
+		mc.reset_slot( 0 );
+		mc.prefill( other.data(), static_cast<int>( other.size() ), 0 );
+		mc.reset_slot( 0 );
+		ENGINE_ASSERT( mc.load_snapshot( 0, s1, true ) && mc.load_snapshot( 0, s2, false ), "test_dsv41: load" );
+		std::vector<int> toks;
+		int tok = mc.prefill( prompt.data() + P2, static_cast<int>( prompt.size() ) - P2, 0, 0, nullptr, P2 );
+		toks.push_back( tok );
+		for ( int pos = static_cast<int>( prompt.size() ); static_cast<int>( toks.size() ) < static_cast<int>( st.tokens.size() ) && !mc.is_eos( tok ); ) {
+			mc.forward( &tok, 1, pos++, 0 );
+			tok = mc.sample_one();
+			toks.push_back( tok );
+		}
+		const bool same = toks == st.tokens;
+		std::printf( "[%c] snapshot round trip at %d / %d of %zu tokens: continuation %s (%zu tokens)\n", same ? '+' : '-', P1, P2, prompt.size(), same ? "identical" : "DIFFERS", toks.size() );
+		mc.free_snapshot( &s1 );
+		mc.free_snapshot( &s2 );
+	}
 	const int dec = static_cast<int>( st.tokens.size() ) - 1;
 	std::printf( "[*] prompt %zu tokens, %.1f s: prefill %.0f ms (%.0f tok/s), decode %d tokens in %.0f ms (%.1f ms/token, %.1f tok/s)\n", prompt.size(), test::ms_since( t0 ) / 1000.0,
 		st.prefill_ms, prompt.size() * 1000.0 / st.prefill_ms, dec, st.decode_ms, dec > 0 ? st.decode_ms / dec : 0.0, dec > 0 ? dec * 1000.0 / st.decode_ms : 0.0 );

@@ -144,8 +144,8 @@ Qwen extras:
   the route counts are saved at exit and the next start keeps the hottest experts on the device and balances the heat over the ranks. Counts from five
   recorded Claude Code turns put 95% of the routes of five other turns on resident experts (62% without), and a held-out turn decoded at 59 ms a token
   instead of 196 and prefilled at 188 tok/s instead of 84; a placement made on one kind of text slows down a very different one (a story: 46% resident). The prompt format is the checkpoint's `encoding/encoding.py`, built in
-  (no chat template): thinking and reasoning effort (low 50, medium 60, high 75, max 100), tools as DSML tool calls. Not yet: the prefix cache
-  (`prefix_cache_gib` must be 0), speculation, images.
+  (no chat template): thinking and reasoning effort (low 50, medium 60, high 75, max 100), tools as DSML tool calls. The prefix cache works (a snapshot holds the
+  compressed KV and index keys of its positions plus the last 128 window rows of each layer). Not yet: speculation, images.
 * **Two GPUs per instance**: `--tp-size 2` runs one model on two GPUs (about 0.7x the speed of four); start a second server with
   `CUDA_VISIBLE_DEVICES=2,3` on the other pair for twice the aggregate throughput. GLM runs on 1, 2 or 4 GPUs (on two, the experts need the expert tier, `expert_cache` below 1, to fit).
 
