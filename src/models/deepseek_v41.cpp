@@ -20,6 +20,9 @@
 #include <cstring>
 #include <fstream>
 #include <numeric>
+#include <chrono>
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace engine::models {
 
@@ -398,6 +401,12 @@ bool DeepseekV41Pipeline::load_engram( const char* model_dir ) {
 		ENGINE_ASSERT( mw->shape[1] == eg_.dim && ms->shape[1] * eg_.block == eg_.dim, "Engram table shape" );
 		eg_.table[e] = static_cast<const uint8_t*>( engine::loader::safetensors_get_data_cpu( *repo_->get_shard( sw ), mw ) );
 		eg_.scale[e] = static_cast<const uint8_t*>( engine::loader::safetensors_get_data_cpu( *repo_->get_shard( ss ), ms ) );
+		// random 4 KB reads: the default readahead of a fault (128 KB and up) would read mostly unrelated rows
+		eg_.page = static_cast<size_t>( sysconf( _SC_PAGESIZE ) );
+		for ( auto [ptr, bytes] : { std::pair<const uint8_t*, size_t>{ eg_.table[e], mw->size_bytes }, std::pair<const uint8_t*, size_t>{ eg_.scale[e], ms->size_bytes } } ) {
+			const uintptr_t a = reinterpret_cast<uintptr_t>( ptr ) & ~( eg_.page - 1 );
+			madvise( reinterpret_cast<void*>( a ), reinterpret_cast<uintptr_t>( ptr ) + bytes - a, MADV_RANDOM );
+		}
 	}
 	eg_.hist.assign( config_.max_slots, std::vector<int>( config_.max_seq, eg_.pad ) );
 	const size_t cols = static_cast<size_t>( eg_.heads ) * ( eg_.ngram - 1 ) * eg_.dim;
@@ -634,7 +643,10 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 	const int m = rows.count;
 	ENGINE_ASSERT( static_cast<int>( pending_tokens_.size() ) == m, "DeepseekV41Pipeline: embed_tokens and forward disagree on the row count" );
 	const int N = eg_.ngram, NH = eg_.heads, D = eg_.dim, nb = D / eg_.block;
-	const size_t cols = static_cast<size_t>( NH ) * ( N - 1 ) * D;
+	const int per = ( N - 1 ) * NH;   // table rows per position and Engram layer
+	const size_t cols = static_cast<size_t>( per ) * D;
+	// 1. hashes (the history is updated row by row, so a chunk sees its own earlier rows)
+	eg_.idx.resize( static_cast<size_t>( m ) * eg_.layers * per );
 	for ( int r = 0; r < m; ++r ) {
 		const int s = rows.slot[r], pos = rows.pos[r];
 		const int tok = pending_tokens_[r];
@@ -642,20 +654,39 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 		int64_t toks[8];
 		for ( int k = 0; k < N; ++k ) toks[k] = pos - k >= 0 ? eg_.hist[s][pos - k] : eg_.pad;
 		for ( int e = 0; e < eg_.layers; ++e ) {
-			backend::half_t* dst = eg_.host_rows + ( static_cast<size_t>( e ) * pod::MAX_ROWS + r ) * cols;
 			int64_t rolling = toks[0] * eg_.mult[static_cast<size_t>( e ) * N];
 			for ( int i = 1; i < N; ++i ) {
 				rolling ^= toks[i] * eg_.mult[static_cast<size_t>( e ) * N + i];
 				for ( int h = 0; h < NH; ++h ) {
 					const size_t c = static_cast<size_t>( i - 1 ) * NH + h;
-					const int64_t row = rolling % eg_.primes[static_cast<size_t>( e ) * ( N - 1 ) * NH + c] + eg_.offsets[static_cast<size_t>( e ) * ( N - 1 ) * NH + c];
-					const uint8_t* w = eg_.table[e] + static_cast<size_t>( row ) * D;
-					const uint8_t* sc = eg_.scale[e] + static_cast<size_t>( row ) * nb;
-					backend::half_t* o = dst + c * D;
-					for ( int b = 0; b < nb; ++b ) {
-						const float f = std::ldexp( 1.0f, static_cast<int>( sc[b] ) - 127 );
-						for ( int d = b * eg_.block; d < ( b + 1 ) * eg_.block; ++d ) o[d] = backend::from_float_half( eg_.e4m3[w[d]] * f );
-					}
+					eg_.idx[( static_cast<size_t>( r ) * eg_.layers + e ) * per + c] =
+						rolling % eg_.primes[static_cast<size_t>( e ) * per + c] + eg_.offsets[static_cast<size_t>( e ) * per + c];
+				}
+			}
+		}
+	}
+	// 2. the rows' pages are requested all at once (the tables are far larger than the page cache: a miss is an NVMe read, and serial
+	// faults cost ~1 ms each; asked together they overlap)
+	const uintptr_t pg = static_cast<uintptr_t>( eg_.page );
+	for ( size_t k = 0; k < eg_.idx.size(); ++k ) {
+		const int e = static_cast<int>( ( k / per ) % eg_.layers );
+		const uintptr_t w = reinterpret_cast<uintptr_t>( eg_.table[e] + static_cast<size_t>( eg_.idx[k] ) * D );
+		const uintptr_t sc = reinterpret_cast<uintptr_t>( eg_.scale[e] + static_cast<size_t>( eg_.idx[k] ) * nb );
+		madvise( reinterpret_cast<void*>( w & ~( pg - 1 ) ), ( ( w + D - 1 ) & ~( pg - 1 ) ) - ( w & ~( pg - 1 ) ) + pg, MADV_WILLNEED );
+		madvise( reinterpret_cast<void*>( sc & ~( pg - 1 ) ), pg, MADV_WILLNEED );
+	}
+	// 3. gather and dequantize (FP8 with a power-of-two scale per block)
+	for ( int r = 0; r < m; ++r ) {
+		for ( int e = 0; e < eg_.layers; ++e ) {
+			backend::half_t* dst = eg_.host_rows + ( static_cast<size_t>( e ) * pod::MAX_ROWS + r ) * cols;
+			for ( int c = 0; c < per; ++c ) {
+				const int64_t row = eg_.idx[( static_cast<size_t>( r ) * eg_.layers + e ) * per + c];
+				const uint8_t* w = eg_.table[e] + static_cast<size_t>( row ) * D;
+				const uint8_t* sc = eg_.scale[e] + static_cast<size_t>( row ) * nb;
+				backend::half_t* o = dst + static_cast<size_t>( c ) * D;
+				for ( int b = 0; b < nb; ++b ) {
+					const float f = std::ldexp( 1.0f, static_cast<int>( sc[b] ) - 127 );
+					for ( int d = b * eg_.block; d < ( b + 1 ) * eg_.block; ++d ) o[d] = backend::from_float_half( eg_.e4m3[w[d]] * f );
 				}
 			}
 		}

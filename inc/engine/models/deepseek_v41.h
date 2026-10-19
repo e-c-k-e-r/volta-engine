@@ -190,6 +190,8 @@ private:
 		const uint8_t* table[2] = {};
 		const uint8_t* scale[2] = {};
 		std::vector<std::vector<int>> hist;       // [slot][pos] compressed ids
+		std::vector<int64_t> idx;                 // the table rows of the current forward [rows][layers][(ngram - 1) * heads]
+		size_t page = 4096;
 		backend::half_t* host_rows = nullptr;     // pinned [2][MAX_ROWS][cols]
 		float e4m3[256];
 	} eg_;

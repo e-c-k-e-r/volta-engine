@@ -61,7 +61,9 @@ int main( int argc, char** argv ) {
 	}
 	const auto t0 = std::chrono::steady_clock::now();
 	const test::GenStats st = test::generate( mc, prompt, gen, false );
-	std::printf( "[*] prompt %zu tokens, %.1f s\n", prompt.size(), test::ms_since( t0 ) / 1000.0 );
+	const int dec = static_cast<int>( st.tokens.size() ) - 1;
+	std::printf( "[*] prompt %zu tokens, %.1f s: prefill %.0f ms (%.0f tok/s), decode %d tokens in %.0f ms (%.1f ms/token, %.1f tok/s)\n", prompt.size(), test::ms_since( t0 ) / 1000.0,
+		st.prefill_ms, prompt.size() * 1000.0 / st.prefill_ms, dec, st.decode_ms, dec > 0 ? st.decode_ms / dec : 0.0, dec > 0 ? dec * 1000.0 / st.decode_ms : 0.0 );
 	std::printf( "[*] tokens:" );
 	for ( int t : st.tokens ) std::printf( " %d", t );
 	std::printf( "\n" );
