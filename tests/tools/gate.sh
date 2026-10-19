@@ -103,6 +103,9 @@ tier2_models() {
 	run tokenizer_cases_qwen ./test_tokenizer_file $ENGINE_MODEL_ROOT/Qwen3.8-27B-exl3 --cases $ROOT/tests/data/tokenizer_cases_qwen3_5.json
 	run tokenizer_cases_glm ./test_tokenizer_file $ENGINE_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
 	run tokenizer_cases_flash ./test_tokenizer_file $ENGINE_MODEL_ROOT/Swift-Qwen3.8-Flash-Next-exl3-4.00bpw --cases $ROOT/tests/data/tokenizer_cases_qwen4_exp.json
+	run tokenizer_cases_deepseek ./test_tokenizer_file $ENGINE_MODEL_ROOT/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw --cases $ROOT/tests/data/tokenizer_cases_deepseek_v41.json
+	run dsv41_encoding ./test_dsv41_encoding $ENGINE_MODEL_ROOT/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw
+	run prefix_restore_dsv41 gpu ./test_dsv41 $ENGINE_MODEL_ROOT/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw $ROOT/tests/data/dsv41_prompt_ids.txt 24 snap=1000
 	run coherence gpu ./test_coherence
 	run coherence_tp2 sh -c "ENGINE_TP=2 taskset -c 0-9 ./test_coherence --qwen-only --speculative"
 	run prefix_restore gpu ./test_prefix_restore

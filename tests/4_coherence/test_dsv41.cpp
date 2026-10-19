@@ -148,6 +148,7 @@ int main( int argc, char** argv ) {
 		std::printf( "[%c] snapshot round trip at %d / %d of %zu tokens: continuation %s (%zu tokens)\n", same ? '+' : '-', P1, P2, prompt.size(), same ? "identical" : "DIFFERS", toks.size() );
 		mc.free_snapshot( &s1 );
 		mc.free_snapshot( &s2 );
+		if ( !same ) { mc.shutdown(); return 1; }
 	}
 	const int dec = static_cast<int>( st.tokens.size() ) - 1;
 	std::printf( "[*] prompt %zu tokens, %.1f s: prefill %.0f ms (%.0f tok/s), decode %d tokens in %.0f ms (%.1f ms/token, %.1f tok/s)\n", prompt.size(), test::ms_since( t0 ) / 1000.0,
