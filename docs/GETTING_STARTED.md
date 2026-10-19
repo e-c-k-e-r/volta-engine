@@ -139,7 +139,11 @@ Qwen extras:
   `model-00048-of-00048.safetensors` of `deepseek-ai/DeepSeek-V4.1-Flash-1017` go into the model directory, and
   `python tests/tools/dsv41/engram_hash_tables.py <model dir>` (a venv with `torch`, `transformers` and `sympy`) writes the hashing tables the
   engine reads, `engram_hash.bin`, once per directory. The routed experts that do not fit the arena stay in pinned host memory and are read in
-  place (62% resident for the 2.7 bpw checkpoint on four 32 GB GPUs). The prompt format is the checkpoint's `encoding/encoding.py`, built in
+  place (62% resident for the 2.7 bpw checkpoint on four 32 GB GPUs). Its routing is concentrated (on agent text the hottest 10% of a layer's
+  experts take half of the routes) and specialized by domain, so which experts are resident decides the speed: with `--set expert_heat_file=<path>`
+  the route counts are saved at exit and the next start keeps the hottest experts on the device and balances the heat over the ranks. Counts from five
+  recorded Claude Code turns put 95% of the routes of five other turns on resident experts (62% without), and a held-out turn decoded at 59 ms a token
+  instead of 196 and prefilled at 188 tok/s instead of 84; a placement made on one kind of text slows down a very different one (a story: 46% resident). The prompt format is the checkpoint's `encoding/encoding.py`, built in
   (no chat template): thinking and reasoning effort (low 50, medium 60, high 75, max 100), tools as DSML tool calls. Not yet: the prefix cache
   (`prefix_cache_gib` must be 0), speculation, images.
 * **Two GPUs per instance**: `--tp-size 2` runs one model on two GPUs (about 0.7x the speed of four); start a second server with

@@ -118,6 +118,8 @@ public:
 	const pod::TensorView& logits() const override { return logits_; }
 	const backend::half_t* tapped_states( int row = 0 ) const override { (void) row; return nullptr; }
 	const ModelMetadata& get_metadata() const override { return metadata_; }
+	// route counts of this rank's experts per layer, in engine order; the totals (checkpoint ids) go to expert_heat_file at exit
+	bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) override;
 
 private:
 	static int lm_shard_spans( int vocab, int tp, int rank ) { return vocab / 128 / tp + ( rank < vocab / 128 % tp ? 1 : 0 ); }
@@ -182,6 +184,8 @@ private:
 	float* route_scratch_ = nullptr;
 	pod::MoEScratch moe_scratch_;
 	int max_group_ = 1;
+	std::vector<std::vector<int>> mine_;   // [layer] this rank's checkpoint expert ids in engine order
+	std::vector<uint64_t> heat_total_;     // [layer][checkpoint expert] routes counted on this rank
 
 	// engram: host hashing and row gathers, two device row buffers
 	struct EngramHost {
