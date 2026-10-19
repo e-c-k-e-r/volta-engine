@@ -341,7 +341,7 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 	sh_g_ = dev_tensor( arena, pod::DType::FP16, R, config_.intermediate_size );
 	sh_u_ = dev_tensor( arena, pod::DType::FP16, R, config_.intermediate_size );
 	sh_i_ = dev_tensor( arena, pod::DType::FP16, R, config_.intermediate_size );
-	idx_scores_ = dev_alloc<float>( arena, static_cast<size_t>( R ) * max_cap, false );
+	idx_scores_ = dev_alloc<float>( arena, static_cast<size_t>( DSV4::SCORE_ROWS ) * max_cap, false );
 	idx_cand_ = dev_alloc<uint8_t>( arena, static_cast<size_t>( R ) * ( max_cap / config_.candidate_block ) );
 	idx_sel_ = dev_alloc<int>( arena, static_cast<size_t>( R ) * DSV4::TOPK );
 	idx_nsel_ = dev_alloc<int>( arena, R );

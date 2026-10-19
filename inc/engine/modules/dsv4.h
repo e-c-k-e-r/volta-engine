@@ -31,6 +31,7 @@ struct DSV4 {
 	static constexpr int IDX_DIM = 128;
 	static constexpr int TOPK = 512;        // compressed entries a query keeps
 	static constexpr int GROUP_HEADS = 8;   // heads per wo_a group
+	static constexpr int SCORE_ROWS = 64;   // rows the indexer scores at a time
 
 	// kv [rows, HD] (normed) -> rope at pos, E4M3 grid -> ring[slot][layer][pos % RING]
 	static void window_store( const backend::half_t* kv, backend::half_t* ring, const float* rope, int layer, int rows,
@@ -52,7 +53,7 @@ struct DSV4 {
 	//   score[t] = (IDX_DIM * IDX_HEADS)^-1/2 * sum_h w[h] relu(q[h] . k[t]),   t < n = (pos + 1) / ratio
 	// sel[row][0..nsel) = the TOPK best t (all t when n <= TOPK). cand_mode 1 (the candidate source): before the top-k, cand[row] marks the best
 	// cand_blocks blocks of cand_block entries by their best score (the block holding entry n - 1 always kept); cand_mode 2: scores outside
-	// cand[row] do not compete. scores [rows, cap] and cand [rows, cap / cand_block] are scratch
+	// cand[row] do not compete. scores [SCORE_ROWS, cap] and cand [rows, cap / cand_block] are scratch (rows are scored in blocks of SCORE_ROWS)
 	static void indexer( const backend::half_t* q, const backend::half_t* w, const backend::half_t* idx_k, float* scores, uint8_t* cand, int* sel, int* nsel,
 		const float* rope, int ratio, int cap, int cand_mode, int cand_blocks, int cand_block, int rows, const pod::BatchRows* d_rows, size_t idx_slot_stride,
 		backend::stream_t stream );

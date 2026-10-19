@@ -195,13 +195,19 @@ constexpr int IDX_TILE = 64;   // keys per block
 // grid (rows, tiles), 256 threads. q is roped and put on the E2M1 grid per block (cheap: 4096 values), transposed in shared memory so
 // lane h reads q[d][h] without bank conflicts; each warp scores 8 keys, lane = head
 __global__ __launch_bounds__( 256 )
-void index_score_kernel( const half* __restrict__ q, const half* __restrict__ w, const half* __restrict__ idx_k, float* __restrict__ scores, const float2* __restrict__ rope,
-	int ratio, int cap, const pod::BatchRows* __restrict__ rows, size_t idx_slot_stride ) {
+void index_score_kernel( const half* __restrict__ q, const half* __restrict__ w, const half* __restrict__ idx_k, float* __restrict__ scores, const uint8_t* __restrict__ cand,
+	int cand_block, const float2* __restrict__ rope, int ratio, int cap, int row0, const pod::BatchRows* __restrict__ rows, size_t idx_slot_stride ) {
 	constexpr int NH = DSV4::IDX_HEADS, D = DSV4::IDX_DIM;
-	const int r = blockIdx.x, t0 = blockIdx.y * IDX_TILE;
+	const int r = row0 + blockIdx.x, t0 = blockIdx.y * IDX_TILE;
 	const int pos = rows->pos[r];
 	const int n = ( pos + 1 ) / ratio;
 	if ( n <= DSV4::TOPK || t0 >= n ) return;   // every entry is kept, or the tile is past the visible ones
+	if ( cand != nullptr ) {   // after the candidate source: a tile whose blocks were all dropped is never read
+		const uint8_t* cm = cand + static_cast<size_t>( r ) * ( cap / cand_block );
+		bool any = false;
+		for ( int b = t0 / cand_block; b < ( t0 + IDX_TILE ) / cand_block && b * cand_block < n; ++b ) any = any || cm[b];
+		if ( !any ) return;
+	}
 	__shared__ float qt[D][NH];
 	__shared__ half kt[IDX_TILE][D];
 	__shared__ float ws[NH];
@@ -240,7 +246,7 @@ void index_score_kernel( const half* __restrict__ q, const half* __restrict__ w,
 		for ( int d = 0; d < D; ++d ) dot = fmaf( qt[d][lane], __half2float( kt[k][d] ), dot );
 		float v = fmaxf( dot, 0.0f ) * ws[lane];
 		v = engine::math::warp_sum( v );
-		if ( lane == 0 ) scores[static_cast<size_t>( r ) * cap + t] = v;
+		if ( lane == 0 ) scores[static_cast<size_t>( blockIdx.x ) * cap + t] = v;
 	}
 }
 
@@ -285,8 +291,8 @@ __device__ uint32_t radix_kth( int n, int k, KeyFn key, int* above ) {
 // cand_mode 2: entries outside cand[row] do not compete. Then the TOPK best entries into sel[row]
 __global__ __launch_bounds__( 1024 )
 void index_select_kernel( float* __restrict__ scores, uint8_t* __restrict__ cand, int* __restrict__ sel, int* __restrict__ nsel, int ratio, int cap, int cand_mode,
-	int cand_blocks, int cand_block, const pod::BatchRows* __restrict__ rows ) {
-	const int r = blockIdx.x;
+	int cand_blocks, int cand_block, int row0, const pod::BatchRows* __restrict__ rows ) {
+	const int r = row0 + blockIdx.x;
 	const int pos = rows->pos[r];
 	const int n = ( pos + 1 ) / ratio;
 	int* out = sel + static_cast<size_t>( r ) * DSV4::TOPK;
@@ -299,7 +305,7 @@ void index_select_kernel( float* __restrict__ scores, uint8_t* __restrict__ cand
 		if ( cand_mode == 1 ) for ( int b = threadIdx.x; b < nb; b += blockDim.x ) cm[b] = 1;
 		return;
 	}
-	float* sc = scores + static_cast<size_t>( r ) * cap;
+	float* sc = scores + static_cast<size_t>( blockIdx.x ) * cap;
 	if ( cand_mode == 1 ) {
 		if ( nb <= cand_blocks ) {
 			for ( int b = threadIdx.x; b < nb; b += blockDim.x ) cm[b] = 1;
@@ -597,9 +603,14 @@ void DSV4::index_key_store( const half* kraw, const half* knorm_w, half* idx_k, 
 
 void DSV4::indexer( const half* q, const half* w, const half* idx_k, float* scores, uint8_t* cand, int* sel, int* nsel, const float* rope_f, int ratio, int cap,
 	int cand_mode, int cand_blocks, int cand_block, int rows, const pod::BatchRows* d_rows, size_t idx_slot_stride, cudaStream_t stream ) {
-	const dim3 grid( rows, ( cap + IDX_TILE - 1 ) / IDX_TILE );
-	index_score_kernel<<<grid, 256, 0, stream>>>( q, w, idx_k, scores, reinterpret_cast<const float2*>( rope_f ), ratio, cap, d_rows, idx_slot_stride );
-	index_select_kernel<<<rows, 1024, 0, stream>>>( scores, cand, sel, nsel, ratio, cap, cand_mode, cand_blocks, cand_block, d_rows );
+	// blocks of SCORE_ROWS rows share the score buffer
+	for ( int row0 = 0; row0 < rows; row0 += SCORE_ROWS ) {
+		const int nr = rows - row0 < SCORE_ROWS ? rows - row0 : SCORE_ROWS;
+		const dim3 grid( nr, ( cap + IDX_TILE - 1 ) / IDX_TILE );
+		index_score_kernel<<<grid, 256, 0, stream>>>( q, w, idx_k, scores, cand_mode == 2 ? cand : nullptr, cand_block, reinterpret_cast<const float2*>( rope_f ), ratio, cap, row0,
+			d_rows, idx_slot_stride );
+		index_select_kernel<<<nr, 1024, 0, stream>>>( scores, cand, sel, nsel, ratio, cap, cand_mode, cand_blocks, cand_block, row0, d_rows );
+	}
 }
 
 void DSV4::attend( const half* q, const half* ring, const half* comp_kv, const int* sel, const int* nsel, const float* sink, const float* rope_f, half* o, int nh,
