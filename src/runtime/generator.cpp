@@ -57,7 +57,7 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 
 	if ( !runtime::options().spec_cand_log.empty() ) CandLog::get().open( runtime::options().spec_cand_log );
 	const size_t cache_budget = static_cast<size_t>( std::max( 0, runtime::options().prefix_cache_gib ) ) << 30;
-	if ( cache_budget > 0 && cluster_.snapshot_bytes( 0, 1 ) > 0 ) {
+	if ( cache_budget > 0 && cluster_.snapshot_bytes( 0, cluster_.snapshot_align() ) > 0 ) {
 		prefix_cache_ = std::make_unique<PrefixCache>( cluster_, cache_budget );
 		LOG_INFO( "Prefix cache: %.0f GiB pinned host budget\n", cache_budget / 1073741824.0 );
 	}

@@ -357,8 +357,9 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 			if ( !g.checkpoint_at.empty() && static_cast<int>( head.size() ) <= g.checkpoint_at.back().pos ) return;
 			g.checkpoint_at.push_back( { static_cast<int>( head.size() ), pinned } );
 		};
-		add( prompt.find( glm ? "<|user|>" : "<|im_start|>user" ), true, 1024 );
-		add( prompt.rfind( glm ? "<|assistant|>" : "<|im_start|>assistant" ), false, 512 );
+		const bool ds = family == engine::loader::ModelFamily::DEEPSEEK;
+		add( prompt.find( ds ? "<｜User｜>" : glm ? "<|user|>" : "<|im_start|>user" ), true, 1024 );
+		add( prompt.rfind( ds ? "<｜Assistant｜>" : glm ? "<|assistant|>" : "<|im_start|>assistant" ), false, 512 );
 	}
 	g.on_text = [state]( const std::string& delta ) {
 		if ( state->conn->closed() ) return false;
