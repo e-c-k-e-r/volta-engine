@@ -65,6 +65,8 @@ struct DeepseekV41ExpertGroup {
 	int first = 0;
 	int count = 0;
 	std::unique_ptr<pod::MoELayerWeights> mw;
+	std::vector<char> resident;      // [count] 1 when the expert's codes are in device memory, 0 in pinned host memory
+	std::vector<uint64_t> score;     // [count] decayed route counts (the swap decisions)
 };
 
 struct DeepseekV41LayerWeights {
@@ -126,6 +128,9 @@ public:
 	const ModelMetadata& get_metadata() const override { return metadata_; }
 	// route counts of this rank's experts per layer, in engine order; the totals (checkpoint ids) go to expert_heat_file at exit
 	bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) override;
+	// Folds the routes since the last pass into per-expert scores and exchanges the hottest cold experts with the coldest resident ones of the same
+	// bit width (same code size: the bytes trade places, no allocation moves)
+	bool rebalance_experts( backend::stream_t stream = nullptr ) override;
 
 private:
 	static int lm_shard_spans( int vocab, int tp, int rank ) { return vocab / 128 / tp + ( rank < vocab / 128 % tp ? 1 : 0 ); }
@@ -195,6 +200,10 @@ private:
 	int max_group_ = 1;
 	std::vector<std::vector<int>> mine_;   // [layer] this rank's checkpoint expert ids in engine order
 	std::vector<uint64_t> heat_total_;     // [layer][checkpoint expert] routes counted on this rank
+	std::vector<uint32_t> pending_;        // [layer][checkpoint expert] routes drained by expert_heat that the residency has not seen yet
+	uint8_t* swap_staging_[6] = {};        // pinned, one expert projection of each bit width; rotates through the swaps
+	uint64_t swaps_ = 0, window_routes_ = 0, window_hits_ = 0;
+	int rebalances_ = 0;
 
 	// engram: host hashing and row gathers, two device row buffers
 	struct EngramHost {

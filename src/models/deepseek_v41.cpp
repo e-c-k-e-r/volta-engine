@@ -206,7 +206,11 @@ bool DeepseekV41Pipeline::expert_heat( std::vector<uint32_t>& out, int& layers, 
 			at += g.count;
 		}
 		if ( reset ) {
-			for ( int i = 0; i < experts && i < static_cast<int>( mine_[l].size() ); ++i ) heat_total_[static_cast<size_t>( l ) * config_.num_experts + mine_[l][i]] += out[static_cast<size_t>( l ) * experts + i];
+			for ( int i = 0; i < experts && i < static_cast<int>( mine_[l].size() ); ++i ) {
+				const size_t id = static_cast<size_t>( l ) * config_.num_experts + mine_[l][i];
+				heat_total_[id] += out[static_cast<size_t>( l ) * experts + i];
+				pending_[id] += out[static_cast<size_t>( l ) * experts + i];
+			}
 		}
 	}
 	return true;
@@ -598,6 +602,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		if ( rank_ == 0 ) LOG_INFO( "[deepseek_v41] expert placement from %s: %s\n", hf.c_str(), heat.empty() ? "no complete set of route counts, default placement" : "hottest experts resident, heat balanced over the ranks" );
 	}
 	heat_total_.assign( static_cast<size_t>( L ) * E, 0 );
+	pending_.assign( static_cast<size_t>( L ) * E, 0 );
 	mine_.assign( L, {} );
 	size_t code_bytes = 0;
 	std::vector<std::vector<size_t>> expert_bytes( L, std::vector<size_t>( E, 0 ) );
@@ -699,6 +704,9 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			}
 			engine::modules::MoE::init_device_ptrs( mw, arena, stream );
 			mw.heat = dev_alloc<uint32_t>( arena, g.count );
+			g.resident.assign( g.count, 1 );
+			g.score.assign( g.count, 0 );
+			for ( int i = 0; i < g.count; ++i ) g.resident[i] = resident[mine_[l][j + i]];
 			lw.groups.push_back( std::move( g ) );
 			j = k;
 		}
@@ -708,9 +716,103 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		LOG_INFO( "[RANK %d] deepseek_v41 weights: dense %.2f GiB, expert codes %.2f GiB (%.2f GiB in pinned host memory, %.0f%% resident), arena %.2f / %.2f GiB, missing %d\n",
 			rank_, dense_bytes / G, code_bytes / G, on_host / G, 100.0 * frac, arena.offset_bytes / G, arena.total_bytes / G, missing );
 	}
+	if ( frac < 1.0 ) {
+		size_t max_part = 0;
+		for ( auto& g0 : layers_[0].groups ) if ( g0.mw->gate[0].w0.size_bytes() > max_part ) max_part = g0.mw->gate[0].w0.size_bytes();
+		for ( int b = 2; b <= 5; ++b ) swap_staging_[b] = static_cast<uint8_t*>( engine::core::arena_alloc( host_arena_, max_part, 256 ) );
+	}
 	backend::stream_sync( stream );
 	weights_loaded_ = missing == 0;
 	return weights_loaded_;
+}
+
+bool DeepseekV41Pipeline::rebalance_experts( backend::stream_t stream ) {
+	if ( !weights_loaded_ || !host_arena_.base_ptr ) return false;
+	backend::set_device( rank_ );
+	backend::stream_sync( stream );
+	const int L = config_.num_layers, E = config_.num_experts;
+	const int cap_swaps = runtime::options().expert_swaps;
+	const size_t budget = static_cast<size_t>( std::max( 1, runtime::options().expert_swap_mib ) ) << 20;
+	const double cap_w = std::min( 100, std::max( 0, runtime::options().expert_history_pct ) ) / 100.0;
+	const uint64_t margin = static_cast<uint64_t>( std::max( 0, runtime::options().expert_swap_margin ) );
+	int moved = 0;
+	for ( int l = 0; l < L; ++l ) {
+		auto& groups = layers_[l].groups;
+		if ( groups.empty() || groups[0].mw->heat == nullptr ) continue;
+		const int first0 = groups[0].first;
+		// drain the counters: what expert_heat took meanwhile (pending_) plus what the kernels counted since
+		std::vector<uint32_t> cnt;
+		double s_sum = 0.0, t_sum = 0.0;
+		bool any_cold = false;
+		for ( auto& g : groups ) {
+			cnt.assign( g.count, 0 );
+			backend::memcpy_sync( cnt.data(), g.mw->heat, static_cast<size_t>( g.count ) * sizeof( uint32_t ), backend::Copy::D2H );
+			backend::memset_sync( g.mw->heat, 0, static_cast<size_t>( g.count ) * sizeof( uint32_t ) );
+			for ( int i = 0; i < g.count; ++i ) {
+				const size_t at = static_cast<size_t>( l ) * E + mine_[l][g.first - first0 + i];
+				heat_total_[at] += cnt[i];
+				const uint64_t n = static_cast<uint64_t>( cnt[i] ) + pending_[at];
+				pending_[at] = 0;
+				window_routes_ += n;
+				if ( g.resident[i] ) window_hits_ += n; else any_cold = true;
+				g.score[i] = g.score[i] / 2 + n;
+				s_sum += static_cast<double>( g.score[i] );
+				t_sum += static_cast<double>( heat_total_[at] );
+			}
+		}
+		if ( !any_cold ) continue;
+		// the decision blends the recent windows with the layer's long-run counts (as ExpertTier)
+		const double w = ( s_sum > 0.0 && t_sum > 0.0 ) ? cap_w * t_sum / ( t_sum + 4.0 * s_sum ) : 0.0;
+		size_t spent = 0;
+		int done = 0;
+		for ( auto& g : groups ) {
+			std::vector<uint64_t> eff( g.count );
+			for ( int i = 0; i < g.count; ++i ) {
+				const double t = static_cast<double>( heat_total_[static_cast<size_t>( l ) * E + mine_[l][g.first - first0 + i]] );
+				eff[i] = w > 0.0 ? static_cast<uint64_t>( ( 1.0 - w ) * static_cast<double>( g.score[i] ) + w * t * s_sum / t_sum + 0.5 ) : g.score[i];
+			}
+			const size_t part = g.mw->gate[0].w0.size_bytes();
+			const size_t swap_bytes = 2 * 3 * part;
+			while ( true ) {
+				if ( cap_swaps >= 0 ? done >= cap_swaps : ( done > 0 && spent + swap_bytes > budget / static_cast<size_t>( L ) ) ) break;
+				int hot = -1, cool = -1;   // the hottest cold expert, the coldest resident one
+				for ( int i = 0; i < g.count; ++i ) {
+					if ( !g.resident[i] ) { if ( hot < 0 || eff[i] > eff[hot] ) hot = i; }
+					else if ( cool < 0 || eff[i] < eff[cool] ) cool = i;
+				}
+				if ( hot < 0 || cool < 0 || eff[hot] < eff[cool] + eff[cool] / 2 + margin ) break;
+				pod::LinearWeight* set[3] = { g.mw->gate, g.mw->up, g.mw->down };
+				void** table = static_cast<void**>( g.mw->device_ptrs );
+				for ( int p = 0; p < 3; ++p ) {
+					uint8_t* dev = const_cast<uint8_t*>( static_cast<const uint8_t*>( set[p][cool].w0.data ) );
+					uint8_t* host = const_cast<uint8_t*>( static_cast<const uint8_t*>( set[p][hot].w0.data ) );
+					ENGINE_ASSERT( set[p][cool].w0.size_bytes() == part && set[p][hot].w0.size_bytes() == part, "DeepseekV41Pipeline::rebalance_experts: code sizes differ within a bit width" );
+					uint8_t*& stg = swap_staging_[g.bits];
+					backend::memcpy_sync( stg, dev, part, backend::Copy::D2H );
+					backend::memcpy_sync( dev, host, part, backend::Copy::H2D );
+					set[p][cool].w0.data = stg;     // the resident expert's bytes now sit in the staging buffer, the hot expert's in its device buffer
+					set[p][hot].w0.data = dev;
+					stg = host;
+					void* nh = dev; void* nc = set[p][cool].w0.data;
+					backend::memcpy_sync( table + static_cast<size_t>( 3 * p ) * g.count + hot, &nh, sizeof( void* ), backend::Copy::H2D );
+					backend::memcpy_sync( table + static_cast<size_t>( 3 * p ) * g.count + cool, &nc, sizeof( void* ), backend::Copy::H2D );
+				}
+				g.resident[hot] = 1;
+				g.resident[cool] = 0;
+				spent += swap_bytes;
+				++done;
+				++swaps_;
+			}
+		}
+		moved += done;
+	}
+	if ( runtime::options().expert_log ) {
+		LOG_INFO( "[experts rank %d] window hit rate %.3f over %llu routes, %d swaps (%llu total)\n", rank_, window_routes_ ? static_cast<double>( window_hits_ ) / window_routes_ : 1.0,
+			static_cast<unsigned long long>( window_routes_ ), moved, static_cast<unsigned long long>( swaps_ ) );
+	}
+	window_routes_ = window_hits_ = 0;
+	++rebalances_;
+	return true;
 }
 
 void DeepseekV41Pipeline::embed_tokens( const int* token_ids, int count, backend::stream_t stream ) {

@@ -37,11 +37,13 @@ int main( int argc, char** argv ) {
 	std::string turns;
 	int snap_at = 0;   // snap=<P>: prefix-cache round trip with a snapshot chain ending near position P
 	int turns_first = 0, turns_count = 1 << 30;
+	int adapt = 0;      // adapt=<N>: decode with an expert residency rebalance every N tokens, printing the time of each 16 tokens
 	std::string dump;   // dump=<file>: teacher-forced prefill in chunks of 512 rows, every row's FP16 logits appended (needs glm_logit_rows=512)
 	for ( ; a < argc; ++a ) {
 		const std::string kv = argv[a];
 		const size_t eq = kv.find( '=' );
 		ENGINE_ASSERT( eq != std::string::npos, "test_dsv41: options are key=value" );
+		if ( kv.substr( 0, eq ) == "adapt" ) { adapt = std::atoi( kv.c_str() + eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "dump" ) { dump = kv.substr( eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "turns" ) { turns = kv.substr( eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "snap" ) { snap_at = std::atoi( kv.c_str() + eq + 1 ); continue; }
@@ -95,6 +97,24 @@ int main( int argc, char** argv ) {
 		}
 		std::fclose( f );
 		std::printf( "[*] logits of %d positions written to %s\n", n, dump.c_str() );
+		mc.shutdown();
+		return 0;
+	}
+	if ( adapt > 0 ) {
+		mc.reset_slot( 0 );
+		int tok = mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0 );
+		std::vector<int> toks{ tok };
+		auto tw = std::chrono::steady_clock::now();
+		for ( int i = 1, pos = static_cast<int>( prompt.size() ); i < gen && !mc.is_eos( tok ); ++i ) {
+			if ( i % adapt == 0 ) mc.rebalance_experts();
+			mc.forward( &tok, 1, pos++, 0 );
+			tok = mc.sample_one();
+			toks.push_back( tok );
+			if ( i % 16 == 0 ) { std::printf( "[*] tokens %d..%d: %.1f ms/token\n", i - 15, i, test::ms_since( tw ) / 16.0 ); tw = std::chrono::steady_clock::now(); }
+		}
+		std::printf( "[*] tokens:" );
+		for ( int t : toks ) std::printf( " %d", t );
+		std::printf( "\n" );
 		mc.shutdown();
 		return 0;
 	}
