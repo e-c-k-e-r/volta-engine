@@ -10,6 +10,7 @@
 #include "engine/modules/moe.h"
 #include "engine/backend/types.h"
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -64,6 +65,7 @@ struct DeepseekV41ExpertGroup {
 	int bits = 0;
 	int first = 0;
 	int count = 0;
+	int spans = 0;                   // expert_shard: the width of this rank's slice of these experts, in 128-wide spans
 	std::unique_ptr<pod::MoELayerWeights> mw;
 	std::vector<char> resident;      // [count] 1 when the expert's codes are in device memory, 0 in pinned host memory
 	std::vector<uint64_t> score;     // [count] decayed route counts (the swap decisions)
@@ -224,10 +226,14 @@ private:
 	backend::half_t* win_topk_w_ = nullptr;
 	pod::MoEScratch moe_scratch_;
 	int max_group_ = 1;
+	bool expert_tp_ = false;               // every rank holds a slice of every expert (expert_shard) instead of whole experts
+	// expert_shard: the intermediate width is 18 spans of 128; rank r of tp takes 18 / tp of them plus one of the 18 % tp extra, and which ranks get
+	// the extra rotates with the expert so every rank carries the same share of the bytes and of the work
+	void expert_slice( int expert, int rank, int* begin, int* spans ) const;
 	std::vector<std::vector<int>> mine_;   // [layer] this rank's checkpoint expert ids in engine order
 	std::vector<uint64_t> heat_total_;     // [layer][checkpoint expert] routes counted on this rank
 	std::vector<uint32_t> pending_;        // [layer][checkpoint expert] routes drained by expert_heat that the residency has not seen yet
-	uint8_t* swap_staging_[6] = {};        // pinned, one expert projection of each bit width; rotates through the swaps
+	std::map<int, uint8_t*> swap_staging_; // pinned, one expert projection per (bits * 32 + spans); rotates through the swaps
 	uint64_t swaps_ = 0, window_routes_ = 0, window_hits_ = 0;
 	int rebalances_ = 0;
 

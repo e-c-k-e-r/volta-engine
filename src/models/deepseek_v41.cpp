@@ -196,7 +196,7 @@ bool DeepseekV41Pipeline::expert_heat( std::vector<uint32_t>& out, int& layers, 
 	backend::set_device( rank_ );
 	backend::device_sync();
 	layers = config_.num_layers;
-	experts = config_.num_experts / config_.tp_size;
+	experts = expert_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
 	out.assign( static_cast<size_t>( layers ) * experts, 0 );
 	for ( int l = 0; l < layers; ++l ) {
 		size_t at = static_cast<size_t>( l ) * experts;
@@ -357,7 +357,12 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 	e_rows_[0] = dev_tensor( arena, pod::DType::FP16, R, ecols );
 	e_rows_[1] = dev_tensor( arena, pod::DType::FP16, R, ecols );
 	e_kv_ = dev_tensor( arena, pod::DType::FP16, R, 5 * H );
-	max_group_ = ( config_.num_experts + config_.tp_size - 1 ) / config_.tp_size;
+	expert_tp_ = runtime::options().expert_shard && config_.tp_size > 1;
+	{
+		const int spans = config_.intermediate_size / 128, tp = config_.tp_size;
+		ENGINE_ASSERT( config_.intermediate_size % 128 == 0 && spans >= tp, "DeepseekV41Pipeline: the expert width must split into 128-wide spans for every rank" );
+	}
+	max_group_ = expert_tp_ ? config_.num_experts : ( config_.num_experts + config_.tp_size - 1 ) / config_.tp_size;
 	window_ = std::max( 1, std::min( runtime::options().prefill_window, 8 ) );
 	moe_scratch_ = engine::modules::MoE::alloc_scratch( arena, max_group_, config_.top_k, H, config_.intermediate_size, R * window_, false );
 	if ( window_ > 1 ) {
@@ -636,7 +641,11 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			bits[l][e] = meta ? meta->shape[2] / 16 : 0;
 		}
 		std::vector<std::vector<int>> per( tp );
-		if ( heat.empty() ) {
+		if ( expert_tp_ ) {
+			// every rank holds all experts (a slice of each), in the same engine order
+			for ( int e = 0; e < E; ++e ) per[rank_].push_back( e );
+		}
+		else if ( heat.empty() ) {
 			std::vector<int> order( E );
 			std::iota( order.begin(), order.end(), 0 );
 			std::stable_sort( order.begin(), order.end(), [&]( int a, int b ) { return bits[l][a] < bits[l][b]; } );
@@ -657,22 +666,30 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		}
 		std::vector<int> perm( E );
 		for ( int r = 0; r < tp; ++r ) {
-			std::stable_sort( per[r].begin(), per[r].end(), [&]( int a, int b ) { return bits[l][a] < bits[l][b]; } );
-			for ( int j = 0; j < static_cast<int>( per[r].size() ); ++j ) perm[per[r][j]] = r * per_rank + j;
+			std::stable_sort( per[r].begin(), per[r].end(), [&]( int a, int b ) {
+				if ( bits[l][a] != bits[l][b] ) return bits[l][a] < bits[l][b];
+				if ( !expert_tp_ ) return false;
+				int b0, sa, sb;
+				expert_slice( a, r, &b0, &sa );
+				expert_slice( b, r, &b0, &sb );
+				return sa < sb;   // a launch needs one width
+			} );
+			for ( int j = 0; j < static_cast<int>( per[r].size() ); ++j ) perm[per[r][j]] = ( expert_tp_ ? 0 : r * per_rank ) + j;
 		}
 		mine_[l] = per[rank_];
 		if ( !heat.empty() ) for ( int e : mine_[l] ) heat_total_[static_cast<size_t>( l ) * E + e] = heat[static_cast<size_t>( l ) * E + e];   // the file keeps the history
 		layers_[l].perm = dev_alloc<int>( arena, E, false );
 		backend::memcpy_sync( layers_[l].perm, perm.data(), E * sizeof( int ), backend::Copy::H2D );
 		for ( int e : mine_[l] ) {
-			for ( const char* w : { ".w1", ".w2", ".w3" } ) expert_bytes[l][e] += repo.trellis_bytes( ( p + std::to_string( e ) + w ).c_str() );
+			// a slice's codes are its share of the 18 spans of the whole tensor
+			for ( const char* w : { ".w1", ".w2", ".w3" } ) expert_bytes[l][e] += repo.trellis_bytes( ( p + std::to_string( e ) + w ).c_str() ) / ( expert_tp_ ? config_.intermediate_size / 128 : 1 ) * static_cast<size_t>( expert_tp_ ? [&]() { int b0, n; expert_slice( e, rank_, &b0, &n ); return n; }() : 1 );
 			code_bytes += expert_bytes[l][e];
 		}
 	}
 	// placement: as many expert codes on the device as the arena holds (the same share of every layer's bytes; the hottest experts first when the
 	// route counts are known), the rest in pinned host memory
 	const size_t margin = static_cast<size_t>( std::max( runtime::options().vram_reserve_mib, 1024 ) ) * 1024 * 1024;
-	const size_t meta_bytes = static_cast<size_t>( L ) * per_rank * 3 * ( 2 * H + 2 * config_.intermediate_size ) * 2 + ( 64ull << 20 );   // suh / svh and tables
+	const size_t meta_bytes = static_cast<size_t>( L ) * ( expert_tp_ ? E : per_rank ) * ( expert_tp_ ? 3 * H + 3 * ( config_.intermediate_size / tp + 128 ) : 3 * ( 2 * H + 2 * config_.intermediate_size ) ) * 2 + ( 64ull << 20 );   // suh / svh and tables
 	const size_t free_now = arena.total_bytes - arena.offset_bytes;
 	const size_t budget = free_now > margin + meta_bytes ? free_now - margin - meta_bytes : 0;
 	const double frac = std::min( 1.0, static_cast<double>( budget ) / std::max<size_t>( code_bytes, 1 ) );
@@ -702,11 +719,13 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		int j = 0;
 		while ( j < static_cast<int>( mine_[l].size() ) ) {
 			int k = j;
-			while ( k < static_cast<int>( mine_[l].size() ) && bits[l][mine_[l][k]] == bits[l][mine_[l][j]] ) ++k;
+			auto spans_of = [&]( int e ) { int b0, n = 0; if ( expert_tp_ ) expert_slice( e, rank_, &b0, &n ); return n; };
+			while ( k < static_cast<int>( mine_[l].size() ) && bits[l][mine_[l][k]] == bits[l][mine_[l][j]] && spans_of( mine_[l][k] ) == spans_of( mine_[l][j] ) ) ++k;
 			DeepseekV41ExpertGroup g;
 			g.bits = bits[l][mine_[l][j]];
-			g.first = rank_ * per_rank + j;
+			g.first = ( expert_tp_ ? 0 : rank_ * per_rank ) + j;
 			g.count = k - j;
+			g.spans = spans_of( mine_[l][j] );
 			g.mw = std::make_unique<pod::MoELayerWeights>();
 			auto& mw = *g.mw;
 			mw.type = pod::QuantType::TRELLIS;
@@ -716,9 +735,19 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 				const int e = mine_[l][j + i];
 				const std::string b = p + std::to_string( e );
 				pod::MemoryArena* codes = resident[e] ? nullptr : &host_arena_;
-				mw.gate[i] = repo.load_linear( ( b + ".w1" ).c_str(), arena, g.bits, stream, codes );
-				mw.up[i] = repo.load_linear( ( b + ".w3" ).c_str(), arena, g.bits, stream, codes );
-				mw.down[i] = repo.load_linear( ( b + ".w2" ).c_str(), arena, g.bits, stream, codes );
+				if ( expert_tp_ ) {
+					// w1 / w3: [hidden, intermediate], this rank's output columns; w2: [intermediate, hidden], its input rows
+					int s0 = 0, sn = 0;
+					expert_slice( e, rank_, &s0, &sn );
+					mw.gate[i] = repo.load_linear_range( ( b + ".w1" ).c_str(), arena, 1, s0 * 8, sn * 8, stream, codes );
+					mw.up[i] = repo.load_linear_range( ( b + ".w3" ).c_str(), arena, 1, s0 * 8, sn * 8, stream, codes );
+					mw.down[i] = repo.load_linear_range( ( b + ".w2" ).c_str(), arena, 0, s0 * 8, sn * 8, stream, codes );
+				}
+				else {
+					mw.gate[i] = repo.load_linear( ( b + ".w1" ).c_str(), arena, g.bits, stream, codes );
+					mw.up[i] = repo.load_linear( ( b + ".w3" ).c_str(), arena, g.bits, stream, codes );
+					mw.down[i] = repo.load_linear( ( b + ".w2" ).c_str(), arena, g.bits, stream, codes );
+				}
 				need( mw.gate[i].is_valid() && mw.up[i].is_valid() && mw.down[i].is_valid(), b );
 				ENGINE_ASSERT( mw.up[i].bits == g.bits && mw.down[i].bits == g.bits, "DeepseekV41Pipeline: an expert's three projections differ in bit width" );
 				scale_device_half( mw.down[i].w2.ptr<backend::half_t>(), static_cast<size_t>( H ), 1.0f / kOutScale, stream );
@@ -739,13 +768,25 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			rank_, dense_bytes / G, code_bytes / G, on_host / G, 100.0 * frac, arena.offset_bytes / G, arena.total_bytes / G, missing );
 	}
 	if ( frac < 1.0 ) {
-		size_t max_part = 0;
-		for ( auto& g0 : layers_[0].groups ) if ( g0.mw->gate[0].w0.size_bytes() > max_part ) max_part = g0.mw->gate[0].w0.size_bytes();
-		for ( int b = 2; b <= 5; ++b ) swap_staging_[b] = static_cast<uint8_t*>( engine::core::arena_alloc( host_arena_, max_part, 256 ) );
+		for ( int l = 0; l < L; ++l ) {
+			for ( auto& g0 : layers_[l].groups ) {
+				uint8_t*& stg = swap_staging_[g0.bits * 32 + g0.spans];
+				if ( !stg ) stg = static_cast<uint8_t*>( engine::core::arena_alloc( host_arena_, g0.mw->gate[0].w0.size_bytes(), 256 ) );
+			}
+		}
 	}
 	backend::stream_sync( stream );
 	weights_loaded_ = missing == 0;
 	return weights_loaded_;
+}
+
+void DeepseekV41Pipeline::expert_slice( int expert, int rank, int* begin, int* spans ) const {
+	const int total = config_.intermediate_size / 128, tp = config_.tp_size, extra = total % tp;
+	auto width = [&]( int r ) { return total / tp + ( ( r - expert % tp + tp ) % tp < extra ? 1 : 0 ); };
+	int b = 0;
+	for ( int r = 0; r < rank; ++r ) b += width( r );
+	*begin = b;
+	*spans = width( rank );
 }
 
 bool DeepseekV41Pipeline::rebalance_experts( backend::stream_t stream ) {
@@ -809,7 +850,7 @@ bool DeepseekV41Pipeline::rebalance_experts( backend::stream_t stream ) {
 					uint8_t* dev = const_cast<uint8_t*>( static_cast<const uint8_t*>( set[p][cool].w0.data ) );
 					uint8_t* host = const_cast<uint8_t*>( static_cast<const uint8_t*>( set[p][hot].w0.data ) );
 					ENGINE_ASSERT( set[p][cool].w0.size_bytes() == part && set[p][hot].w0.size_bytes() == part, "DeepseekV41Pipeline::rebalance_experts: code sizes differ within a bit width" );
-					uint8_t*& stg = swap_staging_[g.bits];
+					uint8_t*& stg = swap_staging_[g.bits * 32 + g.spans];
 					backend::memcpy_sync( stg, dev, part, backend::Copy::D2H );
 					backend::memcpy_sync( dev, host, part, backend::Copy::H2D );
 					set[p][cool].w0.data = stg;     // the resident expert's bytes now sit in the staging buffer, the hot expert's in its device buffer

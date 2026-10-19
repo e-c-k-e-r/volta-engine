@@ -1033,6 +1033,71 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 	}
 }
 
+pod::LinearWeight SafeTensorsRepo::load_linear_range(
+	const char* base_name,
+	pod::MemoryArena& arena,
+	int slice_dim,
+	int begin16,
+	int count16,
+	backend::stream_t stream,
+	pod::MemoryArena* code_arena
+) {
+	char name_buf[512];
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
+	int shard = -1;
+	const auto* meta = find( name_buf, &shard );
+	if ( !meta || shard < 0 || meta->ndim != 3 ) return pod::LinearWeight{};
+	const int BK = meta->shape[0], BN = meta->shape[1], B = meta->shape[2];
+	ENGINE_ASSERT( slice_dim == 0 || slice_dim == 1, "load_linear_range: slice_dim is 0 (input) or 1 (output)" );
+	const int total = slice_dim == 0 ? BK : BN;
+	ENGINE_ASSERT( begin16 >= 0 && count16 > 0 && begin16 + count16 <= total && begin16 % 8 == 0 && count16 % 8 == 0, "load_linear_range: the range must be whole 128-wide spans inside the tensor" );
+	const int shape[3] = { slice_dim == 0 ? count16 : BK, slice_dim == 1 ? count16 : BN, B };
+	pod::TensorView tr = engine::core::arena_alloc_tensor( code_arena ? *code_arena : arena, pod::DType::UINT16, shape, 3 );
+	if ( !tr.data ) return pod::LinearWeight{};
+	const uint16_t* src = static_cast<const uint16_t*>( safetensors_get_data_cpu( shards_[shard], meta ) );
+	ENGINE_ASSERT( src != nullptr, "load_linear_range: no CPU data for the trellis tensor" );
+	if ( slice_dim == 0 ) {
+		// whole rows: one contiguous run
+		backend::memcpy_async( tr.data, src + static_cast<size_t>( begin16 ) * BN * B, static_cast<size_t>( count16 ) * BN * B * sizeof( uint16_t ), backend::Copy::Auto, stream );
+	}
+	else {
+		std::vector<uint16_t> h( static_cast<size_t>( BK ) * count16 * B );
+		for ( int k = 0; k < BK; ++k ) std::memcpy( h.data() + static_cast<size_t>( k ) * count16 * B, src + ( static_cast<size_t>( k ) * BN + begin16 ) * B, static_cast<size_t>( count16 ) * B * sizeof( uint16_t ) );
+		backend::memcpy_async( tr.data, h.data(), h.size() * sizeof( uint16_t ), backend::Copy::Auto, stream );
+		backend::stream_sync( stream );
+	}
+	// scale vectors (FP16 in the checkpoint; converted when not): the sliced one by its elements, the other whole
+	auto scales = [&]( const char* suffix, bool sliced ) {
+		std::snprintf( name_buf, sizeof( name_buf ), "%s.%s", base_name, suffix );
+		int sh = -1;
+		const auto* m = find( name_buf, &sh );
+		ENGINE_ASSERT( m != nullptr && sh >= 0 && m->ndim == 1, "load_linear_range: missing scale vector" );
+		const size_t first = sliced ? static_cast<size_t>( begin16 ) * 16 : 0, n = sliced ? static_cast<size_t>( count16 ) * 16 : static_cast<size_t>( m->shape[0] );
+		ENGINE_ASSERT( first + n <= static_cast<size_t>( m->shape[0] ), "load_linear_range: scale vector shorter than the range" );
+		const void* d = safetensors_get_data_cpu( shards_[sh], m );
+		ENGINE_ASSERT( d != nullptr, "load_linear_range: no CPU data for a scale vector" );
+		std::vector<backend::half_t> h( n );
+		if ( m->dtype == pod::DType::FP16 ) std::memcpy( h.data(), static_cast<const backend::half_t*>( d ) + first, n * sizeof( backend::half_t ) );
+		else if ( m->dtype == pod::DType::BF16 ) for ( size_t i = 0; i < n; ++i ) h[i] = bf16_to_fp16( static_cast<const uint16_t*>( d )[first + i] );
+		else if ( m->dtype == pod::DType::FP32 ) for ( size_t i = 0; i < n; ++i ) h[i] = backend::from_float_half( static_cast<const float*>( d )[first + i] );
+		else ENGINE_ASSERT( false, "load_linear_range: scale vector dtype" );
+		const int sh1[1] = { static_cast<int>( n ) };
+		pod::TensorView t = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, sh1, 1 );
+		ENGINE_ASSERT( t.data != nullptr, "load_linear_range: arena full" );
+		backend::memcpy_async( t.data, h.data(), n * sizeof( backend::half_t ), backend::Copy::Auto, stream );
+		backend::stream_sync( stream );
+		return t;
+	};
+	pod::TensorView suh = scales( "suh", slice_dim == 0 );
+	pod::TensorView svh = scales( "svh", slice_dim == 1 );
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.mul1", base_name );
+	int dummy = -1;
+	const bool has_mul1 = find( name_buf, &dummy ) != nullptr;
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.mcg", base_name );
+	const bool has_mcg = find( name_buf, &dummy ) != nullptr;
+	return pod::LinearWeight::make_trellis( tr, suh, svh, B / 16, has_mul1, has_mcg );
+}
+
 pod::LinearWeight SafeTensorsRepo::load_linear_slice_padded(
 	const char* base_name,
 	pod::MemoryArena& arena,
