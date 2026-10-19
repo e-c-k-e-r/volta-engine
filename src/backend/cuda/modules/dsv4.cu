@@ -459,22 +459,43 @@ __global__ void concat_groups_kernel( const half* __restrict__ in, half* __restr
 	}
 }
 
-// ---- routing: one block per row, one thread per expert ----------------------------------------------------------------------------------
+// ---- routing: partial logits over hidden slices (lane = expert, so the [hidden, E] weight reads coalesce), then one block per row selects -----
+
+constexpr int ROUTE_SPLITS = 4;
+
+// grid (rows, experts / 32, ROUTE_SPLITS), 256 threads: warp w sums its share of the block's hidden slice for 32 experts
+__global__ __launch_bounds__( 256 )
+void route_partial_kernel( const half* __restrict__ x, const half* __restrict__ w_t, float* __restrict__ part, int hidden, int experts ) {
+	const int r = blockIdx.x, e = blockIdx.y * 32 + ( threadIdx.x & 31 ), warp = threadIdx.x >> 5;
+	const int slice = hidden / ROUTE_SPLITS, per_warp = slice / 8;
+	const int d0 = blockIdx.z * slice + warp * per_warp;
+	const half* xr = x + static_cast<size_t>( r ) * hidden;
+	float acc = 0.0f;
+	if ( e < experts ) {
+		for ( int d = d0; d < d0 + per_warp; ++d ) acc = fmaf( __half2float( xr[d] ), __half2float( w_t[static_cast<size_t>( d ) * experts + e] ), acc );
+	}
+	__shared__ float red[8][32];
+	red[warp][threadIdx.x & 31] = acc;
+	__syncthreads();
+	if ( warp == 0 && e < experts ) {
+		float v = 0.0f;
+		#pragma unroll
+		for ( int w = 0; w < 8; ++w ) v += red[w][threadIdx.x];
+		part[( static_cast<size_t>( r ) * ROUTE_SPLITS + blockIdx.z ) * experts + e] = v;
+	}
+}
 
 __global__ __launch_bounds__( 512 )
-void route_kernel( const half* __restrict__ x, const half* __restrict__ w_t, const float* __restrict__ bias, const int* __restrict__ perm, int* __restrict__ idx_out,
-	half* __restrict__ w_out, int hidden, int experts, int top_k, float scale ) {
-	extern __shared__ float rt_smem[];
-	float* xs = rt_smem;                 // [hidden]
-	float* sel_v = rt_smem + hidden;     // [blockDim]
-	int* sel_i = reinterpret_cast<int*>( sel_v + blockDim.x );
+void route_select_kernel( const float* __restrict__ part, const float* __restrict__ bias, const int* __restrict__ perm, int* __restrict__ idx_out, half* __restrict__ w_out,
+	int experts, int top_k, float scale ) {
+	__shared__ float sel_v[512];
+	__shared__ int sel_i[512];
 	const int r = blockIdx.x, e = threadIdx.x;
-	for ( int d = e; d < hidden; d += blockDim.x ) xs[d] = __half2float( x[static_cast<size_t>( r ) * hidden + d] );
-	__syncthreads();
 	float s = 0.0f, b = -FLT_MAX;
 	if ( e < experts ) {
 		float acc = 0.0f;
-		for ( int d = 0; d < hidden; ++d ) acc = fmaf( xs[d], __half2float( w_t[static_cast<size_t>( d ) * experts + e] ), acc );
+		#pragma unroll
+		for ( int k = 0; k < ROUTE_SPLITS; ++k ) acc += part[( static_cast<size_t>( r ) * ROUTE_SPLITS + k ) * experts + e];
 		const float sp = acc > 20.0f ? acc : log1pf( expf( acc ) );
 		s = sqrtf( sp );
 		b = s + bias[e];
@@ -604,13 +625,11 @@ void DSV4::concat_groups( const half* in, half* out, int groups, int n, int rows
 	concat_groups_kernel<<<static_cast<int>( ( total + 255 ) / 256 > 4096 ? 4096 : ( total + 255 ) / 256 ), 256, 0, stream>>>( in, out, groups, n, rows );
 }
 
-void DSV4::route( const half* x, const half* w_t, const float* bias, const int* perm, int* idx_out, half* w_out, int hidden, int experts, int top_k, float scale,
-	int rows, cudaStream_t stream ) {
-	ENGINE_ASSERT( experts <= 512 && top_k <= 16, "DSV4::route: at most 512 experts, top 16" );
-	int threads = 32;
-	while ( threads < experts ) threads <<= 1;
-	const size_t smem = static_cast<size_t>( hidden ) * sizeof( float ) + static_cast<size_t>( threads ) * ( sizeof( float ) + sizeof( int ) );
-	route_kernel<<<rows, threads, smem, stream>>>( x, w_t, bias, perm, idx_out, w_out, hidden, experts, top_k, scale );
+void DSV4::route( const half* x, const half* w_t, const float* bias, const int* perm, int* idx_out, half* w_out, float* scratch, int hidden, int experts, int top_k,
+	float scale, int rows, cudaStream_t stream ) {
+	ENGINE_ASSERT( experts <= 512 && top_k <= 16 && hidden % ( ROUTE_SPLITS * 8 ) == 0, "DSV4::route: at most 512 experts, top 16, hidden a multiple of 32" );
+	route_partial_kernel<<<dim3( rows, ( experts + 31 ) / 32, ROUTE_SPLITS ), 256, 0, stream>>>( x, w_t, scratch, hidden, experts );
+	route_select_kernel<<<rows, 512, 0, stream>>>( scratch, bias, perm, idx_out, w_out, experts, top_k, scale );
 }
 
 void DSV4::hc_collapse_norm( const float* streams, const float* pre, const half* norm_w, half* out, float* post, float post_scale, int hidden, float eps, int rows,

@@ -68,9 +68,10 @@ struct DSV4 {
 	static void concat_groups( const backend::half_t* in, backend::half_t* out, int groups, int n, int rows, backend::stream_t stream );
 
 	// sqrt-softplus routing: s = sqrt(softplus(x . W[e])), experts = top_k of s + bias, weights = s / sum(s of the chosen) * scale.
-	// w_t [hidden, E]; the chosen ids are written through perm (checkpoint id -> engine id)
+	// w_t [hidden, E]; the chosen ids are written through perm (checkpoint id -> engine id). scratch: route_scratch_floats( rows, experts )
 	static void route( const backend::half_t* x, const backend::half_t* w_t, const float* bias, const int* perm, int* idx_out, backend::half_t* w_out,
-		int hidden, int experts, int top_k, float scale, int rows, backend::stream_t stream );
+		float* scratch, int hidden, int experts, int top_k, float scale, int rows, backend::stream_t stream );
+	static constexpr size_t route_scratch_floats( int rows, int experts ) { return static_cast<size_t>( rows ) * 4 * experts; }
 
 	// Hyper-connection input with the lagged pre-mix: out = rmsnorm(sum_h pre[h] streams[h]) * norm_w (the sum in FP32, it exceeds FP16),
 	// and post[row][h] *= post_scale (the sublayer output is stored scaled down by that factor)

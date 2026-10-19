@@ -313,6 +313,7 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 	idx_nsel_ = dev_alloc<int>( arena, R );
 	d_topk_idx_ = dev_alloc<int>( arena, static_cast<size_t>( R ) * config_.top_k );
 	d_topk_w_ = dev_alloc<backend::half_t>( arena, static_cast<size_t>( R ) * config_.top_k );
+	route_scratch_ = dev_alloc<float>( arena, DSV4::route_scratch_floats( R, config_.num_experts ), false );
 	const int ecols = config_.engram_heads * ( config_.engram_ngram - 1 ) * config_.engram_head_dim;
 	e_rows_[0] = dev_tensor( arena, pod::DType::FP16, R, ecols );
 	e_rows_[1] = dev_tensor( arena, pod::DType::FP16, R, ecols );
@@ -859,7 +860,7 @@ void DeepseekV41Pipeline::ffn( int layer, DeepseekV41LayerWeights& lw, int m, ba
 	pre_cur_ ^= 1;
 	trace_tensor( 4000 + layer, norm_x_, m, H, stream );
 
-	DSV4::route( norm_x_.ptr<const backend::half_t>(), lw.router_w_t.ptr<const backend::half_t>(), lw.router_bias.ptr<const float>(), lw.perm, d_topk_idx_, d_topk_w_,
+	DSV4::route( norm_x_.ptr<const backend::half_t>(), lw.router_w_t.ptr<const backend::half_t>(), lw.router_bias.ptr<const float>(), lw.perm, d_topk_idx_, d_topk_w_, route_scratch_,
 		H, config_.num_experts, config_.top_k, config_.route_scale, m, stream );
 	bool first = true;
 	for ( auto& g : lw.groups ) {

@@ -34,7 +34,7 @@ __attribute__(( weak )) void DSV4::concat_groups( const backend::half_t* in, bac
 	__builtin_unreachable();
 }
 
-__attribute__(( weak )) void DSV4::route( const backend::half_t* x, const backend::half_t* w_t, const float* bias, const int* perm, int* idx_out, backend::half_t* w_out, int hidden, int experts, int top_k, float scale, int rows, backend::stream_t stream ) {
+__attribute__(( weak )) void DSV4::route( const backend::half_t* x, const backend::half_t* w_t, const float* bias, const int* perm, int* idx_out, backend::half_t* w_out, float* scratch, int hidden, int experts, int top_k, float scale, int rows, backend::stream_t stream ) {
 	ENGINE_UNSUPPORTED( "DSV4::route" );
 	__builtin_unreachable();
 }

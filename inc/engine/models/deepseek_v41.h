@@ -179,6 +179,7 @@ private:
 	int* idx_nsel_ = nullptr;
 	int* d_topk_idx_ = nullptr;
 	backend::half_t* d_topk_w_ = nullptr;
+	float* route_scratch_ = nullptr;
 	pod::MoEScratch moe_scratch_;
 	int max_group_ = 1;
 
