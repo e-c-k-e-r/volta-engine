@@ -190,6 +190,7 @@ private:
 	int* d_topk_idx_ = nullptr;
 	backend::half_t* d_topk_w_ = nullptr;
 	float* route_scratch_ = nullptr;
+	float* attend_ws_ = nullptr;   // split-KV partials of the decode attention
 	pod::MoEScratch moe_scratch_;
 	int max_group_ = 1;
 	std::vector<std::vector<int>> mine_;   // [layer] this rank's checkpoint expert ids in engine order

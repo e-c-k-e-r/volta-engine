@@ -24,7 +24,7 @@ __attribute__(( weak )) void DSV4::indexer( const backend::half_t* q, const back
 	__builtin_unreachable();
 }
 
-__attribute__(( weak )) void DSV4::attend( const backend::half_t* q, const backend::half_t* ring, const backend::half_t* comp_kv, const int* sel, const int* nsel, const float* sink, const float* rope, backend::half_t* o, int nh, int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride, size_t comp_slot_stride, backend::stream_t stream ) {
+__attribute__(( weak )) void DSV4::attend( const backend::half_t* q, const backend::half_t* ring, const backend::half_t* comp_kv, const int* sel, const int* nsel, const float* sink, const float* rope, backend::half_t* o, int nh, int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride, size_t comp_slot_stride, float* ws, backend::stream_t stream ) {
 	ENGINE_UNSUPPORTED( "DSV4::attend" );
 	__builtin_unreachable();
 }

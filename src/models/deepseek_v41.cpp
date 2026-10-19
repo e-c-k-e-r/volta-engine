@@ -347,6 +347,7 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 	idx_nsel_ = dev_alloc<int>( arena, R );
 	d_topk_idx_ = dev_alloc<int>( arena, static_cast<size_t>( R ) * config_.top_k );
 	d_topk_w_ = dev_alloc<backend::half_t>( arena, static_cast<size_t>( R ) * config_.top_k );
+	attend_ws_ = dev_alloc<float>( arena, DSV4::attend_ws_floats( lh_ ), false );
 	route_scratch_ = dev_alloc<float>( arena, DSV4::route_scratch_floats( R, config_.num_experts ), false );
 	const int ecols = config_.engram_heads * ( config_.engram_ngram - 1 ) * config_.engram_head_dim;
 	e_rows_[0] = dev_tensor( arena, pod::DType::FP16, R, ecols );
@@ -921,7 +922,7 @@ void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int
 		comp = comp_kv_[s];
 	}
 	DSV4::attend( q_.ptr<const backend::half_t>(), win_ring_, comp, idx_sel_, idx_nsel_, lw.sink.ptr<const float>(), rope, o_g_.ptr<backend::half_t>(), lh_, layer, m, d_rows_,
-		win_slot_stride_, lw.ratio > 0 ? comp_slot_stride_[lw.kv_src] : 0, stream );
+		win_slot_stride_, lw.ratio > 0 ? comp_slot_stride_[lw.kv_src] : 0, m <= pod::MAX_BATCH ? attend_ws_ : nullptr, stream );
 	const int G = DSV4::GROUP_HEADS * DSV4::HD, O = config_.o_lora_rank;
 	for ( int g = 0; g < gl_; ++g ) {
 		pod::TensorView in = view( o_g_, static_cast<size_t>( g ) * m * G, m, G );

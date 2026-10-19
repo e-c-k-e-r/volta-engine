@@ -362,7 +362,7 @@ template <int HPW>
 __global__ __launch_bounds__( ATT_THREADS )
 void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, const half* __restrict__ comp_kv, const int* __restrict__ sel, const int* __restrict__ nsel,
 	const float* __restrict__ sink, const float2* __restrict__ rope, half* __restrict__ o, int nh, int layer, int rows_n, const pod::BatchRows* __restrict__ rows,
-	size_t ring_slot_stride, size_t comp_slot_stride ) {
+	size_t ring_slot_stride, size_t comp_slot_stride, float* __restrict__ ws ) {
 	extern __shared__ half2 att_smem[];
 	half2* qs = att_smem;                       // [nh][HD / 2]
 	half2* ks = att_smem + nh * ( HD / 2 );     // [ATT_TILE][HD / 2]
@@ -384,6 +384,14 @@ void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, c
 	const int* srow = comp_kv ? sel + static_cast<size_t>( r ) * DSV4::TOPK : nullptr;
 	const int total = n_win + n_cmp;
 	const float scale = rsqrtf( static_cast<float>( HD ) );
+	// split-KV (ws != null, decode): this block takes keys [kb, ke) and leaves a partial; att_combine_kernel merges the splits
+	const int nsplit = gridDim.y;
+	int kb = 0, ke = total;
+	if ( ws != nullptr ) {
+		const int chunk = ( ( total + nsplit - 1 ) / nsplit + ATT_TILE - 1 ) / ATT_TILE * ATT_TILE;
+		kb = min( total, static_cast<int>( blockIdx.y ) * chunk);
+		ke = min( total, kb + chunk );
+	}
 
 	float m[HPW], l[HPW];
 	float2 acc[HPW][8];
@@ -394,9 +402,9 @@ void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, c
 		#pragma unroll
 		for ( int i = 0; i < 8; ++i ) acc[j][i] = make_float2( 0.0f, 0.0f );
 	}
-	for ( int k0 = 0; k0 < total; k0 += ATT_TILE ) {
+	for ( int k0 = kb; k0 < ke; k0 += ATT_TILE ) {
 		__syncthreads();
-		const int nk = min( ATT_TILE, total - k0 );
+		const int nk = min( ATT_TILE, ke - k0 );
 		for ( int i = tid; i < nk * ( HD / 8 ); i += ATT_THREADS ) {   // 16-byte loads
 			const int k = i / ( HD / 8 ), c = i % ( HD / 8 );
 			const int e = k0 + k;
@@ -430,6 +438,18 @@ void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, c
 			}
 		}
 	}
+	if ( ws != nullptr ) {
+		#pragma unroll
+		for ( int j = 0; j < HPW; ++j ) {
+			const int h = warp * HPW + j;
+			float* p = ws + ( ( static_cast<size_t>( r ) * nsplit + blockIdx.y ) * nh + h ) * ( HD + 2 );
+			float2* pa = reinterpret_cast<float2*>( p + 2 );
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) pa[lane + 32 * i] = acc[j][i];
+			if ( lane == 0 ) { p[0] = m[j]; p[1] = l[j]; }
+		}
+		return;
+	}
 	const int G = DSV4::GROUP_HEADS;
 	#pragma unroll
 	for ( int j = 0; j < HPW; ++j ) {
@@ -451,6 +471,49 @@ void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, c
 			const float amax = group_max<16>( fmaxf( fabsf( v[i].x ), fabsf( v[i].y ) ) );
 			const float s = e4m3_scale_pow2( amax );
 			reinterpret_cast<half2*>( dst )[lane + 32 * i] = __floats2half2_rn( q_e4m3( v[i].x, s ), q_e4m3( v[i].y, s ) );
+		}
+	}
+}
+
+// Merges the split-KV partials of a row (grid rows, 8 warps, a warp owns nh / 8 heads, lane layout as attend_kernel) and writes its output
+template <int HPW>
+__global__ __launch_bounds__( ATT_THREADS )
+void att_combine_kernel( const float* __restrict__ ws, int nsplit, const float* __restrict__ sink, const float2* __restrict__ rope, half* __restrict__ o, int nh,
+	int rows_n, const pod::BatchRows* __restrict__ rows ) {
+	const int r = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+	const float2* cs_row = rope + static_cast<size_t>( rows->pos[r] ) * ( ROPE / 2 );
+	const int G = DSV4::GROUP_HEADS;
+	#pragma unroll
+	for ( int j = 0; j < HPW; ++j ) {
+		const int h = warp * HPW + j;
+		float M = sink[h];
+		for ( int sp = 0; sp < nsplit; ++sp ) M = fmaxf( M, ws[( ( static_cast<size_t>( r ) * nsplit + sp ) * nh + h ) * ( HD + 2 )] );
+		float den = expf( sink[h] - M );
+		float2 v[8];
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) v[i] = make_float2( 0.0f, 0.0f );
+		for ( int sp = 0; sp < nsplit; ++sp ) {
+			const float* p = ws + ( ( static_cast<size_t>( r ) * nsplit + sp ) * nh + h ) * ( HD + 2 );
+			const float w = expf( p[0] - M );
+			den += p[1] * w;
+			const float2* pa = reinterpret_cast<const float2*>( p + 2 );
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) {
+				const float2 a = pa[lane + 32 * i];
+				v[i].x += a.x * w;
+				v[i].y += a.y * w;
+			}
+		}
+		const float f = 1.0f / den;
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) v[i] = __half22float2( __floats2half2_rn( v[i].x * f, v[i].y * f ) );
+		rot( v[7].x, v[7].y, cs_row[lane], true );
+		half* dst = o + ( static_cast<size_t>( h / G ) * rows_n + r ) * ( G * HD ) + static_cast<size_t>( h % G ) * HD;
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) {
+			const float amax = group_max<16>( fmaxf( fabsf( v[i].x ), fabsf( v[i].y ) ) );
+			const float sc = e4m3_scale_pow2( amax );
+			reinterpret_cast<half2*>( dst )[lane + 32 * i] = __floats2half2_rn( q_e4m3( v[i].x, sc ), q_e4m3( v[i].y, sc ) );
 		}
 	}
 }
@@ -614,20 +677,33 @@ void DSV4::indexer( const half* q, const half* w, const half* idx_k, float* scor
 }
 
 void DSV4::attend( const half* q, const half* ring, const half* comp_kv, const int* sel, const int* nsel, const float* sink, const float* rope_f, half* o, int nh,
-	int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride, size_t comp_slot_stride, cudaStream_t stream ) {
+	int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride, size_t comp_slot_stride, float* ws, cudaStream_t stream ) {
 	const float2* rope = reinterpret_cast<const float2*>( rope_f );
 	const size_t smem = static_cast<size_t>( nh + ATT_TILE ) * ( HD / 2 ) * sizeof( half2 );
+	ENGINE_ASSERT( nh == 8 || nh == 16 || nh == 32, "DSV4::attend: heads per rank must be 8, 16 or 32" );
+	// decode batches with compressed entries split the keys over blocks (a single block per row leaves almost every SM idle, and its dependent
+	// loads miss the cache once the compressed cache outgrows it); window-only layers and prefill chunks stay on one block per row
+	int nsplit = 1;
+	if ( ws != nullptr && comp_kv != nullptr ) nsplit = rows == 1 ? 16 : rows <= 4 ? 8 : rows <= 16 ? 4 : 1;
+	float* wsp = nsplit > 1 ? ws : nullptr;
+	const dim3 grid( rows, nsplit );
+	if ( nh == 32 ) {
+		static bool attr[ENGINE_NUM_GPUS] = {};
+		int dev = 0;
+		cudaGetDevice( &dev );
+		if ( !attr[dev] ) { cudaFuncSetAttribute( attend_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024 ); attr[dev] = true; }
+	}
 	switch ( nh / 8 ) {
-		case 1: attend_kernel<1><<<rows, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride ); break;
-		case 2: attend_kernel<2><<<rows, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride ); break;
-		case 4: {
-			static bool attr[ENGINE_NUM_GPUS] = {};
-			int dev = 0;
-			cudaGetDevice( &dev );
-			if ( !attr[dev] ) { cudaFuncSetAttribute( attend_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024 ); attr[dev] = true; }
-			attend_kernel<4><<<rows, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride );
-		} break;
-		default: ENGINE_ASSERT( false, "DSV4::attend: heads per rank must be 8, 16 or 32" );
+		case 1: attend_kernel<1><<<grid, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride, wsp ); break;
+		case 2: attend_kernel<2><<<grid, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride, wsp ); break;
+		default: attend_kernel<4><<<grid, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride, wsp ); break;
+	}
+	if ( nsplit > 1 ) {
+		switch ( nh / 8 ) {
+			case 1: att_combine_kernel<1><<<rows, ATT_THREADS, 0, stream>>>( wsp, nsplit, sink, rope, o, nh, rows, d_rows ); break;
+			case 2: att_combine_kernel<2><<<rows, ATT_THREADS, 0, stream>>>( wsp, nsplit, sink, rope, o, nh, rows, d_rows ); break;
+			default: att_combine_kernel<4><<<rows, ATT_THREADS, 0, stream>>>( wsp, nsplit, sink, rope, o, nh, rows, d_rows ); break;
+		}
 	}
 }
 

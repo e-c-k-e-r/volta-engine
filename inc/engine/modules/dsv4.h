@@ -61,9 +61,11 @@ struct DSV4 {
 	// Attention of nh heads over the window (positions pos - WINDOW + 1 .. pos of the layer's ring) and, with comp_kv, the selected compressed
 	// entries sel[row][0..nsel). q [rows, nh, HD] unrotated; logits scaled by HD^-1/2, a per-head sink in the denominator; the output is
 	// inverse-roped at pos, put on the E4M3-32 grid and written group-major: o[g][row][(h % GROUP_HEADS) * HD + d], g = h / GROUP_HEADS
+	// ws (attend_ws_floats( nh )) enables the split-KV decode path for up to MAX_BATCH rows; null runs one block per row
 	static void attend( const backend::half_t* q, const backend::half_t* ring, const backend::half_t* comp_kv, const int* sel, const int* nsel,
 		const float* sink, const float* rope, backend::half_t* o, int nh, int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride,
-		size_t comp_slot_stride, backend::stream_t stream );
+		size_t comp_slot_stride, float* ws, backend::stream_t stream );
+	static constexpr size_t attend_ws_floats( int nh ) { return static_cast<size_t>( 64 ) * nh * ( HD + 2 ); }   // rows x splits <= 64
 
 	// out[row][g * n + c] = in[g][row][c] for g < groups
 	static void concat_groups( const backend::half_t* in, backend::half_t* out, int groups, int n, int rows, backend::stream_t stream );
