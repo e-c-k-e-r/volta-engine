@@ -94,6 +94,7 @@ int main( int argc, char** argv ) {
 			buf.resize( static_cast<size_t>( c ) * V );
 			mc.read_logits( c, buf.data() );
 			std::fwrite( buf.data(), sizeof( engine::backend::half_t ), buf.size(), f );
+			if ( adapt > 0 ) mc.rebalance_experts();   // residency changes between chunks: the logits must not
 		}
 		std::fclose( f );
 		std::printf( "[*] logits of %d positions written to %s\n", n, dump.c_str() );
