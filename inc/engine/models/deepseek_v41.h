@@ -104,6 +104,10 @@ public:
 	bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) override;
 	void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) override;
 	void forward( const pod::BatchRows& rows, backend::stream_t stream = nullptr ) override;
+	// Prefill chunks layer by layer (prefill_window): the routed experts of a layer run once over the rows of all the window's chunks, so the
+	// cold experts' codes cross the PCIe link once per window instead of once per 512-row chunk
+	int window_chunks() const override { return window_; }
+	void forward_window( const int* tokens, const pod::BatchRows* chunks, int n, backend::stream_t stream = nullptr ) override;
 	void sample_tokens( int* out_preds, int count, backend::stream_t stream = nullptr ) override;
 	bool sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream = nullptr ) override;
 	bool topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream = nullptr ) override;
@@ -142,11 +146,15 @@ private:
 	bool load_engram( const char* model_dir );
 	// moves the snapshot rows of [from, tokens) of a slot between the caches and host memory (layout: see seq_state_bytes)
 	void copy_seq_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
-	void engram_prepare( const pod::BatchRows& rows, backend::stream_t stream );
+	void engram_prepare( const pod::BatchRows& rows, backend::stream_t stream, int chunk = 0, bool upload = true );
 	void set_rows( int m );
 	void forward_body( int m, backend::stream_t stream );
 	void attention( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );
 	void ffn( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );
+	void ffn_front( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );     // mHC collapse, norm, router
+	void ffn_experts( DeepseekV41LayerWeights& lw, int rows, backend::stream_t stream ); // the routed experts over norm_x_ rows
+	void ffn_back( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );      // shared expert, all-reduce
+	void forward_head( int m, backend::stream_t stream );
 	void trace( int tag, int m, backend::stream_t stream );
 	void trace_tensor( int tag, const pod::TensorView& t, int m, int cols, backend::stream_t stream );   // debug: <trace_layers>.t
 
@@ -196,6 +204,24 @@ private:
 	backend::half_t* d_topk_w_ = nullptr;
 	float* route_scratch_ = nullptr;
 	float* attend_ws_ = nullptr;   // split-KV partials of the decode attention
+	// Window prefill: what a chunk keeps from layer to layer (its residual streams, lagged pre-mix, mHC post / comb of the FFN in flight, the
+	// indexer's selection and candidate blocks) lives in a per-chunk set; the window's normed FFN input, router results and routed output are
+	// one block of rows
+	struct WinChunk {
+		void* streams = nullptr;
+		float* pre[2] = {};
+		int pre_cur = 0;
+		float* post = nullptr;
+		float* comb = nullptr;
+		int* sel = nullptr;
+		int* nsel = nullptr;
+		uint8_t* cand = nullptr;
+	};
+	int window_ = 1;
+	std::vector<WinChunk> win_;
+	pod::TensorView win_norm_, win_moe_out_, win_moe_tmp_;
+	int* win_topk_idx_ = nullptr;
+	backend::half_t* win_topk_w_ = nullptr;
 	pod::MoEScratch moe_scratch_;
 	int max_group_ = 1;
 	std::vector<std::vector<int>> mine_;   // [layer] this rank's checkpoint expert ids in engine order

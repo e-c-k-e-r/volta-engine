@@ -358,7 +358,29 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 	e_rows_[1] = dev_tensor( arena, pod::DType::FP16, R, ecols );
 	e_kv_ = dev_tensor( arena, pod::DType::FP16, R, 5 * H );
 	max_group_ = ( config_.num_experts + config_.tp_size - 1 ) / config_.tp_size;
-	moe_scratch_ = engine::modules::MoE::alloc_scratch( arena, max_group_, config_.top_k, H, config_.intermediate_size, R, false );
+	window_ = std::max( 1, std::min( runtime::options().prefill_window, 8 ) );
+	moe_scratch_ = engine::modules::MoE::alloc_scratch( arena, max_group_, config_.top_k, H, config_.intermediate_size, R * window_, false );
+	if ( window_ > 1 ) {
+		const size_t before = arena.offset_bytes;
+		win_.resize( window_ );
+		for ( int c = 0; c < window_; ++c ) {
+			WinChunk& w = win_[c];
+			w.streams = c == 0 ? streams_.data : static_cast<void*>( dev_alloc<float>( arena, static_cast<size_t>( 4 ) * R * H, false ) );
+			w.pre[0] = c == 0 ? pre_[0] : dev_alloc<float>( arena, 4 * R, false );
+			w.pre[1] = c == 0 ? pre_[1] : dev_alloc<float>( arena, 4 * R, false );
+			w.post = c == 0 ? mhc_post_.ptr<float>() : dev_alloc<float>( arena, 4 * R, false );
+			w.comb = c == 0 ? mhc_comb_.ptr<float>() : dev_alloc<float>( arena, static_cast<size_t>( 16 ) * R, false );
+			w.sel = c == 0 ? idx_sel_ : dev_alloc<int>( arena, static_cast<size_t>( R ) * DSV4::TOPK, false );
+			w.nsel = c == 0 ? idx_nsel_ : dev_alloc<int>( arena, R, false );
+			w.cand = c == 0 ? idx_cand_ : dev_alloc<uint8_t>( arena, static_cast<size_t>( R ) * ( max_cap / config_.candidate_block ), false );
+		}
+		win_norm_ = dev_tensor( arena, pod::DType::FP16, R * window_, H );
+		win_moe_out_ = dev_tensor( arena, pod::DType::FP16, R * window_, H );
+		win_moe_tmp_ = dev_tensor( arena, pod::DType::FP16, R * window_, H );
+		win_topk_idx_ = dev_alloc<int>( arena, static_cast<size_t>( R ) * window_ * config_.top_k, false );
+		win_topk_w_ = dev_alloc<backend::half_t>( arena, static_cast<size_t>( R ) * window_ * config_.top_k, false );
+		if ( rank_ == 0 ) LOG_INFO( "[deepseek_v41] prefill window of %d chunks: %.2f GiB per rank\n", window_, ( arena.offset_bytes - before ) / 1073741824.0 );
+	}
 
 	// logits: vocabulary-parallel head, shards padded to 256 columns
 	lm_shard_real_cols_ = 128 * lm_shard_spans( config_.vocab_size, config_.tp_size, rank_ );
@@ -450,7 +472,7 @@ bool DeepseekV41Pipeline::load_engram( const char* model_dir ) {
 	}
 	eg_.hist.assign( config_.max_slots, std::vector<int>( config_.max_seq, eg_.pad ) );
 	const size_t cols = static_cast<size_t>( eg_.heads ) * ( eg_.ngram - 1 ) * eg_.dim;
-	eg_.host_rows = static_cast<backend::half_t*>( engine::core::host_alloc_pinned( 2 * static_cast<size_t>( pod::MAX_ROWS ) * cols * sizeof( backend::half_t ) ) );
+	eg_.host_rows = static_cast<backend::half_t*>( engine::core::host_alloc_pinned( 2 * static_cast<size_t>( window_ ) * pod::MAX_ROWS * cols * sizeof( backend::half_t ) ) );
 	return true;
 }
 
@@ -832,12 +854,13 @@ void DeepseekV41Pipeline::embed_tokens( const int* token_ids, int count, backend
 
 // Host side of the Engram lookups: each row's compressed id joins its slot's history, its n-gram hashes pick rows of the two tables
 // (FP8 with power-of-two block scales, read through the checkpoint mapping), dequantized to FP16 and uploaded
-void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::stream_t stream ) {
+void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::stream_t stream, int chunk, bool upload ) {
 	const int m = rows.count;
 	ENGINE_ASSERT( static_cast<int>( pending_tokens_.size() ) == m, "DeepseekV41Pipeline: embed_tokens and forward disagree on the row count" );
 	const int N = eg_.ngram, NH = eg_.heads, D = eg_.dim, nb = D / eg_.block;
 	const int per = ( N - 1 ) * NH;   // table rows per position and Engram layer
 	const size_t cols = static_cast<size_t>( per ) * D;
+	backend::half_t* const host_rows = eg_.host_rows + static_cast<size_t>( chunk ) * 2 * pod::MAX_ROWS * cols;   // this chunk's region
 	// 1. hashes (the history is updated row by row, so a chunk sees its own earlier rows)
 	eg_.idx.resize( static_cast<size_t>( m ) * eg_.layers * per );
 	for ( int r = 0; r < m; ++r ) {
@@ -871,7 +894,7 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 	// 3. gather and dequantize (FP8 with a power-of-two scale per block)
 	for ( int r = 0; r < m; ++r ) {
 		for ( int e = 0; e < eg_.layers; ++e ) {
-			backend::half_t* dst = eg_.host_rows + ( static_cast<size_t>( e ) * pod::MAX_ROWS + r ) * cols;
+			backend::half_t* dst = host_rows + ( static_cast<size_t>( e ) * pod::MAX_ROWS + r ) * cols;
 			for ( int c = 0; c < per; ++c ) {
 				const int64_t row = eg_.idx[( static_cast<size_t>( r ) * eg_.layers + e ) * per + c];
 				const uint8_t* w = eg_.table[e] + static_cast<size_t>( row ) * D;
@@ -884,8 +907,9 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 			}
 		}
 	}
+	if ( !upload ) return;
 	for ( int e = 0; e < eg_.layers; ++e ) {
-		backend::memcpy_async( e_rows_[e].data, eg_.host_rows + static_cast<size_t>( e ) * pod::MAX_ROWS * cols, static_cast<size_t>( m ) * cols * sizeof( backend::half_t ),
+		backend::memcpy_async( e_rows_[e].data, host_rows + static_cast<size_t>( e ) * pod::MAX_ROWS * cols, static_cast<size_t>( m ) * cols * sizeof( backend::half_t ),
 			backend::Copy::H2D, stream );
 	}
 }
@@ -913,6 +937,114 @@ void DeepseekV41Pipeline::forward( const pod::BatchRows& rows, backend::stream_t
 	engram_prepare( rows, stream );
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
 	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); } );
+}
+
+void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRows* chunks, int n, backend::stream_t stream ) {
+	ENGINE_ASSERT( weights_loaded_ && window_ > 1 && n >= 1 && n <= window_, "DeepseekV41Pipeline::forward_window: no window configured" );
+	backend::set_device( rank_ );
+	const int H = config_.hidden_size, R = pod::MAX_ROWS, K = config_.top_k;
+	const size_t row_bytes = static_cast<size_t>( H ) * sizeof( backend::half_t );
+	const size_t ecols = static_cast<size_t>( eg_.heads ) * ( eg_.ngram - 1 ) * eg_.dim;
+	int off[9] = {};
+	for ( int c = 0; c < n; ++c ) {
+		ENGINE_ASSERT( chunks[c].count > pod::MAX_BATCH && chunks[c].count <= R, "DeepseekV41Pipeline::forward_window: chunk size out of range" );
+		for ( int r = 0; r < chunks[c].count; ++r ) {
+			ENGINE_ASSERT( chunks[c].slot[r] >= 0 && chunks[c].slot[r] < config_.max_slots && chunks[c].pos[r] >= 0 && chunks[c].pos[r] < config_.max_seq,
+				"DeepseekV41Pipeline::forward_window: slot or position out of range" );
+		}
+		off[c + 1] = off[c] + chunks[c].count;
+	}
+	const int total = off[n];
+	void* const norm0 = norm_x_.data;
+	void* const out0 = moe_out_.data;
+	void* const tmp0 = moe_tmp_.data;
+	int* const ti0 = d_topk_idx_;
+	backend::half_t* const tw0 = d_topk_w_;
+	auto bind = [&]( int c ) {
+		const int m = chunks[c].count;
+		WinChunk& w = win_[c];
+		streams_.data = w.streams;
+		pre_[0] = w.pre[0];
+		pre_[1] = w.pre[1];
+		pre_cur_ = w.pre_cur;
+		mhc_post_.data = w.post;
+		mhc_comb_.data = w.comb;
+		idx_sel_ = w.sel;
+		idx_nsel_ = w.nsel;
+		idx_cand_ = w.cand;
+		norm_x_.data = win_norm_.ptr<char>() + static_cast<size_t>( off[c] ) * row_bytes;
+		moe_out_.data = win_moe_out_.ptr<char>() + static_cast<size_t>( off[c] ) * row_bytes;
+		moe_tmp_.data = win_moe_tmp_.ptr<char>() + static_cast<size_t>( off[c] ) * row_bytes;
+		d_topk_idx_ = win_topk_idx_ + static_cast<size_t>( off[c] ) * K;
+		d_topk_w_ = win_topk_w_ + static_cast<size_t>( off[c] ) * K;
+		set_rows( m );
+		key_hint_ = chunks[c].pos[m - 1] + 1;
+		backend::memcpy_async( d_rows_, &chunks[c], chunks[c].upload_bytes(), backend::Copy::H2D, stream );
+		return m;
+	};
+	auto unbind = [&]( int c ) { win_[c].pre_cur = pre_cur_; };
+	const pod::BatchRows& last = chunks[n - 1];
+	lm_mode_ = last.logits_mode;
+	last_rows_ = lm_mode_ == pod::BatchRows::LOGITS_NONE ? 0 : lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : last.count;
+	ENGINE_ASSERT( last_rows_ <= logit_rows_, "DeepseekV41Pipeline::forward_window: more logit rows than the buffer holds" );
+
+	// embeddings, streams and Engram rows of every chunk (the hash history advances chunk by chunk)
+	for ( int c = 0; c < n; ++c ) {
+		const int m = bind( c );
+		embed_tokens( tokens + off[c], m, stream );
+		engine::modules::HyperConnection::init_streams( embed_rows_, streams_, H, stream, m );
+		DSV4::hc_identity_pre( pre_[0], m, stream );
+		pre_cur_ = 0;
+		engram_prepare( chunks[c], stream, c, false );
+		unbind( c );
+	}
+	for ( int l = 0; l < config_.num_layers; ++l ) {
+		auto& lw = layers_[l];
+		for ( int c = 0; c < n; ++c ) {
+			const int m = bind( c );
+			if ( lw.engram >= 0 ) {
+				backend::memcpy_async( e_rows_[lw.engram].data, eg_.host_rows + ( static_cast<size_t>( c ) * 2 + lw.engram ) * R * ecols, static_cast<size_t>( m ) * ecols * sizeof( backend::half_t ),
+					backend::Copy::H2D, stream );
+				engine::modules::Linear::forward( e_rows_[lw.engram], lw.e_wkv, e_kv_, stream );
+				DSV4::engram_gate( streams_.ptr<float>(), e_kv_.ptr<const backend::half_t>(), lw.e_w.ptr<const float>(), H, config_.norm_eps, m, stream );
+			}
+			attention( l, lw, m, stream );
+			ffn_front( lw, m, stream );
+			unbind( c );
+		}
+		// the routed experts over the whole window
+		norm_x_.data = win_norm_.data;
+		norm_x_.shape[0] = total;
+		moe_out_.data = win_moe_out_.data;
+		moe_out_.shape[0] = total;
+		moe_tmp_.data = win_moe_tmp_.data;
+		moe_tmp_.shape[0] = total;
+		d_topk_idx_ = win_topk_idx_;
+		d_topk_w_ = win_topk_w_;
+		ffn_experts( lw, total, stream );
+		for ( int c = 0; c < n; ++c ) {
+			const int m = bind( c );
+			ffn_back( lw, m, stream );
+			engine::modules::HyperConnection::update( streams_, moe_out_, mhc_post_, mhc_comb_, H, stream, m );
+			unbind( c );
+		}
+	}
+	forward_head( bind( n - 1 ), stream );
+
+	// back to the single-chunk bindings
+	streams_.data = win_[0].streams;
+	pre_[0] = win_[0].pre[0];
+	pre_[1] = win_[0].pre[1];
+	mhc_post_.data = win_[0].post;
+	mhc_comb_.data = win_[0].comb;
+	idx_sel_ = win_[0].sel;
+	idx_nsel_ = win_[0].nsel;
+	idx_cand_ = win_[0].cand;
+	norm_x_.data = norm0;
+	moe_out_.data = out0;
+	moe_tmp_.data = tmp0;
+	d_topk_idx_ = ti0;
+	d_topk_w_ = tw0;
 }
 
 void DeepseekV41Pipeline::trace( int tag, int m, backend::stream_t stream ) {
@@ -965,7 +1097,12 @@ void DeepseekV41Pipeline::forward_body( int m, backend::stream_t stream ) {
 		ffn( l, lw, m, stream );
 		trace( l, m, stream );
 	}
-	// head: the last pre-mix collapses the streams, then the final norm and this rank's vocabulary shard
+	forward_head( m, stream );
+}
+
+void DeepseekV41Pipeline::forward_head( int m, backend::stream_t stream ) {
+	const int H = config_.hidden_size;
+	// the last pre-mix collapses the streams, then the final norm and this rank's vocabulary shard
 	if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
 	DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], final_norm_.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), nullptr, 1.0f, H,
 		config_.norm_eps, m, stream );
@@ -1040,8 +1177,15 @@ void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int
 }
 
 void DeepseekV41Pipeline::ffn( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
-	(void) layer;
-	using engine::modules::Linear;
+	ffn_front( lw, m, stream );
+	trace_tensor( 4000 + layer, norm_x_, m, config_.hidden_size, stream );
+	ffn_experts( lw, m, stream );
+	ffn_back( lw, m, stream );
+	trace_tensor( 5000 + layer, moe_out_, m, config_.hidden_size, stream );
+	engine::modules::HyperConnection::update( streams_, moe_out_, mhc_post_, mhc_comb_, config_.hidden_size, stream, m );
+}
+
+void DeepseekV41Pipeline::ffn_front( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size;
 	float* pre_new = pre_[pre_cur_ ^ 1];
 	pod::TensorView pre_view = pod::make_tensor_2d( pre_new, pod::DType::FP32, 1, 4 * m );
@@ -1050,10 +1194,12 @@ void DeepseekV41Pipeline::ffn( int layer, DeepseekV41LayerWeights& lw, int m, ba
 	DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], lw.ffn_norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), mhc_post_.ptr<float>(),
 		kOutScale, H, config_.norm_eps, m, stream );
 	pre_cur_ ^= 1;
-	trace_tensor( 4000 + layer, norm_x_, m, H, stream );
-
 	DSV4::route( norm_x_.ptr<const backend::half_t>(), lw.router_w_t.ptr<const backend::half_t>(), lw.router_bias.ptr<const float>(), lw.perm, d_topk_idx_, d_topk_w_, route_scratch_,
 		H, config_.num_experts, config_.top_k, config_.route_scale, m, stream );
+}
+
+void DeepseekV41Pipeline::ffn_experts( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
+	const int H = config_.hidden_size;
 	bool first = true;
 	for ( auto& g : lw.groups ) {
 		pod::TensorView& out = first ? moe_out_ : moe_tmp_;
@@ -1062,6 +1208,11 @@ void DeepseekV41Pipeline::ffn( int layer, DeepseekV41LayerWeights& lw, int m, ba
 		first = false;
 	}
 	if ( first ) backend::memset_async( moe_out_.data, 0, static_cast<size_t>( m ) * H * sizeof( backend::half_t ), stream );
+}
+
+void DeepseekV41Pipeline::ffn_back( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
+	using engine::modules::Linear;
+	const int H = config_.hidden_size;
 	if ( lw.sh_gate.is_valid() ) {
 		Linear::forward( norm_x_, lw.sh_gate, sh_g_, stream );
 		Linear::forward( norm_x_, lw.sh_up, sh_u_, stream );
@@ -1070,8 +1221,6 @@ void DeepseekV41Pipeline::ffn( int layer, DeepseekV41LayerWeights& lw, int m, ba
 		engine::modules::MoERouter::accumulate( moe_out_.ptr<backend::half_t>(), sh_out_.ptr<const backend::half_t>(), backend::from_float_half( 1.0f ), m * H, stream );
 	}
 	if ( ring_ ) ring_->all_reduce( moe_out_, stream );
-	trace_tensor( 5000 + layer, moe_out_, m, H, stream );
-	engine::modules::HyperConnection::update( streams_, moe_out_, mhc_post_, mhc_comb_, H, stream, m );
 }
 
 // Snapshot layout: [window: layers x WINDOW x HD halves, the rows of positions tokens - WINDOW .. tokens - 1] then per kv source [compressed
