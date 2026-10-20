@@ -11,6 +11,7 @@
 		"prefix_cache_gib": 16,
 		"prefill_window": 16,
 		"speculator": "suffix",
-		"spec_suffix": 4
+		"spec_suffix": 4,
+		"max_image_tokens": 576
 	}
 }

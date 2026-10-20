@@ -70,9 +70,10 @@ struct DSV4 {
 	// out[row][g * n + c] = in[g][row][c] for g < groups
 	static void concat_groups( const backend::half_t* in, backend::half_t* out, int groups, int n, int rows, backend::stream_t stream );
 
-	// sqrt-softplus routing: s = sqrt(softplus(x . W[e])), experts = top_k of s + bias, weights = s / sum(s of the chosen) * scale.
+	// sqrt-softplus routing: s = sqrt(softplus(x . W[e])), experts = top_k of s + bias, weights = s / sum(s of the chosen) * scale. Rows whose img_flags entry
+	// is set (tokens of an image) take bias_vl instead of bias (both null-safe: without img_flags every row takes bias).
 	// w_t [hidden, E]; the chosen ids are written through perm (checkpoint id -> engine id). scratch: route_scratch_floats( rows, experts )
-	static void route( const backend::half_t* x, const backend::half_t* w_t, const float* bias, const int* perm, int* idx_out, backend::half_t* w_out,
+	static void route( const backend::half_t* x, const backend::half_t* w_t, const float* bias, const float* bias_vl, const uint8_t* img_flags, const int* perm, int* idx_out, backend::half_t* w_out,
 		float* scratch, int hidden, int experts, int top_k, float scale, int rows, backend::stream_t stream );
 	static constexpr size_t route_scratch_floats( int rows, int experts ) { return static_cast<size_t>( rows ) * 4 * experts; }
 

@@ -27,6 +27,7 @@
 |---|---|---|---|
 | `test_rows`, `test_moe`, `test_nvfp4_linear`, `test_mla_latent`, `test_spec_state`, `test_dflash` | 2 | yes | layer and speculator parity with real weights (`test_mla_latent` also covers the FP8 / int8 / NVFP4 latent caches) |
 | `test_tokenizer`, `test_tokenizer_file --cases` | 2 | no | token-exact against HF tokenizers (fixtures in `tests/data`) |
+| `test_dsv41_vision <model dir> <golden dir>` | 2 | yes | DeepSeek-V4.1 vision tower: the engine's preprocessing of a test image matches the checkpoint reference's patches (BF16 rounding), and the tower's image rows match the reference run in FP32 (row cosine; the BF16 reference is itself noisy on a few rows). `tests/tools/dsv41/vision_golden.py <model dir> <golden dir>` writes the goldens with the reference's torch code (gate.sh makes them once under results/) |
 | `test_dsv41_encoding <model dir>` | 2 | no | DeepSeek-V4.1 prompt encoding byte-exact against the checkpoint's `encoding/tests` golden cases and cases of its `test_encoding.py` |
 | `test_coherence`, `test_sampling_gpu` | 4 | yes | greedy determinism, seeded sampling, speculative equivalence |
 | `test_prefix_restore` (`--spec`, `--glm`, `--flash`, `ENGINE_KV_FORMAT=fp8`) | 2 | yes | a restored snapshot continues exactly like the same prefill without one |

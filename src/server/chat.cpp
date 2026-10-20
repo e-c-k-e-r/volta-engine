@@ -134,6 +134,7 @@ std::vector<int> expand_image_tokens( const std::vector<int>& tokens, int pad_id
 
 // The image placeholder token of a model family
 const char* image_pad_name( engine::loader::ModelFamily fam ) {
+	if ( fam == engine::loader::ModelFamily::DEEPSEEK ) return "<｜deepseek_image｜>";
 	return fam == engine::loader::ModelFamily::GLM ? "<|image|>" : "<|image_pad|>";
 }
 
@@ -262,9 +263,9 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 				return false;
 			}
 			engine::runtime::GenerationRequest::Image im;
-			im.grid_h = prep->grid_h / vp->merge_size;
-			im.grid_w = prep->grid_w / vp->merge_size;
-			im.count = im.grid_h * im.grid_w;
+			im.grid_h = vp->deepseek ? prep->llm_h : prep->grid_h / vp->merge_size;
+			im.grid_w = vp->deepseek ? prep->llm_w : prep->grid_w / vp->merge_size;
+			im.count = vp->deepseek ? prep->span_tokens() : im.grid_h * im.grid_w;   // DeepSeek: the delimiters and newlines are part of the span
 			im.hash = prep->hash;
 			im.prepared = std::move( prep );
 			images->push_back( std::move( im ) );

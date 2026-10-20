@@ -555,7 +555,7 @@ void route_partial_kernel( const half* __restrict__ x, const half* __restrict__ 
 }
 
 __global__ __launch_bounds__( 512 )
-void route_select_kernel( const float* __restrict__ part, const float* __restrict__ bias, const int* __restrict__ perm, int* __restrict__ idx_out, half* __restrict__ w_out,
+void route_select_kernel( const float* __restrict__ part, const float* __restrict__ bias, const float* __restrict__ bias_vl, const uint8_t* __restrict__ img_flags, const int* __restrict__ perm, int* __restrict__ idx_out, half* __restrict__ w_out,
 	int experts, int top_k, float scale ) {
 	__shared__ float sel_v[512];
 	__shared__ int sel_i[512];
@@ -567,7 +567,7 @@ void route_select_kernel( const float* __restrict__ part, const float* __restric
 		for ( int k = 0; k < ROUTE_SPLITS; ++k ) acc += part[( static_cast<size_t>( r ) * ROUTE_SPLITS + k ) * experts + e];
 		const float sp = acc > 20.0f ? acc : log1pf( expf( acc ) );
 		s = sqrtf( sp );
-		b = s + bias[e];
+		b = s + ( ( img_flags != nullptr && img_flags[r] ) ? bias_vl[e] : bias[e] );
 	}
 	__shared__ int chosen[16];
 	__shared__ float chosen_s[16];
@@ -712,11 +712,11 @@ void DSV4::concat_groups( const half* in, half* out, int groups, int n, int rows
 	concat_groups_kernel<<<static_cast<int>( ( total + 255 ) / 256 > 4096 ? 4096 : ( total + 255 ) / 256 ), 256, 0, stream>>>( in, out, groups, n, rows );
 }
 
-void DSV4::route( const half* x, const half* w_t, const float* bias, const int* perm, int* idx_out, half* w_out, float* scratch, int hidden, int experts, int top_k,
+void DSV4::route( const half* x, const half* w_t, const float* bias, const float* bias_vl, const uint8_t* img_flags, const int* perm, int* idx_out, half* w_out, float* scratch, int hidden, int experts, int top_k,
 	float scale, int rows, cudaStream_t stream ) {
 	ENGINE_ASSERT( experts <= 512 && top_k <= 16 && hidden % ( ROUTE_SPLITS * 8 ) == 0, "DSV4::route: at most 512 experts, top 16, hidden a multiple of 32" );
 	route_partial_kernel<<<dim3( rows, ( experts + 31 ) / 32, ROUTE_SPLITS ), 256, 0, stream>>>( x, w_t, scratch, hidden, experts );
-	route_select_kernel<<<rows, 512, 0, stream>>>( scratch, bias, perm, idx_out, w_out, experts, top_k, scale );
+	route_select_kernel<<<rows, 512, 0, stream>>>( scratch, bias, bias_vl, img_flags, perm, idx_out, w_out, experts, top_k, scale );
 }
 
 void DSV4::hc_collapse_norm( const float* streams, const float* pre, const half* norm_w, half* out, float* post, float post_scale, int hidden, float eps, int rows,

@@ -8,6 +8,7 @@
 #include "engine/core/graph_cache.h"
 #include "engine/modules/linear.h"
 #include "engine/modules/moe.h"
+#include "engine/models/deepseek_v41_vision.h"
 #include "engine/backend/types.h"
 #include <cstdint>
 #include <map>
@@ -85,7 +86,7 @@ struct DeepseekV41LayerWeights {
 	pod::LinearWeight c_wkv, c_wgate, idx_wk, idx_wq_b, idx_wproj;
 	pod::TensorView c_norm, idx_knorm;
 	// routing (checkpoint expert ids -> engine ids through perm) and experts
-	pod::TensorView router_w_t, router_bias;
+	pod::TensorView router_w_t, router_bias, router_bias_vl;   // bias_vl: the router bias of image tokens
 	int* perm = nullptr;
 	std::vector<DeepseekV41ExpertGroup> groups;
 	pod::LinearWeight sh_gate, sh_up, sh_down;     // rank 0
@@ -126,6 +127,12 @@ public:
 	// is the last WINDOW rows of every layer's window ring. Positions are even, so no 2:1 compression group is ever half filled at a boundary
 	int seq_align() const override { return 2; }
 	bool free_rollback() const override { return true; }
+	// Images: the tower sits on rank 0 (its arena share comes out of that rank's resident experts); the cluster overwrites the embedded rows of an
+	// image's token span with encode_image's rows (inject_embeddings), which then route with bias_vl and stay out of the Engram n-grams
+	bool load_vision( const char* model_dir, backend::stream_t stream = nullptr ) override;
+	const engine::loader::VisionParams* vision_params() const override { return vision_.loaded() ? &vision_.params() : nullptr; }
+	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
+	bool inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream = nullptr ) override;
 	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
 	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
 	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;
@@ -229,6 +236,12 @@ private:
 	backend::half_t* win_topk_w_ = nullptr;
 	pod::MoEScratch moe_scratch_;
 	int max_group_ = 1;
+	DeepseekV41VisionTower vision_;
+	size_t vision_reserve_ = 0;            // arena bytes the tower will need (rank 0), kept out of the resident share
+	std::vector<char> img_rows_;           // rows of the current forward that hold image tokens
+	uint8_t* d_img_flag_ = nullptr;        // the same on the device, read by the router
+	bool img_flag_dirty_ = false;          // the device flags hold ones that have not been cleared yet
+	void sync_image_flags( backend::stream_t stream );
 	bool expert_tp_ = false;               // every rank holds a slice of every expert (expert_shard) instead of whole experts
 	// expert_shard: the intermediate width is 18 spans of 128; rank r of tp takes 18 / tp of them plus one of the 18 % tp extra, and which ranks get
 	// the extra rotates with the expert so every rank carries the same share of the bytes and of the work

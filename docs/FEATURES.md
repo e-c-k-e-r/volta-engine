@@ -97,6 +97,7 @@ Covered by `test_all_reduce`, `bench_all_reduce`, `test_coherence`, `tests/4_ser
 | Qwen | 27 LayerNorm / GELU blocks, tensor-core attention, M-RoPE (interleaved 11/11/10) | Qwen2-VL smart resize |
 | GLM | 24 RMSNorm / SwiGLU blocks with q/k norm, 2x2 conv merge | aspect-preserving resize onto a zero-padded canvas aligned to 28; embeddings only, no M-RoPE |
 | Flash-Next | the checkpoint's own tower | |
+| DeepSeek | 32 RMSNorm / SwiGLU blocks, fused qkv, 2-D rotary, whole-image attention; a 3x3 aligner (raster order, zero padded) | grey-padded resize under a 1024-token budget; each image is a span of start, rows with a newline each, end; image tokens route with `bias_vl` and skip the Engram n-grams; costs rank 0 about 1.1 GiB of resident experts |
 
 * Option: `max_image_tokens` (default 1024 language-model tokens per image, 0 turns images off). The tower loads last into what the arena has left; GLM with the drafter leaves too little, so images stay off there unless memory is freed.
 * Input is base64 `data:` URLs or Anthropic base64 sources, also inside `tool_result`. Remote URLs are not fetched on purpose (a request-forgery surface, and Claude Code sends base64).

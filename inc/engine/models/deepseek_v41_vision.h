@@ -29,6 +29,9 @@ struct DeepseekV41VisionConfig {
 // carries it: [start] ([image] * llm_w + [newline]) * llm_h [end], the three delimiters being learned embeddings.
 class DeepseekV41VisionTower : public VisionTower {
 public:
+	// Arena bytes load() needs for images of up to max_image_tokens tokens (weights, scratch), 0 when the checkpoint has no tower; the model keeps
+	// that out of its residency budget on the rank that hosts the tower
+	static size_t arena_bytes( const char* model_dir, int max_image_tokens );
 	// False without a vision_config or without the vision tensors, or when the arena has no room
 	bool load( const char* model_dir, pod::MemoryArena& arena, int max_image_tokens, backend::stream_t stream );
 	bool loaded() const override { return loaded_; }

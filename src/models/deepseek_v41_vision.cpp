@@ -38,6 +38,24 @@ const backend::half_t* rows_of( const pod::TensorView& t, size_t first_row, size
 
 } // namespace
 
+size_t DeepseekV41VisionTower::arena_bytes( const char* model_dir, int max_image_tokens ) {
+	const nlohmann::json cfg_json = read_json( std::string( model_dir ) + "/config.json" );
+	if ( max_image_tokens <= 0 || cfg_json.is_discarded() || !cfg_json.contains( "vision_config" ) ) return 0;
+	const auto& vc = cfg_json["vision_config"];
+	engine::loader::SafeTensorsRepo repo;
+	if ( !repo.open( model_dir ) ) return 0;
+	size_t bytes = 0;
+	if ( repo.find( "vision.patch_embed.proj.weight" ) && repo.find( "aligner.w2.weight" ) ) {
+		const int tokens = std::min( max_image_tokens, vc.value( "max_image_tokens", max_image_tokens ) );
+		const int ds = vc.value( "downsample_ratio", 3 ), patch = vc.value( "patch_size", 14 );
+		const size_t M = static_cast<size_t>( tokens ) * ds * ds, H = vc.value( "hidden_size", 1024 ), I = vc.value( "intermediate_size", 2816 ), T = tokens, O = repo.find( "aligner.w2.weight" )->shape[0];
+		const size_t scratch = M * ( 3 * patch * patch * 2 + 64 * 8 + H * 4 + H * 2 * 6 + I * 2 * 3 ) + T * ( H * 9 * 2 + O * 2 * 2 ) + ( 16u << 20 );
+		bytes = repo.bytes_with_prefix( "vision." ) + repo.bytes_with_prefix( "aligner." ) + 3 * O * 2 + scratch;
+	}
+	repo.close();
+	return bytes;
+}
+
 bool DeepseekV41VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int max_image_tokens, backend::stream_t stream ) {
 	const nlohmann::json cfg_json = read_json( std::string( model_dir ) + "/config.json" );
 	if ( cfg_json.is_discarded() || !cfg_json.contains( "vision_config" ) ) return false;
