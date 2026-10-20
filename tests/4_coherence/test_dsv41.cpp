@@ -157,7 +157,9 @@ int main( int argc, char** argv ) {
 			const int L = std::atoi( verify.c_str() + at );
 			at = verify.find( ',', at ) == std::string::npos ? verify.size() : verify.find( ',', at ) + 1;
 			mc.reset_slot( 0 );
+			const auto tp = std::chrono::steady_clock::now();
 			mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0 );
+			std::printf( "[*] second prefill: %.0f ms (%.0f tok/s)\n", test::ms_since( tp ), prompt.size() * 1000.0 / test::ms_since( tp ) );
 			int blocks = 0, pos = static_cast<int>( prompt.size() );
 			const auto tv = std::chrono::steady_clock::now();
 			for ( size_t i = 0; i + L <= st.tokens.size(); i += L, ++blocks ) {

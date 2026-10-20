@@ -928,15 +928,20 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 	// 2. the rows' pages are requested all at once (the tables are far larger than the page cache: a miss is an NVMe read, and serial
 	// faults cost ~1 ms each; asked together they overlap)
 	const uintptr_t pg = static_cast<uintptr_t>( eg_.page );
-	for ( size_t k = 0; k < idx.size(); ++k ) {
-		const int e = static_cast<int>( ( k / per ) % eg_.layers );
-		const uintptr_t w = reinterpret_cast<uintptr_t>( eg_.table[e] + static_cast<size_t>( idx[k] ) * D );
-		const uintptr_t sc = reinterpret_cast<uintptr_t>( eg_.scale[e] + static_cast<size_t>( idx[k] ) * nb );
-		madvise( reinterpret_cast<void*>( w & ~( pg - 1 ) ), ( ( w + D - 1 ) & ~( pg - 1 ) ) - ( w & ~( pg - 1 ) ) + pg, MADV_WILLNEED );
-		madvise( reinterpret_cast<void*>( sc & ~( pg - 1 ) ), pg, MADV_WILLNEED );
-	}
+	auto advise = [this, &idx, pg, per, D, nb]() {
+		for ( size_t k = 0; k < idx.size(); ++k ) {
+			const int e = static_cast<int>( ( k / per ) % eg_.layers );
+			const uintptr_t w = reinterpret_cast<uintptr_t>( eg_.table[e] + static_cast<size_t>( idx[k] ) * D );
+			const uintptr_t sc = reinterpret_cast<uintptr_t>( eg_.scale[e] + static_cast<size_t>( idx[k] ) * nb );
+			madvise( reinterpret_cast<void*>( w & ~( pg - 1 ) ), ( ( w + D - 1 ) & ~( pg - 1 ) ) - ( w & ~( pg - 1 ) ) + pg, MADV_WILLNEED );
+			madvise( reinterpret_cast<void*>( sc & ~( pg - 1 ) ), pg, MADV_WILLNEED );
+		}
+	};
+	if ( phases == 3 ) advise();                       // one forward: every rank requests its pages, as before
+	else if ( rank_ == 0 ) eg_.advise[chunk] = std::thread( advise );   // a window: one thread requests them, the others read the shared page cache
 	}
 	if ( !( phases & 2 ) ) return;
+	if ( eg_.advise[chunk].joinable() ) eg_.advise[chunk].join();
 	// 3. gather and dequantize (FP8 with a power-of-two scale per block)
 	for ( int r = 0; r < m; ++r ) {
 		for ( int e = 0; e < eg_.layers; ++e ) {
