@@ -9,7 +9,7 @@
 		"max_seq": 16384,
 		"max_slots": 1,
 		"prefix_cache_gib": 16,
-		"prefill_window": 8,
+		"prefill_window": 16,
 		"speculator": "suffix",
 		"spec_suffix": 4
 	}
