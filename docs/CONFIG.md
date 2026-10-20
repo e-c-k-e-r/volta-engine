@@ -92,7 +92,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `expert_stats` | bool | `true` | `ENGINE_EXPERT_STATS` | count the routes per expert for the monitor page (a device sync per rank about once a second while serving) |
 | `spec_depth` | float | `0` | `ENGINE_SPEC_DEPTH` | DFlash2: shorten each round's block where the drafter's recent per-position accuracy says the chance of reaching a position is below this (0 = always the whole block; 0.15 to 0.3 measured +3 to +5% on GLM) |
 | `spec_suffix_min` | int | `3` | `ENGINE_SPEC_SUFFIX_MIN` | with spec_suffix: the fewest continuation tokens a match must offer to be used instead of drafting (1 to 7) |
-| `spec_suffix` | int | `0` | `ENGINE_SPEC_SUFFIX` | DFlash2: propose the tokens that followed the last earlier occurrence of the current suffix of this request's prompt and output (copied text: file contents, tool arguments, identifiers) instead of drafting when that suffix matches at least this many tokens; 0 = always draft |
+| `spec_suffix` | int | `0` | `ENGINE_SPEC_SUFFIX` | DFlash2, speculator=suffix: propose the tokens that followed the last earlier occurrence of the current suffix of this request's prompt and output (copied text: file contents, tool arguments, identifiers) instead of drafting when that suffix matches at least this many tokens; 0 = always draft |
 | `spec_ctrl` | bool | `true` | `ENGINE_SPEC_CTRL` | adaptive speculation controller; false always speculates |
 | `mem_log` | bool | `false` | `ENGINE_MEM_LOG` | log the per-pipeline [mem] breakdown at startup (GLM: buffers by kind, weights by kind, drafter; Flash-Next: buffers, weights by kind); the arena summary lines stay on |
 | **Debug** | | | | |
