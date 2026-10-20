@@ -129,7 +129,7 @@ Taps make_taps( int in_size, int out_size ) {
 
 } // namespace
 
-std::vector<float> resize_bicubic( const uint8_t* rgb, int in_h, int in_w, int out_h, int out_w ) {
+std::vector<float> resize_bicubic( const uint8_t* rgb, int in_h, int in_w, int out_h, int out_w, bool round_mid ) {
 	const Taps tx = make_taps( in_w, out_w );
 	const Taps ty = make_taps( in_h, out_h );
 	// Horizontal pass: [in_h, out_w, 3]
@@ -145,9 +145,7 @@ std::vector<float> resize_bicubic( const uint8_t* rgb, int in_h, int in_w, int o
 				acc[2] += w[j] * px[2];
 			}
 			float* o = &mid[( static_cast<size_t>( y ) * out_w + x ) * 3];
-			o[0] = acc[0];
-			o[1] = acc[1];
-			o[2] = acc[2];
+			for ( int c = 0; c < 3; ++c ) o[c] = round_mid ? std::min( 255.0f, std::max( 0.0f, std::nearbyint( acc[c] ) ) ) : acc[c];
 		}
 	}
 	std::vector<float> out( static_cast<size_t>( out_h ) * out_w * 3 );
@@ -194,11 +192,85 @@ void glm_canvas( int height, int width, int factor, int min_pixels, int max_pixe
 	*out_w = aw;
 }
 
+namespace {
+
+// DeepSeek-V4.1 (inference/image_processor.py): plan the pixel size from the token budget, pad onto a grey canvas, cut raster patches
+bool prepare_image_deepseek( const DecodedImage& img, const VisionParams& p, PreparedImage* out, std::string* error ) {
+	const int P = p.patch_size, R = p.downsample, cell = P * R;
+	int width = img.width, height = img.height;
+	if ( static_cast<int64_t>( width ) * height < p.min_pixels ) {
+		const double ratio = std::sqrt( static_cast<double>( p.min_pixels ) / ( static_cast<double>( width ) * height ) );
+		width = static_cast<int>( width * ratio );
+		height = static_cast<int>( height * ratio );
+	}
+	if ( width < 1 || height < 1 ) {
+		if ( error ) *error = "image too small";
+		return false;
+	}
+	int best_w = ( width + P - 1 ) / P * P, best_h = ( height + P - 1 ) / P * P;
+	auto grid = [&]( int bh, int bw, int* gh, int* gw ) { *gh = ( bh / P + R - 1 ) / R; *gw = ( bw / P + R - 1 ) / R; };
+	int lh = 0, lw = 0;
+	grid( best_h, best_w, &lh, &lw );
+	if ( lh * ( lw + 1 ) + 2 > p.max_tokens ) {
+		const double r = static_cast<double>( height ) / width;
+		const double max_w = std::sqrt( ( p.max_tokens - 2 ) / r + 0.25 ) - 0.5, max_h = max_w * r;
+		if ( max_w < 1.0 ) { best_h = ( p.max_tokens - 2 ) / 2 * cell; best_w = cell; }
+		else if ( max_h < 1.0 ) { best_h = cell; best_w = ( p.max_tokens - 3 ) * cell; }
+		else {
+			const double beta = std::min( std::floor( max_w ) * cell / width, std::floor( max_h ) * cell / height );
+			best_h = static_cast<int>( std::floor( height * beta / P ) ) * P;
+			best_w = static_cast<int>( std::floor( width * beta / P ) ) * P;
+		}
+		grid( best_h, best_w, &lh, &lw );
+		if ( lh * ( lw + 1 ) + 2 > p.max_tokens || best_h < P || best_w < P ) {
+			if ( error ) *error = "image does not fit the token budget";
+			return false;
+		}
+	}
+	// PIL ImageOps.pad( image, (best_w, best_h), color = (127, 127, 127) ): contain the image in the box (bicubic), centre it on the canvas
+	int nw = best_w, nh = best_h;
+	const double im_ratio = static_cast<double>( img.width ) / img.height, box_ratio = static_cast<double>( best_w ) / best_h;
+	if ( im_ratio > box_ratio ) nh = static_cast<int>( std::nearbyint( static_cast<double>( img.height ) / img.width * best_w ) );
+	else if ( im_ratio < box_ratio ) nw = static_cast<int>( std::nearbyint( static_cast<double>( img.width ) / img.height * best_h ) );
+	nw = std::max( 1, std::min( nw, best_w ) );
+	nh = std::max( 1, std::min( nh, best_h ) );
+	std::vector<float> content = ( nw == img.width && nh == img.height ) ? std::vector<float>( img.rgb.begin(), img.rgb.end() )
+	                                                                   : resize_bicubic( img.rgb.data(), img.height, img.width, nh, nw, true );
+	for ( float& v : content ) v = std::min( 255.0f, std::max( 0.0f, std::nearbyint( v ) ) );   // a PIL image holds 8-bit values
+	const int x0 = nw != best_w ? static_cast<int>( std::nearbyint( ( best_w - nw ) * 0.5 ) ) : 0;
+	const int y0 = nw == best_w ? static_cast<int>( std::nearbyint( ( best_h - nh ) * 0.5 ) ) : 0;
+	std::vector<float> px( static_cast<size_t>( best_h ) * best_w * 3, 127.0f );
+	for ( int y = 0; y < nh; ++y ) std::copy_n( &content[static_cast<size_t>( y ) * nw * 3], static_cast<size_t>( nw ) * 3, &px[( static_cast<size_t>( y0 + y ) * best_w + x0 ) * 3] );
+
+	const int gh = best_h / P, gw = best_w / P, dim = 3 * P * P;
+	out->grid_h = gh;
+	out->grid_w = gw;
+	out->llm_h = lh;
+	out->llm_w = lw;
+	out->patches.assign( static_cast<size_t>( gh ) * gw * dim, 0.0f );
+	size_t row = 0;
+	for ( int by = 0; by < gh; ++by ) {
+		for ( int bx = 0; bx < gw; ++bx, ++row ) {
+			float* dst = &out->patches[row * dim];
+			for ( int c = 0; c < 3; ++c )
+				for ( int y = 0; y < P; ++y )
+					for ( int x = 0; x < P; ++x )
+						*dst++ = px[( static_cast<size_t>( by * P + y ) * best_w + bx * P + x ) * 3 + c] * ( 1.0f / 127.5f ) - 1.0f;   // ( v / 255 - 0.5 ) / 0.5
+		}
+	}
+	const int dims[2] = { gh, gw };
+	out->hash = hash_bytes( dims, sizeof( dims ), hash_bytes( img.rgb.data(), img.rgb.size() ) );
+	return true;
+}
+
+} // namespace
+
 bool prepare_image( const DecodedImage& img, const VisionParams& p, PreparedImage* out, std::string* error ) {
 	if ( img.width < 1 || img.height < 1 ) {
 		if ( error ) *error = "empty image";
 		return false;
 	}
+	if ( p.deepseek ) return prepare_image_deepseek( img, p, out, error );
 	const int factor = p.patch_size * p.merge_size;
 	if ( std::max( img.width, img.height ) > 200 * std::min( img.width, img.height ) ) {
 		if ( error ) *error = "image aspect ratio above 200:1";

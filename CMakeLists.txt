@@ -127,6 +127,7 @@ set(ENGINE_HOST_SOURCES
 	src/models/qwen3_5.cpp
 	src/models/qwen3_vision.cpp
 	src/models/glm5_vision.cpp
+	src/models/deepseek_v41_vision.cpp
 	src/models/glm5_next.cpp
 	src/models/qwen4_exp.cpp
 	src/models/deepseek_v41.cpp
@@ -404,6 +405,10 @@ set_target_properties(test_dflash PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT
 add_executable(test_dsv41_encoding tests/2_parity/test_dsv41_encoding.cpp)
 target_link_libraries(test_dsv41_encoding PRIVATE engine_kernels)
 set_target_properties(test_dsv41_encoding PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_dsv41_vision tests/2_parity/test_dsv41_vision.cpp)
+target_link_libraries(test_dsv41_vision PRIVATE engine_kernels)
+set_target_properties(test_dsv41_vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_jinja tests/2_parity/test_jinja.cpp)
 target_link_libraries(test_jinja PRIVATE engine_kernels)
