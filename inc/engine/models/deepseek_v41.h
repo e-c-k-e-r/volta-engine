@@ -149,7 +149,8 @@ private:
 	bool load_engram( const char* model_dir );
 	// moves the snapshot rows of [from, tokens) of a slot between the caches and host memory (layout: see seq_state_bytes)
 	void copy_seq_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
-	void engram_prepare( const pod::BatchRows& rows, backend::stream_t stream, int chunk = 0, bool upload = true );
+	// phases: 1 = hashes and the page requests, 2 = gather and dequantize (and upload); a window requests the pages of all its chunks first
+	void engram_prepare( const pod::BatchRows& rows, backend::stream_t stream, int chunk = 0, bool upload = true, int phases = 3 );
 	void set_rows( int m );
 	void forward_body( int m, backend::stream_t stream );
 	void attention( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );
@@ -246,7 +247,8 @@ private:
 		const uint8_t* table[2] = {};
 		const uint8_t* scale[2] = {};
 		std::vector<std::vector<int>> hist;       // [slot][pos] compressed ids
-		std::vector<int64_t> idx;                 // the table rows of the current forward [rows][layers][(ngram - 1) * heads]
+		std::vector<int64_t> idx[8];              // the table rows of each chunk of the current forward [rows][layers][(ngram - 1) * heads]
+		int rows_c[8] = {};
 		size_t page = 4096;
 		backend::half_t* host_rows = nullptr;     // pinned [2][MAX_ROWS][cols]
 		float e4m3[256];

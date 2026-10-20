@@ -895,15 +895,18 @@ void DeepseekV41Pipeline::embed_tokens( const int* token_ids, int count, backend
 
 // Host side of the Engram lookups: each row's compressed id joins its slot's history, its n-gram hashes pick rows of the two tables
 // (FP8 with power-of-two block scales, read through the checkpoint mapping), dequantized to FP16 and uploaded
-void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::stream_t stream, int chunk, bool upload ) {
-	const int m = rows.count;
-	ENGINE_ASSERT( static_cast<int>( pending_tokens_.size() ) == m, "DeepseekV41Pipeline: embed_tokens and forward disagree on the row count" );
+void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::stream_t stream, int chunk, bool upload, int phases ) {
+	const int m = ( phases & 1 ) ? rows.count : eg_.rows_c[chunk];
+	std::vector<int64_t>& idx = eg_.idx[chunk];
+	if ( phases & 1 ) ENGINE_ASSERT( static_cast<int>( pending_tokens_.size() ) == m, "DeepseekV41Pipeline: embed_tokens and forward disagree on the row count" );
 	const int N = eg_.ngram, NH = eg_.heads, D = eg_.dim, nb = D / eg_.block;
 	const int per = ( N - 1 ) * NH;   // table rows per position and Engram layer
 	const size_t cols = static_cast<size_t>( per ) * D;
 	backend::half_t* const host_rows = eg_.host_rows + static_cast<size_t>( chunk ) * 2 * pod::MAX_ROWS * cols;   // this chunk's region
 	// 1. hashes (the history is updated row by row, so a chunk sees its own earlier rows)
-	eg_.idx.resize( static_cast<size_t>( m ) * eg_.layers * per );
+	if ( phases & 1 ) {
+	eg_.rows_c[chunk] = m;
+	idx.resize( static_cast<size_t>( m ) * eg_.layers * per );
 	for ( int r = 0; r < m; ++r ) {
 		const int s = rows.slot[r], pos = rows.pos[r];
 		const int tok = pending_tokens_[r];
@@ -916,7 +919,7 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 				rolling ^= toks[i] * eg_.mult[static_cast<size_t>( e ) * N + i];
 				for ( int h = 0; h < NH; ++h ) {
 					const size_t c = static_cast<size_t>( i - 1 ) * NH + h;
-					eg_.idx[( static_cast<size_t>( r ) * eg_.layers + e ) * per + c] =
+					idx[( static_cast<size_t>( r ) * eg_.layers + e ) * per + c] =
 						rolling % eg_.primes[static_cast<size_t>( e ) * per + c] + eg_.offsets[static_cast<size_t>( e ) * per + c];
 				}
 			}
@@ -925,19 +928,21 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 	// 2. the rows' pages are requested all at once (the tables are far larger than the page cache: a miss is an NVMe read, and serial
 	// faults cost ~1 ms each; asked together they overlap)
 	const uintptr_t pg = static_cast<uintptr_t>( eg_.page );
-	for ( size_t k = 0; k < eg_.idx.size(); ++k ) {
+	for ( size_t k = 0; k < idx.size(); ++k ) {
 		const int e = static_cast<int>( ( k / per ) % eg_.layers );
-		const uintptr_t w = reinterpret_cast<uintptr_t>( eg_.table[e] + static_cast<size_t>( eg_.idx[k] ) * D );
-		const uintptr_t sc = reinterpret_cast<uintptr_t>( eg_.scale[e] + static_cast<size_t>( eg_.idx[k] ) * nb );
+		const uintptr_t w = reinterpret_cast<uintptr_t>( eg_.table[e] + static_cast<size_t>( idx[k] ) * D );
+		const uintptr_t sc = reinterpret_cast<uintptr_t>( eg_.scale[e] + static_cast<size_t>( idx[k] ) * nb );
 		madvise( reinterpret_cast<void*>( w & ~( pg - 1 ) ), ( ( w + D - 1 ) & ~( pg - 1 ) ) - ( w & ~( pg - 1 ) ) + pg, MADV_WILLNEED );
 		madvise( reinterpret_cast<void*>( sc & ~( pg - 1 ) ), pg, MADV_WILLNEED );
 	}
+	}
+	if ( !( phases & 2 ) ) return;
 	// 3. gather and dequantize (FP8 with a power-of-two scale per block)
 	for ( int r = 0; r < m; ++r ) {
 		for ( int e = 0; e < eg_.layers; ++e ) {
 			backend::half_t* dst = host_rows + ( static_cast<size_t>( e ) * pod::MAX_ROWS + r ) * cols;
 			for ( int c = 0; c < per; ++c ) {
-				const int64_t row = eg_.idx[( static_cast<size_t>( r ) * eg_.layers + e ) * per + c];
+				const int64_t row = idx[( static_cast<size_t>( r ) * eg_.layers + e ) * per + c];
 				const uint8_t* w = eg_.table[e] + static_cast<size_t>( row ) * D;
 				const uint8_t* sc = eg_.scale[e] + static_cast<size_t>( row ) * nb;
 				backend::half_t* o = dst + static_cast<size_t>( c ) * D;
@@ -1036,7 +1041,7 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 		engine::modules::HyperConnection::init_streams( embed_rows_, streams_, H, stream, m );
 		DSV4::hc_identity_pre( pre_[0], m, stream );
 		pre_cur_ = 0;
-		engram_prepare( chunks[c], stream, c, false );
+		engram_prepare( chunks[c], stream, c, false, 1 );   // the pages are requested now, gathered when layer 1 needs them
 		unbind( c );
 	}
 	for ( int l = 0; l < config_.num_layers; ++l ) {
@@ -1044,6 +1049,7 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 		for ( int c = 0; c < n; ++c ) {
 			const int m = bind( c );
 			if ( lw.engram >= 0 ) {
+				if ( lw.engram == 0 ) engram_prepare( chunks[c], stream, c, false, 2 );
 				backend::memcpy_async( e_rows_[lw.engram].data, eg_.host_rows + ( static_cast<size_t>( c ) * 2 + lw.engram ) * R * ecols, static_cast<size_t>( m ) * ecols * sizeof( backend::half_t ),
 					backend::Copy::H2D, stream );
 				engine::modules::Linear::forward( e_rows_[lw.engram], lw.e_wkv, e_kv_, stream );
