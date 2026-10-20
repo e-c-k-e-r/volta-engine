@@ -1,5 +1,6 @@
 {
 	"model_dir": "/path/to/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw",
+	"draft_model_dir": "/path/to/DeepSeek-V4.1-Flash-1017-DSpark-EXL3-e3",
 	"tp_size": 4,
 	"port": 8000,
 	"max_batch_size": 1,
@@ -10,8 +11,8 @@
 		"max_slots": 1,
 		"prefix_cache_gib": 16,
 		"prefill_window": 16,
-		"speculator": "suffix",
-		"spec_suffix": 4,
+		"speculator": "dspark",
+		"dspark_conf": 0.7,
 		"max_image_tokens": 576
 	}
 }
