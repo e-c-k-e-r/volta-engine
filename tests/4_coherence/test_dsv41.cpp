@@ -37,12 +37,14 @@ int main( int argc, char** argv ) {
 	std::string turns;
 	int snap_at = 0;   // snap=<P>: prefix-cache round trip with a snapshot chain ending near position P
 	int turns_first = 0, turns_count = 1 << 30;
+	std::string verify;   // verify=<L,L,..>: the greedy continuation fed back in blocks of L rows, the time of a block (the cost of a speculative verify)
 	int adapt = 0;      // adapt=<N>: decode with an expert residency rebalance every N tokens, printing the time of each 16 tokens
 	std::string dump;   // dump=<file>: teacher-forced prefill in chunks of 512 rows, every row's FP16 logits appended (needs glm_logit_rows=512)
 	for ( ; a < argc; ++a ) {
 		const std::string kv = argv[a];
 		const size_t eq = kv.find( '=' );
 		ENGINE_ASSERT( eq != std::string::npos, "test_dsv41: options are key=value" );
+		if ( kv.substr( 0, eq ) == "verify" ) { verify = kv.substr( eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "adapt" ) { adapt = std::atoi( kv.c_str() + eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "dump" ) { dump = kv.substr( eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "turns" ) { turns = kv.substr( eq + 1 ); continue; }
@@ -149,6 +151,23 @@ int main( int argc, char** argv ) {
 		mc.free_snapshot( &s1 );
 		mc.free_snapshot( &s2 );
 		if ( !same ) { mc.shutdown(); return 1; }
+	}
+	if ( !verify.empty() ) {
+		for ( size_t at = 0; at < verify.size(); ) {
+			const int L = std::atoi( verify.c_str() + at );
+			at = verify.find( ',', at ) == std::string::npos ? verify.size() : verify.find( ',', at ) + 1;
+			mc.reset_slot( 0 );
+			mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0 );
+			int blocks = 0, pos = static_cast<int>( prompt.size() );
+			const auto tv = std::chrono::steady_clock::now();
+			for ( size_t i = 0; i + L <= st.tokens.size(); i += L, ++blocks ) {
+				mc.forward( &st.tokens[i], L, pos, 0 );
+				pos += L;
+				mc.sample_one();
+			}
+			const double ms = test::ms_since( tv );
+			std::printf( "[*] verify blocks of %d rows: %d blocks, %.1f ms per block, %.1f ms per row\n", L, blocks, ms / blocks, ms / ( blocks * L ) );
+		}
 	}
 	const int dec = static_cast<int>( st.tokens.size() ) - 1;
 	std::printf( "[*] prompt %zu tokens, %.1f s: prefill %.0f ms (%.0f tok/s), decode %d tokens in %.0f ms (%.1f ms/token, %.1f tok/s)\n", prompt.size(), test::ms_since( t0 ) / 1000.0,

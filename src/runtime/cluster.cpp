@@ -1,6 +1,7 @@
 #include "engine/runtime/cluster.h"
 #include "engine/backend/tiers.h"
 #include "engine/runtime/mtp_runner.h"
+#include "engine/runtime/suffix_runner.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
@@ -121,6 +122,15 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		auto mtp = std::make_unique<MtpRunner>();
 		if ( !mtp->init( *this ) ) return false;
 		runner_ = std::move( mtp );
+	}
+	else if ( opt.speculator == "suffix" && cfg.speculate ) {
+		if ( !models_[0]->free_rollback() ) {
+			LOG_ERROR( "ModelCluster: speculator=suffix needs a model whose caches are indexed by position; %s keeps recurrent state\n", cfg.model_type.c_str() );
+			return false;
+		}
+		auto suffix = std::make_unique<SuffixRunner>();
+		if ( !suffix->init( *this ) ) return false;
+		runner_ = std::move( suffix );
 	}
 	else if ( !cfg.draft_model_dir.empty() ) {
 		auto dflash = std::make_unique<DFlash2Runner>();

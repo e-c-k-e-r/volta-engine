@@ -124,6 +124,7 @@ public:
 	// Prefix-cache snapshots: positions [from, tokens) store their compressed KV and index-key entries and their Engram ids; the state at `tokens`
 	// is the last WINDOW rows of every layer's window ring. Positions are even, so no 2:1 compression group is ever half filled at a boundary
 	int seq_align() const override { return 2; }
+	bool free_rollback() const override { return true; }
 	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
 	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
 	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;

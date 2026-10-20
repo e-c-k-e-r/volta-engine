@@ -412,7 +412,7 @@ bool ServerConfig::resolve() {
 		if ( default_top_k < 0 ) default_top_k = 16;
 		LOG_INFO( "Sampling defaults: temperature %.2f, top_p %.2f, top_k %d\n", default_temperature, default_top_p, default_top_k );
 	}
-	if ( use_speculation && draft_model_dir.empty() && runtime::options().speculator != "mtp" ) {
+	if ( use_speculation && draft_model_dir.empty() && runtime::options().speculator != "mtp" && runtime::options().speculator != "suffix" ) {
 		LOG_ERROR( "FATAL: use_speculation requires draft_model_dir\n" );
 		return false;
 	}

@@ -3,11 +3,14 @@
 	"tp_size": 4,
 	"port": 8000,
 	"max_batch_size": 1,
+	"use_speculation": true,
 	"request_timeout_s": 600,
 	"options": {
 		"max_seq": 16384,
 		"max_slots": 1,
 		"prefix_cache_gib": 16,
-		"prefill_window": 8
+		"prefill_window": 8,
+		"speculator": "suffix",
+		"spec_suffix": 4
 	}
 }

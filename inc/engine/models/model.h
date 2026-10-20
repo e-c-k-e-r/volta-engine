@@ -211,6 +211,8 @@ public:
 	// target's final-norm rows (scratch), so save what later steps need first. With logits_last the
 	// last row's logits are left in row 0 of the logits buffer (sample / sample_topk read them).
 	virtual bool has_mtp() const { return false; }
+	// Every cache is indexed by position, so rejected speculative rows leave nothing to repair (no recurrent state): the drafter-free suffix speculator needs it
+	virtual bool free_rollback() const { return false; }
 	virtual void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) { (void) rows; (void) tokens; (void) hidden_mode; (void) hist_row0; (void) logits_last; (void) stream; ENGINE_ASSERT( false, "model has no MTP head" ); }
 	// Joint rounds: rows of several slots in one head step, logits (and the chained stack) for the rows out_rows[0 .. n_out) only; hidden_mode 4 =
 	// the stacks staged by mtp_gather_hist. A model that cannot returns false from mtp_joint().
