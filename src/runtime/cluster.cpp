@@ -324,8 +324,8 @@ int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Ca
 	const int window = ( mm_slots_ == 0 && chunk > pod::MAX_BATCH ) ? models_[0]->window_chunks() : 1;
 	for ( int pos = 0; pos < count; ) {
 		int n = 0;
-		pod::BatchRows win[8];
-		for ( int p = pos; window > 1 && n < MIN( window, 8 ) && p < count; ) {
+		pod::BatchRows win[16];
+		for ( int p = pos; window > 1 && n < MIN( window, 16 ) && p < count; ) {
 			const int rows = MIN( chunk, count - p );
 			if ( rows <= pod::MAX_BATCH ) break;
 			win[n++] = pod::BatchRows::causal( rows, pos0 + p, slot, ( p + rows >= count ) ? pod::BatchRows::LOGITS_LAST : pod::BatchRows::LOGITS_NONE );

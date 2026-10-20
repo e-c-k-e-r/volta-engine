@@ -363,10 +363,10 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 		ENGINE_ASSERT( config_.intermediate_size % 128 == 0 && spans >= tp, "DeepseekV41Pipeline: the expert width must split into 128-wide spans for every rank" );
 	}
 	max_group_ = expert_tp_ ? config_.num_experts : ( config_.num_experts + config_.tp_size - 1 ) / config_.tp_size;
-	window_ = std::max( 1, std::min( runtime::options().prefill_window, 8 ) );
+	window_ = std::max( 1, std::min( runtime::options().prefill_window, 16 ) );
+	const size_t window_mark = arena.offset_bytes;
 	moe_scratch_ = engine::modules::MoE::alloc_scratch( arena, max_group_, config_.top_k, H, config_.intermediate_size, R * window_, false );
 	if ( window_ > 1 ) {
-		const size_t before = arena.offset_bytes;
 		win_.resize( window_ );
 		for ( int c = 0; c < window_; ++c ) {
 			WinChunk& w = win_[c];
@@ -384,7 +384,7 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 		win_moe_tmp_ = dev_tensor( arena, pod::DType::FP16, R * window_, H );
 		win_topk_idx_ = dev_alloc<int>( arena, static_cast<size_t>( R ) * window_ * config_.top_k, false );
 		win_topk_w_ = dev_alloc<backend::half_t>( arena, static_cast<size_t>( R ) * window_ * config_.top_k, false );
-		if ( rank_ == 0 ) LOG_INFO( "[deepseek_v41] prefill window of %d chunks: %.2f GiB per rank\n", window_, ( arena.offset_bytes - before ) / 1073741824.0 );
+		if ( rank_ == 0 ) LOG_INFO( "[deepseek_v41] prefill window of %d chunks: %.2f GiB per rank\n", window_, ( arena.offset_bytes - window_mark ) / 1073741824.0 );
 	}
 
 	// logits: vocabulary-parallel head, shards padded to 256 columns
@@ -996,7 +996,7 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 	const int H = config_.hidden_size, R = pod::MAX_ROWS, K = config_.top_k;
 	const size_t row_bytes = static_cast<size_t>( H ) * sizeof( backend::half_t );
 	const size_t ecols = static_cast<size_t>( eg_.heads ) * ( eg_.ngram - 1 ) * eg_.dim;
-	int off[9] = {};
+	int off[17] = {};
 	for ( int c = 0; c < n; ++c ) {
 		ENGINE_ASSERT( chunks[c].count > pod::MAX_BATCH && chunks[c].count <= R, "DeepseekV41Pipeline::forward_window: chunk size out of range" );
 		for ( int r = 0; r < chunks[c].count; ++r ) {

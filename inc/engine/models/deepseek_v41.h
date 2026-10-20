@@ -248,9 +248,9 @@ private:
 		const uint8_t* table[2] = {};
 		const uint8_t* scale[2] = {};
 		std::vector<std::vector<int>> hist;       // [slot][pos] compressed ids
-		std::vector<int64_t> idx[8];              // the table rows of each chunk of the current forward [rows][layers][(ngram - 1) * heads]
-		int rows_c[8] = {};
-		std::thread advise[8];                    // a window: rank 0 requests the pages of a chunk in the background
+		std::vector<int64_t> idx[16];              // the table rows of each chunk of the current forward [rows][layers][(ngram - 1) * heads]
+		int rows_c[16] = {};
+		std::thread advise[16];                    // a window: rank 0 requests the pages of a chunk in the background
 		size_t page = 4096;
 		backend::half_t* host_rows = nullptr;     // pinned [2][MAX_ROWS][cols]
 		float e4m3[256];
