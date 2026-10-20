@@ -416,7 +416,7 @@ bool Generator::prefill_slot( int s, int budget ) {
 			const int align = cluster_.snapshot_align();
 			for ( auto& cp : slot.pf_cps ) cp.pos -= cp.pos % align;
 			const int interval = runtime::options().prefix_interval;
-			for ( int p = interval; interval > 0 && p < n - kPrefixMinTokens; p += interval ) slot.pf_cps.push_back( { p, false, false } );
+			for ( int p = interval; interval > 0 && p < n - kPrefixMinTokens; p += interval ) slot.pf_cps.push_back( { p, false, cluster_.has_speculator() && cluster_.speculator().cheap_snapshot_taps() } );
 			std::sort( slot.pf_cps.begin(), slot.pf_cps.end(), []( const GenerationRequest::Checkpoint& a, const GenerationRequest::Checkpoint& b ) { return a.pos < b.pos || ( a.pos == b.pos && a.pinned > b.pinned ); } );
 		}
 		if ( prefix_cache_ && !slot.pf_cps.empty() ) {

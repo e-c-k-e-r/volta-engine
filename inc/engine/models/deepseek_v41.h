@@ -174,6 +174,7 @@ private:
 	void ffn( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );
 	void ffn_front( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream, int experts = 0, int top_k = 0 );     // mHC collapse, norm, router (the drafter's has fewer experts)
 	void dspark_ingest( int slot, int from, int to, backend::stream_t stream );
+	void copy_taps( int slot_id, int tokens, char* host, bool to_host, backend::stream_t stream );
 	void embed_raw( const int* token_ids, int count, backend::stream_t stream );
 	void ffn_experts( DeepseekV41LayerWeights& lw, int rows, backend::stream_t stream ); // the routed experts over norm_x_ rows
 	void ffn_back( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );      // shared expert, all-reduce

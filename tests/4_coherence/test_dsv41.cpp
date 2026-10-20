@@ -40,6 +40,7 @@ int main( int argc, char** argv ) {
 	std::string verify;   // verify=<L,L,..>: the greedy continuation fed back in blocks of L rows, the time of a block (the cost of a speculative verify)
 	int adapt = 0;      // adapt=<N>: decode with an expert residency rebalance every N tokens, printing the time of each 16 tokens
 	std::string dump;   // dump=<file>: teacher-forced prefill in chunks of 512 rows, every row's FP16 logits appended (needs glm_logit_rows=512)
+	int dsnap = 0;            // dsnap=<P>: the drafter's draft after prompt[0, P) before and after a snapshot round trip with taps
 	std::string dspark_dir;   // dspark_dir=<dir>: load the DSpark drafter (quantize_dspark.py output) as the speculator
 	int spec_run = 0;         // spec=1: after the plain decode, the same generation with speculative rounds (output must be identical)
 	std::string dtf;          // dtf=<ids file>: the drafter on a recorded sequence, teacher forced
@@ -48,6 +49,7 @@ int main( int argc, char** argv ) {
 		const std::string kv = argv[a];
 		const size_t eq = kv.find( '=' );
 		ENGINE_ASSERT( eq != std::string::npos, "test_dsv41: options are key=value" );
+		if ( kv.substr( 0, eq ) == "dsnap" ) { dsnap = std::atoi( kv.c_str() + eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "dspark_dir" ) { dspark_dir = kv.substr( eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "spec" ) { spec_run = std::atoi( kv.c_str() + eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "dtf" ) { dtf = kv.substr( eq + 1 ); continue; }
@@ -71,6 +73,33 @@ int main( int argc, char** argv ) {
 		cfg.speculate = true;
 	}
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
+	if ( dsnap > 0 ) {
+		// the drafter through a prefix-cache round trip: the draft after prompt[0, P) must not change when the slot is overwritten by another prompt and
+		// restored from a snapshot with taps (the window KV is re-derived from the restored tap rows)
+		const int P = ( std::min<int>( dsnap, static_cast<int>( prompt.size() ) - 2 ) / 2 ) * 2;
+		const int B = mc.model( 0 ).dspark_block(), from = std::max( 0, P - 128 );
+		int dA[8] = {}, dB[8] = {};
+		float cA[8] = {}, cB[8] = {};
+		mc.reset_slot( 0 );
+		mc.prefill( prompt.data(), P, 0 );
+		mc.dspark_draft( 0, P, from, from, prompt[P], dA, cA );
+		ModelCluster::SeqSnapshot snap;
+		ENGINE_ASSERT( mc.save_snapshot( 0, 0, P, &snap, true ) && snap.with_taps, "test_dsv41: save with taps" );
+		std::vector<int> other( prompt.rbegin(), prompt.rend() );
+		mc.reset_slot( 0 );
+		mc.prefill( other.data(), P, 0 );
+		mc.reset_slot( 0 );
+		ENGINE_ASSERT( mc.load_snapshot( 0, snap, false ), "test_dsv41: load" );
+		mc.dspark_draft( 0, P, from, from, prompt[P], dB, cB );
+		bool same = true;
+		for ( int j = 0; j < B; ++j ) same = same && dA[j] == dB[j] && cA[j] == cB[j];
+		std::printf( "[%c] drafter after a snapshot round trip at %d: drafts", same ? '+' : '-', P );
+		for ( int j = 0; j < B; ++j ) std::printf( " %d/%d", dA[j], dB[j] );
+		std::printf( " (%s)\n", same ? "identical, confidences too" : "DIFFER" );
+		mc.free_snapshot( &snap );
+		mc.shutdown();
+		return same ? 0 : 1;
+	}
 	if ( !dtf.empty() ) {
 		// the drafter on a recorded sequence (prompt + the target's greedy continuation): at each position t the drafter gets the anchor ids[t]
 		// (the token the target chose, not yet forwarded) and drafts positions t + 1 ..; a draft is right when it equals the recorded token

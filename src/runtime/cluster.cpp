@@ -631,7 +631,10 @@ bool ModelCluster::load_snapshot( int slot, const SeqSnapshot& snap, bool kv_onl
 	}
 	// The drafter takes the slot over: the restored tap rows are its context for the prefix, and the tail prefill publishes the rest
 	if ( runner_ && !kv_only ) {
-		if ( snap.with_taps || !runner_->needs_taps() ) runner_->claim( slot );
+		if ( snap.with_taps || !runner_->needs_taps() ) {
+			runner_->claim( slot );
+			if ( snap.with_taps ) runner_->on_restore( slot, snap.tokens );
+		}
 		else runner_->release( slot ); // no taps for this prefix: the slot decodes without the drafter
 	}
 	return true;

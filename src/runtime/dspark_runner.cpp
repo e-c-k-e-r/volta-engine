@@ -46,6 +46,15 @@ void DSparkRunner::on_prefill_chunk( int slot, const int* tokens, int rows, int 
 	}
 }
 
+// The taps of the last WINDOW positions before `tokens` are back in the ring: the window KV is derived from them at the first round
+void DSparkRunner::on_restore( int slot, int tokens ) {
+	if ( !owns( slot ) ) return;
+	SlotState& S = st_[slot];
+	S.fresh = false;
+	S.valid_from = MAX( 0, tokens - 128 );
+	S.ingested = S.valid_from;
+}
+
 void DSparkRunner::step_stats( int* attempts, int* hits ) const {
 	for ( int i = 0; i < 8; ++i ) {
 		attempts[i] = att_[i];

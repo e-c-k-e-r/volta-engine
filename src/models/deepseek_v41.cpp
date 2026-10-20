@@ -1611,14 +1611,31 @@ void DeepseekV41Pipeline::dspark_chain( const backend::half_t* const* peer_shard
 // Snapshot layout: [window: layers x WINDOW x HD halves, the rows of positions tokens - WINDOW .. tokens - 1] then per kv source [compressed
 // entries [from / r, tokens / r) x HD halves | index keys of the same entries x IDX_DIM halves], then the Engram ids of [from, tokens) (int32)
 size_t DeepseekV41Pipeline::seq_state_bytes( int from, int tokens, bool with_taps ) const {
-	(void) with_taps;
 	if ( from < 0 || tokens <= from || tokens > config_.max_seq || from % 2 || tokens % 2 || !weights_loaded_ ) return 0;
 	size_t b = static_cast<size_t>( config_.num_layers ) * DSV4::WINDOW * DSV4::HD * sizeof( backend::half_t );
 	for ( int s : config_.kv_sources ) {
 		const int r = config_.compress_ratios[s];
 		b += static_cast<size_t>( tokens / r - from / r ) * ( DSV4::HD + DSV4::IDX_DIM ) * sizeof( backend::half_t );
 	}
-	return b + static_cast<size_t>( tokens - from ) * sizeof( int32_t ) + 256;
+	b += static_cast<size_t>( tokens - from ) * sizeof( int32_t ) + 256;
+	// the drafter's taps of the last WINDOW positions, in position order (the drafter re-derives its window KV from them)
+	if ( with_taps && ds_.loaded ) b += static_cast<size_t>( DSV4::WINDOW ) * ds_.taps * config_.hidden_size * sizeof( backend::half_t );
+	return b;
+}
+
+// Moves the tap rows of positions [tokens - WINDOW, tokens) of a slot between the tap ring and host memory
+void DeepseekV41Pipeline::copy_taps( int slot_id, int tokens, char* host, bool to_host, backend::stream_t stream ) {
+	const size_t row = static_cast<size_t>( ds_.taps ) * config_.hidden_size * sizeof( backend::half_t );
+	const int first = std::max( 0, tokens - DSV4::WINDOW );
+	char* ring = reinterpret_cast<char*>( ds_.tap_ring ) + static_cast<size_t>( slot_id ) * ds_.tap_stride * sizeof( backend::half_t );
+	for ( int p = first; p < tokens; ) {
+		const int r = p % DSV4::WINDOW, n = std::min( tokens - p, DSV4::WINDOW - r );
+		char* dev = ring + static_cast<size_t>( r ) * row;
+		char* at = host + static_cast<size_t>( p - first ) * row;
+		if ( to_host ) backend::memcpy_async( at, dev, static_cast<size_t>( n ) * row, backend::Copy::D2H, stream );
+		else backend::memcpy_async( dev, at, static_cast<size_t>( n ) * row, backend::Copy::H2D, stream );
+		p += n;
+	}
 }
 
 void DeepseekV41Pipeline::copy_seq_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream ) {
@@ -1661,6 +1678,7 @@ bool DeepseekV41Pipeline::save_seq_state( int slot_id, int from, int tokens, boo
 		}
 	}
 	copy_seq_rows( slot_id, from, tokens, dst + static_cast<size_t>( config_.num_layers ) * DSV4::WINDOW * row, true, stream );
+	if ( with_taps && ds_.loaded ) copy_taps( slot_id, tokens, dst + seq_state_bytes( from, tokens, false ), true, stream );
 	backend::stream_sync( stream );
 	return true;
 }
@@ -1683,6 +1701,7 @@ bool DeepseekV41Pipeline::load_seq_state( int slot_id, int from, int tokens, boo
 		}
 	}
 	copy_seq_rows( slot_id, from, tokens, src + static_cast<size_t>( config_.num_layers ) * DSV4::WINDOW * row, false, stream );
+	if ( !kv_only && with_taps && ds_.loaded ) copy_taps( slot_id, tokens, src + seq_state_bytes( from, tokens, false ), false, stream );
 	backend::stream_sync( stream );
 	return true;
 }

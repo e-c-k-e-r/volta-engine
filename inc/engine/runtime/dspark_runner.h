@@ -23,7 +23,10 @@ public:
 	void offer_draft( int slot, const int* tokens, int n ) override;
 	bool takes_offered_draft() const override { return true; }
 	void on_prefill_chunk( int slot, const int* tokens, int rows, int pos0 ) override;
-	bool needs_taps() const override { return false; }
+	// Snapshots carry the last WINDOW positions' taps: a restore re-derives the drafter's window KV from them
+	bool needs_taps() const override { return true; }
+	bool cheap_snapshot_taps() const override { return true; }
+	void on_restore( int slot, int tokens ) override;
 	void step_stats( int* attempts, int* hits ) const override;
 	void profile_dump() override;
 

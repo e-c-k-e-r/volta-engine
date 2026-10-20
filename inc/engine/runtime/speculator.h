@@ -54,6 +54,10 @@ public:
 	virtual void on_dense_row( int slot, int token, int pos, int row ) { (void) slot; (void) token; (void) pos; (void) row; }
 	// Whether the target must publish drafter taps (and snapshots carry them)
 	virtual bool needs_taps() const { return true; }
+	// The tap rows of a snapshot are small, so every prefix checkpoint may carry them (a resume from a periodic checkpoint keeps speculating)
+	virtual bool cheap_snapshot_taps() const { return false; }
+	// The slot's context was restored from a snapshot of `tokens` positions that carried taps (after claim, before the rest of the prompt prefills)
+	virtual void on_restore( int slot, int tokens ) { (void) slot; (void) tokens; }
 
 	// Per-step draft accuracy where the step was reached
 	virtual void step_stats( int* attempts, int* hits ) const = 0;
