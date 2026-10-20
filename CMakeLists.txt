@@ -137,6 +137,7 @@ set(ENGINE_HOST_SOURCES
 	src/runtime/dflash2_runner.cpp
 	src/runtime/mtp_runner.cpp
 	src/runtime/suffix_runner.cpp
+	src/runtime/dspark_runner.cpp
 	src/runtime/prefix_cache.cpp
 	src/runtime/cpu_experts.cpp
 	src/runtime/cpu_expert_service.cpp

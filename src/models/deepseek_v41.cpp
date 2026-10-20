@@ -293,7 +293,9 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 		backend::memcpy_sync( rope_comp_, comp.data(), comp.size() * sizeof( float ), backend::Copy::H2D );
 	}
 	// caches
-	win_slot_stride_ = static_cast<size_t>( L ) * DSV4::RING * DSV4::HD;
+	ds_.enabled = runtime::options().speculator == "dspark";
+	win_layers_ = L + ( ds_.enabled ? ds_.blocks : 0 );   // the drafter's blocks keep the main-KV rows of the window in the layers after the trunk's
+	win_slot_stride_ = static_cast<size_t>( win_layers_ ) * DSV4::RING * DSV4::HD;
 	win_ring_ = dev_alloc<backend::half_t>( arena, S * win_slot_stride_ );
 	cring_slot_stride_ = static_cast<size_t>( DSV4::RING ) * DSV4::HD;
 	int max_cap = 0;
@@ -358,6 +360,18 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 	e_rows_[0] = dev_tensor( arena, pod::DType::FP16, R, ecols );
 	e_rows_[1] = dev_tensor( arena, pod::DType::FP16, R, ecols );
 	e_kv_ = dev_tensor( arena, pod::DType::FP16, R, 5 * H );
+	if ( ds_.enabled ) {
+		ds_.tap_stride = static_cast<size_t>( DSV4::WINDOW ) * ds_.taps * H;
+		ds_.tap_ring = dev_alloc<backend::half_t>( arena, S * ds_.tap_stride );
+		ds_.blk_ring = dev_alloc<backend::half_t>( arena, static_cast<size_t>( DSV4::RING ) * DSV4::HD );
+		ds_.d_ing_rows = dev_alloc<pod::BatchRows>( arena, 1 );
+		ds_.d_blk_rows = dev_alloc<pod::BatchRows>( arena, 1 );
+		ds_.taps_in = dev_tensor( arena, pod::DType::FP16, DSV4::WINDOW, ds_.taps * H );
+		ds_.mx_pre = dev_tensor( arena, pod::DType::FP16, DSV4::WINDOW, H );
+		ds_.mx = dev_tensor( arena, pod::DType::FP16, DSV4::WINDOW, H );
+		ds_.dkv = dev_tensor( arena, pod::DType::FP16, DSV4::WINDOW, DSV4::HD );
+		ds_.dkvn = dev_tensor( arena, pod::DType::FP16, DSV4::WINDOW, DSV4::HD );
+	}
 	expert_tp_ = runtime::options().expert_shard && config_.tp_size > 1;
 	{
 		const int spans = config_.intermediate_size / 128, tp = config_.tp_size;
@@ -694,7 +708,9 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 	const size_t meta_bytes = static_cast<size_t>( L ) * ( expert_tp_ ? E : per_rank ) * ( expert_tp_ ? 3 * H + 3 * ( config_.intermediate_size / tp + 128 ) : 3 * ( 2 * H + 2 * config_.intermediate_size ) ) * 2 + ( 64ull << 20 );   // suh / svh and tables
 	const size_t free_now = arena.total_bytes - arena.offset_bytes;
 	if ( rank_ == 0 ) vision_reserve_ = DeepseekV41VisionTower::arena_bytes( model_dir, runtime::options().max_image_tokens );
-	const size_t budget = free_now > margin + meta_bytes + vision_reserve_ ? free_now - margin - meta_bytes - vision_reserve_ : 0;
+	// the drafter's experts are split over the ranks like the trunk's; its attention and the rest are replicated
+	const size_t drafter_reserve = ds_.enabled && reserve_after_ > 0 ? reserve_after_ / static_cast<size_t>( tp ) + ( 320ull << 20 ) : 0;
+	const size_t budget = free_now > margin + meta_bytes + vision_reserve_ + drafter_reserve ? free_now - margin - meta_bytes - vision_reserve_ - drafter_reserve : 0;
 	const double frac = std::min( 1.0, static_cast<double>( budget ) / std::max<size_t>( code_bytes, 1 ) );
 	if ( frac < 1.0 ) {
 		const size_t host_bytes = static_cast<size_t>( ( 1.0 - frac ) * code_bytes * 1.02 ) + ( 256ull << 20 );
@@ -1025,6 +1041,7 @@ void DeepseekV41Pipeline::forward( const pod::BatchRows& rows, backend::stream_t
 	last_rows_ = lm_mode_ == pod::BatchRows::LOGITS_NONE ? 0 : lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m;
 	ENGINE_ASSERT( last_rows_ <= logit_rows_, "DeepseekV41Pipeline::forward: more logit rows than the buffer holds" );
 	set_rows( m );
+	tap_floor_ = m > pod::MAX_BATCH ? std::max( 0, rows.pos[m - 1] - DSV4::WINDOW + 1 ) : 0;   // decode blocks never wrap the tap ring (and run from a graph)
 	sync_image_flags( stream );
 	engram_prepare( rows, stream );
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
@@ -1076,6 +1093,7 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 	};
 	auto unbind = [&]( int c ) { win_[c].pre_cur = pre_cur_; };
 	const pod::BatchRows& last = chunks[n - 1];
+	tap_floor_ = std::max( 0, last.pos[last.count - 1] - DSV4::WINDOW + 1 );
 	lm_mode_ = last.logits_mode;
 	last_rows_ = lm_mode_ == pod::BatchRows::LOGITS_NONE ? 0 : lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : last.count;
 	ENGINE_ASSERT( last_rows_ <= logit_rows_, "DeepseekV41Pipeline::forward_window: more logit rows than the buffer holds" );
@@ -1102,6 +1120,8 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 				engine::modules::Linear::forward( e_rows_[lw.engram], lw.e_wkv, e_kv_, stream );
 				DSV4::engram_gate( streams_.ptr<float>(), e_kv_.ptr<const backend::half_t>(), lw.e_w.ptr<const float>(), H, config_.norm_eps, m, stream );
 			}
+			if ( ds_.loaded && l >= ds_.tap0 && l < ds_.tap0 + ds_.taps )
+				DSV4::tap_store( streams_.ptr<const float>(), ds_.tap_ring, l - ds_.tap0, ds_.taps, H, kTapScale, tap_floor_, m, d_rows_, ds_.tap_stride, stream );
 			attention( l, lw, m, stream );
 			ffn_front( lw, m, stream );
 			unbind( c );
@@ -1186,6 +1206,8 @@ void DeepseekV41Pipeline::forward_body( int m, backend::stream_t stream ) {
 			engine::modules::Linear::forward( e_rows_[lw.engram], lw.e_wkv, e_kv_, stream );
 			DSV4::engram_gate( streams_.ptr<float>(), e_kv_.ptr<const backend::half_t>(), lw.e_w.ptr<const float>(), H, config_.norm_eps, m, stream );
 		}
+		if ( ds_.loaded && l >= ds_.tap0 && l < ds_.tap0 + ds_.taps )
+			DSV4::tap_store( streams_.ptr<const float>(), ds_.tap_ring, l - ds_.tap0, ds_.taps, H, kTapScale, tap_floor_, m, d_rows_, ds_.tap_stride, stream );
 		attention( l, lw, m, stream );
 		trace( 100 + l, m, stream );
 		ffn( l, lw, m, stream );
@@ -1279,7 +1301,7 @@ void DeepseekV41Pipeline::ffn( int layer, DeepseekV41LayerWeights& lw, int m, ba
 	engine::modules::HyperConnection::update( streams_, moe_out_, mhc_post_, mhc_comb_, config_.hidden_size, stream, m );
 }
 
-void DeepseekV41Pipeline::ffn_front( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
+void DeepseekV41Pipeline::ffn_front( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream, int experts, int top_k ) {
 	const int H = config_.hidden_size;
 	float* pre_new = pre_[pre_cur_ ^ 1];
 	pod::TensorView pre_view = pod::make_tensor_2d( pre_new, pod::DType::FP32, 1, 4 * m );
@@ -1289,7 +1311,7 @@ void DeepseekV41Pipeline::ffn_front( DeepseekV41LayerWeights& lw, int m, backend
 		kOutScale, H, config_.norm_eps, m, stream );
 	pre_cur_ ^= 1;
 	DSV4::route( norm_x_.ptr<const backend::half_t>(), lw.router_w_t.ptr<const backend::half_t>(), lw.router_bias.ptr<const float>(), lw.router_bias_vl.data ? lw.router_bias_vl.ptr<const float>() : nullptr, d_img_flag_, lw.perm, d_topk_idx_, d_topk_w_, route_scratch_,
-		H, config_.num_experts, config_.top_k, config_.route_scale, m, stream );
+		H, experts > 0 ? experts : config_.num_experts, top_k > 0 ? top_k : config_.top_k, config_.route_scale, m, stream );
 }
 
 void DeepseekV41Pipeline::ffn_experts( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
@@ -1316,6 +1338,275 @@ void DeepseekV41Pipeline::ffn_back( DeepseekV41LayerWeights& lw, int m, backend:
 	}
 	if ( ring_ ) ring_->all_reduce( moe_out_, stream );
 }
+
+// ---- DSpark drafter ---------------------------------------------------------------------------------------------------------------------
+
+bool DeepseekV41Pipeline::load_dspark( const char* dir, backend::stream_t stream ) {
+	ENGINE_ASSERT( weights_loaded_ && ds_.enabled, "DeepseekV41Pipeline::load_dspark: the trunk is not loaded or speculator is not dspark" );
+	backend::set_device( rank_ );
+	ds_.repo = std::make_unique<engine::loader::SafeTensorsRepo>();
+	if ( !ds_.repo->open( dir ) ) { LOG_ERROR( "[deepseek_v41] cannot open the drafter directory %s\n", dir ); return false; }
+	auto& repo = *ds_.repo;
+	auto& arena = *arena_;
+	const int H = config_.hidden_size, tp = config_.tp_size, E = ds_.experts;
+	const size_t bytes0 = arena.offset_bytes;
+	int missing = 0;
+	auto need = [&]( bool ok, const std::string& what ) { if ( !ok ) { LOG_ERROR( "[RANK %d] DSPARK MISSING: %s\n", rank_, what.c_str() ); ++missing; } };
+	auto bits_of = [&]( const std::string& base ) { const auto* m = repo.find( ( base + ".trellis" ).c_str() ); return m != nullptr && m->ndim == 3 ? m->shape[2] / 16 : 0; };
+	ds_.layers.resize( ds_.blocks );
+	for ( int l = 0; l < ds_.blocks; ++l ) {
+		auto& lw = ds_.layers[l];
+		const std::string p = "mtp." + std::to_string( l ) + ".";
+		lw.attn_norm = load_vec( repo, p + "attn_norm.weight", arena, pod::DType::FP16 );
+		lw.ffn_norm = load_vec( repo, p + "ffn_norm.weight", arena, pod::DType::FP16 );
+		lw.q_norm = load_vec( repo, p + "attn.q_norm.weight", arena, pod::DType::FP16 );
+		lw.kv_norm = load_vec( repo, p + "attn.kv_norm.weight", arena, pod::DType::FP16 );
+		lw.sink = load_vec( repo, p + "attn.attn_sink", arena, pod::DType::FP32, rank_ * lh_, lh_ );
+		need( lw.attn_norm.data && lw.ffn_norm.data && lw.q_norm.data && lw.kv_norm.data && lw.sink.data, p + "norms / sink" );
+		lw.wq_a = repo.load_linear( ( p + "attn.wq_a" ).c_str(), arena, bits_of( p + "attn.wq_a" ), stream );
+		lw.wq_b = repo.load_linear_slice( ( p + "attn.wq_b" ).c_str(), arena, bits_of( p + "attn.wq_b" ), 1, rank_, tp, stream );
+		lw.wkv = repo.load_linear( ( p + "attn.wkv" ).c_str(), arena, bits_of( p + "attn.wkv" ), stream );
+		lw.wo_b = repo.load_linear_slice( ( p + "attn.wo_b" ).c_str(), arena, bits_of( p + "attn.wo_b" ), 0, rank_, tp, stream );
+		need( lw.wq_a.is_valid() && lw.wq_b.is_valid() && lw.wkv.is_valid() && lw.wo_b.is_valid(), p + "attention linears" );
+		if ( lw.wo_b.is_valid() ) scale_device_half( lw.wo_b.w2.ptr<backend::half_t>(), static_cast<size_t>( H ), 1.0f / kOutScale, stream );
+		for ( int g = 0; g < gl_; ++g ) {
+			const std::string b = p + "attn.wo_a.slice." + std::to_string( rank_ * gl_ + g );
+			lw.wo_a.push_back( repo.load_linear( b.c_str(), arena, bits_of( b ), stream ) );
+			need( lw.wo_a.back().is_valid(), b );
+		}
+		{
+			int shard = -1;
+			const auto* meta = repo.find( ( p + "ffn.gate.weight" ).c_str(), &shard );
+			need( meta != nullptr && meta->shape[0] == E && meta->shape[1] == H, p + "ffn.gate.weight" );
+			if ( meta != nullptr ) {
+				const uint16_t* src = static_cast<const uint16_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), meta ) );
+				std::vector<backend::half_t> t( static_cast<size_t>( H ) * E );
+				for ( int e = 0; e < E; ++e )
+					for ( int d = 0; d < H; ++d ) t[static_cast<size_t>( d ) * E + e] = backend::from_float_half( bf16_to_float( src[static_cast<size_t>( e ) * H + d] ) );
+				lw.router_w_t = dev_tensor( arena, pod::DType::FP16, H, E );
+				backend::memcpy_sync( lw.router_w_t.data, t.data(), t.size() * sizeof( backend::half_t ), backend::Copy::H2D );
+			}
+			lw.router_bias = load_vec( repo, p + "ffn.gate.bias", arena, pod::DType::FP32 );
+			need( lw.router_bias.data != nullptr, p + "ffn.gate.bias" );
+		}
+		if ( rank_ == 0 ) {
+			lw.sh_gate = repo.load_linear( ( p + "ffn.shared_experts.w1" ).c_str(), arena, bits_of( p + "ffn.shared_experts.w1" ), stream );
+			lw.sh_up = repo.load_linear( ( p + "ffn.shared_experts.w3" ).c_str(), arena, bits_of( p + "ffn.shared_experts.w3" ), stream );
+			lw.sh_down = repo.load_linear( ( p + "ffn.shared_experts.w2" ).c_str(), arena, bits_of( p + "ffn.shared_experts.w2" ), stream );
+			need( lw.sh_gate.is_valid() && lw.sh_up.is_valid() && lw.sh_down.is_valid(), p + "shared expert" );
+			if ( lw.sh_down.is_valid() ) scale_device_half( lw.sh_down.w2.ptr<backend::half_t>(), static_cast<size_t>( H ), 1.0f / kOutScale, stream );
+		}
+		lw.hc_attn_fn = load_vec( repo, p + "hc_attn_fn", arena, pod::DType::FP32 );
+		lw.hc_attn_base = load_vec( repo, p + "hc_attn_base", arena, pod::DType::FP32 );
+		lw.hc_attn_scale = load_vec( repo, p + "hc_attn_scale", arena, pod::DType::FP32 );
+		lw.hc_ffn_fn = load_vec( repo, p + "hc_ffn_fn", arena, pod::DType::FP32 );
+		lw.hc_ffn_base = load_vec( repo, p + "hc_ffn_base", arena, pod::DType::FP32 );
+		lw.hc_ffn_scale = load_vec( repo, p + "hc_ffn_scale", arena, pod::DType::FP32 );
+		need( lw.hc_attn_fn.data && lw.hc_attn_base.data && lw.hc_attn_scale.data && lw.hc_ffn_fn.data && lw.hc_ffn_base.data && lw.hc_ffn_scale.data, p + "hc" );
+		// experts: whole experts, in order, E / tp to a rank (all resident); the router's ids are the engine ids
+		{
+			ENGINE_ASSERT( E % tp == 0, "DeepseekV41Pipeline::load_dspark: experts must split evenly over the ranks" );
+			std::vector<int> perm( E );
+			std::iota( perm.begin(), perm.end(), 0 );
+			lw.perm = dev_alloc<int>( arena, E, false );
+			backend::memcpy_sync( lw.perm, perm.data(), E * sizeof( int ), backend::Copy::H2D );
+			const int per = E / tp, e0 = rank_ * per;
+			const int bits = bits_of( p + "ffn.experts." + std::to_string( e0 ) + ".w1" );
+			DeepseekV41ExpertGroup g;
+			g.bits = bits;
+			g.first = e0;
+			g.count = per;
+			g.mw = std::make_unique<pod::MoELayerWeights>();
+			auto& mw = *g.mw;
+			mw.type = pod::QuantType::TRELLIS;
+			mw.num_local_experts = per;
+			mw.top_k = ds_.top_k;
+			for ( int i = 0; i < per; ++i ) {
+				const std::string b = p + "ffn.experts." + std::to_string( e0 + i );
+				ENGINE_ASSERT( bits_of( b + ".w1" ) == bits && bits_of( b + ".w2" ) == bits && bits_of( b + ".w3" ) == bits, "DeepseekV41Pipeline::load_dspark: the drafter's experts differ in bit width" );
+				mw.gate[i] = repo.load_linear( ( b + ".w1" ).c_str(), arena, bits, stream );
+				mw.up[i] = repo.load_linear( ( b + ".w3" ).c_str(), arena, bits, stream );
+				mw.down[i] = repo.load_linear( ( b + ".w2" ).c_str(), arena, bits, stream );
+				need( mw.gate[i].is_valid() && mw.up[i].is_valid() && mw.down[i].is_valid(), b );
+				scale_device_half( mw.down[i].w2.ptr<backend::half_t>(), static_cast<size_t>( H ), 1.0f / kOutScale, stream );
+			}
+			engine::modules::MoE::init_device_ptrs( mw, arena, stream );
+			mw.heat = dev_alloc<uint32_t>( arena, per );
+			g.resident.assign( per, 1 );
+			g.score.assign( per, 0 );
+			lw.groups.push_back( std::move( g ) );
+		}
+	}
+	ds_.main_proj = repo.load_linear( "mtp.0.main_proj", arena, bits_of( "mtp.0.main_proj" ), stream );
+	ds_.main_norm = load_vec( repo, "mtp.0.main_norm.weight", arena, pod::DType::FP16 );
+	ds_.final_norm = load_vec( repo, "mtp.2.norm.weight", arena, pod::DType::FP16 );
+	need( ds_.main_proj.is_valid() && ds_.main_norm.data && ds_.final_norm.data, "main_proj / main_norm / norm" );
+	if ( rank_ == 0 ) {
+		// the markov bigram head and the confidence head run on rank 0
+		int shard = -1;
+		const auto* me = repo.find( "mtp.2.markov_head.embed.weight", &shard );
+		need( me != nullptr && me->dtype == pod::DType::BF16 && me->shape[0] == config_.vocab_size && me->shape[1] == ds_.markov_rank, "mtp.2.markov_head.embed.weight (BF16)" );
+		if ( me != nullptr ) {
+			ds_.markov_embed = dev_tensor( arena, pod::DType::BF16, config_.vocab_size, ds_.markov_rank );
+			backend::memcpy_sync( ds_.markov_embed.data, engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), me ), me->size_bytes, backend::Copy::H2D );
+		}
+		ds_.markov_head = load_dense( repo, "mtp.2.markov_head.head", arena, stream );
+		need( ds_.markov_head.is_valid(), "mtp.2.markov_head.head" );
+		const auto* mc = repo.find( "mtp.2.confidence_head.proj.weight", &shard );
+		need( mc != nullptr && static_cast<int>( mc->size_bytes / ( mc->dtype == pod::DType::FP32 ? 4 : 2 ) ) == H + ds_.markov_rank, "mtp.2.confidence_head.proj.weight" );
+		if ( mc != nullptr ) {
+			ds_.conf_w.resize( H + ds_.markov_rank );
+			const void* src = engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), mc );
+			for ( size_t i = 0; i < ds_.conf_w.size(); ++i )
+				ds_.conf_w[i] = mc->dtype == pod::DType::FP32 ? static_cast<const float*>( src )[i] : bf16_to_float( static_cast<const uint16_t*>( src )[i] );
+		}
+		ds_.d_chain = dev_alloc<int>( arena, 8 );
+		ds_.memb = dev_tensor( arena, pod::DType::FP16, 8, ds_.markov_rank );
+		ds_.bias = dev_tensor( arena, pod::DType::FP16, 1, config_.vocab_size );
+	}
+	backend::stream_sync( stream );
+	if ( rank_ == 0 || missing > 0 ) LOG_INFO( "[RANK %d] DSpark drafter: %.2f GiB (experts at %d bits), missing %d\n", rank_, ( arena.offset_bytes - bytes0 ) / 1073741824.0, ds_.layers[0].groups.empty() ? 0 : ds_.layers[0].groups[0].bits, missing );
+	ds_.loaded = missing == 0;
+	return ds_.loaded;
+}
+
+// The embedding of rows that do not belong to a forward (the drafter's block): the same gather and reduction as embed_tokens, without its bookkeeping
+void DeepseekV41Pipeline::embed_raw( const int* token_ids, int count, backend::stream_t stream ) {
+	embed_rows_.shape[0] = count;
+	if ( rank_ == 0 ) {
+		backend::memcpy_async( d_token_ids_, token_ids, count * sizeof( int ), backend::Copy::H2D, stream );
+		engine::modules::Embedding::forward( embed_table_, d_token_ids_, count, embed_rows_, stream );
+	}
+	else {
+		backend::memset_async( embed_rows_.data, 0, embed_rows_.size_bytes(), stream );
+	}
+	if ( ring_ ) ring_->all_reduce( embed_rows_, stream );
+}
+
+// Main-KV rows of positions [from, to) of a slot for the drafter's blocks: main_x = main_norm(main_proj(taps)), then each block's wkv, kv_norm, rope
+// and the E4M3 grid into its layer of the window ring. Only the last WINDOW positions can matter
+void DeepseekV41Pipeline::dspark_ingest( int slot, int from, int to, backend::stream_t stream ) {
+	using engine::modules::Linear;
+	using engine::modules::RMSNorm;
+	from = std::max( std::max( from, 0 ), to - DSV4::WINDOW );
+	const int n = to - from;
+	if ( n <= 0 ) return;
+	const int H = config_.hidden_size;
+	pod::BatchRows br = pod::BatchRows::causal( n, from, slot );
+	backend::memcpy_async( ds_.d_ing_rows, &br, br.upload_bytes(), backend::Copy::H2D, stream );
+	DSV4::tap_gather( ds_.tap_ring, ds_.taps_in.ptr<backend::half_t>(), slot, from, n, ds_.taps, H, ds_.tap_stride, stream );
+	for ( pod::TensorView* t : { &ds_.taps_in, &ds_.mx_pre, &ds_.mx, &ds_.dkv, &ds_.dkvn } ) t->shape[0] = n;
+	Linear::forward( ds_.taps_in, ds_.main_proj, ds_.mx_pre, stream );
+	RMSNorm::forward( ds_.mx_pre, ds_.main_norm, ds_.mx, config_.norm_eps, 0.0f, stream );
+	for ( int l = 0; l < ds_.blocks; ++l ) {
+		auto& lw = ds_.layers[l];
+		Linear::forward( ds_.mx, lw.wkv, ds_.dkv, stream );
+		RMSNorm::forward( ds_.dkv, lw.kv_norm, ds_.dkvn, config_.norm_eps, 0.0f, stream );
+		DSV4::window_store( ds_.dkvn.ptr<const backend::half_t>(), win_ring_, rope_plain_, config_.num_layers + l, n, ds_.d_ing_rows, win_slot_stride_, stream );
+	}
+}
+
+void DeepseekV41Pipeline::dspark_forward( int slot, int pos, int from, int win_start, int anchor, backend::stream_t stream ) {
+	using engine::modules::Linear;
+	using engine::modules::RMSNorm;
+	ENGINE_ASSERT( ds_.loaded && slot >= 0 && slot < config_.max_slots && pos >= 1 && pos + ds_.block < config_.max_seq, "DeepseekV41Pipeline::dspark_forward: out of range" );
+	backend::set_device( rank_ );
+	const int H = config_.hidden_size, B = ds_.block, t = pos - 1, L = config_.num_layers;
+	const float eps = config_.norm_eps;
+	dspark_ingest( slot, from, pos, stream );
+
+	// the block: [anchor, noise ...] at positions pos .. pos + B - 1 (the scratch slot 0 of the block's own keys)
+	pod::BatchRows br = pod::BatchRows::causal( B, pos, 0 );
+	backend::memcpy_async( ds_.d_blk_rows, &br, br.upload_bytes(), backend::Copy::H2D, stream );
+	int tokens[8];
+	tokens[0] = anchor;
+	for ( int i = 1; i < B; ++i ) tokens[i] = ds_.noise;
+	set_rows( B );
+	embed_raw( tokens, B, stream );
+	engine::modules::HyperConnection::init_streams( embed_rows_, streams_, H, stream, B );
+	DSV4::hc_identity_pre( pre_[0], B, stream );
+	pre_cur_ = 0;
+	const int w0 = std::max( std::max( 0, win_start ), t - DSV4::WINDOW + 1 );
+	const int G = DSV4::GROUP_HEADS * DSV4::HD, O = config_.o_lora_rank;
+	for ( int l = 0; l < ds_.blocks; ++l ) {
+		auto& lw = ds_.layers[l];
+		// attention sublayer: the mHC mixes, the block's queries and keys, the window plus the block, the grouped output projection
+		float* pre_new = pre_[pre_cur_ ^ 1];
+		pod::TensorView pre_view = pod::make_tensor_2d( pre_new, pod::DType::FP32, 1, 4 * B );
+		engine::modules::HyperConnection::collapse( streams_, lw.hc_attn_fn, lw.hc_attn_base, lw.hc_attn_scale, collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_,
+			pre_view, H, config_.hc_sinkhorn_iters, config_.hc_eps, stream, B );
+		DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], lw.attn_norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), mhc_post_.ptr<float>(),
+			kOutScale, H, eps, B, stream );
+		pre_cur_ ^= 1;
+		Linear::forward( norm_x_, lw.wq_a, qr_, stream );
+		RMSNorm::forward( qr_, lw.q_norm, qr_n_, eps, 0.0f, stream );
+		Linear::forward( qr_n_, lw.wq_b, q_, stream );
+		Linear::forward( norm_x_, lw.wkv, kv_, stream );
+		RMSNorm::forward( kv_, lw.kv_norm, kv_n_, eps, 0.0f, stream );
+		DSV4::window_store( kv_n_.ptr<const backend::half_t>(), ds_.blk_ring, rope_plain_, 0, B, ds_.d_blk_rows, 0, stream );
+		DSV4::dspark_attend( q_.ptr<const backend::half_t>(), win_ring_, ds_.blk_ring, lw.sink.ptr<const float>(), rope_plain_, o_g_.ptr<backend::half_t>(), lh_, L + l, B,
+			ds_.d_blk_rows, slot, w0, t, win_slot_stride_, stream );
+		for ( int g = 0; g < gl_; ++g ) {
+			pod::TensorView in = view( o_g_, static_cast<size_t>( g ) * B * G, B, G );
+			pod::TensorView out = view( woa_out_, static_cast<size_t>( g ) * B * O, B, O );
+			Linear::forward( in, lw.wo_a[g], out, stream );
+		}
+		DSV4::concat_groups( woa_out_.ptr<const backend::half_t>(), woa_cat_.ptr<backend::half_t>(), gl_, O, B, stream );
+		Linear::forward( woa_cat_, lw.wo_b, attn_out_, stream );
+		if ( ring_ ) ring_->all_reduce( attn_out_, stream );
+		engine::modules::HyperConnection::update( streams_, attn_out_, mhc_post_, mhc_comb_, H, stream, B );
+		// the MoE sublayer: 128 experts, 3 per token
+		ffn_front( lw, B, stream, ds_.experts, ds_.top_k );
+		ffn_experts( lw, B, stream );
+		ffn_back( lw, B, stream );
+		engine::modules::HyperConnection::update( streams_, moe_out_, mhc_post_, mhc_comb_, H, stream, B );
+	}
+	// the last pre-mix collapses the streams, the drafter's own final norm, the trunk's head over this rank's vocabulary shard
+	DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], ds_.final_norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), nullptr, 1.0f, H, eps, B, stream );
+	logits_.shape[0] = B;
+	Linear::forward( norm_x_, lm_head_, logits_, stream );
+}
+
+void DeepseekV41Pipeline::dspark_chain( const backend::half_t* const* peer_shards, int peer_cols, int anchor, int* drafts, float* conf, backend::stream_t stream ) {
+	using engine::modules::Linear;
+	ENGINE_ASSERT( ds_.loaded && rank_ == 0, "DeepseekV41Pipeline::dspark_chain: rank 0 only" );
+	backend::set_device( rank_ );
+	const int B = ds_.block, V = config_.vocab_size, H = config_.hidden_size, R = ds_.markov_rank;
+	last_rows_ = std::max( last_rows_, B );   // gather_logits reads up to the rows the last forward left
+	pod::TensorView full = gather_logits( B, peer_shards, peer_cols, stream );
+	backend::memcpy_async( ds_.d_chain, &anchor, sizeof( int ), backend::Copy::H2D, stream );
+	for ( int i = 0; i < B; ++i ) {
+		// logits[i] += markov bias of the previous token; its argmax is the next token
+		pod::TensorView memb_i = view( ds_.memb, static_cast<size_t>( i ) * R, 1, R );
+		engine::modules::Embedding::forward( ds_.markov_embed, ds_.d_chain + i, 1, memb_i, stream );
+		Linear::forward( memb_i, ds_.markov_head, ds_.bias, stream );
+		pod::TensorView row = view( full, static_cast<size_t>( i ) * V, 1, V );
+		engine::modules::MoERouter::accumulate( row.ptr<backend::half_t>(), ds_.bias.ptr<const backend::half_t>(), backend::from_float_half( 1.0f ), V, stream );
+		engine::modules::Elementwise::batched_argmax_range( row, d_argmax_idx_, nullptr, V, 1, 0, stream );
+		backend::memcpy_async( ds_.d_chain + i + 1, d_argmax_idx_, sizeof( int ), backend::Copy::D2D, stream );
+	}
+	int chain[8] = {};
+	std::vector<backend::half_t> memb( static_cast<size_t>( B ) * R );
+	std::vector<float> st( static_cast<size_t>( B ) * 4 * H ), pre( static_cast<size_t>( B ) * 4 );
+	backend::memcpy_async( chain, ds_.d_chain, ( B + 1 ) * sizeof( int ), backend::Copy::D2H, stream );
+	backend::memcpy_async( memb.data(), ds_.memb.data, memb.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+	backend::memcpy_async( st.data(), streams_.data, st.size() * sizeof( float ), backend::Copy::D2H, stream );
+	backend::memcpy_async( pre.data(), pre_[pre_cur_], pre.size() * sizeof( float ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
+	for ( int i = 0; i < B; ++i ) {
+		drafts[i] = chain[i + 1];
+		// confidence: proj(cat(hc-collapsed hidden before the final norm, markov embedding of the token that fed this position))
+		double acc = 0.0;
+		for ( int d = 0; d < H; ++d ) {
+			float x = 0.0f;
+			for ( int k = 0; k < 4; ++k ) x += pre[static_cast<size_t>( i ) * 4 + k] * st[( static_cast<size_t>( i ) * 4 + k ) * H + d];
+			acc += static_cast<double>( ds_.conf_w[d] ) * x;
+		}
+		for ( int c = 0; c < R; ++c ) acc += static_cast<double>( ds_.conf_w[H + c] ) * backend::to_float( memb[static_cast<size_t>( i ) * R + c] );
+		conf[i] = static_cast<float>( acc );
+	}
+}
+
 
 // Snapshot layout: [window: layers x WINDOW x HD halves, the rows of positions tokens - WINDOW .. tokens - 1] then per kv source [compressed
 // entries [from / r, tokens / r) x HD halves | index keys of the same entries x IDX_DIM halves], then the Engram ids of [from, tokens) (int32)

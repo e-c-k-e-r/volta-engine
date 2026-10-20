@@ -29,6 +29,21 @@ __attribute__(( weak )) void DSV4::attend( const backend::half_t* q, const backe
 	__builtin_unreachable();
 }
 
+__attribute__(( weak )) void DSV4::tap_store( const float* streams, backend::half_t* ring, int tap, int taps, int hidden, float scale, int floor_pos, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride, backend::stream_t stream ) {
+	ENGINE_UNSUPPORTED( "DSV4::tap_store" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void DSV4::tap_gather( const backend::half_t* ring, backend::half_t* out, int slot, int first, int n, int taps, int hidden, size_t ring_slot_stride, backend::stream_t stream ) {
+	ENGINE_UNSUPPORTED( "DSV4::tap_gather" );
+	__builtin_unreachable();
+}
+
+__attribute__(( weak )) void DSV4::dspark_attend( const backend::half_t* q, const backend::half_t* ring, const backend::half_t* blk, const float* sink, const float* rope, backend::half_t* o, int nh, int layer, int rows, const pod::BatchRows* d_rows, int slot, int w0, int t, size_t ring_slot_stride, backend::stream_t stream ) {
+	ENGINE_UNSUPPORTED( "DSV4::dspark_attend" );
+	__builtin_unreachable();
+}
+
 __attribute__(( weak )) void DSV4::concat_groups( const backend::half_t* in, backend::half_t* out, int groups, int n, int rows, backend::stream_t stream ) {
 	ENGINE_UNSUPPORTED( "DSV4::concat_groups" );
 	__builtin_unreachable();

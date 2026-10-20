@@ -221,6 +221,19 @@ public:
 	virtual void mtp_gather_hist( const int* src_rows, int count, backend::stream_t stream = nullptr ) { (void) src_rows; (void) count; (void) stream; ENGINE_ASSERT( false, "model has no joint MTP step" ); }
 	virtual void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) { (void) src_row; (void) rows; (void) dst_row; (void) stream; ENGINE_ASSERT( false, "model has no MTP head" ); }
 
+	// 5e. DSpark block drafter (DeepSeek-V4.1: three small blocks entered through the trunk's stream-mean taps). The model keeps the taps of
+	// the last WINDOW positions of every slot while a drafter is loaded. A draft round for the anchor token at `pos` (not yet forwarded):
+	//   dspark_forward (every rank): the window KV of positions [from, pos) is derived from their taps (the drafter attends to the last WINDOW positions
+	//     but none below win_start), then the block [anchor, noise ...] runs; the
+	//     vocabulary shards of the block's logits stay in the logits buffer
+	//   dspark_chain (rank 0, after the others finished): gathers the shards, runs the sequential bigram-biased argmax and the confidence head;
+	//     drafts[0 .. block) are the draft tokens for positions pos + 1 ..., conf[i] the confidence logit of draft i
+	virtual bool load_dspark( const char* dir, backend::stream_t stream = nullptr ) { (void) dir; (void) stream; return false; }
+	virtual bool has_dspark() const { return false; }
+	virtual int dspark_block() const { return 0; }
+	virtual void dspark_forward( int slot, int pos, int from, int win_start, int anchor, backend::stream_t stream = nullptr ) { (void) slot; (void) pos; (void) from; (void) win_start; (void) anchor; (void) stream; ENGINE_ASSERT( false, "model has no DSpark drafter" ); }
+	virtual void dspark_chain( const backend::half_t* const* peer_shards, int peer_cols, int anchor, int* drafts, float* conf, backend::stream_t stream = nullptr ) { (void) peer_shards; (void) peer_cols; (void) anchor; (void) drafts; (void) conf; (void) stream; ENGINE_ASSERT( false, "model has no DSpark drafter" ); }
+
 	// 6. Output descriptors & tapped states
 	virtual pod::TensorView& logits() = 0;
 	virtual const pod::TensorView& logits() const = 0;

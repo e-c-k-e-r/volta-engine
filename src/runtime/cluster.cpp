@@ -2,6 +2,7 @@
 #include "engine/backend/tiers.h"
 #include "engine/runtime/mtp_runner.h"
 #include "engine/runtime/suffix_runner.h"
+#include "engine/runtime/dspark_runner.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
@@ -122,6 +123,21 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		auto mtp = std::make_unique<MtpRunner>();
 		if ( !mtp->init( *this ) ) return false;
 		runner_ = std::move( mtp );
+	}
+	else if ( opt.speculator == "dspark" && cfg.speculate ) {
+		if ( cfg.draft_model_dir.empty() ) {
+			LOG_ERROR( "ModelCluster: speculator=dspark needs draft_model_dir (the directory quantize_dspark.py wrote)\n" );
+			return false;
+		}
+		bool loaded[ENGINE_NUM_GPUS] = {};
+		pool_.run( [&]( int d ) {
+			loaded[d] = models_[d]->load_dspark( cfg.draft_model_dir.c_str(), streams_[d] );
+			backend::stream_sync( streams_[d] );
+		} );
+		for ( int d = 0; d < tp_; ++d ) if ( !loaded[d] ) { LOG_ERROR( "ModelCluster: GPU %d could not load the DSpark drafter from %s\n", d, cfg.draft_model_dir.c_str() ); return false; }
+		auto dspark = std::make_unique<DSparkRunner>();
+		if ( !dspark->init( *this ) ) return false;
+		runner_ = std::move( dspark );
 	}
 	else if ( opt.speculator == "suffix" && cfg.speculate ) {
 		if ( !models_[0]->free_rollback() ) {
@@ -276,6 +292,21 @@ void ModelCluster::forward( const int* tokens, const pod::BatchRows& rows ) {
 
 void ModelCluster::forward( const int* tokens, int count, int pos, int slot ) {
 	forward( tokens, pod::BatchRows::causal( count, pos, slot ) );
+}
+
+void ModelCluster::dspark_draft( int slot, int pos, int from, int win_start, int anchor, int* drafts, float* conf ) {
+	pool_.run( [&]( int d ) {
+		models_[d]->dspark_forward( slot, pos, from, win_start, anchor, streams_[d] );
+		backend::stream_sync( streams_[d] );
+	} );
+	backend::set_device( 0 );
+	const backend::half_t* peer_shards[ENGINE_NUM_GPUS] = { nullptr };
+	int peer_cols = 0;
+	for ( int d = 0; d < tp_; ++d ) {
+		peer_shards[d] = models_[d]->shard_logits_ptr();
+		peer_cols = models_[d]->shard_logits_cols();
+	}
+	models_[0]->dspark_chain( peer_shards, peer_cols, anchor, drafts, conf, streams_[0] );
 }
 
 void ModelCluster::mtp_step( int slot, int pos0, int count, const int* tokens, int hidden_mode, int hist_row0, bool logits_last ) {

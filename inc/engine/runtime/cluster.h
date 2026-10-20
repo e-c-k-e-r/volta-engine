@@ -128,6 +128,9 @@ public:
 		return runner_->speculate( slot, anchor, pos, depth_threshold, sp, rng );
 	}
 
+	// DSpark drafter round (see ModelPipeline::dspark_forward): the block's draft tokens and confidence logits, from rank 0
+	void dspark_draft( int slot, int pos, int from, int win_start, int anchor, int* drafts, float* conf );
+
 	// MTP head steps on all ranks (see ModelPipeline::mtp_step); positions pos0 .. pos0 + count - 1 of `slot`, tokens[j] follows position pos0 + j.
 	void mtp_step( int slot, int pos0, int count, const int* tokens, int hidden_mode, int hist_row0, bool logits_last );
 	void mtp_save_hist( int src_row, int rows, int dst_row );

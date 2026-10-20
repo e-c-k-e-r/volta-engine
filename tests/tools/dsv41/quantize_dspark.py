@@ -23,6 +23,7 @@ ap.add_argument("--blocks", default="0,1,2")
 ap.add_argument("--limit", type=int, default=0, help="only the first N items (timing test)")
 ap.add_argument("--worker", type=int, default=-1)
 ap.add_argument("--workers", type=int, default=4)
+ap.add_argument("--aux-only", action="store_true", help="write only model-aux.safetensors (the official tensors the engine needs next to the quantized ones)")
 a = ap.parse_args()
 
 NB, NE = 3, 128
@@ -45,6 +46,23 @@ def items():
         if b == 0:
             out.append((f"{p}.main_proj", f"{p}.main_proj", None, a.k_dense))
     return out
+
+if a.aux_only:
+    # the tensors that stay official (norms, router, hyper-connections, attention sinks, markov and confidence heads) -> DIR/model-aux.safetensors,
+    # so that DIR is the whole drafter (the engine reads it as draft_model_dir)
+    import dsv41_ref as R  # noqa: E402
+    from safetensors.torch import save_file  # noqa: E402
+    idx = R.TensorIndex(a.model)
+    linear = ("wq_a", "wq_b", "wkv", "wo_a", "wo_b", "main_proj")
+    aux = {}
+    for k in sorted(idx.keys("mtp.")):
+        if k.endswith(".scale") or ".experts." in k or ".shared_experts." in k or any(f".{n}.weight" in k for n in linear):
+            continue
+        aux[k] = idx.get(k, "cpu").contiguous()
+    os.makedirs(a.out, exist_ok=True)
+    save_file(aux, f"{a.out}/model-aux.safetensors")
+    print(f"{len(aux)} tensors, {sum(t.numel() * t.element_size() for t in aux.values()) / 2**20:.0f} MiB")
+    sys.exit(0)
 
 if a.worker < 0:
     os.makedirs(a.out, exist_ok=True)

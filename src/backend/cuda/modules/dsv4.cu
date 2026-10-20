@@ -518,6 +518,115 @@ void att_combine_kernel( const float* __restrict__ ws, int nsplit, const float* 
 	}
 }
 
+
+// ---- DSpark drafter -----------------------------------------------------------------------------------------------------------------
+
+// ring[slot][pos % WINDOW][tap][hidden] = scale * mean of the row's four streams
+__global__ __launch_bounds__( 256 )
+void tap_store_kernel( const float* __restrict__ streams, half* __restrict__ ring, int tap, int taps, int hidden, float scale, int floor_pos,
+	const pod::BatchRows* __restrict__ rows, size_t ring_slot_stride ) {
+	const int r = blockIdx.x;
+	const int pos = rows->pos[r];
+	if ( pos < floor_pos ) return;
+	half* dst = ring + static_cast<size_t>( rows->slot[r] ) * ring_slot_stride + ( static_cast<size_t>( pos % DSV4::WINDOW ) * taps + tap ) * hidden;
+	const float* s = streams + static_cast<size_t>( r ) * 4 * hidden;
+	for ( int d = threadIdx.x; d < hidden; d += blockDim.x ) dst[d] = __float2half_rn( 0.25f * scale * ( s[d] + s[hidden + d] + s[2 * hidden + d] + s[3 * hidden + d] ) );
+}
+
+__global__ __launch_bounds__( 256 )
+void tap_gather_kernel( const half* __restrict__ ring, half* __restrict__ out, int slot, int first, int taps_hidden, size_t ring_slot_stride ) {
+	const half* src = ring + static_cast<size_t>( slot ) * ring_slot_stride + static_cast<size_t>( ( first + blockIdx.x ) % DSV4::WINDOW ) * taps_hidden;
+	half* dst = out + static_cast<size_t>( blockIdx.x ) * taps_hidden;
+	for ( int d = threadIdx.x; d < taps_hidden; d += blockDim.x ) dst[d] = src[d];
+}
+
+// attend_kernel for a drafter block (see DSV4::dspark_attend): the keys are the ring window [w0, t] followed by the block's own rows_n keys
+template <int HPW>
+__global__ __launch_bounds__( ATT_THREADS )
+void dspark_attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, const half* __restrict__ blk, const float* __restrict__ sink, const float2* __restrict__ rope,
+	half* __restrict__ o, int nh, int layer, int rows_n, const pod::BatchRows* __restrict__ rows, int slot, int w0, int t, size_t ring_slot_stride ) {
+	extern __shared__ half2 att_smem[];
+	half2* qs = att_smem;                       // [nh][HD / 2]
+	half2* ks = att_smem + nh * ( HD / 2 );     // [ATT_TILE][HD / 2]
+	const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+	const float2* cs_row = rope + static_cast<size_t>( rows->pos[r] ) * ( ROPE / 2 );
+	for ( int i = tid; i < nh * ( HD / 2 ); i += ATT_THREADS ) {
+		const int h = i / ( HD / 2 ), c = i % ( HD / 2 );
+		float2 v = __half22float2( reinterpret_cast<const half2*>( q + ( static_cast<size_t>( r ) * nh + h ) * HD )[c] );
+		if ( c * 2 >= ROPE0 ) rot( v.x, v.y, cs_row[c - ROPE0 / 2], false );
+		qs[i] = __floats2half2_rn( v.x, v.y );
+	}
+	const half* wring = ring + static_cast<size_t>( slot ) * ring_slot_stride + static_cast<size_t>( layer ) * DSV4::RING * HD;
+	const int n_win = t - w0 + 1;
+	const int total = n_win + rows_n;
+	const float scale = rsqrtf( static_cast<float>( HD ) );
+	float m[HPW], l[HPW];
+	float2 acc[HPW][8];
+	#pragma unroll
+	for ( int j = 0; j < HPW; ++j ) {
+		m[j] = -1e30f;
+		l[j] = 0.0f;
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) acc[j][i] = make_float2( 0.0f, 0.0f );
+	}
+	for ( int k0 = 0; k0 < total; k0 += ATT_TILE ) {
+		__syncthreads();
+		const int nk = min( ATT_TILE, total - k0 );
+		for ( int i = tid; i < nk * ( HD / 8 ); i += ATT_THREADS ) {
+			const int k = i / ( HD / 8 ), c = i % ( HD / 8 );
+			const int e = k0 + k;
+			const half* src = e < n_win ? wring + static_cast<size_t>( ( w0 + e ) % DSV4::RING ) * HD : blk + static_cast<size_t>( rows->pos[e - n_win] % DSV4::RING ) * HD;
+			reinterpret_cast<int4*>( ks + k * ( HD / 2 ) )[c] = reinterpret_cast<const int4*>( src )[c];
+		}
+		__syncthreads();
+		for ( int k = 0; k < nk; ++k ) {
+			float2 kv[8];
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) kv[i] = __half22float2( ks[k * ( HD / 2 ) + lane + 32 * i] );
+			#pragma unroll
+			for ( int j = 0; j < HPW; ++j ) {
+				const int h = warp * HPW + j;
+				float dot = 0.0f;
+				#pragma unroll
+				for ( int i = 0; i < 8; ++i ) {
+					const float2 qv = __half22float2( qs[h * ( HD / 2 ) + lane + 32 * i] );
+					dot = fmaf( qv.x, kv[i].x, fmaf( qv.y, kv[i].y, dot ) );
+				}
+				dot = engine::math::warp_sum( dot ) * scale;
+				const float mn = fmaxf( m[j], dot );
+				const float corr = expf( m[j] - mn ), p = expf( dot - mn );
+				l[j] = l[j] * corr + p;
+				#pragma unroll
+				for ( int i = 0; i < 8; ++i ) {
+					acc[j][i].x = acc[j][i].x * corr + p * kv[i].x;
+					acc[j][i].y = acc[j][i].y * corr + p * kv[i].y;
+				}
+				m[j] = mn;
+			}
+		}
+	}
+	const int G = DSV4::GROUP_HEADS;
+	#pragma unroll
+	for ( int j = 0; j < HPW; ++j ) {
+		const int h = warp * HPW + j;
+		const float mn = fmaxf( m[j], sink[h] );
+		const float corr = expf( m[j] - mn );
+		const float den = l[j] * corr + expf( sink[h] - mn );
+		const float f = corr / den;
+		float2 v[8];
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) v[i] = __half22float2( __floats2half2_rn( acc[j][i].x * f, acc[j][i].y * f ) );
+		rot( v[7].x, v[7].y, cs_row[lane], true );
+		half* dst = o + ( static_cast<size_t>( h / G ) * rows_n + r ) * ( G * HD ) + static_cast<size_t>( h % G ) * HD;
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) {
+			const float amax = group_max<16>( fmaxf( fabsf( v[i].x ), fabsf( v[i].y ) ) );
+			const float s = e4m3_scale_pow2( amax );
+			reinterpret_cast<half2*>( dst )[lane + 32 * i] = __floats2half2_rn( q_e4m3( v[i].x, s ), q_e4m3( v[i].y, s ) );
+		}
+	}
+}
+
 __global__ void concat_groups_kernel( const half* __restrict__ in, half* __restrict__ out, int groups, int n, int rows ) {
 	const size_t total = static_cast<size_t>( rows ) * groups * n;
 	for ( size_t i = blockIdx.x * static_cast<size_t>( blockDim.x ) + threadIdx.x; i < total; i += static_cast<size_t>( gridDim.x ) * blockDim.x ) {
@@ -704,6 +813,33 @@ void DSV4::attend( const half* q, const half* ring, const half* comp_kv, const i
 			case 2: att_combine_kernel<2><<<rows, ATT_THREADS, 0, stream>>>( wsp, nsplit, sink, rope, o, nh, rows, d_rows ); break;
 			default: att_combine_kernel<4><<<rows, ATT_THREADS, 0, stream>>>( wsp, nsplit, sink, rope, o, nh, rows, d_rows ); break;
 		}
+	}
+}
+
+void DSV4::tap_store( const float* streams, half* ring, int tap, int taps, int hidden, float scale, int floor_pos, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride,
+	cudaStream_t stream ) {
+	tap_store_kernel<<<rows, 256, 0, stream>>>( streams, ring, tap, taps, hidden, scale, floor_pos, d_rows, ring_slot_stride );
+}
+
+void DSV4::tap_gather( const half* ring, half* out, int slot, int first, int n, int taps, int hidden, size_t ring_slot_stride, cudaStream_t stream ) {
+	tap_gather_kernel<<<n, 256, 0, stream>>>( ring, out, slot, first, taps * hidden, ring_slot_stride );
+}
+
+void DSV4::dspark_attend( const half* q, const half* ring, const half* blk, const float* sink, const float* rope_f, half* o, int nh, int layer, int rows, const pod::BatchRows* d_rows,
+	int slot, int w0, int t, size_t ring_slot_stride, cudaStream_t stream ) {
+	const float2* rope = reinterpret_cast<const float2*>( rope_f );
+	const size_t smem = static_cast<size_t>( nh + ATT_TILE ) * ( HD / 2 ) * sizeof( half2 );
+	ENGINE_ASSERT( nh == 8 || nh == 16 || nh == 32, "DSV4::dspark_attend: heads per rank must be 8, 16 or 32" );
+	if ( nh == 32 ) {
+		static bool attr[ENGINE_NUM_GPUS] = {};
+		int dev = 0;
+		cudaGetDevice( &dev );
+		if ( !attr[dev] ) { cudaFuncSetAttribute( dspark_attend_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024 ); attr[dev] = true; }
+	}
+	switch ( nh / 8 ) {
+		case 1: dspark_attend_kernel<1><<<rows, ATT_THREADS, smem, stream>>>( q, ring, blk, sink, rope, o, nh, layer, rows, d_rows, slot, w0, t, ring_slot_stride ); break;
+		case 2: dspark_attend_kernel<2><<<rows, ATT_THREADS, smem, stream>>>( q, ring, blk, sink, rope, o, nh, layer, rows, d_rows, slot, w0, t, ring_slot_stride ); break;
+		default: dspark_attend_kernel<4><<<rows, ATT_THREADS, smem, stream>>>( q, ring, blk, sink, rope, o, nh, layer, rows, d_rows, slot, w0, t, ring_slot_stride ); break;
 	}
 }
 

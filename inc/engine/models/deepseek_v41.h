@@ -133,6 +133,15 @@ public:
 	const engine::loader::VisionParams* vision_params() const override { return vision_.loaded() ? &vision_.params() : nullptr; }
 	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
 	bool inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream = nullptr ) override;
+	// DSpark block drafter (speculator=dspark, draft_model_dir = the directory quantize_dspark.py wrote): three blocks of window attention and a
+	// 128-expert MoE on the same hyper-connection streams, entered through main_proj from the trunk's stream means at layers 37 / 38 / 39. The
+	// main-KV rows of the window live in three extra layers of the window ring; see ModelPipeline::dspark_forward
+	void set_reserve_after_weights( size_t bytes ) override { reserve_after_ = bytes; }
+	bool load_dspark( const char* dir, backend::stream_t stream = nullptr ) override;
+	bool has_dspark() const override { return ds_.loaded; }
+	int dspark_block() const override { return ds_.block; }
+	void dspark_forward( int slot, int pos, int from, int win_start, int anchor, backend::stream_t stream = nullptr ) override;
+	void dspark_chain( const backend::half_t* const* peer_shards, int peer_cols, int anchor, int* drafts, float* conf, backend::stream_t stream = nullptr ) override;
 	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
 	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
 	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;
@@ -163,7 +172,9 @@ private:
 	void forward_body( int m, backend::stream_t stream );
 	void attention( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );
 	void ffn( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );
-	void ffn_front( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );     // mHC collapse, norm, router
+	void ffn_front( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream, int experts = 0, int top_k = 0 );     // mHC collapse, norm, router (the drafter's has fewer experts)
+	void dspark_ingest( int slot, int from, int to, backend::stream_t stream );
+	void embed_raw( const int* token_ids, int count, backend::stream_t stream );
 	void ffn_experts( DeepseekV41LayerWeights& lw, int rows, backend::stream_t stream ); // the routed experts over norm_x_ rows
 	void ffn_back( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );      // shared expert, all-reduce
 	void forward_head( int m, backend::stream_t stream );
@@ -229,6 +240,31 @@ private:
 		int* nsel = nullptr;
 		uint8_t* cand = nullptr;
 	};
+	// DSpark drafter
+	struct DSparkState {
+		bool enabled = false;                    // buffers allocated (speculator=dspark)
+		bool loaded = false;
+		int block = 5, noise = 128799, tap0 = 37, taps = 3, experts = 128, top_k = 3, blocks = 3, markov_rank = 256;
+		std::vector<DeepseekV41LayerWeights> layers;
+		pod::LinearWeight main_proj;
+		pod::TensorView main_norm, final_norm;
+		std::unique_ptr<engine::loader::SafeTensorsRepo> repo;
+		pod::TensorView markov_embed;            // rank 0: device BF16 [vocab, markov_rank]
+		pod::LinearWeight markov_head;           // rank 0: [markov_rank -> vocab]
+		std::vector<float> conf_w;               // rank 0: confidence head over [hidden | markov_rank]
+		backend::half_t* tap_ring = nullptr;     // [slot][WINDOW][taps][hidden]
+		size_t tap_stride = 0;
+		backend::half_t* blk_ring = nullptr;     // scratch window ring for the block's own keys
+		pod::BatchRows* d_ing_rows = nullptr;
+		pod::BatchRows* d_blk_rows = nullptr;
+		pod::TensorView taps_in, mx_pre, mx, dkv, dkvn;   // [WINDOW rows, ...]
+		int* d_chain = nullptr;                  // rank 0: [8] token ids of the chain
+		pod::TensorView memb, bias;              // rank 0: [8, markov_rank], [1, vocab]
+	} ds_;
+	static constexpr float kTapScale = 1.0f / 16.0f;   // taps are stored scaled (the stream means pass FP16 at the BOS row); main_norm removes the scale
+	size_t reserve_after_ = 0;
+	int tap_floor_ = 0;
+	int win_layers_ = 0;
 	int window_ = 1;
 	std::vector<WinChunk> win_;
 	pod::TensorView win_norm_, win_moe_out_, win_moe_tmp_;

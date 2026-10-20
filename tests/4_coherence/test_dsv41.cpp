@@ -40,10 +40,18 @@ int main( int argc, char** argv ) {
 	std::string verify;   // verify=<L,L,..>: the greedy continuation fed back in blocks of L rows, the time of a block (the cost of a speculative verify)
 	int adapt = 0;      // adapt=<N>: decode with an expert residency rebalance every N tokens, printing the time of each 16 tokens
 	std::string dump;   // dump=<file>: teacher-forced prefill in chunks of 512 rows, every row's FP16 logits appended (needs glm_logit_rows=512)
+	std::string dspark_dir;   // dspark_dir=<dir>: load the DSpark drafter (quantize_dspark.py output) as the speculator
+	int spec_run = 0;         // spec=1: after the plain decode, the same generation with speculative rounds (output must be identical)
+	std::string dtf;          // dtf=<ids file>: the drafter on a recorded sequence, teacher forced
+	int dtf_prompt = 0;       // dtf_prompt=<P>: the first P ids are the prompt, the rest the target's own greedy continuation
 	for ( ; a < argc; ++a ) {
 		const std::string kv = argv[a];
 		const size_t eq = kv.find( '=' );
 		ENGINE_ASSERT( eq != std::string::npos, "test_dsv41: options are key=value" );
+		if ( kv.substr( 0, eq ) == "dspark_dir" ) { dspark_dir = kv.substr( eq + 1 ); continue; }
+		if ( kv.substr( 0, eq ) == "spec" ) { spec_run = std::atoi( kv.c_str() + eq + 1 ); continue; }
+		if ( kv.substr( 0, eq ) == "dtf" ) { dtf = kv.substr( eq + 1 ); continue; }
+		if ( kv.substr( 0, eq ) == "dtf_prompt" ) { dtf_prompt = std::atoi( kv.c_str() + eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "verify" ) { verify = kv.substr( eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "adapt" ) { adapt = std::atoi( kv.c_str() + eq + 1 ); continue; }
 		if ( kv.substr( 0, eq ) == "dump" ) { dump = kv.substr( eq + 1 ); continue; }
@@ -57,7 +65,57 @@ int main( int argc, char** argv ) {
 	ClusterConfig cfg;
 	cfg.model_type = "deepseek_v41";
 	cfg.model_dir = dir;
+	if ( !dspark_dir.empty() ) {
+		ENGINE_ASSERT( set_option( "speculator", "dspark" ), "test_dsv41: speculator" );
+		cfg.draft_model_dir = dspark_dir;
+		cfg.speculate = true;
+	}
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
+	if ( !dtf.empty() ) {
+		// the drafter on a recorded sequence (prompt + the target's greedy continuation): at each position t the drafter gets the anchor ids[t]
+		// (the token the target chose, not yet forwarded) and drafts positions t + 1 ..; a draft is right when it equals the recorded token
+		std::vector<int> ids;
+		{
+			std::ifstream f( dtf );
+			for ( int t; f >> t; ) ids.push_back( t );
+		}
+		const int P = dtf_prompt, n = static_cast<int>( ids.size() );
+		ENGINE_ASSERT( P >= 2 && P < n - 8, "test_dsv41: dtf_prompt out of range" );
+		mc.reset_slot( 0 );
+		mc.prefill( ids.data(), P, 0 );
+		const int B = mc.model( 0 ).dspark_block();
+		long steps = 0;
+		long match[8] = {}, prefix[8] = {}, sum_acc = 0;
+		double draft_ms = 0.0;
+		int ingested = 0;
+		for ( int t = P; t + B + 1 < n; ++t ) {
+			int drafts[8] = {};
+			float conf[8] = {};
+			const auto td = std::chrono::steady_clock::now();
+			mc.dspark_draft( 0, t, ingested, 0, ids[t], drafts, conf );
+			draft_ms += test::ms_since( td );
+			ingested = t;
+			bool alive = true;
+			int acc = 0;
+			for ( int j = 0; j < B; ++j ) {
+				const bool ok = drafts[j] == ids[t + 1 + j];
+				match[j] += ok;
+				alive = alive && ok;
+				if ( alive ) { prefix[j]++; acc++; }
+			}
+			sum_acc += acc;
+			++steps;
+			mc.forward( &ids[t], 1, t, 0 );   // the anchor joins the context
+		}
+		std::printf( "[*] drafter on %ld positions: %.2f accepted drafts per round (%.2f tokens), draft %.1f ms\n", steps, static_cast<double>( sum_acc ) / steps, 1.0 + static_cast<double>( sum_acc ) / steps, draft_ms / steps );
+		std::printf( "[*] per position match:" );
+		for ( int j = 0; j < B; ++j ) std::printf( " %.3f", static_cast<double>( match[j] ) / steps );
+		std::printf( "\n[*] prefix >= j:      " );
+		for ( int j = 0; j < B; ++j ) std::printf( " %.3f", static_cast<double>( prefix[j] ) / steps );
+		std::printf( "\n" );
+		mc.shutdown();
+		return 0;
+	}
 	if ( !turns.empty() ) {
 		engine::loader::Tokenizer tok;
 		ENGINE_ASSERT( tok.load( dir.c_str() ), "test_dsv41: tokenizer" );
@@ -162,14 +220,38 @@ int main( int argc, char** argv ) {
 			std::printf( "[*] second prefill: %.0f ms (%.0f tok/s)\n", test::ms_since( tp ), prompt.size() * 1000.0 / test::ms_since( tp ) );
 			int blocks = 0, pos = static_cast<int>( prompt.size() );
 			const auto tv = std::chrono::steady_clock::now();
+			int rows = 0, disagree = 0;
 			for ( size_t i = 0; i + L <= st.tokens.size(); i += L, ++blocks ) {
 				mc.forward( &st.tokens[i], L, pos, 0 );
 				pos += L;
-				mc.sample_one();
+				int preds[pod::MAX_BATCH];
+				mc.sample( preds, L );
+				// row j's logits predict the token after st.tokens[i + j]: the plain run's next token
+				for ( int j = 0; j < L && i + j + 1 < st.tokens.size(); ++j, ++rows ) {
+					if ( preds[j] != st.tokens[i + j + 1] ) {
+						++disagree;
+						std::printf( "[*]   block row differs at generated token %zu: plain %d, block %d\n", i + j + 1, st.tokens[i + j + 1], preds[j] );
+					}
+				}
 			}
+			std::printf( "[*] blocks of %d rows: %d of %d predictions differ from the one-row decode\n", L, disagree, rows );
 			const double ms = test::ms_since( tv );
 			std::printf( "[*] verify blocks of %d rows: %d blocks, %.1f ms per block, %.1f ms per row\n", L, blocks, ms / blocks, ms / ( blocks * L ) );
 		}
+	}
+	if ( spec_run ) {
+		const test::GenStats sp = test::generate( mc, prompt, gen, true );
+		const bool same = sp.tokens == st.tokens;
+		const int sdec = static_cast<int>( sp.tokens.size() ) - 1;
+		std::printf( "[%c] speculative decode: %s; %d rounds, %d proposed, %d accepted (%.2f per round), %d tokens in %.0f ms (%.1f tok/s; plain %.1f tok/s)\n", same ? '+' : '-',
+			same ? "identical to the plain run" : "DIFFERS from the plain run", sp.rounds, sp.proposed, sp.accepted, sp.rounds ? static_cast<double>( sp.accepted ) / sp.rounds : 0.0, sdec,
+			sp.decode_ms, sdec > 0 ? sdec * 1000.0 / sp.decode_ms : 0.0, st.decode_tok_s() );
+		if ( !same ) {
+			size_t d = 0;
+			while ( d < sp.tokens.size() && d < st.tokens.size() && sp.tokens[d] == st.tokens[d] ) ++d;
+			std::printf( "[*] first difference at generated token %zu: plain %d, speculative %d\n", d, d < st.tokens.size() ? st.tokens[d] : -1, d < sp.tokens.size() ? sp.tokens[d] : -1 );
+		}
+		if ( mc.has_speculator() ) mc.speculator().profile_dump();
 	}
 	const int dec = static_cast<int>( st.tokens.size() ) - 1;
 	std::printf( "[*] prompt %zu tokens, %.1f s: prefill %.0f ms (%.0f tok/s), decode %d tokens in %.0f ms (%.1f ms/token, %.1f tok/s)\n", prompt.size(), test::ms_since( t0 ) / 1000.0,

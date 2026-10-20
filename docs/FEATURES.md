@@ -70,6 +70,7 @@ Validated contexts:
 | DFlash2 drafter (Qwen, GLM), verified in one forward (per-row recurrent-state snapshots; GLM journals the KDA rows and replays the accepted ones), a context and tap ring per slot on GLM | opt-in | `--speculative`, `--draft-model-dir`, `draft_tp` | `test_dflash*`, `test_spec_state`, `test_spec_target_equiv`, `test_coherence` |
 | MTP: the checkpoint's own head (Qwen, Flash-Next, GLM) | opt-in | `speculator=mtp`, `mtp_depth` | `test_mtp` |
 | DFlash2 blocks shortened where the drafter's recent per-position accuracy makes the later rows unlikely to be reached | opt-in | `spec_depth` | `bench_accept --depths` |
+| DeepSeek-V4.1 DSpark block drafter (EXL3 from `quantize_dspark.py`, `draft_model_dir`): 5-token drafts from the trunk's stream means, confidence-cut, one verify forward | opt-in | `speculator=dspark`, `dspark_conf` | |
 | DFlash2 rounds whose block is the continuation of the last earlier occurrence of the current suffix of the request's own text (copied code, tool arguments), no draft pass | opt-in | `spec_suffix` | |
 | Adaptive controller that falls back to plain decode when speculation loses | default | `spec_ctrl` | `bench_accept`, `bench_spec` |
 | One verify forward for the blocks of all speculating slots (DFlash2: on, drafted in turn; MTP: off, one draft chain too) | on (DFlash2) | `spec_joint` | `test_api.sh` |
