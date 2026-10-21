@@ -94,6 +94,18 @@ What the settings change, measured on one request (`bench_serve.py` style, greed
 
 On a replay of 30 turns of a recorded Claude Code session (each turn's prompt is the recorded history, about 11K tokens, and the server writes the next turn, greedy, 400 tokens at most), with `spec_depth=0.25`: `spec_suffix` 6 to 12 gives about +5% decode tokens per second over off (92.7 against 88.1 tok/s over six and two runs; two runs of the same setting differ by up to 5%), 58% of the proposed suffix tokens are accepted, and 22% of the rounds use a suffix block. 4 proposes too eagerly (+2%) and 16 rarely fires (no gain). The minimum continuation (`spec_suffix_min`, 3) makes no measurable difference from 2 to 5.
 
+DeepSeek-V4.1-Flash on the same kind of replay (30 turns of a recorded session in three segments of ten, prompts of 4-9K tokens served from the prefix cache, greedy, 400 tokens at most, experts placed from a heat file, `max_image_tokens=0`), decode tokens over decode time and the wall time of the 30 requests:
+
+| `speculator` | decode tok/s | wall s | rounds | per segment tok/s |
+|---|---|---|---|---|
+| off | 18.7 | 316.6 | 0 | 18.5 / 18.9 / 18.8 |
+| `suffix`, `spec_suffix=4` | 21.8 | 312.9 | 2108 | 20.0 / 19.2 / 28.5 |
+| `dspark`, `dspark_conf=0.7` | **24.4** | **281.4** | 1109 | 22.5 / 24.3 / 26.8 |
+| `dspark` 0.7 + `spec_suffix=4` | 23.4 | 307.6 | 1101 | 20.8 / 23.8 / 26.9 |
+| `dspark`, `dspark_conf=0.5` | 23.8 | 306.1 | 1174 | 21.3 / 23.9 / 27.3 |
+
+The drafter is +30% over off and +12% over suffix matching, which only pays in the segment that rewrites files. Time to first token is 3.2-3.8 s on average in every row (prefill is unchanged). Speculative runs leave the plain run's text at near-tie tokens (12-17 of 30 turns identical), so the generated lengths differ by up to 15%; two runs of one setting differ by up to 5%.
+
 A prompt of about 11K tokens arriving while another request decodes (`prefill_budget_ms`): the decoding request's 90th-percentile token gap and the new prompt's time to first token.
 
 | `prefill_budget_ms` | Token gap p90 | Prompt TTFT |
