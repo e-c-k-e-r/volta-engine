@@ -113,7 +113,7 @@ A prompt of about 11K tokens arriving while another request decodes (`prefill_bu
 | 0 (512-row pieces) | 0.59 s | 8.2 s |
 | 300 | 0.33 s | 10.0 s |
 
-`prefill_cooldown` keeps the pieces at full size and lets the decoding requests step several times between two of them. Flash-Next, a prompt of about 11K tokens arriving while another request decodes, one run each: with `prefill_cooldown=3` the decoding request streams at about 125 characters/s during the prefill (42 without), its 90th-percentile token gap is 0.03 s (0.37 s) and the prompt's time to first token is 13.1 s (11.2 s). The longest single gap stays at one piece (0.44 s).
+`prefill_cooldown` keeps the pieces at full size and lets the decoding requests step several times between two of them. Flash-Next, a prompt of about 11K tokens arriving while another request decodes, one run each: with `prefill_cooldown=3` the decoding request streams at about 125 characters/s during the prefill (42 without), its 90th-percentile token gap is 0.03 s (0.37 s) and the prompt's time to first token is 13.1 s (11.2 s). The longest single gap stays at one piece (0.44 s). GLM-5.3-Flash with the DFlash2 drafter, the same test: 51 against 14 characters/s during the prefill, token gap p90 0.06 s (0.83 s), the prompt's first token 23.2 s (20.8 s). DeepSeek-V4.1-Flash with the DSpark drafter (2 slots, half of the experts resident): 5.7 against 1.5 characters/s, median token gap 0.14 s (4.5 s), but the prompt's first token takes 142 s (112 s) and one stall of 28 s appeared (5 s without the cooldown); with swapped experts a decode step between two pieces changes which experts are resident, so leave the cooldown at 0 there.
 
 Settings for how many requests run at once:
 
