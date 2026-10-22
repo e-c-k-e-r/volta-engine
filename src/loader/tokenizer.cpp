@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cctype>
+#include <functional>
 
 namespace engine::loader {
 
@@ -747,7 +748,14 @@ bool Tokenizer::load( const char* model_dir ) {
 	return true;
 }
 
+// Words up to this many pieces merge by rescanning for the lowest rank; the rescan is quadratic, so a long word (base64, minified data) takes the heap below
+static constexpr size_t kBpeScanMax = 32;
+
 void Tokenizer::bpe_merge( std::vector<int>& ids ) const {
+	if ( ids.size() > kBpeScanMax ) {
+		bpe_merge_heap( ids );
+		return;
+	}
 	while ( ids.size() > 1 ) {
 		int min_rank = 1000000000;
 		int min_idx = -1;
@@ -768,6 +776,50 @@ void Tokenizer::bpe_merge( std::vector<int>& ids ) const {
 		ids[min_idx] = merge_result_.at( min_key );
 		ids.erase( ids.begin() + min_idx + 1 );
 	}
+}
+
+// The same merges in the same order (lowest rank first, the leftmost of equal ranks) with the pieces in a linked list and the candidate pairs in a heap
+// ordered by (rank, position); a pair that has changed since it was pushed is skipped when it comes up
+void Tokenizer::bpe_merge_heap( std::vector<int>& ids ) const {
+	const int n = static_cast<int>( ids.size() );
+	std::vector<int> next( n ), prev( n );
+	std::vector<char> alive( n, 1 );
+	for ( int i = 0; i < n; ++i ) {
+		next[i] = i + 1 < n ? i + 1 : -1;
+		prev[i] = i - 1;
+	}
+	struct Cand {
+		int rank, pos;
+		uint64_t key;
+		bool operator>( const Cand& o ) const { return rank != o.rank ? rank > o.rank : pos > o.pos; }
+	};
+	std::vector<Cand> heap;
+	const auto key_at = [&]( int i ) { return ( static_cast<uint64_t>( ids[i] ) << 32 ) | static_cast<uint64_t>( ids[next[i]] ); };
+	const auto push = [&]( int i ) {
+		if ( i < 0 || next[i] < 0 ) return;
+		const uint64_t key = key_at( i );
+		auto it = merge_rank_.find( key );
+		if ( it == merge_rank_.end() ) return;
+		heap.push_back( { it->second, i, key } );
+		std::push_heap( heap.begin(), heap.end(), std::greater<Cand>() );
+	};
+	for ( int i = 0; i + 1 < n; ++i ) push( i );
+	while ( !heap.empty() ) {
+		std::pop_heap( heap.begin(), heap.end(), std::greater<Cand>() );
+		const Cand c = heap.back();
+		heap.pop_back();
+		if ( !alive[c.pos] || next[c.pos] < 0 || key_at( c.pos ) != c.key ) continue;
+		const int j = next[c.pos];
+		ids[c.pos] = merge_result_.at( c.key );
+		alive[j] = 0;
+		next[c.pos] = next[j];
+		if ( next[j] >= 0 ) prev[next[j]] = c.pos;
+		push( prev[c.pos] );
+		push( c.pos );
+	}
+	size_t out = 0;
+	for ( int i = 0; i >= 0 && i < n; i = next[i] ) ids[out++] = ids[i];
+	ids.resize( out );
 }
 
 std::vector<int> Tokenizer::encode_piece( const std::string& piece ) const {

@@ -1,11 +1,13 @@
 // Compares the engine tokenizer with reference token ids (HF tokenizers).
 //   test_tokenizer_file <model_dir> <text file> <reference ids.json>   one file against a JSON array of ids
 //   test_tokenizer_file <model_dir> --cases <cases.json>               [{"text", "ids"}] fixtures (tests/data/tokenizer_cases_*.json)
+//   test_tokenizer_file <model_dir> --time <text file> [ids out.bin]   encode time of one file, optionally dumping the ids (int32) to compare runs
 #include "engine/loader/tokenizer.h"
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -19,6 +21,21 @@ int main( int argc, char** argv ) {
 	if ( !tok.load( argv[1] ) ) {
 		std::printf( "[-] cannot load tokenizer from %s\n", argv[1] );
 		return 2;
+	}
+	if ( std::string( argv[2] ) == "--time" ) {
+		std::ifstream tf( argv[3], std::ios::binary );
+		std::stringstream ts;
+		ts << tf.rdbuf();
+		const std::string text = ts.str();
+		const auto t0 = std::chrono::steady_clock::now();
+		const std::vector<int> ids = tok.encode( text, false );
+		const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
+		std::printf( "%zu bytes -> %zu tokens in %.1f ms\n", text.size(), ids.size(), ms );
+		if ( argc > 4 ) {
+			std::ofstream of( argv[4], std::ios::binary );
+			of.write( reinterpret_cast<const char*>( ids.data() ), static_cast<std::streamsize>( ids.size() * sizeof( int ) ) );
+		}
+		return 0;
 	}
 	if ( std::string( argv[2] ) == "--cases" ) {
 		std::ifstream cf( argv[3] );

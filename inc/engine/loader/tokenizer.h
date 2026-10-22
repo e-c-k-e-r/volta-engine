@@ -48,6 +48,7 @@ public:
 private:
 	void init_byte_mappings();
 	void bpe_merge( std::vector<int>& ids ) const;
+	void bpe_merge_heap( std::vector<int>& ids ) const;
 	std::vector<int> encode_piece( const std::string& piece ) const;
 	std::vector<int> encode_text_segment( const std::string& text ) const;
 
