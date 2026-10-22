@@ -879,8 +879,14 @@ void Qwen4ExpPipeline::gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, i
 	}
 #if ENGINE_BACKEND_CUDA
 	if ( normed_ready_ ) {
-		engine::modules::GatedResidual::mix_prenormed( g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(), with_post ? g.inject.ptr<const backend::half_t>() : nullptr,
-			mixed_.ptr<backend::half_t>(), post_, gr_scratch_, m, config_.hidden_size, config_.hc_mult, config_.hc_rank, stream );
+		// The fused all-reduce wrote the normed rows of all m; the decode kernels take them in groups of 8, t going after the last of them
+		const int H = config_.hidden_size, hc = config_.hc_mult;
+		float* t = gr_scratch_ + static_cast<size_t>( m ) * hc * H;
+		for ( int r0 = 0; r0 < m; r0 += 8 ) {
+			engine::modules::GatedResidual::mix_prenormed( g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(), with_post ? g.inject.ptr<const backend::half_t>() : nullptr,
+				mixed_.ptr<backend::half_t>() + static_cast<size_t>( r0 ) * H, post_ + static_cast<size_t>( r0 ) * hc, gr_scratch_ + static_cast<size_t>( r0 ) * hc * H, MIN( 8, m - r0 ), H, hc,
+				config_.hc_rank, stream, t + static_cast<size_t>( r0 ) * config_.hc_rank );
+		}
 		normed_ready_ = false;
 		return;
 	}
@@ -1235,7 +1241,7 @@ bool Qwen4ExpPipeline::fuses_site( int m, const backend::half_t* next_norm ) con
 #if ENGINE_BACKEND_CUDA
 	static const bool fuse = runtime::options().gr_fuse && runtime::options().trace_layers.empty() && runtime::options().teacher_streams.empty() &&
 		runtime::options().hessian_dir.empty();
-	return ring_ != nullptr && fuse && next_norm != nullptr && m <= 8 && !apply_pending_;
+	return ring_ != nullptr && fuse && next_norm != nullptr && m <= kGrDecodeRows && !apply_pending_;
 #else
 	return false;
 #endif
