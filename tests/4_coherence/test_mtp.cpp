@@ -35,6 +35,9 @@ int main( int argc, char** argv ) {
 	const bool glm = argc > 1 && std::string( argv[1] ) == "--glm";
 	// --joint (with --flash): two prompts speculate together, their blocks verified in one forward (joint rounds), each held to its own plain greedy run
 	const bool joint = flash && argc > 2 && std::string( argv[2] ) == "--joint";
+	// --interleave: slot 0 speculates while slot 1's long prompt is prefilled in pieces between its rounds (what the generator does when a request arrives
+	// during decoding); both slots must give exactly the tokens they give alone, since the pieces and the rounds are separate forwards
+	const bool interleave = argc > 2 && std::string( argv[2] ) == "--interleave";
 	const char* dir = glm ? test::GLM_DIR : flash ? test::FLASH_DIR : test::QWEN_DIR;
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	setenv( "ENGINE_SPECULATOR", "mtp", 1 );
@@ -69,6 +72,49 @@ int main( int argc, char** argv ) {
 	ENGINE_ASSERT( mc.has_speculator(), "no speculator" );
 	mc.warm_graphs( 8 );
 	int failures = 0;
+	if ( interleave ) {
+		constexpr int kPiece = 512, kNewA = 96, kNewB = 32;
+		const std::vector<int>& A = prompts[0];
+		const std::vector<int>& B = prompts[1];
+		const test::GenStats refA = test::generate( mc, A, kNewA, true, 0 );
+		const test::GenStats refB = test::generate( mc, B, kNewB, true, 1 );
+		mc.reset_slot( 0 );
+		mc.reset_slot( 1 );
+		std::vector<int> ta;
+		int tokA = mc.prefill( A.data(), static_cast<int>( A.size() ), 0 );
+		ta.push_back( tokA );
+		int posA = static_cast<int>( A.size() ), posB = 0, tokB = -1, pieces = 0, rounds_during = 0;
+		while ( static_cast<int>( ta.size() ) < kNewA || tokB < 0 ) {
+			if ( static_cast<int>( ta.size() ) < kNewA && !mc.is_eos( tokA ) ) {
+				const SpecResult r = mc.speculate( 0, tokA, posA );
+				posA = r.next_pos;
+				for ( int i = 0; i < r.emitted_count && static_cast<int>( ta.size() ) < kNewA; ++i ) ta.push_back( tokA = r.emitted[i] );
+				if ( tokB < 0 ) ++rounds_during;
+			}
+			if ( tokB < 0 ) {
+				const int len = MIN( kPiece, static_cast<int>( B.size() ) - posB );
+				const int r = mc.prefill( B.data() + posB, len, 1, 0, nullptr, posB );
+				posB += len;
+				++pieces;
+				if ( posB >= static_cast<int>( B.size() ) ) tokB = r;
+			}
+			else if ( static_cast<int>( ta.size() ) >= kNewA || mc.is_eos( tokA ) ) break;
+		}
+		std::vector<int> tb = { tokB };
+		int pb = static_cast<int>( B.size() );
+		while ( static_cast<int>( tb.size() ) < kNewB && !mc.is_eos( tb.back() ) ) {
+			const SpecResult r = mc.speculate( 1, tb.back(), pb );
+			pb = r.next_pos;
+			for ( int i = 0; i < r.emitted_count && static_cast<int>( tb.size() ) < kNewB; ++i ) tb.push_back( r.emitted[i] );
+		}
+		const bool okA = ta == refA.tokens, okB = tb == refB.tokens;
+		std::printf( "[%s] slot 0 (%zu tokens, %d rounds while %d pieces of slot 1 went in): %zu tokens equal to the run alone\n", okA ? "ok" : "FAIL", A.size(), rounds_during, pieces, ta.size() );
+		std::printf( "[%s] slot 1 (%zu tokens in pieces of %d): %zu tokens equal to the run alone\n", okB ? "ok" : "FAIL", B.size(), kPiece, tb.size() );
+		if ( !okA ) std::printf( "   alone %s\n   mixed %s\n", test::format_tokens( refA.tokens, 24 ).c_str(), test::format_tokens( ta, 24 ).c_str() );
+		if ( !okB ) std::printf( "   alone %s\n   mixed %s\n", test::format_tokens( refB.tokens, 24 ).c_str(), test::format_tokens( tb, 24 ).c_str() );
+		std::printf( okA && okB ? "test_mtp --interleave: PASS\n" : "test_mtp --interleave: FAIL\n" );
+		return okA && okB ? 0 : 1;
+	}
 	if ( joint ) {
 		ENGINE_ASSERT( mc.speculator().joint(), "the speculator has no joint rounds" );
 		mc.warm_graphs( pod::MAX_BATCH );

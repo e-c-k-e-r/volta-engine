@@ -113,6 +113,8 @@ A prompt of about 11K tokens arriving while another request decodes (`prefill_bu
 | 0 (512-row pieces) | 0.59 s | 8.2 s |
 | 300 | 0.33 s | 10.0 s |
 
+`prefill_cooldown` keeps the pieces at full size and lets the decoding requests step several times between two of them. Flash-Next, a prompt of about 11K tokens arriving while another request decodes, one run each: with `prefill_cooldown=3` the decoding request streams at about 125 characters/s during the prefill (42 without), its 90th-percentile token gap is 0.03 s (0.37 s) and the prompt's time to first token is 13.1 s (11.2 s). The longest single gap stays at one piece (0.44 s).
+
 Settings for how many requests run at once:
 
 | Requests at once | `max_slots` | Other settings |

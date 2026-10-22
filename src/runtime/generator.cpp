@@ -571,7 +571,8 @@ void Generator::step_batch() {
 	const double budget_ms = runtime::options().prefill_budget_ms;
 	if ( budget_ms > 0.0 && pf_rows_ <= 0.0 ) pf_rows_ = chunk_max;
 	const int chunk = ( decoding && ( !cluster_.has_speculator() || cluster_.speculator().per_slot() ) ) ? ( budget_ms > 0.0 ? static_cast<int>( pf_rows_ ) : chunk_max ) : 0;
-	if ( chunk > 0 ) {
+	if ( chunk > 0 && pf_cooldown_left_ > 0 ) --pf_cooldown_left_;   // the decoding requests take this step on their own
+	else if ( chunk > 0 ) {
 		for ( int i = 1; i <= num_slots_; ++i ) {
 			const int s = ( pf_rr_ + i ) % num_slots_;
 			if ( slots_[s].active && !slots_[s].prefill_done ) {
@@ -587,11 +588,13 @@ void Generator::step_batch() {
 					pf_rows_ = std::min( static_cast<double>( chunk_max ), std::max( 64.0, pf_rows_ * step ) );
 				}
 				if ( ms > 300.0 ) LOG_DEBUG( "[gen] slot %d prefill piece at %d (%d rows) took %.0f ms\n", s, pos0, slots_[s].pf_pos - pos0, ms );
+				pf_cooldown_left_ = runtime::options().prefill_cooldown;
 				break;
 			}
 		}
 	}
 	else {
+		pf_cooldown_left_ = 0;
 		for ( int s = 0; s < num_slots_; ++s ) {
 			while ( slots_[s].active && !slots_[s].prefill_done ) prefill_slot( s, 0 );
 		}

@@ -231,6 +231,7 @@ private:
 	// Feeds up to `budget` prompt tokens of slot s (0 = all of them); true once the prompt is done and the first token is out
 	bool prefill_slot( int s, int budget );
 	double pf_rows_ = 0.0;   // prefill_budget_ms: the piece size (rows) the next piece starts with
+	int pf_cooldown_left_ = 0;   // prefill_cooldown: the steps still to run without a prompt piece
 	int pf_rr_ = 0;   // the slot after which the next prefilling slot is looked for
 	PrefixCache::Entry* store_prefix( int s, PrefixCache::Entry* parent, int tokens, bool pinned, bool with_taps );
 	static constexpr int kPrefixMinTokens = 512;
