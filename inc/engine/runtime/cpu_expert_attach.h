@@ -25,4 +25,7 @@ struct CpuExpertHandle {
 // layer i are numbered first_expert + e; act_limit is the SwiGLU clamp of the model (0 = plain SiLU)
 CpuExpertHandle attach_cpu_experts( modules::ExpertTier& tier, int rank, int first_expert, int hidden, float act_limit, pod::MemoryArena& device, backend::stream_t stream );
 
+// Stops the CPU expert service and frees its host state (the model's teardown, before the device contexts are destroyed)
+void detach_cpu_experts();
+
 }   // namespace engine::cpu_moe

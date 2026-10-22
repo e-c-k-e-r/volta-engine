@@ -73,4 +73,6 @@ CpuExpertHandle attach_cpu_experts( modules::ExpertTier& tier, int rank, int fir
 	return h;
 }
 
+void detach_cpu_experts() { Service::get().quiesce(); }
+
 }   // namespace engine::cpu_moe

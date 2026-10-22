@@ -138,6 +138,7 @@ engine::loader::NgramTable& ngram_table() {
 Qwen4ExpPipeline::Qwen4ExpPipeline() = default;
 Qwen4ExpPipeline::~Qwen4ExpPipeline() {
 	if ( arena_ != nullptr ) {
+	if ( cpu_.on() ) engine::cpu_moe::detach_cpu_experts();
 		backend::set_device( rank_ );
 		hessian_dump();
 		graphs_.reset();

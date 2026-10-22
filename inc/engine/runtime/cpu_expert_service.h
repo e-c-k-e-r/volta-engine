@@ -34,6 +34,9 @@ public:
 	void* numa_alloc( size_t bytes, int node );
 	// "10-19,22" -> {10..19, 22}
 	static std::vector<int> parse_cpus( const std::string& list );
+	// Stops the dispatcher and releases the mailboxes, host experts and pool, so a later start() begins afresh. Must run before the device contexts go: the
+	// mailboxes are mapped pinned memory, which the dispatcher would otherwise read after cudaDeviceReset unmapped it
+	void quiesce();
 	~Service();
 
 private:

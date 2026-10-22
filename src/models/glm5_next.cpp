@@ -86,6 +86,7 @@ pod::TensorView load_router_weights_glm(
 Glm5NextPipeline::Glm5NextPipeline() = default;
 
 Glm5NextPipeline::~Glm5NextPipeline() {
+	if ( cpu_.on() ) engine::cpu_moe::detach_cpu_experts();
 	destroy();
 }
 

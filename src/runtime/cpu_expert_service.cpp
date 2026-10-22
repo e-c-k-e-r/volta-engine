@@ -33,6 +33,21 @@ Service::~Service() {
 	for ( auto& r : ranks_ ) if ( r && r->mb ) backend::host_free_pinned( r->mb );
 }
 
+void Service::quiesce() {
+	if ( !started_ ) return;
+	stop_ = true;
+	if ( th_.joinable() ) th_.join();
+	std::lock_guard<std::mutex> l( mu_ );
+	for ( auto& r : ranks_ ) if ( r && r->mb ) backend::host_free_pinned( r->mb );
+	ranks_.clear();
+	for ( auto& m : maps_ ) munmap( m.first, m.second );
+	maps_.clear();
+	pool_.reset();
+	stop_ = false;
+	started_ = false;
+	++ranks_version_;
+}
+
 void Service::start( const std::vector<int>& cpus, int spin_us ) {
 	std::lock_guard<std::mutex> l( mu_ );
 	if ( started_ ) return;
