@@ -112,6 +112,8 @@ public:
 	// cold experts' codes cross the PCIe link once per window instead of once per 512-row chunk
 	int window_chunks() const override { return window_; }
 	void forward_window( const int* tokens, const pod::BatchRows* chunks, int n, backend::stream_t stream = nullptr ) override;
+	// The Engram rows of the next window are requested from the table files while this one runs (the lookups' pages are the NVMe reads of a prefill)
+	void set_prefetch_hint( const int* tokens, int count, int slot, int pos0 ) override { hint_tokens_ = tokens; hint_count_ = count; hint_slot_ = slot; hint_pos0_ = pos0; }
 	void sample_tokens( int* out_preds, int count, backend::stream_t stream = nullptr ) override;
 	bool sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream = nullptr ) override;
 	bool topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream = nullptr ) override;
@@ -174,6 +176,8 @@ private:
 	void ffn( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );
 	void ffn_front( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream, int experts = 0, int top_k = 0 );     // mHC collapse, norm, router (the drafter's has fewer experts)
 	void dspark_ingest( int slot, int from, int to, backend::stream_t stream );
+	void engram_hash( const int64_t* toks, int64_t* out ) const;                       // the table rows of one position: out [layers][(ngram - 1) * heads]
+	void engram_stage_start( const pod::BatchRows* chunks, int n );                    // rank 0: reads the window's table rows (and the next window's, from the hint) into shared staging
 	void copy_taps( int slot_id, int tokens, char* host, bool to_host, backend::stream_t stream );
 	void embed_raw( const int* token_ids, int count, backend::stream_t stream );
 	void ffn_experts( DeepseekV41LayerWeights& lw, int rows, backend::stream_t stream ); // the routed experts over norm_x_ rows
@@ -263,6 +267,8 @@ private:
 		pod::TensorView memb, bias;              // rank 0: [8, markov_rank], [1, vocab]
 	} ds_;
 	static constexpr float kTapScale = 1.0f / 16.0f;   // taps are stored scaled (the stream means pass FP16 at the BOS row); main_norm removes the scale
+	const int* hint_tokens_ = nullptr;     // set_prefetch_hint
+	int hint_count_ = 0, hint_slot_ = 0, hint_pos0_ = 0;
 	size_t reserve_after_ = 0;
 	int tap_floor_ = 0;
 	int win_layers_ = 0;
@@ -304,6 +310,12 @@ private:
 		size_t page = 4096;
 		backend::half_t* host_rows = nullptr;     // pinned [2][MAX_ROWS][cols]
 		float e4m3[256];
+		int fd[2] = { -1, -1 };                    // the table shards: rank 0 reads the rows of a window through them (deep pread queues, not page faults)
+		size_t toff[2] = {};                       // absolute file offsets of the two tables
+		int chunk_off[16] = {};                    // first row of each chunk of the current window in the window's staging
+		int win_slot = -1, win_from = 0;           // the window the chunks belong to
+		std::thread fetcher;                       // rank 0: reads the rows of this window and of the next one
+		double t_ms[4] = {};                       // host time in the Engram lookups of this forward: hashes + page requests, waiting for the page-request thread, gather + dequantize, upload (expert_log)
 	} eg_;
 	std::vector<int> pending_tokens_;
 	pod::TensorView e_rows_[2], e_kv_;

@@ -363,6 +363,11 @@ int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Ca
 			p += rows;
 		}
 		if ( n >= 2 ) {
+			// the tokens of the window after this one, for a model that fetches host-side lookups early
+			int p_end = pos;
+			for ( int c = 0; c < n; ++c ) p_end += win[c].count;
+			if ( count - p_end > pod::MAX_BATCH )
+				for ( int d = 0; d < tp_; ++d ) models_[d]->set_prefetch_hint( tokens + p_end, MIN( count - p_end, MIN( window, 16 ) * chunk ), slot, pos0 + p_end );
 			ForwardTimer timer{ win[n - 1].count };
 			pool_.run( [&]( int d ) {
 				models_[d]->forward_window( tokens + pos, win, n, streams_[d] );

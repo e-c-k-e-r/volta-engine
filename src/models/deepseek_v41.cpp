@@ -22,6 +22,16 @@
 #include <numeric>
 #include <chrono>
 #include <sys/mman.h>
+#include <condition_variable>
+#include <mutex>
+#include <atomic>
+#include <memory>
+#include <fcntl.h>
+#include <sched.h>
+#include <pthread.h>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <unistd.h>
 
 namespace engine::models {
@@ -31,6 +41,82 @@ using engine::modules::DSV4;
 namespace {
 
 pod::TensorView g_embed_table;   // host BF16 [vocab, hidden], shared by the ranks
+
+// Engram rows of a prefill window, read ahead by rank 0 and used by every rank: the raw FP8 rows [window row][layer][head x n-gram][dim] for the
+// table indices idx (same layout). The scale tables (8 bytes a row) are held in memory, once for all ranks
+struct EngramStage {
+	int slot = -1, from = 0, rows = 0;
+	bool ready = false;
+	std::vector<int64_t> idx;
+	std::vector<uint8_t> raw;
+};
+std::mutex g_stage_mu;
+std::condition_variable g_stage_cv;
+std::vector<std::shared_ptr<EngramStage>> g_stages;
+std::once_flag g_scale_once[2];
+std::vector<uint8_t> g_scale_mem[2];
+
+std::shared_ptr<EngramStage> stage_find( int slot, int from ) {
+	std::lock_guard<std::mutex> lk( g_stage_mu );
+	for ( auto& s : g_stages ) if ( s->slot == slot && s->from == from ) return s;
+	return nullptr;
+}
+
+void stage_add( const std::shared_ptr<EngramStage>& s ) {
+	std::lock_guard<std::mutex> lk( g_stage_mu );
+	if ( g_stages.size() >= 4 ) g_stages.erase( g_stages.begin() );
+	g_stages.push_back( s );
+}
+
+std::shared_ptr<EngramStage> stage_wait( int slot, int from ) {
+	std::unique_lock<std::mutex> lk( g_stage_mu );
+	std::shared_ptr<EngramStage> found;
+	const bool ok = g_stage_cv.wait_for( lk, std::chrono::seconds( 600 ), [&]() {
+		for ( auto& s : g_stages ) if ( s->slot == slot && s->from == from && s->ready ) { found = s; return true; }
+		return false;
+	} );
+	ENGINE_ASSERT( ok, "DeepseekV41Pipeline: the Engram rows of a prefill window were never read" );
+	return found;
+}
+
+// The cores the Engram read threads may use: the process's own (the main thread's mask) without those of the rank workers, which the pool pins one to a
+// core (a thread inherits its creator's mask, so the read threads of rank 0 would all share its core), and without the scheduler thread's core 4
+cpu_set_t engram_io_cpus( int ranks ) {
+	cpu_set_t all, io;
+	CPU_ZERO( &all );
+	if ( sched_getaffinity( getpid(), sizeof all, &all ) != 0 ) { CPU_ZERO( &io ); return io; }
+	io = all;
+	for ( int c = 0; c < CPU_SETSIZE; ++c ) if ( c < ranks || c == 4 ) CPU_CLR( c, &io );
+	return CPU_COUNT( &io ) > 0 ? io : all;
+}
+
+// Reads the stage's rows with a pool of threads (the drive wants a queue depth of 64 or more; one faulting thread gets 7K reads a second, 128 get 200K)
+void fetch_stage( const std::shared_ptr<EngramStage>& s, const int* fd, const size_t* toff, int layers, int per, int dim ) {
+	const size_t total = s->idx.size();
+	s->raw.resize( total * dim );
+	std::atomic<size_t> next{ 0 };
+	std::vector<std::thread> ts;
+	for ( int t = 0; t < 96; ++t ) {
+		ts.emplace_back( [&]() {
+			for ( ;; ) {
+				const size_t k0 = next.fetch_add( 256 );
+				if ( k0 >= total ) break;
+				const size_t k1 = std::min( total, k0 + 256 );
+				for ( size_t k = k0; k < k1; ++k ) {
+					const int e = static_cast<int>( ( k / per ) % layers );
+					const ssize_t got = pread( fd[e], s->raw.data() + k * dim, dim, static_cast<off_t>( toff[e] + static_cast<size_t>( s->idx[k] ) * dim ) );
+					ENGINE_ASSERT( got == dim, "DeepseekV41Pipeline: short read of an Engram table row" );
+				}
+			}
+		} );
+	}
+	for ( auto& t : ts ) t.join();
+	{
+		std::lock_guard<std::mutex> lk( g_stage_mu );
+		s->ready = true;
+	}
+	g_stage_cv.notify_all();
+}
 
 float bf16_to_float( uint16_t b ) {
 	const uint32_t u = static_cast<uint32_t>( b ) << 16;
@@ -99,6 +185,24 @@ void scale_device_half( backend::half_t* p, size_t n, float f, backend::stream_t
 	for ( auto& v : h ) v = backend::from_float_half( backend::to_float( v ) * f );
 	backend::memcpy_sync( p, h.data(), n * sizeof( backend::half_t ), backend::Copy::H2D );
 }
+
+#if defined(__x86_64__)
+// One Engram table row (FP8 E4M3 with a power-of-two scale per block) to halves, 8 values at a time: the same products and roundings as the scalar loop
+__attribute__(( target( "avx2,f16c" ) )) void dequant_row_avx2( const uint8_t* w, const uint8_t* sc, int nb, int block, const float* lut, uint16_t* out ) {
+	for ( int b = 0; b < nb; ++b ) {
+		float f;
+		if ( sc[b] ) { const uint32_t bits = static_cast<uint32_t>( sc[b] ) << 23; std::memcpy( &f, &bits, 4 ); }
+		else f = std::ldexp( 1.0f, -127 );
+		const __m256 vf = _mm256_set1_ps( f );
+		for ( int d = b * block; d < ( b + 1 ) * block; d += 8 ) {
+			const __m256i ix = _mm256_cvtepu8_epi32( _mm_loadl_epi64( reinterpret_cast<const __m128i*>( w + d ) ) );
+			const __m256 v = _mm256_mul_ps( _mm256_i32gather_ps( lut, ix, 4 ), vf );
+			_mm_storeu_si128( reinterpret_cast<__m128i*>( out + d ), _mm256_cvtps_ph( v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC ) );
+		}
+	}
+}
+const bool g_avx2 = __builtin_cpu_supports( "avx2" ) && __builtin_cpu_supports( "f16c" );
+#endif
 
 // A [N, K] tensor (BF16 / F32) as FP16 on the device, or FP8 E4M3 with [N/32, K/32] E8M0 block scales dequantized to FP16
 pod::LinearWeight load_dense( engine::loader::SafeTensorsRepo& repo, const std::string& base, pod::MemoryArena& arena, backend::stream_t stream ) {
@@ -177,6 +281,7 @@ DeepseekV41Pipeline::DeepseekV41Pipeline() {
 }
 
 DeepseekV41Pipeline::~DeepseekV41Pipeline() {
+	if ( eg_.fetcher.joinable() ) eg_.fetcher.join();
 	// route counts of this rank's experts since the start (checkpoint ids) to expert_heat_file.r<rank>, for the next run's placement
 	const std::string& hf = runtime::options().expert_heat_file;
 	if ( hf.empty() || !weights_loaded_ ) return;
@@ -485,10 +590,29 @@ bool DeepseekV41Pipeline::load_engram( const char* model_dir ) {
 		eg_.scale[e] = static_cast<const uint8_t*>( engine::loader::safetensors_get_data_cpu( *repo_->get_shard( ss ), ms ) );
 		// random 4 KB reads: the default readahead of a fault (128 KB and up) would read mostly unrelated rows
 		eg_.page = static_cast<size_t>( sysconf( _SC_PAGESIZE ) );
-		for ( auto [ptr, bytes] : { std::pair<const uint8_t*, size_t>{ eg_.table[e], mw->size_bytes }, std::pair<const uint8_t*, size_t>{ eg_.scale[e], ms->size_bytes } } ) {
-			const uintptr_t a = reinterpret_cast<uintptr_t>( ptr ) & ~( eg_.page - 1 );
-			madvise( reinterpret_cast<void*>( a ), reinterpret_cast<uintptr_t>( ptr ) + bytes - a, MADV_RANDOM );
+		{
+			const uintptr_t a = reinterpret_cast<uintptr_t>( eg_.table[e] ) & ~( eg_.page - 1 );
+			madvise( reinterpret_cast<void*>( a ), reinterpret_cast<uintptr_t>( eg_.table[e] ) + mw->size_bytes - a, MADV_RANDOM );
 		}
+		// the weight rows are read through the shard's descriptor; the scales (8 bytes a row, 3 GB a table) are read once into memory, so that a row
+		// costs one random read instead of two
+		int fdw = -1, fds = -1;
+		size_t offw = 0, offs = 0, bytesw = 0, bytess = 0;
+		ENGINE_ASSERT( repo_->file_ref( ( pre + "weight" ).c_str(), &fdw, &offw, &bytesw ) && repo_->file_ref( ( pre + "scale" ).c_str(), &fds, &offs, &bytess ), "Engram table files" );
+		eg_.fd[e] = fdw;
+		eg_.toff[e] = offw;
+		posix_fadvise( fdw, 0, 0, POSIX_FADV_RANDOM );
+		std::call_once( g_scale_once[e], [&]() {
+			g_scale_mem[e].resize( bytess );
+			for ( size_t at = 0; at < bytess; ) {
+				const size_t n = std::min<size_t>( bytess - at, 64ull << 20 );
+				const ssize_t got = pread( fds, g_scale_mem[e].data() + at, n, static_cast<off_t>( offs + at ) );
+				ENGINE_ASSERT( got > 0, "Engram scale table read failed" );
+				at += static_cast<size_t>( got );
+			}
+			posix_fadvise( fds, static_cast<off_t>( offs ), static_cast<off_t>( bytess ), POSIX_FADV_DONTNEED );
+		} );
+		eg_.scale[e] = g_scale_mem[e].data();
 	}
 	eg_.hist.assign( config_.max_slots, std::vector<int>( config_.max_seq, eg_.pad ) );
 	const size_t cols = static_cast<size_t>( eg_.heads ) * ( eg_.ngram - 1 ) * eg_.dim;
@@ -916,6 +1040,12 @@ void DeepseekV41Pipeline::embed_tokens( const int* token_ids, int count, backend
 // Host side of the Engram lookups: each row's compressed id joins its slot's history, its n-gram hashes pick rows of the two tables
 // (FP8 with power-of-two block scales, read through the checkpoint mapping), dequantized to FP16 and uploaded
 void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::stream_t stream, int chunk, bool upload, int phases ) {
+	auto tick = std::chrono::steady_clock::now();
+	auto lap = [&]( int slot ) {
+		const auto now = std::chrono::steady_clock::now();
+		eg_.t_ms[slot] += std::chrono::duration<double, std::milli>( now - tick ).count();
+		tick = now;
+	};
 	const int m = ( phases & 1 ) ? rows.count : eg_.rows_c[chunk];
 	std::vector<int64_t>& idx = eg_.idx[chunk];
 	if ( phases & 1 ) ENGINE_ASSERT( static_cast<int>( pending_tokens_.size() ) == m, "DeepseekV41Pipeline: embed_tokens and forward disagree on the row count" );
@@ -926,6 +1056,10 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 	// 1. hashes (the history is updated row by row, so a chunk sees its own earlier rows)
 	if ( phases & 1 ) {
 	eg_.rows_c[chunk] = m;
+	if ( phases == 1 ) {   // a window: where this chunk's rows start in the window's staging
+		if ( chunk == 0 ) { eg_.win_slot = rows.slot[0]; eg_.win_from = rows.pos[0]; eg_.chunk_off[0] = 0; }
+		else eg_.chunk_off[chunk] = eg_.chunk_off[chunk - 1] + eg_.rows_c[chunk - 1];
+	}
 	idx.resize( static_cast<size_t>( m ) * eg_.layers * per );
 	for ( int r = 0; r < m; ++r ) {
 		const int s = rows.slot[r], pos = rows.pos[r];
@@ -938,17 +1072,7 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 			blocked = blocked || hv < 0;
 			toks[k] = blocked ? eg_.pad : hv;
 		}
-		for ( int e = 0; e < eg_.layers; ++e ) {
-			int64_t rolling = toks[0] * eg_.mult[static_cast<size_t>( e ) * N];
-			for ( int i = 1; i < N; ++i ) {
-				rolling ^= toks[i] * eg_.mult[static_cast<size_t>( e ) * N + i];
-				for ( int h = 0; h < NH; ++h ) {
-					const size_t c = static_cast<size_t>( i - 1 ) * NH + h;
-					idx[( static_cast<size_t>( r ) * eg_.layers + e ) * per + c] =
-						rolling % eg_.primes[static_cast<size_t>( e ) * per + c] + eg_.offsets[static_cast<size_t>( e ) * per + c];
-				}
-			}
-		}
+		engram_hash( toks, idx.data() + static_cast<size_t>( r ) * eg_.layers * per );
 	}
 	// 2. the rows' pages are requested all at once (the tables are far larger than the page cache: a miss is an NVMe read, and serial
 	// faults cost ~1 ms each; asked together they overlap)
@@ -957,25 +1081,43 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 		for ( size_t k = 0; k < idx.size(); ++k ) {
 			const int e = static_cast<int>( ( k / per ) % eg_.layers );
 			const uintptr_t w = reinterpret_cast<uintptr_t>( eg_.table[e] + static_cast<size_t>( idx[k] ) * D );
-			const uintptr_t sc = reinterpret_cast<uintptr_t>( eg_.scale[e] + static_cast<size_t>( idx[k] ) * nb );
 			madvise( reinterpret_cast<void*>( w & ~( pg - 1 ) ), ( ( w + D - 1 ) & ~( pg - 1 ) ) - ( w & ~( pg - 1 ) ) + pg, MADV_WILLNEED );
-			madvise( reinterpret_cast<void*>( sc & ~( pg - 1 ) ), pg, MADV_WILLNEED );
 		}
 	};
-	if ( phases == 3 ) advise();                       // one forward: every rank requests its pages, as before
-	else if ( rank_ == 0 ) eg_.advise[chunk] = std::thread( advise );   // a window: one thread requests them, the others read the shared page cache
+	if ( phases == 3 ) advise();                       // one forward (decode, a short chunk): every rank requests its pages; a window reads its rows through engram_stage_start
 	}
+	lap( 0 );
 	if ( !( phases & 2 ) ) return;
-	if ( eg_.advise[chunk].joinable() ) eg_.advise[chunk].join();
+	std::shared_ptr<EngramStage> stage;   // a window: the rows rank 0 read ahead
+	if ( phases == 2 ) stage = stage_wait( eg_.win_slot, eg_.win_from );
+	lap( 1 );
 	// 3. gather and dequantize (FP8 with a power-of-two scale per block)
 	for ( int r = 0; r < m; ++r ) {
 		for ( int e = 0; e < eg_.layers; ++e ) {
 			backend::half_t* dst = host_rows + ( static_cast<size_t>( e ) * pod::MAX_ROWS + r ) * cols;
 			for ( int c = 0; c < per; ++c ) {
 				const int64_t row = idx[( static_cast<size_t>( r ) * eg_.layers + e ) * per + c];
-				const uint8_t* w = eg_.table[e] + static_cast<size_t>( row ) * D;
+				const uint8_t* w = stage ? stage->raw.data() + ( ( ( static_cast<size_t>( eg_.chunk_off[chunk] ) + r ) * eg_.layers + e ) * per + c ) * D
+				                         : eg_.table[e] + static_cast<size_t>( row ) * D;
 				const uint8_t* sc = eg_.scale[e] + static_cast<size_t>( row ) * nb;
 				backend::half_t* o = dst + static_cast<size_t>( c ) * D;
+#if defined(__x86_64__)
+				if ( g_avx2 ) {
+					dequant_row_avx2( w, sc, nb, eg_.block, eg_.e4m3, reinterpret_cast<uint16_t*>( o ) );
+					static bool checked = false;   // the first row once: the vector path must equal the scalar one bit for bit
+					if ( !checked ) {
+						checked = true;
+						for ( int b = 0; b < nb; ++b ) {
+							const float f = std::ldexp( 1.0f, static_cast<int>( sc[b] ) - 127 );
+							for ( int d = b * eg_.block; d < ( b + 1 ) * eg_.block; ++d ) {
+								const backend::half_t ref = backend::from_float_half( eg_.e4m3[w[d]] * f );
+								ENGINE_ASSERT( std::memcmp( &ref, &o[d], sizeof( ref ) ) == 0, "Engram dequantizer: the AVX2 path differs from the scalar one" );
+							}
+						}
+					}
+					continue;
+				}
+#endif
 				for ( int b = 0; b < nb; ++b ) {
 					const float f = std::ldexp( 1.0f, static_cast<int>( sc[b] ) - 127 );
 					for ( int d = b * eg_.block; d < ( b + 1 ) * eg_.block; ++d ) o[d] = backend::from_float_half( eg_.e4m3[w[d]] * f );
@@ -983,11 +1125,77 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 			}
 		}
 	}
+	lap( 2 );
 	if ( !upload ) return;
 	for ( int e = 0; e < eg_.layers; ++e ) {
 		backend::memcpy_async( e_rows_[e].data, host_rows + static_cast<size_t>( e ) * pod::MAX_ROWS * cols, static_cast<size_t>( m ) * cols * sizeof( backend::half_t ),
 			backend::Copy::H2D, stream );
 	}
+}
+
+// The table rows of one position from its N compressed ids (the rolling hash of the n-grams, one prime and offset per head)
+void DeepseekV41Pipeline::engram_hash( const int64_t* toks, int64_t* out ) const {
+	const int N = eg_.ngram, NH = eg_.heads, per = ( N - 1 ) * NH;
+	for ( int e = 0; e < eg_.layers; ++e ) {
+		int64_t rolling = toks[0] * eg_.mult[static_cast<size_t>( e ) * N];
+		for ( int i = 1; i < N; ++i ) {
+			rolling ^= toks[i] * eg_.mult[static_cast<size_t>( e ) * N + i];
+			for ( int h = 0; h < NH; ++h ) {
+				const size_t c = static_cast<size_t>( i - 1 ) * NH + h;
+				out[static_cast<size_t>( e ) * per + c] = rolling % eg_.primes[static_cast<size_t>( e ) * per + c] + eg_.offsets[static_cast<size_t>( e ) * per + c];
+			}
+		}
+	}
+}
+
+// Rank 0, once the history of the window's rows is set: the table rows of this window (when the window before did not already ask for them) and,
+// from the hint, of the next one are read into shared staging on a thread, a queue of 96 reads deep. The ranks wait for their window's staging
+// at the layer that needs it, and dequantize from it.
+void DeepseekV41Pipeline::engram_stage_start( const pod::BatchRows* chunks, int n ) {
+	if ( eg_.fetcher.joinable() ) eg_.fetcher.join();
+	const int N = eg_.ngram, NH = eg_.heads, per = ( N - 1 ) * NH, D = eg_.dim, L = eg_.layers;
+	const int slot = chunks[0].slot[0], from = chunks[0].pos[0];
+	std::vector<std::shared_ptr<EngramStage>> todo;
+	if ( !stage_find( slot, from ) ) {
+		auto s = std::make_shared<EngramStage>();
+		s->slot = slot;
+		s->from = from;
+		for ( int c = 0; c < n; ++c ) s->idx.insert( s->idx.end(), eg_.idx[c].begin(), eg_.idx[c].begin() + static_cast<size_t>( eg_.rows_c[c] ) * L * per );
+		s->rows = static_cast<int>( s->idx.size() / ( static_cast<size_t>( L ) * per ) );
+		stage_add( s );
+		todo.push_back( s );
+	}
+	if ( hint_tokens_ != nullptr && hint_count_ > 0 ) {
+		const int pos0 = hint_pos0_, count = hint_count_, slot2 = hint_slot_;
+		auto s = std::make_shared<EngramStage>();
+		s->slot = slot2;
+		s->from = pos0;
+		s->rows = count;
+		s->idx.resize( static_cast<size_t>( count ) * L * per );
+		std::vector<int> comp( N - 1 + count );   // the compressed ids of positions pos0 - (N - 1) .. pos0 + count - 1
+		for ( int j = 0; j < N - 1; ++j ) { const int p = pos0 - ( N - 1 ) + j; comp[j] = p >= 0 ? eg_.hist[slot2][p] : -1; }
+		for ( int j = 0; j < count; ++j ) { const int tok = hint_tokens_[j]; comp[N - 1 + j] = ( tok >= 0 && tok < eg_.vocab ) ? eg_.token_map[tok] : eg_.pad; }
+		for ( int r = 0; r < count; ++r ) {
+			int64_t toks[8];
+			bool blocked = false;
+			for ( int k = 0; k < N; ++k ) {
+				const int hv = pos0 + r - k >= 0 ? comp[N - 1 + r - k] : -1;
+				blocked = blocked || hv < 0;
+				toks[k] = blocked ? eg_.pad : hv;
+			}
+			engram_hash( toks, s->idx.data() + static_cast<size_t>( r ) * L * per );
+		}
+		stage_add( s );
+		todo.push_back( s );
+	}
+	if ( todo.empty() ) return;
+	const int fds[2] = { eg_.fd[0], eg_.fd[1] };
+	const size_t offs[2] = { eg_.toff[0], eg_.toff[1] };
+	const cpu_set_t io = engram_io_cpus( config_.tp_size );
+	eg_.fetcher = std::thread( [todo, fds, offs, L, per, D, io]() {
+		if ( CPU_COUNT( &io ) > 0 ) pthread_setaffinity_np( pthread_self(), sizeof io, &io );   // the read threads it starts inherit this
+		for ( const auto& s : todo ) fetch_stage( s, fds, offs, L, per, D );
+	} );
 }
 
 void DeepseekV41Pipeline::sync_image_flags( backend::stream_t stream ) {
@@ -1108,6 +1316,8 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 		engram_prepare( chunks[c], stream, c, false, 1 );   // the pages are requested now, gathered when layer 1 needs them
 		unbind( c );
 	}
+	if ( rank_ == 0 ) engram_stage_start( chunks, n );
+	hint_tokens_ = nullptr;
 	sync_image_flags( stream );   // every chunk is text: clears the flags an image prefill left
 	for ( int l = 0; l < config_.num_layers; ++l ) {
 		auto& lw = layers_[l];
@@ -1145,6 +1355,10 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 	}
 	forward_head( bind( n - 1 ), stream );
 
+	if ( runtime::options().expert_log ) {
+		LOG_INFO( "[engram rank %d] window of %d rows: hashes + page requests %.0f ms, waiting for the page-request thread %.0f ms, gather + dequantize %.0f ms\n", rank_, total, eg_.t_ms[0], eg_.t_ms[1], eg_.t_ms[2] );
+		for ( double& t : eg_.t_ms ) t = 0.0;
+	}
 	// back to the single-chunk bindings
 	streams_.data = win_[0].streams;
 	pre_[0] = win_[0].pre[0];

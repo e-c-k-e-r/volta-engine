@@ -85,6 +85,10 @@ public:
 		}
 	}
 
+	// The prompt tokens of the window that will follow the next forward_window call (a model with host-side lookups starts fetching them early; the
+	// pointer must stay valid until that call returns)
+	virtual void set_prefetch_hint( const int* tokens, int count, int slot, int pos0 ) { (void) tokens; (void) count; (void) slot; (void) pos0; }
+
 	// 3. Forward over embedded rows
 	virtual void forward( const pod::BatchRows& rows, backend::stream_t stream = nullptr ) = 0;
 	void forward( int batch_size, int pos, int slot_id = 0, backend::stream_t stream = nullptr ) {
