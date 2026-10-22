@@ -7,7 +7,7 @@
 | Test | Tier | GPU | Checks |
 |---|---|---|---|
 | `test_trellis`, `test_gemv_int8` | 2 | yes | trellis and int8 GEMV kernels against FP32 references |
-| `test_mhc`, `test_attention`, `test_attention_prefill`, `test_dsa`, `test_kv_pages`, `test_gdn`, `test_norm`, `test_rope`, `test_kv_quant`, `test_prefill_linear` | 2 | yes | module operations against CPU references |
+| `test_mhc`, `test_attention`, `test_attention_prefill`, `test_dsa`, `test_dsv4_indexer` (DeepSeek's indexer: the tensor-core scorer against the scalar kernel, selections, candidate masks and scores, with timing), `test_kv_pages`, `test_gdn`, `test_norm`, `test_rope`, `test_kv_quant`, `test_prefill_linear` | 2 | yes | module operations against CPU references |
 | `test_all_reduce` | 2 | yes (4; `AR_RANKS=2` runs two) | NVLink all-reduce: single, asynchronous multi-layer, fused with the gated add and stream norm (Flash-Next), fused with the hyper-connection post-step (GLM; bit-identical to the all-reduce followed by `HyperConnection::update`) |
 | `test_sparse_attn` | 2 | yes | `Attention::forward_sparse` (decode-sized sparse-list attention, head_dim 256) against an FP64 softmax over the same keys |
 | `test_vulkan_comm` | 2 | yes (2-4) | the Vulkan build's host-staged all-reduce and all-reduce + RMSNorm on 2 and 4 devices, one thread per rank (skips with fewer devices) |

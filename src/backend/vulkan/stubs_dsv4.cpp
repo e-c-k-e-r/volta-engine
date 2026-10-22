@@ -19,7 +19,7 @@ __attribute__(( weak )) void DSV4::index_key_store( const backend::half_t* kraw,
 	__builtin_unreachable();
 }
 
-__attribute__(( weak )) void DSV4::indexer( const backend::half_t* q, const backend::half_t* w, const backend::half_t* idx_k, float* scores, uint8_t* cand, int* sel, int* nsel, const float* rope, int ratio, int cap, int cand_mode, int cand_blocks, int cand_block, int rows, const pod::BatchRows* d_rows, size_t idx_slot_stride, backend::stream_t stream ) {
+__attribute__(( weak )) void DSV4::indexer( const backend::half_t* q, const backend::half_t* w, const backend::half_t* idx_k, float* scores, uint8_t* cand, int* sel, int* nsel, const float* rope, int ratio, int cap, int cand_mode, int cand_blocks, int cand_block, int rows, const pod::BatchRows* d_rows, size_t idx_slot_stride, bool tensor_cores, backend::stream_t stream ) {
 	ENGINE_UNSUPPORTED( "DSV4::indexer" );
 	__builtin_unreachable();
 }

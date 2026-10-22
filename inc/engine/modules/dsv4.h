@@ -51,12 +51,13 @@ struct DSV4 {
 
 	// Indexer of an index-source layer. q [rows, IDX_HEADS * IDX_DIM] (rope at pos, E2M1 / E8M0-32 grid here), w [rows, IDX_HEADS] (weights_proj x):
 	//   score[t] = (IDX_DIM * IDX_HEADS)^-1/2 * sum_h w[h] relu(q[h] . k[t]),   t < n = (pos + 1) / ratio
+	// tensor_cores: more than MAX_BATCH rows (one slot) are scored on wmma, two rows to a block, sharing the key tile; otherwise the scalar kernel
 	// sel[row][0..nsel) = the TOPK best t (all t when n <= TOPK). cand_mode 1 (the candidate source): before the top-k, cand[row] marks the best
 	// cand_blocks blocks of cand_block entries by their best score (the block holding entry n - 1 always kept); cand_mode 2: scores outside
 	// cand[row] do not compete. scores [SCORE_ROWS, cap] and cand [rows, cap / cand_block] are scratch (rows are scored in blocks of SCORE_ROWS)
 	static void indexer( const backend::half_t* q, const backend::half_t* w, const backend::half_t* idx_k, float* scores, uint8_t* cand, int* sel, int* nsel,
 		const float* rope, int ratio, int cap, int cand_mode, int cand_blocks, int cand_block, int rows, const pod::BatchRows* d_rows, size_t idx_slot_stride,
-		backend::stream_t stream );
+		bool tensor_cores, backend::stream_t stream );
 
 	// Attention of nh heads over the window (positions pos - WINDOW + 1 .. pos of the layer's ring) and, with comp_kv, the selected compressed
 	// entries sel[row][0..nsel). q [rows, nh, HD] unrotated; logits scaled by HD^-1/2, a per-head sink in the denominator; the output is

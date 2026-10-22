@@ -1,8 +1,11 @@
 #include "engine/modules/dsv4.h"
 #include "engine/backend/cuda/reduce.cuh"
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <cmath>
 #include <cfloat>
+
+namespace wmma = nvcuda::wmma;
 
 namespace engine::modules {
 
@@ -247,6 +250,111 @@ void index_score_kernel( const half* __restrict__ q, const half* __restrict__ w,
 		float v = fmaxf( dot, 0.0f ) * ws[lane];
 		v = engine::math::warp_sum( v );
 		if ( lane == 0 ) scores[static_cast<size_t>( blockIdx.x ) * cap + t] = v;
+	}
+}
+
+// ---- indexer scores on tensor cores --------------------------------------------------------------------------------------------------
+// Block = 2 consecutive rows of one slot x a span of IDX_TC_SPAN keys, 8 warps. The rows' queries (rope, E2M1 grid) are prepared once, then the span is
+// walked in tiles of 32 keys. Warp = (row, 16-key half, 16-head half): a 16 x 16 x 128 product on wmma m16n16k16 (fp16 operands, fp32 accumulate: the
+// products are exact as in the scalar kernel, only the sum order differs). The two head halves of a (row, key) meet in shared memory for the ReLU, the
+// head weight and the head sum. The key tile is read once for both rows.
+constexpr int IDX_TC_KEYS = 32;     // keys per tile
+constexpr int IDX_TC_SPAN = 1024;   // keys per block
+constexpr int IDX_TC_LD = DSV4::IDX_DIM + 8;   // shared-memory row stride in halves: 272 bytes, so the fragment loads of 16 rows hit different banks
+
+__global__ __launch_bounds__( 256 )
+void index_score_tc_kernel( const half* __restrict__ q, const half* __restrict__ w, const half* __restrict__ idx_k, float* __restrict__ scores, const uint8_t* __restrict__ cand,
+	int cand_block, const float2* __restrict__ rope, int ratio, int cap, int row0, int nr, const pod::BatchRows* __restrict__ rows, size_t idx_slot_stride ) {
+	constexpr int NH = DSV4::IDX_HEADS, D = DSV4::IDX_DIM;
+	const int lr0 = blockIdx.x * 2, span0 = blockIdx.y * IDX_TC_SPAN;
+	int pos[2] = { 0, 0 }, n[2] = { 0, 0 };
+	bool live[2];
+	int nmax = 0;
+	#pragma unroll
+	for ( int i = 0; i < 2; ++i ) {
+		const bool valid = lr0 + i < nr;
+		if ( valid ) { pos[i] = rows->pos[row0 + lr0 + i]; n[i] = ( pos[i] + 1 ) / ratio; }
+		live[i] = valid && n[i] > DSV4::TOPK && span0 < n[i];   // not a dense row, and the span starts within the visible entries
+		if ( live[i] ) nmax = max( nmax, n[i] );
+	}
+	if ( !live[0] && !live[1] ) return;
+	const int span_end = min( span0 + IDX_TC_SPAN, nmax );
+	__shared__ __align__( 32 ) half sq[2][NH * IDX_TC_LD];
+	__shared__ __align__( 32 ) half kt[IDX_TC_KEYS * IDX_TC_LD];
+	__shared__ __align__( 32 ) float sl[8][16 * 16];
+	__shared__ float ws[2][NH];
+	const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+	// q of both rows: rope on the last ROPE dims, then the E2M1 grid (a power-of-two scale per 32 dims), as halves
+	#pragma unroll
+	for ( int i = 0; i < 2; ++i ) {
+		for ( int h = warp; h < NH; h += 8 ) {
+			float x[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+			const int d0 = lane * 4;
+			if ( live[i] ) {
+				const half* src = q + ( static_cast<size_t>( row0 + lr0 + i ) * NH + h ) * D + d0;
+				#pragma unroll
+				for ( int k = 0; k < 4; ++k ) x[k] = __half2float( src[k] );
+				if ( d0 >= D - ROPE ) {
+					const float2* cs = rope + static_cast<size_t>( pos[i] ) * ( ROPE / 2 ) + ( d0 - ( D - ROPE ) ) / 2;
+					rot( x[0], x[1], cs[0], false );
+					rot( x[2], x[3], cs[1], false );
+				}
+			}
+			float amax = fmaxf( fmaxf( fabsf( x[0] ), fabsf( x[1] ) ), fmaxf( fabsf( x[2] ), fabsf( x[3] ) ) );
+			amax = group_max<8>( amax );   // 32 dims = 8 lanes
+			const float s = e2m1_scale_pow2( amax );
+			#pragma unroll
+			for ( int k = 0; k < 4; ++k ) sq[i][h * IDX_TC_LD + d0 + k] = __float2half_rn( q_e2m1( x[k], s ) );
+		}
+	}
+	if ( tid < 2 * NH ) {
+		const int i = tid / NH, h = tid % NH;
+		ws[i][h] = live[i] ? __half2float( w[static_cast<size_t>( row0 + lr0 + i ) * NH + h] ) * rsqrtf( static_cast<float>( D ) * NH ) : 0.0f;
+	}
+	const half* kbase = idx_k + static_cast<size_t>( rows->slot[row0 + lr0] ) * idx_slot_stride;   // both rows are of one slot
+	const int ri = warp >> 2, nt = ( warp >> 1 ) & 1, slab = warp & 1;
+	for ( int t0 = span0; t0 < span_end; t0 += IDX_TC_KEYS ) {
+		if ( cand != nullptr ) {   // after the candidate source: a tile whose blocks were all dropped is never read
+			bool any = false;
+			#pragma unroll
+			for ( int i = 0; i < 2; ++i ) {
+				if ( !live[i] ) continue;
+				const uint8_t* cm = cand + static_cast<size_t>( row0 + lr0 + i ) * ( cap / cand_block );
+				for ( int b = t0 / cand_block; b < ( t0 + IDX_TC_KEYS ) / cand_block && b * cand_block < n[i]; ++b ) any = any || cm[b];
+			}
+			if ( !any ) continue;
+		}
+		__syncthreads();   // the previous tile's shared memory is free (and the first iteration waits for the query)
+		for ( int i = tid; i < IDX_TC_KEYS * D / 2; i += 256 ) {
+			const int k = i / ( D / 2 ), c = i % ( D / 2 );
+			const int t = t0 + k;
+			reinterpret_cast<half2*>( kt )[k * ( IDX_TC_LD / 2 ) + c] = t < nmax ? reinterpret_cast<const half2*>( kbase + static_cast<size_t>( t ) * D )[c] : __float2half2_rn( 0.0f );
+		}
+		__syncthreads();
+		wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+		wmma::fill_fragment( acc, 0.0f );
+		#pragma unroll
+		for ( int k = 0; k < D; k += 16 ) {
+			wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> fb;
+			wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
+			wmma::load_matrix_sync( fb, kt + nt * 16 * IDX_TC_LD + k, IDX_TC_LD );
+			wmma::load_matrix_sync( fa, sq[ri] + slab * 16 * IDX_TC_LD + k, IDX_TC_LD );
+			wmma::mma_sync( acc, fa, fb, acc );
+		}
+		wmma::store_matrix_sync( sl[warp], acc, 16, wmma::mem_row_major );
+		__syncthreads();
+		if ( tid < 64 ) {
+			const int i = tid >> 5, tt = ( tid >> 4 ) & 1, kk = tid & 15;
+			const int wa = i * 4 + tt * 2;   // the two head halves of this (row, key half)
+			float v = 0.0f;
+			#pragma unroll
+			for ( int h = 0; h < 16; ++h ) {
+				v = fmaf( fmaxf( sl[wa][h * 16 + kk], 0.0f ), ws[i][h], v );
+				v = fmaf( fmaxf( sl[wa + 1][h * 16 + kk], 0.0f ), ws[i][16 + h], v );
+			}
+			const int t = t0 + tt * 16 + kk;
+			if ( live[i] && t < n[i] ) scores[static_cast<size_t>( lr0 + i ) * cap + t] = v;
+		}
 	}
 }
 
@@ -774,13 +882,22 @@ void DSV4::index_key_store( const half* kraw, const half* knorm_w, half* idx_k, 
 }
 
 void DSV4::indexer( const half* q, const half* w, const half* idx_k, float* scores, uint8_t* cand, int* sel, int* nsel, const float* rope_f, int ratio, int cap,
-	int cand_mode, int cand_blocks, int cand_block, int rows, const pod::BatchRows* d_rows, size_t idx_slot_stride, cudaStream_t stream ) {
+	int cand_mode, int cand_blocks, int cand_block, int rows, const pod::BatchRows* d_rows, size_t idx_slot_stride, bool tensor_cores, cudaStream_t stream ) {
+	// the tensor-core scorer pairs consecutive rows of one slot: prefill chunks (decode blocks may mix slots and are a few rows anyway)
+	const bool tc = tensor_cores && rows > pod::MAX_BATCH;
 	// blocks of SCORE_ROWS rows share the score buffer
 	for ( int row0 = 0; row0 < rows; row0 += SCORE_ROWS ) {
 		const int nr = rows - row0 < SCORE_ROWS ? rows - row0 : SCORE_ROWS;
-		const dim3 grid( nr, ( cap + IDX_TILE - 1 ) / IDX_TILE );
-		index_score_kernel<<<grid, 256, 0, stream>>>( q, w, idx_k, scores, cand_mode == 2 ? cand : nullptr, cand_block, reinterpret_cast<const float2*>( rope_f ), ratio, cap, row0,
-			d_rows, idx_slot_stride );
+		if ( tc ) {
+			const dim3 grid( ( nr + 1 ) / 2, ( cap + IDX_TC_SPAN - 1 ) / IDX_TC_SPAN );
+			index_score_tc_kernel<<<grid, 256, 0, stream>>>( q, w, idx_k, scores, cand_mode == 2 ? cand : nullptr, cand_block, reinterpret_cast<const float2*>( rope_f ), ratio, cap, row0, nr,
+				d_rows, idx_slot_stride );
+		}
+		else {
+			const dim3 grid( nr, ( cap + IDX_TILE - 1 ) / IDX_TILE );
+			index_score_kernel<<<grid, 256, 0, stream>>>( q, w, idx_k, scores, cand_mode == 2 ? cand : nullptr, cand_block, reinterpret_cast<const float2*>( rope_f ), ratio, cap, row0,
+				d_rows, idx_slot_stride );
+		}
 		index_select_kernel<<<nr, 1024, 0, stream>>>( scores, cand, sel, nsel, ratio, cap, cand_mode, cand_blocks, cand_block, row0, d_rows );
 	}
 }

@@ -1272,7 +1272,7 @@ void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int
 			Linear::forward( norm_x_, lw.idx_wproj, wi_, stream );
 			const int cand_mode = layer == config_.candidate_source ? 1 : layer > config_.candidate_source ? 2 : 0;
 			DSV4::indexer( qi_.ptr<const backend::half_t>(), wi_.ptr<const backend::half_t>(), idx_k_[s], idx_scores_, idx_cand_, idx_sel_, idx_nsel_, rope, lw.ratio, src_cap_[s],
-				cand_mode, config_.candidate_blocks, config_.candidate_block, m, d_rows_, idx_slot_stride_[s], stream );
+				cand_mode, config_.candidate_blocks, config_.candidate_block, m, d_rows_, idx_slot_stride_[s], runtime::options().indexer_tc, stream );
 		}
 		comp = comp_kv_[s];
 	}
