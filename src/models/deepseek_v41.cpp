@@ -1310,7 +1310,7 @@ void DeepseekV41Pipeline::ffn_front( DeepseekV41LayerWeights& lw, int m, backend
 	DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], lw.ffn_norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), mhc_post_.ptr<float>(),
 		kOutScale, H, config_.norm_eps, m, stream );
 	pre_cur_ ^= 1;
-	DSV4::route( norm_x_.ptr<const backend::half_t>(), lw.router_w_t.ptr<const backend::half_t>(), lw.router_bias.ptr<const float>(), lw.router_bias_vl.data ? lw.router_bias_vl.ptr<const float>() : nullptr, d_img_flag_, lw.perm, d_topk_idx_, d_topk_w_, route_scratch_,
+	DSV4::route( norm_x_.ptr<const backend::half_t>(), lw.router_w_t.ptr<const backend::half_t>(), lw.router_bias.ptr<const float>(), lw.router_bias_vl.data ? lw.router_bias_vl.ptr<const float>() : nullptr, experts > 0 ? nullptr : d_img_flag_, lw.perm, d_topk_idx_, d_topk_w_, route_scratch_,
 		H, experts > 0 ? experts : config_.num_experts, top_k > 0 ? top_k : config_.top_k, config_.route_scale, m, stream );
 }
 

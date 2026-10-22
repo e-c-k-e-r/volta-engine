@@ -676,7 +676,7 @@ void route_select_kernel( const float* __restrict__ part, const float* __restric
 		for ( int k = 0; k < ROUTE_SPLITS; ++k ) acc += part[( static_cast<size_t>( r ) * ROUTE_SPLITS + k ) * experts + e];
 		const float sp = acc > 20.0f ? acc : log1pf( expf( acc ) );
 		s = sqrtf( sp );
-		b = s + ( ( img_flags != nullptr && img_flags[r] ) ? bias_vl[e] : bias[e] );
+		b = s + ( ( img_flags != nullptr && bias_vl != nullptr && img_flags[r] ) ? bias_vl[e] : bias[e] );
 	}
 	__shared__ int chosen[16];
 	__shared__ float chosen_s[16];
