@@ -728,13 +728,13 @@ pod::MoEScratch MoE::alloc_scratch(
 }
 
 bool MoE::fused_decode( const pod::MoELayerWeights& weights, const pod::MoEScratch& scratch, int rows ) {
-	const int ebits = weights.gate[0].bits;
+	const int ebits = weights.bits_dev ? weights.bits_max : weights.gate[0].bits;
 	if ( weights.type == pod::QuantType::NVFP4 ) return true;   // no trellis workspace
 #if defined(USE_ROCM)
 	const bool bits_ok = ebits >= 1 && ebits <= 8;   // the ROCm launch (exl3_moe.cu) takes any width
 #else
 	auto bok = []( int b ) { return b >= 1 && b <= 4; };
-	const bool bits_ok = bok( ebits ) && bok( weights.up[0].bits ) && bok( weights.down[0].bits );
+	const bool bits_ok = weights.bits_dev ? bok( weights.bits_max ) : ( bok( ebits ) && bok( weights.up[0].bits ) && bok( weights.down[0].bits ) );
 #endif
 #if defined(USE_ROCM)
 	const bool rows_ok = true;   // blocks of MOE_COOP_MAX_ROWS rows
@@ -804,7 +804,9 @@ void MoE::forward(
 		p.I = weights.up[0].w2.shape[0];
 		p.topk = weights.top_k;
 		p.bits = ebits;
-		p.bits_g = ebits; p.bits_u = weights.up[0].bits; p.bits_d = weights.down[0].bits;
+		p.bits_g = ebits; p.bits_u = weights.bits_dev ? ebits : weights.up[0].bits; p.bits_d = weights.bits_dev ? ebits : weights.down[0].bits;
+		p.bits_tab = weights.bits_dev;
+		p.num_local = E;
 		p.act_limit = act_limit;
 		p.g_trellis = reinterpret_cast<const uint16_t* const*>( d_ptrs + 0 * E );
 		p.g_suh = reinterpret_cast<const half* const*>( d_ptrs + 1 * E );
@@ -854,9 +856,9 @@ void MoE::forward(
 	switch ( weights.type ) {
 		case pod::QuantType::TRELLIS: {
 			const int E = weights.num_local_experts;
-			const int K_gate = weights.gate[0].bits;
-			const int K_up = weights.up[0].bits;
-			const int K_down = weights.down[0].bits;
+			const int K_gate = weights.bits_dev ? weights.bits_max : weights.gate[0].bits;   // the widest when the widths are per expert
+			const int K_up = weights.bits_dev ? weights.bits_max : weights.up[0].bits;
+			const int K_down = weights.bits_dev ? weights.bits_max : weights.down[0].bits;
 			ENGINE_ASSERT( weights.device_ptrs != nullptr, "MoE::forward: init_device_ptrs not called" );
 			ENGINE_ASSERT( K_gate >= 1 && K_gate <= 5 && K_up >= 1 && K_up <= 5 && K_down >= 1 && K_down <= 5, "MoE::forward: persistent trellis MoE kernel is instantiated for 1 to 5-bit experts" );
 
@@ -916,7 +918,8 @@ void MoE::forward(
 				weights.up[0].w2.shape[0],      // this rank's intermediate width: the length of svh (2048, or 512 when sharded)
 				E,
 				stream,
-				weights.top_k
+				weights.top_k,
+				weights.bits_dev
 			);
 			if ( num_groups > 1 ) {
 				if ( plane_elems % 8 == 0 && num_groups <= MOE_MAX_GROUPS ) {
@@ -986,7 +989,8 @@ void exl3_moe(
 	int intermediate_dim,
 	int num_experts,
 	cudaStream_t stream,
-	int top_k
+	int top_k,
+	const uint8_t* bits_tab
 ) {
 	(void) gate_mcg; (void) gate_mul1; (void) up_mcg; (void) up_mul1; (void) down_mcg; (void) down_mul1;
 	(void) num_active;
@@ -1043,13 +1047,14 @@ void exl3_moe(
 		(void*) &K_down,
 		(void*) &locks,
 		(void*) &active_experts,
-		(void*) &out_plane_stride
+		(void*) &out_plane_stride,
+		(void*) &bits_tab
 	};
 
 	// 3-bit experts with a 256-divisible intermediate width (GLM) run 256-wide output tiles; every other shape (4-bit experts, and
 	// 3-bit ones with Flash-Next's intermediate 640) takes the 128-wide tiles
 	ENGINE_ASSERT( K_gate >= 1 && K_gate <= 5 && K_up >= 1 && K_up <= 5 && K_down >= 1 && K_down <= 5, "exl3_moe: expert bits" );
-	const bool mixed = K_gate != K_up || K_up != K_down;   // the projections of the experts differ in width: one kernel that picks each GEMM's instantiation at run time
+	const bool mixed = bits_tab != nullptr || K_gate != K_up || K_up != K_down;   // the projections of the experts differ in width: one kernel that picks each GEMM's instantiation at run time
 	const int K_max = MAX( K_gate, MAX( K_up, K_down ) );
 	const bool tile128 = mixed || K_gate != 3 || intermediate_dim % 256 != 0;
 	ENGINE_ASSERT( intermediate_dim % ( tile128 ? 128 : 256 ) == 0, "exl3_moe: intermediate width vs the output tile" );

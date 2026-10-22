@@ -118,20 +118,15 @@ int main() {
 	CUDA_CHECK( cudaMemcpy( d_idx, h_idx, sizeof( h_idx ), cudaMemcpyHostToDevice ) );
 	CUDA_CHECK( cudaMemcpy( d_w, h_w.data(), K * sizeof( half ), cudaMemcpyHostToDevice ) );
 
-	// 1-bit projections have no fused or tiled GEMM kernel: the reference dequantizes them and multiplies with cuBLAS
-	auto ref_linear = [&]( const pod::TensorView& in, const pod::LinearWeight& w, pod::TensorView& o ) {
-		if ( w.bits == 1 ) engine::modules::LinearTrellis::forward_recon( in, w.w0, w.w1, w.w2, o, w.bits, w.mcg, w.mul1, stream );
-		else engine::modules::Linear::forward( in, w, o, stream );
-	};
 	// Reference: per-expert Linear path (the validated pre-refactor decode path)
 	CUDA_CHECK( cudaMemset( ref.data, 0, ref.size_bytes() ) );
 	for ( int k = 0; k < K; ++k ) {
 		if ( h_idx[k] >= E ) continue;
 		const int e = h_idx[k];
-		ref_linear( x, mw.gate[e], g );
-		ref_linear( x, mw.up[e], u );
+		engine::modules::Linear::forward( x, mw.gate[e], g, stream );
+		engine::modules::Linear::forward( x, mw.up[e], u, stream );
 		engine::modules::SwiGLU::forward( g, u, inter, stream, 10.0f );
-		ref_linear( inter, mw.down[e], eo );
+		engine::modules::Linear::forward( inter, mw.down[e], eo, stream );
 		engine::modules::MoERouter::accumulate( ref.ptr<half>(), eo.ptr<const half>(), h_w[k], H, stream );
 	}
 

@@ -40,6 +40,8 @@ struct MoeCoopParams {
 	int topk;
 	int bits;                           // 1 to 4 bits per weight
 	int bits_g, bits_u, bits_d;         // per projection when the experts' widths differ (all three set, tensor-core tile only); else 0
+	const uint8_t* bits_tab;            // or per expert: [gate | up | down][num_local] widths (null: the three above)
+	int num_local;
 	float act_limit;
 	const uint16_t* const* g_trellis; const half* const* g_suh; const half* const* g_svh;
 	const uint16_t* const* u_trellis; const half* const* u_suh; const half* const* u_svh;

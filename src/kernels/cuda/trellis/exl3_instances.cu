@@ -9,7 +9,8 @@ namespace cg = cooperative_groups;
 #include "exl3_kernel_map.cuh"
 #include "exl3_mgemm_gv_kernel.cuh"
 
-// Stub out the unused bitwidth 1 to avoid hundreds of unused template instantiations (7 and 8 are real: Flash-Next ships 8 bpw projections)
+// Stub out bitwidth 1 for the 3inst and mcg codebooks to avoid hundreds of unused template instantiations (1 bit with mul1 is real: the
+// DeepSeek-V4.1 SAGE packs have 1-bit experts; 7 and 8 are real too: Flash-Next ships 8 bpw projections)
 #define STUB_K(K) \
 	fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K##_cb0[5] = {}; \
 	fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K##_cb0[5] = {}; \
@@ -18,11 +19,7 @@ namespace cg = cooperative_groups;
 	fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K##_cb1[5] = {}; \
 	fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K##_cb1[5] = {}; \
 	fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K##_cb1[5] = {}; \
-	fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K##_cb1[5] = {}; \
-	fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K##_cb2[5] = {}; \
-	fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K##_cb2[5] = {}; \
-	fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K##_cb2[5] = {}; \
-	fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K##_cb2[5] = {};
+	fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K##_cb1[5] = {};
 
 STUB_K(1)
 #undef STUB_K
@@ -46,6 +43,12 @@ STUB_CB(2)
 #endif
 #undef STUB_CB
 #undef STUB_KCB
+#if defined(EXL3_CB_BUILT_2) && !EXL3_CB_BUILT_2
+fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b1_cb2[5] = {};
+fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b1_cb2[5] = {};
+fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b1_cb2[5] = {};
+fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b1_cb2[5] = {};
+#endif
 
 // Instantiations for SM70 m=1 GEMV-class mgemm restructure (exl3_mgemm_gv_kernel)
 template __global__ void exl3_mgemm_gv_kernel<2, false, 0, false>( EXL3_MGEMM_ARGS );

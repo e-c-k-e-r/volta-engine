@@ -1020,6 +1020,45 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			lw.groups.push_back( std::move( g ) );
 			j = k;
 		}
+		// experts whose widths differ: one launch over all of the rank's experts, each expert's widths in a table
+		if ( !expert_tp_ && lw.groups.size() > 1 && runtime::options().merge_expert_groups ) {
+			bool mixed = false;
+			int bmax = 0;
+			for ( auto& g : lw.groups ) {
+				const int kg = g.bits & 15, ku = ( g.bits >> 4 ) & 15, kd = ( g.bits >> 8 ) & 15;
+				mixed = mixed || kg != ku || ku != kd;
+				bmax = std::max( bmax, std::max( kg, std::max( ku, kd ) ) );
+			}
+			if ( mixed && bmax <= 5 ) {
+				int total = 0;
+				for ( auto& g : lw.groups ) total += g.count;
+				auto m = std::make_unique<pod::MoELayerWeights>();
+				m->type = pod::QuantType::TRELLIS;
+				m->num_local_experts = total;
+				m->top_k = config_.top_k;
+				std::vector<uint8_t> tab( 3 * static_cast<size_t>( total ) );
+				int off = 0;
+				for ( auto& g : lw.groups ) {
+					for ( int i = 0; i < g.count; ++i ) {
+						m->gate[off + i] = g.mw->gate[i];
+						m->up[off + i] = g.mw->up[i];
+						m->down[off + i] = g.mw->down[i];
+						tab[off + i] = static_cast<uint8_t>( g.bits & 15 );
+						tab[total + off + i] = static_cast<uint8_t>( ( g.bits >> 4 ) & 15 );
+						tab[2 * total + off + i] = static_cast<uint8_t>( ( g.bits >> 8 ) & 15 );
+					}
+					off += g.count;
+				}
+				engine::modules::MoE::init_device_ptrs( *m, arena, stream );
+				m->heat = dev_alloc<uint32_t>( arena, total );
+				off = 0;
+				for ( auto& g : lw.groups ) { g.mw->heat = m->heat + off; off += g.count; }   // the groups' counters are slices of the layer's
+				m->bits_dev = dev_alloc<uint8_t>( arena, tab.size(), false );
+				backend::memcpy_sync( m->bits_dev, tab.data(), tab.size(), backend::Copy::H2D );
+				m->bits_max = bmax;
+				lw.merged = std::move( m );
+			}
+		}
 	}
 	if ( rank_ == 0 || missing > 0 ) {
 		constexpr double G = 1073741824.0;
@@ -1123,6 +1162,12 @@ bool DeepseekV41Pipeline::rebalance_experts( backend::stream_t stream ) {
 					void* nh = dev; void* nc = set[p][cool].w0.data;
 					backend::memcpy_sync( table + static_cast<size_t>( 3 * p ) * g.count + hot, &nh, sizeof( void* ), backend::Copy::H2D );
 					backend::memcpy_sync( table + static_cast<size_t>( 3 * p ) * g.count + cool, &nc, sizeof( void* ), backend::Copy::H2D );
+					if ( layers_[l].merged ) {   // the layer's table follows
+						void** mt = static_cast<void**>( layers_[l].merged->device_ptrs );
+						const size_t total = layers_[l].merged->num_local_experts, off = g.first - first0;
+						backend::memcpy_sync( mt + static_cast<size_t>( 3 * p ) * total + off + hot, &nh, sizeof( void* ), backend::Copy::H2D );
+						backend::memcpy_sync( mt + static_cast<size_t>( 3 * p ) * total + off + cool, &nc, sizeof( void* ), backend::Copy::H2D );
+					}
 				}
 				g.resident[hot] = 1;
 				g.resident[cool] = 0;
@@ -1651,6 +1696,10 @@ void DeepseekV41Pipeline::ffn_front( DeepseekV41LayerWeights& lw, int m, backend
 
 void DeepseekV41Pipeline::ffn_experts( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size;
+	if ( lw.merged ) {
+		engine::modules::MoE::forward( norm_x_, *lw.merged, d_topk_idx_, d_topk_w_, moe_out_, lw.groups[0].first, lw.groups[0].first + lw.merged->num_local_experts, moe_scratch_, config_.swiglu_limit, stream );
+		return;
+	}
 	bool first = true;
 	for ( auto& g : lw.groups ) {
 		pod::TensorView& out = first ? moe_out_ : moe_tmp_;

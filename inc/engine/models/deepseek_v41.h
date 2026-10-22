@@ -89,6 +89,9 @@ struct DeepseekV41LayerWeights {
 	pod::TensorView router_w_t, router_bias, router_bias_vl;   // bias_vl: the router bias of image tokens
 	int* perm = nullptr;
 	std::vector<DeepseekV41ExpertGroup> groups;
+	// Mixed-width packs: every expert of the rank in one table (widths per expert), so a layer is one MoE launch instead of one per width signature;
+	// the groups keep the storage (swaps, heat slices)
+	std::unique_ptr<pod::MoELayerWeights> merged;
 	pod::LinearWeight sh_gate, sh_up, sh_down;     // rank 0
 	// engram
 	pod::LinearWeight e_wkv;

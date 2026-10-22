@@ -263,8 +263,8 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
 					hidden_dim, warp_idx0, warps_per_group, group_idx, group_size, barrier_counters_sense
 				);
 
-				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( K_gate, temp_state_g, exp_gate_trellis, temp_intermediate_g, rows, hidden_dim, intermediate_dim, locks );
-				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( K_up, temp_state_u, exp_up_trellis, temp_intermediate_u, rows, hidden_dim, intermediate_dim, locks );
+				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( bits_tab ? bits_tab[expert_idx] : K_gate, temp_state_g, exp_gate_trellis, temp_intermediate_g, rows, hidden_dim, intermediate_dim, locks );
+				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( bits_tab ? bits_tab[num_experts + expert_idx] : K_up, temp_state_u, exp_up_trellis, temp_intermediate_u, rows, hidden_dim, intermediate_dim, locks );
 			}
 			else {
 				moe_gather_gu_in<false>(
@@ -273,7 +273,7 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
 					hidden_dim, warp_idx0, warps_per_group, group_idx, group_size, barrier_counters_sense
 				);
 
-				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( K_up, temp_state_u, exp_up_trellis, temp_intermediate_u, rows, hidden_dim, intermediate_dim, locks );
+				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( bits_tab ? bits_tab[num_experts + expert_idx] : K_up, temp_state_u, exp_up_trellis, temp_intermediate_u, rows, hidden_dim, intermediate_dim, locks );
 			}
 			group_barrier( group_idx, group_size, barrier_counters_sense );
 
@@ -284,7 +284,7 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
 				warp_idx0, warps_per_group, group_idx, group_size, barrier_counters_sense
 			);
 
-			moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( K_down, temp_intermediate_g, exp_down_trellis, temp_state_g, rows, intermediate_dim, hidden_dim, locks );
+			moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( bits_tab ? bits_tab[2 * num_experts + expert_idx] : K_down, temp_intermediate_g, exp_down_trellis, temp_state_g, rows, intermediate_dim, hidden_dim, locks );
 			group_barrier( group_idx, group_size, barrier_counters_sense );
 
 			moe_had_d_out( temp_state_g, output_state, exp_down_svh, rows, top_x, weights, hidden_dim, warp_idx0, warps_per_group );

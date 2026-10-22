@@ -841,7 +841,7 @@ void a_kernel( const MoeCoopParams p ) {
 			}
 		}
 		if constexpr ( BITS_ == 0 ) {
-			gemv_tile_dyn<cb, WN_>( is_gate ? p.bits_g : p.bits_u, B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red );
+			gemv_tile_dyn<cb, WN_>( p.bits_tab ? static_cast<int>( p.bits_tab[( is_gate ? 0 : p.num_local ) + local] ) : ( is_gate ? p.bits_g : p.bits_u ), B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red );
 		}
 		else if constexpr ( MODE == 0 || MODE == 3 || BITS_ != 3 ) {
 			if ( !done ) gemv_tile<BITS_, cb, WN_>( B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red );
@@ -932,7 +932,7 @@ void b_kernel( const MoeCoopParams p ) {
 			}
 		}
 		if constexpr ( BITS_ == 0 ) {
-			gemv_tile_dyn<cb, WN_>( p.bits_d, B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
+			gemv_tile_dyn<cb, WN_>( p.bits_tab ? static_cast<int>( p.bits_tab[2 * p.num_local + local] ) : p.bits_d, B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
 				0, p.I / 16, p.H / 16, group, sh_red );
 		}
 		else if constexpr ( MODE == 0 || MODE == 3 || BITS_ != 3 ) {
@@ -1015,7 +1015,7 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	using namespace exl3_moe_coop_ns;
 	MoeCoopParams p = p_in;
 	const int slots = p.bsz * p.topk;
-	ENGINE_ASSERT( p.topk >= 1 && p.topk <= MOE_COOP_TOPK && p.bsz >= 1 && p.bsz <= MOE_COOP_MAX_ROWS && ( p.bits >= 1 && p.bits <= 4 ) && ( p.bits_g == 0 || ( p.bits_g >= 1 && p.bits_g <= 4 && p.bits_u >= 1 && p.bits_u <= 4 && p.bits_d >= 1 && p.bits_d <= 4 ) ), "exl3_moe_coop: row count / topk / bits" );
+	ENGINE_ASSERT( p.topk >= 1 && p.topk <= MOE_COOP_TOPK && p.bsz >= 1 && p.bsz <= MOE_COOP_MAX_ROWS && ( p.bits_tab != nullptr || ( p.bits >= 1 && p.bits <= 4 ) ) && ( p.bits_g == 0 || ( p.bits_g >= 1 && p.bits_g <= 4 && p.bits_u >= 1 && p.bits_u <= 4 && p.bits_d >= 1 && p.bits_d <= 4 ) ), "exl3_moe_coop: row count / topk / bits" );
 	ENGINE_ASSERT( p.H % 128 == 0 && p.I % 128 == 0, "exl3_moe_coop: widths" );
 	p.a_global = p.bsz > 1;
 	p.ctr_a_len = MOE_COOP_MAX_SLOTS * ( p.I / 128 );
@@ -1041,7 +1041,7 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 
 	// Tile: 1 int8 dp4a for one-row decode; with more rows 3 = dp4a for runs of up to 4 rows and fp16 tensor core above
 	// (dp4a on wider runs re-reads the weights in 4-row passes and loses to the tensor core there)
-	const bool mixed = p.bits_g != 0 && ( p.bits_g != p.bits_u || p.bits_u != p.bits_d );
+	const bool mixed = p.bits_tab != nullptr || ( p.bits_g != 0 && ( p.bits_g != p.bits_u || p.bits_u != p.bits_d ) );
 	const int mode = mixed || p.bits != 3 ? 0 : ( p.bsz == 1 ? 1 : 3 );
 	const int stage_rows = mode == 1 ? 1 : ( mode >= 2 ? 4 : 0 );
 	// int8 activation staging: 2 x 16 B per k-tile per k-slab

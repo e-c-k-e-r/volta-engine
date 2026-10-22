@@ -22,6 +22,10 @@ struct MoELayerWeights {
 	void* device_ptrs = nullptr;
 	void* staged_ptrs = nullptr;       // tier (trellis or NVFP4): a table of the same layout whose cold experts point at device scratch; set by ExpertTier for the length of a prefill layer
 	uint32_t* heat = nullptr;          // [num_local_experts] routes per expert since the last reset (device), optional
+	// Trellis experts whose widths differ (DeepSeek-V4.1 mixed-width packs): a device table [gate | up | down][num_local_experts] of each expert's
+	// width per projection, and the widest; the kernels then pick each projection's instantiation per expert. Null: gate[0].bits etc. hold for all
+	uint8_t* bits_dev = nullptr;
+	int bits_max = 0;
 };
 
 // Device scratch for one MoE dispatch (single token, top_k routes). Allocated once at init.
@@ -199,7 +203,8 @@ void exl3_moe(
 	int intermediate_dim,           // this rank's width of the expert intermediate
 	int num_experts,
 	engine::backend::stream_t stream = nullptr,
-	int top_k = 8                   // routes per token (the kernel argument num_experts_per_tok)
+	int top_k = 8,                  // routes per token (the kernel argument num_experts_per_tok)
+	const uint8_t* bits_tab = nullptr   // per-expert widths [gate | up | down][num_experts] (the K arguments then give the widest); null: K_gate / K_up / K_down for all
 );
 
 } // namespace ext

@@ -269,7 +269,7 @@ int main( int argc, char** argv ) {
 	bool ok = engine::core::arena_create( arena, dev, arena_bytes );
 	ENGINE_ASSERT( ok, "Failed to create static arena" );
 
-	// Sweep across 2 .. 8 bpw (the M <= 8 GEMV kernels exist for 2 .. 6; 1, 7 and 8 take the GEMM kernel)
+	// Sweep across 2 .. 8 bpw (the M <= 8 GEMV kernels exist for 2 .. 6; 1, 7 and 8 take the GEMM kernel; 1 bit is built for the mul1 codebook only)
 	int bit_widths[] = { 2, 3, 4, 5, 6, 7, 8 };
 	for ( int K : bit_widths ) {
 		bool mcg = ( K != 4 );
@@ -286,10 +286,12 @@ int main( int argc, char** argv ) {
 	run_parity_test_k( 4, false, 3, 4096, 1024, arena, stream );
 	run_parity_test_k( 6, true, 7, 2048, 1024, arena, stream );
 	// Multiplier codebook (cb 2): what the Flash-Next 7 / 8 bpw projections use
-	for ( int K : { 5, 7, 8 } ) {
+	for ( int K : { 1, 5, 7, 8 } ) {   // 1 bit exists with this codebook only (the DeepSeek-V4.1 SAGE packs' experts)
 		run_parity_test_k( K, false, 4, 512, 512, arena, stream, true );
 		run_parity_test_k( K, false, 16, 512, 1024, arena, stream, true );
 	}
+	run_parity_test_k( 1, false, 1, 4096, 2304, arena, stream, true );
+	run_parity_test_k( 1, false, 40, 2304, 5120, arena, stream, true );
 
 	CUDA_CHECK( cudaStreamDestroy( stream ) );
 
