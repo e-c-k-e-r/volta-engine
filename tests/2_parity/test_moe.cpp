@@ -21,6 +21,9 @@ int main() {
 	const bool flash = std::getenv( "MOE_FLASH" ) != nullptr;
 	const bool dsv41 = std::getenv( "MOE_DSV41" ) != nullptr;
 	const int EBITS = std::getenv( "MOE_BITS" ) ? std::atoi( std::getenv( "MOE_BITS" ) ) : 4;
+	// MOE_SIG=g,u,d (with MOE_DSV41): experts whose gate / up / down projections have those widths (the mixed-width packs), instead of MOE_BITS for all three
+	int sig[3] = { EBITS, EBITS, EBITS };
+	if ( const char* sg = std::getenv( "MOE_SIG" ) ) std::sscanf( sg, "%d,%d,%d", &sig[0], &sig[1], &sig[2] );
 	const char* dir = dsv41 ? engine::runtime::test::model_path( "DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw", "ENGINE_TEST_DSV41_DIR" )
 		: flash ? engine::runtime::test::model_path( "Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", "ENGINE_TEST_FLASH_DIR" ) : engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw", "ENGINE_TEST_GLM_DIR" );
 	const int H = dsv41 ? 5120 : flash ? 2560 : 4096, I = dsv41 ? 2304 : flash ? 640 : 2048, K = dsv41 ? 6 : flash ? 10 : 8;
@@ -47,16 +50,21 @@ int main() {
 		for ( int l = 0; l < 40; ++l ) {
 			std::vector<int> ids;
 			for ( int e = 0; e < 384; ++e ) {
-				std::snprintf( name, sizeof( name ), "layers.%d.ffn.experts.%d.w1.trellis", l, e );
-				const auto* m = repo.find( name );
-				if ( m != nullptr && m->shape[2] / 16 == EBITS && ids.size() < 96 ) ids.push_back( e );
+				bool ok = true;
+				const char* const ws[3] = { "w1", "w3", "w2" };
+				for ( int q = 0; q < 3; ++q ) {
+					std::snprintf( name, sizeof( name ), "layers.%d.ffn.experts.%d.%s.trellis", l, e, ws[q] );
+					const auto* m = repo.find( name );
+					ok = ok && m != nullptr && m->shape[2] / 16 == sig[q];
+				}
+				if ( ok && ids.size() < 96 ) ids.push_back( e );
 			}
 			if ( ids.size() > best ) { best = ids.size(); dsv_ids = ids; L = l; }
 		}
 		ENGINE_ASSERT( !dsv_ids.empty(), "test_moe: no expert of that width" );
 		E = static_cast<int>( dsv_ids.size() );
 		mw.num_local_experts = E;
-		std::printf( "[*] DeepSeek-V4.1: %d experts of %d bits in layer %d\n", E, EBITS, L );
+		std::printf( "[*] DeepSeek-V4.1: %d experts of %d/%d/%d bits in layer %d\n", E, sig[0], sig[1], sig[2], L );
 	}
 	for ( int e = 0; e < E; ++e ) {
 		if ( dsv41 ) {
@@ -64,7 +72,7 @@ int main() {
 			pod::LinearWeight* dst[3] = { &mw.gate[e], &mw.up[e], &mw.down[e] };
 			for ( int p = 0; p < 3; ++p ) {
 				std::snprintf( name, sizeof( name ), "layers.%d.ffn.experts.%d.%s", L, dsv_ids[e], parts[p] );
-				*dst[p] = repo.load_linear( name, arena, EBITS, stream );
+				*dst[p] = repo.load_linear( name, arena, sig[p], stream );
 			}
 			continue;
 		}
@@ -110,15 +118,20 @@ int main() {
 	CUDA_CHECK( cudaMemcpy( d_idx, h_idx, sizeof( h_idx ), cudaMemcpyHostToDevice ) );
 	CUDA_CHECK( cudaMemcpy( d_w, h_w.data(), K * sizeof( half ), cudaMemcpyHostToDevice ) );
 
+	// 1-bit projections have no fused or tiled GEMM kernel: the reference dequantizes them and multiplies with cuBLAS
+	auto ref_linear = [&]( const pod::TensorView& in, const pod::LinearWeight& w, pod::TensorView& o ) {
+		if ( w.bits == 1 ) engine::modules::LinearTrellis::forward_recon( in, w.w0, w.w1, w.w2, o, w.bits, w.mcg, w.mul1, stream );
+		else engine::modules::Linear::forward( in, w, o, stream );
+	};
 	// Reference: per-expert Linear path (the validated pre-refactor decode path)
 	CUDA_CHECK( cudaMemset( ref.data, 0, ref.size_bytes() ) );
 	for ( int k = 0; k < K; ++k ) {
 		if ( h_idx[k] >= E ) continue;
 		const int e = h_idx[k];
-		engine::modules::Linear::forward( x, mw.gate[e], g, stream );
-		engine::modules::Linear::forward( x, mw.up[e], u, stream );
+		ref_linear( x, mw.gate[e], g );
+		ref_linear( x, mw.up[e], u );
 		engine::modules::SwiGLU::forward( g, u, inter, stream, 10.0f );
-		engine::modules::Linear::forward( inter, mw.down[e], eo, stream );
+		ref_linear( inter, mw.down[e], eo );
 		engine::modules::MoERouter::accumulate( ref.ptr<half>(), eo.ptr<const half>(), h_w[k], H, stream );
 	}
 

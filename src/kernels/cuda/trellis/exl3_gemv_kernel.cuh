@@ -269,6 +269,23 @@ __device__ __forceinline__ void dq8_regs_3bits(uint32_t a, uint32_t b, int s2, F
                 w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
 }
 
+// The 3-bit form for any width whose eight windows fit two words (1 to 6 bits): s2 and the source words from the tile geometry of the width
+template <int cb, int bits>
+__device__ __forceinline__ void dq8_regs_kbits(uint32_t a, uint32_t b, int s2, FragB& f0, FragB& f1)
+{
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    w7 = fshift(b, a, s2);
+    w6 = w7 >> bits;
+    w5 = w6 >> bits;
+    w4 = w5 >> bits;
+    w3 = fshift(b, a, s2 + 4 * bits);
+    w2 = w3 >> bits;
+    w1 = w2 >> bits;
+    w0 = w1 >> bits;
+    decode8<cb>(w0 & 0xffff, w1 & 0xffff, w2 & 0xffff, w3 & 0xffff,
+                w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
+}
+
 }  // namespace exl3_gemv_ns
 
 inline __device__ uint4 ld_cs_v4(const uint4* ptr)

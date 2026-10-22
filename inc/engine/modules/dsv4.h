@@ -104,6 +104,10 @@ struct DSV4 {
 	//   s[h] += gate * value
 	static void engram_gate( float* streams, const backend::half_t* kv, const float* w, int hidden, float eps, int rows, backend::stream_t stream );
 
+	// out [m, n] = x [m, k] * w^T for an FP8 E4M3 weight w [n, k] with E8M0 scales per 32 x 32 block (value = fp8 * 2^(e - 127)), FP32 accumulation:
+	// up to 16 rows read the FP8 bytes directly; more rows dequantize w into scratch (n * k halves) for the dense GEMM
+	static void linear_fp8( const backend::half_t* x, const uint8_t* w, const uint8_t* scales, backend::half_t* out, int m, int n, int k, backend::half_t* scratch, backend::stream_t stream );
+
 };
 
 } // namespace engine::modules

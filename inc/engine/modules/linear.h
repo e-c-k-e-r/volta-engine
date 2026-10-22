@@ -12,7 +12,8 @@ namespace pod {
 enum class QuantType : uint8_t {
 	FP16,
 	TRELLIS,
-	NVFP4
+	NVFP4,
+	FP8      // the original block-scaled weight, applied by DSV4::linear_fp8 (DeepSeek-V4.1 SAGE packs): w0 FP8 E4M3 [n, k], w1 E8M0 scales [n / 32, k / 32]
 };
 
 struct LinearWeight {
@@ -59,6 +60,14 @@ struct LinearWeight {
 		lw.w1 = fp8_scales;
 		lw.alpha = alpha;
 		lw.bits = 4;
+		return lw;
+	}
+
+	static LinearWeight make_fp8( const TensorView& codes, const TensorView& scales ) {
+		LinearWeight lw;
+		lw.type = QuantType::FP8;
+		lw.w0 = codes;   // shape (k, n) like the FP16 form, the bytes laid out [n][k]
+		lw.w1 = scales;
 		return lw;
 	}
 

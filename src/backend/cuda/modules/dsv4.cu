@@ -1,4 +1,5 @@
 #include "engine/modules/dsv4.h"
+#include "engine/modules/linear.h"
 #include "engine/backend/cuda/reduce.cuh"
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -983,6 +984,108 @@ void DSV4::hc_identity_pre( float* pre, int rows, cudaStream_t stream ) {
 
 void DSV4::engram_gate( float* streams, const half* kv, const float* w, int hidden, float eps, int rows, cudaStream_t stream ) {
 	engram_gate_kernel<<<dim3( rows, 4 ), 256, 0, stream>>>( streams, kv, w, hidden, eps );
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// FP8 E4M3 weights with E8M0 block scales (the original DeepSeek-V4.1 tensors, kept as they are in device memory)
+
+namespace {
+
+// Two E4M3 bytes of x (picked by the __byte_perm selector 0x4140 / 0x4342) as a half2 holding value * 2^-8: the sign, the 4 exponent bits and the
+// 3 mantissa bits of an E4M3 byte placed at a half's sign / low exponent / top mantissa bits read as the same number with the exponent bias 15
+// instead of 7 (subnormals included); fp8_block_scale puts the 2^8 back
+__device__ __forceinline__ half2 fp8x2_to_half2( uint32_t x, uint32_t sel ) {
+	const uint32_t t = __byte_perm( x, 0u, sel );
+	const uint32_t h = ( ( t & 0x007f007fu ) << 7 ) | ( ( t & 0x00800080u ) << 8 );
+	return *reinterpret_cast<const half2*>( &h );
+}
+
+// 2^(e - 127) * 2^8, undoing the half read's 2^-8
+__device__ __forceinline__ float fp8_block_scale( uint32_t e ) {
+	const uint32_t biased = min( max( e + 8u, 1u ), 254u );
+	return __uint_as_float( biased << 23 );
+}
+
+template <int MAXM>
+__global__ __launch_bounds__( 256 )
+void fp8_gemv_kernel( const half* __restrict__ x, const uint8_t* __restrict__ w, const uint8_t* __restrict__ sc, half* __restrict__ out, int m0, int m, int n, int k ) {
+	const int row = blockIdx.x * 8 + threadIdx.x / 32;
+	if ( row >= n ) return;
+	const int lane = threadIdx.x % 32;
+	const uint8_t* wr = w + static_cast<size_t>( row ) * k;
+	const uint8_t* sr = sc + static_cast<size_t>( row / 32 ) * ( k / 32 );
+	float acc[MAXM];
+	#pragma unroll
+	for ( int r = 0; r < MAXM; ++r ) acc[r] = 0.0f;
+	for ( int kk = lane * 16; kk < k; kk += 512 ) {
+		const uint4 wb = *reinterpret_cast<const uint4*>( wr + kk );
+		const float s = fp8_block_scale( sr[kk / 32] );
+		float2 wf[8];
+		const uint32_t words[4] = { wb.x, wb.y, wb.z, wb.w };
+		#pragma unroll
+		for ( int q = 0; q < 4; ++q ) {
+			wf[2 * q] = __half22float2( fp8x2_to_half2( words[q], 0x4140u ) );
+			wf[2 * q + 1] = __half22float2( fp8x2_to_half2( words[q], 0x4342u ) );
+		}
+		#pragma unroll
+		for ( int r = 0; r < MAXM; ++r ) {
+			if ( m0 + r >= m ) break;
+			const uint4 xa = *reinterpret_cast<const uint4*>( x + static_cast<size_t>( m0 + r ) * k + kk );
+			const uint4 xb = *reinterpret_cast<const uint4*>( x + static_cast<size_t>( m0 + r ) * k + kk + 8 );
+			const uint32_t xs[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
+			float sum = 0.0f;
+			#pragma unroll
+			for ( int q = 0; q < 8; ++q ) {
+				const float2 xf = __half22float2( *reinterpret_cast<const half2*>( &xs[q] ) );
+				sum = fmaf( wf[q].x, xf.x, sum );
+				sum = fmaf( wf[q].y, xf.y, sum );
+			}
+			acc[r] += s * sum;
+		}
+	}
+	#pragma unroll
+	for ( int r = 0; r < MAXM; ++r ) {
+		float v = acc[r];
+		#pragma unroll
+		for ( int o = 16; o > 0; o >>= 1 ) v += __shfl_xor_sync( 0xffffffffu, v, o );
+		if ( lane == 0 && m0 + r < m ) out[static_cast<size_t>( m0 + r ) * n + row] = __float2half_rn( v );
+	}
+}
+
+__global__ __launch_bounds__( 256 )
+void fp8_dequant_kernel( const uint8_t* __restrict__ w, const uint8_t* __restrict__ sc, half* __restrict__ out, int n, int k ) {
+	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;   // 16 elements each
+	if ( i * 16 >= static_cast<size_t>( n ) * k ) return;
+	const size_t at = i * 16;
+	const int row = static_cast<int>( at / k ), col = static_cast<int>( at % k );
+	const uint4 wb = *reinterpret_cast<const uint4*>( w + at );
+	const float s = fp8_block_scale( sc[static_cast<size_t>( row / 32 ) * ( k / 32 ) + col / 32] );
+	const uint32_t words[4] = { wb.x, wb.y, wb.z, wb.w };
+	uint32_t o[8];
+	#pragma unroll
+	for ( int q = 0; q < 4; ++q ) {
+		const float2 a = __half22float2( fp8x2_to_half2( words[q], 0x4140u ) );
+		const float2 b = __half22float2( fp8x2_to_half2( words[q], 0x4342u ) );
+		const half2 ha = __floats2half2_rn( a.x * s, a.y * s ), hb = __floats2half2_rn( b.x * s, b.y * s );
+		o[2 * q] = *reinterpret_cast<const uint32_t*>( &ha );
+		o[2 * q + 1] = *reinterpret_cast<const uint32_t*>( &hb );
+	}
+	*reinterpret_cast<uint4*>( out + at ) = make_uint4( o[0], o[1], o[2], o[3] );
+	*reinterpret_cast<uint4*>( out + at + 8 ) = make_uint4( o[4], o[5], o[6], o[7] );
+}
+
+} // namespace
+
+void DSV4::linear_fp8( const half* x, const uint8_t* w, const uint8_t* scales, half* out, int m, int n, int k, half* scratch, cudaStream_t stream ) {
+	ENGINE_ASSERT( k % 32 == 0 && n % 32 == 0, "DSV4::linear_fp8: block-aligned shapes" );
+	if ( m <= 16 ) {
+		for ( int m0 = 0; m0 < m; m0 += 8 ) fp8_gemv_kernel<8><<<( n + 7 ) / 8, 256, 0, stream>>>( x, w, scales, out, m0, m, n, k );
+		return;
+	}
+	ENGINE_ASSERT( scratch != nullptr, "DSV4::linear_fp8: a scratch for the dequantized weight" );
+	const size_t groups = static_cast<size_t>( n ) * k / 16;
+	fp8_dequant_kernel<<<( groups + 255 ) / 256, 256, 0, stream>>>( w, scales, scratch, n, k );
+	LinearPlainGEMV::forward( scratch, x, out, m, n, k, stream );
 }
 
 } // namespace engine::modules

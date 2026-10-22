@@ -25,6 +25,7 @@ ENGINE_TIER_ENTRY( DSV4, route, CudaSm70, "CPU, Vulkan: unsupported (DeepSeek-V4
 ENGINE_TIER_ENTRY( DSV4, hc_collapse_norm, CudaSm70, "CPU, Vulkan: unsupported (DeepSeek-V4.1 runs on CUDA only)" )
 ENGINE_TIER_ENTRY( DSV4, hc_identity_pre, CudaSm70, "CPU, Vulkan: unsupported (DeepSeek-V4.1 runs on CUDA only)" )
 ENGINE_TIER_ENTRY( DSV4, engram_gate, CudaSm70, "CPU, Vulkan: unsupported (DeepSeek-V4.1 runs on CUDA only)" )
+ENGINE_TIER_ENTRY( DSV4, linear_fp8, CudaSm70, "CPU, Vulkan: unsupported (DeepSeek-V4.1 runs on CUDA only)" )
 ENGINE_TIER_ENTRY( Embedding, forward, Portable, "" )
 ENGINE_TIER_ENTRY( ExpertTier, resident_fraction, CudaSm70, "CPU and Vulkan: always 1 (every expert resident; the host-memory tier is CUDA only)" )
 ENGINE_TIER_ENTRY( GDN, project_gates, Portable, "" )

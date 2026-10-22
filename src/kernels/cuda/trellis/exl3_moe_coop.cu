@@ -262,15 +262,16 @@ __device__ __forceinline__ void gemv_tile(
 	const half2 hzero = __half2half2( __ushort_as_half( 0 ) );
 
 	int x_src_a, x_src_b, x_s2 = 0;
-	if constexpr ( BITS_ == 3 ) {
+	if constexpr ( BITS_ == 3 || BITS_ == 1 ) {
+		// 3 and 1 bpw: a lane's eight windows span two words of the tile (24 or 8 words), the funnel shift being lane dependent
 		const int t_offset = lane << 3;
-		const int b1 = ( t_offset + 257 ) * 3;
-		const int b2 = b1 + 21;
+		const int b1 = ( t_offset + 257 ) * BITS_;
+		const int b2 = b1 + 7 * BITS_;
 		const int i0 = ( b1 - 16 ) / 32;
 		const int i2 = ( b2 - 1 ) / 32;
 		x_s2 = ( i2 + 1 ) * 32 - b2;
-		x_src_a = i0 % 24;
-		x_src_b = i2 % 24;
+		x_src_a = i0 % TW;
+		x_src_b = i2 % TW;
 	}
 	else if constexpr ( BITS_ == 2 ) {
 		// 2 bpw: the 16 words of a tile; a window spans the previous word and the lane's own, the funnel shift being lane dependent
@@ -335,10 +336,10 @@ __device__ __forceinline__ void gemv_tile(
 			#pragma unroll
 			for ( int t = 0; t < WNT; ++t ) {
 				FragB f0, f1;
-				if constexpr ( BITS_ == 3 ) {
+				if constexpr ( BITS_ == 3 || BITS_ == 1 ) {
 					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
 					const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
-					exl3_gemv_ns::dq8_regs_3bits<cb>( awv, bwv, x_s2, f0, f1 );
+					exl3_gemv_ns::dq8_regs_kbits<cb, BITS_>( awv, bwv, x_s2, f0, f1 );
 				}
 				else if constexpr ( BITS_ == 2 ) {
 					// tile t lives in lanes (t & 1) * 16 .. + 15 of load t / 2
@@ -375,10 +376,10 @@ __device__ __forceinline__ void gemv_tile(
 			#pragma unroll
 			for ( int t = 0; t < WNT; ++t ) {
 				FragB f0, f1;
-				if constexpr ( BITS_ == 3 ) {
+				if constexpr ( BITS_ == 3 || BITS_ == 1 ) {
 					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
 					const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
-					exl3_gemv_ns::dq8_regs_3bits<cb>( awv, bwv, x_s2, f0, f1 );
+					exl3_gemv_ns::dq8_regs_kbits<cb, BITS_>( awv, bwv, x_s2, f0, f1 );
 				}
 				else if constexpr ( BITS_ == 2 ) {
 					// tile t lives in lanes (t & 1) * 16 .. + 15 of load t / 2
@@ -761,6 +762,20 @@ void rot_kernel( const MoeCoopParams p ) {
 
 // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (output rotation, svh, activation,
 // down-input rotation) by the last arrival per (slot, chunk)
+// gemv_tile at the width of the block's projection (BITS_ == 0 kernels: experts whose projections differ in width)
+template <int cb, int WN_>
+__device__ __forceinline__ void gemv_tile_dyn(
+	int bits, const uint32_t* __restrict__ B32, const half2* __restrict__ A2, size_t a_stride2, const int* __restrict__ rows, int nrows,
+	float* __restrict__ C, size_t c_stride, int k_begin, int k_end, int ntiles, int group, float* __restrict__ sh_red
+) {
+	switch ( bits ) {
+		case 1: gemv_tile<1, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
+		case 2: gemv_tile<2, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
+		case 3: gemv_tile<3, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
+		default: gemv_tile<4, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
+	}
+}
+
 template <int BITS_, int cb, int WN_, int MODE>
 __global__ __launch_bounds__( THREADS )
 void a_kernel( const MoeCoopParams p ) {
@@ -825,7 +840,10 @@ void a_kernel( const MoeCoopParams p ) {
 				done = true;
 			}
 		}
-		if constexpr ( MODE == 0 || MODE == 3 || BITS_ != 3 ) {
+		if constexpr ( BITS_ == 0 ) {
+			gemv_tile_dyn<cb, WN_>( is_gate ? p.bits_g : p.bits_u, B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red );
+		}
+		else if constexpr ( MODE == 0 || MODE == 3 || BITS_ != 3 ) {
 			if ( !done ) gemv_tile<BITS_, cb, WN_>( B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red );
 		}
 	}
@@ -913,7 +931,11 @@ void b_kernel( const MoeCoopParams p ) {
 				done = true;
 			}
 		}
-		if constexpr ( MODE == 0 || MODE == 3 || BITS_ != 3 ) {
+		if constexpr ( BITS_ == 0 ) {
+			gemv_tile_dyn<cb, WN_>( p.bits_d, B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
+				0, p.I / 16, p.H / 16, group, sh_red );
+		}
+		else if constexpr ( MODE == 0 || MODE == 3 || BITS_ != 3 ) {
 			if ( !done ) gemv_tile<BITS_, cb, WN_>( B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
 				0, p.I / 16, p.H / 16, group, sh_red );
 		}
@@ -993,7 +1015,7 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	using namespace exl3_moe_coop_ns;
 	MoeCoopParams p = p_in;
 	const int slots = p.bsz * p.topk;
-	ENGINE_ASSERT( p.topk >= 1 && p.topk <= MOE_COOP_TOPK && p.bsz >= 1 && p.bsz <= MOE_COOP_MAX_ROWS && ( p.bits == 2 || p.bits == 3 || p.bits == 4 ), "exl3_moe_coop: row count / topk / bits" );
+	ENGINE_ASSERT( p.topk >= 1 && p.topk <= MOE_COOP_TOPK && p.bsz >= 1 && p.bsz <= MOE_COOP_MAX_ROWS && ( p.bits >= 1 && p.bits <= 4 ) && ( p.bits_g == 0 || ( p.bits_g >= 1 && p.bits_g <= 4 && p.bits_u >= 1 && p.bits_u <= 4 && p.bits_d >= 1 && p.bits_d <= 4 ) ), "exl3_moe_coop: row count / topk / bits" );
 	ENGINE_ASSERT( p.H % 128 == 0 && p.I % 128 == 0, "exl3_moe_coop: widths" );
 	p.a_global = p.bsz > 1;
 	p.ctr_a_len = MOE_COOP_MAX_SLOTS * ( p.I / 128 );
@@ -1019,7 +1041,8 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 
 	// Tile: 1 int8 dp4a for one-row decode; with more rows 3 = dp4a for runs of up to 4 rows and fp16 tensor core above
 	// (dp4a on wider runs re-reads the weights in 4-row passes and loses to the tensor core there)
-	const int mode = p.bits != 3 ? 0 : ( p.bsz == 1 ? 1 : 3 );
+	const bool mixed = p.bits_g != 0 && ( p.bits_g != p.bits_u || p.bits_u != p.bits_d );
+	const int mode = mixed || p.bits != 3 ? 0 : ( p.bsz == 1 ? 1 : 3 );
 	const int stage_rows = mode == 1 ? 1 : ( mode >= 2 ? 4 : 0 );
 	// int8 activation staging: 2 x 16 B per k-tile per k-slab
 	constexpr int wkk = WK / WN;
@@ -1029,7 +1052,7 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	const int smem_b = smem_red_bytes() + smem_part_bytes() + stage_b;
 	// The opt-in limit (96 KB on SM70): DeepSeek-V4.1's hidden 5120 with the 4-row int8 stage needs more than 64 KB for stage A
 	ENGINE_ASSERT( smem_a <= 96 * 1024 && smem_b <= 96 * 1024, "exl3_moe_coop: shared memory above the opt-in limit" );
-	static bool attr_set[ENGINE_NUM_GPUS] = { false }, attr_set4[ENGINE_NUM_GPUS] = { false }, attr_set2[ENGINE_NUM_GPUS] = { false };
+	static bool attr_set[ENGINE_NUM_GPUS] = { false }, attr_set4[ENGINE_NUM_GPUS] = { false }, attr_set2[ENGINE_NUM_GPUS] = { false }, attr_set1[ENGINE_NUM_GPUS] = { false }, attr_setm[ENGINE_NUM_GPUS] = { false };
 	if ( p.bits == 3 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set[device] ) {
 		coop_smem_optin( (void*) a_kernel<3, 2, WN, 0> );
 		coop_smem_optin( (void*) a_kernel<3, 2, WN, 1> );
@@ -1046,6 +1069,16 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 		coop_smem_optin( (void*) b_kernel<2, 2, WN, 0> );
 		attr_set2[device] = true;
 	}
+	if ( mixed && device >= 0 && device < ENGINE_NUM_GPUS && !attr_setm[device] ) {
+		coop_smem_optin( (void*) a_kernel<0, 2, WN, 0> );
+		coop_smem_optin( (void*) b_kernel<0, 2, WN, 0> );
+		attr_setm[device] = true;
+	}
+	if ( p.bits == 1 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set1[device] ) {
+		coop_smem_optin( (void*) a_kernel<1, 2, WN, 0> );
+		coop_smem_optin( (void*) b_kernel<1, 2, WN, 0> );
+		attr_set1[device] = true;
+	}
 	if ( p.bits == 4 && device >= 0 && device < ENGINE_NUM_GPUS && !attr_set4[device] ) {
 		coop_smem_optin( (void*) a_kernel<4, 2, WN, 0> );
 		coop_smem_optin( (void*) b_kernel<4, 2, WN, 0> );
@@ -1055,6 +1088,18 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	if ( p.a_global ) {
 		const int rot_warps = slots * ( p.H / 128 ) * 2;
 		rot_kernel<<<dim3( MAX( 1, CEIL_DIVIDE( rot_warps, THREADS / 32 ) ) ), dim3( THREADS ), 0, stream>>>( p );
+	}
+	if ( mixed ) {
+		a_kernel<0, 2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+		b_kernel<0, 2, WN, 0><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+		CUDA_CHECK( cudaGetLastError() );
+		return;
+	}
+	if ( p.bits == 1 ) {
+		a_kernel<1, 2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+		b_kernel<1, 2, WN, 0><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+		CUDA_CHECK( cudaGetLastError() );
+		return;
 	}
 	if ( p.bits == 2 ) {
 		a_kernel<2, 2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );

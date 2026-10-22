@@ -82,6 +82,33 @@ __device__ inline void moe_gemm(
 	moe_gemm_m4<t_bits, MOE_TILESIZE_N, cb, MOE_TILESIZE_K, ( wide == 3 ? MOE_PREFILL_FRAG_STAGES : MOE_FRAG_STAGES )>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks );
 }
 
+// The GEMM of one projection at the width the expert has for it: t_bits is the width of every projection of a uniform launch, 0 means
+// the three projections may differ (DeepSeek-V4.1 mixed-width packs) and `bits` selects the instantiation
+template<int t_bits, int MOE_TILESIZE_N, int cb, int wide>
+__device__ inline void moe_gemm_k(
+	int bits,
+	const half* in_addr,
+	const uint16_t* trellis,
+	half* out_addr,
+	int rows,
+	int dim_k,
+	int dim_n,
+	int* locks
+) {
+	if constexpr ( t_bits != 0 ) {
+		moe_gemm<t_bits, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks );
+	}
+	else {
+		switch ( bits ) {
+			case 1: moe_gemm<1, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
+			case 2: moe_gemm<2, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
+			case 3: moe_gemm<3, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
+			case 4: moe_gemm<4, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
+			default: moe_gemm<5, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
+		}
+	}
+}
+
 template<bool gated>
 __device__ inline void moe_gather_gu_in(
 	const half* hidden_state,
@@ -236,8 +263,8 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
 					hidden_dim, warp_idx0, warps_per_group, group_idx, group_size, barrier_counters_sense
 				);
 
-				moe_gemm<t_bits, MOE_TILESIZE_N, cb, wide>( temp_state_g, exp_gate_trellis, temp_intermediate_g, rows, hidden_dim, intermediate_dim, locks );
-				moe_gemm<t_bits, MOE_TILESIZE_N, cb, wide>( temp_state_u, exp_up_trellis, temp_intermediate_u, rows, hidden_dim, intermediate_dim, locks );
+				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( K_gate, temp_state_g, exp_gate_trellis, temp_intermediate_g, rows, hidden_dim, intermediate_dim, locks );
+				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( K_up, temp_state_u, exp_up_trellis, temp_intermediate_u, rows, hidden_dim, intermediate_dim, locks );
 			}
 			else {
 				moe_gather_gu_in<false>(
@@ -246,7 +273,7 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
 					hidden_dim, warp_idx0, warps_per_group, group_idx, group_size, barrier_counters_sense
 				);
 
-				moe_gemm<t_bits, MOE_TILESIZE_N, cb, wide>( temp_state_u, exp_up_trellis, temp_intermediate_u, rows, hidden_dim, intermediate_dim, locks );
+				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( K_up, temp_state_u, exp_up_trellis, temp_intermediate_u, rows, hidden_dim, intermediate_dim, locks );
 			}
 			group_barrier( group_idx, group_size, barrier_counters_sense );
 
@@ -257,7 +284,7 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
 				warp_idx0, warps_per_group, group_idx, group_size, barrier_counters_sense
 			);
 
-			moe_gemm<t_bits, MOE_TILESIZE_N, cb, wide>( temp_intermediate_g, exp_down_trellis, temp_state_g, rows, intermediate_dim, hidden_dim, locks );
+			moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( K_down, temp_intermediate_g, exp_down_trellis, temp_state_g, rows, intermediate_dim, hidden_dim, locks );
 			group_barrier( group_idx, group_size, barrier_counters_sense );
 
 			moe_had_d_out( temp_state_g, output_state, exp_down_svh, rows, top_x, weights, hidden_dim, warp_idx0, warps_per_group );

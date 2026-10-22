@@ -23,10 +23,11 @@
 #include <chrono>
 #include <sys/mman.h>
 #include <condition_variable>
-#include <mutex>
 #include <atomic>
 #include <memory>
 #include <fcntl.h>
+#include <mutex>
+#include <set>
 #include <sched.h>
 #include <pthread.h>
 #if defined(__x86_64__)
@@ -204,34 +205,46 @@ __attribute__(( target( "avx2,f16c" ) )) void dequant_row_avx2( const uint8_t* w
 const bool g_avx2 = __builtin_cpu_supports( "avx2" ) && __builtin_cpu_supports( "f16c" );
 #endif
 
-// A [N, K] tensor (BF16 / F32) as FP16 on the device, or FP8 E4M3 with [N/32, K/32] E8M0 block scales dequantized to FP16
-pod::LinearWeight load_dense( engine::loader::SafeTensorsRepo& repo, const std::string& base, pod::MemoryArena& arena, backend::stream_t stream ) {
+// A [N, K] tensor (BF16 / F32) as FP16 on the device, or FP8 E4M3 with [N/32, K/32] E8M0 block scales dequantized to FP16.
+// An FP8 window [row0, row0 + rows) x [col0, col0 + cols) of it (a rank's share of a projection, or one of wo_a's groups) times `scale`
+// can be taken instead of the whole tensor
+pod::LinearWeight load_dense( engine::loader::SafeTensorsRepo& repo, const std::string& base, pod::MemoryArena& arena, backend::stream_t stream,
+	int row0 = 0, int rows = -1, int col0 = 0, int cols = -1, float scale = 1.0f ) {
 	int shard = -1;
 	const auto* meta = repo.find( ( base + ".weight" ).c_str(), &shard );
 	if ( meta == nullptr || meta->ndim != 2 ) return {};
-	const int n = meta->shape[0], k = meta->shape[1];
+	const int n_all = meta->shape[0], k_all = meta->shape[1];
+	const int n = rows < 0 ? n_all : rows, k = cols < 0 ? k_all : cols;
 	const uint8_t* src = static_cast<const uint8_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), meta ) );
 	std::vector<backend::half_t> h( static_cast<size_t>( n ) * k );
 	const auto* smeta = repo.find( ( base + ".scale" ).c_str(), &shard );
 	if ( smeta != nullptr ) {
 		const uint8_t* sc = static_cast<const uint8_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), smeta ) );
 		const int sk = smeta->shape[1];
-		ENGINE_ASSERT( meta->size_bytes == static_cast<size_t>( n ) * k && smeta->shape[0] == ( n + 31 ) / 32 && sk == ( k + 31 ) / 32, "load_dense: FP8 block layout" );
+		ENGINE_ASSERT( meta->size_bytes == static_cast<size_t>( n_all ) * k_all && smeta->shape[0] == ( n_all + 31 ) / 32 && sk == ( k_all + 31 ) / 32, "load_dense: FP8 block layout" );
+		ENGINE_ASSERT( row0 >= 0 && col0 >= 0 && row0 + n <= n_all && col0 + k <= k_all, "load_dense: FP8 window" );
 		float lut[256];
 		for ( int i = 0; i < 256; ++i ) lut[i] = e4m3_to_float( static_cast<uint8_t>( i ) );
 		for ( int r = 0; r < n; ++r ) {
-			for ( int c = 0; c < k; ++c ) {
-				const float s = std::ldexp( 1.0f, static_cast<int>( sc[static_cast<size_t>( r / 32 ) * sk + c / 32] ) - 127 );
-				h[static_cast<size_t>( r ) * k + c] = backend::from_float_half( lut[src[static_cast<size_t>( r ) * k + c]] * s );
+			const uint8_t* srow = src + static_cast<size_t>( row0 + r ) * k_all + col0;
+			const uint8_t* srows = sc + static_cast<size_t>( ( row0 + r ) / 32 ) * sk;
+			backend::half_t* drow = h.data() + static_cast<size_t>( r ) * k;
+			int c = 0;
+			while ( c < k ) {
+				const int blk = ( col0 + c ) / 32;
+				const int end = std::min( k, blk * 32 + 32 - col0 );
+				const float s = std::ldexp( scale, static_cast<int>( srows[blk] ) - 127 );
+				for ( ; c < end; ++c ) drow[c] = backend::from_float_half( lut[srow[c]] * s );
 			}
 		}
 	}
 	else if ( meta->dtype == pod::DType::BF16 ) {
+		ENGINE_ASSERT( rows < 0 && cols < 0 && scale == 1.0f, "load_dense: windows are for FP8 tensors" );
 		const uint16_t* b = reinterpret_cast<const uint16_t*>( src );
 		for ( size_t i = 0; i < h.size(); ++i ) h[i] = backend::from_float_half( bf16_to_float( b[i] ) );
 	}
 	else {
-		ENGINE_ASSERT( meta->dtype == pod::DType::FP32, "load_dense: unsupported dtype" );
+		ENGINE_ASSERT( meta->dtype == pod::DType::FP32 && rows < 0 && cols < 0 && scale == 1.0f, "load_dense: unsupported dtype" );
 		const float* f = reinterpret_cast<const float*>( src );
 		for ( size_t i = 0; i < h.size(); ++i ) h[i] = backend::from_float_half( f[i] );
 	}
@@ -239,6 +252,41 @@ pod::LinearWeight load_dense( engine::loader::SafeTensorsRepo& repo, const std::
 	backend::memcpy_sync( d, h.data(), h.size() * sizeof( backend::half_t ), backend::Copy::H2D );
 	(void) stream;
 	return pod::LinearWeight::make_fp16( pod::make_tensor_2d( d, pod::DType::FP16, k, n ) );   // Linear takes k from shape[0], n from shape[1]
+}
+
+// An FP8 window [row0, row0 + rows) x [col0, col0 + cols) of an [N, K] block-scaled tensor kept as it is (FP8 bytes and E8M0 scales on the
+// device), with 2^shift folded into the scales; the window is whole 32 x 32 blocks. Empty when the tensor is not FP8 or the window is not
+pod::LinearWeight load_fp8_resident( engine::loader::SafeTensorsRepo& repo, const std::string& base, pod::MemoryArena& arena, int row0, int rows, int col0, int cols, int shift ) {
+	int shard = -1;
+	const auto* meta = repo.find( ( base + ".weight" ).c_str(), &shard );
+	int sshard = -1;   // the scales may sit in another shard file than the weight
+	const auto* smeta = repo.find( ( base + ".scale" ).c_str(), &sshard );
+	if ( meta == nullptr || smeta == nullptr || meta->ndim != 2 || meta->size_bytes != static_cast<size_t>( meta->shape[0] ) * meta->shape[1] ) return {};
+	const int n_all = meta->shape[0], k_all = meta->shape[1];
+	if ( rows < 0 ) rows = n_all;
+	if ( cols < 0 ) cols = k_all;
+	if ( row0 % 32 || col0 % 32 || rows % 32 || cols % 32 || row0 + rows > n_all || col0 + cols > k_all || smeta->shape[0] != ( n_all + 31 ) / 32 || smeta->shape[1] != ( k_all + 31 ) / 32 ) return {};
+	const uint8_t* src = static_cast<const uint8_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), meta ) );
+	const uint8_t* sc = static_cast<const uint8_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( sshard ), smeta ) );
+	std::vector<uint8_t> w( static_cast<size_t>( rows ) * cols ), s( static_cast<size_t>( rows / 32 ) * ( cols / 32 ) );
+	for ( int r = 0; r < rows; ++r ) std::memcpy( w.data() + static_cast<size_t>( r ) * cols, src + static_cast<size_t>( row0 + r ) * k_all + col0, cols );
+	const int sk = smeta->shape[1];
+	for ( int r = 0; r < rows / 32; ++r )
+		for ( int c = 0; c < cols / 32; ++c ) {
+			const int e = static_cast<int>( sc[static_cast<size_t>( row0 / 32 + r ) * sk + col0 / 32 + c] ) + shift;
+			s[static_cast<size_t>( r ) * ( cols / 32 ) + c] = static_cast<uint8_t>( std::min( std::max( e, 1 ), 254 ) );
+		}
+	uint8_t* dw = dev_alloc<uint8_t>( arena, w.size(), false );
+	uint8_t* ds = dev_alloc<uint8_t>( arena, s.size(), false );
+	backend::memcpy_sync( dw, w.data(), w.size(), backend::Copy::H2D );
+	backend::memcpy_sync( ds, s.data(), s.size(), backend::Copy::H2D );
+	return pod::LinearWeight::make_fp8( pod::make_tensor_2d( dw, pod::DType::UINT8, cols, rows ), pod::make_tensor_2d( ds, pod::DType::UINT8, rows / 32, cols / 32 ) );
+}
+
+// A projection through the weight's own format: the FP8 form (DSV4::linear_fp8, scratch for the dequantized weight above 16 rows) or Linear
+void lin_fwd( const pod::TensorView& x, const pod::LinearWeight& w, pod::TensorView& out, backend::half_t* scratch, backend::stream_t stream ) {
+	if ( w.type != pod::QuantType::FP8 ) engine::modules::Linear::forward( x, w, out, stream );
+	else engine::modules::DSV4::linear_fp8( x.ptr<const backend::half_t>(), w.w0.ptr<const uint8_t>(), w.w1.ptr<const uint8_t>(), out.ptr<backend::half_t>(), x.shape[0], w.w0.shape[1], w.w0.shape[0], scratch, stream );
 }
 
 // A 1-D tensor (BF16 / F32) as FP16 or FP32 on the device, optionally elements [begin, begin + count)
@@ -660,6 +708,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		for ( size_t i = 0; i < config_.kv_sources.size(); ++i ) if ( config_.kv_sources[i] <= layer ) s = static_cast<int>( i );
 		return s;
 	};
+	const bool fp8_resident = runtime::options().fp8_resident;   // keep the pack's FP8 attention / shared-expert weights as they are (else dequantized to FP16)
 	for ( int l = 0; l < L; ++l ) {
 		auto& lw = layers_[l];
 		const std::string p = "layers." + std::to_string( l ) + ".";
@@ -674,14 +723,48 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		lw.kv_norm = load_vec( repo, p + "attn.kv_norm.weight", arena, pod::DType::FP16 );
 		lw.sink = load_vec( repo, p + "attn.attn_sink", arena, pod::DType::FP32, rank_ * lh_, lh_ );
 		need( lw.attn_norm.data && lw.ffn_norm.data && lw.q_norm.data && lw.kv_norm.data && lw.sink.data, p + "norms / sink" );
-		lw.wq_a = repo.load_linear( ( p + "attn.wq_a" ).c_str(), arena, 4, stream );
-		lw.wq_b = repo.load_linear_slice( ( p + "attn.wq_b" ).c_str(), arena, 4, 1, rank_, tp, stream );
-		lw.wkv = repo.load_linear( ( p + "attn.wkv" ).c_str(), arena, 4, stream );
-		lw.wo_b = repo.load_linear_slice( ( p + "attn.wo_b" ).c_str(), arena, 4, 0, rank_, tp, stream );
+		// a projection of the pack: EXL3 (the trellis tensors, `bits` wide; slice_dim 1 / 0 = this rank's output columns / input rows, -1 whole), or the
+		// original FP8 weight with block scales (SAGE packs), dequantized to FP16; out_scale is the output scale folded into the weights (EXL3: into svh)
+		auto lin = [&]( const std::string& name, int bits, int slice_dim, float out_scale ) -> pod::LinearWeight {
+			if ( repo.find( ( name + ".trellis" ).c_str() ) ) {
+				pod::LinearWeight w = slice_dim < 0 ? repo.load_linear( name.c_str(), arena, bits, stream ) : repo.load_linear_slice( name.c_str(), arena, bits, slice_dim, rank_, tp, stream );
+				if ( out_scale != 1.0f && w.is_valid() ) scale_device_half( w.w2.ptr<backend::half_t>(), static_cast<size_t>( H ), out_scale, stream );
+				return w;
+			}
+			const auto* meta = repo.find( ( name + ".weight" ).c_str() );
+			if ( meta == nullptr || meta->ndim != 2 ) return {};
+			const int n = meta->shape[0], k = meta->shape[1];
+			if ( fp8_resident ) {
+				// the output scale is a power of two: it goes into the block scales' exponents
+				const int shift = out_scale == 1.0f ? 0 : static_cast<int>( std::lround( std::log2( out_scale ) ) );
+				pod::LinearWeight w;
+				if ( slice_dim == 1 ) w = load_fp8_resident( repo, name, arena, rank_ * ( n / tp ), n / tp, 0, k, shift );
+				else if ( slice_dim == 0 ) w = load_fp8_resident( repo, name, arena, 0, n, rank_ * ( k / tp ), k / tp, shift );
+				else w = load_fp8_resident( repo, name, arena, 0, n, 0, k, shift );
+				if ( w.is_valid() ) { fp8_scratch_elems_ = std::max<size_t>( fp8_scratch_elems_, static_cast<size_t>( w.w0.shape[0] ) * w.w0.shape[1] ); return w; }
+			}
+			if ( slice_dim == 1 ) return load_dense( repo, name, arena, stream, rank_ * ( n / tp ), n / tp, 0, k, out_scale );
+			if ( slice_dim == 0 ) return load_dense( repo, name, arena, stream, 0, n, rank_ * ( k / tp ), k / tp, out_scale );
+			return load_dense( repo, name, arena, stream, 0, n, 0, k, out_scale );
+		};
+		lw.wq_a = lin( p + "attn.wq_a", 4, -1, 1.0f );
+		lw.wq_b = lin( p + "attn.wq_b", 4, 1, 1.0f );
+		lw.wkv = lin( p + "attn.wkv", 4, -1, 1.0f );
+		lw.wo_b = lin( p + "attn.wo_b", 4, 0, 1.0f / kOutScale );
 		need( lw.wq_a.is_valid() && lw.wq_b.is_valid() && lw.wkv.is_valid() && lw.wo_b.is_valid(), p + "attention linears" );
-		if ( lw.wo_b.is_valid() ) scale_device_half( lw.wo_b.w2.ptr<backend::half_t>(), static_cast<size_t>( H ), 1.0f / kOutScale, stream );
 		for ( int g = 0; g < gl_; ++g ) {
-			lw.wo_a.push_back( repo.load_linear( ( p + "attn.wo_a.slice." + std::to_string( rank_ * gl_ + g ) ).c_str(), arena, 5, stream ) );
+			const std::string slice = p + "attn.wo_a.slice." + std::to_string( rank_ * gl_ + g );
+			if ( repo.find( ( slice + ".trellis" ).c_str() ) ) lw.wo_a.push_back( repo.load_linear( slice.c_str(), arena, 5, stream ) );
+			else {
+				// the whole [groups x rank, input] weight: group g is its g-th band of rows
+				const auto* meta = repo.find( ( p + "attn.wo_a.weight" ).c_str() );
+				const int band = meta != nullptr ? meta->shape[0] / ( gl_ * tp ) : 0;
+				pod::LinearWeight w;
+				if ( meta != nullptr && fp8_resident ) w = load_fp8_resident( repo, p + "attn.wo_a", arena, ( rank_ * gl_ + g ) * band, band, 0, meta->shape[1], 0 );
+				if ( w.is_valid() ) fp8_scratch_elems_ = std::max<size_t>( fp8_scratch_elems_, static_cast<size_t>( w.w0.shape[0] ) * w.w0.shape[1] );
+				else if ( meta != nullptr ) w = load_dense( repo, p + "attn.wo_a", arena, stream, ( rank_ * gl_ + g ) * band, band, 0, meta->shape[1] );
+				lw.wo_a.push_back( w );
+			}
 			need( lw.wo_a.back().is_valid(), p + "attn.wo_a slice" );
 		}
 		if ( lw.is_kv_source ) {
@@ -715,11 +798,10 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			if ( repo.find( ( p + "ffn.gate.bias_vl" ).c_str() ) ) lw.router_bias_vl = load_vec( repo, p + "ffn.gate.bias_vl", arena, pod::DType::FP32 );
 		}
 		if ( rank_ == 0 ) {
-			lw.sh_gate = repo.load_linear( ( p + "ffn.shared_experts.w1" ).c_str(), arena, 4, stream );
-			lw.sh_up = repo.load_linear( ( p + "ffn.shared_experts.w3" ).c_str(), arena, 4, stream );
-			lw.sh_down = repo.load_linear( ( p + "ffn.shared_experts.w2" ).c_str(), arena, 4, stream );
+			lw.sh_gate = lin( p + "ffn.shared_experts.w1", 4, -1, 1.0f );
+			lw.sh_up = lin( p + "ffn.shared_experts.w3", 4, -1, 1.0f );
+			lw.sh_down = lin( p + "ffn.shared_experts.w2", 4, -1, 1.0f / kOutScale );
 			need( lw.sh_gate.is_valid() && lw.sh_up.is_valid() && lw.sh_down.is_valid(), p + "shared expert" );
-			if ( lw.sh_down.is_valid() ) scale_device_half( lw.sh_down.w2.ptr<backend::half_t>(), static_cast<size_t>( H ), 1.0f / kOutScale, stream );
 		}
 		if ( lw.engram >= 0 ) {
 			lw.e_wkv = load_dense( repo, p + "engram.wkv", arena, stream );
@@ -744,6 +826,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		need( lw.hc_attn_fn.data && lw.hc_attn_base.data && lw.hc_attn_scale.data && lw.hc_ffn_fn.data && lw.hc_ffn_base.data && lw.hc_ffn_scale.data, p + "hc" );
 	}
 	if ( !load_engram( model_dir ) ) return false;
+	if ( fp8_scratch_elems_ > 0 ) fp8_scratch_ = dev_alloc<backend::half_t>( arena, fp8_scratch_elems_, false );   // above 16 rows a dequantized copy of the weight in use
 	const size_t dense_bytes = arena.offset_bytes - bytes0;
 
 	// routed experts. A rank's experts get consecutive engine ids grouped by bit width, so each width is one MoE call over an id range; perm
@@ -776,9 +859,15 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 	for ( int l = 0; l < L; ++l ) {
 		const std::string p = "layers." + std::to_string( l ) + ".ffn.experts.";
 		for ( int e = 0; e < E; ++e ) {
-			const auto* meta = repo.find( ( p + std::to_string( e ) + ".w1.trellis" ).c_str() );
-			need( meta != nullptr && meta->ndim == 3, p + std::to_string( e ) );
-			bits[l][e] = meta ? meta->shape[2] / 16 : 0;
+			// the widths of the three projections (a pack may give each its own): gate | up << 4 | down << 8, which orders and groups the experts
+			int sig = 0, sh = 0;
+			for ( const char* w : { ".w1", ".w3", ".w2" } ) {
+				const auto* meta = repo.find( ( p + std::to_string( e ) + w + ".trellis" ).c_str() );
+				need( meta != nullptr && meta->ndim == 3, p + std::to_string( e ) + w );
+				sig |= ( meta ? meta->shape[2] / 16 : 0 ) << sh;
+				sh += 4;
+			}
+			bits[l][e] = sig;
 		}
 		std::vector<std::vector<int>> per( tp );
 		if ( expert_tp_ ) {
@@ -828,7 +917,10 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 	}
 	// placement: as many expert codes on the device as the arena holds (the same share of every layer's bytes; the hottest experts first when the
 	// route counts are known), the rest in pinned host memory
-	const size_t margin = static_cast<size_t>( std::max( runtime::options().vram_reserve_mib, 1024 ) ) * 1024 * 1024;
+	// headroom kept free in the arena after the weights: 1 GiB, or what vram_reserve_mib asks for (at least 256 MiB) when it is set below that: a pack that
+	// would just fit with the context's default reserve can be loaded fully resident by lowering both
+	const int reserve_opt = runtime::options().vram_reserve_mib;
+	const size_t margin = static_cast<size_t>( reserve_opt >= 0 && reserve_opt < 1024 ? std::max( reserve_opt, 256 ) : 1024 ) * 1024 * 1024;
 	const size_t meta_bytes = static_cast<size_t>( L ) * ( expert_tp_ ? E : per_rank ) * ( expert_tp_ ? 3 * H + 3 * ( config_.intermediate_size / tp + 128 ) : 3 * ( 2 * H + 2 * config_.intermediate_size ) ) * 2 + ( 64ull << 20 );   // suh / svh and tables
 	const size_t free_now = arena.total_bytes - arena.offset_bytes;
 	if ( rank_ == 0 ) vision_reserve_ = DeepseekV41VisionTower::arena_bytes( model_dir, runtime::options().max_image_tokens );
@@ -836,20 +928,14 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 	const size_t drafter_reserve = ds_.enabled && reserve_after_ > 0 ? reserve_after_ / static_cast<size_t>( tp ) + ( 320ull << 20 ) : 0;
 	const size_t budget = free_now > margin + meta_bytes + vision_reserve_ + drafter_reserve ? free_now - margin - meta_bytes - vision_reserve_ - drafter_reserve : 0;
 	const double frac = std::min( 1.0, static_cast<double>( budget ) / std::max<size_t>( code_bytes, 1 ) );
-	if ( frac < 1.0 ) {
-		const size_t host_bytes = static_cast<size_t>( ( 1.0 - frac ) * code_bytes * 1.02 ) + ( 256ull << 20 );
-		ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "DeepseekV41Pipeline: pinned host arena for the cold experts failed" );
-	}
-	size_t on_host = 0;
-	for ( int l = 0; l < L; ++l ) {
-		auto& lw = layers_[l];
-		const std::string p = "layers." + std::to_string( l ) + ".ffn.experts.";
-		// the resident set: experts in order of heat (else engine order) while the layer's device share of bytes lasts
+	// the resident set of a layer: experts in order of heat (else engine order) while the layer's device share of bytes lasts
+	auto pick_resident = [&]( int l ) {
 		std::vector<int> order = mine_[l];
 		if ( !heat.empty() ) {
 			const uint64_t* h = heat.data() + static_cast<size_t>( l ) * E;
 			std::stable_sort( order.begin(), order.end(), [&]( int a, int b ) { return h[a] > h[b]; } );
 		}
+		else std::stable_sort( order.begin(), order.end(), [&]( int a, int b ) { return expert_bytes[l][a] > expert_bytes[l][b]; } );
 		size_t layer_bytes = 0;
 		for ( int e : order ) layer_bytes += expert_bytes[l][e];
 		std::vector<char> resident( E, 0 );
@@ -859,6 +945,36 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			used += expert_bytes[l][e];
 			resident[e] = 1;
 		}
+		// the experts left over, largest first, into the slack that remains (the first pass leaves a whole expert's worth at the end of an order sorted by size)
+		std::vector<int> rest;
+		for ( int e : order ) if ( !resident[e] ) rest.push_back( e );
+		std::stable_sort( rest.begin(), rest.end(), [&]( int a, int b ) { return expert_bytes[l][a] > expert_bytes[l][b]; } );
+		for ( int e : rest ) {
+			if ( static_cast<double>( used + expert_bytes[l][e] ) > frac * static_cast<double>( layer_bytes ) + 1.0 ) continue;
+			used += expert_bytes[l][e];
+			resident[e] = 1;
+		}
+		return resident;
+	};
+	if ( frac < 1.0 ) {
+		size_t cold_bytes = 0;   // exactly what the resident rule leaves (a rank's share rounds to whole experts, up to a few percent more than 1 - frac)
+		for ( int l = 0; l < L; ++l ) {
+			const std::vector<char> res = pick_resident( l );
+			for ( int e : mine_[l] ) if ( !res[e] ) cold_bytes += expert_bytes[l][e];
+		}
+		// plus one staging buffer per projection of every (width signature, slice width) a swap may touch (an upper bound: a full-width projection at its bits)
+		std::set<int> sigs;
+		for ( int l = 0; l < L; ++l ) for ( int e : mine_[l] ) sigs.insert( bits[l][e] );
+		size_t staging = 0;
+		for ( int sg : sigs ) staging += static_cast<size_t>( ( sg & 15 ) + ( ( sg >> 4 ) & 15 ) + ( ( sg >> 8 ) & 15 ) ) * ( static_cast<size_t>( H ) * config_.intermediate_size / 8 + 512 );
+		const size_t host_bytes = static_cast<size_t>( cold_bytes * 1.01 ) + 40 * 3 * 256 * 200 + ( 256ull << 20 ) + staging * ( expert_tp_ ? 4 : 1 );   // codes (each aligned to 256 B), the swap buffers, a margin
+		ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "DeepseekV41Pipeline: pinned host arena for the cold experts failed" );
+	}
+	size_t on_host = 0;
+	for ( int l = 0; l < L; ++l ) {
+		auto& lw = layers_[l];
+		const std::string p = "layers." + std::to_string( l ) + ".ffn.experts.";
+		const std::vector<char> resident = pick_resident( l );
 		int j = 0;
 		while ( j < static_cast<int>( mine_[l].size() ) ) {
 			int k = j;
@@ -887,12 +1003,12 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 					mw.down[i] = repo.load_linear_range( ( b + ".w2" ).c_str(), arena, 0, s0 * 8, sn * 8, stream, codes );
 				}
 				else {
-					mw.gate[i] = repo.load_linear( ( b + ".w1" ).c_str(), arena, g.bits, stream, codes );
-					mw.up[i] = repo.load_linear( ( b + ".w3" ).c_str(), arena, g.bits, stream, codes );
-					mw.down[i] = repo.load_linear( ( b + ".w2" ).c_str(), arena, g.bits, stream, codes );
+					mw.gate[i] = repo.load_linear( ( b + ".w1" ).c_str(), arena, g.bits & 15, stream, codes );
+					mw.up[i] = repo.load_linear( ( b + ".w3" ).c_str(), arena, ( g.bits >> 4 ) & 15, stream, codes );
+					mw.down[i] = repo.load_linear( ( b + ".w2" ).c_str(), arena, ( g.bits >> 8 ) & 15, stream, codes );
 				}
 				need( mw.gate[i].is_valid() && mw.up[i].is_valid() && mw.down[i].is_valid(), b );
-				ENGINE_ASSERT( mw.up[i].bits == g.bits && mw.down[i].bits == g.bits, "DeepseekV41Pipeline: an expert's three projections differ in bit width" );
+				ENGINE_ASSERT( mw.gate[i].bits == ( g.bits & 15 ) && mw.up[i].bits == ( ( g.bits >> 4 ) & 15 ) && mw.down[i].bits == ( ( g.bits >> 8 ) & 15 ), "DeepseekV41Pipeline: an expert's projections differ from its group's bit widths" );
 				scale_device_half( mw.down[i].w2.ptr<backend::half_t>(), static_cast<size_t>( H ), 1.0f / kOutScale, stream );
 				if ( codes ) on_host += expert_bytes[l][e];
 			}
@@ -911,10 +1027,14 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			rank_, dense_bytes / G, code_bytes / G, on_host / G, 100.0 * frac, arena.offset_bytes / G, arena.total_bytes / G, missing );
 	}
 	if ( frac < 1.0 ) {
+		LOG_INFO( "[RANK %d] cold experts: %.3f GiB used of the %.3f GiB pinned arena before the swap buffers (frac %.3f)\n", rank_, host_arena_.offset_bytes / 1073741824.0, host_arena_.total_bytes / 1073741824.0, frac );
 		for ( int l = 0; l < L; ++l ) {
 			for ( auto& g0 : layers_[l].groups ) {
-				uint8_t*& stg = swap_staging_[g0.bits * 32 + g0.spans];
-				if ( !stg ) stg = static_cast<uint8_t*>( engine::core::arena_alloc( host_arena_, g0.mw->gate[0].w0.size_bytes(), 256 ) );
+				const pod::LinearWeight* set[3] = { g0.mw->gate, g0.mw->up, g0.mw->down };
+				for ( int q = 0; q < 3; ++q ) {
+					uint8_t*& stg = swap_staging_[( g0.bits * 32 + g0.spans ) * 4 + q];
+					if ( !stg ) stg = static_cast<uint8_t*>( engine::core::arena_alloc( host_arena_, set[q][0].w0.size_bytes(), 256 ) );
+				}
 			}
 		}
 	}
@@ -977,8 +1097,8 @@ bool DeepseekV41Pipeline::rebalance_experts( backend::stream_t stream ) {
 				const double t = static_cast<double>( heat_total_[static_cast<size_t>( l ) * E + mine_[l][g.first - first0 + i]] );
 				eff[i] = w > 0.0 ? static_cast<uint64_t>( ( 1.0 - w ) * static_cast<double>( g.score[i] ) + w * t * s_sum / t_sum + 0.5 ) : g.score[i];
 			}
-			const size_t part = g.mw->gate[0].w0.size_bytes();
-			const size_t swap_bytes = 2 * 3 * part;
+			const size_t part_of[3] = { g.mw->gate[0].w0.size_bytes(), g.mw->up[0].w0.size_bytes(), g.mw->down[0].w0.size_bytes() };   // the projections' widths may differ
+			const size_t swap_bytes = 2 * ( part_of[0] + part_of[1] + part_of[2] );
 			while ( true ) {
 				if ( cap_swaps >= 0 ? done >= cap_swaps : ( done > 0 && spent + swap_bytes > budget / static_cast<size_t>( L ) ) ) break;
 				int hot = -1, cool = -1;   // the hottest cold expert, the coldest resident one
@@ -992,8 +1112,9 @@ bool DeepseekV41Pipeline::rebalance_experts( backend::stream_t stream ) {
 				for ( int p = 0; p < 3; ++p ) {
 					uint8_t* dev = const_cast<uint8_t*>( static_cast<const uint8_t*>( set[p][cool].w0.data ) );
 					uint8_t* host = const_cast<uint8_t*>( static_cast<const uint8_t*>( set[p][hot].w0.data ) );
+					const size_t part = part_of[p];
 					ENGINE_ASSERT( set[p][cool].w0.size_bytes() == part && set[p][hot].w0.size_bytes() == part, "DeepseekV41Pipeline::rebalance_experts: code sizes differ within a bit width" );
-					uint8_t*& stg = swap_staging_[g.bits * 32 + g.spans];
+					uint8_t*& stg = swap_staging_[( g.bits * 32 + g.spans ) * 4 + p];
 					backend::memcpy_sync( stg, dev, part, backend::Copy::D2H );
 					backend::memcpy_sync( dev, host, part, backend::Copy::H2D );
 					set[p][cool].w0.data = stg;     // the resident expert's bytes now sit in the staging buffer, the hot expert's in its device buffer
@@ -1462,10 +1583,10 @@ void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int
 	trace_tensor( 1000 + layer, norm_x_, m, H, stream );
 
 	const float* rope = lw.ratio > 0 ? rope_comp_ : rope_plain_;
-	Linear::forward( norm_x_, lw.wq_a, qr_, stream );
+	lin_fwd( norm_x_, lw.wq_a, qr_, fp8_scratch_, stream );
 	RMSNorm::forward( qr_, lw.q_norm, qr_n_, eps, 0.0f, stream );
-	Linear::forward( qr_n_, lw.wq_b, q_, stream );
-	Linear::forward( norm_x_, lw.wkv, kv_, stream );
+	lin_fwd( qr_n_, lw.wq_b, q_, fp8_scratch_, stream );
+	lin_fwd( norm_x_, lw.wkv, kv_, fp8_scratch_, stream );
 	RMSNorm::forward( kv_, lw.kv_norm, kv_n_, eps, 0.0f, stream );
 	trace_tensor( 3000 + layer, kv_n_, m, DSV4::HD, stream );
 	trace_tensor( 6000 + layer, q_, m, lh_ * DSV4::HD, stream );
@@ -1496,10 +1617,10 @@ void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int
 	for ( int g = 0; g < gl_; ++g ) {
 		pod::TensorView in = view( o_g_, static_cast<size_t>( g ) * m * G, m, G );
 		pod::TensorView out = view( woa_out_, static_cast<size_t>( g ) * m * O, m, O );
-		Linear::forward( in, lw.wo_a[g], out, stream );
+		lin_fwd( in, lw.wo_a[g], out, fp8_scratch_, stream );
 	}
 	DSV4::concat_groups( woa_out_.ptr<const backend::half_t>(), woa_cat_.ptr<backend::half_t>(), gl_, O, m, stream );
-	Linear::forward( woa_cat_, lw.wo_b, attn_out_, stream );
+	lin_fwd( woa_cat_, lw.wo_b, attn_out_, fp8_scratch_, stream );
 	if ( ring_ ) ring_->all_reduce( attn_out_, stream );
 	trace_tensor( 7000 + layer, o_g_, m, gl_ * DSV4::GROUP_HEADS * DSV4::HD, stream );
 	trace_tensor( 2000 + layer, attn_out_, m, H, stream );
@@ -1544,10 +1665,10 @@ void DeepseekV41Pipeline::ffn_back( DeepseekV41LayerWeights& lw, int m, backend:
 	using engine::modules::Linear;
 	const int H = config_.hidden_size;
 	if ( lw.sh_gate.is_valid() ) {
-		Linear::forward( norm_x_, lw.sh_gate, sh_g_, stream );
-		Linear::forward( norm_x_, lw.sh_up, sh_u_, stream );
+		lin_fwd( norm_x_, lw.sh_gate, sh_g_, fp8_scratch_, stream );
+		lin_fwd( norm_x_, lw.sh_up, sh_u_, fp8_scratch_, stream );
 		engine::modules::SwiGLU::forward( sh_g_, sh_u_, sh_i_, stream, config_.swiglu_limit );
-		Linear::forward( sh_i_, lw.sh_down, sh_out_, stream );
+		lin_fwd( sh_i_, lw.sh_down, sh_out_, fp8_scratch_, stream );
 		engine::modules::MoERouter::accumulate( moe_out_.ptr<backend::half_t>(), sh_out_.ptr<const backend::half_t>(), backend::from_float_half( 1.0f ), m * H, stream );
 	}
 	if ( ring_ ) ring_->all_reduce( moe_out_, stream );
@@ -1714,7 +1835,7 @@ void DeepseekV41Pipeline::dspark_ingest( int slot, int from, int to, backend::st
 	RMSNorm::forward( ds_.mx_pre, ds_.main_norm, ds_.mx, config_.norm_eps, 0.0f, stream );
 	for ( int l = 0; l < ds_.blocks; ++l ) {
 		auto& lw = ds_.layers[l];
-		Linear::forward( ds_.mx, lw.wkv, ds_.dkv, stream );
+		lin_fwd( ds_.mx, lw.wkv, ds_.dkv, fp8_scratch_, stream );
 		RMSNorm::forward( ds_.dkv, lw.kv_norm, ds_.dkvn, config_.norm_eps, 0.0f, stream );
 		DSV4::window_store( ds_.dkvn.ptr<const backend::half_t>(), win_ring_, rope_plain_, config_.num_layers + l, n, ds_.d_ing_rows, win_slot_stride_, stream );
 	}
@@ -1752,10 +1873,10 @@ void DeepseekV41Pipeline::dspark_forward( int slot, int pos, int from, int win_s
 		DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], lw.attn_norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), mhc_post_.ptr<float>(),
 			kOutScale, H, eps, B, stream );
 		pre_cur_ ^= 1;
-		Linear::forward( norm_x_, lw.wq_a, qr_, stream );
+		lin_fwd( norm_x_, lw.wq_a, qr_, fp8_scratch_, stream );
 		RMSNorm::forward( qr_, lw.q_norm, qr_n_, eps, 0.0f, stream );
-		Linear::forward( qr_n_, lw.wq_b, q_, stream );
-		Linear::forward( norm_x_, lw.wkv, kv_, stream );
+		lin_fwd( qr_n_, lw.wq_b, q_, fp8_scratch_, stream );
+		lin_fwd( norm_x_, lw.wkv, kv_, fp8_scratch_, stream );
 		RMSNorm::forward( kv_, lw.kv_norm, kv_n_, eps, 0.0f, stream );
 		DSV4::window_store( kv_n_.ptr<const backend::half_t>(), ds_.blk_ring, rope_plain_, 0, B, ds_.d_blk_rows, 0, stream );
 		DSV4::dspark_attend( q_.ptr<const backend::half_t>(), win_ring_, ds_.blk_ring, lw.sink.ptr<const float>(), rope_plain_, o_g_.ptr<backend::half_t>(), lh_, L + l, B,
@@ -1763,10 +1884,10 @@ void DeepseekV41Pipeline::dspark_forward( int slot, int pos, int from, int win_s
 		for ( int g = 0; g < gl_; ++g ) {
 			pod::TensorView in = view( o_g_, static_cast<size_t>( g ) * B * G, B, G );
 			pod::TensorView out = view( woa_out_, static_cast<size_t>( g ) * B * O, B, O );
-			Linear::forward( in, lw.wo_a[g], out, stream );
+			lin_fwd( in, lw.wo_a[g], out, fp8_scratch_, stream );
 		}
 		DSV4::concat_groups( woa_out_.ptr<const backend::half_t>(), woa_cat_.ptr<backend::half_t>(), gl_, O, B, stream );
-		Linear::forward( woa_cat_, lw.wo_b, attn_out_, stream );
+		lin_fwd( woa_cat_, lw.wo_b, attn_out_, fp8_scratch_, stream );
 		if ( ring_ ) ring_->all_reduce( attn_out_, stream );
 		engine::modules::HyperConnection::update( streams_, attn_out_, mhc_post_, mhc_comb_, H, stream, B );
 		// the MoE sublayer: 128 experts, 3 per token

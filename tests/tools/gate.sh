@@ -56,7 +56,7 @@ static_checks() {
 
 # Tests that need no checkpoint (synthetic inputs, goldens, host-only logic); some need a GPU
 tier2_fast() {
-	for t in test_trellis test_gemv_int8 test_mhc test_attention test_attention_prefill test_dsa test_dsv4_indexer test_kv_pages test_gdn \
+	for t in test_trellis test_gemv_int8 test_mhc test_attention test_attention_prefill test_dsa test_dsv4_indexer test_dsv4_fp8 test_kv_pages test_gdn \
 		test_norm test_rope test_kv_quant test_all_reduce test_prefill_linear test_sampling test_sparse_attn test_slang_cpu test_slang_kernels; do
 		run $t gpu ./$t
 	done

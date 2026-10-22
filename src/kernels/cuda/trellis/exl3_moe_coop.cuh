@@ -38,7 +38,8 @@ struct MoeCoopParams {
 	int H;                              // hidden width (gate/up in_features, down out_features), multiple of 128
 	int I;                              // this rank's intermediate width, multiple of 128
 	int topk;
-	int bits;                           // 3 or 4 bits per weight
+	int bits;                           // 1 to 4 bits per weight
+	int bits_g, bits_u, bits_d;         // per projection when the experts' widths differ (all three set, tensor-core tile only); else 0
 	float act_limit;
 	const uint16_t* const* g_trellis; const half* const* g_suh; const half* const* g_svh;
 	const uint16_t* const* u_trellis; const half* const* u_suh; const half* const* u_svh;

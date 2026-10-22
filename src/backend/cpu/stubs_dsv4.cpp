@@ -69,4 +69,9 @@ __attribute__(( weak )) void DSV4::engram_gate( float* streams, const backend::h
 	__builtin_unreachable();
 }
 
+__attribute__(( weak )) void DSV4::linear_fp8( const backend::half_t* x, const uint8_t* w, const uint8_t* scales, backend::half_t* out, int m, int n, int k, backend::half_t* scratch, backend::stream_t stream ) {
+	ENGINE_UNSUPPORTED( "DSV4::linear_fp8" );
+	__builtin_unreachable();
+}
+
 } // namespace engine::modules

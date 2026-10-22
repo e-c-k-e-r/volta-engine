@@ -292,6 +292,8 @@ private:
 	std::vector<std::vector<int>> mine_;   // [layer] this rank's checkpoint expert ids in engine order
 	std::vector<uint64_t> heat_total_;     // [layer][checkpoint expert] routes counted on this rank
 	std::vector<uint32_t> pending_;        // [layer][checkpoint expert] routes drained by expert_heat that the residency has not seen yet
+	backend::half_t* fp8_scratch_ = nullptr;   // FP8 projections above 16 rows: the weight in use, dequantized
+	size_t fp8_scratch_elems_ = 0;
 	std::map<int, uint8_t*> swap_staging_; // pinned, one expert projection per (bits * 32 + spans); rotates through the swaps
 	uint64_t swaps_ = 0, window_routes_ = 0, window_hits_ = 0;
 	int rebalances_ = 0;

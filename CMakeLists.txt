@@ -623,6 +623,9 @@ set_target_properties(test_mla_latent PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PRO
 add_executable(test_dsv4_indexer tests/2_parity/test_dsv4_indexer.cpp)
 target_link_libraries(test_dsv4_indexer PRIVATE engine_kernels)
 set_target_properties(test_dsv4_indexer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_dsv4_fp8 tests/2_parity/test_dsv4_fp8.cpp)
+target_link_libraries(test_dsv4_fp8 PRIVATE engine_kernels)
+set_target_properties(test_dsv4_fp8 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_dsa tests/2_parity/test_dsa.cpp)
 target_link_libraries(test_dsa PRIVATE engine_kernels)

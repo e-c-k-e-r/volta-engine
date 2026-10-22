@@ -7,7 +7,7 @@
 | Test | Tier | GPU | Checks |
 |---|---|---|---|
 | `test_trellis`, `test_gemv_int8` | 2 | yes | trellis and int8 GEMV kernels against FP32 references |
-| `test_mhc`, `test_attention`, `test_attention_prefill`, `test_dsa`, `test_dsv4_indexer` (DeepSeek's indexer: the tensor-core scorer against the scalar kernel, selections, candidate masks and scores, with timing), `test_kv_pages`, `test_gdn`, `test_norm`, `test_rope`, `test_kv_quant`, `test_prefill_linear` | 2 | yes | module operations against CPU references |
+| `test_mhc`, `test_attention`, `test_attention_prefill`, `test_dsa`, `test_dsv4_indexer` (DeepSeek's indexer: the tensor-core scorer against the scalar kernel, selections, candidate masks and scores, with timing), `test_dsv4_fp8` (DeepSeek's FP8 projections against a double-precision product, 1 to 300 rows), `test_kv_pages`, `test_gdn`, `test_norm`, `test_rope`, `test_kv_quant`, `test_prefill_linear` | 2 | yes | module operations against CPU references |
 | `test_all_reduce` | 2 | yes (4; `AR_RANKS=2` runs two) | NVLink all-reduce: single, asynchronous multi-layer, fused with the gated add and stream norm (Flash-Next), fused with the hyper-connection post-step (GLM; bit-identical to the all-reduce followed by `HyperConnection::update`) |
 | `test_sparse_attn` | 2 | yes | `Attention::forward_sparse` (decode-sized sparse-list attention, head_dim 256) against an FP64 softmax over the same keys |
 | `test_vulkan_comm` | 2 | yes (2-4) | the Vulkan build's host-staged all-reduce and all-reduce + RMSNorm on 2 and 4 devices, one thread per rank (skips with fewer devices) |
@@ -25,7 +25,7 @@
 
 | Test | Tier | GPU | Checks |
 |---|---|---|---|
-| `test_rows`, `test_moe`, `test_nvfp4_linear`, `test_mla_latent`, `test_spec_state`, `test_dflash` | 2 | yes | layer and speculator parity with real weights (`test_mla_latent` also covers the FP8 / int8 / NVFP4 latent caches) |
+| `test_rows`, `test_moe` (`MOE_DSV41=1` with `MOE_BITS=n` or `MOE_SIG=g,u,d`: DeepSeek-V4.1 experts of one width, or of the three projection widths a mixed pack gives them), `test_nvfp4_linear`, `test_mla_latent`, `test_spec_state`, `test_dflash` | 2 | yes | layer and speculator parity with real weights (`test_mla_latent` also covers the FP8 / int8 / NVFP4 latent caches) |
 | `test_tokenizer`, `test_tokenizer_file --cases` | 2 | no | token-exact against HF tokenizers (fixtures in `tests/data`) |
 | `test_dsv41_vision <model dir> <golden dir>` | 2 | yes | DeepSeek-V4.1 vision tower: the engine's preprocessing of a test image matches the checkpoint reference's patches (BF16 rounding), and the tower's image rows match the reference run in FP32 (row cosine; the BF16 reference is itself noisy on a few rows). `tests/tools/dsv41/vision_golden.py <model dir> <golden dir>` writes the goldens with the reference's torch code (gate.sh makes them once under results/) |
 | `test_dsv41_encoding <model dir>` | 2 | no | DeepSeek-V4.1 prompt encoding byte-exact against the checkpoint's `encoding/tests` golden cases and cases of its `test_encoding.py` |
