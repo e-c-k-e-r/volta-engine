@@ -19,7 +19,7 @@ void bench_model( const char* type, const char* dir, int steps ) {
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	const auto& meta = mc.metadata();
 	const std::vector<int> prompt = { 15, 16, 17, 18, 19, 20, 21, 22 };
-	mc.warm_graphs( 8 );
+	mc.warm_graphs( std::getenv( "BENCH_VL" ) ? pod::MAX_BATCH : 8 );
 
 	// M=1 decode
 	mc.reset_slot( 0 );
@@ -46,8 +46,8 @@ void bench_model( const char* type, const char* dir, int steps ) {
 
 	// Mode A: M=8 causal block (state rolled back each iteration)
 	const int iters = 16;
-	int block[8];
-	for ( int i = 0; i < 8; ++i ) block[i] = prompt[i];
+	int block[pod::MAX_BATCH];
+	for ( int i = 0; i < pod::MAX_BATCH; ++i ) block[i] = prompt[i % 8] + i / 8;
 	int preds[pod::MAX_BATCH];
 	if ( prof_a && !prof_b ) CUDA_CHECK( cudaProfilerStart() );
 	t0 = std::chrono::steady_clock::now();
@@ -71,11 +71,11 @@ void bench_model( const char* type, const char* dir, int steps ) {
 	const double m8_ms = test::ms_since( t0 ) / iters;
 	if ( prof_a && !prof_b ) CUDA_CHECK( cudaProfilerStop() );
 
-	// BENCH_VL=2,3,4 times causal verify blocks of those widths (checkpoint, forward, sample, rollback) after the M=8 block
+	// BENCH_VL=2,3,4 (up to MAX_BATCH rows) times causal verify blocks of those widths (checkpoint, forward, sample, rollback) after the M=8 block
 	if ( const char* vl = std::getenv( "BENCH_VL" ) ) {
 		for ( const char* q = vl; *q; ) {
 			const int L = std::atoi( q );
-			if ( L >= 1 && L <= 8 ) {
+			if ( L >= 1 && L <= pod::MAX_BATCH ) {
 				auto tv = std::chrono::steady_clock::now();
 				for ( int i = 0; i < iters; ++i ) {
 					mc.checkpoint( 0 );

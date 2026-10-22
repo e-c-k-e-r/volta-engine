@@ -12,7 +12,8 @@ using namespace engine::runtime;
 // The logits are FP16, so two candidates within one ulp are common (an ulp is 0.0156 at |logit| 16..32), and a verify block rounds differently from a single
 // row: the same near-tie then breaks one way in plain decoding and the other in a round (ties keep the lower id). A first difference is accepted when it is
 // exactly that: plain decoding's runner-up at that step, within one FP16 ulp of its pick. Replays the plain run's tokens as single rows to read the step's logits.
-static bool one_ulp_tie( ModelCluster& mc, const std::vector<int>& prompt, const std::vector<int>& plain, size_t d, int spec_token ) {
+// max_gap > 0 widens the tie to that many logits (joint rounds on Flash-Next: the router flips move a row's logits by a few tenths against single rows).
+static bool one_ulp_tie( ModelCluster& mc, const std::vector<int>& prompt, const std::vector<int>& plain, size_t d, int spec_token, float max_gap = 0.0f ) {
 	if ( d == 0 || d >= plain.size() ) return false;
 	mc.reset_slot( 0 );
 	mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0 );
@@ -24,7 +25,7 @@ static bool one_ulp_tie( ModelCluster& mc, const std::vector<int>& prompt, const
 	const float top = cs[0].logits[0], gap = top - cs[0].logits[1];
 	const float ulp = std::ldexp( 1.0f, std::ilogb( std::fabs( top ) ) - 10 );
 	std::printf( "   at that step plain's top-2 logits are %.5f (id %d) and %.5f (id %d): gap %.5f, one FP16 ulp %.5f\n", top, cs[0].ids[0], cs[0].logits[1], cs[0].ids[1], gap, ulp );
-	return gap <= ulp * 1.001f;
+	return max_gap > 0.0f ? gap <= max_gap : gap <= ulp * 1.001f;
 }
 
 int main( int argc, char** argv ) {
@@ -32,6 +33,8 @@ int main( int argc, char** argv ) {
 	// ENGINE_NVFP4_DENSE_SRC)
 	const bool flash = argc > 1 && std::string( argv[1] ) == "--flash";
 	const bool glm = argc > 1 && std::string( argv[1] ) == "--glm";
+	// --joint (with --flash): two prompts speculate together, their blocks verified in one forward (joint rounds), each held to its own plain greedy run
+	const bool joint = flash && argc > 2 && std::string( argv[2] ) == "--joint";
 	const char* dir = glm ? test::GLM_DIR : flash ? test::FLASH_DIR : test::QWEN_DIR;
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	setenv( "ENGINE_SPECULATOR", "mtp", 1 );
@@ -66,6 +69,26 @@ int main( int argc, char** argv ) {
 	ENGINE_ASSERT( mc.has_speculator(), "no speculator" );
 	mc.warm_graphs( 8 );
 	int failures = 0;
+	if ( joint ) {
+		ENGINE_ASSERT( mc.speculator().joint(), "the speculator has no joint rounds" );
+		mc.warm_graphs( pod::MAX_BATCH );
+		const std::vector<std::vector<int>> jp = { prompts[0], prompt_ids( "Explain how a hash map handles collisions, with a short C++ example of open addressing." ) };
+		const std::vector<test::GenStats> js = test::generate_joint( mc, jp, 96 );
+		for ( size_t i = 0; i < jp.size(); ++i ) {
+			const test::GenStats plain = test::generate( mc, jp[i], 96, false, static_cast<int>( i ) );
+			const test::GenStats& spec = js[i];
+			size_t d = 0;
+			while ( d < plain.tokens.size() && d < spec.tokens.size() && plain.tokens[d] == spec.tokens[d] ) ++d;
+			bool same = plain.tokens == spec.tokens;
+			if ( !same && d < spec.tokens.size() ) same = one_ulp_tie( mc, jp[i], plain.tokens, d, spec.tokens[d], 0.25f );
+			std::printf( "[%s] joint slot %zu (%zu tokens): %d rounds, accepted %d / %d, first difference at %zu of %zu\n", same ? "ok" : "FAIL", i, jp[i].size(), spec.rounds,
+				spec.accepted, spec.proposed, d, plain.tokens.size() );
+			if ( !same ) std::printf( "   plain %s\n   joint %s\n", test::format_tokens( plain.tokens, 24 ).c_str(), test::format_tokens( spec.tokens, 24 ).c_str() );
+			failures += same ? 0 : 1;
+		}
+		std::printf( failures ? "test_mtp --joint: FAIL\n" : "test_mtp --joint: PASS\n" );
+		return failures ? 1 : 0;
+	}
 	for ( size_t p = 0; p < prompts.size(); ++p ) {
 		const test::GenStats plain = test::generate( mc, prompts[p], 96, false );
 		const test::GenStats spec = test::generate( mc, prompts[p], 96, true );

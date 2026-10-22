@@ -40,6 +40,9 @@ namespace engine::models {
 namespace {
 // Row count of the dense fp16 GEMMs of a prefill chunk. CUDA runs them at the full row capacity (one cuBLAS algorithm, so a row's result does not depend on its
 // chunk); the CPU and Vulkan GEMMs have no algorithm choice and run the rows there are (the full capacity costs hundreds of times the work)
+// Rows up to which the gated residual runs on its decode kernels (in groups of 8) instead of the prefill GEMMs: the blocks of two slots verified together
+constexpr int kGrDecodeRows = 16;
+
 inline int gemm_rows( int m ) {
 #if defined(ENGINE_BACKEND_CUDA) && ENGINE_BACKEND_CUDA == 1
 	( void )m;
@@ -856,7 +859,8 @@ void Qwen4ExpPipeline::gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, i
 	// chunk size (test_gr_tc); the rows past m are stale but never read.
 	// Prefill rows: the gate and up projections run on the tensor cores as fp16 hi / lo GEMM pairs with fp32 accumulation (the row-tile kernels below are fp32
 	// FMA bound at hundreds of rows); decode rows (a few) keep the fp32 kernels, whose reads of the 13 MB of weights are the floor there
-	if ( with_post && m > 8 && g.down_lw.is_valid() ) {
+	// 9 to 16 rows (the blocks of a joint verify) stay on the decode kernels in groups of 8: the GEMMs below run at the full row capacity, about 0.5 ms a site
+	if ( with_post && m > kGrDecodeRows && g.down_lw.is_valid() ) {
 		using GR = engine::modules::GatedResidual;
 		using half_t = backend::half_t;
 		const int H = config_.hidden_size, hc = config_.hc_mult, flat = hc * H, rank = config_.hc_rank;
@@ -881,11 +885,17 @@ void Qwen4ExpPipeline::gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, i
 		return;
 	}
 #endif
-	engine::modules::GatedResidual::mix(
-		streams_.ptr<const float>(), g.norm.ptr<const backend::half_t>(), g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(),
-		with_post ? g.inject.ptr<const backend::half_t>() : nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_,
-		m, config_.hidden_size, config_.hc_mult, config_.hc_rank, config_.rms_norm_eps, stream,
-		apply_pending_ ? post_ : nullptr, apply_pending_ ? y_.ptr<const backend::half_t>() : nullptr );
+	// The decode kernels take 8 rows at most; more rows (up to kGrDecodeRows) go through them in groups, each group a call of its own with the row-indexed
+	// buffers offset (the scratch is reused, the calls run in order on the stream)
+	const int H = config_.hidden_size, hc = config_.hc_mult;
+	for ( int r0 = 0; r0 < m; r0 += 8 ) {
+		const int n = MIN( 8, m - r0 );
+		engine::modules::GatedResidual::mix(
+			streams_.ptr<const float>() + static_cast<size_t>( r0 ) * hc * H, g.norm.ptr<const backend::half_t>(), g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(),
+			with_post ? g.inject.ptr<const backend::half_t>() : nullptr, mixed_.ptr<backend::half_t>() + static_cast<size_t>( r0 ) * H, post_ + static_cast<size_t>( r0 ) * hc,
+			gr_scratch_, n, H, hc, config_.hc_rank, config_.rms_norm_eps, stream,
+			apply_pending_ ? post_ + static_cast<size_t>( r0 ) * hc : nullptr, apply_pending_ ? y_.ptr<const backend::half_t>() + static_cast<size_t>( r0 ) * H : nullptr );
+	}
 	apply_pending_ = false;
 }
 

@@ -79,6 +79,47 @@ inline GenStats generate( ModelCluster& mc, const std::vector<int>& prompt, int 
 	return st;
 }
 
+// Greedy generation of up to max_new tokens on each of the given slots at once, the speculating slots verified together in joint rounds (Speculator::speculate_joint);
+// a slot that has finished drops out and the rest carry on (one slot is a plain round). Output per slot is what generate( speculative ) gives, up to rounding.
+inline std::vector<GenStats> generate_joint( ModelCluster& mc, const std::vector<std::vector<int>>& prompts, int max_new ) {
+	const int n = static_cast<int>( prompts.size() );
+	std::vector<GenStats> st( n );
+	std::vector<int> tok( n ), pos( n );
+	for ( int i = 0; i < n; ++i ) {
+		mc.reset_slot( i );
+		tok[i] = mc.prefill( prompts[i].data(), static_cast<int>( prompts[i].size() ), i );
+		st[i].tokens.push_back( tok[i] );
+		pos[i] = static_cast<int>( prompts[i].size() );
+	}
+	const auto t0 = std::chrono::steady_clock::now();
+	for ( ;; ) {
+		int slots[16], anchors[16], poss[16], k = 0;
+		const SamplingParams* sps[16] = {};
+		Rng* rngs[16] = {};
+		for ( int i = 0; i < n; ++i ) {
+			if ( static_cast<int>( st[i].tokens.size() ) >= max_new || mc.is_eos( tok[i] ) ) continue;
+			slots[k] = i; anchors[k] = tok[i]; poss[k] = pos[i]; ++k;
+		}
+		if ( k == 0 ) break;
+		SpecResult res[16];
+		mc.speculator().speculate_joint( k, slots, anchors, poss, sps, rngs, res );
+		for ( int j = 0; j < k; ++j ) {
+			const int i = slots[j];
+			st[i].rounds++;
+			st[i].proposed += res[j].proposed;
+			st[i].accepted += res[j].accepted;
+			pos[i] = res[j].next_pos;
+			for ( int e = 0; e < res[j].emitted_count && static_cast<int>( st[i].tokens.size() ) < max_new; ++e ) {
+				tok[i] = res[j].emitted[e];
+				st[i].tokens.push_back( tok[i] );
+				if ( mc.is_eos( tok[i] ) ) break;
+			}
+		}
+	}
+	for ( auto& g : st ) g.decode_ms = ms_since( t0 );
+	return st;
+}
+
 inline std::string format_tokens( const std::vector<int>& toks, size_t max_n = 64 ) {
 	std::string s;
 	for ( size_t i = 0; i < toks.size() && i < max_n; ++i ) {
