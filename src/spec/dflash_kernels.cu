@@ -779,7 +779,223 @@ void dflash_qk_norm_rope(
 
 #if defined(USE_ROCM)
 #include "../kernels/rocm/dflash_attn_wmma.cuh"
+#else
+// Split-key attention for the drafter block on CUDA cores (head_dim 128). The scalar kernel above gives every (row, head) its own block that walks all the
+// keys serially (64 blocks, 0.6 ms per layer on a 2048-key window); here a block owns one kv head, 32 query slots (row, head-in-group pairs) and a range of
+// keys, so each K / V row is loaded once for all the slots of its group and the key range is spread over the SMs. A block keeps an online softmax
+// (m, l) and the unnormalized O of its range; dflash_attn_split_reduce merges the ranges of a (row, head) in a fixed order, so the result does not depend
+// on scheduling (the draft round is graph-replayed).
+constexpr int DFS_HD = 128, DFS_SLOTS = 32, DFS_BK = 32, DFS_WS_STRIDE = DFS_HD + 2;
+constexpr int DFS_MAX_ROWS = 16, DFS_MAX_QHEADS = 32, DFS_MAX_SPLIT = 64;
+constexpr size_t DFS_SMEM = ( static_cast<size_t>( DFS_SLOTS ) * DFS_HD + static_cast<size_t>( DFS_BK ) * ( DFS_HD + 1 ) + static_cast<size_t>( DFS_SLOTS ) * DFS_BK + 3 * DFS_SLOTS ) * sizeof( float )
+	+ static_cast<size_t>( DFS_BK ) * DFS_HD * sizeof( half );
+
+__device__ float g_dfs_workspace[DFS_MAX_ROWS * DFS_MAX_QHEADS * DFS_MAX_SPLIT * DFS_WS_STRIDE];
+
+__global__ __launch_bounds__( 256 )
+void dflash_attn_split_kernel(
+	const half* __restrict__ q,        // [rows, q_heads, 128]
+	const half* __restrict__ kcache,   // [slots, layers, kv_heads, 128]
+	const half* __restrict__ vcache,
+	float* __restrict__ ws,            // [rows * q_heads][nsplit][130]: m, l, unnormalized O
+	int rows, int q_heads, int kv_heads,
+	int nctx, int first_ctx, int ring_slots, int ctx_layer,
+	int stride_slot, int stride_layer, int stride_head,
+	int own_slot, int own_first_row,
+	float scale, int nsplit, int keys_per_split
+) {
+	extern __shared__ float dfs_smem[];
+	float* sQ = dfs_smem;                                  // [32 slots][128]
+	float* sK = sQ + DFS_SLOTS * DFS_HD;                   // [32 keys][129]
+	float* sP = sK + DFS_BK * ( DFS_HD + 1 );              // [32 slots][32 keys]
+	float* sM = sP + DFS_SLOTS * DFS_BK;
+	float* sL = sM + DFS_SLOTS;
+	float* sA = sL + DFS_SLOTS;
+	half* sV = reinterpret_cast<half*>( sA + DFS_SLOTS );  // [32 keys][128]
+
+	const int G = q_heads / kv_heads;
+	const int kvh = blockIdx.x, qtile = blockIdx.y, split = blockIdx.z;
+	const int nslots = rows * G;
+	const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+	const int nkeys = nctx + ( rows - own_first_row );
+	const int k0 = split * keys_per_split;
+	const int k1 = min( nkeys, k0 + keys_per_split );
+
+	for ( int u = tid; u < DFS_SLOTS * DFS_HD; u += 256 ) {
+		const int s = u / DFS_HD, d = u % DFS_HD;
+		const int qi = qtile * DFS_SLOTS + s;
+		sQ[u] = qi < nslots ? __half2float( q[( static_cast<int64_t>( qi / G ) * q_heads + kvh * G + qi % G ) * DFS_HD + d] ) : 0.0f;
+	}
+	if ( tid < DFS_SLOTS ) { sM[tid] = -INFINITY; sL[tid] = 0.0f; sA[tid] = 1.0f; }
+
+	// Key kk maps to a context slot first (a ring), then to the block's own rows
+	auto ptr_of = [&] ( const half* base, int kk ) {
+		int slot;
+		if ( kk < nctx ) {
+			slot = first_ctx + kk;
+			if ( slot >= ring_slots ) slot -= ring_slots;
+		}
+		else slot = own_slot + own_first_row + ( kk - nctx );
+		return base + static_cast<int64_t>( slot ) * stride_slot + static_cast<int64_t>( ctx_layer ) * stride_layer + static_cast<int64_t>( kvh ) * stride_head;
+	};
+
+	const int pv_slot = tid >> 3, pv_d0 = ( tid & 7 ) * 16;   // the PV phase: thread owns 16 dims of one slot
+	float o[16];
+	#pragma unroll
+	for ( int i = 0; i < 16; ++i ) o[i] = 0.0f;
+
+	for ( int kt = k0; kt < k1; kt += DFS_BK ) {
+		__syncthreads();
+		for ( int u = tid; u < DFS_BK * ( DFS_HD / 2 ); u += 256 ) {
+			const int j = u / ( DFS_HD / 2 ), c = u % ( DFS_HD / 2 );
+			const int kk = kt + j;
+			float2 kf = make_float2( 0.0f, 0.0f );
+			half2 vh = __floats2half2_rn( 0.0f, 0.0f );
+			if ( kk < k1 ) {
+				kf = __half22float2( *( reinterpret_cast<const half2*>( ptr_of( kcache, kk ) ) + c ) );
+				vh = *( reinterpret_cast<const half2*>( ptr_of( vcache, kk ) ) + c );
+			}
+			sK[j * ( DFS_HD + 1 ) + 2 * c] = kf.x;
+			sK[j * ( DFS_HD + 1 ) + 2 * c + 1] = kf.y;
+			reinterpret_cast<half2*>( sV )[j * ( DFS_HD / 2 ) + c] = vh;
+		}
+		__syncthreads();
+		{
+			// Scores: lane = key, warp = 4 slots
+			const float* kr = sK + lane * ( DFS_HD + 1 );
+			const float* q0 = sQ + warp * 4 * DFS_HD;
+			float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+			#pragma unroll 8
+			for ( int d = 0; d < DFS_HD; ++d ) {
+				const float kv = kr[d];
+				a0 = fmaf( q0[d], kv, a0 );
+				a1 = fmaf( q0[DFS_HD + d], kv, a1 );
+				a2 = fmaf( q0[2 * DFS_HD + d], kv, a2 );
+				a3 = fmaf( q0[3 * DFS_HD + d], kv, a3 );
+			}
+			const bool valid = kt + lane < k1;
+			sP[( warp * 4 + 0 ) * DFS_BK + lane] = valid ? a0 * scale : -INFINITY;
+			sP[( warp * 4 + 1 ) * DFS_BK + lane] = valid ? a1 * scale : -INFINITY;
+			sP[( warp * 4 + 2 ) * DFS_BK + lane] = valid ? a2 * scale : -INFINITY;
+			sP[( warp * 4 + 3 ) * DFS_BK + lane] = valid ? a3 * scale : -INFINITY;
+		}
+		__syncthreads();
+		if ( tid < DFS_SLOTS ) {
+			float* pr = sP + tid * DFS_BK;
+			float mt = -INFINITY;
+			for ( int j = 0; j < DFS_BK; ++j ) mt = fmaxf( mt, pr[j] );
+			const float m_old = sM[tid];
+			const float m_new = fmaxf( m_old, mt );
+			const float alpha = m_new == -INFINITY ? 1.0f : ( m_old == -INFINITY ? 0.0f : expf( m_old - m_new ) );
+			float l = sL[tid] * alpha;
+			for ( int j = 0; j < DFS_BK; ++j ) {
+				const float p = m_new == -INFINITY ? 0.0f : expf( pr[j] - m_new );
+				pr[j] = p;
+				l += p;
+			}
+			sM[tid] = m_new;
+			sL[tid] = l;
+			sA[tid] = alpha;
+		}
+		__syncthreads();
+		{
+			const float alpha = sA[pv_slot];
+			#pragma unroll
+			for ( int i = 0; i < 16; ++i ) o[i] *= alpha;
+			const float* pr = sP + pv_slot * DFS_BK;
+			for ( int j = 0; j < DFS_BK; ++j ) {
+				const float p = pr[j];
+				const half2* vp = reinterpret_cast<const half2*>( sV + j * DFS_HD + pv_d0 );
+				#pragma unroll
+				for ( int c = 0; c < 8; ++c ) {
+					const float2 v = __half22float2( vp[c] );
+					o[2 * c] = fmaf( p, v.x, o[2 * c] );
+					o[2 * c + 1] = fmaf( p, v.y, o[2 * c + 1] );
+				}
+			}
+		}
+	}
+
+	const int qi = qtile * DFS_SLOTS + pv_slot;
+	if ( qi < nslots ) {
+		float* dst = ws + ( ( static_cast<int64_t>( qi / G ) * q_heads + kvh * G + qi % G ) * nsplit + split ) * DFS_WS_STRIDE;
+		if ( ( tid & 7 ) == 0 ) { dst[0] = sM[pv_slot]; dst[1] = sL[pv_slot]; }
+		#pragma unroll
+		for ( int i = 0; i < 16; ++i ) dst[2 + pv_d0 + i] = o[i];
+	}
+}
+
+// Merges the nsplit partials of one (row, head): grid (q_heads, rows), 128 threads
+__global__ void dflash_attn_split_reduce( const float* __restrict__ ws, half* __restrict__ out, int q_heads, int nsplit ) {
+	const int head = blockIdx.x, row = blockIdx.y, d = threadIdx.x;
+	const float* base = ws + ( static_cast<int64_t>( row ) * q_heads + head ) * nsplit * DFS_WS_STRIDE;
+	float m_acc = -INFINITY, l_acc = 0.0f, o_acc = 0.0f;
+	for ( int c = 0; c < nsplit; ++c ) {
+		const float* p = base + static_cast<int64_t>( c ) * DFS_WS_STRIDE;
+		const float m_c = p[0], l_c = p[1];
+		if ( l_c == 0.0f ) continue;
+		const float m_new = fmaxf( m_acc, m_c );
+		const float alpha = m_acc == -INFINITY ? 0.0f : expf( m_acc - m_new );
+		const float beta = expf( m_c - m_new );
+		o_acc = fmaf( alpha, o_acc, beta * p[2 + d] );
+		l_acc = fmaf( alpha, l_acc, beta * l_c );
+		m_acc = m_new;
+	}
+	out[( static_cast<int64_t>( row ) * q_heads + head ) * DFS_HD + d] = __float2half_rn( l_acc > 0.0f ? o_acc / l_acc : 0.0f );
+}
+
+static bool dflash_attn_split_launch(
+	const half* q, const half* kcache, const half* vcache, half* out,
+	int rows, int q_heads, int kv_heads, int head_dim,
+	int nctx, int first_ctx, int ring_slots, int ctx_layer,
+	int stride_slot, int stride_layer, int stride_head, int own_slot, int own_first_row, cudaStream_t stream
+) {
+	if ( head_dim != DFS_HD || kv_heads <= 0 || q_heads % kv_heads != 0 || rows > DFS_MAX_ROWS || q_heads > DFS_MAX_QHEADS ) return false;
+	const int G = q_heads / kv_heads;
+	const int qtiles = ( rows * G + DFS_SLOTS - 1 ) / DFS_SLOTS;
+	const int nkeys = nctx + MAX( rows - own_first_row, 0 );
+	if ( nkeys < 1 ) return false;
+	const int ntiles = ( nkeys + DFS_BK - 1 ) / DFS_BK;
+	const int base_blocks = kv_heads * qtiles;
+	int nsplit = MAX( 1, MIN( ( 160 + base_blocks - 1 ) / base_blocks, MIN( ntiles, DFS_MAX_SPLIT ) ) );
+	const int keys_per_split = ( ( ntiles + nsplit - 1 ) / nsplit ) * DFS_BK;
+	nsplit = ( nkeys + keys_per_split - 1 ) / keys_per_split;
+	static float* ws_ptr[ENGINE_NUM_GPUS] = {};
+	int dev = 0;
+	CUDA_CHECK( cudaGetDevice( &dev ) );
+	ENGINE_ASSERT( dev >= 0 && dev < ENGINE_NUM_GPUS, "dflash_attn_split: device out of range" );
+	if ( !ws_ptr[dev] ) {
+		void* p = nullptr;
+		CUDA_CHECK( cudaGetSymbolAddress( &p, g_dfs_workspace ) );
+		ws_ptr[dev] = static_cast<float*>( p );
+	}
+	dflash_attn_split_kernel<<<dim3( kv_heads, qtiles, nsplit ), 256, DFS_SMEM, stream>>>(
+		q, kcache, vcache, ws_ptr[dev], rows, q_heads, kv_heads, nctx, first_ctx, ring_slots, ctx_layer,
+		stride_slot, stride_layer, stride_head, own_slot, own_first_row, rsqrtf( static_cast<float>( head_dim ) ), nsplit, keys_per_split );
+	dflash_attn_split_reduce<<<dim3( q_heads, rows ), DFS_HD, 0, stream>>>( ws_ptr[dev], out, q_heads, nsplit );
+	return true;
+}
 #endif
+
+void dflash_attn_scalar(
+	const half* q, const half* kcache, const half* vcache, half* out,
+	int rows, int q_heads, int kv_heads, int head_dim,
+	int nctx, int first_ctx, int ring_slots, int ctx_layer,
+	int stride_slot, int stride_layer, int stride_head,
+	int own_slot,
+	int own_first_row,
+	cudaStream_t stream
+) {
+	if ( rows <= 0 || q_heads <= 0 ) return;
+	const int nkeys = nctx + MAX( rows - own_first_row, 0 );
+	const float scale = rsqrtf( static_cast<float>( head_dim ) );
+	dim3 grid( q_heads, rows );
+	const size_t smem = static_cast<size_t>( nkeys + ( 128 >> 5 ) * head_dim ) * sizeof( float );
+	dflash_attn_kernel<<<grid, 128, smem, stream >>>(
+		q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim,
+		nctx, first_ctx, ring_slots, ctx_layer, stride_slot, stride_layer, stride_head,
+		own_slot, own_first_row, scale );
+}
 
 void dflash_attn(
 	const half* q, const half* kcache, const half* vcache, half* out,
@@ -792,21 +1008,18 @@ void dflash_attn(
 ) {
 	if ( rows <= 0 || q_heads <= 0 ) return;
 #if defined(USE_ROCM)
-	// RDNA3: the WMMA kernel (the scalar one below spends 0.8 ms per layer on a 2048-key window)
+	// RDNA3: the WMMA kernel (the scalar one spends 0.8 ms per layer on a 2048-key window)
 	if ( ( head_dim == 128 || head_dim == 256 ) && kv_heads > 0 && q_heads % kv_heads == 0 && rows <= 16 && q_heads <= 64 ) {
 		if ( head_dim == 128 ) dflash_attn_wmma_launch<128>( q, kcache, vcache, out, rows, q_heads, kv_heads, nctx, first_ctx, ring_slots, ctx_layer, stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream );
 		else dflash_attn_wmma_launch<256>( q, kcache, vcache, out, rows, q_heads, kv_heads, nctx, first_ctx, ring_slots, ctx_layer, stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream );
 		return;
 	}
+#else
+	if ( dflash_attn_split_launch( q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim, nctx, first_ctx, ring_slots, ctx_layer,
+		stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream ) ) return;
 #endif
-	const int nkeys = nctx + MAX( rows - own_first_row, 0 );
-	const float scale = rsqrtf( static_cast<float>( head_dim ) );
-	dim3 grid( q_heads, rows );
-	const size_t smem = static_cast<size_t>( nkeys + ( 128 >> 5 ) * head_dim ) * sizeof( float );
-	dflash_attn_kernel<<<grid, 128, smem, stream >>>(
-		q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim,
-		nctx, first_ctx, ring_slots, ctx_layer, stride_slot, stride_layer, stride_head,
-		own_slot, own_first_row, scale );
+	dflash_attn_scalar( q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim, nctx, first_ctx, ring_slots, ctx_layer,
+		stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream );
 }
 
 void dflash_f16_gemv_nt(

@@ -731,6 +731,10 @@ int main() {
 	test_attn( arena, 8, 32, 8, 128, 2040 );
 	test_attn( arena, 1, 32, 8, 128, 3 );
 	test_attn( arena, 8, 4, 4, 64, 17 );
+	test_attn( arena, 8, 8, 2, 128, 2040 );   // tensor-parallel 4 shape (split-key kernel)
+	test_attn( arena, 8, 8, 2, 128, 33 );
+	test_attn( arena, 8, 8, 2, 128, 1 );
+	test_attn( arena, 3, 8, 2, 128, 700 );
 
 	// Shard top-k, including the padded case the vocabulary-parallel LM head actually runs:
 	// 62080 real columns in a 62208-wide shard, offset by the rank's slice of the vocabulary.

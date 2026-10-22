@@ -234,6 +234,14 @@ void dflash_attn(
 	backend::stream_t stream = nullptr
 );
 
+// The same attention through the one-block-per-(row, head) scalar kernel (what dflash_attn falls back to for shapes the split kernel does not cover);
+// the parity test compares the two
+void dflash_attn_scalar(
+	const backend::half_t* q, const backend::half_t* kcache, const backend::half_t* vcache, backend::half_t* out,
+	int rows, int q_heads, int kv_heads, int head_dim, int nctx, int first_ctx, int ring_slots, int ctx_layer,
+	int stride_slot, int stride_layer, int stride_head, int own_slot, int own_first_row = 1, backend::stream_t stream = nullptr
+);
+
 // Take one side out of a conv kernel projection's [rows, 2*taps*groups] output and reinterpret it as
 // the [rows, taps, groups] the grouped conv indexes. Side 0 is the sandwich's entry side, side 1 its
 // exit side; the projection emits both contiguously.

@@ -52,6 +52,8 @@ struct Qwen4ExpConfig {
 	int ple_layer = 1;
 	int ple_embed_dim = 2560;
 
+	int tap_layers[5] = { 5, 15, 25, 35, 45 };   // DFlash2 drafter taps (target_layer_ids): the completed output of these layers, mean of the streams
+
 	int max_seq = 32768;
 	int max_slots = 2;
 	float rms_norm_eps = 1e-6f;
@@ -124,6 +126,11 @@ public:
 	const engine::loader::VisionParams* vision_params() const override { return vision_.loaded() ? &vision_.params() : nullptr; }
 	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
 	bool has_mtp() const override { return mtp_on_; }
+	// DFlash2 drafter (see DraftHooks): a tap ring per slot, filled by forward_body once a drafter is attached (set_snapshot_taps)
+	const DraftHooks& draft_hooks() const override { return draft_hooks_; }
+	void draft_head_topk( int rows, backend::stream_t stream = nullptr ) override;
+	void set_snapshot_taps( bool on ) override { snap_taps_ = on; }
+	bool read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream = nullptr ) override;
 	bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) override;
 	bool rebalance_experts( backend::stream_t stream = nullptr ) override;
 	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
@@ -187,6 +194,17 @@ private:
 	struct HessianSite { float* h = nullptr; int k = 0; int64_t rows = 0; };
 	std::vector<HessianSite> hess_;
 	int hess_layer_ = 0;
+	DraftHooks draft_hooks_;
+	pod::TensorView draft_taps_;         // [slots * taps_cap, 5 * hidden]
+	pod::TensorView tap_tmp_;            // [MAX_ROWS, hidden] mean of the residual streams at a tapped layer
+	pod::TensorView draft_lm_logits_;    // [kDraftM, lm_shard_cols]
+	float* draft_cand_part_v_ = nullptr;
+	int* draft_cand_part_i_ = nullptr;
+	int* draft_cand_counters_ = nullptr;
+	int* d_taps_owner_ = nullptr;        // unused with per-slot rings
+	bool draft_taps_on_ = false;         // the tap ring exists (speculator is not the MTP head)
+	bool snap_taps_ = false;             // a drafter is attached: forwards publish taps and snapshots carry the ring rows
+	size_t tap_snapshot_bytes( int tokens ) const;
 	engine::modules::ExpertTier tier_;   // ENGINE_EXPERT_CACHE < 1: resident experts' codes in device slots, the rest in pinned host memory
 	pod::MemoryArena host_arena_{};
 	int tier_layers_ = 0;

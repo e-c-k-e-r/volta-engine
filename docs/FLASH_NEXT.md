@@ -56,6 +56,9 @@ The final `hyper_connection_mixer` is the same without `post` and returns `mixed
   on every stream plus the broadcast `fc_embedding` branch, one block with its own KV / QSA layer, its own mixer, the shared head). Greedy output equals plain decoding. The head keeps its state per
   slot; with several slots decoding the generator chooses per step between one slot's round and a plain step of all of them by the measured rates (re-measured every 64 steps).
   `spec_joint` (off by default) runs one draft chain and one verify forward over all speculating slots: about even with the controller at two requests, 25% ahead at four on code prompts.
+* **DFlash2 drafter**: `draft_model_dir` pointing at the `Qwen3.8-Flash-Next-DFlash2` checkpoint (with the default `speculator=dflash`) drafts a block of 8 tokens per round from the target's taps instead of chaining the head. The taps
+  are the completed outputs of layers 5, 15, 25, 35 and 45, each the mean of the four hyper-connection streams, kept in a per-slot ring of the last 2048 positions (prefix-cache snapshots carry the ring). The drafter is tensor-parallel
+  like the target; greedy output equals plain decoding. `spec_depth` and `spec_suffix` apply as for the other DFlash2 targets; `spec_profile` logs the time of each stage of a round at shutdown. Example: `configs/flash_next_dflash2.json`.
 * **Serving**: prefix snapshots (GDN state, conv history, n-gram conv ring and token context, KV rows, pooled index keys), the OpenAI / Anthropic APIs, images through the checkpoint's tower.
   Message content is tokenized as plain text: the template's role markers are real special tokens, but the same strings inside message content are escaped before the template
   renders and encoded without special-token parsing (`chat.cpp`), so quoted source cannot end or open a turn. `ENGINE_LOG_LEVEL=debug` logs the token that stopped each generation.

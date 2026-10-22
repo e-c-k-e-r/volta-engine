@@ -98,6 +98,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `spec_ctrl` | bool | `true` | `ENGINE_SPEC_CTRL` | adaptive speculation controller; false always speculates |
 | `mem_log` | bool | `false` | `ENGINE_MEM_LOG` | log the per-pipeline [mem] breakdown at startup (GLM: buffers by kind, weights by kind, drafter; Flash-Next: buffers, weights by kind); the arena summary lines stay on |
 | **Debug** | | | | |
+| `spec_profile` | bool | `false` | `ENGINE_DEBUG_SPEC_PROFILE` | DFlash2: time the stages of every round (draft, walk, snapshot switch, verify launch, sample wait, accept) and log the per-round averages when the server shuts down |
 | `merge_expert_groups` | bool | `true` | `ENGINE_DEBUG_MERGE_EXPERT_GROUPS` | DeepSeek-V4.1 packs whose experts have different widths per projection: one MoE launch per layer over all of a rank's experts with a width table (false: one launch per width combination, for A/B) |
 | `fp8_resident` | bool | `true` | `ENGINE_DEBUG_FP8_RESIDENT` | DeepSeek-V4.1 packs that keep the original FP8 attention and shared-expert weights (SAGE): keep them FP8 in device memory (false: dequantize to FP16 at load, twice the bytes) |
 | `indexer_tc` | bool | `true` | `ENGINE_DEBUG_INDEXER_TC` | DeepSeek-V4.1: the indexer scores prefill rows on tensor cores (false: the scalar kernel, for A/B) |

@@ -152,6 +152,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		auto dflash = std::make_unique<DFlash2Runner>();
 		if ( !dflash->init( *this, cfg.draft_model_dir ) ) return false;
 		dflash_ = dflash.get();
+		dflash->set_profile( opt.spec_profile );
 		runner_ = std::move( dflash );
 		for ( int d = 0; d < tp_; ++d ) models_[d]->set_snapshot_taps( true );
 	}
@@ -182,6 +183,7 @@ void ModelCluster::shutdown() {
 	initialized_ = false;
 	pool_.stop();
 	if ( runner_ ) {
+		if ( runtime::options().spec_profile ) runner_->profile_dump();
 		runner_->shutdown();
 		runner_.reset();
 		dflash_ = nullptr;
