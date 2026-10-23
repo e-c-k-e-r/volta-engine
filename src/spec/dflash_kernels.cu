@@ -3,6 +3,7 @@
 #include "engine/modules/norm.h"
 #include "engine/modules/swiglu.h"
 #include "engine/modules/embedding.h"
+#include "engine/runtime/options.h"
 #include "engine/modules/linear.h"
 #include "engine/backend/cuda/rope_math.cuh"
 #include "../kernels/cuda/trellis/trellis_context.h"
@@ -1015,7 +1016,7 @@ void dflash_attn(
 		return;
 	}
 #else
-	if ( dflash_attn_split_launch( q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim, nctx, first_ctx, ring_slots, ctx_layer,
+	if ( !engine::runtime::options().dflash_attn_scalar && dflash_attn_split_launch( q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim, nctx, first_ctx, ring_slots, ctx_layer,
 		stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream ) ) return;
 #endif
 	dflash_attn_scalar( q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim, nctx, first_ctx, ring_slots, ctx_layer,
