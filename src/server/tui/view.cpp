@@ -145,6 +145,36 @@ std::string fit( const std::string& s, int cols ) {
 
 // ---- tab bodies
 
+// The newest `width` columns of a series as block characters, one column per bucket of samples (the bucket's maximum, so a short spike
+// survives the thinning), scaled to `top`; zero is blank so idle stretches stay empty. Shorter series sit at the right edge.
+std::string spark( const std::vector<double>& v, int width, double top ) {
+	static const char* const BLOCKS[] = { "\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83", "\xe2\x96\x84", "\xe2\x96\x85", "\xe2\x96\x86", "\xe2\x96\x87", "\xe2\x96\x88" };
+	const size_t n = v.size();
+	const size_t cols = static_cast<size_t>( width );
+	std::string out;
+	const size_t shown = std::min( n, cols * ( ( n + cols - 1 ) / cols ) );   // whole buckets only
+	const size_t per = n == 0 ? 1 : ( n + cols - 1 ) / cols;
+	const size_t used = ( shown + per - 1 ) / per;
+	out.append( cols - std::min( cols, used ), ' ' );
+	const size_t start = n - shown;
+	for ( size_t b = 0; b < used; ++b ) {
+		double m = 0.0;
+		for ( size_t i = start + b * per; i < std::min( n, start + ( b + 1 ) * per ); ++i ) m = std::max( m, v[i] );
+		if ( m <= 0.0 || top <= 0.0 ) out += ' ';
+		else out += BLOCKS[std::min( 7, std::max( 0, static_cast<int>( std::ceil( m / top * 8.0 ) ) - 1 ) )];
+	}
+	return out;
+}
+
+std::vector<double> series( const json& s, const char* key ) {
+	std::vector<double> v;
+	if ( const json* a = get( s, "history", key ); a && a->is_array() ) {
+		for ( const auto& x : *a ) v.push_back( num( &x ) );
+	}
+	return v;
+}
+
+
 using Lines = std::vector<std::string>;
 
 void overview( const json& s, int cols, Lines* out ) {
@@ -187,6 +217,16 @@ void overview( const json& s, int cols, Lines* out ) {
 	if ( tt && tt->is_array() && tt->size() >= 3 ) {
 		out->push_back( "  ttft       p50 " + ms( num( &( *tt )[0] ) ) + "   p90 " + ms( num( &( *tt )[1] ) ) + "   p99 " + ms( num( &( *tt )[2] ) ) );
 	}
+	const int sw = std::max( 10, cols - 46 );
+	struct Row { const char* label; const char* key; const char* unit; double top; };
+	const double slot_count = num( s, "server", "slots" );
+	for ( const Row& r : { Row{ "decode ", "decode", " tok/s", 0.0 }, Row{ "prefill", "prefill", " tok/s", 0.0 }, Row{ "busy   ", "active", " slots", slot_count } } ) {
+		const std::vector<double> v = series( s, r.key );
+		if ( v.empty() ) continue;
+		const double top = r.top > 0.0 ? r.top : std::max( 1.0, *std::max_element( v.begin(), v.end() ) );
+		out->push_back( "  " + std::string( DIM ) + r.label + RESET + " " + CYAN + spark( v, sw, top ) + RESET + "  now " + format( "%.0f", v.back() ) + " / max " + format( "%.0f", top ) + r.unit );
+	}
+	out->push_back( std::string( DIM ) + "  last " + duration( static_cast<double>( series( s, "decode" ).size() ) ) + ", one sample per second" + RESET );
 	out->push_back( "" );
 
 	out->push_back( heading( "Requests" ) );

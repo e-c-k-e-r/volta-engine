@@ -27,6 +27,7 @@ int main() {
 		         {"slot":1,"active":false,"phase":"idle"}],
 		"recent":[{"req_id":4,"age_s":9,"prompt_tokens":10,"cached_tokens":0,"generated":5,"queue_ms":1,"ttft_ms":50,"prefill_ms":40,"total_ms":200,"decode_tok_s":30,"reason":"stop"}],
 		"gpus":[{"index":0,"name":"gpu","power_w":100,"power_limit_w":150,"energy_kj":1,"temp_c":60,"util_gpu":50,"util_mem":10,"sm_mhz":1300,"mem_mhz":877,"mem_used":1073741824,"mem_total":34359738368,"arena_bytes":0,"throttle":["sw_power_cap"]}],
+		"history":{"t":[1,2,3,4],"decode":[0,0,50,100],"prefill":[0,200,0,0],"active":[0,1,2,1]},
 		"host":{"cpu_pct":10,"mem_used":1073741824,"mem_total":68719476736,"rss":1073741824,"load1":1.5}})" );
 	const nlohmann::json partial = nlohmann::json::parse( R"({"server":{"model":"m"}})" );
 	const std::vector<std::string> log = { "[*] one", "[!] two" };
@@ -57,6 +58,21 @@ int main() {
 	std::string frame = render_frame( d, ui, 40, 120 );
 	CHECK( frame.find( "dflash2" ) != std::string::npos, "overview shows the speculator" );
 	CHECK( frame.find( "from cache" ) != std::string::npos, "overview shows the cached share" );
+	CHECK( frame.find( "\xe2\x96\x88" ) != std::string::npos, "overview draws the throughput history" );
+	CHECK( frame.find( "now 100 / max 100 tok/s" ) != std::string::npos, "history rows give the current value and the scale" );
+	{
+		nlohmann::json many = full;
+		std::vector<double> dec;
+		for ( int i = 0; i < 900; ++i ) dec.push_back( i == 450 ? 500.0 : 10.0 );
+		many["history"] = { { "decode", dec }, { "prefill", dec }, { "active", dec } };
+		UiState u;
+		ViewData md;
+		md.stats = &many;
+		md.connected = true;
+		CHECK( render_frame( md, u, 40, 60 ).find( "max 500 tok/s" ) != std::string::npos, "a spike survives thinning to a narrow window" );
+		many["history"] = nlohmann::json::object();
+		CHECK( count_rows( render_frame( md, u, 40, 60 ) ) == 40, "missing history draws no rows" );
+	}
 	ui.tab = TAB_GPUS;
 	CHECK( render_frame( d, ui, 40, 120 ).find( "sw_power_cap" ) != std::string::npos, "gpu tab lists the throttle reason" );
 	ui.tab = TAB_SLOTS;
