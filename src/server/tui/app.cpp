@@ -39,18 +39,18 @@ std::string clean_line( const std::string& raw ) {
 
 void run_viewer( Terminal& term, const ViewerOptions& opt, const FetchFn& fetch, const LogFn& log, const std::atomic<bool>& stop ) {
 	UiState ui;
-	nlohmann::json stats;
-	bool have_stats = false, connected = false;
-	std::string error;
+	nlohmann::json stats, experts;
+	bool have_stats = false, have_experts = false, connected = false;
+	std::string error, experts_error;
 	std::vector<std::string> lines;
-	double last_fetch = -1.0e18;
+	double last_fetch = -1.0e18, last_experts = -1.0e18;
 	int last_rows = 0, last_cols = 0;
 	bool dirty = true;
 	while ( !stop.load() ) {
-		if ( now_ms() - last_fetch >= opt.interval_ms ) {
+		if ( !ui.paused && now_ms() - last_fetch >= opt.interval_ms ) {
 			nlohmann::json fresh;
 			std::string err;
-			if ( fetch( &fresh, &err ) ) {
+			if ( fetch( "stats", &fresh, &err ) ) {
 				stats = std::move( fresh );
 				have_stats = connected = true;
 			}
@@ -61,6 +61,21 @@ void run_viewer( Terminal& term, const ViewerOptions& opt, const FetchFn& fetch,
 			last_fetch = now_ms();
 			dirty = true;
 		}
+		// the routing counters are a few hundred KB of JSON: only while their tab is open, and not every second
+		if ( !ui.paused && ui.tab == TAB_EXPERTS && ( !have_experts || now_ms() - last_experts >= 2.0 * opt.interval_ms ) ) {
+			nlohmann::json fresh;
+			std::string err;
+			if ( fetch( "experts", &fresh, &err ) ) {
+				experts = std::move( fresh );
+				have_experts = true;
+				experts_error.clear();
+			}
+			else {
+				experts_error = err;
+			}
+			last_experts = now_ms();
+			dirty = true;
+		}
 		int rows = 0, cols = 0;
 		term.size( &rows, &cols );
 		if ( rows != last_rows || cols != last_cols ) {
@@ -68,7 +83,7 @@ void run_viewer( Terminal& term, const ViewerOptions& opt, const FetchFn& fetch,
 			last_cols = cols;
 			dirty = true;
 		}
-		if ( log && ui.tab == TAB_LOG ) {
+		if ( log && ui.tab == TAB_LOG && !ui.paused ) {
 			const size_t before = lines.size();
 			const std::string tail = lines.empty() ? std::string() : lines.back();
 			log( &lines );
@@ -77,6 +92,8 @@ void run_viewer( Terminal& term, const ViewerOptions& opt, const FetchFn& fetch,
 		if ( dirty ) {
 			ViewData data;
 			data.stats = have_stats ? &stats : nullptr;
+			data.experts = have_experts ? &experts : nullptr;
+			data.experts_error = experts_error;
 			data.connected = connected;
 			data.error = error;
 			data.source = opt.source;

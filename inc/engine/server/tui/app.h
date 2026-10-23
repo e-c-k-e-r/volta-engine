@@ -12,8 +12,8 @@
 
 namespace engine::server::tui {
 
-// Fills `stats` with a fresh /api/stats document; false (with `error`) when there is none
-using FetchFn = std::function<bool( nlohmann::json* stats, std::string* error )>;
+// Fills `doc` with a fresh /api/<what> document ("stats" every second, "experts" only while its tab is open); false (with `error`) when there is none
+using FetchFn = std::function<bool( const char* what, nlohmann::json* doc, std::string* error )>;
 // Replaces `lines` with the current log; an empty function means the source has no log
 using LogFn = std::function<void( std::vector<std::string>* lines )>;
 

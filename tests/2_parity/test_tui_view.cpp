@@ -21,7 +21,7 @@ int main() {
 		"server":{"model":"m","model_type":"qwen4_exp","uptime_s":3725,"slots":2,"max_context":32768,"tp":4,"queued":0,"speculation":true,"speculator":"dflash2","kv_format":"fp8"},
 		"totals":{"requests":10,"completed":9,"tokens_out":1000,"prompt_tokens":5000,"cached_tokens":2500,"finished":{"stop":8,"length":1,"stop_string":0,"cancelled":0}},
 		"averages":{"ttft_ms":300,"prefill_tok_s":5000,"decode_tok_s":100},
-		"latency":{"gap_ms":[5,8,20,40,90],"ttft_ms":[200,400,900]},
+		"latency":{"gap_ms":[5,8,20,40,90],"ttft_ms":[200,400,900],"gap_hist":[0,5,40,30,10,5,2,1,0,0,0,0]},
 		"speculation":{"rounds":10,"accept_rate":0.5,"tokens_per_round":2.5},
 		"slots":[{"slot":0,"active":true,"phase":"decode","req_id":5,"pos":100,"prompt_tokens":80,"cached_tokens":10,"generated":20,"max_tokens":256,"age_s":3,"decode_tok_s":40},
 		         {"slot":1,"active":false,"phase":"idle"}],
@@ -31,6 +31,15 @@ int main() {
 		"host":{"cpu_pct":10,"mem_used":1073741824,"mem_total":68719476736,"rss":1073741824,"load1":1.5}})" );
 	const nlohmann::json partial = nlohmann::json::parse( R"({"server":{"model":"m"}})" );
 	const std::vector<std::string> log = { "[*] one", "[!] two" };
+	// 2 ranks x 3 layers x 4 experts, rank 1 hot
+	nlohmann::json experts = { { "ranks", 2 }, { "layers", 3 }, { "experts", 4 } };
+	{
+		std::vector<int> v;
+		for ( int r = 0; r < 2; ++r ) for ( int l = 0; l < 3; ++l ) for ( int e = 0; e < 4; ++e ) v.push_back( ( r + 1 ) * ( e + 1 ) * 10 + l );
+		experts["total"] = v;
+		experts["recent"] = v;
+	}
+	const nlohmann::json dense_experts = { { "ranks", 1 }, { "layers", 0 }, { "experts", 0 }, { "total", nlohmann::json::array() }, { "recent", nlohmann::json::array() } };
 
 	const int sizes[][2] = { { 40, 120 }, { 24, 80 }, { 6, 20 }, { 3, 5 } };
 	for ( const nlohmann::json* doc : { &full, &partial, static_cast<const nlohmann::json*>( nullptr ) } ) {
@@ -44,6 +53,7 @@ int main() {
 				d.error = "refused";
 				d.source = "host:8000";
 				d.log = &log;
+				d.experts = tab % 2 ? &experts : &dense_experts;
 				const std::string frame = render_frame( d, ui, sz[0], sz[1] );
 				const int want = sz[0] < 6 ? 6 : sz[0];
 				CHECK( count_rows( frame ) == want, "tab %d size %dx%d: %d rows, expected %d", tab, sz[0], sz[1], count_rows( frame ), want );
@@ -78,9 +88,62 @@ int main() {
 	ui.tab = TAB_SLOTS;
 	CHECK( render_frame( d, ui, 40, 120 ).find( "#5" ) != std::string::npos, "slot tab lists the running request" );
 
+	CHECK( frame.find( "token gaps by size" ) != std::string::npos, "overview draws the gap histogram" );
+	ui.tab = TAB_EXPERTS;
+	d.experts = &experts;
+	frame = render_frame( d, ui, 40, 120 );
+	CHECK( frame.find( "Expert routing" ) != std::string::npos && frame.find( "\xe2\x96\x80" ) != std::string::npos, "experts tab draws the heat map" );
+	CHECK( frame.find( "rank 1" ) != std::string::npos, "experts tab lists the ranks" );
+	d.experts = &dense_experts;
+	CHECK( render_frame( d, ui, 40, 120 ).find( "no mixture-of-experts" ) != std::string::npos, "a dense model says it has no routing counters" );
+	d.experts = nullptr;
+	CHECK( render_frame( d, ui, 40, 120 ).find( "loading the routing" ) != std::string::npos, "experts tab waits for its first reading" );
+
+	{   // alerts: a hot GPU, a hardware throttle and a waiting request
+		nlohmann::json hot = full;
+		hot["gpus"][0]["temp_c"] = 90;
+		hot["gpus"][0]["throttle"] = { "hw slowdown" };
+		hot["server"]["queued"] = 2;
+		UiState u;
+		ViewData hd;
+		hd.stats = &hot;
+		hd.connected = true;
+		const std::string f = render_frame( hd, u, 40, 120 );
+		CHECK( f.find( "GPU 0 at 90 C" ) != std::string::npos && f.find( "hw slowdown" ) != std::string::npos && f.find( "waiting for a slot" ) != std::string::npos, "alerts name the conditions" );
+		CHECK( count_rows( f ) == 40, "the alert row takes a body row, not an extra one" );
+		ui = UiState();
+		CHECK( render_frame( d, ui, 40, 120 ).find( "waiting for a slot" ) == std::string::npos, "no alert for a healthy server" );
+		d.experts = &experts;
+	}
+	{   // the always-on power cap is not an alert
+		UiState u;
+		ViewData hd;
+		hd.stats = &full;
+		hd.connected = true;
+		CHECK( render_frame( hd, u, 40, 120 ).find( "! " ) == std::string::npos, "sw power cap alone raises no alert" );
+	}
+	{   // slot picking, detail and pause
+		UiState u;
+		u.tab = TAB_SLOTS;
+		ViewData hd;
+		hd.stats = &full;
+		hd.connected = true;
+		apply_key( u, KEY_DOWN, 10 );
+		apply_key( u, KEY_DOWN, 10 );
+		render_frame( hd, u, 40, 120 );
+		CHECK( u.slot_sel == 1, "the selection stops at the last slot (%d)", u.slot_sel );
+		apply_key( u, KEY_UP, 10 );
+		apply_key( u, '\r', 10 );
+		const std::string f = render_frame( hd, u, 40, 120 );
+		CHECK( u.slot_sel == 0 && f.find( "% full" ) != std::string::npos, "Enter shows the detail of the picked slot" );
+		apply_key( u, 'p', 10 );
+		CHECK( u.paused && render_frame( hd, u, 40, 120 ).find( "PAUSED" ) != std::string::npos, "p pauses" );
+	}
+
 	UiState k;
 	CHECK( apply_key( k, '3', 10 ) && k.tab == TAB_GPUS, "digit selects a tab" );
-	CHECK( apply_key( k, KEY_TAB, 10 ) && k.tab == TAB_LOG, "tab key advances" );
+	CHECK( apply_key( k, KEY_TAB, 10 ) && k.tab == TAB_EXPERTS, "tab key advances" );
+	CHECK( apply_key( k, KEY_TAB, 10 ) && k.tab == TAB_LOG, "tab key reaches the log" );
 	CHECK( apply_key( k, KEY_TAB, 10 ) && k.tab == TAB_OVERVIEW, "tab key wraps" );
 	CHECK( !apply_key( k, 'q', 10 ), "q quits" );
 	UiState s;

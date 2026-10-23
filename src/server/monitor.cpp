@@ -90,7 +90,12 @@ std::string VoltaServer::stats_json() {
 }
 
 void VoltaServer::handle_api_experts( const ConnPtr& conn ) {
+	send_json( conn, 200, experts_json() );
+}
+
+std::string VoltaServer::experts_json() {
 	using nlohmann::json;
+	if ( !generator_ ) return std::string();
 	const auto e = generator_->get_expert_stats();
 	json j;
 	j["ranks"] = e.ranks;
@@ -101,7 +106,7 @@ void VoltaServer::handle_api_experts( const ConnPtr& conn ) {
 	for ( float v : e.recent ) recent.push_back( static_cast<int>( v + 0.5f ) );
 	j["total"] = total;
 	j["recent"] = recent;
-	send_json( conn, 200, j.dump() );
+	return j.dump();
 }
 
 } // namespace engine::server

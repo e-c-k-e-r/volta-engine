@@ -21,7 +21,7 @@ constexpr const char* GREEN = "\x1b[32m";
 constexpr const char* YELLOW = "\x1b[33m";
 constexpr const char* CYAN = "\x1b[36m";
 
-const char* const TAB_NAMES[TAB_COUNT] = { "Overview", "Slots", "GPUs", "Log" };
+const char* const TAB_NAMES[TAB_COUNT] = { "Overview", "Slots", "GPUs", "Experts", "Log" };
 
 // ---- reading the stats document; every accessor tolerates a missing key, so an older or smaller server still renders
 
@@ -213,6 +213,23 @@ void overview( const json& s, int cols, Lines* out ) {
 		out->push_back( "  token gap  p50 " + ms( num( &( *gap )[0] ) ) + "   p90 " + ms( num( &( *gap )[1] ) ) + "   p99 " + ms( num( &( *gap )[2] ) ) +
 			"   p99.9 " + ms( num( &( *gap )[3] ) ) + "   max " + ms( num( &( *gap )[4] ) ) );
 	}
+	if ( const json* h = get( s, "latency", "gap_hist" ); h && h->is_array() && h->size() == 12 ) {   // log2 buckets from 1 ms
+		static const char* const LABELS[12] = { "<2", "4", "8", "16", "32", "64", "128", "256", "512", "1k", "2k", ">2k" };
+		std::vector<double> v;
+		double top = 0.0;
+		for ( const auto& x : *h ) { v.push_back( num( &x ) ); top = std::max( top, v.back() ); }
+		if ( top > 0.0 ) {
+			std::string blocks = "  gap ms  ", names = "          ";
+			for ( int i = 0; i < 12; ++i ) {
+				const std::string cell = spark( { v[static_cast<size_t>( i )] }, 1, top );
+				blocks += std::string( CYAN ) + cell + RESET + "    ";
+				names += pad( LABELS[i], 5 );
+			}
+			out->push_back( DIM + std::string( "  token gaps by size (time between tokens, buckets doubling from 2 ms; height = share of samples)" ) + RESET );
+			out->push_back( blocks );
+			out->push_back( std::string( DIM ) + names + RESET );
+		}
+	}
 	const json* tt = get( s, "latency", "ttft_ms" );
 	if ( tt && tt->is_array() && tt->size() >= 3 ) {
 		out->push_back( "  ttft       p50 " + ms( num( &( *tt )[0] ) ) + "   p90 " + ms( num( &( *tt )[1] ) ) + "   p99 " + ms( num( &( *tt )[2] ) ) );
@@ -263,29 +280,50 @@ void overview( const json& s, int cols, Lines* out ) {
 	}
 }
 
-void slots( const json& s, int cols, Lines* out ) {
+void slots( const json& s, const UiState& ui, int cols, Lines* out ) {
 	const int barw = std::max( 8, std::min( 24, cols / 6 ) );
 	const double ctx = num( s, "server", "max_context" );
 	out->push_back( heading( "Slots" ) );
 	out->push_back( std::string( DIM ) + "  " + lpad( "slot", 4 ) + " " + pad( "phase", 9 ) + " " + pad( "req", 8 ) + " " + pad( "context", static_cast<size_t>( barw ) + 2 ) + " " + lpad( "pos", 7 ) + "  " + lpad( "prompt", 6 ) + "  " +
 		lpad( "cached", 6 ) + "  " + lpad( "generated", 9 ) + "/" + pad( "max", 6 ) + lpad( "age", 8 ) + "  " + lpad( "tok/s", 6 ) + RESET );
-	if ( const json* sl = get( s, "slots" ); sl && sl->is_array() ) {
+	const json* sl = get( s, "slots" );
+	if ( sl && sl->is_array() ) {
+		int row = 0;
 		for ( const auto& x : *sl ) {
+			const bool selected = row++ == ui.slot_sel;
 			const std::string phase = str( x, "phase" );
 			const bool idle = phase == "idle";
 			const double pos = num( x, "pos" );
-			std::string l = "  " + lpad( format( "%.0f", num( x, "slot" ) ), 4 ) + " " + pad( phase, 9 ) + " ";
+			const std::string lead = selected ? std::string( BOLD ) + "> " + RESET : "  ";
+			std::string l = lead + lpad( format( "%.0f", num( x, "slot" ) ), 4 ) + " " + pad( phase, 9 ) + " ";
 			if ( idle ) {
-				l = std::string( DIM ) + l + "-" + RESET;
+				l = lead + DIM + lpad( format( "%.0f", num( x, "slot" ) ), 4 ) + " " + pad( phase, 9 ) + " -" + RESET;
 			}
 			else {
 				const char* pc = phase == "prefill" ? YELLOW : phase == "thinking" ? CYAN : GREEN;
-				l = "  " + lpad( format( "%.0f", num( x, "slot" ) ), 4 ) + " " + pc + pad( phase, 9 ) + RESET + " " + pad( "#" + format( "%.0f", num( x, "req_id" ) ), 8 ) + " " +
+				l = lead + lpad( format( "%.0f", num( x, "slot" ) ), 4 ) + " " + pc + pad( phase, 9 ) + RESET + " " + pad( "#" + format( "%.0f", num( x, "req_id" ) ), 8 ) + " " +
 					bar( ctx > 0 ? pos / ctx : 0.0, barw ) + " " + lpad( count( pos ), 7 ) + "  " + lpad( count( num( x, "prompt_tokens" ) ), 6 ) + "  " +
 					lpad( count( num( x, "cached_tokens" ) ), 6 ) + "  " + lpad( count( num( x, "generated" ) ), 9 ) + "/" + pad( count( num( x, "max_tokens" ) ), 6 ) +
 					lpad( duration( num( x, "age_s" ) ), 8 ) + "  " + lpad( format( "%.1f", num( x, "decode_tok_s" ) ), 6 );
 			}
 			out->push_back( l );
+		}
+	}
+	if ( ui.slot_detail && sl && sl->is_array() && ui.slot_sel < static_cast<int>( sl->size() ) ) {
+		const json& x = ( *sl )[static_cast<size_t>( ui.slot_sel )];
+		out->push_back( "" );
+		out->push_back( heading( "Slot " + std::to_string( ui.slot_sel ) ) + std::string( DIM ) + "  (Enter closes)" + RESET );
+		if ( str( x, "phase" ) == "idle" ) {
+			out->push_back( "  idle" );
+		}
+		else {
+			const double pos = num( x, "pos" ), prompt = num( x, "prompt_tokens" ), cached = num( x, "cached_tokens" ), gen = num( x, "generated" ), mx = num( x, "max_tokens" ), rate = num( x, "decode_tok_s" );
+			out->push_back( "  request #" + format( "%.0f", num( x, "req_id" ) ) + "   " + str( x, "phase" ) + " for " + duration( num( x, "age_s" ) ) );
+			out->push_back( "  context   " + count( pos ) + " of " + count( ctx ) + " (" + format( "%.1f", ctx > 0 ? pos * 100.0 / ctx : 0.0 ) + "% full)" );
+			out->push_back( "  prompt    " + count( prompt ) + " tokens, " + count( cached ) + " from the prefix cache (" + format( "%.1f", prompt > 0 ? cached * 100.0 / prompt : 0.0 ) + "%)" );
+			std::string g = "  output    " + count( gen ) + " of at most " + count( mx ) + " tokens at " + format( "%.1f", rate ) + " tok/s";
+			if ( rate > 0.0 && mx > gen ) g += "; the limit is " + duration( ( mx - gen ) / rate ) + " away";
+			out->push_back( g );
 		}
 	}
 	out->push_back( "" );
@@ -336,9 +374,149 @@ void gpus( const json& s, int cols, Lines* out ) {
 	}
 }
 
+
+// Cell colours for the routing heat map: dark (cold) through blue and green to orange and red (hot)
+const int HEAT_RAMP[] = { 236, 24, 31, 36, 71, 142, 208, 196 };
+
+std::string heat_color( bool background, double f ) {
+	f = std::min( 0.999, std::max( 0.0, f ) );
+	return "\x1b[" + std::string( background ? "48" : "38" ) + ";5;" + std::to_string( HEAT_RAMP[static_cast<int>( f * 8.0 )] ) + "m";
+}
+
+void experts_tab( const json* e, const std::string& error, const UiState& ui, int cols, int rows, Lines* out ) {
+	if ( !e ) {
+		out->push_back( error.empty() ? std::string( "loading the routing counters..." ) : std::string( RED ) + "no routing data: " + error + RESET );
+		return;
+	}
+	const int R = static_cast<int>( num( *e, "ranks" ) ), L = static_cast<int>( num( *e, "layers" ) ), E = static_cast<int>( num( *e, "experts" ) );
+	const json* arr = get( *e, ui.experts_total ? "total" : "recent" );
+	if ( R <= 0 || L <= 0 || E <= 0 || !arr || !arr->is_array() || arr->size() != static_cast<size_t>( R ) * L * E ) {
+		out->push_back( std::string( DIM ) + "No routing counters: this model has no mixture-of-experts layers, or expert_stats is off." + RESET );
+		return;
+	}
+	const int C = R * E;
+	std::vector<double> v;
+	v.reserve( arr->size() );
+	for ( const auto& x : *arr ) v.push_back( num( &x ) );
+	auto at = [&]( int r, int l, int x ) { return v[( static_cast<size_t>( r ) * L + l ) * E + x]; };
+	double sum = 0.0;
+	std::vector<double> per_rank( static_cast<size_t>( R ), 0.0 ), per_expert( static_cast<size_t>( C ), 0.0 ), imb;
+	for ( int l = 0; l < L; ++l ) {
+		double lsum = 0.0, lmax = 0.0;
+		for ( int r = 0; r < R; ++r ) {
+			for ( int x = 0; x < E; ++x ) {
+				const double c = at( r, l, x );
+				sum += c; lsum += c; per_rank[static_cast<size_t>( r )] += c; per_expert[static_cast<size_t>( r ) * E + x] += c;
+				lmax = std::max( lmax, c );
+			}
+		}
+		if ( lsum > 0.0 ) imb.push_back( lmax / ( lsum / C ) );
+	}
+	int live = 0;
+	for ( double c : per_expert ) live += c > 0.0;
+	double imbalance = 0.0;
+	for ( double x : imb ) imbalance += x;
+	imbalance = imb.empty() ? 0.0 : imbalance / static_cast<double>( imb.size() );
+	std::vector<int> order( static_cast<size_t>( C ) );
+	for ( int i = 0; i < C; ++i ) order[static_cast<size_t>( i )] = i;
+	std::sort( order.begin(), order.end(), [&]( int a, int b ) { return per_expert[static_cast<size_t>( a )] > per_expert[static_cast<size_t>( b )]; } );
+	double top10 = 0.0;
+	for ( int i = 0; i < std::min( 10, C ); ++i ) top10 += per_expert[static_cast<size_t>( order[static_cast<size_t>( i )] )];
+
+	out->push_back( heading( "Expert routing" ) + std::string( DIM ) + ( ui.experts_total ? "  since boot (m: recent minute)" : "  recent minute (m: since boot)" ) + RESET );
+	out->push_back( "  " + count( sum ) + " routes, " + std::to_string( L ) + " layers x " + std::to_string( C ) + " experts" + ( R > 1 ? " on " + std::to_string( R ) + " ranks" : std::string() ) );
+	out->push_back( "  experts used " + std::string( live < C ? YELLOW : GREEN ) + std::to_string( live ) + " / " + std::to_string( C ) + RESET + "   layer imbalance " + format( "%.2f", imbalance ) + "x   top 10 share " +
+		format( "%.1f", sum > 0 ? top10 * 100.0 / sum : 0.0 ) + "% (even: " + format( "%.1f", 1000.0 / C ) + "%)" );
+	if ( R > 1 ) {
+		const int bw = std::max( 10, std::min( 30, cols / 4 ) );
+		for ( int r = 0; r < R; ++r ) {
+			const double share = sum > 0 ? per_rank[static_cast<size_t>( r )] / sum : 0.0;
+			out->push_back( "  rank " + std::to_string( r ) + " " + bar( share * R / 2.0, bw, false ) + lpad( format( "%.1f", share * 100.0 ), 6 ) + "%" +
+				( std::fabs( share * R - 1.0 ) > 0.15 ? std::string( YELLOW ) + "  uneven" + RESET : std::string() ) );
+		}
+	}
+	out->push_back( "" );
+	out->push_back( DIM + std::string( "  hottest experts" ) + RESET );
+	for ( int i = 0; i < std::min( 5, C ); ++i ) {
+		const int id = order[static_cast<size_t>( i )];
+		out->push_back( "    expert " + lpad( std::to_string( id ), 5 ) + ( R > 1 ? "  (rank " + std::to_string( id / E ) + ")" : std::string() ) + "  " + lpad( count( per_expert[static_cast<size_t>( id )] ), 12 ) + "  " +
+			lpad( format( "%.2f", sum > 0 ? per_expert[static_cast<size_t>( id )] * 100.0 / sum : 0.0 ), 6 ) + "%" );
+	}
+	out->push_back( "" );
+
+	// heat map: layers down (two per text row, as the halves of a block character), experts across; cells that do not fit are averaged
+	const int label = 5;
+	const int width = std::max( 8, cols - label - 1 );
+	const int per_col = ( C + width - 1 ) / width;
+	const int ncols = ( C + per_col - 1 ) / per_col;
+	const int max_rows = std::max( 4, rows - static_cast<int>( out->size() ) - 6 );
+	const int per_row = std::max( 1, ( L + 2 * max_rows - 1 ) / ( 2 * max_rows ) );   // layers per half row
+	const int groups = ( L + per_row - 1 ) / per_row;
+	std::vector<double> cell( static_cast<size_t>( groups ) * ncols, 0.0 );
+	double top = 0.0;
+	for ( int g = 0; g < groups; ++g ) {
+		for ( int c = 0; c < ncols; ++c ) {
+			double acc = 0.0;
+			int n = 0;
+			for ( int l = g * per_row; l < std::min( L, ( g + 1 ) * per_row ); ++l ) {
+				for ( int x = c * per_col; x < std::min( C, ( c + 1 ) * per_col ); ++x ) { acc += at( x / E, l, x % E ); ++n; }
+			}
+			cell[static_cast<size_t>( g ) * ncols + c] = n ? acc / n : 0.0;
+			top = std::max( top, cell[static_cast<size_t>( g ) * ncols + c] );
+		}
+	}
+	const double lg = std::log1p( top );
+	auto level = [&]( int g, int c ) { return g < groups && lg > 0.0 ? std::log1p( cell[static_cast<size_t>( g ) * ncols + c] ) / lg : 0.0; };
+	std::string ruler = std::string( static_cast<size_t>( label ), ' ' );
+	for ( int c = 0; c < ncols; ++c ) {
+		const bool edge = R > 1 && c > 0 && ( c * per_col ) % E < per_col;   // the first column of a rank
+		ruler += edge ? '|' : ' ';
+	}
+	out->push_back( DIM + std::string( "  layers down, experts across" ) + ( R > 1 ? "; | marks a rank" : "" ) + ( per_col > 1 ? "; a column is " + std::to_string( per_col ) + " experts" : std::string() ) +
+		( per_row > 1 ? "; a half row is " + std::to_string( per_row ) + " layers" : std::string() ) + RESET );
+	out->push_back( DIM + ruler + RESET );
+	for ( int g = 0; g < groups; g += 2 ) {
+		std::string line = std::string( DIM ) + lpad( std::to_string( g * per_row ), 4 ) + RESET + " ";
+		for ( int c = 0; c < ncols; ++c ) line += heat_color( false, level( g, c ) ) + heat_color( true, level( g + 1, c ) ) + "\xe2\x96\x80";
+		out->push_back( line + RESET );
+	}
+	out->push_back( DIM + std::string( "  cold" ) + RESET + " " + [&] { std::string k; for ( int i = 0; i < 8; ++i ) k += heat_color( true, ( i + 0.5 ) / 8.0 ) + "  "; return k + RESET; }() + " " + DIM + "hot (log scale)" + RESET );
+}
+
+struct Alert { bool critical; std::string text; };
+
+// Conditions worth a second look; the always-on power cap and idle clocks are not among them
+std::vector<Alert> alerts( const ViewData& d ) {
+	std::vector<Alert> a;
+	if ( !d.connected ) a.push_back( { true, "no connection" + ( d.error.empty() ? std::string() : ": " + d.error ) } );
+	if ( !d.stats ) return a;
+	const json& s = *d.stats;
+	if ( const json* g = get( s, "gpus" ); g && g->is_array() ) {
+		for ( const auto& x : *g ) {
+			const std::string id = "GPU " + format( "%.0f", num( x, "index" ) );
+			if ( num( x, "temp_c" ) >= 85.0 ) a.push_back( { true, id + " at " + format( "%.0f", num( x, "temp_c" ) ) + " C" } );
+			if ( const json* t = get( x, "throttle" ); t && t->is_array() ) {
+				for ( const auto& n : *t ) {
+					const std::string name = str( &n );
+					if ( name == "hw slowdown" || name == "hw thermal" || name == "sw thermal" || name == "hw power brake" ) a.push_back( { true, id + " throttled: " + name } );
+				}
+			}
+			const double total = num( x, "mem_total" );
+			if ( total > 0.0 && num( x, "mem_used" ) / total > 0.95 ) a.push_back( { false, id + " memory " + format( "%.0f", num( x, "mem_used" ) * 100.0 / total ) + "% full" } );
+		}
+	}
+	if ( num( s, "server", "queued" ) > 0.0 ) a.push_back( { false, format( "%.0f", num( s, "server", "queued" ) ) + " request(s) waiting for a slot" } );
+	if ( const json* gap = get( s, "latency", "gap_ms" ); gap && gap->is_array() && gap->size() >= 3 && num( &( *gap )[2] ) > 500.0 ) {
+		a.push_back( { false, "token gap p99 " + ms( num( &( *gap )[2] ) ) } );
+	}
+	const double mt = num( s, "host", "mem_total" );
+	if ( mt > 0.0 && num( s, "host", "mem_used" ) / mt > 0.95 ) a.push_back( { false, "host memory " + format( "%.0f", num( s, "host", "mem_used" ) * 100.0 / mt ) + "% full" } );
+	return a;
+}
+
 // ---- frame
 
-int body_rows( int rows ) { return std::max( 1, rows - 3 ); }
+int body_rows( int rows, bool has_alerts ) { return std::max( 1, rows - 3 - ( has_alerts ? 1 : 0 ) ); }
 
 } // namespace
 
@@ -347,10 +525,15 @@ bool apply_key( UiState& ui, int key, int page ) {
 		case 'q': case 'Q': return false;
 		case KEY_TAB: case KEY_RIGHT: ui.tab = ( ui.tab + 1 ) % TAB_COUNT; break;
 		case KEY_BTAB: case KEY_LEFT: ui.tab = ( ui.tab + TAB_COUNT - 1 ) % TAB_COUNT; break;
-		case '1': case '2': case '3': case '4': ui.tab = key - '1'; break;
+		case 'p': case 'P': ui.paused = !ui.paused; break;
+		case 'm': case 'M': ui.experts_total = !ui.experts_total; break;
+		case '\r': case '\n': if ( ui.tab == TAB_SLOTS ) ui.slot_detail = !ui.slot_detail; break;
 		default: {
+			if ( key >= '1' && key < '1' + TAB_COUNT ) { ui.tab = key - '1'; break; }
 			const int sign = ui.tab == TAB_LOG ? 1 : -1;   // the log counts lines above the tail
 			int& sc = ui.scroll[ui.tab];
+			if ( ui.tab == TAB_SLOTS && ( key == KEY_UP || key == 'k' ) ) { --ui.slot_sel; break; }   // the arrows pick a slot there; the page keys scroll
+			if ( ui.tab == TAB_SLOTS && ( key == KEY_DOWN || key == 'j' ) ) { ++ui.slot_sel; break; }
 			if ( key == KEY_UP || key == 'k' ) sc += sign;
 			else if ( key == KEY_DOWN || key == 'j' ) sc -= sign;
 			else if ( key == KEY_PGUP ) sc += sign * page;
@@ -367,16 +550,19 @@ std::string render_frame( const ViewData& data, UiState& ui, int rows, int cols 
 	rows = std::max( rows, 6 );
 	cols = std::max( cols, 20 );
 	std::vector<std::string> screen;
+	const std::vector<Alert> alert = alerts( data );
+	bool critical = false;
+	for ( const Alert& a : alert ) critical = critical || a.critical;
 
-	// title bar
+	// title bar: red when something needs attention, yellow for a warning
 	std::string title = " volta-top";
 	if ( data.stats ) title += "  " + str( *data.stats, "server", "model" ) + "  up " + duration( num( *data.stats, "server", "uptime_s" ) );
-	std::string right = data.connected ? "connected " : "NO CONNECTION ";
+	std::string right = ( ui.paused ? "PAUSED  " : std::string() ) + ( data.connected ? "connected " : "NO CONNECTION " );
 	if ( !data.source.empty() ) right = data.source + "  " + right;
 	const int gap = cols - visible_width( title ) - visible_width( right );
 	title = fit( title, cols );
-	std::string bar_line = std::string( REVERSE ) + title + ( gap > 0 ? std::string( static_cast<size_t>( gap ), ' ' ) + right : std::string() );
-	screen.push_back( bar_line );
+	const char* title_style = critical ? "\x1b[41;97m" : !alert.empty() ? "\x1b[43;30m" : REVERSE;
+	screen.push_back( std::string( title_style ) + title + ( gap > 0 ? std::string( title_style ) + std::string( static_cast<size_t>( gap ), ' ' ) + right : std::string() ) );
 
 	// tab bar
 	std::string tabs;
@@ -385,9 +571,15 @@ std::string render_frame( const ViewData& data, UiState& ui, int rows, int cols 
 		tabs += ( t == ui.tab ? std::string( REVERSE ) + BOLD + label + RESET : label ) + " ";
 	}
 	screen.push_back( tabs );
+	if ( !alert.empty() ) {
+		std::string line;
+		for ( const Alert& a : alert ) line += std::string( a.critical ? RED : YELLOW ) + "! " + a.text + RESET + "   ";
+		screen.push_back( line );
+	}
 
 	// body
 	Lines body;
+	const int avail = body_rows( rows, !alert.empty() );
 	if ( ui.tab == TAB_LOG ) {
 		if ( !data.log ) body.push_back( std::string( DIM ) + "The log is shown only when the server runs with --tui; this viewer has no access to its console output." + RESET );
 		else body = *data.log;
@@ -397,11 +589,16 @@ std::string render_frame( const ViewData& data, UiState& ui, int rows, int cols 
 	}
 	else {
 		if ( !data.connected ) body.push_back( std::string( RED ) + "connection lost (" + data.error + "); the numbers below are the last reading" + RESET );
+		if ( ui.tab == TAB_SLOTS ) {
+			const json* sl = get( *data.stats, "slots" );
+			const int n = sl && sl->is_array() ? static_cast<int>( sl->size() ) : 0;
+			ui.slot_sel = std::min( std::max( ui.slot_sel, 0 ), std::max( 0, n - 1 ) );
+		}
 		if ( ui.tab == TAB_OVERVIEW ) overview( *data.stats, cols, &body );
-		else if ( ui.tab == TAB_SLOTS ) slots( *data.stats, cols, &body );
-		else gpus( *data.stats, cols, &body );
+		else if ( ui.tab == TAB_SLOTS ) slots( *data.stats, ui, cols, &body );
+		else if ( ui.tab == TAB_GPUS ) gpus( *data.stats, cols, &body );
+		else experts_tab( data.experts, data.experts_error, ui, cols, avail, &body );
 	}
-	const int avail = body_rows( rows );
 	const int total = static_cast<int>( body.size() );
 	const int max_scroll = std::max( 0, total - avail );
 	int& sc = ui.scroll[ui.tab];
@@ -413,7 +610,11 @@ std::string render_frame( const ViewData& data, UiState& ui, int rows, int cols 
 	}
 
 	// footer
-	std::string foot = std::string( DIM ) + " Tab/1-4 switch   Up/Down PgUp/PgDn Home/End scroll   q quit" + RESET;
+	std::string keys = " Tab/1-" + std::to_string( TAB_COUNT ) + " switch   PgUp/PgDn Home/End scroll   p pause   q quit";
+	if ( ui.tab == TAB_SLOTS ) keys += "   Up/Down pick a slot   Enter detail";
+	else if ( ui.tab == TAB_EXPERTS ) keys += "   m since boot / recent";
+	else keys += "   Up/Down scroll";
+	std::string foot = std::string( DIM ) + keys + RESET;
 	if ( max_scroll > 0 ) {
 		const int shown = ui.tab == TAB_LOG ? max_scroll - sc : sc;
 		foot += std::string( DIM ) + "   lines " + std::to_string( shown + 1 ) + "-" + std::to_string( std::min( total, shown + avail ) ) + " of " + std::to_string( total ) + RESET;

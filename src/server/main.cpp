@@ -3,6 +3,7 @@
 #include "engine/server/config.h"
 #include "engine/server/tui/app.h"
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <sched.h>
 
@@ -34,10 +35,10 @@ int main( int argc, char** argv ) {
 	// The dashboard starts after the load, so the loading messages stay on the console; it hands the terminal back before the server shuts down
 	engine::server::tui::ServerTui tui;
 	if ( cfg.tui ) {
-		auto fetch = [&server]( nlohmann::json* stats, std::string* error ) {
-			const std::string doc = server->stats_json();
-			*stats = nlohmann::json::parse( doc, nullptr, false );
-			if ( doc.empty() || stats->is_discarded() ) {
+		auto fetch = [&server]( const char* what, nlohmann::json* doc, std::string* error ) {
+			const std::string text = std::strcmp( what, "experts" ) == 0 ? server->experts_json() : server->stats_json();
+			*doc = nlohmann::json::parse( text, nullptr, false );
+			if ( text.empty() || doc->is_discarded() ) {
 				*error = "this server has no language-model statistics";
 				return false;
 			}

@@ -41,12 +41,12 @@ int main( int argc, char** argv ) {
 		return 1;
 	}
 	std::atomic<bool> stop{ false };
-	auto fetch = [&]( nlohmann::json* stats, std::string* error ) {
+	auto fetch = [&]( const char* what, nlohmann::json* doc, std::string* error ) {
 		std::string body;
-		if ( !http_get( host, port, "/api/stats", 800, &body, error ) ) return false;
-		*stats = nlohmann::json::parse( body, nullptr, false );
-		if ( stats->is_discarded() ) {
-			*error = "/api/stats did not return JSON (is this a language-model server?)";
+		if ( !http_get( host, port, std::string( "/api/" ) + what, 800, &body, error ) ) return false;
+		*doc = nlohmann::json::parse( body, nullptr, false );
+		if ( doc->is_discarded() ) {
+			*error = std::string( "/api/" ) + what + " did not return JSON (is this a language-model server?)";
 			return false;
 		}
 		return true;

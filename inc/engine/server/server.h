@@ -30,6 +30,8 @@ public:
 	void run();
 	// The /api/stats document (empty without a language-model runtime); safe to call from any thread
 	std::string stats_json();
+	// The /api/experts document (the MoE routing counters; empty without a language-model runtime)
+	std::string experts_json();
 	// Called first thing when the server stops, before the shutdown messages (a dashboard restores the terminal here)
 	void set_stop_hook( std::function<void()> hook ) { stop_hook_ = std::move( hook ); }
 	void request_stop();

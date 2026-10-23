@@ -63,7 +63,8 @@ The `/monitor` page: one self-contained HTML string (Monokai or Tomorrow Night t
 ## `src/server/tui/`
 
 The terminal dashboard, one view in two hosts: `volta_top [host[:port]]` polls a running server's `/api/stats` (so it attaches to any server, at any time), and `volta_server --tui` (or `"tui": true`) runs the same view on a thread inside the server.
-* `view` renders a frame from the `/api/stats` document: Overview, Slots (with recent requests), GPUs and Log tabs, scrolling, a missing key never fails a frame
+* `view` renders a frame from the `/api/stats` document: Overview (throughput sparklines from the 15-minute history, token-gap histogram), Slots (pick a slot, `Enter` for its detail, recent requests), GPUs, Experts (the `/api/experts` routing heat map, fetched only while that tab is open; `m` switches between the recent minute and since boot) and Log; scrolling; `p` pauses; a missing key never fails a frame
+* an alert row appears under the tabs and the title bar turns red (yellow for warnings) for: no connection, a GPU at 85 C or more or throttled by hardware or thermal limits (the software power cap is not one), GPU or host memory over 95%, waiting requests, a p99 token gap over 500 ms
 * `term` is the raw-mode terminal on the alternate screen; Ctrl-C still reaches the server's handler
 * `app` has the viewer loop (one reading per second), `StdioCapture` (descriptors 1 and 2 go to a pipe while the dashboard is up, so `printf` and library output land in the Log tab instead of tearing the screen) and `ServerTui`; `q`, or the server stopping, restores the terminal and the console output
 * `http_get` is the small blocking client `volta_top` uses; the Log tab is empty there, since console output is only available inside the server process
