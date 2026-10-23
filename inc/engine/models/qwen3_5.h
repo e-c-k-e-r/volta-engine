@@ -214,22 +214,17 @@ private:
 
 	// DFlash2 attachment (see DraftHooks): tap ring, head scratch and per-rank candidate top-k scratch.
 	DraftHooks draft_hooks_;
-	pod::TensorView draft_taps_;         // [taps_cap, 5 * hidden]
+	DraftScratch draft_;               // drafter tap ring, head logits and candidate top-k scratch
 	size_t tap_snapshot_bytes( int tokens ) const;
 	void copy_kv_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	bool snap_taps_ = false;             // sequence snapshots include the tap ring rows
-	pod::TensorView draft_lm_logits_;    // [kDraftM, lm_shard_cols]
 	static constexpr int kTopkTile = 4096;   // TOPK_THREADS * 16
-	float* draft_cand_part_v_ = nullptr;
-	int* draft_cand_part_i_ = nullptr;
-	int* draft_cand_counters_ = nullptr;
 	// Sampling top-k scratch (target logits, up to MAX_BATCH rows).
 	float* samp_part_v_ = nullptr;
 	int* samp_part_i_ = nullptr;
 	int* samp_counters_ = nullptr;
 	float* d_samp_vals_ = nullptr;
 	int* d_samp_idx_ = nullptr;
-	int* d_taps_owner_ = nullptr;
 
 	// MTP head (speculator=mtp): fc over [embedding | hidden], one full-attention decoder layer, final norm; shares the LM head
 	bool mtp_on_ = false;

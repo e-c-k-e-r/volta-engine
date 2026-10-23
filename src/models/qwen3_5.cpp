@@ -98,14 +98,7 @@ bool Qwen3_5Pipeline::init(
 	// The ring is per position, not per slot (a per-slot ring would cost ~840 MiB per rank), so only
 	// one slot may publish into it: rows from every other slot are skipped on device. The owner is a
 	// device scalar so the captured forward graph stays valid when it changes. -1 publishes nothing.
-	draft_hooks_.taps_cap = MAX( MIN( config_.max_seq, 2048 ), 256 );
-	int wtap_shape[2] = { draft_hooks_.taps_cap, 5 * config_.hidden_size };
-	draft_taps_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, wtap_shape, 2 );
-	backend::memset_sync( draft_taps_.data, 0, wtap_shape[0] * wtap_shape[1] * sizeof( backend::half_t ) );
-	d_taps_owner_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
-	backend::memset_sync( d_taps_owner_, 0xFF, sizeof( int ) );
-	draft_hooks_.taps = draft_taps_.ptr<const backend::half_t>();
-	draft_hooks_.taps_owner = d_taps_owner_;
+	engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, config_.hidden_size, 1, false );
 	draft_hooks_.embedding = &embed_tokens_;
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
@@ -200,23 +193,7 @@ bool Qwen3_5Pipeline::init(
 		// lm_in, the head shard writes [kDraftM, shard] logits, and the local top-k comes out in
 		// cand_vals / cand_idx. Each row's candidate set is the top-k over the union of every rank's
 		// shard, so every rank needs all of it.
-		{
-			const int kM = kDraftM;
-			int ds[2] = { kM, config_.hidden_size };
-			draft_hooks_.lm_in = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ds, 2 ).ptr<backend::half_t>();
-			int dl[2] = { kM, lm_shard_cols_ };
-			draft_lm_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, dl, 2 );
-			const int splits = ( lm_shard_cols_ + kTopkTile - 1 ) / kTopkTile;
-			const size_t per = static_cast<size_t>( kM ) * splits * kDraftTopK;
-			draft_cand_part_v_ = static_cast<float*>( engine::core::arena_alloc( arena, per * sizeof( float ) ) );
-			draft_cand_part_i_ = static_cast<int*>( engine::core::arena_alloc( arena, per * sizeof( int ) ) );
-			draft_cand_counters_ = static_cast<int*>( engine::core::arena_alloc( arena, kM * sizeof( int ) ) );
-			draft_hooks_.cand_vals = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( kM ) * kDraftTopK * sizeof( float ) ) );
-			draft_hooks_.cand_idx = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( kM ) * kDraftTopK * sizeof( int ) ) );
-			backend::memset_sync( draft_cand_counters_, 0, kM * sizeof( int ) );
-			draft_hooks_.shard_offset = rank_ * lm_shard_real_cols_;
-			draft_hooks_.shard_real_cols = lm_shard_real_cols_;
-		}
+		engine::models::alloc_draft_head( arena, draft_hooks_, draft_, config_.hidden_size, lm_shard_cols_, kTopkTile, rank_ * lm_shard_real_cols_, lm_shard_real_cols_ );
 	}
 
 	for ( int L = 0; L < config_.num_layers; ++L ) {
@@ -612,13 +589,13 @@ void Qwen3_5Pipeline::draft_head_topk( int rows, backend::stream_t stream ) {
 	// All kDraftM rows, whatever `rows` is: the head's fast path only covers m in {1, 2, 4, 8}, and any
 	// other m falls through to the cooperative GEMM (far slower). The caller consumes the first rows.
 	pod::TensorView in = pod::make_tensor_2d( draft_hooks_.lm_in, pod::DType::FP16, kDraftM, H );
-	engine::modules::Linear::forward( in, lm_head_, draft_lm_logits_, stream );
+	engine::modules::Linear::forward( in, lm_head_, draft_.lm_logits, stream );
 	// Columns are the slice's real width: pad columns hold the next rank's tokens, so scanning them
 	// would put the same token in two ranks' candidate sets and let the merge emit it twice.
 	engine::spec::dflash2_topk_shard(
-		draft_lm_logits_.ptr<const backend::half_t>(), kDraftM, lm_shard_cols_, lm_shard_real_cols_, kDraftTopK,
+		draft_.lm_logits.ptr<const backend::half_t>(), kDraftM, lm_shard_cols_, lm_shard_real_cols_, kDraftTopK,
 		draft_hooks_.cand_vals, draft_hooks_.cand_idx, draft_hooks_.shard_offset,
-		draft_cand_part_v_, draft_cand_part_i_, draft_cand_counters_, stream );
+		draft_.cand_part_v, draft_.cand_part_i, draft_.cand_counters, stream );
 }
 
 void Qwen3_5Pipeline::forward( const pod::BatchRows& rows, backend::stream_t stream ) {
@@ -870,7 +847,7 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 			// the owner all come from device memory: forward_body is replayed from a CUDA graph keyed
 			// only on the row count, and a host-side value would be frozen at capture time.
 			engine::spec::dflash_publish_taps(
-				draft_taps_.ptr<backend::half_t>(), hidden_states_.ptr<const backend::half_t>(), d_rows_, d_taps_owner_,
+				draft_.taps.ptr<backend::half_t>(), hidden_states_.ptr<const backend::half_t>(), d_rows_, draft_.taps_owner,
 				m, tap, config_.hidden_size, draft_hooks_.taps_cap, stream );
 		}
 	}
@@ -1096,7 +1073,7 @@ bool Qwen3_5Pipeline::save_seq_state( int slot_id, int from, int tokens, bool wi
 	backend::memcpy_async( dst + gdn, state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, conv, backend::Copy::D2H, stream );
 	dst += gdn + conv;
 	if ( const size_t tap_bytes = with_taps ? tap_snapshot_bytes( tokens ) : 0 ) {
-		backend::memcpy_async( dst, draft_taps_.data, tap_bytes, backend::Copy::D2H, stream );
+		backend::memcpy_async( dst, draft_.taps.data, tap_bytes, backend::Copy::D2H, stream );
 		dst += tap_bytes;
 	}
 	copy_kv_rows( slot_id, from, tokens, dst, true, stream );
@@ -1112,7 +1089,7 @@ bool Qwen3_5Pipeline::load_seq_state( int slot_id, int from, int tokens, bool wi
 	if ( !kv_only ) {
 		backend::memcpy_async( state_.gdn_states + static_cast<size_t>( slot_id ) * state_.slot_gdn_floats, src, gdn, backend::Copy::H2D, stream );
 		backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, src + gdn, conv, backend::Copy::H2D, stream );
-		if ( tap_bytes ) backend::memcpy_async( draft_taps_.data, src + gdn + conv, tap_bytes, backend::Copy::H2D, stream );
+		if ( tap_bytes ) backend::memcpy_async( draft_.taps.data, src + gdn + conv, tap_bytes, backend::Copy::H2D, stream );
 	}
 	copy_kv_rows( slot_id, from, tokens, const_cast<char*>( src ) + gdn + conv + tap_bytes, false, stream );
 	return true;

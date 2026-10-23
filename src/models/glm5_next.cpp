@@ -374,34 +374,12 @@ bool Glm5NextPipeline::init(
 	// 6. DFlash2 attachment: a position-indexed tap ring per slot (every slot's rows publish to its own, so each can feed the drafter), head scratch,
 	// candidate top-k scratch
 	{
-		draft_hooks_.taps_cap = MAX( MIN( config_.max_seq, 2048 ), 256 );
-		int wtap_shape[2] = { S * draft_hooks_.taps_cap, 5 * config_.hidden_size };
-		draft_hooks_.taps_slot_stride = static_cast<size_t>( draft_hooks_.taps_cap ) * 5 * config_.hidden_size;
-		draft_taps_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, wtap_shape, 2 );
-		backend::memset_sync( draft_taps_.data, 0, static_cast<size_t>( wtap_shape[0] ) * wtap_shape[1] * sizeof( backend::half_t ) );
-		d_taps_owner_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
-		backend::memset_sync( d_taps_owner_, 0xFF, sizeof( int ) );
-		draft_hooks_.taps = draft_taps_.ptr<const backend::half_t>();
-		draft_hooks_.taps_owner = d_taps_owner_;
+		engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, config_.hidden_size, S, true );
 		// embedding: set when the table is loaded (host-resident, shared by every rank)
 		int tap_shape[2] = { R, config_.hidden_size };
 		tap_tmp_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, tap_shape, 2 );
 
-		const int kM = kDraftM;
-		int ds[2] = { kM, config_.hidden_size };
-		draft_hooks_.lm_in = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ds, 2 ).ptr<backend::half_t>();
-		int dl[2] = { kM, lm_shard_cols_ };
-		draft_lm_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, dl, 2 );
-		const int splits = ( lm_shard_cols_ + kTopkTile - 1 ) / kTopkTile;
-		const size_t per = static_cast<size_t>( kM ) * splits * kDraftTopK;
-		draft_cand_part_v_ = static_cast<float*>( engine::core::arena_alloc( arena, per * sizeof( float ) ) );
-		draft_cand_part_i_ = static_cast<int*>( engine::core::arena_alloc( arena, per * sizeof( int ) ) );
-		draft_cand_counters_ = static_cast<int*>( engine::core::arena_alloc( arena, kM * sizeof( int ) ) );
-		draft_hooks_.cand_vals = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( kM ) * kDraftTopK * sizeof( float ) ) );
-		draft_hooks_.cand_idx = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( kM ) * kDraftTopK * sizeof( int ) ) );
-		backend::memset_sync( draft_cand_counters_, 0, kM * sizeof( int ) );
-		draft_hooks_.shard_offset = lm_shard_offset_;
-		draft_hooks_.shard_real_cols = lm_shard_real_cols_;
+		engine::models::alloc_draft_head( arena, draft_hooks_, draft_, config_.hidden_size, lm_shard_cols_, kTopkTile, lm_shard_offset_, lm_shard_real_cols_ );
 		draft_hooks_.embedding = &g_embed_table;
 	}
 
@@ -1342,11 +1320,11 @@ void Glm5NextPipeline::draft_head_topk( int rows, backend::stream_t stream ) {
 	backend::set_device( rank_ );
 	// All kDraftM rows, whatever `rows` is: the head's fast path only covers m in {1, 2, 4, 8}
 	pod::TensorView in = pod::make_tensor_2d( draft_hooks_.lm_in, pod::DType::FP16, kDraftM, config_.hidden_size );
-	engine::modules::Linear::forward( in, lm_head_, draft_lm_logits_, stream );
+	engine::modules::Linear::forward( in, lm_head_, draft_.lm_logits, stream );
 	engine::spec::dflash2_topk_shard(
-		draft_lm_logits_.ptr<const backend::half_t>(), kDraftM, lm_shard_cols_, lm_shard_real_cols_, kDraftTopK,
+		draft_.lm_logits.ptr<const backend::half_t>(), kDraftM, lm_shard_cols_, lm_shard_real_cols_, kDraftTopK,
 		draft_hooks_.cand_vals, draft_hooks_.cand_idx, draft_hooks_.shard_offset,
-		draft_cand_part_v_, draft_cand_part_i_, draft_cand_counters_, stream );
+		draft_.cand_part_v, draft_.cand_part_i, draft_.cand_counters, stream );
 }
 
 void Glm5NextPipeline::set_spec_snapshot( bool on, backend::stream_t stream ) {
@@ -2068,7 +2046,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 			if ( layer != config_.tap_layers[tap] ) continue;
 			engine::spec::dflash_reduce_streams( hidden_streams_.ptr<const float>(), tap_tmp_.ptr<backend::half_t>(), m, H, 0, stream );
 			engine::spec::dflash_publish_taps_slots(
-				draft_taps_.ptr<backend::half_t>(), tap_tmp_.ptr<const backend::half_t>(), d_rows_,
+				draft_.taps.ptr<backend::half_t>(), tap_tmp_.ptr<const backend::half_t>(), d_rows_,
 				m, tap, H, draft_hooks_.taps_cap, draft_hooks_.taps_slot_stride, stream );
 		}
 
@@ -2271,7 +2249,7 @@ bool Glm5NextPipeline::read_taps( int slot_id, int first_pos, int count, backend
 	if ( draft_hooks_.taps == nullptr || slot_id < 0 || slot_id >= config_.max_slots || first_pos < 0 || count <= 0 || count > cap ) return false;
 	backend::set_device( rank_ );
 	const size_t row = static_cast<size_t>( 5 ) * config_.hidden_size;
-	const backend::half_t* ring = draft_taps_.ptr<const backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride;
+	const backend::half_t* ring = draft_.taps.ptr<const backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride;
 	// Position p lives in ring row p % cap: at most two contiguous runs
 	for ( int done = 0; done < count; ) {
 		const int r = ( first_pos + done ) % cap;
@@ -2293,7 +2271,7 @@ bool Glm5NextPipeline::save_seq_state( int slot_id, int from, int tokens, bool w
 	backend::memcpy_async( dst + kda + conv, dsa_plane_ + static_cast<size_t>( slot_id ) * dsa_plane_stride_, planes, backend::Copy::D2H, stream );
 	dst += kda + conv + planes;
 	if ( const size_t tap_bytes = with_taps ? tap_snapshot_bytes( tokens ) : 0 ) {
-		backend::memcpy_async( dst, draft_taps_.ptr<backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride, tap_bytes, backend::Copy::D2H, stream );
+		backend::memcpy_async( dst, draft_.taps.ptr<backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride, tap_bytes, backend::Copy::D2H, stream );
 		dst += tap_bytes;
 	}
 	copy_seq_rows( slot_id, from, tokens, dst, true, stream );
@@ -2311,7 +2289,7 @@ bool Glm5NextPipeline::load_seq_state( int slot_id, int from, int tokens, bool w
 		backend::memcpy_async( state_.kda_states + static_cast<size_t>( slot_id ) * state_.slot_kda_floats, src, kda, backend::Copy::H2D, stream );
 		backend::memcpy_async( state_.conv_history + static_cast<size_t>( slot_id ) * state_.slot_conv_floats, src + kda, conv, backend::Copy::H2D, stream );
 		backend::memcpy_async( dsa_plane_ + static_cast<size_t>( slot_id ) * dsa_plane_stride_, src + kda + conv, planes, backend::Copy::H2D, stream );
-		if ( tap_bytes ) backend::memcpy_async( draft_taps_.ptr<backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride, src + kda + conv + planes, tap_bytes, backend::Copy::H2D, stream );
+		if ( tap_bytes ) backend::memcpy_async( draft_.taps.ptr<backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride, src + kda + conv + planes, tap_bytes, backend::Copy::H2D, stream );
 	}
 	copy_seq_rows( slot_id, from, tokens, const_cast<char*>( src ) + kda + conv + planes + tap_bytes, false, stream );
 	return true;

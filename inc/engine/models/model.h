@@ -36,6 +36,23 @@ struct DraftHooks {
 	bool valid() const { return embedding != nullptr && taps != nullptr; }
 };
 
+// Device buffers behind a model's DraftHooks: the tap ring, the drafter's head logits and the candidate top-k scratch. Owned by the arena.
+struct DraftScratch {
+	pod::TensorView taps;            // [slots * taps_cap, 5 * hidden] (one ring per slot) or [taps_cap, 5 * hidden] (one ring, one owner)
+	int* taps_owner = nullptr;
+	pod::TensorView lm_logits;       // [kDraftM, lm_shard_cols]
+	float* cand_part_v = nullptr;    // per-tile partial top-k of the head shard
+	int* cand_part_i = nullptr;
+	int* cand_counters = nullptr;
+};
+
+// The tap ring: taps_cap = clamp( max_seq, 256, 2048 ) positions of [5, hidden] per ring. per_slot gives every one of `slots` slots its own ring
+// (hooks.taps_slot_stride is set); otherwise one position-indexed ring is shared and taps_owner names the slot that publishes into it.
+void alloc_draft_taps( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int max_seq, int hidden, int slots, bool per_slot );
+
+// The drafter's head scratch: lm_in, the head shard's logits and the per-rank candidate top-k buffers, wired into the hooks
+void alloc_draft_head( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int hidden, int lm_shard_cols, int tile, int shard_offset, int shard_real_cols );
+
 struct ModelMetadata {
 	std::string model_name;
 	int hidden_size = 0;

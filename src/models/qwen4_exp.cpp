@@ -287,34 +287,11 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	// per-rank candidate top-k scratch. The MTP head has no use for them
 	draft_taps_on_ = !mtp_on_;
 	if ( draft_taps_on_ ) {
-		draft_hooks_.taps_cap = MAX( MIN( config_.max_seq, 2048 ), 256 );
-		const int tap_cols = 5 * H;
-		int wtap_shape[2] = { S * draft_hooks_.taps_cap, tap_cols };
-		draft_hooks_.taps_slot_stride = static_cast<size_t>( draft_hooks_.taps_cap ) * tap_cols;
-		draft_taps_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, wtap_shape, 2 );
-		backend::memset_sync( draft_taps_.data, 0, static_cast<size_t>( wtap_shape[0] ) * wtap_shape[1] * sizeof( backend::half_t ) );
-		d_taps_owner_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
-		backend::memset_sync( d_taps_owner_, 0xFF, sizeof( int ) );
-		draft_hooks_.taps = draft_taps_.ptr<const backend::half_t>();
-		draft_hooks_.taps_owner = d_taps_owner_;
+		engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, H, S, true );
 		draft_hooks_.embedding = &embed_table_;   // loaded by load_weights; the hooks point at the member
 		int tap_shape[2] = { R, H };
 		tap_tmp_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, tap_shape, 2 );
-		const int kM = kDraftM;
-		int ds[2] = { kM, H };
-		draft_hooks_.lm_in = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ds, 2 ).ptr<backend::half_t>();
-		int dl[2] = { kM, lm_shard_cols_ };
-		draft_lm_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, dl, 2 );
-		const int splits = ( lm_shard_cols_ + kTopkTile - 1 ) / kTopkTile;
-		const size_t per = static_cast<size_t>( kM ) * splits * kDraftTopK;
-		draft_cand_part_v_ = static_cast<float*>( engine::core::arena_alloc( arena, per * sizeof( float ) ) );
-		draft_cand_part_i_ = static_cast<int*>( engine::core::arena_alloc( arena, per * sizeof( int ) ) );
-		draft_cand_counters_ = static_cast<int*>( engine::core::arena_alloc( arena, kM * sizeof( int ) ) );
-		draft_hooks_.cand_vals = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( kM ) * kDraftTopK * sizeof( float ) ) );
-		draft_hooks_.cand_idx = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( kM ) * kDraftTopK * sizeof( int ) ) );
-		backend::memset_sync( draft_cand_counters_, 0, kM * sizeof( int ) );
-		draft_hooks_.shard_offset = rank_ * lm_shard_real_cols_;
-		draft_hooks_.shard_real_cols = lm_shard_real_cols_;
+		engine::models::alloc_draft_head( arena, draft_hooks_, draft_, H, lm_shard_cols_, kTopkTile, rank_ * lm_shard_real_cols_, lm_shard_real_cols_ );
 	}
 	// N-gram embedding layer buffers and per-slot histories
 	{
@@ -1363,7 +1340,7 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 				if ( L != config_.tap_layers[tap] ) continue;
 				flush_apply( m, stream );
 				engine::spec::dflash_reduce_streams( streams_.ptr<const float>(), tap_tmp_.ptr<backend::half_t>(), m, H, 0, stream );
-				engine::spec::dflash_publish_taps_slots( draft_taps_.ptr<backend::half_t>(), tap_tmp_.ptr<const backend::half_t>(), d_rows_,
+				engine::spec::dflash_publish_taps_slots( draft_.taps.ptr<backend::half_t>(), tap_tmp_.ptr<const backend::half_t>(), d_rows_,
 					m, tap, H, draft_hooks_.taps_cap, draft_hooks_.taps_slot_stride, stream );
 			}
 		}
@@ -1597,10 +1574,10 @@ void Qwen4ExpPipeline::draft_head_topk( int rows, backend::stream_t stream ) {
 	backend::set_device( rank_ );
 	// All kDraftM rows whatever `rows` is: the head's fast path covers m in {1, 2, 4, 8} only
 	pod::TensorView in = pod::make_tensor_2d( draft_hooks_.lm_in, pod::DType::FP16, kDraftM, config_.hidden_size );
-	engine::modules::Linear::forward( in, lm_head_, draft_lm_logits_, stream );
-	engine::spec::dflash2_topk_shard( draft_lm_logits_.ptr<const backend::half_t>(), kDraftM, lm_shard_cols_, lm_shard_real_cols_, kDraftTopK,
+	engine::modules::Linear::forward( in, lm_head_, draft_.lm_logits, stream );
+	engine::spec::dflash2_topk_shard( draft_.lm_logits.ptr<const backend::half_t>(), kDraftM, lm_shard_cols_, lm_shard_real_cols_, kDraftTopK,
 		draft_hooks_.cand_vals, draft_hooks_.cand_idx, draft_hooks_.shard_offset,
-		draft_cand_part_v_, draft_cand_part_i_, draft_cand_counters_, stream );
+		draft_.cand_part_v, draft_.cand_part_i, draft_.cand_counters, stream );
 }
 
 bool Qwen4ExpPipeline::read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream ) {
@@ -1608,7 +1585,7 @@ bool Qwen4ExpPipeline::read_taps( int slot_id, int first_pos, int count, backend
 	if ( draft_hooks_.taps == nullptr || slot_id < 0 || slot_id >= config_.max_slots || first_pos < 0 || count <= 0 || count > cap ) return false;
 	backend::set_device( rank_ );
 	const size_t row = static_cast<size_t>( 5 ) * config_.hidden_size;
-	const backend::half_t* ring = draft_taps_.ptr<const backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride;
+	const backend::half_t* ring = draft_.taps.ptr<const backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride;
 	// Position p lives in ring row p % cap: at most two contiguous runs
 	for ( int done = 0; done < count; ) {
 		const int r = ( first_pos + done ) % cap;
@@ -1724,7 +1701,7 @@ bool Qwen4ExpPipeline::save_seq_state( int slot_id, int from, int tokens, bool w
 	std::memcpy( dst, ctx, kCtxBytes );
 	dst += kCtxBytes;
 	if ( const size_t tap_bytes = with_taps ? tap_snapshot_bytes( tokens ) : 0 ) {
-		backend::memcpy_async( dst, draft_taps_.ptr<backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride, tap_bytes, backend::Copy::D2H, stream );
+		backend::memcpy_async( dst, draft_.taps.ptr<backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride, tap_bytes, backend::Copy::D2H, stream );
 		dst += tap_bytes;
 	}
 	dst += copy_kv_rows( slot_id, from, tokens, dst, true, stream );
@@ -1747,7 +1724,7 @@ bool Qwen4ExpPipeline::load_seq_state( int slot_id, int from, int tokens, bool w
 		std::memcpy( ctx, src + gdn + conv + ring, kCtxBytes );
 		if ( tokens >= 1 ) { hist_tok_[slot_id][tokens - 1] = ctx[0]; hist_seg_[slot_id][tokens - 1] = ctx[2]; }
 		if ( tokens >= 2 ) hist_tok_[slot_id][tokens - 2] = ctx[1];
-		if ( tap_bytes ) backend::memcpy_async( draft_taps_.ptr<backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride, src + gdn + conv + ring + kCtxBytes, tap_bytes, backend::Copy::H2D, stream );
+		if ( tap_bytes ) backend::memcpy_async( draft_.taps.ptr<backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride, src + gdn + conv + ring + kCtxBytes, tap_bytes, backend::Copy::H2D, stream );
 	}
 	char* kv_src = const_cast<char*>( src ) + gdn + conv + ring + kCtxBytes + tap_bytes;
 	kv_src += copy_kv_rows( slot_id, from, tokens, kv_src, false, stream );

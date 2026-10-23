@@ -195,13 +195,8 @@ private:
 	std::vector<HessianSite> hess_;
 	int hess_layer_ = 0;
 	DraftHooks draft_hooks_;
-	pod::TensorView draft_taps_;         // [slots * taps_cap, 5 * hidden]
+	DraftScratch draft_;               // drafter tap ring, head logits and candidate top-k scratch
 	pod::TensorView tap_tmp_;            // [MAX_ROWS, hidden] mean of the residual streams at a tapped layer
-	pod::TensorView draft_lm_logits_;    // [kDraftM, lm_shard_cols]
-	float* draft_cand_part_v_ = nullptr;
-	int* draft_cand_part_i_ = nullptr;
-	int* draft_cand_counters_ = nullptr;
-	int* d_taps_owner_ = nullptr;        // unused with per-slot rings
 	bool draft_taps_on_ = false;         // the tap ring exists (speculator is not the MTP head)
 	bool snap_taps_ = false;             // a drafter is attached: forwards publish taps and snapshots carry the ring rows
 	size_t tap_snapshot_bytes( int tokens ) const;

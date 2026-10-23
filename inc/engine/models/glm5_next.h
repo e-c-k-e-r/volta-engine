@@ -312,16 +312,11 @@ private:
 
 	// DFlash2 attachment (see DraftHooks): tap ring, head scratch and per-rank candidate top-k scratch
 	DraftHooks draft_hooks_;
-	pod::TensorView draft_taps_;         // [taps_cap, 5 * hidden]
+	DraftScratch draft_;               // drafter tap ring, head logits and candidate top-k scratch
 	bool snap_taps_ = false;             // sequence snapshots include the tap ring rows
 	size_t tap_snapshot_bytes( int tokens ) const;
 	void copy_seq_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	pod::TensorView tap_tmp_;            // [MAX_ROWS, hidden] mean of the 4 residual streams at a tapped layer
-	pod::TensorView draft_lm_logits_;    // [kDraftM, lm_shard_cols]
-	float* draft_cand_part_v_ = nullptr;
-	int* draft_cand_part_i_ = nullptr;
-	int* draft_cand_counters_ = nullptr;
-	int* d_taps_owner_ = nullptr;
 
 	pod::TensorView embed_rows_;    // [MAX_ROWS, hidden] embedded inputs
 	Glm5VisionTower vision_;        // rank 0 only
