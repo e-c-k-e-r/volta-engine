@@ -78,7 +78,6 @@ public:
 
 	bool enabled() const { return enabled_; }
 	unsigned long long replays() const { return replays_; }
-	void set_enabled( bool on ) { enabled_ = on; }
 
 private:
 	backend::graph_exec_t exec_[pod::MAX_BATCH + 1][2] = {};

@@ -20,6 +20,9 @@
 | `test_output_parser` | 2 | no | reasoning / tool-call parser, chunking independence, template round trip |
 | `test_backend_tiers` | 1 | no | capability registry matches the declared module functions |
 | `test_mma_frag` | 1 | no | on a simulated warp, against the PTX m16n8k16 / m8n8k4 layouts: the tensor-core fragment maps of the SM_80+ paths (`mma_frag.h`, `nvfp4_frag.h`) and the ROCm `mma` emulations (`mma_emu.h`) |
+| `test_dflash2_blocks` | 2 | yes | DFlash2 backbone building blocks (dynamic grouped convolution, RMSNorm residual split, FP16 GEMV) against explicit FP32 CPU references |
+| `test_cpu_bridge` | 2 | yes | GPU to CPU expert handoff with synthetic NVFP4 experts: routes to CPU-owned experts leave the route list, their outputs arrive in the layer output (also from a CUDA graph), layers without CPU routes do not wait |
+| `test_cpu_nvfp4_vs_gpu` | 2 | yes | the CPU NVFP4 expert against the GPU NVFP4 MoE kernel on the same random weights and inputs |
 
 ## Model-backed: checkpoints from `ENGINE_MODEL_ROOT`
 
@@ -43,6 +46,11 @@
 | `test_longctx` | 4 | yes | needle retrieval at long context (run by hand) |
 | `tests/4_server/test_api.sh` | 4 | yes | OpenAI and Anthropic APIs, tool calls, reasoning, prefix cache, image input (`VOLTA_TEST_MODEL=glm5_next` for GLM, `VOLTA_TEST_SPEC=mtp` for the MTP head) |
 | `tests/4_server/test_server.sh` | 4 | yes | server integration, concurrency throughput gate |
+| `test_cpu_experts <model dir> <layer> <expert>` | 2 | no | host-CPU routed experts: the AVX2 trellis GEMV and the expert pipeline against a scalar model of the EXL3 format (1 to 8 bits; part 2 checks one GLM expert and its speed) |
+| `test_cpu_trellis_vs_gpu <model dir> <layer> <expert>` | 2 | yes | the CPU trellis linear against the GPU `Linear::forward` on real GLM expert weights |
+| `test_dflash2_quant` | 2 | yes | trellis quantization of the DFlash2 drafter (codes, suh, svh, mul1) against its unquantized checkpoint |
+| `test_mixed_rows` (`[chunk] [decode_slots] [order]`) | 2 | yes | diagnostic, no pass/fail: GLM forward of a prefill chunk plus decode rows of other slots against the same rows run as separate forwards |
+| `diag_glm_tie PROMPT PREFIX WORD_A WORD_B` | 4 | yes | diagnostic: GLM logits of two candidate continuations in the single-row decode path against verify blocks of L rows (separates a near-tie from a defect) |
 
 ## Benchmarks and profiler brackets
 
@@ -64,6 +72,7 @@ Not part of `gate.sh` (except `bench_decode`, `bench_accept` and `bench_prefill`
 | `bench_nvfp4`, `bench_trellis` | NVFP4 and trellis linear kernels |
 | `bench_allreduce` | NCCL all-reduce of an activation-sized FP16 tensor next to the sequence-parallel alternative (the H3 transformer) |
 | `bench_all_reduce` | the engine's own all-reduce kernels |
+| `h3_text_repeat <text_encoder dir> <tokenizer dir> "prompt"` | whether the H3 text encoder gives identical hidden states on repeated encodes (fingerprints) |
 
 ## Serving benchmarks
 

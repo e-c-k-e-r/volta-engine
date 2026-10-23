@@ -20,14 +20,6 @@
 #define MOE_PREFILL_BLOCKS_PER_SM 2
 #endif
 
-inline int get_moe_num_groups( int bsz, int concurrency ) {
-	return (int) concurrency;
-}
-
-inline int get_moe_group_size( int bsz, int num_sms, int num_groups ) {
-	return MOE_SMS_PER_EXPERT;
-}
-
 #ifndef EXL3_GEMM_BASE_THREADS
 #define EXL3_GEMM_BASE_THREADS 256
 #endif

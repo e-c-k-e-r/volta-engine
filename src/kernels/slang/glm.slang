@@ -13,18 +13,6 @@ static const int DSA_SEL = 512;
 
 groupshared float g_red[256];
 
-float gsum256(int t, float v) {
-	g_red[t] = v;
-	GroupMemoryBarrierWithGroupSync();
-	for (int s = 128; s > 0; s >>= 1) {
-		if (t < s) g_red[t] += g_red[t + s];
-		GroupMemoryBarrierWithGroupSync();
-	}
-	let r = g_red[0];
-	GroupMemoryBarrierWithGroupSync();
-	return r;
-}
-
 float gsum128(int t, float v) {
 	g_red[t] = v;
 	GroupMemoryBarrierWithGroupSync();

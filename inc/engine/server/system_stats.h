@@ -28,7 +28,6 @@ public:
 	~SystemStats();
 	// Cached for a short while, so several viewers do not multiply the NVML calls
 	void read( std::vector<GpuReading>* gpus, HostReading* host );
-	bool has_nvml() const { return lib_ != nullptr; }
 
 private:
 	void* lib_ = nullptr;

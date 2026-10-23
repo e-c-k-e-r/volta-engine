@@ -9,11 +9,6 @@
 	#define EXL3_CB_LOP3( x ) asm ( "lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"( x ) )
 #endif
 
-template <uint32_t w>
-__device__ __forceinline__ uint32_t mul_const_u32( uint32_t x ) {
-	return x * w;
-}
-
 __device__ inline half2 decode_mul1_product_2( uint32_t x0, uint32_t x1 ) {
 	const uint32_t acc = 0x6400u;
 	uint32_t sum0 = __dp4a( x0, 0x01010101u, acc );
@@ -86,14 +81,4 @@ __device__ inline half2 decode_3inst_2( uint32_t x0, uint32_t x1 ) {
 		x1 *= 0x83DCD12Du;
 		return decode_mul1_product_2( x0, x1 );
 	}
-}
-
-template <int cb>
-__device__ inline float decode_3inst_f( uint64_t x ) {
-	return __half2float( decode_3inst<cb>( x ) );
-}
-
-template <int cb>
-__device__ inline float decode_3inst_f_diff( uint64_t x, float d ) {
-	return __half2float( decode_3inst<cb>( x ) ) - d;
 }

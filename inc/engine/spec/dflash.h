@@ -369,7 +369,6 @@ public:
 	float* merged_final_values_ptr() { return merge_vals_.ptr<float>(); }
 	int* merged_final_indices_ptr() { return merge_ix_.ptr<int>(); }
 	int merge_stride() const { return config_.block_size * config_.selector_top_k; }
-	int merge_rows() const { return config_.block_size; }
 
 	// One draft round of the drafter backbone.
 	//

@@ -80,7 +80,6 @@ public:
 	};
 	void set_diag( bool on ) { diag_on_ = on; }
 	const DiagStats& diag() const { return diag_; }
-	void diag_reset() { diag_ = DiagStats{}; }
 
 private:
 	int draft_block( int slot, int anchor, int pos, float depth_threshold, int* h_draft );

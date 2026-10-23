@@ -1,4 +1,4 @@
-// CPU backend: weak stubs for the moe entry points that have no CPU implementation (CUDA/SM70 only or not yet ported).
+// CPU and Vulkan backends: weak stubs for the moe entry points that have no CPU or Vulkan implementation (CUDA/SM70 only or not yet ported).
 // A strong definition in another translation unit overrides these. Declarations come from engine/modules/moe.h.
 #include "engine/modules/moe.h"
 #include "engine/backend/tiers.h"

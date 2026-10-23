@@ -5,21 +5,13 @@
 #include "engine/loader/safetensors.h"
 #include "engine/video/h3_vae.h"
 #include "h3_kernels.cuh"
+#include "h3_util.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstring>
 #include <string>
 #include <thread>
-
-#define CUBLAS_CHECK( call ) \
-	do { \
-		cublasStatus_t st_ = ( call ); \
-		if ( ENGINE_UNLIKELY( st_ != CUBLAS_STATUS_SUCCESS ) ) { \
-			std::fprintf( stderr, "[CUBLAS ERROR] %s (%s:%d): %d\n", #call, __FILE__, __LINE__, static_cast<int>( st_ ) ); \
-			std::_Exit( 1 ); \
-		} \
-	} while ( 0 )
 
 namespace engine::video {
 namespace {

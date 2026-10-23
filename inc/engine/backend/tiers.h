@@ -32,16 +32,6 @@ inline const TierEntry* tier_entries( int* count ) {
 	return entries;
 }
 
-// Tier of module::function, or -1 when the pair is not registered
-inline int tier_of( const char* module, const char* function ) {
-	int n = 0;
-	const TierEntry* e = tier_entries( &n );
-	for ( int i = 0; i < n; ++i ) {
-		if ( std::strcmp( e[i].module, module ) == 0 && std::strcmp( e[i].function, function ) == 0 ) return static_cast<int>( e[i].tier );
-	}
-	return -1;
-}
-
 #if defined(ENGINE_BACKEND_CUDA) && ENGINE_BACKEND_CUDA == 1
 	#define ENGINE_BACKEND_NAME "CUDA"
 #elif defined(ENGINE_BACKEND_VULKAN) && ENGINE_BACKEND_VULKAN == 1

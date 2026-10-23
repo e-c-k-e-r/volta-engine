@@ -19,7 +19,6 @@
 
 #define MOE_COOP_THREADS 512
 #define MOE_COOP_WNT 2                  // adjacent 16-column tiles per warp
-#define MOE_COOP_COLS ( MOE_COOP_WNT * 16 )
 #define MOE_COOP_MAX_ROWS 16
 #define MOE_COOP_TOPK 10                // the largest routes-per-token a call may have (scratch is sized by it); 3 bpw experts with 8 or fewer routes also take the int8 tile
 #define MOE_COOP_MAX_SLOTS ( MOE_COOP_MAX_ROWS * MOE_COOP_TOPK )

@@ -1,4 +1,4 @@
-// CPU backend: weak stubs for the DFlash speculator and its top-k kernels (src/spec/*.cu, CUDA/SM70 only).
+// CPU and Vulkan backends: weak stubs for the DFlash speculator and its top-k kernels (src/spec/*.cu, CUDA/SM70 only).
 // A strong definition in another translation unit overrides these.
 #include "engine/spec/dflash.h"
 #include "engine/backend/tiers.h"
@@ -21,7 +21,7 @@ __attribute__(( weak )) void dflash2_topk_merge(
 }
 
 __attribute__(( weak )) DFlashSpeculator::DFlashSpeculator() {
-	// Default state only: init() is unsupported on this backend
+	// Default state only: init() is unsupported on these backends
 }
 
 __attribute__(( weak )) DFlashSpeculator::~DFlashSpeculator() {

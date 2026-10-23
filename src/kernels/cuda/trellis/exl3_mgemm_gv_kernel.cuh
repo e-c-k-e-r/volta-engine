@@ -108,34 +108,6 @@ __device__ __forceinline__ void gv_dq8_4bits_regs(uint32_t prev, uint32_t cur, F
     frag1[1] = decode_3inst_2<cb>(w6, w7);
 }
 
-// One k16 row: decode + FFMA into the lane's two fp32 column accumulators.
-// Fragment contract (m16n8k16 B, col-major): lane l holds B[k][col] for
-// k in {2*tig, 2*tig+1, 2*tig+8, 2*tig+9}, tig = l & 3, col = l >> 2 (frag0) / col + 8 (frag1).
-// A k-set is the matching A[row=0] half2 pairs, staged in shared memory.
-template <int cb>
-__device__ __forceinline__ void gv_row_ffma(
-    FragB& frag0, FragB& frag1,
-    const half2* sh_a2, int kb, int tig,
-    float& c0, float& c1)
-{
-    half2 a0 = sh_a2[(kb << 3) + tig];        // A[2*tig], A[2*tig+1]
-    half2 a1 = sh_a2[(kb << 3) + tig + 4];    // A[2*tig+8], A[2*tig+9]
-    float2 af0 = __half22float2(a0);
-    float2 af1 = __half22float2(a1);
-    float2 f00 = __half22float2(frag0[0]);
-    float2 f01 = __half22float2(frag0[1]);
-    float2 f10 = __half22float2(frag1[0]);
-    float2 f11 = __half22float2(frag1[1]);
-    c0 = fmaf(af0.x, f00.x, c0);
-    c0 = fmaf(af0.y, f00.y, c0);
-    c0 = fmaf(af1.x, f01.x, c0);
-    c0 = fmaf(af1.y, f01.y, c0);
-    c1 = fmaf(af0.x, f10.x, c1);
-    c1 = fmaf(af0.y, f10.y, c1);
-    c1 = fmaf(af1.x, f11.x, c1);
-    c1 = fmaf(af1.y, f11.y, c1);
-}
-
 // GEMV inner for one slot (size_m == 1). blockIdx.y splits k; parts merge through the C row
 // with the tile-pipeline kernel's deterministic reverse-stage lock protocol. blockIdx.x covers
 // an n128 chunk of the (max) width, one warp per n16 block for the part's k range.

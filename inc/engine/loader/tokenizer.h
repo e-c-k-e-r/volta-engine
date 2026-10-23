@@ -41,7 +41,6 @@ public:
 	int sop_id() const { return get_special_token( "<sop>" ); }
 	int eos_id() const { return eos_token_id_; }
 	int pad_id() const { return pad_token_id_; }
-	int bos_id() const { return bos_token_id_; }
 
 	size_t vocab_size() const { return id_to_token_.size(); }
 

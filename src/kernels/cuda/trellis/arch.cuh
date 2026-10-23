@@ -17,4 +17,3 @@
 	#define EXL3_SM70_HMMA 1
 #endif
 
-#define EXL3_SMEM_MAX_DEFAULT (96 * 1024)

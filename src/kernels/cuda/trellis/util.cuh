@@ -40,27 +40,6 @@ typedef struct __align__( 16 ) half8 {
 		 w( __halves2half2( h6, h7 ) ) {}
 } half8;
 
-struct Dim3 {
-	int m;
-	int k;
-	int n;
-	inline __device__ int numel_a() { return m * k; }
-	inline __device__ int numel_b() { return k * n; }
-	inline __device__ int numel_c() { return m * n; }
-};
-
-#define READ128(__x, __y) ((uint4*)&__x)[0] = ((uint4*)(__y))[0];
-#define WRITE128(__x, __y) ((uint4*)__x)[0] = ((uint4*)(&__y))[0];
-#define READ64(__x, __y) ((uint2*)&__x)[0] = ((uint2*)(__y))[0];
-#define WRITE64(__x, __y) ((uint2*)__x)[0] = ((uint2*)(&__y))[0];
-
-#define LOW_TO_FLOAT(__x) __half2float(__low2half(__x))
-#define HIGH_TO_FLOAT(__x) __half2float(__high2half(__x))
-
-#define CLAMP(__x, __min, __max) fmaxf(__min, fminf(__x, __max))
-#define CLAMP_FP16(__x) CLAMP(__x, -65504.0f, 65504.0f)
-#define SWAP16(__x) __byte_perm(__x, 0, 0x1032)
-
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define CEIL_DIVIDE(x, size) (((x) + (size) - 1) / (size))
@@ -81,10 +60,3 @@ union half_uint16 {
 	__device__ half_uint16() : as_uint16( 0 ) {}
 };
 
-#define cuda_check(ans) { gpu_assert((ans), __FILE__, __LINE__); }
-inline void gpu_assert( cudaError_t code, const char* file, int line, bool abort = true ) {
-	if ( code != cudaSuccess ) {
-		std::fprintf( stderr, "GPU assert: %s %s %d\n", cudaGetErrorString( code ), file, line );
-		if ( abort ) std::abort();
-	}
-}

@@ -23,30 +23,6 @@ using FragB = Vec<half2, 2>;
 using FragC = Vec<float, 4>;
 using FragC_h = Vec<half2, 2>;
 
-__device__ inline void ptx_mma_m8n8k4(
-	const Vec<half2, 2>& frag_a,
-	const Vec<half2, 2>& frag_b,
-	Vec<float, 8>& frag_c
-) {
-	const uint32_t* a = reinterpret_cast<const uint32_t*>( &frag_a );
-	const uint32_t* b = reinterpret_cast<const uint32_t*>( &frag_b );
-	float* c = reinterpret_cast<float*>( &frag_c );
-#if defined(USE_ROCM)
-	mma_emu_m8n8k4_f32( a, b, c, threadIdx.x & 31, rocm_shfl() );
-#else
-	const float* d = reinterpret_cast<const float*>( &frag_c );
-
-	asm (
-		"mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
-		"{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%12,%13,%14,%15,%16,%17,%18,%19};\n"
-		: "=f"( c[0] ), "=f"( c[1] ), "=f"( c[2] ), "=f"( c[3] ), "=f"( c[4] ), "=f"( c[5] ), "=f"( c[6] ), "=f"( c[7] )
-		: "r"( a[0] ), "r"( a[1] ),
-		  "r"( b[0] ), "r"( b[1] ),
-		  "f"( d[0] ), "f"( d[1] ), "f"( d[2] ), "f"( d[3] ), "f"( d[4] ), "f"( d[5] ), "f"( d[6] ), "f"( d[7] )
-	);
-#endif
-}
-
 __device__ inline void volta_mma_m8n8k4(
 	uint32_t a0,
 	uint32_t a1,
@@ -268,23 +244,6 @@ __device__ inline void cp_async( void* smem_ptr, const void* glob_ptr ) {
 	asm volatile (
 		"{\n"
 		"   cp.async.cg.shared.global [%0], [%1], %2;\n"
-		"}\n" :: "r"( smem ), "l"( glob_ptr ), "n"( bytes )
-	);
-#endif
-}
-
-__device__ inline void cp_async_stream( void* smem_ptr, const void* glob_ptr ) {
-#if PTX_SYNC_COPY
-	uint4 v = *reinterpret_cast<const uint4*>( glob_ptr );
-	*reinterpret_cast<uint4*>( smem_ptr ) = v;
-#else
-	uint32_t smem = static_cast<uint32_t>( __cvta_generic_to_shared( smem_ptr ) );
-	const int bytes = 16;
-	asm volatile (
-		"{\n"
-		"   .reg .b64 p;\n"
-		"   createpolicy.fractional.L2::evict_first.b64 p, 1.0;\n"
-		"   cp.async.cg.shared.global.L2::cache_hint [%0], [%1], %2, p;\n"
 		"}\n" :: "r"( smem ), "l"( glob_ptr ), "n"( bytes )
 	);
 #endif

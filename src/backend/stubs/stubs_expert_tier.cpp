@@ -1,4 +1,4 @@
-// CPU backend: weak stubs for the expert_tier entry points that have no CPU implementation (CUDA/SM70 only or not yet ported).
+// CPU and Vulkan backends: weak stubs for the expert_tier entry points that have no CPU or Vulkan implementation (CUDA/SM70 only or not yet ported).
 // A strong definition in another translation unit overrides these. Declarations come from engine/modules/expert_tier.h.
 #include "engine/modules/expert_tier.h"
 #include "engine/modules/cpu_experts.h"

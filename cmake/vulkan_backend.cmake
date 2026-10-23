@@ -2,7 +2,7 @@
 # ENGINE_BACKEND_VULKAN is defined for these targets only; the CUDA build is untouched.
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND AND TARGET slang_kernels)
-	# vk_*.cpp: device layer only; mod_*.cpp / stubs_*.cpp are the module layer of the VULKAN configuration (below)
+	# vk_*.cpp: device layer only; mod_*.cpp / stubs_*.cpp (plus src/backend/stubs, shared with the CPU build) are the module layer of the VULKAN configuration (below)
 	file(GLOB VULKAN_BACKEND_SOURCES ${PROJECT_SOURCE_DIR}/src/backend/vulkan/vk_*.cpp)
 	add_library(engine_backend_vulkan STATIC ${VULKAN_BACKEND_SOURCES})
 	# The main CMakeLists adds ENGINE_BACKEND_CUDA=1 globally; -U after the -D flags removes it for these targets
@@ -75,7 +75,7 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	add_custom_target(flash_spv DEPENDS ${VK_FLASH_SPV})
 	add_dependencies(slang_kernels flash_spv)
 
-	file(GLOB ENGINE_VK_MODULE_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/src/backend/vulkan/mod_*.cpp ${PROJECT_SOURCE_DIR}/src/backend/vulkan/stubs_*.cpp)
+	file(GLOB ENGINE_VK_MODULE_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/src/backend/vulkan/mod_*.cpp ${PROJECT_SOURCE_DIR}/src/backend/vulkan/stubs_*.cpp ${PROJECT_SOURCE_DIR}/src/backend/stubs/*.cpp)
 	add_library(engine_vk_host OBJECT ${ENGINE_HOST_SOURCES})
 	add_library(engine_vk_modules OBJECT ${ENGINE_VK_MODULE_SOURCES})
 	target_link_libraries(engine_vk_modules PUBLIC engine_backend_vulkan)

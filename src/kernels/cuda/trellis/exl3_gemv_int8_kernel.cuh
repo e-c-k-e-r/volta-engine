@@ -214,102 +214,11 @@ __device__ __forceinline__ void extract8_4bits_words(uint32_t a, uint32_t b,
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Device building blocks (also reusable from batched mgemm/MoE-style kernels)
-
-// Quantize one k-slice of the (Hadamard-transformed) activation row into int8 byte-splats in shared
-// memory, plus optional error-feedback residual splats
-template <bool residual>
-__device__ __forceinline__ void gemv_int8_stage_splats
-(
-    const half* __restrict__ A_had_row,
-    float q,
-    uint32_t* __restrict__ sh_as,
-    uint32_t* __restrict__ sh_as2,
-    int kb0,
-    int nrows
-)
-{
-    __syncthreads();
-    float rq = 1.0f / q;
-    float rq2 = rq * 254.0f;
-    for (int i = threadIdx.x; i < nrows * 16; i += NUM_THREADS)
-    {
-        float a = __half2float(A_had_row[(kb0 << 4) + i]);
-        int v = __float2int_rn(a * rq);
-        v = max(-127, min(127, v));
-        sh_as[i] = ((uint32_t)(uint8_t)(int8_t) v) * 0x01010101u;
-        if constexpr (residual)
-        {
-            float r = a - q * (float) v;
-            int v2 = __float2int_rn(r * rq2);
-            v2 = max(-127, min(127, v2));
-            sh_as2[i] = ((uint32_t)(uint8_t)(int8_t) v2) * 0x01010101u;
-        }
-    }
-    __syncthreads();
-}
-
-// Block-wide: exact int8(+residual) sums of one activation row, writes {q, s1, s2} to qsums_row
-template <bool residual>
-__device__ __forceinline__ void gemv_int8_row_sums
-(
-    const half* __restrict__ Ar,
-    float q,
-    int size_k,
-    float* __restrict__ qsums_row
-)
-{
-    __shared__ int sh_s1[32];
-    __shared__ int sh_s2[32];
-    int t = threadIdx.x;
-    float rq = 1.0f / q;
-    float rq2 = rq * 254.0f;
-    int s1 = 0, s2 = 0;
-    for (int i = t; i < size_k; i += NUM_THREADS)
-    {
-        float a = __half2float(Ar[i]);
-        int v = __float2int_rn(a * rq);
-        v = max(-127, min(127, v));
-        s1 += v;
-        if constexpr (residual)
-        {
-            float r = a - q * (float) v;
-            int v2 = __float2int_rn(r * rq2);
-            s2 += max(-127, min(127, v2));
-        }
-    }
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-    {
-        s1 += __shfl_xor_sync(0xffffffff, s1, o);
-        s2 += __shfl_xor_sync(0xffffffff, s2, o);
-    }
-    if ((t & 31) == 0) { sh_s1[t >> 5] = s1; sh_s2[t >> 5] = s2; }
-    __syncthreads();
-    if (t < 32)
-    {
-        int v1 = t < (NUM_THREADS >> 5) ? sh_s1[t] : 0;
-        int v2 = t < (NUM_THREADS >> 5) ? sh_s2[t] : 0;
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1)
-        {
-            v1 += __shfl_xor_sync(0xffffffff, v1, o);
-            v2 += __shfl_xor_sync(0xffffffff, v2, o);
-        }
-        if (t == 0)
-        {
-            qsums_row[0] = q;
-            ((int*) qsums_row)[1] = v1;
-            ((int*) qsums_row)[2] = v2;
-        }
-    }
-    __syncthreads();
-}
+// Staging and slice parameters
 
 // The K cap (fall back to the regular kernel in the DRAM-bound regime) is per-arch; see
 // exl3_gemv_int8_max_k in exl3_gemv_int8.cu
 #define GEMV_STAGE_D 4      // cp.async pipeline depth (rows) for the smem-staged unit
-#define GEMV_STAGE_MAX_BYTES (8 * GEMV_STAGE_D * 16 * 8 * 4)   // 8 warps, K = 8
 
 // Per-slice-scale ("sq") kernel parameters
 #define SQ_KSPLIT_CAP 64
@@ -706,60 +615,6 @@ __device__ __forceinline__ void gemv_int8_unit_smem
 __host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
 {
     return bits == 3 || bits == 5 || bits == 7;
-}
-
-// Epilogue for one row: affine correction + output Hadamard + svh scale + accumulator reset,
-// striped over all warps of the grid. sh_tmp: 128 floats per warp.
-template <bool c_fp32, bool residual>
-__device__ __forceinline__ void gemv_int8_epilogue
-(
-    int* __restrict__ accs,
-    void* __restrict__ C_row,
-    const float* __restrict__ qrow,
-    const half* __restrict__ svh,
-    float* __restrict__ sh_tmp,
-    int size_n,
-    float output_scale
-)
-{
-    int lane = threadIdx.x & 31;
-    int warps_grid = gridDim.x * NUM_THREADS / 32;
-    int this_warp = threadIdx.x / 32 + NUM_THREADS / 32 * blockIdx.x;
-    float* tmp = sh_tmp + (threadIdx.x / 32) * 128;
-
-    float k_inv  = __half2float(__ushort_as_half(0x1eee));
-    float k_bias = __half2float(__ushort_as_half(0xc931));
-    float q = qrow[0];
-    float q2 = q * (1.0f / 254.0f);
-    float suma = q * (float) ((const int*) qrow)[1];
-    if constexpr (residual) suma += q2 * (float) ((const int*) qrow)[2];
-    float corr = (1024.0f * k_inv + k_bias) * suma;
-
-    int total_chunks = size_n / 128;
-    for (; this_warp < total_chunks; this_warp += warps_grid)
-    {
-        int base = this_warp * 128;
-        #pragma unroll
-        for (int i = 0; i < 4; ++i)
-        {
-            int j = lane * 4 + i;
-            float s = q * (float) accs[base + j];
-            accs[base + j] = 0;
-            if constexpr (residual)
-            {
-                s += q2 * (float) accs[size_n + base + j];
-                accs[size_n + base + j] = 0;
-            }
-            tmp[j] = k_inv * s + corr;
-        }
-        __syncwarp();
-        // gridDim.y == 1, so the inner's blockIdx.y-based scale offset is zero; pre-offset svh
-        if constexpr (c_fp32)
-            had_ff_r_128_inner<false, true>(tmp, ((float*) C_row) + base, svh + base, 0.088388347648f * output_scale);
-        else
-            had_fh_r_128_inner<false, true>(tmp, ((half*) C_row) + base, svh + base, 0.088388347648f * output_scale);
-        __syncwarp();
-    }
 }
 
 // ---------------------------------------------------------------------------------------------------------

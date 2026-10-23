@@ -25,8 +25,6 @@ public:
 	// (channel-major); frames = ceil(samples / 800). Loads the encoder weights on first use.
 	bool encode( const std::vector<float>& wave, int samples, std::vector<float>* rows, int* frames );
 
-	int sample_rate() const { return 32000; }
-
 private:
 	struct Impl;
 	Impl* p_;

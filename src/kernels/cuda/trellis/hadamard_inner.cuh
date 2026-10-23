@@ -6,10 +6,6 @@
 #define ACT_GELU 1
 #define ACT_RELU2_NOGATE 2
 
-__device__ inline half hreduce( half2 x ) {
-	return __hadd( __low2half( x ), __high2half( x ) );
-}
-
 __device__ inline void shuffle_had_f4x32( float& h0, float& h1, float& h2, float& h3, const int lane_id ) {
 	#pragma unroll
 	for ( int i = 1; i < 32; i <<= 1 ) {
@@ -52,17 +48,6 @@ __device__ inline void shuffle_had_f2x32( float& v, float& w, const int lane_id 
 		v = __uint_as_float( vi ) + pv;
 		w = __uint_as_float( wi ) + pw;
 	}
-}
-
-__device__ inline float shuffle_had_fx32( float v, const int lane_id ) {
-	for ( int i = 1; i < 32; i <<= 1 ) {
-		float pv = __shfl_xor_sync( 0xffffffff, v, i );
-		uint32_t* vi = reinterpret_cast<uint32_t*>( &v );
-		int32_t sfm = -static_cast<int16_t>( lane_id & i ) >> 31;
-		*vi ^= ( sfm & 0x80000000 );
-		v = v + pv;
-	}
-	return v;
 }
 
 __device__ inline half2 shuffle_had_h2x32( half2 v, int lane_id ) {

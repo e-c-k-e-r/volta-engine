@@ -11,7 +11,7 @@ endif()
 # Host sources that compile without the vendor runtime (see the report in the commit message for what blocks the rest)
 set(ENGINE_CPU_HOST_SOURCES ${ENGINE_HOST_SOURCES})
 
-file(GLOB ENGINE_CPU_BACKEND_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/src/backend/cpu/*.cpp)
+file(GLOB ENGINE_CPU_BACKEND_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/src/backend/cpu/*.cpp ${PROJECT_SOURCE_DIR}/src/backend/stubs/*.cpp)
 
 add_library(engine_cpu_host OBJECT ${ENGINE_CPU_HOST_SOURCES})
 

@@ -39,7 +39,6 @@ constexpr int LSTRIDE = 24;
 constexpr float R_SCALE = 0.088388347648f;      // 1/sqrt(128)
 
 // Block geometry: WN warps along n (adjacent 32-column pieces), WK / WN along k
-template <int WN> constexpr int tile_wn() { return WN; }
 template <int WN> constexpr int tile_wk() { return WK / WN; }
 template <int WN> constexpr int tile_cols() { return WN * COLS; }
 template <int WN> constexpr int tile_gpc() { return tile_cols<WN>() >= 128 ? 1 : 128 / tile_cols<WN>(); }  // block groups per 128-chunk
