@@ -1,2 +1,2 @@
-bench_decode 58058e01fedbb53257023d94ee930066 functions=687 hmma=101188
-volta_server 821d045a0d06055521d2a02adf9481d8 functions=761 hmma=106820
+bench_decode fd93b7d2551be8a725d7f192dd5955b8 functions=753 hmma=106253
+volta_server a92519c9f0ae4cf7220b6659bcaf572f functions=827 hmma=111885
