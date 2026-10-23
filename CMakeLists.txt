@@ -108,6 +108,13 @@ include_directories(
 	${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
 )
 
+# Terminal dashboard (volta_top and the server's --tui); host C++ only, no vendor runtime
+set(ENGINE_TUI_SOURCES
+	src/server/tui/term.cpp
+	src/server/tui/view.cpp
+	src/server/tui/app.cpp
+)
+
 # Host C++ (built by the host compiler; talks to the device only through engine/backend and the module headers)
 set(ENGINE_HOST_SOURCES
 	src/core/arena.cpp
@@ -157,6 +164,7 @@ set(ENGINE_HOST_SOURCES
 	src/server/monitor.cpp
 	src/server/monitor_page.cpp
 	src/server/system_stats.cpp
+	${ENGINE_TUI_SOURCES}
 )
 
 if(ENGINE_GPU)
@@ -424,6 +432,10 @@ target_link_libraries(test_image PRIVATE engine_kernels)
 target_compile_definitions(test_image PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
 set_target_properties(test_image PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(test_tui_view tests/2_parity/test_tui_view.cpp)
+target_link_libraries(test_tui_view PRIVATE engine_kernels)
+set_target_properties(test_tui_view PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(test_output_parser tests/2_parity/test_output_parser.cpp)
 target_link_libraries(test_output_parser PRIVATE engine_kernels)
 target_compile_definitions(test_output_parser PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
@@ -681,6 +693,10 @@ set_target_properties(test_sparse_attn PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PR
 endif()
 
 # Per-lane build fragments (each owned by one Wave 2 lane; empty until the lane fills it in)
+# volta_top: the dashboard as a stand-alone client of a running server's /api/stats (the same on every backend)
+add_executable(volta_top src/server/tui/top_main.cpp src/server/tui/http_get.cpp ${ENGINE_TUI_SOURCES})
+set_target_properties(volta_top PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 include(${PROJECT_SOURCE_DIR}/cmake/cpu_backend.cmake OPTIONAL)
 include(${PROJECT_SOURCE_DIR}/cmake/reference_kernels.cmake OPTIONAL)
 # The CPU configuration has no Vulkan targets: they compile against the other backend definitions and break all-targets builds

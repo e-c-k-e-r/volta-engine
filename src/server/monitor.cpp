@@ -25,7 +25,12 @@ void VoltaServer::handle_monitor( const ConnPtr& conn ) {
 }
 
 void VoltaServer::handle_api_stats( const ConnPtr& conn ) {
+	send_json( conn, 200, stats_json() );
+}
+
+std::string VoltaServer::stats_json() {
 	using nlohmann::json;
+	if ( !generator_ ) return std::string();
 	const auto mon = generator_->get_monitor();
 	const auto met = generator_->get_metrics();
 	const auto& opt = runtime::options();
@@ -81,7 +86,7 @@ void VoltaServer::handle_api_stats( const ConnPtr& conn ) {
 	}
 	j["gpus"] = g;
 	j["host"] = { { "cpu_pct", host.cpu_pct }, { "mem_used", host.mem_used }, { "mem_total", host.mem_total }, { "rss", host.rss }, { "load1", host.load1 } };
-	send_json( conn, 200, j.dump() );
+	return j.dump();
 }
 
 void VoltaServer::handle_api_experts( const ConnPtr& conn ) {

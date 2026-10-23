@@ -65,6 +65,7 @@ SystemStats::~SystemStats() {
 }
 
 void SystemStats::read( std::vector<GpuReading>* gpus, HostReading* host ) {
+	std::lock_guard<std::mutex> lock( mu_ );
 	const double t = now_s();
 	if ( read_at_ < 0.0 || t - read_at_ > 0.4 ) {
 		read_at_ = t;

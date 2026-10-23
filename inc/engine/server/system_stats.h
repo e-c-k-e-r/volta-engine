@@ -1,5 +1,6 @@
 #pragma once
 // Host and GPU readings for the monitor page. NVML is loaded at run time (libnvidia-ml.so.1), so a machine without it just reports no GPUs.
+#include <mutex>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -26,10 +27,11 @@ class SystemStats {
 public:
 	SystemStats();
 	~SystemStats();
-	// Cached for a short while, so several viewers do not multiply the NVML calls
+	// Cached for a short while, so several viewers do not multiply the NVML calls; callable from several threads
 	void read( std::vector<GpuReading>* gpus, HostReading* host );
 
 private:
+	std::mutex mu_;
 	void* lib_ = nullptr;
 	std::vector<void*> dev_;
 	std::vector<GpuReading> gpus_;

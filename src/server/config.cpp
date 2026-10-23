@@ -100,6 +100,9 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 	if ( j.contains( "benchmark_mode" ) && j["benchmark_mode"].is_boolean() ) {
 		benchmark_mode = j["benchmark_mode"].get<bool>();
 	}
+	if ( j.contains( "tui" ) && j["tui"].is_boolean() ) {
+		tui = j["tui"].get<bool>();
+	}
 	if ( j.contains( "tp_size" ) && j["tp_size"].is_number_integer() ) {
 		tp_size = j["tp_size"].get<int>();
 	}
@@ -161,6 +164,7 @@ values are fatal errors. The model type is never configured: it is read from the
 | `model_dir` | `--model-dir` | required | checkpoint directory |
 | `draft_model_dir` | `--draft-model-dir` | none | DFlash2 drafter checkpoint; required with `use_speculation` |
 | `use_speculation` | `--speculative` | false | enable speculative decoding |
+| `tui` | `--tui` | false | show a terminal dashboard (`volta_top`'s view, in this process) instead of the console log; the log moves to its last tab. Needs a terminal; `q` closes it and the server goes on with plain output |
 | `tp_size` | `--tp-size` | 4 | GPUs (1, 2 or 4; GLM runs on 1, 2 or 4) |
 | `host`, `port` | `--host`, `--port` | 0.0.0.0, 8000 | listen address |
 | `max_batch_size` | `--max-batch-size` | 8 | concurrent decode slots the scheduler may fill (capped by `max_slots`) |
@@ -252,6 +256,9 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 		}
 		else if ( std::strcmp( argv[i], "--benchmark" ) == 0 ) {
 			benchmark_mode = true;
+		}
+		else if ( std::strcmp( argv[i], "--tui" ) == 0 ) {
+			tui = true;
 		}
 		else if ( std::strcmp( argv[i], "--load-weights" ) == 0 ) {
 			load_weights = true;

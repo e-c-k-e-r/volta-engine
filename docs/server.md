@@ -60,6 +60,14 @@ The `/monitor` page: one self-contained HTML string (Monokai or Tomorrow Night t
 * for MoE models, a layer-by-expert routing heat map with the load per rank (`expert_stats=false` turns the counters off)
   * the expert tier and the monitor both read and clear the same counters, so the monitor undercounts with the tier on
 
+## `src/server/tui/`
+
+The terminal dashboard, one view in two hosts: `volta_top [host[:port]]` polls a running server's `/api/stats` (so it attaches to any server, at any time), and `volta_server --tui` (or `"tui": true`) runs the same view on a thread inside the server.
+* `view` renders a frame from the `/api/stats` document: Overview, Slots (with recent requests), GPUs and Log tabs, scrolling, a missing key never fails a frame
+* `term` is the raw-mode terminal on the alternate screen; Ctrl-C still reaches the server's handler
+* `app` has the viewer loop (one reading per second), `StdioCapture` (descriptors 1 and 2 go to a pipe while the dashboard is up, so `printf` and library output land in the Log tab instead of tearing the screen) and `ServerTui`; `q`, or the server stopping, restores the terminal and the console output
+* `http_get` is the small blocking client `volta_top` uses; the Log tab is empty there, since console output is only available inside the server process
+
 ## `src/server/video/`
 
 The MiniMax-H3 service: `adapters` (LoRA scan and labels), `jobs` (the queue and the on-disk job history), `service` (the worker thread that owns the GPUs), `api` (the routes), `metrics`, and `page` (the web page). Picture caption requests (`POST /api/caption`, with `video.captioner`) are queued beside the jobs and run by the same worker between jobs. See [video.md](video.md).

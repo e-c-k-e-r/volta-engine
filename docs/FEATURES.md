@@ -119,6 +119,7 @@ Covered by `test_all_reduce`, `bench_all_reduce`, `test_coherence`, `tests/4_ser
 | Prefix-cache usage reporting | default | `cached_tokens` / `cache_read_input_tokens` |
 | `/health`, `/metrics`, `/metrics/prometheus` | default | |
 | `/monitor`: throughput, slots, TTFT and token-gap percentiles, speculation, prefix cache, per-GPU NVML power / clocks / throttle, MoE routing heat | default | `expert_stats` |
+| Terminal dashboard: `volta_top` attaches to a running server, `--tui` runs it inside the server (slots, throughput, GPUs, log) | default | `tui` |
 | Request dumps for debugging | debug | `dump_requests` |
 
 Covered by `test_output_parser`, `test_jinja`, `test_tokenizer*`, `test_sampling`, `test_sampling_gpu`, `tests/4_server/*`.

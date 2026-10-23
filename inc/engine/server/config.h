@@ -40,6 +40,7 @@ struct ServerConfig {
 	bool use_speculation = false;
 	bool load_weights = true;
 	bool benchmark_mode = false;
+	bool tui = false;             // a terminal dashboard in this process (the console output moves into its log tab); needs a terminal
 	int tp_size = 4;
 	VideoConfig video;
 

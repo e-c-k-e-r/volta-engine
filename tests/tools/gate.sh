@@ -64,6 +64,7 @@ tier2_fast() {
 	run jinja_chat_templates ./test_jinja
 	run image_preprocess ./test_image
 	run output_parser ./test_output_parser
+	run tui_view ./test_tui_view
 	run backend_tiers ./test_backend_tiers $ROOT
 	run mma_frag ./test_mma_frag
 	run ref_linear_host ./test_ref_linear

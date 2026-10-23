@@ -13,6 +13,7 @@ values are fatal errors. The model type is never configured: it is read from the
 | `model_dir` | `--model-dir` | required | checkpoint directory |
 | `draft_model_dir` | `--draft-model-dir` | none | DFlash2 drafter checkpoint; required with `use_speculation` |
 | `use_speculation` | `--speculative` | false | enable speculative decoding |
+| `tui` | `--tui` | false | show a terminal dashboard (`volta_top`'s view, in this process) instead of the console log; the log moves to its last tab. Needs a terminal; `q` closes it and the server goes on with plain output |
 | `tp_size` | `--tp-size` | 4 | GPUs (1, 2 or 4; GLM runs on 1, 2 or 4) |
 | `host`, `port` | `--host`, `--port` | 0.0.0.0, 8000 | listen address |
 | `max_batch_size` | `--max-batch-size` | 8 | concurrent decode slots the scheduler may fill (capped by `max_slots`) |

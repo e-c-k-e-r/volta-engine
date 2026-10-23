@@ -421,6 +421,7 @@ void VoltaServer::stop() {
 		return;
 	}
 
+	if ( stop_hook_ ) stop_hook_();
 	LOG_INFO( "\n[*] Initiating Volta Server graceful shutdown...\n" );
 
 	for ( auto& kv : conns_ ) kv.second->close_now();

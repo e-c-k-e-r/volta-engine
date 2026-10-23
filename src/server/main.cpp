@@ -1,6 +1,7 @@
 #include "engine/server/server.h"
 #include "engine/core/log.h"
 #include "engine/server/config.h"
+#include "engine/server/tui/app.h"
 #include <cstdio>
 #include <memory>
 #include <sched.h>
@@ -28,6 +29,23 @@ int main( int argc, char** argv ) {
 	if ( !server->init( cfg ) ) {
 		LOG_ERROR( "FATAL: Failed to initialize Volta Server.\n" );
 		return 1;
+	}
+
+	// The dashboard starts after the load, so the loading messages stay on the console; it hands the terminal back before the server shuts down
+	engine::server::tui::ServerTui tui;
+	if ( cfg.tui ) {
+		auto fetch = [&server]( nlohmann::json* stats, std::string* error ) {
+			const std::string doc = server->stats_json();
+			*stats = nlohmann::json::parse( doc, nullptr, false );
+			if ( doc.empty() || stats->is_discarded() ) {
+				*error = "this server has no language-model statistics";
+				return false;
+			}
+			return true;
+		};
+		if ( server->stats_json().empty() ) LOG_WARN( "--tui: this server runs the generation service, which has no statistics to show; continuing with the console\n" );
+		else if ( !tui.start( fetch, cfg.host + ":" + std::to_string( cfg.port ) ) ) LOG_WARN( "--tui needs a terminal on standard input and output; continuing with the console\n" );
+		else server->set_stop_hook( [&tui] { tui.stop(); } );
 	}
 
 	server->run();
