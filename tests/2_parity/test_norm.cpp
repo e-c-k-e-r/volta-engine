@@ -2,17 +2,10 @@
 #include "engine/modules/norm.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include "test_util.h"
 #include <cstdio>
 #include <vector>
 #include <cmath>
-
-static float half_to_float( half h ) {
-	return __half2float( h );
-}
-
-static half float_to_half( float f ) {
-	return __float2half_rn( f );
-}
 
 int main() {
 	std::printf( "========================================================\n" );

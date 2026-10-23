@@ -8,8 +8,8 @@ namespace engine::modules {
 
 namespace {
 
-inline float h2f( backend::half_t v ) { return static_cast<float>( v ); }
-inline backend::half_t f2h( float v ) { return static_cast<backend::half_t>( v ); }
+using impl::h2f;
+using impl::f2h;
 
 } // namespace
 

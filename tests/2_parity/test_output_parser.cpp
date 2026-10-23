@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
+#include "test_util.h"
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -49,13 +50,6 @@ static void check_chunking( const char* what, ModelFamily fam, bool in_reasoning
 		const Result got = run( fam, in_reasoning, text, chunk, tools );
 		CHECK( got == want, "%s (chunk %zu): reasoning='%s' content='%s' calls=%zu", what, chunk, got.reasoning.c_str(), got.content.c_str(), got.calls.size() );
 	}
-}
-
-static std::string read_file( const std::string& path ) {
-	std::ifstream f( path, std::ios::binary );
-	std::stringstream ss;
-	ss << f.rdbuf();
-	return ss.str();
 }
 
 int main() {

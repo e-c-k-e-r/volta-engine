@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include "test_util.h"
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -16,11 +17,6 @@
 using engine::loader::DecodedImage;
 using engine::loader::PreparedImage;
 using engine::loader::VisionParams;
-
-static std::string read_file( const std::string& path ) {
-	std::ifstream f( path, std::ios::binary );
-	return std::string( std::istreambuf_iterator<char>( f ), std::istreambuf_iterator<char>() );
-}
 
 int main() {
 	const std::string dir = TEST_DATA_DIR;

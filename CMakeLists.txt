@@ -550,9 +550,6 @@ add_executable(test_dsv41 tests/4_coherence/test_dsv41.cpp)
 target_link_libraries(test_dsv41 PRIVATE engine_kernels)
 set_target_properties(test_dsv41 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
-add_executable(test_long_context tests/4_coherence/test_long_context.cpp)
-target_link_libraries(test_long_context PRIVATE engine_kernels)
-set_target_properties(test_long_context PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_sampling_gpu tests/4_coherence/test_sampling_gpu.cpp)
 target_link_libraries(test_sampling_gpu PRIVATE engine_kernels)

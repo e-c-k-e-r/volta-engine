@@ -320,8 +320,6 @@ __device__ __forceinline__ uint32_t ldg_acquire_sys_u32( const uint32_t* p ) { r
 __device__ __forceinline__ uint64_t ldg_acquire_sys_u64( const uint64_t* p ) { return __hip_atomic_load( p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM ); }
 __device__ __forceinline__ void stg_release_sys_u32( uint32_t* p, uint32_t v ) { __hip_atomic_store( p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM ); }
 __device__ __forceinline__ void stg_release_sys_u64( uint64_t* p, uint64_t v ) { __hip_atomic_store( p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM ); }
-// Nanoseconds from the constant-rate counter (100 MHz on RDNA: hipDeviceAttributeWallClockRate). Diagnostics only
-__device__ __forceinline__ uint64_t globaltimer_ns() { return wall_clock64() * 10ull; }
 static __forceinline__ __device__ uint32_t bfe64( uint32_t lo, uint32_t hi, int offset, int length ) {
 	const uint64_t value = ( static_cast<uint64_t>( hi ) << 32 ) | static_cast<uint64_t>( lo );
 	return static_cast<uint32_t>( ( value >> offset ) & ( length >= 64 ? ~0ull : ( ( 1ull << length ) - 1 ) ) );
@@ -394,12 +392,6 @@ __device__ __forceinline__ void stg_release_sys_u32( uint32_t* p, uint32_t v ) {
 
 __device__ __forceinline__ void stg_release_sys_u64( uint64_t* p, uint64_t v ) {
 	asm volatile ( "st.global.release.sys.u64 [%0], %1;" :: "l"( p ), "l"( v ) : "memory" );
-}
-
-__device__ __forceinline__ uint64_t globaltimer_ns() {
-	uint64_t t;
-	asm volatile ( "mov.u64 %0, %%globaltimer;" : "=l"( t ) );
-	return t;
 }
 
 static __forceinline__ __device__ uint32_t bfe64( uint32_t lo, uint32_t hi, int offset, int length ) {

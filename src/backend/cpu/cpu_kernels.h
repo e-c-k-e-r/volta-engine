@@ -76,6 +76,10 @@ struct GatedNormParams { half* attn_out; half* z; half* norm_weight; int num_v_h
 
 namespace impl {
 
+// FP16 <-> float for the host-side reference arithmetic (the compiler conversion rounds to nearest even)
+inline float h2f( half v ) { return static_cast<float>( v ); }
+inline half f2h( float v ) { return static_cast<half>( v ); }
+
 // Runs a kernel over a gx * gy * gz grid of thread groups
 inline void cpu_dispatch( void ( *fn )( ComputeVaryingInput*, void*, void* ), void* params, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1 ) {
 	if ( gx == 0 || gy == 0 || gz == 0 ) return;

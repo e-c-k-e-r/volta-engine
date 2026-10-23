@@ -14,25 +14,6 @@
 
 namespace engine::models {
 
-namespace {
-
-pod::TensorView view2d( void* p, int rows, int cols ) {
-	return pod::make_tensor_2d( p, pod::DType::FP16, rows, cols );
-}
-
-template <typename T>
-T* take( pod::MemoryArena& arena, size_t count ) {
-	return static_cast<T*>( engine::core::arena_alloc( arena, count * sizeof( T ) ) );
-}
-
-nlohmann::json read_json( const std::string& path ) {
-	std::ifstream f( path );
-	if ( !f ) return nlohmann::json::value_t::discarded;
-	return nlohmann::json::parse( std::string( std::istreambuf_iterator<char>( f ), std::istreambuf_iterator<char>() ), nullptr, false );
-}
-
-} // namespace
-
 bool Glm5VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream ) {
 	const nlohmann::json cfg_json = read_json( std::string( model_dir ) + "/config.json" );
 	if ( cfg_json.is_discarded() || !cfg_json.contains( "vision_config" ) ) return false;

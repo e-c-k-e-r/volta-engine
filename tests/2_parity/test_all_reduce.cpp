@@ -6,20 +6,13 @@
 #include "engine/modules/norm.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include "test_util.h"
 #include <cstdio>
 #include <vector>
 #include <cmath>
 #include <cstring>
 #include <thread>
 #include <atomic>
-
-static float half_to_float( half h ) {
-	return __half2float( h );
-}
-
-static half float_to_half( float f ) {
-	return __float2half_rn( f );
-}
 
 int main() {
 	// AR_RANKS=2 checks the two-rank collective (the TP=2 configuration); the default is the 4-GPU mesh

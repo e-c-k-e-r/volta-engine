@@ -18,8 +18,8 @@ namespace {
 
 constexpr int D = QSA::DIM;
 
-inline float h2f( backend::half_t v ) { return static_cast<float>( v ); }
-inline backend::half_t f2h( float v ) { return static_cast<backend::half_t>( v ); }
+using impl::h2f;
+using impl::f2h;
 inline float round_half( float v ) { return h2f( f2h( v ) ); }
 
 // Rotate-half rope on the first rot_dim dims of a 128-wide vector, in place

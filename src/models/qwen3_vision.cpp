@@ -16,23 +16,8 @@
 
 namespace engine::models {
 
-namespace {
-
-pod::TensorView view2d( void* p, int rows, int cols ) {
-	return pod::make_tensor_2d( p, pod::DType::FP16, rows, cols );
-}
-
-template <typename T>
-T* take( pod::MemoryArena& arena, size_t count ) {
-	return static_cast<T*>( engine::core::arena_alloc( arena, count * sizeof( T ) ) );
-}
-
-} // namespace
-
 bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream, bool allow_dense ) {
-	std::ifstream cf( std::string( model_dir ) + "/config.json" );
-	if ( !cf ) return false;
-	const auto cfg_json = nlohmann::json::parse( std::string( std::istreambuf_iterator<char>( cf ), std::istreambuf_iterator<char>() ), nullptr, false );
+	const auto cfg_json = read_json( std::string( model_dir ) + "/config.json" );
 	if ( cfg_json.is_discarded() || !cfg_json.contains( "vision_config" ) ) return false;
 	const auto& vc = cfg_json["vision_config"];
 	cfg_.depth = vc.value( "depth", cfg_.depth );

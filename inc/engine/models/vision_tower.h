@@ -1,10 +1,14 @@
 #pragma once
 
 #include "engine/core/arena.h"
+#include "engine/core/tensor.h"
 #include "engine/core/log.h"
 #include "engine/loader/image.h"
 #include "engine/loader/safetensors.h"
 #include "engine/backend/types.h"
+#include <nlohmann/json.hpp>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -19,6 +23,22 @@ public:
 	// Encodes one prepared image into [tokens, hidden] FP16 rows (host). Blocks until done.
 	virtual bool encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, backend::stream_t stream ) = 0;
 };
+
+// Loading helpers the towers share: an FP16 matrix view, a typed arena allocation, and a JSON file that parses to a discarded value on error
+inline pod::TensorView view2d( void* p, int rows, int cols ) {
+	return pod::make_tensor_2d( p, pod::DType::FP16, rows, cols );
+}
+
+template <typename T>
+T* take( pod::MemoryArena& arena, size_t count ) {
+	return static_cast<T*>( engine::core::arena_alloc( arena, count * sizeof( T ) ) );
+}
+
+inline nlohmann::json read_json( const std::string& path ) {
+	std::ifstream f( path );
+	if ( !f ) return nlohmann::json::value_t::discarded;
+	return nlohmann::json::parse( std::string( std::istreambuf_iterator<char>( f ), std::istreambuf_iterator<char>() ), nullptr, false );
+}
 
 // 2-D rotary tables of a patch grid in merge order: [h * w, head_dim] cos / sin (rotate_half layout; half the head dimension
 // rotates by the row, the other half by the column).

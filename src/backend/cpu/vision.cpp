@@ -15,8 +15,8 @@ namespace {
 
 using h16 = backend::half_t;
 
-inline float h2f( h16 v ) { return static_cast<float>( v ); }
-inline h16 f2h( float v ) { return static_cast<h16>( v ); }
+using impl::h2f;
+using impl::f2h;
 
 float gelu_tanh_f( float x ) {
 	const float u = 0.7978845608028654f * ( x + 0.044715f * x * x * x );

@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
+#include "test_util.h"
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -15,13 +16,6 @@
 #endif
 
 namespace jinja = engine::loader::jinja;
-
-static std::string read_file( const std::string& path ) {
-	std::ifstream f( path, std::ios::binary );
-	std::stringstream ss;
-	ss << f.rdbuf();
-	return ss.str();
-}
 
 int main() {
 	const std::string dir = TEST_DATA_DIR;
