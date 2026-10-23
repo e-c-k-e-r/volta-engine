@@ -115,6 +115,18 @@ int main() {
 		CHECK( render_frame( d, ui, 40, 120 ).find( "waiting for a slot" ) == std::string::npos, "no alert for a healthy server" );
 		d.experts = &experts;
 	}
+	{   // a card the arena fills is not an alert; memory outside the arena is
+		nlohmann::json full_card = full;
+		full_card["gpus"][0]["mem_used"] = 34359738368.0 - 100000000.0;
+		full_card["gpus"][0]["arena_bytes"] = 34359738368.0 - 1400000000.0;
+		UiState u;
+		ViewData hd;
+		hd.stats = &full_card;
+		hd.connected = true;
+		CHECK( render_frame( hd, u, 40, 120 ).find( "outside the engine arena" ) == std::string::npos, "an arena-filled card raises no alert" );
+		full_card["gpus"][0]["arena_bytes"] = 20000000000.0;
+		CHECK( render_frame( hd, u, 40, 120 ).find( "outside the engine arena" ) != std::string::npos, "memory outside the arena raises an alert" );
+	}
 	{   // the always-on power cap is not an alert
 		UiState u;
 		ViewData hd;

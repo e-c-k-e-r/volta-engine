@@ -501,8 +501,10 @@ std::vector<Alert> alerts( const ViewData& d ) {
 					if ( name == "hw slowdown" || name == "hw thermal" || name == "sw thermal" || name == "hw power brake" ) a.push_back( { true, id + " throttled: " + name } );
 				}
 			}
-			const double total = num( x, "mem_total" );
-			if ( total > 0.0 && num( x, "mem_used" ) / total > 0.95 ) a.push_back( { false, id + " memory " + format( "%.0f", num( x, "mem_used" ) * 100.0 / total ) + "% full" } );
+			// The engine takes its arena up to the last megabyte, so a full card is normal; what matters is memory outside the arena
+			// (another process, a leak), which is what the arena leaves free for the CUDA context, NCCL and graphs (about 1.3 GiB measured)
+			const double arena = num( x, "arena_bytes" ), outside = num( x, "mem_used" ) - arena;
+			if ( arena > 0.0 && outside > 2.0 * 1073741824.0 ) a.push_back( { false, id + " has " + bytes( outside ) + " in use outside the engine arena" } );
 		}
 	}
 	if ( num( s, "server", "queued" ) > 0.0 ) a.push_back( { false, format( "%.0f", num( s, "server", "queued" ) ) + " request(s) waiting for a slot" } );
