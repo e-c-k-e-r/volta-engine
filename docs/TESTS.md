@@ -53,6 +53,7 @@
 | `test_dflash2_quant` | 2 | yes | trellis quantization of the DFlash2 drafter (codes, suh, svh, mul1) against its unquantized checkpoint |
 | `test_mixed_rows` (`[chunk] [decode_slots] [order]`) | 2 | yes | diagnostic, no pass/fail: GLM forward of a prefill chunk plus decode rows of other slots against the same rows run as separate forwards |
 | `diag_glm_tie PROMPT PREFIX WORD_A WORD_B` | 4 | yes | diagnostic: GLM logits of two candidate continuations in the single-row decode path against verify blocks of L rows (separates a near-tie from a defect) |
+| `diag_logits_dump OUT.bin [--flash \| --qwen]` | 4 | yes | diagnostic: the full-vocabulary logits after a fixed 48-token prompt, to a file; `tests/tools/compare_logits.py A B` gives their cosine and top-k overlap (two builds, two checkpoints, or the Volta tile order against the stock one with `ENGINE_DEBUG_GLM_LAYERS=7`) |
 
 ## Benchmarks and profiler brackets
 

@@ -104,6 +104,11 @@ bool Glm5NextPipeline::init(
 	config_.kda_heads = lh_;
 	config_.kda_channels = lh_ * 3 * config_.kda_head_dim;
 	rank_ = rank;
+	if ( const int cut = runtime::options().glm_layers; cut > 0 && cut < 45 ) {   // debug: the first `cut` layers only (every fourth, from the fourth, is MLA)
+		config_.num_layers = cut;
+		config_.num_mla_layers = 0;
+		for ( int l = 3; l < cut; l += 4 ) ++config_.num_mla_layers;
+	}
 #if ENGINE_BACKEND_CUDA
 	backend::set_device( rank_ );
 	if ( runtime::options().side_streams ) {
@@ -152,7 +157,7 @@ bool Glm5NextPipeline::init(
 	state_.layer_kda_floats = static_cast<size_t>( config_.kda_heads ) * config_.kda_head_dim * config_.kda_head_dim;
 	state_.layer_conv_floats = static_cast<size_t>( config_.kda_channels ) * 3;
 	const int n_lin = config_.num_layers - config_.num_mla_layers;
-	ENGINE_ASSERT( config_.num_layers == 45 && n_lin == 34, "Glm5NextPipeline: linear-layer indexing assumes 45 layers with every fourth MLA" );
+	ENGINE_ASSERT( ( config_.num_layers == 45 && n_lin == 34 ) || runtime::options().glm_layers > 0, "Glm5NextPipeline: linear-layer indexing assumes 45 layers with every fourth MLA" );
 	const size_t slot_kda = state_.layer_kda_floats * n_lin;
 	const size_t slot_conv = state_.layer_conv_floats * n_lin;
 	state_.slot_kda_floats = slot_kda;

@@ -99,6 +99,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `spec_ctrl` | bool | `true` | `ENGINE_SPEC_CTRL` | adaptive speculation controller; false always speculates |
 | `mem_log` | bool | `false` | `ENGINE_MEM_LOG` | log the per-pipeline [mem] breakdown at startup (GLM: buffers by kind, weights by kind, drafter; Flash-Next: buffers, weights by kind); the arena summary lines stay on |
 | **Debug** | | | | |
+| `glm_layers` | int | `0` | `ENGINE_DEBUG_GLM_LAYERS` | GLM: run only the first N decoder layers (a checkpoint cut to N layers, for A/B of kernels on a small model; the logits mean nothing); 0 = all 45 |
 | `dflash_attn_scalar` | bool | `false` | `ENGINE_DEBUG_DFLASH_ATTN_SCALAR` | DFlash2 drafter attention on CUDA: the scalar one-block-per-(row, head) kernel instead of the split-key kernel (for A/B) |
 | `spec_profile` | bool | `false` | `ENGINE_DEBUG_SPEC_PROFILE` | DFlash2: time the stages of every round (draft, walk, snapshot switch, verify launch, sample wait, accept) and log the per-round averages when the server shuts down |
 | `merge_expert_groups` | bool | `true` | `ENGINE_DEBUG_MERGE_EXPERT_GROUPS` | DeepSeek-V4.1 packs whose experts have different widths per projection: one MoE launch per layer over all of a rank's experts with a width table (false: one launch per width combination, for A/B) |

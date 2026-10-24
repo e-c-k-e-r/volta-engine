@@ -442,6 +442,10 @@ add_executable(test_trellis_layout tests/2_parity/test_trellis_layout.cpp)
 target_link_libraries(test_trellis_layout PRIVATE engine_kernels)
 set_target_properties(test_trellis_layout PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(diag_logits_dump tests/4_coherence/diag_logits_dump.cpp)
+target_link_libraries(diag_logits_dump PRIVATE engine_kernels)
+set_target_properties(diag_logits_dump PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(test_tui_view tests/2_parity/test_tui_view.cpp)
 target_link_libraries(test_tui_view PRIVATE engine_kernels)
 set_target_properties(test_tui_view PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
