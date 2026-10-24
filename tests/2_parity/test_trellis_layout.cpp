@@ -1,8 +1,9 @@
 // The trellis dequantizer against a golden decode in the tile order the build expects: random trellis words and the FP16 weights they
 // decode to, written by tests/tools/trellis_layout_golden.py (--layout stock for a normal build, volta for ENGINE_EXL3_VOLTA_LAYOUT=ON).
-//   test_trellis_layout <golden_dir> <bits> <tiles_k> <tiles_n> [mcg]
+//   test_trellis_layout <golden_dir> <bits> <tiles_k> <tiles_n> [mcg]   (bits 9 to 11 are the half-integer rates 1.5, 2.5, 3.5)
 // pass: the reconstructed matrix equals the golden bit for bit, for the plain and the Hadamard-fused dequantizer's input path.
 #include "reconstruct.cuh"
+#include "engine/modules/trellis_bits.h"
 #include "engine/config.h"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -33,7 +34,7 @@ int main( int argc, char** argv ) {
 	const bool mcg = argc > 5 && !std::strcmp( argv[5], "mcg" );
 	const std::vector<char> words = read_all( dir + "/trellis.bin" ), expect = read_all( dir + "/expect.bin" );
 	const size_t rows = 16 * static_cast<size_t>( tk ), cols = 16 * static_cast<size_t>( tn );
-	ENGINE_ASSERT( words.size() == static_cast<size_t>( tk ) * tn * 16 * K * 2, "trellis.bin size" );
+	ENGINE_ASSERT( words.size() == static_cast<size_t>( tk ) * tn * engine::modules::trellis_tile_u16( K ) * 2, "trellis.bin size" );
 	ENGINE_ASSERT( expect.size() == rows * cols * 2, "expect.bin size" );
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	uint16_t* d_w = nullptr;

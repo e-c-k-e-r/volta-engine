@@ -1,5 +1,6 @@
 // MoE parity: persistent MoE::forward vs per-expert reference (Linear + SwiGLU + accumulate)
 // on real GLM-5.3-Flash layer-3 routed experts (rank-0 partition, 72 experts).
+#include "engine/modules/trellis_bits.h"
 #include "engine/runtime/test_paths.h"
 #include "engine/config.h"
 #include "engine/core/arena.h"
@@ -67,17 +68,17 @@ int main() {
 		std::printf( "[*] DeepSeek-V4.1: %d experts of %d/%d/%d bits in layer %d\n", E, sig[0], sig[1], sig[2], L );
 	}
 	// MOE_SYNTH=1: random trellis words and small random signs instead of the checkpoint's experts, in whatever tile order the build reads
-	// (ENGINE_EXL3_VOLTA_LAYOUT builds cannot read a stock checkpoint); MOE_SIG=g,u,d sets the widths of the three projections
+	// (ENGINE_EXL3_VOLTA_LAYOUT builds cannot read a stock checkpoint); MOE_SIG=g,u,d sets the widths of the three projections (width codes: 10 and 11 are 2.5 and 3.5 bpw)
 	const bool synth = std::getenv( "MOE_SYNTH" ) != nullptr;
 	uint32_t synth_state = 777u;
 	auto synth_linear = [&]( int k, int n, int bits ) {
-		const size_t words = static_cast<size_t>( k / 16 ) * ( n / 16 ) * 16 * bits;
+		const size_t words = static_cast<size_t>( k / 16 ) * ( n / 16 ) * engine::modules::trellis_tile_u16( bits );
 		std::vector<uint16_t> ht( words );
 		for ( auto& w : ht ) { synth_state = synth_state * 1664525u + 1013904223u; w = static_cast<uint16_t>( synth_state >> 16 ); }
 		std::vector<half> hu( k ), hv( n );
 		for ( auto& v : hu ) { synth_state = synth_state * 1664525u + 1013904223u; v = __float2half( ( synth_state >> 16 ) & 1 ? 1.0f : -1.0f ); }
 		for ( auto& v : hv ) { synth_state = synth_state * 1664525u + 1013904223u; v = __float2half( ( ( synth_state >> 16 ) & 1 ? 1.0f : -1.0f ) * 0.02f ); }
-		int tshape[3] = { k / 16, n / 16, 16 * bits };
+		int tshape[3] = { k / 16, n / 16, engine::modules::trellis_tile_u16( bits ) };
 		pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, tshape, 3 );
 		int ks[1] = { k }, ns[1] = { n };
 		pod::TensorView su = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ks, 1 );

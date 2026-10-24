@@ -15,17 +15,20 @@ import exl3_volta_layout as V
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
 ap.add_argument("--layout", default="stock", choices=["stock", "volta"])
-ap.add_argument("--bits", type=int, default=4)
+ap.add_argument("--bits", type=int, default=4, help="width code: 1 to 8, or 9 to 11 for the half-integer rates 1.5, 2.5, 3.5 (mul1 only)")
 ap.add_argument("--tk", type=int, default=6)
 ap.add_argument("--tn", type=int, default=16)
 ap.add_argument("--mcg", action="store_true")
 a = ap.parse_args()
 dev = torch.device("cuda:0")
 K, tk, tn = a.bits, a.tk, a.tn
+half = K > 8
+KB = K - 8 if half else K
 g = torch.Generator(device="cpu").manual_seed(1234)
-words = torch.randint(-32768, 32768, (tk, tn, 16 * K), dtype=torch.int16, generator=g)
+words = torch.randint(-32768, 32768, (tk, tn, 16 * KB + (8 if half else 0)), dtype=torch.int16, generator=g)
 unp = torch.zeros((tk, tn, 256), dtype=torch.int16, device=dev)
-ext.unpack_trellis(unp, words.to(dev).contiguous(), K)
+if half: V.frac_ext().unpack_trellis_frac(unp, words.to(dev).contiguous(), KB, 0xaaaa)
+else: ext.unpack_trellis(unp, words.to(dev).contiguous(), K)
 tiles = torch.zeros((tk * tn, 256), dtype=torch.float, device=dev)
 ext.decode(unp.reshape(-1, 256).contiguous(), tiles, a.mcg, not a.mcg)
 perm = tensor_core_perm(dev).long() if a.layout == "stock" else V.volta_perm(dev)   # perm[pos] = row-major element at stream position pos
