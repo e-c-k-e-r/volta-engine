@@ -83,7 +83,10 @@ __device__ inline void moe_gemm(
 }
 
 // The GEMM of one projection at the width the expert has for it: t_bits is the width of every projection of a uniform launch, 0 means
-// the three projections may differ (DeepSeek-V4.1 mixed-width packs) and `bits` selects the instantiation
+// the three projections may differ (DeepSeek-V4.1 mixed-width packs) and `bits` selects the instantiation, MOE_BITS_HALF_DYN the same for
+// layers that hold half-integer rates (width codes 10 and 11: 2.5 and 3.5 bpw) beside 2, 3 and 4 bpw. The two switches are separate kernels
+// because the arms add up in the kernel's stack frame (local memory is reserved for it per resident thread).
+#define MOE_BITS_HALF_DYN 100
 template<int t_bits, int MOE_TILESIZE_N, int cb, int wide>
 __device__ inline void moe_gemm_k(
 	int bits,
@@ -95,7 +98,16 @@ __device__ inline void moe_gemm_k(
 	int dim_n,
 	int* locks
 ) {
-	if constexpr ( t_bits != 0 ) {
+	if constexpr ( t_bits == MOE_BITS_HALF_DYN ) {
+		switch ( bits ) {
+			case 2: moe_gemm<2, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
+			case 3: moe_gemm<3, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
+			case 10: moe_gemm<10, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
+			case 11: moe_gemm<11, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
+			default: moe_gemm<4, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
+		}
+	}
+	else if constexpr ( t_bits != 0 ) {
 		moe_gemm<t_bits, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks );
 	}
 	else {

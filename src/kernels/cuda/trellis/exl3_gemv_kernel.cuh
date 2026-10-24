@@ -286,6 +286,24 @@ __device__ __forceinline__ void dq8_regs_kbits(uint32_t a, uint32_t b, int s2, F
                 w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
 }
 
+// Register form of dq8_half<KA, cb> (exl3_dq.cuh): the two window groups' word pairs and funnel alignments are lane constants, so the
+// caller resolves the four words by shuffle or from the staged tile
+template <int KA, int cb>
+__device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, uint32_t a3, uint32_t b3, int s3, FragB& f0, FragB& f1)
+{
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    w7 = fshift(b7, a7, s7);
+    w6 = w7 >> (KA + 1);
+    w5 = w6 >> KA;
+    w4 = w5 >> (KA + 1);
+    w3 = fshift(b3, a3, s3);
+    w2 = w3 >> (KA + 1);
+    w1 = w2 >> KA;
+    w0 = w1 >> (KA + 1);
+    decode8<cb>(w0 & 0xffff, w1 & 0xffff, w2 & 0xffff, w3 & 0xffff,
+                w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
+}
+
 }  // namespace exl3_gemv_ns
 
 inline __device__ uint4 ld_cs_v4(const uint4* ptr)
@@ -446,7 +464,11 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__) < 800
+    #if EXL3_VOLTA_LAYOUT
+        float dacc[WNT][8] = {};   // the octet's own n8 half of each tile (nfrag q & 1), over its two k chunks
+    #else
         float dacc[WNT][2][8] = {};
+    #endif
 #else
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
@@ -520,6 +542,17 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             const size_t a_row_v = (size_t) r_v * (size_k / 2);
             const bool r_v_ok = (MMODE == 0) ? (r_v == 0) : (r_v < size_m);
             const size_t a_col_v = (size_t) (ks0 + i) * 8;
+#if EXL3_VOLTA_LAYOUT
+            // Volta tile order: the octet works on the k chunks 2 * (q >> 1) and 2 * (q >> 1) + 1 of the k16 step
+            uint32_t va[2][2];
+            #pragma unroll
+            for (int s_ = 0; s_ < 2; ++s_)
+            {
+                const int c = 2 * ((lane >> 3) & 1) + s_;
+                va[s_][0] = r_v_ok ? *(const uint32_t*)&A2[a_row_v + a_col_v + 2 * c + 0] : 0;
+                va[s_][1] = r_v_ok ? *(const uint32_t*)&A2[a_row_v + a_col_v + 2 * c + 1] : 0;
+            }
+#else
             uint32_t va[4][2];
             #pragma unroll
             for (int c = 0; c < 4; ++c)
@@ -527,6 +560,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 va[c][0] = r_v_ok ? *(const uint32_t*)&A2[a_row_v + a_col_v + 2 * c + 0] : 0;
                 va[c][1] = r_v_ok ? *(const uint32_t*)&A2[a_row_v + a_col_v + 2 * c + 1] : 0;
             }
+#endif
 #else
             // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
             const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
@@ -577,6 +611,11 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__) < 800
+#if EXL3_VOLTA_LAYOUT
+                // the lane's eight decoded values are its m8n8k4 B operands (f0 = k chunk 2 * (q >> 1), f1 the next one)
+                volta_mma_m8n8k4(va[0][0], va[0][1], *(const uint32_t*)&f0[0], *(const uint32_t*)&f0[1], dacc[t]);
+                volta_mma_m8n8k4(va[1][0], va[1][1], *(const uint32_t*)&f1[0], *(const uint32_t*)&f1[1], dacc[t]);
+#else
                 if (is_zero_shfl)
                 {
                     sh_f[warp][0][lane] = *(const uint32_t*)&f0[0];
@@ -656,6 +695,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     b1_1 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f1[1], 4 * cv + 3);
                     volta_mma_m8n8k4(va[3][0], va[3][1], b0_1, b1_1, dacc[t][1]);
                 }
+#endif
 #else
                 exl3_gemv_ns::mma_ab_h2(a01, a23, f0, f1, ch[t][0], ch[t][1]);
 #endif
@@ -681,6 +721,26 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         // Cross-warp reduction over the k splits.
         {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__) < 800
+#if EXL3_VOLTA_LAYOUT
+            // the octet pair (q, q ^ 2) holds the two k halves of one n8 block: add them, the two lower octets write their halves
+            {
+                const int q_ = (lane >> 2) & 3;
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                {
+                    #pragma unroll
+                    for (int reg = 0; reg < 8; ++reg)
+                    {
+                        float v = dacc[t][reg];
+                        v += __shfl_xor_sync(0xffffffffu, v, 8);
+                        int m, n;
+                        volta_d_slot(lane, reg, &m, &n);
+                        if (q_ < 2 && m < ROWS)
+                            sh_red[warp][m][t * 16 + 8 * (q_ & 1) + n] = v;
+                    }
+                }
+            }
+#else
             if constexpr (MMODE == 0)
             {
                 if ((lane & 1) == 0 && lane < 16)
@@ -718,6 +778,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     }
                 }
             }
+#endif
 #else
             const int c0 = 2 * (lane & 3);
             const bool store0 = MMODE == 0 ? lane < 4 : r0 < ROWS;

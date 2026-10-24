@@ -1,3 +1,4 @@
+#include "engine/modules/trellis_bits.h"
 #include "engine/modules/moe.h"
 #include "engine/backend/cuda/activation.cuh"
 #include "engine/modules/nvfp4_moe.h"
@@ -650,6 +651,32 @@ void MoE::init_device_ptrs(
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		}
 		weights.device_ptrs = d_ptrs;
+
+		// Experts whose widths differ within the layer: a per-expert width table for the kernels, the widest tile named in bits_max.
+		// (DeepSeek-V4.1's merged layers build their own after this call; the 2.60 bpw GLM is uniform per layer, 2.5, 3.5 or 4 bpw.)
+		if ( weights.bits_dev == nullptr && E > 0 ) {
+			const int first = weights.gate[0].bits;
+			bool differ = false;
+			int widest = first;
+			bool anyhalf = false;
+			std::vector<uint8_t> tab( 3 * static_cast<size_t>( E ) );
+			for ( int e = 0; e < E; ++e ) {
+				const int kb[3] = { weights.gate[e].bits, weights.up[e].bits, weights.down[e].bits };
+				for ( int q = 0; q < 3; ++q ) {
+					tab[static_cast<size_t>( q ) * E + e] = static_cast<uint8_t>( kb[q] );
+					differ = differ || kb[q] != first;
+					anyhalf = anyhalf || engine::modules::trellis_is_half( kb[q] );
+					if ( engine::modules::trellis_tile_u16( kb[q] ) > engine::modules::trellis_tile_u16( widest ) ) widest = kb[q];
+				}
+			}
+			if ( differ ) {
+				weights.bits_dev = static_cast<uint8_t*>( engine::core::arena_alloc( arena, tab.size() ) );
+				CUDA_CHECK( cudaMemcpyAsync( weights.bits_dev, tab.data(), tab.size(), cudaMemcpyHostToDevice, stream ) );
+				if ( stream ) CUDA_CHECK( cudaStreamSynchronize( stream ) );
+				weights.bits_max = widest;
+				weights.bits_half = anyhalf;
+			}
+		}
 	}
 	if ( weights.type == pod::QuantType::NVFP4 ) {
 		// 6 pointer arrays (gate c/s, up c/s, down c/s) then 3 float arrays (global scales)
@@ -733,7 +760,7 @@ bool MoE::fused_decode( const pod::MoELayerWeights& weights, const pod::MoEScrat
 #if defined(USE_ROCM)
 	const bool bits_ok = ebits >= 1 && ebits <= 8;   // the ROCm launch (exl3_moe.cu) takes any width
 #else
-	auto bok = []( int b ) { return b >= 1 && b <= 4; };
+	auto bok = []( int b ) { return ( b >= 1 && b <= 4 ) || b == 10 || b == 11; };   // 10 and 11: the half-integer rates 2.5 and 3.5
 	const bool bits_ok = weights.bits_dev ? bok( weights.bits_max ) : ( bok( ebits ) && bok( weights.up[0].bits ) && bok( weights.down[0].bits ) );
 #endif
 #if defined(USE_ROCM)
@@ -860,7 +887,8 @@ void MoE::forward(
 			const int K_up = weights.bits_dev ? weights.bits_max : weights.up[0].bits;
 			const int K_down = weights.bits_dev ? weights.bits_max : weights.down[0].bits;
 			ENGINE_ASSERT( weights.device_ptrs != nullptr, "MoE::forward: init_device_ptrs not called" );
-			ENGINE_ASSERT( K_gate >= 1 && K_gate <= 5 && K_up >= 1 && K_up <= 5 && K_down >= 1 && K_down <= 5, "MoE::forward: persistent trellis MoE kernel is instantiated for 1 to 5-bit experts" );
+			auto kok = []( int b ) { return ( b >= 1 && b <= 5 ) || b == 10 || b == 11; };
+			ENGINE_ASSERT( kok( K_gate ) && kok( K_up ) && kok( K_down ), "MoE::forward: persistent trellis MoE kernel is instantiated for 1 to 5-bit experts and 2.5 / 3.5 bpw" );
 
 			const int wide = rows > 128 && runtime::options().moe_prefill_tile ? 3 : rows > 8 ? 2 : 0;
 			MoERouter::exl3_moe_dispatch(
@@ -919,7 +947,7 @@ void MoE::forward(
 				E,
 				stream,
 				weights.top_k,
-				weights.bits_dev
+				weights.bits_dev, weights.bits_half
 			);
 			if ( num_groups > 1 ) {
 				if ( plane_elems % 8 == 0 && num_groups <= MOE_MAX_GROUPS ) {
@@ -950,12 +978,15 @@ static void* moe_kernel_fn( int variant, int mode ) {
 		case 3: return mode == 3 ? (void*) exl3_moe_kernel<2, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<2, 128, 2, 2> : (void*) exl3_moe_kernel<2, 128, 2, 0>;
 		case 4: return mode == 3 ? (void*) exl3_moe_kernel<5, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<5, 128, 2, 2> : (void*) exl3_moe_kernel<5, 128, 2, 0>;
 		case 5: return mode == 3 ? (void*) exl3_moe_kernel<1, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<1, 128, 2, 2> : (void*) exl3_moe_kernel<1, 128, 2, 0>;
+		case 8: return mode == 3 ? (void*) exl3_moe_kernel<10, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<10, 128, 2, 2> : (void*) exl3_moe_kernel<10, 128, 2, 0>;
+		case 9: return mode == 3 ? (void*) exl3_moe_kernel<11, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<11, 128, 2, 2> : (void*) exl3_moe_kernel<11, 128, 2, 0>;
+		case 7: return mode == 3 ? (void*) exl3_moe_kernel<MOE_BITS_HALF_DYN, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<MOE_BITS_HALF_DYN, 128, 2, 2> : (void*) exl3_moe_kernel<MOE_BITS_HALF_DYN, 128, 2, 0>;
 		case 6: return mode == 3 ? (void*) exl3_moe_kernel<0, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<0, 128, 2, 2> : (void*) exl3_moe_kernel<0, 128, 2, 0>;
 		default: return mode == 3 ? (void*) exl3_moe_kernel<4, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<4, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 0>;
 	}
 }
 
-static bool attr_done[ENGINE_NUM_GPUS][7] = {};
+static bool attr_done[ENGINE_NUM_GPUS][10] = {};
 
 void exl3_moe_reset_caches() {
 	for ( auto& d : attr_done ) for ( bool& b : d ) b = false;
@@ -990,7 +1021,7 @@ void exl3_moe(
 	int num_experts,
 	cudaStream_t stream,
 	int top_k,
-	const uint8_t* bits_tab
+	const uint8_t* bits_tab, bool has_half
 ) {
 	(void) gate_mcg; (void) gate_mul1; (void) up_mcg; (void) up_mul1; (void) down_mcg; (void) down_mul1;
 	(void) num_active;
@@ -1053,12 +1084,15 @@ void exl3_moe(
 
 	// 3-bit experts with a 256-divisible intermediate width (GLM) run 256-wide output tiles; every other shape (4-bit experts, and
 	// 3-bit ones with Flash-Next's intermediate 640) takes the 128-wide tiles
-	ENGINE_ASSERT( K_gate >= 1 && K_gate <= 5 && K_up >= 1 && K_up <= 5 && K_down >= 1 && K_down <= 5, "exl3_moe: expert bits" );
+	auto kok = []( int b ) { return ( b >= 1 && b <= 5 ) || b == 10 || b == 11; };
+	ENGINE_ASSERT( kok( K_gate ) && kok( K_up ) && kok( K_down ), "exl3_moe: expert bits" );
 	const bool mixed = bits_tab != nullptr || K_gate != K_up || K_up != K_down;   // the projections of the experts differ in width: one kernel that picks each GEMM's instantiation at run time
-	const int K_max = MAX( K_gate, MAX( K_up, K_down ) );
+	// the widest tile of the three (width codes do not order by size: 11 is 3.5 bpw)
+	int K_max = K_gate;
+	for ( int kq : { K_up, K_down } ) if ( engine::modules::trellis_tile_u16( kq ) > engine::modules::trellis_tile_u16( K_max ) ) K_max = kq;
 	const bool tile128 = mixed || K_gate != 3 || intermediate_dim % 256 != 0;
 	ENGINE_ASSERT( intermediate_dim % ( tile128 ? 128 : 256 ) == 0, "exl3_moe: intermediate width vs the output tile" );
-	const int variant = mixed ? 6 : K_gate == 5 ? 4 : K_gate == 4 ? 2 : K_gate == 2 ? 3 : K_gate == 1 ? 5 : ( tile128 ? 1 : 0 );   // 0: <3,256>, 1: <3,128>, 2: <4,128>, 3: <2,128>, 4: <5,128> (DeepSeek-V4.1's few 5-bit experts), 5: <1,128>
+	const int variant = mixed ? ( has_half ? 7 : 6 ) : K_gate == 10 ? 8 : K_gate == 11 ? 9 : K_gate == 5 ? 4 : K_gate == 4 ? 2 : K_gate == 2 ? 3 : K_gate == 1 ? 5 : ( tile128 ? 1 : 0 );   // 0: <3,256>, 1: <3,128>, 2: <4,128>, 3: <2,128>, 4: <5,128> (DeepSeek-V4.1's few 5-bit experts), 5: <1,128>
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_done[device][variant] ) {
 		void* fns[3] = { moe_kernel_fn( variant, 0 ), moe_kernel_fn( variant, 2 ), moe_kernel_fn( variant, 3 ) };
 		for ( void* fn : fns ) CUDA_CHECK( cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );

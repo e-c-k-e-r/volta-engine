@@ -6,13 +6,6 @@
 #include "hadamard.cuh"
 #include <cstdlib>
 
-// ENGINE_EXL3_VOLTA_LAYOUT builds read the weight tiles in the Volta order, which the GEMV kernels do not know: those row counts take the GEMM
-#if defined(EXL3_VOLTA_LAYOUT) && EXL3_VOLTA_LAYOUT
-	#define EXL3_VOLTA_LAYOUT_BUILD 1
-#else
-	#define EXL3_VOLTA_LAYOUT_BUILD 0
-#endif
-
 namespace engine::modules {
 
 namespace {
@@ -100,8 +93,10 @@ void LinearTrellis::forward(
 	const bool recon = m > EXL3_GEMV_ROCM_MAX_M;
 	gemm_shape = 0;
 #else
-	const bool recon = recon_threshold() > 0 && m > recon_threshold();
+	// The half-integer rates (width codes above 8) have no GEMM / GEMV instances: dequantize and run cuBLAS at any row count
+	const bool recon = ( recon_threshold() > 0 && m > recon_threshold() ) || bits > 8;
 #endif
+	ENGINE_ASSERT( bits <= 8 || ( !c_fp32 && k % 128 == 0 && n % 128 == 0 ), "LinearTrellis::forward: a half-integer rate needs FP16 output and dimensions that are multiples of 128" );
 	if ( recon && !c_fp32 && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 		forward_recon( x, trellis, suh, svh, out, bits, mcg, mul1, stream );
 	}
@@ -111,7 +106,7 @@ void LinearTrellis::forward(
 #if defined(USE_ROCM)
 	else if ( m <= EXL3_GEMV_ROCM_MAX_M && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 #else
-	else if ( m <= 8 && ( m == 1 || m == 2 || m == 4 || m == 8 ) && ( k % 128 == 0 ) && ( n % 128 == 0 ) && !EXL3_VOLTA_LAYOUT_BUILD ) {
+	else if ( m <= 8 && ( m == 1 || m == 2 || m == 4 || m == 8 ) && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 #endif
 		exl3_gemv(
 			x_ptr,

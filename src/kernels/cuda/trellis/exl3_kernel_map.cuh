@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/modules/trellis_bits.h"
 #include <cstdint>
 #include <cuda_fp16.h>
 
@@ -144,7 +145,7 @@ __host__ __device__ constexpr int exl3_gemm_smem_bytes(
 	int frags_n_per_warp = 2 * tileblocks_n / ( EXL3_GEMM_BASE_THREADS / 32 );
 
 	int sh_a_stage_size = tilesize_m * tilesize_k;
-	int sh_b_stage_size = tileblocks_k * tileblocks_n * 256 / 16 * bits;
+	int sh_b_stage_size = tileblocks_k * tileblocks_n * engine::modules::trellis_tile_u16( bits );
 	int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp;
 	int sh_c_had = shmem_out_had ? tilesize_n * tilesize_m : 0;
 	if ( sh_c_had > sh_c_size ) {

@@ -77,6 +77,7 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--only", default="", help="re-encode only tensors whose name contains this (others are copied as they are)")
     ap.add_argument("--files", default="", help="only these shards, comma separated (run one process per GPU)")
+    ap.add_argument("--claim", action="store_true", help="take the next shard nobody has claimed (start one process per GPU, add more at any time; a finished shard is skipped on a restart)")
     ap.add_argument("--limit", type=int, default=0, help="stop after this many trellis tensors (testing)")
     a = ap.parse_args()
     device = torch.device(a.device)
@@ -103,6 +104,14 @@ def main():
             continue
         if a.files and fn not in a.files.split(","):
             continue
+        final = os.path.join(a.dst, fn)
+        if a.claim:
+            if os.path.exists(final):
+                continue
+            try:
+                os.close(os.open(final + ".claim", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            except FileExistsError:
+                continue
         tensors = {}
         with safe_open(src, "pt") as f:
             meta = f.metadata()
@@ -119,7 +128,10 @@ def main():
                     done += 1
                     print(f"[{time.time() - t0:7.1f}s] {name} K={K} relative re-encode error {err:.4f}", flush=True)
                 tensors[name] = t.contiguous()
-        save_file(tensors, os.path.join(a.dst, fn), metadata=meta)
+        save_file(tensors, final + ".tmp", metadata=meta)
+        os.replace(final + ".tmp", final)
+        if a.claim:
+            os.unlink(final + ".claim")
         print(f"wrote {fn}", flush=True)
     if errs:
         print(f"{done} tensors, mean relative re-encode error {sum(errs) / len(errs):.4f}, {time.time() - t0:.0f} s")

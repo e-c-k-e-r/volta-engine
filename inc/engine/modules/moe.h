@@ -26,6 +26,7 @@ struct MoELayerWeights {
 	// width per projection, and the widest; the kernels then pick each projection's instantiation per expert. Null: gate[0].bits etc. hold for all
 	uint8_t* bits_dev = nullptr;
 	int bits_max = 0;
+	bool bits_half = false;            // a width in the table is a half-integer rate (width codes above 8)
 };
 
 // Device scratch for one MoE dispatch (single token, top_k routes). Allocated once at init.
@@ -204,7 +205,8 @@ void exl3_moe(
 	int num_experts,
 	engine::backend::stream_t stream = nullptr,
 	int top_k = 8,                  // routes per token (the kernel argument num_experts_per_tok)
-	const uint8_t* bits_tab = nullptr   // per-expert widths [gate | up | down][num_experts] (the K arguments then give the widest); null: K_gate / K_up / K_down for all
+	const uint8_t* bits_tab = nullptr,  // per-expert widths [gate | up | down][num_experts] (the K arguments then give the widest); null: K_gate / K_up / K_down for all
+	bool bits_half = false              // a width in that table is a half-integer rate (2.5 / 3.5 bpw): the kernel variant that holds those arms
 );
 
 } // namespace ext

@@ -4,6 +4,7 @@
 #include "ptx.cuh"
 #include "exl3_dq.cuh"
 #include "hadamard_inner.cuh"
+#include "engine/modules/trellis_bits.h"
 #include <array>
 
 template <int K, int cb>
@@ -14,7 +15,7 @@ void reconstruct_kernel(
 	int packed_blocks_n,
 	int packed_n_offset
 ) {
-	constexpr int packed_size = 256 * K / 16;
+	constexpr int packed_size = engine::modules::trellis_tile_u16( K );
 
 	int t = threadIdx.x;
 	int lane_id = t % 32;
@@ -93,7 +94,8 @@ void reconstruct_kernel(
 constexpr auto reconstruct_kernel_instances = std::array{
 	__(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
 	__(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
-	__(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2)
+	__(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+	__(9, 2), __(10, 2), __(11, 2)   // the half-integer rates 1.5, 2.5, 3.5 (mul1 only)
 };
 #undef __
 
@@ -109,7 +111,7 @@ void reconstruct_had_kernel(
 	int packed_blocks_n,
 	int packed_n_offset
 ) {
-	constexpr int packed_size = 256 * K / 16;
+	constexpr int packed_size = engine::modules::trellis_tile_u16( K );
 	constexpr float r_scale = 0.08838834764831845f;
 
 	int t = threadIdx.x;
@@ -256,7 +258,8 @@ void reconstruct_had_kernel(
 constexpr auto reconstruct_had_kernel_instances = std::array{
 	__(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
 	__(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
-	__(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2)
+	__(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+	__(9, 2), __(10, 2), __(11, 2)   // the half-integer rates 1.5, 2.5, 3.5 (mul1 only)
 };
 #undef __
 
@@ -271,7 +274,7 @@ void reconstruct_slice(
 	int64_t n_offset,
 	cudaStream_t stream
 ) {
-	if ( K < 1 || K > 8 ) return;
+	if ( K < 1 || K > 11 || ( K > 8 && !mul1 ) ) return;
 	int packed_cols = cols / 16;
 	int packed_n_offset = n_offset / 16;
 
@@ -279,7 +282,8 @@ void reconstruct_slice(
 	dim3 gridDim( cols / 128, rows );
 
 	int cbi = K - 1;
-	if ( mcg ) cbi += 8;
+	if ( K > 8 ) cbi = 24 + K - 9;
+	else if ( mcg ) cbi += 8;
 	else if ( mul1 ) cbi += 16;
 
 	reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>(
@@ -303,7 +307,7 @@ void reconstruct_had_slice(
 	int64_t n_offset,
 	cudaStream_t stream
 ) {
-	if ( K < 1 || K > 8 ) return;
+	if ( K < 1 || K > 11 || ( K > 8 && !mul1 ) ) return;
 	int packed_cols = cols / 16;
 	int packed_n_offset = n_offset / 16;
 
@@ -311,7 +315,8 @@ void reconstruct_had_slice(
 	dim3 gridDim( cols / 128, rows / 128 );
 
 	int cbi = K - 1;
-	if ( mcg ) cbi += 8;
+	if ( K > 8 ) cbi = 24 + K - 9;
+	else if ( mcg ) cbi += 8;
 	else if ( mul1 ) cbi += 16;
 
 	reconstruct_had_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>(

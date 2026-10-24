@@ -47,7 +47,7 @@ int main() {
 		// the unsharded (tp=1) 27B shapes, and the 3 and 6 bit tensors
 		{ "mlp gate/up tp1", 5120, 17408, 4 }, { "mlp down tp1", 17408, 5120, 4 }, { "mlp gate/up 3b", 5120, 17408, 3 }, { "mlp down 3b", 17408, 5120, 3 }, { "attn kv 6b", 5120, 1024, 6 }, { "gdn qkv tp1", 5120, 10240, 4 },
 	};
-	const int ms[] = { 1, 4, 8, 12, 16, 17, 20, 24, 32, 40, 48, 64 };
+	const int ms[] = { 1, 2, 4, 8, 12, 16, 17, 20, 24, 32, 40, 48, 64 };
 	int fails = 0;
 	for ( const auto& sh : shapes ) {
 		const size_t words = static_cast<size_t>( sh.k / 16 ) * ( sh.n / 16 ) * 16 * sh.bits;
@@ -102,6 +102,22 @@ int main() {
 			const double rms = std::sqrt( sq / r1.size() );
 			const bool ok = cosv >= 0.9999 && maxd <= 0.05 * rms * 4.0;
 			fails += ok ? 0 : 1;
+			// the module's own dispatch (the dedicated GEMV kernel at 1, 2, 4 and 8 rows, any width) against the same reference
+			bool ok_lin = true;
+			if ( m <= 8 && ( m == 1 || m == 2 || m == 4 || m == 8 ) && sh.k % 128 == 0 && sh.n % 128 == 0 ) {
+				engine::modules::LinearTrellis::forward( xm, tv, su, sv, om1, sh.bits, false, true, s );
+				CUDA_CHECK( cudaStreamSynchronize( s ) );
+				std::vector<half> r3( r1.size() );
+				CUDA_CHECK( cudaMemcpy( r3.data(), o1.data, r3.size() * 2, cudaMemcpyDeviceToHost ) );
+				double d3 = 0, m3 = 0, q3 = 0, qr = 0;
+				for ( size_t i = 0; i < r3.size(); ++i ) {
+					const double a = __half2float( r3[i] ), b = __half2float( r2[i] );
+					d3 += a * b; m3 += a * a; q3 += b * b; qr = std::fmax( qr, std::fabs( a - b ) );
+				}
+				ok_lin = d3 / ( std::sqrt( m3 ) * std::sqrt( q3 ) + 1e-30 ) >= 0.9999 && qr <= 0.05 * rms * 4.0;
+				fails += ok_lin ? 0 : 1;
+				if ( !ok_lin ) std::printf( "  %-15s M=%3d: LinearTrellis::forward (GEMV) FAIL (max|d| %.4g)\n", sh.name, m, qr );
+			}
 			const float t_g = time_us( gemm, s, 10 ), t_r = time_us( recon, s, 10 );
 			std::printf( "  %-15s M=%3d: cos %.6f  max|d| %.4g (rms %.3g) | gemm %7.1f us  recon %7.1f us (%.2fx)  %s\n",
 				sh.name, m, cosv, maxd, rms, t_g, t_r, t_g / t_r, ok ? "PASS" : "FAIL" );

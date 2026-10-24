@@ -30,7 +30,11 @@ namespace {
 // 0: disabled; 1: int8 + error-feedback residual pass (~15-16 bit activation precision);
 // 2: plain int8 (cheaper, lossy).
 int int8_mode() {
+#if EXL3_VOLTA_LAYOUT
+	return 0;   // the dp4a kernels map decoded values to k and n by the stock tile order
+#else
 	return 1;
+#endif
 }
 
 // Smem-staged unit routing. Upstream measured K = 3, 5, 7 on Ampere, where cp.async hides the

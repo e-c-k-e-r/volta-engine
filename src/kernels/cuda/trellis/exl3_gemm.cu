@@ -80,7 +80,6 @@ void exl3_gemm(
 		(void*) &svh
 	};
 
-#if !EXL3_VOLTA_LAYOUT   // the GEMV kernel reads the stock tile order
 	if ( force_shape <= 0 && size_m <= 8 && size_n < 4096 && size_k % 128 == 0 && size_n % 128 == 0 ) {
 		if ( exl3_gemv_try_launch(
 			kernel_args,
@@ -99,7 +98,6 @@ void exl3_gemm(
 			return;
 		}
 	}
-#endif
 
 	int block_dim = 0;
 	int shape_idx = force_shape > 0 ? force_shape : select_gemm_shape( cc, size_m, size_k, size_n, K, false, 1, 1 );

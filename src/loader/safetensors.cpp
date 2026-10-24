@@ -1,3 +1,4 @@
+#include "engine/modules/trellis_bits.h"
 #include "engine/loader/safetensors.h"
 #include "engine/core/log.h"
 #include "engine/backend/runtime.h"
@@ -891,7 +892,7 @@ size_t SafeTensorsRepo::synth_trellis_bytes( const char* base_name ) const {
 pod::LinearWeight SafeTensorsRepo::synth_linear( const char* base_name, pod::MemoryArena& arena, backend::stream_t stream, pod::MemoryArena* code_arena ) const {
 	std::array<int, 3> sh;
 	if ( !synth_trellis_shape( dir_path_, base_name, sh ) ) return pod::LinearWeight{};
-	const int bits = sh[2] / 16, k = sh[0] * 16, n = sh[1] * 16;
+	const int bits = engine::modules::trellis_code_from_u16( sh[2] ), k = sh[0] * 16, n = sh[1] * 16;
 	const size_t code_bytes = static_cast<size_t>( sh[0] ) * sh[1] * sh[2] * 2;
 	static std::vector<uint16_t> pattern;   // one pseudo-random buffer, copied into every generated expert (the decode cost does not depend on the values)
 	if ( pattern.size() * 2 < code_bytes ) {
@@ -979,7 +980,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear(
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.mcg", base_name );
 	const bool has_mcg = ( find( name_buf, &dummy_shard ) != nullptr );
 
-	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( tr.shape[2] / 16 ) : bits;
+	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : bits;
 	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg );
 }
 
@@ -1011,7 +1012,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.mcg", base_name );
 	const bool has_mcg = ( find( name_buf, &dummy_shard ) != nullptr );
 
-	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( tr.shape[2] / 16 ) : bits;
+	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : bits;
 
 	if ( slice_dim == 0 ) {
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.suh", base_name );
@@ -1189,7 +1190,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_cols_padded(
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.mcg", base_name );
 	const bool has_mcg = ( find( name_buf, &dummy_shard ) != nullptr );
 
-	int actual_bits = B / 16;
+	int actual_bits = engine::modules::trellis_code_from_u16( B );
 	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits ? actual_bits : bits, has_mul1, has_mcg );
 }
 
@@ -1292,7 +1293,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_fused(
 	backend::memcpy_async( svh.data, h_svh_fused.data(), local_N_fused * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 	backend::stream_sync( stream );
 
-	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( tr.shape[2] / 16 ) : bits;
+	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : bits;
 	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits );
 }
 
@@ -1335,7 +1336,7 @@ pod::LinearWeight SafeTensorsRepo::load_grouped_trellis_slice(
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.mcg", base_name );
 	const bool has_mcg = ( find( name_buf, &dummy_shard ) != nullptr );
 
-	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( tr.shape[2] / 16 ) : 5;
+	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : 5;
 	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg );
 }
 

@@ -6,6 +6,7 @@ namespace cg = cooperative_groups;
 #include "util.cuh"
 #include "ptx.cuh"
 #include "exl3_dq.cuh"
+#include "engine/modules/trellis_bits.h"
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
 #include "exl3_gemv_kernel.cuh"
@@ -234,7 +235,9 @@ __device__ __forceinline__ void gemv_tile(
 	float* __restrict__ sh_red          // [WKK][ROWS][TCOLS]
 ) {
 	constexpr int WN = WN_;
-	constexpr int TW = 8 * BITS_;                // uint32 per 16x16 tile
+	constexpr bool HALF = BITS_ > 8;             // the half-integer rates 2.5 and 3.5 (width codes 10 and 11, mul1 only)
+	static_assert( !HALF || ( BITS_ == 10 || BITS_ == 11 ), "the fused MoE tile covers the half-integer rates 2.5 and 3.5" );
+	constexpr int TW = engine::modules::trellis_tile_u32( BITS_ );   // uint32 per 16x16 tile
 	constexpr int GW = WNT * TW;                 // uint32 per warp per k-slice
 	constexpr int WKK = tile_wk<WN_>();
 	constexpr int TCOLS = tile_cols<WN_>();
@@ -260,8 +263,18 @@ __device__ __forceinline__ void gemv_tile(
 	const size_t a_row0 = r0_ok ? static_cast<size_t>( rows[r0] ) * a_stride2 : 0;
 	const half2 hzero = __half2half2( __ushort_as_half( 0 ) );
 
-	int x_src_a, x_src_b, x_s2 = 0;
-	if constexpr ( BITS_ == 3 || BITS_ == 1 ) {
+	int x_src_a = 0, x_src_b = 0, x_s2 = 0;
+	// Half-integer rates: the word indices (< TW <= 28) and funnel shifts (< 32) of the two window groups, six 5-bit fields in one register
+	[[maybe_unused]] uint32_t x_pack = 0;
+	if constexpr ( HALF ) {
+		constexpr int KA = BITS_ - 8, bits2 = 2 * KA + 1, gspan = 18 + 3 * KA;
+		const int e7 = ( ( ( lane << 3 ) >> 1 ) + 4 ) * bits2 + 128 * bits2;
+		const int e3 = e7 - 2 * bits2;
+		const uint32_t hi7 = ( ( e7 - 1 ) / 32 ) % TW, lo7 = ( ( e7 - gspan ) / 32 ) % TW, s7 = ( ( e7 - 1 ) / 32 + 1 ) * 32 - e7;
+		const uint32_t hi3 = ( ( e3 - 1 ) / 32 ) % TW, lo3 = ( ( e3 - gspan ) / 32 ) % TW, s3 = ( ( e3 - 1 ) / 32 + 1 ) * 32 - e3;
+		x_pack = lo7 | ( hi7 << 5 ) | ( s7 << 10 ) | ( lo3 << 15 ) | ( hi3 << 20 ) | ( s3 << 25 );
+	}
+	else if constexpr ( BITS_ == 3 || BITS_ == 1 ) {
 		// 3 and 1 bpw: a lane's eight windows span two words of the tile (24 or 8 words), the funnel shift being lane dependent
 		const int t_offset = lane << 3;
 		const int b1 = ( t_offset + 257 ) * BITS_;
@@ -300,7 +313,11 @@ __device__ __forceinline__ void gemv_tile(
 	}
 
 #if MOE_COOP_M8N8K4
+	#if EXL3_VOLTA_LAYOUT
+	float dacc[WNT][8] = {};   // the octet's own n8 half of each tile (nfrag q & 1) over its two k chunks
+	#else
 	float dacc[WNT][2][8] = {};
+	#endif
 	const int r_v = ( lane & 3 ) + 4 * ( lane >= 16 );
 	const bool r_v_ok = r_v < nrows;
 	const size_t a_row_v = r_v_ok ? static_cast<size_t>( rows[r_v] ) * a_stride2 : 0;
@@ -326,16 +343,37 @@ __device__ __forceinline__ void gemv_tile(
 
 #if MOE_COOP_M8N8K4
 			// Real Volta m8n8k4 with FP32 accumulation: lane row (lane&3)+4*(lane>=16), 4 k per step
+#if EXL3_VOLTA_LAYOUT
+			// Volta tile order: the octet works on the k chunks 2 * (q >> 1) and 2 * (q >> 1) + 1 of the k16 step
+			uint32_t va[2][2];
+			#pragma unroll
+			for ( int s_ = 0; s_ < 2; ++s_ ) {
+				const int c = 2 * ( ( lane >> 3 ) & 1 ) + s_;
+				va[s_][0] = r_v_ok ? *reinterpret_cast<const uint32_t*>( &A2[a_row_v + static_cast<size_t>( ks0 + i ) * 8 + 2 * c + 0] ) : 0;
+				va[s_][1] = r_v_ok ? *reinterpret_cast<const uint32_t*>( &A2[a_row_v + static_cast<size_t>( ks0 + i ) * 8 + 2 * c + 1] ) : 0;
+			}
+#else
 			uint32_t va[4][2];
 			#pragma unroll
 			for ( int c = 0; c < 4; ++c ) {
 				va[c][0] = r_v_ok ? *reinterpret_cast<const uint32_t*>( &A2[a_row_v + static_cast<size_t>( ks0 + i ) * 8 + 2 * c + 0] ) : 0;
 				va[c][1] = r_v_ok ? *reinterpret_cast<const uint32_t*>( &A2[a_row_v + static_cast<size_t>( ks0 + i ) * 8 + 2 * c + 1] ) : 0;
 			}
+#endif
 			#pragma unroll
 			for ( int t = 0; t < WNT; ++t ) {
 				FragB f0, f1;
-				if constexpr ( BITS_ == 3 || BITS_ == 1 ) {
+				if constexpr ( HALF ) {
+					// one tile per warp load, the trailing lanes idle (28 or 20 words of 32)
+					#define XP( i ) ( ( x_pack >> ( 5 * ( i ) ) ) & 31u )   // 0: lo7, 1: hi7, 2: s7, 3: lo3, 4: hi3, 5: s3
+					const uint32_t a7 = __shfl_sync( 0xffffffffu, bw[t], XP( 0 ) );
+					const uint32_t b7 = __shfl_sync( 0xffffffffu, bw[t], XP( 1 ) );
+					const uint32_t a3 = __shfl_sync( 0xffffffffu, bw[t], XP( 3 ) );
+					const uint32_t b3 = __shfl_sync( 0xffffffffu, bw[t], XP( 4 ) );
+					exl3_gemv_ns::dq8_regs_half<BITS_ - 8, cb>( a7, b7, XP( 2 ), a3, b3, XP( 5 ), f0, f1 );
+					#undef XP
+				}
+				else if constexpr ( BITS_ == 3 || BITS_ == 1 ) {
 					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
 					const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
 					exl3_gemv_ns::dq8_regs_kbits<cb, BITS_>( awv, bwv, x_s2, f0, f1 );
@@ -352,6 +390,11 @@ __device__ __forceinline__ void gemv_tile(
 					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
 					exl3_gemv_ns::dq8_regs_4bits<cb>( awv, bw[t], f0, f1 );
 				}
+#if EXL3_VOLTA_LAYOUT
+				// the lane's eight decoded values are its m8n8k4 B operands (f0 = k chunk 2 * (q >> 1), f1 the next one)
+				volta_mma_m8n8k4( va[0][0], va[0][1], *reinterpret_cast<const uint32_t*>( &f0[0] ), *reinterpret_cast<const uint32_t*>( &f0[1] ), dacc[t] );
+				volta_mma_m8n8k4( va[1][0], va[1][1], *reinterpret_cast<const uint32_t*>( &f1[0] ), *reinterpret_cast<const uint32_t*>( &f1[1] ), dacc[t] );
+#else
 				const int cv = ( lane & 3 ) + 4 * ( lane >= 16 );
 				#pragma unroll
 				for ( int s = 0; s < 4; ++s ) {
@@ -362,6 +405,7 @@ __device__ __forceinline__ void gemv_tile(
 					volta_mma_m8n8k4( va[s][0], va[s][1], __shfl_sync( 0xffffffffu, e0, src ), __shfl_sync( 0xffffffffu, e0, src + 1 ), dacc[t][0] );
 					volta_mma_m8n8k4( va[s][0], va[s][1], __shfl_sync( 0xffffffffu, e1, src ), __shfl_sync( 0xffffffffu, e1, src + 1 ), dacc[t][1] );
 				}
+#endif
 			}
 #else
 			// A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
@@ -375,7 +419,17 @@ __device__ __forceinline__ void gemv_tile(
 			#pragma unroll
 			for ( int t = 0; t < WNT; ++t ) {
 				FragB f0, f1;
-				if constexpr ( BITS_ == 3 || BITS_ == 1 ) {
+				if constexpr ( HALF ) {
+					// one tile per warp load, the trailing lanes idle (28 or 20 words of 32)
+					#define XP( i ) ( ( x_pack >> ( 5 * ( i ) ) ) & 31u )   // 0: lo7, 1: hi7, 2: s7, 3: lo3, 4: hi3, 5: s3
+					const uint32_t a7 = __shfl_sync( 0xffffffffu, bw[t], XP( 0 ) );
+					const uint32_t b7 = __shfl_sync( 0xffffffffu, bw[t], XP( 1 ) );
+					const uint32_t a3 = __shfl_sync( 0xffffffffu, bw[t], XP( 3 ) );
+					const uint32_t b3 = __shfl_sync( 0xffffffffu, bw[t], XP( 4 ) );
+					exl3_gemv_ns::dq8_regs_half<BITS_ - 8, cb>( a7, b7, XP( 2 ), a3, b3, XP( 5 ), f0, f1 );
+					#undef XP
+				}
+				else if constexpr ( BITS_ == 3 || BITS_ == 1 ) {
 					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
 					const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
 					exl3_gemv_ns::dq8_regs_kbits<cb, BITS_>( awv, bwv, x_s2, f0, f1 );
@@ -422,10 +476,17 @@ __device__ __forceinline__ void gemv_tile(
 			for ( int reg = 0; reg < 8; ++reg ) {
 				int m, n;
 				volta_d_slot( lane, reg, &m, &n );
+#if EXL3_VOLTA_LAYOUT
+				// the octet pair (q, q ^ 2) holds the two k halves of one n8 block: add them, the two lower octets write their halves
+				float v = dacc[t][reg];
+				v += __shfl_xor_sync( 0xffffffffu, v, 8 );
+				if ( ( ( lane >> 2 ) & 3 ) < 2 && m < ROWS ) red[m * TCOLS + t * 16 + 8 * ( ( lane >> 2 ) & 1 ) + n] = v;
+#else
 				if ( m < ROWS ) {
 					red[m * TCOLS + t * 16 + n] = dacc[t][0][reg];
 					red[m * TCOLS + t * 16 + 8 + n] = dacc[t][1][reg];
 				}
+#endif
 			}
 		}
 	}
@@ -771,6 +832,8 @@ __device__ __forceinline__ void gemv_tile_dyn(
 		case 1: gemv_tile<1, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
 		case 2: gemv_tile<2, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
 		case 3: gemv_tile<3, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
+		case 10: gemv_tile<10, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
+		case 11: gemv_tile<11, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
 		default: gemv_tile<4, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
 	}
 }
@@ -1010,11 +1073,14 @@ static void coop_smem_optin( void* fn ) {
 	CUDA_CHECK( cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( 96 * 1024 - a.sharedSizeBytes ) ) );
 }
 
+// 1 to 4 bpw and the half-integer rates 2.5 and 3.5 (width codes 10 and 11)
+static bool coop_bits_ok( int b ) { return ( b >= 1 && b <= 4 ) || b == 10 || b == 11; }
+
 void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t stream ) {
 	using namespace exl3_moe_coop_ns;
 	MoeCoopParams p = p_in;
 	const int slots = p.bsz * p.topk;
-	ENGINE_ASSERT( p.topk >= 1 && p.topk <= MOE_COOP_TOPK && p.bsz >= 1 && p.bsz <= MOE_COOP_MAX_ROWS && ( p.bits_tab != nullptr || ( p.bits >= 1 && p.bits <= 4 ) ) && ( p.bits_g == 0 || ( p.bits_g >= 1 && p.bits_g <= 4 && p.bits_u >= 1 && p.bits_u <= 4 && p.bits_d >= 1 && p.bits_d <= 4 ) ), "exl3_moe_coop: row count / topk / bits" );
+	ENGINE_ASSERT( p.topk >= 1 && p.topk <= MOE_COOP_TOPK && p.bsz >= 1 && p.bsz <= MOE_COOP_MAX_ROWS && ( p.bits_tab != nullptr || coop_bits_ok( p.bits ) ) && ( p.bits_g == 0 || ( coop_bits_ok( p.bits_g ) && coop_bits_ok( p.bits_u ) && coop_bits_ok( p.bits_d ) ) ), "exl3_moe_coop: row count / topk / bits" );
 	ENGINE_ASSERT( p.H % 128 == 0 && p.I % 128 == 0, "exl3_moe_coop: widths" );
 	p.a_global = p.bsz > 1;
 	p.ctr_a_len = MOE_COOP_MAX_SLOTS * ( p.I / 128 );
@@ -1041,7 +1107,11 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	// Tile: 1 int8 dp4a for one-row decode; with more rows 3 = dp4a for runs of up to 4 rows and fp16 tensor core above
 	// (dp4a on wider runs re-reads the weights in 4-row passes and loses to the tensor core there)
 	const bool mixed = p.bits_tab != nullptr || ( p.bits_g != 0 && ( p.bits_g != p.bits_u || p.bits_u != p.bits_d ) );
+	#if EXL3_VOLTA_LAYOUT
+	const int mode = 0;   // the int8 tiles read the stock tile order
+#else
 	const int mode = mixed || p.bits != 3 ? 0 : ( p.bsz == 1 ? 1 : 3 );
+#endif
 	const int stage_rows = mode == 1 ? 1 : ( mode >= 2 ? 4 : 0 );
 	// int8 activation staging: 2 x 16 B per k-tile per k-slab
 	constexpr int wkk = WK / WN;
@@ -1103,6 +1173,25 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	if ( p.bits == 2 ) {
 		a_kernel<2, 2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
 		b_kernel<2, 2, WN, 0><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+		CUDA_CHECK( cudaGetLastError() );
+		return;
+	}
+	if ( p.bits == 10 || p.bits == 11 ) {
+		static bool half_attr[ENGINE_NUM_GPUS][2] = {};
+		bool& done = half_attr[device >= 0 && device < ENGINE_NUM_GPUS ? device : 0][p.bits - 10];
+		if ( !done ) {
+			if ( p.bits == 10 ) { coop_smem_optin( (void*) a_kernel<10, 2, WN, 0> ); coop_smem_optin( (void*) b_kernel<10, 2, WN, 0> ); }
+			else { coop_smem_optin( (void*) a_kernel<11, 2, WN, 0> ); coop_smem_optin( (void*) b_kernel<11, 2, WN, 0> ); }
+			done = true;
+		}
+		if ( p.bits == 10 ) {
+			a_kernel<10, 2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+			b_kernel<10, 2, WN, 0><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+		}
+		else {
+			a_kernel<11, 2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+			b_kernel<11, 2, WN, 0><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+		}
 		CUDA_CHECK( cudaGetLastError() );
 		return;
 	}

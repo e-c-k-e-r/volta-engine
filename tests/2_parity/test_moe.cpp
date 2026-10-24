@@ -27,7 +27,7 @@ int main() {
 	const char* dir = dsv41 ? engine::runtime::test::model_path( "DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw", "ENGINE_TEST_DSV41_DIR" )
 		: flash ? engine::runtime::test::model_path( "Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", "ENGINE_TEST_FLASH_DIR" ) : engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw", "ENGINE_TEST_GLM_DIR" );
 	const int H = dsv41 ? 5120 : flash ? 2560 : 4096, I = dsv41 ? 2304 : flash ? 640 : 2048, K = dsv41 ? 6 : flash ? 10 : 8;
-	int E = flash ? 128 : 72, L = 3;
+	int E = flash ? 128 : 72, L = std::getenv( "MOE_LAYER" ) ? std::atoi( std::getenv( "MOE_LAYER" ) ) : 3;   // MOE_LAYER: the layer of the checkpoint whose experts are tested
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	engine::modules::trellis_context_init_all();
 	engine::modules::trellis_get_workspace( 0, 16 * 1024 * 1024 );
@@ -38,7 +38,7 @@ int main() {
 	ENGINE_ASSERT( engine::core::arena_create( arena, 0, 2ULL * 1024 * 1024 * 1024 ), "arena" );
 
 	engine::loader::SafeTensorsRepo repo;
-	ENGINE_ASSERT( repo.open( dir ), "open model dir" );
+	ENGINE_ASSERT( std::getenv( "MOE_SYNTH" ) || repo.open( dir ), "open model dir" );
 	pod::MoELayerWeights mw;
 	mw.type = pod::QuantType::TRELLIS;
 	mw.num_local_experts = E;
@@ -66,7 +66,34 @@ int main() {
 		mw.num_local_experts = E;
 		std::printf( "[*] DeepSeek-V4.1: %d experts of %d/%d/%d bits in layer %d\n", E, sig[0], sig[1], sig[2], L );
 	}
+	// MOE_SYNTH=1: random trellis words and small random signs instead of the checkpoint's experts, in whatever tile order the build reads
+	// (ENGINE_EXL3_VOLTA_LAYOUT builds cannot read a stock checkpoint); MOE_SIG=g,u,d sets the widths of the three projections
+	const bool synth = std::getenv( "MOE_SYNTH" ) != nullptr;
+	uint32_t synth_state = 777u;
+	auto synth_linear = [&]( int k, int n, int bits ) {
+		const size_t words = static_cast<size_t>( k / 16 ) * ( n / 16 ) * 16 * bits;
+		std::vector<uint16_t> ht( words );
+		for ( auto& w : ht ) { synth_state = synth_state * 1664525u + 1013904223u; w = static_cast<uint16_t>( synth_state >> 16 ); }
+		std::vector<half> hu( k ), hv( n );
+		for ( auto& v : hu ) { synth_state = synth_state * 1664525u + 1013904223u; v = __float2half( ( synth_state >> 16 ) & 1 ? 1.0f : -1.0f ); }
+		for ( auto& v : hv ) { synth_state = synth_state * 1664525u + 1013904223u; v = __float2half( ( ( synth_state >> 16 ) & 1 ? 1.0f : -1.0f ) * 0.02f ); }
+		int tshape[3] = { k / 16, n / 16, 16 * bits };
+		pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, tshape, 3 );
+		int ks[1] = { k }, ns[1] = { n };
+		pod::TensorView su = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ks, 1 );
+		pod::TensorView sv = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ns, 1 );
+		CUDA_CHECK( cudaMemcpy( tv.data, ht.data(), words * 2, cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMemcpy( su.data, hu.data(), k * 2, cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMemcpy( sv.data, hv.data(), n * 2, cudaMemcpyHostToDevice ) );
+		return pod::LinearWeight::make_trellis( tv, su, sv, bits, true, false );
+	};
 	for ( int e = 0; e < E; ++e ) {
+		if ( synth ) {
+			mw.gate[e] = synth_linear( H, I, sig[0] );
+			mw.up[e] = synth_linear( H, I, sig[1] );
+			mw.down[e] = synth_linear( I, H, sig[2] );
+			continue;
+		}
 		if ( dsv41 ) {
 			const char* parts[3] = { "w1", "w3", "w2" };
 			pod::LinearWeight* dst[3] = { &mw.gate[e], &mw.up[e], &mw.down[e] };

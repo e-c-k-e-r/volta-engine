@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/modules/trellis_bits.h"
 #include "ptx.cuh"
 #include "util.cuh"
 
@@ -72,7 +73,7 @@ void exl3_gemm_kernel_inner_m64
     const int FRAGS_N_PER_WARP = 2 * TILEBLOCKS_N / (EXL3_GEMM_BASE_THREADS / 32);
 
     const int sh_a_stage_size = TM * TILESIZE_K;                                 // in halfs
-    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;   // in uint16s
+    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * engine::modules::trellis_tile_u16( bits );   // in uint16s
     const int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP;         // in floats
 
     const int A_COLS = TILESIZE_K / 8;
@@ -137,9 +138,9 @@ void exl3_gemm_kernel_inner_m64
         pred_a_gl[i] = m < size_m;
     }
 
-    int gl_b_stride_k = blocks_n * TILEBLOCKS_K * 256 / 16 * bits;
-    const int gl_b_stride_n = TILEBLOCKS_N * 256 / 16 * bits;
-    const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;
+    int gl_b_stride_k = blocks_n * TILEBLOCKS_K * engine::modules::trellis_tile_u16( bits );
+    const int gl_b_stride_n = TILEBLOCKS_N * engine::modules::trellis_tile_u16( bits );
+    const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * engine::modules::trellis_tile_u16( bits );
     const uint16_t* gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
     uint16_t* sh0_b_ptr = sh_b + (slice0_iters % SH_STAGES) * sh_b_stage_size;
 
@@ -150,7 +151,7 @@ void exl3_gemm_kernel_inner_m64
     {
         int n = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_b_stride_n / 8);
         int k = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_b_stride_n / 8);
-        load_b_gl[i] = k * (blocks_n * 256 / 16 * bits / 8) + n;
+        load_b_gl[i] = k * (blocks_n * engine::modules::trellis_tile_u16( bits ) / 8) + n;
         pred_b_gl[i] = i * EXL3_GEMM_BASE_THREADS + t < sh0_b_stride_k / 8;
     }
 
@@ -291,7 +292,7 @@ void exl3_gemm_kernel_inner_m64
         for (int n2 = 0; n2 < FRAGS_N_PER_WARP; n2 += 2)
         {
             int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
-            const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * 256 / 16 * bits);
+            const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * engine::modules::trellis_tile_u16( bits ));
 
             dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
         }
@@ -618,7 +619,7 @@ void exl3_gemm_kernel_inner
     const int FRAGS_N_PER_WARP = 2 * TILEBLOCKS_N / (EXL3_GEMM_BASE_THREADS / 32);
 
     const int sh_a_stage_size = TILESIZE_M * TILESIZE_K;                         // in halfs
-    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;   // in uint16s
+    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * engine::modules::trellis_tile_u16( bits );   // in uint16s
     const int sh_c_size = MAX  // in floats
     (
         4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP,
@@ -712,9 +713,9 @@ void exl3_gemm_kernel_inner
         pred_a_gl[i] = m < size_m;
     }
 
-    int gl_b_stride_k = blocks_n * TILEBLOCKS_K * 256 / 16 * bits;
-    const int gl_b_stride_n = TILEBLOCKS_N * 256 / 16 * bits;
-    const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;
+    int gl_b_stride_k = blocks_n * TILEBLOCKS_K * engine::modules::trellis_tile_u16( bits );
+    const int gl_b_stride_n = TILEBLOCKS_N * engine::modules::trellis_tile_u16( bits );
+    const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * engine::modules::trellis_tile_u16( bits );
     const uint16_t* gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
     uint16_t* sh0_b_ptr = sh_b + (slice0_iters % SH_STAGES) * sh_b_stage_size;
 
@@ -725,7 +726,7 @@ void exl3_gemm_kernel_inner
     {
         int n = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_b_stride_n / 8);
         int k = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_b_stride_n / 8);
-        load_b_gl[i] = k * (blocks_n * 256 / 16 * bits / 8) + n;
+        load_b_gl[i] = k * (blocks_n * engine::modules::trellis_tile_u16( bits ) / 8) + n;
         pred_b_gl[i] = i * EXL3_GEMM_BASE_THREADS + t < sh0_b_stride_k / 8;
     }
 
@@ -942,7 +943,7 @@ void exl3_gemm_kernel_inner
         for (int n2 = 0; n2 < FRAGS_N_PER_WARP; n2 += 2)
         {
             int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
-            const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * 256 / 16 * bits);
+            const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * engine::modules::trellis_tile_u16( bits ));
 
             dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
         }
