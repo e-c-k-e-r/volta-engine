@@ -1,5 +1,5 @@
 // Prefill throughput: tokens/s for a synthetic prompt at several chunk sizes. BENCH_PROFILE=1 brackets the final run
-// with cudaProfilerStart/Stop for nvprof --profile-from-start off. BENCH_GLM=1 / BENCH_FLASH=1 pick GLM / Flash-Next (default Qwen).
+// with cudaProfilerStart/Stop for nvprof --profile-from-start off. BENCH_GLM=1 / BENCH_FLASH=1 pick GLM / Flash-Next (default Qwen); BENCH_TP sets the rank count.
 //   bench_prefill [tokens] [chunk ...]
 #include "engine/runtime/test_driver.h"
 #include <cuda_profiler_api.h>
@@ -19,6 +19,7 @@ int main( int argc, char** argv ) {
 	const bool flash = std::getenv( "BENCH_FLASH" ) != nullptr;   // Qwen3.8-Flash-Next (qwen4_exp)
 	cfg.model_type = glm ? "glm5_next" : flash ? "qwen4_exp" : "qwen3_5";
 	cfg.model_dir = glm ? test::GLM_DIR : flash ? test::FLASH_DIR : test::QWEN_DIR;
+	if ( const char* tp = std::getenv( "BENCH_TP" ) ) cfg.tp = std::atoi( tp );   // BENCH_TP=1: one GPU, no collectives (CUDA_VISIBLE_DEVICES picks which)
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	if ( !glm || std::getenv( "BENCH_WARM" ) ) mc.warm_graphs( 8 );  // BENCH_WARM=1: warm the decode graphs for GLM too
 	std::vector<int> ids( n );

@@ -16,6 +16,7 @@ void bench_model( const char* type, const char* dir, int steps ) {
 	ClusterConfig cfg;
 	cfg.model_type = type;
 	cfg.model_dir = dir;
+	if ( const char* tp = std::getenv( "BENCH_TP" ) ) cfg.tp = std::atoi( tp );   // BENCH_TP=1: one GPU, no collectives (CUDA_VISIBLE_DEVICES picks which)
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	const auto& meta = mc.metadata();
 	const std::vector<int> prompt = { 15, 16, 17, 18, 19, 20, 21, 22 };
