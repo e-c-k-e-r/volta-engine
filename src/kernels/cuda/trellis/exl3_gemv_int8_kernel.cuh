@@ -254,6 +254,9 @@ __device__ __forceinline__ void gemv_int8_unit_wide
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * 64 + 2 * lane;
     int c2 = (lane & 1) ? 4 : 0;
     int shfl_src = (lane & 16) | ((lane + 15) & 15);
+#if EXL3_VOLTA_LAYOUT
+    const int cs = (lane >> 2) & 1;   // which half of the k16 row: bit 3 of the run index 2 * (lane & 15)
+#endif
 
     int iacc0[M] = {}, iacc1[M] = {}, jacc0[M] = {}, jacc1[M] = {};
     uint2 r0 = *(const uint2*) bp;
@@ -275,6 +278,28 @@ __device__ __forceinline__ void gemv_int8_unit_wide
         v0 *= 0x83DCD12Du; v1 *= 0x83DCD12Du; v2 *= 0x83DCD12Du; v3 *= 0x83DCD12Du;
         v4 *= 0x83DCD12Du; v5 *= 0x83DCD12Du; v6 *= 0x83DCD12Du; v7 *= 0x83DCD12Du;
 
+#if EXL3_VOLTA_LAYOUT
+        // Volta tile order: run 2 * lp holds one column over eight consecutive k (8 * cs ..), and so does run 2 * lp + 1 (the next column)
+        #pragma unroll
+        for (int r = 0; r < M; ++r)
+        {
+            const uint32_t* as = sh_as + r * slice_stride + (kb << 4) + 8 * cs;
+            const uint4 a0 = *(const uint4*) as, a1 = *(const uint4*) (as + 4);
+            iacc0[r] = dp4a_us(w0, a0.x, iacc0[r]); iacc0[r] = dp4a_us(w1, a0.y, iacc0[r]); iacc0[r] = dp4a_us(w2, a0.z, iacc0[r]); iacc0[r] = dp4a_us(w3, a0.w, iacc0[r]);
+            iacc0[r] = dp4a_us(w4, a1.x, iacc0[r]); iacc0[r] = dp4a_us(w5, a1.y, iacc0[r]); iacc0[r] = dp4a_us(w6, a1.z, iacc0[r]); iacc0[r] = dp4a_us(w7, a1.w, iacc0[r]);
+            iacc1[r] = dp4a_us(v0, a0.x, iacc1[r]); iacc1[r] = dp4a_us(v1, a0.y, iacc1[r]); iacc1[r] = dp4a_us(v2, a0.z, iacc1[r]); iacc1[r] = dp4a_us(v3, a0.w, iacc1[r]);
+            iacc1[r] = dp4a_us(v4, a1.x, iacc1[r]); iacc1[r] = dp4a_us(v5, a1.y, iacc1[r]); iacc1[r] = dp4a_us(v6, a1.z, iacc1[r]); iacc1[r] = dp4a_us(v7, a1.w, iacc1[r]);
+            if constexpr (residual)
+            {
+                const uint32_t* as2 = sh_as + (M + r) * slice_stride + (kb << 4) + 8 * cs;
+                const uint4 b0 = *(const uint4*) as2, b1 = *(const uint4*) (as2 + 4);
+                jacc0[r] = dp4a_us(w0, b0.x, jacc0[r]); jacc0[r] = dp4a_us(w1, b0.y, jacc0[r]); jacc0[r] = dp4a_us(w2, b0.z, jacc0[r]); jacc0[r] = dp4a_us(w3, b0.w, jacc0[r]);
+                jacc0[r] = dp4a_us(w4, b1.x, jacc0[r]); jacc0[r] = dp4a_us(w5, b1.y, jacc0[r]); jacc0[r] = dp4a_us(w6, b1.z, jacc0[r]); jacc0[r] = dp4a_us(w7, b1.w, jacc0[r]);
+                jacc1[r] = dp4a_us(v0, b0.x, jacc1[r]); jacc1[r] = dp4a_us(v1, b0.y, jacc1[r]); jacc1[r] = dp4a_us(v2, b0.z, jacc1[r]); jacc1[r] = dp4a_us(v3, b0.w, jacc1[r]);
+                jacc1[r] = dp4a_us(v4, b1.x, jacc1[r]); jacc1[r] = dp4a_us(v5, b1.y, jacc1[r]); jacc1[r] = dp4a_us(v6, b1.z, jacc1[r]); jacc1[r] = dp4a_us(v7, b1.w, jacc1[r]);
+            }
+        }
+#else
         #pragma unroll
         for (int r = 0; r < M; ++r)
         {
@@ -321,10 +346,57 @@ __device__ __forceinline__ void gemv_int8_unit_wide
             }
         }
 
+#endif
+
         r0 = r1;
         r1 = r2;
     }
 
+#if EXL3_VOLTA_LAYOUT
+    // The lane pair (l, l ^ 4) holds the two k halves of the same two columns
+    #pragma unroll
+    for (int r = 0; r < M; ++r)
+    {
+        iacc0[r] += __shfl_xor_sync(0xffffffff, iacc0[r], 4);
+        iacc1[r] += __shfl_xor_sync(0xffffffff, iacc1[r], 4);
+        if constexpr (residual)
+        {
+            jacc0[r] += __shfl_xor_sync(0xffffffff, jacc0[r], 4);
+            jacc1[r] += __shfl_xor_sync(0xffffffff, jacc1[r], 4);
+        }
+    }
+    if (cs == 0)
+    {
+        const int lp = lane & 15;
+        const int nb = nbp * 2 + (lane >> 4);
+        const int n0 = nb * 16 + 8 * ((lp >> 1) & 1) + (lp & 1) * 2 + 4 * (lp >> 3);   // column of run 2 * lp; run 2 * lp + 1 is the next one
+        #pragma unroll
+        for (int r = 0; r < M; ++r)
+        {
+            int* acc = accs + r * acc_stride;
+            if constexpr (atomic)
+            {
+                atomicAdd(acc + n0, iacc0[r]);
+                atomicAdd(acc + n0 + 1, iacc1[r]);
+                if constexpr (residual)
+                {
+                    atomicAdd(acc + size_n + n0, jacc0[r]);
+                    atomicAdd(acc + size_n + n0 + 1, jacc1[r]);
+                }
+            }
+            else
+            {
+                acc[n0] = iacc0[r];
+                acc[n0 + 1] = iacc1[r];
+                if constexpr (residual)
+                {
+                    acc[size_n + n0] = jacc0[r];
+                    acc[size_n + n0 + 1] = jacc1[r];
+                }
+            }
+        }
+    }
+#else
     // Lanes l, l^1 share both n values
     #pragma unroll
     for (int r = 0; r < M; ++r)
@@ -367,8 +439,51 @@ __device__ __forceinline__ void gemv_int8_unit_wide
             }
         }
     }
+#endif
 }
 
+#if EXL3_VOLTA_LAYOUT
+// One k-row of an adjacent block pair, generic K, Volta tile order: lane l decodes run l of each block, one column over the eight
+// consecutive k 8 * cs .. 8 * cs + 7 (cs = (l >> 3) & 1); only the A-side accumulators ia0 / ja0 and B-side ib0 / jb0 are used
+template <int bits, int M, bool residual>
+__device__ __forceinline__ void gemv_int8_pair_row
+(
+    const uint32_t* blockA, const uint32_t* blockB,
+    const uint32_t* as_kb,             // sh_as + (kb << 4)
+    int slice_stride, int c2, int t0,
+    int* ia0, int* ia1, int* ib0, int* ib1,
+    int* ja0, int* ja1, int* jb0, int* jb1
+)
+{
+    (void) c2; (void) ia1; (void) ib1; (void) ja1; (void) jb1;
+    const int cs = (threadIdx.x >> 3) & 1;
+    uint32_t w[8];
+    #pragma unroll
+    for (int blk = 0; blk < 2; ++blk)
+    {
+        ext8w<bits>(blk ? blockB : blockA, t0, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] *= 0x83DCD12Du;
+        int* ia = blk ? ib0 : ia0;
+        int* ja = blk ? jb0 : ja0;
+        #pragma unroll
+        for (int r = 0; r < M; ++r)
+        {
+            const uint32_t* as = as_kb + r * slice_stride + 8 * cs;
+            const uint4 a0 = *(const uint4*) as, a1 = *(const uint4*) (as + 4);
+            ia[r] = dp4a_us(w[0], a0.x, ia[r]); ia[r] = dp4a_us(w[1], a0.y, ia[r]); ia[r] = dp4a_us(w[2], a0.z, ia[r]); ia[r] = dp4a_us(w[3], a0.w, ia[r]);
+            ia[r] = dp4a_us(w[4], a1.x, ia[r]); ia[r] = dp4a_us(w[5], a1.y, ia[r]); ia[r] = dp4a_us(w[6], a1.z, ia[r]); ia[r] = dp4a_us(w[7], a1.w, ia[r]);
+            if constexpr (residual)
+            {
+                const uint32_t* as2 = as_kb + (M + r) * slice_stride + 8 * cs;
+                const uint4 b0 = *(const uint4*) as2, b1 = *(const uint4*) (as2 + 4);
+                ja[r] = dp4a_us(w[0], b0.x, ja[r]); ja[r] = dp4a_us(w[1], b0.y, ja[r]); ja[r] = dp4a_us(w[2], b0.z, ja[r]); ja[r] = dp4a_us(w[3], b0.w, ja[r]);
+                ja[r] = dp4a_us(w[4], b1.x, ja[r]); ja[r] = dp4a_us(w[5], b1.y, ja[r]); ja[r] = dp4a_us(w[6], b1.z, ja[r]); ja[r] = dp4a_us(w[7], b1.w, ja[r]);
+            }
+        }
+    }
+}
+#else
 // One k-row of an adjacent block pair, generic K: extract + dp4a for both blocks from block pointers
 // (global or shared memory), M rows sharing the extraction
 template <int bits, int M, bool residual>
@@ -448,7 +563,62 @@ __device__ __forceinline__ void gemv_int8_pair_row
         }
     }
 }
+#endif
 
+#if EXL3_VOLTA_LAYOUT
+// Volta tile order: the lane pair (l, l ^ 8) holds the two k halves of one column; the lanes with cs == 0 write the column of each block
+template <int M, bool residual, bool atomic = true>
+__device__ __forceinline__ void gemv_int8_pair_tail
+(
+    int* __restrict__ accs, size_t acc_stride, int nbp, int lane, int size_n,
+    int* ia0, int* ia1, int* ib0, int* ib1,
+    int* ja0, int* ja1, int* jb0, int* jb1
+)
+{
+    (void) ia1; (void) ib1; (void) ja1; (void) jb1;
+    #pragma unroll
+    for (int r = 0; r < M; ++r)
+    {
+        ia0[r] += __shfl_xor_sync(0xffffffff, ia0[r], 8);
+        ib0[r] += __shfl_xor_sync(0xffffffff, ib0[r], 8);
+        if constexpr (residual)
+        {
+            ja0[r] += __shfl_xor_sync(0xffffffff, ja0[r], 8);
+            jb0[r] += __shfl_xor_sync(0xffffffff, jb0[r], 8);
+        }
+    }
+    if (((lane >> 3) & 1) == 0)
+    {
+        const int nA = (nbp * 2) * 16 + 8 * ((lane >> 2) & 1) + (lane & 3) + 4 * (lane >> 4);
+        const int nB = nA + 16;
+        #pragma unroll
+        for (int r = 0; r < M; ++r)
+        {
+            int* acc = accs + r * acc_stride;
+            if constexpr (atomic)
+            {
+                atomicAdd(acc + nA, ia0[r]);
+                atomicAdd(acc + nB, ib0[r]);
+                if constexpr (residual)
+                {
+                    atomicAdd(acc + size_n + nA, ja0[r]);
+                    atomicAdd(acc + size_n + nB, jb0[r]);
+                }
+            }
+            else
+            {
+                acc[nA] = ia0[r];
+                acc[nB] = ib0[r];
+                if constexpr (residual)
+                {
+                    acc[size_n + nA] = ja0[r];
+                    acc[size_n + nB] = jb0[r];
+                }
+            }
+        }
+    }
+}
+#else
 // Shared reduction tail for the pair-per-warp generic units (atomic, or exclusive plain stores for
 // the per-slice partials of the sq kernel): four lanes share each n
 template <int M, bool residual, bool atomic = true>
@@ -517,6 +687,7 @@ __device__ __forceinline__ void gemv_int8_pair_tail
         }
     }
 }
+#endif
 
 // Narrow generic unit (any K): one (256-column x k-slice) unit, warp per adjacent block pair
 // processed sequentially with pointer-based extraction straight from global memory

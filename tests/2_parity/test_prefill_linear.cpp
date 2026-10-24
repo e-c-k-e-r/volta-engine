@@ -45,7 +45,7 @@ int main() {
 		{ "mlp gate/up 4b", 5120, 4352, 4 }, { "mlp down 4b", 4352, 5120, 4 }, { "gdn qkv 4b", 5120, 2560, 4 },
 		{ "gdn z 4b", 5120, 1536, 4 }, { "gdn out 4b", 1536, 5120, 4 }, { "attn q 5b", 5120, 3072, 5 }, { "attn kv 4b", 5120, 512, 4 }, { "attn kv 5b", 5120, 512, 5 }, { "attn q 4b", 5120, 3072, 4 },
 		// the unsharded (tp=1) 27B shapes, and the 3 and 6 bit tensors
-		{ "mlp gate/up tp1", 5120, 17408, 4 }, { "mlp down tp1", 17408, 5120, 4 }, { "mlp gate/up 3b", 5120, 17408, 3 }, { "mlp down 3b", 17408, 5120, 3 }, { "attn kv 6b", 5120, 1024, 6 }, { "gdn qkv tp1", 5120, 10240, 4 },
+		{ "mlp gate/up tp1", 5120, 17408, 4 }, { "mlp down tp1", 17408, 5120, 4 }, { "mlp gate/up 3b", 5120, 17408, 3 }, { "mlp down 3b", 17408, 5120, 3 }, { "attn kv 6b", 5120, 1024, 6 }, { "gdn qkv tp1", 5120, 10240, 4 }, { "mlp gate/up 2b", 5120, 4352, 2 }, { "mlp down 2b", 4352, 5120, 2 },
 	};
 	const int ms[] = { 1, 2, 4, 8, 12, 16, 17, 20, 24, 32, 40, 48, 64 };
 	int fails = 0;

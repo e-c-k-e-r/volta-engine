@@ -610,7 +610,11 @@ __device__ __forceinline__ void gemv_tile_i8(
 				s2 += v2;
 			}
 			const int tile = i >> 3, j = i & 7;
+#if EXL3_VOLTA_LAYOUT
+			const int at = tile * 8 + j;   // natural k order: a lane's eight values are eight consecutive k (see below)
+#else
 			const int at = ( tile * 4 + ( j & 3 ) ) * 2 + ( j >> 2 );
+#endif
 			st_q[at] = static_cast<uint16_t>( pq );
 			st_r[at] = static_cast<uint16_t>( pr );
 		}
@@ -660,7 +664,12 @@ __device__ __forceinline__ void gemv_tile_i8(
 		}
 	}
 
+#if EXL3_VOLTA_LAYOUT
+	int ia[R][WNT] = {}, ja[R][WNT] = {};   // Volta tile order: a lane's eight values are one column over eight consecutive k
+	const int cs = ( lane >> 3 ) & 1;       // which half of the k16 slice
+#else
 	int ia[R][WNT][2] = {}, ja[R][WNT][2] = {};
+#endif
 	const int m = lane & 3;
 
 	for ( int ib = 0; ib < myn; ib += PF ) {
@@ -677,6 +686,48 @@ __device__ __forceinline__ void gemv_tile_i8(
 				for ( int l = 0; l < LOADS; ++l ) pf[d][l] = ld_b( i + PF, l );
 			}
 
+#if EXL3_VOLTA_LAYOUT
+			uint32_t pa[R][8], pb[R][8];
+			#pragma unroll
+			for ( int r = 0; r < R; ++r ) {
+				#pragma unroll
+				for ( int h = 0; h < 2; ++h ) {
+					const uint32_t qa = reinterpret_cast<const uint32_t*>( sh_stage )[( ( ( r * 2 ) * WKK + wk ) * chunk + i ) * 4 + 2 * cs + h];
+					const uint32_t qb = reinterpret_cast<const uint32_t*>( sh_stage )[( ( ( r * 2 + 1 ) * WKK + wk ) * chunk + i ) * 4 + 2 * cs + h];
+					pa[r][4 * h + 0] = __byte_perm( qa, 0, 0x0000 ); pa[r][4 * h + 1] = __byte_perm( qa, 0, 0x1111 );
+					pa[r][4 * h + 2] = __byte_perm( qa, 0, 0x2222 ); pa[r][4 * h + 3] = __byte_perm( qa, 0, 0x3333 );
+					pb[r][4 * h + 0] = __byte_perm( qb, 0, 0x0000 ); pb[r][4 * h + 1] = __byte_perm( qb, 0, 0x1111 );
+					pb[r][4 * h + 2] = __byte_perm( qb, 0, 0x2222 ); pb[r][4 * h + 3] = __byte_perm( qb, 0, 0x3333 );
+				}
+			}
+
+			#pragma unroll
+			for ( int t = 0; t < WNT; ++t ) {
+				const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+				const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
+				uint32_t w[8];
+				w[7] = fshift( bwv, awv, x_s2 );
+				w[6] = w[7] >> 3;
+				w[5] = w[6] >> 3;
+				w[4] = w[5] >> 3;
+				w[3] = fshift( bwv, awv, x_s2 + 12 );
+				w[2] = w[3] >> 3;
+				w[1] = w[2] >> 3;
+				w[0] = w[1] >> 3;
+				#pragma unroll
+				for ( int j = 0; j < 8; ++j ) w[j] = ( w[j] & 0xffff ) * 0x83DCD12Du;
+				#pragma unroll
+				for ( int r = 0; r < R; ++r ) {
+					#pragma unroll
+					for ( int j = 0; j < 8; ++j ) {
+						ia[r][t] = dp4a_us_c( w[j], pa[r][j], ia[r][t] );
+						ja[r][t] = dp4a_us_c( w[j], pb[r][j], ja[r][t] );
+					}
+				}
+			}
+		}
+	}
+#else
 			uint32_t pa[R][4], pb[R][4];
 			#pragma unroll
 			for ( int r = 0; r < R; ++r ) {
@@ -716,7 +767,29 @@ __device__ __forceinline__ void gemv_tile_i8(
 			}
 		}
 	}
-
+#endif
+#if EXL3_VOLTA_LAYOUT
+	// The lane pair (l, l ^ 8) holds the two k halves of one column
+	#pragma unroll
+	for ( int r = 0; r < R; ++r ) {
+		#pragma unroll
+		for ( int t = 0; t < WNT; ++t ) {
+			ia[r][t] += __shfl_xor_sync( 0xffffffffu, ia[r][t], 8 );
+			ja[r][t] += __shfl_xor_sync( 0xffffffffu, ja[r][t], 8 );
+		}
+	}
+	if ( cs == 0 ) {
+		const int col = 8 * ( ( lane >> 2 ) & 1 ) + ( lane & 3 ) + 4 * ( lane >> 4 );
+		#pragma unroll
+		for ( int r = 0; r < R; ++r ) {
+			float* red = sh_red + ( wk * ROWS + r ) * TCOLS + wn * COLS;
+			#pragma unroll
+			for ( int t = 0; t < WNT; ++t ) {
+				red[t * 16 + col] = k_inv * ( qr[r] * static_cast<float>( ia[r][t] ) + q2r[r] * static_cast<float>( ja[r][t] ) ) + corr[r];
+			}
+		}
+	}
+#else
 	// Four lanes (lane % 4) share each column
 	#pragma unroll
 	for ( int r = 0; r < R; ++r ) {
@@ -745,6 +818,7 @@ __device__ __forceinline__ void gemv_tile_i8(
 			}
 		}
 	}
+#endif
 	__syncthreads();
 
 	for ( int o = threadIdx.x; o < TCOLS * nrows; o += THREADS ) {
@@ -1107,11 +1181,7 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	// Tile: 1 int8 dp4a for one-row decode; with more rows 3 = dp4a for runs of up to 4 rows and fp16 tensor core above
 	// (dp4a on wider runs re-reads the weights in 4-row passes and loses to the tensor core there)
 	const bool mixed = p.bits_tab != nullptr || ( p.bits_g != 0 && ( p.bits_g != p.bits_u || p.bits_u != p.bits_d ) );
-	#if EXL3_VOLTA_LAYOUT
-	const int mode = 0;   // the int8 tiles read the stock tile order
-#else
 	const int mode = mixed || p.bits != 3 ? 0 : ( p.bsz == 1 ? 1 : 3 );
-#endif
 	const int stage_rows = mode == 1 ? 1 : ( mode >= 2 ? 4 : 0 );
 	// int8 activation staging: 2 x 16 B per k-tile per k-slab
 	constexpr int wkk = WK / WN;
