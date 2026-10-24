@@ -13,6 +13,13 @@
 	#endif
 #endif
 
+// EXL3_VOLTA_LAYOUT=1 (proof of concept, CMake option ENGINE_EXL3_VOLTA_LAYOUT) reads the weight tiles in the Volta order written by
+// tests/tools/exl3_volta_layout.py: the eight values a lane decodes are exactly its m8n8k4 B operands, so the GEMM needs no shuffles.
+// A build with it only runs checkpoints in that order, and only the dense GEMM paths (gemm kernels, reconstruct) know it.
+#ifndef EXL3_VOLTA_LAYOUT
+	#define EXL3_VOLTA_LAYOUT 0
+#endif
+
 #ifndef EXL3_SM70_HMMA
 	#define EXL3_SM70_HMMA 1
 #endif

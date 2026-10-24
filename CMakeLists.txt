@@ -50,6 +50,12 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	if(ENGINE_EXL3_FORCE_VOLTA_MMA)
 		set(ENGINE_EXL3_DEFS "${ENGINE_EXL3_DEFS} -DEXL3_VOLTA=1")
 	endif()
+	# Proof of concept: read the weight tiles in the Volta order of tests/tools/exl3_volta_layout.py (no fragment shuffles in the GEMM). Such a build
+	# only runs checkpoints written in that order, and only the dense GEMM paths (gemm kernels, reconstruct) know it
+	option(ENGINE_EXL3_VOLTA_LAYOUT "EXL3 GEMM: weight tiles in the Volta order (proof of concept)" OFF)
+	if(ENGINE_EXL3_VOLTA_LAYOUT)
+		set(ENGINE_EXL3_DEFS "${ENGINE_EXL3_DEFS} -DEXL3_VOLTA_LAYOUT=1")
+	endif()
 	# Hardware overrides (0: query the device at startup). ENGINE_SM_COUNT caps the SMs the persistent / cooperative kernels spread over;
 	# ENGINE_MAX_SMEM is the opt-in shared memory per block the big kernels request (default 98304, which V100, SM_86 and SM_89 all allow)
 	set(ENGINE_SM_COUNT 0 CACHE STRING "SMs to size persistent / cooperative grids to (0: the device's own count)")
@@ -431,6 +437,10 @@ add_executable(test_image tests/2_parity/test_image.cpp)
 target_link_libraries(test_image PRIVATE engine_kernels)
 target_compile_definitions(test_image PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
 set_target_properties(test_image PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_trellis_layout tests/2_parity/test_trellis_layout.cpp)
+target_link_libraries(test_trellis_layout PRIVATE engine_kernels)
+set_target_properties(test_trellis_layout PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_tui_view tests/2_parity/test_tui_view.cpp)
 target_link_libraries(test_tui_view PRIVATE engine_kernels)

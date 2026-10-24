@@ -6,6 +6,13 @@
 #include "hadamard.cuh"
 #include <cstdlib>
 
+// ENGINE_EXL3_VOLTA_LAYOUT builds read the weight tiles in the Volta order, which the GEMV kernels do not know: those row counts take the GEMM
+#if defined(EXL3_VOLTA_LAYOUT) && EXL3_VOLTA_LAYOUT
+	#define EXL3_VOLTA_LAYOUT_BUILD 1
+#else
+	#define EXL3_VOLTA_LAYOUT_BUILD 0
+#endif
+
 namespace engine::modules {
 
 namespace {
@@ -104,7 +111,7 @@ void LinearTrellis::forward(
 #if defined(USE_ROCM)
 	else if ( m <= EXL3_GEMV_ROCM_MAX_M && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 #else
-	else if ( m <= 8 && ( m == 1 || m == 2 || m == 4 || m == 8 ) && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
+	else if ( m <= 8 && ( m == 1 || m == 2 || m == 4 || m == 8 ) && ( k % 128 == 0 ) && ( n % 128 == 0 ) && !EXL3_VOLTA_LAYOUT_BUILD ) {
 #endif
 		exl3_gemv(
 			x_ptr,

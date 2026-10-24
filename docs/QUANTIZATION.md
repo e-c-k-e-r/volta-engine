@@ -19,6 +19,14 @@ This document tries its best to continuously reference a model by its quantizati
 * [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
 * [nvidia/GLM-5.3-Flash-NVFP4](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4)
 
+## Volta tile order (EXL3, build option)
+
+A 16x16 weight tile is stored in the order of the Ampere `m16n8k16` fragments, so the Volta GEMM moves each lane's decoded values to the lanes that need them with shuffles. A build with `-DENGINE_EXL3_VOLTA_LAYOUT=ON` (CMake option `ENGINE_EXL3_VOLTA_LAYOUT`, off by default) instead reads tiles in an order where the eight values a lane decodes are exactly its `m8n8k4` operands, and the GEMM kernels and `reconstruct` use them without moving anything (two octets share each output block and their partial sums are added once per column).
+
+* Such a build only runs checkpoints written in that order, and only the dense GEMM paths know it: the GEMV kernels (1 to 8 rows) are bypassed there, and the MoE, GLM and CPU paths are not converted.
+* `tests/tools/exl3_volta_layout.py <in> <out>` re-encodes a checkpoint (exllamav3 venv; one process per shard and GPU). The order is a tile permutation applied before the trellis encoder, which does not depend on it; re-encoding already quantized weights adds about one quantization's worth of error, so a conversion from the BF16 weights is the way to produce a real checkpoint.
+* `test_trellis_layout` checks the dequantizer against a golden decode (`tests/tools/trellis_layout_golden.py --layout stock|volta`); `test_prefill_linear` compares the fused GEMM with reconstruct plus cuBLAS from 1 to 64 rows.
+
 ## Bit widths of the EXL3 checkpoints
 
 | Checkpoint | Average bits | Head | MTP head | Vision | Notes |

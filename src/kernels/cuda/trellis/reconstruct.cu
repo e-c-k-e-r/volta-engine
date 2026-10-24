@@ -36,6 +36,20 @@ void reconstruct_kernel(
 
 	__shared__ half2 tile[16][8][8];
 
+#if EXL3_VOLTA_LAYOUT
+	// Volta tile order: lane (q, t_, hh) holds value 4 * s + i = element (k = 4 * (2 * (q >> 1) + s) + i, column 8 * (q & 1) + t_ + 4 * hh)
+	{
+		const int q = ( lane_id >> 2 ) & 3, col = 8 * ( q & 1 ) + ( lane_id & 3 ) + 4 * ( lane_id >> 4 );
+		half* th = reinterpret_cast<half*>( &tile[0][0][0] );
+		#pragma unroll
+		for ( int s = 0; s < 2; ++s )
+			#pragma unroll
+			for ( int i = 0; i < 4; ++i ) {
+				const half v = ( i & 1 ) ? __high2half( frag[s][i >> 1] ) : __low2half( frag[s][i >> 1] );
+				th[( ( 4 * ( 2 * ( q >> 1 ) + s ) + i ) * 8 + warp_id ) * 16 + col] = v;
+			}
+	}
+#else
 	half2 n0 = __shfl_down_sync( 0xFFFFFFFF, frag[0][0], 4, 32 );
 	half2 n1 = __shfl_down_sync( 0xFFFFFFFF, frag[0][1], 4, 32 );
 	half2 n2 = __shfl_down_sync( 0xFFFFFFFF, frag[1][0], 4, 32 );
@@ -65,6 +79,7 @@ void reconstruct_kernel(
 		tile[r2][warp_id][c1] = m6;
 		tile[r3][warp_id][c1] = m7;
 	}
+#endif
 	__syncthreads();
 
 	int r = t / 16;
@@ -128,6 +143,20 @@ void reconstruct_had_kernel(
 		FragB frag[2];
 		dq_dispatch<K, cb>( s_packed[j][wn], lane_id * 8, frag[0], frag[1] );
 
+#if EXL3_VOLTA_LAYOUT
+		{
+			const int q = ( lane_id >> 2 ) & 3, col = 8 * ( q & 1 ) + ( lane_id & 3 ) + 4 * ( lane_id >> 4 );
+			const int cc = wn * 8 + ( col >> 1 );
+			#pragma unroll
+			for ( int s = 0; s < 2; ++s )
+				#pragma unroll
+				for ( int i = 0; i < 4; ++i ) {
+					const half v = ( i & 1 ) ? __high2half( frag[s][i >> 1] ) : __low2half( frag[s][i >> 1] );
+					const int R = j * 16 + 4 * ( 2 * ( q >> 1 ) + s ) + i;
+					reinterpret_cast<half*>( &stile[tix( R, cc >> 1, cc & 1 )] )[col & 1] = v;
+				}
+		}
+#else
 		half2 n0 = __shfl_down_sync( 0xFFFFFFFF, frag[0][0], 4, 32 );
 		half2 n1 = __shfl_down_sync( 0xFFFFFFFF, frag[0][1], 4, 32 );
 		half2 n2 = __shfl_down_sync( 0xFFFFFFFF, frag[1][0], 4, 32 );
@@ -158,6 +187,7 @@ void reconstruct_had_kernel(
 			stile[tix( r2, q1, p1 )] = m6;
 			stile[tix( r3, q1, p1 )] = m7;
 		}
+#endif
 	}
 	__syncthreads();
 

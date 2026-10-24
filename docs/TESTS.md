@@ -18,6 +18,7 @@
 | `test_jinja` | 2 | no | Jinja2 subset against reference Jinja2 renders of both chat templates |
 | `test_image` | 2 | no | image decode, smart resize and patch layout against PIL / HF-layout references, GLM canvas sizes against exllamav3's (`tests/tools/gen_image_goldens.py`) |
 | `test_output_parser` | 2 | no | reasoning / tool-call parser, chunking independence, template round trip |
+| `test_trellis_layout` | 2 | yes | the trellis dequantizer against a golden decode in the build's tile order (tests/tools/trellis_layout_golden.py; run by hand, stock or Volta layout) |
 | `test_tui_view` | 2 | no | dashboard frames on every tab for full, partial and missing stats at normal and tiny terminal sizes; sparklines, gap histogram, expert heat map, alerts, slot picking, pause; key handling and scroll clamps |
 | `test_backend_tiers` | 1 | no | capability registry matches the declared module functions |
 | `test_mma_frag` | 1 | no | on a simulated warp, against the PTX m16n8k16 / m8n8k4 layouts: the tensor-core fragment maps of the SM_80+ paths (`mma_frag.h`, `nvfp4_frag.h`) and the ROCm `mma` emulations (`mma_emu.h`) |
