@@ -153,6 +153,7 @@ def main():
     ap.add_argument("--files", default="", help="only these template shards, comma separated; the others are linked to the template's (a partial requantization costs one shard of disk)")
     ap.add_argument("--plan", action="store_true", help="only list what would be done with every tensor of the template (from the index files: no GPU, no tensor data)")
     ap.add_argument("--passthrough", action="store_true", help="tensors the template does not quantize (norms, gates, embeddings ...) come from the original when it has them, not from the template (needed when the template is another model's checkpoint)")
+    ap.add_argument("--src-files", default="", help="comma separated names of small files (tokenizer.json ...) copied from --src instead of the template (the template is another model's checkpoint)")
     ap.add_argument("--redo", action="store_true", help="quantize shards again that already exist in --out")
     ap.add_argument("--claim", action="store_true", help="work on the next template shard nobody has claimed (one process per GPU)")
     a = ap.parse_args()
@@ -270,7 +271,8 @@ def main():
                     if a.order == "volta": cfg["tile_layout"] = "volta"
                     json.dump(cfg, open(os.path.join(a.out, fn), "w"), indent=4)
                 else:
-                    shutil.copy(p, os.path.join(a.out, fn))
+                    srcp = os.path.join(a.src, fn)
+                    shutil.copy(srcp if fn in a.src_files.split(",") and os.path.exists(srcp) else p, os.path.join(a.out, fn))
             continue
         final = os.path.join(a.out, fn)
         if os.path.exists(final) and not os.path.islink(final) and fn.startswith("model") and not a.redo:
