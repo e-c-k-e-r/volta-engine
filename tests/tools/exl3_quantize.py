@@ -75,6 +75,14 @@ def load_upstream(order):
     sys.modules["exllamav3.ext"] = stub
     import importlib
     qz = importlib.import_module("exllamav3.modules.quant.exl3_lib.quantize")
+    # upstream keeps tensors above 5e8 elements on the CPU, where its uncalibrated path (fallback_quant) cannot run: bring the weight to the GPU for it
+    orig_fallback = qz.fallback_quant
+
+    def fallback_on_gpu(weight, q_device, quant_args, pb=None):
+        if not weight.is_cuda:
+            weight = weight.to(quant_args["devices"][0])
+        return orig_fallback(weight, q_device, quant_args, pb)
+    qz.fallback_quant = fallback_on_gpu
     if order == "volta":
         perm = volta_perm_fn(torch)
         qz.tensor_core_perm = perm
@@ -110,6 +118,7 @@ def main():
     ap.add_argument("--hess", default="")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--only", default="")
+    ap.add_argument("--skip", default="", help="comma separated substrings: matching tensors keep the template's version (the vision tower, whose widths are not multiples of 128)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--files", default="", help="only these template shards, comma separated; the others are linked to the template's (a partial requantization costs one shard of disk)")
@@ -181,6 +190,8 @@ def main():
             try: os.close(os.open(final + ".claim", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
             except FileExistsError: continue
         tensors, new = {}, {}
+        part_dir = os.path.join(a.out, ".partial", fn)    # every finished tensor is saved here, so a restart of this shard continues where it stopped
+        os.makedirs(part_dir, exist_ok=True)
         t0 = time.time()
         done = 0
         errs = []
@@ -189,7 +200,14 @@ def main():
             for name in f.keys():
                 t = f.get_tensor(name)
                 base = name[:-len(".trellis")] if name.endswith(".trellis") else None
-                if base and a.only in name and (not a.limit or done < a.limit) and base + ".weight" in src_idx:
+                if base and a.only in name and not any(k and k in name for k in a.skip.split(",")) and (not a.limit or done < a.limit) and base + ".weight" in src_idx:
+                    part = os.path.join(part_dir, base + ".safetensors")
+                    if os.path.exists(part):
+                        with safe_open(part, "pt") as pf:
+                            for k in pf.keys(): new[k] = pf.get_tensor(k)
+                        done += 1
+                        print(f"[{time.time() - t0:7.1f}s] {base} (from a previous run)", flush=True)
+                        continue
                     w = src_weight(base, device).t().contiguous()     # [in, out]
                     kk, nn = w.shape
                     words = t.shape[2]
@@ -211,6 +229,8 @@ def main():
                     for k, v in out.items():
                         new[f"{base}.{k}"] = v.cpu().contiguous()
                     assert new[base + ".trellis"].shape == t.shape, (base, new[base + ".trellis"].shape, t.shape)
+                    save_file({k: v for k, v in new.items() if k.startswith(base + ".")}, part + ".tmp")
+                    os.replace(part + ".tmp", part)
                     errs.append(proxy)
                     done += 1
                     print(f"[{time.time() - t0:7.1f}s] {base} K={K} {kk}x{nn} proxy error {proxy:.5f}{'' if hp else ' (no Hessian)'}", flush=True)
@@ -220,6 +240,7 @@ def main():
         tensors.update(new)         # the template's suh / svh / codebook markers of a requantized tensor give way to the new ones
         save_file(tensors, final + ".tmp", metadata=meta)
         os.replace(final + ".tmp", final)
+        shutil.rmtree(part_dir, ignore_errors=True)
         if a.claim: os.unlink(final + ".claim")
         print(f"wrote {fn}: {done} tensors, mean proxy error {sum(errs) / max(len(errs), 1):.5f}, {time.time() - t0:.0f} s", flush=True)
 

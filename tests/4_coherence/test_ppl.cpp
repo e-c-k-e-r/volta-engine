@@ -5,6 +5,8 @@
 //   test_ppl --calibrate --prompts DIR [--tokens N] [--chunk C]   replays the rendered prompts a server wrote with dump_requests (req_N.prompt.txt, chat-template tokens
 //   intact): only the last request of each session is used, and the rows it shares with an earlier session (the system prompt and tool schemas) run without
 //   adding to the Hessians, so every distinct token counts once; --tokens stops after N counted rows
+//   test_ppl --prompts DIR [--select hold|train] [--sessions N]   without --calibrate: perplexity of the assistant turns of the sessions (prefix rows run without logits; chat models are
+//   not trained on system and user text, whose loss is meaningless, so only the tokens between <|im_start|>assistant and <|im_end|> after the shared prefix are scored); --select hold takes every 10th session in name order, train the rest
 //   test_ppl --flash --qbench qbench_prompts.md [--chunk C]   scores only the response tokens of each traced row (input as context), the
 //   quantity the checkpoint's model card reports as PPL
 // The default text is the docs/ folder concatenated; ids never include special tokens.
@@ -29,7 +31,8 @@ int main( int argc, char** argv ) {
 	bool glm = false, flash = false, calibrate = false;
 	int n_tokens = 6000, chunk = 512;
 	std::string file, nll_out, qbench, prompts_dir;
-	int seq = 0;
+	int seq = 0, max_sessions = 0, skip_override = 0, show_miss = 0;
+	std::string select;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
 		else if ( !std::strcmp( argv[i], "--flash" ) ) flash = true;
@@ -41,8 +44,12 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--nll" ) && i + 1 < argc ) nll_out = argv[++i];
 		else if ( !std::strcmp( argv[i], "--prompts" ) && i + 1 < argc ) prompts_dir = argv[++i];
 		else if ( !std::strcmp( argv[i], "--seq" ) && i + 1 < argc ) seq = std::atoi( argv[++i] );
+		else if ( !std::strcmp( argv[i], "--select" ) && i + 1 < argc ) select = argv[++i];
+		else if ( !std::strcmp( argv[i], "--show-miss" ) && i + 1 < argc ) show_miss = std::atoi( argv[++i] );
+		else if ( !std::strcmp( argv[i], "--skip" ) && i + 1 < argc ) skip_override = std::atoi( argv[++i] );
+		else if ( !std::strcmp( argv[i], "--sessions" ) && i + 1 < argc ) max_sessions = std::atoi( argv[++i] );
 	}
-	if ( !calibrate && chunk > pod::MAX_BATCH ) {
+	if ( !calibrate && prompts_dir.empty() && chunk > pod::MAX_BATCH ) {
 		std::printf( "[test_ppl] chunk %d clamped to %d: the gathered logits hold a decode batch (--calibrate reads none and takes any chunk)\n", chunk, pod::MAX_BATCH );
 		chunk = pod::MAX_BATCH;
 	}
@@ -51,7 +58,6 @@ int main( int argc, char** argv ) {
 	ENGINE_ASSERT( tok.load( model_dir ), "tokenizer load failed" );
 
 	if ( !prompts_dir.empty() ) {
-		ENGINE_ASSERT( calibrate, "--prompts replays sessions for calibration: add --calibrate" );
 		std::vector<std::pair<std::string, std::string>> all;   // (name, text)
 		for ( const auto& e : std::filesystem::directory_iterator( prompts_dir ) ) {
 			const std::string name = e.path().filename().string();
@@ -69,6 +75,12 @@ int main( int argc, char** argv ) {
 			if ( !covered ) leaves.push_back( &a.second );
 		}
 		std::sort( leaves.begin(), leaves.end(), []( const std::string* a, const std::string* b ) { return *a < *b; } );
+		if ( !select.empty() ) {
+			std::vector<const std::string*> kept;
+			for ( size_t i = 0; i < leaves.size(); ++i ) if ( ( i % 10 == 0 ) == ( select == "hold" ) ) kept.push_back( leaves[i] );
+			leaves = kept;
+		}
+		if ( max_sessions > 0 && static_cast<int>( leaves.size() ) > max_sessions ) leaves.resize( max_sessions );
 		std::printf( "[*] %zu prompt dumps, %zu sessions\n", all.size(), leaves.size() );
 		ModelCluster mc;
 		ClusterConfig cfg;
@@ -77,6 +89,83 @@ int main( int argc, char** argv ) {
 		ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 		std::vector<std::vector<int>> done;
 		long counted = 0, replayed = 0;
+		if ( !calibrate ) {
+			// perplexity of the rows after the prefix the sessions share
+			std::vector<std::vector<int>> all_ids;
+			for ( const std::string* text : leaves ) {
+				std::vector<int> ids;
+				for ( size_t at = 0; at < text->size(); ) {
+					size_t end = std::min( text->size(), at + 4096 );
+					if ( end < text->size() ) {
+						const size_t nl = text->find( '\n', end );
+						end = nl == std::string::npos ? text->size() : nl + 1;
+					}
+					const std::vector<int> part = tok.encode( text->substr( at, end - at ), false );
+					ids.insert( ids.end(), part.begin(), part.end() );
+					at = end;
+				}
+				all_ids.push_back( std::move( ids ) );
+			}
+			size_t skip = all_ids.empty() ? 0 : all_ids[0].size();
+			for ( const auto& v : all_ids ) {
+				size_t k = 0;
+				while ( k < v.size() && k < all_ids[0].size() && v[k] == all_ids[0][k] ) ++k;
+				skip = std::min( skip, k );
+			}
+			if ( skip_override > 0 ) skip = static_cast<size_t>( skip_override );
+			const int V = mc.metadata().vocab_size;
+			std::vector<backend::half_t> logits( static_cast<size_t>( pod::MAX_BATCH ) * V );
+			double total = 0.0;
+			long n = 0;
+			const std::vector<int> open_assistant = tok.encode( "<|im_start|>assistant\n", false );
+			const int im_end = tok.im_end_id();
+			for ( size_t si = 0; si < all_ids.size(); ++si ) {
+				const std::vector<int>& ids = all_ids[si];
+				std::vector<char> in_assistant( ids.size(), 0 );   // target tokens that the model itself produced: the assistant turns, their <|im_end|> included
+				bool inside = false;
+				for ( size_t j = 0; j < ids.size(); ++j ) {
+					if ( inside ) {
+						in_assistant[j] = 1;
+						if ( ids[j] == im_end ) inside = false;
+					}
+					else if ( j + open_assistant.size() <= ids.size() && std::equal( open_assistant.begin(), open_assistant.end(), ids.begin() + j ) ) {
+						inside = true;
+						j += open_assistant.size() - 1;
+					}
+				}
+				mc.reset_slot( 0 );
+				double st = 0.0;
+				long sn = 0;
+				for ( size_t off = 0; off + 1 < ids.size(); ) {
+					const bool scoring = off + 1 >= skip;
+					const size_t step = scoring ? static_cast<size_t>( pod::MAX_BATCH ) : static_cast<size_t>( chunk );
+					size_t end = std::min( ids.size(), off + step );
+					if ( !scoring && end + 1 > skip ) end = skip - 1;
+					const int count = static_cast<int>( end - off );
+					mc.forward( ids.data() + off, pod::BatchRows::causal( count, static_cast<int>( off ), 0, scoring ? pod::BatchRows::LOGITS_ALL : pod::BatchRows::LOGITS_NONE ) );
+					if ( scoring ) {
+						mc.read_logits( count, logits.data() );
+						for ( int r = 0; r < count && off + r + 1 < ids.size(); ++r ) {
+							const backend::half_t* l = logits.data() + static_cast<size_t>( r ) * V;
+							float mx = -1e30f;
+							for ( int v = 0; v < V; ++v ) mx = std::fmax( mx, backend::to_float( l[v] ) );
+							double sum = 0.0;
+							for ( int v = 0; v < V; ++v ) sum += std::exp( static_cast<double>( backend::to_float( l[v] ) - mx ) );
+							if ( !in_assistant[off + r + 1] ) continue;
+							st += std::log( sum ) + mx - backend::to_float( l[ids[off + r + 1]] );
+							++sn;
+						}
+					}
+					off = end;
+				}
+				total += st;
+				n += sn;
+				std::printf( "[*] session %zu: %zu tokens, %ld scored, NLL %.4f\n", si, ids.size(), sn, sn ? st / sn : 0.0 );
+			}
+			std::printf( "[*] %ld predicted tokens in %zu sessions (assistant turns only, after a prefix of %zu tokens): mean NLL %.4f, perplexity %.3f\n", n, all_ids.size(), skip, total / std::max( n, 1L ), std::exp( total / std::max( n, 1L ) ) );
+			mc.shutdown();
+			return 0;
+		}
 		for ( const std::string* text : leaves ) {
 			if ( counted >= n_tokens ) break;
 			std::vector<int> ids;
@@ -257,6 +346,12 @@ int main( int argc, char** argv ) {
 			double sum = 0.0;
 			for ( int v = 0; v < V; ++v ) sum += std::exp( static_cast<double>( backend::to_float( l[v] ) - mx ) );
 			const float nl = static_cast<float>( std::log( sum ) + mx - backend::to_float( l[ids[off + r + 1]] ) );
+			if ( show_miss > 0 && nl > 10.0f && static_cast<int>( nll.size() ) % 25 == 0 ) {   // every 25th position of the badly predicted ones: the target and the model's top guess
+				int top = 0;
+				for ( int v = 1; v < V; ++v ) if ( backend::to_float( l[v] ) > backend::to_float( l[top] ) ) top = v;
+				std::printf( "[miss] pos %d target %d (%s) top %d (%s) nll %.1f\n", off + r + 1, ids[off + r + 1], tok.decode( { ids[off + r + 1] } ).c_str(), top, tok.decode( { top } ).c_str(), nl );
+				if ( --show_miss == 0 ) show_miss = -1;
+			}
 			nll.push_back( nl );
 			total += nl;
 		}
