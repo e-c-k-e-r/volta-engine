@@ -154,6 +154,9 @@ def main():
     ap.add_argument("--plan", action="store_true", help="only list what would be done with every tensor of the template (from the index files: no GPU, no tensor data)")
     ap.add_argument("--passthrough", action="store_true", help="tensors the template does not quantize (norms, gates, embeddings ...) come from the original when it has them, not from the template (needed when the template is another model's checkpoint)")
     ap.add_argument("--src-files", default="", help="comma separated names of small files (tokenizer.json ...) copied from --src instead of the template (the template is another model's checkpoint)")
+    ap.add_argument("--helper", default="", help="work for another process: quantize the tensors of this shard from its end backwards (every --helper-mod'th one, starting at --helper-rem) into .partial/, stop where the owner's front has been reached; writes nothing else")
+    ap.add_argument("--helper-mod", type=int, default=1)
+    ap.add_argument("--helper-rem", type=int, default=0)
     ap.add_argument("--redo", action="store_true", help="quantize shards again that already exist in --out")
     ap.add_argument("--claim", action="store_true", help="work on the next template shard nobody has claimed (one process per GPU)")
     a = ap.parse_args()
@@ -260,6 +263,7 @@ def main():
 
     for fn in sorted(os.listdir(a.template)):
         p = os.path.join(a.template, fn)
+        if a.helper and fn != a.helper: continue
         if fn == "ngram_embedding.safetensors":      # Qwen3.8-Flash-Next's hashed n-gram table (39 GB, its own file): the template's is used as it is, linked, not copied or requantized
             dst = os.path.join(a.out, fn)
             if not os.path.lexists(dst): os.symlink(os.path.abspath(p), dst)
@@ -293,12 +297,18 @@ def main():
         errs = []
         with safe_open(p, "pt") as f:
             meta = f.metadata()
-            for name in f.keys():
+            names = list(f.keys())
+            if a.helper:
+                elig = lambda n: n.endswith(".trellis") and a.only in n and not any(k and k in n for k in a.skip.split(",")) and has_src(n[:-len(".trellis")])
+                names = [n for n in reversed(names) if elig(n)][a.helper_rem::a.helper_mod]
+            for name in names:
+                if a.helper and a.limit and done >= a.limit: break
                 t = f.get_tensor(name)
                 base = name[:-len(".trellis")] if name.endswith(".trellis") else None
                 if base and a.only in name and not any(k and k in name for k in a.skip.split(",")) and (not a.limit or done < a.limit) and has_src(base):
                     part = os.path.join(part_dir, base + ".safetensors")
                     if os.path.exists(part):
+                        if a.helper: print(f"[{time.time() - t0:7.1f}s] helper: {base} is done already, the owner's front is reached", flush=True); break
                         with safe_open(part, "pt") as pf:
                             for k in pf.keys(): new[k] = pf.get_tensor(k)
                         done += 1
@@ -338,8 +348,9 @@ def main():
                     for k, v in out.items():
                         new[f"{base}.{k}"] = v.cpu().contiguous()
                     assert new[base + ".trellis"].shape == t.shape, (base, new[base + ".trellis"].shape, t.shape)
-                    save_file({k: v for k, v in new.items() if k.startswith(base + ".")}, part + ".tmp")
-                    os.replace(part + ".tmp", part)
+                    tmp = f"{part}.{os.getpid()}.tmp"           # unique: a helper and the owner can meet on one tensor
+                    save_file({k: v for k, v in new.items() if k.startswith(base + ".")}, tmp)
+                    os.replace(tmp, part)
                     errs.append(proxy)
                     done += 1
                     print(f"[{time.time() - t0:7.1f}s] {base} K={K} {kk}x{nn} proxy error {proxy:.5f}{'' if hp else ' (no Hessian)'}", flush=True)
@@ -350,6 +361,9 @@ def main():
                     if tuple(st.shape) == tuple(t.shape): t = st.to(t.dtype)
                     else: print(f"{name}: shape {tuple(st.shape)} in the original, {tuple(t.shape)} in the template: kept from the template", flush=True)
                 tensors[name] = t.contiguous()
+        if a.helper:
+            print(f"helper for {fn}: {done} tensors", flush=True)
+            return
         tensors.update(new)         # the template's suh / svh / codebook markers of a requantized tensor give way to the new ones
         save_file(tensors, final + ".tmp", metadata=meta)
         os.replace(final + ".tmp", final)
