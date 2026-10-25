@@ -112,6 +112,7 @@ def main():
     ap.add_argument("--only", default="")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--files", default="", help="only these template shards, comma separated; the others are linked to the template's (a partial requantization costs one shard of disk)")
     ap.add_argument("--claim", action="store_true", help="work on the next template shard nobody has claimed (one process per GPU)")
     a = ap.parse_args()
 
@@ -123,13 +124,17 @@ def main():
     hmap = json.load(open(a.hess)) if a.hess else {}
     os.makedirs(a.out, exist_ok=True)
 
-    # source tensors by name
+    # source tensors by name (the index file when there is one: opening every shard of a network share only to list its keys is slow)
     src_idx = {}
-    for fn in sorted(os.listdir(a.src)):
-        if fn.endswith(".safetensors"):
-            with safe_open(os.path.join(a.src, fn), "pt") as f:
-                for k in f.keys():
-                    src_idx[k] = fn
+    idx_path = os.path.join(a.src, "model.safetensors.index.json")
+    if os.path.exists(idx_path):
+        src_idx = dict(json.load(open(idx_path))["weight_map"])
+    else:
+        for fn in sorted(os.listdir(a.src)):
+            if fn.endswith(".safetensors"):
+                with safe_open(os.path.join(a.src, fn), "pt") as f:
+                    for k in f.keys():
+                        src_idx[k] = fn
     handles = {}
 
     def src_get(name):
@@ -137,6 +142,16 @@ def main():
         if fn not in handles:
             handles[fn] = safe_open(os.path.join(a.src, fn), "pt")
         return handles[fn].get_tensor(name)
+
+    def src_weight(base, dev):
+        """<base>.weight as fp32 [out, in]: BF16/FP16 as it is, FP8 (E4M3) with its block scales (<base>.weight_scale_inv, one per 128 x 128 block) applied"""
+        w = src_get(base + ".weight").to(dev)
+        if w.dtype == torch.float8_e4m3fn:
+            sc = src_get(base + ".weight_scale_inv").to(dev).float()
+            bo, bi = w.shape[0] // sc.shape[0] if w.shape[0] % sc.shape[0] == 0 else 128, w.shape[1] // sc.shape[1] if w.shape[1] % sc.shape[1] == 0 else 128
+            sc = sc.repeat_interleave(bo, 0)[:w.shape[0]].repeat_interleave(bi, 1)[:, :w.shape[1]]
+            return w.float() * sc
+        return w.float()
 
     qcfg = json.load(open(os.path.join(a.template, "quantization_config.json")))
     out_scales = {"always": True, "never": False}.get(qcfg.get("out_scales", "auto"))
@@ -158,6 +173,9 @@ def main():
                     shutil.copy(p, os.path.join(a.out, fn))
             continue
         final = os.path.join(a.out, fn)
+        if a.files and fn not in a.files.split(","):
+            if not os.path.lexists(final): os.symlink(os.path.abspath(p), final)
+            continue
         if a.claim:
             if os.path.exists(final): continue
             try: os.close(os.open(final + ".claim", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
@@ -172,7 +190,7 @@ def main():
                 t = f.get_tensor(name)
                 base = name[:-len(".trellis")] if name.endswith(".trellis") else None
                 if base and a.only in name and (not a.limit or done < a.limit) and base + ".weight" in src_idx:
-                    w = src_get(base + ".weight").to(device).float().t().contiguous()     # [in, out]
+                    w = src_weight(base, device).t().contiguous()     # [in, out]
                     kk, nn = w.shape
                     words = t.shape[2]
                     K = words // 16 if words % 16 == 0 else words // 16 + 0.5

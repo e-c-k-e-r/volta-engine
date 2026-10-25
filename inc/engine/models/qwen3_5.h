@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/modules/hessian.h"
 #include "engine/config.h"
 #include "engine/models/model.h"
 #include "engine/models/qwen3_vision.h"
@@ -158,6 +159,8 @@ private:
 
 	pod::BatchRows* d_rows_ = nullptr; // device-resident row descriptor of the current forward
 	engine::core::GraphCache graphs_;
+	int hess_layer_ = 0;
+	engine::modules::HessianSet hess_;   // calibration (hessian_dir): sites per layer 0 attention input, 1 MLP input, 2 o_proj / out_proj input, 3 down_proj input; (0, 4) the LM head input
 
 	// Per-rank (TP-sharded) head counts
 	int q_heads_ = 0;

@@ -35,6 +35,10 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--calibrate" ) ) calibrate = true;
 		else if ( !std::strcmp( argv[i], "--nll" ) && i + 1 < argc ) nll_out = argv[++i];
 	}
+	if ( !calibrate && chunk > pod::MAX_BATCH ) {
+		std::printf( "[test_ppl] chunk %d clamped to %d: the gathered logits hold a decode batch (--calibrate reads none and takes any chunk)\n", chunk, pod::MAX_BATCH );
+		chunk = pod::MAX_BATCH;
+	}
 	const char* model_dir = glm ? test::GLM_DIR : ( flash ? test::FLASH_DIR : test::QWEN_DIR );
 	engine::loader::Tokenizer tok;
 	ENGINE_ASSERT( tok.load( model_dir ), "tokenizer load failed" );
@@ -100,7 +104,7 @@ int main( int argc, char** argv ) {
 			int row_count = 0;
 			for ( int off = 0; off + 1 < n; off += chunk ) {
 				const int count = std::min( chunk, n - off );
-				mc.forward( ids.data() + off, pod::BatchRows::causal( count, off, 0, glm && calibrate ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );   // GLM's logits buffer holds a decode batch
+				mc.forward( ids.data() + off, pod::BatchRows::causal( count, off, 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );   // the logits buffers hold a decode batch; a calibration pass reads none
 				if ( calibrate ) continue;   // forward only (ENGINE_HESSIAN_DIR collects its statistics in the layers); the host scoring below is the slow part
 		mc.read_logits( count, logits.data() );
 				for ( int r = 0; r < count && off + r + 1 < n; ++r ) {
@@ -169,7 +173,8 @@ int main( int argc, char** argv ) {
 	double total = 0.0;
 	for ( int off = 0; off + 1 < n_tokens; off += chunk ) {
 		const int count = std::min( chunk, n_tokens - off );
-		mc.forward( ids.data() + off, pod::BatchRows::causal( count, off, 0, pod::BatchRows::LOGITS_ALL ) );
+		mc.forward( ids.data() + off, pod::BatchRows::causal( count, off, 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );
+		if ( calibrate ) continue;   // forward only: ENGINE_HESSIAN_DIR collects its statistics in the layers
 		mc.read_logits( count, logits.data() );
 		for ( int r = 0; r < count && off + r + 1 < n_tokens; ++r ) {
 			const backend::half_t* l = logits.data() + static_cast<size_t>( r ) * V;

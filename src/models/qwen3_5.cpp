@@ -245,6 +245,20 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 		return false;
 	}
 
+	if ( !runtime::options().hessian_dir.empty() ) {
+		// Calibration accumulators (sites per layer: see hess_); the replicated inputs live on rank 0, the o_proj / out_proj and down_proj inputs on every rank
+		hess_.init( config_.num_layers, 5 );
+		int hl_lo = 0, hl_hi = config_.num_layers - 1;
+		if ( const std::string& hl = runtime::options().hessian_layers; !hl.empty() ) std::sscanf( hl.c_str(), "%d-%d", &hl_lo, &hl_hi );
+		for ( int L = hl_lo; L <= hl_hi && L < config_.num_layers; ++L ) {
+			if ( rank_ == 0 ) { hess_.add( L, 0, config_.hidden_size, *arena_, stream ); hess_.add( L, 1, config_.hidden_size, *arena_, stream ); }
+			hess_.add( L, 2, ( ( L + 1 ) % 4 == 0 ) ? attn_out_.shape[1] : gdn_out_.shape[1], *arena_, stream );
+			hess_.add( L, 3, mlp_inter_.shape[1], *arena_, stream );
+		}
+		if ( rank_ == 0 && hl_lo == 0 ) hess_.add( 0, 4, config_.hidden_size, *arena_, stream );
+		backend::stream_sync( stream );
+	}
+
 	// 1. Embed tokens
 	embed_tokens_ = repo.load( "model.language_model.embed_tokens.weight", *arena_, stream, pod::DType::BF16 );
 
@@ -560,6 +574,7 @@ const pod::TensorView& Qwen3_5Pipeline::gather_logits(
 		return logits_;
 	}
 	ENGINE_ASSERT( rows >= 1 && rows <= last_rows_, "Qwen3_5Pipeline::gather_logits: rows exceeds last forward rows" );
+	ENGINE_ASSERT( rows <= pod::MAX_BATCH, "Qwen3_5Pipeline::gather_logits: the gathered buffer holds a decode batch" );
 	ENGINE_ASSERT( peer_shard_cols == lm_shard_cols_, "Qwen3_5Pipeline::gather_logits: shard width mismatch" );
 
 	full_logits_.shape[0] = rows;
@@ -635,6 +650,7 @@ void Qwen3_5Pipeline::layer_forward( const Qwen3_5LayerWeights& lw, int& full_at
 	engine::modules::RMSNorm::forward(
 		hidden_states_, lw.input_norm, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
 	);
+	hess_.accumulate( hess_layer_, 0, norm_hidden_.data, config_.hidden_size, m, stream );
 
 	// 2. Attention
 	if ( lw.is_full_attention ) {
@@ -712,6 +728,7 @@ void Qwen3_5Pipeline::layer_forward( const Qwen3_5LayerWeights& lw, int& full_at
 		full_attn_idx++;
 
 		// O proj: projects attn_out (6144 or 1536) to mlp_out (5120)
+		hess_.accumulate( hess_layer_, 2, attn_out_.data, attn_out_.shape[1], m, stream );
 		engine::modules::Linear::forward(
 			attn_out_, lw.o_proj, mlp_out_, stream
 		);
@@ -786,6 +803,7 @@ void Qwen3_5Pipeline::layer_forward( const Qwen3_5LayerWeights& lw, int& full_at
 		);
 
 		// Out proj: projects gdn_out (6144 or 1536) to mlp_out (5120) across all M rows
+		hess_.accumulate( hess_layer_, 2, gdn_out_.data, gdn_out_.shape[1], m, stream );
 		engine::modules::Linear::forward(
 			gdn_out_, lw.out_proj, mlp_out_, stream
 		);
@@ -811,6 +829,7 @@ void Qwen3_5Pipeline::layer_forward( const Qwen3_5LayerWeights& lw, int& full_at
 	}
 
 	// 4. MLP
+	hess_.accumulate( hess_layer_, 1, norm_hidden_.data, config_.hidden_size, m, stream );
 	engine::modules::Linear::forward(
 		norm_hidden_, lw.gate_proj, gate_buf_, stream
 	);
@@ -820,6 +839,7 @@ void Qwen3_5Pipeline::layer_forward( const Qwen3_5LayerWeights& lw, int& full_at
 	);
 
 	engine::modules::SwiGLU::forward( gate_buf_, up_buf_, mlp_inter_, stream );
+	hess_.accumulate( hess_layer_, 3, mlp_inter_.data, mlp_inter_.shape[1], m, stream );
 
 	engine::modules::Linear::forward(
 		mlp_inter_, lw.down_proj, mlp_out_, stream
@@ -836,6 +856,7 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 	int linear_idx = 0;
 
 	for ( int layer = 0; layer < config_.num_layers; ++layer ) {
+		hess_layer_ = layer;
 		layer_forward( layers_[layer], full_attn_idx, linear_idx, m, stream );
 
 		// Tapped layer states for DFlash2: tapped_states_[r][tap] = hidden after layer tap_layers[tap]
@@ -856,8 +877,10 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 	// four 5120 x 62208 GEMVs running in parallel instead of one 5120 x 248320 GEMV gating rank 0.
 	if ( tp_size_ > 1 || rank_ == 0 ) {
 		// The MTP head reads the final-norm hidden of every prefill row, whether or not the chunk needs logits
-		if ( mtp_on_ && m > pod::MAX_BATCH ) {
+		// (and the calibration of the head, which wants the final-norm hidden of every prefill row)
+		if ( ( mtp_on_ || hess_.on() ) && m > pod::MAX_BATCH ) {
 			engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream );
+			hess_.accumulate( 0, 4, norm_hidden_.data, config_.hidden_size, m, stream );
 		}
 		if ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) return;
 		if ( lm_mode_ == pod::BatchRows::LOGITS_LAST ) {
@@ -966,6 +989,7 @@ void Qwen3_5Pipeline::mtp_save_hist( int src_row, int rows, int dst_row, backend
 void Qwen3_5Pipeline::destroy() {
 	if ( arena_ != nullptr ) {
 		backend::set_device( rank_ );
+		hess_.dump( runtime::options().hessian_dir, rank_ );
 		graphs_.reset();
 	}
 	if ( h_argmax_idx_ != nullptr ) {
