@@ -122,6 +122,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--files", default="", help="only these template shards, comma separated; the others are linked to the template's (a partial requantization costs one shard of disk)")
+    ap.add_argument("--redo", action="store_true", help="quantize shards again that already exist in --out")
     ap.add_argument("--claim", action="store_true", help="work on the next template shard nobody has claimed (one process per GPU)")
     a = ap.parse_args()
 
@@ -182,6 +183,9 @@ def main():
                     shutil.copy(p, os.path.join(a.out, fn))
             continue
         final = os.path.join(a.out, fn)
+        if os.path.exists(final) and not os.path.islink(final) and fn.startswith("model") and not a.redo:
+            print(f"{fn}: already written, skipped (--redo quantizes it again)", flush=True)
+            continue
         if a.files and fn not in a.files.split(","):
             if not os.path.lexists(final): os.symlink(os.path.abspath(p), final)
             continue
