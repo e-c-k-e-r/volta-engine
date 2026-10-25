@@ -82,3 +82,13 @@ The calibrated tensors are the ones `configs/glm_nvfp4_dense.json` uses. GLM is 
 
 * KV cache formats: FP8 and the int8 / NVFP4 caches against FP16 on the same prompts (cosine of the logits: FP8 0.999998, K8V4 0.9998, NVFP4 0.99995 on Qwen3.8-27B at tensor-parallel 4; the 8K needle passes on all of them on GLM). See [TESTS.md](TESTS.md).
 * MiniMax-H3 text tower: EXL3 6 bpw 0.999999 cosine against the BF16 hidden states (0.999957 with an image), the NVFP4 build 0.999913 text-only and 0.9737 with an image ([video.md](video.md)).
+
+## Quantizing EXL3 from the original weights
+
+For a Qwen3.5-family dense model (tile order stock or Volta), with a model of the same architecture already quantized to EXL3 as the template:
+
+1. **Calibration text.** Serve a model with `--set dump_requests=<dir>` and run `tests/agentic/bench.py` against it (`gen_tasks.py` generates the tasks); `tests/tools/prose_corpus.py` writes plain prose from book transcripts.
+2. **Hessians.** `ENGINE_HESSIAN_DIR=<dir> ENGINE_HESSIAN_LAYERS=<lo-hi> test_ppl --calibrate --prompts <dump dir> --select train --tokens N --chunk 512` replays the sessions (rows shared between sessions count once) and `--file prose.txt --seq 2048` the prose, in slices of layers that fit beside the weights (16 layers per pass at tensor parallel 2). Each capture directory takes about 0.9 GB per layer.
+3. **Mix and map.** `hess_merge.py --src agent_dir:0.7 --src prose_dir:0.3 --out mix_dir`, `hess_check.py` on the directories, `qwen_hess_map.py --dir mix_dir --out map.json --layers 64 --ranks 2`.
+4. **Quantize.** `exl3_quantize.py --src <original weights> --template <EXL3 directory> --out <dir> --order stock|volta --hess map.json --skip model.visual`; a shard that already exists in `--out` is skipped and a restarted shard continues from the tensors it finished.
+5. **Score.** `test_ppl --prompts <dump dir> --select hold --sessions 10` gives the perplexity of the assistant turns of held-out sessions (system and user text carry no meaningful loss for a chat model, so only the model's own turns are scored).
