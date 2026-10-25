@@ -12,7 +12,7 @@ with which codebook, plus every tensor that stays as it is and the config files.
 
 Hessians (x^T x of a projection's input, from the engine's ENGINE_HESSIAN_DIR capture) are optional: a tensor without one is quantized
 without calibration (upstream's fallback). --hess takes a JSON file mapping a tensor name (or a name prefix ending in '*') to a Hessian file of the
-engine's format; one Hessian may serve several tensors that share an input (q, k, v).
+engine's format, or to a list of them (one per rank of a row-parallel input: block diagonal); one Hessian may serve several tensors that share an input (q, k, v).
 
   exl3_quantize.py --src <bf16 dir> --template <exl3 dir> --out <dir> [--order volta|stock] [--hess map.json] [--device cuda:0]
                    [--only SUBSTRING] [--claim] [--limit N] [--seed N]
@@ -220,9 +220,14 @@ def main():
                     H_data = {"first_key": base, "count": 0, "finalized": False, "num_total": 0, "device": device,
                               "inf_nan": torch.zeros(2, dtype=torch.long, device=device)}
                     if hp:
-                        H, rows = load_hessian(hp, device)
+                        # one file, or one per rank for a row-parallel input: the rank blocks form a block diagonal (the cross-rank covariance is not captured)
+                        blocks = []
+                        for path in (hp if isinstance(hp, list) else [hp]):
+                            Hb, rows = load_hessian(path, device)
+                            blocks.append(Hb)
+                        H = blocks[0] if len(blocks) == 1 else torch.block_diag(*blocks)
                         assert H.shape[0] == kk, f"{base}: Hessian {tuple(H.shape)} for {kk} inputs"
-                        H_data.update(H=H * float(rows), count=rows)      # quantize.py divides by the row count
+                        H_data.update(H=H, count=rows)      # the capture files hold sums over the rows; quantize.py divides by the row count
                     else:
                         H_data["H"] = torch.zeros(kk, kk, device="meta")
                     wq, proxy, out = qz.quantize_exl3(w, H_data, qa, False)
