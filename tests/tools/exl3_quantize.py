@@ -58,6 +58,34 @@ def volta_perm_fn(torch):
     return perm
 
 
+E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+E2M1_EDGES = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]       # midpoints; ties go to the lower magnitude
+
+
+def nvfp4_dequant(packed, scale, inv_global, dev):
+    """NVFP4 weight [N, K] fp32: E2M1 codes (the even element of a pair in the low nibble) times the E4M3 scale of its block of 16 times inv_global"""
+    import torch
+    p = packed.to(dev)
+    codes = torch.stack([p & 15, p >> 4], dim=-1).reshape(p.shape[0], -1)
+    mag = torch.tensor(E2M1, device=dev)[(codes & 7).long()]
+    val = torch.where((codes & 8) != 0, -mag, mag)
+    return val * scale.to(dev).float().repeat_interleave(16, 1) * inv_global
+
+
+def nvfp4_roundtrip(w):
+    """w [N, K] fp32 through NVFP4 as post-training quantizers write it (modelopt): one fp32 scale per tensor, an E4M3 scale per 16 values (amax / 6), round to nearest E2M1"""
+    import torch
+    N, K = w.shape
+    gs = w.abs().max() / (6.0 * 448.0)
+    blocks = w.reshape(N, K // 16, 16)
+    sc = (blocks.abs().amax(-1) / 6.0 / gs).clamp(min=1e-12).to(torch.float8_e4m3fn).float()      # per block, in units of gs
+    scale = (sc * gs).unsqueeze(-1)
+    a = (blocks / scale).abs()
+    m = torch.bucketize(a, torch.tensor(E2M1_EDGES, device=w.device))
+    q = torch.tensor(E2M1, device=w.device)[m] * torch.where(blocks < 0, -1.0, 1.0)
+    return (q * scale).reshape(N, K)
+
+
 def load_upstream(order):
     """import upstream's quantizer with the extension built here, and the tile order selected"""
     import torch
@@ -118,6 +146,7 @@ def main():
     ap.add_argument("--hess", default="")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--only", default="")
+    ap.add_argument("--nvfp4-roundtrip", action="store_true", help="pass every BF16 source weight through NVFP4 first (as a post-training NVFP4 checkpoint would have it): measures what the detour costs")
     ap.add_argument("--skip", default="", help="comma separated substrings: matching tensors keep the template's version (the vision tower, whose widths are not multiples of 128)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
@@ -153,15 +182,23 @@ def main():
             handles[fn] = safe_open(os.path.join(a.src, fn), "pt")
         return handles[fn].get_tensor(name)
 
+    def has_src(base):
+        return base + ".weight" in src_idx or base + ".weight_packed" in src_idx
+
     def src_weight(base, dev):
-        """<base>.weight as fp32 [out, in]: BF16/FP16 as it is, FP8 (E4M3) with its block scales (<base>.weight_scale_inv, one per 128 x 128 block) applied"""
+        """<base> as fp32 [out, in]: BF16/FP16 as it is; FP8 (E4M3) with its block scales (<base>.weight_scale_inv, one per 128 x 128 block); NVFP4 of either layout
+        (compressed-tensors: weight_packed / weight_scale / weight_global_scale, a divisor; modelopt: uint8 weight / weight_scale / weight_scale_2, a multiplier)"""
+        if base + ".weight_packed" in src_idx:
+            return nvfp4_dequant(src_get(base + ".weight_packed"), src_get(base + ".weight_scale"), 1.0 / float(src_get(base + ".weight_global_scale").float().item()), dev)
         w = src_get(base + ".weight").to(dev)
+        if w.dtype == torch.uint8 and base + ".weight_scale_2" in src_idx:
+            return nvfp4_dequant(w, src_get(base + ".weight_scale"), float(src_get(base + ".weight_scale_2").float().item()), dev)
         if w.dtype == torch.float8_e4m3fn:
             sc = src_get(base + ".weight_scale_inv").to(dev).float()
             bo, bi = w.shape[0] // sc.shape[0] if w.shape[0] % sc.shape[0] == 0 else 128, w.shape[1] // sc.shape[1] if w.shape[1] % sc.shape[1] == 0 else 128
             sc = sc.repeat_interleave(bo, 0)[:w.shape[0]].repeat_interleave(bi, 1)[:, :w.shape[1]]
             return w.float() * sc
-        return w.float()
+        return nvfp4_roundtrip(w.float()) if a.nvfp4_roundtrip and not base.endswith("lm_head") else w.float()
 
     qcfg = json.load(open(os.path.join(a.template, "quantization_config.json")))
     out_scales = {"always": True, "never": False}.get(qcfg.get("out_scales", "auto"))
@@ -204,7 +241,7 @@ def main():
             for name in f.keys():
                 t = f.get_tensor(name)
                 base = name[:-len(".trellis")] if name.endswith(".trellis") else None
-                if base and a.only in name and not any(k and k in name for k in a.skip.split(",")) and (not a.limit or done < a.limit) and base + ".weight" in src_idx:
+                if base and a.only in name and not any(k and k in name for k in a.skip.split(",")) and (not a.limit or done < a.limit) and has_src(base):
                     part = os.path.join(part_dir, base + ".safetensors")
                     if os.path.exists(part):
                         with safe_open(part, "pt") as pf:

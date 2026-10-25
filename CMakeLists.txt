@@ -55,6 +55,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	option(ENGINE_EXL3_VOLTA_LAYOUT "EXL3 GEMM: weight tiles in the Volta order (proof of concept)" OFF)
 	if(ENGINE_EXL3_VOLTA_LAYOUT)
 		set(ENGINE_EXL3_DEFS "${ENGINE_EXL3_DEFS} -DEXL3_VOLTA_LAYOUT=1")
+		add_compile_definitions(ENGINE_BUILD_EXL3_VOLTA_LAYOUT=1)    # the loader refuses a checkpoint written in the other tile order
 	endif()
 	# Hardware overrides (0: query the device at startup). ENGINE_SM_COUNT caps the SMs the persistent / cooperative kernels spread over;
 	# ENGINE_MAX_SMEM is the opt-in shared memory per block the big kernels request (default 98304, which V100, SM_86 and SM_89 all allow)

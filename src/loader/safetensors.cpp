@@ -440,10 +440,41 @@ void SafeTensorsRepo::close() {
 	tensor_map_.clear();
 }
 
+namespace {
+
+// An EXL3 checkpoint names its tile order in quantization_config.json ("tile_layout": "volta"; absent = the stock order), and the GEMM kernels of a build read
+// exactly one of them: the other decodes to noise without any error, so the directory is refused here. Searches the file's text; nothing is parsed.
+void check_exl3_tile_layout( const char* dir ) {
+	char path[1200];
+	std::snprintf( path, sizeof( path ), "%s/quantization_config.json", dir );
+	const int fd = ::open( path, O_RDONLY );
+	if ( fd < 0 ) return;
+	struct stat st;
+	if ( fstat( fd, &st ) != 0 || st.st_size <= 0 ) { ::close( fd ); return; }
+	void* map = mmap( nullptr, static_cast<size_t>( st.st_size ), PROT_READ, MAP_PRIVATE, fd, 0 );
+	::close( fd );
+	if ( map == MAP_FAILED ) return;
+	const std::string text( static_cast<const char*>( map ), static_cast<size_t>( st.st_size ) );
+	munmap( map, static_cast<size_t>( st.st_size ) );
+	if ( text.find( "\"quant_method\"" ) == std::string::npos || text.find( "\"exl3\"" ) == std::string::npos ) return;
+	bool volta = false;
+	if ( const size_t at = text.find( "\"tile_layout\"" ); at != std::string::npos ) volta = text.compare( text.find( '"', text.find( ':', at ) ) , 7, "\"volta\"" ) == 0;
+#ifdef ENGINE_BUILD_EXL3_VOLTA_LAYOUT
+	constexpr bool build_volta = true;
+#else
+	constexpr bool build_volta = false;
+#endif
+	ENGINE_ASSERT( volta == build_volta, volta ? "this EXL3 checkpoint is in the Volta tile order (tile_layout in quantization_config.json); build with -DENGINE_EXL3_VOLTA_LAYOUT=ON"
+	                                           : "this build reads the EXL3 Volta tile order (ENGINE_EXL3_VOLTA_LAYOUT=ON) but the checkpoint is in the stock order; re-encode it with tests/tools/exl3_volta_layout.py or quantize it with exl3_quantize.py --order volta" );
+}
+
+} // namespace
+
 bool SafeTensorsRepo::open( const char* dir_path ) {
 	close();
 	std::strncpy( dir_path_, dir_path, sizeof( dir_path_ ) - 1 );
 	dir_path_[sizeof( dir_path_ ) - 1] = '\0';
+	check_exl3_tile_layout( dir_path );
 
 	std::vector<std::string> shard_files;
 
