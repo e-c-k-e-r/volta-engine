@@ -184,6 +184,7 @@ def main():
             handles[fn] = safe_open(os.path.join(a.src, fn), "pt")
         return handles[fn].get_tensor(name)
 
+    hcache = collections.OrderedDict()           # finalized Hessians by file: reused by the tensors that share them
     fused_cache = collections.OrderedDict()      # a few fused expert tensors of the original (BF16 [experts, ...]), the layer being quantized
 
     def fused_ref(base):
@@ -196,7 +197,7 @@ def main():
     def fused_tensor(name):
         if name not in fused_cache:
             fused_cache[name] = src_get(name)
-            while len(fused_cache) > 4: fused_cache.popitem(last=False)
+            while len(fused_cache) > 3: fused_cache.popitem(last=False)
         fused_cache.move_to_end(name)
         return fused_cache[name]
 
@@ -258,6 +259,10 @@ def main():
 
     for fn in sorted(os.listdir(a.template)):
         p = os.path.join(a.template, fn)
+        if fn == "ngram_embedding.safetensors":      # Qwen3.8-Flash-Next's hashed n-gram table (39 GB, its own file): the template's is used as it is, linked, not copied or requantized
+            dst = os.path.join(a.out, fn)
+            if not os.path.lexists(dst): os.symlink(os.path.abspath(p), dst)
+            continue
         if not fn.endswith(".safetensors"):
             if os.path.isfile(p) and fn != "model.safetensors.index.json" or fn == "model.safetensors.index.json":
                 if fn == "quantization_config.json":
@@ -306,9 +311,15 @@ def main():
                     if base + ".mcg" in all_keys: qa["mcg"] = True
                     if base + ".mul1" in all_keys: qa["mul1"] = True
                     hp = hessian_path(hmap, base)
-                    H_data = {"first_key": base, "count": 0, "finalized": False, "num_total": 0, "device": device,
+                    hkey = tuple(hp) if isinstance(hp, list) else hp
+                    H_data = hcache.get(hkey) if hp else None
+                    # tensors with one input (q / k / v, gate / up of every expert) share the factored Hessian and the input sign vector, as upstream's converter does
+                    if H_data is not None:
+                        pass
+                    else:
+                      H_data = {"first_key": base, "count": 0, "finalized": False, "num_total": 0, "device": device,
                               "inf_nan": torch.zeros(2, dtype=torch.long, device=device)}
-                    if hp:
+                    if hp and hkey not in hcache:
                         # one file, or one per rank for a row-parallel input: the rank blocks form a block diagonal (the cross-rank covariance is not captured)
                         blocks = []
                         for path in (hp if isinstance(hp, list) else [hp]):
@@ -317,7 +328,9 @@ def main():
                         H = blocks[0] if len(blocks) == 1 else torch.block_diag(*blocks)
                         assert H.shape[0] == kk, f"{base}: Hessian {tuple(H.shape)} for {kk} inputs"
                         H_data.update(H=H, count=rows)      # the capture files hold sums over the rows; quantize.py divides by the row count
-                    else:
+                        hcache[hkey] = H_data
+                        while len(hcache) > 6: hcache.pop(next(iter(hcache)))
+                    elif not hp:
                         H_data["H"] = torch.zeros(kk, kk, device="meta")
                     wq, proxy, out = qz.quantize_exl3(w, H_data, qa, False)
                     for k, v in out.items():
