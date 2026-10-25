@@ -1,0 +1,9 @@
+{
+  "id": "edit-config",
+  "tier": "quick",
+  "prompt": "In config.json, change the server port to 9090, add \"tls\": true under \"server\", and append \"metrics\" to the \"features\" list. Keep everything else as it is.",
+  "tags": [
+    "edit",
+    "json"
+  ]
+}

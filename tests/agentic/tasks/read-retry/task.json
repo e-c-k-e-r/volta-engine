@@ -1,0 +1,9 @@
+{
+  "id": "read-retry",
+  "tier": "quick",
+  "prompt": "Which function computes the delay before a retry, and what is the longest delay it can ever return (in seconds)? Write the answer to answer.txt as a single line: <function name>: <number>. Do not change any other file.",
+  "tags": [
+    "read-only",
+    "python"
+  ]
+}

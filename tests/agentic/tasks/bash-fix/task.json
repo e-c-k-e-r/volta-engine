@@ -1,0 +1,9 @@
+{
+  "id": "bash-fix",
+  "tier": "quick",
+  "prompt": "report.sh should print the three most frequent words of words.txt, most frequent first, as 'count word' lines. It prints them in the wrong order. Fix it.",
+  "tags": [
+    "bugfix",
+    "shell"
+  ]
+}

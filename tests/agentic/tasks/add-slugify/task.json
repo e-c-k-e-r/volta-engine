@@ -1,0 +1,10 @@
+{
+  "id": "add-slugify",
+  "tier": "quick",
+  "prompt": "Add a function slugify(text) to textutil.py: lowercase, replace every run of non-alphanumeric characters with a single hyphen, strip leading and trailing hyphens. Add tests for it to test_textutil.py.",
+  "tags": [
+    "feature",
+    "python",
+    "tests"
+  ]
+}

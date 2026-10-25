@@ -1,0 +1,9 @@
+{
+  "id": "fix-off-by-one",
+  "tier": "quick",
+  "prompt": "The tests in test_stats.py fail. Find the bug in stats.py and fix it. Do not change the tests.",
+  "tags": [
+    "bugfix",
+    "python"
+  ]
+}

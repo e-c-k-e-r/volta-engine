@@ -1,0 +1,9 @@
+{
+  "id": "rename-symbol",
+  "tier": "quick",
+  "prompt": "Rename the function fetch_data to load_records everywhere in this project (definition, imports and calls, including the docs). Make sure the tests still pass.",
+  "tags": [
+    "refactor",
+    "python"
+  ]
+}
