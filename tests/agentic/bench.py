@@ -13,7 +13,7 @@ work directory afterwards; files from hidden/ are copied in first) and solution.
 A run directory holds meta.json (client version, server URL, model, settings, git revision), results.jsonl (one record per task run)
 and <task>/<rep>/ with the Claude Code event stream (events.jsonl) and the final work directory.
 """
-import argparse, json, os, shutil, statistics, subprocess, sys, tempfile, time
+import argparse, concurrent.futures, json, os, shutil, statistics, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 THINKING = {"off": "0", "low": "4000", "medium": "10000", "high": "31999"}
@@ -38,7 +38,8 @@ def sandbox_cmd(work, inner, net, extra_env=None, ro_extra=()):
         if p.startswith(home):
             cmd += ["--ro-bind", p, p]
     env = {"PATH": "/usr/local/bin:/usr/bin:/bin:" + os.path.join(home, ".local/bin"), "HOME": home, "LANG": "C.UTF-8", "TERM": "dumb",
-           "TMPDIR": "/tmp", "CLAUDE_CONFIG_DIR": "/tmp/claude-config"}
+           "TMPDIR": "/tmp", "CLAUDE_CONFIG_DIR": "/tmp/claude-config", "GIT_AUTHOR_NAME": "agent", "GIT_AUTHOR_EMAIL": "agent@localhost",
+           "GIT_COMMITTER_NAME": "agent", "GIT_COMMITTER_EMAIL": "agent@localhost"}
     env.update(extra_env or {})
     for k, v in env.items():
         cmd += ["--setenv", k, v]
@@ -57,10 +58,13 @@ def run_checked(cmd, timeout):
         return -9, out or "", err or "", True
 
 
+TASKS_DIR = os.path.join(HERE, "tasks")
+
+
 def load_tasks(tier=None, only=None):
     tasks = []
-    for tid in sorted(os.listdir(os.path.join(HERE, "tasks"))):
-        d = os.path.join(HERE, "tasks", tid)
+    for tid in sorted(os.listdir(TASKS_DIR)):
+        d = os.path.join(TASKS_DIR, tid)
         if not os.path.exists(d + "/task.json"):
             continue
         t = json.load(open(d + "/task.json"))
@@ -143,29 +147,38 @@ def run(args):
     env = {"ANTHROPIC_BASE_URL": args.base_url, "ANTHROPIC_API_KEY": args.api_key, "ANTHROPIC_MODEL": args.model, "ANTHROPIC_SMALL_FAST_MODEL": args.model,
            "DISABLE_TELEMETRY": "1", "DISABLE_ERROR_REPORTING": "1", "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
            "API_TIMEOUT_MS": str(args.timeout * 1000)}
-    if args.thinking in THINKING:
-        env["MAX_THINKING_TOKENS"] = THINKING[args.thinking]
     results = open(os.path.join(args.out, "results.jsonl"), "a")
-    for t in load_tasks(args.tier, args.only and args.only.split(",")):
-        for rep in range(args.repeats):
-            rdir = os.path.join(args.out, t["id"], str(rep))
-            shutil.rmtree(rdir, ignore_errors=True)
-            work = os.path.join(rdir, "work")
-            shutil.copytree(t["dir"] + "/repo", work)
-            cmd = ["claude", "-p", t["prompt"], "--output-format", "stream-json", "--verbose", "--max-turns", str(args.max_turns),
-                   "--permission-mode", "bypassPermissions", "--model", args.model]
-            t0 = time.time()
-            rc, out, err, timed_out = run_checked(sandbox_cmd(work, cmd, net=True, extra_env=env, ro_extra=ro), args.timeout)
-            wall = time.time() - t0
-            open(os.path.join(rdir, "events.jsonl"), "w").write(out)
-            open(os.path.join(rdir, "stderr.txt"), "w").write(err[-4000:])
-            m = parse_events(os.path.join(rdir, "events.jsonl"))
-            passed, vlog = verify(t, work)
-            rec = {"task": t["id"], "rep": rep, "passed": passed, "wall_s": round(wall, 1), "claude_rc": rc, "timed_out": timed_out, **m}
+    levels = args.thinking.split(",")
+    jobs = [(t, rep) for t in load_tasks(args.tier, args.only and args.only.split(",")) for rep in range(args.repeats)]
+    lock = threading.Lock()
+
+    def one(idx, t, rep):
+        level = levels[idx % len(levels)]
+        denv = dict(env)
+        if level in THINKING:
+            denv["MAX_THINKING_TOKENS"] = THINKING[level]
+        rdir = os.path.join(args.out, t["id"], str(rep))
+        shutil.rmtree(rdir, ignore_errors=True)
+        work = os.path.join(rdir, "work")
+        shutil.copytree(t["dir"] + "/repo", work)
+        cmd = ["claude", "-p", t["prompt"], "--output-format", "stream-json", "--verbose", "--max-turns", str(args.max_turns),
+               "--permission-mode", "bypassPermissions", "--model", args.model]
+        t0 = time.time()
+        rc, out, err, timed_out = run_checked(sandbox_cmd(work, cmd, net=True, extra_env=denv, ro_extra=ro), args.timeout)
+        wall = time.time() - t0
+        open(os.path.join(rdir, "events.jsonl"), "w").write(out)
+        open(os.path.join(rdir, "stderr.txt"), "w").write(err[-4000:])
+        m = parse_events(os.path.join(rdir, "events.jsonl"))
+        passed, vlog = verify(t, work)
+        rec = {"task": t["id"], "rep": rep, "thinking": level, "passed": passed, "wall_s": round(wall, 1), "claude_rc": rc, "timed_out": timed_out, **m}
+        with lock:
             results.write(json.dumps(rec) + "\n")
             results.flush()
-            print(f"{'PASS' if passed else 'FAIL'} {t['id']:20s} rep {rep} {wall:6.1f}s turns {m['turns']:3d} tools {m['tool_calls']:3d} (err {m['tool_errors']}) "
+            print(f"{'PASS' if passed else 'FAIL'} {t['id']:22s} rep {rep} {level:8s} {wall:6.1f}s turns {m['turns']:3d} tools {m['tool_calls']:3d} (err {m['tool_errors']}) "
                   f"out {m['output_tokens']:6d} tok{' TIMEOUT' if timed_out else ''}", flush=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as ex:
+        list(ex.map(lambda j: one(j[0], *j[1]), enumerate(jobs)))
     summary(args.out)
 
 
@@ -188,14 +201,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     st = sub.add_parser("selftest")
-    st.add_argument("--tier"); st.add_argument("--only")
+    st.add_argument("--tier"); st.add_argument("--only"); st.add_argument("--tasks-dir")
     r = sub.add_parser("run")
     r.add_argument("--base-url", required=True); r.add_argument("--model", required=True); r.add_argument("--out", required=True)
-    r.add_argument("--api-key", default="sk-local"); r.add_argument("--tier"); r.add_argument("--only")
-    r.add_argument("--repeats", type=int, default=1); r.add_argument("--thinking", default="default", choices=["default", "off", "low", "medium", "high"])
+    r.add_argument("--tasks-dir"); r.add_argument("--api-key", default="sk-local"); r.add_argument("--tier"); r.add_argument("--only")
+    r.add_argument("--repeats", type=int, default=1); r.add_argument("--thinking", default="default", help="default, off, low, medium or high; a comma separated list cycles over the tasks")
+    r.add_argument("--parallel", type=int, default=1, help="client runs at the same time (the server's slots)")
     r.add_argument("--max-turns", type=int, default=30); r.add_argument("--timeout", type=int, default=900)
     s = sub.add_parser("summary"); s.add_argument("dir")
     a = ap.parse_args()
+    global TASKS_DIR
+    if getattr(a, "tasks_dir", None): TASKS_DIR = os.path.abspath(a.tasks_dir)
     if a.cmd == "selftest": sys.exit(selftest(a))
     if a.cmd == "run": run(a)
     if a.cmd == "summary": summary(a.dir)

@@ -23,6 +23,12 @@ A task is a directory `tests/agentic/tasks/<id>/`:
 
 The quick tier covers a bug fix, a feature with tests, a rename across files, a shell fix, a read-only question and a config edit.
 
+`tests/agentic/gen_tasks.py --out DIR --per-family N --seed S` generates parametrized instances of eight families (Python bug fixes and features, C and JavaScript
+fixes, SQL questions over a generated SQLite database, git merge conflicts, long access-log questions and shell text processing). Expected values are computed
+from a reference implementation at generation time, so an instance is a pure function of its family, index and seed, and `bench.py selftest --tasks-dir DIR`
+checks every verifier. `--tasks-dir` also selects them for `run`; `--parallel N` runs N clients at once (match the server's slots); `--thinking` takes a list
+(`default,low,medium,high`) that cycles over the tasks.
+
 ## Sandbox
 
 Every run, and every verifier, executes under bubblewrap: the system is read-only, `/home` and `/mnt` are empty, the environment is cleared, and the task's
