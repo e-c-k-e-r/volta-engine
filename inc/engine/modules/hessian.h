@@ -54,10 +54,11 @@ public:
 			std::snprintf( path, sizeof( path ), "%s/L%02d_s%d_r%d.f32", dir.c_str(), static_cast<int>( i / stride_ ), static_cast<int>( i % stride_ ), rank );
 			if ( FILE* f = std::fopen( path, "wb" ) ) {
 				const int32_t hdr[2] = { 0x48455353, hs.k };
-				std::fwrite( hdr, sizeof( int32_t ), 2, f );
-				std::fwrite( &hs.rows, sizeof( int64_t ), 1, f );
-				std::fwrite( host.data(), sizeof( float ), host.size(), f );
-				std::fclose( f );
+				bool ok = std::fwrite( hdr, sizeof( int32_t ), 2, f ) == 2;
+				ok = ok && std::fwrite( &hs.rows, sizeof( int64_t ), 1, f ) == 1;
+				ok = ok && std::fwrite( host.data(), sizeof( float ), host.size(), f ) == host.size();
+				ok = std::fclose( f ) == 0 && ok;
+				if ( !ok ) LOG_ERROR( "[RANK %d] hessian: writing %s failed (disk full?)\n", rank, path );
 			}
 			else LOG_ERROR( "[RANK %d] hessian: cannot write %s\n", rank, path );
 		}

@@ -26,6 +26,10 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     names = sorted({f for d, _ in srcs for f in os.listdir(d) if f.endswith(".f32")})
     for n in names:
+        srcp = [os.path.join(d, n) for d, _ in srcs if os.path.exists(os.path.join(d, n))]
+        outp = os.path.join(a.out, n)
+        if os.path.exists(outp) and os.path.getmtime(outp) > max(os.path.getmtime(p) for p in srcp):
+            continue    # merged before, sources unchanged
         acc, total_rows, k0 = None, 0, None
         parts = []
         for d, w in srcs:

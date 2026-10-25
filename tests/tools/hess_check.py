@@ -10,6 +10,10 @@ for d in sys.argv[1:]:
     for f in files:
         b = open(f, "rb").read()
         k = int(np.frombuffer(b[4:8], dtype=np.int32)[0])
+        if len(b) != 16 + 4 * k * k:       # a write that ran out of disk
+            bad += 1
+            print(f"BAD {f}: {len(b)} bytes, expected {16 + 4 * k * k}")
+            continue
         rows = int(np.frombuffer(b[8:16], dtype=np.int64)[0])
         H = np.frombuffer(b[16:], dtype=np.float32).reshape(k, k)
         dg = np.diag(H)
