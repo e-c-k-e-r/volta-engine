@@ -1,6 +1,7 @@
 // Teacher-forced perplexity of a text file on a served model: the same tokens run through chunked prefill with every row's logits read back,
 // so two builds (or two kernel paths) can be compared on a quality metric instead of greedy tokens. Optionally writes the per-token NLL.
 //   test_ppl [--glm | --flash] [--file PATH] [--tokens N] [--chunk C] [--nll OUT.bin]
+//   test_ppl --calibrate --file TEXT --seq 2048 --tokens N   cuts the text into independent rows of 2048 tokens (the slot restarts at each), as calibration rows are
 //   test_ppl --calibrate --prompts DIR [--tokens N] [--chunk C]   replays the rendered prompts a server wrote with dump_requests (req_N.prompt.txt, chat-template tokens
 //   intact): only the last request of each session is used, and the rows it shares with an earlier session (the system prompt and tool schemas) run without
 //   adding to the Hessians, so every distinct token counts once; --tokens stops after N counted rows
@@ -28,6 +29,7 @@ int main( int argc, char** argv ) {
 	bool glm = false, flash = false, calibrate = false;
 	int n_tokens = 6000, chunk = 512;
 	std::string file, nll_out, qbench, prompts_dir;
+	int seq = 0;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
 		else if ( !std::strcmp( argv[i], "--flash" ) ) flash = true;
@@ -38,6 +40,7 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--calibrate" ) ) calibrate = true;
 		else if ( !std::strcmp( argv[i], "--nll" ) && i + 1 < argc ) nll_out = argv[++i];
 		else if ( !std::strcmp( argv[i], "--prompts" ) && i + 1 < argc ) prompts_dir = argv[++i];
+		else if ( !std::strcmp( argv[i], "--seq" ) && i + 1 < argc ) seq = std::atoi( argv[++i] );
 	}
 	if ( !calibrate && chunk > pod::MAX_BATCH ) {
 		std::printf( "[test_ppl] chunk %d clamped to %d: the gathered logits hold a decode batch (--calibrate reads none and takes any chunk)\n", chunk, pod::MAX_BATCH );
@@ -240,10 +243,12 @@ int main( int argc, char** argv ) {
 	std::vector<float> nll;
 	nll.reserve( n_tokens );
 	double total = 0.0;
-	for ( int off = 0; off + 1 < n_tokens; off += chunk ) {
-		const int count = std::min( chunk, n_tokens - off );
-		mc.forward( ids.data() + off, pod::BatchRows::causal( count, off, 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );
-		if ( calibrate ) continue;   // forward only: ENGINE_HESSIAN_DIR collects its statistics in the layers
+	for ( int off = 0; off + 1 < n_tokens; ) {
+		const int pos = seq > 0 ? off % seq : off;   // --seq: independent rows, the slot restarts at each
+		if ( seq > 0 && pos == 0 ) mc.reset_slot( 0 );
+		const int count = std::min( { chunk, n_tokens - off, seq > 0 ? seq - pos : chunk } );
+		mc.forward( ids.data() + off, pod::BatchRows::causal( count, pos, 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );
+		if ( calibrate ) { off += count; continue; }   // forward only: ENGINE_HESSIAN_DIR collects its statistics in the layers
 		mc.read_logits( count, logits.data() );
 		for ( int r = 0; r < count && off + r + 1 < n_tokens; ++r ) {
 			const backend::half_t* l = logits.data() + static_cast<size_t>( r ) * V;
@@ -255,6 +260,7 @@ int main( int argc, char** argv ) {
 			nll.push_back( nl );
 			total += nl;
 		}
+		off += count;
 	}
 	if ( calibrate ) { mc.shutdown(); return 0; }
 	const double mean = total / nll.size();

@@ -49,3 +49,6 @@ thinking characters among thinking plus answer characters. Runs are not determin
 
 Started with `--set dump_requests=<dir>`, the server writes every request body and the rendered prompt; those are the token sequences the model saw, and
 they serve as calibration text for Hessian capture (`docs/QUANTIZATION.md`).
+
+`tests/tools/prose_corpus.py --src <dir of <title>/whisper.json> --out prose.txt` samples a contiguous stretch from the middle of several book transcripts for the
+non-agent share of a calibration set; `test_ppl --calibrate --file prose.txt --seq 2048 --tokens N` replays it as independent rows.
