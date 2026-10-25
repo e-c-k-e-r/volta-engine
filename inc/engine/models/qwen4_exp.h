@@ -126,6 +126,7 @@ public:
 	const engine::loader::VisionParams* vision_params() const override { return vision_.loaded() ? &vision_.params() : nullptr; }
 	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
 	bool has_mtp() const override { return mtp_on_; }
+	void set_hessian_capture( bool on ) override { hess_on_ = on; }
 	// DFlash2 drafter (see DraftHooks): a tap ring per slot, filled by forward_body once a drafter is attached (set_snapshot_taps)
 	const DraftHooks& draft_hooks() const override { return draft_hooks_; }
 	void draft_head_topk( int rows, backend::stream_t stream = nullptr ) override;
@@ -193,6 +194,7 @@ private:
 	void hessian_dump();
 	struct HessianSite { float* h = nullptr; int k = 0; int64_t rows = 0; };
 	std::vector<HessianSite> hess_;
+	bool hess_on_ = true;   // calibration: the rows of the forwards that follow count (set_hessian_capture)
 	int hess_layer_ = 0;
 	DraftHooks draft_hooks_;
 	DraftScratch draft_;               // drafter tap ring, head logits and candidate top-k scratch

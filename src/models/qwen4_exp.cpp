@@ -822,7 +822,7 @@ void Qwen4ExpPipeline::trace_rows( int tag, const void* dev, bool streams, int m
 // Debug (route_dump): record {layer, rows, first position, K}, the rows' expert ids (int32) and the router's input rows (FP16)
 void Qwen4ExpPipeline::dump_router( int m, backend::stream_t stream ) {
 	static const std::string& path = runtime::options().route_dump;
-	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH ) return;
+	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH || !hess_on_ ) return;      // a replay that switched capture off (the prefix shared with an earlier session) writes nothing
 	const int K = config_.top_k, H = config_.hidden_size;
 	std::vector<int> ids( static_cast<size_t>( m ) * K );
 	std::vector<backend::half_t> x( static_cast<size_t>( m ) * H );
@@ -1213,7 +1213,7 @@ bool Qwen4ExpPipeline::rebalance_experts( backend::stream_t stream ) {
 }
 
 void Qwen4ExpPipeline::hessian( int layer, int site, const void* x, int k, int m, backend::stream_t stream ) {
-	if ( hess_.empty() || m <= pod::MAX_BATCH || layer < 0 ) return;
+	if ( hess_.empty() || !hess_on_ || m <= pod::MAX_BATCH || layer < 0 ) return;
 	HessianSite& hs = hess_[static_cast<size_t>( layer ) * 5 + site];
 	if ( hs.h == nullptr ) return;
 	ENGINE_ASSERT( hs.k == k, "Qwen4ExpPipeline::hessian: site width changed" );
