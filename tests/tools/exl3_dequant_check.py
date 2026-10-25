@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Relative error of EXL3 tensors against the BF16 source, decoded in plain torch (stock or Volta tile order; integer rates; needs the exllamav3 venv).
 
-  exl3_dequant_check.py <exl3 dir> <bf16 dir> [--order stock|volta] [--only SUBSTRING] [--limit N] [--device cuda:0]
+  exl3_dequant_check.py <exl3 dir> <bf16 dir> [--order stock|volta] [--only SUBSTRING[,SUBSTRING]] [--limit N] [--device cuda:0] [--hess map.json]
+
+With --hess (a map as exl3_quantize.py takes) each line also gives the Hessian-weighted error tr(E^T H E) / tr(W^T H W) with H the input-side Hessian of the tensor (a list of
+files: block diagonal), the quantity the calibrated quantizer minimizes.
 """
-import argparse, glob, os, sys
+import argparse, glob, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch
 from safetensors import safe_open
@@ -14,7 +17,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("exl3"); ap.add_argument("src")
     ap.add_argument("--order", default="stock", choices=["stock", "volta"])
-    ap.add_argument("--only", default=""); ap.add_argument("--limit", type=int, default=0); ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--only", default=""); ap.add_argument("--hess", default=""); ap.add_argument("--limit", type=int, default=0); ap.add_argument("--device", default="cuda:0")
     a = ap.parse_args()
     qz = eq.load_upstream(a.order)
     ext = qz.ext
@@ -26,11 +29,14 @@ def main():
         with safe_open(fn, "pt") as f:
             for k in f.keys(): srcs[k] = fn
     n = 0
+    only = [x for x in a.only.split(",")]
+    hmap = json.load(open(a.hess)) if a.hess else {}
+    errs = []
     for fn in sorted(glob.glob(a.exl3 + "/*.safetensors")):
         with safe_open(fn, "pt") as f:
             keys = list(f.keys())
             for name in keys:
-                if not name.endswith(".trellis") or a.only not in name: continue
+                if not name.endswith(".trellis") or not any(o in name for o in only): continue
                 base = name[:-8]
                 if base + ".weight" not in srcs: continue
                 tr = f.get_tensor(name).to(dev)
@@ -54,9 +60,24 @@ def main():
                 with safe_open(srcs[base + ".weight"], "pt") as g:
                     ref = g.get_tensor(base + ".weight").to(dev).float().t()
                 rel = ((wq - ref).square().sum() / ref.square().sum()).sqrt().item()
-                print(f"{base:50s} K={K} relative error {rel:.5f}", flush=True)
+                line = f"{base:60s} K={K} relative error {rel:.5f}"
+                hp = hmap.get(base)
+                if hp:
+                    blocks = []
+                    for p in (hp if isinstance(hp, list) else [hp]):
+                        b = open(p, "rb").read()
+                        k = int(torch.frombuffer(bytearray(b[4:8]), dtype=torch.int32)[0])
+                        blocks.append(torch.frombuffer(bytearray(b[16:]), dtype=torch.float32).reshape(k, k).to(dev))
+                    Hm = blocks[0] if len(blocks) == 1 else torch.block_diag(*blocks)
+                    E = wq - ref
+                    hrel = float(((E * (Hm @ E)).sum() / (ref * (Hm @ ref)).sum()))
+                    line += f"   Hessian-weighted {hrel:.5f}"
+                    errs.append((rel, hrel))
+                print(line, flush=True)
                 n += 1
-                if a.limit and n >= a.limit: return
+                if a.limit and n >= a.limit: break
+    if errs:
+        print(f"MEAN over {len(errs)} tensors: relative error {sum(e[0] for e in errs) / len(errs):.5f}, Hessian-weighted {sum(e[1] for e in errs) / len(errs):.5f}")
 
 
 if __name__ == "__main__":

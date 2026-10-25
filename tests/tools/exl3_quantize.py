@@ -17,7 +17,7 @@ engine's format, or to a list of them (one per rank of a row-parallel input: blo
   exl3_quantize.py --src <bf16 dir> --template <exl3 dir> --out <dir> [--order volta|stock] [--hess map.json] [--device cuda:0]
                    [--only SUBSTRING] [--claim] [--limit N] [--seed N]
 """
-import argparse, glob, json, os, re, shutil, sys, time
+import argparse, collections, glob, json, os, re, shutil, sys, time
 
 UPSTREAM = os.environ.get("EXLLAMAV3_UPSTREAM_DIR", os.path.expanduser("~/Programs/exllamav3-upstream"))
 EXT_BUILD = os.path.expanduser("~/.cache/volta_engine_exl3_quant_ext")
@@ -151,6 +151,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--files", default="", help="only these template shards, comma separated; the others are linked to the template's (a partial requantization costs one shard of disk)")
+    ap.add_argument("--plan", action="store_true", help="only list what would be done with every tensor of the template (from the index files: no GPU, no tensor data)")
+    ap.add_argument("--passthrough", action="store_true", help="tensors the template does not quantize (norms, gates, embeddings ...) come from the original when it has them, not from the template (needed when the template is another model's checkpoint)")
     ap.add_argument("--redo", action="store_true", help="quantize shards again that already exist in --out")
     ap.add_argument("--claim", action="store_true", help="work on the next template shard nobody has claimed (one process per GPU)")
     a = ap.parse_args()
@@ -158,10 +160,10 @@ def main():
     import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
-    qz = load_upstream(a.order)
+    qz = None if a.plan else load_upstream(a.order)
     device = torch.device(a.device)
     hmap = json.load(open(a.hess)) if a.hess else {}
-    os.makedirs(a.out, exist_ok=True)
+    if not a.plan: os.makedirs(a.out, exist_ok=True)
 
     # source tensors by name (the index file when there is one: opening every shard of a network share only to list its keys is slow)
     src_idx = {}
@@ -182,12 +184,36 @@ def main():
             handles[fn] = safe_open(os.path.join(a.src, fn), "pt")
         return handles[fn].get_tensor(name)
 
+    fused_cache = collections.OrderedDict()      # a few fused expert tensors of the original (BF16 [experts, ...]), the layer being quantized
+
+    def fused_ref(base):
+        """('<prefix>.experts', expert, 'gate_proj' | 'up_proj' | 'down_proj') for a per-expert name whose original stores the experts fused (gate_up_proj [E, 2I, H], down_proj [E, H, I]), else None"""
+        m = re.match(r"^(.*\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)$", base)
+        if m and (m.group(1) + ".gate_up_proj") in src_idx and (m.group(1) + ".down_proj") in src_idx:
+            return m.group(1), int(m.group(2)), m.group(3)
+        return None
+
+    def fused_tensor(name):
+        if name not in fused_cache:
+            fused_cache[name] = src_get(name)
+            while len(fused_cache) > 4: fused_cache.popitem(last=False)
+        fused_cache.move_to_end(name)
+        return fused_cache[name]
+
     def has_src(base):
-        return base + ".weight" in src_idx or base + ".weight_packed" in src_idx
+        return base + ".weight" in src_idx or base + ".weight_packed" in src_idx or fused_ref(base) is not None
 
     def src_weight(base, dev):
         """<base> as fp32 [out, in]: BF16/FP16 as it is; FP8 (E4M3) with its block scales (<base>.weight_scale_inv, one per 128 x 128 block); NVFP4 of either layout
         (compressed-tensors: weight_packed / weight_scale / weight_global_scale, a divisor; modelopt: uint8 weight / weight_scale / weight_scale_2, a multiplier)"""
+        fr = fused_ref(base)
+        if fr:
+            prefix, e, proj = fr
+            if proj == "down_proj":
+                return fused_tensor(prefix + ".down_proj")[e].to(dev).float()              # [hidden, intermediate]: [out, in]
+            gu = fused_tensor(prefix + ".gate_up_proj")[e]                                 # [2 * intermediate, hidden]: gate rows first, then up
+            half = gu.shape[0] // 2
+            return (gu[:half] if proj == "gate_proj" else gu[half:]).to(dev).float()
         if base + ".weight_packed" in src_idx:
             return nvfp4_dequant(src_get(base + ".weight_packed"), src_get(base + ".weight_scale"), 1.0 / float(src_get(base + ".weight_global_scale").float().item()), dev)
         w = src_get(base + ".weight").to(dev)
@@ -207,6 +233,28 @@ def main():
         if fn.endswith(".safetensors"):
             with safe_open(os.path.join(a.template, fn), "pt") as f:
                 all_keys.update(f.keys())
+
+
+    if a.plan:
+        skips = [x for x in a.skip.split(",") if x]
+        quant_bases = {k[:-len(".trellis")] for k in all_keys if k.endswith(".trellis")}
+        counts, missing, kept = collections.Counter(), [], []
+        for k in sorted(all_keys):
+            stem = k.rsplit(".", 1)[0]
+            if k.rsplit(".", 1)[-1] in ("trellis", "suh", "svh", "mul1", "mcg") and stem in quant_bases:
+                if k.endswith(".trellis"):
+                    if "ngram_embedding" in k: counts["n-gram table (kept from the template)"] += 1
+                    elif any(x in k for x in skips): counts["quantized tensor kept from the template (--skip)"] += 1
+                    elif has_src(stem): counts["quantize from the original"] += 1
+                    else: counts["quantize but the original has no such tensor"] += 1; missing.append(stem)
+                continue
+            if any(x in k for x in skips) or "ngram_embedding" in k: counts["kept from the template"] += 1; continue
+            if a.passthrough and k in src_idx: counts["copied from the original"] += 1
+            else: counts["kept from the template"] += 1; kept.append(k)
+        for k, v in counts.most_common(): print(f"{v:7d}  {k}")
+        for m in missing[:20]: print("   no source for", m)
+        print("kept from the template (first 25):", kept[:25])
+        return
 
     for fn in sorted(os.listdir(a.template)):
         p = os.path.join(a.template, fn)
@@ -282,6 +330,10 @@ def main():
                     print(f"[{time.time() - t0:7.1f}s] {base} K={K} {kk}x{nn} proxy error {proxy:.5f}{'' if hp else ' (no Hessian)'}", flush=True)
                     del w, wq
                     continue
+                if a.passthrough and name in src_idx and not any(x and x in name for x in a.skip.split(",")):
+                    st = src_get(name)
+                    if tuple(st.shape) == tuple(t.shape): t = st.to(t.dtype)
+                    else: print(f"{name}: shape {tuple(st.shape)} in the original, {tuple(t.shape)} in the template: kept from the template", flush=True)
                 tensors[name] = t.contiguous()
         tensors.update(new)         # the template's suh / svh / codebook markers of a requantized tensor give way to the new ones
         save_file(tensors, final + ".tmp", metadata=meta)
