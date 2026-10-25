@@ -97,6 +97,7 @@ public:
 	void warm_graphs( int max_m, int slot = 0 );
 
 	void reset_slot( int slot );
+	void set_hessian_capture( bool on ) { for ( int d = 0; d < tp_; ++d ) models_[d]->set_hessian_capture( on ); }
 	// Shared token pool (model option kv_pool; always roomy without it): reserve room for positions [0, tokens) of a slot on every rank, or
 	// take nothing and return false; release_tokens hands the slot's pages back. Host bookkeeping only.
 	bool reserve_tokens( int slot, int tokens );

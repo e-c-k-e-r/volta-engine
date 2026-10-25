@@ -3,7 +3,7 @@
 
   gen_tasks.py --out DIR [--per-family N] [--seed S] [--families a,b] [--tier quick|standard|hard]
 
-Families: py-bugfix, py-feature, c-fix, js-fix, sql-query, git-conflict, log-analysis, sh-text. Expected values in tests and verifiers are
+Families: py-bugfix, py-feature, c-fix, js-fix, sql-query, git-conflict, log-analysis, sh-text, prose (writing tasks over a local document; loose verifiers). Expected values in tests and verifiers are
 computed from a reference implementation at generation time, so an instance is a pure function of (family, index, seed).
 """
 import argparse, json, os, random, shutil, sqlite3, stat, subprocess, textwrap
@@ -319,8 +319,59 @@ def sh_text(out, i, rng, tier):
          tags=("shell", "text"))
 
 
+# ---------------------------------------------------------------- prose
+STOP = set("the a an and or of to in is are was were be been it its this that these those for on with as by at from not but if then so we you they he she i do does did can could should would will may might must have has had which who what when where how than into out up down over under about more most some any each other such only also just there their them our your his her my me us no yes all one two".split())
+_DOCS = None
+
+
+def prose_sources():
+    """candidate documents: markdown of the user's own projects and man pages, as (label, text) sorted by label"""
+    global _DOCS
+    if _DOCS is None:
+        import glob, gzip, re
+        home = os.path.expanduser("~/Programs")
+        bad = ("node_modules", ".venv", "site-packages", "third_party", "vendor", "/build", "/models", "/.git/", "/dep/", "/ext/", "LICENSE")
+        docs = []
+        for p in sorted(glob.glob(home + "/*/docs/**/*.md", recursive=True) + glob.glob(home + "/*/*.md")):
+            if any(b in p for b in bad): continue
+            t = open(p, errors="ignore").read()
+            if 600 <= len(t.split()) <= 5000: docs.append((p.replace(home + "/", ""), t))
+        for p in sorted(glob.glob("/usr/share/man/man1/*.1.gz"))[::7]:
+            try:
+                raw = subprocess.run(["man", "-l", p], capture_output=True, text=True, env={**os.environ, "MANWIDTH": "100"}).stdout
+            except OSError:
+                continue
+            t = re.sub(r".\x08", "", raw)
+            if 600 <= len(t.split()) <= 4000: docs.append(("man/" + os.path.basename(p)[:-5], t))
+        _DOCS = docs
+    return _DOCS
+
+
+PROSE_KINDS = [
+    ("summarize", "Read input.md and write a summary of it as 5 to 8 bullet points to summary.md.", "summary.md", 40, 400),
+    ("plain", "Read input.md and rewrite its first two sections in plain language for a reader with no background, in plain.md.", "plain.md", 80, 700),
+    ("faq", "Read input.md and write five questions a new reader might ask about it, each followed by an answer taken from the text, to faq.md.", "faq.md", 120, 900),
+    ("outline", "Read input.md and write a hierarchical outline of it (headings and sub-points) to outline.md.", "outline.md", 60, 600),
+    ("review", "Read input.md as an editor: list the five most important unclear, redundant or contradictory passages, quote each, and suggest a rewrite, in review.md.", "review.md", 150, 1000),
+]
+
+
+def prose(out, i, rng, tier):
+    import re, collections
+    docs = prose_sources()
+    label, text = docs[(i * 7 + rng.randrange(len(docs))) % len(docs)]
+    kind, prompt, outfile, lo, hi = PROSE_KINDS[i % len(PROSE_KINDS)]
+    words = [w for w in re.findall(r"[a-z][a-z-]{4,}", text.lower()) if w not in STOP]
+    top = [w for w, _ in collections.Counter(words).most_common(12)]
+    emit(out, f"prose-{i:03d}", tier, prompt, {"input.md": text},
+         f"[ -s {outfile} ] || exit 1\nn=$(wc -w < {outfile}); [ $n -ge {lo} ] && [ $n -le {hi} ] || exit 1\n"
+         f"hits=0; for w in {' '.join(top)}; do grep -qi -- \"$w\" {outfile} && hits=$((hits+1)); done; [ $hits -ge 3 ] || exit 1\n",
+         f"python3 - <<'EOF'\nwords = {top!r}\nopen('{outfile}', 'w').write(' '.join((words * 40)[:{max(lo, 60) + 20}]) + '\\n')\nEOF\n",
+         tags=("prose", kind, label))
+
+
 FAMILIES = {"py-bugfix": py_bugfix, "py-feature": py_feature, "c-fix": c_fix, "js-fix": js_fix, "sql-query": sql_query, "git-conflict": git_conflict,
-            "log-analysis": log_analysis, "sh-text": sh_text}
+            "log-analysis": log_analysis, "sh-text": sh_text, "prose": prose}
 
 
 def main():

@@ -1,6 +1,9 @@
 // Teacher-forced perplexity of a text file on a served model: the same tokens run through chunked prefill with every row's logits read back,
 // so two builds (or two kernel paths) can be compared on a quality metric instead of greedy tokens. Optionally writes the per-token NLL.
 //   test_ppl [--glm | --flash] [--file PATH] [--tokens N] [--chunk C] [--nll OUT.bin]
+//   test_ppl --calibrate --prompts DIR [--tokens N] [--chunk C]   replays the rendered prompts a server wrote with dump_requests (req_N.prompt.txt, chat-template tokens
+//   intact): only the last request of each session is used, and the rows it shares with an earlier session (the system prompt and tool schemas) run without
+//   adding to the Hessians, so every distinct token counts once; --tokens stops after N counted rows
 //   test_ppl --flash --qbench qbench_prompts.md [--chunk C]   scores only the response tokens of each traced row (input as context), the
 //   quantity the checkpoint's model card reports as PPL
 // The default text is the docs/ folder concatenated; ids never include special tokens.
@@ -24,7 +27,7 @@ int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	bool glm = false, flash = false, calibrate = false;
 	int n_tokens = 6000, chunk = 512;
-	std::string file, nll_out, qbench;
+	std::string file, nll_out, qbench, prompts_dir;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
 		else if ( !std::strcmp( argv[i], "--flash" ) ) flash = true;
@@ -34,6 +37,7 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--qbench" ) && i + 1 < argc ) qbench = argv[++i];
 		else if ( !std::strcmp( argv[i], "--calibrate" ) ) calibrate = true;
 		else if ( !std::strcmp( argv[i], "--nll" ) && i + 1 < argc ) nll_out = argv[++i];
+		else if ( !std::strcmp( argv[i], "--prompts" ) && i + 1 < argc ) prompts_dir = argv[++i];
 	}
 	if ( !calibrate && chunk > pod::MAX_BATCH ) {
 		std::printf( "[test_ppl] chunk %d clamped to %d: the gathered logits hold a decode batch (--calibrate reads none and takes any chunk)\n", chunk, pod::MAX_BATCH );
@@ -42,6 +46,71 @@ int main( int argc, char** argv ) {
 	const char* model_dir = glm ? test::GLM_DIR : ( flash ? test::FLASH_DIR : test::QWEN_DIR );
 	engine::loader::Tokenizer tok;
 	ENGINE_ASSERT( tok.load( model_dir ), "tokenizer load failed" );
+
+	if ( !prompts_dir.empty() ) {
+		ENGINE_ASSERT( calibrate, "--prompts replays sessions for calibration: add --calibrate" );
+		std::vector<std::pair<std::string, std::string>> all;   // (name, text)
+		for ( const auto& e : std::filesystem::directory_iterator( prompts_dir ) ) {
+			const std::string name = e.path().filename().string();
+			if ( name.size() < 11 || name.compare( name.size() - 11, 11, ".prompt.txt" ) != 0 ) continue;
+			std::ifstream f( e.path() );
+			std::stringstream ss;
+			ss << f.rdbuf();
+			all.emplace_back( name, ss.str() );
+		}
+		std::sort( all.begin(), all.end(), []( const auto& a, const auto& b ) { return a.second.size() > b.second.size(); } );
+		std::vector<const std::string*> leaves;   // session tips: prompts that are not the start of a longer one
+		for ( const auto& a : all ) {
+			bool covered = false;
+			for ( const std::string* l : leaves ) covered = covered || ( l->size() >= a.second.size() && l->compare( 0, a.second.size(), a.second ) == 0 );
+			if ( !covered ) leaves.push_back( &a.second );
+		}
+		std::sort( leaves.begin(), leaves.end(), []( const std::string* a, const std::string* b ) { return *a < *b; } );
+		std::printf( "[*] %zu prompt dumps, %zu sessions\n", all.size(), leaves.size() );
+		ModelCluster mc;
+		ClusterConfig cfg;
+		cfg.model_type = glm ? "glm5_next" : ( flash ? "qwen4_exp" : "qwen3_5" );
+		cfg.model_dir = model_dir;
+		ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
+		std::vector<std::vector<int>> done;
+		long counted = 0, replayed = 0;
+		for ( const std::string* text : leaves ) {
+			if ( counted >= n_tokens ) break;
+			std::vector<int> ids;
+			for ( size_t at = 0; at < text->size(); ) {
+				size_t end = std::min( text->size(), at + 4096 );
+				if ( end < text->size() ) {
+					const size_t nl = text->find( '\n', end );
+					end = nl == std::string::npos ? text->size() : nl + 1;
+				}
+				const std::vector<int> part = tok.encode( text->substr( at, end - at ), false );
+				ids.insert( ids.end(), part.begin(), part.end() );
+				at = end;
+			}
+			size_t shared = 0;   // longest common prefix with a session already replayed
+			for ( const auto& d : done ) {
+				size_t k = 0;
+				while ( k < d.size() && k < ids.size() && d[k] == ids[k] ) ++k;
+				shared = std::max( shared, k );
+			}
+			mc.reset_slot( 0 );
+			for ( size_t off = 0; off < ids.size(); ) {
+				const bool counting = off >= shared;
+				size_t end = std::min( ids.size(), off + static_cast<size_t>( chunk ) );
+				if ( !counting && end > shared ) end = shared;
+				const int count = static_cast<int>( end - off );
+				mc.set_hessian_capture( counting );
+				mc.forward( ids.data() + off, pod::BatchRows::causal( count, static_cast<int>( off ), 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );
+				if ( counting ) counted += count;
+				replayed += count;
+				off = end;
+			}
+			done.push_back( std::move( ids ) );
+			std::printf( "[*] session %zu: %zu tokens, %zu shared; counted %ld, replayed %ld\n", done.size(), done.back().size(), shared, counted, replayed );
+		}
+		mc.shutdown();
+		return 0;
+	}
 
 	if ( !qbench.empty() ) {
 		// rows: "### Input (N tokens)" fenced block, then "### Response (N tokens)" up to the next "## Row"

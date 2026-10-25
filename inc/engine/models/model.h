@@ -185,6 +185,8 @@ public:
 	// returns the slot's pages. Models with a cache per slot always have room.
 	virtual bool reserve_tokens( int slot_id, int tokens ) { (void) slot_id; (void) tokens; return true; }
 	virtual void release_tokens( int slot_id ) { (void) slot_id; }
+	// Calibration (hessian_dir): the forwards that follow add their rows to the Hessians (on) or not (off); no-op for models without capture
+	virtual void set_hessian_capture( bool on ) { (void) on; }
 	virtual int pool_tokens() const { return 0; }        // 0 = no shared pool
 	virtual int free_pool_tokens() const { return 0; }
 	// Per-row state slots (replace checkpoint + replay). While on, a forward also publishes the recurrent

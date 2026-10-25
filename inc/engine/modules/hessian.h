@@ -25,6 +25,7 @@ struct Hessian {
 class HessianSet {
 public:
 	bool on() const { return !sites_.empty(); }
+	void enable( bool on ) { enabled_ = on; }
 	void init( int layers, int stride ) { stride_ = stride; sites_.assign( static_cast<size_t>( layers ) * stride, Site{} ); }
 	void add( int layer, int site, int k, pod::MemoryArena& arena, backend::stream_t stream ) {
 		Site& hs = sites_[static_cast<size_t>( layer ) * stride_ + site];
@@ -33,7 +34,7 @@ public:
 		backend::memset_async( hs.h, 0, static_cast<size_t>( k ) * k * sizeof( float ), stream );
 	}
 	void accumulate( int layer, int site, const void* x, int k, int m, backend::stream_t stream ) {
-		if ( sites_.empty() || m <= pod::MAX_BATCH || layer < 0 ) return;
+		if ( sites_.empty() || !enabled_ || m <= pod::MAX_BATCH || layer < 0 ) return;
 		Site& hs = sites_[static_cast<size_t>( layer ) * stride_ + site];
 		if ( hs.h == nullptr ) return;
 		ENGINE_ASSERT( hs.k == k, "HessianSet::accumulate: site width changed" );
@@ -66,6 +67,7 @@ private:
 	struct Site { float* h = nullptr; int k = 0; int64_t rows = 0; };
 	std::vector<Site> sites_;
 	int stride_ = 1;
+	bool enabled_ = true;
 };
 
 } // namespace engine::modules
