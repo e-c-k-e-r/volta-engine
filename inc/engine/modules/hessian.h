@@ -26,6 +26,7 @@ class HessianSet {
 public:
 	bool on() const { return !sites_.empty(); }
 	void enable( bool on ) { enabled_ = on; }
+	void set_min_rows( int rows ) { min_rows_ = rows; }   // rows below this are decode batches and not counted (default: more than one decode batch); the drafter's blocks are 8 rows
 	void init( int layers, int stride ) { stride_ = stride; sites_.assign( static_cast<size_t>( layers ) * stride, Site{} ); }
 	void add( int layer, int site, int k, pod::MemoryArena& arena, backend::stream_t stream ) {
 		Site& hs = sites_[static_cast<size_t>( layer ) * stride_ + site];
@@ -34,7 +35,7 @@ public:
 		backend::memset_async( hs.h, 0, static_cast<size_t>( k ) * k * sizeof( float ), stream );
 	}
 	void accumulate( int layer, int site, const void* x, int k, int m, backend::stream_t stream ) {
-		if ( sites_.empty() || !enabled_ || m <= pod::MAX_BATCH || layer < 0 ) return;
+		if ( sites_.empty() || !enabled_ || m < min_rows_ || layer < 0 ) return;
 		Site& hs = sites_[static_cast<size_t>( layer ) * stride_ + site];
 		if ( hs.h == nullptr ) return;
 		ENGINE_ASSERT( hs.k == k, "HessianSet::accumulate: site width changed" );
@@ -69,6 +70,7 @@ private:
 	std::vector<Site> sites_;
 	int stride_ = 1;
 	bool enabled_ = true;
+	int min_rows_ = pod::MAX_BATCH + 1;
 };
 
 } // namespace engine::modules

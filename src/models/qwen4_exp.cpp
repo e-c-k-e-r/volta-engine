@@ -385,7 +385,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	char nm[256];
 	if ( !runtime::options().hessian_dir.empty() ) {
 		// Calibration accumulators (sites per layer: see hessian()); the replicated sites live on rank 0, the o_proj / out_proj inputs on every rank
-		hess_.assign( static_cast<size_t>( config_.num_layers ) * 5, HessianSite{} );
+		hess_.assign( static_cast<size_t>( config_.num_layers + 2 ) * 5, HessianSite{} );   // + the MTP block (layer num_layers: the block's sites) and its two input projections (num_layers + 1: site 0 = fc_embedding input, 1 = fc_hidden input)
 		auto site = [&]( int layer, int idx, int k ) {
 			HessianSite& hs = hess_[static_cast<size_t>( layer ) * 5 + idx];
 			hs.k = k;
@@ -397,6 +397,11 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 			site( L, 2, config_.is_full_attention( L ) ? q_heads_ * config_.head_dim : lin_v_heads_ * 128 );
 		}
 		if ( rank_ == 0 ) site( 0, 4, config_.hidden_size );
+		if ( mtp_on_ ) {
+			const int Lm = config_.num_layers;
+			if ( rank_ == 0 ) { site( Lm, 0, H ); site( Lm, 1, H ); site( Lm, 3, config_.shared_intermediate ); site( Lm + 1, 0, H ); site( Lm + 1, 1, H ); }
+			site( Lm, 2, q_heads_ * config_.head_dim );
+		}
 		backend::stream_sync( stream );
 	}
 
@@ -822,7 +827,7 @@ void Qwen4ExpPipeline::trace_rows( int tag, const void* dev, bool streams, int m
 // Debug (route_dump): record {layer, rows, first position, K}, the rows' expert ids (int32) and the router's input rows (FP16)
 void Qwen4ExpPipeline::dump_router( int m, backend::stream_t stream ) {
 	static const std::string& path = runtime::options().route_dump;
-	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH || !hess_on_ ) return;      // a replay that switched capture off (the prefix shared with an earlier session) writes nothing
+	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH || !hess_on_ || hess_layer_ < runtime::options().route_dump_from ) return;      // a replay that switched capture off (the prefix shared with an earlier session) writes nothing
 	const int K = config_.top_k, H = config_.hidden_size;
 	std::vector<int> ids( static_cast<size_t>( m ) * K );
 	std::vector<backend::half_t> x( static_cast<size_t>( m ) * H );
@@ -1275,8 +1280,8 @@ void Qwen4ExpPipeline::site_reduce( int m, const backend::half_t* next_norm, bac
 void Qwen4ExpPipeline::attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L, int m, backend::stream_t stream, const backend::half_t* next_norm ) {
 	const int H = config_.hidden_size, hc = config_.hc_mult;
 	gr_mix( lw.attn_hc, true, m, stream );
-	hess_layer_ = L;
-	hessian( L, 0, mixed_.data, H, m, stream );
+	hess_layer_ = L >= 0 ? L : config_.num_layers;   // the MTP block (L < 0) accumulates under the layer index after the last one
+	hessian( hess_layer_, 0, mixed_.data, H, m, stream );
 	if ( L >= 0 ) trace_rows( 100 + L, mixed_.data, false, m, stream );
 	if ( lw.is_full_attention ) attention_forward( lw, idx, m, stream );
 	else gdn_forward( lw, idx, m, stream );
@@ -1289,8 +1294,8 @@ void Qwen4ExpPipeline::attn_site( const Qwen4ExpLayerWeights& lw, int idx, int L
 void Qwen4ExpPipeline::mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, backend::stream_t stream, const backend::half_t* next_norm ) {
 	const int H = config_.hidden_size, hc = config_.hc_mult;
 	gr_mix( lw.mlp_hc, true, m, stream );
-	hess_layer_ = L;
-	hessian( L, 1, mixed_.data, H, m, stream );
+	hess_layer_ = L >= 0 ? L : config_.num_layers;
+	hessian( hess_layer_, 1, mixed_.data, H, m, stream );
 	if ( L >= 0 ) trace_rows( 400 + L, mixed_.data, false, m, stream );
 	const bool defer_shared = fuses_site( m, next_norm );
 	moe_forward( lw, m, stream, defer_shared );
@@ -1435,6 +1440,7 @@ void Qwen4ExpPipeline::mtp_step_impl( const pod::BatchRows& rows, const int* tok
 	pod::TensorView e2 = pod::make_tensor_2d( mtp_e2_.data, pod::DType::FP16, m, H );
 	engine::modules::Embedding::forward( embed_table_, d_token_ids_, m, emb, stream );
 	engine::modules::RMSNorm::forward( emb, mtp_pre_norm_embedding_, xe, config_.rms_norm_eps, 1.0f, stream );
+	hessian( config_.num_layers + 1, 0, xe.data, H, m, stream );
 	engine::modules::Linear::forward( xe, mtp_fc_embedding_, e2, stream );
 
 	// 2. hidden branch: per-stream norm, fc_hidden on every stream
@@ -1455,6 +1461,7 @@ void Qwen4ExpPipeline::mtp_step_impl( const pod::BatchRows& rows, const int* tok
 		engine::modules::GatedResidual::stream_norm( src + static_cast<size_t>( r0 ) * hc * H, mtp_pre_norm_hidden_.ptr<const backend::half_t>(),
 			mtp_hn_.ptr<backend::half_t>(), n, H, hc, config_.rms_norm_eps, stream );
 		pod::TensorView hn = pod::make_tensor_2d( mtp_hn_.data, pod::DType::FP16, n * hc, H );
+		hessian( config_.num_layers + 1, 1, hn.data, H, n * hc, stream );
 		pod::TensorView h2 = pod::make_tensor_2d( mtp_h2_.ptr<backend::half_t>() + static_cast<size_t>( r0 ) * hc * H, pod::DType::FP16, n * hc, H );
 		engine::modules::Linear::forward( hn, mtp_fc_hidden_, h2, stream );
 	}

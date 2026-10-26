@@ -49,6 +49,10 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--skip" ) && i + 1 < argc ) skip_override = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--sessions" ) && i + 1 < argc ) max_sessions = std::atoi( argv[++i] );
 	}
+	// --calibrate with ENGINE_CALIB_MTP set (Flash-Next): the MTP head runs after every forward on the same rows (hidden stack of position p with the token
+	// of p + 1), so ENGINE_HESSIAN_DIR also collects the head's sites (layers 48 and 49 of the file names); the head keeps its own KV like in serving
+	const bool mtp_calib = calibrate && flash && std::getenv( "ENGINE_CALIB_MTP" ) != nullptr;
+	if ( mtp_calib ) setenv( "ENGINE_SPECULATOR", "mtp", 1 );
 	if ( !calibrate && prompts_dir.empty() && chunk > pod::MAX_BATCH ) {
 		std::printf( "[test_ppl] chunk %d clamped to %d: the gathered logits hold a decode batch (--calibrate reads none and takes any chunk)\n", chunk, pod::MAX_BATCH );
 		chunk = pod::MAX_BATCH;
@@ -86,6 +90,7 @@ int main( int argc, char** argv ) {
 		ClusterConfig cfg;
 		cfg.model_type = glm ? "glm5_next" : ( flash ? "qwen4_exp" : "qwen3_5" );
 		cfg.model_dir = model_dir;
+		cfg.speculate = mtp_calib;
 		ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 		std::vector<std::vector<int>> done;
 		long counted = 0, replayed = 0;
@@ -193,6 +198,7 @@ int main( int argc, char** argv ) {
 				const int count = static_cast<int>( end - off );
 				mc.set_hessian_capture( counting );
 				mc.forward( ids.data() + off, pod::BatchRows::causal( count, static_cast<int>( off ), 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );
+				if ( mtp_calib && off + 1 < ids.size() ) mc.mtp_step( 0, static_cast<int>( off ), static_cast<int>( std::min<size_t>( count, ids.size() - off - 1 ) ), ids.data() + off + 1, 0, 0, false );   // the prefix rows too: the head's KV stays continuous
 				if ( counting ) counted += count;
 				replayed += count;
 				off = end;
@@ -325,6 +331,7 @@ int main( int argc, char** argv ) {
 	ClusterConfig cfg;
 	cfg.model_type = glm ? "glm5_next" : ( flash ? "qwen4_exp" : "qwen3_5" );
 	cfg.model_dir = model_dir;
+	cfg.speculate = mtp_calib;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	const int V = mc.metadata().vocab_size;
 	mc.reset_slot( 0 );
@@ -337,6 +344,10 @@ int main( int argc, char** argv ) {
 		if ( seq > 0 && pos == 0 ) mc.reset_slot( 0 );
 		const int count = std::min( { chunk, n_tokens - off, seq > 0 ? seq - pos : chunk } );
 		mc.forward( ids.data() + off, pod::BatchRows::causal( count, pos, 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );
+		if ( mtp_calib ) {
+			const int c = std::min( { count, n_tokens - off - 1, seq > 0 ? seq - pos - 1 : count } );   // a row's last position has no next token inside the row
+			if ( c >= 1 ) mc.mtp_step( 0, pos, c, ids.data() + off + 1, 0, 0, false );
+		}
 		if ( calibrate ) { off += count; continue; }   // forward only: ENGINE_HESSIAN_DIR collects its statistics in the layers
 		mc.read_logits( count, logits.data() );
 		for ( int r = 0; r < count && off + r + 1 < n_tokens; ++r ) {

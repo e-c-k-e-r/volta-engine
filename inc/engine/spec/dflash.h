@@ -7,6 +7,7 @@
 #include "engine/core/arena.h"
 #include "engine/loader/safetensors.h"
 #include "engine/modules/linear.h"
+#include "engine/modules/hessian.h"
 #include "engine/backend/types.h"
 
 namespace pod {
@@ -416,6 +417,7 @@ private:
 	pod::DFlashConfig config_;
 	int device_;
 	pod::MemoryArena* arena_;
+	engine::modules::HessianSet hess_;   // option dflash_hessian_dir: input Hessians of the projections (layers 0..L-1: sites 0 q, 1 k / v, 2 o per rank, 3 gate / up, 4 down per rank; layer L site 0 = fc), written by destroy()
 	bool initialized_;
 	bool weights_loaded_;
 	int rank_ = 0;

@@ -5,6 +5,7 @@ all rows (intermediate x intermediate), written in the engine's Hessian format a
 is read per layer.
 
   moe_down_hessians.py --route FILE --src <original dir> --hidden 2560 --experts 512 --out DIR [--layers 0-47] [--device cuda:0] [--rows-limit N]
+  the MTP head's experts (route layer 48, tensors mtp.layers.0): --layers 48-48 --prefix mtp.layers --src-offset 48
 """
 import argparse, json, os, struct, sys
 import numpy as np
@@ -25,6 +26,7 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--rows-limit", type=int, default=0, help="use at most this many rows per layer")
     ap.add_argument("--prefix", default="model.language_model.layers")
+    ap.add_argument("--src-offset", type=int, default=0, help="the original's layer index is the route layer minus this")
     a = ap.parse_args()
     dev = torch.device(a.device)
     rows = {}
@@ -38,7 +40,7 @@ def main():
         x = torch.cat(rows.pop(L))
         if a.rows_limit: x = x[:a.rows_limit]
         n = x.shape[0]
-        name = f"{a.prefix}.{L}.mlp.experts.gate_up_proj"
+        name = f"{a.prefix}.{L - a.src_offset}.mlp.experts.gate_up_proj"
         with safe_open(os.path.join(a.src, idx[name]), "pt") as g:
             gu = g.get_tensor(name)                                   # [E, 2I, H] bf16 (kept on the host)
         I = gu.shape[1] // 2

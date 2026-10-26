@@ -64,6 +64,7 @@ void DFlashSpeculator::forward_backbone(
 				const_cast<half*>( tapped_states ) + tap_off,
 				pod::DType::FP16, cnt, 5 * H );
 			pod::TensorView fc_out = pod::make_tensor_2d( bb_ctx_fc_.ptr<half>(), pod::DType::FP16, cnt, H );
+			hess_.accumulate( L, 0, taps_in.data, 5 * H, cnt, stream );
 			if ( tp_size_ == 1 ) {
 				engine::modules::Linear::forward( taps_in, fc_, fc_out, stream );
 			}
@@ -92,6 +93,7 @@ void DFlashSpeculator::forward_backbone(
 				pod::TensorView kv_stage = pod::make_tensor_2d(
 					bb_kv_stage_.ptr<half>(), pod::DType::FP16, cnt, kvh_local * hd );
 				const int slot0 = ( kv_len_ + base ) % ctx_ring;
+				hess_.accumulate( l, 1, ctx_n.data, H, cnt, stream );
 				engine::modules::Linear::forward( ctx_n, ly.k_proj, kv_stage, stream );
 				dflash_qk_norm_rope( kv_stage.ptr<half>(),
 					( ly.k_norm.data != nullptr ) ? ly.k_norm.ptr<const half>() : nullptr,
@@ -161,6 +163,8 @@ void DFlashSpeculator::forward_backbone(
 		{
 			pod::TensorView q_out = pod::make_tensor_2d(
 				bb_q_.ptr<half>(), pod::DType::FP16, rows, qh_local * hd );
+			hess_.accumulate( l, 0, stage.data, H, rows, stream );
+			hess_.accumulate( l, 1, stage.data, H, rows, stream );
 			engine::modules::Linear::forward( stage, ly.q_proj, q_out, stream );
 			dflash_qk_norm_rope( bb_q_.ptr<half>(),
 				( ly.q_norm.data != nullptr ) ? ly.q_norm.ptr<const half>() : nullptr,
@@ -192,6 +196,7 @@ void DFlashSpeculator::forward_backbone(
 			// view. The 3D head view reports shape[1] == q_heads, which the Trellis path ignored.
 			const pod::TensorView attn_flat = pod::make_tensor_2d(
 				bb_attn_out_.ptr<half>(), pod::DType::FP16, rows, qh_local * hd );
+			hess_.accumulate( l, 2, attn_flat.data, qh_local * hd, rows, stream );
 			engine::modules::Linear::forward( attn_flat, ly.o_proj, bb_o_proj_, stream );
 			if ( tp_size_ > 1 ) {
 				pod::TensorView o_full = pod::make_tensor_2d( bb_o_proj_.ptr<half>(), pod::DType::FP16, rows, H );
@@ -248,9 +253,11 @@ void DFlashSpeculator::forward_backbone(
 		// (g) SwiGLU MLP: gate/up are column-parallel, down is row-parallel.
 		{
 			pod::TensorView s = pod::make_tensor_2d( bb_stage_h_.ptr<half>(), pod::DType::FP16, rows, H );
+			hess_.accumulate( l, 3, s.data, H, rows, stream );
 			engine::modules::Linear::forward( s, ly.gate_proj, bb_ffn_gate_, stream );
 			engine::modules::Linear::forward( s, ly.up_proj, bb_ffn_up_, stream );
 			engine::modules::SwiGLU::forward( bb_ffn_gate_, bb_ffn_up_, bb_ffn_mlp_, stream );
+			hess_.accumulate( l, 4, bb_ffn_mlp_.data, config_.intermediate_size / tp_size_, rows, stream );
 			engine::modules::Linear::forward( bb_ffn_mlp_, ly.down_proj, bb_hidden_, stream );
 			if ( tp_size_ > 1 ) {
 				pod::TensorView down_full = pod::make_tensor_2d( bb_hidden_.ptr<half>(), pod::DType::FP16, rows, H );

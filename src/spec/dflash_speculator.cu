@@ -422,6 +422,17 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 		ly.mlp_conv_proj = load_dense_proj( repo, key, *arena_, stream );
 	}
 
+	if ( !engine::runtime::options().dflash_hessian_dir.empty() ) {
+		const int hd = config_.head_dim;
+		hess_.init( L + 1, 5 );
+		hess_.set_min_rows( 1 );
+		for ( int i = 0; i < L; ++i ) {
+			if ( R == 0 ) { hess_.add( i, 0, H, *arena_, stream ); hess_.add( i, 1, H, *arena_, stream ); hess_.add( i, 3, H, *arena_, stream ); }
+			hess_.add( i, 2, config_.num_q_heads / TP * hd, *arena_, stream );
+			hess_.add( i, 4, config_.intermediate_size / TP, *arena_, stream );
+		}
+		if ( R == 0 ) hess_.add( L, 0, 5 * H, *arena_, stream );
+	}
 	weights_loaded_ = true;
 	LOG_INFO( "[dflash] backbone loaded: %d layers, hidden %d, tp %d (rank %d), conv groups %d\n",
 		L, H, TP, R, config_.conv_groups() );
@@ -430,6 +441,10 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 }
 
 void DFlashSpeculator::destroy() {
+	if ( hess_.on() && weights_loaded_ ) {
+		CUDA_CHECK( cudaSetDevice( device_ ) );
+		hess_.dump( engine::runtime::options().dflash_hessian_dir, rank_ );
+	}
 	initialized_ = false;
 	weights_loaded_ = false;
 }
