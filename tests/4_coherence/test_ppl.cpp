@@ -94,6 +94,9 @@ int main( int argc, char** argv ) {
 		ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 		std::vector<std::vector<int>> done;
 		long counted = 0, replayed = 0;
+		struct PrefixSnap { ModelCluster::SeqSnapshot snap; std::vector<int> ids; };   // the start that a family of sessions shares (their system prompt), restored instead of replayed
+		std::vector<PrefixSnap> snaps;
+		bool use_snap = !mtp_calib;
 		if ( !calibrate ) {
 			// perplexity of the rows after the prefix the sessions share
 			std::vector<std::vector<int>> all_ids;
@@ -122,8 +125,11 @@ int main( int argc, char** argv ) {
 			std::vector<backend::half_t> logits( static_cast<size_t>( pod::MAX_BATCH ) * V );
 			double total = 0.0;
 			long n = 0;
-			const std::vector<int> open_assistant = tok.encode( "<|im_start|>assistant\n", false );
-			const int im_end = tok.im_end_id();
+			// GLM's turns are <|assistant|> ... up to the next role tag (<|user|>, <|observation|> or <|system|>, which the model emits to end its turn); Qwen's are <|im_start|>assistant\n ... <|im_end|>
+			const std::vector<int> open_assistant = tok.encode( glm ? "<|assistant|>" : "<|im_start|>assistant\n", false );
+			std::vector<int> turn_end;
+			if ( glm ) { for ( const char* t : { "<|user|>", "<|observation|>", "<|system|>" } ) { const std::vector<int> e = tok.encode( t, false ); ENGINE_ASSERT( e.size() == 1, "test_ppl: a GLM role tag is not one token" ); turn_end.push_back( e[0] ); } }
+			else turn_end.push_back( tok.im_end_id() );
 			for ( size_t si = 0; si < all_ids.size(); ++si ) {
 				const std::vector<int>& ids = all_ids[si];
 				std::vector<char> in_assistant( ids.size(), 0 );   // target tokens that the model itself produced: the assistant turns, their <|im_end|> included
@@ -131,7 +137,7 @@ int main( int argc, char** argv ) {
 				for ( size_t j = 0; j < ids.size(); ++j ) {
 					if ( inside ) {
 						in_assistant[j] = 1;
-						if ( ids[j] == im_end ) inside = false;
+						if ( std::find( turn_end.begin(), turn_end.end(), ids[j] ) != turn_end.end() ) inside = false;
 					}
 					else if ( j + open_assistant.size() <= ids.size() && std::equal( open_assistant.begin(), open_assistant.end(), ids.begin() + j ) ) {
 						inside = true;
@@ -191,10 +197,26 @@ int main( int argc, char** argv ) {
 				shared = std::max( shared, k );
 			}
 			mc.reset_slot( 0 );
-			for ( size_t off = 0; off < ids.size(); ) {
+			size_t start = 0, snap_at = 0;
+			if ( use_snap ) {
+				int best = -1;   // the longest snapshot whose tokens are the start of this session
+				for ( size_t i = 0; i < snaps.size(); ++i )
+					if ( ids.size() > snaps[i].ids.size() && std::equal( snaps[i].ids.begin(), snaps[i].ids.end(), ids.begin() ) && ( best < 0 || snaps[i].ids.size() > snaps[best].ids.size() ) ) best = static_cast<int>( i );
+				if ( best >= 0 ) {
+					if ( mc.load_snapshot( 0, snaps[best].snap ) ) start = snaps[best].ids.size(); else { use_snap = false; mc.reset_slot( 0 ); }   // the prefix a family of sessions starts with (their system prompt) comes back from a snapshot instead of a replay
+					if ( use_snap && snaps.size() < 24 && shared >= start + 2048 ) snap_at = shared / static_cast<size_t>( mc.snapshot_align() ) * static_cast<size_t>( mc.snapshot_align() );   // a longer prefix shared with an earlier session: a deeper snapshot
+				}
+				else if ( shared >= 1024 && snaps.size() < 24 ) {   // a prefix shared with an earlier session that no snapshot covers: save the slot there (aligned down) while replaying it
+					const size_t al = static_cast<size_t>( mc.snapshot_align() );
+					snap_at = shared / al * al;
+					if ( snap_at < 1024 ) snap_at = 0;
+				}
+			}
+			for ( size_t off = start; off < ids.size(); ) {
 				const bool counting = off >= shared;
 				size_t end = std::min( ids.size(), off + static_cast<size_t>( chunk ) );
 				if ( !counting && end > shared ) end = shared;
+				if ( snap_at && off < snap_at && end > snap_at ) end = snap_at;
 				const int count = static_cast<int>( end - off );
 				mc.set_hessian_capture( counting );
 				mc.forward( ids.data() + off, pod::BatchRows::causal( count, static_cast<int>( off ), 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );
@@ -202,6 +224,12 @@ int main( int argc, char** argv ) {
 				if ( counting ) counted += count;
 				replayed += count;
 				off = end;
+				if ( snap_at && off == snap_at ) {
+					snaps.emplace_back();
+					if ( mc.save_snapshot( 0, 0, static_cast<int>( snap_at ), &snaps.back().snap, false ) ) { snaps.back().ids.assign( ids.begin(), ids.begin() + snap_at ); std::printf( "[*] snapshot %zu of the first %zu tokens: later sessions with this start restore it\n", snaps.size(), snap_at ); }
+					else { snaps.pop_back(); use_snap = false; }
+					snap_at = 0;
+				}
 			}
 			done.push_back( std::move( ids ) );
 			std::printf( "[*] session %zu: %zu tokens, %zu shared; counted %ld, replayed %ld\n", done.size(), done.back().size(), shared, counted, replayed );

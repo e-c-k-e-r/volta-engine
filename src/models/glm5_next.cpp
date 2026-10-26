@@ -664,7 +664,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	};
 
 	if ( !runtime::options().hessian_dir.empty() ) {
-		// Calibration accumulators (sites: see hessian()); replicated inputs live on rank 0, the o_proj inputs on every rank
+		// Calibration accumulators (sites: see hessian()); replicated inputs live on rank L % tp, the o_proj inputs on every rank
 		hess_.assign( static_cast<size_t>( config_.num_layers ) * 6, HessianSite{} );
 		auto site = [&]( int layer, int idx, int k ) {
 			HessianSite& hs = hess_[static_cast<size_t>( layer ) * 6 + idx];
@@ -677,11 +677,13 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		for ( int L = 0; L < config_.num_layers; ++L ) {
 			if ( L < hl_lo || L > hl_hi ) continue;
 			const bool mla = ( L % 4 == 3 ) && L < 44;
-			if ( rank_ == 0 ) {
+			if ( rank_ == L % config_.tp_size ) {   // the replicated inputs: any rank sees the same rows, so the layers take turns (rank 0 alone would hold every accumulator)
 				site( L, 0, config_.hidden_size );
-				if ( L >= 3 ) { site( L, 1, config_.hidden_size ); site( L, 3, 2048 ); }
+				site( L, 1, config_.hidden_size );
+				if ( L < 3 ) site( L, 3, config_.dense_intermediate_size );   // the dense MLPs (a capture keeps them unsliced): gate / up input, down input
 				if ( mla ) site( L, 4, 1536 );
 			}
+			if ( L >= 3 && rank_ == 0 ) site( L, 3, 2048 );   // the shared expert (unsliced in a capture) runs on rank 0 only
 			site( L, 2, mla ? 16384 / config_.tp_size : 8192 / config_.tp_size );
 		}
 		if ( rank_ == 0 && hl_lo == 0 ) site( 0, 5, config_.hidden_size );
@@ -1860,7 +1862,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 					H, config_.num_experts, config_.top_k, 2.5f, stream, m
 				);
 				static const std::string& dump_path = runtime::options().route_dump;
-				if ( !dump_path.empty() && rank_ == 0 && m > pod::MAX_BATCH ) {
+				if ( !dump_path.empty() && rank_ == 0 && m > pod::MAX_BATCH && hess_on_ ) {
 					// Debug (route_dump): {layer, rows, first position, K}, the rows' expert ids (int32), the router's input rows (FP16)
 					const int K = config_.top_k;
 					std::vector<int> ids( static_cast<size_t>( m ) * K );
@@ -2013,6 +2015,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 					norm_hidden_, lw.dense_mlp.up, dn_u, stream
 				);
 				engine::modules::SwiGLU::forward( dn_g, dn_u, dn_i, stream, 10.0f );
+				if ( !lw.dense_sliced ) hessian( layer, 3, dn_i.data, config_.dense_intermediate_size, m, stream );
 				engine::modules::Linear::forward(
 					dn_i, lw.dense_mlp.down, ffn_out_, stream
 				);
@@ -2060,7 +2063,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 }
 
 void Glm5NextPipeline::hessian( int layer, int site, const void* x, int k, int m, backend::stream_t stream ) {
-	if ( hess_.empty() || m <= pod::MAX_BATCH ) return;
+	if ( hess_.empty() || !hess_on_ || m <= pod::MAX_BATCH ) return;
 	HessianSite& hs = hess_[static_cast<size_t>( layer ) * 6 + site];
 	if ( hs.h == nullptr ) return;
 	ENGINE_ASSERT( hs.k == k, "Glm5NextPipeline::hessian: site width changed" );
@@ -2080,7 +2083,7 @@ void Glm5NextPipeline::hessian_dump() {
 		host.resize( static_cast<size_t>( hs.k ) * hs.k );
 		backend::memcpy_sync( host.data(), hs.h, host.size() * sizeof( float ), backend::Copy::D2H );
 		char path[512];
-		std::snprintf( path, sizeof( path ), "%s/L%02d_s%d_r%d.f32", dir.c_str(), static_cast<int>( i / 6 ), static_cast<int>( i % 6 ), rank_ );
+		std::snprintf( path, sizeof( path ), "%s/L%02d_s%d_r%d.f32", dir.c_str(), static_cast<int>( i / 6 ), static_cast<int>( i % 6 ), i % 6 == 2 ? rank_ : 0 );   // only the o_proj input differs per rank; the other sites are replicated and named r0 whichever rank accumulated them
 		if ( FILE* f = std::fopen( path, "wb" ) ) {
 			const int32_t hdr[2] = { 0x48455353, hs.k };
 			std::fwrite( hdr, sizeof( int32_t ), 2, f );

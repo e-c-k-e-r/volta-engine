@@ -245,10 +245,14 @@ private:
 	int tier_layers_ = 0;
 	engine::cpu_moe::CpuExpertHandle cpu_;   // cpu_experts: cold experts computed on the host CPU
 	// Calibration (ENGINE_HESSIAN_DIR): x^T x of a projection input over the prefill rows, per layer and site (0 attention input, 1 FFN input,
-	// 2 o_proj input (rank slice), 3 shared-expert down input, 4 q-lora norm output (MLA), 5 lm_head input with layer 0)
+	// 2 o_proj input (rank slice), 3 shared-expert down input (layers 0-2: the dense MLP down input, 1 = its gate / up input), 4 q-lora norm output (MLA), 5 lm_head input with layer 0)
 	struct HessianSite { float* h = nullptr; int k = 0; int64_t rows = 0; };
 	std::vector<HessianSite> hess_;
+	bool hess_on_ = true;   // calibration: the rows of the forwards that follow count (set_hessian_capture)
 	void hessian( int layer, int site, const void* x, int k, int m, backend::stream_t stream );
+public:
+	void set_hessian_capture( bool on ) override { hess_on_ = on; }
+private:
 	void hessian_dump();
 	void* latent_cache_ = nullptr;    // [slots][mla layers][max_seq][512] in latent_q_ (K and V are the same latent)
 	void* latent_scales_ = nullptr;   // per-block scales of the quantized formats, same element indexing

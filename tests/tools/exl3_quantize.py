@@ -205,12 +205,23 @@ def main():
         fused_cache.move_to_end(name)
         return fused_cache[name]
 
+    ALT = {"qkv_proj": ("q_proj", "k_proj", "v_proj")}   # a template tensor the original stores as several (GLM's linear attention: one fused qkv_proj, the original has q / k / v): rows concatenated in this order
+
+    def alt_parts(base):
+        head, _, tail = base.rpartition(".")
+        if tail in ALT and base + ".weight" not in src_idx:
+            parts = [head + "." + x for x in ALT[tail]]
+            if all(x + ".weight" in src_idx for x in parts): return parts
+        return None
+
     def has_src(base):
-        return base + ".weight" in src_idx or base + ".weight_packed" in src_idx or fused_ref(base) is not None
+        return base + ".weight" in src_idx or base + ".weight_packed" in src_idx or fused_ref(base) is not None or alt_parts(base) is not None
 
     def src_weight(base, dev):
         """<base> as fp32 [out, in]: BF16/FP16 as it is; FP8 (E4M3) with its block scales (<base>.weight_scale_inv, one per 128 x 128 block); NVFP4 of either layout
         (compressed-tensors: weight_packed / weight_scale / weight_global_scale, a divisor; modelopt: uint8 weight / weight_scale / weight_scale_2, a multiplier)"""
+        parts = alt_parts(base)
+        if parts: return torch.cat([src_weight(x, dev) for x in parts], 0)
         fr = fused_ref(base)
         if fr:
             prefix, e, proj = fr
