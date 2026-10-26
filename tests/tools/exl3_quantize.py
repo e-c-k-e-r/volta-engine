@@ -242,7 +242,8 @@ def main():
             return w.float() * sc
         return nvfp4_roundtrip(w.float()) if a.nvfp4_roundtrip and not base.endswith("lm_head") else w.float()
 
-    qcfg = json.load(open(os.path.join(a.template, "quantization_config.json")))
+    qpath = os.path.join(a.template, "quantization_config.json")
+    qcfg = json.load(open(qpath)) if os.path.exists(qpath) else {"quant_method": "exl3"}   # a template without one (the GLM drafter): the defaults, and a minimal file is written for the output
     out_scales = {"always": True, "never": False}.get(qcfg.get("out_scales", "auto"))
     all_keys = set()
     for fn in os.listdir(a.template):
@@ -272,6 +273,9 @@ def main():
         print("kept from the template (first 25):", kept[:25])
         return
 
+    if not os.path.exists(qpath) and not a.plan and not a.helper:
+        os.makedirs(a.out, exist_ok=True)
+        json.dump(dict(qcfg, **({"tile_layout": "volta"} if a.order == "volta" else {})), open(os.path.join(a.out, "quantization_config.json"), "w"), indent=4)
     for fn in sorted(os.listdir(a.template)):
         p = os.path.join(a.template, fn)
         if a.helper and fn != a.helper: continue
