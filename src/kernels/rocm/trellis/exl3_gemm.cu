@@ -18,10 +18,12 @@
 
 namespace {
 
-constexpr int GEMM_WARPS = 8;
+// Warps per block: the k tiles of the weight are split over them. Up to 32 rows the shared partial tiles are small enough for 16 warps, which hide more of
+// the decode latency; at 64 rows the fixed-order reduction would need 64 KB, so 8
+template <int MB> constexpr int gemm_warps() { return MB <= 2 ? 16 : 8; }
 
 template <int bits, int cb, int MB>
-__global__ __launch_bounds__( 32 * GEMM_WARPS ) void exl3_gemm_wmma_kernel(
+__global__ __launch_bounds__( 32 * gemm_warps<MB>() ) void exl3_gemm_wmma_kernel(
 	const half* __restrict__ A,       // rotated input, M rows of K
 	const uint16_t* __restrict__ B,   // trellis, [K / 16][N / 16][16 * bits]
 	half* __restrict__ C,             // M rows of N (before the output rotation)
@@ -29,12 +31,13 @@ __global__ __launch_bounds__( 32 * GEMM_WARPS ) void exl3_gemm_wmma_kernel(
 	int K,
 	int N
 ) {
-	__shared__ __align__( 16 ) half bs[GEMM_WARPS][16 * 16];   // a decoded tile, [column][k]
-	__shared__ float red[GEMM_WARPS][MB][8 * 32];              // a warp's accumulators, [i][lane]
+	constexpr int W = gemm_warps<MB>();
+	__shared__ __align__( 16 ) half bs[W][2][16 * 16];   // two decoded tiles per warp, [column][k]: the next one is decoded while the current one is multiplied
+	__shared__ float red[W][MB][8 * 32];                 // a warp's accumulators, [i][lane]
 	const int lane = threadIdx.x & 31;
 	const int warp = __builtin_amdgcn_readfirstlane( threadIdx.x >> 5 );
 	const int tile_n = blockIdx.x, n_tiles = N >> 4, k_tiles = K >> 4;
-	const int per = ( k_tiles + GEMM_WARPS - 1 ) / GEMM_WARPS;
+	const int per = ( k_tiles + W - 1 ) / W;
 	const int kb0 = warp * per, kb1 = min( k_tiles, kb0 + per );
 
 	wm_v8f acc[MB];
@@ -47,28 +50,45 @@ __global__ __launch_bounds__( 32 * GEMM_WARPS ) void exl3_gemm_wmma_kernel(
 	for ( int mb = 0; mb < MB; ++mb ) arow[mb] = A + (size_t) min( mb * 16 + ( lane & 15 ), M - 1 ) * K;
 
 	const int c = lane >> 2, r0 = 2 * ( lane & 3 );
-	half2* col_lo = reinterpret_cast<half2*>( &bs[warp][c * 16] );
-	half2* col_hi = reinterpret_cast<half2*>( &bs[warp][( c + 8 ) * 16] );
-	const half* brow = &bs[warp][( lane & 15 ) * 16];
-
-	const uint32_t* bt = reinterpret_cast<const uint32_t*>( B + ( (size_t) kb0 * n_tiles + tile_n ) * ( 16 * bits ) );
 	const size_t bstep = (size_t) n_tiles * 16 * bits / 2;   // uint32 words from one k tile to the next
-	for ( int kt = kb0; kt < kb1; ++kt, bt += bstep ) {
+	const uint32_t* bt0 = reinterpret_cast<const uint32_t*>( B + ( (size_t) kb0 * n_tiles + tile_n ) * ( 16 * bits ) );
+
+	// decodes k tile kt of this warp's range into buffer buf
+	auto stage = [&]( int kt, int buf ) {
 		FragB f0, f1;
-		dq_dispatch<bits, cb>( bt, lane << 3, f0, f1 );
+		dq_dispatch<bits, cb>( bt0 + (size_t) ( kt - kb0 ) * bstep, lane << 3, f0, f1 );
+		half2* col_lo = reinterpret_cast<half2*>( &bs[warp][buf][c * 16] );
+		half2* col_hi = reinterpret_cast<half2*>( &bs[warp][buf][( c + 8 ) * 16] );
 		col_lo[r0 >> 1] = __builtin_bit_cast( half2, f0[0] );
 		col_lo[( r0 + 8 ) >> 1] = __builtin_bit_cast( half2, f0[1] );
 		col_hi[r0 >> 1] = __builtin_bit_cast( half2, f1[0] );
 		col_hi[( r0 + 8 ) >> 1] = __builtin_bit_cast( half2, f1[1] );
-		// the tile is written and read inside one wave: LDS accesses of a wave complete in order, only the compiler must keep them apart
-		asm volatile( "" ::: "memory" );
-		const wm_v16h b = wm_ld16( brow );
+	};
+
+	if ( kb0 < kb1 ) {
+		wm_v16h a_cur[MB], a_nxt[MB];
+		stage( kb0, 0 );
 		#pragma unroll
-		for ( int mb = 0; mb < MB; ++mb ) {
-			const wm_v16h a = wm_ld16( arow[mb] + (size_t) kt * 16 );
-			acc[mb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32( a, b, acc[mb] );
+		for ( int mb = 0; mb < MB; ++mb ) a_cur[mb] = wm_ld16( arow[mb] + (size_t) kb0 * 16 );
+		for ( int kt = kb0; kt < kb1; ++kt ) {
+			const int cur = ( kt - kb0 ) & 1;
+			const bool more = kt + 1 < kb1;
+			if ( more ) {
+				stage( kt + 1, cur ^ 1 );
+				#pragma unroll
+				for ( int mb = 0; mb < MB; ++mb ) a_nxt[mb] = wm_ld16( arow[mb] + (size_t) ( kt + 1 ) * 16 );
+			}
+			// a tile is written and read inside one wave: LDS accesses of a wave complete in order, only the compiler must keep them apart
+			asm volatile( "" ::: "memory" );
+			const wm_v16h b = wm_ld16( &bs[warp][cur][( lane & 15 ) * 16] );
+			#pragma unroll
+			for ( int mb = 0; mb < MB; ++mb ) acc[mb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32( a_cur[mb], b, acc[mb] );
+			if ( more ) {
+				#pragma unroll
+				for ( int mb = 0; mb < MB; ++mb ) a_cur[mb] = a_nxt[mb];
+			}
+			asm volatile( "" ::: "memory" );
 		}
-		asm volatile( "" ::: "memory" );
 	}
 
 	#pragma unroll
@@ -86,14 +106,14 @@ __global__ __launch_bounds__( 32 * GEMM_WARPS ) void exl3_gemm_wmma_kernel(
 		const int slot = ( r >> 1 ) * 32 + ( r & 1 ) * 16 + cc;
 		float v = 0.f;
 		#pragma unroll
-		for ( int w = 0; w < GEMM_WARPS; ++w ) v += red[w][mb][slot];
+		for ( int w = 0; w < W; ++w ) v += red[w][mb][slot];
 		C[(size_t) row * N + tile_n * 16 + cc] = __float2half( v );
 	}
 }
 
 template <int bits, int cb, int MB>
 void launch( const half* A, const uint16_t* B, half* C, int m, int k, int n, cudaStream_t stream ) {
-	exl3_gemm_wmma_kernel<bits, cb, MB><<<n / 16, 32 * GEMM_WARPS, 0, stream>>>( A, B, C, m, k, n );
+	exl3_gemm_wmma_kernel<bits, cb, MB><<<n / 16, 32 * gemm_warps<MB>(), 0, stream>>>( A, B, C, m, k, n );
 }
 
 template <int bits, int cb>
