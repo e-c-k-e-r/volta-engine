@@ -7,6 +7,8 @@
 #include "engine/runtime/steer_probe.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
+#include "engine/models/steer_defaults.h"
+#include <cstdlib>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -26,6 +28,14 @@ const char* const kHedged[] = { "Here is the answer, but note that this may be r
 
 constexpr int kLookahead = 24;
 
+// An option that says "auto" (or nothing) takes the model's value
+double option_or( const std::string& text, double fallback ) {
+	if ( text.empty() || text == "auto" ) return fallback;
+	char* end = nullptr;
+	const double v = std::strtod( text.c_str(), &end );
+	return end != text.c_str() && *end == '\0' ? v : fallback;
+}
+
 bool layer_range( const std::string& spec, int lo_default, int hi_default, int num_layers, int* lo, int* hi ) {
 	*lo = lo_default;
 	*hi = hi_default;
@@ -39,11 +49,12 @@ void Generator::probe_slot( int s ) {
 	const auto& opt = runtime::options();
 	const auto t_start = std::chrono::steady_clock::now();
 	const int NL = cluster_.metadata().num_layers, H = cluster_.metadata().hidden_size;
+	const engine::models::SteerDefaults sd = engine::models::steer_defaults( config_.model_type );
 	const std::vector<int>& prompt = slot.req.prompt_tokens;
 	const int n = static_cast<int>( prompt.size() );
 	int b0, b1, e0, e1, sfirst = 0, scount = 0;
 	cluster_.steer_range( &sfirst, &scount );
-	if ( !layer_range( opt.steer_band, NL / 3, 2 * NL / 3, NL, &b0, &b1 ) || !layer_range( !slot.req.probe_edit_layers.empty() ? slot.req.probe_edit_layers : opt.steer_edit_layers, 17 * NL / 32, 21 * NL / 32, NL, &e0, &e1 ) ||
+	if ( !layer_range( opt.steer_band, NL / 3, 2 * NL / 3, NL, &b0, &b1 ) || !layer_range( !slot.req.probe_edit_layers.empty() ? slot.req.probe_edit_layers : opt.steer_edit_layers, sd.lo_num * NL / sd.lo_den, sd.hi_num * NL / sd.hi_den, NL, &e0, &e1 ) ||
 		e0 < b0 || e1 > b1 || e0 < sfirst || e1 >= sfirst + scount ) {
 		LOG_ERROR( "[steer] probe skipped: the edit layers %d-%d must lie inside the band and inside steer_layers %d-%d\n", e0, e1, sfirst, sfirst + scount - 1 );
 		return;
@@ -97,7 +108,7 @@ void Generator::probe_slot( int s ) {
 		score = std::max( score, f / nb );
 	}
 	auto pick = [&]( float request, double option ) { return std::isnan( request ) ? static_cast<float>( option ) : request; };
-	const float threshold = pick( slot.req.probe_threshold, opt.steer_gate_threshold ), edit_strength = pick( slot.req.probe_edit_strength, opt.steer_edit_strength ),
+	const float threshold = pick( slot.req.probe_threshold, option_or( opt.steer_gate_threshold, sd.gate_threshold ) ), edit_strength = pick( slot.req.probe_edit_strength, option_or( opt.steer_edit_strength, sd.edit_strength ) ),
 		hedge_strength = pick( slot.req.probe_hedge_strength, opt.steer_hedge_strength );
 	const bool fired = score > threshold;
 	slot.metrics.gate_score = score;
@@ -135,8 +146,8 @@ void Generator::probe_slot( int s ) {
 		slot.steer_think_open = slot.in_reasoning;
 		cluster_.steer_control( s, slot.steer_scope, n, slot.in_reasoning ? INT_MAX : 0 );
 	}
-	LOG_INFO( "[steer] req %llu gate %s score=%.3f (threshold %.2f, %.0f ms)\n", static_cast<unsigned long long>( slot.req.req_id ), fired ? "fired" : "clean", score,
-		threshold, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_start ).count() );
+	LOG_INFO( "[steer] req %llu gate %s score=%.3f (threshold %.2f; clamp layers %d-%d strength %g; %.0f ms)\n", static_cast<unsigned long long>( slot.req.req_id ), fired ? "fired" : "clean", score,
+		threshold, e0, e1, edit_strength, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_start ).count() );
 }
 
 } // namespace engine::runtime

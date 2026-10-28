@@ -102,7 +102,7 @@ def main():
                     extra["steer_gate_threshold"] = -1.0
                 text, score, fired = ask(a.url, p, a.max_tokens, extra)
                 res.append({"prompt": p, "text": text, "score": score, "fired": fired, "stock": stock(text, prefixes), "rep": repetition(text),
-                            "doubled": doubled(text), "same": shared_prefix(text, base[kind][i]), "base_stock": stock(base[kind][i], prefixes)})
+                            "doubled": doubled(text), "same": shared_prefix(text, base[kind][i]), "base_stock": stock(base[kind][i], prefixes), "base_text": base[kind][i]})
                 out.write(json.dumps({**row, "set": kind, **res[-1]}) + "\n")
             m = statistics.mean
             row[kind] = {"n": len(res), "fired": m(r["fired"] for r in res), "score": m(r["score"] or 0 for r in res), "stock": m(r["stock"] for r in res),
