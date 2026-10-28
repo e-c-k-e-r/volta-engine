@@ -51,9 +51,10 @@ bool load_steer_file( const std::string& path, SteerFile* out, std::string* err 
 	if ( !f ) { *err = "cannot open " + path; return false; }
 	int32_t hdr[5] = {};
 	char magic[4] = {};
-	bool ok = std::fread( magic, 1, 4, f ) == 4 && std::memcmp( magic, "VSTR", 4 ) == 0 && std::fread( hdr, sizeof( int32_t ), 5, f ) == 5 && hdr[0] == 1;
-	if ( !ok ) { std::fclose( f ); *err = path + ": not a control-vector file (version 1)"; return false; }
+	bool ok = std::fread( magic, 1, 4, f ) == 4 && std::memcmp( magic, "VSTR", 4 ) == 0 && std::fread( hdr, sizeof( int32_t ), 5, f ) == 5 && ( hdr[0] == 1 || hdr[0] == 2 );
+	if ( !ok ) { std::fclose( f ); *err = path + ": not a control-vector file (version 1 or 2)"; return false; }
 	SteerFile file;
+	if ( hdr[0] == 2 && std::fread( &file.scale, sizeof( float ), 1, f ) != 1 ) { std::fclose( f ); *err = path + ": truncated"; return false; }
 	file.hidden = hdr[1];
 	file.layers = hdr[2];
 	file.scope = hdr[3];
@@ -77,8 +78,8 @@ bool load_steer_file( const std::string& path, SteerFile* out, std::string* err 
 bool save_steer_file( const std::string& path, const SteerFile& file, std::string* err ) {
 	FILE* f = std::fopen( path.c_str(), "wb" );
 	if ( !f ) { *err = "cannot write " + path; return false; }
-	const int32_t hdr[5] = { 1, file.hidden, file.layers, file.scope, static_cast<int32_t>( file.entries.size() ) };
-	bool ok = std::fwrite( "VSTR", 1, 4, f ) == 4 && std::fwrite( hdr, sizeof( int32_t ), 5, f ) == 5;
+	const int32_t hdr[5] = { 2, file.hidden, file.layers, file.scope, static_cast<int32_t>( file.entries.size() ) };
+	bool ok = std::fwrite( "VSTR", 1, 4, f ) == 4 && std::fwrite( hdr, sizeof( int32_t ), 5, f ) == 5 && std::fwrite( &file.scale, sizeof( float ), 1, f ) == 1;
 	for ( const auto& e : file.entries ) {
 		const int32_t lk[2] = { e.layer, e.kind };
 		ok = ok && std::fwrite( lk, sizeof( int32_t ), 2, f ) == 2 && std::fwrite( &e.par, sizeof( float ), 1, f ) == 1

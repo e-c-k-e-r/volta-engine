@@ -32,9 +32,23 @@ A bad name, an unreadable or mismatching file, or `steer_probe` without `steer` 
 
 ## Control-vector files
 
-`.steer` files hold, per entry, a layer, a kind (`add` or `clamp`), a strength or reference level and a unit direction (fp32 [hidden]); at most two entries per layer, all inside `steer_layers`. The header carries the hidden size, the layer count and the file's default scope.
+`.steer` files hold, per entry, a layer, a kind (`add` or `clamp`), a strength or reference level and a unit direction (fp32 [hidden]); at most two entries per layer, all inside `steer_layers`. The header carries the hidden size, the layer count, the file's default scope and its recommended scale.
 
-`build/steer_build --pos pos.txt --neg neg.txt --out v.steer [--layers 21-42] [--model dir] [--scope generated]` builds one from two sets of prompts (one per line): it prefills each (as a user turn with an empty reasoning block), reads the last token's residual after every steered layer, and stores per layer the unit mean difference between the sets with a strength of the difference's length divided by the layer count. At `steer_scale` 1 the layers together move the state by the contrast the prompts show; the strengths add up across layers, so scales of 1 and more can wreck the text.
+`build/steer_build --pos pos.txt --neg neg.txt --out v.steer [--layers 21-42] [--model dir] [--scope generated] [--scale 1.5]` builds one from two sets of prompts (one per line): it prefills each (as a user turn with an empty reasoning block), reads the last token's residual after every steered layer, and stores per layer the unit mean difference between the sets with a strength of the difference's length divided by the layer count. At `steer_scale` 1 the layers together move the state by the contrast the prompts show; the recommended scale in the file header (`--scale`, see below) is what a request multiplies.
+
+## Recommended scales and the contrast sets
+
+A `.steer` file (version 2) also carries a recommended scale; a request's `steer_scale` (or the `steer_scale` option) multiplies it, so 1 means as recommended. `tests/tools/steer_file.py info FILE...` prints a file's header and `steer_file.py scale FILE X` sets the scale; `steer_build --scale X` writes it at build time.
+
+`tests/tools/steer_sets.py DIR` writes matched contrast sets (the same question with and without a style instruction) and held-out prompts; `steer_build --batch DIR` builds `terse`, `direct` and `english` from them in one model load, and `tests/tools/steer_vec_sweep.py` sweeps a vector's scale against a running server (answer length, the share of answers that finished, caveat phrases, CJK share, repetition, doubled words, similarity to the unsteered text). On Qwen3.8-27B EXL3 4.0 bpw, 8 held-out questions at 700 tokens (10 Chinese questions at 120 for `english`), unsteered answers average 434 words:
+
+| Vector | Recommended scale | Effect |
+|---|---|---|
+| `terse` (one short sentence) | 1.0 | 38 words per answer, all finished (2: 13 words; 4: 4 words) |
+| `direct` (no disclaimers or caveats) | 1.0 | 150 words, caveat share 0.25 to 0.12; at 2 it gives 37 words and no caveats; repetition rises at 4 |
+| `english` (English only, against a Chinese request) | 2.0 | share of CJK characters in the answers 0.60 to 0.00; at 1 a Chinese term stays in the English text |
+
+Below about 0.5 the vectors change the wording without changing the length or language. The strengths of a file add up over its layers, so a file built before the per-layer division (strength = the full contrast on every layer) needs scales around 1/23 of these.
 
 ## The probe and the gate (`steer_probe`)
 

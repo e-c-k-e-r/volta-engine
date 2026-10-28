@@ -607,7 +607,7 @@ void Generator::steer_admit( int s ) {
 	if ( !name.empty() && name != "none" ) {
 		std::string err;
 		if ( const SteerFile* f = steer_file( name, &err ) ) {
-			const float scale = slot.req.steer_scale >= 0.0f ? slot.req.steer_scale : static_cast<float>( opt.steer_scale );
+			const float scale = ( slot.req.steer_scale >= 0.0f ? slot.req.steer_scale : static_cast<float>( opt.steer_scale ) ) * f->scale;
 			entries = f->entries;
 			for ( auto& e : entries ) if ( e.kind == engine::modules::STEER_ADD ) e.par *= scale;
 			scope = f->scope;

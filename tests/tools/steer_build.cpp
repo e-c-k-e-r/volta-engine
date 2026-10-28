@@ -2,7 +2,8 @@
 // (after each steered layer) between the positive and the negative set, one add entry per layer. The entry's direction is the unit
 // difference and its strength the length of the difference divided by the number of layers, so the layers together move the state by
 // the contrast the prompts show at a steer_scale of 1. Prompts are one per line (\n inside a prompt written as \\n); each is wrapped as a user turn with the answer started after an empty reasoning block.
-//   steer_build --pos pos.txt --neg neg.txt --out v.steer [--layers 21-42] [--model dir] [--scope generated]
+//   steer_build --pos pos.txt --neg neg.txt --out v.steer [--layers 21-42] [--model dir] [--scope generated] [--scale 1.5]
+//   steer_build --batch dir [...]     every NAME.pos.txt with a NAME.neg.txt in dir gives dir/NAME.steer (one model load for all)
 // Needs the steer option (set here) and a checkpoint of a Qwen3.5-family model.
 #include "engine/runtime/cluster.h"
 #include "engine/runtime/steer_file.h"
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -29,27 +31,39 @@ static std::vector<std::string> read_lines( const std::string& path ) {
 }
 
 int main( int argc, char** argv ) {
-	std::string pos_path, neg_path, out_path, layers = "", model = test::model_path( "Qwen3.8-27B-exl3", "ENGINE_TEST_QWEN_DIR" ), scope = "all";
+	float file_scale = 1.0f;   // the recommended steer_scale stored in the file
+	std::string pos_path, neg_path, out_path, batch, layers = "", model = test::model_path( "Qwen3.8-27B-exl3", "ENGINE_TEST_QWEN_DIR" ), scope = "all";
 	for ( int i = 1; i + 1 < argc; i += 2 ) {
 		const std::string a = argv[i];
 		if ( a == "--pos" ) pos_path = argv[i + 1];
 		else if ( a == "--neg" ) neg_path = argv[i + 1];
 		else if ( a == "--out" ) out_path = argv[i + 1];
+		else if ( a == "--batch" ) batch = argv[i + 1];
 		else if ( a == "--layers" ) layers = argv[i + 1];
 		else if ( a == "--model" ) model = argv[i + 1];
 		else if ( a == "--scope" ) scope = argv[i + 1];
+		else if ( a == "--scale" ) file_scale = static_cast<float>( std::atof( argv[i + 1] ) );
 		else { std::fprintf( stderr, "unknown argument %s\n", a.c_str() ); return 2; }
 	}
-	if ( pos_path.empty() || neg_path.empty() || out_path.empty() ) {
-		std::fprintf( stderr, "usage: steer_build --pos pos.txt --neg neg.txt --out v.steer [--layers 21-42] [--model dir] [--scope generated]\n" );
+	struct Job { std::string pos, neg, out; };
+	std::vector<Job> jobs;
+	if ( !batch.empty() ) {
+		for ( const auto& e : std::filesystem::directory_iterator( batch ) ) {
+			const std::string f = e.path().filename().string(), suffix = ".pos.txt";
+			if ( f.size() <= suffix.size() || f.compare( f.size() - suffix.size(), suffix.size(), suffix ) != 0 ) continue;
+			const std::string name = f.substr( 0, f.size() - suffix.size() );
+			if ( std::filesystem::exists( batch + "/" + name + ".neg.txt" ) ) jobs.push_back( { batch + "/" + f, batch + "/" + name + ".neg.txt", batch + "/" + name + ".steer" } );
+		}
+	}
+	else if ( !pos_path.empty() && !neg_path.empty() && !out_path.empty() ) jobs.push_back( { pos_path, neg_path, out_path } );
+	if ( jobs.empty() ) {
+		std::fprintf( stderr, "usage: steer_build --pos pos.txt --neg neg.txt --out v.steer | --batch dir  [--layers 21-42] [--model dir] [--scope generated]\n" );
 		return 2;
 	}
 	int scope_bits = 0;
 	if ( !parse_steer_scope( scope, &scope_bits ) ) { std::fprintf( stderr, "bad --scope\n" ); return 2; }
 	setenv( "ENGINE_STEER", "on", 1 );
 	if ( !layers.empty() ) setenv( "ENGINE_STEER_LAYERS", layers.c_str(), 1 );
-	const std::vector<std::string> pos = read_lines( pos_path ), neg = read_lines( neg_path );
-	if ( pos.empty() || neg.empty() ) { std::fprintf( stderr, "empty prompt set\n" ); return 2; }
 
 	engine::loader::Tokenizer tok;
 	if ( !tok.load( model.c_str() ) ) { std::fprintf( stderr, "tokenizer load failed (%s)\n", model.c_str() ); return 1; }
@@ -80,28 +94,32 @@ int main( int argc, char** argv ) {
 		for ( double& v : sum ) v /= static_cast<double>( prompts.size() );
 		return sum;
 	};
-	const std::vector<double> mp = mean_states( pos ), mn = mean_states( neg );
-
-	SteerFile f;
-	f.hidden = H;
-	f.layers = mc.metadata().num_layers;
-	f.scope = scope_bits;
-	for ( int li = 0; li < count; ++li ) {
-		engine::modules::SteerEntry e;
-		e.layer = first + li;
-		e.kind = engine::modules::STEER_ADD;
-		e.vec.resize( H );
-		double n2 = 0.0;
-		for ( int i = 0; i < H; ++i ) { const double d = mp[static_cast<size_t>( li ) * H + i] - mn[static_cast<size_t>( li ) * H + i]; e.vec[i] = static_cast<float>( d ); n2 += d * d; }
-		const double n = std::sqrt( n2 );
-		for ( float& v : e.vec ) v = static_cast<float>( v / ( n + 1e-12 ) );
-		e.par = static_cast<float>( n / count );
-		f.entries.push_back( std::move( e ) );
-		std::printf( "layer %2d: contrast %.3f\n", first + li, n );
+	for ( const Job& job : jobs ) {
+		const std::vector<std::string> pos = read_lines( job.pos ), neg = read_lines( job.neg );
+		if ( pos.empty() || neg.empty() ) { std::fprintf( stderr, "empty prompt set in %s\n", job.out.c_str() ); return 2; }
+		const std::vector<double> mp = mean_states( pos ), mn = mean_states( neg );
+		SteerFile f;
+		f.hidden = H;
+		f.layers = mc.metadata().num_layers;
+		f.scope = scope_bits;
+		f.scale = file_scale;
+		for ( int li = 0; li < count; ++li ) {
+			engine::modules::SteerEntry e;
+			e.layer = first + li;
+			e.kind = engine::modules::STEER_ADD;
+			e.vec.resize( H );
+			double n2 = 0.0;
+			for ( int i = 0; i < H; ++i ) { const double d = mp[static_cast<size_t>( li ) * H + i] - mn[static_cast<size_t>( li ) * H + i]; e.vec[i] = static_cast<float>( d ); n2 += d * d; }
+			const double n = std::sqrt( n2 );
+			for ( float& v : e.vec ) v = static_cast<float>( v / ( n + 1e-12 ) );
+			e.par = static_cast<float>( n / count );
+			f.entries.push_back( std::move( e ) );
+			std::printf( "%s layer %2d: contrast %.3f\n", job.out.c_str(), first + li, n );
+		}
+		std::string err;
+		if ( !save_steer_file( job.out, f, &err ) ) { std::fprintf( stderr, "%s\n", err.c_str() ); return 1; }
+		std::printf( "wrote %s (%zu entries, scope %s)\n", job.out.c_str(), f.entries.size(), scope.c_str() );
 	}
-	std::string err;
-	if ( !save_steer_file( out_path, f, &err ) ) { std::fprintf( stderr, "%s\n", err.c_str() ); return 1; }
-	std::printf( "wrote %s (%zu entries, scope %s)\n", out_path.c_str(), f.entries.size(), scope.c_str() );
 	mc.shutdown();
 	return 0;
 }
