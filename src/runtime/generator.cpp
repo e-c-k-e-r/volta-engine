@@ -3,6 +3,8 @@
 #include "engine/runtime/cand_log.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
+#include <cctype>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -53,6 +55,7 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 		int layers = 0, experts = 0;
 		if ( runtime::options().expert_stats ) cluster_.expert_heat( discard, layers, experts );
 	}
+	if ( cluster_.steer_enabled() ) build_penalty_ids();
 	LOG_INFO( "Generator ready: %d slots, speculation %s\n", num_slots_, cluster_.has_speculator() ? "on" : "off" );
 
 	if ( !runtime::options().spec_cand_log.empty() ) CandLog::get().open( runtime::options().spec_cand_log );
@@ -130,6 +133,7 @@ void Generator::admit_pending() {
 		slot.sp.seed = slot.req.seed != 0 ? slot.req.seed : ( 0x51ED270B0F5A8C3DULL ^ slot.req.req_id );
 		slot.rng.reseed( slot.sp.seed );
 		slot.in_reasoning = slot.req.starts_in_reasoning;
+		if ( cluster_.steer_enabled() ) steer_admit( s );
 		slot.metrics.start_time = std::chrono::steady_clock::now();
 		slot.metrics.queue_ms = std::chrono::duration<double, std::milli>( slot.metrics.start_time - slot.req.submit_time ).count();
 	}
@@ -187,6 +191,11 @@ bool Generator::emit_token( int s, int tok ) {
 		reason = FinishReason::Length;
 	}
 
+	if ( slot.steer_think_open && tok == tokenizer_.think_end_id() ) {
+		// the reasoning block ends here: rows from the next position on are answer rows (no more marker penalty)
+		slot.steer_think_open = false;
+		cluster_.steer_control( s, slot.steer_scope, static_cast<int>( slot.req.prompt_tokens.size() ), static_cast<int>( slot.all_tokens.size() ) );
+	}
 	if ( slot.in_reasoning && !eos ) {
 		if ( tok == slot.req.think_close_id ) slot.in_reasoning = false;
 		else if ( slot.req.reasoning_budget > 0 && ++slot.reasoning_tokens >= slot.req.reasoning_budget ) slot.force_close = true;
@@ -364,12 +373,13 @@ bool Generator::prefill_slot( int s, int budget ) {
 	const int n = static_cast<int>( prompt.size() );
 	if ( !slot.pf_started ) {
 		slot.pf_started = true;
+		if ( slot.req.steer_probe && cluster_.steer_enabled() ) probe_slot( s );
 		// Prefix-cache keys: image placeholders are keyed by the image content, so the same prompt with another picture never matches
 		const std::vector<int>& key_prompt = slot.key_tokens.empty() ? prompt : slot.key_tokens;
 		// Resume from the deepest cached prefix of the prompt, else start cold (which also hands the drafter to this slot)
 		int pos = 0;
 		slot.pf_node = nullptr;
-		if ( prefix_cache_ && n >= kPrefixMinTokens ) {
+		if ( prefix_cache_ && !slot.steer_prompt && n >= kPrefixMinTokens ) {
 			if ( PrefixCache::Entry* hit = prefix_cache_->find( key_prompt ) ) {
 				const auto t_restore = std::chrono::steady_clock::now();
 				const bool restored = prefix_cache_->restore( s, hit );
@@ -411,7 +421,7 @@ bool Generator::prefill_slot( int s, int budget ) {
 		// Checkpoints on the way through: the requested ones (end of the system prompt, turn boundary) plus one every
 		// prefix_interval tokens of a long prompt. Each stores only the KV rows since the previous one.
 		slot.pf_cps.clear();
-		if ( prefix_cache_ && n >= kPrefixMinTokens ) {
+		if ( prefix_cache_ && !slot.steer_prompt && n >= kPrefixMinTokens ) {
 			slot.pf_cps = slot.req.checkpoint_at;
 			const int align = cluster_.snapshot_align();
 			for ( auto& cp : slot.pf_cps ) cp.pos -= cp.pos % align;
@@ -507,6 +517,114 @@ PrefixCache::Entry* Generator::store_prefix( int s, PrefixCache::Entry* parent, 
 
 // The reasoning budget ran out: feed the closing tokens as if the model had written them (anchor first, then all but the
 // last close token as a short prefill), emit them, and let the model continue with the answer.
+// The words of think_penalty as token ids: the first token of each spelling (as is, space-prefixed, after a newline; capitalised and lower case).
+// The list is the option's (a comma list or a file of one word per line) or Wait, Hmm, Alternatively, But.
+void Generator::build_penalty_ids() {
+	std::vector<std::string> words;
+	const std::string& spec = runtime::options().think_penalty_words;
+	auto split = [&]( const std::string& text, char sep ) {
+		size_t i = 0;
+		while ( i <= text.size() ) {
+			size_t j = text.find( sep, i );
+			if ( j == std::string::npos ) j = text.size();
+			std::string w = text.substr( i, j - i );
+			while ( !w.empty() && ( w.back() == '\r' || w.back() == ' ' ) ) w.pop_back();
+			if ( !w.empty() ) words.push_back( w );
+			i = j + 1;
+		}
+	};
+	if ( spec.empty() ) words = { "Wait", "Hmm", "Alternatively", "But" };
+	else if ( FILE* f = std::fopen( spec.c_str(), "rb" ) ) {
+		std::string text;
+		char buf[4096];
+		size_t n;
+		while ( ( n = std::fread( buf, 1, sizeof( buf ), f ) ) > 0 ) text.append( buf, n );
+		std::fclose( f );
+		split( text, '\n' );
+	}
+	else split( spec, ',' );
+	std::vector<std::string> spellings;
+	for ( const std::string& w : words ) {
+		std::string lower = w, upper = w;
+		for ( char& c : lower ) c = static_cast<char>( std::tolower( static_cast<unsigned char>( c ) ) );
+		if ( !upper.empty() ) upper[0] = static_cast<char>( std::toupper( static_cast<unsigned char>( upper[0] ) ) );
+		for ( const std::string& v : { w, lower, upper } ) {
+			for ( const char* prefix : { "", " ", "\n" } ) spellings.push_back( prefix + v );
+		}
+	}
+	penalty_ids_.clear();
+	std::string shown;
+	for ( const std::string& sp : spellings ) {
+		const std::vector<int> ids = tokenizer_.encode_plain( sp );
+		if ( ids.empty() || ids[0] < 0 || ids[0] >= cluster_.metadata().vocab_size ) continue;
+		if ( std::find( penalty_ids_.begin(), penalty_ids_.end(), ids[0] ) != penalty_ids_.end() ) continue;
+		penalty_ids_.push_back( ids[0] );
+		shown += " [" + tokenizer_.decode_token( ids[0] ) + "]";
+	}
+	if ( penalty_ids_.size() > static_cast<size_t>( engine::modules::kSteerPenaltyIds ) ) penalty_ids_.resize( engine::modules::kSteerPenaltyIds );
+	LOG_INFO( "[steer] think_penalty tokens (%zu):%s\n", penalty_ids_.size(), shown.c_str() );
+}
+
+// A control-vector file by request name: "file" is the steer_file option, anything else a name in steer_dir. Loaded once and checked against the model.
+const SteerFile* Generator::steer_file( const std::string& vector, std::string* err ) {
+	std::unique_lock<std::mutex> lock( steer_mtx_ );
+	auto it = steer_files_.find( vector );
+	if ( it != steer_files_.end() ) return &it->second;
+	std::string path;
+	if ( vector == "file" ) path = runtime::options().steer_file;
+	else if ( vector.find( '/' ) != std::string::npos || vector.find( ".." ) != std::string::npos || vector[0] == '.' ) { *err = "steer_vector must be a plain name"; return nullptr; }
+	else if ( runtime::options().steer_dir.empty() ) { *err = "the server has no steer_dir"; return nullptr; }
+	else path = runtime::options().steer_dir + "/" + vector + ".steer";
+	if ( path.empty() ) { *err = "the server has no steer_file"; return nullptr; }
+	SteerFile f;
+	if ( !load_steer_file( path, &f, err ) ) return nullptr;
+	int first = 0, count = 0;
+	cluster_.steer_range( &first, &count );
+	if ( f.hidden != cluster_.metadata().hidden_size ) { *err = path + ": built for hidden size " + std::to_string( f.hidden ); return nullptr; }
+	std::vector<int> per_layer( cluster_.metadata().num_layers, 0 );
+	for ( const auto& e : f.entries ) {
+		if ( e.layer < first || e.layer >= first + count ) { *err = path + ": layer " + std::to_string( e.layer ) + " is outside the steered layers " + std::to_string( first ) + "-" + std::to_string( first + count - 1 ) + " (steer_layers)"; return nullptr; }
+		if ( ( e.kind != engine::modules::STEER_ADD && e.kind != engine::modules::STEER_CLAMP ) || ++per_layer[e.layer] > engine::modules::kSteerEntries ) { *err = path + ": bad entry on layer " + std::to_string( e.layer ); return nullptr; }
+	}
+	return &steer_files_.emplace( vector, std::move( f ) ).first->second;
+}
+
+bool Generator::check_steer( const std::string& vector, const std::string& scope, std::string* err ) {
+	if ( !cluster_.steer_enabled() ) { if ( vector.empty() && scope.empty() ) return true; *err = "steering is off (steer option)"; return false; }
+	int bits = 0;
+	if ( !scope.empty() && !parse_steer_scope( scope, &bits ) ) { *err = "steer_scope: use prompt, think, answer, generated or all"; return false; }
+	if ( vector.empty() || vector == "none" ) return true;
+	return steer_file( vector, err ) != nullptr;
+}
+
+void Generator::steer_admit( int s ) {
+	Slot& slot = slots_[s];
+	const auto& opt = runtime::options();
+	std::vector<engine::modules::SteerEntry> entries;
+	int scope = 0;
+	std::string name = slot.req.steer_vector;
+	if ( name.empty() && opt.steer == "file" ) name = "file";
+	if ( !name.empty() && name != "none" ) {
+		std::string err;
+		if ( const SteerFile* f = steer_file( name, &err ) ) {
+			const float scale = slot.req.steer_scale >= 0.0f ? slot.req.steer_scale : static_cast<float>( opt.steer_scale );
+			entries = f->entries;
+			for ( auto& e : entries ) if ( e.kind == engine::modules::STEER_ADD ) e.par *= scale;
+			scope = f->scope;
+			const std::string& sc = !slot.req.steer_scope.empty() ? slot.req.steer_scope : opt.steer_scope;
+			if ( !sc.empty() ) parse_steer_scope( sc, &scope );
+		}
+		else LOG_ERROR( "[steer] request %llu runs unsteered: %s\n", static_cast<unsigned long long>( slot.req.req_id ), err.c_str() );
+	}
+	slot.steer_scope = entries.empty() ? 0 : scope;
+	slot.steer_prompt = ( slot.steer_scope & engine::modules::STEER_PROMPT ) != 0;
+	slot.steer_think_open = slot.in_reasoning;
+	const float penalty = slot.req.think_penalty >= 0.0f ? slot.req.think_penalty : static_cast<float>( opt.think_penalty );
+	cluster_.steer_set( s, entries );
+	cluster_.steer_control( s, slot.steer_scope, static_cast<int>( slot.req.prompt_tokens.size() ), slot.in_reasoning ? INT_MAX : 0 );
+	cluster_.steer_penalty( s, penalty != 0.0f ? penalty_ids_ : std::vector<int>(), penalty );
+}
+
 void Generator::apply_forced_close( int s ) {
 	Slot& slot = slots_[s];
 	if ( !slot.active || !slot.force_close ) return;

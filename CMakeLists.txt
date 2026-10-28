@@ -153,6 +153,9 @@ set(ENGINE_HOST_SOURCES
 	src/runtime/suffix_runner.cpp
 	src/runtime/dspark_runner.cpp
 	src/runtime/prefix_cache.cpp
+	src/runtime/steer_file.cpp
+	src/runtime/steer_probe.cpp
+	src/runtime/generator_probe.cpp
 	src/runtime/cpu_experts.cpp
 	src/runtime/cpu_expert_service.cpp
 	src/runtime/cpu_expert_attach.cpp
@@ -200,6 +203,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/gated_residual.cu
 	src/backend/cuda/modules/ple.cu
 	src/backend/cuda/modules/hessian.cu
+	src/backend/cuda/modules/steer.cu
 	src/backend/cuda/modules/qsa.cu
 	src/backend/cuda/modules/dsv4.cu
 	src/backend/cuda/modules/embedding.cu
@@ -506,6 +510,13 @@ add_executable(test_gr_tc tests/2_parity/test_gr_tc.cpp)
 target_link_libraries(test_gr_tc PRIVATE engine_kernels)
 set_target_properties(test_gr_tc PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(test_steer_probe tests/2_parity/test_steer_probe.cpp)
+target_link_libraries(test_steer_probe PRIVATE engine_kernels)
+set_target_properties(test_steer_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_steer tests/2_parity/test_steer.cpp)
+target_link_libraries(test_steer PRIVATE engine_kernels)
+set_target_properties(test_steer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 # Test Norm & Elementwise Parity
 add_executable(test_norm tests/2_parity/test_norm.cpp)
 target_link_libraries(test_norm PRIVATE engine_kernels)
@@ -628,6 +639,12 @@ set_target_properties(test_chunk_boundary PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$
 add_executable(test_longctx tests/4_coherence/test_longctx.cpp)
 target_link_libraries(test_longctx PRIVATE engine_kernels)
 set_target_properties(test_longctx PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_steer_model tests/4_coherence/test_steer_model.cpp)
+target_link_libraries(test_steer_model PRIVATE engine_kernels)
+set_target_properties(test_steer_model PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(steer_build tests/tools/steer_build.cpp)
+target_link_libraries(steer_build PRIVATE engine_kernels)
+set_target_properties(steer_build PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 add_executable(test_ppl tests/4_coherence/test_ppl.cpp)
 target_link_libraries(test_ppl PRIVATE engine_kernels)
 set_target_properties(test_ppl PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

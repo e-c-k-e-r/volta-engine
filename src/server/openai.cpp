@@ -281,6 +281,15 @@ public:
 			const json& k = j["chat_template_kwargs"];
 			if ( k.contains( "enable_thinking" ) && k["enable_thinking"].is_boolean() ) r.enable_thinking = k["enable_thinking"].get<bool>() ? 1 : 0;
 		}
+		// runtime steering (server option steer): a control-vector file by name, its strength and scope, and the reflection-marker logit penalty
+		if ( j.contains( "steer_vector" ) && j["steer_vector"].is_string() ) r.steer_vector = j["steer_vector"].get<std::string>();
+		if ( j.contains( "steer_scale" ) && j["steer_scale"].is_number() ) r.steer_scale = j["steer_scale"].get<float>();
+		if ( j.contains( "steer_scope" ) && j["steer_scope"].is_string() ) r.steer_scope = j["steer_scope"].get<std::string>();
+		if ( j.contains( "steer_gate_threshold" ) && j["steer_gate_threshold"].is_number() ) r.probe_threshold = j["steer_gate_threshold"].get<float>();
+		if ( j.contains( "steer_edit_strength" ) && j["steer_edit_strength"].is_number() ) r.probe_edit_strength = j["steer_edit_strength"].get<float>();
+		if ( j.contains( "steer_hedge_strength" ) && j["steer_hedge_strength"].is_number() ) r.probe_hedge_strength = j["steer_hedge_strength"].get<float>();
+		if ( j.contains( "steer_probe" ) && j["steer_probe"].is_boolean() ) r.steer_probe = j["steer_probe"].get<bool>();
+		if ( j.contains( "think_penalty" ) && j["think_penalty"].is_number() ) r.think_penalty = j["think_penalty"].get<float>();
 		*out = std::move( r );
 		return true;
 	}

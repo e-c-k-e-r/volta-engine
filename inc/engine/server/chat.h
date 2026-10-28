@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <memory>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,14 @@ struct ChatRequest {
 	int thinking_budget = 0;     // reasoning tokens before the thinking block is closed for the model (0 = unlimited)
 	bool require_tool = false;
 	std::string force_tool;
+	// runtime steering (needs the steer option): control-vector file name ("" = the server's choice, "none" = unsteered), strength and scope
+	// (<0 / empty = the server's), and the logit taken off reflection markers inside the reasoning block (<0 = the server's)
+	std::string steer_vector;
+	float steer_scale = -1.0f;
+	std::string steer_scope;
+	float probe_threshold = NAN, probe_edit_strength = NAN, probe_hedge_strength = NAN;   // per-request values of the probe options (NaN = the option)
+	bool steer_probe = false;   // the steering probe reads the prompt first and applies its direction clamps when the gate fires
+	float think_penalty = -1.0f;
 };
 
 struct Usage {

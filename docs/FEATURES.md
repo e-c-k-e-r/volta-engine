@@ -49,6 +49,7 @@ The model type is read from the checkpoint, never configured. Anything else is a
 | Flash-Next QSA block selection past 2048 tokens of context | default | `qsa_off` (debug, dense) | `test_sparse_attn`, `test_ops_flash` |
 | Context window per slot | default 32K (Qwen), 12K (GLM) | `max_seq`, `max_slots` | `test_longctx` |
 | Prefix cache: snapshots in pinned host RAM as a tree keyed by exact token prefixes, automatic checkpoints inside long prompts | default | `prefix_cache_gib`, `prefix_interval` | `test_prefix_restore`, `tests/4_server/test_api.sh` |
+| Runtime steering: per-request control vectors on the residual stream, a direction-clamp probe with a gate, a logit penalty on reflection markers ([STEERING.md](STEERING.md)); Qwen3.5-family | opt-in | `steer`, `steer_*`, `think_penalty` | `test_steer`, `test_steer_probe`, `test_steer_model` |
 | GLM, DeepSeek prefill of several 512-row chunks layer by layer, the routed experts running once over all their rows | opt-in | `prefill_window` | `needle_glm_window` (gate) |
 | Chunked prefill interleaved with the other slots' decode steps; `prefill_budget_ms` sizes each piece from its measured time so a decoding request waits about that long | default | `prefill_chunk`, `prefill_budget_ms` | `test_prefill_equiv`, `test_server.sh` |
 | CUDA graphs for decode, one per row count | default | `no_graphs` (debug) | `test_coherence` |

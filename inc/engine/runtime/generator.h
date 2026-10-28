@@ -8,12 +8,14 @@
 #include "engine/core/comm.h"
 #include "engine/runtime/cluster.h"
 #include "engine/runtime/prefix_cache.h"
+#include "engine/runtime/steer_file.h"
 #include "engine/loader/tokenizer.h"
 #include "engine/loader/image.h"
 #include "engine/loader/chat_template.h"
 #include "engine/server/config.h"
 
 #include "engine/backend/types.h"
+#include <cmath>
 #include <string>
 #include <vector>
 #include <memory>
@@ -41,6 +43,8 @@ struct SlotMetrics {
 	// Where the time before the first token went (ms): waiting for a slot, restoring a cached prefix, the prefill kernels, storing
 	// checkpoints; what is left of the time to first token (start_time to first_token_time) went to other slots' decode steps
 	double queue_ms = 0.0, restore_ms = 0.0, prefill_ms = 0.0, store_ms = 0.0;
+	float gate_score = -1.0f;   // steering probe: the look-ahead score (-1 = no probe ran)
+	bool gate_fired = false;
 };
 
 enum class FinishReason { Stop, Length, StopString, Cancelled };
@@ -78,6 +82,16 @@ struct GenerationRequest {
 	bool starts_in_reasoning = false;
 	std::vector<int> reasoning_close;
 	int think_close_id = -1;
+	// Runtime steering (needs the steer option, ignored without it). steer_vector: "" = the option's choice, "file" = the steer_file option,
+	// else a name in steer_dir; scale and scope replace the options' (<0 / empty = the options'); think_penalty is the logit taken off the
+	// reflection markers inside the reasoning block (a prompt that ends in the template's <think> opens one; the tokenizer's </think> closes it).
+	std::string steer_vector;
+	float steer_scale = -1.0f;
+	std::string steer_scope;
+	// Overrides of the steer_gate_threshold / steer_edit_strength / steer_hedge_strength options for research (NaN = the option)
+	float probe_threshold = NAN, probe_edit_strength = NAN, probe_hedge_strength = NAN;
+	bool steer_probe = false;   // read the prompt with the steering probe first (Generator::probe_slot); replaces steer_vector when the gate fires
+	float think_penalty = -1.0f;
 	std::vector<std::string> stop_strings;   // generation ends before the first match
 	std::string matched_stop;                // set when FinishReason::StopString
 	// Called from the scheduler thread with detokenized text (never the end-of-sequence token). Returning false cancels.
@@ -188,6 +202,9 @@ public:
 	const engine::loader::VisionParams* vision_params() const { return cluster_.vision_params(); }
 	int vocab_size() const { return cluster_.metadata().vocab_size; }
 	int num_slots() const { return num_slots_; }
+	bool steer_enabled() const { return cluster_.steer_enabled(); }
+	// Steering request fields: false with the reason when the named control-vector file cannot be used (server: 400)
+	bool check_steer( const std::string& vector, const std::string& scope, std::string* err );
 
 private:
 	struct Slot {
@@ -210,6 +227,9 @@ private:
 		bool pf_chain_ok = true;
 		bool in_reasoning = false;
 		int reasoning_tokens = 0;
+		bool steer_think_open = false;   // steering: the reasoning block has not closed yet (the slot's think_end is still open)
+		int steer_scope = 0;             // steering: SteerScope bits of the slot's residual edit (0 = none)
+		bool steer_prompt = false;       // the prompt rows are edited: its KV is not the cache's (no restore, no checkpoints)
 		bool force_close = false;   // budget reached: close the reasoning block before the next step
 		std::string held_text;   // detokenized text withheld while it could still begin a stop string
 		std::vector<int> all_tokens;
@@ -239,6 +259,16 @@ private:
 	bool emit_token( int s, int tok );
 	void finish_slot( int s, FinishReason reason );
 	void apply_forced_close( int s );
+	// Steering (option steer): the slot's edits, scope, prompt length and reflection-marker penalty on every rank, set when the request is admitted
+	void steer_admit( int s );
+	// Steering probe (request field steer_probe): reads the prompt unedited (openings forced after it, then a short greedy look-ahead), builds the
+	// direction clamps from the states it sees and, when the look-ahead score passes the gate, leaves them on the slot for the real prefill
+	void probe_slot( int s );
+	const SteerFile* steer_file( const std::string& vector, std::string* err );
+	void build_penalty_ids();
+	std::mutex steer_mtx_;
+	std::map<std::string, SteerFile> steer_files_;
+	std::vector<int> penalty_ids_;
 	// Embeddings of an image: from the cache, else the vision tower (null on failure)
 	std::shared_ptr<const std::vector<backend::half_t>> image_embeddings( const GenerationRequest::Image& im );
 	std::unordered_map<uint64_t, std::shared_ptr<const std::vector<backend::half_t>>> image_cache_;

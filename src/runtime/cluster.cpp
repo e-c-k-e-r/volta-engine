@@ -666,6 +666,26 @@ void ModelCluster::reset_slot( int slot ) {
 	} );
 }
 
+void ModelCluster::steer_set( int slot, const std::vector<engine::modules::SteerEntry>& entries ) {
+	pool_.run( [&]( int d ) { models_[d]->steer_set( slot, entries, streams_[d] ); } );
+}
+
+void ModelCluster::steer_control( int slot, int scope, int prompt_len, int think_end ) {
+	pool_.run( [&]( int d ) { models_[d]->steer_control( slot, scope, prompt_len, think_end, streams_[d] ); } );
+}
+
+void ModelCluster::steer_penalty( int slot, const std::vector<int>& ids, float penalty ) {
+	pool_.run( [&]( int d ) { models_[d]->steer_penalty( slot, ids, penalty, streams_[d] ); } );
+}
+
+void ModelCluster::steer_capture( const std::vector<int>& layers, bool on ) {
+	for ( int d = 0; d < tp_; ++d ) models_[d]->steer_capture( layers, on );
+}
+
+bool ModelCluster::steer_read( std::vector<float>& out ) {
+	return models_[0]->steer_read( out, streams_[0] );
+}
+
 bool ModelCluster::reserve_tokens( int slot, int tokens ) {
 	bool ok = true;
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {

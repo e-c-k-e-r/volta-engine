@@ -8,6 +8,7 @@
 #include "engine/core/batch.h"
 #include "engine/loader/image.h"
 #include "engine/backend/types.h"
+#include "engine/modules/steer.h"
 #include <string>
 #include <memory>
 
@@ -187,6 +188,19 @@ public:
 	virtual void release_tokens( int slot_id ) { (void) slot_id; }
 	// Calibration (hessian_dir): the forwards that follow add their rows to the Hessians (on) or not (off); no-op for models without capture
 	virtual void set_hessian_capture( bool on ) { (void) on; }
+	// Runtime steering (option steer): per-slot residual edits and a logit penalty on reflection markers, all device-resident and indexed by the
+	// rows' slots. Models without it report steer_enabled() false and ignore the rest. Stream-ordered: the forwards queued after a call see it.
+	virtual bool steer_enabled() const { return false; }
+	// Replaces the slot's residual edits (an empty list clears them); the entries' layers lie in the steered range, at most kSteerEntries per layer
+	virtual void steer_set( int slot_id, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream = nullptr ) { (void) slot_id; (void) entries; (void) stream; }
+	// Which rows of the slot are edited (SteerScope bits; 0 = the slot is not steered), the request's prompt length and the position after its reasoning block
+	virtual void steer_control( int slot_id, int scope, int prompt_len, int think_end, backend::stream_t stream = nullptr ) { (void) slot_id; (void) scope; (void) prompt_len; (void) think_end; (void) stream; }
+	// The slot's logit penalty: `penalty` is subtracted from the global token ids while the predicted token lies inside the reasoning block; no ids clears it
+	virtual void steer_penalty( int slot_id, const std::vector<int>& ids, float penalty, backend::stream_t stream = nullptr ) { (void) slot_id; (void) ids; (void) penalty; (void) stream; }
+	// Probes: while on, forwards run eagerly and keep the last row's residual after the given layers; steer_read returns them as fp32 [layers.size()][hidden]
+	virtual void steer_capture( const std::vector<int>& layers, bool on ) { (void) layers; (void) on; }
+	virtual bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) { (void) out; (void) stream; return false; }
+	virtual void steer_range( int* first_layer, int* num_layers ) const { *first_layer = 0; *num_layers = 0; }
 	virtual int pool_tokens() const { return 0; }        // 0 = no shared pool
 	virtual int free_pool_tokens() const { return 0; }
 	// Per-row state slots (replace checkpoint + replay). While on, a forward also publishes the recurrent

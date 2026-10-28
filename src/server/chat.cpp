@@ -310,6 +310,14 @@ bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg
 bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatRequest req, uint64_t request_id,
 	std::shared_ptr<Responder> responder, const ConnPtr& conn, ApiError* err ) {
 	const auto family = gen.chat_template().model_family();
+	if ( req.steer_probe && !gen.steer_enabled() ) {
+		err->message = "steer_probe needs the steer option";
+		return false;
+	}
+	if ( std::string why; !gen.check_steer( req.steer_vector, req.steer_scope, &why ) ) {
+		err->message = why;
+		return false;
+	}
 	std::string prompt;
 	std::vector<int> tokens;
 	ImageList images;
@@ -339,6 +347,14 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	g.seed = req.seed;
 	g.stop_strings = req.stop;
 	g.starts_in_reasoning = in_reasoning;
+	g.steer_vector = req.steer_vector;
+	g.steer_scale = req.steer_scale;
+	g.steer_scope = req.steer_scope;
+	g.steer_probe = req.steer_probe;
+	g.probe_threshold = req.probe_threshold;
+	g.probe_edit_strength = req.probe_edit_strength;
+	g.probe_hedge_strength = req.probe_hedge_strength;
+	g.think_penalty = req.think_penalty;
 	if ( in_reasoning && req.thinking_budget > 0 ) {
 		g.reasoning_budget = req.thinking_budget;
 		g.reasoning_close = gen.tokenizer().encode( family == engine::loader::ModelFamily::GLM ? "</think>" : "\n</think>\n\n", false );

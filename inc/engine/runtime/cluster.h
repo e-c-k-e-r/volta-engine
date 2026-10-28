@@ -98,6 +98,14 @@ public:
 
 	void reset_slot( int slot );
 	void set_hessian_capture( bool on ) { for ( int d = 0; d < tp_; ++d ) models_[d]->set_hessian_capture( on ); }
+	// Runtime steering (option steer), on every rank; see ModelPipeline::steer_*. Stream-ordered with the forwards.
+	bool steer_enabled() const { return models_[0] && models_[0]->steer_enabled(); }
+	void steer_set( int slot, const std::vector<engine::modules::SteerEntry>& entries );
+	void steer_control( int slot, int scope, int prompt_len, int think_end );
+	void steer_penalty( int slot, const std::vector<int>& ids, float penalty );
+	void steer_range( int* first_layer, int* num_layers ) const { models_[0]->steer_range( first_layer, num_layers ); }
+	void steer_capture( const std::vector<int>& layers, bool on );
+	bool steer_read( std::vector<float>& out );   // rank 0's capture (the residual is replicated)
 	// Shared token pool (model option kv_pool; always roomy without it): reserve room for positions [0, tokens) of a slot on every rank, or
 	// take nothing and return false; release_tokens hands the slot's pages back. Host bookkeeping only.
 	bool reserve_tokens( int slot, int tokens );
