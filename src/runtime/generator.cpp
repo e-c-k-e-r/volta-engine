@@ -915,6 +915,8 @@ EngineMetrics Generator::get_metrics() const {
 		m.avg_prefill_tok_s = sum_prefill_tok_s_ / completed_requests_;
 		m.avg_decode_tok_s = sum_decode_tok_s_ / completed_requests_;
 	}
+	m.spec_proposals = spec_proposals_;
+	m.spec_accepted = spec_accepted_;
 	if ( spec_proposals_ > 0 ) {
 		m.spec_acceptance_rate = static_cast<double>( spec_accepted_ ) / spec_proposals_;
 	}

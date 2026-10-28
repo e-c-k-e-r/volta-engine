@@ -109,6 +109,7 @@ struct EngineMetrics {
 	double avg_prefill_tok_s = 0.0;
 	double avg_decode_tok_s = 0.0;
 	double spec_acceptance_rate = 0.0;
+	uint64_t spec_proposals = 0, spec_accepted = 0;   // drafted tokens offered to the verifier and taken, since boot
 	std::vector<size_t> gpu_vram_used_bytes;
 	PrefixCache::Stats prefix;
 	bool prefix_enabled = false;
