@@ -10,7 +10,14 @@ using cpu_moe::MailboxRoute;
 
 namespace {
 
+#if defined( USE_ROCM )
+// The constant-rate wall clock runs at 100 MHz on RDNA3 (hipDeviceAttributeWallClockRate); the host-written result is read at system scope
+__device__ inline uint64_t global_ns() { return wall_clock64() * 10; }
+__device__ inline float load_host( const float* p ) { return __hip_atomic_load( p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM ); }
+#else
 __device__ inline uint64_t global_ns() { uint64_t t; asm volatile( "mov.u64 %0, %%globaltimer;" : "=l"( t ) ); return t; }
+__device__ inline float load_host( const float* p ) { return __ldcv( p ); }
+#endif
 
 __global__ __launch_bounds__( 256 )
 void cpu_post_kernel( const half* __restrict__ x, int* __restrict__ sel, const half* __restrict__ rw, int rows, int topk, int hidden, int min_e, int max_e,
@@ -100,7 +107,7 @@ void cpu_wait_add_kernel( half* __restrict__ out, int rows, int hidden, Mailbox*
 	if ( !ok ) return;
 	__threadfence_system();
 	const float* mo = reinterpret_cast<const float*>( reinterpret_cast<const char*>( mb ) + ( ( sizeof( Mailbox ) + 255 ) & ~size_t( 255 ) ) + size_t( cpu_moe::kMailboxRows ) * hidden * 2 );
-	for ( int i = threadIdx.x; i < rows * hidden; i += blockDim.x ) out[i] = __float2half( __half2float( out[i] ) + __ldcv( mo + i ) );
+	for ( int i = threadIdx.x; i < rows * hidden; i += blockDim.x ) out[i] = __float2half( __half2float( out[i] ) + load_host( mo + i ) );
 }
 
 }   // namespace
