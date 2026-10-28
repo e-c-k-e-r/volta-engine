@@ -907,20 +907,6 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 		engine::modules::RMSNorm::forward(
 			hidden_states_, final_norm_, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
 		);
-#if defined( USE_ROCM )
-		if ( m > 8 && m <= pod::MAX_BATCH ) {
-			// The ROCm trellis GEMV takes up to 8 rows (EXL3_GEMV_ROCM_MAX_M); more rows dequantize the whole head into a scratch buffer (2.4 GB for the
-			// full vocabulary) that does not fit beside an arena sized to the free memory. The rows are independent, so the head runs in slices of 8.
-			const int H = config_.hidden_size;
-			for ( int r0 = 0; r0 < m; r0 += 8 ) {
-				const int n = MIN( 8, m - r0 );
-				pod::TensorView xs = pod::make_tensor_2d( norm_hidden_.ptr<backend::half_t>() + static_cast<size_t>( r0 ) * H, pod::DType::FP16, n, H );
-				pod::TensorView ls = pod::make_tensor_2d( logits_.ptr<backend::half_t>() + static_cast<size_t>( r0 ) * lm_shard_cols_, pod::DType::FP16, n, lm_shard_cols_ );
-				engine::modules::Linear::forward( xs, lm_head_, ls, stream );
-			}
-		}
-		else
-#endif
 		engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
 		if ( steer_.on() ) engine::modules::ResidualSteer::penalize( steer_.tables(), logits_.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, 0, m, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
 	}

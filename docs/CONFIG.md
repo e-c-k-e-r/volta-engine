@@ -113,6 +113,8 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `spec_ctrl` | bool | `true` | `ENGINE_SPEC_CTRL` | adaptive speculation controller; false always speculates |
 | `mem_log` | bool | `false` | `ENGINE_MEM_LOG` | log the per-pipeline [mem] breakdown at startup (GLM: buffers by kind, weights by kind, drafter; Flash-Next: buffers, weights by kind); the arena summary lines stay on |
 | **Debug** | | | | |
+| `exl3_gemv_max_m` | int | `4` | `ENGINE_DEBUG_EXL3_GEMV_MAX_M` | ROCm: EXL3 linears of up to this many rows (0 to 8) run the v_dot2 GEMV; the rows above it, up to exl3_wmma_max_m, run the WMMA GEMM (for A/B; the GEMV is no faster than the GEMM from 3 rows and 35% slower at 5 to 8) |
+| `exl3_wmma_max_m` | int | `64` | `ENGINE_DEBUG_EXL3_WMMA_MAX_M` | ROCm: EXL3 linears of 9 up to this many rows (at most 64) run the WMMA GEMM that reads the packed weight once; more rows, or 0 here, dequantize the weight and call hipBLAS (for A/B) |
 | `glm_layers` | int | `0` | `ENGINE_DEBUG_GLM_LAYERS` | GLM: run only the first N decoder layers (a checkpoint cut to N layers, for A/B of kernels on a small model; the logits mean nothing); 0 = all 45 |
 | `dflash_attn_scalar` | bool | `false` | `ENGINE_DEBUG_DFLASH_ATTN_SCALAR` | DFlash2 drafter attention on CUDA: the scalar one-block-per-(row, head) kernel instead of the split-key kernel (for A/B) |
 | `spec_profile` | bool | `false` | `ENGINE_DEBUG_SPEC_PROFILE` | DFlash2: time the stages of every round (draft, walk, snapshot switch, verify launch, sample wait, accept) and log the per-round averages when the server shuts down |

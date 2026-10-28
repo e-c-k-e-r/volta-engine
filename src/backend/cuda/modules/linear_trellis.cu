@@ -5,6 +5,7 @@
 #include "reconstruct.cuh"
 #include "hadamard.cuh"
 #include <cstdlib>
+#include "engine/runtime/options.h"
 
 namespace engine::modules {
 
@@ -90,7 +91,10 @@ void LinearTrellis::forward(
 #if defined(USE_ROCM)
 	// ROCm: the fused GEMM runs on emulated mma, 15-125x slower than reconstruct + hipBLAS at M = 16..64 (test_prefill_linear on a
 	// 7900 XTX). Up to EXL3_GEMV_ROCM_MAX_M rows the v_dot2 GEMV (exl3_gemv_rocm.cu), above that reconstruct
-	const bool recon = m > EXL3_GEMV_ROCM_MAX_M;
+	const int wmma_max = std::min( EXL3_GEMM_ROCM_MAX_M, runtime::options().exl3_wmma_max_m );
+	const int gemv_max = std::max( 0, std::min( EXL3_GEMV_ROCM_MAX_M, runtime::options().exl3_gemv_max_m ) );
+	const bool wmma = m > gemv_max && m <= wmma_max && !c_fp32 && ( k % 128 == 0 ) && ( n % 128 == 0 ) && bits <= 8;
+	const bool recon = m > gemv_max && !wmma;
 	gemm_shape = 0;
 #else
 	// The half-integer rates (width codes above 8) have no GEMM / GEMV instances: dequantize and run cuBLAS at any row count
@@ -100,11 +104,16 @@ void LinearTrellis::forward(
 	if ( recon && !c_fp32 && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 		forward_recon( x, trellis, suh, svh, out, bits, mcg, mul1, stream );
 	}
+#if defined(USE_ROCM)
+	else if ( wmma ) {
+		exl3_gemm_rocm( x_ptr, trellis_ptr, out_ptr, suh_ptr, A_had, svh_ptr, m, k, n, bits, mcg, mul1, c_fp32, stream );
+	}
+#endif
 	else if ( gemm_shape > 0 ) {
 		exl3_gemm( x_ptr, trellis_ptr, out_ptr, suh_ptr, A_had, svh_ptr, m, k, n, bits, mcg, mul1, c_fp32, stream, gemm_shape );
 	}
 #if defined(USE_ROCM)
-	else if ( m <= EXL3_GEMV_ROCM_MAX_M && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
+	else if ( m <= gemv_max && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 #else
 	else if ( m <= 8 && ( m == 1 || m == 2 || m == 4 || m == 8 ) && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 #endif

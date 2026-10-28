@@ -6,6 +6,7 @@
 #include "engine/core/arena.h"
 #include "engine/modules/trellis.h"
 #include "exl3_gemm.cuh"
+#include "exl3_gemv.cuh"
 #include "trellis_context.h"
 #include <cuda_runtime.h>
 #include <cmath>
@@ -118,6 +119,28 @@ int main() {
 				fails += ok_lin ? 0 : 1;
 				if ( !ok_lin ) std::printf( "  %-15s M=%3d: LinearTrellis::forward (GEMV) FAIL (max|d| %.4g)\n", sh.name, m, qr );
 			}
+#if defined( USE_ROCM )
+			// ROCm: 9..64 rows take the WMMA GEMM through the module's dispatch; same reference, timed against dequantize + hipBLAS
+			float t_w = 0.0f;
+			bool ok_w = true;
+			if ( m > 4 && m <= EXL3_GEMM_ROCM_MAX_M && sh.k % 128 == 0 && sh.n % 128 == 0 ) {
+				auto wmma = [&]() { engine::modules::LinearTrellis::forward( xm, tv, su, sv, om1, sh.bits, false, true, s ); };
+				wmma();
+				CUDA_CHECK( cudaStreamSynchronize( s ) );
+				std::vector<half> r4( r1.size() );
+				CUDA_CHECK( cudaMemcpy( r4.data(), o1.data, r4.size() * 2, cudaMemcpyDeviceToHost ) );
+				double d4 = 0, m4 = 0, q4 = 0, qm = 0;
+				for ( size_t i = 0; i < r4.size(); ++i ) {
+					const double a = __half2float( r4[i] ), b = __half2float( r2[i] );
+					d4 += a * b; m4 += a * a; q4 += b * b; qm = std::fmax( qm, std::fabs( a - b ) );
+				}
+				ok_w = d4 / ( std::sqrt( m4 ) * std::sqrt( q4 ) + 1e-30 ) >= 0.9999 && qm <= 0.05 * rms * 4.0;
+				fails += ok_w ? 0 : 1;
+				t_w = time_us( wmma, s, 10 );
+				std::printf( "  %-15s M=%3d: WMMA GEMM (dispatch) %7.1f us  recon %7.1f us (%.2fx)  max|d| %.4g  %s\n", sh.name, m, t_w, time_us( recon, s, 10 ), t_w / time_us( recon, s, 10 ), qm, ok_w ? "PASS" : "FAIL" );
+			}
+			continue;   // the emulated-mma fused GEMM below is 15 to 125 times slower on this backend and is not the path anything takes
+#endif
 			const float t_g = time_us( gemm, s, 10 ), t_r = time_us( recon, s, 10 );
 			std::printf( "  %-15s M=%3d: cos %.6f  max|d| %.4g (rms %.3g) | gemm %7.1f us  recon %7.1f us (%.2fx)  %s\n",
 				sh.name, m, cosv, maxd, rms, t_g, t_r, t_g / t_r, ok ? "PASS" : "FAIL" );
