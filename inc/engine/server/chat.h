@@ -47,6 +47,7 @@ struct ChatRequest {
 	float steer_scale = -1.0f;
 	std::string steer_scope;
 	float probe_threshold = NAN, probe_edit_strength = NAN, probe_hedge_strength = NAN;   // per-request values of the probe options (NaN = the option)
+	std::string probe_edit_layers;   // per-request steer_edit_layers (empty = the option)
 	bool steer_probe = false;   // the steering probe reads the prompt first and applies its direction clamps when the gate fires
 	float think_penalty = -1.0f;
 };
@@ -57,6 +58,8 @@ struct Usage {
 	int completion_tokens = 0;
 	double ttft_ms = 0.0;
 	double decode_tok_s = 0.0;
+	float gate_score = -1.0f;   // steering probe: the look-ahead score (-1 = no probe ran)
+	bool gate_fired = false;
 };
 
 // Writes one protocol's response for one request. Called from the scheduler thread.

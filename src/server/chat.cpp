@@ -351,6 +351,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	g.steer_scale = req.steer_scale;
 	g.steer_scope = req.steer_scope;
 	g.steer_probe = req.steer_probe;
+	g.probe_edit_layers = req.probe_edit_layers;
 	g.probe_threshold = req.probe_threshold;
 	g.probe_edit_strength = req.probe_edit_strength;
 	g.probe_hedge_strength = req.probe_hedge_strength;
@@ -397,6 +398,8 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		u.completion_tokens = m.generated_tokens;
 		u.ttft_ms = std::chrono::duration<double, std::milli>( m.first_token_time - m.start_time ).count();
 		u.decode_tok_s = m.decode_tok_s;
+		u.gate_score = m.gate_score;
+		u.gate_fired = m.gate_fired;
 		state->responder->on_finish( reason, matched, state->parser.saw_tool_call(), u );
 	};
 	if ( !gen.submit_request( std::move( g ) ) ) {

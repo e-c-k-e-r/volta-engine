@@ -90,6 +90,7 @@ struct GenerationRequest {
 	std::string steer_scope;
 	// Overrides of the steer_gate_threshold / steer_edit_strength / steer_hedge_strength options for research (NaN = the option)
 	float probe_threshold = NAN, probe_edit_strength = NAN, probe_hedge_strength = NAN;
+	std::string probe_edit_layers;   // per-request steer_edit_layers (empty = the option)
 	bool steer_probe = false;   // read the prompt with the steering probe first (Generator::probe_slot); replaces steer_vector when the gate fires
 	float think_penalty = -1.0f;
 	std::vector<std::string> stop_strings;   // generation ends before the first match

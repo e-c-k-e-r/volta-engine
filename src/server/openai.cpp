@@ -189,8 +189,10 @@ private:
 	}
 
 	static json usage_json( const Usage& u ) {
-		return { { "prompt_tokens", u.prompt_tokens }, { "completion_tokens", u.completion_tokens }, { "total_tokens", u.prompt_tokens + u.completion_tokens }, { "prompt_tokens_details", { { "cached_tokens", u.cached_tokens } } },
+		json j = { { "prompt_tokens", u.prompt_tokens }, { "completion_tokens", u.completion_tokens }, { "total_tokens", u.prompt_tokens + u.completion_tokens }, { "prompt_tokens_details", { { "cached_tokens", u.cached_tokens } } },
 			{ "ttft_ms", u.ttft_ms }, { "decode_tok_s", u.decode_tok_s } };
+		if ( u.gate_score >= 0.0f || u.gate_fired ) j["steer_gate"] = { { "score", u.gate_score }, { "fired", u.gate_fired } };
+		return j;
 	}
 
 	bool sse( const json& j ) { return conn_->write_all( "data: " + dump_safe( j ) + "\n\n" ); }
@@ -288,6 +290,7 @@ public:
 		if ( j.contains( "steer_gate_threshold" ) && j["steer_gate_threshold"].is_number() ) r.probe_threshold = j["steer_gate_threshold"].get<float>();
 		if ( j.contains( "steer_edit_strength" ) && j["steer_edit_strength"].is_number() ) r.probe_edit_strength = j["steer_edit_strength"].get<float>();
 		if ( j.contains( "steer_hedge_strength" ) && j["steer_hedge_strength"].is_number() ) r.probe_hedge_strength = j["steer_hedge_strength"].get<float>();
+		if ( j.contains( "steer_edit_layers" ) && j["steer_edit_layers"].is_string() ) r.probe_edit_layers = j["steer_edit_layers"].get<std::string>();
 		if ( j.contains( "steer_probe" ) && j["steer_probe"].is_boolean() ) r.steer_probe = j["steer_probe"].get<bool>();
 		if ( j.contains( "think_penalty" ) && j["think_penalty"].is_number() ) r.think_penalty = j["think_penalty"].get<float>();
 		*out = std::move( r );

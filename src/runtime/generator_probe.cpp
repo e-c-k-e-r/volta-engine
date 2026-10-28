@@ -43,7 +43,7 @@ void Generator::probe_slot( int s ) {
 	const int n = static_cast<int>( prompt.size() );
 	int b0, b1, e0, e1, sfirst = 0, scount = 0;
 	cluster_.steer_range( &sfirst, &scount );
-	if ( !layer_range( opt.steer_band, NL / 3, 2 * NL / 3, NL, &b0, &b1 ) || !layer_range( opt.steer_edit_layers, 3 * NL / 7, 2 * NL / 3, NL, &e0, &e1 ) ||
+	if ( !layer_range( opt.steer_band, NL / 3, 2 * NL / 3, NL, &b0, &b1 ) || !layer_range( !slot.req.probe_edit_layers.empty() ? slot.req.probe_edit_layers : opt.steer_edit_layers, 17 * NL / 32, 21 * NL / 32, NL, &e0, &e1 ) ||
 		e0 < b0 || e1 > b1 || e0 < sfirst || e1 >= sfirst + scount ) {
 		LOG_ERROR( "[steer] probe skipped: the edit layers %d-%d must lie inside the band and inside steer_layers %d-%d\n", e0, e1, sfirst, sfirst + scount - 1 );
 		return;
@@ -128,8 +128,10 @@ void Generator::probe_slot( int s ) {
 			}
 		}
 		cluster_.steer_set( s, entries );
-		slot.steer_scope = engine::modules::STEER_ALL;
-		slot.steer_prompt = true;
+		int scope = engine::modules::STEER_ALL;
+		if ( !slot.req.steer_scope.empty() ) parse_steer_scope( slot.req.steer_scope, &scope );   // a request may restrict the clamps (prompt, generated, ...)
+		slot.steer_scope = scope;
+		slot.steer_prompt = ( scope & engine::modules::STEER_PROMPT ) != 0;
 		slot.steer_think_open = slot.in_reasoning;
 		cluster_.steer_control( s, slot.steer_scope, n, slot.in_reasoning ? INT_MAX : 0 );
 	}

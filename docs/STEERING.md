@@ -43,13 +43,17 @@ For a request with `steer_probe`, before its prefill (on the scheduler thread; o
 1. The prompt is prefilled unedited and its recurrent state checkpointed. A few short openings are forced after it (5 accepting, 8 declining, 4 plain, 4 hedged; English, in `src/runtime/generator_probe.cpp`), each run as a block whose state is rolled back, and the residual after every layer of the band (`steer_band`, default 1/3 to 2/3 of the layers) at the last token is kept. These blocks run without the LM head.
 2. Per band layer, the axis is the unit difference of the mean declining and accepting states, with the spread of the accepting samples projected out (`src/runtime/steer_probe.cpp`). `pa`, `pb` are the mean projections of the two sets and `sd` the standard deviation of the accepting one.
 3. Look-ahead: the model decodes 24 greedy tokens unedited; for each token the band-averaged fraction `(h . axis - pa) / max(pb - pa, 1e-3)` is taken, and the largest over the tokens is the score.
-4. Score above `steer_gate_threshold`: the gate fires. The slot gets a clamp on each edit layer (`steer_edit_layers`, default 3/7 to 2/3) with reference `pa - steer_edit_strength * sd`, optionally a second clamp (plain against hedged openings, reference `plain mean + steer_hedge_strength * gap`, off when negative), scope `all`, and the prompt is prefilled again with the edit active. Below it the request runs as if the probe had not been asked for, from the prefix cache like any other.
+4. Score above `steer_gate_threshold`: the gate fires. The slot gets a clamp on each edit layer (`steer_edit_layers`, default 17/32 to 21/32 of the layers, 34 to 42 of 64) with reference `pa - steer_edit_strength * sd`, optionally a second clamp (plain against hedged openings, reference `plain mean + steer_hedge_strength * gap`, off when negative), scope `all`, and the prompt is prefilled again with the edit active. Below it the request runs as if the probe had not been asked for, from the prefix cache like any other.
 
 The score is logged (`[steer] req N gate fired|clean score=... (threshold ..., ms)`) and kept in the request's metrics. The probe replaces `steer_vector` when it fires.
 
 ## Options
 
 `steer`, `steer_layers`, `steer_file`, `steer_dir`, `steer_scale`, `steer_scope`, `think_penalty`, `think_penalty_words`, `steer_gate_threshold`, `steer_edit_strength`, `steer_hedge_strength`, `steer_band`, `steer_edit_layers`; see [CONFIG.md](CONFIG.md). `think_penalty_words` is a comma list or a file with one word per line (default `Wait, Hmm, Alternatively, But`); each word's first token in the spellings as is, lower case, capitalised, each plain, after a space and after a newline goes on the list, which the server logs at start.
+
+## Sweeps
+
+`tests/tools/steer_sweep.py` sends two prompt files (target and control, one prompt per line) to a running server with `steer=on` over a grid of `steer_edit_strength`, `steer_edit_layers`, `steer_scope` and `steer_hedge_strength`, and reports per point the gate fire rate, the share of outputs that start with a stock opening, repetition and doubled words, and how far the control text moves from the unprobed text when the gate is forced. The response carries the gate score in `usage.steer_gate`.
 
 ## Tests
 
@@ -62,4 +66,4 @@ The score is logged (`[steer] req N gate fired|clean score=... (threshold ..., m
 * Qwen3.5-family models with a single residual stream; the other models do not implement the hooks.
 * The DFlash2 and MTP heads do not apply the logit penalty, and see the steered hidden states; acceptance on steered slots is not measured.
 * The probe prefills a probed prompt twice when the gate fires and once more than a plain request when it does not (the probe's own prefill is not taken from the prefix cache).
-* The openings are English and short, the band-averaged score and the clamp strengths are tuned on a handful of prompts of one model; the second clamp degrades the text quickly.
+* The defaults (gate threshold 0.65, edit strength -8, edit layers 34-42 of 64, second clamp off) were tuned on Qwen3.8-27B EXL3 4.0 bpw with `tests/tools/steer_sweep.py` over 8 target and 10 control prompts: the gate fired on 7 of 8 target prompts and on none of the control prompts (scores 0.66 to 0.83 against 0.45 to 0.61), and the control text was unchanged. A wider edit window or a higher strength degrades unrelated text when the gate fires; other models, depths and quant formats need their own sweep. The openings are English and short; the second clamp degrades the text quickly.
