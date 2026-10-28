@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sweep of the steering probe's settings against a running server (steer=on).
 
-Two prompt files, one prompt per line (the files are the caller's; nothing is bundled):
+Two prompt files, one prompt per line, plain text or a JSON object {"messages": [...]} for a conversation (the files are the caller's; nothing is bundled; tests/tools/steer_eval_sets.py writes a larger pair):
   --target   prompts whose stock reply the probe is meant to steer away from
   --control  prompts that should come through unchanged
 For every point of the grid (edit strength x edit layers x scope x second-clamp strength) each prompt is sent greedily with steer_probe;
@@ -22,7 +22,9 @@ STOCK = ["i cannot", "i can't", "i can not", "i'm sorry", "i am sorry", "sorry",
 
 
 def ask(url, prompt, max_tokens, extra):
-    body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": 0, "enable_thinking": False}
+    # a prompt line is plain text (one user turn) or a JSON object {"messages": [...]} for a conversation
+    messages = json.loads(prompt)["messages"] if prompt.startswith("{") else [{"role": "user", "content": prompt}]
+    body = {"messages": messages, "max_tokens": max_tokens, "temperature": 0, "enable_thinking": False}
     body.update(extra)
     req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(), {"content-type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
