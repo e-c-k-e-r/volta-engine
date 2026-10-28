@@ -56,6 +56,9 @@ __device__ inline half decode_3inst( uint32_t x ) {
 	}
 }
 
+#if defined(USE_ROCM)
+#include "../../rocm/trellis/codebook_rdna.cuh"
+#else
 template <int cb>
 __device__ inline half2 decode_3inst_2( uint32_t x0, uint32_t x1 ) {
 	if constexpr ( cb == 0 ) {
@@ -82,3 +85,4 @@ __device__ inline half2 decode_3inst_2( uint32_t x0, uint32_t x1 ) {
 		return decode_mul1_product_2( x0, x1 );
 	}
 }
+#endif

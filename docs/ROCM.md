@@ -60,6 +60,12 @@ device's limit:
 The emulated `mma` kernels are slow on RDNA, so by row count a linear takes another route. An EXL3 linear takes a GEMV for 1 to 4 rows, a
 WMMA GEMM for 5 to 64 rows, and above that dequantizes its weight once into FP16 and runs one hipBLAS GEMM (prefill chunks).
 
+All of them decode the trellis with the RDNA form of the codebook hash (`src/kernels/rocm/trellis/codebook_rdna.cuh`, after upstream exllamav3's
+RDNA GEMV): the 32-bit multiply of a 16-bit index, a quarter-rate `v_mul_lo_u32`, is one packed 16-bit multiply and one 24-bit multiply-add,
+and the mul1 byte sums are `v_sad_u8` / `v_sad_hi_u8`, which leave the decoded pair packed. It gives the same halves as the CUDA decode for
+every index (checked exhaustively for the three codebooks). The ROCm-only kernels and declarations live in `src/kernels/rocm/`; the shared
+sources include them under `USE_ROCM`.
+
 The GEMV (`src/kernels/rocm/trellis/exl3_gemv.cu`, after upstream exllamav3's RDNA GEMV) is a plain launch: the input and output
 Hadamard transforms are their own launches, and between them a kernel accumulates `v_dot2_f32_f16` straight from the trellis
 decoder's fragments (each lane quad owns two output columns), one block per 16 columns with its warps splitting K. The CUDA GEMV is
@@ -104,7 +110,7 @@ the host for each kernel launch, so on ROCm they report the count instead of fai
 
 ## Still on the vector ALUs or the emulation
 
-* The EXL3 GEMV and GEMM: the GEMV's per-row products use `v_dot2` and its trellis decode is ALU-bound, so an 8-row verify costs 2.3 times a token on EXL3.
+* The EXL3 GEMV (1 to 4 rows): its per-row products use `v_dot2`.
 * The MoE kernels other than the expert-grouped one (`moe_kernels.cu`, `exl3_moe_coop.cu`) and the int8 GEMV.
 * The linear-attention (GDN) prefill recurrence, which is serial per head.
 
@@ -115,8 +121,8 @@ One RX 7900 XTX (24 GB), Qwen3.8-27B, `build/bench_decode` (8K context) and `ben
 | | Plain token | 8-row verify | Prefill (512-row chunks) |
 |---|---|---|---|
 | NVFP4 (head quantized, `nvfp4_dense=head`) | 21.6 ms (46 tok/s) | 27 ms (1.25x) | 1123 tok/s |
-| EXL3 4.0 bpw | 29.0 ms (34 tok/s) | 40 ms (1.4x) | 1115 tok/s |
+| EXL3 4.0 bpw | 29.2 ms (34 tok/s) | 37 ms (1.3x) | 1115 tok/s |
 
 * NVFP4 target with the DFlash2 EXL3 5.0 bpw drafter, natural 8K prompts (`tests/3_bench/bench_serve.py`): 129, 153, 145 and 75 tok/s, 37 ms per round (27 ms verify, 9.5 ms drafter).
 * The NVFP4 GEMVs read the packed weights at 80 to 90% of the 920 GB/s a plain read kernel reaches on this card; the prefill GEMM reaches 73 of the ~96 TFLOP/s the WMMA peaks at.
-* EXL3 decode is bound by the trellis decode arithmetic (about 29 ms of the plain token with the per-row math removed), not by memory. A verify block of 8 rows costs 1.4 times a token (40 ms), 12 rows 42 ms and 16 rows 45 ms (`bench_decode` with `BENCH_VL=8,12,16`, 8000 tokens of context).
+* An EXL3 plain token at 8K context is about 1900 kernel launches: the GEMVs take about 21 ms of it and read the large projections at 690 to 750 GB/s, attention about 2 ms and the Hadamard rotations (two per linear) about 1 ms (rocprofv3 kernel trace of `bench_decode`). A verify block of 8 rows costs 1.3 times a token (37 ms), 12 rows 39 ms and 16 rows 43 ms (`bench_decode` with `BENCH_VL=8,12,16`, 8000 tokens of context).

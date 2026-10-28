@@ -90,7 +90,7 @@ void LinearTrellis::forward(
 	if ( bits == 5 && m >= 4 && m <= 8 && mul1 && !c_fp32 && n == 6144 && ( k % 16 == 0 ) ) gemm_shape = 4;
 #if defined(USE_ROCM)
 	// ROCm: the fused GEMM runs on emulated mma, 15-125x slower than reconstruct + hipBLAS at M = 16..64 (test_prefill_linear on a
-	// 7900 XTX). Up to EXL3_GEMV_ROCM_MAX_M rows the v_dot2 GEMV (exl3_gemv_rocm.cu), above that reconstruct
+	// 7900 XTX). Up to EXL3_GEMV_ROCM_MAX_M rows the v_dot2 GEMV (src/kernels/rocm/trellis/exl3_gemv.cu), above that reconstruct
 	const int wmma_max = std::min( EXL3_GEMM_ROCM_MAX_M, runtime::options().exl3_wmma_max_m );
 	const int gemv_max = std::max( 0, std::min( EXL3_GEMV_ROCM_MAX_M, runtime::options().exl3_gemv_max_m ) );
 	const bool wmma = m > gemv_max && m <= wmma_max && !c_fp32 && ( k % 128 == 0 ) && ( n % 128 == 0 ) && bits <= 8;
