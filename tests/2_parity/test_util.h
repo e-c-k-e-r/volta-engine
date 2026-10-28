@@ -3,7 +3,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
-#ifdef __CUDA_FP16_H__
+#if defined( __CUDA_FP16_H__ ) || defined( USE_ROCM )   // the ROCm stand-in header does not define the CUDA guard
 	#define TEST_UTIL_HAS_HALF 1
 #endif
 
