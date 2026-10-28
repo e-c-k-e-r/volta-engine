@@ -103,6 +103,7 @@ ENGINE_TIER_ENTRY( GatedResidual, gemm_f32, CudaSm70, "CPU: plain C++ (gated_res
 ENGINE_TIER_ENTRY( GatedResidual, gate_act, CudaSm70, "CPU: plain C++ (gated_residual.cpp); Vulkan: flash.slang" )
 ENGINE_TIER_ENTRY( GatedResidual, up_epilogue, CudaSm70, "CPU: plain C++ (gated_residual.cpp); Vulkan: flash.slang" )
 ENGINE_TIER_ENTRY( ResidualSteer, apply, CudaSm70, "CPU, Vulkan: unsupported (steering runs on CUDA and ROCm)" )
+ENGINE_TIER_ENTRY( ResidualSteer, apply_streams, CudaSm70, "CPU, Vulkan: unsupported (steering runs on CUDA and ROCm)" )
 ENGINE_TIER_ENTRY( ResidualSteer, penalize, CudaSm70, "CPU, Vulkan: unsupported (steering runs on CUDA and ROCm)" )
 ENGINE_TIER_ENTRY( PLE, gate_and_norm, CudaSm70, "CPU: plain C++ (ple.cpp); Vulkan: flash.slang" )
 ENGINE_TIER_ENTRY( PLE, conv_apply, CudaSm70, "CPU: plain C++ (ple.cpp); Vulkan: flash.slang" )

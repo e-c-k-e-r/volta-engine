@@ -1,6 +1,6 @@
 # Runtime steering
 
-Changes how a model behaves at inference time, per request, with the weights untouched: control vectors added to the residual stream, a direction clamp built by a probe of the prompt itself, and a logit penalty on reflection markers inside the reasoning block. The edits act on the fp16 residual after a range of layers, so they are independent of the weight format (EXL3, NVFP4). Qwen3.5-family dense models (Qwen3.8-27B) only; the CPU and Vulkan builds carry stubs.
+Changes how a model behaves at inference time, per request, with the weights untouched: control vectors added to the residual stream, a direction clamp built by a probe of the prompt itself, and a logit penalty on reflection markers inside the reasoning block. The edits act on the fp16 residual after a range of layers, so they are independent of the weight format (EXL3, NVFP4). Qwen3.5-family dense models (Qwen3.8-27B) and Qwen3.8-Flash-Next; the CPU and Vulkan builds carry stubs.
 
 Everything is off unless `steer` is set (`on`, or `file` to give every request the `steer_file` vector). With `steer=off` no table is allocated and no kernel is launched.
 
@@ -77,6 +77,17 @@ The score is logged (`[steer] req N gate fired|clean score=... (threshold ..., m
 
 On Qwen3.8-27B EXL3 4.0 bpw, 12 such questions at 3500 tokens, the model hesitates rarely (0.19 marker words per 100 reasoning words, 307 reasoning words per answer on average); penalties of 2, 4 and 8 take the marker rate to 0.05, 0.03 and 0.00 and change neither the length (307 to 315 words) nor the share finished or correct (0.83 each; the two unfinished questions are long enumerations with 1000-word reasoning that the penalty does not shorten). The default stays 0.
 
+## Flash-Next
+
+Flash-Next (`qwen4_exp`) keeps four fp32 residual streams per row. The steering entries act on the mean of the four and the change of the mean is added to every stream (`ResidualSteer::apply_streams`), after the finished layer; a layer that is steered or captured skips the fused all-reduce hand-off of pre-normed streams, since it edits the streams after it. The probe captures the stream mean, and the penalty runs after the LM head as for Qwen. `steer_build` reads `model_type` from the checkpoint's `config.json`. The default steered layers are 1/3 to 2/3 of the 48 (16 to 32).
+
+On the 24 GB card this model loads with `expert_cache` 0.4 (0.5 does not fit the arena) and decodes at about 16 to 20 tokens per second; a probe takes about 9.5 s here against 2.5 s on the 27B.
+
+Measured on Qwen3.8-Flash-Next-exl3 (2 bpw experts), numbers tuned for the 27B left as they are:
+* Clamp, 12 target and 8 control prompts: the gate fires on exactly the 6 targets the model declines unprobed (scores 0.66 to 1.01), not on the 6 it answers (0.29 to 0.50) and not on any control (0.31 to 0.45). With the 27B's edit settings (strength -8, edit layers 25 to 31) 2 of those 6 stop declining and 4 still do; the window and strength need their own sweep on this model, as does the threshold (the gap between the two groups is wider than on the 27B).
+* Vectors (6 held-out prompts each, `steer_vec_sweep.py`): `terse` at scale 1 takes the answers from 336 words (none finished at 500 tokens) to 73 (all finished), 14 at 2; `direct` at 2 gives 56 words and no caveat phrases (caveat share 0.50 unsteered, 0.17 at scale 1); `english` takes the CJK share of the answers to Chinese questions from 0.61 to 0.29 at scale 1 and 0.00 at 2. Recommended scales stored in the files: terse 1.0, direct 2.0, english 2.0. Repetition and doubled words stay at the unsteered level at these scales.
+* The penalty path is live: a thinking request with `think_penalty` 8 differs from the plain one (53 against 61 reasoning words on a short question).
+
 ## Tests
 
 * `test_steer`: the kernels against an fp32 reference on a mixed batch (add and clamp, every scope, slots with and without edits, the penalty over a vocabulary slice); rows the scope does not cover and unlisted logits come back bit-identical.
@@ -85,7 +96,7 @@ On Qwen3.8-27B EXL3 4.0 bpw, 12 such questions at 3500 tokens, the model hesitat
 
 ## Limits
 
-* Qwen3.5-family models with a single residual stream; the other models do not implement the hooks.
+* The Qwen3.5 family and Flash-Next implement the hooks; GLM and DeepSeek (also several residual streams) do not.
 * Speculation (DFlash2 drafter, MTP head) stays correct under steering, because the verify block runs the same steered forward as plain decode; the draft proposals are not steered by the edits of their own layers and do not apply the logit penalty. `tests/tools/steer_spec_bench.py` measures the cost on Qwen3.8-27B (8 questions, 200 tokens): the accepted share of drafted tokens is 0.358 (DFlash2) and 0.486 (MTP) without steering, 0.323 and 0.520 with the terse vector, 0.332 and 0.479 with the clamp forced, and with a penalty of 8 on common sentence starters inside the reasoning block 0.325 against 0.330 and 0.479 against 0.486. The steered text equals the unspeculated steered text on 7 of 8 prompts with either speculator (the eighth differs late in the answer, at the same place for both).
 * The probe prefills a probed prompt twice when the gate fires and once more than a plain request when it does not (the probe's own prefill is not taken from the prefix cache).
 * The defaults (gate threshold 0.65, edit strength -8, edit layers 34-42 of 64, second clamp off) were tuned on Qwen3.8-27B EXL3 4.0 bpw with `tests/tools/steer_sweep.py` over 8 target and 10 control prompts: the gate fired on 7 of 8 target prompts and on none of the control prompts (scores 0.66 to 0.83 against 0.45 to 0.61), and the control text was unchanged. A wider edit window or a higher strength degrades unrelated text when the gate fires; other models, depths and quant formats need their own sweep. The openings are English and short; the second clamp degrades the text quickly.

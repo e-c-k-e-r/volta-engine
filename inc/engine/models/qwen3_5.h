@@ -2,6 +2,7 @@
 
 #include "engine/modules/hessian.h"
 #include "engine/modules/steer.h"
+#include "engine/models/steer_host.h"
 #include "engine/config.h"
 #include "engine/models/model.h"
 #include "engine/models/qwen3_vision.h"
@@ -138,13 +139,13 @@ public:
 	void reset_state( int slot_id = 0 ) override;
 	bool has_mtp() const override { return mtp_on_; }
 	void set_hessian_capture( bool on ) override { hess_.enable( on ); }
-	bool steer_enabled() const override { return steer_.layers > 0; }
-	void steer_set( int slot_id, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream = nullptr ) override;
-	void steer_control( int slot_id, int scope, int prompt_len, int think_end, backend::stream_t stream = nullptr ) override;
-	void steer_penalty( int slot_id, const std::vector<int>& ids, float penalty, backend::stream_t stream = nullptr ) override;
-	void steer_capture( const std::vector<int>& layers, bool on ) override;
-	bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) override;
-	void steer_range( int* first_layer, int* num_layers ) const override { *first_layer = steer_first_; *num_layers = steer_.layers; }
+	bool steer_enabled() const override { return steer_.on(); }
+	void steer_set( int slot_id, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream = nullptr ) override { steer_.set( slot_id, entries, stream ); }
+	void steer_control( int slot_id, int scope, int prompt_len, int think_end, backend::stream_t stream = nullptr ) override { steer_.control( slot_id, scope, prompt_len, think_end, stream ); }
+	void steer_penalty( int slot_id, const std::vector<int>& ids, float penalty, backend::stream_t stream = nullptr ) override { steer_.penalty( slot_id, ids, penalty, stream ); }
+	void steer_capture( const std::vector<int>& layers, bool on ) override { steer_.capture( layers, on ); }
+	bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) override { return steer_.read( out, stream ); }
+	void steer_range( int* first_layer, int* num_layers ) const override { *first_layer = steer_.first(); *num_layers = steer_.layers(); }
 	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
 	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
 	bool inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream = nullptr ) override;
@@ -170,13 +171,7 @@ private:
 	engine::core::GraphCache graphs_;
 	int hess_layer_ = 0;
 	engine::modules::HessianSet hess_;   // calibration (hessian_dir): sites per layer 0 attention input, 1 MLP input, 2 o_proj / out_proj input, 3 down_proj input; (0, 4) the LM head input
-	engine::modules::SteerTables steer_;   // runtime steering (option steer): empty (layers 0) when off
-	int steer_first_ = 0;
-	std::vector<engine::modules::SteerSlotCtl> steer_ctl_host_;
-	bool steer_cap_on_ = false;
-	std::vector<int> steer_cap_layer_;      // per model layer: row of steer_cap_ (-1 = not kept)
-	std::vector<int> steer_cap_order_;      // the captured layers in the caller's order
-	backend::half_t* steer_cap_ = nullptr;  // [layers][hidden] last row after each captured layer
+	SteerHost steer_;   // runtime steering (option steer): off (nothing allocated) unless set
 
 	// Per-rank (TP-sharded) head counts
 	int q_heads_ = 0;

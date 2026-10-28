@@ -4,7 +4,7 @@
 // the contrast the prompts show at a steer_scale of 1. Prompts are one per line (\n inside a prompt written as \\n); each is wrapped as a user turn with the answer started after an empty reasoning block.
 //   steer_build --pos pos.txt --neg neg.txt --out v.steer [--layers 21-42] [--model dir] [--scope generated] [--scale 1.5]
 //   steer_build --batch dir [...]     every NAME.pos.txt with a NAME.neg.txt in dir gives dir/NAME.steer (one model load for all)
-// Needs the steer option (set here) and a checkpoint of a Qwen3.5-family model.
+// Needs the steer option (set here) and a checkpoint of a model with the steering hooks (qwen3_5, qwen4_exp; read from its config.json).
 #include "engine/runtime/cluster.h"
 #include "engine/runtime/steer_file.h"
 #include "engine/runtime/test_paths.h"
@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
@@ -69,7 +70,13 @@ int main( int argc, char** argv ) {
 	if ( !tok.load( model.c_str() ) ) { std::fprintf( stderr, "tokenizer load failed (%s)\n", model.c_str() ); return 1; }
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = "qwen3_5";
+	{
+		// model_type of the checkpoint (qwen3_5 or qwen4_exp): the same file the server reads
+		std::ifstream cf( model + "/config.json" );
+		const nlohmann::json j = nlohmann::json::parse( cf, nullptr, false );
+		cfg.model_type = !j.is_discarded() && j.contains( "model_type" ) && j["model_type"].is_string() ? j["model_type"].get<std::string>() : "qwen3_5";
+		if ( cfg.model_type != "qwen3_5" && cfg.model_type != "qwen4_exp" ) { std::fprintf( stderr, "model_type %s has no steering hooks\n", cfg.model_type.c_str() ); return 1; }
+	}
 	cfg.model_dir = model;
 	if ( !mc.init( cfg ) ) return 1;
 	int first = 0, count = 0;

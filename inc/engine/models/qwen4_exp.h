@@ -2,6 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/models/model.h"
+#include "engine/models/steer_host.h"
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
@@ -127,6 +128,14 @@ public:
 	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
 	bool has_mtp() const override { return mtp_on_; }
 	void set_hessian_capture( bool on ) override { hess_on_ = on; }
+	// Runtime steering (option steer): the edits act on the mean of the residual streams and shift every stream by the change (ResidualSteer::apply_streams)
+	bool steer_enabled() const override { return steer_.on(); }
+	void steer_set( int slot_id, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream = nullptr ) override { steer_.set( slot_id, entries, stream ); }
+	void steer_control( int slot_id, int scope, int prompt_len, int think_end, backend::stream_t stream = nullptr ) override { steer_.control( slot_id, scope, prompt_len, think_end, stream ); }
+	void steer_penalty( int slot_id, const std::vector<int>& ids, float penalty, backend::stream_t stream = nullptr ) override { steer_.penalty( slot_id, ids, penalty, stream ); }
+	void steer_capture( const std::vector<int>& layers, bool on ) override { steer_.capture( layers, on ); }
+	bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) override { return steer_.read( out, stream ); }
+	void steer_range( int* first_layer, int* num_layers ) const override { *first_layer = steer_.first(); *num_layers = steer_.layers(); }
 	// DFlash2 drafter (see DraftHooks): a tap ring per slot, filled by forward_body once a drafter is attached (set_snapshot_taps)
 	const DraftHooks& draft_hooks() const override { return draft_hooks_; }
 	void draft_head_topk( int rows, backend::stream_t stream = nullptr ) override;
@@ -171,6 +180,10 @@ private:
 	void gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream );
 	void defer_apply();
 	void flush_apply( int m, backend::stream_t stream );
+	// After layer L: the steering edits of its range and the probe's capture of the stream mean (both read the finished streams)
+	void steer_layer( int L, int m, backend::stream_t stream );
+	SteerHost steer_;
+	pod::TensorView steer_mean_;         // [MAX_ROWS, hidden] fp16: the stream mean of a probe's capture
 	pod::TensorView gr16_hi_, gr16_lo_, gr16_z_, gr16_thi_, gr16_tlo_, gr16_u_;   // operands / results of the tensor-core gated residual (prefill rows)
 	bool normed_ready_ = false;    // gr_scratch_ already holds the next gr_mix's normed streams (the fused all-reduce wrote them)
 	bool apply_pending_ = false;   // a gated add (post_, y_) waits to be folded into the next gr_mix

@@ -51,6 +51,57 @@ void steer_apply_kernel( SteerTables t, half* __restrict__ hidden, const pod::Ba
 	for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) x[i] = __float2half_rn( fminf( fmaxf( srow[i], -65504.0f ), 65504.0f ) );
 }
 
+// The mean of the hc streams is edited as in steer_apply_kernel and the change is added to every stream
+__global__ __launch_bounds__( 256 )
+void steer_apply_streams_kernel( SteerTables t, float* __restrict__ streams, int hc, const pod::BatchRows* __restrict__ rows, int layer_index ) {
+	extern __shared__ float smem[];
+	float* srow = smem;              // the edited mean
+	float* orig = smem + t.hidden;   // the mean before the edits
+	const int r = blockIdx.x;
+	const int slot = rows->slot[r];
+	const SteerSlotCtl c = t.ctl[slot];
+	if ( ( c.scope & row_class( c, rows->pos[r] ) ) == 0 ) return;
+	const size_t entry0 = ( static_cast<size_t>( slot ) * t.layers + layer_index ) * kSteerEntries;
+	bool any = false;
+	#pragma unroll
+	for ( int k = 0; k < kSteerEntries; ++k ) any |= t.kind[entry0 + k] != STEER_OFF;
+	if ( !any ) return;
+
+	float* x = streams + static_cast<size_t>( r ) * hc * t.hidden;
+	for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) {
+		float m = 0.0f;
+		for ( int s = 0; s < hc; ++s ) m += x[static_cast<size_t>( s ) * t.hidden + i];
+		m /= static_cast<float>( hc );
+		srow[i] = m;
+		orig[i] = m;
+	}
+	__syncthreads();
+	for ( int k = 0; k < kSteerEntries; ++k ) {
+		const int kind = t.kind[entry0 + k];
+		if ( kind == STEER_OFF ) continue;
+		const float* v = t.vec + ( entry0 + k ) * t.hidden;
+		const float par = t.par[entry0 + k];
+		if ( kind == STEER_ADD ) {
+			for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) srow[i] += par * v[i];
+		}
+		else {
+			float dot = 0.0f;
+			for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) dot = fmaf( srow[i], v[i], dot );
+			dot = engine::math::block_sum<8>( dot );
+			const float over = dot - par;
+			if ( over > 0.0f ) {
+				for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) srow[i] -= over * v[i];
+			}
+			__syncthreads();
+		}
+		__syncthreads();
+	}
+	for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) {
+		const float d = srow[i] - orig[i];
+		for ( int s = 0; s < hc; ++s ) x[static_cast<size_t>( s ) * t.hidden + i] += d;
+	}
+}
+
 __global__ __launch_bounds__( 128 )
 void steer_penalize_kernel( SteerTables t, half* __restrict__ logits, int logit_cols, const pod::BatchRows* __restrict__ rows, int row0,
 	int shard_lo, int shard_cols ) {
@@ -72,6 +123,10 @@ void steer_penalize_kernel( SteerTables t, half* __restrict__ logits, int logit_
 
 void ResidualSteer::apply( const SteerTables& tables, backend::half_t* hidden, const pod::BatchRows* d_rows, int rows, int layer_index, backend::stream_t stream ) {
 	steer_apply_kernel<<<rows, 256, static_cast<size_t>( tables.hidden ) * sizeof( float ), stream>>>( tables, reinterpret_cast<half*>( hidden ), d_rows, layer_index );
+}
+
+void ResidualSteer::apply_streams( const SteerTables& tables, float* streams, int hc, const pod::BatchRows* d_rows, int rows, int layer_index, backend::stream_t stream ) {
+	steer_apply_streams_kernel<<<rows, 256, 2 * static_cast<size_t>( tables.hidden ) * sizeof( float ), stream>>>( tables, streams, hc, d_rows, layer_index );
 }
 
 void ResidualSteer::penalize( const SteerTables& tables, backend::half_t* logits, int logit_cols, const pod::BatchRows* d_rows, int row0, int count,

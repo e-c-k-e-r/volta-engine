@@ -103,30 +103,7 @@ bool Qwen3_5Pipeline::init(
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
 
-	// Runtime steering (option steer): per-slot tables for the steered layers; nothing exists, and no kernel runs, while it is off
-	if ( runtime::options().steer != "off" ) {
-		int first = 0, last = 0;
-		ENGINE_ASSERT( engine::modules::parse_steer_layers( runtime::options().steer_layers, config_.num_layers, &first, &last ), "Qwen3_5Pipeline: steer_layers is malformed or out of range" );
-		const size_t H = config_.hidden_size, nl = last - first + 1, K = engine::modules::kSteerEntries;
-		steer_.hidden = config_.hidden_size;
-		steer_.layers = static_cast<int>( nl );
-		steer_.slots = S;
-		steer_first_ = first;
-		steer_.vec = static_cast<float*>( engine::core::arena_alloc( arena, S * nl * K * H * sizeof( float ) ) );
-		steer_.par = static_cast<float*>( engine::core::arena_alloc( arena, S * nl * K * sizeof( float ) ) );
-		steer_.kind = static_cast<int32_t*>( engine::core::arena_alloc( arena, S * nl * K * sizeof( int32_t ) ) );
-		steer_.ctl = static_cast<engine::modules::SteerSlotCtl*>( engine::core::arena_alloc( arena, S * sizeof( engine::modules::SteerSlotCtl ) ) );
-		steer_.penalty_ids = static_cast<int32_t*>( engine::core::arena_alloc( arena, S * engine::modules::kSteerPenaltyIds * sizeof( int32_t ) ) );
-		steer_cap_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( config_.num_layers ) * H * sizeof( backend::half_t ) ) );
-		backend::memset_sync( steer_.vec, 0, S * nl * K * H * sizeof( float ) );
-		backend::memset_sync( steer_.par, 0, S * nl * K * sizeof( float ) );
-		backend::memset_sync( steer_.kind, 0, S * nl * K * sizeof( int32_t ) );
-		backend::memset_sync( steer_.ctl, 0, S * sizeof( engine::modules::SteerSlotCtl ) );
-		backend::memset_sync( steer_.penalty_ids, 0, S * engine::modules::kSteerPenaltyIds * sizeof( int32_t ) );
-		steer_ctl_host_.assign( S, engine::modules::SteerSlotCtl{} );
-		steer_cap_layer_.assign( config_.num_layers, -1 );
-		if ( rank_ == 0 ) LOG_INFO( "[steer] layers %d-%d of %d, %zu KiB per slot\n", first, last, config_.num_layers, nl * K * H * sizeof( float ) / 1024 );
-	}
+	steer_.init( arena, config_.hidden_size, config_.num_layers, S, rank_ );
 
 	// 5. Full attention buffers
 	int q_gate_shape[2] = { R, full_q_heads * config_.full_head_dim * 2 };
@@ -254,90 +231,6 @@ bool Qwen3_5Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm
 	return init( config, device_id, arena, ring );
 }
 
-
-void Qwen3_5Pipeline::steer_set( int slot_id, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream ) {
-	ENGINE_ASSERT( steer_.layers > 0 && slot_id >= 0 && slot_id < steer_.slots, "Qwen3_5Pipeline::steer_set: steering is off or the slot is out of range" );
-	backend::set_device( rank_ );
-	constexpr int K = engine::modules::kSteerEntries;
-	const size_t H = steer_.hidden, per_slot = static_cast<size_t>( steer_.layers ) * K;
-	std::vector<float> vec( per_slot * H, 0.0f ), par( per_slot, 0.0f );
-	std::vector<int32_t> kind( per_slot, engine::modules::STEER_OFF );
-	for ( const auto& e : entries ) {
-		const int li = e.layer - steer_first_;
-		ENGINE_ASSERT( li >= 0 && li < steer_.layers, "Qwen3_5Pipeline::steer_set: entry layer outside the steered range" );
-		ENGINE_ASSERT( e.vec.size() == H && ( e.kind == engine::modules::STEER_ADD || e.kind == engine::modules::STEER_CLAMP ), "Qwen3_5Pipeline::steer_set: bad entry" );
-		int k = 0;
-		while ( k < K && kind[static_cast<size_t>( li ) * K + k] != engine::modules::STEER_OFF ) ++k;
-		ENGINE_ASSERT( k < K, "Qwen3_5Pipeline::steer_set: more than kSteerEntries entries on a layer" );
-		const size_t idx = static_cast<size_t>( li ) * K + k;
-		kind[idx] = e.kind;
-		par[idx] = e.par;
-		std::memcpy( vec.data() + idx * H, e.vec.data(), H * sizeof( float ) );
-	}
-	if ( !entries.empty() ) {   // without entries every kind is off and the vectors are never read
-		backend::memcpy_async( steer_.vec + slot_id * per_slot * H, vec.data(), vec.size() * sizeof( float ), backend::Copy::H2D, stream );
-		backend::memcpy_async( steer_.par + slot_id * per_slot, par.data(), par.size() * sizeof( float ), backend::Copy::H2D, stream );
-	}
-	backend::memcpy_async( steer_.kind + slot_id * per_slot, kind.data(), kind.size() * sizeof( int32_t ), backend::Copy::H2D, stream );
-}
-
-void Qwen3_5Pipeline::steer_control( int slot_id, int scope, int prompt_len, int think_end, backend::stream_t stream ) {
-	ENGINE_ASSERT( steer_.layers > 0 && slot_id >= 0 && slot_id < steer_.slots, "Qwen3_5Pipeline::steer_control: steering is off or the slot is out of range" );
-	backend::set_device( rank_ );
-	engine::modules::SteerSlotCtl& c = steer_ctl_host_[slot_id];
-	c.scope = scope;
-	c.prompt_len = prompt_len;
-	c.think_end = think_end;
-	backend::memcpy_async( steer_.ctl + slot_id, &c, sizeof( c ), backend::Copy::H2D, stream );
-}
-
-void Qwen3_5Pipeline::steer_penalty( int slot_id, const std::vector<int>& ids, float penalty, backend::stream_t stream ) {
-	ENGINE_ASSERT( steer_.layers > 0 && slot_id >= 0 && slot_id < steer_.slots, "Qwen3_5Pipeline::steer_penalty: steering is off or the slot is out of range" );
-	ENGINE_ASSERT( ids.size() <= static_cast<size_t>( engine::modules::kSteerPenaltyIds ), "Qwen3_5Pipeline::steer_penalty: too many ids" );
-	backend::set_device( rank_ );
-	engine::modules::SteerSlotCtl& c = steer_ctl_host_[slot_id];
-	c.penalty_n = static_cast<int>( ids.size() );
-	c.penalty = penalty;
-	if ( !ids.empty() ) backend::memcpy_async( steer_.penalty_ids + static_cast<size_t>( slot_id ) * engine::modules::kSteerPenaltyIds, ids.data(), ids.size() * sizeof( int ), backend::Copy::H2D, stream );
-	backend::memcpy_async( steer_.ctl + slot_id, &c, sizeof( c ), backend::Copy::H2D, stream );
-}
-
-void Qwen3_5Pipeline::steer_capture( const std::vector<int>& layers, bool on ) {
-	ENGINE_ASSERT( steer_.layers > 0, "Qwen3_5Pipeline::steer_capture: steering is off" );
-	steer_cap_layer_.assign( config_.num_layers, -1 );
-	steer_cap_order_.clear();
-	if ( on ) {
-		for ( int l : layers ) {
-			ENGINE_ASSERT( l >= 0 && l < config_.num_layers && steer_cap_layer_[l] < 0, "Qwen3_5Pipeline::steer_capture: bad or repeated layer" );
-			steer_cap_layer_[l] = static_cast<int>( steer_cap_order_.size() );
-			steer_cap_order_.push_back( l );
-		}
-	}
-	steer_cap_on_ = on;
-}
-
-namespace {
-float fp16_bits_to_float( uint16_t h ) {
-	const uint32_t sign = ( h >> 15 ) & 1u, exp = ( h >> 10 ) & 31u, man = h & 1023u;
-	float v;
-	if ( exp == 0 ) v = std::ldexp( static_cast<float>( man ), -24 );
-	else if ( exp == 31 ) v = man ? NAN : INFINITY;
-	else v = std::ldexp( static_cast<float>( man | 1024u ), static_cast<int>( exp ) - 25 );
-	return sign ? -v : v;
-}
-}   // namespace
-
-bool Qwen3_5Pipeline::steer_read( std::vector<float>& out, backend::stream_t stream ) {
-	if ( !steer_cap_on_ || steer_cap_order_.empty() ) return false;
-	backend::set_device( rank_ );
-	const size_t H = config_.hidden_size, n = steer_cap_order_.size();
-	std::vector<uint16_t> raw( n * H );
-	backend::memcpy_async( raw.data(), steer_cap_, raw.size() * sizeof( uint16_t ), backend::Copy::D2H, stream );
-	backend::stream_sync( stream );
-	out.resize( n * H );
-	for ( size_t i = 0; i < out.size(); ++i ) out[i] = fp16_bits_to_float( raw[i] );
-	return true;
-}
 
 void Qwen3_5Pipeline::reset_state( int slot_id ) {
 	ENGINE_ASSERT( slot_id >= 0 && slot_id < config_.max_slots, "Qwen3_5Pipeline::reset_state: slot out of range" );
@@ -734,7 +627,7 @@ void Qwen3_5Pipeline::forward( const pod::BatchRows& rows, backend::stream_t str
 	last_slot_ = rows.slot[0];
 	key_hint_ = rows.pos[m - 1] + 1;
 	// Logits selection applies to eager prefill chunks only (decode graphs are keyed on m alone).
-	lm_mode_ = ( m > pod::MAX_BATCH || steer_cap_on_ ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;   // a probe runs eagerly, so any block may skip the head
+	lm_mode_ = ( m > pod::MAX_BATCH || steer_.capturing() ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;   // a probe runs eagerly, so any block may skip the head
 	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
 	set_rows( m );
 
@@ -746,7 +639,7 @@ void Qwen3_5Pipeline::forward( const pod::BatchRows& rows, backend::stream_t str
 	// distinct slots get a block each. The graph body differs, so the two shapes get separate graphs.
 	attn_tc_ = true;
 	for ( int r = 1; r < m; ++r ) attn_tc_ = attn_tc_ && rows.slot[r] == rows.slot[0];
-	if ( steer_cap_on_ ) forward_body( m, stream );   // a probe: the capture list is host state a graph would freeze
+	if ( steer_.capturing() ) forward_body( m, stream );   // a probe: the capture list is host state a graph would freeze
 	else graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); }, attn_tc_ ? 1 : 0 );
 }
 
@@ -968,13 +861,11 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 	for ( int layer = 0; layer < config_.num_layers; ++layer ) {
 		hess_layer_ = layer;
 		layer_forward( layers_[layer], full_attn_idx, linear_idx, m, stream );
-		if ( steer_.layers > 0 ) {
-			const int li = layer - steer_first_;
-			if ( li >= 0 && li < steer_.layers ) engine::modules::ResidualSteer::apply( steer_, hidden_states_.ptr<backend::half_t>(), d_rows_, m, li, stream );
-			if ( steer_cap_on_ && steer_cap_layer_[layer] >= 0 ) {
+		if ( steer_.on() ) {
+			if ( const int li = steer_.index( layer ); li >= 0 ) engine::modules::ResidualSteer::apply( steer_.tables(), hidden_states_.ptr<backend::half_t>(), d_rows_, m, li, stream );
+			if ( backend::half_t* dst = steer_.capture_dst( layer ) ) {
 				const size_t H = config_.hidden_size;
-				backend::memcpy_async( steer_cap_ + static_cast<size_t>( steer_cap_layer_[layer] ) * H, hidden_states_.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * H,
-					H * sizeof( backend::half_t ), backend::Copy::D2D, stream );
+				backend::memcpy_async( dst, hidden_states_.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * H, H * sizeof( backend::half_t ), backend::Copy::D2D, stream );
 			}
 		}
 
@@ -1010,7 +901,7 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 			pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
 			engine::modules::RMSNorm::forward( h1, final_norm_, n1, config_.rms_norm_eps, config_.rms_norm_bias, stream );
 			engine::modules::Linear::forward( n1, lm_head_, l1, stream );
-			if ( steer_.layers > 0 ) engine::modules::ResidualSteer::penalize( steer_, l1.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, m - 1, 1, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
+			if ( steer_.on() ) engine::modules::ResidualSteer::penalize( steer_.tables(), l1.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, m - 1, 1, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
 			return;
 		}
 		engine::modules::RMSNorm::forward(
@@ -1031,7 +922,7 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 		else
 #endif
 		engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
-		if ( steer_.layers > 0 ) engine::modules::ResidualSteer::penalize( steer_, logits_.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, 0, m, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
+		if ( steer_.on() ) engine::modules::ResidualSteer::penalize( steer_.tables(), logits_.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, 0, m, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
 	}
 }
 

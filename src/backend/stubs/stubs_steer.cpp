@@ -9,6 +9,11 @@ __attribute__(( weak )) void ResidualSteer::apply( const SteerTables& tables, ba
 	__builtin_unreachable();
 }
 
+__attribute__(( weak )) void ResidualSteer::apply_streams( const SteerTables& tables, float* streams, int hc, const pod::BatchRows* d_rows, int rows, int layer_index, backend::stream_t stream ) {
+	ENGINE_UNSUPPORTED( "ResidualSteer::apply_streams" );
+	__builtin_unreachable();
+}
+
 __attribute__(( weak )) void ResidualSteer::penalize( const SteerTables& tables, backend::half_t* logits, int logit_cols, const pod::BatchRows* d_rows, int row0, int count,
 	int shard_lo, int shard_cols, backend::stream_t stream ) {
 	ENGINE_UNSUPPORTED( "ResidualSteer::penalize" );

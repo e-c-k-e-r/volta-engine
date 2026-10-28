@@ -206,6 +206,11 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	kv_pool_.init( rank_, arena, S, config_.max_seq, attn_layers_, kv_heads_, config_.head_dim );
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
+	steer_.init( arena, config_.hidden_size, config_.num_layers, S, rank_ );
+	if ( steer_.on() ) {
+		int mean_shape[2] = { R, H };
+		steer_mean_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mean_shape, 2 );
+	}
 	int h_shape[2] = { R, H };
 	embed_rows_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	mixed_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
@@ -763,7 +768,7 @@ void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 	backend::set_device( rank_ );
 	const int m = rows.count;
 	key_hint_ = rows.pos[m - 1] + 1;
-	lm_mode_ = ( m > pod::MAX_BATCH ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;
+	lm_mode_ = ( m > pod::MAX_BATCH || steer_.capturing() ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;   // a probe runs eagerly, so any block may skip the head
 	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
 	set_rows( m );
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
@@ -793,7 +798,8 @@ void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 	ple_rows_ = ( m > pod::MAX_BATCH ) ? &rows : nullptr;
 	if ( !ple_rows_ ) ple_prepare( rows, m, stream );
 	// Decode-sized forwards replay a per-row-count graph (the body reads slots, positions and the n-gram rows from device memory)
-	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); }, attn_tc_ ? 1 : 0 );   // the attention path differs for rows of one slot
+	if ( steer_.capturing() ) forward_body( m, stream );   // a probe: the capture list is host state a graph would freeze
+	else graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); }, attn_tc_ ? 1 : 0 );   // the attention path differs for rows of one slot
 }
 
 void Qwen4ExpPipeline::trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols ) {
@@ -1322,8 +1328,11 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 		attn_site( lw, lw.is_full_attention ? attn_idx++ : linear_idx++, L, m, stream, lw.mlp_hc.norm.ptr<const backend::half_t>() );
 		if ( halt == site++ ) { flush_apply( m, stream ); return; }
 		// The next site is the next layer's attention, unless the PLE layer comes first (it changes the streams) or this is the last layer (the head's mixer follows)
-		const bool next_is_site = L + 1 < config_.num_layers && L + 1 != config_.ple_layer;
+		// A steered or captured layer edits the finished streams, so the fused all-reduce must not hand the next site pre-normed streams
+		const bool steered = steer_.on() && ( steer_.index( L ) >= 0 || steer_.capture_dst( L ) != nullptr );
+		const bool next_is_site = L + 1 < config_.num_layers && L + 1 != config_.ple_layer && !steered;
 		mlp_site( lw, L, m, stream, next_is_site ? layers_[L + 1].attn_hc.norm.ptr<const backend::half_t>() : nullptr );
+		if ( steered ) steer_layer( L, m, stream );
 		if ( static const double eps_l = runtime::options().perturb_layers; eps_l != 0.0 && m > pod::MAX_BATCH ) {
 			flush_apply( m, stream );
 			const size_t n = static_cast<size_t>( m ) * hc * H;
@@ -1365,6 +1374,17 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 	pod::TensorView lout = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, n, lm_shard_cols_ );
 	hessian( 0, 4, hin.data, H, n, stream );
 	engine::modules::Linear::forward( hin, lm_head_, lout, stream );
+	if ( steer_.on() ) engine::modules::ResidualSteer::penalize( steer_.tables(), lout.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, first, n, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
+}
+
+void Qwen4ExpPipeline::steer_layer( int L, int m, backend::stream_t stream ) {
+	flush_apply( m, stream );
+	const int H = config_.hidden_size;
+	if ( const int li = steer_.index( L ); li >= 0 ) engine::modules::ResidualSteer::apply_streams( steer_.tables(), streams_.ptr<float>(), config_.hc_mult, d_rows_, m, li, stream );
+	if ( backend::half_t* dst = steer_.capture_dst( L ) ) {
+		engine::spec::dflash_reduce_streams( streams_.ptr<const float>(), steer_mean_.ptr<backend::half_t>(), m, H, 0, stream );
+		backend::memcpy_async( dst, steer_mean_.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * H, H * sizeof( backend::half_t ), backend::Copy::D2D, stream );
+	}
 }
 
 void Qwen4ExpPipeline::checkpoint_state( int slot_id, backend::stream_t stream ) {

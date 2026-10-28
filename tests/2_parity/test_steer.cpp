@@ -108,6 +108,55 @@ int main() {
 		std::printf( "    layer %d: %d of %d rows edited, the rest bit-identical\n", layer, edited, rows );
 	}
 
+	std::printf( "[*] streams (hc = 4): the entries act on the mean, every stream takes the change...\n" );
+	{
+		const int hc = 4;
+		std::vector<float> hs( static_cast<size_t>( rows ) * hc * H );
+		for ( float& v : hs ) v = rnd( seed ) * 6.0f;
+		float* d_s;
+		CUDA_CHECK( cudaMalloc( &d_s, hs.size() * sizeof( float ) ) );
+		for ( int layer = 0; layer < layers; ++layer ) {
+			CUDA_CHECK( cudaMemcpy( d_s, hs.data(), hs.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+			ResidualSteer::apply_streams( t, d_s, hc, d_rows, rows, layer, stream );
+			CUDA_CHECK( cudaStreamSynchronize( stream ) );
+			std::vector<float> got( hs.size() );
+			CUDA_CHECK( cudaMemcpy( got.data(), d_s, got.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
+			int edited = 0;
+			for ( int r = 0; r < rows; ++r ) {
+				const int sl = row_slot[r], p = row_pos[r];
+				const int cls = p < ctl[sl].prompt_len ? STEER_PROMPT : ( p < ctl[sl].think_end ? STEER_THINK : STEER_ANSWER );
+				bool any = false;
+				for ( int k = 0; k < K; ++k ) any |= kind[( static_cast<size_t>( sl ) * layers + layer ) * K + k] != STEER_OFF;
+				const bool active = ( ctl[sl].scope & cls ) != 0 && any;
+				const float* x = &hs[static_cast<size_t>( r ) * hc * H];
+				std::vector<double> mean( H, 0.0 ), edit;
+				for ( int i = 0; i < H; ++i ) { for ( int q = 0; q < hc; ++q ) mean[i] += x[q * H + i]; mean[i] /= hc; }
+				edit = mean;
+				if ( active ) {
+					++edited;
+					for ( int k = 0; k < K; ++k ) {
+						const size_t e = ( static_cast<size_t>( sl ) * layers + layer ) * K + k;
+						if ( kind[e] == STEER_OFF ) continue;
+						const float* v = &vec[e * H];
+						if ( kind[e] == STEER_ADD ) { for ( int i = 0; i < H; ++i ) edit[i] += par[e] * v[i]; }
+						else {
+							double dot = 0; for ( int i = 0; i < H; ++i ) dot += edit[i] * v[i];
+							if ( dot - par[e] > 0 ) for ( int i = 0; i < H; ++i ) edit[i] -= ( dot - par[e] ) * v[i];
+						}
+					}
+				}
+				for ( int q = 0; q < hc; ++q ) {
+					for ( int i = 0; i < H; ++i ) {
+						const float g = got[( static_cast<size_t>( r ) * hc + q ) * H + i];
+						if ( !active ) ENGINE_ASSERT( std::memcmp( &g, &x[q * H + i], sizeof( float ) ) == 0, "a stream row outside the scope changed" );
+						else ENGINE_ASSERT( std::fabs( g - ( x[q * H + i] + ( edit[i] - mean[i] ) ) ) <= 1e-4 * std::fabs( g ) + 1e-4, "steered streams differ from the fp32 reference" );
+					}
+				}
+			}
+			std::printf( "    layer %d: %d of %d rows edited, the rest bit-identical\n", layer, edited, rows );
+		}
+	}
+
 	std::printf( "[*] logit penalty: shard window, think scope...\n" );
 	{
 		std::vector<half> hl( static_cast<size_t>( rows ) * logit_cols );

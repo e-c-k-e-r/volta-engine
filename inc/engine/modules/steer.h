@@ -58,6 +58,10 @@ struct ResidualSteer {
 	// in fp32, written back to fp16 (saturated). Rows of a slot whose scope does not cover them are not touched.
 	static void apply( const SteerTables& tables, backend::half_t* hidden, const pod::BatchRows* d_rows, int rows, int layer_index, backend::stream_t stream );
 
+	// The same edits for a model whose residual is `hc` fp32 streams per row (streams [rows, hc, hidden], the gated-residual models): the entries act on the
+	// mean of the streams, and the change of the mean is added to every stream (so the layers see the shift whichever way they mix the streams)
+	static void apply_streams( const SteerTables& tables, float* streams, int hc, const pod::BatchRows* d_rows, int rows, int layer_index, backend::stream_t stream );
+
 	// logits [*, logit_cols] fp16 of this rank's vocabulary slice [shard_lo, shard_lo + shard_cols): for the `count` logit rows j (the forward's row
 	// row0 + j), subtract the slot's penalty from its marker ids in the slice while the row's predicted token lies inside the reasoning block
 	static void penalize( const SteerTables& tables, backend::half_t* logits, int logit_cols, const pod::BatchRows* d_rows, int row0, int count,
