@@ -69,6 +69,12 @@ The score is logged (`[steer] req N gate fired|clean score=... (threshold ..., m
 
 `tests/tools/steer_sweep.py` sends two prompt files (target and control, one prompt per line) to a running server with `steer=on` over a grid of `steer_edit_strength`, `steer_edit_layers`, `steer_scope` and `steer_hedge_strength`, and reports per point the gate fire rate, the share of outputs that start with a stock opening, repetition and doubled words, and how far the control text moves from the unprobed text when the gate is forced. The response carries the gate score in `usage.steer_gate`.
 
+## The reflection-marker penalty
+
+`think_penalty` (option, or per request) subtracts a fixed logit from the first token of each marker spelling while the predicted token lies inside the reasoning block. Only first tokens that are word pieces of at least three letters go on the list (a bare newline or a single letter would be penalised everywhere); the server logs the list at start (15 tokens for the default words). `tests/tools/steer_think_sweep.py` measures it: seeded counting questions with exact answers, thinking on, per penalty the reasoning words, marker words per 100 reasoning words, the share of answers that finished and the share that are correct.
+
+On Qwen3.8-27B EXL3 4.0 bpw, 12 such questions at 3500 tokens, the model hesitates rarely (0.19 marker words per 100 reasoning words, 307 reasoning words per answer on average); penalties of 2, 4 and 8 take the marker rate to 0.05, 0.03 and 0.00 and change neither the length (307 to 315 words) nor the share finished or correct (0.83 each; the two unfinished questions are long enumerations with 1000-word reasoning that the penalty does not shorten). The default stays 0.
+
 ## Tests
 
 * `test_steer`: the kernels against an fp32 reference on a mixed batch (add and clamp, every scope, slots with and without edits, the penalty over a vocabulary slice); rows the scope does not cover and unlisted logits come back bit-identical.

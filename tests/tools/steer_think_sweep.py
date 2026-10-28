@@ -16,28 +16,28 @@ MARKS = re.compile(r"\b(wait|hmm|alternatively)\b", re.I)
 
 
 def problems(n, seed):
+    """Counting and number-theory questions with an exact answer: easy to check, and hard enough to make the model hesitate and recheck."""
     rnd = random.Random(seed)
     out = []
     for i in range(n):
-        k = i % 3
+        k = i % 4
         if k == 0:
-            a, b, c, d = rnd.randint(12, 49), rnd.randint(6, 19), rnd.randint(30, 99), rnd.randint(3, 9)
-            q = f"A school buys {a} boxes of pencils with {b} pencils in each box, then gives away {c} pencils and splits the rest equally among {d} classes, with {(a * b - c) % d} pencils left over. How many pencils does each class get?"
-            ans = (a * b - c) // d
+            hi, a, b = rnd.randint(300, 900), rnd.choice([4, 6, 7, 9]), rnd.choice([5, 8, 10, 11])
+            ans = sum(1 for x in range(1, hi + 1) if (x % a == 0) != (x % b == 0))
+            q = f"How many integers from 1 to {hi} are divisible by exactly one of {a} and {b} (divisible by one of them but not by both)?"
         elif k == 1:
-            s, t, u = rnd.randint(40, 90), rnd.randint(2, 6), rnd.randint(30, 70)
-            h = rnd.randint(2, 5)
-            q = f"A train travels at {s} km/h for {t} hours, stops, then travels at {u} km/h for {h} more hours. How many kilometres did it travel in total?"
-            ans = s * t + u * h
+            m = rnd.choice([7, 9, 11, 13, 17, 19])
+            r1 = rnd.randint(2, m - 1) ** 2 % m or 1
+            ans = sum(1 for x in range(1, 200) if x * x % m == r1)
+            q = f"How many integers x with 1 <= x <= 199 satisfy x*x leaving remainder {r1} when divided by {m}?"
+        elif k == 2:
+            n_, d = rnd.randint(20, 60), rnd.randint(3, 6)
+            ans = sum(1 for a_ in range(1, n_ + 1) for b_ in range(a_ + 1, n_ + 1) if (a_ + b_) % d == 0)
+            q = f"How many pairs of different integers a < b chosen from 1 to {n_} have a sum divisible by {d}?"
         else:
-            x, y, z = rnd.randint(5, 20), rnd.randint(3, 12), rnd.randint(2, 9)
-            q = f"There are {x} shelves with {y} books on each. {z} shelves are emptied and their books are spread evenly over the remaining shelves, and the number of books divides evenly. How many books are on each remaining shelf?"
-            while (x * y) % (x - z) != 0 or x - z <= 0:
-                z = rnd.randint(1, x - 1)
-                y = rnd.randint(3, 12)
-                x = x
-            q = f"There are {x} shelves with {y} books on each. {z} shelves are emptied and their books are spread evenly over the remaining shelves. How many books are on each remaining shelf?"
-            ans = (x * y) // (x - z)
+            lo, hi = rnd.randint(100, 400), rnd.randint(500, 900)
+            ans = sum(1 for x in range(lo, hi + 1) if sum(int(c) for c in str(x)) % 7 == 0)
+            q = f"How many integers from {lo} to {hi} (both included) have a digit sum divisible by 7?"
         out.append((q + " Give the final number at the end.", ans))
     return out
 

@@ -557,6 +557,10 @@ void Generator::build_penalty_ids() {
 	for ( const std::string& sp : spellings ) {
 		const std::vector<int> ids = tokenizer_.encode_plain( sp );
 		if ( ids.empty() || ids[0] < 0 || ids[0] >= cluster_.metadata().vocab_size ) continue;
+		// only a token that is a word piece of its own: "\nWait" starts with the bare newline token and "hmm" with "h", which would be penalised everywhere
+		int letters = 0;
+		for ( unsigned char c : tokenizer_.decode_token( ids[0] ) ) letters += std::isalpha( c ) ? 1 : 0;
+		if ( letters < 3 ) continue;
 		if ( std::find( penalty_ids_.begin(), penalty_ids_.end(), ids[0] ) != penalty_ids_.end() ) continue;
 		penalty_ids_.push_back( ids[0] );
 		shown += " [" + tokenizer_.decode_token( ids[0] ) + "]";
