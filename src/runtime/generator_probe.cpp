@@ -109,26 +109,37 @@ void Generator::probe_slot( int s ) {
 	}
 	auto pick = [&]( float request, double option ) { return std::isnan( request ) ? static_cast<float>( option ) : request; };
 	const float threshold = pick( slot.req.probe_threshold, option_or( opt.steer_gate_threshold, sd.gate_threshold ) ), edit_strength = pick( slot.req.probe_edit_strength, option_or( opt.steer_edit_strength, sd.edit_strength ) ),
-		hedge_strength = pick( slot.req.probe_hedge_strength, opt.steer_hedge_strength );
+		hedge_strength = pick( slot.req.probe_hedge_strength, opt.steer_hedge_strength ), push = pick( slot.req.probe_push, opt.steer_push );
 	const bool fired = score > threshold;
 	slot.metrics.gate_score = score;
 	slot.metrics.gate_fired = fired;
 
 	cluster_.reset_slot( s );   // the real prefill starts from nothing
-	if ( !fired ) {
+	if ( !fired && push == 0.0f ) {
 		steer_admit( s );       // back to what the request asked for without the probe
 	}
 	else {
 		std::vector<engine::modules::SteerEntry> entries;
 		for ( int l = e0; l <= e1; ++l ) {
 			const int bi = l - b0;
-			engine::modules::SteerEntry c;
-			c.layer = l;
-			c.kind = engine::modules::STEER_CLAMP;
-			c.vec = axes[bi].dir;
-			c.par = axes[bi].pa - edit_strength * axes[bi].sd;
-			entries.push_back( std::move( c ) );
-			if ( hedge_strength >= 0.0f ) {
+			if ( fired ) {
+				engine::modules::SteerEntry c;
+				c.layer = l;
+				c.kind = engine::modules::STEER_CLAMP;
+				c.vec = axes[bi].dir;
+				c.par = axes[bi].pa - edit_strength * axes[bi].sd;
+				entries.push_back( std::move( c ) );
+			}
+			if ( push != 0.0f ) {
+				// towards the declining side: k gaps along the axis (gap = mean projection of the declining openings minus the accepting ones)
+				engine::modules::SteerEntry a;
+				a.layer = l;
+				a.kind = engine::modules::STEER_ADD;
+				a.vec = axes[bi].dir;
+				a.par = push * ( axes[bi].pb - axes[bi].pa );
+				entries.push_back( std::move( a ) );
+			}
+			if ( fired && push == 0.0f && hedge_strength >= 0.0f ) {   // at most kSteerEntries edits per layer: a push takes the hedge clamp's place
 				const ProbeAxis hx = probe_axis( set_at( plain, bi ), set_at( hedged, bi ), H, false );
 				engine::modules::SteerEntry d;
 				d.layer = l;
@@ -146,8 +157,8 @@ void Generator::probe_slot( int s ) {
 		slot.steer_think_open = slot.in_reasoning;
 		cluster_.steer_control( s, slot.steer_scope, n, slot.in_reasoning ? INT_MAX : 0 );
 	}
-	LOG_INFO( "[steer] req %llu gate %s score=%.3f (threshold %.2f; clamp layers %d-%d strength %g; %.0f ms)\n", static_cast<unsigned long long>( slot.req.req_id ), fired ? "fired" : "clean", score,
-		threshold, e0, e1, edit_strength, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_start ).count() );
+	LOG_INFO( "[steer] req %llu gate %s score=%.3f (threshold %.2f; clamp layers %d-%d strength %g; push %g; %.0f ms)\n", static_cast<unsigned long long>( slot.req.req_id ), fired ? "fired" : "clean", score,
+		threshold, e0, e1, edit_strength, push, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_start ).count() );
 }
 
 } // namespace engine::runtime

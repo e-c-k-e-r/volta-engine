@@ -355,6 +355,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	g.probe_threshold = req.probe_threshold;
 	g.probe_edit_strength = req.probe_edit_strength;
 	g.probe_hedge_strength = req.probe_hedge_strength;
+	g.probe_push = req.probe_push;
 	g.think_penalty = req.think_penalty;
 	if ( in_reasoning && req.thinking_budget > 0 ) {
 		g.reasoning_budget = req.thinking_budget;

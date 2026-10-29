@@ -348,6 +348,7 @@ public:
 		if ( j.contains( "steer_gate_threshold" ) && j["steer_gate_threshold"].is_number() ) r.probe_threshold = j["steer_gate_threshold"].get<float>();
 		if ( j.contains( "steer_edit_strength" ) && j["steer_edit_strength"].is_number() ) r.probe_edit_strength = j["steer_edit_strength"].get<float>();
 		if ( j.contains( "steer_hedge_strength" ) && j["steer_hedge_strength"].is_number() ) r.probe_hedge_strength = j["steer_hedge_strength"].get<float>();
+		if ( j.contains( "steer_push" ) && j["steer_push"].is_number() ) r.probe_push = j["steer_push"].get<float>();
 		if ( j.contains( "steer_edit_layers" ) && j["steer_edit_layers"].is_string() ) r.probe_edit_layers = j["steer_edit_layers"].get<std::string>();
 		if ( j.contains( "steer_probe" ) && j["steer_probe"].is_boolean() ) r.steer_probe = j["steer_probe"].get<bool>();
 		if ( j.contains( "think_penalty" ) && j["think_penalty"].is_number() ) r.think_penalty = j["think_penalty"].get<float>();

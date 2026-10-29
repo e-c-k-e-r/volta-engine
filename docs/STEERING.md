@@ -26,7 +26,7 @@ On `/v1/chat/completions` and `/v1/messages`, as top-level keys of the body:
 | `steer_scope` | comma list of `prompt`, `think`, `answer`, `generated`, `all` (default: the file's own) |
 | `think_penalty` | logit taken off the reflection markers inside the reasoning block (default `think_penalty` option, 0 = off) |
 | `steer_probe` | run the probe below before the real prefill |
-| `steer_gate_threshold`, `steer_edit_strength`, `steer_hedge_strength` | per-request values of the probe options |
+| `steer_gate_threshold`, `steer_edit_strength`, `steer_hedge_strength`, `steer_push` | per-request values of the probe options |
 
 A bad name, an unreadable or mismatching file, or `steer_probe` without `steer` answers 400.
 
@@ -65,7 +65,7 @@ The score is logged (`[steer] req N gate fired|clean score=... (threshold ..., m
 
 ## Options
 
-`steer`, `steer_layers`, `steer_file`, `steer_dir`, `steer_scale`, `steer_scope`, `think_penalty`, `think_penalty_words`, `steer_gate_threshold`, `steer_edit_strength`, `steer_hedge_strength`, `steer_band`, `steer_edit_layers`; see [CONFIG.md](CONFIG.md). `think_penalty_words` is a comma list or a file with one word per line (default `Wait, Hmm, Alternatively, But`); each word's first token in the spellings as is, lower case, capitalised, each plain, after a space and after a newline goes on the list, which the server logs at start.
+`steer`, `steer_layers`, `steer_file`, `steer_dir`, `steer_scale`, `steer_scope`, `think_penalty`, `think_penalty_words`, `steer_gate_threshold`, `steer_edit_strength`, `steer_hedge_strength`, `steer_push`, `steer_band`, `steer_edit_layers`; see [CONFIG.md](CONFIG.md). `think_penalty_words` is a comma list or a file with one word per line (default `Wait, Hmm, Alternatively, But`); each word's first token in the spellings as is, lower case, capitalised, each plain, after a space and after a newline goes on the list, which the server logs at start.
 
 `steer_gate_threshold`, `steer_edit_strength` and `steer_edit_layers` say "auto" (or are empty) until set, and then take the model's value from `inc/engine/models/steer_defaults.h`; a request's own fields override both. The table, with the checkpoint each row was tuned on:
 
@@ -98,6 +98,16 @@ A sweep is serial (one request at a time), and the probe is several times the co
 `think_penalty` (option, or per request) subtracts a fixed logit from the first token of each marker spelling while the predicted token lies inside the reasoning block. Only first tokens that are word pieces of at least three letters go on the list (a bare newline or a single letter would be penalised everywhere); the server logs the list at start (15 tokens for the default words). `tests/tools/steer_think_sweep.py` measures it: seeded counting questions with exact answers, thinking on, per penalty the reasoning words, marker words per 100 reasoning words, the share of answers that finished and the share that are correct.
 
 On Qwen3.8-27B EXL3 4.0 bpw, 12 such questions at 3500 tokens, the model hesitates rarely (0.19 marker words per 100 reasoning words, 307 reasoning words per answer on average); penalties of 2, 4 and 8 take the marker rate to 0.05, 0.03 and 0.00 and change neither the length (307 to 315 words) nor the share finished or correct (0.83 each; the two unfinished questions are long enumerations with 1000-word reasoning that the penalty does not shorten). The default stays 0.
+
+## Push
+
+`steer_push` (option and request field, default 0) goes the other way: with `steer_probe` on, it adds the probe's declining direction to the states of the edit layers, `steer_push` times the gap between the declining and the accepting openings (their mean projections on the axis), on every prompt whether or not the gate fires; negative values subtract it. It shares the layers' two edit slots with the clamp, so a push replaces the hedge clamp.
+
+Measured on Qwen3.8-27B EXL3 4.0 bpw (24 target and 24 control prompts, the gate left unforced on the controls, 80 tokens, clamp strength -8 on the targets; the stock rate is the share of replies that open with a refusal):
+* Control prompts' refusal rate by push: 0 at 0.03, 0.08 at 0.06, 0.79 at 0.10 ("I cannot fulfill this request."), then the text breaks down: repeated fragments at 0.15, dots from 0.2, garbage at 0.5 and above. The useful band is narrow, about 0.08 to 0.12.
+* Targets under the clamp alone refuse 0.21 of the time (0.71 unprobed); with the push 0.25 / 0.29 / 0.33 at 0.03 / 0.06 / 0.10 and 0.50 at 0.3, and at 0.5 to 1 the replies are refusals again (0.79 and 0.92) while the controls are already broken.
+* Negative push (-1) breaks every reply into one repeated token.
+* The sum over the edit layers is what counts: a push of 1 puts about ten gaps into the residual stream. Fine steps are needed, and the tuned value moves with the edit window (`steer_edit_layers`).
 
 ## Flash-Next
 
