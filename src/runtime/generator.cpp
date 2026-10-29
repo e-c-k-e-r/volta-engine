@@ -588,7 +588,7 @@ const SteerFile* Generator::steer_file( const std::string& vector, std::string* 
 	std::vector<int> per_layer( cluster_.metadata().num_layers, 0 );
 	for ( const auto& e : f.entries ) {
 		if ( e.layer < first || e.layer >= first + count ) { *err = path + ": layer " + std::to_string( e.layer ) + " is outside the steered layers " + std::to_string( first ) + "-" + std::to_string( first + count - 1 ) + " (steer_layers)"; return nullptr; }
-		if ( ( e.kind != engine::modules::STEER_ADD && e.kind != engine::modules::STEER_CLAMP ) || ++per_layer[e.layer] > engine::modules::kSteerEntries ) { *err = path + ": bad entry on layer " + std::to_string( e.layer ); return nullptr; }
+		if ( ( e.kind != engine::modules::STEER_ADD && e.kind != engine::modules::STEER_CLAMP && e.kind != engine::modules::STEER_CLAMP_KEEP ) || ++per_layer[e.layer] > engine::modules::kSteerEntries ) { *err = path + ": bad entry on layer " + std::to_string( e.layer ); return nullptr; }
 	}
 	return &steer_files_.emplace( vector, std::move( f ) ).first->second;
 }

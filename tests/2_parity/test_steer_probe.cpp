@@ -29,6 +29,25 @@ int main() {
 	std::printf( "fraction of a %.4f, of b %.4f, a's spread %.4f\n", fa, fb, ax.sd );
 	ENGINE_ASSERT( std::fabs( fa ) < 0.05f && std::fabs( fb - 1.0f ) < 0.05f, "fractions should be 0 at set a and 1 at set b" );
 	ENGINE_ASSERT( ax.sd < 0.1f, "set a varies too much along the axis" );
+	// Extra directions: the declining samples split into two styles beyond axis 0 (3 samples lean on axis 3, 5 on axis 4); the extra axes must
+	// stay in the span of axes 0, 3 and 4 (the first axis already holds part of both styles), be unit and orthogonal to axis 0 and to each other, 
+	std::vector<std::vector<float>> b2 = b;
+	for ( int j = 0; j < 8; ++j ) { if ( j < 3 ) b2[j][3] = 2.0f; else b2[j][4] = 1.0f; }
+	StateSet sb2;
+	for ( auto& v : b2 ) sb2.push_back( v.data() );
+	const ProbeAxis ax2 = probe_axis( sa, sb2, H, true );
+	const std::vector<ProbeAxis> extra = probe_extra_axes( sa, sb2, H, { ax2.dir }, 3 );
+	ENGINE_ASSERT( extra.size() >= 2, "two further directions were planted" );
+	for ( size_t k = 0; k < 2; ++k ) {
+		double n2 = 0.0, plane = 0.0, c0 = 0.0, c01 = 0.0;
+		for ( int i = 0; i < H; ++i ) { n2 += extra[k].dir[i] * extra[k].dir[i]; c0 += extra[k].dir[i] * ax2.dir[i]; if ( i == 0 || i == 3 || i == 4 ) plane += extra[k].dir[i] * extra[k].dir[i]; if ( k == 1 ) c01 += extra[k].dir[i] * extra[0].dir[i]; }
+		ENGINE_ASSERT( std::fabs( n2 - 1.0 ) < 1e-4, "an extra axis is not a unit vector" );
+		ENGINE_ASSERT( plane > 0.95, "an extra axis left the span of the planted axes" );
+		ENGINE_ASSERT( std::fabs( c0 ) < 1e-3 && std::fabs( c01 ) < 1e-3, "extra axes are not orthogonal to the earlier ones" );
+		ENGINE_ASSERT( extra[k].pb > extra[k].pa, "an extra axis should put the declining samples above the accepting ones on average" );
+	}
+		ENGINE_ASSERT( extra.size() == 2 || std::sqrt( extra[2].sd ) < 1.0, "a third axis, if any, must be sane" );
+	std::printf( "extra axes: %zu, first (%.2f on axis 3, %.2f on axis 4)\n", extra.size(), extra[0].dir[3], extra[0].dir[4] );
 	std::printf( "[+] steer probe maths PASS\n" );
 	return 0;
 }

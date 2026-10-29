@@ -45,7 +45,7 @@ void SteerHost::set( int slot, const std::vector<SteerEntry>& entries, backend::
 	for ( const auto& e : entries ) {
 		const int li = e.layer - first_;
 		ENGINE_ASSERT( li >= 0 && li < t_.layers, "SteerHost::set: entry layer outside the steered range" );
-		ENGINE_ASSERT( e.vec.size() == H && ( e.kind == STEER_ADD || e.kind == STEER_CLAMP ), "SteerHost::set: bad entry" );
+		ENGINE_ASSERT( e.vec.size() == H && ( e.kind == STEER_ADD || e.kind == STEER_CLAMP || e.kind == STEER_CLAMP_KEEP ), "SteerHost::set: bad entry" );
 		int k = 0;
 		while ( k < K && kind[static_cast<size_t>( li ) * K + k] != STEER_OFF ) ++k;
 		ENGINE_ASSERT( k < K, "SteerHost::set: more than kSteerEntries entries on a layer" );

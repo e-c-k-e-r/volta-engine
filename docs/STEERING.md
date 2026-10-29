@@ -26,7 +26,7 @@ On `/v1/chat/completions` and `/v1/messages`, as top-level keys of the body:
 | `steer_scope` | comma list of `prompt`, `think`, `answer`, `generated`, `all` (default: the file's own) |
 | `think_penalty` | logit taken off the reflection markers inside the reasoning block (default `think_penalty` option, 0 = off) |
 | `steer_probe` | run the probe below before the real prefill |
-| `steer_gate_threshold`, `steer_edit_strength`, `steer_hedge_strength`, `steer_push` | per-request values of the probe options |
+| `steer_gate_threshold`, `steer_edit_strength`, `steer_hedge_strength`, `steer_push`, `steer_directions`, `steer_keep_norm` | per-request values of the probe options |
 
 A bad name, an unreadable or mismatching file, or `steer_probe` without `steer` answers 400.
 
@@ -65,7 +65,7 @@ The score is logged (`[steer] req N gate fired|clean score=... (threshold ..., m
 
 ## Options
 
-`steer`, `steer_layers`, `steer_file`, `steer_dir`, `steer_scale`, `steer_scope`, `think_penalty`, `think_penalty_words`, `steer_gate_threshold`, `steer_edit_strength`, `steer_hedge_strength`, `steer_push`, `steer_openings`, `steer_band`, `steer_edit_layers`; see [CONFIG.md](CONFIG.md). `think_penalty_words` is a comma list or a file with one word per line (default `Wait, Hmm, Alternatively, But`); each word's first token in the spellings as is, lower case, capitalised, each plain, after a space and after a newline goes on the list, which the server logs at start.
+`steer`, `steer_layers`, `steer_file`, `steer_dir`, `steer_scale`, `steer_scope`, `think_penalty`, `think_penalty_words`, `steer_gate_threshold`, `steer_edit_strength`, `steer_hedge_strength`, `steer_push`, `steer_directions`, `steer_keep_norm`, `steer_openings`, `steer_band`, `steer_edit_layers`; see [CONFIG.md](CONFIG.md). `think_penalty_words` is a comma list or a file with one word per line (default `Wait, Hmm, Alternatively, But`); each word's first token in the spellings as is, lower case, capitalised, each plain, after a space and after a newline goes on the list, which the server logs at start.
 
 `steer_gate_threshold`, `steer_edit_strength` and `steer_edit_layers` say "auto" (or are empty) until set, and then take the model's value from `inc/engine/models/steer_defaults.h`; a request's own fields override both. The table, with the checkpoint each row was tuned on:
 
@@ -99,6 +99,15 @@ A sweep is serial (one request at a time), and the probe is several times the co
 `think_penalty` (option, or per request) subtracts a fixed logit from the first token of each marker spelling while the predicted token lies inside the reasoning block. Only first tokens that are word pieces of at least three letters go on the list (a bare newline or a single letter would be penalised everywhere); the server logs the list at start (15 tokens for the default words). `tests/tools/steer_think_sweep.py` measures it: seeded counting questions with exact answers, thinking on, per penalty the reasoning words, marker words per 100 reasoning words, the share of answers that finished and the share that are correct.
 
 On Qwen3.8-27B EXL3 4.0 bpw, 12 such questions at 3500 tokens, the model hesitates rarely (0.19 marker words per 100 reasoning words, 307 reasoning words per answer on average); penalties of 2, 4 and 8 take the marker rate to 0.05, 0.03 and 0.00 and change neither the length (307 to 315 words) nor the share finished or correct (0.83 each; the two unfinished questions are long enumerations with 1000-word reasoning that the penalty does not shorten). The default stays 0.
+
+## Several directions and a kept norm
+
+`steer_directions` (option and request field, default 1) clamps that many refusal directions per edit layer: the first is the openings' mean difference as before, the others are the strongest remaining variation of the declining openings once the earlier directions and the accepting openings' own spread are removed (power iteration, each with its own reference level at `steer_edit_strength` spreads). A layer holds 4 edits (`kSteerEntries`), shared with `steer_push` and the hedge clamp. `steer_keep_norm` (default off) uses a clamp that afterwards rescales the row to the norm it had before.
+
+Measured on Qwen3.8-27B EXL3 4.0 bpw, 68 target and 68 control prompts, the gate forced on the controls (unprobed refusal rate of the targets 0.65; the gate fires on 47 of 62 answered targets, and the 15 it skips score 0.57 to 0.64 and are answered anyway):
+* Targets still refusing: 0.13 and 0.11 with one direction at strengths -8 and -4, 0.11 and 0.10 with three. The difference is one prompt; the controls' text is a little cleaner with three (doubled words 0.3 and 0.4 per reply against 1.0 and 2.2). The default stays 1.
+* Keeping the norm is worse in every setting of the 24-prompt sweep: control prompts repeat (share 0.10 to 0.19 against 0.01 to 0.07) and double words (3 to 7 per reply against 0.4 to 3.0).
+* All of the remaining refusals are on prompts where the gate fired (6 to 8 of 47). They are mostly ethics-flavoured requests (cheating on an exam, secretly tracking a partner or a teenager, a hurtful text, insulting nicknames, a one-sided persuasive essay), and their replies cite policy ("as this a direct violation of academic integrity ...").
 
 ## Opening sets
 

@@ -46,7 +46,7 @@ struct ChatRequest {
 	std::string steer_vector;
 	float steer_scale = -1.0f;
 	std::string steer_scope;
-	float probe_threshold = NAN, probe_edit_strength = NAN, probe_hedge_strength = NAN, probe_push = NAN;   // per-request values of the probe options (NaN = the option)
+	float probe_threshold = NAN, probe_edit_strength = NAN, probe_hedge_strength = NAN, probe_push = NAN, probe_directions = NAN, probe_keep_norm = NAN;   // per-request values of the probe options (NaN = the option)
 	std::string probe_edit_layers;   // per-request steer_edit_layers (empty = the option)
 	bool steer_probe = false;   // the steering probe reads the prompt first and applies its direction clamps when the gate fires
 	float think_penalty = -1.0f;

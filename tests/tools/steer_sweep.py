@@ -78,6 +78,8 @@ def main():
     ap.add_argument("--scope", default="all", help="steer_scope values")
     ap.add_argument("--hedge", default="-1", help="steer_hedge_strength values (<0 = off)")
     ap.add_argument("--push", default="0", help="steer_push values: gaps added along the declining direction on every prompt (0 = off; it replaces the hedge clamp)")
+    ap.add_argument("--directions", default="1", help="steer_directions values: refusal directions clamped per layer")
+    ap.add_argument("--keep-norm", default="0", help="steer_keep_norm values (0/1): rescale the row to its norm after a clamp")
     ap.add_argument("--max-tokens", type=int, default=80)
     ap.add_argument("--stock", help="file with one stock opening per line (lower case prefixes), replacing the built-in list")
     ap.add_argument("--no-force-control", action="store_true", help="do not force the gate on the control prompts")
@@ -89,14 +91,14 @@ def main():
     base = {k: [ask(a.url, p, a.max_tokens, {})[0] for p in v] for k, v in sets.items()}
     out = open(a.jsonl, "w")
     rows = []
-    grid = itertools.product(lst(a.strength, float), lst(a.layers) or [""], lst(a.scope), lst(a.hedge, float), lst(a.push, float))
-    for strength, layers, scope, hedge, push in grid:
-        row = {"strength": strength, "layers": layers or "server", "scope": scope, "hedge": hedge, "push": push}
+    grid = itertools.product(lst(a.strength, float), lst(a.layers) or [""], lst(a.scope), lst(a.hedge, float), lst(a.push, float), lst(a.directions, int), lst(a.keep_norm, int))
+    for strength, layers, scope, hedge, push, ndir, keep in grid:
+        row = {"strength": strength, "layers": layers or "server", "scope": scope, "hedge": hedge, "push": push, "directions": ndir, "keep_norm": keep}
         for kind in ("target", "control"):
             force = kind == "control" and not a.no_force_control
             res = []
             for i, p in enumerate(sets[kind]):
-                extra = {"steer_probe": True, "steer_edit_strength": strength, "steer_hedge_strength": hedge, "steer_scope": scope, "steer_push": push}
+                extra = {"steer_probe": True, "steer_edit_strength": strength, "steer_hedge_strength": hedge, "steer_scope": scope, "steer_push": push, "steer_directions": ndir, "steer_keep_norm": bool(keep)}
                 if layers:
                     extra["steer_edit_layers"] = layers
                 if force:
@@ -110,7 +112,7 @@ def main():
                          "rep": m(r["rep"] for r in res), "doubled": m(r["doubled"] for r in res), "same": m(r["same"] for r in res)}
         rows.append(row)
         t, c = row["target"], row["control"]
-        print(f"strength {strength:>5} layers {row['layers']:>7} scope {scope:>9} hedge {hedge:>4} push {push:>5} | target fired {t['fired']:.2f} stock {t['stock']:.2f} rep {t['rep']:.2f} dbl {t['doubled']:.1f}"
+        print(f"strength {strength:>5} layers {row['layers']:>7} scope {scope:>9} dirs {ndir} keep {keep} hedge {hedge:>4} push {push:>5} | target fired {t['fired']:.2f} stock {t['stock']:.2f} rep {t['rep']:.2f} dbl {t['doubled']:.1f}"
               f" | control fired {c['fired']:.2f} same {c['same']:.2f} rep {c['rep']:.2f} dbl {c['doubled']:.1f}", flush=True)
     bt = statistics.mean(stock(t, prefixes) for t in base["target"])
     bc = statistics.mean(stock(t, prefixes) for t in base["control"])

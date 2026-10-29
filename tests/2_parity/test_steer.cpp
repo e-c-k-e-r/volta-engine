@@ -37,6 +37,7 @@ int main() {
 	// slot 1: add then clamp on layer 1; slot 2: clamp only (reference level below the projections, so it always fires); slot 3: add on layer 0
 	set( 1, 1, 0, STEER_ADD, 3.0f ); set( 1, 1, 1, STEER_CLAMP, 0.5f );
 	set( 2, 1, 0, STEER_CLAMP, -2.0f );
+	set( 2, 1, 1, STEER_CLAMP_KEEP, -1.0f ); set( 2, 1, 2, STEER_CLAMP, -0.5f );   // a norm-keeping clamp, and a third edit on the layer
 	set( 3, 0, 0, STEER_ADD, -1.5f );
 	std::vector<SteerSlotCtl> ctl( slots, SteerSlotCtl{} );
 	ctl[1].scope = STEER_ALL;                     ctl[1].prompt_len = 4; ctl[1].think_end = INT_MAX;
@@ -94,8 +95,12 @@ int main() {
 					const float* v = &vec[e * H];
 					if ( kind[e] == STEER_ADD ) { for ( int i = 0; i < H; ++i ) x[i] += par[e] * v[i]; }
 					else {
-						double dot = 0; for ( int i = 0; i < H; ++i ) dot += x[i] * v[i];
-						if ( dot - par[e] > 0 ) for ( int i = 0; i < H; ++i ) x[i] -= ( dot - par[e] ) * v[i];
+						double dot = 0, n0 = 0; for ( int i = 0; i < H; ++i ) { dot += x[i] * v[i]; n0 += x[i] * x[i]; }
+						if ( dot - par[e] > 0 ) {
+							double n1 = 0;
+							for ( int i = 0; i < H; ++i ) { x[i] -= ( dot - par[e] ) * v[i]; n1 += x[i] * x[i]; }
+							if ( kind[e] == STEER_CLAMP_KEEP ) for ( int i = 0; i < H; ++i ) x[i] *= std::sqrt( n0 / n1 );
+						}
 					}
 				}
 			}
@@ -140,8 +145,12 @@ int main() {
 						const float* v = &vec[e * H];
 						if ( kind[e] == STEER_ADD ) { for ( int i = 0; i < H; ++i ) edit[i] += par[e] * v[i]; }
 						else {
-							double dot = 0; for ( int i = 0; i < H; ++i ) dot += edit[i] * v[i];
-							if ( dot - par[e] > 0 ) for ( int i = 0; i < H; ++i ) edit[i] -= ( dot - par[e] ) * v[i];
+							double dot = 0, n0 = 0; for ( int i = 0; i < H; ++i ) { dot += edit[i] * v[i]; n0 += edit[i] * edit[i]; }
+							if ( dot - par[e] > 0 ) {
+								double n1 = 0;
+								for ( int i = 0; i < H; ++i ) { edit[i] -= ( dot - par[e] ) * v[i]; n1 += edit[i] * edit[i]; }
+								if ( kind[e] == STEER_CLAMP_KEEP ) for ( int i = 0; i < H; ++i ) edit[i] *= std::sqrt( n0 / n1 );
+							}
 						}
 					}
 				}

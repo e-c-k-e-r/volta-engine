@@ -165,6 +165,10 @@ void Generator::probe_slot( int s ) {
 	auto pick = [&]( float request, double option ) { return std::isnan( request ) ? static_cast<float>( option ) : request; };
 	const float threshold = pick( slot.req.probe_threshold, option_or( opt.steer_gate_threshold, sd.gate_threshold ) ), edit_strength = pick( slot.req.probe_edit_strength, option_or( opt.steer_edit_strength, sd.edit_strength ) ),
 		hedge_strength = pick( slot.req.probe_hedge_strength, opt.steer_hedge_strength ), push = pick( slot.req.probe_push, opt.steer_push );
+	const bool keep_norm = pick( slot.req.probe_keep_norm, opt.steer_keep_norm ? 1.0 : 0.0 ) != 0.0f;
+	// edit slots per layer: the clamp directions, a push and the hedge clamp share kSteerEntries
+	const int slots_left = engine::modules::kSteerEntries - ( push != 0.0f ? 1 : 0 );
+	const int directions = std::max( 1, std::min( static_cast<int>( pick( slot.req.probe_directions, static_cast<double>( opt.steer_directions ) ) ), slots_left ) );
 	const bool fired = score > threshold;
 	slot.metrics.gate_score = score;
 	slot.metrics.gate_fired = fired;
@@ -180,10 +184,20 @@ void Generator::probe_slot( int s ) {
 			if ( fired ) {
 				engine::modules::SteerEntry c;
 				c.layer = l;
-				c.kind = engine::modules::STEER_CLAMP;
+				c.kind = keep_norm ? engine::modules::STEER_CLAMP_KEEP : engine::modules::STEER_CLAMP;
 				c.vec = axes[bi].dir;
 				c.par = axes[bi].pa - edit_strength * axes[bi].sd;
 				entries.push_back( std::move( c ) );
+				if ( directions > 1 ) {
+					for ( ProbeAxis& x : probe_extra_axes( set_at( accept, bi ), set_at( decline, bi ), H, { axes[bi].dir }, directions - 1 ) ) {
+						engine::modules::SteerEntry e;
+						e.layer = l;
+						e.kind = c.kind;
+						e.vec = std::move( x.dir );
+						e.par = x.pa - edit_strength * x.sd;
+						entries.push_back( std::move( e ) );
+					}
+				}
 			}
 			if ( push != 0.0f ) {
 				// towards the declining side: k gaps along the axis (gap = mean projection of the declining openings minus the accepting ones)
@@ -194,7 +208,7 @@ void Generator::probe_slot( int s ) {
 				a.par = push * ( axes[bi].pb - axes[bi].pa );
 				entries.push_back( std::move( a ) );
 			}
-			if ( fired && push == 0.0f && hedge_strength >= 0.0f ) {   // at most kSteerEntries edits per layer: a push takes the hedge clamp's place
+			if ( fired && push == 0.0f && directions < engine::modules::kSteerEntries && hedge_strength >= 0.0f ) {   // at most kSteerEntries edits per layer: a push or further directions take the hedge clamp's place
 				const ProbeAxis hx = probe_axis( set_at( plain, bi ), set_at( hedged, bi ), H, false );
 				engine::modules::SteerEntry d;
 				d.layer = l;
@@ -212,8 +226,8 @@ void Generator::probe_slot( int s ) {
 		slot.steer_think_open = slot.in_reasoning;
 		cluster_.steer_control( s, slot.steer_scope, n, slot.in_reasoning ? INT_MAX : 0 );
 	}
-	LOG_INFO( "[steer] req %llu gate %s score=%.3f (threshold %.2f; clamp layers %d-%d strength %g; push %g; %d of %d prompt tokens from the prefix cache; %.0f ms)\n", static_cast<unsigned long long>( slot.req.req_id ), fired ? "fired" : "clean", score,
-		threshold, e0, e1, edit_strength, push, pos0, n, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_start ).count() );
+	LOG_INFO( "[steer] req %llu gate %s score=%.3f (threshold %.2f; clamp layers %d-%d strength %g; push %g; %d direction(s)%s; %d of %d prompt tokens from the prefix cache; %.0f ms)\n", static_cast<unsigned long long>( slot.req.req_id ), fired ? "fired" : "clean", score,
+		threshold, e0, e1, edit_strength, push, directions, keep_norm ? " norm kept" : "", pos0, n, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_start ).count() );
 }
 
 } // namespace engine::runtime

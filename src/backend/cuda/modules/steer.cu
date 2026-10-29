@@ -37,12 +37,28 @@ void steer_apply_kernel( SteerTables t, half* __restrict__ hidden, const pod::Ba
 			for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) srow[i] += par * v[i];
 		}
 		else {
-			float dot = 0.0f;
-			for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) dot = fmaf( srow[i], v[i], dot );
+			float dot = 0.0f, sq = 0.0f;
+			for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) {
+				dot = fmaf( srow[i], v[i], dot );
+				sq = fmaf( srow[i], srow[i], sq );
+			}
 			dot = engine::math::block_sum<8>( dot );
+			if ( kind == STEER_CLAMP_KEEP ) {
+				__syncthreads();   // block_sum's shared array is reused
+				sq = engine::math::block_sum<8>( sq );
+			}
 			const float over = dot - par;
 			if ( over > 0.0f ) {
-				for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) srow[i] -= over * v[i];
+				// |x - over v|^2 = |x|^2 - 2 over (x . v) + over^2 |v|^2: the kept norm needs no second pass over the row
+				float keep = 1.0f;
+				if ( kind == STEER_CLAMP_KEEP ) {
+					float vv = 0.0f;
+					for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) vv = fmaf( v[i], v[i], vv );
+					__syncthreads();
+					vv = engine::math::block_sum<8>( vv );
+					keep = sqrtf( sq / fmaxf( sq - 2.0f * over * dot + over * over * vv, 1e-12f ) );
+				}
+				for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) srow[i] = ( srow[i] - over * v[i] ) * keep;
 			}
 			__syncthreads();   // the next block_sum reuses its shared array, and the next entry reads the edited row
 		}
@@ -85,12 +101,28 @@ void steer_apply_streams_kernel( SteerTables t, float* __restrict__ streams, int
 			for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) srow[i] += par * v[i];
 		}
 		else {
-			float dot = 0.0f;
-			for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) dot = fmaf( srow[i], v[i], dot );
+			float dot = 0.0f, sq = 0.0f;
+			for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) {
+				dot = fmaf( srow[i], v[i], dot );
+				sq = fmaf( srow[i], srow[i], sq );
+			}
 			dot = engine::math::block_sum<8>( dot );
+			if ( kind == STEER_CLAMP_KEEP ) {
+				__syncthreads();   // block_sum's shared array is reused
+				sq = engine::math::block_sum<8>( sq );
+			}
 			const float over = dot - par;
 			if ( over > 0.0f ) {
-				for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) srow[i] -= over * v[i];
+				// |x - over v|^2 = |x|^2 - 2 over (x . v) + over^2 |v|^2: the kept norm needs no second pass over the row
+				float keep = 1.0f;
+				if ( kind == STEER_CLAMP_KEEP ) {
+					float vv = 0.0f;
+					for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) vv = fmaf( v[i], v[i], vv );
+					__syncthreads();
+					vv = engine::math::block_sum<8>( vv );
+					keep = sqrtf( sq / fmaxf( sq - 2.0f * over * dot + over * over * vv, 1e-12f ) );
+				}
+				for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) srow[i] = ( srow[i] - over * v[i] ) * keep;
 			}
 			__syncthreads();
 		}
