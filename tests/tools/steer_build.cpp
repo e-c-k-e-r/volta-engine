@@ -3,6 +3,9 @@
 // difference and its strength the length of the difference divided by the number of layers, so the layers together move the state by
 // the contrast the prompts show at a steer_scale of 1. Prompts are one per line (\n inside a prompt written as \\n); each is wrapped as a user turn with the answer started after an empty reasoning block.
 //   steer_build --pos pos.txt --neg neg.txt --out v.steer [--layers 21-42] [--model dir] [--scope generated] [--scale 1.5]
+//   steer_build ... --clamp [--strength K] [--orthogonal-to OTHER.steer]   a direction clamp per layer instead of an add: the direction is the unit mean difference
+//                (pos minus neg), the reference level the neg prompts' mean projection plus K standard deviations of it (default 2); --orthogonal-to first removes the
+//                directions of another file's entries (same layers) from it, so the axis keeps only what the other one does not cover
 //   steer_build ... --answers   lines are `question ||| answer` (the model's own answers); the state is the mean over the answer's first 48 tokens, fed one at a time
 //   steer_build --batch dir [...]     every NAME.pos.txt with a NAME.neg.txt in dir gives dir/NAME.steer (one model load for all)
 // Needs the steer option (set here) and a checkpoint of a model with the steering hooks (qwen3_5, qwen4_exp; read from its config.json).
@@ -35,11 +38,14 @@ static std::vector<std::string> read_lines( const std::string& path ) {
 
 int main( int argc, char** argv ) {
 	float file_scale = 1.0f;   // the recommended steer_scale stored in the file
-	bool answers = false;
+	bool answers = false, clamp = false;
+	float clamp_k = 2.0f;
+	std::string ortho_path;
 	std::string pos_path, neg_path, out_path, batch, layers = "", model = test::model_path( "Qwen3.8-27B-exl3", "ENGINE_TEST_QWEN_DIR" ), scope = "all";
-	for ( int i = 1; i < argc; i += ( std::string( argv[i] ) == "--answers" ? 1 : 2 ) ) {
+	for ( int i = 1; i < argc; i += ( std::string( argv[i] ) == "--answers" || std::string( argv[i] ) == "--clamp" ? 1 : 2 ) ) {
 		const std::string a = argv[i];
 		if ( a == "--answers" ) { answers = true; continue; }
+		if ( a == "--clamp" ) { clamp = true; continue; }
 		if ( i + 1 >= argc ) { std::fprintf( stderr, "missing value for %s\n", a.c_str() ); return 2; }
 		if ( a == "--pos" ) pos_path = argv[i + 1];
 		else if ( a == "--neg" ) neg_path = argv[i + 1];
@@ -49,6 +55,8 @@ int main( int argc, char** argv ) {
 		else if ( a == "--model" ) model = argv[i + 1];
 		else if ( a == "--scope" ) scope = argv[i + 1];
 		else if ( a == "--scale" ) file_scale = static_cast<float>( std::atof( argv[i + 1] ) );
+		else if ( a == "--strength" ) clamp_k = static_cast<float>( std::atof( argv[i + 1] ) );
+		else if ( a == "--orthogonal-to" ) ortho_path = argv[i + 1];
 		else { std::fprintf( stderr, "unknown argument %s\n", a.c_str() ); return 2; }
 	}
 	struct Job { std::string pos, neg, out; };
@@ -90,9 +98,9 @@ int main( int argc, char** argv ) {
 	for ( int l = first; l < first + count; ++l ) cap.push_back( l );
 	const int H = mc.metadata().hidden_size;
 
-	auto mean_states = [&]( const std::vector<std::string>& prompts ) {
-		std::vector<double> sum( static_cast<size_t>( count ) * H, 0.0 );
-		int rows = 0;
+	// the states of every prompt, [prompt][layer * H + i]
+	auto prompt_states = [&]( const std::vector<std::string>& prompts ) {
+		std::vector<std::vector<double>> all;
 		for ( const std::string& line : prompts ) {
 			std::string p = line, answer;
 			if ( answers ) {
@@ -109,31 +117,42 @@ int main( int argc, char** argv ) {
 			std::vector<float> st;
 			if ( !answers ) {
 				if ( !mc.steer_read( st ) ) { std::fprintf( stderr, "capture failed\n" ); std::exit( 1 ); }
-				for ( size_t i = 0; i < sum.size(); ++i ) sum[i] += st[i];
-				++rows;
+				all.emplace_back( st.begin(), st.end() );
 			}
 			else {
 				// the answer's tokens one at a time; each state is the residual after the token was read, the mean over the first 48
 				const std::vector<int> a = tok.encode( answer, false );
-				std::vector<double> acc( sum.size(), 0.0 );
+				std::vector<double> acc( static_cast<size_t>( count ) * H, 0.0 );
 				const int na = std::min( static_cast<int>( a.size() ), 48 );
 				for ( int t = 0; t < na; ++t ) {
 					mc.forward( &a[t], 1, static_cast<int>( ids.size() ) + t, 0 );
 					if ( !mc.steer_read( st ) ) { std::fprintf( stderr, "capture failed\n" ); std::exit( 1 ); }
 					for ( size_t i = 0; i < acc.size(); ++i ) acc[i] += st[i];
 				}
-				for ( size_t i = 0; i < sum.size(); ++i ) sum[i] += acc[i] / std::max( na, 1 );
-				++rows;
+				for ( double& v : acc ) v /= std::max( na, 1 );
+				all.push_back( std::move( acc ) );
 			}
 			mc.steer_capture( {}, false );
 		}
-		for ( double& v : sum ) v /= static_cast<double>( std::max( rows, 1 ) );
+		return all;
+	};
+	auto mean_of = [&]( const std::vector<std::vector<double>>& all ) {
+		std::vector<double> sum( static_cast<size_t>( count ) * H, 0.0 );
+		for ( const auto& v : all ) for ( size_t i = 0; i < sum.size(); ++i ) sum[i] += v[i];
+		for ( double& v : sum ) v /= static_cast<double>( std::max( all.size(), size_t( 1 ) ) );
 		return sum;
 	};
+	SteerFile other;   // --orthogonal-to
+	if ( !ortho_path.empty() ) {
+		std::string err;
+		if ( !load_steer_file( ortho_path, &other, &err ) ) { std::fprintf( stderr, "%s\n", err.c_str() ); return 1; }
+		if ( other.hidden != H ) { std::fprintf( stderr, "--orthogonal-to: hidden size %d, the model has %d\n", other.hidden, H ); return 1; }
+	}
 	for ( const Job& job : jobs ) {
 		const std::vector<std::string> pos = read_lines( job.pos ), neg = read_lines( job.neg );
 		if ( pos.empty() || neg.empty() ) { std::fprintf( stderr, "empty prompt set in %s\n", job.out.c_str() ); return 2; }
-		const std::vector<double> mp = mean_states( pos ), mn = mean_states( neg );
+		const auto pos_all = prompt_states( pos ), neg_all = prompt_states( neg );
+		const std::vector<double> mp = mean_of( pos_all ), mn = mean_of( neg_all );
 		SteerFile f;
 		f.hidden = H;
 		f.layers = mc.metadata().num_layers;
@@ -142,15 +161,42 @@ int main( int argc, char** argv ) {
 		for ( int li = 0; li < count; ++li ) {
 			engine::modules::SteerEntry e;
 			e.layer = first + li;
-			e.kind = engine::modules::STEER_ADD;
+			e.kind = clamp ? engine::modules::STEER_CLAMP : engine::modules::STEER_ADD;
 			e.vec.resize( H );
+			std::vector<double> d( H );
 			double n2 = 0.0;
-			for ( int i = 0; i < H; ++i ) { const double d = mp[static_cast<size_t>( li ) * H + i] - mn[static_cast<size_t>( li ) * H + i]; e.vec[i] = static_cast<float>( d ); n2 += d * d; }
-			const double n = std::sqrt( n2 );
-			for ( float& v : e.vec ) v = static_cast<float>( v / ( n + 1e-12 ) );
-			e.par = static_cast<float>( n / count );
+			for ( int i = 0; i < H; ++i ) { d[i] = mp[static_cast<size_t>( li ) * H + i] - mn[static_cast<size_t>( li ) * H + i]; n2 += d[i] * d[i]; }
+			const double n_full = std::sqrt( n2 );
+			double cos_other = 0.0;
+			for ( const auto& o : other.entries ) {
+				if ( o.layer != e.layer ) continue;
+				double c = 0.0, dn = 0.0;
+				for ( int i = 0; i < H; ++i ) { c += d[i] * o.vec[i]; dn += d[i] * d[i]; }
+				for ( int i = 0; i < H; ++i ) d[i] -= c * o.vec[i];
+				cos_other = c / ( std::sqrt( dn ) + 1e-12 );
+			}
+			double n3 = 0.0;
+			for ( double v : d ) n3 += v * v;
+			const double n = std::sqrt( n3 );
+			for ( int i = 0; i < H; ++i ) e.vec[i] = static_cast<float>( d[i] / ( n + 1e-12 ) );
+			if ( clamp ) {
+				// reference level: the neg prompts' mean projection plus clamp_k standard deviations of it
+				double m = 0.0, v2 = 0.0;
+				std::vector<double> pr;
+				for ( const auto& st : neg_all ) {
+					double pj = 0.0;
+					for ( int i = 0; i < H; ++i ) pj += st[static_cast<size_t>( li ) * H + i] * e.vec[i];
+					pr.push_back( pj );
+					m += pj;
+				}
+				m /= pr.size();
+				for ( double pj : pr ) v2 += ( pj - m ) * ( pj - m );
+				e.par = static_cast<float>( m + clamp_k * std::sqrt( v2 / pr.size() ) );
+				if ( !ortho_path.empty() ) std::printf( "%s layer %2d: cos with the other axis %.2f, kept %.2f of the contrast\n", job.out.c_str(), first + li, cos_other, n / ( n_full + 1e-12 ) );
+			}
+			else e.par = static_cast<float>( n_full / count );
 			f.entries.push_back( std::move( e ) );
-			std::printf( "%s layer %2d: contrast %.3f\n", job.out.c_str(), first + li, n );
+			std::printf( "%s layer %2d: contrast %.3f\n", job.out.c_str(), first + li, n_full );
 		}
 		std::string err;
 		if ( !save_steer_file( job.out, f, &err ) ) { std::fprintf( stderr, "%s\n", err.c_str() ); return 1; }
