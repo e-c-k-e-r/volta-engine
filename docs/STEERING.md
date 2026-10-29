@@ -117,6 +117,8 @@ Measured on Qwen3.8-27B EXL3 4.0 bpw (24 target prompts, unprobed refusal rate 0
 * Built-in set, strength -8: targets refuse 0.21 of the time, gate fired on 0.92.
 * A set of 28 accepting and 35 declining openings (more phrasings, polite and firm, mid-sentence, four languages): targets 0.71, 0.67, 0.54 and 0.50 at strengths -8, -3, -1.5 and -0.5, gate fired on 0.75; an English-only subset (24 + 29) gives 0.71, 0.67 and 0.58 at -8, -3 and -1. A broader set averages the refusal feature into a weaker direction, and no strength recovers the built-in set's effect. The small, similar-phrased sets are the better ones here.
 
+* Six declining openings about ethics and policy (academic integrity, privacy, hurtful or insulting content, misinformation) added to the built-in 5 + 8, 68 target and 68 control prompts, strength -8: targets still refusing 0.11 with one and with three directions (0.13 and 0.11 with the built-in set), and 6 of the 8 prompts that keep refusing under the built-in set keep refusing. The gate fires on every target (1.00 against 0.76), so that set would also need another threshold.
+
 ## Push
 
 `steer_push` (option and request field, default 0) goes the other way: with `steer_probe` on, it adds the probe's declining direction to the states of the edit layers, `steer_push` times the gap between the declining and the accepting openings (their mean projections on the axis), on every prompt whether or not the gate fires; negative values subtract it. It shares the layers' two edit slots with the clamp, so a push replaces the hedge clamp.
