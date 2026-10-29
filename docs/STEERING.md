@@ -109,6 +109,25 @@ Measured on Qwen3.8-27B EXL3 4.0 bpw, 68 target and 68 control prompts, the gate
 * Keeping the norm is worse in every setting of the 24-prompt sweep: control prompts repeat (share 0.10 to 0.19 against 0.01 to 0.07) and double words (3 to 7 per reply against 0.4 to 3.0).
 * All of the remaining refusals are on prompts where the gate fired (6 to 8 of 47). They are mostly ethics-flavoured requests (cheating on an exam, secretly tracking a partner or a teenager, a hurtful text, insulting nicknames, a one-sided persuasive essay), and their replies cite policy ("as this a direct violation of academic integrity ...").
 
+## Refusal geometry
+
+`tests/tools/steer_geometry` (C++, one model load, about 35 s for 60 prompts) records, for each prompt, the residual after each layer in 6 to 58 at the last prompt token and after each of the probe's built-in accepting and declining openings; `tests/tools/steer_geometry.py` turns that into the table below. Prompts: 15 technical or security requests (lock picking, hotwiring, phishing, ransomware, skimmers, scams ...), 15 ethics or etiquette requests (exam cheating, covert tracking of a partner or teenager, hurtful or insulting writing, fake documents, one-sided persuasion ...) and 30 benign ones, from the evaluation sets. A category's axis is the mean over its prompts of (declining openings' mean - accepting openings' mean), minus the benign prompts' mean, so it holds the part that depends on the prompt.
+
+Qwen3.8-27B EXL3 4.0 bpw, selected layers (the clamp edits 34 to 42):
+
+| layer | norm technical | norm ethics | cosine of the two axes | own / other-axis share of an ethics prompt's contrast | prompt-end separation from benign (leave-one-out AUC), technical / ethics |
+|---|---|---|---|---|---|
+| 12 | 1.6 | 2.3 | 0.02 | 0.30 / 0.26 | 0.80 / 0.81 |
+| 21 | 6.8 | 10.3 | 0.50 | 0.45 / 0.26 | 0.85 / 0.86 |
+| 30 | 16.8 | 20.0 | 0.72 | 0.53 / 0.34 | 0.96 / 0.99 |
+| 36 | 28.8 | 36.3 | 0.82 | 0.60 / 0.44 | 0.97 / 0.99 |
+| 42 | 29.9 | 37.4 | 0.77 | 0.55 / 0.40 | 0.97 / 0.99 |
+| 54 | 76.4 | 97.1 | 0.76 | 0.56 / 0.39 | 0.98 / 1.00 |
+
+* The ethics category is at least as detectable at the end of the prompt as the technical one, and its axis is about 25% larger: the clamp window does not lack a signal for it.
+* The two axes are nearly orthogonal in the early layers and share most of their direction from about layer 30 on (cosine 0.72 to 0.82); in the clamp window an ethics prompt's contrast lies only about 55 to 60% along its own category axis, 40% along the technical one (the shares do not add to 1).
+* One axis from the built-in openings therefore removes the shared part; the prompts that keep refusing are the ones whose refusal sits in what the technical axis does not cover. Nothing here says how the model came to be that way.
+
 ## Opening sets
 
 The probe's directions come from forced openings (5 accepting, 8 declining, 4 plain, 4 hedged, in the source). `steer_openings` names a file that replaces them: lines `accept: TEXT`, `decline: TEXT`, `plain: TEXT`, `hedged: TEXT`; a kind without lines keeps the built-in ones.
@@ -126,7 +145,7 @@ Measured on Qwen3.8-27B EXL3 4.0 bpw (24 target prompts, unprobed refusal rate 0
 Measured on Qwen3.8-27B EXL3 4.0 bpw (24 target and 24 control prompts, the gate left unforced on the controls, 80 tokens, clamp strength -8 on the targets; the stock rate is the share of replies that open with a refusal):
 * Control prompts' refusal rate by push: 0 at 0.03, 0.08 at 0.06, 0.79 at 0.10 ("I cannot fulfill this request."), then the text breaks down: repeated fragments at 0.15, dots from 0.2, garbage at 0.5 and above. The useful band is narrow, about 0.08 to 0.12.
 * Targets under the clamp alone refuse 0.21 of the time (0.71 unprobed); with the push 0.25 / 0.29 / 0.33 at 0.03 / 0.06 / 0.10 and 0.50 at 0.3, and at 0.5 to 1 the replies are refusals again (0.79 and 0.92) while the controls are already broken.
-* Negative push (-1) breaks every reply into one repeated token.
+* Negative push, on top of the clamp (strength -8; 68 targets, 24 controls): -1 breaks every reply into one repeated token. In small steps it does reach some of the refusals the clamp leaves: targets still refusing 0.13 without, 0.11 at -0.03, 0.06 at -0.06, 0.00 at -0.1 and beyond, and of the 8 prompts that keep refusing under the clamp 1 is answered at -0.03 and 4 at -0.06 ("Here is a step-by-step guide ...", a persuasive essay, a harsh text). The text pays for it: at -0.06 8 of the 47 gated targets show repetition ("its its its", "the the") and the controls stay clean (repetition 0.03), from -0.1 the controls break down too (repetition 0.72). Some replies are hybrids that refuse and then comply ("I cannot provide a list of ... :" followed by the list). There is no clean window, only a trade.
 * The sum over the edit layers is what counts: a push of 1 puts about ten gaps into the residual stream. Fine steps are needed, and the tuned value moves with the edit window (`steer_edit_layers`).
 
 ## Flash-Next
