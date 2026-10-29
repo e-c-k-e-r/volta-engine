@@ -3,12 +3,14 @@
 // difference and its strength the length of the difference divided by the number of layers, so the layers together move the state by
 // the contrast the prompts show at a steer_scale of 1. Prompts are one per line (\n inside a prompt written as \\n); each is wrapped as a user turn with the answer started after an empty reasoning block.
 //   steer_build --pos pos.txt --neg neg.txt --out v.steer [--layers 21-42] [--model dir] [--scope generated] [--scale 1.5]
+//   steer_build ... --answers   lines are `question ||| answer` (the model's own answers); the state is the mean over the answer's first 48 tokens, fed one at a time
 //   steer_build --batch dir [...]     every NAME.pos.txt with a NAME.neg.txt in dir gives dir/NAME.steer (one model load for all)
 // Needs the steer option (set here) and a checkpoint of a model with the steering hooks (qwen3_5, qwen4_exp; read from its config.json).
 #include "engine/runtime/cluster.h"
 #include "engine/runtime/steer_file.h"
 #include "engine/runtime/test_paths.h"
 #include "engine/loader/tokenizer.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -33,9 +35,12 @@ static std::vector<std::string> read_lines( const std::string& path ) {
 
 int main( int argc, char** argv ) {
 	float file_scale = 1.0f;   // the recommended steer_scale stored in the file
+	bool answers = false;
 	std::string pos_path, neg_path, out_path, batch, layers = "", model = test::model_path( "Qwen3.8-27B-exl3", "ENGINE_TEST_QWEN_DIR" ), scope = "all";
-	for ( int i = 1; i + 1 < argc; i += 2 ) {
+	for ( int i = 1; i < argc; i += ( std::string( argv[i] ) == "--answers" ? 1 : 2 ) ) {
 		const std::string a = argv[i];
+		if ( a == "--answers" ) { answers = true; continue; }
+		if ( i + 1 >= argc ) { std::fprintf( stderr, "missing value for %s\n", a.c_str() ); return 2; }
 		if ( a == "--pos" ) pos_path = argv[i + 1];
 		else if ( a == "--neg" ) neg_path = argv[i + 1];
 		else if ( a == "--out" ) out_path = argv[i + 1];
@@ -87,18 +92,42 @@ int main( int argc, char** argv ) {
 
 	auto mean_states = [&]( const std::vector<std::string>& prompts ) {
 		std::vector<double> sum( static_cast<size_t>( count ) * H, 0.0 );
-		for ( const std::string& p : prompts ) {
+		int rows = 0;
+		for ( const std::string& line : prompts ) {
+			std::string p = line, answer;
+			if ( answers ) {
+				const size_t cut = line.find( " ||| " );
+				if ( cut == std::string::npos ) { std::fprintf( stderr, "--answers: a line without ' ||| '\n" ); std::exit( 1 ); }
+				p = line.substr( 0, cut );
+				answer = line.substr( cut + 5 );
+			}
 			const std::vector<int> ids = tok.encode( "<|im_start|>user\n" + p + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", false );
 			if ( ids.empty() || ids[0] != tok.im_start_id() ) { std::fprintf( stderr, "template special tokens were not recognised\n" ); std::exit( 1 ); }
 			mc.reset_slot( 0 );
 			mc.steer_capture( cap, true );
 			mc.prefill( ids.data(), static_cast<int>( ids.size() ), 0 );
 			std::vector<float> st;
-			if ( !mc.steer_read( st ) ) { std::fprintf( stderr, "capture failed\n" ); std::exit( 1 ); }
+			if ( !answers ) {
+				if ( !mc.steer_read( st ) ) { std::fprintf( stderr, "capture failed\n" ); std::exit( 1 ); }
+				for ( size_t i = 0; i < sum.size(); ++i ) sum[i] += st[i];
+				++rows;
+			}
+			else {
+				// the answer's tokens one at a time; each state is the residual after the token was read, the mean over the first 48
+				const std::vector<int> a = tok.encode( answer, false );
+				std::vector<double> acc( sum.size(), 0.0 );
+				const int na = std::min( static_cast<int>( a.size() ), 48 );
+				for ( int t = 0; t < na; ++t ) {
+					mc.forward( &a[t], 1, static_cast<int>( ids.size() ) + t, 0 );
+					if ( !mc.steer_read( st ) ) { std::fprintf( stderr, "capture failed\n" ); std::exit( 1 ); }
+					for ( size_t i = 0; i < acc.size(); ++i ) acc[i] += st[i];
+				}
+				for ( size_t i = 0; i < sum.size(); ++i ) sum[i] += acc[i] / std::max( na, 1 );
+				++rows;
+			}
 			mc.steer_capture( {}, false );
-			for ( size_t i = 0; i < sum.size(); ++i ) sum[i] += st[i];
 		}
-		for ( double& v : sum ) v /= static_cast<double>( prompts.size() );
+		for ( double& v : sum ) v /= static_cast<double>( std::max( rows, 1 ) );
 		return sum;
 	};
 	for ( const Job& job : jobs ) {
