@@ -88,6 +88,13 @@ weight straight into shared memory. `ENGINE_DEBUG_NVFP4_HIPBLAS=1` takes dequant
 grows (which a captured graph cannot follow; decode graphs, at most 8 rows, never take that path). `ENGINE_DEBUG_MOE_GEMV=1` runs the
 expert-grouped EXL3 MoE on the v_dot2 GEMV instead of its WMMA kernels.
 
+Attention with head_dim 256 (Qwen's full-attention layers) takes the WMMA kernel (`src/kernels/rocm/attn_wmma.cuh`) for prefill chunks and
+for rows of one slot (a verify block shares the K/V tiles across its rows). One decode row, or rows of distinct slots, take the decode kernel
+(`src/kernels/rocm/attn_decode_rdna.cuh`): a block owns a kv head, a row and a slice of its keys, reads every key and value once for all the
+kv head's query heads (up to 8), with four lanes per key for the scores and one lane per 8 output dimensions for the values, and leaves its
+partial for `attn_reduce_kernel` (32 slices for one row; rows of distinct slots slice until about 384 blocks). At 5000 keys one row takes
+42 us (`test_attention_prefill`).
+
 A config's `tp_size` must not exceed the GPUs present (the files in configs/ are written for four).
 
 ## Cooperative launches
@@ -121,8 +128,8 @@ One RX 7900 XTX (24 GB), Qwen3.8-27B, `build/bench_decode` (8K context) and `ben
 | | Plain token | 8-row verify | Prefill (512-row chunks) |
 |---|---|---|---|
 | NVFP4 (head quantized, `nvfp4_dense=head`) | 21.6 ms (46 tok/s) | 27 ms (1.25x) | 1123 tok/s |
-| EXL3 4.0 bpw | 29.2 ms (34 tok/s) | 37 ms (1.3x) | 1115 tok/s |
+| EXL3 4.0 bpw | 28.3 ms (35 tok/s) | 37 ms (1.3x) | 1115 tok/s |
 
 * NVFP4 target with the DFlash2 EXL3 5.0 bpw drafter, natural 8K prompts (`tests/3_bench/bench_serve.py`): 129, 153, 145 and 75 tok/s, 37 ms per round (27 ms verify, 9.5 ms drafter).
 * The NVFP4 GEMVs read the packed weights at 80 to 90% of the 920 GB/s a plain read kernel reaches on this card; the prefill GEMM reaches 73 of the ~96 TFLOP/s the WMMA peaks at.
-* An EXL3 plain token at 8K context is about 1900 kernel launches: the GEMVs take about 21 ms of it and read the large projections at 690 to 750 GB/s, attention about 2 ms and the Hadamard rotations (two per linear) about 1 ms (rocprofv3 kernel trace of `bench_decode`). A verify block of 8 rows costs 1.3 times a token (37 ms), 12 rows 39 ms and 16 rows 43 ms (`bench_decode` with `BENCH_VL=8,12,16`, 8000 tokens of context).
+* An EXL3 plain token at 8K context is about 1900 kernel launches: the GEMVs take about 21 ms of it and read the large projections at 690 to 750 GB/s, attention about 1 ms and the Hadamard rotations (two per linear) about 1 ms (rocprofv3 kernel trace of `bench_decode`). At 32000 tokens of context a plain token takes 30.3 ms. A verify block of 8 rows costs 1.3 times a token (37 ms), 12 rows 39 ms and 16 rows 43 ms (`bench_decode` with `BENCH_VL=8,12,16`, 8000 tokens of context).

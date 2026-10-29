@@ -818,27 +818,33 @@ __global__ void attn_reduce_kernel(
 	const int tid = threadIdx.x;
 	if ( q_head >= num_q_heads || tid >= D ) return;
 
-	float m_acc = -1e30f;
-	float l_acc = 0.0f;
-	float o_acc = 0.0f;
-
 	const float* ws_base = workspace + ( static_cast<size_t>( token_idx ) * num_q_heads + q_head ) * n_chunks * ( ATTN_MAX_HEAD_DIM + 2 );
 
+	// The chunks' maxima first (one pass, in parallel), then every chunk's weight exp(m_c - m) is known and the weighted sum has no
+	// dependency chain through the loads
+	__shared__ float s_w[ATTN_MAX_CHUNKS];
+	__shared__ float s_m;
+	for ( int c = tid; c < n_chunks; c += D ) {
+		const float* ws_c = ws_base + static_cast<size_t>( c ) * ( ATTN_MAX_HEAD_DIM + 2 );
+		s_w[c] = ws_c[1] == 0.0f ? -1e30f : ws_c[0];
+	}
+	__syncthreads();
+	if ( tid == 0 ) {
+		float m = -1e30f;
+		for ( int c = 0; c < n_chunks; ++c ) m = fmaxf( m, s_w[c] );
+		s_m = m;
+	}
+	__syncthreads();
+	const float m_acc = s_m;
+	float l_acc = 0.0f;
+	float o_acc = 0.0f;
+	#pragma unroll 8
 	for ( int c = 0; c < n_chunks; ++c ) {
 		const float* ws_c = ws_base + static_cast<size_t>( c ) * ( ATTN_MAX_HEAD_DIM + 2 );
-		float m_c = ws_c[0];
-		float l_c = ws_c[1];
-		float o_c = ws_c[2 + tid];
-
-		if ( l_c == 0.0f ) continue;
-
-		float m_new = fmaxf( m_acc, m_c );
-		float alpha = __expf( m_acc - m_new );
-		float beta = __expf( m_c - m_new );
-
-		o_acc = fmaf( alpha, o_acc, beta * o_c );
-		l_acc = fmaf( alpha, l_acc, beta * l_c );
-		m_acc = m_new;
+		const float l_c = ws_c[1];
+		const float w = l_c == 0.0f ? 0.0f : __expf( ws_c[0] - m_acc );
+		o_acc = fmaf( w, ws_c[2 + tid], o_acc );
+		l_acc = fmaf( w, l_c, l_acc );
 	}
 
 	float inv_l = ( l_acc > 0.0f ) ? ( 1.0f / l_acc ) : 0.0f;
@@ -859,6 +865,7 @@ __global__ void attn_reduce_kernel(
 
 #if defined(USE_ROCM)
 #include "../../../kernels/rocm/attn_wmma.cuh"
+#include "../../../kernels/rocm/attn_decode_rdna.cuh"
 #endif
 
 } // namespace
@@ -1010,6 +1017,25 @@ void Attention::forward_prefill(
 		(void) key_hint;
 		const float scale_w = 1.0f / sqrtf( static_cast<float>( head_dim ) );
 		const int Gw = num_q_heads / num_kv_heads;
+		// Decode rows of distinct slots, or one row: the decode kernel reads each key once for the kv head's query heads. Rows of one slot
+		// (a verify block) stay on the WMMA kernel, which shares the K/V tiles across them. 32 splits for one row; rows of distinct slots
+		// split until about 384 blocks (attention test on a 7900 XTX)
+		if ( ( per_row || count == 1 ) && Gw <= AD_GMAX ) {
+			const int nsplit = count == 1 ? 32 : MIN( ATTN_MAX_CHUNKS, MAX( 8, ( 384 + num_kv_heads * count - 1 ) / ( num_kv_heads * count ) ) );
+			ENGINE_ASSERT( static_cast<size_t>( count ) * num_q_heads * nsplit <= static_cast<size_t>( ATTN_MAX_ROW_HEADS ) * ATTN_MAX_CHUNKS, "Attention::forward_prefill: workspace" );
+			float* ws_d = attn_workspace_ptr();
+			#define LAUNCH_AD() attn_decode_rdna_kernel<KQ_, VQ_><<<dim3( num_kv_heads, count, nsplit ), 32 * AD_W, 0, stream>>>( q.ptr<const half>(), kv, \
+				slot_stride, layer_idx, d_rows, num_q_heads, num_kv_heads, max_seq, scale_w, ws_d, nsplit )
+			#define KQ_ KQV_
+			#define VQ_ VQV_
+			KV_DISPATCH( KQV_, VQV_, LAUNCH_AD() )
+			#undef KQ_
+			#undef VQ_
+			#undef LAUNCH_AD
+			attn_reduce_kernel<256><<<dim3( num_q_heads, count ), 256, 0, stream>>>( ws_d, gate.data != nullptr ? gate.ptr<const half>() : nullptr,
+				out.ptr<half>(), num_q_heads, nsplit, kv.vq == KVQ::Q4 ? 1 : 0 );
+			return;
+		}
 		const int tile_w = per_row ? Gw : WM_BQ;
 		const int base_w = num_kv_heads * ( ( count * Gw + tile_w - 1 ) / tile_w );
 		int nsplit_w = 1;
