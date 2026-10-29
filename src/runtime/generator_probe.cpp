@@ -9,6 +9,10 @@
 #include "engine/runtime/options.h"
 #include "engine/models/steer_defaults.h"
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <string>
+#include <vector>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -27,6 +31,46 @@ const char* const kHedged[] = { "Here is the answer, but note that this may be r
 	"Here is, with the caveat that", "I can help; however, please note that this is for educational purposes only and" };
 
 constexpr int kLookahead = 24;
+
+// The forced openings of the four kinds: the built-in ones, or those of the steer_openings file ( `kind: text` per line )
+struct Openings {
+	std::vector<std::string> kind[4];   // accept, decline, plain, hedged
+};
+
+const Openings& openings() {
+	static Openings built_in, loaded;
+	static std::string loaded_from;
+	static bool init = false;
+	if ( !init ) {
+		init = true;
+		for ( const char* o : kAccept ) built_in.kind[0].push_back( o );
+		for ( const char* o : kDecline ) built_in.kind[1].push_back( o );
+		for ( const char* o : kPlain ) built_in.kind[2].push_back( o );
+		for ( const char* o : kHedged ) built_in.kind[3].push_back( o );
+	}
+	const std::string& path = runtime::options().steer_openings;
+	if ( path.empty() ) return built_in;
+	if ( path != loaded_from ) {
+		loaded_from = path;
+		loaded = built_in;
+		Openings file;
+		std::ifstream in( path );
+		ENGINE_ASSERT( in.good(), "steer_openings: cannot read the file" );
+		static const char* const names[4] = { "accept:", "decline:", "plain:", "hedged:" };
+		for ( std::string line; std::getline( in, line ); ) {
+			for ( int k = 0; k < 4; ++k ) {
+				const size_t len = std::strlen( names[k] );
+				if ( line.compare( 0, len, names[k] ) != 0 ) continue;
+				size_t b = len;
+				while ( b < line.size() && line[b] == ' ' ) ++b;
+				if ( b < line.size() ) file.kind[k].push_back( line.substr( b ) );
+			}
+		}
+		for ( int k = 0; k < 4; ++k )
+			if ( !file.kind[k].empty() ) loaded.kind[k] = std::move( file.kind[k] );
+	}
+	return loaded;
+}
 
 // An option that says "auto" (or nothing) takes the model's value
 double option_or( const std::string& text, double fallback ) {
@@ -73,18 +117,19 @@ void Generator::probe_slot( int s ) {
 	cluster_.checkpoint( s );
 	cluster_.steer_capture( band, true );
 	auto read_state = [&]() { std::vector<float> st; ENGINE_ASSERT( cluster_.steer_read( st ), "probe: capture failed" ); return st; };
-	auto states_of = [&]( const char* const* openings, size_t count ) {
+	auto states_of = [&]( const std::vector<std::string>& list ) {
 		std::vector<std::vector<float>> out;
-		for ( size_t i = 0; i < count; ++i ) {
-			const std::vector<int> ids = tokenizer_.encode( openings[i], false );
+		for ( const std::string& text : list ) {
+			const std::vector<int> ids = tokenizer_.encode( text, false );
 			cluster_.forward( ids.data(), pod::BatchRows::causal( static_cast<int>( ids.size() ), n, s, pod::BatchRows::LOGITS_NONE ) );   // no head: a block above 16 rows would dequantize the whole LM head
 			out.push_back( read_state() );
 			cluster_.rollback( s );
 		}
 		return out;
 	};
-	const auto accept = states_of( kAccept, std::size( kAccept ) ), decline = states_of( kDecline, std::size( kDecline ) );
-	const auto plain = states_of( kPlain, std::size( kPlain ) ), hedged = states_of( kHedged, std::size( kHedged ) );
+	const Openings& ops = openings();
+	const auto accept = states_of( ops.kind[0] ), decline = states_of( ops.kind[1] );
+	const auto plain = states_of( ops.kind[2] ), hedged = states_of( ops.kind[3] );
 	// look-ahead: the states of the first tokens the unedited model would write
 	std::vector<std::vector<float>> ahead;
 	for ( int i = 0, pos = n; i < kLookahead && !cluster_.is_eos( cur ); ++i, ++pos ) {
