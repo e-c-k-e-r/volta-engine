@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 #include "exl3_gemv.cuh"
 #include "exl3_dq.cuh"
+#include "exl3_tile_rdna.cuh"
 #include "hadamard.cuh"
 #include "trellis_context.h"
 #include "../wmma.cuh"
@@ -50,13 +51,20 @@ __global__ __launch_bounds__( 32 * gemm_warps<MB>() ) void exl3_gemm_wmma_kernel
 	for ( int mb = 0; mb < MB; ++mb ) arow[mb] = A + (size_t) min( mb * 16 + ( lane & 15 ), M - 1 ) * K;
 
 	const int c = lane >> 2, r0 = 2 * ( lane & 3 );
-	const size_t bstep = (size_t) n_tiles * 16 * bits / 2;   // uint32 words from one k tile to the next
-	const uint32_t* bt0 = reinterpret_cast<const uint32_t*>( B + ( (size_t) kb0 * n_tiles + tile_n ) * ( 16 * bits ) );
+	// The tile walk: a wave-uniform byte pointer plus the lane's fixed word offsets (exl3_tile_rdna.cuh)
+	const size_t bstep = (size_t) n_tiles * 32 * bits;   // bytes from one k tile to the next
+	const Exl3TilePlan<bits> plan = exl3_tile_plan<bits>( lane );
+	const uint64_t b0 = reinterpret_cast<uint64_t>( B + ( (size_t) kb0 * n_tiles + tile_n ) * ( 16 * bits ) );
+	const uint32_t b_hi = static_cast<uint32_t>( __builtin_amdgcn_readfirstlane( static_cast<uint32_t>( b0 >> 32 ) ) );
+	const uint32_t b_lo = static_cast<uint32_t>( __builtin_amdgcn_readfirstlane( static_cast<uint32_t>( b0 ) ) );
+	const char* bt0 = reinterpret_cast<const char*>( ( static_cast<uint64_t>( b_hi ) << 32 ) | b_lo );
 
 	// decodes k tile kt of this warp's range into buffer buf
 	auto stage = [&]( int kt, int buf ) {
+		uint32_t raw[Exl3TilePlan<bits>::R];
+		exl3_tile_load<bits>( bt0 + (size_t) ( kt - kb0 ) * bstep, plan, raw );
 		FragB f0, f1;
-		dq_dispatch<bits, cb>( bt0 + (size_t) ( kt - kb0 ) * bstep, lane << 3, f0, f1 );
+		exl3_tile_decode<bits, cb>( raw, plan, f0, f1 );
 		half2* col_lo = reinterpret_cast<half2*>( &bs[warp][buf][c * 16] );
 		half2* col_hi = reinterpret_cast<half2*>( &bs[warp][buf][( c + 8 ) * 16] );
 		col_lo[r0 >> 1] = __builtin_bit_cast( half2, f0[0] );

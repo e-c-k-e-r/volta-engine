@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 #include "exl3_gemv.cuh"
 #include "exl3_dq.cuh"
+#include "exl3_tile_rdna.cuh"
 #include "hadamard.cuh"
 #include "trellis_context.h"
 #include <cstdint>
@@ -51,8 +52,13 @@ __global__ __launch_bounds__( 32 * ROCM_GEMV_MAX_WARPS ) void exl3_gemv_rocm_ker
 	#pragma unroll
 	for ( int m = 0; m < MR; ++m ) acc_a[m] = acc_b[m] = 0.f;
 
-	const uint32_t* bt = reinterpret_cast<const uint32_t*>( B + ( (size_t) kb0 * n_tiles + tile_n ) * ( 16 * bits ) );
-	const size_t bstep = (size_t) n_tiles * 16 * bits / 2;   // uint32 words from one k tile to the next
+	// The tile walk: a wave-uniform byte pointer (scalar registers) plus the lane's fixed word offsets (exl3_tile_rdna.cuh)
+	const Exl3TilePlan<bits> plan = exl3_tile_plan<bits>( lane );
+	const uint64_t bt0 = reinterpret_cast<uint64_t>( B + ( (size_t) kb0 * n_tiles + tile_n ) * ( 16 * bits ) );
+	const uint32_t bt_hi = static_cast<uint32_t>( __builtin_amdgcn_readfirstlane( static_cast<uint32_t>( bt0 >> 32 ) ) );
+	const uint32_t bt_lo = static_cast<uint32_t>( __builtin_amdgcn_readfirstlane( static_cast<uint32_t>( bt0 ) ) );
+	const char* bt = reinterpret_cast<const char*>( ( static_cast<uint64_t>( bt_hi ) << 32 ) | bt_lo );
+	const size_t bstep = (size_t) n_tiles * 32 * bits;   // bytes from one k tile to the next
 	const uint2* alane = reinterpret_cast<const uint2*>( &as_[warp][0][0] ) + ( lane & 3 ) * MR;
 	for ( int c = 0; c < nchunks; ++c ) {
 		const int kc = kb0 + c * CH;
@@ -71,8 +77,10 @@ __global__ __launch_bounds__( 32 * ROCM_GEMV_MAX_WARPS ) void exl3_gemv_rocm_ker
 		__syncthreads();
 		#pragma unroll 4
 		for ( int j = 0; j < n; ++j, bt += bstep ) {
+			uint32_t raw[Exl3TilePlan<bits>::R];
+			exl3_tile_load<bits>( bt, plan, raw );
 			FragB f0, f1;
-			dq_dispatch<bits, cb>( bt, lane << 3, f0, f1 );
+			exl3_tile_decode<bits, cb>( raw, plan, f0, f1 );
 			#pragma unroll
 			for ( int m = 0; m < MR; ++m ) {
 				const uint2 av = alane[j * 4 * MR + m];

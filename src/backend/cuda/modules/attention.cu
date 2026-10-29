@@ -1039,7 +1039,10 @@ void Attention::forward_prefill(
 		const int tile_w = per_row ? Gw : WM_BQ;
 		const int base_w = num_kv_heads * ( ( count * Gw + tile_w - 1 ) / tile_w );
 		int nsplit_w = 1;
-		if ( base_w < 96 ) nsplit_w = MIN( ( 192 + base_w - 1 ) / base_w, 32 );
+		// Up to 64 key slices while the query tiles alone leave the device under four blocks per CU (a verify block at 32K context: 1.2 ms
+		// of 42.8 faster than 32), no more than the workspace holds for these rows
+		if ( base_w < 96 ) nsplit_w = MIN( ( 384 + base_w - 1 ) / base_w, 64 );
+		nsplit_w = MAX( 1, MIN( nsplit_w, ATTN_MAX_ROW_HEADS * ATTN_MAX_CHUNKS / ( count * num_q_heads ) ) );
 		if ( key_hint > 0 ) nsplit_w = MAX( 1, MIN( nsplit_w, key_hint / ( 4 * WM_BK ) ) );
 		ENGINE_ASSERT( static_cast<size_t>( count ) * num_q_heads * nsplit_w <= static_cast<size_t>( ATTN_MAX_ROW_HEADS ) * ATTN_MAX_CHUNKS, "Attention::forward_prefill: workspace" );
 		float* ws_w = attn_workspace_ptr();

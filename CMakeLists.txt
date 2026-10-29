@@ -407,7 +407,7 @@ set_target_properties(test_trellis PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJEC
 
 # Test the trellis pair decode bit for bit (every index, the three codebooks; on ROCm its RDNA form)
 add_executable(test_trellis_decode tests/2_parity/test_trellis_decode.cu)
-target_include_directories(test_trellis_decode PRIVATE ${PROJECT_SOURCE_DIR}/src/kernels/cuda/trellis)
+target_include_directories(test_trellis_decode PRIVATE ${PROJECT_SOURCE_DIR}/src/kernels/cuda/trellis ${PROJECT_SOURCE_DIR}/src/kernels/rocm/trellis)
 if(ENGINE_BACKEND STREQUAL "ROCM")
 	set_source_files_properties(tests/2_parity/test_trellis_decode.cu PROPERTIES LANGUAGE HIP)
 endif()

@@ -13,6 +13,7 @@
 #include "engine/config.h"
 #include "engine/runtime/options.h"
 #include "exl3_dq.cuh"
+#include "exl3_tile_rdna.cuh"
 #include "exl3_moe_coop.cuh"
 #include "hadamard_inner.cuh"
 #include "../wmma.cuh"
@@ -128,10 +129,11 @@ __global__ __launch_bounds__( 32 * GEMV_WARPS ) void moe_gemv_kernel(
 	float acc_a = 0.f, acc_b = 0.f;
 	const uint32_t* bt = reinterpret_cast<const uint32_t*>( B + ( static_cast<size_t>( kb0 ) * n_tiles + tile_n ) * ( 16 * bits ) );
 	const size_t bstep = static_cast<size_t>( n_tiles ) * 16 * bits / 2;
+	const Exl3TilePlan<bits> plan = exl3_tile_plan<bits>( lane );
 	#pragma unroll 4
 	for ( int kt = kb0; kt < kb1; ++kt, bt += bstep ) {
 		FragB f0, f1;
-		dq_dispatch<bits, 2>( bt, lane << 3, f0, f1 );
+		exl3_tile_dq<bits, 2>( bt, plan, f0, f1 );
 		const half2 a01 = ar[kt * 8], a89 = ar[kt * 8 + 4];
 		acc_a = fdot2( a01, f0[0], acc_a );
 		acc_a = fdot2( a89, f0[1], acc_a );
@@ -365,6 +367,7 @@ __global__ __launch_bounds__( 32 * GEMV_WARPS ) void grp_gemv_kernel(
 	float* C = ( second ? out1 : out0 ) + static_cast<size_t>( i0 ) * N;
 	const int tid = threadIdx.x, lane = tid & 31;
 	const int warp = __builtin_amdgcn_readfirstlane( tid >> 5 );
+	const Exl3TilePlan<bits> plan = exl3_tile_plan<bits>( lane );
 	const int kc = K >> 3;
 	const int tile_n = blockIdx.x, n_tiles = N >> 4, k_tiles = K >> 4;
 	if constexpr ( STAGED ) {
@@ -406,7 +409,8 @@ __global__ __launch_bounds__( 32 * GEMV_WARPS ) void grp_gemv_kernel(
 		const size_t bstep = STAGED ? static_cast<size_t>( 8 * bits ) : static_cast<size_t>( n_tiles ) * 16 * bits / 2;
 		for ( int kt = kb0; kt < kb1; ++kt, bt += bstep ) {
 			FragB f0, f1;
-			dq_dispatch<bits, 2>( bt, lane << 3, f0, f1 );
+			if constexpr ( STAGED ) dq_dispatch<bits, 2>( bt, lane << 3, f0, f1 );   // tiles in shared memory
+			else exl3_tile_dq<bits, 2>( bt, plan, f0, f1 );
 			#pragma unroll
 			for ( int j = 0; j < MR; ++j ) {
 				if ( j < mg ) {
@@ -476,6 +480,7 @@ __global__ __launch_bounds__( 32 * GEMV_WARPS ) void grp_wmma_kernel(
 	float* C = ( second ? out1 : out0 ) + static_cast<size_t>( i0 ) * N;
 	const int tid = threadIdx.x, lane = tid & 31;
 	const int warp = __builtin_amdgcn_readfirstlane( tid >> 5 );
+	const Exl3TilePlan<bits> plan = exl3_tile_plan<bits>( lane );
 	const int tile_n = blockIdx.x, n_tiles = N >> 4, k_tiles = K >> 4;
 	if constexpr ( STAGED ) {
 		constexpr int Q = 2 * bits;
@@ -512,7 +517,8 @@ __global__ __launch_bounds__( 32 * GEMV_WARPS ) void grp_wmma_kernel(
 			const uint32_t* bt = STAGED ? reinterpret_cast<const uint32_t*>( sw ) + static_cast<size_t>( kt ) * ( 8 * bits )
 				: reinterpret_cast<const uint32_t*>( B + ( static_cast<size_t>( kt ) * n_tiles + tile_n ) * ( 16 * bits ) );
 			FragB f0, f1;
-			dq_dispatch<bits, 2>( bt, lane << 3, f0, f1 );
+			if constexpr ( STAGED ) dq_dispatch<bits, 2>( bt, lane << 3, f0, f1 );   // tiles in shared memory
+			else exl3_tile_dq<bits, 2>( bt, plan, f0, f1 );
 			*reinterpret_cast<uint32_t*>( my_slab + c8 * WG_SLAB + r0 ) = __builtin_bit_cast( uint32_t, f0[0] );
 			*reinterpret_cast<uint32_t*>( my_slab + c8 * WG_SLAB + r0 + 8 ) = __builtin_bit_cast( uint32_t, f0[1] );
 			*reinterpret_cast<uint32_t*>( my_slab + ( c8 + 8 ) * WG_SLAB + r0 ) = __builtin_bit_cast( uint32_t, f1[0] );
