@@ -113,7 +113,17 @@ void Generator::probe_slot( int s ) {
 
 	cluster_.steer_control( s, 0, n, 0 );   // the probe reads the unedited model
 	cluster_.reset_slot( s );
-	int cur = cluster_.prefill( prompt.data(), n, s );
+	// The probe reads the unedited model, which is what the prefix cache holds: resume from the deepest cached prefix of the prompt
+	int pos0 = 0;
+	if ( prefix_cache_ && slot.req.images.empty() && n >= kPrefixMinTokens ) {
+		const std::vector<int>& key_prompt = slot.key_tokens.empty() ? prompt : slot.key_tokens;
+		if ( PrefixCache::Entry* hit = prefix_cache_->find( key_prompt ) ) {
+			const int hit_tokens = static_cast<int>( hit->tokens.size() );
+			if ( hit_tokens < n && prefix_cache_->restore( s, hit ) ) pos0 = hit_tokens;
+			else cluster_.reset_slot( s );
+		}
+	}
+	int cur = cluster_.prefill( prompt.data() + pos0, n - pos0, s, 0, nullptr, pos0 );
 	cluster_.checkpoint( s );
 	cluster_.steer_capture( band, true );
 	auto read_state = [&]() { std::vector<float> st; ENGINE_ASSERT( cluster_.steer_read( st ), "probe: capture failed" ); return st; };
@@ -202,8 +212,8 @@ void Generator::probe_slot( int s ) {
 		slot.steer_think_open = slot.in_reasoning;
 		cluster_.steer_control( s, slot.steer_scope, n, slot.in_reasoning ? INT_MAX : 0 );
 	}
-	LOG_INFO( "[steer] req %llu gate %s score=%.3f (threshold %.2f; clamp layers %d-%d strength %g; push %g; %.0f ms)\n", static_cast<unsigned long long>( slot.req.req_id ), fired ? "fired" : "clean", score,
-		threshold, e0, e1, edit_strength, push, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_start ).count() );
+	LOG_INFO( "[steer] req %llu gate %s score=%.3f (threshold %.2f; clamp layers %d-%d strength %g; push %g; %d of %d prompt tokens from the prefix cache; %.0f ms)\n", static_cast<unsigned long long>( slot.req.req_id ), fired ? "fired" : "clean", score,
+		threshold, e0, e1, edit_strength, push, pos0, n, std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_start ).count() );
 }
 
 } // namespace engine::runtime
