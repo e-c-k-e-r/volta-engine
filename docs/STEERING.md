@@ -118,6 +118,17 @@ Measured on Qwen3.8-27B EXL3 4.0 bpw, layers 34 to 42, K = 2, one axis per categ
 * All 15 ethics prompts (none of them used for the technical axis): 0.87 unsteered, 0.33 with the technical axis, 0.53 with the ethics axis (half of these prompts built it).
 * The two axes are close (cosine 0.93 to 0.95 per layer); the part of the ethics axis the technical one does not cover is about a third of its size (0.32 to 0.37) and by itself changes nothing. The prompts that keep refusing under the technical axis (insulting nicknames, tracking a partner) are among those that keep refusing under the probe's clamp.
 * A fixed clamp at the benign prompts' range plus two spreads leaves benign prompts untouched, so it can stay on for every request without a gate.
+* Margin K and layer window of the technical axis (clamp file built from the 8 technical prompts; 15 ethics prompts, 7 held-out technical prompts, 30 benign prompts; refusing share, unsteered 0.87 / 0.29 / 0.00):
+
+  | window | K | ethics | technical | benign text |
+  |---|---|---|---|---|
+  | 34-42 | 0 / 1 / 2 / 4 | 0.40 / 0.40 / 0.33 / 0.60 | 0.14 | clean |
+  | 26-46 | 0 | 0.13 | 0.00 | repetition 0.04, ethics replies repeat (doubled words 3.5) |
+  | 26-46 | 1 | 0.20 | 0.00 | occasional function-word slips ("you is the best-case scenario") |
+  | 26-46 | 2 | **0.27** | 0.14 | clean |
+  | 26-46 | 4 | 0.60 | 0.14 | clean |
+
+  The wider window helps, and K = 2 is the setting that keeps the text clean. A file's layers must lie inside the `steer_layers` range of the server (the default is 1/3 to 2/3 of the layers, 21 to 43 here; 26-46 needs `steer_layers` 20-48 or similar), otherwise the request is refused with a 400.
 
 ## Refusal geometry
 
