@@ -127,13 +127,24 @@ the host for each kernel launch, so on ROCm they report the count instead of fai
 
 ## Performance
 
-One RX 7900 XTX (24 GB), Qwen3.8-27B, `build/bench_decode` (8K context) and `bench_prefill`, decode graphs on, a 10K window:
+One RX 7900 XTX (24 GB, 303 W cap, stock clocks), decode graphs on. Qwen3.8-27B with `bench_decode` (8000 tokens of context; mean of three runs, spread under 0.5 ms) and `bench_prefill` (8192 tokens in 512-row chunks):
 
-| | Plain token | 8-row verify | Prefill (512-row chunks) |
+| | Plain token | 8 / 12 / 16-row verify | Prefill |
 |---|---|---|---|
-| NVFP4 (head quantized, `nvfp4_dense=head`) | 21.6 ms (46 tok/s) | 27 ms (1.25x) | 1123 tok/s |
-| EXL3 4.0 bpw | 26.9 ms (37 tok/s) | 37 ms (1.4x) | 1115 tok/s |
+| NVFP4 (head quantized, `nvfp4_dense=head`; not re-run for this table) | 21.6 ms (46 tok/s) | 27 ms (8 rows) | 1123 tok/s |
+| EXL3 4.0 bpw, 8K context | 26.7 ms (37 tok/s) | 37.0 / 39.7 / 43.8 ms | 1089 tok/s |
+| EXL3 4.0 bpw, 32K context | 28.8 ms (35 tok/s) | 41.3 ms (8), 51.4 ms (16) | |
+
+Served with `bench_serve.py` (one stream, 256 tokens, the contract sampling T = 1, top-p 0.95, top-k 20, seed 0), EXL3 4.0 bpw target:
+
+| speculator | fixed 8K prompt | natural 8K prompts (four questions) | accepted |
+|---|---|---|---|
+| DFlash2 EXL3 5.0 bpw drafter | 175 tok/s (7.5 tokens per round) | 131, 132, 108, 59 tok/s | 0.68, 0.69, 0.53, 0.23 |
+| DFlash2, greedy | | 128, 150, 130, 89 tok/s | 0.65, 0.79, 0.69, 0.41 |
+| the checkpoint's MTP head | 158 tok/s | 114, 88, 89, 63 tok/s | 0.74, 0.56, 0.58, 0.46 |
+
+Qwen3.8-Flash-Next with 2 bpw experts (`expert_cache` 0.4, 8192-token window): a plain token 61.0 ms (16.4 tok/s), an 8-row verify block 380.6 ms, prefill 189 tok/s (4096 tokens, 512-row chunks). Served without speculation: 17 to 28 tok/s, 22 s to the first token for a 4K prompt and 40 s for an 8K one. The cold experts cross PCIe (x8) on every token and prefill chunk, which sets these figures; the kernel changes above do not move them (a plain token was 61.1 and 61.9 ms with and without them). The MTP head cannot be loaded from this checkpoint (the three `mtp.hyper_connection_mixer` tensors are not in it); `mtp_nvfp4` takes the head from the NVFP4 checkpoint, whose 124 GB of experts need about 66 GB of pinned host memory for the cold tier at `expert_cache` 0.4, more than this machine's 32 GB, so Flash-Next with MTP has not been measured here.
 
 * NVFP4 target with the DFlash2 EXL3 5.0 bpw drafter, natural 8K prompts (`tests/3_bench/bench_serve.py`): 129, 153, 145 and 75 tok/s, 37 ms per round (27 ms verify, 9.5 ms drafter).
 * The NVFP4 GEMVs read the packed weights at 80 to 90% of the 920 GB/s a plain read kernel reaches on this card; the prefill GEMM reaches 73 of the ~96 TFLOP/s the WMMA peaks at.
-* An EXL3 plain token at 8K context is about 1900 kernel launches: the GEMVs take about 20 ms of it, attention about 1 ms and the Hadamard rotations (two per linear) about 1 ms (rocprofv3 kernel trace of `bench_decode`). At 32000 tokens of context a plain token takes 29.0 ms and an 8-row verify block 42 ms. A verify block of 8 rows costs 1.3 times a token (37 ms), 12 rows 39 ms and 16 rows 43 ms (`bench_decode` with `BENCH_VL=8,12,16`, 8000 tokens of context).
+* An EXL3 plain token at 8K context is about 1900 kernel launches: the GEMVs take about 20 ms of it, attention about 1 ms and the Hadamard rotations (two per linear) about 1 ms (rocprofv3 kernel trace of `bench_decode`). A verify block of 8 rows costs 1.4 times a token at 8K context (37 ms), 12 rows 39.7 ms and 16 rows 43.8 ms (`bench_decode` with `BENCH_VL=8,12,16`).
