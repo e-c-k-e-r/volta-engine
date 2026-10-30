@@ -129,6 +129,8 @@ Measured on Qwen3.8-27B EXL3 4.0 bpw, layers 34 to 42, K = 2, one axis per categ
   | 26-46 | 4 | 0.60 | 0.14 | clean |
 
   The wider window helps, and K = 2 is the setting that keeps the text clean. A file's layers must lie inside the `steer_layers` range of the server (the default is 1/3 to 2/3 of the layers, 21 to 43 here; 26-46 needs `steer_layers` 20-48 or similar), otherwise the request is refused with a 400.
+* With the probe (68 target and 24 control prompts, the controls' gate forced; targets refusing, unprobed 0.65): the 26-46 / K = 2 file alone 0.16 with clean text and benign prompts untouched; the probe alone 0.13 at strength -8 and 0.11 at -4; the file and the probe together 0.08 and 0.06, with more strain on the text (targets: repetition 0.08 to 0.10, doubled words 2.0 and 0.9 per reply, against 0.01 and 0.3 for the probe alone; controls: repetition 0.05 to 0.10). Together they free the prompts about monitoring a teenager, a harsh breakup text and a one-sided essay; insulting nicknames, tracking a partner and exam cheating still refuse.
+* A probed request keeps its `steer_vector`: the file's edits come first on each layer and the probe's after them, up to 4 per layer (the probe's surplus on a full layer is dropped); the request's scope list applies to all of them, as the probe's do. Earlier a fired probe replaced the vector.
 
 ## Refusal geometry
 

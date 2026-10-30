@@ -80,6 +80,7 @@ def main():
     ap.add_argument("--push", default="0", help="steer_push values: gaps added along the declining direction on every prompt (0 = off; it replaces the hedge clamp)")
     ap.add_argument("--directions", default="1", help="steer_directions values: refusal directions clamped per layer")
     ap.add_argument("--keep-norm", default="0", help="steer_keep_norm values (0/1): rescale the row to its norm after a clamp")
+    ap.add_argument("--vector", default="", help="steer_vector name (a clamp or add file in the server's steer_dir) sent with every request, probe or not")
     ap.add_argument("--max-tokens", type=int, default=80)
     ap.add_argument("--stock", help="file with one stock opening per line (lower case prefixes), replacing the built-in list")
     ap.add_argument("--no-force-control", action="store_true", help="do not force the gate on the control prompts")
@@ -99,6 +100,8 @@ def main():
             res = []
             for i, p in enumerate(sets[kind]):
                 extra = {"steer_probe": True, "steer_edit_strength": strength, "steer_hedge_strength": hedge, "steer_scope": scope, "steer_push": push, "steer_directions": ndir, "steer_keep_norm": bool(keep)}
+                if a.vector:
+                    extra["steer_vector"] = a.vector
                 if layers:
                     extra["steer_edit_layers"] = layers
                 if force:

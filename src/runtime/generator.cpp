@@ -601,7 +601,7 @@ bool Generator::check_steer( const std::string& vector, const std::string& scope
 	return steer_file( vector, err ) != nullptr;
 }
 
-void Generator::steer_admit( int s ) {
+std::vector<engine::modules::SteerEntry> Generator::request_steer_entries( int s, int* scope_out ) {
 	Slot& slot = slots_[s];
 	const auto& opt = runtime::options();
 	std::vector<engine::modules::SteerEntry> entries;
@@ -620,7 +620,16 @@ void Generator::steer_admit( int s ) {
 		}
 		else LOG_ERROR( "[steer] request %llu runs unsteered: %s\n", static_cast<unsigned long long>( slot.req.req_id ), err.c_str() );
 	}
-	slot.steer_scope = entries.empty() ? 0 : scope;
+	*scope_out = entries.empty() ? 0 : scope;
+	return entries;
+}
+
+void Generator::steer_admit( int s ) {
+	Slot& slot = slots_[s];
+	const auto& opt = runtime::options();
+	int scope = 0;
+	const std::vector<engine::modules::SteerEntry> entries = request_steer_entries( s, &scope );
+	slot.steer_scope = scope;
 	slot.steer_prompt = ( slot.steer_scope & engine::modules::STEER_PROMPT ) != 0;
 	slot.steer_think_open = slot.in_reasoning;
 	const float penalty = slot.req.think_penalty >= 0.0f ? slot.req.think_penalty : static_cast<float>( opt.think_penalty );

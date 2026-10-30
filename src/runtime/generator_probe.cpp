@@ -178,7 +178,11 @@ void Generator::probe_slot( int s ) {
 		steer_admit( s );       // back to what the request asked for without the probe
 	}
 	else {
-		std::vector<engine::modules::SteerEntry> entries;
+		// the request's own vector stays: its edits come first on every layer, the probe's after them (at most kSteerEntries per layer; the probe's
+		// surplus entries on a full layer are dropped)
+		int vec_scope = 0;
+		std::vector<engine::modules::SteerEntry> entries = request_steer_entries( s, &vec_scope );
+		std::vector<engine::modules::SteerEntry> probe_entries;
 		for ( int l = e0; l <= e1; ++l ) {
 			const int bi = l - b0;
 			if ( fired ) {
@@ -187,7 +191,7 @@ void Generator::probe_slot( int s ) {
 				c.kind = keep_norm ? engine::modules::STEER_CLAMP_KEEP : engine::modules::STEER_CLAMP;
 				c.vec = axes[bi].dir;
 				c.par = axes[bi].pa - edit_strength * axes[bi].sd;
-				entries.push_back( std::move( c ) );
+				probe_entries.push_back( std::move( c ) );
 				if ( directions > 1 ) {
 					for ( ProbeAxis& x : probe_extra_axes( set_at( accept, bi ), set_at( decline, bi ), H, { axes[bi].dir }, directions - 1 ) ) {
 						engine::modules::SteerEntry e;
@@ -195,7 +199,7 @@ void Generator::probe_slot( int s ) {
 						e.kind = c.kind;
 						e.vec = std::move( x.dir );
 						e.par = x.pa - edit_strength * x.sd;
-						entries.push_back( std::move( e ) );
+						probe_entries.push_back( std::move( e ) );
 					}
 				}
 			}
@@ -206,7 +210,7 @@ void Generator::probe_slot( int s ) {
 				a.kind = engine::modules::STEER_ADD;
 				a.vec = axes[bi].dir;
 				a.par = push * ( axes[bi].pb - axes[bi].pa );
-				entries.push_back( std::move( a ) );
+				probe_entries.push_back( std::move( a ) );
 			}
 			if ( fired && push == 0.0f && directions < engine::modules::kSteerEntries && hedge_strength >= 0.0f ) {   // at most kSteerEntries edits per layer: a push or further directions take the hedge clamp's place
 				const ProbeAxis hx = probe_axis( set_at( plain, bi ), set_at( hedged, bi ), H, false );
@@ -215,8 +219,15 @@ void Generator::probe_slot( int s ) {
 				d.kind = engine::modules::STEER_CLAMP;
 				d.vec = hx.dir;
 				d.par = hx.pa - hedge_strength * ( hx.pb - hx.pa );
-				entries.push_back( std::move( d ) );
+				probe_entries.push_back( std::move( d ) );
 			}
+		}
+		std::vector<int> per_layer( NL, 0 );
+		for ( const auto& e : entries ) ++per_layer[e.layer];
+		for ( auto& e : probe_entries ) {
+			if ( per_layer[e.layer] >= engine::modules::kSteerEntries ) continue;
+			++per_layer[e.layer];
+			entries.push_back( std::move( e ) );
 		}
 		cluster_.steer_set( s, entries );
 		int scope = engine::modules::STEER_ALL;

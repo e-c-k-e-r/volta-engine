@@ -263,6 +263,8 @@ private:
 	void apply_forced_close( int s );
 	// Steering (option steer): the slot's edits, scope, prompt length and reflection-marker penalty on every rank, set when the request is admitted
 	void steer_admit( int s );
+	// The edits of the request's steer_vector (scaled, with its scope in *scope), or none
+	std::vector<engine::modules::SteerEntry> request_steer_entries( int s, int* scope );
 	// Steering probe (request field steer_probe): reads the prompt unedited (openings forced after it, then a short greedy look-ahead), builds the
 	// direction clamps from the states it sees and, when the look-ahead score passes the gate, leaves them on the slot for the real prefill
 	void probe_slot( int s );
