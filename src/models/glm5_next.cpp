@@ -143,7 +143,7 @@ bool Glm5NextPipeline::init(
 	// 1. Router outputs + routed-MoE dispatch scratch
 	state_.d_topk_indices = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( int ) ) );
 	state_.d_topk_weights = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( backend::half_t ) ) );
-	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R * window_, mtp_on_ );
+	state_.moe = engine::modules::MoE::alloc_scratch( arena, E_local, config_.top_k, config_.hidden_size, config_.intermediate_size, R * window_, mtp_on_ || !runtime::options().nvfp4_expert_layers.empty() );
 	// The fused decode kernels read cold experts from host memory a little slower than the persistent kernel (6.4 vs 6.8 tok/s at a
 	// 50% tier), but with most experts resident they are far faster (the persistent kernel costs ~11 ms a token more at 99% resident): only a
 	// small resident set keeps the persistent path. expert_cache=auto decides when the fraction is known
@@ -628,7 +628,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	// Dense groups quantized to NVFP4 at load from the BF16 tensors of a modelopt checkpoint (ENGINE_NVFP4_DENSE_SRC, ENGINE_NVFP4_DENSE); the
 	// routed experts stay EXL3. The dense MLP layers are NVFP4 in that checkpoint already and load as they are (group `dense`)
 	std::unique_ptr<engine::loader::SafeTensorsRepo> nv_repo;
-	if ( const std::string& nv_dir = runtime::options().nvfp4_dense_src; !nv_dir.empty() && ( !runtime::options().nvfp4_dense.empty() || mtp_on_ ) ) {
+	if ( const std::string& nv_dir = runtime::options().nvfp4_dense_src; !nv_dir.empty() && ( !runtime::options().nvfp4_dense.empty() || mtp_on_ || !runtime::options().nvfp4_expert_layers.empty() ) ) {
 		nv_repo = std::make_unique<engine::loader::SafeTensorsRepo>();
 		if ( !nv_repo->open( nv_dir.c_str() ) ) {
 			LOG_ERROR( "[loader] FAILED to open the NVFP4 directory %s\n", nv_dir.c_str() );
@@ -873,10 +873,30 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			auto& mw = lw.moe_weights;
 			mw.type = pod::QuantType::TRELLIS;
 			mw.num_local_experts = experts_per_rank;
+			// nvfp4_expert_layers: this layer's routed experts from the modelopt NVFP4 checkpoint, resident, outside the tier
+			size_t experts_cost_from = arena_->offset_bytes;
+			int nv_lo = -1, nv_hi = -1;
+			if ( const std::string& r = runtime::options().nvfp4_expert_layers; !r.empty() ) {
+				if ( std::sscanf( r.c_str(), "%d-%d", &nv_lo, &nv_hi ) == 1 ) nv_hi = nv_lo;
+			}
+			if ( nv_repo && L >= nv_lo && L <= nv_hi ) {
+				mw.type = pod::QuantType::NVFP4;
+				static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+				for ( int e = 0; e < experts_per_rank; ++e ) {
+					pod::LinearWeight* dst[3] = { &mw.gate[e], &mw.up[e], &mw.down[e] };
+					for ( int p = 0; p < 3; ++p ) {
+						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", L, start_expert + e, kinds[p] );
+						*dst[p] = moe_tp_ ? nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, p < 2, rank_, config_.tp_size, stream ), name_buf )
+						                  : nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, true, 0, 1, stream ), name_buf );
+					}
+				}
+				if ( rank_ == 0 ) LOG_INFO( "[RANK 0] layer %d: routed experts from the NVFP4 checkpoint\n", L );
+			}
+			else {
 			// Tiered experts (ENGINE_EXPERT_CACHE < 1): the codes of resident experts go to device slots, the rest to pinned host memory
 			double tier_fraction = engine::modules::ExpertTier::resident_fraction();
 			const bool resident_fraction_auto = tier_fraction <= 0.0;
-			size_t experts_cost_from = arena_->offset_bytes;
+			experts_cost_from = arena_->offset_bytes;
 			int tier_layer = -1;
 			if ( tier_fraction < 1.0 ) {
 				if ( tier_layers_ == 0 ) {
@@ -948,6 +968,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, gid );
 				mw.down[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 0, rank_, config_.tp_size, stream ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[2] );
+			}
 			}
 			engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );
 			mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( experts_per_rank ) * sizeof( uint32_t ), 128 ) );
