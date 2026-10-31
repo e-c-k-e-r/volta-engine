@@ -41,7 +41,7 @@ int main( int argc, char** argv ) {
 	bool answers = false, clamp = false;
 	float clamp_k = 2.0f;
 	std::string ortho_path;
-	std::string pos_path, neg_path, out_path, batch, layers = "", model = test::model_path( "Qwen3.8-27B-exl3", "ENGINE_TEST_QWEN_DIR" ), scope = "all";
+	std::string pos_path, neg_path, out_path, batch, layers = "", model = test::model_path( "ENGINE_TEST_QWEN_DIR" ), scope = "all";
 	for ( int i = 1; i < argc; i += ( std::string( argv[i] ) == "--answers" || std::string( argv[i] ) == "--clamp" ? 1 : 2 ) ) {
 		const std::string a = argv[i];
 		if ( a == "--answers" ) { answers = true; continue; }

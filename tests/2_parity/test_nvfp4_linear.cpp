@@ -10,7 +10,7 @@
 #include "trellis_context.h"
 #include <vector>
 
-static const char* NVFP4_DIR = engine::runtime::test::model_path( "Qwen3.8-27B-QUASAR-NVFP4" );
+static const char* NVFP4_DIR = engine::runtime::test::model_path( "ENGINE_TEST_QWEN_NVFP4_DIR" );
 
 int main() {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );

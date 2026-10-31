@@ -70,6 +70,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `mtp_nvfp4` | bool | `false` | `ENGINE_MTP_NVFP4` | Flash-Next: load the MTP head from the nvfp4_experts checkpoint instead of the model directory (its FP8 block-scaled experts and BF16 dense tensors are quantized to NVFP4 at load; the head then matches the base model, not the model directory's conversion) |
 | `nvfp4_dense_dir` | string | `(empty)` | `ENGINE_NVFP4_DENSE_DIR` | Flash-Next, GLM: directory of calibrated NVFP4 dense tensors (tests/tools/nvfp4_ldlq.py) used instead of round-to-nearest for the groups of nvfp4_dense they cover |
 | `nvfp4_dense_src` | string | `(empty)` | `ENGINE_NVFP4_DENSE_SRC` | directory of a modelopt NVFP4 checkpoint of the model whose BF16 dense tensors the nvfp4_dense groups are quantized from (GLM; Flash-Next takes them from nvfp4_experts) |
+| `nvfp4_expert_layers` | string | `(empty)` | `ENGINE_NVFP4_EXPERT_LAYERS` | GLM, with nvfp4_dense_src: layers "lo-hi" whose routed experts load from that modelopt NVFP4 checkpoint instead of the model directory (those layers stay out of the expert tier, always resident); empty = none |
 | `dflash_hessian_dir` | string | `(empty)` | `ENGINE_DFLASH_HESSIAN_DIR` | calibration of the DFlash2 drafter: directory to write the input Hessians of its projections (L<layer>_s<site>_r<rank>.f32: site 0 q_proj, 1 k_proj / v_proj (context rows and block rows), 2 o_proj (one file per rank), 3 gate_proj / up_proj, 4 down_proj (per rank); layer 5 site 0 = fc) over the rows the drafter processes while the server speculates, written when the speculator shuts down; empty = off |
 | `hessian_layers` | string | `(empty)` | `ENGINE_HESSIAN_LAYERS` | with hessian_dir: layers to collect, "lo-hi" (GLM: the accumulators of all 45 layers do not fit beside the weights, so collect a third at a time); empty = all |
 | `kv_format` | string | `(empty)` | `ENGINE_KV_FORMAT` | KV cache format: fp16, fp8, k8v4 or nvfp4; empty = the model default (fp16). GLM stores its single latent tensor in one format (k8v4 = 8-bit) |
@@ -167,7 +168,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | Variable | Description |
 |---|---|
 | `ENGINE_MODEL_ROOT` | directory holding the checkpoints used by tests and benches (also read from `tests/local.env`) |
-| `ENGINE_TEST_QWEN_DIR`, `ENGINE_TEST_DRAFT_DIR`, `ENGINE_TEST_GLM_DIR`, `ENGINE_TEST_GLM_DRAFT_DIR` | override one checkpoint |
+| `ENGINE_TEST_QWEN_DIR`, `ENGINE_TEST_DRAFT_DIR`, `ENGINE_TEST_GLM_DIR`, `ENGINE_TEST_FLASH_DIR`, `ENGINE_TEST_DSV41_DIR`, ... | the checkpoint of one test role: a directory under `ENGINE_MODEL_ROOT` or an absolute path; the defaults and the full list are in `tests/models.env`, `tests/local.env` overrides them per machine, the environment overrides both (`GATE_BUILD` there picks the build `gate.sh` runs from) |
 | `ENGINE_CPU_THREADS` | worker threads of the CPU backend (default: the process's allowed cores) |
 | `ENGINE_DEBUG_CPU_TRACE` | per-call timing lines in the CPU backend |
 | `ENGINE_VK_DEVICE` | Vulkan device index |

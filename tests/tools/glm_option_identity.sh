@@ -2,8 +2,9 @@
 # GLM decode options that must not change a bit: test_glm_rows (run from the build directory) is hashed with the defaults, with side_streams off and with hc_fuse
 # off, in the NVFP4 dense configuration (the overlaps and the fused all-reduce only apply to NVFP4 / FP16 projections and decode-sized rows).
 # Needs ENGINE_MODEL_ROOT with GLM-5.3-Flash-exl3-3.05bpw, GLM-5.3-Flash-NVFP4 and GLM-5.3-Flash-NVFP4-dense.
-M=${ENGINE_MODEL_ROOT:?ENGINE_MODEL_ROOT is not set}
-base=(ENGINE_NVFP4_DENSE_SRC=$M/GLM-5.3-Flash-NVFP4 ENGINE_NVFP4_DENSE_DIR=$M/GLM-5.3-Flash-NVFP4-dense ENGINE_NVFP4_DENSE=kda,mla,idx,head,dense,shared ENGINE_EXPERT_CACHE=0.9)
+source ${0:A:h}/models_env.sh ${0:A:h:h}
+: ${ENGINE_MODEL_ROOT:?ENGINE_MODEL_ROOT is not set}
+base=(ENGINE_NVFP4_DENSE_SRC=$(model_dir ENGINE_TEST_GLM_NVFP4_DIR) ENGINE_NVFP4_DENSE_DIR=$(model_dir ENGINE_TEST_GLM_NVFP4_DENSE_DIR) ENGINE_NVFP4_DENSE=kda,mla,idx,head,dense,shared ENGINE_EXPERT_CACHE=0.9)
 h() { env $base "$@" taskset -c 0-9 ./test_glm_rows 2>&1 | sed -n '/100-token/,$p' | md5sum | cut -d' ' -f1; }
 a=$(h)
 b=$(h ENGINE_DEBUG_SIDE_STREAMS=0)

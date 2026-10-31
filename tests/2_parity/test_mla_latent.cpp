@@ -13,7 +13,7 @@
 
 int main() {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	const char* dir = engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw", "ENGINE_TEST_GLM_DIR" );
+	const char* dir = engine::runtime::test::model_path( "ENGINE_TEST_GLM_DIR" );
 	constexpr int LORA = 512, HD = 256;
 	const int H = std::getenv( "MLA_HEADS" ) ? std::atoi( std::getenv( "MLA_HEADS" ) ) : 16;
 	CUDA_CHECK( cudaSetDevice( 0 ) );

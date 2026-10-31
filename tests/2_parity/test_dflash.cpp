@@ -277,7 +277,7 @@ int main( int argc, char** argv ) {
 	std::printf( "\n[*] Test 5: SafeTensorsRepo Draft Model Weight Discovery...\n" );
 	{
 		engine::loader::SafeTensorsRepo repo;
-		const char* qwen_dir = engine::runtime::test::model_path( "Qwen3.8-27B-DFlash2-EXL3-5.0bpw" );
+		const char* qwen_dir = engine::runtime::test::model_path( "ENGINE_TEST_DRAFT_DIR" );
 		bool opened = repo.open( qwen_dir );
 		if ( opened ) {
 			std::printf( "   [+] Successfully opened Qwen3.8-27B-DFlash2-EXL3 repo (shards: %d)\n", repo.shard_count() );
@@ -295,7 +295,7 @@ int main( int argc, char** argv ) {
 			std::printf( "   [*] Notice: %s not accessible, skipping checkpoint load verification\n", qwen_dir );
 		}
 
-		const char* glm_dir = engine::runtime::test::model_path( "GLM-5.3-Flash-DFlash2" );
+		const char* glm_dir = engine::runtime::test::model_path( "ENGINE_TEST_GLM_DRAFT_DIR" );
 		opened = repo.open( glm_dir );
 		if ( opened ) {
 			std::printf( "   [+] Successfully opened GLM-5.3-Flash-DFlash2 repo (shards: %d)\n", repo.shard_count() );
@@ -318,7 +318,7 @@ int main( int argc, char** argv ) {
 	// a child and judged by exit status.
 	std::printf( "\n[*] Test 5b: DFlash2 geometry validation against the real checkpoint...\n" );
 	{
-		const char* d2_dir = engine::runtime::test::model_path( "Qwen3.8-27B-DFlash2-EXL3-5.0bpw" );
+		const char* d2_dir = engine::runtime::test::model_path( "ENGINE_TEST_DRAFT_DIR" );
 		engine::loader::SafeTensorsRepo probe;
 		if ( probe.open( d2_dir ) ) {
 			probe.close();

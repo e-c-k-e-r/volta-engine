@@ -11,8 +11,8 @@ int main() {
 	std::printf( "  VOLTA ENGINE: BPE TOKENIZER & CHAT TEMPLATE PARITY\n" );
 	std::printf( "========================================================\n\n" );
 
-	const char* qwen_dir = engine::runtime::test::model_path( "Qwen3.8-27B-exl3" );
-	const char* glm_dir = engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw" );
+	const char* qwen_dir = engine::runtime::test::model_path( "ENGINE_TEST_QWEN_DIR" );
+	const char* glm_dir = engine::runtime::test::model_path( "ENGINE_TEST_GLM_DIR" );
 
 	bool all_passed = true;
 

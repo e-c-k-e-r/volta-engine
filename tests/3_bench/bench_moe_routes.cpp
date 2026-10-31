@@ -16,7 +16,7 @@
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	const bool glm = std::getenv( "BENCH_GLM" ) != nullptr;
-	const char* dir = engine::runtime::test::model_path( glm ? "GLM-5.3-Flash-exl3-3.05bpw" : "Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", glm ? nullptr : "ENGINE_TEST_FLASH_DIR" );
+	const char* dir = engine::runtime::test::model_path( glm ? "ENGINE_TEST_GLM_DIR" : "ENGINE_TEST_FLASH_DIR" );
 	const int BITS = std::getenv( "BENCH_BITS" ) ? std::atoi( std::getenv( "BENCH_BITS" ) ) : 4;   // the experts' bit width (Qwen3.8-Flash-Next-exl3: 2)
 	const int L = argc > 1 ? std::atoi( argv[1] ) : ( glm ? 3 : 10 );
 	const int H = glm ? 4096 : 2560, I = glm ? 2048 : 640, E = glm ? 72 : 128, K = glm ? 8 : 10;

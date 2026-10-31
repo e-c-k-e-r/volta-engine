@@ -13,9 +13,9 @@
 #   compare <tag>   GPU: bench again and diff against results/baseline_<tag>.txt (flags > 1% regressions)
 # Logs go to results/gate_<mode>_<timestamp>/ (gitignored).
 set -u
-[[ -f ${0:A:h:h}/local.env ]] && source ${0:A:h:h}/local.env
 ROOT=${0:A:h:h:h}
-cd $ROOT/build || exit 2
+source $ROOT/tests/tools/models_env.sh $ROOT/tests   # checkpoints by role (tests/models.env, tests/local.env) and GATE_BUILD
+cd $ROOT/$GATE_BUILD || exit 2
 mode=${1:-static}
 tag=${2:-}
 stamp=$(date +%Y%m%d_%H%M%S)
@@ -95,22 +95,23 @@ tier2_fast() {
 
 # Tests that load a checkpoint from $ENGINE_MODEL_ROOT (tokenizer files, weights): the model-backed set
 tier2_models() {
+	local DSV41=$(model_dir ENGINE_TEST_DSV41_DIR)
 	for t in test_rows test_glm_rows test_prefill_equiv test_moe test_nvfp4_linear test_mla_latent test_spec_state; do
 		run $t gpu ./$t
 	done
 	# test_dflash prints a known FATAL in its geometry step (present before 2026-10-07); judged by its final line
 	run test_dflash sh -c "taskset -c 0-9 ./test_dflash | tail -3 | grep -q 'PASSED'"
 	run tokenizer ./test_tokenizer
-	run tokenizer_cases_qwen ./test_tokenizer_file $ENGINE_MODEL_ROOT/Qwen3.8-27B-exl3 --cases $ROOT/tests/data/tokenizer_cases_qwen3_5.json
-	run tokenizer_cases_glm ./test_tokenizer_file $ENGINE_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
-	run tokenizer_cases_flash ./test_tokenizer_file $ENGINE_MODEL_ROOT/Swift-Qwen3.8-Flash-Next-exl3-4.00bpw --cases $ROOT/tests/data/tokenizer_cases_qwen4_exp.json
-	run tokenizer_cases_deepseek ./test_tokenizer_file $ENGINE_MODEL_ROOT/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw --cases $ROOT/tests/data/tokenizer_cases_deepseek_v41.json
-	run dsv41_encoding ./test_dsv41_encoding $ENGINE_MODEL_ROOT/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw
+	run tokenizer_cases_qwen ./test_tokenizer_file $(model_dir ENGINE_TEST_QWEN_DIR) --cases $ROOT/tests/data/tokenizer_cases_qwen3_5.json
+	run tokenizer_cases_glm ./test_tokenizer_file $(model_dir ENGINE_TEST_GLM_DIR) --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
+	run tokenizer_cases_flash ./test_tokenizer_file $(model_dir ENGINE_TEST_FLASH_DIR) --cases $ROOT/tests/data/tokenizer_cases_qwen4_exp.json
+	run tokenizer_cases_deepseek ./test_tokenizer_file $DSV41 --cases $ROOT/tests/data/tokenizer_cases_deepseek_v41.json
+	run dsv41_encoding ./test_dsv41_encoding $DSV41
 	# the vision tower against the checkpoint reference (FP32): the goldens come from the reference's torch code (needs the exllamav3 venv), made once
 	local vg=$ROOT/results/dsv41_vision_golden
-	[[ -f $vg/emb32.f32 ]] || run dsv41_vision_golden ${DSV41_PYTHON:-$HOME/Programs/exllamav3/.venv/bin/python} $ROOT/tests/tools/dsv41/vision_golden.py $ENGINE_MODEL_ROOT/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw $vg
-	run dsv41_vision gpu ./test_dsv41_vision $ENGINE_MODEL_ROOT/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw $vg
-	run prefix_restore_dsv41 gpu ./test_dsv41 $ENGINE_MODEL_ROOT/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw $ROOT/tests/data/dsv41_prompt_ids.txt 24 snap=1000 max_image_tokens=0
+	[[ -f $vg/emb32.f32 ]] || run dsv41_vision_golden ${DSV41_PYTHON:-$HOME/Programs/exllamav3/.venv/bin/python} $ROOT/tests/tools/dsv41/vision_golden.py $DSV41 $vg
+	run dsv41_vision gpu ./test_dsv41_vision $DSV41 $vg
+	run prefix_restore_dsv41 gpu ./test_dsv41 $DSV41 $ROOT/tests/data/dsv41_prompt_ids.txt 24 snap=1000 max_image_tokens=0
 	run coherence gpu ./test_coherence
 	run coherence_tp2 sh -c "ENGINE_TP=2 taskset -c 0-9 ./test_coherence --qwen-only --speculative"
 	run prefix_restore gpu ./test_prefix_restore
@@ -120,7 +121,7 @@ tier2_models() {
 	# the GLM decode options (side_streams, hc_fuse) must not change the output of test_glm_rows in the NVFP4 dense configuration
 	run glm_option_identity $ROOT/tests/tools/glm_option_identity.sh
 	run vision_tower gpu ./test_vision
-	run vision_tower_glm gpu ./test_vision $ENGINE_MODEL_ROOT/GLM-5.3-Flash-exl3-3.05bpw $ROOT/tests/data/image_wide.png --glm
+	run vision_tower_glm gpu ./test_vision $(model_dir ENGINE_TEST_GLM_DIR) $ROOT/tests/data/image_wide.png --glm
 	run prefix_restore_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore"
 	run prefix_restore_glm gpu ./test_prefix_restore --glm
 	run prefix_restore_glm_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore --glm"

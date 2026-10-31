@@ -182,7 +182,7 @@ int main() {
 
 	engine::loader::SafeTensorsRepo bf16_repo, exl3_repo;
 	ENGINE_ASSERT( bf16_repo.open( test::QWEN_DRAFT_BF16_DIR ), "cannot open unquantized drafter" );
-	ENGINE_ASSERT( exl3_repo.open( test::model_path( "Qwen3.8-27B-DFlash2-EXL3-5.0bpw" ) ), "cannot open EXL3 drafter" );
+	ENGINE_ASSERT( exl3_repo.open( test::model_path( "ENGINE_TEST_DRAFT_DIR" ) ), "cannot open EXL3 drafter" );
 
 	pod::MemoryArena arena;
 	engine::core::arena_create( arena, 0, 8ULL * 1024 * 1024 * 1024 );

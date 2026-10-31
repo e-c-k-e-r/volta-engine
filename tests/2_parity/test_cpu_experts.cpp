@@ -7,6 +7,7 @@
 #include "engine/kernels/cpu/nvfp4_linear.h"
 #include "engine/quant/fp4_fp8.h"
 #include "engine/loader/safetensors.h"
+#include "engine/runtime/test_paths.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -432,7 +433,7 @@ int main( int argc, char** argv ) {
 	part3();
 	part3_many();
 	part3_speed();
-	const std::string dir = argc > 1 ? argv[1] : "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
+	const std::string dir = argc > 1 ? argv[1] : engine::runtime::test::model_path( "ENGINE_TEST_GLM_DIR" );
 	part2( dir, argc > 2 ? std::atoi( argv[2] ) : 10, argc > 3 ? std::atoi( argv[3] ) : 0 );
 	std::printf( g_fail ? "%d FAILED\n" : "all passed\n", g_fail );
 	return g_fail ? 1 : 0;

@@ -25,8 +25,8 @@ int main() {
 	// MOE_SIG=g,u,d (with MOE_DSV41): experts whose gate / up / down projections have those widths (the mixed-width packs), instead of MOE_BITS for all three
 	int sig[3] = { EBITS, EBITS, EBITS };
 	if ( const char* sg = std::getenv( "MOE_SIG" ) ) std::sscanf( sg, "%d,%d,%d", &sig[0], &sig[1], &sig[2] );
-	const char* dir = dsv41 ? engine::runtime::test::model_path( "DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw", "ENGINE_TEST_DSV41_DIR" )
-		: flash ? engine::runtime::test::model_path( "Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", "ENGINE_TEST_FLASH_DIR" ) : engine::runtime::test::model_path( "GLM-5.3-Flash-exl3-3.05bpw", "ENGINE_TEST_GLM_DIR" );
+	const char* dir = dsv41 ? engine::runtime::test::model_path( "ENGINE_TEST_DSV41_DIR" )
+		: flash ? engine::runtime::test::model_path( "ENGINE_TEST_FLASH_DIR" ) : engine::runtime::test::model_path( "ENGINE_TEST_GLM_DIR" );
 	const int H = dsv41 ? 5120 : flash ? 2560 : 4096, I = dsv41 ? 2304 : flash ? 640 : 2048, K = dsv41 ? 6 : flash ? 10 : 8;
 	int E = flash ? 128 : 72, L = std::getenv( "MOE_LAYER" ) ? std::atoi( std::getenv( "MOE_LAYER" ) ) : 3;   // MOE_LAYER: the layer of the checkpoint whose experts are tested
 	CUDA_CHECK( cudaSetDevice( 0 ) );

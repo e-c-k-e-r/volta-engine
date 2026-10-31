@@ -2,6 +2,7 @@
 #include "engine/config.h"
 #include "engine/core/arena.h"
 #include "engine/loader/safetensors.h"
+#include "engine/runtime/test_paths.h"
 #include "engine/modules/linear.h"
 #include "engine/kernels/cpu/cpu_util.h"
 #include "engine/kernels/cpu/trellis_linear.h"
@@ -18,7 +19,7 @@
 using namespace engine::kernels::cpu;
 
 int main( int argc, char** argv ) {
-	const std::string dir = argc > 1 ? argv[1] : "/home/mrq/Documents/models/GLM-5.3-Flash-exl3-3.05bpw";
+	const std::string dir = argc > 1 ? argv[1] : engine::runtime::test::model_path( "ENGINE_TEST_GLM_DIR" );
 	const int layer = argc > 2 ? std::atoi( argv[2] ) : 10, expert = argc > 3 ? std::atoi( argv[3] ) : 0;
 	cudaSetDevice( 0 );
 	engine::loader::SafeTensorsRepo repo;

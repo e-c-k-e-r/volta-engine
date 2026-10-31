@@ -15,7 +15,7 @@ namespace backend = engine::backend;
 
 int main( int argc, char** argv ) {
 	GoldenArgs args( argc, argv );
-	const char* model_dir = engine::runtime::test::model_path( "Qwen3.8-27B-exl3" );
+	const char* model_dir = engine::runtime::test::model_path( "ENGINE_TEST_QWEN_DIR" );
 	const char* model_type = "qwen3_5";
 	int steps = 0;
 	int ntokens = 4;

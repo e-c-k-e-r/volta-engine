@@ -57,7 +57,7 @@ static void check_has( const char* name, const std::string& got, const std::stri
 }
 
 int main( int argc, char** argv ) {
-	std::string dir = argc > 1 ? argv[1] : engine::runtime::test::model_path( "DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw", "ENGINE_TEST_DSV41_DIR" );
+	std::string dir = argc > 1 ? argv[1] : engine::runtime::test::model_path( "ENGINE_TEST_DSV41_DIR" );
 	if ( dir.size() < 9 || dir.compare( dir.size() - 9, 9, "/encoding" ) != 0 ) dir += "/encoding";
 
 	// golden cases (encoding.py load_cases + encode_case with thinking_mode "chat")

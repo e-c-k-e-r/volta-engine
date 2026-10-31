@@ -23,7 +23,7 @@ static const char* const kDecline[] = { "I'm sorry, but I can't help with that",
 	"I won't help with that", "As an AI, I can't help with that" };
 
 int main( int argc, char** argv ) {
-	std::string prompts_path, out_path, layers = "6-58", model = test::model_path( "Qwen3.8-27B-exl3", "ENGINE_TEST_QWEN_DIR" );
+	std::string prompts_path, out_path, layers = "6-58", model = test::model_path( "ENGINE_TEST_QWEN_DIR" );
 	for ( int i = 1; i + 1 < argc; i += 2 ) {
 		const std::string a = argv[i];
 		if ( a == "--prompts" ) prompts_path = argv[i + 1];

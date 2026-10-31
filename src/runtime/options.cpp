@@ -99,7 +99,7 @@ Options from_env() {
 	for ( const OptionInfo& info : table() ) {
 		const char* e = std::getenv( info.env.c_str() );
 		if ( !e ) continue;
-		if ( !info.set( o, e ) ) {
+		if ( !info.set( o, info.name == std::string( "expert_cache" ) && !std::strcmp( e, "auto" ) ? "-1" : e ) ) {   // "auto" as with --set
 			std::fprintf( stderr, "[-] FATAL: invalid value '%s' for %s\n", e, info.env.c_str() );
 			std::exit( 2 );
 		}
