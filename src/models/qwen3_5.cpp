@@ -1,4 +1,5 @@
 #include "engine/models/qwen3_5.h"
+#include "engine/modules/sparse_head.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
@@ -167,6 +168,16 @@ bool Qwen3_5Pipeline::init(
 		pad_cols = ( 256 - ( lm_shard_real_cols_ % 256 ) ) % 256;
 	}
 	lm_shard_cols_ = lm_shard_real_cols_ + pad_cols;
+	if ( const int c = runtime::options().sparse_head; c > 0 && mtp_on_ ) {
+		// sparse drafter head: a rank can hold the whole subset (the frequent ids cluster at the low end of the vocabulary, i.e. on the first ranks)
+		const int H = config_.hidden_size;
+		sh_cap_ = std::min( std::max( 256, c ), lm_shard_real_cols_ );
+		sh_w_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( sh_cap_ ) * H * sizeof( backend::half_t ) ) );
+		sh_cols_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( sh_cap_ ) * sizeof( int ) ) );
+		sh_sub_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( sh_cap_ ) * sizeof( backend::half_t ) ) );
+		sh_ident_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( kShIdentRows ) * H * sizeof( backend::half_t ) ) );
+		sh_chunk_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( kShIdentRows ) * lm_shard_cols_ * sizeof( backend::half_t ) ) );
+	}
 	{
 		int logit_shape[2] = { R, lm_shard_cols_ };
 		logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
@@ -983,10 +994,26 @@ void Qwen3_5Pipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, i
 	if ( logits_last && ( tp_size_ > 1 || rank_ == 0 ) ) {
 		pod::TensorView n1 = pod::make_tensor_2d( mtp_chain_.data, pod::DType::FP16, 1, H );
 		pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
-		engine::modules::Linear::forward( n1, lm_head_, l1, stream );
+		if ( sh_use_ ) {
+			// sparse drafter head: the subset's logits, every other column at the lowest value (the argmax that follows reads the shard as usual)
+			engine::modules::SparseHead::logits( sh_w_, sh_count_, sh_cols_, mtp_chain_.ptr<const backend::half_t>(), 1, config_.hidden_size, sh_sub_, logits_.ptr<backend::half_t>(), lm_shard_cols_, stream );
+		}
+		else engine::modules::Linear::forward( n1, lm_head_, l1, stream );
 		logits_.shape[0] = 1;
 		last_rows_ = 1;
 	}
+}
+
+bool Qwen3_5Pipeline::sparse_head_set( const int* cols, int count, backend::stream_t stream ) {
+	if ( sh_cap_ == 0 ) return false;
+	ENGINE_ASSERT( count >= 0 && count <= sh_cap_, "Qwen3_5Pipeline::sparse_head_set: more columns than the buffer holds" );
+	backend::set_device( rank_ );
+	sh_use_ = false;
+	sh_count_ = count;
+	if ( count == 0 ) return true;
+	backend::memcpy_async( sh_cols_, cols, static_cast<size_t>( count ) * sizeof( int ), backend::Copy::H2D, stream );
+	engine::modules::SparseHead::extract( lm_head_, config_.hidden_size, lm_shard_cols_, sh_cols_, count, sh_ident_, sh_chunk_, kShIdentRows, sh_w_, stream );
+	return true;
 }
 
 // Keeps rows [src_row, src_row + rows) of the last forward's final-norm hidden for later MTP steps (row dst_row onwards)

@@ -1,5 +1,6 @@
 #include <condition_variable>
 #include "engine/models/qwen4_exp.h"
+#include "engine/modules/sparse_head.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/modules/hessian.h"
@@ -253,6 +254,15 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 		mtp_src_ = static_cast<float*>( engine::core::arena_alloc( arena, R * stack ) );
 		mtp_hist_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( config_.max_slots ) * 2 * ( kDraftM + 1 ) * stack ) );   // a region per slot (the runner offsets by slot)
 		mtp_chain_ = static_cast<float*>( engine::core::arena_alloc( arena, kSnapRows * stack ) );
+		if ( const int c = runtime::options().sparse_head; c > 0 ) {
+			// a rank can hold the whole subset (the frequent ids cluster at the low end of the vocabulary, i.e. on the first ranks)
+			sh_cap_ = std::min( std::max( 256, c ), lm_shard_real_cols_ );
+			sh_w_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( sh_cap_ ) * H * sizeof( backend::half_t ) ) );
+			sh_cols_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( sh_cap_ ) * sizeof( int ) ) );
+			sh_sub_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( kSnapRows ) * sh_cap_ * sizeof( backend::half_t ) ) );
+			sh_ident_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( kShIdentRows ) * H * sizeof( backend::half_t ) ) );
+			sh_chunk_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( kShIdentRows ) * lm_shard_cols_ * sizeof( backend::half_t ) ) );
+		}
 	}
 	// QSA indexer state
 	{
@@ -1502,10 +1512,26 @@ void Qwen4ExpPipeline::mtp_step_impl( const pod::BatchRows& rows, const int* tok
 			mtp_mixer_.up.ptr<const backend::half_t>(), nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_, n_out, H, hc, config_.hc_rank, config_.rms_norm_eps, stream );
 		pod::TensorView hin = pod::make_tensor_2d( mixed_.ptr<backend::half_t>(), pod::DType::FP16, n_out, H );
 		pod::TensorView lout = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, n_out, lm_shard_cols_ );
-		engine::modules::Linear::forward( hin, lm_head_, lout, stream );
+		if ( sh_use_ && n_out <= 8 ) {
+			// sparse drafter head: the subset's logits, every other column at the lowest value (the argmax that follows reads the shard as usual)
+			engine::modules::SparseHead::logits( sh_w_, sh_count_, sh_cols_, mixed_.ptr<const backend::half_t>(), n_out, H, sh_sub_, logits_.ptr<backend::half_t>(), lm_shard_cols_, stream );
+		}
+		else engine::modules::Linear::forward( hin, lm_head_, lout, stream );
 		logits_.shape[0] = n_out;
 		last_rows_ = n_out;
 	}
+}
+
+bool Qwen4ExpPipeline::sparse_head_set( const int* cols, int count, backend::stream_t stream ) {
+	if ( sh_cap_ == 0 ) return false;
+	ENGINE_ASSERT( count >= 0 && count <= sh_cap_, "Qwen4ExpPipeline::sparse_head_set: more columns than the buffer holds" );
+	backend::set_device( rank_ );
+	sh_use_ = false;
+	sh_count_ = count;
+	if ( count == 0 ) return true;
+	backend::memcpy_async( sh_cols_, cols, static_cast<size_t>( count ) * sizeof( int ), backend::Copy::H2D, stream );
+	engine::modules::SparseHead::extract( lm_head_, config_.hidden_size, lm_shard_cols_, sh_cols_, count, sh_ident_, sh_chunk_, kShIdentRows, sh_w_, stream );
+	return true;
 }
 
 // Keeps the stacks of rows [src_row, src_row + rows) of the last forward for later steps (row dst_row onwards)

@@ -2,6 +2,7 @@
 
 #include "engine/models/model.h"
 #include "engine/runtime/speculator.h"
+#include "engine/runtime/sparse_head_policy.h"
 
 namespace engine::runtime {
 
@@ -16,7 +17,7 @@ class ModelCluster;
 class MtpRunner : public Speculator {
 public:
 	bool init( ModelCluster& mc );
-	void shutdown() override { mc_ = nullptr; }
+	void shutdown() override;
 
 	void claim( int slot ) override;
 	void release( int slot ) override;
@@ -48,6 +49,11 @@ private:
 	float cond_[8] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };   // survival EMA of draft step k given steps < k were accepted
 	int att_[8] = {};
 	int hit_[8] = {};
+	// sparse drafter head (sparse_head option): the subset policy, and the mode the models are in
+	SparseHeadPolicy sh_;
+	bool sh_cur_ = false;
+	bool sparse_round_begin();
+	void sparse_round_end( bool sparse, const SpecResult* res, int n, double draft_ms, int draft_steps, double round_ms );
 };
 
 } // namespace engine::runtime

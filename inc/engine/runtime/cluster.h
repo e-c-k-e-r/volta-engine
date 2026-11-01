@@ -146,6 +146,11 @@ public:
 	// Joint rounds (see ModelPipeline::mtp_step_rows): rows of several slots in one head step, logits for rows out_rows[0 .. n_out) only
 	bool mtp_joint() const;
 	void mtp_step_rows( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out );
+	// Sparse drafter head (sparse_head option): the vocabulary ids in `ids`, most important first, become the draft head's subset; each rank
+	// takes the ids of its shard up to its capacity (the rest are dropped). Returns the ids kept (sorted), empty when the model has none
+	std::vector<int> sparse_head_set( const std::vector<int>& ids );
+	void sparse_head_use( bool on );
+	int sparse_head_cap() const { return models_[0] ? models_[0]->sparse_head_cap() : 0; }
 	void mtp_gather_hist( const int* src_rows, int count );
 
 	// Runs fn( rank ) on every rank's pinned worker thread and waits for all of them.

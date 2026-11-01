@@ -9,6 +9,7 @@
 #if ENGINE_BACKEND_CUDA
 #include "trellis_context.h"
 #endif
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -318,6 +319,30 @@ void ModelCluster::mtp_step( int slot, int pos0, int count, const int* tokens, i
 		models_[d]->mtp_step( rows, tokens, hidden_mode, hist_row0, logits_last, streams_[d] );
 		backend::stream_sync( streams_[d] );
 	} );
+}
+
+std::vector<int> ModelCluster::sparse_head_set( const std::vector<int>& ids ) {
+	const int tp = tp_;
+	const int cap = models_[0] ? models_[0]->sparse_head_cap() : 0;
+	std::vector<int> kept;
+	if ( cap == 0 ) return kept;
+	const int shard = metadata().vocab_size / tp;
+	std::vector<std::vector<int>> per( tp );
+	for ( int id : ids ) {
+		const int r = id / shard;
+		if ( id < 0 || r >= tp || static_cast<int>( per[r].size() ) >= cap ) continue;
+		per[r].push_back( id - r * shard );
+	}
+	for ( int r = 0; r < tp; ++r ) {
+		std::sort( per[r].begin(), per[r].end() );
+		for ( int c : per[r] ) kept.push_back( r * shard + c );
+	}
+	pool_.run( [&]( int d ) { models_[d]->sparse_head_set( per[d].data(), static_cast<int>( per[d].size() ), streams_[d] ); } );
+	return kept;
+}
+
+void ModelCluster::sparse_head_use( bool on ) {
+	pool_.run( [&]( int d ) { models_[d]->sparse_head_use( on ); } );
 }
 
 bool ModelCluster::mtp_joint() const {

@@ -256,6 +256,11 @@ public:
 	virtual bool mtp_joint() const { return false; }
 	virtual void mtp_step_rows( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, backend::stream_t stream = nullptr ) { (void) rows; (void) tokens; (void) hidden_mode; (void) hist_row0; (void) out_rows; (void) n_out; (void) stream; ENGINE_ASSERT( false, "model has no joint MTP step" ); }
 	virtual void mtp_gather_hist( const int* src_rows, int count, backend::stream_t stream = nullptr ) { (void) src_rows; (void) count; (void) stream; ENGINE_ASSERT( false, "model has no joint MTP step" ); }
+	// Sparse drafter head (sparse_head option): the FP16 columns of this rank's vocabulary shard listed in cols (shard-local indices, at most
+	// sparse_head_cap()) replace the full head for the draft logits while sparse_head_use(true). Returns false when the model has no sparse head
+	virtual int sparse_head_cap() const { return 0; }
+	virtual bool sparse_head_set( const int* cols, int count, backend::stream_t stream = nullptr ) { (void) cols; (void) count; (void) stream; return false; }
+	virtual void sparse_head_use( bool on ) { (void) on; }
 	virtual void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) { (void) src_row; (void) rows; (void) dst_row; (void) stream; ENGINE_ASSERT( false, "model has no MTP head" ); }
 
 	// 5e. DSpark block drafter (DeepSeek-V4.1: three small blocks entered through the trunk's stream-mean taps). The model keeps the taps of

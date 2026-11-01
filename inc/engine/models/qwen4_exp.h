@@ -148,6 +148,9 @@ public:
 	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
 	bool mtp_joint() const override { return true; }
 	void mtp_step_rows( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, backend::stream_t stream = nullptr ) override;
+	int sparse_head_cap() const override { return sh_cap_; }
+	bool sparse_head_set( const int* cols, int count, backend::stream_t stream = nullptr ) override;
+	void sparse_head_use( bool on ) override { sh_use_ = on && sh_count_ > 0; }
 	void mtp_gather_hist( const int* src_rows, int count, backend::stream_t stream = nullptr ) override;
 	void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;
@@ -298,6 +301,7 @@ private:
 	void* full_logits_mem_ = nullptr;
 	int full_logits_rows_ = 0;
 	static constexpr int kTopkTile = 4096;
+	static constexpr int kShIdentRows = 128;   // identity rows per head pass when the sparse head reads its columns
 	int* d_argmax_idx_ = nullptr;
 	float* d_argmax_val_ = nullptr;
 	int* h_argmax_idx_ = nullptr;
@@ -324,6 +328,15 @@ private:
 	float* mtp_src_ = nullptr;          // [R, hc, H] staging of the hidden stacks of a step
 	float* mtp_hist_ = nullptr;         // [2 * (kDraftM + 1), hc, H] saved stacks
 	float* mtp_chain_ = nullptr;        // [kSnapRows, hc, H] the previous step's output stacks (the rows a step was asked for)
+	// sparse drafter head (sparse_head option): [sh_cap_, H] FP16 columns of this rank's shard, their shard-local indices, the subset logits
+	// of a step, and the identity block / head output the columns are read through
+	backend::half_t* sh_w_ = nullptr;
+	int* sh_cols_ = nullptr;
+	backend::half_t* sh_sub_ = nullptr;
+	backend::half_t* sh_ident_ = nullptr;
+	backend::half_t* sh_chunk_ = nullptr;
+	int sh_cap_ = 0, sh_count_ = 0;
+	bool sh_use_ = false;
 };
 
 } // namespace engine::models

@@ -1,6 +1,6 @@
 # Volta Engine
 
-Yet another (slopped) inference engine, tailored in C++ for Volta, specifically 4xV100 SXM2 systems.
+Yet another (slopped) inference engine, tailored in C++ for Volta, specifically 4xV100 SXM2 systems (~~T180-G20~~ T181-G20).
 
 ## Build
 
@@ -27,7 +27,7 @@ This aims to milk every drop of perf from my V100s with the realistic goal of se
 
 Most inference engines treat Volta (SM_70) as a second class citizen and fall back to eager, unfused kernels. Existing solutions do come with their pros and cons:
 * 1Cat-vLLM boasts the best performance out of the box, but only really guarantees that with NVFP4 weights and quite a hefty stack. Models that require higher quantization like GLM-5.3-Flash are boxed out (and solutions like `vllm-exl3` are severely capped).
-* exllamav3, while boasting higher quantization and lower perplexity loss, can only achieve ~60% of the cap due to quantization overhead, even with optimizations.
+* exllamav3, while boasting higher quantization, better perplexity, and utilization of the CPU for host-side expert residence, but can only achieve ~60% of the cap due to quantization overhead, even with optimizations.
 * llama.cpp is a mixed bag, and forking it dooms it to never get rebased without headaches (and submitting it as a valid PR is a fools errand).
 * Strata targets one model (Qwen3.8-Flash-Next) really well, but neglects the specialized coverage for SM_70, and is geared towards lower end specs.
 
@@ -60,7 +60,7 @@ I don't intend to turn this into an actual project beyond a side-hobby, as exist
 
 A slim amount of [models](/src/models/) and weight formats (EXL3, NVFP4) are supported, but extending them shouldn't be too much of a hassle.
 
-Supported, tested configurations are narrow, as it's limited to what I currently have on hand, so gaps in coverage may exist.
+Supported, tested configurations are narrow, as it's limited to what I currently have on hand, so gaps in coverage may exist. On the other side, some values may end up hard-coded, or undocumented, that may only pertain to a specific system used during development.
 
 ## Notices
 

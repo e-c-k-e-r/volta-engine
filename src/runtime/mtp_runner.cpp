@@ -14,7 +14,53 @@ bool MtpRunner::init( ModelCluster& mc ) {
 	mc_ = &mc;
 	depth_ = MIN( MAX( runtime::options().mtp_depth, 1 ), models::kDraftM - 1 );
 	LOG_INFO( "MTP speculator: depth %d\n", depth_ );
+	if ( const int c = runtime::options().sparse_head; c > 0 ) {
+		if ( mc.sparse_head_cap() == 0 ) LOG_WARN( "sparse_head: this model has no sparse drafter head; option ignored\n" );
+		else {
+			SparseHeadPolicy::Params p;
+			p.capacity = c;
+			p.interval = runtime::options().sparse_head_interval;
+			sh_.init( mc.metadata().vocab_size, p );
+			if ( sh_.load( runtime::options().sparse_head_file.c_str() ) ) LOG_INFO( "MTP speculator: sparse head token counts read from %s\n", runtime::options().sparse_head_file.c_str() );
+			LOG_INFO( "MTP speculator: sparse drafter head of up to %d columns, rebuilt every %d generated tokens\n", c, p.interval );
+		}
+	}
 	return true;
+}
+
+void MtpRunner::shutdown() {
+	if ( sh_.active() && !runtime::options().sparse_head_file.empty() ) {
+		if ( sh_.save( runtime::options().sparse_head_file.c_str() ) ) LOG_INFO( "MTP speculator: sparse head token counts saved to %s\n", runtime::options().sparse_head_file.c_str() );
+	}
+	mc_ = nullptr;
+}
+
+// Round start: extract a new subset when due, and choose the head the draft steps use
+bool MtpRunner::sparse_round_begin() {
+	if ( !sh_.active() ) return false;
+	if ( sh_.rebuild_due() ) {
+		const auto t0 = std::chrono::steady_clock::now();
+		const std::vector<int> kept = mc_->sparse_head_set( sh_.ranked() );
+		sh_.set_subset( kept );
+		sh_cur_ = false;   // a new subset leaves the models on the full head
+		LOG_INFO( "[mtp] sparse head: %d columns extracted in %.0f ms (miss rate %.3f, draft step %.3f ms full / %.3f ms sparse)\n", static_cast<int>( kept.size() ),
+			std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count(), sh_.miss_rate(), sh_.full_step_ms(), sh_.sparse_step_ms() );
+	}
+	const bool use = sh_.use_sparse() || ( runtime::options().sparse_head_force && sh_.subset_size() > 0 );
+	if ( use != sh_cur_ ) {
+		mc_->sparse_head_use( use );
+		sh_cur_ = use;
+	}
+	return use;
+}
+
+void MtpRunner::sparse_round_end( bool sparse, const SpecResult* res, int n, double draft_ms, int draft_steps, double round_ms ) {
+	if ( !sh_.active() ) return;
+	for ( int i = 0; i < n; ++i )
+		for ( int t = 0; t < res[i].emitted_count; ++t ) sh_.observe_generated( res[i].emitted[t] );
+	if ( draft_steps > 0 ) sh_.draft_step_time( sparse, draft_ms / draft_steps );
+	if ( sh_.save_due() ) sh_.save( runtime::options().sparse_head_file.c_str() );
+	sh_.round_time( round_ms, draft_steps );
 }
 
 void MtpRunner::claim( int slot ) {
@@ -38,6 +84,7 @@ void MtpRunner::step_stats( int* attempts, int* hits ) const {
 // hidden was kept), the chunk's own last hidden becomes the pending row.
 void MtpRunner::on_prefill_chunk( int slot, const int* tokens, int count, int pos0 ) {
 	if ( !owns( slot ) || count < 1 ) return;
+	sh_.observe_prompt( tokens, count );
 	SlotState& S = st_[slot];
 	const int off = hist_off( slot );
 	const int other = kHalf - S.hist_base;
@@ -104,6 +151,7 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 	for ( int j = 0; j < S.pend_n - 1; ++j ) toks[j] = S.pend_tok[j];
 	toks[S.pend_n - 1] = anchor;
 	const int catch_rows = S.pend_n;
+	const bool sparse = sparse_round_begin();
 	const auto t_round = std::chrono::steady_clock::now();
 	mc.mtp_step( slot, S.pend_pos, S.pend_n, toks, 2, off + S.hist_base, true );
 	int cands[pod::MAX_BATCH];
@@ -178,6 +226,8 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 		LOG_DEBUG( "[mtp] round: catch-up %.1f ms (%d rows), %d draft steps %.1f ms, verify %.1f ms, tail %.1f ms; accepted %d of %d\n", ms( t_round, t_catch ), catch_rows, active - 1,
 			ms( t_catch, t_draft ), ms( t_draft, t_verify ), ms( t_verify, t_end ), res.accepted, active );
 	}
+	sparse_round_end( sparse, &res, 1, std::chrono::duration<double, std::milli>( t_draft - t_catch ).count(), active - 1,
+		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_round ).count() );
 	return res;
 }
 
@@ -229,11 +279,14 @@ void MtpRunner::speculate_joint( int n, const int* slots, const int* anchors, co
 		}
 		cout_rows[j] = r - 1;
 	}
+	const bool sparse = sparse_round_begin();
+	const auto t_round = std::chrono::steady_clock::now();
 	mc.mtp_gather_hist( csrc, catch_rows );
 	mc.mtp_step_rows( crows, ctok, 4, 0, cout_rows, k );
 	int cands[kMaxSlots][pod::MAX_BATCH], preds[pod::MAX_BATCH];
 	mc.sample( preds, k );
 	for ( int j = 0; j < k; ++j ) cands[j][0] = preds[j];
+	const auto t_catch = std::chrono::steady_clock::now();
 
 	// 2. chain the head on its own output for the rest of the block (the depth is the same for every slot: the survival estimate is shared)
 	constexpr float kMinSurvival = 0.3f;
@@ -258,6 +311,7 @@ void MtpRunner::speculate_joint( int n, const int* slots, const int* anchors, co
 		++drafted;
 	}
 	depth = drafted;
+	const auto t_draft = std::chrono::steady_clock::now();
 
 	// 3. one verify forward over [anchor, c0 .. c_{depth-1}] of every slot
 	const int B = depth + 1, total = k * B;
@@ -328,6 +382,10 @@ void MtpRunner::speculate_joint( int n, const int* slots, const int* anchors, co
 		if ( res.accepted < depth ) mc.commit_spec_row( slots[i], j * B + res.accepted );
 	}
 	mc.set_spec_snapshot( false );
+	SpecResult joint_res[kMaxSlots];
+	for ( int j = 0; j < k; ++j ) joint_res[j] = out[J[j]];
+	sparse_round_end( sparse, joint_res, k, std::chrono::duration<double, std::milli>( t_draft - t_catch ).count(), depth - 1,
+		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_round ).count() );
 }
 
 } // namespace engine::runtime

@@ -166,6 +166,7 @@ set(ENGINE_HOST_SOURCES
 	src/kernels/cpu/nvfp4_linear.cpp
 	src/runtime/generator.cpp
 	src/runtime/loop_detect.cpp
+	src/runtime/sparse_head_policy.cpp
 	src/server/config.cpp
 	src/server/output_parser.cpp
 	src/server/http.cpp
@@ -206,6 +207,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/ple.cu
 	src/backend/cuda/modules/hessian.cu
 	src/backend/cuda/modules/steer.cu
+	src/backend/cuda/modules/sparse_head.cu
 	src/backend/cuda/modules/qsa.cu
 	src/backend/cuda/modules/dsv4.cu
 	src/backend/cuda/modules/embedding.cu
@@ -691,6 +693,10 @@ set_target_properties(test_dsv4_indexer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${P
 add_executable(test_dsv4_fp8 tests/2_parity/test_dsv4_fp8.cpp)
 target_link_libraries(test_dsv4_fp8 PRIVATE engine_kernels)
 set_target_properties(test_dsv4_fp8 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_sparse_head tests/2_parity/test_sparse_head.cpp)
+target_link_libraries(test_sparse_head PRIVATE engine_kernels)
+target_include_directories(test_sparse_head PRIVATE src/kernels/cuda/trellis)
+set_target_properties(test_sparse_head PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 add_executable(test_loop_detect tests/2_parity/test_loop_detect.cpp)
 target_link_libraries(test_loop_detect PRIVATE engine_kernels)
 set_target_properties(test_loop_detect PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
