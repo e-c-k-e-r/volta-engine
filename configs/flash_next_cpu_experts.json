@@ -13,8 +13,6 @@
 		"nvfp4_dense": "all",
 		"expert_cache": 0.4,
 		"expert_adapt_every": 0,
-		"cpu_experts": 0.5,
-		"cpu_expert_cpus": "10-19",
-		"cpu_expert_node": 1
+		"cpu_experts": 1.0
 	}
 }

@@ -9,7 +9,6 @@
 	"options": {
 		"max_seq": 262144,
 		"max_slots": 2,
-		"prefix_cache_gib": 48,
-		"prefix_interval": 16384
+		"prefix_cache_gib": 48
 	}
 }

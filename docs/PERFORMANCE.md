@@ -10,7 +10,7 @@ Reference numbers for the three model families on the target machine, how they w
 * weights
   * Qwen3.8-27B: EXL3 4.0 bpw (`Qwen3.8-27B-exl3`), or the NVFP4 checkpoint (`Qwen3.8-27B-QUASAR-NVFP4`) with the BF16 DFlash2 drafter
   * Flash-Next: the normal NVFP4 checkpoint on its own (`configs/flash_next_nvfp4_only.json`: routed experts as shipped, every dense group and the FP8 MTP head quantized to NVFP4 at load, the FP8 n-gram table read in place), or the mix of [FLASH_NEXT.md](FLASH_NEXT.md) (NVFP4 experts and dense groups with the Swift EXL3 4.0 bpw conversion's trunk, head and n-gram table)
-  * GLM-5.3-Flash: EXL3 3.05 bpw experts with the calibrated NVFP4 dense groups `kda,mla,idx,head,dense,shared`, all experts resident, 12K window; the MTP head comes from the NVFP4 checkpoint (`configs/glm_mtp.json`)
+  * GLM-5.3-Flash: EXL3 3.05 bpw experts with the calibrated NVFP4 dense groups `kda,mla,idx,head,dense,shared`, all experts resident, 12K window; the MTP head comes from the NVFP4 checkpoint
 
 ## Serving speed
 
