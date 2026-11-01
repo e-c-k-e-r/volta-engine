@@ -57,8 +57,8 @@ const CpuPlan& cpu_plan( bool nvfp4 = false ) {
 			if ( sib.empty() || sib[0] == c ) p.cpus.push_back( c );   // the first thread of each core
 		}
 		p.node = node;
-		// EXL3 on a two-socket host: a second pool on node 0 (from core 4), the experts of a request split between the two (measured: the
-		// sockets add up, 18 + 23 GB/s of codes against 23 for one); the copies stay on the first node (EXL3 reads cost the same from either)
+		// EXL3 on a two-socket host: a second pool on node 0 (from core 4) works on the other half of every expert's output columns; the copies
+		// stay on the first node (EXL3 reads cost the same from either)
 		if ( !nvfp4 && nodes > 1 && p.node != 0 && opt.cpu_expert_node < 0 ) {
 			for ( int c : read_cpulist( "/sys/devices/system/node/node0/cpulist" ) ) {
 				if ( c < 4 ) continue;

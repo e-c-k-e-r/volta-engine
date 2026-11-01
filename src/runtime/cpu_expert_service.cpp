@@ -56,6 +56,7 @@ void Service::start( const std::vector<int>& cpus, int spin_us, const std::vecto
 	if ( started_ ) return;
 	started_ = true;
 	spin_us_ = spin_us;
+	second_.svc = this;
 	if ( !cpus2.empty() ) {
 		std::vector<int> rest2( cpus2.begin() + 1, cpus2.end() );
 		pool2_.reset( new kernels::cpu::Pool( static_cast<int>( cpus2.size() ), rest2, spin_us ) );
@@ -84,7 +85,7 @@ void Service::start( const std::vector<int>& cpus, int spin_us, const std::vecto
 	else LOG_INFO( "[cpu-experts] service started: %d threads%s\n", n, cpus.empty() ? "" : " pinned" );
 }
 
-// The second pool's leader: runs each batch the dispatcher posts (calls2_) on the second pool, spinning between batches like the pool's threads
+// The second pool's leader: runs each task the dispatcher posts on the second pool, spinning between tasks like the pool's threads
 void Service::loop2() {
 	uint64_t seen = 0;
 	auto t_idle = std::chrono::steady_clock::now();
@@ -96,10 +97,20 @@ void Service::loop2() {
 			continue;
 		}
 		seen = p;
-		expert_forward_many( *pool2_, calls2_.data(), static_cast<int>( calls2_.size() ), scratch2_, act2_ );
+		pool2_->run( *task2_.load( std::memory_order_acquire ) );
 		done2_.store( p, std::memory_order_release );
 		t_idle = std::chrono::steady_clock::now();
 	}
+}
+
+void Service::Second::post( kernels::cpu::Task& task ) const {
+	svc->task2_.store( &task, std::memory_order_release );
+	svc->post2_.fetch_add( 1, std::memory_order_acq_rel );
+}
+
+void Service::Second::wait() const {
+	const uint64_t want = svc->post2_.load( std::memory_order_acquire );
+	while ( svc->done2_.load( std::memory_order_acquire ) != want ) __builtin_ia32_pause();
 }
 
 Mailbox* Service::mailbox( int rank, int hidden, float act_limit ) {
@@ -251,26 +262,7 @@ void Service::handle( Rank& r ) {
 		Expert ex; ex.gate = g.o->gate.get(); ex.up = g.o->up.get(); ex.down = g.o->down.get();
 		calls_[gi] = ExpertCall{ ex, g.m, g.xg.data(), g.wts.data(), groups_[gi].tmp.data() };
 	}
-	if ( groups >= 2 && pool2_ ) {
-		// two pools: the experts split by rows (the cost of a group), largest first onto the lighter side; the second half goes to the other node's
-		// leader, this thread runs the first on its own pool at the same time
-		std::vector<int> idx( groups );
-		for ( int i = 0; i < groups; ++i ) idx[i] = i;
-		std::stable_sort( idx.begin(), idx.end(), [&]( int a, int b ) { return groups_[a].m > groups_[b].m; } );
-		std::vector<ExpertCall> a;
-		calls2_.clear();
-		int wa = 0, wb = 0;
-		for ( int i : idx ) {
-			if ( wa <= wb ) { a.push_back( calls_[i] ); wa += groups_[i].m; }
-			else { calls2_.push_back( calls_[i] ); wb += groups_[i].m; }
-		}
-		act2_ = r.act_limit;
-		const uint64_t ticket = post2_.load( std::memory_order_relaxed ) + 1;
-		post2_.store( ticket, std::memory_order_release );
-		expert_forward_many( *pool_, a.data(), static_cast<int>( a.size() ), scratch_, r.act_limit );
-		while ( done2_.load( std::memory_order_acquire ) != ticket ) __builtin_ia32_pause();
-	}
-	else if ( groups ) expert_forward_many( *pool_, calls_.data(), groups, scratch_, r.act_limit );
+	if ( groups ) expert_forward_many( *pool_, calls_.data(), groups, scratch_, r.act_limit, pool2_ ? &second_ : nullptr );
 	for ( int gi = 0; gi < groups; ++gi ) {
 		const Group& g = groups_[gi];
 		for ( int k = 0; k < g.m; ++k ) {

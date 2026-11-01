@@ -457,6 +457,70 @@ static void part3_stream() {
 
 // Speed of a layer's worth of distinct experts handed over at once (expert_forward_many, as the expert service does when serving): n experts of
 // `layer` from `first` on, one row each, on 1 to all of the allowed CPUs
+
+// Two pools (SECOND_CPUS=4-13: another node's cores): every expert split by halves of its output columns between this node's pool and the
+// second; the outputs must equal one pool's exactly, timed for 1 and for n experts per call
+struct TestSecond : engine::cpu_moe::SecondPool {
+	Pool* pool = nullptr;
+	mutable std::atomic<engine::kernels::cpu::Task*> task{ nullptr };
+	mutable std::atomic<uint64_t> posted{ 0 }, done{ 0 };
+	std::atomic<bool> stop{ false };
+	std::thread th;
+	void post( engine::kernels::cpu::Task& t ) const override { task.store( &t, std::memory_order_release ); posted.fetch_add( 1, std::memory_order_acq_rel ); }
+	void wait() const override { const uint64_t w = posted.load(); while ( done.load( std::memory_order_acquire ) != w ) __builtin_ia32_pause(); }
+	void start( int lead ) {
+		th = std::thread( [this, lead] {
+			cpu_set_t cs; CPU_ZERO( &cs ); CPU_SET( lead, &cs ); pthread_setaffinity_np( pthread_self(), sizeof cs, &cs );
+			uint64_t seen = 0;
+			while ( !stop.load() ) {
+				const uint64_t p = posted.load( std::memory_order_acquire );
+				if ( p == seen ) { __builtin_ia32_pause(); continue; }
+				seen = p; pool->run( *task.load() ); done.store( p, std::memory_order_release );
+			}
+		} );
+	}
+	~TestSecond() { stop = true; if ( th.joinable() ) th.join(); }
+};
+
+static void part2_split( const std::vector<ExpertCall>& calls ) {
+	const char* env = std::getenv( "SECOND_CPUS" );
+	if ( !env ) return;
+	std::vector<int> c2;
+	{ std::string c = env; size_t p0 = 0; while ( p0 < c.size() ) { size_t q = c.find( ',', p0 ); if ( q == std::string::npos ) q = c.size(); std::string t = c.substr( p0, q - p0 );
+		const size_t d = t.find( '-' ); const int a = std::atoi( t.c_str() ), b = d == std::string::npos ? a : std::atoi( t.c_str() + d + 1 ); for ( int x = a; x <= b; ++x ) c2.push_back( x ); p0 = q + 1; } }
+	const int n1 = static_cast<int>( allowed_cpus().size() );
+	std::vector<int> cpus1;
+	for ( int t = 1; t < n1; ++t ) cpus1.push_back( allowed_cpus()[t] );
+	Pool pool1( n1, cpus1 );
+	Pool pool2( static_cast<int>( c2.size() ), std::vector<int>( c2.begin() + 1, c2.end() ) );
+	TestSecond second;
+	second.pool = &pool2;
+	second.start( c2[0] );
+	Scratch s1, s2;
+	const int H = calls[0].e.hidden(), n = static_cast<int>( calls.size() );
+	// exactness: the same experts through one pool and through two
+	std::vector<std::vector<float>> a( n, std::vector<float>( H, 0.0f ) ), b( n, std::vector<float>( H, 0.0f ) );
+	std::vector<ExpertCall> ca = calls, cb = calls;
+	for ( int j = 0; j < n; ++j ) { ca[j].out = a[j].data(); cb[j].out = b[j].data(); }
+	expert_forward_many( pool1, ca.data(), n, s1 );
+	expert_forward_many( pool1, cb.data(), n, s2, 10.0f, &second );
+	double worst = 0;
+	for ( int j = 0; j < n; ++j ) for ( int c = 0; c < H; ++c ) worst = std::max( worst, static_cast<double>( std::fabs( a[j][c] - b[j][c] ) ) );
+	std::printf( "  two pools (%d + %zu threads): max |two - one| %.3g%s\n", n1, c2.size(), worst, worst == 0.0 ? "" : "  FAIL" );
+	if ( worst != 0.0 ) ++g_fail;
+	for ( int per : { 1, n } ) {
+		for ( int i = 0; i < 3; ++i ) expert_forward_many( pool1, cb.data(), per, s2, 10.0f, &second );
+		const int reps = 20;
+		const auto t0 = std::chrono::steady_clock::now();
+		for ( int i = 0; i < reps; ++i ) expert_forward_many( pool1, cb.data(), per, s2, 10.0f, &second );
+		const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() / reps;
+		const auto t1 = std::chrono::steady_clock::now();
+		for ( int i = 0; i < reps; ++i ) expert_forward_many( pool1, ca.data(), per, s1 );
+		const double ms1 = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t1 ).count() / reps;
+		std::printf( "  %d expert(s) per call: one pool %.3f ms per expert, two pools %.3f ms per expert\n", per, ms1 / per, ms / per );
+	}
+}
+
 static void part2_many( const std::string& dir, int layer, int first, int n ) {
 	std::vector<pod::SafeTensorsFile> keep;
 	keep.reserve( 64 );
@@ -499,6 +563,7 @@ static void part2_many( const std::string& dir, int layer, int first, int n ) {
 		const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() / reps;
 		std::printf( "  %d experts at once, %2d threads: %.3f ms per expert, %.2f GB/s of codes\n", n, thr, ms / n, bytes / ms * 1e-6 );
 	}
+	part2_split( calls );
 }
 
 int main( int argc, char** argv ) {

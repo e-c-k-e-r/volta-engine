@@ -46,6 +46,13 @@ struct ExpertCall {
 	const float* wts;
 	float* out;
 };
-void expert_forward_many( kernels::cpu::Pool& pool, const ExpertCall* calls, int count, Scratch& s, float act_limit = 10.0f );
+// A second pool (another NUMA node's cores) that works on the other half of every expert's output columns at the same time: post() hands it a task
+// and returns at once, wait() returns when that task is finished
+struct SecondPool {
+	virtual ~SecondPool() {}
+	virtual void post( kernels::cpu::Task& task ) const = 0;
+	virtual void wait() const = 0;
+};
+void expert_forward_many( kernels::cpu::Pool& pool, const ExpertCall* calls, int count, Scratch& s, float act_limit = 10.0f, const SecondPool* second = nullptr );
 
 }   // namespace engine::cpu_moe

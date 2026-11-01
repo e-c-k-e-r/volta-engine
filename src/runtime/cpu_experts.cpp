@@ -49,11 +49,15 @@ struct ExpertJob : kernels::cpu::Task {
 	std::vector<std::atomic<int>> unit_done_b;   // done units per block: [gu blocks | down blocks]
 	std::vector<Piece> fin;                      // finishing steps: [gu blocks | down blocks]
 	std::atomic<int> next_unit{ 0 }, gu_blocks_done{ 0 }, d_blocks_done{ 0 };
+	// halves = 2 (two pools, one per NUMA node): half h takes the gate / up / down pieces and finishing blocks of its half of every matrix's
+	// output columns, with its own counter of fresh pieces; the halves meet only where down needs the whole intermediate
+	int halves = 1;
+	std::atomic<int> next_half[2];
 	std::atomic<bool> done{ false };
 
 	bool finished() const override { return done.load( std::memory_order_acquire ); }
 
-	void prepare( const Expert& ex, int r, const uint16_t* x, const float* w, float limit ) {
+	void prepare( const Expert& ex, int r, const uint16_t* x, const float* w, float limit, int want_halves = 1 ) {
 		e = ex; rows = r; act_limit = limit;
 		H = e.hidden(); I = e.inter();
 		nu = e.gate->units(); nb_gu = I / kBlock; nu_d = e.down->units(); nb_d = H / kBlock;
@@ -89,6 +93,10 @@ struct ExpertJob : kernels::cpu::Task {
 		for ( auto& p : fin ) { p.state.store( 0, std::memory_order_relaxed ); p.ts.store( 0, std::memory_order_relaxed ); }
 		for ( auto& c : unit_done_b ) c.store( 0, std::memory_order_relaxed );
 		next_unit.store( 0, std::memory_order_relaxed ); gu_blocks_done.store( 0, std::memory_order_relaxed ); d_blocks_done.store( 0, std::memory_order_relaxed );
+		// halves need every matrix's pieces and blocks to split evenly at a block boundary
+		halves = want_halves == 2 && nb_gu % 2 == 0 && nb_d % 2 == 0 && nch_gu % 2 == 0 && nch_d % 2 == 0 && ( nch_gu / 2 ) * cg_gu == ( nb_gu / 2 ) * kUnitsPerBlock &&
+			( nch_d / 2 ) * cg_d == ( nb_d / 2 ) * kUnitsPerBlock ? 2 : 1;
+		next_half[0].store( 0, std::memory_order_relaxed ); next_half[1].store( 0, std::memory_order_relaxed );
 		dsum_ready.store( false, std::memory_order_relaxed );
 		done.store( false, std::memory_order_release );
 	}
@@ -177,7 +185,37 @@ struct ExpertJob : kernels::cpu::Task {
 		return true;
 	}
 
-	bool work() override {
+	bool work() override { return work_half( -1 ); }
+
+	// half < 0: any piece (one pool); half 0 / 1: only that half's pieces and blocks (two pools), stale pieces of either half may be taken over
+	bool work_half( int half ) {
+		if ( half >= 0 && halves == 2 ) return work_split( half );
+		return work_any();
+	}
+
+	bool work_split( int h ) {
+		if ( finished() ) return false;
+		const uint64_t now = now_ns();
+		const int gh = nch_gu / 2, dh = nch_d / 2;
+		const int total = 2 * gh + ( dsum_ready.load( std::memory_order_acquire ) ? dh : 0 );
+		int v = next_half[h].load( std::memory_order_relaxed );
+		while ( v < total ) {
+			if ( next_half[h].compare_exchange_weak( v, v + 1, std::memory_order_acq_rel ) ) {
+				const int u = v < gh ? h * gh + v : v < 2 * gh ? nch_gu + h * gh + ( v - gh ) : 2 * nch_gu + h * dh + ( v - 2 * gh );
+				if ( claim( unit[u], kUnitStaleNs, now ) ) { do_unit( u ); return true; }
+				v = next_half[h].load( std::memory_order_relaxed );
+			}
+		}
+		// nothing fresh in this half: its finishing blocks, then stale pieces anywhere
+		for ( int b = h * ( nb_gu / 2 ); b < ( h + 1 ) * ( nb_gu / 2 ); ++b ) if ( try_finish( b, now ) ) return true;
+		for ( int b = h * ( nb_d / 2 ); b < ( h + 1 ) * ( nb_d / 2 ); ++b ) if ( try_finish( nb_gu + b, now ) ) return true;
+		const int all = 2 * nch_gu + ( dsum_ready.load( std::memory_order_acquire ) ? nch_d : 0 );
+		for ( int i = 0; i < all; ++i )
+			if ( unit[i].state.load( std::memory_order_acquire ) == 1 && claim( unit[i], kUnitStaleNs, now ) ) { do_unit( i ); return true; }
+		return false;
+	}
+
+	bool work_any() {
 		if ( finished() ) return false;
 		const uint64_t now = now_ns();
 		const int total = 2 * nch_gu + ( dsum_ready.load( std::memory_order_acquire ) ? nch_d : 0 );
@@ -218,6 +256,7 @@ struct ExpertJob : kernels::cpu::Task {
 struct ManyTask : kernels::cpu::Task {
 	ExpertJob* jobs[kJobs] = {};
 	int n = 0;
+	int half = -1;   // two pools: the half of every job this task's pool works on
 	std::atomic<uint32_t> rr{ 0 };
 	bool finished() const override {
 		for ( int i = 0; i < n; ++i ) if ( !jobs[i]->finished() ) return false;
@@ -229,7 +268,7 @@ struct ManyTask : kernels::cpu::Task {
 			ExpertJob* j = jobs[( start + i ) % n];
 			if ( j->finished() ) continue;
 			j->refs.fetch_add( 1, std::memory_order_acq_rel );   // the job may not be reused while this thread is inside it
-			const bool did = j->work();
+			const bool did = j->work_half( half );
 			j->refs.fetch_sub( 1, std::memory_order_acq_rel );
 			if ( did ) return true;
 		}
@@ -257,20 +296,34 @@ T* acquire( std::vector<std::unique_ptr<T>>& ring, size_t& next ) {
 }
 }   // namespace
 
-void expert_forward_many( Pool& pool, const ExpertCall* calls, int count, Scratch& s, float act_limit ) {
+void expert_forward_many( Pool& pool, const ExpertCall* calls, int count, Scratch& s, float act_limit, const SecondPool* second ) {
 	for ( int base = 0; base < count; base += kJobs ) {
 		const int n = std::min( kJobs, count - base );
 		ManyTask* task = acquire( s.many, s.next_many );
 		task->n = n;
+		task->half = second ? 0 : -1;
 		for ( int i = 0; i < n; ++i ) {
 			// the jobs of a wave stay distinct: take them in order, not holding two of the same
 			ExpertJob* j = acquire( s.jobs, s.next );
 			for ( int k = 0; k < i && task->jobs[k] == j; ++k ) j = acquire( s.jobs, s.next );
 			const ExpertCall& c = calls[base + i];
-			j->prepare( c.e, c.rows, c.x, c.wts, act_limit );
+			j->prepare( c.e, c.rows, c.x, c.wts, act_limit, second ? 2 : 1 );
 			task->jobs[i] = j;
 		}
-		pool.run( *task );
+		if ( second ) {
+			// the other half of the same jobs on the second pool, at the same time
+			ManyTask* other = acquire( s.many, s.next_many );
+			while ( other == task ) other = acquire( s.many, s.next_many );
+			other->n = n;
+			other->half = 1;
+			for ( int i = 0; i < n; ++i ) other->jobs[i] = task->jobs[i];
+			other->refs.fetch_add( 1, std::memory_order_acq_rel );
+			second->post( *other );
+			pool.run( *task );
+			second->wait();
+			other->refs.fetch_sub( 1, std::memory_order_acq_rel );
+		}
+		else pool.run( *task );
 		for ( int i = 0; i < n; ++i ) {
 			const ExpertCall& c = calls[base + i];
 			const size_t m = static_cast<size_t>( c.rows ) * task->jobs[i]->H;
@@ -281,7 +334,7 @@ void expert_forward_many( Pool& pool, const ExpertCall* calls, int count, Scratc
 
 void expert_forward( Pool& pool, const Expert& e, int rows, const uint16_t* x, const float* wts, float* out, Scratch& s, float act_limit ) {
 	const ExpertCall c = { e, rows, x, wts, out };
-	expert_forward_many( pool, &c, 1, s, act_limit );
+	expert_forward_many( pool, &c, 1, s, act_limit, nullptr );
 }
 
 }   // namespace engine::cpu_moe
