@@ -1,5 +1,6 @@
 // Routed-MoE prefill throughput on real GLM-5.3-Flash layer-3 experts (rank-0 partition, 72 of 288 experts):
-// rows routed uniformly over all 288 experts, time per MoE::forward at several chunk sizes.
+// rows routed uniformly over all 288 experts (BENCH_EXPERTS=N: over the first N), time per MoE::forward at several chunk sizes;
+// BENCH_RECON=1 also times one expert's three matrices through LinearTrellis::forward_recon (FP16 dequantization + cuBLAS) at those row counts.
 //   bench_moe_prefill [rows ...]
 #include "engine/runtime/test_paths.h"
 #include "engine/config.h"
@@ -85,13 +86,15 @@ int main( int argc, char** argv ) {
 			v = __float2half( ( ( seed >> 8 ) / 16777216.0f ) * 2.0f - 1.0f );
 		}
 		int local_routes = 0;
+		// BENCH_EXPERTS=N: rows routed over experts 0 .. N-1 only (N >= 8; 8 = every row to the same 8 experts, each `rows` rows: heavy experts)
+		static const int route_experts = std::getenv( "BENCH_EXPERTS" ) ? std::max( K, std::atoi( std::getenv( "BENCH_EXPERTS" ) ) ) : 288;
 		for ( int r = 0; r < R; ++r ) {
 			int used[288] = {};
 			for ( int k = 0; k < K; ++k ) {
 				int e;
 				do {
 					seed = seed * 1664525u + 1013904223u;
-					e = ( seed >> 8 ) % 288;
+					e = ( seed >> 8 ) % route_experts;
 				} while ( used[e] );
 				used[e] = 1;
 				hi[r * K + k] = e;
@@ -126,6 +129,43 @@ int main( int argc, char** argv ) {
 			dot += x * y; na += x * x; nb += y * y; maxd = std::max( maxd, std::fabs( x - y ) );
 		}
 		std::printf( "    agreement: cos %.7f, max |diff| %.5f (rms %.4f)\n", dot / std::sqrt( na * nb + 1e-30 ), maxd, std::sqrt( na / res[0].size() ) );
+		if ( const int heavy = engine::runtime::options().moe_heavy_rows; heavy > 0 ) {
+			// the heavy-expert path (moe_heavy_rows) against the quantized kernel alone, on the same routes
+			engine::runtime::options().moe_prefill_tile = true;
+			std::vector<half> hv[2];
+			for ( int on = 0; on < 2; ++on ) {
+				engine::runtime::options().moe_heavy_rows = on ? heavy : 0;
+				engine::modules::MoE::forward( xr, mw, d_idx, d_w, outr, 0, E, scratch, 10.0f, stream );
+				CUDA_CHECK( cudaStreamSynchronize( stream ) );
+				hv[on].resize( static_cast<size_t>( R ) * H );
+				CUDA_CHECK( cudaMemcpy( hv[on].data(), outr.data, hv[on].size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+			}
+			engine::runtime::options().moe_heavy_rows = heavy;
+			double d2 = 0, a2 = 0, b2 = 0, md = 0;
+			for ( size_t i = 0; i < hv[0].size(); ++i ) {
+				const double x = __half2float( hv[0][i] ), y = __half2float( hv[1][i] );
+				d2 += x * y; a2 += x * x; b2 += y * y; md = std::max( md, std::fabs( x - y ) );
+			}
+			std::printf( "    heavy path vs quantized kernel: cos %.7f, max |diff| %.5f (rms %.4f)\n", d2 / std::sqrt( a2 * b2 + 1e-30 ), md, std::sqrt( a2 / hv[0].size() ) );
+		}
+		if ( std::getenv( "BENCH_RECON" ) ) {
+			// one expert's gate, up and down through FP16 dequantization + cuBLAS at R rows (the heavy-expert path)
+			int gs[2] = { R, I }, ds[2] = { R, H };
+			auto yg2 = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, gs, 2 );
+			auto yu2 = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, gs, 2 );
+			auto yd2 = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ds, 2 );
+			auto rc = [&]( const pod::TensorView& x, const pod::LinearWeight& lw, pod::TensorView& y ) {
+				engine::modules::LinearTrellis::forward_recon( x, lw.w0, lw.w1, lw.w2, y, lw.bits, lw.mcg, lw.mul1, stream );
+			};
+			for ( int it = 0; it < 2; ++it ) { rc( xr, mw.gate[0], yg2 ); rc( xr, mw.up[0], yu2 ); rc( yg2, mw.down[0], yd2 ); }
+			CUDA_CHECK( cudaEventRecord( e0, stream ) );
+			for ( int it = 0; it < 10; ++it ) { const int e = it % 8; rc( xr, mw.gate[e], yg2 ); rc( xr, mw.up[e], yu2 ); rc( yg2, mw.down[e], yd2 ); }
+			CUDA_CHECK( cudaEventRecord( e1, stream ) );
+			CUDA_CHECK( cudaEventSynchronize( e1 ) );
+			float rms = 0.0f;
+			CUDA_CHECK( cudaEventElapsedTime( &rms, e0, e1 ) );
+			std::printf( "  rows %4d: one expert through FP16 dequantization + cuBLAS (gate, up, down): %.1f us\n", R, rms * 100.0f );
+		}
 	}
 	return 0;
 }
