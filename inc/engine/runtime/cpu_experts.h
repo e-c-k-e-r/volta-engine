@@ -29,6 +29,7 @@ struct Scratch {
 	std::vector<std::unique_ptr<ExpertJob>> jobs;
 	std::vector<std::unique_ptr<ManyTask>> many;
 	size_t next = 0, next_many = 0;
+	std::vector<ManyTask*> open;   // the last wave's tasks, closed before the next prepares their jobs again
 };
 
 // out[m][h] += wts[m] * expert( x[m] )[h] for m < rows (FP32 accumulate; the three linears round to FP16 between stages like the device

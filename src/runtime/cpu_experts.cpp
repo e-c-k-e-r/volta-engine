@@ -117,9 +117,13 @@ struct ExpertJob : kernels::cpu::Task {
 				a[i] = silu( gc ) * uc;
 			}
 			round_to_half( a, kBlock );
-			e.down->prepare_block( a, b, &act_in[base] );
+			// transformed in a local buffer, then copied: a thread taking this step over (kFinishStaleNs) writes the same values, but an in-place
+			// transform (several passes over the block) interleaved with another left a mix of partial passes in act_in
+			float t[kBlock];
+			e.down->prepare_block( a, b, t );
+			std::memcpy( &act_in[base], t, sizeof t );
 			float sum = 0;
-			if ( e.down->needs_row_sum() ) for ( int i = 0; i < kBlock; ++i ) sum += act_in[base + i];
+			if ( e.down->needs_row_sum() ) for ( int i = 0; i < kBlock; ++i ) sum += t[i];
 			bsum[static_cast<size_t>( r ) * nb_gu + b] = sum;
 		}
 	}
@@ -256,13 +260,18 @@ struct ExpertJob : kernels::cpu::Task {
 struct ManyTask : kernels::cpu::Task {
 	ExpertJob* jobs[kJobs] = {};
 	int n = 0;
+	// set before its jobs are prepared again: a pool thread still looping on this task from an earlier call (Pool::run returns without waiting for
+	// it) must leave without touching jobs that are being reset
+	std::atomic<bool> closed{ false };
 	int half = -1;   // two pools: the half of every job this task's pool works on
 	std::atomic<uint32_t> rr{ 0 };
 	bool finished() const override {
+		if ( closed.load( std::memory_order_acquire ) ) return true;
 		for ( int i = 0; i < n; ++i ) if ( !jobs[i]->finished() ) return false;
 		return true;
 	}
 	bool work() override {
+		if ( closed.load( std::memory_order_acquire ) ) return false;
 		const uint32_t start = rr.fetch_add( 1, std::memory_order_relaxed );
 		for ( int i = 0; i < n; ++i ) {
 			ExpertJob* j = jobs[( start + i ) % n];
@@ -298,9 +307,17 @@ T* acquire( std::vector<std::unique_ptr<T>>& ring, size_t& next ) {
 
 void expert_forward_many( Pool& pool, const ExpertCall* calls, int count, Scratch& s, float act_limit, const SecondPool* second ) {
 	for ( int base = 0; base < count; base += kJobs ) {
+		// the tasks of the previous wave or call: closed, and left by every pool thread, before their jobs can be prepared again
+		for ( ManyTask* t : s.open ) {
+			t->closed.store( true, std::memory_order_release );
+			while ( t->refs.load( std::memory_order_acquire ) > 0 ) std::this_thread::yield();
+		}
+		s.open.clear();
 		const int n = std::min( kJobs, count - base );
 		ManyTask* task = acquire( s.many, s.next_many );
+		task->closed.store( false, std::memory_order_relaxed );
 		task->n = n;
+		s.open.push_back( task );
 		task->half = second ? 0 : -1;
 		for ( int i = 0; i < n; ++i ) {
 			// the jobs of a wave stay distinct: take them in order, not holding two of the same
@@ -314,8 +331,10 @@ void expert_forward_many( Pool& pool, const ExpertCall* calls, int count, Scratc
 			// the other half of the same jobs on the second pool, at the same time
 			ManyTask* other = acquire( s.many, s.next_many );
 			while ( other == task ) other = acquire( s.many, s.next_many );
+			other->closed.store( false, std::memory_order_relaxed );
 			other->n = n;
 			other->half = 1;
+			s.open.push_back( other );
 			for ( int i = 0; i < n; ++i ) other->jobs[i] = task->jobs[i];
 			other->refs.fetch_add( 1, std::memory_order_acq_rel );
 			second->post( *other );
