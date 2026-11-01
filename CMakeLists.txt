@@ -686,6 +686,9 @@ set_target_properties(test_dsv4_indexer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${P
 add_executable(test_dsv4_fp8 tests/2_parity/test_dsv4_fp8.cpp)
 target_link_libraries(test_dsv4_fp8 PRIVATE engine_kernels)
 set_target_properties(test_dsv4_fp8 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_dsv4_engram tests/2_parity/test_dsv4_engram.cpp)
+target_link_libraries(test_dsv4_engram PRIVATE engine_kernels)
+set_target_properties(test_dsv4_engram PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_dsa tests/2_parity/test_dsa.cpp)
 target_link_libraries(test_dsa PRIVATE engine_kernels)

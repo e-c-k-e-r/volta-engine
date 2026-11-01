@@ -64,7 +64,7 @@ __attribute__(( weak )) void DSV4::hc_identity_pre( float* pre, int rows, backen
 	__builtin_unreachable();
 }
 
-__attribute__(( weak )) void DSV4::engram_gate( float* streams, const backend::half_t* kv, const float* w, int hidden, float eps, int rows, backend::stream_t stream ) {
+__attribute__(( weak )) void DSV4::engram_gate( float* streams, const backend::half_t* kv, const float* w, const uint8_t* skip, int hidden, float eps, int rows, backend::stream_t stream ) {
 	ENGINE_UNSUPPORTED( "DSV4::engram_gate" );
 	__builtin_unreachable();
 }

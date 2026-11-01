@@ -844,8 +844,9 @@ __global__ void hc_identity_pre_kernel( float* pre, int rows ) {
 
 // grid (rows, 4 streams), 256 threads
 __global__ __launch_bounds__( 256 )
-void engram_gate_kernel( float* __restrict__ streams, const half* __restrict__ kv, const float* __restrict__ w, int hidden, float eps ) {
+void engram_gate_kernel( float* __restrict__ streams, const half* __restrict__ kv, const float* __restrict__ w, const uint8_t* __restrict__ skip, int hidden, float eps ) {
 	const int r = blockIdx.x, h = blockIdx.y;
+	if ( skip && skip[r] ) return;   // a row inside an image span: the reference shuts its gate
 	float* s = streams + ( static_cast<size_t>( r ) * 4 + h ) * hidden;
 	const half* key = kv + static_cast<size_t>( r ) * 5 * hidden + static_cast<size_t>( h ) * hidden;
 	const half* val = kv + static_cast<size_t>( r ) * 5 * hidden + static_cast<size_t>( 4 ) * hidden;
@@ -982,8 +983,8 @@ void DSV4::hc_identity_pre( float* pre, int rows, cudaStream_t stream ) {
 	hc_identity_pre_kernel<<<( rows * 4 + 255 ) / 256, 256, 0, stream>>>( pre, rows );
 }
 
-void DSV4::engram_gate( float* streams, const half* kv, const float* w, int hidden, float eps, int rows, cudaStream_t stream ) {
-	engram_gate_kernel<<<dim3( rows, 4 ), 256, 0, stream>>>( streams, kv, w, hidden, eps );
+void DSV4::engram_gate( float* streams, const half* kv, const float* w, const uint8_t* skip, int hidden, float eps, int rows, cudaStream_t stream ) {
+	engram_gate_kernel<<<dim3( rows, 4 ), 256, 0, stream>>>( streams, kv, w, skip, hidden, eps );
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

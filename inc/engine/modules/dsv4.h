@@ -102,7 +102,8 @@ struct DSV4 {
 	// Engram: kv [rows, 5 * hidden] = [key 0..3 | value] (wkv of the looked-up rows); for each stream h:
 	//   dot = sum_d s[h][d] w[h][d] key[h][d] * rstd(s[h]) * rstd(key[h]) / sqrt(hidden),  gate = sigmoid(sign(dot) sqrt(max(|dot|, 1e-6)))
 	//   s[h] += gate * value
-	static void engram_gate( float* streams, const backend::half_t* kv, const float* w, int hidden, float eps, int rows, backend::stream_t stream );
+	// Rows with skip[row] != 0 (inside an image span; skip may be null) are left untouched: the reference shuts their gate
+	static void engram_gate( float* streams, const backend::half_t* kv, const float* w, const uint8_t* skip, int hidden, float eps, int rows, backend::stream_t stream );
 
 	// out [m, n] = x [m, k] * w^T for an FP8 E4M3 weight w [n, k] with E8M0 scales per 32 x 32 block (value = fp8 * 2^(e - 127)), FP32 accumulation:
 	// up to 16 rows read the FP8 bytes directly; more rows dequantize w into scratch (n * k halves) for the dense GEMM

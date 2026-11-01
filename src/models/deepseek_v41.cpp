@@ -1494,7 +1494,7 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 				backend::memcpy_async( e_rows_[lw.engram].data, eg_.host_rows + ( static_cast<size_t>( c ) * 2 + lw.engram ) * R * ecols, static_cast<size_t>( m ) * ecols * sizeof( backend::half_t ),
 					backend::Copy::H2D, stream );
 				engine::modules::Linear::forward( e_rows_[lw.engram], lw.e_wkv, e_kv_, stream );
-				DSV4::engram_gate( streams_.ptr<float>(), e_kv_.ptr<const backend::half_t>(), lw.e_w.ptr<const float>(), H, config_.norm_eps, m, stream );
+				DSV4::engram_gate( streams_.ptr<float>(), e_kv_.ptr<const backend::half_t>(), lw.e_w.ptr<const float>(), nullptr, H, config_.norm_eps, m, stream );
 			}
 			if ( ds_.loaded && l >= ds_.tap0 && l < ds_.tap0 + ds_.taps )
 				DSV4::tap_store( streams_.ptr<const float>(), ds_.tap_ring, l - ds_.tap0, ds_.taps, H, kTapScale, tap_floor_, m, d_rows_, ds_.tap_stride, stream );
@@ -1584,7 +1584,7 @@ void DeepseekV41Pipeline::forward_body( int m, backend::stream_t stream ) {
 		auto& lw = layers_[l];
 		if ( lw.engram >= 0 ) {
 			engine::modules::Linear::forward( e_rows_[lw.engram], lw.e_wkv, e_kv_, stream );
-			DSV4::engram_gate( streams_.ptr<float>(), e_kv_.ptr<const backend::half_t>(), lw.e_w.ptr<const float>(), H, config_.norm_eps, m, stream );
+			DSV4::engram_gate( streams_.ptr<float>(), e_kv_.ptr<const backend::half_t>(), lw.e_w.ptr<const float>(), d_img_flag_, H, config_.norm_eps, m, stream );
 		}
 		if ( ds_.loaded && l >= ds_.tap0 && l < ds_.tap0 + ds_.taps )
 			DSV4::tap_store( streams_.ptr<const float>(), ds_.tap_ring, l - ds_.tap0, ds_.taps, H, kTapScale, tap_floor_, m, d_rows_, ds_.tap_stride, stream );
