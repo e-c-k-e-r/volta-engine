@@ -22,6 +22,34 @@
 #include <string>
 #include <vector>
 
+// The CPUs this process may run on (numactl -N / taskset), one per physical core (hyperthread siblings dropped), in order
+static const std::vector<int>& allowed_cpus() {
+	static const std::vector<int> v = [] {
+		std::vector<int> out;
+		cpu_set_t set;
+		CPU_ZERO( &set );
+		sched_getaffinity( 0, sizeof( set ), &set );
+		for ( int c = 0; c < CPU_SETSIZE; ++c ) {
+			if ( !CPU_ISSET( c, &set ) ) continue;
+			char path[128];
+			std::snprintf( path, sizeof( path ), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c );
+			int first = c;
+			if ( std::FILE* f = std::fopen( path, "r" ) ) { if ( std::fscanf( f, "%d", &first ) != 1 ) first = c; std::fclose( f ); }
+			if ( first == c ) out.push_back( c );
+		}
+		return out;
+	}();
+	return v;
+}
+static std::vector<int> thread_counts() {
+	const int n = static_cast<int>( allowed_cpus().size() );
+	std::vector<int> t = { 1 };
+	if ( n >= 4 ) t.push_back( n / 2 );
+	if ( n > 1 ) t.push_back( n );
+	return t;
+}
+
+
 using namespace engine::cpu_moe;
 using namespace engine::kernels::cpu;
 
@@ -184,10 +212,10 @@ static void part2( const std::string& dir, int layer, int expert ) {
 		CHECK( e < 4e-3, "expert, %d rows: relative error %.3g", rows, e );
 		std::printf( "  rows %d: relative error vs the double model %.3g\n", rows, e );
 	}
-	// speed: one expert on 1..10 threads
-	for ( int thr : { 1, 5, 10 } ) {
+	// speed: one expert on 1 to all of the allowed CPUs (one per physical core: run under numactl -N <node>)
+	for ( int thr : thread_counts() ) {
 		std::vector<int> cpus;
-		for ( int t = 1; t < thr; ++t ) cpus.push_back( 10 + t );
+		for ( int t = 1; t < thr; ++t ) cpus.push_back( allowed_cpus()[t] );
 		Pool pool( thr, cpus );
 		Scratch scratch;
 		std::vector<uint16_t> xh( H, 0x3c00 );
@@ -355,9 +383,9 @@ static void part3_speed() {
 	Fp4Mat mg = make_fp4( H, I ), mu = make_fp4( H, I ), md = make_fp4( I, H );
 	Nvfp4Linear lg( mg.codes.data(), mg.scales.data(), mg.gs, H, I ), lu( mu.codes.data(), mu.scales.data(), mu.gs, H, I ), ld( md.codes.data(), md.scales.data(), md.gs, I, H );
 	Expert ex; ex.gate = &lg; ex.up = &lu; ex.down = &ld;
-	for ( int thr : { 1, 5, 10 } ) {
+	for ( int thr : thread_counts() ) {
 		std::vector<int> cpus;
-		for ( int t = 1; t < thr; ++t ) cpus.push_back( 10 + t );
+		for ( int t = 1; t < thr; ++t ) cpus.push_back( allowed_cpus()[t] );
 		Pool pool( thr, cpus );
 		Scratch sc;
 		std::vector<uint16_t> xh( H, 0x3c00 );
@@ -426,6 +454,53 @@ static void part3_stream() {
 	std::printf( "  stream: %zu threads: %.3f ms per expert (2.8 MB codes+scales each: %.2f GB/s)\n", all.size(), ms / cnt, 3.0 * H * I * 0.5625 / ( ms / cnt ) * 1e-6 );
 }
 
+
+// Speed of a layer's worth of distinct experts handed over at once (expert_forward_many, as the expert service does when serving): n experts of
+// `layer` from `first` on, one row each, on 1 to all of the allowed CPUs
+static void part2_many( const std::string& dir, int layer, int first, int n ) {
+	std::vector<pod::SafeTensorsFile> keep;
+	keep.reserve( 64 );
+	const char* parts[3] = { "gate_proj", "up_proj", "down_proj" };
+	std::vector<std::unique_ptr<TrellisLinear>> lin;
+	std::vector<Expert> ex( n );
+	double bytes = 0;
+	for ( int j = 0; j < n; ++j ) {
+		TrellisLinear* l3[3];
+		for ( int p = 0; p < 3; ++p ) {
+			char base[256];
+			std::snprintf( base, sizeof base, "model.language_model.layers.%d.mlp.experts.%d.%s", layer, first + j, parts[p] );
+			const pod::SafeTensorMeta *mt, *ms, *mv;
+			const void* tr = find_tensor( dir, std::string( base ) + ".trellis", keep, &mt );
+			const void* su = find_tensor( dir, std::string( base ) + ".suh", keep, &ms );
+			const void* sv = find_tensor( dir, std::string( base ) + ".svh", keep, &mv );
+			if ( !tr || !su || !sv ) { std::printf( "many experts: %s not found, skipped\n", base ); return; }
+			const int kt = mt->shape[0], nt = mt->shape[1], bits = mt->shape[2] / 16;
+			lin.emplace_back( new TrellisLinear( static_cast<const uint16_t*>( tr ), kt, nt, bits, static_cast<const uint16_t*>( su ), static_cast<const uint16_t*>( sv ) ) );
+			l3[p] = lin.back().get();
+			bytes += static_cast<double>( kt ) * nt * bits * 32;
+		}
+		ex[j].gate = l3[0]; ex[j].up = l3[1]; ex[j].down = l3[2];
+	}
+	const int H = ex[0].hidden();
+	std::vector<uint16_t> xh( H, 0x3c00 );
+	std::vector<std::vector<float>> out( n, std::vector<float>( H ) );
+	float wt = 1.0f;
+	std::vector<ExpertCall> calls( n );
+	for ( int j = 0; j < n; ++j ) calls[j] = { ex[j], 1, xh.data(), &wt, out[j].data() };
+	for ( int thr : thread_counts() ) {
+		std::vector<int> cpus;
+		for ( int t = 1; t < thr; ++t ) cpus.push_back( allowed_cpus()[t] );
+		Pool pool( thr, cpus );
+		Scratch scratch;
+		for ( int i = 0; i < 3; ++i ) expert_forward_many( pool, calls.data(), n, scratch );
+		const int reps = 20;
+		const auto t0 = std::chrono::steady_clock::now();
+		for ( int i = 0; i < reps; ++i ) expert_forward_many( pool, calls.data(), n, scratch );
+		const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() / reps;
+		std::printf( "  %d experts at once, %2d threads: %.3f ms per expert, %.2f GB/s of codes\n", n, thr, ms / n, bytes / ms * 1e-6 );
+	}
+}
+
 int main( int argc, char** argv ) {
 	if ( std::getenv( "CPUS" ) ) { part3_stream(); return 0; }
 	pool_stress();
@@ -435,6 +510,7 @@ int main( int argc, char** argv ) {
 	part3_speed();
 	const std::string dir = argc > 1 ? argv[1] : engine::runtime::test::model_path( "ENGINE_TEST_GLM_DIR" );
 	part2( dir, argc > 2 ? std::atoi( argv[2] ) : 10, argc > 3 ? std::atoi( argv[3] ) : 0 );
+	part2_many( dir, argc > 2 ? std::atoi( argv[2] ) : 10, 0, 8 );
 	std::printf( g_fail ? "%d FAILED\n" : "all passed\n", g_fail );
 	return g_fail ? 1 : 0;
 }

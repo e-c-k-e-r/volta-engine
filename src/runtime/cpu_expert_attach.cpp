@@ -6,6 +6,9 @@
 #include "engine/kernels/cpu/trellis_linear.h"
 #include "engine/backend/runtime.h"
 #include "engine/core/log.h"
+#include <cstdio>
+#include <cstring>
+#include <string>
 #include <memory>
 #include <vector>
 
@@ -15,8 +18,52 @@ namespace {
 
 using kernels::cpu::Linear;
 
+// The expert threads and the node of the CPU-side copies: the options when given, otherwise one thread per physical core of a NUMA node. EXL3
+// experts are compute-bound (measured: the same speed from local or remote memory), so they take the last node, on two sockets the one away from
+// the GPU rank threads; NVFP4 experts read their codes in place from the expert tier's pinned buffers on node 0 (remote reads cost 19-86%), so
+// they take node 0's cores from 4 on (0 to 3 drive the GPUs)
+struct CpuPlan { std::vector<int> cpus; int node = -1; };
+
+std::vector<int> read_cpulist( const char* path ) {
+	std::vector<int> out;
+	if ( std::FILE* f = std::fopen( path, "r" ) ) {
+		char buf[4096] = {};
+		if ( std::fgets( buf, sizeof buf, f ) ) out = Service::parse_cpus( std::string( buf, std::strcspn( buf, "\n" ) ) );
+		std::fclose( f );
+	}
+	return out;
+}
+
+const CpuPlan& cpu_plan( bool nvfp4 = false ) {
+	static const CpuPlan plan = [nvfp4] {
+		const auto& opt = runtime::options();
+		CpuPlan p;
+		p.node = opt.cpu_expert_node;
+		if ( !opt.cpu_expert_cpus.empty() ) { p.cpus = Service::parse_cpus( opt.cpu_expert_cpus ); return p; }
+		int nodes = 0;
+		while ( nodes < 64 ) {
+			char path[96];
+			std::snprintf( path, sizeof path, "/sys/devices/system/node/node%d/cpulist", nodes );
+			if ( std::FILE* f = std::fopen( path, "r" ) ) { std::fclose( f ); ++nodes; } else break;
+		}
+		if ( nodes == 0 ) return p;   // no NUMA information: the service's default (4 unpinned threads)
+		const int node = p.node >= 0 && p.node < nodes ? p.node : nvfp4 ? 0 : nodes - 1;
+		char path[96];
+		std::snprintf( path, sizeof path, "/sys/devices/system/node/node%d/cpulist", node );
+		for ( int c : read_cpulist( path ) ) {
+			if ( node == 0 && c < 4 ) continue;   // the rank threads' cores
+			std::snprintf( path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c );
+			const std::vector<int> sib = read_cpulist( path );
+			if ( sib.empty() || sib[0] == c ) p.cpus.push_back( c );   // the first thread of each core
+		}
+		p.node = node;
+		return p;
+	}();
+	return plan;
+}
+
 std::unique_ptr<Linear> make_linear( const pod::LinearWeight& lw, Service& svc ) {
-	const int node = runtime::options().cpu_expert_node;
+	const int node = cpu_plan().node;
 	if ( lw.type == pod::QuantType::NVFP4 ) {
 		// w0: packed codes [N, K / 2] bytes (host copy, in the prepacked tile order), w1: E4M3 block scales [N * K / 16] (device), alpha: the global scale
 		const int n = lw.w0.shape[0], k = lw.w0.shape[1] * 2;
@@ -56,7 +103,14 @@ void build( modules::ExpertTier& tier, int rank, int first_expert, int li, int e
 CpuExpertHandle attach_cpu_experts( modules::ExpertTier& tier, int rank, int first_expert, int hidden, float act_limit, pod::MemoryArena& device, backend::stream_t stream ) {
 	const auto& opt = runtime::options();
 	Service& svc = Service::get();
-	if ( !svc.started() ) svc.start( Service::parse_cpus( opt.cpu_expert_cpus ), opt.cpu_expert_spin_us );
+	if ( !svc.started() ) {
+		// the format of this tier's experts decides the default node (the plan is fixed by the first tier)
+		bool nvfp4 = false;
+		for ( size_t li = 0; li < tier.layers.size() && !nvfp4; ++li ) nvfp4 = tier.layers[li].mw && tier.layers[li].mw->type == pod::QuantType::NVFP4;
+		const CpuPlan& plan = cpu_plan( nvfp4 );
+		svc.start( plan.cpus, opt.cpu_expert_spin_us );
+		if ( rank == 0 ) LOG_INFO( "[cpu-experts] %zu expert threads%s, host-side copies on node %d\n", plan.cpus.size(), opt.cpu_expert_cpus.empty() ? " (one per core of the node, cpu_expert_cpus unset)" : "", plan.node );
+	}
 	CpuExpertHandle h;
 	h.mb = svc.mailbox( rank, hidden, act_limit );
 	h.ctl = static_cast<uint64_t*>( engine::core::arena_alloc( device, 2 * sizeof( uint64_t ), 256 ) );
@@ -69,7 +123,7 @@ CpuExpertHandle attach_cpu_experts( modules::ExpertTier& tier, int rank, int fir
 		for ( int e = 0; e < tier.experts; ++e )
 			if ( tier.layers[li].cpu_owned[e] ) { build( tier, rank, first_expert, static_cast<int>( li ), e ); ++built; }
 	tier.on_cold = [&tier, rank, first_expert]( int li, int e ) { build( tier, rank, first_expert, li, e ); };
-	if ( rank == 0 ) LOG_INFO( "[cpu-experts] rank 0: %d cold experts on the CPU path, %.2f GiB of host-side copies (all ranks so far); up to %.0f%% of a layer's cold experts go to the CPU; node %d\n", built, svc.host_bytes() / 1073741824.0, 100.0 * opt.cpu_experts, opt.cpu_expert_node );
+	if ( rank == 0 ) LOG_INFO( "[cpu-experts] rank 0: %d cold experts on the CPU path, %.2f GiB of host-side copies (all ranks so far); up to %.0f%% of a layer's cold experts go to the CPU; node %d\n", built, svc.host_bytes() / 1073741824.0, 100.0 * opt.cpu_experts, cpu_plan().node );
 	return h;
 }
 
