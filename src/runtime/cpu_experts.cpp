@@ -70,8 +70,10 @@ struct ExpertJob : kernels::cpu::Task {
 		if ( rows < 1 || rows > kMaxRows || e.up->out() != I || e.down->in() != I || e.down->out() != H ) std::abort();
 		for ( int i = 0; i < rows; ++i ) wts[i] = w[i];
 		const size_t rH = static_cast<size_t>( rows ) * H, rI = static_cast<size_t>( rows ) * I;
-		xf.resize( rH ); xg.resize( rH ); xu.resize( rH ); raw_d.resize( rH ); out_tmp.assign( rH, 0.0f );
-		raw_g.resize( rI ); raw_u.resize( rI ); act_in.resize( rI ); bsum.assign( static_cast<size_t>( rows ) * nb_gu, 0.0f );
+		// out_tmp and bsum need no clearing: every finishing step assigns its block of them in full
+		auto grow = []( std::vector<float>& v, size_t n ) { if ( v.size() < n ) v.resize( n ); };
+		grow( xf, rH ); grow( xg, rH ); grow( xu, rH ); grow( raw_d, rH ); grow( out_tmp, rH );
+		grow( raw_g, rI ); grow( raw_u, rI ); grow( act_in, rI ); grow( bsum, static_cast<size_t>( rows ) * nb_gu );
 		half_to_float( x, xf.data(), rH );
 		for ( int i = 0; i < 2 * rows; ++i ) xsum[i] = 0.0f;
 		for ( int rr = 0; rr < rows; ++rr ) {
@@ -146,8 +148,10 @@ struct ExpertJob : kernels::cpu::Task {
 			if ( !p.state.compare_exchange_strong( st, 1, std::memory_order_acq_rel ) ) return false;
 		}
 		else if ( st == 1 ) {
+			// `now` was read when the caller's work() began, and the piece may have been claimed after that: such a claim is fresh (the unsigned
+			// difference would wrap and make it look stale)
 			const uint64_t t = p.ts.load( std::memory_order_acquire );
-			if ( now - t < stale_ns ) return false;
+			if ( t >= now || now - t < stale_ns ) return false;
 		}
 		else return false;
 		p.ts.store( now, std::memory_order_release );
