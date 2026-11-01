@@ -2,6 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/models/model.h"
+#include "engine/models/steer_host.h"
 #include "engine/models/glm5_vision.h"
 #include "engine/runtime/kv_cache.h"
 #include "engine/core/tensor.h"
@@ -204,6 +205,14 @@ public:
 
 	// MTP head (speculator=mtp, from the NVFP4 checkpoint's layer 45): see model.h 5d. The history rows are the final-norm hidden rows
 	bool has_mtp() const override { return mtp_on_; }
+	// Runtime steering (option steer): the edits act on the mean of the four residual streams and shift every stream by the change (ResidualSteer::apply_streams)
+	bool steer_enabled() const override { return steer_.on(); }
+	void steer_set( int slot_id, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream = nullptr ) override { steer_.set( slot_id, entries, stream ); }
+	void steer_control( int slot_id, int scope, int prompt_len, int think_end, backend::stream_t stream = nullptr ) override { steer_.control( slot_id, scope, prompt_len, think_end, stream ); }
+	void steer_penalty( int slot_id, const std::vector<int>& ids, float penalty, backend::stream_t stream = nullptr ) override { steer_.penalty( slot_id, ids, penalty, stream ); }
+	void steer_capture( const std::vector<int>& layers, bool on ) override { steer_.capture( layers, on ); }
+	bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) override { return steer_.read( out, stream ); }
+	void steer_range( int* first_layer, int* num_layers ) const override { *first_layer = steer_.first(); *num_layers = steer_.layers(); }
 	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
 	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
 
@@ -320,6 +329,11 @@ private:
 	bool snap_taps_ = false;             // sequence snapshots include the tap ring rows
 	size_t tap_snapshot_bytes( int tokens ) const;
 	void copy_seq_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
+	// After layer L's FFN update: the steering edits of its range and the probe's capture of the stream mean
+	void steer_layer( int L, int m, backend::stream_t stream );
+	void steer_penalize( pod::TensorView& logits, int row0, int n, backend::stream_t stream );   // the reflection-marker penalty on this rank's logit rows
+	SteerHost steer_;
+	pod::TensorView steer_mean_;         // [MAX_ROWS, hidden] fp16: the stream mean of a probe's capture
 	pod::TensorView tap_tmp_;            // [MAX_ROWS, hidden] mean of the 4 residual streams at a tapped layer
 
 	pod::TensorView embed_rows_;    // [MAX_ROWS, hidden] embedded inputs

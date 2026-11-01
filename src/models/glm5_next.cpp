@@ -192,7 +192,9 @@ bool Glm5NextPipeline::init(
 	embed_rows_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rows_shape, 2 );
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
+	steer_.init( arena, config_.hidden_size, config_.num_layers, S, rank_ );
 	int h_shape[2] = { R, config_.hidden_size };
+	if ( steer_.on() ) steer_mean_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	hidden_states_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	norm_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 
@@ -1399,14 +1401,15 @@ void Glm5NextPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 	const int m = rows.count;
 	key_hint_ = rows.pos[m - 1] + 1;
 	// Logits selection applies to eager prefill chunks only (decode graphs are keyed on m alone)
-	lm_mode_ = ( m > pod::MAX_BATCH ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;
+	lm_mode_ = ( m > pod::MAX_BATCH || steer_.capturing() ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;   // a probe runs eagerly, so any block may skip the head
 	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
 	ENGINE_ASSERT( last_rows_ <= logit_rows_, "Glm5NextPipeline::forward: more logit rows than the buffer holds (ENGINE_DEBUG_GLM_LOGIT_ROWS)" );
 	set_rows( m );
 	kv_prepare( rows, stream );
 	// Pageable source: the copy is staged before return, so `rows` may be a temporary
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
-	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); } );
+	if ( steer_.capturing() ) forward_body( m, stream );   // a probe: the capture list is host state a graph would freeze
+	else graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); } );
 }
 
 void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
@@ -1465,16 +1468,40 @@ void Glm5NextPipeline::forward_head( int m, backend::stream_t stream ) {
 		if ( norm_all ) {   // already normed above (n1 is the last row of norm_hidden_, which the head step still needs whole)
 			pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
 			engine::modules::Linear::forward( n1, lm_head_, l1, stream );
+			steer_penalize( l1, m - 1, 1, stream );
 			return;
 		}
 		pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
 		engine::modules::RMSNorm::forward( h1, final_norm_, n1, 1e-5f, 0.0f, stream );
 		engine::modules::Linear::forward( n1, lm_head_, l1, stream );
+		steer_penalize( l1, m - 1, 1, stream );
 		return;
 	}
 	logits_.shape[0] = m;
 	engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, 1e-5f, 0.0f, stream );
 	engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
+	steer_penalize( logits_, 0, m, stream );
+}
+
+void Glm5NextPipeline::steer_penalize( pod::TensorView& logits, int row0, int n, backend::stream_t stream ) {
+	if ( steer_.on() ) engine::modules::ResidualSteer::penalize( steer_.tables(), logits.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, row0, n, lm_shard_offset_, lm_shard_real_cols_, stream );
+}
+
+void Glm5NextPipeline::steer_layer( int L, int m, backend::stream_t stream ) {
+	const int H = config_.hidden_size;
+	const bool hc = layers_[L].hc_ffn_fn.data != nullptr;
+	if ( const int li = steer_.index( L ); li >= 0 ) {
+		if ( hc ) engine::modules::ResidualSteer::apply_streams( steer_.tables(), hidden_streams_.ptr<float>(), 4, d_rows_, m, li, stream );
+		else engine::modules::ResidualSteer::apply( steer_.tables(), hidden_states_.ptr<backend::half_t>(), d_rows_, m, li, stream );
+	}
+	if ( backend::half_t* dst = steer_.capture_dst( L ) ) {
+		const backend::half_t* src = hidden_states_.ptr<const backend::half_t>();
+		if ( hc ) {
+			engine::spec::dflash_reduce_streams( hidden_streams_.ptr<const float>(), steer_mean_.ptr<backend::half_t>(), m, H, 0, stream );
+			src = steer_mean_.ptr<const backend::half_t>();
+		}
+		backend::memcpy_async( dst, src + static_cast<size_t>( m - 1 ) * H, H * sizeof( backend::half_t ), backend::Copy::D2D, stream );
+	}
 }
 
 // A window of consecutive prefill chunks of one slot, layer by layer: every chunk runs its attention and router, the routed experts run once over all
@@ -2068,6 +2095,8 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				engine::modules::Elementwise::add_residual( hidden_states_, ffn_out_, stream );
 			}
 		}
+
+		if ( steer_.on() && ( steer_.index( layer ) >= 0 || steer_.capture_dst( layer ) != nullptr ) ) steer_layer( layer, m, stream );
 
 		// Tapped layer states for the DFlash2 drafter: position-indexed ring, owner/slot/position read on device.
 		// The tapped hidden state of an mHC layer is the mean of its four residual streams (as HyperHead).
