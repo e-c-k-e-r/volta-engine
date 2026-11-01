@@ -133,6 +133,11 @@ void Generator::admit_pending() {
 		slot.sp.seed = slot.req.seed != 0 ? slot.req.seed : ( 0x51ED270B0F5A8C3DULL ^ slot.req.req_id );
 		slot.rng.reseed( slot.sp.seed );
 		slot.in_reasoning = slot.req.starts_in_reasoning;
+		slot.loop_mode = slot.req.loop_detect >= 0 ? slot.req.loop_detect : loop_detect_mode();
+		if ( slot.loop_mode > 0 ) {
+			slot.loop = std::make_unique<LoopDetector>();
+			slot.loop->prime( slot.req.prompt_tokens.data(), static_cast<int>( slot.req.prompt_tokens.size() ) );
+		}
 		if ( cluster_.steer_enabled() ) steer_admit( s );
 		slot.metrics.start_time = std::chrono::steady_clock::now();
 		slot.metrics.queue_ms = std::chrono::duration<double, std::milli>( slot.metrics.start_time - slot.req.submit_time ).count();
@@ -164,6 +169,12 @@ void Generator::scheduler_loop() {
 	}
 }
 
+// loop_detect option: off / report / stop -> 0 / 1 / 2
+int Generator::loop_detect_mode() {
+	const std::string& m = runtime::options().loop_detect;
+	return m == "stop" ? 2 : m == "report" ? 1 : 0;
+}
+
 bool Generator::emit_token( int s, int tok ) {
 	Slot& slot = slots_[s];
 	slot.all_tokens.push_back( tok );
@@ -189,6 +200,15 @@ bool Generator::emit_token( int s, int tok ) {
 		( cluster_.pool_tokens() > 0 && !cluster_.reserve_tokens( s, slot.current_pos + 2 * pod::MAX_BATCH ) ) ) ) {
 		finish = true;
 		reason = FinishReason::Length;
+	}
+
+	if ( !finish && slot.loop && !slot.loop->detected() && slot.loop->feed( tok ) ) {
+		LOG_WARN( "[gen] slot %d (req %llu): the output repeats itself (period %d tokens, found at token %lld)%s\n", s, static_cast<unsigned long long>( slot.req.req_id ),
+			slot.loop->period(), static_cast<long long>( slot.loop->detected_at() ), slot.loop_mode == 2 ? ", request stopped" : "" );
+		if ( slot.loop_mode == 2 ) {
+			finish = true;
+			reason = FinishReason::Loop;
+		}
 	}
 
 	if ( slot.steer_think_open && tok == tokenizer_.think_end_id() ) {
@@ -316,7 +336,7 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 		rec.restore_ms = slot.metrics.restore_ms;
 		rec.prefill_ms = slot.metrics.prefill_ms;
 		rec.store_ms = slot.metrics.store_ms;
-		const char* why = reason == FinishReason::Stop ? "stop" : reason == FinishReason::Length ? "length" : reason == FinishReason::StopString ? "stop string" : "cancelled";
+		const char* why = reason == FinishReason::Stop ? "stop" : reason == FinishReason::Length ? "length" : reason == FinishReason::StopString ? "stop string" : reason == FinishReason::Loop ? "loop" : "cancelled";
 		if ( slot.prefill_done ) {
 			LOG_INFO( "[req %llu] slot %d %s: %d tokens in %.1f s (%.0f tok/s) | first token after %.1f s = restore %.2f + prefill %.2f + checkpoints %.2f + other slots %.2f\n",
 				static_cast<unsigned long long>( rec.req_id ), s, why, slot.tokens_generated, std::chrono::duration<double>( now - slot.metrics.first_token_time ).count(),
@@ -1056,7 +1076,7 @@ MonitorSnapshot Generator::get_monitor() const {
 	m.tokens_prefilled = tokens_prefilled_.load( std::memory_order_relaxed );
 	m.prompt_tokens = prompt_tokens_total_;
 	m.cached_tokens = cached_tokens_total_;
-	for ( int i = 0; i < 4; ++i ) m.finished[i] = finished_[i];
+	for ( int i = 0; i < 5; ++i ) m.finished[i] = finished_[i];
 	m.spec_rounds = spec_rounds_;
 	m.spec_proposed = spec_proposals_;
 	m.spec_accepted = spec_accepted_;

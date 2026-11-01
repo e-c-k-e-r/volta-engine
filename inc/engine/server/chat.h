@@ -35,6 +35,7 @@ struct ChatRequest {
 	int top_k = -1;              // <0: server default
 	uint64_t seed = 0;
 	std::vector<std::string> stop;
+	int stop_on_loop = -1;       // extension field stop_on_loop: -1 the loop_detect option, 0 off, 1 stop on a detected loop
 	int enable_thinking = -1;    // -1: server default
 	std::string reasoning_effort;
 	// tool_choice "required" / a named function: the model is told to call a tool (best effort, no constrained decoding)

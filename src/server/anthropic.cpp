@@ -330,6 +330,7 @@ public:
 		}
 		if ( j.contains( "top_p" ) && j["top_p"].is_number() ) r.top_p = j["top_p"].get<float>();
 		if ( j.contains( "top_k" ) && j["top_k"].is_number_integer() ) r.top_k = j["top_k"].get<int>();
+		if ( j.contains( "stop_on_loop" ) && j["stop_on_loop"].is_boolean() ) r.stop_on_loop = j["stop_on_loop"].get<bool>() ? 1 : 0;
 		if ( j.contains( "stop_sequences" ) && j["stop_sequences"].is_array() ) {
 			for ( const auto& s : j["stop_sequences"] ) {
 				if ( s.is_string() ) r.stop.push_back( s.get<std::string>() );

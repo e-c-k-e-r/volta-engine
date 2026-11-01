@@ -346,6 +346,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	g.top_k = req.top_k > 0 ? req.top_k : cfg.default_top_k;
 	g.seed = req.seed;
 	g.stop_strings = req.stop;
+	if ( req.stop_on_loop >= 0 ) g.loop_detect = req.stop_on_loop ? 2 : 0;
 	g.starts_in_reasoning = in_reasoning;
 	g.steer_vector = req.steer_vector;
 	g.steer_scale = req.steer_scale;

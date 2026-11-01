@@ -1,5 +1,7 @@
 #pragma once
 
+#include "engine/runtime/loop_detect.h"
+
 #include "engine/runtime/spec_controller.h"
 #include "engine/runtime/suffix_index.h"
 #include "engine/runtime/sampling.h"
@@ -47,7 +49,7 @@ struct SlotMetrics {
 	bool gate_fired = false;
 };
 
-enum class FinishReason { Stop, Length, StopString, Cancelled };
+enum class FinishReason { Stop, Length, StopString, Cancelled, Loop };
 
 struct GenerationRequest {
 	uint64_t req_id = 0;
@@ -95,6 +97,7 @@ struct GenerationRequest {
 	float think_penalty = -1.0f;
 	std::vector<std::string> stop_strings;   // generation ends before the first match
 	std::string matched_stop;                // set when FinishReason::StopString
+	int loop_detect = -1;                    // -1 = the loop_detect option, 0 off, 1 report (log only), 2 stop (FinishReason::Loop)
 	// Called from the scheduler thread with detokenized text (never the end-of-sequence token). Returning false cancels.
 	std::function<bool( const std::string& delta )> on_text;
 	// Called once, from the scheduler thread, when the request leaves its slot.
@@ -164,7 +167,7 @@ struct MonitorSnapshot {
 	size_t queued = 0;
 	uint64_t requests = 0, completed = 0;
 	uint64_t tokens_out = 0, tokens_prefilled = 0, prompt_tokens = 0, cached_tokens = 0;
-	uint64_t finished[4] = {};                  // by FinishReason
+	uint64_t finished[5] = {};                  // by FinishReason
 	uint64_t spec_rounds = 0, spec_proposed = 0, spec_accepted = 0;
 	uint64_t suffix_rounds = 0, suffix_proposed = 0, suffix_accepted = 0;   // the rounds whose block came from a suffix match (also counted above)
 	double gap_ms[5] = {};                      // token-gap percentiles: p50 p90 p99 p999 max, over the last samples
@@ -234,6 +237,8 @@ private:
 		bool steer_prompt = false;       // the prompt rows are edited: its KV is not the cache's (no restore, no checkpoints)
 		bool force_close = false;   // budget reached: close the reasoning block before the next step
 		std::string held_text;   // detokenized text withheld while it could still begin a stop string
+		std::unique_ptr<LoopDetector> loop;   // loop_detect report / stop: fed every generated token
+		int loop_mode = 0;
 		std::vector<int> all_tokens;
 		SuffixIndex suffix;            // all_tokens indexed for spec_suffix
 		bool suffix_offered = false;   // this round's block was offered from the index
@@ -258,6 +263,7 @@ private:
 	PrefixCache::Entry* store_prefix( int s, PrefixCache::Entry* parent, int tokens, bool pinned, bool with_taps );
 	static constexpr int kPrefixMinTokens = 512;
 	// Commits `tok` to slot s's output; returns true when the request finished.
+	static int loop_detect_mode();
 	bool emit_token( int s, int tok );
 	void finish_slot( int s, FinishReason reason );
 	void apply_forced_close( int s );
@@ -318,7 +324,7 @@ private:
 	void fold_expert_heat( bool force = false );
 	std::atomic<uint64_t> tokens_out_{ 0 };
 	std::atomic<uint64_t> tokens_prefilled_{ 0 };
-	uint64_t prompt_tokens_total_ = 0, cached_tokens_total_ = 0, finished_[4] = {}, spec_rounds_ = 0;
+	uint64_t prompt_tokens_total_ = 0, cached_tokens_total_ = 0, finished_[5] = {}, spec_rounds_ = 0;
 	SlotView slot_view_[MAX_SLOTS];
 	std::deque<RequestRecord> recent_;
 	std::vector<float> gap_ring_ = std::vector<float>( 4096, 0.0f );

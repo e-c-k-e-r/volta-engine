@@ -14,6 +14,7 @@ const char* reason_name( engine::runtime::FinishReason r ) {
 		case engine::runtime::FinishReason::Length: return "length";
 		case engine::runtime::FinishReason::StopString: return "stop_string";
 		case engine::runtime::FinishReason::Cancelled: return "cancelled";
+		case engine::runtime::FinishReason::Loop: return "loop";
 	}
 	return "stop";
 }
@@ -40,7 +41,7 @@ std::string VoltaServer::stats_json() {
 		{ "speculator", config_.use_speculation ? opt.speculator : std::string() }, { "kv_format", opt.kv_format.empty() ? std::string( "default" ) : opt.kv_format } };
 	j["totals"] = { { "requests", mon.requests }, { "completed", mon.completed }, { "tokens_out", mon.tokens_out }, { "tokens_prefilled", mon.tokens_prefilled },
 		{ "prompt_tokens", mon.prompt_tokens }, { "cached_tokens", mon.cached_tokens },
-		{ "finished", { { "stop", mon.finished[0] }, { "length", mon.finished[1] }, { "stop_string", mon.finished[2] }, { "cancelled", mon.finished[3] } } } };
+		{ "finished", { { "stop", mon.finished[0] }, { "length", mon.finished[1] }, { "stop_string", mon.finished[2] }, { "cancelled", mon.finished[3] }, { "loop", mon.finished[4] } } } };
 	j["averages"] = { { "ttft_ms", met.avg_ttft_ms }, { "prefill_tok_s", met.avg_prefill_tok_s }, { "decode_tok_s", met.avg_decode_tok_s } };
 	j["latency"] = { { "gap_ms", { mon.gap_ms[0], mon.gap_ms[1], mon.gap_ms[2], mon.gap_ms[3], mon.gap_ms[4] } }, { "gap_samples", mon.gap_samples },
 		{ "ttft_ms", { mon.ttft_ms[0], mon.ttft_ms[1], mon.ttft_ms[2] } }, { "gap_hist", mon.gap_hist } };

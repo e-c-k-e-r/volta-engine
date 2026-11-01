@@ -67,6 +67,7 @@ bool valid( const char* name, const Options& o ) {
 	if ( !std::strcmp( name, "mtp_depth" ) ) return o.mtp_depth >= 1 && o.mtp_depth <= 7;
 	if ( !std::strcmp( name, "log_level" ) ) return o.log_level == "error" || o.log_level == "warn" || o.log_level == "info" || o.log_level == "debug";
 	if ( !std::strcmp( name, "tp" ) ) return o.tp < 0 || o.tp == 1 || o.tp == 2 || o.tp == 4;
+	if ( !std::strcmp( name, "loop_detect" ) ) return o.loop_detect == "off" || o.loop_detect == "report" || o.loop_detect == "stop";
 	return true;
 }
 
