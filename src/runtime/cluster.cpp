@@ -57,7 +57,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	// arena_gib) it takes the device's free memory less a reserve for what lives outside it (graphs, workspaces, the
 	// CUDA context); vram_reserve_mib overrides the reserve. The model's own tables (KV pools, scratch) are sized by
 	// max_seq / max_slots, not by the arena, so a larger context needs no arena tuning.
-	const size_t reserve = ( opt.vram_reserve_mib >= 0 ? static_cast<size_t>( opt.vram_reserve_mib ) : ( is_glm ? 288ULL : 1536ULL ) ) * 1024 * 1024;
+	const size_t reserve = ( opt.vram_reserve_mib >= 0 ? static_cast<size_t>( opt.vram_reserve_mib ) : ( is_glm ? 768ULL : 1536ULL ) ) * 1024 * 1024;
 	ENGINE_ASSERT( tp_ == 1 || tp_ == 2 || tp_ == ENGINE_NUM_GPUS, "ModelCluster::init: the collective supports tp 1, 2 or 4 ranks" );
 	created_ = true;
 	if ( tp_ > 1 ) engine::comm::init_4gpu_mesh( rings_, staging_ptrs_, flag_ptrs_, engine::comm::kMeshStagingBytes, tp_ );
