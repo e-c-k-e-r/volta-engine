@@ -22,7 +22,7 @@ using kernels::cpu::Linear;
 // experts are compute-bound (measured: the same speed from local or remote memory), so they take the last node, on two sockets the one away from
 // the GPU rank threads; NVFP4 experts read their codes in place from the expert tier's pinned buffers on node 0 (remote reads cost 19-86%), so
 // they take node 0's cores from 4 on (0 to 3 drive the GPUs)
-struct CpuPlan { std::vector<int> cpus; int node = -1; };
+struct CpuPlan { std::vector<int> cpus, cpus2; int node = -1; };
 
 std::vector<int> read_cpulist( const char* path ) {
 	std::vector<int> out;
@@ -57,6 +57,16 @@ const CpuPlan& cpu_plan( bool nvfp4 = false ) {
 			if ( sib.empty() || sib[0] == c ) p.cpus.push_back( c );   // the first thread of each core
 		}
 		p.node = node;
+		// EXL3 on a two-socket host: a second pool on node 0 (from core 4), the experts of a request split between the two (measured: the
+		// sockets add up, 18 + 23 GB/s of codes against 23 for one); the copies stay on the first node (EXL3 reads cost the same from either)
+		if ( !nvfp4 && nodes > 1 && p.node != 0 && opt.cpu_expert_node < 0 ) {
+			for ( int c : read_cpulist( "/sys/devices/system/node/node0/cpulist" ) ) {
+				if ( c < 4 ) continue;
+				std::snprintf( path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c );
+				const std::vector<int> sib = read_cpulist( path );
+				if ( sib.empty() || sib[0] == c ) p.cpus2.push_back( c );
+			}
+		}
 		return p;
 	}();
 	return plan;
@@ -108,8 +118,9 @@ CpuExpertHandle attach_cpu_experts( modules::ExpertTier& tier, int rank, int fir
 		bool nvfp4 = false;
 		for ( size_t li = 0; li < tier.layers.size() && !nvfp4; ++li ) nvfp4 = tier.layers[li].mw && tier.layers[li].mw->type == pod::QuantType::NVFP4;
 		const CpuPlan& plan = cpu_plan( nvfp4 );
-		svc.start( plan.cpus, opt.cpu_expert_spin_us );
-		if ( rank == 0 ) LOG_INFO( "[cpu-experts] %zu expert threads%s, host-side copies on node %d\n", plan.cpus.size(), opt.cpu_expert_cpus.empty() ? " (one per core of the node, cpu_expert_cpus unset)" : "", plan.node );
+		svc.start( plan.cpus, opt.cpu_expert_spin_us, plan.cpus2 );
+		if ( rank == 0 ) LOG_INFO( "[cpu-experts] %zu expert threads%s%s, host-side copies on node %d\n", plan.cpus.size() + plan.cpus2.size(),
+			opt.cpu_expert_cpus.empty() ? " (one per core, cpu_expert_cpus unset)" : "", plan.cpus2.empty() ? "" : ", a second pool on node 0", plan.node );
 	}
 	CpuExpertHandle h;
 	h.mb = svc.mailbox( rank, hidden, act_limit );

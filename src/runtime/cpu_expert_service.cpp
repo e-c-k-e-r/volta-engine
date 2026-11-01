@@ -29,6 +29,7 @@ Service& Service::get() {
 Service::~Service() {
 	stop_ = true;
 	if ( th_.joinable() ) th_.join();
+	if ( th2_.joinable() ) th2_.join();
 	for ( auto& m : maps_ ) munmap( m.first, m.second );
 	for ( auto& r : ranks_ ) if ( r && r->mb ) backend::host_free_pinned( r->mb );
 }
@@ -37,21 +38,35 @@ void Service::quiesce() {
 	if ( !started_ ) return;
 	stop_ = true;
 	if ( th_.joinable() ) th_.join();
+	if ( th2_.joinable() ) th2_.join();
 	std::lock_guard<std::mutex> l( mu_ );
 	for ( auto& r : ranks_ ) if ( r && r->mb ) backend::host_free_pinned( r->mb );
 	ranks_.clear();
 	for ( auto& m : maps_ ) munmap( m.first, m.second );
 	maps_.clear();
 	pool_.reset();
+	pool2_.reset();
 	stop_ = false;
 	started_ = false;
 	++ranks_version_;
 }
 
-void Service::start( const std::vector<int>& cpus, int spin_us ) {
+void Service::start( const std::vector<int>& cpus, int spin_us, const std::vector<int>& cpus2 ) {
 	std::lock_guard<std::mutex> l( mu_ );
 	if ( started_ ) return;
 	started_ = true;
+	spin_us_ = spin_us;
+	if ( !cpus2.empty() ) {
+		std::vector<int> rest2( cpus2.begin() + 1, cpus2.end() );
+		pool2_.reset( new kernels::cpu::Pool( static_cast<int>( cpus2.size() ), rest2, spin_us ) );
+		const int lead = cpus2[0];
+		th2_ = std::thread( [this, lead] {
+#if defined( __linux__ )
+			cpu_set_t cs; CPU_ZERO( &cs ); CPU_SET( lead, &cs ); pthread_setaffinity_np( pthread_self(), sizeof cs, &cs );
+#endif
+			loop2();
+		} );
+	}
 	const int n = cpus.empty() ? 4 : static_cast<int>( cpus.size() );
 	std::vector<int> rest;
 	for ( size_t i = 1; i < cpus.size(); ++i ) rest.push_back( cpus[i] );
@@ -65,7 +80,26 @@ void Service::start( const std::vector<int>& cpus, int spin_us ) {
 #endif
 		loop();
 	} );
-	LOG_INFO( "[cpu-experts] service started: %d threads%s\n", n, cpus.empty() ? "" : " pinned" );
+	if ( pool2_ ) LOG_INFO( "[cpu-experts] service started: %d + %d threads pinned (two pools)\n", n, static_cast<int>( cpus2.size() ) );
+	else LOG_INFO( "[cpu-experts] service started: %d threads%s\n", n, cpus.empty() ? "" : " pinned" );
+}
+
+// The second pool's leader: runs each batch the dispatcher posts (calls2_) on the second pool, spinning between batches like the pool's threads
+void Service::loop2() {
+	uint64_t seen = 0;
+	auto t_idle = std::chrono::steady_clock::now();
+	while ( !stop_.load( std::memory_order_relaxed ) ) {
+		const uint64_t p = post2_.load( std::memory_order_acquire );
+		if ( p == seen ) {
+			if ( std::chrono::duration_cast<std::chrono::microseconds>( std::chrono::steady_clock::now() - t_idle ).count() > spin_us_ ) std::this_thread::sleep_for( std::chrono::microseconds( 50 ) );
+			else __builtin_ia32_pause();
+			continue;
+		}
+		seen = p;
+		expert_forward_many( *pool2_, calls2_.data(), static_cast<int>( calls2_.size() ), scratch2_, act2_ );
+		done2_.store( p, std::memory_order_release );
+		t_idle = std::chrono::steady_clock::now();
+	}
 }
 
 Mailbox* Service::mailbox( int rank, int hidden, float act_limit ) {
@@ -217,7 +251,26 @@ void Service::handle( Rank& r ) {
 		Expert ex; ex.gate = g.o->gate.get(); ex.up = g.o->up.get(); ex.down = g.o->down.get();
 		calls_[gi] = ExpertCall{ ex, g.m, g.xg.data(), g.wts.data(), groups_[gi].tmp.data() };
 	}
-	if ( groups ) expert_forward_many( *pool_, calls_.data(), groups, scratch_, r.act_limit );
+	if ( groups >= 2 && pool2_ ) {
+		// two pools: the experts split by rows (the cost of a group), largest first onto the lighter side; the second half goes to the other node's
+		// leader, this thread runs the first on its own pool at the same time
+		std::vector<int> idx( groups );
+		for ( int i = 0; i < groups; ++i ) idx[i] = i;
+		std::stable_sort( idx.begin(), idx.end(), [&]( int a, int b ) { return groups_[a].m > groups_[b].m; } );
+		std::vector<ExpertCall> a;
+		calls2_.clear();
+		int wa = 0, wb = 0;
+		for ( int i : idx ) {
+			if ( wa <= wb ) { a.push_back( calls_[i] ); wa += groups_[i].m; }
+			else { calls2_.push_back( calls_[i] ); wb += groups_[i].m; }
+		}
+		act2_ = r.act_limit;
+		const uint64_t ticket = post2_.load( std::memory_order_relaxed ) + 1;
+		post2_.store( ticket, std::memory_order_release );
+		expert_forward_many( *pool_, a.data(), static_cast<int>( a.size() ), scratch_, r.act_limit );
+		while ( done2_.load( std::memory_order_acquire ) != ticket ) __builtin_ia32_pause();
+	}
+	else if ( groups ) expert_forward_many( *pool_, calls_.data(), groups, scratch_, r.act_limit );
 	for ( int gi = 0; gi < groups; ++gi ) {
 		const Group& g = groups_[gi];
 		for ( int k = 0; k < g.m; ++k ) {

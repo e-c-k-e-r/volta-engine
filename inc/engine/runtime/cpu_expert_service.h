@@ -18,8 +18,10 @@ namespace engine::cpu_moe {
 class Service {
 public:
 	static Service& get();
-	// Starts the pool once: one thread per entry of `cpus`, thread i pinned to cpus[i] (empty: 4 unpinned threads); later calls are ignored
-	void start( const std::vector<int>& cpus, int spin_us = 2000 );
+	// Starts the pool once: one thread per entry of `cpus`, thread i pinned to cpus[i] (empty: 4 unpinned threads); later calls are ignored.
+	// cpus2 (another NUMA node's cores): a second pool, led by a thread pinned to cpus2[0]; a request's experts are then split between the two
+	// pools and evaluated at the same time (two sockets add up where one pool spanning both does not: nothing is shared across them meanwhile)
+	void start( const std::vector<int>& cpus, int spin_us = 2000, const std::vector<int>& cpus2 = {} );
 	bool started() const { return started_; }
 	// The rank's mailbox (pinned, mapped host memory), created on first use
 	Mailbox* mailbox( int rank, int hidden, float act_limit );
@@ -63,8 +65,16 @@ private:
 	std::atomic<uint32_t> ranks_version_{ 0 };   // bumped when a rank's mailbox appears, so the dispatcher refreshes its list only then
 	struct Group { const Owned* o = nullptr; int first = 0, m = 0; std::vector<uint16_t> xg; std::vector<float> wts, tmp; };
 	std::vector<Group> groups_;       // the experts of the request being served
-	std::vector<ExpertCall> calls_;
+	std::vector<ExpertCall> calls_, calls2_;
 	Scratch scratch_;
+	// the second pool (start's cpus2) and its leader thread: post2_ > done2_ while a batch (calls2_, act2_) is out
+	std::unique_ptr<kernels::cpu::Pool> pool2_;
+	Scratch scratch2_;
+	std::thread th2_;
+	std::atomic<uint64_t> post2_{ 0 }, done2_{ 0 };
+	float act2_ = 10.0f;
+	int spin_us_ = 2000;
+	void loop2();
 	std::atomic<uint64_t> requests_{ 0 }, experts_{ 0 }, rows_{ 0 };
 	std::atomic<uint64_t> busy_ns_{ 0 };
 	struct Mark { uint64_t requests = 0, experts = 0, busy_ns = 0, wait_ns = 0, waits = 0; } last_;   // totals at the last log line
