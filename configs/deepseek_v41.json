@@ -1,5 +1,5 @@
 {
-	"model_dir": "/path/to/DeepSeek-V4.1-Flash-1017-exl31-1.68bpw",
+	"model_dir": "/path/to/DeepSeek-V4.1-Flash-1017-exl3-1.68bpw",
 	"draft_model_dir": "/path/to/DeepSeek-V4.1-Flash-1017-DSpark-EXL3-e3",
 	"use_speculation": true,
 	"tp_size": 4,
