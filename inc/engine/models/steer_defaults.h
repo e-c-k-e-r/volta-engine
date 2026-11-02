@@ -14,6 +14,7 @@ struct SteerDefaults {
 
 inline SteerDefaults steer_defaults( const std::string& model_type ) {
 	if ( model_type == "qwen4_exp" ) return { 0.60, 8.0, 1, 3, 2, 3 };   // Qwen3.8-Flash-Next, 2 bpw experts
+	if ( model_type == "glm5_next" ) return { 0.55, 3.0, 17, 32, 21, 32 };   // GLM-5.3-Flash, EXL3 3.05 bpw
 	return { 0.65, -8.0, 17, 32, 21, 32 };                                // Qwen3.8-27B, EXL3 4.0 bpw; also the fallback
 }
 
