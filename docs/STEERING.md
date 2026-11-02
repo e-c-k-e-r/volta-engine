@@ -74,6 +74,7 @@ The score is logged (`[steer] req N gate fired|clean score=... (threshold ..., m
 | `qwen3_5` (also the fallback) | 0.65 | -8 | 17/32 to 21/32 of the layers (34 to 42 of 64) | Qwen3.8-27B EXL3 4.0 bpw |
 | `qwen4_exp` | 0.60 | 8 | 1/3 to 2/3 (16 to 32 of 48) | Qwen3.8-Flash-Next, 2 bpw experts |
 | `glm5_next` | 0.55 | 3 | 17/32 to 21/32 (23 to 29 of 45) | GLM-5.3-Flash EXL3 3.05 bpw |
+| `deepseek_v41` | 0.78 | -24 | 17/32 to 21/32 (21 to 26 of 40) | DeepSeek-V4.1-Flash EXL3 1.68 bpw |
 
 
 ## Running the sweeps
@@ -194,6 +195,15 @@ Measured on GLM-5.3-Flash EXL3 3.05 bpw at four ranks (the `glm_256k` configurat
 * Defaults: threshold 0.55, strength 3, edit window 17/32 to 21/32 (23-29).
 * Clamp files do not carry over: a refusal axis built with `steer_build --clamp --answers` from 9 declined targets (the 8 declining and 5 accepting built-in openings each) and applied to every request, with no probe, frees few of the held-out declined targets and makes GLM decline prompts it otherwise answers. On 9 held-out declined targets, 28 answered targets and 46 controls, layers 18-32 or 23-29: margins K = 0 to 4 leave 0.56 to 0.89 of the declined targets refusing and take the answered ones from 0.00 to 0.14 to 0.32; K = -0.5 to -3 leave 0.56 to 0.78 refusing, take the answered ones to 0.25 to 0.79 and add repetition (up to 0.32). Use the probe on GLM.
 
+## DeepSeek-V4.1-Flash
+
+DeepSeek (`deepseek_v41`) keeps four fp32 residual streams per row; the entries act on their mean after each layer's FFN update, as on GLM. The DSpark drafter's forward is not steered. Its 40 layers give a default steered range of 13 to 27.
+
+Measured on DeepSeek-V4.1-Flash EXL3 1.68 bpw (exllamav3's release) at four ranks, one slot, 56 target and 56 control prompts, the gate left alone on the controls:
+* Gate: 29 of the 56 targets are declined unprobed (stock-opening rate 0.52). Those 29 score 0.83 to 1.09 and the controls 0.62 at most bar a few up to 0.75 (AUC 1.0). A threshold of 0.78 fires on all 29 declined targets and on no control (0.65 fires on 3 controls).
+* Edit strength and window (declined targets that fire: 29): the sign is negative, as on the 27B, and the text breaks easily. At strength -8 and threshold 0.65, 7 (layers 21-26) and 5 (13-26) still decline but 6 and 33 of the 37 fired answers fall into repeated words; at 8 almost every answer does. At threshold 0.78 on layers 21-26: strength -12 / -16 / -24 leave 8 / 8 / 9 declining, with 4 / 3 / 0 answers that repeat; on layers 23-26: 12 / 12 / 15 declining, none repeating. **Strength -24 on 21-26: 9 of 29 still decline, target stock-opening rate 0.16, repetition 0.01**; controls keep 0.94 of their leading words.
+* Defaults: threshold 0.78, strength -24, edit window 17/32 to 21/32 (21-26).
+
 ## Tests
 
 * `test_steer`: the kernels against an fp32 reference on a mixed batch (add and clamp, every scope, slots with and without edits, the penalty over a vocabulary slice); rows the scope does not cover and unlisted logits come back bit-identical.
@@ -202,7 +212,7 @@ Measured on GLM-5.3-Flash EXL3 3.05 bpw at four ranks (the `glm_256k` configurat
 
 ## Limits
 
-* The Qwen3.5 family, Flash-Next, GLM-5.3-Flash and DeepSeek-V4.1-Flash implement the hooks (GLM and DeepSeek edit the mean of their four residual streams after each layer's FFN update, as Flash-Next; DeepSeek's DSpark drafter is not steered). DeepSeek has no probe defaults of its own: it uses the 27B's until a sweep sets them.
+* The Qwen3.5 family, Flash-Next, GLM-5.3-Flash and DeepSeek-V4.1-Flash implement the hooks (GLM and DeepSeek edit the mean of their four residual streams after each layer's FFN update, as Flash-Next; DeepSeek's DSpark drafter is not steered). 
 * Speculation (DFlash2 drafter, MTP head) stays correct under steering, because the verify block runs the same steered forward as plain decode; the draft proposals are not steered by the edits of their own layers and do not apply the logit penalty. `tests/tools/steer_spec_bench.py` measures the cost on Qwen3.8-27B (8 questions, 200 tokens): the accepted share of drafted tokens is 0.358 (DFlash2) and 0.486 (MTP) without steering, 0.323 and 0.520 with the terse vector, 0.332 and 0.479 with the clamp forced, and with a penalty of 8 on common sentence starters inside the reasoning block 0.325 against 0.330 and 0.479 against 0.486. The steered text equals the unspeculated steered text on 7 of 8 prompts with either speculator (the eighth differs late in the answer, at the same place for both).
 * The probe prefills a probed prompt before the real prefill; it resumes from the deepest prefix the prefix cache holds (the cache only holds unedited prompts, which is what the probe reads), so a long prompt with a cached prefix costs the openings plus the uncached tail (2448 tokens, all but 7 cached: 3.6 s to 1.5 s). When the gate fires the real prefill runs again from scratch, because the edits change the prompt's KV and the cache is bypassed for it.
 * The probe's defaults are per model (`inc/engine/models/steer_defaults.h`) and were tuned on one checkpoint and bit width each: Qwen3.8-27B EXL3 4.0 bpw (the Evaluation paragraph above) Qwen3.8-Flash-Next with 2 bpw experts (the Flash-Next section) and GLM-5.3-Flash EXL3 3.05 bpw (the GLM-5.3-Flash section). A wider edit window or a stronger edit than the tuned one degrades unrelated text when the gate fires; other models, depths and quantization formats need their own sweep (see "Running the sweeps"). The openings are English and short; the second clamp degrades the text quickly.
