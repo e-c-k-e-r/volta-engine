@@ -928,6 +928,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 				}
 				tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_, layer_resident ) );
 				tier_layer = tier_layers_++;
+				lw.tier_layer = tier_layer;
 			}
 			for ( int e = 0; e < experts_per_rank; ++e ) {
 				int gid = start_expert + e;
@@ -1901,7 +1902,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 		// 4. MoE FFN
 		if ( phase & kPhaseRoute ) hessian( layer, 1, norm_hidden_.data, H, m, stream );
 		if ( lw.is_moe ) {
-			if ( ( phase & kPhaseExperts ) && tier_.active() && engine::modules::ExpertTier::stream_mode() ) tier_.stream_fill( layer - 3, stream );   // tier layers are the MoE layers from 3 on
+			if ( ( phase & kPhaseExperts ) && lw.tier_layer >= 0 && engine::modules::ExpertTier::stream_mode() ) tier_.stream_fill( lw.tier_layer, stream );
 			if ( phase & kPhaseRoute ) {
 				// Replicated Top-K Router: 288 experts, top-8 selection evaluated on all ranks
 				engine::modules::MoERouter::route_topk(
@@ -2015,20 +2016,21 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				// Routed experts in this rank's partition: device-resident dispatch, no host sync. A prefill chunk reads the layer's cold experts from device
 				// scratch, copied a layer ahead
 			if ( phase & kPhaseExperts ) {
-				const bool on_cpu = cpu_.usable( tier_, layer - 3, m );
+				const int tl = lw.tier_layer;
+				const bool on_cpu = tl >= 0 && cpu_.usable( tier_, tl, m );
 				if ( on_cpu ) {
 					engine::modules::CpuExperts::post( norm_hidden_.ptr<const backend::half_t>(), state_.d_topk_indices, state_.d_topk_weights, m, config_.top_k, H, start_expert, end_expert,
-						tier_.layers[layer - 3].cpu_owner_dev, cpu_.frac, lw.moe_weights.heat, cpu_.mb, cpu_.ctl, layer - 3, stream );
+						tier_.layers[tl].cpu_owner_dev, cpu_.frac, lw.moe_weights.heat, cpu_.mb, cpu_.ctl, tl, stream );
 				}
-				const bool staged = m > pod::MAX_BATCH && tier_.prefill_staging() && tier_.stage_begin( layer - 3, stream );
-				if ( staged && layer + 1 < config_.num_layers ) tier_.stage_prefetch( layer - 2, stream );
+				const bool staged = tl >= 0 && m > pod::MAX_BATCH && tier_.prefill_staging() && tier_.stage_begin( tl, stream );
+				if ( staged && layer + 1 < config_.num_layers ) tier_.stage_prefetch( layers_[layer + 1].tier_layer, stream );
 				engine::modules::MoE::forward(
 					norm_hidden_, lw.moe_weights,
 					state_.d_topk_indices, state_.d_topk_weights,
 					local_moe_out_, start_expert, end_expert,
 					state_.moe, 10.0f, stream
 				);
-				if ( staged ) tier_.stage_end( layer - 3, stream );
+				if ( staged ) tier_.stage_end( tl, stream );
 				if ( on_cpu ) engine::modules::CpuExperts::wait_add( local_moe_out_.ptr<backend::half_t>(), m, H, cpu_.mb, cpu_.ctl, stream );
 				if ( overlap ) backend::stream_join( stream, sh_stream );
 

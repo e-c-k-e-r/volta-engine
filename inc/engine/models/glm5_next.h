@@ -79,6 +79,7 @@ struct Glm5NextExpertWeights {
 
 struct Glm5NextLayerWeights {
 	bool is_moe = false;
+	int tier_layer = -1;   // this layer's index in the expert tier (-1: its experts are not in it)
 	bool is_linear_attn = false;
 	bool is_mla = false;
 	pod::TensorView input_norm;
