@@ -508,34 +508,37 @@ __global__ void moe_scatter_add_kernel( const half* __restrict__ y, const int64_
 	for ( int c = threadIdx.x; c < hidden; c += blockDim.x ) dst[c] = __float2half( __half2float( dst[c] ) + wj * __half2float( src[c] ) );
 }
 
-// a heavy expert's rows go through the FP16 path in pieces of at most this many (bounds the workspace of a long prefill window)
+// a heavy expert's rows go through the FP16 path in pieces of at most this many
 constexpr int kHeavyPiece = 1024;
 
-// The views of MoEScratch::heavy_ws
+// The views of MoEScratch::heavy_ws (the routes) and of the planes buffer (a piece of an expert's rows: the heavy experts run after the planes have
+// been summed into the output, so it is free by then)
 struct HeavyBufs {
 	int* idx;              // [routes] masked routes
 	int64_t* tok;          // [routes] the heavy experts' tokens, expert by expert
 	half* w;               // [routes] their routing weights
 	uint8_t* mask;         // [experts] heavy or not
-	half *xg, *yg, *yu, *ya, *yd;   // [kHeavyPiece, hidden | intermediate | intermediate | intermediate | hidden]
+	int piece;             // rows per piece: kHeavyPiece or what the planes hold
+	half *xg, *yg, *yu, *ya, *yd;   // [piece, hidden | intermediate | intermediate | intermediate | hidden]
 };
 size_t heavy_align( size_t v ) { return ( v + 255 ) & ~size_t( 255 ); }
-size_t heavy_bytes( int routes, int experts, int hidden, int inter ) {
-	return heavy_align( routes * sizeof( int ) ) + heavy_align( routes * sizeof( int64_t ) ) + heavy_align( routes * sizeof( half ) ) + heavy_align( experts ) +
-		static_cast<size_t>( kHeavyPiece ) * ( 2 * hidden + 3 * inter ) * sizeof( half );
+size_t heavy_bytes( int routes, int experts ) {
+	return heavy_align( routes * sizeof( int ) ) + heavy_align( routes * sizeof( int64_t ) ) + heavy_align( routes * sizeof( half ) ) + heavy_align( experts );
 }
-HeavyBufs heavy_bufs( void* ws, int routes, int experts, int hidden, int inter ) {
-	char* p = static_cast<char*>( ws );
+HeavyBufs heavy_bufs( const pod::MoEScratch& scratch, int experts, int hidden, int inter ) {
+	char* p = static_cast<char*>( scratch.heavy_ws );
+	const int routes = scratch.heavy_routes;
 	HeavyBufs b;
 	b.idx = reinterpret_cast<int*>( p ); p += heavy_align( routes * sizeof( int ) );
 	b.tok = reinterpret_cast<int64_t*>( p ); p += heavy_align( routes * sizeof( int64_t ) );
 	b.w = reinterpret_cast<half*>( p ); p += heavy_align( routes * sizeof( half ) );
-	b.mask = reinterpret_cast<uint8_t*>( p ); p += heavy_align( experts );
-	b.xg = reinterpret_cast<half*>( p );
-	b.yg = b.xg + static_cast<size_t>( kHeavyPiece ) * hidden;
-	b.yu = b.yg + static_cast<size_t>( kHeavyPiece ) * inter;
-	b.ya = b.yu + static_cast<size_t>( kHeavyPiece ) * inter;
-	b.yd = b.ya + static_cast<size_t>( kHeavyPiece ) * inter;
+	b.mask = reinterpret_cast<uint8_t*>( p );
+	b.piece = static_cast<int>( MIN( static_cast<size_t>( kHeavyPiece ), scratch.planes_bytes / ( static_cast<size_t>( 2 * hidden + 3 * inter ) * sizeof( half ) ) ) );
+	b.xg = scratch.planes;
+	b.yg = b.xg + static_cast<size_t>( b.piece ) * hidden;
+	b.yu = b.yg + static_cast<size_t>( b.piece ) * inter;
+	b.ya = b.yu + static_cast<size_t>( b.piece ) * inter;
+	b.yd = b.ya + static_cast<size_t>( b.piece ) * inter;
 	return b;
 }
 
@@ -807,7 +810,7 @@ pod::MoEScratch MoE::alloc_scratch(
 	const int heavy_min = runtime::options().moe_heavy_rows;
 	if ( !nvfp4 && heavy_min > 0 && max_rows >= heavy_min && hidden_size % 128 == 0 && intermediate_size % 128 == 0 ) {
 		s.heavy_routes = top_k * max_rows;
-		s.heavy_ws = engine::core::arena_alloc( arena, heavy_bytes( s.heavy_routes, num_local_experts, hidden_size, intermediate_size ) );
+		s.heavy_ws = engine::core::arena_alloc( arena, heavy_bytes( s.heavy_routes, num_local_experts ) );
 	}
 	if ( nvfp4 ) {
 		s.nv_h = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( MOE_NVFP4_ROWS ) * top_k * intermediate_size * sizeof( half ) ) );
@@ -964,8 +967,8 @@ void MoE::forward(
 			const int heavy_min = runtime::options().moe_heavy_rows;
 			const int H = x.shape[x.ndim - 1], Iw = weights.up[0].w2.shape[0];
 			const int routes = rows * weights.top_k;
-			const bool plan = scratch.heavy_ws != nullptr && heavy_min > 0 && rows >= heavy_min && routes <= scratch.heavy_routes;
-			const HeavyBufs hb = plan ? heavy_bufs( scratch.heavy_ws, scratch.heavy_routes, E, H, Iw ) : HeavyBufs{};
+			const HeavyBufs hb = scratch.heavy_ws != nullptr ? heavy_bufs( scratch, E, H, Iw ) : HeavyBufs{};
+			const bool plan = scratch.heavy_ws != nullptr && heavy_min > 0 && rows >= heavy_min && routes <= scratch.heavy_routes && hb.piece >= 64;
 			auto dispatch = [&]( const int* sel, uint32_t* heat ) {
 				MoERouter::exl3_moe_dispatch( sel, d_topk_weights, scratch.expert_count, scratch.token_sorted, scratch.weight_sorted, scratch.cursors, E,
 					start_expert, end_expert, scratch.active_experts, stream, rows, wide == 3 ? 32 : wide == 2 ? 16 : 4, heat, weights.top_k );
@@ -1049,8 +1052,8 @@ void MoE::forward(
 			}
 			// the heavy experts, in pieces of rows: rows gathered, gate / up / down dequantized and multiplied by cuBLAS, weighted rows added to out. The
 			// host-side LinearWeight of an expert points at its codes wherever the expert tier keeps them (a device slot, or pinned host memory read in place)
-			for ( const Heavy& h : heavy ) for ( int p = 0; p < h.count; p += kHeavyPiece ) {
-				const int c = MIN( h.count - p, kHeavyPiece ), off = h.off + p;
+			for ( const Heavy& h : heavy ) for ( int p = 0; p < h.count; p += hb.piece ) {
+				const int c = MIN( h.count - p, hb.piece ), off = h.off + p;
 				moe_gather_rows_kernel<<<c, 256, 0, stream>>>( x.ptr<const half>(), hb.tok + off, hb.xg, H );
 				pod::TensorView tx = pod::make_tensor_2d( hb.xg, pod::DType::FP16, c, H ), tg = pod::make_tensor_2d( hb.yg, pod::DType::FP16, c, Iw ),
 					tu = pod::make_tensor_2d( hb.yu, pod::DType::FP16, c, Iw ), ta = pod::make_tensor_2d( hb.ya, pod::DType::FP16, c, Iw ),

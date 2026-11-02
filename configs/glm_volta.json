@@ -17,6 +17,7 @@
 		"spec_depth": 0.25,
 		"spec_suffix": 8,
 		"prefill_window": 8,
+		"moe_heavy_rows": 256,
 		"nvfp4_dense_src": "/path/to/GLM-5.3-Flash-NVFP4",
 		"nvfp4_dense_dir": "/path/to/GLM-5.3-Flash-NVFP4-dense",
 		"nvfp4_dense": "kda,mla,idx,head,dense,shared"
