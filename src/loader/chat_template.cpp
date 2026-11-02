@@ -38,6 +38,19 @@ bool ChatTemplate::load( const char* template_path_or_model_dir ) {
 		cfg_path = dir + "tokenizer_config.json";
 	}
 
+	// DeepSeek-V4.1 ships its prompt format as code (encoding/encoding.py) instead of a template: the built-in port renders it, also when a
+	// conversion adds a chat_template.jinja of its own (an explicit .jinja path still wins)
+	if ( !cfg_path.empty() ) {
+		std::ifstream mc( cfg_path.substr( 0, cfg_path.size() - std::string( "tokenizer_config.json" ).size() ) + "config.json" );
+		if ( mc.is_open() ) {
+			const nlohmann::json mcfg = nlohmann::json::parse( mc, nullptr, false );
+			if ( !mcfg.is_discarded() && mcfg.value( "model_type", std::string() ) == "deepseek_v41" ) {
+				model_family_ = ModelFamily::DEEPSEEK;
+				return true;
+			}
+		}
+	}
+
 	std::ifstream jf( jinja_path );
 	if ( jf.is_open() ) {
 		std::stringstream buffer;
@@ -51,18 +64,6 @@ bool ChatTemplate::load( const char* template_path_or_model_dir ) {
 				if ( cfg["chat_template"].is_string() ) {
 					template_raw_ = cfg["chat_template"].get<std::string>();
 				}
-			}
-		}
-	}
-
-	// DeepSeek-V4.1 ships its prompt format as code (encoding/encoding.py) instead of a template: the built-in port renders
-	if ( template_raw_.empty() && !cfg_path.empty() ) {
-		std::ifstream mc( cfg_path.substr( 0, cfg_path.size() - std::string( "tokenizer_config.json" ).size() ) + "config.json" );
-		if ( mc.is_open() ) {
-			const nlohmann::json mcfg = nlohmann::json::parse( mc, nullptr, false );
-			if ( !mcfg.is_discarded() && mcfg.value( "model_type", std::string() ) == "deepseek_v41" ) {
-				model_family_ = ModelFamily::DEEPSEEK;
-				return true;
 			}
 		}
 	}
