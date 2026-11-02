@@ -1418,28 +1418,7 @@ void Glm5NextPipeline::forward_body( int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size;
 
 	// mHC: expand every row's embedding into its 4 residual streams
-	if ( static const double eps = runtime::options().perturb_embed; eps != 0.0 && m > pod::MAX_BATCH ) {
-		// Debug: rounding-scale noise on the embeddings, a function of (position, dim) only
-		std::vector<backend::half_t> e( static_cast<size_t>( m ) * H );
-		backend::stream_sync( stream );
-		backend::memcpy_async( e.data(), embed_rows_.ptr<const backend::half_t>(), e.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
-		backend::stream_sync( stream );
-		for ( int r = 0; r < m; ++r ) {
-			for ( int d = 0; d < H; ++d ) {
-				uint32_t h = static_cast<uint32_t>( key_hint_ - m + r ) * 2654435761u ^ static_cast<uint32_t>( d ) * 40503u;
-				h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
-				const float u = ( static_cast<float>( h & 0xffff ) / 32767.5f ) - 1.0f;
-				backend::half_t& v = e[static_cast<size_t>( r ) * H + d];
-				v = backend::from_float_half( backend::to_float( v ) * ( 1.0f + static_cast<float>( eps ) * u ) );
-			}
-		}
-		backend::memcpy_async( embed_rows_.ptr<backend::half_t>(), e.data(), e.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
-		backend::stream_sync( stream );
-	}
 	engine::modules::HyperConnection::init_streams( embed_rows_, hidden_streams_, H, stream, m );
-
-
-
 	for ( int layer = 0; layer < config_.num_layers; ++layer ) layer_body( layer, layers_[layer], m, stream );
 
 	forward_head( m, stream );
@@ -2010,11 +1989,10 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 						sh_i, lw.shared_expert.down, moe_expert_out_, sh_stream
 					);
 				}
-
 			}
 
-				// Routed experts in this rank's partition: device-resident dispatch, no host sync. A prefill chunk reads the layer's cold experts from device
-				// scratch, copied a layer ahead
+			// Routed experts in this rank's partition: device-resident dispatch, no host sync. A prefill chunk reads the layer's cold experts from device
+			// scratch, copied a layer ahead
 			if ( phase & kPhaseExperts ) {
 				const int tl = lw.tier_layer;
 				const bool on_cpu = tl >= 0 && cpu_.usable( tier_, tl, m );

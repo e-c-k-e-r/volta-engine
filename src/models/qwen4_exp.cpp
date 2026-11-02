@@ -784,25 +784,6 @@ void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
 	attn_tc_ = true;
 	for ( int r = 1; r < m; ++r ) attn_tc_ = attn_tc_ && rows.slot[r] == rows.slot[0];
-	if ( static const double eps = runtime::options().perturb_embed; eps != 0.0 && m > pod::MAX_BATCH ) {
-		// Debug: rounding-scale noise on the embeddings, a function of (position, dim) only (see the GLM pipeline)
-		const int H = config_.hidden_size;
-		std::vector<backend::half_t> e( static_cast<size_t>( m ) * H );
-		backend::stream_sync( stream );
-		backend::memcpy_async( e.data(), embed_rows_.ptr<const backend::half_t>(), e.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
-		backend::stream_sync( stream );
-		for ( int r = 0; r < m; ++r ) {
-			for ( int d = 0; d < H; ++d ) {
-				uint32_t h = static_cast<uint32_t>( rows.pos[r] ) * 2654435761u ^ static_cast<uint32_t>( d ) * 40503u;
-				h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
-				const float u = ( static_cast<float>( h & 0xffff ) / 32767.5f ) - 1.0f;
-				backend::half_t& v = e[static_cast<size_t>( r ) * H + d];
-				v = backend::from_float_half( backend::to_float( v ) * ( 1.0f + static_cast<float>( eps ) * u ) );
-			}
-		}
-		backend::memcpy_async( embed_rows_.ptr<backend::half_t>(), e.data(), e.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
-		backend::stream_sync( stream );
-	}
 	// Prefill rows decode the n-gram embeddings on the host while the GPU runs the layers before the PLE layer (forward_body); decode rows
 	// (replayed graph) have them ready up front
 	ple_rows_ = ( m > pod::MAX_BATCH ) ? &rows : nullptr;
@@ -1343,21 +1324,6 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 		const bool next_is_site = L + 1 < config_.num_layers && L + 1 != config_.ple_layer && !steered;
 		mlp_site( lw, L, m, stream, next_is_site ? layers_[L + 1].attn_hc.norm.ptr<const backend::half_t>() : nullptr );
 		if ( steered ) steer_layer( L, m, stream );
-		if ( static const double eps_l = runtime::options().perturb_layers; eps_l != 0.0 && m > pod::MAX_BATCH ) {
-			flush_apply( m, stream );
-			const size_t n = static_cast<size_t>( m ) * hc * H;
-			std::vector<float> st( n );
-			backend::stream_sync( stream );
-			backend::memcpy_async( st.data(), streams_.data, n * sizeof( float ), backend::Copy::D2H, stream );
-			backend::stream_sync( stream );
-			for ( size_t i = 0; i < n; ++i ) {
-				uint32_t h = static_cast<uint32_t>( i ) * 2654435761u ^ static_cast<uint32_t>( L + 1 ) * 40503u;
-				h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
-				st[i] *= 1.0f + static_cast<float>( eps_l ) * ( ( static_cast<float>( h & 0xffff ) / 32767.5f ) - 1.0f );
-			}
-			backend::memcpy_async( streams_.data, st.data(), n * sizeof( float ), backend::Copy::H2D, stream );
-			backend::stream_sync( stream );
-		}
 		// DFlash2 taps: the completed output of the layer (the gated add of its MLP site applied), mean of the streams, into the slot's ring
 		if ( snap_taps_ ) {
 			for ( int tap = 0; tap < 5; ++tap ) {
