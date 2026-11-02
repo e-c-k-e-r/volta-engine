@@ -558,15 +558,17 @@ bool SafeTensorsRepo::open( const char* dir_path ) {
 		}
 	}
 
-	// Tensors a checkpoint keeps outside its index (GLM-5.3 ships the DSA k-pool gate / APE in kpool_aux.safetensors)
-	{
+	// Tensors a checkpoint keeps outside its index: GLM-5.3 ships the DSA k-pool gate / APE in kpool_aux.safetensors, exllamav3's DeepSeek-V4.1
+	// conversions the Engram tables in ngram_embedding.safetensors
+	for ( const char* aux : { "kpool_aux.safetensors", "ngram_embedding.safetensors" } ) {
+		if ( std::find( shard_files.begin(), shard_files.end(), std::string( aux ) ) != shard_files.end() ) continue;
 		char aux_path[1024];
-		std::snprintf( aux_path, sizeof( aux_path ), "%s/kpool_aux.safetensors", dir_path );
+		std::snprintf( aux_path, sizeof( aux_path ), "%s/%s", dir_path, aux );
 		FILE* fa = ( num_shards_ < MAX_SHARDS ) ? std::fopen( aux_path, "rb" ) : nullptr;
 		if ( fa != nullptr ) {
 			std::fclose( fa );
 			if ( safetensors_open( shards_[num_shards_], aux_path ) ) {
-				std::strncpy( shard_names_[num_shards_], "kpool_aux.safetensors", sizeof( shard_names_[0] ) - 1 );
+				std::strncpy( shard_names_[num_shards_], aux, sizeof( shard_names_[0] ) - 1 );
 				const int s_idx = num_shards_++;
 				for ( int t = 0; t < shards_[s_idx].tensor_count; ++t ) {
 					tensor_map_[shards_[s_idx].tensors[t].name] = { s_idx, &shards_[s_idx].tensors[t] };
