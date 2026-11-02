@@ -55,6 +55,10 @@ struct MoEScratch {
 	float*   nv_partial = nullptr;     // [rows * top_k, hidden]
 	int*     nv_disp = nullptr;        // route grouping by expert (nvfp4_disp_ints)
 	int*     nv_ctr = nullptr;         // [hidden / 32], zero between calls
+	// Heavy experts of a prefill chunk (option moe_heavy_rows): masked routes, the heavy routes' tokens and weights, the expert mask, and one
+	// piece of an expert's rows (input, gate, up, activation, down); allocated when the option is on
+	void*    heavy_ws = nullptr;
+	int      heavy_routes = 0;         // routes the buffers hold (top_k * max_rows)
 };
 
 } // namespace pod

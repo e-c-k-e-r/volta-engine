@@ -7,7 +7,6 @@
 #include "engine/runtime/options.h"
 #include "exl3_moe_kernel.cuh"
 #include "exl3_moe_coop.cuh"
-#include "trellis_context.h"
 #include "engine/core/batch.h"
 #include <cuda_fp16.h>
 #include <cmath>
@@ -482,6 +481,64 @@ __global__ void moe_accumulate_kernel(
 	}
 }
 
+// ---- heavy experts of a prefill chunk (moe_heavy_rows): an expert routed by many rows runs as FP16 dequantization + cuBLAS ----
+
+// idx_out = the routes with the heavy experts' entries set to -1 (outside every expert range, so the dispatch skips them)
+__global__ void moe_mask_heavy_kernel( const int* __restrict__ sel, int* __restrict__ out, const uint8_t* __restrict__ heavy, int n, int first, int last ) {
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( i >= n ) return;
+	const int e = sel[i];
+	out[i] = ( e >= first && e < last && heavy[e - first] ) ? -1 : e;
+}
+
+// xg[j] = x[tok[j]] for an expert's rows
+__global__ void moe_gather_rows_kernel( const half* __restrict__ x, const int64_t* __restrict__ tok, half* __restrict__ xg, int hidden ) {
+	const int j = blockIdx.x;
+	const half* src = x + static_cast<size_t>( tok[j] ) * hidden;
+	half* dst = xg + static_cast<size_t>( j ) * hidden;
+	for ( int c = threadIdx.x; c < hidden; c += blockDim.x ) dst[c] = src[c];
+}
+
+// out[tok[j]] += w[j] * y[j]: one block per row; the rows of one expert are distinct tokens, so the adds of a launch do not collide
+__global__ void moe_scatter_add_kernel( const half* __restrict__ y, const int64_t* __restrict__ tok, const half* __restrict__ w, half* __restrict__ out, int hidden ) {
+	const int j = blockIdx.x;
+	const float wj = __half2float( w[j] );
+	half* dst = out + static_cast<size_t>( tok[j] ) * hidden;
+	const half* src = y + static_cast<size_t>( j ) * hidden;
+	for ( int c = threadIdx.x; c < hidden; c += blockDim.x ) dst[c] = __float2half( __half2float( dst[c] ) + wj * __half2float( src[c] ) );
+}
+
+// a heavy expert's rows go through the FP16 path in pieces of at most this many (bounds the workspace of a long prefill window)
+constexpr int kHeavyPiece = 1024;
+
+// The views of MoEScratch::heavy_ws
+struct HeavyBufs {
+	int* idx;              // [routes] masked routes
+	int64_t* tok;          // [routes] the heavy experts' tokens, expert by expert
+	half* w;               // [routes] their routing weights
+	uint8_t* mask;         // [experts] heavy or not
+	half *xg, *yg, *yu, *ya, *yd;   // [kHeavyPiece, hidden | intermediate | intermediate | intermediate | hidden]
+};
+size_t heavy_align( size_t v ) { return ( v + 255 ) & ~size_t( 255 ); }
+size_t heavy_bytes( int routes, int experts, int hidden, int inter ) {
+	return heavy_align( routes * sizeof( int ) ) + heavy_align( routes * sizeof( int64_t ) ) + heavy_align( routes * sizeof( half ) ) + heavy_align( experts ) +
+		static_cast<size_t>( kHeavyPiece ) * ( 2 * hidden + 3 * inter ) * sizeof( half );
+}
+HeavyBufs heavy_bufs( void* ws, int routes, int experts, int hidden, int inter ) {
+	char* p = static_cast<char*>( ws );
+	HeavyBufs b;
+	b.idx = reinterpret_cast<int*>( p ); p += heavy_align( routes * sizeof( int ) );
+	b.tok = reinterpret_cast<int64_t*>( p ); p += heavy_align( routes * sizeof( int64_t ) );
+	b.w = reinterpret_cast<half*>( p ); p += heavy_align( routes * sizeof( half ) );
+	b.mask = reinterpret_cast<uint8_t*>( p ); p += heavy_align( experts );
+	b.xg = reinterpret_cast<half*>( p );
+	b.yg = b.xg + static_cast<size_t>( kHeavyPiece ) * hidden;
+	b.yu = b.yg + static_cast<size_t>( kHeavyPiece ) * inter;
+	b.ya = b.yu + static_cast<size_t>( kHeavyPiece ) * inter;
+	b.yd = b.ya + static_cast<size_t>( kHeavyPiece ) * inter;
+	return b;
+}
+
 } // namespace
 
 void MoERouter::route_topk(
@@ -576,51 +633,6 @@ void MoERouter::accumulate(
 	accumulate( accum_out.ptr<half>(), expert_out.ptr<const half>(), weight, hidden_size, stream );
 }
 
-
-// ---- heavy experts of a prefill chunk (moe_heavy_rows): an expert routed by many rows runs as FP16 dequantization + cuBLAS ----
-
-// idx_out = the routes with the heavy experts' entries set to -1 (outside every expert range, so the dispatch skips them)
-__global__ void moe_mask_heavy_kernel( const int* __restrict__ sel, int* __restrict__ out, const uint8_t* __restrict__ heavy, int n, int first, int last ) {
-	const int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if ( i >= n ) return;
-	const int e = sel[i];
-	out[i] = ( e >= first && e < last && heavy[e - first] ) ? -1 : e;
-}
-
-// xg[j] = x[tok[j]] for an expert's rows
-__global__ void moe_gather_rows_kernel( const half* __restrict__ x, const int64_t* __restrict__ tok, half* __restrict__ xg, int hidden ) {
-	const int j = blockIdx.x;
-	const half* src = x + static_cast<size_t>( tok[j] ) * hidden;
-	half* dst = xg + static_cast<size_t>( j ) * hidden;
-	for ( int c = threadIdx.x; c < hidden; c += blockDim.x ) dst[c] = src[c];
-}
-
-// out[tok[j]] += w[j] * y[j]: one block per row; the rows of one expert are distinct tokens, so the adds of a launch do not collide
-__global__ void moe_scatter_add_kernel( const half* __restrict__ y, const int64_t* __restrict__ tok, const half* __restrict__ w, half* __restrict__ out, int hidden ) {
-	const int j = blockIdx.x;
-	const float wj = __half2float( w[j] );
-	half* dst = out + static_cast<size_t>( tok[j] ) * hidden;
-	const half* src = y + static_cast<size_t>( j ) * hidden;
-	for ( int c = threadIdx.x; c < hidden; c += blockDim.x ) dst[c] = __float2half( __half2float( dst[c] ) + wj * __half2float( src[c] ) );
-}
-
-// a heavy expert's rows go through the FP16 path in pieces of at most this many (bounds the workspaces of a long prefill window)
-constexpr int kHeavyPiece = 1024;
-
-// a per-device buffer that grows (cudaMalloc, outside the arena: sized by the largest prefill chunk seen)
-struct HeavyWs { void* p = nullptr; size_t bytes = 0; };
-void* heavy_ws( size_t bytes ) {
-	static HeavyWs ws[16];
-	int dev = 0;
-	CUDA_CHECK( cudaGetDevice( &dev ) );
-	HeavyWs& w = ws[dev];
-	if ( w.bytes < bytes ) {
-		if ( w.p ) { CUDA_CHECK( cudaDeviceSynchronize() ); CUDA_CHECK( cudaFree( w.p ) ); w.p = nullptr; w.bytes = 0; }
-		if ( cudaMalloc( &w.p, bytes ) != cudaSuccess ) { (void) cudaGetLastError(); w.p = nullptr; w.bytes = 0; return nullptr; }
-		w.bytes = bytes;
-	}
-	return w.p;
-}
 
 void MoERouter::exl3_moe_dispatch(
 	const int* selected_experts,
@@ -792,6 +804,11 @@ pod::MoEScratch MoE::alloc_scratch(
 		s.coop_ctr = static_cast<int*>( engine::core::arena_alloc( arena, ctr_bytes ) );
 		CUDA_CHECK( cudaMemset( s.coop_ctr, 0, ctr_bytes ) );
 	}
+	const int heavy_min = runtime::options().moe_heavy_rows;
+	if ( !nvfp4 && heavy_min > 0 && max_rows >= heavy_min && hidden_size % 128 == 0 && intermediate_size % 128 == 0 ) {
+		s.heavy_routes = top_k * max_rows;
+		s.heavy_ws = engine::core::arena_alloc( arena, heavy_bytes( s.heavy_routes, num_local_experts, hidden_size, intermediate_size ) );
+	}
 	if ( nvfp4 ) {
 		s.nv_h = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( MOE_NVFP4_ROWS ) * top_k * intermediate_size * sizeof( half ) ) );
 		s.nv_partial = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( MOE_NVFP4_ROWS ) * top_k * hidden_size * sizeof( float ) ) );
@@ -941,68 +958,44 @@ void MoE::forward(
 
 			const int wide = rows > 128 && runtime::options().moe_prefill_tile ? 3 : rows > 8 ? 2 : 0;
 			// moe_heavy_rows: the experts of this chunk routed by at least that many rows run as FP16 dequantization + cuBLAS after the
-			// quantized kernel has done the others (their routes are masked out of its dispatch)
+			// quantized kernel has done the others (their routes are masked out of a second dispatch); none heavy, the first dispatch stands
 			struct Heavy { int e, count, off; };
 			std::vector<Heavy> heavy;
 			const int heavy_min = runtime::options().moe_heavy_rows;
-			const int* sel = d_topk_indices;
-			int64_t* heavy_tok = nullptr;
-			half* heavy_w = nullptr;
-			if ( heavy_min > 0 && rows >= heavy_min ) {
-				MoERouter::exl3_moe_dispatch( d_topk_indices, d_topk_weights, scratch.expert_count, scratch.token_sorted, scratch.weight_sorted, scratch.cursors, E,
-					start_expert, end_expert, scratch.active_experts, stream, rows, wide == 3 ? 32 : wide == 2 ? 16 : 4, weights.heat, weights.top_k );
+			const int H = x.shape[x.ndim - 1], Iw = weights.up[0].w2.shape[0];
+			const int routes = rows * weights.top_k;
+			const bool plan = scratch.heavy_ws != nullptr && heavy_min > 0 && rows >= heavy_min && routes <= scratch.heavy_routes;
+			const HeavyBufs hb = plan ? heavy_bufs( scratch.heavy_ws, scratch.heavy_routes, E, H, Iw ) : HeavyBufs{};
+			auto dispatch = [&]( const int* sel, uint32_t* heat ) {
+				MoERouter::exl3_moe_dispatch( sel, d_topk_weights, scratch.expert_count, scratch.token_sorted, scratch.weight_sorted, scratch.cursors, E,
+					start_expert, end_expert, scratch.active_experts, stream, rows, wide == 3 ? 32 : wide == 2 ? 16 : 4, heat, weights.top_k );
+			};
+			dispatch( d_topk_indices, weights.heat );
+			if ( plan ) {
 				std::vector<int64_t> cnt( E );
 				std::vector<int> cur( E );
 				CUDA_CHECK( cudaMemcpyAsync( cnt.data(), scratch.expert_count, E * sizeof( int64_t ), cudaMemcpyDeviceToHost, stream ) );
 				CUDA_CHECK( cudaMemcpyAsync( cur.data(), scratch.cursors, E * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
 				CUDA_CHECK( cudaStreamSynchronize( stream ) );
-				int total = 0, maxc = 0;
 				std::vector<uint8_t> mask( E, 0 );
-				for ( int e = 0; e < E; ++e )
-					if ( cnt[e] >= heavy_min ) { heavy.push_back( { e, static_cast<int>( cnt[e] ), total } ); mask[e] = 1; total += static_cast<int>( cnt[e] ); maxc = MAX( maxc, static_cast<int>( cnt[e] ) ); }
-				maxc = MIN( maxc, kHeavyPiece );
+				int total = 0;
+				for ( int e = 0; e < E; ++e ) {
+					if ( cnt[e] < heavy_min ) continue;
+					heavy.push_back( { e, static_cast<int>( cnt[e] ), total } );
+					mask[e] = 1;
+					total += static_cast<int>( cnt[e] );
+				}
 				if ( !heavy.empty() ) {
-					const int H = x.shape[x.ndim - 1], Iw = weights.up[0].w2.shape[0];
-					const size_t n = static_cast<size_t>( rows ) * weights.top_k;
-					// workspace: masked routes, the heavy routes' tokens and weights, the mask, and one expert's rows at a time (x, gate, up, act, down)
-					const size_t b_idx = n * sizeof( int ), b_tok = total * sizeof( int64_t ), b_w = total * sizeof( half ), b_mask = E;
-					const size_t b_rows = static_cast<size_t>( maxc ) * ( 2 * H + 3 * Iw ) * sizeof( half );
-					auto al = []( size_t v ) { return ( v + 255 ) & ~size_t( 255 ); };
-					char* ws = static_cast<char*>( heavy_ws( al( b_idx ) + al( b_tok ) + al( b_w ) + al( b_mask ) + al( b_rows ) ) );
-					if ( !ws ) heavy.clear();   // no memory for it: the quantized kernel does every expert
-					else {
-						int* idx_m = reinterpret_cast<int*>( ws );
-						heavy_tok = reinterpret_cast<int64_t*>( ws + al( b_idx ) );
-						heavy_w = reinterpret_cast<half*>( ws + al( b_idx ) + al( b_tok ) );
-						uint8_t* d_mask = reinterpret_cast<uint8_t*>( ws + al( b_idx ) + al( b_tok ) + al( b_w ) );
-						for ( const Heavy& h : heavy ) {
-							CUDA_CHECK( cudaMemcpyAsync( heavy_tok + h.off, scratch.token_sorted + cur[h.e], h.count * sizeof( int64_t ), cudaMemcpyDeviceToDevice, stream ) );
-							CUDA_CHECK( cudaMemcpyAsync( heavy_w + h.off, scratch.weight_sorted + cur[h.e], h.count * sizeof( half ), cudaMemcpyDeviceToDevice, stream ) );
-						}
-						CUDA_CHECK( cudaMemcpyAsync( d_mask, mask.data(), E, cudaMemcpyHostToDevice, stream ) );
-						moe_mask_heavy_kernel<<<static_cast<unsigned>( ( n + 255 ) / 256 ), 256, 0, stream>>>( d_topk_indices, idx_m, d_mask, static_cast<int>( n ), start_expert, end_expert );
-						CUDA_CHECK( cudaStreamSynchronize( stream ) );   // mask (host vector) and the segment starts are read before this scope ends
-						sel = idx_m;
+					// the heavy experts' segments of the sorted routes, before the second dispatch reuses those buffers
+					for ( const Heavy& h : heavy ) {
+						CUDA_CHECK( cudaMemcpyAsync( hb.tok + h.off, scratch.token_sorted + cur[h.e], h.count * sizeof( int64_t ), cudaMemcpyDeviceToDevice, stream ) );
+						CUDA_CHECK( cudaMemcpyAsync( hb.w + h.off, scratch.weight_sorted + cur[h.e], h.count * sizeof( half ), cudaMemcpyDeviceToDevice, stream ) );
 					}
+					CUDA_CHECK( cudaMemcpyAsync( hb.mask, mask.data(), E, cudaMemcpyHostToDevice, stream ) );   // pageable: staged before the call returns
+					moe_mask_heavy_kernel<<<static_cast<unsigned>( ( routes + 255 ) / 256 ), 256, 0, stream>>>( d_topk_indices, hb.idx, hb.mask, routes, start_expert, end_expert );
+					dispatch( hb.idx, nullptr );   // the routes were counted by the first dispatch
 				}
 			}
-			MoERouter::exl3_moe_dispatch(
-				sel,
-				d_topk_weights,
-				scratch.expert_count,
-				scratch.token_sorted,
-				scratch.weight_sorted,
-				scratch.cursors,
-				E,
-				start_expert,
-				end_expert,
-				scratch.active_experts,
-				stream,
-				rows,
-				wide == 3 ? 32 : wide == 2 ? 16 : 4,
-				heavy_min > 0 && rows >= heavy_min ? nullptr : weights.heat,   // counted by the first dispatch already
-				weights.top_k
-			);
 
 			const void** d_ptrs = static_cast<const void**>( weights.staged_ptrs != nullptr ? weights.staged_ptrs : weights.device_ptrs );
 			const uint16_t** gate_trellis = reinterpret_cast<const uint16_t**>( d_ptrs + 0 * E );
@@ -1054,41 +1047,22 @@ void MoE::forward(
 						scratch.planes, out.ptr<half>(), static_cast<int>( plane_elems ), num_groups );
 				}
 			}
-			// the heavy experts, one at a time: rows gathered, gate / up / down dequantized and multiplied by cuBLAS, weighted rows added to out
-			if ( !heavy.empty() ) {
-				const int H = x.shape[x.ndim - 1], Iw = weights.up[0].w2.shape[0];
-				int maxc = 0;
-				for ( const Heavy& h : heavy ) maxc = MAX( maxc, MIN( h.count, kHeavyPiece ) );
-				// forward_recon's input workspace at its bound once (it keeps the buffers it outgrows)
-				int dev = 0;
-				CUDA_CHECK( cudaGetDevice( &dev ) );
-				trellis_get_workspace( dev, static_cast<size_t>( kHeavyPiece ) * MAX( H, Iw ) * sizeof( half ) );
-				auto al = []( size_t v ) { return ( v + 255 ) & ~size_t( 255 ); };
-				const size_t n = static_cast<size_t>( rows ) * weights.top_k;
-				size_t total = 0;
-				for ( const Heavy& h : heavy ) total += h.count;
-				char* rows_ws = static_cast<char*>( heavy_ws( 0 ) ) + al( n * sizeof( int ) ) + al( total * sizeof( int64_t ) ) + al( total * sizeof( half ) ) + al( E );
-				half* xg = reinterpret_cast<half*>( rows_ws );
-				half* yg = xg + static_cast<size_t>( maxc ) * H;
-				half* yu = yg + static_cast<size_t>( maxc ) * Iw;
-				half* ya = yu + static_cast<size_t>( maxc ) * Iw;
-				half* yd = ya + static_cast<size_t>( maxc ) * Iw;
-				for ( const Heavy& h : heavy ) for ( int p = 0; p < h.count; p += kHeavyPiece ) {
-					const int c = MIN( h.count - p, kHeavyPiece ), e = h.e, off = h.off + p;
-					moe_gather_rows_kernel<<<c, 256, 0, stream>>>( x.ptr<const half>(), heavy_tok + off, xg, H );
-					pod::TensorView tx = pod::make_tensor_2d( xg, pod::DType::FP16, c, H ), tg = pod::make_tensor_2d( yg, pod::DType::FP16, c, Iw ),
-						tu = pod::make_tensor_2d( yu, pod::DType::FP16, c, Iw ), ta = pod::make_tensor_2d( ya, pod::DType::FP16, c, Iw ),
-						td = pod::make_tensor_2d( yd, pod::DType::FP16, c, H );
-					const pod::LinearWeight& g = weights.gate[e];
-					const pod::LinearWeight& u = weights.up[e];
-					const pod::LinearWeight& d = weights.down[e];
-					// the host-side LinearWeight of the expert (kept current by the expert tier; the d_ptrs tables are device memory)
-					LinearTrellis::forward_recon( tx, g.w0, g.w1, g.w2, tg, g.bits, g.mcg, g.mul1, stream );
-					LinearTrellis::forward_recon( tx, u.w0, u.w1, u.w2, tu, u.bits, u.mcg, u.mul1, stream );
-					SwiGLU::forward( tg, tu, ta, stream, act_limit );
-					LinearTrellis::forward_recon( ta, d.w0, d.w1, d.w2, td, d.bits, d.mcg, d.mul1, stream );
-					moe_scatter_add_kernel<<<c, 256, 0, stream>>>( yd, heavy_tok + off, heavy_w + off, out.ptr<half>(), H );
-				}
+			// the heavy experts, in pieces of rows: rows gathered, gate / up / down dequantized and multiplied by cuBLAS, weighted rows added to out. The
+			// host-side LinearWeight of an expert points at its codes wherever the expert tier keeps them (a device slot, or pinned host memory read in place)
+			for ( const Heavy& h : heavy ) for ( int p = 0; p < h.count; p += kHeavyPiece ) {
+				const int c = MIN( h.count - p, kHeavyPiece ), off = h.off + p;
+				moe_gather_rows_kernel<<<c, 256, 0, stream>>>( x.ptr<const half>(), hb.tok + off, hb.xg, H );
+				pod::TensorView tx = pod::make_tensor_2d( hb.xg, pod::DType::FP16, c, H ), tg = pod::make_tensor_2d( hb.yg, pod::DType::FP16, c, Iw ),
+					tu = pod::make_tensor_2d( hb.yu, pod::DType::FP16, c, Iw ), ta = pod::make_tensor_2d( hb.ya, pod::DType::FP16, c, Iw ),
+					td = pod::make_tensor_2d( hb.yd, pod::DType::FP16, c, H );
+				const pod::LinearWeight& g = weights.gate[h.e];
+				const pod::LinearWeight& u = weights.up[h.e];
+				const pod::LinearWeight& d = weights.down[h.e];
+				LinearTrellis::forward_recon( tx, g.w0, g.w1, g.w2, tg, g.bits, g.mcg, g.mul1, stream );
+				LinearTrellis::forward_recon( tx, u.w0, u.w1, u.w2, tu, u.bits, u.mcg, u.mul1, stream );
+				SwiGLU::forward( tg, tu, ta, stream, act_limit );
+				LinearTrellis::forward_recon( ta, d.w0, d.w1, d.w2, td, d.bits, d.mcg, d.mul1, stream );
+				moe_scatter_add_kernel<<<c, 256, 0, stream>>>( hb.yd, hb.tok + off, hb.w + off, out.ptr<half>(), H );
 			}
 		} break;
 		default: {
