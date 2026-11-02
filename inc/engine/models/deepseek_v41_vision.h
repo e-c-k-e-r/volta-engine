@@ -25,7 +25,8 @@ struct DeepseekV41VisionConfig {
 // The DeepSeek-V4.1 image encoder (inference/vision.py): a patch projection, RMSNorm + SwiGLU ViT blocks over the whole image with a fused
 // qkv projection and 2-D rotary (half the rotated pairs by the row, half by the column), a final norm, then the aligner: downsample x downsample
 // patches (raster order, zero padded at the edges) are concatenated channel-major and projected through two linears with GELU between. The
-// weights are the checkpoint's BF16 vision.* / aligner.* tensors, kept as FP16. encode() returns the image's whole token span as the prompt
+// projections are the checkpoint's EXL3 groups where it has them (exllamav3's conversions: q / k / v, wo, gate / up / w2, the aligner), else its
+// BF16 tensors kept as FP16 (the fused wqkv and w1 split by rows). encode() returns the image's whole token span as the prompt
 // carries it: [start] ([image] * llm_w + [newline]) * llm_h [end], the three delimiters being learned embeddings.
 class DeepseekV41VisionTower : public VisionTower {
 public:
@@ -41,7 +42,9 @@ public:
 private:
 	struct Block {
 		pod::TensorView norm1_w, norm2_w;
-		pod::TensorView wqkv, qkv_b, wo, wo_b, w1, w2;
+		pod::LinearWeight q, k, v, wo, gate, up, down;
+		const backend::half_t *q_b = nullptr, *k_b = nullptr, *v_b = nullptr;
+		pod::TensorView wo_b;
 	};
 
 	bool loaded_ = false;
@@ -50,7 +53,8 @@ private:
 	int max_patches_ = 0, max_tokens_ = 0;
 	std::vector<Block> blocks_;
 	pod::TensorView patch_w_, patch_b_, norm_w_, zero_bias_;
-	pod::TensorView al_w1_, al_b1_, al_w2_, al_b2_;
+	pod::LinearWeight al_w1_, al_w2_;
+	pod::TensorView al_b1_, al_b2_;
 	std::vector<backend::half_t> start_, end_, newline_;   // host copies of the delimiter embeddings
 
 	backend::half_t* d_patches_ = nullptr;

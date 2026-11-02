@@ -1,6 +1,7 @@
 #include "engine/models/deepseek_v41_vision.h"
 #include "engine/modules/vision.h"
 #include "engine/modules/swiglu.h"
+#include "engine/modules/linear.h"
 #include "engine/loader/safetensors.h"
 #include "engine/backend/numeric.h"
 #include "engine/backend/runtime.h"
@@ -17,8 +18,31 @@ namespace engine::models {
 
 namespace {
 
-const backend::half_t* rows_of( const pod::TensorView& t, size_t first_row, size_t row_len ) {
-	return t.ptr<const backend::half_t>() + first_row * row_len;
+// The tower's projections: an EXL3 group (name.trellis ...) where the checkpoint has one, else rows [row0, row0 + n) of the dense tensor `dense`
+bool has_group( engine::loader::SafeTensorsRepo& repo, const std::string& name ) { return repo.find( ( name + ".trellis" ).c_str() ) != nullptr; }
+
+// Arena bytes of the tower's weights as load() takes them
+size_t tower_bytes( engine::loader::SafeTensorsRepo& repo, int depth ) {
+	auto pre = [&]( const std::string& s ) { return repo.bytes_with_prefix( s.c_str() ); };
+	auto group_or = [&]( const std::string& name, const std::string& dense ) { return has_group( repo, name ) ? pre( name + "." ) : pre( dense + "." ); };
+	size_t b = pre( "vision.patch_embed." ) + pre( "vision.norm." );
+	for ( int i = 0; i < depth; ++i ) {
+		const std::string p = "vision.blocks." + std::to_string( i ) + ".";
+		b += pre( p + "norm1." ) + pre( p + "norm2." );
+		b += has_group( repo, p + "attn.q_proj" ) ? pre( p + "attn.q_proj." ) + pre( p + "attn.k_proj." ) + pre( p + "attn.v_proj." )
+			: pre( p + "attn.wqkv." );
+		b += pre( p + "attn.wo." );
+		b += has_group( repo, p + "mlp.gate_proj" ) ? pre( p + "mlp.gate_proj." ) + pre( p + "mlp.up_proj." ) : pre( p + "mlp.w1." );
+		b += pre( p + "mlp.w2." );
+	}
+	return b + group_or( "aligner.w1", "aligner.w1" ) + group_or( "aligner.w2", "aligner.w2" );
+}
+
+// Output width of the aligner (the delimiter embeddings have it too)
+int aligner_out( engine::loader::SafeTensorsRepo& repo ) {
+	if ( const auto* m = repo.find( "aligner.w2.weight" ) ) return static_cast<int>( m->shape[0] );
+	if ( const auto* m = repo.find( "aligner.w2.trellis" ) ) return static_cast<int>( m->shape[1] ) * 16;
+	return 0;
 }
 
 } // namespace
@@ -30,12 +54,12 @@ size_t DeepseekV41VisionTower::arena_bytes( const char* model_dir, int max_image
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) return 0;
 	size_t bytes = 0;
-	if ( repo.find( "vision.patch_embed.proj.weight" ) && repo.find( "aligner.w2.weight" ) ) {
+	if ( repo.find( "vision.patch_embed.proj.weight" ) && aligner_out( repo ) > 0 ) {
 		const int tokens = std::min( max_image_tokens, vc.value( "max_image_tokens", max_image_tokens ) );
 		const int ds = vc.value( "downsample_ratio", 3 ), patch = vc.value( "patch_size", 14 );
-		const size_t M = static_cast<size_t>( tokens ) * ds * ds, H = vc.value( "hidden_size", 1024 ), I = vc.value( "intermediate_size", 2816 ), T = tokens, O = repo.find( "aligner.w2.weight" )->shape[0];
+		const size_t M = static_cast<size_t>( tokens ) * ds * ds, H = vc.value( "hidden_size", 1024 ), I = vc.value( "intermediate_size", 2816 ), T = tokens, O = aligner_out( repo );
 		const size_t scratch = M * ( 3 * patch * patch * 2 + 64 * 8 + H * 4 + H * 2 * 6 + I * 2 * 3 ) + T * ( H * 9 * 2 + O * 2 * 2 ) + ( 16u << 20 );
-		bytes = repo.bytes_with_prefix( "vision." ) + repo.bytes_with_prefix( "aligner." ) + 3 * O * 2 + scratch;
+		bytes = tower_bytes( repo, vc.value( "num_hidden_layers", 24 ) ) + 3 * O * 2 + scratch;
 	}
 	repo.close();
 	return bytes;
@@ -67,15 +91,15 @@ bool DeepseekV41VisionTower::load( const char* model_dir, pod::MemoryArena& aren
 
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) return false;
-	if ( !repo.find( "vision.patch_embed.proj.weight" ) || !repo.find( "aligner.w1.weight" ) ) {
+	if ( !repo.find( "vision.patch_embed.proj.weight" ) || aligner_out( repo ) == 0 ) {
 		LOG_WARN( "[vision] checkpoint has no vision tower; image input disabled\n" );
 		repo.close();
 		return false;
 	}
-	cfg_.out_hidden = repo.find( "aligner.w2.weight" )->shape[0];
+	cfg_.out_hidden = aligner_out( repo );
 	const size_t M = static_cast<size_t>( max_patches_ ), H = cfg_.hidden, T = static_cast<size_t>( max_tokens_ ), O = cfg_.out_hidden, I = cfg_.intermediate;
 	const size_t scratch = M * ( cfg_.patch_dim() * 2 + 64 * 8 + H * 4 + H * 2 * 6 + I * 2 * 3 ) + T * ( H * 9 * 2 + O * 2 * 2 ) + ( 16u << 20 );
-	const size_t weights = repo.bytes_with_prefix( "vision." ) + repo.bytes_with_prefix( "aligner." ) + 3 * O * 2;
+	const size_t weights = tower_bytes( repo, cfg_.depth ) + 3 * O * 2;
 	if ( !vision_fits( arena, weights + scratch, "the DeepSeek vision tower" ) ) {
 		repo.close();
 		return false;
@@ -86,6 +110,16 @@ bool DeepseekV41VisionTower::load( const char* model_dir, pod::MemoryArena& aren
 		ENGINE_ASSERT( t.data != nullptr, "vision: missing tensor" );
 		return t;
 	};
+	// A projection: the EXL3 group `name`, else rows [row0, row0 + n) of the dense [*, k] tensor `dense` as an FP16 weight
+	auto proj = [&]( const std::string& name, const std::string& dense, int row0, int n, int k ) -> pod::LinearWeight {
+		if ( has_group( repo, name ) ) {
+			pod::LinearWeight w = repo.load_linear( name.c_str(), arena, 4, stream );
+			ENGINE_ASSERT( w.is_valid(), "vision: missing projection" );
+			return w;
+		}
+		pod::TensorView t = fp16( dense + ".weight" );
+		return pod::LinearWeight::make_fp16( pod::make_tensor_2d( t.ptr<backend::half_t>() + static_cast<size_t>( row0 ) * k, pod::DType::FP16, k, n ) );   // Linear takes k from shape[0]
+	};
 	patch_w_ = fp16( "vision.patch_embed.proj.weight" );   // [hidden, 3 * 14 * 14]
 	patch_b_ = fp16( "vision.patch_embed.proj.bias" );
 	norm_w_ = fp16( "vision.norm.weight" );
@@ -95,16 +129,36 @@ bool DeepseekV41VisionTower::load( const char* model_dir, pod::MemoryArena& aren
 		Block& b = blocks_[i];
 		b.norm1_w = fp16( p + "norm1.weight" );
 		b.norm2_w = fp16( p + "norm2.weight" );
-		b.wqkv = fp16( p + "attn.wqkv.weight" );
-		b.qkv_b = fp16( p + "attn.wqkv.bias" );
-		b.wo = fp16( p + "attn.wo.weight" );
+		const int Hb = cfg_.hidden, Ib = cfg_.intermediate;
+		if ( has_group( repo, p + "attn.q_proj" ) ) {
+			b.q = proj( p + "attn.q_proj", "", 0, Hb, Hb );
+			b.k = proj( p + "attn.k_proj", "", 0, Hb, Hb );
+			b.v = proj( p + "attn.v_proj", "", 0, Hb, Hb );
+			b.q_b = fp16( p + "attn.q_proj.bias" ).ptr<const backend::half_t>();
+			b.k_b = fp16( p + "attn.k_proj.bias" ).ptr<const backend::half_t>();
+			b.v_b = fp16( p + "attn.v_proj.bias" ).ptr<const backend::half_t>();
+		}
+		else {
+			// the fused [3 * hidden, hidden] wqkv: q rows, k rows, v rows
+			b.q = proj( "", p + "attn.wqkv", 0, Hb, Hb );
+			b.k = proj( "", p + "attn.wqkv", Hb, Hb, Hb );
+			b.v = proj( "", p + "attn.wqkv", 2 * Hb, Hb, Hb );
+			const backend::half_t* qkv_b = fp16( p + "attn.wqkv.bias" ).ptr<const backend::half_t>();
+			b.q_b = qkv_b;
+			b.k_b = qkv_b + Hb;
+			b.v_b = qkv_b + 2 * Hb;
+		}
+		b.wo = proj( p + "attn.wo", p + "attn.wo", 0, Hb, Hb );
 		b.wo_b = fp16( p + "attn.wo.bias" );
-		b.w1 = fp16( p + "mlp.w1.weight" );   // [2 * intermediate, hidden]: gate rows, then up rows
-		b.w2 = fp16( p + "mlp.w2.weight" );
+		// [2 * intermediate, hidden] w1: gate rows, then up rows
+		b.gate = proj( p + "mlp.gate_proj", p + "mlp.w1", 0, Ib, Hb );
+		b.up = proj( p + "mlp.up_proj", p + "mlp.w1", Ib, Ib, Hb );
+		b.down = proj( p + "mlp.w2", p + "mlp.w2", 0, Hb, Ib );
 	}
-	al_w1_ = fp16( "aligner.w1.weight" );
+	const int R = cfg_.downsample;
+	al_w1_ = proj( "aligner.w1", "aligner.w1", 0, static_cast<int>( O ), static_cast<int>( H ) * R * R );
 	al_b1_ = fp16( "aligner.w1.bias" );
-	al_w2_ = fp16( "aligner.w2.weight" );
+	al_w2_ = proj( "aligner.w2", "aligner.w2", 0, static_cast<int>( O ), static_cast<int>( O ) );
 	al_b2_ = fp16( "aligner.w2.bias" );
 	{
 		pod::TensorView z = pod::make_tensor_2d( engine::core::arena_alloc( arena, H * sizeof( backend::half_t ) ), pod::DType::FP16, 1, static_cast<int>( H ) );
@@ -177,26 +231,31 @@ bool DeepseekV41VisionTower::encode( const engine::loader::PreparedImage& img, s
 	backend::stream_sync( stream );   // the staging vectors die at return
 
 	using engine::modules::Vision;
+	// out [rows, n] = x [rows, k] times a projection
+	auto lin = [&]( const backend::half_t* x, const pod::LinearWeight& w, backend::half_t* out, int rows, int k, int n ) {
+		const pod::TensorView xv = pod::make_tensor_2d( const_cast<backend::half_t*>( x ), pod::DType::FP16, rows, k );
+		pod::TensorView ov = pod::make_tensor_2d( out, pod::DType::FP16, rows, n );
+		engine::modules::Linear::forward( xv, w, ov, stream );
+	};
 	Vision::f32_to_f16( reinterpret_cast<const float*>( d_mlp_ ), d_patches_, patch_floats, stream );
 	Vision::patch_embed( d_patches_, patch_w_.ptr<const backend::half_t>(), patch_b_.ptr<const backend::half_t>(), nullptr, d_hidden_, m, H, P, stream );
 	const float scale = 1.0f / std::sqrt( static_cast<float>( hd ) );
 	for ( const Block& b : blocks_ ) {
 		Vision::rms_norm( d_hidden_, b.norm1_w.ptr<const backend::half_t>(), d_ln_, m, H, cfg_.eps, stream );
-		Vision::dense_gemm( d_ln_, rows_of( b.wqkv, 0, H ), d_q_, m, H, H, stream );
-		Vision::dense_gemm( d_ln_, rows_of( b.wqkv, H, H ), d_k_, m, H, H, stream );
-		Vision::dense_gemm( d_ln_, rows_of( b.wqkv, 2 * H, H ), d_v_, m, H, H, stream );
-		const backend::half_t* bias = b.qkv_b.ptr<const backend::half_t>();
-		Vision::qkv_bias_rope( d_q_, d_k_, d_v_, bias, bias + H, bias + 2 * H, d_cos_, d_sin_, m, cfg_.heads, hd, stream );
+		lin( d_ln_, b.q, d_q_, m, H, H );
+		lin( d_ln_, b.k, d_k_, m, H, H );
+		lin( d_ln_, b.v, d_v_, m, H, H );
+		Vision::qkv_bias_rope( d_q_, d_k_, d_v_, b.q_b, b.k_b, b.v_b, d_cos_, d_sin_, m, cfg_.heads, hd, stream );
 		Vision::attention( d_q_, d_k_, d_v_, d_attn_, m, cfg_.heads, hd, scale, stream );
-		Vision::dense_gemm( d_attn_, b.wo.ptr<const backend::half_t>(), d_tmp_, m, H, H, stream );
+		lin( d_attn_, b.wo, d_tmp_, m, H, H );
 		Vision::bias_residual( d_hidden_, d_tmp_, b.wo_b.ptr<const backend::half_t>(), m, H, stream );
 
 		Vision::rms_norm( d_hidden_, b.norm2_w.ptr<const backend::half_t>(), d_ln_, m, H, cfg_.eps, stream );
-		Vision::dense_gemm( d_ln_, rows_of( b.w1, 0, H ), d_gate_, m, I, H, stream );
-		Vision::dense_gemm( d_ln_, rows_of( b.w1, I, H ), d_up_, m, I, H, stream );
+		lin( d_ln_, b.gate, d_gate_, m, H, I );
+		lin( d_ln_, b.up, d_up_, m, H, I );
 		pod::TensorView gate = view2d( d_gate_, m, I ), up = view2d( d_up_, m, I ), mlp = view2d( d_mlp_, m, I );
 		engine::modules::SwiGLU::forward( gate, up, mlp, stream, 0.0f );
-		Vision::dense_gemm( d_mlp_, b.w2.ptr<const backend::half_t>(), d_tmp_, m, H, I, stream );
+		lin( d_mlp_, b.down, d_tmp_, m, I, H );
 		Vision::bias_residual( d_hidden_, d_tmp_, zero_bias_.ptr<const backend::half_t>(), m, H, stream );
 	}
 	Vision::rms_norm( d_hidden_, norm_w_.ptr<const backend::half_t>(), d_ln_, m, H, cfg_.eps, stream );
@@ -220,9 +279,9 @@ bool DeepseekV41VisionTower::encode( const engine::loader::PreparedImage& img, s
 		}
 	}
 	backend::memcpy_async( d_gathered_, cat.data(), cat.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
-	Vision::dense_gemm( d_gathered_, al_w1_.ptr<const backend::half_t>(), d_al1_, tokens, O, H * R * R, stream );
+	lin( d_gathered_, al_w1_, d_al1_, tokens, H * R * R, O );
 	Vision::bias_act( d_al1_, al_b1_.ptr<const backend::half_t>(), tokens, O, Vision::ACT_GELU_ERF, stream );
-	Vision::dense_gemm( d_al1_, al_w2_.ptr<const backend::half_t>(), d_out_, tokens, O, O, stream );
+	lin( d_al1_, al_w2_, d_out_, tokens, O, O );
 	Vision::bias_act( d_out_, al_b2_.ptr<const backend::half_t>(), tokens, O, Vision::ACT_NONE, stream );
 	std::vector<backend::half_t> rows( static_cast<size_t>( tokens ) * O );
 	backend::stream_sync( stream );   // the unfold staging is consumed
