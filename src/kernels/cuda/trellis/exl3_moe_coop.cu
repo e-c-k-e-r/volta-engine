@@ -235,8 +235,8 @@ __device__ __forceinline__ void gemv_tile(
 	float* __restrict__ sh_red          // [WKK][ROWS][TCOLS]
 ) {
 	constexpr int WN = WN_;
-	constexpr bool HALF = BITS_ > 8;             // the half-integer rates 2.5 and 3.5 (width codes 10 and 11, mul1 only)
-	static_assert( !HALF || ( BITS_ == 10 || BITS_ == 11 ), "the fused MoE tile covers the half-integer rates 2.5 and 3.5" );
+	constexpr bool HALF = BITS_ > 8;             // the half-integer rates 1.5, 2.5 and 3.5 (width codes 9 to 11, mul1 only)
+	static_assert( !HALF || ( BITS_ >= 9 && BITS_ <= 11 ), "the fused MoE tile covers the half-integer rates 1.5, 2.5 and 3.5" );
 	constexpr int TW = engine::modules::trellis_tile_u32( BITS_ );   // uint32 per 16x16 tile
 	constexpr int GW = WNT * TW;                 // uint32 per warp per k-slice
 	constexpr int WKK = tile_wk<WN_>();
@@ -906,6 +906,7 @@ __device__ __forceinline__ void gemv_tile_dyn(
 		case 1: gemv_tile<1, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
 		case 2: gemv_tile<2, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
 		case 3: gemv_tile<3, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
+		case 9: gemv_tile<9, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
 		case 10: gemv_tile<10, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
 		case 11: gemv_tile<11, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
 		default: gemv_tile<4, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
@@ -1147,8 +1148,8 @@ static void coop_smem_optin( void* fn ) {
 	CUDA_CHECK( cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( 96 * 1024 - a.sharedSizeBytes ) ) );
 }
 
-// 1 to 4 bpw and the half-integer rates 2.5 and 3.5 (width codes 10 and 11)
-static bool coop_bits_ok( int b ) { return ( b >= 1 && b <= 4 ) || b == 10 || b == 11; }
+// 1 to 4 bpw and the half-integer rates 1.5, 2.5 and 3.5 (width codes 9 to 11)
+static bool coop_bits_ok( int b ) { return ( b >= 1 && b <= 4 ) || ( b >= 9 && b <= 11 ); }
 
 void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t stream ) {
 	using namespace exl3_moe_coop_ns;
@@ -1246,15 +1247,20 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 		CUDA_CHECK( cudaGetLastError() );
 		return;
 	}
-	if ( p.bits == 10 || p.bits == 11 ) {
-		static bool half_attr[ENGINE_NUM_GPUS][2] = {};
-		bool& done = half_attr[device >= 0 && device < ENGINE_NUM_GPUS ? device : 0][p.bits - 10];
+	if ( p.bits >= 9 && p.bits <= 11 ) {
+		static bool half_attr[ENGINE_NUM_GPUS][3] = {};
+		bool& done = half_attr[device >= 0 && device < ENGINE_NUM_GPUS ? device : 0][p.bits - 9];
 		if ( !done ) {
-			if ( p.bits == 10 ) { coop_smem_optin( (void*) a_kernel<10, 2, WN, 0> ); coop_smem_optin( (void*) b_kernel<10, 2, WN, 0> ); }
+			if ( p.bits == 9 ) { coop_smem_optin( (void*) a_kernel<9, 2, WN, 0> ); coop_smem_optin( (void*) b_kernel<9, 2, WN, 0> ); }
+			else if ( p.bits == 10 ) { coop_smem_optin( (void*) a_kernel<10, 2, WN, 0> ); coop_smem_optin( (void*) b_kernel<10, 2, WN, 0> ); }
 			else { coop_smem_optin( (void*) a_kernel<11, 2, WN, 0> ); coop_smem_optin( (void*) b_kernel<11, 2, WN, 0> ); }
 			done = true;
 		}
-		if ( p.bits == 10 ) {
+		if ( p.bits == 9 ) {
+			a_kernel<9, 2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+			b_kernel<9, 2, WN, 0><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+		}
+		else if ( p.bits == 10 ) {
 			a_kernel<10, 2, WN, 0><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
 			b_kernel<10, 2, WN, 0><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
 		}

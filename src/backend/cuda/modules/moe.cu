@@ -826,7 +826,7 @@ bool MoE::fused_decode( const pod::MoELayerWeights& weights, const pod::MoEScrat
 #if defined(USE_ROCM)
 	const bool bits_ok = ebits >= 1 && ebits <= 8;   // the ROCm launch (exl3_moe.cu) takes any width
 #else
-	auto bok = []( int b ) { return ( b >= 1 && b <= 4 ) || b == 10 || b == 11; };   // 10 and 11: the half-integer rates 2.5 and 3.5
+	auto bok = []( int b ) { return ( b >= 1 && b <= 4 ) || ( b >= 9 && b <= 11 ); };   // 9 to 11: the half-integer rates 1.5 to 3.5
 	const bool bits_ok = weights.bits_dev ? bok( weights.bits_max ) : ( bok( ebits ) && bok( weights.up[0].bits ) && bok( weights.down[0].bits ) );
 #endif
 #if defined(USE_ROCM)
@@ -953,8 +953,8 @@ void MoE::forward(
 			const int K_up = weights.bits_dev ? weights.bits_max : weights.up[0].bits;
 			const int K_down = weights.bits_dev ? weights.bits_max : weights.down[0].bits;
 			ENGINE_ASSERT( weights.device_ptrs != nullptr, "MoE::forward: init_device_ptrs not called" );
-			auto kok = []( int b ) { return ( b >= 1 && b <= 5 ) || b == 10 || b == 11; };
-			ENGINE_ASSERT( kok( K_gate ) && kok( K_up ) && kok( K_down ), "MoE::forward: persistent trellis MoE kernel is instantiated for 1 to 5-bit experts and 2.5 / 3.5 bpw" );
+			auto kok = []( int b ) { return ( b >= 1 && b <= 5 ) || ( b >= 9 && b <= 11 ); };
+			ENGINE_ASSERT( kok( K_gate ) && kok( K_up ) && kok( K_down ), "MoE::forward: persistent trellis MoE kernel is instantiated for 1 to 5-bit experts and 1.5 / 2.5 / 3.5 bpw" );
 
 			const int wide = rows > 128 && runtime::options().moe_prefill_tile ? 3 : rows > 8 ? 2 : 0;
 			// moe_heavy_rows: the experts of this chunk routed by at least that many rows run as FP16 dequantization + cuBLAS after the
@@ -1085,13 +1085,14 @@ static void* moe_kernel_fn( int variant, int mode ) {
 		case 5: return mode == 3 ? (void*) exl3_moe_kernel<1, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<1, 128, 2, 2> : (void*) exl3_moe_kernel<1, 128, 2, 0>;
 		case 8: return mode == 3 ? (void*) exl3_moe_kernel<10, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<10, 128, 2, 2> : (void*) exl3_moe_kernel<10, 128, 2, 0>;
 		case 9: return mode == 3 ? (void*) exl3_moe_kernel<11, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<11, 128, 2, 2> : (void*) exl3_moe_kernel<11, 128, 2, 0>;
+		case 10: return mode == 3 ? (void*) exl3_moe_kernel<9, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<9, 128, 2, 2> : (void*) exl3_moe_kernel<9, 128, 2, 0>;
 		case 7: return mode == 3 ? (void*) exl3_moe_kernel<MOE_BITS_HALF_DYN, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<MOE_BITS_HALF_DYN, 128, 2, 2> : (void*) exl3_moe_kernel<MOE_BITS_HALF_DYN, 128, 2, 0>;
 		case 6: return mode == 3 ? (void*) exl3_moe_kernel<0, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<0, 128, 2, 2> : (void*) exl3_moe_kernel<0, 128, 2, 0>;
 		default: return mode == 3 ? (void*) exl3_moe_kernel<4, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<4, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 0>;
 	}
 }
 
-static bool attr_done[ENGINE_NUM_GPUS][10] = {};
+static bool attr_done[ENGINE_NUM_GPUS][11] = {};
 
 void exl3_moe_reset_caches() {
 	for ( auto& d : attr_done ) for ( bool& b : d ) b = false;
@@ -1189,7 +1190,7 @@ void exl3_moe(
 
 	// 3-bit experts with a 256-divisible intermediate width (GLM) run 256-wide output tiles; every other shape (4-bit experts, and
 	// 3-bit ones with Flash-Next's intermediate 640) takes the 128-wide tiles
-	auto kok = []( int b ) { return ( b >= 1 && b <= 5 ) || b == 10 || b == 11; };
+	auto kok = []( int b ) { return ( b >= 1 && b <= 5 ) || ( b >= 9 && b <= 11 ); };
 	ENGINE_ASSERT( kok( K_gate ) && kok( K_up ) && kok( K_down ), "exl3_moe: expert bits" );
 	const bool mixed = bits_tab != nullptr || K_gate != K_up || K_up != K_down;   // the projections of the experts differ in width: one kernel that picks each GEMM's instantiation at run time
 	// the widest tile of the three (width codes do not order by size: 11 is 3.5 bpw)
@@ -1197,7 +1198,7 @@ void exl3_moe(
 	for ( int kq : { K_up, K_down } ) if ( engine::modules::trellis_tile_u16( kq ) > engine::modules::trellis_tile_u16( K_max ) ) K_max = kq;
 	const bool tile128 = mixed || K_gate != 3 || intermediate_dim % 256 != 0;
 	ENGINE_ASSERT( intermediate_dim % ( tile128 ? 128 : 256 ) == 0, "exl3_moe: intermediate width vs the output tile" );
-	const int variant = mixed ? ( has_half ? 7 : 6 ) : K_gate == 10 ? 8 : K_gate == 11 ? 9 : K_gate == 5 ? 4 : K_gate == 4 ? 2 : K_gate == 2 ? 3 : K_gate == 1 ? 5 : ( tile128 ? 1 : 0 );   // 0: <3,256>, 1: <3,128>, 2: <4,128>, 3: <2,128>, 4: <5,128> (DeepSeek-V4.1's few 5-bit experts), 5: <1,128>
+	const int variant = mixed ? ( has_half ? 7 : 6 ) : K_gate == 9 ? 10 : K_gate == 10 ? 8 : K_gate == 11 ? 9 : K_gate == 5 ? 4 : K_gate == 4 ? 2 : K_gate == 2 ? 3 : K_gate == 1 ? 5 : ( tile128 ? 1 : 0 );   // 0: <3,256>, 1: <3,128>, 2: <4,128>, 3: <2,128>, 4: <5,128> (DeepSeek-V4.1's few 5-bit experts), 5: <1,128>
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_done[device][variant] ) {
 		void* fns[3] = { moe_kernel_fn( variant, 0 ), moe_kernel_fn( variant, 2 ), moe_kernel_fn( variant, 3 ) };
 		for ( void* fn : fns ) CUDA_CHECK( cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );

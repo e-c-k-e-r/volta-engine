@@ -18,7 +18,7 @@
 int main() {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	// MOE_FLASH=1: Flash-Next's experts (ENGINE_TEST_FLASH_DIR; MOE_BITS gives their bit width, 2 for Qwen3.8-Flash-Next-exl3) instead of GLM's
-	// MOE_DSV41=1: DeepSeek-V4.1-Flash's experts of bit width MOE_BITS (2 to 5; ENGINE_TEST_DSV41_DIR), from the layer that has the most of them
+	// MOE_DSV41=1: DeepSeek-V4.1-Flash's experts of width code MOE_BITS (1 to 5, 9 for 1.5 bpw; ENGINE_TEST_DSV41_DIR), from the layer that has the most of them
 	const bool flash = std::getenv( "MOE_FLASH" ) != nullptr;
 	const bool dsv41 = std::getenv( "MOE_DSV41" ) != nullptr;
 	const int EBITS = std::getenv( "MOE_BITS" ) ? std::atoi( std::getenv( "MOE_BITS" ) ) : 4;
@@ -56,7 +56,7 @@ int main() {
 				for ( int q = 0; q < 3; ++q ) {
 					std::snprintf( name, sizeof( name ), "layers.%d.ffn.experts.%d.%s.trellis", l, e, ws[q] );
 					const auto* m = repo.find( name );
-					ok = ok && m != nullptr && m->shape[2] / 16 == sig[q];
+					ok = ok && m != nullptr && engine::modules::trellis_code_from_u16( m->shape[2] ) == sig[q];
 				}
 				if ( ok && ids.size() < 96 ) ids.push_back( e );
 			}
