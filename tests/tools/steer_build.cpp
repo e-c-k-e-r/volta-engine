@@ -1,7 +1,7 @@
 // Builds a control-vector file (.steer) from two sets of prompts: the mean difference of the model's last-token residual states
 // (after each steered layer) between the positive and the negative set, one add entry per layer. The entry's direction is the unit
 // difference and its strength the length of the difference divided by the number of layers, so the layers together move the state by
-// the contrast the prompts show at a steer_scale of 1. Prompts are one per line (\n inside a prompt written as \\n); each is wrapped as a user turn with the answer started after an empty reasoning block.
+// the contrast the prompts show at a steer_scale of 1. Prompts are one per line (\n inside a prompt written as \\n); each is wrapped as a user turn (the checkpoint's chat format) with the answer started after an empty reasoning block.
 //   steer_build --pos pos.txt --neg neg.txt --out v.steer [--layers 21-42] [--model dir] [--scope generated] [--scale 1.5]
 //   steer_build ... --clamp [--strength K] [--orthogonal-to OTHER.steer]   a direction clamp per layer instead of an add: the direction is the unit mean difference
 //                (pos minus neg), the reference level the neg prompts' mean projection plus K standard deviations of it (default 2); --orthogonal-to first removes the
@@ -109,8 +109,10 @@ int main( int argc, char** argv ) {
 				p = line.substr( 0, cut );
 				answer = line.substr( cut + 5 );
 			}
-			const std::vector<int> ids = tok.encode( "<|im_start|>user\n" + p + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", false );
-			if ( ids.empty() || ids[0] != tok.im_start_id() ) { std::fprintf( stderr, "template special tokens were not recognised\n" ); std::exit( 1 ); }
+			const bool glm = cfg.model_type == "glm5_next";
+			const std::vector<int> ids = glm ? tok.encode( "[gMASK]<sop><|user|>" + p + "<|assistant|></think>", false )
+				: tok.encode( "<|im_start|>user\n" + p + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", false );
+			if ( ids.empty() || ( !glm && ids[0] != tok.im_start_id() ) || ( glm && ids.size() < 4 ) ) { std::fprintf( stderr, "template special tokens were not recognised\n" ); std::exit( 1 ); }
 			mc.reset_slot( 0 );
 			mc.steer_capture( cap, true );
 			mc.prefill( ids.data(), static_cast<int>( ids.size() ), 0 );
