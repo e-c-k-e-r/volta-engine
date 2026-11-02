@@ -134,9 +134,10 @@ Qwen extras:
   `nvfp4_dense=kda,mla,idx,head,dense,shared` (experts stay EXL3: the NVFP4 experts do not fit in VRAM and the offload penalty rules them out). Calibration: run
   `ENGINE_HESSIAN_DIR=<dir> test_ppl --flash|--glm --calibrate --file <text>` (GLM: `ENGINE_HESSIAN_LAYERS=lo-hi`, a third of the layers per pass) and then
   `nvfp4_ldlq.py --model flash|glm`. Speed figures there are indicative (150 W cap, single runs).
-* **DeepSeek-V4.1-Flash** (`deepseek_v41`, EXL3 checkpoints of the sudoingX / 0xSero layout, for example `DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw`;
-  example `configs/deepseek_v41.json`): the Engram tables are not in those repositories, so `model-00047-of-00048.safetensors` and
-  `model-00048-of-00048.safetensors` of `deepseek-ai/DeepSeek-V4.1-Flash-1017` go into the model directory, and
+* **DeepSeek-V4.1-Flash** (`deepseek_v41`, exllamav3's own EXL3 conversions such as `turboderp/DeepSeek-V4.1-Flash-1017-exl3` (its 1.68 bpw
+  experts are 1.5 and 2 bpw) or those of the sudoingX / 0xSero layout; example `configs/deepseek_v41.json`): exllamav3's releases keep the Engram
+  tables in `ngram_embedding.safetensors`, which the loader opens next to the shards; the other repositories do not carry them, so
+  `model-00047-of-00048.safetensors` and `model-00048-of-00048.safetensors` of `deepseek-ai/DeepSeek-V4.1-Flash-1017` go into the model directory. Either way
   `python tests/tools/dsv41/engram_hash_tables.py <model dir>` (a venv with `torch`, `transformers` and `sympy`) writes the hashing tables the
   engine reads, `engram_hash.bin`, once per directory. The routed experts that do not fit the arena stay in pinned host memory and are read in
   place (62% resident for the 2.7 bpw checkpoint on four 32 GB GPUs). Its routing is concentrated (on agent text the hottest 10% of a layer's

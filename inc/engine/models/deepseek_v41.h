@@ -2,6 +2,7 @@
 
 #include "engine/config.h"
 #include "engine/models/model.h"
+#include "engine/models/steer_host.h"
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
@@ -145,6 +146,15 @@ public:
 	bool load_dspark( const char* dir, backend::stream_t stream = nullptr ) override;
 	bool has_dspark() const override { return ds_.loaded; }
 	int dspark_block() const override { return ds_.block; }
+	// Runtime steering (option steer): the edits act on the mean of the four residual streams after each layer's FFN update and shift every stream
+	// by the change (ResidualSteer::apply_streams); the DSpark drafter's forward is not steered
+	bool steer_enabled() const override { return steer_.on(); }
+	void steer_set( int slot_id, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream = nullptr ) override { steer_.set( slot_id, entries, stream ); }
+	void steer_control( int slot_id, int scope, int prompt_len, int think_end, backend::stream_t stream = nullptr ) override { steer_.control( slot_id, scope, prompt_len, think_end, stream ); }
+	void steer_penalty( int slot_id, const std::vector<int>& ids, float penalty, backend::stream_t stream = nullptr ) override { steer_.penalty( slot_id, ids, penalty, stream ); }
+	void steer_capture( const std::vector<int>& layers, bool on ) override { steer_.capture( layers, on ); }
+	bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) override { return steer_.read( out, stream ); }
+	void steer_range( int* first_layer, int* num_layers ) const override { *first_layer = steer_.first(); *num_layers = steer_.layers(); }
 	void dspark_forward( int slot, int pos, int from, int win_start, int anchor, backend::stream_t stream = nullptr ) override;
 	void dspark_chain( const backend::half_t* const* peer_shards, int peer_cols, int anchor, int* drafts, float* conf, backend::stream_t stream = nullptr ) override;
 	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
@@ -186,6 +196,11 @@ private:
 	void ffn_experts( DeepseekV41LayerWeights& lw, int rows, backend::stream_t stream ); // the routed experts over norm_x_ rows
 	void ffn_back( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );      // shared expert, all-reduce
 	void forward_head( int m, backend::stream_t stream );
+	// After layer L's FFN update: the steering edits of its range and the probe's capture of the stream mean; the penalty on this rank's logit rows
+	void steer_layer( int L, int m, backend::stream_t stream );
+	void steer_penalize( pod::TensorView& logits, int row0, int n, backend::stream_t stream );
+	SteerHost steer_;
+	pod::TensorView steer_mean_;         // [MAX_ROWS, hidden] fp16: the stream mean of a probe's capture
 	void trace( int tag, int m, backend::stream_t stream );
 	void trace_tensor( int tag, const pod::TensorView& t, int m, int cols, backend::stream_t stream );   // debug: <trace_layers>.t
 

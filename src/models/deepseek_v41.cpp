@@ -9,7 +9,9 @@
 #include "engine/modules/swiglu.h"
 #include "engine/modules/embedding.h"
 #include "engine/modules/dsv4.h"
+#include "engine/modules/trellis_bits.h"
 #include "engine/spec/dflash.h"
+#include "engine/spec/tap_ring.h"
 #if ENGINE_BACKEND_CUDA
 #include "trellis_context.h"
 #endif
@@ -126,6 +128,13 @@ float bf16_to_float( uint16_t b ) {
 	return f;
 }
 
+// Element i of a BF16, FP16 or FP32 tensor as a float
+float elem_to_float( pod::DType dtype, const void* src, size_t i ) {
+	return dtype == pod::DType::BF16 ? bf16_to_float( static_cast<const uint16_t*>( src )[i] )
+		: dtype == pod::DType::FP16 ? backend::to_float( static_cast<const backend::half_t*>( src )[i] )
+		: static_cast<const float*>( src )[i];
+}
+
 float e4m3_to_float( uint8_t b ) {
 	const int s = b >> 7, e = ( b >> 3 ) & 15, m = b & 7;
 	float v;
@@ -205,13 +214,17 @@ __attribute__(( target( "avx2,f16c" ) )) void dequant_row_avx2( const uint8_t* w
 const bool g_avx2 = __builtin_cpu_supports( "avx2" ) && __builtin_cpu_supports( "f16c" );
 #endif
 
-// A [N, K] tensor (BF16 / F32) as FP16 on the device, or FP8 E4M3 with [N/32, K/32] E8M0 block scales dequantized to FP16.
+// A [N, K] tensor (BF16 / FP16 / F32) as FP16 on the device, or FP8 E4M3 with [N/32, K/32] E8M0 block scales dequantized to FP16.
 // An FP8 window [row0, row0 + rows) x [col0, col0 + cols) of it (a rank's share of a projection, or one of wo_a's groups) times `scale`
-// can be taken instead of the whole tensor
+// can be taken instead of the whole tensor. A projection an exllamav3 conversion quantized (a .trellis group) loads as that, whole
 pod::LinearWeight load_dense( engine::loader::SafeTensorsRepo& repo, const std::string& base, pod::MemoryArena& arena, backend::stream_t stream,
 	int row0 = 0, int rows = -1, int col0 = 0, int cols = -1, float scale = 1.0f ) {
 	int shard = -1;
 	const auto* meta = repo.find( ( base + ".weight" ).c_str(), &shard );
+	if ( meta == nullptr && repo.find( ( base + ".trellis" ).c_str() ) ) {
+		ENGINE_ASSERT( row0 == 0 && rows < 0 && col0 == 0 && cols < 0 && scale == 1.0f, "load_dense: windows are for FP8 tensors" );
+		return repo.load_linear( base.c_str(), arena, 4, stream );
+	}
 	if ( meta == nullptr || meta->ndim != 2 ) return {};
 	const int n_all = meta->shape[0], k_all = meta->shape[1];
 	const int n = rows < 0 ? n_all : rows, k = cols < 0 ? k_all : cols;
@@ -237,6 +250,10 @@ pod::LinearWeight load_dense( engine::loader::SafeTensorsRepo& repo, const std::
 				for ( ; c < end; ++c ) drow[c] = backend::from_float_half( lut[srow[c]] * s );
 			}
 		}
+	}
+	else if ( meta->dtype == pod::DType::FP16 ) {
+		ENGINE_ASSERT( rows < 0 && cols < 0 && scale == 1.0f, "load_dense: windows are for FP8 tensors" );
+		std::memcpy( h.data(), src, h.size() * sizeof( backend::half_t ) );
 	}
 	else if ( meta->dtype == pod::DType::BF16 ) {
 		ENGINE_ASSERT( rows < 0 && cols < 0 && scale == 1.0f, "load_dense: windows are for FP8 tensors" );
@@ -301,9 +318,7 @@ pod::TensorView load_vec( engine::loader::SafeTensorsRepo& repo, const std::stri
 	std::vector<float> f( count );
 	for ( int i = 0; i < count; ++i ) {
 		const size_t j = static_cast<size_t>( begin ) + i;
-		f[i] = meta->dtype == pod::DType::BF16 ? bf16_to_float( static_cast<const uint16_t*>( src )[j] )
-			: meta->dtype == pod::DType::FP16 ? backend::to_float( static_cast<const backend::half_t*>( src )[j] )
-			: static_cast<const float*>( src )[j];
+		f[i] = elem_to_float( meta->dtype, src, j );
 	}
 	if ( to == pod::DType::FP32 ) {
 		pod::TensorView t = dev_tensor( arena, pod::DType::FP32, 1, count );
@@ -471,6 +486,8 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 	d_token_ids_ = dev_alloc<int>( arena, R );
 	embed_rows_ = dev_tensor( arena, pod::DType::FP16, R, H );
 	streams_ = dev_tensor( arena, pod::DType::FP32, 4 * R, H );
+	steer_.init( arena, H, L, S, rank_ );
+	if ( steer_.on() ) steer_mean_ = dev_tensor( arena, pod::DType::FP16, R, H );
 	norm_x_ = dev_tensor( arena, pod::DType::FP16, R, H );
 	collapsed_ = dev_tensor( arena, pod::DType::FP16, R, H );
 	attn_out_ = dev_tensor( arena, pod::DType::FP16, R, H );
@@ -780,16 +797,16 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			lw.idx_wproj = load_dense( repo, p + "attn.indexer.weights_proj", arena, stream );
 			need( lw.idx_wq_b.is_valid() && lw.idx_wproj.is_valid(), p + "indexer" );
 		}
-		// router [E, H] BF16 -> [H, E] FP16
+		// router [E, H] BF16 / FP16 -> [H, E] FP16
 		{
 			int shard = -1;
 			const auto* meta = repo.find( ( p + "ffn.gate.weight" ).c_str(), &shard );
 			need( meta != nullptr && meta->shape[0] == config_.num_experts && meta->shape[1] == H, p + "ffn.gate.weight" );
 			if ( meta != nullptr ) {
-				const uint16_t* src = static_cast<const uint16_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), meta ) );
+				const void* src = engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), meta );
 				std::vector<backend::half_t> t( static_cast<size_t>( H ) * config_.num_experts );
 				for ( int e = 0; e < config_.num_experts; ++e )
-					for ( int d = 0; d < H; ++d ) t[static_cast<size_t>( d ) * config_.num_experts + e] = backend::from_float_half( bf16_to_float( src[static_cast<size_t>( e ) * H + d] ) );
+					for ( int d = 0; d < H; ++d ) t[static_cast<size_t>( d ) * config_.num_experts + e] = backend::from_float_half( elem_to_float( meta->dtype, src, static_cast<size_t>( e ) * H + d ) );
 				lw.router_w_t = dev_tensor( arena, pod::DType::FP16, H, config_.num_experts );
 				backend::memcpy_sync( lw.router_w_t.data, t.data(), t.size() * sizeof( backend::half_t ), backend::Copy::H2D );
 			}
@@ -864,7 +881,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			for ( const char* w : { ".w1", ".w3", ".w2" } ) {
 				const auto* meta = repo.find( ( p + std::to_string( e ) + w + ".trellis" ).c_str() );
 				need( meta != nullptr && meta->ndim == 3, p + std::to_string( e ) + w );
-				sig |= ( meta ? meta->shape[2] / 16 : 0 ) << sh;
+				sig |= ( meta ? engine::modules::trellis_code_from_u16( meta->shape[2] ) : 0 ) << sh;
 				sh += 4;
 			}
 			bits[l][e] = sig;
@@ -1411,7 +1428,7 @@ void DeepseekV41Pipeline::forward( const pod::BatchRows& rows, backend::stream_t
 	}
 	const int m = rows.count;
 	key_hint_ = rows.pos[m - 1] + 1;
-	lm_mode_ = m > pod::MAX_BATCH ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;
+	lm_mode_ = m > pod::MAX_BATCH || steer_.capturing() ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;   // a probe runs eagerly, so any block may skip the head
 	last_rows_ = lm_mode_ == pod::BatchRows::LOGITS_NONE ? 0 : lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m;
 	ENGINE_ASSERT( last_rows_ <= logit_rows_, "DeepseekV41Pipeline::forward: more logit rows than the buffer holds" );
 	set_rows( m );
@@ -1419,7 +1436,8 @@ void DeepseekV41Pipeline::forward( const pod::BatchRows& rows, backend::stream_t
 	sync_image_flags( stream );
 	engram_prepare( rows, stream );
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
-	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); } );
+	if ( steer_.capturing() ) forward_body( m, stream );   // a probe: the capture list is host state a graph would freeze
+	else graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); } );
 }
 
 void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRows* chunks, int n, backend::stream_t stream ) {
@@ -1516,6 +1534,7 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 			const int m = bind( c );
 			ffn_back( lw, m, stream );
 			engine::modules::HyperConnection::update( streams_, moe_out_, mhc_post_, mhc_comb_, H, stream, m );
+			steer_layer( l, m, stream );
 			unbind( c );
 		}
 	}
@@ -1591,6 +1610,7 @@ void DeepseekV41Pipeline::forward_body( int m, backend::stream_t stream ) {
 		attention( l, lw, m, stream );
 		trace( 100 + l, m, stream );
 		ffn( l, lw, m, stream );
+		steer_layer( l, m, stream );
 		trace( l, m, stream );
 	}
 	forward_head( m, stream );
@@ -1606,10 +1626,26 @@ void DeepseekV41Pipeline::forward_head( int m, backend::stream_t stream ) {
 		pod::TensorView n1 = view( norm_x_, static_cast<size_t>( m - 1 ) * H, 1, H );
 		pod::TensorView l1 = view( logits_, 0, 1, lm_shard_cols_ );
 		engine::modules::Linear::forward( n1, lm_head_, l1, stream );
+		steer_penalize( l1, m - 1, 1, stream );
 		return;
 	}
 	logits_.shape[0] = m;
 	engine::modules::Linear::forward( norm_x_, lm_head_, logits_, stream );
+	steer_penalize( logits_, 0, m, stream );
+}
+
+void DeepseekV41Pipeline::steer_penalize( pod::TensorView& logits, int row0, int n, backend::stream_t stream ) {
+	if ( steer_.on() ) engine::modules::ResidualSteer::penalize( steer_.tables(), logits.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, row0, n, lm_shard_offset_, lm_shard_real_cols_, stream );
+}
+
+void DeepseekV41Pipeline::steer_layer( int L, int m, backend::stream_t stream ) {
+	if ( !steer_.on() ) return;
+	const int H = config_.hidden_size;
+	if ( const int li = steer_.index( L ); li >= 0 ) engine::modules::ResidualSteer::apply_streams( steer_.tables(), streams_.ptr<float>(), 4, d_rows_, m, li, stream );
+	if ( backend::half_t* dst = steer_.capture_dst( L ) ) {
+		engine::spec::dflash_reduce_streams( streams_.ptr<const float>(), steer_mean_.ptr<backend::half_t>(), m, H, 0, stream );
+		backend::memcpy_async( dst, steer_mean_.ptr<const backend::half_t>() + static_cast<size_t>( m - 1 ) * H, H * sizeof( backend::half_t ), backend::Copy::D2D, stream );
+	}
 }
 
 void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
@@ -1736,7 +1772,7 @@ bool DeepseekV41Pipeline::load_dspark( const char* dir, backend::stream_t stream
 	const size_t bytes0 = arena.offset_bytes;
 	int missing = 0;
 	auto need = [&]( bool ok, const std::string& what ) { if ( !ok ) { LOG_ERROR( "[RANK %d] DSPARK MISSING: %s\n", rank_, what.c_str() ); ++missing; } };
-	auto bits_of = [&]( const std::string& base ) { const auto* m = repo.find( ( base + ".trellis" ).c_str() ); return m != nullptr && m->ndim == 3 ? m->shape[2] / 16 : 0; };
+	auto bits_of = [&]( const std::string& base ) { const auto* m = repo.find( ( base + ".trellis" ).c_str() ); return m != nullptr && m->ndim == 3 ? engine::modules::trellis_code_from_u16( m->shape[2] ) : 0; };
 	ds_.layers.resize( ds_.blocks );
 	for ( int l = 0; l < ds_.blocks; ++l ) {
 		auto& lw = ds_.layers[l];
@@ -1763,10 +1799,10 @@ bool DeepseekV41Pipeline::load_dspark( const char* dir, backend::stream_t stream
 			const auto* meta = repo.find( ( p + "ffn.gate.weight" ).c_str(), &shard );
 			need( meta != nullptr && meta->shape[0] == E && meta->shape[1] == H, p + "ffn.gate.weight" );
 			if ( meta != nullptr ) {
-				const uint16_t* src = static_cast<const uint16_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), meta ) );
+				const void* src = engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), meta );
 				std::vector<backend::half_t> t( static_cast<size_t>( H ) * E );
 				for ( int e = 0; e < E; ++e )
-					for ( int d = 0; d < H; ++d ) t[static_cast<size_t>( d ) * E + e] = backend::from_float_half( bf16_to_float( src[static_cast<size_t>( e ) * H + d] ) );
+					for ( int d = 0; d < H; ++d ) t[static_cast<size_t>( d ) * E + e] = backend::from_float_half( elem_to_float( meta->dtype, src, static_cast<size_t>( e ) * H + d ) );
 				lw.router_w_t = dev_tensor( arena, pod::DType::FP16, H, E );
 				backend::memcpy_sync( lw.router_w_t.data, t.data(), t.size() * sizeof( backend::half_t ), backend::Copy::H2D );
 			}
@@ -1842,7 +1878,7 @@ bool DeepseekV41Pipeline::load_dspark( const char* dir, backend::stream_t stream
 			ds_.conf_w.resize( H + ds_.markov_rank );
 			const void* src = engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), mc );
 			for ( size_t i = 0; i < ds_.conf_w.size(); ++i )
-				ds_.conf_w[i] = mc->dtype == pod::DType::FP32 ? static_cast<const float*>( src )[i] : bf16_to_float( static_cast<const uint16_t*>( src )[i] );
+				ds_.conf_w[i] = elem_to_float( mc->dtype, src, i );
 		}
 		ds_.d_chain = dev_alloc<int>( arena, 8 );
 		ds_.memb = dev_tensor( arena, pod::DType::FP16, 8, ds_.markov_rank );

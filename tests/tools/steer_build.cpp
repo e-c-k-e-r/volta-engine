@@ -8,11 +8,12 @@
 //                directions of another file's entries (same layers) from it, so the axis keeps only what the other one does not cover
 //   steer_build ... --answers   lines are `question ||| answer` (the model's own answers); the state is the mean over the answer's first 48 tokens, fed one at a time
 //   steer_build --batch dir [...]     every NAME.pos.txt with a NAME.neg.txt in dir gives dir/NAME.steer (one model load for all)
-// Needs the steer option (set here) and a checkpoint of a model with the steering hooks (qwen3_5, qwen4_exp, glm5_next; read from its config.json).
+// Needs the steer option (set here) and a checkpoint of a model with the steering hooks (qwen3_5, qwen4_exp, glm5_next, deepseek_v41; read from its config.json).
 #include "engine/runtime/cluster.h"
 #include "engine/runtime/steer_file.h"
 #include "engine/runtime/test_paths.h"
 #include "engine/loader/tokenizer.h"
+#include "engine/loader/deepseek_encoding.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -84,11 +85,11 @@ int main( int argc, char** argv ) {
 	ModelCluster mc;
 	ClusterConfig cfg;
 	{
-		// model_type of the checkpoint (qwen3_5, qwen4_exp or glm5_next): the same file the server reads
+		// model_type of the checkpoint (qwen3_5, qwen4_exp, glm5_next or deepseek_v41): the same file the server reads
 		std::ifstream cf( model + "/config.json" );
 		const nlohmann::json j = nlohmann::json::parse( cf, nullptr, false );
 		cfg.model_type = !j.is_discarded() && j.contains( "model_type" ) && j["model_type"].is_string() ? j["model_type"].get<std::string>() : "qwen3_5";
-		if ( cfg.model_type != "qwen3_5" && cfg.model_type != "qwen4_exp" && cfg.model_type != "glm5_next" ) { std::fprintf( stderr, "model_type %s has no steering hooks\n", cfg.model_type.c_str() ); return 1; }
+		if ( cfg.model_type != "qwen3_5" && cfg.model_type != "qwen4_exp" && cfg.model_type != "glm5_next" && cfg.model_type != "deepseek_v41" ) { std::fprintf( stderr, "model_type %s has no steering hooks\n", cfg.model_type.c_str() ); return 1; }
 	}
 	cfg.model_dir = model;
 	if ( !mc.init( cfg ) ) return 1;
@@ -109,10 +110,16 @@ int main( int argc, char** argv ) {
 				p = line.substr( 0, cut );
 				answer = line.substr( cut + 5 );
 			}
-			const bool glm = cfg.model_type == "glm5_next";
-			const std::vector<int> ids = glm ? tok.encode( "[gMASK]<sop><|user|>" + p + "<|assistant|></think>", false )
-				: tok.encode( "<|im_start|>user\n" + p + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", false );
-			if ( ids.empty() || ( !glm && ids[0] != tok.im_start_id() ) || ( glm && ids.size() < 4 ) ) { std::fprintf( stderr, "template special tokens were not recognised\n" ); std::exit( 1 ); }
+			const bool glm = cfg.model_type == "glm5_next", dsv41 = cfg.model_type == "deepseek_v41";
+			std::string text;
+			if ( dsv41 ) {
+				std::string err;
+				const nlohmann::json msgs = nlohmann::json::array( { { { "role", "user" }, { "content", p } } } );
+				if ( !engine::loader::deepseek_v41_encode( msgs.dump(), std::string(), engine::loader::DeepseekEncodeOptions{}, &text, &err ) ) { std::fprintf( stderr, "DeepSeek prompt encoding failed: %s\n", err.c_str() ); std::exit( 1 ); }
+			}
+			else text = glm ? "[gMASK]<sop><|user|>" + p + "<|assistant|></think>" : "<|im_start|>user\n" + p + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+			const std::vector<int> ids = tok.encode( text, false );
+			if ( ids.empty() || ( !glm && !dsv41 && ids[0] != tok.im_start_id() ) || ( ( glm || dsv41 ) && ids.size() < 4 ) ) { std::fprintf( stderr, "template special tokens were not recognised\n" ); std::exit( 1 ); }
 			mc.reset_slot( 0 );
 			mc.steer_capture( cap, true );
 			mc.prefill( ids.data(), static_cast<int>( ids.size() ), 0 );

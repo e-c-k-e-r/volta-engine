@@ -1,4 +1,4 @@
-// Tier 4: runtime steering on a real model (Qwen3.5 family, Flash-Next with STEER_FLASH=1 or GLM-5.3-Flash with STEER_GLM=1; no speculator).
+// Tier 4: runtime steering on a real model (Qwen3.5 family, Flash-Next with STEER_FLASH=1, GLM-5.3-Flash with STEER_GLM=1 or DeepSeek-V4.1-Flash with STEER_DSV41=1; no speculator).
 //  1. a slot with scope 0 decodes exactly what it decodes with steering never configured is checked by running this binary with ENGINE_STEER=off
 //     (--tokens prints the greedy tokens) and diffing against ENGINE_STEER=on; here: greedy tokens of slot 0 alone.
 //  2. an add vector on slot 1 changes slot 1's greedy text, and slot 0, decoding in the same batches, keeps the tokens it gives alone.
@@ -7,6 +7,8 @@
 #include "engine/runtime/test_driver.h"
 #include "engine/runtime/steer_file.h"
 #include "engine/loader/tokenizer.h"
+#include "engine/loader/deepseek_encoding.h"
+#include <nlohmann/json.hpp>
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
@@ -20,7 +22,9 @@ int main( int argc, char** argv ) {
 	const bool print_only = argc > 1 && std::string( argv[1] ) == "--tokens";
 	const bool flash = std::getenv( "STEER_FLASH" ) != nullptr;   // Flash-Next (qwen4_exp, ENGINE_TEST_FLASH_DIR) instead of the 27B
 	const bool glm = std::getenv( "STEER_GLM" ) != nullptr;       // GLM-5.3-Flash (glm5_next, ENGINE_TEST_GLM_DIR)
-	const char* dir = glm ? test::GLM_DIR : flash ? test::FLASH_DIR : test::QWEN_DIR;
+	const bool dsv41 = std::getenv( "STEER_DSV41" ) != nullptr;   // DeepSeek-V4.1-Flash (deepseek_v41, ENGINE_TEST_DSV41_DIR)
+	static const std::string dsv41_dir = test::model_path( "ENGINE_TEST_DSV41_DIR" );
+	const char* dir = dsv41 ? dsv41_dir.c_str() : glm ? test::GLM_DIR : flash ? test::FLASH_DIR : test::QWEN_DIR;
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	if ( !std::getenv( "ENGINE_STEER" ) ) setenv( "ENGINE_STEER", "on", 1 );
 	if ( !std::getenv( "ENGINE_MAX_SLOTS" ) ) setenv( "ENGINE_MAX_SLOTS", "3", 1 );   // slot 2 takes the penalty check
@@ -28,12 +32,20 @@ int main( int argc, char** argv ) {
 	engine::loader::Tokenizer tok;
 	ENGINE_ASSERT( tok.load( dir ), "tokenizer load failed" );
 	auto prompt = [&]( const std::string& user, bool think ) {
+		if ( dsv41 ) {
+			engine::loader::DeepseekEncodeOptions o;
+			o.thinking = think;
+			std::string text, err;
+			const nlohmann::json msgs = nlohmann::json::array( { { { "role", "user" }, { "content", user } } } );
+			ENGINE_ASSERT( engine::loader::deepseek_v41_encode( msgs.dump(), std::string(), o, &text, &err ), "test_steer_model: DeepSeek prompt encoding" );
+			return tok.encode( text, false );
+		}
 		if ( glm ) return tok.encode( "[gMASK]<sop><|user|>" + user + ( think ? "<|assistant|><think>" : "<|assistant|></think>" ), false );
 		return tok.encode( "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n" + ( think ? "<think>\n" : "<think>\n\n</think>\n\n" ), false );
 	};
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm5_next" : flash ? "qwen4_exp" : "qwen3_5";
+	cfg.model_type = dsv41 ? "deepseek_v41" : glm ? "glm5_next" : flash ? "qwen4_exp" : "qwen3_5";
 	cfg.model_dir = dir;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	mc.warm_graphs( 4 );
