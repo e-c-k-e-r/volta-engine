@@ -199,8 +199,8 @@ int DFlash2Runner::draft_block( int slot, int anchor, int pos, float depth_thres
 		} );
 	}
 
-	// Diagnostic: ENGINE_DEBUG_DUMP_DRAFT_ROUND=<round> writes that round's inputs and the drafter hidden to
-	// /tmp/draft_dump.bin for comparison against an independent implementation. Header (int32): pos, anchor,
+	// Diagnostic (debug option dump_draft_round = <round>): writes that round's inputs and the drafter hidden to
+	// /tmp/draft_dump.bin for comparison against an independent implementation (tests/2_parity/draft_oracle.py). Header (int32): pos, anchor,
 	// hidden, taps_cap; then the tap ring rows for positions [0, pos) as FP16 [pos, 5 * hidden]
 	// (only valid while pos <= taps_cap), then the drafter hidden FP16 [M, hidden].
 	{
@@ -215,12 +215,15 @@ int DFlash2Runner::draft_block( int slot, int anchor, int pos, float depth_thres
 			backend::memcpy_sync( taps.data(), hk0.taps, taps.size() * sizeof( backend::half_t ), backend::Copy::D2H );
 			backend::memcpy_sync( hid.data(), spec_[0].draft_hidden().data, hid.size() * sizeof( backend::half_t ), backend::Copy::D2H );
 			FILE* f = std::fopen( "/tmp/draft_dump.bin", "wb" );
-			const int hdr[4] = { pos, anchor, H, hk0.taps_cap };
-			std::fwrite( hdr, sizeof( int ), 4, f );
-			std::fwrite( taps.data(), sizeof( backend::half_t ), taps.size(), f );
-			std::fwrite( hid.data(), sizeof( backend::half_t ), hid.size(), f );
-			std::fclose( f );
-			LOG_INFO( "[dump] round %d: pos %d anchor %d\n", dump_round, pos, anchor );
+			if ( f == nullptr ) LOG_ERROR( "[dump] cannot write /tmp/draft_dump.bin\n" );
+			else {
+				const int hdr[4] = { pos, anchor, H, hk0.taps_cap };
+				std::fwrite( hdr, sizeof( int ), 4, f );
+				std::fwrite( taps.data(), sizeof( backend::half_t ), taps.size(), f );
+				std::fwrite( hid.data(), sizeof( backend::half_t ), hid.size(), f );
+				std::fclose( f );
+				LOG_INFO( "[dump] round %d: pos %d anchor %d\n", dump_round, pos, anchor );
+			}
 		}
 	}
 

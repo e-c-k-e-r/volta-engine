@@ -1,6 +1,6 @@
 # Runtime steering
 
-Changes how a model behaves at inference time, per request, with the weights untouched: control vectors added to the residual stream, a direction clamp built by a probe of the prompt itself, and a logit penalty on reflection markers inside the reasoning block. The edits act on the fp16 residual after a range of layers, so they are independent of the weight format (EXL3, NVFP4). Qwen3.5-family dense models (Qwen3.8-27B) and Qwen3.8-Flash-Next; the CPU and Vulkan builds carry stubs.
+Changes how a model behaves at inference time, per request, with the weights untouched: control vectors added to the residual stream, a direction clamp built by a probe of the prompt itself, and a logit penalty on reflection markers inside the reasoning block. The edits act on the fp16 residual after a range of layers, so they are independent of the weight format (EXL3, NVFP4). Qwen3.5-family dense models (Qwen3.8-27B), Qwen3.8-Flash-Next and GLM-5.3-Flash; the CPU and Vulkan builds carry stubs.
 
 Everything is off unless `steer` is set (`on`, or `file` to give every request the `steer_file` vector). With `steer=off` no table is allocated and no kernel is launched.
 
@@ -57,11 +57,11 @@ For a request with `steer_probe`, before its prefill (on the scheduler thread; o
 1. The prompt is prefilled unedited and its recurrent state checkpointed. A few short openings are forced after it (5 accepting, 8 declining, 4 plain, 4 hedged; English, in `src/runtime/generator_probe.cpp`), each run as a block whose state is rolled back, and the residual after every layer of the band (`steer_band`, default 1/3 to 2/3 of the layers) at the last token is kept. These blocks run without the LM head.
 2. Per band layer, the axis is the unit difference of the mean declining and accepting states, with the spread of the accepting samples projected out (`src/runtime/steer_probe.cpp`). `pa`, `pb` are the mean projections of the two sets and `sd` the standard deviation of the accepting one.
 3. Look-ahead: the model decodes 24 greedy tokens unedited; for each token the band-averaged fraction `(h . axis - pa) / max(pb - pa, 1e-3)` is taken, and the largest over the tokens is the score.
-4. Score above `steer_gate_threshold`: the gate fires. The slot gets a clamp on each edit layer (`steer_edit_layers`, default 17/32 to 21/32 of the layers, 34 to 42 of 64) with reference `pa - steer_edit_strength * sd`, optionally a second clamp (plain against hedged openings, reference `plain mean + steer_hedge_strength * gap`, off when negative), scope `all`, and the prompt is prefilled again with the edit active. Below it the request runs as if the probe had not been asked for, from the prefix cache like any other.
+4. Score above `steer_gate_threshold`: the gate fires. The slot gets a clamp on each edit layer (`steer_edit_layers`, by default the model's window from the table below) with reference `pa - steer_edit_strength * sd`, optionally a second clamp (plain against hedged openings, reference `plain mean + steer_hedge_strength * gap`, off when negative), scope `all`, and the prompt is prefilled again with the edit active. Below it the request runs as if the probe had not been asked for, from the prefix cache like any other.
 
 Evaluation on Qwen3.8-27B EXL3 4.0 bpw (`tests/tools/steer_eval_sets.py` writes the prompt sets, `tests/tools/steer_sweep.py` runs them): 56 target prompts (requests the model tends to answer with a stock reply, plain, with a purpose given, and as a second turn after a harmless first turn) and 56 control prompts (ordinary tasks and benign questions on the same topics, plain and as conversations). The gate score separates the two sets with an AUC of 0.949. At the default threshold 0.65 the gate fires on 47 of 56 targets and 3 of 56 controls; at 0.70 on 42 and 0. Of the 40 targets whose unprobed answer opens with a stock reply, all fire the gate and 8 still open with one afterwards. Controls that do not fire give the same text as without the probe (53 of 53). With a long neutral passage in front (6 target and 6 control prompts) the gate fires on all 6 targets (stock openings 1.00 to 0.17) and on no control. With the gate forced on every control prompt, the text stays coherent but moves: at edit strengths -12, -8 and -4 the share of repeated word trigrams is 0.02, 0.03 and 0.05 (0.00 unprobed), doubled words per answer 0.2, 1.0 and 2.2, and the answers share 13%, 10% and 7% of their leading words with the unprobed text.
 
-The score is logged (`[steer] req N gate fired|clean score=... (threshold ..., ms)`) and kept in the request's metrics. The probe replaces `steer_vector` when it fires.
+The score is logged (`[steer] req N gate fired|clean score=... (threshold ..., ms)`) and kept in the request's metrics. A request's `steer_vector` stays when the probe fires; the probe's clamps are added after it (see "Clamp files").
 
 ## Options
 
@@ -73,6 +73,7 @@ The score is logged (`[steer] req N gate fired|clean score=... (threshold ..., m
 |---|---|---|---|---|
 | `qwen3_5` (also the fallback) | 0.65 | -8 | 17/32 to 21/32 of the layers (34 to 42 of 64) | Qwen3.8-27B EXL3 4.0 bpw |
 | `qwen4_exp` | 0.60 | 8 | 1/3 to 2/3 (16 to 32 of 48) | Qwen3.8-Flash-Next, 2 bpw experts |
+| `glm5_next` | 0.55 | 3 | 17/32 to 21/32 (23 to 29 of 45) | GLM-5.3-Flash EXL3 3.05 bpw |
 
 
 ## Running the sweeps
@@ -130,7 +131,7 @@ Measured on Qwen3.8-27B EXL3 4.0 bpw, layers 34 to 42, K = 2, one axis per categ
 
   The wider window helps, and K = 2 is the setting that keeps the text clean. A file's layers must lie inside the `steer_layers` range of the server (the default is 1/3 to 2/3 of the layers, 21 to 43 here; 26-46 needs `steer_layers` 20-48 or similar), otherwise the request is refused with a 400.
 * With the probe (68 target and 24 control prompts, the controls' gate forced; targets refusing, unprobed 0.65): the 26-46 / K = 2 file alone 0.16 with clean text and benign prompts untouched; the probe alone 0.13 at strength -8 and 0.11 at -4; the file and the probe together 0.08 and 0.06, with more strain on the text (targets: repetition 0.08 to 0.10, doubled words 2.0 and 0.9 per reply, against 0.01 and 0.3 for the probe alone; controls: repetition 0.05 to 0.10). Together they free the prompts about monitoring a teenager, a harsh breakup text and a one-sided essay; insulting nicknames, tracking a partner and exam cheating still refuse.
-* A probed request keeps its `steer_vector`: the file's edits come first on each layer and the probe's after them, up to 4 per layer (the probe's surplus on a full layer is dropped); the request's scope list applies to all of them, as the probe's do. Earlier a fired probe replaced the vector.
+* A probed request keeps its `steer_vector`: the file's edits come first on each layer and the probe's after them, up to 4 per layer (the probe's surplus on a full layer is dropped); the request's scope list applies to all of them, as the probe's do.
 
 ## Refusal geometry
 
