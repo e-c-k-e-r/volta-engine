@@ -99,8 +99,7 @@ tier2_models() {
 	for t in test_rows test_glm_rows test_prefill_equiv test_moe test_nvfp4_linear test_mla_latent test_spec_state; do
 		run $t gpu ./$t
 	done
-	# test_dflash prints a known FATAL in its geometry step (present before 2026-10-07); judged by its final line
-	run test_dflash sh -c "taskset -c 0-9 ./test_dflash | tail -3 | grep -q 'PASSED'"
+	run test_dflash sh -c "taskset -c 0-9 ./test_dflash"
 	run tokenizer ./test_tokenizer
 	run tokenizer_cases_qwen ./test_tokenizer_file $(model_dir ENGINE_TEST_QWEN_DIR) --cases $ROOT/tests/data/tokenizer_cases_qwen3_5.json
 	run tokenizer_cases_glm ./test_tokenizer_file $(model_dir ENGINE_TEST_GLM_DIR) --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json

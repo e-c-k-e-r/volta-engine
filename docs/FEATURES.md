@@ -30,6 +30,9 @@ The model type is read from the checkpoint, never configured. Anything else is a
 | NVFP4 dense groups from a calibrated (LDLQ) directory instead of round-to-nearest | opt-in | `nvfp4_dense_dir`, `hessian_dir`, `hessian_layers` | `test_ppl`, `tests/tools/nvfp4_ldlq.py` |
 | Mixed checkpoints: EXL3 directory stays the model, NVFP4 pieces swapped in at load | opt-in | as above | `configs/flash_next_nvfp4.json`, `configs/qwen_nvfp4.json`, `configs/glm_256k.json` |
 | Two-tier expert residency (hot experts on the GPU, the rest in pinned host RAM, rebalanced online) | opt-in | `expert_cache`, `expert_adapt_every`, `expert_swaps` | `test_moe`, `bench_expert_heat` |
+| Routed experts in host memory computed by the CPU during decode, in parallel with the PCIe reads of the others (AVX2 EXL3 kernel on a repacked copy, NVFP4 read in place; a pool per NUMA node, each expert split between them) | opt-in | `cpu_experts`, `cpu_expert_cpus`, `cpu_expert_node`, `cpu_expert_spin_us` | `test_cpu_experts` |
+| GLM routed experts of chosen layers from the modelopt NVFP4 checkpoint instead of EXL3 (resident, outside the expert tier) | debug | `nvfp4_expert_layers` (with `nvfp4_dense_src`) | `test_ppl` |
+| Prefill: experts routed by many rows of a chunk or window run as FP16 dequantization + cuBLAS, the rest on the quantized kernel (logits then depend on how a prompt is chunked) | opt-in | `moe_heavy_rows` (256 in the GLM configs) | `bench_moe_prefill` |
 
 * NVFP4 experts for GLM are not built: they do not fit in VRAM and the offload penalty rules them out. Dense NVFP4 groups on GLM take the 8-row verify from 48 to about 34 ms.
 * The expert tier is a capacity valve, not a speed feature: GLM and Flash-Next routing is trained for balance, so the hit rate at 50% residency is only 0.6 to 0.7 and decode drops to about a third.
@@ -70,6 +73,7 @@ Validated contexts:
 |---|---|---|---|
 | DFlash2 drafter (Qwen, GLM), verified in one forward (per-row recurrent-state snapshots; GLM journals the KDA rows and replays the accepted ones), a context and tap ring per slot on GLM | opt-in | `--speculative`, `--draft-model-dir`, `draft_tp` | `test_dflash*`, `test_spec_state`, `test_spec_target_equiv`, `test_coherence` |
 | MTP: the checkpoint's own head (Qwen, Flash-Next, GLM) | opt-in | `speculator=mtp`, `mtp_depth` | `test_mtp` |
+| Sparse drafter head for MTP: draft logits over a vocabulary subset picked from the tokens seen, used while its miss rate stays below the break-even | opt-in | `sparse_head`, `sparse_head_interval`, `sparse_head_file` | `test_sparse_head`, `bench_sparse_head` |
 | DFlash2 blocks shortened where the drafter's recent per-position accuracy makes the later rows unlikely to be reached | opt-in | `spec_depth` | `bench_accept --depths` |
 | DeepSeek-V4.1 DSpark block drafter (EXL3 from `quantize_dspark.py`, `draft_model_dir`): 5-token drafts from the trunk's stream means, confidence-cut, one verify forward | opt-in | `speculator=dspark`, `dspark_conf` | |
 | DFlash2 rounds whose block is the continuation of the last earlier occurrence of the current suffix of the request's own text (copied code, tool arguments), no draft pass | opt-in | `spec_suffix` | |
@@ -112,6 +116,7 @@ Covered by `test_all_reduce`, `bench_all_reduce`, `test_coherence`, `tests/4_ser
 |---|---|---|
 | OpenAI `/v1/chat/completions`, `/v1/models` | default | streaming, `stream_options.include_usage`, `stop`, `seed` |
 | Anthropic `/v1/messages`, `/v1/messages/count_tokens` | default | what Claude Code connects to |
+| Loop detection: a request whose output settles into repeating a span is reported or stopped (finish reason `loop`) | opt-in | `loop_detect` off / report / stop, request field `stop_on_loop` |
 | Tools in either shape, `tool_choice` `required` / named | default | best effort, no constrained decoding |
 | Reasoning and tool-call parsing from the text stream | default | Qwen and GLM syntaxes; independent of how the stream is chunked |
 | Jinja chat templates | default | own subset, tested against reference renders |

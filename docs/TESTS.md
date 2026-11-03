@@ -27,6 +27,8 @@
 | `test_dflash2_blocks` | 2 | yes | DFlash2 backbone building blocks (dynamic grouped convolution, RMSNorm residual split, FP16 GEMV) against explicit FP32 CPU references |
 | `test_cpu_bridge` | 2 | yes | GPU to CPU expert handoff with synthetic NVFP4 experts: routes to CPU-owned experts leave the route list, their outputs arrive in the layer output (also from a CUDA graph), layers without CPU routes do not wait |
 | `test_cpu_nvfp4_vs_gpu` | 2 | yes | the CPU NVFP4 expert against the GPU NVFP4 MoE kernel on the same random weights and inputs |
+| `test_gr_tc`, `test_gr_decode` | 2 | yes | Flash-Next gated residual: the tensor-core path (hi/lo FP16 GEMM pairs) against the FP32 row-tile kernel, a row's output independent of its position and batch; the streaming decode kernels (8 rows or fewer) against the row-tile kernels, with timing over 96 weight sets |
+| `test_dflash2_backbone [small\|real]` | 2 | yes | DFlash2 drafter backbone forward against an FP32 CPU reference, on a small or the production geometry (random weights) |
 
 ## Model-backed: checkpoints from `ENGINE_MODEL_ROOT`
 
@@ -58,6 +60,10 @@
 | `test_mixed_rows` (`[chunk] [decode_slots] [order]`) | 2 | yes | diagnostic, no pass/fail: GLM forward of a prefill chunk plus decode rows of other slots against the same rows run as separate forwards |
 | `diag_glm_tie PROMPT PREFIX WORD_A WORD_B` | 4 | yes | diagnostic: GLM logits of two candidate continuations in the single-row decode path against verify blocks of L rows (separates a near-tie from a defect) |
 | `diag_logits_dump OUT.bin [--flash \| --qwen]` | 4 | yes | diagnostic: the full-vocabulary logits after a fixed 48-token prompt, to a file; `tests/tools/compare_logits.py A B` gives their cosine and top-k overlap (two builds, two checkpoints, or the Volta tile order against the stock one with `ENGINE_DEBUG_GLM_LAYERS=7`) |
+| `test_spec_target_equiv [--prompt-tokens N] [--rows N]` | 4 | yes | speculation losslessness on the 27B: a multi-row verify forward against one-row steps, per row, with the logit margin where they disagree |
+| `test_sparse_head [model dir]` | 2 | yes | sparse drafter head on one rank's Flash-Next head shard: extracted columns give the full head's logits there, the rest of the row is the lowest value, the subset's argmax is the full head's restricted to it; one extraction timed (`CUDA_VISIBLE_DEVICES=1`) |
+| `test_glm_qkv <exl3 dir> <source dir> [layer] [rank]` | 2 | yes | GLM linear-attention qkv_proj as loaded (one rank's slice of the fused trellis tensor) against the source's q / k / v rows that rank owns |
+| `test_nvfp4_quantize <exl3 dir> <nvfp4 dir> <tensor> [bits]` | 2 | yes | round-to-nearest NVFP4 from a BF16 tensor against the EXL3 version of the same matrix (cosine and relative difference at 1 and 8 rows) |
 
 ## Benchmarks and profiler brackets
 
@@ -81,6 +87,9 @@ Not part of `gate.sh` (except `bench_decode`, `bench_accept` and `bench_prefill`
 | `bench_allreduce` | NCCL all-reduce of an activation-sized FP16 tensor next to the sequence-parallel alternative (the H3 transformer) |
 | `bench_all_reduce` | the engine's own all-reduce kernels |
 | `h3_text_repeat <text_encoder dir> <tokenizer dir> "prompt"` | whether the H3 text encoder gives identical hidden states on repeated encodes (fingerprints) |
+| `bench_shapes` | GEMV against GEMM time per Qwen TP4 per-rank shape (GPU 0, random trellis data) |
+| `bench_expert_heat` | GLM routed-expert skew: the share of a prompt's routes a resident subset of each layer's experts would serve, from its own or the other prompts' counts |
+| `bench_sparse_head [model dir]` | the Flash-Next head shard through `Linear::forward` against an FP16 GEMV over a vocabulary subset of 4K to 32K columns, 1 to 4 draft rows (one GPU) |
 
 ## Serving benchmarks
 

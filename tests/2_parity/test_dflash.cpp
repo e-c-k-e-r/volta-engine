@@ -345,14 +345,11 @@ int main( int argc, char** argv ) {
 				std::printf( "   [!] validator did NOT reject the mismatched config\n" );
 				std::_Exit( 0 );
 			}
-			const std::string cmd = std::string( "./" ) + argv[ 0 ]
-				+ " > /dev/null 2>&1";
-			(void) cmd;
 			{
-				char self[ 4096 ];
-				snprintf( self, sizeof( self ), "%s", argv[ 0 ] );
+				// the child's assertion is the expected outcome: its output is discarded so the log carries no FATAL
+				const std::string cmd = std::string( argv[0] ) + " > /dev/null 2>&1";
 				setenv( "ENGINE_TEST_DFLASH2_CHILD", "1", 1 );
-				const int rc = system( self );
+				const int rc = system( cmd.c_str() );
 				unsetenv( "ENGINE_TEST_DFLASH2_CHILD" );
 				// Nonzero means the child hit the geometry assert, which is the point.
 				ENGINE_ASSERT( rc != 0, "geometry validation accepted a mismatched DFlashConfig" );
