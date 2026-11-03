@@ -171,6 +171,7 @@ struct MonitorSnapshot {
 	uint64_t finished[kFinishReasons] = {};     // by FinishReason
 	uint64_t spec_rounds = 0, spec_proposed = 0, spec_accepted = 0;
 	uint64_t suffix_rounds = 0, suffix_proposed = 0, suffix_accepted = 0;   // the rounds whose block came from a suffix match (also counted above)
+	int step_attempts[8] = {}, step_hits[8] = {};   // per draft step: rounds that reached it and rounds whose draft there was accepted
 	double gap_ms[5] = {};                      // token-gap percentiles: p50 p90 p99 p999 max, over the last samples
 	double ttft_ms[3] = {};                     // p50 p90 p99 over the last requests
 	size_t gap_samples = 0;

@@ -1098,6 +1098,7 @@ MonitorSnapshot Generator::get_monitor() const {
 	m.suffix_rounds = suffix_rounds_;
 	m.suffix_proposed = suffix_proposed_;
 	m.suffix_accepted = suffix_accepted_;
+	if ( cluster_.has_speculator() ) cluster_.speculator().step_stats( m.step_attempts, m.step_hits );
 	for ( int s = 0; s < num_slots_; ++s ) m.slots.push_back( slot_view_[s] );
 	m.recent.assign( recent_.begin(), recent_.end() );
 	m.history.assign( history_.begin(), history_.end() );

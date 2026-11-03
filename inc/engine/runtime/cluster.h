@@ -130,6 +130,7 @@ public:
 	// Drafter taps of positions [first_pos, first_pos + count) of a slot, from rank 0 (every rank holds the same values), count * 5 * hidden halves
 	bool read_taps( int slot, int first_pos, int count, backend::half_t* host_dst );
 	Speculator& speculator() { return *runner_; }
+	const Speculator& speculator() const { return *runner_; }
 	DFlash2Runner& spec() { ENGINE_ASSERT( dflash_ != nullptr, "ModelCluster::spec: the speculator is not DFlash2" ); return *dflash_; }
 	bool spec_owns( int slot ) const { return runner_ && runner_->owns( slot ); }
 	SpecResult speculate( int slot, int anchor, int pos, float depth_threshold = -1.0f,

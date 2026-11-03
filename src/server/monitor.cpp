@@ -49,6 +49,9 @@ std::string VoltaServer::stats_json() {
 		{ "accept_rate", mon.spec_proposed ? static_cast<double>( mon.spec_accepted ) / mon.spec_proposed : 0.0 },
 		{ "tokens_per_round", mon.spec_rounds ? 1.0 + static_cast<double>( mon.spec_accepted ) / mon.spec_rounds : 0.0 },
 		{ "suffix", { { "rounds", mon.suffix_rounds }, { "proposed", mon.suffix_proposed }, { "accepted", mon.suffix_accepted } } } };
+	json steps = json::array();
+	for ( int k = 0; k < 8 && mon.step_attempts[k] > 0; ++k ) steps.push_back( { { "attempts", mon.step_attempts[k] }, { "hits", mon.step_hits[k] } } );
+	j["speculation"]["steps"] = steps;
 	json slots = json::array();
 	for ( size_t i = 0; i < mon.slots.size(); ++i ) {
 		const auto& s = mon.slots[i];
