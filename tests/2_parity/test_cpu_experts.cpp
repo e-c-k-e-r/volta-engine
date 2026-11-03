@@ -188,8 +188,8 @@ static void part2( const std::string& dir, int layer, int expert ) {
 		half_to_float( xh.data(), xf.data(), xf.size() );
 		std::vector<float> wts( rows ), out( static_cast<size_t>( rows ) * H, 0.0f );
 		for ( auto& w : wts ) w = 0.5f + rnd() * 0.25f;
+		Scratch scratch;   // before the pool, so its workers are joined first
 		Pool pool( 4, {} );
-		Scratch scratch;
 		expert_forward( pool, ex, rows, xh.data(), wts.data(), out.data(), scratch );
 		std::vector<double> ref( out.size() );
 		for ( int r = 0; r < rows; ++r ) {
@@ -216,8 +216,8 @@ static void part2( const std::string& dir, int layer, int expert ) {
 	for ( int thr : thread_counts() ) {
 		std::vector<int> cpus;
 		for ( int t = 1; t < thr; ++t ) cpus.push_back( allowed_cpus()[t] );
+		Scratch scratch;   // before the pool: the pool's workers are joined (its destructor) before the tasks they may still hold go away
 		Pool pool( thr, cpus );
-		Scratch scratch;
 		std::vector<uint16_t> xh( H, 0x3c00 );
 		std::vector<float> out( H ), wts( 1, 1.0f );
 		for ( int i = 0; i < 3; ++i ) expert_forward( pool, ex, 1, xh.data(), wts.data(), out.data(), scratch );
@@ -323,8 +323,8 @@ static void part3() {
 		float_to_half( xf.data(), xh.data(), xf.size() );
 		half_to_float( xh.data(), xf.data(), xf.size() );
 		for ( auto& w : wts ) w = 0.6f;
+		Scratch sc;   // before the pool, so its workers are joined first
 		Pool pool( 3, {} );
-		Scratch sc;
 		expert_forward( pool, ex, rows, xh.data(), wts.data(), out.data(), sc );
 		std::vector<double> ref( out.size() );
 		for ( int r = 0; r < rows; ++r ) {
@@ -356,8 +356,8 @@ static void part3_many() {
 	std::vector<std::vector<uint16_t>> xh( E );
 	std::vector<std::vector<float>> w( E ), one( E ), many( E );
 	std::vector<ExpertCall> calls;
+	Scratch sc;   // before the pool, so its workers are joined first
 	Pool pool( 4, {} );
-	Scratch sc;
 	for ( int e = 0; e < E; ++e ) {
 		const int rows = 1 + e % 3;
 		std::vector<float> xf( static_cast<size_t>( rows ) * H );
@@ -386,8 +386,8 @@ static void part3_speed() {
 	for ( int thr : thread_counts() ) {
 		std::vector<int> cpus;
 		for ( int t = 1; t < thr; ++t ) cpus.push_back( allowed_cpus()[t] );
+		Scratch sc;   // before the pool, so its workers are joined first
 		Pool pool( thr, cpus );
-		Scratch sc;
 		std::vector<uint16_t> xh( H, 0x3c00 );
 		std::vector<float> out( H ), wts( 1, 1.0f );
 		for ( int i = 0; i < 3; ++i ) expert_forward( pool, ex, 1, xh.data(), wts.data(), out.data(), sc );
@@ -407,9 +407,9 @@ struct CountTask : Task {
 	bool finished() const override { return done.load() >= 50; }
 };
 static void pool_stress() {
+	std::vector<CountTask> tasks( 8 );   // tasks outlive the call and the pool: a worker may still look at the last one until the pool is joined
 	Pool pool( 6, {}, 20 );
 	long total = 0;
-	std::vector<CountTask> tasks( 8 );   // tasks outlive the call: a worker may still look at the last one
 	for ( int i = 0; i < 20000; ++i ) {
 		CountTask& t = tasks[i % 8];
 		while ( t.refs.load() != 0 ) {}   // nobody holds it
@@ -437,9 +437,9 @@ static void part3_stream() {
 	std::vector<int> all;
 	{ std::string c = std::getenv( "CPUS" ); size_t p0 = 0; while ( p0 < c.size() ) { size_t q = c.find( ',', p0 ); if ( q == std::string::npos ) q = c.size(); all.push_back( std::atoi( c.substr( p0, q - p0 ).c_str() ) ); p0 = q + 1; } }
 	std::vector<int> rest( all.begin() + 1, all.end() );
+	Scratch sc;   // before the pool, so its workers are joined first
 	Pool pool( static_cast<int>( all.size() ), rest );
 	cpu_set_t cs; CPU_ZERO( &cs ); CPU_SET( all[0], &cs ); sched_setaffinity( 0, sizeof cs, &cs );
-	Scratch sc;
 	std::vector<uint16_t> xh( H, 0x3c00 );
 	std::vector<float> out( H ), wts( 1, 1.0f );
 	double ms = 0; int cnt = 0;
@@ -491,12 +491,12 @@ static void part2_split( const std::vector<ExpertCall>& calls ) {
 	const int n1 = static_cast<int>( allowed_cpus().size() );
 	std::vector<int> cpus1;
 	for ( int t = 1; t < n1; ++t ) cpus1.push_back( allowed_cpus()[t] );
+	Scratch s1, s2;   // before the pools, so their workers are joined first
 	Pool pool1( n1, cpus1 );
 	Pool pool2( static_cast<int>( c2.size() ), std::vector<int>( c2.begin() + 1, c2.end() ) );
 	TestSecond second;
 	second.pool = &pool2;
 	second.start( c2[0] );
-	Scratch s1, s2;
 	const int H = calls[0].e.hidden(), n = static_cast<int>( calls.size() );
 	// exactness: the same experts through one pool and through two
 	std::vector<std::vector<float>> a( n, std::vector<float>( H, 0.0f ) ), b( n, std::vector<float>( H, 0.0f ) );
@@ -554,8 +554,8 @@ static void part2_many( const std::string& dir, int layer, int first, int n ) {
 	for ( int thr : thread_counts() ) {
 		std::vector<int> cpus;
 		for ( int t = 1; t < thr; ++t ) cpus.push_back( allowed_cpus()[t] );
+		Scratch scratch;   // before the pool, so its workers are joined first
 		Pool pool( thr, cpus );
-		Scratch scratch;
 		for ( int i = 0; i < 3; ++i ) expert_forward_many( pool, calls.data(), n, scratch );
 		const int reps = 20;
 		const auto t0 = std::chrono::steady_clock::now();

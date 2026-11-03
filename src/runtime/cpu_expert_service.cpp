@@ -39,13 +39,14 @@ void Service::quiesce() {
 	stop_ = true;
 	if ( th_.joinable() ) th_.join();
 	if ( th2_.joinable() ) th2_.join();
+	// the pools' workers first: Pool::run does not wait for a worker still on the last task, which may read the mailboxes and the experts' copies
+	pool_.reset();
+	pool2_.reset();
 	std::lock_guard<std::mutex> l( mu_ );
 	for ( auto& r : ranks_ ) if ( r && r->mb ) backend::host_free_pinned( r->mb );
 	ranks_.clear();
 	for ( auto& m : maps_ ) munmap( m.first, m.second );
 	maps_.clear();
-	pool_.reset();
-	pool2_.reset();
 	stop_ = false;
 	started_ = false;
 	++ranks_version_;
