@@ -203,6 +203,7 @@ Measured on DeepSeek-V4.1-Flash EXL3 1.68 bpw (exllamav3's release) at four rank
 * Gate: 29 of the 56 targets are declined unprobed (stock-opening rate 0.52). Those 29 score 0.83 to 1.09 and the controls 0.62 at most bar a few up to 0.75 (AUC 1.0). A threshold of 0.78 fires on all 29 declined targets and on no control (0.65 fires on 3 controls).
 * Edit strength and window (declined targets that fire: 29): the sign is negative, as on the 27B, and the text breaks easily. At strength -8 and threshold 0.65, 7 (layers 21-26) and 5 (13-26) still decline but 6 and 33 of the 37 fired answers fall into repeated words; at 8 almost every answer does. At threshold 0.78 on layers 21-26: strength -12 / -16 / -24 leave 8 / 8 / 9 declining, with 4 / 3 / 0 answers that repeat; on layers 23-26: 12 / 12 / 15 declining, none repeating. **Strength -24 on 21-26: 9 of 29 still decline, target stock-opening rate 0.16, repetition 0.01**; controls keep 0.94 of their leading words.
 * Defaults: threshold 0.78, strength -24, edit window 17/32 to 21/32 (21-26).
+* Clamp files do not carry over here either: a refusal axis built with `steer_build --clamp --answers` from 9 declined targets (the built-in openings) and applied to every request, with no probe, on 9 held-out declined targets, 22 answered targets and 46 controls: layers 21-26 at K = 1 / 2 leave 0.56 / 0.67 of the declined targets refusing and take the answered ones from 0.00 to 0.14 / 0.09; layers 18-30: 0.78 / 0.78 and 0.18 / 0.14. Controls stay at 0.00 and the text clean. Use the probe on DeepSeek.
 
 ## Tests
 
