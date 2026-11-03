@@ -136,6 +136,9 @@ void dflash2_topk(
 // stride is `row_stride` (the padded shard width), and adds `index_offset` so the winner is a global
 // token id. The scratch is caller-owned, so this is safe inside a CUDA graph and per device, unlike
 // dflash2_topk's process-global lazily-allocated scratch.
+// Per row: the max of the shard's first `columns` logits and the sum of exp( x - max ), written as out[2 * row] and out[2 * row + 1]
+void logits_lse_shard( const backend::half_t* logits, int rows, int row_stride, int columns, float* out, backend::stream_t stream );
+
 void dflash2_topk_shard(
 	const backend::half_t* logits,
 	int rows,

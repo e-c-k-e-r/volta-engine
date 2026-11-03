@@ -32,6 +32,8 @@ struct ServerConfig {
 	float default_temperature = -1.0f;
 	float default_top_p = -1.0f;
 	int default_top_k = -1;
+	float default_presence_penalty = 0.0f;     // from generation_config.json when it sets them
+	float default_repetition_penalty = 1.0f;
 	bool default_enable_thinking = false; // requests without an explicit setting (reasoning_effort / thinking enable it)
 
 	std::string model_type;      // deduced by resolve() from <model_dir>/config.json (qwen3_5 | glm5_next)

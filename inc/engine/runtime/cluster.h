@@ -81,6 +81,8 @@ public:
 	// Top-16 candidates (merged across the vocabulary shards, descending) for each of the last forward's first
 	// `count` rows, for temperature / top-p sampling. Synchronizes.
 	void sample_topk( int count, Candidates* out );
+	// sample_topk also fills Candidates::lse (a log-sum-exp over the vocabulary per row) while a request wants log-probabilities
+	void set_logprobs( bool on ) { logprobs_ = on; }
 
 	// Full-vocabulary FP16 logits of the last forward's first `rows` rows, copied to host
 	// ([rows, vocab_size], row-major). Reassembles the TP shards when the LM head is sharded.
@@ -176,6 +178,7 @@ private:
 	void* staging_ptrs_[ENGINE_NUM_GPUS] = {};
 	void* flag_ptrs_[ENGINE_NUM_GPUS] = {};
 	std::unique_ptr<Speculator> runner_;
+	bool logprobs_ = false;
 	DFlash2Runner* dflash_ = nullptr;   // runner_ when it is DFlash2
 	std::vector<MmLayout> slot_mm_;   // per slot
 	int mm_slots_ = 0;                // slots with a non-empty layout

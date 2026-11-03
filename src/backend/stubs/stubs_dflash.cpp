@@ -13,6 +13,11 @@ __attribute__(( weak )) void dflash2_topk_shard(
 	__builtin_unreachable();
 }
 
+__attribute__(( weak )) void logits_lse_shard( const backend::half_t* logits, int rows, int row_stride, int columns, float* out, backend::stream_t stream ) {
+	ENGINE_UNSUPPORTED( "logits_lse_shard" );
+	__builtin_unreachable();
+}
+
 __attribute__(( weak )) void dflash2_topk_merge(
 	const float* part_vals, const int* part_ix, int tp_size, int rows, int k, float* out_vals, int* out_ix, int part_rows, backend::stream_t stream
 ) {

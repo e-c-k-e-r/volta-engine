@@ -169,7 +169,7 @@ values are fatal errors. The model type is never configured: it is read from the
 | `host`, `port` | `--host`, `--port` | 0.0.0.0, 8000 | listen address |
 | `max_batch_size` | `--max-batch-size` | 8 | concurrent decode slots the scheduler may fill (capped by `max_slots`) |
 | `default_max_tokens` | `--max-tokens` | 256 | `max_tokens` for requests that omit it |
-| `default_temperature`, `default_top_p`, `default_top_k` | `--temperature` | from the checkpoint's `generation_config.json` | sampling defaults for requests that omit them |
+| `default_temperature`, `default_top_p`, `default_top_k` | `--temperature` | from the checkpoint's `generation_config.json` | sampling defaults for requests that omit them (`presence_penalty` and `repetition_penalty` are also taken from that file when it sets them) |
 | `default_enable_thinking` | | false | thinking on for requests that do not say |
 | `request_timeout_s` | | 30 | seconds a connection may stay silent before its request is complete |
 | `video` | see below | | MiniMax-H3 settings |
@@ -412,12 +412,15 @@ bool ServerConfig::resolve() {
 				if ( default_temperature < 0.0f && g.contains( "temperature" ) && g["temperature"].is_number() ) default_temperature = g["temperature"].get<float>();
 				if ( default_top_p < 0.0f && g.contains( "top_p" ) && g["top_p"].is_number() ) default_top_p = g["top_p"].get<float>();
 				if ( default_top_k < 0 && g.contains( "top_k" ) && g["top_k"].is_number_integer() ) default_top_k = g["top_k"].get<int>();
+				if ( g.contains( "presence_penalty" ) && g["presence_penalty"].is_number() ) default_presence_penalty = g["presence_penalty"].get<float>();
+				if ( g.contains( "repetition_penalty" ) && g["repetition_penalty"].is_number() ) default_repetition_penalty = g["repetition_penalty"].get<float>();
 			}
 		}
 		if ( default_temperature < 0.0f ) default_temperature = 0.0f;
 		if ( default_top_p < 0.0f ) default_top_p = 1.0f;
 		if ( default_top_k < 0 ) default_top_k = 16;
-		LOG_INFO( "Sampling defaults: temperature %.2f, top_p %.2f, top_k %d\n", default_temperature, default_top_p, default_top_k );
+		LOG_INFO( "Sampling defaults: temperature %.2f, top_p %.2f, top_k %d, presence penalty %.2f, repetition penalty %.2f\n", default_temperature, default_top_p, default_top_k,
+			default_presence_penalty, default_repetition_penalty );
 	}
 	if ( use_speculation && draft_model_dir.empty() && runtime::options().speculator != "mtp" && runtime::options().speculator != "suffix" ) {
 		LOG_ERROR( "FATAL: use_speculation requires draft_model_dir\n" );

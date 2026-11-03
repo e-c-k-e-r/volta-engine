@@ -345,6 +345,10 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	g.top_p = req.top_p >= 0.0f ? req.top_p : cfg.default_top_p;
 	g.top_k = req.top_k > 0 ? req.top_k : cfg.default_top_k;
 	g.seed = req.seed;
+	g.presence_penalty = req.presence_penalty > -1000.0f ? req.presence_penalty : cfg.default_presence_penalty;
+	g.frequency_penalty = req.frequency_penalty;
+	g.repetition_penalty = req.repetition_penalty > 0.0f ? req.repetition_penalty : cfg.default_repetition_penalty;
+	g.logprobs = req.logprobs;
 	g.stop_strings = req.stop;
 	if ( req.stop_on_loop >= 0 ) g.loop_detect = req.stop_on_loop ? 2 : 0;
 	g.starts_in_reasoning = in_reasoning;
@@ -392,6 +396,18 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		}
 		return true;
 	};
+	if ( req.logprobs >= 0 ) {
+		const engine::loader::Tokenizer* tk = &gen.tokenizer();
+		g.on_logprobs = [state, tk]( const std::vector<engine::runtime::TokenLogprob>& entries ) {
+			std::vector<LogprobOut> out( entries.size() );
+			for ( size_t i = 0; i < entries.size(); ++i ) {
+				out[i].token = tk->decode_token( entries[i].id );
+				out[i].logprob = entries[i].logprob;
+				for ( int k = 0; k < entries[i].n; ++k ) out[i].top.emplace_back( tk->decode_token( entries[i].ids[k] ), entries[i].logprobs[k] );
+			}
+			state->responder->on_logprobs( out );
+		};
+	}
 	g.on_finish = [state]( engine::runtime::FinishReason reason, const std::string& matched, const engine::runtime::SlotMetrics& m ) {
 		std::vector<OutputEvent> events;
 		state->parser.finish( events );

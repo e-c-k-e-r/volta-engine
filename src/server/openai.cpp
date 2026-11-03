@@ -124,7 +124,7 @@ bool normalize_messages( const json& messages, json* out, std::vector<std::strin
 class OpenAIResponder : public Responder {
 public:
 	OpenAIResponder( const ChatRequest& req, ConnPtr conn, uint64_t id )
-		: conn_( std::move( conn ) ), stream_( req.stream ), include_usage_( req.include_usage ), model_( req.model ), id_( id ),
+		: conn_( std::move( conn ) ), stream_( req.stream ), include_usage_( req.include_usage ), logprobs_( req.logprobs >= 0 ), model_( req.model ), id_( id ),
 		  created_( static_cast<int64_t>( std::time( nullptr ) ) ) {
 		completion_id_ = "chatcmpl-" + std::to_string( id );
 	}
@@ -146,6 +146,15 @@ public:
 		return send_delta( { { reasoning ? "reasoning_content" : "content", ev.text } } );
 	}
 
+	void on_logprobs( const std::vector<LogprobOut>& entries ) override {
+		for ( const LogprobOut& e : entries ) {
+			json top = json::array();
+			for ( const auto& t : e.top ) top.push_back( { { "token", t.first }, { "logprob", t.second }, { "bytes", bytes_of( t.first ) } } );
+			json item = { { "token", e.token }, { "logprob", e.logprob }, { "bytes", bytes_of( e.token ) }, { "top_logprobs", top } };
+			( stream_ ? pending_lp_ : all_lp_ ).push_back( std::move( item ) );
+		}
+	}
+
 	void on_finish( engine::runtime::FinishReason reason, const std::string&, bool had_tool_calls, const Usage& usage ) override {
 		using engine::runtime::FinishReason;
 		const char* finish = had_tool_calls ? "tool_calls" : ( reason == FinishReason::Length ? "length" : "stop" );
@@ -157,6 +166,10 @@ public:
 			if ( !ensure_started() ) return;
 			json last = chunk();
 			last["choices"] = json::array( { { { "index", 0 }, { "delta", json::object() }, { "finish_reason", finish } } } );
+			if ( !pending_lp_.empty() ) {
+				last["choices"][0]["logprobs"] = { { "content", pending_lp_ } };
+				pending_lp_ = json::array();
+			}
 			if ( !sse( last ) ) return;
 			if ( include_usage_ ) {
 				json u = chunk();
@@ -180,6 +193,7 @@ public:
 		}
 		json resp = { { "id", completion_id_ }, { "object", "chat.completion" }, { "created", created_ }, { "model", model_ },
 			{ "choices", json::array( { { { "index", 0 }, { "message", msg }, { "finish_reason", finish } } } ) }, { "usage", usage_json( usage ) } };
+		if ( logprobs_ ) resp["choices"][0]["logprobs"] = { { "content", all_lp_ } };
 		send_json( conn_, 200, dump_safe( resp ) );
 	}
 
@@ -210,17 +224,28 @@ private:
 		if ( !ensure_started() ) return false;
 		json c = chunk();
 		c["choices"] = json::array( { { { "index", 0 }, { "delta", delta }, { "finish_reason", nullptr } } } );
+		if ( !pending_lp_.empty() ) {
+			c["choices"][0]["logprobs"] = { { "content", pending_lp_ } };
+			pending_lp_ = json::array();
+		}
 		return sse( c );
 	}
 
+	static json bytes_of( const std::string& s ) {
+		json b = json::array();
+		for ( unsigned char ch : s ) b.push_back( static_cast<int>( ch ) );
+		return b;
+	}
+
 	ConnPtr conn_;
-	bool stream_, include_usage_;
+	bool stream_, include_usage_, logprobs_;
 	std::string model_, completion_id_;
 	uint64_t id_;
 	int64_t created_;
 	bool started_ = false;
 	std::string content_, reasoning_;
 	std::vector<ToolCallOut> calls_;
+	json pending_lp_ = json::array(), all_lp_ = json::array();
 };
 
 class OpenAIProtocol : public ChatProtocol {
@@ -264,6 +289,24 @@ public:
 		if ( j.contains( "top_p" ) && j["top_p"].is_number() ) r.top_p = j["top_p"].get<float>();
 		if ( j.contains( "top_k" ) && j["top_k"].is_number_integer() ) r.top_k = j["top_k"].get<int>();
 		if ( j.contains( "seed" ) && j["seed"].is_number_integer() ) r.seed = j["seed"].get<uint64_t>();
+		for ( const char* key : { "presence_penalty", "frequency_penalty" } ) {
+			if ( j.contains( key ) && j[key].is_number() ) {
+				const float v = j[key].get<float>();
+				if ( v < -2.0f || v > 2.0f ) return fail( err, std::string( key ) + " must be between -2 and 2" );
+				( key[0] == 'p' ? r.presence_penalty : r.frequency_penalty ) = v;
+			}
+		}
+		if ( j.value( "logprobs", false ) ) {
+			r.logprobs = 0;
+			if ( j.contains( "top_logprobs" ) && j["top_logprobs"].is_number_integer() ) {
+				r.logprobs = j["top_logprobs"].get<int>();
+				if ( r.logprobs < 0 || r.logprobs > 20 ) return fail( err, "top_logprobs must be between 0 and 20" );
+			}
+		}
+		if ( j.contains( "repetition_penalty" ) && j["repetition_penalty"].is_number() ) {
+			r.repetition_penalty = j["repetition_penalty"].get<float>();
+			if ( r.repetition_penalty <= 0.0f ) return fail( err, "repetition_penalty must be positive" );
+		}
 		if ( j.contains( "stop" ) ) {
 			if ( j["stop"].is_string() ) r.stop.push_back( j["stop"].get<std::string>() );
 			else if ( j["stop"].is_array() ) {

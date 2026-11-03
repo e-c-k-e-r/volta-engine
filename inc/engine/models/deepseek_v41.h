@@ -121,6 +121,7 @@ public:
 	void sample_tokens( int* out_preds, int count, backend::stream_t stream = nullptr ) override;
 	bool sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream = nullptr ) override;
 	bool topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream = nullptr ) override;
+	bool lse_local( float* out, int count, backend::stream_t stream = nullptr ) override;
 	const backend::half_t* shard_logits_ptr() const override { return logits_.ptr<const backend::half_t>(); }
 	int shard_logits_cols() const override { return lm_shard_cols_; }
 	const pod::TensorView& gather_logits( int rows, const backend::half_t* const* peer_shard_ptrs, int peer_shard_cols, backend::stream_t stream = nullptr ) override;

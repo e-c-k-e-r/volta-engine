@@ -3,6 +3,7 @@
 #include "engine/config.h"
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 namespace engine::runtime {
 
@@ -13,19 +14,69 @@ namespace engine::runtime {
 // recommended temperatures, and this definition is exact for the speculative acceptance below.
 static constexpr int kSampleTopK = 16;
 
+// A request's token history for the penalties: how often each token was generated, and which tokens the prompt holds
+struct TokenHistory {
+	std::vector<uint16_t> out;      // per token id: times generated (saturating)
+	std::vector<uint8_t> prompt;    // per token id: 1 if it occurs in the prompt (repetition penalty only)
+	void init( int vocab, const std::vector<int>& prompt_tokens, bool with_prompt ) {
+		out.assign( static_cast<size_t>( vocab ), 0 );
+		prompt.clear();
+		if ( with_prompt ) {
+			prompt.assign( static_cast<size_t>( vocab ), 0 );
+			for ( int t : prompt_tokens ) if ( t >= 0 && t < vocab ) prompt[t] = 1;
+		}
+	}
+	void add( int tok ) {
+		if ( tok >= 0 && static_cast<size_t>( tok ) < out.size() && out[tok] < 0xFFFF ) ++out[tok];
+	}
+};
+
 struct SamplingParams {
 	float temperature = 0.0f;   // 0 = greedy
 	float top_p = 1.0f;
 	int top_k = kSampleTopK;
 	uint64_t seed = 0;
+	// OpenAI presence / frequency penalties over the generated tokens, and the multiplicative repetition penalty over prompt and output
+	float presence_penalty = 0.0f;
+	float frequency_penalty = 0.0f;
+	float repetition_penalty = 1.0f;
+	const TokenHistory* history = nullptr;
+	int logprobs = -1;          // >= 0: report each token's log-probability and this many alternatives
 	bool greedy() const { return temperature <= 0.0f; }
+	bool penalized() const { return history != nullptr && ( presence_penalty != 0.0f || frequency_penalty != 0.0f || repetition_penalty != 1.0f ); }
+	// the token is chosen on the host from the top-k candidates (sampling, or greedy over penalized logits) instead of the device argmax
+	bool host() const { return !greedy() || penalized() || logprobs >= 0; }
 };
 
 struct Candidates {
 	int n = 0;                  // valid entries, sorted by logit descending
 	int ids[kSampleTopK] = {};
 	float logits[kSampleTopK] = {};
+	float lse = NAN;            // log-sum-exp of the row over the whole vocabulary, when log-probabilities were asked for
 };
+
+// A generated token's log-probability under the model (raw logits: before temperature, truncation and penalties) and the top alternatives
+struct TokenLogprob {
+	int id = 0;
+	float logprob = 0.0f;
+	int n = 0;
+	int ids[kSampleTopK] = {};
+	float logprobs[kSampleTopK] = {};
+};
+
+// The entry for token `tok` from its row's candidates (tok is always among them: tokens are chosen from the top kSampleTopK)
+inline TokenLogprob token_logprob( const Candidates& c, int tok, int top ) {
+	TokenLogprob e;
+	e.id = tok;
+	e.logprob = -INFINITY;
+	for ( int i = 0; i < c.n; ++i ) if ( c.ids[i] == tok ) e.logprob = c.logits[i] - c.lse;
+	e.n = top < c.n ? top : c.n;
+	for ( int i = 0; i < e.n; ++i ) {
+		e.ids[i] = c.ids[i];
+		e.logprobs[i] = c.logits[i] - c.lse;
+	}
+	return e;
+}
 
 // splitmix64-seeded xoshiro256++: small, fast, and reproducible across runs for a given seed.
 class Rng {
@@ -86,6 +137,40 @@ inline void make_dist( const Candidates& c, const SamplingParams& p, double prob
 	for ( int i = 0; i < kSampleTopK; ++i ) probs[i] = ( i < keep ) ? probs[i] / kept : 0.0;
 }
 
+// Apply the penalties to a row's candidates and restore the descending order. `drafted` are the tokens of the speculative block before
+// this row (they precede it in the text the row's logits condition on); n_drafted of them count as generated.
+inline void penalize( Candidates& c, const SamplingParams& p, const int* drafted, int n_drafted ) {
+	if ( !p.penalized() ) return;
+	const TokenHistory& h = *p.history;
+	for ( int i = 0; i < c.n; ++i ) {
+		const int id = c.ids[i];
+		int cnt = ( id >= 0 && static_cast<size_t>( id ) < h.out.size() ) ? h.out[id] : 0;
+		for ( int j = 0; j < n_drafted; ++j ) cnt += drafted[j] == id ? 1 : 0;
+		const bool in_prompt = id >= 0 && static_cast<size_t>( id ) < h.prompt.size() && h.prompt[id];
+		float l = c.logits[i];
+		if ( p.repetition_penalty != 1.0f && ( cnt > 0 || in_prompt ) ) l = l > 0.0f ? l / p.repetition_penalty : l * p.repetition_penalty;
+		l -= p.frequency_penalty * static_cast<float>( cnt ) + ( cnt > 0 ? p.presence_penalty : 0.0f );
+		c.logits[i] = l;
+	}
+	for ( int i = 1; i < c.n; ++i ) {
+		const float l = c.logits[i];
+		const int id = c.ids[i];
+		int j = i - 1;
+		for ( ; j >= 0 && c.logits[j] < l; --j ) {
+			c.logits[j + 1] = c.logits[j];
+			c.ids[j + 1] = c.ids[j];
+		}
+		c.logits[j + 1] = l;
+		c.ids[j + 1] = id;
+	}
+}
+
+// The rows of a verified block: row k follows the k drafted tokens before it
+inline void penalize_block( Candidates* cs, int rows, const SamplingParams& p, const int* drafts ) {
+	if ( !p.penalized() ) return;
+	for ( int k = 0; k < rows; ++k ) penalize( cs[k], p, drafts, k );
+}
+
 inline int sample_dist( const Candidates& c, const double probs[kSampleTopK], Rng& rng ) {
 	const double u = rng.uniform();
 	double cum = 0.0;
@@ -110,6 +195,11 @@ inline int sample_token( const Candidates& c, const SamplingParams& p, Rng& rng 
 // which is what the DFlash2 walk produces). Accept d with probability p(d); otherwise draw from p with d removed
 // and renormalised. The returned token is distributed exactly as a sample from p. Sets *accepted.
 inline int spec_step( const Candidates& c, const SamplingParams& p, int d, Rng& rng, bool* accepted ) {
+	if ( p.greedy() ) {
+		// greedy over penalized candidates: the draft must be the best one
+		*accepted = c.ids[0] == d;
+		return c.ids[0];
+	}
 	double probs[kSampleTopK];
 	make_dist( c, p, probs );
 	double pd = 0.0;

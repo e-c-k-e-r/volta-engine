@@ -1,6 +1,7 @@
 // Host-only checks of the sampler: (1) sample_token reproduces the truncated distribution, (2) speculative
 // acceptance against a deterministic draft returns tokens distributed exactly as the target, whatever the draft
-// token is (including one outside the candidate set), and (3) the same seed gives the same stream.
+// token is (including one outside the candidate set), (3) the penalties (arithmetic, order, drafted tokens, greedy and
+// sampled acceptance on penalized rows), and (4) the same seed gives the same stream.
 #include "engine/runtime/sampling.h"
 #include <cstdio>
 #include <map>
@@ -76,6 +77,65 @@ int main() {
 			std::snprintf( name, sizeof( name ), "spec    T=%.1f p=%.2f k=%d draft=%d", p.temperature, p.top_p, p.top_k, d );
 			check_freq( name, hs, N, c, probs );
 		}
+	}
+
+	// Penalties: the arithmetic, the restored order, drafted tokens counting like generated ones, and exact acceptance on penalized rows.
+	{
+		TokenHistory h;
+		h.init( 2000, { c.ids[1] }, true );
+		h.add( c.ids[0] );
+		h.add( c.ids[0] );
+		SamplingParams p{ 1.0f, 1.0f, 16, 1 };
+		p.presence_penalty = 1.5f;
+		p.frequency_penalty = 0.3f;
+		p.repetition_penalty = 1.2f;
+		p.history = &h;
+		Candidates pc = c;
+		penalize( pc, p, nullptr, 0 );
+		auto logit_of = []( const Candidates& x, int id ) { for ( int i = 0; i < x.n; ++i ) if ( x.ids[i] == id ) return x.logits[i]; return -1e30f; };
+		const float want0 = c.logits[0] / 1.2f - 0.3f * 2 - 1.5f, want1 = c.logits[1] / 1.2f, want2 = c.logits[2];
+		bool math = std::fabs( logit_of( pc, c.ids[0] ) - want0 ) < 1e-5f && std::fabs( logit_of( pc, c.ids[1] ) - want1 ) < 1e-5f &&
+			logit_of( pc, c.ids[2] ) == want2;
+		bool sorted = true;
+		for ( int i = 1; i < pc.n; ++i ) sorted = sorted && pc.logits[i] <= pc.logits[i - 1];
+		g_fail += math && sorted ? 0 : 1;
+		std::printf( "  %-44s %s\n", "penalty arithmetic and order", math && sorted ? "PASS" : "FAIL" );
+
+		// a drafted token counts as generated: penalizing with c.ids[2] drafted equals a history that generated it
+		TokenHistory h2 = h;
+		h2.add( c.ids[2] );
+		SamplingParams p2 = p;
+		p2.history = &h2;
+		Candidates a = c, b = c;
+		const int drafted[] = { c.ids[2] };
+		penalize( a, p, drafted, 1 );
+		penalize( b, p2, nullptr, 0 );
+		bool same = true;
+		for ( int i = 0; i < a.n; ++i ) same = same && a.ids[i] == b.ids[i] && a.logits[i] == b.logits[i];
+		g_fail += same ? 0 : 1;
+		std::printf( "  %-44s %s\n", "drafted tokens count as generated", same ? "PASS" : "FAIL" );
+
+		// greedy over penalized rows: the draft is accepted only when it is the penalized best
+		SamplingParams g = p;
+		g.temperature = 0.0f;
+		Rng r0( 1 );
+		bool acc_best = false, acc_old = true;
+		const int t_best = spec_step( pc, g, pc.ids[0], r0, &acc_best );
+		const int t_old = spec_step( pc, g, c.ids[0], r0, &acc_old );
+		const bool greedy_ok = g.host() && acc_best && t_best == pc.ids[0] && ( pc.ids[0] == c.ids[0] || ( !acc_old && t_old == pc.ids[0] ) );
+		g_fail += greedy_ok ? 0 : 1;
+		std::printf( "  %-44s %s\n", "greedy acceptance on penalized rows", greedy_ok ? "PASS" : "FAIL" );
+
+		// sampled: speculative acceptance on the penalized row reproduces the penalized distribution
+		double probs[kSampleTopK];
+		make_dist( pc, p, probs );
+		Rng r2( 9 );
+		std::map<int, long> hs;
+		for ( long i = 0; i < N; ++i ) {
+			bool acc = false;
+			++hs[spec_step( pc, p, c.ids[0], r2, &acc )];
+		}
+		check_freq( "spec    penalized T=1.0 draft=old best", hs, N, pc, probs );
 	}
 
 	// Reproducibility.

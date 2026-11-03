@@ -466,6 +466,18 @@ void ModelCluster::sample_topk( int count, Candidates* out ) {
 			c.ids[j] = t[j];
 		}
 	}
+	if ( logprobs_ ) {
+		// per rank: the max and the sum of exp( x - max ) over its vocabulary shard; combined into the log-sum-exp of the whole row
+		float part[ENGINE_NUM_GPUS][pod::MAX_BATCH * 2];
+		pool_.run( [&]( int d ) { ok[d] = models_[d]->lse_local( part[d], count, streams_[d] ) ? 1 : 0; } );
+		for ( int r = 0; r < count; ++r ) {
+			float m = -INFINITY;
+			for ( int d = 0; d < tp_; ++d ) m = ok[d] && part[d][2 * r] > m ? part[d][2 * r] : m;
+			double sum = 0.0;
+			for ( int d = 0; d < tp_; ++d ) if ( ok[d] ) sum += part[d][2 * r + 1] * std::exp( static_cast<double>( part[d][2 * r] ) - m );
+			out[r].lse = m + static_cast<float>( std::log( sum ) );
+		}
+	}
 }
 
 void ModelCluster::sample( int* out, int count ) {

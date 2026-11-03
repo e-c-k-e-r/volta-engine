@@ -330,6 +330,18 @@ public:
 		}
 		if ( j.contains( "top_p" ) && j["top_p"].is_number() ) r.top_p = j["top_p"].get<float>();
 		if ( j.contains( "top_k" ) && j["top_k"].is_number_integer() ) r.top_k = j["top_k"].get<int>();
+		// extensions (not in the Anthropic API): the same penalties as the OpenAI front end
+		for ( const char* key : { "presence_penalty", "frequency_penalty" } ) {
+			if ( j.contains( key ) && j[key].is_number() ) {
+				const float v = j[key].get<float>();
+				if ( v < -2.0f || v > 2.0f ) return fail( err, std::string( key ) + " must be between -2 and 2" );
+				( key[0] == 'p' ? r.presence_penalty : r.frequency_penalty ) = v;
+			}
+		}
+		if ( j.contains( "repetition_penalty" ) && j["repetition_penalty"].is_number() ) {
+			r.repetition_penalty = j["repetition_penalty"].get<float>();
+			if ( r.repetition_penalty <= 0.0f ) return fail( err, "repetition_penalty must be positive" );
+		}
 		if ( j.contains( "stop_on_loop" ) && j["stop_on_loop"].is_boolean() ) r.stop_on_loop = j["stop_on_loop"].get<bool>() ? 1 : 0;
 		if ( j.contains( "stop_sequences" ) && j["stop_sequences"].is_array() ) {
 			for ( const auto& s : j["stop_sequences"] ) {

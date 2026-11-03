@@ -355,7 +355,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	const auto& meta = mc.metadata();
 	const backend::stream_t s0 = mc.stream( 0 );
 	SpecResult res;
-	const bool sampled = sp != nullptr && !sp->greedy();
+	const bool sampled = sp != nullptr && sp->host();
 	ENGINE_ASSERT( !sampled || rng != nullptr, "DFlash2Runner::speculate: sampling needs an Rng" );
 	prof_last_ = SpecProfile::DRAFT;
 	prof_t0_ = impl::now_ms();
@@ -369,6 +369,8 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		if ( sampled ) {
 			Candidates c1[1];
 			mc.sample_topk( 1, c1 );
+			if ( sp->logprobs >= 0 ) { res.rows[0] = c1[0]; res.has_rows = true; }
+			penalize( c1[0], *sp, nullptr, 0 );
 			res.emitted[res.emitted_count++] = sample_token( c1[0], *sp, *rng );
 		}
 		else {
@@ -398,6 +400,11 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	const bool spool = TargetSpool::get().on();
 	if ( sampled ) mc.sample_topk( active + 1, cs );
 	else mc.sample( preds, active + 1 );
+	if ( sampled && sp->logprobs >= 0 ) {
+		std::copy( cs, cs + active + 1, res.rows );
+		res.has_rows = true;
+	}
+	if ( sampled ) penalize_block( cs, active + 1, *sp, cands );   // row k follows the k drafts before it
 	if ( spool && !sampled ) mc.sample_topk( active + 1, cs );
 	mark( SpecProfile::REPAIR );
 	++prof_.rounds;
@@ -550,7 +557,7 @@ void DFlash2Runner::speculate_joint( int n, const int* slots, const int* anchors
 			vslot[base[j] + t] = slots[i];
 			vpos[base[j] + t] = poss[i] + t;
 		}
-		any_sampled = any_sampled || ( sps[i] != nullptr && !sps[i]->greedy() );
+		any_sampled = any_sampled || ( sps[i] != nullptr && sps[i]->host() );
 	}
 	mc.set_spec_snapshot( true );
 	mc.forward( vtok, pod::BatchRows::batched( total, vslot, vpos ) );
@@ -566,11 +573,16 @@ void DFlash2Runner::speculate_joint( int n, const int* slots, const int* anchors
 		const int i = who[j];
 		SpecResult& res = out[i];
 		res = SpecResult();
-		const bool sampled = sps[i] != nullptr && !sps[i]->greedy();
+		const bool sampled = sps[i] != nullptr && sps[i]->host();
 		ENGINE_ASSERT( !sampled || rngs[i] != nullptr, "DFlash2Runner::speculate_joint: sampling needs an Rng" );
 		const int* cands = hd[j] + 1;
 		const int b = base[j], act = active[j];
 		res.proposed = act;
+		if ( sampled && sps[i]->logprobs >= 0 ) {
+			std::copy( cs + b, cs + b + act + 1, res.rows );
+			res.has_rows = true;
+		}
+		if ( sampled ) penalize_block( cs + b, act + 1, *sps[i], cands );
 		for ( int t = 0; t < act; ++t ) {
 			if ( !offered[j] ) ++att_[t];
 			if ( sampled ) {

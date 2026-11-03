@@ -62,6 +62,10 @@ struct GenerationRequest {
 	float top_p = 1.0f;
 	int top_k = 16;          // capped at 16 (kSampleTopK)
 	uint64_t seed = 0;       // 0 = derive from req_id
+	float presence_penalty = 0.0f;    // OpenAI semantics, over the generated tokens
+	float frequency_penalty = 0.0f;
+	float repetition_penalty = 1.0f;  // multiplicative, over prompt and output (1 = off)
+	int logprobs = -1;                // >= 0: report each token's log-probability and this many alternatives (at most 16)
 	struct Checkpoint {
 		int pos = 0;
 		bool pinned = false;
@@ -101,6 +105,8 @@ struct GenerationRequest {
 	int loop_detect = -1;                    // -1 = the loop_detect option, 0 off, 1 report (log only), 2 stop (FinishReason::Loop)
 	// Called from the scheduler thread with detokenized text (never the end-of-sequence token). Returning false cancels.
 	std::function<bool( const std::string& delta )> on_text;
+	// With logprobs: called just before the on_text that carries these tokens' text (and once before on_finish for the rest)
+	std::function<void( const std::vector<TokenLogprob>& entries )> on_logprobs;
 	// Called once, from the scheduler thread, when the request leaves its slot.
 	std::function<void( FinishReason reason, const std::string& matched_stop, const SlotMetrics& metrics )> on_finish;
 };
@@ -222,6 +228,8 @@ private:
 		int last_token = -1;   // sampled, not yet forwarded (next anchor)
 		SamplingParams sp;
 		Rng rng;
+		TokenHistory history;   // only filled when the request sets a penalty
+		std::vector<TokenLogprob> pending_logprobs;   // emitted since the last text delta
 		bool prefill_done = false;
 		// A prompt fed in pieces between decode steps of the other slots
 		bool pf_started = false;
@@ -266,7 +274,7 @@ private:
 	static constexpr int kPrefixMinTokens = 512;
 	// Commits `tok` to slot s's output; returns true when the request finished.
 	static int loop_detect_mode();
-	bool emit_token( int s, int tok );
+	bool emit_token( int s, int tok, const Candidates* row = nullptr );   // row: the token's unpenalized candidates, for log-probabilities
 	void finish_slot( int s, FinishReason reason );
 	void apply_forced_close( int s );
 	// Steering (option steer): the slot's edits, scope, prompt length and reflection-marker penalty on every rank, set when the request is admitted

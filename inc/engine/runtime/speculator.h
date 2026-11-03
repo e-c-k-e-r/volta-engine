@@ -12,6 +12,9 @@ struct SpecResult {
 	int emitted[pod::MAX_BATCH] = {};  // tokens committed this round (accepted drafts + correction/bonus)
 	int emitted_count = 0;
 	int next_pos = 0;                  // position of the next anchor (== tokens committed to KV)
+	// with SamplingParams::logprobs: the unpenalized verify row of each emitted token (rows[i] for emitted[i])
+	Candidates rows[pod::MAX_BATCH];
+	bool has_rows = false;
 };
 
 // A source of draft tokens for the target's batched verify (DFlash2: a block drafter reading tapped hidden states; MTP: the

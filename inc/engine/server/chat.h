@@ -34,6 +34,10 @@ struct ChatRequest {
 	float top_p = -1.0f;         // <0: server default
 	int top_k = -1;              // <0: server default
 	uint64_t seed = 0;
+	float presence_penalty = -1000.0f;    // -1000: server default
+	float frequency_penalty = 0.0f;
+	float repetition_penalty = -1.0f;     // <0: server default
+	int logprobs = -1;                    // >= 0: report token log-probabilities with this many alternatives
 	std::vector<std::string> stop;
 	int stop_on_loop = -1;       // extension field stop_on_loop: -1 the loop_detect option, 0 off, 1 stop on a detected loop
 	int enable_thinking = -1;    // -1: server default
@@ -63,6 +67,13 @@ struct Usage {
 	bool gate_fired = false;
 };
 
+// A generated token's log-probability and its top alternatives, as text
+struct LogprobOut {
+	std::string token;
+	float logprob = 0.0f;
+	std::vector<std::pair<std::string, float>> top;
+};
+
 // Writes one protocol's response for one request. Called from the scheduler thread.
 class Responder {
 public:
@@ -70,6 +81,8 @@ public:
 	// Parsed pieces in order. Returning false cancels the generation.
 	virtual void on_prompt( int prompt_tokens ) { (void) prompt_tokens; }
 	virtual bool on_event( const OutputEvent& ev ) = 0;
+	// With ChatRequest::logprobs: the entries of the tokens whose text the next on_event calls carry
+	virtual void on_logprobs( const std::vector<LogprobOut>& entries ) { (void) entries; }
 	virtual void on_finish( engine::runtime::FinishReason reason, const std::string& matched_stop, bool had_tool_calls, const Usage& usage ) = 0;
 };
 

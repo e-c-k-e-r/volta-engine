@@ -1304,6 +1304,16 @@ bool Glm5NextPipeline::sample_local( int* out_tokens, float* out_vals, int count
 	return true;
 }
 
+bool Glm5NextPipeline::lse_local( float* out, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Glm5NextPipeline::lse_local: count exceeds last forward rows" );
+	backend::set_device( rank_ );
+	// the top-k value scratch is free here (topk_local copies it out and syncs on this stream first)
+	engine::spec::logits_lse_shard( logits_.ptr<const backend::half_t>(), count, lm_shard_cols_, lm_shard_real_cols_, d_samp_vals_, stream );
+	backend::memcpy_async( out, d_samp_vals_, static_cast<size_t>( count ) * 2 * sizeof( float ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
+	return true;
+}
+
 bool Glm5NextPipeline::topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream ) {
 	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Glm5NextPipeline::topk_local: count exceeds last forward rows" );
 	backend::set_device( rank_ );

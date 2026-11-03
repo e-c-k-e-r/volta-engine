@@ -1239,6 +1239,41 @@ void dflash2_topk(
 	);
 }
 
+// Per row of a vocabulary shard: the max of the real columns and the sum of exp( x - max ), online, so the ranks' partials combine
+// on the host into the log-sum-exp over the whole vocabulary (logprobs).
+__global__ void logits_lse_shard_kernel( const half* __restrict__ logits, int row_stride, int columns, float* __restrict__ out ) {
+	const half* x = logits + static_cast<size_t>( blockIdx.x ) * row_stride;
+	float m = -INFINITY, sum = 0.0f;
+	for ( int c = threadIdx.x; c < columns; c += blockDim.x ) {
+		const float v = __half2float( x[c] );
+		if ( v > m ) { sum = sum * __expf( m - v ) + 1.0f; m = v; }
+		else sum += __expf( v - m );
+	}
+	__shared__ float sm[256], ss[256];
+	sm[threadIdx.x] = m;
+	ss[threadIdx.x] = sum;
+	__syncthreads();
+	for ( int w = blockDim.x / 2; w > 0; w >>= 1 ) {
+		if ( threadIdx.x < w ) {
+			const float m2 = sm[threadIdx.x + w], s2 = ss[threadIdx.x + w], m1 = sm[threadIdx.x], s1 = ss[threadIdx.x];
+			const float mm = fmaxf( m1, m2 );
+			sm[threadIdx.x] = mm;
+			ss[threadIdx.x] = ( m1 == -INFINITY ? 0.0f : s1 * __expf( m1 - mm ) ) + ( m2 == -INFINITY ? 0.0f : s2 * __expf( m2 - mm ) );
+		}
+		__syncthreads();
+	}
+	if ( threadIdx.x == 0 ) {
+		out[2 * blockIdx.x] = sm[0];
+		out[2 * blockIdx.x + 1] = ss[0];
+	}
+}
+
+void logits_lse_shard( const half* logits, int rows, int row_stride, int columns, float* out, cudaStream_t stream ) {
+	if ( rows <= 0 || columns <= 0 ) return;
+	logits_lse_shard_kernel<<<rows, 256, 0, stream>>>( logits, row_stride, columns, out );
+	CUDA_CHECK( cudaGetLastError() );
+}
+
 void dflash2_topk_shard(
 	const half* logits,
 	int rows,

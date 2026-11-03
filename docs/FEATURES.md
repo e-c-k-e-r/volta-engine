@@ -122,6 +122,8 @@ Covered by `test_all_reduce`, `bench_all_reduce`, `test_coherence`, `tests/4_ser
 | Jinja chat templates | default | own subset, tested against reference renders |
 | Escaping of control tokens inside message content | default | quoted source cannot end or open a turn |
 | Sampling: temperature, top-p, top-k (capped at 16), seed | default | greedy = GPU argmax; sampled = GPU top-16 merged across shards |
+| Penalties: `presence_penalty`, `frequency_penalty` (over the generated tokens) and `repetition_penalty` (multiplicative, over prompt and output) | per request | applied to the top-16 candidates of every row, verify rows included (each row counts the drafts before it), so speculation stays exact; `presence_penalty` and `repetition_penalty` default from `generation_config.json`; the Anthropic front end accepts them as extensions |
+| Log-probabilities: `logprobs`, `top_logprobs` (at most 16 alternatives) | opt-in, per request | raw model log-probabilities (before temperature, truncation and penalties), normalised over the whole vocabulary; streamed with the chunk that carries the token's text; reasoning tokens included |
 | Prefix-cache usage reporting | default | `cached_tokens` / `cache_read_input_tokens` |
 | `/health`, `/metrics`, `/metrics/prometheus` | default | |
 | `/monitor`: throughput, slots, TTFT and token-gap percentiles, speculation, prefix cache, per-GPU NVML power / clocks / throttle, MoE routing heat | default | `expert_stats` |
@@ -130,7 +132,7 @@ Covered by `test_all_reduce`, `bench_all_reduce`, `test_coherence`, `tests/4_ser
 
 Covered by `test_output_parser`, `test_jinja`, `test_tokenizer*`, `test_sampling`, `test_sampling_gpu`, `tests/4_server/*`.
 
-Not parsed: repetition / presence / frequency penalties, `logprobs`, `n` above 1.
+Not parsed: `n` above 1.
 
 ## Backends
 

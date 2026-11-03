@@ -133,6 +133,12 @@ public:
 	// 4b'. Vocabulary-parallel top-k for sampling: this rank's top-kSampleTopK (16) logits per row over its shard of
 	// the last forward's first `count` rows, with global token ids, into caller-owned host arrays
 	// [count][16] (descending). False when the logits are not sharded.
+	// Per row of the last forward: max and sum of exp( logit - max ) over this rank's vocabulary shard (out[2 * row], out[2 * row + 1]),
+	// for log-probabilities. False when the model has no vocabulary-parallel head.
+	virtual bool lse_local( float* out, int count, backend::stream_t stream = nullptr ) {
+		(void) out; (void) count; (void) stream;
+		return false;
+	}
 	virtual bool topk_local( float* out_vals, int* out_ids, int count, backend::stream_t stream = nullptr ) {
 		(void) out_vals;
 		(void) out_ids;

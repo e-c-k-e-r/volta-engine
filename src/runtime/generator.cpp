@@ -134,6 +134,14 @@ void Generator::admit_pending() {
 		slot.sp.top_k = MAX( 1, MIN( slot.req.top_k, kSampleTopK ) );
 		slot.sp.seed = slot.req.seed != 0 ? slot.req.seed : ( 0x51ED270B0F5A8C3DULL ^ slot.req.req_id );
 		slot.rng.reseed( slot.sp.seed );
+		slot.sp.logprobs = slot.req.logprobs < 0 ? -1 : MIN( slot.req.logprobs, kSampleTopK );
+		slot.sp.presence_penalty = slot.req.presence_penalty;
+		slot.sp.frequency_penalty = slot.req.frequency_penalty;
+		slot.sp.repetition_penalty = slot.req.repetition_penalty > 0.0f ? slot.req.repetition_penalty : 1.0f;
+		if ( slot.sp.presence_penalty != 0.0f || slot.sp.frequency_penalty != 0.0f || slot.sp.repetition_penalty != 1.0f ) {
+			slot.history.init( cluster_.metadata().vocab_size, slot.req.prompt_tokens, slot.sp.repetition_penalty != 1.0f );
+			slot.sp.history = &slot.history;
+		}
 		slot.in_reasoning = slot.req.starts_in_reasoning;
 		slot.loop_mode = slot.req.loop_detect >= 0 ? slot.req.loop_detect : loop_detect_mode();
 		if ( slot.loop_mode > 0 ) {
@@ -163,6 +171,9 @@ void Generator::scheduler_loop() {
 			} );
 			continue;
 		}
+		bool want_logprobs = false;
+		for ( int s = 0; s < num_slots_; ++s ) want_logprobs = want_logprobs || ( slots_[s].active && slots_[s].sp.logprobs >= 0 );
+		cluster_.set_logprobs( want_logprobs );
 		step_batch();
 		heat_pending_ = true;
 		for ( int s = 0; s < num_slots_; ++s ) apply_forced_close( s );
@@ -177,9 +188,11 @@ int Generator::loop_detect_mode() {
 	return m == "stop" ? 2 : m == "report" ? 1 : 0;
 }
 
-bool Generator::emit_token( int s, int tok ) {
+bool Generator::emit_token( int s, int tok, const Candidates* row ) {
 	Slot& slot = slots_[s];
+	if ( slot.sp.logprobs >= 0 && row != nullptr ) slot.pending_logprobs.push_back( token_logprob( *row, tok, slot.sp.logprobs ) );
 	slot.all_tokens.push_back( tok );
+	if ( slot.sp.history ) slot.history.add( tok );
 	slot.tokens_generated++;
 	tokens_out_.fetch_add( 1, std::memory_order_relaxed );
 	{
@@ -272,6 +285,10 @@ bool Generator::emit_token( int s, int tok ) {
 	if ( finish ) {
 		out += slot.held_text;
 		slot.held_text.clear();
+	}
+	if ( ( !out.empty() || finish ) && !slot.pending_logprobs.empty() ) {
+		if ( slot.req.on_logprobs ) slot.req.on_logprobs( slot.pending_logprobs );
+		slot.pending_logprobs.clear();
 	}
 	if ( !out.empty() && slot.req.on_text && !slot.req.on_text( out ) ) {
 		finish = true;
@@ -501,12 +518,16 @@ bool Generator::prefill_slot( int s, int budget ) {
 		int seg_end = end;
 		if ( budget > 0 ) seg_end = MIN( end, pos + MAX( 1, budget - fed ) );
 		if ( seg_end >= n ) {
-			Candidates first_cands;
+			Candidates first_cands, first_raw;
 			const auto t_pf = std::chrono::steady_clock::now();
-			int first = cluster_.prefill( prompt.data() + pos, n - pos, s, 0, slot.sp.greedy() ? nullptr : &first_cands, pos );
+			int first = cluster_.prefill( prompt.data() + pos, n - pos, s, 0, slot.sp.host() ? &first_cands : nullptr, pos );
 			slot.metrics.prefill_ms += std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_pf ).count();
 			tokens_prefilled_.fetch_add( static_cast<uint64_t>( n - pos ), std::memory_order_relaxed );
-			if ( !slot.sp.greedy() ) first = sample_token( first_cands, slot.sp, slot.rng );
+			if ( slot.sp.host() ) {
+				first_raw = first_cands;
+				penalize( first_cands, slot.sp, nullptr, 0 );
+				first = sample_token( first_cands, slot.sp, slot.rng );
+			}
 			slot.current_pos = n;
 			slot.prefill_done = true;
 			slot.metrics.first_token_time = std::chrono::steady_clock::now();
@@ -515,7 +536,7 @@ bool Generator::prefill_slot( int s, int budget ) {
 			slot.metrics.cached_tokens = slot.pf_resumed;
 			slot.metrics.prefill_tok_s = ( ttft_ms > 0.0 ) ? static_cast<float>( n / ( ttft_ms / 1000.0 ) ) : 0.0f;
 			slot.last_token = first;
-			emit_token( s, first );
+			emit_token( s, first, slot.sp.logprobs >= 0 ? &first_raw : nullptr );
 			return true;
 		}
 		const auto t_pf = std::chrono::steady_clock::now();
@@ -867,7 +888,7 @@ void Generator::step_batch() {
 				spec_accepted_ += res[i].accepted;
 			}
 			for ( int t = 0; t < res[i].emitted_count; ++t ) {
-				if ( emit_token( s, res[i].emitted[t] ) ) break;
+				if ( emit_token( s, res[i].emitted[t], res[i].has_rows ? &res[i].rows[t] : nullptr ) ) break;
 			}
 		}
 		return;
@@ -895,7 +916,7 @@ void Generator::step_batch() {
 			spec_accepted_ += r.accepted;
 		}
 		for ( int i = 0; i < r.emitted_count; ++i ) {
-			if ( emit_token( s, r.emitted[i] ) ) break;
+			if ( emit_token( s, r.emitted[i], r.has_rows ? &r.rows[i] : nullptr ) ) break;
 		}
 		return;
 	}
@@ -912,13 +933,17 @@ void Generator::step_batch() {
 	int preds[MAX_SLOTS];
 	cluster_.sample( preds, n );
 	bool any_sampled = false;
-	for ( int i = 0; i < n; ++i ) any_sampled = any_sampled || !slots_[ids[i]].sp.greedy();
+	for ( int i = 0; i < n; ++i ) any_sampled = any_sampled || slots_[ids[i]].sp.host();
+	Candidates raw[MAX_SLOTS];
 	if ( any_sampled ) {
 		Candidates cs[MAX_SLOTS];
 		cluster_.sample_topk( n, cs );
+		std::copy( cs, cs + n, raw );
 		for ( int i = 0; i < n; ++i ) {
 			Slot& sl = slots_[ids[i]];
-			if ( !sl.sp.greedy() ) preds[i] = sample_token( cs[i], sl.sp, sl.rng );
+			if ( !sl.sp.host() ) continue;
+			penalize( cs[i], sl.sp, nullptr, 0 );
+			preds[i] = sample_token( cs[i], sl.sp, sl.rng );
 		}
 	}
 	if ( per_slot ) {
@@ -940,7 +965,7 @@ void Generator::step_batch() {
 		Slot& slot = slots_[ids[i]];
 		slot.current_pos++;
 		slot.last_token = preds[i];
-		emit_token( ids[i], preds[i] );
+		emit_token( ids[i], preds[i], any_sampled && slot.sp.logprobs >= 0 ? &raw[i] : nullptr );
 	}
 }
 

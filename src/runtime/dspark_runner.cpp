@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cmath>
+#include <algorithm>
 #include "engine/runtime/dspark_runner.h"
 #include "engine/runtime/cluster.h"
 #include "engine/runtime/options.h"
@@ -74,7 +75,7 @@ SpecResult DSparkRunner::speculate( int slot, int anchor, int pos, float depth_t
 	SlotState& S = st_[slot];
 	ModelCluster& mc = *mc_;
 	SpecResult res;
-	const bool sampled = sp != nullptr && !sp->greedy();
+	const bool sampled = sp != nullptr && sp->host();
 	ENGINE_ASSERT( !sampled || rng != nullptr, "DSparkRunner::speculate: sampling needs an Rng" );
 	const int room = mc.metadata().max_seq_len - pos - 2;
 	int active = MIN( S.n, room );
@@ -104,6 +105,8 @@ SpecResult DSparkRunner::speculate( int slot, int anchor, int pos, float depth_t
 		if ( sampled ) {
 			Candidates c1[1];
 			mc.sample_topk( 1, c1 );
+			if ( sp->logprobs >= 0 ) { res.rows[0] = c1[0]; res.has_rows = true; }
+			penalize( c1[0], *sp, nullptr, 0 );
 			res.emitted[res.emitted_count++] = sample_token( c1[0], *sp, *rng );
 		}
 		else {
@@ -124,6 +127,11 @@ SpecResult DSparkRunner::speculate( int slot, int anchor, int pos, float depth_t
 	Candidates cs[pod::MAX_BATCH];
 	if ( sampled ) mc.sample_topk( active + 1, cs );
 	else mc.sample( preds, active + 1 );
+	if ( sampled && sp->logprobs >= 0 ) {
+		std::copy( cs, cs + active + 1, res.rows );
+		res.has_rows = true;
+	}
+	if ( sampled ) penalize_block( cs, active + 1, *sp, cands );   // row k follows the k drafts before it
 	verify_ms_ += std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t1 ).count();
 	for ( int k = 0; k < active; ++k ) {
 		++att_[k];
