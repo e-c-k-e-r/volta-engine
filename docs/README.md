@@ -33,6 +33,7 @@
 * [CAPABILITIES.md](CAPABILITIES.md): which module functions each backend implements (generated)
 * [KERNEL_MAP.md](KERNEL_MAP.md): kernel family -> file -> what verifies it
 * [TESTS.md](TESTS.md): the test inventory and what `tests/tools/gate.sh` runs
+* [DEADENDS.md](DEADENDS.md): approaches that were measured and did not pay, with the numbers and the reasons
 * [ROCM.md](ROCM.md): the AMD RDNA (ROCm) build, how the CUDA sources run there, and what still runs on the emulation
 * [HARDWARE_SM70.md](HARDWARE_SM70.md): Volta notes (no `cp.async`, no FP4, fragment layouts, cooperative launch limits, NVLink)
 * [FLASH_NEXT.md](FLASH_NEXT.md): Qwen3.8-Flash-Next and the NVFP4 paths, with the numbers
