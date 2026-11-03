@@ -164,12 +164,9 @@ bool DFlashSpeculator::init(
 	// otherwise -- and that fallback is the one code path the block side never exercises. Keep the
 	// chunk at 8 until the cooperative GEMM has its own parity gate.
 	//
-	// This has to be settled before any buffer that is sized from it. It used to be assigned further
-	// down, after bb_kv_stage_ was already allocated from it, so that staging buffer was sized
-	// MAX(M, 0) = block_size rows while the context loop wrote up to ctx_chunk_ rows into it -- 32 rows
-	// of overrun at the parity geometry, 256 in production. The arena is a bump allocator with no
-	// guard, so it silently overwrote the buffers allocated after it (the FP32 residual carrier, the
-	// pre-attn/pre-MLP conv staging and the K/V cache itself) rather than faulting.
+	// This has to be settled before any buffer sized from it: bb_kv_stage_ below takes MAX(M, ctx_chunk_)
+	// rows because the context loop writes up to ctx_chunk_ rows into it, and the arena is a bump allocator
+	// with no guard, so a short staging buffer would silently overwrite the buffers allocated after it.
 	ctx_chunk_ = MIN( ring_len_, 256 );
 
 	const int kv_stage_cols = MAX( q_heads_local * config_.head_dim, kv_heads_local * config_.head_dim );

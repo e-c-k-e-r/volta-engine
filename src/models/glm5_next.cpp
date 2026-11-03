@@ -192,9 +192,8 @@ bool Glm5NextPipeline::init(
 	embed_rows_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rows_shape, 2 );
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
-	steer_.init( arena, config_.hidden_size, config_.num_layers, S, rank_ );
+	steer_.init( arena, config_.hidden_size, config_.num_layers, S, rank_, R );
 	int h_shape[2] = { R, config_.hidden_size };
-	if ( steer_.on() ) steer_mean_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	hidden_states_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	norm_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 
@@ -627,7 +626,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 
 	int missing_count = 0;
 
-	// Dense groups quantized to NVFP4 at load from the BF16 tensors of a modelopt checkpoint (ENGINE_NVFP4_DENSE_SRC, ENGINE_NVFP4_DENSE); the
+	// Dense groups quantized to NVFP4 at load from the BF16 tensors of a modelopt checkpoint (nvfp4_dense_src, nvfp4_dense); the
 	// routed experts stay EXL3. The dense MLP layers are NVFP4 in that checkpoint already and load as they are (group `dense`)
 	std::unique_ptr<engine::loader::SafeTensorsRepo> nv_repo;
 	if ( const std::string& nv_dir = runtime::options().nvfp4_dense_src; !nv_dir.empty() && ( !runtime::options().nvfp4_dense.empty() || mtp_on_ || !runtime::options().nvfp4_expert_layers.empty() ) ) {
@@ -895,7 +894,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 				if ( rank_ == 0 ) LOG_INFO( "[RANK 0] layer %d: routed experts from the NVFP4 checkpoint\n", L );
 			}
 			else {
-			// Tiered experts (ENGINE_EXPERT_CACHE < 1): the codes of resident experts go to device slots, the rest to pinned host memory
+			// Tiered experts (expert_cache < 1): the codes of resident experts go to device slots, the rest to pinned host memory
 			double tier_fraction = engine::modules::ExpertTier::resident_fraction();
 			const bool resident_fraction_auto = tier_fraction <= 0.0;
 			experts_cost_from = arena_->offset_bytes;
@@ -1464,24 +1463,12 @@ void Glm5NextPipeline::forward_head( int m, backend::stream_t stream ) {
 }
 
 void Glm5NextPipeline::steer_penalize( pod::TensorView& logits, int row0, int n, backend::stream_t stream ) {
-	if ( steer_.on() ) engine::modules::ResidualSteer::penalize( steer_.tables(), logits.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, row0, n, lm_shard_offset_, lm_shard_real_cols_, stream );
+	steer_.penalize( logits.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, row0, n, lm_shard_offset_, lm_shard_real_cols_, stream );
 }
 
 void Glm5NextPipeline::steer_layer( int L, int m, backend::stream_t stream ) {
-	const int H = config_.hidden_size;
-	const bool hc = layers_[L].hc_ffn_fn.data != nullptr;
-	if ( const int li = steer_.index( L ); li >= 0 ) {
-		if ( hc ) engine::modules::ResidualSteer::apply_streams( steer_.tables(), hidden_streams_.ptr<float>(), 4, d_rows_, m, li, stream );
-		else engine::modules::ResidualSteer::apply( steer_.tables(), hidden_states_.ptr<backend::half_t>(), d_rows_, m, li, stream );
-	}
-	if ( backend::half_t* dst = steer_.capture_dst( L ) ) {
-		const backend::half_t* src = hidden_states_.ptr<const backend::half_t>();
-		if ( hc ) {
-			engine::spec::dflash_reduce_streams( hidden_streams_.ptr<const float>(), steer_mean_.ptr<backend::half_t>(), m, H, 0, stream );
-			src = steer_mean_.ptr<const backend::half_t>();
-		}
-		backend::memcpy_async( dst, src + static_cast<size_t>( m - 1 ) * H, H * sizeof( backend::half_t ), backend::Copy::D2D, stream );
-	}
+	if ( layers_[L].hc_ffn_fn.data != nullptr ) steer_.layer_streams( hidden_streams_.ptr<float>(), d_rows_, m, L, stream );
+	else steer_.layer_rows( hidden_states_.ptr<backend::half_t>(), d_rows_, m, L, stream );
 }
 
 // A window of consecutive prefill chunks of one slot, layer by layer: every chunk runs its attention and router, the routed experts run once over all

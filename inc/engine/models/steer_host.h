@@ -19,7 +19,8 @@ public:
 	// Position of a model layer in the steered range, -1 outside it
 	int index( int layer ) const { return layer >= first_ && layer < first_ + t_.layers ? layer - first_ : -1; }
 
-	void init( pod::MemoryArena& arena, int hidden, int num_layers, int slots, int rank );
+	// mean_rows > 0 (the four-stream models): a [mean_rows, hidden] fp16 buffer for the stream mean a probe captures
+	void init( pod::MemoryArena& arena, int hidden, int num_layers, int slots, int rank, int mean_rows = 0 );
 	void set( int slot, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream );
 	void control( int slot, int scope, int prompt_len, int think_end, backend::stream_t stream );
 	void penalty( int slot, const std::vector<int>& ids, float penalty, backend::stream_t stream );
@@ -30,6 +31,14 @@ public:
 	backend::half_t* capture_dst( int layer ) const { return cap_on_ && cap_layer_[layer] >= 0 ? cap_ + static_cast<size_t>( cap_layer_[layer] ) * t_.hidden : nullptr; }
 	bool read( std::vector<float>& out, backend::stream_t stream );
 
+	// After model layer `layer`: its edits on the rows' fp16 residual [m, hidden], and the probe's capture of the last row
+	void layer_rows( backend::half_t* hidden, const pod::BatchRows* d_rows, int m, int layer, backend::stream_t stream ) const;
+	// The same for a residual of four fp32 streams per row [m, 4, hidden]: the edits act on the streams' mean (ResidualSteer::apply_streams), the
+	// capture reads the mean
+	void layer_streams( float* streams, const pod::BatchRows* d_rows, int m, int layer, backend::stream_t stream ) const;
+	// The reflection-marker penalty on logit rows [row0, row0 + n) of this rank's vocabulary slice [shard_lo, shard_lo + shard_cols); nothing while off
+	void penalize( backend::half_t* logits, int logit_cols, const pod::BatchRows* d_rows, int row0, int n, int shard_lo, int shard_cols, backend::stream_t stream ) const;
+
 private:
 	engine::modules::SteerTables t_;
 	int first_ = 0;
@@ -39,6 +48,17 @@ private:
 	std::vector<int> cap_layer_;   // per model layer: row of cap_ (-1 = not kept)
 	std::vector<int> cap_order_;   // the captured layers in the caller's order
 	backend::half_t* cap_ = nullptr;
+	backend::half_t* mean_ = nullptr;   // [mean_rows, hidden]
 };
+
+// The Model steering overrides of a pipeline that owns a SteerHost named `host`
+#define ENGINE_STEER_HOOKS( host ) \
+	bool steer_enabled() const override { return host.on(); } \
+	void steer_set( int slot_id, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream = nullptr ) override { host.set( slot_id, entries, stream ); } \
+	void steer_control( int slot_id, int scope, int prompt_len, int think_end, backend::stream_t stream = nullptr ) override { host.control( slot_id, scope, prompt_len, think_end, stream ); } \
+	void steer_penalty( int slot_id, const std::vector<int>& ids, float penalty, backend::stream_t stream = nullptr ) override { host.penalty( slot_id, ids, penalty, stream ); } \
+	void steer_capture( const std::vector<int>& layers, bool on ) override { host.capture( layers, on ); } \
+	bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) override { return host.read( out, stream ); } \
+	void steer_range( int* first_layer, int* num_layers ) const override { *first_layer = host.first(); *num_layers = host.layers(); }
 
 } // namespace engine::models

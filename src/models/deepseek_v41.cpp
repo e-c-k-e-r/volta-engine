@@ -486,8 +486,7 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 	d_token_ids_ = dev_alloc<int>( arena, R );
 	embed_rows_ = dev_tensor( arena, pod::DType::FP16, R, H );
 	streams_ = dev_tensor( arena, pod::DType::FP32, 4 * R, H );
-	steer_.init( arena, H, L, S, rank_ );
-	if ( steer_.on() ) steer_mean_ = dev_tensor( arena, pod::DType::FP16, R, H );
+	steer_.init( arena, H, L, S, rank_, R );
 	norm_x_ = dev_tensor( arena, pod::DType::FP16, R, H );
 	collapsed_ = dev_tensor( arena, pod::DType::FP16, R, H );
 	attn_out_ = dev_tensor( arena, pod::DType::FP16, R, H );
@@ -1635,17 +1634,11 @@ void DeepseekV41Pipeline::forward_head( int m, backend::stream_t stream ) {
 }
 
 void DeepseekV41Pipeline::steer_penalize( pod::TensorView& logits, int row0, int n, backend::stream_t stream ) {
-	if ( steer_.on() ) engine::modules::ResidualSteer::penalize( steer_.tables(), logits.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, row0, n, lm_shard_offset_, lm_shard_real_cols_, stream );
+	steer_.penalize( logits.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, row0, n, lm_shard_offset_, lm_shard_real_cols_, stream );
 }
 
 void DeepseekV41Pipeline::steer_layer( int L, int m, backend::stream_t stream ) {
-	if ( !steer_.on() ) return;
-	const int H = config_.hidden_size;
-	if ( const int li = steer_.index( L ); li >= 0 ) engine::modules::ResidualSteer::apply_streams( steer_.tables(), streams_.ptr<float>(), 4, d_rows_, m, li, stream );
-	if ( backend::half_t* dst = steer_.capture_dst( L ) ) {
-		engine::spec::dflash_reduce_streams( streams_.ptr<const float>(), steer_mean_.ptr<backend::half_t>(), m, H, 0, stream );
-		backend::memcpy_async( dst, steer_mean_.ptr<const backend::half_t>() + static_cast<size_t>( m - 1 ) * H, H * sizeof( backend::half_t ), backend::Copy::D2D, stream );
-	}
+	steer_.layer_streams( streams_.ptr<float>(), d_rows_, m, L, stream );
 }
 
 void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {

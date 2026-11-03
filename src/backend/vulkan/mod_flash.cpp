@@ -1,6 +1,6 @@
 // Vulkan backend: the Qwen4Exp (Flash-Next) modules on the Slang kernels of src/kernels/slang/flash.slang: gated residual, the n-gram layer
 // (PLE), the QSA indexer, DSA selection, the sparse-list attention, the softmax router and the routed MoE. The MoE reads the routes back to the
-// host to batch the tokens per expert (the CPU form), so it cannot run inside a graph capture: use ENGINE_DEBUG_NO_GRAPHS=1 with it.
+// host to batch the tokens per expert (the CPU form), so it cannot run inside a graph capture: use no_graphs=1 with it.
 #include "mod_common.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/tiers.h"

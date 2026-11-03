@@ -219,7 +219,7 @@ void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, 
 
 void ExpertTier::code_arena( int layer, int expert, int part, pod::MemoryArena& out ) const {
 	const Layer& l = layers[layer];
-	// ENGINE_DEBUG_EXPERT_SYNTH: a cold expert shares the device slot of resident slot (expert mod resident), so every read is a device read
+	// expert_synth: a cold expert shares the device slot of resident slot (expert mod resident), so every read is a device read
 	const bool synth = runtime::options().expert_synth && l.slot_of[expert] < 0;
 	uint8_t* base = l.slot_of[expert] >= 0 ? l.slots + static_cast<size_t>( l.slot_of[expert] ) * slot_bytes
 		: synth ? l.slots + static_cast<size_t>( expert % resident ) * slot_bytes : l.host[expert];

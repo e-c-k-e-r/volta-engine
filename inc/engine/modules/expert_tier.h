@@ -68,7 +68,7 @@ struct ExpertTier {
 	bool stage_begin( int layer, backend::stream_t stream );      // the layer's MoE then reads the staged copy; false: nothing cold, run as usual
 	void stage_end( int layer, backend::stream_t stream );        // after the layer's MoE kernel
 
-	// ENGINE_EXPERT_CACHE: fraction of each layer's experts kept resident (1 or unset: tiering off)
+	// expert_cache: fraction of each layer's experts kept resident (1 or unset: tiering off)
 	static double resident_fraction();
 
 	bool active() const { return resident < experts; }
@@ -92,7 +92,7 @@ struct ExpertTier {
 	// returned views are where expert `e`'s three code tensors are to be loaded
 	void add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, pod::MemoryArena& host, std::vector<int> resident_set );
 	void code_arena( int layer, int expert, int part, pod::MemoryArena& out ) const;
-	// ENGINE_DEBUG_EXPERT_STREAM: the cold experts are not kept in host memory: before each layer's MoE `stream_fill` reads them from the
+	// expert_stream: the cold experts are not kept in host memory: before each layer's MoE `stream_fill` reads them from the
 	// checkpoint (parallel pread, so NVMe speed) into one pinned buffer shared by all layers, where the kernels read them in place
 	static bool stream_mode();
 	void set_source( int layer, int expert, int part, int fd, size_t off, size_t bytes );

@@ -168,16 +168,7 @@ bool Qwen3_5Pipeline::init(
 		pad_cols = ( 256 - ( lm_shard_real_cols_ % 256 ) ) % 256;
 	}
 	lm_shard_cols_ = lm_shard_real_cols_ + pad_cols;
-	if ( const int c = runtime::options().sparse_head; c > 0 && mtp_on_ ) {
-		// sparse drafter head: a rank can hold the whole subset (the frequent ids cluster at the low end of the vocabulary, i.e. on the first ranks)
-		const int H = config_.hidden_size;
-		sh_cap_ = std::min( std::max( 256, c ), lm_shard_real_cols_ );
-		sh_w_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( sh_cap_ ) * H * sizeof( backend::half_t ) ) );
-		sh_cols_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( sh_cap_ ) * sizeof( int ) ) );
-		sh_sub_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( sh_cap_ ) * sizeof( backend::half_t ) ) );
-		sh_ident_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( kShIdentRows ) * H * sizeof( backend::half_t ) ) );
-		sh_chunk_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( kShIdentRows ) * lm_shard_cols_ * sizeof( backend::half_t ) ) );
-	}
+	if ( mtp_on_ ) sparse_.init( arena, config_.hidden_size, lm_shard_real_cols_, lm_shard_cols_, 1 );
 	{
 		int logit_shape[2] = { R, lm_shard_cols_ };
 		logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
@@ -872,13 +863,7 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 	for ( int layer = 0; layer < config_.num_layers; ++layer ) {
 		hess_layer_ = layer;
 		layer_forward( layers_[layer], full_attn_idx, linear_idx, m, stream );
-		if ( steer_.on() ) {
-			if ( const int li = steer_.index( layer ); li >= 0 ) engine::modules::ResidualSteer::apply( steer_.tables(), hidden_states_.ptr<backend::half_t>(), d_rows_, m, li, stream );
-			if ( backend::half_t* dst = steer_.capture_dst( layer ) ) {
-				const size_t H = config_.hidden_size;
-				backend::memcpy_async( dst, hidden_states_.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * H, H * sizeof( backend::half_t ), backend::Copy::D2D, stream );
-			}
-		}
+		steer_.layer_rows( hidden_states_.ptr<backend::half_t>(), d_rows_, m, layer, stream );
 
 		// Tapped layer states for DFlash2: tapped_states_[r][tap] = hidden after layer tap_layers[tap]
 		for ( int tap = 0; tap < 5; ++tap ) {
@@ -912,14 +897,14 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 			pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
 			engine::modules::RMSNorm::forward( h1, final_norm_, n1, config_.rms_norm_eps, config_.rms_norm_bias, stream );
 			engine::modules::Linear::forward( n1, lm_head_, l1, stream );
-			if ( steer_.on() ) engine::modules::ResidualSteer::penalize( steer_.tables(), l1.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, m - 1, 1, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
+			steer_.penalize( l1.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, m - 1, 1, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
 			return;
 		}
 		engine::modules::RMSNorm::forward(
 			hidden_states_, final_norm_, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
 		);
 		engine::modules::Linear::forward( norm_hidden_, lm_head_, logits_, stream );
-		if ( steer_.on() ) engine::modules::ResidualSteer::penalize( steer_.tables(), logits_.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, 0, m, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
+		steer_.penalize( logits_.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, 0, m, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
 	}
 }
 
@@ -994,26 +979,11 @@ void Qwen3_5Pipeline::mtp_step( const pod::BatchRows& rows, const int* tokens, i
 	if ( logits_last && ( tp_size_ > 1 || rank_ == 0 ) ) {
 		pod::TensorView n1 = pod::make_tensor_2d( mtp_chain_.data, pod::DType::FP16, 1, H );
 		pod::TensorView l1 = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, 1, lm_shard_cols_ );
-		if ( sh_use_ ) {
-			// sparse drafter head: the subset's logits, every other column at the lowest value (the argmax that follows reads the shard as usual)
-			engine::modules::SparseHead::logits( sh_w_, sh_count_, sh_cols_, mtp_chain_.ptr<const backend::half_t>(), 1, config_.hidden_size, sh_sub_, logits_.ptr<backend::half_t>(), lm_shard_cols_, stream );
-		}
+		if ( sparse_.in_use() ) sparse_.logits( mtp_chain_.ptr<const backend::half_t>(), 1, logits_.ptr<backend::half_t>(), stream );   // the argmax that follows reads the shard as usual
 		else engine::modules::Linear::forward( n1, lm_head_, l1, stream );
 		logits_.shape[0] = 1;
 		last_rows_ = 1;
 	}
-}
-
-bool Qwen3_5Pipeline::sparse_head_set( const int* cols, int count, backend::stream_t stream ) {
-	if ( sh_cap_ == 0 ) return false;
-	ENGINE_ASSERT( count >= 0 && count <= sh_cap_, "Qwen3_5Pipeline::sparse_head_set: more columns than the buffer holds" );
-	backend::set_device( rank_ );
-	sh_use_ = false;
-	sh_count_ = count;
-	if ( count == 0 ) return true;
-	backend::memcpy_async( sh_cols_, cols, static_cast<size_t>( count ) * sizeof( int ), backend::Copy::H2D, stream );
-	engine::modules::SparseHead::extract( lm_head_, config_.hidden_size, lm_shard_cols_, sh_cols_, count, sh_ident_, sh_chunk_, kShIdentRows, sh_w_, stream );
-	return true;
 }
 
 // Keeps rows [src_row, src_row + rows) of the last forward's final-norm hidden for later MTP steps (row dst_row onwards)

@@ -4,7 +4,7 @@ namespace engine::core {
 
 enum class LogLevel { Error = 0, Warn = 1, Info = 2, Debug = 3 };
 
-// Threshold from the log_level option (ENGINE_LOG_LEVEL: error, warn, info, debug; default info)
+// Threshold from the log_level option (error, warn, info, debug; default info)
 LogLevel log_level();
 
 // printf-style line with a level prefix ("[-] ", "[!] ", "[*] ", "    "): errors and warnings go to stderr, the rest to stdout.

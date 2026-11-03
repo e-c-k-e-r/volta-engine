@@ -140,6 +140,7 @@ set(ENGINE_HOST_SOURCES
 	src/models/model.cpp
 	src/models/qwen3_5.cpp
 	src/models/steer_host.cpp
+	src/models/sparse_head_host.cpp
 	src/models/qwen3_vision.cpp
 	src/models/glm5_vision.cpp
 	src/models/deepseek_v41_vision.cpp

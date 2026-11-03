@@ -40,7 +40,7 @@ struct Glm5NextConfig {
 	int vocab_size = 154880;
 	int tp_size = 4;
 	int max_seq = 12288;
-	int max_slots = 1; // absorbed MLA latent cache: ~135 MiB/slot/rank at 12K (expanded K/V: 369 MiB at 2K); weights fill the 31 GiB arena and the FP16 drafter needs the last GiB (ENGINE_MAX_SEQ=32768 fits without it, 16384 with the EXL3 drafter)
+	int max_slots = 1; // absorbed MLA latent cache: ~135 MiB/slot/rank at 12K (expanded K/V: 369 MiB at 2K); weights fill the 31 GiB arena and the FP16 drafter needs the last GiB (max_seq=32768 fits without it, 16384 with the EXL3 drafter)
 	int num_mla_layers = 11;
 	int kda_heads = 16;
 	int kda_head_dim = 128;
@@ -176,7 +176,7 @@ public:
 
 	const DraftHooks& draft_hooks() const override { return draft_hooks_; }
 	bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) override;
-	// ENGINE_EXPERT_CACHE < 1: fold the routing counters into the experts' scores and move hot experts into the device tier
+	// expert_cache < 1: fold the routing counters into the experts' scores and move hot experts into the device tier
 	bool rebalance_experts( backend::stream_t stream = nullptr ) override;
 	void draft_head_topk( int rows, backend::stream_t stream = nullptr ) override;
 	void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) override;
@@ -207,13 +207,7 @@ public:
 	// MTP head (speculator=mtp, from the NVFP4 checkpoint's layer 45): see model.h 5d. The history rows are the final-norm hidden rows
 	bool has_mtp() const override { return mtp_on_; }
 	// Runtime steering (option steer): the edits act on the mean of the four residual streams and shift every stream by the change (ResidualSteer::apply_streams)
-	bool steer_enabled() const override { return steer_.on(); }
-	void steer_set( int slot_id, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream = nullptr ) override { steer_.set( slot_id, entries, stream ); }
-	void steer_control( int slot_id, int scope, int prompt_len, int think_end, backend::stream_t stream = nullptr ) override { steer_.control( slot_id, scope, prompt_len, think_end, stream ); }
-	void steer_penalty( int slot_id, const std::vector<int>& ids, float penalty, backend::stream_t stream = nullptr ) override { steer_.penalty( slot_id, ids, penalty, stream ); }
-	void steer_capture( const std::vector<int>& layers, bool on ) override { steer_.capture( layers, on ); }
-	bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) override { return steer_.read( out, stream ); }
-	void steer_range( int* first_layer, int* num_layers ) const override { *first_layer = steer_.first(); *num_layers = steer_.layers(); }
+	ENGINE_STEER_HOOKS( steer_ )
 	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
 	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
 
@@ -254,7 +248,7 @@ private:
 	pod::MemoryArena host_arena_{};     // pinned cold-expert tier
 	int tier_layers_ = 0;
 	engine::cpu_moe::CpuExpertHandle cpu_;   // cpu_experts: cold experts computed on the host CPU
-	// Calibration (ENGINE_HESSIAN_DIR): x^T x of a projection input over the prefill rows, per layer and site (0 attention input, 1 FFN input,
+	// Calibration (hessian_dir): x^T x of a projection input over the prefill rows, per layer and site (0 attention input, 1 FFN input,
 	// 2 o_proj input (rank slice), 3 shared-expert down input (layers 0-2: the dense MLP down input, 1 = its gate / up input), 4 q-lora norm output (MLA), 5 lm_head input with layer 0)
 	struct HessianSite { float* h = nullptr; int k = 0; int64_t rows = 0; };
 	std::vector<HessianSite> hess_;
@@ -292,7 +286,7 @@ private:
 	int ws_seq_ = 0;                  // context the workspace is sized for
 	bool use_journal_ = false;        // speculative verify journals the KDA rows and replays the accepted ones instead of keeping a state snapshot per row
 	pod::TensorView q_lat_;           // [rows, 16 * 512]
-	// DSA (ENGINE_DSA, default on with the latent cache): indexer planes and selection scratch
+	// DSA (dsa, default on with the latent cache): indexer planes and selection scratch
 	bool dsa_ = true;
 	backend::half_t* dsa_plane_ = nullptr;       // [slots][mla layers][DSA::PLANE_CAP][256]  ring of per-token [k_norm | gate]
 	backend::half_t* dsa_pool_ = nullptr;        // [slots][mla layers][max_seq / 4][128]  pooled keys
@@ -334,7 +328,6 @@ private:
 	void steer_layer( int L, int m, backend::stream_t stream );
 	void steer_penalize( pod::TensorView& logits, int row0, int n, backend::stream_t stream );   // the reflection-marker penalty on this rank's logit rows
 	SteerHost steer_;
-	pod::TensorView steer_mean_;         // [MAX_ROWS, hidden] fp16: the stream mean of a probe's capture
 	pod::TensorView tap_tmp_;            // [MAX_ROWS, hidden] mean of the 4 residual streams at a tapped layer
 
 	pod::TensorView embed_rows_;    // [MAX_ROWS, hidden] embedded inputs

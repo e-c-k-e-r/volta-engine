@@ -3,6 +3,7 @@
 #include "engine/modules/hessian.h"
 #include "engine/modules/steer.h"
 #include "engine/models/steer_host.h"
+#include "engine/models/sparse_head_host.h"
 #include "engine/config.h"
 #include "engine/models/model.h"
 #include "engine/models/qwen3_vision.h"
@@ -139,17 +140,9 @@ public:
 	void reset_state( int slot_id = 0 ) override;
 	bool has_mtp() const override { return mtp_on_; }
 	void set_hessian_capture( bool on ) override { hess_.enable( on ); }
-	bool steer_enabled() const override { return steer_.on(); }
-	void steer_set( int slot_id, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream = nullptr ) override { steer_.set( slot_id, entries, stream ); }
-	void steer_control( int slot_id, int scope, int prompt_len, int think_end, backend::stream_t stream = nullptr ) override { steer_.control( slot_id, scope, prompt_len, think_end, stream ); }
-	void steer_penalty( int slot_id, const std::vector<int>& ids, float penalty, backend::stream_t stream = nullptr ) override { steer_.penalty( slot_id, ids, penalty, stream ); }
-	void steer_capture( const std::vector<int>& layers, bool on ) override { steer_.capture( layers, on ); }
-	bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) override { return steer_.read( out, stream ); }
-	void steer_range( int* first_layer, int* num_layers ) const override { *first_layer = steer_.first(); *num_layers = steer_.layers(); }
+	ENGINE_STEER_HOOKS( steer_ )
 	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
-	int sparse_head_cap() const override { return sh_cap_; }
-	bool sparse_head_set( const int* cols, int count, backend::stream_t stream = nullptr ) override;
-	void sparse_head_use( bool on ) override { sh_use_ = on && sh_count_ > 0; }
+	ENGINE_SPARSE_HEAD_HOOKS( sparse_, lm_head_, rank_ )
 	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
 	bool inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream = nullptr ) override;
 	bool load_vision( const char* model_dir, backend::stream_t stream = nullptr ) override;
@@ -236,15 +229,7 @@ private:
 	void copy_kv_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	bool snap_taps_ = false;             // sequence snapshots include the tap ring rows
 	static constexpr int kTopkTile = 4096;   // TOPK_THREADS * 16
-	static constexpr int kShIdentRows = 128;   // identity rows per head pass when the sparse head reads its columns
-	// sparse drafter head (sparse_head option, MTP): [sh_cap_, H] FP16 columns of this rank's shard and their shard-local indices
-	backend::half_t* sh_w_ = nullptr;
-	int* sh_cols_ = nullptr;
-	backend::half_t* sh_sub_ = nullptr;
-	backend::half_t* sh_ident_ = nullptr;
-	backend::half_t* sh_chunk_ = nullptr;
-	int sh_cap_ = 0, sh_count_ = 0;
-	bool sh_use_ = false;
+	SparseHeadHost sparse_;   // sparse drafter head (sparse_head option, MTP draft steps)
 	// Sampling top-k scratch (target logits, up to MAX_BATCH rows).
 	float* samp_part_v_ = nullptr;
 	int* samp_part_i_ = nullptr;

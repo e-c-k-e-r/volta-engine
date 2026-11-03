@@ -207,11 +207,7 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	kv_pool_.init( rank_, arena, S, config_.max_seq, attn_layers_, kv_heads_, config_.head_dim );
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
-	steer_.init( arena, config_.hidden_size, config_.num_layers, S, rank_ );
-	if ( steer_.on() ) {
-		int mean_shape[2] = { R, H };
-		steer_mean_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mean_shape, 2 );
-	}
+	steer_.init( arena, config_.hidden_size, config_.num_layers, S, rank_, R );
 	int h_shape[2] = { R, H };
 	embed_rows_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	mixed_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
@@ -254,15 +250,7 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 		mtp_src_ = static_cast<float*>( engine::core::arena_alloc( arena, R * stack ) );
 		mtp_hist_ = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( config_.max_slots ) * 2 * ( kDraftM + 1 ) * stack ) );   // a region per slot (the runner offsets by slot)
 		mtp_chain_ = static_cast<float*>( engine::core::arena_alloc( arena, kSnapRows * stack ) );
-		if ( const int c = runtime::options().sparse_head; c > 0 ) {
-			// a rank can hold the whole subset (the frequent ids cluster at the low end of the vocabulary, i.e. on the first ranks)
-			sh_cap_ = std::min( std::max( 256, c ), lm_shard_real_cols_ );
-			sh_w_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( sh_cap_ ) * H * sizeof( backend::half_t ) ) );
-			sh_cols_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( sh_cap_ ) * sizeof( int ) ) );
-			sh_sub_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( kSnapRows ) * sh_cap_ * sizeof( backend::half_t ) ) );
-			sh_ident_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( kShIdentRows ) * H * sizeof( backend::half_t ) ) );
-			sh_chunk_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( kShIdentRows ) * lm_shard_cols_ * sizeof( backend::half_t ) ) );
-		}
+		sparse_.init( arena, H, lm_shard_real_cols_, lm_shard_cols_, kSnapRows );
 	}
 	// QSA indexer state
 	{
@@ -468,7 +456,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	// Column-parallel (output split) and row-parallel (input split) trellis projections
 	auto load_col = [&]( const char* name, int bits ) { return check( repo.load_linear_slice( name, *arena_, bits, 1, rank_, tp, stream ), name ); };
 	auto load_row = [&]( const char* name, int bits ) { return check( repo.load_linear_slice( name, *arena_, bits, 0, rank_, tp, stream ), name ); };
-	// Dense groups quantized to NVFP4 at load from the BF16 tensors of the NVFP4 checkpoint (ENGINE_NVFP4_DENSE); otherwise the trellis tensors
+	// Dense groups quantized to NVFP4 at load from the BF16 tensors of the NVFP4 checkpoint (nvfp4_dense); otherwise the trellis tensors
 	const std::string& nv_groups = runtime::options().nvfp4_dense;
 	bool in_mtp = false;   // the MTP head keeps its own tensors: EXL3, or (mtp_nvfp4) quantized from the NVFP4 checkpoint's FP8 / BF16 ones
 	// A group is on when named in the list, or "all"; `shared` also covers its parts shared_gate / shared_up / shared_down
@@ -601,7 +589,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		ENGINE_ASSERT( per_rank <= MOE_MAX_EXPERTS, "Qwen4ExpPipeline: experts per rank exceed MOE_MAX_EXPERTS" );
 		mw.num_local_experts = per_rank;
 		mw.top_k = config_.top_k;
-		// Tiered experts (ENGINE_EXPERT_CACHE < 1): the codes of resident experts go to device slots, the rest to pinned host memory; the scales
+		// Tiered experts (expert_cache < 1): the codes of resident experts go to device slots, the rest to pinned host memory; the scales
 		// (NVFP4) and sign vectors (trellis) stay on the device
 		const size_t wb_experts_start = arena_->offset_bytes;   // [mem]: the tier slots count as experts
 		const double tier_fraction = engine::modules::ExpertTier::resident_fraction();
@@ -1316,17 +1304,12 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 	pod::TensorView lout = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, n, lm_shard_cols_ );
 	hessian( 0, 4, hin.data, H, n, stream );
 	engine::modules::Linear::forward( hin, lm_head_, lout, stream );
-	if ( steer_.on() ) engine::modules::ResidualSteer::penalize( steer_.tables(), lout.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, first, n, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
+	steer_.penalize( lout.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, first, n, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
 }
 
 void Qwen4ExpPipeline::steer_layer( int L, int m, backend::stream_t stream ) {
 	flush_apply( m, stream );
-	const int H = config_.hidden_size;
-	if ( const int li = steer_.index( L ); li >= 0 ) engine::modules::ResidualSteer::apply_streams( steer_.tables(), streams_.ptr<float>(), config_.hc_mult, d_rows_, m, li, stream );
-	if ( backend::half_t* dst = steer_.capture_dst( L ) ) {
-		engine::spec::dflash_reduce_streams( streams_.ptr<const float>(), steer_mean_.ptr<backend::half_t>(), m, H, 0, stream );
-		backend::memcpy_async( dst, steer_mean_.ptr<backend::half_t>() + static_cast<size_t>( m - 1 ) * H, H * sizeof( backend::half_t ), backend::Copy::D2D, stream );
-	}
+	steer_.layer_streams( streams_.ptr<float>(), d_rows_, m, L, stream );
 }
 
 void Qwen4ExpPipeline::checkpoint_state( int slot_id, backend::stream_t stream ) {
@@ -1444,26 +1427,11 @@ void Qwen4ExpPipeline::mtp_step_impl( const pod::BatchRows& rows, const int* tok
 			mtp_mixer_.up.ptr<const backend::half_t>(), nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_, n_out, H, hc, config_.hc_rank, config_.rms_norm_eps, stream );
 		pod::TensorView hin = pod::make_tensor_2d( mixed_.ptr<backend::half_t>(), pod::DType::FP16, n_out, H );
 		pod::TensorView lout = pod::make_tensor_2d( logits_.ptr<backend::half_t>(), pod::DType::FP16, n_out, lm_shard_cols_ );
-		if ( sh_use_ && n_out <= 8 ) {
-			// sparse drafter head: the subset's logits, every other column at the lowest value (the argmax that follows reads the shard as usual)
-			engine::modules::SparseHead::logits( sh_w_, sh_count_, sh_cols_, mixed_.ptr<const backend::half_t>(), n_out, H, sh_sub_, logits_.ptr<backend::half_t>(), lm_shard_cols_, stream );
-		}
+		if ( sparse_.in_use() && n_out <= 8 ) sparse_.logits( mixed_.ptr<const backend::half_t>(), n_out, logits_.ptr<backend::half_t>(), stream );   // the argmax that follows reads the shard as usual
 		else engine::modules::Linear::forward( hin, lm_head_, lout, stream );
 		logits_.shape[0] = n_out;
 		last_rows_ = n_out;
 	}
-}
-
-bool Qwen4ExpPipeline::sparse_head_set( const int* cols, int count, backend::stream_t stream ) {
-	if ( sh_cap_ == 0 ) return false;
-	ENGINE_ASSERT( count >= 0 && count <= sh_cap_, "Qwen4ExpPipeline::sparse_head_set: more columns than the buffer holds" );
-	backend::set_device( rank_ );
-	sh_use_ = false;
-	sh_count_ = count;
-	if ( count == 0 ) return true;
-	backend::memcpy_async( sh_cols_, cols, static_cast<size_t>( count ) * sizeof( int ), backend::Copy::H2D, stream );
-	engine::modules::SparseHead::extract( lm_head_, config_.hidden_size, lm_shard_cols_, sh_cols_, count, sh_ident_, sh_chunk_, kShIdentRows, sh_w_, stream );
-	return true;
 }
 
 // Keeps the stacks of rows [src_row, src_row + rows) of the last forward for later steps (row dst_row onwards)

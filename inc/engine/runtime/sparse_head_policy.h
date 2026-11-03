@@ -38,7 +38,6 @@ public:
 	std::vector<int> ranked() const;
 	void set_subset( const std::vector<int>& kept );
 	int subset_size() const { return subset_n_; }
-	bool in_subset( int token ) const { return token >= 0 && token < vocab_ && in_[token]; }
 
 	// Timing of a round's draft steps (ms per step) in the mode it ran in, and of the whole round
 	void draft_step_time( bool sparse, double ms );

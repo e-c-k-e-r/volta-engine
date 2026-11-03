@@ -2,6 +2,7 @@
 #include "engine/backend/runtime.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
+#include "engine/spec/tap_ring.h"
 #include <cmath>
 #include <cstring>
 
@@ -9,7 +10,7 @@ namespace engine::models {
 
 using namespace engine::modules;
 
-void SteerHost::init( pod::MemoryArena& arena, int hidden, int num_layers, int slots, int rank ) {
+void SteerHost::init( pod::MemoryArena& arena, int hidden, int num_layers, int slots, int rank, int mean_rows ) {
 	if ( runtime::options().steer == "off" ) return;
 	int first = 0, last = 0;
 	ENGINE_ASSERT( parse_steer_layers( runtime::options().steer_layers, num_layers, &first, &last ), "steer_layers is malformed or out of range" );
@@ -25,6 +26,7 @@ void SteerHost::init( pod::MemoryArena& arena, int hidden, int num_layers, int s
 	t_.ctl = static_cast<SteerSlotCtl*>( core::arena_alloc( arena, S * sizeof( SteerSlotCtl ) ) );
 	t_.penalty_ids = static_cast<int32_t*>( core::arena_alloc( arena, S * kSteerPenaltyIds * sizeof( int32_t ) ) );
 	cap_ = static_cast<backend::half_t*>( core::arena_alloc( arena, static_cast<size_t>( num_layers ) * H * sizeof( backend::half_t ) ) );
+	if ( mean_rows > 0 ) mean_ = static_cast<backend::half_t*>( core::arena_alloc( arena, static_cast<size_t>( mean_rows ) * H * sizeof( backend::half_t ) ) );
 	backend::memset_sync( t_.vec, 0, S * nl * K * H * sizeof( float ) );
 	backend::memset_sync( t_.par, 0, S * nl * K * sizeof( float ) );
 	backend::memset_sync( t_.kind, 0, S * nl * K * sizeof( int32_t ) );
@@ -117,6 +119,27 @@ bool SteerHost::read( std::vector<float>& out, backend::stream_t stream ) {
 	out.resize( n * H );
 	for ( size_t i = 0; i < out.size(); ++i ) out[i] = fp16_bits_to_float( raw[i] );
 	return true;
+}
+
+void SteerHost::layer_rows( backend::half_t* hidden, const pod::BatchRows* d_rows, int m, int layer, backend::stream_t stream ) const {
+	if ( !on() ) return;
+	if ( const int li = index( layer ); li >= 0 ) ResidualSteer::apply( t_, hidden, d_rows, m, li, stream );
+	if ( backend::half_t* dst = capture_dst( layer ) )
+		backend::memcpy_async( dst, hidden + static_cast<size_t>( m - 1 ) * t_.hidden, t_.hidden * sizeof( backend::half_t ), backend::Copy::D2D, stream );
+}
+
+void SteerHost::layer_streams( float* streams, const pod::BatchRows* d_rows, int m, int layer, backend::stream_t stream ) const {
+	if ( !on() ) return;
+	if ( const int li = index( layer ); li >= 0 ) ResidualSteer::apply_streams( t_, streams, 4, d_rows, m, li, stream );
+	if ( backend::half_t* dst = capture_dst( layer ) ) {
+		ENGINE_ASSERT( mean_ != nullptr, "SteerHost::layer_streams: init without mean_rows" );
+		engine::spec::dflash_reduce_streams( streams, mean_, m, t_.hidden, 0, stream );
+		backend::memcpy_async( dst, mean_ + static_cast<size_t>( m - 1 ) * t_.hidden, t_.hidden * sizeof( backend::half_t ), backend::Copy::D2D, stream );
+	}
+}
+
+void SteerHost::penalize( backend::half_t* logits, int logit_cols, const pod::BatchRows* d_rows, int row0, int n, int shard_lo, int shard_cols, backend::stream_t stream ) const {
+	if ( on() ) ResidualSteer::penalize( t_, logits, logit_cols, d_rows, row0, n, shard_lo, shard_cols, stream );
 }
 
 } // namespace engine::models

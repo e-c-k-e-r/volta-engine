@@ -34,8 +34,35 @@ std::vector<int> read_cpulist( const char* path ) {
 	return out;
 }
 
-const CpuPlan& cpu_plan( bool nvfp4 = false ) {
-	static const CpuPlan plan = [nvfp4] {
+constexpr int kRankCores = 4;   // cores 0 to 3 of node 0 drive the GPU ranks
+
+// The first SMT thread of every core in a node's cpulist, from core skip_below on
+std::vector<int> first_threads( int node, int skip_below ) {
+	std::vector<int> out;
+	char path[96];
+	std::snprintf( path, sizeof path, "/sys/devices/system/node/node%d/cpulist", node );
+	for ( int c : read_cpulist( path ) ) {
+		if ( c < skip_below ) continue;
+		std::snprintf( path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c );
+		const std::vector<int> sib = read_cpulist( path );
+		if ( sib.empty() || sib[0] == c ) out.push_back( c );
+	}
+	return out;
+}
+
+// The plan is made once, by the first tier attached (its expert format picks the default node); later calls read it
+CpuPlan g_plan;
+bool g_plan_made = false;
+
+const CpuPlan& cpu_plan() {
+	ENGINE_ASSERT( g_plan_made, "cpu_experts: the CPU plan is read before it was made" );
+	return g_plan;
+}
+
+const CpuPlan& make_cpu_plan( bool nvfp4 ) {
+	if ( g_plan_made ) return g_plan;
+	g_plan_made = true;
+	g_plan = [nvfp4] {
 		const auto& opt = runtime::options();
 		CpuPlan p;
 		p.node = opt.cpu_expert_node;
@@ -48,28 +75,14 @@ const CpuPlan& cpu_plan( bool nvfp4 = false ) {
 		}
 		if ( nodes == 0 ) return p;   // no NUMA information: the service's default (4 unpinned threads)
 		const int node = p.node >= 0 && p.node < nodes ? p.node : nvfp4 ? 0 : nodes - 1;
-		char path[96];
-		std::snprintf( path, sizeof path, "/sys/devices/system/node/node%d/cpulist", node );
-		for ( int c : read_cpulist( path ) ) {
-			if ( node == 0 && c < 4 ) continue;   // the rank threads' cores
-			std::snprintf( path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c );
-			const std::vector<int> sib = read_cpulist( path );
-			if ( sib.empty() || sib[0] == c ) p.cpus.push_back( c );   // the first thread of each core
-		}
+		p.cpus = first_threads( node, node == 0 ? kRankCores : 0 );
 		p.node = node;
 		// EXL3 on a two-socket host: a second pool on node 0 (from core 4) works on the other half of every expert's output columns; the copies
 		// stay on the first node (EXL3 reads cost the same from either)
-		if ( !nvfp4 && nodes > 1 && p.node != 0 && opt.cpu_expert_node < 0 ) {
-			for ( int c : read_cpulist( "/sys/devices/system/node/node0/cpulist" ) ) {
-				if ( c < 4 ) continue;
-				std::snprintf( path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c );
-				const std::vector<int> sib = read_cpulist( path );
-				if ( sib.empty() || sib[0] == c ) p.cpus2.push_back( c );
-			}
-		}
+		if ( !nvfp4 && nodes > 1 && p.node != 0 && opt.cpu_expert_node < 0 ) p.cpus2 = first_threads( 0, kRankCores );
 		return p;
 	}();
-	return plan;
+	return g_plan;
 }
 
 std::unique_ptr<Linear> make_linear( const pod::LinearWeight& lw, Service& svc ) {
@@ -117,7 +130,7 @@ CpuExpertHandle attach_cpu_experts( modules::ExpertTier& tier, int rank, int fir
 		// the format of this tier's experts decides the default node (the plan is fixed by the first tier)
 		bool nvfp4 = false;
 		for ( size_t li = 0; li < tier.layers.size() && !nvfp4; ++li ) nvfp4 = tier.layers[li].mw && tier.layers[li].mw->type == pod::QuantType::NVFP4;
-		const CpuPlan& plan = cpu_plan( nvfp4 );
+		const CpuPlan& plan = make_cpu_plan( nvfp4 );
 		svc.start( plan.cpus, opt.cpu_expert_spin_us, plan.cpus2 );
 		if ( rank == 0 ) LOG_INFO( "[cpu-experts] %zu expert threads%s%s, host-side copies on node %d\n", plan.cpus.size() + plan.cpus2.size(),
 			opt.cpu_expert_cpus.empty() ? " (one per core, cpu_expert_cpus unset)" : "", plan.cpus2.empty() ? "" : ", a second pool on node 0", plan.node );

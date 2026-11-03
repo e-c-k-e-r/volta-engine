@@ -180,8 +180,7 @@ void Generator::probe_slot( int s ) {
 	else {
 		// the request's own vector stays: its edits come first on every layer, the probe's after them (at most kSteerEntries per layer; the probe's
 		// surplus entries on a full layer are dropped)
-		int vec_scope = 0;
-		std::vector<engine::modules::SteerEntry> entries = request_steer_entries( s, &vec_scope );
+		std::vector<engine::modules::SteerEntry> entries = request_steer_entries( s, nullptr );
 		std::vector<engine::modules::SteerEntry> probe_entries;
 		for ( int l = e0; l <= e1; ++l ) {
 			const int bi = l - b0;

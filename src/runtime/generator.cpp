@@ -640,7 +640,7 @@ std::vector<engine::modules::SteerEntry> Generator::request_steer_entries( int s
 		}
 		else LOG_ERROR( "[steer] request %llu runs unsteered: %s\n", static_cast<unsigned long long>( slot.req.req_id ), err.c_str() );
 	}
-	*scope_out = entries.empty() ? 0 : scope;
+	if ( scope_out ) *scope_out = entries.empty() ? 0 : scope;
 	return entries;
 }
 
@@ -1076,7 +1076,7 @@ MonitorSnapshot Generator::get_monitor() const {
 	m.tokens_prefilled = tokens_prefilled_.load( std::memory_order_relaxed );
 	m.prompt_tokens = prompt_tokens_total_;
 	m.cached_tokens = cached_tokens_total_;
-	for ( int i = 0; i < 5; ++i ) m.finished[i] = finished_[i];
+	for ( int i = 0; i < kFinishReasons; ++i ) m.finished[i] = finished_[i];
 	m.spec_rounds = spec_rounds_;
 	m.spec_proposed = spec_proposals_;
 	m.spec_accepted = spec_accepted_;

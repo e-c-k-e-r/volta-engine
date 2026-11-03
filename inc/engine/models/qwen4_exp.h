@@ -3,6 +3,7 @@
 #include "engine/config.h"
 #include "engine/models/model.h"
 #include "engine/models/steer_host.h"
+#include "engine/models/sparse_head_host.h"
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
 #include "engine/core/comm.h"
@@ -129,13 +130,7 @@ public:
 	bool has_mtp() const override { return mtp_on_; }
 	void set_hessian_capture( bool on ) override { hess_on_ = on; }
 	// Runtime steering (option steer): the edits act on the mean of the residual streams and shift every stream by the change (ResidualSteer::apply_streams)
-	bool steer_enabled() const override { return steer_.on(); }
-	void steer_set( int slot_id, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream = nullptr ) override { steer_.set( slot_id, entries, stream ); }
-	void steer_control( int slot_id, int scope, int prompt_len, int think_end, backend::stream_t stream = nullptr ) override { steer_.control( slot_id, scope, prompt_len, think_end, stream ); }
-	void steer_penalty( int slot_id, const std::vector<int>& ids, float penalty, backend::stream_t stream = nullptr ) override { steer_.penalty( slot_id, ids, penalty, stream ); }
-	void steer_capture( const std::vector<int>& layers, bool on ) override { steer_.capture( layers, on ); }
-	bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) override { return steer_.read( out, stream ); }
-	void steer_range( int* first_layer, int* num_layers ) const override { *first_layer = steer_.first(); *num_layers = steer_.layers(); }
+	ENGINE_STEER_HOOKS( steer_ )
 	// DFlash2 drafter (see DraftHooks): a tap ring per slot, filled by forward_body once a drafter is attached (set_snapshot_taps)
 	const DraftHooks& draft_hooks() const override { return draft_hooks_; }
 	void draft_head_topk( int rows, backend::stream_t stream = nullptr ) override;
@@ -148,9 +143,7 @@ public:
 	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
 	bool mtp_joint() const override { return true; }
 	void mtp_step_rows( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, backend::stream_t stream = nullptr ) override;
-	int sparse_head_cap() const override { return sh_cap_; }
-	bool sparse_head_set( const int* cols, int count, backend::stream_t stream = nullptr ) override;
-	void sparse_head_use( bool on ) override { sh_use_ = on && sh_count_ > 0; }
+	ENGINE_SPARSE_HEAD_HOOKS( sparse_, lm_head_, rank_ )
 	void mtp_gather_hist( const int* src_rows, int count, backend::stream_t stream = nullptr ) override;
 	void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;
@@ -185,7 +178,6 @@ private:
 	// After layer L: the steering edits of its range and the probe's capture of the stream mean (both read the finished streams)
 	void steer_layer( int L, int m, backend::stream_t stream );
 	SteerHost steer_;
-	pod::TensorView steer_mean_;         // [MAX_ROWS, hidden] fp16: the stream mean of a probe's capture
 	pod::TensorView gr16_hi_, gr16_lo_, gr16_z_, gr16_thi_, gr16_tlo_, gr16_u_;   // operands / results of the tensor-core gated residual (prefill rows)
 	bool normed_ready_ = false;    // gr_scratch_ already holds the next gr_mix's normed streams (the fused all-reduce wrote them)
 	bool apply_pending_ = false;   // a gated add (post_, y_) waits to be folded into the next gr_mix
@@ -203,7 +195,7 @@ private:
 	void trace_route( int tag, int m, backend::stream_t stream );
 	void dump_router( int m, backend::stream_t stream );
 	void trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols = 0 );
-	// Calibration (ENGINE_HESSIAN_DIR): x^T x of a projection input, accumulated over prefill rows into site `site` of layer `layer`
+	// Calibration (hessian_dir): x^T x of a projection input, accumulated over prefill rows into site `site` of layer `layer`
 	// (0 attention / GDN input, 1 MoE input, 2 o_proj / out_proj input (rank slice), 3 shared-expert down input, 4 lm_head input with layer 0)
 	void hessian( int layer, int site, const void* x, int k, int m, backend::stream_t stream );
 	void hessian_dump();
@@ -217,7 +209,7 @@ private:
 	bool draft_taps_on_ = false;         // the tap ring exists (speculator is not the MTP head)
 	bool snap_taps_ = false;             // a drafter is attached: forwards publish taps and snapshots carry the ring rows
 	size_t tap_snapshot_bytes( int tokens ) const;
-	engine::modules::ExpertTier tier_;   // ENGINE_EXPERT_CACHE < 1: resident experts' codes in device slots, the rest in pinned host memory
+	engine::modules::ExpertTier tier_;   // expert_cache < 1: resident experts' codes in device slots, the rest in pinned host memory
 	pod::MemoryArena host_arena_{};
 	int tier_layers_ = 0;
 	engine::cpu_moe::CpuExpertHandle cpu_;   // cpu_experts: cold experts computed on the host CPU
@@ -300,7 +292,6 @@ private:
 	void* full_logits_mem_ = nullptr;
 	int full_logits_rows_ = 0;
 	static constexpr int kTopkTile = 4096;
-	static constexpr int kShIdentRows = 128;   // identity rows per head pass when the sparse head reads its columns
 	int* d_argmax_idx_ = nullptr;
 	float* d_argmax_val_ = nullptr;
 	int* h_argmax_idx_ = nullptr;
@@ -327,15 +318,7 @@ private:
 	float* mtp_src_ = nullptr;          // [R, hc, H] staging of the hidden stacks of a step
 	float* mtp_hist_ = nullptr;         // [2 * (kDraftM + 1), hc, H] saved stacks
 	float* mtp_chain_ = nullptr;        // [kSnapRows, hc, H] the previous step's output stacks (the rows a step was asked for)
-	// sparse drafter head (sparse_head option): [sh_cap_, H] FP16 columns of this rank's shard, their shard-local indices, the subset logits
-	// of a step, and the identity block / head output the columns are read through
-	backend::half_t* sh_w_ = nullptr;
-	int* sh_cols_ = nullptr;
-	backend::half_t* sh_sub_ = nullptr;
-	backend::half_t* sh_ident_ = nullptr;
-	backend::half_t* sh_chunk_ = nullptr;
-	int sh_cap_ = 0, sh_count_ = 0;
-	bool sh_use_ = false;
+	SparseHeadHost sparse_;   // sparse drafter head (sparse_head option, MTP draft steps)
 };
 
 } // namespace engine::models

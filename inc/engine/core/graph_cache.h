@@ -17,7 +17,7 @@ namespace engine::core {
 //   call 1 for m : eager (lazy one-time setup such as smem attributes happens outside capture)
 //   call 2 for m : capture (thread-local mode, the ranks capture concurrently) + instantiate
 //   call 3+      : cudaGraphLaunch
-// ENGINE_DEBUG_NO_GRAPHS=1 (Options::no_graphs) forces eager execution.
+// no_graphs=1 (Options::no_graphs) forces eager execution.
 class GraphCache {
 public:
 	GraphCache() {

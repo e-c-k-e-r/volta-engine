@@ -98,6 +98,7 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 			( mc.arena( d ).offset_bytes - mem1 ) / 1073741824.0 );
 	}
 	LOG_INFO( "DFlash2 speculator: %s (%s), drafter tp=%d\n", loaded ? "loaded" : "STANDALONE", draft_dir.c_str(), tp_ );
+	if ( runtime::options().sparse_head > 0 ) LOG_WARN( "sparse_head: the sparse drafter head serves the MTP speculator only; DFlash2 drafts through its own head, option ignored\n" );
 	return true;
 }
 

@@ -248,7 +248,7 @@ void ModelCluster::apply_mrope( pod::BatchRows& rows ) const {
 }
 
 namespace {
-// ENGINE_LOG_LEVEL=debug: rows and wall time of every forward (a slow backend shows where a request spends its time)
+// log_level=debug: rows and wall time of every forward (a slow backend shows where a request spends its time)
 struct ForwardTimer {
 	int rows;
 	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();

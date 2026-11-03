@@ -50,6 +50,7 @@ struct SlotMetrics {
 };
 
 enum class FinishReason { Stop, Length, StopString, Cancelled, Loop };
+constexpr int kFinishReasons = 5;
 
 struct GenerationRequest {
 	uint64_t req_id = 0;
@@ -167,7 +168,7 @@ struct MonitorSnapshot {
 	size_t queued = 0;
 	uint64_t requests = 0, completed = 0;
 	uint64_t tokens_out = 0, tokens_prefilled = 0, prompt_tokens = 0, cached_tokens = 0;
-	uint64_t finished[5] = {};                  // by FinishReason
+	uint64_t finished[kFinishReasons] = {};     // by FinishReason
 	uint64_t spec_rounds = 0, spec_proposed = 0, spec_accepted = 0;
 	uint64_t suffix_rounds = 0, suffix_proposed = 0, suffix_accepted = 0;   // the rounds whose block came from a suffix match (also counted above)
 	double gap_ms[5] = {};                      // token-gap percentiles: p50 p90 p99 p999 max, over the last samples
@@ -270,7 +271,7 @@ private:
 	// Steering (option steer): the slot's edits, scope, prompt length and reflection-marker penalty on every rank, set when the request is admitted
 	void steer_admit( int s );
 	// The edits of the request's steer_vector (scaled, with its scope in *scope), or none
-	std::vector<engine::modules::SteerEntry> request_steer_entries( int s, int* scope );
+	std::vector<engine::modules::SteerEntry> request_steer_entries( int s, int* scope );   // scope: the vector's scope bits, may be null
 	// Steering probe (request field steer_probe): reads the prompt unedited (openings forced after it, then a short greedy look-ahead), builds the
 	// direction clamps from the states it sees and, when the look-ahead score passes the gate, leaves them on the slot for the real prefill
 	void probe_slot( int s );
@@ -324,7 +325,7 @@ private:
 	void fold_expert_heat( bool force = false );
 	std::atomic<uint64_t> tokens_out_{ 0 };
 	std::atomic<uint64_t> tokens_prefilled_{ 0 };
-	uint64_t prompt_tokens_total_ = 0, cached_tokens_total_ = 0, finished_[5] = {}, spec_rounds_ = 0;
+	uint64_t prompt_tokens_total_ = 0, cached_tokens_total_ = 0, finished_[kFinishReasons] = {}, spec_rounds_ = 0;
 	SlotView slot_view_[MAX_SLOTS];
 	std::deque<RequestRecord> recent_;
 	std::vector<float> gap_ring_ = std::vector<float>( 4096, 0.0f );

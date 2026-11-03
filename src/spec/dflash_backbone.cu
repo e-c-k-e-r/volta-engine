@@ -207,8 +207,8 @@ void DFlashSpeculator::forward_backbone(
 		// (d) grouped dynamic conv, post-attention side (side 1 of the same projection)
 		{
 			// The reference consumes self_attn's output here, which is o_proj's result, not the
-			// concatenated head outputs. At tp_size 1 both are [rows, H] so the shape alone does not
-			// catch a mistake; the buffers differ, and this used to read bb_attn_out_.
+			// concatenated head outputs (bb_attn_out_). At tp_size 1 both are [rows, H], so the shape alone
+			// does not tell them apart.
 			const pod::TensorView c1 = pod::make_tensor_3d(
 				bb_coef_a1_.ptr<float>(), pod::DType::FP32, rows, taps, groups );
 			const pod::TensorView base = pod::make_tensor_2d(

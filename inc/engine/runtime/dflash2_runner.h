@@ -28,7 +28,7 @@ struct SpecProfile {
 // The drafter backbone is tensor-parallel across the ranks by default: every rank holds a shard of each
 // projection, runs the whole block in lockstep (all-reduce after o_proj and down_proj, fc all-gather) and
 // ends with the full drafter hidden replicated, which feeds its own head shard with no peer copy. The walk
-// runs on rank 0. ENGINE_DRAFT_TP=0 selects the single-GPU drafter on rank 0 (A/B knob).
+// runs on rank 0. draft_tp=0 selects the single-GPU drafter on rank 0 (A/B knob).
 class DFlash2Runner : public Speculator {
 public:
 	bool init( ModelCluster& mc, const std::string& draft_dir );

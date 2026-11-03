@@ -87,7 +87,7 @@ public:
 	// Diagnostic / test path: synchronizes and issues per-row peer copies.
 	void read_logits( int rows, backend::half_t* host_dst );
 	int sample_one();
-	// Adapts the routed-expert residency (ENGINE_EXPERT_CACHE) to the routing seen since the last call; false when no model tiers
+	// Adapts the routed-expert residency (expert_cache) to the routing seen since the last call; false when no model tiers
 	bool rebalance_experts();
 	// Routed-expert route counts since the previous call, per rank: layers x experts of that rank's partition; false when the model keeps none
 	bool expert_heat( std::vector<std::vector<uint32_t>>& per_rank, int& layers, int& experts );
