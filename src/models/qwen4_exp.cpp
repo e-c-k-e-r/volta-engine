@@ -1004,10 +1004,6 @@ void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_i
 	pod::TensorView beta_rows = pod::make_tensor_2d( gdn_beta_.ptr<float>(), pod::DType::FP32, m, v_heads );
 	engine::modules::GDN::project_gates( mixed_, lw.in_proj_a, lw.in_proj_b, lw.A_log, lw.dt_bias, gate_rows, beta_rows, v_heads, config_.hidden_size, sk, m );
 	engine::modules::Linear::forward( mixed_, lw.in_proj_qkv, qkv_buf_, stream );
-	if ( linear_idx == 0 ) {
-		trace_rows( 2000, qkv_buf_.data, false, m, stream, channels );
-		trace_rows( 2001, z_buf_.data, false, m, stream, v_heads * 128 );
-	}
 
 	float* hist = state_.conv_history + static_cast<size_t>( linear_idx ) * channels * 3;
 	float* layer_state = state_.gdn_states + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
@@ -1028,15 +1024,12 @@ void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_i
 		engine::modules::GDN::causal_conv1d_silu_rows( qkv_rows, hist, lw.conv1d_w, channels, m, d_rows_, state_.slot_conv_floats,
 			conv_snap, state_.slot_conv_floats, snap_rows, state_.d_snap_on, stream );
 	}
-	if ( linear_idx == 0 ) trace_rows( 2004, qkv_rows.data, false, m, stream, channels );   // after conv + silu
 	engine::modules::GDN::l2_norm_heads( qkv_rows, k_heads, config_.linear_head_dim, stream, false, m, channels );
 	if ( overlap ) backend::stream_join( stream, sk );
 	engine::modules::GDN::recurrent_step_rows( layer_state, qkv_rows, gate_rows, beta_rows, out_rows, k_heads, v_heads, config_.linear_head_dim, m, d_rows_,
 		state_.slot_gdn_floats, gdn_snap, state_.slot_gdn_floats, snap_rows, state_.d_snap_on, stream );
 	// Sigmoid-gated RMSNorm (the KDA flavor): rmsnorm(out) * w * sigmoid(z)
-	if ( linear_idx == 0 ) trace_rows( 2002, out_rows.data, false, m, stream, v_heads * 128 );   // recurrence output before the norm
 	engine::modules::GDN::gated_rmsnorm( out_rows, z_rows, lw.linear_norm, v_heads, config_.linear_head_dim, stream, true, m );
-	if ( linear_idx == 0 ) trace_rows( 2003, out_rows.data, false, m, stream, v_heads * 128 );
 	hessian( hess_layer_, 2, gdn_out_.data, v_heads * 128, m, stream );
 	engine::modules::Linear::forward( gdn_out_, lw.out_proj, y_, stream );
 }
@@ -1177,29 +1170,6 @@ void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backe
 	}
 }
 
-// Debug (teacher_streams): replaces the residual streams entering layer L by the reference's
-void Qwen4ExpPipeline::teacher_inject( int L, int m, backend::stream_t stream ) {
-	static const std::string& path = runtime::options().teacher_streams;
-	if ( path.empty() || m <= pod::MAX_BATCH ) return;
-	static std::vector<float> data;
-	static int rows = 0;
-	static std::once_flag once;
-	std::call_once( once, [&]() {
-		if ( FILE* f = std::fopen( path.c_str(), "rb" ) ) {
-			if ( std::fread( &rows, sizeof( int ), 1, f ) == 1 && rows > 0 ) {
-				data.resize( static_cast<size_t>( 47 ) * rows * config_.hc_mult * config_.hidden_size );
-				if ( std::fread( data.data(), sizeof( float ), data.size(), f ) != data.size() ) data.clear();
-			}
-			std::fclose( f );
-		}
-	} );
-	if ( data.empty() || rows != m ) return;
-	const size_t block = static_cast<size_t>( rows ) * config_.hc_mult * config_.hidden_size;
-	flush_apply( m, stream );
-	backend::memcpy_async( streams_.data, data.data() + static_cast<size_t>( L - 1 ) * block, block * sizeof( float ), backend::Copy::H2D, stream );
-	backend::stream_sync( stream );
-}
-
 bool Qwen4ExpPipeline::rebalance_experts( backend::stream_t stream ) {
 	if ( !tier_.active() ) return false;
 	backend::set_device( rank_ );
@@ -1253,7 +1223,7 @@ void Qwen4ExpPipeline::hessian_dump() {
 // Whether site_reduce will run the fused all-reduce (so the shared expert's gated add can ride in it)
 bool Qwen4ExpPipeline::fuses_site( int m, const backend::half_t* next_norm ) const {
 #if ENGINE_BACKEND_CUDA
-	static const bool fuse = runtime::options().gr_fuse && runtime::options().trace_layers.empty() && runtime::options().teacher_streams.empty() &&
+	static const bool fuse = runtime::options().gr_fuse && runtime::options().trace_layers.empty() &&
 		runtime::options().hessian_dir.empty();
 	return ring_ != nullptr && fuse && next_norm != nullptr && m <= kGrDecodeRows && !apply_pending_;
 #else
@@ -1303,11 +1273,10 @@ void Qwen4ExpPipeline::mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, b
 
 void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size, hc = config_.hc_mult;
-	const int halt = runtime::options().qwen4_halt;
 	apply_pending_ = false;
 	engine::modules::GatedResidual::init_streams( embed_rows_.ptr<const backend::half_t>(), streams_.ptr<float>(), m, H, hc, stream );
 	trace_rows( 1000, streams_.data, true, m, stream );
-	int linear_idx = 0, attn_idx = 0, site = 0;
+	int linear_idx = 0, attn_idx = 0;
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		auto& lw = layers_[L];
 		if ( L == config_.ple_layer ) {
@@ -1315,9 +1284,7 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 			ple_forward( m, stream );
 			trace_rows( 800, streams_.data, true, m, stream );
 		}
-		if ( L >= 1 ) teacher_inject( L, m, stream );
 		attn_site( lw, lw.is_full_attention ? attn_idx++ : linear_idx++, L, m, stream, lw.mlp_hc.norm.ptr<const backend::half_t>() );
-		if ( halt == site++ ) { flush_apply( m, stream ); return; }
 		// The next site is the next layer's attention, unless the PLE layer comes first (it changes the streams) or this is the last layer (the head's mixer follows)
 		// A steered or captured layer edits the finished streams, so the fused all-reduce must not hand the next site pre-normed streams
 		const bool steered = steer_.on() && ( steer_.index( L ) >= 0 || steer_.capture_dst( L ) != nullptr );
@@ -1335,7 +1302,6 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 			}
 		}
 		trace_rows( 600 + L, streams_.data, true, m, stream );
-		if ( halt == site++ ) { flush_apply( m, stream ); return; }
 	}
 	flush_apply( m, stream );
 

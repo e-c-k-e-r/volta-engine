@@ -1,14 +1,15 @@
 # Oracle dump for the Qwen3.8-Flash-Next port: runs the exllamav3 reference on a fixed prompt and saves module and block-internal
 # activations (module index: 0 embed, 1 expand streams, 2 block 0, 3 PLE, 4..8 blocks 1..5; b2 = layer 0 GDN block, b6 = layer 3 QSA block)
-# plus ids.npy and logits.npy to results/flash_next_ref/. Run from ~/Programs/exllamav3 with its venv: EXL3_NO_TRITON=1 taskset -c 0-9 .venv/bin/python <this file>
+# plus ids.npy and logits.npy to results/flash_next_ref/ (FN_OUT overrides). With exllamav3's venv:
+#   EXL3_DIR=<exllamav3 checkout> EXL3_NO_TRITON=1 taskset -c 0-9 <venv>/bin/python <this file> <Flash-Next EXL3 checkpoint>
 import sys, time, os, torch, numpy as np
-sys.path.insert(0, "/home/mrq/Programs/exllamav3")
+sys.path.insert(0, os.environ.get("EXL3_DIR", os.path.expanduser("~/Programs/exllamav3")))
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, GreedySampler
-OUT = os.environ.get("FN_OUT", "/home/mrq/Programs/volta-engine/results/flash_next_ref")
+OUT = os.environ.get("FN_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "results", "flash_next_ref"))
 LONG = int(os.environ.get("FN_LONG", "0"))   # N > 0: a ~N-token filler prompt (QSA selection kicks in past 2052 tokens); only ids and logits are saved
 def main():
     os.makedirs(OUT, exist_ok = True)
-    d = "/home/mrq/Documents/models/Swift-Qwen3.8-Flash-Next-exl3-4.00bpw"
+    d = sys.argv[1]
     config = Config.from_directory(d)
     model = Model.from_config(config)
     cache = Cache(model, max_num_tokens = 12288)

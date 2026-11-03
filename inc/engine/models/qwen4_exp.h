@@ -178,7 +178,6 @@ private:
 	bool fuses_site( int m, const backend::half_t* next_norm ) const;
 	// shared_deferred: rank 0 adds gate * sh_out_ inside the fused all-reduce (moe_forward left only the gate in sh_gate_)
 	void site_reduce( int m, const backend::half_t* next_norm, backend::stream_t stream, bool shared_deferred = false );
-	void teacher_inject( int L, int m, backend::stream_t stream );
 	// One sublayer's input: the gated-residual mix of the streams into mixed_ (and post_ when the site has an inject gate)
 	void gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream );
 	void defer_apply();
