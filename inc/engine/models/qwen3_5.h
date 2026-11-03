@@ -134,6 +134,7 @@ public:
 	void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) override;
 	void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) override;
 	void set_snapshot_taps( bool on ) override { snap_taps_ = on; }
+	bool read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream = nullptr ) override;
 	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
 	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
 	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;

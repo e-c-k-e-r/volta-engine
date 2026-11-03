@@ -4,6 +4,7 @@
 #include "engine/runtime/cand_log.h"
 #include "engine/backend/runtime.h"
 #include "engine/runtime/cluster.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <vector>
@@ -251,10 +252,18 @@ int DFlash2Runner::draft_block( int slot, int anchor, int pos, float depth_thres
 	backend::stream_sync( s0 );
 	backend::check_last_error();
 
-	// Depth: the whole block by default (what DFlash2 does natively). depth_threshold > 0 enables the
-	// survival-EMA truncation; it is a throughput option, off by default so acceptance is measurable.
+	// Depth: the whole block by default (what DFlash2 does natively). spec_depth_rate picks the size with the most expected tokens per
+	// millisecond; depth_threshold > 0 enables the survival-EMA truncation. Both are throughput options, off by default so acceptance is measurable.
 	int active = K;
-	if ( depth_threshold > 0.0f ) {
+	static const std::vector<int> cycle = [] {
+		std::vector<int> v;
+		const std::string& s = runtime::options().spec_block_cycle;
+		for ( size_t p = 0; p < s.size(); ) { v.push_back( std::atoi( s.c_str() + p ) ); p = s.find( ',', p ); if ( p == std::string::npos ) break; ++p; }
+		return v;
+	}();
+	if ( !cycle.empty() ) active = cycle[static_cast<size_t>( cost_.rounds ) % cycle.size()];
+	else if ( runtime::options().spec_depth_rate ) active = rate_block( K );
+	else if ( depth_threshold > 0.0f ) {
 		active = 1;
 		float run = cond_[0];
 		for ( int k = 1; k < K && run >= depth_threshold; ++k ) {
@@ -290,8 +299,54 @@ int DFlash2Runner::round_block( int slot, int anchor, int pos, float depth_thres
 	return draft_block( slot, anchor, pos, dt, h_draft );
 }
 
+void DFlash2Runner::observe( int proposed, int accepted ) {
+	// cond_: per-step survival EMA over every proposed step (a step past a rejection counts as a miss; the survival cut is tuned on this).
+	// reach_: the chance a step survives given the steps before it did, observed only on steps the verify reached.
+	constexpr float kEma = 0.25f, kReachEma = 0.1f;
+	for ( int k = 0; k < proposed; ++k ) cond_[k] = ( 1.0f - kEma ) * cond_[k] + kEma * ( k < accepted ? 1.0f : 0.0f );
+	for ( int k = 0; k < proposed && k <= accepted; ++k ) reach_[k] = ( 1.0f - kReachEma ) * reach_[k] + kReachEma * ( k < accepted ? 1.0f : 0.0f );
+}
+
+void DFlash2Runner::RoundCost::add( int size, double t ) {
+	if ( size < 1 || size > 15 ) return;
+	++rounds;
+	last[size] = rounds;
+	if ( seen[size]++ == 0 ) return;   // a size's first round pays one-time costs (graph capture, workspace growth)
+	const int n = MIN( seen[size] - 1, kKeep );
+	recent[size][( seen[size] - 2 ) % kKeep] = t;
+	double v[kKeep];
+	std::copy( recent[size], recent[size] + n, v );
+	std::nth_element( v, v + n / 2, v + n );
+	ms[size] = v[n / 2];
+}
+
+int DFlash2Runner::rate_block( int K ) {
+	K = MIN( K, 15 );
+	// warm-up: every size four times (its first round is discarded), so each has a measured time
+	if ( cost_.rounds < 4 * K ) return 1 + static_cast<int>( cost_.rounds % K );
+
+	// every 16th round the size measured longest ago, so a time measured early (or on a different context) gets refreshed
+	if ( cost_.rounds % 16 == 0 ) {
+		int stale = 1;
+		for ( int s = 2; s <= K; ++s ) if ( cost_.last[s] < cost_.last[stale] ) stale = s;
+		return stale;
+	}
+	// expected tokens of a block of s drafts: the bonus or correction token plus each draft's chance of surviving to it
+	int best = K;
+	double best_rate = -1.0, surv = 1.0, expect = 1.0;
+	for ( int s = 1; s <= K; ++s ) {
+		surv *= reach_[s - 1];
+		expect += surv;
+		if ( cost_.seen[s] < 2 ) continue;
+		const double rate = expect / cost_.ms[s];
+		if ( rate > best_rate ) { best_rate = rate; best = s; }
+	}
+	return best;
+}
+
 SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_threshold,
 	const SamplingParams* sp, Rng* rng ) {
+	const double t_round = impl::now_ms();
 	ENGINE_ASSERT( owns( slot ), "DFlash2Runner::speculate: slot does not own the drafter context" );
 	constexpr int M = models::kDraftM;
 	constexpr int K = M - 1;
@@ -404,11 +459,7 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 			diag_.walk[k] += ( cands[k] == preds[k] ) ? 1 : 0;
 		}
 	}
-	// Per-step survival EMA, observed only where the step was proposed.
-	constexpr float kEma = 0.25f;
-	for ( int k = 0; k < res.proposed && !offered; ++k ) {
-		cond_[k] = ( 1.0f - kEma ) * cond_[k] + kEma * ( k < res.accepted ? 1.0f : 0.0f );
-	}
+	if ( !offered ) observe( res.proposed, res.accepted );
 	// Bonus token: the target's prediction just past the accepted prefix.
 	if ( res.accepted == active ) {
 		res.emitted[res.emitted_count++] = sampled ? sample_token( cs[active], *sp, *rng ) : preds[active];
@@ -421,6 +472,13 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	if ( res.accepted < active || mc.spec_commit_always() ) mc.commit_spec_rows( slot, 0, res.accepted );
 	mc.set_spec_snapshot( false );
 	res.next_pos = pos + 1 + res.accepted;
+	if ( !offered ) cost_.add( active, impl::now_ms() - t_round );
+	if ( !offered && cost_.rounds % 200 == 0 ) {
+		char line[256];
+		int n = 0;
+		for ( int k = 1; k <= 7; ++k ) n += std::snprintf( line + n, sizeof( line ) - n, " %d:%.2f/%d/%.2f", k, cost_.ms[k], cost_.seen[k], reach_[k - 1] );
+		LOG_DEBUG( "[spec] round ms / rounds / reach per block size:%s\n", line );
+	}
 	// Close the round: account the trailing segment and rewind the cursor.
 	if ( profile_on_ ) {
 		const double now = impl::now_ms();
@@ -525,8 +583,7 @@ void DFlash2Runner::speculate_joint( int n, const int* slots, const int* anchors
 			res.emitted[res.emitted_count++] = cands[t];
 			res.accepted++;
 		}
-		constexpr float kEma = 0.25f;
-		for ( int t = 0; t < res.proposed && !offered[j]; ++t ) cond_[t] = ( 1.0f - kEma ) * cond_[t] + kEma * ( t < res.accepted ? 1.0f : 0.0f );
+		if ( !offered[j] ) observe( res.proposed, res.accepted );
 		if ( res.accepted == act ) res.emitted[res.emitted_count++] = sampled ? sample_token( cs[b + act], *sps[i], *rngs[i] ) : vpred[b + act];
 		if ( res.accepted < act ) ++prof_.commits;
 		mc.commit_spec_rows( slots[i], b, b + res.accepted );

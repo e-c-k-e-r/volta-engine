@@ -20,6 +20,23 @@ void alloc_draft_taps( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch&
 	hooks.taps_owner = s.taps_owner;
 }
 
+bool read_draft_taps( const DraftHooks& hooks, int slot_id, int slots, int first_pos, int count, int hidden, backend::half_t* host_dst, backend::stream_t stream ) {
+	const int cap = hooks.taps_cap;
+	if ( hooks.taps == nullptr || slot_id < 0 || slot_id >= slots || first_pos < 0 || count <= 0 || count > cap ) return false;
+	if ( hooks.taps_slot_stride == 0 && slot_id != 0 ) return false;   // one shared ring: only a single-slot server reads it unambiguously
+	const size_t row = static_cast<size_t>( 5 ) * hidden;
+	const backend::half_t* ring = hooks.taps + static_cast<size_t>( slot_id ) * hooks.taps_slot_stride;
+	// Position p lives in ring row p % cap: at most two contiguous runs
+	for ( int done = 0; done < count; ) {
+		const int r = ( first_pos + done ) % cap;
+		const int n = MIN( count - done, cap - r );
+		backend::memcpy_async( host_dst + static_cast<size_t>( done ) * row, ring + static_cast<size_t>( r ) * row, static_cast<size_t>( n ) * row * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+		done += n;
+	}
+	backend::stream_sync( stream );
+	return true;
+}
+
 void alloc_draft_head( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int hidden, int lm_shard_cols, int tile, int shard_offset, int shard_real_cols ) {
 	const int kM = kDraftM;
 	int ds[2] = { kM, hidden };

@@ -100,6 +100,20 @@ private:
 	int att_[8] = {};
 	int hit_[8] = {};
 	float cond_[8] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };  // survival EMA (depth policy)
+	float reach_[8] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f }; // conditional survival EMA (spec_depth_rate)
+	void observe( int proposed, int accepted );
+	// spec_depth_rate: the measured round time of every block size (the median of its recent rounds: the cost is not linear in the size,
+	// and single rounds stall), and the size that gives the most expected tokens per millisecond
+	struct RoundCost {
+		static constexpr int kKeep = 9;
+		double ms[16] = {};
+		double recent[16][kKeep] = {};
+		int seen[16] = {};
+		long last[16] = {};   // the round a size was last measured, so the stalest one is refreshed first
+		long rounds = 0;
+		void add( int size, double t );
+	} cost_;
+	int rate_block( int K );
 
 	bool profile_on_ = false;
 	SpecProfile prof_;

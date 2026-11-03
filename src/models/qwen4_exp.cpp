@@ -1534,20 +1534,8 @@ void Qwen4ExpPipeline::draft_head_topk( int rows, backend::stream_t stream ) {
 }
 
 bool Qwen4ExpPipeline::read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream ) {
-	const int cap = draft_hooks_.taps_cap;
-	if ( draft_hooks_.taps == nullptr || slot_id < 0 || slot_id >= config_.max_slots || first_pos < 0 || count <= 0 || count > cap ) return false;
 	backend::set_device( rank_ );
-	const size_t row = static_cast<size_t>( 5 ) * config_.hidden_size;
-	const backend::half_t* ring = draft_.taps.ptr<const backend::half_t>() + static_cast<size_t>( slot_id ) * draft_hooks_.taps_slot_stride;
-	// Position p lives in ring row p % cap: at most two contiguous runs
-	for ( int done = 0; done < count; ) {
-		const int r = ( first_pos + done ) % cap;
-		const int n = std::min( count - done, cap - r );
-		backend::memcpy_async( host_dst + static_cast<size_t>( done ) * row, ring + static_cast<size_t>( r ) * row, static_cast<size_t>( n ) * row * sizeof( backend::half_t ), backend::Copy::D2H, stream );
-		done += n;
-	}
-	backend::stream_sync( stream );
-	return true;
+	return read_draft_taps( draft_hooks_, slot_id, config_.max_slots, first_pos, count, config_.hidden_size, host_dst, stream );
 }
 
 void Qwen4ExpPipeline::reset_state( int slot_id ) {

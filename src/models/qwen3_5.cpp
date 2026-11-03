@@ -1097,6 +1097,11 @@ void Qwen3_5Pipeline::copy_kv_rows( int slot_id, int from, int tokens, char* hos
 	}
 }
 
+bool Qwen3_5Pipeline::read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream ) {
+	backend::set_device( rank_ );
+	return read_draft_taps( draft_hooks_, slot_id, config_.max_slots, first_pos, count, config_.hidden_size, host_dst, stream );
+}
+
 bool Qwen3_5Pipeline::save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream ) {
 	if ( seq_state_bytes( from, tokens, with_taps ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
 	backend::set_device( rank_ );

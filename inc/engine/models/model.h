@@ -51,6 +51,9 @@ struct DraftScratch {
 // (hooks.taps_slot_stride is set); otherwise one position-indexed ring is shared and taps_owner names the slot that publishes into it.
 void alloc_draft_taps( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int max_seq, int hidden, int slots, bool per_slot );
 
+// Copy the taps of positions [first_pos, first_pos + count) of a slot's ring to the host (the read_taps of every model with a drafter)
+bool read_draft_taps( const DraftHooks& hooks, int slot_id, int slots, int first_pos, int count, int hidden, backend::half_t* host_dst, backend::stream_t stream );
+
 // The drafter's head scratch: lm_in, the head shard's logits and the per-rank candidate top-k buffers, wired into the hooks
 void alloc_draft_head( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int hidden, int lm_shard_cols, int tile, int shard_offset, int shard_real_cols );
 
