@@ -2,6 +2,7 @@
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/runtime/cand_log.h"
+#include "engine/runtime/target_spool.h"
 #include "engine/backend/runtime.h"
 #include "engine/runtime/cluster.h"
 #include <algorithm>
@@ -394,8 +395,10 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	mark( SpecProfile::SAMPLE );
 	int preds[pod::MAX_BATCH];
 	Candidates cs[pod::MAX_BATCH];
+	const bool spool = TargetSpool::get().on();
 	if ( sampled ) mc.sample_topk( active + 1, cs );
 	else mc.sample( preds, active + 1 );
+	if ( spool && !sampled ) mc.sample_topk( active + 1, cs );
 	mark( SpecProfile::REPAIR );
 	++prof_.rounds;
 
@@ -460,6 +463,8 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 		}
 	}
 	if ( !offered ) observe( res.proposed, res.accepted );
+	// rows 0..accepted were verified on the emitted prefix: row k holds the target's logits for position pos + 1 + k
+	if ( spool ) for ( int k = 0; k <= res.accepted; ++k ) TargetSpool::get().add( slot, pos + 1 + k, cs[k] );
 	// Bonus token: the target's prediction just past the accepted prefix.
 	if ( res.accepted == active ) {
 		res.emitted[res.emitted_count++] = sampled ? sample_token( cs[active], *sp, *rng ) : preds[active];
@@ -552,7 +557,8 @@ void DFlash2Runner::speculate_joint( int n, const int* slots, const int* anchors
 	int vpred[pod::MAX_BATCH];
 	Candidates cs[pod::MAX_BATCH];
 	mc.sample( vpred, total );
-	if ( any_sampled ) mc.sample_topk( total, cs );
+	const bool spool = TargetSpool::get().on();
+	if ( any_sampled || spool ) mc.sample_topk( total, cs );
 	++prof_.rounds;
 
 	// 3. Acceptance per slot (as in speculate), then the slot's state is the one after its last accepted row
@@ -584,6 +590,7 @@ void DFlash2Runner::speculate_joint( int n, const int* slots, const int* anchors
 			res.accepted++;
 		}
 		if ( !offered[j] ) observe( res.proposed, res.accepted );
+		if ( spool ) for ( int t = 0; t <= res.accepted; ++t ) TargetSpool::get().add( slots[i], poss[i] + 1 + t, cs[b + t] );
 		if ( res.accepted == act ) res.emitted[res.emitted_count++] = sampled ? sample_token( cs[b + act], *sps[i], *rngs[i] ) : vpred[b + act];
 		if ( res.accepted < act ) ++prof_.commits;
 		mc.commit_spec_rows( slots[i], b, b + res.accepted );

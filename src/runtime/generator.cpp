@@ -1,6 +1,7 @@
 #include "engine/core/utf8.h"
 #include "engine/runtime/generator.h"
 #include "engine/runtime/cand_log.h"
+#include "engine/runtime/target_spool.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include <cctype>
@@ -59,6 +60,7 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 	LOG_INFO( "Generator ready: %d slots, speculation %s\n", num_slots_, cluster_.has_speculator() ? "on" : "off" );
 
 	if ( !runtime::options().spec_cand_log.empty() ) CandLog::get().open( runtime::options().spec_cand_log );
+	if ( !runtime::options().tap_spool.empty() ) TargetSpool::get().enable();
 	const size_t cache_budget = static_cast<size_t>( std::max( 0, runtime::options().prefix_cache_gib ) ) << 30;
 	if ( cache_budget > 0 && cluster_.snapshot_bytes( 0, cluster_.snapshot_align() ) > 0 ) {
 		prefix_cache_ = std::make_unique<PrefixCache>( cluster_, cache_budget );
@@ -287,9 +289,11 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 	double decode_s = std::chrono::duration<double>( now - slot.metrics.first_token_time ).count();
 	slot.metrics.generated_tokens = slot.tokens_generated;
 	slot.metrics.decode_tok_s = ( decode_s > 0.0 && slot.tokens_generated > 1 ) ? static_cast<float>( ( slot.tokens_generated - 1 ) / decode_s ) : 0.0f;
-	// Tap spool: int32 0x7A950001, request id, prompt tokens, n tokens, first position, count W; then the tokens [first, n) (int32), then the taps of
-	// positions [first, first + W) (W x 5 x hidden FP16). The last token is not forwarded yet, so taps exist up to n - 2
+	// Tap spool: int32 0x7A950002, request id, prompt tokens, n tokens, first position, count W; then the tokens [first, n) (int32), then the taps of
+	// positions [first, first + W) (W x 5 x hidden FP16), then int32 R and R rows of the target's top-16 at the positions speculation emitted
+	// (int32 pos, int32 n, float logits[16], int32 ids[16]; logits unscaled, sorted descending). The last token is not forwarded yet, so taps exist up to n - 2
 	if ( const std::string& spool = runtime::options().tap_spool; !spool.empty() && cluster_.has_speculator() ) {
+		const std::vector<TargetSpool::Row> rows = TargetSpool::get().take( s );
 		static std::FILE* f = std::fopen( spool.c_str(), "ab" );
 		const int n = static_cast<int>( slot.all_tokens.size() );
 		const int W = std::max( 0, std::min( std::min( runtime::options().tap_spool_window, n - 1 ), 2048 ) );
@@ -297,10 +301,21 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 		if ( f && W > 0 && slot.prefill_done ) {
 			std::vector<backend::half_t> taps( static_cast<size_t>( W ) * 5 * cluster_.metadata().hidden_size );
 			if ( cluster_.read_taps( s, first, W, taps.data() ) ) {
-				const int32_t head[6] = { static_cast<int32_t>( 0x7A950001 ), static_cast<int32_t>( slot.req.req_id ), static_cast<int32_t>( slot.req.prompt_tokens.size() ), n, first, W };
+				const int32_t head[6] = { static_cast<int32_t>( 0x7A950002 ), static_cast<int32_t>( slot.req.req_id ), static_cast<int32_t>( slot.req.prompt_tokens.size() ), n, first, W };
 				std::fwrite( head, sizeof( int32_t ), 6, f );
 				std::fwrite( slot.all_tokens.data() + first, sizeof( int ), static_cast<size_t>( n - first ), f );
 				std::fwrite( taps.data(), sizeof( backend::half_t ), taps.size(), f );
+				std::vector<int32_t> tr;
+				for ( const TargetSpool::Row& r : rows ) {
+					if ( r.pos < first || r.pos >= n ) continue;
+					tr.push_back( r.pos );
+					tr.push_back( r.c.n );
+					for ( int k = 0; k < kSampleTopK; ++k ) { int32_t v; std::memcpy( &v, &r.c.logits[k], 4 ); tr.push_back( v ); }
+					for ( int k = 0; k < kSampleTopK; ++k ) tr.push_back( r.c.ids[k] );
+				}
+				const int32_t R = static_cast<int32_t>( tr.size() / ( 2 + 2 * kSampleTopK ) );
+				std::fwrite( &R, sizeof( int32_t ), 1, f );
+				std::fwrite( tr.data(), sizeof( int32_t ), tr.size(), f );
 				std::fflush( f );
 			}
 		}
