@@ -778,7 +778,7 @@ void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 	backend::set_device( rank_ );
 	const int m = rows.count;
 	key_hint_ = rows.pos[m - 1] + 1;
-	lm_mode_ = ( m > pod::MAX_BATCH || steer_.capturing() ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;   // a probe runs eagerly, so any block may skip the head
+	lm_mode_ = ( m > pod::MAX_BATCH || ( steer_.capturing() && rows.logits_mode == pod::BatchRows::LOGITS_NONE ) ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;   // a probe runs eagerly, so its blocks may skip the head (decode-size blocks otherwise compute every row's logits, which the cluster samples)
 	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
 	set_rows( m );
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
