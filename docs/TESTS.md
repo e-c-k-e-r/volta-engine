@@ -91,6 +91,8 @@ Not part of `gate.sh` (except `bench_decode`, `bench_accept` and `bench_prefill`
 | `bench_shapes` | GEMV against GEMM time per Qwen TP4 per-rank shape (GPU 0, random trellis data) |
 | `bench_expert_heat` | GLM routed-expert skew: the share of a prompt's routes a resident subset of each layer's experts would serve, from its own or the other prompts' counts |
 | `bench_sparse_head [model dir]` | the Flash-Next head shard through `Linear::forward` against an FP16 GEMV over a vocabulary subset of 4K to 32K columns, 1 to 4 draft rows (one GPU) |
+| `tests/tools/pcie_bw.cu` (standalone, `nvcc -O3`) | host to device and device to host bandwidth per GPU, alone and all at once (a shared uplink shows), and a kernel reading pinned memory in place |
+| `tests/tools/ram_bw.c` (standalone, `cc -O3 -march=native -fopenmp`; `[GiB per array]`) | host RAM read / write / triad bandwidth per NUMA node (one thread, every core, every hardware thread) and for all nodes together, threads pinned and pages node-local |
 
 ## Serving benchmarks
 
