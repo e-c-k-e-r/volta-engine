@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <filesystem>
 
 namespace engine::runtime {
 
@@ -65,6 +66,24 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 	if ( cache_budget > 0 && cluster_.snapshot_bytes( 0, cluster_.snapshot_align() ) > 0 ) {
 		prefix_cache_ = std::make_unique<PrefixCache>( cluster_, cache_budget );
 		LOG_INFO( "Prefix cache: %.0f GiB pinned host budget\n", cache_budget / 1073741824.0 );
+		if ( const std::string& dir = runtime::options().prefix_cache_dir; !dir.empty() ) {
+			// everything the snapshot bytes depend on: the checkpoint's files, the weight-format options, the KV format, the ranks and the layout sizes
+			const auto& opt = runtime::options();
+			std::string fp = "volta-engine prefix snapshots v1\nmodel " + std::filesystem::weakly_canonical( config.model_dir ).string() + "\n";
+			std::error_code ec;
+			std::vector<std::string> files;
+			for ( const auto& de : std::filesystem::directory_iterator( config.model_dir, ec ) ) {
+				const std::string ext = de.path().extension().string();
+				if ( ext == ".safetensors" || ext == ".json" ) files.push_back( de.path().filename().string() + " " + std::to_string( de.file_size( ec ) ) + " " +
+					std::to_string( std::filesystem::last_write_time( de.path(), ec ).time_since_epoch().count() ) );
+			}
+			std::sort( files.begin(), files.end() );
+			for ( const std::string& f : files ) fp += f + "\n";
+			fp += "kv_format " + opt.kv_format + "\nnvfp4_experts " + opt.nvfp4_experts + "\nnvfp4_dense_dir " + opt.nvfp4_dense_dir + "\nnvfp4_dense " + opt.nvfp4_dense +
+				"\nranks " + std::to_string( cluster_.tp() ) + "\nalign " + std::to_string( cluster_.snapshot_align() ) + "\nbytes " +
+				std::to_string( cluster_.snapshot_bytes( 0, cluster_.snapshot_align() ) ) + " " + std::to_string( cluster_.snapshot_bytes( 0, cluster_.snapshot_align(), true ) ) + "\n";
+			prefix_cache_->enable_disk( dir, fp, static_cast<size_t>( std::max( 1, opt.prefix_cache_disk_gib ) ) << 30 );
+		}
 	}
 	else {
 		LOG_INFO( "Prefix cache off\n" );
@@ -191,6 +210,7 @@ int Generator::loop_detect_mode() {
 bool Generator::emit_token( int s, int tok, const Candidates* row ) {
 	Slot& slot = slots_[s];
 	if ( slot.sp.logprobs >= 0 && row != nullptr ) slot.pending_logprobs.push_back( token_logprob( *row, tok, slot.sp.logprobs ) );
+	probe_collect( s, false );
 	slot.all_tokens.push_back( tok );
 	if ( slot.sp.history ) slot.history.add( tok );
 	slot.tokens_generated++;
@@ -300,8 +320,44 @@ bool Generator::emit_token( int s, int tok, const Candidates* row ) {
 	return finish;
 }
 
+void Generator::probe_collect( int s, bool final ) {
+	Slot& slot = slots_[s];
+	if ( slot.metrics.probes.empty() ) return;
+	const int prompt_len = static_cast<int>( slot.req.prompt_tokens.size() );
+	// rows forwarded so far whose input is an emitted token (a speculation round may forward drafts past a max_tokens cut)
+	const int end = std::min( slot.current_pos, prompt_len + slot.tokens_generated );
+	int from = slot.probe_read < 0 ? prompt_len - 1 : slot.probe_read;
+	if ( from >= end || ( !final && end - from < 256 ) ) return;
+	const int np = static_cast<int>( slot.metrics.probes.size() );
+	std::vector<float> buf;
+	while ( from < end ) {
+		const int count = std::min( end - from, engine::modules::kProbeRing / 2 );
+		buf.resize( static_cast<size_t>( engine::modules::kProbes ) * count );
+		if ( !cluster_.probe_read( s, from, count, buf.data() ) ) return;
+		for ( int p = 0; p < np; ++p ) {
+			ProbeSummary& ps = slot.metrics.probes[p];
+			for ( int i = 0; i < count; ++i ) {
+				const float v = buf[static_cast<size_t>( p ) * count + i];
+				if ( from + i == prompt_len - 1 ) { ps.prompt = v; continue; }
+				ps.max = ps.n == 0 ? v : std::max( ps.max, v );
+				ps.last = v;
+				slot.probe_sum[p] += v;
+				slot.probe_above[p] += v > 0.5f ? 1 : 0;
+				++ps.n;
+			}
+			if ( ps.n > 0 ) {
+				ps.mean = static_cast<float>( slot.probe_sum[p] / ps.n );
+				ps.above = static_cast<float>( slot.probe_above[p] ) / ps.n;
+			}
+		}
+		from += count;
+	}
+	slot.probe_read = end;
+}
+
 void Generator::finish_slot( int s, FinishReason reason ) {
 	Slot& slot = slots_[s];
+	probe_collect( s, true );
 	auto now = std::chrono::steady_clock::now();
 	double decode_s = std::chrono::duration<double>( now - slot.metrics.first_token_time ).count();
 	slot.metrics.generated_tokens = slot.tokens_generated;
@@ -644,7 +700,8 @@ const SteerFile* Generator::steer_file( const std::string& vector, std::string* 
 	std::vector<int> per_layer( cluster_.metadata().num_layers, 0 );
 	for ( const auto& e : f.entries ) {
 		if ( e.layer < first || e.layer >= first + count ) { *err = path + ": layer " + std::to_string( e.layer ) + " is outside the steered layers " + std::to_string( first ) + "-" + std::to_string( first + count - 1 ) + " (steer_layers)"; return nullptr; }
-		if ( ( e.kind != engine::modules::STEER_ADD && e.kind != engine::modules::STEER_CLAMP && e.kind != engine::modules::STEER_CLAMP_KEEP ) || ++per_layer[e.layer] > engine::modules::kSteerEntries ) { *err = path + ": bad entry on layer " + std::to_string( e.layer ); return nullptr; }
+		if ( ( e.kind != engine::modules::STEER_ADD && e.kind != engine::modules::STEER_CLAMP && e.kind != engine::modules::STEER_CLAMP_KEEP && e.kind != engine::modules::STEER_PROBE ) ||
+			++per_layer[e.layer] > engine::modules::kSteerEntries ) { *err = path + ": bad entry on layer " + std::to_string( e.layer ); return nullptr; }
 	}
 	return &steer_files_.emplace( vector, std::move( f ) ).first->second;
 }
@@ -655,6 +712,32 @@ bool Generator::check_steer( const std::string& vector, const std::string& scope
 	if ( !scope.empty() && !parse_steer_scope( scope, &bits ) ) { *err = "steer_scope: use prompt, think, answer, generated or all"; return false; }
 	if ( vector.empty() || vector == "none" ) return true;
 	return steer_file( vector, err ) != nullptr;
+}
+
+// The probes of a request: its own list, else the probe option's
+std::vector<std::string> Generator::probe_names( const std::vector<std::string>& requested ) const {
+	if ( !requested.empty() ) return requested;
+	std::vector<std::string> out;
+	const std::string& spec = runtime::options().probe;
+	for ( size_t p = 0; p < spec.size(); ) {
+		const size_t q = std::min( spec.find( ',', p ), spec.size() );
+		if ( q > p ) out.push_back( spec.substr( p, q - p ) );
+		p = q + 1;
+	}
+	return out;
+}
+
+bool Generator::check_probes( const std::vector<std::string>& names, std::string* err ) {
+	const std::vector<std::string> list = probe_names( names );
+	if ( list.empty() ) return true;
+	if ( !cluster_.steer_enabled() ) { *err = "probes need the steer option"; return false; }
+	if ( list.size() > static_cast<size_t>( engine::modules::kProbes ) ) { *err = "at most " + std::to_string( engine::modules::kProbes ) + " probes"; return false; }
+	for ( const std::string& n : list ) {
+		const SteerFile* f = steer_file( n, err );
+		if ( !f ) return false;
+		for ( const auto& e : f->entries ) if ( e.kind != engine::modules::STEER_PROBE ) { *err = n + ": not a probe file (steer_build --probe)"; return false; }
+	}
+	return true;
 }
 
 std::vector<engine::modules::SteerEntry> Generator::request_steer_entries( int s, int* scope_out ) {
@@ -668,7 +751,7 @@ std::vector<engine::modules::SteerEntry> Generator::request_steer_entries( int s
 		std::string err;
 		if ( const SteerFile* f = steer_file( name, &err ) ) {
 			const float scale = ( slot.req.steer_scale >= 0.0f ? slot.req.steer_scale : static_cast<float>( opt.steer_scale ) ) * f->scale;
-			entries = f->entries;
+			for ( const auto& e : f->entries ) if ( e.kind != engine::modules::STEER_PROBE ) entries.push_back( e );
 			for ( auto& e : entries ) if ( e.kind == engine::modules::STEER_ADD ) e.par *= scale;
 			scope = f->scope;
 			const std::string& sc = !slot.req.steer_scope.empty() ? slot.req.steer_scope : opt.steer_scope;
@@ -677,6 +760,18 @@ std::vector<engine::modules::SteerEntry> Generator::request_steer_entries( int s
 		else LOG_ERROR( "[steer] request %llu runs unsteered: %s\n", static_cast<unsigned long long>( slot.req.req_id ), err.c_str() );
 	}
 	if ( scope_out ) *scope_out = entries.empty() ? 0 : scope;
+	// the probes, after the edits (SteerHost::set runs them first on their layer, so they read the unedited state)
+	const std::vector<std::string> probes = probe_names( slot.req.probes );
+	for ( size_t p = 0; p < probes.size() && p < static_cast<size_t>( engine::modules::kProbes ); ++p ) {
+		std::string err;
+		const SteerFile* f = steer_file( probes[p], &err );
+		if ( !f ) { LOG_ERROR( "[probe] request %llu: %s\n", static_cast<unsigned long long>( slot.req.req_id ), err.c_str() ); continue; }
+		for ( const auto& e : f->entries ) {
+			if ( e.kind != engine::modules::STEER_PROBE ) continue;
+			entries.push_back( e );
+			entries.back().probe = static_cast<int>( p );
+		}
+	}
 	return entries;
 }
 
@@ -688,6 +783,11 @@ void Generator::steer_admit( int s ) {
 	slot.steer_scope = scope;
 	slot.steer_prompt = ( slot.steer_scope & engine::modules::STEER_PROMPT ) != 0;
 	slot.steer_think_open = slot.in_reasoning;
+	slot.metrics.probes.clear();   // steer_admit runs again after the gate's probe
+	for ( const std::string& n : probe_names( slot.req.probes ) ) {
+		if ( slot.metrics.probes.size() >= static_cast<size_t>( engine::modules::kProbes ) ) break;
+		slot.metrics.probes.push_back( ProbeSummary{ n } );
+	}
 	const float penalty = slot.req.think_penalty >= 0.0f ? slot.req.think_penalty : static_cast<float>( opt.think_penalty );
 	cluster_.steer_set( s, entries );
 	cluster_.steer_control( s, slot.steer_scope, static_cast<int>( slot.req.prompt_tokens.size() ), slot.in_reasoning ? INT_MAX : 0 );

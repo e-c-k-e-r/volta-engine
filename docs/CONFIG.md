@@ -18,7 +18,7 @@ values are fatal errors. The model type is never configured: it is read from the
 | `host`, `port` | `--host`, `--port` | 0.0.0.0, 8000 | listen address |
 | `max_batch_size` | `--max-batch-size` | 8 | concurrent decode slots the scheduler may fill (capped by `max_slots`) |
 | `default_max_tokens` | `--max-tokens` | 256 | `max_tokens` for requests that omit it |
-| `default_temperature`, `default_top_p`, `default_top_k` | `--temperature` | from the checkpoint's `generation_config.json` | sampling defaults for requests that omit them |
+| `default_temperature`, `default_top_p`, `default_top_k` | `--temperature` | from the checkpoint's `generation_config.json` | sampling defaults for requests that omit them (`presence_penalty` and `repetition_penalty` are also taken from that file when it sets them) |
 | `default_enable_thinking` | | false | thinking on for requests that do not say |
 | `request_timeout_s` | | 30 | seconds a connection may stay silent before its request is complete |
 | `video` | see below | | MiniMax-H3 settings |
@@ -59,6 +59,8 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `max_seq` | int | `0` | `ENGINE_MAX_SEQ` | context window per slot in tokens (sizes the KV pool); 0 = the model default (Qwen 32768, GLM 12288) |
 | `max_slots` | int | `0` | `ENGINE_MAX_SLOTS` | decode slots; 0 = the model default (Qwen 8, GLM 1) |
 | `prefix_cache_gib` | int | `16` | `ENGINE_PREFIX_CACHE_GIB` | pinned host RAM for the prefix cache (sequence snapshots); 0 = off |
+| `prefix_cache_dir` | string | `(empty)` | `ENGINE_PREFIX_CACHE_DIR` | directory of the prefix cache's disk tier: evicted snapshots are written there instead of dropped, all of them when the server stops, and a restart reads them back on demand (files are kept apart per model and configuration); empty = RAM only |
+| `prefix_cache_disk_gib` | int | `64` | `ENGINE_PREFIX_CACHE_DISK_GIB` | with prefix_cache_dir: the disk tier's size; the least recently used files are deleted beyond it |
 | `prefill_window` | int | `0` | `ENGINE_PREFILL_WINDOW` | GLM (up to 8), DeepSeek (up to 16): prefill several chunks of a prompt layer by layer: the routed experts of a layer then run once over all the window's rows instead of once per 512-row chunk, which they do faster per row; costs about 0.1 GiB of buffers per extra chunk (the KV pool or expert_cache give it back); 0 or 1 = a chunk at a time |
 | `prefill_budget_ms` | float | `0` | `ENGINE_PREFILL_BUDGET_MS` | while other requests are decoding, the longest (ms) a prompt piece may run before the decoding requests step again: the piece size adapts between 64 and prefill_chunk rows from the measured piece time (a 512-row GLM piece takes about 610 ms, 256 rows 370, 128 rows 270; smaller pieces lower the prompt's speed); 0 = pieces of prefill_chunk rows |
 | `prefill_cooldown` | int | `0` | `ENGINE_PREFILL_COOLDOWN` | while other requests are decoding, the decode steps that run between two prompt pieces (0 = a piece every step): the decoding requests then get most of the GPU time and the prompt is ingested more slowly, in pieces of the same size |
@@ -96,6 +98,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `steer_layers` | string | `(empty)` | `ENGINE_STEER_LAYERS` | steered layers, first-last: indices, fractions of the layer count (0.33, 1/3) or last; empty = 1/3-2/3 (the memory per slot grows with the count) |
 | `steer_file` | string | `(empty)` | `ENGINE_STEER_FILE` | control-vector file (steer_build) of steer=file and of requests that ask for the steering file without naming one |
 | `steer_dir` | string | `(empty)` | `ENGINE_STEER_DIR` | directory of control-vector files that requests name with steer_vector (the name plus .steer); empty = requests cannot name files |
+| `probe` | string | `(empty)` | `ENGINE_PROBE` | with steer: comma list of probe files (steer_build --probe) in steer_dir scored on every request that names none itself, at most 4; each request's usage reports the scores at its last prompt token and over its output |
 | `steer_scale` | float | `1` | `ENGINE_STEER_SCALE` | multiplies the strengths of the add entries of control-vector files (a request's steer_scale replaces it) |
 | `steer_scope` | string | `(empty)` | `ENGINE_STEER_SCOPE` | rows a control-vector file edits, a comma list of prompt, think, answer, generated, all; empty = the file's own scope |
 | `steer_gate_threshold` | string | `auto` | `ENGINE_STEER_GATE_THRESHOLD` | requests with steer_probe: the look-ahead score above which the probe's direction clamp is applied (0 = like the accepting openings, 1 = like the declining ones); auto = the model's value (inc/engine/models/steer_defaults.h) |

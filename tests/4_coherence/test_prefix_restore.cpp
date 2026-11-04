@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <filesystem>
+#include <unistd.h>
 
 using namespace engine::runtime;
 
@@ -204,8 +206,44 @@ int main( int argc, char** argv ) {
 		e = cache.find( other );
 		expect( e && e->tokens.size() == 1024, "an entry equal to the whole prompt is not a hit (no token left to prefill)" );
 
-		// eviction: a small budget keeps the pinned root and its in-use parent chain, drops leaves LRU first
+		// disk tier: a cache with a directory writes its nodes when it is destroyed; a new one indexes the files, reads the chain back and restores it
 		cache.clear();
+		{
+			const std::string dir = "/tmp/volta_prefix_disk_test_" + std::to_string( getpid() );
+			{
+				PrefixCache d1( mc, size_t( 64 ) << 30 );
+				expect( d1.enable_disk( dir, "test_prefix_restore", size_t( 64 ) << 30 ), "disk tier on" );
+				mc.reset_slot( 0 );
+				PrefixCache::Entry* p = nullptr;
+				int at = 0;
+				for ( int cp : { 1024, 2560, 4096 } ) {
+					mc.prefill( ids.data() + at, cp - at, 0, 0, nullptr, at );
+					ModelCluster::SeqSnapshot sn;
+					ENGINE_ASSERT( mc.save_snapshot( 0, p ? static_cast<int>( p->tokens.size() ) : 0, cp, &sn ), "save_snapshot failed" );
+					p = d1.insert( p, prefix( cp ), sn, cp == 1024 );
+					ENGINE_ASSERT( p, "insert failed" );
+					at = cp;
+				}
+			}
+			PrefixCache d2( mc, size_t( 64 ) << 30 );
+			expect( d2.enable_disk( dir, "test_prefix_restore", size_t( 64 ) << 30 ) && d2.stats().disk_entries == 3, "a new cache indexes the three files" );
+			PrefixCache::Entry* dl = d2.find( ids );
+			expect( dl && dl->tokens.size() == 4096 && d2.stats().disk_hits == 1 && d2.stats().entries == 3, "the deepest prefix and its ancestors are read back" );
+			const int ds = slot_of( 3 );
+			mc.reset_slot( ds );
+			expect( dl && d2.restore( ds, dl ), "restore the chain read from disk" );
+			Candidates disk_c;
+			const int disk_first = mc.prefill( ids.data() + 4096, n - 4096, ds, 0, &disk_c, 4096 );
+			const std::vector<int> disk_tokens = decode( mc, disk_first, n, ds, 48 );
+			float disk_diff = 0.0f;
+			for ( int j = 0; j < disk_c.n; ++j ) disk_diff = std::max( disk_diff, std::fabs( disk_c.logits[j] - cold_c.logits[j] ) );
+			expect( disk_tokens == cold && disk_diff < 0.25f, "a restore from disk continues like the cold run" );
+			std::printf( "    disk restore: max |dlogit| %.4g\n", disk_diff );
+			std::error_code ec;
+			std::filesystem::remove_all( dir, ec );
+		}
+
+		// eviction: a small budget keeps the pinned root and its in-use parent chain, drops leaves LRU first
 		auto rounded = [&]( int from, int to ) {
 			const size_t r = size_t( 8 ) << 20;
 			return ( mc.snapshot_bytes( from, to, true ) + r - 1 ) / r * r * mc.tp();

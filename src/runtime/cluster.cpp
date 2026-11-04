@@ -582,22 +582,16 @@ size_t ModelCluster::snapshot_bytes( int from, int tokens, bool with_taps ) cons
 	return models_[0]->seq_state_bytes( from, tokens, with_taps );
 }
 
-bool ModelCluster::save_snapshot( int slot, int from, int tokens, SeqSnapshot* snap, bool with_taps ) {
-	constexpr size_t kRound = size_t( 8 ) << 20;
-	with_taps = with_taps && runner_ != nullptr && runner_->needs_taps();
-	const size_t need = snapshot_bytes( from, tokens, with_taps );
-	if ( need == 0 ) return false;
-	const size_t cls = ( need + kRound - 1 ) / kRound * kRound;
+bool ModelCluster::alloc_snapshot( int from, int tokens, bool with_taps, size_t bytes, SeqSnapshot* snap ) {
 	snap->from = from;
 	snap->with_taps = with_taps;
 	snap->tokens = tokens;
-	snap->bytes = cls;
-	const auto t_alloc = std::chrono::steady_clock::now();
+	snap->bytes = bytes;
 	for ( int d = 0; d < tp_; ++d ) {
 		void* p = nullptr;
 		{
 			std::lock_guard<std::mutex> lock( snapshot_mtx_ );
-			auto& list = snapshot_free_[d][cls];
+			auto& list = snapshot_free_[d][bytes];
 			if ( !list.empty() ) {
 				p = list.back();
 				list.pop_back();
@@ -605,7 +599,7 @@ bool ModelCluster::save_snapshot( int slot, int from, int tokens, SeqSnapshot* s
 		}
 		if ( !p ) {
 			backend::set_device( d );
-			p = backend::host_alloc_pinned( cls, backend::Pin::Default );
+			p = backend::host_alloc_pinned( bytes, backend::Pin::Default );
 		}
 		if ( !p ) {
 			free_snapshot( snap );
@@ -613,6 +607,17 @@ bool ModelCluster::save_snapshot( int slot, int from, int tokens, SeqSnapshot* s
 		}
 		snap->host[d] = p;
 	}
+	return true;
+}
+
+bool ModelCluster::save_snapshot( int slot, int from, int tokens, SeqSnapshot* snap, bool with_taps ) {
+	constexpr size_t kRound = size_t( 8 ) << 20;
+	with_taps = with_taps && runner_ != nullptr && runner_->needs_taps();
+	const size_t need = snapshot_bytes( from, tokens, with_taps );
+	if ( need == 0 ) return false;
+	const size_t cls = ( need + kRound - 1 ) / kRound * kRound;
+	const auto t_alloc = std::chrono::steady_clock::now();
+	if ( !alloc_snapshot( from, tokens, with_taps, cls, snap ) ) return false;
 	const auto t_copy = std::chrono::steady_clock::now();
 	int ok[ENGINE_NUM_GPUS] = {};
 	pool_.run( [&]( int d ) {
@@ -721,6 +726,10 @@ void ModelCluster::steer_capture( const std::vector<int>& layers, bool on ) {
 
 bool ModelCluster::steer_read( std::vector<float>& out ) {
 	return models_[0]->steer_read( out, streams_[0] );
+}
+
+bool ModelCluster::probe_read( int slot, int first_pos, int count, float* out ) {
+	return models_[0]->probe_read( slot, first_pos, count, out, streams_[0] );
 }
 
 bool ModelCluster::reserve_tokens( int slot, int tokens ) {

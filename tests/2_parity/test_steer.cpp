@@ -191,6 +191,52 @@ int main() {
 		ENGINE_ASSERT( hit == 3 * 2, "expected the three in-think rows of slot 2 (predicted positions 4, 5, 6) to be penalised at both in-shard ids" );
 		std::printf( "    %d logits penalised, all others bit-identical\n", hit );
 	}
+	std::printf( "[*] probes: ring scores over layers, rows untouched, scored whatever the edit scope...\n" );
+	{
+		// slot 0 (no edits) gets probe 1 on layers 0 and 2 (first on layer 0); slot 3 (an add on layer 0, scope prompt) gets probe 0 on layer 2, after that add
+		const float pp0 = 0.25f, pp2 = -0.5f, pp3 = 0.75f;
+		set( 0, 0, 0, kSteerProbeKind + 2 * 1 + 1, pp0 );
+		set( 0, 2, 0, kSteerProbeKind + 2 * 1, pp2 );
+		set( 3, 2, 0, kSteerProbeKind + 2 * 0 + 1, pp3 );
+		ctl[0].probe_n = 2;
+		ctl[3].probe_n = 1;
+		CUDA_CHECK( cudaMemcpy( t.par, par.data(), par.size() * 4, cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMemcpy( t.kind, kind.data(), kind.size() * 4, cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMemcpy( t.ctl, ctl.data(), ctl.size() * sizeof( SteerSlotCtl ), cudaMemcpyHostToDevice ) );
+		const size_t ring_n = static_cast<size_t>( slots ) * kProbes * kProbeRing;
+		CUDA_CHECK( cudaMalloc( &t.probe, ring_n * 4 ) );
+		CUDA_CHECK( cudaMemset( t.probe, 0, ring_n * 4 ) );
+		CUDA_CHECK( cudaMemcpy( d_x, hx.data(), hx.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
+		for ( int layer = 0; layer < layers; ++layer ) ResidualSteer::apply( t, d_x, d_rows, rows, layer, stream );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		std::vector<float> ring( ring_n );
+		CUDA_CHECK( cudaMemcpy( ring.data(), t.probe, ring_n * 4, cudaMemcpyDeviceToHost ) );
+		std::vector<half> got( hx.size() );
+		CUDA_CHECK( cudaMemcpy( got.data(), d_x, got.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+		auto dot_with = []( const half* x, const float* v, int n ) { double d = 0; for ( int i = 0; i < n; ++i ) d += half_to_float( x[i] ) * v[i]; return d; };
+		int checked = 0;
+		for ( int r = 0; r < rows; ++r ) {
+			const int s = row_slot[r], p = row_pos[r];
+			const half* x0 = &hx[static_cast<size_t>( r ) * H];
+			if ( s == 0 ) {
+				// no edits: the row is unchanged and the score is the sum of both layers' x . v - par
+				for ( int i = 0; i < H; ++i ) ENGINE_ASSERT( std::memcmp( &got[static_cast<size_t>( r ) * H + i], &x0[i], sizeof( half ) ) == 0, "a probe changed its row" );
+				const double want = dot_with( x0, &vec[( 0 * layers + 0 ) * K * static_cast<size_t>( H )], H ) - pp0 + dot_with( x0, &vec[( 0 * layers + 2 ) * K * static_cast<size_t>( H )], H ) - pp2;
+				const float g = ring[( 0 * kProbes + 1 ) * kProbeRing + p % kProbeRing];
+				ENGINE_ASSERT( std::fabs( g - want ) <= 1e-3 * std::fabs( want ) + 1e-3, "probe score differs from the reference" );
+				++checked;
+			}
+			if ( s == 3 ) {
+				// the probe on layer 2 reads the row after layer 0's add (prompt rows only: the add's scope), which is the row the kernels left
+				const double want = dot_with( &got[static_cast<size_t>( r ) * H], &vec[( 3 * layers + 2 ) * K * static_cast<size_t>( H )], H ) - pp3;
+				const float g = ring[( 3 * kProbes + 0 ) * kProbeRing + p % kProbeRing];
+				ENGINE_ASSERT( std::fabs( g - want ) <= 2e-3 * std::fabs( want ) + 2e-3, "probe score after an edit differs from the reference" );
+				++checked;
+			}
+		}
+		ENGINE_ASSERT( checked == 3, "expected slot 0's row and slot 3's two rows to be scored" );
+		std::printf( "    %d probe scores match, probe-only rows bit-identical\n", checked );
+	}
 	std::printf( "[+] ResidualSteer PASS\n" );
 	return 0;
 }

@@ -206,6 +206,7 @@ private:
 		json j = { { "prompt_tokens", u.prompt_tokens }, { "completion_tokens", u.completion_tokens }, { "total_tokens", u.prompt_tokens + u.completion_tokens }, { "prompt_tokens_details", { { "cached_tokens", u.cached_tokens } } },
 			{ "ttft_ms", u.ttft_ms }, { "decode_tok_s", u.decode_tok_s } };
 		if ( u.gate_score >= 0.0f || u.gate_fired ) j["steer_gate"] = { { "score", u.gate_score }, { "fired", u.gate_fired } };
+		if ( !u.probes.empty() ) j["probes"] = probes_json( u.probes );
 		return j;
 	}
 
@@ -331,6 +332,23 @@ public:
 		if ( j.contains( "steer_vector" ) && j["steer_vector"].is_string() ) r.steer_vector = j["steer_vector"].get<std::string>();
 		if ( j.contains( "steer_scale" ) && j["steer_scale"].is_number() ) r.steer_scale = j["steer_scale"].get<float>();
 		if ( j.contains( "steer_scope" ) && j["steer_scope"].is_string() ) r.steer_scope = j["steer_scope"].get<std::string>();
+		if ( j.contains( "probes" ) ) {
+			if ( j["probes"].is_string() ) {
+				const std::string v = j["probes"].get<std::string>();
+				for ( size_t p = 0; p < v.size(); ) {
+					const size_t q = std::min( v.find( ',', p ), v.size() );
+					if ( q > p ) r.probes.push_back( v.substr( p, q - p ) );
+					p = q + 1;
+				}
+			}
+			else if ( j["probes"].is_array() ) {
+				for ( const auto& x : j["probes"] ) {
+					if ( !x.is_string() ) return fail( err, "probes must be a string or an array of strings" );
+					r.probes.push_back( x.get<std::string>() );
+				}
+			}
+			else return fail( err, "probes must be a string or an array of strings" );
+		}
 		if ( j.contains( "steer_gate_threshold" ) && j["steer_gate_threshold"].is_number() ) r.probe_threshold = j["steer_gate_threshold"].get<float>();
 		if ( j.contains( "steer_edit_strength" ) && j["steer_edit_strength"].is_number() ) r.probe_edit_strength = j["steer_edit_strength"].get<float>();
 		if ( j.contains( "steer_hedge_strength" ) && j["steer_hedge_strength"].is_number() ) r.probe_hedge_strength = j["steer_hedge_strength"].get<float>();

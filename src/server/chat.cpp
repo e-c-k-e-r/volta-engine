@@ -318,6 +318,10 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		err->message = why;
 		return false;
 	}
+	if ( std::string why; !gen.check_probes( req.probes, &why ) ) {
+		err->message = why;
+		return false;
+	}
 	std::string prompt;
 	std::vector<int> tokens;
 	ImageList images;
@@ -349,6 +353,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	g.frequency_penalty = req.frequency_penalty;
 	g.repetition_penalty = req.repetition_penalty > 0.0f ? req.repetition_penalty : cfg.default_repetition_penalty;
 	g.logprobs = req.logprobs;
+	g.probes = req.probes;
 	g.stop_strings = req.stop;
 	if ( req.stop_on_loop >= 0 ) g.loop_detect = req.stop_on_loop ? 2 : 0;
 	g.starts_in_reasoning = in_reasoning;
@@ -419,6 +424,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		u.ttft_ms = std::chrono::duration<double, std::milli>( m.first_token_time - m.start_time ).count();
 		u.decode_tok_s = m.decode_tok_s;
 		u.gate_score = m.gate_score;
+		u.probes = m.probes;
 		u.gate_fired = m.gate_fired;
 		state->responder->on_finish( reason, matched, state->parser.saw_tool_call(), u );
 	};
@@ -429,6 +435,16 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		return false;
 	}
 	return true;
+}
+
+nlohmann::json probes_json( const std::vector<engine::runtime::ProbeSummary>& probes ) {
+	nlohmann::json out = nlohmann::json::array();
+	auto num = []( float v ) { return std::isfinite( v ) ? nlohmann::json( v ) : nlohmann::json( nullptr ); };
+	for ( const auto& p : probes ) {
+		out.push_back( { { "name", p.name }, { "prompt", num( p.prompt ) }, { "max", num( p.max ) }, { "mean", num( p.mean ) }, { "last", num( p.last ) },
+			{ "above", p.above }, { "tokens", p.n } } );
+	}
+	return out;
 }
 
 } // namespace engine::server

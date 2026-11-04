@@ -5,6 +5,7 @@
 #include "engine/server/http.h"
 #include "engine/server/output_parser.h"
 
+#include <nlohmann/json.hpp>
 #include <atomic>
 #include <memory>
 #include <cmath>
@@ -38,6 +39,7 @@ struct ChatRequest {
 	float frequency_penalty = 0.0f;
 	float repetition_penalty = -1.0f;     // <0: server default
 	int logprobs = -1;                    // >= 0: report token log-probabilities with this many alternatives
+	std::vector<std::string> probes;      // probe files scored on the request (empty: the probe option's)
 	std::vector<std::string> stop;
 	int stop_on_loop = -1;       // extension field stop_on_loop: -1 the loop_detect option, 0 off, 1 stop on a detected loop
 	int enable_thinking = -1;    // -1: server default
@@ -65,7 +67,11 @@ struct Usage {
 	double decode_tok_s = 0.0;
 	float gate_score = -1.0f;   // steering probe: the look-ahead score (-1 = no probe ran)
 	bool gate_fired = false;
+	std::vector<engine::runtime::ProbeSummary> probes;
 };
+
+// The usage entry of a request's probes: [{ name, prompt, max, mean, last, above, tokens }] (scores without data are null); empty array when none
+nlohmann::json probes_json( const std::vector<engine::runtime::ProbeSummary>& probes );
 
 // A generated token's log-probability and its top alternatives, as text
 struct LogprobOut {

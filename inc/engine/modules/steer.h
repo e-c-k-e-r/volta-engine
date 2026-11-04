@@ -13,9 +13,14 @@ namespace engine::modules {
 // slot without steering is untouched (its rows return before reading or writing the residual).
 constexpr int kSteerEntries = 4;         // edits per steered layer, applied in order (each sees the result of the ones before)
 constexpr int kSteerPenaltyIds = 256;    // token ids of a slot's logit penalty
+constexpr int kProbes = 4;               // probes per slot
+constexpr int kProbeRing = 4096;         // positions of probe scores kept per probe (indexed by position % kProbeRing)
 
 // STEER_CLAMP_KEEP: a clamp that rescales the whole row afterwards to the norm it had before the clamp
-enum SteerKind : int32_t { STEER_OFF = 0, STEER_ADD = 1, STEER_CLAMP = 2, STEER_CLAMP_KEEP = 3 };
+// STEER_PROBE: one layer's share of a probe score, (x . v - par) added to the slot's probe ring at the row's position; the residual is not edited.
+// On the device a probe entry's kind is kSteerProbeKind + 2 * probe index + (1 on the probe's first layer, which writes instead of adding).
+enum SteerKind : int32_t { STEER_OFF = 0, STEER_ADD = 1, STEER_CLAMP = 2, STEER_CLAMP_KEEP = 3, STEER_PROBE = 8 };
+constexpr int kSteerProbeKind = 16;
 // Rows a slot's residual edit applies to. A row is `prompt` below prompt_len, `think` from there to think_end, `answer` after it.
 enum SteerScope : int32_t { STEER_PROMPT = 1, STEER_THINK = 2, STEER_ANSWER = 4, STEER_GENERATED = 6, STEER_ALL = 7 };
 
@@ -25,6 +30,7 @@ struct SteerEntry {
 	int kind = STEER_ADD;
 	float par = 0.0f;
 	std::vector<float> vec;
+	int probe = 0;   // STEER_PROBE: which of the slot's probes the entry adds to
 };
 
 // "first-last" of the steer_layers option: each side an index, a fraction of the layer count (0.33, 1/3) or "last"; empty = 1/3-2/3. False when malformed.
@@ -36,7 +42,8 @@ struct SteerSlotCtl {
 	int32_t think_end;    // position after the reasoning block (INT32_MAX while it is open or can open, 0 = no reasoning block)
 	int32_t penalty_n;    // marker ids in use (0 = no penalty)
 	float penalty;        // logit subtracted from them while the predicted token lies inside the reasoning block
-	int32_t pad[3];
+	int32_t probe_n;      // probes of the slot (their entries run on every row, whatever the scope)
+	int32_t pad[2];
 };
 
 // Device state of one rank. vec [slots][layers][kSteerEntries][hidden] fp32, par and kind [slots][layers][kSteerEntries]: the strength of an
@@ -50,6 +57,7 @@ struct SteerTables {
 	int32_t* kind = nullptr;
 	SteerSlotCtl* ctl = nullptr;
 	int32_t* penalty_ids = nullptr;   // [slots][kSteerPenaltyIds] global token ids
+	float* probe = nullptr;           // [slots][kProbes][kProbeRing] probe scores by position
 };
 
 struct ResidualSteer {
@@ -57,6 +65,7 @@ struct ResidualSteer {
 	//   add    x += strength * v
 	//   clamp  x -= max( x . v - ref, 0 ) * v
 	//   clamp_keep  the clamp, then x *= |x_before| / |x_after| (only when the clamp removed something)
+	//   probe  probe[slot][p][pos % kProbeRing] (=, on the probe's first layer, else +=) x . v - par, the row unchanged; on every row of a slot with probes
 	// in fp32, written back to fp16 (saturated). Rows of a slot whose scope does not cover them are not touched.
 	static void apply( const SteerTables& tables, backend::half_t* hidden, const pod::BatchRows* d_rows, int rows, int layer_index, backend::stream_t stream );
 

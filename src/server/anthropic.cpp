@@ -235,18 +235,24 @@ public:
 		if ( stream_ ) {
 			if ( !ensure_started() || !close_block() ) return;
 			if ( !event( "message_delta", { { "type", "message_delta" }, { "delta", { { "stop_reason", stop }, { "stop_sequence", stop_seq } } },
-				{ "usage", { { "input_tokens", usage.prompt_tokens - usage.cached_tokens }, { "cache_read_input_tokens", usage.cached_tokens }, { "output_tokens", usage.completion_tokens } } } } ) ) return;
+				{ "usage", usage_json( usage ) } } ) ) return;
 			event( "message_stop", { { "type", "message_stop" } } );
 			conn_->finish();
 			return;
 		}
 		json msg = { { "id", message_id_ }, { "type", "message" }, { "role", "assistant" }, { "model", model_ }, { "content", blocks_.empty() ? json::array() : blocks_ },
 			{ "stop_reason", stop }, { "stop_sequence", stop_seq },
-			{ "usage", { { "input_tokens", usage.prompt_tokens - usage.cached_tokens }, { "cache_read_input_tokens", usage.cached_tokens }, { "output_tokens", usage.completion_tokens } } } };
+			{ "usage", usage_json( usage ) } };
 		send_json( conn_, 200, dump_safe( msg ) );
 	}
 
 private:
+	static json usage_json( const Usage& u ) {
+		json j = { { "input_tokens", u.prompt_tokens - u.cached_tokens }, { "cache_read_input_tokens", u.cached_tokens }, { "output_tokens", u.completion_tokens } };
+		if ( !u.probes.empty() ) j["probes"] = probes_json( u.probes );
+		return j;
+	}
+
 	enum class Kind { None, Thinking, Text, Tool };
 
 	bool event( const char* name, const json& data ) {
@@ -358,6 +364,23 @@ public:
 		if ( j.contains( "steer_vector" ) && j["steer_vector"].is_string() ) r.steer_vector = j["steer_vector"].get<std::string>();
 		if ( j.contains( "steer_scale" ) && j["steer_scale"].is_number() ) r.steer_scale = j["steer_scale"].get<float>();
 		if ( j.contains( "steer_scope" ) && j["steer_scope"].is_string() ) r.steer_scope = j["steer_scope"].get<std::string>();
+		if ( j.contains( "probes" ) ) {
+			if ( j["probes"].is_string() ) {
+				const std::string v = j["probes"].get<std::string>();
+				for ( size_t p = 0; p < v.size(); ) {
+					const size_t q = std::min( v.find( ',', p ), v.size() );
+					if ( q > p ) r.probes.push_back( v.substr( p, q - p ) );
+					p = q + 1;
+				}
+			}
+			else if ( j["probes"].is_array() ) {
+				for ( const auto& x : j["probes"] ) {
+					if ( !x.is_string() ) return fail( err, "probes must be a string or an array of strings" );
+					r.probes.push_back( x.get<std::string>() );
+				}
+			}
+			else return fail( err, "probes must be a string or an array of strings" );
+		}
 		if ( j.contains( "steer_gate_threshold" ) && j["steer_gate_threshold"].is_number() ) r.probe_threshold = j["steer_gate_threshold"].get<float>();
 		if ( j.contains( "steer_edit_strength" ) && j["steer_edit_strength"].is_number() ) r.probe_edit_strength = j["steer_edit_strength"].get<float>();
 		if ( j.contains( "steer_hedge_strength" ) && j["steer_hedge_strength"].is_number() ) r.probe_hedge_strength = j["steer_hedge_strength"].get<float>();

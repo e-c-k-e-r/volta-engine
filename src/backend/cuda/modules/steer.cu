@@ -11,6 +11,19 @@ __device__ __forceinline__ int row_class( const SteerSlotCtl& c, int pos ) {
 	return pos < c.prompt_len ? STEER_PROMPT : ( pos < c.think_end ? STEER_THINK : STEER_ANSWER );
 }
 
+// A probe entry: the row's x . v - par into the slot's ring at the row's position (written on the probe's first layer, added on the others)
+__device__ __forceinline__ void probe_score( const SteerTables& t, int slot, int kind, int pos, const float* srow, const float* v, float par ) {
+	float dot = 0.0f;
+	for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) dot = fmaf( srow[i], v[i], dot );
+	dot = engine::math::block_sum<8>( dot );
+	if ( threadIdx.x == 0 ) {
+		const int p = ( kind - kSteerProbeKind ) >> 1;
+		float* cell = t.probe + ( static_cast<size_t>( slot ) * kProbes + p ) * kProbeRing + pos % kProbeRing;
+		*cell = ( ( kind - kSteerProbeKind ) & 1 ) ? dot - par : *cell + dot - par;
+	}
+	__syncthreads();   // block_sum's shared array is reused by the next entry
+}
+
 // One block per row; the row is edited in shared memory (fp32) through the slot's entries in order, then written back
 __global__ __launch_bounds__( 256 )
 void steer_apply_kernel( SteerTables t, half* __restrict__ hidden, const pod::BatchRows* __restrict__ rows, int layer_index ) {
@@ -18,11 +31,16 @@ void steer_apply_kernel( SteerTables t, half* __restrict__ hidden, const pod::Ba
 	const int r = blockIdx.x;
 	const int slot = rows->slot[r];
 	const SteerSlotCtl c = t.ctl[slot];
-	if ( ( c.scope & row_class( c, rows->pos[r] ) ) == 0 ) return;
+	const bool edit = ( c.scope & row_class( c, rows->pos[r] ) ) != 0;
+	if ( !edit && c.probe_n == 0 ) return;
 	const size_t entry0 = ( static_cast<size_t>( slot ) * t.layers + layer_index ) * kSteerEntries;
-	bool any = false;
+	bool any = false, edits = false;
 	#pragma unroll
-	for ( int k = 0; k < kSteerEntries; ++k ) any |= t.kind[entry0 + k] != STEER_OFF;
+	for ( int k = 0; k < kSteerEntries; ++k ) {
+		const int kd = t.kind[entry0 + k];
+		any |= kd >= kSteerProbeKind || ( edit && kd != STEER_OFF );
+		edits |= edit && kd != STEER_OFF && kd < kSteerProbeKind;
+	}
 	if ( !any ) return;
 
 	half* x = hidden + static_cast<size_t>( r ) * t.hidden;
@@ -33,6 +51,11 @@ void steer_apply_kernel( SteerTables t, half* __restrict__ hidden, const pod::Ba
 		if ( kind == STEER_OFF ) continue;
 		const float* v = t.vec + ( entry0 + k ) * t.hidden;
 		const float par = t.par[entry0 + k];
+		if ( kind >= kSteerProbeKind ) {
+			probe_score( t, slot, kind, rows->pos[r], srow, v, par );
+			continue;
+		}
+		if ( !edit ) continue;
 		if ( kind == STEER_ADD ) {
 			for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) srow[i] += par * v[i];
 		}
@@ -64,6 +87,7 @@ void steer_apply_kernel( SteerTables t, half* __restrict__ hidden, const pod::Ba
 		}
 		__syncthreads();
 	}
+	if ( !edits ) return;
 	for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) x[i] = __float2half_rn( fminf( fmaxf( srow[i], -65504.0f ), 65504.0f ) );
 }
 
@@ -76,11 +100,16 @@ void steer_apply_streams_kernel( SteerTables t, float* __restrict__ streams, int
 	const int r = blockIdx.x;
 	const int slot = rows->slot[r];
 	const SteerSlotCtl c = t.ctl[slot];
-	if ( ( c.scope & row_class( c, rows->pos[r] ) ) == 0 ) return;
+	const bool edit = ( c.scope & row_class( c, rows->pos[r] ) ) != 0;
+	if ( !edit && c.probe_n == 0 ) return;
 	const size_t entry0 = ( static_cast<size_t>( slot ) * t.layers + layer_index ) * kSteerEntries;
-	bool any = false;
+	bool any = false, edits = false;
 	#pragma unroll
-	for ( int k = 0; k < kSteerEntries; ++k ) any |= t.kind[entry0 + k] != STEER_OFF;
+	for ( int k = 0; k < kSteerEntries; ++k ) {
+		const int kd = t.kind[entry0 + k];
+		any |= kd >= kSteerProbeKind || ( edit && kd != STEER_OFF );
+		edits |= edit && kd != STEER_OFF && kd < kSteerProbeKind;
+	}
 	if ( !any ) return;
 
 	float* x = streams + static_cast<size_t>( r ) * hc * t.hidden;
@@ -97,6 +126,11 @@ void steer_apply_streams_kernel( SteerTables t, float* __restrict__ streams, int
 		if ( kind == STEER_OFF ) continue;
 		const float* v = t.vec + ( entry0 + k ) * t.hidden;
 		const float par = t.par[entry0 + k];
+		if ( kind >= kSteerProbeKind ) {
+			probe_score( t, slot, kind, rows->pos[r], srow, v, par );
+			continue;
+		}
+		if ( !edit ) continue;
 		if ( kind == STEER_ADD ) {
 			for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) srow[i] += par * v[i];
 		}
@@ -128,6 +162,7 @@ void steer_apply_streams_kernel( SteerTables t, float* __restrict__ streams, int
 		}
 		__syncthreads();
 	}
+	if ( !edits ) return;
 	for ( int i = threadIdx.x; i < t.hidden; i += blockDim.x ) {
 		const float d = srow[i] - orig[i];
 		for ( int s = 0; s < hc; ++s ) x[static_cast<size_t>( s ) * t.hidden + i] += d;

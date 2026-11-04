@@ -7,6 +7,9 @@
 //                (pos minus neg), the reference level the neg prompts' mean projection plus K standard deviations of it (default 2); --orthogonal-to first removes the
 //                directions of another file's entries (same layers) from it, so the axis keeps only what the other one does not cover
 //   steer_build ... --answers   lines are `question ||| answer` (the model's own answers); the state is the mean over the answer's first 48 tokens, fed one at a time
+//   steer_build ... --probe   a probe file instead: per layer the unit mean difference and the neg prompts' mean projection, both divided by the gap between the
+//                sets' mean projections and by the layer count, so the probe score (the sum over its layers of x . v - par) is 0 at the neg mean and 1 at the pos mean;
+//                prints the separation of the two sets
 //   steer_build --batch dir [...]     every NAME.pos.txt with a NAME.neg.txt in dir gives dir/NAME.steer (one model load for all)
 // Needs the steer option (set here) and a checkpoint of a model with the steering hooks (qwen3_5, qwen4_exp, glm5_next, deepseek_v41; read from its config.json).
 #include "engine/runtime/cluster.h"
@@ -39,14 +42,15 @@ static std::vector<std::string> read_lines( const std::string& path ) {
 
 int main( int argc, char** argv ) {
 	float file_scale = 1.0f;   // the recommended steer_scale stored in the file
-	bool answers = false, clamp = false;
+	bool answers = false, clamp = false, probe = false;
 	float clamp_k = 2.0f;
 	std::string ortho_path;
 	std::string pos_path, neg_path, out_path, batch, layers = "", model = test::model_path( "ENGINE_TEST_QWEN_DIR" ), scope = "all";
-	for ( int i = 1; i < argc; i += ( std::string( argv[i] ) == "--answers" || std::string( argv[i] ) == "--clamp" ? 1 : 2 ) ) {
+	for ( int i = 1; i < argc; i += ( std::string( argv[i] ) == "--answers" || std::string( argv[i] ) == "--clamp" || std::string( argv[i] ) == "--probe" ? 1 : 2 ) ) {
 		const std::string a = argv[i];
 		if ( a == "--answers" ) { answers = true; continue; }
 		if ( a == "--clamp" ) { clamp = true; continue; }
+		if ( a == "--probe" ) { probe = true; continue; }
 		if ( i + 1 >= argc ) { std::fprintf( stderr, "missing value for %s\n", a.c_str() ); return 2; }
 		if ( a == "--pos" ) pos_path = argv[i + 1];
 		else if ( a == "--neg" ) neg_path = argv[i + 1];
@@ -204,8 +208,40 @@ int main( int argc, char** argv ) {
 				if ( !ortho_path.empty() ) std::printf( "%s layer %2d: cos with the other axis %.2f, kept %.2f of the contrast\n", job.out.c_str(), first + li, cos_other, n / ( n_full + 1e-12 ) );
 			}
 			else e.par = static_cast<float>( n_full / count );
+			if ( probe ) {
+				// both sets' mean projections on the unit direction; the score of this layer is ( x . v - pa ) / ( pb - pa ) / count
+				auto mean_proj = [&]( const std::vector<std::vector<double>>& all ) {
+					double m = 0.0;
+					for ( const auto& st : all ) for ( int i = 0; i < H; ++i ) m += st[static_cast<size_t>( li ) * H + i] * e.vec[i];
+					return m / all.size();
+				};
+				const double pa = mean_proj( neg_all ), pb = mean_proj( pos_all ), w = 1.0 / ( std::max( pb - pa, 1e-6 ) * count );
+				e.kind = engine::modules::STEER_PROBE;
+				for ( float& x : e.vec ) x = static_cast<float>( x * w );
+				e.par = static_cast<float>( pa * w );
+			}
 			f.entries.push_back( std::move( e ) );
 			std::printf( "%s layer %2d: contrast %.3f\n", job.out.c_str(), first + li, n_full );
+		}
+		if ( probe ) {
+			// separation on the build sets: each prompt's score, and the share of (pos, neg) pairs the score orders correctly
+			auto score = [&]( const std::vector<double>& st ) {
+				double sc = 0.0;
+				for ( const auto& e : f.entries ) {
+					const size_t li = static_cast<size_t>( e.layer - first );
+					for ( int i = 0; i < H; ++i ) sc += st[li * H + i] * e.vec[i];
+					sc -= e.par;
+				}
+				return sc;
+			};
+			std::vector<double> sp, sn;
+			for ( const auto& st : pos_all ) sp.push_back( score( st ) );
+			for ( const auto& st : neg_all ) sn.push_back( score( st ) );
+			double ordered = 0.0, mp_ = 0.0, mn_ = 0.0;
+			for ( double a : sp ) for ( double b : sn ) ordered += a > b ? 1.0 : a == b ? 0.5 : 0.0;
+			for ( double a : sp ) mp_ += a;
+			for ( double b : sn ) mn_ += b;
+			std::printf( "%s: probe score pos mean %.3f, neg mean %.3f, AUC %.3f (build sets)\n", job.out.c_str(), mp_ / sp.size(), mn_ / sn.size(), ordered / ( sp.size() * sn.size() ) );
 		}
 		std::string err;
 		if ( !save_steer_file( job.out, f, &err ) ) { std::fprintf( stderr, "%s\n", err.c_str() ); return 1; }

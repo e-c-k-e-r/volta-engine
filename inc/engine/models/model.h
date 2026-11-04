@@ -209,6 +209,8 @@ public:
 	// Probes: while on, forwards run eagerly and keep the last row's residual after the given layers; steer_read returns them as fp32 [layers.size()][hidden]
 	virtual void steer_capture( const std::vector<int>& layers, bool on ) { (void) layers; (void) on; }
 	virtual bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) { (void) out; (void) stream; return false; }
+	// probe scores of positions [first_pos, first_pos + count) of a slot, out [kProbes][count]
+	virtual bool probe_read( int slot_id, int first_pos, int count, float* out, backend::stream_t stream = nullptr ) { (void) slot_id; (void) first_pos; (void) count; (void) out; (void) stream; return false; }
 	virtual void steer_range( int* first_layer, int* num_layers ) const { *first_layer = 0; *num_layers = 0; }
 	virtual int pool_tokens() const { return 0; }        // 0 = no shared pool
 	virtual int free_pool_tokens() const { return 0; }

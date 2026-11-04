@@ -3,6 +3,8 @@
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/spec/tap_ring.h"
+#include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstring>
 
@@ -25,6 +27,7 @@ void SteerHost::init( pod::MemoryArena& arena, int hidden, int num_layers, int s
 	t_.kind = static_cast<int32_t*>( core::arena_alloc( arena, S * nl * K * sizeof( int32_t ) ) );
 	t_.ctl = static_cast<SteerSlotCtl*>( core::arena_alloc( arena, S * sizeof( SteerSlotCtl ) ) );
 	t_.penalty_ids = static_cast<int32_t*>( core::arena_alloc( arena, S * kSteerPenaltyIds * sizeof( int32_t ) ) );
+	t_.probe = static_cast<float*>( core::arena_alloc( arena, S * kProbes * kProbeRing * sizeof( float ) ) );
 	cap_ = static_cast<backend::half_t*>( core::arena_alloc( arena, static_cast<size_t>( num_layers ) * H * sizeof( backend::half_t ) ) );
 	if ( mean_rows > 0 ) mean_ = static_cast<backend::half_t*>( core::arena_alloc( arena, static_cast<size_t>( mean_rows ) * H * sizeof( backend::half_t ) ) );
 	backend::memset_sync( t_.vec, 0, S * nl * K * H * sizeof( float ) );
@@ -32,6 +35,7 @@ void SteerHost::init( pod::MemoryArena& arena, int hidden, int num_layers, int s
 	backend::memset_sync( t_.kind, 0, S * nl * K * sizeof( int32_t ) );
 	backend::memset_sync( t_.ctl, 0, S * sizeof( SteerSlotCtl ) );
 	backend::memset_sync( t_.penalty_ids, 0, S * kSteerPenaltyIds * sizeof( int32_t ) );
+	backend::memset_sync( t_.probe, 0, S * kProbes * kProbeRing * sizeof( float ) );
 	ctl_host_.assign( S, SteerSlotCtl{} );
 	cap_layer_.assign( num_layers, -1 );
 	if ( rank == 0 ) LOG_INFO( "[steer] layers %d-%d of %d, %zu KiB per slot\n", first, last, num_layers, nl * K * H * sizeof( float ) / 1024 );
@@ -44,18 +48,35 @@ void SteerHost::set( int slot, const std::vector<SteerEntry>& entries, backend::
 	const size_t H = t_.hidden, per_slot = static_cast<size_t>( t_.layers ) * K;
 	std::vector<float> vec( per_slot * H, 0.0f ), par( per_slot, 0.0f );
 	std::vector<int32_t> kind( per_slot, STEER_OFF );
+	// a probe's first layer writes its ring cell, the later ones add to it
+	int probe_first[kProbes];
+	for ( int& f : probe_first ) f = INT32_MAX;
+	int probes = 0;
 	for ( const auto& e : entries ) {
-		const int li = e.layer - first_;
-		ENGINE_ASSERT( li >= 0 && li < t_.layers, "SteerHost::set: entry layer outside the steered range" );
-		ENGINE_ASSERT( e.vec.size() == H && ( e.kind == STEER_ADD || e.kind == STEER_CLAMP || e.kind == STEER_CLAMP_KEEP ), "SteerHost::set: bad entry" );
-		int k = 0;
-		while ( k < K && kind[static_cast<size_t>( li ) * K + k] != STEER_OFF ) ++k;
-		ENGINE_ASSERT( k < K, "SteerHost::set: more than kSteerEntries entries on a layer" );
-		const size_t idx = static_cast<size_t>( li ) * K + k;
-		kind[idx] = e.kind;
-		par[idx] = e.par;
-		std::memcpy( vec.data() + idx * H, e.vec.data(), H * sizeof( float ) );
+		if ( e.kind != STEER_PROBE ) continue;
+		ENGINE_ASSERT( e.probe >= 0 && e.probe < kProbes, "SteerHost::set: probe index out of range" );
+		probe_first[e.probe] = std::min( probe_first[e.probe], e.layer );
+		probes = std::max( probes, e.probe + 1 );
 	}
+	// probe entries first on their layer, so they read the state before the edits
+	for ( int pass = 0; pass < 2; ++pass ) {
+		for ( const auto& e : entries ) {
+			if ( ( e.kind == STEER_PROBE ) != ( pass == 0 ) ) continue;
+			const int li = e.layer - first_;
+			ENGINE_ASSERT( li >= 0 && li < t_.layers, "SteerHost::set: entry layer outside the steered range" );
+			ENGINE_ASSERT( e.vec.size() == H && ( e.kind == STEER_ADD || e.kind == STEER_CLAMP || e.kind == STEER_CLAMP_KEEP || e.kind == STEER_PROBE ), "SteerHost::set: bad entry" );
+			int k = 0;
+			while ( k < K && kind[static_cast<size_t>( li ) * K + k] != STEER_OFF ) ++k;
+			ENGINE_ASSERT( k < K, "SteerHost::set: more than kSteerEntries entries on a layer" );
+			const size_t idx = static_cast<size_t>( li ) * K + k;
+			kind[idx] = e.kind == STEER_PROBE ? kSteerProbeKind + 2 * e.probe + ( e.layer == probe_first[e.probe] ? 1 : 0 ) : e.kind;
+			par[idx] = e.par;
+			std::memcpy( vec.data() + idx * H, e.vec.data(), H * sizeof( float ) );
+		}
+	}
+	SteerSlotCtl& c = ctl_host_[slot];
+	c.probe_n = probes;
+	backend::memcpy_async( t_.ctl + slot, &c, sizeof( c ), backend::Copy::H2D, stream );
 	if ( !entries.empty() ) {   // without entries every kind is off and the vectors are never read
 		backend::memcpy_async( t_.vec + slot * per_slot * H, vec.data(), vec.size() * sizeof( float ), backend::Copy::H2D, stream );
 		backend::memcpy_async( t_.par + slot * per_slot, par.data(), par.size() * sizeof( float ), backend::Copy::H2D, stream );
@@ -108,6 +129,23 @@ float fp16_bits_to_float( uint16_t h ) {
 	return sign ? -v : v;
 }
 }   // namespace
+
+bool SteerHost::read_probes( int slot, int first_pos, int count, float* out, backend::stream_t stream ) {
+	if ( !on() || slot < 0 || slot >= t_.slots || first_pos < 0 || count <= 0 || count > kProbeRing ) return false;
+	backend::set_device( rank_ );
+	for ( int p = 0; p < kProbes; ++p ) {
+		const float* ring = t_.probe + ( static_cast<size_t>( slot ) * kProbes + p ) * kProbeRing;
+		// position q lives in ring cell q % kProbeRing: at most two contiguous runs
+		for ( int done = 0; done < count; ) {
+			const int r = ( first_pos + done ) % kProbeRing;
+			const int n = std::min( count - done, kProbeRing - r );
+			backend::memcpy_async( out + static_cast<size_t>( p ) * count + done, ring + r, static_cast<size_t>( n ) * sizeof( float ), backend::Copy::D2H, stream );
+			done += n;
+		}
+	}
+	backend::stream_sync( stream );
+	return true;
+}
 
 bool SteerHost::read( std::vector<float>& out, backend::stream_t stream ) {
 	if ( !cap_on_ || cap_order_.empty() ) return false;

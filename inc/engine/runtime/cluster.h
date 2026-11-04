@@ -65,6 +65,8 @@ public:
 	int snapshot_align() const { return models_[0]->seq_align(); }
 	size_t snapshot_bytes( int from, int tokens, bool with_taps = false ) const;    // per rank; 0 when the model cannot snapshot
 	bool save_snapshot( int slot, int from, int tokens, SeqSnapshot* snap, bool with_taps = true );
+	// Host buffers of `bytes` per rank for a snapshot that is filled from elsewhere (the prefix cache's disk tier); false when pinning fails
+	bool alloc_snapshot( int from, int tokens, bool with_taps, size_t bytes, SeqSnapshot* snap );
 	// Pins the host buffers of snapshots that a long prompt is about to store (cudaHostAlloc costs ~0.75 s per GiB, which would stall every
 	// decoding slot when done inside a checkpoint) on a helper thread, so the store finds them in the free list.
 	struct SnapshotPlan { int from, tokens; bool with_taps; };
@@ -108,6 +110,7 @@ public:
 	void steer_range( int* first_layer, int* num_layers ) const { models_[0]->steer_range( first_layer, num_layers ); }
 	void steer_capture( const std::vector<int>& layers, bool on );
 	bool steer_read( std::vector<float>& out );   // rank 0's capture (the residual is replicated)
+	bool probe_read( int slot, int first_pos, int count, float* out );   // rank 0's probe scores, out [kProbes][count]
 	// Shared token pool (model option kv_pool; always roomy without it): reserve room for positions [0, tokens) of a slot on every rank, or
 	// take nothing and return false; release_tokens hands the slot's pages back. Host bookkeeping only.
 	bool reserve_tokens( int slot, int tokens );

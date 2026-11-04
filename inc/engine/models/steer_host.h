@@ -30,6 +30,8 @@ public:
 	bool capturing() const { return cap_on_; }
 	backend::half_t* capture_dst( int layer ) const { return cap_on_ && cap_layer_[layer] >= 0 ? cap_ + static_cast<size_t>( cap_layer_[layer] ) * t_.hidden : nullptr; }
 	bool read( std::vector<float>& out, backend::stream_t stream );
+	// probe scores of positions [first_pos, first_pos + count) of a slot, out [kProbes][count] (count <= kProbeRing)
+	bool read_probes( int slot, int first_pos, int count, float* out, backend::stream_t stream );
 
 	// After model layer `layer`: its edits on the rows' fp16 residual [m, hidden], and the probe's capture of the last row
 	void layer_rows( backend::half_t* hidden, const pod::BatchRows* d_rows, int m, int layer, backend::stream_t stream ) const;
@@ -59,6 +61,7 @@ private:
 	void steer_penalty( int slot_id, const std::vector<int>& ids, float penalty, backend::stream_t stream = nullptr ) override { host.penalty( slot_id, ids, penalty, stream ); } \
 	void steer_capture( const std::vector<int>& layers, bool on ) override { host.capture( layers, on ); } \
 	bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) override { return host.read( out, stream ); } \
+	bool probe_read( int slot_id, int first_pos, int count, float* out, backend::stream_t stream = nullptr ) override { return host.read_probes( slot_id, first_pos, count, out, stream ); } \
 	void steer_range( int* first_layer, int* num_layers ) const override { *first_layer = host.first(); *num_layers = host.layers(); }
 
 } // namespace engine::models

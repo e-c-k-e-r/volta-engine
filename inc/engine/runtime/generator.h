@@ -34,6 +34,15 @@
 
 namespace engine::runtime {
 
+// A probe's scores over a request: at the last prompt token (before any output), and over the generated tokens
+struct ProbeSummary {
+	std::string name;
+	float prompt = NAN;
+	float max = NAN, mean = NAN, last = NAN;
+	float above = 0.0f;   // share of generated tokens scoring above 0.5
+	int n = 0;
+};
+
 struct SlotMetrics {
 	std::chrono::steady_clock::time_point start_time;
 	std::chrono::steady_clock::time_point first_token_time;
@@ -47,6 +56,7 @@ struct SlotMetrics {
 	double queue_ms = 0.0, restore_ms = 0.0, prefill_ms = 0.0, store_ms = 0.0;
 	float gate_score = -1.0f;   // steering probe: the look-ahead score (-1 = no probe ran)
 	bool gate_fired = false;
+	std::vector<ProbeSummary> probes;
 };
 
 enum class FinishReason { Stop, Length, StopString, Cancelled, Loop };
@@ -95,6 +105,8 @@ struct GenerationRequest {
 	std::string steer_vector;
 	float steer_scale = -1.0f;
 	std::string steer_scope;
+	// Probes (needs the steer option): names in steer_dir (.steer files of probe entries, steer_build --probe), at most 4; empty = the probe option
+	std::vector<std::string> probes;
 	// Overrides of the steer_gate_threshold / steer_edit_strength / steer_hedge_strength options for research (NaN = the option)
 	float probe_threshold = NAN, probe_edit_strength = NAN, probe_hedge_strength = NAN, probe_push = NAN, probe_directions = NAN, probe_keep_norm = NAN;
 	std::string probe_edit_layers;   // per-request steer_edit_layers (empty = the option)
@@ -218,6 +230,7 @@ public:
 	bool steer_enabled() const { return cluster_.steer_enabled(); }
 	// Steering request fields: false with the reason when the named control-vector file cannot be used (server: 400)
 	bool check_steer( const std::string& vector, const std::string& scope, std::string* err );
+	bool check_probes( const std::vector<std::string>& names, std::string* err );   // the request's probes (or the probe option's) exist and are probe files
 
 private:
 	struct Slot {
@@ -230,6 +243,9 @@ private:
 		Rng rng;
 		TokenHistory history;   // only filled when the request sets a penalty
 		std::vector<TokenLogprob> pending_logprobs;   // emitted since the last text delta
+		int probe_read = -1;                          // next position whose probe scores are folded into metrics.probes (-1: none yet)
+		double probe_sum[engine::modules::kProbes] = {};
+		int probe_above[engine::modules::kProbes] = {};
 		bool prefill_done = false;
 		// A prompt fed in pieces between decode steps of the other slots
 		bool pf_started = false;
@@ -275,6 +291,8 @@ private:
 	// Commits `tok` to slot s's output; returns true when the request finished.
 	static int loop_detect_mode();
 	bool emit_token( int s, int tok, const Candidates* row = nullptr );   // row: the token's unpenalized candidates, for log-probabilities
+	void probe_collect( int s, bool final );   // fold the probe scores of the positions forwarded since the last call into the slot's metrics
+	std::vector<std::string> probe_names( const std::vector<std::string>& requested ) const;   // the request's probes, else the probe option's
 	void finish_slot( int s, FinishReason reason );
 	void apply_forced_close( int s );
 	// Steering (option steer): the slot's edits, scope, prompt length and reflection-marker penalty on every rank, set when the request is admitted

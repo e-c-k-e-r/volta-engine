@@ -26,6 +26,7 @@ On `/v1/chat/completions` and `/v1/messages`, as top-level keys of the body:
 | `steer_scope` | comma list of `prompt`, `think`, `answer`, `generated`, `all` (default: the file's own) |
 | `think_penalty` | logit taken off the reflection markers inside the reasoning block (default `think_penalty` option, 0 = off) |
 | `steer_probe` | run the probe below before the real prefill |
+| `probes` | probe files to score (list or comma string of names in `steer_dir`; default the `probe` option), reported in the usage; see "Probes" |
 | `steer_gate_threshold`, `steer_edit_strength`, `steer_hedge_strength`, `steer_push`, `steer_directions`, `steer_keep_norm` | per-request values of the probe options |
 
 A bad name, an unreadable or mismatching file, or `steer_probe` without `steer` answers 400.
@@ -63,9 +64,27 @@ Evaluation on Qwen3.8-27B EXL3 4.0 bpw (`tests/tools/steer_eval_sets.py` writes 
 
 The score is logged (`[steer] req N gate fired|clean score=... (threshold ..., ms)`) and kept in the request's metrics. A request's `steer_vector` stays when the probe fires; the probe's clamps are added after it (see "Clamp files").
 
+## Probes
+
+A probe scores a direction in the residual stream without editing it: per row, the sum over its layers of `x . v - par`, written into a per-slot ring of 4096 positions (`probe` entries in `inc/engine/modules/steer.h`). The scores of verify rows that speculation rejects are overwritten when their positions are computed again, so only the emitted text is scored. A slot holds up to four probes, and a probe's layers count against the four entries per layer.
+
+`steer_build --probe --pos pos.txt --neg neg.txt --out NAME.steer` builds one: per layer the unit mean difference of the two sets and the neg set's mean projection, both divided by the gap between the sets' mean projections and by the layer count, so a state like the neg set's mean scores 0 and one like the pos set's mean scores 1. It prints the separation of the build sets.
+
+A request names its probes with `probes` (a list or a comma string of names in `steer_dir`); without it the `probe` option's list applies to every request, which is how a client that sends no extra fields (Claude Code) gets scored. The response's usage carries per probe `prompt` (the score at the last prompt token, before any output), `max`, `mean` and `last` over the generated tokens, `above` (the share of generated tokens scoring above 0.5) and `tokens`. Probes need `steer=on`; they do not change the output and do not keep a request out of the prefix cache.
+
+Measured on Qwen3.8-27B EXL3 4.0 bpw with a probe built from half of the plain target and control prompts of `steer_eval_sets.py` (23 each) and scored through the server on the other 33 of each (plain, conversations, long passages), greedy, 120 tokens:
+
+| Score | Targets | Controls | AUC |
+|---|---|---|---|
+| last prompt token | 0.844 | 0.122 | 0.927 |
+| max over the output | 1.036 | 0.465 | 0.967 |
+| mean over the output | 0.557 | 0.312 | 0.965 |
+
+At 0.5 on the prompt score, 26 of 33 targets and 1 of 33 controls are flagged. The answers are the same with and without the probe.
+
 ## Options
 
-`steer`, `steer_layers`, `steer_file`, `steer_dir`, `steer_scale`, `steer_scope`, `think_penalty`, `think_penalty_words`, `steer_gate_threshold`, `steer_edit_strength`, `steer_hedge_strength`, `steer_push`, `steer_directions`, `steer_keep_norm`, `steer_openings`, `steer_band`, `steer_edit_layers`; see [CONFIG.md](CONFIG.md). `think_penalty_words` is a comma list or a file with one word per line (default `Wait, Hmm, Alternatively, But`); each word's first token in the spellings as is, lower case, capitalised, each plain, after a space and after a newline goes on the list, which the server logs at start.
+`steer`, `steer_layers`, `steer_file`, `steer_dir`, `probe`, `steer_scale`, `steer_scope`, `think_penalty`, `think_penalty_words`, `steer_gate_threshold`, `steer_edit_strength`, `steer_hedge_strength`, `steer_push`, `steer_directions`, `steer_keep_norm`, `steer_openings`, `steer_band`, `steer_edit_layers`; see [CONFIG.md](CONFIG.md). `think_penalty_words` is a comma list or a file with one word per line (default `Wait, Hmm, Alternatively, But`); each word's first token in the spellings as is, lower case, capitalised, each plain, after a space and after a newline goes on the list, which the server logs at start.
 
 `steer_gate_threshold`, `steer_edit_strength` and `steer_edit_layers` say "auto" (or are empty) until set, and then take the model's value from `inc/engine/models/steer_defaults.h`; a request's own fields override both. The table, with the checkpoint each row was tuned on:
 
