@@ -3,7 +3,9 @@
 
   gen_tasks.py --out DIR [--per-family N] [--seed S] [--families a,b] [--tier quick|standard|hard]
 
-Families: py-bugfix, py-feature, c-fix, js-fix, sql-query, git-conflict, log-analysis, sh-text, prose (writing tasks over a local document; loose verifiers). Expected values in tests and verifiers are
+Families: py-bugfix, py-feature, c-fix, js-fix, sql-query, git-conflict, log-analysis, sh-text, prose (writing tasks over a local document; loose verifiers), and harder ones:
+py-multibug (two bugs in different modules of a small package, each exposed by the tests on its own), py-algo (a function with edge cases in its spec, hidden tests including
+the errors it must raise), data-reconcile (matching two CSV files by stated rules), log-multi (joining two logs with retried requests). Expected values in tests and verifiers are
 computed from a reference implementation at generation time, so an instance is a pure function of (family, index, seed).
 """
 import argparse, json, os, random, shutil, sqlite3, stat, subprocess, textwrap
@@ -370,8 +372,369 @@ def prose(out, i, rng, tier):
          tags=("prose", kind, label))
 
 
+# ---------------------------------------------------------------- hard families: several files, a spec with edge cases, a join of two sources
+INV_GOOD = {
+    "inventory/__init__.py": "",
+    "inventory/parse.py": '''
+def parse_line(line):
+    """'sku,qty,price' -> (SKU upper-cased, int qty, float price); blank lines and lines starting with # give None"""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    sku, qty, price = [p.strip() for p in line.split(",")]
+    return sku.upper(), int(qty), float(price)
+
+
+def parse(text):
+    return [r for r in (parse_line(l) for l in text.splitlines()) if r is not None]
+''',
+    "inventory/stock.py": '''
+class Stock:
+    """Lots per SKU, oldest first; shipping takes from the oldest lots (FIFO)."""
+
+    def __init__(self):
+        self.lots = {}
+
+    def receive(self, sku, qty, price):
+        self.lots.setdefault(sku, []).append([qty, price])
+
+    def ship(self, sku, qty):
+        """Returns the cost of the shipped units; raises ValueError (and ships nothing) when fewer than qty are on hand"""
+        lots = self.lots.get(sku, [])
+        if sum(q for q, _ in lots) < qty:
+            raise ValueError(sku)
+        cost = 0.0
+        while qty > 0:
+            take = min(qty, lots[0][0])
+            cost += take * lots[0][1]
+            lots[0][0] -= take
+            qty -= take
+            if lots[0][0] == 0:
+                lots.pop(0)
+        return cost
+
+    def on_hand(self, sku):
+        return sum(q for q, _ in self.lots.get(sku, []))
+
+    def value(self):
+        return sum(q * p for lots in self.lots.values() for q, p in lots)
+''',
+    "inventory/report.py": '''
+from inventory.parse import parse
+from inventory.stock import Stock
+
+
+def run(receipts_text, orders):
+    """receipts_text: 'sku,qty,price' lines; orders: (sku, qty) pairs, filled in order (SKUs case-insensitive).
+    Returns cogs and value rounded to cents, the SKUs of the orders that could not be filled (in order) and the units on hand per SKU (sorted)."""
+    s = Stock()
+    for sku, qty, price in parse(receipts_text):
+        s.receive(sku, qty, price)
+    cogs, short = 0.0, []
+    for sku, qty in orders:
+        try:
+            cogs += s.ship(sku.upper(), qty)
+        except ValueError:
+            short.append(sku.upper())
+    return {"cogs": round(cogs, 2), "value": round(s.value(), 2), "short": short, "on_hand": {k: s.on_hand(k) for k in sorted(s.lots)}}
+''',
+}
+INV_BUGS = [   # (file, good fragment, bad fragment)
+    ("inventory/parse.py", "return sku.upper(), int(qty), float(price)", "return sku, int(qty), float(price)"),
+    ("inventory/parse.py", 'if not line or line.startswith("#"):', "if not line:"),
+    ("inventory/stock.py", "cost += take * lots[0][1]", "cost += qty * lots[0][1]"),
+    ("inventory/stock.py", "if sum(q for q, _ in lots) < qty:", "if sum(q for q, _ in lots) <= qty:"),
+    ("inventory/report.py", "cogs += s.ship(sku.upper(), qty)", "cogs += s.ship(sku, qty)"),
+    ("inventory/report.py", "short.append(sku.upper())", "short.append(sku)"),
+]
+
+
+def inv_load(files):
+    import sys, types
+    mods = {}
+    pkg = types.ModuleType("inventory"); pkg.__path__ = []
+    saved = {k: sys.modules.get(k) for k in ("inventory", "inventory.parse", "inventory.stock", "inventory.report")}
+    sys.modules["inventory"] = pkg
+    try:
+        for name in ("parse", "stock", "report"):
+            m = types.ModuleType("inventory." + name)
+            sys.modules["inventory." + name] = m
+            setattr(pkg, name, m)
+            exec(textwrap.dedent(files[f"inventory/{name}.py"]), m.__dict__)
+            mods[name] = m
+    finally:
+        for k, v in saved.items():
+            if v is None: sys.modules.pop(k, None)
+            else: sys.modules[k] = v
+    return mods["report"].run
+
+
+def inv_case(rng):
+    skus = rng.sample(["ab12", "cx9", "dd4", "ef70", "gh3"], 3)
+    lines = ["# receipts"]
+    for _ in range(rng.randint(5, 8)):
+        sku = rng.choice(skus)
+        lines.append(f"{rng.choice([sku, sku.upper()])}, {rng.randint(1, 9)}, {rng.choice([1.25, 2.5, 3.1, 4.75, 7.2])}")
+        if rng.random() < 0.3: lines.append("")
+    lines.insert(rng.randint(1, len(lines)), "# late delivery, re-counted")
+    orders = [(rng.choice([s, s.upper()]), rng.randint(1, 12)) for s in (rng.choice(skus) for _ in range(rng.randint(3, 6)))]
+    return "\n".join(lines) + "\n", orders
+
+
+def py_multibug(out, i, rng, tier):
+    files = {k: textwrap.dedent(v).lstrip("\n") for k, v in INV_GOOD.items()}
+    while True:
+        b1, b2 = rng.sample(range(len(INV_BUGS)), 2)
+        if INV_BUGS[b1][0] != INV_BUGS[b2][0]: break
+    def with_bugs(ids):
+        f = dict(files)
+        for b in ids:
+            path, good, bad = INV_BUGS[b]
+            assert good in f[path]
+            f[path] = f[path].replace(good, bad)
+        return f
+    good_run, only1, only2 = inv_load(files), inv_load(with_bugs([b1])), inv_load(with_bugs([b2]))
+    def differs(f, c, e):
+        try:
+            return f(*c) != e
+        except Exception:
+            return True
+    for _ in range(500):   # cases where each bug on its own changes a result, so both have to be found
+        cases = [inv_case(rng) for _ in range(6)]
+        exp = [good_run(*c) for c in cases]
+        if any(differs(only1, c, e) for c, e in zip(cases, exp)) and any(differs(only2, c, e) for c, e in zip(cases, exp)): break
+    else:
+        raise SystemExit("py-multibug: no exposing cases")
+    body = "\n".join(f"    def test_run_{k}(self):\n        self.assertEqual(run({c[0]!r}, {c[1]!r}), {e!r})\n" for k, (c, e) in enumerate(zip(cases, exp)))
+    test = f"import unittest\nfrom inventory.report import run\n\n\nclass T(unittest.TestCase):\n{body}\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+    repo = with_bugs([b1, b2])
+    repo["test_inventory.py"] = test
+    repo["README.md"] = "Inventory costing: receipts are parsed (inventory/parse.py), lots are kept per SKU and shipped FIFO (inventory/stock.py), and report.run ties them together.\n"
+    sol = "".join(f"cat > {p} <<'EOF'\n{files[p]}EOF\n" for p in ("inventory/parse.py", "inventory/stock.py", "inventory/report.py"))
+    emit(out, f"py-multibug-{i:03d}", tier, "The tests in test_inventory.py fail. Find and fix the bugs in the inventory package (there may be more than one). Do not change the tests.",
+         repo, "python3 -m unittest -q test_inventory >/dev/null 2>&1 || exit 1\n", sol, tags=("bugfix", "python", "multi-file"))
+
+
+def topo_case(r, cycle):
+    """A dependency map over a few names; with cycle, one edge back from an early task to a later one closes a loop"""
+    names = r.sample(list("abcdefghij"), r.randint(3, 9))
+    deps = {}
+    for n in r.sample(names, len(names) - r.randint(0, 2)):
+        earlier = [m for m in names if m < n]
+        deps[n] = sorted(r.sample(earlier, r.randint(0, min(3, len(earlier)))))
+    if cycle:
+        a, b = sorted(r.sample(names, 2))
+        deps.setdefault(b, []); deps[b] = sorted(set(deps[b]) | {a})
+        deps.setdefault(a, []); deps[a] = sorted(set(deps[a]) | {b})
+    return (deps,)
+
+
+ALGOS = {
+    "merge_intervals": ("merge_intervals(intervals) -> list: intervals are half-open [start, end) pairs of ints; drop empty ones (start >= end), merge the ones that overlap or touch "
+                        "([1, 3) and [3, 5) become [1, 5)), and return the result as a list of [start, end] lists sorted by start",
+                        '''
+def merge_intervals(intervals):
+    out = []
+    for a, b in sorted((a, b) for a, b in intervals if a < b):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+''', lambda r: [[(lambda a: [a, a + r.randint(-2, 6)])(r.randint(0, 30)) for _ in range(r.randint(0, 9))] for _ in range(14)]),
+    "topo_order": ("topo_order(deps) -> list: deps maps a task name to the list of names it depends on (a name that only appears as a dependency is a task too); return every task once, "
+                   "each after all of its dependencies, choosing the alphabetically smallest ready task at every step; raise ValueError when the dependencies contain a cycle",
+                   '''
+import heapq
+def topo_order(deps):
+    nodes = set(deps) | {d for ds in deps.values() for d in ds}
+    need = {n: set(deps.get(n, [])) for n in nodes}
+    users = {n: [] for n in nodes}
+    for n, ds in need.items():
+        for d in ds: users[d].append(n)
+    ready = [n for n in nodes if not need[n]]
+    heapq.heapify(ready)
+    out = []
+    while ready:
+        n = heapq.heappop(ready)
+        out.append(n)
+        for u in users[n]:
+            need[u].discard(n)
+            if not need[u]: heapq.heappush(ready, u)
+    if len(out) != len(nodes): raise ValueError("cycle")
+    return out
+''', lambda r: [topo_case(r, k % 4 == 3) for k in range(12)]),
+    "eval_expr": ("eval_expr(text) -> int: evaluate an integer expression with +, -, *, / (division truncates toward zero, as in C), parentheses, unary minus and spaces, with the usual "
+                  "precedence (* and / before + and -, left to right); raise ValueError for a malformed expression and ZeroDivisionError for a division by zero",
+                  '''
+def eval_expr(text):
+    toks, i = [], 0
+    while i < len(text):
+        c = text[i]
+        if c.isspace(): i += 1; continue
+        if c.isdigit():
+            j = i
+            while j < len(text) and text[j].isdigit(): j += 1
+            toks.append(int(text[i:j])); i = j; continue
+        if c in "+-*/()": toks.append(c); i += 1; continue
+        raise ValueError(c)
+    pos = 0
+    def peek(): return toks[pos] if pos < len(toks) else None
+    def take():
+        nonlocal pos
+        if pos >= len(toks): raise ValueError("end")
+        pos += 1
+        return toks[pos - 1]
+    def atom():
+        t = take()
+        if t == "-": return -atom()
+        if t == "(":
+            v = expr()
+            if take() != ")": raise ValueError(")")
+            return v
+        if isinstance(t, int): return t
+        raise ValueError(t)
+    def term():
+        v = atom()
+        while peek() in ("*", "/"):
+            op = take(); w = atom()
+            if op == "*": v *= w
+            else:
+                if w == 0: raise ZeroDivisionError()
+                q = abs(v) // abs(w)
+                v = q if (v >= 0) == (w >= 0) else -q
+        return v
+    def expr():
+        v = term()
+        while peek() in ("+", "-"):
+            op = take(); w = term()
+            v = v + w if op == "+" else v - w
+        return v
+    v = expr()
+    if pos != len(toks): raise ValueError("trailing")
+    return v
+''', lambda r: [r.choice(["7 - 10 / 3", "-7 / 2", "2 * (3 + 4) - -5", "((1+2)*(3-8))/4", "10 - 2 - 3", "-(4 - 9) * 2", "1 + 2 * 3 - 4 / 2",
+                           "8 / -3", "(2+3", "4 / (2 - 2)", "3 + * 4", " 12 ", "-(-(-3))", "6 / 4 * 4", "100 / 7 / 2", "2 3"]) for _ in range(12)]),
+    "justify": ("justify(text, width) -> list: full justification. Split text on whitespace into words and fill lines greedily (as many words as fit with single spaces); in every line "
+                "but the last, widen the gaps so the line is exactly width long, giving the leftmost gaps the extra spaces; a line with a single word, and the last line, are left-aligned "
+                "with single spaces and padded with spaces to width; a word longer than width gets a line of its own, unpadded; empty text gives []",
+                '''
+def justify(text, width):
+    words, lines, cur = text.split(), [], []
+    for w in words:
+        if cur and len(" ".join(cur + [w])) > width:
+            lines.append(cur); cur = []
+        cur.append(w)
+    if cur: lines.append(cur)
+    out = []
+    for k, ws in enumerate(lines):
+        if len(ws) == 1 or k == len(lines) - 1:
+            s = " ".join(ws)
+            out.append(s + " " * max(0, width - len(s)))
+            continue
+        gaps, spaces = len(ws) - 1, width - sum(len(w) for w in ws)
+        s = ""
+        for g, w in enumerate(ws[:-1]):
+            s += w + " " * (spaces // gaps + (1 if g < spaces % gaps else 0))
+        out.append(s + ws[-1])
+    return out
+''', lambda r: [(" ".join(r.choice(["a", "to", "the", "quick", "extraordinary", "fox", "jumps", "over", "lazy", "dog", "x"]) for _ in range(r.randint(0, 14))), r.randint(6, 16)) for _ in range(12)]),
+}
+
+
+def py_algo(out, i, rng, tier):
+    key = sorted(ALGOS)[i % len(ALGOS)]
+    spec, ref, gen = ALGOS[key]
+    ns = {}
+    exec(textwrap.dedent(ref), ns)
+    fn = ns[key]
+    lines = []
+    for c in gen(rng):
+        args = c if isinstance(c, tuple) else (c,)
+        try:
+            want = ("ok", fn(*args))
+        except (ValueError, ZeroDivisionError) as e:
+            want = ("raise", type(e).__name__)
+        lines.append(f"check({args!r}, {want!r})")
+    hidden = (f"from impl import {key}\n"
+              "def check(args, want):\n"
+              "    try:\n"
+              f"        got = ('ok', {key}(*args))\n"
+              "    except (ValueError, ZeroDivisionError) as e:\n"
+              "        got = ('raise', type(e).__name__)\n"
+              "    assert got == want, (args, got, want)\n" + "\n".join(lines) + "\n")
+    emit(out, f"py-algo-{i:03d}", tier, f"Implement {spec}. Put it in impl.py and add unit tests for it in test_impl.py (unittest), covering the edge cases. Run the tests.",
+         {"impl.py": "# implement the function described in the task here\n", "README.md": "Small utility module.\n"},
+         "python3 hidden_check.py || exit 1\ngrep -q \"unittest\" test_impl.py || exit 1\npython3 -m unittest -q test_impl >/dev/null 2>&1 || exit 1\n",
+         f"cat > impl.py <<'EOF'\n{textwrap.dedent(ref).lstrip()}EOF\ncat > test_impl.py <<'EOF'\nimport unittest\nimport impl\nclass T(unittest.TestCase):\n    def test_exists(self):\n        self.assertTrue(callable(impl.{key}))\nEOF\n",
+         hidden={"hidden_check.py": hidden}, tags=("feature", "python", "spec"))
+
+
+def data_reconcile(out, i, rng, tier):
+    import datetime
+    base = datetime.date(2024, 5, 1)
+    ledger, bank = [], []
+    for k in range(rng.randint(14, 22)):
+        amt = rng.choice([1250, 4000, 999, 15075, 2300, 4000, 999, 7710])
+        d = base + datetime.timedelta(days=rng.randint(0, 25))
+        ledger.append((f"L{k + 1}", d, amt))
+        r = rng.random()
+        if r < 0.75:
+            bank.append((d + datetime.timedelta(days=rng.choice([0, 0, 1, 2, -1, 3])), amt if rng.random() < 0.9 else amt + rng.choice([1, -100])))
+    for _ in range(rng.randint(1, 3)):
+        bank.append((base + datetime.timedelta(days=rng.randint(0, 27)), rng.choice([999, 4000, 5555])))
+    rng.shuffle(bank)
+    bank = [(f"B{k + 1}", d, a) for k, (d, a) in enumerate(bank)]
+    # reference: ledger rows in date order (then id number); each takes the unmatched bank row with the same amount and the smallest date distance (at most 2 days), ties to the earlier bank date, then the lower id
+    used, unmatched_l = set(), []
+    num = lambda s: int(s[1:])
+    for lid, ld, la in sorted(ledger, key=lambda x: (x[1], num(x[0]))):
+        cands = [(abs((bd - ld).days), bd, num(bid), bid) for bid, bd, ba in bank if bid not in used and ba == la and abs((bd - ld).days) <= 2]
+        if cands: used.add(min(cands)[3])
+        else: unmatched_l.append(lid)
+    unmatched_b = [bid for bid, _, _ in bank if bid not in used]
+    want = "ledger: " + " ".join(sorted(unmatched_l, key=num)) + "\nbank: " + " ".join(sorted(unmatched_b, key=num))
+    fmt = lambda c: f"{c // 100}.{c % 100:02d}"
+    lcsv = "id,date,amount\n" + "".join(f"{a},{d.isoformat()},{fmt(c)}\n" for a, d, c in ledger)
+    bcsv = "id,booked,amount,memo\n" + "".join(f"{a},{d.strftime('%d/%m/%Y')},{fmt(c)},{rng.choice(['card', 'transfer', 'ref ' + str(rng.randint(100, 999))])}\n" for a, d, c in bank)
+    prompt = ("ledger.csv and bank.csv list the same payments from two sides. Match them: take the ledger rows in date order (ties by id number); each matches the not yet matched bank row with "
+              "exactly the same amount whose booking date is closest to the ledger date, at most 2 days apart (ties: the earlier booking date, then the lower id number). Note the bank dates are "
+              "day/month/year. Write the ids that stay unmatched to answer.txt as two lines, 'ledger: <ids>' and 'bank: <ids>', ids in ascending id number, separated by single spaces.")
+    emit(out, f"data-reconcile-{i:03d}", tier, prompt, {"ledger.csv": lcsv, "bank.csv": bcsv},
+         f"python3 - <<'EOF' || exit 1\nimport sys\ngot = [' '.join(l.split()) for l in open('answer.txt').read().strip().splitlines() if l.strip()]\nwant = {want.splitlines()!r}\nsys.exit(0 if got == [' '.join(w.split()) for w in want] else 1)\nEOF\n",
+         f"cat > answer.txt <<'EOF'\n{want}\nEOF\n", tags=("analysis", "data", "spec"))
+
+
+def log_multi(out, i, rng, tier):
+    ids = [f"req-{rng.randrange(16 ** 5):05x}" for _ in range(rng.randint(60, 110))]
+    api, db, final = [], [], {}
+    t = 0
+    for rid in ids:
+        for attempt in range(rng.choice([1, 1, 1, 2, 3])):
+            t += rng.randint(1, 40)
+            status = rng.choices([200, 500, 502, 404], [6, 2, 1, 1])[0]
+            api.append((t, f"{t // 3600:02d}:{t // 60 % 60:02d}:{t % 60:02d} api {rid} status={status} route={rng.choice(['/pay', '/cart', '/user'])}"))
+            final[rid] = status
+            for _ in range(rng.randint(0, 4)):
+                db.append((t + rng.randint(0, 3), f"db query id={rid} ms={rng.randint(2, 400)} table={rng.choice(['orders', 'users', 'items'])}"))
+    db.sort(key=lambda x: x[0])
+    total = {}
+    for _, l in db:
+        rid = l.split("id=")[1].split()[0]
+        total[rid] = total.get(rid, 0) + int(l.split("ms=")[1].split()[0])
+    failed = [r for r in final if final[r] >= 500]
+    best = max(failed, key=lambda r: (total.get(r, 0), r))
+    want = f"{best} {total.get(best, 0)}"
+    prompt = ("api.log has one line per attempt of a request (a client retries a request under the same id, so an id can appear several times; the status of its last line is its final "
+              "status). db.log has the database queries of every attempt, with the request id and the time each took. Among the requests whose final status is 500 or above, which one spent "
+              "the most database time in total, over all of its attempts? Write '<id> <total ms>' to answer.txt.")
+    emit(out, f"log-multi-{i:03d}", tier, prompt, {"api.log": "\n".join(l for _, l in api) + "\n", "db.log": "\n".join(l for _, l in db) + "\n"},
+         f"[ \"$(tr -s ' \\n' ' ' < answer.txt | sed 's/ *$//')\" = {json.dumps(want)} ] || exit 1\n", f"echo {json.dumps(want)} > answer.txt\n", tags=("analysis", "join"))
+
+
 FAMILIES = {"py-bugfix": py_bugfix, "py-feature": py_feature, "c-fix": c_fix, "js-fix": js_fix, "sql-query": sql_query, "git-conflict": git_conflict,
-            "log-analysis": log_analysis, "sh-text": sh_text, "prose": prose}
+            "log-analysis": log_analysis, "sh-text": sh_text, "prose": prose,
+            "py-multibug": py_multibug, "py-algo": py_algo, "data-reconcile": data_reconcile, "log-multi": log_multi}
 
 
 def main():
