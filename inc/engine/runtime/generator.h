@@ -72,6 +72,7 @@ struct GenerationRequest {
 	float top_p = 1.0f;
 	int top_k = 16;          // capped at 16 (kSampleTopK)
 	uint64_t seed = 0;       // 0 = derive from req_id
+	int priority = 0;        // queue order: lower values take a free slot first (equal ones in arrival order); a running request is never preempted
 	float presence_penalty = 0.0f;    // OpenAI semantics, over the generated tokens
 	float frequency_penalty = 0.0f;
 	float repetition_penalty = 1.0f;  // multiplicative, over prompt and output (1 = off)

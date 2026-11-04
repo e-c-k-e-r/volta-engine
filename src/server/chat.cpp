@@ -2,6 +2,7 @@
 #include "engine/runtime/options.h"
 
 #include <algorithm>
+#include <cctype>
 
 #include <cstdio>
 
@@ -354,6 +355,19 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	g.repetition_penalty = req.repetition_penalty > 0.0f ? req.repetition_penalty : cfg.default_repetition_penalty;
 	g.logprobs = req.logprobs;
 	g.probes = req.probes;
+	g.priority = req.priority;
+	if ( g.priority == INT_MIN ) {
+		// a client's side calls name a smaller model (Claude Code: haiku-class titles and summaries): they queue behind the main conversation
+		g.priority = 0;
+		const std::string& low = engine::runtime::options().low_priority_models;
+		std::string model = req.model;
+		for ( char& c : model ) c = static_cast<char>( std::tolower( static_cast<unsigned char>( c ) ) );
+		for ( size_t p = 0; p < low.size(); ) {
+			const size_t q = std::min( low.find( ',', p ), low.size() );
+			if ( q > p && model.find( low.substr( p, q - p ) ) != std::string::npos ) { g.priority = 1; break; }
+			p = q + 1;
+		}
+	}
 	g.stop_strings = req.stop;
 	if ( req.stop_on_loop >= 0 ) g.loop_detect = req.stop_on_loop ? 2 : 0;
 	g.starts_in_reasoning = in_reasoning;

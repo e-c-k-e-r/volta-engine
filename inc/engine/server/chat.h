@@ -7,6 +7,7 @@
 
 #include <nlohmann/json.hpp>
 #include <atomic>
+#include <climits>
 #include <memory>
 #include <cmath>
 #include <string>
@@ -39,6 +40,7 @@ struct ChatRequest {
 	float frequency_penalty = 0.0f;
 	float repetition_penalty = -1.0f;     // <0: server default
 	int logprobs = -1;                    // >= 0: report token log-probabilities with this many alternatives
+	int priority = INT_MIN;               // INT_MIN: from the model name (low_priority_models), else 0
 	std::vector<std::string> probes;      // probe files scored on the request (empty: the probe option's)
 	std::vector<std::string> stop;
 	int stop_on_loop = -1;       // extension field stop_on_loop: -1 the loop_detect option, 0 off, 1 stop on a detected loop

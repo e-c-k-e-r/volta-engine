@@ -122,7 +122,9 @@ bool Generator::submit_request( GenerationRequest req ) {
 	{
 		std::unique_lock<std::mutex> lock( queue_mtx_ );
 		req.submit_time = std::chrono::steady_clock::now();
-		pending_queue_.push_back( std::move( req ) );
+		// lower priority values are admitted first; equal ones keep their order
+		auto at = std::find_if( pending_queue_.begin(), pending_queue_.end(), [&]( const GenerationRequest& q ) { return q.priority > req.priority; } );
+		pending_queue_.insert( at, std::move( req ) );
 	}
 	queue_cv_.notify_one();
 	std::unique_lock<std::mutex> mlock( metrics_mtx_ );

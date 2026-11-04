@@ -343,6 +343,7 @@ public:
 		if ( j.contains( "steer_vector" ) && j["steer_vector"].is_string() ) r.steer_vector = j["steer_vector"].get<std::string>();
 		if ( j.contains( "steer_scale" ) && j["steer_scale"].is_number() ) r.steer_scale = j["steer_scale"].get<float>();
 		if ( j.contains( "steer_scope" ) && j["steer_scope"].is_string() ) r.steer_scope = j["steer_scope"].get<std::string>();
+		if ( j.contains( "priority" ) && j["priority"].is_number_integer() ) r.priority = j["priority"].get<int>();
 		if ( j.contains( "probes" ) ) {
 			if ( j["probes"].is_string() ) {
 				const std::string v = j["probes"].get<std::string>();
