@@ -221,6 +221,9 @@ static void launch_router_logits( const half* x, const half* router_weights, int
 __global__ __launch_bounds__( 288 )
 void router_select_kernel(
 	const half* __restrict__ e_score_bias,
+	const float* __restrict__ slot_bias,
+	const pod::BatchRows* __restrict__ rows_desc,
+	int bias_stride,
 	int* __restrict__ topk_indices,
 	half* __restrict__ topk_weights,
 	int num_experts,
@@ -247,6 +250,8 @@ void router_select_kernel(
 		if ( e_score_bias != nullptr ) {
 			select_score += __half2float( e_score_bias[expert] );
 		}
+		// steering: the slot's bias moves the expert in or out of the selection; the weights still come from the raw scores
+		if ( slot_bias != nullptr ) select_score += slot_bias[static_cast<size_t>( rows_desc->slot[m] ) * bias_stride + expert];
 		s_raw[expert] = raw_score;
 		s_select[expert] = select_score;
 	}
@@ -555,14 +560,21 @@ void MoERouter::route_topk(
 	int top_k,
 	float routed_scaling_factor,
 	cudaStream_t stream,
-	int rows
+	int rows,
+	const float* slot_bias,
+	const pod::BatchRows* d_rows,
+	int bias_stride
 ) {
 	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS, "MoERouter::route_topk: rows out of range" );
+	ENGINE_ASSERT( slot_bias == nullptr || d_rows != nullptr, "MoERouter::route_topk: a slot bias needs the rows' slots" );
 	ENGINE_ASSERT( top_k <= 16 && num_experts <= 288 && hidden_size % 128 == 0, "MoERouter::route_topk: top_k / num_experts / hidden_size out of range" );
 	ENGINE_ASSERT( hidden_size / 128 <= ROUTER_MAX_KSLICES, "MoERouter::route_topk: hidden_size exceeds the router k slices" );
 	launch_router_logits( x.ptr<const half>(), router_weights.ptr<const half>(), hidden_size, num_experts, rows, stream );
 	router_select_kernel<<<dim3( rows ), dim3( ( num_experts + 31 ) / 32 * 32 ), 0, stream>>>(
 		e_score_bias.ptr<const half>(),
+		slot_bias,
+		d_rows,
+		bias_stride,
 		d_topk_indices,
 		d_topk_weights,
 		num_experts,

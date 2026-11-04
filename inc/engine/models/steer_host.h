@@ -20,7 +20,12 @@ public:
 	int index( int layer ) const { return layer >= first_ && layer < first_ + t_.layers ? layer - first_ : -1; }
 
 	// mean_rows > 0 (the four-stream models): a [mean_rows, hidden] fp16 buffer for the stream mean a probe captures
-	void init( pod::MemoryArena& arena, int hidden, int num_layers, int slots, int rank, int mean_rows = 0 );
+	// route_experts > 0: a router bias table for every layer (MoE models whose router takes it)
+	void init( pod::MemoryArena& arena, int hidden, int num_layers, int slots, int rank, int mean_rows = 0, int route_experts = 0 );
+	// the router bias of `layer` for slot 0 (slots are route_stride() floats apart), nullptr when the table is off
+	const float* route_bias( int layer ) const { return t_.route && layer >= 0 && layer < t_.route_layers ? t_.route + static_cast<size_t>( layer ) * t_.route_experts : nullptr; }
+	int route_stride() const { return t_.route_layers * t_.route_experts; }
+	int route_experts() const { return t_.route_experts; }
 	void set( int slot, const std::vector<engine::modules::SteerEntry>& entries, backend::stream_t stream );
 	void control( int slot, int scope, int prompt_len, int think_end, backend::stream_t stream );
 	void penalty( int slot, const std::vector<int>& ids, float penalty, backend::stream_t stream );
@@ -62,6 +67,7 @@ private:
 	void steer_capture( const std::vector<int>& layers, bool on ) override { host.capture( layers, on ); } \
 	bool steer_read( std::vector<float>& out, backend::stream_t stream = nullptr ) override { return host.read( out, stream ); } \
 	bool probe_read( int slot_id, int first_pos, int count, float* out, backend::stream_t stream = nullptr ) override { return host.read_probes( slot_id, first_pos, count, out, stream ); } \
-	void steer_range( int* first_layer, int* num_layers ) const override { *first_layer = host.first(); *num_layers = host.layers(); }
+	void steer_range( int* first_layer, int* num_layers ) const override { *first_layer = host.first(); *num_layers = host.layers(); } \
+	int steer_route_experts() const override { return host.route_experts(); }
 
 } // namespace engine::models

@@ -35,6 +35,8 @@ A bad name, an unreadable or mismatching file, or `steer_probe` without `steer` 
 
 `.steer` files hold, per entry, a layer, a kind (`add` or `clamp`), a strength or reference level and a unit direction (fp32 [hidden]); at most two entries per layer, all inside `steer_layers`. The header carries the hidden size, the layer count, the file's default scope and its recommended scale.
 
+Version 3 files add an expert id (int32) to every entry, for router entries (see "Router steering"), which carry a bias on one expert of one MoE layer and no vector; they may sit on any MoE layer, outside `steer_layers`, and do not count towards the per-layer limit. The engine writes version 3 only for files with router entries; `steer_file.py` reads and merges all three versions.
+
 `build/steer_build --pos pos.txt --neg neg.txt --out v.steer [--layers 21-42] [--model dir] [--scope generated] [--scale 1.5]` builds one from two sets of prompts (one per line): it prefills each (as a user turn with an empty reasoning block), reads the last token's residual after every steered layer, and stores per layer the unit mean difference between the sets with a strength of the difference's length divided by the layer count. At `steer_scale` 1 the layers together move the state by the contrast the prompts show; the recommended scale in the file header (`--scale`, see below) is what a request multiplies.
 
 ## Recommended scales and the contrast sets
@@ -214,6 +216,33 @@ Measured on GLM-5.3-Flash EXL3 3.05 bpw at four ranks (the `glm_256k` configurat
 * Defaults: threshold 0.55, strength 3, edit window 17/32 to 21/32 (23-29).
 * Clamp files do not carry over: a refusal axis built with `steer_build --clamp --answers` from 9 declined targets (the 8 declining and 5 accepting built-in openings each) and applied to every request, with no probe, frees few of the held-out declined targets and makes GLM decline prompts it otherwise answers. On 9 held-out declined targets, 28 answered targets and 46 controls, layers 18-32 or 23-29: margins K = 0 to 4 leave 0.56 to 0.89 of the declined targets refusing and take the answered ones from 0.00 to 0.14 to 0.32; K = -0.5 to -3 leave 0.56 to 0.78 refusing, take the answered ones to 0.25 to 0.79 and add repetition (up to 0.32). Use the probe on GLM.
 
+## Router steering (GLM-5.3-Flash)
+
+A router entry adds a bias to one expert's selection score on one MoE layer for the steered request's rows: the top-8 selection sees the sigmoid score plus the checkpoint's correction bias plus the entry's bias, while the weights stay the raw sigmoid scores of the chosen experts, renormalised. A bias of -1 always removes an expert and +1 always keeps it; small biases move near-ties. The table is per slot ([slots][MoE layers][experts], fp32), so neighbouring requests in the same batch route as before. Router entries run on the CUDA backend only.
+
+`tests/tools/steer_route_build.py` builds a file from a route dump (the `route_dump` option, over two prompt sets, one prefill each, with a JSON log naming each request's kind): per layer and expert, how often the expert is chosen at the last prompt token of the `--pos` prompts against the `--neg` prompts; the `--top` pairs with the largest gap get `-B` (favoured by `--pos`, picked less) or `+B` (favoured by `--neg`, picked more), `--mode suppress` or `promote` keeps one side only. Only the even-indexed prompts of each kind are used by default (`--use`), so the odd ones stay held out. `--with OTHER.steer` copies another file's entries into the output.
+
+```
+python3 tests/tools/steer_route_build.py --dump routes.bin --log log.json --pos target --neg control --top 10 --bias 0.3 --out route.steer [--with clamp.steer]
+```
+
+Measured on GLM-5.3-Flash EXL3 3.05 bpw at four ranks (`expert_cache` 0.4):
+* The refusal clamp (layers 23-29) leaves routing identical up to layer 23; from layer 24 on, 75 to 93% of the rows change 1.5 to 2 of their 8 experts.
+* Experts separate the prompt sets: at the last prompt token, the five most separating (layer, expert) pairs give a held-out AUC of 0.992 between declined targets and controls (layer 34 expert 62 is chosen on 0.88 of the targets, on none of the controls and none of 30 chat prompts).
+* Biasing those experts does not change the decision. Built from 25 + 25 discovery prompts, on 15 held-out targets, 20 controls and 30 chat prompts, 40 tokens greedy (share of targets that decline; controls and chat decline in no arm and repeat at most 0.01):
+
+| File | Targets declining |
+| --- | --- |
+| none | 0.60 |
+| refusal clamp, layers 23-29 | 0.73 |
+| 5 pairs, bias 0.1 | 0.60 |
+| 10 pairs, bias 0.1 | 0.47 |
+| 10 pairs, bias 0.3 | 0.60 |
+| 10 pairs, bias 1 | 0.60 |
+| 10 pairs, suppress only, bias 1 | 0.53 |
+| 20 pairs, bias 0.3 | 0.60 |
+| 10 pairs, bias 0.3, with the clamp | 0.67 |
+
 ## DeepSeek-V4.1-Flash
 
 DeepSeek (`deepseek_v41`) keeps four fp32 residual streams per row; the entries act on their mean after each layer's FFN update, as on GLM. The DSpark drafter's forward is not steered. Its 40 layers give a default steered range of 13 to 27.
@@ -228,6 +257,7 @@ Measured on DeepSeek-V4.1-Flash EXL3 1.68 bpw (exllamav3's release) at four rank
 
 * `test_steer`: the kernels against an fp32 reference on a mixed batch (add and clamp, every scope, slots with and without edits, the penalty over a vocabulary slice); rows the scope does not cover and unlisted logits come back bit-identical.
 * `test_steer_probe`: the probe's axis and fraction on synthetic states (host only).
+* `test_router_steer`: the router selection with a per-slot bias table: a zero table selects and weighs exactly as none, a -1 bias removes an expert and a +1 bias adds one for that slot's rows only, and the weights are the raw scores of the selection, renormalised.
 * `test_steer_model`: the 27B (Flash-Next with `STEER_FLASH=1`, GLM-5.3-Flash with `STEER_GLM=1`) with three slots: a zero-strength vector on one slot leaves both slots' tokens exactly as alone, a random-direction vector changes the steered slot's text while the neighbouring slot, decoding in the same batches, keeps at least its first 16 tokens (on GLM later tokens can flip at a near-tie, because its batched rounding depends on what the other rows route to), and a penalty on the tokens a reasoning block starts with removes them. `--tokens` prints the plain greedy tokens for a comparison with `steer=off`.
 
 ## Limits

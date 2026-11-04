@@ -212,6 +212,7 @@ public:
 	// probe scores of positions [first_pos, first_pos + count) of a slot, out [kProbes][count]
 	virtual bool probe_read( int slot_id, int first_pos, int count, float* out, backend::stream_t stream = nullptr ) { (void) slot_id; (void) first_pos; (void) count; (void) out; (void) stream; return false; }
 	virtual void steer_range( int* first_layer, int* num_layers ) const { *first_layer = 0; *num_layers = 0; }
+	virtual int steer_route_experts() const { return 0; }   // experts per layer a router bias may name (0: no router steering)
 	virtual int pool_tokens() const { return 0; }        // 0 = no shared pool
 	virtual int free_pool_tokens() const { return 0; }
 	// Per-row state slots (replace checkpoint + replay). While on, a forward also publishes the recurrent

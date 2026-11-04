@@ -20,7 +20,8 @@ constexpr int kRouterStride = 288; // partials stride per k slice, fixed by rout
 
 } // namespace
 
-void MoERouter::route_topk( const pod::TensorView& x, const pod::TensorView& router_weights, const pod::TensorView& e_score_bias, int* d_topk_indices, backend::half_t* d_topk_weights, int hidden_size, int num_experts, int top_k, float routed_scaling_factor, backend::stream_t, int rows ) {
+void MoERouter::route_topk( const pod::TensorView& x, const pod::TensorView& router_weights, const pod::TensorView& e_score_bias, int* d_topk_indices, backend::half_t* d_topk_weights, int hidden_size, int num_experts, int top_k, float routed_scaling_factor, backend::stream_t, int rows, const float* slot_bias, const pod::BatchRows*, int ) {
+	ENGINE_ASSERT( slot_bias == nullptr, "MoERouter::route_topk: router steering is CUDA only" );
 	ENGINE_ASSERT( rows >= 1, "MoERouter::route_topk: rows out of range" );
 	ENGINE_ASSERT( top_k <= 16 && num_experts <= kRouterStride && hidden_size % 128 == 0, "MoERouter::route_topk: top_k / num_experts / hidden_size out of range" );
 	const int slices = hidden_size / 128;

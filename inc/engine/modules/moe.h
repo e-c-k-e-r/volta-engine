@@ -3,9 +3,11 @@
 #include "engine/config.h"
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
+#include "engine/core/batch.h"
 #include "engine/modules/linear.h"
 #include "engine/modules/nvfp4_moe.h"   // MOE_NVFP4_ROWS
 #include "engine/backend/types.h"
+#include "engine/core/batch.h"
 
 #define MOE_MAX_GROUPS 8
 #define MOE_MAX_EXPERTS 512   // experts per rank: 72 expert-parallel (GLM), 128 whole experts of 4 ranks (Flash-Next; 512 on a single rank)
@@ -77,7 +79,10 @@ struct MoERouter {
 		int top_k = 8,
 		float routed_scaling_factor = 2.5f,
 		backend::stream_t stream = nullptr,
-		int rows = 1                    // x [rows, hidden] -> indices / weights [rows, top_k]
+		int rows = 1,                   // x [rows, hidden] -> indices / weights [rows, top_k]
+		const float* slot_bias = nullptr,          // steering: per slot, added to the selection score of each expert (slot_bias[slot * bias_stride + expert])
+		const pod::BatchRows* d_rows = nullptr,    // the rows' slots (with slot_bias)
+		int bias_stride = 0
 	);
 
 	// Softmax routing (Qwen family): the top_k largest raw logits, weighted by the softmax over just those logits.

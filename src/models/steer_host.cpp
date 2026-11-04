@@ -12,7 +12,7 @@ namespace engine::models {
 
 using namespace engine::modules;
 
-void SteerHost::init( pod::MemoryArena& arena, int hidden, int num_layers, int slots, int rank, int mean_rows ) {
+void SteerHost::init( pod::MemoryArena& arena, int hidden, int num_layers, int slots, int rank, int mean_rows, int route_experts ) {
 	if ( runtime::options().steer == "off" ) return;
 	int first = 0, last = 0;
 	ENGINE_ASSERT( parse_steer_layers( runtime::options().steer_layers, num_layers, &first, &last ), "steer_layers is malformed or out of range" );
@@ -36,6 +36,13 @@ void SteerHost::init( pod::MemoryArena& arena, int hidden, int num_layers, int s
 	backend::memset_sync( t_.ctl, 0, S * sizeof( SteerSlotCtl ) );
 	backend::memset_sync( t_.penalty_ids, 0, S * kSteerPenaltyIds * sizeof( int32_t ) );
 	backend::memset_sync( t_.probe, 0, S * kProbes * kProbeRing * sizeof( float ) );
+	if ( route_experts > 0 ) {
+		t_.route_layers = num_layers;
+		t_.route_experts = route_experts;
+		const size_t rb = S * static_cast<size_t>( num_layers ) * route_experts * sizeof( float );
+		t_.route = static_cast<float*>( core::arena_alloc( arena, rb ) );
+		backend::memset_sync( t_.route, 0, rb );
+	}
 	ctl_host_.assign( S, SteerSlotCtl{} );
 	cap_layer_.assign( num_layers, -1 );
 	if ( rank == 0 ) LOG_INFO( "[steer] layers %d-%d of %d, %zu KiB per slot\n", first, last, num_layers, nl * K * H * sizeof( float ) / 1024 );
@@ -52,6 +59,15 @@ void SteerHost::set( int slot, const std::vector<SteerEntry>& entries, backend::
 	int probe_first[kProbes];
 	for ( int& f : probe_first ) f = INT32_MAX;
 	int probes = 0;
+	// router bias entries: the slot's whole table (zero where no entry sets it)
+	std::vector<float> route;
+	if ( t_.route ) route.assign( static_cast<size_t>( route_stride() ), 0.0f );
+	for ( const auto& e : entries ) {
+		if ( e.kind != STEER_ROUTE ) continue;
+		ENGINE_ASSERT( t_.route && e.layer >= 0 && e.layer < t_.route_layers && e.expert >= 0 && e.expert < t_.route_experts, "SteerHost::set: router entry out of range (or the model has no router steering)" );
+		route[static_cast<size_t>( e.layer ) * t_.route_experts + e.expert] += e.par;
+	}
+	if ( t_.route ) backend::memcpy_async( t_.route + static_cast<size_t>( slot ) * route_stride(), route.data(), route.size() * sizeof( float ), backend::Copy::H2D, stream );
 	for ( const auto& e : entries ) {
 		if ( e.kind != STEER_PROBE ) continue;
 		ENGINE_ASSERT( e.probe >= 0 && e.probe < kProbes, "SteerHost::set: probe index out of range" );
@@ -61,7 +77,7 @@ void SteerHost::set( int slot, const std::vector<SteerEntry>& entries, backend::
 	// probe entries first on their layer, so they read the state before the edits
 	for ( int pass = 0; pass < 2; ++pass ) {
 		for ( const auto& e : entries ) {
-			if ( ( e.kind == STEER_PROBE ) != ( pass == 0 ) ) continue;
+			if ( e.kind == STEER_ROUTE || ( e.kind == STEER_PROBE ) != ( pass == 0 ) ) continue;
 			const int li = e.layer - first_;
 			ENGINE_ASSERT( li >= 0 && li < t_.layers, "SteerHost::set: entry layer outside the steered range" );
 			ENGINE_ASSERT( e.vec.size() == H && ( e.kind == STEER_ADD || e.kind == STEER_CLAMP || e.kind == STEER_CLAMP_KEEP || e.kind == STEER_PROBE ), "SteerHost::set: bad entry" );

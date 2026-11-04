@@ -9,7 +9,8 @@ namespace engine::runtime {
 // Control-vector file (.steer), written by tests/tools/steer_build and read at start or per request:
 //   char[4] "VSTR", int32 version (2; 1 has no scale), int32 hidden, int32 model layers, int32 default scope (SteerScope bits), int32 entries,
 //   float scale (version 2: the file's recommended strength multiplier; a request's steer_scale multiplies it, so 1 means as recommended),
-//   then per entry: int32 layer, int32 kind (SteerKind), float par, float vec[hidden]   (native little-endian)
+//   then per entry: int32 layer, int32 kind (SteerKind), float par, [version 3: int32 expert], float vec[hidden] (none for a router entry)   (native little-endian);
+//   version 3 is written only for files with router entries (STEER_ROUTE)
 struct SteerFile {
 	int hidden = 0;
 	int layers = 0;

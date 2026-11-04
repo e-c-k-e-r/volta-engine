@@ -529,6 +529,9 @@ set_target_properties(test_steer_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PR
 add_executable(test_steer tests/2_parity/test_steer.cpp)
 target_link_libraries(test_steer PRIVATE engine_kernels)
 set_target_properties(test_steer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_router_steer tests/2_parity/test_router_steer.cpp)
+target_link_libraries(test_router_steer PRIVATE engine_kernels)
+set_target_properties(test_router_steer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Test Norm & Elementwise Parity
 add_executable(test_norm tests/2_parity/test_norm.cpp)

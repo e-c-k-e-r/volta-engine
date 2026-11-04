@@ -192,7 +192,7 @@ bool Glm5NextPipeline::init(
 	embed_rows_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rows_shape, 2 );
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
-	steer_.init( arena, config_.hidden_size, config_.num_layers, S, rank_, R );
+	steer_.init( arena, config_.hidden_size, config_.num_layers, S, rank_, R, config_.num_experts );
 	int h_shape[2] = { R, config_.hidden_size };
 	hidden_states_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	norm_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
@@ -1884,7 +1884,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				engine::modules::MoERouter::route_topk(
 					norm_hidden_, lw.router_weights, lw.e_score_bias,
 					state_.d_topk_indices, state_.d_topk_weights,
-					H, config_.num_experts, config_.top_k, 2.5f, stream, m
+					H, config_.num_experts, config_.top_k, 2.5f, stream, m, steer_.route_bias( layer ), d_rows_, steer_.route_stride()
 				);
 				static const std::string& dump_path = runtime::options().route_dump;
 				if ( !dump_path.empty() && rank_ == 0 && m > pod::MAX_BATCH && hess_on_ ) {

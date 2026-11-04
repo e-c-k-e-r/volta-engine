@@ -108,6 +108,7 @@ public:
 	void steer_control( int slot, int scope, int prompt_len, int think_end );
 	void steer_penalty( int slot, const std::vector<int>& ids, float penalty );
 	void steer_range( int* first_layer, int* num_layers ) const { models_[0]->steer_range( first_layer, num_layers ); }
+	int steer_route_experts() const { return models_[0]->steer_route_experts(); }
 	void steer_capture( const std::vector<int>& layers, bool on );
 	bool steer_read( std::vector<float>& out );   // rank 0's capture (the residual is replicated)
 	bool probe_read( int slot, int first_pos, int count, float* out );   // rank 0's probe scores, out [kProbes][count]

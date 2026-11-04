@@ -19,7 +19,8 @@ constexpr int kProbeRing = 4096;         // positions of probe scores kept per p
 // STEER_CLAMP_KEEP: a clamp that rescales the whole row afterwards to the norm it had before the clamp
 // STEER_PROBE: one layer's share of a probe score, (x . v - par) added to the slot's probe ring at the row's position; the residual is not edited.
 // On the device a probe entry's kind is kSteerProbeKind + 2 * probe index + (1 on the probe's first layer, which writes instead of adding).
-enum SteerKind : int32_t { STEER_OFF = 0, STEER_ADD = 1, STEER_CLAMP = 2, STEER_CLAMP_KEEP = 3, STEER_PROBE = 8 };
+// STEER_ROUTE: a bias on one expert's router selection score in one MoE layer (the expert is picked more or less often; its weight is unchanged)
+enum SteerKind : int32_t { STEER_OFF = 0, STEER_ADD = 1, STEER_CLAMP = 2, STEER_CLAMP_KEEP = 3, STEER_PROBE = 8, STEER_ROUTE = 9 };
 constexpr int kSteerProbeKind = 16;
 // Rows a slot's residual edit applies to. A row is `prompt` below prompt_len, `think` from there to think_end, `answer` after it.
 enum SteerScope : int32_t { STEER_PROMPT = 1, STEER_THINK = 2, STEER_ANSWER = 4, STEER_GENERATED = 6, STEER_ALL = 7 };
@@ -31,6 +32,7 @@ struct SteerEntry {
 	float par = 0.0f;
 	std::vector<float> vec;
 	int probe = 0;   // STEER_PROBE: which of the slot's probes the entry adds to
+	int expert = -1; // STEER_ROUTE: the expert whose selection score par is added to (vec unused)
 };
 
 // "first-last" of the steer_layers option: each side an index, a fraction of the layer count (0.33, 1/3) or "last"; empty = 1/3-2/3. False when malformed.
@@ -58,6 +60,9 @@ struct SteerTables {
 	SteerSlotCtl* ctl = nullptr;
 	int32_t* penalty_ids = nullptr;   // [slots][kSteerPenaltyIds] global token ids
 	float* probe = nullptr;           // [slots][kProbes][kProbeRing] probe scores by position
+	float* route = nullptr;           // [slots][model layers][route_experts] router selection bias (MoE models), zero when unset
+	int route_layers = 0;
+	int route_experts = 0;
 };
 
 struct ResidualSteer {

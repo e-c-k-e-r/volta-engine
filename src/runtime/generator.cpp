@@ -733,6 +733,12 @@ const SteerFile* Generator::steer_file( const std::string& vector, std::string* 
 	if ( f.hidden != cluster_.metadata().hidden_size ) { *err = path + ": built for hidden size " + std::to_string( f.hidden ); return nullptr; }
 	std::vector<int> per_layer( cluster_.metadata().num_layers, 0 );
 	for ( const auto& e : f.entries ) {
+		if ( e.kind == engine::modules::STEER_ROUTE ) {
+			// a router bias may sit on any MoE layer, outside the steered range
+			if ( cluster_.steer_route_experts() <= 0 ) { *err = path + ": router entries, but this model has no router steering"; return nullptr; }
+			if ( e.layer < 0 || e.layer >= cluster_.metadata().num_layers || e.expert < 0 || e.expert >= cluster_.steer_route_experts() ) { *err = path + ": router entry out of range (layer " + std::to_string( e.layer ) + ", expert " + std::to_string( e.expert ) + ")"; return nullptr; }
+			continue;
+		}
 		if ( e.layer < first || e.layer >= first + count ) { *err = path + ": layer " + std::to_string( e.layer ) + " is outside the steered layers " + std::to_string( first ) + "-" + std::to_string( first + count - 1 ) + " (steer_layers)"; return nullptr; }
 		if ( ( e.kind != engine::modules::STEER_ADD && e.kind != engine::modules::STEER_CLAMP && e.kind != engine::modules::STEER_CLAMP_KEEP && e.kind != engine::modules::STEER_PROBE ) ||
 			++per_layer[e.layer] > engine::modules::kSteerEntries ) { *err = path + ": bad entry on layer " + std::to_string( e.layer ); return nullptr; }
