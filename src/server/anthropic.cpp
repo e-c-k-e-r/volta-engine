@@ -4,6 +4,7 @@
 #define JSON_NOEXCEPTION 1
 #include "engine/server/json_safe.h"
 #include <chrono>
+#include <cstring>
 
 namespace engine::server {
 
@@ -326,6 +327,15 @@ public:
 
 		bool tools_off = j.contains( "tool_choice" ) && j["tool_choice"].is_object() && j["tool_choice"].value( "type", std::string() ) == "none";
 		if ( j.contains( "tools" ) && j["tools"].is_array() && !j["tools"].empty() && !tools_off ) {
+			// Server tools run on Anthropic's side inside the API call; nothing here can execute them, so they are refused by name rather than
+			// offered to the model as empty functions (client tools, custom or typed, are executed by the caller and pass)
+			for ( const auto& t : j["tools"] ) {
+				const std::string type = t.is_object() ? t.value( "type", std::string() ) : std::string();
+				for ( const char* server : { "web_search_", "web_fetch_", "code_execution_", "tool_search_tool_", "mcp_toolset" } ) {
+					if ( type.compare( 0, std::strlen( server ), server ) == 0 )
+						return fail( err, "server tool '" + t.value( "name", type ) + "' (" + type + ") is not supported: this server cannot run Anthropic's server tools" );
+				}
+			}
 			bool ok = false;
 			std::string tools = normalize_tools( j["tools"].dump(), &ok );
 			if ( !ok ) return fail( err, "malformed tools" );

@@ -215,6 +215,9 @@ if True:
     check(code == 200 and json.loads(body)["input_tokens"] > 300, "count_tokens includes the image tokens", body)
     code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}]}]})
     check(code == 400, "remote image URLs are rejected", body)
+code, body = post("/v1/messages", {"model": "claude-x", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
+                                   "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]})
+check(code == 400 and "server tool" in json.loads(body)["error"]["message"], "Anthropic server tools are refused by name", body)
 
 # client disconnect frees the slot
 s = socket.create_connection((BASE.split("//")[1].split(":")[0], int(BASE.rsplit(":", 1)[1])))
