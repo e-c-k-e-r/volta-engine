@@ -23,6 +23,7 @@ struct VideoConfig {
 
 struct ServerConfig {
 	std::string host = "0.0.0.0";
+	std::string api_key;         // non-empty: /v1/* requests need it (Authorization: Bearer KEY or x-api-key: KEY)
 	int port = 8000;
 	int max_batch_size = 8;
 	int request_timeout_s = 30;   // a connection that sends nothing for this long before its request is complete is dropped

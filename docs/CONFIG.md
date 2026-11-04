@@ -16,6 +16,7 @@ values are fatal errors. The model type is never configured: it is read from the
 | `tui` | `--tui` | false | show a terminal dashboard (`volta_top`'s view, in this process) instead of the console log; the log moves to its last tab. Needs a terminal; `q` closes it and the server goes on with plain output |
 | `tp_size` | `--tp-size` | 4 | GPUs (1, 2 or 4; GLM runs on 1, 2 or 4) |
 | `host`, `port` | `--host`, `--port` | 0.0.0.0, 8000 | listen address |
+| `api_key` | `--api-key` | empty | when set, `/v1/*` requests must carry it as `Authorization: Bearer KEY` or `x-api-key: KEY` (Claude Code sends `ANTHROPIC_API_KEY` as the latter); `/health`, `/metrics` and the monitor stay open |
 | `max_batch_size` | `--max-batch-size` | 8 | concurrent decode slots the scheduler may fill (capped by `max_slots`) |
 | `default_max_tokens` | `--max-tokens` | 256 | `max_tokens` for requests that omit it |
 | `default_temperature`, `default_top_p`, `default_top_k` | `--temperature` | from the checkpoint's `generation_config.json` | sampling defaults for requests that omit them (`presence_penalty` and `repetition_penalty` are also taken from that file when it sets them) |

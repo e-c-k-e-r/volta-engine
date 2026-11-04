@@ -193,6 +193,7 @@ void Generator::scheduler_loop() {
 		bool want_logprobs = false;
 		for ( int s = 0; s < num_slots_; ++s ) want_logprobs = want_logprobs || ( slots_[s].active && slots_[s].sp.logprobs >= 0 );
 		cluster_.set_logprobs( want_logprobs );
+		poll_waiting();
 		step_batch();
 		heat_pending_ = true;
 		for ( int s = 0; s < num_slots_; ++s ) apply_forced_close( s );
@@ -353,6 +354,37 @@ void Generator::probe_collect( int s, bool final ) {
 		from += count;
 	}
 	slot.probe_read = end;
+}
+
+void Generator::poll_waiting() {
+	constexpr auto kEvery = std::chrono::seconds( 2 );
+	const auto now = std::chrono::steady_clock::now();
+	auto due = [&]( GenerationRequest& r ) {
+		if ( !r.on_wait || now - r.last_wait < kEvery ) return false;
+		r.last_wait = now;
+		return true;
+	};
+	for ( int s = 0; s < num_slots_; ++s ) {
+		Slot& slot = slots_[s];
+		if ( !slot.active || slot.prefill_done || !due( slot.req ) || slot.req.on_wait() ) continue;
+		LOG_INFO( "[req %llu] client gone during the prefill (%d of %zu prompt tokens): cancelled\n", static_cast<unsigned long long>( slot.req.req_id ), slot.pf_pos, slot.req.prompt_tokens.size() );
+		finish_slot( s, FinishReason::Cancelled );
+	}
+	std::vector<GenerationRequest> gone;
+	{
+		std::unique_lock<std::mutex> lock( queue_mtx_ );
+		for ( size_t i = 0; i < pending_queue_.size(); ) {
+			if ( due( pending_queue_[i] ) && !pending_queue_[i].on_wait() ) {
+				gone.push_back( std::move( pending_queue_[i] ) );
+				pending_queue_.erase( pending_queue_.begin() + static_cast<long>( i ) );
+			}
+			else ++i;
+		}
+	}
+	for ( GenerationRequest& r : gone ) {
+		LOG_INFO( "[req %llu] client gone while queued: cancelled\n", static_cast<unsigned long long>( r.req_id ) );
+		if ( r.on_finish ) r.on_finish( FinishReason::Cancelled, std::string(), SlotMetrics() );
+	}
 }
 
 void Generator::finish_slot( int s, FinishReason reason ) {
@@ -883,7 +915,13 @@ void Generator::step_batch() {
 	else {
 		pf_cooldown_left_ = 0;
 		for ( int s = 0; s < num_slots_; ++s ) {
-			while ( slots_[s].active && !slots_[s].prefill_done ) prefill_slot( s, 0 );
+			// bounded pieces (a multiple of the 512-row chunk, so the chunking and any prefill window are unchanged), so a client that goes away
+			// cancels a long prompt between them and a streaming client gets its keepalives
+			constexpr int kPiece = 8192;
+			while ( slots_[s].active && !slots_[s].prefill_done ) {
+				prefill_slot( s, kPiece );
+				if ( slots_[s].active && !slots_[s].prefill_done ) poll_waiting();
+			}
 		}
 	}
 

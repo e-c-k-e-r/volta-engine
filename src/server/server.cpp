@@ -88,6 +88,8 @@ bool VoltaServer::init( const ServerConfig& config ) {
 	}
 
 	LOG_INFO( "Volta Server listening on http://%s:%d\n", config_.host.c_str(), config_.port );
+	if ( config_.api_key.empty() && config_.host != "127.0.0.1" && config_.host != "localhost" && config_.host != "::1" )
+		LOG_WARN( "No api_key set and the server listens on %s: anyone who can reach the port can use it (set api_key, or host 127.0.0.1)\n", config_.host.c_str() );
 	std::fflush( stdout );
 	return true;
 }
@@ -298,6 +300,14 @@ void VoltaServer::register_routes() {
 }
 
 void VoltaServer::dispatch( const ConnPtr& conn, const HttpRequest& req ) {
+	if ( !config_.api_key.empty() && req.path.compare( 0, 4, "/v1/" ) == 0 ) {
+		const std::string bearer = req.header( "authorization" ), key = req.header( "x-api-key" );
+		const bool ok = key == config_.api_key || ( bearer.size() > 7 && bearer.compare( 0, 7, "Bearer " ) == 0 && bearer.compare( 7, std::string::npos, config_.api_key ) == 0 );
+		if ( !ok ) {
+			send_error( conn, 401, "authentication_error", "missing or wrong API key", req.path.compare( 0, 12, "/v1/messages" ) == 0 );
+			return;
+		}
+	}
 	if ( !router_.dispatch( conn, req ) ) send_error( conn, 404, "not_found_error", "unknown endpoint " + req.method + " " + req.path );
 }
 

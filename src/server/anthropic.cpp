@@ -3,6 +3,7 @@
 
 #define JSON_NOEXCEPTION 1
 #include "engine/server/json_safe.h"
+#include <chrono>
 
 namespace engine::server {
 
@@ -224,6 +225,15 @@ public:
 		return delta( kind == Kind::Thinking ? json( { { "type", "thinking_delta" }, { "thinking", ev.text } } ) : json( { { "type", "text_delta" }, { "text", ev.text } } ) );
 	}
 
+	bool on_wait() override {
+		if ( !stream_ ) return true;
+		if ( !ensure_started() ) return false;   // message_start goes out at once, so the client sees the response begin
+		const auto now = std::chrono::steady_clock::now();
+		if ( now - last_ping_ < std::chrono::seconds( 10 ) ) return true;
+		last_ping_ = now;
+		return event( "ping", { { "type", "ping" } } );
+	}
+
 	void on_finish( engine::runtime::FinishReason reason, const std::string& matched, bool had_tool_calls, const Usage& usage ) override {
 		using engine::runtime::FinishReason;
 		if ( reason == FinishReason::Cancelled || conn_->closed() ) {
@@ -300,6 +310,7 @@ private:
 	int tool_index_ = 0;
 	Kind cur_ = Kind::None;
 	json blocks_ = json::array();
+	std::chrono::steady_clock::time_point last_ping_ = std::chrono::steady_clock::now();
 };
 
 class AnthropicProtocol : public ChatProtocol {

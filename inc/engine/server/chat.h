@@ -89,6 +89,8 @@ public:
 	virtual bool on_event( const OutputEvent& ev ) = 0;
 	// With ChatRequest::logprobs: the entries of the tokens whose text the next on_event calls carry
 	virtual void on_logprobs( const std::vector<LogprobOut>& entries ) { (void) entries; }
+	// While queued or prefilling (every few seconds): a streaming response starts and sends keepalives. False when the client is gone.
+	virtual bool on_wait() { return true; }
 	virtual void on_finish( engine::runtime::FinishReason reason, const std::string& matched_stop, bool had_tool_calls, const Usage& usage ) = 0;
 };
 

@@ -401,6 +401,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		}
 		return true;
 	};
+	g.on_wait = [state]() { return !state->conn->closed() && state->responder->on_wait(); };
 	if ( req.logprobs >= 0 ) {
 		const engine::loader::Tokenizer* tk = &gen.tokenizer();
 		g.on_logprobs = [state, tk]( const std::vector<engine::runtime::TokenLogprob>& entries ) {

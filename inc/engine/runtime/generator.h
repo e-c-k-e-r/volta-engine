@@ -119,6 +119,10 @@ struct GenerationRequest {
 	std::function<bool( const std::string& delta )> on_text;
 	// With logprobs: called just before the on_text that carries these tokens' text (and once before on_finish for the rest)
 	std::function<void( const std::vector<TokenLogprob>& entries )> on_logprobs;
+	// Called from the scheduler thread every few seconds while the request waits for a slot or prefills (nothing else reaches the client then):
+	// returning false cancels it. The server checks the connection here and keeps a stream alive.
+	std::function<bool()> on_wait;
+	std::chrono::steady_clock::time_point last_wait;
 	// Called once, from the scheduler thread, when the request leaves its slot.
 	std::function<void( FinishReason reason, const std::string& matched_stop, const SlotMetrics& metrics )> on_finish;
 };
@@ -291,7 +295,8 @@ private:
 	// Commits `tok` to slot s's output; returns true when the request finished.
 	static int loop_detect_mode();
 	bool emit_token( int s, int tok, const Candidates* row = nullptr );   // row: the token's unpenalized candidates, for log-probabilities
-	void probe_collect( int s, bool final );   // fold the probe scores of the positions forwarded since the last call into the slot's metrics
+	void probe_collect( int s, bool final );
+	void poll_waiting();   // on_wait of the queued and prefilling requests (at most every 2 s each); cancels those whose client is gone   // fold the probe scores of the positions forwarded since the last call into the slot's metrics
 	std::vector<std::string> probe_names( const std::vector<std::string>& requested ) const;   // the request's probes, else the probe option's
 	void finish_slot( int s, FinishReason reason );
 	void apply_forced_close( int s );

@@ -116,6 +116,8 @@ Covered by `test_all_reduce`, `bench_all_reduce`, `test_coherence`, `tests/4_ser
 |---|---|---|
 | OpenAI `/v1/chat/completions`, `/v1/models` | default | streaming, `stream_options.include_usage`, `stop`, `seed` |
 | Anthropic `/v1/messages`, `/v1/messages/count_tokens` | default | what Claude Code connects to |
+| Waiting requests: a streaming response starts at once and sends keepalives every 10 s while the request waits for a slot or prefills (`ping` events, SSE comments on OpenAI); a client that disconnects cancels its request there too (long prompts are prefilled in 8192-token pieces between the checks) | default | |
+| API key: `/v1/*` requests must carry `Authorization: Bearer KEY` or `x-api-key: KEY`; the server warns at start when it listens beyond localhost without one | opt-in | `api_key` / `--api-key` |
 | Loop detection: a request whose output settles into repeating a span is reported or stopped (finish reason `loop`) | opt-in | `loop_detect` off / report / stop, request field `stop_on_loop` |
 | Tools in either shape, `tool_choice` `required` / named | default | best effort, no constrained decoding |
 | Reasoning and tool-call parsing from the text stream | default | Qwen and GLM syntaxes; independent of how the stream is chunked |

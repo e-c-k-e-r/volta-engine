@@ -3,6 +3,7 @@
 
 #define JSON_NOEXCEPTION 1
 #include "engine/server/json_safe.h"
+#include <chrono>
 
 #include <ctime>
 
@@ -146,6 +147,15 @@ public:
 		return send_delta( { { reasoning ? "reasoning_content" : "content", ev.text } } );
 	}
 
+	bool on_wait() override {
+		if ( !stream_ ) return true;
+		if ( !ensure_started() ) return false;
+		const auto now = std::chrono::steady_clock::now();
+		if ( now - last_ping_ < std::chrono::seconds( 10 ) ) return true;
+		last_ping_ = now;
+		return conn_->write_all( ": keepalive\n\n" );   // an SSE comment: clients ignore it, proxies and timeouts see traffic
+	}
+
 	void on_logprobs( const std::vector<LogprobOut>& entries ) override {
 		for ( const LogprobOut& e : entries ) {
 			json top = json::array();
@@ -247,6 +257,7 @@ private:
 	std::string content_, reasoning_;
 	std::vector<ToolCallOut> calls_;
 	json pending_lp_ = json::array(), all_lp_ = json::array();
+	std::chrono::steady_clock::time_point last_ping_ = std::chrono::steady_clock::now();
 };
 
 class OpenAIProtocol : public ChatProtocol {
