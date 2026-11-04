@@ -224,6 +224,7 @@ void router_select_kernel(
 	const float* __restrict__ slot_bias,
 	const pod::BatchRows* __restrict__ rows_desc,
 	int bias_stride,
+	const float* __restrict__ expert_bias,
 	int* __restrict__ topk_indices,
 	half* __restrict__ topk_weights,
 	int num_experts,
@@ -252,6 +253,7 @@ void router_select_kernel(
 		}
 		// steering: the slot's bias moves the expert in or out of the selection; the weights still come from the raw scores
 		if ( slot_bias != nullptr ) select_score += slot_bias[static_cast<size_t>( rows_desc->slot[m] ) * bias_stride + expert];
+		if ( expert_bias != nullptr ) select_score += expert_bias[expert];
 		s_raw[expert] = raw_score;
 		s_select[expert] = select_score;
 	}
@@ -563,7 +565,8 @@ void MoERouter::route_topk(
 	int rows,
 	const float* slot_bias,
 	const pod::BatchRows* d_rows,
-	int bias_stride
+	int bias_stride,
+	const float* expert_bias
 ) {
 	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS, "MoERouter::route_topk: rows out of range" );
 	ENGINE_ASSERT( slot_bias == nullptr || d_rows != nullptr, "MoERouter::route_topk: a slot bias needs the rows' slots" );
@@ -575,6 +578,7 @@ void MoERouter::route_topk(
 		slot_bias,
 		d_rows,
 		bias_stride,
+		expert_bias,
 		d_topk_indices,
 		d_topk_weights,
 		num_experts,

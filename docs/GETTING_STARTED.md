@@ -107,6 +107,11 @@ Qwen extras:
   Decode keeps the fused MoE kernels while at least 75% of the experts are resident (below that the persistent kernel reads the cold experts a
   little faster): at 99% resident a token takes 19.0 ms against 15.5 ms with every expert resident (16.3 ms with the PCIe reads taken out; the
   rest is cold-expert traffic, 2.7 ms for one row and 7.6 ms for an 8-row verify), and 28.5 ms before.
+  `--set route_resident_bias=0.1` adds 0.1 to the router selection score of every resident expert (the weights stay the raw scores), so
+  near-ties go to experts on the device; the table follows the residency after every rebalance. On GLM 3.05 bpw at `expert_cache=0.4` (29 of 72
+  experts per rank resident), 16 chat prompts of 256 greedy tokens, one slot, no drafter, decode / share of routes to resident experts /
+  held-out prose perplexity (12,000 tokens, from the same resident sets): bias 0: 6.13 tok/s / 0.47 / 7.661; 0.02: 7.08 / 0.55 / 7.653;
+  0.05: 8.23 / 0.64 / 7.667; 0.1: 10.45 / 0.75 / 7.698; 0.2: 13.53 / 0.85 / 7.801. The routing change alters greedy text from early on.
   `--set kv_pool=262144` lets the two slots share one pool of that many tokens instead of owning 256K each (0.95 GiB per GPU less at the 4-bit
   cache, which the expert cache or the drafter can use): a request starts once the pool holds its prompt, otherwise it queues, and one that
   grows past the pool ends with finish reason `length`.

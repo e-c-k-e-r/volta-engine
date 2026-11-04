@@ -179,6 +179,8 @@ public:
 	bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) override;
 	// expert_cache < 1: fold the routing counters into the experts' scores and move hot experts into the device tier
 	bool rebalance_experts( backend::stream_t stream = nullptr ) override;
+	bool resident_mask( std::vector<uint8_t>& mask, int& layers, int& experts ) const override;
+	void set_resident_bias( const std::vector<uint8_t>& mask, float bias, backend::stream_t stream = nullptr ) override;
 	void draft_head_topk( int rows, backend::stream_t stream = nullptr ) override;
 	void set_spec_snapshot( bool on, backend::stream_t stream = nullptr ) override;
 	void commit_spec_row( int slot_id, int row, backend::stream_t stream = nullptr ) override;
@@ -248,6 +250,7 @@ private:
 	engine::modules::ExpertTier tier_;
 	pod::MemoryArena host_arena_{};     // pinned cold-expert tier
 	int tier_layers_ = 0;
+	float* resident_bias_ = nullptr;    // route_resident_bias: [tier layer][num_experts] added to the router selection score (device)
 	engine::cpu_moe::CpuExpertHandle cpu_;   // cpu_experts: cold experts computed on the host CPU
 	// Calibration (hessian_dir): x^T x of a projection input over the prefill rows, per layer and site (0 attention input, 1 FFN input,
 	// 2 o_proj input (rank slice), 3 shared-expert down input (layers 0-2: the dense MLP down input, 1 = its gate / up input), 4 q-lora norm output (MLA), 5 lm_head input with layer 0)

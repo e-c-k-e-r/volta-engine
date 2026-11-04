@@ -449,6 +449,27 @@ bool Glm5NextPipeline::rebalance_experts( backend::stream_t stream ) {
 	return true;
 }
 
+bool Glm5NextPipeline::resident_mask( std::vector<uint8_t>& mask, int& layers, int& experts ) const {
+	if ( !tier_.active() ) return false;
+	layers = tier_layers_;
+	experts = config_.num_experts;
+	const int start = moe_tp_ ? 0 : rank_ * tier_.experts;
+	mask.assign( static_cast<size_t>( layers ) * experts, 0 );
+	for ( int l = 0; l < layers; ++l ) {
+		for ( int e = 0; e < tier_.experts; ++e ) mask[static_cast<size_t>( l ) * experts + start + e] = tier_.layers[l].slot_of[e] >= 0 ? 1 : 0;
+	}
+	return true;
+}
+
+void Glm5NextPipeline::set_resident_bias( const std::vector<uint8_t>& mask, float bias, backend::stream_t stream ) {
+	if ( resident_bias_ == nullptr ) return;
+	backend::set_device( rank_ );
+	std::vector<float> table( mask.size() );
+	for ( size_t i = 0; i < mask.size(); ++i ) table[i] = mask[i] ? bias : 0.0f;
+	backend::stream_sync( stream );
+	backend::memcpy_sync( resident_bias_, table.data(), table.size() * sizeof( float ), backend::Copy::H2D );
+}
+
 bool Glm5NextPipeline::expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset ) {
 	backend::set_device( rank_ );
 	backend::device_sync();
@@ -1174,6 +1195,11 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	}
 
 	tier_.stage_init( *arena_ );
+	if ( tier_.active() && runtime::options().route_resident_bias != 0.0 ) {
+		const size_t n = static_cast<size_t>( tier_layers_ ) * config_.num_experts;
+		resident_bias_ = static_cast<float*>( core::arena_alloc( *arena_, n * sizeof( float ) ) );
+		backend::memset_sync( resident_bias_, 0, n * sizeof( float ) );   // the cluster fills it once every rank is loaded
+	}
 	if ( tier_.active() && runtime::options().cpu_experts > 0.0 ) cpu_ = engine::cpu_moe::attach_cpu_experts( tier_, rank_, start_expert, config_.hidden_size, 10.0f, *arena_, stream );
 	size_t bytes_after = arena_->offset_bytes;
 	if ( rank_ <= 1 && runtime::options().mem_log ) {
@@ -1884,7 +1910,8 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				engine::modules::MoERouter::route_topk(
 					norm_hidden_, lw.router_weights, lw.e_score_bias,
 					state_.d_topk_indices, state_.d_topk_weights,
-					H, config_.num_experts, config_.top_k, 2.5f, stream, m, steer_.route_bias( layer ), d_rows_, steer_.route_stride()
+					H, config_.num_experts, config_.top_k, 2.5f, stream, m, steer_.route_bias( layer ), d_rows_, steer_.route_stride(),
+					resident_bias_ != nullptr && lw.tier_layer >= 0 ? resident_bias_ + static_cast<size_t>( lw.tier_layer ) * config_.num_experts : nullptr
 				);
 				static const std::string& dump_path = runtime::options().route_dump;
 				if ( !dump_path.empty() && rank_ == 0 && m > pod::MAX_BATCH && hess_on_ ) {

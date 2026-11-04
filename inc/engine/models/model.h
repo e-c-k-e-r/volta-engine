@@ -152,6 +152,10 @@ public:
 	virtual bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) { (void) out; (void) layers; (void) experts; (void) reset; return false; }
 	// Adapt the routed-expert residency to the routing seen so far; false when the model keeps every expert resident
 	virtual bool rebalance_experts( backend::stream_t stream = nullptr ) { (void) stream; return false; }
+	// route_resident_bias: sets `mask` (layers x all experts, model expert ids) to 1 for the experts this rank keeps on the device; false without a tier
+	virtual bool resident_mask( std::vector<uint8_t>& mask, int& layers, int& experts ) const { (void) mask; (void) layers; (void) experts; return false; }
+	// The ranks' merged mask: the router adds `bias` to the selection score of the experts it marks
+	virtual void set_resident_bias( const std::vector<uint8_t>& mask, float bias, backend::stream_t stream = nullptr ) { (void) mask; (void) bias; (void) stream; }
 	virtual const backend::half_t* shard_logits_ptr() const { return nullptr; }
 	virtual int shard_logits_cols() const { return 0; }
 

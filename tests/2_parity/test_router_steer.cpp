@@ -1,6 +1,6 @@
 // Router steering in MoERouter::route_topk (GLM's sigmoid router): a per-slot bias on the selection score. A zero table selects exactly what the
 // router selects without one; a -1 bias on a chosen expert removes it from that slot's rows only; a +1 bias on an unchosen expert brings it in; the
-// weights stay the raw scores renormalised over the selection.
+// weights stay the raw scores renormalised over the selection. The all-rows expert bias (route_resident_bias) brings an expert into every row.
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
 #include "engine/core/arena.h"
@@ -100,6 +100,20 @@ int main() {
 	expect( slot0_ok, "slot 0's rows drop the -1 expert and take the +1 expert" );
 	expect( slot1_same, "slot 1's rows select as before" );
 	expect( weights_ok, "weights are the raw scores of the selection, renormalised" );
+
+	// the all-rows bias (cache-aware routing): +1 on an expert no row picks brings it into every row, whatever the slot
+	int outsider = 0;
+	while ( std::find( i0.begin(), i0.end(), outsider ) != i0.end() ) ++outsider;
+	std::vector<float> eb( E, 0.0f );
+	eb[outsider] = 1.0f;
+	float* d_eb = static_cast<float*>( core::arena_alloc( arena, static_cast<size_t>( E ) * sizeof( float ) ) );
+	backend::memcpy_sync( d_eb, eb.data(), eb.size() * sizeof( float ), backend::Copy::H2D );
+	modules::MoERouter::route_topk( x, w, b, d_idx, d_w, H, E, K, 2.5f, nullptr, M, nullptr, nullptr, 0, d_eb );
+	backend::device_sync();
+	backend::memcpy_sync( i1.data(), d_idx, i1.size() * sizeof( int ), backend::Copy::D2H );
+	bool all_rows = true;
+	for ( int r = 0; r < M; ++r ) all_rows = all_rows && std::find( &i1[static_cast<size_t>( r ) * K], &i1[static_cast<size_t>( r ) * K] + K, outsider ) != &i1[static_cast<size_t>( r ) * K] + K;
+	expect( all_rows, "an expert bias reaches every row" );
 	std::printf( "%s\n", fails ? "[-] router steering FAIL" : "[+] router steering PASS" );
 	return fails ? 1 : 0;
 }

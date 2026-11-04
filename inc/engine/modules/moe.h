@@ -82,7 +82,8 @@ struct MoERouter {
 		int rows = 1,                   // x [rows, hidden] -> indices / weights [rows, top_k]
 		const float* slot_bias = nullptr,          // steering: per slot, added to the selection score of each expert (slot_bias[slot * bias_stride + expert])
 		const pod::BatchRows* d_rows = nullptr,    // the rows' slots (with slot_bias)
-		int bias_stride = 0
+		int bias_stride = 0,
+		const float* expert_bias = nullptr         // added to every row's selection score of each expert ([num_experts]; cache-aware routing)
 	);
 
 	// Softmax routing (Qwen family): the top_k largest raw logits, weighted by the softmax over just those logits.

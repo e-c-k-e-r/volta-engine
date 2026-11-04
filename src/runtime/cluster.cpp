@@ -168,6 +168,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	// speculative round's, reports only errors raised after init.
 	backend::clear_last_error();
 	initialized_ = true;
+	update_resident_bias();
 	return true;
 }
 
@@ -755,7 +756,33 @@ bool ModelCluster::rebalance_experts() {
 	pool_.run( [&]( int d ) {
 		any[d] = models_[d]->rebalance_experts( streams_[d] ) ? 1 : 0;
 	} );
+	update_resident_bias();
 	return any[0] != 0;
+}
+
+void ModelCluster::update_resident_bias() {
+	const float bias = static_cast<float>( runtime::options().route_resident_bias );
+	if ( bias == 0.0f ) return;
+	std::vector<std::vector<uint8_t>> masks( tp_ );
+	int ok[ENGINE_NUM_GPUS] = {}, l[ENGINE_NUM_GPUS] = {}, e[ENGINE_NUM_GPUS] = {};
+	pool_.run( [&]( int d ) {
+		ok[d] = models_[d]->resident_mask( masks[d], l[d], e[d] ) ? 1 : 0;
+	} );
+	if ( !ok[0] ) return;
+	std::vector<uint8_t> merged( masks[0].size(), 0 );
+	for ( int d = 0; d < tp_; ++d ) {
+		ENGINE_ASSERT( ok[d] && masks[d].size() == merged.size(), "ModelCluster::update_resident_bias: ranks disagree on the tier" );
+		for ( size_t i = 0; i < merged.size(); ++i ) merged[i] |= masks[d][i];
+	}
+	pool_.run( [&]( int d ) {
+		models_[d]->set_resident_bias( merged, bias, streams_[d] );
+	} );
+	if ( !resident_bias_logged_ ) {
+		size_t on = 0;
+		for ( uint8_t m : merged ) on += m;
+		LOG_INFO( "[experts] route_resident_bias %.3f on the %zu resident experts of %d layers\n", bias, on, l[0] );
+		resident_bias_logged_ = true;
+	}
 }
 
 bool ModelCluster::expert_heat( std::vector<std::vector<uint32_t>>& per_rank, int& layers, int& experts ) {

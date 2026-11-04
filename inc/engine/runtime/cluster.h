@@ -93,6 +93,8 @@ public:
 	int sample_one();
 	// Adapts the routed-expert residency (expert_cache) to the routing seen since the last call; false when no model tiers
 	bool rebalance_experts();
+	// route_resident_bias: gives every rank's router the bias for the experts resident on any rank (after a rebalance and at start)
+	void update_resident_bias();
 	// Routed-expert route counts since the previous call, per rank: layers x experts of that rank's partition; false when the model keeps none
 	bool expert_heat( std::vector<std::vector<uint32_t>>& per_rank, int& layers, int& experts );
 
@@ -174,6 +176,7 @@ public:
 private:
 	bool created_ = false;
 	bool initialized_ = false;
+	bool resident_bias_logged_ = false;   // route_resident_bias: the first update logs the table
 	int tp_ = ENGINE_NUM_GPUS;
 	std::unique_ptr<engine::models::ModelPipeline> models_[ENGINE_NUM_GPUS];
 	pod::MemoryArena arenas_[ENGINE_NUM_GPUS] = {};
