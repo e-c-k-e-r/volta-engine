@@ -32,6 +32,9 @@ public:
 
 	// Decodes one row (+ the head's bias) to fp32
 	void decode_row( uint64_t uid, int head, float* out ) const;
+	// Asks the kernel to read the pages of a row (asynchronous readahead): a lookup that requests all its rows first and decodes them after
+	// waits for the reads together instead of one fault after another
+	void prefetch_row( uint64_t uid ) const;
 
 private:
 	void* base_ = nullptr;

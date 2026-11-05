@@ -161,6 +161,16 @@ void NgramTable::row_ids( const int64_t* tokens, uint64_t* uids ) const {
 	}
 }
 
+void NgramTable::prefetch_row( uint64_t uid ) const {
+	const int64_t shard = static_cast<int64_t>( uid ) / rows_per_shard_;
+	const int64_t local = static_cast<int64_t>( uid ) - shard * rows_per_shard_;
+	const uint8_t* p = fp8_ ? shards8_[shard] + local * ROW_DIM : reinterpret_cast<const uint8_t*>( shards_[shard] + local * words_ );
+	const size_t bytes = fp8_ ? ROW_DIM : static_cast<size_t>( words_ ) * sizeof( uint16_t );
+	static const uintptr_t pg = static_cast<uintptr_t>( sysconf( _SC_PAGESIZE ) );
+	const uintptr_t a = reinterpret_cast<uintptr_t>( p ) & ~( pg - 1 ), b = ( reinterpret_cast<uintptr_t>( p ) + bytes + pg - 1 ) & ~( pg - 1 );
+	madvise( reinterpret_cast<void*>( a ), b - a, MADV_WILLNEED );
+}
+
 void NgramTable::decode_row( uint64_t uid, int head, float* out ) const {
 	const int64_t shard = static_cast<int64_t>( uid ) / rows_per_shard_;
 	const int64_t local = static_cast<int64_t>( uid ) - shard * rows_per_shard_;

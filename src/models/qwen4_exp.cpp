@@ -760,11 +760,60 @@ void Qwen4ExpPipeline::embed_tokens( const int* token_ids, int count, backend::s
 	engine::modules::Embedding::forward( embed_table_, d_token_ids_, count, embed_rows_, stream );
 }
 
+namespace {
+
+// ple_log: rank 0's time in ple_prepare per row-count class (decode 1 row, verify blocks 2..MAX_BATCH, prefill chunks), against the time between forwards
+struct PleTimes {
+	using clock = std::chrono::steady_clock;
+	double part[3][4] = {};   // lookup and decode, first barrier, upload and sync, second barrier (ms)
+	double step[3] = {};      // time from this forward's start to the next one's (ms; decode and verify classes)
+	int calls[3] = {};
+	int steps[3] = {};
+	clock::time_point last_start{};
+	int last_cls = -1;
+	static int cls( int m ) { return m == 1 ? 0 : m <= pod::MAX_BATCH ? 1 : 2; }
+	void forward_start( int m ) {
+		const auto now = clock::now();
+		if ( last_cls >= 0 && last_cls < 2 ) {
+			step[last_cls] += std::chrono::duration<double, std::milli>( now - last_start ).count();
+			++steps[last_cls];
+		}
+		last_start = now;
+		last_cls = cls( m );
+	}
+	void add( int m, const clock::time_point* t ) {
+		const int c = cls( m );
+		for ( int i = 0; i < 4; ++i ) part[c][i] += std::chrono::duration<double, std::milli>( t[i + 1] - t[i] ).count();
+		if ( ++calls[c] % 256 != 0 ) return;
+		static const char* name[3] = { "decode (1 row)", "verify (2-8 rows)", "prefill chunks" };
+		const double n = calls[c], tot = part[c][0] + part[c][1] + part[c][2] + part[c][3];
+		if ( c < 2 && steps[c] > 0 ) {
+			LOG_INFO( "[ple] %s: %.3f ms per forward = lookup %.3f + barrier %.3f + upload/sync %.3f + barrier %.3f; %.1f%% of the %.2f ms between forwards (%d forwards)\n",
+				name[c], tot / n, part[c][0] / n, part[c][1] / n, part[c][2] / n, part[c][3] / n, 100.0 * tot / step[c] * steps[c] / n, step[c] / steps[c], calls[c] );
+		}
+		else LOG_INFO( "[ple] %s: %.3f ms per chunk = lookup %.3f + barrier %.3f + upload/sync %.3f + barrier %.3f (%d chunks)\n",
+			name[c], tot / n, part[c][0] / n, part[c][1] / n, part[c][2] / n, part[c][3] / n, calls[c] );
+		for ( double& v : part[c] ) v = 0.0;   // each line covers the last 256 forwards of its class
+		step[c] = 0.0;
+		calls[c] = 0;
+		steps[c] = 0;
+	}
+};
+
+PleTimes& ple_times() {
+	static PleTimes t;
+	return t;
+}
+
+} // namespace
+
 void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t stream ) {
 	ENGINE_ASSERT( weights_loaded_, "Qwen4ExpPipeline::forward: weights not loaded" );
 	ENGINE_ASSERT( rows.count >= 1 && rows.count <= pod::MAX_ROWS, "Qwen4ExpPipeline::forward: row count out of range" );
 	backend::set_device( rank_ );
 	const int m = rows.count;
+	static const bool ple_timing = runtime::options().ple_log;
+	if ( ple_timing && rank_ == 0 ) ple_times().forward_start( m );
 	key_hint_ = rows.pos[m - 1] + 1;
 	lm_mode_ = ( m > pod::MAX_BATCH || ( steer_.capturing() && rows.logits_mode == pod::BatchRows::LOGITS_NONE ) ) ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;   // a probe runs eagerly, so its blocks may skip the head (decode-size blocks otherwise compute every row's logits, which the cluster samples)
 	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
@@ -1053,7 +1102,12 @@ PleHostShare& ple_share() {
 
 } // namespace
 
+
 void Qwen4ExpPipeline::ple_prepare( const pod::BatchRows& rows, int m, backend::stream_t stream ) {
+	static const bool timing = runtime::options().ple_log;
+	const bool timed = timing && rank_ == 0;
+	PleTimes::clock::time_point t[5];
+	if ( timed ) t[0] = PleTimes::clock::now();
 	auto& table = ngram_table();
 	ENGINE_ASSERT( table.is_open() && static_cast<int>( host_tokens_.size() ) >= m, "Qwen4ExpPipeline: n-gram table or token ids missing" );
 	const int eos = 248044;   // text_config eos_token_id: n-grams never span it
@@ -1074,7 +1128,9 @@ void Qwen4ExpPipeline::ple_prepare( const pod::BatchRows& rows, int m, backend::
 	}
 	backend::half_t* shared_emb = tp_ > 1 ? share.emb.data() : emb.data();
 	std::vector<float> row( engine::loader::NgramTable::ROW_DIM );
-	std::vector<uint64_t> uids( table.num_heads() );
+	const int NH = table.num_heads();
+	std::vector<uint64_t> all_uids( static_cast<size_t>( m ) * NH );
+	// this rank's rows: every row id first, their pages requested together (a cold row is a random NVMe read), then the decode
 	for ( int r = ( tp_ > 1 ? rank_ : 0 ); r < m; r += ( tp_ > 1 ? tp_ : 1 ) ) {
 		const int slot = rows.slot[r], pos = rows.pos[r];
 		int64_t tokens[8];
@@ -1082,18 +1138,29 @@ void Qwen4ExpPipeline::ple_prepare( const pod::BatchRows& rows, int m, backend::
 			const bool valid = ( s == 0 ) || ( pos - s >= 0 && pos - hist_seg_[slot][pos] >= s );
 			tokens[s] = valid ? hist_tok_[slot][pos - s] : eos;
 		}
-		table.row_ids( tokens, uids.data() );
-		for ( int h = 0; h < table.num_heads(); ++h ) {
+		table.row_ids( tokens, all_uids.data() + static_cast<size_t>( r ) * NH );
+		for ( int h = 0; h < NH; ++h ) table.prefetch_row( all_uids[static_cast<size_t>( r ) * NH + h] );
+	}
+	for ( int r = ( tp_ > 1 ? rank_ : 0 ); r < m; r += ( tp_ > 1 ? tp_ : 1 ) ) {
+		const uint64_t* uids = all_uids.data() + static_cast<size_t>( r ) * NH;
+		for ( int h = 0; h < NH; ++h ) {
 			table.decode_row( uids[h], h, row.data() );
 			for ( int i = 0; i < engine::loader::NgramTable::ROW_DIM; ++i ) {
 				shared_emb[static_cast<size_t>( r ) * D + static_cast<size_t>( h ) * engine::loader::NgramTable::ROW_DIM + i] = backend::from_float_half( row[i] );
 			}
 		}
 	}
+	if ( timed ) t[1] = PleTimes::clock::now();
 	if ( tp_ > 1 ) share.barrier( tp_ );   // every rank's rows are in
+	if ( timed ) t[2] = PleTimes::clock::now();
 	backend::memcpy_async( ple_emb_.data, shared_emb, static_cast<size_t>( m ) * D * sizeof( backend::half_t ), backend::Copy::H2D, stream );
 	backend::stream_sync( stream );   // the host buffer is reused by the next call
+	if ( timed ) t[3] = PleTimes::clock::now();
 	if ( tp_ > 1 ) share.barrier( tp_ );   // every rank has copied it
+	if ( timed ) {
+		t[4] = PleTimes::clock::now();
+		ple_times().add( m, t );
+	}
 }
 
 void Qwen4ExpPipeline::ple_forward( int m, backend::stream_t stream ) {
