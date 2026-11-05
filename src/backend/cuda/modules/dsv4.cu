@@ -396,6 +396,33 @@ __device__ uint32_t radix_kth( int n, int k, KeyFn key, int* above ) {
 	return s_prefix;
 }
 
+// Exclusive prefix sum of v over the block's threads in thread order (blockDim.x a multiple of 32, at most 1024); *total gets the block's sum.
+// Every thread of the block calls it
+__device__ int block_excl_scan( int v, int* total ) {
+	__shared__ int warp_sum[32];
+	const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+	int x = v;
+	for ( int o = 1; o < 32; o <<= 1 ) {
+		const int y = __shfl_up_sync( 0xffffffff, x, o );
+		if ( lane >= o ) x += y;
+	}
+	if ( lane == 31 ) warp_sum[warp] = x;
+	__syncthreads();
+	if ( warp == 0 ) {
+		int w = lane < nw ? warp_sum[lane] : 0;
+		for ( int o = 1; o < 32; o <<= 1 ) {
+			const int y = __shfl_up_sync( 0xffffffff, w, o );
+			if ( lane >= o ) w += y;
+		}
+		if ( lane < nw ) warp_sum[lane] = w;
+	}
+	__syncthreads();
+	const int base = warp > 0 ? warp_sum[warp - 1] : 0;
+	*total = warp_sum[nw - 1];
+	__syncthreads();   // warp_sum is reused by the next call
+	return base + x - v;
+}
+
 // One block (1024 threads) per row. cand_mode 1: mark the best cand_blocks blocks (by their best score; the newest block always) in cand[row];
 // cand_mode 2: entries outside cand[row] do not compete. Then the TOPK best entries into sel[row]
 __global__ __launch_bounds__( 1024 )
@@ -429,14 +456,16 @@ void index_select_kernel( float* __restrict__ scores, uint8_t* __restrict__ cand
 			};
 			int above = 0;
 			const uint32_t th = radix_kth( nb, cand_blocks, bkey, &above );
-			__shared__ int ties;
-			if ( threadIdx.x == 0 ) ties = 0;
-			__syncthreads();
-			for ( int b = threadIdx.x; b < nb; b += blockDim.x ) {
-				const uint32_t k = bkey( b );
-				uint8_t keep = k > th;
-				if ( k == th ) keep = atomicAdd( &ties, 1 ) < cand_blocks - above;
-				cm[b] = keep;
+			// blocks tied at the threshold: the lowest indices fill the remaining places (in block order, so every run keeps the same ones)
+			int ties_seen = 0;
+			for ( int b0 = 0; b0 < nb; b0 += blockDim.x ) {
+				const int b = b0 + threadIdx.x;
+				const uint32_t k = b < nb ? bkey( b ) : 0u;
+				const int tie = b < nb && k == th;
+				int tie_total;
+				const int rank = ties_seen + block_excl_scan( tie, &tie_total );
+				if ( b < nb ) cm[b] = ( k > th || ( tie && rank < cand_blocks - above ) ) ? 1 : 0;
+				ties_seen += tie_total;
 			}
 			__syncthreads();
 		}
@@ -447,16 +476,21 @@ void index_select_kernel( float* __restrict__ scores, uint8_t* __restrict__ cand
 	};
 	int above = 0;
 	const uint32_t th = radix_kth( n, DSV4::TOPK, ekey, &above );
-	__shared__ int cnt, ties;
-	if ( threadIdx.x == 0 ) { cnt = 0; ties = 0; }
-	__syncthreads();
-	for ( int i = threadIdx.x; i < n; i += blockDim.x ) {
-		const uint32_t k = ekey( i );
-		if ( k == 0u ) continue;
-		if ( k > th ) out[atomicAdd( &cnt, 1 )] = i;
-		else if ( k == th && atomicAdd( &ties, 1 ) < DSV4::TOPK - above ) out[atomicAdd( &cnt, 1 )] = i;
+	// the selection in ascending entry order, ties at the threshold to the lowest entries: the same list every run, so the attention sums
+	// over it in the same order
+	int cnt = 0, ties_seen = 0;
+	for ( int i0 = 0; i0 < n; i0 += blockDim.x ) {
+		const int i = i0 + threadIdx.x;
+		const uint32_t k = i < n ? ekey( i ) : 0u;
+		const int tie = k != 0u && k == th;
+		int tie_total, keep_total;
+		const int rank = ties_seen + block_excl_scan( tie, &tie_total );
+		const int keep = k != 0u && ( k > th || ( tie && rank < DSV4::TOPK - above ) );
+		const int at = cnt + block_excl_scan( keep, &keep_total );
+		if ( keep ) out[at] = i;
+		cnt += keep_total;
+		ties_seen += tie_total;
 	}
-	__syncthreads();
 	if ( threadIdx.x == 0 ) nsel[r] = cnt;
 }
 
