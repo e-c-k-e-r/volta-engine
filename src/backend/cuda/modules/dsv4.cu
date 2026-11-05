@@ -471,7 +471,7 @@ template <int HPW>
 __global__ __launch_bounds__( ATT_THREADS )
 void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, const half* __restrict__ comp_kv, const int* __restrict__ sel, const int* __restrict__ nsel,
 	const float* __restrict__ sink, const float2* __restrict__ rope, half* __restrict__ o, int nh, int layer, int rows_n, const pod::BatchRows* __restrict__ rows,
-	size_t ring_slot_stride, size_t comp_slot_stride, float* __restrict__ ws ) {
+	size_t ring_slot_stride, size_t comp_slot_stride, float* __restrict__ ws, int win_floor ) {
 	extern __shared__ half2 att_smem[];
 	half2* qs = att_smem;                       // [nh][HD / 2]
 	half2* ks = att_smem + nh * ( HD / 2 );     // [ATT_TILE][HD / 2]
@@ -487,7 +487,7 @@ void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, c
 	}
 	const half* wring = ring + static_cast<size_t>( rows->slot[r] ) * ring_slot_stride + static_cast<size_t>( layer ) * DSV4::RING * HD;
 	const half* cbase = comp_kv ? comp_kv + static_cast<size_t>( rows->slot[r] ) * comp_slot_stride : nullptr;
-	const int w0 = max( 0, pos - DSV4::WINDOW + 1 );
+	const int w0 = max( max( 0, win_floor ), pos - DSV4::WINDOW + 1 );
 	const int n_win = pos - w0 + 1;
 	const int n_cmp = comp_kv ? nsel[r] : 0;
 	const int* srow = comp_kv ? sel + static_cast<size_t>( r ) * DSV4::TOPK : nullptr;
@@ -905,7 +905,7 @@ void DSV4::indexer( const half* q, const half* w, const half* idx_k, float* scor
 }
 
 void DSV4::attend( const half* q, const half* ring, const half* comp_kv, const int* sel, const int* nsel, const float* sink, const float* rope_f, half* o, int nh,
-	int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride, size_t comp_slot_stride, float* ws, cudaStream_t stream ) {
+	int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride, size_t comp_slot_stride, float* ws, cudaStream_t stream, int win_floor ) {
 	const float2* rope = reinterpret_cast<const float2*>( rope_f );
 	const size_t smem = static_cast<size_t>( nh + ATT_TILE ) * ( HD / 2 ) * sizeof( half2 );
 	ENGINE_ASSERT( nh == 8 || nh == 16 || nh == 32, "DSV4::attend: heads per rank must be 8, 16 or 32" );
@@ -922,9 +922,9 @@ void DSV4::attend( const half* q, const half* ring, const half* comp_kv, const i
 		if ( !attr[dev] ) { cudaFuncSetAttribute( attend_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024 ); attr[dev] = true; }
 	}
 	switch ( nh / 8 ) {
-		case 1: attend_kernel<1><<<grid, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride, wsp ); break;
-		case 2: attend_kernel<2><<<grid, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride, wsp ); break;
-		default: attend_kernel<4><<<grid, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride, wsp ); break;
+		case 1: attend_kernel<1><<<grid, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride, wsp, win_floor ); break;
+		case 2: attend_kernel<2><<<grid, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride, wsp, win_floor ); break;
+		default: attend_kernel<4><<<grid, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride, wsp, win_floor ); break;
 	}
 	if ( nsplit > 1 ) {
 		switch ( nh / 8 ) {

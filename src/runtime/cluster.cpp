@@ -381,6 +381,7 @@ int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Ca
 	// A model that prefills several chunks layer by layer (prefill_window) takes up to that many consecutive chunks at once; a chunk at the decode
 	// sizes (the tail of a prompt) and prompts with images go the ordinary way
 	const int window = ( mm_slots_ == 0 && chunk > pod::MAX_BATCH ) ? models_[0]->window_chunks() : 1;
+	for ( int d = 0; d < tp_; ++d ) models_[d]->set_prefill_end( pos0 + count );
 	for ( int pos = 0; pos < count; ) {
 		int n = 0;
 		pod::BatchRows win[16];
@@ -417,6 +418,7 @@ int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Ca
 		if ( runner_ ) runner_->on_prefill_chunk( slot, tokens + pos, last_rows, pos0 + pos );
 		pos += last_rows;
 	}
+	for ( int d = 0; d < tp_; ++d ) models_[d]->set_prefill_end( -1 );
 	// A final chunk above the decode sizes computed logits for its last row only (in row 0).
 	const int rows = ( last_rows > pod::MAX_BATCH ) ? 1 : last_rows;
 	int preds[pod::MAX_BATCH];

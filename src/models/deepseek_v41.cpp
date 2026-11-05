@@ -49,6 +49,7 @@ pod::TensorView g_embed_table;   // host BF16 [vocab, hidden], shared by the ran
 // table indices idx (same layout). The scale tables (8 bytes a row) are held in memory, once for all ranks
 struct EngramStage {
 	int slot = -1, from = 0, rows = 0;
+	uint64_t key = 0;                    // stage_key of idx: a later prompt that starts at the same slot and position has other rows
 	bool ready = false;
 	std::vector<int64_t> idx;
 	std::vector<uint8_t> raw;
@@ -59,9 +60,18 @@ std::vector<std::shared_ptr<EngramStage>> g_stages;
 std::once_flag g_scale_once[2];
 std::vector<uint8_t> g_scale_mem[2];
 
-std::shared_ptr<EngramStage> stage_find( int slot, int from ) {
+// FNV-1a over table-row ids, continued from `h` (a window folds its chunks in order)
+uint64_t stage_key( const int64_t* idx, size_t n, uint64_t h = 1469598103934665603ull ) {
+	for ( size_t i = 0; i < n; ++i ) {
+		uint64_t v = static_cast<uint64_t>( idx[i] );
+		for ( int b = 0; b < 8; ++b, v >>= 8 ) h = ( h ^ ( v & 0xff ) ) * 1099511628211ull;
+	}
+	return h;
+}
+
+std::shared_ptr<EngramStage> stage_find( int slot, int from, uint64_t key ) {
 	std::lock_guard<std::mutex> lk( g_stage_mu );
-	for ( auto& s : g_stages ) if ( s->slot == slot && s->from == from ) return s;
+	for ( auto& s : g_stages ) if ( s->slot == slot && s->from == from && s->key == key ) return s;
 	return nullptr;
 }
 
@@ -71,11 +81,11 @@ void stage_add( const std::shared_ptr<EngramStage>& s ) {
 	g_stages.push_back( s );
 }
 
-std::shared_ptr<EngramStage> stage_wait( int slot, int from ) {
+std::shared_ptr<EngramStage> stage_wait( int slot, int from, uint64_t key ) {
 	std::unique_lock<std::mutex> lk( g_stage_mu );
 	std::shared_ptr<EngramStage> found;
 	const bool ok = g_stage_cv.wait_for( lk, std::chrono::seconds( 600 ), [&]() {
-		for ( auto& s : g_stages ) if ( s->slot == slot && s->from == from && s->ready ) { found = s; return true; }
+		for ( auto& s : g_stages ) if ( s->slot == slot && s->from == from && s->key == key && s->ready ) { found = s; return true; }
 		return false;
 	} );
 	ENGINE_ASSERT( ok, "DeepseekV41Pipeline: the Engram rows of a prefill window were never read" );
@@ -517,7 +527,27 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 	sh_u_ = dev_tensor( arena, pod::DType::FP16, R, config_.intermediate_size );
 	sh_i_ = dev_tensor( arena, pod::DType::FP16, R, config_.intermediate_size );
 	idx_scores_ = dev_alloc<float>( arena, static_cast<size_t>( DSV4::SCORE_ROWS ) * max_cap, false );
-	idx_cand_ = dev_alloc<uint8_t>( arena, static_cast<size_t>( R ) * ( max_cap / config_.candidate_block ) );
+	cand_row_bytes_ = static_cast<size_t>( max_cap / config_.candidate_block );
+	// prefill truncation: from the first layer that reads the shared compressed KV of a ratio-1 source on, nothing a later row needs comes from an
+	// earlier row except that source's KV and index keys and each layer's window; it needs no KV source and no Engram layer after that layer
+	if ( runtime::options().prefill_truncate != 0 ) {
+		const auto& cr = config_.compress_ratios;
+		int b = -1;
+		for ( int l = 0; l < config_.num_layers && b < 0; ++l ) if ( cr[l] == 1 ) b = l;
+		bool ok = b > 0;
+		for ( int s : config_.kv_sources ) ok = ok && s <= b;
+		for ( int e : config_.engram_layers ) ok = ok && e < b;
+		if ( ok && std::find( config_.kv_sources.begin(), config_.kv_sources.end(), b ) != config_.kv_sources.end() ) {
+			trunc_layer_ = b;
+			// exact (-1): each layer after b reads one window further back than the one before (b's own window entries are written for every row)
+			const int exact = ( config_.num_layers - b - 1 ) * ( DSV4::WINDOW - 1 ) + DSV4::WINDOW;
+			trunc_keep_ = runtime::options().prefill_truncate < 0 ? exact : std::max( runtime::options().prefill_truncate, DSV4::WINDOW );
+			if ( rank_ == 0 ) LOG_INFO( "[prefill] truncation: layers %d-%d run the last %d rows of a prefill call (%s)\n", b, config_.num_layers - 1, trunc_keep_,
+				trunc_keep_ >= exact ? "exact" : "approximate" );
+		}
+		else if ( rank_ == 0 ) LOG_WARN( "[prefill] prefill_truncate ignored: the layer layout does not allow it\n" );
+	}
+	idx_cand_ = dev_alloc<uint8_t>( arena, static_cast<size_t>( R ) * cand_row_bytes_ );
 	idx_sel_ = dev_alloc<int>( arena, static_cast<size_t>( R ) * DSV4::TOPK );
 	idx_nsel_ = dev_alloc<int>( arena, R );
 	d_img_flag_ = dev_alloc<uint8_t>( arena, R );
@@ -1239,7 +1269,7 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 	if ( phases & 1 ) {
 	eg_.rows_c[chunk] = m;
 	if ( phases == 1 ) {   // a window: where this chunk's rows start in the window's staging
-		if ( chunk == 0 ) { eg_.win_slot = rows.slot[0]; eg_.win_from = rows.pos[0]; eg_.chunk_off[0] = 0; }
+		if ( chunk == 0 ) { eg_.win_slot = rows.slot[0]; eg_.win_from = rows.pos[0]; eg_.chunk_off[0] = 0; eg_.win_key = stage_key( nullptr, 0 ); }
 		else eg_.chunk_off[chunk] = eg_.chunk_off[chunk - 1] + eg_.rows_c[chunk - 1];
 	}
 	idx.resize( static_cast<size_t>( m ) * eg_.layers * per );
@@ -1256,6 +1286,7 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 		}
 		engram_hash( toks, idx.data() + static_cast<size_t>( r ) * eg_.layers * per );
 	}
+	if ( phases == 1 ) eg_.win_key = stage_key( idx.data(), idx.size(), eg_.win_key );
 	// 2. the rows' pages are requested all at once (the tables are far larger than the page cache: a miss is an NVMe read, and serial
 	// faults cost ~1 ms each; asked together they overlap)
 	const uintptr_t pg = static_cast<uintptr_t>( eg_.page );
@@ -1271,7 +1302,7 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 	lap( 0 );
 	if ( !( phases & 2 ) ) return;
 	std::shared_ptr<EngramStage> stage;   // a window: the rows rank 0 read ahead
-	if ( phases == 2 ) stage = stage_wait( eg_.win_slot, eg_.win_from );
+	if ( phases == 2 ) stage = stage_wait( eg_.win_slot, eg_.win_from, eg_.win_key );
 	lap( 1 );
 	// 3. gather and dequantize (FP8 with a power-of-two scale per block)
 	for ( int r = 0; r < m; ++r ) {
@@ -1338,10 +1369,11 @@ void DeepseekV41Pipeline::engram_stage_start( const pod::BatchRows* chunks, int 
 	const int N = eg_.ngram, NH = eg_.heads, per = ( N - 1 ) * NH, D = eg_.dim, L = eg_.layers;
 	const int slot = chunks[0].slot[0], from = chunks[0].pos[0];
 	std::vector<std::shared_ptr<EngramStage>> todo;
-	if ( !stage_find( slot, from ) ) {
+	if ( !stage_find( slot, from, eg_.win_key ) ) {
 		auto s = std::make_shared<EngramStage>();
 		s->slot = slot;
 		s->from = from;
+		s->key = eg_.win_key;
 		for ( int c = 0; c < n; ++c ) s->idx.insert( s->idx.end(), eg_.idx[c].begin(), eg_.idx[c].begin() + static_cast<size_t>( eg_.rows_c[c] ) * L * per );
 		s->rows = static_cast<int>( s->idx.size() / ( static_cast<size_t>( L ) * per ) );
 		stage_add( s );
@@ -1367,6 +1399,7 @@ void DeepseekV41Pipeline::engram_stage_start( const pod::BatchRows* chunks, int 
 			}
 			engram_hash( toks, s->idx.data() + static_cast<size_t>( r ) * L * per );
 		}
+		s->key = stage_key( s->idx.data(), s->idx.size() );
 		stage_add( s );
 		todo.push_back( s );
 	}
@@ -1432,6 +1465,9 @@ void DeepseekV41Pipeline::forward( const pod::BatchRows& rows, backend::stream_t
 	ENGINE_ASSERT( last_rows_ <= logit_rows_, "DeepseekV41Pipeline::forward: more logit rows than the buffer holds" );
 	set_rows( m );
 	tap_floor_ = m > pod::MAX_BATCH ? std::max( 0, rows.pos[m - 1] - DSV4::WINDOW + 1 ) : 0;   // decode blocks never wrap the tap ring (and run from a graph)
+	cur_rows_ = &rows;
+	trunc_k0_ = trunc_from( rows );
+	ENGINE_ASSERT( trunc_k0_ < m || lm_mode_ == pod::BatchRows::LOGITS_NONE, "DeepseekV41Pipeline::forward: a truncated chunk dropped the row that wants logits" );
 	sync_image_flags( stream );
 	engram_prepare( rows, stream );
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
@@ -1483,6 +1519,38 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 		return m;
 	};
 	auto unbind = [&]( int c ) { win_[c].pre_cur = pre_cur_; };
+	// prefill truncation: from trunc_layer_ on a chunk runs its rows from k0[c] on, packed at off2[c] in the window buffers
+	int k0[16] = {}, off2[17] = {};
+	bool trunc = false;
+	for ( int c = 0; c < n; ++c ) {
+		k0[c] = trunc_from( chunks[c] );
+		trunc = trunc || k0[c] > 0;
+		off2[c + 1] = off2[c] + chunks[c].count - k0[c];
+	}
+	ENGINE_ASSERT( !trunc || k0[n - 1] < chunks[n - 1].count || chunks[n - 1].logits_mode == pod::BatchRows::LOGITS_NONE,
+		"DeepseekV41Pipeline::forward_window: a truncated chunk dropped the row that wants logits" );
+	auto bind_kept = [&]( int c ) {
+		const int k = k0[c], m = chunks[c].count - k;
+		WinChunk& w = win_[c];
+		streams_.data = static_cast<float*>( w.streams ) + static_cast<size_t>( k ) * 4 * H;
+		pre_[0] = w.pre[0] + 4 * k;
+		pre_[1] = w.pre[1] + 4 * k;
+		pre_cur_ = w.pre_cur;
+		mhc_post_.data = w.post + 4 * k;
+		mhc_comb_.data = w.comb + 16 * k;
+		idx_sel_ = w.sel + static_cast<size_t>( k ) * DSV4::TOPK;
+		idx_nsel_ = w.nsel + k;
+		idx_cand_ = w.cand + static_cast<size_t>( k ) * cand_row_bytes_;
+		norm_x_.data = win_norm_.ptr<char>() + static_cast<size_t>( off2[c] ) * row_bytes;
+		moe_out_.data = win_moe_out_.ptr<char>() + static_cast<size_t>( off2[c] ) * row_bytes;
+		moe_tmp_.data = win_moe_tmp_.ptr<char>() + static_cast<size_t>( off2[c] ) * row_bytes;
+		d_topk_idx_ = win_topk_idx_ + static_cast<size_t>( off2[c] ) * K;
+		d_topk_w_ = win_topk_w_ + static_cast<size_t>( off2[c] ) * K;
+		set_rows( m );
+		key_hint_ = chunks[c].pos[chunks[c].count - 1] + 1;
+		upload_sub_rows( chunks[c], k, chunks[c].count, stream );
+		return m;
+	};
 	const pod::BatchRows& last = chunks[n - 1];
 	tap_floor_ = std::max( 0, last.pos[last.count - 1] - DSV4::WINDOW + 1 );
 	lm_mode_ = last.logits_mode;
@@ -1504,6 +1572,47 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 	sync_image_flags( stream );   // every chunk is text: clears the flags an image prefill left
 	for ( int l = 0; l < config_.num_layers; ++l ) {
 		auto& lw = layers_[l];
+		if ( trunc && l >= trunc_layer_ ) {
+			if ( l == trunc_layer_ ) {
+				// the rows before the kept tail stop here, after writing what the kept rows read of this layer
+				for ( int c = 0; c < n; ++c ) {
+					if ( k0[c] == 0 ) continue;
+					bind( c );
+					upload_sub_rows( chunks[c], 0, k0[c], stream );
+					set_rows( k0[c] );
+					attention_kv( l, lw, k0[c], stream );
+					unbind( c );
+				}
+				win_floor_ = prefill_end_ - trunc_keep_;
+			}
+			for ( int c = 0; c < n; ++c ) {
+				if ( k0[c] == chunks[c].count ) continue;
+				const int m = bind_kept( c );
+				if ( ds_.loaded && l >= ds_.tap0 && l < ds_.tap0 + ds_.taps )
+					DSV4::tap_store( streams_.ptr<const float>(), ds_.tap_ring, l - ds_.tap0, ds_.taps, H, kTapScale, tap_floor_, m, d_rows_, ds_.tap_stride, stream );
+				attention( l, lw, m, stream );
+				ffn_front( lw, m, stream );
+				unbind( c );
+			}
+			norm_x_.data = win_norm_.data;
+			norm_x_.shape[0] = off2[n];
+			moe_out_.data = win_moe_out_.data;
+			moe_out_.shape[0] = off2[n];
+			moe_tmp_.data = win_moe_tmp_.data;
+			moe_tmp_.shape[0] = off2[n];
+			d_topk_idx_ = win_topk_idx_;
+			d_topk_w_ = win_topk_w_;
+			ffn_experts( lw, off2[n], stream );
+			for ( int c = 0; c < n; ++c ) {
+				if ( k0[c] == chunks[c].count ) continue;
+				const int m = bind_kept( c );
+				ffn_back( lw, m, stream );
+				engine::modules::HyperConnection::update( streams_, moe_out_, mhc_post_, mhc_comb_, H, stream, m );
+				steer_layer( l, m, stream );
+				unbind( c );
+			}
+			continue;
+		}
 		for ( int c = 0; c < n; ++c ) {
 			const int m = bind( c );
 			if ( lw.engram >= 0 ) {
@@ -1537,7 +1646,8 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 			unbind( c );
 		}
 	}
-	forward_head( bind( n - 1 ), stream );
+	forward_head( trunc ? bind_kept( n - 1 ) : bind( n - 1 ), stream );
+	win_floor_ = 0;
 
 	if ( runtime::options().expert_log ) {
 		LOG_INFO( "[engram rank %d] window of %d rows: hashes + page requests %.0f ms, waiting for the page-request thread %.0f ms, gather + dequantize %.0f ms\n", rank_, total, eg_.t_ms[0], eg_.t_ms[1], eg_.t_ms[2] );
@@ -1593,13 +1703,37 @@ void DeepseekV41Pipeline::trace_tensor( int tag, const pod::TensorView& t, int m
 	}
 }
 
+void DeepseekV41Pipeline::upload_sub_rows( const pod::BatchRows& rows, int a, int b, backend::stream_t stream ) {
+	sub_rows_ = pod::BatchRows{};
+	sub_rows_.count = b - a;
+	sub_rows_.logits_mode = rows.logits_mode;
+	for ( int i = a; i < b; ++i ) {
+		sub_rows_.slot[i - a] = rows.slot[i];
+		sub_rows_.pos[i - a] = rows.pos[i];
+	}
+	backend::memcpy_async( d_rows_, &sub_rows_, sub_rows_.upload_bytes(), backend::Copy::H2D, stream );
+}
+
 void DeepseekV41Pipeline::forward_body( int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size;
 	engine::modules::HyperConnection::init_streams( embed_rows_, streams_, H, stream, m );
 	DSV4::hc_identity_pre( pre_[0], m, stream );
 	pre_cur_ = 0;
+	const int k0 = trunc_k0_;
 	for ( int l = 0; l < config_.num_layers; ++l ) {
 		auto& lw = layers_[l];
+		if ( l == trunc_layer_ && k0 > 0 ) {
+			// prefill truncation: the rows before the kept tail stop here, after writing what the kept rows read of this layer
+			upload_sub_rows( *cur_rows_, 0, k0, stream );
+			set_rows( k0 );
+			attention_kv( l, lw, k0, stream );
+			if ( k0 == m ) return;   // nothing of this chunk runs further (and it wants no logits)
+			shift_rows( k0 );
+			upload_sub_rows( *cur_rows_, k0, m, stream );
+			m -= k0;
+			set_rows( m );
+			win_floor_ = prefill_end_ - trunc_keep_;
+		}
 		if ( lw.engram >= 0 ) {
 			engine::modules::Linear::forward( e_rows_[lw.engram], lw.e_wkv, e_kv_, stream );
 			DSV4::engram_gate( streams_.ptr<float>(), e_kv_.ptr<const backend::half_t>(), lw.e_w.ptr<const float>(), d_img_flag_, H, config_.norm_eps, m, stream );
@@ -1613,6 +1747,10 @@ void DeepseekV41Pipeline::forward_body( int m, backend::stream_t stream ) {
 		trace( l, m, stream );
 	}
 	forward_head( m, stream );
+	if ( k0 > 0 ) {
+		shift_rows( -k0 );
+		win_floor_ = 0;
+	}
 }
 
 void DeepseekV41Pipeline::forward_head( int m, backend::stream_t stream ) {
@@ -1639,6 +1777,54 @@ void DeepseekV41Pipeline::steer_penalize( pod::TensorView& logits, int row0, int
 
 void DeepseekV41Pipeline::steer_layer( int L, int m, backend::stream_t stream ) {
 	steer_.layer_streams( streams_.ptr<float>(), d_rows_, m, L, stream );
+}
+
+int DeepseekV41Pipeline::trunc_from( const pod::BatchRows& rows ) const {
+	if ( trunc_layer_ < 0 || prefill_end_ < 0 || rows.count <= pod::MAX_BATCH || rows.mrope || rows.logits_mode == pod::BatchRows::LOGITS_ALL ) return 0;
+	const int keep_pos = prefill_end_ - trunc_keep_;
+	int k = 0;
+	while ( k < rows.count && rows.pos[k] < keep_pos ) ++k;
+	return k;
+}
+
+void DeepseekV41Pipeline::shift_rows( int k ) {
+	const ptrdiff_t d = k;
+	streams_.data = streams_.ptr<float>() + d * 4 * config_.hidden_size;
+	pre_[0] += d * 4;
+	pre_[1] += d * 4;
+	mhc_post_.data = mhc_post_.ptr<float>() + d * 4;
+	mhc_comb_.data = mhc_comb_.ptr<float>() + d * 16;
+	idx_sel_ += d * DSV4::TOPK;
+	idx_nsel_ += d;
+	idx_cand_ += d * static_cast<ptrdiff_t>( cand_row_bytes_ );
+	d_img_flag_ += d;
+}
+
+// Rows of a truncated prefill that skip the layers from this one on: only what the kept rows read of them, this layer's window entries and,
+// as the KV source, its compressed KV and index keys. The pre-mix toggle is left alone (these rows go no further)
+void DeepseekV41Pipeline::attention_kv( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
+	using engine::modules::Linear;
+	using engine::modules::RMSNorm;
+	const int H = config_.hidden_size;
+	const float eps = config_.norm_eps;
+	pod::TensorView pre_view = pod::make_tensor_2d( pre_[pre_cur_ ^ 1], pod::DType::FP32, 1, 4 * m );
+	engine::modules::HyperConnection::collapse( streams_, lw.hc_attn_fn, lw.hc_attn_base, lw.hc_attn_scale, collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_,
+		pre_view, H, config_.hc_sinkhorn_iters, config_.hc_eps, stream, m );
+	DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], lw.attn_norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), mhc_post_.ptr<float>(),
+		kOutScale, H, eps, m, stream );
+	const float* rope = lw.ratio > 0 ? rope_comp_ : rope_plain_;
+	lin_fwd( norm_x_, lw.wkv, kv_, fp8_scratch_, stream );
+	RMSNorm::forward( kv_, lw.kv_norm, kv_n_, eps, 0.0f, stream );
+	DSV4::window_store( kv_n_.ptr<const backend::half_t>(), win_ring_, rope, layer, m, d_rows_, win_slot_stride_, stream );
+	if ( lw.ratio > 0 && lw.is_kv_source ) {
+		const int s = lw.kv_src;
+		Linear::forward( norm_x_, lw.c_wkv, ckv_, stream );
+		if ( lw.ratio > 1 ) Linear::forward( norm_x_, lw.c_wgate, csc_, stream );
+		DSV4::compress( ckv_.ptr<const backend::half_t>(), csc_.ptr<const backend::half_t>(), lw.c_norm.ptr<const backend::half_t>(), cring_kv_[s], cring_sc_[s],
+			latent_.ptr<backend::half_t>(), comp_kv_[s], rope, lw.ratio, m, d_rows_, cring_slot_stride_, comp_slot_stride_[s], eps, stream );
+		Linear::forward( latent_, lw.idx_wk, kraw_, stream );
+		DSV4::index_key_store( kraw_.ptr<const backend::half_t>(), lw.idx_knorm.ptr<const backend::half_t>(), idx_k_[s], rope, lw.ratio, m, d_rows_, idx_slot_stride_[s], eps, stream );
+	}
 }
 
 void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
@@ -1686,7 +1872,7 @@ void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int
 		comp = comp_kv_[s];
 	}
 	DSV4::attend( q_.ptr<const backend::half_t>(), win_ring_, comp, idx_sel_, idx_nsel_, lw.sink.ptr<const float>(), rope, o_g_.ptr<backend::half_t>(), lh_, layer, m, d_rows_,
-		win_slot_stride_, lw.ratio > 0 ? comp_slot_stride_[lw.kv_src] : 0, m <= pod::MAX_BATCH ? attend_ws_ : nullptr, stream );
+		win_slot_stride_, lw.ratio > 0 ? comp_slot_stride_[lw.kv_src] : 0, m <= pod::MAX_BATCH ? attend_ws_ : nullptr, stream, layer > trunc_layer_ ? win_floor_ : 0 );
 	const int G = DSV4::GROUP_HEADS * DSV4::HD, O = config_.o_lora_rank;
 	for ( int g = 0; g < gl_; ++g ) {
 		pod::TensorView in = view( o_g_, static_cast<size_t>( g ) * m * G, m, G );

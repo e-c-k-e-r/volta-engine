@@ -109,6 +109,8 @@ public:
 	// The prompt tokens of the window that will follow the next forward_window call (a model with host-side lookups starts fetching them early; the
 	// pointer must stay valid until that call returns)
 	virtual void set_prefetch_hint( const int* tokens, int count, int slot, int pos0 ) { (void) tokens; (void) count; (void) slot; (void) pos0; }
+	// The position a prefill call ends at (its last token + 1), -1 after it; prefill truncation keeps the rows before this end
+	virtual void set_prefill_end( int end ) { (void) end; }
 
 	// 3. Forward over embedded rows
 	virtual void forward( const pod::BatchRows& rows, backend::stream_t stream = nullptr ) = 0;
