@@ -1,7 +1,8 @@
 // Compares the engine tokenizer with reference token ids (HF tokenizers).
 //   test_tokenizer_file <model_dir> <text file> <reference ids.json>   one file against a JSON array of ids
 //   test_tokenizer_file <model_dir> --cases <cases.json>               [{"text", "ids"}] fixtures (tests/data/tokenizer_cases_*.json)
-//   test_tokenizer_file <model_dir> --time <text file> [ids out.bin]   encode time of one file, optionally dumping the ids (int32) to compare runs
+//   test_tokenizer_file <model_dir> --time <text file> [ids out.bin]   encode time of one file, and of a second encode from the stretch cache,
+//                                                                      optionally dumping the ids (int32) to compare runs
 #include "engine/loader/tokenizer.h"
 
 #define JSON_NOEXCEPTION 1
@@ -31,6 +32,10 @@ int main( int argc, char** argv ) {
 		const std::vector<int> ids = tok.encode( text, false );
 		const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
 		std::printf( "%zu bytes -> %zu tokens in %.1f ms\n", text.size(), ids.size(), ms );
+		const auto t1 = std::chrono::steady_clock::now();
+		const std::vector<int> again = tok.encode( text, false );   // the long stretches now come from the tokenizer's cache
+		std::printf( "again (cached stretches): %.1f ms, %s\n", std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t1 ).count(),
+			again == ids ? "same ids" : "IDS DIFFER" );
 		if ( argc > 4 ) {
 			std::ofstream of( argv[4], std::ios::binary );
 			of.write( reinterpret_cast<const char*>( ids.data() ), static_cast<std::streamsize>( ids.size() * sizeof( int ) ) );

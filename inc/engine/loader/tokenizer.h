@@ -3,6 +3,7 @@
 #include "engine/config.h"
 #include <string>
 #include <vector>
+#include <mutex>
 #include <unordered_map>
 #include <cstdint>
 
@@ -53,6 +54,12 @@ private:
 
 	std::unordered_map<std::string, int> vocab_;
 	std::unordered_map<std::string, int> special_tokens_;
+	// encode: the ids of long text stretches between special tokens, by their text (an agent's next prompt repeats every earlier message;
+	// each stretch is encoded on its own, so a cached one is exact); cleared when it outgrows its budget
+	std::vector<int> encode_segment_cached( const std::string& text, size_t pos, size_t len ) const;
+	mutable std::mutex seg_mu_;
+	mutable std::unordered_map<std::string, std::vector<int>> seg_cache_;
+	mutable size_t seg_bytes_ = 0;
 	std::vector<std::string> id_to_token_;
 	std::vector<std::string> decoded_tokens_;
 	std::vector<bool> is_special_;

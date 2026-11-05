@@ -846,6 +846,27 @@ std::vector<int> Tokenizer::encode_text_segment( const std::string& text ) const
 	return result;
 }
 
+std::vector<int> Tokenizer::encode_segment_cached( const std::string& text, size_t pos, size_t len ) const {
+	constexpr size_t kMinBytes = 256, kBudget = size_t( 256 ) << 20;
+	if ( len < kMinBytes ) return encode_text_segment( text.substr( pos, len ) );
+	std::string key = text.substr( pos, len );
+	{
+		std::lock_guard<std::mutex> lk( seg_mu_ );
+		const auto it = seg_cache_.find( key );
+		if ( it != seg_cache_.end() ) return it->second;
+	}
+	std::vector<int> ids = encode_text_segment( key );
+	std::lock_guard<std::mutex> lk( seg_mu_ );
+	const size_t cost = key.size() + ids.size() * sizeof( int ) + 64;
+	if ( seg_bytes_ + cost > kBudget ) {
+		seg_cache_.clear();
+		seg_bytes_ = 0;
+	}
+	seg_bytes_ += cost;
+	seg_cache_.emplace( std::move( key ), ids );
+	return ids;
+}
+
 std::vector<int> Tokenizer::encode( const std::string& text, bool add_special ) const {
 	std::vector<int> result;
 	if ( text.empty() ) return result;
@@ -854,30 +875,43 @@ std::vector<int> Tokenizer::encode( const std::string& text, bool add_special ) 
 		result.push_back( bos_token_id_ );
 	}
 
+	// Each special token's next occurrence at or after pos, searched again only once pos has passed it (searching every token from every
+	// match was quadratic in the number of matches on long prompts)
+	std::vector<std::pair<const std::pair<const std::string, int>*, size_t>> next;
+	next.reserve( special_tokens_.size() );
+	for ( const auto& st : special_tokens_ ) {
+		const size_t p = text.find( st.first );
+		if ( p != std::string::npos ) next.push_back( { &st, p } );
+	}
 	size_t pos = 0;
 	while ( pos < text.size() ) {
 		size_t best_pos = std::string::npos;
 		size_t best_len = 0;
 		int best_id = -1;
 
-		for ( const auto& st : special_tokens_ ) {
-			size_t p = text.find( st.first, pos );
-			if ( p != std::string::npos ) {
-				if ( p < best_pos || ( p == best_pos && st.first.size() > best_len ) ) {
-					best_pos = p;
-					best_len = st.first.size();
-					best_id = st.second;
-				}
+		for ( size_t k = 0; k < next.size(); ) {
+			auto& [st, p] = next[k];
+			if ( p < pos ) p = text.find( st->first, pos );
+			if ( p == std::string::npos ) {
+				next[k] = next.back();
+				next.pop_back();
+				continue;
 			}
+			if ( p < best_pos || ( p == best_pos && st->first.size() > best_len ) ) {
+				best_pos = p;
+				best_len = st->first.size();
+				best_id = st->second;
+			}
+			++k;
 		}
 
 		if ( best_pos == std::string::npos ) {
-			auto seg_toks = encode_text_segment( text.substr( pos ) );
+			auto seg_toks = encode_segment_cached( text, pos, text.size() - pos );
 			result.insert( result.end(), seg_toks.begin(), seg_toks.end() );
 			break;
 		} else {
 			if ( best_pos > pos ) {
-				auto seg_toks = encode_text_segment( text.substr( pos, best_pos - pos ) );
+				auto seg_toks = encode_segment_cached( text, pos, best_pos - pos );
 				result.insert( result.end(), seg_toks.begin(), seg_toks.end() );
 			}
 			result.push_back( best_id );
