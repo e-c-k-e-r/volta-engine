@@ -427,6 +427,35 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 			}
 		}
 	}
+	if ( const std::string& dump = runtime::options().dump_requests; !dump.empty() ) {
+		// next to the request's body and prompt: int32 prompt tokens, int32 n, then the n token ids (prompt and generated)
+		if ( FILE* f = std::fopen( ( dump + "/req_" + std::to_string( slot.req.req_id ) + ".tokens" ).c_str(), "wb" ) ) {
+			const int32_t head[2] = { static_cast<int32_t>( slot.req.prompt_tokens.size() ), static_cast<int32_t>( slot.all_tokens.size() ) };
+			std::fwrite( head, sizeof( int32_t ), 2, f );
+			std::fwrite( slot.all_tokens.data(), sizeof( int ), slot.all_tokens.size(), f );
+			std::fclose( f );
+		}
+	}
+	// The reply: an agent's next request re-renders it (reasoning, text and tool calls) after the turn boundary, so a snapshot of everything the slot
+	// has read lets that request resume after the reply instead of reading it again. Keyed by exactly the tokens fed (the last sampled token is
+	// fed or not, depending on the round that ended the request); a next prompt that renders the reply differently simply does not match
+	if ( prefix_cache_ && runtime::options().prefix_cache_reply && reason != FinishReason::Cancelled && slot.prefill_done && !slot.steer_prompt &&
+		slot.steer_scope == 0 && slot.key_tokens.empty() && slot.req.images.empty() ) {
+		const int fed = std::min( slot.current_pos, static_cast<int>( slot.all_tokens.size() ) );
+		if ( fed > static_cast<int>( slot.req.prompt_tokens.size() ) && fed >= kPrefixMinTokens && fed % cluster_.snapshot_align() == 0 ) {
+			const std::vector<int> key( slot.all_tokens.begin(), slot.all_tokens.begin() + fed );
+			// the parent is looked up again: the prompt's own nodes may have been evicted while the reply was decoding
+			PrefixCache::Entry* parent = prefix_cache_->exact( key ) ? nullptr : prefix_cache_->find( key );
+			const int parent_tokens = parent ? static_cast<int>( parent->tokens.size() ) : 0;
+			if ( !prefix_cache_->exact( key ) ) {
+				const auto t_store = std::chrono::steady_clock::now();
+				ModelCluster::SeqSnapshot snap;
+				if ( cluster_.save_snapshot( s, parent_tokens, fed, &snap, true ) ) prefix_cache_->insert( parent, key, snap, false );
+				LOG_DEBUG( "[gen] slot %d: reply snapshot at %d stored in %.0f ms\n", s, fed,
+					std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_store ).count() );
+			}
+		}
+	}
 	if ( CandLog::get().on() ) {
 		const int32_t head[3] = { static_cast<int32_t>( 0xC0DE0002 ), s, static_cast<int32_t>( slot.all_tokens.size() ) };
 		CandLog::get().write( head, sizeof( head ) );

@@ -80,7 +80,11 @@ The server speaks the OpenAI chat API (`/v1/chat/completions`, `/v1/models`) and
 
 Useful options for agent workloads: a large context (`--set max_seq=262144 --set max_slots=2`) and the prefix cache
 (`prefix_cache_gib`), which keeps the system prompt and earlier turns resident in pinned host RAM so a long conversation is
-not prefilled again on every turn. The resumed tokens show up in the usage (OpenAI `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens`, with `input_tokens` excluding them).
+not prefilled again on every turn. When a request ends, a snapshot of everything the slot has read, prompt and reply, is stored as well
+(`prefix_cache_reply`, on by default): an agent's next request renders the reply back into its prompt, so it resumes after the reply
+instead of reading it again. On Qwen3.8-27B in Claude Code sessions with thinking on, the next prompt repeated every token of the reply in 21
+of 23 turns (the other two were `Edit` calls, whose arguments the client re-serializes in another order), and the tokens read per turn fell
+from a median of 671 to 362. The resumed tokens show up in the usage (OpenAI `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens`, with `input_tokens` excluding them).
 
 Qwen extras:
 

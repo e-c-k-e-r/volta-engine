@@ -68,6 +68,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `prefill_cooldown` | int | `0` | `ENGINE_PREFILL_COOLDOWN` | while other requests are decoding, the decode steps that run between two prompt pieces (0 = a piece every step): the decoding requests then get most of the GPU time and the prompt is ingested more slowly, in pieces of the same size |
 | `prefill_chunk` | int | `512` | `ENGINE_PREFILL_CHUNK` | prompt tokens a new request prefills per scheduler step while other requests are decoding (decode steps run between the pieces); 0 = the whole prompt at once |
 | `prefix_interval` | int | `16384` | `ENGINE_PREFIX_INTERVAL` | prompt tokens between automatic prefix checkpoints inside long prompts; 0 = only the requested ones |
+| `prefix_cache_reply` | bool | `true` | `ENGINE_PREFIX_CACHE_REPLY` | prefix cache: when a request ends, snapshot everything the slot has read (prompt and reply), so an agent's next request, whose prompt renders the reply back, resumes after it instead of reading the reply again |
 | `nvfp4_experts` | string | `(empty)` | `ENGINE_NVFP4_EXPERTS` | Flash-Next: directory of a modelopt NVFP4 checkpoint (same architecture) to load the routed experts from; everything else comes from the model directory. Empty = the model's own experts |
 | `nvfp4_dense` | string | `(empty)` | `ENGINE_NVFP4_DENSE` | dense projection groups to quantize to NVFP4 at load (round-to-nearest from the BF16 tensors of the nvfp4_experts checkpoint): Flash-Next: gdn, shared (or shared_gate / shared_up / shared_down), attn, idx, head; GLM: kda, mla, idx, shared, dense, head; Qwen NVFP4 checkpoint: head (a quarter of the bytes of the FP16 head); or all |
 | `hessian_dir` | string | `(empty)` | `ENGINE_HESSIAN_DIR` | calibration (Flash-Next, GLM, Qwen3.5-family dense): directory to write the input Hessians (x^T x per dense projection input, fp32) of the prefill rows that ran, one file per site at shutdown; empty = off |
@@ -172,7 +173,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `spec_joint` | int | `-1` | `ENGINE_DEBUG_SPEC_JOINT` | per-slot speculators: one verify forward for the blocks of the speculating slots (MTP: one draft chain too; measured no gain over one slot per round at 2 requests, up to ~+6-25% at 4; DFlash2: the blocks are drafted in turn and verified together); 1 on, 0 one slot per round, -1 the speculator's default (DFlash2 on, MTP off) |
 | `spec_interleave` | bool | `true` | `ENGINE_DEBUG_SPEC_INTERLEAVE` | speculators with a context per slot (MTP): interleave one slot's round per step; false steps all active slots plainly together while more than one decodes (A/B) |
 | `no_graphs` | bool | `false` | `ENGINE_DEBUG_NO_GRAPHS` | eager execution, no CUDA graphs |
-| `dump_requests` | string | `(empty)` | `ENGINE_DEBUG_DUMP_REQUESTS` | directory: write every API request body and rendered prompt there |
+| `dump_requests` | string | `(empty)` | `ENGINE_DEBUG_DUMP_REQUESTS` | directory: write every API request body and rendered prompt there, and at its end the prompt and generated token ids (req_N.tokens: int32 prompt length, int32 count, the ids) |
 | `dump_draft_round` | int | `-1` | `ENGINE_DEBUG_DUMP_DRAFT_ROUND` | speculation round whose drafter inputs are written to /tmp/draft_dump.bin; <0 = off |
 
 ## Test and tool variables
