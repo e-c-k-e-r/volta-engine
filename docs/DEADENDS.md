@@ -90,3 +90,17 @@ from the hardware of the time (4x V100, power caps as noted); relative results a
 ## Steering
 
 * **Static clamp files on GLM-5.3-Flash and DeepSeek-V4.1-Flash:** only the 27B responds; see [STEERING.md](STEERING.md).
+* **Router steering against refusals (GLM-5.3-Flash):** a bias on the router scores of the experts that separate declined prompts from
+  answered ones (held-out AUC 0.99) left 0.47 to 0.60 of held-out declined targets declining, against 0.60 without it; the experts mark a
+  refusal rather than cause it. See [STEERING.md](STEERING.md).
+
+## Reasoning control
+
+* **Per-turn thinking (DART-style: two quick drafts without reasoning, think only when they disagree), Qwen3.8-27B in Claude Code.** On 20
+  harder agent tasks thinking off passed 34/40 and thinking high 39/40 (1.79x the wall time), so a gap exists; but replaying 202 recorded
+  thinking-high turns, the two no-think drafts agreed on 65% of turns (same kind of step and files) and 25% of those agreed steps differed
+  from the reasoned one, mostly hastier (running before fixing, acting before reading, finishing without running). Skipping reasoning on
+  agreement would take a hasty step on about one turn in ten. Tool: `tests/agentic/dart_replay.py`.
+* **Thinking intervention (a first-person thought in the empty reasoning block of thinking-off turns), Qwen3.8-27B.** "Before I act I make
+  sure the step is ready: I read the code or data it depends on, follow the task's rules exactly as stated, and check the result before I
+  report it." On the same 20 tasks, 2 runs each: 33/40 with it and 33/40 without (143 s and 147 s per task).
