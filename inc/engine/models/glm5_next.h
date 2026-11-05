@@ -187,7 +187,9 @@ public:
 	void commit_spec_rows( int slot_id, int first_row, int last_row, backend::stream_t stream = nullptr ) override;
 	bool spec_commit_always() const override { return use_journal_; }
 	void set_snapshot_taps( bool on ) override { snap_taps_ = on; }
-	int seq_align() const override { return 4; }   // DSA::POOL
+	// a snapshot may end inside a pool: the plane ring it saves holds the open pool's tokens, and the row that completes the pool builds it (checked at
+	// cuts 1025 and 1027, FP16 and FP8 latents, with and without kv_pool: restores equal the split prefill bit for bit)
+	int seq_align() const override { return 1; }
 	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
 	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
 	bool read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream = nullptr ) override;

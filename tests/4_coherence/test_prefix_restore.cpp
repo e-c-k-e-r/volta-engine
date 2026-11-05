@@ -2,7 +2,7 @@
 // tokens, snapshots the slot (recurrent state + KV rows), restores into other slots and prefills only the tail; the
 // next-token candidates and 16 greedy continuation tokens must match the cold run. An aligned cut (a multiple of the
 // prefill chunk) reproduces the cold chunk boundaries and must match bit for bit.
-//   test_prefix_restore [--glm | --flash] [--spec] [--tokens N]   (ENGINE_KV_FORMAT=fp8|k8v4|nvfp4 selects a quantized KV cache; GLM stores its latent in that format)
+//   test_prefix_restore [--glm | --flash] [--spec] [--tokens N] [--cut N ...]   (ENGINE_KV_FORMAT=fp8|k8v4|nvfp4 selects a quantized KV cache; GLM stores its latent in that format)
 #include "engine/runtime/test_driver.h"
 #include "engine/runtime/prefix_cache.h"
 #include "engine/loader/tokenizer.h"
@@ -45,11 +45,13 @@ int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	int n_tokens = 6000;
 	bool spec = false, glm = false, flash = false;
+	std::vector<int> cuts_arg;   // --cut N (repeatable): snapshot at these positions instead of the two default cuts
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--spec" ) ) spec = true;
 		else if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
 		else if ( !std::strcmp( argv[i], "--flash" ) ) flash = true;
 		if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
+		else if ( !std::strcmp( argv[i], "--cut" ) && i + 1 < argc ) cuts_arg.push_back( std::atoi( argv[++i] ) );
 	}
 	engine::loader::Tokenizer tok;
 	const char* model_dir = glm ? test::GLM_DIR : ( flash ? test::FLASH_DIR : test::QWEN_DIR );
@@ -88,7 +90,8 @@ int main( int argc, char** argv ) {
 	// models with a single slot (GLM at its default VRAM split) restore into the slot they saved from
 	const int S = mc.metadata().max_slots;
 	auto slot_of = [&]( int k ) { return S > k ? k : 0; };
-	for ( int cut : { chunk * ( ( n / 2 ) / chunk ), ( n / 2 + 37 ) / 64 * 64 } ) {
+	const std::vector<int> cuts = cuts_arg.empty() ? std::vector<int>{ chunk * ( ( n / 2 ) / chunk ), ( n / 2 + 37 ) / 64 * 64 } : cuts_arg;
+	for ( int cut : cuts ) {
 		const bool aligned = cut % chunk == 0;
 		// Control: the same two-part prefill on one slot without any snapshot. Chunk boundaries move with the cut, and
 		// models whose chunked prefill is boundary sensitive (GLM) differ from the cold run for that reason alone; a
