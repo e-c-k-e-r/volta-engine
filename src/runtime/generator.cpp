@@ -255,8 +255,33 @@ bool Generator::emit_token( int s, int tok, const Candidates* row ) {
 		cluster_.steer_control( s, slot.steer_scope, static_cast<int>( slot.req.prompt_tokens.size() ), static_cast<int>( slot.all_tokens.size() ) );
 	}
 	if ( slot.in_reasoning && !eos ) {
-		if ( tok == slot.req.think_close_id ) slot.in_reasoning = false;
-		else if ( slot.req.reasoning_budget > 0 && ++slot.reasoning_tokens >= slot.req.reasoning_budget ) slot.force_close = true;
+		if ( tok == slot.req.think_close_id ) {
+			slot.in_reasoning = false;
+			slot.soft_close = false;
+		}
+		else if ( slot.soft_close ) {
+			// past the budget: close after the token that ends a sentence or a line, or when the wait runs out
+			const std::string t = tokenizer_.decode_token_fast( tok );
+			size_t e = t.find_last_not_of( " \t" );
+			const char last = e == std::string::npos ? 0 : t[e];
+			const char before = e == std::string::npos || e == 0 ? slot.prev_char : t[e - 1];
+			const bool ends = t.find( '\n' ) != std::string::npos || last == '!' || last == '?' || ( last == '.' && !( before >= '0' && before <= '9' ) );
+			if ( ends || ++slot.soft_close_tokens >= runtime::options().thinking_soft_close ) {
+				slot.soft_close = false;
+				slot.force_close = true;
+			}
+		}
+		else if ( slot.req.reasoning_budget > 0 && ++slot.reasoning_tokens >= slot.req.reasoning_budget ) {
+			if ( runtime::options().thinking_soft_close > 0 ) {
+				slot.soft_close = true;
+				slot.soft_close_tokens = 0;
+			}
+			else slot.force_close = true;
+		}
+		if ( slot.in_reasoning ) {
+			const std::string t = tokenizer_.decode_token_fast( tok );
+			if ( !t.empty() ) slot.prev_char = t.back();
+		}
 	}
 	std::string out;
 	if ( !eos ) slot.held_text += tokenizer_.decode_token_fast( tok );
@@ -979,7 +1004,7 @@ void Generator::step_batch() {
 	if ( per_slot ) {
 		for ( int i = 0; i < n; ++i ) {
 			const int s = ids[i];
-			if ( cluster_.spec_owns( s ) && !slots_[s].ctrl.dense_mode() ) e_ids[ne++] = s;
+			if ( cluster_.spec_owns( s ) && !slots_[s].ctrl.dense_mode() && !slots_[s].soft_close ) e_ids[ne++] = s;
 			else d_ids[nd++] = s;
 		}
 	}
@@ -1000,7 +1025,7 @@ void Generator::step_batch() {
 	if ( per_slot && !agg_dense ) {
 		// A slot in plain mode gets its probe round when its counter says so
 		for ( int i = 0; i < nd && spec_slot < 0; ++i ) {
-			if ( cluster_.spec_owns( d_ids[i] ) && slots_[d_ids[i]].ctrl.use_spec() ) spec_slot = d_ids[i];
+			if ( cluster_.spec_owns( d_ids[i] ) && slots_[d_ids[i]].ctrl.use_spec() && !slots_[d_ids[i]].soft_close ) spec_slot = d_ids[i];
 		}
 		if ( spec_slot < 0 && ne > 0 && ( nd == 0 || spec_turn_ ) ) {
 			if ( joint_rounds ) {
@@ -1070,7 +1095,7 @@ void Generator::step_batch() {
 	}
 
 	const bool single_spec = ( n == 1 && cluster_.spec_owns( ids[0] ) );
-	if ( per_slot ? ( spec_slot >= 0 ) : ( single_spec && slots_[ids[0]].ctrl.use_spec() ) ) {
+	if ( per_slot ? ( spec_slot >= 0 ) : ( single_spec && slots_[ids[0]].ctrl.use_spec() && !slots_[ids[0]].soft_close ) ) {
 		// Case A: single request that owns the drafter context, DFlash2 speculative round (Mode A
 		// causal verify block). A slot that lost ownership to a newer request decodes normally.
 		const int s = ids[0];

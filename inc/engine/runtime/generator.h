@@ -267,6 +267,9 @@ private:
 		int steer_scope = 0;             // steering: SteerScope bits of the slot's residual edit (0 = none)
 		bool steer_prompt = false;       // the prompt rows are edited: its KV is not the cache's (no restore, no checkpoints)
 		bool force_close = false;   // budget reached: close the reasoning block before the next step
+		bool soft_close = false;    // budget reached, thinking_soft_close: decoding one token a step until a sentence or line ends
+		int soft_close_tokens = 0;  // tokens since the budget ran out
+		char prev_char = 0;         // the last character of the previous token (a '.' after a digit ends no sentence)
 		std::string held_text;   // detokenized text withheld while it could still begin a stop string
 		std::unique_ptr<LoopDetector> loop;   // loop_detect report / stop: fed every generated token
 		int loop_mode = 0;
