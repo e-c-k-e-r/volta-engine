@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include "engine/backend/cuda/reduce.cuh"
 #include "engine/backend/cuda/activation.cuh"
+#include "engine/kernels/dense.cuh"
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
@@ -11,83 +12,15 @@
 namespace engine::video {
 namespace kern {
 
-// Block sum / max with a barrier first, as the callers use them back to back (red is unused: the shared array lives in the helper)
-__device__ __forceinline__ float block_sum( float v, float* ) {
-	__syncthreads();
-	return engine::math::block_sum<32>( v );
-}
-
-__device__ __forceinline__ float block_max( float v, float* ) {
-	__syncthreads();
-	return engine::math::block_max<32>( v );
-}
-
-template <typename Tin, typename Tout>
-static __global__ void k_convert( const Tin* src, Tout* dst, size_t n ) {
-	for ( size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x; i < n; i += static_cast<size_t>( gridDim.x ) * blockDim.x ) {
-		dst[i] = static_cast<Tout>( static_cast<float>( src[i] ) );
-	}
-}
-
-__device__ __forceinline__ void store_out( half* p, float v ) { *p = __float2half_rn( v ); }
-__device__ __forceinline__ void store_out( float* p, float v ) { *p = v; }
-
-constexpr int kMaxPerThread = 24; // hidden <= 256 * 24
-
-// x[row] (+= gate[idx] * branch[row]) -> normalized, optionally scale/shift modulated, written as Tout.
-template <typename Tout>
-static __global__ void k_norm_mod( float* x, const float* branch, const float* gate, long gstride, const float* w, const float* shift, const float* scale, long mstride,
-	const int* idx, int H, float eps, Tout* out ) {
-	__shared__ float red[32];
-	const int row = blockIdx.x;
-	const long ii = idx ? idx[row] : 0;
-	float v[kMaxPerThread];
-	float ss = 0.0f;
-	#pragma unroll
-	for ( int e = 0; e < kMaxPerThread; ++e ) {
-		const int c = threadIdx.x + e * 256;
-		float a = 0.0f;
-		if ( c < H ) {
-			a = x[static_cast<size_t>( row ) * H + c];
-			if ( branch ) {
-				const float g = gate ? gate[ii * gstride + c] : 1.0f;
-				a = a + g * branch[static_cast<size_t>( row ) * H + c];
-				x[static_cast<size_t>( row ) * H + c] = a;
-			}
-		}
-		v[e] = a;
-		ss += a * a;
-	}
-	ss = block_sum( ss, red );
-	const float inv = rsqrtf( ss / static_cast<float>( H ) + eps );
-	#pragma unroll
-	for ( int e = 0; e < kMaxPerThread; ++e ) {
-		const int c = threadIdx.x + e * 256;
-		if ( c < H ) {
-			float o = v[e] * inv * w[c];
-			if ( scale ) { o = o * ( 1.0f + scale[ii * mstride + c] ) + shift[ii * mstride + c]; }
-			store_out( out + static_cast<size_t>( row ) * H + c, o );
-		}
-	}
-}
-
-// x += gate[idx] * (branch * rowscale)
-static __global__ void k_add_gated( float* x, const float* branch, const float* rowscale, const float* gate, long gstride, const int* idx, int H, const float* bias = nullptr ) {
-	const int row = blockIdx.x;
-	const long ii = idx ? idx[row] : 0;
-	const float rs = rowscale ? rowscale[row] : 1.0f;
-	for ( int c = threadIdx.x; c < H; c += blockDim.x ) {
-		const float g = gate ? gate[ii * gstride + c] : 1.0f;
-		x[static_cast<size_t>( row ) * H + c] += g * ( branch[static_cast<size_t>( row ) * H + c] * rs + ( bias ? bias[c] : 0.0f ) );
-	}
-}
-
-static __global__ void k_add_bias( float* y, const float* b, int rows, int cols ) {
-	const size_t n = static_cast<size_t>( rows ) * cols;
-	for ( size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x; i < n; i += static_cast<size_t>( gridDim.x ) * blockDim.x ) {
-		y[i] += b[i % cols];
-	}
-}
+// the generic pieces live in engine/kernels/dense.cuh (shared with the TTS model)
+using engine::dense::block_sum;
+using engine::dense::block_max;
+using engine::dense::k_convert;
+using engine::dense::store_out;
+using engine::dense::kMaxPerThread;
+using engine::dense::k_norm_mod;
+using engine::dense::k_add_gated;
+using engine::dense::k_add_bias;
 
 // silu(gate) * up with a per-row power-of-two scale that keeps the FP16 result in range (restored after the down projection).
 static __global__ void k_silu_mul( const half* f1, half* f2, float* rowscale, int F, const float* bias = nullptr ) {

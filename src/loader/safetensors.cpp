@@ -66,6 +66,55 @@ static pod::DType parse_dtype_str( const char* str, size_t len ) {
 	return pod::DType::FP16;
 }
 
+// The JSON string starting after its opening quote at json[pos], decoded (escapes, \\uXXXX with surrogate pairs, as
+// UTF-8); pos ends after the closing quote
+static std::string json_string( const char* json, size_t len, size_t& pos ) {
+	std::string out;
+	auto put = [&]( uint32_t c ) {
+		if ( c < 0x80 ) { out += char( c ); }
+		else if ( c < 0x800 ) { out += char( 0xC0 | ( c >> 6 ) ); out += char( 0x80 | ( c & 0x3F ) ); }
+		else if ( c < 0x10000 ) { out += char( 0xE0 | ( c >> 12 ) ); out += char( 0x80 | ( ( c >> 6 ) & 0x3F ) ); out += char( 0x80 | ( c & 0x3F ) ); }
+		else { out += char( 0xF0 | ( c >> 18 ) ); out += char( 0x80 | ( ( c >> 12 ) & 0x3F ) ); out += char( 0x80 | ( ( c >> 6 ) & 0x3F ) ); out += char( 0x80 | ( c & 0x3F ) ); }
+	};
+	auto hex4 = [&]( size_t at ) -> uint32_t {
+		uint32_t v = 0;
+		for ( size_t i = 0; i < 4 && at + i < len; ++i ) {
+			char h = json[at + i];
+			v = v * 16 + ( h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : 0 );
+		}
+		return v;
+	};
+	while ( pos < len && json[pos] != '"' ) {
+		char c = json[pos++];
+		if ( c != '\\' || pos >= len ) {
+			out += c;
+			continue;
+		}
+		char e = json[pos++];
+		switch ( e ) {
+			case 'n': out += '\n'; break;
+			case 't': out += '\t'; break;
+			case 'r': out += '\r'; break;
+			case 'b': out += '\b'; break;
+			case 'f': out += '\f'; break;
+			case 'u': {
+				uint32_t c1 = hex4( pos ); pos += 4;
+				if ( c1 >= 0xD800 && c1 < 0xDC00 && pos + 6 <= len && json[pos] == '\\' && json[pos + 1] == 'u' ) {
+					uint32_t c2 = hex4( pos + 2 ); pos += 6;
+					c1 = 0x10000 + ( ( c1 - 0xD800 ) << 10 ) + ( c2 - 0xDC00 );
+				}
+				put( c1 );
+				break;
+			}
+			default: out += e; break;  // \" \\ \/
+		}
+	}
+	if ( pos < len ) {
+		++pos;
+	}
+	return out;
+}
+
 static bool parse_header( pod::SafeTensorsFile& st ) {
 	const char* json = static_cast<const char*>( st.mmap_addr ) + 8;
 	size_t len = st.header_len;
@@ -215,6 +264,10 @@ static bool parse_header( pod::SafeTensorsFile& st ) {
 						}
 					}
 				}
+				else if ( is_meta && pos < len && json[pos] == '"' ) {
+					++pos;
+					st.metadata[std::string( json + subkey_start, subkey_len )] = json_string( json, len, pos );
+				}
 				else {
 					if ( pos < len && json[pos] == '"' ) {
 						++pos;
@@ -348,6 +401,12 @@ void safetensors_close( pod::SafeTensorsFile& st ) {
 	st.header_len = 0;
 	st.tensor_count = 0;
 	st.tensor_capacity = 0;
+	st.metadata.clear();
+}
+
+const std::string* safetensors_metadata( const pod::SafeTensorsFile& st, const char* key ) {
+	auto it = st.metadata.find( key );
+	return it == st.metadata.end() ? nullptr : &it->second;
 }
 
 const pod::SafeTensorMeta* safetensors_find( const pod::SafeTensorsFile& st, const char* name ) {

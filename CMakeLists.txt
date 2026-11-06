@@ -247,6 +247,8 @@ set(ENGINE_DEVICE_SOURCES
 	src/video/h3_stage_denoise.cpp
 	src/video/h3_stage_decode.cu
 	src/kernels/cuda/h3/h3_attn.cu
+	src/loader/device_upload.cu
+	src/tts/tts_model.cu
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
 	src/spec/dflash_backbone.cu
@@ -1023,6 +1025,9 @@ if(ENGINE_GPU)
 	add_executable(h3_generate src/video/h3_generate_main.cpp)
 	target_link_libraries(h3_generate PRIVATE engine_kernels)
 	set_target_properties(h3_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	add_executable(tts_generate src/tts/tts_generate_main.cpp)
+	target_link_libraries(tts_generate PRIVATE engine_kernels)
+	set_target_properties(tts_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# NCCL is optional: it enables tensor parallelism (the transformer and the text tower over several GPUs) and bench_allreduce
 	if(ENGINE_BACKEND STREQUAL "CUDA")

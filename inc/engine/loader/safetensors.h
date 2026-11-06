@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -40,6 +41,8 @@ struct SafeTensorsFile {
 	int             tensor_count = 0;
 	int             tensor_capacity = 0;
 	void*           gguf = nullptr;   // a GGUF file's loader state (engine/loader/gguf.h); nullptr for safetensors
+	// the header's __metadata__ entries (string values, JSON-unescaped), e.g. a config JSON an exporter stored there
+	std::map<std::string, std::string> metadata;
 };
 
 } // namespace pod
@@ -50,6 +53,8 @@ bool safetensors_open( pod::SafeTensorsFile& st, const char* filepath );
 void safetensors_close( pod::SafeTensorsFile& st );
 const pod::SafeTensorMeta* safetensors_find( const pod::SafeTensorsFile& st, const char* name );
 const void* safetensors_get_data_cpu( const pod::SafeTensorsFile& st, const pod::SafeTensorMeta* meta );
+// A __metadata__ value, nullptr if the file has no such key
+const std::string* safetensors_metadata( const pod::SafeTensorsFile& st, const char* key );
 bool safetensors_load_to_device( const pod::SafeTensorsFile& st, const pod::SafeTensorMeta* meta, void* dst_device_ptr, backend::stream_t stream = nullptr );
 pod::TensorView safetensors_alloc_tensor( const pod::SafeTensorsFile& st, const char* name, pod::MemoryArena& arena, backend::stream_t stream = nullptr );
 
