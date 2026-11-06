@@ -249,6 +249,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/kernels/cuda/h3/h3_attn.cu
 	src/loader/device_upload.cu
 	src/tts/tts_model.cu
+	src/tts/tts_backbone.cu
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
 	src/spec/dflash_backbone.cu

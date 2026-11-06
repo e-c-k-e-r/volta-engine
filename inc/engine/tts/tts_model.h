@@ -7,6 +7,7 @@
 #include "engine/core/arena.h"
 #include "engine/loader/safetensors.h"
 #include <cuda_fp16.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -48,17 +49,44 @@ struct TtsWeights {
 	const float *length_w = nullptr, *length_b = nullptr;
 };
 
+// One sequence of the backbone (a row of vall_e/data.py pack, unpadded): [text | prompt | target], or [text | prompt |
+// length query] for the length head. Digits are FSQ level indices, `values` per position.
+struct TtsRow {
+	std::vector<int> text;  // phoneme ids (1-based; 0 is padding)
+	std::vector<uint8_t> prompt;  // [Lp * values]
+	std::vector<uint8_t> target;  // [La * values]
+	std::vector<uint8_t> masked;  // [La]: positions shown as the mask embedding
+	int mode = 0;  // 0 NAR demask, 2 length
+	bool len_query = false;  // a length-query position instead of the target
+	int length() const;
+};
+
 class TtsModel {
 public:
 	bool load( const std::string& path, int device = 0 );
+	// The final hidden states of every position of `row` into out (device, [L, d] FP32). taps: if given, the input of
+	// every block (and finally the output, after the final norm) copied to the host, [layers + 1][L * d]
+	void hidden( const TtsRow& row, float* out, std::vector<std::vector<float>>* taps = nullptr );
+	static constexpr int MAX_LEN = 2560;  // positions per row (30 s targets with 10 s prompts and long texts fit)
 	const TtsConfig& config() const { return cfg_; }
 	const TtsWeights& weights() const { return w_; }
 	size_t weight_bytes() const { return arena_.offset_bytes; }
 	~TtsModel();
 
 private:
+	void alloc_workspace();
+	void gemm( const half* A, const half* W, void* C, int M, int N, int K, bool c32 );
+
 	TtsConfig cfg_;
 	TtsWeights w_;
+	void* blas_ = nullptr;  // cublasHandle_t
+	struct Workspace {
+		float *x = nullptr, *a = nullptr, *S = nullptr;
+		half *xn = nullptr, *qkv = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr, *g = nullptr, *y = nullptr, *up = nullptr, *act = nullptr, *P = nullptr, *vals = nullptr;
+		int *ids = nullptr;
+		uint8_t *kind = nullptr, *masked = nullptr, *digits = nullptr;
+	} ws_;
+	pod::MemoryArena ws_arena_ {};
 	pod::SafeTensorsFile st_;
 	pod::MemoryArena arena_ {};
 };

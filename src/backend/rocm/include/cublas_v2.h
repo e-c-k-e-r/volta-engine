@@ -27,6 +27,7 @@ using cudaDataType = hipDataType;
 #define cublasDestroy hipblasDestroy
 #define cublasSetStream hipblasSetStream
 #define cublasGemmEx hipblasGemmEx
+#define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
 #define cublasSgemm hipblasSgemm
 
 // Tensor-op math is cuBLAS's switch; rocBLAS picks its kernels itself
