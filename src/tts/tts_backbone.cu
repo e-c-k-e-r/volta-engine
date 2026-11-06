@@ -22,7 +22,8 @@ int TtsRow::length() const {
 
 void TtsModel::alloc_workspace() {
 	const size_t L = MAX_LEN, d = cfg_.d_model, H = cfg_.heads, F = cfg_.ffn(), V = cfg_.values();
-	const size_t bytes = L * d * 4 * 2 + H * L * L * ( 4 + 2 ) + L * d * 2 * 9 + L * 3 * d * 2 + L * 2 * F * 2 + L * F * 2 + L * V * 3 + L * 16 + ( 64 << 20 );
+	const size_t bytes = L * d * 4 * 2 + H * L * L * ( 4 + 2 ) + L * d * 2 * 9 + L * 3 * d * 2 + L * 2 * F * 2 + L * F * 2 + L * V * 3 + L * 16 + ( 64 << 20 )
+		+ 3 * L * ( d * 6 + cfg_.flow_width * 4 * 12 + V * 16 ) + ( 16 << 20 );  // + the flow head's (tts_flow.cu)
 	ENGINE_ASSERT( engine::core::arena_create( ws_arena_, 0, bytes ), "tts: can't allocate the workspace" );
 	auto A = [&]( size_t n ) { return engine::core::arena_alloc( ws_arena_, n ); };
 	ws_.x = static_cast<float*>( A( L * d * 4 ) );
@@ -44,6 +45,7 @@ void TtsModel::alloc_workspace() {
 	ws_.ids = static_cast<int*>( A( L * 4 ) );
 	ws_.kind = static_cast<uint8_t*>( A( L ) );
 	ws_.masked = static_cast<uint8_t*>( A( L ) );
+	alloc_flow_workspace();
 	cublasHandle_t h;
 	CUBLAS_CHECK( cublasCreate( &h ) );
 	blas_ = h;

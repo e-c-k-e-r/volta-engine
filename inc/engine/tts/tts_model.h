@@ -68,6 +68,23 @@ public:
 	// every block (and finally the output, after the final norm) copied to the host, [layers + 1][L * d]
 	void hidden( const TtsRow& row, float* out, std::vector<std::vector<float>>* taps = nullptr );
 	static constexpr int MAX_LEN = 2560;  // positions per row (30 s targets with 10 s prompts and long texts fit)
+
+	struct Sampling {
+		int steps = 25, flow_steps = 8;
+		float cfg = 6.0f, cfg_prompt = 2.0f, sway = -1.0f;
+	};
+	// One demasking step (vall_e/model.py demask_flow): the backbone over the guidance rows (cond; null without text and
+	// prompt; promptless, with cfg_prompt) at the current target digits [La * values] / masked [La], then the guided flow
+	// head from noise [k * values] at the `reveal` positions, whose snapped digits are written into digits (and their
+	// masked flags cleared). vtaps: the guided velocity of every flow step, [flow_steps][k * values]
+	void demask_step( const std::vector<int>& text, const std::vector<uint8_t>& prompt, std::vector<uint8_t>& digits, std::vector<uint8_t>& masked,
+		const std::vector<int>& reveal, const float* noise, const Sampling& s, std::vector<std::vector<float>>* vtaps = nullptr );
+	// A whole generation of n_frames frames: order [La] the reveal order and noise[step] each step's starting noise
+	// (golden.py's draws, or the caller's own). Returns the frames' digits [n_frames * 32]
+	std::vector<uint8_t> generate( const std::vector<int>& text, const std::vector<uint8_t>& prompt, int n_frames, const std::vector<int>& order,
+		const std::vector<std::vector<float>>& noise, const Sampling& s );
+	// How many patches step s of `steps` has revealed in total, of La
+	static int revealed_after( int s, int steps, int La );
 	const TtsConfig& config() const { return cfg_; }
 	const TtsWeights& weights() const { return w_; }
 	size_t weight_bytes() const { return arena_.offset_bytes; }
@@ -75,6 +92,7 @@ public:
 
 private:
 	void alloc_workspace();
+	void alloc_flow_workspace();
 	void gemm( const half* A, const half* W, void* C, int M, int N, int K, bool c32 );
 
 	TtsConfig cfg_;
@@ -86,6 +104,11 @@ private:
 		int *ids = nullptr;
 		uint8_t *kind = nullptr, *masked = nullptr, *digits = nullptr;
 	} ws_;
+	struct FlowWorkspace {
+		float *h = nullptr, *cond = nullptr, *c = nullptr, *mod = nullptr, *xf = nullptr, *m2 = nullptr, *m1 = nullptr, *v = nullptr, *x = nullptr, *temb = nullptr, *t0 = nullptr;
+		half *hh = nullptr, *sc = nullptr, *ln = nullptr, *m1h = nullptr, *xin = nullptr, *tvec = nullptr, *t0h = nullptr;
+		uint8_t* snapped = nullptr;
+	} fw_;
 	pod::MemoryArena ws_arena_ {};
 	pod::SafeTensorsFile st_;
 	pod::MemoryArena arena_ {};
