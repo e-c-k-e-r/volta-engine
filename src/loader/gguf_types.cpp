@@ -29,6 +29,7 @@ GgmlBlock ggml_block( GgmlType type ) {
 		case GgmlType::IQ1_M: return { 256, 56 };
 		case GgmlType::IQ4_NL: return { 32, 18 };
 		case GgmlType::IQ4_XS: return { 256, 136 };
+		case GgmlType::Q2_0: return { 64, 18 };
 		default: return {};
 	}
 }
@@ -59,6 +60,7 @@ const char* ggml_type_name( GgmlType type ) {
 		case GgmlType::IQ1_M: return "IQ1_M";
 		case GgmlType::IQ4_NL: return "IQ4_NL";
 		case GgmlType::IQ4_XS: return "IQ4_XS";
+		case GgmlType::Q2_0: return "Q2_0";
 		case GgmlType::MXFP4: return "MXFP4";
 		case GgmlType::NVFP4: return "NVFP4";
 		default: return "unknown";

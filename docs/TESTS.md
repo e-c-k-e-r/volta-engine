@@ -64,7 +64,7 @@
 | `test_spec_target_equiv [--prompt-tokens N] [--rows N]` | 4 | yes | speculation losslessness on the 27B: a multi-row verify forward against one-row steps, per row, with the logit margin where they disagree |
 | `test_sparse_head [model dir]` | 2 | yes | sparse drafter head on one rank's Flash-Next head shard: extracted columns give the full head's logits there, the rest of the row is the lowest value, the subset's argmax is the full head's restricted to it; one extraction timed (`CUDA_VISIBLE_DEVICES=1`) |
 | `test_glm_qkv <exl3 dir> <source dir> [layer] [rank]` | 2 | yes | GLM linear-attention qkv_proj as loaded (one rank's slice of the fused trellis tensor) against the source's q / k / v rows that rank owns |
-| `test_gguf_linear <fixture dir>` | 2 | yes | LinearGguf for every block type it reads (the K-quants, IQ1_S to IQ4_XS, Q4_0 to Q8_0): 1 to 8 rows against the q8_1 dot product of the same blocks, 20 rows (the dequantize-and-GEMM path) against the exact product; fixtures from `tests/tools/gguf_fixtures.py --libggml <llama.cpp build/bin> --gguf-py <llama.cpp/gguf-py> --out <dir>` (ggml's own quantizer through ctypes; run by hand) |
+| `test_gguf_linear <fixture dir>` | 2 | yes | LinearGguf for every block type it reads (the K-quants, IQ1_S to IQ4_XS, Q4_0 to Q8_0, Q2_0): 1 to 8 rows (the GEMV) against the q8_1 dot product of the same blocks, 9 to 16 rows (the tile kernel) and 20 rows (the dequantize-and-GEMM path) against the exact product; fixtures from `tests/tools/gguf_fixtures.py --libggml <llama.cpp build/bin> --gguf-py <llama.cpp/gguf-py> --out <dir>` (ggml's own quantizer through ctypes, a llama.cpp build that has every type; run by hand) |
 | `test_nvfp4_quantize <exl3 dir> <nvfp4 dir> <tensor> [bits]` | 2 | yes | round-to-nearest NVFP4 from a BF16 tensor against the EXL3 version of the same matrix (cosine and relative difference at 1 and 8 rows) |
 
 ## Benchmarks and profiler brackets
@@ -82,6 +82,7 @@ Not part of `gate.sh` (except `bench_decode`, `bench_accept` and `bench_prefill`
 | `bench_kda` | the KDA recurrent step (`GDN::recurrent_step_kda_rows`) per layer for 1 to 8 rows over cycled layer states; `BENCH_ITERS=1` for a profiler |
 | `bench_moe_prefill` | routed-MoE prefill time per `MoE::forward` on real GLM layer-3 experts (rank-0 partition), rows routed uniformly, at several chunk sizes |
 | `bench_moe_routes` (`BENCH_GLM=1`, `BENCH_ROUTES=<n>` for one route count) | the fused decode MoE kernels at a given number of local routes |
+| `bench_gguf_shapes` (`TYPE ... [-- K N ...]`, `BENCH_DEQUANT=1`) | GGUF linear at 1 to 16 rows on the 27B's per-rank shapes: time per call and GB/s of the blocks; `BENCH_DEQUANT=1` also times the whole-weight dequantization |
 | `bench_nvfp4_shapes` (`K N ...`) | NVFP4 skinny GEMV at decode shapes: time per call and GB/s of the packed weights |
 | `bench_nvfp4_moe` | the fused NVFP4 routed-expert path on Flash-Next's expert shapes (synthetic weights): parity with the chained calls, then time per layer |
 | `bench_nvfp4`, `bench_trellis` | NVFP4 and trellis linear kernels |

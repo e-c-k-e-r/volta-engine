@@ -27,7 +27,7 @@ lib.ggml_row_size.restype = ctypes.c_size_t
 lib.ggml_row_size.argtypes = [ctypes.c_int, ctypes.c_int64]
 
 TYPES = [T.Q4_0, T.Q4_1, T.Q5_0, T.Q5_1, T.Q8_0, T.Q2_K, T.Q3_K, T.Q4_K, T.Q5_K, T.Q6_K, T.IQ2_XXS, T.IQ2_XS, T.IQ2_S, T.IQ3_XXS,
-         T.IQ3_S, T.IQ1_S, T.IQ1_M, T.IQ4_NL, T.IQ4_XS]
+         T.IQ3_S, T.IQ1_S, T.IQ1_M, T.IQ4_NL, T.IQ4_XS, T.Q2_0]
 
 def q8_1(x):
     """llama.cpp's quantize_q8_1 on rows of x: per 32 values d = amax / 127, q = round(x / d)"""

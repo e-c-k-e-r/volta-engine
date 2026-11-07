@@ -93,8 +93,8 @@ int main( int argc, char** argv ) {
 		pod::TensorView w = core::arena_alloc_tensor( arena, pod::DType::INT8, bdims, 2 );
 		backend::memcpy_sync( w.data, f.blocks.data(), f.blocks.size(), backend::Copy::H2D );
 		const pod::LinearWeight lw = pod::LinearWeight::make_gguf( w, static_cast<uint32_t>( f.type ), f.k, f.n );
-		double worst_gemv = 0.0, worst_gemm = 0.0;
-		for ( int rows : { 1, 2, 3, 4, 5, 6, 7, 8, 20 } ) {
+		double worst_gemv = 0.0, worst_tile = 0.0, worst_gemm = 0.0;
+		for ( int rows : { 1, 2, 3, 5, 8, 9, 13, 16, 20 } ) {
 			if ( rows > f.m ) continue;
 			int xdims[2] = { rows, f.k }, odims[2] = { rows, f.n };
 			pod::TensorView x = core::arena_alloc_tensor( arena, pod::DType::FP16, xdims, 2 );
@@ -107,17 +107,18 @@ int main( int argc, char** argv ) {
 			std::vector<float> o( oh.size() );
 			for ( size_t i = 0; i < o.size(); ++i ) o[i] = backend::to_float( oh[i] );
 			if ( rows <= 8 ) worst_gemv = std::max( worst_gemv, rel_rms( o, f.ref_q, rows, f.n ) );
-			else worst_gemm = std::max( worst_gemm, rel_rms( o, f.exact, rows, f.n ) );
+			else if ( rows <= 16 ) worst_tile = std::max( worst_tile, rel_rms( o, f.exact, rows, f.n ) );
+			else worst_gemm = rel_rms( o, f.exact, rows, f.n );
 		}
 		// The GEMV: FP16 output rounding stays well under 1e-2 against the q8_1 reference. The types whose offset or minimum comes from the q8_1
 		// block's half-precision sum of the activations (llama.cpp's formulation: Q4_0, Q4_1, Q5_0, Q5_1, and IQ1_S / IQ1_M for their delta) lose
 		// more, because that term nearly cancels the main dot product: a numpy emulation of the same formula gives the same 1.3% on Q4_0, so
-		// their bound is 3e-2. The GEMM reads FP16 activations and the exactly dequantized weight: FP16 rounding only
+		// their bound is 3e-2. The tile kernel and the GEMM read FP16 activations and the exactly dequantized weight: FP16 rounding only
 		const bool sum_offset = type == modules::GgmlType::Q4_0 || type == modules::GgmlType::Q4_1 || type == modules::GgmlType::Q5_0 ||
 			type == modules::GgmlType::Q5_1 || type == modules::GgmlType::IQ1_S || type == modules::GgmlType::IQ1_M;
-		const bool ok = worst_gemv < ( sum_offset ? 3e-2 : 1e-2 ) && worst_gemm < 5e-3;
-		std::printf( "  %-8s n %d k %d: GEMV (1-8 rows) vs q8_1 reference %.2e, GEMM (20 rows) vs exact %.2e  %s\n", modules::ggml_type_name( type ), f.n, f.k,
-			worst_gemv, worst_gemm, ok ? "PASS" : "FAIL" );
+		const bool ok = worst_gemv < ( sum_offset ? 3e-2 : 1e-2 ) && worst_tile < 5e-3 && worst_gemm < 5e-3;
+		std::printf( "  %-8s n %d k %d: GEMV (1-8 rows) vs q8_1 reference %.2e, tile (9-16 rows) vs exact %.2e, GEMM (20 rows) vs exact %.2e  %s\n",
+			modules::ggml_type_name( type ), f.n, f.k, worst_gemv, worst_tile, worst_gemm, ok ? "PASS" : "FAIL" );
 		fails += ok ? 0 : 1;
 		arena.offset_bytes = mark;
 	}

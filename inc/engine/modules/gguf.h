@@ -7,9 +7,10 @@
 #include <cstdint>
 
 // GGUF quantized weights (llama.cpp's block formats), read as they are stored in the file: a weight of n output rows and k inputs is n rows
-// of k / block_elems blocks, each block_bytes long. Decode and verify rows multiply through the block types' integer dot products against
-// activations quantized to q8_1 (llama.cpp's vec_dot kernels); prefill chunks dequantize the weight to FP16 (llama.cpp's converters) and
-// run one tensor-core GEMM. The llama.cpp files are vendored in src/kernels/cuda/gguf/ggml.
+// of k / block_elems blocks, each block_bytes long. Up to 8 rows multiply through the block types' integer dot products against
+// activations quantized to q8_1 (llama.cpp's vec_dot kernels); 9 to 16 rows decode every block once into shared memory (llama.cpp's
+// block decoders) and multiply it with all rows on the tensor cores; prefill chunks dequantize the weight to FP16 (llama.cpp's
+// converters) and run one cuBLAS GEMM. The llama.cpp files are vendored in src/kernels/cuda/gguf/ggml.
 namespace engine::modules {
 
 // Tensor type ids of the GGUF format (ggml_type)
@@ -17,7 +18,7 @@ enum class GgmlType : uint32_t {
 	F32 = 0, F16 = 1, Q4_0 = 2, Q4_1 = 3, Q5_0 = 6, Q5_1 = 7, Q8_0 = 8, Q8_1 = 9,
 	Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, Q8_K = 15,
 	IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23,
-	I8 = 24, I16 = 25, I32 = 26, I64 = 27, F64 = 28, IQ1_M = 29, BF16 = 30, MXFP4 = 39, NVFP4 = 40,
+	I8 = 24, I16 = 25, I32 = 26, I64 = 27, F64 = 28, IQ1_M = 29, BF16 = 30, MXFP4 = 39, NVFP4 = 40, Q2_0 = 42,
 };
 
 struct GgmlBlock {
