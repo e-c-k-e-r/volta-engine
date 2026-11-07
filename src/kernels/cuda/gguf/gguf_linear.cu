@@ -140,15 +140,21 @@ void gemv_tiles( const void* w, const block_q8_1* y, half* out, int n, int k, in
 	for ( int r = 0; r < m; r += 8 ) launch_rows<T>( w, y + static_cast<size_t>( r ) * ( k / QK8_1 ), out + static_cast<size_t>( r ) * n, n, k, std::min( 8, m - r ), stream );
 }
 
-// The q8_1 activations of one call, per device, kept between calls (decode graphs capture the pointer): the first size covers a
-// prefill chunk of 32K-wide rows, so it does not regrow after the graphs are captured
+// Per-device state, each behind its own lock: a cudaMalloc waits for its device, whose queue may hold a collective the other ranks
+// have to join, so one rank must never hold a lock another rank's device is waiting behind
+std::mutex& device_mutex( int dev ) {
+	static std::mutex mu[64];
+	return mu[dev];
+}
+
+// The q8_1 activations of one call, per device, kept between calls (decode graphs capture the pointer): allocated at load
+// (LinearGguf::prepare) to cover a prefill chunk of 32K-wide rows, so it does not grow inside a forward
 block_q8_1* q8_workspace( size_t blocks ) {
-	static std::mutex mu;
 	static block_q8_1* buf[64] = {};
 	static size_t cap[64] = {};
 	int dev = 0;
 	cudaGetDevice( &dev );
-	std::lock_guard<std::mutex> lk( mu );
+	std::lock_guard<std::mutex> lk( device_mutex( dev ) );
 	if ( blocks > cap[dev] ) {
 		if ( buf[dev] ) cudaFree( buf[dev] );
 		const size_t want = std::max( blocks, static_cast<size_t>( pod::MAX_ROWS ) * 1024 );   // a prefill chunk of 32K-wide rows without regrowing
@@ -160,12 +166,11 @@ block_q8_1* q8_workspace( size_t blocks ) {
 
 // The FP16 copy of one weight for the prefill GEMM, per device; grows to the largest weight (prefill runs eagerly, never inside a graph)
 half* recon_workspace( size_t elems, cudaStream_t stream ) {
-	static std::mutex mu;
 	static half* buf[64] = {};
 	static size_t cap[64] = {};
 	int dev = 0;
 	cudaGetDevice( &dev );
-	std::lock_guard<std::mutex> lk( mu );
+	std::lock_guard<std::mutex> lk( device_mutex( dev ) );
 	if ( elems > cap[dev] ) {
 		ENGINE_CHECK( cudaStreamSynchronize( stream ) );   // the previous copy may still be read by queued work
 		if ( buf[dev] ) cudaFree( buf[dev] );
@@ -176,16 +181,20 @@ half* recon_workspace( size_t elems, cudaStream_t stream ) {
 }
 
 cublasHandle_t cublas_handle() {
-	static std::mutex mu;
 	static cublasHandle_t h[64] = {};
 	int dev = 0;
 	cudaGetDevice( &dev );
-	std::lock_guard<std::mutex> lk( mu );
+	std::lock_guard<std::mutex> lk( device_mutex( dev ) );
 	if ( !h[dev] ) ENGINE_ASSERT( cublasCreate( &h[dev] ) == CUBLAS_STATUS_SUCCESS, "LinearGguf: cublasCreate failed" );
 	return h[dev];
 }
 
 } // namespace
+
+void LinearGguf::prepare() {
+	q8_workspace( 1 );
+	cublas_handle();
+}
 
 void LinearGguf::dequant( const void* w, GgmlType type, int64_t elems, half* out, cudaStream_t stream ) {
 	const to_fp16_cuda_t fn = ggml_get_to_fp16_cuda( static_cast<ggml_type>( type ) );

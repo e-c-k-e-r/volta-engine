@@ -1037,6 +1037,7 @@ pod::LinearWeight SafeTensorsRepo::gguf_linear( int shard, const pod::SafeTensor
 		LOG_ERROR( "[SafeTensorsRepo] %s: GGUF type %s has no matrix kernel\n", meta->name, engine::modules::ggml_type_name( type ) );
 		ENGINE_ASSERT( false, "gguf_linear: unsupported GGUF block type" );
 	}
+	engine::modules::LinearGguf::prepare();
 	const size_t row_bytes = static_cast<size_t>( meta->shape[1] / blk.elems ) * blk.bytes;
 	int n_local = pad_rows, k_local = 0;
 	for ( const auto& r : rows ) n_local += r.second;

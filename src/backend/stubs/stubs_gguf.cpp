@@ -6,6 +6,8 @@ namespace engine::modules {
 
 __attribute__(( weak )) bool gguf_linear_supported( GgmlType ) { return false; }
 
+__attribute__(( weak )) void LinearGguf::prepare() {}
+
 __attribute__(( weak )) void LinearGguf::dequant( const void*, GgmlType, int64_t, backend::half_t*, backend::stream_t ) {
 	ENGINE_UNSUPPORTED( "LinearGguf::dequant" );
 	__builtin_unreachable();

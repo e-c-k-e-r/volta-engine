@@ -41,6 +41,8 @@ struct LinearGguf {
 	// out[m, n] (FP16) = x[m, k] (FP16) times the weight w, n rows of k / elems blocks of `type`
 	static void forward( const pod::TensorView& x, const void* w, GgmlType type, int n, int k, pod::TensorView& out, backend::stream_t stream = nullptr,
 		GgufColTiling tiling = {} );
+	// The current device's activation workspace and GEMM handle, made at load so no forward allocates (decode graphs, collectives)
+	static void prepare();
 	// out (FP16, `elems` values) = the blocks of w dequantized, in their stored order (elems a multiple of the block size)
 	static void dequant( const void* w, GgmlType type, int64_t elems, backend::half_t* out, backend::stream_t stream = nullptr );
 };
