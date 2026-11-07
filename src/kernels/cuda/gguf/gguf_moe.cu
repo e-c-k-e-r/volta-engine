@@ -54,7 +54,8 @@ __global__ void moe_dispatch_kernel( const int* __restrict__ topk, int routes, i
 }
 
 // out[route][row] = expert row `row` . input of each route of the work item (the route's token's q8_1 row, or the route's own), scaled by
-// the route's weight when `weighted`
+// the route's weight when `weighted`. One warp per output row, kMoEWarps rows per block: expert rows are short (640 or 2560 values), too
+// short to keep a whole block of threads on one
 template <GgmlType T>
 __global__ __launch_bounds__( 32 * kMoEWarps )
 void moe_proj_kernel( const void* const* __restrict__ ptrs, const Item* __restrict__ items, const int* __restrict__ n_items, const int* __restrict__ sorted,
@@ -62,8 +63,9 @@ void moe_proj_kernel( const void* const* __restrict__ ptrs, const Item* __restri
 	using Tr = Traits<T>;
 	if ( static_cast<int>( blockIdx.y ) >= *n_items ) return;
 	const Item it = items[blockIdx.y];
-	const int row = blockIdx.x;
-	const int tid = threadIdx.y * 32 + threadIdx.x;
+	const int row = blockIdx.x * kMoEWarps + threadIdx.y;
+	if ( row >= n ) return;
+	const int lane = threadIdx.x;
 	const void* w = ptrs[it.expert];
 	const int blocks_per_row = k / Tr::qk, y_blocks = k / QK8_1;
 	const block_q8_1* y[kItemRoutes];
@@ -72,30 +74,26 @@ void moe_proj_kernel( const void* const* __restrict__ ptrs, const Item* __restri
 		const int r = sorted[it.begin + min( j, it.count - 1 )];
 		y[j] = in + static_cast<size_t>( per_token ? r / top_k : r ) * y_blocks;
 	}
-	constexpr int per_iter = Tr::vdr * kMoEWarps * 32 / Tr::qi;
+	constexpr int per_iter = Tr::vdr * 32 / Tr::qi;   // weight blocks a warp covers per iteration
 	float acc[kItemRoutes] = {};
-	for ( int kbx = tid / ( Tr::qi / Tr::vdr ); kbx < blocks_per_row; kbx += per_iter ) {
+	for ( int kbx = lane / ( Tr::qi / Tr::vdr ); kbx < blocks_per_row; kbx += per_iter ) {
 		const int kby = kbx * ( Tr::qk / QK8_1 );
-		const int kqs = Tr::vdr * ( tid % ( Tr::qi / Tr::vdr ) );
+		const int kqs = Tr::vdr * ( lane % ( Tr::qi / Tr::vdr ) );
 		#pragma unroll
 		for ( int j = 0; j < kItemRoutes; ++j ) {
 			if ( j < it.count ) acc[j] += Tr::dot( w, y[j] + kby, row * blocks_per_row + kbx, kqs );
 		}
 	}
-	__shared__ float part[kMoEWarps][kItemRoutes];
 	#pragma unroll
 	for ( int j = 0; j < kItemRoutes; ++j ) {
-		float v = acc[j];
 		#pragma unroll
-		for ( int off = 16; off > 0; off >>= 1 ) v += __shfl_xor_sync( 0xffffffff, v, off );
-		if ( threadIdx.x == 0 ) part[threadIdx.y][j] = v;
+		for ( int off = 16; off > 0; off >>= 1 ) acc[j] += __shfl_xor_sync( 0xffffffff, acc[j], off );
 	}
-	__syncthreads();
-	if ( threadIdx.y == 0 && threadIdx.x < it.count ) {
+	if ( lane < it.count ) {
 		float v = 0.0f;
 		#pragma unroll
-		for ( int wi = 0; wi < kMoEWarps; ++wi ) v += part[wi][threadIdx.x];
-		const int r = sorted[it.begin + threadIdx.x];
+		for ( int j = 0; j < kItemRoutes; ++j ) v = lane == j ? acc[j] : v;
+		const int r = sorted[it.begin + lane];
 		out[static_cast<size_t>( r ) * n + row] = weighted ? v * __half2float( topw[r] ) : v;
 	}
 }
@@ -138,7 +136,7 @@ int max_items( int routes, int num_local ) { return std::min( routes, num_local 
 template <GgmlType T>
 void launch_proj( const void* const* ptrs, const Item* items, const int* n_items, const int* sorted, int max_n, const block_q8_1* in, bool per_token, int k, int n,
 	const half* topw, int top_k, bool weighted, float* out, cudaStream_t stream ) {
-	moe_proj_kernel<T><<<dim3( n, max_n ), dim3( 32, kMoEWarps ), 0, stream>>>( ptrs, items, n_items, sorted, in, per_token, k, n, topw, top_k, weighted, out );
+	moe_proj_kernel<T><<<dim3( ( n + kMoEWarps - 1 ) / kMoEWarps, max_n ), dim3( 32, kMoEWarps ), 0, stream>>>( ptrs, items, n_items, sorted, in, per_token, k, n, topw, top_k, weighted, out );
 }
 
 void proj( GgmlType type, const void* const* ptrs, const Item* items, const int* n_items, const int* sorted, int max_n, const block_q8_1* in, bool per_token, int k,
