@@ -264,7 +264,8 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 	}
 
 	// 1. Embed tokens
-	embed_tokens_ = repo.load( "model.language_model.embed_tokens.weight", *arena_, stream, pod::DType::BF16 );
+	embed_tokens_ = runtime::options().embed_host ? repo.shared_host_bf16( "model.language_model.embed_tokens.weight", stream )
+	                                              : repo.load( "model.language_model.embed_tokens.weight", *arena_, stream, pod::DType::BF16 );
 
 	// 2. Final norm
 	final_norm_ = repo.load( "model.language_model.norm.weight", *arena_, stream, pod::DType::FP16 );

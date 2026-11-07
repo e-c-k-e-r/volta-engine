@@ -92,6 +92,10 @@ public:
 	);
 	// Checkpoint bytes of the tensors whose names start with `prefix` and contain none of the `skip` substrings
 	size_t bytes_of( const std::string& prefix, std::initializer_list<const char*> skip = {} ) const;
+	// A [rows, cols] tensor as BF16 in pinned, mapped, portable host memory, one copy per process shared by every rank and every repo that
+	// asks for the same name (an embedding table read a few rows per forward over the link); converted from BF16, FP16, FP32 or GGUF
+	// blocks. Empty when the tensor is missing
+	pod::TensorView shared_host_bf16( const char* name, backend::stream_t stream = nullptr );
 	// Bytes of the codes of `base_name`: its trellis, or the blocks of a GGUF weight (0 when it is neither)
 	size_t trellis_bytes( const char* base_name ) const;
 	// Where a tensor's bytes are in its shard file (an open descriptor, absolute offset), for reads that bypass the mmap

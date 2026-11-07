@@ -491,7 +491,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 
 	const char* P = "model.language_model";
 	std::snprintf( nm, sizeof( nm ), "%s.embed_tokens.weight", P );
-	embed_table_ = repo.load( nm, *arena_, stream, pod::DType::BF16 );
+	embed_table_ = runtime::options().embed_host ? repo.shared_host_bf16( nm, stream ) : repo.load( nm, *arena_, stream, pod::DType::BF16 );
 	if ( !embed_table_.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, nm ); ++missing; }
 	std::snprintf( nm, sizeof( nm ), "%s.hyper_connection_mixer", P );
 	final_mixer_ = load_gr( nm, false );

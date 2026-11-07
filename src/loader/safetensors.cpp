@@ -15,6 +15,7 @@
 #include <cctype>
 #include <cstdio>
 #include <algorithm>
+#include <mutex>
 #include <array>
 #include <map>
 #include <string>
@@ -935,6 +936,36 @@ size_t SafeTensorsRepo::bytes_of( const std::string& prefix, std::initializer_li
 		if ( !skipped ) total += static_cast<size_t>( kv.second.second->size_bytes );
 	}
 	return total;
+}
+
+pod::TensorView SafeTensorsRepo::shared_host_bf16( const char* name, backend::stream_t stream ) {
+	static std::mutex mu;
+	static std::map<std::string, pod::TensorView> tables;
+	std::lock_guard<std::mutex> lk( mu );
+	if ( const auto it = tables.find( name ); it != tables.end() ) return it->second;
+	int shard = -1;
+	const auto* meta = find( name, &shard );
+	if ( meta == nullptr || shard < 0 || meta->ndim != 2 ) return pod::TensorView{};
+	meta = engine::loader::gguf_float_view( shards_[shard], meta, stream );
+	const void* src = safetensors_get_data_cpu( shards_[shard], meta );
+	if ( src == nullptr ) return pod::TensorView{};
+	const size_t n = static_cast<size_t>( meta->shape[0] ) * meta->shape[1];
+	auto* dst = static_cast<uint16_t*>( backend::host_alloc_pinned( n * sizeof( uint16_t ), backend::Pin::MappedPortable ) );
+	ENGINE_ASSERT( dst != nullptr, "shared_host_bf16: pinned allocation failed" );
+	if ( meta->dtype == pod::DType::BF16 ) std::memcpy( dst, src, n * sizeof( uint16_t ) );
+	else {
+		ENGINE_ASSERT( meta->dtype == pod::DType::FP16 || meta->dtype == pod::DType::FP32, "shared_host_bf16: BF16, FP16, FP32 or GGUF tensors" );
+		for ( size_t i = 0; i < n; ++i ) {
+			// round to nearest even
+			float f = meta->dtype == pod::DType::FP32 ? static_cast<const float*>( src )[i] : backend::to_float( static_cast<const backend::half_t*>( src )[i] );
+			uint32_t u;
+			std::memcpy( &u, &f, sizeof( u ) );
+			dst[i] = static_cast<uint16_t>( ( u + 0x7FFFu + ( ( u >> 16 ) & 1u ) ) >> 16 );
+		}
+	}
+	const pod::TensorView t = pod::make_tensor_2d( dst, pod::DType::BF16, meta->shape[0], meta->shape[1] );
+	tables[name] = t;
+	return t;
 }
 
 size_t SafeTensorsRepo::trellis_bytes( const char* base_name ) const {
