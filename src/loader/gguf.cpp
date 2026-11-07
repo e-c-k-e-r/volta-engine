@@ -161,6 +161,7 @@ bool gguf_open( pod::SafeTensorsFile& st, const char* path, const pod::SafeTenso
 		bool have_arch = false;
 		if ( s->arch_name == "qwen35" ) have_arch = gguf_arch_qwen35( s->kv, &s->arch );
 		else if ( s->arch_name == "qwen4exp" ) have_arch = gguf_arch_qwen4exp( s->kv, &s->arch );
+		else if ( s->arch_name == "dflash" ) have_arch = gguf_arch_dflash( s->kv, &s->arch );
 		if ( !have_arch ) {
 			LOG_ERROR( "[gguf] %s: architecture '%s' has no adapter\n", path, s->arch_name.c_str() );
 			safetensors_close( st );

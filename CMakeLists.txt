@@ -130,6 +130,7 @@ set(ENGINE_HOST_SOURCES
 	src/loader/gguf.cpp
 	src/loader/gguf_qwen35.cpp
 	src/loader/gguf_qwen4exp.cpp
+	src/loader/gguf_dflash.cpp
 	src/loader/gguf_types.cpp
 	src/loader/nvfp4.cpp
 	src/loader/tokenizer.cpp

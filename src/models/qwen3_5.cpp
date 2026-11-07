@@ -439,7 +439,10 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 	}
 
 	if ( mtp_on_ ) {
-		ENGINE_ASSERT( !fp4 && repo.find( "mtp.fc.trellis" ) != nullptr, "speculator=mtp: the checkpoint has no quantized MTP head (mtp.*)" );
+		// the head of an EXL3 checkpoint, or the MTP block of a GGUF conversion (its blocks as they are in the file)
+		const pod::SafeTensorMeta* fc_gguf = repo.find( "mtp.fc.weight" );
+		ENGINE_ASSERT( !fp4 && ( repo.find( "mtp.fc.trellis" ) != nullptr || ( fc_gguf != nullptr && fc_gguf->dtype == pod::DType::GGUF ) ),
+			"speculator=mtp: the checkpoint has no quantized MTP head (mtp.*)" );
 		mtp_fc_ = load_row( "mtp.fc", 4 );
 		mtp_pre_norm_e_ = repo.load( "mtp.pre_fc_norm_embedding.weight", *arena_, stream, pod::DType::FP16 );
 		mtp_pre_norm_h_ = repo.load( "mtp.pre_fc_norm_hidden.weight", *arena_, stream, pod::DType::FP16 );
