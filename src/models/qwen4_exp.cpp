@@ -435,20 +435,25 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		char prefix[200], n2[256];
 		std::snprintf( prefix, sizeof( prefix ), "%s", prefix_in );   // callers pass nm itself
 		std::snprintf( n2, sizeof( n2 ), "%s.hc_norm.weight", prefix ); g.norm = dense( n2 );
-		std::snprintf( n2, sizeof( n2 ), "%s.input_mix_weight_down.weight", prefix ); g.down = dense( n2 );
 		std::snprintf( n2, sizeof( n2 ), "%s.input_mix_weight_up.weight", prefix ); g.up = dense( n2 );
-		if ( inject ) { std::snprintf( n2, sizeof( n2 ), "%s.block_inject_weight.weight", prefix ); g.inject = dense( n2 ); }
+		// down and inject are read in place by the decode kernels and, as one [down; inject; zero pad] matrix ([rank (+ hc, padded to 8), flat]
+		// row-major = an [n, k] matrix tagged [k, n]), by the tensor-core path: loaded once, straight into that matrix
+		const int flat = config_.hc_mult * config_.hidden_size, rank = config_.hc_rank;
+		const int n_cat = inject ? rank + 8 : rank;
+		const size_t row_bytes = static_cast<size_t>( flat ) * sizeof( backend::half_t );
+		auto* cat = static_cast<char*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( n_cat ) * row_bytes, 256 ) );
+		pod::MemoryArena in_cat{ cat, static_cast<size_t>( n_cat ) * row_bytes, 0, false };
+		std::snprintf( n2, sizeof( n2 ), "%s.input_mix_weight_down.weight", prefix );
+		g.down = src->load( n2, in_cat, stream, pod::DType::FP16 );
+		if ( !g.down.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, n2 ); ++missing; }
+		if ( inject ) {
+			std::snprintf( n2, sizeof( n2 ), "%s.block_inject_weight.weight", prefix );
+			g.inject = src->load( n2, in_cat, stream, pod::DType::FP16 );
+			if ( !g.inject.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, n2 ); ++missing; }
+			ENGINE_ASSERT( !g.inject.data || g.inject.data == cat + static_cast<size_t>( rank ) * row_bytes, "Qwen4ExpPipeline: the inject rows do not follow the down rows" );
+			backend::memset_async( cat + static_cast<size_t>( rank + config_.hc_mult ) * row_bytes, 0, static_cast<size_t>( 8 - config_.hc_mult ) * row_bytes, stream );
+		}
 		if ( g.down.data && g.up.data ) {
-			// Dense fp16 views for the tensor-core path: [rank (+ hc, padded to 8), flat] row-major = an [n, k] matrix tagged [k, n]
-			const int flat = config_.hc_mult * config_.hidden_size, rank = config_.hc_rank;
-			const int n_cat = inject ? rank + 8 : rank;
-			const size_t row_bytes = static_cast<size_t>( flat ) * sizeof( backend::half_t );
-			auto* cat = static_cast<char*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( n_cat ) * row_bytes, 128 ) );
-			backend::memcpy_async( cat, g.down.data, static_cast<size_t>( rank ) * row_bytes, backend::Copy::D2D, stream );
-			if ( inject ) {
-				backend::memcpy_async( cat + static_cast<size_t>( rank ) * row_bytes, g.inject.data, static_cast<size_t>( config_.hc_mult ) * row_bytes, backend::Copy::D2D, stream );
-				backend::memset_async( cat + static_cast<size_t>( rank + config_.hc_mult ) * row_bytes, 0, static_cast<size_t>( 8 - config_.hc_mult ) * row_bytes, stream );
-			}
 			g.down_lw = pod::LinearWeight::make_fp16( pod::make_tensor_2d( cat, pod::DType::FP16, flat, n_cat ) );
 			g.up_lw = pod::LinearWeight::make_fp16( pod::make_tensor_2d( g.up.data, pod::DType::FP16, rank, flat ) );
 		}
