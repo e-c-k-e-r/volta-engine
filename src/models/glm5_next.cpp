@@ -379,7 +379,7 @@ bool Glm5NextPipeline::init(
 	mem( "logits" );
 	// 6. DFlash2 attachment: a position-indexed tap ring per slot (every slot's rows publish to its own, so each can feed the drafter), head scratch,
 	// candidate top-k scratch
-	{
+	if ( speculation_ == Speculation::DFlash ) {
 		engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, config_.hidden_size, S, true );
 		// embedding: set when the table is loaded (host-resident, shared by every rank)
 		int tap_shape[2] = { R, config_.hidden_size };
@@ -2104,7 +2104,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 
 		// Tapped layer states for the DFlash2 drafter: position-indexed ring, owner/slot/position read on device.
 		// The tapped hidden state of an mHC layer is the mean of its four residual streams (as HyperHead).
-		for ( int tap = 0; tap < 5; ++tap ) {
+		for ( int tap = 0; tap < 5 && draft_.taps.data != nullptr; ++tap ) {
 			if ( layer != config_.tap_layers[tap] ) continue;
 			engine::spec::dflash_reduce_streams( hidden_streams_.ptr<const float>(), tap_tmp_.ptr<backend::half_t>(), m, H, 0, stream );
 			engine::spec::dflash_publish_taps_slots(

@@ -71,8 +71,11 @@ bool Qwen3_5Pipeline::init(
 	state_.conv_checkpoint = static_cast<float*>( engine::core::arena_alloc( arena, state_.slot_conv_floats * sizeof( float ) ) );
 
 	// 2b. Per-row snapshots for the speculative verify forward (kDraftM rows, one speculating slot).
-	state_.gdn_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * state_.slot_gdn_floats * sizeof( float ) ) );
-	state_.conv_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * state_.slot_conv_floats * sizeof( float ) ) );
+	// Only with a speculator: nothing else commits a row's state
+	if ( speculation_ != Speculation::None ) {
+		state_.gdn_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * state_.slot_gdn_floats * sizeof( float ) ) );
+		state_.conv_snap = static_cast<float*>( engine::core::arena_alloc( arena, kDraftM * state_.slot_conv_floats * sizeof( float ) ) );
+	}
 	state_.d_snap_on = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
 	backend::memset_sync( state_.d_snap_on, 0, sizeof( int ) );
 
@@ -93,7 +96,7 @@ bool Qwen3_5Pipeline::init(
 	// The ring is per position, not per slot (a per-slot ring would cost ~840 MiB per rank), so only
 	// one slot may publish into it: rows from every other slot are skipped on device. The owner is a
 	// device scalar so the captured forward graph stays valid when it changes. -1 publishes nothing.
-	engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, config_.hidden_size, 1, false );
+	if ( speculation_ == Speculation::DFlash ) engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, config_.hidden_size, 1, false );
 	draft_hooks_.embedding = &embed_tokens_;
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
@@ -769,8 +772,8 @@ void Qwen3_5Pipeline::layer_forward( const Qwen3_5LayerWeights& lw, int& full_at
 		float* hist_ptr = state_.conv_history + static_cast<size_t>( linear_idx ) * lin_channels * 3;
 		float* layer_gdn_state = state_.gdn_states + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
 		const int snap_rows = MIN( m, kDraftM );
-		float* conv_snap = state_.conv_snap + static_cast<size_t>( linear_idx ) * lin_channels * 3;
-		float* gdn_snap = state_.gdn_snap + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
+		float* conv_snap = state_.conv_snap ? state_.conv_snap + static_cast<size_t>( linear_idx ) * lin_channels * 3 : nullptr;
+		float* gdn_snap = state_.gdn_snap ? state_.gdn_snap + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128 : nullptr;
 
 		pod::TensorView qkv_rows = pod::make_tensor_2d( qkv_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, lin_channels );
 		pod::TensorView out_rows = pod::make_tensor_2d( gdn_out_.ptr<backend::half_t>(), pod::DType::FP16, m, v_heads * 128 );
@@ -877,7 +880,7 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 		// Tapped layer states for DFlash2: the hidden after layer tap_layers[tap], position-indexed for the drafter's context stage. Each
 		// row lands in its own ring slot. The slot, the position and the owner all come from device memory: forward_body is replayed from a
 		// CUDA graph keyed only on the row count, and a host-side value would be frozen at capture time.
-		for ( int tap = 0; tap < 5; ++tap ) {
+		for ( int tap = 0; tap < 5 && draft_.taps.data != nullptr; ++tap ) {
 			if ( layer != config_.tap_layers[tap] ) continue;
 			engine::spec::dflash_publish_taps(
 				draft_.taps.ptr<backend::half_t>(), hidden_states_.ptr<const backend::half_t>(), d_rows_, draft_.taps_owner,

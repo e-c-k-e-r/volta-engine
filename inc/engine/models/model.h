@@ -86,6 +86,10 @@ public:
 	// 1. Lifecycle & weight loading
 	// Rank count of the tensor-parallel group; call before init(). A null ring means a group of one.
 	void set_tp_size( int tp ) { requested_tp_ = tp; }
+	// The speculator the cluster will attach (call before init()): a model allocates the verify snapshots only when one will run, and the
+	// drafter's tap ring only for DFlash2
+	enum class Speculation { None, Mtp, DFlash, Other };
+	void set_speculation( Speculation s ) { speculation_ = s; }
 	// Bytes the arena must still hold after the weights (the speculator's); a model sizing something from the free arena keeps them back. Before load_weights
 	virtual void set_reserve_after_weights( size_t bytes ) { (void) bytes; }
 	virtual bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) = 0;
@@ -301,6 +305,7 @@ public:
 
 protected:
 	int requested_tp_ = ENGINE_NUM_GPUS;
+	Speculation speculation_ = Speculation::DFlash;   // what a model allocates for when nobody says (standalone tests)
 };
 
 // Factory helper to instantiate models dynamically

@@ -196,8 +196,11 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	state_.slot_conv_floats = static_cast<size_t>( linear_layers ) * lin_channels_ * 3;
 	state_.conv_history = static_cast<float*>( engine::core::arena_alloc( arena, static_cast<size_t>( S ) * state_.slot_conv_floats * sizeof( float ) ) );
 	backend::memset_sync( state_.conv_history, 0, static_cast<size_t>( S ) * state_.slot_conv_floats * sizeof( float ) );
-	state_.gdn_snap = static_cast<float*>( engine::core::arena_alloc( arena, kSnapRows * state_.slot_gdn_floats * sizeof( float ) ) );
-	state_.conv_snap = static_cast<float*>( engine::core::arena_alloc( arena, kSnapRows * state_.slot_conv_floats * sizeof( float ) ) );
+	// Only with a speculator: nothing else commits a row's state
+	if ( speculation_ != Speculation::None ) {
+		state_.gdn_snap = static_cast<float*>( engine::core::arena_alloc( arena, kSnapRows * state_.slot_gdn_floats * sizeof( float ) ) );
+		state_.conv_snap = static_cast<float*>( engine::core::arena_alloc( arena, kSnapRows * state_.slot_conv_floats * sizeof( float ) ) );
+	}
 	state_.d_snap_on = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
 	backend::memset_sync( state_.d_snap_on, 0, sizeof( int ) );
 
@@ -289,7 +292,7 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	}
 	// DFlash2 attachment: a position-indexed tap ring per slot (every slot's rows publish to its own, so each can feed the drafter), head scratch and the
 	// per-rank candidate top-k scratch. The MTP head has no use for them
-	draft_taps_on_ = !mtp_on_;
+	draft_taps_on_ = !mtp_on_ && speculation_ == Speculation::DFlash;
 	if ( draft_taps_on_ ) {
 		engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, H, S, true );
 		draft_hooks_.embedding = &embed_table_;   // loaded by load_weights; the hooks point at the member
@@ -1067,8 +1070,8 @@ void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_i
 	float* hist = state_.conv_history + static_cast<size_t>( linear_idx ) * channels * 3;
 	float* layer_state = state_.gdn_states + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
 	const int snap_rows = MIN( m, kSnapRows );
-	float* conv_snap = state_.conv_snap + static_cast<size_t>( linear_idx ) * channels * 3;
-	float* gdn_snap = state_.gdn_snap + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128;
+	float* conv_snap = state_.conv_snap ? state_.conv_snap + static_cast<size_t>( linear_idx ) * channels * 3 : nullptr;
+	float* gdn_snap = state_.gdn_snap ? state_.gdn_snap + static_cast<size_t>( linear_idx ) * v_heads * 128 * 128 : nullptr;
 
 	pod::TensorView qkv_rows = pod::make_tensor_2d( qkv_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, channels );
 	pod::TensorView out_rows = pod::make_tensor_2d( gdn_out_.ptr<backend::half_t>(), pod::DType::FP16, m, v_heads * 128 );
