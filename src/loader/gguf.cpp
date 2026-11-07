@@ -162,6 +162,7 @@ bool gguf_open( pod::SafeTensorsFile& st, const char* path, const pod::SafeTenso
 		if ( s->arch_name == "qwen35" ) have_arch = gguf_arch_qwen35( s->kv, &s->arch );
 		else if ( s->arch_name == "qwen4exp" ) have_arch = gguf_arch_qwen4exp( s->kv, &s->arch );
 		else if ( s->arch_name == "dflash" ) have_arch = gguf_arch_dflash( s->kv, &s->arch );
+		else if ( s->arch_name == "glm5-next" ) have_arch = gguf_arch_glm5next( s->kv, &s->arch );
 		if ( !have_arch ) {
 			LOG_ERROR( "[gguf] %s: architecture '%s' has no adapter\n", path, s->arch_name.c_str() );
 			safetensors_close( st );
@@ -238,6 +239,17 @@ bool gguf_open( pod::SafeTensorsFile& st, const char* path, const pod::SafeTenso
 					float* v = reinterpret_cast<float*>( data.data() );
 					for ( size_t i = 0; i < meta.size_bytes / sizeof( float ); ++i ) v[i] = m.transform == GgufTransform::NormMinusOne ? v[i] - 1.0f : std::log( -v[i] );
 				}
+				else if ( m.transform == GgufTransform::TransposeHeads ) {
+					// ne = [b, a, heads]: head h's a x b matrix becomes b x a
+					if ( t.ne.size() != 3 || ( type != GgmlType::F32 && type != GgmlType::F16 && type != GgmlType::BF16 ) ) return fail( "a per-head transposed tensor is not a 3-D float tensor" );
+					const size_t es = type == GgmlType::F32 ? 4 : 2, b = t.ne[0], a = t.ne[1], heads = t.ne[2];
+					const std::vector<uint8_t> src_copy( data );
+					for ( size_t h = 0; h < heads; ++h ) {
+						for ( size_t i = 0; i < a; ++i ) {
+							for ( size_t j = 0; j < b; ++j ) std::memcpy( &data[( ( h * b + j ) * a + i ) * es], &src_copy[( ( h * a + i ) * b + j ) * es], es );
+						}
+					}
+				}
 				else {
 					const int first_row = m.transform == GgufTransform::RowsUntileVPart ? m.row_offset : 0;
 					if ( s->arch.k_heads > 0 && static_cast<size_t>( first_row + s->arch.v_heads * m.head_dim ) != n_rows ) return fail( "V-head rows do not match the tensor" );
@@ -253,15 +265,24 @@ bool gguf_open( pod::SafeTensorsFile& st, const char* path, const pod::SafeTenso
 			bool all = true;
 			for ( const auto& g : got ) all = all && g.ndim > 0;
 			if ( !all ) continue;
-			// every part read: one host copy of their rows in part order
+			// every part read: one host copy of their rows in part order (or head by head)
 			pod::SafeTensorMeta joined = got[0];
 			std::vector<uint8_t> data;
 			int joined_rows = 0;
 			for ( const auto& g : got ) {
-				if ( g.gguf_type != joined.gguf_type || g.ndim != 2 || g.shape[1] != joined.shape[1] ) return fail( "the parts of a split tensor differ in type or width" );
-				const uint8_t* src = g.host ? static_cast<const uint8_t*>( g.host ) : static_cast<const uint8_t*>( st.mmap_addr ) + g.data_offset_bytes;
-				data.insert( data.end(), src, src + g.size_bytes );
+				bool same = g.gguf_type == joined.gguf_type && g.ndim == joined.ndim && g.ndim >= 2;
+				for ( int d = 1; d < g.ndim && same; ++d ) same = g.shape[d] == joined.shape[d];
+				if ( !same ) return fail( "the parts of a split tensor differ in type or inner dimensions" );
 				joined_rows += g.shape[0];
+			}
+			const int heads = m.interleave_heads > 0 ? m.interleave_heads : 1;
+			for ( int h = 0; h < heads; ++h ) {
+				for ( const auto& g : got ) {
+					if ( g.size_bytes % heads != 0 ) return fail( "a head-interleaved part does not split into its heads" );
+					const size_t per = g.size_bytes / heads;
+					const uint8_t* src = ( g.host ? static_cast<const uint8_t*>( g.host ) : static_cast<const uint8_t*>( st.mmap_addr ) + g.data_offset_bytes ) + h * per;
+					data.insert( data.end(), src, src + per );
+				}
 			}
 			joined.shape[0] = joined_rows;
 			joined.size_bytes = data.size();

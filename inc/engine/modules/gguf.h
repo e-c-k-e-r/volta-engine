@@ -60,6 +60,7 @@ struct MoEGguf {
 		int num_local = 0, first_expert = 0;   // global id of local expert 0
 		GgmlType type[3] = {};                 // gate, up, down
 		int hidden = 0, inter = 0;
+		float act_limit = 0.0f;                // > 0: the SwiGLU clamp (gate <= limit, up in [-limit, limit])
 	};
 	static size_t scratch_bytes( int top_k, int hidden, int inter );
 	// out[m, hidden] (FP16) = this rank's experts over the routes of x[m, hidden]; topk ids are global, routes to other ranks' experts add 0.

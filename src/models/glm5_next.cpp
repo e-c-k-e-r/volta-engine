@@ -8,6 +8,7 @@
 #include "engine/loader/safetensors.h"
 #include "engine/modules/gdn.h"
 #include "engine/modules/dsa.h"
+#include "engine/modules/gguf.h"
 #include "engine/modules/embedding.h"
 #include "engine/modules/cpu_experts.h"
 #include "engine/runtime/cpu_expert_attach.h"
@@ -53,15 +54,17 @@ pod::TensorView load_router_weights_glm(
 	int hidden_size = meta->shape[1]; // 4096
 	const backend::half_t* src = static_cast<const backend::half_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta ) );
 	if ( !src ) return pod::TensorView{};
-	// The NVFP4 checkpoint stores the gate in BF16 (a BF16 gate read as FP16 routes every token wrongly)
+	// The NVFP4 checkpoint stores the gate in BF16 and a GGUF conversion in FP32 (a gate read as the wrong type routes every token wrongly)
 	std::vector<backend::half_t> converted;
-	if ( meta->dtype == pod::DType::BF16 ) {
+	if ( meta->dtype == pod::DType::BF16 || meta->dtype == pod::DType::FP32 ) {
 		converted.resize( static_cast<size_t>( num_experts ) * hidden_size );
-		const uint16_t* bf = reinterpret_cast<const uint16_t*>( src );
 		for ( size_t i = 0; i < converted.size(); ++i ) {
-			const uint32_t u = static_cast<uint32_t>( bf[i] ) << 16;
 			float f;
-			std::memcpy( &f, &u, 4 );
+			if ( meta->dtype == pod::DType::FP32 ) f = reinterpret_cast<const float*>( src )[i];
+			else {
+				const uint32_t u = static_cast<uint32_t>( reinterpret_cast<const uint16_t*>( src )[i] ) << 16;
+				std::memcpy( &f, &u, 4 );
+			}
 			converted[i] = backend::from_float_half( f );
 		}
 		src = converted.data();
@@ -721,15 +724,14 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		const auto* meta = repo.find( ename, &shard_idx );
 		if ( meta == nullptr || shard_idx < 0 ) { LOG_ERROR( "[RANK %d] MISSING: embed_tokens\n", rank_ ); ++missing_count; }
 		else {
-			const size_t bytes = static_cast<size_t>( config_.vocab_size ) * config_.hidden_size * sizeof( uint16_t );
-			const void* src = engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard_idx ), meta );
+			const size_t elems = static_cast<size_t>( config_.vocab_size ) * config_.hidden_size;
 			if ( g_embed_table.data == nullptr ) {
-				void* host = backend::host_alloc_pinned( bytes, backend::Pin::MappedPortable );
+				void* host = backend::host_alloc_pinned( elems * sizeof( uint16_t ), backend::Pin::MappedPortable );
 				ENGINE_ASSERT( host != nullptr, "Glm5NextPipeline: pinned embedding table allocation failed" );
 				g_embed_table = pod::make_tensor_2d( host, pod::DType::BF16, config_.vocab_size, config_.hidden_size );
 			}
-			if ( src == nullptr ) { ++missing_count; }
-			else { std::memcpy( g_embed_table.data, src, bytes ); }
+			// BF16 in the checkpoint; a GGUF conversion's blocks are dequantized and rounded to BF16
+			if ( !repo.copy_host_bf16( ename, static_cast<uint16_t*>( g_embed_table.data ), elems, stream ) ) ++missing_count;
 		}
 	}
 	embed_tokens_ = g_embed_table;
@@ -893,7 +895,15 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			wb_router += arena_->offset_bytes - wb_attn_end;
 			// 72 local experts for this rank
 			auto& mw = lw.moe_weights;
-			mw.type = pod::QuantType::TRELLIS;
+			// a GGUF conversion holds the experts as block-quantized weights (the stacked tensors, read expert by expert)
+			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.0.gate_proj.weight", L );
+			const pod::SafeTensorMeta* em = repo.find( name_buf );
+			const bool gguf_experts = em != nullptr && em->dtype == pod::DType::GGUF;
+			mw.type = gguf_experts ? pod::QuantType::GGUF : pod::QuantType::TRELLIS;
+			if ( gguf_experts && state_.moe.gguf_ws == nullptr ) {
+				const int inter_local = moe_tp_ ? config_.intermediate_size / config_.tp_size : config_.intermediate_size;
+				state_.moe.gguf_ws = engine::core::arena_alloc( *arena_, engine::modules::MoEGguf::scratch_bytes( config_.top_k, config_.hidden_size, inter_local ), 256 );
+			}
 			mw.num_local_experts = experts_per_rank;
 			// nvfp4_expert_layers: this layer's routed experts from the modelopt NVFP4 checkpoint, resident, outside the tier
 			size_t experts_cost_from = arena_->offset_bytes;
@@ -932,6 +942,19 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 					}
 					int moe_layers = 0;
 					for ( int ll = 0; ll < config_.num_layers; ++ll ) moe_layers += ( ll >= 3 ) ? 1 : 0;
+					// a GGUF conversion's block types differ between layers: every MoE layer's own sizes
+					std::vector<std::array<size_t, 3>> per_layer;
+					if ( gguf_experts ) {
+						for ( int ll = 3; ll < config_.num_layers; ++ll ) {
+							std::array<size_t, 3> b{};
+							for ( int p = 0; p < 3; ++p ) {
+								std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", ll, start_expert, kinds[p] );
+								b[p] = repo.trellis_bytes( name_buf );
+								ENGINE_ASSERT( b[p] > 0, "Glm5NextPipeline: GGUF expert blocks not found for the tier" );
+							}
+							per_layer.push_back( b );
+						}
+					}
 					if ( tier_fraction <= 0.0 ) {
 						auto_base = auto_resident( repo, L, layers_begin, experts_cost, 0, experts_per_rank, bytes[0] + bytes[1] + bytes[2], moe_layers );
 						tier_fraction = ( auto_base + 0.25 ) / experts_per_rank;
@@ -939,7 +962,8 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 						if ( tier_fraction < kFusedTierMinFraction ) state_.moe.coop_ctr = nullptr;
 #endif
 					}
-					tier_.start( experts_per_rank, tier_fraction, bytes, rank_, config_.tp_size, moe_layers, runtime::options().expert_stream, host_arena_ );
+					tier_.start( experts_per_rank, tier_fraction, bytes, rank_, config_.tp_size, moe_layers, runtime::options().expert_stream, host_arena_,
+						per_layer.empty() ? nullptr : &per_layer );
 				}
 				experts_cost_from = arena_->offset_bytes;
 				int layer_resident = tier_.resident;

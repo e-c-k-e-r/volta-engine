@@ -98,12 +98,17 @@ void moe_proj_kernel( const void* const* __restrict__ ptrs, const Item* __restri
 	}
 }
 
-// act = SiLU( gate ) * up of every route, quantized to q8_1 ([route][inter / 32]) as quantize_q8_1_kernel does
-__global__ void moe_act_q8_kernel( const float* __restrict__ g, const float* __restrict__ u, block_q8_1* __restrict__ q, int inter ) {
+// act = SiLU( gate ) * up of every route, quantized to q8_1 ([route][inter / 32]) as quantize_q8_1_kernel does; limit > 0 clamps the
+// gate from above and up to [-limit, limit] first (SwiGLU::forward's activation limit)
+__global__ void moe_act_q8_kernel( const float* __restrict__ g, const float* __restrict__ u, block_q8_1* __restrict__ q, int inter, float limit ) {
 	const int r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
 	if ( i >= inter ) return;
-	const float gv = g[static_cast<size_t>( r ) * inter + i];
-	const float a = gv / ( 1.0f + __expf( -gv ) ) * u[static_cast<size_t>( r ) * inter + i];
+	float gv = g[static_cast<size_t>( r ) * inter + i], uv = u[static_cast<size_t>( r ) * inter + i];
+	if ( limit > 0.0f ) {
+		gv = fminf( gv, limit );
+		uv = fmaxf( -limit, fminf( uv, limit ) );
+	}
+	const float a = gv / ( 1.0f + __expf( -gv ) ) * uv;
 	float amax = fabsf( a ), sum = a;
 	#pragma unroll
 	for ( int o = 16; o > 0; o >>= 1 ) {
@@ -197,7 +202,7 @@ void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx
 		quantize_q8_1_kernel<<<dim3( ( t.hidden + 255 ) / 256, rn ), 256, 0, stream>>>( x + static_cast<size_t>( r0 ) * t.hidden, xq, t.hidden, GgufColTiling{} );
 		proj( t.type[0], gate, items, n_items, sorted, mi, xq, true, t.hidden, t.inter, tw, top_k, false, g, stream );
 		proj( t.type[1], up, items, n_items, sorted, mi, xq, true, t.hidden, t.inter, tw, top_k, false, u, stream );
-		moe_act_q8_kernel<<<dim3( ( t.inter + 127 ) / 128, routes ), 128, 0, stream>>>( g, u, aq, t.inter );
+		moe_act_q8_kernel<<<dim3( ( t.inter + 127 ) / 128, routes ), 128, 0, stream>>>( g, u, aq, t.inter, t.act_limit );
 		proj( t.type[2], down, items, n_items, sorted, mi, aq, false, t.inter, t.hidden, tw, top_k, true, part, stream );
 		moe_combine_kernel<<<( rn * t.hidden + 255 ) / 256, 256, 0, stream>>>( part, ti, t.first_expert, t.num_local, out + static_cast<size_t>( r0 ) * t.hidden, rn, top_k, t.hidden );
 	}

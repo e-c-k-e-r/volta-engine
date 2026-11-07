@@ -28,6 +28,7 @@ enum class GgufTransform {
 	RowsUntile,          // rows in tiled V-head order (head_dim rows per head): back to grouped order
 	RowsUntileVPart,     // the same for the rows after the first `row_offset` (the V part of [q | k | v])
 	ColsTiled,           // input columns in tiled order: left as stored, flagged (GGUF_COLS_V_TILED)
+	TransposeHeads,      // a stack of per-head matrices stored transposed ([heads][a][b] for [heads][b][a]; F32 / F16 / BF16): each transposed back
 };
 
 struct GgufMapped {
@@ -41,6 +42,8 @@ struct GgufMapped {
 	int64_t row_begin = 0, rows = -1;
 	// One of `parts` GGUF tensors whose rows, in part order, make up the Hugging Face tensor (the converter split it)
 	int part = 0, parts = 1;
+	// > 0: the parts are joined head by head (that many heads, each part's rows split evenly) instead of one after the other
+	int interleave_heads = 0;
 };
 
 struct GgufArch {
@@ -54,5 +57,6 @@ struct GgufArch {
 bool gguf_arch_qwen35( const GgufKv& kv, GgufArch* out );
 bool gguf_arch_qwen4exp( const GgufKv& kv, GgufArch* out );
 bool gguf_arch_dflash( const GgufKv& kv, GgufArch* out );
+bool gguf_arch_glm5next( const GgufKv& kv, GgufArch* out );
 
 } // namespace engine::loader

@@ -938,23 +938,17 @@ size_t SafeTensorsRepo::bytes_of( const std::string& prefix, std::initializer_li
 	return total;
 }
 
-pod::TensorView SafeTensorsRepo::shared_host_bf16( const char* name, backend::stream_t stream ) {
-	static std::mutex mu;
-	static std::map<std::string, pod::TensorView> tables;
-	std::lock_guard<std::mutex> lk( mu );
-	if ( const auto it = tables.find( name ); it != tables.end() ) return it->second;
+bool SafeTensorsRepo::copy_host_bf16( const char* name, uint16_t* dst, size_t elems, backend::stream_t stream ) {
 	int shard = -1;
 	const auto* meta = find( name, &shard );
-	if ( meta == nullptr || shard < 0 || meta->ndim != 2 ) return pod::TensorView{};
+	if ( meta == nullptr || shard < 0 || meta->ndim != 2 ) return false;
 	meta = engine::loader::gguf_float_view( shards_[shard], meta, stream );
 	const void* src = safetensors_get_data_cpu( shards_[shard], meta );
-	if ( src == nullptr ) return pod::TensorView{};
 	const size_t n = static_cast<size_t>( meta->shape[0] ) * meta->shape[1];
-	auto* dst = static_cast<uint16_t*>( backend::host_alloc_pinned( n * sizeof( uint16_t ), backend::Pin::MappedPortable ) );
-	ENGINE_ASSERT( dst != nullptr, "shared_host_bf16: pinned allocation failed" );
+	if ( src == nullptr || n != elems ) return false;
 	if ( meta->dtype == pod::DType::BF16 ) std::memcpy( dst, src, n * sizeof( uint16_t ) );
 	else {
-		ENGINE_ASSERT( meta->dtype == pod::DType::FP16 || meta->dtype == pod::DType::FP32, "shared_host_bf16: BF16, FP16, FP32 or GGUF tensors" );
+		ENGINE_ASSERT( meta->dtype == pod::DType::FP16 || meta->dtype == pod::DType::FP32, "copy_host_bf16: BF16, FP16, FP32 or GGUF tensors" );
 		for ( size_t i = 0; i < n; ++i ) {
 			// round to nearest even
 			float f = meta->dtype == pod::DType::FP32 ? static_cast<const float*>( src )[i] : backend::to_float( static_cast<const backend::half_t*>( src )[i] );
@@ -963,7 +957,25 @@ pod::TensorView SafeTensorsRepo::shared_host_bf16( const char* name, backend::st
 			dst[i] = static_cast<uint16_t>( ( u + 0x7FFFu + ( ( u >> 16 ) & 1u ) ) >> 16 );
 		}
 	}
-	const pod::TensorView t = pod::make_tensor_2d( dst, pod::DType::BF16, meta->shape[0], meta->shape[1] );
+	return true;
+}
+
+pod::TensorView SafeTensorsRepo::shared_host_bf16( const char* name, backend::stream_t stream ) {
+	static std::mutex mu;
+	static std::map<std::string, pod::TensorView> tables;
+	std::lock_guard<std::mutex> lk( mu );
+	if ( const auto it = tables.find( name ); it != tables.end() ) return it->second;
+	const auto* meta = find( name );
+	if ( meta == nullptr || meta->ndim != 2 ) return pod::TensorView{};
+	const int rows = meta->shape[0], cols = meta->shape[1];
+	const size_t n = static_cast<size_t>( rows ) * cols;
+	auto* dst = static_cast<uint16_t*>( backend::host_alloc_pinned( n * sizeof( uint16_t ), backend::Pin::MappedPortable ) );
+	ENGINE_ASSERT( dst != nullptr, "shared_host_bf16: pinned allocation failed" );
+	if ( !copy_host_bf16( name, dst, n, stream ) ) {
+		backend::host_free_pinned( dst );
+		return pod::TensorView{};
+	}
+	const pod::TensorView t = pod::make_tensor_2d( dst, pod::DType::BF16, rows, cols );
 	tables[name] = t;
 	return t;
 }
@@ -1341,6 +1353,12 @@ pod::LinearWeight SafeTensorsRepo::load_linear_cols_padded(
 ) {
 	char name_buf[512];
 	int shard = -1;
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
+	if ( const auto* gm = find( name_buf, &shard ); gm != nullptr && gm->dtype == pod::DType::GGUF ) {
+		// the output rows of the column blocks (16 per block), then the pad rows (zero blocks: exactly 0 logits)
+		ENGINE_ASSERT( ( col_block_begin + col_blocks ) * 16 <= gm->shape[0], "column range outside the tensor" );
+		return gguf_linear( shard, gm, arena, { { col_block_begin * 16, col_blocks * 16 } }, { { 0, gm->shape[1] } }, pad_cols, stream );
+	}
 
 	// Trellis: rank's column slice, zero-padded to pad_cols. The pad rows are never read for a token
 	// decision (the argmax range stops at the real width), but the kernel still walks them, so they

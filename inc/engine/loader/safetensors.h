@@ -96,6 +96,8 @@ public:
 	// asks for the same name (an embedding table read a few rows per forward over the link); converted from BF16, FP16, FP32 or GGUF
 	// blocks. Empty when the tensor is missing
 	pod::TensorView shared_host_bf16( const char* name, backend::stream_t stream = nullptr );
+	// A [rows, cols] tensor converted to BF16 into dst (rows * cols values; BF16, FP16, FP32 or GGUF blocks); false when it is missing
+	bool copy_host_bf16( const char* name, uint16_t* dst, size_t elems, backend::stream_t stream = nullptr );
 	// Bytes of the codes of `base_name`: its trellis, or the blocks of a GGUF weight (0 when it is neither)
 	size_t trellis_bytes( const char* base_name ) const;
 	// Where a tensor's bytes are in its shard file (an open descriptor, absolute offset), for reads that bypass the mmap

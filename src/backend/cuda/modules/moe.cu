@@ -894,7 +894,7 @@ void MoE::forward(
 	// Fused decode path: gate/up and down GEMV kernels over runs of rows that share an expert (exl3_moe_coop.cuh)
 	// 3 bpw (up to 8 routes: the integer tile) and 4 bpw experts, all mul1
 	if ( weights.type == pod::QuantType::GGUF ) {
-		ENGINE_ASSERT( scratch.gguf_ws != nullptr && weights.device_ptrs != nullptr && act_limit <= 0.0f, "MoE::forward: GGUF experts need their scratch, init_device_ptrs and no activation limit" );
+		ENGINE_ASSERT( scratch.gguf_ws != nullptr && weights.device_ptrs != nullptr, "MoE::forward: GGUF experts need their scratch and init_device_ptrs" );
 		MoEGguf::Table t;
 		t.ptrs = static_cast<const void* const*>( weights.staged_ptrs != nullptr ? weights.staged_ptrs : weights.device_ptrs );   // a prefill layer reads its cold experts from the stage buffer
 		t.num_local = weights.num_local_experts;
@@ -904,6 +904,7 @@ void MoE::forward(
 		t.type[2] = static_cast<GgmlType>( weights.down[0].gguf_type );
 		t.hidden = x.shape[x.ndim - 1];
 		t.inter = weights.gate[0].gguf_n;
+		t.act_limit = act_limit;
 		MoEGguf::forward( t, x.ptr<const half>(), rows, d_topk_indices, d_topk_weights, weights.top_k, out.ptr<half>(), scratch.gguf_ws, weights.heat, stream );
 		return;
 	}
