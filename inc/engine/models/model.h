@@ -297,7 +297,6 @@ public:
 	// 6. Output descriptors & tapped states
 	virtual pod::TensorView& logits() = 0;
 	virtual const pod::TensorView& logits() const = 0;
-	virtual const backend::half_t* tapped_states( int row = 0 ) const = 0;
 	virtual const ModelMetadata& get_metadata() const = 0;
 
 protected:

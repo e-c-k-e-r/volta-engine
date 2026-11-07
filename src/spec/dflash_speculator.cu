@@ -368,8 +368,15 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 
 	// Candidate selector: read by the walk on the output rank (0) only.
 	if ( R == 0 ) {
-		pred_codebook_ = repo.load( "candidate_selector.predecessor_codebook", *arena_, stream, pod::DType::FP16 );
-		succ_codebook_ = repo.load( "candidate_selector.successor_codebook", *arena_, stream, pod::DType::FP16 );
+		// into the codebooks init() reserved (a standalone run without weights keeps them as they are)
+		auto into = [&]( const char* name, pod::TensorView& book ) {
+			pod::MemoryArena in_book{ book.data, book.size_bytes(), 0, false };
+			const pod::TensorView t = repo.load( name, book.data ? in_book : *arena_, stream, pod::DType::FP16 );
+			ENGINE_ASSERT( !book.data || !t.data || t.data == book.data, "dflash2: a codebook does not fit the reserved one" );
+			if ( t.data ) book = t;
+		};
+		into( "candidate_selector.predecessor_codebook", pred_codebook_ );
+		into( "candidate_selector.successor_codebook", succ_codebook_ );
 		// The selector's hidden projection is a plain FP16 [rank, hidden] matrix, not a trellis tensor, so
 		// it cannot go through load_linear. Stored as a raw weight for a small dedicated GEMV.
 		hidden_proj_w_ = load_dense_proj( repo, "candidate_selector.hidden_projection", *arena_, stream );

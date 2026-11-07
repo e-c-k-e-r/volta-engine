@@ -87,14 +87,8 @@ bool Qwen3_5Pipeline::init(
 	norm_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	backend::memset_sync( hidden_states_.data, 0, hidden_states_.size_bytes() );
 
-	// Tapped hidden states for DFlash2: [R, 5, hidden]
-	const size_t tap_bytes = static_cast<size_t>( R ) * 5 * config_.hidden_size * sizeof( backend::half_t );
-	tapped_states_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, tap_bytes ) );
-	backend::memset_sync( tapped_states_, 0, tap_bytes );
-
-	// Drafter context taps. tapped_states_ only survives the last forward (MAX_BATCH rows), but the
-	// drafter's context stage needs every position in the window, so keep a position-indexed ring of
-	// the same per-position [5, hidden] tap set.
+	// Drafter context taps: the drafter's context stage needs every position in the window, so a position-indexed ring of the
+	// per-position [5, hidden] tap set (the hidden after each tap layer).
 	//
 	// The ring is per position, not per slot (a per-slot ring would cost ~840 MiB per rank), so only
 	// one slot may publish into it: rows from every other slot are skipped on device. The owner is a
@@ -170,7 +164,8 @@ bool Qwen3_5Pipeline::init(
 	lm_shard_cols_ = lm_shard_real_cols_ + pad_cols;
 	if ( mtp_on_ ) sparse_.init( arena, config_.hidden_size, lm_shard_real_cols_, lm_shard_cols_, 1 );
 	{
-		int logit_shape[2] = { R, lm_shard_cols_ };
+		// every row's logits are computed for decode-size forwards only (prefill reads its last row): MAX_BATCH rows
+		int logit_shape[2] = { pod::MAX_BATCH, lm_shard_cols_ };
 		logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, logit_shape, 2 );
 		d_argmax_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 		d_argmax_val_ = static_cast<float*>( engine::core::arena_alloc( arena, R * sizeof( float ) ) );
@@ -879,14 +874,11 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 		layer_forward( layers_[layer], full_attn_idx, linear_idx, m, stream );
 		steer_.layer_rows( hidden_states_.ptr<backend::half_t>(), d_rows_, m, layer, stream );
 
-		// Tapped layer states for DFlash2: tapped_states_[r][tap] = hidden after layer tap_layers[tap]
+		// Tapped layer states for DFlash2: the hidden after layer tap_layers[tap], position-indexed for the drafter's context stage. Each
+		// row lands in its own ring slot. The slot, the position and the owner all come from device memory: forward_body is replayed from a
+		// CUDA graph keyed only on the row count, and a host-side value would be frozen at capture time.
 		for ( int tap = 0; tap < 5; ++tap ) {
 			if ( layer != config_.tap_layers[tap] ) continue;
-			backend::memcpy2d_async( tapped_states_ + static_cast<size_t>( tap ) * config_.hidden_size, 5 * config_.hidden_size * sizeof( backend::half_t ), hidden_states_.data, config_.hidden_size * sizeof( backend::half_t ), config_.hidden_size * sizeof( backend::half_t ), m, backend::Copy::D2D, stream );
-			// Also keep it position-indexed for the drafter's context stage. Each row lands in its own
-			// ring slot, so this cannot be the same strided copy as above. The slot, the position and
-			// the owner all come from device memory: forward_body is replayed from a CUDA graph keyed
-			// only on the row count, and a host-side value would be frozen at capture time.
 			engine::spec::dflash_publish_taps(
 				draft_.taps.ptr<backend::half_t>(), hidden_states_.ptr<const backend::half_t>(), d_rows_, draft_.taps_owner,
 				m, tap, config_.hidden_size, draft_hooks_.taps_cap, stream );
@@ -914,6 +906,7 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 			steer_.penalize( l1.ptr<backend::half_t>(), lm_shard_cols_, d_rows_, m - 1, 1, rank_ * lm_shard_real_cols_, lm_shard_real_cols_, stream );
 			return;
 		}
+		ENGINE_ASSERT( m <= pod::MAX_BATCH, "Qwen3_5Pipeline: every row's logits are kept for up to MAX_BATCH rows" );
 		engine::modules::RMSNorm::forward(
 			hidden_states_, final_norm_, norm_hidden_, config_.rms_norm_eps, config_.rms_norm_bias, stream
 		);

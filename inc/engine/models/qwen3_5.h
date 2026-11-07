@@ -153,7 +153,6 @@ public:
 
 	pod::TensorView& logits() override { return logits_; }
 	const pod::TensorView& logits() const override { return logits_; }
-	const backend::half_t* tapped_states( int row = 0 ) const override { return tapped_states_ + static_cast<size_t>( row ) * 5 * config_.hidden_size; }
 	const ModelMetadata& get_metadata() const override { return metadata_; }
 
 	void destroy();
@@ -193,7 +192,6 @@ private:
 	Qwen3_5State state_;
 	bool weights_loaded_ = false;
 
-	backend::half_t* tapped_states_ = nullptr; // [MAX_BATCH, 5, hidden_size]
 	int* d_token_ids_ = nullptr;    // [MAX_ROWS]
 	int lm_mode_ = 0;               // BatchRows::LogitsMode of the forward in flight
 	pod::TensorView hidden_states_;

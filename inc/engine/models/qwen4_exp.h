@@ -157,7 +157,6 @@ public:
 
 	pod::TensorView& logits() override { return logits_; }
 	const pod::TensorView& logits() const override { return logits_; }
-	const backend::half_t* tapped_states( int row = 0 ) const override { (void) row; return nullptr; }
 	const ModelMetadata& get_metadata() const override { return metadata_; }
 
 private:

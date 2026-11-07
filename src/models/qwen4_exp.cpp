@@ -676,11 +676,14 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		wb_experts += arena_->offset_bytes - wb_experts_start;
 		mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( per_rank ) * sizeof( uint32_t ), 128 ) );
 		backend::memset_async( mw.heat, 0, static_cast<size_t>( per_rank ) * sizeof( uint32_t ), stream );
+		// The shared expert runs on rank 0 only (moe_forward), so only rank 0 holds it
 		const size_t wb_shared_start = arena_->offset_bytes;
-		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.gate_proj", pre ); lw.shared_gate = load_full_g( "shared_gate", nm, 4 );
-		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.up_proj", pre ); lw.shared_up = load_full_g( "shared_up", nm, 4 );
-		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.down_proj", pre ); lw.shared_down = load_full_g( "shared_down", nm, 4 );
-		std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert_gate.weight", pre ); lw.shared_expert_gate = dense( nm );
+		if ( rank_ == 0 ) {
+			std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.gate_proj", pre ); lw.shared_gate = load_full_g( "shared_gate", nm, 4 );
+			std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.up_proj", pre ); lw.shared_up = load_full_g( "shared_up", nm, 4 );
+			std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert.down_proj", pre ); lw.shared_down = load_full_g( "shared_down", nm, 4 );
+			std::snprintf( nm, sizeof( nm ), "%s.mlp.shared_expert_gate.weight", pre ); lw.shared_expert_gate = dense( nm );
+		}
 		wb_shared += arena_->offset_bytes - wb_shared_start;
 	};
 	for ( int L = 0; L < config_.num_layers; ++L ) {

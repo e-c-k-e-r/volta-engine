@@ -159,7 +159,6 @@ public:
 
 	pod::TensorView& logits() override { return logits_; }
 	const pod::TensorView& logits() const override { return logits_; }
-	const backend::half_t* tapped_states( int row = 0 ) const override { (void) row; return nullptr; }
 	const ModelMetadata& get_metadata() const override { return metadata_; }
 	// route counts of this rank's experts per layer, in engine order; the totals (checkpoint ids) go to expert_heat_file at exit
 	bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) override;
