@@ -7,6 +7,7 @@
 #include "engine/core/batch.h"
 #include "engine/backend/runtime.h"
 #include <algorithm>
+#include <cstdlib>
 #include "gguf_common.cuh"
 #include "ggml/convert.cuh"
 #include "ggml/dequantize.cuh"
@@ -282,6 +283,152 @@ __global__ void tile_reduce_kernel( const float* __restrict__ part, half* __rest
 	out[i] = __float2half_rn( v );
 }
 
+// Volta tensor-core kernel (2 to 16 rows, the types with an MmaDec): mma.m8n8k4, whose 8-lane quad pairs each multiply an 8 x 4 block of
+// activations (row p of a lane: p = lane % 4 + 4 * (lane >= 16)) with a 4 x 8 block of the weight (column p of a lane: weight row p of the
+// pair). A lane decodes 4 consecutive values of its own weight row per step straight into that B fragment, so every weight value is decoded
+// once for all rows and multiplied on the tensor cores; a warp's four quad pairs hold 32 weight rows, the warps of a block and, when the
+// grid is small, the blocks split k. Fragment layouts measured on sm_70 (C: rows (lane & 1) + 4 (lane >= 16) and + 2, columns (lane & 2)
+// + {0, 1, 4, 5}, in register order (r, c) (r, c + 1) (r + 2, c) (r + 2, c + 1), then the same 4 columns on).
+constexpr int kMmaWarps = 4, kMmaRows = 32, kMmaMinRows = 3;
+
+__device__ __forceinline__ void mma884( float d[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1 ) {
+	asm( "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};"
+		: "+f"( d[0] ), "+f"( d[1] ), "+f"( d[2] ), "+f"( d[3] ), "+f"( d[4] ), "+f"( d[5] ), "+f"( d[6] ), "+f"( d[7] ) : "r"( a0 ), "r"( a1 ), "r"( b0 ), "r"( b1 ) );
+}
+
+__device__ __forceinline__ uint32_t h2u( half2 h ) { return *reinterpret_cast<const uint32_t*>( &h ); }
+
+// A type's decode for the kernel: its group (values staged per row at a time), the bytes of a group, the staging stride, and pair(): the
+// products of one 64-value stretch of a lane's row with its activation rows
+template <GgmlType T> struct MmaDec { static constexpr bool on = false; };
+
+// Q4_K: a group is one 256-value super-block, staged per warp (32 rows, stride bytes each: 16-byte aligned rows) and decoded by a lane for its
+// own row: sub-block pair j (values 64 j .. 64 j + 63) is the low and the high nibbles of quant bytes 32 j .. 32 j + 31
+template <> struct MmaDec<GgmlType::Q4_K> {
+	static constexpr bool on = true;
+	static constexpr int group = 256, bytes = sizeof( block_q4_K ), stride = bytes + 16;
+	// the 64 values of pair j times the activations, for MT tiles of 8 rows; xr[t]: this lane's activation row of tile t at the pair's start
+	template <int MT>
+	static __device__ __forceinline__ void pair( const block_q4_K* b, int j, const half* const xr[MT], const bool live[MT], float d[MT][8] ) {
+		const float2 dm = __half22float2( b->dm );
+		uint8_t sc, mn;
+		get_scale_min_k4( 2 * j, b->scales, sc, mn );
+		const half2 dlo = __float2half2_rn( dm.x * sc ), mlo = __float2half2_rn( -dm.y * mn );
+		get_scale_min_k4( 2 * j + 1, b->scales, sc, mn );
+		const half2 dhi = __float2half2_rn( dm.x * sc ), mhi = __float2half2_rn( -dm.y * mn );
+		const uint4 q0 = *reinterpret_cast<const uint4*>( b->qs + 32 * j ), q1 = *reinterpret_cast<const uint4*>( b->qs + 32 * j + 16 );
+		const uint32_t words[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+		#pragma unroll
+		for ( int h = 0; h < 2; ++h ) {
+			#pragma unroll
+			for ( int c = 0; c < 4; ++c ) {
+				// steps 2 c and 2 c + 1 of this half: words 2 c and 2 c + 1, activations 8 c .. 8 c + 7 of the half (one 16-byte load per tile)
+				uint4 xa[MT];
+				#pragma unroll
+				for ( int t = 0; t < MT; ++t ) xa[t] = live[t] ? __ldg( reinterpret_cast<const uint4*>( xr[t] + 32 * h + 8 * c ) ) : make_uint4( 0, 0, 0, 0 );
+				#pragma unroll
+				for ( int e = 0; e < 2; ++e ) {
+					const uint32_t word = words[2 * c + e];
+					half2 v0, v1;
+					nibbles_to_half2( h ? ( word >> 4 ) & 0x0F0F0F0Fu : word & 0x0F0F0F0Fu, v0, v1 );
+					const uint32_t b0 = h2u( __hfma2( v0, h ? dhi : dlo, h ? mhi : mlo ) ), b1 = h2u( __hfma2( v1, h ? dhi : dlo, h ? mhi : mlo ) );
+					#pragma unroll
+					for ( int t = 0; t < MT; ++t ) mma884( d[t], e ? xa[t].z : xa[t].x, e ? xa[t].w : xa[t].y, b0, b1 );
+				}
+			}
+		}
+	}
+};
+
+// out [m, n] (or, split along k, FP32 partials part [split][kTileRows][n]) for blocks of kMmaRows weight rows; MT tiles of 8 activation rows.
+// Shared memory: per warp its 32 rows' current group (D::stride each), loaded with coalesced 16-byte loads, the next group into registers
+// while the current one is multiplied; the activations are read from global memory (L1)
+template <GgmlType T, int MT>
+__global__ __launch_bounds__( 32 * kMmaWarps )
+void mma_rows_kernel( const void* __restrict__ w, size_t row_bytes, const half* __restrict__ x, half* __restrict__ out, float* __restrict__ part, int n, int k, int m,
+	GgufColTiling tiling, int groups_per_split ) {
+	using D = MmaDec<T>;
+	constexpr int chunks = ( kMmaRows * D::bytes / 16 + 31 ) / 32;   // 16-byte loads per lane for a warp's group
+	static_assert( D::bytes % 16 == 0 && D::stride % 16 == 0, "16-byte rows" );
+	extern __shared__ __align__( 16 ) uint8_t smem[];
+	const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+	const int q = ( lane >> 2 ) & 3, p = ( lane & 3 ) + 4 * ( lane >> 4 );
+	const int g0 = blockIdx.y * groups_per_split, g1 = min( k / D::group, g0 + groups_per_split );
+	uint8_t* ws = smem + static_cast<size_t>( warp ) * kMmaRows * D::stride;
+	const int row_base = blockIdx.x * kMmaRows;
+	// a lane's chunks of every group: the same rows and offsets each time (source: group 0, step D::bytes per group)
+	const uint4* src[chunks];
+	uint4* dst[chunks];
+	#pragma unroll
+	for ( int c = 0; c < chunks; ++c ) {
+		const int i = c * 32 + lane, r = min( i / ( D::bytes / 16 ), kMmaRows - 1 ), o = 16 * ( i % ( D::bytes / 16 ) );
+		src[c] = reinterpret_cast<const uint4*>( static_cast<const uint8_t*>( w ) + static_cast<size_t>( min( row_base + r, n - 1 ) ) * row_bytes + o );
+		dst[c] = reinterpret_cast<uint4*>( ws + r * D::stride + o );
+	}
+	constexpr bool tail = kMmaRows * D::bytes / 16 % 32 != 0;   // the last chunk round is partial
+	const bool last_ok = !tail || ( ( chunks - 1 ) * 32 + lane ) < kMmaRows * D::bytes / 16;
+	uint4 pre[chunks];
+	auto fetch = [&]( int g ) {
+		#pragma unroll
+		for ( int c = 0; c < chunks; ++c ) {
+			if ( c < chunks - 1 || last_ok ) pre[c] = __ldg( src[c] + static_cast<size_t>( g ) * ( D::bytes / 16 ) );
+		}
+	};
+	auto stash = [&]() {
+		#pragma unroll
+		for ( int c = 0; c < chunks; ++c ) {
+			if ( c < chunks - 1 || last_ok ) *dst[c] = pre[c];
+		}
+	};
+	// this lane's activation rows (rows past m read nothing); the tiled columns move whole 64-value pairs (the tiled head dim is a multiple of 64)
+	bool live[MT];
+	#pragma unroll
+	for ( int t = 0; t < MT; ++t ) live[t] = 8 * t + p < m;
+	float d[MT][8] = {};
+	int g = g0 + warp;
+	if ( g < g1 ) fetch( g );
+	for ( ; g < g1; g += kMmaWarps ) {
+		stash();
+		__syncwarp();
+		if ( g + kMmaWarps < g1 ) fetch( g + kMmaWarps );
+		const auto* b = reinterpret_cast<const typename std::conditional<T == GgmlType::Q4_K, block_q4_K, void>::type*>( ws + ( 8 * q + p ) * D::stride );
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			const int src = tiled_source( g * D::group + 64 * j, tiling, k );
+			const half* xr[MT];
+			#pragma unroll
+			for ( int t = 0; t < MT; ++t ) xr[t] = x + static_cast<size_t>( live[t] ? 8 * t + p : 0 ) * k + src;
+			D::template pair<MT>( b, j, xr, live, d );
+		}
+		__syncwarp();
+	}
+	__syncthreads();
+	// the warps' partial sums through the staging space
+	static_assert( kMmaRows * D::stride >= 2 * 8 * 32 * sizeof( float ), "reduction space" );
+	float* red = reinterpret_cast<float*>( smem );   // [warp][t][i][lane]
+	#pragma unroll
+	for ( int t = 0; t < MT; ++t ) {
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) red[( ( warp * MT + t ) * 8 + i ) * 32 + lane] = d[t][i];
+	}
+	__syncthreads();
+	if ( warp != 0 ) return;
+	const int r0 = ( lane & 1 ) + 4 * ( lane >> 4 ), c0 = lane & 2;
+	#pragma unroll
+	for ( int t = 0; t < MT; ++t ) {
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) {
+			float v = 0.0f;
+			#pragma unroll
+			for ( int wi = 0; wi < kMmaWarps; ++wi ) v += red[( ( wi * MT + t ) * 8 + i ) * 32 + lane];
+			const int mr = 8 * t + r0 + 2 * ( ( i >> 1 ) & 1 ), wrow = row_base + 8 * q + c0 + ( i & 1 ) + 4 * ( i >> 2 );
+			if ( mr >= m || wrow >= n ) continue;
+			if ( gridDim.y == 1 ) out[static_cast<size_t>( mr ) * n + wrow] = __float2half_rn( v );
+			else part[( static_cast<size_t>( blockIdx.y ) * kTileRows + mr ) * n + wrow] = v;
+		}
+	}
+}
+
 // Per-device state, each behind its own lock: a cudaMalloc waits for its device, whose queue may hold a collective the other ranks
 // have to join, so one rank must never hold a lock another rank's device is waiting behind
 std::mutex& device_mutex( int dev ) {
@@ -358,6 +505,48 @@ void launch_tile( const void* w, const half* x, half* out, int n, int k, int m, 
 	if ( used > 1 ) tile_reduce_kernel<<<( m * n + 255 ) / 256, 256, 0, stream>>>( st.part, out, n, m, used );
 }
 
+template <GgmlType T>
+void launch_mma( const void* w, const half* x, half* out, int n, int k, int m, GgufColTiling tiling, cudaStream_t stream ) {
+	using D = MmaDec<T>;
+	const TileState& st = tile_state();
+	const int blocks = ( n + kMmaRows - 1 ) / kMmaRows, groups = k / D::group;
+	// split along k into close to whole waves of resident blocks (three if they leave each warp a group), at least one group per warp
+	const int mt = m <= 8 ? 1 : 2;
+	static int resident[2][64] = {};
+	int dev = 0;
+	cudaGetDevice( &dev );
+	if ( resident[mt - 1][dev] == 0 ) {
+		const size_t sm = static_cast<size_t>( kMmaWarps ) * kMmaRows * D::stride;
+		ENGINE_CHECK( mt == 1 ? cudaOccupancyMaxActiveBlocksPerMultiprocessor( &resident[0][dev], mma_rows_kernel<T, 1>, 32 * kMmaWarps, sm )
+		                      : cudaOccupancyMaxActiveBlocksPerMultiprocessor( &resident[1][dev], mma_rows_kernel<T, 2>, 32 * kMmaWarps, sm ) );
+	}
+	const int slots = std::max( 1, resident[mt - 1][dev] ) * st.sms, max_splits = std::max( 1, groups / kMmaWarps );
+	int splits = 1;
+	for ( int waves = 3; waves >= 1 && splits == 1; --waves ) splits = std::max( 1, std::min( max_splits, waves * slots / blocks ) );
+	const int per_split = ( groups + splits - 1 ) / splits, used = ( groups + per_split - 1 ) / per_split;
+	ENGINE_ASSERT( used == 1 || static_cast<size_t>( used ) * kTileRows * n <= kPartFloats, "LinearGguf: split-k workspace too small" );
+	const size_t row_bytes = static_cast<size_t>( k / ggml_block( T ).elems ) * ggml_block( T ).bytes;
+	const size_t smem = static_cast<size_t>( kMmaWarps ) * kMmaRows * D::stride;
+	const dim3 grid( blocks, used );
+	if ( mt == 1 ) {
+		static bool attr = false;
+		if ( !attr ) { ENGINE_CHECK( cudaFuncSetAttribute( mma_rows_kernel<T, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024 ) ); attr = true; }
+		mma_rows_kernel<T, 1><<<grid, 32 * kMmaWarps, smem, stream>>>( w, row_bytes, x, out, st.part, n, k, m, tiling, per_split );
+	}
+	else {
+		static bool attr = false;
+		if ( !attr ) { ENGINE_CHECK( cudaFuncSetAttribute( mma_rows_kernel<T, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024 ) ); attr = true; }
+		mma_rows_kernel<T, 2><<<grid, 32 * kMmaWarps, smem, stream>>>( w, row_bytes, x, out, st.part, n, k, m, tiling, per_split );
+	}
+	if ( used > 1 ) tile_reduce_kernel<<<( m * n + 255 ) / 256, 256, 0, stream>>>( st.part, out, n, m, used );
+}
+
+// ENGINE_DEBUG_GGUF_MMA=0 takes the tensor-core rows kernel out (the GEMV / tile paths), for A/B timing
+bool mma_off() {
+	static const bool off = [] { const char* e = std::getenv( "ENGINE_DEBUG_GGUF_MMA" ); return e != nullptr && e[0] == '0'; }();
+	return off;
+}
+
 cublasHandle_t cublas_handle() {
 	static cublasHandle_t h[64] = {};
 	int dev = 0;
@@ -413,6 +602,11 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 		const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, wf, CUDA_R_16F, k, xs, CUDA_R_16F, k,
 			&beta, out.data, CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP );
 		ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "LinearGguf: cublasGemmEx failed" );
+		return;
+	}
+	// 3 to 16 rows (two still go faster through the GEMV) of a type with a tensor-core decoder
+	if ( m >= kMmaMinRows && type == GgmlType::Q4_K && k % MmaDec<GgmlType::Q4_K>::group == 0 && !mma_off() ) {
+		launch_mma<GgmlType::Q4_K>( w, x.ptr<const half>(), out.ptr<half>(), n, k, m, tiling, stream );
 		return;
 	}
 	if ( m > kGemvRows && k % kSpan == 0 ) {
