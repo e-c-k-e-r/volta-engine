@@ -343,6 +343,86 @@ template <> struct MmaDec<GgmlType::Q4_K> {
 	}
 };
 
+// Q5_K: Q4_K with a fifth bit per value: bit 2 j (low nibbles) or 2 j + 1 (high nibbles) of qh[l] for value l of the pair's half
+template <> struct MmaDec<GgmlType::Q5_K> {
+	static constexpr bool on = true;
+	static constexpr int group = 256, bytes = sizeof( block_q5_K ), align = 16, stage = bytes, stride = bytes + 16, min_rows = 6;
+	template <int MT>
+	static __device__ __forceinline__ void pair( const uint8_t* blk, int j, const half* const xr[MT], const bool live[MT], float d[MT][8] ) {
+		const block_q5_K* b = reinterpret_cast<const block_q5_K*>( blk );
+		const float2 dm = __half22float2( b->dm );
+		uint8_t sc, mn;
+		get_scale_min_k4( 2 * j, b->scales, sc, mn );
+		const half2 dlo = __float2half2_rn( dm.x * sc ), mlo = __float2half2_rn( -dm.y * mn );
+		get_scale_min_k4( 2 * j + 1, b->scales, sc, mn );
+		const half2 dhi = __float2half2_rn( dm.x * sc ), mhi = __float2half2_rn( -dm.y * mn );
+		const uint4 q0 = *reinterpret_cast<const uint4*>( b->qs + 32 * j ), q1 = *reinterpret_cast<const uint4*>( b->qs + 32 * j + 16 );
+		const uint4 h0 = *reinterpret_cast<const uint4*>( b->qh ), h1 = *reinterpret_cast<const uint4*>( b->qh + 16 );
+		const uint32_t words[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+		const uint32_t highs[8] = { h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w };
+		#pragma unroll
+		for ( int h = 0; h < 2; ++h ) {
+			#pragma unroll
+			for ( int c = 0; c < 4; ++c ) {
+				uint4 xa[MT];
+				#pragma unroll
+				for ( int t = 0; t < MT; ++t ) xa[t] = live[t] ? __ldg( reinterpret_cast<const uint4*>( xr[t] + 32 * h + 8 * c ) ) : make_uint4( 0, 0, 0, 0 );
+				#pragma unroll
+				for ( int e = 0; e < 2; ++e ) {
+					const uint32_t word = words[2 * c + e];
+					const uint32_t q = ( h ? ( word >> 4 ) & 0x0F0F0F0Fu : word & 0x0F0F0F0Fu ) | ( ( ( highs[2 * c + e] >> ( 2 * j + h ) ) & 0x01010101u ) << 4 );
+					const uint32_t w0 = __byte_perm( q, 0x64646464u, 0x4140 ), w1 = __byte_perm( q, 0x64646464u, 0x4342 );
+					const half2 bias = __half2half2( __float2half( 1024.0f ) );
+					const uint32_t b0 = h2u( __hfma2( __hsub2( *reinterpret_cast<const half2*>( &w0 ), bias ), h ? dhi : dlo, h ? mhi : mlo ) );
+					const uint32_t b1 = h2u( __hfma2( __hsub2( *reinterpret_cast<const half2*>( &w1 ), bias ), h ? dhi : dlo, h ? mhi : mlo ) );
+					#pragma unroll
+					for ( int t = 0; t < MT; ++t ) mma884( d[t], e ? xa[t].z : xa[t].x, e ? xa[t].w : xa[t].y, b0, b1 );
+				}
+			}
+		}
+	}
+};
+
+// IQ4_XS: 32-value sub-blocks ib with a 6-bit scale; values 0..15 of a sub-block are the low nibbles of qs[16 ib .. 16 ib + 15], 16..31 the
+// high ones, each an index into the non-linear grid kvalues_iq4nl (dequantize_iq4_xs); the grid lookup is llama.cpp's byte-permute one
+template <> struct MmaDec<GgmlType::IQ4_XS> {
+	static constexpr bool on = true;
+	static constexpr int group = 256, bytes = sizeof( block_iq4_xs ), align = 8, stage = bytes, stride = bytes + 8, min_rows = 6;
+	template <int MT>
+	static __device__ __forceinline__ void pair( const uint8_t* blk, int j, const half* const xr[MT], const bool live[MT], float d[MT][8] ) {
+		const block_iq4_xs* b = reinterpret_cast<const block_iq4_xs*>( blk );
+		half dh;
+		memcpy( &dh, &b->d, sizeof( dh ) );
+		const float df = __half2float( dh );
+		const half2 bias = __half2half2( __float2half( 1152.0f ) );   // 1024 + 128: the grid value + 128 as a half above 1024, recentred
+		#pragma unroll
+		for ( int sb = 0; sb < 2; ++sb ) {
+			const int ib = 2 * j + sb;
+			const int scale = ( ( ( b->scales_l[ib / 2] >> ( 4 * ( ib % 2 ) ) ) & 0xF ) | ( ( ( b->scales_h >> ( 2 * ib ) ) & 3 ) << 4 ) ) - 32;
+			const half2 sc = __float2half2_rn( df * scale );
+			const uint2 q0 = *reinterpret_cast<const uint2*>( b->qs + 16 * ib ), q1 = *reinterpret_cast<const uint2*>( b->qs + 16 * ib + 8 );
+			const uint32_t words[4] = { q0.x, q0.y, q1.x, q1.y };
+			#pragma unroll
+			for ( int c = 0; c < 4; ++c ) {
+				// values 8 c .. 8 c + 7 of the sub-block: c < 2 the low nibbles of words 2 c, 2 c + 1, else the high nibbles of words 2 c - 4, 2 c - 3
+				uint4 xa[MT];
+				#pragma unroll
+				for ( int t = 0; t < MT; ++t ) xa[t] = live[t] ? __ldg( reinterpret_cast<const uint4*>( xr[t] + 32 * sb + 8 * c ) ) : make_uint4( 0, 0, 0, 0 );
+				#pragma unroll
+				for ( int e = 0; e < 2; ++e ) {
+					const int2 v = get_int_from_table_16( static_cast<int>( words[2 * ( c % 2 ) + e] ), kvalues_iq4nl );
+					const uint32_t g = static_cast<uint32_t>( c < 2 ? v.x : v.y ) ^ 0x80808080u;   // grid value + 128, as unsigned bytes
+					const uint32_t w0 = __byte_perm( g, 0x64646464u, 0x4140 ), w1 = __byte_perm( g, 0x64646464u, 0x4342 );
+					const uint32_t b0 = h2u( __hmul2( __hsub2( *reinterpret_cast<const half2*>( &w0 ), bias ), sc ) );
+					const uint32_t b1 = h2u( __hmul2( __hsub2( *reinterpret_cast<const half2*>( &w1 ), bias ), sc ) );
+					#pragma unroll
+					for ( int t = 0; t < MT; ++t ) mma884( d[t], e ? xa[t].z : xa[t].x, e ? xa[t].w : xa[t].y, b0, b1 );
+				}
+			}
+		}
+	}
+};
+
 // Q6_K: a group is one 256-value super-block, staged block-aligned (the warp shifts each row's 8-byte aligned stretch by the block's offset
 // in it while staging). Half h (128 values) quarter Q (32 values): value l is the low (Q < 2) or high nibble of ql[64 h + 32 (Q & 1) + l]
 // with bits 2 Q, 2 Q + 1 of qh[32 h + l] on top, minus 32, times scales[8 h + 2 Q + l / 16] and d (dequantize_q6_K)
@@ -687,7 +767,7 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 		const size_t row_bytes = static_cast<size_t>( k / ggml_block( type ).elems ) * ggml_block( type ).bytes;
 		switch ( type ) {
 #define CASE( T ) case GgmlType::T: if ( m >= MmaDec<GgmlType::T>::min_rows && ( row_bytes % MmaDec<GgmlType::T>::align == 0 || MmaDec<GgmlType::T>::bytes % MmaDec<GgmlType::T>::align != 0 ) ) { launch_mma<GgmlType::T>( w, x.ptr<const half>(), out.ptr<half>(), n, k, m, tiling, stream ); return; } break;
-			CASE( Q4_K ) CASE( Q6_K )
+			CASE( Q4_K ) CASE( Q5_K ) CASE( Q6_K ) CASE( IQ4_XS )
 #undef CASE
 			default: break;
 		}
