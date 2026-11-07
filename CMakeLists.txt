@@ -684,6 +684,11 @@ add_executable(test_ppl tests/4_coherence/test_ppl.cpp)
 target_link_libraries(test_ppl PRIVATE engine_kernels)
 set_target_properties(test_ppl PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(test_ear tests/4_coherence/test_ear.cpp)
+target_link_libraries(test_ear PRIVATE engine_kernels)
+target_compile_definitions(test_ear PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
+set_target_properties(test_ear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(test_nvfp4_linear tests/2_parity/test_nvfp4_linear.cpp)
 target_link_libraries(test_nvfp4_linear PRIVATE engine_kernels)
 set_target_properties(test_nvfp4_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
