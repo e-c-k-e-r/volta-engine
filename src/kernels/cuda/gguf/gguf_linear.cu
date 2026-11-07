@@ -289,7 +289,7 @@ __global__ void tile_reduce_kernel( const float* __restrict__ part, half* __rest
 // once for all rows and multiplied on the tensor cores; a warp's four quad pairs hold 32 weight rows, the warps of a block and, when the
 // grid is small, the blocks split k. Fragment layouts measured on sm_70 (C: rows (lane & 1) + 4 (lane >= 16) and + 2, columns (lane & 2)
 // + {0, 1, 4, 5}, in register order (r, c) (r, c + 1) (r + 2, c) (r + 2, c + 1), then the same 4 columns on).
-constexpr int kMmaWarps = 4, kMmaRows = 32, kMmaMinRows = 3;
+constexpr int kMmaWarps = 4, kMmaRows = 32;
 
 __device__ __forceinline__ void mma884( float d[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1 ) {
 	asm( "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};"
@@ -306,10 +306,13 @@ template <GgmlType T> struct MmaDec { static constexpr bool on = false; };
 // own row: sub-block pair j (values 64 j .. 64 j + 63) is the low and the high nibbles of quant bytes 32 j .. 32 j + 31
 template <> struct MmaDec<GgmlType::Q4_K> {
 	static constexpr bool on = true;
-	static constexpr int group = 256, bytes = sizeof( block_q4_K ), stride = bytes + 16;
+	// align: the staging unit (rows and blocks are multiples of it); stage: bytes staged per row and group; stride: their spacing in shared memory
+	// min_rows: from this many rows on the kernel beats the GEMV
+	static constexpr int group = 256, bytes = sizeof( block_q4_K ), align = 16, stage = bytes, stride = bytes + 16, min_rows = 4;
 	// the 64 values of pair j times the activations, for MT tiles of 8 rows; xr[t]: this lane's activation row of tile t at the pair's start
 	template <int MT>
-	static __device__ __forceinline__ void pair( const block_q4_K* b, int j, const half* const xr[MT], const bool live[MT], float d[MT][8] ) {
+	static __device__ __forceinline__ void pair( const uint8_t* blk, int j, const half* const xr[MT], const bool live[MT], float d[MT][8] ) {
+		const block_q4_K* b = reinterpret_cast<const block_q4_K*>( blk );
 		const float2 dm = __half22float2( b->dm );
 		uint8_t sc, mn;
 		get_scale_min_k4( 2 * j, b->scales, sc, mn );
@@ -340,6 +343,49 @@ template <> struct MmaDec<GgmlType::Q4_K> {
 	}
 };
 
+// Q6_K: a group is one 256-value super-block, staged block-aligned (the warp shifts each row's 8-byte aligned stretch by the block's offset
+// in it while staging). Half h (128 values) quarter Q (32 values): value l is the low (Q < 2) or high nibble of ql[64 h + 32 (Q & 1) + l]
+// with bits 2 Q, 2 Q + 1 of qh[32 h + l] on top, minus 32, times scales[8 h + 2 Q + l / 16] and d (dequantize_q6_K)
+template <> struct MmaDec<GgmlType::Q6_K> {
+	static constexpr bool on = true;
+	static constexpr int group = 256, bytes = sizeof( block_q6_K ), align = 8, stage = ( bytes + align - 2 + align - 1 ) / align * align, stride = stage + 8, min_rows = 6;
+	template <int MT>
+	static __device__ __forceinline__ void pair( const uint8_t* blk, int j, const half* const xr[MT], const bool live[MT], float d[MT][8] ) {
+		const block_q6_K* b = reinterpret_cast<const block_q6_K*>( blk );
+		const int h = j / 2;
+		half dd;
+		memcpy( &dd, &b->d, sizeof( dd ) );
+		const float df = __half2float( dd );
+		const half2 bias = __half2half2( __float2half( 1056.0f ) );   // 1024 + 32: the 6-bit code as a half above 1024, recentred
+		const uint4 h0 = *reinterpret_cast<const uint4*>( b->qh + 32 * h ), h1 = *reinterpret_cast<const uint4*>( b->qh + 32 * h + 16 );
+		const uint32_t hw[8] = { h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w };
+		#pragma unroll
+		for ( int qq = 0; qq < 2; ++qq ) {
+			const int Q = 2 * ( j % 2 ) + qq;
+			const uint4 l0 = *reinterpret_cast<const uint4*>( b->ql + 64 * h + 32 * ( Q & 1 ) ), l1 = *reinterpret_cast<const uint4*>( b->ql + 64 * h + 32 * ( Q & 1 ) + 16 );
+			const uint32_t lw[8] = { l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w };
+			const half2 sc[2] = { __float2half2_rn( df * b->scales[8 * h + 2 * Q] ), __float2half2_rn( df * b->scales[8 * h + 2 * Q + 1] ) };
+			#pragma unroll
+			for ( int c = 0; c < 4; ++c ) {
+				// values 8 c .. 8 c + 7 of the quarter: two steps, one 16-byte activation load per tile
+				uint4 xa[MT];
+				#pragma unroll
+				for ( int t = 0; t < MT; ++t ) xa[t] = live[t] ? __ldg( reinterpret_cast<const uint4*>( xr[t] + 32 * qq + 8 * c ) ) : make_uint4( 0, 0, 0, 0 );
+				#pragma unroll
+				for ( int e = 0; e < 2; ++e ) {
+					const int wi = 2 * c + e;
+					const uint32_t q = ( ( Q < 2 ? lw[wi] : lw[wi] >> 4 ) & 0x0F0F0F0Fu ) | ( ( ( hw[wi] >> ( 2 * Q ) ) & 0x03030303u ) << 4 );
+					const uint32_t w0 = __byte_perm( q, 0x64646464u, 0x4140 ), w1 = __byte_perm( q, 0x64646464u, 0x4342 );
+					const uint32_t b0 = h2u( __hmul2( __hsub2( *reinterpret_cast<const half2*>( &w0 ), bias ), sc[c / 2] ) );
+					const uint32_t b1 = h2u( __hmul2( __hsub2( *reinterpret_cast<const half2*>( &w1 ), bias ), sc[c / 2] ) );
+					#pragma unroll
+					for ( int t = 0; t < MT; ++t ) mma884( d[t], e ? xa[t].z : xa[t].x, e ? xa[t].w : xa[t].y, b0, b1 );
+				}
+			}
+		}
+	}
+};
+
 // out [m, n] (or, split along k, FP32 partials part [split][kTileRows][n]) for blocks of kMmaRows weight rows; MT tiles of 8 activation rows.
 // Shared memory: per warp its 32 rows' current group (D::stride each), loaded with coalesced 16-byte loads, the next group into registers
 // while the current one is multiplied; the activations are read from global memory (L1)
@@ -348,36 +394,67 @@ __global__ __launch_bounds__( 32 * kMmaWarps )
 void mma_rows_kernel( const void* __restrict__ w, size_t row_bytes, const half* __restrict__ x, half* __restrict__ out, float* __restrict__ part, int n, int k, int m,
 	GgufColTiling tiling, int groups_per_split ) {
 	using D = MmaDec<T>;
-	constexpr int chunks = ( kMmaRows * D::bytes / 16 + 31 ) / 32;   // 16-byte loads per lane for a warp's group
-	static_assert( D::bytes % 16 == 0 && D::stride % 16 == 0, "16-byte rows" );
+	using Unit = typename std::conditional<D::align == 16, uint4, uint2>::type;
+	constexpr int per_row = D::stage / D::align, chunks = ( kMmaRows * per_row + 31 ) / 32;   // staging loads per lane for a warp's group
+	static_assert( D::stage % D::align == 0 && D::stride % D::align == 0, "aligned staging" );
 	extern __shared__ __align__( 16 ) uint8_t smem[];
 	const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 	const int q = ( lane >> 2 ) & 3, p = ( lane & 3 ) + 4 * ( lane >> 4 );
 	const int g0 = blockIdx.y * groups_per_split, g1 = min( k / D::group, g0 + groups_per_split );
 	uint8_t* ws = smem + static_cast<size_t>( warp ) * kMmaRows * D::stride;
 	const int row_base = blockIdx.x * kMmaRows;
-	// a lane's chunks of every group: the same rows and offsets each time (source: group 0, step D::bytes per group)
-	const uint4* src[chunks];
-	uint4* dst[chunks];
+	// a lane's chunks: chunk c is unit o of row r's stretch, the aligned run of units holding the group's bytes (rows of a type whose blocks are
+	// not whole units start anywhere: the stretch is per row)
+	uintptr_t rowp[chunks];
+	int unit[chunks];
+	Unit* dst[chunks];
 	#pragma unroll
 	for ( int c = 0; c < chunks; ++c ) {
-		const int i = c * 32 + lane, r = min( i / ( D::bytes / 16 ), kMmaRows - 1 ), o = 16 * ( i % ( D::bytes / 16 ) );
-		src[c] = reinterpret_cast<const uint4*>( static_cast<const uint8_t*>( w ) + static_cast<size_t>( min( row_base + r, n - 1 ) ) * row_bytes + o );
-		dst[c] = reinterpret_cast<uint4*>( ws + r * D::stride + o );
+		const int i = c * 32 + lane, r = min( i / per_row, kMmaRows - 1 ), o = i % per_row;
+		rowp[c] = reinterpret_cast<uintptr_t>( static_cast<const uint8_t*>( w ) + static_cast<size_t>( min( row_base + r, n - 1 ) ) * row_bytes );
+		unit[c] = o;
+		dst[c] = reinterpret_cast<Unit*>( ws + r * D::stride + D::align * o );
 	}
-	constexpr bool tail = kMmaRows * D::bytes / 16 % 32 != 0;   // the last chunk round is partial
-	const bool last_ok = !tail || ( ( chunks - 1 ) * 32 + lane ) < kMmaRows * D::bytes / 16;
-	uint4 pre[chunks];
+	constexpr bool tail = kMmaRows * per_row % 32 != 0;   // the last chunk round is partial
+	const bool last_ok = !tail || ( ( chunks - 1 ) * 32 + lane ) < kMmaRows * per_row;
+	// a group's stretch may end past its row's bytes (the next row's, or the end of the weight + the allocation's slack)
+	Unit pre[chunks];
+	int shift[chunks];   // bytes from the stretch's start to the group's
 	auto fetch = [&]( int g ) {
 		#pragma unroll
 		for ( int c = 0; c < chunks; ++c ) {
-			if ( c < chunks - 1 || last_ok ) pre[c] = __ldg( src[c] + static_cast<size_t>( g ) * ( D::bytes / 16 ) );
+			const uintptr_t a = rowp[c] + static_cast<size_t>( g ) * D::bytes;
+			shift[c] = static_cast<int>( a % D::align );
+			if ( c < chunks - 1 || last_ok ) pre[c] = __ldg( reinterpret_cast<const Unit*>( a - shift[c] ) + unit[c] );
 		}
 	};
+	// staged block-aligned: the group's bytes start shift bytes into the row's stretch; a chunk takes the bytes it lacks from the next one (the
+	// next lane's, or for lane 31 lane 0's of the next round)
 	auto stash = [&]() {
-		#pragma unroll
-		for ( int c = 0; c < chunks; ++c ) {
-			if ( c < chunks - 1 || last_ok ) *dst[c] = pre[c];
+		if constexpr ( D::bytes % D::align == 0 ) {
+			#pragma unroll
+			for ( int c = 0; c < chunks; ++c ) {
+				if ( c < chunks - 1 || last_ok ) *dst[c] = pre[c];
+			}
+		}
+		else {
+			static_assert( D::align == 8, "a shifted staging unit is 8 bytes" );
+			#pragma unroll
+			for ( int c = 0; c < chunks; ++c ) {
+				// lane 31 needs lane 0's chunk of round c + 1: lane 0 sends that one, every other lane its round-c chunk
+				const uint32_t s0 = lane == 0 && c + 1 < chunks ? pre[c + 1].x : pre[c].x, s1 = lane == 0 && c + 1 < chunks ? pre[c + 1].y : pre[c].y;
+				uint2 nx;
+				nx.x = __shfl_sync( 0xffffffff, s0, ( lane + 1 ) & 31 );
+				nx.y = __shfl_sync( 0xffffffff, s1, ( lane + 1 ) & 31 );
+				// the next chunk is the same row's (past a row's last chunk the bytes are past its block and never read)
+				uint2 v = pre[c];
+				if ( shift[c] ) {
+					const uint64_t lo = ( static_cast<uint64_t>( v.y ) << 32 ) | v.x, hi = ( static_cast<uint64_t>( nx.y ) << 32 ) | nx.x;
+					const uint64_t r = ( lo >> ( 8 * shift[c] ) ) | ( hi << ( 64 - 8 * shift[c] ) );
+					v = make_uint2( static_cast<uint32_t>( r ), static_cast<uint32_t>( r >> 32 ) );
+				}
+				if ( c < chunks - 1 || last_ok ) *dst[c] = v;
+			}
 		}
 	};
 	// this lane's activation rows (rows past m read nothing); the tiled columns move whole 64-value pairs (the tiled head dim is a multiple of 64)
@@ -391,7 +468,7 @@ void mma_rows_kernel( const void* __restrict__ w, size_t row_bytes, const half* 
 		stash();
 		__syncwarp();
 		if ( g + kMmaWarps < g1 ) fetch( g + kMmaWarps );
-		const auto* b = reinterpret_cast<const typename std::conditional<T == GgmlType::Q4_K, block_q4_K, void>::type*>( ws + ( 8 * q + p ) * D::stride );
+		const uint8_t* b = ws + ( 8 * q + p ) * D::stride;
 		#pragma unroll
 		for ( int j = 0; j < 4; ++j ) {
 			const int src = tiled_source( g * D::group + 64 * j, tiling, k );
@@ -604,10 +681,16 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 		ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "LinearGguf: cublasGemmEx failed" );
 		return;
 	}
-	// 3 to 16 rows (two still go faster through the GEMV) of a type with a tensor-core decoder
-	if ( m >= kMmaMinRows && type == GgmlType::Q4_K && k % MmaDec<GgmlType::Q4_K>::group == 0 && !mma_off() ) {
-		launch_mma<GgmlType::Q4_K>( w, x.ptr<const half>(), out.ptr<half>(), n, k, m, tiling, stream );
-		return;
+	// up to 16 rows of a type with a tensor-core decoder (from its min_rows on: fewer go faster through the GEMV); a type whose blocks are whole
+	// staging units needs rows that are too, the others realign every row
+	if ( m >= 2 && !mma_off() && k % 256 == 0 ) {
+		const size_t row_bytes = static_cast<size_t>( k / ggml_block( type ).elems ) * ggml_block( type ).bytes;
+		switch ( type ) {
+#define CASE( T ) case GgmlType::T: if ( m >= MmaDec<GgmlType::T>::min_rows && ( row_bytes % MmaDec<GgmlType::T>::align == 0 || MmaDec<GgmlType::T>::bytes % MmaDec<GgmlType::T>::align != 0 ) ) { launch_mma<GgmlType::T>( w, x.ptr<const half>(), out.ptr<half>(), n, k, m, tiling, stream ); return; } break;
+			CASE( Q4_K ) CASE( Q6_K )
+#undef CASE
+			default: break;
+		}
 	}
 	if ( m > kGemvRows && k % kSpan == 0 ) {
 		const half* xs = x.ptr<const half>();

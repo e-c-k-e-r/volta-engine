@@ -1110,9 +1110,12 @@ pod::LinearWeight SafeTensorsRepo::gguf_linear( int shard, const pod::SafeTensor
 			}
 		}
 	}
-	const int shape[2] = { n_local, static_cast<int>( local_row_bytes ) };
-	pod::TensorView tv = engine::core::arena_alloc_tensor( code_arena ? *code_arena : arena, pod::DType::UINT8, shape, 2 );
-	ENGINE_ASSERT( tv.data != nullptr, "gguf_linear: arena full" );
+	// 64 bytes of slack past the last row: kernels that read blocks in aligned stretches may run a few bytes over (expert tier slots, whose
+	// size is the blocks', get none: the MoE kernels read whole blocks)
+	const size_t slack = code_arena ? 0 : 64;
+	void* mem = engine::core::arena_alloc( code_arena ? *code_arena : arena, h.size() + slack, 256 );
+	ENGINE_ASSERT( mem != nullptr, "gguf_linear: arena full" );
+	pod::TensorView tv = pod::make_tensor_2d( mem, pod::DType::UINT8, n_local, static_cast<int>( local_row_bytes ) );
 	backend::memcpy_async( tv.data, h.data(), h.size(), backend::Copy::Auto, stream );
 	backend::stream_sync( stream );
 	pod::LinearWeight lw = pod::LinearWeight::make_gguf( tv, meta->gguf_type, k_local, n_local );

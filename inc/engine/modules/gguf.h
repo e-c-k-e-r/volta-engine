@@ -9,8 +9,9 @@
 // GGUF quantized weights (llama.cpp's block formats), read as they are stored in the file: a weight of n output rows and k inputs is n rows
 // of k / block_elems blocks, each block_bytes long. Up to 8 rows multiply through the block types' integer dot products against
 // activations quantized to q8_1 (llama.cpp's vec_dot kernels); 9 to 16 rows decode every block once into shared memory (llama.cpp's
-// block decoders) and multiply it with all rows on the tensor cores; prefill chunks dequantize the weight to FP16 (llama.cpp's
-// converters) and run one cuBLAS GEMM. The llama.cpp files are vendored in src/kernels/cuda/gguf/ggml.
+// block decoders) and multiply it with all rows on the tensor cores; Q4_K and Q6_K from 4 / 6 rows on decode each lane's weight row straight
+// into Volta's m8n8k4 tensor-core fragments instead; prefill chunks dequantize the weight to FP16 (llama.cpp's converters) and run one
+// cuBLAS GEMM. The llama.cpp files are vendored in src/kernels/cuda/gguf/ggml.
 namespace engine::modules {
 
 // Tensor type ids of the GGUF format (ggml_type)

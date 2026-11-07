@@ -117,7 +117,7 @@ int main( int argc, char** argv ) {
 		const bool sum_offset = type == modules::GgmlType::Q4_0 || type == modules::GgmlType::Q4_1 || type == modules::GgmlType::Q5_0 ||
 			type == modules::GgmlType::Q5_1 || type == modules::GgmlType::IQ1_S || type == modules::GgmlType::IQ1_M;
 		const bool ok = worst_gemv < ( sum_offset ? 3e-2 : 1e-2 ) && worst_tile < 5e-3 && worst_gemm < 5e-3;
-		std::printf( "  %-8s n %d k %d: GEMV (1-8 rows) vs q8_1 reference %.2e, tile (9-16 rows) vs exact %.2e, GEMM (20 rows) vs exact %.2e  %s\n",
+		std::printf( "  %-8s n %d k %d: 1-8 rows vs q8_1 reference %.2e, 9-16 rows vs exact %.2e, 20 rows (GEMM) vs exact %.2e  %s\n",
 			modules::ggml_type_name( type ), f.n, f.k, worst_gemv, worst_tile, worst_gemm, ok ? "PASS" : "FAIL" );
 		fails += ok ? 0 : 1;
 		arena.offset_bytes = mark;
