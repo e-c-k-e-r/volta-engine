@@ -77,6 +77,11 @@ from the hardware of the time (4x V100, power caps as noted); relative results a
   (21.2 -> 15.4 tok/s): each thread's small output slice strides across tiles and NUMA nodes. Patch kept in
   `.agents/shelved/cpu_exl3_in_place.patch`.
 * **Persistent CPU thread team** for the CPU backend: slower than per-call threads.
+* **AVX-512 CPU expert kernels on Skylake-SP (Xeon Gold 6132).** Widening the EXL3 trellis kernel to 512 bits (two tiles per vector):
+  4.44 -> 4.14 ms per 3-bit GLM expert on one thread, 0.76 -> 0.82 ms on ten (slower), outputs unchanged. Integer accumulation with int16
+  activations: 0 to 6%. Skylake-SP issues the 512-bit integer multiply of the state hash on a single port and lowers the clock under heavy
+  AVX-512 load; the AVX2 kernel already does about 6 billion weights per second per core. Upstream's int8 paired-row BW tier would need
+  16-bit state hashing and int8 activations (about 1% output error) for a theoretical ~20%.
 
 ## Quantization
 
