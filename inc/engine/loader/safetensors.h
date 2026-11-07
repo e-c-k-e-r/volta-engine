@@ -9,6 +9,7 @@
 #include <initializer_list>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include "engine/backend/types.h"
 
@@ -21,6 +22,11 @@ struct SafeTensorMeta {
 	int         shape[4];
 	size_t      data_offset_bytes;
 	size_t      size_bytes;
+	// GGUF files (engine/loader/gguf.h): the block type when dtype is GGUF, layout flags, and a host copy the loader made when it had to
+	// transform the file's data (nullptr: the data is read from the mapped file at data_offset_bytes)
+	uint32_t    gguf_type = 0;
+	uint32_t    gguf_flags = 0;
+	const void* host = nullptr;
 };
 
 struct SafeTensorsFile {
@@ -31,6 +37,7 @@ struct SafeTensorsFile {
 	SafeTensorMeta* tensors = nullptr;
 	int             tensor_count = 0;
 	int             tensor_capacity = 0;
+	void*           gguf = nullptr;   // a GGUF file's loader state (engine/loader/gguf.h); nullptr for safetensors
 };
 
 } // namespace pod
@@ -297,6 +304,11 @@ public:
 	}
 
 private:
+	// A GGUF block tensor as a LinearWeight: the given row ranges, and of each row the given column ranges (whole blocks), plus pad_rows zero
+	// rows (an LM head padded to its shard width); the column order flag follows the tensor's GGUF_COLS_V_TILED
+	pod::LinearWeight gguf_linear( int shard, const pod::SafeTensorMeta* meta, pod::MemoryArena& arena, const std::vector<std::pair<int, int>>& rows,
+		const std::vector<std::pair<int, int>>& cols, int pad_rows, backend::stream_t stream );
+
 	static constexpr int MAX_SHARDS = 128;
 	pod::SafeTensorsFile shards_[MAX_SHARDS];
 	char shard_names_[MAX_SHARDS][256];

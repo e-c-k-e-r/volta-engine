@@ -70,5 +70,6 @@ CUDA kernels / code scaffollding are heavily referenced from:
 * [dnv2003/v100-skinny](https://github.com/dnv2003/v100-skinny) for NVFP4 kernels
 * [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) for NVFP4 kernels
 * [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) for EXL3 kernels
+* [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) for the GGUF block formats and their CUDA dot-product and dequantization kernels, vendored unchanged under the MIT license in [src/kernels/cuda/gguf/ggml](/src/kernels/cuda/gguf/ggml)
 * [Niko1221/Strata](https://github.com/Niko1221/Strata/) for online experts streaming (rather than a static/offline approach)
 * a bunch of extra slopped optimizations from abandoned private experiments of the above

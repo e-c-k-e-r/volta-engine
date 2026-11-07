@@ -143,6 +143,10 @@ Qwen extras:
   `nvfp4_dense=kda,mla,idx,head,dense,shared` (experts stay EXL3: the NVFP4 experts do not fit in VRAM and the offload penalty rules them out). Calibration: run
   `ENGINE_HESSIAN_DIR=<dir> test_ppl --flash|--glm --calibrate --file <text>` (GLM: `ENGINE_HESSIAN_LAYERS=lo-hi`, a third of the layers per pass) and then
   `nvfp4_ldlq.py --model flash|glm`. Speed figures there are indicative (150 W cap, single runs).
+* **GGUF weights** (Qwen3.8-27B, llama.cpp's `qwen35` architecture; block types Q4_0 to Q8_0, Q2_K to Q6_K and IQ1_S to IQ4_XS): a model
+  directory holding one `.gguf` file plus the original `config.json`, tokenizer files and chat template loads like a safetensors one. Projections keep
+  their blocks (llama.cpp's integer dot products for decode and verify rows, a dequantized FP16 GEMM for prefill chunks); norms, embeddings and other
+  small tensors are dequantized once at load. Split files (`-00001-of-0000N.gguf`) are not read: `llama-gguf-split --merge` joins them.
 * **DeepSeek-V4.1-Flash** (`deepseek_v41`, exllamav3's own EXL3 conversions such as `turboderp/DeepSeek-V4.1-Flash-1017-exl3` (its 1.68 bpw
   experts are 1.5 and 2 bpw) or those of the sudoingX / 0xSero layout; example `configs/deepseek_v41.json`): exllamav3's releases keep the Engram
   tables in `ngram_embedding.safetensors`, which the loader opens next to the shards; the other repositories do not carry them, so

@@ -4,6 +4,7 @@
 #include "engine/core/tensor.h"
 #include "engine/modules/trellis.h"
 #include "engine/modules/nvfp4.h"
+#include "engine/modules/gguf.h"
 #include "engine/backend/types.h"
 #include <cstdint>
 
@@ -13,7 +14,8 @@ enum class QuantType : uint8_t {
 	FP16,
 	TRELLIS,
 	NVFP4,
-	FP8      // the original block-scaled weight, applied by DSV4::linear_fp8 (DeepSeek-V4.1 SAGE packs): w0 FP8 E4M3 [n, k], w1 E8M0 scales [n / 32, k / 32]
+	FP8,     // the original block-scaled weight, applied by DSV4::linear_fp8 (DeepSeek-V4.1 SAGE packs): w0 FP8 E4M3 [n, k], w1 E8M0 scales [n / 32, k / 32]
+	GGUF     // a GGUF block type as stored in the file: w0 = n rows of k / elems blocks (bytes), gguf_type the block type, k and n in gguf_k / gguf_n
 };
 
 struct LinearWeight {
@@ -25,6 +27,9 @@ struct LinearWeight {
 	int        bits = 4;
 	bool       mul1 = false;
 	bool       mcg = false;   // MCG codebook (the quantized DFlash2 drafters); everything else decodes as mul1
+	uint32_t   gguf_type = 0; // GGUF: engine::modules::GgmlType of w0's blocks
+	int        gguf_k = 0, gguf_n = 0;
+	int        gguf_tile_heads = 0, gguf_tile_dim = 0;   // GGUF: input columns in tiled V-head order (see GgufColTiling); 0: as the activation
 
 	// Trellis projections run through one workspace per device (rotated activations, split-K partials): two of them must not run on different streams at once
 	bool shares_workspace() const { return type == QuantType::TRELLIS; }
@@ -68,6 +73,16 @@ struct LinearWeight {
 		lw.type = QuantType::FP8;
 		lw.w0 = codes;   // shape (k, n) like the FP16 form, the bytes laid out [n][k]
 		lw.w1 = scales;
+		return lw;
+	}
+
+	static LinearWeight make_gguf( const TensorView& blocks, uint32_t ggml_type, int k, int n ) {
+		LinearWeight lw;
+		lw.type = QuantType::GGUF;
+		lw.w0 = blocks;   // [n, k / elems * bytes] raw bytes
+		lw.gguf_type = ggml_type;
+		lw.gguf_k = k;
+		lw.gguf_n = n;
 		return lw;
 	}
 
@@ -152,6 +167,10 @@ struct Linear {
 					out.ptr<backend::half_t>(),
 					rows, n, k, stream
 				);
+			} break;
+			case pod::QuantType::GGUF: {
+				LinearGguf::forward( x, weight.w0.data, static_cast<GgmlType>( weight.gguf_type ), weight.gguf_n, weight.gguf_k, out, stream,
+					{ weight.gguf_tile_heads, weight.gguf_tile_dim } );
 			} break;
 			default: {
 				ENGINE_ASSERT( false, "Unimplemented format" );

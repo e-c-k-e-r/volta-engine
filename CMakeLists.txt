@@ -127,6 +127,9 @@ set(ENGINE_HOST_SOURCES
 	src/core/arena.cpp
 	src/core/log.cpp
 	src/loader/safetensors.cpp
+	src/loader/gguf.cpp
+	src/loader/gguf_qwen35.cpp
+	src/loader/gguf_types.cpp
 	src/loader/nvfp4.cpp
 	src/loader/tokenizer.cpp
 	src/video/h3_vae_config.cpp
@@ -193,6 +196,8 @@ set(ENGINE_DEVICE_SOURCES
 	src/comm/all_reduce_ipc.cu
 	src/kernels/cuda/nvfp4/skinny_kernels.cu
 	src/kernels/cuda/nvfp4/moe_kernels.cu
+	src/kernels/cuda/gguf/gguf_linear.cu
+	src/kernels/cuda/gguf/ggml/convert.cu
 	src/backend/cuda/modules/norm.cu
 	src/backend/cuda/modules/swiglu.cu
 	src/backend/cuda/modules/rope.cu
@@ -532,6 +537,10 @@ set_target_properties(test_steer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_
 add_executable(test_router_steer tests/2_parity/test_router_steer.cpp)
 target_link_libraries(test_router_steer PRIVATE engine_kernels)
 set_target_properties(test_router_steer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(test_gguf_linear tests/2_parity/test_gguf_linear.cpp)
+target_link_libraries(test_gguf_linear PRIVATE engine_kernels)
+set_target_properties(test_gguf_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Test Norm & Elementwise Parity
 add_executable(test_norm tests/2_parity/test_norm.cpp)

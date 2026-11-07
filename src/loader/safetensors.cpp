@@ -1,5 +1,7 @@
 #include "engine/modules/trellis_bits.h"
 #include "engine/loader/safetensors.h"
+#include "engine/loader/gguf.h"
+#include "engine/modules/gguf.h"
 #include "engine/core/log.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
@@ -106,7 +108,7 @@ static bool parse_header( pod::SafeTensorsFile& st ) {
 			++pos;
 			bool is_meta = ( key_len == 12 && std::strncmp( json + key_start, "__metadata__", 12 ) == 0 );
 
-			pod::SafeTensorMeta meta;
+			pod::SafeTensorMeta meta{};
 			std::memset( &meta, 0, sizeof( pod::SafeTensorMeta ) );
 			size_t name_copy_len = key_len < sizeof( meta.name ) - 1 ? key_len : sizeof( meta.name ) - 1;
 			std::memcpy( meta.name, json + key_start, name_copy_len );
@@ -322,6 +324,7 @@ bool safetensors_open( pod::SafeTensorsFile& st, const char* filepath ) {
 }
 
 void safetensors_close( pod::SafeTensorsFile& st ) {
+	if ( st.gguf != nullptr ) gguf_release( st );
 	if ( st.mmap_addr != nullptr && st.mmap_addr != MAP_FAILED ) {
 		munmap( st.mmap_addr, st.file_size );
 		st.mmap_addr = nullptr;
@@ -350,6 +353,9 @@ const pod::SafeTensorMeta* safetensors_find( const pod::SafeTensorsFile& st, con
 }
 
 const void* safetensors_get_data_cpu( const pod::SafeTensorsFile& st, const pod::SafeTensorMeta* meta ) {
+	if ( meta != nullptr && meta->host != nullptr ) {
+		return meta->host;
+	}
 	if ( meta == nullptr || st.mmap_addr == nullptr ) {
 		return nullptr;
 	}
@@ -533,12 +539,39 @@ bool SafeTensorsRepo::open( const char* dir_path ) {
 		}
 	}
 
-	// 3. Fallback: single model.safetensors
+	// 3. No safetensors shards: one GGUF file in the directory (its tensors under the Hugging Face names of its architecture; config.json and
+	// the tokenizer still come from the directory)
+	if ( shard_files.empty() ) {
+		std::vector<std::string> ggufs;
+		if ( DIR* dir = opendir( dir_path ) ) {
+			while ( struct dirent* entry = readdir( dir ) ) {
+				const size_t len = std::strlen( entry->d_name );
+				if ( len > 5 && std::strcmp( entry->d_name + len - 5, ".gguf" ) == 0 && std::strstr( entry->d_name, "mmproj" ) == nullptr ) ggufs.push_back( entry->d_name );
+			}
+			closedir( dir );
+		}
+		if ( ggufs.size() > 1 ) {
+			LOG_ERROR( "[SafeTensorsRepo] %s holds %zu GGUF files; keep one (split GGUF files are not read)\n", dir_path, ggufs.size() );
+			return false;
+		}
+		if ( ggufs.size() == 1 ) {
+			char full_path[1024];
+			std::snprintf( full_path, sizeof( full_path ), "%s/%s", dir_path, ggufs[0].c_str() );
+			if ( !engine::loader::gguf_open( shards_[0], full_path ) ) return false;
+			std::strncpy( shard_names_[0], ggufs[0].c_str(), sizeof( shard_names_[0] ) - 1 );
+			num_shards_ = 1;
+			for ( int t = 0; t < shards_[0].tensor_count; ++t ) tensor_map_[shards_[0].tensors[t].name] = { 0, &shards_[0].tensors[t] };
+			LOG_INFO( "[SafeTensorsRepo] GGUF %s, mapped %zu tensors\n", ggufs[0].c_str(), tensor_map_.size() );
+			return true;
+		}
+	}
+
+	// 4. Fallback: single model.safetensors
 	if ( shard_files.empty() ) {
 		shard_files.push_back( "model.safetensors" );
 	}
 
-	// 4. Open each shard and populate tensor_map_
+	// 5. Open each shard and populate tensor_map_
 	for ( const auto& fname : shard_files ) {
 		if ( num_shards_ >= MAX_SHARDS ) {
 			LOG_ERROR( "[SafeTensorsRepo] %s has more than %d shard files; the rest are ignored\n", dir_path, MAX_SHARDS );
@@ -605,6 +638,7 @@ pod::TensorView SafeTensorsRepo::load(
 	if ( !meta || shard_idx < 0 ) {
 		return pod::TensorView{};
 	}
+	meta = engine::loader::gguf_float_view( shards_[shard_idx], meta, stream );   // a GGUF block tensor read as floats: dequantized once
 
 	pod::DType out_dtype = target_dtype;
 	if ( target_dtype == pod::DType::AUTO ) {
@@ -658,6 +692,18 @@ pod::TensorView SafeTensorsRepo::load(
 		backend::memcpy_async( tv.data, h_fp16.data(), total_elems * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 		backend::stream_sync( stream );
 	}
+	else if ( ( meta->dtype == pod::DType::FP32 || meta->dtype == pod::DType::FP16 ) && out_dtype == pod::DType::BF16 ) {
+		// GGUF embeddings stored as F32 / F16, or dequantized from blocks: round to BF16 (nearest even)
+		std::vector<uint16_t> h_bf16( total_elems );
+		for ( size_t i = 0; i < total_elems; ++i ) {
+			float f = meta->dtype == pod::DType::FP32 ? static_cast<const float*>( src_cpu )[i] : backend::to_float( static_cast<const backend::half_t*>( src_cpu )[i] );
+			uint32_t u;
+			std::memcpy( &u, &f, sizeof( u ) );
+			h_bf16[i] = static_cast<uint16_t>( ( u + 0x7FFFu + ( ( u >> 16 ) & 1u ) ) >> 16 );
+		}
+		backend::memcpy_async( tv.data, h_bf16.data(), total_elems * sizeof( uint16_t ), backend::Copy::Auto, stream );
+		backend::stream_sync( stream );
+	}
 	else {
 		backend::memcpy_async( tv.data, src_cpu, meta->size_bytes, backend::Copy::Auto, stream );
 		backend::stream_sync( stream );
@@ -684,6 +730,7 @@ pod::TensorView SafeTensorsRepo::load_slice(
 	if ( !meta || shard_idx < 0 ) {
 		return pod::TensorView{};
 	}
+	meta = engine::loader::gguf_float_view( shards_[shard_idx], meta, stream );
 
 	ENGINE_ASSERT( slice_dim >= 0 && slice_dim < meta->ndim, "Invalid slice_dim" );
 
@@ -802,6 +849,17 @@ pod::TensorView SafeTensorsRepo::load_slice(
 				for ( int r = 0; r < rows; ++r ) {
 					for ( int c = 0; c < local_cols; ++c ) {
 						h_buf[r * local_cols + c] = bf16_to_fp16( src_bf16[r * cols + rank * local_cols + c] );
+					}
+				}
+				backend::memcpy_async( tv.data, h_buf.data(), total_local * sizeof( backend::half_t ), backend::Copy::Auto, stream );
+				backend::stream_sync( stream );
+			}
+			else if ( meta->dtype == pod::DType::FP32 && out_dtype == pod::DType::FP16 ) {
+				std::vector<backend::half_t> h_buf( total_local );
+				const float* src_f32 = static_cast<const float*>( src_cpu );
+				for ( int r = 0; r < rows; ++r ) {
+					for ( int c = 0; c < local_cols; ++c ) {
+						h_buf[r * local_cols + c] = f32_to_fp16( src_f32[static_cast<size_t>( r ) * cols + rank * local_cols + c] );
 					}
 				}
 				backend::memcpy_async( tv.data, h_buf.data(), total_local * sizeof( backend::half_t ), backend::Copy::Auto, stream );
@@ -971,6 +1029,50 @@ size_t SafeTensorsRepo::bytes_with_prefix( const char* prefix ) const {
 	return total;
 }
 
+pod::LinearWeight SafeTensorsRepo::gguf_linear( int shard, const pod::SafeTensorMeta* meta, pod::MemoryArena& arena,
+	const std::vector<std::pair<int, int>>& rows, const std::vector<std::pair<int, int>>& cols, int pad_rows, backend::stream_t stream ) {
+	const auto type = static_cast<engine::modules::GgmlType>( meta->gguf_type );
+	const engine::modules::GgmlBlock blk = engine::modules::ggml_block( type );
+	if ( !engine::modules::gguf_linear_supported( type ) ) {
+		LOG_ERROR( "[SafeTensorsRepo] %s: GGUF type %s has no matrix kernel\n", meta->name, engine::modules::ggml_type_name( type ) );
+		ENGINE_ASSERT( false, "gguf_linear: unsupported GGUF block type" );
+	}
+	const size_t row_bytes = static_cast<size_t>( meta->shape[1] / blk.elems ) * blk.bytes;
+	int n_local = pad_rows, k_local = 0;
+	for ( const auto& r : rows ) n_local += r.second;
+	for ( const auto& c : cols ) {
+		ENGINE_ASSERT( c.first % blk.elems == 0 && c.second % blk.elems == 0, "gguf_linear: a column range splits a block" );
+		k_local += c.second;
+	}
+	const size_t local_row_bytes = static_cast<size_t>( k_local / blk.elems ) * blk.bytes;
+	const uint8_t* src = static_cast<const uint8_t*>( safetensors_get_data_cpu( shards_[shard], meta ) );
+	ENGINE_ASSERT( src != nullptr, "gguf_linear: no CPU data for the tensor" );
+	std::vector<uint8_t> h( static_cast<size_t>( n_local ) * local_row_bytes, 0 );
+	uint8_t* dst = h.data();
+	for ( const auto& r : rows ) {
+		for ( int i = r.first; i < r.first + r.second; ++i ) {
+			for ( const auto& c : cols ) {
+				const size_t bytes = static_cast<size_t>( c.second / blk.elems ) * blk.bytes;
+				std::memcpy( dst, src + static_cast<size_t>( i ) * row_bytes + static_cast<size_t>( c.first / blk.elems ) * blk.bytes, bytes );
+				dst += bytes;
+			}
+		}
+	}
+	const int shape[2] = { n_local, static_cast<int>( local_row_bytes ) };
+	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::UINT8, shape, 2 );
+	ENGINE_ASSERT( tv.data != nullptr, "gguf_linear: arena full" );
+	backend::memcpy_async( tv.data, h.data(), h.size(), backend::Copy::Auto, stream );
+	backend::stream_sync( stream );
+	pod::LinearWeight lw = pod::LinearWeight::make_gguf( tv, meta->gguf_type, k_local, n_local );
+	if ( meta->gguf_flags & engine::loader::GGUF_COLS_V_TILED ) {
+		// the gathered columns hold k_local / (v_per_k * head_dim) key heads per v
+		const engine::loader::GgufVHeads h = engine::loader::gguf_v_heads( shards_[shard] );
+		lw.gguf_tile_heads = k_local / ( h.v_heads / h.k_heads * h.head_v_dim );
+		lw.gguf_tile_dim = h.head_v_dim;
+	}
+	return lw;
+}
+
 pod::LinearWeight SafeTensorsRepo::load_linear(
 	const char* base_name,
 	pod::MemoryArena& arena,
@@ -993,6 +1095,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear(
 			LOG_ERROR( "load_linear: no tensor group for '%s'\n", base_name );
 			ENGINE_ASSERT( false, "load_linear: neither a trellis group nor a 2-D weight for this name" );
 		}
+		if ( meta->dtype == pod::DType::GGUF ) return gguf_linear( shard, meta, arena, { { 0, meta->shape[0] } }, { { 0, meta->shape[1] } }, 0, stream );
 		pod::TensorView w = load( name_buf, arena, stream, pod::DType::FP16 );
 		const int n = meta->shape[0], k = meta->shape[1];
 		// The tensor is stored [n, k]; Linear::forward takes n from shape[1] and k from shape[0].
@@ -1032,8 +1135,22 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 		// Unquantized checkpoint (the DFlash2 drafter's own release): a dense [n, k] weight. Trellis slice_dim 1 splits
 		// the output dimension n (dense dim 0), slice_dim 0 splits the input dimension k (dense dim 1).
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
-		const pod::SafeTensorMeta* meta = find( name_buf );
+		int shard = -1;
+		const pod::SafeTensorMeta* meta = find( name_buf, &shard );
 		ENGINE_ASSERT( meta != nullptr && meta->ndim == 2, "load_linear_slice: neither a trellis group nor a 2-D weight for this name" );
+		if ( meta->dtype == pod::DType::GGUF ) {
+			const int n = meta->shape[0], k = meta->shape[1];
+			if ( slice_dim == 1 ) return gguf_linear( shard, meta, arena, { { rank * ( n / tp_size ), n / tp_size } }, { { 0, k } }, 0, stream );
+			std::vector<std::pair<int, int>> cols;
+			if ( meta->gguf_flags & engine::loader::GGUF_COLS_V_TILED ) {
+				// tiled input columns [v][k_head][head_dim]: this rank's key heads are one run per v
+				const engine::loader::GgufVHeads h = engine::loader::gguf_v_heads( shards_[shard] );
+				const int run = h.k_heads / tp_size * h.head_v_dim;
+				for ( int v = 0; v < h.v_heads / h.k_heads; ++v ) cols.push_back( { v * h.k_heads * h.head_v_dim + rank * run, run } );
+			}
+			else cols.push_back( { rank * ( k / tp_size ), k / tp_size } );
+			return gguf_linear( shard, meta, arena, { { 0, n } }, cols, 0, stream );
+		}
 		pod::TensorView w = load_slice( name_buf, arena, slice_dim == 1 ? 0 : 1, rank, tp_size, stream, pod::DType::FP16 );
 		return pod::LinearWeight::make_fp16( pod::make_tensor_2d( w.data, pod::DType::FP16, w.shape[1], w.shape[0] ) );
 	}
@@ -1142,6 +1259,14 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_padded(
 	backend::stream_t stream
 ) {
 	char name_buf[512];
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
+	int gguf_shard = -1;
+	if ( const auto* gm = find( name_buf, &gguf_shard ); gm != nullptr && gm->dtype == pod::DType::GGUF ) {
+		// this rank's vocabulary rows, then the pad rows (zero blocks: exactly 0 logits)
+		const int n = gm->shape[0], local = ( n + tp_size - 1 ) / tp_size;
+		const int begin = std::min( n, rank * local ), count = std::min( n, begin + local ) - begin;
+		return gguf_linear( gguf_shard, gm, arena, { { begin, count } }, { { 0, gm->shape[1] } }, local - count + pad_cols, stream );
+	}
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
 	const auto* meta = find( name_buf );
 	if ( !meta ) return pod::LinearWeight{};
@@ -1340,6 +1465,14 @@ pod::LinearWeight SafeTensorsRepo::load_grouped_trellis_slice(
 	backend::stream_t stream
 ) {
 	char name_buf[512];
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
+	int gguf_shard = -1;
+	if ( const auto* meta = find( name_buf, &gguf_shard ); meta != nullptr && meta->dtype == pod::DType::GGUF ) {
+		// the groups' output rows (16 per block), this rank's share of each
+		std::vector<std::pair<int, int>> rows;
+		for ( int g = 0, start = 0; g < num_groups; start += group_channel_blocks[g++] * 16 ) rows.push_back( { start + rank * rank_channel_blocks[g] * 16, rank_channel_blocks[g] * 16 } );
+		return gguf_linear( gguf_shard, meta, arena, rows, { { 0, meta->shape[1] } }, 0, stream );
+	}
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
 	pod::TensorView tr = load_grouped_slice(
 		name_buf, arena, group_channel_blocks, rank_channel_blocks, num_groups, rank, 1, stream, pod::DType::UINT16
@@ -1389,6 +1522,7 @@ pod::TensorView SafeTensorsRepo::load_grouped_slice(
 	if ( !meta || shard_idx < 0 || num_groups <= 0 ) {
 		return pod::TensorView{};
 	}
+	meta = engine::loader::gguf_float_view( shards_[shard_idx], meta, stream );
 
 	int total_group_size = 0;
 	int total_rank_size = 0;

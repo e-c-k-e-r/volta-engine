@@ -1,0 +1,2 @@
+ca89968a23a13e571a6b802a9891d22763153b61 2026-11-06
+ggml-common.h, ggml-cuda/vecdotq.cuh, convert.cu, convert.cuh and dequantize.cuh from llama.cpp (MIT, see LICENSE), commit above, unchanged; they include common.cuh, which is this engine's stand-in (only what they use)

@@ -1,0 +1,51 @@
+#pragma once
+
+// GGUF architecture adapters: how a GGUF tensor name maps to the Hugging Face name the models load, and which of llama.cpp's converter
+// transforms to undo (src/loader/gguf.cpp applies them)
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace engine::loader {
+
+// The key-value metadata of a GGUF file (integers, floats and strings; arrays of integers are kept, others skipped)
+struct GgufKv {
+	std::map<std::string, int64_t> ints;
+	std::map<std::string, double> floats;
+	std::map<std::string, std::string> strings;
+	std::map<std::string, std::vector<int64_t>> int_arrays;
+	int64_t get( const std::string& key, int64_t fallback = 0 ) const {
+		const auto it = ints.find( key );
+		return it == ints.end() ? fallback : it->second;
+	}
+};
+
+enum class GgufTransform {
+	None,
+	NormMinusOne,        // the converter stored 1 + w (Qwen3.5 RMSNorm weights): w = stored - 1 (F32)
+	ALogFromNegExp,      // the converter stored -exp(A_log) in tiled V-head order: A_log = log(-stored), back to grouped order (F32)
+	RowsUntile,          // rows in tiled V-head order (head_dim rows per head): back to grouped order
+	RowsUntileVPart,     // the same for the rows after the first `row_offset` (the V part of [q | k | v])
+	ColsTiled,           // input columns in tiled order: left as stored, flagged (GGUF_COLS_V_TILED)
+};
+
+struct GgufMapped {
+	std::string name;                // the Hugging Face name
+	GgufTransform transform = GgufTransform::None;
+	int head_dim = 1;                // rows (or columns) per V head for the untile transforms
+	int row_offset = 0;              // RowsUntileVPart: rows before the V part
+	std::vector<int> shape;          // a Hugging Face shape when it differs from the GGUF one beyond the dimension order (empty: reversed ne)
+};
+
+struct GgufArch {
+	// V heads tiled by the converter: num_k_heads groups of v_per_k heads (0: none)
+	int k_heads = 0, v_heads = 0, head_v_dim = 0;
+	// Maps one tensor; false: the tensor is not used by the engine (skipped)
+	bool ( *map )( const GgufArch& arch, const GgufKv& kv, const std::string& gguf_name, GgufMapped* out ) = nullptr;
+};
+
+// The adapter of an architecture (general.architecture), filled from the file's metadata; false when there is none
+bool gguf_arch_qwen35( const GgufKv& kv, GgufArch* out );
+
+} // namespace engine::loader

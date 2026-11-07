@@ -21,6 +21,7 @@ enum class DType : uint8_t {
 	TRELLIS_5,
 	TRELLIS_6,
 	NVFP4,
+	GGUF,      // raw GGUF block bytes (the block type is kept beside the tensor)
 	AUTO = 255
 };
 
@@ -38,7 +39,8 @@ inline size_t dtype_bytes( DType dtype ) {
 		} break;
 		case DType::INT8:
 		case DType::UINT8:
-		case DType::NVFP4: {
+		case DType::NVFP4:
+		case DType::GGUF: {
 			return 1;
 		} break;
 		case DType::TRELLIS_2:

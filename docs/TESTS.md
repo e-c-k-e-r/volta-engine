@@ -64,6 +64,7 @@
 | `test_spec_target_equiv [--prompt-tokens N] [--rows N]` | 4 | yes | speculation losslessness on the 27B: a multi-row verify forward against one-row steps, per row, with the logit margin where they disagree |
 | `test_sparse_head [model dir]` | 2 | yes | sparse drafter head on one rank's Flash-Next head shard: extracted columns give the full head's logits there, the rest of the row is the lowest value, the subset's argmax is the full head's restricted to it; one extraction timed (`CUDA_VISIBLE_DEVICES=1`) |
 | `test_glm_qkv <exl3 dir> <source dir> [layer] [rank]` | 2 | yes | GLM linear-attention qkv_proj as loaded (one rank's slice of the fused trellis tensor) against the source's q / k / v rows that rank owns |
+| `test_gguf_linear <fixture dir>` | 2 | yes | LinearGguf for every block type it reads (the K-quants, IQ1_S to IQ4_XS, Q4_0 to Q8_0): 1 to 8 rows against the q8_1 dot product of the same blocks, 20 rows (the dequantize-and-GEMM path) against the exact product; fixtures from `tests/tools/gguf_fixtures.py --libggml <llama.cpp build/bin> --gguf-py <llama.cpp/gguf-py> --out <dir>` (ggml's own quantizer through ctypes; run by hand) |
 | `test_nvfp4_quantize <exl3 dir> <nvfp4 dir> <tensor> [bits]` | 2 | yes | round-to-nearest NVFP4 from a BF16 tensor against the EXL3 version of the same matrix (cosine and relative difference at 1 and 8 rows) |
 
 ## Benchmarks and profiler brackets
