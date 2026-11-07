@@ -17,12 +17,28 @@ double ExpertTier::resident_fraction() {
 	return runtime::options().expert_cache;
 }
 
-void ExpertTier::start( int experts_per_layer, double fraction, const size_t bytes[3], int rank, int tp, int layers, bool streamed, pod::MemoryArena& host ) {
+void ExpertTier::start( int experts_per_layer, double fraction, const size_t bytes[3], int rank, int tp, int layers, bool streamed, pod::MemoryArena& host,
+	const std::vector<std::array<size_t, 3>>* per_layer ) {
 	const std::string& heat = runtime::options().expert_heat_file;
-	configure( experts_per_layer, fraction, bytes, heat.empty() ? std::string() : heat + ( tp > 1 ? ".r" + std::to_string( rank ) : std::string() ) );
-	const size_t cold = runtime::options().expert_synth ? 0 : streamed ? cold_bytes_per_layer() + 256 : static_cast<size_t>( layers ) * cold_bytes_per_layer();
-	ENGINE_ASSERT( engine::core::arena_create_pinned( host, cold + slot_bytes + 256 ), "ExpertTier: pinned expert tier allocation failed" );
-	allocate_staging( host );
+	size_t largest[3] = { bytes[0], bytes[1], bytes[2] };
+	if ( per_layer ) {
+		ENGINE_ASSERT( static_cast<int>( per_layer->size() ) >= layers, "ExpertTier::start: sizes for every layer" );
+		layer_bytes = *per_layer;
+		for ( int p = 0; p < 3; ++p ) {
+			largest[p] = 0;
+			for ( const auto& b : layer_bytes ) largest[p] = std::max( largest[p], b[p] );
+		}
+	}
+	configure( experts_per_layer, fraction, largest, heat.empty() ? std::string() : heat + ( tp > 1 ? ".r" + std::to_string( rank ) : std::string() ) );
+	// every layer's cold experts (one layer's worth when streamed) and its staging buffer
+	size_t cold = 0, stage = 0;
+	for ( int L = 0; L < layers; ++L ) {
+		const size_t slot = layer_bytes.empty() ? slot_bytes : layer_bytes[L][0] + layer_bytes[L][1] + layer_bytes[L][2];
+		cold = streamed ? std::max( cold, static_cast<size_t>( experts - resident ) * slot ) : cold + static_cast<size_t>( experts - resident ) * slot;
+		stage += slot;
+	}
+	if ( runtime::options().expert_synth ) cold = 0;
+	ENGINE_ASSERT( engine::core::arena_create_pinned( host, cold + stage + 256 ), "ExpertTier: pinned expert tier allocation failed" );
 }
 
 void ExpertTier::configure( int experts_per_layer, double fraction, const size_t bytes[3], const std::string& heat_file ) {
@@ -120,6 +136,7 @@ void ExpertTier::stage_init( pod::MemoryArena& device ) {
 	for ( Layer& l : layers ) {
 		// The pointer table of the layer's experts: trellis 9 pointer rows, NVFP4 6 pointer rows then 3 rows of float global scales
 		const size_t table_bytes = l.mw->type == pod::QuantType::NVFP4 ? 6 * static_cast<size_t>( experts ) * sizeof( void* ) + 3 * static_cast<size_t>( experts ) * sizeof( float )
+		                         : l.mw->type == pod::QuantType::GGUF  ? 3 * static_cast<size_t>( experts ) * sizeof( void* )
 		                                                              : 9 * static_cast<size_t>( experts ) * sizeof( void* );
 		l.staged_dev = engine::core::arena_alloc( device, 9 * static_cast<size_t>( experts ) * sizeof( void* ), 256 );
 		CUDA_CHECK( cudaMemcpy( l.staged_dev, l.mw->device_ptrs, table_bytes, cudaMemcpyDeviceToDevice ) );
@@ -147,25 +164,25 @@ void ExpertTier::stage_prefetch( int layer, cudaStream_t stream ) {
 	if ( l.built != l.version ) {
 		// Gate, up and down code pointers (trellis rows 0, 3, 6 of the table; NVFP4 rows 0, 2, 4, the scales being rows 1, 3, 5): resident experts keep their
 		// slots, cold ones go to their place in the stage buffer
-		const int row_step = l.mw->type == pod::QuantType::NVFP4 ? 2 : 3;
+		const int row_step = l.mw->type == pod::QuantType::NVFP4 ? 2 : l.mw->type == pod::QuantType::GGUF ? 1 : 3;
 		std::vector<const void*> row( experts );
 		std::vector<int> rank( experts, -1 );
 		for ( size_t k = 0; k < cold.size(); ++k ) rank[cold[k]] = static_cast<int>( k );
 		size_t off = 0;
 		for ( int p = 0; p < 3; ++p ) {
 			for ( int e = 0; e < experts; ++e ) {
-				row[e] = l.slot_of[e] >= 0 ? static_cast<const void*>( l.slots + static_cast<size_t>( l.slot_of[e] ) * slot_bytes + off )
-				                           : static_cast<const void*>( stage_buf[parity] + static_cast<size_t>( rank[e] ) * slot_bytes + off );
+				row[e] = l.slot_of[e] >= 0 ? static_cast<const void*>( l.slots + static_cast<size_t>( l.slot_of[e] ) * l.slot_bytes + off )
+				                           : static_cast<const void*>( stage_buf[parity] + static_cast<size_t>( rank[e] ) * l.slot_bytes + off );
 			}
 			CUDA_CHECK( cudaMemcpyAsync( static_cast<const void**>( l.staged_dev ) + static_cast<size_t>( row_step * p ) * experts, row.data(), experts * sizeof( void* ), cudaMemcpyHostToDevice, stream ) );
-			off += part_bytes[p];
+			off += l.part_bytes[p];
 		}
 		l.built = l.version;
 	}
 	cudaStream_t cs = static_cast<cudaStream_t>( copy_stream );
 	CUDA_CHECK( cudaStreamWaitEvent( cs, static_cast<cudaEvent_t>( ev_free[parity] ), 0 ) );
 	for ( size_t k = 0; k < cold.size(); ++k ) {
-		CUDA_CHECK( cudaMemcpyAsync( stage_buf[parity] + k * slot_bytes, l.host[cold[k]], slot_bytes, cudaMemcpyHostToDevice, cs ) );
+		CUDA_CHECK( cudaMemcpyAsync( stage_buf[parity] + k * l.slot_bytes, l.host[cold[k]], l.slot_bytes, cudaMemcpyHostToDevice, cs ) );
 	}
 	CUDA_CHECK( cudaEventRecord( static_cast<cudaEvent_t>( ev_ready[layer] ), cs ) );
 	l.queued = true;
@@ -195,6 +212,12 @@ void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, 
 	l.mw = mw;
 	const int res = static_cast<int>( resident_set.size() );
 	ENGINE_ASSERT( res >= resident && res <= experts, "ExpertTier::add_layer: resident set size" );
+	for ( int p = 0; p < 3; ++p ) {
+		l.part_bytes[p] = layer_bytes.empty() ? part_bytes[p] : layer_bytes[layers.size()][p];
+		l.slot_bytes += l.part_bytes[p];
+	}
+	ENGINE_ASSERT( l.slot_bytes % 256 == 0, "ExpertTier: expert code bytes must be a multiple of 256" );
+	const size_t slot_bytes = l.slot_bytes;
 	l.slots = static_cast<uint8_t*>( engine::core::arena_alloc( device, static_cast<size_t>( res ) * slot_bytes, 256 ) );
 	l.slot_of.assign( experts, -1 );
 	l.owner.assign( res, -1 );
@@ -206,7 +229,7 @@ void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, 
 		l.slot_of[resident_set[s]] = s;
 		l.owner[s] = resident_set[s];
 	}
-	if ( stream_mode() && ring == nullptr ) ring = static_cast<uint8_t*>( engine::core::arena_alloc( host, cold_bytes_per_layer(), 256 ) );
+	if ( stream_mode() && ring == nullptr ) ring = static_cast<uint8_t*>( engine::core::arena_alloc( host, cold_bytes_per_layer(), 256 ) );   // the largest layer's
 	l.src.assign( static_cast<size_t>( experts ) * 3, Layer::Src{} );
 	size_t cold_i = 0;
 	for ( int e = 0; e < experts; ++e ) {
@@ -214,6 +237,7 @@ void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, 
 		l.host[e] = stream_mode() ? ring + cold_i * slot_bytes : static_cast<uint8_t*>( engine::core::arena_alloc( host, slot_bytes, 256 ) );
 		++cold_i;
 	}
+	l.staging = static_cast<uint8_t*>( engine::core::arena_alloc( host, slot_bytes, 256 ) );
 	layers.push_back( std::move( l ) );
 }
 
@@ -221,12 +245,12 @@ void ExpertTier::code_arena( int layer, int expert, int part, pod::MemoryArena& 
 	const Layer& l = layers[layer];
 	// expert_synth: a cold expert shares the device slot of resident slot (expert mod resident), so every read is a device read
 	const bool synth = runtime::options().expert_synth && l.slot_of[expert] < 0;
-	uint8_t* base = l.slot_of[expert] >= 0 ? l.slots + static_cast<size_t>( l.slot_of[expert] ) * slot_bytes
-		: synth ? l.slots + static_cast<size_t>( expert % resident ) * slot_bytes : l.host[expert];
+	uint8_t* base = l.slot_of[expert] >= 0 ? l.slots + static_cast<size_t>( l.slot_of[expert] ) * l.slot_bytes
+		: synth ? l.slots + static_cast<size_t>( expert % resident ) * l.slot_bytes : l.host[expert];
 	size_t off = 0;
-	for ( int i = 0; i < part; ++i ) off += part_bytes[i];
+	for ( int i = 0; i < part; ++i ) off += l.part_bytes[i];
 	out.base_ptr = base + off;
-	out.total_bytes = part_bytes[part];
+	out.total_bytes = l.part_bytes[part];
 	out.offset_bytes = 0;
 	out.pinned = l.slot_of[expert] < 0 && !synth;
 	out.stream_skip = out.pinned && runtime::options().expert_stream;
@@ -260,7 +284,7 @@ void ExpertTier::stream_fill( int layer, cudaStream_t stream ) {
 				size_t dst_off = 0;
 				for ( int p = 0; p < 3; ++p ) {
 					const Layer::Src& s = l.src[static_cast<size_t>( e ) * 3 + p];
-					ENGINE_ASSERT( s.fd >= 0 && s.bytes == part_bytes[p], "ExpertTier::stream_fill: no source for a cold expert" );
+					ENGINE_ASSERT( s.fd >= 0 && s.bytes == l.part_bytes[p], "ExpertTier::stream_fill: no source for a cold expert" );
 					size_t done = 0;
 					while ( done < s.bytes ) {
 						const ssize_t n = pread( s.fd, l.host[e] + dst_off + done, s.bytes - done, static_cast<off_t>( s.off + done ) );
@@ -268,16 +292,12 @@ void ExpertTier::stream_fill( int layer, cudaStream_t stream ) {
 						ENGINE_ASSERT( n > 0, "ExpertTier::stream_fill: read failed" );
 						done += static_cast<size_t>( n );
 					}
-					dst_off += part_bytes[p];
+					dst_off += l.part_bytes[p];
 				}
 			}
 		} );
 	}
 	for ( auto& th : pool ) th.join();
-}
-
-void ExpertTier::allocate_staging( pod::MemoryArena& host ) {
-	staging = static_cast<uint8_t*>( engine::core::arena_alloc( host, slot_bytes, 256 ) );
 }
 
 int ExpertTier::rebalance( int layer, cudaStream_t stream ) {
@@ -318,27 +338,27 @@ int ExpertTier::rebalance( int layer, cudaStream_t stream ) {
 		}
 		if ( hot < 0 || cold_res < 0 || eff[hot] < eff[cold_res] + eff[cold_res] / 2 + static_cast<uint64_t>( std::max( 0, runtime::options().expert_swap_margin ) ) ) break;
 		const int slot = l.slot_of[cold_res];
-		uint8_t* slot_ptr = l.slots + static_cast<size_t>( slot ) * slot_bytes;
+		uint8_t* slot_ptr = l.slots + static_cast<size_t>( slot ) * l.slot_bytes;
 		uint8_t* hot_buf = l.host[hot];
-		// Exchange: the slot's bytes into the staging buffer, the hot expert's bytes into the slot
-		CUDA_CHECK( cudaMemcpyAsync( staging, slot_ptr, slot_bytes, cudaMemcpyDeviceToHost, stream ) );
-		CUDA_CHECK( cudaMemcpyAsync( slot_ptr, hot_buf, slot_bytes, cudaMemcpyHostToDevice, stream ) );
+		// Exchange: the slot's bytes into the layer's staging buffer, the hot expert's bytes into the slot
+		CUDA_CHECK( cudaMemcpyAsync( l.staging, slot_ptr, l.slot_bytes, cudaMemcpyDeviceToHost, stream ) );
+		CUDA_CHECK( cudaMemcpyAsync( slot_ptr, hot_buf, l.slot_bytes, cudaMemcpyHostToDevice, stream ) );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
-		l.host[cold_res] = staging;
+		l.host[cold_res] = l.staging;
 		l.host[hot] = nullptr;
-		staging = hot_buf;
+		l.staging = hot_buf;
 		l.slot_of[hot] = slot;
 		l.slot_of[cold_res] = -1;
 		l.owner[slot] = hot;
 		// Point the kernels' tables at the new homes (gate, up, down codes: rows 0, 3, 6 of the trellis 9 x E pointer table, rows 0, 2, 4 of the
 		// NVFP4 6 x E table, where the scales are the rows between)
-		const int row_step = l.mw->type == pod::QuantType::NVFP4 ? 2 : 3;
+		const int row_step = l.mw->type == pod::QuantType::NVFP4 ? 2 : l.mw->type == pod::QuantType::GGUF ? 1 : 3;
 		const void* ptrs_hot[3], *ptrs_cold[3];
 		size_t off = 0;
 		for ( int p = 0; p < 3; ++p ) {
 			ptrs_hot[p] = slot_ptr + off;
 			ptrs_cold[p] = l.host[cold_res] + off;
-			off += part_bytes[p];
+			off += l.part_bytes[p];
 			const size_t row = static_cast<size_t>( row_step * p ) * experts;
 			CUDA_CHECK( cudaMemcpy( static_cast<const void**>( table ) + row + hot, &ptrs_hot[p], sizeof( void* ), cudaMemcpyHostToDevice ) );
 			CUDA_CHECK( cudaMemcpy( static_cast<const void**>( table ) + row + cold_res, &ptrs_cold[p], sizeof( void* ), cudaMemcpyHostToDevice ) );
@@ -349,7 +369,7 @@ int ExpertTier::rebalance( int layer, cudaStream_t stream ) {
 			pod::LinearWeight* set[3] = { l.mw->gate, l.mw->up, l.mw->down };
 			set[p][hot].w0.data = slot_ptr + off;
 			set[p][cold_res].w0.data = l.host[cold_res] + off;
-			off += part_bytes[p];
+			off += l.part_bytes[p];
 		}
 		if ( !l.cpu_owned.empty() ) {
 			if ( on_cold ) on_cold( layer, cold_res );

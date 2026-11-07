@@ -6,6 +6,7 @@
 #include "engine/loader/safetensors.h"
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace engine::loader {
 
@@ -14,8 +15,9 @@ enum GgufFlags : uint32_t {
 	GGUF_COLS_V_TILED = 1,   // input columns in the converter's tiled V-head order (Qwen3.5 linear attention out_proj); the model reorders the activation
 };
 
-// Opens a GGUF file into `st`: false when it cannot be read or its architecture has no adapter
-bool gguf_open( pod::SafeTensorsFile& st, const char* path );
+// Opens a GGUF file into `st`: false when it cannot be read or its architecture has no adapter. A later file of a split model
+// (-0000N-of-0000M.gguf, N > 1) takes the model's metadata from the first file, `first`
+bool gguf_open( pod::SafeTensorsFile& st, const char* path, const pod::SafeTensorsFile* first = nullptr );
 void gguf_release( pod::SafeTensorsFile& st );
 
 // A block-quantized tensor of `st` as FP16 values (what the dequantizers produce), dequantized on the current device the first time and kept: the norms, embeddings and small
@@ -30,5 +32,9 @@ GgufVHeads gguf_v_heads( const pod::SafeTensorsFile& st );
 
 // The file's general.architecture ("" for safetensors)
 std::string gguf_architecture( const pod::SafeTensorsFile& st );
+
+// An integer or integer-array metadata value of the file (false when it has none)
+bool gguf_kv_int( const pod::SafeTensorsFile& st, const char* key, int64_t* out );
+bool gguf_kv_ints( const pod::SafeTensorsFile& st, const char* key, std::vector<int64_t>* out );
 
 } // namespace engine::loader

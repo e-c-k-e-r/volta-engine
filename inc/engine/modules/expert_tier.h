@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <array>
 #include <vector>
 
 namespace engine::modules {
@@ -24,7 +25,10 @@ namespace engine::modules {
 struct ExpertTier {
 	struct Layer {
 		pod::MoELayerWeights* mw = nullptr;
+		size_t part_bytes[3] = {};           // this layer's expert: gate, up and down code bytes (layers differ in a GGUF conversion's block types)
+		size_t slot_bytes = 0;
 		uint8_t* slots = nullptr;            // resident * slot_bytes, device
+		uint8_t* staging = nullptr;          // one pinned expert-sized buffer of this layer that rotates through its swaps
 		std::vector<int> slot_of;            // expert -> slot, -1 when cold
 		std::vector<int> owner;              // slot -> expert
 		std::vector<uint8_t*> host;          // expert -> its pinned buffer when cold
@@ -41,11 +45,11 @@ struct ExpertTier {
 
 	int experts = 0;
 	int resident = 0;                        // the base count per layer; add_layer takes the size of the set it is given
-	size_t part_bytes[3] = {};
+	size_t part_bytes[3] = {};               // the largest layer's (the shared buffers' size); Layer has each layer's own
 	size_t slot_bytes = 0;
+	std::vector<std::array<size_t, 3>> layer_bytes;   // per layer, when start() was given them (empty: every layer is part_bytes)
 	std::vector<Layer> layers;
 	uint8_t* ring = nullptr;                 // expert_stream: the one pinned buffer every layer's cold experts are read into before the layer runs
-	uint8_t* staging = nullptr;              // one pinned expert-sized buffer that rotates through the swaps
 	uint64_t swaps = 0, window_routes = 0, window_hits = 0;
 	int max_swaps = -1;                      // per layer per rebalance; <0 = derived from the byte budget expert_swap_mib
 	std::string heat_path;                   // expert_heat_file of this rank (empty: no persistence)
@@ -77,8 +81,10 @@ struct ExpertTier {
 	// Sizes the tier for `experts` local experts per layer and the byte sizes of one expert's gate / up / down codes
 	void configure( int experts_per_layer, double fraction, const size_t bytes[3], const std::string& heat_file = std::string() );
 	// configure() for rank `rank` of `tp` (the heat file gets a .r<rank> suffix with more than one rank), plus the pinned host buffer for
-	// `layers` MoE layers' cold experts (one layer's worth when `streamed`) and the staging; host is created here
-	void start( int experts_per_layer, double fraction, const size_t bytes[3], int rank, int tp, int layers, bool streamed, pod::MemoryArena& host );
+	// `layers` MoE layers' cold experts (one layer's worth when `streamed`) and their staging buffers; host is created here. per_layer: each
+	// layer's byte sizes, when they differ (bytes is then ignored)
+	void start( int experts_per_layer, double fraction, const size_t bytes[3], int rank, int tp, int layers, bool streamed, pod::MemoryArena& host,
+		const std::vector<std::array<size_t, 3>>* per_layer = nullptr );
 	// The experts a layer starts with: the hottest ones of the saved counts when there are any, experts 0..resident - 1 otherwise
 	// (`count` of them; the tier's `resident` when 0 - a layer may hold more than the base count, never fewer)
 	std::vector<int> initial_set( int layer, int count = 0 ) const;
@@ -97,8 +103,6 @@ struct ExpertTier {
 	static bool stream_mode();
 	void set_source( int layer, int expert, int part, int fd, size_t off, size_t bytes );
 	void stream_fill( int layer, backend::stream_t stream );
-	// After a layer's experts are loaded and its device pointer table built
-	void allocate_staging( pod::MemoryArena& host );
 	// Reads and clears the layer counters, updates the scores and performs up to max_swaps exchanges; returns swaps done
 	int rebalance( int layer, backend::stream_t stream );
 	double hit_rate() const { return window_routes ? static_cast<double>( window_hits ) / static_cast<double>( window_routes ) : 1.0; }

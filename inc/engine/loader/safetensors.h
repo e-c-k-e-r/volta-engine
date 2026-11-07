@@ -92,7 +92,7 @@ public:
 	);
 	// Checkpoint bytes of the tensors whose names start with `prefix` and contain none of the `skip` substrings
 	size_t bytes_of( const std::string& prefix, std::initializer_list<const char*> skip = {} ) const;
-	// Bytes of the trellis codes of `base_name` (0 when it is not a trellis tensor)
+	// Bytes of the codes of `base_name`: its trellis, or the blocks of a GGUF weight (0 when it is neither)
 	size_t trellis_bytes( const char* base_name ) const;
 	// Where a tensor's bytes are in its shard file (an open descriptor, absolute offset), for reads that bypass the mmap
 	bool file_ref( const char* tensor_name, int* fd, size_t* offset, size_t* bytes ) const;
@@ -304,10 +304,11 @@ public:
 	}
 
 private:
-	// A GGUF block tensor as a LinearWeight: the given row ranges, and of each row the given column ranges (whole blocks), plus pad_rows zero
-	// rows (an LM head padded to its shard width); the column order flag follows the tensor's GGUF_COLS_V_TILED
+	// A GGUF block tensor as a LinearWeight: the given row ranges, and of each row the given column ranges (whole blocks), the column order
+	// following the tensor's GGUF_COLS_V_TILED
+	// (pad_rows zero rows: an LM head padded to its shard width); the blocks go to code_arena when given (an expert tier slot)
 	pod::LinearWeight gguf_linear( int shard, const pod::SafeTensorMeta* meta, pod::MemoryArena& arena, const std::vector<std::pair<int, int>>& rows,
-		const std::vector<std::pair<int, int>>& cols, int pad_rows, backend::stream_t stream );
+		const std::vector<std::pair<int, int>>& cols, int pad_rows, backend::stream_t stream, pod::MemoryArena* code_arena = nullptr );
 
 	static constexpr int MAX_SHARDS = 128;
 	pod::SafeTensorsFile shards_[MAX_SHARDS];

@@ -36,16 +36,22 @@ struct GgufMapped {
 	int head_dim = 1;                // rows (or columns) per V head for the untile transforms
 	int row_offset = 0;              // RowsUntileVPart: rows before the V part
 	std::vector<int> shape;          // a Hugging Face shape when it differs from the GGUF one beyond the dimension order (empty: reversed ne)
+	// A row range of the GGUF tensor (its rows: every dimension but the innermost, flattened): one expert of a stacked expert tensor, one
+	// part of a weight the converter concatenated. rows < 0: all of them
+	int64_t row_begin = 0, rows = -1;
+	// One of `parts` GGUF tensors whose rows, in part order, make up the Hugging Face tensor (the converter split it)
+	int part = 0, parts = 1;
 };
 
 struct GgufArch {
 	// V heads tiled by the converter: num_k_heads groups of v_per_k heads (0: none)
 	int k_heads = 0, v_heads = 0, head_v_dim = 0;
-	// Maps one tensor; false: the tensor is not used by the engine (skipped)
-	bool ( *map )( const GgufArch& arch, const GgufKv& kv, const std::string& gguf_name, GgufMapped* out ) = nullptr;
+	// Maps one tensor to the Hugging Face tensors it holds (none: the tensor is not used by the engine)
+	void ( *map )( const GgufArch& arch, const GgufKv& kv, const std::string& gguf_name, std::vector<GgufMapped>* out ) = nullptr;
 };
 
 // The adapter of an architecture (general.architecture), filled from the file's metadata; false when there is none
 bool gguf_arch_qwen35( const GgufKv& kv, GgufArch* out );
+bool gguf_arch_qwen4exp( const GgufKv& kv, GgufArch* out );
 
 } // namespace engine::loader

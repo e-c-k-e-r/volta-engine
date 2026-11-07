@@ -129,6 +129,7 @@ set(ENGINE_HOST_SOURCES
 	src/loader/safetensors.cpp
 	src/loader/gguf.cpp
 	src/loader/gguf_qwen35.cpp
+	src/loader/gguf_qwen4exp.cpp
 	src/loader/gguf_types.cpp
 	src/loader/nvfp4.cpp
 	src/loader/tokenizer.cpp
@@ -197,6 +198,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/kernels/cuda/nvfp4/skinny_kernels.cu
 	src/kernels/cuda/nvfp4/moe_kernels.cu
 	src/kernels/cuda/gguf/gguf_linear.cu
+	src/kernels/cuda/gguf/gguf_moe.cu
 	src/kernels/cuda/gguf/ggml/convert.cu
 	src/backend/cuda/modules/norm.cu
 	src/backend/cuda/modules/swiglu.cu

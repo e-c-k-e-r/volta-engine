@@ -1,5 +1,6 @@
 #include "engine/modules/trellis_bits.h"
 #include "engine/modules/moe.h"
+#include "engine/modules/gguf.h"
 #include "engine/modules/swiglu.h"
 #include "engine/modules/trellis.h"
 #include "engine/backend/cuda/activation.cuh"
@@ -758,6 +759,20 @@ void MoE::init_device_ptrs(
 			}
 		}
 	}
+	if ( weights.type == pod::QuantType::GGUF ) {
+		// 3 pointer arrays: each expert's gate, up and down blocks
+		const int E = weights.num_local_experts;
+		std::vector<const void*> h_ptrs( 3 * E );
+		for ( int e = 0; e < E; ++e ) {
+			h_ptrs[0 * E + e] = weights.gate[e].w0.data;
+			h_ptrs[1 * E + e] = weights.up[e].w0.data;
+			h_ptrs[2 * E + e] = weights.down[e].w0.data;
+		}
+		void* d = engine::core::arena_alloc( arena, 3 * E * sizeof( const void* ) );
+		CUDA_CHECK( cudaMemcpyAsync( d, h_ptrs.data(), 3 * E * sizeof( const void* ), cudaMemcpyHostToDevice, stream ) );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		weights.device_ptrs = d;
+	}
 	if ( weights.type == pod::QuantType::NVFP4 ) {
 		// 6 pointer arrays (gate c/s, up c/s, down c/s) then 3 float arrays (global scales)
 		const int E = weights.num_local_experts;
@@ -841,7 +856,7 @@ pod::MoEScratch MoE::alloc_scratch(
 
 bool MoE::fused_decode( const pod::MoELayerWeights& weights, const pod::MoEScratch& scratch, int rows ) {
 	const int ebits = weights.bits_dev ? weights.bits_max : weights.gate[0].bits;
-	if ( weights.type == pod::QuantType::NVFP4 ) return true;   // no trellis workspace
+	if ( weights.type == pod::QuantType::NVFP4 || weights.type == pod::QuantType::GGUF ) return true;   // no trellis workspace
 #if defined(USE_ROCM)
 	const bool bits_ok = ebits >= 1 && ebits <= 8;   // the ROCm launch (exl3_moe.cu) takes any width
 #else
@@ -878,6 +893,20 @@ void MoE::forward(
 	const int num_groups = sharded ? MOE_MAX_GROUPS : rows == 1 ? 1 : rows <= 16 ? 4 : MOE_MAX_GROUPS;
 	// Fused decode path: gate/up and down GEMV kernels over runs of rows that share an expert (exl3_moe_coop.cuh)
 	// 3 bpw (up to 8 routes: the integer tile) and 4 bpw experts, all mul1
+	if ( weights.type == pod::QuantType::GGUF ) {
+		ENGINE_ASSERT( scratch.gguf_ws != nullptr && weights.device_ptrs != nullptr && act_limit <= 0.0f, "MoE::forward: GGUF experts need their scratch, init_device_ptrs and no activation limit" );
+		MoEGguf::Table t;
+		t.ptrs = static_cast<const void* const*>( weights.staged_ptrs != nullptr ? weights.staged_ptrs : weights.device_ptrs );   // a prefill layer reads its cold experts from the stage buffer
+		t.num_local = weights.num_local_experts;
+		t.first_expert = start_expert;
+		t.type[0] = static_cast<GgmlType>( weights.gate[0].gguf_type );
+		t.type[1] = static_cast<GgmlType>( weights.up[0].gguf_type );
+		t.type[2] = static_cast<GgmlType>( weights.down[0].gguf_type );
+		t.hidden = x.shape[x.ndim - 1];
+		t.inter = weights.gate[0].gguf_n;
+		MoEGguf::forward( t, x.ptr<const half>(), rows, d_topk_indices, d_topk_weights, weights.top_k, out.ptr<half>(), scratch.gguf_ws, weights.heat, stream );
+		return;
+	}
 	if ( weights.type == pod::QuantType::NVFP4 ) {
 		ENGINE_ASSERT( scratch.nv_ctr != nullptr && weights.device_ptrs != nullptr && act_limit >= 0.0f, "MoE::forward: NVFP4 experts need nvfp4 scratch and init_device_ptrs" );
 		const int E = weights.num_local_experts;

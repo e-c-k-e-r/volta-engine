@@ -39,7 +39,8 @@ __attribute__(( weak )) void ExpertTier::stage_end( int, backend::stream_t ) {}
 
 __attribute__(( weak )) ExpertTier::~ExpertTier() {}
 
-__attribute__(( weak )) void ExpertTier::start( int experts_per_layer, double fraction, const size_t bytes[3], int rank, int tp, int layers, bool streamed, pod::MemoryArena& host ) {
+__attribute__(( weak )) void ExpertTier::start( int experts_per_layer, double fraction, const size_t bytes[3], int rank, int tp, int layers, bool streamed, pod::MemoryArena& host,
+	const std::vector<std::array<size_t, 3>>* per_layer ) {
 	ENGINE_UNSUPPORTED( "ExpertTier::start" );
 	__builtin_unreachable();
 }
@@ -51,11 +52,6 @@ __attribute__(( weak )) void ExpertTier::add_layer( pod::MoELayerWeights* mw, po
 
 __attribute__(( weak )) void ExpertTier::code_arena( int layer, int expert, int part, pod::MemoryArena& out ) const {
 	ENGINE_UNSUPPORTED( "ExpertTier::code_arena" );
-	__builtin_unreachable();
-}
-
-__attribute__(( weak )) void ExpertTier::allocate_staging( pod::MemoryArena& host ) {
-	ENGINE_UNSUPPORTED( "ExpertTier::allocate_staging" );
 	__builtin_unreachable();
 }
 

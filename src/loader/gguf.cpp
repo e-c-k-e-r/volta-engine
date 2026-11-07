@@ -121,7 +121,7 @@ void untile_rows( std::vector<uint8_t>& data, size_t row_bytes, int first, const
 
 } // namespace
 
-bool gguf_open( pod::SafeTensorsFile& st, const char* path ) {
+bool gguf_open( pod::SafeTensorsFile& st, const char* path, const pod::SafeTensorsFile* first ) {
 	st = pod::SafeTensorsFile{};
 	st.fd = ::open( path, O_RDONLY );
 	if ( st.fd < 0 ) return false;
@@ -145,13 +145,27 @@ bool gguf_open( pod::SafeTensorsFile& st, const char* path ) {
 	for ( uint64_t k = 0; k < n_kv; ++k ) {
 		if ( !read_kv( r, &s->kv ) ) return fail( "unreadable metadata" );
 	}
-	s->arch_name = s->kv.strings["general.architecture"];
-	bool have_arch = false;
-	if ( s->arch_name == "qwen35" ) have_arch = gguf_arch_qwen35( s->kv, &s->arch );
-	if ( !have_arch ) {
-		LOG_ERROR( "[gguf] %s: architecture '%s' has no adapter\n", path, s->arch_name.c_str() );
-		safetensors_close( st );
-		return false;
+	if ( s->kv.get( "split.no" ) > 0 ) {
+		// a later file of a split model carries only the split keys: the model's metadata is the first file's
+		const GgufState* f = first ? state_of( *first ) : nullptr;
+		if ( f == nullptr ) return fail( "a later split file opened without the first one" );
+		s->arch_name = f->arch_name;
+		s->arch = f->arch;
+		for ( const auto& [key, v] : f->kv.ints ) s->kv.ints.emplace( key, v );
+		for ( const auto& [key, v] : f->kv.floats ) s->kv.floats.emplace( key, v );
+		for ( const auto& [key, v] : f->kv.strings ) s->kv.strings.emplace( key, v );
+		for ( const auto& [key, v] : f->kv.int_arrays ) s->kv.int_arrays.emplace( key, v );
+	}
+	else {
+		s->arch_name = s->kv.strings["general.architecture"];
+		bool have_arch = false;
+		if ( s->arch_name == "qwen35" ) have_arch = gguf_arch_qwen35( s->kv, &s->arch );
+		else if ( s->arch_name == "qwen4exp" ) have_arch = gguf_arch_qwen4exp( s->kv, &s->arch );
+		if ( !have_arch ) {
+			LOG_ERROR( "[gguf] %s: architecture '%s' has no adapter\n", path, s->arch_name.c_str() );
+			safetensors_close( st );
+			return false;
+		}
 	}
 
 	struct Info { std::string name; std::vector<uint64_t> ne; uint32_t type; uint64_t offset; };
@@ -169,12 +183,15 @@ bool gguf_open( pod::SafeTensorsFile& st, const char* path ) {
 	const uint64_t align = static_cast<uint64_t>( s->kv.get( "general.alignment", 32 ) );
 	const uint64_t data_start = ( r.pos + align - 1 ) / align * align;
 
-	st.tensor_capacity = static_cast<int>( n_tensors ) + 1;
-	st.tensors = static_cast<pod::SafeTensorMeta*>( std::calloc( st.tensor_capacity, sizeof( pod::SafeTensorMeta ) ) );
+	std::vector<pod::SafeTensorMeta> metas;
+	// parts of a Hugging Face tensor the converter split (index_qk_proj): its metas by part index, joined once all have been read
+	std::map<std::string, std::vector<pod::SafeTensorMeta>> parts;
 	int skipped = 0;
+	std::vector<GgufMapped> mapped;
 	for ( const Info& t : infos ) {
-		GgufMapped m;
-		if ( !s->arch.map( s->arch, s->kv, t.name, &m ) ) { ++skipped; continue; }
+		mapped.clear();
+		s->arch.map( s->arch, s->kv, t.name, &mapped );
+		if ( mapped.empty() ) { ++skipped; continue; }
 		const auto type = static_cast<GgmlType>( t.type );
 		const engine::modules::GgmlBlock blk = engine::modules::ggml_block( type );
 		if ( blk.elems == 0 || t.ne[0] % blk.elems != 0 ) {
@@ -182,52 +199,82 @@ bool gguf_open( pod::SafeTensorsFile& st, const char* path ) {
 			++skipped;
 			continue;
 		}
-		pod::SafeTensorMeta meta{};
-		std::strncpy( meta.name, m.name.c_str(), sizeof( meta.name ) - 1 );
-		meta.dtype = type == GgmlType::F32 ? pod::DType::FP32 : type == GgmlType::F16 ? pod::DType::FP16 : type == GgmlType::BF16 ? pod::DType::BF16 : pod::DType::GGUF;
-		meta.gguf_type = t.type;
-		// Hugging Face dimension order: outermost first (ne[0] is the innermost)
-		const int nd = static_cast<int>( t.ne.size() );
-		std::vector<int> shape( nd );
-		for ( int d = 0; d < nd; ++d ) shape[d] = static_cast<int>( t.ne[nd - 1 - d] );
-		if ( !m.shape.empty() ) {
-			std::vector<int> hs = m.shape;
-			size_t from = 0;
-			for ( int& d : hs ) if ( d < 0 ) d = from < shape.size() ? shape[from++] : 1;
-			shape = hs;
-		}
-		meta.ndim = static_cast<int>( shape.size() );
-		for ( int d = 0; d < meta.ndim; ++d ) meta.shape[d] = shape[d];
-		uint64_t rows = 1;
-		for ( size_t d = 1; d < t.ne.size(); ++d ) rows *= t.ne[d];
+		uint64_t all_rows = 1;
+		for ( size_t d = 1; d < t.ne.size(); ++d ) all_rows *= t.ne[d];
 		const size_t row_bytes = static_cast<size_t>( t.ne[0] / blk.elems * blk.bytes );
-		meta.size_bytes = static_cast<size_t>( rows ) * row_bytes;
-		meta.data_offset_bytes = static_cast<size_t>( data_start + t.offset );
-		if ( meta.data_offset_bytes + meta.size_bytes > st.file_size ) return fail( "tensor data past the end of the file" );
-		if ( m.transform == GgufTransform::ColsTiled && s->arch.k_heads > 0 ) meta.gguf_flags |= GGUF_COLS_V_TILED;
-		if ( m.transform != GgufTransform::None && m.transform != GgufTransform::ColsTiled ) {
-			// A host copy: rows are the outermost dimension (a 1-D tensor is rows of one value)
-			const uint8_t* src = static_cast<const uint8_t*>( st.mmap_addr ) + meta.data_offset_bytes;
-			std::vector<uint8_t> data( src, src + meta.size_bytes );
-			const size_t n_rows = t.ne.size() == 1 ? static_cast<size_t>( t.ne[0] ) : static_cast<size_t>( rows );
-			const size_t rb = meta.size_bytes / n_rows;
-			if ( m.transform == GgufTransform::NormMinusOne || m.transform == GgufTransform::ALogFromNegExp ) {
-				if ( type != GgmlType::F32 ) return fail( "a transformed norm / A_log tensor is not F32" );
-				if ( m.transform == GgufTransform::ALogFromNegExp ) untile_rows( data, rb, 0, s->arch, 1 );
-				float* v = reinterpret_cast<float*>( data.data() );
-				for ( size_t i = 0; i < meta.size_bytes / sizeof( float ); ++i ) v[i] = m.transform == GgufTransform::NormMinusOne ? v[i] - 1.0f : std::log( -v[i] );
+		if ( data_start + t.offset + all_rows * row_bytes > st.file_size ) return fail( "tensor data past the end of the file" );
+		for ( const GgufMapped& m : mapped ) {
+			pod::SafeTensorMeta meta{};
+			std::strncpy( meta.name, m.name.c_str(), sizeof( meta.name ) - 1 );
+			meta.dtype = type == GgmlType::F32 ? pod::DType::FP32 : type == GgmlType::F16 ? pod::DType::FP16 : type == GgmlType::BF16 ? pod::DType::BF16 : pod::DType::GGUF;
+			meta.gguf_type = t.type;
+			const uint64_t rows = m.rows >= 0 ? static_cast<uint64_t>( m.rows ) : all_rows;
+			if ( m.row_begin + rows > all_rows ) return fail( "a mapped row range runs past its tensor" );
+			// Hugging Face dimension order: outermost first (ne[0] is the innermost); a row range is a matrix of its rows
+			std::vector<int> shape;
+			if ( m.rows >= 0 ) shape = { static_cast<int>( rows ), static_cast<int>( t.ne[0] ) };
+			else for ( size_t d = t.ne.size(); d-- > 0; ) shape.push_back( static_cast<int>( t.ne[d] ) );
+			if ( !m.shape.empty() ) {
+				std::vector<int> hs = m.shape;
+				size_t from = 0;
+				for ( int& d : hs ) if ( d < 0 ) d = from < shape.size() ? shape[from++] : 1;
+				shape = hs;
 			}
-			else {
-				const int first = m.transform == GgufTransform::RowsUntileVPart ? m.row_offset : 0;
-				if ( s->arch.k_heads > 0 && static_cast<size_t>( first + s->arch.v_heads * m.head_dim ) != n_rows ) return fail( "V-head rows do not match the tensor" );
-				untile_rows( data, rb, first, s->arch, m.head_dim );
+			meta.ndim = static_cast<int>( shape.size() );
+			for ( int d = 0; d < meta.ndim; ++d ) meta.shape[d] = shape[d];
+			meta.size_bytes = static_cast<size_t>( rows ) * row_bytes;
+			meta.data_offset_bytes = static_cast<size_t>( data_start + t.offset + m.row_begin * row_bytes );
+			if ( m.transform == GgufTransform::ColsTiled && s->arch.k_heads > 0 ) meta.gguf_flags |= GGUF_COLS_V_TILED;
+			if ( m.transform != GgufTransform::None && m.transform != GgufTransform::ColsTiled ) {
+				// A host copy: rows are the outermost dimension (a 1-D tensor is rows of one value)
+				const uint8_t* src = static_cast<const uint8_t*>( st.mmap_addr ) + meta.data_offset_bytes;
+				std::vector<uint8_t> data( src, src + meta.size_bytes );
+				const size_t n_rows = t.ne.size() == 1 ? static_cast<size_t>( t.ne[0] ) : static_cast<size_t>( rows );
+				const size_t rb = meta.size_bytes / n_rows;
+				if ( m.transform == GgufTransform::NormMinusOne || m.transform == GgufTransform::ALogFromNegExp ) {
+					if ( type != GgmlType::F32 ) return fail( "a transformed norm / A_log tensor is not F32" );
+					if ( m.transform == GgufTransform::ALogFromNegExp ) untile_rows( data, rb, 0, s->arch, 1 );
+					float* v = reinterpret_cast<float*>( data.data() );
+					for ( size_t i = 0; i < meta.size_bytes / sizeof( float ); ++i ) v[i] = m.transform == GgufTransform::NormMinusOne ? v[i] - 1.0f : std::log( -v[i] );
+				}
+				else {
+					const int first_row = m.transform == GgufTransform::RowsUntileVPart ? m.row_offset : 0;
+					if ( s->arch.k_heads > 0 && static_cast<size_t>( first_row + s->arch.v_heads * m.head_dim ) != n_rows ) return fail( "V-head rows do not match the tensor" );
+					untile_rows( data, rb, first_row, s->arch, m.head_dim );
+				}
+				s->owned.push_back( std::move( data ) );
+				meta.host = s->owned.back().data();
 			}
+			if ( m.parts <= 1 ) { metas.push_back( meta ); continue; }
+			auto& got = parts[m.name];
+			got.resize( m.parts );
+			got[m.part] = meta;
+			bool all = true;
+			for ( const auto& g : got ) all = all && g.ndim > 0;
+			if ( !all ) continue;
+			// every part read: one host copy of their rows in part order
+			pod::SafeTensorMeta joined = got[0];
+			std::vector<uint8_t> data;
+			int joined_rows = 0;
+			for ( const auto& g : got ) {
+				if ( g.gguf_type != joined.gguf_type || g.ndim != 2 || g.shape[1] != joined.shape[1] ) return fail( "the parts of a split tensor differ in type or width" );
+				const uint8_t* src = g.host ? static_cast<const uint8_t*>( g.host ) : static_cast<const uint8_t*>( st.mmap_addr ) + g.data_offset_bytes;
+				data.insert( data.end(), src, src + g.size_bytes );
+				joined_rows += g.shape[0];
+			}
+			joined.shape[0] = joined_rows;
+			joined.size_bytes = data.size();
 			s->owned.push_back( std::move( data ) );
-			meta.host = s->owned.back().data();
+			joined.host = s->owned.back().data();
+			metas.push_back( joined );
+			parts.erase( m.name );
 		}
-		st.tensors[st.tensor_count++] = meta;
 	}
-	LOG_INFO( "[gguf] %s: architecture %s, %d tensors mapped, %d not used\n", path, s->arch_name.c_str(), st.tensor_count, skipped );
+	if ( !parts.empty() ) return fail( "a split tensor is missing a part" );
+	st.tensor_capacity = static_cast<int>( metas.size() ) + 1;
+	st.tensors = static_cast<pod::SafeTensorMeta*>( std::calloc( st.tensor_capacity, sizeof( pod::SafeTensorMeta ) ) );
+	for ( const auto& m : metas ) st.tensors[st.tensor_count++] = m;
+	LOG_INFO( "[gguf] %s: architecture %s, %zu tensors read as %d, %d not used\n", path, s->arch_name.c_str(), infos.size(), st.tensor_count, skipped );
 	return true;
 }
 
@@ -281,6 +328,24 @@ GgufVHeads gguf_v_heads( const pod::SafeTensorsFile& st ) {
 std::string gguf_architecture( const pod::SafeTensorsFile& st ) {
 	const GgufState* s = state_of( st );
 	return s ? s->arch_name : std::string();
+}
+
+bool gguf_kv_int( const pod::SafeTensorsFile& st, const char* key, int64_t* out ) {
+	const GgufState* s = state_of( st );
+	if ( s == nullptr ) return false;
+	const auto it = s->kv.ints.find( key );
+	if ( it == s->kv.ints.end() ) return false;
+	*out = it->second;
+	return true;
+}
+
+bool gguf_kv_ints( const pod::SafeTensorsFile& st, const char* key, std::vector<int64_t>* out ) {
+	const GgufState* s = state_of( st );
+	if ( s == nullptr ) return false;
+	const auto it = s->kv.int_arrays.find( key );
+	if ( it == s->kv.int_arrays.end() ) return false;
+	*out = it->second;
+	return true;
 }
 
 } // namespace engine::loader

@@ -57,6 +57,8 @@ struct MoEScratch {
 	float*   nv_partial = nullptr;     // [rows * top_k, hidden]
 	int*     nv_disp = nullptr;        // route grouping by expert (nvfp4_disp_ints)
 	int*     nv_ctr = nullptr;         // [hidden / 32], zero between calls
+	// GGUF experts (MoEGguf::scratch_bytes; the owner allocates it once it knows the experts are GGUF)
+	void*    gguf_ws = nullptr;
 	// Heavy experts of a prefill chunk (option moe_heavy_rows): masked routes, the heavy routes' tokens and weights and the expert mask (an expert's
 	// rows are worked on in the planes buffer); allocated when the option is on
 	void*    heavy_ws = nullptr;

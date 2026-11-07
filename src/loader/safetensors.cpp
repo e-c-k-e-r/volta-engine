@@ -550,18 +550,32 @@ bool SafeTensorsRepo::open( const char* dir_path ) {
 			}
 			closedir( dir );
 		}
+		std::sort( ggufs.begin(), ggufs.end() );
 		if ( ggufs.size() > 1 ) {
-			LOG_ERROR( "[SafeTensorsRepo] %s holds %zu GGUF files; keep one (split GGUF files are not read)\n", dir_path, ggufs.size() );
-			return false;
+			// the files of one split model (name-00001-of-0000N.gguf ... name-0000N-of-0000N.gguf), in order
+			bool split = static_cast<int>( ggufs.size() ) <= MAX_SHARDS;
+			for ( size_t i = 0; i < ggufs.size() && split; ++i ) {
+				char tail[32];
+				std::snprintf( tail, sizeof( tail ), "-%05zu-of-%05zu.gguf", i + 1, ggufs.size() );
+				const std::string& f = ggufs[i];
+				split = f.size() > std::strlen( tail ) && f.compare( f.size() - std::strlen( tail ), std::string::npos, tail ) == 0 &&
+					f.compare( 0, f.size() - std::strlen( tail ), ggufs[0], 0, ggufs[0].size() - std::strlen( tail ) ) == 0;
+			}
+			if ( !split ) {
+				LOG_ERROR( "[SafeTensorsRepo] %s holds %zu GGUF files that are not the parts of one split model; keep one model\n", dir_path, ggufs.size() );
+				return false;
+			}
 		}
-		if ( ggufs.size() == 1 ) {
-			char full_path[1024];
-			std::snprintf( full_path, sizeof( full_path ), "%s/%s", dir_path, ggufs[0].c_str() );
-			if ( !engine::loader::gguf_open( shards_[0], full_path ) ) return false;
-			std::strncpy( shard_names_[0], ggufs[0].c_str(), sizeof( shard_names_[0] ) - 1 );
-			num_shards_ = 1;
-			for ( int t = 0; t < shards_[0].tensor_count; ++t ) tensor_map_[shards_[0].tensors[t].name] = { 0, &shards_[0].tensors[t] };
-			LOG_INFO( "[SafeTensorsRepo] GGUF %s, mapped %zu tensors\n", ggufs[0].c_str(), tensor_map_.size() );
+		if ( !ggufs.empty() ) {
+			for ( size_t i = 0; i < ggufs.size(); ++i ) {
+				char full_path[1024];
+				std::snprintf( full_path, sizeof( full_path ), "%s/%s", dir_path, ggufs[i].c_str() );
+				if ( !engine::loader::gguf_open( shards_[i], full_path, i > 0 ? &shards_[0] : nullptr ) ) return false;
+				std::strncpy( shard_names_[i], ggufs[i].c_str(), sizeof( shard_names_[i] ) - 1 );
+				num_shards_ = static_cast<int>( i ) + 1;
+				for ( int t = 0; t < shards_[i].tensor_count; ++t ) tensor_map_[shards_[i].tensors[t].name] = { static_cast<int>( i ), &shards_[i].tensors[t] };
+			}
+			LOG_INFO( "[SafeTensorsRepo] GGUF %s (%zu files), mapped %zu tensors\n", ggufs[0].c_str(), ggufs.size(), tensor_map_.size() );
 			return true;
 		}
 	}
@@ -927,7 +941,13 @@ size_t SafeTensorsRepo::trellis_bytes( const char* base_name ) const {
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
 	const pod::SafeTensorMeta* meta = find( name_buf );
-	return meta != nullptr ? static_cast<size_t>( meta->size_bytes ) : 0;
+	if ( meta == nullptr ) {
+		// a GGUF weight: its blocks are the codes
+		std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
+		meta = find( name_buf );
+		if ( meta == nullptr || meta->dtype != pod::DType::GGUF ) return 0;
+	}
+	return static_cast<size_t>( meta->size_bytes );
 }
 
 
@@ -1030,7 +1050,7 @@ size_t SafeTensorsRepo::bytes_with_prefix( const char* prefix ) const {
 }
 
 pod::LinearWeight SafeTensorsRepo::gguf_linear( int shard, const pod::SafeTensorMeta* meta, pod::MemoryArena& arena,
-	const std::vector<std::pair<int, int>>& rows, const std::vector<std::pair<int, int>>& cols, int pad_rows, backend::stream_t stream ) {
+	const std::vector<std::pair<int, int>>& rows, const std::vector<std::pair<int, int>>& cols, int pad_rows, backend::stream_t stream, pod::MemoryArena* code_arena ) {
 	const auto type = static_cast<engine::modules::GgmlType>( meta->gguf_type );
 	const engine::modules::GgmlBlock blk = engine::modules::ggml_block( type );
 	if ( !engine::modules::gguf_linear_supported( type ) ) {
@@ -1060,7 +1080,7 @@ pod::LinearWeight SafeTensorsRepo::gguf_linear( int shard, const pod::SafeTensor
 		}
 	}
 	const int shape[2] = { n_local, static_cast<int>( local_row_bytes ) };
-	pod::TensorView tv = engine::core::arena_alloc_tensor( arena, pod::DType::UINT8, shape, 2 );
+	pod::TensorView tv = engine::core::arena_alloc_tensor( code_arena ? *code_arena : arena, pod::DType::UINT8, shape, 2 );
 	ENGINE_ASSERT( tv.data != nullptr, "gguf_linear: arena full" );
 	backend::memcpy_async( tv.data, h.data(), h.size(), backend::Copy::Auto, stream );
 	backend::stream_sync( stream );
@@ -1096,7 +1116,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear(
 			LOG_ERROR( "load_linear: no tensor group for '%s'\n", base_name );
 			ENGINE_ASSERT( false, "load_linear: neither a trellis group nor a 2-D weight for this name" );
 		}
-		if ( meta->dtype == pod::DType::GGUF ) return gguf_linear( shard, meta, arena, { { 0, meta->shape[0] } }, { { 0, meta->shape[1] } }, 0, stream );
+		if ( meta->dtype == pod::DType::GGUF ) return gguf_linear( shard, meta, arena, { { 0, meta->shape[0] } }, { { 0, meta->shape[1] } }, 0, stream, code_arena );
 		pod::TensorView w = load( name_buf, arena, stream, pod::DType::FP16 );
 		const int n = meta->shape[0], k = meta->shape[1];
 		// The tensor is stored [n, k]; Linear::forward takes n from shape[1] and k from shape[0].

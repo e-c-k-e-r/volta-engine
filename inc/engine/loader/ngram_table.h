@@ -19,7 +19,11 @@ public:
 	// `weight_scale`, with the hash parameters `<prefix>.ngram_heads_offsets`, `.ngram_heads_vocab_sizes` and `.layer_multipliers` in the repo); no bias.
 	// The repo's mapping is used as it is: it has to outlive the table.
 	bool open_fp8( const SafeTensorsRepo& repo, const std::string& prefix );
-	bool is_open() const { return base_ != nullptr || fp8_; }
+	// The same table from a GGUF conversion (llama.cpp's qwen4exp: per_layer_token_embd, one tensor of every shard's rows in order, here under
+	// `name`, block-quantized rows of 160 values), with the hash parameters from the file's metadata (`<arch>.ple.*`); no bias. Rows are
+	// decoded on the host (IQ4_NL, Q8_0, F16, BF16, F32). The repo's mapping is used as it is: it has to outlive the table.
+	bool open_gguf( const SafeTensorsRepo& repo, const std::string& name );
+	bool is_open() const { return base_ != nullptr || fp8_ || gguf_rows_ != nullptr; }
 
 	int ngram_size() const { return ngram_size_; }
 	int heads_per_ngram() const { return heads_per_ngram_; }
@@ -46,6 +50,9 @@ private:
 	std::vector<const uint8_t*> shards8_;   // FP8 mode
 	bool fp8_ = false;
 	float fp8_scale_ = 1.0f;
+	const uint8_t* gguf_rows_ = nullptr;   // GGUF mode: every row, row_bytes each
+	size_t gguf_row_bytes_ = 0;
+	uint32_t gguf_type_ = 0;
 	std::vector<float> head_bias_;       // [num_heads, 160]
 	std::vector<int64_t> head_offsets_, head_sizes_, multipliers_;
 	std::vector<float> codebook_;        // 65536 decoded mul1 values (fp16 rounded)

@@ -1,6 +1,8 @@
 #include "engine/loader/ngram_table.h"
 #include "engine/quant/fp4_fp8.h"
 #include "engine/loader/safetensors.h"
+#include "engine/loader/gguf.h"
+#include "engine/modules/gguf.h"
 #include "engine/core/log.h"
 #include "engine/backend/numeric.h"
 #include <nlohmann/json.hpp>
@@ -148,6 +150,46 @@ bool NgramTable::open_fp8( const SafeTensorsRepo& repo, const std::string& prefi
 	return true;
 }
 
+bool NgramTable::open_gguf( const SafeTensorsRepo& repo, const std::string& name ) {
+	using engine::modules::GgmlType;
+	int shard = -1;
+	const auto* m = repo.find( name.c_str(), &shard );
+	if ( !m || shard < 0 || m->ndim != 2 || m->shape[1] != ROW_DIM ) {
+		LOG_ERROR( "NgramTable: no GGUF table %s of %d-wide rows\n", name.c_str(), ROW_DIM );
+		return false;
+	}
+	const pod::SafeTensorsFile& st = *repo.get_shard( shard );
+	const std::string arch = engine::loader::gguf_architecture( st );
+	int64_t ngram = 0, heads = 0;
+	if ( !engine::loader::gguf_kv_ints( st, ( arch + ".ple.head_offsets" ).c_str(), &head_offsets_ ) ||
+		!engine::loader::gguf_kv_ints( st, ( arch + ".ple.head_vocab_sizes" ).c_str(), &head_sizes_ ) ||
+		!engine::loader::gguf_kv_ints( st, ( arch + ".ple.layer_multipliers" ).c_str(), &multipliers_ ) ||
+		!engine::loader::gguf_kv_int( st, ( arch + ".ple.ngram_size" ).c_str(), &ngram ) || !engine::loader::gguf_kv_int( st, ( arch + ".ple.heads_per_ngram" ).c_str(), &heads ) ) {
+		LOG_ERROR( "NgramTable: the GGUF file has no %s.ple hash parameters\n", arch.c_str() );
+		return false;
+	}
+	num_heads_ = static_cast<int>( head_offsets_.size() );
+	ngram_size_ = static_cast<int>( ngram );
+	heads_per_ngram_ = static_cast<int>( heads );
+	if ( static_cast<int>( multipliers_.size() ) != ngram_size_ || num_heads_ != ( ngram_size_ - 1 ) * heads_per_ngram_ || static_cast<int>( head_sizes_.size() ) != num_heads_ ) {
+		LOG_ERROR( "NgramTable: inconsistent GGUF hash parameters\n" );
+		return false;
+	}
+	gguf_type_ = m->dtype == pod::DType::GGUF ? m->gguf_type : m->dtype == pod::DType::FP16 ? static_cast<uint32_t>( GgmlType::F16 )
+		: m->dtype == pod::DType::BF16 ? static_cast<uint32_t>( GgmlType::BF16 ) : static_cast<uint32_t>( GgmlType::F32 );
+	const auto t = static_cast<GgmlType>( gguf_type_ );
+	if ( t != GgmlType::IQ4_NL && t != GgmlType::Q8_0 && t != GgmlType::F16 && t != GgmlType::BF16 && t != GgmlType::F32 ) {
+		LOG_ERROR( "NgramTable: GGUF table type %s not read\n", engine::modules::ggml_type_name( t ) );
+		return false;
+	}
+	gguf_rows_ = static_cast<const uint8_t*>( repo.cpu_data( name.c_str() ) );
+	gguf_row_bytes_ = m->size_bytes / static_cast<size_t>( m->shape[0] );
+	rows_per_shard_ = m->shape[0];   // one shard: every row id is local
+	head_bias_.assign( static_cast<size_t>( num_heads_ ) * ROW_DIM, 0.0f );
+	LOG_INFO( "NgramTable: GGUF %s, %d rows of %s, %d heads\n", name.c_str(), m->shape[0], engine::modules::ggml_type_name( t ), num_heads_ );
+	return gguf_rows_ != nullptr;
+}
+
 void NgramTable::row_ids( const int64_t* tokens, uint64_t* uids ) const {
 	for ( int n = 2; n <= ngram_size_; ++n ) {
 		const int lo = ( n - 2 ) * heads_per_ngram_;
@@ -164,8 +206,8 @@ void NgramTable::row_ids( const int64_t* tokens, uint64_t* uids ) const {
 void NgramTable::prefetch_row( uint64_t uid ) const {
 	const int64_t shard = static_cast<int64_t>( uid ) / rows_per_shard_;
 	const int64_t local = static_cast<int64_t>( uid ) - shard * rows_per_shard_;
-	const uint8_t* p = fp8_ ? shards8_[shard] + local * ROW_DIM : reinterpret_cast<const uint8_t*>( shards_[shard] + local * words_ );
-	const size_t bytes = fp8_ ? ROW_DIM : static_cast<size_t>( words_ ) * sizeof( uint16_t );
+	const uint8_t* p = gguf_rows_ ? gguf_rows_ + local * gguf_row_bytes_ : fp8_ ? shards8_[shard] + local * ROW_DIM : reinterpret_cast<const uint8_t*>( shards_[shard] + local * words_ );
+	const size_t bytes = gguf_rows_ ? gguf_row_bytes_ : fp8_ ? ROW_DIM : static_cast<size_t>( words_ ) * sizeof( uint16_t );
 	static const uintptr_t pg = static_cast<uintptr_t>( sysconf( _SC_PAGESIZE ) );
 	const uintptr_t a = reinterpret_cast<uintptr_t>( p ) & ~( pg - 1 ), b = ( reinterpret_cast<uintptr_t>( p ) + bytes + pg - 1 ) & ~( pg - 1 );
 	madvise( reinterpret_cast<void*>( a ), b - a, MADV_WILLNEED );
@@ -174,6 +216,47 @@ void NgramTable::prefetch_row( uint64_t uid ) const {
 void NgramTable::decode_row( uint64_t uid, int head, float* out ) const {
 	const int64_t shard = static_cast<int64_t>( uid ) / rows_per_shard_;
 	const int64_t local = static_cast<int64_t>( uid ) - shard * rows_per_shard_;
+	if ( gguf_rows_ ) {
+		using engine::modules::GgmlType;
+		const uint8_t* row = gguf_rows_ + static_cast<size_t>( local ) * gguf_row_bytes_;
+		switch ( static_cast<GgmlType>( gguf_type_ ) ) {
+			case GgmlType::IQ4_NL: {
+				// 32-value blocks: an fp16 scale and 16 bytes of 4-bit indices into the non-linear grid, values j and j + 16 in byte j
+				static const int8_t grid[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+				for ( int b = 0; b < ROW_DIM / 32; ++b ) {
+					const uint8_t* blk = row + b * 18;
+					uint16_t dh;
+					std::memcpy( &dh, blk, 2 );
+					const float d = half_bits_to_float( dh );
+					for ( int j = 0; j < 16; ++j ) {
+						out[b * 32 + j] = d * grid[blk[2 + j] & 0x0F];
+						out[b * 32 + j + 16] = d * grid[blk[2 + j] >> 4];
+					}
+				}
+				break;
+			}
+			case GgmlType::Q8_0:
+				for ( int b = 0; b < ROW_DIM / 32; ++b ) {
+					const uint8_t* blk = row + b * 34;
+					uint16_t dh;
+					std::memcpy( &dh, blk, 2 );
+					const float d = half_bits_to_float( dh );
+					for ( int j = 0; j < 32; ++j ) out[b * 32 + j] = d * static_cast<int8_t>( blk[2 + j] );
+				}
+				break;
+			case GgmlType::F16:
+				for ( int i = 0; i < ROW_DIM; ++i ) { uint16_t h; std::memcpy( &h, row + 2 * i, 2 ); out[i] = half_bits_to_float( h ); }
+				break;
+			case GgmlType::BF16:
+				for ( int i = 0; i < ROW_DIM; ++i ) { uint16_t h; std::memcpy( &h, row + 2 * i, 2 ); out[i] = bf16_bits_to_float( h ); }
+				break;
+			default:
+				std::memcpy( out, row, ROW_DIM * sizeof( float ) );
+				break;
+		}
+		(void) head;
+		return;
+	}
 	if ( fp8_ ) {
 		static const std::vector<float> lut = []() {
 			std::vector<float> t( 256 );

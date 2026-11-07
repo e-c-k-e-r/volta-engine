@@ -48,4 +48,23 @@ struct LinearGguf {
 	static void dequant( const void* w, GgmlType type, int64_t elems, backend::half_t* out, backend::stream_t stream = nullptr );
 };
 
+// GGUF routed experts (MoE::forward with QuantType::GGUF), route by route: the rows quantized to q8_1 once, each route's gate and up
+// projections through the vec_dot of their block types, SiLU(gate) * up quantized to q8_1, the down projection scaled by the route's
+// weight, then each row's routes summed in route order (deterministic). Rows run in passes of kMoERowsPerPass.
+struct MoEGguf {
+	static constexpr int kMoERowsPerPass = 64;
+	// Device pointer table of a layer: rows gate, up, down of num_local pointers to each expert's blocks
+	struct Table {
+		const void* const* ptrs = nullptr;
+		int num_local = 0, first_expert = 0;   // global id of local expert 0
+		GgmlType type[3] = {};                 // gate, up, down
+		int hidden = 0, inter = 0;
+	};
+	static size_t scratch_bytes( int top_k, int hidden, int inter );
+	// out[m, hidden] (FP16) = this rank's experts over the routes of x[m, hidden]; topk ids are global, routes to other ranks' experts add 0.
+	// heat (optional): per local expert, incremented once per route
+	static void forward( const Table& t, const backend::half_t* x, int m, const int* topk_idx, const backend::half_t* topk_w, int top_k,
+		backend::half_t* out, void* scratch, uint32_t* heat, backend::stream_t stream = nullptr );
+};
+
 } // namespace engine::modules

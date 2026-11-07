@@ -31,8 +31,9 @@ struct LinearWeight {
 	int        gguf_k = 0, gguf_n = 0;
 	int        gguf_tile_heads = 0, gguf_tile_dim = 0;   // GGUF: input columns in tiled V-head order (see GgufColTiling); 0: as the activation
 
-	// Trellis projections run through one workspace per device (rotated activations, split-K partials): two of them must not run on different streams at once
-	bool shares_workspace() const { return type == QuantType::TRELLIS; }
+	// Trellis and GGUF projections run through one workspace per device (rotated or q8_1 activations, split-K partials): two of them must not
+	// run on different streams at once
+	bool shares_workspace() const { return type == QuantType::TRELLIS || type == QuantType::GGUF; }
 
 	static LinearWeight make_trellis(
 		const TensorView& codes,

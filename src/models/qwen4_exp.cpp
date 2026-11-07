@@ -1,5 +1,6 @@
 #include <condition_variable>
 #include "engine/models/qwen4_exp.h"
+#include "engine/modules/gguf.h"
 #include "engine/modules/sparse_head.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
@@ -526,9 +527,12 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 			const std::string file = std::string( model_dir ) + "/ngram_embedding.safetensors";
 			if ( ::access( file.c_str(), R_OK ) == 0 ) table_ok = ngram_table().open( file );
 			else {
-				// The rows stay mapped for the life of the process, like the trellis file: a repo of their own that is never closed
+				// The rows stay mapped for the life of the process, like the trellis file: a repo of their own that is never closed. A GGUF
+				// conversion holds the table as one tensor of block-quantized rows, the NVFP4 checkpoint as FP8 shards
 				static engine::loader::SafeTensorsRepo table_repo;
-				table_ok = table_repo.open( model_dir ) && ngram_table().open_fp8( table_repo, std::string( P ) + ".layers." + std::to_string( config_.ple_layer ) + ".ple.ple_embedding" );
+				const std::string ple = std::string( P ) + ".layers." + std::to_string( config_.ple_layer ) + ".ple";
+				table_ok = table_repo.open( model_dir ) &&
+					( table_repo.find( ( ple + ".ngram_table" ).c_str() ) ? ngram_table().open_gguf( table_repo, ple + ".ngram_table" ) : ngram_table().open_fp8( table_repo, ple + ".ple_embedding" ) );
 			}
 		} );
 		if ( !table_ok ) { LOG_ERROR( "[RANK %d] the n-gram table failed to open\n", rank_ ); ++missing; }
@@ -584,7 +588,14 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		if ( !lw.router.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, nm ); ++missing; }
 		auto& mw = lw.experts;
 		const bool nv_experts = nv_repo && ( !in_mtp || mtp_nv );
-		mw.type = nv_experts ? pod::QuantType::NVFP4 : pod::QuantType::TRELLIS;
+		// GGUF conversions hold the experts as block-quantized weights (the stacked tensors, read expert by expert)
+		std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.0.gate_proj.weight", pre );
+		const pod::SafeTensorMeta* em = nv_experts ? nullptr : repo.find( nm );
+		const bool gguf_experts = em != nullptr && em->dtype == pod::DType::GGUF;
+		mw.type = nv_experts ? pod::QuantType::NVFP4 : gguf_experts ? pod::QuantType::GGUF : pod::QuantType::TRELLIS;
+		if ( gguf_experts && moe_scratch_.gguf_ws == nullptr ) {
+			moe_scratch_.gguf_ws = engine::core::arena_alloc( *arena_, engine::modules::MoEGguf::scratch_bytes( config_.top_k, H, config_.moe_intermediate ), 256 );
+		}
 		const int per_rank = config_.num_experts / tp;
 		ENGINE_ASSERT( per_rank <= MOE_MAX_EXPERTS, "Qwen4ExpPipeline: experts per rank exceed MOE_MAX_EXPERTS" );
 		mw.num_local_experts = per_rank;
@@ -597,18 +608,21 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		int tier_layer = -1;
 		if ( tier_fraction < 1.0 && !in_mtp ) {
 			if ( tier_layers_ == 0 ) {
-				size_t bytes[3];
+				// one expert's gate / up / down code bytes, layer by layer (a GGUF conversion's block types differ between layers)
+				std::vector<std::array<size_t, 3>> bytes( config_.num_layers );
 				const char* kinds[3] = { "gate_proj", "up_proj", "down_proj" };
-				for ( int p = 0; p < 3; ++p ) {
-					if ( nv_experts ) bytes[p] = static_cast<size_t>( config_.hidden_size ) * config_.moe_intermediate / 2;
-					else {
-						std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.%s", pre, rank_ * per_rank, kinds[p] );
-						bytes[p] = repo.trellis_bytes( nm );
-						if ( bytes[p] == 0 && runtime::options().expert_synth >= 2 ) bytes[p] = repo.synth_trellis_bytes( nm );
-						ENGINE_ASSERT( bytes[p] > 0, "Qwen4ExpPipeline: expert codes not found for the tier" );
+				for ( int L = 0; L < config_.num_layers; ++L ) {
+					for ( int p = 0; p < 3; ++p ) {
+						if ( nv_experts ) bytes[L][p] = static_cast<size_t>( config_.hidden_size ) * config_.moe_intermediate / 2;
+						else {
+							std::snprintf( nm, sizeof( nm ), "%s.layers.%d.mlp.experts.%d.%s", P, L, rank_ * per_rank, kinds[p] );
+							bytes[L][p] = repo.trellis_bytes( nm );
+							if ( bytes[L][p] == 0 && runtime::options().expert_synth >= 2 ) bytes[L][p] = repo.synth_trellis_bytes( nm );
+							ENGINE_ASSERT( bytes[L][p] > 0, "Qwen4ExpPipeline: expert codes not found for the tier" );
+						}
 					}
 				}
-				tier_.start( per_rank, tier_fraction, bytes, rank_, tp_, config_.num_layers, false, host_arena_ );
+				tier_.start( per_rank, tier_fraction, bytes[0].data(), rank_, tp_, config_.num_layers, false, host_arena_, &bytes );
 			}
 			tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_ ) );
 			tier_layer = tier_layers_++;
