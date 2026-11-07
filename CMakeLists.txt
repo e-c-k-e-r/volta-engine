@@ -199,6 +199,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/kernels/cuda/nvfp4/skinny_kernels.cu
 	src/kernels/cuda/nvfp4/moe_kernels.cu
 	src/kernels/cuda/gguf/gguf_linear.cu
+	src/kernels/cuda/gemm/gemm_f16.cu
 	src/kernels/cuda/gguf/gguf_moe.cu
 	src/kernels/cuda/gguf/ggml/convert.cu
 	src/backend/cuda/modules/norm.cu
@@ -320,7 +321,8 @@ add_library(engine_kernels STATIC
 	${ENGINE_CORE_SOURCES}
 	${TRELLIS_SOURCES}
 )
-# cuBLAS (hipBLAS on ROCm) for the large-M prefill path (dequantize once, then a tensor-core HGEMM).
+# cuBLAS for the MiniMax-H3 video sources (the language models' GEMMs are the engine's own, src/kernels/cuda/gemm); hipBLAS on ROCm, where
+# the engine's GEMM forwards to it
 if(ENGINE_BACKEND STREQUAL "ROCM")
 	target_link_libraries(engine_kernels PUBLIC roc::hipblas hip::host)
 else()
@@ -541,6 +543,10 @@ add_executable(test_router_steer tests/2_parity/test_router_steer.cpp)
 target_link_libraries(test_router_steer PRIVATE engine_kernels)
 set_target_properties(test_router_steer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(test_gemm tests/2_parity/test_gemm.cpp)
+target_link_libraries(test_gemm PRIVATE engine_kernels)
+set_target_properties(test_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(test_gguf_linear tests/2_parity/test_gguf_linear.cpp)
 target_link_libraries(test_gguf_linear PRIVATE engine_kernels)
 set_target_properties(test_gguf_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
@@ -571,6 +577,10 @@ set_target_properties(bench_shapes PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJEC
 add_executable(bench_nvfp4 tests/3_bench/bench_nvfp4.cpp)
 target_link_libraries(bench_nvfp4 PRIVATE engine_kernels)
 set_target_properties(bench_nvfp4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(bench_gemm tests/3_bench/bench_gemm.cpp)
+target_link_libraries(bench_gemm PRIVATE engine_kernels cublas)
+set_target_properties(bench_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(bench_gguf_shapes tests/3_bench/bench_gguf_shapes.cpp)
 target_link_libraries(bench_gguf_shapes PRIVATE engine_kernels)

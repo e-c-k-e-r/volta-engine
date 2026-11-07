@@ -11,7 +11,7 @@
 #include "gguf_common.cuh"
 #include "ggml/convert.cuh"
 #include "ggml/dequantize.cuh"
-#include <cublas_v2.h>
+#include "engine/modules/gemm.h"
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <mutex>
@@ -704,21 +704,11 @@ bool mma_off() {
 	return off;
 }
 
-cublasHandle_t cublas_handle() {
-	static cublasHandle_t h[64] = {};
-	int dev = 0;
-	cudaGetDevice( &dev );
-	std::lock_guard<std::mutex> lk( device_mutex( dev ) );
-	if ( !h[dev] ) ENGINE_ASSERT( cublasCreate( &h[dev] ) == CUBLAS_STATUS_SUCCESS, "LinearGguf: cublasCreate failed" );
-	return h[dev];
-}
-
 } // namespace
 
 void LinearGguf::prepare() {
 	q8_workspace( 1 );
 	tile_state();
-	cublas_handle();
 }
 
 void LinearGguf::dequant( const void* w, GgmlType type, int64_t elems, half* out, cudaStream_t stream ) {
@@ -744,7 +734,6 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	ENGINE_ASSERT( x.shape[1] == k && k % ggml_block( type ).elems == 0 && k % QK8_1 == 0, "LinearGguf: k does not match the weight's blocks" );
 	ENGINE_ASSERT( tiling.heads == 0 || ( tiling.dim > 0 && k % ( tiling.heads * tiling.dim ) == 0 ), "LinearGguf: tiling does not divide k" );
 	if ( m > kTileRows ) {
-		// W [n][k] row-major is W^T in column-major terms: C (column-major [n][m]) = op(W)^T [n, k] times x^T [k, m]
 		half* wf = recon_workspace( static_cast<size_t>( n ) * k + ( tiling.heads ? static_cast<size_t>( m ) * k : 0 ), stream );
 		dequant( w, type, static_cast<int64_t>( n ) * k, wf, stream );
 		const half* xs = x.ptr<const half>();
@@ -753,12 +742,7 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 			tile_columns_kernel<<<dim3( ( k + 255 ) / 256, m ), 256, 0, stream>>>( xs, xt, k, tiling );
 			xs = xt;
 		}
-		cublasHandle_t h = cublas_handle();
-		cublasSetStream( h, stream );
-		const float alpha = 1.0f, beta = 0.0f;
-		const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, wf, CUDA_R_16F, k, xs, CUDA_R_16F, k,
-			&beta, out.data, CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP );
-		ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "LinearGguf: cublasGemmEx failed" );
+		Gemm::tn( xs, k, wf, k, out.data, n, false, m, n, k, 0.0f, stream );
 		return;
 	}
 	// up to 16 rows of a type with a tensor-core decoder (from its min_rows on: fewer go faster through the GEMV); a type whose blocks are whole

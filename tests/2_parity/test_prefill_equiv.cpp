@@ -1,5 +1,5 @@
 // Prefill equivalence: a long prompt prefilled in 16-row chunks (fused GEMM kernel, the pre-existing path) against
-// 256-row chunks (dequantize + cuBLAS HGEMM). The two leave the same model state if the final-row logits agree and
+// 256-row chunks (dequantize + the tensor-core GEMM). The two leave the same model state if the final-row logits agree and
 // greedy decode continues identically from both. Also checks that the new path is bit-reproducible.
 //   pass: cosine >= 0.9999 on the final-row logits, top-1 equal, next 32 greedy tokens equal, rerun logits identical.
 #include "engine/runtime/test_driver.h"

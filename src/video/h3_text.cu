@@ -506,7 +506,6 @@ bool H3TextEncoder::load( const char* dir, int device, int max_tokens, int layer
 		// deadlocks the all-reduces (the other ranks spin in NCCL, the cudaFree waits for their kernels), so every workspace is sized here, before any collective.
 		engine::modules::trellis_context_init_all();
 		engine::modules::trellis_get_recon_ws( device, static_cast<size_t>( std::max( kH * s.ffn_l, kH * s.nh_l * kHd ) ) * sizeof( half ) );
-		engine::modules::trellis_get_cublas( device );
 		CUDA_CHECK( cudaStreamSynchronize( s.cs ) );
 		LOG_INFO( "H3 text: %d %s layers resident, %.2f GB", s.total_layers, s.nvfp4 ? "NVFP4" : "EXL3", s.warena.offset_bytes / 1e9 );
 	} else {

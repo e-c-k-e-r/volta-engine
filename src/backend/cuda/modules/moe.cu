@@ -489,7 +489,7 @@ __global__ void moe_accumulate_kernel(
 	}
 }
 
-// ---- heavy experts of a prefill chunk (moe_heavy_rows): an expert routed by many rows runs as FP16 dequantization + cuBLAS ----
+// ---- heavy experts of a prefill chunk (moe_heavy_rows): an expert routed by many rows runs as FP16 dequantization + a tensor-core GEMM ----
 
 // idx_out = the routes with the heavy experts' entries set to -1 (outside every expert range, so the dispatch skips them)
 __global__ void moe_mask_heavy_kernel( const int* __restrict__ sel, int* __restrict__ out, const uint8_t* __restrict__ heavy, int n, int first, int last ) {
@@ -1005,7 +1005,7 @@ void MoE::forward(
 			ENGINE_ASSERT( kok( K_gate ) && kok( K_up ) && kok( K_down ), "MoE::forward: persistent trellis MoE kernel is instantiated for 1 to 5-bit experts and 1.5 / 2.5 / 3.5 bpw" );
 
 			const int wide = rows > 128 && runtime::options().moe_prefill_tile ? 3 : rows > 8 ? 2 : 0;
-			// moe_heavy_rows: the experts of this chunk routed by at least that many rows run as FP16 dequantization + cuBLAS after the
+			// moe_heavy_rows: the experts of this chunk routed by at least that many rows run as FP16 dequantization + a tensor-core GEMM after the
 			// quantized kernel has done the others (their routes are masked out of a second dispatch); none heavy, the first dispatch stands
 			struct Heavy { int e, count, off; };
 			std::vector<Heavy> heavy;
@@ -1095,7 +1095,7 @@ void MoE::forward(
 						scratch.planes, out.ptr<half>(), static_cast<int>( plane_elems ), num_groups );
 				}
 			}
-			// the heavy experts, in pieces of rows: rows gathered, gate / up / down dequantized and multiplied by cuBLAS, weighted rows added to out. The
+			// the heavy experts, in pieces of rows: rows gathered, gate / up / down dequantized and multiplied by the tensor-core GEMM, weighted rows added to out. The
 			// host-side LinearWeight of an expert points at its codes wherever the expert tier keeps them (a device slot, or pinned host memory read in place)
 			for ( const Heavy& h : heavy ) for ( int p = 0; p < h.count; p += hb.piece ) {
 				const int c = MIN( h.count - p, hb.piece ), off = h.off + p;

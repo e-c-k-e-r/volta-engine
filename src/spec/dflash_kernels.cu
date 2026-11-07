@@ -7,7 +7,7 @@
 #include "engine/modules/linear.h"
 #include "engine/backend/cuda/rope_math.cuh"
 #include "../kernels/cuda/trellis/trellis_context.h"
-#include <cublas_v2.h>
+#include "engine/modules/gemm.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cmath>
@@ -1388,15 +1388,8 @@ void engine::modules::LinearPlainGEMV::forward(
 	cudaStream_t stream
 ) {
 	if ( m >= 128 ) {
-		// Many rows (an unquantized vision tower, prefill chunks): the tensor-core HGEMM; the skinny GEMV reads the whole weight once per few rows
-		int device = 0;
-		(void) cudaGetDevice( &device );
-		cublasHandle_t h = engine::modules::trellis_get_cublas( device );
-		cublasSetStream( h, stream );
-		const float one = 1.0f, zero = 0.0f;
-		const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &one, w, CUDA_R_16F, k, x, CUDA_R_16F, k, &zero, out, CUDA_R_16F, n, CUBLAS_COMPUTE_32F,
-			CUBLAS_GEMM_DEFAULT_TENSOR_OP );
-		ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "LinearPlainGEMV: cublasGemmEx failed" );
+		// Many rows (an unquantized vision tower, prefill chunks): the tensor-core GEMM; the skinny GEMV reads the whole weight once per few rows
+		engine::modules::Gemm::tn( x, k, w, k, out, n, false, m, n, k, 0.0f, stream );
 		return;
 	}
 	engine::spec::dflash_f16_gemv_nt( w, x, out, m, n, k, stream );

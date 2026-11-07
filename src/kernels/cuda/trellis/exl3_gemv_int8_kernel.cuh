@@ -31,7 +31,6 @@
 //
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <cublas_v2.h>
 #include <cstdio>
 #include <cooperative_groups.h>
 #include "util.cuh"

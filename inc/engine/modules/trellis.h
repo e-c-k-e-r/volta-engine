@@ -19,7 +19,7 @@ struct LinearTrellis {
 		backend::stream_t stream = nullptr
 	);
 
-	// Large-M path: Hadamard, dequantize the weight to FP16, cuBLAS HGEMM (FP32 accumulate), Hadamard. FP16 output.
+	// Large-M path: Hadamard, dequantize the weight to FP16, Gemm::nn (FP32 accumulate), Hadamard. FP16 output.
 	// forward() routes here above a row threshold; exposed so tests can compare it against the fused kernels.
 	static void forward_recon(
 		const pod::TensorView& x,

@@ -3,7 +3,7 @@
 #include "engine/backend/cuda/reduce.cuh"
 #include "engine/config.h"
 #include "trellis_context.h"
-#include <cublas_v2.h>
+#include "engine/modules/gemm.h"
 #include <cuda_fp16.h>
 #include <cmath>
 
@@ -636,15 +636,7 @@ void GatedResidual::norm( float* x, const backend::half_t* norm_w, float* normed
 }
 
 void GatedResidual::gemm_f32( const backend::half_t* a, const backend::half_t* w, float* out, int m, int n, int k, bool accumulate, backend::stream_t stream ) {
-	int device = 0;
-	(void) cudaGetDevice( &device );
-	cublasHandle_t h = trellis_get_cublas( device );
-	cublasSetStream( h, stream );
-	const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
-	// C^T[n, m] = W[n, k] A^T with W and A row-major (k fastest)
-	const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, w, CUDA_R_16F, k, a, CUDA_R_16F, k, &beta, out, CUDA_R_32F, n, CUBLAS_COMPUTE_32F,
-		CUBLAS_GEMM_DEFAULT_TENSOR_OP );
-	ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "GatedResidual::gemm_f32: cublasGemmEx failed" );
+	Gemm::tn( a, k, w, k, out, n, true, m, n, k, accumulate ? 1.0f : 0.0f, stream );
 }
 
 void GatedResidual::gate_act( const float* z, int ld, backend::half_t* t_hi, backend::half_t* t_lo, float* post, int rows, int rank, int hc, bool has_inject, backend::stream_t stream ) {

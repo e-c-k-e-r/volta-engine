@@ -56,7 +56,7 @@ static_checks() {
 
 # Tests that need no checkpoint (synthetic inputs, goldens, host-only logic); some need a GPU
 tier2_fast() {
-	for t in test_trellis test_trellis_decode test_gemv_int8 test_mhc test_attention test_attention_prefill test_dsa test_dsv4_indexer test_dsv4_fp8 test_dsv4_engram test_loop_detect test_kv_pages test_gdn \
+	for t in test_trellis test_trellis_decode test_gemv_int8 test_gemm test_mhc test_attention test_attention_prefill test_dsa test_dsv4_indexer test_dsv4_fp8 test_dsv4_engram test_loop_detect test_kv_pages test_gdn \
 		test_norm test_steer test_steer_probe test_router_steer test_rope test_kv_quant test_all_reduce test_prefill_linear test_sampling test_sparse_attn test_slang_cpu test_slang_kernels; do
 		run $t gpu ./$t
 	done
@@ -111,7 +111,9 @@ tier2_models() {
 	[[ -f $vg/emb32.f32 ]] || run dsv41_vision_golden ${DSV41_PYTHON:-$HOME/Programs/exllamav3/.venv/bin/python} $ROOT/tests/tools/dsv41/vision_golden.py $DSV41 $vg
 	run dsv41_vision gpu ./test_dsv41_vision $DSV41 $vg
 	run prefix_restore_dsv41 gpu ./test_dsv41 $DSV41 $ROOT/tests/data/dsv41_prompt_ids.txt 24 snap=1000 max_image_tokens=0
-	run coherence gpu ./test_coherence
+	# one model per process, as the engine runs (a second cluster in one process is not a supported configuration)
+	run coherence gpu ./test_coherence --qwen-only
+	run coherence_glm gpu ./test_coherence --glm-only
 	run coherence_tp2 sh -c "ENGINE_TP=2 taskset -c 0-9 ./test_coherence --qwen-only --speculative"
 	run prefix_restore gpu ./test_prefix_restore
 	run prefix_restore_spec gpu ./test_prefix_restore --spec
@@ -176,7 +178,8 @@ case $mode in
 		ninja > $out/build.log 2>&1 || { echo "[FAIL] build"; fails=$((fails+1)); }
 		fingerprint > $out/fingerprint.txt
 		compare_fp fingerprint $out/fingerprint.txt $ROOT/tests/baselines/fingerprint.txt || fails=$((fails+1))
-		run coherence gpu ./test_coherence ;;
+		run coherence gpu ./test_coherence --qwen-only
+		run coherence_glm gpu ./test_coherence --glm-only ;;
 	fingerprint) fingerprint > $ROOT/tests/baselines/fingerprint.txt; cat $ROOT/tests/baselines/fingerprint.txt ;;
 	sass)
 		ninja > $out/build.log 2>&1 || { echo "[FAIL] build"; fails=$((fails+1)); }

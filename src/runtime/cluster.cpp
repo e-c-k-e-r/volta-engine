@@ -89,7 +89,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		using Spec = engine::models::ModelPipeline::Speculation;
 		const Spec spec = cfg.speculate && opt.speculator == "mtp" ? Spec::Mtp
 			: cfg.speculate && ( opt.speculator == "dspark" || opt.speculator == "suffix" ) ? Spec::Other
-			: !cfg.draft_model_dir.empty() ? Spec::DFlash : Spec::None;
+			: !cfg.draft_model_dir.empty() ? Spec::DFlash : cfg.spec_rows ? Spec::Other : Spec::None;
 		models_[d]->set_speculation( spec );
 		if ( !models_[d]->init( d, arenas_[d], ( tp_ > 1 ) ? &rings_[d] : nullptr ) ) return false;
 	}

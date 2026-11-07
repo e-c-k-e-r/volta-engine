@@ -41,7 +41,7 @@
 namespace engine::models {
 
 namespace {
-// Row count of the dense fp16 GEMMs of a prefill chunk. CUDA runs them at the full row capacity (one cuBLAS algorithm, so a row's result does not depend on its
+// Row count of the dense fp16 GEMMs of a prefill chunk. CUDA runs them at the full row capacity (one tile size and split, so a row's result does not depend on its
 // chunk); the CPU and Vulkan GEMMs have no algorithm choice and run the rows there are (the full capacity costs hundreds of times the work)
 // Rows up to which the gated residual runs on its decode kernels (in groups of 8) instead of the prefill GEMMs: the blocks of two slots verified together
 constexpr int kGrDecodeRows = 16;
@@ -931,7 +931,7 @@ void Qwen4ExpPipeline::trace_route( int tag, int m, backend::stream_t stream ) {
 void Qwen4ExpPipeline::gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream ) {
 	// Prefill rows: the gate and up projections are dense fp16 GEMMs on the tensor cores (the row-tile kernels below are fp32 FMA bound at hundreds
 	// of rows); decode rows (a few) keep the fp32 kernels, whose reads of the 13 MB of weights are the floor there
-	// The GEMMs always run at the full row capacity: cuBLAS then picks one algorithm and a row's result is bit-identical whatever its position in the chunk or the
+	// The GEMMs always run at the full row capacity: Gemm then picks one tile size and split and a row's result is bit-identical whatever its position in the chunk or the
 	// chunk size (test_gr_tc); the rows past m are stale but never read.
 	// Prefill rows: the gate and up projections run on the tensor cores as fp16 hi / lo GEMM pairs with fp32 accumulation (the row-tile kernels below are fp32
 	// FMA bound at hundreds of rows); decode rows (a few) keep the fp32 kernels, whose reads of the 13 MB of weights are the floor there
@@ -1192,7 +1192,7 @@ void Qwen4ExpPipeline::ple_forward( int m, backend::stream_t stream ) {
 	flush_apply( m, stream );
 	const int H = config_.hidden_size, hc = config_.hc_mult;
 	if ( m > 8 ) {
-		// Prefill rows: the dense fp16 projections as tensor-core GEMMs at the full row capacity (one cuBLAS algorithm, so a row does not depend on the chunking);
+		// Prefill rows: the dense fp16 projections as tensor-core GEMMs at the full row capacity (one tile size and split, so a row does not depend on the chunking);
 		// the plain GEMV behind Linear::forward takes 20 ms per 512-row chunk here
 		const int R = gemm_rows( m ), H = config_.hidden_size, hc = config_.hc_mult;
 		engine::modules::Vision::dense_gemm( ple_emb_.ptr<const backend::half_t>(), ple_.key_proj.w0.ptr<const backend::half_t>(), ple_key_.ptr<backend::half_t>(), R, hc * H, config_.ple_embed_dim, stream );

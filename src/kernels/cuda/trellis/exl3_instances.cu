@@ -1,5 +1,4 @@
 #include <cuda_fp16.h>
-#include <cublas_v2.h>
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 

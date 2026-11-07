@@ -1,7 +1,7 @@
 #include "engine/modules/nvfp4.h"
 #include "engine/runtime/options.h"
 #include "trellis_context.h"
-#include <cublas_v2.h>
+#include "engine/modules/gemm.h"
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cstdint>
@@ -511,13 +511,7 @@ void LinearNVFP4::forward(
 		const size_t threads_total = static_cast<size_t>( n / 32 ) * ( k / 16 ) * 32;
 		nvfp4_dequant_kernel<<<static_cast<unsigned>( ( threads_total + 255 ) / 256 ), 256, 0, stream>>>(
 			codes_ptr, scales_ptr, w, n, k, gscale );
-		cublasHandle_t h = trellis_get_cublas( device );
-		cublasSetStream( h, stream );
-		const float one = 1.0f, zero = 0.0f;
-		const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k,
-			&one, w, CUDA_R_16F, k, x_ptr, CUDA_R_16F, k,
-			&zero, y_ptr, CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP );
-		ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "NVFP4: cublasGemmEx failed" );
+		Gemm::tn( x_ptr, k, w, k, y_ptr, n, false, m, n, k, 0.0f, stream );
 	}
 }
 

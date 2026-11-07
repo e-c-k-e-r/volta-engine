@@ -2,7 +2,7 @@
 #include "engine/backend/cuda/reduce.cuh"
 #include "trellis_context.h"
 
-#include <cublas_v2.h>
+#include "engine/modules/gemm.h"
 #include <cuda_fp16.h>
 #include <mma.h>
 #if defined(USE_ROCM)
@@ -574,15 +574,8 @@ void Vision::pos_interp( const backend::half_t* table, backend::half_t* out, int
 
 void Vision::patch_embed( const half* patches, const half* w, const half* bias, const half* add, float* out,
 	int m, int n, int k, cudaStream_t stream ) {
-	int device = 0;
-	(void) cudaGetDevice( &device );
-	// FP32 output straight from the tensor-core GEMM: C^T[n, m] = W[n, k] A^T with W and A row-major (k fastest).
-	cublasHandle_t h = trellis_get_cublas( device );
-	cublasSetStream( h, stream );
-	const float alpha = 1.0f, beta = 0.0f;
-	const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, w, CUDA_R_16F, k, patches, CUDA_R_16F, k,
-		&beta, out, CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP );
-	ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "Vision::patch_embed: cublasGemmEx failed" );
+	// FP32 output straight from the tensor-core GEMM
+	Gemm::tn( patches, k, w, k, out, n, true, m, n, k, 0.0f, stream );
 	const size_t total = static_cast<size_t>( m ) * n;
 	add_bias_pos_kernel<<<static_cast<unsigned>( ( total + 255 ) / 256 ), 256, 0, stream>>>( out, bias, add, n, total );
 }
@@ -606,14 +599,7 @@ void Vision::merge_gather( const half* h, half* out, int tokens, int n, int grou
 }
 
 void Vision::dense_gemm( const half* a, const half* w, half* out, int m, int n, int k, cudaStream_t stream ) {
-	int device = 0;
-	(void) cudaGetDevice( &device );
-	cublasHandle_t h = trellis_get_cublas( device );
-	cublasSetStream( h, stream );
-	const float alpha = 1.0f, beta = 0.0f;
-	const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, w, CUDA_R_16F, k, a, CUDA_R_16F, k,
-		&beta, out, CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP );
-	ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "Vision::dense_gemm: cublasGemmEx failed" );
+	Gemm::tn( a, k, w, k, out, n, false, m, n, k, 0.0f, stream );
 }
 
 void Vision::layer_norm( const float* x, const half* w, const half* b, half* out, int m, int n, float eps, cudaStream_t stream ) {

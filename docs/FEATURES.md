@@ -33,7 +33,7 @@ The model type is read from the checkpoint, never configured. Anything else is a
 | Cache-aware routing (a bias on the router score of resident experts, GLM) | opt-in | `route_resident_bias` | `test_router_steer` |
 | Routed experts in host memory computed by the CPU during decode, in parallel with the PCIe reads of the others (AVX2 EXL3 kernel on a repacked copy, NVFP4 read in place; a pool per NUMA node, each expert split between them) | opt-in | `cpu_experts`, `cpu_expert_cpus`, `cpu_expert_node`, `cpu_expert_spin_us` | `test_cpu_experts` |
 | GLM routed experts of chosen layers from the modelopt NVFP4 checkpoint instead of EXL3 (resident, outside the expert tier) | debug | `nvfp4_expert_layers` (with `nvfp4_dense_src`) | `test_ppl` |
-| Prefill: experts routed by many rows of a chunk or window run as FP16 dequantization + cuBLAS, the rest on the quantized kernel (logits then depend on how a prompt is chunked) | opt-in | `moe_heavy_rows` (256 in the GLM configs) | `bench_moe_prefill` |
+| Prefill: experts routed by many rows of a chunk or window run as FP16 dequantization + a tensor-core GEMM, the rest on the quantized kernel (logits then depend on how a prompt is chunked) | opt-in | `moe_heavy_rows` (256 in the GLM configs) | `bench_moe_prefill` |
 
 * NVFP4 experts for GLM are not built: they do not fit in VRAM and the offload penalty rules them out. Dense NVFP4 groups on GLM take the 8-row verify from 48 to about 34 ms.
 * The expert tier is a capacity valve, not a speed feature: GLM and Flash-Next routing is trained for balance, so the hit rate at 50% residency is only 0.6 to 0.7 and decode drops to about a third.

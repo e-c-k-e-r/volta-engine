@@ -1,4 +1,4 @@
-// Large-M linear path (dequantize once + cuBLAS HGEMM) against the fused EXL3 GEMM kernel, on the per-rank Qwen
+// Large-M linear path (dequantize once + the tensor-core GEMM) against the fused EXL3 GEMM kernel, on the per-rank Qwen
 // shapes with random trellis data, plus timing of both to locate the crossover.
 //   pass: cosine >= 0.9999 and max |diff| <= 0.5% of the output's RMS-scaled range for every shape and M.
 #include "engine/config.h"

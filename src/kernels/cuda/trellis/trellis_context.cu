@@ -1,3 +1,4 @@
+#include "engine/modules/gemm.h"
 #include "trellis_context.h"
 #include "exl3_gemm.cuh"
 #include "exl3_gemv_int8.cuh"
@@ -18,7 +19,6 @@ static void* g_workspace[ENGINE_NUM_GPUS] = { nullptr };
 static size_t g_workspace_size[ENGINE_NUM_GPUS] = { 0 };
 static void* g_recon_ws[ENGINE_NUM_GPUS] = { nullptr };
 static size_t g_recon_ws_size[ENGINE_NUM_GPUS] = { 0 };
-static cublasHandle_t g_cublas[ENGINE_NUM_GPUS] = { nullptr };
 static std::mutex g_trellis_ctx_mtx;
 
 // Persistent and cooperative launches size their grids to the SM count, which must be the card's own: 80 on a V100, 82 on a 3090,
@@ -127,22 +127,6 @@ half* trellis_get_workspace( int device, size_t bytes ) {
 	return static_cast<half*>( g_workspace[device] );
 }
 
-cublasHandle_t trellis_get_cublas( int device ) {
-	if ( device < 0 || device >= ENGINE_NUM_GPUS ) device = 0;
-	if ( g_cublas[device] == nullptr ) {
-		std::lock_guard<std::mutex> lock( g_trellis_ctx_mtx );
-		if ( g_cublas[device] == nullptr ) {
-			int orig_dev = 0;
-			(void) cudaGetDevice( &orig_dev );
-			(void) cudaSetDevice( device );
-			ENGINE_ASSERT( cublasCreate( &g_cublas[device] ) == CUBLAS_STATUS_SUCCESS, "cublasCreate failed" );
-			cublasSetMathMode( g_cublas[device], CUBLAS_TENSOR_OP_MATH );
-			(void) cudaSetDevice( orig_dev );
-		}
-	}
-	return g_cublas[device];
-}
-
 half* trellis_get_recon_ws( int device, size_t bytes ) {
 	if ( device < 0 || device >= ENGINE_NUM_GPUS ) device = 0;
 	if ( g_recon_ws[device] == nullptr || g_recon_ws_size[device] < bytes ) {
@@ -222,6 +206,7 @@ void trellis_reset_launch_caches() {
 	exl3_gemv_reset_caches();
 	exl3_gemv_int8_reset_caches();
 	::ext::exl3_moe_reset_caches();
+	Gemm::reset_caches();
 }
 
 void trellis_context_destroy() {
@@ -237,11 +222,6 @@ void trellis_context_destroy() {
 			(void) cudaSetDevice( d );
 			(void) cudaFree( g_int8_ws[d] );
 			g_int8_ws[d] = nullptr;
-		}
-		if ( g_cublas[d] != nullptr ) {
-			(void) cudaSetDevice( d );
-			cublasDestroy( g_cublas[d] );
-			g_cublas[d] = nullptr;
 		}
 		if ( g_recon_ws[d] != nullptr ) {
 			(void) cudaSetDevice( d );

@@ -11,7 +11,7 @@
 // activations quantized to q8_1 (llama.cpp's vec_dot kernels); 9 to 16 rows decode every block once into shared memory (llama.cpp's
 // block decoders) and multiply it with all rows on the tensor cores; Q4_K from 4 rows on, Q5_K, Q6_K and IQ4_XS from 6, decode each lane's weight row straight
 // into Volta's m8n8k4 tensor-core fragments instead; prefill chunks dequantize the weight to FP16 (llama.cpp's converters) and run one
-// cuBLAS GEMM. The llama.cpp files are vendored in src/kernels/cuda/gguf/ggml.
+// tensor-core GEMM (Gemm::tn). The llama.cpp files are vendored in src/kernels/cuda/gguf/ggml.
 namespace engine::modules {
 
 // Tensor type ids of the GGUF format (ggml_type)

@@ -46,7 +46,7 @@ The final `hyper_connection_mixer` is the same without `post` and returns `mixed
   (two all-reduces per layer, ~25 us per 8-bit projection launch), not layout.
 * **Decode**: CUDA graphs; a fused cooperative MoE kernel (`exl3_moe_coop`, 2, 3 and 4 bpw, up to 10 routes); the dp4a int8 GEMV serves the 7 / 8-bit projections at M = 1; gated-residual
   decode kernels stream the 6.5 MB gate / up weights with all loads in flight (rows <= 8); the gated add after a sublayer is deferred into the next site's norm pass.
-* **Prefill**: the gated-residual projections run as cuBLAS GEMM pairs on fp16 hi / lo splits of the fp32 operands at a fixed row capacity (a row's result is bit-identical whatever
+* **Prefill**: the gated-residual projections run as tensor-core GEMM pairs on fp16 hi / lo splits of the fp32 operands at a fixed row capacity (a row's result is bit-identical whatever
   its position or chunk size); QSA sparse attention for prefill rows runs on a tensor-core kernel (keys gathered through the row's top-k list); the PLE row decode overlaps the layers
   queued before it. Interleaved prefill (`prefill_chunk`, default 512): while other requests decode, a new prompt is fed in pieces and the decode steps run between them; snapshot
   buffers for the prompt's planned prefix checkpoints are pinned on a helper thread when its prefill starts, so a checkpoint store does not stall the streams.

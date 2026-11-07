@@ -29,6 +29,7 @@ struct ClusterConfig {
 	size_t arena_bytes = 0;      // 0 => per-model default
 	int tp = ENGINE_NUM_GPUS;    // ranks: 1 (single device, no collective) or ENGINE_NUM_GPUS
 	bool speculate = false;      // build a speculator (the MTP head, or DFlash2 when draft_model_dir is set)
+	bool spec_rows = false;      // the verify snapshots without a speculator (a test that runs and commits speculative rows itself)
 };
 
 // TP model instance (1 or ENGINE_NUM_GPUS ranks): per-rank arenas, streams, NVLink mesh, pipelines and a persistent

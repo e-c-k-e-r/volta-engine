@@ -2,7 +2,7 @@
 #include "engine/core/log.h"
 #include "engine/backend/cuda/reduce.cuh"
 #include "trellis_context.h"
-#include <cublas_v2.h>
+#include "engine/modules/gemm.h"
 #include <cmath>
 #include <mma.h>
 
@@ -274,21 +274,7 @@ void DSA::project_small( const half* w, const half* x, half* proj, int rows, int
 }
 
 void DSA::project_large( const half* w, const half* x, half* proj, int rows, int n, int k, cudaStream_t stream ) {
-	int device = 0;
-	(void) cudaGetDevice( &device );
-	cublasHandle_t h = trellis_get_cublas( device );
-	cublasSetStream( h, stream );
-	const float one = 1.0f, zero = 0.0f;
-	const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, k, &one, w, CUDA_R_16F, k, x, CUDA_R_16F, k,
-		&zero, proj, CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP );
-	if ( st != CUBLAS_STATUS_SUCCESS ) {
-		const cudaError_t e = cudaGetLastError();
-		cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
-		cudaStreamIsCapturing( stream, &cap );
-		LOG_ERROR( "DSA::project_large: cublasGemmEx returned %d (rows %d, n %d, k %d; last CUDA error %s; stream capturing %d)\n", static_cast<int>( st ), rows, n, k,
-			cudaGetErrorString( e ), static_cast<int>( cap ) );
-	}
-	ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "DSA::project_large: indexer projection GEMM failed" );
+	Gemm::tn( x, k, w, k, proj, n, false, rows, n, k, 0.0f, stream );
 }
 
 void DSA::prep( const half* proj, const half* ln_w, const half* ln_b, half* plane, half* w_out, int layer, int max_seq, int rows,

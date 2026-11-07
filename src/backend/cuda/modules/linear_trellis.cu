@@ -1,3 +1,4 @@
+#include "engine/modules/gemm.h"
 #include "engine/modules/trellis.h"
 #include "exl3_gemm.cuh"
 #include "exl3_gemv.cuh"
@@ -46,14 +47,7 @@ void LinearTrellis::forward_recon(
 	had_r_128( x.ptr<const half>(), xh, suh.ptr<const half>(), nullptr, kRScale, m, k, stream );
 	reconstruct_slice( w, trellis.ptr<const uint16_t>(), bits, mcg, mul1, k / 16, n, 0, stream );
 
-	cublasHandle_t h = trellis_get_cublas( device );
-	cublasSetStream( h, stream );
-	const float alpha = 1.0f, beta = 0.0f;
-	// Row-major C[m,n] = A[m,k] @ W[k,n] as column-major C^T = W^T A^T.
-	const cublasStatus_t st = cublasGemmEx( h, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
-		&alpha, w, CUDA_R_16F, n, xh, CUDA_R_16F, k,
-		&beta, out.data, CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP );
-	ENGINE_ASSERT( st == CUBLAS_STATUS_SUCCESS, "LinearTrellis::forward_recon: cublasGemmEx failed" );
+	Gemm::nn( xh, k, w, n, out.data, n, false, m, n, k, 0.0f, stream );
 	had_r_128( out.ptr<const half>(), out.ptr<half>(), nullptr, svh.ptr<const half>(), kRScale, m, n, stream );
 }
 
