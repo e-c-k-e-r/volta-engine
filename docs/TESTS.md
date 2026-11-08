@@ -85,6 +85,7 @@ Not part of `gate.sh` (except `bench_decode`, `bench_accept` and `bench_prefill`
 | `bench_moe_prefill` | routed-MoE prefill time per `MoE::forward` on real GLM layer-3 experts (rank-0 partition), rows routed uniformly, at several chunk sizes |
 | `bench_moe_routes` (`BENCH_GLM=1`, `BENCH_ROUTES=<n>` for one route count) | the fused decode MoE kernels at a given number of local routes |
 | `bench_gguf_shapes` (`TYPE ... [-- K N ...]`, `BENCH_DEQUANT=1`) | GGUF linear at 1 to 16 rows on the 27B's per-rank shapes: time per call and GB/s of the blocks; `BENCH_DEQUANT=1` also times the whole-weight dequantization |
+| `bench_gguf_moe` (`[TYPE] [hidden inter global local top_k]`) | GGUF routed experts (MoEGguf) at 1 to 16 rows, routes uniform over the experts, this rank holding the first `local`: time per layer and GB/s of the experts touched, cold L2; default GLM-5.3-Flash's Q2_K experts expert-parallel at TP=4 |
 | `bench_gemm` (`[--nn] [M ...] [-- N K ...]`) | Gemm::tn / Gemm::nn against cuBLAS on the language models' projection shapes: time per call and TFLOPS of each, cold L2 (graph replay over distinct weights) |
 | `bench_nvfp4_shapes` (`K N ...`) | NVFP4 skinny GEMV at decode shapes: time per call and GB/s of the packed weights |
 | `bench_nvfp4_moe` | the fused NVFP4 routed-expert path on Flash-Next's expert shapes (synthetic weights): parity with the chained calls, then time per layer |

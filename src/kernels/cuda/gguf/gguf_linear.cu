@@ -423,6 +423,45 @@ template <> struct MmaDec<GgmlType::IQ4_XS> {
 	}
 };
 
+// Q8_0: a group is 8 blocks of 32 values (34 bytes each: the scale, then the int8 values), 16-byte aligned when k is a multiple of 256. Block
+// 2 j + sb is values 32 sb .. 32 sb + 31 of pair j
+template <> struct MmaDec<GgmlType::Q8_0> {
+	static constexpr bool on = true;
+	static constexpr int group = 256, bytes = 8 * sizeof( block_q8_0 ), align = 16, stage = bytes, stride = bytes + 16, min_rows = 12;
+	template <int MT>
+	static __device__ __forceinline__ void pair( const uint8_t* blk, int j, const half* const xr[MT], const bool live[MT], float d[MT][8] ) {
+		const half2 bias = __half2half2( __float2half( 1152.0f ) );   // 1024 + 128: the int8 value + 128 as a half above 1024, recentred
+		#pragma unroll
+		for ( int sb = 0; sb < 2; ++sb ) {
+			const block_q8_0* b = reinterpret_cast<const block_q8_0*>( blk ) + 2 * j + sb;
+			half dh;
+			memcpy( &dh, &b->d, sizeof( dh ) );
+			const half2 sc = __half2half2( dh );
+			// a staged row is 16-byte aligned and a block 34 bytes: block 2 j's values start 2 bytes into a word, block 2 j + 1's on one. Words
+			// from the aligned address below them, realigned with a funnel shift
+			const uint32_t* qw = reinterpret_cast<const uint32_t*>( b->qs - 2 * ( 1 - sb ) );
+			#pragma unroll
+			for ( int c = 0; c < 4; ++c ) {
+				uint4 xa[MT];
+				#pragma unroll
+				for ( int t = 0; t < MT; ++t ) xa[t] = live[t] ? __ldg( reinterpret_cast<const uint4*>( xr[t] + 32 * sb + 8 * c ) ) : make_uint4( 0, 0, 0, 0 );
+				#pragma unroll
+				for ( int e = 0; e < 2; ++e ) {
+					// values 8 c + 4 e .. 8 c + 4 e + 3
+					const int wi = 2 * c + e;
+					const uint32_t q = sb ? qw[wi] : __funnelshift_r( qw[wi], qw[wi + 1], 16 );
+					const uint32_t g = q ^ 0x80808080u;
+					const uint32_t w0 = __byte_perm( g, 0x64646464u, 0x4140 ), w1 = __byte_perm( g, 0x64646464u, 0x4342 );
+					const uint32_t b0 = h2u( __hmul2( __hsub2( *reinterpret_cast<const half2*>( &w0 ), bias ), sc ) );
+					const uint32_t b1 = h2u( __hmul2( __hsub2( *reinterpret_cast<const half2*>( &w1 ), bias ), sc ) );
+					#pragma unroll
+					for ( int t = 0; t < MT; ++t ) mma884( d[t], e ? xa[t].z : xa[t].x, e ? xa[t].w : xa[t].y, b0, b1 );
+				}
+			}
+		}
+	}
+};
+
 // Q6_K: a group is one 256-value super-block, staged block-aligned (the warp shifts each row's 8-byte aligned stretch by the block's offset
 // in it while staging). Half h (128 values) quarter Q (32 values): value l is the low (Q < 2) or high nibble of ql[64 h + 32 (Q & 1) + l]
 // with bits 2 Q, 2 Q + 1 of qh[32 h + l] on top, minus 32, times scales[8 h + 2 Q + l / 16] and d (dequantize_q6_K)
@@ -751,7 +790,7 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 		const size_t row_bytes = static_cast<size_t>( k / ggml_block( type ).elems ) * ggml_block( type ).bytes;
 		switch ( type ) {
 #define CASE( T ) case GgmlType::T: if ( m >= MmaDec<GgmlType::T>::min_rows && ( row_bytes % MmaDec<GgmlType::T>::align == 0 || MmaDec<GgmlType::T>::bytes % MmaDec<GgmlType::T>::align != 0 ) ) { launch_mma<GgmlType::T>( w, x.ptr<const half>(), out.ptr<half>(), n, k, m, tiling, stream ); return; } break;
-			CASE( Q4_K ) CASE( Q5_K ) CASE( Q6_K ) CASE( IQ4_XS )
+			CASE( Q4_K ) CASE( Q5_K ) CASE( Q6_K ) CASE( IQ4_XS ) CASE( Q8_0 )
 #undef CASE
 			default: break;
 		}

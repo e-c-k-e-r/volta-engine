@@ -586,6 +586,10 @@ set_target_properties(bench_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_
 add_executable(bench_gguf_shapes tests/3_bench/bench_gguf_shapes.cpp)
 target_link_libraries(bench_gguf_shapes PRIVATE engine_kernels)
 set_target_properties(bench_gguf_shapes PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(bench_gguf_moe tests/3_bench/bench_gguf_moe.cpp)
+target_link_libraries(bench_gguf_moe PRIVATE engine_kernels)
+set_target_properties(bench_gguf_moe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 add_executable(bench_decode tests/3_bench/bench_decode.cpp)
 target_link_libraries(bench_decode PRIVATE engine_kernels)
 set_target_properties(bench_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
