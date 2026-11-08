@@ -844,3 +844,48 @@ void gguf_permute_rows(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uni
 	if (i >= p.k) return;
 	p.out_[int64_t(r) * p.k + i] = p.x[int64_t(r) * p.k + tiled_source(i, p.heads, p.dim, p.k)];
 }
+
+// The activation rows as llama.cpp's block_q8_1_x4 (src/kernels/vulkan/ggml/types.glsl) for its int8 matmul: per 128 values (straight across
+// the rows, k a multiple of 128) the four 32-value blocks' (d, d * sum q) as half pairs, then their 32 packed int8 words; d = amax / 127,
+// q = round(x / d) half away from zero. In the weight's column order. A thread per 32-value block
+struct GgufQ81Params { uint4* xv; uint* xq; int m; int k; int heads; int dim; };
+
+[shader("compute")]
+[numthreads(128, 1, 1)]
+void gguf_quantize_q8_1x4(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform GgufQ81Params p) {
+	let blk = int(gid.x) * 128 + int(tid.x);
+	let r = int(gid.y);
+	if (blk * 32 >= p.k) return;
+	float v[32];
+	for (int q = 0; q < 4; ++q) {
+		let xv = p.xv[(int64_t(r) * p.k + tiled_source(blk * 32 + q * 8, p.heads, p.dim, p.k)) / 8];
+		v[q * 8 + 0] = f16tof32(xv.x & 0xffffu);
+		v[q * 8 + 1] = f16tof32(xv.x >> 16);
+		v[q * 8 + 2] = f16tof32(xv.y & 0xffffu);
+		v[q * 8 + 3] = f16tof32(xv.y >> 16);
+		v[q * 8 + 4] = f16tof32(xv.z & 0xffffu);
+		v[q * 8 + 5] = f16tof32(xv.z >> 16);
+		v[q * 8 + 6] = f16tof32(xv.w & 0xffffu);
+		v[q * 8 + 7] = f16tof32(xv.w >> 16);
+	}
+	float amax = 0.0f;
+	for (int i = 0; i < 32; ++i) amax = max(amax, abs(v[i]));
+	let d = amax / 127.0f;
+	let id = d != 0.0f ? 1.0f / d : 0.0f;
+	let g = int64_t(r) * (p.k / 32) + blk;   // the block's index across all rows
+	let o = (g / 4) * 36;
+	let inner = int(g % 4);
+	int sum = 0;
+	for (int w = 0; w < 8; ++w) {
+		uint packed = 0u;
+		for (int j = 0; j < 4; ++j) {
+			let x = v[w * 4 + j] * id;
+			let q = int(sign(x) * floor(abs(x) + 0.5f));
+			sum += q;
+			packed |= (uint(q) & 255u) << (8u * uint(j));
+		}
+		p.xq[o + 4 + inner * 8 + w] = packed;
+	}
+	p.xq[o + inner] = f32tof16(d) | (f32tof16(float(sum) * d) << 16);
+}
+

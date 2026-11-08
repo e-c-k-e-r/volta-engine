@@ -73,7 +73,7 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 		COMMENT "slangc nvfp4_gemm -> spirv")
 	list(APPEND VK_FLASH_SPV ${SLANG_OUT}/nvfp4_gemm.spv)
 	# GGUF block weights (src/kernels/slang/gguf.slang)
-	foreach(entry gguf_gemv_sg gguf_quantize_q8 gguf_gemm_tile gguf_dequant gguf_permute_rows)
+	foreach(entry gguf_gemv_sg gguf_quantize_q8 gguf_gemm_tile gguf_dequant gguf_permute_rows gguf_quantize_q8_1x4)
 		set(sout ${SLANG_OUT}/${entry}.spv)
 		add_custom_command(OUTPUT ${sout}
 			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/gguf.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
@@ -119,6 +119,37 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 					-DD_TYPE=float16_t -DFLOAT_TYPE=float -DFLOAT_TYPEV2=vec2 -DUSE_SUBGROUP_ADD_NO_SHMEM=1 ${src} -o ${sout}
 				DEPENDS ${GGML_VK_DEPS}
 				COMMENT "glslc ggml mul_mat_vec ${tname} -> spirv")
+			list(APPEND VK_FLASH_SPV ${sout})
+		endforeach()
+		# and its int8 matmul (q8_1 activations) for the types that have one, as llama.cpp's FP16 build of it, FP16 output
+		foreach(pair 2:q4_0 3:q4_1 6:q5_0 7:q5_1 8:q8_0 10:q2_k 11:q3_k 12:q4_k 13:q5_k 14:q6_k 21:iq3_s 23:iq4_xs)
+			string(REPLACE ":" ";" pl ${pair})
+			list(GET pl 0 id)
+			list(GET pl 1 tname)
+			string(TOUPPER ${tname} TU)
+			set(sout ${SLANG_OUT}/ggml_mmq_${id}.spv)
+			add_custom_command(OUTPUT ${sout}
+				COMMAND ${GLSLC} -fshader-stage=compute --target-env=vulkan1.2 -O -DFLOAT16=1 -DACC_TYPE=float -DACC_TYPEV2=vec2 -DACC_TYPE_VEC4=vec4
+					-DFLOAT_TYPE=float16_t -DFLOAT_TYPEV2=f16vec2 -DFLOAT_TYPEV4=f16vec4 -DFLOAT_TYPEV8=f16mat2x4 -DDATA_A_${TU}=1 -DD_TYPE=float16_t
+					${GGML_VK_DIR}/mul_mmq.comp -o ${sout}
+				DEPENDS ${GGML_VK_DEPS}
+				COMMENT "glslc ggml mul_mmq ${tname} -> spirv")
+			list(APPEND VK_FLASH_SPV ${sout})
+		endforeach()
+		# and its matmul with the weight dequantized as it loads (lookup-table types without an int8 matmul): FP16 activations, fp32 sums
+		foreach(pair 16:iq2_xxs:8 17:iq2_xs:8 18:iq3_xxs:4 19:iq1_s:8 20:iq4_nl:4 22:iq2_s:8 29:iq1_m:8)
+			string(REPLACE ":" ";" pl ${pair})
+			list(GET pl 0 id)
+			list(GET pl 1 tname)
+			list(GET pl 2 lva)
+			string(TOUPPER ${tname} TU)
+			set(sout ${SLANG_OUT}/ggml_mm_${id}.spv)
+			add_custom_command(OUTPUT ${sout}
+				COMMAND ${GLSLC} -fshader-stage=compute --target-env=vulkan1.2 -O -DFLOAT16=1 -DACC_TYPE=float -DACC_TYPEV2=vec2 -DACC_TYPE_VEC4=vec4
+					-DFLOAT_TYPE=float16_t -DFLOAT_TYPEV2=f16vec2 -DFLOAT_TYPEV4=f16vec4 -DFLOAT_TYPEV8=f16mat2x4 -DDATA_A_${TU}=1 -DLOAD_VEC_A=${lva}
+					-DLOAD_VEC_B=8 -DB_TYPE=f16mat2x4 -DB_TYPE_SCALAR=float16_t -DB_TYPEV4=f16vec4 -DD_TYPE=float16_t ${GGML_VK_DIR}/mul_mm.comp -o ${sout}
+				DEPENDS ${GGML_VK_DEPS}
+				COMMENT "glslc ggml mul_mm ${tname} -> spirv")
 			list(APPEND VK_FLASH_SPV ${sout})
 		endforeach()
 	else()

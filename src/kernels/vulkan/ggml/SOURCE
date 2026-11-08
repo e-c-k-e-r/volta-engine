@@ -1,1 +1,1 @@
-llama.cpp (https://github.com/ggml-org/llama.cpp), ggml/src/ggml-vulkan/vulkan-shaders at commit ca89968a23, unchanged: the mat-vec shaders and the headers they include (MIT, LICENSE)
+llama.cpp (https://github.com/ggml-org/llama.cpp), ggml/src/ggml-vulkan/vulkan-shaders at commit ca89968a23, unchanged: the mat-vec and matmul shaders (mul_mat_vec*, mul_mm, mul_mmq) and the headers they include (MIT, LICENSE)

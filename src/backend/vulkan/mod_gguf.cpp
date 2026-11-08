@@ -29,6 +29,10 @@ struct GgufPermuteParams { uint64_t x, out_; int m, k, heads, dim; };
 // llama.cpp's mat-vec push constants (mul_mat_vec_base.glsl, without MUL_MAT_ID)
 struct MmvParams { uint32_t ncols, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, fusion_flags, base_work_group_y, ne02, ne12,
 	broadcast2, broadcast3; };
+struct GgufQ81Params { uint64_t xv, xq; int m, k, heads, dim; };
+// llama.cpp's matmul push constants (mul_mmq.comp, without MUL_MAT_ID)
+struct MmqParams { uint32_t M, N, K, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, num_batches, k_split, ne02,
+	ne12, broadcast2, broadcast3; };
 struct GgufDequantParams { uint64_t w, tables, out_; int64_t elems; int type; };
 
 const void* tables() {
@@ -117,6 +121,73 @@ backend::vk::Pipeline* mmv_pipeline( GgmlType type, int m ) {
 	c[key] = p;
 	return p;
 }
+// llama.cpp's int8 matmul (mul_mmq.comp, one SPIR-V per type) and its tiles on a device without matrix cores, as llama.cpp sets them for a
+// 32-wide subgroup: {BLOCK_SIZE, BM, BN, BK, WM, WN, WMITER, TM, TN, TK, WARP}, the K-quants with WMITER 1 (their register use)
+bool mmq_type( GgmlType t ) {
+	switch ( t ) {
+		case GgmlType::Q4_0: case GgmlType::Q4_1: case GgmlType::Q5_0: case GgmlType::Q5_1: case GgmlType::Q8_0:
+		case GgmlType::Q2_K: case GgmlType::Q3_K: case GgmlType::Q4_K: case GgmlType::Q5_K: case GgmlType::Q6_K:
+		case GgmlType::IQ3_S: case GgmlType::IQ4_XS: return true;
+		default: return false;
+	}
+}
+bool k_quant( GgmlType t ) { return t == GgmlType::Q2_K || t == GgmlType::Q3_K || t == GgmlType::Q4_K || t == GgmlType::Q5_K || t == GgmlType::Q6_K; }
+struct MmqTile { uint32_t spec[11]; };
+MmqTile mmq_tile( GgmlType t, bool large ) {
+	const uint32_t wm = k_quant( t ) ? 1u : 2u;
+	if ( large ) return { { 128, 128, 128, 32, 64, 64, wm, 4, 4, 1, 32 } };
+	return { { 128, 64, 64, 32, 32, 32, wm, 2, 2, 1, 32 } };
+}
+backend::vk::Pipeline* mmq_pipeline( GgmlType type, bool large ) {
+	static std::mutex mu;
+	static std::map<std::pair<int, int>, backend::vk::Pipeline*> cache[64];
+	std::lock_guard<std::mutex> lk( mu );
+	auto& c = cache[backend::get_device()];
+	const auto key = std::make_pair( static_cast<int>( type ), large ? 1 : 0 );
+	auto it = c.find( key );
+	if ( it != c.end() ) return it->second;
+	backend::vk::Pipeline* p = nullptr;
+	if ( backend::vk::bound_pipelines() && backend::vk::int_dot() && mmq_type( type ) ) {
+		const char* dir = std::getenv( "ENGINE_SPV_DIR" );
+		const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + "/ggml_mmq_" + std::to_string( static_cast<int>( type ) ) + ".spv";
+		const MmqTile tile = mmq_tile( type, large );
+		p = backend::vk::pipeline_create_bound( path.c_str(), sizeof( MmqParams ), 3, tile.spec, 11 );   // A, B (q8_1 x4), D
+	}
+	c[key] = p;
+	return p;
+}
+
+// llama.cpp's matmul with the weight dequantized as it loads (mul_mm.comp, one SPIR-V per lookup-table type without an int8 matmul): the
+// same tiles as the int8 one (the quant BK of 32) and ALIGNED (vector loads; k a multiple of the tile's 64 / 128)
+bool mm_type( GgmlType t ) {
+	switch ( t ) {
+		case GgmlType::IQ2_XXS: case GgmlType::IQ2_XS: case GgmlType::IQ3_XXS: case GgmlType::IQ1_S: case GgmlType::IQ4_NL: case GgmlType::IQ2_S:
+		case GgmlType::IQ1_M: return true;
+		default: return false;
+	}
+}
+backend::vk::Pipeline* mm_pipeline( GgmlType type, bool large ) {
+	static std::mutex mu;
+	static std::map<std::pair<int, int>, backend::vk::Pipeline*> cache[64];
+	std::lock_guard<std::mutex> lk( mu );
+	auto& c = cache[backend::get_device()];
+	const auto key = std::make_pair( static_cast<int>( type ), large ? 1 : 0 );
+	auto it = c.find( key );
+	if ( it != c.end() ) return it->second;
+	backend::vk::Pipeline* p = nullptr;
+	if ( backend::vk::bound_pipelines() && mm_type( type ) ) {
+		const char* dir = std::getenv( "ENGINE_SPV_DIR" );
+		const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + "/ggml_mm_" + std::to_string( static_cast<int>( type ) ) + ".spv";
+		const MmqTile tile = mmq_tile( type, large );
+		uint32_t spec[12];
+		for ( int i = 0; i < 11; ++i ) spec[i] = tile.spec[i];
+		spec[11] = 1;   // ALIGNED
+		p = backend::vk::pipeline_create_bound( path.c_str(), sizeof( MmqParams ), 3, spec, 12 );   // A, B (FP16), D
+	}
+	c[key] = p;
+	return p;
+}
+
 // The permuted activation rows for the tiled out_proj, sized at prepare like the q8 rows
 constexpr size_t kPermBytes = static_cast<size_t>( kMmvMaxRows ) * kDotMaxK * sizeof( backend::half_t );
 void* perm_scratch( backend::stream_t stream ) { return vki::scratch( 17, kPermBytes, stream ); }
@@ -154,10 +225,39 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 		tiling.heads, tiling.dim };
 	ENGINE_ASSERT( k % 8 == 0 && ( tiling.heads == 0 || tiling.dim % 8 == 0 ) && reinterpret_cast<uintptr_t>( x.data ) % 16 == 0,
 		"LinearGguf::forward (Vulkan): the activations are read in runs of 8 halves" );
-	// gguf.slang: up to 16 rows on a device with int8 dot products the q8 rows against the integer weights, a subgroup per column (4 per
-	// workgroup); otherwise up to 8 rows the same with FP16 activations, more a workgroup per 64 x 64 tile
+	// Up to 8 rows llama.cpp's mat-vec; 9 to 16 on a device with int8 dot products the q8 rows against the integer weights (gguf.slang, a
+	// subgroup per column); more llama.cpp's int8 matmul (the types that have one) or its dequantizing matmul (the lookup-table types);
+	// otherwise the Slang kernels: up to 8 rows a subgroup per column with FP16 activations, more a workgroup per 64 x 64 tile
 	backend::vk::Pipeline* mmv = m <= kMmvMaxRows ? mmv_pipeline( type, m ) : nullptr;
-	if ( mmv != nullptr ) {
+	// more than 16 rows: llama.cpp's matmuls, the large tiles from 128 rows
+	const bool large = m >= 128;
+	backend::vk::Pipeline* mmq = m > kDotMaxRows && k % 128 == 0 ? mmq_pipeline( type, large ) : nullptr;
+	if ( mmq != nullptr ) {
+		// the rows as q8_1 x4 blocks (36 words per 128 values), then the matmul in BM x BN tiles of output rows x activation rows
+		void* xq = vki::scratch( 18, static_cast<size_t>( m ) * ( k / 128 ) * 144, stream );
+		GgufQ81Params q{ vki::dp( x.data ), vki::dp( xq ), m, k, tiling.heads, tiling.dim };
+		vki::launch( "gguf_quantize_q8_1x4", q, stream, static_cast<uint32_t>( ( k / 32 + 127 ) / 128 ), static_cast<uint32_t>( m ) );
+		const uint32_t uk = static_cast<uint32_t>( k ), un = static_cast<uint32_t>( n ), um = static_cast<uint32_t>( m );
+		MmqParams mp{ un, um, uk, uk, uk, un, un * uk, um * uk, um * un, 0u, 1u, uk, 1u, 1u, 1u, 1u };
+		const void* bufs[3] = { w, xq, out.data };
+		const MmqTile tile = mmq_tile( type, large );
+		backend::vk::dispatch_bound( stream, mmq, &mp, bufs, ( un + tile.spec[1] - 1 ) / tile.spec[1], ( um + tile.spec[2] - 1 ) / tile.spec[2], 1 );
+	}
+	else if ( backend::vk::Pipeline* mm = m > kDotMaxRows && k % 128 == 0 ? mm_pipeline( type, large ) : nullptr ) {
+		const void* xs = x.data;
+		if ( tiling.heads != 0 ) {
+			void* xp = vki::scratch( 19, static_cast<size_t>( m ) * k * sizeof( backend::half_t ), stream );
+			GgufPermuteParams q{ vki::dp( x.data ), vki::dp( xp ), m, k, tiling.heads, tiling.dim };
+			vki::launch( "gguf_permute_rows", q, stream, static_cast<uint32_t>( ( k + 255 ) / 256 ), static_cast<uint32_t>( m ) );
+			xs = xp;
+		}
+		const uint32_t uk = static_cast<uint32_t>( k ), un = static_cast<uint32_t>( n ), um = static_cast<uint32_t>( m );
+		MmqParams mp{ un, um, uk, uk, uk, un, un * uk, um * uk, um * un, 0u, 1u, uk, 1u, 1u, 1u, 1u };
+		const void* bufs[3] = { w, xs, out.data };
+		const MmqTile tile = mmq_tile( type, large );
+		backend::vk::dispatch_bound( stream, mm, &mp, bufs, ( un + tile.spec[1] - 1 ) / tile.spec[1], ( um + tile.spec[2] - 1 ) / tile.spec[2], 1 );
+	}
+	else if ( mmv != nullptr ) {
 		const void* xs = x.data;
 		if ( tiling.heads != 0 ) {
 			ENGINE_ASSERT( k <= kDotMaxK, "LinearGguf::forward (Vulkan): k beyond the permuted-row scratch" );

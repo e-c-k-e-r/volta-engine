@@ -128,9 +128,10 @@ int main( int argc, char** argv ) {
 		const double full_bound = sum_offset ? 3e-2 : 1e-2;
 		const double gemm_bound = sum_offset ? 3e-2 : 1.5e-2;
 #elif defined(ENGINE_BACKEND_VULKAN)
-		// Vulkan: up to 16 rows quantized to q8 for the int8 dot products (on a device that has them), the GEMV's bound; more rows FP16
+		// Vulkan: from 9 rows the activations are quantized to q8 for the int8 dot products and llama.cpp's int8 matmul (on a device that has
+		// them), the GEMV's bound (the types without an int8 matmul stay FP16 from 17 rows, well inside it)
 		const double full_bound = sum_offset ? 3e-2 : 1e-2;
-		const double gemm_bound = 5e-3;
+		const double gemm_bound = full_bound;
 #else
 		const double full_bound = 5e-3, gemm_bound = full_bound;
 #endif
