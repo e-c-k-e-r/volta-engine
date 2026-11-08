@@ -9,8 +9,12 @@
 #include "engine/backend/runtime.h"
 #include "engine/core/batch.h"
 #include "engine/modules/gguf.h"
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace engine::modules {
@@ -21,6 +25,10 @@ namespace vki = ::engine::backend::impl;
 struct GgufParams { uint64_t w, tables, x, out_; int64_t row_bytes; int type, m, k, n, heads, dim; };
 struct GgufQuantParams { uint64_t xv, xq; int m, k, heads, dim; };
 struct GgufDotParams { uint64_t w, tables, xq, out_; int64_t row_bytes; int type, m, k, n; };
+struct GgufPermuteParams { uint64_t x, out_; int m, k, heads, dim; };
+// llama.cpp's mat-vec push constants (mul_mat_vec_base.glsl, without MUL_MAT_ID)
+struct MmvParams { uint32_t ncols, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, fusion_flags, base_work_group_y, ne02, ne12,
+	broadcast2, broadcast3; };
 struct GgufDequantParams { uint64_t w, tables, out_; int64_t elems; int type; };
 
 const void* tables() {
@@ -78,6 +86,41 @@ constexpr int kDotMaxRows = pod::MAX_BATCH, kDotMaxK = 65536;
 constexpr size_t kDotBytes = static_cast<size_t>( kDotMaxRows ) * ( kDotMaxK / 32 ) * 40;
 void* dot_scratch( backend::stream_t stream ) { return vki::scratch( 16, kDotBytes, stream ); }
 
+// llama.cpp's mat-vec shaders (src/kernels/vulkan/ggml, one SPIR-V per type): output rows per 32-thread workgroup as llama.cpp picks them on
+// NVIDIA before Turing (the IQ types 4, the K-quants 2, Q8_0 1, the other 32-value types 2), one pipeline per activation-row count. Up to 8
+// rows, the decode and a speculative verify on the same arithmetic (a row's sum does not depend on the row count), so a verify accepts
+// exactly what plain decoding emits; the int8 dot path below is faster at 8 rows but rounds apart from the 1-row product
+constexpr int kMmvMaxRows = 8;
+int mmv_rows( GgmlType t ) {
+	switch ( t ) {
+		case GgmlType::Q8_0: return 1;
+		case GgmlType::Q4_0: case GgmlType::Q4_1: case GgmlType::Q5_0: case GgmlType::Q5_1:
+		case GgmlType::Q2_K: case GgmlType::Q3_K: case GgmlType::Q4_K: case GgmlType::Q5_K: case GgmlType::Q6_K: return 2;
+		default: return 4;
+	}
+}
+backend::vk::Pipeline* mmv_pipeline( GgmlType type, int m ) {
+	static std::mutex mu;
+	static std::map<std::pair<int, int>, backend::vk::Pipeline*> cache[64];
+	std::lock_guard<std::mutex> lk( mu );
+	auto& c = cache[backend::get_device()];
+	const auto key = std::make_pair( static_cast<int>( type ), m );
+	auto it = c.find( key );
+	if ( it != c.end() ) return it->second;
+	backend::vk::Pipeline* p = nullptr;
+	if ( backend::vk::bound_pipelines() ) {
+		const char* dir = std::getenv( "ENGINE_SPV_DIR" );
+		const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + "/ggml_mmv_" + std::to_string( static_cast<int>( type ) ) + ".spv";
+		const uint32_t spec[3] = { 32u, static_cast<uint32_t>( mmv_rows( type ) ), static_cast<uint32_t>( m ) };
+		p = backend::vk::pipeline_create_bound( path.c_str(), sizeof( MmvParams ), 5, spec, 3 );   // A, B, D and the two (unused) fusion inputs
+	}
+	c[key] = p;
+	return p;
+}
+// The permuted activation rows for the tiled out_proj, sized at prepare like the q8 rows
+constexpr size_t kPermBytes = static_cast<size_t>( kMmvMaxRows ) * kDotMaxK * sizeof( backend::half_t );
+void* perm_scratch( backend::stream_t stream ) { return vki::scratch( 17, kPermBytes, stream ); }
+
 } // namespace
 
 bool gguf_linear_supported( GgmlType type ) {
@@ -93,6 +136,7 @@ bool gguf_linear_supported( GgmlType type ) {
 void LinearGguf::prepare() {
 	(void) tables();
 	if ( backend::vk::int_dot() ) (void) dot_scratch( nullptr );
+	if ( backend::vk::bound_pipelines() ) (void) perm_scratch( nullptr );
 }
 
 void LinearGguf::dequant( const void* w, GgmlType type, int64_t elems, backend::half_t* out, backend::stream_t stream ) {
@@ -112,7 +156,25 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 		"LinearGguf::forward (Vulkan): the activations are read in runs of 8 halves" );
 	// gguf.slang: up to 16 rows on a device with int8 dot products the q8 rows against the integer weights, a subgroup per column (4 per
 	// workgroup); otherwise up to 8 rows the same with FP16 activations, more a workgroup per 64 x 64 tile
-	if ( m <= kDotMaxRows && backend::vk::int_dot() ) {
+	backend::vk::Pipeline* mmv = m <= kMmvMaxRows ? mmv_pipeline( type, m ) : nullptr;
+	if ( mmv != nullptr ) {
+		const void* xs = x.data;
+		if ( tiling.heads != 0 ) {
+			ENGINE_ASSERT( k <= kDotMaxK, "LinearGguf::forward (Vulkan): k beyond the permuted-row scratch" );
+			void* xp = perm_scratch( stream );
+			GgufPermuteParams q{ vki::dp( x.data ), vki::dp( xp ), m, k, tiling.heads, tiling.dim };
+			vki::launch( "gguf_permute_rows", q, stream, static_cast<uint32_t>( ( k + 255 ) / 256 ), static_cast<uint32_t>( m ) );
+			xs = xp;
+		}
+		const uint32_t uk = static_cast<uint32_t>( k ), un = static_cast<uint32_t>( n );
+		MmvParams mp{ uk, uk, uk, un, uk * un, uk, un, 0u, 0u, 1u, 1u, 1u, 1u };
+		const void* bufs[5] = { w, xs, out.data, out.data, out.data };
+		// workgroups of mmv_rows output rows; beyond the x limit the shader reads the rest from z
+		const uint32_t groups = static_cast<uint32_t>( ( n + mmv_rows( type ) - 1 ) / mmv_rows( type ) );
+		const uint32_t gx = std::min<uint32_t>( groups, 65535u ), gz = ( groups + gx - 1 ) / gx;
+		backend::vk::dispatch_bound( stream, mmv, &mp, bufs, gx, 1, gz );
+	}
+	else if ( m <= kDotMaxRows && backend::vk::int_dot() ) {
 		ENGINE_ASSERT( k <= kDotMaxK, "LinearGguf::forward (Vulkan): k beyond the q8 activation scratch" );
 		void* xq = dot_scratch( stream );
 		GgufQuantParams q{ vki::dp( x.data ), vki::dp( xq ), m, k, tiling.heads, tiling.dim };

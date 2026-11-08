@@ -73,11 +73,20 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 		COMMENT "slangc nvfp4_gemm -> spirv")
 	list(APPEND VK_FLASH_SPV ${SLANG_OUT}/nvfp4_gemm.spv)
 	# GGUF block weights (src/kernels/slang/gguf.slang)
-	foreach(entry gguf_gemv_sg gguf_quantize_q8 gguf_gemm_tile gguf_dequant)
+	foreach(entry gguf_gemv_sg gguf_quantize_q8 gguf_gemm_tile gguf_dequant gguf_permute_rows)
 		set(sout ${SLANG_OUT}/${entry}.spv)
 		add_custom_command(OUTPUT ${sout}
 			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/gguf.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
 			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/gguf.slang
+			COMMENT "slangc ${entry} -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
+	# the head's top-k and log-sum-exp (src/kernels/slang/spec_topk.slang)
+	foreach(entry topk_shard lse_shard topk_merge)
+		set(sout ${SLANG_OUT}/${entry}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/spec_topk.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/spec_topk.slang
 			COMMENT "slangc ${entry} -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
@@ -90,6 +99,31 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			COMMENT "slangc gguf_gemv_dot (type ${t}) -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
+	# llama.cpp's mat-vec shaders (src/kernels/vulkan/ggml, GLSL) once per block type: FP16 activations and output, subgroup reduction
+	find_program(GLSLC glslc HINTS ${Vulkan_GLSLC_EXECUTABLE})
+	if(GLSLC)
+		set(GGML_VK_DIR ${PROJECT_SOURCE_DIR}/src/kernels/vulkan/ggml)
+		file(GLOB GGML_VK_DEPS ${GGML_VK_DIR}/*.glsl ${GGML_VK_DIR}/*.comp)
+		foreach(pair 2:q4_0 3:q4_1 6:q5_0 7:q5_1 8:q8_0 20:iq4_nl 10:q2_k 11:q3_k 12:q4_k 13:q5_k 14:q6_k 16:iq2_xxs 17:iq2_xs 18:iq3_xxs 19:iq1_s 21:iq3_s 22:iq2_s 23:iq4_xs 29:iq1_m)
+			string(REPLACE ":" ";" pl ${pair})
+			list(GET pl 0 id)
+			list(GET pl 1 tname)
+			string(TOUPPER ${tname} TU)
+			set(src ${GGML_VK_DIR}/mul_mat_vec_${tname}.comp)
+			if(NOT EXISTS ${src})
+				set(src ${GGML_VK_DIR}/mul_mat_vec.comp)
+			endif()
+			set(sout ${SLANG_OUT}/ggml_mmv_${id}.spv)
+			add_custom_command(OUTPUT ${sout}
+				COMMAND ${GLSLC} -fshader-stage=compute --target-env=vulkan1.2 -O -DDATA_A_${TU}=1 -DB_TYPE=float16_t -DB_TYPEV2=f16vec2 -DB_TYPEV4=f16vec4
+					-DD_TYPE=float16_t -DFLOAT_TYPE=float -DFLOAT_TYPEV2=vec2 -DUSE_SUBGROUP_ADD_NO_SHMEM=1 ${src} -o ${sout}
+				DEPENDS ${GGML_VK_DEPS}
+				COMMENT "glslc ggml mul_mat_vec ${tname} -> spirv")
+			list(APPEND VK_FLASH_SPV ${sout})
+		endforeach()
+	else()
+		message(STATUS "glslc not found: the Vulkan GGUF projections run on the Slang kernels alone")
+	endif()
 	add_custom_target(flash_spv DEPENDS ${VK_FLASH_SPV})
 	add_dependencies(slang_kernels flash_spv)
 

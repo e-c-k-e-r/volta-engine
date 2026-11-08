@@ -833,3 +833,14 @@ void gguf_dequant(uint3 gid : SV_DispatchThreadID, uniform GgufDequantParams p) 
 	p.out_[e] = half(dq(p.type, p.w, (e / be) * block_bytes(p.type), int(e % be), p.tables));
 }
 
+// out[r][i] = x[r][src(i)]: the activation rows in the weight's tiled column order, for kernels that read them as they are
+struct GgufPermuteParams { half* x; half* out_; int m; int k; int heads; int dim; };
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void gguf_permute_rows(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform GgufPermuteParams p) {
+	let i = int(gid.x) * 256 + int(tid.x);
+	let r = int(gid.y);
+	if (i >= p.k) return;
+	p.out_[int64_t(r) * p.k + i] = p.x[int64_t(r) * p.k + tiled_source(i, p.heads, p.dim, p.k)];
+}

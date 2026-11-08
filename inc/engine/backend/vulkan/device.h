@@ -19,9 +19,17 @@ bool int_dot();
 // SPIR-V file (entry point "main"); push_bytes = sizeof( Params ), at most max_push_constants_bytes(). nullptr on failure
 Pipeline* pipeline_create( const char* spv_path, uint32_t push_bytes );
 void pipeline_destroy( Pipeline* p );
+// A pipeline whose shader reads `buffers` storage buffers at bindings 0 .. buffers - 1 of set 0 (GLSL shaders, e.g. the vendored ggml ones),
+// with spec_count 32-bit specialization constants (constant_id 0 .. spec_count - 1). Needs bound_pipelines(); nullptr on failure
+Pipeline* pipeline_create_bound( const char* spv_path, uint32_t push_bytes, uint32_t buffers, const uint32_t* spec, uint32_t spec_count );
+// VK_KHR_push_descriptor is enabled: pipelines with bound buffers can be created and recorded (also into graphs)
+bool bound_pipelines();
 
 // Record bind + push constants + dispatch( gx, gy, gz workgroups ) + a compute/transfer barrier into the stream
 // (nullptr = default stream). While a graph capture is active this records into the graph.
 void dispatch( stream_t s, Pipeline* p, const void* push, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1 );
+// dispatch for a pipeline_create_bound pipeline: buffers[i] (device pointers, 16-byte aligned) bound at binding i, each up to the end of
+// its allocation
+void dispatch_bound( stream_t s, Pipeline* p, const void* push, const void* const* buffers, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1 );
 
 } // namespace engine::backend::vk

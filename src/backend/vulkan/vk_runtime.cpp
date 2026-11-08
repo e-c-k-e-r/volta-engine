@@ -43,6 +43,7 @@ struct Ctx {
 	VkCommandPool pool = VK_NULL_HANDLE;
 	VkPhysicalDeviceMemoryProperties mem{};
 	VkPhysicalDeviceProperties props{};
+	PFN_vkCmdPushDescriptorSetKHR push_descriptor = nullptr;   // VK_KHR_push_descriptor: storage buffers bound inside the command buffer
 	bool int_dot = false;   // shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product) enabled: packed 4 x int8 dot products
 	bool rte16 = false;   // shaderRoundingModeRTEFloat16: float -> half conversions can be made round-to-nearest-even
 	std::map<uint64_t, Alloc> allocs; // keyed by device address
@@ -90,7 +91,8 @@ struct Pipeline {
 	VkShaderModule module = VK_NULL_HANDLE;
 	VkPipelineLayout layout = VK_NULL_HANDLE;
 	VkPipeline pipeline = VK_NULL_HANDLE;
-	uint32_t push_bytes = 0;
+	VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;   // pipelines with storage-buffer bindings (pipeline_create_bound)
+	uint32_t push_bytes = 0, buffers = 0;
 };
 } // namespace vk
 
@@ -134,13 +136,16 @@ bool init_context( int dev ) {
 	}
 
 	// Feature requirements of the Slang SPIR-V: PhysicalStorageBufferAddresses, Float16, Int64 (+ Int16 for the BF16 table)
-	bool has_dot_ext = false;
+	bool has_dot_ext = false, has_push_desc = false;
 	{
 		uint32_t en = 0;
 		vkEnumerateDeviceExtensionProperties( g.phys, nullptr, &en, nullptr );
 		std::vector<VkExtensionProperties> ext( en );
 		vkEnumerateDeviceExtensionProperties( g.phys, nullptr, &en, ext.data() );
-		for ( const auto& e : ext ) has_dot_ext = has_dot_ext || std::strcmp( e.extensionName, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME ) == 0;
+		for ( const auto& e : ext ) {
+			has_dot_ext = has_dot_ext || std::strcmp( e.extensionName, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME ) == 0;
+			has_push_desc = has_push_desc || std::strcmp( e.extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME ) == 0;
+		}
 	}
 	VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR fdot{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR };
 	VkPhysicalDeviceVulkan11Features f11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, has_dot_ext ? &fdot : nullptr };
@@ -184,12 +189,13 @@ bool init_context( int dev ) {
 	VkDeviceCreateInfo dci{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &want2 };
 	dci.queueCreateInfoCount = 1;
 	dci.pQueueCreateInfos = &qci;
-	const char* dot_ext = VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
-	if ( g.int_dot ) {
-		dci.enabledExtensionCount = 1;
-		dci.ppEnabledExtensionNames = &dot_ext;
-	}
+	std::vector<const char*> exts;
+	if ( g.int_dot ) exts.push_back( VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME );
+	if ( has_push_desc ) exts.push_back( VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME );
+	dci.enabledExtensionCount = static_cast<uint32_t>( exts.size() );
+	dci.ppEnabledExtensionNames = exts.data();
 	if ( vkCreateDevice( g.phys, &dci, nullptr, &g.device ) != VK_SUCCESS ) return false;
+	if ( has_push_desc ) g.push_descriptor = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>( vkGetDeviceProcAddr( g.device, "vkCmdPushDescriptorSetKHR" ) );
 	vkGetDeviceQueue( g.device, g.family, 0, &g.queue );
 
 	VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
@@ -628,8 +634,10 @@ const char* device_name() { return ctx().props.deviceName; }
 uint32_t max_push_constants_bytes() { return ctx().props.limits.maxPushConstantsSize; }
 bool int_dot() { return ctx().int_dot; }
 
-Pipeline* pipeline_create( const char* spv_path, uint32_t push_bytes ) {
+namespace {
+Pipeline* create_pipeline( const char* spv_path, uint32_t push_bytes, uint32_t buffers, const uint32_t* spec, uint32_t spec_count ) {
 	ctx();
+	if ( buffers > 0 && !cur().push_descriptor ) return nullptr;
 	if ( push_bytes > cur().props.limits.maxPushConstantsSize || push_bytes % 4 ) return nullptr;
 	FILE* f = std::fopen( spv_path, "rb" );
 	if ( !f ) return nullptr;
@@ -651,6 +659,24 @@ Pipeline* pipeline_create( const char* spv_path, uint32_t push_bytes ) {
 	VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
 	pli.pushConstantRangeCount = push_bytes ? 1 : 0;
 	pli.pPushConstantRanges = &range;
+	p->buffers = buffers;
+	if ( buffers > 0 ) {
+		std::vector<VkDescriptorSetLayoutBinding> b( buffers );
+		for ( uint32_t i = 0; i < buffers; ++i ) b[i] = { i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+		VkDescriptorSetLayoutCreateInfo dli{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+		dli.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+		dli.bindingCount = buffers;
+		dli.pBindings = b.data();
+		if ( vkCreateDescriptorSetLayout( cur().device, &dli, nullptr, &p->set_layout ) != VK_SUCCESS ) {
+			pipeline_destroy( p );
+			return nullptr;
+		}
+		pli.setLayoutCount = 1;
+		pli.pSetLayouts = &p->set_layout;
+	}
+	std::vector<VkSpecializationMapEntry> entries( spec_count );
+	for ( uint32_t i = 0; i < spec_count; ++i ) entries[i] = { i, i * 4, 4 };
+	VkSpecializationInfo si{ spec_count, entries.data(), spec_count * 4u, spec };
 	VkComputePipelineCreateInfo cpi{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
 	cpi.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
 	cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -661,12 +687,19 @@ Pipeline* pipeline_create( const char* spv_path, uint32_t push_bytes ) {
 		return nullptr;
 	}
 	cpi.stage.module = p->module;
+	if ( spec_count > 0 ) cpi.stage.pSpecializationInfo = &si;
 	cpi.layout = p->layout;
 	if ( vkCreateComputePipelines( cur().device, VK_NULL_HANDLE, 1, &cpi, nullptr, &p->pipeline ) != VK_SUCCESS ) {
 		pipeline_destroy( p );
 		return nullptr;
 	}
 	return p;
+}
+} // namespace
+
+Pipeline* pipeline_create( const char* spv_path, uint32_t push_bytes ) { return create_pipeline( spv_path, push_bytes, 0, nullptr, 0 ); }
+Pipeline* pipeline_create_bound( const char* spv_path, uint32_t push_bytes, uint32_t buffers, const uint32_t* spec, uint32_t spec_count ) {
+	return create_pipeline( spv_path, push_bytes, buffers, spec, spec_count );
 }
 
 void pipeline_destroy( Pipeline* p ) {
@@ -675,6 +708,7 @@ void pipeline_destroy( Pipeline* p ) {
 	if ( p->pipeline ) vkDestroyPipeline( cur().device, p->pipeline, nullptr );
 	if ( p->layout ) vkDestroyPipelineLayout( cur().device, p->layout, nullptr );
 	if ( p->module ) vkDestroyShaderModule( cur().device, p->module, nullptr );
+	if ( p->set_layout ) vkDestroyDescriptorSetLayout( cur().device, p->set_layout, nullptr );
 	delete p;
 }
 
@@ -689,6 +723,39 @@ void dispatch( stream_t st, Pipeline* p, const void* push, uint32_t gx, uint32_t
 	barrier( cb );
 	if ( s->capture ) ++s->capture_nodes;
 }
+
+void dispatch_bound( stream_t st, Pipeline* p, const void* push, const void* const* buffers, uint32_t gx, uint32_t gy, uint32_t gz ) {
+	ctx();
+	if ( !cur().default_stream ) cur().default_stream = make_stream();
+	vk_stream* s = resolve_stream( st );
+	VkCommandBuffer cb = recording( s );
+	vkCmdBindPipeline( cb, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline );
+	// each binding: from the pointer to the end of its allocation (at most maxStorageBufferRange)
+	std::vector<VkDescriptorBufferInfo> info( p->buffers );
+	std::vector<VkWriteDescriptorSet> writes( p->buffers );
+	for ( uint32_t i = 0; i < p->buffers; ++i ) {
+		VkBuffer buf;
+		VkDeviceSize off;
+		ENGINE_ASSERT( resolve( buffers[i], buf, off ), "Vulkan backend: a bound buffer is not a device allocation" );
+		ENGINE_ASSERT( off % cur().props.limits.minStorageBufferOffsetAlignment == 0, "Vulkan backend: a bound buffer is misaligned" );
+		const uint64_t a = reinterpret_cast<uint64_t>( buffers[i] );
+		auto it = --cur().allocs.upper_bound( a );
+		const VkDeviceSize left = it->second.size - off;
+		info[i] = { buf, off, std::min<VkDeviceSize>( left, cur().props.limits.maxStorageBufferRange ) };
+		writes[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+		writes[i].dstBinding = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		writes[i].pBufferInfo = &info[i];
+	}
+	cur().push_descriptor( cb, VK_PIPELINE_BIND_POINT_COMPUTE, p->layout, 0, p->buffers, writes.data() );
+	if ( p->push_bytes ) vkCmdPushConstants( cb, p->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, p->push_bytes, push );
+	vkCmdDispatch( cb, gx, gy, gz );
+	barrier( cb );
+	if ( s->capture ) ++s->capture_nodes;
+}
+
+bool bound_pipelines() { return ctx().push_descriptor != nullptr; }
 
 } // namespace vk
 } // namespace engine::backend
