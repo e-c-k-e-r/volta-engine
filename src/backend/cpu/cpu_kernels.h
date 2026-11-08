@@ -84,13 +84,25 @@ namespace impl {
 inline float h2f( half v ) { return static_cast<float>( v ); }
 inline half f2h( float v ) { return static_cast<half>( v ); }
 
-// Runs a kernel over a gx * gy * gz grid of thread groups
+inline void cpu_parallel_for( int64_t total, int64_t min_chunk, const std::function<void( int64_t, int64_t )>& fn );
+
+// Runs a kernel over a gx * gy * gz grid of thread groups, the flattened grid split across the worker threads. The kernels' host entry
+// points keep no state across groups (no groupshared, no cross-group atomics on the host target), so the groups run in any order
 inline void cpu_dispatch( void ( *fn )( ComputeVaryingInput*, void*, void* ), void* params, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1 ) {
 	if ( gx == 0 || gy == 0 || gz == 0 ) return;
-	ComputeVaryingInput vi = {};
-	vi.startGroupID = { 0, 0, 0 };
-	vi.endGroupID = { gx, gy, gz };
-	fn( &vi, params, nullptr );
+	const int64_t total = static_cast<int64_t>( gx ) * gy * gz;
+	cpu_parallel_for( total, 1, [&]( int64_t b, int64_t e ) {
+		// one call per run of x groups at a fixed (y, z)
+		while ( b < e ) {
+			const uint32_t x = static_cast<uint32_t>( b % gx ), yz = static_cast<uint32_t>( b / gx ), y = yz % gy, z = yz / gy;
+			const uint32_t x1 = static_cast<uint32_t>( std::min<int64_t>( gx, x + ( e - b ) ) );
+			ComputeVaryingInput vi = {};
+			vi.startGroupID = { x, y, z };
+			vi.endGroupID = { x1, y + 1, z + 1 };
+			fn( &vi, params, nullptr );
+			b += x1 - x;
+		}
+	} );
 }
 
 // Worker count for the parallel helpers: ENGINE_CPU_THREADS, else the physical cores of the affinity mask
