@@ -702,6 +702,10 @@ add_executable(test_ppl tests/4_coherence/test_ppl.cpp)
 target_link_libraries(test_ppl PRIVATE engine_kernels)
 set_target_properties(test_ppl PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(test_mc tests/4_coherence/test_mc.cpp)
+target_link_libraries(test_mc PRIVATE engine_kernels)
+set_target_properties(test_mc PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(test_ear tests/4_coherence/test_ear.cpp)
 target_link_libraries(test_ear PRIVATE engine_kernels)
 target_compile_definitions(test_ear PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
