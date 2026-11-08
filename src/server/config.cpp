@@ -210,7 +210,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 |---|---|
 | `ENGINE_MODEL_ROOT` | directory holding the checkpoints used by tests and benches (also read from `tests/local.env`) |
 | `ENGINE_TEST_QWEN_DIR`, `ENGINE_TEST_DRAFT_DIR`, `ENGINE_TEST_GLM_DIR`, `ENGINE_TEST_FLASH_DIR`, `ENGINE_TEST_DSV41_DIR`, ... | the checkpoint of one test role: a directory under `ENGINE_MODEL_ROOT` or an absolute path; the defaults and the full list are in `tests/models.env`, `tests/local.env` overrides them per machine, the environment overrides both (`GATE_BUILD` there picks the build `gate.sh` runs from) |
-| `ENGINE_CPU_THREADS` | worker threads of the CPU backend (default: the process's allowed cores) |
+| `ENGINE_CPU_THREADS` | worker threads of the CPU backend, a persistent pool (default: one per physical core of the process's allowed CPUs) |
 | `ENGINE_DEBUG_CPU_TRACE` | per-call timing lines in the CPU backend |
 | `ENGINE_VK_DEVICE` | Vulkan device index |
 | `ENGINE_SPV_DIR` | directory of compiled SPIR-V modules (default: the build directory) |

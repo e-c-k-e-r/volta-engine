@@ -7,8 +7,12 @@
 #include <algorithm>
 #include <functional>
 #include <cstdlib>
+#include <cstdio>
 #include <sched.h>
 #include <thread>
+#include <atomic>
+#include <mutex>
+#include "engine/kernels/cpu/pool.h"
 #include <vector>
 
 extern "C" {
@@ -89,33 +93,98 @@ inline void cpu_dispatch( void ( *fn )( ComputeVaryingInput*, void*, void* ), vo
 	fn( &vi, params, nullptr );
 }
 
-// Worker count for the parallel helpers: ENGINE_CPU_THREADS, else the hardware concurrency
+// Worker count for the parallel helpers: ENGINE_CPU_THREADS, else the physical cores of the affinity mask
 inline int cpu_threads() {
 	static const int n = [] {
 		const char* e = std::getenv( "ENGINE_CPU_THREADS" );
 		cpu_set_t mask;
 		const int allowed = ( sched_getaffinity( 0, sizeof( mask ), &mask ) == 0 ) ? CPU_COUNT( &mask ) : static_cast<int>( std::thread::hardware_concurrency() );
-		const int v = e ? std::atoi( e ) : allowed;
+		// default: one thread per physical core the process may run on (hyperthread siblings share the cores' units: measured slower)
+		int physical = 0;
+		{
+			std::vector<std::pair<int, int>> seen;
+			for ( int c = 0; c < CPU_SETSIZE; ++c ) {
+				if ( !CPU_ISSET( c, &mask ) ) continue;
+				int pkg = -1, core = -1;
+				char path[128];
+				std::snprintf( path, sizeof( path ), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", c );
+				if ( FILE* f = std::fopen( path, "r" ) ) { if ( std::fscanf( f, "%d", &pkg ) != 1 ) pkg = -1; std::fclose( f ); }
+				std::snprintf( path, sizeof( path ), "/sys/devices/system/cpu/cpu%d/topology/core_id", c );
+				if ( FILE* f = std::fopen( path, "r" ) ) { if ( std::fscanf( f, "%d", &core ) != 1 ) core = -1; std::fclose( f ); }
+				const std::pair<int, int> id{ pkg, core < 0 ? c : core };
+				if ( std::find( seen.begin(), seen.end(), id ) == seen.end() ) seen.push_back( id );
+			}
+			physical = static_cast<int>( seen.size() );
+		}
+		const int v = e ? std::atoi( e ) : ( physical > 0 ? physical : allowed );
 		return std::max( 1, v );
 	}();
 	return n;
 }
 
-// Splits [0, total) into contiguous ranges and runs fn( begin, end ) on each from its own thread. fn must be re-entrant
+// Splits [0, total) into pieces of at least min_chunk and runs fn( begin, end ) on each, on the process's persistent worker pool (the workers
+// spin between the back-to-back calls of a forward instead of being created per call). fn must be re-entrant
+inline thread_local bool g_in_pool_task = false;   // a piece of a pool task runs on this thread: nested loops run inline
+
+struct RangeTask : engine::kernels::cpu::Task {
+	const std::function<void( int64_t, int64_t )>* fn = nullptr;
+	int64_t total = 0, chunk = 1;
+	std::atomic<int64_t> next{ 0 }, done{ 0 };
+	bool work() override {
+		const int64_t b = next.fetch_add( chunk );
+		if ( b >= total ) return false;
+		const int64_t e = std::min( total, b + chunk );
+		const bool outer = g_in_pool_task;
+		g_in_pool_task = true;
+		( *fn )( b, e );
+		g_in_pool_task = outer;
+		done.fetch_add( e - b );
+		return true;
+	}
+	bool finished() const override { return done.load() >= total; }
+};
+
+inline engine::kernels::cpu::Pool& cpu_pool() {
+	static engine::kernels::cpu::Pool pool( cpu_threads(), {} );
+	return pool;
+}
+
 inline void cpu_parallel_for( int64_t total, int64_t min_chunk, const std::function<void( int64_t, int64_t )>& fn ) {
 	const int64_t t = std::min<int64_t>( cpu_threads(), std::max<int64_t>( 1, total / std::max<int64_t>( 1, min_chunk ) ) );
 	if ( t <= 1 ) {
 		fn( 0, total );
 		return;
 	}
-	const int64_t step = ( total + t - 1 ) / t;
-	std::vector<std::thread> pool;
-	for ( int64_t i = 1; i < t; ++i ) {
-		if ( i * step >= total ) break;
-		pool.emplace_back( [&fn, i, step, total] { fn( i * step, std::min( total, ( i + 1 ) * step ) ); } );
+	if ( g_in_pool_task ) {   // inside a piece of another loop: the pool's threads are already busy
+		fn( 0, total );
+		return;
 	}
-	fn( 0, std::min( total, step ) );
-	for ( auto& th : pool ) th.join();
+	// one caller at a time owns the pool; another thread's loop (the loader's, a second rank's) gets threads of its own
+	static std::mutex pool_mu;
+	std::unique_lock<std::mutex> own( pool_mu, std::try_to_lock );
+	if ( !own.owns_lock() ) {
+		const int64_t step = ( total + t - 1 ) / t;
+		std::vector<std::thread> pool;
+		for ( int64_t i = 1; i < t; ++i ) {
+			if ( i * step >= total ) break;
+			pool.emplace_back( [&fn, i, step, total] { fn( i * step, std::min( total, ( i + 1 ) * step ) ); } );
+		}
+		fn( 0, std::min( total, step ) );
+		for ( auto& th : pool ) th.join();
+		return;
+	}
+	// The pool's workers may still hold a task after run() returns (Pool's contract): the tasks are a ring of long-lived objects, each reused
+	// once no worker refers to it any more. A few pieces per worker for balance, none below min_chunk
+	static RangeTask ring[64];
+	static unsigned at = 0;
+	RangeTask& task = ring[at++ % 64];
+	while ( task.refs.load( std::memory_order_acquire ) != 0 ) std::this_thread::yield();
+	task.fn = &fn;
+	task.total = total;
+	task.chunk = std::max<int64_t>( min_chunk, ( total + 4 * t - 1 ) / ( 4 * t ) );
+	task.done.store( 0, std::memory_order_relaxed );
+	task.next.store( 0, std::memory_order_release );
+	cpu_pool().run( task );
 }
 
 // cpu_dispatch with the x grid split across threads. Only for kernels whose groups are independent and keep no shared

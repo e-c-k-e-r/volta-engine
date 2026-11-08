@@ -76,7 +76,6 @@ from the hardware of the time (4x V100, power caps as noted); relative results a
 * **CPU experts read in place (EXL3, no repacked copy):** the kernel reached 1.07-1.10x the repacked layout, but decode lost 27%
   (21.2 -> 15.4 tok/s): each thread's small output slice strides across tiles and NUMA nodes. Patch kept in
   `.agents/shelved/cpu_exl3_in_place.patch`.
-* **Persistent CPU thread team** for the CPU backend: slower than per-call threads.
 * **Widening the AVX2 CPU expert kernel to AVX-512 on Skylake-SP (Xeon Gold 6132).** Two of the kernel's tiles per 512-bit vector:
   4.44 -> 4.14 ms per 3-bit GLM expert on one thread, 0.76 -> 0.82 ms on ten (slower), outputs unchanged. Integer accumulation with int16
   activations: 0 to 6%. Skylake-SP issues the 512-bit integer multiply of the state hash on a single port and lowers the clock under heavy
