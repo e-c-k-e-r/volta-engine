@@ -3,7 +3,7 @@
 // ONE source for both configurations:
 //   --dump <dir>   run in the CUDA build: computes with the real kernels, writes golden outputs
 //   --check <dir>  recompute with the built backend and compare (tier 2) against the golden files
-// 3-bit MUL1 trellis experts (what the persistent / fused CUDA kernels instantiate), rows 1, 4, 17.
+// 3-bit MUL1 trellis experts (what the persistent / fused CUDA kernels instantiate) and GGUF experts (Q4_K gate, IQ3_S up, Q6_K down), rows 1, 4, 17.
 // --softmax routes with MoERouter::route_softmax_topk (the Qwen family's router) instead of route_topk (GLM's sigmoid router); the case names then carry
 // an _sm suffix, so one golden directory serves both.
 #include "golden_io.h"
@@ -12,6 +12,9 @@
 #include "engine/backend/tiers.h"
 #include "engine/core/arena.h"
 #include "engine/modules/moe.h"
+#include "engine/modules/gguf.h"
+#include <algorithm>
+#include <cstring>
 #include <vector>
 
 using namespace engine;
@@ -67,7 +70,23 @@ static pod::LinearWeight make_expert_weight( GoldenRng& rng, int k, int n, int b
 	return pod::LinearWeight::make_trellis( codes, suh, svh, bits, true, false );
 }
 
-static pod::MoELayerWeights g_full, g_shard;
+// A GGUF expert: n rows of k / 256 blocks of random bytes (valid codes for these types) with the half scales set small, so the products stay
+// in FP16 range; d_at / dmin_at are the byte offsets of the scales in a block (dmin_at < 0: none)
+static pod::LinearWeight make_gguf_expert( GoldenRng& rng, int k, int n, modules::GgmlType type, int block_bytes, int d_at, int dmin_at ) {
+	std::vector<uint8_t> b( static_cast<size_t>( n ) * ( k / 256 ) * block_bytes );
+	for ( auto& v : b ) v = static_cast<uint8_t>( rng.next() );
+	const half_t d = backend::from_float_half( 1e-4f ), dmin = backend::from_float_half( 5e-5f );
+	for ( size_t o = 0; o < b.size(); o += block_bytes ) {
+		std::memcpy( &b[o + d_at], &d, 2 );
+		if ( dmin_at >= 0 ) std::memcpy( &b[o + dmin_at], &dmin, 2 );
+	}
+	int s[1] = { static_cast<int>( b.size() ) };
+	pod::TensorView t = core::arena_alloc_tensor( g_arena, pod::DType::UINT8, s, 1 );
+	backend::memcpy_sync( t.data, b.data(), b.size(), backend::Copy::H2D );
+	return pod::LinearWeight::make_gguf( t, static_cast<uint32_t>( type ), k, n );
+}
+
+static pod::MoELayerWeights g_full, g_shard, g_gguf_full, g_gguf_shard;
 
 struct Case {
 	std::string name;
@@ -102,6 +121,25 @@ int main( int argc, char** argv ) {
 		g_shard.up[e] = g_full.up[4 + e];
 		g_shard.down[e] = g_full.down[4 + e];
 	}
+	// GGUF experts (MoE::forward with QuantType::GGUF): gate Q4_K, up IQ3_S, down Q6_K
+	g_gguf_full.type = g_gguf_shard.type = pod::QuantType::GGUF;
+	g_gguf_full.num_local_experts = E;
+	g_gguf_shard.num_local_experts = 8;
+	g_gguf_full.top_k = g_gguf_shard.top_k = TOPK;
+	for ( int e = 0; e < E; ++e ) {
+		g_gguf_full.gate[e] = make_gguf_expert( rng, H, I, modules::GgmlType::Q4_K, 144, 0, 2 );
+		g_gguf_full.up[e] = make_gguf_expert( rng, H, I, modules::GgmlType::IQ3_S, 110, 0, -1 );
+		g_gguf_full.down[e] = make_gguf_expert( rng, I, H, modules::GgmlType::Q6_K, 210, 208, -1 );
+	}
+	for ( int e = 0; e < 8; ++e ) {
+		g_gguf_shard.gate[e] = g_gguf_full.gate[4 + e];
+		g_gguf_shard.up[e] = g_gguf_full.up[4 + e];
+		g_gguf_shard.down[e] = g_gguf_full.down[4 + e];
+	}
+	modules::MoE::init_device_ptrs( g_gguf_full, g_arena );
+	modules::MoE::init_device_ptrs( g_gguf_shard, g_arena );
+	pod::MoEScratch sc_gguf{};
+	sc_gguf.gguf_ws = core::arena_alloc( g_arena, std::max<size_t>( 256, modules::MoEGguf::scratch_bytes( TOPK, H, I ) ), 256 );
 	modules::MoE::init_device_ptrs( g_full, g_arena );
 	modules::MoE::init_device_ptrs( g_shard, g_arena );
 	const pod::MoEScratch sc_full = modules::MoE::alloc_scratch( g_arena, E, TOPK, H, I, max_rows );
@@ -135,6 +173,14 @@ int main( int argc, char** argv ) {
 			std::snprintf( nm, sizeof( nm ), "moe%s_%s_m%d", softmax ? "_sm" : "", shard ? "shard" : "full", m );
 			cases.push_back( { nm, download_half( out.data, out.numel() ) } );
 		}
+		for ( int shard = 0; shard < 2; ++shard ) {
+			int os[2] = { m, H };
+			pod::TensorView out = core::arena_alloc_tensor( g_arena, pod::DType::FP16, os, 2 );
+			if ( shard ) modules::MoE::forward( x, g_gguf_shard, d_idx, d_w, out, 4, 12, sc_gguf );
+			else modules::MoE::forward( x, g_gguf_full, d_idx, d_w, out, 0, E, sc_gguf );
+			std::snprintf( nm, sizeof( nm ), "gguf%s_%s_m%d", softmax ? "_sm" : "", shard ? "shard" : "full", m );
+			cases.push_back( { nm, download_half( out.data, out.numel() ) } );
+		}
 	}
 
 	{ // accumulate (accum += w * expert_out) and combine (shared + sum_k w[k] * part[k])
@@ -165,7 +211,9 @@ int main( int argc, char** argv ) {
 			}
 			std::vector<float> ref( raw.size() / sizeof( float ) );
 			std::memcpy( ref.data(), raw.data(), ref.size() * sizeof( float ) );
-			pass = golden_compare( c.name.c_str(), ref, c.out ) && pass;
+			// GGUF experts: each backend quantizes the activations its own way (CUDA q8_1, CPU q8_K, Vulkan FP16 / q8 by row count)
+			const bool gguf = c.name.rfind( "gguf", 0 ) == 0;
+			pass = ( gguf ? golden_compare( c.name.c_str(), ref, c.out, 0.999, 0.05 ) : golden_compare( c.name.c_str(), ref, c.out ) ) && pass;
 		}
 	}
 	core::arena_destroy( g_arena );

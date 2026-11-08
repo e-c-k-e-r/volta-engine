@@ -176,13 +176,14 @@ pod::MoEScratch MoE::alloc_scratch( pod::MemoryArena&, int, int, int, int, int, 
 // the host and batched per expert (one trellis dequantization per weight and expert); the weighted sum runs on the device in route order.
 void MoE::forward( const pod::TensorView& x, const pod::MoELayerWeights& weights, const int* d_topk_indices, const backend::half_t* d_topk_weights, pod::TensorView& out, int start_expert, int end_expert,
 	const pod::MoEScratch&, float act_limit, backend::stream_t stream ) {
-	ENGINE_ASSERT( weights.type == pod::QuantType::TRELLIS || weights.type == pod::QuantType::FP16, "MoE::forward (Vulkan): TRELLIS or FP16 experts only" );
+	ENGINE_ASSERT( weights.type == pod::QuantType::TRELLIS || weights.type == pod::QuantType::FP16 || weights.type == pod::QuantType::GGUF,
+		"MoE::forward (Vulkan): TRELLIS, FP16 or GGUF experts only" );
 	const int rows = ( out.ndim >= 2 && out.shape[0] > 0 ) ? out.shape[0] : 1;
 	const int hidden = out.shape[out.ndim - 1];
 	const int E = weights.num_local_experts;
 	const int topk = weights.top_k;
 	const pod::LinearWeight& ref = weights.up[0];
-	const int inter = ref.type == pod::QuantType::TRELLIS ? ref.w2.shape[0] : ref.w0.shape[1];
+	const int inter = ref.type == pod::QuantType::TRELLIS ? ref.w2.shape[0] : ref.type == pod::QuantType::GGUF ? ref.gguf_n : ref.w0.shape[1];
 	std::vector<int> idx( static_cast<size_t>( rows ) * topk );
 	backend::memcpy_async( idx.data(), d_topk_indices, idx.size() * sizeof( int ), backend::Copy::D2H, stream );
 	backend::stream_sync( stream );

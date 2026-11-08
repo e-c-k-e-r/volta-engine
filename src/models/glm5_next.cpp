@@ -34,7 +34,6 @@ constexpr double kFusedTierMinFraction = 0.75;
 namespace {
 
 // Host-resident embedding table shared by all ranks (see load_weights)
-pod::TensorView g_embed_table;
 
 } // namespace
 
@@ -389,7 +388,7 @@ bool Glm5NextPipeline::init(
 		tap_tmp_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, tap_shape, 2 );
 
 		engine::models::alloc_draft_head( arena, draft_hooks_, draft_, config_.hidden_size, lm_shard_cols_, kTopkTile, lm_shard_offset_, lm_shard_real_cols_ );
-		draft_hooks_.embedding = &g_embed_table;
+		draft_hooks_.embedding = &embed_tokens_;
 	}
 
 	if ( mtp_on_ ) {
@@ -715,26 +714,16 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		backend::stream_sync( stream );
 	}
 
-	// 1. Embedding table: 1.27 GB of BF16 kept in portable pinned host memory instead of rank 0's arena (which has
-	// no room for the drafter beside it). Lookups touch a few rows per forward and read over the link; every rank
-	// shares the one table (the drafter looks up its anchor token on all four).
-	if ( rank_ == 0 ) {
+	// 1. Embedding table: 1.27 GB of BF16 kept in portable pinned host memory instead of rank 0's arena (which has no room for the drafter
+	// beside it), one table every rank shares (the drafter looks up its anchor token on all four); lookups touch a few rows per forward and
+	// read over the link. A GGUF conversion's blocks are dequantized and rounded to BF16. On a backend without mapped host memory the device
+	// reads (Vulkan) each rank keeps its own copy
+	{
 		const char* ename = "model.language_model.embed_tokens.weight";
-		int shard_idx = -1;
-		const auto* meta = repo.find( ename, &shard_idx );
-		if ( meta == nullptr || shard_idx < 0 ) { LOG_ERROR( "[RANK %d] MISSING: embed_tokens\n", rank_ ); ++missing_count; }
-		else {
-			const size_t elems = static_cast<size_t>( config_.vocab_size ) * config_.hidden_size;
-			if ( g_embed_table.data == nullptr ) {
-				void* host = backend::host_alloc_pinned( elems * sizeof( uint16_t ), backend::Pin::MappedPortable );
-				ENGINE_ASSERT( host != nullptr, "Glm5NextPipeline: pinned embedding table allocation failed" );
-				g_embed_table = pod::make_tensor_2d( host, pod::DType::BF16, config_.vocab_size, config_.hidden_size );
-			}
-			// BF16 in the checkpoint; a GGUF conversion's blocks are dequantized and rounded to BF16
-			if ( !repo.copy_host_bf16( ename, static_cast<uint16_t*>( g_embed_table.data ), elems, stream ) ) ++missing_count;
-		}
+		embed_tokens_ = repo.shared_host_bf16( ename, stream );
+		if ( !embed_tokens_.data ) embed_tokens_ = repo.load( ename, *arena_, stream, pod::DType::BF16 );
+		if ( !embed_tokens_.data ) { LOG_ERROR( "[RANK %d] MISSING: embed_tokens\n", rank_ ); ++missing_count; }
 	}
-	embed_tokens_ = g_embed_table;
 	// Final norm + this rank's vocabulary shard of the LM head
 	final_norm_ = repo.load( "model.language_model.norm.weight", *arena_, stream, pod::DType::FP16 );
 	if ( !final_norm_.data ) { LOG_ERROR( "[RANK %d] MISSING: norm\n", rank_ ); ++missing_count; }
@@ -2261,10 +2250,6 @@ void Glm5NextPipeline::destroy() {
 	if ( h_argmax_idx_ != nullptr ) {
 		engine::core::host_free_pinned( h_argmax_idx_ );
 		h_argmax_idx_ = nullptr;
-	}
-	if ( rank_ == 0 && g_embed_table.data != nullptr ) {
-		backend::host_free_pinned( g_embed_table.data );
-		g_embed_table.data = nullptr;
 	}
 }
 
