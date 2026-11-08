@@ -970,7 +970,11 @@ pod::TensorView SafeTensorsRepo::shared_host_bf16( const char* name, backend::st
 	const int rows = meta->shape[0], cols = meta->shape[1];
 	const size_t n = static_cast<size_t>( rows ) * cols;
 	auto* dst = static_cast<uint16_t*>( backend::host_alloc_pinned( n * sizeof( uint16_t ), backend::Pin::MappedPortable ) );
-	ENGINE_ASSERT( dst != nullptr, "shared_host_bf16: pinned allocation failed" );
+	if ( dst == nullptr ) {
+		// a backend without mapped host memory the device reads (Vulkan): the caller keeps its own copy
+		LOG_WARN( "[SafeTensorsRepo] %s: no mapped pinned host memory on this backend, kept on the device instead\n", name );
+		return pod::TensorView{};
+	}
 	if ( !copy_host_bf16( name, dst, n, stream ) ) {
 		backend::host_free_pinned( dst );
 		return pod::TensorView{};

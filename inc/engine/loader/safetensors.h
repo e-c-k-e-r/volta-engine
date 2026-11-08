@@ -94,7 +94,7 @@ public:
 	size_t bytes_of( const std::string& prefix, std::initializer_list<const char*> skip = {} ) const;
 	// A [rows, cols] tensor as BF16 in pinned, mapped, portable host memory, one copy per process shared by every rank and every repo that
 	// asks for the same name (an embedding table read a few rows per forward over the link); converted from BF16, FP16, FP32 or GGUF
-	// blocks. Empty when the tensor is missing
+	// blocks. Empty when the tensor is missing or the backend has no device-readable pinned host memory (the caller loads its own copy)
 	pod::TensorView shared_host_bf16( const char* name, backend::stream_t stream = nullptr );
 	// A [rows, cols] tensor converted to BF16 into dst (rows * cols values; BF16, FP16, FP32 or GGUF blocks); false when it is missing
 	bool copy_host_bf16( const char* name, uint16_t* dst, size_t elems, backend::stream_t stream = nullptr );

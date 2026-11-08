@@ -152,7 +152,9 @@ Qwen extras:
   The 27B's MTP head is read from its GGUF file, and a DFlash2 drafter directory may hold a GGUF conversion (llama.cpp's `dflash`
   architecture) with the release's `config.json`; the vision projector (`mmproj`) and the MTP blocks of Flash-Next and GLM are not read.
   The CPU backend runs GGUF projections through llama.cpp's CPU kernels (its AVX2 / AVX-512 dot products, the activations quantized to
-  q8_0, q8_1 or q8_K by type); the routed experts of Flash-Next and GLM and the Vulkan backend do not take GGUF yet.
+  q8_0, q8_1 or q8_K by type), the Vulkan backend through Slang decoders of every type but Q2_0 (src/kernels/slang/gguf.slang, the weight decoded in the
+  shader against FP16 activations); the routed experts of Flash-Next and GLM run on CUDA only. `embed_host` falls back to a per-device copy on a backend
+  without device-readable pinned host memory (Vulkan).
 * **DeepSeek-V4.1-Flash** (`deepseek_v41`, exllamav3's own EXL3 conversions such as `turboderp/DeepSeek-V4.1-Flash-1017-exl3` (its 1.68 bpw
   experts are 1.5 and 2 bpw) or those of the sudoingX / 0xSero layout; example `configs/deepseek_v41.json`): exllamav3's releases keep the Engram
   tables in `ngram_embedding.safetensors`, which the loader opens next to the shards; the other repositories do not carry them, so

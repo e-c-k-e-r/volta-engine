@@ -72,6 +72,15 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 		DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/nvfp4.slang
 		COMMENT "slangc nvfp4_gemm -> spirv")
 	list(APPEND VK_FLASH_SPV ${SLANG_OUT}/nvfp4_gemm.spv)
+	# GGUF block weights (src/kernels/slang/gguf.slang)
+	foreach(entry gguf_gemv gguf_dequant)
+		set(sout ${SLANG_OUT}/${entry}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/gguf.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/gguf.slang
+			COMMENT "slangc ${entry} -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
 	add_custom_target(flash_spv DEPENDS ${VK_FLASH_SPV})
 	add_dependencies(slang_kernels flash_spv)
 
@@ -97,6 +106,12 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	target_link_libraries(test_vulkan_comm PRIVATE engine_backend_vulkan pthread)
 	add_dependencies(test_vulkan_comm slang_kernels)
 	set_target_properties(test_vulkan_comm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	# GGUF block types against the ggml fixtures (tests/tools/gguf_fixtures.py), same source as the CUDA and CPU builds
+	add_executable(test_gguf_linear tests/2_parity/test_gguf_linear.cpp ${ENGINE_VK_OBJECTS})
+	target_link_libraries(test_gguf_linear PRIVATE engine_backend_vulkan pthread)
+	add_dependencies(test_gguf_linear slang_kernels)
+	set_target_properties(test_gguf_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# End-to-end single-rank forward (--check against the CUDA --dump golden), same source as test_cpu_forward
 	add_executable(test_vulkan_forward tests/2_parity/test_cpu_forward.cpp ${ENGINE_VK_OBJECTS})
