@@ -8,6 +8,12 @@
 
 #include "gguf_cpu.h"
 
+// ik_llama.cpp's iqk GEMM (ik/src/iqk/iqk_mul_mat.h, declared here so its ggml headers stay out of this unit)
+extern "C" bool iqk_mul_mat( long Nx, long Ny, long ne00, int typeA, const void* A, long strideA, int typeB, const void* B, long strideB, float* C, long stride_C,
+	int ith, int nth );
+// ik's q8_K (ik/src/ggml-common.h: a float block sum after the scale, 296 bytes against mainline's 292), which its kernels read
+extern "C" void iqk_quantize_row_q8_K( const float* x, void* y, int64_t k );
+
 namespace engine::modules::gguf_cpu {
 
 namespace {
@@ -69,5 +75,16 @@ float dot( GgmlType type, const void* w_row, const void* act_row, int k ) {
 }
 
 void to_float( GgmlType type, const void* blocks, float* out, int64_t elems ) { cpu_type( type ).to_float( blocks, out, elems ); }
+
+bool iqk_rows( GgmlType type ) { return cpu_type( type ).act == GgmlType::Q8_K; }
+
+size_t iqk_act_bytes( int k ) { return static_cast<size_t>( k / 256 ) * 296; }
+
+void iqk_quantize_act( const float* x, void* out, int k ) { iqk_quantize_row_q8_K( x, out, k ); }
+
+bool mul_rows( GgmlType type, const void* w, size_t w_stride, int n, int k, const void* acts, int m, float* out, int ith, int nth ) {
+	return iqk_mul_mat( n, m, k, static_cast<int>( type ), w, static_cast<long>( w_stride ), static_cast<int>( GgmlType::Q8_K ), acts, static_cast<long>( iqk_act_bytes( k ) ), out, n, ith,
+		nth );
+}
 
 } // namespace engine::modules::gguf_cpu

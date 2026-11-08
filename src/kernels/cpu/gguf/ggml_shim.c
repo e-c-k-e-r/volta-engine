@@ -52,6 +52,12 @@ static void geometry( enum ggml_type t, int64_t* elems, size_t* bytes ) {
 		G( GGML_TYPE_IQ1_S, QK_K, sizeof( block_iq1_s ) ) G( GGML_TYPE_IQ1_M, QK_K, sizeof( block_iq1_m ) )
 		G( GGML_TYPE_IQ4_NL, QK4_NL, sizeof( block_iq4_nl ) ) G( GGML_TYPE_IQ4_XS, QK_K, sizeof( block_iq4_xs ) )
 #undef G
+		// ik_llama.cpp's interleaved repack types (its own type ids, above every mainline one), for the iqk kernels' prefill path:
+		// per row, Q8_0_R8 / Q8_0_R16 as 34 / 36 bytes per 32 values, Q8_K_R8 / Q8_K_R16 as 258 / 260 bytes per 256
+		case 208: *elems = 32; *bytes = 34; break;    // Q8_0_R8
+		case 396: *elems = 32; *bytes = 36; break;    // Q8_0_R16
+		case 397: *elems = 256; *bytes = 260; break;  // Q8_K_R16
+		case 399: *elems = 256; *bytes = 258; break;  // Q8_K_R8
 		default: break;
 	}
 }

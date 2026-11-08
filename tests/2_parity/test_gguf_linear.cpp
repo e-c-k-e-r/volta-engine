@@ -1,6 +1,7 @@
 // GGUF block types through Linear::forward against references made outside the engine (tests/tools/gguf_fixtures.py: blocks from ggml's own
 // quantizer, gguf-py's dequantization). Every type for 1 to 8 rows (the q8_1 GEMV of decode and verify blocks), against the product with the
-// activations rounded through q8_1 as the kernels do; and a 20-row chunk (the FP16 dequantization and GEMM of prefill), against the exact product.
+// activations rounded through q8_1 as the kernels do; and 20- and 64-row chunks (the FP16 dequantization and GEMM of prefill on CUDA, the iqk GEMM
+// and its repacking prefill path on CPU), against the exact product.
 //   test_gguf_linear <fixture dir>
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
@@ -94,7 +95,7 @@ int main( int argc, char** argv ) {
 		backend::memcpy_sync( w.data, f.blocks.data(), f.blocks.size(), backend::Copy::H2D );
 		const pod::LinearWeight lw = pod::LinearWeight::make_gguf( w, static_cast<uint32_t>( f.type ), f.k, f.n );
 		double worst_gemv = 0.0, worst_tile = 0.0, worst_gemm = 0.0;
-		for ( int rows : { 1, 2, 3, 5, 8, 9, 13, 16, 20 } ) {
+		for ( int rows : { 1, 2, 3, 5, 8, 9, 13, 16, 20, 64 } ) {
 			if ( rows > f.m ) continue;
 			int xdims[2] = { rows, f.k }, odims[2] = { rows, f.n };
 			pod::TensorView x = core::arena_alloc_tensor( arena, pod::DType::FP16, xdims, 2 );
@@ -108,7 +109,7 @@ int main( int argc, char** argv ) {
 			for ( size_t i = 0; i < o.size(); ++i ) o[i] = backend::to_float( oh[i] );
 			if ( rows <= 8 ) worst_gemv = std::max( worst_gemv, rel_rms( o, f.ref_q, rows, f.n ) );
 			else if ( rows <= 16 ) worst_tile = std::max( worst_tile, rel_rms( o, f.exact, rows, f.n ) );
-			else worst_gemm = rel_rms( o, f.exact, rows, f.n );
+			else worst_gemm = std::max( worst_gemm, rel_rms( o, f.exact, rows, f.n ) );
 		}
 		// The GEMV: FP16 output rounding stays well under 1e-2 against the q8_1 reference. The types whose offset or minimum comes from the q8_1
 		// block's half-precision sum of the activations (llama.cpp's formulation: Q4_0, Q4_1, Q5_0, Q5_1, and IQ1_S / IQ1_M for their delta) lose
@@ -117,14 +118,16 @@ int main( int argc, char** argv ) {
 		const bool sum_offset = type == modules::GgmlType::Q4_0 || type == modules::GgmlType::Q4_1 || type == modules::GgmlType::Q5_0 ||
 			type == modules::GgmlType::Q5_1 || type == modules::GgmlType::IQ1_S || type == modules::GgmlType::IQ1_M;
 		// The CPU backend (llama.cpp's CPU kernels) quantizes the activations at every row count (q8_0, q8_1 or q8_K by type): there the 9-16 and
-		// 20-row products meet the exact one at the GEMV's bound
+		// 20-row products meet the exact one at the GEMV's bound; from 32 rows ik_llama.cpp's iqk GEMM also requantizes each weight tile to
+		// int8 (its Q8_K_R8 / Q8_0_R8 repack), a little more: 1.5e-2
 #if defined(ENGINE_BACKEND_CPU)
 		const double full_bound = sum_offset ? 3e-2 : 1e-2;
+		const double gemm_bound = sum_offset ? 3e-2 : 1.5e-2;
 #else
-		const double full_bound = 5e-3;
+		const double full_bound = 5e-3, gemm_bound = full_bound;
 #endif
-		const bool ok = worst_gemv < ( sum_offset ? 3e-2 : 1e-2 ) && worst_tile < full_bound && worst_gemm < full_bound;
-		std::printf( "  %-8s n %d k %d: 1-8 rows vs q8_1 reference %.2e, 9-16 rows vs exact %.2e, 20 rows (GEMM) vs exact %.2e  %s\n",
+		const bool ok = worst_gemv < ( sum_offset ? 3e-2 : 1e-2 ) && worst_tile < full_bound && worst_gemm < gemm_bound;
+		std::printf( "  %-8s n %d k %d: 1-8 rows vs q8_1 reference %.2e, 9-16 rows vs exact %.2e, 20 / 64 rows vs exact %.2e  %s\n",
 			modules::ggml_type_name( type ), f.n, f.k, worst_gemv, worst_tile, worst_gemm, ok ? "PASS" : "FAIL" );
 		fails += ok ? 0 : 1;
 		arena.offset_bytes = mark;

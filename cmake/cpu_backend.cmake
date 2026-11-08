@@ -33,7 +33,19 @@ add_library(engine_cpu_slang OBJECT ${SLANG_CPU_SOURCES})
 add_dependencies(engine_cpu_slang slang_kernels)
 target_include_directories(engine_cpu_slang PRIVATE ${SLANG_INCLUDE_DIR})
 
-set(ENGINE_CPU_OBJECTS $<TARGET_OBJECTS:engine_cpu_host> $<TARGET_OBJECTS:engine_cpu_backend> $<TARGET_OBJECTS:engine_cpu_slang> $<TARGET_OBJECTS:engine_cpu_ggml>)
+# ik_llama.cpp's iqk GEMM kernels (MIT, src/kernels/cpu/gguf/ik), with ik's own ggml headers: the multi-row GGUF products
+set(IQK_DIR ${PROJECT_SOURCE_DIR}/src/kernels/cpu/gguf/ik)
+file(GLOB IQK_SOURCES ${IQK_DIR}/src/iqk/*.cpp)
+add_library(engine_cpu_iqk OBJECT ${IQK_SOURCES} ${PROJECT_SOURCE_DIR}/src/kernels/cpu/gguf/ik_shim.c)
+target_include_directories(engine_cpu_iqk PRIVATE ${IQK_DIR}/include ${IQK_DIR}/src ${IQK_DIR}/src/iqk)
+target_compile_definitions(engine_cpu_iqk PRIVATE GGML_USE_IQK_MULMAT)
+target_compile_options(engine_cpu_iqk PRIVATE -O3 $<$<BOOL:${ENGINE_CPU_NATIVE}>:-march=native> -w)
+# mainline's ggml-quants.c defines these four too
+set_source_files_properties(${IQK_DIR}/src/iqk/iqk_quantize.cpp PROPERTIES COMPILE_DEFINITIONS
+	"dequantize_row_mxfp4=ik_dequantize_row_mxfp4;quantize_mxfp4=ik_quantize_mxfp4;quantize_row_mxfp4=ik_quantize_row_mxfp4;quantize_row_mxfp4_ref=ik_quantize_row_mxfp4_ref")
+
+set(ENGINE_CPU_OBJECTS $<TARGET_OBJECTS:engine_cpu_host> $<TARGET_OBJECTS:engine_cpu_backend> $<TARGET_OBJECTS:engine_cpu_slang> $<TARGET_OBJECTS:engine_cpu_ggml>
+	$<TARGET_OBJECTS:engine_cpu_iqk>)
 
 add_executable(test_cpu_smoke tests/2_parity/test_cpu_smoke.cpp ${ENGINE_CPU_OBJECTS})
 set_target_properties(test_cpu_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

@@ -1,11 +1,12 @@
 // LinearGguf on the CPU backend over llama.cpp's own CPU kernels (src/kernels/cpu/gguf): each activation row quantized once to the block
-// type the weight's dot product pairs with (q8_0, q8_1 or q8_K, ggml-cpu's type traits), in the weight's column order, then every output
-// row is one dot product per activation row, the output rows split across the worker threads.
+// type the weight's dot product pairs with (q8_0, q8_1 or q8_K, ggml-cpu's type traits), in the weight's column order; one row is then one
+// dot product per output row (split across the worker threads), several rows ik_llama.cpp's iqk GEMM where it has a kernel.
 #include "cpu_kernels.h"
 #include "engine/modules/gguf.h"
 #include "engine/backend/numeric.h"
 #include "../../kernels/cpu/gguf/gguf_cpu.h"
 #include <algorithm>
+#include <atomic>
 #include <vector>
 
 namespace engine::modules {
@@ -65,6 +66,31 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	} );
 	const size_t wb = row_bytes( type, k );
 	backend::half_t* o = out.ptr<backend::half_t>();
+	// several rows of a q8_K type: ik_llama.cpp's iqk GEMM (one decoded weight tile for all the rows; from 32 rows it repacks the weight per
+	// tile), on the rows quantized to ik's own q8_K; a single row stays on llama.cpp's dot products (iqk is no faster there)
+	if ( m >= 2 && gguf_cpu::iqk_rows( type ) ) {
+		const size_t ib = gguf_cpu::iqk_act_bytes( k );
+		std::vector<uint8_t> xi( static_cast<size_t>( m ) * ib );
+		impl::cpu_parallel_for( m, 1, [&]( int64_t r0, int64_t r1 ) {
+			std::vector<float> f( static_cast<size_t>( k ) );
+			for ( int64_t r = r0; r < r1; ++r ) {
+				for ( int i = 0; i < k; ++i ) f[static_cast<size_t>( i )] = backend::to_float( xs[static_cast<size_t>( r ) * k + tiled_source( i, tiling, k )] );
+				gguf_cpu::iqk_quantize_act( f.data(), xi.data() + static_cast<size_t>( r ) * ib, k );
+			}
+		} );
+		const int nth = impl::cpu_threads();
+		std::vector<float> f( static_cast<size_t>( m ) * n );
+		std::atomic<bool> ok{ true };
+		impl::cpu_parallel_for( nth, 1, [&]( int64_t t0, int64_t t1 ) {
+			for ( int64_t t = t0; t < t1 && ok.load( std::memory_order_relaxed ); ++t ) {
+				if ( !gguf_cpu::mul_rows( type, w, wb, n, k, xi.data(), m, f.data(), static_cast<int>( t ), nth ) ) ok.store( false );
+			}
+		} );
+		if ( ok.load() ) {
+			for ( size_t i = 0; i < f.size(); ++i ) o[i] = backend::from_float_half( f[i] );
+			return;
+		}
+	}
 	impl::cpu_parallel_for( n, 64, [&]( int64_t j0, int64_t j1 ) {
 		for ( int64_t j = j0; j < j1; ++j ) {
 			const void* wr = static_cast<const uint8_t*>( w ) + static_cast<size_t>( j ) * wb;
