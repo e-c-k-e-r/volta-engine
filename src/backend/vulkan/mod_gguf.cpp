@@ -96,7 +96,7 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	for ( int d = 0; d < x.ndim - 1; ++d ) m *= x.shape[d];
 	GgufParams p{ vki::dp( w ), vki::dp( tables() ), vki::dp( x.data ), vki::dp( out.data ), row_bytes( type, k ), static_cast<int>( type ), m, k, n,
 		tiling.heads, tiling.dim };
-	vki::launch( "gguf_gemv", p, stream, static_cast<uint32_t>( ( n + 63 ) / 64 ), static_cast<uint32_t>( m ) );
+	vki::launch( "gguf_gemv", p, stream, static_cast<uint32_t>( n ), static_cast<uint32_t>( ( m + 7 ) / 8 ) );   // gguf.slang: a workgroup per column and 8 rows
 }
 
 } // namespace engine::modules

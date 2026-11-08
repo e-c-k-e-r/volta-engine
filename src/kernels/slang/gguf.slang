@@ -233,7 +233,7 @@ float dq(int type, uint* p, int64_t b, int i, uint* t) {
 	}
 }
 
-// out[r][c] = sum_i x[r][src(i)] * w[c][i]: a thread per output column and row, the weight row decoded in the shader. tiled: the
+// out[r][c] = sum_i x[r][src(i)] * w[c][i], the weight row decoded in the shader. tiled: the
 // columns are in llama.cpp's tiled V-head order (heads x dim per v), the activation in grouped order (the Qwen3.5 linear-attention out_proj)
 struct GgufParams { uint* w; uint* tables; half* x; half* out_; int64_t row_bytes; int type; int m; int k; int n; int heads; int dim; };
 
@@ -246,22 +246,40 @@ int tiled_source(int i, int heads, int dim, int k) {
 	return (head * (k / per_v) + v) * dim + d;
 }
 
+// A workgroup per output column and group of up to 8 activation rows: the threads stride over k (neighbouring threads read neighbouring
+// bytes of a block), each weight decoded once for all the group's rows, the partial sums reduced in shared memory
+static const int GEMV_THREADS = 128;
+static const int GEMV_ROWS = 8;
+groupshared float s_part[GEMV_ROWS][GEMV_THREADS];
+
 [shader("compute")]
-[numthreads(64, 1, 1)]
+[numthreads(GEMV_THREADS, 1, 1)]
 void gguf_gemv(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform GgufParams p) {
-	let c = int(gid.x) * 64 + int(tid.x);
-	let r = int(gid.y);
-	if (c >= p.n || r >= p.m) return;
+	let c = int(gid.x);
+	let r0 = int(gid.y) * GEMV_ROWS;
+	let t = int(tid.x);
+	let rows = min(GEMV_ROWS, p.m - r0);
 	let be = block_elems(p.type);
 	let bb = block_bytes(p.type);
-	half* xr = p.x + int64_t(r) * p.k;
 	let row = int64_t(c) * p.row_bytes;
-	float acc = 0.0f;
-	for (int kb = 0; kb < p.k / be; ++kb) {
-		let b = row + int64_t(kb) * bb;
-		for (int i = 0; i < be; ++i) acc = fma(float(xr[tiled_source(kb * be + i, p.heads, p.dim, p.k)]), dq(p.type, p.w, b, i, p.tables), acc);
+	float acc[GEMV_ROWS];
+	for (int r = 0; r < GEMV_ROWS; ++r) acc[r] = 0.0f;
+	for (int i = t; i < p.k; i += GEMV_THREADS) {
+		let w = dq(p.type, p.w, row + int64_t(i / be) * bb, i % be, p.tables);
+		let src = tiled_source(i, p.heads, p.dim, p.k);
+		for (int r = 0; r < GEMV_ROWS; ++r) {
+			if (r < rows) acc[r] = fma(float(p.x[int64_t(r0 + r) * p.k + src]), w, acc[r]);
+		}
 	}
-	p.out_[int64_t(r) * p.n + c] = half(acc);
+	for (int r = 0; r < GEMV_ROWS; ++r) s_part[r][t] = acc[r];
+	GroupMemoryBarrierWithGroupSync();
+	for (int s = GEMV_THREADS / 2; s > 0; s >>= 1) {
+		if (t < s) {
+			for (int r = 0; r < GEMV_ROWS; ++r) s_part[r][t] += s_part[r][t + s];
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	if (t < rows) p.out_[int64_t(r0 + t) * p.n + c] = half(s_part[t][0]);
 }
 
 // out[e] = value e of the blocks, a thread per value
