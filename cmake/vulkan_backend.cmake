@@ -73,7 +73,7 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 		COMMENT "slangc nvfp4_gemm -> spirv")
 	list(APPEND VK_FLASH_SPV ${SLANG_OUT}/nvfp4_gemm.spv)
 	# GGUF block weights (src/kernels/slang/gguf.slang)
-	foreach(entry gguf_gemv gguf_dequant)
+	foreach(entry gguf_gemv_sg gguf_gemm_tile gguf_dequant)
 		set(sout ${SLANG_OUT}/${entry}.spv)
 		add_custom_command(OUTPUT ${sout}
 			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/gguf.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}

@@ -1,6 +1,6 @@
 // GGUF block weights for the Vulkan backend (GPU targets only; the CPU backend runs llama.cpp's own CPU kernels, src/kernels/cpu/gguf):
-// element-wise decoders that follow ggml's dequantize_row_* (ggml-quants.c) value for value, a GEMV / GEMM that decodes the weight row in
-// the shader and accumulates against the FP16 activations in fp32 (no activation quantization), and a plain dequantization. Blocks are
+// element-wise decoders that follow ggml's dequantize_row_* (ggml-quants.c) value for value (and 8-value run decoders with the same
+// arithmetic), a GEMV / tiled GEMM that decode the weight in the shader and accumulates against the FP16 activations in fp32 (no activation quantization), and a plain dequantization. Blocks are
 // read through 32-bit words (block sizes are not word multiples); the IQ grids, the sign table and the IQ4 values are one word buffer the
 // host fills from ggml-common.h (offsets below, in words).
 
@@ -233,9 +233,168 @@ float dq(int type, uint* p, int64_t b, int i, uint* t) {
 	}
 }
 
+// Bytes off .. off + 3 as one word (little-endian), from the one or two words they straddle
+uint rdw(uint* p, int64_t off) {
+	let s = uint(off & 3) * 8u;
+	let lo = p[off >> 2];
+	return s == 0u ? lo : (lo >> s) | (p[(off >> 2) + 1] << (32u - s));
+}
+// byte j (0..7) of the 8 bytes held in a (0..3) and c (4..7)
+uint byte8(uint a, uint c, int j) { return ((j < 4 ? a : c) >> (8u * uint(j & 3))) & 255u; }
+
+// Values off .. off + 7 of the block at byte offset b (off a multiple of 8): the run shares its block's scales, signs and grid entries, read
+// once; the same arithmetic as dq value for value. Types without a run decoder take dq per value
+void dq8(int type, uint* p, int64_t b, int off, uint* t, out float v[8]) {
+	switch (type) {
+	case T_Q8_0: {
+		let d = rdh(p, b);
+		let a = rdw(p, b + 2 + off);
+		let c = rdw(p, b + 6 + off);
+		for (int j = 0; j < 8; ++j) v[j] = d * float(s8(byte8(a, c, j)));
+		return;
+	}
+	case T_Q2_K: {
+		let h = off / 128;
+		let w = off % 128;
+		let j = w / 32;
+		let l = w % 32;
+		let a = rdw(p, b + 16 + 32 * h + l);
+		let c = rdw(p, b + 20 + 32 * h + l);
+		let sc = rd8(p, b + 8 * h + 2 * j + (l >= 16 ? 1 : 0));
+		let dl = rdh(p, b + 80) * float(sc & 15u);
+		let ml = rdh(p, b + 82) * float(sc >> 4);
+		for (int k = 0; k < 8; ++k) v[k] = dl * float((byte8(a, c, k) >> uint(2 * j)) & 3u) - ml;
+		return;
+	}
+	case T_Q3_K: {
+		let h = off / 128;
+		let w = off % 128;
+		let j = w / 32;
+		let l = w % 32;
+		let is = 8 * h + 2 * j + (l >= 16 ? 1 : 0);
+		let lo = (rd8(p, b + 96 + (is & 7)) >> (is >= 8 ? 4u : 0u)) & 15u;
+		let hi = (rd8(p, b + 96 + 8 + (is & 3)) >> uint(2 * (is >> 2))) & 3u;
+		let dl = rdh(p, b + 108) * float(int(lo | (hi << 4)) - 32);
+		let a = rdw(p, b + 32 + 32 * h + l);
+		let c = rdw(p, b + 36 + 32 * h + l);
+		let ma = rdw(p, b + l);
+		let mc = rdw(p, b + 4 + l);
+		for (int k = 0; k < 8; ++k) {
+			let q = (byte8(a, c, k) >> uint(2 * j)) & 3u;
+			let m = (byte8(ma, mc, k) >> uint(4 * h + j)) & 1u;
+			v[k] = dl * (float(q) - (m != 0u ? 0.0f : 4.0f));
+		}
+		return;
+	}
+	case T_Q4_K: {
+		let j = off / 64;
+		let w = off % 64;
+		float sc, mn;
+		scale_min_k4(p, b + 4, 2 * j + (w >= 32 ? 1 : 0), sc, mn);
+		let dl = rdh(p, b) * sc;
+		let ml = rdh(p, b + 2) * mn;
+		let a = rdw(p, b + 16 + 32 * j + (w & 31));
+		let c = rdw(p, b + 20 + 32 * j + (w & 31));
+		let sh = w >= 32 ? 4u : 0u;
+		for (int k = 0; k < 8; ++k) v[k] = dl * float((byte8(a, c, k) >> sh) & 15u) - ml;
+		return;
+	}
+	case T_Q6_K: {
+		let h = off / 128;
+		let w = off % 128;
+		let quarter = w / 32;
+		let l = w % 32;
+		let a = rdw(p, b + 64 * h + l + 32 * (quarter & 1));
+		let c = rdw(p, b + 64 * h + l + 32 * (quarter & 1) + 4);
+		let ha = rdw(p, b + 128 + 32 * h + l);
+		let hc = rdw(p, b + 132 + 32 * h + l);
+		let dl = rdh(p, b + 208) * float(s8(rd8(p, b + 192 + 8 * h + l / 16 + 2 * quarter)));
+		let sh = quarter >= 2 ? 4u : 0u;
+		for (int k = 0; k < 8; ++k) {
+			let ql = (byte8(a, c, k) >> sh) & 15u;
+			let qh = (byte8(ha, hc, k) >> uint(2 * quarter)) & 3u;
+			v[k] = dl * (float(ql | (qh << 4)) - 32.0f);
+		}
+		return;
+	}
+	case T_IQ4_XS: {
+		let ib = off / 32;
+		let w = off % 32;
+		let ls = ((rd8(p, b + 4 + ib / 2) >> uint(4 * (ib % 2))) & 15u) | (((rd16(p, b + 2) >> uint(2 * ib)) & 3u) << 4);
+		let dl = rdh(p, b) * (float(ls) - 32.0f);
+		let a = rdw(p, b + 8 + 16 * ib + (w & 15));
+		let c = rdw(p, b + 12 + 16 * ib + (w & 15));
+		let sh = w >= 16 ? 4u : 0u;
+		for (int k = 0; k < 8; ++k) v[k] = dl * float(kvalue(t, (byte8(a, c, k) >> sh) & 15u));
+		return;
+	}
+	case T_IQ3_S: {
+		let ib = off / 32;
+		let l = (off % 32) / 8;
+		let qh = rd8(p, b + 66 + ib);
+		let g0 = t[W_IQ3S + int(rd8(p, b + 2 + 8 * ib + 2 * l) | ((qh << uint(8 - 2 * l)) & 256u))];
+		let g1 = t[W_IQ3S + int(rd8(p, b + 3 + 8 * ib + 2 * l) | ((qh << uint(7 - 2 * l)) & 256u))];
+		let sg = rd8(p, b + 74 + 4 * ib + l);
+		let db = rdh(p, b) * float(1 + 2 * int((rd8(p, b + 106 + ib / 2) >> uint(4 * (ib % 2))) & 15u));
+		for (int k = 0; k < 8; ++k) v[k] = db * float(byte8(g0, g1, k)) * ((sg & (1u << uint(k))) != 0u ? -1.0f : 1.0f);
+		return;
+	}
+	case T_IQ3_XXS: {
+		let ib = off / 32;
+		let l = (off % 32) / 8;
+		let aux = rd32(p, b + 66 + 4 * ib);
+		let g0 = t[W_IQ3XXS + int(rd8(p, b + 2 + 8 * ib + 2 * l))];
+		let g1 = t[W_IQ3XXS + int(rd8(p, b + 3 + 8 * ib + 2 * l))];
+		let sg = ksigns(t, (aux >> uint(7 * l)) & 127u);
+		let db = rdh(p, b) * (0.5f + float(aux >> 28)) * 0.5f;
+		for (int k = 0; k < 8; ++k) v[k] = db * float(byte8(g0, g1, k)) * ((sg & (1u << uint(k))) != 0u ? -1.0f : 1.0f);
+		return;
+	}
+	case T_IQ2_S: {
+		let ib = off / 32;
+		let l = (off % 32) / 8;
+		let gi = int(rd8(p, b + 2 + 4 * ib + l) | ((rd8(p, b + 66 + ib) << uint(8 - 2 * l)) & 768u));
+		let g0 = t[W_IQ2S + gi * 2];
+		let g1 = t[W_IQ2S + gi * 2 + 1];
+		let sg = rd8(p, b + 34 + 4 * ib + l);
+		let db = rdh(p, b) * (0.5f + float((rd8(p, b + 74 + ib) >> uint(4 * (l / 2))) & 15u)) * 0.25f;
+		for (int k = 0; k < 8; ++k) v[k] = db * float(byte8(g0, g1, k)) * ((sg & (1u << uint(k))) != 0u ? -1.0f : 1.0f);
+		return;
+	}
+	case T_IQ2_XS: {
+		let ib = off / 32;
+		let l = (off % 32) / 8;
+		let q = rd16(p, b + 2 + 2 * (4 * ib + l));
+		let gi = int(q & 511u);
+		let g0 = t[W_IQ2XS + gi * 2];
+		let g1 = t[W_IQ2XS + gi * 2 + 1];
+		let sg = ksigns(t, q >> 9);
+		let db = rdh(p, b) * (0.5f + float((rd8(p, b + 66 + ib) >> uint(4 * (l / 2))) & 15u)) * 0.25f;
+		for (int k = 0; k < 8; ++k) v[k] = db * float(byte8(g0, g1, k)) * ((sg & (1u << uint(k))) != 0u ? -1.0f : 1.0f);
+		return;
+	}
+	case T_IQ2_XXS: {
+		let ib = off / 32;
+		let l = (off % 32) / 8;
+		let a1 = rd32(p, b + 2 + 8 * ib + 4);
+		let gi = int(rd8(p, b + 2 + 8 * ib + l));
+		let g0 = t[W_IQ2XXS + gi * 2];
+		let g1 = t[W_IQ2XXS + gi * 2 + 1];
+		let sg = ksigns(t, (a1 >> uint(7 * l)) & 127u);
+		let db = rdh(p, b) * (0.5f + float(a1 >> 28)) * 0.25f;
+		for (int k = 0; k < 8; ++k) v[k] = db * float(byte8(g0, g1, k)) * ((sg & (1u << uint(k))) != 0u ? -1.0f : 1.0f);
+		return;
+	}
+	default:
+		for (int k = 0; k < 8; ++k) v[k] = dq(type, p, b, off + k, t);
+		return;
+	}
+}
+
 // out[r][c] = sum_i x[r][src(i)] * w[c][i], the weight row decoded in the shader. tiled: the
-// columns are in llama.cpp's tiled V-head order (heads x dim per v), the activation in grouped order (the Qwen3.5 linear-attention out_proj)
-struct GgufParams { uint* w; uint* tables; half* x; half* out_; int64_t row_bytes; int type; int m; int k; int n; int heads; int dim; };
+// columns are in llama.cpp's tiled V-head order (heads x dim per v), the activation in grouped order (the Qwen3.5 linear-attention out_proj). The
+// activations are read as 16-byte vectors (runs of 8 halves)
+struct GgufParams { uint* w; uint* tables; uint4* xv; half* out_; int64_t row_bytes; int type; int m; int k; int n; int heads; int dim; };
 
 int tiled_source(int i, int heads, int dim, int k) {
 	if (heads == 0) return i;
@@ -246,40 +405,121 @@ int tiled_source(int i, int heads, int dim, int k) {
 	return (head * (k / per_v) + v) * dim + d;
 }
 
-// A workgroup per output column and group of up to 8 activation rows: the threads stride over k (neighbouring threads read neighbouring
-// bytes of a block), each weight decoded once for all the group's rows, the partial sums reduced in shared memory
-static const int GEMV_THREADS = 128;
 static const int GEMV_ROWS = 8;
-groupshared float s_part[GEMV_ROWS][GEMV_THREADS];
+
+// A subgroup per output column (GEMV_SG_COLS of them per workgroup) and group of up to 8 activation rows: each lane decodes runs of 8
+// consecutive values (one 256-value block per pass of the subgroup; a run shares its block's scale and grid bytes), each weight once for all
+// the group's rows, the partial sums reduced across the subgroup. The lanes of a column are 32 consecutive invocations: one subgroup on a
+// 32-wide device
+static const int GEMV_SG_COLS = 4;
 
 [shader("compute")]
-[numthreads(GEMV_THREADS, 1, 1)]
-void gguf_gemv(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform GgufParams p) {
-	let c = int(gid.x);
+[numthreads(32 * GEMV_SG_COLS, 1, 1)]
+void gguf_gemv_sg(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform GgufParams p) {
+	let c = int(gid.x) * GEMV_SG_COLS + int(tid.x) / 32;
+	if (c >= p.n) return;   // the whole subgroup leaves together
+	let lane = int(tid.x) % 32;
 	let r0 = int(gid.y) * GEMV_ROWS;
-	let t = int(tid.x);
 	let rows = min(GEMV_ROWS, p.m - r0);
 	let be = block_elems(p.type);
 	let bb = block_bytes(p.type);
 	let row = int64_t(c) * p.row_bytes;
 	float acc[GEMV_ROWS];
 	for (int r = 0; r < GEMV_ROWS; ++r) acc[r] = 0.0f;
-	for (int i = t; i < p.k; i += GEMV_THREADS) {
-		let w = dq(p.type, p.w, row + int64_t(i / be) * bb, i % be, p.tables);
-		let src = tiled_source(i, p.heads, p.dim, p.k);
+	for (int i0 = lane * 8; i0 < p.k; i0 += 256) {
+		let blk = row + int64_t(i0 / be) * bb;
+		let off = i0 % be;
+		float wv[8];
+		dq8(p.type, p.w, blk, off, p.tables, wv);
+		// the run's 8 activations of a row are contiguous (the tiled order moves runs of dim, a multiple of 8): one 16-byte load
+		let src = tiled_source(i0, p.heads, p.dim, p.k);
 		for (int r = 0; r < GEMV_ROWS; ++r) {
-			if (r < rows) acc[r] = fma(float(p.x[int64_t(r0 + r) * p.k + src]), w, acc[r]);
+			if (r < rows) {
+				let xv = p.xv[(int64_t(r0 + r) * p.k + src) / 8];
+				float a = acc[r];
+				a = fma(f16tof32(xv.x & 0xffffu), wv[0], a);
+				a = fma(f16tof32(xv.x >> 16), wv[1], a);
+				a = fma(f16tof32(xv.y & 0xffffu), wv[2], a);
+				a = fma(f16tof32(xv.y >> 16), wv[3], a);
+				a = fma(f16tof32(xv.z & 0xffffu), wv[4], a);
+				a = fma(f16tof32(xv.z >> 16), wv[5], a);
+				a = fma(f16tof32(xv.w & 0xffffu), wv[6], a);
+				a = fma(f16tof32(xv.w >> 16), wv[7], a);
+				acc[r] = a;
+			}
 		}
 	}
-	for (int r = 0; r < GEMV_ROWS; ++r) s_part[r][t] = acc[r];
-	GroupMemoryBarrierWithGroupSync();
-	for (int s = GEMV_THREADS / 2; s > 0; s >>= 1) {
-		if (t < s) {
-			for (int r = 0; r < GEMV_ROWS; ++r) s_part[r][t] += s_part[r][t + s];
+	for (int r = 0; r < GEMV_ROWS; ++r) {
+		let s = WaveActiveSum(acc[r]);
+		if (lane == 0 && r < rows) p.out_[int64_t(r0 + r) * p.n + c] = half(s);
+	}
+}
+
+// More than 8 activation rows: a workgroup per tile of 64 columns x 64 rows, k in steps of 32. Each step decodes the 64 x 32 weight tile
+// into shared memory once (two runs of 8 per thread) and loads the 64 x 32 activation tile (one 16-byte load per run), then each thread
+// accumulates 4 columns x 8 rows from shared memory
+static const int GT_N = 64;
+static const int GT_M = 64;
+static const int GT_K = 32;
+groupshared float s_w[GT_K][GT_N + 4];
+groupshared float s_x[GT_K][GT_M + 4];
+
+[shader("compute")]
+[numthreads(128, 1, 1)]
+void gguf_gemm_tile(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform GgufParams p) {
+	let t = int(tid.x);
+	let c0 = int(gid.x) * GT_N;
+	let r0 = int(gid.y) * GT_M;
+	let be = block_elems(p.type);
+	let bb = block_bytes(p.type);
+	let tc = (t % 16) * 4;   // this thread's 4 columns
+	let tr = (t / 16) * 8;   // and 8 rows
+	float acc[8][4];
+	for (int r = 0; r < 8; ++r) {
+		for (int c = 0; c < 4; ++c) acc[r][c] = 0.0f;
+	}
+	for (int k0 = 0; k0 < p.k; k0 += GT_K) {
+		// the tiles: 64 columns (rows) x 4 runs of 8 values, two runs per thread
+		for (int q = 0; q < 2; ++q) {
+			let ri = t * 2 + q;
+			let lc = ri / 4;
+			let kr = (ri % 4) * 8;
+			let kk = k0 + kr;
+			float wv[8];
+			if (c0 + lc < p.n) dq8(p.type, p.w, int64_t(c0 + lc) * p.row_bytes + int64_t(kk / be) * bb, kk % be, p.tables, wv);
+			else {
+				for (int j = 0; j < 8; ++j) wv[j] = 0.0f;
+			}
+			for (int j = 0; j < 8; ++j) s_w[kr + j][lc] = wv[j];
+			uint4 xv = uint4(0u, 0u, 0u, 0u);
+			if (r0 + lc < p.m) xv = p.xv[(int64_t(r0 + lc) * p.k + tiled_source(kk, p.heads, p.dim, p.k)) / 8];
+			s_x[kr + 0][lc] = f16tof32(xv.x & 0xffffu);
+			s_x[kr + 1][lc] = f16tof32(xv.x >> 16);
+			s_x[kr + 2][lc] = f16tof32(xv.y & 0xffffu);
+			s_x[kr + 3][lc] = f16tof32(xv.y >> 16);
+			s_x[kr + 4][lc] = f16tof32(xv.z & 0xffffu);
+			s_x[kr + 5][lc] = f16tof32(xv.z >> 16);
+			s_x[kr + 6][lc] = f16tof32(xv.w & 0xffffu);
+			s_x[kr + 7][lc] = f16tof32(xv.w >> 16);
+		}
+		GroupMemoryBarrierWithGroupSync();
+		for (int kk = 0; kk < GT_K; ++kk) {
+			float w[4];
+			float x[8];
+			for (int c = 0; c < 4; ++c) w[c] = s_w[kk][tc + c];
+			for (int r = 0; r < 8; ++r) x[r] = s_x[kk][tr + r];
+			for (int r = 0; r < 8; ++r) {
+				for (int c = 0; c < 4; ++c) acc[r][c] = fma(x[r], w[c], acc[r][c]);
+			}
 		}
 		GroupMemoryBarrierWithGroupSync();
 	}
-	if (t < rows) p.out_[int64_t(r0 + t) * p.n + c] = half(s_part[t][0]);
+	for (int r = 0; r < 8; ++r) {
+		if (r0 + tr + r >= p.m) break;
+		for (int c = 0; c < 4; ++c) {
+			if (c0 + tc + c < p.n) p.out_[int64_t(r0 + tr + r) * p.n + c0 + tc + c] = half(acc[r][c]);
+		}
+	}
 }
 
 // out[e] = value e of the blocks, a thread per value

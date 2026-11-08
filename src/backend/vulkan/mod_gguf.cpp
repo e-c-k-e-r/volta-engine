@@ -96,7 +96,11 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	for ( int d = 0; d < x.ndim - 1; ++d ) m *= x.shape[d];
 	GgufParams p{ vki::dp( w ), vki::dp( tables() ), vki::dp( x.data ), vki::dp( out.data ), row_bytes( type, k ), static_cast<int>( type ), m, k, n,
 		tiling.heads, tiling.dim };
-	vki::launch( "gguf_gemv", p, stream, static_cast<uint32_t>( n ), static_cast<uint32_t>( ( m + 7 ) / 8 ) );   // gguf.slang: a workgroup per column and 8 rows
+	ENGINE_ASSERT( k % 8 == 0 && ( tiling.heads == 0 || tiling.dim % 8 == 0 ) && reinterpret_cast<uintptr_t>( x.data ) % 16 == 0,
+		"LinearGguf::forward (Vulkan): the activations are read in runs of 8 halves" );
+	// gguf.slang: up to 8 rows a subgroup per column (4 per workgroup), more a workgroup per 64 x 64 tile
+	if ( m > 8 ) vki::launch( "gguf_gemm_tile", p, stream, static_cast<uint32_t>( ( n + 63 ) / 64 ), static_cast<uint32_t>( ( m + 63 ) / 64 ) );
+	else vki::launch( "gguf_gemv_sg", p, stream, static_cast<uint32_t>( ( n + 3 ) / 4 ), static_cast<uint32_t>( ( m + 7 ) / 8 ) );
 }
 
 } // namespace engine::modules
