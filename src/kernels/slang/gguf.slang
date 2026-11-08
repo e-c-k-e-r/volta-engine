@@ -455,6 +455,305 @@ void gguf_gemv_sg(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform 
 	}
 }
 
+// Integer path (devices with packed int8 dot products). The activation rows quantized in blocks of 32 as llama.cpp's q8_1 does (d = amax / 127,
+// q = round(x / d), half away from zero), in the weight's column order: per block d (a float) and the 32 q packed in 8 words, 10 words
+static const int Q8_WORDS = 10;
+struct GgufQuantParams { uint4* xv; uint* xq; int m; int k; int heads; int dim; };
+
+[shader("compute")]
+[numthreads(128, 1, 1)]
+void gguf_quantize_q8(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform GgufQuantParams p) {
+	let blk = int(gid.x) * 128 + int(tid.x);
+	let r = int(gid.y);
+	if (blk * 32 >= p.k) return;
+	float v[32];
+	for (int q = 0; q < 4; ++q) {
+		let xv = p.xv[(int64_t(r) * p.k + tiled_source(blk * 32 + q * 8, p.heads, p.dim, p.k)) / 8];
+		v[q * 8 + 0] = f16tof32(xv.x & 0xffffu);
+		v[q * 8 + 1] = f16tof32(xv.x >> 16);
+		v[q * 8 + 2] = f16tof32(xv.y & 0xffffu);
+		v[q * 8 + 3] = f16tof32(xv.y >> 16);
+		v[q * 8 + 4] = f16tof32(xv.z & 0xffffu);
+		v[q * 8 + 5] = f16tof32(xv.z >> 16);
+		v[q * 8 + 6] = f16tof32(xv.w & 0xffffu);
+		v[q * 8 + 7] = f16tof32(xv.w >> 16);
+	}
+	float amax = 0.0f;
+	for (int i = 0; i < 32; ++i) amax = max(amax, abs(v[i]));
+	let d = amax / 127.0f;
+	let id = d != 0.0f ? 1.0f / d : 0.0f;
+	let o = (int64_t(r) * (p.k / 32) + blk) * Q8_WORDS;
+	p.xq[o] = asuint(d);
+	for (int w = 0; w < 8; ++w) {
+		uint packed = 0u;
+		for (int j = 0; j < 4; ++j) {
+			let x = v[w * 4 + j] * id;
+			let q = int(sign(x) * floor(abs(x) + 0.5f));
+			packed |= (uint(q) & 255u) << (8u * uint(j));
+		}
+		p.xq[o + 2 + w] = packed;
+	}
+}
+
+// Word sources for the integer decoders (the blocks, the tables)
+interface IWords { uint at(int i); }
+struct GWords : IWords { uint* p; uint at(int i) { return p[i]; } }
+static const int GEMV_SG_COLS_DOT = 4;
+
+uint wrd8<W : IWords>(W p, int off) { return (p.at(off >> 2) >> (8u * uint(off & 3))) & 255u; }
+uint wrdw<W : IWords>(W p, int off) {
+	let s = uint(off & 3) * 8u;
+	let lo = p.at(off >> 2);
+	return s == 0u ? lo : (lo >> s) | (p.at((off >> 2) + 1) << (32u - s));
+}
+uint wrd16<W : IWords>(W p, int off) { return wrdw(p, off) & 0xffffu; }
+uint wrd32<W : IWords>(W p, int off) { return wrdw(p, off); }
+float wrdh<W : IWords>(W p, int off) { return f16tof32(wrd16(p, off)); }
+void wscale_min_k4<W : IWords>(W p, int s, int j, out float sc, out float mn) {
+	if (j < 4) {
+		sc = float(wrd8(p, s + j) & 63u);
+		mn = float(wrd8(p, s + j + 4) & 63u);
+	} else {
+		sc = float((wrd8(p, s + j + 4) & 15u) | ((wrd8(p, s + j - 4) >> 6) << 4));
+		mn = float((wrd8(p, s + j + 4) >> 4) | ((wrd8(p, s + j) >> 6) << 4));
+	}
+}
+
+struct GTab : IWords { uint* t; uint at(int i) { return t[i]; } }
+uint wksigns<T : IWords>(T t, uint i) { return (t.at(W_KSIGNS + int(i >> 2)) >> (8u * (i & 3u))) & 255u; }
+int wkvalue<T : IWords>(T t, uint i) { return s8((t.at(W_KVAL + int(i >> 2)) >> (8u * (i & 3u))) & 255u); }
+
+// Bytes 0xff where bit j (0..3) of bits is set
+uint sign_mask4(uint bits) { return (((bits & 15u) * 0x00204081u) & 0x01010101u) * 255u; }
+// The bytes of g (each 1..127) negated where the mask has 0xff (no byte is 0, so ~g + 1 never carries into the next byte)
+uint neg_bytes(uint g, uint m) { return (g ^ m) + (m & 0x01010101u); }
+
+// Values off .. off + 7 of the block at byte offset b as two words of signed bytes (a, c) and a scale and offset: value j = sc * q_j - mn.
+// False for types without an integer run decoder
+bool dq8i<W : IWords, T : IWords>(int type, W p, int b, int off, T t, out uint a, out uint c, out float sc, out float mn) {
+	a = 0u;
+	c = 0u;
+	sc = 0.0f;
+	mn = 0.0f;
+	switch (type) {
+	case T_Q8_0: {
+		a = wrdw(p, b + 2 + off);
+		c = wrdw(p, b + 6 + off);
+		sc = wrdh(p, b);
+		return true;
+	}
+	case T_Q2_K: {
+		let h = off / 128;
+		let w = off % 128;
+		let j = w / 32;
+		let l = w % 32;
+		a = (wrdw(p, b + 16 + 32 * h + l) >> uint(2 * j)) & 0x03030303u;
+		c = (wrdw(p, b + 20 + 32 * h + l) >> uint(2 * j)) & 0x03030303u;
+		let s = wrd8(p, b + 8 * h + 2 * j + (l >= 16 ? 1 : 0));
+		sc = wrdh(p, b + 80) * float(s & 15u);
+		mn = wrdh(p, b + 82) * float(s >> 4);
+		return true;
+	}
+	case T_Q3_K: {
+		let h = off / 128;
+		let w = off % 128;
+		let j = w / 32;
+		let l = w % 32;
+		let is = 8 * h + 2 * j + (l >= 16 ? 1 : 0);
+		let lo = (wrd8(p, b + 96 + (is & 7)) >> (is >= 8 ? 4u : 0u)) & 15u;
+		let hi = (wrd8(p, b + 96 + 8 + (is & 3)) >> uint(2 * (is >> 2))) & 3u;
+		sc = wrdh(p, b + 108) * float(int(lo | (hi << 4)) - 32);
+		mn = 4.0f * sc;   // q - (hmask ? 0 : 4) = (q | hmask << 2) - 4
+		let sh = uint(4 * h + j);
+		a = ((wrdw(p, b + 32 + 32 * h + l) >> uint(2 * j)) & 0x03030303u) | (((wrdw(p, b + l) >> sh) & 0x01010101u) << 2);
+		c = ((wrdw(p, b + 36 + 32 * h + l) >> uint(2 * j)) & 0x03030303u) | (((wrdw(p, b + 4 + l) >> sh) & 0x01010101u) << 2);
+		return true;
+	}
+	case T_Q4_K: {
+		let j = off / 64;
+		let w = off % 64;
+		float s;
+		float m;
+		wscale_min_k4(p, b + 4, 2 * j + (w >= 32 ? 1 : 0), s, m);
+		sc = wrdh(p, b) * s;
+		mn = wrdh(p, b + 2) * m;
+		let sh = w >= 32 ? 4u : 0u;
+		a = (wrdw(p, b + 16 + 32 * j + (w & 31)) >> sh) & 0x0f0f0f0fu;
+		c = (wrdw(p, b + 20 + 32 * j + (w & 31)) >> sh) & 0x0f0f0f0fu;
+		return true;
+	}
+	case T_Q6_K: {
+		let h = off / 128;
+		let w = off % 128;
+		let quarter = w / 32;
+		let l = w % 32;
+		let sh = quarter >= 2 ? 4u : 0u;
+		let lb = b + 64 * h + l + 32 * (quarter & 1);
+		a = ((wrdw(p, lb) >> sh) & 0x0f0f0f0fu) | (((wrdw(p, b + 128 + 32 * h + l) >> uint(2 * quarter)) & 0x03030303u) << 4);
+		c = ((wrdw(p, lb + 4) >> sh) & 0x0f0f0f0fu) | (((wrdw(p, b + 132 + 32 * h + l) >> uint(2 * quarter)) & 0x03030303u) << 4);
+		sc = wrdh(p, b + 208) * float(s8(wrd8(p, b + 192 + 8 * h + l / 16 + 2 * quarter)));
+		mn = 32.0f * sc;
+		return true;
+	}
+	case T_IQ4_XS: {
+		let ib = off / 32;
+		let w = off % 32;
+		let ls = ((wrd8(p, b + 4 + ib / 2) >> uint(4 * (ib % 2))) & 15u) | (((wrd16(p, b + 2) >> uint(2 * ib)) & 3u) << 4);
+		sc = wrdh(p, b) * (float(ls) - 32.0f);
+		let sh = w >= 16 ? 4u : 0u;
+		let qa = wrdw(p, b + 8 + 16 * ib + (w & 15)) >> sh;
+		let qc = wrdw(p, b + 12 + 16 * ib + (w & 15)) >> sh;
+		for (int j = 0; j < 4; ++j) {
+			a |= (uint(wkvalue(t, (qa >> uint(8 * j)) & 15u)) & 255u) << uint(8 * j);
+			c |= (uint(wkvalue(t, (qc >> uint(8 * j)) & 15u)) & 255u) << uint(8 * j);
+		}
+		return true;
+	}
+	case T_IQ3_S: {
+		let ib = off / 32;
+		let l = (off % 32) / 8;
+		let qh = wrd8(p, b + 66 + ib);
+		let g0 = t.at(W_IQ3S + int(wrd8(p, b + 2 + 8 * ib + 2 * l) | ((qh << uint(8 - 2 * l)) & 256u)));
+		let g1 = t.at(W_IQ3S + int(wrd8(p, b + 3 + 8 * ib + 2 * l) | ((qh << uint(7 - 2 * l)) & 256u)));
+		let sg = wrd8(p, b + 74 + 4 * ib + l);
+		a = neg_bytes(g0, sign_mask4(sg));
+		c = neg_bytes(g1, sign_mask4(sg >> 4));
+		sc = wrdh(p, b) * float(1 + 2 * int((wrd8(p, b + 106 + ib / 2) >> uint(4 * (ib % 2))) & 15u));
+		return true;
+	}
+	case T_IQ3_XXS: {
+		let ib = off / 32;
+		let l = (off % 32) / 8;
+		let aux = wrd32(p, b + 66 + 4 * ib);
+		let g0 = t.at(W_IQ3XXS + int(wrd8(p, b + 2 + 8 * ib + 2 * l)));
+		let g1 = t.at(W_IQ3XXS + int(wrd8(p, b + 3 + 8 * ib + 2 * l)));
+		let sg = wksigns(t, (aux >> uint(7 * l)) & 127u);
+		a = neg_bytes(g0, sign_mask4(sg));
+		c = neg_bytes(g1, sign_mask4(sg >> 4));
+		sc = wrdh(p, b) * (0.5f + float(aux >> 28)) * 0.5f;
+		return true;
+	}
+	case T_IQ2_S: {
+		let ib = off / 32;
+		let l = (off % 32) / 8;
+		let gi = int(wrd8(p, b + 2 + 4 * ib + l) | ((wrd8(p, b + 66 + ib) << uint(8 - 2 * l)) & 768u));
+		let sg = wrd8(p, b + 34 + 4 * ib + l);
+		a = neg_bytes(t.at(W_IQ2S + gi * 2), sign_mask4(sg));
+		c = neg_bytes(t.at(W_IQ2S + gi * 2 + 1), sign_mask4(sg >> 4));
+		sc = wrdh(p, b) * (0.5f + float((wrd8(p, b + 74 + ib) >> uint(4 * (l / 2))) & 15u)) * 0.25f;
+		return true;
+	}
+	case T_IQ2_XS: {
+		let ib = off / 32;
+		let l = (off % 32) / 8;
+		let q = wrd16(p, b + 2 + 2 * (4 * ib + l));
+		let gi = int(q & 511u);
+		let sg = wksigns(t, q >> 9);
+		a = neg_bytes(t.at(W_IQ2XS + gi * 2), sign_mask4(sg));
+		c = neg_bytes(t.at(W_IQ2XS + gi * 2 + 1), sign_mask4(sg >> 4));
+		sc = wrdh(p, b) * (0.5f + float((wrd8(p, b + 66 + ib) >> uint(4 * (l / 2))) & 15u)) * 0.25f;
+		return true;
+	}
+	case T_IQ2_XXS: {
+		let ib = off / 32;
+		let l = (off % 32) / 8;
+		let a1 = wrd32(p, b + 2 + 8 * ib + 4);
+		let gi = int(wrd8(p, b + 2 + 8 * ib + l));
+		let sg = wksigns(t, (a1 >> uint(7 * l)) & 127u);
+		a = neg_bytes(t.at(W_IQ2XXS + gi * 2), sign_mask4(sg));
+		c = neg_bytes(t.at(W_IQ2XXS + gi * 2 + 1), sign_mask4(sg >> 4));
+		sc = wrdh(p, b) * (0.5f + float(a1 >> 28)) * 0.25f;
+		return true;
+	}
+	default: return false;
+	}
+}
+
+// gguf_gemv_sg on the q8 activation rows: each run of 8 is two packed int8 dot products against the run's integer weights, scaled by
+// the run's scale and the activation block's d, less the run's offset times the activations' sum (one more dot product each). Per pass
+// the subgroup of a column copies the column's next 1024 values of blocks into shared memory (coalesced word loads), then each lane
+// decodes its 32 values (four runs) from there. The columns of a workgroup run the same passes (the barriers), a missing one idles
+// One SPIR-V per block type (-DGGUF_T=<ggml type>): the type a compile-time constant, its decoder alone in the kernel
+#ifdef GGUF_T
+#define GGUF_TYPE(p) GGUF_T
+#else
+#define GGUF_TYPE(p) (p).type
+#endif
+
+// gguf_gemv_sg on the q8 activation rows: each run of 8 is two packed int8 dot products against the run's integer weights, scaled by
+// the run's scale and the activation block's d, less the run's offset times the activations' sum (one more dot product each). A lane
+// takes 32 values (four runs) per pass, the blocks read in place
+struct GgufDotParams { uint* w; uint* tables; uint* xq; half* out_; int64_t row_bytes; int type; int m; int k; int n; };
+
+[shader("compute")]
+[numthreads(32 * GEMV_SG_COLS_DOT, 1, 1)]
+void gguf_gemv_dot(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform GgufDotParams p) {
+	GTab st;
+	st.t = p.tables;
+	let lane = int(tid.x) % 32;
+	let r0 = int(gid.y) * GEMV_ROWS;
+	let rows = min(GEMV_ROWS, p.m - r0);
+	let type = GGUF_TYPE(p);
+	let be = block_elems(type);
+	let bb = block_bytes(type);
+	let kb = p.k / 32;
+	{
+		let c = int(gid.x) * GEMV_SG_COLS_DOT + int(tid.x) / 32;
+		if (c >= p.n) return;   // the whole subgroup leaves together
+		let row = int64_t(c) * p.row_bytes;
+		float acc[GEMV_ROWS];
+		for (int r = 0; r < GEMV_ROWS; ++r) acc[r] = 0.0f;
+		for (int i32 = lane * 32; i32 < p.k; i32 += 1024) {
+			// the words from the 32 values' first block on, read in place through 32-bit offsets
+			let b0 = i32 / be;
+			let start = row + int64_t(b0) * bb;
+			GWords gw;
+			gw.p = p.w + (start >> 2);
+			for (int q4 = 0; q4 < 4; ++q4) {
+				let i0 = i32 + q4 * 8;
+				let lb = (i0 / be - b0) * bb + int(start & 3);
+				let off = i0 % be;
+				let qo = (i0 / 32) * Q8_WORDS + 2 + (i0 % 32) / 4;
+				uint wa;
+				uint wc;
+				float sc;
+				float mn;
+				if (dq8i(type, gw, lb, off, st, wa, wc, sc, mn)) {
+					for (int r = 0; r < GEMV_ROWS; ++r) {
+						if (r < rows) {
+							let xo = (r0 + r) * kb * Q8_WORDS;
+							let xa = p.xq[xo + qo];
+							let xc = p.xq[xo + qo + 1];
+							let d = asfloat(p.xq[xo + (i0 / 32) * Q8_WORDS]);
+							let dotw = dot4add_i8packed(wa, xa, dot4add_i8packed(wc, xc, 0));
+							let dots = dot4add_i8packed(0x01010101u, xa, dot4add_i8packed(0x01010101u, xc, 0));
+							acc[r] = fma(d, sc * float(dotw) - mn * float(dots), acc[r]);
+						}
+					}
+				} else {
+					float wv[8];
+					dq8(type, p.w, row + int64_t(i0 / be) * bb, off, p.tables, wv);
+					for (int r = 0; r < GEMV_ROWS; ++r) {
+						if (r < rows) {
+							let xo = (r0 + r) * kb * Q8_WORDS;
+							let xa = p.xq[xo + qo];
+							let xc = p.xq[xo + qo + 1];
+							let d = asfloat(p.xq[xo + (i0 / 32) * Q8_WORDS]);
+							float sum = 0.0f;
+							for (int j = 0; j < 8; ++j) sum = fma(wv[j], float(s8(byte8(xa, xc, j))), sum);
+							acc[r] = fma(d, sum, acc[r]);
+						}
+					}
+				}
+			}
+		}
+		for (int r = 0; r < GEMV_ROWS; ++r) {
+			let s = WaveActiveSum(acc[r]);
+			if (lane == 0 && r < rows) p.out_[int64_t(r0 + r) * p.n + c] = half(s);
+		}
+	}
+}
+
 // More than 8 activation rows: a workgroup per tile of 64 columns x 64 rows, k in steps of 32. Each step decodes the 64 x 32 weight tile
 // into shared memory once (two runs of 8 per thread) and loads the 64 x 32 activation tile (one 16-byte load per run), then each thread
 // accumulates 4 columns x 8 rows from shared memory
@@ -533,3 +832,4 @@ void gguf_dequant(uint3 gid : SV_DispatchThreadID, uniform GgufDequantParams p) 
 	let be = block_elems(p.type);
 	p.out_[e] = half(dq(p.type, p.w, (e / be) * block_bytes(p.type), int(e % be), p.tables));
 }
+

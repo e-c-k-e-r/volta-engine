@@ -13,6 +13,8 @@ struct Pipeline;
 bool available();
 const char* device_name();
 uint32_t max_push_constants_bytes();
+// Packed 4 x int8 dot products (VK_KHR_shader_integer_dot_product) are enabled on the current device
+bool int_dot();
 
 // SPIR-V file (entry point "main"); push_bytes = sizeof( Params ), at most max_push_constants_bytes(). nullptr on failure
 Pipeline* pipeline_create( const char* spv_path, uint32_t push_bytes );

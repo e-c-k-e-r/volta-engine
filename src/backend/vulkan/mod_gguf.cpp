@@ -7,6 +7,7 @@
 
 #include "mod_common.h"
 #include "engine/backend/runtime.h"
+#include "engine/core/batch.h"
 #include "engine/modules/gguf.h"
 #include <cstring>
 #include <mutex>
@@ -18,6 +19,8 @@ namespace {
 namespace vki = ::engine::backend::impl;
 
 struct GgufParams { uint64_t w, tables, x, out_; int64_t row_bytes; int type, m, k, n, heads, dim; };
+struct GgufQuantParams { uint64_t xv, xq; int m, k, heads, dim; };
+struct GgufDotParams { uint64_t w, tables, xq, out_; int64_t row_bytes; int type, m, k, n; };
 struct GgufDequantParams { uint64_t w, tables, out_; int64_t elems; int type; };
 
 const void* tables() {
@@ -69,6 +72,12 @@ int64_t row_bytes( GgmlType t, int k ) {
 	}
 }
 
+// The q8 activation rows of the integer path (gguf.slang: 10 words per 32 values), sized at prepare for the most rows and the widest k so a
+// captured decode graph never sees it move
+constexpr int kDotMaxRows = pod::MAX_BATCH, kDotMaxK = 65536;
+constexpr size_t kDotBytes = static_cast<size_t>( kDotMaxRows ) * ( kDotMaxK / 32 ) * 40;
+void* dot_scratch( backend::stream_t stream ) { return vki::scratch( 16, kDotBytes, stream ); }
+
 } // namespace
 
 bool gguf_linear_supported( GgmlType type ) {
@@ -81,7 +90,10 @@ bool gguf_linear_supported( GgmlType type ) {
 	}
 }
 
-void LinearGguf::prepare() { (void) tables(); }
+void LinearGguf::prepare() {
+	(void) tables();
+	if ( backend::vk::int_dot() ) (void) dot_scratch( nullptr );
+}
 
 void LinearGguf::dequant( const void* w, GgmlType type, int64_t elems, backend::half_t* out, backend::stream_t stream ) {
 	ENGINE_ASSERT( gguf_linear_supported( type ), "LinearGguf::dequant (Vulkan): unsupported block type" );
@@ -98,8 +110,23 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 		tiling.heads, tiling.dim };
 	ENGINE_ASSERT( k % 8 == 0 && ( tiling.heads == 0 || tiling.dim % 8 == 0 ) && reinterpret_cast<uintptr_t>( x.data ) % 16 == 0,
 		"LinearGguf::forward (Vulkan): the activations are read in runs of 8 halves" );
-	// gguf.slang: up to 8 rows a subgroup per column (4 per workgroup), more a workgroup per 64 x 64 tile
-	if ( m > 8 ) vki::launch( "gguf_gemm_tile", p, stream, static_cast<uint32_t>( ( n + 63 ) / 64 ), static_cast<uint32_t>( ( m + 63 ) / 64 ) );
+	// gguf.slang: up to 16 rows on a device with int8 dot products the q8 rows against the integer weights, a subgroup per column (4 per
+	// workgroup); otherwise up to 8 rows the same with FP16 activations, more a workgroup per 64 x 64 tile
+	if ( m <= kDotMaxRows && backend::vk::int_dot() ) {
+		ENGINE_ASSERT( k <= kDotMaxK, "LinearGguf::forward (Vulkan): k beyond the q8 activation scratch" );
+		void* xq = dot_scratch( stream );
+		GgufQuantParams q{ vki::dp( x.data ), vki::dp( xq ), m, k, tiling.heads, tiling.dim };
+		vki::launch( "gguf_quantize_q8", q, stream, static_cast<uint32_t>( ( k / 32 + 127 ) / 128 ), static_cast<uint32_t>( m ) );
+		GgufDotParams d{ vki::dp( w ), vki::dp( tables() ), vki::dp( xq ), vki::dp( out.data ), row_bytes( type, k ), static_cast<int>( type ), m, k, n };
+		static const char* const names[32] = { nullptr, nullptr, "gguf_gemv_dot_2", "gguf_gemv_dot_3", nullptr, nullptr, "gguf_gemv_dot_6", "gguf_gemv_dot_7",
+			"gguf_gemv_dot_8", nullptr, "gguf_gemv_dot_10", "gguf_gemv_dot_11", "gguf_gemv_dot_12", "gguf_gemv_dot_13", "gguf_gemv_dot_14", nullptr,
+			"gguf_gemv_dot_16", "gguf_gemv_dot_17", "gguf_gemv_dot_18", "gguf_gemv_dot_19", "gguf_gemv_dot_20", "gguf_gemv_dot_21", "gguf_gemv_dot_22",
+			"gguf_gemv_dot_23", nullptr, nullptr, nullptr, nullptr, nullptr, "gguf_gemv_dot_29", nullptr, nullptr };
+		const int ti = static_cast<int>( type );
+		ENGINE_ASSERT( ti >= 0 && ti < 32 && names[ti] != nullptr, "LinearGguf::forward (Vulkan): no integer kernel for this block type" );
+		vki::launch( names[ti], d, stream, static_cast<uint32_t>( ( n + 3 ) / 4 ), static_cast<uint32_t>( ( m + 7 ) / 8 ) );
+	}
+	else if ( m > 8 ) vki::launch( "gguf_gemm_tile", p, stream, static_cast<uint32_t>( ( n + 63 ) / 64 ), static_cast<uint32_t>( ( m + 63 ) / 64 ) );
 	else vki::launch( "gguf_gemv_sg", p, stream, static_cast<uint32_t>( ( n + 3 ) / 4 ), static_cast<uint32_t>( ( m + 7 ) / 8 ) );
 }
 

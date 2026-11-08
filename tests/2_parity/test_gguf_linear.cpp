@@ -127,6 +127,10 @@ int main( int argc, char** argv ) {
 #if defined(ENGINE_BACKEND_CPU)
 		const double full_bound = sum_offset ? 3e-2 : 1e-2;
 		const double gemm_bound = sum_offset ? 3e-2 : 1.5e-2;
+#elif defined(ENGINE_BACKEND_VULKAN)
+		// Vulkan: up to 16 rows quantized to q8 for the int8 dot products (on a device that has them), the GEMV's bound; more rows FP16
+		const double full_bound = sum_offset ? 3e-2 : 1e-2;
+		const double gemm_bound = 5e-3;
 #else
 		const double full_bound = 5e-3, gemm_bound = full_bound;
 #endif

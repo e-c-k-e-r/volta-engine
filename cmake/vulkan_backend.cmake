@@ -73,12 +73,21 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 		COMMENT "slangc nvfp4_gemm -> spirv")
 	list(APPEND VK_FLASH_SPV ${SLANG_OUT}/nvfp4_gemm.spv)
 	# GGUF block weights (src/kernels/slang/gguf.slang)
-	foreach(entry gguf_gemv_sg gguf_gemm_tile gguf_dequant)
+	foreach(entry gguf_gemv_sg gguf_quantize_q8 gguf_gemm_tile gguf_dequant)
 		set(sout ${SLANG_OUT}/${entry}.spv)
 		add_custom_command(OUTPUT ${sout}
 			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/gguf.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
 			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/gguf.slang
 			COMMENT "slangc ${entry} -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
+	# the integer GEMV once per block type (gguf.slang GGUF_T)
+	foreach(t 2 3 6 7 8 10 11 12 13 14 16 17 18 19 20 21 22 23 29)
+		set(sout ${SLANG_OUT}/gguf_gemv_dot_${t}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/gguf.slang -target spirv -stage compute -entry gguf_gemv_dot -DENGINE_TARGET_CPU=0 -DGGUF_T=${t} ${GGUF_DOT_FLAGS} -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/gguf.slang
+			COMMENT "slangc gguf_gemv_dot (type ${t}) -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
 	add_custom_target(flash_spv DEPENDS ${VK_FLASH_SPV})
@@ -113,6 +122,10 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	add_dependencies(test_mtp slang_kernels)
 
 	# GGUF block types against the ggml fixtures (tests/tools/gguf_fixtures.py), same source as the CUDA and CPU builds
+	add_executable(bench_gguf_shapes tests/3_bench/bench_gguf_shapes.cpp ${ENGINE_VK_OBJECTS})
+	target_link_libraries(bench_gguf_shapes PRIVATE engine_backend_vulkan pthread)
+	add_dependencies(bench_gguf_shapes slang_kernels)
+	set_target_properties(bench_gguf_shapes PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 	add_executable(test_gguf_linear tests/2_parity/test_gguf_linear.cpp ${ENGINE_VK_OBJECTS})
 	target_link_libraries(test_gguf_linear PRIVATE engine_backend_vulkan pthread)
 	add_dependencies(test_gguf_linear slang_kernels)

@@ -43,6 +43,7 @@ struct Ctx {
 	VkCommandPool pool = VK_NULL_HANDLE;
 	VkPhysicalDeviceMemoryProperties mem{};
 	VkPhysicalDeviceProperties props{};
+	bool int_dot = false;   // shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product) enabled: packed 4 x int8 dot products
 	bool rte16 = false;   // shaderRoundingModeRTEFloat16: float -> half conversions can be made round-to-nearest-even
 	std::map<uint64_t, Alloc> allocs; // keyed by device address
 	uint64_t allocated = 0;           // bytes in allocs
@@ -133,13 +134,25 @@ bool init_context( int dev ) {
 	}
 
 	// Feature requirements of the Slang SPIR-V: PhysicalStorageBufferAddresses, Float16, Int64 (+ Int16 for the BF16 table)
-	VkPhysicalDeviceVulkan11Features f11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
+	bool has_dot_ext = false;
+	{
+		uint32_t en = 0;
+		vkEnumerateDeviceExtensionProperties( g.phys, nullptr, &en, nullptr );
+		std::vector<VkExtensionProperties> ext( en );
+		vkEnumerateDeviceExtensionProperties( g.phys, nullptr, &en, ext.data() );
+		for ( const auto& e : ext ) has_dot_ext = has_dot_ext || std::strcmp( e.extensionName, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME ) == 0;
+	}
+	VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR fdot{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR };
+	VkPhysicalDeviceVulkan11Features f11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, has_dot_ext ? &fdot : nullptr };
 	VkPhysicalDeviceVulkan12Features f12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f11 };
 	VkPhysicalDeviceFeatures2 f2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12 };
 	vkGetPhysicalDeviceFeatures2( g.phys, &f2 );
 	if ( !f12.bufferDeviceAddress || !f12.shaderFloat16 || !f12.timelineSemaphore || !f2.features.shaderInt64 ) return false;
 
-	VkPhysicalDeviceVulkan11Features want11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
+	g.int_dot = has_dot_ext && fdot.shaderIntegerDotProduct == VK_TRUE;
+	VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR want_dot{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR };
+	want_dot.shaderIntegerDotProduct = VK_TRUE;
+	VkPhysicalDeviceVulkan11Features want11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, g.int_dot ? &want_dot : nullptr };
 	want11.storageBuffer16BitAccess = f11.storageBuffer16BitAccess;
 	want11.uniformAndStorageBuffer16BitAccess = f11.uniformAndStorageBuffer16BitAccess;
 	VkPhysicalDeviceVulkan12Features want12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &want11 };
@@ -171,6 +184,11 @@ bool init_context( int dev ) {
 	VkDeviceCreateInfo dci{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &want2 };
 	dci.queueCreateInfoCount = 1;
 	dci.pQueueCreateInfos = &qci;
+	const char* dot_ext = VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
+	if ( g.int_dot ) {
+		dci.enabledExtensionCount = 1;
+		dci.ppEnabledExtensionNames = &dot_ext;
+	}
 	if ( vkCreateDevice( g.phys, &dci, nullptr, &g.device ) != VK_SUCCESS ) return false;
 	vkGetDeviceQueue( g.device, g.family, 0, &g.queue );
 
@@ -608,6 +626,7 @@ bool available() {
 }
 const char* device_name() { return ctx().props.deviceName; }
 uint32_t max_push_constants_bytes() { return ctx().props.limits.maxPushConstantsSize; }
+bool int_dot() { return ctx().int_dot; }
 
 Pipeline* pipeline_create( const char* spv_path, uint32_t push_bytes ) {
 	ctx();
