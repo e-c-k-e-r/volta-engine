@@ -1,0 +1,2 @@
+ca89968a23a13e571a6b802a9891d22763153b61 2026-11-06
+ggml.h, gguf.h, ggml-backend.h, ggml-alloc.h, ggml-cpu.h, ggml-impl.h, ggml-common.h, ggml-quants.c/.h and ggml-cpu/{quants.c, quants.h, ggml-cpu-impl.h, simd-mappings.h, vec.h, arch-fallback.h, arch/x86/quants.c} from llama.cpp (MIT, see LICENSE), commit above, unchanged; the runtime symbols they use come from ../ggml_shim.c

@@ -1,6 +1,8 @@
 // End-to-end single-rank (tp=1) model forward, cross-backend: `--dump <dir>` (CUDA build) runs a short prefill and writes the last
 // row's logits; `--check <dir>` (any build, in particular CPU) repeats it and compares against the golden file (tier 2 tolerance,
 // plus argmax equality). Model directory from argv `--model <dir>` (default: the Qwen EXL3 checkpoint) and `--type <model_type>` (default qwen3_5).
+// --cos 0.999 for GGUF weights: llama.cpp's CPU kernels quantize the activations to q8_K and its CUDA ones to q8_1, so the logits round apart
+// (the argmax and the decoded tokens must still match).
 // ENGINE_TP overrides the single rank (a checkpoint too big for one GPU, e.g. Flash-Next, is dumped from a CUDA tp=4 build).
 #include "engine/runtime/test_paths.h"
 #include "engine/runtime/cluster.h"
@@ -18,15 +20,17 @@ int main( int argc, char** argv ) {
 	const char* model_dir = engine::runtime::test::model_path( "ENGINE_TEST_QWEN_DIR" );
 	const char* model_type = "qwen3_5";
 	int steps = 0;
+	double min_cos = 0.9999;   // --cos: the logits' bound for paths that round differently per backend (GGUF: q8_K activations on CPU, q8_1 on CUDA)
 	int ntokens = 4;
 	for ( int i = 1; i + 1 < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--model" ) ) model_dir = argv[i + 1];
 		if ( !std::strcmp( argv[i], "--type" ) ) model_type = argv[i + 1];
 		if ( !std::strcmp( argv[i], "--steps" ) ) steps = std::atoi( argv[i + 1] );
 		if ( !std::strcmp( argv[i], "--tokens" ) ) ntokens = std::atoi( argv[i + 1] );
+		if ( !std::strcmp( argv[i], "--cos" ) ) min_cos = std::atof( argv[i + 1] );
 	}
 	if ( !args.dump && !args.check ) {
-		std::printf( "usage: test_cpu_forward --dump|--check <dir> [--model <dir>] [--type <model_type>] [--steps <greedy decode steps after the prefill>] [--tokens <prompt length, default 4>]\n" );
+		std::printf( "usage: test_cpu_forward --dump|--check <dir> [--model <dir>] [--type <model_type>] [--steps <greedy decode steps after the prefill>] [--tokens <prompt length, default 4>] [--cos <logits bound, default 0.9999>]\n" );
 		return 2;
 	}
 	::setenv( "ENGINE_TP", "1", 0 );
@@ -85,7 +89,7 @@ int main( int argc, char** argv ) {
 		std::memcpy( ref.data(), raw_l.data(), MIN( raw_l.size(), ref.size() * sizeof( float ) ) );
 		int ref_pred = 0;
 		std::memcpy( &ref_pred, raw_p.data(), sizeof( ref_pred ) );
-		ok = golden_compare( "logits", ref, logits );
+		ok = golden_compare( "logits", ref, logits, min_cos, min_cos < 0.9999 ? 0.06 : 0.005 );
 		const bool same = ( ref_pred == pred );
 		std::printf( "  argmax %d vs golden %d  %s\n", pred, ref_pred, same ? "PASS" : "FAIL" );
 		ok = ok && same;

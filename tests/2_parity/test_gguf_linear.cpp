@@ -116,7 +116,14 @@ int main( int argc, char** argv ) {
 		// their bound is 3e-2. The tile kernel and the GEMM read FP16 activations and the exactly dequantized weight: FP16 rounding only
 		const bool sum_offset = type == modules::GgmlType::Q4_0 || type == modules::GgmlType::Q4_1 || type == modules::GgmlType::Q5_0 ||
 			type == modules::GgmlType::Q5_1 || type == modules::GgmlType::IQ1_S || type == modules::GgmlType::IQ1_M;
-		const bool ok = worst_gemv < ( sum_offset ? 3e-2 : 1e-2 ) && worst_tile < 5e-3 && worst_gemm < 5e-3;
+		// The CPU backend (llama.cpp's CPU kernels) quantizes the activations at every row count (q8_0, q8_1 or q8_K by type): there the 9-16 and
+		// 20-row products meet the exact one at the GEMV's bound
+#if defined(ENGINE_BACKEND_CPU)
+		const double full_bound = sum_offset ? 3e-2 : 1e-2;
+#else
+		const double full_bound = 5e-3;
+#endif
+		const bool ok = worst_gemv < ( sum_offset ? 3e-2 : 1e-2 ) && worst_tile < full_bound && worst_gemm < full_bound;
 		std::printf( "  %-8s n %d k %d: 1-8 rows vs q8_1 reference %.2e, 9-16 rows vs exact %.2e, 20 rows (GEMM) vs exact %.2e  %s\n",
 			modules::ggml_type_name( type ), f.n, f.k, worst_gemv, worst_tile, worst_gemm, ok ? "PASS" : "FAIL" );
 		fails += ok ? 0 : 1;

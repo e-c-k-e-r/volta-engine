@@ -17,7 +17,7 @@
 //   golden_rng:   deterministic LCG (same sequence everywhere)
 //   golden_write: <dir>/<name>.bin, raw bytes
 //   golden_read:  false when the file is missing
-//   golden_compare: tier 2 tolerance (cos >= 0.9999, max|d| <= 0.005 * max + 1e-3) on float data
+//   golden_compare: tier 2 tolerance (cos >= 0.9999, max|d| <= 0.005 * max + 1e-3, or a looser bound given) on float data
 
 struct GoldenRng {
 	uint32_t state;
@@ -61,7 +61,9 @@ inline bool golden_read( const std::string& dir, const std::string& name, std::v
 	return ok;
 }
 
-inline bool golden_compare( const char* name, const std::vector<float>& ref, const std::vector<float>& got ) {
+// min_cos / rel_max: a looser bound for paths that round differently by design on each backend (GGUF weights: the CPU kernels quantize
+// activations to q8_K, the CUDA ones to q8_1)
+inline bool golden_compare( const char* name, const std::vector<float>& ref, const std::vector<float>& got, double min_cos = 0.9999, double rel_max = 0.005 ) {
 	if ( ref.size() != got.size() ) { std::printf( "  %-28s size mismatch %zu vs %zu  FAIL\n", name, ref.size(), got.size() ); return false; }
 	double dot = 0, na = 0, nb = 0, maxd = 0, maxabs = 0;
 	for ( size_t i = 0; i < ref.size(); ++i ) {
@@ -70,7 +72,7 @@ inline bool golden_compare( const char* name, const std::vector<float>& ref, con
 		maxabs = std::fmax( maxabs, std::fabs( static_cast<double>( ref[i] ) ) );
 	}
 	const double cosv = dot / ( std::sqrt( na ) * std::sqrt( nb ) + 1e-30 );
-	const bool ok = cosv >= 0.9999 && maxd <= 0.005 * maxabs + 1e-3;
+	const bool ok = cosv >= min_cos && maxd <= rel_max * maxabs + 1e-3;
 	std::printf( "  %-28s cos %.7f max|d| %.3g (max %.3g)  %s\n", name, cosv, maxd, maxabs, ok ? "PASS" : "FAIL" );
 	return ok;
 }
