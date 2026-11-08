@@ -53,3 +53,7 @@ target_link_libraries(test_cpu_forward PRIVATE pthread)
 add_executable(test_gguf_linear tests/2_parity/test_gguf_linear.cpp ${ENGINE_CPU_OBJECTS})
 set_target_properties(test_gguf_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 target_link_libraries(test_gguf_linear PRIVATE pthread)
+
+add_executable(test_mtp tests/4_coherence/test_mtp.cpp ${ENGINE_CPU_OBJECTS})
+target_link_libraries(test_mtp PRIVATE pthread)
+set_target_properties(test_mtp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

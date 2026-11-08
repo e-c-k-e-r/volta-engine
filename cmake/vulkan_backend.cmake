@@ -107,6 +107,11 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	add_dependencies(test_vulkan_comm slang_kernels)
 	set_target_properties(test_vulkan_comm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+	add_executable(test_mtp tests/4_coherence/test_mtp.cpp ${ENGINE_VK_OBJECTS})
+	target_link_libraries(test_mtp PRIVATE engine_backend_vulkan pthread)
+	set_target_properties(test_mtp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	add_dependencies(test_mtp slang_kernels)
+
 	# GGUF block types against the ggml fixtures (tests/tools/gguf_fixtures.py), same source as the CUDA and CPU builds
 	add_executable(test_gguf_linear tests/2_parity/test_gguf_linear.cpp ${ENGINE_VK_OBJECTS})
 	target_link_libraries(test_gguf_linear PRIVATE engine_backend_vulkan pthread)

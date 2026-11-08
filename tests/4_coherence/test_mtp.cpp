@@ -39,6 +39,9 @@ int main( int argc, char** argv ) {
 	// --interleave: slot 0 speculates while slot 1's long prompt is prefilled in pieces between its rounds (what the generator does when a request arrives
 	// during decoding); both slots must give exactly the tokens they give alone, since the pieces and the rounds are separate forwards
 	const bool interleave = argc > 2 && std::string( argv[2] ) == "--interleave";
+	// --short (anywhere): only the short prompt (the CPU and Vulkan builds, where the long one takes long to prefill)
+	bool short_only = false;
+	for ( int a = 1; a < argc; ++a ) short_only = short_only || std::string( argv[a] ) == "--short";
 	const char* dir = glm ? test::GLM_DIR : flash ? test::FLASH_DIR : test::QWEN_DIR;
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	setenv( "ENGINE_SPECULATOR", "mtp", 1 );
@@ -136,7 +139,7 @@ int main( int argc, char** argv ) {
 		std::printf( failures ? "test_mtp --joint: FAIL\n" : "test_mtp --joint: PASS\n" );
 		return failures ? 1 : 0;
 	}
-	for ( size_t p = 0; p < prompts.size(); ++p ) {
+	for ( size_t p = 0; p < ( short_only ? 1 : prompts.size() ); ++p ) {
 		const test::GenStats plain = test::generate( mc, prompts[p], 96, false );
 		const test::GenStats spec = test::generate( mc, prompts[p], 96, true );
 		size_t d = 0;
