@@ -1,12 +1,13 @@
 // LinearGguf on the CPU backend over llama.cpp's own CPU kernels (src/kernels/cpu/gguf): each activation row quantized once to the block
-// type the weight's dot product pairs with (q8_0, q8_1 or q8_K, ggml-cpu's type traits), in the weight's column order; one row is then one
-// dot product per output row (split across the worker threads), several rows ik_llama.cpp's iqk GEMM where it has a kernel.
+// type the weight's dot product pairs with (q8_0, q8_1 or q8_K, ggml-cpu's type traits), in the weight's column order; the q8_K types go through
+// ik_llama.cpp's iqk GEMM, the others one dot product per output row and activation row (split across the worker threads).
 #include "cpu_kernels.h"
 #include "engine/modules/gguf.h"
 #include "engine/backend/numeric.h"
 #include "../../kernels/cpu/gguf/gguf_cpu.h"
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <vector>
 
 namespace engine::modules {
@@ -52,32 +53,26 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	ENGINE_ASSERT( x.dtype == pod::DType::FP16 && out.dtype == pod::DType::FP16 && x.shape[x.ndim - 1] == k, "LinearGguf: FP16 [m, k] activations and output" );
 	int m = 1;
 	for ( int d = 0; d < x.ndim - 1; ++d ) m *= x.shape[d];
-	// the rows in the weight's column order, quantized to the dot product's activation type
-	const GgmlType act = gguf_cpu::act_type( type );
-	const size_t act_bytes = row_bytes( act, k );
-	std::vector<uint8_t> xq( static_cast<size_t>( m ) * act_bytes );
 	const backend::half_t* xs = x.ptr<const backend::half_t>();
-	impl::cpu_parallel_for( m, 1, [&]( int64_t r0, int64_t r1 ) {
-		std::vector<float> f( static_cast<size_t>( k ) );
-		for ( int64_t r = r0; r < r1; ++r ) {
-			for ( int i = 0; i < k; ++i ) f[static_cast<size_t>( i )] = backend::to_float( xs[static_cast<size_t>( r ) * k + tiled_source( i, tiling, k )] );
-			gguf_cpu::quantize_act( act, f.data(), xq.data() + static_cast<size_t>( r ) * act_bytes, k );
-		}
-	} );
-	const size_t wb = row_bytes( type, k );
-	backend::half_t* o = out.ptr<backend::half_t>();
-	// several rows of a q8_K type: ik_llama.cpp's iqk GEMM (one decoded weight tile for all the rows; from 32 rows it repacks the weight per
-	// tile), on the rows quantized to ik's own q8_K; a single row stays on llama.cpp's dot products (iqk is no faster there)
-	if ( m >= 2 && gguf_cpu::iqk_rows( type ) ) {
-		const size_t ib = gguf_cpu::iqk_act_bytes( k );
-		std::vector<uint8_t> xi( static_cast<size_t>( m ) * ib );
+	// the rows in the weight's column order, each quantized by q into bytes per row
+	auto quantize_rows = [&]( size_t bytes, const std::function<void( const float*, void* )>& q ) {
+		std::vector<uint8_t> xq( static_cast<size_t>( m ) * bytes );
 		impl::cpu_parallel_for( m, 1, [&]( int64_t r0, int64_t r1 ) {
 			std::vector<float> f( static_cast<size_t>( k ) );
 			for ( int64_t r = r0; r < r1; ++r ) {
 				for ( int i = 0; i < k; ++i ) f[static_cast<size_t>( i )] = backend::to_float( xs[static_cast<size_t>( r ) * k + tiled_source( i, tiling, k )] );
-				gguf_cpu::iqk_quantize_act( f.data(), xi.data() + static_cast<size_t>( r ) * ib, k );
+				q( f.data(), xq.data() + static_cast<size_t>( r ) * bytes );
 			}
 		} );
+		return xq;
+	};
+	const size_t wb = row_bytes( type, k );
+	backend::half_t* o = out.ptr<backend::half_t>();
+	// a q8_K type: ik_llama.cpp's iqk GEMM (one decoded weight tile for all the rows; from 32 rows it repacks the weight per tile), on the
+	// rows quantized to ik's own q8_K. A single row runs through it too: up to 8 rows each row then gets the bits the 1-row decode gives it,
+	// so a speculative verify accepts exactly what plain decoding emits
+	if ( gguf_cpu::iqk_rows( type ) ) {
+		const std::vector<uint8_t> xi = quantize_rows( gguf_cpu::iqk_act_bytes( k ), [&]( const float* f, void* q ) { gguf_cpu::iqk_quantize_act( f, q, k ); } );
 		const int nth = impl::cpu_threads();
 		std::vector<float> f( static_cast<size_t>( m ) * n );
 		std::atomic<bool> ok{ true };
@@ -91,6 +86,10 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 			return;
 		}
 	}
+	// otherwise llama.cpp's dot products, on the rows quantized to the activation type the weight's pairs with
+	const GgmlType act = gguf_cpu::act_type( type );
+	const size_t act_bytes = row_bytes( act, k );
+	const std::vector<uint8_t> xq = quantize_rows( act_bytes, [&]( const float* f, void* q ) { gguf_cpu::quantize_act( act, f, q, k ); } );
 	impl::cpu_parallel_for( n, 64, [&]( int64_t j0, int64_t j1 ) {
 		for ( int64_t j = j0; j < j1; ++j ) {
 			const void* wr = static_cast<const uint8_t*>( w ) + static_cast<size_t>( j ) * wb;

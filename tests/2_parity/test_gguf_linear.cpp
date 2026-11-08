@@ -95,6 +95,8 @@ int main( int argc, char** argv ) {
 		backend::memcpy_sync( w.data, f.blocks.data(), f.blocks.size(), backend::Copy::H2D );
 		const pod::LinearWeight lw = pod::LinearWeight::make_gguf( w, static_cast<uint32_t>( f.type ), f.k, f.n );
 		double worst_gemv = 0.0, worst_tile = 0.0, worst_gemm = 0.0;
+		std::vector<half_t> one_row;   // the 1-row product, which the first row of 2 to 8 rows must equal bit for bit on CPU
+		int row_mismatch = 0;
 		for ( int rows : { 1, 2, 3, 5, 8, 9, 13, 16, 20, 64 } ) {
 			if ( rows > f.m ) continue;
 			int xdims[2] = { rows, f.k }, odims[2] = { rows, f.n };
@@ -107,6 +109,8 @@ int main( int argc, char** argv ) {
 			backend::memcpy_sync( oh.data(), out.data, oh.size() * sizeof( half_t ), backend::Copy::D2H );
 			std::vector<float> o( oh.size() );
 			for ( size_t i = 0; i < o.size(); ++i ) o[i] = backend::to_float( oh[i] );
+			if ( rows == 1 ) one_row = oh;
+			else if ( rows <= 8 ) row_mismatch += std::memcmp( one_row.data(), oh.data(), one_row.size() * sizeof( half_t ) ) != 0;
 			if ( rows <= 8 ) worst_gemv = std::max( worst_gemv, rel_rms( o, f.ref_q, rows, f.n ) );
 			else if ( rows <= 16 ) worst_tile = std::max( worst_tile, rel_rms( o, f.exact, rows, f.n ) );
 			else worst_gemm = std::max( worst_gemm, rel_rms( o, f.exact, rows, f.n ) );
@@ -126,7 +130,14 @@ int main( int argc, char** argv ) {
 #else
 		const double full_bound = 5e-3, gemm_bound = full_bound;
 #endif
-		const bool ok = worst_gemv < ( sum_offset ? 3e-2 : 1e-2 ) && worst_tile < full_bound && worst_gemm < gemm_bound;
+		// On CPU a speculative verify (2 to 8 rows) must give a row exactly what the 1-row decode gives it
+#if defined(ENGINE_BACKEND_CPU)
+		const bool rows_agree = row_mismatch == 0;
+#else
+		const bool rows_agree = true;
+#endif
+		if ( !rows_agree ) std::printf( "  %-8s row 0 of %d of the 2-8 row products differs from the 1-row product\n", modules::ggml_type_name( type ), row_mismatch );
+		const bool ok = worst_gemv < ( sum_offset ? 3e-2 : 1e-2 ) && worst_tile < full_bound && worst_gemm < gemm_bound && rows_agree;
 		std::printf( "  %-8s n %d k %d: 1-8 rows vs q8_1 reference %.2e, 9-16 rows vs exact %.2e, 20 / 64 rows vs exact %.2e  %s\n",
 			modules::ggml_type_name( type ), f.n, f.k, worst_gemv, worst_tile, worst_gemm, ok ? "PASS" : "FAIL" );
 		fails += ok ? 0 : 1;
