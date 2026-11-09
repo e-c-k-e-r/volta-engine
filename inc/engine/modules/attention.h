@@ -74,7 +74,9 @@ struct Attention {
 		int max_seq = 2048,
 		backend::stream_t stream = nullptr,
 		int key_hint = 0,
-		bool per_row = false  // every row gets its own block, for rows that sit in distinct slots
+		bool per_row = false,  // every row gets its own block, for rows that sit in distinct slots
+		float scale = 0.0f,    // as forward_decode
+		int window = 0
 	);
 
 	// Attention over a per-row token list (QSA sparse selection): row r attends to the nkeys[r] positions idx[r * idx_stride + i] of its

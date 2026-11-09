@@ -388,8 +388,12 @@ void Gemma4Pipeline::forward( const pod::BatchRows& rows, backend::stream_t stre
 	lm_mode_ = m > pod::MAX_BATCH ? rows.logits_mode : pod::BatchRows::LOGITS_ALL;
 	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : m );
 	set_rows( m );
+	key_hint_ = rows.pos[m - 1] + 1;
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
-	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); } );
+	// Tensor-core attention shares K/V tiles across the rows of one slot; rows of distinct slots get a block each (a separate graph)
+	attn_tc_ = true;
+	for ( int r = 1; r < m; ++r ) attn_tc_ = attn_tc_ && rows.slot[r] == rows.slot[0];
+	graphs_.run( m, stream, [&]( backend::stream_t s ) { forward_body( m, s ); }, attn_tc_ ? 1 : 0 );
 }
 
 // One decoder layer over the m rows of d_rows_ (resid_ in and out):
@@ -421,8 +425,9 @@ void Gemma4Pipeline::layer_forward( const Gemma4LayerWeights& lw, int kv_layer, 
 	else RoPE::forward( q, k, q_heads_, kvh, hd, hd, d_rows_, m, config_.swa_rope_theta, stream );
 
 	Attention::store_kv_cache( kv, k, v, pool.slot_stride_elems, kv_layer, d_rows_, m, kvh, hd, pool.max_seq_len, stream );
-	Attention::forward_decode( kv, q, pod::TensorView{}, o, pool.slot_stride_elems, kv_layer, d_rows_, m, q_heads_, kvh, hd, pool.max_seq_len, stream,
-		1.0f, lw.is_full ? 0 : config_.swa_window );
+	// Tensor cores: K/V tiles shared across the rows of one slot, a block per row otherwise
+	Attention::forward_prefill( kv, q, pod::TensorView{}, o, pool.slot_stride_elems, kv_layer, d_rows_, m, q_heads_, kvh, hd, pool.max_seq_len, stream,
+		m > pod::MAX_BATCH ? key_hint_ : 0, m <= pod::MAX_BATCH && !attn_tc_, 1.0f, lw.is_full ? 0 : config_.swa_window );
 
 	Linear::forward( o, lw.o_proj, mlp_out_, stream );
 	if ( ring_ ) ring_->all_reduce( mlp_out_, stream );

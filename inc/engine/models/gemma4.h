@@ -143,6 +143,8 @@ private:
 	int* d_token_ids_ = nullptr;
 	int lm_mode_ = 0;
 	int last_rows_ = 0;
+	bool attn_tc_ = false;   // current forward: all rows share one slot
+	int key_hint_ = 0;       // keys the current chunk can attend to (sizes the prefill attention split)
 
 	pod::TensorView resid_;          // [MAX_ROWS, hidden] FP32 residual stream
 	pod::TensorView hidden_states_;  // [MAX_ROWS, hidden] FP16 embedding rows

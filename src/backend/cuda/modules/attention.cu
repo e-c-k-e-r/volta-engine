@@ -451,7 +451,9 @@ void attn_prefill_tc_kernel(
 	int tile_q, // query slots a block owns: PA_BQ, or G to give every row its own block (rows of distinct slots)
 	const int* __restrict__ idx,   // SP: the keys of row r are idx[r * idx_stride + i], i < nkeys[r] (all 0 .. pos when nkeys[r] < 0); tile_q == G
 	const int* __restrict__ nkeys,
-	int idx_stride
+	int idx_stride,
+	int window = 0,   // > 0: a row attends to its last `window` positions only (the row's own included)
+	int ring = 0      // > 0: position p is cache row p % ring (a sliding-window cache of max_seq == ring rows)
 ) {
 	constexpr int HD = 256;
 	extern __shared__ __align__( 16 ) unsigned char pa_smem[];
@@ -478,14 +480,19 @@ void attn_prefill_tc_kernel(
 	const int qp = ( lane >> 2 ) & 3;
 
 	const int last_row = ( q_end - 1 ) / G;
-	int max_pos = 0;
+	int max_pos = 0, min_pos = 0x7fffffff;
 	// SP: max_pos is the last entry of the row's key list (the list position, not the token position)
 	const int sp_nk = SP ? nkeys[q_base / G] : 0;
 	if constexpr ( SP ) max_pos = ( sp_nk >= 0 ? sp_nk : min( rows->pos[q_base / G] + 1, max_seq ) ) - 1;
 	else {
-		for ( int r = q_base / G; r <= last_row; ++r ) max_pos = max( max_pos, rows->pos[r] );
-		max_pos = min( max_pos, max_seq - 1 );
+		for ( int r = q_base / G; r <= last_row; ++r ) {
+			max_pos = max( max_pos, rows->pos[r] );
+			min_pos = min( min_pos, rows->pos[r] );
+		}
+		if ( ring == 0 ) max_pos = min( max_pos, max_seq - 1 );
 	}
+	// The block's keys start at the tile below its earliest row's window
+	const int key_lo = ( !SP && window > 0 ) ? ( max( 0, min_pos - window + 1 ) / PA_BK ) * PA_BK : 0;
 	const size_t slot_off = static_cast<size_t>( rows->slot[q_base / G] ) * slot_stride;
 	const size_t kv_stride = static_cast<size_t>( num_kv_heads ) * HD;
 	const size_t kv_base = slot_off + static_cast<size_t>( layer_idx ) * max_seq * kv_stride + static_cast<size_t>( kvh ) * HD;
@@ -553,6 +560,7 @@ void attn_prefill_tc_kernel(
 						const int c = ( ( tid >> 5 ) + 8 * ui ) * 2 + cc;
 						int tok = kb + key;
 						if constexpr ( SP ) { if ( sp_nk >= 0 ) tok = idx[static_cast<size_t>( q_base / G ) * idx_stride + kb + key]; }
+						if ( ring > 0 ) tok %= ring;
 						const size_t at = kv_base + static_cast<size_t>( tok ) * kv_stride + c * 8;
 						k4 = kv_fetch8<KQ>( kv.k, kv.ks, at );
 						v4 = kv_fetch8<VQ>( kv.v, kv.vs, at );
@@ -564,9 +572,9 @@ void attn_prefill_tc_kernel(
 		}
 	};
 	// Split the key tiles over blockIdx.z; a split with no tiles leaves an empty partial for the merge
-	const int ntiles = ( max_pos + PA_BK ) / PA_BK;
-	const int kb0 = ( blockIdx.z * ntiles / nsplit ) * PA_BK;
-	const int kb1 = ( ( blockIdx.z + 1 ) * ntiles / nsplit ) * PA_BK;
+	const int ntiles = ( max_pos - key_lo + PA_BK ) / PA_BK;
+	const int kb0 = key_lo + ( blockIdx.z * ntiles / nsplit ) * PA_BK;
+	const int kb1 = key_lo + ( ( blockIdx.z + 1 ) * ntiles / nsplit ) * PA_BK;
 	if ( kb0 < kb1 ) fetch( kb0 );
 
 	for ( int kb = kb0; kb < kb1; kb += PA_BK ) {
@@ -646,7 +654,8 @@ void attn_prefill_tc_kernel(
 			float mx = -1e30f;
 			#pragma unroll
 			for ( int j = 0; j < 8; ++j ) {
-				const bool ok = svalid && kb + sub * 8 + j <= spos;
+				const int key = kb + sub * 8 + j;
+				const bool ok = svalid && key <= spos && ( window <= 0 || key > spos - window );
 				sv[j] = ok ? sS[srow * PA_SS + sub * 8 + j] * scale : -1e30f;
 				mx = fmaxf( mx, sv[j] );
 			}
@@ -810,6 +819,314 @@ void attn_prefill_tc_kernel(
 		*reinterpret_cast<uint4*>( out + off ) = res;
 	}
 }
+
+#if !MMA_SM80
+// head_dim 512 (Gemma 4's full-attention layers) on the same tiles and shared buffers: Q and K are staged one 256-dimension half at a time and
+// S accumulates over both halves; after the softmax each V half is staged in turn into its own set of accumulators. No register prefetch of the
+// next tile (the halves reuse the buffers). Volta mma.m8n8k4 only (other builds take the decode kernel for head_dim 512).
+template <KVQ KQ, KVQ VQ>
+__global__ __launch_bounds__( 256 )
+void attn_prefill_tc512_kernel(
+	const half* __restrict__ q,
+	const pod::KVRef kv,
+	const half* __restrict__ gate,
+	half* __restrict__ out,
+	size_t slot_stride,
+	int layer_idx,
+	const pod::BatchRows* __restrict__ rows,
+	int count,
+	int num_q_heads,
+	int num_kv_heads,
+	int max_seq,
+	float scale,
+	float* __restrict__ workspace,
+	int nsplit,
+	int tile_q,
+	int window,
+	int ring
+) {
+	constexpr int HD = 512, HH = 256;
+	extern __shared__ __align__( 16 ) unsigned char pa_smem[];
+	half* sK = reinterpret_cast<half*>( pa_smem );
+	half* sVt = reinterpret_cast<half*>( pa_smem + PA_OFF_VT );
+	half* sQ = reinterpret_cast<half*>( pa_smem + PA_OFF_Q );
+	float* sS = reinterpret_cast<float*>( pa_smem + PA_OFF_S );
+	half* sP = reinterpret_cast<half*>( pa_smem + PA_OFF_P );
+	float* sA = reinterpret_cast<float*>( pa_smem + PA_OFF_A );
+	float* sM = sA + PA_BQ;
+	float* sL = sM + PA_BQ;
+	float* sO = reinterpret_cast<float*>( pa_smem );
+
+	const int G = num_q_heads / num_kv_heads;
+	const int kvh = blockIdx.x;
+	const int q_base = blockIdx.y * tile_q;
+	const int q_end = min( q_base + tile_q, count * G );
+	const int tid = threadIdx.x;
+	const int warp = tid >> 5;
+	const int lane = tid & 31;
+	const int t = lane & 3;
+	const int hi = lane >> 4;
+	const int e = t + 4 * hi;
+	const int qp = ( lane >> 2 ) & 3;
+
+	const int last_row = ( q_end - 1 ) / G;
+	int max_pos = 0, min_pos = 0x7fffffff;
+	for ( int r = q_base / G; r <= last_row; ++r ) {
+		max_pos = max( max_pos, rows->pos[r] );
+		min_pos = min( min_pos, rows->pos[r] );
+	}
+	if ( ring == 0 ) max_pos = min( max_pos, max_seq - 1 );
+	const int key_lo = window > 0 ? ( max( 0, min_pos - window + 1 ) / PA_BK ) * PA_BK : 0;
+	const size_t slot_off = static_cast<size_t>( rows->slot[q_base / G] ) * slot_stride;
+	const size_t kv_stride = static_cast<size_t>( num_kv_heads ) * HD;
+	const size_t kv_base = slot_off + static_cast<size_t>( layer_idx ) * max_seq * kv_stride + static_cast<size_t>( kvh ) * HD;
+
+	const int srow = tid >> 3;
+	const int sub = tid & 7;
+	const int sqi = q_base + srow;
+	const bool svalid = sqi < q_end;
+	const int spos = svalid ? rows->pos[sqi / G] : -1;
+	float m_run = -1e30f, l_run = 0.0f;
+
+	const int s_qg = warp >> 2, s_kg = warp & 3;
+	const half* s_arow = sQ + ( s_qg * 16 + 8 * ( qp >> 1 ) + e ) * PA_KS;
+	const half* s_brow = sK + ( s_kg * 16 + 8 * ( qp & 1 ) + e ) * PA_KS;
+	const half* v_row = sVt + ( 32 * warp + qp + 4 * e ) * PA_VS;
+	const half* p_row = sP + e * PA_VS;
+
+	float acc[2][4][8];
+	#pragma unroll
+	for ( int h = 0; h < 2; ++h ) {
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			#pragma unroll
+			for ( int r = 0; r < 8; ++r ) acc[h][i][r] = 0.0f;
+		}
+	}
+
+	auto stage_q = [&]( int h ) {
+		for ( int u = tid; u < PA_BQ * ( HH / 8 ); u += 256 ) {
+			const int qq = u >> 5, c = u & 31;
+			const int qi = q_base + qq;
+			uint4 raw = make_uint4( 0, 0, 0, 0 );
+			if ( qi < q_end ) raw = *reinterpret_cast<const uint4*>( q + ( static_cast<size_t>( qi / G ) * num_q_heads + kvh * G + qi % G ) * HD + h * HH + c * 8 );
+			uint2* dst = reinterpret_cast<uint2*>( sQ + qq * PA_KS + c * 8 );
+			dst[0] = make_uint2( raw.x, raw.y );
+			dst[1] = make_uint2( raw.z, raw.w );
+		}
+	};
+	// thread stages keys 2 st_kp, 2 st_kp + 1 for chunks c = ( warp + 8 ui ) * 2 + cc of the half
+	const int st_kp = tid & 31;
+	auto key_at = [&]( int kb, int key, int h, int c ) {
+		int tok = kb + key;
+		if ( ring > 0 ) tok %= ring;
+		return kv_base + static_cast<size_t>( tok ) * kv_stride + h * HH + c * 8;
+	};
+	auto stage_k = [&]( int kb, int h ) {
+		#pragma unroll
+		for ( int ui = 0; ui < 2; ++ui ) {
+			#pragma unroll
+			for ( int cc = 0; cc < 2; ++cc ) {
+				const int c = ( warp + 8 * ui ) * 2 + cc;
+				#pragma unroll
+				for ( int kk = 0; kk < 2; ++kk ) {
+					const int key = 2 * st_kp + kk;
+					KVRaw8 k4 = {};
+					if ( kb + key <= max_pos ) k4 = kv_fetch8<KQ>( kv.k, kv.ks, key_at( kb, key, h, c ) );
+					const uint4 kh = kv_decode8_h<KQ>( k4 );
+					uint2* kd = reinterpret_cast<uint2*>( sK + key * PA_KS + c * 8 );
+					kd[0] = make_uint2( kh.x, kh.y );
+					kd[1] = make_uint2( kh.z, kh.w );
+				}
+			}
+		}
+	};
+	auto stage_v = [&]( int kb, int h ) {
+		#pragma unroll
+		for ( int ui = 0; ui < 2; ++ui ) {
+			#pragma unroll
+			for ( int cc = 0; cc < 2; ++cc ) {
+				const int c = ( warp + 8 * ui ) * 2 + cc;
+				KVRaw8 r0 = {}, r1 = {};
+				if ( kb + 2 * st_kp <= max_pos ) r0 = kv_fetch8<VQ>( kv.v, kv.vs, key_at( kb, 2 * st_kp, h, c ) );
+				if ( kb + 2 * st_kp + 1 <= max_pos ) r1 = kv_fetch8<VQ>( kv.v, kv.vs, key_at( kb, 2 * st_kp + 1, h, c ) );
+				const uint4 va = kv_decode8_h<VQ>( r0 ), vb = kv_decode8_h<VQ>( r1 );
+				const half* v0 = reinterpret_cast<const half*>( &va );
+				const half* v1 = reinterpret_cast<const half*>( &vb );
+				#pragma unroll
+				for ( int i = 0; i < 8; ++i ) *reinterpret_cast<half2*>( sVt + ( c * 8 + i ) * PA_VS + 2 * st_kp ) = __halves2half2( v0[i], v1[i] );
+			}
+		}
+	};
+
+	const int ntiles = ( max_pos - key_lo + PA_BK ) / PA_BK;
+	const int kb0 = key_lo + ( blockIdx.z * ntiles / nsplit ) * PA_BK;
+	const int kb1 = key_lo + ( ( blockIdx.z + 1 ) * ntiles / nsplit ) * PA_BK;
+
+	for ( int kb = kb0; kb < kb1; kb += PA_BK ) {
+		// S = Q K^T over both halves
+		float c8[8];
+		#pragma unroll
+		for ( int r = 0; r < 8; ++r ) c8[r] = 0.0f;
+		for ( int h = 0; h < 2; ++h ) {
+			stage_q( h );
+			stage_k( kb, h );
+			__syncthreads();
+			#pragma unroll 16
+			for ( int ks = 0; ks < HH / 4; ++ks ) {
+				const uint2 a = *reinterpret_cast<const uint2*>( s_arow + 4 * ks );
+				const uint2 b = *reinterpret_cast<const uint2*>( s_brow + 4 * ks );
+				mma884( c8, a.x, a.y, b.x, b.y );
+			}
+			__syncthreads();
+		}
+		#pragma unroll
+		for ( int r = 0; r < 8; ++r ) {
+			const int m = ( t & 1 ) + 2 * ( ( r >> 1 ) & 1 ) + 4 * hi;
+			const int n = ( r & 1 ) + 2 * ( t >> 1 ) + 4 * ( r >> 2 );
+			sS[( s_qg * 16 + 8 * ( qp >> 1 ) + m ) * PA_SS + s_kg * 16 + 8 * ( qp & 1 ) + n] = c8[r];
+		}
+		__syncthreads();
+
+		// Online softmax of this tile, one query row per 8 lanes
+		{
+			float sv[8];
+			float mx = -1e30f;
+			#pragma unroll
+			for ( int j = 0; j < 8; ++j ) {
+				const int key = kb + sub * 8 + j;
+				const bool ok = svalid && key <= spos && ( window <= 0 || key > spos - window );
+				sv[j] = ok ? sS[srow * PA_SS + sub * 8 + j] * scale : -1e30f;
+				mx = fmaxf( mx, sv[j] );
+			}
+			#pragma unroll
+			for ( int mask = 1; mask < 8; mask <<= 1 ) mx = fmaxf( mx, __shfl_xor_sync( 0xffffffff, mx, mask ) );
+			const float m_new = fmaxf( m_run, mx );
+			const float alpha = __expf( m_run - m_new );
+			float sum = 0.0f;
+			half2 ph[4];
+			#pragma unroll
+			for ( int j = 0; j < 4; ++j ) {
+				const float p0 = sv[2 * j] > -1e29f ? __expf( sv[2 * j] - m_new ) : 0.0f;
+				const float p1 = sv[2 * j + 1] > -1e29f ? __expf( sv[2 * j + 1] - m_new ) : 0.0f;
+				sum += p0 + p1;
+				ph[j] = __floats2half2_rn( p0, p1 );
+			}
+			#pragma unroll
+			for ( int mask = 1; mask < 8; mask <<= 1 ) sum += __shfl_xor_sync( 0xffffffff, sum, mask );
+			l_run = l_run * alpha + sum;
+			m_run = m_new;
+			uint2* pd = reinterpret_cast<uint2*>( sP + srow * PA_VS + sub * 8 );
+			pd[0] = make_uint2( *reinterpret_cast<uint32_t*>( &ph[0] ), *reinterpret_cast<uint32_t*>( &ph[1] ) );
+			pd[1] = make_uint2( *reinterpret_cast<uint32_t*>( &ph[2] ), *reinterpret_cast<uint32_t*>( &ph[3] ) );
+			if ( sub == 0 ) sA[srow] = alpha;
+		}
+		__syncthreads();
+
+		// O_h = O_h * alpha + P V_h, each half's 32 dimensions per warp
+		#pragma unroll
+		for ( int h = 0; h < 2; ++h ) {
+			stage_v( kb, h );
+			__syncthreads();
+			#pragma unroll
+			for ( int i = 0; i < 4; ++i ) {
+				#pragma unroll
+				for ( int r = 0; r < 8; ++r ) {
+					const int m = ( t & 1 ) + 2 * ( ( r >> 1 ) & 1 ) + 4 * hi;
+					acc[h][i][r] *= sA[8 * i + m];
+				}
+			}
+			#pragma unroll
+			for ( int kk = 0; kk < PA_BK / 4; ++kk ) {
+				const uint2 b = *reinterpret_cast<const uint2*>( v_row + 4 * kk );
+				#pragma unroll
+				for ( int i = 0; i < 4; ++i ) {
+					const uint2 a = *reinterpret_cast<const uint2*>( p_row + 8 * i * PA_VS + 4 * kk );
+					mma884( acc[h][i], a.x, a.y, b.x, b.y );
+				}
+			}
+			__syncthreads();
+		}
+	}
+
+	if ( sub == 0 ) {
+		sA[srow] = nsplit > 1 ? 1.0f : ( l_run > 0.0f ? 1.0f / l_run : 0.0f );
+		sM[srow] = m_run;
+		sL[srow] = l_run;
+	}
+	__syncthreads();
+	#pragma unroll
+	for ( int h = 0; h < 2; ++h ) {
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			#pragma unroll
+			for ( int r = 0; r < 8; ++r ) {
+				const int m = ( t & 1 ) + 2 * ( ( r >> 1 ) & 1 ) + 4 * hi;
+				const int n = ( r & 1 ) + 2 * ( t >> 1 ) + 4 * ( r >> 2 );
+				sO[( 8 * i + m ) * PA_KS + 32 * warp + qp + 4 * n] = acc[h][i][r] * sA[8 * i + m];
+			}
+		}
+		__syncthreads();
+		if ( nsplit > 1 ) {
+			for ( int u = tid; u < PA_BQ * HH; u += 256 ) {
+				const int qq = u >> 8, d = u & 255;
+				const int qi = q_base + qq;
+				if ( qi >= q_end ) continue;
+				float* ws = workspace + ( ( static_cast<size_t>( qi / G ) * num_q_heads + kvh * G + qi % G ) * nsplit + blockIdx.z ) * ( ATTN_MAX_HEAD_DIM + 2 );
+				if ( d == 0 && h == 0 ) {
+					ws[0] = sM[qq];
+					ws[1] = sL[qq];
+				}
+				ws[2 + h * HH + d] = sO[qq * PA_KS + d];
+			}
+		}
+		else {
+			if constexpr ( VQ == KVQ::Q4 ) {
+				if ( tid < PA_BQ * 4 ) {
+					float* x = sO + ( tid >> 2 ) * PA_KS + ( tid & 3 ) * 64;
+					for ( int hh = 1; hh < 64; hh <<= 1 ) {
+						for ( int i = 0; i < 64; ++i ) {
+							if ( ( i & hh ) == 0 ) {
+								const float a = x[i], b = x[i | hh];
+								x[i] = a + b;
+								x[i | hh] = a - b;
+							}
+						}
+					}
+					for ( int i = 0; i < 64; ++i ) x[i] *= 0.125f;
+				}
+				__syncthreads();
+			}
+			for ( int u = tid; u < PA_BQ * ( HH / 8 ); u += 256 ) {
+				const int qq = u >> 5, c = u & 31;
+				const int qi = q_base + qq;
+				if ( qi >= q_end ) continue;
+				const size_t off = ( static_cast<size_t>( qi / G ) * num_q_heads + kvh * G + qi % G ) * HD + h * HH + c * 8;
+				float sig[8];
+				#pragma unroll
+				for ( int i = 0; i < 8; ++i ) sig[i] = 1.0f;
+				if ( gate != nullptr ) {
+					const uint4 graw = *reinterpret_cast<const uint4*>( gate + off );
+					const half2* g2 = reinterpret_cast<const half2*>( &graw );
+					#pragma unroll
+					for ( int i = 0; i < 4; ++i ) {
+						const float2 f = __half22float2( g2[i] );
+						sig[2 * i] = engine::math::sigmoid( f.x );
+						sig[2 * i + 1] = engine::math::sigmoid( f.y );
+					}
+				}
+				const float* o = sO + qq * PA_KS + c * 8;
+				uint4 res;
+				half2* r2 = reinterpret_cast<half2*>( &res );
+				#pragma unroll
+				for ( int i = 0; i < 4; ++i ) r2[i] = __floats2half2_rn( o[2 * i] * sig[2 * i], o[2 * i + 1] * sig[2 * i + 1] );
+				*reinterpret_cast<uint4*>( out + off ) = res;
+			}
+		}
+		__syncthreads();
+	}
+}
+#endif
 
 template <int D>
 __global__ void attn_reduce_kernel(
@@ -1023,11 +1340,23 @@ void Attention::forward_prefill(
 	int max_seq,
 	cudaStream_t stream,
 	int key_hint,
-	bool per_row
+	bool per_row,
+	float scale_override,
+	int window
 ) {
-	ENGINE_ASSERT( kv.ring == 0, "Attention::forward_prefill: no ring caches" );
-	ENGINE_ASSERT( head_dim == 256 && num_q_heads % num_kv_heads == 0, "Attention::forward_prefill: head_dim 256 and GQA only" );
+#if MMA_SM80 || defined(USE_ROCM)
+	if ( head_dim == 512 ) {
+		// no tensor-core kernel for head_dim 512 on these builds: the decode kernel (same arguments and result)
+		forward_decode( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream, scale_override, window );
+		return;
+	}
+#endif
+	ENGINE_ASSERT( ( head_dim == 256 || head_dim == 512 ) && num_q_heads % num_kv_heads == 0, "Attention::forward_prefill: head_dim 256 or 512 and GQA only" );
+	ENGINE_ASSERT( kv.ring == 0 || ( window > 0 && window <= kv.ring && kv.ring == max_seq ), "Attention::forward_prefill: a ring cache holds a sliding window of max_seq rows" );
+	// a window bounds the keys a chunk reads: size the split by them
+	if ( window > 0 ) key_hint = key_hint > 0 ? MIN( key_hint, window + count ) : window + count;
 #if defined(USE_ROCM)
+	ENGINE_ASSERT( window == 0 && kv.ring == 0 && scale_override <= 0.0f, "Attention::forward_prefill (ROCm): no sliding windows or scale overrides" );
 	// The tiled kernel stages ~96 KB of shared memory; RDNA grants a workgroup 64 KB. The WMMA kernel fits in 64 KB
 	if ( PA_SMEM > rocm_smem_optin_max() ) {
 		(void) key_hint;
@@ -1082,7 +1411,7 @@ void Attention::forward_prefill(
 		return;
 	}
 #endif
-	const float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
+	const float scale = scale_override > 0.0f ? scale_override : 1.0f / sqrtf( static_cast<float>( head_dim ) );
 	const int G = num_q_heads / num_kv_heads;
 	// Spread the key tiles over extra blocks when the query tiles alone leave the GPU under two waves
 	const int tile_q = per_row ? G : PA_BQ;
@@ -1094,11 +1423,31 @@ void Attention::forward_prefill(
 	float* workspace = attn_workspace_ptr();
 	const dim3 grid_tc( num_kv_heads, ( count * G + tile_q - 1 ) / tile_q, nsplit );
 	const half* gate_ptr = gate.data != nullptr ? gate.ptr<const half>() : nullptr;
+#if !MMA_SM80
+	if ( head_dim == 512 ) {
+		#define LAUNCH_512() do { \
+			CUDA_CHECK( cudaFuncSetAttribute( attn_prefill_tc512_kernel<KQ_, VQ_>, cudaFuncAttributeMaxDynamicSharedMemorySize, PA_SMEM ) ); \
+			attn_prefill_tc512_kernel<KQ_, VQ_><<<grid_tc, 256, PA_SMEM, stream>>>( \
+				q.ptr<const half>(), kv, gate_ptr, out.ptr<half>(), slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, max_seq, scale, workspace, nsplit, tile_q, window, kv.ring ); \
+		} while ( 0 )
+		#define KQ_ KQV_
+		#define VQ_ VQV_
+		KV_DISPATCH( KQV_, VQV_, LAUNCH_512() )
+		#undef KQ_
+		#undef VQ_
+		#undef LAUNCH_512
+		if ( nsplit > 1 ) {
+			const int vrot = kv.vq == KVQ::Q4 ? 1 : 0;
+			attn_reduce_kernel<512><<<dim3( num_q_heads, count ), 512, 0, stream>>>( workspace, gate_ptr, out.ptr<half>(), num_q_heads, nsplit, vrot );
+		}
+		return;
+	}
+#endif
 	#define LAUNCH_PREFILL() do { \
 		{ \
 			CUDA_CHECK( cudaFuncSetAttribute( attn_prefill_tc_kernel<KQ_, VQ_, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, PA_SMEM ) ); \
 			attn_prefill_tc_kernel<KQ_, VQ_, false><<<grid_tc, 256, PA_SMEM, stream>>>( \
-				q.ptr<const half>(), kv, gate_ptr, out.ptr<half>(), slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, max_seq, scale, workspace, nsplit, tile_q, nullptr, nullptr, 0 ); \
+				q.ptr<const half>(), kv, gate_ptr, out.ptr<half>(), slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, max_seq, scale, workspace, nsplit, tile_q, nullptr, nullptr, 0, window, kv.ring ); \
 		} \
 	} while ( 0 )
 	#define KQ_ KQV_

@@ -175,8 +175,9 @@ Qwen extras:
   template). The 50 sliding-window layers keep a ring of 1536 positions per slot (the window and one prefill chunk: 1.3 GB at TP=1), the 10
   full-attention layers every position (80 KB a token at TP=1, 20 KB per rank at TP=4); prefix-cache snapshots keep the sliding layers' last window. The DFlash drafter `z-lab/gemma-4-31B-it-DFlash` (a DFlash v1 `DFlashDraftModel`: no convs
   or selector, the head's argmax per row, a 16-row block of which the first 8 rows are verified, one full-attention layer whose context is every
-  position the drafter has ingested) loads through `draft_model_dir`, also as an EXL3 conversion. At TP=4 decode is 20 ms a token, about 100 tok/s
-  with the drafter (4.3 tokens a round on the bench prompts). Images (the vision tower and the `mmproj` file) are not read yet.
+  position the drafter has ingested) loads through `draft_model_dir`, also as an EXL3 conversion. Attention (head_dim 256 with the window, and 512) runs on
+  the tensor-core prefill kernels for every row count (SM_80+ and ROCm builds keep the scalar kernel for 512). At TP=4 decode is 20 ms a token,
+  about 110 tok/s with the drafter (4.3 tokens a round on the bench prompts), and a 3019-token prompt prefills in 1.6 s. Images (the vision tower and the `mmproj` file) are not read yet.
 * **Two GPUs per instance**: `--tp-size 2` runs one model on two GPUs (about 0.7x the speed of four); start a second server with
   `CUDA_VISIBLE_DEVICES=2,3` on the other pair for twice the aggregate throughput. GLM runs on 1, 2 or 4 GPUs (on two, the experts need the expert tier, `expert_cache` below 1, to fit).
 
