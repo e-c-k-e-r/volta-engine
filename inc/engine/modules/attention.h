@@ -51,7 +51,9 @@ struct Attention {
 		int num_kv_heads,
 		int head_dim,
 		int max_seq = 2048,
-		backend::stream_t stream = nullptr
+		backend::stream_t stream = nullptr,
+		float scale = 0.0f,   // the softmax scale; 0: 1 / sqrt( head_dim )
+		int window = 0        // > 0: a row attends to its last `window` positions (its own included); 0: all of them
 	);
 
 	// Prefill form for chunks above the decode sizes (one slot, head_dim 256): K/V tiles are shared across queries.

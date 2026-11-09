@@ -14,15 +14,21 @@ void dflash_publish_taps(
 	int tap,
 	int H,
 	int cap,
-	backend::stream_t stream
+	backend::stream_t stream,
+	int taps_n
 ) {
+	ENGINE_ASSERT( taps_n == 5, "dflash_publish_taps (Vulkan): five taps per position" );
 	namespace vki = ::engine::backend::impl;
 	vki::TapStoreParams p{ vki::dp( taps ), vki::dp( hidden ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ), vki::dp( d_owner ), m, tap, H, cap };
 	vki::launch( "dflash_store_taps", p, stream, ( H + 255 ) / 256, m );
 }
 
-void dflash_publish_taps_slots( backend::half_t*, const backend::half_t*, const pod::BatchRows*, int, int, int, int, size_t, backend::stream_t ) {
+void dflash_publish_taps_slots( backend::half_t*, const backend::half_t*, const pod::BatchRows*, int, int, int, int, size_t, backend::stream_t, int ) {
 	ENGINE_UNSUPPORTED( "dflash_publish_taps_slots" );
+}
+
+void dflash_publish_taps_slots_f32( backend::half_t*, const float*, const pod::BatchRows*, int, int, int, int, size_t, int, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "dflash_publish_taps_slots_f32" );
 }
 
 void dflash_reduce_streams( const float* streams, backend::half_t* out, int m, int H, int mode, backend::stream_t stream ) {

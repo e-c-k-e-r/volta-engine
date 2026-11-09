@@ -27,8 +27,10 @@ static constexpr int kSnapRows = pod::MAX_BATCH;
 // stable for the model's lifetime, so a captured graph may bake them in.
 struct DraftHooks {
 	const pod::TensorView* embedding = nullptr; // [vocab, hidden] table (replicated on every rank)
-	const backend::half_t* taps = nullptr;                 // [taps_cap, 5 * hidden] position-indexed tap ring
+	const backend::half_t* taps = nullptr;                 // [taps_cap, taps_n * hidden] position-indexed tap ring
 	int taps_cap = 0;
+	int taps_n = 5;                             // tapped layers per position
+	float embed_scale = 1.0f;                   // the model's multiplier of its embedding rows (Gemma 4: sqrt( hidden ))
 	int* taps_owner = nullptr;                  // device scalar: slot whose rows publish taps (-1: none)
 	size_t taps_slot_stride = 0;                // elements between the slots' rings when every slot has its own (taps_owner is then unused); 0: one ring, one owner
 	backend::half_t* lm_in = nullptr;                      // [kDraftM, hidden] drafter hidden, written by the runner
@@ -41,7 +43,7 @@ struct DraftHooks {
 
 // Device buffers behind a model's DraftHooks: the tap ring, the drafter's head logits and the candidate top-k scratch. Owned by the arena.
 struct DraftScratch {
-	pod::TensorView taps;            // [slots * taps_cap, 5 * hidden] (one ring per slot) or [taps_cap, 5 * hidden] (one ring, one owner)
+	pod::TensorView taps;            // [slots * taps_cap, taps_n * hidden] (one ring per slot) or [taps_cap, taps_n * hidden] (one ring, one owner)
 	int* taps_owner = nullptr;
 	pod::TensorView lm_logits;       // [kDraftM, lm_shard_cols]
 	float* cand_part_v = nullptr;    // per-tile partial top-k of the head shard
@@ -49,9 +51,9 @@ struct DraftScratch {
 	int* cand_counters = nullptr;
 };
 
-// The tap ring: taps_cap = clamp( max_seq, 256, 2048 ) positions of [5, hidden] per ring. per_slot gives every one of `slots` slots its own ring
+// The tap ring: taps_cap = clamp( max_seq, 256, 2048 ) positions of [taps_n, hidden] per ring. per_slot gives every one of `slots` slots its own ring
 // (hooks.taps_slot_stride is set); otherwise one position-indexed ring is shared and taps_owner names the slot that publishes into it.
-void alloc_draft_taps( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int max_seq, int hidden, int slots, bool per_slot );
+void alloc_draft_taps( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int max_seq, int hidden, int slots, bool per_slot, int taps_n = 5 );
 
 // Copy the taps of positions [first_pos, first_pos + count) of a slot's ring to the host (the read_taps of every model with a drafter)
 bool read_draft_taps( const DraftHooks& hooks, int slot_id, int slots, int first_pos, int count, int hidden, backend::half_t* host_dst, backend::stream_t stream );
@@ -189,7 +191,7 @@ public:
 	// reads this rank's embedding, the tap ring and a head-shard top-k through one descriptor, and
 	// asks the model to run the head over caller-provided hidden rows.
 	virtual const DraftHooks& draft_hooks() const { static const DraftHooks none; return none; }
-	// Copies the drafter taps of positions [first_pos, first_pos + count) of a slot (count rows of 5 * hidden halves) to host memory; false without a tap ring
+	// Copies the drafter taps of positions [first_pos, first_pos + count) of a slot (count rows of taps_n * hidden halves) to host memory; false without a tap ring
 	// or when count exceeds the ring
 	virtual bool read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream = nullptr ) {
 		(void) slot_id; (void) first_pos; (void) count; (void) host_dst; (void) stream;

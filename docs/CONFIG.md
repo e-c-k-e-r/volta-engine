@@ -176,6 +176,9 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `spec_interleave` | bool | `true` | `ENGINE_DEBUG_SPEC_INTERLEAVE` | speculators with a context per slot (MTP): interleave one slot's round per step; false steps all active slots plainly together while more than one decodes (A/B) |
 | `no_graphs` | bool | `false` | `ENGINE_DEBUG_NO_GRAPHS` | eager execution, no CUDA graphs |
 | `dump_requests` | string | `(empty)` | `ENGINE_DEBUG_DUMP_REQUESTS` | directory: write every API request body and rendered prompt there, and at its end the prompt and generated token ids (req_N.tokens: int32 prompt length, int32 count, the ids) |
+| `dflash_tap_shift` | int | `0` | `ENGINE_DEBUG_DFLASH_TAP_SHIFT` | DFlash v1 drafters (Gemma 4): tap i is the output of target layer target_layer_ids[i] + this (the exllamav3 port reads one layer later; A/B) |
+| `dflash_embed_scale` | bool | `true` | `ENGINE_DEBUG_DFLASH_EMBED_SCALE` | DFlash v1 drafters: the block's embedding rows carry the target's embedding scale (Gemma 4: sqrt(hidden)); false = the raw table rows (A/B) |
+| `dflash_sliding_causal` | bool | `true` | `ENGINE_DEBUG_DFLASH_SLIDING_CAUSAL` | DFlash v1 drafters: the block is causal on the sliding-window layers (as the exllamav3 port's window has it), bidirectional on the full-attention ones; false = bidirectional on every layer (A/B) |
 | `dump_draft_round` | int | `-1` | `ENGINE_DEBUG_DUMP_DRAFT_ROUND` | speculation round whose drafter inputs are written to /tmp/draft_dump.bin; <0 = off |
 
 ## Test and tool variables

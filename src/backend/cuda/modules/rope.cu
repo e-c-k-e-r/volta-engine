@@ -71,10 +71,13 @@ void RoPE::forward(
 	int count,
 	float freq_base,
 	cudaStream_t stream,
-	bool interleaved
+	bool interleaved,
+	int rot_pairs
 ) {
+	ENGINE_ASSERT( rot_pairs >= 0 && rot_pairs <= rot_dim / 2, "RoPE::forward: rot_pairs beyond the rotary pairs" );
 	auto kernel = interleaved ? rope_kernel<true> : rope_kernel<false>;
-	kernel<<<dim3( 1, count ), dim3( rot_dim / 2 ), 0, stream>>>(
+	// a thread per rotated pair (the frequencies come from rot_dim, so the first rot_pairs are those of the full rotation)
+	kernel<<<dim3( 1, count ), dim3( rot_pairs > 0 ? rot_pairs : rot_dim / 2 ), 0, stream>>>(
 		q.ptr<half>(),
 		k.ptr<half>(),
 		num_q_heads,

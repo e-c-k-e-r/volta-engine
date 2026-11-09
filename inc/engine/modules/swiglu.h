@@ -12,7 +12,8 @@ struct SwiGLU {
 		const pod::TensorView& up,
 		pod::TensorView& out,
 		backend::stream_t stream = nullptr,
-		float limit = 0.0f
+		float limit = 0.0f,
+		bool gelu = false   // GELU (tanh approximation) on the gate instead of SiLU (Gemma's GeGLU)
 	);
 
 	static void forward_fused(

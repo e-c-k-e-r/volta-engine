@@ -36,16 +36,7 @@ void DFlashSpeculator::forward_backbone(
 	const int qh_local = config_.num_q_heads / tp_size_;
 	const int kvh_local = config_.num_kv_heads / tp_size_;
 	const int rope_pairs = hd / 2;
-	const int kv_total = ring_len_ + config_.block_size;
-	const int stride_slot = drafter_k_.shape[1] * drafter_k_.shape[2] * hd;
-	const int stride_layer = drafter_k_.shape[2] * hd;
-
-	// The cache ring's own K/V live in a separate tail, so passing kv_total as the "ring" keeps the
-	// single conditional subtract in the attention kernel correct for the context part while the own
-	// rows sit above it.
-	const int ctx_ring = ring_len_;
-	const int ctx_strides_slot = stride_slot;
-	const int ctx_strides_layer = stride_layer;
+	const int tn = config_.num_target_layer_ids;   // tapped target layers per position
 
 	// ---- Stage 1: project the target context into the drafter's own KV cache ----
 	// fc is column-parallel on the output. At tp > 1 each rank computes its H/tp columns, writes them into
@@ -58,14 +49,14 @@ void DFlashSpeculator::forward_backbone(
 			// taps_ring_cap > 0 means `tapped_states` is a position-indexed ring rather than a packed
 			// [n_ctx, 5*H] block, so the chunk's first row sits at (ctx_pos0 + base) % cap.
 			const size_t tap_off = ( taps_ring_cap > 0 )
-				? static_cast<size_t>( ( ctx_pos0 + base ) % taps_ring_cap ) * 5 * H
-				: static_cast<size_t>( base ) * 5 * H;
+				? static_cast<size_t>( ( ctx_pos0 + base ) % taps_ring_cap ) * tn * H
+				: static_cast<size_t>( base ) * tn * H;
 			const pod::TensorView taps_in = pod::make_tensor_2d(
 				const_cast<half*>( tapped_states ) + tap_off,
-				pod::DType::FP16, cnt, 5 * H );
+				pod::DType::FP16, cnt, tn * H );
 			pod::TensorView fc_out = pod::make_tensor_2d( bb_ctx_fc_.ptr<half>(), pod::DType::FP16, cnt, H );
-			hess_.accumulate( L, 0, taps_in.data, 5 * H, cnt, stream );
-			if ( tp_size_ == 1 ) {
+			hess_.accumulate( L, 0, taps_in.data, tn * H, cnt, stream );
+			if ( !fc_sharded_ ) {
 				engine::modules::Linear::forward( taps_in, fc_, fc_out, stream );
 			}
 			else {
@@ -90,30 +81,27 @@ void DFlashSpeculator::forward_backbone(
 
 			for ( int l = 0; l < L; ++l ) {
 				DFlashLayer& ly = layers_[l];
+				const LayerKV kv = layer_kv( l );
 				pod::TensorView kv_stage = pod::make_tensor_2d(
 					bb_kv_stage_.ptr<half>(), pod::DType::FP16, cnt, kvh_local * hd );
-				const int slot0 = ( kv_len_ + base ) % ctx_ring;
+				// ingested row i lives in ring slot i % ring
+				const int slot0 = ( kv_len_ + base ) % kv.ring;
 				hess_.accumulate( l, 1, ctx_n.data, H, cnt, stream );
 				engine::modules::Linear::forward( ctx_n, ly.k_proj, kv_stage, stream );
 				dflash_qk_norm_rope( kv_stage.ptr<half>(),
 					( ly.k_norm.data != nullptr ) ? ly.k_norm.ptr<const half>() : nullptr,
 					config_.rope_theta, cnt, kvh_local, hd, rope_pairs, ctx_pos0 + base,
 					config_.rms_norm_eps, 0.0f, stream );
-				dflash_cache_store( drafter_k_.ptr<half>(), kv_stage.ptr<const half>(), cnt, kvh_local, hd,
-					slot0, ctx_ring, l, ctx_strides_slot, ctx_strides_layer, stream );
+				dflash_cache_store( kv.k, kv_stage.ptr<const half>(), cnt, kvh_local, hd,
+					slot0, kv.ring, kv.layer, kv.stride_slot, kv.stride_layer, stream );
 				engine::modules::Linear::forward( ctx_n, ly.v_proj, kv_stage, stream );
-				dflash_cache_store( drafter_v_.ptr<half>(), kv_stage.ptr<const half>(), cnt, kvh_local, hd,
-					slot0, ctx_ring, l, ctx_strides_slot, ctx_strides_layer, stream );
+				dflash_cache_store( kv.v, kv_stage.ptr<const half>(), cnt, kvh_local, hd,
+					slot0, kv.ring, kv.layer, kv.stride_slot, kv.stride_layer, stream );
 			}
 		}
 		kv_len_ += n_ctx;
 		if ( kv_len_ > ring_len_ ) kv_pos0_ = kv_len_ - ring_len_;
 	}
-
-	// Visible context window: at most sliding_window entries ending at the newest.
-	const int ring_n = MIN( kv_len_, config_.sliding_window );
-	const int ctx_slot0 = ( kv_len_ > ctx_ring ? kv_pos0_ : 0 )
-		+ ( kv_len_ - ring_n ) % ctx_ring;
 
 	// ---- Stage 2: the block of `rows` query positions ----
 	engine::modules::Embedding::forward( embed_table, d_input_ids, rows, bb_normed_, stream );
@@ -137,8 +125,15 @@ void DFlashSpeculator::forward_backbone(
 			pod::TensorView rin = ( l == 0 ) ? empty
 				: pod::make_tensor_2d( bb_residual_.ptr<float>(), pod::DType::FP32, rows, H );
 			dflash_rmsnorm_residual( x, rin, ly.input_norm, n, r, rows, config_.rms_norm_eps, 0.0f, stream );
+			// The residual stream starts from the scaled embedding (the norm itself does not see the scale)
+			if ( l == 0 && config_.embed_scale != 1.0f ) dflash_scale_f32( bb_residual_.ptr<float>(), rows * H, config_.embed_scale, stream );
 		}
 		const pod::TensorView normed = pod::make_tensor_2d( bb_normed_.ptr<half>(), pod::DType::FP16, rows, H );
+		const bool conv = ly.attn_conv_base.data != nullptr;   // DFlash v1 layers have no convs
+		const LayerKV kv = layer_kv( l );
+		// Visible context: the newest entries, at most sliding_window of them (a full-attention layer: its whole ring)
+		const int ring_n = MIN( kv_len_, config_.layer_full[l] ? kv.ring : MIN( config_.sliding_window, kv.ring ) );
+		const int ctx_slot0 = ( kv_len_ - ring_n ) % kv.ring;
 
 		// (b) grouped dynamic conv, pre-attention side. kernel_projection emits both sides of the
 		//     sandwich as one [rows, 2*taps*groups] output, side 0 first.
@@ -148,7 +143,7 @@ void DFlashSpeculator::forward_backbone(
 			dflash_conv_side_split( bb_coef_a0_.ptr<float>(), bb_dyn_a_.ptr<const half>(), rows, taps, groups, 0, stream );
 			dflash_conv_side_split( bb_coef_a1_.ptr<float>(), bb_dyn_a_.ptr<const half>(), rows, taps, groups, 1, stream );
 		}
-		{
+		if ( conv ) {
 			const pod::TensorView c0 = pod::make_tensor_3d(
 				bb_coef_a0_.ptr<float>(), pod::DType::FP32, rows, taps, groups );
 			const pod::TensorView base = pod::make_tensor_2d(
@@ -156,7 +151,7 @@ void DFlashSpeculator::forward_backbone(
 				pod::DType::FP16, taps, H );
 			dflash2_dynconv( normed, c0, base, bb_stage_h_, config_.conv_group_size, false, stream );
 		}
-		const pod::TensorView stage = pod::make_tensor_2d( bb_stage_h_.ptr<half>(), pod::DType::FP16, rows, H );
+		const pod::TensorView stage = conv ? pod::make_tensor_2d( bb_stage_h_.ptr<half>(), pod::DType::FP16, rows, H ) : normed;
 
 		// (c) attention: projections, per-head norm + RoPE, then attention over
 		//     [context window | this block's own rows]
@@ -178,19 +173,20 @@ void DFlashSpeculator::forward_backbone(
 				( ly.k_norm.data != nullptr ) ? ly.k_norm.ptr<const half>() : nullptr,
 				config_.rope_theta, rows, kvh_local, hd, rope_pairs, block_pos0,
 				config_.rms_norm_eps, 0.0f, stream );
-			dflash_cache_store( drafter_k_.ptr<half>(), kv_stage.ptr<const half>(), rows, kvh_local, hd,
-				own_slot_, kv_total, l, stride_slot, stride_layer, stream );
+			// the block's own rows sit in the tail past the ring (passing ring + block as the ring keeps them from wrapping)
+			dflash_cache_store( kv.k, kv_stage.ptr<const half>(), rows, kvh_local, hd,
+				kv.ring, kv.ring + config_.block_size, kv.layer, kv.stride_slot, kv.stride_layer, stream );
 			engine::modules::Linear::forward( stage, ly.v_proj, kv_stage, stream );
-			dflash_cache_store( drafter_v_.ptr<half>(), kv_stage.ptr<const half>(), rows, kvh_local, hd,
-				own_slot_, kv_total, l, stride_slot, stride_layer, stream );
+			dflash_cache_store( kv.v, kv_stage.ptr<const half>(), rows, kvh_local, hd,
+				kv.ring, kv.ring + config_.block_size, kv.layer, kv.stride_slot, kv.stride_layer, stream );
 		}
 		{
 			const pod::TensorView attn_out = pod::make_tensor_3d(
 				bb_attn_out_.ptr<half>(), pod::DType::FP16, rows, qh_local, hd );
-			dflash_attn( bb_q_.ptr<const half>(), drafter_k_.ptr<const half>(), drafter_v_.ptr<const half>(),
+			dflash_attn( bb_q_.ptr<const half>(), kv.k, kv.v,
 				bb_attn_out_.ptr<half>(), rows, qh_local, kvh_local, hd,
-				ring_n, ctx_slot0, ctx_ring, l, ctx_strides_slot, ctx_strides_layer, hd, own_slot_,
-				own_first_row_, stream );
+				ring_n, ctx_slot0, kv.ring, kv.layer, kv.stride_slot, kv.stride_layer, hd, kv.ring,
+				own_first_row_, stream, config_.sliding_causal && !config_.layer_full[l] ? 1 : 0 );
 			// o_proj is row-parallel; at TP 1 it is the whole projection and needs no reduce.
 			// Linear::forward reads x.shape[1] as K, so this must be the flat [rows, q_heads*head_dim]
 			// view. The 3D head view reports shape[1] == q_heads, which the Trellis path ignored.
@@ -204,8 +200,9 @@ void DFlashSpeculator::forward_backbone(
 			}
 		}
 
-		// (d) grouped dynamic conv, post-attention side (side 1 of the same projection)
-		{
+		// (d) grouped dynamic conv, post-attention side (side 1 of the same projection); without convs o_proj goes on widened
+		if ( !conv ) dflash_h2f( bb_o_proj_.ptr<const half>(), bb_stage_.ptr<float>(), rows * H, stream );
+		else {
 			// The reference consumes self_attn's output here, which is o_proj's result, not the
 			// concatenated head outputs (bb_attn_out_). At tp_size 1 both are [rows, H], so the shape alone
 			// does not tell them apart.
@@ -241,7 +238,7 @@ void DFlashSpeculator::forward_backbone(
 			dflash_conv_side_split( bb_coef_m0_.ptr<float>(), bb_dyn_m_.ptr<const half>(), rows, taps, groups, 0, stream );
 			dflash_conv_side_split( bb_coef_m1_.ptr<float>(), bb_dyn_m_.ptr<const half>(), rows, taps, groups, 1, stream );
 		}
-		{
+		if ( conv ) {
 			const pod::TensorView c0 = pod::make_tensor_3d(
 				bb_coef_m0_.ptr<float>(), pod::DType::FP32, rows, taps, groups );
 			const pod::TensorView base = pod::make_tensor_2d(
@@ -252,7 +249,7 @@ void DFlashSpeculator::forward_backbone(
 
 		// (g) SwiGLU MLP: gate/up are column-parallel, down is row-parallel.
 		{
-			pod::TensorView s = pod::make_tensor_2d( bb_stage_h_.ptr<half>(), pod::DType::FP16, rows, H );
+			pod::TensorView s = conv ? pod::make_tensor_2d( bb_stage_h_.ptr<half>(), pod::DType::FP16, rows, H ) : normed_m;
 			hess_.accumulate( l, 3, s.data, H, rows, stream );
 			engine::modules::Linear::forward( s, ly.gate_proj, bb_ffn_gate_, stream );
 			engine::modules::Linear::forward( s, ly.up_proj, bb_ffn_up_, stream );
@@ -265,8 +262,9 @@ void DFlashSpeculator::forward_backbone(
 			}
 		}
 
-		// (h) grouped dynamic conv, post-MLP side
-		{
+		// (h) grouped dynamic conv, post-MLP side; without convs down_proj goes on widened
+		if ( !conv ) dflash_h2f( bb_hidden_.ptr<const half>(), bb_stage_.ptr<float>(), rows * H, stream );
+		else {
 			pod::TensorView m_in = pod::make_tensor_2d(
 				bb_stage_f32_.ptr<float>(), pod::DType::FP32, rows, H );
 			dflash_h2f( bb_hidden_.ptr<const half>(), m_in.ptr<float>(), rows * H, stream );
@@ -408,7 +406,7 @@ void DFlashSpeculator::draft_select(
 	CUDA_CHECK( cudaSetDevice( device_ ) );
 	rows = MIN( rows, config_.block_size - 1 );
 	if ( vals == nullptr || ix == nullptr ) return;
-	ENGINE_ASSERT( pred_codebook_.data != nullptr && succ_codebook_.data != nullptr,
+	ENGINE_ASSERT( config_.version < 2 || ( pred_codebook_.data != nullptr && succ_codebook_.data != nullptr ),
 		"draft_select: selector codebooks not loaded" );
 
 	// Candidates come from block rows 1..M, not 0..M-1. Row 0 is the anchor and is never scored:
@@ -418,6 +416,11 @@ void DFlashSpeculator::draft_select(
 	// *and* gate row i+1, and both need the same one-row shift. Walking rows 0..M-1 puts every step
 	// one position early.
 	const int kk = config_.selector_top_k;
+	if ( config_.version < 2 ) {
+		// DFlash v1: no selector, every row's draft is the head's argmax
+		dflash_argmax_draft( ix, kk, d_anchor_, d_draft_tokens_, rows, stream );
+		return;
+	}
 	dflash2_selector_walk(
 		vals + kk, ix + kk, d_gate_ + config_.selector_rank,
 		pred_codebook_.ptr<const half>(), succ_codebook_.ptr<const half>(),

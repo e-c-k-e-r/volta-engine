@@ -2,7 +2,8 @@
 // row's logits; `--check <dir>` (any build, in particular CPU) repeats it and compares against the golden file (tier 2 tolerance,
 // plus argmax equality). Model directory from argv `--model <dir>` (default: the Qwen EXL3 checkpoint) and `--type <model_type>` (default qwen3_5).
 // --cos 0.999 for GGUF weights: llama.cpp's CPU kernels quantize the activations to q8_K and its CUDA ones to q8_1, so the logits round apart
-// (the argmax and the decoded tokens must still match).
+// (the argmax and the decoded tokens must still match). `--ids <file>`: the prompt from a file of int32 token ids (a reference run elsewhere, e.g. a
+// real chat prompt) instead of the synthetic 15, 16, ...
 // ENGINE_TP overrides the single rank (a checkpoint too big for one GPU, e.g. Flash-Next, is dumped from a CUDA tp=4 build).
 #include "engine/runtime/test_paths.h"
 #include "engine/runtime/cluster.h"
@@ -22,15 +23,17 @@ int main( int argc, char** argv ) {
 	int steps = 0;
 	double min_cos = 0.9999;   // --cos: the logits' bound for paths that round differently per backend (GGUF: q8_K activations on CPU, q8_1 on CUDA)
 	int ntokens = 4;
+	const char* ids_file = nullptr;
 	for ( int i = 1; i + 1 < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--model" ) ) model_dir = argv[i + 1];
 		if ( !std::strcmp( argv[i], "--type" ) ) model_type = argv[i + 1];
 		if ( !std::strcmp( argv[i], "--steps" ) ) steps = std::atoi( argv[i + 1] );
 		if ( !std::strcmp( argv[i], "--tokens" ) ) ntokens = std::atoi( argv[i + 1] );
 		if ( !std::strcmp( argv[i], "--cos" ) ) min_cos = std::atof( argv[i + 1] );
+		if ( !std::strcmp( argv[i], "--ids" ) ) ids_file = argv[i + 1];
 	}
 	if ( !args.dump && !args.check ) {
-		std::printf( "usage: test_cpu_forward --dump|--check <dir> [--model <dir>] [--type <model_type>] [--steps <greedy decode steps after the prefill>] [--tokens <prompt length, default 4>] [--cos <logits bound, default 0.9999>]\n" );
+		std::printf( "usage: test_cpu_forward --dump|--check <dir> [--model <dir>] [--type <model_type>] [--steps <greedy decode steps after the prefill>] [--tokens <prompt length, default 4> | --ids <int32 token ids file>] [--cos <logits bound, default 0.9999>]\n" );
 		return 2;
 	}
 	::setenv( "ENGINE_TP", "1", 0 );
@@ -46,7 +49,15 @@ int main( int argc, char** argv ) {
 	const int vocab = mc.metadata().vocab_size;
 
 	std::vector<int> prompt;
-	for ( int i = 0; i < ntokens; ++i ) prompt.push_back( 15 + i );
+	if ( ids_file != nullptr ) {
+		std::FILE* f = std::fopen( ids_file, "rb" );
+		ENGINE_ASSERT( f != nullptr, "cannot open the --ids file" );
+		int id;
+		while ( std::fread( &id, sizeof( id ), 1, f ) == 1 ) prompt.push_back( id );
+		std::fclose( f );
+		ENGINE_ASSERT( !prompt.empty(), "empty --ids file" );
+	}
+	else for ( int i = 0; i < ntokens; ++i ) prompt.push_back( 15 + i );
 	auto now = [] { return std::chrono::steady_clock::now(); };
 	auto ms_since = [&]( auto t0 ) { return std::chrono::duration<double, std::milli>( now() - t0 ).count(); };
 	mc.reset_slot( 0 );

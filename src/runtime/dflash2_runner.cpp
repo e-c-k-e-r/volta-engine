@@ -40,8 +40,18 @@ void load_draft_config( const std::string& dir, pod::DFlashConfig& cfg ) {
 	geti( j, "num_target_layers", cfg.num_target_layers );
 	geti( j, "sliding_window", cfg.sliding_window );
 	if ( j.contains( "rms_norm_eps" ) && j["rms_norm_eps"].is_number() ) cfg.rms_norm_eps = j["rms_norm_eps"].get<float>();
+	if ( j.contains( "rope_theta" ) && j["rope_theta"].is_number() ) cfg.rope_theta = j["rope_theta"].get<float>();
 	if ( j.contains( "rope_parameters" ) && j["rope_parameters"].is_object() && j["rope_parameters"].contains( "rope_theta" ) ) {
 		cfg.rope_theta = j["rope_parameters"]["rope_theta"].get<float>();
+	}
+	// DFlash v1 (DFlashDraftModel): no convs or selector, block_size at the top level, sliding and full-attention layers
+	if ( j.contains( "architectures" ) && j["architectures"].is_array() && !j["architectures"].empty() && j["architectures"][0] == "DFlashDraftModel" ) {
+		cfg.version = 1;
+		geti( j, "block_size", cfg.block_size );
+		if ( j.contains( "layer_types" ) && j["layer_types"].is_array() ) {
+			int l = 0;
+			for ( const auto& t : j["layer_types"] ) if ( l < 8 ) cfg.layer_full[l++] = t == "full_attention";
+		}
 	}
 	if ( j.contains( "dflash_config" ) && j["dflash_config"].is_object() ) {
 		const auto& d = j["dflash_config"];
@@ -74,15 +84,20 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 	ENGINE_ASSERT( cfg.hidden_size == meta.hidden_size, "DFlash2Runner: drafter hidden size does not match the target" );
 	cfg.hidden_size = meta.hidden_size;
 	cfg.vocab_size = meta.vocab_size;
-	ENGINE_ASSERT( cfg.block_size == models::kDraftM, "DFlash2Runner: drafter block size != kDraftM" );
-	cfg.block_size = models::kDraftM;
+	// DFlash2 drafts exactly the verify block; a DFlash v1 block may be wider (its extra rows only shape the block attention)
+	ENGINE_ASSERT( cfg.version < 2 ? ( cfg.block_size >= models::kDraftM && cfg.block_size <= 16 ) : cfg.block_size == models::kDraftM,
+		"DFlash2Runner: drafter block size != kDraftM (DFlash v1: 8 to 16)" );
+	cfg.max_ctx = meta.max_seq_len;
+	ENGINE_ASSERT( mc.model( 0 ).draft_hooks().taps_n == cfg.num_target_layer_ids, "DFlash2Runner: the target publishes a different number of taps than the drafter reads" );
+	if ( runtime::options().dflash_embed_scale ) cfg.embed_scale = mc.model( 0 ).draft_hooks().embed_scale;
+	cfg.sliding_causal = runtime::options().dflash_sliding_causal;
 	// Full rotary over head_dim: the drafter checkpoint declares rope_type "default" with no
 	// partial_rotary_factor, and a partial-rotation default would quietly poison every prediction.
 	cfg.rope_dim_sections[0] = cfg.head_dim;
 	cfg.rope_dim_sections[1] = 0;
 	cfg.rope_dim_sections[2] = 0;
 	cfg.rope_dim_sections[3] = 0;
-	ENGINE_ASSERT( cfg.selector_top_k == models::kDraftTopK, "DFlash2Runner: selector_top_k != kDraftTopK" );
+	ENGINE_ASSERT( cfg.selector_top_k == models::kDraftTopK, "DFlash2Runner: selector_top_k != kDraftTopK" );   // v1: the default, the merged candidate count
 
 	tp_ = runtime::options().draft_tp ? mc.tp() : 1;
 	per_slot_ = runtime::options().draft_per_slot && mc.model( 0 ).draft_hooks().taps_slot_stride > 0 && meta.max_slots <= kMaxSlots;
@@ -204,7 +219,7 @@ int DFlash2Runner::draft_block( int slot, int anchor, int pos, float depth_thres
 
 	// Diagnostic (debug option dump_draft_round = <round>): writes that round's inputs and the drafter hidden to
 	// /tmp/draft_dump.bin for comparison against an independent implementation (tests/2_parity/draft_oracle.py). Header (int32): pos, anchor,
-	// hidden, taps_cap; then the tap ring rows for positions [0, pos) as FP16 [pos, 5 * hidden]
+	// hidden, taps_cap; then the tap ring rows for positions [0, pos) as FP16 [pos, taps_n * hidden]
 	// (only valid while pos <= taps_cap), then the drafter hidden FP16 [M, hidden].
 	{
 		const int dump_round = runtime::options().dump_draft_round;
@@ -212,7 +227,7 @@ int DFlash2Runner::draft_block( int slot, int anchor, int pos, float depth_thres
 		if ( dump_round >= 0 && round_no++ == dump_round ) {
 			const int H = mc.metadata().hidden_size;
 			ENGINE_ASSERT( pos <= hk0.taps_cap, "dump: context longer than the tap ring" );
-			std::vector<backend::half_t> taps( static_cast<size_t>( pos ) * 5 * H ), hid( static_cast<size_t>( M ) * H );
+			std::vector<backend::half_t> taps( static_cast<size_t>( pos ) * hk0.taps_n * H ), hid( static_cast<size_t>( M ) * H );
 			backend::set_device( 0 );
 			backend::stream_sync( s0 );
 			backend::memcpy_sync( taps.data(), hk0.taps, taps.size() * sizeof( backend::half_t ), backend::Copy::D2H );
@@ -242,7 +257,7 @@ int DFlash2Runner::draft_block( int slot, int anchor, int pos, float depth_thres
 	engine::spec::dflash2_topk_merge(
 		spec_[0].merged_cand_values_ptr( 0 ), spec_[0].merged_cand_indices_ptr( 0 ),
 		mc.tp(), M, models::kDraftTopK,
-		spec_[0].merged_final_values_ptr(), spec_[0].merged_final_indices_ptr(), M, s0 );
+		spec_[0].merged_final_values_ptr(), spec_[0].merged_final_indices_ptr(), spec_[0].merge_stride() / models::kDraftTopK, s0 );
 
 	// 3. Selector gate + bilinear lattice walk over the merged candidates.
 	mark( SpecProfile::WALK );

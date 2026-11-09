@@ -45,6 +45,14 @@ struct DFlashConfig {
 	// default rotated only half of each head and silently made every draft wrong.
 	int rope_dim_sections[4] = { 128, 0, 0, 0 };
 
+	// DFlash v1 (DFlashDraftModel without the convs and the candidate selector: the draft tokens are the head's argmax per row). Its
+	// block (block_size rows, 16) may be wider than the verify block: the rows past kDraftM only shape the bidirectional block attention.
+	int version = 2;
+	bool layer_full[8] = {};        // full-attention drafter layers: their context is every ingested position, not the sliding window
+	int max_ctx = 0;                // context positions a full-attention layer keeps (the target's max_seq)
+	float embed_scale = 1.0f;       // multiplier of the target's embedding rows for the block (Gemma's scaled embedding)
+	bool sliding_causal = false;    // the block is causal on the sliding-window layers (bidirectional otherwise; option dflash_sliding_causal)
+
 	int conv_groups() const { return hidden_size / conv_group_size; }
 	int conv_proj_out() const { return 2 * conv_kernel_size * conv_groups(); }
 };
@@ -101,6 +109,12 @@ void dflash_place_cols( backend::half_t* dst, const backend::half_t* src, int ro
 // FP16 -> FP32 widening copy (the drafter widens o_proj / down_proj before their conv).
 void dflash_h2f( const backend::half_t* in, float* out, int n, backend::stream_t stream = nullptr );
 
+// x *= s over n FP32 values
+void dflash_scale_f32( float* x, int n, float s, backend::stream_t stream = nullptr );
+
+// The DFlash v1 draft: out[0] = *d_anchor, out[1 + i] = ix[( 1 + i ) * k] (the best merged candidate of block row 1 + i), i < rows
+void dflash_argmax_draft( const int* ix, int k, const int* d_anchor, int* out, int rows, backend::stream_t stream = nullptr );
+
 // Pure CUDA candidate selector walk (greedy chained walk)
 void dflash2_selector_walk(
 	const float* unary,       // [bsz, rows, k]
@@ -155,7 +169,7 @@ void dflash2_topk_shard(
 );
 
 // Merge the per-rank local top-k into the global top-k, per row. part_vals/part_ix are
-// [tp_size, rows, k]; out_vals/out_ix are [rows, k]. Exact, not a heuristic: a rank's local top-k is
+// [tp_size, part_rows, 16] (rows of them used, k per row); out_vals/out_ix are [rows, k]. Exact, not a heuristic: a rank's local top-k is
 // a superset of the global top-k restricted to that shard, so the union contains the answer.
 void dflash2_topk_merge(
 	const float* part_vals,
@@ -235,7 +249,8 @@ void dflash_attn(
 	// First block row that contributes a key. 1 leaves the anchor to the context (its K/V comes from
 	// the target's taps); 0 lets row 0 supply the anchor itself. See DFlashSpeculator::draft_backbone.
 	int own_first_row = 1,
-	backend::stream_t stream = nullptr
+	backend::stream_t stream = nullptr,
+	int causal = 0   // 1: row r sees the block's own rows up to r only (the context stays whole)
 );
 
 // The same attention through the one-block-per-(row, head) scalar kernel (what dflash_attn falls back to for shapes the split kernel does not cover);
@@ -243,7 +258,7 @@ void dflash_attn(
 void dflash_attn_scalar(
 	const backend::half_t* q, const backend::half_t* kcache, const backend::half_t* vcache, backend::half_t* out,
 	int rows, int q_heads, int kv_heads, int head_dim, int nctx, int first_ctx, int ring_slots, int ctx_layer,
-	int stride_slot, int stride_layer, int stride_head, int own_slot, int own_first_row = 1, backend::stream_t stream = nullptr
+	int stride_slot, int stride_layer, int stride_head, int own_slot, int own_first_row = 1, backend::stream_t stream = nullptr, int causal = 0
 );
 
 // Take one side out of a conv kernel projection's [rows, 2*taps*groups] output and reinterpret it as
@@ -429,6 +444,7 @@ private:
 
 	// Weights loaded via SafeTensorsRepo
 	pod::LinearWeight fc_;
+	bool fc_sharded_ = false;   // fc column-parallel across the drafter's ranks (otherwise whole on every rank)
 	pod::TensorView fc_norm_;
 	pod::TensorView pred_codebook_;
 	pod::TensorView succ_codebook_;
@@ -497,6 +513,21 @@ private:
 	// The projected context is a ring of ring_len_ slots; kv_pos0_ is the absolute position of
 	// logical slot 0. The block's own transient K/V live in the reserved tail starting at own_slot_.
 	int ring_len_ = 0;
+	// DFlash v1: every layer has a ring of its own inside drafter_k_ / drafter_v_ ([ring_l + block_size, kv_heads_local, head_dim] at
+	// element offset kv_off_[l]): sliding_window slots for a sliding layer, max_ctx for a full-attention one. Otherwise all layers share
+	// the [ring_len + block_size, layers, kv_heads_local, head_dim] layout.
+	bool kv_per_layer_ = false;
+	size_t kv_off_[8] = {};
+	int ring_l_[8] = {};
+	struct LayerKV {
+		half* k;
+		half* v;
+		int ring;          // context slots; the block's own rows follow at slot `ring`
+		int layer;         // the layer index the cache kernels take (0 with a ring per layer)
+		int stride_slot;
+		int stride_layer;
+	};
+	LayerKV layer_kv( int l ) const;
 	int kv_len_ = 0;
 	int kv_pos0_ = 0;
 	int ctx_ingested_ = 0;       // target positions already projected into the drafter's KV ring

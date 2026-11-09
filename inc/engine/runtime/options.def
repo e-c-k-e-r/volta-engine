@@ -126,4 +126,7 @@ DEBUG_OPTION( int, spec_joint, -1, "per-slot speculators: one verify forward for
 DEBUG_OPTION( bool, spec_interleave, true, "speculators with a context per slot (MTP): interleave one slot's round per step; false steps all active slots plainly together while more than one decodes (A/B)" )
 DEBUG_OPTION( bool, no_graphs, false, "eager execution, no CUDA graphs" )
 DEBUG_OPTION( std::string, dump_requests, "", "directory: write every API request body and rendered prompt there, and at its end the prompt and generated token ids (req_N.tokens: int32 prompt length, int32 count, the ids)" )
+DEBUG_OPTION( int, dflash_tap_shift, 0, "DFlash v1 drafters (Gemma 4): tap i is the output of target layer target_layer_ids[i] + this (the exllamav3 port reads one layer later; A/B)" )
+DEBUG_OPTION( bool, dflash_embed_scale, true, "DFlash v1 drafters: the block's embedding rows carry the target's embedding scale (Gemma 4: sqrt(hidden)); false = the raw table rows (A/B)" )
+DEBUG_OPTION( bool, dflash_sliding_causal, true, "DFlash v1 drafters: the block is causal on the sliding-window layers (as the exllamav3 port's window has it), bidirectional on the full-attention ones; false = bidirectional on every layer (A/B)" )
 DEBUG_OPTION( int, dump_draft_round, -1, "speculation round whose drafter inputs are written to /tmp/draft_dump.bin; <0 = off" )

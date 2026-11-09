@@ -16,10 +16,12 @@ void RoPE::forward(
 	int count,
 	float freq_base,
 	backend::stream_t,
-	bool interleaved
+	bool interleaved,
+	int rot_pairs
 ) {
+	ENGINE_ASSERT( rot_pairs >= 0 && rot_pairs <= rot_dim / 2, "RoPE::forward: rot_pairs beyond the rotary pairs" );
 	// d_rows is host-addressable on this backend; the kernel reads pos[row]
-	RopeParams p{ q.ptr<half>(), k.ptr<half>(), const_cast<int*>( d_rows->pos ), num_q_heads, num_kv_heads, head_dim, rot_dim, interleaved ? 1 : 0, freq_base };
+	RopeParams p{ q.ptr<half>(), k.ptr<half>(), const_cast<int*>( d_rows->pos ), num_q_heads, num_kv_heads, head_dim, rot_dim, interleaved ? 1 : 0, freq_base, rot_pairs };
 	impl::cpu_dispatch( ::rope, &p, count );
 }
 

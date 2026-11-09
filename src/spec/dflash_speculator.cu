@@ -158,6 +158,7 @@ bool DFlashSpeculator::init(
 	// reserved tail of block_size slots for the current block's own transient K/V.
 	ring_len_ = MIN( config_.sliding_window, 2048 );
 	own_slot_ = ring_len_;
+	for ( int l = 0; l < config_.num_hidden_layers; ++l ) kv_per_layer_ = kv_per_layer_ || config_.layer_full[l];
 
 	// Chunk width for the context projection. 256 rows is fine in principle, but the Trellis fp16
 	// path has a gemv fast path only for m in {1,2,4,8} and falls back to the cooperative GEMM
@@ -184,6 +185,18 @@ bool DFlashSpeculator::init(
 
 	const int kv_total = ring_len_ + M;
 	int kv_cache_shape[4] = { kv_total, config_.num_hidden_layers, kv_heads_local, config_.head_dim };
+	size_t kv_elems = static_cast<size_t>( kv_total ) * config_.num_hidden_layers * kv_heads_local * config_.head_dim;
+	if ( kv_per_layer_ ) {
+		// A ring per layer: the full-attention layers keep every context position
+		ENGINE_ASSERT( config_.max_ctx > 0, "DFlashSpeculator::init: a full-attention drafter layer needs max_ctx" );
+		kv_elems = 0;
+		for ( int l = 0; l < config_.num_hidden_layers; ++l ) {
+			ring_l_[l] = config_.layer_full[l] ? config_.max_ctx : ring_len_;
+			kv_off_[l] = kv_elems;
+			kv_elems += static_cast<size_t>( ring_l_[l] + M ) * kv_heads_local * config_.head_dim;
+		}
+		kv_cache_shape[0] = static_cast<int>( kv_elems / ( static_cast<size_t>( config_.num_hidden_layers ) * kv_heads_local * config_.head_dim ) ) + 1;
+	}
 	ctxs_.assign( static_cast<size_t>( num_contexts_ ), Ctx{} );
 	for ( Ctx& c : ctxs_ ) {
 		c.k = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, kv_cache_shape, 4 );
@@ -195,7 +208,7 @@ bool DFlashSpeculator::init(
 	kv_len_ = 0;
 	kv_pos0_ = 0;
 
-	int ctx_tap_shape[2] = { ctx_chunk_, 5 * H };
+	int ctx_tap_shape[2] = { ctx_chunk_, config_.num_target_layer_ids * H };
 	bb_ctx_fc_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ctx_tap_shape, 2 );
 	int ctx_shape[2] = { ctx_chunk_, H };
 	bb_ctx_normed_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ctx_shape, 2 );
@@ -203,20 +216,28 @@ bool DFlashSpeculator::init(
 	bb_ctx_resid_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, ctx_res_shape, 2 );
 
 	// Default dummy codebooks (for standalone benchmarks or tests without weights on disk)
-	// Only the output rank (0) runs the selector walk, so the other ranks of a TP drafter skip the 254 MiB.
-	if ( rank_ == 0 ) {
+	// Only the output rank (0) runs the selector walk, so the other ranks of a TP drafter skip the 254 MiB. DFlash v1 has no selector.
+	if ( rank_ == 0 && config_.version >= 2 ) {
 		int cb_shape[2] = { config_.vocab_size, sel_rank };
 		pred_codebook_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, cb_shape, 2 );
 		succ_codebook_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, cb_shape, 2 );
 	}
 
 	if ( rank_ == 0 ) {
-		const size_t kv_bytes = 2 * static_cast<size_t>( kv_total ) * config_.num_hidden_layers * kv_heads_local * config_.head_dim * sizeof( half );
-		const size_t book_bytes = 2 * static_cast<size_t>( config_.vocab_size ) * sel_rank * sizeof( half );
+		const size_t kv_bytes = 2 * kv_elems * sizeof( half ) * ctxs_.size();
+		const size_t book_bytes = config_.version >= 2 ? 2 * static_cast<size_t>( config_.vocab_size ) * sel_rank * sizeof( half ) : 0;
 		if ( engine::runtime::options().mem_log ) LOG_INFO( "[mem] drafter rank 0: KV ring %.0f MiB, selector codebooks %.0f MiB (rank 0 only)\n", kv_bytes / 1048576.0, book_bytes / 1048576.0 );
 	}
 	initialized_ = true;
 	return true;
+}
+
+DFlashSpeculator::LayerKV DFlashSpeculator::layer_kv( int l ) const {
+	const int kvh = config_.num_kv_heads / tp_size_, hd = config_.head_dim;
+	half* k = static_cast<half*>( drafter_k_.data );
+	half* v = static_cast<half*>( drafter_v_.data );
+	if ( kv_per_layer_ ) return { k + kv_off_[l], v + kv_off_[l], ring_l_[l], 0, kvh * hd, 0 };
+	return { k, v, ring_len_, l, config_.num_hidden_layers * kvh * hd, kvh * hd };
 }
 
 
@@ -335,15 +356,18 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 		check1d( "layers.0.input_layernorm.weight", H );
 		check1d( "layers.0.post_attention_layernorm.weight", H );
 		check1d( "norm.weight", H );
-		if ( repo.find( "candidate_selector.hidden_projection.weight" ) != nullptr ) {
+		if ( config_.version < 2 ) {
+			// DFlash v1: no selector
+		}
+		else if ( repo.find( "candidate_selector.hidden_projection.weight" ) != nullptr ) {
 			check( "candidate_selector.hidden_projection.weight", config_.selector_rank, H );
 		}
 		else {
 			const pod::SafeTensorMeta* sv = repo.find( "candidate_selector.hidden_projection.svh" );
 			ENGINE_ASSERT( sv != nullptr && sv->shape[0] == config_.selector_rank, "dflash2 selector projection geometry does not match DFlashConfig" );
 		}
-		ENGINE_ASSERT( repo.find( "candidate_selector.predecessor_codebook" ) != nullptr
-			&& repo.find( "candidate_selector.successor_codebook" ) != nullptr,
+		ENGINE_ASSERT( config_.version < 2 || ( repo.find( "candidate_selector.predecessor_codebook" ) != nullptr
+			&& repo.find( "candidate_selector.successor_codebook" ) != nullptr ),
 			"dflash2 checkpoint is missing the selector codebooks" );
 		// The conv kernel_projection emits 2 * taps * groups columns; groups comes from the config's
 		// conv_group_size, so a mismatch there means every coefficient is misindexed.
@@ -354,9 +378,12 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 	}
 	const int L = config_.num_hidden_layers;
 
-	// Context projection: 5 tapped target states (5*H) -> H. Column-parallel on the output with an
+	// Context projection: the tapped target states (taps * H) -> H. Column-parallel on the output with an
 	// all-gather back to full width, so the 82 MB weight is a quarter per rank instead of replicated.
-	fc_ = load_shard( repo, "fc", *arena_, 1, R, TP, stream );
+	// Column-parallel only when every rank's slice is whole 128-wide Hadamard blocks (Gemma 4's 5376 / 4 = 1344 is not: every rank
+	// then runs the whole fc)
+	fc_sharded_ = TP > 1 && ( H / TP ) % 128 == 0;
+	fc_ = load_shard( repo, "fc", *arena_, 1, R, fc_sharded_ ? TP : 1, stream );
 	if ( fc_.type == pod::QuantType::TRELLIS && fc_.bits > 6 ) {
 		// The 8-bit EXL3 fc has no fused-GEMM instantiation (only 2..6 bits are built); run it as the dense FP16 shard
 		// an unquantized checkpoint would give.
@@ -367,7 +394,7 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 	final_norm_ = repo.load( "norm.weight", *arena_, stream, pod::DType::FP16 );
 
 	// Candidate selector: read by the walk on the output rank (0) only.
-	if ( R == 0 ) {
+	if ( R == 0 && config_.version >= 2 ) {
 		// into the codebooks init() reserved (a standalone run without weights keeps them as they are)
 		auto into = [&]( const char* name, pod::TensorView& book ) {
 			pod::MemoryArena in_book{ book.data, book.size_bytes(), 0, false };
@@ -415,8 +442,9 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 		ly.down_proj = load_shard( repo, key, *arena_, 0, R, TP, stream );
 
 		// Sandwiched grouped dynamic convs: static per-tap per-channel base plus a plain FP16
-		// projection emitting per-token per-group coefficients for both sides of the sandwich.
+		// projection emitting per-token per-group coefficients for both sides of the sandwich. DFlash v1 has none.
 		std::snprintf( key, sizeof( key ), "layers.%d.attention_conv.base_kernel", i );
+		if ( repo.find( key ) == nullptr ) continue;
 		ly.attn_conv_base = repo.load( key, *arena_, stream, pod::DType::FP16 );
 		std::snprintf( key, sizeof( key ), "layers.%d.mlp_conv.base_kernel", i );
 		ly.mlp_conv_base = repo.load( key, *arena_, stream, pod::DType::FP16 );
@@ -435,11 +463,11 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 			hess_.add( i, 2, config_.num_q_heads / TP * hd, *arena_, stream );
 			hess_.add( i, 4, config_.intermediate_size / TP, *arena_, stream );
 		}
-		if ( R == 0 ) hess_.add( L, 0, 5 * H, *arena_, stream );
+		if ( R == 0 ) hess_.add( L, 0, config_.num_target_layer_ids * H, *arena_, stream );
 	}
 	weights_loaded_ = true;
-	LOG_INFO( "[dflash] backbone loaded: %d layers, hidden %d, tp %d (rank %d), conv groups %d\n",
-		L, H, TP, R, config_.conv_groups() );
+	LOG_INFO( "[dflash] backbone loaded (DFlash v%d): %d layers, hidden %d, tp %d (rank %d), %d taps, block %d\n",
+		config_.version, L, H, TP, R, config_.num_target_layer_ids, config_.block_size );
 	if ( rank_ == 0 && engine::runtime::options().mem_log ) LOG_INFO( "[mem] drafter rank 0: weights include %.0f MiB of dense FP16 projections (dequantized at load)\n", g_dense_proj_bytes / 1048576.0 );
 	return true;
 }

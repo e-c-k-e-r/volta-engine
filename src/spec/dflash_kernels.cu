@@ -571,7 +571,8 @@ void dflash_attn_kernel(
 	int stride_head,
 	int own_slot,    // cache slot holding the block's own K/V (row r at own_slot + r)
 	int own_first_row, // 1: rows 1..rows-1 are keys (anchor comes from the context). 0: rows 0..rows-1.
-	float scale
+	float scale,
+	int causal       // 1: a row sees the block's own rows up to itself only
 ) {
 	extern __shared__ float smem[];
 	const int row = blockIdx.y;
@@ -615,7 +616,8 @@ void dflash_attn_kernel(
 			dot = fmaf( __half2float( qrow[d] ), __half2float( krow[d] ), dot );
 		dot = engine::math::warp_sum( dot );
 		__syncwarp();
-		if ( lane == 0 ) s_scores[kk] = dot * scale;
+		const bool masked = causal && kk >= nctx && own_first_row + ( kk - nctx ) > row;
+		if ( lane == 0 ) s_scores[kk] = masked ? -INFINITY : dot * scale;
 	}
 	__syncthreads();
 
@@ -787,7 +789,7 @@ void dflash_qk_norm_rope(
 // (m, l) and the unnormalized O of its range; dflash_attn_split_reduce merges the ranges of a (row, head) in a fixed order, so the result does not depend
 // on scheduling (the draft round is graph-replayed).
 constexpr int DFS_HD = 128, DFS_SLOTS = 32, DFS_BK = 32, DFS_WS_STRIDE = DFS_HD + 2;
-constexpr int DFS_MAX_ROWS = 16, DFS_MAX_QHEADS = 32, DFS_MAX_SPLIT = 64;
+constexpr int DFS_MAX_ROWS = 16, DFS_MAX_QHEADS = 64, DFS_MAX_SPLIT = 64;
 constexpr size_t DFS_SMEM = ( static_cast<size_t>( DFS_SLOTS ) * DFS_HD + static_cast<size_t>( DFS_BK ) * ( DFS_HD + 1 ) + static_cast<size_t>( DFS_SLOTS ) * DFS_BK + 3 * DFS_SLOTS ) * sizeof( float )
 	+ static_cast<size_t>( DFS_BK ) * DFS_HD * sizeof( half );
 
@@ -803,7 +805,7 @@ void dflash_attn_split_kernel(
 	int nctx, int first_ctx, int ring_slots, int ctx_layer,
 	int stride_slot, int stride_layer, int stride_head,
 	int own_slot, int own_first_row,
-	float scale, int nsplit, int keys_per_split
+	float scale, int nsplit, int keys_per_split, int causal
 ) {
 	extern __shared__ float dfs_smem[];
 	float* sQ = dfs_smem;                                  // [32 slots][128]
@@ -874,11 +876,15 @@ void dflash_attn_split_kernel(
 				a2 = fmaf( q0[2 * DFS_HD + d], kv, a2 );
 				a3 = fmaf( q0[3 * DFS_HD + d], kv, a3 );
 			}
-			const bool valid = kt + lane < k1;
-			sP[( warp * 4 + 0 ) * DFS_BK + lane] = valid ? a0 * scale : -INFINITY;
-			sP[( warp * 4 + 1 ) * DFS_BK + lane] = valid ? a1 * scale : -INFINITY;
-			sP[( warp * 4 + 2 ) * DFS_BK + lane] = valid ? a2 * scale : -INFINITY;
-			sP[( warp * 4 + 3 ) * DFS_BK + lane] = valid ? a3 * scale : -INFINITY;
+			const int kk = kt + lane;
+			const bool valid = kk < k1;
+			// causal: an own-row key past the slot's row is masked (slot s holds query row ( qtile * DFS_SLOTS + s ) / G)
+			const int own_j = kk - nctx + own_first_row;
+			auto ok = [&]( int s ) { return valid && !( causal && kk >= nctx && own_j > ( qtile * DFS_SLOTS + warp * 4 + s ) / G ); };
+			sP[( warp * 4 + 0 ) * DFS_BK + lane] = ok( 0 ) ? a0 * scale : -INFINITY;
+			sP[( warp * 4 + 1 ) * DFS_BK + lane] = ok( 1 ) ? a1 * scale : -INFINITY;
+			sP[( warp * 4 + 2 ) * DFS_BK + lane] = ok( 2 ) ? a2 * scale : -INFINITY;
+			sP[( warp * 4 + 3 ) * DFS_BK + lane] = ok( 3 ) ? a3 * scale : -INFINITY;
 		}
 		__syncthreads();
 		if ( tid < DFS_SLOTS ) {
@@ -949,7 +955,7 @@ static bool dflash_attn_split_launch(
 	const half* q, const half* kcache, const half* vcache, half* out,
 	int rows, int q_heads, int kv_heads, int head_dim,
 	int nctx, int first_ctx, int ring_slots, int ctx_layer,
-	int stride_slot, int stride_layer, int stride_head, int own_slot, int own_first_row, cudaStream_t stream
+	int stride_slot, int stride_layer, int stride_head, int own_slot, int own_first_row, int causal, cudaStream_t stream
 ) {
 	if ( head_dim != DFS_HD || kv_heads <= 0 || q_heads % kv_heads != 0 || rows > DFS_MAX_ROWS || q_heads > DFS_MAX_QHEADS ) return false;
 	const int G = q_heads / kv_heads;
@@ -972,7 +978,7 @@ static bool dflash_attn_split_launch(
 	}
 	dflash_attn_split_kernel<<<dim3( kv_heads, qtiles, nsplit ), 256, DFS_SMEM, stream>>>(
 		q, kcache, vcache, ws_ptr[dev], rows, q_heads, kv_heads, nctx, first_ctx, ring_slots, ctx_layer,
-		stride_slot, stride_layer, stride_head, own_slot, own_first_row, rsqrtf( static_cast<float>( head_dim ) ), nsplit, keys_per_split );
+		stride_slot, stride_layer, stride_head, own_slot, own_first_row, rsqrtf( static_cast<float>( head_dim ) ), nsplit, keys_per_split, causal );
 	dflash_attn_split_reduce<<<dim3( q_heads, rows ), DFS_HD, 0, stream>>>( ws_ptr[dev], out, q_heads, nsplit );
 	return true;
 }
@@ -985,7 +991,8 @@ void dflash_attn_scalar(
 	int stride_slot, int stride_layer, int stride_head,
 	int own_slot,
 	int own_first_row,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int causal
 ) {
 	if ( rows <= 0 || q_heads <= 0 ) return;
 	const int nkeys = nctx + MAX( rows - own_first_row, 0 );
@@ -995,7 +1002,7 @@ void dflash_attn_scalar(
 	dflash_attn_kernel<<<grid, 128, smem, stream >>>(
 		q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim,
 		nctx, first_ctx, ring_slots, ctx_layer, stride_slot, stride_layer, stride_head,
-		own_slot, own_first_row, scale );
+		own_slot, own_first_row, scale, causal );
 }
 
 void dflash_attn(
@@ -1005,22 +1012,23 @@ void dflash_attn(
 	int stride_slot, int stride_layer, int stride_head,
 	int own_slot,
 	int own_first_row,
-	cudaStream_t stream
+	cudaStream_t stream,
+	int causal
 ) {
 	if ( rows <= 0 || q_heads <= 0 ) return;
 #if defined(USE_ROCM)
-	// RDNA3: the WMMA kernel (the scalar one spends 0.8 ms per layer on a 2048-key window)
-	if ( ( head_dim == 128 || head_dim == 256 ) && kv_heads > 0 && q_heads % kv_heads == 0 && rows <= 16 && q_heads <= 64 ) {
+	// RDNA3: the WMMA kernel (the scalar one spends 0.8 ms per layer on a 2048-key window); it has no causal block
+	if ( !causal && ( head_dim == 128 || head_dim == 256 ) && kv_heads > 0 && q_heads % kv_heads == 0 && rows <= 16 && q_heads <= 64 ) {
 		if ( head_dim == 128 ) dflash_attn_wmma_launch<128>( q, kcache, vcache, out, rows, q_heads, kv_heads, nctx, first_ctx, ring_slots, ctx_layer, stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream );
 		else dflash_attn_wmma_launch<256>( q, kcache, vcache, out, rows, q_heads, kv_heads, nctx, first_ctx, ring_slots, ctx_layer, stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream );
 		return;
 	}
 #else
 	if ( !engine::runtime::options().dflash_attn_scalar && dflash_attn_split_launch( q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim, nctx, first_ctx, ring_slots, ctx_layer,
-		stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream ) ) return;
+		stride_slot, stride_layer, stride_head, own_slot, own_first_row, causal, stream ) ) return;
 #endif
 	dflash_attn_scalar( q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim, nctx, first_ctx, ring_slots, ctx_layer,
-		stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream );
+		stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream, causal );
 }
 
 void dflash_f16_gemv_nt(
@@ -1087,6 +1095,27 @@ void dflash_h2f( const half* in, float* out, int n, cudaStream_t stream ) {
 	if ( n <= 0 ) return;
 	const int threads = 256;
 	dflash_h2f_kernel<<<( n + threads - 1 ) / threads, threads, 0, stream >>>( out, in, n );
+}
+
+__global__ void dflash_scale_f32_kernel( float* __restrict__ x, int n, float s ) {
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( i < n ) x[i] *= s;
+}
+
+void dflash_scale_f32( float* x, int n, float s, cudaStream_t stream ) {
+	if ( n <= 0 ) return;
+	dflash_scale_f32_kernel<<<( n + 255 ) / 256, 256, 0, stream>>>( x, n, s );
+}
+
+// out[0] = the anchor, out[1 + i] = the best candidate of block row 1 + i (ix rows of k candidates, best first)
+__global__ void dflash_argmax_draft_kernel( const int* __restrict__ ix, int k, const int* __restrict__ anchor, int* __restrict__ out, int rows ) {
+	const int i = threadIdx.x;
+	if ( i == 0 ) out[0] = *anchor;
+	if ( i < rows ) out[1 + i] = ix[static_cast<size_t>( 1 + i ) * k];
+}
+
+void dflash_argmax_draft( const int* ix, int k, const int* d_anchor, int* out, int rows, cudaStream_t stream ) {
+	dflash_argmax_draft_kernel<<<1, 32, 0, stream>>>( ix, k, d_anchor, out, rows );
 }
 
 // Copies a [rows, src_cols] slice into columns [col0, col0 + src_cols) of a [rows, dst_cols] matrix.
@@ -1326,8 +1355,8 @@ __global__ void dflash2_topk_merge_kernel(
 	const int t = threadIdx.x;
 	if ( row >= rows ) return;
 	// dflash2_topk_shard always emits 16 partials per row whatever k was requested, so the rank stride
-	// is rows * 16 and is independent of K_T.
-	const int pstride = rows * 16;
+	// is part_rows * 16 (the staging's rows per rank) and is independent of K_T.
+	const int pstride = part_rows * 16;
 	const float* pv = part_vals + static_cast<int64_t>( row ) * 16;
 	const int* pix = part_ix + static_cast<int64_t>( row ) * 16;
 

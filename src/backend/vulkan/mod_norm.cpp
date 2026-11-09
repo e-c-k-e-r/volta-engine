@@ -19,6 +19,12 @@ void RMSNorm::forward(
 	const int hidden_size = x.shape[x.ndim - 1];
 	int rows = 1;
 	for ( int i = 0; i < x.ndim - 1; ++i ) rows *= x.shape[i];
+	if ( x.dtype == pod::DType::FP32 ) {
+		// an FP32 residual stream (Gemma 4)
+		vki::NormF32Params p{ vki::dp( x.data ), vki::dp( out.data ), vki::dp( weight.data ), hidden_size, weight.data != nullptr, eps, constant_bias };
+		vki::launch( "rms_norm_f32", p, stream, rows );
+		return;
+	}
 	vki::NormParams p{ vki::dp( x.data ), vki::dp( out.data ), vki::dp( weight.data ), hidden_size, weight.data != nullptr, eps, constant_bias };
 	vki::launch( "rms_norm", p, stream, rows );
 }
@@ -41,6 +47,26 @@ void Elementwise::add_residual( pod::TensorView& hidden, const pod::TensorView& 
 	const int n = static_cast<int>( hidden.numel() );
 	vki::AddParams p{ vki::dp( hidden.data ), vki::dp( residual.data ), n };
 	vki::launch( "add_residual", p, stream, ( n + 255 ) / 256 );
+}
+
+void Elementwise::softcap( pod::TensorView& x, float cap, backend::stream_t stream ) {
+	const int n = static_cast<int>( x.numel() );
+	vki::SoftcapParams p{ vki::dp( x.data ), n, cap };
+	vki::launch( "softcap", p, stream, ( n + 255 ) / 256 );
+}
+
+void Elementwise::add_normed( pod::TensorView& resid, const pod::TensorView& y, const pod::TensorView& weight, float eps, float constant_bias, float scale,
+	backend::stream_t stream ) {
+	ENGINE_ASSERT( resid.dtype == pod::DType::FP32 && y.dtype == pod::DType::FP16, "Elementwise::add_normed: FP32 residual, FP16 input" );
+	const int hidden_size = y.shape[y.ndim - 1];
+	vki::AddNormedParams p{ vki::dp( resid.data ), vki::dp( y.data ), vki::dp( weight.data ), hidden_size, weight.data != nullptr, eps, constant_bias, scale };
+	vki::launch( "add_normed", p, stream, static_cast<int>( y.numel() / hidden_size ) );
+}
+
+void Elementwise::scale_to_f32( const pod::TensorView& x, pod::TensorView& out, float scale, backend::stream_t stream ) {
+	const int n = static_cast<int>( x.numel() );
+	vki::ScaleF32Params p{ vki::dp( x.data ), vki::dp( out.data ), n, scale };
+	vki::launch( "scale_to_f32", p, stream, ( n + 255 ) / 256 );
 }
 
 void Elementwise::argmax( const pod::TensorView& logits, int* d_out_idx, int numel, backend::stream_t stream ) {

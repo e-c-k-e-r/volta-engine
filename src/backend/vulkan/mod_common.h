@@ -33,10 +33,14 @@ inline void launch( const char* name, const P& p, stream_t s, uint32_t gx, uint3
 struct NormParams { uint64_t src, dst, weight; int hidden_size, has_weight; float eps, bias; };
 struct HeadNormParams { uint64_t qk, weight; int num_heads, head_dim, has_weight; float eps, bias; };
 struct AddParams { uint64_t hidden, residual; int n; };
-struct SwigluParams { uint64_t gate, up, out_; int n; float limit; };
+struct SwigluParams { uint64_t gate, up, out_; int n; float limit; int gelu; };
 struct SwigluFusedParams { uint64_t gate_up, out_; int inter_dim, total; float limit; };
 struct EmbedParams { uint64_t table, token_ids, out_; int hidden_size; };
-struct RopeParams { uint64_t q, k, pos; int num_q_heads, num_kv_heads, head_dim, rot_dim, interleaved; float freq_base; };
+struct RopeParams { uint64_t q, k, pos; int num_q_heads, num_kv_heads, head_dim, rot_dim, interleaved; float freq_base; int rot_pairs; };
+struct NormF32Params { uint64_t src, dst, weight; int hidden_size, has_weight; float eps, bias; };
+struct AddNormedParams { uint64_t resid, y, weight; int hidden_size, has_weight; float eps, bias, scale; };
+struct ScaleF32Params { uint64_t x, out_; int n; float scale; };
+struct SoftcapParams { uint64_t x; int n; float cap; };
 struct ArgmaxParams { uint64_t logits, out_idx, out_val; int numel, batch_size, index_offset, row_stride, has_val; };
 
 struct L2Params { uint64_t qkv; int num_k_heads, head_dim, scale_q; int64_t row_stride; };
@@ -60,7 +64,7 @@ struct RefGemmParams { uint64_t x, w, out_; int m, k, n; };
 namespace engine::backend::impl {
 struct RefReconParams { uint64_t codes, out_; int k_dim, n_dim, bits, cb; };
 struct RefHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };
-struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq; };
+struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq, window; };
 struct RefUnpackParams { uint64_t qg, q, gate; int total, head_dim; };
 } // namespace engine::backend::impl
 

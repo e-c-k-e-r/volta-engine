@@ -6,7 +6,7 @@
 
 namespace engine::spec {
 
-// Publishes row r of `hidden` ([m, H]) as tap `tap` of the position-indexed ring (taps [cap, 5 * H]) when the row's
+// Publishes row r of `hidden` ([m, H]) as tap `tap` of the position-indexed ring (taps [cap, taps_n * H]) when the row's
 // slot owns the ring. Slot, position and owner come from device memory so the launch is graph-replayable.
 void dflash_publish_taps(
 	backend::half_t* taps,
@@ -17,10 +17,11 @@ void dflash_publish_taps(
 	int tap,
 	int H,
 	int cap,
-	backend::stream_t stream
+	backend::stream_t stream,
+	int taps_n = 5
 );
 
-// The same with one ring per slot (taps [slots, cap, 5 * H], slot_stride elements apart): every row publishes to its own slot's ring, so several slots can
+// The same with one ring per slot (taps [slots, cap, taps_n * H], slot_stride elements apart): every row publishes to its own slot's ring, so several slots can
 // feed a drafter at once. CUDA only (the backends without it keep the single owner ring).
 void dflash_publish_taps_slots(
 	backend::half_t* taps,
@@ -31,6 +32,21 @@ void dflash_publish_taps_slots(
 	int H,
 	int cap,
 	size_t slot_stride,
+	backend::stream_t stream,
+	int taps_n = 5
+);
+
+// The same from FP32 rows (a model whose residual stream is FP32), rounded to FP16
+void dflash_publish_taps_slots_f32(
+	backend::half_t* taps,
+	const float* hidden,
+	const pod::BatchRows* d_rows,
+	int m,
+	int tap,
+	int H,
+	int cap,
+	size_t slot_stride,
+	int taps_n,
 	backend::stream_t stream
 );
 

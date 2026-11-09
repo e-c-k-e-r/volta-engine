@@ -17,7 +17,7 @@ namespace {
 
 #define ATTN_PAGE_SIZE 256
 #define ATTN_MAX_CHUNKS 128
-#define ATTN_MAX_HEAD_DIM 256
+#define ATTN_MAX_HEAD_DIM 512   // the partials' stride (Gemma 4's full-attention layers: 512)
 #define ATTN_MAX_ROW_HEADS ( pod::MAX_BATCH * 16 )
 
 __device__ float g_attn_workspace[ATTN_MAX_ROW_HEADS * ATTN_MAX_CHUNKS * ( ATTN_MAX_HEAD_DIM + 2 )];
@@ -114,7 +114,8 @@ __global__ void attn_chunked_paged_kernel(
 	int n_chunks,
 	int chunk_len,
 	int row0,
-	float scale
+	float scale,
+	int window
 ) {
 	int head = blockIdx.x;
 	int m = blockIdx.y;
@@ -132,15 +133,17 @@ __global__ void attn_chunked_paged_kernel(
 	int total_tokens = min( cur_pos + 1, max_seq );
 	const size_t slot_off = static_cast<size_t>( rows->slot[row0 + m] ) * slot_stride;
 
-	int kv_start = chunk * chunk_len;
-	int kv_end = min( kv_start + chunk_len, total_tokens );
+	// a sliding window keeps the last `window` positions (the row's own included)
+	const int kv_lo = window > 0 ? max( 0, total_tokens - window ) : 0;
+	int kv_start = max( chunk * chunk_len, kv_lo );
+	int kv_end = min( chunk * chunk_len + chunk_len, total_tokens );
 
 	const half* q_head = q + ( static_cast<size_t>( m ) * num_q_heads + head ) * head_dim;
 	half* out_head = out + ( static_cast<size_t>( m ) * num_q_heads + head ) * head_dim;
 
 	float my_q = __half2float( q_head[tid] );
 
-	__shared__ float s_warp_sums[8];
+	__shared__ float s_warp_sums[16];
 	__shared__ float s_score;
 
 	int warp_id = tid >> 5;
@@ -166,7 +169,7 @@ __global__ void attn_chunked_paged_kernel(
 
 			if ( warp_id == 0 ) {
 				float b_sum = ( lane_id < num_warps ) ? s_warp_sums[lane_id] : 0.0f;
-				b_sum = engine::math::warp_sum<4>( b_sum );
+				b_sum = engine::math::warp_sum<8>( b_sum );   // up to 16 warps (head_dim 512); the lanes past num_warps add exact zeros
 				if ( lane_id == 0 ) {
 					s_score = b_sum * scale;
 				}
@@ -954,12 +957,17 @@ void Attention::forward_decode(
 	int num_kv_heads,
 	int head_dim,
 	int max_seq,
-	cudaStream_t stream
+	cudaStream_t stream,
+	float scale_override,
+	int window
 ) {
-	// Keys per chunk: one page, doubled until the window fits the workspace's chunk capacity
+	ENGINE_ASSERT( head_dim <= ATTN_MAX_HEAD_DIM && head_dim % 32 == 0, "Attention::forward_decode: head_dim must be a multiple of 32, at most 512" );
+	// Keys per chunk: one page, doubled until the key range fits the workspace's chunk capacity, for the rows and heads of a batch
+	const int batch_rows = MIN( count, pod::MAX_BATCH );
 	int chunk_len = ATTN_PAGE_SIZE;
-	while ( ( max_seq + chunk_len - 1 ) / chunk_len > ATTN_MAX_CHUNKS ) chunk_len *= 2;
-	const float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
+	while ( ( max_seq + chunk_len - 1 ) / chunk_len > ATTN_MAX_CHUNKS ||
+		static_cast<size_t>( ( max_seq + chunk_len - 1 ) / chunk_len ) * batch_rows * num_q_heads > static_cast<size_t>( ATTN_MAX_ROW_HEADS ) * ATTN_MAX_CHUNKS ) chunk_len *= 2;
+	const float scale = scale_override > 0.0f ? scale_override : 1.0f / sqrtf( static_cast<float>( head_dim ) );
 
 	// Position-independent grid: one chunk per page of the full window (graph-capturable)
 	const int n_chunks = MAX( 1, ( max_seq + chunk_len - 1 ) / chunk_len );
@@ -976,7 +984,7 @@ void Attention::forward_decode(
 		half* o = out.ptr<half>() + row0 * row_elems;
 		#define LAUNCH_DECODE() attn_chunked_paged_kernel<KQ_, VQ_><<<dim3( num_q_heads, M, n_chunks ), dim3( head_dim ), 0, stream>>>( \
 			q.ptr<const half>() + row0 * row_elems, kv, g, o, workspace, slot_stride, layer_idx, d_rows, \
-			num_q_heads, num_kv_heads, head_dim, max_seq, n_chunks, chunk_len, row0, scale )
+			num_q_heads, num_kv_heads, head_dim, max_seq, n_chunks, chunk_len, row0, scale, window )
 		#define KQ_ KQV_
 		#define VQ_ VQV_
 		KV_DISPATCH( KQV_, VQV_, LAUNCH_DECODE() )
@@ -986,7 +994,8 @@ void Attention::forward_decode(
 		if ( n_chunks > 1 ) {
 			const dim3 red_grid( num_q_heads, M );
 			const dim3 red_block( head_dim );
-			if ( head_dim == 256 ) attn_reduce_kernel<256><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks, vrot );
+			if ( head_dim == 512 ) attn_reduce_kernel<512><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks, vrot );
+			else if ( head_dim == 256 ) attn_reduce_kernel<256><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks, vrot );
 			else if ( head_dim == 128 ) attn_reduce_kernel<128><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks, vrot );
 			else attn_reduce_kernel<64><<<red_grid, red_block, 0, stream>>>( workspace, g, o, num_q_heads, n_chunks, vrot );
 		}

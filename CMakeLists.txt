@@ -132,6 +132,7 @@ set(ENGINE_HOST_SOURCES
 	src/loader/gguf_qwen4exp.cpp
 	src/loader/gguf_glm5next.cpp
 	src/loader/gguf_dflash.cpp
+	src/loader/gguf_gemma4.cpp
 	src/loader/gguf_types.cpp
 	src/loader/nvfp4.cpp
 	src/loader/tokenizer.cpp
@@ -153,6 +154,7 @@ set(ENGINE_HOST_SOURCES
 	src/models/glm5_next.cpp
 	src/models/qwen4_exp.cpp
 	src/models/deepseek_v41.cpp
+	src/models/gemma4.cpp
 	src/runtime/options.cpp
 	src/runtime/kv_cache.cpp
 	src/runtime/cluster.cpp
@@ -345,7 +347,8 @@ if(SLANGC)
 	set(SLANG_INCLUDE_DIR ${SLANG_BIN_DIR}/../include)
 	set(SLANG_OUT ${PROJECT_BINARY_DIR}/slang)
 	file(MAKE_DIRECTORY ${SLANG_OUT})
-	set(SLANG_KERNELS rms_norm:rms_norm rms_norm:rms_norm_heads elementwise:add_residual elementwise:swiglu
+	set(SLANG_KERNELS rms_norm:rms_norm rms_norm:rms_norm_heads rms_norm:rms_norm_f32 rms_norm:add_normed elementwise:add_residual elementwise:swiglu
+		elementwise:scale_to_f32 elementwise:softcap
 		elementwise:swiglu_fused elementwise:embed_tokens rope:rope elementwise:moe_sum_planes elementwise:moe_accumulate
 		select:batched_argmax select:router_select gdn:l2_norm_heads gdn:gated_rmsnorm
 		gdn_rows:project_gates gdn_rows:causal_conv1d_silu_rows gdn_rows:causal_conv1d_silu_tiled gdn_rows:causal_conv1d_history

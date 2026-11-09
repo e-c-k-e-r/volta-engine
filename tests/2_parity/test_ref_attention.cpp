@@ -35,7 +35,7 @@ struct RefAttnParams {
 	int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate;
 	float scale;
 	uint8_t *ks, *vs;
-	int kq, vq;
+	int kq, vq, window;
 };
 struct RefLatentParams {
 	__half *q_lat, *cache, *out_;

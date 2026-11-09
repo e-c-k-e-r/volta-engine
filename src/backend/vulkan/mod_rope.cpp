@@ -19,9 +19,11 @@ void RoPE::forward(
 	int count,
 	float freq_base,
 	backend::stream_t stream,
-	bool interleaved
+	bool interleaved,
+	int rot_pairs
 ) {
-	vki::RopeParams p{ vki::dp( q.data ), vki::dp( k.data ), vki::rows_pos( d_rows ), num_q_heads, num_kv_heads, head_dim, rot_dim, interleaved ? 1 : 0, freq_base };
+	ENGINE_ASSERT( rot_pairs >= 0 && rot_pairs <= rot_dim / 2, "RoPE::forward: rot_pairs beyond the rotary pairs" );
+	vki::RopeParams p{ vki::dp( q.data ), vki::dp( k.data ), vki::rows_pos( d_rows ), num_q_heads, num_kv_heads, head_dim, rot_dim, interleaved ? 1 : 0, freq_base, rot_pairs };
 	vki::launch( "rope", p, stream, count );
 }
 

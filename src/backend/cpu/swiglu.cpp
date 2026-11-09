@@ -5,9 +5,9 @@
 
 namespace engine::modules {
 
-void SwiGLU::forward( const pod::TensorView& gate, const pod::TensorView& up, pod::TensorView& out, backend::stream_t, float limit ) {
+void SwiGLU::forward( const pod::TensorView& gate, const pod::TensorView& up, pod::TensorView& out, backend::stream_t, float limit, bool gelu ) {
 	const int n = static_cast<int>( gate.numel() );
-	SwigluParams p{ const_cast<half*>( gate.ptr<const half>() ), const_cast<half*>( up.ptr<const half>() ), out.ptr<half>(), n, limit };
+	SwigluParams p{ const_cast<half*>( gate.ptr<const half>() ), const_cast<half*>( up.ptr<const half>() ), out.ptr<half>(), n, limit, gelu ? 1 : 0 };
 	impl::cpu_dispatch( ::swiglu, &p, ( n + 255 ) / 256 );
 }
 

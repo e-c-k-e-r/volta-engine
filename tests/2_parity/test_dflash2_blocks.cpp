@@ -528,7 +528,7 @@ void test_topk_merge( pod::MemoryArena& arena, int tp, int rows, int k, int shar
 	}
 	CUDA_CHECK( cudaDeviceSynchronize() );
 	dflash2_topk_merge( pv.ptr<const float>(), pix.ptr<const int>(), tp, rows, k,
-		gv.ptr<float>(), gix.ptr<int>(), 16, nullptr );
+		gv.ptr<float>(), gix.ptr<int>(), rows, nullptr );
 	CUDA_CHECK( cudaDeviceSynchronize() );
 
 	std::vector<float> h_gv( static_cast<size_t>( rows ) * k );

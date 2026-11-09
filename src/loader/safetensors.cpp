@@ -1226,6 +1226,11 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 		pod::TensorView w = load_slice( name_buf, arena, slice_dim == 1 ? 0 : 1, rank, tp_size, stream, pod::DType::FP16 );
 		return pod::LinearWeight::make_fp16( pod::make_tensor_2d( w.data, pod::DType::FP16, w.shape[1], w.shape[0] ) );
 	}
+	if ( const pod::SafeTensorMeta* tm = find( name_buf ); tm != nullptr && tm->ndim == 3 && tp_size > 1 ) {
+		// The input and output Hadamards act on 128-wide blocks: a rank's slice has to be whole blocks (8 tiles of 16)
+		ENGINE_ASSERT( tm->shape[slice_dim] % tp_size == 0 && ( tm->shape[slice_dim] / tp_size ) % 8 == 0,
+			"load_linear_slice: a rank's slice of an EXL3 tensor must be whole 128-wide Hadamard blocks" );
+	}
 	pod::TensorView tr = load_slice( name_buf, arena, slice_dim, rank, tp_size, stream );
 
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.mul1", base_name );

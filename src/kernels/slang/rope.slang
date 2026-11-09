@@ -10,6 +10,7 @@ struct RopeParams {
 	int rot_dim;
 	int interleaved;
 	float freq_base;
+	int rot_pairs;    // > 0: only the first rot_pairs pairs rotate (frequencies still from rot_dim); 0: all rot_dim / 2
 };
 
 [shader("compute")]
@@ -18,7 +19,7 @@ void rope(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform RopePara
 	// group x = row, thread = rotary pair index
 	let pair = int(tid.x);
 	let half_rot = p.rot_dim / 2;
-	if (pair >= half_rot)
+	if (pair >= (p.rot_pairs > 0 ? p.rot_pairs : half_rot))
 		return;
 	let row = int(gid.x);
 	let theta = float(p.pos[row]) * pow(p.freq_base, -(2.0f * float(pair) / float(p.rot_dim)));

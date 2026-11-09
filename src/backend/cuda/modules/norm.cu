@@ -7,8 +7,13 @@ namespace engine::modules {
 
 namespace {
 
+__device__ __forceinline__ float load_f( const half* p ) { return __half2float( *p ); }
+__device__ __forceinline__ float load_f( const float* p ) { return *p; }
+
+// T = half, or float for a residual stream kept in FP32 (Gemma 4)
+template <typename T>
 __global__ void rms_norm_kernel(
-	const half* __restrict__ src,
+	const T* __restrict__ src,
 	half* __restrict__ dst,
 	const half* __restrict__ weight,
 	int hidden_size,
@@ -16,7 +21,7 @@ __global__ void rms_norm_kernel(
 	float constant_bias
 ) {
 	int row = blockIdx.x;
-	const half* row_src = src + static_cast<int64_t>( row ) * hidden_size;
+	const T* row_src = src + static_cast<int64_t>( row ) * hidden_size;
 	half* row_dst = dst + static_cast<int64_t>( row ) * hidden_size;
 	int tid = threadIdx.x;
 	float local_sq = 0.0f;
@@ -31,7 +36,7 @@ __global__ void rms_norm_kernel(
 		#pragma unroll
 		for ( int k = 0; k < kMaxPer; ++k ) {
 			const int i = tid + k * blockDim.x;
-			v[k] = ( i < hidden_size ) ? __half2float( row_src[i] ) : 0.0f;
+			v[k] = ( i < hidden_size ) ? load_f( row_src + i ) : 0.0f;
 		}
 		#pragma unroll
 		for ( int k = 0; k < kMaxPer; ++k ) {
@@ -40,7 +45,7 @@ __global__ void rms_norm_kernel(
 	}
 	else {
 		for ( int i = tid; i < hidden_size; i += blockDim.x ) {
-			float val = __half2float( row_src[i] );
+			float val = load_f( row_src + i );
 			local_sq = fmaf( val, val, local_sq );
 		}
 	}
@@ -62,7 +67,7 @@ __global__ void rms_norm_kernel(
 	}
 	else {
 		for ( int i = tid; i < hidden_size; i += blockDim.x ) {
-			float val = __half2float( row_src[i] );
+			float val = load_f( row_src + i );
 			float w = ( weight != nullptr ) ? ( __half2float( weight[i] ) + constant_bias ) : 1.0f;
 			row_dst[i] = __float2half_rn( val * w * inv_rms );
 		}
@@ -86,7 +91,7 @@ __global__ void rms_norm_heads_kernel(
 	float val = __half2float( ptr[tid] );
 	float sq = val * val;
 
-	float inv_rms = rsqrtf( engine::math::block_sum<8>( sq ) / static_cast<float>( head_dim ) + eps );
+	float inv_rms = rsqrtf( engine::math::block_sum<16>( sq ) / static_cast<float>( head_dim ) + eps );
 	float w = ( weight != nullptr ) ? ( __half2float( weight[tid] ) + constant_bias ) : 1.0f;
 	ptr[tid] = __float2half_rn( val * w * inv_rms );
 }
@@ -224,6 +229,10 @@ void RMSNorm::forward(
 	for ( int i = 0; i < x.ndim - 1; ++i ) {
 		rows *= x.shape[i];
 	}
+	if ( x.dtype == pod::DType::FP32 ) {
+		rms_norm_kernel<float><<<dim3( rows ), dim3( 256 ), 0, stream>>>( x.ptr<const float>(), out.ptr<half>(), weight.ptr<const half>(), hidden_size, eps, constant_bias );
+		return;
+	}
 #if defined(USE_ROCM)
 	if ( hidden_size % 8 == 0 && hidden_size <= 8192 && ( reinterpret_cast<uintptr_t>( x.data ) & 15 ) == 0 && ( reinterpret_cast<uintptr_t>( out.data ) & 15 ) == 0
 		&& ( weight.data == nullptr || ( reinterpret_cast<uintptr_t>( weight.data ) & 15 ) == 0 ) ) {
@@ -231,7 +240,7 @@ void RMSNorm::forward(
 		return;
 	}
 #endif
-	rms_norm_kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>(
+	rms_norm_kernel<half><<<dim3( rows ), dim3( 256 ), 0, stream>>>(
 		x.ptr<const half>(),
 		out.ptr<half>(),
 		weight.ptr<const half>(),
@@ -259,6 +268,56 @@ void RMSNorm::forward_heads(
 		eps,
 		constant_bias
 	);
+}
+
+namespace {
+__global__ void softcap_kernel( half* __restrict__ x, size_t n, float cap, float inv_cap ) {
+	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
+	if ( i < n ) x[i] = __float2half_rn( cap * tanhf( __half2float( x[i] ) * inv_cap ) );
+}
+// resid = ( resid + rms_norm( y ) * w ) * scale, a block per row; resid FP32, y FP16
+__global__ void add_normed_kernel( float* __restrict__ resid, const half* __restrict__ y, const half* __restrict__ weight, int hidden_size,
+	float eps, float constant_bias, float scale ) {
+	const half* row_y = y + static_cast<int64_t>( blockIdx.x ) * hidden_size;
+	float* row_r = resid + static_cast<int64_t>( blockIdx.x ) * hidden_size;
+	float local_sq = 0.0f;
+	for ( int i = threadIdx.x; i < hidden_size; i += blockDim.x ) {
+		const float v = __half2float( row_y[i] );
+		local_sq = fmaf( v, v, local_sq );
+	}
+	const float inv_rms = rsqrtf( engine::math::block_sum<8>( local_sq ) / static_cast<float>( hidden_size ) + eps );
+	for ( int i = threadIdx.x; i < hidden_size; i += blockDim.x ) {
+		const float w = weight != nullptr ? __half2float( weight[i] ) + constant_bias : 1.0f;
+		row_r[i] = ( row_r[i] + __half2float( row_y[i] ) * inv_rms * w ) * scale;
+	}
+}
+
+__global__ void scale_to_f32_kernel( const half* __restrict__ x, float* __restrict__ out, size_t n, float scale ) {
+	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
+	if ( i < n ) out[i] = __half2float( x[i] ) * scale;
+}
+
+} // namespace
+
+void Elementwise::add_normed( pod::TensorView& resid, const pod::TensorView& y, const pod::TensorView& weight, float eps, float constant_bias,
+	float scale, cudaStream_t stream ) {
+	ENGINE_ASSERT( resid.dtype == pod::DType::FP32 && y.dtype == pod::DType::FP16, "Elementwise::add_normed: FP32 residual, FP16 input" );
+	const int hidden_size = y.shape[y.ndim - 1];
+	const int rows = static_cast<int>( y.numel() / hidden_size );
+	add_normed_kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>( resid.ptr<float>(), y.ptr<const half>(), weight.ptr<const half>(), hidden_size, eps, constant_bias, scale );
+}
+
+void Elementwise::scale_to_f32( const pod::TensorView& x, pod::TensorView& out, float scale, cudaStream_t stream ) {
+	ENGINE_ASSERT( x.dtype == pod::DType::FP16 && out.dtype == pod::DType::FP32, "Elementwise::scale_to_f32: FP16 in, FP32 out" );
+	const size_t n = x.numel();
+	if ( n == 0 ) return;
+	scale_to_f32_kernel<<<static_cast<unsigned>( ( n + 255 ) / 256 ), 256, 0, stream>>>( x.ptr<const half>(), out.ptr<float>(), n, scale );
+}
+
+void Elementwise::softcap( pod::TensorView& x, float cap, cudaStream_t stream ) {
+	const size_t n = x.numel();
+	if ( n == 0 ) return;
+	softcap_kernel<<<static_cast<unsigned>( ( n + 255 ) / 256 ), 256, 0, stream>>>( x.ptr<half>(), n, cap, 1.0f / cap );
 }
 
 void Elementwise::add_residual(

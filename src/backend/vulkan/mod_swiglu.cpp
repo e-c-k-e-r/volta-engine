@@ -8,9 +8,9 @@ namespace {
 namespace vki = ::engine::backend::impl;
 }
 
-void SwiGLU::forward( const pod::TensorView& gate, const pod::TensorView& up, pod::TensorView& out, backend::stream_t stream, float limit ) {
+void SwiGLU::forward( const pod::TensorView& gate, const pod::TensorView& up, pod::TensorView& out, backend::stream_t stream, float limit, bool gelu ) {
 	const int n = static_cast<int>( gate.numel() );
-	vki::SwigluParams p{ vki::dp( gate.data ), vki::dp( up.data ), vki::dp( out.data ), n, limit };
+	vki::SwigluParams p{ vki::dp( gate.data ), vki::dp( up.data ), vki::dp( out.data ), n, limit, gelu ? 1 : 0 };
 	vki::launch( "swiglu", p, stream, ( n + 255 ) / 256 );
 }
 

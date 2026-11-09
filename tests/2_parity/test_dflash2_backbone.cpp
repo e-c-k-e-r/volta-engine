@@ -425,7 +425,7 @@ Synthetic build( int H_, int L, int rows_, int qh, int kvh, int hd, int inter, i
 	c.rope_theta = 1.0e4f;
 	c.rope_dim_sections[0] = hd;
 	c.num_hidden_layers = L;
-	c.num_target_layer_ids = 1;
+	c.num_target_layer_ids = 5;   // the context stage concatenates five taps (fc is [H, 5 * H])
 
 	s.layers.resize( L );
 	s.wq.resize( L ); s.wk.resize( L ); s.wv.resize( L ); s.wo.resize( L );

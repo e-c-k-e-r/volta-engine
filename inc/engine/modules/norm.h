@@ -7,6 +7,7 @@
 namespace engine::modules {
 
 struct RMSNorm {
+	// x FP16, or FP32 (CUDA and CPU so far); out FP16
 	static void forward(
 		const pod::TensorView& x,
 		const pod::TensorView& weight,
@@ -40,6 +41,24 @@ struct Elementwise {
 		int numel,
 		backend::stream_t stream = nullptr
 	);
+
+	// resid = ( resid + rms_norm( y ) * ( weight + constant_bias ) ) * scale, row by row: a post-norm sublayer added to an FP32
+	// residual stream, then a per-layer scalar (Gemma 4's sandwich norms and layer_scalar). An empty weight is an unweighted norm.
+	static void add_normed(
+		pod::TensorView& resid,
+		const pod::TensorView& y,
+		const pod::TensorView& weight,
+		float eps,
+		float constant_bias,
+		float scale,
+		backend::stream_t stream = nullptr
+	);
+
+	// out = x * scale, FP16 in, FP32 out (an embedding into an FP32 residual stream)
+	static void scale_to_f32( const pod::TensorView& x, pod::TensorView& out, float scale, backend::stream_t stream = nullptr );
+
+	// x = cap * tanh( x / cap ), in place (FP16; Gemma's final logit softcap)
+	static void softcap( pod::TensorView& x, float cap, backend::stream_t stream = nullptr );
 
 	static void batched_argmax(
 		const pod::TensorView& logits,

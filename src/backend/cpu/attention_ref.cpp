@@ -16,6 +16,7 @@ struct RefAttnParams {
 	int layer_idx; int num_q_heads; int num_kv_heads; int head_dim; int max_seq; int has_gate;
 	float scale;
 	uint8_t* ks; uint8_t* vs; int kq; int vq;
+	int window;
 };
 
 extern "C" void ref_attn_decode_cpu( ComputeVaryingInput*, void*, void* ) __attribute__(( weak ));
@@ -25,15 +26,15 @@ namespace engine::modules {
 namespace {
 
 void ref_attention( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride,
-	int layer_idx, const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq ) {
+	int layer_idx, const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, float scale = 0.0f, int window = 0 ) {
 	if ( ref_attn_decode_cpu == nullptr ) {
 		ENGINE_UNSUPPORTED( "Attention decode/prefill (ref_attn_cpu library not linked)" );
 	}
-	ENGINE_ASSERT( head_dim <= 256 && num_kv_heads > 0 && num_q_heads % num_kv_heads == 0, "Attention (CPU): head_dim <= 256 and GQA only" );
+	ENGINE_ASSERT( head_dim <= 512 && num_kv_heads > 0 && num_q_heads % num_kv_heads == 0, "Attention (CPU): head_dim <= 512 and GQA only" );
 	RefAttnParams p{ const_cast<half*>( q.ptr<const half>() ), static_cast<half*>( kv.k ), static_cast<half*>( kv.v ), gate.data != nullptr ? const_cast<half*>( gate.ptr<const half>() ) : nullptr, out.ptr<half>(),
 		const_cast<int*>( d_rows->slot ), const_cast<int*>( d_rows->pos ), static_cast<int64_t>( slot_stride ), layer_idx, num_q_heads, num_kv_heads,
-		head_dim, max_seq, gate.data != nullptr ? 1 : 0, 1.0f / std::sqrt( static_cast<float>( head_dim ) ),
-		static_cast<uint8_t*>( kv.ks ), static_cast<uint8_t*>( kv.vs ), static_cast<int>( kv.kq ), static_cast<int>( kv.vq ) };
+		head_dim, max_seq, gate.data != nullptr ? 1 : 0, scale > 0.0f ? scale : 1.0f / std::sqrt( static_cast<float>( head_dim ) ),
+		static_cast<uint8_t*>( kv.ks ), static_cast<uint8_t*>( kv.vs ), static_cast<int>( kv.kq ), static_cast<int>( kv.vq ), window };
 	ENGINE_ASSERT( kv.vq != pod::KVQ::Q4 || head_dim % 64 == 0, "Attention (CPU): Q4 values need head_dim % 64 == 0" );
 	impl::cpu_dispatch( ref_attn_decode_cpu, &p, num_q_heads, count );
 }
@@ -41,8 +42,8 @@ void ref_attention( const pod::KVRef& kv, const pod::TensorView& q, const pod::T
 }
 
 void Attention::forward_decode( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
-	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t ) {
-	ref_attention( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq );
+	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t, float scale, int window ) {
+	ref_attention( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, scale, window );
 }
 
 void Attention::forward_prefill( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,

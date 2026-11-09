@@ -11,7 +11,8 @@ void add_residual(uint3 tid : SV_DispatchThreadID, uniform AddParams p) {
 		p.hidden[i] = half(float(p.hidden[i]) + float(p.residual[i]));
 }
 
-struct SwigluParams { half* gate; half* up; half* out_; int n; float limit; };
+// gelu != 0: gelu_tanh( gate ) * up (Gemma's gated MLP) instead of silu( gate ) * up
+struct SwigluParams { half* gate; half* up; half* out_; int n; float limit; int gelu; };
 
 float swiglu_value(float g, float u, float limit) {
 	if (limit > 0.0f) {
@@ -21,12 +22,38 @@ float swiglu_value(float g, float u, float limit) {
 	return g / (1.0f + exp(-g)) * u;
 }
 
+float gelu_tanh(float x) {
+	return 0.5f * x * (1.0f + tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+}
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void swiglu(uint3 tid : SV_DispatchThreadID, uniform SwigluParams p) {
 	let i = int(tid.x);
 	if (i < p.n)
-		p.out_[i] = half(swiglu_value(float(p.gate[i]), float(p.up[i]), p.limit));
+		p.out_[i] = half(p.gelu != 0 ? gelu_tanh(float(p.gate[i])) * float(p.up[i]) : swiglu_value(float(p.gate[i]), float(p.up[i]), p.limit));
+}
+
+// out = x * scale, FP16 in, FP32 out (an embedding into an FP32 residual stream)
+struct ScaleF32Params { half* x; float* out_; int n; float scale; };
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void scale_to_f32(uint3 tid : SV_DispatchThreadID, uniform ScaleF32Params p) {
+	let i = int(tid.x);
+	if (i < p.n)
+		p.out_[i] = float(p.x[i]) * p.scale;
+}
+
+// x = cap * tanh( x / cap ), in place (a final logit softcap)
+struct SoftcapParams { half* x; int n; float cap; };
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void softcap(uint3 tid : SV_DispatchThreadID, uniform SoftcapParams p) {
+	let i = int(tid.x);
+	if (i < p.n)
+		p.x[i] = half(p.cap * tanh(float(p.x[i]) / p.cap));
 }
 
 // gate_up rows are [gate (inter_dim) | up (inter_dim)]

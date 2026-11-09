@@ -2,6 +2,7 @@
 // enabled (the regime DFlash2 was trained on) or suppressed (--nothink), reporting per-position candidate
 // quality: how often the drafter's best candidate / its top-k set / the selector walk hit the target's token.
 //   bench_accept [--glm] [--nothink] [--tokens N] [--prompts K] [--temp T]   (T > 0 samples, top_p 0.95)
+//   bench_accept --type gemma4 --model <dir> --draft <dir> ...   (another target and drafter; Gemma 4 prompts use its turn format)
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"
 #include "engine/loader/chat_template.h"
@@ -18,8 +19,14 @@ int main( int argc, char** argv ) {
 	float temp = 0.0f;
 	std::vector<float> depths = { -1.0f };   // --depths a,b,c: the survival threshold of the depth policy for each pass (-1 = the whole block)
 	bool glm = false;
+	const char* model_type = nullptr;
+	const char* model_dir = nullptr;
+	const char* draft_dir = nullptr;
 	for ( int i = 1; i < argc; ++i ) {
-		if ( !std::strcmp( argv[i], "--nothink" ) ) think = false;
+		if ( !std::strcmp( argv[i], "--type" ) && i + 1 < argc ) model_type = argv[++i];
+		else if ( !std::strcmp( argv[i], "--model" ) && i + 1 < argc ) model_dir = argv[++i];
+		else if ( !std::strcmp( argv[i], "--draft" ) && i + 1 < argc ) draft_dir = argv[++i];
+		else if ( !std::strcmp( argv[i], "--nothink" ) ) think = false;
 		else if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
 		else if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--prompts" ) && i + 1 < argc ) n_prompts = std::atoi( argv[++i] );
@@ -46,15 +53,17 @@ int main( int argc, char** argv ) {
 	const char* one_prompt = std::getenv( "BENCH_PROMPT" ); // measure a single prompt of your own
 	const int total = one_prompt ? 1 : static_cast<int>( sizeof( prompts ) / sizeof( prompts[0] ) );
 
+	const bool gemma = model_type != nullptr && !std::strcmp( model_type, "gemma4" );
+	const char* dir = model_dir ? model_dir : ( glm ? test::GLM_DIR : test::QWEN_DIR );
 	engine::loader::Tokenizer tok;
-	ENGINE_ASSERT( tok.load( glm ? test::GLM_DIR : test::QWEN_DIR ), "tokenizer load failed" );
+	ENGINE_ASSERT( tok.load( dir ), "tokenizer load failed" );
 	engine::loader::ChatTemplate chat;
-	ENGINE_ASSERT( chat.load( glm ? test::GLM_DIR : test::QWEN_DIR ), "chat template load failed" );
+	ENGINE_ASSERT( gemma || chat.load( dir ), "chat template load failed" );
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm5_next" : "qwen3_5";
-	cfg.model_dir = glm ? test::GLM_DIR : test::QWEN_DIR;
-	cfg.draft_model_dir = glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR;
+	cfg.model_type = model_type ? model_type : ( glm ? "glm5_next" : "qwen3_5" );
+	cfg.model_dir = dir;
+	cfg.draft_model_dir = draft_dir ? draft_dir : ( glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR );
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	mc.warm_graphs( 8 );
 	mc.spec().set_diag( true );
@@ -68,7 +77,16 @@ int main( int argc, char** argv ) {
 	double ms = 0.0;
 	for ( int pi = 0; pi < total && pi < n_prompts; ++pi ) {
 		std::vector<int> ids;
-		if ( glm ) {
+		if ( gemma ) {
+			// <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n
+			ids = { 2, 105 };
+			const std::vector<int> body = tok.encode( std::string( "user\n" ) + ( one_prompt ? one_prompt : prompts[pi] ), false );
+			ids.insert( ids.end(), body.begin(), body.end() );
+			const std::vector<int> head = tok.encode( "model\n", false );
+			ids.insert( ids.end(), { 106, 107, 105 } );
+			ids.insert( ids.end(), head.begin(), head.end() );
+		}
+		else if ( glm ) {
 			engine::loader::ChatTemplateOptions opts;
 			opts.enable_thinking = think;
 			ids = tok.encode( chat.render( { { "user", ( one_prompt ? one_prompt : prompts[pi] ) } }, opts ), false );

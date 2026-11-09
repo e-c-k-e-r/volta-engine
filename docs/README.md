@@ -8,6 +8,7 @@
   * Qwen3.8-27B (`qwen3_5`): GDN linear attention + full attention
   * GLM-5.3-Flash (`glm5_next`): KDA linear attention + absorbed MLA with a sparse indexer, routed MoE
   * Qwen3.8-Flash-Next (`qwen4_exp`): GDN + QSA block-sparse attention, 512-expert MoE, gated residuals, n-gram embedding layer
+  * Gemma 4 31B (`gemma4`): sliding-window (1024) and full attention (head_dim 512, K = V), sandwich norms, an FP32 residual stream; EXL3, NVFP4 and GGUF on CUDA, CPU and Vulkan
   * MiniMax-H3: video + audio generation (see [video.md](video.md))
 * weight formats
   * EXL3 (trellis) through the ported SM70 GEMM / GEMV / MoE kernels
@@ -16,7 +17,7 @@
 * serving
   * OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) APIs, with reasoning and tool-call parsing
   * a prefix cache in pinned host RAM, interleaved prefill, up to 256K context with two slots
-  * speculative decoding with either a DFlash2 drafter or the checkpoint's own MTP head
+  * speculative decoding with a DFlash2 or DFlash drafter or the checkpoint's own MTP head
   * image input (Qwen, GLM, Flash-Next)
   * a `/monitor` page with throughput, per-GPU power / clocks, speculation, prefix cache, and MoE routing heat maps
 * two-tier expert residency (hot experts on the GPU, the rest in pinned host RAM) as a capacity valve for MoE models

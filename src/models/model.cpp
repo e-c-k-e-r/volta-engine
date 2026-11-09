@@ -1,6 +1,7 @@
 #include "engine/models/model.h"
 #include "engine/backend/runtime.h"
 #include "engine/models/qwen3_5.h"
+#include "engine/models/gemma4.h"
 #include "engine/models/glm5_next.h"
 #include "engine/models/qwen4_exp.h"
 #include "engine/models/deepseek_v41.h"
@@ -9,9 +10,10 @@
 
 namespace engine::models {
 
-void alloc_draft_taps( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int max_seq, int hidden, int slots, bool per_slot ) {
+void alloc_draft_taps( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int max_seq, int hidden, int slots, bool per_slot, int taps_n ) {
 	hooks.taps_cap = MAX( MIN( max_seq, 2048 ), 256 );
-	const int tap_cols = 5 * hidden;
+	hooks.taps_n = taps_n;
+	const int tap_cols = taps_n * hidden;
 	int shape[2] = { ( per_slot ? slots : 1 ) * hooks.taps_cap, tap_cols };
 	if ( per_slot ) hooks.taps_slot_stride = static_cast<size_t>( hooks.taps_cap ) * tap_cols;
 	s.taps = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
@@ -26,7 +28,7 @@ bool read_draft_taps( const DraftHooks& hooks, int slot_id, int slots, int first
 	const int cap = hooks.taps_cap;
 	if ( hooks.taps == nullptr || slot_id < 0 || slot_id >= slots || first_pos < 0 || count <= 0 || count > cap ) return false;
 	if ( hooks.taps_slot_stride == 0 && slot_id != 0 ) return false;   // one shared ring: only a single-slot server reads it unambiguously
-	const size_t row = static_cast<size_t>( 5 ) * hidden;
+	const size_t row = static_cast<size_t>( hooks.taps_n ) * hidden;
 	const backend::half_t* ring = hooks.taps + static_cast<size_t>( slot_id ) * hooks.taps_slot_stride;
 	// Position p lives in ring row p % cap: at most two contiguous runs
 	for ( int done = 0; done < count; ) {
@@ -88,11 +90,14 @@ std::unique_ptr<ModelPipeline> create_model_pipeline( const std::string& model_t
 	if ( model_type == "deepseek_v41" ) {
 		return std::make_unique<DeepseekV41Pipeline>();
 	}
+	if ( model_type == "gemma4" ) {
+		return std::make_unique<Gemma4Pipeline>();
+	}
 	return nullptr;
 }
 
 bool is_known_model_type( const std::string& model_type ) {
-	return model_type == "qwen3_5" || model_type == "glm5_next" || model_type == "qwen4_exp" || model_type == "deepseek_v41";
+	return model_type == "qwen3_5" || model_type == "glm5_next" || model_type == "qwen4_exp" || model_type == "deepseek_v41" || model_type == "gemma4";
 }
 
 } // namespace engine::models

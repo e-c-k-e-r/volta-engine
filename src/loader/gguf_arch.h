@@ -58,5 +58,6 @@ bool gguf_arch_qwen35( const GgufKv& kv, GgufArch* out );
 bool gguf_arch_qwen4exp( const GgufKv& kv, GgufArch* out );
 bool gguf_arch_dflash( const GgufKv& kv, GgufArch* out );
 bool gguf_arch_glm5next( const GgufKv& kv, GgufArch* out );
+bool gguf_arch_gemma4( const GgufKv& kv, GgufArch* out );
 
 } // namespace engine::loader

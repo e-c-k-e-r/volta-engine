@@ -12,7 +12,8 @@ __global__ void swiglu_kernel(
 	const half* __restrict__ up,
 	half* __restrict__ out,
 	int numel,
-	float limit
+	float limit,
+	bool gelu
 ) {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if ( idx < numel ) {
@@ -22,8 +23,8 @@ __global__ void swiglu_kernel(
 			g = fminf( g, limit );
 			u = fmaxf( -limit, fminf( u, limit ) );
 		}
-		float silu_g = engine::math::silu( g );
-		out[idx] = __float2half_rn( silu_g * u );
+		float act_g = gelu ? engine::math::gelu_tanh( g ) : engine::math::silu( g );
+		out[idx] = __float2half_rn( act_g * u );
 	}
 }
 
@@ -57,7 +58,8 @@ void SwiGLU::forward(
 	const pod::TensorView& up,
 	pod::TensorView& out,
 	cudaStream_t stream,
-	float limit
+	float limit,
+	bool gelu
 ) {
 	int numel = gate.numel();
 	int threads = 256;
@@ -67,7 +69,8 @@ void SwiGLU::forward(
 		up.ptr<const half>(),
 		out.ptr<half>(),
 		numel,
-		limit
+		limit,
+		gelu
 	);
 }
 
