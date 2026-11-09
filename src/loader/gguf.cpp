@@ -164,6 +164,7 @@ bool gguf_open( pod::SafeTensorsFile& st, const char* path, const pod::SafeTenso
 		else if ( s->arch_name == "dflash" ) have_arch = gguf_arch_dflash( s->kv, &s->arch );
 		else if ( s->arch_name == "glm5-next" ) have_arch = gguf_arch_glm5next( s->kv, &s->arch );
 		else if ( s->arch_name == "gemma4" ) have_arch = gguf_arch_gemma4( s->kv, &s->arch );
+		else if ( s->arch_name == "clip" ) have_arch = gguf_arch_clip( s->kv, &s->arch );
 		if ( !have_arch ) {
 			LOG_ERROR( "[gguf] %s: architecture '%s' has no adapter\n", path, s->arch_name.c_str() );
 			safetensors_close( st );
@@ -239,6 +240,21 @@ bool gguf_open( pod::SafeTensorsFile& st, const char* path, const pod::SafeTenso
 					if ( m.transform == GgufTransform::ALogFromNegExp ) untile_rows( data, rb, 0, s->arch, 1 );
 					float* v = reinterpret_cast<float*>( data.data() );
 					for ( size_t i = 0; i < meta.size_bytes / sizeof( float ); ++i ) v[i] = m.transform == GgufTransform::NormMinusOne ? v[i] - 1.0f : std::log( -v[i] );
+				}
+				else if ( m.transform == GgufTransform::PatchChwToHwc ) {
+					// ne = [x, y, channel, n]: element (n, c, y, x) moves to (n, y, x, c), and the tensor becomes [n, y * x * channel]
+					if ( t.ne.size() != 4 || ( type != GgmlType::F32 && type != GgmlType::F16 && type != GgmlType::BF16 ) ) return fail( "a patch embedding is not a 4-D float tensor" );
+					const size_t es = type == GgmlType::F32 ? 4 : 2, X = t.ne[0], Y = t.ne[1], C = t.ne[2], N = t.ne[3];
+					const std::vector<uint8_t> src_copy( data );
+					for ( size_t n = 0; n < N; ++n )
+						for ( size_t c = 0; c < C; ++c )
+							for ( size_t y = 0; y < Y; ++y )
+								for ( size_t x = 0; x < X; ++x )
+									std::memcpy( &data[( ( ( n * Y + y ) * X + x ) * C + c ) * es], &src_copy[( ( ( n * C + c ) * Y + y ) * X + x ) * es], es );
+					meta.ndim = 2;
+					meta.shape[0] = static_cast<int>( N );
+					meta.shape[1] = static_cast<int>( X * Y * C );
+					meta.shape[2] = meta.shape[3] = 0;
 				}
 				else if ( m.transform == GgufTransform::TransposeHeads ) {
 					// ne = [b, a, heads]: head h's a x b matrix becomes b x a

@@ -29,6 +29,7 @@ enum class GgufTransform {
 	RowsUntileVPart,     // the same for the rows after the first `row_offset` (the V part of [q | k | v])
 	ColsTiled,           // input columns in tiled order: left as stored, flagged (GGUF_COLS_V_TILED)
 	TransposeHeads,      // a stack of per-head matrices stored transposed ([heads][a][b] for [heads][b][a]; F32 / F16 / BF16): each transposed back
+	PatchChwToHwc,       // a patch embedding stored as a conv kernel [n][channel][y][x] (F32 / F16 / BF16): back to [n, y * x * channel] (Gemma 4)
 };
 
 struct GgufMapped {
@@ -59,5 +60,6 @@ bool gguf_arch_qwen4exp( const GgufKv& kv, GgufArch* out );
 bool gguf_arch_dflash( const GgufKv& kv, GgufArch* out );
 bool gguf_arch_glm5next( const GgufKv& kv, GgufArch* out );
 bool gguf_arch_gemma4( const GgufKv& kv, GgufArch* out );
+bool gguf_arch_clip( const GgufKv& kv, GgufArch* out );   // a vision projector (mmproj) file: Gemma 4's (projector type gemma4v)
 
 } // namespace engine::loader

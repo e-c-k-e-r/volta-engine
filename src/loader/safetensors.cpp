@@ -477,19 +477,19 @@ void check_exl3_tile_layout( const char* dir ) {
 
 } // namespace
 
-bool SafeTensorsRepo::open( const char* dir_path ) {
+bool SafeTensorsRepo::open( const char* dir_path, bool mmproj ) {
 	close();
 	std::strncpy( dir_path_, dir_path, sizeof( dir_path_ ) - 1 );
 	dir_path_[sizeof( dir_path_ ) - 1] = '\0';
-	check_exl3_tile_layout( dir_path );
+	if ( !mmproj ) check_exl3_tile_layout( dir_path );
 
 	std::vector<std::string> shard_files;
 
-	// 1. Try to parse model.safetensors.index.json
+	// 1. Try to parse model.safetensors.index.json (a projector file is a GGUF of its own: straight to step 3)
 	char index_path[1024];
 	std::snprintf( index_path, sizeof( index_path ), "%s/model.safetensors.index.json", dir_path );
 
-	FILE* f_idx = std::fopen( index_path, "rb" );
+	FILE* f_idx = mmproj ? nullptr : std::fopen( index_path, "rb" );
 	if ( f_idx != nullptr ) {
 		std::fseek( f_idx, 0, SEEK_END );
 		long sz = std::ftell( f_idx );
@@ -523,7 +523,7 @@ bool SafeTensorsRepo::open( const char* dir_path ) {
 	}
 
 	// 2. If index.json was not found or empty, scan directory for safetensors
-	if ( shard_files.empty() ) {
+	if ( shard_files.empty() && !mmproj ) {
 		DIR* dir = opendir( dir_path );
 		if ( dir != nullptr ) {
 			struct dirent* entry;
@@ -547,7 +547,7 @@ bool SafeTensorsRepo::open( const char* dir_path ) {
 		if ( DIR* dir = opendir( dir_path ) ) {
 			while ( struct dirent* entry = readdir( dir ) ) {
 				const size_t len = std::strlen( entry->d_name );
-				if ( len > 5 && std::strcmp( entry->d_name + len - 5, ".gguf" ) == 0 && std::strstr( entry->d_name, "mmproj" ) == nullptr ) ggufs.push_back( entry->d_name );
+				if ( len > 5 && std::strcmp( entry->d_name + len - 5, ".gguf" ) == 0 && ( std::strstr( entry->d_name, "mmproj" ) != nullptr ) == mmproj ) ggufs.push_back( entry->d_name );
 			}
 			closedir( dir );
 		}
@@ -580,6 +580,8 @@ bool SafeTensorsRepo::open( const char* dir_path ) {
 			return true;
 		}
 	}
+
+	if ( mmproj ) return false;   // no projector file
 
 	// 4. Fallback: single model.safetensors
 	if ( shard_files.empty() ) {

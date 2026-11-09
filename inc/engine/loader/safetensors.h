@@ -59,7 +59,8 @@ public:
 	SafeTensorsRepo( const SafeTensorsRepo& ) = delete;
 	SafeTensorsRepo& operator=( const SafeTensorsRepo& ) = delete;
 
-	bool open( const char* dir_path );
+	// mmproj: the directory's vision projector GGUF (a file named *mmproj*.gguf) instead of the model
+	bool open( const char* dir_path, bool mmproj = false );
 	void close();
 
 	const pod::SafeTensorMeta* find( const char* name, int* out_shard_idx = nullptr ) const;

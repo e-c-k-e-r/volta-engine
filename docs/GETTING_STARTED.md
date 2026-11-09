@@ -150,7 +150,7 @@ Qwen extras:
   the routed experts of Flash-Next and GLM run route by route on the same dot products and take part in the expert tier (`expert_cache`); Flash-Next's n-gram
   table stays memory-mapped and is decoded row by row on the host; norms, embeddings and other small tensors are dequantized once at load.
   The 27B's MTP head is read from its GGUF file, and a DFlash2 drafter directory may hold a GGUF conversion (llama.cpp's `dflash`
-  architecture) with the release's `config.json`; the vision projector (`mmproj`) and the MTP blocks of Flash-Next and GLM are not read.
+  architecture) with the release's `config.json`; the vision projector (`mmproj`) is read for Gemma 4 only, and the MTP blocks of Flash-Next and GLM are not read.
   The CPU backend runs GGUF projections through llama.cpp's CPU kernels (its AVX2 / AVX-512 dot products, the activations quantized to
   q8_0, q8_1 or q8_K by type; the q8_K types through ik_llama.cpp's iqk kernels), the Vulkan backend through llama.cpp's mat-vec and matmul shaders
   (src/kernels/vulkan/ggml, compiled with glslc) and Slang kernels (src/kernels/slang/gguf.slang), every type but Q2_0; on CPU and Vulkan the routed experts of Flash-Next and GLM
@@ -180,7 +180,8 @@ Qwen extras:
   about 110 tok/s with the drafter (4.3 tokens a round on the bench prompts), and a 3019-token prompt prefills in 1.6 s. Images: the checkpoint's vision tower (27 ViT blocks with a 2-D rotary, 3 x 3 pooling into
   at most 280 soft tokens, `max_image_tokens` caps that) runs on rank 0 from the BF16 `model.vision_tower.*` tensors (1.1 GB; 124 ms for a
   1008 x 576 image); an image's tokens attend to the whole image on the sliding-window layers and causally on the full-attention ones (the
-  Hugging Face masks), and a prefill forward never splits an image. The GGUF directory's `mmproj` file is not read yet.
+  Hugging Face masks), and a prefill forward never splits an image. A GGUF directory's tower is its `mmproj` file (llama.cpp's
+  `clip` architecture with the `gemma4v` projector).
 * **Two GPUs per instance**: `--tp-size 2` runs one model on two GPUs (about 0.7x the speed of four); start a second server with
   `CUDA_VISIBLE_DEVICES=2,3` on the other pair for twice the aggregate throughput. GLM runs on 1, 2 or 4 GPUs (on two, the experts need the expert tier, `expert_cache` below 1, to fit).
 

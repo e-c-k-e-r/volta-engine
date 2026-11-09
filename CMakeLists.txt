@@ -133,6 +133,7 @@ set(ENGINE_HOST_SOURCES
 	src/loader/gguf_glm5next.cpp
 	src/loader/gguf_dflash.cpp
 	src/loader/gguf_gemma4.cpp
+	src/loader/gguf_clip.cpp
 	src/loader/gguf_types.cpp
 	src/loader/nvfp4.cpp
 	src/loader/tokenizer.cpp

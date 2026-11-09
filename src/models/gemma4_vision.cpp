@@ -45,6 +45,11 @@ bool Gemma4VisionTower::load( const char* model_dir, pod::MemoryArena& arena, in
 	if ( !repo.open( model_dir ) ) return false;
 	const char* VT = "model.vision_tower.";
 	auto has = [&]( const std::string& n ) { return repo.find( n.c_str() ) != nullptr; };
+	// a GGUF model keeps the tower in its mmproj file
+	if ( !has( std::string( VT ) + "patch_embedder.input_proj.weight" ) && !repo.open( model_dir, true ) ) {
+		LOG_WARN( "[vision] checkpoint has no Gemma 4 vision tower; image input disabled\n" );
+		return false;
+	}
 	if ( !has( std::string( VT ) + "patch_embedder.input_proj.weight" ) || !has( "model.embed_vision.embedding_projection.weight" ) ) {
 		LOG_WARN( "[vision] checkpoint has no Gemma 4 vision tower; image input disabled\n" );
 		repo.close();
