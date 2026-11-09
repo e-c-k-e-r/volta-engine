@@ -235,9 +235,24 @@ bool ModelCluster::encode_image( const engine::loader::PreparedImage& image, std
 	return models_[0]->encode_image( image, out, streams_[0] );
 }
 
-// Fills the M-RoPE positions of rows whose slot has images (and sets rows.mrope); a no-op when no slot has any
+// Fills the M-RoPE positions of rows whose slot has images (and sets rows.mrope), or for a model with bidirectional images the rows' key
+// limits (rows.bidir); a no-op when no slot has any
 void ModelCluster::apply_mrope( pod::BatchRows& rows ) const {
 	if ( mm_slots_ == 0 ) return;
+	if ( !models_[0]->image_mrope() ) {
+		// Bidirectional images instead (Gemma 4): an image row sees its whole image
+		if ( !models_[0]->bidirectional_images() ) return;
+		bool any = false;
+		for ( int m = 0; m < rows.count; ++m ) {
+			const int slot = rows.slot[m];
+			const MmLayout* layout = ( static_cast<size_t>( slot ) < slot_mm_.size() && !slot_mm_[slot].empty() ) ? &slot_mm_[slot] : nullptr;
+			const MmImage* im = layout ? layout->image_at( rows.pos[m] ) : nullptr;
+			rows.key_end[m] = im ? im->start + im->count : rows.pos[m] + 1;
+			any = any || im != nullptr;
+		}
+		rows.bidir = any ? 1 : 0;
+		return;
+	}
 	bool any = false;
 	for ( int m = 0; m < rows.count; ++m ) {
 		const int slot = rows.slot[m];
@@ -379,6 +394,14 @@ void ModelCluster::mtp_save_hist( int src_row, int rows, int dst_row ) {
 	} );
 }
 
+int ModelCluster::span_safe_end( int slot, int from, int end ) const {
+	if ( mm_slots_ == 0 || !models_[0]->bidirectional_images() || slot < 0 || static_cast<size_t>( slot ) >= slot_mm_.size() ) return end;
+	for ( const MmImage& im : slot_mm_[slot].images ) {
+		if ( end > im.start && end < im.start + im.count ) return im.start > from ? im.start : im.start + im.count;
+	}
+	return end;
+}
+
 int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Candidates* last_cands, int pos0 ) {
 	ENGINE_ASSERT( count >= 1, "ModelCluster::prefill: empty prompt" );
 	const int max_rows = metadata().max_rows;
@@ -418,6 +441,8 @@ int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Ca
 			continue;
 		}
 		last_rows = MIN( chunk, count - pos );
+		// whole images per forward (bidirectional images)
+		last_rows = MIN( span_safe_end( slot, pos0 + pos, pos0 + pos + last_rows ) - pos0, count ) - pos;
 		const bool last = ( pos + last_rows >= count );
 		forward( tokens + pos, pod::BatchRows::causal( last_rows, pos0 + pos, slot,
 			last ? pod::BatchRows::LOGITS_LAST : pod::BatchRows::LOGITS_NONE ) );

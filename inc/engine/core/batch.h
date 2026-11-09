@@ -33,9 +33,14 @@ struct BatchRows {
 	// Multimodal rotary positions (M-RoPE). With mrope != 0, row m rotates by rope_pos[0..2][m] (time, height, width) instead of
 	// pos[m]; pos[m] stays the KV index. Only the prefix up to rope_pos is uploaded when mrope is 0.
 	int mrope = 0;
+	// Bidirectional image spans (Gemma 4): with bidir != 0, row m of a sliding-window attention attends to keys below key_end[m] (the end of
+	// its image for an image row, pos[m] + 1 otherwise; the window still counts back from pos[m]); attention without a window stays causal,
+	// as Gemma 4's full-attention layers are. Only uploaded when bidir is set.
+	int bidir = 0;
 	int rope_pos[3][MAX_ROWS];
+	int key_end[MAX_ROWS];
 
-	size_t upload_bytes() const { return mrope ? sizeof( BatchRows ) : offsetof( BatchRows, rope_pos ); }
+	size_t upload_bytes() const { return bidir ? sizeof( BatchRows ) : mrope ? offsetof( BatchRows, key_end ) : offsetof( BatchRows, rope_pos ); }
 
 	static BatchRows causal( int count, int base_pos, int slot_id, int logits_mode = LOGITS_ALL ) {
 		ENGINE_ASSERT( count >= 1 && count <= MAX_ROWS, "BatchRows::causal: count out of range" );

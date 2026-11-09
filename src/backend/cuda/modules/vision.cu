@@ -120,6 +120,56 @@ __global__ void qkv_norm_rope_kernel( half* __restrict__ q, half* __restrict__ k
 	}
 }
 
+// One block per (row, head), 128 threads: q, k normalized with gains, v without, then q and k rotated in their x / y halves
+__global__ void qkv_norm_rope2d_kernel( half* __restrict__ q, half* __restrict__ k, half* __restrict__ v, const half* __restrict__ qn,
+	const half* __restrict__ kn, const int* __restrict__ pos_xy, int heads, int hd, float theta, float eps ) {
+	__shared__ float s_x[128];
+	const int row = blockIdx.y, head = blockIdx.x, t = threadIdx.x;
+	const size_t off = ( static_cast<size_t>( row ) * heads + head ) * hd;
+	const int half_d = hd / 2, quarter = hd / 4;
+	for ( int which = 0; which < 3; ++which ) {
+		half* x = ( which == 0 ? q : which == 1 ? k : v ) + off;
+		const half* w = which == 0 ? qn : which == 1 ? kn : nullptr;
+		const float val = t < hd ? __half2float( x[t] ) : 0.0f;
+		const float inv = rsqrtf( engine::math::block_sum<4>( val * val ) / hd + eps );
+		float y = val * inv * ( w != nullptr && t < hd ? __half2float( w[t] ) : 1.0f );
+		if ( which < 2 ) {
+			// pair (i, i + quarter) inside the half: s_x holds the normalized head, every thread reads its partner
+			__syncthreads();
+			if ( t < hd ) s_x[t] = y;
+			__syncthreads();
+			if ( t < hd ) {
+				const int hf = t / half_d, i = t % half_d, pi = i % quarter;
+				const float pos = static_cast<float>( pos_xy[2 * row + hf] );
+				const float ang = pos * powf( theta, -2.0f * pi / static_cast<float>( half_d ) );
+				float sn, cs;
+				sincosf( ang, &sn, &cs );
+				const float partner = s_x[hf * half_d + ( i < quarter ? i + quarter : i - quarter )];
+				y = i < quarter ? y * cs - partner * sn : y * cs + partner * sn;
+			}
+		}
+		if ( t < hd ) x[t] = __float2half_rn( y );
+		__syncthreads();   // block_sum's shared array is reused by the next tensor
+	}
+}
+
+// One block per soft token: the mean of its k x k patches, scaled and standardized
+__global__ void pool_std_kernel( const float* __restrict__ x, const half* __restrict__ bias, const half* __restrict__ scale, half* __restrict__ out,
+	int gw, int k, int n, float mul ) {
+	const int tok = blockIdx.x, tw = gw / k;
+	const int ty = tok / tw, tx = tok % tw;
+	const float inv = 1.0f / static_cast<float>( k * k );
+	for ( int c = threadIdx.x; c < n; c += blockDim.x ) {
+		float acc = 0.0f;
+		for ( int dy = 0; dy < k; ++dy )
+			for ( int dx = 0; dx < k; ++dx ) acc += x[( static_cast<size_t>( ty * k + dy ) * gw + tx * k + dx ) * n + c];
+		float vv = acc * inv * mul;
+		if ( bias ) vv -= __half2float( bias[c] );
+		if ( scale ) vv *= __half2float( scale[c] );
+		out[static_cast<size_t>( tok ) * n + c] = __float2half_rn( vv );
+	}
+}
+
 __global__ void merge_gather_kernel( const half* __restrict__ h, half* __restrict__ out, int n, int group ) {
 	const int t = blockIdx.x;
 	for ( int idx = threadIdx.x; idx < n * group; idx += blockDim.x ) {
@@ -592,6 +642,17 @@ void Vision::qkv_bias_norm_rope( half* q, half* k, half* v, const half* bq, cons
 	const float* cos_table, const float* sin_table, int m, int heads, int head_dim, float eps, cudaStream_t stream ) {
 	ENGINE_ASSERT( head_dim == 64 && heads <= 32, "Vision::qkv_bias_norm_rope: 64-wide heads, at most 32" );
 	qkv_norm_rope_kernel<<<m, heads * 32, 0, stream>>>( q, k, v, bq, bk, bv, qn, kn, cos_table, sin_table, heads, eps );
+}
+
+void Vision::qkv_norm_rope2d( half* q, half* k, half* v, const half* qn, const half* kn, const int* pos_xy, int m, int heads, int head_dim, float theta,
+	float eps, cudaStream_t stream ) {
+	ENGINE_ASSERT( head_dim <= 128 && head_dim % 4 == 0, "Vision::qkv_norm_rope2d: head_dim a multiple of 4, at most 128" );
+	qkv_norm_rope2d_kernel<<<dim3( heads, m ), 128, 0, stream>>>( q, k, v, qn, kn, pos_xy, heads, head_dim, theta, eps );
+}
+
+void Vision::pool_std( const float* x, const half* bias, const half* scale, half* out, int gh, int gw, int k, int n, cudaStream_t stream ) {
+	ENGINE_ASSERT( gh % k == 0 && gw % k == 0, "Vision::pool_std: the patch grid must be whole k x k cells" );
+	pool_std_kernel<<<( gh / k ) * ( gw / k ), 256, 0, stream>>>( x, bias, scale, out, gw, k, n, sqrtf( static_cast<float>( n ) ) );
 }
 
 void Vision::merge_gather( const half* h, half* out, int tokens, int n, int group, cudaStream_t stream ) {

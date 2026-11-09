@@ -118,20 +118,30 @@ namespace {
 
 using ImageList = std::vector<engine::runtime::GenerationRequest::Image>;
 
-// Replaces each image placeholder token by `count` copies, consuming counts in order. Tokens of a prompt prefix expand the same
-// way (the images of the prefix come first), which is how checkpoint positions stay valid.
-std::vector<int> expand_image_tokens( const std::vector<int>& tokens, int pad_id, const ImageList& images ) {
+// Replaces each image placeholder token by `count` copies, consuming counts in order, between begin_id and end_id when those are set
+// (Gemma 4's <|image> ... <image|>). Tokens of a prompt prefix expand the same way (the images of the prefix come first), which is how
+// checkpoint positions stay valid.
+std::vector<int> expand_image_tokens( const std::vector<int>& tokens, int pad_id, const ImageList& images, int begin_id = -1, int end_id = -1 ) {
 	if ( images.empty() || pad_id < 0 ) return tokens;
 	std::vector<int> out;
 	out.reserve( tokens.size() );
 	size_t next = 0;
 	for ( int t : tokens ) {
 		if ( t == pad_id && next < images.size() ) {
+			if ( begin_id >= 0 ) out.push_back( begin_id );
 			out.insert( out.end(), images[next++].count, pad_id );
+			if ( end_id >= 0 ) out.push_back( end_id );
 		}
 		else out.push_back( t );
 	}
 	return out;
+}
+
+// The tokens around an image's placeholders (Gemma 4), -1 for families without them
+void image_markers( engine::loader::ModelFamily fam, const engine::loader::Tokenizer& tok, int* begin_id, int* end_id ) {
+	const bool gemma = fam == engine::loader::ModelFamily::GEMMA;
+	*begin_id = gemma ? tok.get_special_token( "<|image>" ) : -1;
+	*end_id = gemma ? tok.get_special_token( "<image|>" ) : -1;
 }
 
 // The image placeholder token of a model family
@@ -312,7 +322,9 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 			err->message = "the conversation holds " + std::to_string( images->size() ) + " images but the chat template placed " + std::to_string( pads ) + " (images are only allowed in user and tool messages)";
 			return false;
 		}
-		*tokens = expand_image_tokens( *tokens, pad_id, *images );
+		int img_begin = -1, img_end = -1;
+		image_markers( family, gen.tokenizer(), &img_begin, &img_end );
+		*tokens = expand_image_tokens( *tokens, pad_id, *images, img_begin, img_end );
 		int at = 0, k = 0;
 		for ( size_t i = 0; i < tokens->size(); ++i ) {
 			if ( ( *tokens )[i] != pad_id ) continue;
@@ -429,9 +441,11 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	{
 		const bool glm = family == engine::loader::ModelFamily::GLM;
 		const int pad_id = gen.tokenizer().get_special_token( image_pad_name( family ) );
+		int img_begin = -1, img_end = -1;
+		image_markers( family, gen.tokenizer(), &img_begin, &img_end );
 		auto add = [&]( size_t at, bool pinned, size_t min_tokens ) {
 			if ( at == std::string::npos || at == 0 ) return;
-			const std::vector<int> head = expand_image_tokens( encode_prompt( gen.tokenizer(), prompt.substr( 0, at ) ), pad_id, g.images );
+			const std::vector<int> head = expand_image_tokens( encode_prompt( gen.tokenizer(), prompt.substr( 0, at ) ), pad_id, g.images, img_begin, img_end );
 			if ( head.size() < min_tokens || head.size() >= g.prompt_tokens.size() ) return;
 			if ( !std::equal( head.begin(), head.end(), g.prompt_tokens.begin() ) ) return;
 			if ( !g.checkpoint_at.empty() && static_cast<int>( head.size() ) <= g.checkpoint_at.back().pos ) return;

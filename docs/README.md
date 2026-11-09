@@ -18,7 +18,7 @@
   * OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) APIs, with reasoning and tool-call parsing
   * a prefix cache in pinned host RAM, interleaved prefill, up to 256K context with two slots
   * speculative decoding with a DFlash2 or DFlash drafter or the checkpoint's own MTP head
-  * image input (Qwen, GLM, Flash-Next)
+  * image input (Qwen, GLM, Flash-Next, DeepSeek-V4.1, Gemma 4)
   * a `/monitor` page with throughput, per-GPU power / clocks, speculation, prefix cache, and MoE routing heat maps
 * two-tier expert residency (hot experts on the GPU, the rest in pinned host RAM) as a capacity valve for MoE models
 

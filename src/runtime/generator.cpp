@@ -654,13 +654,14 @@ bool Generator::prefill_slot( int s, int budget ) {
 				++slot.pf_cp_next;
 				continue;
 			}
-			end = c.pos;
+			// a checkpoint inside an image (bidirectional images) moves to its edge: a forward holds whole images
+			end = MIN( cluster_.span_safe_end( s, pos, c.pos ), n );
 			is_cp = true;
 			cp = &c;
 			break;
 		}
 		int seg_end = end;
-		if ( budget > 0 ) seg_end = MIN( end, pos + MAX( 1, budget - fed ) );
+		if ( budget > 0 ) seg_end = MIN( end, cluster_.span_safe_end( s, pos, pos + MAX( 1, budget - fed ) ) );
 		if ( seg_end >= n ) {
 			Candidates first_cands, first_raw;
 			const auto t_pf = std::chrono::steady_clock::now();

@@ -32,6 +32,9 @@ struct VisionParams {
 	bool deepseek = false;
 	int downsample = 3;
 	int max_tokens = 1024;
+	// Gemma 4: aspect-preserving resize to whole merge_size x merge_size cells of patches, at most max_tokens soft tokens; raster patches
+	// ([y][x][channel] within a patch, values 2 * v / 255 - 1); a soft token pools merge_size x merge_size patches
+	bool gemma = false;
 };
 
 // An image resized to the patch grid and cut into patches, ready for the vision tower.

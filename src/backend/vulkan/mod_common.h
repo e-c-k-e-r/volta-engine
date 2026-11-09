@@ -16,6 +16,8 @@ inline uint64_t dp( const void* p ) { return reinterpret_cast<uint64_t>( p ); }
 // BatchRows lives in device memory on this backend: address of its slot[] / pos[] arrays
 inline uint64_t rows_slot( const pod::BatchRows* r ) { return dp( r ) + offsetof( pod::BatchRows, slot ); }
 inline uint64_t rows_pos( const pod::BatchRows* r ) { return dp( r ) + offsetof( pod::BatchRows, pos ); }
+inline uint64_t rows_key_end( const pod::BatchRows* r ) { return dp( r ) + offsetof( pod::BatchRows, key_end ); }
+inline uint64_t rows_bidir( const pod::BatchRows* r ) { return dp( r ) + offsetof( pod::BatchRows, bidir ); }
 
 // Pipeline of <spv dir>/<name>.spv (env ENGINE_SPV_DIR overrides the build directory), created once. Aborts when missing
 vk::Pipeline* kernel( const char* name, uint32_t push_bytes );
@@ -64,7 +66,7 @@ struct RefGemmParams { uint64_t x, w, out_; int m, k, n; };
 namespace engine::backend::impl {
 struct RefReconParams { uint64_t codes, out_; int k_dim, n_dim, bits, cb; };
 struct RefHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };
-struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq, window, ring; };
+struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq, window, ring; uint64_t key_end, bidir; };
 struct RefUnpackParams { uint64_t qg, q, gate; int total, head_dim; };
 } // namespace engine::backend::impl
 

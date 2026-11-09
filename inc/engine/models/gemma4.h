@@ -8,6 +8,7 @@
 #include "engine/core/comm.h"
 #include "engine/core/graph_cache.h"
 #include "engine/modules/linear.h"
+#include "engine/models/gemma4_vision.h"
 #include "engine/backend/types.h"
 #include <cstdint>
 #include <vector>
@@ -103,6 +104,14 @@ public:
 	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
 	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;
 
+	// Images: the tower runs on rank 0; its rows replace the embeddings of the image tokens (unscaled)
+	bool inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream = nullptr ) override;
+	bool load_vision( const char* model_dir, backend::stream_t stream = nullptr ) override;
+	const engine::loader::VisionParams* vision_params() const override { return vision_.loaded() ? &vision_.params() : nullptr; }
+	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
+	bool bidirectional_images() const override { return true; }
+	bool image_mrope() const override { return false; }
+
 	pod::TensorView& logits() override { return logits_; }
 	const pod::TensorView& logits() const override { return logits_; }
 	const ModelMetadata& get_metadata() const override { return metadata_; }
@@ -115,6 +124,8 @@ private:
 	void forward_body( int m, backend::stream_t stream );
 	void copy_kv_rows( const engine::runtime::KVCachePool& pool, int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	size_t tap_snapshot_bytes( int tokens ) const;
+
+	Gemma4VisionTower vision_;   // rank 0 only
 
 	// DFlash drafter attachment: a tap ring per slot (6 taps per position), the head scratch
 	DraftHooks draft_hooks_;

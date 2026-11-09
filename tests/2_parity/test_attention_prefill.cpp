@@ -1,7 +1,8 @@
 // Prefill attention kernel against the decode kernel on random K/V: a chunk of rows at consecutive positions over a
 // cache that already holds earlier positions, GQA at head_dim 256: 6 q-heads / 2 kv-heads (the per-rank Qwen shape) and 24 / 4, and at head_dim
 // 512: 8 / 1 and 32 / 4 (Gemma 4's full-attention layers). Also sliding
-// windows of 1024 with the softmax scale 1 (Gemma 4), over a full-length cache and over a ring of 1536 rows.
+// windows of 1024 with the softmax scale 1 (Gemma 4), over a full-length cache and over a ring of 1536 rows, and image rows that see their
+// whole image (BatchRows::key_end).
 //   pass: cosine >= 0.9999 and max relative error <= 0.5% per case.
 #include "engine/config.h"
 #include "engine/core/tensor.h"
@@ -34,13 +35,15 @@ int main() {
 	CUDA_CHECK( cudaMemcpy( v_cache, hv.data(), kv_elems * 2, cudaMemcpyHostToDevice ) );
 	auto* d_rows = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
 
-	struct Case { int rows, pos0; bool per_row = false; int window = 0; bool ring = false; };
+	struct Case { int rows, pos0; bool per_row = false; int window = 0; bool ring = false; int img_start = -1, img_len = 0; };
 	constexpr int W = 1024, RING = 1536;
 	const Case cases[] = { { 20, 0 }, { 33, 5 }, { 128, 0 }, { 128, 700 }, { 256, 1900 }, { 200, 4000 }, { 256, 7936 }, { 256, 7700 },
 		{ 1, 5000 }, { 2, 3000 }, { 5, 6000 }, { 8, 7000 }, { 8, 40 }, { 3, 0 },
 		{ 1, 5000, true }, { 5, 6000, true }, { 8, 7000, true }, { 8, 40, true },   // decode / verify shapes (key_hint 0, as the graphs pass)
 		{ 33, 5, false, W }, { 256, 1900, false, W }, { 200, 4000, false, W }, { 1, 5000, false, W }, { 8, 7000, true, W },
-		{ 512, 7000, false, W, true }, { 256, 1300, false, W, true }, { 8, 7000, false, W, true }, { 1, 5000, true, W, true } };
+		{ 512, 7000, false, W, true }, { 256, 1300, false, W, true }, { 8, 7000, false, W, true }, { 1, 5000, true, W, true },
+		// an image inside the chunk whose rows attend to the whole image (bidirectional, sliding-window layers)
+		{ 300, 2000, false, W, false, 2040, 252 }, { 512, 7000, false, W, true, 7100, 280 }, { 260, 0, false, W, false, 5, 252 } };
 	int fails = 0;
 	// head_dim 256: the per-rank TP4 Qwen shape and the whole model on one GPU; 512: Gemma 4's full-attention layers (TP4 rank, one GPU)
 	const int shapes[4][3] = { { 6, 2, 256 }, { 24, 4, 256 }, { 8, 1, 512 }, { 32, 4, 512 } };
@@ -61,7 +64,14 @@ int main() {
 		pod::TensorView o_new = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qs, 3 );
 		CUDA_CHECK( cudaMemcpy( q.data, hq.data(), qn * 2, cudaMemcpyHostToDevice ) );
 		CUDA_CHECK( cudaMemcpy( g.data, hg.data(), qn * 2, cudaMemcpyHostToDevice ) );
-		const auto rows = pod::BatchRows::causal( c.rows, c.pos0, 0 );
+		auto rows = pod::BatchRows::causal( c.rows, c.pos0, 0 );
+		if ( c.img_start >= 0 ) {
+			rows.bidir = 1;
+			for ( int r = 0; r < c.rows; ++r ) {
+				const int p = c.pos0 + r;
+				rows.key_end[r] = ( p >= c.img_start && p < c.img_start + c.img_len ) ? c.img_start + c.img_len : p + 1;
+			}
+		}
 		pod::KVRef kv = pod::kv_ref_f16( k_cache, v_cache );
 		kv.ring = c.ring ? RING : 0;
 		const int ms = c.ring ? RING : max_seq;
@@ -95,7 +105,7 @@ int main() {
 		CUDA_CHECK( cudaEventRecord( e1, s ) ); CUDA_CHECK( cudaEventSynchronize( e1 ) );
 		float t_pre = 0; CUDA_CHECK( cudaEventElapsedTime( &t_pre, e0, e1 ) );
 		std::printf( "  rows %3d at pos %4d: cos %.6f max|d| %.4g (max %.3g) | decode kernel %8.1f us  prefill kernel %8.1f us (%.1fx)  %s%s\n",
-			c.rows, c.pos0, cosv, maxd, maxabs, t_dec * 200.0f, t_pre * 200.0f, t_dec / t_pre, ok ? "PASS" : "FAIL", c.window ? ( c.ring ? "  [window 1024, ring 1536]" : "  [window 1024]" ) : "" );
+			c.rows, c.pos0, cosv, maxd, maxabs, t_dec * 200.0f, t_pre * 200.0f, t_dec / t_pre, ok ? "PASS" : "FAIL", c.window ? ( c.img_start >= 0 ? "  [window 1024, an image]" : c.ring ? "  [window 1024, ring 1536]" : "  [window 1024]" ) : "" );
 	}
 	}
 	std::printf( "=== ATTENTION PREFILL: %s ===\n", fails ? "FAIL" : "PASS" );

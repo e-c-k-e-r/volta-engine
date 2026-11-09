@@ -32,6 +32,17 @@ struct Vision {
 		const backend::half_t* bv, const backend::half_t* qn, const backend::half_t* kn, const float* cos_table, const float* sin_table,
 		int m, int heads, int head_dim, float eps, backend::stream_t stream = nullptr );
 
+	// Gemma 4: RMS-normalizes every head of q and k with the gains qn / kn and every head of v without a gain, then rotates q and k in two
+	// halves: the first head_dim / 2 channels by the patch's x position, the rest by its y (pairs i, i + head_dim / 4 inside each half,
+	// frequency theta^( -4 i / head_dim )). pos_xy is [m, 2] (x, y) on the device; head_dim <= 128 and a multiple of 4.
+	static void qkv_norm_rope2d( backend::half_t* q, backend::half_t* k, backend::half_t* v, const backend::half_t* qn, const backend::half_t* kn,
+		const int* pos_xy, int m, int heads, int head_dim, float theta, float eps, backend::stream_t stream = nullptr );
+
+	// Gemma 4's pooler: soft token t of a ( gh / k ) x ( gw / k ) grid is the mean of its k x k patches (rows of x in raster order of the
+	// gh x gw patch grid), times sqrt( n ), minus bias, times scale (both [n]; may be null). FP32 in, FP16 out [tokens, n]
+	static void pool_std( const float* x, const backend::half_t* bias, const backend::half_t* scale, backend::half_t* out, int gh, int gw, int k, int n,
+		backend::stream_t stream = nullptr );
+
 	// out[t, c * group + j] = h[t * group + j, c]: the group's rows laid out channel-major (the input of a stride-`group` conv)
 	static void merge_gather( const backend::half_t* h, backend::half_t* out, int tokens, int n, int group, backend::stream_t stream = nullptr );
 

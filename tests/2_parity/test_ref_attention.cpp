@@ -36,6 +36,7 @@ struct RefAttnParams {
 	float scale;
 	uint8_t *ks, *vs;
 	int kq, vq, window, ring;
+	int* key_end; int* bidir;
 };
 struct RefLatentParams {
 	__half *q_lat, *cache, *out_;

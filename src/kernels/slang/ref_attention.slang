@@ -32,6 +32,8 @@ struct RefAttnParams {
 	int vq;
 	int window;       // > 0: attend to positions pos - window + 1 .. pos only
 	int ring;         // > 0: position t is cache row t % ring (a sliding-window cache, window <= ring)
+	int* key_end;     // with *bidir != 0 and a window: row m attends to keys below key_end[m] (an image row sees its whole image)
+	int* bidir;       // BatchRows::bidir; may be null
 };
 
 float ref_kv_k(RefAttnParams p, int64_t i) {
@@ -60,8 +62,9 @@ void ref_attn_decode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, unifo
 	let m = int(gid.y);
 	let per_kv = max(p.num_q_heads / p.num_kv_heads, 1);
 	let kv_head = head / per_kv;
-	let total = p.ring > 0 ? p.pos[m] + 1 : min(p.pos[m] + 1, p.max_seq);
-	let first = p.window > 0 ? max(0, total - p.window) : 0;
+	let key_end = ( p.window > 0 && p.bidir != nullptr && p.bidir[0] != 0 ) ? p.key_end[m] : p.pos[m] + 1;
+	let total = p.ring > 0 ? key_end : min(key_end, p.max_seq);
+	let first = p.window > 0 ? max(0, p.pos[m] + 1 - p.window) : 0;
 	let row_elems = p.num_kv_heads * p.head_dim;
 	let base = int64_t(p.slots[m]) * p.slot_stride + int64_t(p.layer_idx) * p.max_seq * row_elems + kv_head * p.head_dim;
 	let qo = (int64_t(m) * p.num_q_heads + head) * p.head_dim;
@@ -146,11 +149,12 @@ void ref_attn_decode_cpu(uint3 gid : SV_GroupID, uniform RefAttnParams p) {
 	let m = int(gid.y);
 	let per_kv = max(p.num_q_heads / p.num_kv_heads, 1);
 	let kv_head = head / per_kv;
-	let total = p.ring > 0 ? p.pos[m] + 1 : min(p.pos[m] + 1, p.max_seq);
+	let key_end = ( p.window > 0 && p.bidir != nullptr && p.bidir[0] != 0 ) ? p.key_end[m] : p.pos[m] + 1;
+	let total = p.ring > 0 ? key_end : min(key_end, p.max_seq);
 	let row_elems = p.num_kv_heads * p.head_dim;
 	let base = int64_t(p.slots[m]) * p.slot_stride + int64_t(p.layer_idx) * p.max_seq * row_elems + kv_head * p.head_dim;
 	let qo = (int64_t(m) * p.num_q_heads + head) * p.head_dim;
-	let first = p.window > 0 ? max(0, total - p.window) : 0;
+	let first = p.window > 0 ? max(0, p.pos[m] + 1 - p.window) : 0;
 	float qf[512];
 	float o[512];
 	for (int d = 0; d < p.head_dim; ++d) {

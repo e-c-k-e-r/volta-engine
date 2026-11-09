@@ -280,6 +280,11 @@ public:
 	// precomputed embeddings (host [rows, hidden] FP16); call it between embed_tokens and forward. The image encoder runs on
 	// rank 0 only; vision_params() is null when the model has none loaded.
 	virtual bool inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream = nullptr ) { (void) host_rows; (void) dst_row; (void) rows; (void) stream; return false; }
+	// The tokens of one image attend to each other in both directions (Gemma 4): a forward must hold whole images, and their rows see the
+	// image's later positions (BatchRows::key_end)
+	virtual bool bidirectional_images() const { return false; }
+	// Image tokens take 3-D rotary positions (Qwen / GLM M-RoPE); false: they keep their sequence positions
+	virtual bool image_mrope() const { return true; }
 	// Loads the image encoder into what is left of the arena after everything else (rank 0); false when there is none or no room
 	virtual bool load_vision( const char* model_dir, backend::stream_t stream = nullptr ) { (void) model_dir; (void) stream; return false; }
 	virtual const engine::loader::VisionParams* vision_params() const { return nullptr; }

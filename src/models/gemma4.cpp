@@ -372,6 +372,30 @@ void Gemma4Pipeline::draft_head_topk( int rows, backend::stream_t stream ) {
 		draft_hooks_.cand_vals, draft_hooks_.cand_idx, draft_hooks_.shard_offset, draft_.cand_part_v, draft_.cand_part_i, draft_.cand_counters, stream );
 }
 
+bool Gemma4Pipeline::load_vision( const char* model_dir, backend::stream_t stream ) {
+	if ( rank_ != 0 || runtime::options().max_image_tokens <= 0 ) return false;
+	backend::set_device( rank_ );
+	return vision_.load( model_dir, *arena_, runtime::options().max_image_tokens, stream );
+}
+
+bool Gemma4Pipeline::encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream ) {
+	if ( rank_ != 0 || !vision_.loaded() ) return false;
+	backend::set_device( rank_ );
+	return vision_.encode( image, out, stream );
+}
+
+bool Gemma4Pipeline::inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream ) {
+	ENGINE_ASSERT( dst_row >= 0 && rows >= 1 && dst_row + rows <= pod::MAX_ROWS, "Gemma4Pipeline::inject_embeddings: rows out of range" );
+	backend::set_device( rank_ );
+	const int H = config_.hidden_size;
+	backend::half_t* stage = hidden_states_.ptr<backend::half_t>() + static_cast<size_t>( dst_row ) * H;
+	backend::memcpy_async( stage, host_rows, static_cast<size_t>( rows ) * H * sizeof( backend::half_t ), backend::Copy::H2D, stream );
+	pod::TensorView in = pod::make_tensor_2d( stage, pod::DType::FP16, rows, H );
+	pod::TensorView dst = pod::make_tensor_2d( resid_.ptr<float>() + static_cast<size_t>( dst_row ) * H, pod::DType::FP32, rows, H );
+	engine::modules::Elementwise::scale_to_f32( in, dst, 1.0f, stream );
+	return true;
+}
+
 bool Gemma4Pipeline::read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream ) {
 	backend::set_device( rank_ );
 	return read_draft_taps( draft_hooks_, slot_id, config_.max_slots, first_pos, count, config_.hidden_size, host_dst, stream );

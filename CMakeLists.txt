@@ -155,6 +155,7 @@ set(ENGINE_HOST_SOURCES
 	src/models/qwen4_exp.cpp
 	src/models/deepseek_v41.cpp
 	src/models/gemma4.cpp
+	src/models/gemma4_vision.cpp
 	src/runtime/options.cpp
 	src/runtime/kv_cache.cpp
 	src/runtime/cluster.cpp
@@ -460,6 +461,9 @@ set_target_properties(test_dsv41_encoding PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$
 add_executable(test_dsv41_vision tests/2_parity/test_dsv41_vision.cpp)
 target_link_libraries(test_dsv41_vision PRIVATE engine_kernels)
 set_target_properties(test_dsv41_vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_gemma4_vision tests/2_parity/test_gemma4_vision.cpp)
+target_link_libraries(test_gemma4_vision PRIVATE engine_kernels)
+set_target_properties(test_gemma4_vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_jinja tests/2_parity/test_jinja.cpp)
 target_link_libraries(test_jinja PRIVATE engine_kernels)

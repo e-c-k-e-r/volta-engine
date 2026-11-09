@@ -1,6 +1,6 @@
 // End-to-end single-rank (tp=1) model forward, cross-backend: `--dump <dir>` (CUDA build) runs a short prefill and writes the last
 // row's logits; `--check <dir>` (any build, in particular CPU) repeats it and compares against the golden file (tier 2 tolerance,
-// plus argmax equality). Model directory from argv `--model <dir>` (default: the Qwen EXL3 checkpoint) and `--type <model_type>` (default qwen3_5).
+// plus argmax equality). Model directory from argv `--model <dir>` (default: the Qwen EXL3 checkpoint) and `--type <model_type>` (default qwen3_5); `--image <dir>` places precomputed image embeddings (image.f32 at the positions of image_at.txt).
 // --cos 0.999 for GGUF weights: llama.cpp's CPU kernels quantize the activations to q8_K and its CUDA ones to q8_1, so the logits round apart
 // (the argmax and the decoded tokens must still match). `--ids <file>`: the prompt from a file of int32 token ids (a reference run elsewhere, e.g. a
 // real chat prompt) instead of the synthetic 15, 16, ...
@@ -10,6 +10,9 @@
 #include "engine/backend/numeric.h"
 #include "golden_io.h"
 #include <chrono>
+#include <cstdio>
+#include <memory>
+#include <string>
 #include <cstdlib>
 #include <vector>
 
@@ -24,6 +27,7 @@ int main( int argc, char** argv ) {
 	double min_cos = 0.9999;   // --cos: the logits' bound for paths that round differently per backend (GGUF: q8_K activations on CPU, q8_1 on CUDA)
 	int ntokens = 4;
 	const char* ids_file = nullptr;
+	const char* image_dir = nullptr;   // --image <dir>: image.f32 ([count, hidden] embeddings) placed at the positions of image_at.txt ("start count")
 	for ( int i = 1; i + 1 < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--model" ) ) model_dir = argv[i + 1];
 		if ( !std::strcmp( argv[i], "--type" ) ) model_type = argv[i + 1];
@@ -31,6 +35,7 @@ int main( int argc, char** argv ) {
 		if ( !std::strcmp( argv[i], "--tokens" ) ) ntokens = std::atoi( argv[i + 1] );
 		if ( !std::strcmp( argv[i], "--cos" ) ) min_cos = std::atof( argv[i + 1] );
 		if ( !std::strcmp( argv[i], "--ids" ) ) ids_file = argv[i + 1];
+		if ( !std::strcmp( argv[i], "--image" ) ) image_dir = argv[i + 1];
 	}
 	if ( !args.dump && !args.check ) {
 		std::printf( "usage: test_cpu_forward --dump|--check <dir> [--model <dir>] [--type <model_type>] [--steps <greedy decode steps after the prefill>] [--tokens <prompt length, default 4> | --ids <int32 token ids file>] [--cos <logits bound, default 0.9999>]\n" );
@@ -61,6 +66,22 @@ int main( int argc, char** argv ) {
 	auto now = [] { return std::chrono::steady_clock::now(); };
 	auto ms_since = [&]( auto t0 ) { return std::chrono::duration<double, std::milli>( now() - t0 ).count(); };
 	mc.reset_slot( 0 );
+	if ( image_dir != nullptr ) {
+		engine::runtime::MmImage im;
+		std::FILE* f = std::fopen( ( std::string( image_dir ) + "/image_at.txt" ).c_str(), "r" );
+		ENGINE_ASSERT( f != nullptr && std::fscanf( f, "%d %d", &im.start, &im.count ) == 2, "--image: image_at.txt" );
+		std::fclose( f );
+		std::vector<float> e( static_cast<size_t>( im.count ) * mc.metadata().hidden_size );
+		f = std::fopen( ( std::string( image_dir ) + "/image.f32" ).c_str(), "rb" );
+		ENGINE_ASSERT( f != nullptr && std::fread( e.data(), sizeof( float ), e.size(), f ) == e.size(), "--image: image.f32" );
+		std::fclose( f );
+		auto rows = std::make_shared<std::vector<backend::half_t>>( e.size() );
+		for ( size_t i = 0; i < e.size(); ++i ) ( *rows )[i] = backend::from_float_half( e[i] );
+		im.embeds = rows;
+		engine::runtime::MmLayout layout;
+		layout.images.push_back( im );
+		mc.set_slot_mm( 0, std::move( layout ) );
+	}
 	const auto t_prefill = now();
 	const int pred = mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0, 0 );
 	const double prefill_ms = ms_since( t_prefill );

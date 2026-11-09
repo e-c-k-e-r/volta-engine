@@ -183,6 +183,58 @@ void Vision::qkv_bias_rope( h16* q, h16* k, h16* v, const h16* bq, const h16* bk
 	} );
 }
 
+void Vision::qkv_norm_rope2d( h16* q, h16* k, h16* v, const h16* qn, const h16* kn, const int* pos_xy, int m, int heads, int hd, float theta, float eps,
+	backend::stream_t ) {
+	ENGINE_ASSERT( hd <= 128 && hd % 4 == 0, "Vision::qkv_norm_rope2d: head_dim a multiple of 4, at most 128" );
+	const int half_d = hd / 2, quarter = hd / 4;
+	impl::cpu_parallel_for( static_cast<int64_t>( m ) * heads, 1, [&]( int64_t b, int64_t e ) {
+		float y[128];
+		for ( int64_t rh = b; rh < e; ++rh ) {
+			const int row = static_cast<int>( rh / heads );
+			const size_t off = static_cast<size_t>( rh ) * hd;
+			for ( int which = 0; which < 3; ++which ) {
+				h16* x = ( which == 0 ? q : which == 1 ? k : v ) + off;
+				const h16* w = which == 0 ? qn : which == 1 ? kn : nullptr;
+				float sq = 0.0f;
+				for ( int t = 0; t < hd; ++t ) sq += h2f( x[t] ) * h2f( x[t] );
+				const float inv = 1.0f / std::sqrt( sq / hd + eps );
+				for ( int t = 0; t < hd; ++t ) y[t] = h2f( x[t] ) * inv * ( w ? h2f( w[t] ) : 1.0f );
+				for ( int t = 0; t < hd; ++t ) {
+					float r = y[t];
+					if ( which < 2 ) {
+						const int hf = t / half_d, i = t % half_d, pi = i % quarter;
+						const float ang = static_cast<float>( pos_xy[2 * row + hf] ) * std::pow( theta, -2.0f * pi / static_cast<float>( half_d ) );
+						const float cs = std::cos( ang ), sn = std::sin( ang );
+						const float partner = y[hf * half_d + ( i < quarter ? i + quarter : i - quarter )];
+						r = i < quarter ? y[t] * cs - partner * sn : y[t] * cs + partner * sn;
+					}
+					x[t] = f2h( r );
+				}
+			}
+		}
+	} );
+}
+
+void Vision::pool_std( const float* x, const h16* bias, const h16* scale, h16* out, int gh, int gw, int k, int n, backend::stream_t ) {
+	ENGINE_ASSERT( gh % k == 0 && gw % k == 0, "Vision::pool_std: the patch grid must be whole k x k cells" );
+	const int tw = gw / k, tokens = ( gh / k ) * tw;
+	const float mul = std::sqrt( static_cast<float>( n ) ), inv = 1.0f / static_cast<float>( k * k );
+	impl::cpu_parallel_for( tokens, 1, [&]( int64_t b, int64_t e ) {
+		for ( int64_t tok = b; tok < e; ++tok ) {
+			const int ty = static_cast<int>( tok ) / tw, tx = static_cast<int>( tok ) % tw;
+			for ( int c = 0; c < n; ++c ) {
+				float acc = 0.0f;
+				for ( int dy = 0; dy < k; ++dy )
+					for ( int dx = 0; dx < k; ++dx ) acc += x[( static_cast<size_t>( ty * k + dy ) * gw + tx * k + dx ) * n + c];
+				float vv = acc * inv * mul;
+				if ( bias ) vv -= h2f( bias[c] );
+				if ( scale ) vv *= h2f( scale[c] );
+				out[static_cast<size_t>( tok ) * n + c] = f2h( vv );
+			}
+		}
+	} );
+}
+
 void Vision::merge_gather( const h16* h, h16* out, int tokens, int n, int group, backend::stream_t ) {
 	for ( int t = 0; t < tokens; ++t ) {
 		for ( int idx = 0; idx < n * group; ++idx ) {

@@ -263,6 +263,52 @@ bool prepare_image_deepseek( const DecodedImage& img, const VisionParams& p, Pre
 	return true;
 }
 
+// Gemma 4 (Gemma4ImageProcessor): the largest size of whole pooling cells within the patch budget that keeps the aspect, PIL bicubic,
+// raster patches
+bool prepare_image_gemma( const DecodedImage& img, const VisionParams& p, PreparedImage* out, std::string* error ) {
+	const int P = p.patch_size, k = p.merge_size, side = P * k;
+	const int64_t max_patches = static_cast<int64_t>( p.max_tokens ) * k * k;
+	const double factor = std::sqrt( static_cast<double>( max_patches ) * P * P / ( static_cast<double>( img.width ) * img.height ) );
+	int th = static_cast<int>( std::floor( factor * img.height / side ) ) * side;
+	int tw = static_cast<int>( std::floor( factor * img.width / side ) ) * side;
+	const int max_side = static_cast<int>( max_patches / ( k * k ) ) * side;
+	if ( th == 0 && tw == 0 ) {
+		if ( error ) *error = "image too small";
+		return false;
+	}
+	if ( th == 0 ) {
+		th = side;
+		tw = std::min( img.width / img.height * side, max_side );
+	}
+	else if ( tw == 0 ) {
+		tw = side;
+		th = std::min( img.height / img.width * side, max_side );
+	}
+	if ( static_cast<int64_t>( th ) * tw > max_patches * P * P || th < side || tw < side ) {
+		if ( error ) *error = "image does not fit the patch budget";
+		return false;
+	}
+	std::vector<float> px = ( th == img.height && tw == img.width ) ? std::vector<float>( img.rgb.begin(), img.rgb.end() )
+	                                                                : resize_bicubic( img.rgb.data(), img.height, img.width, th, tw, true );
+	for ( float& v : px ) v = std::min( 255.0f, std::max( 0.0f, std::nearbyint( v ) ) );   // a PIL image holds 8-bit values
+	const int gh = th / P, gw = tw / P, dim = 3 * P * P;
+	out->grid_h = gh;
+	out->grid_w = gw;
+	out->patches.assign( static_cast<size_t>( gh ) * gw * dim, 0.0f );
+	size_t row = 0;
+	for ( int by = 0; by < gh; ++by ) {
+		for ( int bx = 0; bx < gw; ++bx, ++row ) {
+			float* dst = &out->patches[row * dim];
+			for ( int y = 0; y < P; ++y )
+				for ( int x = 0; x < P; ++x )
+					for ( int c = 0; c < 3; ++c ) *dst++ = px[( static_cast<size_t>( by * P + y ) * tw + bx * P + x ) * 3 + c] * ( 2.0f / 255.0f ) - 1.0f;
+		}
+	}
+	const int dims[2] = { gh, gw };
+	out->hash = hash_bytes( dims, sizeof( dims ), hash_bytes( img.rgb.data(), img.rgb.size() ) );
+	return true;
+}
+
 } // namespace
 
 bool prepare_image( const DecodedImage& img, const VisionParams& p, PreparedImage* out, std::string* error ) {
@@ -271,6 +317,7 @@ bool prepare_image( const DecodedImage& img, const VisionParams& p, PreparedImag
 		return false;
 	}
 	if ( p.deepseek ) return prepare_image_deepseek( img, p, out, error );
+	if ( p.gemma ) return prepare_image_gemma( img, p, out, error );
 	const int factor = p.patch_size * p.merge_size;
 	if ( std::max( img.width, img.height ) > 200 * std::min( img.width, img.height ) ) {
 		if ( error ) *error = "image aspect ratio above 200:1";

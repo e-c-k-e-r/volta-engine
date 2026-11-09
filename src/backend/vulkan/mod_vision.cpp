@@ -3,6 +3,7 @@
 #include "mod_common.h"
 #include "engine/modules/linear.h"
 #include "engine/modules/vision.h"
+#include "engine/backend/tiers.h"
 #include <algorithm>
 
 namespace engine::modules {
@@ -63,6 +64,15 @@ void Vision::qkv_bias_rope( backend::half_t* q, backend::half_t* k, backend::hal
 	ENGINE_ASSERT( head_dim % 2 == 0 && heads * head_dim / 2 <= 1024, "Vision::qkv_bias_rope: even head_dim, at most 1024 rotary pairs per row" );
 	vki::QkvRopeParams p{ vki::dp( q ), vki::dp( k ), vki::dp( v ), vki::dp( bq ), vki::dp( bk ), vki::dp( bv ), 0, 0, vki::dp( cos_table ), vki::dp( sin_table ), heads, head_dim, 0.0f, 0 };
 	vki::launch( "vision_qkv_rope", p, stream, m );
+}
+
+void Vision::qkv_norm_rope2d( backend::half_t*, backend::half_t*, backend::half_t*, const backend::half_t*, const backend::half_t*, const int*, int, int, int,
+	float, float, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "Vision::qkv_norm_rope2d" );
+}
+
+void Vision::pool_std( const float*, const backend::half_t*, const backend::half_t*, backend::half_t*, int, int, int, int, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "Vision::pool_std" );
 }
 
 void Vision::merge_gather( const backend::half_t* h, backend::half_t* out, int tokens, int n, int group, backend::stream_t stream ) {

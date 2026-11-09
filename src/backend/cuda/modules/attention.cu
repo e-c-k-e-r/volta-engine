@@ -132,12 +132,14 @@ __global__ void attn_chunked_paged_kernel(
 	// the grid can be sized by max_seq and stay valid across positions (graph replay)
 	int cur_pos = rows->pos[row0 + m];
 	const int ring = kv.ring;
-	int total_tokens = ring > 0 ? cur_pos + 1 : min( cur_pos + 1, max_seq );
+	// keys below key_end: the row's own position, or the end of its image (bidirectional image rows)
+	const int key_end = ( rows->bidir && window > 0 ) ? rows->key_end[row0 + m] : cur_pos + 1;
+	int total_tokens = ring > 0 ? key_end : min( key_end, max_seq );
 	const size_t slot_off = static_cast<size_t>( rows->slot[row0 + m] ) * slot_stride;
 
 	// a sliding window keeps the last `window` positions (the row's own included). In a ring cache the chunks tile the window from the
 	// chunk boundary below it (rows mod ring), so they are the absolute chunks a full-length cache would use and sum alike
-	const int kv_lo = window > 0 ? max( 0, total_tokens - window ) : 0;
+	const int kv_lo = window > 0 ? max( 0, cur_pos + 1 - window ) : 0;
 	const int chunk0 = ring > 0 ? ( kv_lo / chunk_len ) * chunk_len : 0;
 	int kv_start = max( chunk0 + chunk * chunk_len, kv_lo );
 	int kv_end = min( chunk0 + chunk * chunk_len + chunk_len, total_tokens );
@@ -486,7 +488,7 @@ void attn_prefill_tc_kernel(
 	if constexpr ( SP ) max_pos = ( sp_nk >= 0 ? sp_nk : min( rows->pos[q_base / G] + 1, max_seq ) ) - 1;
 	else {
 		for ( int r = q_base / G; r <= last_row; ++r ) {
-			max_pos = max( max_pos, rows->pos[r] );
+			max_pos = max( max_pos, ( rows->bidir && window > 0 ) ? rows->key_end[r] - 1 : rows->pos[r] );
 			min_pos = min( min_pos, rows->pos[r] );
 		}
 		if ( ring == 0 ) max_pos = min( max_pos, max_seq - 1 );
@@ -502,7 +504,8 @@ void attn_prefill_tc_kernel(
 	const int sub = tid & 7;
 	const int sqi = q_base + srow;
 	const bool svalid = sqi < q_end;
-	const int spos = svalid ? ( SP ? max_pos : rows->pos[sqi / G] ) : -1;
+	const int spos = svalid ? ( SP ? max_pos : ( rows->bidir && window > 0 ) ? rows->key_end[sqi / G] - 1 : rows->pos[sqi / G] ) : -1;   // the row's last key
+	const int sp0 = svalid && !SP ? rows->pos[sqi / G] : spos;   // its position (the window counts back from it)
 	float m_run = -1e30f, l_run = 0.0f;
 
 	for ( int u = tid; u < PA_BQ * ( HD / 8 ); u += 256 ) {
@@ -655,7 +658,7 @@ void attn_prefill_tc_kernel(
 			#pragma unroll
 			for ( int j = 0; j < 8; ++j ) {
 				const int key = kb + sub * 8 + j;
-				const bool ok = svalid && key <= spos && ( window <= 0 || key > spos - window );
+				const bool ok = svalid && key <= spos && ( window <= 0 || key > sp0 - window );
 				sv[j] = ok ? sS[srow * PA_SS + sub * 8 + j] * scale : -1e30f;
 				mx = fmaxf( mx, sv[j] );
 			}
@@ -872,7 +875,7 @@ void attn_prefill_tc512_kernel(
 	const int last_row = ( q_end - 1 ) / G;
 	int max_pos = 0, min_pos = 0x7fffffff;
 	for ( int r = q_base / G; r <= last_row; ++r ) {
-		max_pos = max( max_pos, rows->pos[r] );
+		max_pos = max( max_pos, ( rows->bidir && window > 0 ) ? rows->key_end[r] - 1 : rows->pos[r] );
 		min_pos = min( min_pos, rows->pos[r] );
 	}
 	if ( ring == 0 ) max_pos = min( max_pos, max_seq - 1 );
@@ -885,7 +888,8 @@ void attn_prefill_tc512_kernel(
 	const int sub = tid & 7;
 	const int sqi = q_base + srow;
 	const bool svalid = sqi < q_end;
-	const int spos = svalid ? rows->pos[sqi / G] : -1;
+	const int spos = svalid ? ( ( rows->bidir && window > 0 ) ? rows->key_end[sqi / G] - 1 : rows->pos[sqi / G] ) : -1;   // the row's last key
+	const int sp0 = svalid ? rows->pos[sqi / G] : -1;   // its position (the window counts back from it)
 	float m_run = -1e30f, l_run = 0.0f;
 
 	const int s_qg = warp >> 2, s_kg = warp & 3;
@@ -995,7 +999,7 @@ void attn_prefill_tc512_kernel(
 			#pragma unroll
 			for ( int j = 0; j < 8; ++j ) {
 				const int key = kb + sub * 8 + j;
-				const bool ok = svalid && key <= spos && ( window <= 0 || key > spos - window );
+				const bool ok = svalid && key <= spos && ( window <= 0 || key > sp0 - window );
 				sv[j] = ok ? sS[srow * PA_SS + sub * 8 + j] * scale : -1e30f;
 				mx = fmaxf( mx, sv[j] );
 			}

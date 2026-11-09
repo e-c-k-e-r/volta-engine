@@ -53,6 +53,9 @@ public:
 	// LM head except for the final row of the final chunk.
 	// pos0: position of tokens[0] (a prefill that resumes from a restored prefix starts there)
 	int prefill( const int* tokens, int count, int slot, int chunk = 0, Candidates* last_cands = nullptr, int pos0 = 0 );
+	// Where a forward of the slot's positions [from, end) may stop when the model's images are bidirectional (a forward holds whole images):
+	// an end inside an image moves back to the image's start, or past its end when the image starts at `from`; otherwise `end`
+	int span_safe_end( int slot, int from, int end ) const;
 
 	// Sequence snapshots (prefix cache): one pinned host buffer per rank holding the slot's recurrent state and the KV
 	// rows [0, tokens). Buffers are recycled through a pool, so steady-state saves allocate nothing.

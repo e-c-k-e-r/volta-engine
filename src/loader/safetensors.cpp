@@ -941,10 +941,11 @@ size_t SafeTensorsRepo::bytes_of( const std::string& prefix, std::initializer_li
 bool SafeTensorsRepo::copy_host_bf16( const char* name, uint16_t* dst, size_t elems, backend::stream_t stream ) {
 	int shard = -1;
 	const auto* meta = find( name, &shard );
-	if ( meta == nullptr || shard < 0 || meta->ndim != 2 ) return false;
+	if ( meta == nullptr || shard < 0 || meta->ndim < 1 ) return false;
 	meta = engine::loader::gguf_float_view( shards_[shard], meta, stream );
 	const void* src = safetensors_get_data_cpu( shards_[shard], meta );
-	const size_t n = static_cast<size_t>( meta->shape[0] ) * meta->shape[1];
+	size_t n = 1;
+	for ( int d = 0; d < meta->ndim; ++d ) n *= static_cast<size_t>( meta->shape[d] );
 	if ( src == nullptr || n != elems ) return false;
 	if ( meta->dtype == pod::DType::BF16 ) std::memcpy( dst, src, n * sizeof( uint16_t ) );
 	else {
