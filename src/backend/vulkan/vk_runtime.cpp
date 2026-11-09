@@ -31,7 +31,12 @@ struct Staging {
 	void* map = nullptr;
 	void* host_dst = nullptr; // D2H: copied here after the wait
 	size_t bytes = 0;
+	size_t capacity = 0;      // the buffer's size (a pooled one: a power of two)
 };
+
+// Host transfers stage through mapped buffers. Those of up to kPoolMax bytes come from a per-device pool of power-of-two sizes and go back to
+// it at the stream's sync (an allocation per eager transfer cost milliseconds); larger ones (weight loads) are made and freed per transfer
+constexpr size_t kPoolMin = size_t( 64 ) << 10, kPoolMax = size_t( 64 ) << 20, kPoolLimit = size_t( 256 ) << 20;
 
 struct Ctx {
 	bool tried = false, ok = false;
@@ -47,6 +52,8 @@ struct Ctx {
 	bool int_dot = false;   // shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product) enabled: packed 4 x int8 dot products
 	bool rte16 = false;   // shaderRoundingModeRTEFloat16: float -> half conversions can be made round-to-nearest-even
 	std::map<uint64_t, Alloc> allocs; // keyed by device address
+	std::multimap<size_t, Staging> staging_pool;   // idle pooled staging buffers by capacity
+	size_t staging_pool_bytes = 0;
 	uint64_t allocated = 0;           // bytes in allocs
 	vk_stream* default_stream = nullptr;
 	PFN_vkGetBufferDeviceAddress get_address = nullptr;
@@ -328,6 +335,12 @@ void sync( vk_stream* s ) {
 	ENGINE_CHECK( vkWaitSemaphores( cur().device, &wi, UINT64_MAX ) );
 	for ( auto& st : s->staging ) {
 		if ( st.host_dst ) std::memcpy( st.host_dst, st.map, st.bytes );
+		if ( st.capacity <= kPoolMax && cur().staging_pool_bytes + st.capacity <= kPoolLimit ) {
+			st.host_dst = nullptr;
+			cur().staging_pool_bytes += st.capacity;
+			cur().staging_pool.emplace( st.capacity, st );
+			continue;
+		}
 		vkUnmapMemory( cur().device, st.memory );
 		vkDestroyBuffer( cur().device, st.buffer, nullptr );
 		vkFreeMemory( cur().device, st.memory, nullptr );
@@ -451,8 +464,19 @@ bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, strea
 		// Bound the host memory held by staging buffers of in-flight transfers (a weight load copies tens of GiB)
 		if ( s->staging_bytes + bytes > ( size_t( 1 ) << 29 ) && s->staging_bytes > 0 ) sync( s );
 		Staging st_buf;
+		size_t cap = bytes;
+		if ( bytes <= kPoolMax ) {
+			cap = kPoolMin;
+			while ( cap < bytes ) cap <<= 1;
+		}
+		if ( auto it = cur().staging_pool.find( cap ); it != cur().staging_pool.end() ) {
+			st_buf = it->second;
+			cur().staging_pool.erase( it );
+			cur().staging_pool_bytes -= cap;
+		}
+		else if ( !create_buffer( cap, true, st_buf.buffer, st_buf.memory, &st_buf.map ) ) return false;
 		st_buf.bytes = bytes;
-		if ( !create_buffer( bytes, true, st_buf.buffer, st_buf.memory, &st_buf.map ) ) return false;
+		st_buf.capacity = cap;
 		if ( dir == Copy::H2D ) {
 			if ( !resolve( dst, db, doff ) ) return false;
 			std::memcpy( st_buf.map, src, bytes );
