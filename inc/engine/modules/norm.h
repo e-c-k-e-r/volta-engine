@@ -7,7 +7,7 @@
 namespace engine::modules {
 
 struct RMSNorm {
-	// x FP16, or FP32 (CUDA and CPU so far); out FP16
+	// x FP16 or FP32 (an FP32 residual stream); out FP16
 	static void forward(
 		const pod::TensorView& x,
 		const pod::TensorView& weight,

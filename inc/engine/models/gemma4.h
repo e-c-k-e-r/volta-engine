@@ -40,7 +40,8 @@ struct Gemma4Config {
 	int vocab_size = 262144;
 	float rms_norm_eps = 1e-6f;
 	float final_softcap = 30.0f;
-	int tap_layers[6] = { 1, 12, 23, 35, 46, 57 };   // the DFlash drafter's target_layer_ids (z-lab gemma-4-31B-it-DFlash)
+	static constexpr int kTaps = 6;
+	int tap_layers[kTaps] = { 1, 12, 23, 35, 46, 57 };   // the DFlash drafter's target_layer_ids (z-lab gemma-4-31B-it-DFlash)
 };
 
 struct Gemma4LayerWeights {
@@ -177,8 +178,7 @@ private:
 	pod::TensorView full_logits_;
 	float embed_scale_ = 1.0f;
 
-	int tp_size_ = 1;     // 1 when the head is not sharded
-	int tp_ranks_ = 1;
+	int tp_size_ = 1;     // ranks of the group; above 1 the head is vocabulary-parallel
 	int lm_shard_cols_ = 0;
 	int lm_shard_real_cols_ = 0;
 	int* d_argmax_idx_ = nullptr;

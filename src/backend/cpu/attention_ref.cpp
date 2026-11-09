@@ -29,6 +29,7 @@ namespace {
 
 void ref_attention( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride,
 	int layer_idx, const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, float scale = 0.0f, int window = 0 ) {
+	ENGINE_ASSERT( kv.ring == 0 || ( window > 0 && window <= kv.ring && kv.ring == max_seq ), "Attention (CPU): a ring cache holds a sliding window of max_seq rows" );
 	if ( ref_attn_decode_cpu == nullptr ) {
 		ENGINE_UNSUPPORTED( "Attention decode/prefill (ref_attn_cpu library not linked)" );
 	}

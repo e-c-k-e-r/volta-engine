@@ -137,6 +137,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `exl3_gemv_max_m` | int | `4` | `ENGINE_DEBUG_EXL3_GEMV_MAX_M` | ROCm: EXL3 linears of up to this many rows (0 to 8) run the v_dot2 GEMV; the rows above it, up to exl3_wmma_max_m, run the WMMA GEMM (for A/B; the GEMV is no faster than the GEMM from 3 rows and 35% slower at 5 to 8) |
 | `exl3_wmma_max_m` | int | `64` | `ENGINE_DEBUG_EXL3_WMMA_MAX_M` | ROCm: EXL3 linears of 9 up to this many rows (at most 64) run the WMMA GEMM that reads the packed weight once; more rows, or 0 here, dequantize the weight and call hipBLAS (for A/B) |
 | `glm_layers` | int | `0` | `ENGINE_DEBUG_GLM_LAYERS` | GLM: run only the first N decoder layers (a checkpoint cut to N layers, for A/B of kernels on a small model; the logits mean nothing); 0 = all 45 |
+| `gguf_mma` | bool | `true` | `ENGINE_DEBUG_GGUF_MMA` | CUDA GGUF projections: the tensor-core rows kernel for 9 to 16 rows (Q4_K / Q6_K from 4 / 6 rows); false = the GEMV and tile paths (A/B) |
 | `dflash_attn_scalar` | bool | `false` | `ENGINE_DEBUG_DFLASH_ATTN_SCALAR` | DFlash2 drafter attention on CUDA: the scalar one-block-per-(row, head) kernel instead of the split-key kernel (for A/B) |
 | `spec_profile` | bool | `false` | `ENGINE_DEBUG_SPEC_PROFILE` | DFlash2: time the stages of every round (draft, walk, snapshot switch, verify launch, sample wait, accept) and log the per-round averages when the server shuts down |
 | `merge_expert_groups` | bool | `true` | `ENGINE_DEBUG_MERGE_EXPERT_GROUPS` | DeepSeek-V4.1 packs whose experts have different widths per projection: one MoE launch per layer over all of a rank's experts with a width table (false: one launch per width combination, for A/B) |
@@ -176,9 +177,9 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `spec_interleave` | bool | `true` | `ENGINE_DEBUG_SPEC_INTERLEAVE` | speculators with a context per slot (MTP): interleave one slot's round per step; false steps all active slots plainly together while more than one decodes (A/B) |
 | `no_graphs` | bool | `false` | `ENGINE_DEBUG_NO_GRAPHS` | eager execution, no CUDA graphs |
 | `dump_requests` | string | `(empty)` | `ENGINE_DEBUG_DUMP_REQUESTS` | directory: write every API request body and rendered prompt there, and at its end the prompt and generated token ids (req_N.tokens: int32 prompt length, int32 count, the ids) |
-| `dflash_tap_shift` | int | `0` | `ENGINE_DEBUG_DFLASH_TAP_SHIFT` | DFlash v1 drafters (Gemma 4): tap i is the output of target layer target_layer_ids[i] + this (the exllamav3 port reads one layer later; A/B) |
+| `dflash_tap_shift` | int | `0` | `ENGINE_DEBUG_DFLASH_TAP_SHIFT` | DFlash v1 drafters (Gemma 4): tap i is the output of target layer target_layer_ids[i] + this (A/B) |
 | `dflash_embed_scale` | bool | `true` | `ENGINE_DEBUG_DFLASH_EMBED_SCALE` | DFlash v1 drafters: the block's embedding rows carry the target's embedding scale (Gemma 4: sqrt(hidden)); false = the raw table rows (A/B) |
-| `dflash_sliding_causal` | bool | `true` | `ENGINE_DEBUG_DFLASH_SLIDING_CAUSAL` | DFlash v1 drafters: the block is causal on the sliding-window layers (as the exllamav3 port's window has it), bidirectional on the full-attention ones; false = bidirectional on every layer (A/B) |
+| `dflash_sliding_causal` | bool | `true` | `ENGINE_DEBUG_DFLASH_SLIDING_CAUSAL` | DFlash v1 drafters: the block is causal on the sliding-window layers and bidirectional on the full-attention ones; false = bidirectional on every layer (A/B) |
 | `dump_draft_round` | int | `-1` | `ENGINE_DEBUG_DUMP_DRAFT_ROUND` | speculation round whose drafter inputs are written to /tmp/draft_dump.bin; <0 = off |
 
 ## Test and tool variables

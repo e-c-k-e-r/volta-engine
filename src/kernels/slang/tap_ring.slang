@@ -1,4 +1,5 @@
-// Speculative-decode tap ring kernels (Tier B): publish a hidden-state row into the 5-tap ring at pos % cap, and reduce the
+// Speculative-decode tap ring kernels (Tier B): publish a hidden-state row into a ring of 5 taps per position (the CPU and Vulkan
+// backends' only layout) at pos % cap, and reduce the
 // four mHC streams to one FP16 row (mean, or a single stream). Plain per-element kernels: one source for every target.
 
 struct TapStoreParams {

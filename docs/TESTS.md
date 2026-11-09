@@ -18,9 +18,9 @@
 | `test_slang_cpu`, `test_slang_kernels` | 2 | partly | Slang kernels on CPU and as generated CUDA |
 | `test_ref_linear`, `test_ref_attention`, `test_vulkan_kernels`, `test_vulkan_smoke`, `test_vulkan_ref` | 2 | yes | portable reference kernels on CUDA, CPU and Vulkan |
 | `test_ops_linear`, `test_ops_moe` (`--softmax` for the Qwen router), `test_ops_attention`, `test_ops_flash`, `test_ops_vision` | 2 | yes | cross-backend op goldens (dumped on CUDA, checked on CUDA, CPU, Vulkan); `test_ops_flash` covers the Flash-Next modules (gated residual, PLE, QSA, selection, sparse attention, softmax router); `test_ops_vision` the vision-tower operators; `test_ops_moe` routes trellis and GGUF experts (Q4_K gate, IQ3_S up, Q6_K down; GGUF at cosine 0.999, each backend quantizing the activations its own way) |
-| `test_jinja` | 2 | no | Jinja2 subset against reference Jinja2 renders of both chat templates |
+| `test_jinja` | 2 | no | Jinja2 subset against reference Jinja2 renders of the Qwen, GLM and Gemma 4 chat templates |
 | `test_image` | 2 | no | image decode, smart resize and patch layout against PIL / HF-layout references, GLM canvas sizes against exllamav3's (`tests/tools/gen_image_goldens.py`) |
-| `test_output_parser` | 2 | no | reasoning / tool-call parser, chunking independence, template round trip |
+| `test_output_parser` | 2 | no | reasoning / tool-call parser (Qwen, GLM, DeepSeek and Gemma 4 formats), chunking independence, template round trip |
 | `test_trellis_layout` | 2 | yes | the trellis dequantizer against a golden decode in the build's tile order (tests/tools/trellis_layout_golden.py; run by hand, stock or Volta layout) |
 | `test_tui_view` | 2 | no | dashboard frames on every tab for full, partial and missing stats at normal and tiny terminal sizes; sparklines, gap histogram, expert heat map, alerts, slot picking, pause; key handling and scroll clamps |
 | `test_backend_tiers` | 1 | no | capability registry matches the declared module functions |
@@ -41,7 +41,7 @@
 | `test_gemma4_vision <model dir> <golden dir> <image>` | 2 | yes | (CUDA, CPU and Vulkan builds) Gemma 4 vision tower against exllamav3 (`tests/tools/gemma4_vision_golden.py`): the engine's preprocessing gives the reference's patch grid and patches (within one 8-bit step), the tower on the reference's patches matches its embeddings (row cosine worst 0.996, mean 0.99993), and on the engine's own patches on average (the model amplifies one-step pixel differences on some tokens: the reference itself under such noise drops single rows to 0.35-0.65) |
 | `test_dsv41_encoding <model dir>` | 2 | no | DeepSeek-V4.1 prompt encoding byte-exact against the checkpoint's `encoding/tests` golden cases and cases of its `test_encoding.py` |
 | `test_coherence`, `test_sampling_gpu` | 4 | yes | greedy determinism, seeded sampling, speculative equivalence |
-| `test_prefix_restore` (`--spec`, `--glm`, `--flash`, `ENGINE_KV_FORMAT=fp8`) | 2 | yes | a restored snapshot continues exactly like the same prefill without one, also after a round trip through the disk tier |
+| `test_prefix_restore` (`--spec`, `--glm`, `--flash`, `--gemma <dir> [--draft <dir>]`, `ENGINE_KV_FORMAT=fp8`) | 2 | yes | a restored snapshot continues exactly like the same prefill without one, also after a round trip through the disk tier |
 | `test_qwen4_exp` (`--gen N`, `ENGINE_DEBUG_TRACE_LAYERS`) | 4 | yes | Flash-Next bring-up driver: traces compared with `tests/tools/ref_qwen4_exp_dump.py` oracle dumps by `qwen4_exp_trace_cmp.py`; greedy decode speed |
 | `test_chunk_boundary` (`--cuts a,b`, `ENGINE_DSA=0`, `ENGINE_DEBUG_TRACE_LAYERS=<file>`) | 2 | yes | diagnostic, no pass/fail: GLM logit shift when the prompt is prefilled split at a non-chunk-aligned cut (aligned = 0); the trace file holds the last row after every layer and attention half |
 | `test_vision` (`--glm` for GLM's tower) | 2 | yes | vision tower: tensor-core attention against the CUDA-core reference, finite deterministic embeddings (the semantic check is `test_api.sh`) |
@@ -79,7 +79,7 @@ Not part of `gate.sh` (except `bench_decode`, `bench_accept` and `bench_prefill`
 |---|---|
 | `bench_decode` (`--glm`, `--flash`; `BENCH_CTX`) | graph-captured decode body on real weights: a plain token, an 8-row verify block, two slots decoding together. `BENCH_PROF_A=1` brackets the 8-row block and `BENCH_PROF_B=1` the two-slot steps with `cudaProfilerStart/Stop` (default: the plain token) |
 | `bench_prefill` (`BENCH_GLM=1`, `BENCH_FLASH=1`; `[tokens] [chunk ...]`) | prefill tok/s for a synthetic prompt at several chunk sizes |
-| `bench_accept` | draft acceptance of speculative decoding on a spread of prompts (per-position candidates; `--nothink`) |
+| `bench_accept` | draft acceptance of speculative decoding on a spread of prompts (per-position candidates; `--nothink`; `--type <model> --model <dir> --draft <dir>` for another target and drafter) |
 | `bench_spec` | DFlash2 rounds against plain greedy decoding on the same prompts (output must be token-identical) |
 | `bench_mhc` | `HyperConnection::collapse_norm` per site for 1 to 8 rows (`SINK` sets the Sinkhorn iterations) |
 | `bench_router` (`GLM=1` for the sigmoid router) | router logits and top-k per layer over 48 cycled weight copies |

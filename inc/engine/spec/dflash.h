@@ -354,13 +354,11 @@ public:
 	void set_context( int i ) {
 		if ( i == ctx_cur_ || i < 0 || i >= static_cast<int>( ctxs_.size() ) ) return;
 		ctxs_[ctx_cur_].kv_len = kv_len_;
-		ctxs_[ctx_cur_].kv_pos0 = kv_pos0_;
 		ctxs_[ctx_cur_].ingested = ctx_ingested_;
 		ctx_cur_ = i;
 		drafter_k_ = ctxs_[i].k;
 		drafter_v_ = ctxs_[i].v;
 		kv_len_ = ctxs_[i].kv_len;
-		kv_pos0_ = ctxs_[i].kv_pos0;
 		ctx_ingested_ = ctxs_[i].ingested;
 	}
 
@@ -369,7 +367,6 @@ public:
 	void reset_context() {
 		ctx_ingested_ = 0;
 		kv_len_ = 0;
-		kv_pos0_ = 0;
 	}
 
 	// Prefill: the tapped positions [ingested, upto) go into the drafter's context now (a drafter with a full-attention layer keeps a
@@ -470,7 +467,7 @@ private:
 	pod::TensorView drafter_v_;
 	struct Ctx {
 		pod::TensorView k, v;
-		int kv_len = 0, kv_pos0 = 0, ingested = 0;   // the counters of a context that is not selected
+		int kv_len = 0, ingested = 0;   // the counters of a context that is not selected
 	};
 	std::vector<Ctx> ctxs_;
 	int num_contexts_ = 1;
@@ -513,12 +510,11 @@ private:
 	pod::TensorView bb_dyn_a_, bb_dyn_m_;     // [8, conv_proj_out] FP16, before the side split
 	pod::TensorView bb_coef_a0_, bb_coef_a1_;  // [8, taps, groups] FP32, attention-conv sides
 	pod::TensorView bb_coef_m0_, bb_coef_m1_;  // [8, taps, groups] FP32, mlp-conv sides
-	pod::TensorView bb_ctx_fc_;     // [CTX_CHUNK, 5*hidden] FP16 context taps
+	pod::TensorView bb_ctx_fc_;     // [CTX_CHUNK, taps * hidden] FP16 context taps
 	pod::TensorView bb_ctx_normed_; // [CTX_CHUNK, hidden] FP16
 	pod::TensorView bb_ctx_resid_;  // [CTX_CHUNK, hidden] FP32, discarded
-	// rope tables for the drafter's own positions
-	// The projected context is a ring of ring_len_ slots; kv_pos0_ is the absolute position of
-	// logical slot 0. The block's own transient K/V live in the reserved tail starting at own_slot_.
+	// The projected context is a ring of ring_len_ slots (ingested row i in slot i % ring_len_); the block's own transient K/V live in
+	// the reserved tail starting at own_slot_.
 	int ring_len_ = 0;
 	// DFlash v1: every layer has a ring of its own inside drafter_k_ / drafter_v_ ([ring_l + block_size, kv_heads_local, head_dim] at
 	// element offset kv_off_[l]): sliding_window slots for a sliding layer, max_ctx for a full-attention one. Otherwise all layers share
@@ -536,7 +532,6 @@ private:
 	};
 	LayerKV layer_kv( int l ) const;
 	int kv_len_ = 0;
-	int kv_pos0_ = 0;
 	int ctx_ingested_ = 0;       // target positions already projected into the drafter's KV ring
 	int own_slot_ = 0;
 

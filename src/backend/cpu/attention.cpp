@@ -19,6 +19,7 @@ void Attention::store_kv_cache(
 	int max_seq,
 	backend::stream_t
 ) {
+	ENGINE_ASSERT( kv.ring == 0 || kv.ring == max_seq, "Attention::store_kv_cache: a ring cache has max_seq rows per layer" );
 	const int total_elems = num_kv_heads * head_dim;
 	if ( kv.kq != pod::KVQ::F16 || kv.vq != pod::KVQ::F16 ) {
 		// Quantized formats: one invocation per quantization unit (kv_codec.slang), K and V each in their own format

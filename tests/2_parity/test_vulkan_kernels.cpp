@@ -18,11 +18,11 @@ using namespace engine::backend;
 // Push-constant blocks: natural C layout == Slang's std430 emission (8-byte pointers, 4-byte scalars); mirrors test_slang_cpu.cpp
 struct NormParams { uint64_t src, dst, weight; int hidden_size, has_weight; float eps, bias; };
 struct AddParams { uint64_t hidden, residual; int n; };
-struct SwigluParams { uint64_t gate, up, out_; int n; float limit; };
+struct SwigluParams { uint64_t gate, up, out_; int n; float limit; int gelu; };
 struct EmbedParams { uint64_t table, token_ids, out_; int hidden_size; };
 struct RopeParams { uint64_t q, k, pos; int num_q_heads, num_kv_heads, head_dim, rot_dim, interleaved; float freq_base; int rot_pairs; };
 struct ArgmaxParams { uint64_t logits, out_idx, out_val; int numel, batch_size, index_offset, row_stride, has_val; };
-static_assert( sizeof( NormParams ) == 40 && sizeof( AddParams ) == 24 && sizeof( SwigluParams ) == 32, "push layout" );
+static_assert( sizeof( NormParams ) == 40 && sizeof( AddParams ) == 24 && sizeof( SwigluParams ) == 40, "push layout" );
 static_assert( sizeof( EmbedParams ) == 32 && sizeof( RopeParams ) == 56 && sizeof( ArgmaxParams ) == 48, "push layout" );
 
 static uint32_t g_state = 777u;

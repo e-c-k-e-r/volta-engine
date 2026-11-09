@@ -96,8 +96,8 @@ void dflash_publish_taps_slots(
 	dflash_store_taps_slots_kernel<half><<<g, 256, 0, stream>>>( taps, hidden, d_rows, m, tap, H, cap, slot_stride, taps_n );
 }
 
-void dflash_publish_taps_slots_f32( half* taps, const float* hidden, const pod::BatchRows* d_rows, int m, int tap, int H, int cap, size_t slot_stride, int taps_n,
-	cudaStream_t stream ) {
+void dflash_publish_taps_slots_f32( half* taps, const float* hidden, const pod::BatchRows* d_rows, int m, int tap, int H, int cap, size_t slot_stride,
+	cudaStream_t stream, int taps_n ) {
 	dim3 g( ( H + 255 ) / 256, m );
 	dflash_store_taps_slots_kernel<float><<<g, 256, 0, stream>>>( taps, hidden, d_rows, m, tap, H, cap, slot_stride, taps_n );
 }

@@ -2266,7 +2266,7 @@ void Glm5NextPipeline::destroy() {
 // small ring of recent per-token index rows (the whole slot is stored; it is part of the state, not of the segment).
 size_t Glm5NextPipeline::tap_snapshot_bytes( int tokens ) const {
 	if ( !snap_taps_ ) return 0;
-	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * 5 * config_.hidden_size * sizeof( backend::half_t );
+	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * draft_hooks_.taps_n * config_.hidden_size * sizeof( backend::half_t );
 }
 
 size_t Glm5NextPipeline::seq_state_bytes( int from, int tokens, bool with_taps ) const {

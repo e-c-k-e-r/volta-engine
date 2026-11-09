@@ -408,8 +408,8 @@ int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Ca
 	chunk = ( chunk <= 0 ) ? max_rows : MAX( 1, MIN( chunk, max_rows ) );
 	int last_rows = 1;
 	// A model that prefills several chunks layer by layer (prefill_window) takes up to that many consecutive chunks at once; a chunk at the decode
-	// sizes (the tail of a prompt) and prompts with images go the ordinary way
-	const int window = ( mm_slots_ == 0 && chunk > pod::MAX_BATCH ) ? models_[0]->window_chunks() : 1;
+	// sizes (the tail of a prompt), prompts with images and a speculator that reads each chunk's taps go the ordinary way
+	const int window = ( mm_slots_ == 0 && chunk > pod::MAX_BATCH && !( runner_ && runner_->reads_prefill_chunks() ) ) ? models_[0]->window_chunks() : 1;
 	for ( int d = 0; d < tp_; ++d ) models_[d]->set_prefill_end( pos0 + count );
 	for ( int pos = 0; pos < count; ) {
 		int n = 0;

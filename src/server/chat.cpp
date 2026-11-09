@@ -263,7 +263,7 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 	if ( family == engine::loader::ModelFamily::GLM && !req.images.empty() && vars["messages"].is_array() ) inline_glm_image_markers( vars["messages"] );
 	if ( family == engine::loader::ModelFamily::GEMMA ) {
 		if ( vars["messages"].is_array() ) gemma_tool_messages( vars["messages"] );
-		vars["bos_token"] = gen.tokenizer().decode_token( 2 );
+		vars["bos_token"] = gen.tokenizer().decode_token( gen.tokenizer().get_special_token( "<bos>" ) );
 	}
 	// tool_choice required / named: say so on the last user turn (not after a tool result, or the model would loop on it)
 	if ( !req.tools_json.empty() && ( req.require_tool || !req.force_tool.empty() ) && vars["messages"].is_array() && !vars["messages"].empty() &&

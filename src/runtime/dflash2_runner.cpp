@@ -50,7 +50,10 @@ void load_draft_config( const std::string& dir, pod::DFlashConfig& cfg ) {
 		geti( j, "block_size", cfg.block_size );
 		if ( j.contains( "layer_types" ) && j["layer_types"].is_array() ) {
 			int l = 0;
-			for ( const auto& t : j["layer_types"] ) if ( l < 8 ) cfg.layer_full[l++] = t == "full_attention";
+			for ( const auto& t : j["layer_types"] ) {
+				ENGINE_ASSERT( l < 8, "DFlash2Runner: a drafter of at most 8 layers" );
+				cfg.layer_full[l++] = t == "full_attention";
+			}
 		}
 	}
 	if ( j.contains( "dflash_config" ) && j["dflash_config"].is_object() ) {

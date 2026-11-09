@@ -15,6 +15,7 @@
 #if ENGINE_BACKEND_CUDA
 #include "trellis_context.h"
 #endif
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -40,7 +41,7 @@ bool Gemma4Pipeline::init( const Gemma4Config& config, int rank, pod::MemoryAren
 
 	const int tp_size = ( ring_ != nullptr ) ? requested_tp_ : 1;
 	ENGINE_ASSERT( tp_size == 1 || tp_size == 2 || tp_size == 4, "Gemma4Pipeline: tensor parallelism of 1, 2 or 4 ranks" );
-	tp_ranks_ = tp_size;
+	tp_size_ = tp_size;
 	q_heads_ = config_.num_q_heads / tp_size;
 	swa_kv_heads_ = config_.swa_kv_heads / tp_size;
 	full_kv_heads_ = config_.full_kv_heads / tp_size;
@@ -84,7 +85,6 @@ bool Gemma4Pipeline::init( const Gemma4Config& config, int rank, pod::MemoryAren
 	mlp_inter_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, mlp_shape, 2 );
 
 	// Vocabulary-parallel head: every rank projects vocab / tp columns, padded to a multiple of 256 (the int8 GEMV's width)
-	tp_size_ = tp_size > 1 ? tp_size : 1;
 	lm_shard_real_cols_ = config_.vocab_size / tp_size_;
 	lm_shard_cols_ = lm_shard_real_cols_ + ( tp_size_ > 1 ? ( 256 - lm_shard_real_cols_ % 256 ) % 256 : 0 );
 	{
@@ -119,7 +119,7 @@ bool Gemma4Pipeline::init( const Gemma4Config& config, int rank, pod::MemoryAren
 
 	// DFlash drafter: a tap ring per slot (the hidden after each tapped layer) and the head scratch
 	if ( speculation_ == Speculation::DFlash ) {
-		engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, H, S, true, 6 );
+		engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, H, S, true, Gemma4Config::kTaps );
 		engine::models::alloc_draft_head( arena, draft_hooks_, draft_, H, lm_shard_cols_, kTopkTile, rank_ * lm_shard_real_cols_, lm_shard_real_cols_ );
 		draft_hooks_.embedding = &embed_tokens_;
 		draft_hooks_.embed_scale = embed_scale_;
@@ -211,7 +211,7 @@ bool Gemma4Pipeline::load_weights( const char* model_dir, backend::stream_t stre
 	else if ( tp_size_ > 1 ) lm_head_ = repo.load_linear_slice_padded( "lm_head", *arena_, 6, rank_, tp_size_, pad, stream );
 	else if ( rank_ == 0 ) lm_head_ = repo.load_linear( "lm_head", *arena_, 6, stream );
 
-	const int tp = tp_ranks_;
+	const int tp = tp_size_;
 	// A dense projection: FP16 sliced along its output rows (column parallel) or input columns (row parallel), or NVFP4 at load
 	auto dense_proj = [&]( const char* base, bool split_n ) {
 		if ( nv_group( "attn" ) ) return repo.quantize_nvfp4_slice( base, *arena_, split_n, rank_, tp, 0, stream );
@@ -350,11 +350,11 @@ const pod::TensorView& Gemma4Pipeline::gather_logits( int rows, const backend::h
 	ENGINE_ASSERT( peer_shard_cols == lm_shard_cols_, "Gemma4Pipeline::gather_logits: shard width mismatch" );
 	full_logits_.shape[0] = rows;
 	const size_t shard_elems = static_cast<size_t>( lm_shard_real_cols_ );
-	for ( int d = 0; d < tp_ranks_; ++d ) {
+	for ( int d = 0; d < tp_size_; ++d ) {
 		const backend::half_t* src_base = ( d == rank_ ) ? logits_.ptr<const backend::half_t>() : peer_shard_ptrs[d];
 		ENGINE_ASSERT( src_base != nullptr, "Gemma4Pipeline::gather_logits: missing peer shard pointer" );
 		for ( int r = 0; r < rows; ++r ) {
-			backend::half_t* dst = full_logits_.ptr<backend::half_t>() + ( static_cast<size_t>( r ) * tp_ranks_ + d ) * shard_elems;
+			backend::half_t* dst = full_logits_.ptr<backend::half_t>() + ( static_cast<size_t>( r ) * tp_size_ + d ) * shard_elems;
 			backend::peer_copy_async( dst, rank_, src_base + static_cast<size_t>( r ) * lm_shard_cols_, d, shard_elems * sizeof( backend::half_t ), stream );
 		}
 	}
@@ -473,10 +473,10 @@ void Gemma4Pipeline::forward_body( int m, backend::stream_t stream ) {
 		const Gemma4LayerWeights& lw = layers_[L];
 		layer_forward( lw, lw.is_full ? full_idx++ : swa_idx++, m, stream );
 		// Drafter taps: the hidden after the tapped layers, into each row's slot ring (slot and position from d_rows_: graph-replayable)
-		for ( int tap = 0; tap < 6 && draft_.taps.data != nullptr; ++tap ) {
+		for ( int tap = 0; tap < Gemma4Config::kTaps && draft_.taps.data != nullptr; ++tap ) {
 			if ( L != config_.tap_layers[tap] + tap_shift_ ) continue;
 			engine::spec::dflash_publish_taps_slots_f32( draft_.taps.ptr<backend::half_t>(), resid_.ptr<const float>(), d_rows_, m, tap, config_.hidden_size,
-				draft_hooks_.taps_cap, draft_hooks_.taps_slot_stride, 6, stream );
+				draft_hooks_.taps_cap, draft_hooks_.taps_slot_stride, stream, Gemma4Config::kTaps );
 		}
 	}
 

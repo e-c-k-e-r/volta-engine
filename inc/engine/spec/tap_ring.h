@@ -46,8 +46,8 @@ void dflash_publish_taps_slots_f32(
 	int H,
 	int cap,
 	size_t slot_stride,
-	int taps_n,
-	backend::stream_t stream
+	backend::stream_t stream,
+	int taps_n
 );
 
 // Reduces mHC residual streams [m, 4, H] (FP32) to one FP16 hidden row per token: mode 0 = mean of the four streams,

@@ -1360,7 +1360,11 @@ void Attention::forward_prefill(
 	// a window bounds the keys a chunk reads: size the split by them
 	if ( window > 0 ) key_hint = key_hint > 0 ? MIN( key_hint, window + count ) : window + count;
 #if defined(USE_ROCM)
-	ENGINE_ASSERT( window == 0 && kv.ring == 0 && scale_override <= 0.0f, "Attention::forward_prefill (ROCm): no sliding windows or scale overrides" );
+	if ( window > 0 || kv.ring > 0 || scale_override > 0.0f ) {
+		// the RDNA kernels have no windows, rings or scale overrides: the decode kernel (same arguments and result)
+		forward_decode( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream, scale_override, window );
+		return;
+	}
 	// The tiled kernel stages ~96 KB of shared memory; RDNA grants a workgroup 64 KB. The WMMA kernel fits in 64 KB
 	if ( PA_SMEM > rocm_smem_optin_max() ) {
 		(void) key_hint;

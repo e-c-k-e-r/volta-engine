@@ -24,6 +24,7 @@ void Attention::store_kv_cache(
 	int max_seq,
 	backend::stream_t stream
 ) {
+	ENGINE_ASSERT( kv.ring == 0 || kv.ring == max_seq, "Attention::store_kv_cache: a ring cache has max_seq rows per layer" );
 	const int total_elems = num_kv_heads * head_dim;
 	if ( kv.kq != pod::KVQ::F16 || kv.vq != pod::KVQ::F16 ) {
 		// Quantized formats: one invocation per quantization unit (kv_codec.slang), K and V each in their own format
@@ -52,6 +53,7 @@ namespace {
 
 void ref_attention( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
 	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, float scale = 0.0f, int window = 0 ) {
+	ENGINE_ASSERT( kv.ring == 0 || ( window > 0 && window <= kv.ring && kv.ring == max_seq ), "Attention (Vulkan): a ring cache holds a sliding window of max_seq rows" );
 	ENGINE_ASSERT( head_dim <= 512 && num_kv_heads > 0 && num_q_heads % num_kv_heads == 0, "Attention (Vulkan): head_dim <= 512 and GQA only" );
 	vki::RefAttnParams p{ vki::dp( q.data ), vki::dp( kv.k ), vki::dp( kv.v ), vki::dp( gate.data ), vki::dp( out.data ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ),
 		static_cast<int64_t>( slot_stride ), layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, gate.data != nullptr ? 1 : 0, scale > 0.0f ? scale : 1.0f / std::sqrt( static_cast<float>( head_dim ) ),

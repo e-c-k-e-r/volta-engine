@@ -105,6 +105,7 @@ tier2_models() {
 	run tokenizer_cases_glm ./test_tokenizer_file $(model_dir ENGINE_TEST_GLM_DIR) --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
 	run tokenizer_cases_flash ./test_tokenizer_file $(model_dir ENGINE_TEST_FLASH_DIR) --cases $ROOT/tests/data/tokenizer_cases_qwen4_exp.json
 	run tokenizer_cases_deepseek ./test_tokenizer_file $DSV41 --cases $ROOT/tests/data/tokenizer_cases_deepseek_v41.json
+	run tokenizer_cases_gemma ./test_tokenizer_file $(model_dir ENGINE_TEST_GEMMA_DIR) --cases $ROOT/tests/data/tokenizer_cases_gemma4.json
 	run dsv41_encoding ./test_dsv41_encoding $DSV41
 	# the vision tower against the checkpoint reference (FP32): the goldens come from the reference's torch code (needs the exllamav3 venv), made once
 	local vg=$ROOT/results/dsv41_vision_golden

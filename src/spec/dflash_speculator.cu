@@ -68,6 +68,7 @@ bool DFlashSpeculator::init(
 	const int inter_local = config_.intermediate_size / TP;
 	const int groups = config_.conv_groups();
 	const int proj_out = config_.conv_proj_out();
+	ENGINE_ASSERT( config_.num_hidden_layers >= 1 && config_.num_hidden_layers <= 8 && config_.num_target_layer_ids <= 8, "DFlashSpeculator::init: at most 8 drafter layers and 8 taps" );
 	ENGINE_ASSERT( config_.num_q_heads % TP == 0 && config_.num_kv_heads % TP == 0
 		&& config_.intermediate_size % TP == 0 && H % TP == 0,
 		"DFlashSpeculator::init: TP size must divide the head and intermediate counts" );
@@ -206,7 +207,6 @@ bool DFlashSpeculator::init(
 	drafter_k_ = ctxs_[0].k;
 	drafter_v_ = ctxs_[0].v;
 	kv_len_ = 0;
-	kv_pos0_ = 0;
 
 	int ctx_tap_shape[2] = { ctx_chunk_, config_.num_target_layer_ids * H };
 	bb_ctx_fc_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ctx_tap_shape, 2 );

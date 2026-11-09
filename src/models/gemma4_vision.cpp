@@ -7,6 +7,7 @@
 #include "engine/backend/runtime.h"
 #include "engine/core/log.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 

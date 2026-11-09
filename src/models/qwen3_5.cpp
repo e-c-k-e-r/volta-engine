@@ -1061,7 +1061,7 @@ constexpr size_t kSeqAlign = 256;
 
 size_t Qwen3_5Pipeline::tap_snapshot_bytes( int tokens ) const {
 	if ( !snap_taps_ ) return 0;
-	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * 5 * config_.hidden_size * sizeof( backend::half_t );
+	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * draft_hooks_.taps_n * config_.hidden_size * sizeof( backend::half_t );
 }
 
 // Bytes (data + scales) of the K or V rows [from, tokens) of one layer

@@ -27,7 +27,7 @@ void dflash_publish_taps_slots( backend::half_t*, const backend::half_t*, const 
 	ENGINE_UNSUPPORTED( "dflash_publish_taps_slots" );
 }
 
-void dflash_publish_taps_slots_f32( backend::half_t*, const float*, const pod::BatchRows*, int, int, int, int, size_t, int, backend::stream_t ) {
+void dflash_publish_taps_slots_f32( backend::half_t*, const float*, const pod::BatchRows*, int, int, int, int, size_t, backend::stream_t, int ) {
 	ENGINE_UNSUPPORTED( "dflash_publish_taps_slots_f32" );
 }
 

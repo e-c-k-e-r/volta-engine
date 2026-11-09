@@ -422,7 +422,7 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 	slot.metrics.generated_tokens = slot.tokens_generated;
 	slot.metrics.decode_tok_s = ( decode_s > 0.0 && slot.tokens_generated > 1 ) ? static_cast<float>( ( slot.tokens_generated - 1 ) / decode_s ) : 0.0f;
 	// Tap spool: int32 0x7A950002, request id, prompt tokens, n tokens, first position, count W; then the tokens [first, n) (int32), then the taps of
-	// positions [first, first + W) (W x 5 x hidden FP16), then int32 R and R rows of the target's top-16 at the positions speculation emitted
+	// positions [first, first + W) (W x 5 x hidden FP16; only drafters of 5 taps are spooled), then int32 R and R rows of the target's top-16 at the positions speculation emitted
 	// (int32 pos, int32 n, float logits[16], int32 ids[16]; logits unscaled, sorted descending). The last token is not forwarded yet, so taps exist up to n - 2
 	if ( const std::string& spool = runtime::options().tap_spool; !spool.empty() && cluster_.has_speculator() ) {
 		const std::vector<TargetSpool::Row> rows = TargetSpool::get().take( s );
@@ -430,8 +430,14 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 		const int n = static_cast<int>( slot.all_tokens.size() );
 		const int W = std::max( 0, std::min( std::min( runtime::options().tap_spool_window, n - 1 ), 2048 ) );
 		const int first = n - 1 - W;
-		if ( f && W > 0 && slot.prefill_done ) {
-			std::vector<backend::half_t> taps( static_cast<size_t>( W ) * 5 * cluster_.metadata().hidden_size );
+		const int taps_n = cluster_.model( 0 ).draft_hooks().taps_n;
+		if ( taps_n != 5 ) {
+			static bool warned = false;
+			if ( !warned ) LOG_WARN( "tap_spool: the record layout holds 5 taps per position, this target publishes %d; nothing spooled\n", taps_n );
+			warned = true;
+		}
+		if ( f && W > 0 && slot.prefill_done && taps_n == 5 ) {
+			std::vector<backend::half_t> taps( static_cast<size_t>( W ) * taps_n * cluster_.metadata().hidden_size );
 			if ( cluster_.read_taps( s, first, W, taps.data() ) ) {
 				const int32_t head[6] = { static_cast<int32_t>( 0x7A950002 ), static_cast<int32_t>( slot.req.req_id ), static_cast<int32_t>( slot.req.prompt_tokens.size() ), n, first, W };
 				std::fwrite( head, sizeof( int32_t ), 6, f );

@@ -48,6 +48,11 @@ __attribute__(( weak )) void DFlashSpeculator::draft_backbone( const pod::Tensor
 	__builtin_unreachable();
 }
 
+__attribute__(( weak )) void DFlashSpeculator::prefill_context( const backend::half_t* tapped_states, int upto, int taps_cap, backend::stream_t stream ) {
+	ENGINE_UNSUPPORTED( "DFlashSpeculator::prefill_context" );
+	__builtin_unreachable();
+}
+
 __attribute__(( weak )) void DFlashSpeculator::project_gate( int rows, backend::stream_t stream ) {
 	ENGINE_UNSUPPORTED( "DFlashSpeculator::project_gate" );
 	__builtin_unreachable();

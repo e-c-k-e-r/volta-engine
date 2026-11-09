@@ -6,6 +6,7 @@
 #include "engine/modules/gguf.h"
 #include "engine/core/batch.h"
 #include "engine/backend/runtime.h"
+#include "engine/runtime/options.h"
 #include <algorithm>
 #include <cstdlib>
 #include "gguf_common.cuh"
@@ -737,10 +738,9 @@ void launch_mma( const void* w, const half* x, half* out, int n, int k, int m, G
 	if ( used > 1 ) tile_reduce_kernel<<<( m * n + 255 ) / 256, 256, 0, stream>>>( st.part, out, n, m, used );
 }
 
-// ENGINE_DEBUG_GGUF_MMA=0 takes the tensor-core rows kernel out (the GEMV / tile paths), for A/B timing
+// Option gguf_mma false takes the tensor-core rows kernel out (the GEMV / tile paths), for A/B timing
 bool mma_off() {
-	static const bool off = [] { const char* e = std::getenv( "ENGINE_DEBUG_GGUF_MMA" ); return e != nullptr && e[0] == '0'; }();
-	return off;
+	return !engine::runtime::options().gguf_mma;
 }
 
 } // namespace

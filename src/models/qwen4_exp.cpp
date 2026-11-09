@@ -1672,7 +1672,7 @@ size_t kv_segment_bytes( pod::KVQ q, size_t row_elems, int rows ) {
 
 size_t Qwen4ExpPipeline::tap_snapshot_bytes( int tokens ) const {
 	if ( !snap_taps_ ) return 0;
-	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * 5 * config_.hidden_size * sizeof( backend::half_t );
+	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * draft_hooks_.taps_n * config_.hidden_size * sizeof( backend::half_t );
 }
 
 size_t Qwen4ExpPipeline::seq_state_bytes( int from, int tokens, bool with_taps ) const {

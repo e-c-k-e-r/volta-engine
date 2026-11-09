@@ -81,7 +81,6 @@ void DFlashSpeculator::ingest_context( const half* tapped_states, int n_ctx, int
 			}
 		}
 		kv_len_ += n_ctx;
-		if ( kv_len_ > ring_len_ ) kv_pos0_ = kv_len_ - ring_len_;
 	}
 
 }

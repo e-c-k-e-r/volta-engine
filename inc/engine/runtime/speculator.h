@@ -53,6 +53,8 @@ public:
 
 	// Called after every prefill chunk of the owning slot: `rows` prompt tokens starting at position pos0 were just forwarded
 	virtual void on_prefill_chunk( int slot, const int* tokens, int rows, int pos0 ) { (void) slot; (void) tokens; (void) rows; (void) pos0; }
+	// on_prefill_chunk reads what each chunk's forward wrote (the tap ring): chunks then go one forward at a time, not layer by layer in a window
+	virtual bool reads_prefill_chunks() const { return false; }
 	// Called after a plain (non-speculative) decode step of the owning slot: `token` was forwarded at `pos` as row `row` of the batch
 	virtual void on_dense_row( int slot, int token, int pos, int row ) { (void) slot; (void) token; (void) pos; (void) row; }
 	// Whether the target must publish drafter taps (and snapshots carry them)

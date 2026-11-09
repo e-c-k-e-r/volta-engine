@@ -107,6 +107,7 @@ void QSA::score( const backend::half_t* q, const backend::half_t* pool_plane, ba
 
 void Attention::forward_sparse( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
 	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, const int* idx, const int* nkeys, int idx_stride, backend::stream_t ) {
+	ENGINE_ASSERT( kv.ring == 0, "Attention::forward_sparse: no ring caches" );
 	ENGINE_ASSERT( kv.vq != pod::KVQ::Q4, "Attention::forward_sparse: Q4 values are not supported" );
 	const float scale = 1.0f / std::sqrt( static_cast<float>( head_dim ) );
 	const int heads_per_kv = std::max( num_q_heads / num_kv_heads, 1 );

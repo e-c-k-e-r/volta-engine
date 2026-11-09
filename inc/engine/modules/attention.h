@@ -12,6 +12,8 @@ namespace engine::modules {
 // k_cache / v_cache point at slot 0; slot_stride is the per-slot element stride.
 // Row m of every call reads/writes slot d_rows->slot[m] at position d_rows->pos[m]; d_rows is
 // device-resident so launches carry no position/slot values (CUDA-graph replayable).
+// A ring cache (KVRef::ring > 0, a sliding window) keeps max_seq == ring rows per layer and position p in row p % ring; with
+// d_rows->bidir, a windowed call lets row m see keys below d_rows->key_end[m] (an image row sees its whole image).
 struct Attention {
 	static void unpack_q_gate(
 		const pod::TensorView& q_gate,
@@ -56,9 +58,9 @@ struct Attention {
 		int window = 0        // > 0: a row attends to its last `window` positions (its own included); 0: all of them
 	);
 
-	// Prefill form for chunks above the decode sizes (one slot, head_dim 256): K/V tiles are shared across queries.
-	// Same arguments and result as forward_decode; key_hint (keys the chunk can attend to, 0 = unknown) only sizes the
-	// split of the key range over blocks.
+	// Tensor-core form (head_dim 256 or 512; 512 takes the decode kernel on SM_80+ and ROCm builds): K/V tiles are shared across the
+	// queries of one slot, or every row gets its own block (per_row, rows of distinct slots). Same arguments and result as
+	// forward_decode; key_hint (keys the chunk can attend to, 0 = unknown) only sizes the split of the key range over blocks.
 	static void forward_prefill(
 		const pod::KVRef& kv,
 		const pod::TensorView& q,
