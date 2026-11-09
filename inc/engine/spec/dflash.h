@@ -372,6 +372,11 @@ public:
 		kv_pos0_ = 0;
 	}
 
+	// Prefill: the tapped positions [ingested, upto) go into the drafter's context now (a drafter with a full-attention layer keeps a
+	// prompt longer than the tap ring that way); wants_prefill_context() says whether the drafter benefits
+	void prefill_context( const backend::half_t* tapped_states, int upto, int taps_cap, backend::stream_t stream = nullptr );
+	bool wants_prefill_context() const { return kv_per_layer_; }
+
 	void draft_select(
 		const float* vals,
 		const int* ix,
@@ -407,6 +412,8 @@ public:
 	// Parity tests install dense weights and read internals through DFlashTestAccess (below); the
 	// engine never does.
 	friend struct DFlashTestAccess;
+
+	void ingest_context( const backend::half_t* tapped_states, int n_ctx, int ctx_pos0, int taps_ring_cap, backend::stream_t stream );
 
 	void forward_backbone(
 		const pod::TensorView& embed_table,

@@ -11,38 +11,19 @@
 
 namespace engine::spec {
 
-void DFlashSpeculator::forward_backbone(
-	const pod::TensorView& embed_table,
-	const int* d_input_ids,
-	int rows,
-	const half* tapped_states,
-	int n_ctx,
-	int ctx_pos0,
-	int block_pos0,
-	pod::TensorView& hidden_out,
-	cudaStream_t stream,
-	int taps_ring_cap
-) {
-	CUDA_CHECK( cudaSetDevice( device_ ) );
-	ENGINE_ASSERT( weights_loaded_, "DFlashSpeculator::forward_backbone: weights not loaded" );
-	ENGINE_ASSERT( rows >= 1 && rows <= config_.block_size, "DFlashSpeculator::forward_backbone: rows" );
-
+// The context stage: the tapped target states of n_ctx positions from ctx_pos0 go through fc and hidden_norm and every layer's k / v
+// projection into the drafter's KV rings
+void DFlashSpeculator::ingest_context( const half* tapped_states, int n_ctx, int ctx_pos0, int taps_ring_cap, cudaStream_t stream ) {
 	const int H = config_.hidden_size;
 	const int L = config_.num_hidden_layers;
-	const int taps = config_.conv_kernel_size;
-	const int groups = config_.conv_groups();
-	const int proj_out = config_.conv_proj_out();
 	const int hd = config_.head_dim;
-	const int qh_local = config_.num_q_heads / tp_size_;
 	const int kvh_local = config_.num_kv_heads / tp_size_;
 	const int rope_pairs = hd / 2;
 	const int tn = config_.num_target_layer_ids;   // tapped target layers per position
-
-	// ---- Stage 1: project the target context into the drafter's own KV cache ----
 	// fc is column-parallel on the output. At tp > 1 each rank computes its H/tp columns, writes them into
 	// a zeroed full-width buffer and a sum across ranks gathers them (x + 0 is exact), so the norm and
 	// every later stage see the full-width row on every rank.
-	ENGINE_ASSERT( tp_size_ == 1 || ring_ != nullptr, "DFlashSpeculator::forward_backbone: TP > 1 needs set_ring" );
+	ENGINE_ASSERT( tp_size_ == 1 || ring_ != nullptr, "DFlashSpeculator::ingest_context: TP > 1 needs set_ring" );
 	if ( n_ctx > 0 && fc_.is_valid() ) {
 		for ( int base = 0; base < n_ctx; base += ctx_chunk_ ) {
 			const int cnt = MIN( ctx_chunk_, n_ctx - base );
@@ -102,6 +83,51 @@ void DFlashSpeculator::forward_backbone(
 		kv_len_ += n_ctx;
 		if ( kv_len_ > ring_len_ ) kv_pos0_ = kv_len_ - ring_len_;
 	}
+
+}
+
+// Prefill: positions up to `upto` (excluded) that the tap ring holds go into the drafter's context now, so a full-attention drafter layer
+// keeps a prompt longer than the ring (draft rounds then only ingest what the target wrote since)
+void DFlashSpeculator::prefill_context( const half* tapped_states, int upto, int taps_cap, cudaStream_t stream ) {
+	CUDA_CHECK( cudaSetDevice( device_ ) );
+	if ( !weights_loaded_ || upto <= ctx_ingested_ ) return;
+	int n = upto - ctx_ingested_;
+	if ( taps_cap > 0 && n > taps_cap ) {
+		ctx_ingested_ = upto - taps_cap;
+		n = taps_cap;
+	}
+	ingest_context( tapped_states, n, ctx_ingested_, taps_cap, stream );
+	ctx_ingested_ += n;
+}
+
+void DFlashSpeculator::forward_backbone(
+	const pod::TensorView& embed_table,
+	const int* d_input_ids,
+	int rows,
+	const half* tapped_states,
+	int n_ctx,
+	int ctx_pos0,
+	int block_pos0,
+	pod::TensorView& hidden_out,
+	cudaStream_t stream,
+	int taps_ring_cap
+) {
+	CUDA_CHECK( cudaSetDevice( device_ ) );
+	ENGINE_ASSERT( weights_loaded_, "DFlashSpeculator::forward_backbone: weights not loaded" );
+	ENGINE_ASSERT( rows >= 1 && rows <= config_.block_size, "DFlashSpeculator::forward_backbone: rows" );
+
+	const int H = config_.hidden_size;
+	const int L = config_.num_hidden_layers;
+	const int taps = config_.conv_kernel_size;
+	const int groups = config_.conv_groups();
+	const int proj_out = config_.conv_proj_out();
+	const int hd = config_.head_dim;
+	const int qh_local = config_.num_q_heads / tp_size_;
+	const int kvh_local = config_.num_kv_heads / tp_size_;
+	const int rope_pairs = hd / 2;
+
+	// ---- Stage 1: project the target context into the drafter's own KV cache ----
+	ingest_context( tapped_states, n_ctx, ctx_pos0, taps_ring_cap, stream );
 
 	// ---- Stage 2: the block of `rows` query positions ----
 	engine::modules::Embedding::forward( embed_table, d_input_ids, rows, bb_normed_, stream );

@@ -1,5 +1,6 @@
 // Vision-tower operators for the Vulkan backend (GPU targets only; the CPU backend has plain C++ in src/backend/cpu/vision.cpp): norms, patch embedding bias,
-// interpolated position table, rotary with biases, bidirectional attention, bias / activation / residual helpers and the merger's gather. Same arithmetic as
+// interpolated position table, rotary with biases, bidirectional attention, bias / activation / residual helpers, the merger's gather and Gemma 4's
+// per-head norms with the 2-D rotary and its pooler. Same arithmetic as
 // src/backend/cuda/modules/vision.cu; slow but simple. The GEMMs go through ref_gemm_nt_f16.
 
 groupshared float v_red[256];
@@ -275,4 +276,67 @@ void vision_bias_residual(uint3 tid : SV_DispatchThreadID, uniform BiasResidualP
 	let i = int64_t(tid.x) + int64_t(tid.y) * 65535 * 256;
 	if (i >= p.total) return;
 	p.hidden[i] += float(p.y[i]) + float(p.bias[i % p.n]);
+}
+
+// Gemma 4: q, k normalized per head with gains, v without, then q and k rotated in an x half and a y half (pairs i, i + head_dim / 4 inside a
+// half, frequency theta^( -4 i / head_dim )). A group of 256 per (head, row) (vsum256); head_dim <= 128.
+struct QkvRope2dParams { half* q; half* k; half* v; half* qn; half* kn; int* pos_xy; int heads; int head_dim; float theta; float eps; };
+
+groupshared float r2_x[128];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void vision_qkv_rope2d(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform QkvRope2dParams p) {
+	let t = int(tid.x);
+	let row = int(gid.y);
+	let hd = p.head_dim;
+	let half_d = hd / 2;
+	let quarter = hd / 4;
+	let off = (int64_t(row) * p.heads + int64_t(gid.x)) * hd;
+	for (int which = 0; which < 3; ++which) {
+		half* x = (which == 0 ? p.q : which == 1 ? p.k : p.v) + off;
+		let val = t < hd ? float(x[t]) : 0.0f;
+		let inv = rsqrt(vsum256(t, val * val) / float(hd) + p.eps);
+		float w = 1.0f;
+		if (which == 0 && t < hd) w = float(p.qn[t]);
+		if (which == 1 && t < hd) w = float(p.kn[t]);
+		float y = val * inv * w;
+		if (which < 2) {
+			if (t < hd) r2_x[t] = y;
+			GroupMemoryBarrierWithGroupSync();
+			if (t < hd) {
+				let hf = t / half_d;
+				let i = t % half_d;
+				let pi = i % quarter;
+				let ang = float(p.pos_xy[2 * row + hf]) * pow(p.theta, -2.0f * float(pi) / float(half_d));
+				let cs = cos(ang);
+				let sn = sin(ang);
+				let partner = r2_x[hf * half_d + (i < quarter ? i + quarter : i - quarter)];
+				y = i < quarter ? y * cs - partner * sn : y * cs + partner * sn;
+			}
+			GroupMemoryBarrierWithGroupSync();
+		}
+		if (t < hd) x[t] = half(y);
+	}
+}
+
+// Gemma 4's pooler: soft token t is the mean of its k x k patches (raster rows of x over a gh x gw grid), times mul, minus bias, times scale
+struct PoolStdParams { float* x; half* bias; half* scale; half* out_; int gw; int k; int n; float mul; int has_std; };
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void vision_pool_std(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform PoolStdParams p) {
+	let tok = int(gid.x);
+	let tw = p.gw / p.k;
+	let ty = tok / tw;
+	let tx = tok % tw;
+	let inv = 1.0f / float(p.k * p.k);
+	for (int c = int(tid.x); c < p.n; c += 256) {
+		float acc = 0.0f;
+		for (int dy = 0; dy < p.k; ++dy)
+			for (int dx = 0; dx < p.k; ++dx) acc += p.x[(int64_t(ty * p.k + dy) * p.gw + tx * p.k + dx) * p.n + c];
+		float v = acc * inv * p.mul;
+		if (p.has_std != 0) v = (v - float(p.bias[c])) * float(p.scale[c]);
+		p.out_[int64_t(tok) * p.n + c] = half(v);
+	}
 }

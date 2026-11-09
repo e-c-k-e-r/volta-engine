@@ -154,6 +154,22 @@ void DFlash2Runner::claim( int slot ) {
 	} );
 }
 
+void DFlash2Runner::on_prefill_chunk( int slot, const int* tokens, int rows, int pos0 ) {
+	(void) tokens;
+	if ( mc_ == nullptr || !spec_[0].wants_prefill_context() || !owns( slot ) ) return;
+	auto ingest = [&]( int d ) {
+		const auto& hk = mc_->model( d ).draft_hooks();
+		if ( per_slot_ ) spec_[d].set_context( slot );
+		spec_[d].prefill_context( hk.taps + static_cast<size_t>( per_slot_ ? slot : 0 ) * hk.taps_slot_stride, pos0 + rows, hk.taps_cap, mc_->stream( d ) );
+		backend::stream_sync( mc_->stream( d ) );
+	};
+	if ( tp_ > 1 ) mc_->run_ranks( ingest );
+	else {
+		backend::set_device( 0 );
+		ingest( 0 );
+	}
+}
+
 void DFlash2Runner::release( int slot ) {
 	if ( per_slot_ ) {
 		if ( slot >= 0 && slot < kMaxSlots ) owned_[slot] = false;

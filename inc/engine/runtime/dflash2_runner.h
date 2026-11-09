@@ -44,6 +44,8 @@ public:
 	bool per_slot() const override { return per_slot_; }
 	// The slot stops owning the drafter context (it was overwritten by a restored snapshot, which carries no taps).
 	void release( int slot ) override;
+	// A drafter with a full-attention layer (DFlash v1) takes each prefill chunk's taps into its context as they are written
+	void on_prefill_chunk( int slot, const int* tokens, int rows, int pos0 ) override;
 
 	// Requires owns( slot ). `anchor` is the last committed, not yet forwarded token at `pos`.
 	// With a non-greedy `sp` the round samples: each draft token is accepted with the target's probability of it

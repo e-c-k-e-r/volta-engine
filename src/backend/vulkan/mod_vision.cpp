@@ -3,8 +3,8 @@
 #include "mod_common.h"
 #include "engine/modules/linear.h"
 #include "engine/modules/vision.h"
-#include "engine/backend/tiers.h"
 #include <algorithm>
+#include <cmath>
 
 namespace engine::modules {
 
@@ -66,13 +66,18 @@ void Vision::qkv_bias_rope( backend::half_t* q, backend::half_t* k, backend::hal
 	vki::launch( "vision_qkv_rope", p, stream, m );
 }
 
-void Vision::qkv_norm_rope2d( backend::half_t*, backend::half_t*, backend::half_t*, const backend::half_t*, const backend::half_t*, const int*, int, int, int,
-	float, float, backend::stream_t ) {
-	ENGINE_UNSUPPORTED( "Vision::qkv_norm_rope2d" );
+void Vision::qkv_norm_rope2d( backend::half_t* q, backend::half_t* k, backend::half_t* v, const backend::half_t* qn, const backend::half_t* kn, const int* pos_xy, int m,
+	int heads, int head_dim, float theta, float eps, backend::stream_t stream ) {
+	ENGINE_ASSERT( head_dim <= 128 && head_dim % 4 == 0, "Vision::qkv_norm_rope2d: head_dim a multiple of 4, at most 128" );
+	vki::QkvRope2dParams p{ vki::dp( q ), vki::dp( k ), vki::dp( v ), vki::dp( qn ), vki::dp( kn ), vki::dp( pos_xy ), heads, head_dim, theta, eps };
+	vki::launch( "vision_qkv_rope2d", p, stream, static_cast<uint32_t>( heads ), static_cast<uint32_t>( m ) );
 }
 
-void Vision::pool_std( const float*, const backend::half_t*, const backend::half_t*, backend::half_t*, int, int, int, int, backend::stream_t ) {
-	ENGINE_UNSUPPORTED( "Vision::pool_std" );
+void Vision::pool_std( const float* x, const backend::half_t* bias, const backend::half_t* scale, backend::half_t* out, int gh, int gw, int k, int n,
+	backend::stream_t stream ) {
+	ENGINE_ASSERT( gh % k == 0 && gw % k == 0, "Vision::pool_std: the patch grid must be whole k x k cells" );
+	vki::PoolStdParams p{ vki::dp( x ), vki::dp( bias ), vki::dp( scale ), vki::dp( out ), gw, k, n, std::sqrt( static_cast<float>( n ) ), bias != nullptr && scale != nullptr };
+	vki::launch( "vision_pool_std", p, stream, static_cast<uint32_t>( ( gh / k ) * ( gw / k ) ) );
 }
 
 void Vision::merge_gather( const backend::half_t* h, backend::half_t* out, int tokens, int n, int group, backend::stream_t stream ) {

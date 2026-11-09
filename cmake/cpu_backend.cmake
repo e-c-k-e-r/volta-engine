@@ -62,6 +62,10 @@ add_executable(test_cpu_forward tests/2_parity/test_cpu_forward.cpp ${ENGINE_CPU
 set_target_properties(test_cpu_forward PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 target_link_libraries(test_cpu_forward PRIVATE pthread)
 
+add_executable(test_gemma4_vision tests/2_parity/test_gemma4_vision.cpp ${ENGINE_CPU_OBJECTS})
+set_target_properties(test_gemma4_vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+target_link_libraries(test_gemma4_vision PRIVATE pthread)
+
 add_executable(test_gguf_linear tests/2_parity/test_gguf_linear.cpp ${ENGINE_CPU_OBJECTS})
 set_target_properties(test_gguf_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 target_link_libraries(test_gguf_linear PRIVATE pthread)

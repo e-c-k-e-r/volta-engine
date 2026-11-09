@@ -58,7 +58,7 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
 	# Vision tower operators (src/kernels/slang/vision.slang)
-	foreach(entry vision_f32_to_f16 vision_pos_interp vision_patch_embed vision_norm vision_qkv_rope vision_merge_gather vision_attention vision_bias_act vision_bias_residual)
+	foreach(entry vision_f32_to_f16 vision_pos_interp vision_patch_embed vision_norm vision_qkv_rope vision_merge_gather vision_attention vision_bias_act vision_bias_residual vision_qkv_rope2d vision_pool_std)
 		set(sout ${SLANG_OUT}/${entry}.spv)
 		add_custom_command(OUTPUT ${sout}
 			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/vision.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
@@ -234,6 +234,12 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	target_link_libraries(test_vulkan_forward PRIVATE engine_backend_vulkan pthread)
 	add_dependencies(test_vulkan_forward slang_kernels)
 	set_target_properties(test_vulkan_forward PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	# Gemma 4 vision tower against the exllamav3 golden (same source as the CUDA build's)
+	add_executable(test_gemma4_vision tests/2_parity/test_gemma4_vision.cpp ${ENGINE_VK_OBJECTS})
+	target_link_libraries(test_gemma4_vision PRIVATE engine_backend_vulkan pthread)
+	add_dependencies(test_gemma4_vision slang_kernels)
+	set_target_properties(test_gemma4_vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# Op-level goldens through the module API (--check against the CUDA --dump)
 	foreach(t test_ops_linear test_ops_attention test_ops_moe test_ops_flash test_ops_vision)

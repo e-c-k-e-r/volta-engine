@@ -7,7 +7,9 @@
 #include "engine/loader/image.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
+#if ENGINE_BACKEND_CUDA
 #include "trellis_context.h"
+#endif
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -48,7 +50,9 @@ int main( int argc, char** argv ) {
 	}
 
 	backend::set_device( 0 );
+#if ENGINE_BACKEND_CUDA
 	engine::modules::trellis_context_init_all();
+#endif
 	pod::MemoryArena arena;
 	engine::core::arena_create( arena, 0, 3ULL << 30 );
 	auto stream = backend::stream_create();

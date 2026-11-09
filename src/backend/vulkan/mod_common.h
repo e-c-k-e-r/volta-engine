@@ -84,6 +84,8 @@ struct PosInterpParams { uint64_t table, out_; int gh, gw, merge, side, dim; };
 struct PatchEmbedParams { uint64_t patches, w, bias, add, out_; int m, n, k, has_add; };
 struct VNormParams { uint64_t x32, x16, w, b, out_; int n, group, kind; float eps; };
 struct QkvRopeParams { uint64_t q, k, v, bq, bk, bv, qn, kn, cs, sn; int heads, head_dim; float eps; int norm; };
+struct QkvRope2dParams { uint64_t q, k, v, qn, kn, pos_xy; int heads, head_dim; float theta, eps; };
+struct PoolStdParams { uint64_t x, bias, scale, out_; int gw, k, n; float mul; int has_std; };
 struct MergeGatherParams { uint64_t h, out_; int n, group; };
 struct VAttnParams { uint64_t q, k, v, out_; int m, heads, head_dim; float scale; };
 struct BiasActParams { uint64_t x, bias; int64_t total; int n, act, has_bias; };
