@@ -135,6 +135,8 @@ int run_concurrent( ModelCluster& mc, const std::vector<Case>& cases, const engi
 	return fail;
 }
 
+constexpr double kMinAcceptance = 0.6;
+
 int run_model( const char* type, const char* dir, const char* draft, const std::vector<Case>& cases, bool spec ) {
 	std::printf( "\n[*] %s (TP=4)\n", type );
 	ModelCluster mc;
@@ -149,6 +151,7 @@ int run_model( const char* type, const char* dir, const char* draft, const std::
 
 	int fail = 0;
 	const bool kvq = kv_quantized();
+	int accepted = 0, proposed = 0;   // over the golden cases
 	for ( size_t i = 0; i < cases.size(); ++i ) {
 		Case c = cases[i];
 		std::printf( "[*] Prompt %zu: \"%s\"\n", i + 1, c.prompt );
@@ -161,7 +164,9 @@ int run_model( const char* type, const char* dir, const char* draft, const std::
 		if ( spec ) {
 			std::printf( " | acceptance %d/%d over %d rounds", st.accepted, st.proposed, st.rounds );
 			if ( !c.probe ) {
-				// Where the draft chain dies. Step k is only sampled when 0..k-1 were all accepted, so
+				accepted += st.accepted;
+				proposed += st.proposed;
+				// Where the draft chain dies, over the prompts so far. Step k is only sampled when 0..k-1 were all accepted, so
 				// this is each position's conditional survival, not the marginal hit rate.
 				int att[8], hit[8];
 				mc.spec().step_stats( att, hit );
@@ -176,6 +181,14 @@ int run_model( const char* type, const char* dir, const char* draft, const std::
 		std::printf( "\n" );
 	}
 	if ( spec && getenv( "ENGINE_TEST_DFLASH2_PROFILE" ) ) mc.spec().profile_dump();
+	// Identity alone passes a drafter that drafts badly (verify catches every miss): the golden prompts must also keep most drafts
+	if ( spec && proposed > 0 ) {
+		const double rate = static_cast<double>( accepted ) / proposed;
+		const bool ok = rate >= kMinAcceptance;
+		std::printf( "[%c] draft acceptance over the golden prompts %d/%d (%.0f%%, floor %.0f%%)\n", ok ? '+' : '-', accepted, proposed,
+			100.0 * rate, 100.0 * kMinAcceptance );
+		if ( !ok ) ++fail;
+	}
 	if ( !spec && mc.metadata().max_slots >= static_cast<int>( cases.size() ) ) {
 		fail += run_concurrent( mc, cases, tok );
 	}
