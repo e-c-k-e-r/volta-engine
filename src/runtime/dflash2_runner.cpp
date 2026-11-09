@@ -93,7 +93,8 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 	cfg.max_ctx = meta.max_seq_len;
 	ENGINE_ASSERT( mc.model( 0 ).draft_hooks().taps_n == cfg.num_target_layer_ids, "DFlash2Runner: the target publishes a different number of taps than the drafter reads" );
 	if ( runtime::options().dflash_embed_scale ) cfg.embed_scale = mc.model( 0 ).draft_hooks().embed_scale;
-	cfg.sliding_causal = runtime::options().dflash_sliding_causal;
+	// DFlash2 blocks are bidirectional on every layer (is_causal false); only a DFlash v1 drafter takes the causal sliding layers
+	cfg.sliding_causal = cfg.version < 2 && runtime::options().dflash_sliding_causal;
 	// Full rotary over head_dim: the drafter checkpoint declares rope_type "default" with no
 	// partial_rotary_factor, and a partial-rotation default would quietly poison every prediction.
 	cfg.rope_dim_sections[0] = cfg.head_dim;
@@ -140,12 +141,10 @@ void DFlash2Runner::claim( int slot ) {
 			spec_[d].set_context( slot );
 			spec_[d].reset_context();
 		}
-		for ( int i = 0; i < 8; ++i ) att_[i] = hit_[i] = 0;
 		return;   // every slot's rows publish to its own tap ring: nothing to redirect
 	}
 	owner_ = slot;
 	for ( int d = 0; d < tp_; ++d ) spec_[d].reset_context();
-	for ( int i = 0; i < 8; ++i ) att_[i] = hit_[i] = 0;
 	// cond_ survives: per-step survival is a property of the drafter against this target, not of the
 	// sequence being decoded, so resetting it per request would re-learn it at full depth every time.
 	mc_->run_ranks( [&]( int d ) {
