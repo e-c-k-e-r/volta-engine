@@ -22,7 +22,8 @@ enum class ModelFamily {
 	UNKNOWN,
 	QWEN,
 	GLM,
-	DEEPSEEK   // DeepSeek-V4.1: no chat template; the built-in port of its encoding.py renders (deepseek_encoding.h)
+	DEEPSEEK,  // DeepSeek-V4.1: no chat template; the built-in port of its encoding.py renders (deepseek_encoding.h)
+	GEMMA      // Gemma 4: <|turn> / <turn|> turns, a <|channel>thought block, <|tool_call>call:name{...}<tool_call|> calls
 };
 
 class ChatTemplate {

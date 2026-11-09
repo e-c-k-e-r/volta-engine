@@ -25,6 +25,98 @@ size_t partial_suffix( const std::string& s, const std::string& marker ) {
 	return 0;
 }
 
+// Gemma 4's argument syntax as JSON text: <|"|>string<|"|>, {key:value,...} (keys bare or quoted), [values], numbers, true / false /
+// null; a bare word that is none of those becomes a string. Advances `p`; false on a malformed value.
+const char* const kGemmaQuote = "<|\"|>";
+
+bool gemma_value( const std::string& s, size_t& p, std::string* out );
+
+void gemma_ws( const std::string& s, size_t& p ) {
+	while ( p < s.size() && is_ws( s[p] ) ) ++p;
+}
+
+bool gemma_string( const std::string& s, size_t& p, std::string* raw ) {
+	const size_t q = std::char_traits<char>::length( kGemmaQuote );
+	if ( s.compare( p, q, kGemmaQuote ) != 0 ) return false;
+	const size_t e = s.find( kGemmaQuote, p + q );
+	if ( e == std::string::npos ) return false;
+	*raw = s.substr( p + q, e - p - q );
+	p = e + q;
+	return true;
+}
+
+bool gemma_object( const std::string& s, size_t& p, std::string* out ) {
+	// at '{'
+	++p;
+	std::string obj = "{";
+	bool first = true;
+	for ( ;; ) {
+		gemma_ws( s, p );
+		if ( p >= s.size() ) return false;
+		if ( s[p] == '}' ) { ++p; break; }
+		if ( !first ) {
+			if ( s[p] != ',' ) return false;
+			++p;
+			gemma_ws( s, p );
+		}
+		std::string key;
+		if ( !gemma_string( s, p, &key ) ) {
+			const size_t k0 = p;
+			while ( p < s.size() && s[p] != ':' && s[p] != '}' && s[p] != ',' ) ++p;
+			key = s.substr( k0, p - k0 );
+			while ( !key.empty() && is_ws( key.back() ) ) key.pop_back();
+		}
+		gemma_ws( s, p );
+		if ( p >= s.size() || s[p] != ':' ) return false;
+		++p;
+		std::string v;
+		if ( !gemma_value( s, p, &v ) ) return false;
+		obj += ( first ? "" : "," ) + nlohmann::json( key ).dump() + ":" + v;
+		first = false;
+	}
+	*out = obj + "}";
+	return true;
+}
+
+bool gemma_value( const std::string& s, size_t& p, std::string* out ) {
+	gemma_ws( s, p );
+	if ( p >= s.size() ) return false;
+	std::string raw;
+	if ( gemma_string( s, p, &raw ) ) {
+		*out = nlohmann::json( raw ).dump();
+		return true;
+	}
+	if ( s[p] == '{' ) return gemma_object( s, p, out );
+	if ( s[p] == '[' ) {
+		++p;
+		std::string arr = "[";
+		bool first = true;
+		for ( ;; ) {
+			gemma_ws( s, p );
+			if ( p >= s.size() ) return false;
+			if ( s[p] == ']' ) { ++p; break; }
+			if ( !first ) {
+				if ( s[p] != ',' ) return false;
+				++p;
+			}
+			std::string v;
+			if ( !gemma_value( s, p, &v ) ) return false;
+			arr += ( first ? "" : "," ) + v;
+			first = false;
+		}
+		*out = arr + "]";
+		return true;
+	}
+	// a scalar runs to the next separator
+	const size_t b = p;
+	while ( p < s.size() && s[p] != ',' && s[p] != '}' && s[p] != ']' ) ++p;
+	std::string word = s.substr( b, p - b );
+	while ( !word.empty() && is_ws( word.back() ) ) word.pop_back();
+	const auto j = nlohmann::json::parse( word, nullptr, false );
+	*out = ( !word.empty() && !j.is_discarded() && !j.is_string() ) ? j.dump() : nlohmann::json( word ).dump();
+	return true;
+}
+
 } // namespace
 
 ToolSchemas tool_schemas_from_json( const std::string& tools_json ) {
@@ -51,10 +143,18 @@ ToolSchemas tool_schemas_from_json( const std::string& tools_json ) {
 
 OutputParser::OutputParser( engine::loader::ModelFamily family, bool starts_in_reasoning, ToolSchemas schemas )
 	: family_( family ), schemas_( std::move( schemas ) ), state_( starts_in_reasoning ? State::Reasoning : State::Content ) {
+	think_open_ = kThinkOpen;
+	think_close_ = kThinkClose;
 	if ( family_ == engine::loader::ModelFamily::DEEPSEEK ) {
 		call_open_ = "<｜DSML｜ invoke";
 		call_close_ = "</｜DSML｜ invoke>";
 		wrappers_ = { "<｜DSML｜ calls>", "</｜DSML｜ calls>" };
+	}
+	else if ( family_ == engine::loader::ModelFamily::GEMMA ) {
+		call_open_ = "<|tool_call>";
+		call_close_ = "<tool_call|>";
+		think_open_ = "<|channel>thought";
+		think_close_ = "<channel|>";
 	}
 	else {
 		call_open_ = kCallOpen;
@@ -101,22 +201,22 @@ void OutputParser::emit_text( OutputEvent::Type type, const std::string& s, std:
 void OutputParser::process( std::vector<OutputEvent>& events, bool final ) {
 	for ( ;; ) {
 		if ( state_ == State::Reasoning ) {
-			const size_t p = buf_.find( kThinkClose );
+			const size_t p = buf_.find( think_close_ );
 			if ( p != std::string::npos ) {
 				emit_text( OutputEvent::Type::Reasoning, buf_.substr( 0, p ), events );
-				buf_.erase( 0, p + std::char_traits<char>::length( kThinkClose ) );
+				buf_.erase( 0, p + think_close_.size() );
 				end_section();
 				state_ = State::Content;
 				continue;
 			}
-			const size_t safe = final ? buf_.size() : buf_.size() - partial_suffix( buf_, kThinkClose );
+			const size_t safe = final ? buf_.size() : buf_.size() - partial_suffix( buf_, think_close_ );
 			emit_text( OutputEvent::Type::Reasoning, buf_.substr( 0, safe ), events );
 			buf_.erase( 0, safe );
 			return;
 		}
 		if ( state_ == State::Content ) {
 			const size_t pc = buf_.find( call_open_ );
-			const size_t pt = emitted_any_ || saw_tool_call_ ? std::string::npos : buf_.find( kThinkOpen );
+			const size_t pt = emitted_any_ || saw_tool_call_ ? std::string::npos : buf_.find( think_open_ );
 			// a calls-block wrapper: the text before it is content, the marker itself is dropped
 			size_t pw = std::string::npos, wlen = 0;
 			for ( const std::string& w : wrappers_ ) {
@@ -130,7 +230,7 @@ void OutputParser::process( std::vector<OutputEvent>& events, bool final ) {
 			}
 			if ( pt != std::string::npos && ( pc == std::string::npos || pt < pc ) ) {
 				emit_text( OutputEvent::Type::Content, buf_.substr( 0, pt ), events );
-				buf_.erase( 0, pt + std::char_traits<char>::length( kThinkOpen ) );
+				buf_.erase( 0, pt + think_open_.size() );
 				end_section();
 				state_ = State::Reasoning;
 				continue;
@@ -144,7 +244,7 @@ void OutputParser::process( std::vector<OutputEvent>& events, bool final ) {
 			}
 			size_t hold = partial_suffix( buf_, call_open_ );
 			for ( const std::string& w : wrappers_ ) hold = std::max( hold, partial_suffix( buf_, w ) );
-			if ( !emitted_any_ && !saw_tool_call_ ) hold = std::max( hold, partial_suffix( buf_, kThinkOpen ) );
+			if ( !emitted_any_ && !saw_tool_call_ ) hold = std::max( hold, partial_suffix( buf_, think_open_ ) );
 			const size_t safe = final ? buf_.size() : buf_.size() - hold;
 			emit_text( OutputEvent::Type::Content, buf_.substr( 0, safe ), events );
 			buf_.erase( 0, safe );
@@ -236,6 +336,22 @@ bool OutputParser::parse_tool_call( const std::string& body, ToolCallOut* out ) 
 		out->name = name;
 		out->arguments = args + "}";
 		return !name.empty();
+	}
+	if ( family_ == engine::loader::ModelFamily::GEMMA ) {
+		// body: call:name{key:value,...}
+		size_t p = body.find( "call:" );
+		if ( p == std::string::npos ) return false;
+		p += 5;
+		const size_t brace = body.find( '{', p );
+		if ( brace == std::string::npos ) return false;
+		name = body.substr( p, brace - p );
+		while ( !name.empty() && is_ws( name.back() ) ) name.pop_back();
+		size_t q = brace;
+		std::string args;
+		if ( name.empty() || !gemma_object( body, q, &args ) ) return false;
+		out->name = name;
+		out->arguments = args;
+		return true;
 	}
 	if ( family_ == engine::loader::ModelFamily::GLM ) {
 		const size_t k = body.find( "<arg_key>" );

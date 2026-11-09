@@ -5,6 +5,7 @@
 #include <cctype>
 
 #include <cstdio>
+#include <map>
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -136,7 +137,7 @@ std::vector<int> expand_image_tokens( const std::vector<int>& tokens, int pad_id
 // The image placeholder token of a model family
 const char* image_pad_name( engine::loader::ModelFamily fam ) {
 	if ( fam == engine::loader::ModelFamily::DEEPSEEK ) return "<｜deepseek_image｜>";
-	return fam == engine::loader::ModelFamily::GLM ? "<|image|>" : "<|image_pad|>";
+	return ( fam == engine::loader::ModelFamily::GLM || fam == engine::loader::ModelFamily::GEMMA ) ? "<|image|>" : "<|image_pad|>";
 }
 
 // GLM's shipped chat template only knows text (an image part renders as a "cannot process" reminder), so the image markers of
@@ -150,6 +151,36 @@ void inline_glm_image_markers( nlohmann::ordered_json& messages ) {
 			}
 		}
 	}
+}
+
+// Gemma 4's template takes tool results as tool_responses ({ name, response }) on the tool message: the results of consecutive tool
+// messages go into one, each named after the call its tool_call_id answers (text parts joined; other parts are dropped)
+void gemma_tool_messages( nlohmann::ordered_json& messages ) {
+	std::map<std::string, std::string> call_names;
+	nlohmann::ordered_json out = nlohmann::ordered_json::array();
+	for ( auto& m : messages ) {
+		const std::string role = m.value( "role", std::string() );
+		if ( role == "assistant" && m.contains( "tool_calls" ) && m["tool_calls"].is_array() ) {
+			for ( const auto& tc : m["tool_calls"] ) {
+				if ( tc.is_object() && tc.contains( "id" ) && tc["id"].is_string() && tc.contains( "function" ) && tc["function"].is_object() )
+					call_names[tc["id"].get<std::string>()] = tc["function"].value( "name", std::string() );
+			}
+		}
+		if ( role != "tool" ) {
+			out.push_back( std::move( m ) );
+			continue;
+		}
+		std::string text;
+		const auto& c = m["content"];
+		if ( c.is_string() ) text = c.get<std::string>();
+		else if ( c.is_array() ) for ( const auto& p : c ) if ( p.is_object() && p.value( "type", std::string() ) == "text" ) text += p.value( "text", std::string() );
+		const std::string id = m.value( "tool_call_id", std::string() );
+		const auto it = call_names.find( id );
+		nlohmann::ordered_json resp = { { "name", it != call_names.end() ? it->second : std::string( "unknown" ) }, { "response", text } };
+		if ( !out.empty() && out.back().value( "role", std::string() ) == "tool" && out.back().contains( "tool_responses" ) ) out.back()["tool_responses"].push_back( resp );
+		else out.push_back( { { "role", "tool" }, { "tool_responses", nlohmann::ordered_json::array( { resp } ) } } );
+	}
+	messages = std::move( out );
 }
 
 // Chat-control special tokens in message content are text, not control tokens: the escape swaps each such string in the
@@ -220,6 +251,10 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 	}
 	if ( vars["messages"].is_array() ) fold_system_messages( vars["messages"] );
 	if ( family == engine::loader::ModelFamily::GLM && !req.images.empty() && vars["messages"].is_array() ) inline_glm_image_markers( vars["messages"] );
+	if ( family == engine::loader::ModelFamily::GEMMA ) {
+		if ( vars["messages"].is_array() ) gemma_tool_messages( vars["messages"] );
+		vars["bos_token"] = gen.tokenizer().decode_token( 2 );
+	}
 	// tool_choice required / named: say so on the last user turn (not after a tool result, or the model would loop on it)
 	if ( !req.tools_json.empty() && ( req.require_tool || !req.force_tool.empty() ) && vars["messages"].is_array() && !vars["messages"].empty() &&
 		vars["messages"].back().value( "role", std::string() ) == "user" ) {
@@ -402,9 +437,9 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 			if ( !g.checkpoint_at.empty() && static_cast<int>( head.size() ) <= g.checkpoint_at.back().pos ) return;
 			g.checkpoint_at.push_back( { static_cast<int>( head.size() ), pinned } );
 		};
-		const bool ds = family == engine::loader::ModelFamily::DEEPSEEK;
-		add( prompt.find( ds ? "<｜User｜>" : glm ? "<|user|>" : "<|im_start|>user" ), true, 1024 );
-		add( prompt.rfind( ds ? "<｜Assistant｜>" : glm ? "<|assistant|>" : "<|im_start|>assistant" ), false, 512 );
+		const bool ds = family == engine::loader::ModelFamily::DEEPSEEK, gemma = family == engine::loader::ModelFamily::GEMMA;
+		add( prompt.find( ds ? "<｜User｜>" : glm ? "<|user|>" : gemma ? "<|turn>user" : "<|im_start|>user" ), true, 1024 );
+		add( prompt.rfind( ds ? "<｜Assistant｜>" : glm ? "<|assistant|>" : gemma ? "<|turn>model" : "<|im_start|>assistant" ), false, 512 );
 	}
 	g.on_text = [state]( const std::string& delta ) {
 		if ( state->conn->closed() ) return false;

@@ -144,6 +144,7 @@ bool Gemma4Pipeline::init( const Gemma4Config& config, int rank, pod::MemoryAren
 	metadata_.max_rows = R;
 	metadata_.eos_ids[0] = 1;     // <eos>
 	metadata_.eos_ids[1] = 106;   // <turn|>
+	metadata_.eos_ids[2] = 50;    // <|tool_response>: after its calls the model hands the turn to the tool
 	return true;
 }
 

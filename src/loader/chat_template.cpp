@@ -73,6 +73,8 @@ bool ChatTemplate::load( const char* template_path_or_model_dir ) {
 		model_family_ = ModelFamily::GLM;
 	} else if ( template_raw_.find( "<|im_start|>" ) != std::string::npos || template_raw_.find( "<|im_end|>" ) != std::string::npos ) {
 		model_family_ = ModelFamily::QWEN;
+	} else if ( template_raw_.find( "<|turn>" ) != std::string::npos ) {
+		model_family_ = ModelFamily::GEMMA;
 	} else {
 		if ( path.find( "glm" ) != std::string::npos || path.find( "GLM" ) != std::string::npos ) {
 			model_family_ = ModelFamily::GLM;

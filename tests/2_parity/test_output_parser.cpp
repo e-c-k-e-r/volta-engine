@@ -146,6 +146,20 @@ int main() {
 		plain.content = "No tools needed: 2 < 3.";
 		check_chunking( "deepseek: chat mode, plain text", ModelFamily::DEEPSEEK, false, "No tools needed: 2 < 3.", plain );
 	}
+	// Gemma 4: <|channel>thought reasoning, <|tool_call>call:name{...}<tool_call|> with <|"|>-quoted strings
+	{
+		Result want;
+		want.reasoning = "reason";
+		want.content = "summary";
+		want.calls = { { "lookup", "{\"query\":\"a, b: {c}\",\"limit\":2,\"opts\":{\"x\":[1,true,null],\"y\":\"z\"}}" } };
+		const std::string call1 = "<|tool_call>call:lookup{query:<|\"|>a, b: {c}<|\"|>,limit:2,opts:{x:[1,true,null],<|\"|>y<|\"|>:<|\"|>z<|\"|>}}<tool_call|>";
+		check_chunking( "gemma: think, content, call", ModelFamily::GEMMA, false, "<|channel>thought\nreason<channel|>summary" + call1, want );
+		want.calls.push_back( { "f", "{}" } );
+		check_chunking( "gemma: two calls", ModelFamily::GEMMA, false, "<|channel>thought\nreason<channel|>summary" + call1 + "<|tool_call>call:f{}<tool_call|>", want );
+		Result plain;
+		plain.content = "Plain answer.";
+		check_chunking( "gemma: no reasoning", ModelFamily::GEMMA, false, "Plain answer.", plain );
+	}
 	// Streaming safety: a character split across tokens is held back, and JSON of invalid UTF-8 is replaced instead of aborting the process
 	{
 		const std::string han = "\xE4\xBD\xA0";   // U+4F60

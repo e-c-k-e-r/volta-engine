@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Regenerates tests/data/chat_template_cases.json: conversations rendered by the reference Jinja2 (transformers'
-# environment: sandboxed, trim_blocks, lstrip_blocks, loop controls, json.dumps-based tojson) with the two checkpoint
+# environment: sandboxed, trim_blocks, lstrip_blocks, loop controls, json.dumps-based tojson) with the checkpoint
 # templates stored next to it. tests/2_parity/test_jinja.cpp renders the same inputs with the engine's interpreter.
 #   python3 -I tests/tools/gen_chat_goldens.py
 import json, os, sys
@@ -72,7 +72,7 @@ OPTS = [
 ]
 
 out = {"templates": {}}
-for name in ("qwen3_5", "glm5_next"):
+for name in ("qwen3_5", "glm5_next", "gemma4"):
     path = os.path.join(data, name + "_chat_template.jinja")
     tpl = env.from_string(open(path, encoding="utf-8").read())
     cases = []
@@ -80,6 +80,10 @@ for name in ("qwen3_5", "glm5_next"):
         for opts in OPTS:
             for gen in (True, False):
                 kw = dict(opts, messages=messages, add_generation_prompt=gen)
+                if name == "gemma4":
+                    kw["bos_token"] = "<bos>"
+                    if opts.get("enable_thinking") is False:
+                        kw["enable_thinking"] = True   # Gemma 4 thinks only when asked: cover the system-turn <|think|> instead
                 if tools:
                     kw["tools"] = tools
                 case = {"name": cname, "vars": kw}

@@ -1507,6 +1507,57 @@ private:
 			}
 			return out;
 		}
+		if ( f == "dictsort" ) {
+			// [key, value] pairs ordered by key; case-insensitive unless case_sensitive=true (Jinja2's default)
+			bool case_sensitive = false;
+			for ( const auto& kv : n.kw ) {
+				if ( kv.first == "case_sensitive" ) case_sensitive = eval( *kv.second ).truthy();
+			}
+			std::vector<std::pair<std::string, Value>> items;
+			if ( v.kind == Value::Kind::Map ) for ( const auto& kv : v.map->items ) items.emplace_back( kv.first, kv.second );
+			auto key_of = [&]( const std::string& k ) {
+				if ( case_sensitive ) return k;
+				std::string l = k;
+				for ( char& c : l ) c = static_cast<char>( std::tolower( static_cast<unsigned char>( c ) ) );
+				return l;
+			};
+			std::stable_sort( items.begin(), items.end(), [&]( const auto& a, const auto& b ) { return key_of( a.first ) < key_of( b.first ); } );
+			Value out = Value::make_list();
+			for ( const auto& kv : items ) {
+				Value pair = Value::make_list();
+				pair.push( Value::string( kv.first ) );
+				pair.push( kv.second );
+				out.push( pair );
+			}
+			return out;
+		}
+		if ( f == "map" ) {
+			// map( 'filter' ) with a one-argument string filter, or map( attribute = 'name' )
+			std::string attribute;
+			for ( const auto& kv : n.kw ) {
+				if ( kv.first == "attribute" ) attribute = to_str( eval( *kv.second ) );
+			}
+			Value out = Value::make_list();
+			if ( v.kind != Value::Kind::List ) return out;
+			const std::string fn = args.empty() ? std::string() : to_str( args[0] );
+			for ( const Value& x : *v.list ) {
+				if ( !attribute.empty() ) {
+					const Value* a = x.kind == Value::Kind::Map ? x.find( attribute ) : nullptr;
+					out.push( a ? *a : Value() );
+					continue;
+				}
+				std::string str = to_str( x );
+				if ( fn == "upper" || fn == "lower" ) {
+					for ( char& c : str ) c = static_cast<char>( fn == "upper" ? std::toupper( static_cast<unsigned char>( c ) ) : std::tolower( static_cast<unsigned char>( c ) ) );
+					out.push( Value::string( str ) );
+				}
+				else if ( fn == "trim" ) out.push( Value::string( trim_ws( str, true, true ) ) );
+				else if ( fn == "string" ) out.push( Value::string( str ) );
+				else if ( fn == "tojson" ) out.push( Value::string( to_json( x ) ) );
+				else { fail( "unsupported filter for map: '" + fn + "'" ); return Value(); }
+			}
+			return out;
+		}
 		if ( f == "capitalize" ) {
 			std::string s = to_str( v );
 			for ( size_t k = 0; k < s.size(); ++k ) s[k] = static_cast<char>( k == 0 ? std::toupper( static_cast<unsigned char>( s[k] ) ) : std::tolower( static_cast<unsigned char>( s[k] ) ) );

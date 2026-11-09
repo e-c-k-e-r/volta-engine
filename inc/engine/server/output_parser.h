@@ -29,7 +29,8 @@ ToolSchemas tool_schemas_from_json( const std::string& tools_json );
 
 // Incremental parser for the model's output: <think> reasoning, plain content, and <tool_call> blocks in the family's
 // syntax (Qwen: <function=name><parameter=key>value</parameter></function>; GLM: name<arg_key>k</arg_key><arg_value>v</arg_value>;
-// DeepSeek-V4.1: <｜DSML｜ calls> around <｜DSML｜ invoke name="n"><｜DSML｜ parameter name="k" string="true|false">v</｜DSML｜ parameter></｜DSML｜ invoke>).
+// DeepSeek-V4.1: <｜DSML｜ calls> around <｜DSML｜ invoke name="n"><｜DSML｜ parameter name="k" string="true|false">v</｜DSML｜ parameter></｜DSML｜ invoke>;
+// Gemma 4: <|channel>thought ... <channel|> reasoning and <|tool_call>call:name{key:value,...}<tool_call|> with <|"|>-quoted strings).
 // The result does not depend on how the text is split across feed() calls.
 class OutputParser {
 public:
@@ -52,6 +53,7 @@ private:
 
 	engine::loader::ModelFamily family_;
 	std::string call_open_, call_close_;   // the family's tool call markers
+	std::string think_open_, think_close_; // and reasoning markers
 	std::vector<std::string> wrappers_;    // markers around a group of calls, dropped from the text (DeepSeek's calls block)
 	ToolSchemas schemas_;
 	State state_;

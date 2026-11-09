@@ -3,7 +3,7 @@
 This section of the project handles `volta_server`: the HTTP server, the chat protocols spoken over it, and the monitor page. Everything else (generation, scheduling, models) is behind `runtime/`, and the video service (MiniMax-H3) is its own sub-folder.
 
 Start it with a launch config or flags, see [GETTING_STARTED.md](GETTING_STARTED.md) and [CONFIG.md](CONFIG.md). The model family is read from the model directory:
-* `qwen3_5`, `glm5_next`, `qwen4_exp`: the language-model path (below)
+* `qwen3_5`, `glm5_next`, `qwen4_exp`, `deepseek_v41`, `gemma4`: the language-model path (below)
 * a `model_index.json` of class `MiniMaxH3Pipeline`: the video service (see [video.md](video.md))
 * anything else is a fatal error
 
@@ -47,7 +47,7 @@ The launch file (`--config`), `--set key=value`, `ENGINE_*` environment variable
 
 ## `output_parser.cpp`
 
-An incremental parser for what the model writes: `<think>` reasoning, plain content, and tool calls in the family's syntax (Qwen: `<function=name><parameter=key>value</parameter></function>`; GLM: `name<arg_key>k</arg_key><arg_value>v</arg_value>`).
+An incremental parser for what the model writes: reasoning (`<think>`; Gemma 4: `<|channel>thought ... <channel|>`), plain content, and tool calls in the family's syntax (Qwen: `<function=name><parameter=key>value</parameter></function>`; GLM: `name<arg_key>k</arg_key><arg_value>v</arg_value>`; Gemma 4: `<|tool_call>call:name{key:value}<tool_call|>` with `<|"|>`-quoted strings). For Gemma 4 the tool results of consecutive tool messages go into one message's `tool_responses`, named after the calls they answer, as its template expects.
 * the result does not depend on how the text is split across `feed()` calls
 * argument values written as text are decoded using the parameter types from the request's tool schemas
 * `starts_in_reasoning` handles a rendered prompt that ended inside an open `<think>` block
