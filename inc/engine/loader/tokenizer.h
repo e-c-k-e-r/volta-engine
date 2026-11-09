@@ -77,6 +77,10 @@ private:
 	int bos_token_id_ = -1;
 	int max_digits_ = 1; // 1 for Qwen (\p{N}), 3 for GLM (\p{N}{1,3})
 	bool nfc_ = false;               // tokenizer.json normalizer: NFC
+	// SentencePiece-style BPE (Gemma): spaces normalized to U+2581, the text one piece of Unicode characters (no byte-level map), a character
+	// missing from the vocabulary as its UTF-8 bytes (<0xHH> tokens); decoding maps U+2581 back to a space and the byte tokens to bytes
+	bool sp_ = false;
+	int sp_byte_[256] = {};          // <0xHH> token ids
 	bool deepseek_split_ = false;   // DeepSeek-V4.1: digit groups, CJK runs, then its own word pattern (three isolated splits)
 	bool marks_are_letters_ = true; // Qwen pattern: [\p{L}\p{M}]+, GLM: \p{L}+
 };

@@ -704,6 +704,25 @@ bool Tokenizer::load( const char* model_dir ) {
 		if ( nz.value( "type", std::string() ) == "NFC" ) {
 			nfc_ = true;
 		}
+		else if ( nz.value( "type", std::string() ) == "Replace" && nz.contains( "pattern" ) && nz["pattern"].value( "String", std::string() ) == " " &&
+			nz.value( "content", std::string() ) == "\u2581" ) {
+			// SentencePiece-style (Gemma): needs byte fallback for characters outside the vocabulary
+			if ( !( tok_json.contains( "model" ) && tok_json["model"].value( "byte_fallback", false ) ) ) {
+				LOG_ERROR( "tokenizer.json: a U+2581 space normalizer without byte fallback is not implemented\n" );
+				return false;
+			}
+			sp_ = true;
+			for ( int b = 0; b < 256; ++b ) {
+				char nm[8];
+				std::snprintf( nm, sizeof( nm ), "<0x%02X>", b );
+				const auto it = vocab_.find( nm );
+				if ( it == vocab_.end() ) {
+					LOG_ERROR( "tokenizer.json: byte fallback token %s missing\n", nm );
+					return false;
+				}
+				sp_byte_[b] = it->second;
+			}
+		}
 		else if ( nz.value( "type", std::string() ) == "Sequence" && nz.contains( "normalizers" ) && nz["normalizers"].is_array() && nz["normalizers"].empty() ) {
 			// an empty sequence (DeepSeek-V4.1): no normalization
 		}
@@ -715,7 +734,15 @@ bool Tokenizer::load( const char* model_dir ) {
 	// The split regex must be one the matcher implements exactly
 	max_digits_ = 1;
 	marks_are_letters_ = true;
-	if ( has_tok_json && tok_json.contains( "pre_tokenizer" ) ) {
+	if ( has_tok_json && sp_ && tok_json.contains( "pre_tokenizer" ) ) {
+		// Split on " " after the normalizer has turned every space into U+2581: nothing to split
+		const nlohmann::json& pt = tok_json["pre_tokenizer"];
+		if ( !pt.is_null() && !( pt.value( "type", std::string() ) == "Split" && pt.contains( "pattern" ) && pt["pattern"].value( "String", std::string() ) == " " ) ) {
+			LOG_ERROR( "tokenizer.json uses a pre-tokenizer this engine does not implement with a U+2581 normalizer\n" );
+			return false;
+		}
+	}
+	else if ( has_tok_json && tok_json.contains( "pre_tokenizer" ) ) {
 		const std::string pt_dump = tok_json["pre_tokenizer"].dump();
 		// the regex appears JSON-escaped inside the dump, so compare against the escaped form
 		const std::string qwen = nlohmann::json( unicode_util::kQwenPattern ).dump();
@@ -835,6 +862,23 @@ std::vector<int> Tokenizer::encode_piece( const std::string& piece ) const {
 std::vector<int> Tokenizer::encode_text_segment( const std::string& text ) const {
 	std::vector<int> result;
 	if ( text.empty() ) return result;
+	if ( sp_ ) {
+		// one piece: the characters (spaces as U+2581) or their bytes, then the merges
+		std::vector<int> ids;
+		ids.reserve( text.size() );
+		std::string ch;
+		for ( size_t i = 0; i < text.size(); ) {
+			const unsigned char c = static_cast<unsigned char>( text[i] );
+			const size_t len = c < 0x80 ? 1 : ( c & 0xE0 ) == 0xC0 ? 2 : ( c & 0xF0 ) == 0xE0 ? 3 : ( c & 0xF8 ) == 0xF0 ? 4 : 1;
+			ch = c == ' ' ? std::string( "\xE2\x96\x81" ) : text.substr( i, len );
+			const auto it = vocab_.find( ch );
+			if ( it != vocab_.end() ) ids.push_back( it->second );
+			else for ( unsigned char b : ch ) ids.push_back( sp_byte_[b] );
+			i += len;
+		}
+		bpe_merge( ids );
+		return ids;
+	}
 
 	const std::string normalized = nfc_ ? unicode_util::nfc( text ) : text;
 	std::vector<std::string> words = deepseek_split_ ? unicode_util::deepseek_split( normalized ) : unicode_util::bpe_split( normalized, max_digits_, marks_are_letters_ );
@@ -936,6 +980,24 @@ std::string Tokenizer::decode_token( int token_id ) const {
 	}
 
 	const std::string& s = id_to_token_[token_id];
+	if ( sp_ ) {
+		// <0xHH>: the byte; otherwise U+2581 as a space
+		if ( s.size() == 6 && s[0] == '<' && s[1] == '0' && s[2] == 'x' && s[5] == '>' ) {
+			for ( int b = 0; b < 256; ++b ) {
+				if ( sp_byte_[b] == token_id ) return std::string( 1, static_cast<char>( b ) );
+			}
+		}
+		std::string out;
+		out.reserve( s.size() );
+		for ( size_t i = 0; i < s.size(); ) {
+			if ( s.compare( i, 3, "\xE2\x96\x81" ) == 0 ) {
+				out.push_back( ' ' );
+				i += 3;
+			}
+			else out.push_back( s[i++] );
+		}
+		return out;
+	}
 	std::string raw;
 	size_t i = 0;
 	while ( i < s.size() ) {
