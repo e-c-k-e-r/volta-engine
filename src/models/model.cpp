@@ -4,6 +4,8 @@
 #include "engine/models/glm5_next.h"
 #include "engine/models/qwen4_exp.h"
 #include "engine/models/deepseek_v41.h"
+#include "engine/loader/safetensors.h"
+#include <cstdio>
 
 namespace engine::models {
 
@@ -34,6 +36,24 @@ bool read_draft_taps( const DraftHooks& hooks, int slot_id, int slots, int first
 		done += n;
 	}
 	backend::stream_sync( stream );
+	return true;
+}
+
+bool alloc_expert_stacks( const engine::loader::SafeTensorsRepo& repo, pod::MemoryArena& arena, const char* layer_prefix, int first, int count, ExpertStacks& out,
+	int slices ) {
+	static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+	char nm[512];
+	for ( int p = 0; p < 3; ++p ) {
+		std::snprintf( nm, sizeof( nm ), "%s.mlp.experts.%d.%s.weight", layer_prefix, first, kinds[p] );
+		const pod::SafeTensorMeta* meta = repo.find( nm );
+		if ( meta == nullptr || meta->dtype != pod::DType::GGUF ) return false;
+		out.stride[p] = ( static_cast<size_t>( meta->size_bytes ) / slices + 255 ) / 256 * 256;
+	}
+	for ( int p = 0; p < 3; ++p ) {
+		// 64 bytes of slack past the last expert: kernels that read blocks in aligned stretches may run a few bytes over
+		out.base[p] = static_cast<uint8_t*>( engine::core::arena_alloc( arena, out.stride[p] * count + 64, 256 ) );
+		ENGINE_ASSERT( out.base[p] != nullptr, "alloc_expert_stacks: arena full" );
+	}
 	return true;
 }
 

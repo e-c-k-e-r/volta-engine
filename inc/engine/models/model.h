@@ -10,6 +10,8 @@
 #include "engine/backend/types.h"
 #include "engine/modules/steer.h"
 #include <string>
+
+namespace engine::loader { class SafeTensorsRepo; }
 #include <memory>
 
 namespace engine::models {
@@ -56,6 +58,24 @@ bool read_draft_taps( const DraftHooks& hooks, int slot_id, int slots, int first
 
 // The drafter's head scratch: lm_in, the head shard's logits and the per-rank candidate top-k buffers, wired into the hooks
 void alloc_draft_head( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int hidden, int lm_shard_cols, int tile, int shard_offset, int shard_real_cols );
+
+// A layer's GGUF experts in three stacks: the rank's gates one after another, then the ups, then the downs, each a whole number of blocks
+// apart (an expert's blocks, rounded up to 256 bytes), so a kernel reads expert e of a part at base + e * stride (the Vulkan MoE's
+// expert-indexed shaders). slot() is the arena the loader fills for one expert's part
+struct ExpertStacks {
+	uint8_t* base[3] = {};
+	size_t stride[3] = {};
+	pod::MemoryArena slot( int expert, int part ) const {
+		pod::MemoryArena a{};
+		a.base_ptr = base[part] + static_cast<size_t>( expert ) * stride[part];
+		a.total_bytes = stride[part];
+		return a;
+	}
+};
+// The stacks for experts [first, first + count) of the layer named by layer_prefix ("<...>.layers.<L>"), each expert's part cut to 1 / slices
+// of it (experts split over the ranks by width); false (and nothing allocated) when that layer's experts are not GGUF
+bool alloc_expert_stacks( const engine::loader::SafeTensorsRepo& repo, pod::MemoryArena& arena, const char* layer_prefix, int first, int count, ExpertStacks& out,
+	int slices = 1 );
 
 struct ModelMetadata {
 	std::string model_name;

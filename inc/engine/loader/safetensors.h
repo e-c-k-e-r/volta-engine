@@ -126,7 +126,8 @@ public:
 		int slice_dim,
 		int rank,
 		int tp_size,
-		backend::stream_t stream = nullptr
+		backend::stream_t stream = nullptr,
+		pod::MemoryArena* code_arena = nullptr   // GGUF: the slice's blocks go here (an expert stack's slot) instead of the arena
 	);
 
 	// Vocabulary-parallel shard: this rank's columns of a [K, N] weight, padded up by pad_cols so the

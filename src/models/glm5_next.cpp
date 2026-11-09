@@ -963,11 +963,19 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 				tier_layer = tier_layers_++;
 				lw.tier_layer = tier_layer;
 			}
+			// resident GGUF experts on one rank each: one stack per part (expert-indexed kernels address them by stride)
+			ExpertStacks stacks;
+			char layer_prefix[96];
+			std::snprintf( layer_prefix, sizeof( layer_prefix ), "model.language_model.layers.%d", L );
+			const bool stacked = tier_layer < 0 && runtime::options().expert_synth < 2 &&
+				alloc_expert_stacks( repo, *arena_, layer_prefix, start_expert, experts_per_rank, stacks, moe_tp_ ? config_.tp_size : 1 );
 			for ( int e = 0; e < experts_per_rank; ++e ) {
 				int gid = start_expert + e;
 				pod::MemoryArena ca[3];
 				if ( tier_layer >= 0 ) for ( int p = 0; p < 3; ++p ) tier_.code_arena( tier_layer, e, p, ca[p] );
-				pod::MemoryArena* cp[3] = { tier_layer >= 0 ? &ca[0] : nullptr, tier_layer >= 0 ? &ca[1] : nullptr, tier_layer >= 0 ? &ca[2] : nullptr };
+				else if ( stacked ) for ( int p = 0; p < 3; ++p ) ca[p] = stacks.slot( e, p );
+				const bool own = tier_layer >= 0 || stacked;
+				pod::MemoryArena* cp[3] = { own ? &ca[0] : nullptr, own ? &ca[1] : nullptr, own ? &ca[2] : nullptr };
 				if ( runtime::options().expert_synth >= 2 ) {
 					// Timing only: experts that are not in the checkpoint. The resident ones are generated, a cold one is a copy of a resident one
 					ENGINE_ASSERT( tier_layer >= 0 && !moe_tp_, "Glm5NextPipeline: ENGINE_DEBUG_EXPERT_SYNTH=2 needs expert_cache < 1 on one rank" );
@@ -997,13 +1005,13 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 					}
 				}
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, gid );
-				mw.gate[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, config_.tp_size, stream ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[0] );
+				mw.gate[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, config_.tp_size, stream, cp[0] ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[0] );
 
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, gid );
-				mw.up[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, config_.tp_size, stream ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[1] );
+				mw.up[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, config_.tp_size, stream, cp[1] ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[1] );
 
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, gid );
-				mw.down[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 0, rank_, config_.tp_size, stream ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[2] );
+				mw.down[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 0, rank_, config_.tp_size, stream, cp[2] ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[2] );
 			}
 			}
 			engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );

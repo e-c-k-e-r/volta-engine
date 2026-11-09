@@ -126,11 +126,10 @@ int main( int argc, char** argv ) {
 	g_gguf_full.num_local_experts = E;
 	g_gguf_shard.num_local_experts = 8;
 	g_gguf_full.top_k = g_gguf_shard.top_k = TOPK;
-	for ( int e = 0; e < E; ++e ) {
-		g_gguf_full.gate[e] = make_gguf_expert( rng, H, I, modules::GgmlType::Q4_K, 144, 0, 2 );
-		g_gguf_full.up[e] = make_gguf_expert( rng, H, I, modules::GgmlType::IQ3_S, 110, 0, -1 );
-		g_gguf_full.down[e] = make_gguf_expert( rng, I, H, modules::GgmlType::Q6_K, 210, 208, -1 );
-	}
+	// part by part, so each part's experts are one stack (Vulkan runs up to 8 rows on its expert-indexed shaders, more on the host path)
+	for ( int e = 0; e < E; ++e ) g_gguf_full.gate[e] = make_gguf_expert( rng, H, I, modules::GgmlType::Q4_K, 144, 0, 2 );
+	for ( int e = 0; e < E; ++e ) g_gguf_full.up[e] = make_gguf_expert( rng, H, I, modules::GgmlType::IQ3_S, 110, 0, -1 );
+	for ( int e = 0; e < E; ++e ) g_gguf_full.down[e] = make_gguf_expert( rng, I, H, modules::GgmlType::Q6_K, 210, 208, -1 );
 	for ( int e = 0; e < 8; ++e ) {
 		g_gguf_shard.gate[e] = g_gguf_full.gate[4 + e];
 		g_gguf_shard.up[e] = g_gguf_full.up[4 + e];

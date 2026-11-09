@@ -636,11 +636,16 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 			tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_ ) );
 			tier_layer = tier_layers_++;
 		}
+		// resident GGUF experts: one stack per part (expert-indexed kernels address them by stride)
+		ExpertStacks stacks;
+		const bool stacked = tier_layer < 0 && gguf_experts && runtime::options().expert_synth < 2 && alloc_expert_stacks( repo, *arena_, pre, rank_ * per_rank, per_rank, stacks );
 		for ( int e = 0; e < per_rank; ++e ) {
 			const int gid = rank_ * per_rank + e;
 			pod::MemoryArena ca[3];
 			if ( tier_layer >= 0 ) for ( int p = 0; p < 3; ++p ) tier_.code_arena( tier_layer, e, p, ca[p] );
-			pod::MemoryArena* cp[3] = { tier_layer >= 0 ? &ca[0] : nullptr, tier_layer >= 0 ? &ca[1] : nullptr, tier_layer >= 0 ? &ca[2] : nullptr };
+			else if ( stacked ) for ( int p = 0; p < 3; ++p ) ca[p] = stacks.slot( e, p );
+			const bool own = tier_layer >= 0 || stacked;
+			pod::MemoryArena* cp[3] = { own ? &ca[0] : nullptr, own ? &ca[1] : nullptr, own ? &ca[2] : nullptr };
 			if ( runtime::options().expert_synth >= 2 && !nv_experts && tier_layer >= 0 ) {
 				// Timing only: experts that are not in the checkpoint. The resident ones are generated, a cold one is a copy of a resident one
 				if ( e >= tier_.resident ) {

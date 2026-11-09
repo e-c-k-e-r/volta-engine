@@ -889,3 +889,16 @@ void gguf_quantize_q8_1x4(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, 
 	p.xq[o + inner] = f32tof16(d) | (f32tof16(float(sum) * d) << 16);
 }
 
+// The routes' expert ids as this rank's local experts (id - start), -1 for an expert outside [start, end) (the expert-indexed shaders write
+// zeros for it)
+struct MoeLocalIdsParams { int* ids; int* out_; int n; int start; int end; };
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void moe_local_ids(uint3 gid : SV_DispatchThreadID, uniform MoeLocalIdsParams p) {
+	let i = int(gid.x);
+	if (i >= p.n) return;
+	let e = p.ids[i];
+	p.out_[i] = (e >= p.start && e < p.end) ? e - p.start : -1;
+}
+

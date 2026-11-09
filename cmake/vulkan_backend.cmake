@@ -73,7 +73,7 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 		COMMENT "slangc nvfp4_gemm -> spirv")
 	list(APPEND VK_FLASH_SPV ${SLANG_OUT}/nvfp4_gemm.spv)
 	# GGUF block weights (src/kernels/slang/gguf.slang)
-	foreach(entry gguf_gemv_sg gguf_quantize_q8 gguf_gemm_tile gguf_dequant gguf_permute_rows gguf_quantize_q8_1x4)
+	foreach(entry gguf_gemv_sg gguf_quantize_q8 gguf_gemm_tile gguf_dequant gguf_permute_rows gguf_quantize_q8_1x4 moe_local_ids)
 		set(sout ${SLANG_OUT}/${entry}.spv)
 		add_custom_command(OUTPUT ${sout}
 			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/gguf.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
@@ -119,6 +119,14 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 					-DD_TYPE=float16_t -DFLOAT_TYPE=float -DFLOAT_TYPEV2=vec2 -DUSE_SUBGROUP_ADD_NO_SHMEM=1 ${src} -o ${sout}
 				DEPENDS ${GGML_VK_DEPS}
 				COMMENT "glslc ggml mul_mat_vec ${tname} -> spirv")
+			list(APPEND VK_FLASH_SPV ${sout})
+			# and its expert-indexed form (MUL_MAT_ID: the routed experts of one token, the expert ids from a buffer)
+			set(sout ${SLANG_OUT}/ggml_mmvid_${id}.spv)
+			add_custom_command(OUTPUT ${sout}
+				COMMAND ${GLSLC} -fshader-stage=compute --target-env=vulkan1.2 -O -DMUL_MAT_ID=1 -DDATA_A_${TU}=1 -DB_TYPE=float16_t -DB_TYPEV2=f16vec2
+					-DB_TYPEV4=f16vec4 -DD_TYPE=float16_t -DFLOAT_TYPE=float -DFLOAT_TYPEV2=vec2 -DUSE_SUBGROUP_ADD_NO_SHMEM=1 ${src} -o ${sout}
+				DEPENDS ${GGML_VK_DEPS}
+				COMMENT "glslc ggml mul_mat_vec_id ${tname} -> spirv")
 			list(APPEND VK_FLASH_SPV ${sout})
 		endforeach()
 		# and its int8 matmul (q8_1 activations) for the types that have one, as llama.cpp's FP16 build of it, FP16 output

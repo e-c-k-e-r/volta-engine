@@ -9,6 +9,8 @@
 #include "engine/backend/runtime.h"
 #include "engine/core/batch.h"
 #include "engine/modules/gguf.h"
+#include "engine/modules/moe.h"
+#include "engine/modules/swiglu.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -33,6 +35,9 @@ struct GgufQ81Params { uint64_t xv, xq; int m, k, heads, dim; };
 // llama.cpp's matmul push constants (mul_mmq.comp, without MUL_MAT_ID)
 struct MmqParams { uint32_t M, N, K, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, num_batches, k_split, ne02,
 	ne12, broadcast2, broadcast3; };
+// llama.cpp's mat-vec push constants with MUL_MAT_ID
+struct MmvIdParams { uint32_t ncols, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, fusion_flags, nei0, ne11, expert_i1, nbi1; };
+struct MoeLocalIdsParams { uint64_t ids, out_; int n, start, end; };
 struct GgufDequantParams { uint64_t w, tables, out_; int64_t elems; int type; };
 
 const void* tables() {
@@ -188,6 +193,49 @@ backend::vk::Pipeline* mm_pipeline( GgmlType type, bool large ) {
 	return p;
 }
 
+// The expert-indexed mat-vec (one activation row per expert slot), cached per type like mmv_pipeline
+backend::vk::Pipeline* mmvid_pipeline( GgmlType type ) {
+	static std::mutex mu;
+	static std::map<int, backend::vk::Pipeline*> cache[64];
+	std::lock_guard<std::mutex> lk( mu );
+	auto& c = cache[backend::get_device()];
+	auto it = c.find( static_cast<int>( type ) );
+	if ( it != c.end() ) return it->second;
+	backend::vk::Pipeline* p = nullptr;
+	if ( backend::vk::bound_pipelines() ) {
+		const char* dir = std::getenv( "ENGINE_SPV_DIR" );
+		const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + "/ggml_mmvid_" + std::to_string( static_cast<int>( type ) ) + ".spv";
+		const uint32_t spec[3] = { 32u, static_cast<uint32_t>( mmv_rows( type ) ), 1u };
+		p = backend::vk::pipeline_create_bound( path.c_str(), sizeof( MmvIdParams ), 6, spec, 3 );   // A, B, D, two fusion inputs, the ids
+	}
+	c[static_cast<int>( type )] = p;
+	return p;
+}
+int block_elems( GgmlType t ) {
+	switch ( t ) {
+		case GgmlType::Q4_0: case GgmlType::Q4_1: case GgmlType::Q5_0: case GgmlType::Q5_1: case GgmlType::Q8_0: case GgmlType::IQ4_NL: return 32;
+		default: return 256;
+	}
+}
+// A part of a layer's experts as one buffer: expert e at base + e * stride, the stride in values (a whole number of blocks); false when the
+// experts are not laid out so (models::alloc_expert_stacks does)
+bool expert_stack( const pod::LinearWeight* lw, int count, const void*& base, uint32_t& stride_values ) {
+	const GgmlType t = static_cast<GgmlType>( lw[0].gguf_type );
+	const int64_t bb = row_bytes( t, block_elems( t ) );
+	if ( bb <= 0 ) return false;
+	const auto* b0 = static_cast<const uint8_t*>( lw[0].w0.data );
+	const int64_t stride = count > 1 ? static_cast<const uint8_t*>( lw[1].w0.data ) - b0 : row_bytes( t, lw[0].gguf_k ) * lw[0].gguf_n;
+	if ( stride <= 0 || stride % bb != 0 || reinterpret_cast<uintptr_t>( b0 ) % 16 != 0 ) return false;
+	for ( int e = 0; e < count; ++e ) {
+		if ( static_cast<const uint8_t*>( lw[e].w0.data ) != b0 + e * stride || lw[e].gguf_type != lw[0].gguf_type ) return false;
+	}
+	const int64_t values = stride / bb * block_elems( t );
+	if ( values > 0xffffffffll ) return false;
+	base = b0;
+	stride_values = static_cast<uint32_t>( values );
+	return true;
+}
+
 // The permuted activation rows for the tiled out_proj, sized at prepare like the q8 rows
 constexpr size_t kPermBytes = static_cast<size_t>( kMmvMaxRows ) * kDotMaxK * sizeof( backend::half_t );
 void* perm_scratch( backend::stream_t stream ) { return vki::scratch( 17, kPermBytes, stream ); }
@@ -290,6 +338,56 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	}
 	else if ( m > 8 ) vki::launch( "gguf_gemm_tile", p, stream, static_cast<uint32_t>( ( n + 63 ) / 64 ), static_cast<uint32_t>( ( m + 63 ) / 64 ) );
 	else vki::launch( "gguf_gemv_sg", p, stream, static_cast<uint32_t>( ( n + 3 ) / 4 ), static_cast<uint32_t>( ( m + 7 ) / 8 ) );
+}
+
+// Vulkan MoE::forward for GGUF experts on up to 8 rows without leaving the device: the routes' local expert ids, then per row llama.cpp's
+// expert-indexed mat-vec over the row's top-k experts (gate and up from the row, down from each slot's activation), SwiGLU, and the weighted
+// sum of the slots in route order (moe_combine_routes). False (nothing run) when the shaders are missing, there are more rows or the experts
+// are not stacked; the caller then routes on the host. The row count of the scratch is fixed at the first call (graph capture)
+bool moe_gguf_device( const pod::TensorView& x, const pod::MoELayerWeights& w, const int* d_idx, const backend::half_t* d_w, pod::TensorView& out, int start, int end,
+	float act_limit, backend::stream_t stream ) {
+	constexpr int kMaxRows = 8;
+	const int m = ( out.ndim >= 2 && out.shape[0] > 0 ) ? out.shape[0] : 1;
+	if ( m > kMaxRows || w.type != pod::QuantType::GGUF ) return false;
+	const int E = w.num_local_experts, topk = w.top_k, H = out.shape[out.ndim - 1], I = w.up[0].gguf_n;
+	const pod::LinearWeight* parts[3] = { w.gate, w.up, w.down };
+	const void* base[3];
+	uint32_t stride[3];
+	backend::vk::Pipeline* pipe[3];
+	for ( int p = 0; p < 3; ++p ) {
+		pipe[p] = mmvid_pipeline( static_cast<GgmlType>( parts[p][0].gguf_type ) );
+		if ( pipe[p] == nullptr || !expert_stack( parts[p], E, base[p], stride[p] ) ) return false;
+	}
+	ENGINE_ASSERT( w.gate[0].gguf_k == H && w.down[0].gguf_k == I && w.down[0].gguf_n == H, "MoE (Vulkan): GGUF expert shapes" );
+	const size_t slots = static_cast<size_t>( kMaxRows ) * topk;
+	auto* ids = static_cast<int*>( vki::scratch( 24, slots * sizeof( int ), stream ) );
+	auto* g = static_cast<backend::half_t*>( vki::scratch( 20, slots * I * sizeof( backend::half_t ), stream ) );
+	auto* u = static_cast<backend::half_t*>( vki::scratch( 21, slots * I * sizeof( backend::half_t ), stream ) );
+	auto* a = static_cast<backend::half_t*>( vki::scratch( 22, slots * I * sizeof( backend::half_t ), stream ) );
+	auto* d = static_cast<backend::half_t*>( vki::scratch( 23, slots * H * sizeof( backend::half_t ), stream ) );
+	MoeLocalIdsParams ip{ vki::dp( d_idx ), vki::dp( ids ), m * topk, start, end };
+	vki::launch( "moe_local_ids", ip, stream, static_cast<uint32_t>( ( m * topk + 255 ) / 256 ) );
+	const uint32_t uH = static_cast<uint32_t>( H ), uI = static_cast<uint32_t>( I ), uk = static_cast<uint32_t>( topk );
+	auto proj = [&]( int p, const void* src, uint32_t k, uint32_t n, uint32_t ne11, void* dst ) {
+		const GgmlType t = static_cast<GgmlType>( parts[p][0].gguf_type );
+		const uint32_t groups = static_cast<uint32_t>( ( n + mmv_rows( t ) - 1 ) / mmv_rows( t ) );
+		const uint32_t gx = std::min<uint32_t>( groups, 65535u ), gz = ( groups + gx - 1 ) / gx;
+		for ( int r = 0; r < m; ++r ) {
+			MmvIdParams mp{ k, k, k, n, stride[p], k * ne11, n * uk, 0u, uk, ne11, static_cast<uint32_t>( r ), uk };
+			const void* bufs[6] = { base[p], src, dst, dst, dst, ids };
+			backend::vk::dispatch_bound( stream, pipe[p], &mp, bufs, gx, uk, gz );
+		}
+	};
+	proj( 0, x.data, uH, uI, 1u, g );
+	proj( 1, x.data, uH, uI, 1u, u );
+	pod::TensorView tg = pod::make_tensor_2d( g, pod::DType::FP16, m * topk, I );
+	pod::TensorView tu = pod::make_tensor_2d( u, pod::DType::FP16, m * topk, I );
+	pod::TensorView ta = pod::make_tensor_2d( a, pod::DType::FP16, m * topk, I );
+	SwiGLU::forward( tg, tu, ta, stream, act_limit );
+	proj( 2, a, uI, uH, uk, d );
+	vki::MoeCombineParams cp{ vki::dp( d ), vki::dp( d_w ), vki::dp( d_idx ), vki::dp( out.data ), H, topk, start, end };
+	vki::launch( "moe_combine_routes", cp, stream, static_cast<uint32_t>( ( H + 255 ) / 256 ), static_cast<uint32_t>( m ) );
+	return true;
 }
 
 } // namespace engine::modules

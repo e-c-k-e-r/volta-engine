@@ -23,6 +23,9 @@ __attribute__(( weak )) Options& options();
 
 namespace engine::modules {
 
+bool moe_gguf_device( const pod::TensorView& x, const pod::MoELayerWeights& w, const int* d_idx, const backend::half_t* d_w, pod::TensorView& out, int start, int end,
+	float act_limit, backend::stream_t stream );   // mod_gguf.cpp
+
 namespace {
 namespace vki = ::engine::backend::impl;
 
@@ -178,6 +181,8 @@ void MoE::forward( const pod::TensorView& x, const pod::MoELayerWeights& weights
 	const pod::MoEScratch&, float act_limit, backend::stream_t stream ) {
 	ENGINE_ASSERT( weights.type == pod::QuantType::TRELLIS || weights.type == pod::QuantType::FP16 || weights.type == pod::QuantType::GGUF,
 		"MoE::forward (Vulkan): TRELLIS, FP16 or GGUF experts only" );
+	// GGUF experts on few rows: on the device (no route read-back), when the experts are stacked
+	if ( moe_gguf_device( x, weights, d_topk_indices, d_topk_weights, out, start_expert, end_expert, act_limit, stream ) ) return;
 	const int rows = ( out.ndim >= 2 && out.shape[0] > 0 ) ? out.shape[0] : 1;
 	const int hidden = out.shape[out.ndim - 1];
 	const int E = weights.num_local_experts;

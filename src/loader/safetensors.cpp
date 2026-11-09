@@ -1198,7 +1198,8 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 	int slice_dim,
 	int rank,
 	int tp_size,
-	backend::stream_t stream
+	backend::stream_t stream,
+	pod::MemoryArena* code_arena
 ) {
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
@@ -1211,7 +1212,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 		ENGINE_ASSERT( meta != nullptr && meta->ndim == 2, "load_linear_slice: neither a trellis group nor a 2-D weight for this name" );
 		if ( meta->dtype == pod::DType::GGUF ) {
 			const int n = meta->shape[0], k = meta->shape[1];
-			if ( slice_dim == 1 ) return gguf_linear( shard, meta, arena, { { rank * ( n / tp_size ), n / tp_size } }, { { 0, k } }, 0, stream );
+			if ( slice_dim == 1 ) return gguf_linear( shard, meta, arena, { { rank * ( n / tp_size ), n / tp_size } }, { { 0, k } }, 0, stream, code_arena );
 			std::vector<std::pair<int, int>> cols;
 			if ( meta->gguf_flags & engine::loader::GGUF_COLS_V_TILED ) {
 				// tiled input columns [v][k_head][head_dim]: this rank's key heads are one run per v
@@ -1220,7 +1221,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 				for ( int v = 0; v < h.v_heads / h.k_heads; ++v ) cols.push_back( { v * h.k_heads * h.head_v_dim + rank * run, run } );
 			}
 			else cols.push_back( { rank * ( k / tp_size ), k / tp_size } );
-			return gguf_linear( shard, meta, arena, { { 0, n } }, cols, 0, stream );
+			return gguf_linear( shard, meta, arena, { { 0, n } }, cols, 0, stream, code_arena );
 		}
 		pod::TensorView w = load_slice( name_buf, arena, slice_dim == 1 ? 0 : 1, rank, tp_size, stream, pod::DType::FP16 );
 		return pod::LinearWeight::make_fp16( pod::make_tensor_2d( w.data, pod::DType::FP16, w.shape[1], w.shape[0] ) );
