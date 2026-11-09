@@ -49,6 +49,7 @@ struct Ctx {
 	VkPhysicalDeviceMemoryProperties mem{};
 	VkPhysicalDeviceProperties props{};
 	PFN_vkCmdPushDescriptorSetKHR push_descriptor = nullptr;
+	std::mutex queue_mu;        // vkQueueSubmit / vkQueueWaitIdle need external synchronization: a device's queue is shared by the threads that use it
 	bool host_import = false;   // VK_EXT_external_memory_host: a host allocation imported as device-addressable memory
 	bool sem_fd = false;        // VK_KHR_external_semaphore_fd: timeline semaphores shared with the other devices
 	size_t host_import_align = 0;   // VK_KHR_push_descriptor: storage buffers bound inside the command buffer
@@ -341,6 +342,7 @@ void submit( vk_stream* s, VkCommandBuffer cb ) {
 	si.pCommandBuffers = cb ? &cb : nullptr;
 	si.signalSemaphoreCount = static_cast<uint32_t>( signals.size() );
 	si.pSignalSemaphores = signals.data();
+	std::lock_guard<std::mutex> lk( cur().queue_mu );
 	ENGINE_CHECK( vkQueueSubmit( cur().queue, 1, &si, VK_NULL_HANDLE ) );
 }
 
@@ -469,7 +471,7 @@ void device_sync() {
 	ctx();
 	if ( !cur().default_stream ) cur().default_stream = make_stream();
 	sync( cur().default_stream );
-	vkQueueWaitIdle( cur().queue );
+	{ std::lock_guard<std::mutex> qlk( cur().queue_mu ); vkQueueWaitIdle( cur().queue ); }
 }
 
 bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, stream_t st ) {
@@ -624,7 +626,7 @@ void device_free( void* p ) {
 	if ( !p ) return;
 	auto it = cur().allocs.find( reinterpret_cast<uint64_t>( p ) );
 	if ( it == cur().allocs.end() ) return;
-	vkQueueWaitIdle( cur().queue ); // cudaFree synchronizes implicitly
+	{ std::lock_guard<std::mutex> qlk( cur().queue_mu ); vkQueueWaitIdle( cur().queue ); } // cudaFree synchronizes implicitly
 	vkDestroyBuffer( cur().device, it->second.buffer, nullptr );
 	vkFreeMemory( cur().device, it->second.memory, nullptr );
 	cur().allocated -= it->second.size;
@@ -669,7 +671,7 @@ void graph_launch( graph_exec_t e, stream_t st ) {
 }
 void graph_destroy( graph_t gr ) {
 	if ( !gr ) return;
-	vkQueueWaitIdle( cur().queue );
+	{ std::lock_guard<std::mutex> qlk( cur().queue_mu ); vkQueueWaitIdle( cur().queue ); }
 	if ( gr->cb ) vkFreeCommandBuffers( cur().device, cur().pool, 1, &gr->cb );
 	delete gr;
 }
@@ -756,7 +758,7 @@ Pipeline* pipeline_create_bound( const char* spv_path, uint32_t push_bytes, uint
 
 void pipeline_destroy( Pipeline* p ) {
 	if ( !p ) return;
-	vkQueueWaitIdle( cur().queue );
+	{ std::lock_guard<std::mutex> qlk( cur().queue_mu ); vkQueueWaitIdle( cur().queue ); }
 	if ( p->pipeline ) vkDestroyPipeline( cur().device, p->pipeline, nullptr );
 	if ( p->layout ) vkDestroyPipelineLayout( cur().device, p->layout, nullptr );
 	if ( p->module ) vkDestroyShaderModule( cur().device, p->module, nullptr );

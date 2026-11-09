@@ -57,11 +57,11 @@ inline size_t dtype_bytes( DType dtype ) {
 }
 
 struct TensorView {
-	void*  data;            // Raw GPU device pointer (cudaMalloc)
-	DType  dtype;           // Data type identifier
-	int    ndim;            // Dimensions count (1 to 4)
-	int    shape[4];        // Shape array
-	size_t strides[4];      // Strides in elements
+	void*  data = nullptr;  // Raw GPU device pointer (cudaMalloc); null until something allocates it (a view nobody fills reads as empty)
+	DType  dtype{};         // Data type identifier
+	int    ndim = 0;        // Dimensions count (1 to 4)
+	int    shape[4] = {};   // Shape array
+	size_t strides[4] = {}; // Strides in elements
 
 	template<typename T>
 	T* ptr() {
