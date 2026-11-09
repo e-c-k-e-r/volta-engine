@@ -44,7 +44,7 @@ from the hardware of the time (4x V100, power caps as noted); relative results a
   pinned at 128 registers and spills.
 * **L2 prefetch of the B tile ahead of the pipeline:** +8% / -1% / -3% at 512 / 1024 / 2048 rows.
 * **Volta-order trellis decode for the MoE prefill kernel by random-access decode:** the shuffle-removed ablation bounds it at 9% of the
-  kernel, under 2% end to end. The Volta tile order was built instead at the quantizer (`ENGINE_EXL3_VOLTA_LAYOUT`).
+  kernel, under 2% end to end. The Volta tile order was built instead at the quantizer (`tile_layout: volta` checkpoints).
 * **Transcoding a low-bit EXL3 checkpoint to the Volta order.** The GLM 2.60 bpw re-encode lost the original's Hessian-guided rounding:
   perplexity 4.56 -> 33.3. Volta-order checkpoints are quantized from the original weights (`tests/tools/exl3_quantize.py`).
 * **Per-expert slices over all ranks for DeepSeek decode (`expert_shard`):** rank waiting fell from 40% to 6%, but the fused MoE kernels

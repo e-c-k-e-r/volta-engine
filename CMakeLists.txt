@@ -50,13 +50,6 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	if(ENGINE_EXL3_FORCE_VOLTA_MMA)
 		set(ENGINE_EXL3_DEFS "${ENGINE_EXL3_DEFS} -DEXL3_VOLTA=1")
 	endif()
-	# Proof of concept: read the weight tiles in the Volta order of tests/tools/exl3_volta_layout.py (no fragment shuffles in the GEMM). Such a build
-	# only runs checkpoints written in that order, and only the dense GEMM paths (gemm kernels, reconstruct) know it
-	option(ENGINE_EXL3_VOLTA_LAYOUT "EXL3 GEMM: weight tiles in the Volta order (proof of concept)" OFF)
-	if(ENGINE_EXL3_VOLTA_LAYOUT)
-		set(ENGINE_EXL3_DEFS "${ENGINE_EXL3_DEFS} -DEXL3_VOLTA_LAYOUT=1")
-		add_compile_definitions(ENGINE_BUILD_EXL3_VOLTA_LAYOUT=1)    # the loader refuses a checkpoint written in the other tile order
-	endif()
 	# Hardware overrides (0: query the device at startup). ENGINE_SM_COUNT caps the SMs the persistent / cooperative kernels spread over;
 	# ENGINE_MAX_SMEM is the opt-in shared memory per block the big kernels request (default 98304, which V100, SM_86 and SM_89 all allow)
 	set(ENGINE_SM_COUNT 0 CACHE STRING "SMs to size persistent / cooperative grids to (0: the device's own count)")
@@ -283,6 +276,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	set(EXL3_SHAPE1 0)
 	set(EXL3_SHAPE4_HIGH_K 0)
 	set(EXL3_VOLTA_ONLY TRUE)
+	set(EXL3_HAS_SM70 FALSE)
 	foreach(arch ${EXL3_ARCHS})
 		string(REGEX REPLACE "-(real|virtual)$" "" arch_num "${arch}")
 		if(NOT arch_num MATCHES "^[0-9]+$" OR arch_num GREATER_EQUAL 90)
@@ -293,6 +287,8 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 		endif()
 		if(NOT arch_num STREQUAL "70")
 			set(EXL3_VOLTA_ONLY FALSE)
+		else()
+			set(EXL3_HAS_SM70 TRUE)
 		endif()
 	endforeach()
 	if(ENGINE_EXL3_PRUNE STREQUAL "ON" OR (ENGINE_EXL3_PRUNE STREQUAL "AUTO" AND EXL3_VOLTA_ONLY))
@@ -308,6 +304,7 @@ set(TRELLIS_SOURCES
 	src/kernels/cuda/trellis/exl3_instances.cu
 	src/kernels/cuda/trellis/exl3_kernel_map.cu
 	src/kernels/cuda/trellis/exl3_moe_coop.cu
+	src/kernels/cuda/trellis/exl3_moe_launch.cu
 	src/kernels/cuda/trellis/hadamard.cu
 	src/kernels/cuda/trellis/reconstruct.cu
 	src/kernels/cuda/trellis/trellis_context.cu
@@ -316,6 +313,28 @@ if(ENGINE_BACKEND STREQUAL "ROCM")
 	list(APPEND TRELLIS_SOURCES src/kernels/rocm/trellis/exl3_gemv.cu src/kernels/rocm/trellis/exl3_gemm.cu src/kernels/rocm/trellis/exl3_moe.cu)
 endif()
 list(APPEND TRELLIS_SOURCES ${EXL3_UNIT_SOURCES})
+# SM_70 CUDA builds read EXL3 tiles in both orders (a checkpoint's quantization_config.json "tile_layout": "volta" picks the Volta one, per weight):
+# every unit whose kernels decode tiles is compiled a second time with EXL3_VOLTA_LAYOUT=1 inside namespace exl3_vl (trellis/exl3_vl.cuh)
+if(ENGINE_BACKEND STREQUAL "CUDA" AND EXL3_HAS_SM70)
+	add_compile_definitions(ENGINE_EXL3_VL=1)
+	set(EXL3_VL_INPUTS
+		${PROJECT_SOURCE_DIR}/src/kernels/cuda/trellis/exl3_gemm.cu
+		${PROJECT_SOURCE_DIR}/src/kernels/cuda/trellis/exl3_gemv.cu
+		${PROJECT_SOURCE_DIR}/src/kernels/cuda/trellis/exl3_gemv_int8.cu
+		${PROJECT_SOURCE_DIR}/src/kernels/cuda/trellis/exl3_instances.cu
+		${PROJECT_SOURCE_DIR}/src/kernels/cuda/trellis/exl3_kernel_map.cu
+		${PROJECT_SOURCE_DIR}/src/kernels/cuda/trellis/exl3_moe_coop.cu
+		${PROJECT_SOURCE_DIR}/src/kernels/cuda/trellis/exl3_moe_launch.cu
+		${PROJECT_SOURCE_DIR}/src/kernels/cuda/trellis/reconstruct.cu
+		${EXL3_UNIT_SOURCES}
+	)
+	foreach(EXL3_VL_SRC ${EXL3_VL_INPUTS})
+		get_filename_component(vl_name "${EXL3_VL_SRC}" NAME_WE)
+		set(vl_unit "${PROJECT_BINARY_DIR}/exl3_vl/${vl_name}_vl.cu")
+		configure_file(src/kernels/cuda/trellis/exl3_vl_unit.cu.in "${vl_unit}" @ONLY)
+		list(APPEND TRELLIS_SOURCES "${vl_unit}")
+	endforeach()
+endif()
 
 if(ENGINE_BACKEND STREQUAL "ROCM")
 	set(ENGINE_ROCM_HIP_SOURCES ${ENGINE_CORE_SOURCES} ${TRELLIS_SOURCES})
@@ -475,6 +494,10 @@ target_link_libraries(test_image PRIVATE engine_kernels)
 target_compile_definitions(test_image PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
 set_target_properties(test_image PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(test_trellis_order tests/2_parity/test_trellis_order.cpp)
+target_link_libraries(test_trellis_order PRIVATE engine_kernels)
+set_target_properties(test_trellis_order PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(test_trellis_layout tests/2_parity/test_trellis_layout.cpp)
 target_link_libraries(test_trellis_layout PRIVATE engine_kernels)
 set_target_properties(test_trellis_layout PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
@@ -569,6 +592,10 @@ set_target_properties(test_norm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_B
 add_executable(bench_all_reduce tests/3_bench/bench_all_reduce.cpp)
 target_link_libraries(bench_all_reduce PRIVATE engine_kernels)
 set_target_properties(bench_all_reduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+add_executable(bench_trellis_order tests/3_bench/bench_trellis_order.cpp)
+target_link_libraries(bench_trellis_order PRIVATE engine_kernels)
+set_target_properties(bench_trellis_order PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(bench_trellis tests/3_bench/bench_trellis.cpp)
 target_link_libraries(bench_trellis PRIVATE engine_kernels)

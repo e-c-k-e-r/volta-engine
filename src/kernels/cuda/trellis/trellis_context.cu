@@ -3,6 +3,7 @@
 #include "exl3_gemm.cuh"
 #include "exl3_gemv_int8.cuh"
 #include "exl3_kernel_map.cuh"
+#include "exl3_vl.cuh"
 #include <mutex>
 #include <cstdio>
 
@@ -198,6 +199,10 @@ void trellis_context_init_all() {
 		trellis_get_int8_ws( d );
 		exl3_gemm_init_all_attrs( d );
 		exl3_gemv_int8_init( d );
+#if ENGINE_EXL3_VL
+		exl3_vl::exl3_gemm_init_all_attrs( d );
+		exl3_vl::exl3_gemv_int8_init( d );
+#endif
 	}
 }
 
@@ -206,6 +211,12 @@ void trellis_reset_launch_caches() {
 	exl3_gemv_reset_caches();
 	exl3_gemv_int8_reset_caches();
 	::ext::exl3_moe_reset_caches();
+#if ENGINE_EXL3_VL
+	exl3_vl::exl3_gemm_reset_caches();
+	exl3_vl::exl3_gemv_reset_caches();
+	exl3_vl::exl3_gemv_int8_reset_caches();
+	exl3_vl::ext::exl3_moe_reset_caches();
+#endif
 	Gemm::reset_caches();
 }
 

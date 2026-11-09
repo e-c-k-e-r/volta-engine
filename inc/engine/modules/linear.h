@@ -27,6 +27,7 @@ struct LinearWeight {
 	int        bits = 4;
 	bool       mul1 = false;
 	bool       mcg = false;   // MCG codebook (the quantized DFlash2 drafters); everything else decodes as mul1
+	bool       volta_tiles = false;   // Trellis: the tiles are in the Volta order (quantization_config.json "tile_layout": "volta"), else the stock order
 	uint32_t   gguf_type = 0; // GGUF: engine::modules::GgmlType of w0's blocks
 	int        gguf_k = 0, gguf_n = 0;
 	int        gguf_tile_heads = 0, gguf_tile_dim = 0;   // GGUF: input columns in tiled V-head order (see GgufColTiling); 0: as the activation
@@ -138,7 +139,8 @@ struct Linear {
 					weight.bits,
 					weight.mcg,
 					!weight.mcg,
-					stream
+					stream,
+					weight.volta_tiles
 				);
 			} break;
 			case pod::QuantType::NVFP4: {

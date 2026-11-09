@@ -64,7 +64,7 @@ struct RefGemmParams { uint64_t x, w, out_; int m, k, n; };
 } // namespace engine::backend::impl
 
 namespace engine::backend::impl {
-struct RefReconParams { uint64_t codes, out_; int k_dim, n_dim, bits, cb; };
+struct RefReconParams { uint64_t codes, out_; int k_dim, n_dim, bits, cb, volta; };
 struct RefHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };
 struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq, window, ring; uint64_t key_end, bidir; };
 struct RefUnpackParams { uint64_t qg, q, gate; int total, head_dim; };

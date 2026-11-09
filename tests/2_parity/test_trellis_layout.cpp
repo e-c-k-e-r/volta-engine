@@ -1,8 +1,9 @@
-// The trellis dequantizer against a golden decode in the tile order the build expects: random trellis words and the FP16 weights they
-// decode to, written by tests/tools/trellis_layout_golden.py (--layout stock for a normal build, volta for ENGINE_EXL3_VOLTA_LAYOUT=ON).
-//   test_trellis_layout <golden_dir> <bits> <tiles_k> <tiles_n> [mcg]   (bits 9 to 11 are the half-integer rates 1.5, 2.5, 3.5)
+// The trellis dequantizer against a golden decode: random trellis words and the FP16 weights they decode to, written by
+// tests/tools/trellis_layout_golden.py --layout stock|volta (the volta argument reads the words in the Volta tile order).
+//   test_trellis_layout <golden_dir> <bits> <tiles_k> <tiles_n> [mcg] [volta]   (bits 9 to 11 are the half-integer rates 1.5, 2.5, 3.5)
 // pass: the reconstructed matrix equals the golden bit for bit, for the plain and the Hadamard-fused dequantizer's input path.
 #include "reconstruct.cuh"
+#include "exl3_vl.cuh"
 #include "engine/modules/trellis_bits.h"
 #include "engine/config.h"
 #include <cuda_runtime.h>
@@ -26,12 +27,16 @@ static std::vector<char> read_all( const std::string& path ) {
 
 int main( int argc, char** argv ) {
 	if ( argc < 5 ) {
-		std::printf( "usage: test_trellis_layout <golden_dir> <bits> <tiles_k> <tiles_n> [mcg]\n" );
+		std::printf( "usage: test_trellis_layout <golden_dir> <bits> <tiles_k> <tiles_n> [mcg] [volta]\n" );
 		return 2;
 	}
 	const std::string dir = argv[1];
 	const int K = std::atoi( argv[2] ), tk = std::atoi( argv[3] ), tn = std::atoi( argv[4] );
-	const bool mcg = argc > 5 && !std::strcmp( argv[5], "mcg" );
+	bool mcg = false, volta = false;
+	for ( int a = 5; a < argc; ++a ) {
+		mcg = mcg || !std::strcmp( argv[a], "mcg" );
+		volta = volta || !std::strcmp( argv[a], "volta" );
+	}
 	const std::vector<char> words = read_all( dir + "/trellis.bin" ), expect = read_all( dir + "/expect.bin" );
 	const size_t rows = 16 * static_cast<size_t>( tk ), cols = 16 * static_cast<size_t>( tn );
 	ENGINE_ASSERT( words.size() == static_cast<size_t>( tk ) * tn * engine::modules::trellis_tile_u16( K ) * 2, "trellis.bin size" );
@@ -43,7 +48,7 @@ int main( int argc, char** argv ) {
 	CUDA_CHECK( cudaMalloc( &d_out, expect.size() ) );
 	CUDA_CHECK( cudaMemcpy( d_w, words.data(), words.size(), cudaMemcpyHostToDevice ) );
 	CUDA_CHECK( cudaMemset( d_out, 0xFF, expect.size() ) );
-	reconstruct_slice( d_out, d_w, K, mcg, !mcg, tk, static_cast<int>( cols ), 0, nullptr );
+	EXL3_TILES_CALL( volta, reconstruct_slice, d_out, d_w, K, mcg, !mcg, tk, static_cast<int>( cols ), 0, nullptr );
 	CUDA_CHECK( cudaDeviceSynchronize() );
 	std::vector<char> got( expect.size() );
 	CUDA_CHECK( cudaMemcpy( got.data(), d_out, got.size(), cudaMemcpyDeviceToHost ) );

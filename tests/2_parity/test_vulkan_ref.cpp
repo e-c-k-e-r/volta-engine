@@ -18,7 +18,7 @@ using namespace engine::backend;
 
 // Push-constant blocks: natural C layout == Slang's std430 emission (8-byte pointers, 4-byte scalars); mirrors src/kernels/slang/ref_*.slang
 struct RefGemmParams { uint64_t x, w, out_; int m, k, n; };
-struct RefReconParams { uint64_t codes, out_; int k_dim, n_dim, bits, cb; };
+struct RefReconParams { uint64_t codes, out_; int k_dim, n_dim, bits, cb, volta; };
 struct RefHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };
 struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq, window, ring; uint64_t key_end, bidir; };
 struct RefLatentParams { uint64_t q_lat, cache, out_, slots, pos; int64_t slot_stride; int layer, heads, max_seq; float scale; };
@@ -108,7 +108,7 @@ static double codebook_ref( uint32_t w, int cb ) {
 }
 // Dequantized [k, n] weight in the rotated basis; window extraction follows dq() (funnel shift over uint32 words), the scatter follows
 // the forward map of the engine's reconstruct kernel (a different formulation from the Slang kernel's inverse map)
-static std::vector<double> recon_ref( const std::vector<uint16_t>& codes, int k, int n, int bits, int cb ) {
+static std::vector<double> recon_ref( const std::vector<uint16_t>& codes, int k, int n, int bits, int cb, bool volta = false ) {
 	std::vector<double> w( static_cast<size_t>( k ) * n );
 	const int nw = bits * 256 / 32;
 	for ( int kt = 0; kt < k / 16; ++kt ) {
@@ -124,8 +124,9 @@ static std::vector<double> recon_ref( const std::vector<uint16_t>& codes, int k,
 					const int s0 = ( i1 + 1 ) * 32 - b1;
 					const uint64_t merged = ( static_cast<uint64_t>( word( i0 ) ) << 32 ) | word( i1 );
 					const uint32_t win = static_cast<uint32_t>( merged >> s0 ) & 0xffffu;
-					const int row = ( lane % 4 ) * 2 + ( i & 1 ) + 8 * ( ( i >> 1 ) & 1 );
-					const int col = 2 * ( lane / 8 + 4 * ( i >> 2 ) ) + ( ( lane >> 2 ) & 1 );
+					const int q = ( lane >> 2 ) & 3;   // the Volta order: lane 4 q + t + 16 h holds k = 4 (2 (q >> 1) + (i >> 2)) + (i & 3), n = 8 (q & 1) + t + 4 h
+					const int row = volta ? 4 * ( 2 * ( q >> 1 ) + ( i >> 2 ) ) + ( i & 3 ) : ( lane % 4 ) * 2 + ( i & 1 ) + 8 * ( ( i >> 1 ) & 1 );
+					const int col = volta ? 8 * ( q & 1 ) + ( lane & 3 ) + 4 * ( lane >> 4 ) : 2 * ( lane / 8 + 4 * ( i >> 2 ) ) + ( ( lane >> 2 ) & 1 );
 					w[static_cast<size_t>( kt * 16 + row ) * n + nt * 16 + col] = codebook_ref( win, cb );
 				}
 			}
@@ -205,20 +206,22 @@ int main() {
 			pass = check( name, ref, out.get() ) && pass;
 		}
 	}
-	{ // ref_trellis_reconstruct for 2..4 bpw and the three codebooks
+	{ // ref_trellis_reconstruct for 2..4 bpw, the three codebooks and both tile orders
 		const int k = 256, n = 384;
 		for ( int bits = 2; bits <= 4; ++bits ) {
 			for ( int cb = 0; cb < 3; ++cb ) {
-				std::vector<uint16_t> codes( size_t( k / 16 ) * ( n / 16 ) * 16 * bits );
-				for ( auto& c : codes ) c = static_cast<uint16_t>( rnd() >> 8 );
-				Dev<uint16_t> dc( codes );
-				Dev<half_t> out( size_t( k ) * n );
-				RefReconParams p{ dc.addr(), out.addr(), k, n, bits, cb };
-				vk::dispatch( nullptr, recon, &p, uint32_t( ( size_t( k ) * n + 255 ) / 256 ) );
-				stream_sync( nullptr );
-				char name[64];
-				std::snprintf( name, sizeof( name ), "ref_trellis_reconstruct %d bpw cb %d", bits, cb );
-				pass = check( name, recon_ref( codes, k, n, bits, cb ), out.get() ) && pass;
+				for ( int volta = 0; volta < 2; ++volta ) {
+					std::vector<uint16_t> codes( size_t( k / 16 ) * ( n / 16 ) * 16 * bits );
+					for ( auto& c : codes ) c = static_cast<uint16_t>( rnd() >> 8 );
+					Dev<uint16_t> dc( codes );
+					Dev<half_t> out( size_t( k ) * n );
+					RefReconParams p{ dc.addr(), out.addr(), k, n, bits, cb, volta };
+					vk::dispatch( nullptr, recon, &p, uint32_t( ( size_t( k ) * n + 255 ) / 256 ) );
+					stream_sync( nullptr );
+					char name[64];
+					std::snprintf( name, sizeof( name ), "ref_trellis_reconstruct %d bpw cb %d%s", bits, cb, volta ? " volta" : "" );
+					pass = check( name, recon_ref( codes, k, n, bits, cb, volta != 0 ), out.get() ) && pass;
+				}
 			}
 		}
 	}

@@ -1,4 +1,4 @@
-// Op-level golden test for the Linear module (trellis at 3/4/5/6 bits with MUL1 and MCG, rows 1/4/40, plain FP16, NVFP4).
+// Op-level golden test for the Linear module (trellis at 3/4/5/6 bits with MUL1 and MCG and at 3/4 bits in the Volta tile order, rows 1/4/40, plain FP16, NVFP4).
 // ONE source for both configurations through the module API:
 //   --dump <dir>   run in the CUDA build: computes with the real kernels, writes golden outputs
 //   --check <dir>  recompute with the built backend and compare (tier 2) against the golden files
@@ -92,6 +92,24 @@ int main( int argc, char** argv ) {
 				std::snprintf( nm, sizeof( nm ), "trellis_%s_b%d_m%d", mcg ? "mcg" : "mul1", bits, m );
 				cases.push_back( { nm, download_half( out ) } );
 			}
+		}
+	}
+	// the Volta tile order (LinearWeight::volta_tiles) on the same kind of random words: each backend's own decode of that order
+	for ( int bits : { 3, 4 } ) {
+		GoldenRng rng( 5000u + 17u * static_cast<uint32_t>( bits ) );
+		auto codes = upload_codes( code_vec( rng, k, n, bits ), k, n, bits );
+		auto suh = upload_half( sign_vec( rng, k ), { k } );
+		auto svh = upload_half( sign_vec( rng, n ), { n } );
+		pod::LinearWeight lw = pod::LinearWeight::make_trellis( codes, suh, svh, bits, true, false );
+		lw.volta_tiles = true;
+		for ( int m : row_list ) {
+			auto x = upload_half( uniform_vec( rng, static_cast<size_t>( m ) * k, 1.0f ), { m, k } );
+			int os[2] = { m, n };
+			pod::TensorView out = core::arena_alloc_tensor( g_arena, pod::DType::FP16, os, 2 );
+			modules::Linear::forward( x, lw, out );
+			char nm[64];
+			std::snprintf( nm, sizeof( nm ), "trellis_volta_mul1_b%d_m%d", bits, m );
+			cases.push_back( { nm, download_half( out ) } );
 		}
 	}
 	{ // plain FP16 [k, n]

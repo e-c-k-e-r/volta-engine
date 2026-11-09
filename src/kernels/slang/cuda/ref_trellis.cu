@@ -12,7 +12,7 @@ namespace had {
 #include "ref_cuda.h"
 
 void ref_trellis_reconstruct_cuda( void* codes, void* w, int k, int n, int bits, int cb, cudaStream_t s ) {
-	recon::RefReconParams_0 p{ (ushort*) codes, (__half*) w, k, n, bits, cb };
+	recon::RefReconParams_0 p{ (ushort*) codes, (__half*) w, k, n, bits, cb, 0 };
 	const long long total = (long long) k * n;
 	recon::ref_trellis_reconstruct<<<(unsigned) ( ( total + 255 ) / 256 ), 256, 0, s>>>( p );
 }

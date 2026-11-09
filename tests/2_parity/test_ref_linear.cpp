@@ -21,7 +21,7 @@ void ref_had128( ComputeVaryingInput*, void*, void* );
 }
 
 struct RefGemmParams { half* x; half* w; half* out_; int m; int k; int n; };
-struct RefReconParams { uint16_t* codes; half* out_; int k_dim; int n_dim; int bits; int cb; };
+struct RefReconParams { uint16_t* codes; half* out_; int k_dim; int n_dim; int bits; int cb; int volta; };
 struct RefHadParams { half* src; half* dst; half* pre; half* post; int cols; float r_scale; };
 
 static uint32_t g_state = 4242u;

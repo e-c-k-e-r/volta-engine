@@ -22,7 +22,7 @@ void ref_had128( ComputeVaryingInput*, void*, void* );
 }
 
 struct RefGemmParams { half* x; half* w; half* out_; int m; int k; int n; };
-struct RefReconParams { uint16_t* codes; half* out_; int k_dim; int n_dim; int bits; int cb; };
+struct RefReconParams { uint16_t* codes; half* out_; int k_dim; int n_dim; int bits; int cb; int volta; };
 struct RefHadParams { half* src; half* dst; half* pre; half* post; int cols; float r_scale; };
 
 namespace engine::modules {
@@ -124,8 +124,9 @@ void decode_tile_avx2( const uint8_t* stream, int total, int bits, int cb, uint1
 #endif
 
 // Native reconstruction of the dequantized [k, n] weight (same result as the ref_trellis_reconstruct kernel, which costs ~100 ns per
-// element on the host): each 16x16 tile's cyclic MSB-first bit stream is laid out as bytes once, then a window is one unaligned read
-void reconstruct_native( const uint16_t* codes, half* out, int k, int n, int bits, int cb ) {
+// element on the host): each 16x16 tile's cyclic MSB-first bit stream is laid out as bytes once, then a window is one unaligned read.
+// volta: the tiles are in the Volta order (LinearWeight::volta_tiles), which only changes where stream position p lands in the tile
+void reconstruct_native( const uint16_t* codes, half* out, int k, int n, int bits, int cb, bool volta ) {
 	static_assert( sizeof( half ) == 2, "reconstruct_native: half must be 16 bits" );
 	const int tiles_n = n / 16;
 	const int total = 256 * bits;
@@ -155,8 +156,17 @@ void reconstruct_native( const uint16_t* codes, half* out, int k, int n, int bit
 #endif
 				for ( int p = 0; p < 256; ++p ) {
 					const int L = p >> 3, i = p & 7;
-					const int row = ( L & 3 ) * 2 + ( i & 1 ) + 8 * ( ( i >> 1 ) & 1 );
-					const int col = 2 * ( ( L >> 3 ) + 4 * ( i >> 2 ) ) + ( ( L >> 2 ) & 1 );
+					int row, col;
+					if ( volta ) {
+						// lane L = 4 q + t + 16 h holds k = 4 (2 (q >> 1) + (i >> 2)) + (i & 3), n = 8 (q & 1) + t + 4 h
+						const int q = ( L >> 2 ) & 3;
+						row = 4 * ( 2 * ( q >> 1 ) + ( i >> 2 ) ) + ( i & 3 );
+						col = 8 * ( q & 1 ) + ( L & 3 ) + 4 * ( L >> 4 );
+					}
+					else {
+						row = ( L & 3 ) * 2 + ( i & 1 ) + 8 * ( ( i >> 1 ) & 1 );
+						col = 2 * ( ( L >> 3 ) + 4 * ( i >> 2 ) ) + ( ( L >> 2 ) & 1 );
+					}
 					std::memcpy( &out[( kt * 16 + row ) * n + nt * 16 + col], &vals[p], 2 );
 				}
 			}
@@ -201,7 +211,7 @@ void linear_fp32_out( const std::vector<half>& xh, const half* w, const half* sv
 	}
 }
 
-void trellis_linear_impl( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1 ) {
+void trellis_linear_impl( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, bool volta ) {
 	const int m = x.shape[0];
 	const int k = trellis.shape[0] * 16;
 	const int n = trellis.shape[1] * 16;
@@ -215,7 +225,7 @@ void trellis_linear_impl( const pod::TensorView& x, const pod::TensorView& trell
 	if ( wbuf.size() < static_cast<size_t>( k ) * n ) wbuf.resize( static_cast<size_t>( k ) * n );
 	const half* w = wbuf.data();
 	had_rows( x.ptr<const half>(), xh.data(), suh.ptr<const half>(), nullptr, m, k );
-	reconstruct_native( trellis.ptr<const uint16_t>(), wbuf.data(), k, n, bits, cb );
+	reconstruct_native( trellis.ptr<const uint16_t>(), wbuf.data(), k, n, bits, cb, volta );
 	if ( out.dtype == pod::DType::FP32 ) {
 		linear_fp32_out( xh, w, svh.ptr<const half>(), out.ptr<float>(), m, k, n );
 		return;
@@ -228,15 +238,15 @@ void trellis_linear_impl( const pod::TensorView& x, const pod::TensorView& trell
 }
 
 // ENGINE_DEBUG_CPU_TRACE=1: one line per call with the elapsed time and the weight elements dequantized so far
-void trellis_linear( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1 ) {
+void trellis_linear( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, bool volta ) {
 	static const bool trace = std::getenv( "ENGINE_DEBUG_CPU_TRACE" ) != nullptr;
 	if ( !trace ) {
-		trellis_linear_impl( x, trellis, suh, svh, out, bits, mcg, mul1 );
+		trellis_linear_impl( x, trellis, suh, svh, out, bits, mcg, mul1, volta );
 		return;
 	}
 	static double total_elems = 0.0;
 	const auto t0 = std::chrono::steady_clock::now();
-	trellis_linear_impl( x, trellis, suh, svh, out, bits, mcg, mul1 );
+	trellis_linear_impl( x, trellis, suh, svh, out, bits, mcg, mul1, volta );
 	total_elems += static_cast<double>( trellis.shape[0] ) * 16 * trellis.shape[1] * 16;
 	std::fprintf( stderr, "[cpu-trace] linear %dx%d m=%d %.0f ms, %.2f G elems so far\n", trellis.shape[0] * 16, trellis.shape[1] * 16, x.shape[0],
 		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count(), total_elems * 1e-9 );
@@ -244,12 +254,16 @@ void trellis_linear( const pod::TensorView& x, const pod::TensorView& trellis, c
 
 } // namespace
 
-void LinearTrellis::forward( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, backend::stream_t ) {
-	trellis_linear( x, trellis, suh, svh, out, bits, mcg, mul1 );
+void LinearTrellis::forward( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, backend::stream_t, bool volta_tiles ) {
+	trellis_linear( x, trellis, suh, svh, out, bits, mcg, mul1, volta_tiles );
 }
 
-void LinearTrellis::forward_recon( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, backend::stream_t ) {
-	trellis_linear( x, trellis, suh, svh, out, bits, mcg, mul1 );
+void LinearTrellis::forward_recon( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, backend::stream_t, bool volta_tiles ) {
+	trellis_linear( x, trellis, suh, svh, out, bits, mcg, mul1, volta_tiles );
+}
+
+bool trellis_volta_tiles_supported() {
+	return true;
 }
 
 } // namespace engine::modules

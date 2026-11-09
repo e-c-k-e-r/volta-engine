@@ -5,6 +5,7 @@
 #include "trellis_context.h"
 #include "reconstruct.cuh"
 #include "hadamard.cuh"
+#include "exl3_vl.cuh"
 #include <cstdlib>
 #include "engine/runtime/options.h"
 
@@ -29,7 +30,8 @@ void LinearTrellis::forward_recon(
 	int bits,
 	bool mcg,
 	bool mul1,
-	cudaStream_t stream
+	cudaStream_t stream,
+	bool volta_tiles
 ) {
 	const int m = x.shape[0];
 	const int k = trellis.shape[0] * 16;
@@ -45,7 +47,7 @@ void LinearTrellis::forward_recon(
 	half* xh = trellis_get_workspace( device, static_cast<size_t>( m ) * k * sizeof( half ) );
 	half* w = trellis_get_recon_ws( device, static_cast<size_t>( k ) * n * sizeof( half ) );
 	had_r_128( x.ptr<const half>(), xh, suh.ptr<const half>(), nullptr, kRScale, m, k, stream );
-	reconstruct_slice( w, trellis.ptr<const uint16_t>(), bits, mcg, mul1, k / 16, n, 0, stream );
+	EXL3_TILES_CALL( volta_tiles, reconstruct_slice, w, trellis.ptr<const uint16_t>(), bits, mcg, mul1, k / 16, n, 0, stream );
 
 	Gemm::nn( xh, k, w, n, out.data, n, false, m, n, k, 0.0f, stream );
 	had_r_128( out.ptr<const half>(), out.ptr<half>(), nullptr, svh.ptr<const half>(), kRScale, m, n, stream );
@@ -60,7 +62,8 @@ void LinearTrellis::forward(
 	int bits,
 	bool mcg,
 	bool mul1,
-	cudaStream_t stream
+	cudaStream_t stream,
+	bool volta_tiles
 ) {
 	const int m = x.shape[0];
 	const int k = trellis.shape[0] * 16;
@@ -96,7 +99,7 @@ void LinearTrellis::forward(
 #endif
 	ENGINE_ASSERT( bits <= 8 || ( !c_fp32 && k % 128 == 0 && n % 128 == 0 ), "LinearTrellis::forward: a half-integer rate needs FP16 output and dimensions that are multiples of 128" );
 	if ( recon && !c_fp32 && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
-		forward_recon( x, trellis, suh, svh, out, bits, mcg, mul1, stream );
+		forward_recon( x, trellis, suh, svh, out, bits, mcg, mul1, stream, volta_tiles );
 	}
 #if defined(USE_ROCM)
 	else if ( wmma ) {
@@ -104,48 +107,34 @@ void LinearTrellis::forward(
 	}
 #endif
 	else if ( gemm_shape > 0 ) {
-		exl3_gemm( x_ptr, trellis_ptr, out_ptr, suh_ptr, A_had, svh_ptr, m, k, n, bits, mcg, mul1, c_fp32, stream, gemm_shape );
+		EXL3_TILES_CALL( volta_tiles, exl3_gemm, x_ptr, trellis_ptr, out_ptr, suh_ptr, A_had, svh_ptr, m, k, n, bits, mcg, mul1, c_fp32, stream, gemm_shape );
 	}
 #if defined(USE_ROCM)
 	else if ( m <= gemv_max && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 #else
 	else if ( m <= 8 && ( m == 1 || m == 2 || m == 4 || m == 8 ) && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 #endif
-		exl3_gemv(
-			x_ptr,
-			trellis_ptr,
-			out_ptr,
-			suh_ptr,
-			A_had,
-			svh_ptr,
-			m,
-			k,
-			n,
-			bits,
-			mcg,
-			mul1,
-			c_fp32,
-			stream
-		);
+		EXL3_TILES_CALL( volta_tiles, exl3_gemv, x_ptr, trellis_ptr, out_ptr, suh_ptr, A_had, svh_ptr, m, k, n, bits, mcg, mul1, c_fp32, stream );
 	}
 	else {
-		exl3_gemm(
-			x_ptr,
-			trellis_ptr,
-			out_ptr,
-			suh_ptr,
-			A_had,
-			svh_ptr,
-			m,
-			k,
-			n,
-			bits,
-			mcg,
-			mul1,
-			c_fp32,
-			stream
-		);
+		EXL3_TILES_CALL( volta_tiles, exl3_gemm, x_ptr, trellis_ptr, out_ptr, suh_ptr, A_had, svh_ptr, m, k, n, bits, mcg, mul1, c_fp32, stream, 0 );
 	}
+}
+
+bool trellis_volta_tiles_supported() {
+#if ENGINE_EXL3_VL
+	// The Volta copies decode the order on SM_70 only (their SM_80+ code paths read the stock order)
+	int devices = 0;
+	if ( cudaGetDeviceCount( &devices ) != cudaSuccess || devices < 1 ) return false;
+	for ( int d = 0; d < devices; ++d ) {
+		int major = 0;
+		cudaDeviceGetAttribute( &major, cudaDevAttrComputeCapabilityMajor, d );
+		if ( major != 7 ) return false;
+	}
+	return true;
+#else
+	return false;
+#endif
 }
 
 } // namespace engine::modules

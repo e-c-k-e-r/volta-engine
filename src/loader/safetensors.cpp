@@ -1,4 +1,5 @@
 #include "engine/modules/trellis_bits.h"
+#include "engine/modules/trellis.h"
 #include "engine/loader/safetensors.h"
 #include "engine/loader/gguf.h"
 #include "engine/modules/gguf.h"
@@ -449,30 +450,23 @@ void SafeTensorsRepo::close() {
 
 namespace {
 
-// An EXL3 checkpoint names its tile order in quantization_config.json ("tile_layout": "volta"; absent = the stock order), and the GEMM kernels of a build read
-// exactly one of them: the other decodes to noise without any error, so the directory is refused here. Searches the file's text; nothing is parsed.
-void check_exl3_tile_layout( const char* dir ) {
+// An EXL3 checkpoint names its tile order in quantization_config.json ("tile_layout": "volta"; absent = the stock order). The kernels read either,
+// per weight; the other order would decode to noise without any error. Searches the file's text; nothing is parsed.
+bool exl3_volta_tiles( const char* dir ) {
 	char path[1200];
 	std::snprintf( path, sizeof( path ), "%s/quantization_config.json", dir );
 	const int fd = ::open( path, O_RDONLY );
-	if ( fd < 0 ) return;
+	if ( fd < 0 ) return false;
 	struct stat st;
-	if ( fstat( fd, &st ) != 0 || st.st_size <= 0 ) { ::close( fd ); return; }
+	if ( fstat( fd, &st ) != 0 || st.st_size <= 0 ) { ::close( fd ); return false; }
 	void* map = mmap( nullptr, static_cast<size_t>( st.st_size ), PROT_READ, MAP_PRIVATE, fd, 0 );
 	::close( fd );
-	if ( map == MAP_FAILED ) return;
+	if ( map == MAP_FAILED ) return false;
 	const std::string text( static_cast<const char*>( map ), static_cast<size_t>( st.st_size ) );
 	munmap( map, static_cast<size_t>( st.st_size ) );
-	if ( text.find( "\"quant_method\"" ) == std::string::npos || text.find( "\"exl3\"" ) == std::string::npos ) return;
-	bool volta = false;
-	if ( const size_t at = text.find( "\"tile_layout\"" ); at != std::string::npos ) volta = text.compare( text.find( '"', text.find( ':', at ) ) , 7, "\"volta\"" ) == 0;
-#ifdef ENGINE_BUILD_EXL3_VOLTA_LAYOUT
-	constexpr bool build_volta = true;
-#else
-	constexpr bool build_volta = false;
-#endif
-	ENGINE_ASSERT( volta == build_volta, volta ? "this EXL3 checkpoint is in the Volta tile order (tile_layout in quantization_config.json); build with -DENGINE_EXL3_VOLTA_LAYOUT=ON"
-	                                           : "this build reads the EXL3 Volta tile order (ENGINE_EXL3_VOLTA_LAYOUT=ON) but the checkpoint is in the stock order; re-encode it with tests/tools/exl3_volta_layout.py or quantize it with exl3_quantize.py --order volta" );
+	if ( text.find( "\"quant_method\"" ) == std::string::npos || text.find( "\"exl3\"" ) == std::string::npos ) return false;
+	const size_t at = text.find( "\"tile_layout\"" );
+	return at != std::string::npos && text.compare( text.find( '"', text.find( ':', at ) ), 7, "\"volta\"" ) == 0;
 }
 
 } // namespace
@@ -481,7 +475,9 @@ bool SafeTensorsRepo::open( const char* dir_path, bool mmproj ) {
 	close();
 	std::strncpy( dir_path_, dir_path, sizeof( dir_path_ ) - 1 );
 	dir_path_[sizeof( dir_path_ ) - 1] = '\0';
-	if ( !mmproj ) check_exl3_tile_layout( dir_path );
+	volta_tiles_ = !mmproj && exl3_volta_tiles( dir_path );
+	ENGINE_ASSERT( !volta_tiles_ || engine::modules::trellis_volta_tiles_supported(),
+		"this EXL3 checkpoint is in the Volta tile order (tile_layout in quantization_config.json), which this build's GPU kernels do not read (SM_70 CUDA, CPU and Vulkan builds do)" );
 
 	std::vector<std::string> shard_files;
 
@@ -1083,7 +1079,7 @@ pod::LinearWeight SafeTensorsRepo::synth_linear( const char* base_name, pod::Mem
 	backend::memcpy_async( suh.data, signs.data(), static_cast<size_t>( k ) * 2, backend::Copy::H2D, stream );
 	backend::memcpy_async( svh.data, small.data(), static_cast<size_t>( n ) * 2, backend::Copy::H2D, stream );
 	backend::stream_sync( stream );   // the host buffers are reused by the next call
-	return pod::LinearWeight::make_trellis( tr, suh, svh, bits, true, false );
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, bits, true, false ) );
 }
 
 size_t SafeTensorsRepo::bytes_with_prefix( const char* prefix ) const {
@@ -1191,7 +1187,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear(
 	const bool has_mcg = ( find( name_buf, &dummy_shard ) != nullptr );
 
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : bits;
-	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg );
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ) );
 }
 
 pod::LinearWeight SafeTensorsRepo::load_linear_slice(
@@ -1251,7 +1247,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.svh", base_name );
 		pod::TensorView svh = load( name_buf, arena, stream, pod::DType::FP16 );
 
-		return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg );
+		return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ) );
 	}
 	else {
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.suh", base_name );
@@ -1260,7 +1256,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.svh", base_name );
 		pod::TensorView svh = load_slice( name_buf, arena, 0, rank, tp_size, stream, pod::DType::FP16 );
 
-		return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg );
+		return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ) );
 	}
 }
 
@@ -1326,7 +1322,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_range(
 	const bool has_mul1 = find( name_buf, &dummy ) != nullptr;
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.mcg", base_name );
 	const bool has_mcg = find( name_buf, &dummy ) != nullptr;
-	return pod::LinearWeight::make_trellis( tr, suh, svh, B / 16, has_mul1, has_mcg );
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, B / 16, has_mul1, has_mcg ) );
 }
 
 pod::LinearWeight SafeTensorsRepo::load_linear_slice_padded(
@@ -1435,7 +1431,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_cols_padded(
 	const bool has_mcg = ( find( name_buf, &dummy_shard ) != nullptr );
 
 	int actual_bits = engine::modules::trellis_code_from_u16( B );
-	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits ? actual_bits : bits, has_mul1, has_mcg );
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits ? actual_bits : bits, has_mul1, has_mcg ) );
 }
 
 pod::LinearWeight SafeTensorsRepo::load_linear_slice_fused(
@@ -1538,7 +1534,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_fused(
 	backend::stream_sync( stream );
 
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : bits;
-	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits );
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits ) );
 }
 
 pod::LinearWeight SafeTensorsRepo::load_grouped_trellis_slice(
@@ -1589,7 +1585,7 @@ pod::LinearWeight SafeTensorsRepo::load_grouped_trellis_slice(
 	const bool has_mcg = ( find( name_buf, &dummy_shard ) != nullptr );
 
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : 5;
-	return pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg );
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ) );
 }
 
 pod::TensorView SafeTensorsRepo::load_grouped_slice(

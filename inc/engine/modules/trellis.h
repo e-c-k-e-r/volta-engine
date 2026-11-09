@@ -16,7 +16,8 @@ struct LinearTrellis {
 		int bits,
 		bool mcg,
 		bool mul1 = false,
-		backend::stream_t stream = nullptr
+		backend::stream_t stream = nullptr,
+		bool volta_tiles = false
 	);
 
 	// Large-M path: Hadamard, dequantize the weight to FP16, Gemm::nn (FP32 accumulate), Hadamard. FP16 output.
@@ -30,8 +31,12 @@ struct LinearTrellis {
 		int bits,
 		bool mcg,
 		bool mul1 = false,
-		backend::stream_t stream = nullptr
+		backend::stream_t stream = nullptr,
+		bool volta_tiles = false
 	);
 };
+
+// Whether this build reads EXL3 tiles in the Volta order (LinearWeight::volta_tiles): CPU and Vulkan builds do, CUDA builds with SM_70 code on SM_70 devices
+bool trellis_volta_tiles_supported();
 
 } // namespace engine::modules

@@ -7,6 +7,7 @@
 | Test | Tier | GPU | Checks |
 |---|---|---|---|
 | `test_trellis`, `test_gemv_int8` | 2 | yes | trellis (1 to 8 bits) and int8 GEMV kernels against FP32 references |
+| `test_trellis_order` | 2 | yes | both EXL3 tile orders on the same random codes: the Volta reconstruction equals the permuted stock one bit for bit, and each order's GEMV / GEMM / reconstruct paths match a double-precision product from 1 to 48 rows (SM_70 builds; skips elsewhere) |
 | `test_trellis_decode` | 2 | yes | the trellis pair decode (on ROCm its RDNA form) against the 32-bit multiply form, every index of the three codebooks, bit for bit |
 | `test_mhc`, `test_attention`, `test_attention_prefill` (the tensor-core prefill kernels against the decode kernel: head_dim 256 and 512, sliding windows, ring caches), `test_dsa`, `test_dsv4_indexer` (DeepSeek's indexer: the tensor-core scorer against the scalar kernel, selections, candidate masks and scores, with timing), `test_dsv4_fp8` (DeepSeek's FP8 projections against a double-precision product, 1 to 300 rows), `test_dsv4_engram` (DeepSeek's Engram gate against double precision; rows inside an image span come back untouched), `test_loop_detect` (the loop detector on synthetic token streams: exact and near loops found, varied text, reused phrases, transcribed prompt items and an indexed list left alone; no GPU), `test_kv_pages`, `test_gdn`, `test_norm`, `test_rope`, `test_kv_quant`, `test_prefill_linear` | 2 | yes | module operations against CPU references |
 | `test_all_reduce` | 2 | yes (4; `AR_RANKS=2` runs two) | NVLink all-reduce: single, asynchronous multi-layer, fused with the gated add and stream norm (Flash-Next), fused with the hyper-connection post-step (GLM; bit-identical to the all-reduce followed by `HyperConnection::update`) |
@@ -21,7 +22,7 @@
 | `test_jinja` | 2 | no | Jinja2 subset against reference Jinja2 renders of the Qwen, GLM and Gemma 4 chat templates |
 | `test_image` | 2 | no | image decode, smart resize and patch layout against PIL / HF-layout references, GLM canvas sizes against exllamav3's (`tests/tools/gen_image_goldens.py`) |
 | `test_output_parser` | 2 | no | reasoning / tool-call parser (Qwen, GLM, DeepSeek and Gemma 4 formats), chunking independence, template round trip |
-| `test_trellis_layout` | 2 | yes | the trellis dequantizer against a golden decode in the build's tile order (tests/tools/trellis_layout_golden.py; run by hand, stock or Volta layout) |
+| `test_trellis_layout` (`[mcg] [volta]`) | 2 | yes | the trellis dequantizer against a golden decode in either tile order (tests/tools/trellis_layout_golden.py; run by hand) |
 | `test_tui_view` | 2 | no | dashboard frames on every tab for full, partial and missing stats at normal and tiny terminal sizes; sparklines, gap histogram, expert heat map, alerts, slot picking, pause; key handling and scroll clamps |
 | `test_backend_tiers` | 1 | no | capability registry matches the declared module functions |
 | `test_mma_frag` | 1 | no | on a simulated warp, against the PTX m16n8k16 / m8n8k4 layouts: the tensor-core fragment maps of the SM_80+ paths (`mma_frag.h`, `nvfp4_frag.h`) and the ROCm `mma` emulations (`mma_emu.h`) |

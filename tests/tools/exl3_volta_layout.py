@@ -3,7 +3,7 @@
 
 The stock order inside every 16x16 weight tile suits Ampere's m16n8k16 fragments: lane t decodes elements t*8..t*8+7 and holds an
 Ampere B fragment. The Volta order puts into lane t's eight decoded values exactly what its m8n8k4 operands need, so the kernels
-need no shuffles (built with EXL3_VOLTA_LAYOUT=1, see docs/HARDWARE_SM70.md).
+need no shuffles (the loader reads the order from quantization_config.json, see docs/QUANTIZATION.md).
 
   volta order, lane = 4*q + t_ + 16*hh  (q = octet 0..3, t_ = lane & 3, hh = lane >> 4)
     nf  = q & 1            the n8 half of the 16x16 tile the octet works on

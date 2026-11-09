@@ -310,6 +310,8 @@ public:
 	const char* dir_path() const {
 		return dir_path_;
 	}
+	// The EXL3 tiles of this checkpoint are in the Volta order (quantization_config.json "tile_layout": "volta"); every trellis weight it loads carries it
+	bool volta_tiles() const { return volta_tiles_; }
 
 private:
 	// A GGUF block tensor as a LinearWeight: the given row ranges, and of each row the given column ranges (whole blocks), the column order
@@ -323,6 +325,12 @@ private:
 	char shard_names_[MAX_SHARDS][256];
 	int num_shards_ = 0;
 	char dir_path_[1024];
+	bool volta_tiles_ = false;
+
+	pod::LinearWeight tiles( pod::LinearWeight lw ) const {
+		lw.volta_tiles = volta_tiles_;
+		return lw;
+	}
 
 	std::unordered_map<std::string, std::pair<int, const pod::SafeTensorMeta*>> tensor_map_;
 };

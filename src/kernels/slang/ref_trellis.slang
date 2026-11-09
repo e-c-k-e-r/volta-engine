@@ -20,6 +20,7 @@ struct RefReconParams {
 	int n_dim;
 	int bits;
 	int cb;
+	int volta;   // 1: the tiles are in the Volta order (tile_layout volta): lane 4 q + t + 16 h holds k = 4 (2 (q >> 1) + (i >> 2)) + (i & 3), n = 8 (q & 1) + t + 4 h
 };
 
 // IEEE binary16 bit pattern to float (the codebook only produces finite values)
@@ -78,8 +79,12 @@ void ref_trellis_reconstruct(uint3 tid : SV_DispatchThreadID, uniform RefReconPa
 	let rr = r % 16;
 	let cl = c % 16;
 	let c8 = cl >> 1;
-	let lane = (c8 & 3) * 8 + (cl & 1) * 4 + ((rr >> 1) & 3);
-	let i = (c8 >> 2) * 4 + (rr >> 3) * 2 + (rr & 1);
+	var lane = (c8 & 3) * 8 + (cl & 1) * 4 + ((rr >> 1) & 3);
+	var i = (c8 >> 2) * 4 + (rr >> 3) * 2 + (rr & 1);
+	if (p.volta != 0) {
+		lane = 4 * (2 * (rr >> 3) + (cl >> 3)) + (cl & 3) + 16 * ((cl >> 2) & 1);
+		i = ((rr >> 2) & 1) * 4 + (rr & 3);
+	}
 	let tile_base = (kt * (p.n_dim / 16) + nt) * 16 * p.bits;
 	p.out_[idx] = half(trellis_value(p.codes, tile_base, p.bits, p.cb, lane * 8 + i));
 }
