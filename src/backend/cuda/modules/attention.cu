@@ -68,7 +68,8 @@ __global__ void kv_store_kernel(
 	const pod::BatchRows* __restrict__ rows,
 	int count,
 	int total_elems,
-	int max_seq
+	int max_seq,
+	int ring
 ) {
 	constexpr int U = kv_unit<Q>();
 	const int units_per_row = total_elems / U;
@@ -77,7 +78,7 @@ __global__ void kv_store_kernel(
 	const int m = tid / units_per_row;
 	const int u = tid % units_per_row;
 	const size_t idx0 = static_cast<size_t>( rows->slot[m] ) * slot_stride
-		+ ( static_cast<size_t>( layer_idx ) * max_seq + rows->pos[m] ) * total_elems + static_cast<size_t>( u ) * U;
+		+ ( static_cast<size_t>( layer_idx ) * max_seq + ( ring > 0 ? rows->pos[m] % ring : rows->pos[m] ) ) * total_elems + static_cast<size_t>( u ) * U;
 	kv_store_unit<Q>( data, scales, idx0, src + static_cast<size_t>( m ) * total_elems + static_cast<size_t>( u ) * U );
 }
 
@@ -130,13 +131,16 @@ __global__ void attn_chunked_paged_kernel(
 	// Chunks past this row's context write an empty (l = 0) partial that the reduce skips, so
 	// the grid can be sized by max_seq and stay valid across positions (graph replay)
 	int cur_pos = rows->pos[row0 + m];
-	int total_tokens = min( cur_pos + 1, max_seq );
+	const int ring = kv.ring;
+	int total_tokens = ring > 0 ? cur_pos + 1 : min( cur_pos + 1, max_seq );
 	const size_t slot_off = static_cast<size_t>( rows->slot[row0 + m] ) * slot_stride;
 
-	// a sliding window keeps the last `window` positions (the row's own included)
+	// a sliding window keeps the last `window` positions (the row's own included). In a ring cache the chunks tile the window from the
+	// chunk boundary below it (rows mod ring), so they are the absolute chunks a full-length cache would use and sum alike
 	const int kv_lo = window > 0 ? max( 0, total_tokens - window ) : 0;
-	int kv_start = max( chunk * chunk_len, kv_lo );
-	int kv_end = min( chunk * chunk_len + chunk_len, total_tokens );
+	const int chunk0 = ring > 0 ? ( kv_lo / chunk_len ) * chunk_len : 0;
+	int kv_start = max( chunk0 + chunk * chunk_len, kv_lo );
+	int kv_end = min( chunk0 + chunk * chunk_len + chunk_len, total_tokens );
 
 	const half* q_head = q + ( static_cast<size_t>( m ) * num_q_heads + head ) * head_dim;
 	half* out_head = out + ( static_cast<size_t>( m ) * num_q_heads + head ) * head_dim;
@@ -156,7 +160,7 @@ __global__ void attn_chunked_paged_kernel(
 
 	if ( kv_start < total_tokens ) {
 		for ( int t = kv_start; t < kv_end; ++t ) {
-			size_t kv_offset = slot_off + ( static_cast<size_t>( layer_idx ) * max_seq + t ) * ( num_kv_heads * head_dim ) + kv_head * head_dim + tid;
+			size_t kv_offset = slot_off + ( static_cast<size_t>( layer_idx ) * max_seq + ( ring > 0 ? t % ring : t ) ) * ( num_kv_heads * head_dim ) + kv_head * head_dim + tid;
 			float my_k = kv_load1<KQ>( kv.k, kv.ks, kv_offset );
 			float dot = my_q * my_k;
 
@@ -898,21 +902,21 @@ namespace {
 
 template <KVQ Q>
 void launch_kv_store( void* data, void* scales, const half* src, size_t slot_stride, int layer_idx,
-	const pod::BatchRows* d_rows, int count, int total_elems, int max_seq, cudaStream_t stream ) {
+	const pod::BatchRows* d_rows, int count, int total_elems, int max_seq, int ring, cudaStream_t stream ) {
 	constexpr int U = kv_unit<Q>();
 	ENGINE_ASSERT( total_elems % U == 0, "KV store: row width must be a multiple of the quantization group" );
 	const int units = ( total_elems / U ) * count;
-	kv_store_kernel<Q><<<( units + 127 ) / 128, 128, 0, stream>>>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq );
+	kv_store_kernel<Q><<<( units + 127 ) / 128, 128, 0, stream>>>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, ring );
 }
 
 void kv_store_dispatch( KVQ q, void* data, void* scales, const half* src, size_t slot_stride, int layer_idx,
-	const pod::BatchRows* d_rows, int count, int total_elems, int max_seq, cudaStream_t stream ) {
+	const pod::BatchRows* d_rows, int count, int total_elems, int max_seq, int ring, cudaStream_t stream ) {
 	switch ( q ) {
-		case KVQ::F16: launch_kv_store<KVQ::F16>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream ); break;
-		case KVQ::E5M2: launch_kv_store<KVQ::E5M2>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream ); break;
-		case KVQ::I8: launch_kv_store<KVQ::I8>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream ); break;
-		case KVQ::Q4: launch_kv_store<KVQ::Q4>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream ); break;
-		case KVQ::FP4: launch_kv_store<KVQ::FP4>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream ); break;
+		case KVQ::F16: launch_kv_store<KVQ::F16>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, ring, stream ); break;
+		case KVQ::E5M2: launch_kv_store<KVQ::E5M2>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, ring, stream ); break;
+		case KVQ::I8: launch_kv_store<KVQ::I8>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, ring, stream ); break;
+		case KVQ::Q4: launch_kv_store<KVQ::Q4>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, ring, stream ); break;
+		case KVQ::FP4: launch_kv_store<KVQ::FP4>( data, scales, src, slot_stride, layer_idx, d_rows, count, total_elems, max_seq, ring, stream ); break;
 	}
 }
 
@@ -940,8 +944,9 @@ void Attention::store_kv_cache(
 	cudaStream_t stream
 ) {
 	const int total_elems = num_kv_heads * head_dim;
-	kv_store_dispatch( kv.kq, kv.k, kv.ks, k.ptr<const half>(), slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream );
-	kv_store_dispatch( kv.vq, kv.v, kv.vs, v.ptr<const half>(), slot_stride, layer_idx, d_rows, count, total_elems, max_seq, stream );
+	ENGINE_ASSERT( kv.ring == 0 || kv.ring == max_seq, "Attention::store_kv_cache: a ring cache has max_seq rows per layer" );
+	kv_store_dispatch( kv.kq, kv.k, kv.ks, k.ptr<const half>(), slot_stride, layer_idx, d_rows, count, total_elems, max_seq, kv.ring, stream );
+	kv_store_dispatch( kv.vq, kv.v, kv.vs, v.ptr<const half>(), slot_stride, layer_idx, d_rows, count, total_elems, max_seq, kv.ring, stream );
 }
 
 void Attention::forward_decode(
@@ -962,6 +967,7 @@ void Attention::forward_decode(
 	int window
 ) {
 	ENGINE_ASSERT( head_dim <= ATTN_MAX_HEAD_DIM && head_dim % 32 == 0, "Attention::forward_decode: head_dim must be a multiple of 32, at most 512" );
+	ENGINE_ASSERT( kv.ring == 0 || ( window > 0 && window <= kv.ring && kv.ring == max_seq ), "Attention::forward_decode: a ring cache holds a sliding window of max_seq rows" );
 	// Keys per chunk: one page, doubled until the key range fits the workspace's chunk capacity, for the rows and heads of a batch
 	const int batch_rows = MIN( count, pod::MAX_BATCH );
 	int chunk_len = ATTN_PAGE_SIZE;
@@ -1019,6 +1025,7 @@ void Attention::forward_prefill(
 	int key_hint,
 	bool per_row
 ) {
+	ENGINE_ASSERT( kv.ring == 0, "Attention::forward_prefill: no ring caches" );
 	ENGINE_ASSERT( head_dim == 256 && num_q_heads % num_kv_heads == 0, "Attention::forward_prefill: head_dim 256 and GQA only" );
 #if defined(USE_ROCM)
 	// The tiled kernel stages ~96 KB of shared memory; RDNA grants a workgroup 64 KB. The WMMA kernel fits in 64 KB
@@ -1124,6 +1131,7 @@ void Attention::forward_sparse(
 	int idx_stride,
 	cudaStream_t stream
 ) {
+	ENGINE_ASSERT( kv.ring == 0, "Attention::forward_sparse: no ring caches" );
 	ENGINE_ASSERT( kv.vq != KVQ::Q4, "Attention::forward_sparse: Q4 values are not supported" );
 	const float scale = 1.0f / sqrtf( static_cast<float>( head_dim ) );
 #if defined(USE_ROCM)

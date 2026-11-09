@@ -64,6 +64,7 @@ pod::KVRef KVCachePool::ref() const {
 	r.vs = v_scale;
 	r.kq = pod::kv_k_quant( format );
 	r.vq = pod::kv_v_quant( format );
+	r.ring = ring;
 	return r;
 }
 

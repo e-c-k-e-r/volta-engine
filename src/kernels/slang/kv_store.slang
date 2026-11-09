@@ -13,6 +13,7 @@ struct KvStoreParams {
 	int count;
 	int total_elems;
 	int max_seq;
+	int ring;         // > 0: position p goes to row p % ring (a sliding-window cache)
 };
 
 [shader("compute")]
@@ -22,7 +23,7 @@ void kv_store_f16(uint3 tid : SV_DispatchThreadID, uniform KvStoreParams p) {
 	if (i >= int64_t(p.count) * p.total_elems) return;
 	let m = int(i / p.total_elems);
 	let e = i - int64_t(m) * p.total_elems;
-	let dst = int64_t(p.slots[m]) * p.slot_stride + (int64_t(p.layer_idx) * p.max_seq + p.positions[m]) * p.total_elems + e;
+	let dst = int64_t(p.slots[m]) * p.slot_stride + (int64_t(p.layer_idx) * p.max_seq + (p.ring > 0 ? p.positions[m] % p.ring : p.positions[m])) * p.total_elems + e;
 	p.data[dst] = p.src[i];
 }
 
@@ -38,6 +39,7 @@ struct KvStoreQParams {
 	int total_elems;
 	int max_seq;
 	int q;            // 0 F16, 1 E5M2, 2 I8, 3 Q4, 4 FP4
+	int ring;
 };
 
 [shader("compute")]
@@ -49,6 +51,6 @@ void kv_store_q(uint3 tid : SV_DispatchThreadID, uniform KvStoreQParams p) {
 	if (u >= int64_t(p.count) * per_row) return;
 	let m = int(u / per_row);
 	let e0 = (u - int64_t(m) * per_row) * unit;
-	let dst = int64_t(p.slots[m]) * p.slot_stride + (int64_t(p.layer_idx) * p.max_seq + p.positions[m]) * p.total_elems + e0;
+	let dst = int64_t(p.slots[m]) * p.slot_stride + (int64_t(p.layer_idx) * p.max_seq + (p.ring > 0 ? p.positions[m] % p.ring : p.positions[m])) * p.total_elems + e0;
 	kv_store_unit(p.data, p.scales, p.q, dst, p.src + int64_t(m) * p.total_elems + e0);
 }

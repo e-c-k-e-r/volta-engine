@@ -23,6 +23,7 @@ struct KVCachePool {
 	int num_layers = 0;
 	int num_heads = 0;
 	int head_dim = 0;
+	int ring = 0;                       // > 0: the pool is a ring of max_seq_len rows per layer (KVRef::ring)
 
 	// format: kv_format = fp16 | fp8 | k8v4 | nvfp4 overrides the argument.
 	bool init( int device_id, pod::MemoryArena& arena, int max_slots, int max_seq_len, int num_layers, int num_heads, int head_dim,

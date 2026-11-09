@@ -50,7 +50,11 @@ bool Gemma4Pipeline::init( const Gemma4Config& config, int rank, pod::MemoryAren
 
 	for ( int L = 0; L < config_.num_layers; ++L ) layers_[L].is_full = ( L + 1 ) % config_.full_every == 0;
 	const int n_full = config_.num_layers / config_.full_every;
-	swa_pool_.init( rank_, arena, S, config_.max_seq, config_.num_layers - n_full, swa_kv_heads_, config_.swa_head_dim );
+	// The sliding-window layers keep a ring of window + MAX_ROWS rows: a forward stores all its rows before attending, so a chunk's
+	// first row still finds its window after the chunk's last row was written. A context no longer than that keeps every position.
+	const int swa_ring = config_.max_seq > config_.swa_window + R ? config_.swa_window + R : 0;
+	swa_pool_.init( rank_, arena, S, swa_ring > 0 ? swa_ring : config_.max_seq, config_.num_layers - n_full, swa_kv_heads_, config_.swa_head_dim );
+	swa_pool_.ring = swa_ring;
 	full_pool_.init( rank_, arena, S, config_.max_seq, n_full, full_kv_heads_, config_.full_head_dim );
 
 	const int H = config_.hidden_size;
@@ -416,8 +420,8 @@ void Gemma4Pipeline::layer_forward( const Gemma4LayerWeights& lw, int kv_layer, 
 	if ( lw.is_full ) RoPE::forward( q, k, q_heads_, kvh, hd, hd, d_rows_, m, config_.full_rope_theta, stream, false, config_.full_rot_pairs );
 	else RoPE::forward( q, k, q_heads_, kvh, hd, hd, d_rows_, m, config_.swa_rope_theta, stream );
 
-	Attention::store_kv_cache( kv, k, v, pool.slot_stride_elems, kv_layer, d_rows_, m, kvh, hd, config_.max_seq, stream );
-	Attention::forward_decode( kv, q, pod::TensorView{}, o, pool.slot_stride_elems, kv_layer, d_rows_, m, q_heads_, kvh, hd, config_.max_seq, stream,
+	Attention::store_kv_cache( kv, k, v, pool.slot_stride_elems, kv_layer, d_rows_, m, kvh, hd, pool.max_seq_len, stream );
+	Attention::forward_decode( kv, q, pod::TensorView{}, o, pool.slot_stride_elems, kv_layer, d_rows_, m, q_heads_, kvh, hd, pool.max_seq_len, stream,
 		1.0f, lw.is_full ? 0 : config_.swa_window );
 
 	Linear::forward( o, lw.o_proj, mlp_out_, stream );
@@ -477,10 +481,16 @@ void Gemma4Pipeline::destroy() {
 }
 
 // -- Sequence snapshots (prefix cache). Host layout: the drafter tap rows (with taps), the sliding pool's layers, then the full pool's; per
-// layer K data, K scales, V data, V scales of positions [from, tokens).
+// layer K data, K scales, V data, V scales of positions [from, tokens). The sliding pool keeps only the last window of the range: a
+// restore needs the window before its end, which this segment and its parents' last windows cover.
 namespace {
 
 constexpr size_t kSeqAlign = 256;
+
+// First position of [from, tokens) a pool's segment keeps
+int kept_from( const engine::runtime::KVCachePool& pool, int window, int from, int tokens ) {
+	return pool.ring > 0 ? std::max( from, tokens - window ) : from;
+}
 
 size_t pool_rows_bytes( const engine::runtime::KVCachePool& pool, int rows ) {
 	const size_t row_elems = static_cast<size_t>( pool.num_heads ) * pool.head_dim;
@@ -498,13 +508,14 @@ size_t Gemma4Pipeline::tap_snapshot_bytes( int tokens ) const {
 
 size_t Gemma4Pipeline::seq_state_bytes( int from, int tokens, bool with_taps ) const {
 	if ( !swa_pool_.k_data || from < 0 || tokens < from || tokens > config_.max_seq ) return 0;
-	return ( with_taps ? tap_snapshot_bytes( tokens ) : 0 ) + pool_rows_bytes( swa_pool_, tokens - from ) + pool_rows_bytes( full_pool_, tokens - from ) + kSeqAlign;
+	const int swa_from = kept_from( swa_pool_, config_.swa_window, from, tokens );
+	return ( with_taps ? tap_snapshot_bytes( tokens ) : 0 ) + pool_rows_bytes( swa_pool_, tokens - swa_from ) + pool_rows_bytes( full_pool_, tokens - from ) + kSeqAlign;
 }
 
 void Gemma4Pipeline::copy_kv_rows( const engine::runtime::KVCachePool& pool, int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream ) {
+	from = kept_from( pool, config_.swa_window, from, tokens );
 	const size_t row_elems = static_cast<size_t>( pool.num_heads ) * pool.head_dim;
-	const size_t count = static_cast<size_t>( tokens - from );
-	if ( count == 0 ) return;
+	if ( tokens <= from ) return;
 	const pod::KVQ kqs[2] = { pod::kv_k_quant( pool.format ), pod::kv_v_quant( pool.format ) };
 	char* data_base[2] = { static_cast<char*>( pool.k_data ), static_cast<char*>( pool.v_data ) };
 	char* scale_base[2] = { static_cast<char*>( pool.k_scale ), static_cast<char*>( pool.v_scale ) };
@@ -512,18 +523,24 @@ void Gemma4Pipeline::copy_kv_rows( const engine::runtime::KVCachePool& pool, int
 	const size_t slot_scale[2] = { pool.k_scale_slot_bytes, pool.v_scale_slot_bytes };
 	const backend::Copy dir = to_host ? backend::Copy::D2H : backend::Copy::H2D;
 	for ( int layer = 0; layer < pool.num_layers; ++layer ) {
-		const size_t elem0 = ( static_cast<size_t>( layer ) * pool.max_seq_len + from ) * row_elems;
 		for ( int kv = 0; kv < 2; ++kv ) {
-			const size_t db = pod::kv_data_bytes( kqs[kv], row_elems * count );
-			char* dev = data_base[kv] + static_cast<size_t>( slot_id ) * slot_data[kv] + pod::kv_data_bytes( kqs[kv], elem0 );
-			if ( to_host ) backend::memcpy_async( host, dev, db, dir, stream );
-			else backend::memcpy_async( dev, host, db, dir, stream );
-			host += db;
-			if ( const size_t sb = pod::kv_scale_bytes( kqs[kv], row_elems * count ) ) {
-				char* sdev = scale_base[kv] + static_cast<size_t>( slot_id ) * slot_scale[kv] + pod::kv_scale_bytes( kqs[kv], elem0 );
-				if ( to_host ) backend::memcpy_async( host, sdev, sb, dir, stream );
-				else backend::memcpy_async( sdev, host, sb, dir, stream );
-				host += sb;
+			// positions [from, tokens) in runs of contiguous cache rows (a ring wraps at most once over a kept range)
+			for ( int p = from; p < tokens; ) {
+				const int row = pool.ring > 0 ? p % pool.ring : p;
+				const int n = pool.ring > 0 ? std::min( tokens - p, pool.ring - row ) : tokens - p;
+				const size_t elem0 = ( static_cast<size_t>( layer ) * pool.max_seq_len + row ) * row_elems;
+				const size_t db = pod::kv_data_bytes( kqs[kv], row_elems * n );
+				char* dev = data_base[kv] + static_cast<size_t>( slot_id ) * slot_data[kv] + pod::kv_data_bytes( kqs[kv], elem0 );
+				if ( to_host ) backend::memcpy_async( host, dev, db, dir, stream );
+				else backend::memcpy_async( dev, host, db, dir, stream );
+				host += db;
+				if ( const size_t sb = pod::kv_scale_bytes( kqs[kv], row_elems * n ) ) {
+					char* sdev = scale_base[kv] + static_cast<size_t>( slot_id ) * slot_scale[kv] + pod::kv_scale_bytes( kqs[kv], elem0 );
+					if ( to_host ) backend::memcpy_async( host, sdev, sb, dir, stream );
+					else backend::memcpy_async( sdev, host, sb, dir, stream );
+					host += sb;
+				}
+				p += n;
 			}
 		}
 	}
@@ -538,7 +555,7 @@ bool Gemma4Pipeline::save_seq_state( int slot_id, int from, int tokens, bool wit
 		dst += tap_bytes;
 	}
 	copy_kv_rows( swa_pool_, slot_id, from, tokens, dst, true, stream );
-	copy_kv_rows( full_pool_, slot_id, from, tokens, dst + pool_rows_bytes( swa_pool_, tokens - from ), true, stream );
+	copy_kv_rows( full_pool_, slot_id, from, tokens, dst + pool_rows_bytes( swa_pool_, tokens - kept_from( swa_pool_, config_.swa_window, from, tokens ) ), true, stream );
 	return true;
 }
 
@@ -551,7 +568,7 @@ bool Gemma4Pipeline::load_seq_state( int slot_id, int from, int tokens, bool wit
 		src += tap_bytes;
 	}
 	copy_kv_rows( swa_pool_, slot_id, from, tokens, src, false, stream );
-	copy_kv_rows( full_pool_, slot_id, from, tokens, src + pool_rows_bytes( swa_pool_, tokens - from ), false, stream );
+	copy_kv_rows( full_pool_, slot_id, from, tokens, src + pool_rows_bytes( swa_pool_, tokens - kept_from( swa_pool_, config_.swa_window, from, tokens ) ), false, stream );
 	return true;
 }
 

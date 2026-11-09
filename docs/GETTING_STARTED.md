@@ -172,8 +172,8 @@ Qwen extras:
 * **Gemma 4 31B** (`gemma4`, the text model of `google/gemma-4-31B-it`): EXL3 (exllamav3's conversions), NVFP4 (modelopt: the MLP in NVFP4,
   attention and the tied head dense; `nvfp4_dense=attn,head` quantizes those at load, which on one GPU is needed to fit and takes minutes) and GGUF
   (llama.cpp's `gemma4` architecture, e.g. the QAT Q4_0 release; the directory also needs the original `config.json`, tokenizer files and chat
-  template). Sliding-window layers keep a full-length KV cache and mask to the window, so `max_seq` sizes the cache of all 60 layers (about 0.9 MB
-  a token at TP=1, a quarter of that per rank at TP=4). The DFlash drafter `z-lab/gemma-4-31B-it-DFlash` (a DFlash v1 `DFlashDraftModel`: no convs
+  template). The 50 sliding-window layers keep a ring of 1536 positions per slot (the window and one prefill chunk: 1.3 GB at TP=1), the 10
+  full-attention layers every position (80 KB a token at TP=1, 20 KB per rank at TP=4); prefix-cache snapshots keep the sliding layers' last window. The DFlash drafter `z-lab/gemma-4-31B-it-DFlash` (a DFlash v1 `DFlashDraftModel`: no convs
   or selector, the head's argmax per row, a 16-row block of which the first 8 rows are verified, one full-attention layer whose context is every
   position the drafter has ingested) loads through `draft_model_dir`, also as an EXL3 conversion. At TP=4 decode is 20 ms a token, about 100 tok/s
   with the drafter (4.3 tokens a round on the bench prompts). Images (the vision tower and the `mmproj` file) are not read yet.

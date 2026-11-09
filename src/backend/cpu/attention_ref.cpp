@@ -17,6 +17,7 @@ struct RefAttnParams {
 	float scale;
 	uint8_t* ks; uint8_t* vs; int kq; int vq;
 	int window;
+	int ring;
 };
 
 extern "C" void ref_attn_decode_cpu( ComputeVaryingInput*, void*, void* ) __attribute__(( weak ));
@@ -34,7 +35,7 @@ void ref_attention( const pod::KVRef& kv, const pod::TensorView& q, const pod::T
 	RefAttnParams p{ const_cast<half*>( q.ptr<const half>() ), static_cast<half*>( kv.k ), static_cast<half*>( kv.v ), gate.data != nullptr ? const_cast<half*>( gate.ptr<const half>() ) : nullptr, out.ptr<half>(),
 		const_cast<int*>( d_rows->slot ), const_cast<int*>( d_rows->pos ), static_cast<int64_t>( slot_stride ), layer_idx, num_q_heads, num_kv_heads,
 		head_dim, max_seq, gate.data != nullptr ? 1 : 0, scale > 0.0f ? scale : 1.0f / std::sqrt( static_cast<float>( head_dim ) ),
-		static_cast<uint8_t*>( kv.ks ), static_cast<uint8_t*>( kv.vs ), static_cast<int>( kv.kq ), static_cast<int>( kv.vq ), window };
+		static_cast<uint8_t*>( kv.ks ), static_cast<uint8_t*>( kv.vs ), static_cast<int>( kv.kq ), static_cast<int>( kv.vq ), window, kv.ring };
 	ENGINE_ASSERT( kv.vq != pod::KVQ::Q4 || head_dim % 64 == 0, "Attention (CPU): Q4 values need head_dim % 64 == 0" );
 	impl::cpu_dispatch( ref_attn_decode_cpu, &p, num_q_heads, count );
 }

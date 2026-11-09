@@ -2,7 +2,7 @@
 // tokens, snapshots the slot (recurrent state + KV rows), restores into other slots and prefills only the tail; the
 // next-token candidates and 16 greedy continuation tokens must match the cold run. An aligned cut (a multiple of the
 // prefill chunk) reproduces the cold chunk boundaries and must match bit for bit.
-//   test_prefix_restore [--glm | --flash] [--spec] [--tokens N] [--cut N ...]   (ENGINE_KV_FORMAT=fp8|k8v4|nvfp4 selects a quantized KV cache; GLM stores its latent in that format)
+//   test_prefix_restore [--glm | --flash | --gemma <dir> [--draft <dir>]] [--spec] [--tokens N] [--cut N ...]   (ENGINE_KV_FORMAT=fp8|k8v4|nvfp4 selects a quantized KV cache; GLM stores its latent in that format)
 #include "engine/runtime/test_driver.h"
 #include "engine/runtime/prefix_cache.h"
 #include "engine/loader/tokenizer.h"
@@ -45,33 +45,37 @@ int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	int n_tokens = 6000;
 	bool spec = false, glm = false, flash = false;
+	const char* gemma_dir = nullptr;   // Gemma 4 (its turn format; --draft names the drafter for --spec)
+	const char* draft_dir = nullptr;
 	std::vector<int> cuts_arg;   // --cut N (repeatable): snapshot at these positions instead of the two default cuts
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--spec" ) ) spec = true;
 		else if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
 		else if ( !std::strcmp( argv[i], "--flash" ) ) flash = true;
+		else if ( !std::strcmp( argv[i], "--gemma" ) && i + 1 < argc ) gemma_dir = argv[++i];
+		else if ( !std::strcmp( argv[i], "--draft" ) && i + 1 < argc ) draft_dir = argv[++i];
 		if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--cut" ) && i + 1 < argc ) cuts_arg.push_back( std::atoi( argv[++i] ) );
 	}
 	engine::loader::Tokenizer tok;
-	const char* model_dir = glm ? test::GLM_DIR : ( flash ? test::FLASH_DIR : test::QWEN_DIR );
+	const char* model_dir = gemma_dir ? gemma_dir : glm ? test::GLM_DIR : ( flash ? test::FLASH_DIR : test::QWEN_DIR );
 	ENGINE_ASSERT( tok.load( model_dir ), "tokenizer load failed" );
-	std::vector<int> ids = glm ? tok.encode( "[gMASK]<sop><|user|>", false ) : std::vector<int>{ 248045, 846, 198 };
+	std::vector<int> ids = gemma_dir ? std::vector<int>{ 2, 105, 2364, 107 } : glm ? tok.encode( "[gMASK]<sop><|user|>", false ) : std::vector<int>{ 248045, 846, 198 };
 	for ( int i = 0; static_cast<int>( ids.size() ) < n_tokens; ++i ) {
 		const std::string s = "Note " + std::to_string( i ) + ": the weather in district " + std::to_string( i * 7 % 101 ) + " was mild on day " + std::to_string( i % 365 ) + ". ";
 		const std::vector<int> t = tok.encode( s, false );
 		ids.insert( ids.end(), t.begin(), t.end() );
 	}
 	ids.resize( n_tokens );
-	const std::vector<int> end = glm ? tok.encode( "\n\nWhat is the weather in district 7?<|assistant|></think>", false ) : std::vector<int>{ 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271 };
+	const std::vector<int> end = gemma_dir ? std::vector<int>{ 106, 107, 105, 4368, 107 } : glm ? tok.encode( "\n\nWhat is the weather in district 7?<|assistant|></think>", false ) : std::vector<int>{ 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271 };
 	ids.insert( ids.end(), end.begin(), end.end() );
 	const int n = static_cast<int>( ids.size() );
 
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm5_next" : ( flash ? "qwen4_exp" : "qwen3_5" );
+	cfg.model_type = gemma_dir ? "gemma4" : glm ? "glm5_next" : ( flash ? "qwen4_exp" : "qwen3_5" );
 	cfg.model_dir = model_dir;
-	if ( spec ) cfg.draft_model_dir = glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR;
+	if ( spec ) cfg.draft_model_dir = draft_dir ? draft_dir : glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	ENGINE_ASSERT( mc.snapshot_bytes( 0, 1024 ) > 0, "the model cannot snapshot" );
 	mc.warm_graphs( 8 );

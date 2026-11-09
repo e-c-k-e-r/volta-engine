@@ -73,8 +73,8 @@ struct GatesParams { half* norm_hidden; half* in_proj_a; half* in_proj_b; half* 
 struct ConvRowsParams { half* qkv; float* history; half* weights; int* slots; float* snap; int* snap_on; int channels; int rows; int snap_rows; int has_weights; int64_t slot_stride; int64_t snap_stride; };
 struct ConvTiledParams { half* src; half* dst; float* history; half* weights; int* slots; int channels; int rows; int tile_rows; int has_weights; int64_t slot_stride; };
 struct RecurrentParams { float* state; half* qkv; float* gate; float* beta; half* output; int* slots; float* snap; int* snap_on; int h_k; int h_v; int rows; int snap_rows; float scale; int64_t slot_stride; int64_t snap_stride; };
-struct KvStoreParams { half* data; half* src; int* slots; int* positions; int64_t slot_stride; int layer_idx; int count; int total_elems; int max_seq; };
-struct KvStoreQParams { uint8_t* data; uint8_t* scales; half* src; int* slots; int* positions; int64_t slot_stride; int layer_idx; int count; int total_elems; int max_seq; int q; };
+struct KvStoreParams { half* data; half* src; int* slots; int* positions; int64_t slot_stride; int layer_idx; int count; int total_elems; int max_seq; int ring; };
+struct KvStoreQParams { uint8_t* data; uint8_t* scales; half* src; int* slots; int* positions; int64_t slot_stride; int layer_idx; int count; int total_elems; int max_seq; int q; int ring; };
 struct InitStreamsParams { half* in_; float* streams; int hidden_size; };
 struct ApplyParams { float* x_in; float* x_out; half* y; float* post; float* comb; int hidden_size; int has_comb; };
 struct PartialsParams { float* streams; float* fn; float* partials; int row_len; int chunk_cols; int num_chunks; };

@@ -520,8 +520,8 @@ private:
 	size_t kv_off_[8] = {};
 	int ring_l_[8] = {};
 	struct LayerKV {
-		half* k;
-		half* v;
+		backend::half_t* k;
+		backend::half_t* v;
 		int ring;          // context slots; the block's own rows follow at slot `ring`
 		int layer;         // the layer index the cache kernels take (0 with a ring per layer)
 		int stride_slot;

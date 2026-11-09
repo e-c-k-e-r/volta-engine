@@ -31,6 +31,7 @@ struct RefAttnParams {
 	int kq;
 	int vq;
 	int window;       // > 0: attend to positions pos - window + 1 .. pos only
+	int ring;         // > 0: position t is cache row t % ring (a sliding-window cache, window <= ring)
 };
 
 float ref_kv_k(RefAttnParams p, int64_t i) {
@@ -59,7 +60,7 @@ void ref_attn_decode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, unifo
 	let m = int(gid.y);
 	let per_kv = max(p.num_q_heads / p.num_kv_heads, 1);
 	let kv_head = head / per_kv;
-	let total = min(p.pos[m] + 1, p.max_seq);
+	let total = p.ring > 0 ? p.pos[m] + 1 : min(p.pos[m] + 1, p.max_seq);
 	let first = p.window > 0 ? max(0, total - p.window) : 0;
 	let row_elems = p.num_kv_heads * p.head_dim;
 	let base = int64_t(p.slots[m]) * p.slot_stride + int64_t(p.layer_idx) * p.max_seq * row_elems + kv_head * p.head_dim;
@@ -79,7 +80,7 @@ void ref_attn_decode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, unifo
 		// thread t scores key t0 + t
 		float score = -1e30f;
 		if (t < nk) {
-			let kp = base + int64_t(t0 + t) * row_elems;
+			let kp = base + int64_t(p.ring > 0 ? (t0 + t) % p.ring : t0 + t) * row_elems;
 			float dot = 0.0f;
 			for (int d = 0; d < p.head_dim; ++d) dot = fma(s_q[d], ref_kv_k(p, kp + d), dot);
 			score = dot * p.scale;
@@ -106,10 +107,10 @@ void ref_attn_decode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, unifo
 		o0 *= alpha;
 		o1 *= alpha;
 		if (active0) {
-			for (int k = 0; k < nk; ++k) o0 = fma(s_s[k], ref_kv_v(p, base + int64_t(t0 + k) * row_elems + t), o0);
+			for (int k = 0; k < nk; ++k) o0 = fma(s_s[k], ref_kv_v(p, base + int64_t(p.ring > 0 ? (t0 + k) % p.ring : t0 + k) * row_elems + t), o0);
 		}
 		if (active1) {
-			for (int k = 0; k < nk; ++k) o1 = fma(s_s[k], ref_kv_v(p, base + int64_t(t0 + k) * row_elems + t + 256), o1);
+			for (int k = 0; k < nk; ++k) o1 = fma(s_s[k], ref_kv_v(p, base + int64_t(p.ring > 0 ? (t0 + k) % p.ring : t0 + k) * row_elems + t + 256), o1);
 		}
 		GroupMemoryBarrierWithGroupSync();   // s_s / s_red are rewritten by the next tile
 	}
@@ -145,7 +146,7 @@ void ref_attn_decode_cpu(uint3 gid : SV_GroupID, uniform RefAttnParams p) {
 	let m = int(gid.y);
 	let per_kv = max(p.num_q_heads / p.num_kv_heads, 1);
 	let kv_head = head / per_kv;
-	let total = min(p.pos[m] + 1, p.max_seq);
+	let total = p.ring > 0 ? p.pos[m] + 1 : min(p.pos[m] + 1, p.max_seq);
 	let row_elems = p.num_kv_heads * p.head_dim;
 	let base = int64_t(p.slots[m]) * p.slot_stride + int64_t(p.layer_idx) * p.max_seq * row_elems + kv_head * p.head_dim;
 	let qo = (int64_t(m) * p.num_q_heads + head) * p.head_dim;
@@ -158,14 +159,14 @@ void ref_attn_decode_cpu(uint3 gid : SV_GroupID, uniform RefAttnParams p) {
 	}
 	float mx = -1e30f;
 	for (int t = first; t < total; ++t) {
-		let kp = base + int64_t(t) * row_elems;
+		let kp = base + int64_t(p.ring > 0 ? t % p.ring : t) * row_elems;
 		float dot = 0.0f;
 		for (int d = 0; d < p.head_dim; ++d) dot = fma(qf[d], ref_kv_k(p, kp + d), dot);
 		mx = max(mx, dot * p.scale);
 	}
 	float l = 0.0f;
 	for (int t = first; t < total; ++t) {
-		let kp = base + int64_t(t) * row_elems;
+		let kp = base + int64_t(p.ring > 0 ? t % p.ring : t) * row_elems;
 		float dot = 0.0f;
 		for (int d = 0; d < p.head_dim; ++d) dot = fma(qf[d], ref_kv_k(p, kp + d), dot);
 		let pk = exp(dot * p.scale - mx);

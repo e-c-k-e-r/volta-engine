@@ -26,7 +26,7 @@ void Attention::store_kv_cache(
 			const int unit = ( q == pod::KVQ::I8 || q == pod::KVQ::Q4 ) ? 64 : ( q == pod::KVQ::FP4 ? 16 : 1 );
 			ENGINE_ASSERT( total_elems % unit == 0, "KV store: row width must be a multiple of the quantization group" );
 			KvStoreQParams p{ static_cast<uint8_t*>( data ), static_cast<uint8_t*>( scales ), const_cast<half*>( src.ptr<const half>() ), const_cast<int*>( d_rows->slot ),
-				const_cast<int*>( d_rows->pos ), static_cast<int64_t>( slot_stride ), layer_idx, count, total_elems, max_seq, static_cast<int>( q ) };
+				const_cast<int*>( d_rows->pos ), static_cast<int64_t>( slot_stride ), layer_idx, count, total_elems, max_seq, static_cast<int>( q ), kv.ring };
 			impl::cpu_dispatch( ::kv_store_q, &p, ( count * ( total_elems / unit ) + 127 ) / 128 );
 		};
 		store( kv.k, kv.ks, k, kv.kq );
@@ -35,7 +35,7 @@ void Attention::store_kv_cache(
 	}
 	const int groups = ( count * total_elems + 127 ) / 128;
 	KvStoreParams pk{ static_cast<half*>( kv.k ), const_cast<half*>( k.ptr<const half>() ), const_cast<int*>( d_rows->slot ), const_cast<int*>( d_rows->pos ),
-		static_cast<int64_t>( slot_stride ), layer_idx, count, total_elems, max_seq };
+		static_cast<int64_t>( slot_stride ), layer_idx, count, total_elems, max_seq, kv.ring };
 	impl::cpu_dispatch( ::kv_store_f16, &pk, groups );
 	KvStoreParams pv = pk;
 	pv.data = static_cast<half*>( kv.v );

@@ -49,8 +49,8 @@ struct ConvRowsParams { uint64_t qkv, history, weights, slots, snap, snap_on; in
 struct ConvTiledParams { uint64_t src, dst, history, weights, slots; int channels, rows, tile_rows, has_weights; int64_t slot_stride; };
 struct RecurrentParams { uint64_t state, qkv, gate, beta, output, slots, snap, snap_on; int h_k, h_v, rows, snap_rows; float scale; int64_t slot_stride, snap_stride; };
 struct GatedNormParams { uint64_t attn_out, z, norm_weight; int num_v_heads, head_dim, use_sigmoid, has_z, has_weight; };
-struct KvStoreParams { uint64_t data, src, slots, positions; int64_t slot_stride; int layer_idx, count, total_elems, max_seq; };
-struct KvStoreQParams { uint64_t data, scales, src, slots, positions; int64_t slot_stride; int layer_idx, count, total_elems, max_seq, q; };
+struct KvStoreParams { uint64_t data, src, slots, positions; int64_t slot_stride; int layer_idx, count, total_elems, max_seq, ring; };
+struct KvStoreQParams { uint64_t data, scales, src, slots, positions; int64_t slot_stride; int layer_idx, count, total_elems, max_seq, q, ring; };
 struct InitStreamsParams { uint64_t in_, streams; int hidden_size; };
 struct HeadMeanParams { uint64_t streams, final_hidden; int hidden_size; };
 struct PrepParams { uint64_t proj, ln_w, ln_b, plane, w_out, slots, positions; int layer; int64_t plane_slot_stride; };
@@ -64,7 +64,7 @@ struct RefGemmParams { uint64_t x, w, out_; int m, k, n; };
 namespace engine::backend::impl {
 struct RefReconParams { uint64_t codes, out_; int k_dim, n_dim, bits, cb; };
 struct RefHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };
-struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq, window; };
+struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq, window, ring; };
 struct RefUnpackParams { uint64_t qg, q, gate; int total, head_dim; };
 } // namespace engine::backend::impl
 

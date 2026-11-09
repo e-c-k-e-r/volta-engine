@@ -80,6 +80,7 @@ struct KVRef {
 	KVQ kq = KVQ::F16;
 	KVQ vq = KVQ::F16;
 	KVPages pages;            // the latent cache of GLM only
+	int ring = 0;             // > 0: a sliding-window cache of `ring` rows per layer, position p in row p % ring (max_seq is then `ring`)
 };
 
 inline KVRef kv_ref_f16( const void* k, const void* v ) {
