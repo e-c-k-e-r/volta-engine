@@ -38,6 +38,9 @@ struct MmqParams { uint32_t M, N, K, stride_a, stride_b, stride_d, batch_stride_
 // llama.cpp's mat-vec push constants with MUL_MAT_ID
 struct MmvIdParams { uint32_t ncols, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, fusion_flags, nei0, ne11, expert_i1, nbi1; };
 struct MoeLocalIdsParams { uint64_t ids, out_; int n, start, end; };
+struct MoeRowMapParams { uint64_t ids, map; int n_routes, top_k, experts, bn, row_ids_offset; };
+// llama.cpp's matmul push constants with MUL_MAT_ID
+struct MmIdParams { uint32_t M, N, K, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, nei0, nei1, nbi1, ne11, n_experts, row_ids_offset; };
 struct GgufDequantParams { uint64_t w, tables, out_; int64_t elems; int type; };
 
 const void* tables() {
@@ -211,6 +214,33 @@ backend::vk::Pipeline* mmvid_pipeline( GgmlType type ) {
 	c[static_cast<int>( type )] = p;
 	return p;
 }
+// The expert-indexed matmuls (MUL_MAT_ID): the int8 one for its types (q8_1 activations), else the dequantizing one (FP16 activations),
+// both on the medium tile so one row map (64-row tiles) serves a layer's three parts
+backend::vk::Pipeline* mm_id_pipeline( GgmlType type, bool& q8 ) {
+	static std::mutex mu;
+	static std::map<int, std::pair<backend::vk::Pipeline*, bool>> cache[64];
+	std::lock_guard<std::mutex> lk( mu );
+	auto& c = cache[backend::get_device()];
+	auto it = c.find( static_cast<int>( type ) );
+	if ( it != c.end() ) {
+		q8 = it->second.second;
+		return it->second.first;
+	}
+	backend::vk::Pipeline* p = nullptr;
+	q8 = mmq_type( type ) && backend::vk::int_dot();
+	if ( backend::vk::bound_pipelines() && ( q8 || mm_type( type ) ) ) {
+		const char* dir = std::getenv( "ENGINE_SPV_DIR" );
+		const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + ( q8 ? "/ggml_mmqid_" : "/ggml_mmid_" ) + std::to_string( static_cast<int>( type ) ) + ".spv";
+		const MmqTile tile = mmq_tile( type, false );
+		uint32_t spec[12];
+		for ( int i = 0; i < 11; ++i ) spec[i] = tile.spec[i];
+		spec[11] = 1;   // ALIGNED (mul_mm)
+		p = backend::vk::pipeline_create_bound( path.c_str(), sizeof( MmIdParams ), 5, spec, q8 ? 11 : 12 );   // A, B, D, the ids, the row map
+	}
+	c[static_cast<int>( type )] = { p, q8 };
+	return p;
+}
+
 int block_elems( GgmlType t ) {
 	switch ( t ) {
 		case GgmlType::Q4_0: case GgmlType::Q4_1: case GgmlType::Q5_0: case GgmlType::Q5_1: case GgmlType::Q8_0: case GgmlType::IQ4_NL: return 32;
@@ -340,15 +370,69 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	else vki::launch( "gguf_gemv_sg", p, stream, static_cast<uint32_t>( ( n + 3 ) / 4 ), static_cast<uint32_t>( ( m + 7 ) / 8 ) );
 }
 
-// Vulkan MoE::forward for GGUF experts on up to 8 rows without leaving the device: the routes' local expert ids, then per row llama.cpp's
-// expert-indexed mat-vec over the row's top-k experts (gate and up from the row, down from each slot's activation), SwiGLU, and the weighted
-// sum of the slots in route order (moe_combine_routes). False (nothing run) when the shaders are missing, there are more rows or the experts
-// are not stacked; the caller then routes on the host. The row count of the scratch is fixed at the first call (graph capture)
-bool moe_gguf_device( const pod::TensorView& x, const pod::MoELayerWeights& w, const int* d_idx, const backend::half_t* d_w, pod::TensorView& out, int start, int end,
+// More than 8 rows: llama.cpp's expert-indexed matmuls over the routes grouped by expert in 64-row tiles (moe_row_map), gate and up from
+// the rows (q8_1 or FP16), SwiGLU, down from each route's activation row, then the weighted sum as below. Own scratch slots (a prefill's
+// sizes never move a decode graph's buffers)
+bool moe_gguf_rows( const pod::TensorView& x, const pod::MoELayerWeights& w, const int* d_idx, const backend::half_t* d_w, pod::TensorView& out, int m, int start, int end,
 	float act_limit, backend::stream_t stream ) {
-	constexpr int kMaxRows = 8;
-	const int m = ( out.ndim >= 2 && out.shape[0] > 0 ) ? out.shape[0] : 1;
-	if ( m > kMaxRows || w.type != pod::QuantType::GGUF ) return false;
+	const int E = w.num_local_experts, topk = w.top_k, H = out.shape[out.ndim - 1], I = w.up[0].gguf_n;
+	if ( E > 1024 || m > 65535 ) return false;
+	const pod::LinearWeight* parts[3] = { w.gate, w.up, w.down };
+	const void* base[3];
+	uint32_t stride[3];
+	backend::vk::Pipeline* pipe[3];
+	bool q8[3];
+	for ( int p = 0; p < 3; ++p ) {
+		pipe[p] = mm_id_pipeline( static_cast<GgmlType>( parts[p][0].gguf_type ), q8[p] );
+		if ( pipe[p] == nullptr || !expert_stack( parts[p], E, base[p], stride[p] ) ) return false;
+	}
+	if ( H % 128 != 0 || I % 128 != 0 ) return false;   // the q8_1 x4 rows
+	const int routes = m * topk, bn = 64;
+	const int max_tiles = std::min( routes, ( routes + bn - 1 ) / bn + std::min( E, routes ) - 1 );
+	const int row_ids_offset = 1 + 2 * max_tiles;
+	auto* ids = static_cast<int*>( vki::scratch( 25, static_cast<size_t>( routes ) * sizeof( int ), stream ) );
+	auto* map = static_cast<uint32_t*>( vki::scratch( 26, static_cast<size_t>( row_ids_offset + max_tiles * bn ) * sizeof( uint32_t ), stream ) );
+	auto* g = static_cast<backend::half_t*>( vki::scratch( 27, static_cast<size_t>( routes ) * I * sizeof( backend::half_t ), stream ) );
+	auto* u = static_cast<backend::half_t*>( vki::scratch( 28, static_cast<size_t>( routes ) * I * sizeof( backend::half_t ), stream ) );
+	auto* a = static_cast<backend::half_t*>( vki::scratch( 29, static_cast<size_t>( routes ) * I * sizeof( backend::half_t ), stream ) );
+	auto* d = static_cast<backend::half_t*>( vki::scratch( 30, static_cast<size_t>( routes ) * H * sizeof( backend::half_t ), stream ) );
+	MoeLocalIdsParams ip{ vki::dp( d_idx ), vki::dp( ids ), routes, start, end };
+	vki::launch( "moe_local_ids", ip, stream, static_cast<uint32_t>( ( routes + 255 ) / 256 ) );
+	MoeRowMapParams rp{ vki::dp( ids ), vki::dp( map ), routes, topk, E, bn, row_ids_offset };
+	vki::launch( "moe_row_map", rp, stream, 1 );
+	// the activation rows as q8_1 x4 blocks for an int8 part (once per source)
+	auto q81 = [&]( const void* src, int rows, int k, int slot ) {
+		void* q = vki::scratch( slot, static_cast<size_t>( rows ) * ( k / 128 ) * 144, stream );
+		GgufQ81Params qp{ vki::dp( src ), vki::dp( q ), rows, k, 0, 0 };
+		vki::launch( "gguf_quantize_q8_1x4", qp, stream, static_cast<uint32_t>( ( k / 32 + 127 ) / 128 ), static_cast<uint32_t>( rows ) );
+		return q;
+	};
+	const void* xq = ( q8[0] || q8[1] ) ? q81( x.data, m, H, 31 ) : nullptr;
+	const uint32_t uH = static_cast<uint32_t>( H ), uI = static_cast<uint32_t>( I ), uk = static_cast<uint32_t>( topk ), um = static_cast<uint32_t>( m );
+	auto proj = [&]( int p, const void* src, const void* src_q, uint32_t k, uint32_t n, uint32_t ne11, uint32_t b_row_stride, void* dst ) {
+		MmIdParams mp{ n, um * uk, k, k, k, n, stride[p], b_row_stride, n * uk, uk, um, uk, ne11, static_cast<uint32_t>( E ), static_cast<uint32_t>( row_ids_offset ) };
+		const void* bufs[5] = { base[p], q8[p] ? src_q : src, dst, ids, map };
+		backend::vk::dispatch_bound( stream, pipe[p], &mp, bufs, ( n + 63 ) / 64, static_cast<uint32_t>( max_tiles ), 1 );
+	};
+	proj( 0, x.data, xq, uH, uI, 1u, uH, g );
+	proj( 1, x.data, xq, uH, uI, 1u, uH, u );
+	pod::TensorView tg = pod::make_tensor_2d( g, pod::DType::FP16, routes, I );
+	pod::TensorView tu = pod::make_tensor_2d( u, pod::DType::FP16, routes, I );
+	pod::TensorView ta = pod::make_tensor_2d( a, pod::DType::FP16, routes, I );
+	SwiGLU::forward( tg, tu, ta, stream, act_limit );
+	const void* aq = q8[2] ? q81( a, routes, I, 32 ) : nullptr;
+	proj( 2, a, aq, uI, uH, uk, uI * uk, d );
+	vki::MoeCombineParams cp{ vki::dp( d ), vki::dp( d_w ), vki::dp( d_idx ), vki::dp( out.data ), H, topk, start, end };
+	vki::launch( "moe_combine_routes", cp, stream, static_cast<uint32_t>( ( H + 255 ) / 256 ), static_cast<uint32_t>( m ) );
+	return true;
+}
+
+// GGUF experts row by row on llama.cpp's expert-indexed mat-vec without leaving the device: the routes' local expert ids, then per row the
+// mat-vec over the row's top-k experts (gate and up from the row, down from each slot's activation), SwiGLU, and the weighted sum of the
+// slots in route order (moe_combine_routes). The scratch (slots slot0 .. slot0 + 4) holds cap_rows rows. False (nothing run) when the
+// shaders are missing or the experts are not stacked
+bool moe_by_row( const pod::TensorView& x, const pod::MoELayerWeights& w, const int* d_idx, const backend::half_t* d_w, pod::TensorView& out, int m, int start, int end,
+	float act_limit, backend::stream_t stream, int slot0, int cap_rows ) {
 	const int E = w.num_local_experts, topk = w.top_k, H = out.shape[out.ndim - 1], I = w.up[0].gguf_n;
 	const pod::LinearWeight* parts[3] = { w.gate, w.up, w.down };
 	const void* base[3];
@@ -359,12 +443,12 @@ bool moe_gguf_device( const pod::TensorView& x, const pod::MoELayerWeights& w, c
 		if ( pipe[p] == nullptr || !expert_stack( parts[p], E, base[p], stride[p] ) ) return false;
 	}
 	ENGINE_ASSERT( w.gate[0].gguf_k == H && w.down[0].gguf_k == I && w.down[0].gguf_n == H, "MoE (Vulkan): GGUF expert shapes" );
-	const size_t slots = static_cast<size_t>( kMaxRows ) * topk;
-	auto* ids = static_cast<int*>( vki::scratch( 24, slots * sizeof( int ), stream ) );
-	auto* g = static_cast<backend::half_t*>( vki::scratch( 20, slots * I * sizeof( backend::half_t ), stream ) );
-	auto* u = static_cast<backend::half_t*>( vki::scratch( 21, slots * I * sizeof( backend::half_t ), stream ) );
-	auto* a = static_cast<backend::half_t*>( vki::scratch( 22, slots * I * sizeof( backend::half_t ), stream ) );
-	auto* d = static_cast<backend::half_t*>( vki::scratch( 23, slots * H * sizeof( backend::half_t ), stream ) );
+	const size_t slots = static_cast<size_t>( std::max( cap_rows, m ) ) * topk;
+	auto* ids = static_cast<int*>( vki::scratch( slot0, slots * sizeof( int ), stream ) );
+	auto* g = static_cast<backend::half_t*>( vki::scratch( slot0 + 1, slots * I * sizeof( backend::half_t ), stream ) );
+	auto* u = static_cast<backend::half_t*>( vki::scratch( slot0 + 2, slots * I * sizeof( backend::half_t ), stream ) );
+	auto* a = static_cast<backend::half_t*>( vki::scratch( slot0 + 3, slots * I * sizeof( backend::half_t ), stream ) );
+	auto* d = static_cast<backend::half_t*>( vki::scratch( slot0 + 4, slots * H * sizeof( backend::half_t ), stream ) );
 	MoeLocalIdsParams ip{ vki::dp( d_idx ), vki::dp( ids ), m * topk, start, end };
 	vki::launch( "moe_local_ids", ip, stream, static_cast<uint32_t>( ( m * topk + 255 ) / 256 ) );
 	const uint32_t uH = static_cast<uint32_t>( H ), uI = static_cast<uint32_t>( I ), uk = static_cast<uint32_t>( topk );
@@ -388,6 +472,19 @@ bool moe_gguf_device( const pod::TensorView& x, const pod::MoELayerWeights& w, c
 	vki::MoeCombineParams cp{ vki::dp( d ), vki::dp( d_w ), vki::dp( d_idx ), vki::dp( out.data ), H, topk, start, end };
 	vki::launch( "moe_combine_routes", cp, stream, static_cast<uint32_t>( ( H + 255 ) / 256 ), static_cast<uint32_t>( m ) );
 	return true;
+}
+
+// Vulkan MoE::forward for GGUF experts without leaving the device. Up to 8 rows (decode, verify) row by row, the scratch sized for 8 rows at
+// the first call (graph capture); more rows row by row while the routes average under 16 rows per local expert (a 64-row matmul tile
+// would be mostly empty), else on the expert-indexed matmuls, both on their own scratch. False when the caller must route on the host
+bool moe_gguf_device( const pod::TensorView& x, const pod::MoELayerWeights& w, const int* d_idx, const backend::half_t* d_w, pod::TensorView& out, int start, int end,
+	float act_limit, backend::stream_t stream ) {
+	constexpr int kDecodeRows = 8, kTileRowsPerExpert = 16;
+	const int m = ( out.ndim >= 2 && out.shape[0] > 0 ) ? out.shape[0] : 1;
+	if ( w.type != pod::QuantType::GGUF ) return false;
+	if ( m <= kDecodeRows ) return moe_by_row( x, w, d_idx, d_w, out, m, start, end, act_limit, stream, 20, kDecodeRows );
+	if ( m * w.top_k < kTileRowsPerExpert * w.num_local_experts ) return moe_by_row( x, w, d_idx, d_w, out, m, start, end, act_limit, stream, 33, m );
+	return moe_gguf_rows( x, w, d_idx, d_w, out, m, start, end, act_limit, stream );
 }
 
 } // namespace engine::modules

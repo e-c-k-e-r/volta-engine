@@ -902,3 +902,50 @@ void moe_local_ids(uint3 gid : SV_DispatchThreadID, uniform MoeLocalIdsParams p)
 	p.out_[i] = (e >= p.start && e < p.end) ? e - p.start : -1;
 }
 
+// The row map of llama.cpp's expert-indexed matmuls (mul_mm_id_funcs.glsl): [0] the tile count, per tile (expert, rows), then from
+// row_ids_offset per tile `bn` row ids (slot | token << 16): each local expert's routes (ids >= 0) in tiles of bn, expert by expert. One
+// workgroup: counts per expert, the tiles laid out by one thread, then each route placed (the order within an expert does not change any
+// row's sum)
+static const int MAP_EXPERTS = 1024;
+struct MoeRowMapParams { int* ids; uint* map; int n_routes; int top_k; int experts; int bn; int row_ids_offset; };
+groupshared uint s_cnt[MAP_EXPERTS];
+groupshared uint s_tile0[MAP_EXPERTS];
+groupshared uint s_cur[MAP_EXPERTS];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void moe_row_map(uint3 tid : SV_GroupThreadID, uniform MoeRowMapParams p) {
+	let t = int(tid.x);
+	for (int e = t; e < p.experts; e += 256) {
+		s_cnt[e] = 0u;
+		s_cur[e] = 0u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+	for (int r = t; r < p.n_routes; r += 256) {
+		let e = p.ids[r];
+		if (e >= 0) InterlockedAdd(s_cnt[e], 1u);
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (t == 0) {
+		uint tiles = 0u;
+		for (int e = 0; e < p.experts; ++e) {
+			s_tile0[e] = tiles;
+			let c = s_cnt[e];
+			for (uint j = 0u; j * uint(p.bn) < c; ++j) {
+				p.map[1u + 2u * tiles] = uint(e);
+				p.map[2u + 2u * tiles] = min(uint(p.bn), c - j * uint(p.bn));
+				++tiles;
+			}
+		}
+		p.map[0] = tiles;
+	}
+	GroupMemoryBarrierWithGroupSync();
+	for (int r = t; r < p.n_routes; r += 256) {
+		let e = p.ids[r];
+		if (e < 0) continue;
+		uint pos;
+		InterlockedAdd(s_cur[e], 1u, pos);
+		p.map[uint(p.row_ids_offset) + s_tile0[e] * uint(p.bn) + pos] = (uint(r % p.top_k) & 0xffffu) | (uint(r / p.top_k) << 16);
+	}
+}
+
