@@ -48,7 +48,10 @@ struct Ctx {
 	VkCommandPool pool = VK_NULL_HANDLE;
 	VkPhysicalDeviceMemoryProperties mem{};
 	VkPhysicalDeviceProperties props{};
-	PFN_vkCmdPushDescriptorSetKHR push_descriptor = nullptr;   // VK_KHR_push_descriptor: storage buffers bound inside the command buffer
+	PFN_vkCmdPushDescriptorSetKHR push_descriptor = nullptr;
+	bool host_import = false;   // VK_EXT_external_memory_host: a host allocation imported as device-addressable memory
+	bool sem_fd = false;        // VK_KHR_external_semaphore_fd: timeline semaphores shared with the other devices
+	size_t host_import_align = 0;   // VK_KHR_push_descriptor: storage buffers bound inside the command buffer
 	bool int_dot = false;   // shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product) enabled: packed 4 x int8 dot products
 	bool rte16 = false;   // shaderRoundingModeRTEFloat16: float -> half conversions can be made round-to-nearest-even
 	std::map<uint64_t, Alloc> allocs; // keyed by device address
@@ -86,6 +89,8 @@ struct vk_stream {
 	std::vector<VkCommandBuffer> inflight;
 	std::vector<Staging> staging;
 	size_t staging_bytes = 0;
+	std::vector<VkSemaphore> extra_wait, extra_signal;   // the next submission's waits / signals on shared semaphores (stream_wait / stream_signal)
+	std::vector<uint64_t> extra_wait_values, extra_signal_values;
 };
 
 struct vk_graph {
@@ -143,7 +148,7 @@ bool init_context( int dev ) {
 	}
 
 	// Feature requirements of the Slang SPIR-V: PhysicalStorageBufferAddresses, Float16, Int64 (+ Int16 for the BF16 table)
-	bool has_dot_ext = false, has_push_desc = false;
+	bool has_dot_ext = false, has_push_desc = false, has_host_import = false, has_sem_fd = false, has_mem_fd = false;
 	{
 		uint32_t en = 0;
 		vkEnumerateDeviceExtensionProperties( g.phys, nullptr, &en, nullptr );
@@ -152,6 +157,9 @@ bool init_context( int dev ) {
 		for ( const auto& e : ext ) {
 			has_dot_ext = has_dot_ext || std::strcmp( e.extensionName, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME ) == 0;
 			has_push_desc = has_push_desc || std::strcmp( e.extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME ) == 0;
+			has_host_import = has_host_import || std::strcmp( e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME ) == 0;
+			has_sem_fd = has_sem_fd || std::strcmp( e.extensionName, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME ) == 0;
+			has_mem_fd = has_mem_fd || std::strcmp( e.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME ) == 0;
 		}
 	}
 	VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR fdot{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR };
@@ -199,10 +207,20 @@ bool init_context( int dev ) {
 	std::vector<const char*> exts;
 	if ( g.int_dot ) exts.push_back( VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME );
 	if ( has_push_desc ) exts.push_back( VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME );
+	if ( has_host_import ) exts.push_back( VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME );
+	if ( has_sem_fd ) exts.push_back( VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME );
 	dci.enabledExtensionCount = static_cast<uint32_t>( exts.size() );
 	dci.ppEnabledExtensionNames = exts.data();
 	if ( vkCreateDevice( g.phys, &dci, nullptr, &g.device ) != VK_SUCCESS ) return false;
 	if ( has_push_desc ) g.push_descriptor = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>( vkGetDeviceProcAddr( g.device, "vkCmdPushDescriptorSetKHR" ) );
+	g.host_import = has_host_import;
+	g.sem_fd = has_sem_fd;
+	if ( has_host_import ) {
+		VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT };
+		VkPhysicalDeviceProperties2 pp{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &hp };
+		vkGetPhysicalDeviceProperties2( g.phys, &pp );
+		g.host_import_align = hp.minImportedHostPointerAlignment;
+	}
 	vkGetDeviceQueue( g.device, g.family, 0, &g.queue );
 
 	VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
@@ -297,22 +315,32 @@ void barrier( VkCommandBuffer cb, VkPipelineStageFlags dst = VK_PIPELINE_STAGE_C
 	vkCmdPipelineBarrier( cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, dst, 0, 1, &mb, 0, nullptr, 0, nullptr );
 }
 
+// The stream's own timeline orders its submissions; the shared semaphores of stream_wait / stream_signal ride along on the next one
 void submit( vk_stream* s, VkCommandBuffer cb ) {
-	const uint64_t wait = s->value, signal = ++s->value;
-	const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	std::vector<VkSemaphore> waits{ s->timeline }, signals{ s->timeline };
+	std::vector<uint64_t> wait_values{ s->value }, signal_values{ ++s->value };
+	waits.insert( waits.end(), s->extra_wait.begin(), s->extra_wait.end() );
+	wait_values.insert( wait_values.end(), s->extra_wait_values.begin(), s->extra_wait_values.end() );
+	signals.insert( signals.end(), s->extra_signal.begin(), s->extra_signal.end() );
+	signal_values.insert( signal_values.end(), s->extra_signal_values.begin(), s->extra_signal_values.end() );
+	s->extra_wait.clear();
+	s->extra_wait_values.clear();
+	s->extra_signal.clear();
+	s->extra_signal_values.clear();
+	const std::vector<VkPipelineStageFlags> stages( waits.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT );
 	VkTimelineSemaphoreSubmitInfo tsi{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
-	tsi.waitSemaphoreValueCount = 1;
-	tsi.pWaitSemaphoreValues = &wait;
-	tsi.signalSemaphoreValueCount = 1;
-	tsi.pSignalSemaphoreValues = &signal;
+	tsi.waitSemaphoreValueCount = static_cast<uint32_t>( wait_values.size() );
+	tsi.pWaitSemaphoreValues = wait_values.data();
+	tsi.signalSemaphoreValueCount = static_cast<uint32_t>( signal_values.size() );
+	tsi.pSignalSemaphoreValues = signal_values.data();
 	VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO, &tsi };
-	si.waitSemaphoreCount = 1;
-	si.pWaitSemaphores = &s->timeline;
-	si.pWaitDstStageMask = &stage;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cb;
-	si.signalSemaphoreCount = 1;
-	si.pSignalSemaphores = &s->timeline;
+	si.waitSemaphoreCount = static_cast<uint32_t>( waits.size() );
+	si.pWaitSemaphores = waits.data();
+	si.pWaitDstStageMask = stages.data();
+	si.commandBufferCount = cb ? 1 : 0;
+	si.pCommandBuffers = cb ? &cb : nullptr;
+	si.signalSemaphoreCount = static_cast<uint32_t>( signals.size() );
+	si.pSignalSemaphores = signals.data();
 	ENGINE_CHECK( vkQueueSubmit( cur().queue, 1, &si, VK_NULL_HANDLE ) );
 }
 
@@ -780,6 +808,113 @@ void dispatch_bound( stream_t st, Pipeline* p, const void* push, const void* con
 }
 
 bool bound_pipelines() { return ctx().push_descriptor != nullptr; }
+
+bool shared_sync() { return ctx().host_import && ctx().sem_fd; }
+size_t host_import_alignment() { return ctx().host_import_align; }
+
+void* import_host_memory( void* host, size_t bytes ) {
+	ctx();
+	if ( !cur().host_import || reinterpret_cast<uintptr_t>( host ) % cur().host_import_align != 0 || bytes % cur().host_import_align != 0 ) return nullptr;
+	auto props = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>( vkGetDeviceProcAddr( cur().device, "vkGetMemoryHostPointerPropertiesEXT" ) );
+	VkMemoryHostPointerPropertiesEXT mp{ VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
+	if ( props == nullptr || props( cur().device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &mp ) != VK_SUCCESS ) return nullptr;
+	VkExternalMemoryBufferCreateInfo eb{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+	eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+	VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &eb };
+	bci.size = bytes;
+	bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+	Alloc a{};
+	a.size = bytes;
+	if ( vkCreateBuffer( cur().device, &bci, nullptr, &a.buffer ) != VK_SUCCESS ) return nullptr;
+	VkMemoryRequirements req;
+	vkGetBufferMemoryRequirements( cur().device, a.buffer, &req );
+	uint32_t type = 0;
+	const uint32_t bits = mp.memoryTypeBits & req.memoryTypeBits;
+	while ( type < 32 && !( bits & ( 1u << type ) ) ) ++type;
+	if ( type == 32 ) { vkDestroyBuffer( cur().device, a.buffer, nullptr ); return nullptr; }
+	VkImportMemoryHostPointerInfoEXT im{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
+	im.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+	im.pHostPointer = host;
+	VkMemoryAllocateFlagsInfo flags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &im };
+	flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+	VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags };
+	mai.allocationSize = bytes;
+	mai.memoryTypeIndex = type;
+	if ( vkAllocateMemory( cur().device, &mai, nullptr, &a.memory ) != VK_SUCCESS ) { vkDestroyBuffer( cur().device, a.buffer, nullptr ); return nullptr; }
+	vkBindBufferMemory( cur().device, a.buffer, a.memory, 0 );
+	VkBufferDeviceAddressInfo ai{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+	ai.buffer = a.buffer;
+	const uint64_t addr = cur().get_address( cur().device, &ai );
+	cur().allocs[addr] = a;   // not counted in `allocated`: host memory
+	return reinterpret_cast<void*>( addr );
+}
+
+struct SharedSemaphore { VkSemaphore sem = VK_NULL_HANDLE; };
+
+void* shared_timeline_create() {
+	ctx();
+	if ( !cur().sem_fd ) return nullptr;
+	VkExportSemaphoreCreateInfo es{ VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
+	es.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+	VkSemaphoreTypeCreateInfo st{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, &es };
+	st.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+	VkSemaphoreCreateInfo sci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &st };
+	auto* h = new SharedSemaphore();
+	if ( vkCreateSemaphore( cur().device, &sci, nullptr, &h->sem ) != VK_SUCCESS ) { delete h; return nullptr; }
+	return h;
+}
+
+int shared_timeline_fd( void* h ) {
+	auto get = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>( vkGetDeviceProcAddr( ctx().device, "vkGetSemaphoreFdKHR" ) );
+	VkSemaphoreGetFdInfoKHR gi{ VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR };
+	gi.semaphore = static_cast<SharedSemaphore*>( h )->sem;
+	gi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+	int fd = -1;
+	return get != nullptr && get( cur().device, &gi, &fd ) == VK_SUCCESS ? fd : -1;
+}
+
+void* shared_timeline_import( int fd ) {
+	ctx();
+	VkSemaphoreTypeCreateInfo st{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+	st.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+	VkSemaphoreCreateInfo sci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &st };
+	auto* h = new SharedSemaphore();
+	if ( vkCreateSemaphore( cur().device, &sci, nullptr, &h->sem ) != VK_SUCCESS ) { delete h; return nullptr; }
+	auto imp = reinterpret_cast<PFN_vkImportSemaphoreFdKHR>( vkGetDeviceProcAddr( cur().device, "vkImportSemaphoreFdKHR" ) );
+	VkImportSemaphoreFdInfoKHR is{ VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR };
+	is.semaphore = h->sem;
+	is.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+	is.fd = fd;
+	if ( imp == nullptr || imp( cur().device, &is ) != VK_SUCCESS ) {
+		vkDestroySemaphore( cur().device, h->sem, nullptr );
+		delete h;
+		return nullptr;
+	}
+	return h;
+}
+
+void stream_signal( stream_t st, void* sem, uint64_t value ) {
+	ctx();
+	if ( !cur().default_stream ) cur().default_stream = make_stream();
+	vk_stream* s = resolve_stream( st );
+	ENGINE_ASSERT( !s->capture, "Vulkan backend: stream_signal inside a graph capture" );
+	s->extra_signal.push_back( static_cast<SharedSemaphore*>( sem )->sem );
+	s->extra_signal_values.push_back( value );
+	if ( s->cb ) flush( s );
+	else submit( s, VK_NULL_HANDLE );
+}
+
+void stream_wait( stream_t st, void* const* sems, const uint64_t* values, int n ) {
+	ctx();
+	if ( !cur().default_stream ) cur().default_stream = make_stream();
+	vk_stream* s = resolve_stream( st );
+	ENGINE_ASSERT( !s->capture, "Vulkan backend: stream_wait inside a graph capture" );
+	if ( s->cb ) flush( s );   // only what comes after waits
+	for ( int i = 0; i < n; ++i ) {
+		s->extra_wait.push_back( static_cast<SharedSemaphore*>( sems[i] )->sem );
+		s->extra_wait_values.push_back( values[i] );
+	}
+}
 
 } // namespace vk
 } // namespace engine::backend

@@ -13,7 +13,7 @@
 | `test_steer`, `test_steer_probe` | 2 | yes / no | runtime steering: the residual edit, probe-score and logit penalty kernels against an fp32 reference; the probe's axis maths on synthetic states |
 | `test_router_steer` | 2 | yes | router steering: a per-slot bias on the MoE selection score removes or adds experts for that slot only, weights stay the raw scores renormalised |
 | `test_sparse_attn` | 2 | yes | `Attention::forward_sparse` (decode-sized sparse-list attention, head_dim 256) against an FP64 softmax over the same keys |
-| `test_vulkan_comm` | 2 | yes (2-4) | the Vulkan build's host-staged all-reduce and all-reduce + RMSNorm on 2 and 4 devices, one thread per rank (skips with fewer devices) |
+| `test_vulkan_comm` | 2 | yes (2-4) | the Vulkan build's all-reduce and all-reduce + RMSNorm on 2 and 4 devices (on the devices through shared host memory and semaphores where the driver allows, else through the host), one thread per rank, against a host sum (skips with fewer devices) |
 | `test_sampling` | 2 | no | top-k / top-p sampler |
 | `test_slang_cpu`, `test_slang_kernels` | 2 | partly | Slang kernels on CPU and as generated CUDA |
 | `test_ref_linear`, `test_ref_attention`, `test_vulkan_kernels`, `test_vulkan_smoke`, `test_vulkan_ref` | 2 | yes | portable reference kernels on CUDA, CPU and Vulkan |

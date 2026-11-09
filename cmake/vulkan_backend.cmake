@@ -90,6 +90,15 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			COMMENT "slangc ${entry} -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
+		# the multi-device collective's sum (src/kernels/slang/comm.slang)
+	foreach(entry ar_sum)
+		set(sout ${SLANG_OUT}/${entry}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/comm.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/comm.slang
+			COMMENT "slangc ${entry} -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
 	# the integer GEMV once per block type (gguf.slang GGUF_T)
 	foreach(t 2 3 6 7 8 10 11 12 13 14 16 17 18 19 20 21 22 23 29)
 		set(sout ${SLANG_OUT}/gguf_gemv_dot_${t}.spv)
