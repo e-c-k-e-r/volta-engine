@@ -1,5 +1,6 @@
 #include "engine/server/chat.h"
 #include "engine/runtime/options.h"
+#include "engine/core/batch.h"
 
 #include <algorithm>
 #include <cctype>
@@ -246,6 +247,11 @@ std::string unescape_prompt( const engine::loader::Tokenizer& tok, const std::st
 	return out;
 }
 
+// Prompt plus reply tokens a request can hold: generation stops one verify block (MAX_BATCH rows) short of the window
+int reply_window( engine::runtime::Generator& gen ) {
+	return gen.max_context() - pod::MAX_BATCH - 1;
+}
+
 bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ImageList* images, ApiError* err ) {
 	const auto family = gen.chat_template().model_family();
 
@@ -336,6 +342,10 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 		}
 	}
 	const int ctx = gen.max_context();
+	if ( req.strict_context && static_cast<int>( tokens->size() ) >= reply_window( gen ) ) {
+		err->message = "prompt is too long: " + std::to_string( tokens->size() ) + " tokens > " + std::to_string( reply_window( gen ) ) + " maximum";
+		return false;
+	}
 	if ( tokens->empty() || static_cast<int>( tokens->size() ) + 1 >= ctx ) {
 		err->message = "this conversation is " + std::to_string( tokens->size() ) + " tokens; the context window is " + std::to_string( ctx );
 		err->type = "context_length_exceeded";
@@ -388,11 +398,18 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	auto state = std::make_shared<ChatState>(
 		OutputParser( family, in_reasoning, tool_schemas_from_json( req.tools_json ) ), std::move( responder ), conn );
 
+	const int max_tokens = req.max_tokens > 0 ? req.max_tokens : cfg.default_max_tokens;
+	if ( req.strict_context && static_cast<int>( tokens.size() ) + max_tokens > reply_window( gen ) ) {
+		err->message = "input length and `max_tokens` exceed context limit: " + std::to_string( tokens.size() ) + " + " + std::to_string( max_tokens ) + " > " +
+			std::to_string( reply_window( gen ) ) + ", decrease input length or `max_tokens` and try again";
+		return false;
+	}
+
 	engine::runtime::GenerationRequest g;
 	g.req_id = request_id;
 	g.prompt_tokens = std::move( tokens );
 	g.images = std::move( images );
-	g.max_tokens = req.max_tokens > 0 ? req.max_tokens : cfg.default_max_tokens;
+	g.max_tokens = max_tokens;
 	g.temperature = req.temperature >= 0.0f ? req.temperature : cfg.default_temperature;
 	g.top_p = req.top_p >= 0.0f ? req.top_p : cfg.default_top_p;
 	g.top_k = req.top_k > 0 ? req.top_k : cfg.default_top_k;

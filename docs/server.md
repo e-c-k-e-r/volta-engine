@@ -24,7 +24,7 @@ Owns the socket, the router, and the model-family choice.
 
 Routes:
 * `POST /v1/chat/completions` (OpenAI), `GET /v1/models`
-* `POST /v1/messages` and `/v1/messages/count_tokens` (Anthropic), so Claude Code can use it with `ANTHROPIC_BASE_URL=http://host:8000`
+* `POST /v1/messages` and `/v1/messages/count_tokens` (Anthropic), so Claude Code can use it with `ANTHROPIC_BASE_URL=http://host:8000`. Claude Code assumes a 200K window for a model it does not know, so give it the server's (`context_length` in `GET /v1/models`) with `CLAUDE_CODE_MAX_CONTEXT_TOKENS=<max_seq>`; it then compacts in time. A messages request that does not fit is refused with the API's own errors (`prompt is too long: N tokens > W maximum`, ``input length and `max_tokens` exceed context limit: N + M > W``), which Claude Code acts on (compacting, or retrying with a smaller `max_tokens`); W is `max_seq` minus one verify block. The OpenAI route instead ends the reply at the window (finish reason `length`)
 * `GET /health` (also `/`), `/metrics` (JSON), `/metrics/prometheus`
 * `GET /monitor`, `/api/stats`, `/api/experts`. The recent requests in `/api/stats` carry the split of the time before the first token: `queue_ms` (waiting for a slot; `ttft_ms` counts from the slot being taken), `restore_ms` (prefix cache resume), `prefill_ms` (prefill kernels), `store_ms` (checkpoint stores); the rest of `ttft_ms` went to other slots' decode steps. The server prints two lines per request, one when it takes a slot and one when it finishes
 * the video routes when the model is MiniMax-H3

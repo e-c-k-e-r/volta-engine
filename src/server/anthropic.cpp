@@ -321,6 +321,7 @@ public:
 		if ( j.is_discarded() || !j.is_object() ) return fail( err, "the request body is not valid JSON" );
 		ChatRequest r;
 		r.model = j.value( "model", std::string() );
+		r.strict_context = true;   // the messages API refuses what does not fit, with errors its clients parse
 		json messages;
 		if ( !normalize_messages( j, &messages, &r.images, err ) ) return false;
 		r.messages_json = messages.dump();

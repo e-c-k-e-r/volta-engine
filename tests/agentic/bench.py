@@ -13,7 +13,7 @@ work directory afterwards; files from hidden/ are copied in first) and solution.
 A run directory holds meta.json (client version, server URL, model, settings, git revision), results.jsonl (one record per task run)
 and <task>/<rep>/ with the Claude Code event stream (events.jsonl) and the final work directory.
 """
-import argparse, concurrent.futures, json, os, shutil, statistics, subprocess, sys, tempfile, threading, time
+import argparse, concurrent.futures, json, os, shutil, statistics, subprocess, sys, tempfile, threading, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 THINKING = {"off": "0", "low": "4000", "medium": "10000", "high": "31999"}
@@ -137,6 +137,16 @@ def git_rev():
         return ""
 
 
+def context_length(base_url, api_key):
+    """The served model's context window from GET /v1/models (context_length), or 0 when the server does not say."""
+    try:
+        req = urllib.request.Request(base_url.rstrip("/") + "/v1/models", headers={"x-api-key": api_key, "Authorization": "Bearer " + api_key})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return int(json.loads(r.read())["data"][0].get("context_length", 0))
+    except Exception:
+        return 0
+
+
 def run(args):
     exe, ro = claude_paths()
     os.makedirs(args.out, exist_ok=True)
@@ -147,6 +157,13 @@ def run(args):
     env = {"ANTHROPIC_BASE_URL": args.base_url, "ANTHROPIC_API_KEY": args.api_key, "ANTHROPIC_MODEL": args.model, "ANTHROPIC_SMALL_FAST_MODEL": args.model,
            "DISABLE_TELEMETRY": "1", "DISABLE_ERROR_REPORTING": "1", "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
            "API_TIMEOUT_MS": str(args.timeout * 1000)}
+    # Claude Code assumes a 200K window for a model it does not know and compacts only near that; the server's real window (context_length of
+    # /v1/models, which volta_server reports) makes it compact in time
+    window = context_length(args.base_url, args.api_key)
+    if window:
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(window)
+        meta["context_window"] = window
+        json.dump(meta, open(os.path.join(args.out, "meta.json"), "w"), indent=2)
     results = open(os.path.join(args.out, "results.jsonl"), "a")
     levels = args.thinking.split(",")
     jobs = [(t, rep) for t in load_tasks(args.tier, args.only and args.only.split(",")) for rep in range(args.repeats)]

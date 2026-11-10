@@ -59,6 +59,10 @@ struct ChatRequest {
 	std::string probe_edit_layers;   // per-request steer_edit_layers (empty = the option)
 	bool steer_probe = false;   // the steering probe reads the prompt first and applies its direction clamps when the gate fires
 	float think_penalty = -1.0f;
+	// Anthropic messages: a prompt or a prompt + max_tokens that does not fit the context window is refused with the API's own errors
+	// ("prompt is too long: N tokens > W maximum", "input length and `max_tokens` exceed context limit: N + M > W"), which clients such as
+	// Claude Code parse (compacting, or retrying with a smaller max_tokens); otherwise the reply is cut at the window (finish reason length)
+	bool strict_context = false;
 };
 
 struct Usage {
