@@ -80,11 +80,11 @@ void LinearTrellis::forward(
 	const half* suh_ptr = suh.ptr<const half>();
 	const half* svh_ptr = svh.ptr<const half>();
 
-	// GLM 5-bit n=6144 projection (the KDA input) at 4..8 rows: the emulated-MMA GEMV falls to ~120 GB/s while the 16x512 tensor-core
+	// GLM 5-bit n=6144 projection (the KDA input) at 4..12 rows: the emulated-MMA GEMV falls to ~120 GB/s while the 16x512 tensor-core
 	// GEMM tile keeps ~190 (bench_shapes cold sweep over 24 weight copies: 129 -> 82 us). Every other shape measures level or
 	// better on the GEMV with cold weights (the L2-resident loop of a single matrix says otherwise and is misleading).
 	int gemm_shape = 0;
-	if ( bits == 5 && m >= 4 && m <= 8 && mul1 && !c_fp32 && n == 6144 && ( k % 16 == 0 ) ) gemm_shape = 4;
+	if ( bits == 5 && m >= 4 && m <= 12 && mul1 && !c_fp32 && n == 6144 && ( k % 16 == 0 ) ) gemm_shape = 4;
 #if defined(USE_ROCM)
 	// ROCm: the fused GEMM runs on emulated mma, 15-125x slower than reconstruct + hipBLAS at M = 16..64 (test_prefill_linear on a
 	// 7900 XTX). Up to EXL3_GEMV_ROCM_MAX_M rows the v_dot2 GEMV (src/kernels/rocm/trellis/exl3_gemv.cu), above that reconstruct

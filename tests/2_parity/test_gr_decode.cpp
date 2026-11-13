@@ -1,4 +1,4 @@
-// Gated residual, decode-sized calls: the streaming kernels (rows <= 8) against the row-tile kernels (mix_reference): mixed, post, and the time of
+// Gated residual, decode-sized calls: the streaming kernels (rows <= 16) against the row-tile kernels (mix_reference): mixed, post, and the time of
 // 96 calls over distinct weight sets (cold L2, the way a decode step meets 48 layers x 2 sublayers), graph replay.
 #include "engine/config.h"
 #include "engine/core/arena.h"
@@ -33,7 +33,7 @@ int main() {
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	cudaStream_t s;
 	CUDA_CHECK( cudaStreamCreate( &s ) );
-	const int H = 2560, hc = 4, flat = hc * H, rank = 320, R = 8, SETS = 96;
+	const int H = 2560, hc = 4, flat = hc * H, rank = 320, R = 16, SETS = 96;
 	const float eps = 1e-6f;
 	std::vector<half_t*> w_norm( SETS ), down( SETS ), up( SETS ), inject( SETS );
 	for ( int i = 0; i < SETS; ++i ) {
@@ -65,7 +65,7 @@ int main() {
 	CUDA_CHECK( cudaMemcpy( prev_post, hp.data(), hp.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
 
 	int failures = 0;
-	for ( int rows = 1; rows <= 8; ++rows ) {
+	for ( int rows = 1; rows <= 16; ++rows ) {
 		for ( int variant = 0; variant < 3; ++variant ) {
 			const int use_prev = variant & 1;
 			const bool use_inject = variant != 2;   // variant 2: no inject rows (the MTP mixer)
@@ -105,7 +105,7 @@ int main() {
 	CUDA_CHECK( cudaEventCreate( &e0 ) );
 	CUDA_CHECK( cudaEventCreate( &e1 ) );
 	for ( int pass = 0; pass < 2; ++pass ) {
-		for ( int rows : { 1, 4, 8 } ) {
+		for ( int rows : { 1, 4, 8, 12, 16 } ) {
 			auto run = [&]() {
 				for ( int i = 0; i < SETS; ++i ) {
 					if ( pass == 0 ) GatedResidual::mix_reference( x, w_norm[i], down[i], up[i], inject[i], mixed, post, scratch, rows, H, hc, rank, eps, s, prev_post, prev_y );

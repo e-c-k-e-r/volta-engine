@@ -935,13 +935,10 @@ void Qwen4ExpPipeline::trace_route( int tag, int m, backend::stream_t stream ) {
 }
 
 void Qwen4ExpPipeline::gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, int m, backend::stream_t stream ) {
-	// Prefill rows: the gate and up projections are dense fp16 GEMMs on the tensor cores (the row-tile kernels below are fp32 FMA bound at hundreds
-	// of rows); decode rows (a few) keep the fp32 kernels, whose reads of the 13 MB of weights are the floor there
-	// The GEMMs always run at the full row capacity: Gemm then picks one tile size and split and a row's result is bit-identical whatever its position in the chunk or the
-	// chunk size (test_gr_tc); the rows past m are stale but never read.
 	// Prefill rows: the gate and up projections run on the tensor cores as fp16 hi / lo GEMM pairs with fp32 accumulation (the row-tile kernels below are fp32
-	// FMA bound at hundreds of rows); decode rows (a few) keep the fp32 kernels, whose reads of the 13 MB of weights are the floor there
-	// 9 to 16 rows (the blocks of a joint verify) stay on the decode kernels in groups of 8: the GEMMs below run at the full row capacity, about 0.5 ms a site
+	// FMA bound at hundreds of rows); decode rows (up to kGrDecodeRows, the blocks of a joint verify) keep the fp32 kernels, whose reads of the 13 MB of
+	// weights are the floor there. The GEMMs always run at the full row capacity: Gemm then picks one tile size and split and a row's result is bit-identical
+	// whatever its position in the chunk or the chunk size (test_gr_tc); the rows past m are stale but never read.
 	if ( with_post && m > kGrDecodeRows && g.down_lw.is_valid() ) {
 		using GR = engine::modules::GatedResidual;
 		using half_t = backend::half_t;
@@ -961,29 +958,16 @@ void Qwen4ExpPipeline::gr_mix( const Qwen4ExpGatedResidual& g, bool with_post, i
 	}
 #if ENGINE_BACKEND_CUDA
 	if ( normed_ready_ ) {
-		// The fused all-reduce wrote the normed rows of all m; the decode kernels take them in groups of 8, t going after the last of them
-		const int H = config_.hidden_size, hc = config_.hc_mult;
-		float* t = gr_scratch_ + static_cast<size_t>( m ) * hc * H;
-		for ( int r0 = 0; r0 < m; r0 += 8 ) {
-			engine::modules::GatedResidual::mix_prenormed( g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(), with_post ? g.inject.ptr<const backend::half_t>() : nullptr,
-				mixed_.ptr<backend::half_t>() + static_cast<size_t>( r0 ) * H, post_ + static_cast<size_t>( r0 ) * hc, gr_scratch_ + static_cast<size_t>( r0 ) * hc * H, MIN( 8, m - r0 ), H, hc,
-				config_.hc_rank, stream, t + static_cast<size_t>( r0 ) * config_.hc_rank );
-		}
+		// The fused all-reduce wrote the normed rows of all m
+		engine::modules::GatedResidual::mix_prenormed( g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(), with_post ? g.inject.ptr<const backend::half_t>() : nullptr,
+			mixed_.ptr<backend::half_t>(), post_, gr_scratch_, m, config_.hidden_size, config_.hc_mult, config_.hc_rank, stream );
 		normed_ready_ = false;
 		return;
 	}
 #endif
-	// The decode kernels take 8 rows at most; more rows (up to kGrDecodeRows) go through them in groups, each group a call of its own with the row-indexed
-	// buffers offset (the scratch is reused, the calls run in order on the stream)
-	const int H = config_.hidden_size, hc = config_.hc_mult;
-	for ( int r0 = 0; r0 < m; r0 += 8 ) {
-		const int n = MIN( 8, m - r0 );
-		engine::modules::GatedResidual::mix(
-			streams_.ptr<const float>() + static_cast<size_t>( r0 ) * hc * H, g.norm.ptr<const backend::half_t>(), g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(),
-			with_post ? g.inject.ptr<const backend::half_t>() : nullptr, mixed_.ptr<backend::half_t>() + static_cast<size_t>( r0 ) * H, post_ + static_cast<size_t>( r0 ) * hc,
-			gr_scratch_, n, H, hc, config_.hc_rank, config_.rms_norm_eps, stream,
-			apply_pending_ ? post_ + static_cast<size_t>( r0 ) * hc : nullptr, apply_pending_ ? y_.ptr<const backend::half_t>() + static_cast<size_t>( r0 ) * H : nullptr );
-	}
+	engine::modules::GatedResidual::mix( streams_.ptr<const float>(), g.norm.ptr<const backend::half_t>(), g.down.ptr<const backend::half_t>(), g.up.ptr<const backend::half_t>(),
+		with_post ? g.inject.ptr<const backend::half_t>() : nullptr, mixed_.ptr<backend::half_t>(), post_, gr_scratch_, m, config_.hidden_size, config_.hc_mult, config_.hc_rank,
+		config_.rms_norm_eps, stream, apply_pending_ ? post_ : nullptr, apply_pending_ ? y_.ptr<const backend::half_t>() : nullptr );
 	apply_pending_ = false;
 }
 
@@ -1197,9 +1181,9 @@ void Qwen4ExpPipeline::ple_prepare( const pod::BatchRows& rows, int m, backend::
 void Qwen4ExpPipeline::ple_forward( int m, backend::stream_t stream ) {
 	flush_apply( m, stream );
 	const int H = config_.hidden_size, hc = config_.hc_mult;
-	if ( m > 8 ) {
+	if ( m > pod::MAX_BATCH ) {
 		// Prefill rows: the dense fp16 projections as tensor-core GEMMs at the full row capacity (one tile size and split, so a row does not depend on the chunking);
-		// the plain GEMV behind Linear::forward takes 20 ms per 512-row chunk here
+		// the plain GEMV behind Linear::forward takes 20 ms per 512-row chunk here, but a verify block (up to MAX_BATCH rows) is cheaper on it than a 512-row GEMM
 		const int R = gemm_rows( m ), H = config_.hidden_size, hc = config_.hc_mult;
 		engine::modules::Vision::dense_gemm( ple_emb_.ptr<const backend::half_t>(), ple_.key_proj.w0.ptr<const backend::half_t>(), ple_key_.ptr<backend::half_t>(), R, hc * H, config_.ple_embed_dim, stream );
 		engine::modules::Vision::dense_gemm( ple_emb_.ptr<const backend::half_t>(), ple_.value_proj.w0.ptr<const backend::half_t>(), ple_value_.ptr<backend::half_t>(), R, H, config_.ple_embed_dim, stream );

@@ -113,7 +113,9 @@ __global__ void skinny_nvfp4_qpn(
 	}
 }
 
-template <int SPLITK, int NACC>
+// Split-K skinny kernel: SPLITK warps share one 32-column tile, each a slice of K; MT row tiles of 8 (up to 8 * MT rows) reuse every decoded weight
+// fragment, and NACC accumulators per row tile keep the 1-tile Volta MMA chains independent
+template <int SPLITK, int NACC, int MT = 1>
 __global__ void skinny_nvfp4_qpn2(
 	const uint8_t* __restrict__ bcodes,
 	const uint8_t* __restrict__ bscales,
@@ -124,7 +126,7 @@ __global__ void skinny_nvfp4_qpn2(
 	int M,
 	float gscale
 ) {
-	__shared__ float cs[SPLITK > 1 ? SPLITK : 1][SPLITK > 1 ? 256 : 1];
+	__shared__ float cs[SPLITK > 1 ? SPLITK : 1][SPLITK > 1 ? MT * 256 : 1];
 
 	const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 	const int tile = blockIdx.x;
@@ -136,29 +138,40 @@ __global__ void skinny_nvfp4_qpn2(
 					(size_t) tile * G * 32 + lane;
 	const uint8_t* sb = bscales + (size_t) tile * G * 32 + lane;
 	const half2 gm2 = __float2half2_rn( gscale * 16384.f );
-	float c[NACC][8];
+	float c[MT][NACC][8];
 	#pragma unroll
-	for ( int a = 0; a < NACC; a++ ) {
+	for ( int t = 0; t < MT; t++ ) {
 		#pragma unroll
-		for ( int i = 0; i < 8; i++ ) c[a][i] = 0.f;
+		for ( int a = 0; a < NACC; a++ ) {
+			#pragma unroll
+			for ( int i = 0; i < 8; i++ ) c[t][a][i] = 0.f;
+		}
 	}
 
 #if NVFP4_MMA_SM80
 	const int xr0 = nvfp4_x_row( lane );
-	const half* xrow = ( xr0 < M ) ? ( x + (size_t) xr0 * K ) : nullptr;
+	const half* xrow[MT];
+	#pragma unroll
+	for ( int t = 0; t < MT; t++ ) xrow[t] = ( t * 8 + xr0 < M ) ? ( x + (size_t) ( t * 8 + xr0 ) * K ) : nullptr;
 	(void) qp;
 	(void) r;
 
-	// One step per k16 group into c[0] (its two MMAs are already independent chains); the NACC split below then adds zeros
+	// One step per k16 group into c[t][0] (its two MMAs are already independent chains); the NACC split below then adds zeros
 	#pragma unroll 4
 	for ( int g = g0; g < g0 + Gq; g++ ) {
-		unsigned aw[2][4], bx[2];
+		unsigned aw[2][4];
 		nvfp4_wfrag<true>( cb + (size_t) g * 32, sb + (size_t) g * 32, gm2, aw );
-		nvfp4_xfrag( xrow != nullptr ? xrow + g * 16 : nullptr, bx );
-		nvfp4_step( c[0], aw, bx );
+		#pragma unroll
+		for ( int t = 0; t < MT; t++ ) {
+			unsigned bx[2];
+			nvfp4_xfrag( xrow[t] != nullptr ? xrow[t] + g * 16 : nullptr, bx );
+			nvfp4_step( c[t][0], aw, bx );
+		}
 	}
 #else
-	const half* xrow = ( r < M ) ? ( x + (size_t) r * K ) : nullptr;
+	const half* xrow[MT];
+	#pragma unroll
+	for ( int t = 0; t < MT; t++ ) xrow[t] = ( t * 8 + r < M ) ? ( x + (size_t) ( t * 8 + r ) * K ) : nullptr;
 
 	#pragma unroll 4
 	for ( int g = g0; g < g0 + Gq; g++ ) {
@@ -168,61 +181,79 @@ __global__ void skinny_nvfp4_qpn2(
 		dequant8_tm( q2.x, sc2, b + 0 );
 		dequant8_tm( q2.y, sc2, b + 4 );
 		const unsigned* B = reinterpret_cast<const unsigned*>( b );
-		uint4 a01 = make_uint4( 0, 0, 0, 0 ), a23 = make_uint4( 0, 0, 0, 0 );
-		if ( xrow != nullptr ) {
-			a01 = *reinterpret_cast<const uint4*>( xrow + g * 16 );
-			a23 = *reinterpret_cast<const uint4*>( xrow + g * 16 + 8 );
+		#pragma unroll
+		for ( int t = 0; t < MT; t++ ) {
+			uint4 a01 = make_uint4( 0, 0, 0, 0 ), a23 = make_uint4( 0, 0, 0, 0 );
+			if ( xrow[t] != nullptr ) {
+				a01 = *reinterpret_cast<const uint4*>( xrow[t] + g * 16 );
+				a23 = *reinterpret_cast<const uint4*>( xrow[t] + g * 16 + 8 );
+			}
+			const unsigned* A0 = reinterpret_cast<const unsigned*>( &a01 );
+			const unsigned* A1 = reinterpret_cast<const unsigned*>( &a23 );
+			MMA_8N8K4( c[t][0], A0[0], A0[1], B[0], B[1] );
+			MMA_8N8K4( c[t][1 % NACC], A0[2], A0[3], B[2], B[3] );
+			MMA_8N8K4( c[t][2 % NACC], A1[0], A1[1], B[4], B[5] );
+			MMA_8N8K4( c[t][3 % NACC], A1[2], A1[3], B[6], B[7] );
 		}
-		const unsigned* A0 = reinterpret_cast<const unsigned*>( &a01 );
-		const unsigned* A1 = reinterpret_cast<const unsigned*>( &a23 );
-		MMA_8N8K4( c[0], A0[0], A0[1], B[0], B[1] );
-		MMA_8N8K4( c[1 % NACC], A0[2], A0[3], B[2], B[3] );
-		MMA_8N8K4( c[2 % NACC], A1[0], A1[1], B[4], B[5] );
-		MMA_8N8K4( c[3 % NACC], A1[2], A1[3], B[6], B[7] );
 	}
 #endif
 
 	#pragma unroll
-	for ( int a = 1; a < NACC; a++ ) {
+	for ( int t = 0; t < MT; t++ ) {
 		#pragma unroll
-		for ( int i = 0; i < 8; i++ ) c[0][i] += c[a][i];
+		for ( int a = 1; a < NACC; a++ ) {
+			#pragma unroll
+			for ( int i = 0; i < 8; i++ ) c[t][0][i] += c[t][a][i];
+		}
 	}
 
 #if NVFP4_MMA_SM80
 	if ( SPLITK == 1 ) {
 		#pragma unroll
-		for ( int i = 0; i < 8; i++ ) {
-			const int row = nvfp4_acc_row( i, lane );
-			if ( row < M ) y[(size_t) row * N + (size_t) tile * 32 + nvfp4_acc_col( i, lane )] = __float2half( c[0][i] );
-		}
-		return;
-	}
-
-	#pragma unroll
-	for ( int i = 0; i < 8; i++ ) cs[warp][nvfp4_acc_row( i, lane ) * 32 + nvfp4_acc_col( i, lane )] = c[0][i];
-#else
-	if ( SPLITK == 1 ) {
-		#pragma unroll
-		for ( int i = 0; i < 8; i++ ) {
-			const int row = ( i & 2 ) | ( ( lane & 16 ) ? 4 : 0 ) | ( lane & 1 );
-			const int col = ( i & 1 ) | ( ( ( lane >> 1 ) & 1 ) << 1 ) | ( ( i >> 2 ) << 2 );
-			if ( row < M ) {
-				y[(size_t) row * N + (size_t) tile * 32 + qp * 8 + col] = __float2half( c[0][i] );
+		for ( int t = 0; t < MT; t++ ) {
+			#pragma unroll
+			for ( int i = 0; i < 8; i++ ) {
+				const int row = t * 8 + nvfp4_acc_row( i, lane );
+				if ( row < M ) y[(size_t) row * N + (size_t) tile * 32 + nvfp4_acc_col( i, lane )] = __float2half( c[t][0][i] );
 			}
 		}
 		return;
 	}
 
 	#pragma unroll
-	for ( int i = 0; i < 8; i++ ) {
-		const int row = ( i & 2 ) | ( ( lane & 16 ) ? 4 : 0 ) | ( lane & 1 );
-		const int col = ( i & 1 ) | ( ( ( lane >> 1 ) & 1 ) << 1 ) | ( ( i >> 2 ) << 2 );
-		cs[warp][row * 32 + qp * 8 + col] = c[0][i];
+	for ( int t = 0; t < MT; t++ ) {
+		#pragma unroll
+		for ( int i = 0; i < 8; i++ ) cs[warp][( t * 8 + nvfp4_acc_row( i, lane ) ) * 32 + nvfp4_acc_col( i, lane )] = c[t][0][i];
+	}
+#else
+	if ( SPLITK == 1 ) {
+		#pragma unroll
+		for ( int t = 0; t < MT; t++ ) {
+			#pragma unroll
+			for ( int i = 0; i < 8; i++ ) {
+				const int row = t * 8 + ( ( i & 2 ) | ( ( lane & 16 ) ? 4 : 0 ) | ( lane & 1 ) );
+				const int col = ( i & 1 ) | ( ( ( lane >> 1 ) & 1 ) << 1 ) | ( ( i >> 2 ) << 2 );
+				if ( row < M ) {
+					y[(size_t) row * N + (size_t) tile * 32 + qp * 8 + col] = __float2half( c[t][0][i] );
+				}
+			}
+		}
+		return;
+	}
+
+	#pragma unroll
+	for ( int t = 0; t < MT; t++ ) {
+		#pragma unroll
+		for ( int i = 0; i < 8; i++ ) {
+			const int row = t * 8 + ( ( i & 2 ) | ( ( lane & 16 ) ? 4 : 0 ) | ( lane & 1 ) );
+			const int col = ( i & 1 ) | ( ( ( lane >> 1 ) & 1 ) << 1 ) | ( ( i >> 2 ) << 2 );
+			cs[warp][row * 32 + qp * 8 + col] = c[t][0][i];
+		}
 	}
 #endif
 	__syncthreads();
 
-	for ( int e = threadIdx.x; e < 256; e += blockDim.x ) {
+	for ( int e = threadIdx.x; e < MT * 256; e += blockDim.x ) {
 		float v = 0.f;
 		#pragma unroll
 		for ( int w = 0; w < SPLITK; w++ ) v += cs[w][e];
@@ -480,9 +511,24 @@ void LinearNVFP4::forward(
 		}
 	}
 	else if ( fused && m <= 16 ) {
-		skinny_nvfp4_qpn<2><<<grid, dim3( 128 ), 0, stream>>>(
-			codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale
-		);
+		// 9 to 16 rows: the split-K kernel with two row tiles keeps the 8-row kernel's K split, which a few hundred column tiles need to fill the GPU;
+		// wider outputs (lm_head, the drafter's gate/up) have enough tiles for 4 warps each, and the split's reduction costs more than it hides there
+		const bool split = n <= 8192;
+		if ( split && ( k / 16 ) % 16 == 0 ) {
+			skinny_nvfp4_qpn2<16, 2, 2><<<grid, dim3( 32 * 16 ), 0, stream>>>(
+				codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale
+			);
+		}
+		else if ( split && ( k / 16 ) % 8 == 0 ) {
+			skinny_nvfp4_qpn2<8, 2, 2><<<grid, dim3( 32 * 8 ), 0, stream>>>(
+				codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale
+			);
+		}
+		else {
+			skinny_nvfp4_qpn<2><<<grid, dim3( 128 ), 0, stream>>>(
+				codes_ptr, scales_ptr, x_ptr, y_ptr, n, k, m, gscale
+			);
+		}
 	}
 	else if ( fused && m <= NVFP4_SKINNY_MAX_ROWS ) {
 		// Up to 32 rows: the decoded weights are reused across 3 or 4 row tiles of 8

@@ -308,8 +308,9 @@ template <GgmlType T> struct MmaDec { static constexpr bool on = false; };
 template <> struct MmaDec<GgmlType::Q4_K> {
 	static constexpr bool on = true;
 	// align: the staging unit (rows and blocks are multiples of it); stage: bytes staged per row and group; stride: their spacing in shared memory
-	// min_rows: from this many rows on the kernel beats the GEMV
-	static constexpr int group = 256, bytes = sizeof( block_q4_K ), align = 16, stage = bytes, stride = bytes + 16, min_rows = 4;
+	// min_rows: from this many rows on the kernel beats the GEMV on the layer projections (bench_kernels: Q4_K at 4 and 5 rows loses up to 1.23x on
+	// Flash-Next and GLM shapes and wins on the LM head shards, which run once a step)
+	static constexpr int group = 256, bytes = sizeof( block_q4_K ), align = 16, stage = bytes, stride = bytes + 16, min_rows = 6;
 	// the 64 values of pair j times the activations, for MT tiles of 8 rows; xr[t]: this lane's activation row of tile t at the pair's start
 	template <int MT>
 	static __device__ __forceinline__ void pair( const uint8_t* blk, int j, const half* const xr[MT], const bool live[MT], float d[MT][8] ) {
@@ -468,7 +469,7 @@ template <> struct MmaDec<GgmlType::Q8_0> {
 // with bits 2 Q, 2 Q + 1 of qh[32 h + l] on top, minus 32, times scales[8 h + 2 Q + l / 16] and d (dequantize_q6_K)
 template <> struct MmaDec<GgmlType::Q6_K> {
 	static constexpr bool on = true;
-	static constexpr int group = 256, bytes = sizeof( block_q6_K ), align = 8, stage = ( bytes + align - 2 + align - 1 ) / align * align, stride = stage + 8, min_rows = 6;
+	static constexpr int group = 256, bytes = sizeof( block_q6_K ), align = 8, stage = ( bytes + align - 2 + align - 1 ) / align * align, stride = stage + 8, min_rows = 8;
 	template <int MT>
 	static __device__ __forceinline__ void pair( const uint8_t* blk, int j, const half* const xr[MT], const bool live[MT], float d[MT][8] ) {
 		const block_q6_K* b = reinterpret_cast<const block_q6_K*>( blk );

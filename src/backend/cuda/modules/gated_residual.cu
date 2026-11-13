@@ -201,7 +201,7 @@ void gr_up_mix_kernel( const float* __restrict__ normed, const half* __restrict_
 	}
 }
 
-// ---- decode-sized calls (rows <= 8) ----
+// ---- decode-sized calls (rows <= 16) ----
 // gate / up weights are streamed at near HBM rate: each thread keeps all its 16-byte weight loads in flight before touching the activations.
 
 // z_j = dot( normed[r], w_j ) for the rank down rows and the hc inject rows: a block of 256 threads owns NJ consecutive outputs, each thread flat / 8 / 256
@@ -282,24 +282,40 @@ void gr_gate_decode_kernel( const float* __restrict__ normed, const half* __rest
 	}
 }
 
-// Several rows (3..8): the activations (rows x flat fp32) would be re-read by every block, so the work is split along K instead. Block b owns the K slice
-// [b * 128, ...) of every output: a half-warp (16 lanes) reads one output's 256-byte slice (lane i holds the 8 activation values of every row at 8 * i),
-// so a warp covers two outputs per step and the activations are read once per block; the per-row dot products are reduced over the 16 lanes with a
-// reduce-scatter. Block b writes its partial sums; gr_gate_reduce_kernel adds the GRS_SK partials in a fixed order.
+// Several rows (3..16, NR 8 or 16): the activations (rows x flat fp32) would be re-read by every block, so the work is split along K instead. Block b owns
+// the K slice [b * 128, ...) of every output: a half-warp (16 lanes) reads one output's 256-byte slice (lane i holds the 8 activation values of every row
+// at 8 * i), so a warp covers two outputs per step and the activations are read once per block; the per-row dot products are reduced over the 16 lanes
+// with a reduce-scatter. Block b writes its partial sums; gr_gate_reduce_kernel adds the GRS_SK partials in a fixed order.
 constexpr int GRS_SK = 80;
 constexpr int GRS_SLICE = 128;
 constexpr int GRS_WARPS = 12;
 constexpr int GRS_MAX_OUT = 384;
-__device__ float g_gr_partials[GRS_SK * 8 * GRS_MAX_OUT];
+constexpr int GRS_ROWS = 16;
+__device__ float g_gr_partials[GRS_SK * GRS_ROWS * GRS_MAX_OUT];
 
+// One reduce-scatter step over lane bit OFF: of v[0 .. 2 N), the lanes with the bit set keep the upper half, the others the lower, each adding its
+// partner's copy. A template so every index is a constant (a runtime step loop leaves v dynamically indexed, which spills into select chains).
+template<int N, int OFF>
+__device__ __forceinline__ void gr_reduce_scatter_step( float* v, int lane ) {
+	const bool hi = ( lane & OFF ) != 0;
+	#pragma unroll
+	for ( int i = 0; i < N; ++i ) {
+		const float send = hi ? v[i] : v[i + N];
+		const float recv = __shfl_xor_sync( 0xffffffff, send, OFF );
+		v[i] = ( hi ? v[i + N] : v[i] ) + recv;
+	}
+}
+
+template<int NR>
 __global__ __launch_bounds__( GRS_WARPS * 32 )
 void gr_gate_splitk_kernel( const float* __restrict__ normed, const half* __restrict__ down, const half* __restrict__ inject, int flat, int rank, int outputs, int rows ) {
+	static_assert( NR == 8 || NR == 16, "rows per pass" );
 	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
 	const int l16 = lane & 15, half_id = lane >> 4;
 	const int k = blockIdx.x * GRS_SLICE + l16 * 8;
-	float xv[8][8];
+	float xv[NR][8];
 	#pragma unroll
-	for ( int r = 0; r < 8; ++r ) {
+	for ( int r = 0; r < NR; ++r ) {
 		if ( r < rows ) {
 			const float4 a0 = *reinterpret_cast<const float4*>( normed + static_cast<size_t>( r ) * flat + k );
 			const float4 a1 = *reinterpret_cast<const float4*>( normed + static_cast<size_t>( r ) * flat + k + 4 );
@@ -336,29 +352,23 @@ void gr_gate_splitk_kernel( const float* __restrict__ normed, const half* __rest
 				#pragma unroll
 				for ( int i = 0; i < 8; ++i ) wf[i] = 0.0f;
 			}
-			float v[8];
+			float v[NR];
 			#pragma unroll
-			for ( int r = 0; r < 8; ++r ) {
+			for ( int r = 0; r < NR; ++r ) {
 				float a = 0.0f;
 				#pragma unroll
 				for ( int i = 0; i < 8; ++i ) a = fmaf( xv[r][i], wf[i], a );
 				v[r] = a;
 			}
-			// reduce-scatter over lane bits 3, 2, 1 (within the half-warp): the lane keeps row ( b3 b2 b1 ), then one more add over bit 0
-			#pragma unroll
-			for ( int step = 0; step < 3; ++step ) {
-				const int off = 8 >> step, half_n = 4 >> step;
-				const bool hi = ( lane & off ) != 0;
-				#pragma unroll
-				for ( int i = 0; i < half_n; ++i ) {
-					const float send = hi ? v[i] : v[i + half_n];
-					const float recv = __shfl_xor_sync( 0xffffffff, send, off );
-					v[i] = ( hi ? v[i + half_n] : v[i] ) + recv;
-				}
-			}
-			const float sum = v[0] + __shfl_xor_sync( 0xffffffff, v[0], 1 );
-			const int r = ( ( lane >> 3 ) & 1 ) * 4 + ( ( lane >> 2 ) & 1 ) * 2 + ( ( lane >> 1 ) & 1 );
-			if ( ( lane & 1 ) == 0 && r < rows && j < outputs ) g_gr_partials[( static_cast<size_t>( blockIdx.x ) * 8 + r ) * GRS_MAX_OUT + j] = sum;
+			// reduce-scatter over lane bits 3, 2, 1 (within the half-warp): the lane keeps row ( b3 b2 b1 ), then one more add over bit 0; 16 rows scatter
+			// over bit 0 too, so lane l16 ends with row l16
+			gr_reduce_scatter_step<NR / 2, 8>( v, lane );
+			gr_reduce_scatter_step<NR / 4, 4>( v, lane );
+			gr_reduce_scatter_step<NR / 8, 2>( v, lane );
+			if constexpr ( NR == 16 ) gr_reduce_scatter_step<1, 1>( v, lane );
+			const float sum = NR == 16 ? v[0] : v[0] + __shfl_xor_sync( 0xffffffff, v[0], 1 );
+			const int r = NR == 16 ? l16 : l16 >> 1;
+			if ( ( NR == 16 || ( lane & 1 ) == 0 ) && r < rows && j < outputs ) g_gr_partials[( static_cast<size_t>( blockIdx.x ) * GRS_ROWS + r ) * GRS_MAX_OUT + j] = sum;
 		}
 	}
 }
@@ -369,7 +379,7 @@ __global__ void gr_gate_reduce_kernel( float* __restrict__ t, float* __restrict_
 	const int r = idx / outputs, j = idx % outputs;
 	float sum = 0.0f;
 	#pragma unroll 16
-	for ( int b = 0; b < GRS_SK; ++b ) sum += g_gr_partials[( static_cast<size_t>( b ) * 8 + r ) * GRS_MAX_OUT + j];
+	for ( int b = 0; b < GRS_SK; ++b ) sum += g_gr_partials[( static_cast<size_t>( b ) * GRS_ROWS + r ) * GRS_MAX_OUT + j];
 	const float z = sum / hc;
 	if ( j < rank ) t[static_cast<size_t>( r ) * rank + j] = engine::math::silu( z );
 	else post[static_cast<size_t>( r ) * hc + ( j - rank )] = 2.0f / ( 1.0f + __expf( -z ) );
@@ -455,15 +465,17 @@ void gr_up_mix_decode_kernel( const float* __restrict__ normed, const half* __re
 	}
 }
 
-// Several rows (3..8): a thread streams M up rows (channels d .. d + M - 1 of one stream) against the same chunks of t, so each t value read from shared
-// memory serves M outputs. A block owns 8 * M channels of all 4 streams; the 8 lanes of a group reduce-scatter their M outputs x 8 rows, each lane
-// ending with row l8 of the M outputs.
-template<int RANK_CHUNKS, int M>
+// Several rows (3..16, NR 8 or 16): a thread streams M up rows (channels d .. d + M - 1 of one stream) against the same chunks of t, so each t value read
+// from shared memory serves M outputs. A block owns 8 * M channels of all 4 streams; the 8 lanes of a group reduce-scatter their M outputs x NR rows, each
+// lane ending with rows l8 * NR / 8 .. of the M outputs.
+template<int RANK_CHUNKS, int M, int NR>
 __global__ __launch_bounds__( 256 )
 void gr_up_mix_rows_kernel( const float* __restrict__ normed, const half* __restrict__ up, const float* __restrict__ t, half* __restrict__ mixed,
 	int hidden, int hc, int rank, int rows ) {
 	constexpr int CB = 8 * M;   // channels per block
-	extern __shared__ float s_t[];   // [8][rank]
+	constexpr int RL = NR / 8;  // rows per lane after the reduce-scatter
+	static_assert( NR * CB <= 256, "one output per thread in the epilogue" );
+	extern __shared__ float s_t[];   // [NR][rank]
 	const int d0 = blockIdx.x * CB;
 	const int l8 = threadIdx.x & 7, g = threadIdx.x >> 3;
 	const int s = g >> 3, cq = g & 7;
@@ -479,11 +491,11 @@ void gr_up_mix_rows_kernel( const float* __restrict__ normed, const half* __rest
 		for ( int i = threadIdx.x; i < n4; i += 256 ) reinterpret_cast<float4*>( s_t )[i] = __ldg( reinterpret_cast<const float4*>( t ) + i );
 	}
 	__syncthreads();
-	float acc[M][8];
+	float acc[M][NR];
 	#pragma unroll
 	for ( int m = 0; m < M; ++m ) {
 		#pragma unroll
-		for ( int r = 0; r < 8; ++r ) acc[m][r] = 0.0f;
+		for ( int r = 0; r < NR; ++r ) acc[m][r] = 0.0f;
 	}
 	#pragma unroll
 	for ( int i = 0; i < RANK_CHUNKS; ++i ) {
@@ -496,7 +508,7 @@ void gr_up_mix_rows_kernel( const float* __restrict__ normed, const half* __rest
 			for ( int q = 0; q < 4; ++q ) { const float2 f = __half22float2( u2[q] ); uf[m][2 * q] = f.x; uf[m][2 * q + 1] = f.y; }
 		}
 		#pragma unroll
-		for ( int r = 0; r < 8; ++r ) {
+		for ( int r = 0; r < NR; ++r ) {
 			if ( r < rows ) {
 				const float4 t0 = *reinterpret_cast<const float4*>( s_t + r * rank + c * 8 );
 				const float4 t1 = *reinterpret_cast<const float4*>( s_t + r * rank + c * 8 + 4 );
@@ -510,29 +522,25 @@ void gr_up_mix_rows_kernel( const float* __restrict__ normed, const half* __rest
 			}
 		}
 	}
-	// 8 * M values (r * M + m) over the 8 lanes: reduce-scatter on lane bits 2, 1, 0 leaves lane l8 with row l8 of the M outputs
-	float v[8 * M];
+	// NR * M values (r * M + m) over the 8 lanes: reduce-scatter on lane bits 2, 1, 0 leaves lane l8 with rows l8 * RL .. l8 * RL + RL - 1 of the M
+	// outputs (value q * M + m)
+	float v[NR * M];
 	#pragma unroll
-	for ( int r = 0; r < 8; ++r ) {
+	for ( int r = 0; r < NR; ++r ) {
 		#pragma unroll
 		for ( int m = 0; m < M; ++m ) v[r * M + m] = acc[m][r];
 	}
+	gr_reduce_scatter_step<NR * M / 2, 4>( v, l8 );
+	gr_reduce_scatter_step<NR * M / 4, 2>( v, l8 );
+	gr_reduce_scatter_step<NR * M / 8, 1>( v, l8 );
+	__shared__ float sg[4][CB][NR];   // sigmoid gate per stream, channel, row
 	#pragma unroll
-	for ( int step = 0; step < 3; ++step ) {
-		const int off = 4 >> step, half_n = ( 4 * M ) >> step;
-		const bool hi = ( l8 & off ) != 0;
+	for ( int q = 0; q < RL; ++q ) {
 		#pragma unroll
-		for ( int i = 0; i < half_n; ++i ) {
-			const float send = hi ? v[i] : v[i + half_n];
-			const float recv = __shfl_xor_sync( 0xffffffff, send, off );
-			v[i] = ( hi ? v[i + half_n] : v[i] ) + recv;
-		}
+		for ( int m = 0; m < M; ++m ) sg[s][cq * M + m][l8 * RL + q] = engine::math::sigmoid( v[q * M + m] );
 	}
-	__shared__ float sg[4][CB][8];   // sigmoid gate per stream, channel, row
-	#pragma unroll
-	for ( int m = 0; m < M; ++m ) sg[s][cq * M + m][l8] = engine::math::sigmoid( v[m] );
 	__syncthreads();
-	if ( threadIdx.x < 8 * CB ) {
+	if ( threadIdx.x < NR * CB ) {
 		const int r = threadIdx.x / CB, dl = threadIdx.x % CB;
 		if ( r < rows ) {
 			float out = 0.0f;
@@ -673,7 +681,7 @@ void mix_fast( const float* normed, const half* down, const half* up, const half
 	cudaStream_t stream ) {
 	const int flat = hc * hidden;
 	const int outputs = rank + ( inject != nullptr ? hc : 0 );
-	// 3..8 rows: split-K gate + the 4-outputs-per-thread up-mix (hc 4, flat 40 * 256, rank a multiple of 64 up to 384)
+	// 3..16 rows: split-K gate + the 2-outputs-per-thread up-mix (hc 4, flat 40 * 256, rank a multiple of 64 up to 384), 8 or 16 rows per pass
 	const bool several = rows >= 3 && hc == 4 && flat == GRS_SK * GRS_SLICE && outputs <= GRS_MAX_OUT && hidden % ( 8 * GRD_M ) == 0 && rank % 64 == 0 && rank <= 384;
 	#define GR_UPMIX( NR ) \
 		gr_up_mix_decode_kernel<NR><<<hidden / GRD_CH, 256, static_cast<size_t>( NR ) * rank * sizeof( float ), stream>>>( normed, up, t, mixed, hidden, hc, rank, rows )
@@ -683,18 +691,23 @@ void mix_fast( const float* normed, const half* down, const half* up, const half
 	if ( rows == 1 ) { GR_FAST( 1 ); }
 	else if ( rows == 2 ) { GR_FAST( 2 ); }
 	else if ( several ) {
-		gr_gate_splitk_kernel<<<GRS_SK, GRS_WARPS * 32, 0, stream>>>( normed, down, inject, flat, rank, outputs, rows );
+		if ( rows <= 8 ) gr_gate_splitk_kernel<8><<<GRS_SK, GRS_WARPS * 32, 0, stream>>>( normed, down, inject, flat, rank, outputs, rows );
+		else gr_gate_splitk_kernel<16><<<GRS_SK, GRS_WARPS * 32, 0, stream>>>( normed, down, inject, flat, rank, outputs, rows );
 		gr_gate_reduce_kernel<<<( rows * outputs + 127 ) / 128, 128, 0, stream>>>( t, post, rank, hc, outputs, rows );
-		const size_t smem = static_cast<size_t>( 8 ) * rank * sizeof( float );
-		switch ( rank / 64 ) {
-			case 5: gr_up_mix_rows_kernel<5, GRD_M><<<hidden / ( 8 * GRD_M ), 256, smem, stream>>>( normed, up, t, mixed, hidden, hc, rank, rows ); break;
-			case 4: gr_up_mix_rows_kernel<4, GRD_M><<<hidden / ( 8 * GRD_M ), 256, smem, stream>>>( normed, up, t, mixed, hidden, hc, rank, rows ); break;
-			case 6: gr_up_mix_rows_kernel<6, GRD_M><<<hidden / ( 8 * GRD_M ), 256, smem, stream>>>( normed, up, t, mixed, hidden, hc, rank, rows ); break;
-			default: GR_UPMIX( 8 ); break;
-		}
+		#define GR_UPMIX_ROWS( NR ) \
+			switch ( rank / 64 ) { \
+				case 5: gr_up_mix_rows_kernel<5, GRD_M, NR><<<hidden / ( 8 * GRD_M ), 256, NR * rank * sizeof( float ), stream>>>( normed, up, t, mixed, hidden, hc, rank, rows ); break; \
+				case 4: gr_up_mix_rows_kernel<4, GRD_M, NR><<<hidden / ( 8 * GRD_M ), 256, NR * rank * sizeof( float ), stream>>>( normed, up, t, mixed, hidden, hc, rank, rows ); break; \
+				case 6: gr_up_mix_rows_kernel<6, GRD_M, NR><<<hidden / ( 8 * GRD_M ), 256, NR * rank * sizeof( float ), stream>>>( normed, up, t, mixed, hidden, hc, rank, rows ); break; \
+				default: GR_UPMIX( NR ); break; \
+			}
+		if ( rows <= 8 ) { GR_UPMIX_ROWS( 8 ); }
+		else { GR_UPMIX_ROWS( 16 ); }
+		#undef GR_UPMIX_ROWS
 	}
 	else if ( rows <= 4 ) { GR_FAST( 4 ); }
-	else { GR_FAST( 8 ); }
+	else if ( rows <= 8 ) { GR_FAST( 8 ); }
+	else { GR_FAST( 16 ); }
 	#undef GR_FAST
 	#undef GR_UPMIX
 }
@@ -725,7 +738,7 @@ void GatedResidual::mix(
 ) {
 	ENGINE_ASSERT( hc == 4 && ( hc * hidden ) % 1024 == 0 && hidden % GR_DT == 0 && rank % 64 == 0, "GatedResidual::mix: shape" );
 	// Decode-sized calls take the streaming kernels (hc 4, flat <= 10240, hidden % 8, rank <= 384); anything else the row-tile ones
-	const bool fast = rows <= 8 && hc * hidden <= 8 * GRD_CHUNKS * GRD_THREADS && hidden % GRD_CH == 0 && rank <= 384;
+	const bool fast = rows <= 16 && hc * hidden <= 8 * GRD_CHUNKS * GRD_THREADS && hidden % GRD_CH == 0 && rank <= 384;
 	mix_rows( x, reinterpret_cast<const half*>( norm_w ), reinterpret_cast<const half*>( down ), reinterpret_cast<const half*>( up ), reinterpret_cast<const half*>( inject ),
 		reinterpret_cast<half*>( mixed ), post, scratch, rows, hidden, hc, rank, eps, stream, prev_post, reinterpret_cast<const half*>( prev_y ), fast );
 }
@@ -735,7 +748,7 @@ void GatedResidual::mix_prenormed(
 	int rows, int hidden, int hc, int rank, backend::stream_t stream, float* t_scratch
 ) {
 	ENGINE_ASSERT( hc == 4 && ( hc * hidden ) % 1024 == 0 && hidden % GR_DT == 0 && rank % 64 == 0, "GatedResidual::mix_prenormed: shape" );
-	ENGINE_ASSERT( rows <= 8 && hc * hidden <= 8 * GRD_CHUNKS * GRD_THREADS && hidden % GRD_CH == 0 && rank <= 384, "GatedResidual::mix_prenormed: decode-sized calls only" );
+	ENGINE_ASSERT( rows <= 16 && hc * hidden <= 8 * GRD_CHUNKS * GRD_THREADS && hidden % GRD_CH == 0 && rank <= 384, "GatedResidual::mix_prenormed: decode-sized calls only" );
 	float* t = t_scratch != nullptr ? t_scratch : scratch + static_cast<size_t>( rows ) * hc * hidden;
 	mix_fast( scratch, reinterpret_cast<const half*>( down ), reinterpret_cast<const half*>( up ), reinterpret_cast<const half*>( inject ), reinterpret_cast<half*>( mixed ),
 		post, t, rows, hidden, hc, rank, stream );

@@ -8,6 +8,8 @@
 #   models          tier 2 tests that load a checkpoint from $ENGINE_MODEL_ROOT (parity, coherence, prefix restore, sampling)
 #   parity          fast + models
 #   bench           GPU: bench_decode / bench_accept / bench_prefill for both models
+#   kernels         GPU 0: bench_kernels projection sweep (every format, 1 to 512 rows); kernel_cliffs.py lists the cliffs and fails on cells > 5%
+#                   slower than tests/baselines/kernels.csv (saved if absent; delete it to re-baseline after an intended change)
 #   needle          GPU: 8K needle retrieval, greedy and speculative, all three models (Flash-Next also at 12K, past its QSA budget)
 #   baseline <tag>  GPU: parity + bench + needle, bench numbers saved to results/baseline_<tag>.txt
 #   compare <tag>   GPU: bench again and diff against results/baseline_<tag>.txt (flags > 1% regressions)
@@ -192,6 +194,23 @@ case $mode in
 	parity) tier2 ;;
 	bench) benches; cat $out/bench_numbers.txt ;;
 	needle) needles ;;
+	kernels)
+		run bench_kernels gpu ./bench_kernels
+		grep -v '^\[' $out/bench_kernels.log > $out/kernels.csv
+		if [[ ! -f $ROOT/tests/baselines/kernels.csv ]]; then cp $out/kernels.csv $ROOT/tests/baselines/kernels.csv; echo "saved tests/baselines/kernels.csv"; fi
+		python3 -I $ROOT/tests/tools/kernel_cliffs.py $out/kernels.csv --baseline $ROOT/tests/baselines/kernels.csv > $out/cliffs.txt
+		krc=$?
+		# a slow cell has to reproduce: the shapes with one are measured twice more and every cell keeps its fastest run
+		if [[ $krc -ne 0 ]]; then
+			echo "shape,format,rows,us" > $out/kernels_again.csv
+			for sh in ${(f)"$(grep REGRESSION $out/cliffs.txt | sed 's| / .*||' | sort -u)"}; do
+				for i in 1 2; do gpu ./bench_kernels --only "$sh" 2>/dev/null | grep -v '^\[' | tail -n +2 >> $out/kernels_again.csv; done
+			done
+			python3 -I $ROOT/tests/tools/kernel_cliffs.py $out/kernels.csv $out/kernels_again.csv --baseline $ROOT/tests/baselines/kernels.csv > $out/cliffs.txt
+			krc=$?
+		fi
+		if [[ $krc -eq 0 ]]; then echo "[ok]   kernels: no cell slower than the baseline ($(grep -vc REGRESSION $out/cliffs.txt) cliffs listed in $out/cliffs.txt)"
+		else echo "[FAIL] kernels: $(grep -c REGRESSION $out/cliffs.txt) cells slower than the baseline (see $out/cliffs.txt)"; fails=$((fails+1)); fi ;;
 	baseline)
 		[[ -n $tag ]] || { echo "usage: gate.sh baseline <tag>"; exit 2; }
 		tier2; needles; benches
