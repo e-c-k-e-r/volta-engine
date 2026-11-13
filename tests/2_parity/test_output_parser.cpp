@@ -76,6 +76,27 @@ int main() {
 	check_chunking( "glm missing arg_value end", ModelFamily::GLM, false, "<tool_call>f<arg_key>n</arg_key><arg_value>7</tool_call>",
 		{ "", "", { { "f", R"({"n":7})" } } }, tools );
 
+	// Numbers as written: integers past 64 bits keep their digits (re-serializing would round them); NaN / Infinity are not JSON and a number
+	// past the double range would come back as null, so those stay strings
+	check_chunking( "qwen big and non-finite numbers", ModelFamily::QWEN, false,
+		"<tool_call>\n<function=f>\n<parameter=n>\n123456789012345678901234567890\n</parameter>\n<parameter=o>\n1e999\n</parameter>\n<parameter=x>\nNaN\n</parameter>\n<parameter=y>\n-Infinity\n</parameter>\n</function>\n</tool_call>",
+		{ "", "", { { "f", R"({"n":123456789012345678901234567890,"o":"1e999","x":"NaN","y":"-Infinity"})" } } }, tools );
+	check_chunking( "glm big number", ModelFamily::GLM, false, "<tool_call>f<arg_key>n</arg_key><arg_value>-98765432109876543210</arg_value></tool_call>",
+		{ "", "", { { "f", R"({"n":-98765432109876543210})" } } }, tools );
+	check_chunking( "glm nested number kept", ModelFamily::GLM, false, "<tool_call>f<arg_key>o</arg_key><arg_value>{\"a\": 1.50, \"b\": 99999999999999999999}</arg_value></tool_call>",
+		{ "", "", { { "f", R"({"o":{"a":1.50,"b":99999999999999999999}})" } } }, tools );
+
+	// Calls cut at the end of generation (a stop right after the call, before its closing marker): a complete call is still a call
+	check_chunking( "qwen call at finish", ModelFamily::QWEN, false, "Ok.\n<tool_call>\n<function=f>\n<parameter=n>\n7\n</parameter>\n</function>",
+		{ "", "Ok.", { { "f", R"({"n":7})" } } }, tools );
+	check_chunking( "glm call at finish", ModelFamily::GLM, false, "<tool_call>f<arg_key>n</arg_key><arg_value>7</arg_value>",
+		{ "", "", { { "f", R"({"n":7})" } } }, tools );
+	check_chunking( "gemma call at finish", ModelFamily::GEMMA, false, "<|tool_call>call:f{n:1}",
+		{ "", "", { { "f", R"({"n":1})" } } }, tools );
+	check_chunking( "deepseek call at finish", ModelFamily::DEEPSEEK, false,
+		"<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"n\" string=\"false\">7</｜DSML｜ parameter>\n",
+		{ "", "", { { "f", R"({"n":7})" } } }, tools );
+
 	// GLM
 	check_chunking( "glm think+content", ModelFamily::GLM, true, "reason</think>Answer", { "reason", "Answer", {} } );
 	check_chunking( "glm call", ModelFamily::GLM, true, "r</think>go<tool_call>f<arg_key>s</arg_key><arg_value>007</arg_value><arg_key>n</arg_key><arg_value>42</arg_value></tool_call>",

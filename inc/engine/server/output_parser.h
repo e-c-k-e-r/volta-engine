@@ -49,6 +49,7 @@ private:
 	void emit_text( OutputEvent::Type type, const std::string& s, std::vector<OutputEvent>& events );
 	void end_section();
 	bool parse_tool_call( const std::string& body, ToolCallOut* out ) const;
+	bool call_complete( const std::string& body ) const;   // an unterminated call body that ends where a complete call ends
 	std::string decode_value( const std::string& tool, const std::string& key, const std::string& raw ) const;
 
 	engine::loader::ModelFamily family_;

@@ -25,6 +25,31 @@ size_t partial_suffix( const std::string& s, const std::string& marker ) {
 	return 0;
 }
 
+// A value the model wrote as JSON, as written: the text without the whitespace outside strings. Re-serializing the parsed value would
+// round integers past 64 bits and rewrite 1.50 as 1.5. False when the text is not JSON (NaN, Infinity) or holds a number outside the
+// double range (1e999 would re-serialize as null): the caller keeps those as strings.
+bool json_as_written( const std::string& text, std::string* out ) {
+	const auto j = nlohmann::json::parse( text, nullptr, false );
+	if ( text.empty() || j.is_discarded() ) return false;   // includes numbers outside the double range, which the API layers could not re-parse
+	std::string o;
+	o.reserve( text.size() );
+	bool in_str = false, esc = false;
+	for ( char c : text ) {
+		if ( in_str ) {
+			o += c;
+			if ( esc ) esc = false;
+			else if ( c == '\\' ) esc = true;
+			else if ( c == '"' ) in_str = false;
+			continue;
+		}
+		if ( is_ws( c ) ) continue;
+		if ( c == '"' ) in_str = true;
+		o += c;
+	}
+	*out = std::move( o );
+	return true;
+}
+
 // Gemma 4's argument syntax as JSON text: <|"|>string<|"|>, {key:value,...} (keys bare or quoted), [values], numbers, true / false /
 // null; a bare word that is none of those becomes a string. Advances `p`; false on a malformed value.
 const char* const kGemmaQuote = "<|\"|>";
@@ -112,8 +137,8 @@ bool gemma_value( const std::string& s, size_t& p, std::string* out ) {
 	while ( p < s.size() && s[p] != ',' && s[p] != '}' && s[p] != ']' ) ++p;
 	std::string word = s.substr( b, p - b );
 	while ( !word.empty() && is_ws( word.back() ) ) word.pop_back();
-	const auto j = nlohmann::json::parse( word, nullptr, false );
-	*out = ( !word.empty() && !j.is_discarded() && !j.is_string() ) ? j.dump() : nlohmann::json( word ).dump();
+	std::string as_written;
+	*out = ( json_as_written( word, &as_written ) && as_written.front() != '"' ) ? as_written : nlohmann::json( word ).dump();
 	return true;
 }
 
@@ -254,8 +279,17 @@ void OutputParser::process( std::vector<OutputEvent>& events, bool final ) {
 		const size_t p = buf_.find( call_close_ );
 		if ( p == std::string::npos ) {
 			if ( final ) {
-				// unterminated call: hand the raw text back as content rather than dropping it
-				emit_text( OutputEvent::Type::Content, call_open_ + buf_, events );
+				// generation stopped inside the call: a call whose last part is complete is still a call (the closing marker was all that
+				// was left); anything shorter goes back as content rather than being dropped
+				ToolCallOut call;
+				if ( call_complete( buf_ ) && parse_tool_call( buf_, &call ) ) {
+					OutputEvent ev;
+					ev.type = OutputEvent::Type::ToolCall;
+					ev.call = std::move( call );
+					events.push_back( std::move( ev ) );
+					saw_tool_call_ = true;
+				}
+				else emit_text( OutputEvent::Type::Content, call_open_ + buf_, events );
 				buf_.clear();
 			}
 			return;
@@ -278,6 +312,18 @@ void OutputParser::process( std::vector<OutputEvent>& events, bool final ) {
 	}
 }
 
+bool OutputParser::call_complete( const std::string& body ) const {
+	std::string b = body;
+	while ( !b.empty() && is_ws( b.back() ) ) b.pop_back();
+	auto ends_with = [&]( const std::string& m ) { return b.size() >= m.size() && b.compare( b.size() - m.size(), m.size(), m ) == 0; };
+	switch ( family_ ) {
+		case engine::loader::ModelFamily::DEEPSEEK: return ends_with( "</｜DSML｜ parameter>" );
+		case engine::loader::ModelFamily::GLM: return ends_with( "</arg_value>" );
+		case engine::loader::ModelFamily::GEMMA: return ends_with( "}" );   // parse_tool_call checks that the object closes there
+		default: return ends_with( "</function>" );
+	}
+}
+
 std::string OutputParser::decode_value( const std::string& tool, const std::string& key, const std::string& raw ) const {
 	// returns the JSON text of the argument value
 	std::string type;
@@ -292,8 +338,8 @@ std::string OutputParser::decode_value( const std::string& tool, const std::stri
 		while ( b < e && is_ws( trimmed[b] ) ) ++b;
 		while ( e > b && is_ws( trimmed[e - 1] ) ) --e;
 		trimmed = trimmed.substr( b, e - b );
-		auto j = nlohmann::json::parse( trimmed, nullptr, false );
-		if ( !trimmed.empty() && !j.is_discarded() ) return j.dump();
+		std::string as_written;
+		if ( json_as_written( trimmed, &as_written ) ) return as_written;
 	}
 	return nlohmann::json( raw ).dump();
 }
@@ -325,10 +371,7 @@ bool OutputParser::parse_tool_call( const std::string& body, ToolCallOut* out ) 
 			if ( last_open ) ve = body.size();
 			const std::string raw = body.substr( gt + 1, ve - gt - 1 );
 			std::string value = nlohmann::json( raw ).dump();
-			if ( !is_str ) {
-				const auto j = nlohmann::json::parse( raw, nullptr, false );
-				if ( !j.is_discarded() ) value = j.dump();
-			}
+			if ( !is_str ) json_as_written( raw, &value );
 			args += ( k ? "," : "" ) + nlohmann::json( key ).dump() + ":" + value;
 			if ( last_open ) break;
 			pos = ve + pclose.size();
