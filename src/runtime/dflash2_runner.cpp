@@ -216,24 +216,26 @@ int DFlash2Runner::draft_block( int slot, int anchor, int pos, float depth_thres
 			spec_[d].draft_backbone( *hk.embedding, anchor, hk.taps + static_cast<size_t>( per_slot_ ? slot : 0 ) * hk.taps_slot_stride, pos, hk.taps_cap, mc.stream( d ) );
 			backend::memcpy_async( hk.lm_in, spec_[d].draft_hidden().data, hid_bytes, backend::Copy::D2D, mc.stream( d ) );
 			mc.model( d ).draft_head_topk( M, mc.stream( d ) );
-			backend::stream_sync( mc.stream( d ) );
 		} );
 	}
 	else {
 		backend::set_device( 0 );
 		if ( per_slot_ ) spec_[0].set_context( slot );
 		spec_[0].draft_backbone( *hk0.embedding, anchor, hk0.taps + static_cast<size_t>( per_slot_ ? slot : 0 ) * hk0.taps_slot_stride, pos, hk0.taps_cap, s0 );
-		// Peer the hidden rows to every rank, then run each rank's head shard on its own worker/stream.
+		// Peer the hidden rows to every rank, then run each rank's head shard on its own worker/stream once its copy has landed.
 		const pod::TensorView& dh = spec_[0].draft_hidden();
 		for ( int d = 0; d < mc.tp(); ++d ) {
 			backend::peer_copy_async( mc.model( d ).draft_hooks().lm_in, d, dh.ptr<const backend::half_t>(), 0, hid_bytes, s0 );
 		}
-		backend::stream_sync( s0 );
-		mc.run_ranks( [&]( int d ) {
-			mc.model( d ).draft_head_topk( M, mc.stream( d ) );
-			backend::stream_sync( mc.stream( d ) );
-		} );
+		for ( int d = 0; d < mc.tp(); ++d ) {
+			backend::set_device( d );
+			backend::stream_wait_peer( mc.stream( d ), s0, 0 );
+		}
+		mc.run_ranks( [&]( int d ) { mc.model( d ).draft_head_topk( M, mc.stream( d ) ); } );
 	}
+	// Rank 0's stream waits for every rank's head on the device (no host round trip until the drafted tokens are read)
+	backend::set_device( 0 );
+	for ( int d = 1; d < mc.tp(); ++d ) backend::stream_wait_peer( s0, mc.stream( d ), d );
 
 	// Diagnostic (debug option dump_draft_round = <round>): writes that round's inputs and the drafter hidden to
 	// /tmp/draft_dump.bin for comparison against an independent implementation (tests/2_parity/draft_oracle.py). Header (int32): pos, anchor,

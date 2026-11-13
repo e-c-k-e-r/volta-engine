@@ -29,6 +29,8 @@ void stream_sync( stream_t s );
 // One queue: side streams are the main stream, so ordering is implicit
 inline void stream_fork( stream_t, stream_t ) {}
 inline void stream_join( stream_t, stream_t ) {}
+// Cross-device ordering (the CUDA one waits on the device): here the side stream is drained from the host
+inline void stream_wait_peer( stream_t, stream_t side, int ) { stream_sync( side ); }
 void device_sync();
 
 void memcpy_async( void* dst, const void* src, size_t bytes, Copy dir, stream_t s );

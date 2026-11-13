@@ -32,6 +32,8 @@ inline void stream_destroy( stream_t ) {}
 inline void stream_sync( stream_t ) {}
 inline void stream_fork( stream_t, stream_t ) {}
 inline void stream_join( stream_t, stream_t ) {}
+// Cross-device ordering (the CUDA one waits on the device): here the side stream is drained from the host
+inline void stream_wait_peer( stream_t, stream_t side, int ) { stream_sync( side ); }
 inline void device_sync() {}
 
 inline void memcpy_async( void* dst, const void* src, size_t bytes, Copy, stream_t ) { if ( bytes ) std::memmove( dst, src, bytes ); }

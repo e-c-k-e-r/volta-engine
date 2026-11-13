@@ -32,6 +32,19 @@ inline cudaEvent_t& fork_event() {
 }
 inline void stream_fork( stream_t main, stream_t side ) { ENGINE_CHECK( cudaEventRecord( fork_event(), main ) ); ENGINE_CHECK( cudaStreamWaitEvent( side, fork_event(), 0 ) ); }
 inline void stream_join( stream_t main, stream_t side ) { ENGINE_CHECK( cudaEventRecord( fork_event(), side ) ); ENGINE_CHECK( cudaStreamWaitEvent( main, fork_event(), 0 ) ); }
+// Cross-device ordering: `main` (any device) waits for everything queued so far on `side`, a stream of device side_dev, without a host wait.
+// One event per side device, recorded and waited on in program order by the caller's thread (the wait takes the event's state at enqueue time).
+inline void stream_wait_peer( stream_t main, stream_t side, int side_dev ) {
+	static cudaEvent_t events[ENGINE_NUM_GPUS] = {};
+	ENGINE_ASSERT( side_dev >= 0 && side_dev < ENGINE_NUM_GPUS, "stream_wait_peer: device out of range" );
+	int cur = 0;
+	ENGINE_CHECK( cudaGetDevice( &cur ) );
+	if ( cur != side_dev ) ENGINE_CHECK( cudaSetDevice( side_dev ) );
+	if ( events[side_dev] == nullptr ) ENGINE_CHECK( cudaEventCreateWithFlags( &events[side_dev], cudaEventDisableTiming ) );
+	ENGINE_CHECK( cudaEventRecord( events[side_dev], side ) );
+	if ( cur != side_dev ) ENGINE_CHECK( cudaSetDevice( cur ) );
+	ENGINE_CHECK( cudaStreamWaitEvent( main, events[side_dev], 0 ) );
+}
 inline void device_sync() { ENGINE_CHECK( cudaDeviceSynchronize() ); }
 
 inline void memcpy_async( void* dst, const void* src, size_t bytes, Copy dir, stream_t s ) {
