@@ -57,7 +57,6 @@ __device__ __noinline__ void moe_gemm_m64(
 
 // Expert GEMM over `rows` gathered tokens. wide = 0: the 4-row tile only (decode); 2: 16-row tile above 4 rows; 3 (prefill chunks): 16-row tile
 // for 5..16 rows and a 32-row tile above, which decodes each weight tile once for both row blocks.
-// (exl3_gemm_kernel_inner_m64 exists but disagrees with the 16-row kernel: cos 0.96 on expert batches above 4 rows.)
 template<int t_bits, int MOE_TILESIZE_N, int cb, int wide>
 __device__ inline void moe_gemm(
 	const half* in_addr,

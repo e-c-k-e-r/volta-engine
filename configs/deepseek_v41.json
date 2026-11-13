@@ -12,6 +12,7 @@
 		"prefill_window": 16,
 		"speculator": "dspark",
 		"dspark_conf": 0.7,
-		"max_image_tokens": 576
+		"max_image_tokens": 576,
+		"vram_reserve_mib": 256
 	}
 }
