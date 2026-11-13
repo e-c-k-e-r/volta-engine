@@ -12,6 +12,7 @@ namespace cg = cooperative_groups;
 #include "exl3_gemv_kernel.cuh"
 #include "exl3_moe_coop.cuh"
 #include "trellis_context.h"
+#include "engine/runtime/options.h"
 
 // 1: real Volta m8n8k4 tile (FP32 accumulate); 0: m16n8k16 (native on SM_80+, shuffle/HFMA2 emulation on SM_70). Per device pass:
 // SM_80+ has no native m8n8k4 (ptxas expands each into ~80 FFMA / SHFL instructions)
@@ -1180,9 +1181,13 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	const int grid_b = slots * ( p.H / tcols );
 
 	// Tile: 1 int8 dp4a for one-row decode; with more rows 3 = dp4a for runs of up to 4 rows and fp16 tensor core above
-	// (dp4a on wider runs re-reads the weights in 4-row passes and loses to the tensor core there)
+	// (dp4a on wider runs re-reads the weights in 4-row passes and loses to the tensor core there). The Volta tile order takes the tensor
+	// core from 3 rows: its lane's values are the m8n8k4 operands as they decode (2 MMAs a tile, no shuffles, against 8 and 16 in the stock
+	// order), while its dp4a path splats every activation for one weight instead of two (GLM's 3-bit experts at 3 to 16 rows: 0.80 to 0.92
+	// of the dp4a time, 2 rows 1.16)
 	const bool mixed = p.bits_tab != nullptr || ( p.bits_g != 0 && ( p.bits_g != p.bits_u || p.bits_u != p.bits_d ) );
-	const int mode = mixed || p.bits != 3 ? 0 : ( p.bsz == 1 ? 1 : 3 );
+	const int forced = engine::runtime::options().moe_coop_mode;
+	const int mode = mixed || p.bits != 3 ? 0 : forced >= 0 ? forced : p.bsz == 1 ? 1 : ( EXL3_VOLTA_LAYOUT && p.bsz >= 3 ) ? 0 : 3;
 	const int stage_rows = mode == 1 ? 1 : ( mode >= 2 ? 4 : 0 );
 	// int8 activation staging: 2 x 16 B per k-tile per k-slab
 	constexpr int wkk = WK / WN;
