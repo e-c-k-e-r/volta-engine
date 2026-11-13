@@ -112,7 +112,7 @@ void LinearTrellis::forward(
 #if defined(USE_ROCM)
 	else if ( m <= gemv_max && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 #else
-	else if ( m <= 8 && ( m == 1 || m == 2 || m == 4 || m == 8 ) && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
+	else if ( m <= 8 && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {   // the GEMV takes any 2 to 8 rows (row-guarded loads); the GEMM tile costs about twice as much there
 #endif
 		EXL3_TILES_CALL( volta_tiles, exl3_gemv, x_ptr, trellis_ptr, out_ptr, suh_ptr, A_had, svh_ptr, m, k, n, bits, mcg, mul1, c_fp32, stream );
 	}
