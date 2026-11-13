@@ -20,6 +20,9 @@ struct DeepseekV41VisionConfig {
 
 	int head_dim() const { return hidden / heads; }
 	int patch_dim() const { return 3 * patch_size * patch_size; }
+	// the patch rows and the patch-embedding weight as stored on the device: zero-padded to whole 8-element groups (588 -> 592), which the
+	// tensor-core GEMM needs; the zero columns add nothing
+	int patch_cols() const { return ( patch_dim() + 7 ) / 8 * 8; }
 };
 
 // The DeepSeek-V4.1 image encoder (inference/vision.py): a patch projection, RMSNorm + SwiGLU ViT blocks over the whole image with a fused

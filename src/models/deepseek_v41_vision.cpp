@@ -1,3 +1,5 @@
+#include "engine/core/arena.h"
+#include <vector>
 #include "engine/models/deepseek_v41_vision.h"
 #include "engine/modules/vision.h"
 #include "engine/modules/swiglu.h"
@@ -98,7 +100,7 @@ bool DeepseekV41VisionTower::load( const char* model_dir, pod::MemoryArena& aren
 	}
 	cfg_.out_hidden = aligner_out( repo );
 	const size_t M = static_cast<size_t>( max_patches_ ), H = cfg_.hidden, T = static_cast<size_t>( max_tokens_ ), O = cfg_.out_hidden, I = cfg_.intermediate;
-	const size_t scratch = M * ( cfg_.patch_dim() * 2 + 64 * 8 + H * 4 + H * 2 * 6 + I * 2 * 3 ) + T * ( H * 9 * 2 + O * 2 * 2 ) + ( 16u << 20 );
+	const size_t scratch = M * ( cfg_.patch_cols() * 2 + 64 * 8 + H * 4 + H * 2 * 6 + I * 2 * 3 ) + T * ( H * 9 * 2 + O * 2 * 2 ) + ( 16u << 20 );
 	const size_t weights = tower_bytes( repo, cfg_.depth ) + 3 * O * 2;
 	if ( !vision_fits( arena, weights + scratch, "the DeepSeek vision tower" ) ) {
 		repo.close();
@@ -121,6 +123,16 @@ bool DeepseekV41VisionTower::load( const char* model_dir, pod::MemoryArena& aren
 		return pod::LinearWeight::make_fp16( pod::make_tensor_2d( t.ptr<backend::half_t>() + static_cast<size_t>( row0 ) * k, pod::DType::FP16, k, n ) );   // Linear takes k from shape[0]
 	};
 	patch_w_ = fp16( "vision.patch_embed.proj.weight" );   // [hidden, 3 * 14 * 14]
+	if ( cfg_.patch_cols() != cfg_.patch_dim() ) {
+		// [hidden, 588] -> [hidden, 592] with zero columns (patch_cols)
+		const int P = cfg_.patch_dim(), Pc = cfg_.patch_cols(), Hd = patch_w_.shape[0];
+		std::vector<backend::half_t> src( static_cast<size_t>( Hd ) * P ), dst( static_cast<size_t>( Hd ) * Pc, backend::from_float_half( 0.0f ) );
+		backend::memcpy_sync( src.data(), patch_w_.data, src.size() * sizeof( backend::half_t ), backend::Copy::D2H );
+		for ( int r = 0; r < Hd; ++r ) std::copy( src.begin() + static_cast<size_t>( r ) * P, src.begin() + static_cast<size_t>( r + 1 ) * P, dst.begin() + static_cast<size_t>( r ) * Pc );
+		int shape[2] = { Hd, Pc };
+		patch_w_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
+		backend::memcpy_sync( patch_w_.data, dst.data(), dst.size() * sizeof( backend::half_t ), backend::Copy::H2D );
+	}
 	patch_b_ = fp16( "vision.patch_embed.proj.bias" );
 	norm_w_ = fp16( "vision.norm.weight" );
 	blocks_.resize( cfg_.depth );
@@ -173,7 +185,7 @@ bool DeepseekV41VisionTower::load( const char* model_dir, pod::MemoryArena& aren
 	}
 	repo.close();
 
-	d_patches_ = take<backend::half_t>( arena, M * cfg_.patch_dim() );
+	d_patches_ = take<backend::half_t>( arena, M * cfg_.patch_cols() );
 	d_cos_ = take<float>( arena, M * 64 );
 	d_sin_ = take<float>( arena, M * 64 );
 	d_hidden_ = take<float>( arena, M * H );
@@ -223,9 +235,18 @@ bool DeepseekV41VisionTower::encode( const engine::loader::PreparedImage& img, s
 			}
 		}
 	}
-	const size_t patch_floats = static_cast<size_t>( m ) * P;
+	// the patch rows at patch_cols columns, the tail zero
+	const int Pc = cfg_.patch_cols();
+	const size_t patch_floats = static_cast<size_t>( m ) * Pc;
 	ENGINE_ASSERT( patch_floats * sizeof( float ) <= static_cast<size_t>( max_patches_ ) * I * sizeof( backend::half_t ), "vision: patch staging does not fit" );
-	backend::memcpy_async( d_mlp_, img.patches.data(), patch_floats * sizeof( float ), backend::Copy::H2D, stream );
+	std::vector<float> padded;
+	const float* patch_src = img.patches.data();
+	if ( Pc != P ) {
+		padded.assign( patch_floats, 0.0f );
+		for ( int r = 0; r < m; ++r ) std::copy( img.patches.begin() + static_cast<size_t>( r ) * P, img.patches.begin() + static_cast<size_t>( r + 1 ) * P, padded.begin() + static_cast<size_t>( r ) * Pc );
+		patch_src = padded.data();
+	}
+	backend::memcpy_async( d_mlp_, patch_src, patch_floats * sizeof( float ), backend::Copy::H2D, stream );
 	backend::memcpy_async( d_cos_, cs.data(), cs.size() * sizeof( float ), backend::Copy::H2D, stream );
 	backend::memcpy_async( d_sin_, sn.data(), sn.size() * sizeof( float ), backend::Copy::H2D, stream );
 	backend::stream_sync( stream );   // the staging vectors die at return
@@ -238,7 +259,7 @@ bool DeepseekV41VisionTower::encode( const engine::loader::PreparedImage& img, s
 		engine::modules::Linear::forward( xv, w, ov, stream );
 	};
 	Vision::f32_to_f16( reinterpret_cast<const float*>( d_mlp_ ), d_patches_, patch_floats, stream );
-	Vision::patch_embed( d_patches_, patch_w_.ptr<const backend::half_t>(), patch_b_.ptr<const backend::half_t>(), nullptr, d_hidden_, m, H, P, stream );
+	Vision::patch_embed( d_patches_, patch_w_.ptr<const backend::half_t>(), patch_b_.ptr<const backend::half_t>(), nullptr, d_hidden_, m, H, Pc, stream );
 	const float scale = 1.0f / std::sqrt( static_cast<float>( hd ) );
 	for ( const Block& b : blocks_ ) {
 		Vision::rms_norm( d_hidden_, b.norm1_w.ptr<const backend::half_t>(), d_ln_, m, H, cfg_.eps, stream );

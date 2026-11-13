@@ -22,7 +22,11 @@ static bool one_ulp_tie( ModelCluster& mc, const std::vector<int>& prompt, const
 	for ( size_t i = 0; i < d; ++i ) mc.forward( &plain[i], 1, pos++, 0 );
 	Candidates cs[1];
 	mc.sample_topk( 1, cs );
-	if ( cs[0].ids[0] != plain[d] || cs[0].ids[1] != spec_token ) return false;
+	if ( cs[0].ids[0] != plain[d] || cs[0].ids[1] != spec_token ) {
+		std::printf( "   the replayed step's top-2 are id %d (%.5f) and id %d (%.5f), not plain's %d and the speculative %d\n", cs[0].ids[0], cs[0].logits[0],
+			cs[0].ids[1], cs[0].logits[1], plain[d], spec_token );
+		return false;
+	}
 	const float top = cs[0].logits[0], gap = top - cs[0].logits[1];
 	const float ulp = std::ldexp( 1.0f, std::ilogb( std::fabs( top ) ) - 10 );
 	std::printf( "   at that step plain's top-2 logits are %.5f (id %d) and %.5f (id %d): gap %.5f, one FP16 ulp %.5f\n", top, cs[0].ids[0], cs[0].logits[1], cs[0].ids[1], gap, ulp );
