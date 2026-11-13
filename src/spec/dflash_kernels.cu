@@ -484,12 +484,13 @@ void dflash_qk_norm_rope_kernel(
 	int pairs,
 	int pos0,
 	float eps,
-	float constant_bias
+	float constant_bias,
+	const int* __restrict__ pos0_dev
 ) {
 	const int row = blockIdx.y;
 	const int head = blockIdx.x;
 	if ( row >= rows || head >= heads ) return;
-	const int pos = pos0 + row;
+	const int pos = ( pos0_dev != nullptr ? *pos0_dev : pos0 ) + row;
 
 	half* hrow = x + ( static_cast<int64_t>( row ) * heads + head ) * head_dim;
 	const int tid = threadIdx.x;
@@ -772,12 +773,13 @@ void dflash_qk_norm_rope(
 	int pos0,
 	float eps,
 	float constant_bias,
-	cudaStream_t stream
+	cudaStream_t stream,
+	const int* pos0_dev
 ) {
 	if ( rows <= 0 || heads <= 0 ) return;
 	dim3 grid( heads, rows );
 	dflash_qk_norm_rope_kernel<<<grid, 256, 0, stream >>>(
-		x, weight, rope_theta, rows, heads, head_dim, pairs, pos0, eps, constant_bias );
+		x, weight, rope_theta, rows, heads, head_dim, pairs, pos0, eps, constant_bias, pos0_dev );
 }
 
 #if defined(USE_ROCM)
@@ -805,8 +807,21 @@ void dflash_attn_split_kernel(
 	int nctx, int first_ctx, int ring_slots, int ctx_layer,
 	int stride_slot, int stride_layer, int stride_head,
 	int own_slot, int own_first_row,
-	float scale, int nsplit, int keys_per_split, int causal
+	float scale, int nsplit, int keys_per_split, int causal,
+	const int* __restrict__ ctx_dev, int base_blocks
 ) {
+	// ctx_dev (graph replays): the context length and first slot come from the device and the split is derived here exactly as
+	// dflash_attn_split_launch derives it on the host; the grid carries the most splits the ring can need and the rest mark themselves empty
+	if ( ctx_dev != nullptr ) {
+		nctx = ctx_dev[0];
+		first_ctx = ctx_dev[1];
+		const int nk = nctx + max( rows - own_first_row, 0 );
+		const int ntiles = ( nk + DFS_BK - 1 ) / DFS_BK;
+		const int ns = max( 1, min( ( 160 + base_blocks - 1 ) / base_blocks, min( ntiles, DFS_MAX_SPLIT ) ) );
+		keys_per_split = ( ( ntiles + ns - 1 ) / ns ) * DFS_BK;
+		nsplit = ( nk + keys_per_split - 1 ) / keys_per_split;
+	}
+	const int ws_splits = gridDim.z;   // the workspace stride (equals nsplit on host launches)
 	extern __shared__ float dfs_smem[];
 	float* sQ = dfs_smem;                                  // [32 slots][128]
 	float* sK = sQ + DFS_SLOTS * DFS_HD;                   // [32 keys][129]
@@ -823,6 +838,17 @@ void dflash_attn_split_kernel(
 	const int nkeys = nctx + ( rows - own_first_row );
 	const int k0 = split * keys_per_split;
 	const int k1 = min( nkeys, k0 + keys_per_split );
+	if ( split >= nsplit ) {
+		if ( tid < DFS_SLOTS ) {
+			const int qi = qtile * DFS_SLOTS + tid;
+			if ( qi < nslots ) {
+				float* dst = ws + ( ( static_cast<int64_t>( qi / G ) * q_heads + kvh * G + qi % G ) * ws_splits + split ) * DFS_WS_STRIDE;
+				dst[0] = -INFINITY;
+				dst[1] = 0.0f;
+			}
+		}
+		return;
+	}
 
 	for ( int u = tid; u < DFS_SLOTS * DFS_HD; u += 256 ) {
 		const int s = u / DFS_HD, d = u % DFS_HD;
@@ -925,7 +951,7 @@ void dflash_attn_split_kernel(
 
 	const int qi = qtile * DFS_SLOTS + pv_slot;
 	if ( qi < nslots ) {
-		float* dst = ws + ( ( static_cast<int64_t>( qi / G ) * q_heads + kvh * G + qi % G ) * nsplit + split ) * DFS_WS_STRIDE;
+		float* dst = ws + ( ( static_cast<int64_t>( qi / G ) * q_heads + kvh * G + qi % G ) * ws_splits + split ) * DFS_WS_STRIDE;
 		if ( ( tid & 7 ) == 0 ) { dst[0] = sM[pv_slot]; dst[1] = sL[pv_slot]; }
 		#pragma unroll
 		for ( int i = 0; i < 16; ++i ) dst[2 + pv_d0 + i] = o[i];
@@ -955,11 +981,12 @@ static bool dflash_attn_split_launch(
 	const half* q, const half* kcache, const half* vcache, half* out,
 	int rows, int q_heads, int kv_heads, int head_dim,
 	int nctx, int first_ctx, int ring_slots, int ctx_layer,
-	int stride_slot, int stride_layer, int stride_head, int own_slot, int own_first_row, int causal, cudaStream_t stream
+	int stride_slot, int stride_layer, int stride_head, int own_slot, int own_first_row, int causal, cudaStream_t stream, const int* ctx_dev = nullptr
 ) {
 	if ( head_dim != DFS_HD || kv_heads <= 0 || q_heads % kv_heads != 0 || rows > DFS_MAX_ROWS || q_heads > DFS_MAX_QHEADS ) return false;
 	const int G = q_heads / kv_heads;
 	const int qtiles = ( rows * G + DFS_SLOTS - 1 ) / DFS_SLOTS;
+	if ( ctx_dev != nullptr ) nctx = ring_slots;   // graph replays: size the grid for the fullest window the ring holds
 	const int nkeys = nctx + MAX( rows - own_first_row, 0 );
 	if ( nkeys < 1 ) return false;
 	const int ntiles = ( nkeys + DFS_BK - 1 ) / DFS_BK;
@@ -978,7 +1005,7 @@ static bool dflash_attn_split_launch(
 	}
 	dflash_attn_split_kernel<<<dim3( kv_heads, qtiles, nsplit ), 256, DFS_SMEM, stream>>>(
 		q, kcache, vcache, ws_ptr[dev], rows, q_heads, kv_heads, nctx, first_ctx, ring_slots, ctx_layer,
-		stride_slot, stride_layer, stride_head, own_slot, own_first_row, rsqrtf( static_cast<float>( head_dim ) ), nsplit, keys_per_split, causal );
+		stride_slot, stride_layer, stride_head, own_slot, own_first_row, rsqrtf( static_cast<float>( head_dim ) ), nsplit, keys_per_split, causal, ctx_dev, base_blocks );
 	dflash_attn_split_reduce<<<dim3( q_heads, rows ), DFS_HD, 0, stream>>>( ws_ptr[dev], out, q_heads, nsplit );
 	return true;
 }
@@ -1013,10 +1040,12 @@ void dflash_attn(
 	int own_slot,
 	int own_first_row,
 	cudaStream_t stream,
-	int causal
+	int causal,
+	const int* ctx_dev
 ) {
 	if ( rows <= 0 || q_heads <= 0 ) return;
 #if defined(USE_ROCM)
+	ENGINE_ASSERT( ctx_dev == nullptr, "dflash_attn: device-side context arguments are CUDA only" );
 	// RDNA3: the WMMA kernel (the scalar one spends 0.8 ms per layer on a 2048-key window); it has no causal block
 	if ( !causal && ( head_dim == 128 || head_dim == 256 ) && kv_heads > 0 && q_heads % kv_heads == 0 && rows <= 16 && q_heads <= 64 ) {
 		if ( head_dim == 128 ) dflash_attn_wmma_launch<128>( q, kcache, vcache, out, rows, q_heads, kv_heads, nctx, first_ctx, ring_slots, ctx_layer, stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream );
@@ -1024,8 +1053,9 @@ void dflash_attn(
 		return;
 	}
 #else
-	if ( !engine::runtime::options().dflash_attn_scalar && dflash_attn_split_launch( q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim, nctx, first_ctx, ring_slots, ctx_layer,
-		stride_slot, stride_layer, stride_head, own_slot, own_first_row, causal, stream ) ) return;
+	if ( ( ctx_dev != nullptr || !engine::runtime::options().dflash_attn_scalar ) && dflash_attn_split_launch( q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim, nctx, first_ctx, ring_slots, ctx_layer,
+		stride_slot, stride_layer, stride_head, own_slot, own_first_row, causal, stream, ctx_dev ) ) return;
+	ENGINE_ASSERT( ctx_dev == nullptr, "dflash_attn: device-side context arguments need the split kernel's shapes" );
 #endif
 	dflash_attn_scalar( q, kcache, vcache, out, rows, q_heads, kv_heads, head_dim, nctx, first_ctx, ring_slots, ctx_layer,
 		stride_slot, stride_layer, stride_head, own_slot, own_first_row, stream, causal );

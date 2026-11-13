@@ -1,4 +1,5 @@
 #include "engine/spec/dflash.h"
+#include "engine/runtime/options.h"
 #include "engine/modules/norm.h"
 #include "engine/modules/swiglu.h"
 #include "engine/modules/embedding.h"
@@ -8,6 +9,8 @@
 #include <cmath>
 #include <chrono>
 #include <cstring>
+#include <vector>
+#include <memory>
 
 namespace engine::spec {
 
@@ -129,6 +132,41 @@ void DFlashSpeculator::forward_backbone(
 	ingest_context( tapped_states, n_ctx, ctx_pos0, taps_ring_cap, stream );
 
 	// ---- Stage 2: the block of `rows` query positions ----
+	// Its only per-round arguments are the block position and each layer's visible context (length, first ring slot). With dflash_graph they
+	// go to the device first and the stage replays the selected context's graph (the context's KV ring is part of the capture).
+	const bool graph = engine::runtime::options().dflash_graph && !hess_.on() && rows == config_.block_size && d_round_ != nullptr;
+	if ( graph ) {
+		std::vector<int> args( 1 + 2 * L );
+		args[0] = block_pos0;
+		for ( int l = 0; l < L; ++l ) {
+			const LayerKV kv = layer_kv( l );
+			const int ring_n = MIN( kv_len_, config_.layer_full[l] ? kv.ring : MIN( config_.sliding_window, kv.ring ) );
+			args[1 + 2 * l] = ring_n;
+			args[2 + 2 * l] = ( kv_len_ - ring_n ) % kv.ring;
+		}
+		CUDA_CHECK( cudaMemcpyAsync( d_round_, args.data(), args.size() * sizeof( int ), cudaMemcpyHostToDevice, stream ) );
+		if ( static_cast<int>( block_graphs_.size() ) <= ctx_cur_ ) block_graphs_.resize( ctx_cur_ + 1 );
+		if ( !block_graphs_[ctx_cur_] ) block_graphs_[ctx_cur_] = std::make_unique<engine::core::GraphCache>();
+		block_graphs_[ctx_cur_]->run( rows, stream, [&]( cudaStream_t s ) { block_stage( embed_table, d_input_ids, rows, block_pos0, hidden_out, s, true ); } );
+		return;
+	}
+	block_stage( embed_table, d_input_ids, rows, block_pos0, hidden_out, stream, false );
+}
+
+// The block of `rows` query positions through the layers. dev: the block position and each layer's context window come from d_round_
+// ([block_pos0, then ring_n and first slot per layer]) instead of the host, so a graph of this stage stays valid across rounds.
+void DFlashSpeculator::block_stage( const pod::TensorView& embed_table, const int* d_input_ids, int rows, int block_pos0, pod::TensorView& hidden_out,
+	cudaStream_t stream, bool dev ) {
+	const int H = config_.hidden_size;
+	const int L = config_.num_hidden_layers;
+	const int taps = config_.conv_kernel_size;
+	const int groups = config_.conv_groups();
+	const int proj_out = config_.conv_proj_out();
+	const int hd = config_.head_dim;
+	const int qh_local = config_.num_q_heads / tp_size_;
+	const int kvh_local = config_.num_kv_heads / tp_size_;
+	const int rope_pairs = hd / 2;
+	const int* pos_dev = dev ? d_round_ : nullptr;
 	engine::modules::Embedding::forward( embed_table, d_input_ids, rows, bb_normed_, stream );
 
 	// The first layer's input_layernorm takes no incoming residual: the reference sets
@@ -189,7 +227,7 @@ void DFlashSpeculator::forward_backbone(
 			dflash_qk_norm_rope( bb_q_.ptr<half>(),
 				( ly.q_norm.data != nullptr ) ? ly.q_norm.ptr<const half>() : nullptr,
 				config_.rope_theta, rows, qh_local, hd, rope_pairs, block_pos0,
-				config_.rms_norm_eps, 0.0f, stream );
+				config_.rms_norm_eps, 0.0f, stream, pos_dev );
 
 			pod::TensorView kv_stage = pod::make_tensor_2d(
 				bb_kv_stage_.ptr<half>(), pod::DType::FP16, rows, kvh_local * hd );
@@ -197,7 +235,7 @@ void DFlashSpeculator::forward_backbone(
 			dflash_qk_norm_rope( kv_stage.ptr<half>(),
 				( ly.k_norm.data != nullptr ) ? ly.k_norm.ptr<const half>() : nullptr,
 				config_.rope_theta, rows, kvh_local, hd, rope_pairs, block_pos0,
-				config_.rms_norm_eps, 0.0f, stream );
+				config_.rms_norm_eps, 0.0f, stream, pos_dev );
 			// the block's own rows sit in the tail past the ring (passing ring + block as the ring keeps them from wrapping)
 			dflash_cache_store( kv.k, kv_stage.ptr<const half>(), rows, kvh_local, hd,
 				kv.ring, kv.ring + config_.block_size, kv.layer, kv.stride_slot, kv.stride_layer, stream );
@@ -211,7 +249,7 @@ void DFlashSpeculator::forward_backbone(
 			dflash_attn( bb_q_.ptr<const half>(), kv.k, kv.v,
 				bb_attn_out_.ptr<half>(), rows, qh_local, kvh_local, hd,
 				ring_n, ctx_slot0, kv.ring, kv.layer, kv.stride_slot, kv.stride_layer, hd, kv.ring,
-				own_first_row_, stream, config_.sliding_causal && !config_.layer_full[l] ? 1 : 0 );
+				own_first_row_, stream, config_.sliding_causal && !config_.layer_full[l] ? 1 : 0, dev ? d_round_ + 1 + 2 * l : nullptr );
 			// o_proj is row-parallel; at TP 1 it is the whole projection and needs no reduce.
 			// Linear::forward reads x.shape[1] as K, so this must be the flat [rows, q_heads*head_dim]
 			// view. The 3D head view reports shape[1] == q_heads, which the Trellis path ignored.

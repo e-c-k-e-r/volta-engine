@@ -1,4 +1,7 @@
 #pragma once
+#include "engine/core/graph_cache.h"
+#include <memory>
+#include <vector>
 
 #include <vector>
 #include "engine/core/comm.h"
@@ -230,7 +233,8 @@ void dflash_qk_norm_rope(
 	int pos0,
 	float eps,
 	float constant_bias,
-	backend::stream_t stream = nullptr
+	backend::stream_t stream = nullptr,
+	const int* pos0_dev = nullptr   // the position from the device instead (graph replays)
 );
 
 // GQA small-query attention for the drafter block: `rows` queries against `nctx` context slots
@@ -257,7 +261,8 @@ void dflash_attn(
 	// the target's taps); 0 lets row 0 supply the anchor itself. See DFlashSpeculator::draft_backbone.
 	int own_first_row = 1,
 	backend::stream_t stream = nullptr,
-	int causal = 0   // 1: row r sees the block's own rows up to r only (the context stays whole)
+	int causal = 0,   // 1: row r sees the block's own rows up to r only (the context stays whole)
+	const int* ctx_dev = nullptr   // graph replays: nctx and first_ctx from the device ([2]), the split derived there (CUDA split kernel shapes)
 );
 
 // The same attention through the one-block-per-(row, head) scalar kernel (what dflash_attn falls back to for shapes the split kernel does not cover);
@@ -418,6 +423,8 @@ public:
 	friend struct DFlashTestAccess;
 
 	void ingest_context( const backend::half_t* tapped_states, int n_ctx, int ctx_pos0, int taps_ring_cap, backend::stream_t stream );
+	void block_stage( const pod::TensorView& embed_table, const int* d_input_ids, int rows, int block_pos0, pod::TensorView& hidden_out,
+		backend::stream_t stream, bool dev );
 
 	void forward_backbone(
 		const pod::TensorView& embed_table,
@@ -485,6 +492,8 @@ private:
 
 	int* d_draft_tokens_;       // [8]: anchor at [0], 7 draft tokens at [1..7]
 	int* d_anchor_ = nullptr;    // [1]: walk seed, distinct from the walk's own output
+	int* d_round_ = nullptr;     // [1 + 2 * layers]: the block position, then each layer's visible context length and first ring slot (graph replays)
+	std::vector<std::unique_ptr<engine::core::GraphCache>> block_graphs_;   // the block stage per context (its KV ring is captured)
 	float* d_conf_;             // [8]
 	int* d_input_ids_;          // [8] backbone input ids (row 0 = anchor, rest = mask)
 

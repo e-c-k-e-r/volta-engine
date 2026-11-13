@@ -78,6 +78,7 @@ bool DFlashSpeculator::init(
 	// The walk seeds itself from the anchor token and then overwrites d_draft_tokens_, so the anchor
 	// needs its own slot; aliasing them fed the walk its own uninitialized output.
 	d_anchor_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
+	d_round_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( 1 + 2 * config_.num_hidden_layers ) * sizeof( int ) ) );
 	d_conf_ = static_cast<float*>( engine::core::arena_alloc( arena, M * sizeof( float ) ) );
 	d_input_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, M * sizeof( int ) ) );
 	CUDA_CHECK( cudaMemsetAsync( d_input_ids_, 0, M * sizeof( int ), 0 ) );
@@ -476,6 +477,10 @@ void DFlashSpeculator::destroy() {
 	if ( hess_.on() && weights_loaded_ ) {
 		CUDA_CHECK( cudaSetDevice( device_ ) );
 		hess_.dump( engine::runtime::options().dflash_hessian_dir, rank_ );
+	}
+	if ( !block_graphs_.empty() ) {
+		CUDA_CHECK( cudaSetDevice( device_ ) );
+		block_graphs_.clear();   // the graph executables belong to this device
 	}
 	initialized_ = false;
 	weights_loaded_ = false;
