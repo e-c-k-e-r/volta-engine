@@ -53,7 +53,8 @@ int int8_max_k( int device ) {
 
 template <int bits, int M, bool c_fp32, bool residual, bool stage_smem>
 void* sel() {
-	return (void*) exl3_gemv_int8_sq_kernel<bits, M, c_fp32, residual, stage_smem>;
+	if constexpr ( gemv_int8_sq_threads( bits ) == 512 ) return (void*) exl3_gemv_int8_sq_kernel_w<bits, M, c_fp32, residual, stage_smem>;
+	else return (void*) exl3_gemv_int8_sq_kernel<bits, M, c_fp32, residual, stage_smem>;
 }
 
 template <int bits, int M, bool c_fp32, bool residual>
@@ -107,7 +108,7 @@ struct Decomp {
 	int rows_per;
 };
 
-Decomp decomp( int grid, int size_k, int size_n, int M, bool residual ) {
+Decomp decomp( int grid, int size_k, int size_n, int M, bool residual, int bits ) {
 	int rows_total = size_k / 16;
 	int nb256 = size_n / 256;
 	int r = CEIL_DIVIDE( rows_total * nb256, grid );
@@ -115,6 +116,7 @@ Decomp decomp( int grid, int size_k, int size_n, int M, bool residual ) {
 	rows_per = MAX( rows_per, SQ_MINROWS );
 	rows_per = MIN( rows_per, gemv_int8_sq_rows_max( M, residual ) );
 	rows_per = MIN( rows_per, ( rows_total + 7 ) & ~7 );
+	if ( gemv_int8_sq_threads( bits ) == 512 ) rows_per = gemv_int8_sq_fit( rows_per, rows_total, nb256, grid, gemv_int8_sq_rows_max( M, residual ) );
 	return { CEIL_DIVIDE( rows_total, rows_per ), rows_per };
 }
 
@@ -226,7 +228,7 @@ bool exl3_gemv_int8(
 	void* fn1 = select_kernel( K, 1, c_fp32, residual );
 	if ( !fn1 ) fn1 = fn;
 	const int M1 = ( fn1 == fn ) ? M : 1;
-	Decomp d = decomp( 6 * num_sms, size_k, size_n, M1, residual );
+	Decomp d = decomp( 6 * num_sms, size_k, size_n, M1, residual, K );
 	size_t smem_guess = smem_for( d.rows_per, size_n, M1, residual, smem, K );
 
 	int maxb = 1;
@@ -237,11 +239,11 @@ bool exl3_gemv_int8(
 	}
 	else {
 		maxb = 1;
-		(void) cudaOccupancyMaxActiveBlocksPerMultiprocessor( &maxb, fn1, NUM_THREADS, smem_guess );
+		(void) cudaOccupancyMaxActiveBlocksPerMultiprocessor( &maxb, fn1, gemv_int8_sq_threads( K ), smem_guess );
 		int8_occ_cache[device][occ_key] = maxb;
 	}
 	int grid = MIN( MAX( maxb, 1 ) * num_sms, 1024 );
-	d = decomp( grid, size_k, size_n, M, residual );
+	d = decomp( grid, size_k, size_n, M, residual, K );
 	size_t smem_bytes = smem_for( d.rows_per, size_n, M, residual, smem, K );
 	if ( d.ksplit > SQ_KSPLIT_CAP ) return false;
 	if ( size_n / 256 > SQ_COUNTERS_CAP ) return false;
@@ -264,7 +266,7 @@ bool exl3_gemv_int8(
 		(void*) &svh
 	};
 
-	cudaError_t err = cudaLaunchKernel( fn, dim3( grid ), dim3( NUM_THREADS ), kernel_args, smem_bytes, stream );
+	cudaError_t err = cudaLaunchKernel( fn, dim3( grid ), dim3( gemv_int8_sq_threads( K ) ), kernel_args, smem_bytes, stream );
 	if ( err != cudaSuccess ) {
 		// Declining the fast path is only safe if nothing was enqueued. Swallowing the error here
 		// would leave the caller's fallback launch reporting a poisoned stream instead of the real
