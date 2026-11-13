@@ -1,0 +1,3361 @@
+shape,format,rows,us
+27B q+gate,exl3 3b stock,1,33.96
+27B q+gate,exl3 3b stock,2,62.01
+27B q+gate,exl3 3b stock,3,62.58
+27B q+gate,exl3 3b stock,4,63.37
+27B q+gate,exl3 3b stock,5,64.57
+27B q+gate,exl3 3b stock,6,65.71
+27B q+gate,exl3 3b stock,7,67.58
+27B q+gate,exl3 3b stock,8,69.92
+27B q+gate,exl3 3b stock,9,65.54
+27B q+gate,exl3 3b stock,10,65.71
+27B q+gate,exl3 3b stock,11,65.88
+27B q+gate,exl3 3b stock,12,65.88
+27B q+gate,exl3 3b stock,13,66.10
+27B q+gate,exl3 3b stock,14,66.22
+27B q+gate,exl3 3b stock,15,66.45
+27B q+gate,exl3 3b stock,16,66.79
+27B q+gate,exl3 3b stock,32,144.21
+27B q+gate,exl3 3b stock,64,133.06
+27B q+gate,exl3 3b stock,128,188.98
+27B q+gate,exl3 3b stock,256,238.88
+27B q+gate,exl3 3b stock,512,413.13
+27B q+gate,exl3 3b volta,1,30.21
+27B q+gate,exl3 3b volta,2,33.68
+27B q+gate,exl3 3b volta,3,33.74
+27B q+gate,exl3 3b volta,4,33.96
+27B q+gate,exl3 3b volta,5,34.13
+27B q+gate,exl3 3b volta,6,34.13
+27B q+gate,exl3 3b volta,7,34.82
+27B q+gate,exl3 3b volta,8,35.27
+27B q+gate,exl3 3b volta,9,46.82
+27B q+gate,exl3 3b volta,10,47.27
+27B q+gate,exl3 3b volta,11,47.67
+27B q+gate,exl3 3b volta,12,48.18
+27B q+gate,exl3 3b volta,13,49.04
+27B q+gate,exl3 3b volta,14,49.95
+27B q+gate,exl3 3b volta,15,50.92
+27B q+gate,exl3 3b volta,16,52.11
+27B q+gate,exl3 3b volta,32,134.83
+27B q+gate,exl3 3b volta,64,128.68
+27B q+gate,exl3 3b volta,128,178.12
+27B q+gate,exl3 3b volta,256,225.68
+27B q+gate,exl3 3b volta,512,386.28
+27B q+gate,exl3 4b stock,1,25.31
+27B q+gate,exl3 4b stock,2,34.08
+27B q+gate,exl3 4b stock,3,52.08
+27B q+gate,exl3 4b stock,4,52.37
+27B q+gate,exl3 4b stock,5,52.81
+27B q+gate,exl3 4b stock,6,53.76
+27B q+gate,exl3 4b stock,7,55.73
+27B q+gate,exl3 4b stock,8,58.44
+27B q+gate,exl3 4b stock,9,57.49
+27B q+gate,exl3 4b stock,10,57.71
+27B q+gate,exl3 4b stock,11,57.86
+27B q+gate,exl3 4b stock,12,58.00
+27B q+gate,exl3 4b stock,13,58.15
+27B q+gate,exl3 4b stock,14,58.22
+27B q+gate,exl3 4b stock,15,58.59
+27B q+gate,exl3 4b stock,16,58.51
+27B q+gate,exl3 4b stock,32,119.44
+27B q+gate,exl3 4b stock,64,129.17
+27B q+gate,exl3 4b stock,128,174.52
+27B q+gate,exl3 4b stock,256,220.23
+27B q+gate,exl3 4b stock,512,374.35
+27B q+gate,exl3 4b volta,1,25.09
+27B q+gate,exl3 4b volta,2,28.89
+27B q+gate,exl3 4b volta,3,28.67
+27B q+gate,exl3 4b volta,4,28.89
+27B q+gate,exl3 4b volta,5,28.96
+27B q+gate,exl3 4b volta,6,29.48
+27B q+gate,exl3 4b volta,7,29.92
+27B q+gate,exl3 4b volta,8,30.50
+27B q+gate,exl3 4b volta,9,41.55
+27B q+gate,exl3 4b volta,10,41.62
+27B q+gate,exl3 4b volta,11,42.35
+27B q+gate,exl3 4b volta,12,42.93
+27B q+gate,exl3 4b volta,13,43.81
+27B q+gate,exl3 4b volta,14,44.62
+27B q+gate,exl3 4b volta,15,45.86
+27B q+gate,exl3 4b volta,16,46.81
+27B q+gate,exl3 4b volta,32,121.34
+27B q+gate,exl3 4b volta,64,129.17
+27B q+gate,exl3 4b volta,128,173.79
+27B q+gate,exl3 4b volta,256,220.09
+27B q+gate,exl3 4b volta,512,373.91
+27B q+gate,exl3 5b stock,1,35.16
+27B q+gate,exl3 5b stock,2,42.58
+27B q+gate,exl3 5b stock,3,76.63
+27B q+gate,exl3 5b stock,4,77.23
+27B q+gate,exl3 5b stock,5,78.51
+27B q+gate,exl3 5b stock,6,80.04
+27B q+gate,exl3 5b stock,7,80.81
+27B q+gate,exl3 5b stock,8,82.01
+27B q+gate,exl3 5b stock,9,65.28
+27B q+gate,exl3 5b stock,10,65.45
+27B q+gate,exl3 5b stock,11,65.62
+27B q+gate,exl3 5b stock,12,65.62
+27B q+gate,exl3 5b stock,13,65.79
+27B q+gate,exl3 5b stock,14,65.88
+27B q+gate,exl3 5b stock,15,65.96
+27B q+gate,exl3 5b stock,16,66.13
+27B q+gate,exl3 5b stock,32,131.24
+27B q+gate,exl3 5b stock,64,131.93
+27B q+gate,exl3 5b stock,128,176.90
+27B q+gate,exl3 5b stock,256,222.72
+27B q+gate,exl3 5b stock,512,376.49
+27B q+gate,exl3 5b volta,1,34.13
+27B q+gate,exl3 5b volta,2,29.18
+27B q+gate,exl3 5b volta,3,29.44
+27B q+gate,exl3 5b volta,4,29.53
+27B q+gate,exl3 5b volta,5,29.70
+27B q+gate,exl3 5b volta,6,29.95
+27B q+gate,exl3 5b volta,7,29.95
+27B q+gate,exl3 5b volta,8,30.12
+27B q+gate,exl3 5b volta,9,52.74
+27B q+gate,exl3 5b volta,10,53.33
+27B q+gate,exl3 5b volta,11,54.02
+27B q+gate,exl3 5b volta,12,53.93
+27B q+gate,exl3 5b volta,13,54.19
+27B q+gate,exl3 5b volta,14,54.10
+27B q+gate,exl3 5b volta,15,54.44
+27B q+gate,exl3 5b volta,16,54.44
+27B q+gate,exl3 5b volta,32,131.67
+27B q+gate,exl3 5b volta,64,131.75
+27B q+gate,exl3 5b volta,128,176.21
+27B q+gate,exl3 5b volta,256,221.27
+27B q+gate,exl3 5b volta,512,375.30
+27B q+gate,nvfp4,1,17.83
+27B q+gate,nvfp4,2,17.83
+27B q+gate,nvfp4,3,17.92
+27B q+gate,nvfp4,4,18.01
+27B q+gate,nvfp4,5,18.01
+27B q+gate,nvfp4,6,18.43
+27B q+gate,nvfp4,7,19.20
+27B q+gate,nvfp4,8,20.39
+27B q+gate,nvfp4,9,30.72
+27B q+gate,nvfp4,10,31.15
+27B q+gate,nvfp4,11,31.66
+27B q+gate,nvfp4,12,32.43
+27B q+gate,nvfp4,13,33.45
+27B q+gate,nvfp4,14,34.56
+27B q+gate,nvfp4,15,36.27
+27B q+gate,nvfp4,16,37.72
+27B q+gate,nvfp4,32,121.51
+27B q+gate,nvfp4,64,151.21
+27B q+gate,nvfp4,128,193.71
+27B q+gate,nvfp4,256,214.95
+27B q+gate,nvfp4,512,368.90
+27B q+gate,gguf q4_k,1,18.43
+27B q+gate,gguf q4_k,2,20.48
+27B q+gate,gguf q4_k,3,23.47
+27B q+gate,gguf q4_k,4,28.07
+27B q+gate,gguf q4_k,5,31.83
+27B q+gate,gguf q4_k,6,30.81
+27B q+gate,gguf q4_k,7,31.49
+27B q+gate,gguf q4_k,8,32.51
+27B q+gate,gguf q4_k,9,38.31
+27B q+gate,gguf q4_k,10,39.00
+27B q+gate,gguf q4_k,11,40.02
+27B q+gate,gguf q4_k,12,40.87
+27B q+gate,gguf q4_k,13,41.73
+27B q+gate,gguf q4_k,14,42.41
+27B q+gate,gguf q4_k,15,43.43
+27B q+gate,gguf q4_k,16,44.46
+27B q+gate,gguf q4_k,32,190.12
+27B q+gate,gguf q4_k,64,194.73
+27B q+gate,gguf q4_k,128,224.34
+27B q+gate,gguf q4_k,256,273.32
+27B q+gate,gguf q4_k,512,410.11
+27B q+gate,gguf q6_k,1,23.42
+27B q+gate,gguf q6_k,2,25.73
+27B q+gate,gguf q6_k,3,28.67
+27B q+gate,gguf q6_k,4,33.28
+27B q+gate,gguf q6_k,5,37.25
+27B q+gate,gguf q6_k,6,42.50
+27B q+gate,gguf q6_k,7,46.08
+27B q+gate,gguf q6_k,8,45.06
+27B q+gate,gguf q6_k,9,61.06
+27B q+gate,gguf q6_k,10,62.21
+27B q+gate,gguf q6_k,11,63.10
+27B q+gate,gguf q6_k,12,63.62
+27B q+gate,gguf q6_k,13,64.26
+27B q+gate,gguf q6_k,14,65.02
+27B q+gate,gguf q6_k,15,66.05
+27B q+gate,gguf q6_k,16,66.69
+27B q+gate,gguf q6_k,32,158.34
+27B q+gate,gguf q6_k,64,162.56
+27B q+gate,gguf q6_k,128,191.74
+27B q+gate,gguf q6_k,256,242.94
+27B q+gate,gguf q6_k,512,379.01
+27B q+gate,gguf iq3_s,1,22.66
+27B q+gate,gguf iq3_s,2,26.11
+27B q+gate,gguf iq3_s,3,30.53
+27B q+gate,gguf iq3_s,4,34.62
+27B q+gate,gguf iq3_s,5,39.04
+27B q+gate,gguf iq3_s,6,43.90
+27B q+gate,gguf iq3_s,7,47.23
+27B q+gate,gguf iq3_s,8,51.46
+27B q+gate,gguf iq3_s,9,75.65
+27B q+gate,gguf iq3_s,10,75.84
+27B q+gate,gguf iq3_s,11,76.16
+27B q+gate,gguf iq3_s,12,76.54
+27B q+gate,gguf iq3_s,13,77.38
+27B q+gate,gguf iq3_s,14,77.57
+27B q+gate,gguf iq3_s,15,77.95
+27B q+gate,gguf iq3_s,16,77.95
+27B q+gate,gguf iq3_s,32,264.58
+27B q+gate,gguf iq3_s,64,268.99
+27B q+gate,gguf iq3_s,128,299.33
+27B q+gate,gguf iq3_s,256,348.03
+27B q+gate,gguf iq3_s,512,486.02
+27B gdn qkv,exl3 3b stock,1,28.11
+27B gdn qkv,exl3 3b stock,2,31.05
+27B gdn qkv,exl3 3b stock,3,31.33
+27B gdn qkv,exl3 3b stock,4,31.74
+27B gdn qkv,exl3 3b stock,5,31.84
+27B gdn qkv,exl3 3b stock,6,32.26
+27B gdn qkv,exl3 3b stock,7,32.67
+27B gdn qkv,exl3 3b stock,8,33.14
+27B gdn qkv,exl3 3b stock,9,49.48
+27B gdn qkv,exl3 3b stock,10,49.38
+27B gdn qkv,exl3 3b stock,11,49.62
+27B gdn qkv,exl3 3b stock,12,49.76
+27B gdn qkv,exl3 3b stock,13,49.90
+27B gdn qkv,exl3 3b stock,14,50.04
+27B gdn qkv,exl3 3b stock,15,50.13
+27B gdn qkv,exl3 3b stock,16,50.36
+27B gdn qkv,exl3 3b stock,32,114.36
+27B gdn qkv,exl3 3b stock,64,114.55
+27B gdn qkv,exl3 3b stock,128,140.29
+27B gdn qkv,exl3 3b stock,256,195.21
+27B gdn qkv,exl3 3b stock,512,279.37
+27B gdn qkv,exl3 3b volta,1,27.51
+27B gdn qkv,exl3 3b volta,2,24.48
+27B gdn qkv,exl3 3b volta,3,24.58
+27B gdn qkv,exl3 3b volta,4,24.62
+27B gdn qkv,exl3 3b volta,5,24.76
+27B gdn qkv,exl3 3b volta,6,24.72
+27B gdn qkv,exl3 3b volta,7,24.76
+27B gdn qkv,exl3 3b volta,8,24.86
+27B gdn qkv,exl3 3b volta,9,26.07
+27B gdn qkv,exl3 3b volta,10,26.16
+27B gdn qkv,exl3 3b volta,11,26.44
+27B gdn qkv,exl3 3b volta,12,26.62
+27B gdn qkv,exl3 3b volta,13,27.04
+27B gdn qkv,exl3 3b volta,14,27.37
+27B gdn qkv,exl3 3b volta,15,27.83
+27B gdn qkv,exl3 3b volta,16,28.25
+27B gdn qkv,exl3 3b volta,32,121.44
+27B gdn qkv,exl3 3b volta,64,114.41
+27B gdn qkv,exl3 3b volta,128,140.15
+27B gdn qkv,exl3 3b volta,256,195.03
+27B gdn qkv,exl3 3b volta,512,279.55
+27B gdn qkv,exl3 4b stock,1,23.55
+27B gdn qkv,exl3 4b stock,2,32.00
+27B gdn qkv,exl3 4b stock,3,30.27
+27B gdn qkv,exl3 4b stock,4,30.21
+27B gdn qkv,exl3 4b stock,5,30.21
+27B gdn qkv,exl3 4b stock,6,30.72
+27B gdn qkv,exl3 4b stock,7,31.42
+27B gdn qkv,exl3 4b stock,8,32.70
+27B gdn qkv,exl3 4b stock,9,50.11
+27B gdn qkv,exl3 4b stock,10,50.24
+27B gdn qkv,exl3 4b stock,11,50.50
+27B gdn qkv,exl3 4b stock,12,50.62
+27B gdn qkv,exl3 4b stock,13,50.88
+27B gdn qkv,exl3 4b stock,14,50.94
+27B gdn qkv,exl3 4b stock,15,51.26
+27B gdn qkv,exl3 4b stock,16,51.39
+27B gdn qkv,exl3 4b stock,32,114.24
+27B gdn qkv,exl3 4b stock,64,116.54
+27B gdn qkv,exl3 4b stock,128,142.14
+27B gdn qkv,exl3 4b stock,256,197.76
+27B gdn qkv,exl3 4b stock,512,281.66
+27B gdn qkv,exl3 4b volta,1,22.98
+27B gdn qkv,exl3 4b volta,2,22.46
+27B gdn qkv,exl3 4b volta,3,22.53
+27B gdn qkv,exl3 4b volta,4,22.46
+27B gdn qkv,exl3 4b volta,5,22.40
+27B gdn qkv,exl3 4b volta,6,22.46
+27B gdn qkv,exl3 4b volta,7,22.40
+27B gdn qkv,exl3 4b volta,8,22.59
+27B gdn qkv,exl3 4b volta,9,24.64
+27B gdn qkv,exl3 4b volta,10,24.70
+27B gdn qkv,exl3 4b volta,11,25.02
+27B gdn qkv,exl3 4b volta,12,25.34
+27B gdn qkv,exl3 4b volta,13,25.79
+27B gdn qkv,exl3 4b volta,14,26.05
+27B gdn qkv,exl3 4b volta,15,26.69
+27B gdn qkv,exl3 4b volta,16,27.07
+27B gdn qkv,exl3 4b volta,32,118.46
+27B gdn qkv,exl3 4b volta,64,116.10
+27B gdn qkv,exl3 4b volta,128,141.89
+27B gdn qkv,exl3 4b volta,256,196.35
+27B gdn qkv,exl3 4b volta,512,281.22
+27B gdn qkv,exl3 5b stock,1,34.23
+27B gdn qkv,exl3 5b stock,2,41.84
+27B gdn qkv,exl3 5b stock,3,43.59
+27B gdn qkv,exl3 5b stock,4,44.03
+27B gdn qkv,exl3 5b stock,5,44.40
+27B gdn qkv,exl3 5b stock,6,44.76
+27B gdn qkv,exl3 5b stock,7,44.84
+27B gdn qkv,exl3 5b stock,8,45.71
+27B gdn qkv,exl3 5b stock,9,56.83
+27B gdn qkv,exl3 5b stock,10,57.12
+27B gdn qkv,exl3 5b stock,11,57.20
+27B gdn qkv,exl3 5b stock,12,57.42
+27B gdn qkv,exl3 5b stock,13,57.64
+27B gdn qkv,exl3 5b stock,14,57.86
+27B gdn qkv,exl3 5b stock,15,58.00
+27B gdn qkv,exl3 5b stock,16,58.22
+27B gdn qkv,exl3 5b stock,32,114.61
+27B gdn qkv,exl3 5b stock,64,118.78
+27B gdn qkv,exl3 5b stock,128,144.38
+27B gdn qkv,exl3 5b stock,256,198.66
+27B gdn qkv,exl3 5b stock,512,284.31
+27B gdn qkv,exl3 5b volta,1,33.21
+27B gdn qkv,exl3 5b volta,2,25.16
+27B gdn qkv,exl3 5b volta,3,25.23
+27B gdn qkv,exl3 5b volta,4,25.23
+27B gdn qkv,exl3 5b volta,5,25.45
+27B gdn qkv,exl3 5b volta,6,25.60
+27B gdn qkv,exl3 5b volta,7,25.67
+27B gdn qkv,exl3 5b volta,8,25.75
+27B gdn qkv,exl3 5b volta,9,33.65
+27B gdn qkv,exl3 5b volta,10,33.79
+27B gdn qkv,exl3 5b volta,11,34.16
+27B gdn qkv,exl3 5b volta,12,34.16
+27B gdn qkv,exl3 5b volta,13,34.23
+27B gdn qkv,exl3 5b volta,14,34.23
+27B gdn qkv,exl3 5b volta,15,34.23
+27B gdn qkv,exl3 5b volta,16,34.67
+27B gdn qkv,exl3 5b volta,32,120.03
+27B gdn qkv,exl3 5b volta,64,118.13
+27B gdn qkv,exl3 5b volta,128,143.73
+27B gdn qkv,exl3 5b volta,256,198.14
+27B gdn qkv,exl3 5b volta,512,283.50
+27B gdn qkv,nvfp4,1,14.70
+27B gdn qkv,nvfp4,2,14.77
+27B gdn qkv,nvfp4,3,14.99
+27B gdn qkv,nvfp4,4,14.85
+27B gdn qkv,nvfp4,5,14.99
+27B gdn qkv,nvfp4,6,15.14
+27B gdn qkv,nvfp4,7,15.14
+27B gdn qkv,nvfp4,8,15.43
+27B gdn qkv,nvfp4,9,18.51
+27B gdn qkv,nvfp4,10,18.58
+27B gdn qkv,nvfp4,11,18.80
+27B gdn qkv,nvfp4,12,18.94
+27B gdn qkv,nvfp4,13,19.24
+27B gdn qkv,nvfp4,14,19.82
+27B gdn qkv,nvfp4,15,20.55
+27B gdn qkv,nvfp4,16,21.28
+27B gdn qkv,nvfp4,32,112.64
+27B gdn qkv,nvfp4,64,139.41
+27B gdn qkv,nvfp4,128,149.72
+27B gdn qkv,nvfp4,256,207.51
+27B gdn qkv,nvfp4,512,256.88
+27B gdn qkv,gguf q4_k,1,16.60
+27B gdn qkv,gguf q4_k,2,18.58
+27B gdn qkv,gguf q4_k,3,20.85
+27B gdn qkv,gguf q4_k,4,24.87
+27B gdn qkv,gguf q4_k,5,27.79
+27B gdn qkv,gguf q4_k,6,27.65
+27B gdn qkv,gguf q4_k,7,28.75
+27B gdn qkv,gguf q4_k,8,29.55
+27B gdn qkv,gguf q4_k,9,35.25
+27B gdn qkv,gguf q4_k,10,35.55
+27B gdn qkv,gguf q4_k,11,37.01
+27B gdn qkv,gguf q4_k,12,37.52
+27B gdn qkv,gguf q4_k,13,38.62
+27B gdn qkv,gguf q4_k,14,39.64
+27B gdn qkv,gguf q4_k,15,41.03
+27B gdn qkv,gguf q4_k,16,41.62
+27B gdn qkv,gguf q4_k,32,153.82
+27B gdn qkv,gguf q4_k,64,167.20
+27B gdn qkv,gguf q4_k,128,176.64
+27B gdn qkv,gguf q4_k,256,235.96
+27B gdn qkv,gguf q4_k,512,287.31
+27B gdn qkv,gguf q6_k,1,20.79
+27B gdn qkv,gguf q6_k,2,22.84
+27B gdn qkv,gguf q6_k,3,25.09
+27B gdn qkv,gguf q6_k,4,28.98
+27B gdn qkv,gguf q6_k,5,32.46
+27B gdn qkv,gguf q6_k,6,37.17
+27B gdn qkv,gguf q6_k,7,39.73
+27B gdn qkv,gguf q6_k,8,41.16
+27B gdn qkv,gguf q6_k,9,54.68
+27B gdn qkv,gguf q6_k,10,55.30
+27B gdn qkv,gguf q6_k,11,56.42
+27B gdn qkv,gguf q6_k,12,57.04
+27B gdn qkv,gguf q6_k,13,57.86
+27B gdn qkv,gguf q6_k,14,58.37
+27B gdn qkv,gguf q6_k,15,59.49
+27B gdn qkv,gguf q6_k,16,59.70
+27B gdn qkv,gguf q6_k,32,126.77
+27B gdn qkv,gguf q6_k,64,140.80
+27B gdn qkv,gguf q6_k,128,150.12
+27B gdn qkv,gguf q6_k,256,209.72
+27B gdn qkv,gguf q6_k,512,260.71
+27B gdn qkv,gguf iq3_s,1,18.89
+27B gdn qkv,gguf iq3_s,2,21.96
+27B gdn qkv,gguf iq3_s,3,25.66
+27B gdn qkv,gguf iq3_s,4,29.24
+27B gdn qkv,gguf iq3_s,5,33.11
+27B gdn qkv,gguf iq3_s,6,36.92
+27B gdn qkv,gguf iq3_s,7,39.99
+27B gdn qkv,gguf iq3_s,8,43.52
+27B gdn qkv,gguf iq3_s,9,66.16
+27B gdn qkv,gguf iq3_s,10,66.62
+27B gdn qkv,gguf iq3_s,11,66.96
+27B gdn qkv,gguf iq3_s,12,67.24
+27B gdn qkv,gguf iq3_s,13,67.70
+27B gdn qkv,gguf iq3_s,14,67.64
+27B gdn qkv,gguf iq3_s,15,68.55
+27B gdn qkv,gguf iq3_s,16,68.49
+27B gdn qkv,gguf iq3_s,32,215.89
+27B gdn qkv,gguf iq3_s,64,229.77
+27B gdn qkv,gguf iq3_s,128,239.16
+27B gdn qkv,gguf iq3_s,256,297.64
+27B gdn qkv,gguf iq3_s,512,351.00
+27B o,exl3 3b stock,1,19.26
+27B o,exl3 3b stock,2,23.33
+27B o,exl3 3b stock,3,23.49
+27B o,exl3 3b stock,4,23.78
+27B o,exl3 3b stock,5,24.10
+27B o,exl3 3b stock,6,24.45
+27B o,exl3 3b stock,7,25.06
+27B o,exl3 3b stock,8,25.89
+27B o,exl3 3b stock,9,32.64
+27B o,exl3 3b stock,10,33.12
+27B o,exl3 3b stock,11,33.95
+27B o,exl3 3b stock,12,35.07
+27B o,exl3 3b stock,13,36.00
+27B o,exl3 3b stock,14,37.02
+27B o,exl3 3b stock,15,38.08
+27B o,exl3 3b stock,16,39.14
+27B o,exl3 3b stock,32,55.71
+27B o,exl3 3b stock,64,78.11
+27B o,exl3 3b stock,128,99.23
+27B o,exl3 3b stock,256,119.55
+27B o,exl3 3b stock,512,165.95
+27B o,exl3 3b volta,1,18.85
+27B o,exl3 3b volta,2,16.32
+27B o,exl3 3b volta,3,16.38
+27B o,exl3 3b volta,4,16.48
+27B o,exl3 3b volta,5,16.58
+27B o,exl3 3b volta,6,16.64
+27B o,exl3 3b volta,7,16.80
+27B o,exl3 3b volta,8,17.02
+27B o,exl3 3b volta,9,21.25
+27B o,exl3 3b volta,10,21.25
+27B o,exl3 3b volta,11,21.44
+27B o,exl3 3b volta,12,21.73
+27B o,exl3 3b volta,13,22.18
+27B o,exl3 3b volta,14,22.50
+27B o,exl3 3b volta,15,22.98
+27B o,exl3 3b volta,16,23.39
+27B o,exl3 3b volta,32,53.63
+27B o,exl3 3b volta,64,77.86
+27B o,exl3 3b volta,128,99.74
+27B o,exl3 3b volta,256,120.10
+27B o,exl3 3b volta,512,167.90
+27B o,exl3 4b stock,1,15.68
+27B o,exl3 4b stock,2,21.43
+27B o,exl3 4b stock,3,23.67
+27B o,exl3 4b stock,4,23.95
+27B o,exl3 4b stock,5,24.26
+27B o,exl3 4b stock,6,24.77
+27B o,exl3 4b stock,7,25.60
+27B o,exl3 4b stock,8,26.47
+27B o,exl3 4b stock,9,32.65
+27B o,exl3 4b stock,10,33.36
+27B o,exl3 4b stock,11,34.38
+27B o,exl3 4b stock,12,35.29
+27B o,exl3 4b stock,13,36.23
+27B o,exl3 4b stock,14,37.26
+27B o,exl3 4b stock,15,38.24
+27B o,exl3 4b stock,16,39.31
+27B o,exl3 4b stock,32,55.69
+27B o,exl3 4b stock,64,79.01
+27B o,exl3 4b stock,128,100.43
+27B o,exl3 4b stock,256,120.75
+27B o,exl3 4b stock,512,167.98
+27B o,exl3 4b volta,1,15.71
+27B o,exl3 4b volta,2,16.15
+27B o,exl3 4b volta,3,16.15
+27B o,exl3 4b volta,4,16.23
+27B o,exl3 4b volta,5,16.38
+27B o,exl3 4b volta,6,16.50
+27B o,exl3 4b volta,7,16.70
+27B o,exl3 4b volta,8,16.90
+27B o,exl3 4b volta,9,21.03
+27B o,exl3 4b volta,10,21.07
+27B o,exl3 4b volta,11,21.27
+27B o,exl3 4b volta,12,21.62
+27B o,exl3 4b volta,13,21.98
+27B o,exl3 4b volta,14,22.45
+27B o,exl3 4b volta,15,22.92
+27B o,exl3 4b volta,16,23.39
+27B o,exl3 4b volta,32,53.25
+27B o,exl3 4b volta,64,78.69
+27B o,exl3 4b volta,128,99.84
+27B o,exl3 4b volta,256,119.93
+27B o,exl3 4b volta,512,167.42
+27B o,exl3 5b stock,1,20.90
+27B o,exl3 5b stock,2,25.23
+27B o,exl3 5b stock,3,28.02
+27B o,exl3 5b stock,4,28.30
+27B o,exl3 5b stock,5,28.58
+27B o,exl3 5b stock,6,28.81
+27B o,exl3 5b stock,7,28.95
+27B o,exl3 5b stock,8,29.14
+27B o,exl3 5b stock,9,35.61
+27B o,exl3 5b stock,10,36.07
+27B o,exl3 5b stock,11,36.35
+27B o,exl3 5b stock,12,36.91
+27B o,exl3 5b stock,13,37.10
+27B o,exl3 5b stock,14,37.47
+27B o,exl3 5b stock,15,37.66
+27B o,exl3 5b stock,16,37.98
+27B o,exl3 5b stock,32,76.75
+27B o,exl3 5b stock,64,80.66
+27B o,exl3 5b stock,128,101.66
+27B o,exl3 5b stock,256,122.14
+27B o,exl3 5b stock,512,169.05
+27B o,exl3 5b volta,1,20.15
+27B o,exl3 5b volta,2,19.46
+27B o,exl3 5b volta,3,19.50
+27B o,exl3 5b volta,4,19.46
+27B o,exl3 5b volta,5,19.64
+27B o,exl3 5b volta,6,19.69
+27B o,exl3 5b volta,7,19.74
+27B o,exl3 5b volta,8,19.83
+27B o,exl3 5b volta,9,22.11
+27B o,exl3 5b volta,10,22.25
+27B o,exl3 5b volta,11,22.25
+27B o,exl3 5b volta,12,22.30
+27B o,exl3 5b volta,13,22.43
+27B o,exl3 5b volta,14,22.43
+27B o,exl3 5b volta,15,22.62
+27B o,exl3 5b volta,16,22.71
+27B o,exl3 5b volta,32,86.62
+27B o,exl3 5b volta,64,79.83
+27B o,exl3 5b volta,128,101.28
+27B o,exl3 5b volta,256,121.20
+27B o,exl3 5b volta,512,168.49
+27B o,nvfp4,1,9.22
+27B o,nvfp4,2,9.13
+27B o,nvfp4,3,9.22
+27B o,nvfp4,4,9.22
+27B o,nvfp4,5,9.13
+27B o,nvfp4,6,9.26
+27B o,nvfp4,7,9.47
+27B o,nvfp4,8,9.64
+27B o,nvfp4,9,13.57
+27B o,nvfp4,10,13.65
+27B o,nvfp4,11,13.87
+27B o,nvfp4,12,14.04
+27B o,nvfp4,13,14.34
+27B o,nvfp4,14,14.63
+27B o,nvfp4,15,15.06
+27B o,nvfp4,16,15.36
+27B o,nvfp4,32,37.97
+27B o,nvfp4,64,84.35
+27B o,nvfp4,128,97.79
+27B o,nvfp4,256,68.31
+27B o,nvfp4,512,136.19
+27B o,gguf q4_k,1,13.23
+27B o,gguf q4_k,2,14.76
+27B o,gguf q4_k,3,16.68
+27B o,gguf q4_k,4,19.33
+27B o,gguf q4_k,5,21.97
+27B o,gguf q4_k,6,14.38
+27B o,gguf q4_k,7,14.72
+27B o,gguf q4_k,8,14.93
+27B o,gguf q4_k,9,16.94
+27B o,gguf q4_k,10,17.11
+27B o,gguf q4_k,11,17.62
+27B o,gguf q4_k,12,17.92
+27B o,gguf q4_k,13,18.26
+27B o,gguf q4_k,14,18.52
+27B o,gguf q4_k,15,18.94
+27B o,gguf q4_k,16,19.37
+27B o,gguf q4_k,32,96.94
+27B o,gguf q4_k,64,101.03
+27B o,gguf q4_k,128,114.77
+27B o,gguf q4_k,256,143.27
+27B o,gguf q4_k,512,155.35
+27B o,gguf q6_k,1,15.49
+27B o,gguf q6_k,2,17.41
+27B o,gguf q6_k,3,19.65
+27B o,gguf q6_k,4,22.59
+27B o,gguf q6_k,5,25.66
+27B o,gguf q6_k,6,28.86
+27B o,gguf q6_k,7,31.30
+27B o,gguf q6_k,8,21.82
+27B o,gguf q6_k,9,33.22
+27B o,gguf q6_k,10,34.05
+27B o,gguf q6_k,11,34.30
+27B o,gguf q6_k,12,34.30
+27B o,gguf q6_k,13,34.94
+27B o,gguf q6_k,14,34.69
+27B o,gguf q6_k,15,35.14
+27B o,gguf q6_k,16,35.33
+27B o,gguf q6_k,32,80.77
+27B o,gguf q6_k,64,84.80
+27B o,gguf q6_k,128,98.69
+27B o,gguf q6_k,256,128.83
+27B o,gguf q6_k,512,138.37
+27B o,gguf iq3_s,1,15.56
+27B o,gguf iq3_s,2,18.36
+27B o,gguf iq3_s,3,21.33
+27B o,gguf iq3_s,4,24.17
+27B o,gguf iq3_s,5,27.27
+27B o,gguf iq3_s,6,30.79
+27B o,gguf iq3_s,7,33.55
+27B o,gguf iq3_s,8,36.45
+27B o,gguf iq3_s,9,40.45
+27B o,gguf iq3_s,10,40.79
+27B o,gguf iq3_s,11,40.89
+27B o,gguf iq3_s,12,41.10
+27B o,gguf iq3_s,13,41.44
+27B o,gguf iq3_s,14,41.51
+27B o,gguf iq3_s,15,41.81
+27B o,gguf iq3_s,16,41.71
+27B o,gguf iq3_s,32,134.86
+27B o,gguf iq3_s,64,138.79
+27B o,gguf iq3_s,128,152.47
+27B o,gguf iq3_s,256,180.77
+27B o,gguf iq3_s,512,193.47
+27B mlp gate/up,exl3 3b stock,1,38.11
+27B mlp gate/up,exl3 3b stock,2,53.83
+27B mlp gate/up,exl3 3b stock,3,54.78
+27B mlp gate/up,exl3 3b stock,4,55.66
+27B mlp gate/up,exl3 3b stock,5,56.47
+27B mlp gate/up,exl3 3b stock,6,57.49
+27B mlp gate/up,exl3 3b stock,7,58.95
+27B mlp gate/up,exl3 3b stock,8,60.64
+27B mlp gate/up,exl3 3b stock,9,72.12
+27B mlp gate/up,exl3 3b stock,10,72.56
+27B mlp gate/up,exl3 3b stock,11,72.63
+27B mlp gate/up,exl3 3b stock,12,73.07
+27B mlp gate/up,exl3 3b stock,13,73.51
+27B mlp gate/up,exl3 3b stock,14,73.87
+27B mlp gate/up,exl3 3b stock,15,74.17
+27B mlp gate/up,exl3 3b stock,16,74.75
+27B mlp gate/up,exl3 3b stock,32,145.26
+27B mlp gate/up,exl3 3b stock,64,179.71
+27B mlp gate/up,exl3 3b stock,128,232.08
+27B mlp gate/up,exl3 3b stock,256,283.06
+27B mlp gate/up,exl3 3b stock,512,419.18
+27B mlp gate/up,exl3 3b volta,1,37.23
+27B mlp gate/up,exl3 3b volta,2,32.99
+27B mlp gate/up,exl3 3b volta,3,32.99
+27B mlp gate/up,exl3 3b volta,4,33.21
+27B mlp gate/up,exl3 3b volta,5,33.43
+27B mlp gate/up,exl3 3b volta,6,33.57
+27B mlp gate/up,exl3 3b volta,7,34.01
+27B mlp gate/up,exl3 3b volta,8,34.52
+27B mlp gate/up,exl3 3b volta,9,45.13
+27B mlp gate/up,exl3 3b volta,10,45.42
+27B mlp gate/up,exl3 3b volta,11,45.79
+27B mlp gate/up,exl3 3b volta,12,46.45
+27B mlp gate/up,exl3 3b volta,13,47.03
+27B mlp gate/up,exl3 3b volta,14,48.05
+27B mlp gate/up,exl3 3b volta,15,48.86
+27B mlp gate/up,exl3 3b volta,16,49.96
+27B mlp gate/up,exl3 3b volta,32,148.26
+27B mlp gate/up,exl3 3b volta,64,180.22
+27B mlp gate/up,exl3 3b volta,128,233.98
+27B mlp gate/up,exl3 3b volta,256,286.06
+27B mlp gate/up,exl3 3b volta,512,425.25
+27B mlp gate/up,exl3 4b stock,1,32.26
+27B mlp gate/up,exl3 4b stock,2,46.59
+27B mlp gate/up,exl3 4b stock,3,53.04
+27B mlp gate/up,exl3 4b stock,4,53.76
+27B mlp gate/up,exl3 4b stock,5,54.68
+27B mlp gate/up,exl3 4b stock,6,55.50
+27B mlp gate/up,exl3 4b stock,7,57.34
+27B mlp gate/up,exl3 4b stock,8,59.90
+27B mlp gate/up,exl3 4b stock,9,69.02
+27B mlp gate/up,exl3 4b stock,10,69.12
+27B mlp gate/up,exl3 4b stock,11,69.53
+27B mlp gate/up,exl3 4b stock,12,69.84
+27B mlp gate/up,exl3 4b stock,13,70.35
+27B mlp gate/up,exl3 4b stock,14,70.76
+27B mlp gate/up,exl3 4b stock,15,71.07
+27B mlp gate/up,exl3 4b stock,16,71.48
+27B mlp gate/up,exl3 4b stock,32,139.78
+27B mlp gate/up,exl3 4b stock,64,183.91
+27B mlp gate/up,exl3 4b stock,128,239.10
+27B mlp gate/up,exl3 4b stock,256,291.84
+27B mlp gate/up,exl3 4b stock,512,431.82
+27B mlp gate/up,exl3 4b volta,1,32.36
+27B mlp gate/up,exl3 4b volta,2,30.21
+27B mlp gate/up,exl3 4b volta,3,30.41
+27B mlp gate/up,exl3 4b volta,4,30.41
+27B mlp gate/up,exl3 4b volta,5,30.82
+27B mlp gate/up,exl3 4b volta,6,31.03
+27B mlp gate/up,exl3 4b volta,7,31.44
+27B mlp gate/up,exl3 4b volta,8,32.05
+27B mlp gate/up,exl3 4b volta,9,42.39
+27B mlp gate/up,exl3 4b volta,10,42.50
+27B mlp gate/up,exl3 4b volta,11,42.91
+27B mlp gate/up,exl3 4b volta,12,43.72
+27B mlp gate/up,exl3 4b volta,13,44.54
+27B mlp gate/up,exl3 4b volta,14,45.57
+27B mlp gate/up,exl3 4b volta,15,46.69
+27B mlp gate/up,exl3 4b volta,16,47.92
+27B mlp gate/up,exl3 4b volta,32,141.82
+27B mlp gate/up,exl3 4b volta,64,183.91
+27B mlp gate/up,exl3 4b volta,128,237.98
+27B mlp gate/up,exl3 4b volta,256,291.02
+27B mlp gate/up,exl3 4b volta,512,432.13
+27B mlp gate/up,exl3 5b stock,1,41.86
+27B mlp gate/up,exl3 5b stock,2,65.15
+27B mlp gate/up,exl3 5b stock,3,78.34
+27B mlp gate/up,exl3 5b stock,4,79.49
+27B mlp gate/up,exl3 5b stock,5,80.13
+27B mlp gate/up,exl3 5b stock,6,80.90
+27B mlp gate/up,exl3 5b stock,7,81.54
+27B mlp gate/up,exl3 5b stock,8,82.56
+27B mlp gate/up,exl3 5b stock,9,82.05
+27B mlp gate/up,exl3 5b stock,10,82.30
+27B mlp gate/up,exl3 5b stock,11,82.56
+27B mlp gate/up,exl3 5b stock,12,83.20
+27B mlp gate/up,exl3 5b stock,13,83.33
+27B mlp gate/up,exl3 5b stock,14,83.58
+27B mlp gate/up,exl3 5b stock,15,84.22
+27B mlp gate/up,exl3 5b stock,16,84.74
+27B mlp gate/up,exl3 5b stock,32,165.25
+27B mlp gate/up,exl3 5b stock,64,186.88
+27B mlp gate/up,exl3 5b stock,128,241.79
+27B mlp gate/up,exl3 5b stock,256,294.14
+27B mlp gate/up,exl3 5b stock,512,435.33
+27B mlp gate/up,exl3 5b volta,1,39.94
+27B mlp gate/up,exl3 5b volta,2,38.53
+27B mlp gate/up,exl3 5b volta,3,38.66
+27B mlp gate/up,exl3 5b volta,4,38.78
+27B mlp gate/up,exl3 5b volta,5,38.78
+27B mlp gate/up,exl3 5b volta,6,38.78
+27B mlp gate/up,exl3 5b volta,7,39.04
+27B mlp gate/up,exl3 5b volta,8,39.17
+27B mlp gate/up,exl3 5b volta,9,54.02
+27B mlp gate/up,exl3 5b volta,10,53.89
+27B mlp gate/up,exl3 5b volta,11,54.02
+27B mlp gate/up,exl3 5b volta,12,54.66
+27B mlp gate/up,exl3 5b volta,13,54.66
+27B mlp gate/up,exl3 5b volta,14,55.17
+27B mlp gate/up,exl3 5b volta,15,55.42
+27B mlp gate/up,exl3 5b volta,16,55.42
+27B mlp gate/up,exl3 5b volta,32,173.95
+27B mlp gate/up,exl3 5b volta,64,185.60
+27B mlp gate/up,exl3 5b volta,128,238.72
+27B mlp gate/up,exl3 5b volta,256,290.18
+27B mlp gate/up,exl3 5b volta,512,426.62
+27B mlp gate/up,nvfp4,1,20.68
+27B mlp gate/up,nvfp4,2,20.79
+27B mlp gate/up,nvfp4,3,20.99
+27B mlp gate/up,nvfp4,4,20.89
+27B mlp gate/up,nvfp4,5,21.09
+27B mlp gate/up,nvfp4,6,21.40
+27B mlp gate/up,nvfp4,7,21.81
+27B mlp gate/up,nvfp4,8,22.53
+27B mlp gate/up,nvfp4,9,32.15
+27B mlp gate/up,nvfp4,10,32.56
+27B mlp gate/up,nvfp4,11,33.28
+27B mlp gate/up,nvfp4,12,33.79
+27B mlp gate/up,nvfp4,13,34.61
+27B mlp gate/up,nvfp4,14,35.84
+27B mlp gate/up,nvfp4,15,37.38
+27B mlp gate/up,nvfp4,16,38.81
+27B mlp gate/up,nvfp4,32,122.68
+27B mlp gate/up,nvfp4,64,228.86
+27B mlp gate/up,nvfp4,128,256.72
+27B mlp gate/up,nvfp4,256,216.99
+27B mlp gate/up,nvfp4,512,424.14
+27B mlp gate/up,gguf q4_k,1,23.24
+27B mlp gate/up,gguf q4_k,2,26.21
+27B mlp gate/up,gguf q4_k,3,30.52
+27B mlp gate/up,gguf q4_k,4,36.56
+27B mlp gate/up,gguf q4_k,5,41.88
+27B mlp gate/up,gguf q4_k,6,42.19
+27B mlp gate/up,gguf q4_k,7,43.52
+27B mlp gate/up,gguf q4_k,8,45.16
+27B mlp gate/up,gguf q4_k,9,54.78
+27B mlp gate/up,gguf q4_k,10,55.40
+27B mlp gate/up,gguf q4_k,11,57.14
+27B mlp gate/up,gguf q4_k,12,58.27
+27B mlp gate/up,gguf q4_k,13,58.98
+27B mlp gate/up,gguf q4_k,14,60.21
+27B mlp gate/up,gguf q4_k,15,61.85
+27B mlp gate/up,gguf q4_k,16,63.28
+27B mlp gate/up,gguf q4_k,32,256.00
+27B mlp gate/up,gguf q4_k,64,274.12
+27B mlp gate/up,gguf q4_k,128,303.00
+27B mlp gate/up,gguf q4_k,256,385.74
+27B mlp gate/up,gguf q4_k,512,463.56
+27B mlp gate/up,gguf q6_k,1,29.82
+27B mlp gate/up,gguf q6_k,2,33.02
+27B mlp gate/up,gguf q6_k,3,37.25
+27B mlp gate/up,gguf q6_k,4,43.39
+27B mlp gate/up,gguf q6_k,5,49.28
+27B mlp gate/up,gguf q6_k,6,56.58
+27B mlp gate/up,gguf q6_k,7,61.95
+27B mlp gate/up,gguf q6_k,8,65.02
+27B mlp gate/up,gguf q6_k,9,91.52
+27B mlp gate/up,gguf q6_k,10,92.42
+27B mlp gate/up,gguf q6_k,11,93.18
+27B mlp gate/up,gguf q6_k,12,94.59
+27B mlp gate/up,gguf q6_k,13,95.87
+27B mlp gate/up,gguf q6_k,14,96.64
+27B mlp gate/up,gguf q6_k,15,97.92
+27B mlp gate/up,gguf q6_k,16,99.20
+27B mlp gate/up,gguf q6_k,32,210.56
+27B mlp gate/up,gguf q6_k,64,230.14
+27B mlp gate/up,gguf q6_k,128,257.54
+27B mlp gate/up,gguf q6_k,256,339.58
+27B mlp gate/up,gguf q6_k,512,415.10
+27B mlp gate/up,gguf iq3_s,1,28.84
+27B mlp gate/up,gguf iq3_s,2,34.22
+27B mlp gate/up,gguf iq3_s,3,40.36
+27B mlp gate/up,gguf iq3_s,4,46.25
+27B mlp gate/up,gguf iq3_s,5,52.48
+27B mlp gate/up,gguf iq3_s,6,58.97
+27B mlp gate/up,gguf iq3_s,7,64.17
+27B mlp gate/up,gguf iq3_s,8,69.97
+27B mlp gate/up,gguf iq3_s,9,104.96
+27B mlp gate/up,gguf iq3_s,10,104.96
+27B mlp gate/up,gguf iq3_s,11,105.22
+27B mlp gate/up,gguf iq3_s,12,105.81
+27B mlp gate/up,gguf iq3_s,13,107.18
+27B mlp gate/up,gguf iq3_s,14,106.92
+27B mlp gate/up,gguf iq3_s,15,107.52
+27B mlp gate/up,gguf iq3_s,16,107.61
+27B mlp gate/up,gguf iq3_s,32,363.61
+27B mlp gate/up,gguf iq3_s,64,383.23
+27B mlp gate/up,gguf iq3_s,128,411.14
+27B mlp gate/up,gguf iq3_s,256,494.51
+27B mlp gate/up,gguf iq3_s,512,573.44
+27B mlp down,exl3 3b stock,1,35.04
+27B mlp down,exl3 3b stock,2,48.35
+27B mlp down,exl3 3b stock,3,48.93
+27B mlp down,exl3 3b stock,4,49.81
+27B mlp down,exl3 3b stock,5,50.83
+27B mlp down,exl3 3b stock,6,51.79
+27B mlp down,exl3 3b stock,7,52.96
+27B mlp down,exl3 3b stock,8,54.42
+27B mlp down,exl3 3b stock,9,74.02
+27B mlp down,exl3 3b stock,10,75.48
+27B mlp down,exl3 3b stock,11,77.17
+27B mlp down,exl3 3b stock,12,78.63
+27B mlp down,exl3 3b stock,13,80.38
+27B mlp down,exl3 3b stock,14,81.77
+27B mlp down,exl3 3b stock,15,83.16
+27B mlp down,exl3 3b stock,16,84.77
+27B mlp down,exl3 3b stock,32,150.38
+27B mlp down,exl3 3b stock,64,168.16
+27B mlp down,exl3 3b stock,128,217.16
+27B mlp down,exl3 3b stock,256,280.80
+27B mlp down,exl3 3b stock,512,381.00
+27B mlp down,exl3 3b volta,1,34.16
+27B mlp down,exl3 3b volta,2,29.92
+27B mlp down,exl3 3b volta,3,29.99
+27B mlp down,exl3 3b volta,4,30.21
+27B mlp down,exl3 3b volta,5,30.50
+27B mlp down,exl3 3b volta,6,30.65
+27B mlp down,exl3 3b volta,7,30.87
+27B mlp down,exl3 3b volta,8,31.38
+27B mlp down,exl3 3b volta,9,40.37
+27B mlp down,exl3 3b volta,10,40.74
+27B mlp down,exl3 3b volta,11,41.25
+27B mlp down,exl3 3b volta,12,41.76
+27B mlp down,exl3 3b volta,13,42.35
+27B mlp down,exl3 3b volta,14,43.15
+27B mlp down,exl3 3b volta,15,44.03
+27B mlp down,exl3 3b volta,16,44.91
+27B mlp down,exl3 3b volta,32,148.63
+27B mlp down,exl3 3b volta,64,168.30
+27B mlp down,exl3 3b volta,128,217.97
+27B mlp down,exl3 3b volta,256,282.77
+27B mlp down,exl3 3b volta,512,382.68
+27B mlp down,exl3 4b stock,1,28.67
+27B mlp down,exl3 4b stock,2,39.32
+27B mlp down,exl3 4b stock,3,46.59
+27B mlp down,exl3 4b stock,4,47.21
+27B mlp down,exl3 4b stock,5,47.92
+27B mlp down,exl3 4b stock,6,48.64
+27B mlp down,exl3 4b stock,7,50.28
+27B mlp down,exl3 4b stock,8,52.22
+27B mlp down,exl3 4b stock,9,71.88
+27B mlp down,exl3 4b stock,10,73.52
+27B mlp down,exl3 4b stock,11,75.26
+27B mlp down,exl3 4b stock,12,77.00
+27B mlp down,exl3 4b stock,13,78.54
+27B mlp down,exl3 4b stock,14,79.77
+27B mlp down,exl3 4b stock,15,81.51
+27B mlp down,exl3 4b stock,16,83.35
+27B mlp down,exl3 4b stock,32,141.72
+27B mlp down,exl3 4b stock,64,171.72
+27B mlp down,exl3 4b stock,128,219.75
+27B mlp down,exl3 4b stock,256,283.75
+27B mlp down,exl3 4b stock,512,384.10
+27B mlp down,exl3 4b volta,1,28.77
+27B mlp down,exl3 4b volta,2,27.65
+27B mlp down,exl3 4b volta,3,27.85
+27B mlp down,exl3 4b volta,4,27.85
+27B mlp down,exl3 4b volta,5,27.96
+27B mlp down,exl3 4b volta,6,28.36
+27B mlp down,exl3 4b volta,7,28.77
+27B mlp down,exl3 4b volta,8,29.08
+27B mlp down,exl3 4b volta,9,37.89
+27B mlp down,exl3 4b volta,10,38.20
+27B mlp down,exl3 4b volta,11,38.50
+27B mlp down,exl3 4b volta,12,39.12
+27B mlp down,exl3 4b volta,13,40.04
+27B mlp down,exl3 4b volta,14,40.76
+27B mlp down,exl3 4b volta,15,41.68
+27B mlp down,exl3 4b volta,16,42.80
+27B mlp down,exl3 4b volta,32,141.52
+27B mlp down,exl3 4b volta,64,170.50
+27B mlp down,exl3 4b volta,128,219.34
+27B mlp down,exl3 4b volta,256,283.14
+27B mlp down,exl3 4b volta,512,383.80
+27B mlp down,exl3 5b stock,1,39.30
+27B mlp down,exl3 5b stock,2,54.91
+27B mlp down,exl3 5b stock,3,67.46
+27B mlp down,exl3 5b stock,4,68.22
+27B mlp down,exl3 5b stock,5,69.12
+27B mlp down,exl3 5b stock,6,69.76
+27B mlp down,exl3 5b stock,7,70.14
+27B mlp down,exl3 5b stock,8,70.91
+27B mlp down,exl3 5b stock,9,77.70
+27B mlp down,exl3 5b stock,10,78.85
+27B mlp down,exl3 5b stock,11,80.38
+27B mlp down,exl3 5b stock,12,82.05
+27B mlp down,exl3 5b stock,13,83.71
+27B mlp down,exl3 5b stock,14,85.12
+27B mlp down,exl3 5b stock,15,86.78
+27B mlp down,exl3 5b stock,16,88.45
+27B mlp down,exl3 5b stock,32,174.34
+27B mlp down,exl3 5b stock,64,175.74
+27B mlp down,exl3 5b stock,128,225.02
+27B mlp down,exl3 5b stock,256,289.92
+27B mlp down,exl3 5b stock,512,388.86
+27B mlp down,exl3 5b volta,1,38.02
+27B mlp down,exl3 5b volta,2,42.37
+27B mlp down,exl3 5b volta,3,42.50
+27B mlp down,exl3 5b volta,4,42.75
+27B mlp down,exl3 5b volta,5,43.01
+27B mlp down,exl3 5b volta,6,42.88
+27B mlp down,exl3 5b volta,7,43.39
+27B mlp down,exl3 5b volta,8,43.26
+27B mlp down,exl3 5b volta,9,48.00
+27B mlp down,exl3 5b volta,10,48.26
+27B mlp down,exl3 5b volta,11,48.38
+27B mlp down,exl3 5b volta,12,48.51
+27B mlp down,exl3 5b volta,13,48.64
+27B mlp down,exl3 5b volta,14,48.77
+27B mlp down,exl3 5b volta,15,48.90
+27B mlp down,exl3 5b volta,16,49.15
+27B mlp down,exl3 5b volta,32,160.64
+27B mlp down,exl3 5b volta,64,174.85
+27B mlp down,exl3 5b volta,128,224.13
+27B mlp down,exl3 5b volta,256,288.38
+27B mlp down,exl3 5b volta,512,388.35
+27B mlp down,nvfp4,1,21.09
+27B mlp down,nvfp4,2,21.20
+27B mlp down,nvfp4,3,21.20
+27B mlp down,nvfp4,4,21.40
+27B mlp down,nvfp4,5,21.50
+27B mlp down,nvfp4,6,21.61
+27B mlp down,nvfp4,7,21.91
+27B mlp down,nvfp4,8,22.43
+27B mlp down,nvfp4,9,30.21
+27B mlp down,nvfp4,10,30.62
+27B mlp down,nvfp4,11,30.92
+27B mlp down,nvfp4,12,31.33
+27B mlp down,nvfp4,13,31.95
+27B mlp down,nvfp4,14,32.77
+27B mlp down,nvfp4,15,33.48
+27B mlp down,nvfp4,16,34.51
+27B mlp down,nvfp4,32,104.04
+27B mlp down,nvfp4,64,217.09
+27B mlp down,nvfp4,128,242.79
+27B mlp down,nvfp4,256,185.14
+27B mlp down,nvfp4,512,361.68
+27B mlp down,gguf q4_k,1,25.60
+27B mlp down,gguf q4_k,2,28.06
+27B mlp down,gguf q4_k,3,32.36
+27B mlp down,gguf q4_k,4,38.50
+27B mlp down,gguf q4_k,5,43.93
+27B mlp down,gguf q4_k,6,44.44
+27B mlp down,gguf q4_k,7,45.67
+27B mlp down,gguf q4_k,8,46.90
+27B mlp down,gguf q4_k,9,56.83
+27B mlp down,gguf q4_k,10,57.96
+27B mlp down,gguf q4_k,11,59.08
+27B mlp down,gguf q4_k,12,60.11
+27B mlp down,gguf q4_k,13,61.44
+27B mlp down,gguf q4_k,14,62.46
+27B mlp down,gguf q4_k,15,63.39
+27B mlp down,gguf q4_k,16,64.82
+27B mlp down,gguf q4_k,32,254.77
+27B mlp down,gguf q4_k,64,264.09
+27B mlp down,gguf q4_k,128,289.18
+27B mlp down,gguf q4_k,256,374.89
+27B mlp down,gguf q4_k,512,410.11
+27B mlp down,gguf q6_k,1,30.46
+27B mlp down,gguf q6_k,2,33.79
+27B mlp down,gguf q6_k,3,38.53
+27B mlp down,gguf q6_k,4,45.57
+27B mlp down,gguf q6_k,5,51.97
+27B mlp down,gguf q6_k,6,59.65
+27B mlp down,gguf q6_k,7,65.02
+27B mlp down,gguf q6_k,8,65.41
+27B mlp down,gguf q6_k,9,90.24
+27B mlp down,gguf q6_k,10,91.78
+27B mlp down,gguf q6_k,11,92.16
+27B mlp down,gguf q6_k,12,93.31
+27B mlp down,gguf q6_k,13,94.59
+27B mlp down,gguf q6_k,14,94.98
+27B mlp down,gguf q6_k,15,96.64
+27B mlp down,gguf q6_k,16,97.28
+27B mlp down,gguf q6_k,32,207.74
+27B mlp down,gguf q6_k,64,218.24
+27B mlp down,gguf q6_k,128,242.05
+27B mlp down,gguf q6_k,256,328.32
+27B mlp down,gguf q6_k,512,363.26
+27B mlp down,gguf iq3_s,1,29.95
+27B mlp down,gguf iq3_s,2,35.50
+27B mlp down,gguf iq3_s,3,41.73
+27B mlp down,gguf iq3_s,4,48.64
+27B mlp down,gguf iq3_s,5,54.70
+27B mlp down,gguf iq3_s,6,62.04
+27B mlp down,gguf iq3_s,7,67.24
+27B mlp down,gguf iq3_s,8,73.81
+27B mlp down,gguf iq3_s,9,99.75
+27B mlp down,gguf iq3_s,10,100.10
+27B mlp down,gguf iq3_s,11,101.03
+27B mlp down,gguf iq3_s,12,101.03
+27B mlp down,gguf iq3_s,13,102.06
+27B mlp down,gguf iq3_s,14,102.06
+27B mlp down,gguf iq3_s,15,102.57
+27B mlp down,gguf iq3_s,16,103.08
+27B mlp down,gguf iq3_s,32,358.23
+27B mlp down,gguf iq3_s,64,368.55
+27B mlp down,gguf iq3_s,128,391.34
+27B mlp down,gguf iq3_s,256,478.55
+27B mlp down,gguf iq3_s,512,515.41
+27B lm_head/4,exl3 3b stock,1,768.26
+27B lm_head/4,exl3 3b stock,2,792.19
+27B lm_head/4,exl3 3b stock,3,795.65
+27B lm_head/4,exl3 3b stock,4,801.92
+27B lm_head/4,exl3 3b stock,5,815.36
+27B lm_head/4,exl3 3b stock,6,834.05
+27B lm_head/4,exl3 3b stock,7,862.59
+27B lm_head/4,exl3 3b stock,8,885.25
+27B lm_head/4,exl3 3b stock,9,971.01
+27B lm_head/4,exl3 3b stock,10,970.88
+27B lm_head/4,exl3 3b stock,11,972.16
+27B lm_head/4,exl3 3b stock,12,971.90
+27B lm_head/4,exl3 3b stock,13,972.42
+27B lm_head/4,exl3 3b stock,14,972.93
+27B lm_head/4,exl3 3b stock,15,975.10
+27B lm_head/4,exl3 3b stock,16,976.00
+27B lm_head/4,exl3 3b stock,32,1948.42
+27B lm_head/4,exl3 3b stock,64,2111.62
+27B lm_head/4,exl3 3b stock,128,2992.38
+27B lm_head/4,exl3 3b stock,256,3274.88
+27B lm_head/4,exl3 3b stock,512,5541.25
+27B lm_head/4,exl3 3b volta,1,378.37
+27B lm_head/4,exl3 3b volta,2,398.46
+27B lm_head/4,exl3 3b volta,3,400.64
+27B lm_head/4,exl3 3b volta,4,406.02
+27B lm_head/4,exl3 3b volta,5,413.57
+27B lm_head/4,exl3 3b volta,6,419.58
+27B lm_head/4,exl3 3b volta,7,429.18
+27B lm_head/4,exl3 3b volta,8,433.92
+27B lm_head/4,exl3 3b volta,9,548.61
+27B lm_head/4,exl3 3b volta,10,553.60
+27B lm_head/4,exl3 3b volta,11,556.93
+27B lm_head/4,exl3 3b volta,12,560.51
+27B lm_head/4,exl3 3b volta,13,563.33
+27B lm_head/4,exl3 3b volta,14,566.78
+27B lm_head/4,exl3 3b volta,15,570.11
+27B lm_head/4,exl3 3b volta,16,573.06
+27B lm_head/4,exl3 3b volta,32,1811.58
+27B lm_head/4,exl3 3b volta,64,2110.46
+27B lm_head/4,exl3 3b volta,128,2980.99
+27B lm_head/4,exl3 3b volta,256,3282.30
+27B lm_head/4,exl3 3b volta,512,5492.35
+27B lm_head/4,exl3 4b stock,1,583.94
+27B lm_head/4,exl3 4b stock,2,597.12
+27B lm_head/4,exl3 4b stock,3,602.37
+27B lm_head/4,exl3 4b stock,4,607.87
+27B lm_head/4,exl3 4b stock,5,617.86
+27B lm_head/4,exl3 4b stock,6,628.74
+27B lm_head/4,exl3 4b stock,7,640.38
+27B lm_head/4,exl3 4b stock,8,653.57
+27B lm_head/4,exl3 4b stock,9,1047.04
+27B lm_head/4,exl3 4b stock,10,1047.30
+27B lm_head/4,exl3 4b stock,11,1047.17
+27B lm_head/4,exl3 4b stock,12,1049.09
+27B lm_head/4,exl3 4b stock,13,1049.73
+27B lm_head/4,exl3 4b stock,14,1051.52
+27B lm_head/4,exl3 4b stock,15,980.10
+27B lm_head/4,exl3 4b stock,16,981.25
+27B lm_head/4,exl3 4b stock,32,1959.68
+27B lm_head/4,exl3 4b stock,64,2160.26
+27B lm_head/4,exl3 4b stock,128,3033.47
+27B lm_head/4,exl3 4b stock,256,3317.76
+27B lm_head/4,exl3 4b stock,512,5539.33
+27B lm_head/4,exl3 4b volta,1,311.30
+27B lm_head/4,exl3 4b volta,2,302.21
+27B lm_head/4,exl3 4b volta,3,304.13
+27B lm_head/4,exl3 4b volta,4,306.30
+27B lm_head/4,exl3 4b volta,5,307.58
+27B lm_head/4,exl3 4b volta,6,309.25
+27B lm_head/4,exl3 4b volta,7,310.14
+27B lm_head/4,exl3 4b volta,8,311.17
+27B lm_head/4,exl3 4b volta,9,365.70
+27B lm_head/4,exl3 4b volta,10,367.10
+27B lm_head/4,exl3 4b volta,11,371.07
+27B lm_head/4,exl3 4b volta,12,372.99
+27B lm_head/4,exl3 4b volta,13,376.32
+27B lm_head/4,exl3 4b volta,14,380.42
+27B lm_head/4,exl3 4b volta,15,381.70
+27B lm_head/4,exl3 4b volta,16,388.86
+27B lm_head/4,exl3 4b volta,32,1936.26
+27B lm_head/4,exl3 4b volta,64,2167.17
+27B lm_head/4,exl3 4b volta,128,3037.44
+27B lm_head/4,exl3 4b volta,256,3305.98
+27B lm_head/4,exl3 4b volta,512,5527.30
+27B lm_head/4,exl3 5b stock,1,982.40
+27B lm_head/4,exl3 5b stock,2,982.66
+27B lm_head/4,exl3 5b stock,3,991.49
+27B lm_head/4,exl3 5b stock,4,1001.73
+27B lm_head/4,exl3 5b stock,5,1011.97
+27B lm_head/4,exl3 5b stock,6,1029.12
+27B lm_head/4,exl3 5b stock,7,971.14
+27B lm_head/4,exl3 5b stock,8,990.98
+27B lm_head/4,exl3 5b stock,9,1169.92
+27B lm_head/4,exl3 5b stock,10,1167.23
+27B lm_head/4,exl3 5b stock,11,1168.64
+27B lm_head/4,exl3 5b stock,12,1168.38
+27B lm_head/4,exl3 5b stock,13,1147.14
+27B lm_head/4,exl3 5b stock,14,1148.67
+27B lm_head/4,exl3 5b stock,15,1149.06
+27B lm_head/4,exl3 5b stock,16,1149.57
+27B lm_head/4,exl3 5b stock,32,2295.30
+27B lm_head/4,exl3 5b stock,64,2202.75
+27B lm_head/4,exl3 5b stock,128,3086.34
+27B lm_head/4,exl3 5b stock,256,3377.28
+27B lm_head/4,exl3 5b stock,512,5617.28
+27B lm_head/4,exl3 5b volta,1,379.39
+27B lm_head/4,exl3 5b volta,2,403.07
+27B lm_head/4,exl3 5b volta,3,405.50
+27B lm_head/4,exl3 5b volta,4,405.76
+27B lm_head/4,exl3 5b volta,5,407.94
+27B lm_head/4,exl3 5b volta,6,409.47
+27B lm_head/4,exl3 5b volta,7,411.78
+27B lm_head/4,exl3 5b volta,8,414.34
+27B lm_head/4,exl3 5b volta,9,694.02
+27B lm_head/4,exl3 5b volta,10,697.73
+27B lm_head/4,exl3 5b volta,11,656.38
+27B lm_head/4,exl3 5b volta,12,658.18
+27B lm_head/4,exl3 5b volta,13,661.76
+27B lm_head/4,exl3 5b volta,14,660.86
+27B lm_head/4,exl3 5b volta,15,663.55
+27B lm_head/4,exl3 5b volta,16,663.42
+27B lm_head/4,exl3 5b volta,32,2367.36
+27B lm_head/4,exl3 5b volta,64,2204.29
+27B lm_head/4,exl3 5b volta,128,3080.45
+27B lm_head/4,exl3 5b volta,256,3388.42
+27B lm_head/4,exl3 5b volta,512,5623.30
+27B lm_head/4,nvfp4,1,237.44
+27B lm_head/4,nvfp4,2,240.38
+27B lm_head/4,nvfp4,3,242.82
+27B lm_head/4,nvfp4,4,245.12
+27B lm_head/4,nvfp4,5,247.30
+27B lm_head/4,nvfp4,6,249.73
+27B lm_head/4,nvfp4,7,253.44
+27B lm_head/4,nvfp4,8,258.30
+27B lm_head/4,nvfp4,9,310.91
+27B lm_head/4,nvfp4,10,316.93
+27B lm_head/4,nvfp4,11,327.04
+27B lm_head/4,nvfp4,12,343.68
+27B lm_head/4,nvfp4,13,363.52
+27B lm_head/4,nvfp4,14,384.51
+27B lm_head/4,nvfp4,15,409.47
+27B lm_head/4,nvfp4,16,433.92
+27B lm_head/4,nvfp4,32,1013.63
+27B lm_head/4,nvfp4,64,1360.26
+27B lm_head/4,nvfp4,128,1443.58
+27B lm_head/4,nvfp4,256,2667.26
+27B lm_head/4,nvfp4,512,10429.57
+27B lm_head/4,gguf q4_k,1,228.22
+27B lm_head/4,gguf q4_k,2,273.79
+27B lm_head/4,gguf q4_k,3,333.70
+27B lm_head/4,gguf q4_k,4,411.90
+27B lm_head/4,gguf q4_k,5,512.90
+27B lm_head/4,gguf q4_k,6,355.33
+27B lm_head/4,gguf q4_k,7,385.02
+27B lm_head/4,gguf q4_k,8,393.73
+27B lm_head/4,gguf q4_k,9,596.22
+27B lm_head/4,gguf q4_k,10,604.93
+27B lm_head/4,gguf q4_k,11,621.57
+27B lm_head/4,gguf q4_k,12,604.67
+27B lm_head/4,gguf q4_k,13,618.62
+27B lm_head/4,gguf q4_k,14,635.01
+27B lm_head/4,gguf q4_k,15,648.19
+27B lm_head/4,gguf q4_k,16,659.20
+27B lm_head/4,gguf q4_k,32,3591.55
+27B lm_head/4,gguf q4_k,64,3530.50
+27B lm_head/4,gguf q4_k,128,4538.88
+27B lm_head/4,gguf q4_k,256,6700.16
+27B lm_head/4,gguf q4_k,512,11005.18
+27B lm_head/4,gguf q6_k,1,322.05
+27B lm_head/4,gguf q6_k,2,355.58
+27B lm_head/4,gguf q6_k,3,421.89
+27B lm_head/4,gguf q6_k,4,521.09
+27B lm_head/4,gguf q6_k,5,609.66
+27B lm_head/4,gguf q6_k,6,748.93
+27B lm_head/4,gguf q6_k,7,886.91
+27B lm_head/4,gguf q6_k,8,756.48
+27B lm_head/4,gguf q6_k,9,1111.17
+27B lm_head/4,gguf q6_k,10,1093.63
+27B lm_head/4,gguf q6_k,11,1107.97
+27B lm_head/4,gguf q6_k,12,1120.13
+27B lm_head/4,gguf q6_k,13,1132.03
+27B lm_head/4,gguf q6_k,14,1146.11
+27B lm_head/4,gguf q6_k,15,1127.94
+27B lm_head/4,gguf q6_k,16,1139.07
+27B lm_head/4,gguf q6_k,32,2871.68
+27B lm_head/4,gguf q6_k,64,2881.66
+27B lm_head/4,gguf q6_k,128,3904.38
+27B lm_head/4,gguf q6_k,256,6065.79
+27B lm_head/4,gguf q6_k,512,10387.71
+27B lm_head/4,gguf iq3_s,1,289.02
+27B lm_head/4,gguf iq3_s,2,369.92
+27B lm_head/4,gguf iq3_s,3,455.30
+27B lm_head/4,gguf iq3_s,4,536.06
+27B lm_head/4,gguf iq3_s,5,642.30
+27B lm_head/4,gguf iq3_s,6,734.85
+27B lm_head/4,gguf iq3_s,7,821.76
+27B lm_head/4,gguf iq3_s,8,899.07
+27B lm_head/4,gguf iq3_s,9,1311.10
+27B lm_head/4,gguf iq3_s,10,1326.59
+27B lm_head/4,gguf iq3_s,11,1325.44
+27B lm_head/4,gguf iq3_s,12,1330.56
+27B lm_head/4,gguf iq3_s,13,1293.82
+27B lm_head/4,gguf iq3_s,14,1299.07
+27B lm_head/4,gguf iq3_s,15,1303.42
+27B lm_head/4,gguf iq3_s,16,1298.05
+27B lm_head/4,gguf iq3_s,32,5001.22
+27B lm_head/4,gguf iq3_s,64,5009.02
+27B lm_head/4,gguf iq3_s,128,6022.02
+27B lm_head/4,gguf iq3_s,256,8183.17
+27B lm_head/4,gguf iq3_s,512,12495.36
+flash attn/gdn in,exl3 3b stock,1,21.58
+flash attn/gdn in,exl3 3b stock,2,31.94
+flash attn/gdn in,exl3 3b stock,3,32.22
+flash attn/gdn in,exl3 3b stock,4,32.53
+flash attn/gdn in,exl3 3b stock,5,33.12
+flash attn/gdn in,exl3 3b stock,6,33.79
+flash attn/gdn in,exl3 3b stock,7,34.86
+flash attn/gdn in,exl3 3b stock,8,36.12
+flash attn/gdn in,exl3 3b stock,9,47.14
+flash attn/gdn in,exl3 3b stock,10,48.01
+flash attn/gdn in,exl3 3b stock,11,49.07
+flash attn/gdn in,exl3 3b stock,12,49.98
+flash attn/gdn in,exl3 3b stock,13,51.36
+flash attn/gdn in,exl3 3b stock,14,52.50
+flash attn/gdn in,exl3 3b stock,15,53.92
+flash attn/gdn in,exl3 3b stock,16,55.53
+flash attn/gdn in,exl3 3b stock,32,84.80
+flash attn/gdn in,exl3 3b stock,64,98.50
+flash attn/gdn in,exl3 3b stock,128,128.71
+flash attn/gdn in,exl3 3b stock,256,164.23
+flash attn/gdn in,exl3 3b stock,512,229.93
+flash attn/gdn in,exl3 3b volta,1,20.99
+flash attn/gdn in,exl3 3b volta,2,20.40
+flash attn/gdn in,exl3 3b volta,3,20.48
+flash attn/gdn in,exl3 3b volta,4,20.56
+flash attn/gdn in,exl3 3b volta,5,20.72
+flash attn/gdn in,exl3 3b volta,6,20.87
+flash attn/gdn in,exl3 3b volta,7,21.23
+flash attn/gdn in,exl3 3b volta,8,21.58
+flash attn/gdn in,exl3 3b volta,9,27.49
+flash attn/gdn in,exl3 3b volta,10,27.73
+flash attn/gdn in,exl3 3b volta,11,28.04
+flash attn/gdn in,exl3 3b volta,12,28.48
+flash attn/gdn in,exl3 3b volta,13,28.95
+flash attn/gdn in,exl3 3b volta,14,29.50
+flash attn/gdn in,exl3 3b volta,15,30.13
+flash attn/gdn in,exl3 3b volta,16,30.84
+flash attn/gdn in,exl3 3b volta,32,89.72
+flash attn/gdn in,exl3 3b volta,64,98.50
+flash attn/gdn in,exl3 3b volta,128,128.63
+flash attn/gdn in,exl3 3b volta,256,163.60
+flash attn/gdn in,exl3 3b volta,512,229.18
+flash attn/gdn in,exl3 4b stock,1,18.23
+flash attn/gdn in,exl3 4b stock,2,24.42
+flash attn/gdn in,exl3 4b stock,3,31.39
+flash attn/gdn in,exl3 4b stock,4,31.54
+flash attn/gdn in,exl3 4b stock,5,32.00
+flash attn/gdn in,exl3 4b stock,6,32.61
+flash attn/gdn in,exl3 4b stock,7,33.79
+flash attn/gdn in,exl3 4b stock,8,35.38
+flash attn/gdn in,exl3 4b stock,9,44.29
+flash attn/gdn in,exl3 4b stock,10,44.85
+flash attn/gdn in,exl3 4b stock,11,46.03
+flash attn/gdn in,exl3 4b stock,12,47.62
+flash attn/gdn in,exl3 4b stock,13,49.20
+flash attn/gdn in,exl3 4b stock,14,50.94
+flash attn/gdn in,exl3 4b stock,15,52.48
+flash attn/gdn in,exl3 4b stock,16,54.07
+flash attn/gdn in,exl3 4b stock,32,79.77
+flash attn/gdn in,exl3 4b stock,64,100.20
+flash attn/gdn in,exl3 4b stock,128,130.36
+flash attn/gdn in,exl3 4b stock,256,165.22
+flash attn/gdn in,exl3 4b stock,512,230.81
+flash attn/gdn in,exl3 4b volta,1,18.02
+flash attn/gdn in,exl3 4b volta,2,19.46
+flash attn/gdn in,exl3 4b volta,3,19.61
+flash attn/gdn in,exl3 4b volta,4,19.66
+flash attn/gdn in,exl3 4b volta,5,19.81
+flash attn/gdn in,exl3 4b volta,6,19.97
+flash attn/gdn in,exl3 4b volta,7,20.33
+flash attn/gdn in,exl3 4b volta,8,20.79
+flash attn/gdn in,exl3 4b volta,9,26.73
+flash attn/gdn in,exl3 4b volta,10,26.88
+flash attn/gdn in,exl3 4b volta,11,27.24
+flash attn/gdn in,exl3 4b volta,12,27.75
+flash attn/gdn in,exl3 4b volta,13,28.26
+flash attn/gdn in,exl3 4b volta,14,28.83
+flash attn/gdn in,exl3 4b volta,15,29.39
+flash attn/gdn in,exl3 4b volta,16,30.11
+flash attn/gdn in,exl3 4b volta,32,87.19
+flash attn/gdn in,exl3 4b volta,64,99.69
+flash attn/gdn in,exl3 4b volta,128,129.69
+flash attn/gdn in,exl3 4b volta,256,164.66
+flash attn/gdn in,exl3 4b volta,512,230.35
+flash attn/gdn in,exl3 5b stock,1,27.46
+flash attn/gdn in,exl3 5b stock,2,33.28
+flash attn/gdn in,exl3 5b stock,3,41.41
+flash attn/gdn in,exl3 5b stock,4,41.92
+flash attn/gdn in,exl3 5b stock,5,42.30
+flash attn/gdn in,exl3 5b stock,6,42.75
+flash attn/gdn in,exl3 5b stock,7,43.20
+flash attn/gdn in,exl3 5b stock,8,43.58
+flash attn/gdn in,exl3 5b stock,9,53.25
+flash attn/gdn in,exl3 5b stock,10,53.89
+flash attn/gdn in,exl3 5b stock,11,54.27
+flash attn/gdn in,exl3 5b stock,12,54.85
+flash attn/gdn in,exl3 5b stock,13,55.68
+flash attn/gdn in,exl3 5b stock,14,56.06
+flash attn/gdn in,exl3 5b stock,15,56.26
+flash attn/gdn in,exl3 5b stock,16,56.90
+flash attn/gdn in,exl3 5b stock,32,100.35
+flash attn/gdn in,exl3 5b stock,64,101.95
+flash attn/gdn in,exl3 5b stock,128,132.16
+flash attn/gdn in,exl3 5b stock,256,167.42
+flash attn/gdn in,exl3 5b stock,512,232.51
+flash attn/gdn in,exl3 5b volta,1,26.43
+flash attn/gdn in,exl3 5b volta,2,23.23
+flash attn/gdn in,exl3 5b volta,3,23.36
+flash attn/gdn in,exl3 5b volta,4,23.49
+flash attn/gdn in,exl3 5b volta,5,23.62
+flash attn/gdn in,exl3 5b volta,6,23.74
+flash attn/gdn in,exl3 5b volta,7,23.87
+flash attn/gdn in,exl3 5b volta,8,23.81
+flash attn/gdn in,exl3 5b volta,9,30.98
+flash attn/gdn in,exl3 5b volta,10,31.17
+flash attn/gdn in,exl3 5b volta,11,31.23
+flash attn/gdn in,exl3 5b volta,12,31.36
+flash attn/gdn in,exl3 5b volta,13,31.36
+flash attn/gdn in,exl3 5b volta,14,31.49
+flash attn/gdn in,exl3 5b volta,15,31.62
+flash attn/gdn in,exl3 5b volta,16,31.68
+flash attn/gdn in,exl3 5b volta,32,107.01
+flash attn/gdn in,exl3 5b volta,64,101.70
+flash attn/gdn in,exl3 5b volta,128,131.78
+flash attn/gdn in,exl3 5b volta,256,166.85
+flash attn/gdn in,exl3 5b volta,512,232.06
+flash attn/gdn in,nvfp4,1,11.72
+flash attn/gdn in,nvfp4,2,11.72
+flash attn/gdn in,nvfp4,3,11.78
+flash attn/gdn in,nvfp4,4,11.78
+flash attn/gdn in,nvfp4,5,11.83
+flash attn/gdn in,nvfp4,6,11.89
+flash attn/gdn in,nvfp4,7,12.29
+flash attn/gdn in,nvfp4,8,12.57
+flash attn/gdn in,nvfp4,9,18.15
+flash attn/gdn in,nvfp4,10,18.38
+flash attn/gdn in,nvfp4,11,18.77
+flash attn/gdn in,nvfp4,12,19.23
+flash attn/gdn in,nvfp4,13,19.68
+flash attn/gdn in,nvfp4,14,20.37
+flash attn/gdn in,nvfp4,15,20.99
+flash attn/gdn in,nvfp4,16,21.62
+flash attn/gdn in,nvfp4,32,61.38
+flash attn/gdn in,nvfp4,64,117.53
+flash attn/gdn in,nvfp4,128,134.88
+flash attn/gdn in,nvfp4,256,111.05
+flash attn/gdn in,nvfp4,512,205.65
+flash attn/gdn in,gguf q4_k,1,14.51
+flash attn/gdn in,gguf q4_k,2,16.84
+flash attn/gdn in,gguf q4_k,3,19.17
+flash attn/gdn in,gguf q4_k,4,22.58
+flash attn/gdn in,gguf q4_k,5,25.43
+flash attn/gdn in,gguf q4_k,6,29.47
+flash attn/gdn in,gguf q4_k,7,30.09
+flash attn/gdn in,gguf q4_k,8,30.89
+flash attn/gdn in,gguf q4_k,9,32.31
+flash attn/gdn in,gguf q4_k,10,32.82
+flash attn/gdn in,gguf q4_k,11,33.62
+flash attn/gdn in,gguf q4_k,12,34.25
+flash attn/gdn in,gguf q4_k,13,34.93
+flash attn/gdn in,gguf q4_k,14,35.44
+flash attn/gdn in,gguf q4_k,15,36.24
+flash attn/gdn in,gguf q4_k,16,36.92
+flash attn/gdn in,gguf q4_k,32,125.33
+flash attn/gdn in,gguf q4_k,64,141.14
+flash attn/gdn in,gguf q4_k,128,157.47
+flash attn/gdn in,gguf q4_k,256,200.19
+flash attn/gdn in,gguf q4_k,512,227.84
+flash attn/gdn in,gguf q6_k,1,18.43
+flash attn/gdn in,gguf q6_k,2,20.91
+flash attn/gdn in,gguf q6_k,3,22.95
+flash attn/gdn in,gguf q6_k,4,26.62
+flash attn/gdn in,gguf q6_k,5,29.53
+flash attn/gdn in,gguf q6_k,6,33.96
+flash attn/gdn in,gguf q6_k,7,35.84
+flash attn/gdn in,gguf q6_k,8,39.68
+flash attn/gdn in,gguf q6_k,9,53.42
+flash attn/gdn in,gguf q6_k,10,54.19
+flash attn/gdn in,gguf q6_k,11,54.95
+flash attn/gdn in,gguf q6_k,12,55.55
+flash attn/gdn in,gguf q6_k,13,56.41
+flash attn/gdn in,gguf q6_k,14,56.92
+flash attn/gdn in,gguf q6_k,15,57.69
+flash attn/gdn in,gguf q6_k,16,58.37
+flash attn/gdn in,gguf q6_k,32,103.42
+flash attn/gdn in,gguf q6_k,64,120.15
+flash attn/gdn in,gguf q6_k,128,135.51
+flash attn/gdn in,gguf q6_k,256,181.50
+flash attn/gdn in,gguf q6_k,512,205.31
+flash attn/gdn in,gguf iq3_s,1,16.90
+flash attn/gdn in,gguf iq3_s,2,19.97
+flash attn/gdn in,gguf iq3_s,3,23.25
+flash attn/gdn in,gguf iq3_s,4,26.84
+flash attn/gdn in,gguf iq3_s,5,30.12
+flash attn/gdn in,gguf iq3_s,6,33.79
+flash attn/gdn in,gguf iq3_s,7,36.74
+flash attn/gdn in,gguf iq3_s,8,40.06
+flash attn/gdn in,gguf iq3_s,9,53.42
+flash attn/gdn in,gguf iq3_s,10,53.29
+flash attn/gdn in,gguf iq3_s,11,53.67
+flash attn/gdn in,gguf iq3_s,12,53.50
+flash attn/gdn in,gguf iq3_s,13,53.55
+flash attn/gdn in,gguf iq3_s,14,53.85
+flash attn/gdn in,gguf iq3_s,15,54.14
+flash attn/gdn in,gguf iq3_s,16,54.27
+flash attn/gdn in,gguf iq3_s,32,175.06
+flash attn/gdn in,gguf iq3_s,64,191.45
+flash attn/gdn in,gguf iq3_s,128,207.66
+flash attn/gdn in,gguf iq3_s,256,250.15
+flash attn/gdn in,gguf iq3_s,512,277.55
+flash out,exl3 3b stock,1,23.55
+flash out,exl3 3b stock,2,26.19
+flash out,exl3 3b stock,3,26.43
+flash out,exl3 3b stock,4,26.70
+flash out,exl3 3b stock,5,26.82
+flash out,exl3 3b stock,6,27.06
+flash out,exl3 3b stock,7,27.29
+flash out,exl3 3b stock,8,28.00
+flash out,exl3 3b stock,9,41.71
+flash out,exl3 3b stock,10,41.75
+flash out,exl3 3b stock,11,41.94
+flash out,exl3 3b stock,12,42.06
+flash out,exl3 3b stock,13,42.26
+flash out,exl3 3b stock,14,42.42
+flash out,exl3 3b stock,15,42.65
+flash out,exl3 3b stock,16,42.73
+flash out,exl3 3b stock,32,98.62
+flash out,exl3 3b stock,64,96.26
+flash out,exl3 3b stock,128,116.46
+flash out,exl3 3b stock,256,164.23
+flash out,exl3 3b stock,512,242.69
+flash out,exl3 3b volta,1,22.84
+flash out,exl3 3b volta,2,20.83
+flash out,exl3 3b volta,3,20.95
+flash out,exl3 3b volta,4,20.99
+flash out,exl3 3b volta,5,21.07
+flash out,exl3 3b volta,6,21.07
+flash out,exl3 3b volta,7,21.19
+flash out,exl3 3b volta,8,21.23
+flash out,exl3 3b volta,9,22.25
+flash out,exl3 3b volta,10,22.41
+flash out,exl3 3b volta,11,22.49
+flash out,exl3 3b volta,12,22.88
+flash out,exl3 3b volta,13,23.24
+flash out,exl3 3b volta,14,23.51
+flash out,exl3 3b volta,15,23.79
+flash out,exl3 3b volta,16,24.22
+flash out,exl3 3b volta,32,105.51
+flash out,exl3 3b volta,64,95.86
+flash out,exl3 3b volta,128,116.34
+flash out,exl3 3b volta,256,163.64
+flash out,exl3 3b volta,512,242.22
+flash out,exl3 4b stock,1,20.12
+flash out,exl3 4b stock,2,26.57
+flash out,exl3 4b stock,3,25.75
+flash out,exl3 4b stock,4,25.96
+flash out,exl3 4b stock,5,25.91
+flash out,exl3 4b stock,6,26.21
+flash out,exl3 4b stock,7,26.78
+flash out,exl3 4b stock,8,27.85
+flash out,exl3 4b stock,9,41.73
+flash out,exl3 4b stock,10,41.93
+flash out,exl3 4b stock,11,42.04
+flash out,exl3 4b stock,12,42.24
+flash out,exl3 4b stock,13,42.39
+flash out,exl3 4b stock,14,42.44
+flash out,exl3 4b stock,15,42.70
+flash out,exl3 4b stock,16,42.85
+flash out,exl3 4b stock,32,94.00
+flash out,exl3 4b stock,64,97.48
+flash out,exl3 4b stock,128,117.66
+flash out,exl3 4b stock,256,165.63
+flash out,exl3 4b stock,512,243.61
+flash out,exl3 4b volta,1,19.25
+flash out,exl3 4b volta,2,19.56
+flash out,exl3 4b volta,3,19.71
+flash out,exl3 4b volta,4,19.66
+flash out,exl3 4b volta,5,19.66
+flash out,exl3 4b volta,6,19.61
+flash out,exl3 4b volta,7,19.61
+flash out,exl3 4b volta,8,19.71
+flash out,exl3 4b volta,9,21.61
+flash out,exl3 4b volta,10,21.66
+flash out,exl3 4b volta,11,21.91
+flash out,exl3 4b volta,12,22.37
+flash out,exl3 4b volta,13,22.78
+flash out,exl3 4b volta,14,22.94
+flash out,exl3 4b volta,15,23.19
+flash out,exl3 4b volta,16,23.71
+flash out,exl3 4b volta,32,101.73
+flash out,exl3 4b volta,64,96.97
+flash out,exl3 4b volta,128,117.40
+flash out,exl3 4b volta,256,165.02
+flash out,exl3 4b volta,512,243.51
+flash out,exl3 5b stock,1,28.74
+flash out,exl3 5b stock,2,35.46
+flash out,exl3 5b stock,3,36.03
+flash out,exl3 5b stock,4,36.48
+flash out,exl3 5b stock,5,36.74
+flash out,exl3 5b stock,6,37.31
+flash out,exl3 5b stock,7,37.57
+flash out,exl3 5b stock,8,37.89
+flash out,exl3 5b stock,9,47.49
+flash out,exl3 5b stock,10,47.74
+flash out,exl3 5b stock,11,47.87
+flash out,exl3 5b stock,12,48.00
+flash out,exl3 5b stock,13,48.13
+flash out,exl3 5b stock,14,48.32
+flash out,exl3 5b stock,15,48.51
+flash out,exl3 5b stock,16,48.64
+flash out,exl3 5b stock,32,93.95
+flash out,exl3 5b stock,64,99.71
+flash out,exl3 5b stock,128,119.81
+flash out,exl3 5b stock,256,167.30
+flash out,exl3 5b stock,512,245.63
+flash out,exl3 5b volta,1,28.10
+flash out,exl3 5b volta,2,21.44
+flash out,exl3 5b volta,3,21.57
+flash out,exl3 5b volta,4,21.63
+flash out,exl3 5b volta,5,21.70
+flash out,exl3 5b volta,6,21.89
+flash out,exl3 5b volta,7,21.89
+flash out,exl3 5b volta,8,22.02
+flash out,exl3 5b volta,9,28.61
+flash out,exl3 5b volta,10,28.67
+flash out,exl3 5b volta,11,28.80
+flash out,exl3 5b volta,12,28.93
+flash out,exl3 5b volta,13,29.06
+flash out,exl3 5b volta,14,29.18
+flash out,exl3 5b volta,15,29.25
+flash out,exl3 5b volta,16,29.38
+flash out,exl3 5b volta,32,96.77
+flash out,exl3 5b volta,64,98.75
+flash out,exl3 5b volta,128,119.68
+flash out,exl3 5b volta,256,166.98
+flash out,exl3 5b volta,512,245.44
+flash out,nvfp4,1,12.40
+flash out,nvfp4,2,12.40
+flash out,nvfp4,3,12.46
+flash out,nvfp4,4,12.46
+flash out,nvfp4,5,12.52
+flash out,nvfp4,6,12.40
+flash out,nvfp4,7,12.52
+flash out,nvfp4,8,12.69
+flash out,nvfp4,9,15.13
+flash out,nvfp4,10,15.25
+flash out,nvfp4,11,15.47
+flash out,nvfp4,12,15.70
+flash out,nvfp4,13,15.99
+flash out,nvfp4,14,16.27
+flash out,nvfp4,15,16.73
+flash out,nvfp4,16,17.07
+flash out,nvfp4,32,91.70
+flash out,nvfp4,64,105.02
+flash out,nvfp4,128,116.57
+flash out,nvfp4,256,158.49
+flash out,nvfp4,512,212.37
+flash out,gguf q4_k,1,14.34
+flash out,gguf q4_k,2,15.42
+flash out,gguf q4_k,3,17.35
+flash out,gguf q4_k,4,20.48
+flash out,gguf q4_k,5,22.93
+flash out,gguf q4_k,6,24.12
+flash out,gguf q4_k,7,24.92
+flash out,gguf q4_k,8,25.37
+flash out,gguf q4_k,9,26.45
+flash out,gguf q4_k,10,27.08
+flash out,gguf q4_k,11,27.70
+flash out,gguf q4_k,12,28.39
+flash out,gguf q4_k,13,28.90
+flash out,gguf q4_k,14,29.30
+flash out,gguf q4_k,15,29.87
+flash out,gguf q4_k,16,30.38
+flash out,gguf q4_k,32,123.39
+flash out,gguf q4_k,64,130.96
+flash out,gguf q4_k,128,142.34
+flash out,gguf q4_k,256,183.98
+flash out,gguf q4_k,512,238.88
+flash out,gguf q6_k,1,17.92
+flash out,gguf q6_k,2,19.80
+flash out,gguf q6_k,3,21.50
+flash out,gguf q6_k,4,24.66
+flash out,gguf q6_k,5,27.48
+flash out,gguf q6_k,6,31.06
+flash out,gguf q6_k,7,33.28
+flash out,gguf q6_k,8,31.49
+flash out,gguf q6_k,9,43.26
+flash out,gguf q6_k,10,43.61
+flash out,gguf q6_k,11,44.80
+flash out,gguf q6_k,12,44.97
+flash out,gguf q6_k,13,45.31
+flash out,gguf q6_k,14,45.40
+flash out,gguf q6_k,15,46.51
+flash out,gguf q6_k,16,46.68
+flash out,gguf q6_k,32,101.03
+flash out,gguf q6_k,64,109.06
+flash out,gguf q6_k,128,119.64
+flash out,gguf q6_k,256,161.79
+flash out,gguf q6_k,512,214.87
+flash out,gguf iq3_s,1,16.00
+flash out,gguf iq3_s,2,18.47
+flash out,gguf iq3_s,3,21.46
+flash out,gguf iq3_s,4,24.19
+flash out,gguf iq3_s,5,27.05
+flash out,gguf iq3_s,6,30.17
+flash out,gguf iq3_s,7,32.90
+flash out,gguf iq3_s,8,35.71
+flash out,gguf iq3_s,9,53.46
+flash out,gguf iq3_s,10,52.91
+flash out,gguf iq3_s,11,53.42
+flash out,gguf iq3_s,12,53.42
+flash out,gguf iq3_s,13,54.53
+flash out,gguf iq3_s,14,55.00
+flash out,gguf iq3_s,15,55.21
+flash out,gguf iq3_s,16,56.11
+flash out,gguf iq3_s,32,173.61
+flash out,gguf iq3_s,64,181.03
+flash out,gguf iq3_s,128,192.00
+flash out,gguf iq3_s,256,234.45
+flash out,gguf iq3_s,512,288.64
+flash shared gate/up,exl3 3b stock,1,18.08
+flash shared gate/up,exl3 3b stock,2,14.56
+flash shared gate/up,exl3 3b stock,3,14.53
+flash shared gate/up,exl3 3b stock,4,14.72
+flash shared gate/up,exl3 3b stock,5,14.78
+flash shared gate/up,exl3 3b stock,6,14.91
+flash shared gate/up,exl3 3b stock,7,15.20
+flash shared gate/up,exl3 3b stock,8,15.62
+flash shared gate/up,exl3 3b stock,9,18.53
+flash shared gate/up,exl3 3b stock,10,18.66
+flash shared gate/up,exl3 3b stock,11,18.88
+flash shared gate/up,exl3 3b stock,12,19.33
+flash shared gate/up,exl3 3b stock,13,19.71
+flash shared gate/up,exl3 3b stock,14,20.13
+flash shared gate/up,exl3 3b stock,15,20.61
+flash shared gate/up,exl3 3b stock,16,21.12
+flash shared gate/up,exl3 3b stock,32,51.90
+flash shared gate/up,exl3 3b stock,64,35.01
+flash shared gate/up,exl3 3b stock,128,50.30
+flash shared gate/up,exl3 3b stock,256,64.06
+flash shared gate/up,exl3 3b stock,512,106.72
+flash shared gate/up,exl3 3b volta,1,17.76
+flash shared gate/up,exl3 3b volta,2,12.19
+flash shared gate/up,exl3 3b volta,3,12.35
+flash shared gate/up,exl3 3b volta,4,12.45
+flash shared gate/up,exl3 3b volta,5,12.67
+flash shared gate/up,exl3 3b volta,6,12.77
+flash shared gate/up,exl3 3b volta,7,12.90
+flash shared gate/up,exl3 3b volta,8,13.06
+flash shared gate/up,exl3 3b volta,9,13.73
+flash shared gate/up,exl3 3b volta,10,13.76
+flash shared gate/up,exl3 3b volta,11,13.86
+flash shared gate/up,exl3 3b volta,12,13.89
+flash shared gate/up,exl3 3b volta,13,14.21
+flash shared gate/up,exl3 3b volta,14,14.43
+flash shared gate/up,exl3 3b volta,15,14.66
+flash shared gate/up,exl3 3b volta,16,14.91
+flash shared gate/up,exl3 3b volta,32,51.30
+flash shared gate/up,exl3 3b volta,64,34.46
+flash shared gate/up,exl3 3b volta,128,50.11
+flash shared gate/up,exl3 3b volta,256,63.87
+flash shared gate/up,exl3 3b volta,512,106.72
+flash shared gate/up,exl3 4b stock,1,14.30
+flash shared gate/up,exl3 4b stock,2,18.18
+flash shared gate/up,exl3 4b stock,3,14.82
+flash shared gate/up,exl3 4b stock,4,14.94
+flash shared gate/up,exl3 4b stock,5,15.01
+flash shared gate/up,exl3 4b stock,6,15.17
+flash shared gate/up,exl3 4b stock,7,15.55
+flash shared gate/up,exl3 4b stock,8,15.94
+flash shared gate/up,exl3 4b stock,9,18.94
+flash shared gate/up,exl3 4b stock,10,19.17
+flash shared gate/up,exl3 4b stock,11,19.52
+flash shared gate/up,exl3 4b stock,12,19.87
+flash shared gate/up,exl3 4b stock,13,20.35
+flash shared gate/up,exl3 4b stock,14,20.70
+flash shared gate/up,exl3 4b stock,15,21.09
+flash shared gate/up,exl3 4b stock,16,21.57
+flash shared gate/up,exl3 4b stock,32,51.30
+flash shared gate/up,exl3 4b stock,64,35.55
+flash shared gate/up,exl3 4b stock,128,50.78
+flash shared gate/up,exl3 4b stock,256,64.19
+flash shared gate/up,exl3 4b stock,512,106.94
+flash shared gate/up,exl3 4b volta,1,13.98
+flash shared gate/up,exl3 4b volta,2,12.19
+flash shared gate/up,exl3 4b volta,3,12.26
+flash shared gate/up,exl3 4b volta,4,12.35
+flash shared gate/up,exl3 4b volta,5,12.45
+flash shared gate/up,exl3 4b volta,6,12.58
+flash shared gate/up,exl3 4b volta,7,12.64
+flash shared gate/up,exl3 4b volta,8,12.93
+flash shared gate/up,exl3 4b volta,9,13.82
+flash shared gate/up,exl3 4b volta,10,13.86
+flash shared gate/up,exl3 4b volta,11,13.98
+flash shared gate/up,exl3 4b volta,12,14.08
+flash shared gate/up,exl3 4b volta,13,14.37
+flash shared gate/up,exl3 4b volta,14,14.59
+flash shared gate/up,exl3 4b volta,15,14.78
+flash shared gate/up,exl3 4b volta,16,15.01
+flash shared gate/up,exl3 4b volta,32,51.49
+flash shared gate/up,exl3 4b volta,64,35.10
+flash shared gate/up,exl3 4b volta,128,50.43
+flash shared gate/up,exl3 4b volta,256,64.06
+flash shared gate/up,exl3 4b volta,512,106.94
+flash shared gate/up,exl3 5b stock,1,18.56
+flash shared gate/up,exl3 5b stock,2,22.24
+flash shared gate/up,exl3 5b stock,3,16.99
+flash shared gate/up,exl3 5b stock,4,17.12
+flash shared gate/up,exl3 5b stock,5,17.22
+flash shared gate/up,exl3 5b stock,6,17.38
+flash shared gate/up,exl3 5b stock,7,17.54
+flash shared gate/up,exl3 5b stock,8,17.73
+flash shared gate/up,exl3 5b stock,9,21.09
+flash shared gate/up,exl3 5b stock,10,21.22
+flash shared gate/up,exl3 5b stock,11,21.41
+flash shared gate/up,exl3 5b stock,12,21.60
+flash shared gate/up,exl3 5b stock,13,21.66
+flash shared gate/up,exl3 5b stock,14,21.73
+flash shared gate/up,exl3 5b stock,15,21.82
+flash shared gate/up,exl3 5b stock,16,21.95
+flash shared gate/up,exl3 5b stock,32,54.21
+flash shared gate/up,exl3 5b stock,64,36.42
+flash shared gate/up,exl3 5b stock,128,51.52
+flash shared gate/up,exl3 5b stock,256,64.67
+flash shared gate/up,exl3 5b stock,512,107.33
+flash shared gate/up,exl3 5b volta,1,18.14
+flash shared gate/up,exl3 5b volta,2,13.06
+flash shared gate/up,exl3 5b volta,3,13.15
+flash shared gate/up,exl3 5b volta,4,13.18
+flash shared gate/up,exl3 5b volta,5,13.25
+flash shared gate/up,exl3 5b volta,6,13.31
+flash shared gate/up,exl3 5b volta,7,13.31
+flash shared gate/up,exl3 5b volta,8,13.41
+flash shared gate/up,exl3 5b volta,9,15.01
+flash shared gate/up,exl3 5b volta,10,15.01
+flash shared gate/up,exl3 5b volta,11,15.10
+flash shared gate/up,exl3 5b volta,12,15.14
+flash shared gate/up,exl3 5b volta,13,15.14
+flash shared gate/up,exl3 5b volta,14,15.14
+flash shared gate/up,exl3 5b volta,15,15.26
+flash shared gate/up,exl3 5b volta,16,15.26
+flash shared gate/up,exl3 5b volta,32,53.70
+flash shared gate/up,exl3 5b volta,64,35.78
+flash shared gate/up,exl3 5b volta,128,50.94
+flash shared gate/up,exl3 5b volta,256,64.51
+flash shared gate/up,exl3 5b volta,512,107.49
+flash shared gate/up,nvfp4,1,7.55
+flash shared gate/up,nvfp4,2,7.58
+flash shared gate/up,nvfp4,3,7.55
+flash shared gate/up,nvfp4,4,7.52
+flash shared gate/up,nvfp4,5,7.65
+flash shared gate/up,nvfp4,6,7.71
+flash shared gate/up,nvfp4,7,7.81
+flash shared gate/up,nvfp4,8,7.94
+flash shared gate/up,nvfp4,9,10.21
+flash shared gate/up,nvfp4,10,10.30
+flash shared gate/up,nvfp4,11,10.46
+flash shared gate/up,nvfp4,12,10.59
+flash shared gate/up,nvfp4,13,10.82
+flash shared gate/up,nvfp4,14,11.07
+flash shared gate/up,nvfp4,15,11.36
+flash shared gate/up,nvfp4,16,11.65
+flash shared gate/up,nvfp4,32,55.65
+flash shared gate/up,nvfp4,64,33.02
+flash shared gate/up,nvfp4,128,44.74
+flash shared gate/up,nvfp4,256,53.57
+flash shared gate/up,nvfp4,512,85.47
+flash shared gate/up,gguf q4_k,1,7.78
+flash shared gate/up,gguf q4_k,2,8.61
+flash shared gate/up,gguf q4_k,3,9.50
+flash shared gate/up,gguf q4_k,4,11.78
+flash shared gate/up,gguf q4_k,5,11.62
+flash shared gate/up,gguf q4_k,6,13.76
+flash shared gate/up,gguf q4_k,7,13.92
+flash shared gate/up,gguf q4_k,8,13.98
+flash shared gate/up,gguf q4_k,9,15.97
+flash shared gate/up,gguf q4_k,10,16.06
+flash shared gate/up,gguf q4_k,11,16.26
+flash shared gate/up,gguf q4_k,12,16.35
+flash shared gate/up,gguf q4_k,13,16.48
+flash shared gate/up,gguf q4_k,14,16.54
+flash shared gate/up,gguf q4_k,15,16.70
+flash shared gate/up,gguf q4_k,16,16.67
+flash shared gate/up,gguf q4_k,32,36.90
+flash shared gate/up,gguf q4_k,64,40.48
+flash shared gate/up,gguf q4_k,128,52.03
+flash shared gate/up,gguf q4_k,256,60.64
+flash shared gate/up,gguf q4_k,512,92.96
+flash shared gate/up,gguf q6_k,1,8.64
+flash shared gate/up,gguf q6_k,2,10.43
+flash shared gate/up,gguf q6_k,3,11.04
+flash shared gate/up,gguf q6_k,4,12.99
+flash shared gate/up,gguf q6_k,5,13.86
+flash shared gate/up,gguf q6_k,6,15.74
+flash shared gate/up,gguf q6_k,7,14.69
+flash shared gate/up,gguf q6_k,8,18.56
+flash shared gate/up,gguf q6_k,9,20.58
+flash shared gate/up,gguf q6_k,10,20.70
+flash shared gate/up,gguf q6_k,11,21.06
+flash shared gate/up,gguf q6_k,12,21.15
+flash shared gate/up,gguf q6_k,13,21.31
+flash shared gate/up,gguf q6_k,14,21.50
+flash shared gate/up,gguf q6_k,15,21.76
+flash shared gate/up,gguf q6_k,16,21.92
+flash shared gate/up,gguf q6_k,32,31.04
+flash shared gate/up,gguf q6_k,64,34.34
+flash shared gate/up,gguf q6_k,128,45.98
+flash shared gate/up,gguf q6_k,256,54.94
+flash shared gate/up,gguf q6_k,512,87.42
+flash shared gate/up,gguf iq3_s,1,8.54
+flash shared gate/up,gguf iq3_s,2,9.25
+flash shared gate/up,gguf iq3_s,3,10.40
+flash shared gate/up,gguf iq3_s,4,11.42
+flash shared gate/up,gguf iq3_s,5,12.06
+flash shared gate/up,gguf iq3_s,6,13.12
+flash shared gate/up,gguf iq3_s,7,14.14
+flash shared gate/up,gguf iq3_s,8,14.75
+flash shared gate/up,gguf iq3_s,9,21.25
+flash shared gate/up,gguf iq3_s,10,21.12
+flash shared gate/up,gguf iq3_s,11,21.09
+flash shared gate/up,gguf iq3_s,12,21.09
+flash shared gate/up,gguf iq3_s,13,21.09
+flash shared gate/up,gguf iq3_s,14,21.06
+flash shared gate/up,gguf iq3_s,15,21.18
+flash shared gate/up,gguf iq3_s,16,21.18
+flash shared gate/up,gguf iq3_s,32,50.05
+flash shared gate/up,gguf iq3_s,64,53.66
+flash shared gate/up,gguf iq3_s,128,65.12
+flash shared gate/up,gguf iq3_s,256,73.89
+flash shared gate/up,gguf iq3_s,512,106.66
+flash lm_head/4,exl3 3b stock,1,391.55
+flash lm_head/4,exl3 3b stock,2,408.58
+flash lm_head/4,exl3 3b stock,3,410.11
+flash lm_head/4,exl3 3b stock,4,413.82
+flash lm_head/4,exl3 3b stock,5,420.61
+flash lm_head/4,exl3 3b stock,6,430.98
+flash lm_head/4,exl3 3b stock,7,440.06
+flash lm_head/4,exl3 3b stock,8,451.20
+flash lm_head/4,exl3 3b stock,9,497.66
+flash lm_head/4,exl3 3b stock,10,498.05
+flash lm_head/4,exl3 3b stock,11,498.56
+flash lm_head/4,exl3 3b stock,12,498.94
+flash lm_head/4,exl3 3b stock,13,499.58
+flash lm_head/4,exl3 3b stock,14,500.86
+flash lm_head/4,exl3 3b stock,15,500.86
+flash lm_head/4,exl3 3b stock,16,501.63
+flash lm_head/4,exl3 3b stock,32,1000.32
+flash lm_head/4,exl3 3b stock,64,1079.81
+flash lm_head/4,exl3 3b stock,128,1558.27
+flash lm_head/4,exl3 3b stock,256,1767.68
+flash lm_head/4,exl3 3b stock,512,2972.80
+flash lm_head/4,exl3 3b volta,1,211.84
+flash lm_head/4,exl3 3b volta,2,225.54
+flash lm_head/4,exl3 3b volta,3,226.30
+flash lm_head/4,exl3 3b volta,4,228.74
+flash lm_head/4,exl3 3b volta,5,230.91
+flash lm_head/4,exl3 3b volta,6,233.73
+flash lm_head/4,exl3 3b volta,7,236.54
+flash lm_head/4,exl3 3b volta,8,240.51
+flash lm_head/4,exl3 3b volta,9,316.80
+flash lm_head/4,exl3 3b volta,10,320.00
+flash lm_head/4,exl3 3b volta,11,323.71
+flash lm_head/4,exl3 3b volta,12,326.14
+flash lm_head/4,exl3 3b volta,13,328.70
+flash lm_head/4,exl3 3b volta,14,330.88
+flash lm_head/4,exl3 3b volta,15,334.21
+flash lm_head/4,exl3 3b volta,16,336.77
+flash lm_head/4,exl3 3b volta,32,1018.24
+flash lm_head/4,exl3 3b volta,64,1096.19
+flash lm_head/4,exl3 3b volta,128,1571.20
+flash lm_head/4,exl3 3b volta,256,1779.07
+flash lm_head/4,exl3 3b volta,512,2963.71
+flash lm_head/4,exl3 4b stock,1,295.04
+flash lm_head/4,exl3 4b stock,2,306.56
+flash lm_head/4,exl3 4b stock,3,310.02
+flash lm_head/4,exl3 4b stock,4,313.73
+flash lm_head/4,exl3 4b stock,5,319.36
+flash lm_head/4,exl3 4b stock,6,324.22
+flash lm_head/4,exl3 4b stock,7,329.73
+flash lm_head/4,exl3 4b stock,8,335.87
+flash lm_head/4,exl3 4b stock,9,540.54
+flash lm_head/4,exl3 4b stock,10,541.18
+flash lm_head/4,exl3 4b stock,11,541.70
+flash lm_head/4,exl3 4b stock,12,542.72
+flash lm_head/4,exl3 4b stock,13,542.72
+flash lm_head/4,exl3 4b stock,14,544.77
+flash lm_head/4,exl3 4b stock,15,545.41
+flash lm_head/4,exl3 4b stock,16,546.30
+flash lm_head/4,exl3 4b stock,32,1089.41
+flash lm_head/4,exl3 4b stock,64,1106.82
+flash lm_head/4,exl3 4b stock,128,1579.26
+flash lm_head/4,exl3 4b stock,256,1783.81
+flash lm_head/4,exl3 4b stock,512,2965.38
+flash lm_head/4,exl3 4b volta,1,171.39
+flash lm_head/4,exl3 4b volta,2,167.94
+flash lm_head/4,exl3 4b volta,3,170.37
+flash lm_head/4,exl3 4b volta,4,171.39
+flash lm_head/4,exl3 4b volta,5,173.06
+flash lm_head/4,exl3 4b volta,6,174.59
+flash lm_head/4,exl3 4b volta,7,175.36
+flash lm_head/4,exl3 4b volta,8,177.28
+flash lm_head/4,exl3 4b volta,9,210.94
+flash lm_head/4,exl3 4b volta,10,212.22
+flash lm_head/4,exl3 4b volta,11,214.14
+flash lm_head/4,exl3 4b volta,12,215.68
+flash lm_head/4,exl3 4b volta,13,216.32
+flash lm_head/4,exl3 4b volta,14,218.75
+flash lm_head/4,exl3 4b volta,15,220.16
+flash lm_head/4,exl3 4b volta,16,222.21
+flash lm_head/4,exl3 4b volta,32,1014.14
+flash lm_head/4,exl3 4b volta,64,1117.95
+flash lm_head/4,exl3 4b volta,128,1589.50
+flash lm_head/4,exl3 4b volta,256,1796.99
+flash lm_head/4,exl3 4b volta,512,2966.40
+flash lm_head/4,exl3 5b stock,1,468.86
+flash lm_head/4,exl3 5b stock,2,477.70
+flash lm_head/4,exl3 5b stock,3,481.15
+flash lm_head/4,exl3 5b stock,4,486.14
+flash lm_head/4,exl3 5b stock,5,490.37
+flash lm_head/4,exl3 5b stock,6,497.02
+flash lm_head/4,exl3 5b stock,7,504.06
+flash lm_head/4,exl3 5b stock,8,512.26
+flash lm_head/4,exl3 5b stock,9,608.13
+flash lm_head/4,exl3 5b stock,10,608.90
+flash lm_head/4,exl3 5b stock,11,608.26
+flash lm_head/4,exl3 5b stock,12,609.79
+flash lm_head/4,exl3 5b stock,13,609.41
+flash lm_head/4,exl3 5b stock,14,611.07
+flash lm_head/4,exl3 5b stock,15,611.20
+flash lm_head/4,exl3 5b stock,16,589.44
+flash lm_head/4,exl3 5b stock,32,1173.38
+flash lm_head/4,exl3 5b stock,64,1131.01
+flash lm_head/4,exl3 5b stock,128,1602.94
+flash lm_head/4,exl3 5b stock,256,1814.91
+flash lm_head/4,exl3 5b stock,512,3013.25
+flash lm_head/4,exl3 5b volta,1,183.04
+flash lm_head/4,exl3 5b volta,2,193.02
+flash lm_head/4,exl3 5b volta,3,196.48
+flash lm_head/4,exl3 5b volta,4,198.02
+flash lm_head/4,exl3 5b volta,5,199.55
+flash lm_head/4,exl3 5b volta,6,201.47
+flash lm_head/4,exl3 5b volta,7,202.37
+flash lm_head/4,exl3 5b volta,8,203.90
+flash lm_head/4,exl3 5b volta,9,327.04
+flash lm_head/4,exl3 5b volta,10,334.85
+flash lm_head/4,exl3 5b volta,11,337.92
+flash lm_head/4,exl3 5b volta,12,339.97
+flash lm_head/4,exl3 5b volta,13,342.27
+flash lm_head/4,exl3 5b volta,14,344.06
+flash lm_head/4,exl3 5b volta,15,346.24
+flash lm_head/4,exl3 5b volta,16,346.11
+flash lm_head/4,exl3 5b volta,32,1155.46
+flash lm_head/4,exl3 5b volta,64,1131.65
+flash lm_head/4,exl3 5b volta,128,1604.99
+flash lm_head/4,exl3 5b volta,256,1805.95
+flash lm_head/4,exl3 5b volta,512,3000.96
+flash lm_head/4,nvfp4,1,123.52
+flash lm_head/4,nvfp4,2,124.67
+flash lm_head/4,nvfp4,3,126.21
+flash lm_head/4,nvfp4,4,127.49
+flash lm_head/4,nvfp4,5,129.41
+flash lm_head/4,nvfp4,6,131.20
+flash lm_head/4,nvfp4,7,133.76
+flash lm_head/4,nvfp4,8,136.83
+flash lm_head/4,nvfp4,9,161.54
+flash lm_head/4,nvfp4,10,164.61
+flash lm_head/4,nvfp4,11,168.83
+flash lm_head/4,nvfp4,12,174.98
+flash lm_head/4,nvfp4,13,183.17
+flash lm_head/4,nvfp4,14,192.64
+flash lm_head/4,nvfp4,15,204.54
+flash lm_head/4,nvfp4,16,214.91
+flash lm_head/4,nvfp4,32,510.72
+flash lm_head/4,nvfp4,64,733.31
+flash lm_head/4,nvfp4,128,779.01
+flash lm_head/4,nvfp4,256,1435.90
+flash lm_head/4,nvfp4,512,5343.87
+flash lm_head/4,gguf q4_k,1,138.24
+flash lm_head/4,gguf q4_k,2,172.54
+flash lm_head/4,gguf q4_k,3,201.09
+flash lm_head/4,gguf q4_k,4,242.82
+flash lm_head/4,gguf q4_k,5,289.02
+flash lm_head/4,gguf q4_k,6,207.87
+flash lm_head/4,gguf q4_k,7,220.29
+flash lm_head/4,gguf q4_k,8,225.92
+flash lm_head/4,gguf q4_k,9,322.30
+flash lm_head/4,gguf q4_k,10,327.42
+flash lm_head/4,gguf q4_k,11,335.62
+flash lm_head/4,gguf q4_k,12,341.38
+flash lm_head/4,gguf q4_k,13,347.90
+flash lm_head/4,gguf q4_k,14,352.77
+flash lm_head/4,gguf q4_k,15,361.86
+flash lm_head/4,gguf q4_k,16,368.90
+flash lm_head/4,gguf q4_k,32,1812.35
+flash lm_head/4,gguf q4_k,64,1847.04
+flash lm_head/4,gguf q4_k,128,2298.62
+flash lm_head/4,gguf q4_k,256,3425.92
+flash lm_head/4,gguf q4_k,512,5659.01
+flash lm_head/4,gguf q6_k,1,179.46
+flash lm_head/4,gguf q6_k,2,201.98
+flash lm_head/4,gguf q6_k,3,247.30
+flash lm_head/4,gguf q6_k,4,293.50
+flash lm_head/4,gguf q6_k,5,337.54
+flash lm_head/4,gguf q6_k,6,391.17
+flash lm_head/4,gguf q6_k,7,474.88
+flash lm_head/4,gguf q6_k,8,404.35
+flash lm_head/4,gguf q6_k,9,604.80
+flash lm_head/4,gguf q6_k,10,609.66
+flash lm_head/4,gguf q6_k,11,617.09
+flash lm_head/4,gguf q6_k,12,623.87
+flash lm_head/4,gguf q6_k,13,630.91
+flash lm_head/4,gguf q6_k,14,602.88
+flash lm_head/4,gguf q6_k,15,609.54
+flash lm_head/4,gguf q6_k,16,615.55
+flash lm_head/4,gguf q6_k,32,1424.38
+flash lm_head/4,gguf q6_k,64,1460.99
+flash lm_head/4,gguf q6_k,128,1986.56
+flash lm_head/4,gguf q6_k,256,3104.90
+flash lm_head/4,gguf q6_k,512,5348.22
+flash lm_head/4,gguf iq3_s,1,172.93
+flash lm_head/4,gguf iq3_s,2,221.18
+flash lm_head/4,gguf iq3_s,3,271.36
+flash lm_head/4,gguf iq3_s,4,324.22
+flash lm_head/4,gguf iq3_s,5,373.63
+flash lm_head/4,gguf iq3_s,6,427.26
+flash lm_head/4,gguf iq3_s,7,487.42
+flash lm_head/4,gguf iq3_s,8,539.39
+flash lm_head/4,gguf iq3_s,9,664.19
+flash lm_head/4,gguf iq3_s,10,665.60
+flash lm_head/4,gguf iq3_s,11,668.67
+flash lm_head/4,gguf iq3_s,12,647.81
+flash lm_head/4,gguf iq3_s,13,653.31
+flash lm_head/4,gguf iq3_s,14,656.26
+flash lm_head/4,gguf iq3_s,15,657.28
+flash lm_head/4,gguf iq3_s,16,660.22
+flash lm_head/4,gguf iq3_s,32,2489.98
+flash lm_head/4,gguf iq3_s,64,2516.61
+flash lm_head/4,gguf iq3_s,128,3041.28
+flash lm_head/4,gguf iq3_s,256,4165.12
+flash lm_head/4,gguf iq3_s,512,6399.87
+glm kda in,exl3 3b stock,1,37.72
+glm kda in,exl3 3b stock,2,64.09
+glm kda in,exl3 3b stock,3,64.68
+glm kda in,exl3 3b stock,4,65.79
+glm kda in,exl3 3b stock,5,67.07
+glm kda in,exl3 3b stock,6,68.69
+glm kda in,exl3 3b stock,7,71.00
+glm kda in,exl3 3b stock,8,73.81
+glm kda in,exl3 3b stock,9,78.08
+glm kda in,exl3 3b stock,10,79.62
+glm kda in,exl3 3b stock,11,81.15
+glm kda in,exl3 3b stock,12,82.43
+glm kda in,exl3 3b stock,13,83.97
+glm kda in,exl3 3b stock,14,85.25
+glm kda in,exl3 3b stock,15,86.44
+glm kda in,exl3 3b stock,16,88.15
+glm kda in,exl3 3b stock,32,160.26
+glm kda in,exl3 3b stock,64,189.95
+glm kda in,exl3 3b stock,128,268.54
+glm kda in,exl3 3b stock,256,354.05
+glm kda in,exl3 3b stock,512,585.64
+glm kda in,exl3 3b volta,1,36.61
+glm kda in,exl3 3b volta,2,41.47
+glm kda in,exl3 3b volta,3,41.47
+glm kda in,exl3 3b volta,4,41.47
+glm kda in,exl3 3b volta,5,41.64
+glm kda in,exl3 3b volta,6,41.98
+glm kda in,exl3 3b volta,7,42.50
+glm kda in,exl3 3b volta,8,42.92
+glm kda in,exl3 3b volta,9,52.65
+glm kda in,exl3 3b volta,10,52.99
+glm kda in,exl3 3b volta,11,53.59
+glm kda in,exl3 3b volta,12,54.19
+glm kda in,exl3 3b volta,13,55.89
+glm kda in,exl3 3b volta,14,56.92
+glm kda in,exl3 3b volta,15,57.94
+glm kda in,exl3 3b volta,16,59.48
+glm kda in,exl3 3b volta,32,156.07
+glm kda in,exl3 3b volta,64,188.59
+glm kda in,exl3 3b volta,128,267.78
+glm kda in,exl3 3b volta,256,353.28
+glm kda in,exl3 3b volta,512,584.79
+glm kda in,exl3 4b stock,1,31.44
+glm kda in,exl3 4b stock,2,44.24
+glm kda in,exl3 4b stock,3,61.44
+glm kda in,exl3 4b stock,4,62.46
+glm kda in,exl3 4b stock,5,63.59
+glm kda in,exl3 4b stock,6,65.33
+glm kda in,exl3 4b stock,7,67.89
+glm kda in,exl3 4b stock,8,70.96
+glm kda in,exl3 4b stock,9,75.88
+glm kda in,exl3 4b stock,10,77.52
+glm kda in,exl3 4b stock,11,79.05
+glm kda in,exl3 4b stock,12,80.18
+glm kda in,exl3 4b stock,13,81.92
+glm kda in,exl3 4b stock,14,82.94
+glm kda in,exl3 4b stock,15,84.68
+glm kda in,exl3 4b stock,16,86.02
+glm kda in,exl3 4b stock,32,150.02
+glm kda in,exl3 4b stock,64,193.33
+glm kda in,exl3 4b stock,128,271.67
+glm kda in,exl3 4b stock,256,356.76
+glm kda in,exl3 4b stock,512,588.80
+glm kda in,exl3 4b volta,1,31.33
+glm kda in,exl3 4b volta,2,38.40
+glm kda in,exl3 4b volta,3,38.50
+glm kda in,exl3 4b volta,4,38.50
+glm kda in,exl3 4b volta,5,38.81
+glm kda in,exl3 4b volta,6,39.01
+glm kda in,exl3 4b volta,7,39.32
+glm kda in,exl3 4b volta,8,39.94
+glm kda in,exl3 4b volta,9,50.18
+glm kda in,exl3 4b volta,10,50.48
+glm kda in,exl3 4b volta,11,50.89
+glm kda in,exl3 4b volta,12,51.51
+glm kda in,exl3 4b volta,13,53.45
+glm kda in,exl3 4b volta,14,54.48
+glm kda in,exl3 4b volta,15,55.81
+glm kda in,exl3 4b volta,16,57.34
+glm kda in,exl3 4b volta,32,150.73
+glm kda in,exl3 4b volta,64,192.20
+glm kda in,exl3 4b volta,128,271.97
+glm kda in,exl3 4b volta,256,355.53
+glm kda in,exl3 4b volta,512,589.00
+glm kda in,exl3 5b stock,1,41.73
+glm kda in,exl3 5b stock,2,64.64
+glm kda in,exl3 5b stock,3,117.12
+glm kda in,exl3 5b stock,4,74.37
+glm kda in,exl3 5b stock,5,75.65
+glm kda in,exl3 5b stock,6,76.80
+glm kda in,exl3 5b stock,7,78.46
+glm kda in,exl3 5b stock,8,79.74
+glm kda in,exl3 5b stock,9,81.66
+glm kda in,exl3 5b stock,10,82.94
+glm kda in,exl3 5b stock,11,84.48
+glm kda in,exl3 5b stock,12,85.63
+glm kda in,exl3 5b stock,13,87.42
+glm kda in,exl3 5b stock,14,88.70
+glm kda in,exl3 5b stock,15,89.98
+glm kda in,exl3 5b stock,16,91.65
+glm kda in,exl3 5b stock,32,180.86
+glm kda in,exl3 5b stock,64,197.63
+glm kda in,exl3 5b stock,128,276.61
+glm kda in,exl3 5b stock,256,360.06
+glm kda in,exl3 5b stock,512,592.26
+glm kda in,exl3 5b volta,1,40.83
+glm kda in,exl3 5b volta,2,46.85
+glm kda in,exl3 5b volta,3,46.85
+glm kda in,exl3 5b volta,4,67.07
+glm kda in,exl3 5b volta,5,68.35
+glm kda in,exl3 5b volta,6,69.63
+glm kda in,exl3 5b volta,7,71.04
+glm kda in,exl3 5b volta,8,72.32
+glm kda in,exl3 5b volta,9,74.24
+glm kda in,exl3 5b volta,10,75.65
+glm kda in,exl3 5b volta,11,77.44
+glm kda in,exl3 5b volta,12,78.34
+glm kda in,exl3 5b volta,13,83.46
+glm kda in,exl3 5b volta,14,83.84
+glm kda in,exl3 5b volta,15,84.22
+glm kda in,exl3 5b volta,16,84.35
+glm kda in,exl3 5b volta,32,166.14
+glm kda in,exl3 5b volta,64,196.10
+glm kda in,exl3 5b volta,128,274.56
+glm kda in,exl3 5b volta,256,360.19
+glm kda in,exl3 5b volta,512,592.64
+glm kda in,nvfp4,1,28.29
+glm kda in,nvfp4,2,28.42
+glm kda in,nvfp4,3,28.42
+glm kda in,nvfp4,4,28.67
+glm kda in,nvfp4,5,28.80
+glm kda in,nvfp4,6,29.44
+glm kda in,nvfp4,7,30.59
+glm kda in,nvfp4,8,32.00
+glm kda in,nvfp4,9,36.99
+glm kda in,nvfp4,10,37.50
+glm kda in,nvfp4,11,38.40
+glm kda in,nvfp4,12,39.30
+glm kda in,nvfp4,13,40.83
+glm kda in,nvfp4,14,42.24
+glm kda in,nvfp4,15,43.65
+glm kda in,nvfp4,16,45.18
+glm kda in,nvfp4,32,104.83
+glm kda in,nvfp4,64,165.89
+glm kda in,nvfp4,128,171.52
+glm kda in,nvfp4,256,309.12
+glm kda in,nvfp4,512,564.22
+glm kda in,gguf q4_k,1,27.01
+glm kda in,gguf q4_k,2,28.93
+glm kda in,gguf q4_k,3,33.41
+glm kda in,gguf q4_k,4,40.45
+glm kda in,gguf q4_k,5,46.85
+glm kda in,gguf q4_k,6,46.72
+glm kda in,gguf q4_k,7,48.38
+glm kda in,gguf q4_k,8,49.79
+glm kda in,gguf q4_k,9,57.86
+glm kda in,gguf q4_k,10,59.26
+glm kda in,gguf q4_k,11,60.93
+glm kda in,gguf q4_k,12,62.46
+glm kda in,gguf q4_k,13,64.51
+glm kda in,gguf q4_k,14,66.30
+glm kda in,gguf q4_k,15,67.71
+glm kda in,gguf q4_k,16,69.50
+glm kda in,gguf q4_k,32,284.93
+glm kda in,gguf q4_k,64,280.83
+glm kda in,gguf q4_k,128,362.88
+glm kda in,gguf q4_k,256,441.47
+glm kda in,gguf q4_k,512,634.88
+glm kda in,gguf q6_k,1,32.77
+glm kda in,gguf q6_k,2,36.74
+glm kda in,gguf q6_k,3,41.34
+glm kda in,gguf q6_k,4,48.64
+glm kda in,gguf q6_k,5,55.42
+glm kda in,gguf q6_k,6,62.72
+glm kda in,gguf q6_k,7,69.63
+glm kda in,gguf q6_k,8,68.61
+glm kda in,gguf q6_k,9,100.35
+glm kda in,gguf q6_k,10,101.25
+glm kda in,gguf q6_k,11,102.53
+glm kda in,gguf q6_k,12,103.94
+glm kda in,gguf q6_k,13,105.60
+glm kda in,gguf q6_k,14,106.88
+glm kda in,gguf q6_k,15,108.42
+glm kda in,gguf q6_k,16,110.08
+glm kda in,gguf q6_k,32,233.73
+glm kda in,gguf q6_k,64,229.89
+glm kda in,gguf q6_k,128,311.42
+glm kda in,gguf q6_k,256,390.14
+glm kda in,gguf q6_k,512,581.63
+glm kda in,gguf iq3_s,1,31.33
+glm kda in,gguf iq3_s,2,37.38
+glm kda in,gguf iq3_s,3,44.13
+glm kda in,gguf iq3_s,4,50.79
+glm kda in,gguf iq3_s,5,57.75
+glm kda in,gguf iq3_s,6,64.72
+glm kda in,gguf iq3_s,7,71.07
+glm kda in,gguf iq3_s,8,78.03
+glm kda in,gguf iq3_s,9,120.63
+glm kda in,gguf iq3_s,10,121.34
+glm kda in,gguf iq3_s,11,120.93
+glm kda in,gguf iq3_s,12,121.96
+glm kda in,gguf iq3_s,13,121.96
+glm kda in,gguf iq3_s,14,123.60
+glm kda in,gguf iq3_s,15,122.16
+glm kda in,gguf iq3_s,16,122.88
+glm kda in,gguf iq3_s,32,403.76
+glm kda in,gguf iq3_s,64,399.56
+glm kda in,gguf iq3_s,128,481.28
+glm kda in,gguf iq3_s,256,560.84
+glm kda in,gguf iq3_s,512,753.36
+glm k4096 n4096,exl3 3b stock,1,32.43
+glm k4096 n4096,exl3 3b stock,2,45.17
+glm k4096 n4096,exl3 3b stock,3,45.45
+glm k4096 n4096,exl3 3b stock,4,46.19
+glm k4096 n4096,exl3 3b stock,5,46.99
+glm k4096 n4096,exl3 3b stock,6,48.13
+glm k4096 n4096,exl3 3b stock,7,49.21
+glm k4096 n4096,exl3 3b stock,8,51.03
+glm k4096 n4096,exl3 3b stock,9,67.36
+glm k4096 n4096,exl3 3b stock,10,69.06
+glm k4096 n4096,exl3 3b stock,11,71.22
+glm k4096 n4096,exl3 3b stock,12,73.22
+glm k4096 n4096,exl3 3b stock,13,75.32
+glm k4096 n4096,exl3 3b stock,14,77.03
+glm k4096 n4096,exl3 3b stock,15,79.08
+glm k4096 n4096,exl3 3b stock,16,81.01
+glm k4096 n4096,exl3 3b stock,32,125.21
+glm k4096 n4096,exl3 3b stock,64,137.33
+glm k4096 n4096,exl3 3b stock,128,184.04
+glm k4096 n4096,exl3 3b stock,256,228.01
+glm k4096 n4096,exl3 3b stock,512,339.29
+glm k4096 n4096,exl3 3b volta,1,31.80
+glm k4096 n4096,exl3 3b volta,2,28.10
+glm k4096 n4096,exl3 3b volta,3,28.10
+glm k4096 n4096,exl3 3b volta,4,28.27
+glm k4096 n4096,exl3 3b volta,5,28.50
+glm k4096 n4096,exl3 3b volta,6,28.73
+glm k4096 n4096,exl3 3b volta,7,29.07
+glm k4096 n4096,exl3 3b volta,8,29.58
+glm k4096 n4096,exl3 3b volta,9,38.40
+glm k4096 n4096,exl3 3b volta,10,38.86
+glm k4096 n4096,exl3 3b volta,11,39.08
+glm k4096 n4096,exl3 3b volta,12,39.54
+glm k4096 n4096,exl3 3b volta,13,40.50
+glm k4096 n4096,exl3 3b volta,14,41.19
+glm k4096 n4096,exl3 3b volta,15,41.87
+glm k4096 n4096,exl3 3b volta,16,42.89
+glm k4096 n4096,exl3 3b volta,32,128.40
+glm k4096 n4096,exl3 3b volta,64,137.16
+glm k4096 n4096,exl3 3b volta,128,185.74
+glm k4096 n4096,exl3 3b volta,256,229.15
+glm k4096 n4096,exl3 3b volta,512,341.85
+glm k4096 n4096,exl3 4b stock,1,25.01
+glm k4096 n4096,exl3 4b stock,2,34.30
+glm k4096 n4096,exl3 4b stock,3,43.37
+glm k4096 n4096,exl3 4b stock,4,43.67
+glm k4096 n4096,exl3 4b stock,5,44.25
+glm k4096 n4096,exl3 4b stock,6,45.13
+glm k4096 n4096,exl3 4b stock,7,46.88
+glm k4096 n4096,exl3 4b stock,8,49.15
+glm k4096 n4096,exl3 4b stock,9,66.93
+glm k4096 n4096,exl3 4b stock,10,68.97
+glm k4096 n4096,exl3 4b stock,11,70.95
+glm k4096 n4096,exl3 4b stock,12,72.85
+glm k4096 n4096,exl3 4b stock,13,74.83
+glm k4096 n4096,exl3 4b stock,14,76.51
+glm k4096 n4096,exl3 4b stock,15,78.99
+glm k4096 n4096,exl3 4b stock,16,80.68
+glm k4096 n4096,exl3 4b stock,32,119.22
+glm k4096 n4096,exl3 4b stock,64,139.04
+glm k4096 n4096,exl3 4b stock,128,186.51
+glm k4096 n4096,exl3 4b stock,256,230.84
+glm k4096 n4096,exl3 4b stock,512,342.82
+glm k4096 n4096,exl3 4b volta,1,25.09
+glm k4096 n4096,exl3 4b volta,2,25.60
+glm k4096 n4096,exl3 4b volta,3,25.53
+glm k4096 n4096,exl3 4b volta,4,25.89
+glm k4096 n4096,exl3 4b volta,5,26.04
+glm k4096 n4096,exl3 4b volta,6,26.33
+glm k4096 n4096,exl3 4b volta,7,26.62
+glm k4096 n4096,exl3 4b volta,8,27.21
+glm k4096 n4096,exl3 4b volta,9,35.47
+glm k4096 n4096,exl3 4b volta,10,35.91
+glm k4096 n4096,exl3 4b volta,11,36.21
+glm k4096 n4096,exl3 4b volta,12,36.72
+glm k4096 n4096,exl3 4b volta,13,37.89
+glm k4096 n4096,exl3 4b volta,14,38.47
+glm k4096 n4096,exl3 4b volta,15,39.06
+glm k4096 n4096,exl3 4b volta,16,40.16
+glm k4096 n4096,exl3 4b volta,32,121.42
+glm k4096 n4096,exl3 4b volta,64,139.34
+glm k4096 n4096,exl3 4b volta,128,185.93
+glm k4096 n4096,exl3 4b volta,256,230.47
+glm k4096 n4096,exl3 4b volta,512,343.04
+glm k4096 n4096,exl3 5b stock,1,35.12
+glm k4096 n4096,exl3 5b stock,2,42.50
+glm k4096 n4096,exl3 5b stock,3,62.46
+glm k4096 n4096,exl3 5b stock,4,63.39
+glm k4096 n4096,exl3 5b stock,5,63.80
+glm k4096 n4096,exl3 5b stock,6,64.72
+glm k4096 n4096,exl3 5b stock,7,65.13
+glm k4096 n4096,exl3 5b stock,8,65.84
+glm k4096 n4096,exl3 5b stock,9,69.94
+glm k4096 n4096,exl3 5b stock,10,71.99
+glm k4096 n4096,exl3 5b stock,11,74.34
+glm k4096 n4096,exl3 5b stock,12,76.08
+glm k4096 n4096,exl3 5b stock,13,77.72
+glm k4096 n4096,exl3 5b stock,14,79.56
+glm k4096 n4096,exl3 5b stock,15,81.92
+glm k4096 n4096,exl3 5b stock,16,83.87
+glm k4096 n4096,exl3 5b stock,32,138.65
+glm k4096 n4096,exl3 5b stock,64,142.64
+glm k4096 n4096,exl3 5b stock,128,189.44
+glm k4096 n4096,exl3 5b stock,256,233.98
+glm k4096 n4096,exl3 5b stock,512,345.91
+glm k4096 n4096,exl3 5b volta,1,34.30
+glm k4096 n4096,exl3 5b volta,2,31.95
+glm k4096 n4096,exl3 5b volta,3,32.15
+glm k4096 n4096,exl3 5b volta,4,32.26
+glm k4096 n4096,exl3 5b volta,5,32.36
+glm k4096 n4096,exl3 5b volta,6,32.56
+glm k4096 n4096,exl3 5b volta,7,32.67
+glm k4096 n4096,exl3 5b volta,8,32.67
+glm k4096 n4096,exl3 5b volta,9,44.95
+glm k4096 n4096,exl3 5b volta,10,45.47
+glm k4096 n4096,exl3 5b volta,11,45.77
+glm k4096 n4096,exl3 5b volta,12,45.98
+glm k4096 n4096,exl3 5b volta,13,45.88
+glm k4096 n4096,exl3 5b volta,14,46.08
+glm k4096 n4096,exl3 5b volta,15,46.18
+glm k4096 n4096,exl3 5b volta,16,46.28
+glm k4096 n4096,exl3 5b volta,32,142.34
+glm k4096 n4096,exl3 5b volta,64,141.82
+glm k4096 n4096,exl3 5b volta,128,188.31
+glm k4096 n4096,exl3 5b volta,256,232.76
+glm k4096 n4096,exl3 5b volta,512,344.37
+glm k4096 n4096,nvfp4,1,16.90
+glm k4096 n4096,nvfp4,2,16.90
+glm k4096 n4096,nvfp4,3,16.90
+glm k4096 n4096,nvfp4,4,16.98
+glm k4096 n4096,nvfp4,5,17.15
+glm k4096 n4096,nvfp4,6,17.32
+glm k4096 n4096,nvfp4,7,17.75
+glm k4096 n4096,nvfp4,8,18.60
+glm k4096 n4096,nvfp4,9,26.11
+glm k4096 n4096,nvfp4,10,26.45
+glm k4096 n4096,nvfp4,11,26.97
+glm k4096 n4096,nvfp4,12,27.48
+glm k4096 n4096,nvfp4,13,28.42
+glm k4096 n4096,nvfp4,14,29.27
+glm k4096 n4096,nvfp4,15,30.12
+glm k4096 n4096,nvfp4,16,31.06
+glm k4096 n4096,nvfp4,32,95.23
+glm k4096 n4096,nvfp4,64,163.67
+glm k4096 n4096,nvfp4,128,191.57
+glm k4096 n4096,nvfp4,256,171.78
+glm k4096 n4096,nvfp4,512,303.96
+glm k4096 n4096,gguf q4_k,1,20.05
+glm k4096 n4096,gguf q4_k,2,21.76
+glm k4096 n4096,gguf q4_k,3,24.75
+glm k4096 n4096,gguf q4_k,4,29.61
+glm k4096 n4096,gguf q4_k,5,33.54
+glm k4096 n4096,gguf q4_k,6,36.52
+glm k4096 n4096,gguf q4_k,7,37.63
+glm k4096 n4096,gguf q4_k,8,39.00
+glm k4096 n4096,gguf q4_k,9,42.33
+glm k4096 n4096,gguf q4_k,10,43.01
+glm k4096 n4096,gguf q4_k,11,44.20
+glm k4096 n4096,gguf q4_k,12,45.06
+glm k4096 n4096,gguf q4_k,13,46.34
+glm k4096 n4096,gguf q4_k,14,46.93
+glm k4096 n4096,gguf q4_k,15,48.13
+glm k4096 n4096,gguf q4_k,16,48.81
+glm k4096 n4096,gguf q4_k,32,192.43
+glm k4096 n4096,gguf q4_k,64,204.97
+glm k4096 n4096,gguf q4_k,128,230.83
+glm k4096 n4096,gguf q4_k,256,274.43
+glm k4096 n4096,gguf q4_k,512,345.94
+glm k4096 n4096,gguf q6_k,1,24.45
+glm k4096 n4096,gguf q6_k,2,27.26
+glm k4096 n4096,gguf q6_k,3,30.21
+glm k4096 n4096,gguf q6_k,4,35.07
+glm k4096 n4096,gguf q6_k,5,39.42
+glm k4096 n4096,gguf q6_k,6,44.80
+glm k4096 n4096,gguf q6_k,7,48.90
+glm k4096 n4096,gguf q6_k,8,50.30
+glm k4096 n4096,gguf q6_k,9,69.89
+glm k4096 n4096,gguf q6_k,10,69.12
+glm k4096 n4096,gguf q6_k,11,70.53
+glm k4096 n4096,gguf q6_k,12,70.66
+glm k4096 n4096,gguf q6_k,13,71.55
+glm k4096 n4096,gguf q6_k,14,71.68
+glm k4096 n4096,gguf q6_k,15,72.83
+glm k4096 n4096,gguf q6_k,16,73.22
+glm k4096 n4096,gguf q6_k,32,157.95
+glm k4096 n4096,gguf q6_k,64,170.37
+glm k4096 n4096,gguf q6_k,128,195.84
+glm k4096 n4096,gguf q6_k,256,238.85
+glm k4096 n4096,gguf q6_k,512,310.27
+glm k4096 n4096,gguf iq3_s,1,23.70
+glm k4096 n4096,gguf iq3_s,2,27.65
+glm k4096 n4096,gguf iq3_s,3,32.04
+glm k4096 n4096,gguf iq3_s,4,36.64
+glm k4096 n4096,gguf iq3_s,5,41.11
+glm k4096 n4096,gguf iq3_s,6,45.93
+glm k4096 n4096,gguf iq3_s,7,50.18
+glm k4096 n4096,gguf iq3_s,8,54.93
+glm k4096 n4096,gguf iq3_s,9,83.24
+glm k4096 n4096,gguf iq3_s,10,83.53
+glm k4096 n4096,gguf iq3_s,11,83.82
+glm k4096 n4096,gguf iq3_s,12,84.19
+glm k4096 n4096,gguf iq3_s,13,84.85
+glm k4096 n4096,gguf iq3_s,14,84.99
+glm k4096 n4096,gguf iq3_s,15,85.43
+glm k4096 n4096,gguf iq3_s,16,85.36
+glm k4096 n4096,gguf iq3_s,32,272.16
+glm k4096 n4096,gguf iq3_s,64,284.38
+glm k4096 n4096,gguf iq3_s,128,310.05
+glm k4096 n4096,gguf iq3_s,256,354.01
+glm k4096 n4096,gguf iq3_s,512,424.67
+glm k4096 n2048,exl3 3b stock,1,23.23
+glm k4096 n2048,exl3 3b stock,2,25.79
+glm k4096 n2048,exl3 3b stock,3,26.14
+glm k4096 n2048,exl3 3b stock,4,26.24
+glm k4096 n2048,exl3 3b stock,5,26.53
+glm k4096 n2048,exl3 3b stock,6,26.69
+glm k4096 n2048,exl3 3b stock,7,27.10
+glm k4096 n2048,exl3 3b stock,8,27.81
+glm k4096 n2048,exl3 3b stock,9,36.93
+glm k4096 n2048,exl3 3b stock,10,37.06
+glm k4096 n2048,exl3 3b stock,11,37.25
+glm k4096 n2048,exl3 3b stock,12,37.44
+glm k4096 n2048,exl3 3b stock,13,37.66
+glm k4096 n2048,exl3 3b stock,14,37.89
+glm k4096 n2048,exl3 3b stock,15,37.95
+glm k4096 n2048,exl3 3b stock,16,38.21
+glm k4096 n2048,exl3 3b stock,32,67.90
+glm k4096 n2048,exl3 3b stock,64,84.32
+glm k4096 n2048,exl3 3b stock,128,101.12
+glm k4096 n2048,exl3 3b stock,256,140.32
+glm k4096 n2048,exl3 3b stock,512,210.82
+glm k4096 n2048,exl3 3b volta,1,22.46
+glm k4096 n2048,exl3 3b volta,2,19.46
+glm k4096 n2048,exl3 3b volta,3,19.62
+glm k4096 n2048,exl3 3b volta,4,19.62
+glm k4096 n2048,exl3 3b volta,5,19.71
+glm k4096 n2048,exl3 3b volta,6,19.90
+glm k4096 n2048,exl3 3b volta,7,20.03
+glm k4096 n2048,exl3 3b volta,8,20.26
+glm k4096 n2048,exl3 3b volta,9,21.89
+glm k4096 n2048,exl3 3b volta,10,22.08
+glm k4096 n2048,exl3 3b volta,11,22.30
+glm k4096 n2048,exl3 3b volta,12,22.50
+glm k4096 n2048,exl3 3b volta,13,23.01
+glm k4096 n2048,exl3 3b volta,14,23.17
+glm k4096 n2048,exl3 3b volta,15,23.49
+glm k4096 n2048,exl3 3b volta,16,23.94
+glm k4096 n2048,exl3 3b volta,32,64.93
+glm k4096 n2048,exl3 3b volta,64,83.78
+glm k4096 n2048,exl3 3b volta,128,100.64
+glm k4096 n2048,exl3 3b volta,256,139.71
+glm k4096 n2048,exl3 3b volta,512,210.30
+glm k4096 n2048,exl3 4b stock,1,19.57
+glm k4096 n2048,exl3 4b stock,2,25.44
+glm k4096 n2048,exl3 4b stock,3,25.52
+glm k4096 n2048,exl3 4b stock,4,25.56
+glm k4096 n2048,exl3 4b stock,5,25.68
+glm k4096 n2048,exl3 4b stock,6,25.95
+glm k4096 n2048,exl3 4b stock,7,26.58
+glm k4096 n2048,exl3 4b stock,8,27.57
+glm k4096 n2048,exl3 4b stock,9,37.34
+glm k4096 n2048,exl3 4b stock,10,37.49
+glm k4096 n2048,exl3 4b stock,11,37.69
+glm k4096 n2048,exl3 4b stock,12,37.85
+glm k4096 n2048,exl3 4b stock,13,38.08
+glm k4096 n2048,exl3 4b stock,14,38.24
+glm k4096 n2048,exl3 4b stock,15,38.48
+glm k4096 n2048,exl3 4b stock,16,38.64
+glm k4096 n2048,exl3 4b stock,32,68.10
+glm k4096 n2048,exl3 4b stock,64,85.15
+glm k4096 n2048,exl3 4b stock,128,102.01
+glm k4096 n2048,exl3 4b stock,256,140.96
+glm k4096 n2048,exl3 4b stock,512,211.81
+glm k4096 n2048,exl3 4b volta,1,19.02
+glm k4096 n2048,exl3 4b volta,2,18.71
+glm k4096 n2048,exl3 4b volta,3,18.75
+glm k4096 n2048,exl3 4b volta,4,18.87
+glm k4096 n2048,exl3 4b volta,5,19.02
+glm k4096 n2048,exl3 4b volta,6,19.10
+glm k4096 n2048,exl3 4b volta,7,19.18
+glm k4096 n2048,exl3 4b volta,8,19.50
+glm k4096 n2048,exl3 4b volta,9,21.19
+glm k4096 n2048,exl3 4b volta,10,21.35
+glm k4096 n2048,exl3 4b volta,11,21.58
+glm k4096 n2048,exl3 4b volta,12,21.94
+glm k4096 n2048,exl3 4b volta,13,22.45
+glm k4096 n2048,exl3 4b volta,14,22.61
+glm k4096 n2048,exl3 4b volta,15,22.92
+glm k4096 n2048,exl3 4b volta,16,23.39
+glm k4096 n2048,exl3 4b volta,32,65.50
+glm k4096 n2048,exl3 4b volta,64,84.48
+glm k4096 n2048,exl3 4b volta,128,101.77
+glm k4096 n2048,exl3 4b volta,256,140.76
+glm k4096 n2048,exl3 4b volta,512,211.61
+glm k4096 n2048,exl3 5b stock,1,25.34
+glm k4096 n2048,exl3 5b stock,2,30.72
+glm k4096 n2048,exl3 5b stock,3,35.79
+glm k4096 n2048,exl3 5b stock,4,36.25
+glm k4096 n2048,exl3 5b stock,5,36.51
+glm k4096 n2048,exl3 5b stock,6,36.92
+glm k4096 n2048,exl3 5b stock,7,37.07
+glm k4096 n2048,exl3 5b stock,8,37.38
+glm k4096 n2048,exl3 5b stock,9,41.47
+glm k4096 n2048,exl3 5b stock,10,41.73
+glm k4096 n2048,exl3 5b stock,11,41.83
+glm k4096 n2048,exl3 5b stock,12,41.88
+glm k4096 n2048,exl3 5b stock,13,42.19
+glm k4096 n2048,exl3 5b stock,14,42.39
+glm k4096 n2048,exl3 5b stock,15,42.55
+glm k4096 n2048,exl3 5b stock,16,43.01
+glm k4096 n2048,exl3 5b stock,32,76.60
+glm k4096 n2048,exl3 5b stock,64,86.73
+glm k4096 n2048,exl3 5b stock,128,103.68
+glm k4096 n2048,exl3 5b stock,256,142.44
+glm k4096 n2048,exl3 5b stock,512,213.15
+glm k4096 n2048,exl3 5b volta,1,24.58
+glm k4096 n2048,exl3 5b volta,2,20.53
+glm k4096 n2048,exl3 5b volta,3,20.68
+glm k4096 n2048,exl3 5b volta,4,20.74
+glm k4096 n2048,exl3 5b volta,5,20.89
+glm k4096 n2048,exl3 5b volta,6,20.99
+glm k4096 n2048,exl3 5b volta,7,21.09
+glm k4096 n2048,exl3 5b volta,8,21.20
+glm k4096 n2048,exl3 5b volta,9,28.06
+glm k4096 n2048,exl3 5b volta,10,28.26
+glm k4096 n2048,exl3 5b volta,11,28.26
+glm k4096 n2048,exl3 5b volta,12,28.52
+glm k4096 n2048,exl3 5b volta,13,28.62
+glm k4096 n2048,exl3 5b volta,14,28.67
+glm k4096 n2048,exl3 5b volta,15,28.72
+glm k4096 n2048,exl3 5b volta,16,28.83
+glm k4096 n2048,exl3 5b volta,32,78.13
+glm k4096 n2048,exl3 5b volta,64,86.07
+glm k4096 n2048,exl3 5b volta,128,103.17
+glm k4096 n2048,exl3 5b volta,256,142.28
+glm k4096 n2048,exl3 5b volta,512,212.58
+glm k4096 n2048,nvfp4,1,11.26
+glm k4096 n2048,nvfp4,2,11.26
+glm k4096 n2048,nvfp4,3,11.26
+glm k4096 n2048,nvfp4,4,11.31
+glm k4096 n2048,nvfp4,5,11.36
+glm k4096 n2048,nvfp4,6,11.31
+glm k4096 n2048,nvfp4,7,11.45
+glm k4096 n2048,nvfp4,8,11.68
+glm k4096 n2048,nvfp4,9,14.38
+glm k4096 n2048,nvfp4,10,14.52
+glm k4096 n2048,nvfp4,11,14.75
+glm k4096 n2048,nvfp4,12,14.89
+glm k4096 n2048,nvfp4,13,15.31
+glm k4096 n2048,nvfp4,14,15.69
+glm k4096 n2048,nvfp4,15,16.06
+glm k4096 n2048,nvfp4,16,16.66
+glm k4096 n2048,nvfp4,32,90.67
+glm k4096 n2048,nvfp4,64,87.69
+glm k4096 n2048,nvfp4,128,101.10
+glm k4096 n2048,nvfp4,256,130.14
+glm k4096 n2048,nvfp4,512,181.25
+glm k4096 n2048,gguf q4_k,1,12.75
+glm k4096 n2048,gguf q4_k,2,13.68
+glm k4096 n2048,gguf q4_k,3,15.31
+glm k4096 n2048,gguf q4_k,4,17.83
+glm k4096 n2048,gguf q4_k,5,19.74
+glm k4096 n2048,gguf q4_k,6,21.22
+glm k4096 n2048,gguf q4_k,7,21.64
+glm k4096 n2048,gguf q4_k,8,22.20
+glm k4096 n2048,gguf q4_k,9,22.95
+glm k4096 n2048,gguf q4_k,10,23.32
+glm k4096 n2048,gguf q4_k,11,24.44
+glm k4096 n2048,gguf q4_k,12,24.95
+glm k4096 n2048,gguf q4_k,13,25.65
+glm k4096 n2048,gguf q4_k,14,26.11
+glm k4096 n2048,gguf q4_k,15,26.67
+glm k4096 n2048,gguf q4_k,16,27.23
+glm k4096 n2048,gguf q4_k,32,102.17
+glm k4096 n2048,gguf q4_k,64,108.68
+glm k4096 n2048,gguf q4_k,128,121.39
+glm k4096 n2048,gguf q4_k,256,155.46
+glm k4096 n2048,gguf q4_k,512,203.92
+glm k4096 n2048,gguf q6_k,1,15.74
+glm k4096 n2048,gguf q6_k,2,17.41
+glm k4096 n2048,gguf q6_k,3,18.69
+glm k4096 n2048,gguf q6_k,4,21.18
+glm k4096 n2048,gguf q6_k,5,23.49
+glm k4096 n2048,gguf q6_k,6,26.43
+glm k4096 n2048,gguf q6_k,7,28.03
+glm k4096 n2048,gguf q6_k,8,28.10
+glm k4096 n2048,gguf q6_k,9,37.76
+glm k4096 n2048,gguf q6_k,10,38.08
+glm k4096 n2048,gguf q6_k,11,38.78
+glm k4096 n2048,gguf q6_k,12,39.30
+glm k4096 n2048,gguf q6_k,13,39.68
+glm k4096 n2048,gguf q6_k,14,40.19
+glm k4096 n2048,gguf q6_k,15,40.64
+glm k4096 n2048,gguf q6_k,16,41.09
+glm k4096 n2048,gguf q6_k,32,84.80
+glm k4096 n2048,gguf q6_k,64,91.07
+glm k4096 n2048,gguf q6_k,128,103.23
+glm k4096 n2048,gguf q6_k,256,137.92
+glm k4096 n2048,gguf q6_k,512,185.34
+glm k4096 n2048,gguf iq3_s,1,14.34
+glm k4096 n2048,gguf iq3_s,2,16.13
+glm k4096 n2048,gguf iq3_s,3,18.47
+glm k4096 n2048,gguf iq3_s,4,20.59
+glm k4096 n2048,gguf iq3_s,5,22.89
+glm k4096 n2048,gguf iq3_s,6,25.38
+glm k4096 n2048,gguf iq3_s,7,27.47
+glm k4096 n2048,gguf iq3_s,8,29.88
+glm k4096 n2048,gguf iq3_s,9,45.71
+glm k4096 n2048,gguf iq3_s,10,45.93
+glm k4096 n2048,gguf iq3_s,11,46.52
+glm k4096 n2048,gguf iq3_s,12,46.37
+glm k4096 n2048,gguf iq3_s,13,46.70
+glm k4096 n2048,gguf iq3_s,14,46.67
+glm k4096 n2048,gguf iq3_s,15,46.88
+glm k4096 n2048,gguf iq3_s,16,46.88
+glm k4096 n2048,gguf iq3_s,32,142.67
+glm k4096 n2048,gguf iq3_s,64,149.25
+glm k4096 n2048,gguf iq3_s,128,161.97
+glm k4096 n2048,gguf iq3_s,256,196.24
+glm k4096 n2048,gguf iq3_s,512,244.04
+glm k2048 n4096,exl3 3b stock,1,20.45
+glm k2048 n4096,exl3 3b stock,2,27.46
+glm k2048 n4096,exl3 3b stock,3,27.68
+glm k2048 n4096,exl3 3b stock,4,27.97
+glm k2048 n4096,exl3 3b stock,5,28.51
+glm k2048 n4096,exl3 3b stock,6,28.93
+glm k2048 n4096,exl3 3b stock,7,29.73
+glm k2048 n4096,exl3 3b stock,8,31.04
+glm k2048 n4096,exl3 3b stock,9,38.27
+glm k2048 n4096,exl3 3b stock,10,39.01
+glm k2048 n4096,exl3 3b stock,11,39.90
+glm k2048 n4096,exl3 3b stock,12,41.06
+glm k2048 n4096,exl3 3b stock,13,42.59
+glm k2048 n4096,exl3 3b stock,14,43.58
+glm k2048 n4096,exl3 3b stock,15,44.70
+glm k2048 n4096,exl3 3b stock,16,46.02
+glm k2048 n4096,exl3 3b stock,32,61.86
+glm k2048 n4096,exl3 3b stock,64,82.50
+glm k2048 n4096,exl3 3b stock,128,108.61
+glm k2048 n4096,exl3 3b stock,256,139.52
+glm k2048 n4096,exl3 3b stock,512,191.04
+glm k2048 n4096,exl3 3b volta,1,19.68
+glm k2048 n4096,exl3 3b volta,2,17.76
+glm k2048 n4096,exl3 3b volta,3,17.98
+glm k2048 n4096,exl3 3b volta,4,18.02
+glm k2048 n4096,exl3 3b volta,5,18.14
+glm k2048 n4096,exl3 3b volta,6,18.27
+glm k2048 n4096,exl3 3b volta,7,18.53
+glm k2048 n4096,exl3 3b volta,8,18.85
+glm k2048 n4096,exl3 3b volta,9,23.94
+glm k2048 n4096,exl3 3b volta,10,24.13
+glm k2048 n4096,exl3 3b volta,11,24.38
+glm k2048 n4096,exl3 3b volta,12,24.77
+glm k2048 n4096,exl3 3b volta,13,25.34
+glm k2048 n4096,exl3 3b volta,14,25.70
+glm k2048 n4096,exl3 3b volta,15,26.18
+glm k2048 n4096,exl3 3b volta,16,26.82
+glm k2048 n4096,exl3 3b volta,32,58.75
+glm k2048 n4096,exl3 3b volta,64,81.95
+glm k2048 n4096,exl3 3b volta,128,108.64
+glm k2048 n4096,exl3 3b volta,256,139.10
+glm k2048 n4096,exl3 3b volta,512,190.78
+glm k2048 n4096,exl3 4b stock,1,16.74
+glm k2048 n4096,exl3 4b stock,2,22.53
+glm k2048 n4096,exl3 4b stock,3,26.90
+glm k2048 n4096,exl3 4b stock,4,27.18
+glm k2048 n4096,exl3 4b stock,5,27.45
+glm k2048 n4096,exl3 4b stock,6,28.04
+glm k2048 n4096,exl3 4b stock,7,29.07
+glm k2048 n4096,exl3 4b stock,8,30.37
+glm k2048 n4096,exl3 4b stock,9,37.10
+glm k2048 n4096,exl3 4b stock,10,38.01
+glm k2048 n4096,exl3 4b stock,11,39.27
+glm k2048 n4096,exl3 4b stock,12,40.53
+glm k2048 n4096,exl3 4b stock,13,41.94
+glm k2048 n4096,exl3 4b stock,14,43.01
+glm k2048 n4096,exl3 4b stock,15,44.31
+glm k2048 n4096,exl3 4b stock,16,45.76
+glm k2048 n4096,exl3 4b stock,32,62.11
+glm k2048 n4096,exl3 4b stock,64,84.05
+glm k2048 n4096,exl3 4b stock,128,109.73
+glm k2048 n4096,exl3 4b stock,256,140.56
+glm k2048 n4096,exl3 4b stock,512,192.04
+glm k2048 n4096,exl3 4b volta,1,16.50
+glm k2048 n4096,exl3 4b volta,2,17.17
+glm k2048 n4096,exl3 4b volta,3,17.21
+glm k2048 n4096,exl3 4b volta,4,17.33
+glm k2048 n4096,exl3 4b volta,5,17.45
+glm k2048 n4096,exl3 4b volta,6,17.68
+glm k2048 n4096,exl3 4b volta,7,17.88
+glm k2048 n4096,exl3 4b volta,8,18.27
+glm k2048 n4096,exl3 4b volta,9,23.12
+glm k2048 n4096,exl3 4b volta,10,23.32
+glm k2048 n4096,exl3 4b volta,11,23.55
+glm k2048 n4096,exl3 4b volta,12,24.14
+glm k2048 n4096,exl3 4b volta,13,24.85
+glm k2048 n4096,exl3 4b volta,14,25.36
+glm k2048 n4096,exl3 4b volta,15,25.88
+glm k2048 n4096,exl3 4b volta,16,26.23
+glm k2048 n4096,exl3 4b volta,32,59.39
+glm k2048 n4096,exl3 4b volta,64,83.38
+glm k2048 n4096,exl3 4b volta,128,109.49
+glm k2048 n4096,exl3 4b volta,256,140.13
+glm k2048 n4096,exl3 4b volta,512,191.65
+glm k2048 n4096,exl3 5b stock,1,23.40
+glm k2048 n4096,exl3 5b stock,2,27.70
+glm k2048 n4096,exl3 5b stock,3,34.71
+glm k2048 n4096,exl3 5b stock,4,35.02
+glm k2048 n4096,exl3 5b stock,5,35.33
+glm k2048 n4096,exl3 5b stock,6,35.69
+glm k2048 n4096,exl3 5b stock,7,35.89
+glm k2048 n4096,exl3 5b stock,8,36.20
+glm k2048 n4096,exl3 5b stock,9,44.75
+glm k2048 n4096,exl3 5b stock,10,44.90
+glm k2048 n4096,exl3 5b stock,11,45.36
+glm k2048 n4096,exl3 5b stock,12,45.72
+glm k2048 n4096,exl3 5b stock,13,46.23
+glm k2048 n4096,exl3 5b stock,14,46.64
+glm k2048 n4096,exl3 5b stock,15,47.00
+glm k2048 n4096,exl3 5b stock,16,47.05
+glm k2048 n4096,exl3 5b stock,32,85.91
+glm k2048 n4096,exl3 5b stock,64,85.30
+glm k2048 n4096,exl3 5b stock,128,111.51
+glm k2048 n4096,exl3 5b stock,256,142.23
+glm k2048 n4096,exl3 5b stock,512,194.00
+glm k2048 n4096,exl3 5b volta,1,22.73
+glm k2048 n4096,exl3 5b volta,2,20.33
+glm k2048 n4096,exl3 5b volta,3,20.58
+glm k2048 n4096,exl3 5b volta,4,20.74
+glm k2048 n4096,exl3 5b volta,5,20.84
+glm k2048 n4096,exl3 5b volta,6,20.99
+glm k2048 n4096,exl3 5b volta,7,20.99
+glm k2048 n4096,exl3 5b volta,8,21.15
+glm k2048 n4096,exl3 5b volta,9,26.52
+glm k2048 n4096,exl3 5b volta,10,26.47
+glm k2048 n4096,exl3 5b volta,11,26.68
+glm k2048 n4096,exl3 5b volta,12,26.93
+glm k2048 n4096,exl3 5b volta,13,26.88
+glm k2048 n4096,exl3 5b volta,14,26.83
+glm k2048 n4096,exl3 5b volta,15,26.98
+glm k2048 n4096,exl3 5b volta,16,27.08
+glm k2048 n4096,exl3 5b volta,32,95.28
+glm k2048 n4096,exl3 5b volta,64,84.43
+glm k2048 n4096,exl3 5b volta,128,110.69
+glm k2048 n4096,exl3 5b volta,256,141.41
+glm k2048 n4096,exl3 5b volta,512,193.33
+glm k2048 n4096,nvfp4,1,10.10
+glm k2048 n4096,nvfp4,2,10.15
+glm k2048 n4096,nvfp4,3,10.05
+glm k2048 n4096,nvfp4,4,10.05
+glm k2048 n4096,nvfp4,5,10.10
+glm k2048 n4096,nvfp4,6,10.29
+glm k2048 n4096,nvfp4,7,10.61
+glm k2048 n4096,nvfp4,8,11.08
+glm k2048 n4096,nvfp4,9,14.89
+glm k2048 n4096,nvfp4,10,15.08
+glm k2048 n4096,nvfp4,11,15.31
+glm k2048 n4096,nvfp4,12,15.64
+glm k2048 n4096,nvfp4,13,16.15
+glm k2048 n4096,nvfp4,14,16.57
+glm k2048 n4096,nvfp4,15,17.13
+glm k2048 n4096,nvfp4,16,17.73
+glm k2048 n4096,nvfp4,32,48.87
+glm k2048 n4096,nvfp4,64,89.88
+glm k2048 n4096,nvfp4,128,105.98
+glm k2048 n4096,nvfp4,256,88.44
+glm k2048 n4096,nvfp4,512,159.46
+glm k2048 n4096,gguf q4_k,1,12.33
+glm k2048 n4096,gguf q4_k,2,14.48
+glm k2048 n4096,gguf q4_k,3,15.87
+glm k2048 n4096,gguf q4_k,4,18.71
+glm k2048 n4096,gguf q4_k,5,21.09
+glm k2048 n4096,gguf q4_k,6,21.13
+glm k2048 n4096,gguf q4_k,7,21.69
+glm k2048 n4096,gguf q4_k,8,22.48
+glm k2048 n4096,gguf q4_k,9,22.99
+glm k2048 n4096,gguf q4_k,10,23.46
+glm k2048 n4096,gguf q4_k,11,24.11
+glm k2048 n4096,gguf q4_k,12,24.67
+glm k2048 n4096,gguf q4_k,13,25.32
+glm k2048 n4096,gguf q4_k,14,25.69
+glm k2048 n4096,gguf q4_k,15,26.30
+glm k2048 n4096,gguf q4_k,16,26.95
+glm k2048 n4096,gguf q4_k,32,103.24
+glm k2048 n4096,gguf q4_k,64,109.75
+glm k2048 n4096,gguf q4_k,128,125.86
+glm k2048 n4096,gguf q4_k,256,154.72
+glm k2048 n4096,gguf q4_k,512,179.94
+glm k2048 n4096,gguf q6_k,1,16.26
+glm k2048 n4096,gguf q6_k,2,17.47
+glm k2048 n4096,gguf q6_k,3,19.39
+glm k2048 n4096,gguf q6_k,4,22.59
+glm k2048 n4096,gguf q6_k,5,25.41
+glm k2048 n4096,gguf q6_k,6,28.22
+glm k2048 n4096,gguf q6_k,7,30.72
+glm k2048 n4096,gguf q6_k,8,27.90
+glm k2048 n4096,gguf q6_k,9,36.99
+glm k2048 n4096,gguf q6_k,10,37.44
+glm k2048 n4096,gguf q6_k,11,38.21
+glm k2048 n4096,gguf q6_k,12,38.85
+glm k2048 n4096,gguf q6_k,13,39.49
+glm k2048 n4096,gguf q6_k,14,39.87
+glm k2048 n4096,gguf q6_k,15,40.38
+glm k2048 n4096,gguf q6_k,16,40.96
+glm k2048 n4096,gguf q6_k,32,85.82
+glm k2048 n4096,gguf q6_k,64,92.74
+glm k2048 n4096,gguf q6_k,128,107.78
+glm k2048 n4096,gguf q6_k,256,136.13
+glm k2048 n4096,gguf q6_k,512,162.05
+glm k2048 n4096,gguf iq3_s,1,14.45
+glm k2048 n4096,gguf iq3_s,2,16.82
+glm k2048 n4096,gguf iq3_s,3,19.57
+glm k2048 n4096,gguf iq3_s,4,22.20
+glm k2048 n4096,gguf iq3_s,5,24.91
+glm k2048 n4096,gguf iq3_s,6,27.79
+glm k2048 n4096,gguf iq3_s,7,30.28
+glm k2048 n4096,gguf iq3_s,8,33.06
+glm k2048 n4096,gguf iq3_s,9,45.20
+glm k2048 n4096,gguf iq3_s,10,45.35
+glm k2048 n4096,gguf iq3_s,11,45.42
+glm k2048 n4096,gguf iq3_s,12,45.60
+glm k2048 n4096,gguf iq3_s,13,45.97
+glm k2048 n4096,gguf iq3_s,14,46.30
+glm k2048 n4096,gguf iq3_s,15,46.52
+glm k2048 n4096,gguf iq3_s,16,46.59
+glm k2048 n4096,gguf iq3_s,32,143.36
+glm k2048 n4096,gguf iq3_s,64,150.60
+glm k2048 n4096,gguf iq3_s,128,166.29
+glm k2048 n4096,gguf iq3_s,256,195.29
+glm k2048 n4096,gguf iq3_s,512,220.56
+drafter gate/up,exl3 3b stock,1,103.55
+drafter gate/up,exl3 3b stock,2,249.73
+drafter gate/up,exl3 3b stock,3,250.62
+drafter gate/up,exl3 3b stock,4,251.90
+drafter gate/up,exl3 3b stock,5,256.13
+drafter gate/up,exl3 3b stock,6,261.76
+drafter gate/up,exl3 3b stock,7,270.21
+drafter gate/up,exl3 3b stock,8,277.12
+drafter gate/up,exl3 3b stock,9,210.30
+drafter gate/up,exl3 3b stock,10,210.94
+drafter gate/up,exl3 3b stock,11,211.84
+drafter gate/up,exl3 3b stock,12,212.22
+drafter gate/up,exl3 3b stock,13,212.74
+drafter gate/up,exl3 3b stock,14,213.38
+drafter gate/up,exl3 3b stock,15,214.02
+drafter gate/up,exl3 3b stock,16,214.66
+drafter gate/up,exl3 3b stock,32,471.94
+drafter gate/up,exl3 3b stock,64,653.70
+drafter gate/up,exl3 3b stock,128,823.81
+drafter gate/up,exl3 3b stock,256,947.71
+drafter gate/up,exl3 3b stock,512,1605.63
+drafter gate/up,exl3 3b volta,1,110.21
+drafter gate/up,exl3 3b volta,2,136.06
+drafter gate/up,exl3 3b volta,3,135.94
+drafter gate/up,exl3 3b volta,4,137.86
+drafter gate/up,exl3 3b volta,5,140.67
+drafter gate/up,exl3 3b volta,6,142.21
+drafter gate/up,exl3 3b volta,7,146.05
+drafter gate/up,exl3 3b volta,8,148.99
+drafter gate/up,exl3 3b volta,9,190.59
+drafter gate/up,exl3 3b volta,10,192.90
+drafter gate/up,exl3 3b volta,11,194.05
+drafter gate/up,exl3 3b volta,12,195.20
+drafter gate/up,exl3 3b volta,13,196.10
+drafter gate/up,exl3 3b volta,14,196.61
+drafter gate/up,exl3 3b volta,15,199.04
+drafter gate/up,exl3 3b volta,16,199.81
+drafter gate/up,exl3 3b volta,32,491.78
+drafter gate/up,exl3 3b volta,64,661.76
+drafter gate/up,exl3 3b volta,128,864.38
+drafter gate/up,exl3 3b volta,256,1003.65
+drafter gate/up,exl3 3b volta,512,1657.47
+drafter gate/up,exl3 4b stock,1,92.16
+drafter gate/up,exl3 4b stock,2,126.08
+drafter gate/up,exl3 4b stock,3,175.36
+drafter gate/up,exl3 4b stock,4,177.02
+drafter gate/up,exl3 4b stock,5,179.71
+drafter gate/up,exl3 4b stock,6,182.27
+drafter gate/up,exl3 4b stock,7,185.73
+drafter gate/up,exl3 4b stock,8,189.06
+drafter gate/up,exl3 4b stock,9,220.16
+drafter gate/up,exl3 4b stock,10,220.67
+drafter gate/up,exl3 4b stock,11,221.18
+drafter gate/up,exl3 4b stock,12,221.06
+drafter gate/up,exl3 4b stock,13,222.21
+drafter gate/up,exl3 4b stock,14,222.46
+drafter gate/up,exl3 4b stock,15,222.98
+drafter gate/up,exl3 4b stock,16,223.49
+drafter gate/up,exl3 4b stock,32,480.77
+drafter gate/up,exl3 4b stock,64,676.99
+drafter gate/up,exl3 4b stock,128,868.61
+drafter gate/up,exl3 4b stock,256,1001.86
+drafter gate/up,exl3 4b stock,512,1667.58
+drafter gate/up,exl3 4b volta,1,89.22
+drafter gate/up,exl3 4b volta,2,92.80
+drafter gate/up,exl3 4b volta,3,92.93
+drafter gate/up,exl3 4b volta,4,93.18
+drafter gate/up,exl3 4b volta,5,93.95
+drafter gate/up,exl3 4b volta,6,94.08
+drafter gate/up,exl3 4b volta,7,94.72
+drafter gate/up,exl3 4b volta,8,94.98
+drafter gate/up,exl3 4b volta,9,110.85
+drafter gate/up,exl3 4b volta,10,112.13
+drafter gate/up,exl3 4b volta,11,112.51
+drafter gate/up,exl3 4b volta,12,113.28
+drafter gate/up,exl3 4b volta,13,113.79
+drafter gate/up,exl3 4b volta,14,114.56
+drafter gate/up,exl3 4b volta,15,115.33
+drafter gate/up,exl3 4b volta,16,115.84
+drafter gate/up,exl3 4b volta,32,446.59
+drafter gate/up,exl3 4b volta,64,669.57
+drafter gate/up,exl3 4b volta,128,851.58
+drafter gate/up,exl3 4b volta,256,976.38
+drafter gate/up,exl3 4b volta,512,1617.66
+drafter gate/up,exl3 5b stock,1,130.18
+drafter gate/up,exl3 5b stock,2,183.55
+drafter gate/up,exl3 5b stock,3,297.09
+drafter gate/up,exl3 5b stock,4,300.29
+drafter gate/up,exl3 5b stock,5,304.51
+drafter gate/up,exl3 5b stock,6,308.48
+drafter gate/up,exl3 5b stock,7,314.50
+drafter gate/up,exl3 5b stock,8,321.28
+drafter gate/up,exl3 5b stock,9,233.86
+drafter gate/up,exl3 5b stock,10,234.24
+drafter gate/up,exl3 5b stock,11,235.01
+drafter gate/up,exl3 5b stock,12,235.52
+drafter gate/up,exl3 5b stock,13,236.16
+drafter gate/up,exl3 5b stock,14,236.80
+drafter gate/up,exl3 5b stock,15,237.57
+drafter gate/up,exl3 5b stock,16,238.46
+drafter gate/up,exl3 5b stock,32,474.37
+drafter gate/up,exl3 5b stock,64,687.74
+drafter gate/up,exl3 5b stock,128,873.22
+drafter gate/up,exl3 5b stock,256,1004.16
+drafter gate/up,exl3 5b stock,512,1661.18
+drafter gate/up,exl3 5b volta,1,128.00
+drafter gate/up,exl3 5b volta,2,117.89
+drafter gate/up,exl3 5b volta,3,118.02
+drafter gate/up,exl3 5b volta,4,118.53
+drafter gate/up,exl3 5b volta,5,118.78
+drafter gate/up,exl3 5b volta,6,119.30
+drafter gate/up,exl3 5b volta,7,119.68
+drafter gate/up,exl3 5b volta,8,120.06
+drafter gate/up,exl3 5b volta,9,206.59
+drafter gate/up,exl3 5b volta,10,208.13
+drafter gate/up,exl3 5b volta,11,209.66
+drafter gate/up,exl3 5b volta,12,209.66
+drafter gate/up,exl3 5b volta,13,209.66
+drafter gate/up,exl3 5b volta,14,210.18
+drafter gate/up,exl3 5b volta,15,211.20
+drafter gate/up,exl3 5b volta,16,211.58
+drafter gate/up,exl3 5b volta,32,422.14
+drafter gate/up,exl3 5b volta,64,686.34
+drafter gate/up,exl3 5b volta,128,875.90
+drafter gate/up,exl3 5b volta,256,1006.85
+drafter gate/up,exl3 5b volta,512,1674.62
+drafter gate/up,nvfp4,1,73.47
+drafter gate/up,nvfp4,2,74.37
+drafter gate/up,nvfp4,3,75.01
+drafter gate/up,nvfp4,4,75.39
+drafter gate/up,nvfp4,5,76.03
+drafter gate/up,nvfp4,6,77.57
+drafter gate/up,nvfp4,7,80.26
+drafter gate/up,nvfp4,8,83.58
+drafter gate/up,nvfp4,9,88.06
+drafter gate/up,nvfp4,10,89.73
+drafter gate/up,nvfp4,11,92.93
+drafter gate/up,nvfp4,12,97.28
+drafter gate/up,nvfp4,13,102.78
+drafter gate/up,nvfp4,14,108.03
+drafter gate/up,nvfp4,15,114.05
+drafter gate/up,nvfp4,16,119.81
+drafter gate/up,nvfp4,32,378.24
+drafter gate/up,nvfp4,64,407.30
+drafter gate/up,nvfp4,128,433.54
+drafter gate/up,nvfp4,256,859.01
+drafter gate/up,nvfp4,512,2788.74
+drafter gate/up,gguf q4_k,1,69.89
+drafter gate/up,gguf q4_k,2,82.18
+drafter gate/up,gguf q4_k,3,98.82
+drafter gate/up,gguf q4_k,4,121.09
+drafter gate/up,gguf q4_k,5,143.74
+drafter gate/up,gguf q4_k,6,120.70
+drafter gate/up,gguf q4_k,7,126.21
+drafter gate/up,gguf q4_k,8,131.20
+drafter gate/up,gguf q4_k,9,167.42
+drafter gate/up,gguf q4_k,10,169.09
+drafter gate/up,gguf q4_k,11,174.08
+drafter gate/up,gguf q4_k,12,177.15
+drafter gate/up,gguf q4_k,13,182.02
+drafter gate/up,gguf q4_k,14,187.26
+drafter gate/up,gguf q4_k,15,192.64
+drafter gate/up,gguf q4_k,16,196.35
+drafter gate/up,gguf q4_k,32,969.86
+drafter gate/up,gguf q4_k,64,1088.00
+drafter gate/up,gguf q4_k,128,1240.32
+drafter gate/up,gguf q4_k,256,1775.74
+drafter gate/up,gguf q4_k,512,2959.62
+drafter gate/up,gguf q6_k,1,95.87
+drafter gate/up,gguf q6_k,2,105.47
+drafter gate/up,gguf q6_k,3,124.03
+drafter gate/up,gguf q6_k,4,147.07
+drafter gate/up,gguf q6_k,5,170.62
+drafter gate/up,gguf q6_k,6,196.48
+drafter gate/up,gguf q6_k,7,222.08
+drafter gate/up,gguf q6_k,8,213.12
+drafter gate/up,gguf q6_k,9,313.22
+drafter gate/up,gguf q6_k,10,316.54
+drafter gate/up,gguf q6_k,11,321.15
+drafter gate/up,gguf q6_k,12,323.58
+drafter gate/up,gguf q6_k,13,327.30
+drafter gate/up,gguf q6_k,14,331.65
+drafter gate/up,gguf q6_k,15,336.51
+drafter gate/up,gguf q6_k,16,339.84
+drafter gate/up,gguf q6_k,32,794.24
+drafter gate/up,gguf q6_k,64,915.58
+drafter gate/up,gguf q6_k,128,1063.68
+drafter gate/up,gguf q6_k,256,1598.98
+drafter gate/up,gguf q6_k,512,2784.26
+drafter gate/up,gguf iq3_s,1,87.42
+drafter gate/up,gguf iq3_s,2,109.95
+drafter gate/up,gguf iq3_s,3,133.89
+drafter gate/up,gguf iq3_s,4,156.67
+drafter gate/up,gguf iq3_s,5,180.10
+drafter gate/up,gguf iq3_s,6,204.42
+drafter gate/up,gguf iq3_s,7,226.43
+drafter gate/up,gguf iq3_s,8,249.47
+drafter gate/up,gguf iq3_s,9,407.81
+drafter gate/up,gguf iq3_s,10,409.34
+drafter gate/up,gguf iq3_s,11,410.37
+drafter gate/up,gguf iq3_s,12,412.03
+drafter gate/up,gguf iq3_s,13,413.70
+drafter gate/up,gguf iq3_s,14,414.72
+drafter gate/up,gguf iq3_s,15,415.87
+drafter gate/up,gguf iq3_s,16,417.41
+drafter gate/up,gguf iq3_s,32,1387.14
+drafter gate/up,gguf iq3_s,64,1508.35
+drafter gate/up,gguf iq3_s,128,1657.86
+drafter gate/up,gguf iq3_s,256,2191.62
+drafter gate/up,gguf iq3_s,512,3377.54
+drafter down,exl3 3b stock,1,86.91
+drafter down,exl3 3b stock,2,167.68
+drafter down,exl3 3b stock,3,169.34
+drafter down,exl3 3b stock,4,171.01
+drafter down,exl3 3b stock,5,173.18
+drafter down,exl3 3b stock,6,175.23
+drafter down,exl3 3b stock,7,177.66
+drafter down,exl3 3b stock,8,180.61
+drafter down,exl3 3b stock,9,220.54
+drafter down,exl3 3b stock,10,222.59
+drafter down,exl3 3b stock,11,228.86
+drafter down,exl3 3b stock,12,232.32
+drafter down,exl3 3b stock,13,234.24
+drafter down,exl3 3b stock,14,235.78
+drafter down,exl3 3b stock,15,237.82
+drafter down,exl3 3b stock,16,239.62
+drafter down,exl3 3b stock,32,540.80
+drafter down,exl3 3b stock,64,575.36
+drafter down,exl3 3b stock,128,770.69
+drafter down,exl3 3b stock,256,890.88
+drafter down,exl3 3b stock,512,1399.81
+drafter down,exl3 3b volta,1,87.42
+drafter down,exl3 3b volta,2,89.60
+drafter down,exl3 3b volta,3,89.86
+drafter down,exl3 3b volta,4,89.86
+drafter down,exl3 3b volta,5,90.37
+drafter down,exl3 3b volta,6,91.01
+drafter down,exl3 3b volta,7,91.90
+drafter down,exl3 3b volta,8,92.67
+drafter down,exl3 3b volta,9,130.94
+drafter down,exl3 3b volta,10,132.22
+drafter down,exl3 3b volta,11,132.99
+drafter down,exl3 3b volta,12,134.40
+drafter down,exl3 3b volta,13,136.06
+drafter down,exl3 3b volta,14,137.98
+drafter down,exl3 3b volta,15,140.54
+drafter down,exl3 3b volta,16,143.87
+drafter down,exl3 3b volta,32,503.55
+drafter down,exl3 3b volta,64,575.87
+drafter down,exl3 3b volta,128,773.89
+drafter down,exl3 3b volta,256,893.70
+drafter down,exl3 3b volta,512,1403.65
+drafter down,exl3 4b stock,1,76.16
+drafter down,exl3 4b stock,2,121.22
+drafter down,exl3 4b stock,3,158.21
+drafter down,exl3 4b stock,4,159.49
+drafter down,exl3 4b stock,5,160.00
+drafter down,exl3 4b stock,6,161.41
+drafter down,exl3 4b stock,7,162.30
+drafter down,exl3 4b stock,8,171.26
+drafter down,exl3 4b stock,9,218.37
+drafter down,exl3 4b stock,10,220.54
+drafter down,exl3 4b stock,11,221.95
+drafter down,exl3 4b stock,12,223.49
+drafter down,exl3 4b stock,13,225.54
+drafter down,exl3 4b stock,14,226.56
+drafter down,exl3 4b stock,15,229.38
+drafter down,exl3 4b stock,16,230.66
+drafter down,exl3 4b stock,32,513.41
+drafter down,exl3 4b stock,64,587.65
+drafter down,exl3 4b stock,128,782.21
+drafter down,exl3 4b stock,256,899.46
+drafter down,exl3 4b stock,512,1421.82
+drafter down,exl3 4b volta,1,79.36
+drafter down,exl3 4b volta,2,83.20
+drafter down,exl3 4b volta,3,83.33
+drafter down,exl3 4b volta,4,83.97
+drafter down,exl3 4b volta,5,84.48
+drafter down,exl3 4b volta,6,85.25
+drafter down,exl3 4b volta,7,86.40
+drafter down,exl3 4b volta,8,87.81
+drafter down,exl3 4b volta,9,120.32
+drafter down,exl3 4b volta,10,121.86
+drafter down,exl3 4b volta,11,123.01
+drafter down,exl3 4b volta,12,125.06
+drafter down,exl3 4b volta,13,126.98
+drafter down,exl3 4b volta,14,130.30
+drafter down,exl3 4b volta,15,133.63
+drafter down,exl3 4b volta,16,138.62
+drafter down,exl3 4b volta,32,508.29
+drafter down,exl3 4b volta,64,592.26
+drafter down,exl3 4b volta,128,808.96
+drafter down,exl3 4b volta,256,928.77
+drafter down,exl3 4b volta,512,1457.54
+drafter down,exl3 5b stock,1,106.75
+drafter down,exl3 5b stock,2,184.32
+drafter down,exl3 5b stock,3,247.81
+drafter down,exl3 5b stock,4,250.88
+drafter down,exl3 5b stock,5,253.82
+drafter down,exl3 5b stock,6,257.15
+drafter down,exl3 5b stock,7,259.46
+drafter down,exl3 5b stock,8,262.02
+drafter down,exl3 5b stock,9,235.01
+drafter down,exl3 5b stock,10,237.06
+drafter down,exl3 5b stock,11,239.10
+drafter down,exl3 5b stock,12,240.26
+drafter down,exl3 5b stock,13,242.05
+drafter down,exl3 5b stock,14,243.58
+drafter down,exl3 5b stock,15,245.63
+drafter down,exl3 5b stock,16,247.17
+drafter down,exl3 5b stock,32,490.37
+drafter down,exl3 5b stock,64,601.09
+drafter down,exl3 5b stock,128,788.86
+drafter down,exl3 5b stock,256,912.38
+drafter down,exl3 5b stock,512,1429.12
+drafter down,exl3 5b volta,1,103.55
+drafter down,exl3 5b volta,2,144.51
+drafter down,exl3 5b volta,3,145.15
+drafter down,exl3 5b volta,4,145.79
+drafter down,exl3 5b volta,5,146.94
+drafter down,exl3 5b volta,6,147.58
+drafter down,exl3 5b volta,7,148.10
+drafter down,exl3 5b volta,8,149.12
+drafter down,exl3 5b volta,9,163.20
+drafter down,exl3 5b volta,10,164.61
+drafter down,exl3 5b volta,11,165.25
+drafter down,exl3 5b volta,12,165.76
+drafter down,exl3 5b volta,13,165.25
+drafter down,exl3 5b volta,14,166.02
+drafter down,exl3 5b volta,15,167.30
+drafter down,exl3 5b volta,16,166.78
+drafter down,exl3 5b volta,32,427.52
+drafter down,exl3 5b volta,64,599.81
+drafter down,exl3 5b volta,128,788.74
+drafter down,exl3 5b volta,256,910.08
+drafter down,exl3 5b volta,512,1432.32
+drafter down,nvfp4,1,73.73
+drafter down,nvfp4,2,73.86
+drafter down,nvfp4,3,73.98
+drafter down,nvfp4,4,73.98
+drafter down,nvfp4,5,74.50
+drafter down,nvfp4,6,74.75
+drafter down,nvfp4,7,75.39
+drafter down,nvfp4,8,76.67
+drafter down,nvfp4,9,110.98
+drafter down,nvfp4,10,111.49
+drafter down,nvfp4,11,112.64
+drafter down,nvfp4,12,113.92
+drafter down,nvfp4,13,116.35
+drafter down,nvfp4,14,118.91
+drafter down,nvfp4,15,121.86
+drafter down,nvfp4,16,125.95
+drafter down,nvfp4,32,450.82
+drafter down,nvfp4,64,824.32
+drafter down,nvfp4,128,942.08
+drafter down,nvfp4,256,801.79
+drafter down,nvfp4,512,1477.89
+drafter down,gguf q4_k,1,69.50
+drafter down,gguf q4_k,2,80.77
+drafter down,gguf q4_k,3,98.05
+drafter down,gguf q4_k,4,133.89
+drafter down,gguf q4_k,5,154.62
+drafter down,gguf q4_k,6,124.93
+drafter down,gguf q4_k,7,128.90
+drafter down,gguf q4_k,8,133.76
+drafter down,gguf q4_k,9,173.57
+drafter down,gguf q4_k,10,176.90
+drafter down,gguf q4_k,11,181.25
+drafter down,gguf q4_k,12,185.47
+drafter down,gguf q4_k,13,188.42
+drafter down,gguf q4_k,14,191.49
+drafter down,gguf q4_k,15,195.33
+drafter down,gguf q4_k,16,197.89
+drafter down,gguf q4_k,32,1017.22
+drafter down,gguf q4_k,64,993.79
+drafter down,gguf q4_k,128,1079.17
+drafter down,gguf q4_k,256,1335.68
+drafter down,gguf q4_k,512,1576.83
+drafter down,gguf q6_k,1,100.61
+drafter down,gguf q6_k,2,111.23
+drafter down,gguf q6_k,3,125.95
+drafter down,gguf q6_k,4,157.18
+drafter down,gguf q6_k,5,185.98
+drafter down,gguf q6_k,6,263.30
+drafter down,gguf q6_k,7,237.57
+drafter down,gguf q6_k,8,212.35
+drafter down,gguf q6_k,9,314.50
+drafter down,gguf q6_k,10,316.67
+drafter down,gguf q6_k,11,320.00
+drafter down,gguf q6_k,12,322.56
+drafter down,gguf q6_k,13,321.79
+drafter down,gguf q6_k,14,322.43
+drafter down,gguf q6_k,15,325.38
+drafter down,gguf q6_k,16,333.31
+drafter down,gguf q6_k,32,791.17
+drafter down,gguf q6_k,64,818.56
+drafter down,gguf q6_k,128,897.28
+drafter down,gguf q6_k,256,1160.96
+drafter down,gguf q6_k,512,1401.22
+drafter down,gguf iq3_s,1,84.10
+drafter down,gguf iq3_s,2,105.34
+drafter down,gguf iq3_s,3,128.77
+drafter down,gguf iq3_s,4,152.83
+drafter down,gguf iq3_s,5,180.10
+drafter down,gguf iq3_s,6,211.71
+drafter down,gguf iq3_s,7,240.26
+drafter down,gguf iq3_s,8,265.86
+drafter down,gguf iq3_s,9,396.29
+drafter down,gguf iq3_s,10,397.70
+drafter down,gguf iq3_s,11,399.10
+drafter down,gguf iq3_s,12,400.38
+drafter down,gguf iq3_s,13,402.05
+drafter down,gguf iq3_s,14,403.20
+drafter down,gguf iq3_s,15,404.35
+drafter down,gguf iq3_s,16,405.50
+drafter down,gguf iq3_s,32,1392.90
+drafter down,gguf iq3_s,64,1421.18
+drafter down,gguf iq3_s,128,1497.73
+drafter down,gguf iq3_s,256,1759.74
+drafter down,gguf iq3_s,512,2005.89
