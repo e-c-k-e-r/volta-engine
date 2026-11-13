@@ -253,6 +253,112 @@ void all_reduce_ring_kernel(
 	ar_retire( flags[rank], seq );
 }
 
+// all_reduce_ring_kernel followed by Gemma 4's sandwich-norm residual add and the next sublayer's norm, one block per row: y = FP16( sum of the
+// partials ) (the same sum and rounding as the plain all-reduce), resid = ( resid + RMSNorm( y ) * ( w_post + bias ) ) * scale over the fp32 residual,
+// then out = RMSNorm( resid ) * ( w_next + bias ) when w_next is given. y is not written back. The sums of squares differ in order from the module calls.
+constexpr int AR_NA_CHUNKS = 3;   // 8-value chunks per thread: hidden <= 3 * 256 * 8 = 6144
+template <int NR>
+__global__ __launch_bounds__( 256 )
+void all_reduce_normed_add_kernel(
+	int rank,
+	const void* __restrict__ p0, const void* __restrict__ p1, const void* __restrict__ p2, const void* __restrict__ p3,
+	uint32_t* __restrict__ f0, uint32_t* __restrict__ f1, uint32_t* __restrict__ f2, uint32_t* __restrict__ f3,
+	const half* __restrict__ y,
+	float* __restrict__ resid,
+	const half* __restrict__ w_post,
+	const half* __restrict__ w_next,
+	half* __restrict__ out,
+	int hidden_size,
+	float eps,
+	float bias,
+	float scale
+) {
+	const int row = blockIdx.x;
+	const size_t n4 = static_cast<size_t>( hidden_size ) / 8;
+	const void* peer_slots[4] = { p0, p1, p2, p3 };
+	uint32_t* flags[4] = { f0, f1, f2, f3 };
+	const uint32_t seq = ar_next_seq( flags[rank] );
+	const uint32_t stage = seq & 3;
+	uint8_t* my_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[rank] ) ) + ( (size_t) stage * 4 + rank ) * IPC_SLOT_BYTES;
+	uint4* my_slot = reinterpret_cast<uint4*>( my_staging ) + row * n4;
+	const uint4* src_y = reinterpret_cast<const uint4*>( y + static_cast<size_t>( row ) * hidden_size );
+	for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) my_slot[i] = src_y[i];
+	__threadfence_system();
+	__syncthreads();
+	if ( threadIdx.x == 0 ) {
+		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
+		for ( int p = 0; p < NR; ++p ) {
+			if ( p == rank ) continue;
+			while ( ldg_acquire_sys_u32( ar_flag( flags[p], stage, row, p ) ) < seq ) __nanosleep( 32 );
+		}
+	}
+	__syncthreads();
+	const uint4* r_ptrs[NR];
+	#pragma unroll
+	for ( int offset = 0; offset < NR; ++offset ) {
+		const int p = ( rank + offset ) % NR;
+		uint8_t* p_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[p] ) ) + ( (size_t) stage * 4 + p ) * IPC_SLOT_BYTES;
+		r_ptrs[offset] = reinterpret_cast<const uint4*>( p_staging ) + row * n4;
+	}
+	// the reduced row, rounded to FP16 as the plain all-reduce stores it
+	float ys[AR_NA_CHUNKS][8];
+	float sq = 0.0f;
+	#pragma unroll
+	for ( int c = 0; c < AR_NA_CHUNKS; ++c ) {
+		const size_t i = threadIdx.x + c * blockDim.x;
+		if ( i >= n4 ) continue;
+		__half hp[NR][8];
+		#pragma unroll
+		for ( int r = 0; r < NR; ++r ) *reinterpret_cast<uint4*>( hp[r] ) = r_ptrs[r][i];
+		#pragma unroll
+		for ( int k = 0; k < 8; ++k ) {
+			float v = __half2float( hp[0][k] );
+			#pragma unroll
+			for ( int r = 1; r < NR; ++r ) v += __half2float( hp[r][k] );
+			v = __half2float( __float2half_rn( v ) );
+			ys[c][k] = v;
+			sq = fmaf( v, v, sq );
+		}
+	}
+	const float inv1 = rsqrtf( engine::math::block_sum<8>( sq ) / static_cast<float>( hidden_size ) + eps );
+	float* row_r = resid + static_cast<size_t>( row ) * hidden_size;
+	float sq2 = 0.0f;
+	#pragma unroll
+	for ( int c = 0; c < AR_NA_CHUNKS; ++c ) {
+		const size_t i = threadIdx.x + c * blockDim.x;
+		if ( i >= n4 ) continue;
+		__half hw[8];
+		*reinterpret_cast<uint4*>( hw ) = reinterpret_cast<const uint4*>( w_post )[i];
+		float4* rp = reinterpret_cast<float4*>( row_r + i * 8 );
+		float4 a = rp[0], b = rp[1];
+		float rv[8] = { a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w };
+		#pragma unroll
+		for ( int k = 0; k < 8; ++k ) {
+			rv[k] = ( rv[k] + ys[c][k] * inv1 * ( __half2float( hw[k] ) + bias ) ) * scale;
+			ys[c][k] = rv[k];
+			sq2 = fmaf( rv[k], rv[k], sq2 );
+		}
+		rp[0] = make_float4( rv[0], rv[1], rv[2], rv[3] );
+		rp[1] = make_float4( rv[4], rv[5], rv[6], rv[7] );
+	}
+	if ( w_next != nullptr ) {
+		__syncthreads();   // block_sum's warp totals are reused
+		const float inv2 = rsqrtf( engine::math::block_sum<8>( sq2 ) / static_cast<float>( hidden_size ) + eps );
+		half* row_o = out + static_cast<size_t>( row ) * hidden_size;
+		#pragma unroll
+		for ( int c = 0; c < AR_NA_CHUNKS; ++c ) {
+			const size_t i = threadIdx.x + c * blockDim.x;
+			if ( i >= n4 ) continue;
+			__half hw[8], ho[8];
+			*reinterpret_cast<uint4*>( hw ) = reinterpret_cast<const uint4*>( w_next )[i];
+			#pragma unroll
+			for ( int k = 0; k < 8; ++k ) ho[k] = __float2half_rn( ys[c][k] * inv2 * ( __half2float( hw[k] ) + bias ) );
+			reinterpret_cast<uint4*>( row_o )[i] = *reinterpret_cast<uint4*>( ho );
+		}
+	}
+	ar_retire( flags[rank], seq );
+}
+
 // Last block to finish publishes seq as consumed (a grid of `blocks` blocks)
 __device__ __forceinline__ void ar_retire_n( uint32_t* local_flags, uint32_t seq, unsigned blocks ) {
 	__syncthreads();
@@ -607,6 +713,30 @@ void CollectiveRing::all_reduce_hc_apply(
 		rank, peer_ptrs[0], peer_ptrs[1], peer_ptrs[2], peer_ptrs[3],
 		static_cast<uint32_t*>( sync_flags[0] ), static_cast<uint32_t*>( sync_flags[1] ), static_cast<uint32_t*>( sync_flags[2] ), static_cast<uint32_t*>( sync_flags[3] ),
 		y.ptr<const half>(), streams, post, comb, hidden_size );
+}
+
+void CollectiveRing::all_reduce_normed_add(
+	pod::TensorView& y,
+	pod::TensorView& resid,
+	const pod::TensorView& w_post,
+	float scale,
+	const pod::TensorView* w_next,
+	pod::TensorView* out,
+	float eps,
+	float constant_bias,
+	cudaStream_t stream
+) {
+	const int rows = y.shape[0];
+	const int hidden_size = y.shape[1];
+	ENGINE_ASSERT( rows >= 1 && rows <= AR_MAX_ROWS && static_cast<size_t>( rows ) * hidden_size * sizeof( half ) <= IPC_SLOT_BYTES, "all_reduce_normed_add: rows out of range" );
+	ENGINE_ASSERT( hidden_size % 8 == 0 && hidden_size <= AR_NA_CHUNKS * 256 * 8 && resid.dtype == pod::DType::FP32, "all_reduce_normed_add: hidden_size or residual" );
+	ENGINE_ASSERT( ( w_next == nullptr ) == ( out == nullptr ), "all_reduce_normed_add: the next norm needs its output" );
+	auto kernel = ( nranks == 2 ) ? all_reduce_normed_add_kernel<2> : all_reduce_normed_add_kernel<4>;
+	kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>(
+		rank, peer_ptrs[0], peer_ptrs[1], peer_ptrs[2], peer_ptrs[3],
+		static_cast<uint32_t*>( sync_flags[0] ), static_cast<uint32_t*>( sync_flags[1] ), static_cast<uint32_t*>( sync_flags[2] ), static_cast<uint32_t*>( sync_flags[3] ),
+		y.ptr<const half>(), resid.ptr<float>(), w_post.ptr<const half>(), w_next != nullptr ? w_next->ptr<const half>() : nullptr,
+		out != nullptr ? out->ptr<half>() : nullptr, hidden_size, eps, constant_bias, scale );
 }
 
 void init_4gpu_mesh(

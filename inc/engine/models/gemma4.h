@@ -121,7 +121,7 @@ public:
 
 private:
 	void set_rows( int m );
-	void layer_forward( const Gemma4LayerWeights& lw, int kv_layer, int m, backend::stream_t stream );
+	bool layer_forward( const Gemma4LayerWeights& lw, int kv_layer, int m, backend::stream_t stream, bool input_normed = false, const pod::TensorView* next_norm = nullptr );
 	void forward_body( int m, backend::stream_t stream );
 	void copy_kv_rows( const engine::runtime::KVCachePool& pool, int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	size_t tap_snapshot_bytes( int tokens ) const;

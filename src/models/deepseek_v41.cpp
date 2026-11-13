@@ -1607,7 +1607,7 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 				if ( k0[c] == chunks[c].count ) continue;
 				const int m = bind_kept( c );
 				ffn_back( lw, m, stream );
-				engine::modules::HyperConnection::update( streams_, moe_out_, mhc_post_, mhc_comb_, H, stream, m );
+				reduce_update( moe_out_, m, stream );
 				steer_layer( l, m, stream );
 				unbind( c );
 			}
@@ -1641,7 +1641,7 @@ void DeepseekV41Pipeline::forward_window( const int* tokens, const pod::BatchRow
 		for ( int c = 0; c < n; ++c ) {
 			const int m = bind( c );
 			ffn_back( lw, m, stream );
-			engine::modules::HyperConnection::update( streams_, moe_out_, mhc_post_, mhc_comb_, H, stream, m );
+			reduce_update( moe_out_, m, stream );
 			steer_layer( l, m, stream );
 			unbind( c );
 		}
@@ -1881,10 +1881,8 @@ void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int
 	}
 	DSV4::concat_groups( woa_out_.ptr<const backend::half_t>(), woa_cat_.ptr<backend::half_t>(), gl_, O, m, stream );
 	lin_fwd( woa_cat_, lw.wo_b, attn_out_, fp8_scratch_, stream );
-	if ( ring_ ) ring_->all_reduce( attn_out_, stream );
 	trace_tensor( 7000 + layer, o_g_, m, gl_ * DSV4::GROUP_HEADS * DSV4::HD, stream );
-	trace_tensor( 2000 + layer, attn_out_, m, H, stream );
-	engine::modules::HyperConnection::update( streams_, attn_out_, mhc_post_, mhc_comb_, H, stream, m );
+	reduce_update( attn_out_, m, stream, 2000 + layer );
 }
 
 void DeepseekV41Pipeline::ffn( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
@@ -1892,8 +1890,7 @@ void DeepseekV41Pipeline::ffn( int layer, DeepseekV41LayerWeights& lw, int m, ba
 	trace_tensor( 4000 + layer, norm_x_, m, config_.hidden_size, stream );
 	ffn_experts( lw, m, stream );
 	ffn_back( lw, m, stream );
-	trace_tensor( 5000 + layer, moe_out_, m, config_.hidden_size, stream );
-	engine::modules::HyperConnection::update( streams_, moe_out_, mhc_post_, mhc_comb_, config_.hidden_size, stream, m );
+	reduce_update( moe_out_, m, stream, 5000 + layer );
 }
 
 void DeepseekV41Pipeline::ffn_front( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream, int experts, int top_k ) {
@@ -1935,7 +1932,22 @@ void DeepseekV41Pipeline::ffn_back( DeepseekV41LayerWeights& lw, int m, backend:
 		lin_fwd( sh_i_, lw.sh_down, sh_out_, fp8_scratch_, stream );
 		engine::modules::MoERouter::accumulate( moe_out_.ptr<backend::half_t>(), sh_out_.ptr<const backend::half_t>(), backend::from_float_half( 1.0f ), m * H, stream );
 	}
-	if ( ring_ ) ring_->all_reduce( moe_out_, stream );
+}
+
+// A sublayer output's all-reduce and the mHC post-step. Decode-sized rows take the one kernel that reduces y and applies the post-step
+// (all_reduce_hc_apply, bit for bit HyperConnection::update after the reduction; y is not written back), prefill chunks the two launches,
+// with the reduced output traced under trace_tag when trace_layers is on
+void DeepseekV41Pipeline::reduce_update( pod::TensorView& y, int m, backend::stream_t stream, int trace_tag ) {
+#if ENGINE_BACKEND_CUDA
+	if ( ring_ && m <= pod::MAX_BATCH && runtime::options().hc_fuse ) {
+		pod::TensorView v = pod::make_tensor_2d( y.data, y.dtype, m, config_.hidden_size );
+		ring_->all_reduce_hc_apply( v, streams_.ptr<float>(), mhc_post_.ptr<const float>(), mhc_comb_.ptr<const float>(), stream );
+		return;
+	}
+#endif
+	if ( ring_ ) ring_->all_reduce( y, stream );
+	if ( trace_tag >= 0 ) trace_tensor( trace_tag, y, m, config_.hidden_size, stream );
+	engine::modules::HyperConnection::update( streams_, y, mhc_post_, mhc_comb_, config_.hidden_size, stream, m );
 }
 
 // ---- DSpark drafter ---------------------------------------------------------------------------------------------------------------------
@@ -2152,13 +2164,12 @@ void DeepseekV41Pipeline::dspark_forward( int slot, int pos, int from, int win_s
 		}
 		DSV4::concat_groups( woa_out_.ptr<const backend::half_t>(), woa_cat_.ptr<backend::half_t>(), gl_, O, B, stream );
 		lin_fwd( woa_cat_, lw.wo_b, attn_out_, fp8_scratch_, stream );
-		if ( ring_ ) ring_->all_reduce( attn_out_, stream );
-		engine::modules::HyperConnection::update( streams_, attn_out_, mhc_post_, mhc_comb_, H, stream, B );
+		reduce_update( attn_out_, B, stream );
 		// the MoE sublayer: 128 experts, 3 per token
 		ffn_front( lw, B, stream, ds_.experts, ds_.top_k );
 		ffn_experts( lw, B, stream );
 		ffn_back( lw, B, stream );
-		engine::modules::HyperConnection::update( streams_, moe_out_, mhc_post_, mhc_comb_, H, stream, B );
+		reduce_update( moe_out_, B, stream );
 	}
 	// the last pre-mix collapses the streams, the drafter's own final norm, the trunk's head over this rank's vocabulary shard
 	DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], ds_.final_norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), nullptr, 1.0f, H, eps, B, stream );

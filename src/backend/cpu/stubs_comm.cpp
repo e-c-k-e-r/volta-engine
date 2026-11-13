@@ -33,6 +33,10 @@ __attribute__(( weak )) void CollectiveRing::all_reduce_gated_norm( pod::TensorV
 	__builtin_unreachable();
 }
 
+__attribute__(( weak )) void CollectiveRing::all_reduce_normed_add( pod::TensorView&, pod::TensorView&, const pod::TensorView&, float, const pod::TensorView*, pod::TensorView*, float, float, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "CollectiveRing::all_reduce_normed_add" );
+}
+
 __attribute__(( weak )) void CollectiveRing::all_reduce( pod::TensorView& x, backend::stream_t stream ) {
 	ENGINE_UNSUPPORTED( "CollectiveRing::all_reduce" );
 	__builtin_unreachable();

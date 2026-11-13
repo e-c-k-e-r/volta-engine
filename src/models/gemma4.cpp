@@ -423,7 +423,10 @@ void Gemma4Pipeline::forward( const pod::BatchRows& rows, backend::stream_t stre
 
 // One decoder layer over the m rows of d_rows_ (resid_ in and out):
 //   x += post_attn_norm( attn( input_norm( x ) ) ); x += post_ffn_norm( mlp( pre_ffn_norm( x ) ) ); x *= layer_scalar
-void Gemma4Pipeline::layer_forward( const Gemma4LayerWeights& lw, int kv_layer, int m, backend::stream_t stream ) {
+// With TP the reductions of the two sublayer outputs carry the sandwich-norm add and the next norm (all_reduce_normed_add): the attention one writes
+// the pre-FFN norm, the FFN one the next layer's input norm (next_norm), so that layer starts from norm_hidden_ (input_normed). Returns whether the
+// next input norm was written.
+bool Gemma4Pipeline::layer_forward( const Gemma4LayerWeights& lw, int kv_layer, int m, backend::stream_t stream, bool input_normed, const pod::TensorView* next_norm ) {
 	using namespace engine::modules;
 	const float eps = config_.rms_norm_eps;
 	const engine::runtime::KVCachePool& pool = lw.is_full ? full_pool_ : swa_pool_;
@@ -431,7 +434,7 @@ void Gemma4Pipeline::layer_forward( const Gemma4LayerWeights& lw, int kv_layer, 
 	const int hd = lw.is_full ? config_.full_head_dim : config_.swa_head_dim;
 	const int kvh = lw.is_full ? full_kv_heads_ : swa_kv_heads_;
 
-	RMSNorm::forward( resid_, lw.input_norm, norm_hidden_, eps, 0.0f, stream );
+	if ( !input_normed ) RMSNorm::forward( resid_, lw.input_norm, norm_hidden_, eps, 0.0f, stream );
 
 	pod::TensorView q = pod::make_tensor_2d( q_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, q_heads_ * hd );
 	pod::TensorView k = pod::make_tensor_2d( k_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, kvh * hd );
@@ -455,23 +458,32 @@ void Gemma4Pipeline::layer_forward( const Gemma4LayerWeights& lw, int kv_layer, 
 		m > pod::MAX_BATCH ? key_hint_ : 0, m <= pod::MAX_BATCH && !attn_tc_, 1.0f, lw.is_full ? 0 : config_.swa_window );
 
 	Linear::forward( o, lw.o_proj, mlp_out_, stream );
-	if ( ring_ ) ring_->all_reduce( mlp_out_, stream );
-	Elementwise::add_normed( resid_, mlp_out_, lw.post_attn_norm, eps, 0.0f, 1.0f, stream );
-
-	RMSNorm::forward( resid_, lw.pre_ffn_norm, norm_hidden_, eps, 0.0f, stream );
+	const bool fuse = ring_ != nullptr && runtime::options().normed_add_fuse;
+	if ( fuse ) ring_->all_reduce_normed_add( mlp_out_, resid_, lw.post_attn_norm, 1.0f, &lw.pre_ffn_norm, &norm_hidden_, eps, 0.0f, stream );
+	else {
+		if ( ring_ ) ring_->all_reduce( mlp_out_, stream );
+		Elementwise::add_normed( resid_, mlp_out_, lw.post_attn_norm, eps, 0.0f, 1.0f, stream );
+		RMSNorm::forward( resid_, lw.pre_ffn_norm, norm_hidden_, eps, 0.0f, stream );
+	}
 	Linear::forward( norm_hidden_, lw.gate_proj, gate_buf_, stream );
 	Linear::forward( norm_hidden_, lw.up_proj, up_buf_, stream );
 	SwiGLU::forward( gate_buf_, up_buf_, mlp_inter_, stream, 0.0f, true );   // gelu_tanh( gate ) * up
 	Linear::forward( mlp_inter_, lw.down_proj, mlp_out_, stream );
+	if ( fuse ) {
+		ring_->all_reduce_normed_add( mlp_out_, resid_, lw.post_ffn_norm, lw.layer_scalar, next_norm, next_norm != nullptr ? &norm_hidden_ : nullptr, eps, 0.0f, stream );
+		return next_norm != nullptr;
+	}
 	if ( ring_ ) ring_->all_reduce( mlp_out_, stream );
 	Elementwise::add_normed( resid_, mlp_out_, lw.post_ffn_norm, eps, 0.0f, lw.layer_scalar, stream );
+	return false;
 }
 
 void Gemma4Pipeline::forward_body( int m, backend::stream_t stream ) {
 	int swa_idx = 0, full_idx = 0;
+	bool normed = false;
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		const Gemma4LayerWeights& lw = layers_[L];
-		layer_forward( lw, lw.is_full ? full_idx++ : swa_idx++, m, stream );
+		normed = layer_forward( lw, lw.is_full ? full_idx++ : swa_idx++, m, stream, normed, L + 1 < config_.num_layers ? &layers_[L + 1].input_norm : nullptr );
 		// Drafter taps: the hidden after the tapped layers, into each row's slot ring (slot and position from d_rows_: graph-replayable)
 		for ( int tap = 0; tap < Gemma4Config::kTaps && draft_.taps.data != nullptr; ++tap ) {
 			if ( L != config_.tap_layers[tap] + tap_shift_ ) continue;

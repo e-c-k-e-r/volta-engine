@@ -197,6 +197,7 @@ private:
 	SteerHost steer_;
 	void trace( int tag, int m, backend::stream_t stream );
 	void trace_tensor( int tag, const pod::TensorView& t, int m, int cols, backend::stream_t stream );   // debug: <trace_layers>.t
+	void reduce_update( pod::TensorView& y, int m, backend::stream_t stream, int trace_tag = -1 );   // all-reduce + mHC post-step
 
 	DeepseekV41Config config_;
 	ModelMetadata metadata_;

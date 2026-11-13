@@ -60,6 +60,21 @@ struct CollectiveRing {
 		const backend::half_t* addend = nullptr,
 		const float* addend_gate = nullptr
 	);
+
+	// Gemma 4 (sandwich norms, fp32 residual): y = all_reduce(y), then resid = ( resid + RMSNorm( y ) * ( w_post + bias ) ) * scale (what
+	// Elementwise::add_normed does after the reduction) and, with w_next, out = RMSNorm( resid ) * ( w_next + bias ) for the next sublayer, in the
+	// one kernel that reduces y. y is not written back.
+	void all_reduce_normed_add(
+		pod::TensorView& y,
+		pod::TensorView& resid,
+		const pod::TensorView& w_post,
+		float scale,
+		const pod::TensorView* w_next,
+		pod::TensorView* out,
+		float eps,
+		float constant_bias = 0.0f,
+		backend::stream_t stream = nullptr
+	);
 };
 
 void init_4gpu_mesh(
