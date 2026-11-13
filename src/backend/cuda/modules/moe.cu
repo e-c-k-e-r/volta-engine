@@ -492,9 +492,6 @@ __global__ void moe_accumulate_kernel(
 
 // ---- heavy experts of a prefill chunk (moe_heavy_rows): an expert routed by many rows runs as FP16 dequantization + a tensor-core GEMM ----
 
-// moe_heavy_rows 0 for experts in the Volta tile order: their quantized prefill kernel runs one block per SM (a lane keeps a partial sum per
-// row half), so the dequantize + GEMM path takes the experts of 32 or more rows (GLM 3.05 bpw, 2048 tokens: 628 -> 803 tok/s)
-constexpr int kVoltaHeavyRows = 32;
 
 // idx_out = the routes with the heavy experts' entries set to -1 (outside every expert range, so the dispatch skips them)
 __global__ void moe_mask_heavy_kernel( const int* __restrict__ sel, int* __restrict__ out, const uint8_t* __restrict__ heavy, int n, int first, int last ) {
@@ -843,10 +840,8 @@ pod::MoEScratch MoE::alloc_scratch(
 		s.coop_ctr = static_cast<int*>( engine::core::arena_alloc( arena, ctr_bytes ) );
 		CUDA_CHECK( cudaMemset( s.coop_ctr, 0, ctr_bytes ) );
 	}
-	// the route lists of the heavy-expert path are small (about 14 bytes a route), so they exist whenever a threshold could apply: the
-	// option's, or the one Volta-order experts default to (the tile order is not known yet here)
-	const int heavy_min = runtime::options().moe_heavy_rows > 0 ? runtime::options().moe_heavy_rows : kVoltaHeavyRows;
-	if ( !nvfp4 && max_rows >= heavy_min && hidden_size % 128 == 0 && intermediate_size % 128 == 0 ) {
+	const int heavy_min = runtime::options().moe_heavy_rows;
+	if ( !nvfp4 && heavy_min > 0 && max_rows >= heavy_min && hidden_size % 128 == 0 && intermediate_size % 128 == 0 ) {
 		s.heavy_routes = top_k * max_rows;
 		s.heavy_ws = engine::core::arena_alloc( arena, heavy_bytes( s.heavy_routes, num_local_experts ) );
 	}
@@ -1017,7 +1012,7 @@ void MoE::forward(
 			// quantized kernel has done the others (their routes are masked out of a second dispatch); none heavy, the first dispatch stands
 			struct Heavy { int e, count, off; };
 			std::vector<Heavy> heavy;
-			const int heavy_min = runtime::options().moe_heavy_rows > 0 ? runtime::options().moe_heavy_rows : weights.gate[0].volta_tiles ? kVoltaHeavyRows : 0;
+			const int heavy_min = runtime::options().moe_heavy_rows;
 			const int H = x.shape[x.ndim - 1], Iw = weights.up[0].w2.shape[0];
 			const int routes = rows * weights.top_k;
 			const HeavyBufs hb = scratch.heavy_ws != nullptr ? heavy_bufs( scratch, E, H, Iw ) : HeavyBufs{};

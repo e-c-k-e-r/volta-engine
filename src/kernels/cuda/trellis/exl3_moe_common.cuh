@@ -17,11 +17,7 @@
 // blocks share an SM and the warps of one hide the barrier and shuffle stalls of the other (1 block of 230 registers left 8 warps per SM)
 #define MOE_PREFILL_FRAG_STAGES 2
 #ifndef MOE_PREFILL_BLOCKS_PER_SM
-#if EXL3_VOLTA_LAYOUT
-#define MOE_PREFILL_BLOCKS_PER_SM 1
-#else
 #define MOE_PREFILL_BLOCKS_PER_SM 2
-#endif
 #endif
 
 #ifndef EXL3_GEMM_BASE_THREADS
