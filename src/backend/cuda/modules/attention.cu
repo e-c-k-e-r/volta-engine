@@ -1287,7 +1287,7 @@ void Attention::forward_decode(
 	float scale_override,
 	int window
 ) {
-	ENGINE_ASSERT( head_dim <= ATTN_MAX_HEAD_DIM && head_dim % 32 == 0, "Attention::forward_decode: head_dim must be a multiple of 32, at most 512" );
+	ENGINE_ASSERT( head_dim <= ATTN_MAX_HEAD_DIM, "Attention::forward_decode: head_dim at most 512" );
 	ENGINE_ASSERT( kv.ring == 0 || ( window > 0 && window <= kv.ring && kv.ring == max_seq ), "Attention::forward_decode: a ring cache holds a sliding window of max_seq rows" );
 	// Keys per chunk: one page, doubled until the key range fits the workspace's chunk capacity, for the rows and heads of a batch
 	const int batch_rows = MIN( count, pod::MAX_BATCH );
@@ -1298,6 +1298,8 @@ void Attention::forward_decode(
 
 	// Position-independent grid: one chunk per page of the full window (graph-capturable)
 	const int n_chunks = MAX( 1, ( max_seq + chunk_len - 1 ) / chunk_len );
+	ENGINE_ASSERT( n_chunks == 1 || head_dim == 64 || head_dim == 128 || head_dim == 256 || head_dim == 512,
+		"Attention::forward_decode: a window over several chunks needs head_dim 64, 128, 256 or 512 (the partials' reduce)" );
 	float* workspace = attn_workspace_ptr();
 	const half* gate_ptr = gate.data != nullptr ? gate.ptr<const half>() : nullptr;
 	const size_t row_elems = static_cast<size_t>( num_q_heads ) * head_dim;
