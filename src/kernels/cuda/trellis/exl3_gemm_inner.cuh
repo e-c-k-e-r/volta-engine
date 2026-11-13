@@ -217,12 +217,8 @@ void exl3_gemm_kernel_inner_m64
     // warp's B fragments are shared by all 4 row-blocks' HMMAs. The C fragments
     // they convert into live only inside reduce(), so the two arrays can share
     // register storage.
-    #if EXL3_VOLTA_LAYOUT
-        // one partial sum per row half: the octets split the k chunks (see the plain kernel), reduce() adds the pair
-        register float dacc[ROW_BLOCKS][FRAGS_N_PER_WARP / 2][2][8];
-    #else
-        register float dacc[ROW_BLOCKS][FRAGS_N_PER_WARP / 2][8];
-    #endif
+    // (the Volta tile order swaps chunk pairs between octets in matmul, so it keeps the stock order's accumulators: see the plain kernel)
+    register float dacc[ROW_BLOCKS][FRAGS_N_PER_WARP / 2][8];
     // A smem stage captured per pipeline buffer at load_frags time: matmul must
     // read the A stage that matches the B fragments staged for that buffer, and
     // advance1() has already moved sh1_a_ptr on by the time matmul runs.
@@ -307,19 +303,8 @@ void exl3_gemm_kernel_inner_m64
         for (int rb = 0; rb < ROW_BLOCKS; ++rb)
             #pragma unroll
             for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
-            #if EXL3_VOLTA_LAYOUT
             #pragma unroll
-            for (int h = 0; h < 2; ++h)
-            #endif
-            #pragma unroll
-            for (int i = 0; i < 8; ++i)
-            {
-                #if EXL3_VOLTA_LAYOUT
-                dacc[rb][r][h][i] = 0.0f;
-                #else
-                dacc[rb][r][i] = 0.0f;
-                #endif
-            }
+            for (int i = 0; i < 8; ++i) dacc[rb][r][i] = 0.0f;
     };
 
     auto wait_stage = [&] ()
@@ -347,23 +332,6 @@ void exl3_gemm_kernel_inner_m64
                 {
                     float* tile = sh_c + warp_id * (FRAGS_N_PER_WARP * 128);
                     const int q_ = (lane_id >> 2) & 3;
-                    #if EXL3_VOLTA_LAYOUT
-                    #pragma unroll
-                    for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
-                    #pragma unroll
-                    for (int h = 0; h < 2; ++h)
-                    #pragma unroll
-                    for (int i = 0; i < 8; ++i)
-                    {
-                        float v = dacc[rb][r][h][i];
-                        v += __shfl_xor_sync(0xffffffffu, v, 8);   // the octet pair (q, q ^ 2) holds the two k halves of one n8 block
-                        if (q_ < 2)
-                        {
-                            int m, n; volta_d_slot(lane_id, i, &m, &n);
-                            tile[(2 * r + (q_ & 1)) * 128 + (m + 8 * h) * 8 + n] = v;
-                        }
-                    }
-                    #else
                     #pragma unroll
                     for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
                     #pragma unroll
@@ -372,7 +340,6 @@ void exl3_gemm_kernel_inner_m64
                         int m, n; volta_d_slot(lane_id, i, &m, &n);
                         tile[(2 * r + (q_ & 1)) * 128 + (m + 8 * (q_ >> 1)) * 8 + n] = dacc[rb][r][i];
                     }
-                    #endif
                     __syncwarp();
                     const int g_ = lane_id >> 2, t_ = lane_id & 3;
                     #pragma unroll
@@ -498,28 +465,41 @@ void exl3_gemm_kernel_inner_m64
     auto matmul = [&] (int buf)
     {
         #if EXL3_VOLTA_LAYOUT
-        // Volta tile order: the lane's decoded values are its B operands (frag_b[2r + s] = k chunk 2 * (q >> 1) + s of n8 half
-        // q & 1 of tile r). A is gathered per (row block, row half, chunk) from the swizzled stage.
+        // Volta tile order: frag_b[2r + s] is k chunk 2 * (q >> 1) + s of n8 half q & 1 of tile r, and lane l ^ 8 holds the same column's
+        // other two chunks. One swap per decoded pair gives every octet its n8 half over the whole k16, so the quarters split the rows
+        // (row half q >> 1) as in the stock order: 4 shuffles per 16-column tile instead of the stock order's 16, one set of accumulators.
         const int q_ = (lane_id >> 2) & 3;
+        const int rh = q_ >> 1;
+        uint32_t own[FRAGS_N_PER_WARP / 2][2][2], oth[FRAGS_N_PER_WARP / 2][2][2];
         #pragma unroll
-        for (int rb = 0; rb < ROW_BLOCKS; ++rb)
-        #pragma unroll
-        for (int h = 0; h < 2; ++h)
+        for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
         #pragma unroll
         for (int s_ = 0; s_ < 2; ++s_)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
         {
-            uint32_t a0, a1;
-            const int c = 2 * (q_ >> 1) + s_;
-            int k0 = sub_k * 16 + 4 * c;
-            int row_v = rb * 16 + 8 * h + (lane_id & 3) + 4 * (lane_id >= 16);
-            int c_swizzled = (k0 >> 3) ^ ((row_v >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
-            uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(
-                sh_a_buf[buf] + row_v * TILESIZE_K + c_swizzled * 8 + 4 * s_));
-            asm ("ld.shared.v2.b32 {%0,%1}, [%2];"
-                 : "=r"(a0), "=r"(a1) : "r"(addr));
+            own[r][s_][j] = *(const uint32_t*) &frag_b[buf][2 * r + s_][j];
+            oth[r][s_][j] = __shfl_xor_sync(0xffffffffu, own[r][s_][j], 8);
+        }
+        #pragma unroll
+        for (int c = 0; c < 4; ++c)
+        {
+            const bool mine = (c >> 1) == rh;
             #pragma unroll
-            for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
-                volta_mma_m8n8k4(a0, a1, *(const uint32_t*) &frag_b[buf][2 * r + s_][0], *(const uint32_t*) &frag_b[buf][2 * r + s_][1], dacc[rb][r][h]);
+            for (int rb = 0; rb < ROW_BLOCKS; ++rb)
+            {
+                uint32_t a0, a1;
+                int k0 = sub_k * 16 + 4 * c;
+                int row_v = rb * 16 + 8 * rh + (lane_id & 3) + 4 * (lane_id >= 16);
+                int c_swizzled = (k0 >> 3) ^ ((row_v >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
+                uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(
+                    sh_a_buf[buf] + row_v * TILESIZE_K + c_swizzled * 8 + 4 * (c & 1)));
+                asm ("ld.shared.v2.b32 {%0,%1}, [%2];"
+                     : "=r"(a0), "=r"(a1) : "r"(addr));
+                #pragma unroll
+                for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
+                    volta_mma_m8n8k4(a0, a1, mine ? own[r][c & 1][0] : oth[r][c & 1][0], mine ? own[r][c & 1][1] : oth[r][c & 1][1], dacc[rb][r]);
+            }
         }
         #else
         const int q_ = (lane_id >> 2) & 3;
@@ -801,14 +781,13 @@ void exl3_gemm_kernel_inner
         // accumulator per quarter-round, summed over the whole k column, converted to the
         // m16n8k16 C layout once per column in reduce().
         register uint32_t va[FRAG_STAGES][4][2];
-        #if EXL3_VOLTA_LAYOUT
-            // Volta tile order: every octet works on one n8 half of the tile and two of the four k4 chunks, so each of the
-            // (up to) two row halves keeps its own partial sums; the two octets that share an n8 half are added in reduce()
-            register float dacc[FRAGS_N_PER_WARP / 2][2][8];
-        #else
-            register float dacc[FRAGS_N_PER_WARP / 2][8];
-        #endif
+        // Volta tile order: an octet decodes one n8 half of the tile over two of the four k4 chunks. Up to 8 rows (VL_KSPLIT) it
+        // multiplies them as they are and the two octets that share an n8 half are added in reduce(); with more rows the octet pair
+        // swaps its chunk pairs (shfl_xor 8) so every octet holds its n8 half over the whole k16 and the quarters split the rows as
+        // in the stock order, which keeps one set of accumulators instead of one per row half
+        register float dacc[FRAGS_N_PER_WARP / 2][8];
     #endif
+    constexpr bool VL_KSPLIT = EXL3_VOLTA_LAYOUT && TILESIZE_M <= 8;
     #if EXL3_VOLTA && EXL3_SM70_HMMA
         constexpr bool volta = true;
     #else
@@ -893,36 +872,34 @@ void exl3_gemm_kernel_inner
             const int row_v_unclamped = 8 * (q_ >> 1) + (lane_id & 3) + 4 * (lane_id >= 16);
             const int row_in_tile = (TILESIZE_M == 4) ? (lane_id & 3) : ((lane_id & 3) + 4 * (lane_id >= 16));
             const int row_v = (TILESIZE_M < 16) ? (row_in_tile < size_m ? row_in_tile : 0) : row_v_unclamped;
-            #if EXL3_VOLTA_LAYOUT
-            // Volta tile order: the octet's k chunks are 2 * (q >> 1) + s, and its A rows come in two halves (h)
-            #pragma unroll
-            for (int h = 0; h < (TILESIZE_M > 8 ? 2 : 1); ++h)
+            if constexpr (VL_KSPLIT)
             {
-                const int row_h = (TILESIZE_M < 16) ? row_v : 8 * h + (lane_id & 3) + 4 * (lane_id >= 16);
+                // Volta tile order, up to 8 rows: the octet's k chunks are 2 * (q >> 1) + s
                 #pragma unroll
                 for (int s_ = 0; s_ < 2; ++s_)
                 {
                     int c = 2 * (q_ >> 1) + s_;
                     int k0 = sub_k * 16 + 4 * c;
-                    int c_swizzled = (k0 >> 3) ^ ((row_h >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
+                    int c_swizzled = (k0 >> 3) ^ ((row_v >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
                     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(
-                        sh1_a_ptr + row_h * TILESIZE_K + c_swizzled * 8 + 4 * s_));
+                        sh1_a_ptr + row_v * TILESIZE_K + c_swizzled * 8 + 4 * s_));
                     asm ("ld.shared.v2.b32 {%0,%1}, [%2];"
-                         : "=r"(va[buf][2 * h + s_][0]), "=r"(va[buf][2 * h + s_][1]) : "r"(addr));
+                         : "=r"(va[buf][s_][0]), "=r"(va[buf][s_][1]) : "r"(addr));
                 }
             }
-            #else
-            #pragma unroll
-            for (int c = 0; c < 4; ++c)
+            else
             {
-                int k0 = sub_k * 16 + 4 * c;
-                int c_swizzled = (k0 >> 3) ^ ((row_v >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
-                uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(
-                    sh1_a_ptr + row_v * TILESIZE_K + c_swizzled * 8 + 4 * (c & 1)));
-                asm ("ld.shared.v2.b32 {%0,%1}, [%2];"
-                     : "=r"(va[buf][c][0]), "=r"(va[buf][c][1]) : "r"(addr));
+                #pragma unroll
+                for (int c = 0; c < 4; ++c)
+                {
+                    int k0 = sub_k * 16 + 4 * c;
+                    int c_swizzled = (k0 >> 3) ^ ((row_v >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
+                    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(
+                        sh1_a_ptr + row_v * TILESIZE_K + c_swizzled * 8 + 4 * (c & 1)));
+                    asm ("ld.shared.v2.b32 {%0,%1}, [%2];"
+                         : "=r"(va[buf][c][0]), "=r"(va[buf][c][1]) : "r"(addr));
+                }
             }
-            #endif
             #endif
         }
         else
@@ -968,15 +945,8 @@ void exl3_gemm_kernel_inner
             {
                 #pragma unroll
                 for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
-                #if EXL3_VOLTA_LAYOUT
-                #pragma unroll
-                for (int h = 0; h < 2; ++h)
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) dacc[r][h][i] = 0.0f;
-                #else
                 #pragma unroll
                 for (int i = 0; i < 8; ++i) dacc[r][i] = 0.0f;
-                #endif
             }
         #endif
     };
@@ -1260,25 +1230,24 @@ void exl3_gemm_kernel_inner
                 for (int i = 0; i < 8; ++i) dbg2[lane_id * 8 + i] = dacc[0][i];
             }
 #endif
-            #if EXL3_VOLTA_LAYOUT
-            // the octet pair (q, q ^ 2) holds the two k halves of the same n8 block: add them, the lower octet writes
-            #pragma unroll
-            for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
-            #pragma unroll
-            for (int h = 0; h < (TILESIZE_M > 8 ? 2 : 1); ++h)
-            #pragma unroll
-            for (int i = 0; i < 8; ++i)
+            if constexpr (VL_KSPLIT)
             {
-                float v = dacc[r][h][i];
-                v += __shfl_xor_sync(0xffffffffu, v, 8);
-                if (q_ < 2)
+                // the octet pair (q, q ^ 2) holds the two k halves of the same n8 block: add them, the lower octet writes
+                #pragma unroll
+                for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
+                #pragma unroll
+                for (int i = 0; i < 8; ++i)
                 {
-                    int m, n; volta_d_slot(lane_id, i, &m, &n);
-                    tile[(2 * r + (q_ & 1)) * 128 + (m + 8 * h) * 8 + n] = v;
+                    float v = dacc[r][i];
+                    v += __shfl_xor_sync(0xffffffffu, v, 8);
+                    if (q_ < 2)
+                    {
+                        int m, n; volta_d_slot(lane_id, i, &m, &n);
+                        tile[(2 * r + (q_ & 1)) * 128 + m * 8 + n] = v;
+                    }
                 }
             }
-            #else
-            if (TILESIZE_M > 8 || (q_ >> 1 == 0))
+            else if (TILESIZE_M > 8 || (q_ >> 1 == 0))
             {
                 #pragma unroll
                 for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
@@ -1289,7 +1258,6 @@ void exl3_gemm_kernel_inner
                     tile[(2 * r + (q_ & 1)) * 128 + (m + 8 * (q_ >> 1)) * 8 + n] = dacc[r][i];
                 }
             }
-            #endif
             __syncwarp();
             const int g_ = lane_id >> 2, t_ = lane_id & 3;
             #pragma unroll
@@ -1392,16 +1360,42 @@ void exl3_gemm_kernel_inner
             // (silently reads the wrong register) and never a divergent mma.
             #if EXL3_VOLTA_LAYOUT
             // The lane's eight decoded values are already its m8n8k4 B operands: frag_b[2r + s] is k chunk 2 * (q >> 1) + s of the
-            // n8 half q & 1 of tile r, so there is nothing to move; the A operand of the same chunk comes from va
-            #pragma unroll
-            for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
-            #pragma unroll
-            for (int h = 0; h < (TILESIZE_M > 8 ? 2 : 1); ++h)
-            #pragma unroll
-            for (int s_ = 0; s_ < 2; ++s_)
+            // n8 half q & 1 of tile r; the A operand of the same chunk comes from va
+            if constexpr (VL_KSPLIT)
             {
-                volta_mma_m8n8k4(va[buf][2 * h + s_][0], va[buf][2 * h + s_][1],
-                                 *(const uint32_t*) &frag_b[buf][2 * r + s_][0], *(const uint32_t*) &frag_b[buf][2 * r + s_][1], dacc[r][h]);
+                #pragma unroll
+                for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
+                #pragma unroll
+                for (int s_ = 0; s_ < 2; ++s_)
+                {
+                    volta_mma_m8n8k4(va[buf][s_][0], va[buf][s_][1],
+                                     *(const uint32_t*) &frag_b[buf][2 * r + s_][0], *(const uint32_t*) &frag_b[buf][2 * r + s_][1], dacc[r]);
+                }
+            }
+            else
+            {
+                // More rows: lane l ^ 8 holds the same column's other two chunks; after the swap the octet covers the whole k16 and the
+                // quarters' A rows are 8 * (q >> 1) + ... as in the stock order
+                const int q_ = (lane_id >> 2) & 3;
+                #pragma unroll
+                for (int r = 0; r < FRAGS_N_PER_WARP / 2; ++r)
+                {
+                    uint32_t own[2][2], oth[2][2];
+                    #pragma unroll
+                    for (int s_ = 0; s_ < 2; ++s_)
+                    #pragma unroll
+                    for (int j = 0; j < 2; ++j)
+                    {
+                        own[s_][j] = *(const uint32_t*) &frag_b[buf][2 * r + s_][j];
+                        oth[s_][j] = __shfl_xor_sync(0xffffffffu, own[s_][j], 8);
+                    }
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        const bool mine = (c >> 1) == (q_ >> 1);
+                        volta_mma_m8n8k4(va[buf][c][0], va[buf][c][1], mine ? own[c & 1][0] : oth[c & 1][0], mine ? own[c & 1][1] : oth[c & 1][1], dacc[r]);
+                    }
+                }
             }
             #else
             const int q_ = (lane_id >> 2) & 3;

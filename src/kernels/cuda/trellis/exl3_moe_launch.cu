@@ -130,9 +130,7 @@ void exl3_moe(
 	// the widest tile of the three (width codes do not order by size: 11 is 3.5 bpw)
 	int K_max = K_gate;
 	for ( int kq : { K_up, K_down } ) if ( engine::modules::trellis_tile_u16( kq ) > engine::modules::trellis_tile_u16( K_max ) ) K_max = kq;
-	// The Volta tile order takes the 128-wide tiles at every width: its lane groups split k rather than rows, so a lane keeps a partial sum per
-	// row half, and the 256-wide wide-prefill tile would hold twice the stock tile's accumulators (one block per SM instead of two)
-	const bool tile128 = EXL3_VOLTA_LAYOUT || mixed || K_gate != 3 || intermediate_dim % 256 != 0;
+	const bool tile128 = mixed || K_gate != 3 || intermediate_dim % 256 != 0;
 	ENGINE_ASSERT( intermediate_dim % ( tile128 ? 128 : 256 ) == 0, "exl3_moe: intermediate width vs the output tile" );
 	const int variant = mixed ? ( has_half ? 7 : 6 ) : K_gate == 9 ? 10 : K_gate == 10 ? 8 : K_gate == 11 ? 9 : K_gate == 5 ? 4 : K_gate == 4 ? 2 : K_gate == 2 ? 3 : K_gate == 1 ? 5 : ( tile128 ? 1 : 0 );   // 0: <3,256>, 1: <3,128>, 2: <4,128>, 3: <2,128>, 4: <5,128> (DeepSeek-V4.1's few 5-bit experts), 5: <1,128>
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_done[device][variant] ) {
