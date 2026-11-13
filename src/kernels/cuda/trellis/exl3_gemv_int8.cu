@@ -2,6 +2,7 @@
 #include "exl3_gemv_int8.cuh"
 #include "exl3_gemv_int8_kernel.cuh"
 #include "trellis_context.h"
+#include "engine/runtime/options.h"
 #include "exl3_kernel_map.cuh"
 #include <cstdio>
 #include <cstdlib>
@@ -30,7 +31,7 @@ namespace {
 // 0: disabled; 1: int8 + error-feedback residual pass (~15-16 bit activation precision);
 // 2: plain int8 (cheaper, lossy).
 int int8_mode() {
-	return 1;
+	return engine::runtime::options().gemv_int8 ? 1 : 0;
 }
 
 // Smem-staged unit routing. Upstream measured K = 3, 5, 7 on Ampere, where cp.async hides the

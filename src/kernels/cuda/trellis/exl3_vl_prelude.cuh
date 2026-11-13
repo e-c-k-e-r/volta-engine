@@ -16,8 +16,11 @@
 #include <map>
 #include <set>
 #include <stdint.h>
+#include <string>
+#include <vector>
 #include "engine/config.h"
 #include "engine/modules/moe.h"
 #include "engine/modules/trellis_bits.h"
+#include "engine/runtime/options.h"
 #include "trellis_context.h"
 #include "exl3_moe_coop.cuh"

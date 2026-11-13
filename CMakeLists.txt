@@ -593,6 +593,10 @@ add_executable(bench_all_reduce tests/3_bench/bench_all_reduce.cpp)
 target_link_libraries(bench_all_reduce PRIVATE engine_kernels)
 set_target_properties(bench_all_reduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(bench_kernels tests/3_bench/bench_kernels.cpp)
+target_link_libraries(bench_kernels PRIVATE engine_kernels)
+set_target_properties(bench_kernels PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(bench_trellis_order tests/3_bench/bench_trellis_order.cpp)
 target_link_libraries(bench_trellis_order PRIVATE engine_kernels)
 set_target_properties(bench_trellis_order PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
