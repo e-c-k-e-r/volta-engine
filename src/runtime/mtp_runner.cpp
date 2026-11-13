@@ -156,21 +156,28 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 	const int catch_rows = S.pend_n;
 	const bool sparse = sparse_round_begin();
 	const auto t_round = std::chrono::steady_clock::now();
-	mc.mtp_step( slot, S.pend_pos, S.pend_n, toks, 2, off + S.hist_base, true );
-	int cands[pod::MAX_BATCH];
-	cands[0] = mc.sample_one();
-	const auto t_catch = std::chrono::steady_clock::now();
-	// A draft step costs about as much as 1/6 of a token; stop chaining once the chance that the block is still alive drops below that
+	// A draft step costs about as much as 1/6 of a token; stop chaining once the chance that the block is still alive drops below that. The
+	// survival estimate does not depend on the drafted tokens, so the round's length is known before the first step and the chain runs on the device.
 	constexpr float kMinSurvival = 0.3f;
 	float alive = 1.0f;
 	int drafted = 1;
 	for ( int k = 1; k < active; ++k ) {
 		alive *= cond_[k - 1];
 		if ( alive < kMinSurvival ) break;
-		mc.mtp_step( slot, pos - 1 + k, 1, &cands[k - 1], 3, 0, true );
-		cands[k] = mc.sample_one();
 		++drafted;
 	}
+	int cands[pod::MAX_BATCH];
+	auto t_catch = std::chrono::steady_clock::now();
+	if ( !mc.mtp_chain( slot, S.pend_pos, S.pend_n, toks, off + S.hist_base, pos, drafted, cands ) ) {
+		mc.mtp_step( slot, S.pend_pos, S.pend_n, toks, 2, off + S.hist_base, true );
+		cands[0] = mc.sample_one();
+		t_catch = std::chrono::steady_clock::now();
+		for ( int k = 1; k < drafted; ++k ) {
+			mc.mtp_step( slot, pos - 1 + k, 1, &cands[k - 1], 3, 0, true );
+			cands[k] = mc.sample_one();
+		}
+	}
+	else t_catch = t_round;   // the chain runs the catch-up with the steps: its time counts as draft time
 	active = drafted;
 	res.proposed = active;
 	const auto t_draft = std::chrono::steady_clock::now();

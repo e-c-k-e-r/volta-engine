@@ -157,6 +157,9 @@ public:
 	void mtp_step( int slot, int pos0, int count, const int* tokens, int hidden_mode, int hist_row0, bool logits_last );
 	void mtp_save_hist( int src_row, int rows, int dst_row );
 	// Joint rounds (see ModelPipeline::mtp_step_rows): rows of several slots in one head step, logits for rows out_rows[0 .. n_out) only
+	// The MTP draft chain on the device: catch-up over pend_n pending rows from pend_pos (the last takes catch_tokens' anchor), then steps - 1 head
+	// steps at pos ..; the drafted tokens into out. False when the model or the mtp_chain option says no (step the head from the host then).
+	bool mtp_chain( int slot, int pend_pos, int pend_n, const int* catch_tokens, int hist_row0, int pos, int steps, int* out );
 	bool mtp_joint() const;
 	void mtp_step_rows( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out );
 	// Sparse drafter head (sparse_head option): the vocabulary ids in `ids`, most important first, become the draft head's subset; each rank

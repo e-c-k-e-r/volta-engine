@@ -281,6 +281,11 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 		d_argmax_val_ = static_cast<float*>( engine::core::arena_alloc( arena, R * sizeof( float ) ) );
 		h_argmax_idx_ = static_cast<int*>( engine::core::host_alloc_pinned( R * sizeof( int ) ) );
 		std::memset( h_argmax_idx_, 0, R * sizeof( int ) );
+		// the MTP draft chain: the token each step feeds the next, the drafted tokens, the cross-rank argmax row
+		chain_tok_ = static_cast<int*>( engine::core::arena_alloc( arena, sizeof( int ) ) );
+		chain_out_ = static_cast<int*>( engine::core::arena_alloc( arena, pod::MAX_BATCH * sizeof( int ) ) );
+		int chain_row_shape[2] = { 1, kChainRowWidth };
+		chain_row_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, chain_row_shape, 2 );
 		const int splits = ( lm_shard_cols_ + kTopkTile - 1 ) / kTopkTile;
 		const size_t per = static_cast<size_t>( R ) * splits * 16;
 		samp_part_v_ = static_cast<float*>( engine::core::arena_alloc( arena, per * sizeof( float ) ) );
@@ -1447,7 +1452,43 @@ void Qwen4ExpPipeline::mtp_gather_hist( const int* src_rows, int count, backend:
 	}
 }
 
-void Qwen4ExpPipeline::mtp_step_impl( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, bool logits, backend::stream_t stream ) {
+// The MTP draft chain without a host round trip per step: the catch-up over the pending rows, then steps - 1 head steps, each fed the token the one
+// before picked on the device (shard argmax, a cross-rank all-reduce of the winners, pick); the drafted tokens collect in chain_out_ for
+// mtp_chain_read. rows[0] is the catch-up (hidden mode 2 from the history at hist_row0), rows[k] the single row of step k (hidden mode 3). The head
+// steps themselves replay graphs (mtp_step_impl).
+bool Qwen4ExpPipeline::mtp_chain( const pod::BatchRows* rows, const int* catch_tokens, int hist_row0, int steps, backend::stream_t stream ) {
+#if ENGINE_BACKEND_CUDA
+	ENGINE_ASSERT( steps >= 1 && steps <= pod::MAX_BATCH && 3 * tp_ <= kChainRowWidth, "Qwen4ExpPipeline::mtp_chain: steps out of range" );
+	const int last = rows[0].count - 1, zero = 0;
+	auto pick = [&]( int step ) {
+		logits_.shape[0] = 1;
+		engine::modules::Elementwise::batched_argmax_range( logits_, d_argmax_idx_, d_argmax_val_, lm_shard_real_cols_, 1, rank_ * lm_shard_real_cols_, stream );
+		engine::spec::shard_argmax_pack( d_argmax_idx_, d_argmax_val_, chain_row_.ptr<backend::half_t>(), ring_ ? rank_ : 0, kChainRowWidth, stream );
+		if ( ring_ ) ring_->all_reduce( chain_row_, stream );
+		engine::spec::shard_argmax_pick( chain_row_.ptr<const backend::half_t>(), ring_ ? tp_ : 1, chain_tok_, chain_out_, step, stream );
+	};
+	mtp_step_impl( rows[0], catch_tokens, 2, hist_row0, &last, 1, true, stream );
+	pick( 0 );
+	for ( int k = 1; k < steps; ++k ) {
+		mtp_step_impl( rows[k], nullptr, 3, 0, &zero, 1, true, stream, chain_tok_ );
+		pick( k );
+	}
+	return true;
+#else
+	( void ) rows; ( void ) catch_tokens; ( void ) hist_row0; ( void ) steps; ( void ) stream;
+	return false;
+#endif
+}
+
+void Qwen4ExpPipeline::mtp_chain_read( int* out, int steps, backend::stream_t stream ) {
+	backend::set_device( rank_ );
+	backend::memcpy_async( h_argmax_idx_, chain_out_, steps * sizeof( int ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
+	std::memcpy( out, h_argmax_idx_, steps * sizeof( int ) );
+}
+
+void Qwen4ExpPipeline::mtp_step_impl( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, bool logits, backend::stream_t stream,
+	const int* d_tokens ) {
 	ENGINE_ASSERT( mtp_on_ && weights_loaded_, "Qwen4ExpPipeline::mtp_step: no MTP head" );
 	backend::set_device( rank_ );
 	const int m = rows.count;
@@ -1461,7 +1502,36 @@ void Qwen4ExpPipeline::mtp_step_impl( const pod::BatchRows& rows, const int* tok
 	backend::memcpy_async( d_rows_, &rows, rows.upload_bytes(), backend::Copy::H2D, stream );
 
 	// 1. embedding branch
-	backend::memcpy_async( d_token_ids_, tokens, m * sizeof( int ), backend::Copy::H2D, stream );
+	if ( d_tokens != nullptr ) backend::memcpy_async( d_token_ids_, d_tokens, m * sizeof( int ), backend::Copy::D2D, stream );
+	else backend::memcpy_async( d_token_ids_, tokens, m * sizeof( int ), backend::Copy::H2D, stream );
+	// Decode-sized head steps replay graphs (the body reads only device state once the rows and tokens are uploaded): a chain step (one row
+	// from the previous step's output) and a catch-up over history rows, which are staged into mtp_src_ first so no per-call pointer is captured.
+	// One output row, its logits; the sparse head's subset size is a launch argument, so a rebuilt subset drops the graphs.
+	const bool graph = runtime::options().mtp_graph && logits && n_out == 1 && out_rows[0] == m - 1 && m <= pod::MAX_BATCH
+		&& ( ( hidden_mode == 3 && m == 1 ) || hidden_mode == 2 );
+	if ( graph ) {
+		if ( sparse_.count() != mtp_graph_cols_ ) {
+			mtp_graphs_.reset();
+			mtp_catch_graphs_.reset();
+			mtp_graph_cols_ = sparse_.count();
+		}
+		int mode = hidden_mode;
+		if ( hidden_mode == 2 ) {
+			backend::memcpy_async( mtp_src_, mtp_hist_ + static_cast<size_t>( hist_row0 ) * hc * H, static_cast<size_t>( m ) * stack, backend::Copy::D2D, stream );
+			mode = 4;
+		}
+		const int out_row = m - 1;
+		( hidden_mode == 2 ? mtp_catch_graphs_ : mtp_graphs_ ).run( m, stream, [&]( backend::stream_t s ) { mtp_body( m, mode, 0, &out_row, 1, true, s ); }, sparse_.in_use() ? 1 : 0 );
+		logits_.shape[0] = 1;
+		last_rows_ = 1;
+		return;
+	}
+	mtp_body( m, hidden_mode, hist_row0, out_rows, n_out, logits, stream );
+}
+
+void Qwen4ExpPipeline::mtp_body( int m, int hidden_mode, int hist_row0, const int* out_rows, int n_out, bool logits, backend::stream_t stream ) {
+	const int H = config_.hidden_size, hc = config_.hc_mult;
+	const size_t stack = static_cast<size_t>( hc ) * H * sizeof( float );
 	pod::TensorView emb = pod::make_tensor_2d( mtp_emb_.data, pod::DType::FP16, m, H );
 	pod::TensorView xe = pod::make_tensor_2d( mtp_xe_.data, pod::DType::FP16, m, H );
 	pod::TensorView e2 = pod::make_tensor_2d( mtp_e2_.data, pod::DType::FP16, m, H );

@@ -1297,6 +1297,42 @@ __global__ void logits_lse_shard_kernel( const half* __restrict__ logits, int ro
 	}
 }
 
+namespace {
+
+__global__ void shard_argmax_pack_kernel( const int* __restrict__ idx, const float* __restrict__ val, half* __restrict__ row, int rank, int width ) {
+	const int i = threadIdx.x;
+	if ( i >= width ) return;
+	const int id = idx[0];
+	float v = 0.0f;
+	if ( i == 3 * rank ) v = val[0];
+	else if ( i == 3 * rank + 1 ) v = static_cast<float>( id >> 11 );
+	else if ( i == 3 * rank + 2 ) v = static_cast<float>( id & 2047 );
+	row[i] = __float2half_rn( v );
+}
+
+__global__ void shard_argmax_pick_kernel( const half* __restrict__ row, int ranks, int* __restrict__ tok, int* __restrict__ out, int step ) {
+	if ( threadIdx.x != 0 ) return;
+	int best = -1;
+	float best_val = 0.0f;
+	for ( int r = 0; r < ranks; ++r ) {
+		const float v = __half2float( row[3 * r] );
+		const int id = ( static_cast<int>( __half2float( row[3 * r + 1] ) ) << 11 ) | static_cast<int>( __half2float( row[3 * r + 2] ) );
+		if ( best < 0 || v > best_val || ( v == best_val && id < best ) ) { best = id; best_val = v; }
+	}
+	tok[0] = best;
+	out[step] = best;
+}
+
+} // namespace
+
+void shard_argmax_pack( const int* idx, const float* val, backend::half_t* row, int rank, int width, cudaStream_t stream ) {
+	shard_argmax_pack_kernel<<<1, 128, 0, stream>>>( idx, val, reinterpret_cast<half*>( row ), rank, width );
+}
+
+void shard_argmax_pick( const backend::half_t* row, int ranks, int* tok, int* out, int step, cudaStream_t stream ) {
+	shard_argmax_pick_kernel<<<1, 32, 0, stream>>>( reinterpret_cast<const half*>( row ), ranks, tok, out, step );
+}
+
 void logits_lse_shard( const half* logits, int rows, int row_stride, int columns, float* out, cudaStream_t stream ) {
 	if ( rows <= 0 || columns <= 0 ) return;
 	logits_lse_shard_kernel<<<rows, 256, 0, stream>>>( logits, row_stride, columns, out );

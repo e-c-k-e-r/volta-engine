@@ -168,6 +168,8 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `hc_rows` | bool | `true` | `ENGINE_DEBUG_HC_ROWS` | GLM: prefill chunks compute the hyper-connection mix four rows to a block, so the mixing matrix is read once per four rows instead of once per row (bit-identical; false = one row per block, A/B) |
 | `hc_fuse` | bool | `true` | `ENGINE_DEBUG_HC_FUSE` | GLM and DeepSeek-V4.1: decode-sized rows reduce the attention or FFN output and apply the hyper-connection post-step in one kernel (false = all-reduce and update as two launches, for A/B) |
 | `normed_add_fuse` | bool | `true` | `ENGINE_DEBUG_NORMED_ADD_FUSE` | Gemma 4: each sublayer output's all-reduce carries the sandwich-norm residual add and the next sublayer's norm in one kernel (false = all-reduce, add and norm as three launches, for A/B) |
+| `mtp_chain` | bool | `true` | `ENGINE_DEBUG_MTP_CHAIN` | MTP speculation (Flash-Next): the draft steps of a round run back to back on the device, each fed the previous step's argmax, with one host round trip per round (false = a round trip per step, for A/B) |
+| `mtp_graph` | bool | `true` | `ENGINE_DEBUG_MTP_GRAPH` | MTP speculation (Flash-Next): decode-sized head steps (the chain's one-row steps and the catch-up) replay CUDA graphs instead of launching their kernels one by one (false for A/B) |
 | `qsa_off` | bool | `false` | `ENGINE_DEBUG_QSA_OFF` | qwen4_exp: attend densely past the QSA budget (A/B against the sparse selection) |
 | `router_fp16` | bool | `false` | `ENGINE_DEBUG_ROUTER_FP16` | qwen4_exp: round the router logits to fp16 before the top-k, as the exllamav3 router stores them |
 | `spec_ctrl_log` | bool | `false` | `ENGINE_DEBUG_SPEC_CTRL_LOG` | speculation controller decisions |

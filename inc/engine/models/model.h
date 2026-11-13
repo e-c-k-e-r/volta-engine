@@ -303,6 +303,10 @@ public:
 	// Joint rounds: rows of several slots in one head step, logits (and the chained stack) for the rows out_rows[0 .. n_out) only; hidden_mode 4 =
 	// the stacks staged by mtp_gather_hist. A model that cannot returns false from mtp_joint().
 	virtual bool mtp_joint() const { return false; }
+	// The draft chain on the device (catch-up + steps - 1 head steps, each fed the previous step's argmax without a host round trip); false when
+	// the model cannot, and the runner steps the head from the host. mtp_chain_read waits for it and copies the drafted tokens (one rank).
+	virtual bool mtp_chain( const pod::BatchRows* rows, const int* catch_tokens, int hist_row0, int steps, backend::stream_t stream = nullptr ) { (void) rows; (void) catch_tokens; (void) hist_row0; (void) steps; (void) stream; return false; }
+	virtual void mtp_chain_read( int* out, int steps, backend::stream_t stream = nullptr ) { (void) out; (void) steps; (void) stream; ENGINE_ASSERT( false, "model has no MTP chain" ); }
 	virtual void mtp_step_rows( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, backend::stream_t stream = nullptr ) { (void) rows; (void) tokens; (void) hidden_mode; (void) hist_row0; (void) out_rows; (void) n_out; (void) stream; ENGINE_ASSERT( false, "model has no joint MTP step" ); }
 	virtual void mtp_gather_hist( const int* src_rows, int count, backend::stream_t stream = nullptr ) { (void) src_rows; (void) count; (void) stream; ENGINE_ASSERT( false, "model has no joint MTP step" ); }
 	// Sparse drafter head (sparse_head option): the FP16 columns of this rank's vocabulary shard listed in cols (shard-local indices, at most

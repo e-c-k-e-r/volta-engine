@@ -18,6 +18,7 @@ public:
 	void init( pod::MemoryArena& arena, int hidden, int shard_real_cols, int shard_cols, int rows );
 	int cap() const { return cap_; }
 	bool in_use() const { return use_; }
+	int count() const { return count_; }   // the subset's columns (graphs of the draft head capture it)
 	void use( bool on ) { use_ = on && count_ > 0; }
 	// Reads columns cols[0 .. count) (shard-local) out of the head; false without a sparse head
 	bool set( const pod::LinearWeight& head, const int* cols, int count, int rank, backend::stream_t stream );

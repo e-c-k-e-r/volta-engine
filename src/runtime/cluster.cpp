@@ -367,6 +367,24 @@ void ModelCluster::sparse_head_use( bool on ) {
 	pool_.run( [&]( int d ) { models_[d]->sparse_head_use( on ); } );
 }
 
+bool ModelCluster::mtp_chain( int slot, int pend_pos, int pend_n, const int* catch_tokens, int hist_row0, int pos, int steps, int* out ) {
+	if ( !runtime::options().mtp_chain ) return false;
+	pod::BatchRows rows[pod::MAX_BATCH];
+	rows[0] = pod::BatchRows::causal( pend_n, pend_pos, slot );
+	apply_mrope( rows[0] );
+	for ( int k = 1; k < steps; ++k ) {
+		rows[k] = pod::BatchRows::causal( 1, pos - 1 + k, slot );
+		apply_mrope( rows[k] );
+	}
+	bool ok[ENGINE_NUM_GPUS] = {};
+	pool_.run( [&]( int d ) { ok[d] = models_[d]->mtp_chain( rows, catch_tokens, hist_row0, steps, streams_[d] ); } );
+	for ( int d = 0; d < tp_; ++d ) ENGINE_ASSERT( ok[d] == ok[0], "ModelCluster::mtp_chain: ranks disagree" );
+	if ( !ok[0] ) return false;
+	pool_.run( [&]( int d ) { backend::stream_sync( streams_[d] ); } );
+	models_[0]->mtp_chain_read( out, steps, streams_[0] );
+	return true;
+}
+
 bool ModelCluster::mtp_joint() const {
 	return models_[0] != nullptr && models_[0]->mtp_joint();
 }

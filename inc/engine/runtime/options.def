@@ -118,6 +118,8 @@ DEBUG_OPTION( bool, kda_rows, true, "GLM: prefill chunks compute the linear-atte
 DEBUG_OPTION( bool, hc_rows, true, "GLM: prefill chunks compute the hyper-connection mix four rows to a block, so the mixing matrix is read once per four rows instead of once per row (bit-identical; false = one row per block, A/B)" )
 DEBUG_OPTION( bool, hc_fuse, true, "GLM and DeepSeek-V4.1: decode-sized rows reduce the attention or FFN output and apply the hyper-connection post-step in one kernel (false = all-reduce and update as two launches, for A/B)" )
 DEBUG_OPTION( bool, normed_add_fuse, true, "Gemma 4: each sublayer output's all-reduce carries the sandwich-norm residual add and the next sublayer's norm in one kernel (false = all-reduce, add and norm as three launches, for A/B)" )
+DEBUG_OPTION( bool, mtp_chain, true, "MTP speculation (Flash-Next): the draft steps of a round run back to back on the device, each fed the previous step's argmax, with one host round trip per round (false = a round trip per step, for A/B)" )
+DEBUG_OPTION( bool, mtp_graph, true, "MTP speculation (Flash-Next): decode-sized head steps (the chain's one-row steps and the catch-up) replay CUDA graphs instead of launching their kernels one by one (false for A/B)" )
 DEBUG_OPTION( bool, qsa_off, false, "qwen4_exp: attend densely past the QSA budget (A/B against the sparse selection)" )
 DEBUG_OPTION( bool, router_fp16, false, "qwen4_exp: round the router logits to fp16 before the top-k, as the exllamav3 router stores them" )
 DEBUG_OPTION( bool, spec_ctrl_log, false, "speculation controller decisions" )

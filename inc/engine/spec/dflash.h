@@ -150,6 +150,13 @@ void dflash2_topk(
 // stride is `row_stride` (the padded shard width), and adds `index_offset` so the winner is a global
 // token id. The scratch is caller-owned, so this is safe inside a CUDA graph and per device, unlike
 // dflash2_topk's process-global lazily-allocated scratch.
+// Device-side argmax across vocabulary shards (the MTP draft chain, no host round trip per step). pack writes this rank's winner of one row
+// (idx[0], a global token id, and val[0], a logit read from FP16) into its three slots of a [1, width] FP16 row whose other slots it zeroes:
+// the logit, then the id as two 11-bit halves, all exact in FP16, so an all-reduce of the row hands every rank every rank's winner. pick takes
+// the largest logit over `ranks` slots, ties to the lower id as ModelCluster::sample does, into tok[0] and out[step].
+void shard_argmax_pack( const int* idx, const float* val, backend::half_t* row, int rank, int width, backend::stream_t stream );
+void shard_argmax_pick( const backend::half_t* row, int ranks, int* tok, int* out, int step, backend::stream_t stream );
+
 // Per row: the max of the shard's first `columns` logits and the sum of exp( x - max ), written as out[2 * row] and out[2 * row + 1]
 void logits_lse_shard( const backend::half_t* logits, int rows, int row_stride, int columns, float* out, backend::stream_t stream );
 

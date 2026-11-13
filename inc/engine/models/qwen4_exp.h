@@ -140,7 +140,11 @@ public:
 	bool expert_heat( std::vector<uint32_t>& out, int& layers, int& experts, bool reset = false ) override;
 	bool rebalance_experts( backend::stream_t stream = nullptr ) override;
 	void mtp_step( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, bool logits_last, backend::stream_t stream = nullptr ) override;
-	void mtp_step_impl( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, bool logits, backend::stream_t stream );
+	bool mtp_chain( const pod::BatchRows* rows, const int* catch_tokens, int hist_row0, int steps, backend::stream_t stream = nullptr ) override;
+	void mtp_chain_read( int* out, int steps, backend::stream_t stream = nullptr ) override;
+	void mtp_body( int m, int hidden_mode, int hist_row0, const int* out_rows, int n_out, bool logits, backend::stream_t stream );
+	void mtp_step_impl( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, bool logits, backend::stream_t stream,
+		const int* d_tokens = nullptr );
 	void mtp_save_hist( int src_row, int rows, int dst_row, backend::stream_t stream = nullptr ) override;
 	bool mtp_joint() const override { return true; }
 	void mtp_step_rows( const pod::BatchRows& rows, const int* tokens, int hidden_mode, int hist_row0, const int* out_rows, int n_out, backend::stream_t stream = nullptr ) override;
@@ -242,6 +246,9 @@ private:
 
 	pod::BatchRows* d_rows_ = nullptr;
 	engine::core::GraphCache graphs_;
+	engine::core::GraphCache mtp_graphs_;         // the one-row draft-chain step of the MTP head (variant 1: the sparse head)
+	engine::core::GraphCache mtp_catch_graphs_;   // the catch-up step over 1 to MAX_BATCH history rows (variant 1: the sparse head)
+	int mtp_graph_cols_ = 0;                      // the sparse subset size the MTP graphs were captured with
 	const pod::BatchRows* ple_rows_ = nullptr;   // prefill: rows whose n-gram embeddings are decoded at the PLE layer
 	int* d_token_ids_ = nullptr;
 	pod::TensorView embed_table_;
@@ -293,6 +300,10 @@ private:
 	int full_logits_rows_ = 0;
 	static constexpr int kTopkTile = 4096;
 	int* d_argmax_idx_ = nullptr;
+	static constexpr int kChainRowWidth = 128;   // FP16 slots of the chain's cross-rank argmax row (3 per rank; the all-reduce takes multiples of 128)
+	int* chain_tok_ = nullptr;
+	int* chain_out_ = nullptr;
+	pod::TensorView chain_row_;
 	float* d_argmax_val_ = nullptr;
 	int* h_argmax_idx_ = nullptr;
 	float* samp_part_v_ = nullptr;
