@@ -11,6 +11,7 @@
 #include <cstring>
 #include <string>
 #include <filesystem>
+#include <chrono>
 #include <unistd.h>
 
 using namespace engine::runtime;
@@ -246,6 +247,40 @@ int main( int argc, char** argv ) {
 			for ( int j = 0; j < disk_c.n; ++j ) disk_diff = std::max( disk_diff, std::fabs( disk_c.logits[j] - cold_c.logits[j] ) );
 			expect( disk_tokens == cold && disk_diff < 0.25f, "a restore from disk continues like the cold run" );
 			std::printf( "    disk restore: max |dlogit| %.4g\n", disk_diff );
+
+			// shared budget: a cache of another fingerprint under the same root evicts the oldest file of any directory first
+			{
+				namespace fs = std::filesystem;
+				const fs::path other = fs::path( dir ) / "0000000000000000";
+				fs::create_directories( other );
+				{
+					std::FILE* f = std::fopen( ( other / "stale.snap" ).c_str(), "wb" );
+					const std::vector<char> z( size_t( 1 ) << 20 );
+					std::fwrite( z.data(), 1, z.size(), f );
+					std::fclose( f );
+				}
+				fs::last_write_time( other / "stale.snap", fs::file_time_type::clock::now() - std::chrono::hours( 24 * 365 ) );
+				auto snaps = [&]( const fs::path& root ) {
+					std::vector<fs::path> v;
+					for ( const auto& sub : fs::directory_iterator( root ) )
+						if ( sub.is_directory() ) for ( const auto& de : fs::directory_iterator( sub.path() ) ) if ( de.path().extension() == ".snap" ) v.push_back( de.path() );
+					return v;
+				};
+				size_t held = 0;
+				for ( const auto& f : snaps( dir ) ) held += fs::file_size( f );
+				mc.reset_slot( 0 );
+				mc.prefill( ids.data(), 1024, 0 );
+				ModelCluster::SeqSnapshot sn;
+				ENGINE_ASSERT( mc.save_snapshot( 0, 0, 1024, &sn ), "save_snapshot failed" );
+				const size_t incoming = sn.bytes * mc.tp();
+				{
+					PrefixCache d3( mc, size_t( 64 ) << 30 );
+					expect( d3.enable_disk( dir, "test_prefix_restore shared budget", held + incoming - ( size_t( 1 ) << 20 ) ), "disk tier on (another fingerprint)" );
+					ENGINE_ASSERT( d3.insert( nullptr, prefix( 1024 ), sn, false ), "insert failed" );
+				}
+				const auto after = snaps( dir );
+				expect( !fs::exists( other / "stale.snap" ) && after.size() == 4, "the shared budget drops the oldest file of another directory, not the newer ones" );
+			}
 			std::error_code ec;
 			std::filesystem::remove_all( dir, ec );
 		}

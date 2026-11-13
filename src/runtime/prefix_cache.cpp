@@ -106,13 +106,40 @@ std::string PrefixCache::disk_path( const std::vector<int>& tokens ) const {
 void PrefixCache::disk_evict_for( size_t incoming ) {
 	size_t held = 0;
 	for ( const DiskEntry& d : disk_ ) held += d.bytes * cluster_.tp();
+	// The other model directories under the same root (other checkpoints, or this one with other options) share the budget: their
+	// snapshots count by file size and age by modification time (a read refreshes it), so the oldest file goes whichever server wrote it
+	struct Other { std::filesystem::path path; size_t bytes; uint64_t used; };
+	std::vector<Other> others;
+	std::error_code ec;
+	for ( const auto& sub : std::filesystem::directory_iterator( std::filesystem::path( disk_dir_ ).parent_path(), ec ) ) {
+		std::error_code ec2;
+		if ( !sub.is_directory( ec2 ) || std::filesystem::equivalent( sub.path(), disk_dir_, ec2 ) ) continue;
+		for ( const auto& de : std::filesystem::directory_iterator( sub.path(), ec2 ) ) {
+			std::error_code ec3;
+			if ( de.path().extension() != ".snap" ) continue;
+			const size_t bytes = static_cast<size_t>( de.file_size( ec3 ) );
+			const auto t = de.last_write_time( ec3 );
+			if ( ec3 ) continue;
+			others.push_back( { de.path(), bytes, static_cast<uint64_t>( t.time_since_epoch().count() ) } );
+			held += bytes;
+		}
+	}
 	while ( held + incoming > disk_budget_ ) {
 		size_t victim = disk_.size();
 		for ( size_t k = 0; k < disk_.size(); ++k ) {
 			if ( disk_[k].ready && ( victim == disk_.size() || disk_[k].last_used < disk_[victim].last_used ) ) victim = k;
 		}
+		size_t other = others.size();
+		for ( size_t k = 0; k < others.size(); ++k ) {
+			if ( other == others.size() || others[k].used < others[other].used ) other = k;
+		}
+		if ( other < others.size() && ( victim == disk_.size() || others[other].used < disk_[victim].last_used ) ) {
+			std::filesystem::remove( others[other].path, ec );
+			held -= others[other].bytes;
+			others.erase( others.begin() + static_cast<long>( other ) );
+			continue;
+		}
 		if ( victim == disk_.size() ) return;   // only writes in flight: the budget is exceeded until they land
-		std::error_code ec;
 		std::filesystem::remove( disk_[victim].path, ec );
 		held -= disk_[victim].bytes * cluster_.tp();
 		disk_.erase( disk_.begin() + static_cast<long>( victim ) );
@@ -202,11 +229,21 @@ PrefixCache::Entry* PrefixCache::load_disk( size_t index, Entry* parent ) {
 	ModelCluster::SeqSnapshot snap;
 	if ( !cluster_.alloc_snapshot( d.from, static_cast<int>( d.tokens.size() ), d.with_taps, d.bytes, &snap ) ) return nullptr;
 	std::FILE* f = std::fopen( d.path.c_str(), "rb" );
+	if ( !f ) {
+		// another server sharing the disk budget evicted it
+		cluster_.free_snapshot( &snap );
+		std::lock_guard<std::mutex> lock( disk_mtx_ );
+		for ( size_t k = 0; k < disk_.size(); ++k ) {
+			if ( disk_[k].path == d.path ) { disk_.erase( disk_.begin() + static_cast<long>( k ) ); break; }
+		}
+		LOG_INFO( "[prefix] disk tier: %s is gone (evicted by another directory's server)\n", d.path.c_str() );
+		return nullptr;
+	}
 	DiskHeader h{};
 	std::vector<int> tokens;
-	bool ok = f && read_header( f, &h, &tokens ) && tokens == d.tokens && static_cast<size_t>( h.bytes ) == d.bytes;
+	bool ok = read_header( f, &h, &tokens ) && tokens == d.tokens && static_cast<size_t>( h.bytes ) == d.bytes;
 	for ( int r = 0; ok && r < cluster_.tp(); ++r ) ok = std::fread( snap.host[r], 1, d.bytes, f ) == d.bytes;
-	if ( f ) std::fclose( f );
+	std::fclose( f );
 	if ( !ok ) {
 		cluster_.free_snapshot( &snap );
 		LOG_ERROR( "[prefix] disk tier: reading %s failed\n", d.path.c_str() );
