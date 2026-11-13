@@ -142,10 +142,11 @@ Cold prompts of 10-13K new tokens, tok/s:
 | | NVFP4 | 1950-2060 |
 | | GGUF IQ3_S | 850 |
 | GLM-5.3-Flash | EXL3 3.05 bpw, stock order | 970-990 |
-| | EXL3 3.05 bpw, Volta order | 340 |
+| | EXL3 3.05 bpw, Volta order | 710 |
 
-GLM's Volta order prefills at a third of the stock order's speed: the wide prefill form of the trellis MoE kernel spills more registers in the
-Volta-order build of the kernel.
+GLM's Volta order prefills slower than the stock order: in that order a lane's decoded values are the operands of two k-chunks rather than
+two row groups, so the wide prefill tile keeps twice the accumulators and runs one block per SM, and experts routed by 32 or more rows go to
+the dequantize + GEMM path instead (`moe_heavy_rows`). The Volta row is a 14K-token cold prompt.
 
 ## Settings for several requests
 
