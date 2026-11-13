@@ -37,20 +37,20 @@ Most inference engines treat Volta (SM_70) as a second class citizen and fall ba
 
 ### Metrics
 
-Decode speed through the streaming API, one request, 4x V100-SXM2-32GB at a 250 W cap (clocks free up to 1530 MHz), T=1 sampling, 256 new tokens. The numbers are real questions behind 8K tokens of filler, not a best case: the four prompts are listed because speculation speed depends on how predictable the answer is.
+Decode speed of one request through the streaming API on 4x V100-SXM2-32GB at 250 W, every expert on the GPUs (DeepSeek: 92%), greedy, thinking off. Agent turns are replayed from a recorded Claude Code session (13-20K-token prompts); math and code are GSM8K and MBPP problems. Each model's best speculator for the kind of text:
 
-| Model | Speculator | tok/s, 4 prompts (mean) |
-|---|---|---|
-| Qwen3.8-27B (NVFP4) | DFlash2 | 252, 263, 182, 81 (195) |
-| Qwen3.8-27B (EXL3 4.0 bpw) | DFlash2 | 163, 169, 138, 93 (141) |
-| Qwen3.8-Flash-Next (NVFP4 checkpoint) | MTP | 235, 210, 181, 136 (191) |
-| GLM-5.3-Flash (EXL3 3.05 bpw, NVFP4 dense) | DFlash2 | 116, 109, 108, 72 (101) |
-| GLM-5.3-Flash (the same) | MTP | 109, 102, 106, 87 (101) |
-| GLM-5.3-Flash | none | 64 |
+| Model | Weights | Agent turns, tok/s | Math / code, tok/s |
+|---|---|---|---|
+| Qwen3.8-27B | NVFP4 | 154 (DFlash2) | 321 / 292 (DFlash2) |
+| Qwen3.8-27B | EXL3 4.0 bpw | 116 (MTP) | 186 / 167 (DFlash2) |
+| Qwen3.8-Flash-Next | NVFP4 | 165 (MTP) | 267 / 266 (MTP / DFlash2) |
+| Qwen3.8-Flash-Next | EXL3 4.0 bpw, Volta order | 133 (MTP) | 197 / 184 (DFlash2) |
+| GLM-5.3-Flash | EXL3 3.05 bpw | 72 (DFlash2) | 127 / 118 (DFlash2) |
+| DeepSeek-V4.1-Flash | EXL3 1.68 bpw | | 70 / 71 (DSpark) |
 
-A plain token takes 12 ms (Qwen NVFP4), 14 ms (Flash-Next), 15 ms (GLM) or 16 ms (Qwen EXL3). Repetitive output peaks at over 300 tok/s on Qwen NVFP4. Perplexity per configuration and the bit widths of the EXL3 checkpoints are in [docs/QUANTIZATION.md](/docs/QUANTIZATION.md). Everything else, including where the time goes per kernel and how this compares with 1Cat-vLLM's published figures (different cards, clocks and prompts), is in [docs/PERFORMANCE.md](/docs/PERFORMANCE.md).
+Which speculator wins depends on the text: the checkpoint's MTP head on agent turns, which copy much of their input, and the DFlash2 drafter on math and code. Every configuration measured (GGUF, both EXL3 tile orders, each speculator and MTP depth), step latency, prefill and the method are in [docs/PERFORMANCE.md](/docs/PERFORMANCE.md); perplexity per configuration and the EXL3 bit widths are in [docs/QUANTIZATION.md](/docs/QUANTIZATION.md).
 
-A model's weight format heavily predicates its performance (NVFP4 will always win out over EXL3 trellis, but a smaller EXL3 quant should win over bigger ones), at the cost of perplexity.
+A model's weight format largely decides its speed (NVFP4 decodes faster than EXL3 trellis at a similar size, and a smaller EXL3 quant faster than a bigger one), at the cost of perplexity.
 
 ### Why not?
 
