@@ -59,6 +59,7 @@ struct MoeCoopParams {
 	int ksplit_a;
 	int ksplit_b;
 	bool a_global;                      // rows > 1: the gate/up blocks read had_g / had_u
+	bool i8_splat;                      // int8 tile: activations staged as splatted words (Volta tile order, runs of up to 2 rows)
 	int ctr_a_len;
 	int ctr_b_len;
 	// ROCm expert-grouped prefill (exl3_moe.cu): memory for its per-wave buffers

@@ -536,7 +536,10 @@ __device__ __forceinline__ int dp4a_us_c( uint32_t a, uint32_t b, int c ) {
 // result does not depend on the other rows of the run. The slab is staged in shared memory as the four bytes (k = 2m, 2m + 1,
 // 2m + 8, 2m + 9) that every lane with lane % 4 = m needs. Warps of one slab quantize a quarter each and the sums come from the
 // quantized values, so all warps of a slab agree bit-exactly.
-template <int cb, int WN_, int R>
+// SPLAT (Volta tile order, R <= 2): the stage holds every activation byte splatted to a word, [R][2][WKK][chunk][16] words, so a lane
+// reads its eight consecutive k as two 16-byte loads instead of building the splats with byte permutes (a Volta-order lane's splat
+// serves one weight per tile, the stock order's two)
+template <int cb, int WN_, int R, bool SPLAT = false>
 __device__ __forceinline__ void gemv_tile_i8(
 	const uint32_t* __restrict__ B32,
 	const half2* __restrict__ A2,
@@ -611,6 +614,13 @@ __device__ __forceinline__ void gemv_tile_i8(
 				s2 += v2;
 			}
 			const int tile = i >> 3, j = i & 7;
+			if constexpr ( SPLAT ) {
+				uint32_t* sq = sh_stage + ( ( r * 2 ) * WKK + wk ) * chunk * 16 + tile * 16 + 2 * j;
+				uint32_t* sr = sh_stage + ( ( r * 2 + 1 ) * WKK + wk ) * chunk * 16 + tile * 16 + 2 * j;
+				*reinterpret_cast<uint2*>( sq ) = make_uint2( ( pq & 0xffu ) * 0x01010101u, ( ( pq >> 8 ) & 0xffu ) * 0x01010101u );
+				*reinterpret_cast<uint2*>( sr ) = make_uint2( ( pr & 0xffu ) * 0x01010101u, ( ( pr >> 8 ) & 0xffu ) * 0x01010101u );
+				continue;
+			}
 #if EXL3_VOLTA_LAYOUT
 			const int at = tile * 8 + j;   // natural k order: a lane's eight values are eight consecutive k (see below)
 #else
@@ -691,6 +701,14 @@ __device__ __forceinline__ void gemv_tile_i8(
 			uint32_t pa[R][8], pb[R][8];
 			#pragma unroll
 			for ( int r = 0; r < R; ++r ) {
+				if constexpr ( SPLAT ) {
+					const uint4* sa = reinterpret_cast<const uint4*>( sh_stage + ( ( ( r * 2 ) * WKK + wk ) * chunk + i ) * 16 + 8 * cs );
+					const uint4* sb = reinterpret_cast<const uint4*>( sh_stage + ( ( ( r * 2 + 1 ) * WKK + wk ) * chunk + i ) * 16 + 8 * cs );
+					const uint4 a0 = sa[0], a1 = sa[1], b0 = sb[0], b1 = sb[1];
+					pa[r][0] = a0.x; pa[r][1] = a0.y; pa[r][2] = a0.z; pa[r][3] = a0.w; pa[r][4] = a1.x; pa[r][5] = a1.y; pa[r][6] = a1.z; pa[r][7] = a1.w;
+					pb[r][0] = b0.x; pb[r][1] = b0.y; pb[r][2] = b0.z; pb[r][3] = b0.w; pb[r][4] = b1.x; pb[r][5] = b1.y; pb[r][6] = b1.z; pb[r][7] = b1.w;
+					continue;
+				}
 				#pragma unroll
 				for ( int h = 0; h < 2; ++h ) {
 					const uint32_t qa = reinterpret_cast<const uint32_t*>( sh_stage )[( ( ( r * 2 ) * WKK + wk ) * chunk + i ) * 4 + 2 * cs + h];
@@ -838,8 +856,20 @@ __device__ __forceinline__ void gemv_tile_i8(
 template <int cb, int WN_, int RMAX>
 __device__ __forceinline__ void gemv_tile_i8_rows(
 	const uint32_t* __restrict__ B32, const half2* __restrict__ A2, size_t a_stride2, const int* __restrict__ rows, int nrows,
-	float* __restrict__ C, size_t c_stride, int k_begin, int k_end, int ntiles, int group, float* __restrict__ sh_red, uint32_t* __restrict__ sh_stage
+	float* __restrict__ C, size_t c_stride, int k_begin, int k_end, int ntiles, int group, float* __restrict__ sh_red, uint32_t* __restrict__ sh_stage, bool splat
 ) {
+#if EXL3_VOLTA_LAYOUT
+	if ( splat && nrows <= 2 ) {
+		if ( nrows == 1 || RMAX == 1 ) {
+			for ( int r0 = 0; r0 < nrows; ++r0 )
+				gemv_tile_i8<cb, WN_, 1, true>( B32, A2, a_stride2, rows + r0, 1, C, c_stride, k_begin, k_end, ntiles, group, sh_red, sh_stage );
+		}
+		else gemv_tile_i8<cb, WN_, 2, true>( B32, A2, a_stride2, rows, 2, C, c_stride, k_begin, k_end, ntiles, group, sh_red, sh_stage );
+		return;
+	}
+#else
+	(void) splat;
+#endif
 	for ( int r0 = 0; r0 < nrows; r0 += RMAX ) {
 		const int n = min( RMAX, nrows - r0 );
 		if ( RMAX == 1 || n == 1 ) gemv_tile_i8<cb, WN_, 1>( B32, A2, a_stride2, rows + r0, n, C, c_stride, k_begin, k_end, ntiles, group, sh_red, sh_stage );
@@ -974,7 +1004,7 @@ void a_kernel( const MoeCoopParams p ) {
 		if constexpr ( MODE > 0 && BITS_ == 3 ) {
 			if ( MODE != 3 || nrows <= 4 ) {
 				uint32_t* sh_stage = reinterpret_cast<uint32_t*>( sh_red ) + smem_red_bytes() / 4;
-				gemv_tile_i8_rows<cb, WN_, MODE == 1 ? 1 : 4>( B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red, sh_stage );
+				gemv_tile_i8_rows<cb, WN_, MODE == 1 ? 1 : 4>( B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red, sh_stage, p.i8_splat );
 				done = true;
 			}
 		}
@@ -1065,7 +1095,7 @@ void b_kernel( const MoeCoopParams p ) {
 			if ( MODE != 3 || nrows <= 4 ) {
 				uint32_t* sh_stage = reinterpret_cast<uint32_t*>( sh_part ) + smem_part_bytes() / 4;
 				gemv_tile_i8_rows<cb, WN_, MODE == 1 ? 1 : 4>( B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
-					0, p.I / 16, p.H / 16, group, sh_red, sh_stage );
+					0, p.I / 16, p.H / 16, group, sh_red, sh_stage, p.i8_splat );
 				done = true;
 			}
 		}
@@ -1188,13 +1218,28 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	const bool mixed = p.bits_tab != nullptr || ( p.bits_g != 0 && ( p.bits_g != p.bits_u || p.bits_u != p.bits_d ) );
 	const int forced = engine::runtime::options().moe_coop_mode;
 	const int mode = mixed || p.bits != 3 ? 0 : forced >= 0 ? forced : p.bsz == 1 ? 1 : ( EXL3_VOLTA_LAYOUT && p.bsz >= 3 ) ? 0 : 3;
-	const int stage_rows = mode == 1 ? 1 : ( mode >= 2 ? 4 : 0 );
-	// int8 activation staging: 2 x 16 B per k-tile per k-slab
+	// int8 activation staging: 2 x 16 B per k-tile per k-slab and row (stage_rows), or splatted words (4x) for runs of up to 2 rows in
+	// the Volta tile order when that fits the opt-in limit (GLM's hidden 4096; DeepSeek-V4.1's 5120 keeps the bytes)
 	constexpr int wkk = WK / WN;
-	const int stage_a = stage_rows * wkk * CEIL_DIVIDE( CEIL_DIVIDE( p.H / 16, p.ksplit_a ), wkk ) * 32;
-	const int stage_b = stage_rows * wkk * CEIL_DIVIDE( p.I / 16, wkk ) * 32;
-	const int smem_a = p.H * 2 + smem_red_bytes() + stage_a;
-	const int smem_b = smem_red_bytes() + smem_part_bytes() + stage_b;
+	const int slabs_a = wkk * CEIL_DIVIDE( CEIL_DIVIDE( p.H / 16, p.ksplit_a ), wkk ), slabs_b = wkk * CEIL_DIVIDE( p.I / 16, wkk );
+	const int packed_rows = mode == 1 ? 1 : ( mode >= 2 ? 4 : 0 );
+	const int splat_rows = mode == 1 ? 4 : ( mode == 3 ? 8 : 0 );   // in packed-row units: 1 or 2 rows of splats
+	auto smem_for = [&]( int rows_u, int& a, int& b ) {
+		a = p.H * 2 + smem_red_bytes() + rows_u * slabs_a * 32;
+		b = smem_red_bytes() + smem_part_bytes() + rows_u * slabs_b * 32;
+	};
+	int smem_a, smem_b;
+	smem_for( packed_rows, smem_a, smem_b );
+	p.i8_splat = false;
+	if ( EXL3_VOLTA_LAYOUT && splat_rows > 0 ) {
+		int sa, sb;
+		smem_for( MAX( packed_rows, splat_rows ), sa, sb );
+		if ( sa <= 96 * 1024 && sb <= 96 * 1024 ) {
+			smem_a = sa;
+			smem_b = sb;
+			p.i8_splat = true;
+		}
+	}
 	// The opt-in limit (96 KB on SM70): DeepSeek-V4.1's hidden 5120 with the 4-row int8 stage needs more than 64 KB for stage A
 	ENGINE_ASSERT( smem_a <= 96 * 1024 && smem_b <= 96 * 1024, "exl3_moe_coop: shared memory above the opt-in limit" );
 	static bool attr_set[ENGINE_NUM_GPUS] = { false }, attr_set4[ENGINE_NUM_GPUS] = { false }, attr_set2[ENGINE_NUM_GPUS] = { false }, attr_set1[ENGINE_NUM_GPUS] = { false }, attr_setm[ENGINE_NUM_GPUS] = { false };
