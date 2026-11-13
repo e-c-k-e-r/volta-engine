@@ -19,7 +19,8 @@
 //
 // CFG 0 ("narrow", 512 threads, 2 n-tiles/warp, 16 k-splits) wins at attention-projection sizes;
 // CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes. MMODE 0 is
-// the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads.
+// the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads, MMODE 2 covers 9 <= m <= 16: two 8-row A
+// fragments against the same decoded tile, so a weight is decoded once for all the rows.
 
 #include <cooperative_groups.h>
 #include "ptx.cuh"
@@ -27,7 +28,7 @@
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
 
-#define EXL3_GEMV_MAX_M 8
+#define EXL3_GEMV_MAX_M 16
 
 // Split-K partials: [k_slice][row][col] FP32, summed in fixed slice order after a grid sync so the
 // output is bit-identical run to run (FP16 atomicAdd made the target forward nondeterministic).
@@ -332,7 +333,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
     constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
     constexpr int THREADS = WK * 32;
-    constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
+    constexpr int ROWS = MMODE == 0 ? 1 : MMODE == 1 ? 8 : 16;
+    constexpr int RH = MMODE == 2 ? 2 : 1;                  // 8-row halves of the A fragment (m8n8k4 on SM_70, the m16n8k16 halves above)
     constexpr int COLS = WNT * 16;
 
     constexpr int TWORDS = 8 * bits;                        // uint32 per 16x16 tile
@@ -465,13 +467,14 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__) < 800
     #if EXL3_VOLTA_LAYOUT
-        float dacc[WNT][8] = {};   // the octet's own n8 half of each tile (nfrag q & 1), over its two k chunks
+        float dacc[RH][WNT][8] = {};   // the octet's own n8 half of each tile (nfrag q & 1), over its two k chunks, per 8-row half
     #else
-        float dacc[WNT][2][8] = {};
+        float dacc[RH][WNT][2][8] = {};
     #endif
 #else
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
+        [[maybe_unused]] float2 acc1[WNT][2] = {};   // MMODE 2: rows r0 + 8
 #endif
 
         for (int ib = 0; ib < myn; ib += PF)
@@ -539,26 +542,36 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__) < 800
             const int r_v = (lane & 3) + 4 * (lane >= 16);
-            const size_t a_row_v = (size_t) r_v * (size_k / 2);
-            const bool r_v_ok = (MMODE == 0) ? (r_v == 0) : (r_v < size_m);
             const size_t a_col_v = (size_t) (ks0 + i) * 8;
 #if EXL3_VOLTA_LAYOUT
             // Volta tile order: the octet works on the k chunks 2 * (q >> 1) and 2 * (q >> 1) + 1 of the k16 step
-            uint32_t va[2][2];
+            uint32_t va[RH][2][2];
             #pragma unroll
-            for (int s_ = 0; s_ < 2; ++s_)
+            for (int h = 0; h < RH; ++h)
             {
-                const int c = 2 * ((lane >> 3) & 1) + s_;
-                va[s_][0] = r_v_ok ? *(const uint32_t*)&A2[a_row_v + a_col_v + 2 * c + 0] : 0;
-                va[s_][1] = r_v_ok ? *(const uint32_t*)&A2[a_row_v + a_col_v + 2 * c + 1] : 0;
+                const size_t a_row_v = (size_t) (r_v + 8 * h) * (size_k / 2);
+                const bool r_v_ok = (MMODE == 0) ? (r_v == 0) : (r_v + 8 * h < size_m);
+                #pragma unroll
+                for (int s_ = 0; s_ < 2; ++s_)
+                {
+                    const int c = 2 * ((lane >> 3) & 1) + s_;
+                    va[h][s_][0] = r_v_ok ? *(const uint32_t*)&A2[a_row_v + a_col_v + 2 * c + 0] : 0;
+                    va[h][s_][1] = r_v_ok ? *(const uint32_t*)&A2[a_row_v + a_col_v + 2 * c + 1] : 0;
+                }
             }
 #else
-            uint32_t va[4][2];
+            uint32_t va[RH][4][2];
             #pragma unroll
-            for (int c = 0; c < 4; ++c)
+            for (int h = 0; h < RH; ++h)
             {
-                va[c][0] = r_v_ok ? *(const uint32_t*)&A2[a_row_v + a_col_v + 2 * c + 0] : 0;
-                va[c][1] = r_v_ok ? *(const uint32_t*)&A2[a_row_v + a_col_v + 2 * c + 1] : 0;
+                const size_t a_row_v = (size_t) (r_v + 8 * h) * (size_k / 2);
+                const bool r_v_ok = (MMODE == 0) ? (r_v == 0) : (r_v + 8 * h < size_m);
+                #pragma unroll
+                for (int c = 0; c < 4; ++c)
+                {
+                    va[h][c][0] = r_v_ok ? *(const uint32_t*)&A2[a_row_v + a_col_v + 2 * c + 0] : 0;
+                    va[h][c][1] = r_v_ok ? *(const uint32_t*)&A2[a_row_v + a_col_v + 2 * c + 1] : 0;
+                }
             }
 #endif
 #else
@@ -567,8 +580,19 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             FragB a01, a23;
             a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
             a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
-            a01[1] = hzero;
-            a23[1] = hzero;
+            if constexpr (MMODE == 2)
+            {
+                // the m16n8k16 A fragment's upper half: rows r0 + 8
+                const bool r1_ok = r0 + 8 < size_m;
+                const size_t a_row1 = (size_t) (r0 + 8) * (size_k / 2);
+                a01[1] = r1_ok ? A2[a_row1 + a_col] : hzero;
+                a23[1] = r1_ok ? A2[a_row1 + a_col + 4] : hzero;
+            }
+            else
+            {
+                a01[1] = hzero;
+                a23[1] = hzero;
+            }
 #endif
 
             #pragma unroll
@@ -613,8 +637,12 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__) < 800
 #if EXL3_VOLTA_LAYOUT
                 // the lane's eight decoded values are its m8n8k4 B operands (f0 = k chunk 2 * (q >> 1), f1 the next one)
-                volta_mma_m8n8k4(va[0][0], va[0][1], *(const uint32_t*)&f0[0], *(const uint32_t*)&f0[1], dacc[t]);
-                volta_mma_m8n8k4(va[1][0], va[1][1], *(const uint32_t*)&f1[0], *(const uint32_t*)&f1[1], dacc[t]);
+                #pragma unroll
+                for (int h = 0; h < RH; ++h)
+                {
+                    volta_mma_m8n8k4(va[h][0][0], va[h][0][1], *(const uint32_t*)&f0[0], *(const uint32_t*)&f0[1], dacc[h][t]);
+                    volta_mma_m8n8k4(va[h][1][0], va[h][1][1], *(const uint32_t*)&f1[0], *(const uint32_t*)&f1[1], dacc[h][t]);
+                }
 #else
                 if (is_zero_shfl)
                 {
@@ -634,26 +662,26 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     // Step 0: k0..k3
                     uint2 b01_0 = sf0[0];
                     uint2 b01_1 = sf2[0];
-                    volta_mma_m8n8k4(va[0][0], va[0][1], b01_0.x, b01_0.y, dacc[t][0]);
-                    volta_mma_m8n8k4(va[0][0], va[0][1], b01_1.x, b01_1.y, dacc[t][1]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][0][0], va[h][0][1], b01_0.x, b01_0.y, dacc[h][t][0]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][0][0], va[h][0][1], b01_1.x, b01_1.y, dacc[h][t][1]);
 
                     // Step 1: k4..k7
                     uint2 b01_0_1 = sf0[1];
                     uint2 b01_1_1 = sf2[1];
-                    volta_mma_m8n8k4(va[1][0], va[1][1], b01_0_1.x, b01_0_1.y, dacc[t][0]);
-                    volta_mma_m8n8k4(va[1][0], va[1][1], b01_1_1.x, b01_1_1.y, dacc[t][1]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][1][0], va[h][1][1], b01_0_1.x, b01_0_1.y, dacc[h][t][0]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][1][0], va[h][1][1], b01_1_1.x, b01_1_1.y, dacc[h][t][1]);
 
                     // Step 2: k8..k11
                     uint2 b01_0_2 = sf1[0];
                     uint2 b01_1_2 = sf3[0];
-                    volta_mma_m8n8k4(va[2][0], va[2][1], b01_0_2.x, b01_0_2.y, dacc[t][0]);
-                    volta_mma_m8n8k4(va[2][0], va[2][1], b01_1_2.x, b01_1_2.y, dacc[t][1]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][2][0], va[h][2][1], b01_0_2.x, b01_0_2.y, dacc[h][t][0]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][2][0], va[h][2][1], b01_1_2.x, b01_1_2.y, dacc[h][t][1]);
 
                     // Step 3: k12..k15
                     uint2 b01_0_3 = sf1[1];
                     uint2 b01_1_3 = sf3[1];
-                    volta_mma_m8n8k4(va[3][0], va[3][1], b01_0_3.x, b01_0_3.y, dacc[t][0]);
-                    volta_mma_m8n8k4(va[3][0], va[3][1], b01_1_3.x, b01_1_3.y, dacc[t][1]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][3][0], va[h][3][1], b01_0_3.x, b01_0_3.y, dacc[h][t][0]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][3][0], va[h][3][1], b01_1_3.x, b01_1_3.y, dacc[h][t][1]);
                     __syncwarp();
                 }
                 else
@@ -662,38 +690,38 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     // Step 0: k0..k3 from f0[0]/f1[0] lanes 4*cv+0, 4*cv+1
                     uint32_t b0_0 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f0[0], 4 * cv + 0);
                     uint32_t b1_0 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f0[0], 4 * cv + 1);
-                    volta_mma_m8n8k4(va[0][0], va[0][1], b0_0, b1_0, dacc[t][0]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][0][0], va[h][0][1], b0_0, b1_0, dacc[h][t][0]);
 
                     uint32_t b0_1 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f1[0], 4 * cv + 0);
                     uint32_t b1_1 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f1[0], 4 * cv + 1);
-                    volta_mma_m8n8k4(va[0][0], va[0][1], b0_1, b1_1, dacc[t][1]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][0][0], va[h][0][1], b0_1, b1_1, dacc[h][t][1]);
 
                     // Step 1: k4..k7 from f0[0]/f1[0] lanes 4*cv+2, 4*cv+3
                     b0_0 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f0[0], 4 * cv + 2);
                     b1_0 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f0[0], 4 * cv + 3);
-                    volta_mma_m8n8k4(va[1][0], va[1][1], b0_0, b1_0, dacc[t][0]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][1][0], va[h][1][1], b0_0, b1_0, dacc[h][t][0]);
 
                     b0_1 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f1[0], 4 * cv + 2);
                     b1_1 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f1[0], 4 * cv + 3);
-                    volta_mma_m8n8k4(va[1][0], va[1][1], b0_1, b1_1, dacc[t][1]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][1][0], va[h][1][1], b0_1, b1_1, dacc[h][t][1]);
 
                     // Step 2: k8..k11 from f0[1]/f1[1] lanes 4*cv+0, 4*cv+1
                     b0_0 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f0[1], 4 * cv + 0);
                     b1_0 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f0[1], 4 * cv + 1);
-                    volta_mma_m8n8k4(va[2][0], va[2][1], b0_0, b1_0, dacc[t][0]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][2][0], va[h][2][1], b0_0, b1_0, dacc[h][t][0]);
 
                     b0_1 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f1[1], 4 * cv + 0);
                     b1_1 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f1[1], 4 * cv + 1);
-                    volta_mma_m8n8k4(va[2][0], va[2][1], b0_1, b1_1, dacc[t][1]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][2][0], va[h][2][1], b0_1, b1_1, dacc[h][t][1]);
 
                     // Step 3: k12..k15 from f0[1]/f1[1] lanes 4*cv+2, 4*cv+3
                     b0_0 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f0[1], 4 * cv + 2);
                     b1_0 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f0[1], 4 * cv + 3);
-                    volta_mma_m8n8k4(va[3][0], va[3][1], b0_0, b1_0, dacc[t][0]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][3][0], va[h][3][1], b0_0, b1_0, dacc[h][t][0]);
 
                     b0_1 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f1[1], 4 * cv + 2);
                     b1_1 = __shfl_sync(0xffffffffu, *(const uint32_t*)&f1[1], 4 * cv + 3);
-                    volta_mma_m8n8k4(va[3][0], va[3][1], b0_1, b1_1, dacc[t][1]);
+                    for (int h = 0; h < RH; ++h) volta_mma_m8n8k4(va[h][3][0], va[h][3][1], b0_1, b1_1, dacc[h][t][1]);
                 }
 #endif
 #else
@@ -712,6 +740,12 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                         acc0[t][f].x += __low2float(ch[t][f][0]);
                         acc0[t][f].y += __high2float(ch[t][f][0]);
                         ch[t][f][0] = hzero;
+                        if constexpr (MMODE == 2)
+                        {
+                            acc1[t][f].x += __low2float(ch[t][f][1]);
+                            acc1[t][f].y += __high2float(ch[t][f][1]);
+                            ch[t][f][1] = hzero;
+                        }
                     }
             }
 #endif
@@ -726,17 +760,19 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             {
                 const int q_ = (lane >> 2) & 3;
                 #pragma unroll
+                for (int h = 0; h < RH; ++h)
+                #pragma unroll
                 for (int t = 0; t < WNT; ++t)
                 {
                     #pragma unroll
                     for (int reg = 0; reg < 8; ++reg)
                     {
-                        float v = dacc[t][reg];
+                        float v = dacc[h][t][reg];
                         v += __shfl_xor_sync(0xffffffffu, v, 8);
                         int m, n;
                         volta_d_slot(lane, reg, &m, &n);
-                        if (q_ < 2 && m < ROWS)
-                            sh_red[warp][m][t * 16 + 8 * (q_ & 1) + n] = v;
+                        if (q_ < 2 && m + 8 * h < ROWS)
+                            sh_red[warp][m + 8 * h][t * 16 + 8 * (q_ & 1) + n] = v;
                     }
                 }
             }
@@ -754,14 +790,16 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                         {
                             const int reg = (r_idx < 2) ? r_idx : (r_idx + 2); // 0, 1, 4, 5
                             const int n = (reg & 1) + 2 * (t_lane >> 1) + 4 * (reg >> 2);
-                            sh_red[warp][0][t * 16 + 0 + n] = dacc[t][0][reg];
-                            sh_red[warp][0][t * 16 + 8 + n] = dacc[t][1][reg];
+                            sh_red[warp][0][t * 16 + 0 + n] = dacc[0][t][0][reg];
+                            sh_red[warp][0][t * 16 + 8 + n] = dacc[0][t][1][reg];
                         }
                     }
                 }
             }
             else
             {
+                #pragma unroll
+                for (int h = 0; h < RH; ++h)
                 #pragma unroll
                 for (int t = 0; t < WNT; ++t)
                 {
@@ -770,10 +808,10 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     {
                         int m, n;
                         volta_d_slot(lane, reg, &m, &n);
-                        if (m < ROWS)
+                        if (m + 8 * h < ROWS)
                         {
-                            sh_red[warp][m][t * 16 + 0 + n] = dacc[t][0][reg];
-                            sh_red[warp][m][t * 16 + 8 + n] = dacc[t][1][reg];
+                            sh_red[warp][m + 8 * h][t * 16 + 0 + n] = dacc[h][t][0][reg];
+                            sh_red[warp][m + 8 * h][t * 16 + 8 + n] = dacc[h][t][1][reg];
                         }
                     }
                 }
@@ -793,6 +831,11 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                         const int col = t * 16 + f * 8 + c0;
                         sh_red[warp][sr0][col + 0] = acc0[t][f].x;
                         sh_red[warp][sr0][col + 1] = acc0[t][f].y;
+                        if constexpr (MMODE == 2)
+                        {
+                            sh_red[warp][sr0 + 8][col + 0] = acc1[t][f].x;
+                            sh_red[warp][sr0 + 8][col + 1] = acc1[t][f].y;
+                        }
                     }
             }
 #endif

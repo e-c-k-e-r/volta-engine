@@ -112,7 +112,11 @@ void LinearTrellis::forward(
 #if defined(USE_ROCM)
 	else if ( m <= gemv_max && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 #else
-	else if ( m <= 8 && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {   // the GEMV takes any 2 to 8 rows (row-guarded loads); the GEMM tile costs about twice as much there
+	// The GEMV takes 1 to 16 rows (row-guarded loads) and decodes each weight tile once for all of them. Up to 8 rows it beats the GEMM tile
+	// everywhere; at 9 to 16 rows in the Volta tile order too (bench_kernels, same session: 0.39 to 0.97 of the GEMM time; GLM's 5-bit KDA
+	// input at 9 to 12 rows 1.05 to 1.09), in the stock order only for inputs up to 2560 wide and outputs up to 8192 (0.69 to 0.83; wider
+	// inputs pay for the fragment shuffles of the extra row half, and the LM head shards lose 1.06 to 1.29)
+	else if ( ( m <= 8 || ( m <= runtime::options().gemv_max_rows && ( volta_tiles || ( k <= 2560 && n <= 8192 ) ) ) ) && ( k % 128 == 0 ) && ( n % 128 == 0 ) ) {
 #endif
 		EXL3_TILES_CALL( volta_tiles, exl3_gemv, x_ptr, trellis_ptr, out_ptr, suh_ptr, A_had, svh_ptr, m, k, n, bits, mcg, mul1, c_fp32, stream );
 	}

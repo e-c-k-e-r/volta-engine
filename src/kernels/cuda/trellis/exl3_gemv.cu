@@ -52,13 +52,17 @@ static void* exl3_gemv_select_kernel( int bits, int cb, bool c_fp32, int mmode, 
 	#define SEL_GRID(bits_, cb_, sm_) \
 		SEL(bits_, cb_, false, 0, 0, sm_) SEL(bits_, cb_, false, 0, 1, sm_) \
 		SEL(bits_, cb_, false, 1, 0, sm_) SEL(bits_, cb_, false, 1, 1, sm_) \
+		SEL(bits_, cb_, false, 2, 0, sm_) SEL(bits_, cb_, false, 2, 1, sm_) \
 		SEL(bits_, cb_, true,  0, 0, sm_) SEL(bits_, cb_, true,  0, 1, sm_) \
-		SEL(bits_, cb_, true,  1, 0, sm_) SEL(bits_, cb_, true,  1, 1, sm_)
+		SEL(bits_, cb_, true,  1, 0, sm_) SEL(bits_, cb_, true,  1, 1, sm_) \
+		SEL(bits_, cb_, true,  2, 0, sm_) SEL(bits_, cb_, true,  2, 1, sm_)
 	#define SEL_CFG1(bits_, cb_, sm_) \
 		SEL(bits_, cb_, false, 0, 1, sm_) \
 		SEL(bits_, cb_, false, 1, 1, sm_) \
+		SEL(bits_, cb_, false, 2, 1, sm_) \
 		SEL(bits_, cb_, true,  0, 1, sm_) \
-		SEL(bits_, cb_, true,  1, 1, sm_)
+		SEL(bits_, cb_, true,  1, 1, sm_) \
+		SEL(bits_, cb_, true,  2, 1, sm_)
 
 	SEL_GRID( 4, 0, false ) SEL_GRID( 4, 1, false ) SEL_GRID( 4, 2, false )
 	SEL_GRID( 2, 1, false ) SEL_GRID( 2, 2, false ) SEL_GRID( 2, 1, true ) SEL_GRID( 2, 2, true )
@@ -94,7 +98,7 @@ bool exl3_gemv_try_launch(
 
 	int mode = force ? 2 : 1;
 	int cc = engine::modules::trellis_get_cc( device );
-	int mmode = size_m == 1 ? 0 : 1;
+	int mmode = size_m == 1 ? 0 : size_m <= 8 ? 1 : 2;
 	int num_sms = engine::modules::trellis_get_num_sms( device );
 
 	auto& cache = occ_cache[device < ENGINE_NUM_GPUS ? device : 0];

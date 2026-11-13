@@ -74,6 +74,7 @@ OPTION( std::string, speculator, "dflash", "speculation source: dflash (needs a 
 DEBUG_OPTION( int, exl3_gemv_max_m, 4, "ROCm: EXL3 linears of up to this many rows (0 to 8) run the v_dot2 GEMV; the rows above it, up to exl3_wmma_max_m, run the WMMA GEMM (for A/B; the GEMV is no faster than the GEMM from 3 rows and 35% slower at 5 to 8)" )
 DEBUG_OPTION( int, exl3_wmma_max_m, 64, "ROCm: EXL3 linears of 9 up to this many rows (at most 64) run the WMMA GEMM that reads the packed weight once; more rows, or 0 here, dequantize the weight and call hipBLAS (for A/B)" )
 DEBUG_OPTION( int, glm_layers, 0, "GLM: run only the first N decoder layers (a checkpoint cut to N layers, for A/B of kernels on a small model; the logits mean nothing); 0 = all 45" )
+DEBUG_OPTION( int, gemv_max_rows, 16, "EXL3 projections: the most rows the GEMV takes before the GEMM tile (9 to 16: the Volta tile order, and the stock order on inputs up to 2560 wide); 8 = the GEMM from 9 rows (A/B)" )
 DEBUG_OPTION( bool, gemv_int8, true, "EXL3 projections of 1 and 2 rows: the dp4a int8 GEMV first; false = the tensor-core GEMV (A/B)" )
 DEBUG_OPTION( bool, gguf_mma, true, "CUDA GGUF projections: the tensor-core rows kernel for 9 to 16 rows (Q4_K / Q6_K from 4 / 6 rows); false = the GEMV and tile paths (A/B)" )
 DEBUG_OPTION( bool, dflash_attn_scalar, false, "DFlash2 drafter attention on CUDA: the scalar one-block-per-(row, head) kernel instead of the split-key kernel (for A/B)" )
