@@ -2,7 +2,7 @@
 // kItemRoutes routes; each projection is a GEMV of one output row per block and work item, the expert's weight row read once for all the
 // item's routes through llama.cpp's vec_dot of the projection's block type (LinearGguf's multi-row GEMV structure). Routes of experts on
 // other ranks are left out, and the combine skips them. Prefill chunks (more rows than one pass of that path) take the tile path instead:
-// passes of kTileRowsPerPass rows, items of up to kTileRoutes routes, and per item a tile of output rows whose weight blocks are decoded
+// passes of kTileRowsPerPass rows, items of up to 16 or 32 routes, and per item a tile of output rows whose weight blocks are decoded
 // to FP16 in shared memory once and multiplied with all the item's routes on the tensor cores (the vec_dot path decodes them per route).
 #include "engine/modules/gguf.h"
 #include "engine/backend/runtime.h"
@@ -183,8 +183,8 @@ Layout layout( int top_k, int hidden, int inter ) {
 
 
 // ---- tile path (prefill) ----
-constexpr int kTileRowsPerPass = 256;   // rows of a pass: about 4 routes of each local expert at top 6 over 384 experts on 4 ranks
-constexpr int kTileRoutes = 16;         // routes of an item
+constexpr int kTileRowsPerPass = 1024;   // rows of a pass: about 16 routes of each local expert at top 6 over 384 experts on 4 ranks
+constexpr int kTileRoutesMax = 32;      // routes of an item: 16, or 32 when a pass gives the local experts more than about 12 routes each
 constexpr int kTileN = 32;              // output rows of a block: 26 KB of shared memory, three blocks an SM
 constexpr int kTileThreads = 256;       // 8 warps: the decode needs them to hide its loads
 constexpr int kTileLd = 256 + 16;       // halves per shared-memory row: one block of 256 inputs, padded to keep the WMMA rows 32-byte aligned
@@ -198,7 +198,7 @@ TILE_BLK( Q4_K, block_q4_K ) TILE_BLK( Q5_K, block_q5_K ) TILE_BLK( Q6_K, block_
 #undef TILE_BLK
 // bytes of a staged block in shared memory (its size rounded to 16), and the kernel's shared memory: the decoded tile, the routes' inputs and two steps of raw blocks
 template <GgmlType T> constexpr int tile_raw_ld() { return ( static_cast<int>( sizeof( typename TileBlk<T>::type ) ) + 15 ) / 16 * 16; }
-template <GgmlType T> constexpr size_t tile_smem() { return static_cast<size_t>( kTileN + kTileRoutes ) * kTileLd * sizeof( half ) + 2 * kTileN * tile_raw_ld<T>(); }
+template <GgmlType T, int RT> constexpr size_t tile_smem() { return static_cast<size_t>( kTileN + RT ) * kTileLd * sizeof( half ) + 2 * kTileN * tile_raw_ld<T>(); }
 
 // Eight values of an IQ block (sub-block ib of 8, eighth il of 4), as llama.cpp's dequantizers compute them
 template <GgmlType T>
@@ -300,10 +300,10 @@ bool tile_type( GgmlType t ) {
 // GU: gate and up of the same block type in one pass, the tile's first 16 rows from the gate and the last 16 the same rows of the up projection
 // (the routes' inputs copied once for both), and the epilogue writes SiLU( gate ) * up (moe_act16_kernel's activation on the FP16-rounded
 // gate and up, so the result is that of the two passes) to out16 [route][n]
-template <GgmlType T, bool GU>
+template <GgmlType T, bool GU, int RT>
 __global__ __launch_bounds__( kTileThreads, 3 )
 void moe_tile_kernel( const void* const* __restrict__ ptrs, const void* const* __restrict__ ptrs_up, const Item* __restrict__ items, const int* __restrict__ n_items,
-	const int* __restrict__ sorted, const half* __restrict__ in, bool per_token, int k, int n, const half* __restrict__ topw, int top_k, float* __restrict__ out32,
+	const int* __restrict__ sorted, const half* __restrict__ in, bool per_token, int k, int n, const half* __restrict__ topw, int top_k, float* __restrict__ part32,
 	half* __restrict__ out16, float act_limit ) {
 	using namespace nvcuda;
 	using Blk = typename TileBlk<T>::type;
@@ -313,13 +313,13 @@ void moe_tile_kernel( const void* const* __restrict__ ptrs, const void* const* _
 	if ( static_cast<int>( blockIdx.y ) >= *n_items ) return;
 	extern __shared__ __align__( 32 ) unsigned char tile_smem[];
 	half* sW = reinterpret_cast<half*>( tile_smem );                       // [kTileN][kTileLd]
-	half* sX = sW + kTileN * kTileLd;                                      // [kTileRoutes][kTileLd]
-	unsigned char* sR = reinterpret_cast<unsigned char*>( sX + kTileRoutes * kTileLd );   // [2][kTileN][kTileRawLd]: the raw blocks of this and the next step
-	__shared__ int s_route[kTileRoutes];
+	half* sX = sW + kTileN * kTileLd;                                      // [RT][kTileLd]
+	unsigned char* sR = reinterpret_cast<unsigned char*>( sX + RT * kTileLd );   // [2][kTileN][kTileRawLd]: the raw blocks of this and the next step
+	__shared__ int s_route[RT];
 	const Item it = items[blockIdx.y];
 	constexpr int kRows = GU ? kTileN / 2 : kTileN;   // output rows of the block (of each of gate and up)
 	const int row0 = blockIdx.x * kRows, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-	if ( threadIdx.x < kTileRoutes ) s_route[threadIdx.x] = threadIdx.x < it.count ? sorted[it.begin + threadIdx.x] : -1;
+	if ( threadIdx.x < RT ) s_route[threadIdx.x] = threadIdx.x < it.count ? sorted[it.begin + threadIdx.x] : -1;
 	const uint16_t* w = static_cast<const uint16_t*>( ptrs[it.expert] );
 	const uint16_t* wu = GU ? static_cast<const uint16_t*>( ptrs_up[it.expert] ) : w;
 	const int bpr = k / 256;
@@ -345,7 +345,7 @@ void moe_tile_kernel( const void* const* __restrict__ ptrs, const void* const* _
 		for ( int p = 0; p < PER; ++p ) if ( dst[p] >= 0 ) d[dst[p]] = rr[p];
 	};
 	// the routes' input rows this thread copies (16 routes x 32 pieces of 8 halves over the threads)
-	constexpr int XPER = kTileRoutes * 32 / kTileThreads;
+	constexpr int XPER = RT * 32 / kTileThreads;
 	const half* xsrc[XPER];
 	#pragma unroll
 	for ( int i = 0; i < XPER; ++i ) {
@@ -356,8 +356,10 @@ void moe_tile_kernel( const void* const* __restrict__ ptrs, const void* const* _
 	stash( 0 );
 	__syncthreads();
 	const int wn = ( warp & 1 ) * 16, kh = ( warp >> 1 ) * 64;   // the warp's rows and quarter of the inputs
-	wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-	wmma::fill_fragment( acc, 0.0f );
+	constexpr int RF = RT / 16;   // 16-route fragments
+	wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[RF];
+	#pragma unroll
+	for ( int f = 0; f < RF; ++f ) wmma::fill_fragment( acc[f], 0.0f );
 	for ( int kb = 0; kb < bpr; ++kb ) {
 		if ( kb + 1 < bpr ) fetch( kb + 1 );   // in flight while this step decodes and multiplies
 		const unsigned char* raw = sR + ( kb & 1 ) * kTileN * kTileRawLd;
@@ -375,66 +377,72 @@ void moe_tile_kernel( const void* const* __restrict__ ptrs, const void* const* _
 		__syncthreads();
 		#pragma unroll
 		for ( int kk = 0; kk < 64; kk += 16 ) {
-			wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
 			wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
-			wmma::load_matrix_sync( a, sX + kh + kk, kTileLd );
 			wmma::load_matrix_sync( b, sW + wn * kTileLd + kh + kk, kTileLd );
-			wmma::mma_sync( acc, a, b, acc );
+			#pragma unroll
+			for ( int f = 0; f < RF; ++f ) {
+				if ( f * 16 >= it.count ) break;
+				wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+				wmma::load_matrix_sync( a, sX + f * 16 * kTileLd + kh + kk, kTileLd );
+				wmma::mma_sync( acc[f], a, b, acc[f] );
+			}
 		}
 		if ( kb + 1 < bpr ) stash( ( kb + 1 ) & 1 );
 		__syncthreads();
 	}
 	// the four input quarters' pieces through shared memory, summed in order, to the routes' rows
-	float* sC = reinterpret_cast<float*>( tile_smem );   // [4][kTileRoutes][kTileN + 4]
+	float* sC = reinterpret_cast<float*>( tile_smem );   // [4][RT][kTileN + 4]
 	constexpr int ldc = kTileN + 4;
-	wmma::store_matrix_sync( sC + ( warp >> 1 ) * kTileRoutes * ldc + wn, acc, ldc, wmma::mem_row_major );
+	#pragma unroll
+	for ( int f = 0; f < RF; ++f ) wmma::store_matrix_sync( sC + ( ( warp >> 1 ) * RT + f * 16 ) * ldc + wn, acc[f], ldc, wmma::mem_row_major );
 	__syncthreads();
-	for ( int v = threadIdx.x; v < kTileRoutes * kRows; v += kTileThreads ) {
+	for ( int v = threadIdx.x; v < RT * kRows; v += kTileThreads ) {
 		const int j = v / kRows, c = v % kRows, r = s_route[j], gr = row0 + c;
 		if ( r < 0 || gr >= n ) continue;
 		const float* q = sC + j * ldc + c;
-		const float val = ( q[0] + q[kTileRoutes * ldc] ) + ( q[2 * kTileRoutes * ldc] + q[3 * kTileRoutes * ldc] );
+		const float val = ( q[0] + q[RT * ldc] ) + ( q[2 * RT * ldc] + q[3 * RT * ldc] );
 		if constexpr ( GU ) {
 			const float* qu = q + kRows;
 			float gv = __half2float( __float2half_rn( val ) );
-			float uv = __half2float( __float2half_rn( ( qu[0] + qu[kTileRoutes * ldc] ) + ( qu[2 * kTileRoutes * ldc] + qu[3 * kTileRoutes * ldc] ) ) );
+			float uv = __half2float( __float2half_rn( ( qu[0] + qu[RT * ldc] ) + ( qu[2 * RT * ldc] + qu[3 * RT * ldc] ) ) );
 			if ( act_limit > 0.0f ) {
 				gv = fminf( gv, act_limit );
 				uv = fmaxf( -act_limit, fminf( uv, act_limit ) );
 			}
 			out16[static_cast<size_t>( r ) * n + gr] = __float2half_rn( gv / ( 1.0f + __expf( -gv ) ) * uv );
 		}
-		else if ( out32 != nullptr ) out32[static_cast<size_t>( r ) * n + gr] = val * __half2float( topw[r] );
+		else if ( part32 != nullptr ) part32[static_cast<size_t>( r ) * n + gr] = val * __half2float( topw[r] );
 		else out16[static_cast<size_t>( r ) * n + gr] = __float2half_rn( val );
 	}
 }
 
-template <GgmlType T, bool GU>
+template <GgmlType T, bool GU, int RT>
 void launch_tile( const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n, const half* in, bool per_token,
-	int k, int n, const half* topw, int top_k, float* out32, half* out16, float act_limit, cudaStream_t stream ) {
+	int k, int n, const half* topw, int top_k, float* part32, half* out16, float act_limit, cudaStream_t stream ) {
 	static bool attr[64] = {};
 	int dev = 0;
 	cudaGetDevice( &dev );
 	if ( !attr[dev] ) {
-		CUDA_CHECK( cudaFuncSetAttribute( moe_tile_kernel<T, GU>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( tile_smem<T>() ) ) );
+		CUDA_CHECK( cudaFuncSetAttribute( moe_tile_kernel<T, GU, RT>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( tile_smem<T, RT>() ) ) );
 		attr[dev] = true;
 	}
 	constexpr int rows = GU ? kTileN / 2 : kTileN;
-	moe_tile_kernel<T, GU><<<dim3( ( n + rows - 1 ) / rows, max_n ), kTileThreads, tile_smem<T>(), stream>>>( ptrs, ptrs_up, items, n_items, sorted, in, per_token, k, n, topw,
-		top_k, out32, out16, act_limit );
+	moe_tile_kernel<T, GU, RT><<<dim3( ( n + rows - 1 ) / rows, max_n ), kTileThreads, tile_smem<T, RT>(), stream>>>( ptrs, ptrs_up, items, n_items, sorted, in, per_token, k,
+		n, topw, top_k, part32, out16, act_limit );
 }
 
-// ptrs_up != null: gate (ptrs) and up of the same type in one pass, the activation to out16
-void tile_proj( GgmlType type, const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n, const half* in,
-	bool per_token, int k, int n, const half* topw, int top_k, float* out32, half* out16, float act_limit, cudaStream_t stream ) {
+// ptrs_up != null: gate (ptrs) and up of the same type in one pass, the activation to out16; rt: the items' routes (16 or 32)
+void tile_proj( GgmlType type, int rt, const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n,
+	const half* in, bool per_token, int k, int n, const half* topw, int top_k, float* part32, half* out16, float act_limit, cudaStream_t stream ) {
 	switch ( type ) {
-#define CASE( T ) case GgmlType::T: \
-		if ( ptrs_up != nullptr ) launch_tile<GgmlType::T, true>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, out32, out16, act_limit, stream ); \
-		else launch_tile<GgmlType::T, false>( ptrs, nullptr, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, out32, out16, act_limit, stream ); \
-		break;
+#define LAUNCH( T, RT ) \
+		if ( ptrs_up != nullptr ) launch_tile<GgmlType::T, true, RT>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, part32, out16, act_limit, stream ); \
+		else launch_tile<GgmlType::T, false, RT>( ptrs, nullptr, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, part32, out16, act_limit, stream );
+#define CASE( T ) case GgmlType::T: if ( rt > 16 ) { LAUNCH( T, 32 ) } else { LAUNCH( T, 16 ) } break;
 		CASE( IQ1_S ) CASE( IQ1_M ) CASE( IQ2_XXS ) CASE( IQ2_XS ) CASE( IQ2_S ) CASE( IQ3_XXS ) CASE( IQ3_S ) CASE( IQ4_XS ) CASE( Q2_K ) CASE( Q3_K ) CASE( Q4_K )
 		CASE( Q5_K ) CASE( Q6_K )
 #undef CASE
+#undef LAUNCH
 		default: ENGINE_ASSERT( false, "MoEGguf: no tile path for the expert block type" );
 	}
 }
@@ -451,27 +459,33 @@ __global__ void moe_act16_kernel( const half* __restrict__ g, const half* __rest
 	a[i] = __float2half_rn( gv / ( 1.0f + __expf( -gv ) ) * uv );
 }
 
-// The scratch of one tile pass: gate, up and the activation in FP16, the down partials, the work items and the routes in expert order
+// The scratch of one tile pass: the activation in FP16, the down partials in FP32 (FP16 ones moved the first token's distribution by a KL of
+// up to 0.08 on 20K-token prompts; the gate and up of two block types, FP16, sit in their place: the activation reads them before the down
+// projection writes there), the work items and the routes in expert order
 struct TileLayout {
-	size_t g, u, a, part, items, n_items, sorted, total;
+	size_t a, part, g, u, items, n_items, sorted, total;
 };
 TileLayout tile_layout( int top_k, int hidden, int inter ) {
 	const size_t routes = static_cast<size_t>( kTileRowsPerPass ) * top_k;
 	auto up = []( size_t b ) { return ( b + 255 ) / 256 * 256; };
 	TileLayout l{};
-	l.g = 0;
-	l.u = l.g + up( routes * inter * sizeof( half ) );
-	l.a = l.u + up( routes * inter * sizeof( half ) );
+	l.a = 0;
 	l.part = l.a + up( routes * inter * sizeof( half ) );
-	l.items = l.part + up( routes * hidden * sizeof( float ) );
+	l.g = l.part;
+	l.u = l.g + up( routes * inter * sizeof( half ) );
+	l.items = l.part + std::max( up( routes * hidden * sizeof( float ) ), 2 * up( routes * inter * sizeof( half ) ) );
 	l.n_items = l.items + up( routes * sizeof( Item ) );
 	l.sorted = l.n_items + 256;
 	l.total = l.sorted + up( routes * sizeof( int ) );
 	return l;
 }
+
 } // namespace
 
-size_t MoEGguf::scratch_bytes( int top_k, int hidden, int inter ) { return std::max( layout( top_k, hidden, inter ).total, tile_layout( top_k, hidden, inter ).total ); }
+size_t MoEGguf::scratch_bytes( int top_k, int hidden, int inter ) {
+	const bool tile = hidden % 256 == 0 && inter % 256 == 0;   // the widths the tile path takes
+	return std::max( layout( top_k, hidden, inter ).total, tile ? tile_layout( top_k, hidden, inter ).total : 0 );
+}
 
 void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx, const half* topk_w, int top_k, half* out, void* scratch, uint32_t* heat,
 	cudaStream_t stream ) {
@@ -481,27 +495,29 @@ void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx
 	static const bool tile_on = engine::runtime::options().gguf_moe_tile;
 	if ( tile_on && m > kMoERowsPerPass && t.hidden % 256 == 0 && t.inter % 256 == 0 && tile_type( t.type[0] ) && tile_type( t.type[1] ) && tile_type( t.type[2] ) ) {
 		const TileLayout l = tile_layout( top_k, t.hidden, t.inter );
-		auto* g16 = reinterpret_cast<half*>( ws + l.g );
-		auto* u16 = reinterpret_cast<half*>( ws + l.u );
 		auto* a16 = reinterpret_cast<half*>( ws + l.a );
 		auto* part = reinterpret_cast<float*>( ws + l.part );
+		auto* g16 = reinterpret_cast<half*>( ws + l.g );
+		auto* u16 = reinterpret_cast<half*>( ws + l.u );
 		auto* items = reinterpret_cast<Item*>( ws + l.items );
 		auto* n_items = reinterpret_cast<int*>( ws + l.n_items );
 		auto* sorted = reinterpret_cast<int*>( ws + l.sorted );
 		for ( int r0 = 0; r0 < m; r0 += kTileRowsPerPass ) {
-			const int rn = std::min( kTileRowsPerPass, m - r0 ), routes = rn * top_k, mi = std::min( routes, t.num_local + routes / kTileRoutes );
+			const int rn = std::min( kTileRowsPerPass, m - r0 ), routes = rn * top_k;
+			// 32-route items once the local experts average more than about 12 routes in the pass (fewer decodes, at a lower occupancy)
+			const int rt = routes > 12 * 4 * t.num_local ? kTileRoutesMax : 16, mi = std::min( routes, t.num_local + routes / rt );
 			const int* ti = topk_idx + static_cast<size_t>( r0 ) * top_k;
 			const half* tw = topk_w + static_cast<size_t>( r0 ) * top_k;
 			const half* xr = x + static_cast<size_t>( r0 ) * t.hidden;
-			moe_dispatch_kernel<<<1, 256, 2 * t.num_local * sizeof( int ), stream>>>( ti, routes, t.first_expert, t.num_local, items, n_items, sorted, heat, kTileRoutes );
-			if ( t.type[0] == t.type[1] ) tile_proj( t.type[0], gate, up, items, n_items, sorted, mi, xr, true, t.hidden, t.inter, tw, top_k, nullptr, a16, t.act_limit, stream );
+			moe_dispatch_kernel<<<1, 256, 2 * t.num_local * sizeof( int ), stream>>>( ti, routes, t.first_expert, t.num_local, items, n_items, sorted, heat, rt );
+			if ( t.type[0] == t.type[1] ) tile_proj( t.type[0], rt, gate, up, items, n_items, sorted, mi, xr, true, t.hidden, t.inter, tw, top_k, nullptr, a16, t.act_limit, stream );
 			else {
-				tile_proj( t.type[0], gate, nullptr, items, n_items, sorted, mi, xr, true, t.hidden, t.inter, tw, top_k, nullptr, g16, 0.0f, stream );
-				tile_proj( t.type[1], up, nullptr, items, n_items, sorted, mi, xr, true, t.hidden, t.inter, tw, top_k, nullptr, u16, 0.0f, stream );
+				tile_proj( t.type[0], rt, gate, nullptr, items, n_items, sorted, mi, xr, true, t.hidden, t.inter, tw, top_k, nullptr, g16, 0.0f, stream );
+				tile_proj( t.type[1], rt, up, nullptr, items, n_items, sorted, mi, xr, true, t.hidden, t.inter, tw, top_k, nullptr, u16, 0.0f, stream );
 				const size_t act = static_cast<size_t>( routes ) * t.inter;
 				moe_act16_kernel<<<static_cast<unsigned>( ( act + 255 ) / 256 ), 256, 0, stream>>>( g16, u16, a16, act, t.act_limit );
 			}
-			tile_proj( t.type[2], down, nullptr, items, n_items, sorted, mi, a16, false, t.inter, t.hidden, tw, top_k, part, nullptr, 0.0f, stream );
+			tile_proj( t.type[2], rt, down, nullptr, items, n_items, sorted, mi, a16, false, t.inter, t.hidden, tw, top_k, part, nullptr, 0.0f, stream );
 			moe_combine_kernel<<<( rn * t.hidden + 255 ) / 256, 256, 0, stream>>>( part, ti, t.first_expert, t.num_local, out + static_cast<size_t>( r0 ) * t.hidden, rn, top_k, t.hidden );
 		}
 		return;
