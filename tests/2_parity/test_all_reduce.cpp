@@ -13,6 +13,17 @@
 #include <cstring>
 #include <thread>
 #include <atomic>
+#include <string>
+
+// AR_DUMP=<prefix>: every test's outputs appended to <prefix>_<test>.bin, to compare two runs bit for bit (ar_ll on and off)
+static void dump( const char* test, const void* data, size_t bytes ) {
+	const char* prefix = std::getenv( "AR_DUMP" );
+	if ( prefix == nullptr ) return;
+	const std::string path = std::string( prefix ) + "_" + test + ".bin";
+	FILE* f = std::fopen( path.c_str(), "ab" );
+	ENGINE_ASSERT( f != nullptr && std::fwrite( data, 1, bytes, f ) == bytes, "test_all_reduce: AR_DUMP write" );
+	std::fclose( f );
+}
 
 int main() {
 	// AR_RANKS=2 checks the two-rank collective (the TP=2 configuration); the default is the 4-GPU mesh
@@ -105,6 +116,7 @@ int main() {
 			sum_sq_err += ( diff * diff ) / ( r * r + 1e-4f );
 		}
 		double cos_sim = dot / ( std::sqrt( norm_ref ) * std::sqrt( norm_gpu ) + 1e-9 );
+		dump( "allreduce", h_gpu.data(), h_gpu.size() * sizeof( half ) );
 		float rms_rel_err = std::sqrt( static_cast<float>( sum_sq_err / total_elems ) );
 		std::printf( "    [Step %d] cos_sim: %.7f, max_abs_err: %.6f, rms_rel_err: %.6f\n",
 			step, cos_sim, max_abs_err, rms_rel_err );
@@ -185,6 +197,8 @@ int main() {
 			CUDA_CHECK( cudaMemcpy( h_gpu_res.data(), d_res[0].data, total_elems * sizeof( half ), cudaMemcpyDeviceToHost ) );
 			CUDA_CHECK( cudaMemcpy( h_gpu_norm.data(), d_norm_out[0].data, total_elems * sizeof( half ), cudaMemcpyDeviceToHost ) );
 
+			dump( "rmsnorm", h_gpu_res.data(), h_gpu_res.size() * sizeof( half ) );
+			dump( "rmsnorm", h_gpu_norm.data(), h_gpu_norm.size() * sizeof( half ) );
 			double dot_res = 0.0, norm_ref_res = 0.0, norm_gpu_res = 0.0;
 			for ( size_t i = 0; i < total_elems; ++i ) {
 				float r = h_res_ref[i];
@@ -331,6 +345,8 @@ int main() {
 			for ( int d = 0; d < R; ++d ) workers[d].join();
 			double worst_x = 0.0, worst_n = 0.0;
 			for ( int d = 0; d < R; ++d ) {
+				dump( "gated", got_x[d].data(), nx * sizeof( float ) );
+				dump( "gated", got_n[d].data(), nx * sizeof( float ) );
 				for ( size_t i = 0; i < nx; ++i ) {
 					worst_x = std::fmax( worst_x, std::fabs( got_x[d][i] - x_ref[i] ) / ( std::fabs( x_ref[i] ) + 1e-3 ) );
 					worst_n = std::fmax( worst_n, std::fabs( got_n[d][i] - n_ref[i] ) / ( std::fabs( n_ref[i] ) + 1e-3 ) );
@@ -389,6 +405,7 @@ int main() {
 			for ( int d = 0; d < R; ++d ) workers[d].join();
 			size_t mismatches = 0;
 			for ( int d = 0; d < R; ++d ) {
+				dump( "hcapply", got_fused[d].data(), nx * sizeof( float ) );
 				for ( size_t i = 0; i < nx; ++i ) {
 					if ( std::memcmp( &got_fused[d][i], &got_split[d][i], sizeof( float ) ) != 0 ) ++mismatches;
 				}
@@ -397,6 +414,89 @@ int main() {
 			ENGINE_ASSERT( mismatches == 0, "Fused all-reduce + hyper-connection post-step is not bit-identical to the two launches" );
 		}
 		std::printf( "    -> fused post-step PASS (bit-identical on all ranks).\n" );
+	}
+
+	// Test 5: the all-reduce fused with Gemma 4's sandwich-norm residual add and the next norm (hidden 5376): every rank's residual and output
+	// against a reference of the same rounding (the reduced row in FP16; the sums of squares in double, the kernel's in float)
+	std::printf( "[*] Test 5: AllReduce + normed residual add + next norm (Gemma 4 decode, hidden 5376)...\n" );
+	{
+		const int H = 5376;
+		const float eps = 1e-6f, bias = 1.0f, scale = 0.75f;
+		for ( int rows5 : { 1, 2, 4, 8 } ) {
+			const size_t ny = static_cast<size_t>( rows5 ) * H;
+			std::vector<half> h_y[ENGINE_NUM_GPUS];
+			std::vector<float> h_r( ny );
+			std::vector<half> h_wp( H ), h_wn( H );
+			for ( size_t i = 0; i < ny; ++i ) h_r[i] = std::cos( static_cast<float>( i ) * 0.0017f ) * 3.0f;
+			for ( int i = 0; i < H; ++i ) {
+				h_wp[i] = float_to_half( 0.2f * std::sin( static_cast<float>( i ) * 0.013f ) );
+				h_wn[i] = float_to_half( 0.3f * std::cos( static_cast<float>( i ) * 0.007f ) );
+			}
+			for ( int d = 0; d < R; ++d ) {
+				h_y[d].resize( ny );
+				for ( size_t i = 0; i < ny; ++i ) h_y[d][i] = float_to_half( std::sin( static_cast<float>( d * 5000 + i ) * 0.017f ) );
+			}
+			std::vector<float> r_ref( ny ), o_ref( ny );
+			for ( int r = 0; r < rows5; ++r ) {
+				std::vector<float> yv( H );
+				double sq = 0.0;
+				for ( int i = 0; i < H; ++i ) {
+					const size_t j = static_cast<size_t>( r ) * H + i;
+					float sum = half_to_float( h_y[0][j] );
+					for ( int d = 1; d < R; ++d ) sum += half_to_float( h_y[d][j] );
+					yv[i] = half_to_float( float_to_half( sum ) );
+					sq += static_cast<double>( yv[i] ) * yv[i];
+				}
+				const float inv1 = static_cast<float>( 1.0 / std::sqrt( sq / H + eps ) );
+				double sq2 = 0.0;
+				for ( int i = 0; i < H; ++i ) {
+					const size_t j = static_cast<size_t>( r ) * H + i;
+					r_ref[j] = ( h_r[j] + yv[i] * inv1 * ( half_to_float( h_wp[i] ) + bias ) ) * scale;
+					sq2 += static_cast<double>( r_ref[j] ) * r_ref[j];
+				}
+				const float inv2 = static_cast<float>( 1.0 / std::sqrt( sq2 / H + eps ) );
+				for ( int i = 0; i < H; ++i ) {
+					const size_t j = static_cast<size_t>( r ) * H + i;
+					o_ref[j] = r_ref[j] * inv2 * ( half_to_float( h_wn[i] ) + bias );
+				}
+			}
+			std::vector<std::vector<float>> got_r( R, std::vector<float>( ny ) );
+			std::vector<std::vector<half>> got_o( R, std::vector<half>( ny ) );
+			std::thread workers[ENGINE_NUM_GPUS];
+			for ( int d = 0; d < R; ++d ) {
+				workers[d] = std::thread( [&, d]() {
+					CUDA_CHECK( cudaSetDevice( d ) );
+					int sh[2] = { rows5, H }, sh1[1] = { H };
+					pod::TensorView ty = engine::core::arena_alloc_tensor( arenas[d], pod::DType::FP16, sh, 2 );
+					pod::TensorView tr = engine::core::arena_alloc_tensor( arenas[d], pod::DType::FP32, sh, 2 );
+					pod::TensorView to = engine::core::arena_alloc_tensor( arenas[d], pod::DType::FP16, sh, 2 );
+					pod::TensorView twp = engine::core::arena_alloc_tensor( arenas[d], pod::DType::FP16, sh1, 1 );
+					pod::TensorView twn = engine::core::arena_alloc_tensor( arenas[d], pod::DType::FP16, sh1, 1 );
+					CUDA_CHECK( cudaMemcpy( ty.data, h_y[d].data(), ny * sizeof( half ), cudaMemcpyHostToDevice ) );
+					CUDA_CHECK( cudaMemcpy( tr.data, h_r.data(), ny * sizeof( float ), cudaMemcpyHostToDevice ) );
+					CUDA_CHECK( cudaMemcpy( twp.data, h_wp.data(), H * sizeof( half ), cudaMemcpyHostToDevice ) );
+					CUDA_CHECK( cudaMemcpy( twn.data, h_wn.data(), H * sizeof( half ), cudaMemcpyHostToDevice ) );
+					rings[d].all_reduce_normed_add( ty, tr, twp, scale, &twn, &to, eps, bias, streams[d] );
+					CUDA_CHECK( cudaStreamSynchronize( streams[d] ) );
+					CUDA_CHECK( cudaMemcpy( got_r[d].data(), tr.data, ny * sizeof( float ), cudaMemcpyDeviceToHost ) );
+					CUDA_CHECK( cudaMemcpy( got_o[d].data(), to.data, ny * sizeof( half ), cudaMemcpyDeviceToHost ) );
+				} );
+			}
+			for ( int d = 0; d < R; ++d ) workers[d].join();
+			double worst_r = 0.0, worst_o = 0.0;
+			for ( int d = 0; d < R; ++d ) {
+				dump( "normedadd", got_r[d].data(), ny * sizeof( float ) );
+				dump( "normedadd", got_o[d].data(), ny * sizeof( half ) );
+				for ( size_t i = 0; i < ny; ++i ) {
+					// relative to the values' scale (about 1): the float sums of squares move inv by ~1e-7, which a near-zero value would magnify
+					worst_r = std::fmax( worst_r, std::fabs( got_r[d][i] - r_ref[i] ) / ( std::fabs( r_ref[i] ) + 0.05 ) );
+					worst_o = std::fmax( worst_o, std::fabs( half_to_float( got_o[d][i] ) - o_ref[i] ) / ( std::fabs( o_ref[i] ) + 0.05 ) );
+				}
+			}
+			std::printf( "    rows %d: residual max rel diff %.3g, output max rel diff %.3g\n", rows5, worst_r, worst_o ); std::fflush( stdout );
+			ENGINE_ASSERT( worst_r < 1e-5 && worst_o < 2e-3, "Fused all-reduce + normed add differs from the reference" );
+		}
+		std::printf( "    -> fused normed add PASS on all ranks.\n" );
 	}
 
 	engine::comm::destroy_4gpu_mesh( staging_ptrs, flag_ptrs );

@@ -72,13 +72,6 @@ __device__ __forceinline__ void ar_publish_wait( uint32_t* const* flags, int ran
 __device__ __forceinline__ void ll_store( uint4* p, uint32_t d0, uint32_t d1, uint32_t flag ) {
 	asm volatile( "st.volatile.global.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"( p ), "r"( d0 ), "r"( flag ), "r"( d1 ), "r"( flag ) : "memory" );
 }
-__device__ __forceinline__ uint2 ll_load( const uint4* p, uint32_t flag ) {
-	uint32_t d0, f0, d1, f1;
-	do {
-		asm volatile( "ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"( d0 ), "=r"( f0 ), "=r"( d1 ), "=r"( f1 ) : "l"( p ) : "memory" );
-	} while ( f0 != flag || f1 != flag );
-	return make_uint2( d0, d1 );
-}
 // Data units [u0, u1) (8 halves each) of the row to every peer's slot (stage, rank): two LL lines a unit
 template <int NR>
 __device__ __forceinline__ void ll_send( const uint4* src, const void* const* peer_slots, int rank, uint32_t stage, int row, size_t n4, size_t u0, size_t u1,
@@ -96,15 +89,38 @@ __device__ __forceinline__ void ll_send( const uint4* src, const void* const* pe
 		}
 	}
 }
-// Unit i of the rows the peers sent: hp[offset] the unit of rank ( rank + offset ) % NR, own the caller's own unit (offset 0)
+__device__ __forceinline__ uint4 ll_read( const uint4* p ) {
+	uint4 v;
+	asm volatile( "ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"( v.x ), "=r"( v.y ), "=r"( v.z ), "=r"( v.w ) : "l"( p ) : "memory" );
+	return v;
+}
+// Unit i of the rows the peers sent: hp[offset] the unit of rank ( rank + offset ) % NR, own the caller's own unit (offset 0). The peers'
+// lines are read at once and only the ones whose flags do not carry seq yet are read again, so a thread waits about one round trip
 template <int NR>
 __device__ __forceinline__ void ll_gather( __half ( *hp )[8], const uint4 own, const uint4* const* lines, size_t i, uint32_t seq ) {
 	*reinterpret_cast<uint4*>( hp[0] ) = own;
+	uint4 v[NR][2];
 	#pragma unroll
 	for ( int offset = 1; offset < NR; ++offset ) {
-		const uint2 a = ll_load( lines[offset] + 2 * i, seq ), b = ll_load( lines[offset] + 2 * i + 1, seq );
-		*reinterpret_cast<uint4*>( hp[offset] ) = make_uint4( a.x, a.y, b.x, b.y );
+		v[offset][0] = ll_read( lines[offset] + 2 * i );
+		v[offset][1] = ll_read( lines[offset] + 2 * i + 1 );
 	}
+	for ( ;; ) {
+		bool ready = true;
+		#pragma unroll
+		for ( int offset = 1; offset < NR; ++offset ) {
+			#pragma unroll
+			for ( int h = 0; h < 2; ++h ) {
+				if ( v[offset][h].y != seq || v[offset][h].w != seq ) {
+					ready = false;
+					v[offset][h] = ll_read( lines[offset] + 2 * i + h );
+				}
+			}
+		}
+		if ( ready ) break;
+	}
+	#pragma unroll
+	for ( int offset = 1; offset < NR; ++offset ) *reinterpret_cast<uint4*>( hp[offset] ) = make_uint4( v[offset][0].x, v[offset][0].z, v[offset][1].x, v[offset][1].z );
 }
 // This rank's slots (stage, ( rank + offset ) % NR), row `row`, in LL lines
 template <int NR>
@@ -117,7 +133,7 @@ __device__ __forceinline__ void ll_lines( const uint4** lines, const void* const
 }
 #endif
 
-template <int NR>
+template <int NR, bool LL>
 __global__ __launch_bounds__( 512 )
 void all_reduce_rms_norm_ring_kernel(
 	int rank,
@@ -150,41 +166,56 @@ void all_reduce_rms_norm_ring_kernel(
 	uint4* my_slot = reinterpret_cast<uint4*>( my_staging ) + row * n4;
 	const uint4* src_x = ( (const uint4*) ( x + row * row_elems ) );
 
-	// Step 1: publish local X slice to my staging slot
-	for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) {
-		my_slot[i] = src_x[i];
+	const uint4* r_ptrs[NR];
+#if AR_LL
+	if constexpr ( LL ) {
+		// grid (rows, AR_LL_GROUPS): every block of the row sends its share; the first then reduces the whole row, the others are done
+		const size_t per = ( n4 + gridDim.y - 1 ) / gridDim.y, u0 = blockIdx.y * per;
+		ll_send<NR>( src_x, peer_slots, rank, stage, row, n4, u0, min( n4, u0 + per ), seq );
+		if ( blockIdx.y != 0 ) {
+			ar_retire_n( flags[rank], seq, gridDim.x * gridDim.y );
+			return;
+		}
+		ll_lines<NR>( r_ptrs, peer_slots, rank, stage, row, n4 );
 	}
+	else
+#endif
+	{
+		// Step 1: publish local X slice to my staging slot
+		for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) {
+			my_slot[i] = src_x[i];
+		}
 
-	__threadfence_system();
-	__syncthreads();
+		__threadfence_system();
+		__syncthreads();
 
-	// Step 2: per-row synchronization across the NR ranks using system-scope flags
-	if ( threadIdx.x == 0 ) {
-		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
-	}
-	__syncwarp();
+		// Step 2: per-row synchronization across the NR ranks using system-scope flags
+		if ( threadIdx.x == 0 ) {
+			stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
+		}
+		__syncwarp();
 
-	if ( threadIdx.x < NR ) {
-		int p = threadIdx.x;
-		if ( p != rank ) {
-			uint32_t* flag_ptr = ar_flag( flags[p], stage, row, p );
-			int spins = 0;
-			while ( ldg_acquire_sys_u32( flag_ptr ) < seq ) {
-				if ( ++spins > 64 ) {
-					__nanosleep( 32 );
+		if ( threadIdx.x < NR ) {
+			int p = threadIdx.x;
+			if ( p != rank ) {
+				uint32_t* flag_ptr = ar_flag( flags[p], stage, row, p );
+				int spins = 0;
+				while ( ldg_acquire_sys_u32( flag_ptr ) < seq ) {
+					if ( ++spins > 64 ) {
+						__nanosleep( 32 );
+					}
 				}
 			}
 		}
-	}
-	__syncthreads();
+		__syncthreads();
 
-	// Step 3: contention-free ring accumulation across NR peers
-	const uint4* r_ptrs[NR];
-	#pragma unroll
-	for ( int offset = 0; offset < NR; ++offset ) {
-		int p = ( rank + offset ) % NR;
-		uint8_t* p_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[p] ) ) + ( (size_t) stage * 4 + p ) * IPC_SLOT_BYTES;
-		r_ptrs[offset] = reinterpret_cast<const uint4*>( p_staging ) + row * n4;
+		// Step 3: contention-free ring accumulation across NR peers
+		#pragma unroll
+		for ( int offset = 0; offset < NR; ++offset ) {
+			int p = ( rank + offset ) % NR;
+			uint8_t* p_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[p] ) ) + ( (size_t) stage * 4 + p ) * IPC_SLOT_BYTES;
+			r_ptrs[offset] = reinterpret_cast<const uint4*>( p_staging ) + row * n4;
+		}
 	}
 
 	float local_sum_sq = 0.0f;
@@ -193,8 +224,14 @@ void all_reduce_rms_norm_ring_kernel(
 
 	for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) {
 		__half hp[NR][8];
-		#pragma unroll
-		for ( int r = 0; r < NR; ++r ) *reinterpret_cast<uint4*>( hp[r] ) = r_ptrs[r][i];
+#if AR_LL
+		if constexpr ( LL ) ll_gather<NR>( hp, src_x[i], r_ptrs, i, seq );
+		else
+#endif
+		{
+			#pragma unroll
+			for ( int r = 0; r < NR; ++r ) *reinterpret_cast<uint4*>( hp[r] ) = r_ptrs[r][i];
+		}
 
 		uint4 vr = *( (const uint4*) ( row_res + i * 8 ) );
 		__half hr[8];
@@ -257,7 +294,7 @@ void all_reduce_rms_norm_ring_kernel(
 		*( (uint4*) ( dst_row + i * 8 ) ) = *reinterpret_cast<uint4*>( hx );
 	}
 
-	ar_retire( flags[rank], seq );
+	ar_retire_n( flags[rank], seq, gridDim.x * gridDim.y );
 }
 
 template <int NR>
@@ -368,7 +405,7 @@ void all_reduce_ll_kernel(
 // partials ) (the same sum and rounding as the plain all-reduce), resid = ( resid + RMSNorm( y ) * ( w_post + bias ) ) * scale over the fp32 residual,
 // then out = RMSNorm( resid ) * ( w_next + bias ) when w_next is given. y is not written back. The sums of squares differ in order from the module calls.
 constexpr int AR_NA_CHUNKS = 3;   // 8-value chunks per thread: hidden <= 3 * 256 * 8 = 6144
-template <int NR>
+template <int NR, bool LL>
 __global__ __launch_bounds__( 256 )
 void all_reduce_normed_add_kernel(
 	int rank,
@@ -390,19 +427,34 @@ void all_reduce_normed_add_kernel(
 	uint32_t* flags[4] = { f0, f1, f2, f3 };
 	const uint32_t seq = ar_next_seq( flags[rank] );
 	const uint32_t stage = seq & 3;
-	uint8_t* my_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[rank] ) ) + ( (size_t) stage * 4 + rank ) * IPC_SLOT_BYTES;
-	uint4* my_slot = reinterpret_cast<uint4*>( my_staging ) + row * n4;
 	const uint4* src_y = reinterpret_cast<const uint4*>( y + static_cast<size_t>( row ) * hidden_size );
-	for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) my_slot[i] = src_y[i];
-	__threadfence_system();
-	__syncthreads();
-	ar_publish_wait<NR>( flags, rank, stage, row, seq );
 	const uint4* r_ptrs[NR];
-	#pragma unroll
-	for ( int offset = 0; offset < NR; ++offset ) {
-		const int p = ( rank + offset ) % NR;
-		uint8_t* p_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[p] ) ) + ( (size_t) stage * 4 + p ) * IPC_SLOT_BYTES;
-		r_ptrs[offset] = reinterpret_cast<const uint4*>( p_staging ) + row * n4;
+#if AR_LL
+	if constexpr ( LL ) {
+		// grid (rows, AR_LL_GROUPS): every block of the row sends its share; the first then reduces the whole row, the others are done
+		const size_t per = ( n4 + gridDim.y - 1 ) / gridDim.y, u0 = blockIdx.y * per;
+		ll_send<NR>( src_y, peer_slots, rank, stage, row, n4, u0, min( n4, u0 + per ), seq );
+		if ( blockIdx.y != 0 ) {
+			ar_retire_n( flags[rank], seq, gridDim.x * gridDim.y );
+			return;
+		}
+		ll_lines<NR>( r_ptrs, peer_slots, rank, stage, row, n4 );
+	}
+	else
+#endif
+	{
+		uint8_t* my_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[rank] ) ) + ( (size_t) stage * 4 + rank ) * IPC_SLOT_BYTES;
+		uint4* my_slot = reinterpret_cast<uint4*>( my_staging ) + row * n4;
+		for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) my_slot[i] = src_y[i];
+		__threadfence_system();
+		__syncthreads();
+		ar_publish_wait<NR>( flags, rank, stage, row, seq );
+		#pragma unroll
+		for ( int offset = 0; offset < NR; ++offset ) {
+			const int p = ( rank + offset ) % NR;
+			uint8_t* p_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[p] ) ) + ( (size_t) stage * 4 + p ) * IPC_SLOT_BYTES;
+			r_ptrs[offset] = reinterpret_cast<const uint4*>( p_staging ) + row * n4;
+		}
 	}
 	// the reduced row, rounded to FP16 as the plain all-reduce stores it
 	float ys[AR_NA_CHUNKS][8];
@@ -412,8 +464,14 @@ void all_reduce_normed_add_kernel(
 		const size_t i = threadIdx.x + c * blockDim.x;
 		if ( i >= n4 ) continue;
 		__half hp[NR][8];
-		#pragma unroll
-		for ( int r = 0; r < NR; ++r ) *reinterpret_cast<uint4*>( hp[r] ) = r_ptrs[r][i];
+#if AR_LL
+		if constexpr ( LL ) ll_gather<NR>( hp, src_y[i], r_ptrs, i, seq );
+		else
+#endif
+		{
+			#pragma unroll
+			for ( int r = 0; r < NR; ++r ) *reinterpret_cast<uint4*>( hp[r] ) = r_ptrs[r][i];
+		}
 		#pragma unroll
 		for ( int k = 0; k < 8; ++k ) {
 			float v = __half2float( hp[0][k] );
@@ -460,7 +518,7 @@ void all_reduce_normed_add_kernel(
 			reinterpret_cast<uint4*>( row_o )[i] = *reinterpret_cast<uint4*>( ho );
 		}
 	}
-	ar_retire( flags[rank], seq );
+	ar_retire_n( flags[rank], seq, gridDim.x * gridDim.y );
 }
 
 // all_reduce_ring_kernel followed by the Flash-Next gated add and the per-stream norm for the next site. Grid (rows, hc): the block (row, s) reduces the
@@ -468,7 +526,7 @@ void all_reduce_normed_add_kernel(
 // post[row, s] * y to the fp32 stream, reduces its sum of squares and writes the normed stream. y itself is not written back (it is dead after the add).
 // The summation of the squares differs in order from GatedResidual::norm; the streams are updated identically.
 constexpr int AR_GN_CHUNKS = 2;   // 8-value chunks per thread: hidden <= 2 * 256 * 8 = 4096
-template <int NR>
+template <int NR, bool LL>
 __global__ __launch_bounds__( 256 )
 void all_reduce_gated_norm_kernel(
 	int rank,
@@ -493,35 +551,57 @@ void all_reduce_gated_norm_kernel(
 	uint32_t* flags[4] = { f0, f1, f2, f3 };
 	const uint32_t seq = ar_next_seq( flags[rank] );
 	const uint32_t stage = seq & 3;
-	uint8_t* my_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[rank] ) ) + ( (size_t) stage * 4 + rank ) * IPC_SLOT_BYTES;
-	uint4* my_slot = reinterpret_cast<uint4*>( my_staging ) + row * n4;
 	const uint4* src_y = ( (const uint4*) ( y + row * row_elems ) );
-	if ( addend == nullptr ) {
-		for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) my_slot[i] = src_y[i];
-	}
-	else {
-		const uint4* src_a = reinterpret_cast<const uint4*>( addend + row * row_elems );
-		const float g = addend_gate[row];
-		for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) {
-			uint4 yv = src_y[i];
+	const uint4* src_a = addend != nullptr ? reinterpret_cast<const uint4*>( addend + row * row_elems ) : nullptr;
+	const float g = addend != nullptr ? addend_gate[row] : 0.0f;
+	// this rank's unit i of the row it contributes: y, plus the gated addend when given
+	auto own = [&]( size_t i ) {
+		uint4 yv = src_y[i];
+		if ( src_a != nullptr ) {
 			const uint4 av = src_a[i];
 			__half* yh = reinterpret_cast<__half*>( &yv );
 			const __half* ah = reinterpret_cast<const __half*>( &av );
 			#pragma unroll
 			for ( int k = 0; k < 8; ++k ) yh[k] = __float2half_rn( __half2float( yh[k] ) + g * __half2float( ah[k] ) );
-			my_slot[i] = yv;
 		}
-	}
-	__threadfence_system();
-	__syncthreads();
-	ar_publish_wait<NR>( flags, rank, stage, row, seq );
-
+		return yv;
+	};
 	const uint4* r_ptrs[NR];
-	#pragma unroll
-	for ( int offset = 0; offset < NR; ++offset ) {
-		const int p = ( rank + offset ) % NR;
-		uint8_t* p_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[p] ) ) + ( (size_t) stage * 4 + p ) * IPC_SLOT_BYTES;
-		r_ptrs[offset] = reinterpret_cast<const uint4*>( p_staging ) + row * n4;
+#if AR_LL
+	if constexpr ( LL ) {
+		// block (row, s) sends a share of the row; every block of the row reads all of the peers' lines
+		{
+			uint4* dst[NR];
+			#pragma unroll
+			for ( int p = 0; p < NR; ++p ) dst[p] = reinterpret_cast<uint4*>( static_cast<uint8_t*>( const_cast<void*>( peer_slots[p] ) ) + ( (size_t) stage * 4 + rank ) * IPC_SLOT_BYTES ) + 2 * row * n4;
+			const size_t per = ( n4 + gridDim.y - 1 ) / gridDim.y, u0 = blockIdx.y * per, u1 = min( n4, u0 + per );
+			for ( size_t i = u0 + threadIdx.x; i < u1; i += blockDim.x ) {
+				const uint4 v = own( i );
+				#pragma unroll
+				for ( int p = 0; p < NR; ++p ) {
+					if ( p == rank ) continue;
+					ll_store( dst[p] + 2 * i, v.x, v.y, seq );
+					ll_store( dst[p] + 2 * i + 1, v.z, v.w, seq );
+				}
+			}
+		}
+		ll_lines<NR>( r_ptrs, peer_slots, rank, stage, row, n4 );
+	}
+	else
+#endif
+	{
+		uint8_t* my_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[rank] ) ) + ( (size_t) stage * 4 + rank ) * IPC_SLOT_BYTES;
+		uint4* my_slot = reinterpret_cast<uint4*>( my_staging ) + row * n4;
+		for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) my_slot[i] = own( i );
+		__threadfence_system();
+		__syncthreads();
+		ar_publish_wait<NR>( flags, rank, stage, row, seq );
+		#pragma unroll
+		for ( int offset = 0; offset < NR; ++offset ) {
+			const int p = ( rank + offset ) % NR;
+			uint8_t* p_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[p] ) ) + ( (size_t) stage * 4 + p ) * IPC_SLOT_BYTES;
+			r_ptrs[offset] = reinterpret_cast<const uint4*>( p_staging ) + row * n4;
+		}
 	}
 
 	const float pv = post[static_cast<size_t>( row ) * hc + s];
@@ -533,8 +613,14 @@ void all_reduce_gated_norm_kernel(
 		const size_t i = threadIdx.x + static_cast<size_t>( c ) * blockDim.x;
 		if ( i >= n4 ) continue;
 		__half hp[NR][8];
-		#pragma unroll
-		for ( int r = 0; r < NR; ++r ) *reinterpret_cast<uint4*>( hp[r] ) = r_ptrs[r][i];
+#if AR_LL
+		if constexpr ( LL ) ll_gather<NR>( hp, own( i ), r_ptrs, i, seq );
+		else
+#endif
+		{
+			#pragma unroll
+			for ( int r = 0; r < NR; ++r ) *reinterpret_cast<uint4*>( hp[r] ) = r_ptrs[r][i];
+		}
 		float* xs = xs_row + i * 8;
 		const float4 a0 = *reinterpret_cast<const float4*>( xs ), a1 = *reinterpret_cast<const float4*>( xs + 4 );
 		float v[8] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w };
@@ -724,8 +810,17 @@ void CollectiveRing::all_reduce_rms_norm(
 	const half* w_ptr = weight.ptr<const half>();
 	half* out_ptr = ( out != nullptr ) ? out->ptr<half>() : nullptr;
 
-	auto kernel = ( nranks == 2 ) ? all_reduce_rms_norm_ring_kernel<2> : all_reduce_rms_norm_ring_kernel<4>;
-	kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>(
+	auto kernel = ( nranks == 2 ) ? all_reduce_rms_norm_ring_kernel<2, false> : all_reduce_rms_norm_ring_kernel<4, false>;
+#if AR_LL
+	int groups = 1;
+	if ( ll_rows( rows, hidden_size ) ) {
+		kernel = ( nranks == 2 ) ? all_reduce_rms_norm_ring_kernel<2, true> : all_reduce_rms_norm_ring_kernel<4, true>;
+		groups = AR_LL_GROUPS;
+	}
+#else
+	const int groups = 1;
+#endif
+	kernel<<<dim3( rows, groups ), dim3( 256 ), 0, stream>>>(
 		rank,
 		peer_ptrs[0],
 		peer_ptrs[1],
@@ -798,7 +893,10 @@ void CollectiveRing::all_reduce_gated_norm(
 	const int hidden_size = y.shape[1];
 	ENGINE_ASSERT( hc == 4 && rows >= 1 && rows <= AR_MAX_ROWS && static_cast<size_t>( rows ) * hidden_size * sizeof( half ) <= IPC_SLOT_BYTES, "all_reduce_gated_norm: rows out of range" );
 	ENGINE_ASSERT( hidden_size % 128 == 0 && hidden_size / 8 <= AR_GN_CHUNKS * 256, "all_reduce_gated_norm: hidden_size" );
-	auto kernel = ( nranks == 2 ) ? all_reduce_gated_norm_kernel<2> : all_reduce_gated_norm_kernel<4>;
+	auto kernel = ( nranks == 2 ) ? all_reduce_gated_norm_kernel<2, false> : all_reduce_gated_norm_kernel<4, false>;
+#if AR_LL
+	if ( ll_rows( rows, hidden_size ) ) kernel = ( nranks == 2 ) ? all_reduce_gated_norm_kernel<2, true> : all_reduce_gated_norm_kernel<4, true>;
+#endif
 	kernel<<<dim3( rows, hc ), dim3( 256 ), 0, stream>>>(
 		rank, peer_ptrs[0], peer_ptrs[1], peer_ptrs[2], peer_ptrs[3],
 		static_cast<uint32_t*>( sync_flags[0] ), static_cast<uint32_t*>( sync_flags[1] ), static_cast<uint32_t*>( sync_flags[2] ), static_cast<uint32_t*>( sync_flags[3] ),
@@ -843,8 +941,17 @@ void CollectiveRing::all_reduce_normed_add(
 	ENGINE_ASSERT( rows >= 1 && rows <= AR_MAX_ROWS && static_cast<size_t>( rows ) * hidden_size * sizeof( half ) <= IPC_SLOT_BYTES, "all_reduce_normed_add: rows out of range" );
 	ENGINE_ASSERT( hidden_size % 8 == 0 && hidden_size <= AR_NA_CHUNKS * 256 * 8 && resid.dtype == pod::DType::FP32, "all_reduce_normed_add: hidden_size or residual" );
 	ENGINE_ASSERT( ( w_next == nullptr ) == ( out == nullptr ), "all_reduce_normed_add: the next norm needs its output" );
-	auto kernel = ( nranks == 2 ) ? all_reduce_normed_add_kernel<2> : all_reduce_normed_add_kernel<4>;
-	kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>(
+	auto kernel = ( nranks == 2 ) ? all_reduce_normed_add_kernel<2, false> : all_reduce_normed_add_kernel<4, false>;
+#if AR_LL
+	int groups = 1;
+	if ( ll_rows( rows, hidden_size ) ) {
+		kernel = ( nranks == 2 ) ? all_reduce_normed_add_kernel<2, true> : all_reduce_normed_add_kernel<4, true>;
+		groups = AR_LL_GROUPS;
+	}
+#else
+	const int groups = 1;
+#endif
+	kernel<<<dim3( rows, groups ), dim3( 256 ), 0, stream>>>(
 		rank, peer_ptrs[0], peer_ptrs[1], peer_ptrs[2], peer_ptrs[3],
 		static_cast<uint32_t*>( sync_flags[0] ), static_cast<uint32_t*>( sync_flags[1] ), static_cast<uint32_t*>( sync_flags[2] ), static_cast<uint32_t*>( sync_flags[3] ),
 		y.ptr<const half>(), resid.ptr<float>(), w_post.ptr<const half>(), w_next != nullptr ? w_next->ptr<const half>() : nullptr,
