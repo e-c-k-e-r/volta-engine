@@ -896,6 +896,9 @@ void route_select_kernel( const float* __restrict__ part, const float* __restric
 
 // ---- hyper-connections ------------------------------------------------------------------------------------------------------------------
 
+// Element d is thread d % 256's, accumulated in ascending order; up to kHcnPer elements a thread all its loads are issued before any is used
+// (the collapsed values stay in registers), wider rows go through shared memory: the same bits either way
+constexpr int kHcnPer = 24;
 __global__ __launch_bounds__( 256 )
 void hc_collapse_norm_kernel( const float* __restrict__ streams, const float* __restrict__ pre, const half* __restrict__ norm_w, half* __restrict__ out,
 	float* __restrict__ post, float post_scale, int hidden, float eps ) {
@@ -904,15 +907,35 @@ void hc_collapse_norm_kernel( const float* __restrict__ streams, const float* __
 	const float p0 = pre[r * 4 + 0], p1 = pre[r * 4 + 1], p2 = pre[r * 4 + 2], p3 = pre[r * 4 + 3];
 	const float* s = streams + static_cast<size_t>( r ) * 4 * hidden;
 	float ss = 0.0f;
-	for ( int d = threadIdx.x; d < hidden; d += blockDim.x ) {
-		const float c = p0 * s[d] + p1 * s[hidden + d] + p2 * s[2 * hidden + d] + p3 * s[3 * hidden + d];
-		hcn_smem[d] = c;
-		ss += c * c;
+	if ( ( hidden + 255 ) / 256 <= kHcnPer ) {
+		float c[kHcnPer], wv[kHcnPer];
+		#pragma unroll
+		for ( int k = 0; k < kHcnPer; ++k ) {
+			const int d = threadIdx.x + 256 * k;
+			c[k] = d < hidden ? p0 * s[d] + p1 * s[hidden + d] + p2 * s[2 * hidden + d] + p3 * s[3 * hidden + d] : 0.0f;
+			wv[k] = d < hidden ? __half2float( norm_w[d] ) : 0.0f;
+		}
+		#pragma unroll
+		for ( int k = 0; k < kHcnPer; ++k ) if ( threadIdx.x + 256 * k < hidden ) ss += c[k] * c[k];
+		ss = block_sum<256>( ss );
+		const float inv = rsqrtf( ss / hidden + eps );
+		#pragma unroll
+		for ( int k = 0; k < kHcnPer; ++k ) {
+			const int d = threadIdx.x + 256 * k;
+			if ( d < hidden ) out[static_cast<size_t>( r ) * hidden + d] = __float2half_rn( c[k] * inv * wv[k] );
+		}
 	}
-	ss = block_sum<256>( ss );
-	const float inv = rsqrtf( ss / hidden + eps );
-	for ( int d = threadIdx.x; d < hidden; d += blockDim.x ) {
-		out[static_cast<size_t>( r ) * hidden + d] = __float2half_rn( hcn_smem[d] * inv * __half2float( norm_w[d] ) );
+	else {
+		for ( int d = threadIdx.x; d < hidden; d += blockDim.x ) {
+			const float c = p0 * s[d] + p1 * s[hidden + d] + p2 * s[2 * hidden + d] + p3 * s[3 * hidden + d];
+			hcn_smem[d] = c;
+			ss += c * c;
+		}
+		ss = block_sum<256>( ss );
+		const float inv = rsqrtf( ss / hidden + eps );
+		for ( int d = threadIdx.x; d < hidden; d += blockDim.x ) {
+			out[static_cast<size_t>( r ) * hidden + d] = __float2half_rn( hcn_smem[d] * inv * __half2float( norm_w[d] ) );
+		}
 	}
 	if ( post && threadIdx.x < 4 ) post[r * 4 + threadIdx.x] *= post_scale;
 }
@@ -1052,7 +1075,8 @@ void DSV4::route( const half* x, const half* w_t, const float* bias, const float
 
 void DSV4::hc_collapse_norm( const float* streams, const float* pre, const half* norm_w, half* out, float* post, float post_scale, int hidden, float eps, int rows,
 	cudaStream_t stream ) {
-	hc_collapse_norm_kernel<<<rows, 256, static_cast<size_t>( hidden ) * sizeof( float ), stream>>>( streams, pre, norm_w, out, post, post_scale, hidden, eps );
+	const size_t smem = ( hidden + 255 ) / 256 <= kHcnPer ? 0 : static_cast<size_t>( hidden ) * sizeof( float );
+	hc_collapse_norm_kernel<<<rows, 256, smem, stream>>>( streams, pre, norm_w, out, post, post_scale, hidden, eps );
 }
 
 void DSV4::hc_identity_pre( float* pre, int rows, cudaStream_t stream ) {

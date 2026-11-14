@@ -321,6 +321,17 @@ void lin_fwd( const pod::TensorView& x, const pod::LinearWeight& w, pod::TensorV
 	else engine::modules::DSV4::linear_fp8( x.ptr<const backend::half_t>(), w.w0.ptr<const uint8_t>(), w.w1.ptr<const uint8_t>(), out.ptr<backend::half_t>(), x.shape[0], w.w0.shape[1], w.w0.shape[0], scratch, stream );
 }
 
+// Two projections of the same input: one GGUF launch when both are GGUF weights of one block type and width (and untiled) at decode rows
+void lin_fwd2( const pod::TensorView& x, const pod::LinearWeight& wa, pod::TensorView& a, const pod::LinearWeight& wb, pod::TensorView& b, backend::half_t* scratch,
+	backend::stream_t stream ) {
+	if ( wa.type == pod::QuantType::GGUF && wb.type == pod::QuantType::GGUF && wa.gguf_type == wb.gguf_type && wa.gguf_k == wb.gguf_k && wa.gguf_tile_heads == 0 &&
+		wb.gguf_tile_heads == 0 && engine::modules::LinearGguf::forward2( x, wa.w0.data, wa.gguf_n, a, wb.w0.data, wb.gguf_n, b,
+			static_cast<engine::modules::GgmlType>( wa.gguf_type ), wa.gguf_k, stream ) )
+		return;
+	lin_fwd( x, wa, a, scratch, stream );
+	lin_fwd( x, wb, b, scratch, stream );
+}
+
 // A 1-D tensor (BF16 / F32) as FP16 or FP32 on the device, optionally elements [begin, begin + count)
 pod::TensorView load_vec( engine::loader::SafeTensorsRepo& repo, const std::string& name, pod::MemoryArena& arena, pod::DType to, int begin = 0, int count = -1 ) {
 	int shard = -1;
@@ -1902,6 +1913,21 @@ void DeepseekV41Pipeline::shift_rows( int k ) {
 	d_img_flag_ += d;
 }
 
+// The sublayer's mHC mixes (the new pre into pre_view) and its input, the RMSNorm of the streams collapsed with the lagged pre: one launch for
+// decode-sized rows, else collapse + DSV4::hc_collapse_norm (the same bits)
+void DeepseekV41Pipeline::hc_input( const pod::TensorView& fn, const pod::TensorView& base, const pod::TensorView& scale, pod::TensorView& pre_view,
+	const pod::TensorView& norm, float eps, int m, backend::stream_t stream ) {
+	const int H = config_.hidden_size;
+	if ( engine::modules::HyperConnection::collapse_lagged_norm( streams_.ptr<const float>(), fn.ptr<const float>(), base.ptr<const float>(), scale.ptr<const float>(),
+		pre_[pre_cur_], norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), mhc_post_.ptr<float>(), mhc_comb_.ptr<float>(), mhc_inv_rms_.ptr<float>(),
+		mhc_mix_.ptr<float>(), pre_view.ptr<float>(), H, config_.hc_sinkhorn_iters, config_.hc_eps, eps, kOutScale, stream, m ) )
+		return;
+	engine::modules::HyperConnection::collapse( streams_, fn, base, scale, collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_, pre_view, H, config_.hc_sinkhorn_iters,
+		config_.hc_eps, stream, m );
+	DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), mhc_post_.ptr<float>(), kOutScale, H,
+		eps, m, stream );
+}
+
 // Rows of a truncated prefill that skip the layers from this one on: only what the kept rows read of them, this layer's window entries and,
 // as the KV source, its compressed KV and index keys. The pre-mix toggle is left alone (these rows go no further)
 void DeepseekV41Pipeline::attention_kv( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
@@ -1910,10 +1936,7 @@ void DeepseekV41Pipeline::attention_kv( int layer, DeepseekV41LayerWeights& lw, 
 	const int H = config_.hidden_size;
 	const float eps = config_.norm_eps;
 	pod::TensorView pre_view = pod::make_tensor_2d( pre_[pre_cur_ ^ 1], pod::DType::FP32, 1, 4 * m );
-	engine::modules::HyperConnection::collapse( streams_, lw.hc_attn_fn, lw.hc_attn_base, lw.hc_attn_scale, collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_,
-		pre_view, H, config_.hc_sinkhorn_iters, config_.hc_eps, stream, m );
-	DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], lw.attn_norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), mhc_post_.ptr<float>(),
-		kOutScale, H, eps, m, stream );
+	hc_input( lw.hc_attn_fn, lw.hc_attn_base, lw.hc_attn_scale, pre_view, lw.attn_norm, eps, m, stream );
 	const float* rope = lw.ratio > 0 ? rope_comp_ : rope_plain_;
 	lin_fwd( norm_x_, lw.wkv, kv_, fp8_scratch_, stream );
 	RMSNorm::forward( kv_, lw.kv_norm, kv_n_, eps, 0.0f, stream );
@@ -1937,18 +1960,14 @@ void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int
 	// mHC: this sublayer's mixes from the streams; its input uses the pre-mix of the sublayer before (lagged)
 	float* pre_new = pre_[pre_cur_ ^ 1];
 	pod::TensorView pre_view = pod::make_tensor_2d( pre_new, pod::DType::FP32, 1, 4 * m );
-	engine::modules::HyperConnection::collapse( streams_, lw.hc_attn_fn, lw.hc_attn_base, lw.hc_attn_scale, collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_,
-		pre_view, H, config_.hc_sinkhorn_iters, config_.hc_eps, stream, m );
-	DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], lw.attn_norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), mhc_post_.ptr<float>(),
-		kOutScale, H, eps, m, stream );
+	hc_input( lw.hc_attn_fn, lw.hc_attn_base, lw.hc_attn_scale, pre_view, lw.attn_norm, eps, m, stream );
 	pre_cur_ ^= 1;
 	trace_tensor( 1000 + layer, norm_x_, m, H, stream );
 
 	const float* rope = lw.ratio > 0 ? rope_comp_ : rope_plain_;
-	lin_fwd( norm_x_, lw.wq_a, qr_, fp8_scratch_, stream );
+	lin_fwd2( norm_x_, lw.wq_a, qr_, lw.wkv, kv_, fp8_scratch_, stream );
 	RMSNorm::forward( qr_, lw.q_norm, qr_n_, eps, 0.0f, stream );
 	lin_fwd( qr_n_, lw.wq_b, q_, fp8_scratch_, stream );
-	lin_fwd( norm_x_, lw.wkv, kv_, fp8_scratch_, stream );
 	RMSNorm::forward( kv_, lw.kv_norm, kv_n_, eps, 0.0f, stream );
 	trace_tensor( 3000 + layer, kv_n_, m, DSV4::HD, stream );
 	trace_tensor( 6000 + layer, q_, m, lh_ * DSV4::HD, stream );
@@ -1999,10 +2018,7 @@ void DeepseekV41Pipeline::ffn_front( DeepseekV41LayerWeights& lw, int m, backend
 	const int H = config_.hidden_size;
 	float* pre_new = pre_[pre_cur_ ^ 1];
 	pod::TensorView pre_view = pod::make_tensor_2d( pre_new, pod::DType::FP32, 1, 4 * m );
-	engine::modules::HyperConnection::collapse( streams_, lw.hc_ffn_fn, lw.hc_ffn_base, lw.hc_ffn_scale, collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_,
-		pre_view, H, config_.hc_sinkhorn_iters, config_.hc_eps, stream, m );
-	DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], lw.ffn_norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), mhc_post_.ptr<float>(),
-		kOutScale, H, config_.norm_eps, m, stream );
+	hc_input( lw.hc_ffn_fn, lw.hc_ffn_base, lw.hc_ffn_scale, pre_view, lw.ffn_norm, config_.norm_eps, m, stream );
 	pre_cur_ ^= 1;
 	DSV4::route( norm_x_.ptr<const backend::half_t>(), lw.router_w_t.ptr<const backend::half_t>(), lw.router_bias.ptr<const float>(), lw.router_bias_vl.data ? lw.router_bias_vl.ptr<const float>() : nullptr, experts > 0 ? nullptr : d_img_flag_, lw.perm, d_topk_idx_, d_topk_w_, route_scratch_,
 		H, experts > 0 ? experts : config_.num_experts, top_k > 0 ? top_k : config_.top_k, config_.route_scale / ( experts == 0 && lw.gguf_experts ? kOutScale : 1.0f ), m, stream );
@@ -2029,8 +2045,7 @@ void DeepseekV41Pipeline::ffn_back( DeepseekV41LayerWeights& lw, int m, backend:
 	const int H = config_.hidden_size;
 	if ( lw.sh_cols > 0 ) {
 		pod::TensorView g = view( sh_g_, 0, sh_g_.shape[0], lw.sh_cols ), u = view( sh_u_, 0, sh_u_.shape[0], lw.sh_cols ), i = view( sh_i_, 0, sh_i_.shape[0], lw.sh_cols );
-		lin_fwd( norm_x_, lw.sh_gate, g, fp8_scratch_, stream );
-		lin_fwd( norm_x_, lw.sh_up, u, fp8_scratch_, stream );
+		lin_fwd2( norm_x_, lw.sh_gate, g, lw.sh_up, u, fp8_scratch_, stream );
 		engine::modules::SwiGLU::forward( g, u, i, stream, config_.swiglu_limit );
 		lin_fwd( i, lw.sh_down, sh_out_, fp8_scratch_, stream );
 		engine::modules::MoERouter::accumulate( moe_out_.ptr<backend::half_t>(), sh_out_.ptr<const backend::half_t>(), backend::from_float_half( 1.0f ), m * H, stream );
@@ -2248,15 +2263,11 @@ void DeepseekV41Pipeline::dspark_forward( int slot, int pos, int from, int win_s
 		// attention sublayer: the mHC mixes, the block's queries and keys, the window plus the block, the grouped output projection
 		float* pre_new = pre_[pre_cur_ ^ 1];
 		pod::TensorView pre_view = pod::make_tensor_2d( pre_new, pod::DType::FP32, 1, 4 * B );
-		engine::modules::HyperConnection::collapse( streams_, lw.hc_attn_fn, lw.hc_attn_base, lw.hc_attn_scale, collapsed_, mhc_post_, mhc_comb_, mhc_inv_rms_, mhc_mix_,
-			pre_view, H, config_.hc_sinkhorn_iters, config_.hc_eps, stream, B );
-		DSV4::hc_collapse_norm( streams_.ptr<const float>(), pre_[pre_cur_], lw.attn_norm.ptr<const backend::half_t>(), norm_x_.ptr<backend::half_t>(), mhc_post_.ptr<float>(),
-			kOutScale, H, eps, B, stream );
+		hc_input( lw.hc_attn_fn, lw.hc_attn_base, lw.hc_attn_scale, pre_view, lw.attn_norm, eps, B, stream );
 		pre_cur_ ^= 1;
-		lin_fwd( norm_x_, lw.wq_a, qr_, fp8_scratch_, stream );
+		lin_fwd2( norm_x_, lw.wq_a, qr_, lw.wkv, kv_, fp8_scratch_, stream );
 		RMSNorm::forward( qr_, lw.q_norm, qr_n_, eps, 0.0f, stream );
 		lin_fwd( qr_n_, lw.wq_b, q_, fp8_scratch_, stream );
-		lin_fwd( norm_x_, lw.wkv, kv_, fp8_scratch_, stream );
 		RMSNorm::forward( kv_, lw.kv_norm, kv_n_, eps, 0.0f, stream );
 		DSV4::window_store( kv_n_.ptr<const backend::half_t>(), ds_.blk_ring, rope_plain_, 0, B, ds_.d_blk_rows, 0, stream );
 		DSV4::dspark_attend( q_.ptr<const backend::half_t>(), win_ring_, ds_.blk_ring, lw.sink.ptr<const float>(), rope_plain_, o_g_.ptr<backend::half_t>(), lh_, L + l, B,

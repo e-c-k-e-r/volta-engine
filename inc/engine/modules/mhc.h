@@ -82,6 +82,13 @@ struct HyperConnection {
 		int rows
 	);
 
+	// The lagged form (DeepSeek-V4.1) in one launch for decode-sized rows (up to pod::MAX_BATCH): collapse's mixes (post, comb, inv_rms, the mix
+	// logits, the new pre into pre_buf; no collapsed row) and the RMSNorm(norm_weight) of the streams collapsed with pre_in, post then scaled by
+	// post_scale: bit-identical to collapse + DSV4::hc_collapse_norm. Returns false (nothing launched) when the shape does not fit.
+	static bool collapse_lagged_norm( const float* streams, const float* fn, const float* base, const float* scale, const float* pre_in,
+		const backend::half_t* norm_weight, backend::half_t* norm_out, float* post_out, float* comb_out, float* inv_rms_buf, float* mix_logits_buf,
+		float* pre_buf, int hidden_size, int sinkhorn_iters, float eps, float norm_eps, float post_scale, backend::stream_t stream, int rows );
+
 	static void update(
 		pod::TensorView& streams,
 		const pod::TensorView& sublayer_out,

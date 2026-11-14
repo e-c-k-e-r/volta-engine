@@ -52,6 +52,11 @@ bool HyperConnection::collapse_norm( const pod::TensorView&, const pod::TensorVi
 	return false;
 }
 
+bool HyperConnection::collapse_lagged_norm( const float*, const float*, const float*, const float*, const float*, const backend::half_t*, backend::half_t*, float*, float*,
+	float*, float*, float*, int, int, float, float, float, backend::stream_t, int ) {
+	return false;
+}
+
 void HyperConnection::update( pod::TensorView& streams, const pod::TensorView& sublayer_out, const pod::TensorView& post, const pod::TensorView& comb, int hidden_size, backend::stream_t stream, int rows ) {
 	update( streams.ptr<float>(), streams.ptr<const float>(), sublayer_out.ptr<const backend::half_t>(), post.ptr<const float>(), comb.ptr<const float>(), hidden_size, stream, rows );
 }

@@ -200,6 +200,8 @@ private:
 	void trace( int tag, int m, backend::stream_t stream );
 	void trace_tensor( int tag, const pod::TensorView& t, int m, int cols, backend::stream_t stream );   // debug: <trace_layers>.t
 	void reduce_update( pod::TensorView& y, int m, backend::stream_t stream, int trace_tag = -1 );   // all-reduce + mHC post-step
+	void hc_input( const pod::TensorView& fn, const pod::TensorView& base, const pod::TensorView& scale, pod::TensorView& pre_view, const pod::TensorView& norm, float eps,
+		int m, backend::stream_t stream );   // mHC mixes + the lagged-pre input norm
 
 	DeepseekV41Config config_;
 	ModelMetadata metadata_;

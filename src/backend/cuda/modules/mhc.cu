@@ -127,7 +127,7 @@ float rcp_ftz( const float x ) {
 #endif
 }
 
-template <int H, int M_, bool HEAD, bool HALF_OUT>
+template <int H, int M_, bool HEAD, bool HALF_OUT, bool COLLAPSE = true>
 __device__ __forceinline__
 void hc_mix_finalize_body(
 	const int bx,
@@ -236,6 +236,7 @@ void hc_mix_finalize_body(
 		}
 		return;
 	}
+	if constexpr ( !COLLAPSE ) return;
 
 	float pre_r[H];
 	#pragma unroll
@@ -468,6 +469,75 @@ void hc_finalize_norm_kernel(
 		const float w = __half2float( norm_w[i] ) + norm_bias;
 		dst[i] = __float2half_rn( __half2float( s_col[i] ) * w * inv );
 	}
+}
+
+// The lagged form (DeepSeek-V4.1) in one launch: this sublayer's mixes as hc_collapse_norm_kernel computes them (post, comb, inv_rms, the mix
+// logits, the new pre into pre_buf; no collapsed row), while the sublayer input is the RMSNorm of the streams collapsed with the previous
+// sublayer's pre (pre_in), and post is then scaled by post_scale. The last block of a row runs the finalize and that norm with the per-thread
+// order and the reduction of DSV4::hc_collapse_norm's kernel (element d thread d % 256's, ascending), so the results are bit-identical to
+// HyperConnection::collapse + DSV4::hc_collapse_norm. The norm's row stays in registers: at most kLagPer x 256 values.
+constexpr int kLagPer = 24;
+template <int H, int M_>
+__global__ __launch_bounds__( NUM_THREADS )
+void hc_lagged_norm_kernel(
+	const float* __restrict__ streams,
+	const float* __restrict__ fn,
+	const float* __restrict__ base,
+	const float* __restrict__ scale,
+	const float* __restrict__ pre_in,
+	const half* __restrict__ norm_w,
+	half* __restrict__ norm_out,
+	float* __restrict__ post,
+	float* __restrict__ comb,
+	float* __restrict__ inv_rms_buf,
+	float* __restrict__ mix_logits_buf,
+	float* __restrict__ pre_buf,
+	const int D,
+	const int chunk_cols,
+	const float rms_eps,
+	const float hc_eps,
+	const int sinkhorn_iters,
+	const float norm_eps,
+	const float post_scale
+) {
+	__shared__ bool last;
+	const int r = blockIdx.y;
+	hc_mix_partials_body<H, M_, float>( streams, fn, H * D, chunk_cols );
+	__syncthreads();
+	if ( threadIdx.x == 0 ) {
+		__threadfence();
+		const unsigned prev = atomicAdd( &g_mhc_arrivals[r], 1u );
+		last = prev == gridDim.x - 1;
+		if ( last ) g_mhc_arrivals[r] = 0;
+	}
+	__syncthreads();
+	if ( !last ) return;
+	__threadfence();
+	hc_mix_finalize_body<H, M_, false, true, false>( 0, 0, streams, base, scale, post, comb, nullptr, inv_rms_buf,
+		mix_logits_buf, pre_buf, D, gridDim.x, D, rms_eps, hc_eps, sinkhorn_iters );
+	__syncthreads();
+
+	const float p0 = pre_in[r * 4 + 0], p1 = pre_in[r * 4 + 1], p2 = pre_in[r * 4 + 2], p3 = pre_in[r * 4 + 3];
+	const float* s = streams + static_cast<size_t>( r ) * 4 * D;
+	float c[kLagPer], wv[kLagPer];
+	#pragma unroll
+	for ( int k = 0; k < kLagPer; ++k ) {
+		const int d = threadIdx.x + NUM_THREADS * k;
+		c[k] = d < D ? p0 * s[d] + p1 * s[D + d] + p2 * s[2 * D + d] + p3 * s[3 * D + d] : 0.0f;
+		wv[k] = d < D ? __half2float( norm_w[d] ) : 0.0f;
+	}
+	float ss = 0.0f;
+	#pragma unroll
+	for ( int k = 0; k < kLagPer; ++k ) if ( threadIdx.x + NUM_THREADS * k < D ) ss += c[k] * c[k];
+	__syncthreads();
+	ss = engine::math::block_sum<NUM_THREADS / 32>( ss );
+	const float inv = rsqrtf( ss / D + norm_eps );
+	#pragma unroll
+	for ( int k = 0; k < kLagPer; ++k ) {
+		const int d = threadIdx.x + NUM_THREADS * k;
+		if ( d < D ) norm_out[static_cast<size_t>( r ) * D + d] = __float2half_rn( c[k] * inv * wv[k] );
+	}
+	if ( threadIdx.x < H ) post[static_cast<size_t>( r ) * H + threadIdx.x] *= post_scale;
 }
 
 template <int H, typename Y_T, bool HAS_COMB>
@@ -736,6 +806,20 @@ bool HyperConnection::collapse_norm(
 		norm_weight.ptr<const half>(), norm_out.ptr<half>(), post_out.ptr<float>(), comb_out.ptr<float>(),
 		inv_rms_buf.ptr<float>(), mix_logits_buf.ptr<float>(), pre_buf.ptr<float>(),
 		hidden_size, chunk_cols, 1e-5f, eps, sinkhorn_iters, norm_eps, norm_bias );
+	return true;
+}
+
+bool HyperConnection::collapse_lagged_norm( const float* streams, const float* fn, const float* base, const float* scale, const float* pre_in,
+	const half* norm_weight, half* norm_out, float* post_out, float* comb_out, float* inv_rms_buf, float* mix_logits_buf, float* pre_buf, int hidden_size,
+	int sinkhorn_iters, float eps, float norm_eps, float post_scale, cudaStream_t stream, int rows ) {
+	const int H = 4;
+	const int row_len = H * hidden_size;
+	const int chunksA = 64;
+	const int chunk_cols = ( ( row_len / chunksA + 4 * NUM_THREADS_A - 1 ) / ( 4 * NUM_THREADS_A ) ) * ( 4 * NUM_THREADS_A );
+	const int n_chunks_a = ( row_len + chunk_cols - 1 ) / chunk_cols;
+	if ( rows < 1 || rows > pod::MAX_BATCH || hidden_size > kLagPer * NUM_THREADS || n_chunks_a > chunksA ) return false;
+	hc_lagged_norm_kernel<4, 24><<<dim3( n_chunks_a, rows ), NUM_THREADS, 0, stream>>>( streams, fn, base, scale, pre_in, norm_weight, norm_out, post_out,
+		comb_out, inv_rms_buf, mix_logits_buf, pre_buf, hidden_size, chunk_cols, 1e-5f, eps, sinkhorn_iters, norm_eps, post_scale );
 	return true;
 }
 
