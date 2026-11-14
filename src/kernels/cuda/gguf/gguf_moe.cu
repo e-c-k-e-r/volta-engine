@@ -200,79 +200,82 @@ TILE_BLK( Q4_K, block_q4_K ) TILE_BLK( Q5_K, block_q5_K ) TILE_BLK( Q6_K, block_
 template <GgmlType T> constexpr int tile_raw_ld() { return ( static_cast<int>( sizeof( typename TileBlk<T>::type ) ) + 15 ) / 16 * 16; }
 template <GgmlType T, int RT> constexpr size_t tile_smem() { return static_cast<size_t>( kTileN + RT ) * kTileLd * sizeof( half ) + 2 * kTileN * tile_raw_ld<T>(); }
 
-// Eight values of an IQ block (sub-block ib of 8, eighth il of 4), as llama.cpp's dequantizers compute them
+// Eight IQ1 values d * ( q + delta ), q = 0..2 per nibble of a grid word, as FP16 without a conversion per value: the three values a q can
+// give are rounded once (exactly as d * ( q + delta ) is), and each pair of nibbles picks its two halves out of them with one byte permute
+// (selector nibbles 2 qa, 2 qa + 1, 2 qb, 2 qb + 1 = the pair's bytes times 34 plus 0x1010)
+__device__ __forceinline__ uint4 iq1_eight_h( uint32_t g, float d, float delta ) {
+	const half v0 = __float2half_rn( d * ( 0.0f + delta ) ), v1 = __float2half_rn( d * ( 1.0f + delta ) ), v2 = __float2half_rn( d * ( 2.0f + delta ) );
+	const uint32_t t0 = static_cast<uint32_t>( __half_as_ushort( v0 ) ) | static_cast<uint32_t>( __half_as_ushort( v1 ) ) << 16, t1 = __half_as_ushort( v2 );
+	const uint32_t lo = g & 0x0f0f0f0f, hi = ( g >> 4 ) & 0x0f0f0f0f;
+	uint4 out;
+	out.x = __byte_perm( t0, t1, ( lo & 0xffff ) * 34 + 0x1010 );
+	out.y = __byte_perm( t0, t1, ( lo >> 16 ) * 34 + 0x1010 );
+	out.z = __byte_perm( t0, t1, ( hi & 0xffff ) * 34 + 0x1010 );
+	out.w = __byte_perm( t0, t1, ( hi >> 16 ) * 34 + 0x1010 );
+	return out;
+}
+
+// Eight IQ2 values d * grid * sign (grid bytes 8, 25 or 43: byte >> 4 is 0, 1, 2) the same way, the signs set by flipping the halves' sign bits
+__device__ __forceinline__ uint4 iq2_eight_h( uint64_t grid, float d, uint32_t signs ) {
+	const half v0 = __float2half_rn( d * 8.0f ), v1 = __float2half_rn( d * 25.0f ), v2 = __float2half_rn( d * 43.0f );
+	const uint32_t t0 = static_cast<uint32_t>( __half_as_ushort( v0 ) ) | static_cast<uint32_t>( __half_as_ushort( v1 ) ) << 16, t1 = __half_as_ushort( v2 );
+	const uint32_t lo = ( static_cast<uint32_t>( grid ) >> 4 ) & 0x0f0f0f0f, hi = ( static_cast<uint32_t>( grid >> 32 ) >> 4 ) & 0x0f0f0f0f;
+	auto flip = [&]( int p ) { const uint32_t b = signs >> 2 * p; return ( ( b & 1 ) | ( b & 2 ) << 15 ) << 15; };   // value 2 p's and 2 p + 1's sign bits
+	uint4 out;
+	out.x = __byte_perm( t0, t1, ( lo & 0xffff ) * 34 + 0x1010 ) ^ flip( 0 );
+	out.y = __byte_perm( t0, t1, ( lo >> 16 ) * 34 + 0x1010 ) ^ flip( 1 );
+	out.z = __byte_perm( t0, t1, ( hi & 0xffff ) * 34 + 0x1010 ) ^ flip( 2 );
+	out.w = __byte_perm( t0, t1, ( hi >> 16 ) * 34 + 0x1010 ) ^ flip( 3 );
+	return out;
+}
+
+// The FP16 values of block ib of a 256-wide block type, decoded by one warp. The IQ1 and IQ2 types put lane l's eight values at 8 l (sub-block
+// l / 4, eighth l % 4) with one 16-byte store, so a warp's stores are consecutive, bit for bit llama.cpp's dequantizers' values; the others take
+// those dequantizers (32 or 64 threads a block)
 template <GgmlType T>
-__device__ __forceinline__ void iq_eight( const void* vx, int64_t ibs, int ib, int il, float* v ) {
+__device__ __forceinline__ void tile_dequant( const void* w, int64_t ib, half* y, int lane ) {
 	if constexpr ( T == GgmlType::IQ1_S ) {
-		const block_iq1_s* x = static_cast<const block_iq1_s*>( vx ) + ibs;
-		const uint16_t qh = x->qh[ib];
+		const block_iq1_s* x = static_cast<const block_iq1_s*>( w ) + ib;
+		const int sb = lane >> 2, il = lane & 3;
+		const uint16_t qh = x->qh[sb];
 		const float delta = qh & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
 		const float d = static_cast<float>( x->d ) * ( 2 * ( ( qh >> 12 ) & 7 ) + 1 );
-		uint32_t g[2];
-		g[0] = iq1s_grid_gpu[x->qs[4 * ib + il] | ( ( ( qh >> 3 * il ) & 7 ) << 8 )];
-		g[1] = ( g[0] >> 4 ) & 0x0f0f0f0f;
-		g[0] &= 0x0f0f0f0f;
-		const int8_t* q = reinterpret_cast<const int8_t*>( g );
-		#pragma unroll
-		for ( int j = 0; j < 8; ++j ) v[j] = d * ( q[j] + delta );
+		const uint32_t g = iq1s_grid_gpu[x->qs[4 * sb + il] | ( ( ( qh >> 3 * il ) & 7 ) << 8 )];
+		*reinterpret_cast<uint4*>( y + 8 * lane ) = iq1_eight_h( g, d, delta );
 	}
 	else if constexpr ( T == GgmlType::IQ1_M ) {
-		const block_iq1_m* x = static_cast<const block_iq1_m*>( vx ) + ibs;
+		const block_iq1_m* x = static_cast<const block_iq1_m*>( w ) + ib;
+		const int sb = lane >> 2, il = lane & 3;
 		const uint16_t* sc = reinterpret_cast<const uint16_t*>( x->scales );
 		iq1m_scale_t scale;
 		scale.u16 = ( sc[0] >> 12 ) | ( ( sc[1] >> 8 ) & 0x00f0 ) | ( ( sc[2] >> 4 ) & 0x0f00 ) | ( sc[3] & 0xf000 );
-		const int ib16 = 2 * ib + il / 2;
+		const int ib16 = 2 * sb + il / 2;
 		const float d = static_cast<float>( scale.f16 ) * ( 2 * ( ( sc[ib16 / 4] >> 3 * ( ib16 % 4 ) ) & 0x7 ) + 1 );
-		const uint8_t qh = x->qh[2 * ib + il / 2];
+		const uint8_t qh = x->qh[2 * sb + il / 2];
 		const float delta = qh & ( 0x08 << 4 * ( il % 2 ) ) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA;
-		uint32_t g[2];
-		g[0] = iq1s_grid_gpu[x->qs[4 * ib + il] | ( ( ( qh >> 4 * ( il % 2 ) ) & 7 ) << 8 )];
-		g[1] = ( g[0] >> 4 ) & 0x0f0f0f0f;
-		g[0] &= 0x0f0f0f0f;
-		const int8_t* q = reinterpret_cast<const int8_t*>( g );
-		#pragma unroll
-		for ( int j = 0; j < 8; ++j ) v[j] = d * ( q[j] + delta );
+		const uint32_t g = iq1s_grid_gpu[x->qs[4 * sb + il] | ( ( ( qh >> 4 * ( il % 2 ) ) & 7 ) << 8 )];
+		*reinterpret_cast<uint4*>( y + 8 * lane ) = iq1_eight_h( g, d, delta );
 	}
 	else if constexpr ( T == GgmlType::IQ2_XXS ) {
-		const block_iq2_xxs* x = static_cast<const block_iq2_xxs*>( vx ) + ibs;
-		const uint16_t* q2 = x->qs + 4 * ib;
-		const uint8_t* grid = reinterpret_cast<const uint8_t*>( iq2xxs_grid + reinterpret_cast<const uint8_t*>( q2 )[il] );
+		const block_iq2_xxs* x = static_cast<const block_iq2_xxs*>( w ) + ib;
+		const int sb = lane >> 2, il = lane & 3;
+		const uint16_t* q2 = x->qs + 4 * sb;
 		const uint32_t aux32 = q2[2] | ( q2[3] << 16 );
 		const float d = static_cast<float>( x->d ) * ( 0.5f + ( aux32 >> 28 ) ) * 0.25f;
-		const uint8_t signs = ksigns_iq2xs[( aux32 >> 7 * il ) & 127];
-		#pragma unroll
-		for ( int j = 0; j < 8; ++j ) v[j] = d * grid[j] * ( signs & kmask_iq2xs[j] ? -1.f : 1.f );
+		*reinterpret_cast<uint4*>( y + 8 * lane ) = iq2_eight_h( iq2xxs_grid[reinterpret_cast<const uint8_t*>( q2 )[il]], d, ksigns_iq2xs[( aux32 >> 7 * il ) & 127] );
 	}
 	else if constexpr ( T == GgmlType::IQ2_XS ) {
-		const block_iq2_xs* x = static_cast<const block_iq2_xs*>( vx ) + ibs;
-		const uint16_t q2 = x->qs[4 * ib + il];
-		const uint8_t* grid = reinterpret_cast<const uint8_t*>( iq2xs_grid + ( q2 & 511 ) );
-		const float d = static_cast<float>( x->d ) * ( 0.5f + ( ( x->scales[ib] >> 4 * ( il / 2 ) ) & 0xf ) ) * 0.25f;
-		const uint8_t signs = ksigns_iq2xs[q2 >> 9];
-		#pragma unroll
-		for ( int j = 0; j < 8; ++j ) v[j] = d * grid[j] * ( signs & kmask_iq2xs[j] ? -1.f : 1.f );
+		const block_iq2_xs* x = static_cast<const block_iq2_xs*>( w ) + ib;
+		const int sb = lane >> 2, il = lane & 3;
+		const uint16_t q2 = x->qs[4 * sb + il];
+		const float d = static_cast<float>( x->d ) * ( 0.5f + ( ( x->scales[sb] >> 4 * ( il / 2 ) ) & 0xf ) ) * 0.25f;
+		*reinterpret_cast<uint4*>( y + 8 * lane ) = iq2_eight_h( iq2xs_grid[q2 & 511], d, ksigns_iq2xs[q2 >> 9] );
 	}
 	else if constexpr ( T == GgmlType::IQ2_S ) {
-		const block_iq2_s* x = static_cast<const block_iq2_s*>( vx ) + ibs;
-		const uint8_t* grid = reinterpret_cast<const uint8_t*>( iq2s_grid + ( x->qs[4 * ib + il] | ( ( x->qh[ib] << ( 8 - 2 * il ) ) & 0x300 ) ) );
-		const float d = static_cast<float>( x->d ) * ( 0.5f + ( ( x->scales[ib] >> 4 * ( il / 2 ) ) & 0xf ) ) * 0.25f;
-		const uint8_t signs = x->qs[QK_K / 8 + 4 * ib + il];
-		#pragma unroll
-		for ( int j = 0; j < 8; ++j ) v[j] = d * grid[j] * ( signs & kmask_iq2xs[j] ? -1.f : 1.f );
-	}
-}
-
-// The FP16 values of block ib of a 256-wide block type, decoded by one warp. The IQ types put lane l's eight values at 8 l (sub-block l / 4,
-// eighth l % 4) with one 16-byte store, so a warp's stores are consecutive; the others take llama.cpp's dequantizers (32 or 64 threads a block)
-template <GgmlType T>
-__device__ __forceinline__ void tile_dequant( const void* w, int64_t ib, half* y, int lane ) {
-	if constexpr ( T == GgmlType::IQ1_S || T == GgmlType::IQ1_M || T == GgmlType::IQ2_XXS || T == GgmlType::IQ2_XS || T == GgmlType::IQ2_S ) {
-		float v[8];
-		iq_eight<T>( w, ib, lane >> 2, lane & 3, v );
-		__align__( 16 ) half h[8];
-		#pragma unroll
-		for ( int j = 0; j < 8; ++j ) h[j] = __float2half_rn( v[j] );
-		*reinterpret_cast<uint4*>( y + 8 * lane ) = *reinterpret_cast<const uint4*>( h );
+		const block_iq2_s* x = static_cast<const block_iq2_s*>( w ) + ib;
+		const int sb = lane >> 2, il = lane & 3;
+		const float d = static_cast<float>( x->d ) * ( 0.5f + ( ( x->scales[sb] >> 4 * ( il / 2 ) ) & 0xf ) ) * 0.25f;
+		*reinterpret_cast<uint4*>( y + 8 * lane ) = iq2_eight_h( iq2s_grid[x->qs[4 * sb + il] | ( ( x->qh[sb] << ( 8 - 2 * il ) ) & 0x300 )], d, x->qs[QK_K / 8 + 4 * sb + il] );
 	}
 	else if constexpr ( T == GgmlType::IQ3_XXS ) dequantize_iq3_xxs<half>( w, ib, y, lane );
 	else if constexpr ( T == GgmlType::IQ3_S ) dequantize_iq3_s<half>( w, ib, y, lane );
