@@ -1,15 +1,18 @@
 # Performance
 
-Serving speed, step latency and prefill for each model and weight format on the target machine, and how they were measured. Every number below
-comes from one session on 2026-11-12 (master 54e2f89), so the tables compare with each other; speed depends on the power cap and clocks, so
-rerun the whole set rather than one table when either changes.
+Serving speed, step latency and prefill for each model and weight format on the target machine, and how they were measured. The Qwen3.8-27B
+and Flash-Next numbers come from one session on 2026-11-12 (master 54e2f89), the GLM-5.3-Flash and DeepSeek-V4.1-Flash numbers from one on
+2026-11-13 (master da1f5be) with the same setup; speed depends on the power cap and clocks, so rerun the whole set rather than one table when
+either changes.
 
 ## Setup
 
 * 4x Tesla V100-SXM2-32GB, NVLink between every pair, water-cooled, power limit 250 W, SM clocks free up to 1530 MHz
 * CUDA 12.8, tensor parallel over all four GPUs (`tp=4`), CUDA graphs on, `numactl -N 0 -m 0`
-* every expert resident on the GPUs (`expert_cache` 1, or `auto` where noted and it resolved to 100%), except DeepSeek-V4.1-Flash: 92% of
-  its experts fit, the rest are read from pinned host memory
+* host: 2x Xeon Gold 6132, turbo on, no frequency cap; prefill and the host side of a speculative round slow down with a capped CPU
+* every expert resident on the GPUs (`expert_cache` 1, or `auto` where noted and it resolved to 100%), except DeepSeek-V4.1-Flash
+  (`vram_reserve_mib=256`): rank 0 holds 99% of its expert codes and the other ranks all of theirs; with the DSpark drafter
+  (`vram_reserve_mib=512`) 92% and 95%. The rest are read from pinned host memory.
 * one request at a time (`max_slots=1`), `max_seq=32768` (DeepSeek: 16384), greedy decoding, thinking off
 * weights:
 
@@ -55,7 +58,7 @@ through the streaming chat API with `temperature` 0 and `enable_thinking` false.
 * every configuration starts only when each GPU is at or below 55 C
 
 Step latency: `build/bench_decode` replays the graph-captured decode body on the real weights: one row (a plain token) and blocks of 2 to 16
-rows (`BENCH_VL=2,4,8,12,16`, what a speculative round verifies), the median of two or three runs.
+rows (`BENCH_VL=2,4,8,12,16`, what a speculative round verifies), the median of two or three runs (GLM: one).
 
 Prefill: the cold requests of the agent replay (10-13K new tokens, nothing from the prefix cache), as the servers log them.
 
@@ -76,25 +79,25 @@ Decode tok/s, tokens per round in parentheses.
 | | NVFP4 | MTP | 165 (4.09) | 187 (3.63) | 267 (5.84) | 247 (5.29) |
 | | NVFP4 | DFlash2 | 130 (3.31) | 167 (3.40) | 264 (5.48) | 266 (5.29) |
 | | GGUF IQ3_S (Swift) | DFlash2 | 100 (3.79) | 101 (3.44) | 165 (5.54) | 156 (5.28) |
-| GLM-5.3-Flash | EXL3 3.05 bpw, stock order | MTP | 71 (3.40) | 81 (2.97) | 94 (3.90) | 85 (3.87) |
-| | EXL3 3.05 bpw, stock order | DFlash2 | 70 (3.51) | 81 (3.52) | 127 (5.55) | 115 (5.31) |
-| | EXL3 3.05 bpw, Volta order | MTP | 71 (3.33) | 80 (2.92) | 92 (3.72) | 86 (3.86) |
-| | EXL3 3.05 bpw, Volta order | DFlash2 | 72 (3.52) | 82 (3.37) | 126 (5.29) | 118 (5.33) |
-| DeepSeek-V4.1-Flash | EXL3 1.68 bpw, 92% resident | none | | 32 | 34 | 33 |
-| | | DSpark | | 44 (2.10) | 70 (3.35) | 71 (3.50) |
-| | | suffix | | 33 (1.01) | 34 (1.01) | 38 (1.16) |
+| GLM-5.3-Flash | EXL3 3.05 bpw, stock order | MTP | 73 (3.42) | 82 (2.94) | 99 (3.94) | 86 (3.85) |
+| | EXL3 3.05 bpw, stock order | DFlash2 | 67 (3.39) | 81 (3.52) | 127 (5.55) | 114 (5.30) |
+| | EXL3 3.05 bpw, Volta order | MTP | 85 (3.50) | 97 (2.90) | 111 (3.70) | 101 (3.86) |
+| | EXL3 3.05 bpw, Volta order | DFlash2 | 81 (3.49) | 98 (3.43) | 149 (5.30) | 141 (5.38) |
+| DeepSeek-V4.1-Flash | EXL3 1.68 bpw | none | | 35 | 35 | 35 |
+| | | DSpark | | 49 (2.12) | 74 (3.36) | 73 (3.37) |
+| | | suffix | | 34 (1.02) | 34 (1.01) | 38 (1.17) |
 
 DeepSeek's 16K window does not hold the agent replay's prompts.
 
 * which speculator wins depends on the text:
-  * on agent turns, which copy much of their input (file contents, tool arguments), MTP is ahead on Qwen3.8-27B and Flash-Next;
-  * on math and code, DFlash2 is ahead on every model;
-  * on GLM the two tie on agent and chat text, and DFlash2 is 30-35% faster on math and code.
+  * on agent turns, which copy much of their input (file contents, tool arguments), MTP is ahead on Qwen3.8-27B, Flash-Next and GLM;
+  * on math and code, DFlash2 is ahead on every model (28-40% on GLM);
+  * on GLM's chat set the two tie.
 * NVFP4 is the fastest format on both Qwen models. The EXL3 rows are 4.0 bpw, which costs more to decode per weight than NVFP4's unpacking.
 * Flash-Next's two EXL3 checkpoints differ in two ways at once: the tile order and the model (base against the Swift fine-tune). The base
   model is the one the DFlash2 drafter was trained on, which shows in its tokens per round.
-* GLM's tile order makes no difference to served speed: the verify blocks are 5-7% faster (step latency below), and the rest of a round
-  hides it.
+* GLM's Volta tile order serves 12-24% faster than the stock order with either speculator: its verify blocks of 4 to 16 rows take 24-35%
+  less time (step latency below).
 
 ### MTP depth
 
@@ -122,8 +125,8 @@ drafter writes its whole block in one pass, 29.5 ms per round on the same set.
 | | EXL3 4.0 bpw, stock order | 18.4 | 20.1 | 23.8 | 28.0 | 35.5 | 38.8 |
 | | NVFP4 | 9.8 | 11.0 | 13.3 | 15.9 | 23.4 | 25.3 |
 | | GGUF IQ3_S | 14.6 | 15.3 | 20.5 | 29.5 | 41.6 | 47.1 |
-| GLM-5.3-Flash | EXL3 3.05 bpw, stock order | 15.9 | 21.2 | 28.5 | 36.2 | 48.2 | 54.6 |
-| | EXL3 3.05 bpw, Volta order | 15.9 | 21.5 | 27.0 | 33.6 | 47.6 | 53.0 |
+| GLM-5.3-Flash | EXL3 3.05 bpw, stock order | 15.4 | 20.9 | 28.5 | 36.7 | 47.3 | 53.7 |
+| | EXL3 3.05 bpw, Volta order | 15.3 | 19.0 | 21.7 | 26.5 | 31.7 | 35.1 |
 
 The Qwen3.8-27B EXL3 row is the gate benchmark's (one row and the 8-row block only). Flash-Next's one-row time includes the n-gram embedding
 lookups on the host, which vary from run to run by up to 2 ms.
@@ -142,11 +145,11 @@ Cold prompts of 10-13K new tokens, tok/s:
 | | NVFP4 | 1950-2060 |
 | | GGUF IQ3_S | 850 |
 | GLM-5.3-Flash | EXL3 3.05 bpw, stock order | 970-990 |
-| | EXL3 3.05 bpw, Volta order | 880 |
+| | EXL3 3.05 bpw, Volta order | 1010-1040 |
 
 In the Volta tile order a lane's decoded values are the operands of two k-chunks rather than two row groups, so a lane keeps a partial sum
 per row half: the trellis MoE prefill takes 128-column tiles in that order, which hold as many accumulators as the stock order's 256-column
-tiles. The GLM Volta row is a 14K-token cold prompt.
+tiles.
 
 ## Settings for several requests
 
