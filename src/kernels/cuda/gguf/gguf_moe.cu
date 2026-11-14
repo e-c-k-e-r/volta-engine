@@ -186,7 +186,7 @@ Layout layout( int top_k, int hidden, int inter ) {
 // ---- tile path (prefill) ----
 constexpr int kTileRowsPerPass = 1024;   // rows of a pass: about 16 routes of each local expert at top 6 over 384 experts on 4 ranks
 constexpr int kTileRoutesMax = 32;      // routes of an item: 16, or 32 when a pass gives the local experts more than about 12 routes each
-constexpr int kTileN = 32;              // output rows of a block: 26 KB of shared memory, three blocks an SM
+constexpr int kTileN = 32;              // output rows of a block: 26 KB of shared memory
 constexpr int kTileThreads = 256;       // 8 warps: the decode needs them to hide its loads
 constexpr int kTileLd = 256 + 16;       // halves per shared-memory row: one block of 256 inputs, padded to keep the WMMA rows 32-byte aligned
 
@@ -230,14 +230,61 @@ __device__ __forceinline__ uint4 iq2_eight_h( uint64_t grid, float d, uint32_t s
 	return out;
 }
 
-// The types whose eight values of a chunk decode into registers (iq_chunk_h)
-template <GgmlType T> constexpr bool iq_chunk_type() {
-	return T == GgmlType::IQ1_S || T == GgmlType::IQ1_M || T == GgmlType::IQ2_XXS || T == GgmlType::IQ2_XS || T == GgmlType::IQ2_S;
+// Eight Q2_K values dall * s * q - dmin * m (scale byte sc: s = sc & 0xf, m = sc >> 4; q the 2-bit fields at `shift` of the bytes of w0, w1)
+// the same way out of the four values a q can give: the products are exact in FP32, so each value is rounded once, as the dequantizer's
+__device__ __forceinline__ uint4 q2k_eight_h( uint32_t w0, uint32_t w1, int shift, float dall, float dmin, uint32_t sc ) {
+	const float sd = dall * ( sc & 0xf ), md = dmin * ( sc >> 4 );
+	const half v0 = __float2half_rn( sd * 0.0f - md ), v1 = __float2half_rn( sd * 1.0f - md ), v2 = __float2half_rn( sd * 2.0f - md ), v3 = __float2half_rn( sd * 3.0f - md );
+	const uint32_t t0 = static_cast<uint32_t>( __half_as_ushort( v0 ) ) | static_cast<uint32_t>( __half_as_ushort( v1 ) ) << 16;
+	const uint32_t t1 = static_cast<uint32_t>( __half_as_ushort( v2 ) ) | static_cast<uint32_t>( __half_as_ushort( v3 ) ) << 16;
+	const uint32_t s0 = ( ( w0 >> shift ) & 0x03030303 ) * 0x22 + 0x10101010, s1 = ( ( w1 >> shift ) & 0x03030303 ) * 0x22 + 0x10101010;   // selectors of four pairs
+	uint4 out;
+	out.x = __byte_perm( t0, t1, s0 );
+	out.y = __byte_perm( t0, t1, s0 >> 16 );
+	out.z = __byte_perm( t0, t1, s1 );
+	out.w = __byte_perm( t0, t1, s1 >> 16 );
+	return out;
 }
 
-// The FP16 values 8 c .. 8 c + 7 of block x (sub-block c / 4, eighth c % 4), bit for bit llama.cpp's dequantizers' values
+// Eight FP32 values as FP16, each rounded once
+__device__ __forceinline__ uint4 eight_h( const float* v ) {
+	uint32_t o[4];
+	#pragma unroll
+	for ( int i = 0; i < 4; ++i ) {
+		const __half2 h = __floats2half2_rn( v[2 * i], v[2 * i + 1] );
+		o[i] = *reinterpret_cast<const uint32_t*>( &h );
+	}
+	return make_uint4( o[0], o[1], o[2], o[3] );
+}
+
+// The FP16 values of two IQ3 grid words times d, the signs of `signs` (bit j: value j) set by flipping the halves' sign bits
+__device__ __forceinline__ uint4 iq3_eight_h( uint32_t g1, uint32_t g2, float d, uint32_t signs ) {
+	float v[8];
+	#pragma unroll
+	for ( int j = 0; j < 4; ++j ) {
+		v[j] = d * static_cast<float>( ( g1 >> 8 * j ) & 0xff );
+		v[j + 4] = d * static_cast<float>( ( g2 >> 8 * j ) & 0xff );
+	}
+	uint4 out = eight_h( v );
+	auto flip = [&]( int p ) { const uint32_t b = signs >> 2 * p; return ( ( b & 1 ) | ( b & 2 ) << 15 ) << 15; };
+	out.x ^= flip( 0 );
+	out.y ^= flip( 1 );
+	out.z ^= flip( 2 );
+	out.w ^= flip( 3 );
+	return out;
+}
+
+// The tile types: every 256-wide block type, whose eight values of a chunk decode into registers (chunk_h)
+template <GgmlType T> constexpr bool chunk_type() {
+	return T == GgmlType::IQ1_S || T == GgmlType::IQ1_M || T == GgmlType::IQ2_XXS || T == GgmlType::IQ2_XS || T == GgmlType::IQ2_S || T == GgmlType::IQ3_XXS ||
+		T == GgmlType::IQ3_S || T == GgmlType::IQ4_XS || T == GgmlType::Q2_K || T == GgmlType::Q3_K || T == GgmlType::Q4_K || T == GgmlType::Q5_K || T == GgmlType::Q6_K;
+}
+
+// The FP16 values 8 c .. 8 c + 7 of block blk (for the IQ types sub-block c / 4, eighth c % 4), bit for bit llama.cpp's dequantizers' values:
+// every product the dequantizers form is exact in FP32 (FP16 scales times integers of at most 13 bits together), so each value is rounded
+// once whatever the order of the operations
 template <GgmlType T>
-__device__ __forceinline__ uint4 iq_chunk_h( const void* blk, int c ) {
+__device__ __forceinline__ uint4 chunk_h( const void* blk, int c ) {
 	const int sb = c >> 2, il = c & 3;
 	if constexpr ( T == GgmlType::IQ1_S ) {
 		const block_iq1_s* x = static_cast<const block_iq1_s*>( blk );
@@ -270,28 +317,111 @@ __device__ __forceinline__ uint4 iq_chunk_h( const void* blk, int c ) {
 		const float d = static_cast<float>( x->d ) * ( 0.5f + ( ( x->scales[sb] >> 4 * ( il / 2 ) ) & 0xf ) ) * 0.25f;
 		return iq2_eight_h( iq2xs_grid[q2 & 511], d, ksigns_iq2xs[q2 >> 9] );
 	}
-	else {
-		static_assert( T == GgmlType::IQ2_S, "iq_chunk_h: an IQ1 or IQ2 type" );
+	else if constexpr ( T == GgmlType::Q2_K ) {
+		// values 8 c .. 8 c + 7 = 128 n + 32 j + l0 .. + 7: the 2-bit fields 2 j of bytes l0 .. l0 + 7 of the qs half n, one scale byte
+		const block_q2_K* x = static_cast<const block_q2_K*>( blk );
+		const int n = c >> 4, j = ( c >> 2 ) & 3, l0 = 8 * ( c & 3 );
+		const uint32_t* qw = reinterpret_cast<const uint32_t*>( x->qs + 32 * n + l0 );
+		return q2k_eight_h( qw[0], qw[1], 2 * j, __low2float( x->dm ), __high2float( x->dm ), x->scales[8 * n + 2 * j + ( c & 3 ) / 2] );
+	}
+	else if constexpr ( T == GgmlType::IQ2_S ) {
 		const block_iq2_s* x = static_cast<const block_iq2_s*>( blk );
 		const float d = static_cast<float>( x->d ) * ( 0.5f + ( ( x->scales[sb] >> 4 * ( il / 2 ) ) & 0xf ) ) * 0.25f;
 		return iq2_eight_h( iq2s_grid[x->qs[4 * sb + il] | ( ( x->qh[sb] << ( 8 - 2 * il ) ) & 0x300 )], d, x->qs[QK_K / 8 + 4 * sb + il] );
 	}
+	else if constexpr ( T == GgmlType::IQ3_XXS ) {
+		const block_iq3_xxs* x = static_cast<const block_iq3_xxs*>( blk );
+		const uint8_t* q3 = x->qs + 8 * sb;
+		const uint16_t* gas = reinterpret_cast<const uint16_t*>( x->qs + QK_K / 4 ) + 2 * sb;
+		const uint32_t aux32 = gas[0] | ( gas[1] << 16 );
+		const float d = static_cast<float>( x->d ) * ( 0.5f + ( aux32 >> 28 ) ) * 0.5f;
+		return iq3_eight_h( iq3xxs_grid[q3[2 * il]], iq3xxs_grid[q3[2 * il + 1]], d, ksigns_iq2xs[( aux32 >> 7 * il ) & 127] );
+	}
+	else if constexpr ( T == GgmlType::IQ3_S ) {
+		const block_iq3_s* x = static_cast<const block_iq3_s*>( blk );
+		const uint8_t* qs = x->qs + 8 * sb;
+		const float d = static_cast<float>( x->d ) * ( 1 + 2 * ( ( x->scales[sb / 2] >> 4 * ( sb % 2 ) ) & 0xf ) );
+		return iq3_eight_h( iq3s_grid[qs[2 * il] | ( ( x->qh[sb] << ( 8 - 2 * il ) ) & 256 )], iq3s_grid[qs[2 * il + 1] | ( ( x->qh[sb] << ( 7 - 2 * il ) ) & 256 )], d,
+			x->signs[4 * sb + il] );
+	}
+	else if constexpr ( T == GgmlType::IQ4_XS ) {
+		// sub-block sb: values 0..15 the low nibbles of its 16 bytes, 16..31 the high nibbles
+		const block_iq4_xs* x = static_cast<const block_iq4_xs*>( blk );
+		const float d = static_cast<float>( x->d ) * ( ( ( ( x->scales_l[sb / 2] >> 4 * ( sb % 2 ) ) & 0xf ) | ( ( ( x->scales_h >> 2 * sb ) & 3 ) << 4 ) ) - 32 );
+		const uint32_t* q = reinterpret_cast<const uint32_t*>( x->qs + 16 * sb + 8 * ( il & 1 ) );
+		const int shift = 4 * ( il >> 1 );
+		float v[8];
+		#pragma unroll
+		for ( int k = 0; k < 8; ++k ) v[k] = d * kvalues_iq4nl[( q[k >> 2] >> ( 8 * ( k & 3 ) + shift ) ) & 0xf];
+		return eight_h( v );
+	}
+	else if constexpr ( T == GgmlType::Q2_K ) {
+		// values 8 c .. 8 c + 7 = 128 n + 32 j + l0 .. + 7: the 2-bit fields 2 j of bytes l0 .. l0 + 7 of the qs half n, one scale byte
+		const block_q2_K* x = static_cast<const block_q2_K*>( blk );
+		const int n = c >> 4, j = ( c >> 2 ) & 3, l0 = 8 * ( c & 3 );
+		const uint32_t* qw = reinterpret_cast<const uint32_t*>( x->qs + 32 * n + l0 );
+		return q2k_eight_h( qw[0], qw[1], 2 * j, __low2float( x->dm ), __high2float( x->dm ), x->scales[8 * n + 2 * j + ( c & 3 ) / 2] );
+	}
+	else if constexpr ( T == GgmlType::Q3_K ) {
+		// the same positions as Q2_K; a value's high bit is bit 4 n + j of its hmask byte (clear: minus 4), its 6-bit scale split over the scale bytes
+		const block_q3_K* x = static_cast<const block_q3_K*>( blk );
+		const int n = c >> 4, j = ( c >> 2 ) & 3, l0 = 8 * ( c & 3 ), is = 8 * n + 2 * j + ( c & 3 ) / 2;
+		const uint8_t* sc = x->scales;
+		const int us = is < 4 ? ( sc[is] & 0xF ) | ( ( ( sc[is + 8] >> 0 ) & 3 ) << 4 ) : is < 8 ? ( sc[is] & 0xF ) | ( ( ( sc[is + 4] >> 2 ) & 3 ) << 4 ) :
+			is < 12 ? ( sc[is - 8] >> 4 ) | ( ( ( sc[is] >> 4 ) & 3 ) << 4 ) : ( sc[is - 8] >> 4 ) | ( ( ( sc[is - 4] >> 6 ) & 3 ) << 4 );
+		const float dl = static_cast<float>( x->d ) * ( us - 32 );
+		const uint32_t* q = reinterpret_cast<const uint32_t*>( x->qs + 32 * n + l0 );
+		const uint32_t* hm = reinterpret_cast<const uint32_t*>( x->hmask + l0 );
+		float v[8];
+		#pragma unroll
+		for ( int k = 0; k < 8; ++k ) {
+			const int b = 8 * ( k & 3 );
+			v[k] = dl * ( static_cast<int>( ( q[k >> 2] >> ( b + 2 * j ) ) & 3 ) - ( ( hm[k >> 2] >> ( b + 4 * n + j ) ) & 1 ? 0 : 4 ) );
+		}
+		return eight_h( v );
+	}
+	else if constexpr ( T == GgmlType::Q4_K || T == GgmlType::Q5_K ) {
+		// values 8 c .. = 64 il + 32 h + l0 ..: nibble h of bytes l0 .. l0 + 7 of the qs quarter il, scale and min 2 il + h; Q5_K's fifth bit is
+		// bit 2 il + h of qh byte l0 ..
+		const typename TileBlk<T>::type* x = static_cast<const typename TileBlk<T>::type*>( blk );
+		const int i4 = c >> 3, h = ( c >> 2 ) & 1, l0 = 8 * ( c & 3 );
+		uint8_t sc, m;
+		get_scale_min_k4( 2 * i4 + h, x->scales, sc, m );
+		const float d1 = __low2float( x->dm ) * sc, m1 = __high2float( x->dm ) * m;
+		const uint32_t* q = reinterpret_cast<const uint32_t*>( x->qs + 32 * i4 + l0 );
+		float v[8];
+		#pragma unroll
+		for ( int k = 0; k < 8; ++k ) {
+			int qv = ( q[k >> 2] >> ( 8 * ( k & 3 ) + 4 * h ) ) & 0xF;
+			if constexpr ( T == GgmlType::Q5_K ) qv += ( reinterpret_cast<const uint32_t*>( x->qh + l0 )[k >> 2] >> ( 8 * ( k & 3 ) + 2 * i4 + h ) ) & 1 ? 16 : 0;
+			v[k] = d1 * qv - m1;
+		}
+		return eight_h( v );
+	}
+	else {
+		// values 8 c .. = 128 ip + 32 g + l0 ..: nibble g / 2 of ql bytes 64 ip + 32 ( g % 2 ) + l0 .., bits 2 g of qh bytes 32 ip + l0 .., minus 32
+		static_assert( T == GgmlType::Q6_K, "chunk_h: a tile type" );
+		const block_q6_K* x = static_cast<const block_q6_K*>( blk );
+		const int ip = c >> 4, g = ( c >> 2 ) & 3, l0 = 8 * ( c & 3 );
+		const uint32_t* ql = reinterpret_cast<const uint32_t*>( x->ql + 64 * ip + 32 * ( g & 1 ) + l0 );
+		const uint32_t* qh = reinterpret_cast<const uint32_t*>( x->qh + 32 * ip + l0 );
+		const float d = x->d;
+		const int sc = x->scales[8 * ip + l0 / 16 + 2 * g];
+		float v[8];
+		#pragma unroll
+		for ( int k = 0; k < 8; ++k ) {
+			const int b = 8 * ( k & 3 );
+			v[k] = d * sc * ( static_cast<int>( ( ( ql[k >> 2] >> ( b + 4 * ( g >> 1 ) ) ) & 0xF ) | ( ( ( qh[k >> 2] >> ( b + 2 * g ) ) & 3 ) << 4 ) ) - 32 );
+		}
+		return eight_h( v );
+	}
 }
 
-// The FP16 values of block ib of a 256-wide block type, decoded by one warp. The IQ1 and IQ2 types put lane l's eight values at 8 l (sub-block
-// l / 4, eighth l % 4) with one 16-byte store, so a warp's stores are consecutive, bit for bit llama.cpp's dequantizers' values; the others take
-// those dequantizers (32 or 64 threads a block)
+// The FP16 values of block ib of a tile type, decoded by one warp: lane l's eight values at 8 l with one 16-byte store, so a warp's stores
+// are consecutive
 template <GgmlType T>
 __device__ __forceinline__ void tile_dequant( const void* w, int64_t ib, half* y, int lane ) {
-	if constexpr ( iq_chunk_type<T>() ) *reinterpret_cast<uint4*>( y + 8 * lane ) = iq_chunk_h<T>( static_cast<const typename TileBlk<T>::type*>( w ) + ib, lane );
-	else if constexpr ( T == GgmlType::IQ3_XXS ) dequantize_iq3_xxs<half>( w, ib, y, lane );
-	else if constexpr ( T == GgmlType::IQ3_S ) dequantize_iq3_s<half>( w, ib, y, lane );
-	else if constexpr ( T == GgmlType::IQ4_XS ) dequantize_iq4_xs<half>( w, ib, y, lane );
-	else if constexpr ( T == GgmlType::Q4_K ) dequantize_q4_K<half>( w, ib, y, lane );
-	else if constexpr ( T == GgmlType::Q2_K ) { dequantize_q2_K<half>( w, ib, y, lane ); dequantize_q2_K<half>( w, ib, y, lane + 32 ); }
-	else if constexpr ( T == GgmlType::Q3_K ) { dequantize_q3_K<half>( w, ib, y, lane ); dequantize_q3_K<half>( w, ib, y, lane + 32 ); }
-	else if constexpr ( T == GgmlType::Q5_K ) { dequantize_q5_K<half>( w, ib, y, lane ); dequantize_q5_K<half>( w, ib, y, lane + 32 ); }
-	else if constexpr ( T == GgmlType::Q6_K ) { dequantize_q6_K<half>( w, ib, y, lane ); dequantize_q6_K<half>( w, ib, y, lane + 32 ); }
+	*reinterpret_cast<uint4*>( y + 8 * lane ) = chunk_h<T>( static_cast<const typename TileBlk<T>::type*>( w ) + ib, lane );
 }
 
 bool tile_type( GgmlType t ) {
@@ -310,8 +440,13 @@ bool tile_type( GgmlType t ) {
 // GU: gate and up of the same block type in one pass, the tile's first 16 rows from the gate and the last 16 the same rows of the up projection
 // (the routes' inputs copied once for both), and the epilogue writes SiLU( gate ) * up (moe_act16_kernel's activation on the FP16-rounded
 // gate and up, so the result is that of the two passes) to out16 [route][n]
+// resident blocks an SM: three, two for the K-quants above Q2_K, the IQ3 types and IQ4_XS (their dequantizers would spill registers at three)
+template <GgmlType T> constexpr int tile_min_blocks() {
+	return T == GgmlType::Q3_K || T == GgmlType::Q4_K || T == GgmlType::Q5_K || T == GgmlType::Q6_K || T == GgmlType::IQ3_XXS || T == GgmlType::IQ3_S || T == GgmlType::IQ4_XS ? 2 : 3;
+}
+
 template <GgmlType T, bool GU, int RT>
-__global__ __launch_bounds__( kTileThreads, 3 )
+__global__ __launch_bounds__( kTileThreads, tile_min_blocks<T>() )
 void moe_tile_kernel( const void* const* __restrict__ ptrs, const void* const* __restrict__ ptrs_up, const Item* __restrict__ items, const int* __restrict__ n_items,
 	const int* __restrict__ sorted, const half* __restrict__ in, bool per_token, int k, int n, const half* __restrict__ topw, int top_k, float* __restrict__ part32,
 	half* __restrict__ out16, float act_limit ) {
@@ -442,7 +577,7 @@ template <GgmlType T, int RT, int R> constexpr size_t tile884_smem() {
 	return std::max( static_cast<size_t>( RT ) * kTileLd * sizeof( half ) + 2 * kTileN * tile884_raw_ld<T>(), static_cast<size_t>( 2 * R ) * RT * ( kTileN + 4 ) * sizeof( float ) );
 }
 
-// moe_tile_kernel for the IQ1 / IQ2 types on SM_70. In m8n8k4 a warp is four independent quarters; warp w takes R groups of 8 of the block's
+// moe_tile_kernel for the chunk types (IQ1, IQ2, Q2_K) on SM_70. In m8n8k4 a warp is four independent quarters; warp w takes R groups of 8 of the block's
 // 32 rows and 16 / R of each step's 32 chunks of 8 inputs, its quarter q the chunks q, q + 4, ... of those. A lane decodes the eight values of
 // its chunk for each of its rows (B column (l & 3) + 4 (l >= 16) of a group): they are its B operands of two k4 steps, multiplied with each
 // 8 routes' A operands (route (l & 3) + 4 (l >= 16) of the 8, the chunk's 16 bytes from shared memory). The quarters' sums meet over shuffles
@@ -522,7 +657,7 @@ void moe_tile884_kernel( const void* const* __restrict__ ptrs, const void* const
 			const int c = piece * 4 * CQ + q + 4 * j;   // with rows kTileLd apart (8 banks), a phase's eight 16-byte A reads take all 32 banks
 			uint4 b[R];
 			#pragma unroll
-			for ( int h = 0; h < R; ++h ) b[h] = iq_chunk_h<T>( raw + h * 8 * kRawLd, c );
+			for ( int h = 0; h < R; ++h ) b[h] = chunk_h<T>( raw + h * 8 * kRawLd, c );
 			#pragma unroll
 			for ( int g = 0; g < G; ++g ) {
 				if ( g * 8 >= it.count ) break;   // uniform over the block
@@ -580,7 +715,7 @@ void moe_tile884_kernel( const void* const* __restrict__ ptrs, const void* const
 template <GgmlType T, bool GU, int RT>
 void launch_tile884( const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n, const half* in,
 	bool per_token, int k, int n, const half* topw, int top_k, float* part32, half* out16, float act_limit, cudaStream_t stream ) {
-	if constexpr ( iq_chunk_type<T>() ) {
+	if constexpr ( chunk_type<T>() ) {
 		constexpr int R = RT > 16 ? 1 : 2;   // row groups of a warp: each A read feeds R rows' operands, 8 R G accumulators a lane
 		static bool attr[64] = {};
 		int dev = 0;
@@ -631,7 +766,7 @@ void tile_proj( GgmlType type, int rt, const void* const* ptrs, const void* cons
 	const bool m884 = m884_on && tile884_device();
 	switch ( type ) {
 #define LAUNCH( T, RT ) \
-		if ( m884 && iq_chunk_type<GgmlType::T>() ) { \
+		if ( m884 && chunk_type<GgmlType::T>() ) { \
 			if ( ptrs_up != nullptr ) launch_tile884<GgmlType::T, true, RT>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, part32, out16, act_limit, stream ); \
 			else launch_tile884<GgmlType::T, false, RT>( ptrs, nullptr, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, part32, out16, act_limit, stream ); \
 		} \
