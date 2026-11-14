@@ -9,6 +9,7 @@
 #include "engine/runtime/options.h"
 #include "gguf_common.cuh"
 #include "ggml/dequantize.cuh"
+#include "../trellis/ptx.cuh"
 #include <mma.h>
 #include <algorithm>
 
@@ -229,23 +230,24 @@ __device__ __forceinline__ uint4 iq2_eight_h( uint64_t grid, float d, uint32_t s
 	return out;
 }
 
-// The FP16 values of block ib of a 256-wide block type, decoded by one warp. The IQ1 and IQ2 types put lane l's eight values at 8 l (sub-block
-// l / 4, eighth l % 4) with one 16-byte store, so a warp's stores are consecutive, bit for bit llama.cpp's dequantizers' values; the others take
-// those dequantizers (32 or 64 threads a block)
+// The types whose eight values of a chunk decode into registers (iq_chunk_h)
+template <GgmlType T> constexpr bool iq_chunk_type() {
+	return T == GgmlType::IQ1_S || T == GgmlType::IQ1_M || T == GgmlType::IQ2_XXS || T == GgmlType::IQ2_XS || T == GgmlType::IQ2_S;
+}
+
+// The FP16 values 8 c .. 8 c + 7 of block x (sub-block c / 4, eighth c % 4), bit for bit llama.cpp's dequantizers' values
 template <GgmlType T>
-__device__ __forceinline__ void tile_dequant( const void* w, int64_t ib, half* y, int lane ) {
+__device__ __forceinline__ uint4 iq_chunk_h( const void* blk, int c ) {
+	const int sb = c >> 2, il = c & 3;
 	if constexpr ( T == GgmlType::IQ1_S ) {
-		const block_iq1_s* x = static_cast<const block_iq1_s*>( w ) + ib;
-		const int sb = lane >> 2, il = lane & 3;
+		const block_iq1_s* x = static_cast<const block_iq1_s*>( blk );
 		const uint16_t qh = x->qh[sb];
 		const float delta = qh & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
 		const float d = static_cast<float>( x->d ) * ( 2 * ( ( qh >> 12 ) & 7 ) + 1 );
-		const uint32_t g = iq1s_grid_gpu[x->qs[4 * sb + il] | ( ( ( qh >> 3 * il ) & 7 ) << 8 )];
-		*reinterpret_cast<uint4*>( y + 8 * lane ) = iq1_eight_h( g, d, delta );
+		return iq1_eight_h( iq1s_grid_gpu[x->qs[4 * sb + il] | ( ( ( qh >> 3 * il ) & 7 ) << 8 )], d, delta );
 	}
 	else if constexpr ( T == GgmlType::IQ1_M ) {
-		const block_iq1_m* x = static_cast<const block_iq1_m*>( w ) + ib;
-		const int sb = lane >> 2, il = lane & 3;
+		const block_iq1_m* x = static_cast<const block_iq1_m*>( blk );
 		const uint16_t* sc = reinterpret_cast<const uint16_t*>( x->scales );
 		iq1m_scale_t scale;
 		scale.u16 = ( sc[0] >> 12 ) | ( ( sc[1] >> 8 ) & 0x00f0 ) | ( ( sc[2] >> 4 ) & 0x0f00 ) | ( sc[3] & 0xf000 );
@@ -253,30 +255,35 @@ __device__ __forceinline__ void tile_dequant( const void* w, int64_t ib, half* y
 		const float d = static_cast<float>( scale.f16 ) * ( 2 * ( ( sc[ib16 / 4] >> 3 * ( ib16 % 4 ) ) & 0x7 ) + 1 );
 		const uint8_t qh = x->qh[2 * sb + il / 2];
 		const float delta = qh & ( 0x08 << 4 * ( il % 2 ) ) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA;
-		const uint32_t g = iq1s_grid_gpu[x->qs[4 * sb + il] | ( ( ( qh >> 4 * ( il % 2 ) ) & 7 ) << 8 )];
-		*reinterpret_cast<uint4*>( y + 8 * lane ) = iq1_eight_h( g, d, delta );
+		return iq1_eight_h( iq1s_grid_gpu[x->qs[4 * sb + il] | ( ( ( qh >> 4 * ( il % 2 ) ) & 7 ) << 8 )], d, delta );
 	}
 	else if constexpr ( T == GgmlType::IQ2_XXS ) {
-		const block_iq2_xxs* x = static_cast<const block_iq2_xxs*>( w ) + ib;
-		const int sb = lane >> 2, il = lane & 3;
+		const block_iq2_xxs* x = static_cast<const block_iq2_xxs*>( blk );
 		const uint16_t* q2 = x->qs + 4 * sb;
 		const uint32_t aux32 = q2[2] | ( q2[3] << 16 );
 		const float d = static_cast<float>( x->d ) * ( 0.5f + ( aux32 >> 28 ) ) * 0.25f;
-		*reinterpret_cast<uint4*>( y + 8 * lane ) = iq2_eight_h( iq2xxs_grid[reinterpret_cast<const uint8_t*>( q2 )[il]], d, ksigns_iq2xs[( aux32 >> 7 * il ) & 127] );
+		return iq2_eight_h( iq2xxs_grid[reinterpret_cast<const uint8_t*>( q2 )[il]], d, ksigns_iq2xs[( aux32 >> 7 * il ) & 127] );
 	}
 	else if constexpr ( T == GgmlType::IQ2_XS ) {
-		const block_iq2_xs* x = static_cast<const block_iq2_xs*>( w ) + ib;
-		const int sb = lane >> 2, il = lane & 3;
+		const block_iq2_xs* x = static_cast<const block_iq2_xs*>( blk );
 		const uint16_t q2 = x->qs[4 * sb + il];
 		const float d = static_cast<float>( x->d ) * ( 0.5f + ( ( x->scales[sb] >> 4 * ( il / 2 ) ) & 0xf ) ) * 0.25f;
-		*reinterpret_cast<uint4*>( y + 8 * lane ) = iq2_eight_h( iq2xs_grid[q2 & 511], d, ksigns_iq2xs[q2 >> 9] );
+		return iq2_eight_h( iq2xs_grid[q2 & 511], d, ksigns_iq2xs[q2 >> 9] );
 	}
-	else if constexpr ( T == GgmlType::IQ2_S ) {
-		const block_iq2_s* x = static_cast<const block_iq2_s*>( w ) + ib;
-		const int sb = lane >> 2, il = lane & 3;
+	else {
+		static_assert( T == GgmlType::IQ2_S, "iq_chunk_h: an IQ1 or IQ2 type" );
+		const block_iq2_s* x = static_cast<const block_iq2_s*>( blk );
 		const float d = static_cast<float>( x->d ) * ( 0.5f + ( ( x->scales[sb] >> 4 * ( il / 2 ) ) & 0xf ) ) * 0.25f;
-		*reinterpret_cast<uint4*>( y + 8 * lane ) = iq2_eight_h( iq2s_grid[x->qs[4 * sb + il] | ( ( x->qh[sb] << ( 8 - 2 * il ) ) & 0x300 )], d, x->qs[QK_K / 8 + 4 * sb + il] );
+		return iq2_eight_h( iq2s_grid[x->qs[4 * sb + il] | ( ( x->qh[sb] << ( 8 - 2 * il ) ) & 0x300 )], d, x->qs[QK_K / 8 + 4 * sb + il] );
 	}
+}
+
+// The FP16 values of block ib of a 256-wide block type, decoded by one warp. The IQ1 and IQ2 types put lane l's eight values at 8 l (sub-block
+// l / 4, eighth l % 4) with one 16-byte store, so a warp's stores are consecutive, bit for bit llama.cpp's dequantizers' values; the others take
+// those dequantizers (32 or 64 threads a block)
+template <GgmlType T>
+__device__ __forceinline__ void tile_dequant( const void* w, int64_t ib, half* y, int lane ) {
+	if constexpr ( iq_chunk_type<T>() ) *reinterpret_cast<uint4*>( y + 8 * lane ) = iq_chunk_h<T>( static_cast<const typename TileBlk<T>::type*>( w ) + ib, lane );
 	else if constexpr ( T == GgmlType::IQ3_XXS ) dequantize_iq3_xxs<half>( w, ib, y, lane );
 	else if constexpr ( T == GgmlType::IQ3_S ) dequantize_iq3_s<half>( w, ib, y, lane );
 	else if constexpr ( T == GgmlType::IQ4_XS ) dequantize_iq4_xs<half>( w, ib, y, lane );
@@ -419,6 +426,189 @@ void moe_tile_kernel( const void* const* __restrict__ ptrs, const void* const* _
 	}
 }
 
+// ---- SM_70: the decoded values straight into the m8n8k4 B operands (no decoded tile in shared memory) ----
+// Built for SM_70 only (HMMA.884; later architectures run moe_tile_kernel's WMMA): elsewhere the kernel body is empty, and tile_proj launches
+// it only on a compute capability 7.0 device.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+#define GGUF_TILE_884 1
+#else
+#define GGUF_TILE_884 0
+#endif
+
+// bytes of a staged block: an odd number of 32-bit words, so the eight rows a quarter decodes read eight banks
+template <GgmlType T> constexpr int tile884_raw_ld() { return ( ( static_cast<int>( sizeof( typename TileBlk<T>::type ) ) + 3 ) / 4 | 1 ) * 4; }
+// the kernel's shared memory: the routes' inputs and two steps of raw blocks, or the input pieces' FP32 sums at the end
+template <GgmlType T, int RT, int R> constexpr size_t tile884_smem() {
+	return std::max( static_cast<size_t>( RT ) * kTileLd * sizeof( half ) + 2 * kTileN * tile884_raw_ld<T>(), static_cast<size_t>( 2 * R ) * RT * ( kTileN + 4 ) * sizeof( float ) );
+}
+
+// moe_tile_kernel for the IQ1 / IQ2 types on SM_70. In m8n8k4 a warp is four independent quarters; warp w takes R groups of 8 of the block's
+// 32 rows and 16 / R of each step's 32 chunks of 8 inputs, its quarter q the chunks q, q + 4, ... of those. A lane decodes the eight values of
+// its chunk for each of its rows (B column (l & 3) + 4 (l >= 16) of a group): they are its B operands of two k4 steps, multiplied with each
+// 8 routes' A operands (route (l & 3) + 4 (l >= 16) of the 8, the chunk's 16 bytes from shared memory). The quarters' sums meet over shuffles
+// (lanes l, l ^ 4, l ^ 8, l ^ 12 hold the same output slots), the warps' input pieces in shared memory, summed in order.
+template <GgmlType T, bool GU, int RT, int R>
+__global__ __launch_bounds__( kTileThreads, 2 )
+void moe_tile884_kernel( const void* const* __restrict__ ptrs, const void* const* __restrict__ ptrs_up, const Item* __restrict__ items, const int* __restrict__ n_items,
+	const int* __restrict__ sorted, const half* __restrict__ in, bool per_token, int k, int n, const half* __restrict__ topw, int top_k, float* __restrict__ part32,
+	half* __restrict__ out16, float act_limit ) {
+#if GGUF_TILE_884
+	using Blk = typename TileBlk<T>::type;
+	constexpr int kRawLd = tile884_raw_ld<T>();
+	constexpr int RU = sizeof( Blk ) / 2, UNITS = kTileN * RU, PER = ( UNITS + kTileThreads - 1 ) / kTileThreads;
+	constexpr int SETS = 4 / R, PIECES = 8 / SETS, CQ = 4 / R;   // row sets; input pieces (warps per row set); chunks of a quarter a step
+	constexpr int G = RT / 8;                                     // groups of 8 routes
+	if ( static_cast<int>( blockIdx.y ) >= *n_items ) return;
+	extern __shared__ __align__( 32 ) unsigned char tile_smem[];
+	half* sX = reinterpret_cast<half*>( tile_smem );                                  // [RT][kTileLd]
+	unsigned char* sR = reinterpret_cast<unsigned char*>( sX + RT * kTileLd );       // [2][kTileN][kRawLd]
+	__shared__ int s_route[RT];
+	const Item it = items[blockIdx.y];
+	constexpr int kRows = GU ? kTileN / 2 : kTileN;
+	const int row0 = blockIdx.x * kRows, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+	if ( threadIdx.x < RT ) s_route[threadIdx.x] = threadIdx.x < it.count ? sorted[it.begin + threadIdx.x] : -1;
+	const uint16_t* w = static_cast<const uint16_t*>( ptrs[it.expert] );
+	const uint16_t* wu = GU ? static_cast<const uint16_t*>( ptrs_up[it.expert] ) : w;
+	const int bpr = k / 256;
+	int src[PER], dst[PER];
+	unsigned upper = 0;
+	#pragma unroll
+	for ( int p = 0; p < PER; ++p ) {
+		const int u = threadIdx.x + p * kTileThreads, row = u / RU, j = u % RU, gr = row0 + ( GU ? row % kRows : row );
+		src[p] = u < UNITS && gr < n ? gr * bpr * RU + j : -1;
+		dst[p] = u < UNITS ? row * ( kRawLd / 2 ) + j : -1;
+		if ( GU && row >= kRows ) upper |= 1u << p;
+	}
+	uint16_t rr[PER];
+	auto fetch = [&]( int kb ) {
+		#pragma unroll
+		for ( int p = 0; p < PER; ++p ) rr[p] = src[p] >= 0 ? ( ( upper >> p ) & 1 ? wu : w )[src[p] + kb * RU] : 0;
+	};
+	auto stash = [&]( int buf ) {
+		uint16_t* d = reinterpret_cast<uint16_t*>( sR + buf * kTileN * kRawLd );
+		#pragma unroll
+		for ( int p = 0; p < PER; ++p ) if ( dst[p] >= 0 ) d[dst[p]] = rr[p];
+	};
+	constexpr int XPER = RT * 32 / kTileThreads;
+	const half* xsrc[XPER];
+	#pragma unroll
+	for ( int i = 0; i < XPER; ++i ) {
+		const int v = threadIdx.x + i * kTileThreads, j = v >> 5, c = v & 31, r = j < it.count ? sorted[it.begin + j] : -1;
+		xsrc[i] = r >= 0 ? in + static_cast<size_t>( per_token ? r / top_k : r ) * k + c * 8 : nullptr;
+	}
+	fetch( 0 );
+	stash( 0 );
+	const int rs = warp % SETS, piece = warp / SETS;                             // the warp's rows (groups rs R ..) and piece of the inputs
+	const int q = ( lane >> 2 ) & 3, rl = ( lane & 3 ) + 4 * ( lane >> 4 );     // the lane's quarter; its B column and A row within 8
+	float acc[R][G][8];
+	#pragma unroll
+	for ( int h = 0; h < R; ++h )
+		#pragma unroll
+		for ( int g = 0; g < G; ++g )
+			#pragma unroll
+			for ( int r = 0; r < 8; ++r ) acc[h][g][r] = 0.0f;
+	for ( int kb = 0; kb < bpr; ++kb ) {
+		if ( kb + 1 < bpr ) fetch( kb + 1 );
+		#pragma unroll
+		for ( int i = 0; i < XPER; ++i ) {
+			const int v = threadIdx.x + i * kTileThreads;
+			const uint4 val = xsrc[i] != nullptr ? *reinterpret_cast<const uint4*>( xsrc[i] + kb * 256 ) : make_uint4( 0, 0, 0, 0 );
+			*reinterpret_cast<uint4*>( sX + ( v >> 5 ) * kTileLd + ( v & 31 ) * 8 ) = val;
+		}
+		__syncthreads();
+		const unsigned char* raw = sR + ( ( kb & 1 ) * kTileN + rs * R * 8 + rl ) * kRawLd;
+		#pragma unroll
+		for ( int j = 0; j < CQ; ++j ) {
+			const int c = piece * 4 * CQ + q + 4 * j;   // with rows kTileLd apart (8 banks), a phase's eight 16-byte A reads take all 32 banks
+			uint4 b[R];
+			#pragma unroll
+			for ( int h = 0; h < R; ++h ) b[h] = iq_chunk_h<T>( raw + h * 8 * kRawLd, c );
+			#pragma unroll
+			for ( int g = 0; g < G; ++g ) {
+				if ( g * 8 >= it.count ) break;   // uniform over the block
+				const uint4 a = *reinterpret_cast<const uint4*>( sX + ( g * 8 + rl ) * kTileLd + c * 8 );
+				#pragma unroll
+				for ( int h = 0; h < R; ++h ) {
+					volta_mma_m8n8k4( a.x, a.y, b[h].x, b[h].y, acc[h][g] );
+					volta_mma_m8n8k4( a.z, a.w, b[h].z, b[h].w, acc[h][g] );
+				}
+			}
+		}
+		if ( kb + 1 < bpr ) stash( ( kb + 1 ) & 1 );
+		__syncthreads();
+	}
+	float* sC = reinterpret_cast<float*>( tile_smem );   // [PIECES][RT][kTileN + 4]
+	constexpr int ldc = kTileN + 4;
+	#pragma unroll
+	for ( int h = 0; h < R; ++h )
+		#pragma unroll
+		for ( int g = 0; g < G; ++g )
+			#pragma unroll
+			for ( int r = 0; r < 8; ++r ) {
+				float v = acc[h][g][r];
+				v += __shfl_xor_sync( 0xffffffffu, v, 4 );
+				v += __shfl_xor_sync( 0xffffffffu, v, 8 );
+				int m, nn;
+				volta_d_slot( lane, r, &m, &nn );
+				if ( q == 0 ) sC[( piece * RT + g * 8 + m ) * ldc + ( rs * R + h ) * 8 + nn] = v;
+			}
+	__syncthreads();
+	for ( int v = threadIdx.x; v < RT * kRows; v += kTileThreads ) {
+		const int j = v / kRows, c = v % kRows, r = s_route[j], gr = row0 + c;
+		if ( r < 0 || gr >= n ) continue;
+		auto sum = [&]( int col ) {
+			float t = 0.0f;
+			#pragma unroll
+			for ( int p = 0; p < PIECES; ++p ) t += sC[( p * RT + j ) * ldc + col];
+			return t;
+		};
+		const float val = sum( c );
+		if constexpr ( GU ) {
+			float gv = __half2float( __float2half_rn( val ) ), uv = __half2float( __float2half_rn( sum( c + kRows ) ) );
+			if ( act_limit > 0.0f ) {
+				gv = fminf( gv, act_limit );
+				uv = fmaxf( -act_limit, fminf( uv, act_limit ) );
+			}
+			out16[static_cast<size_t>( r ) * n + gr] = __float2half_rn( gv / ( 1.0f + __expf( -gv ) ) * uv );
+		}
+		else if ( part32 != nullptr ) part32[static_cast<size_t>( r ) * n + gr] = val * __half2float( topw[r] );
+		else out16[static_cast<size_t>( r ) * n + gr] = __float2half_rn( val );
+	}
+#endif   // elsewhere empty: tile_proj takes this kernel on compute capability 7.0 only
+}
+
+template <GgmlType T, bool GU, int RT>
+void launch_tile884( const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n, const half* in,
+	bool per_token, int k, int n, const half* topw, int top_k, float* part32, half* out16, float act_limit, cudaStream_t stream ) {
+	if constexpr ( iq_chunk_type<T>() ) {
+		constexpr int R = RT > 16 ? 1 : 2;   // row groups of a warp: each A read feeds R rows' operands, 8 R G accumulators a lane
+		static bool attr[64] = {};
+		int dev = 0;
+		cudaGetDevice( &dev );
+		if ( !attr[dev] ) {
+			CUDA_CHECK( cudaFuncSetAttribute( moe_tile884_kernel<T, GU, RT, R>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( tile884_smem<T, RT, R>() ) ) );
+			attr[dev] = true;
+		}
+		constexpr int rows = GU ? kTileN / 2 : kTileN;
+		moe_tile884_kernel<T, GU, RT, R><<<dim3( ( n + rows - 1 ) / rows, max_n ), kTileThreads, tile884_smem<T, RT, R>(), stream>>>( ptrs, ptrs_up, items, n_items,
+			sorted, in, per_token, k, n, topw, top_k, part32, out16, act_limit );
+	}
+}
+
+// The device runs the SM_70 kernel: compute capability 7.0 exactly
+bool tile884_device() {
+	static int cc[64] = {};
+	int dev = 0;
+	cudaGetDevice( &dev );
+	if ( cc[dev] == 0 ) {
+		int major = 0, minor = 0;
+		CUDA_CHECK( cudaDeviceGetAttribute( &major, cudaDevAttrComputeCapabilityMajor, dev ) );
+		CUDA_CHECK( cudaDeviceGetAttribute( &minor, cudaDevAttrComputeCapabilityMinor, dev ) );
+		cc[dev] = 10 * major + minor;
+	}
+	return cc[dev] == 70;
+}
+
 template <GgmlType T, bool GU, int RT>
 void launch_tile( const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n, const half* in, bool per_token,
 	int k, int n, const half* topw, int top_k, float* part32, half* out16, float act_limit, cudaStream_t stream ) {
@@ -437,9 +627,15 @@ void launch_tile( const void* const* ptrs, const void* const* ptrs_up, const Ite
 // ptrs_up != null: gate (ptrs) and up of the same type in one pass, the activation to out16; rt: the items' routes (16 or 32)
 void tile_proj( GgmlType type, int rt, const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n,
 	const half* in, bool per_token, int k, int n, const half* topw, int top_k, float* part32, half* out16, float act_limit, cudaStream_t stream ) {
+	static const bool m884_on = engine::runtime::options().gguf_moe_tile884;
+	const bool m884 = m884_on && tile884_device();
 	switch ( type ) {
 #define LAUNCH( T, RT ) \
-		if ( ptrs_up != nullptr ) launch_tile<GgmlType::T, true, RT>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, part32, out16, act_limit, stream ); \
+		if ( m884 && iq_chunk_type<GgmlType::T>() ) { \
+			if ( ptrs_up != nullptr ) launch_tile884<GgmlType::T, true, RT>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, part32, out16, act_limit, stream ); \
+			else launch_tile884<GgmlType::T, false, RT>( ptrs, nullptr, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, part32, out16, act_limit, stream ); \
+		} \
+		else if ( ptrs_up != nullptr ) launch_tile<GgmlType::T, true, RT>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, part32, out16, act_limit, stream ); \
 		else launch_tile<GgmlType::T, false, RT>( ptrs, nullptr, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, part32, out16, act_limit, stream );
 #define CASE( T ) case GgmlType::T: if ( rt > 16 ) { LAUNCH( T, 32 ) } else { LAUNCH( T, 16 ) } break;
 		CASE( IQ1_S ) CASE( IQ1_M ) CASE( IQ2_XXS ) CASE( IQ2_XS ) CASE( IQ2_S ) CASE( IQ3_XXS ) CASE( IQ3_S ) CASE( IQ4_XS ) CASE( Q2_K ) CASE( Q3_K ) CASE( Q4_K )

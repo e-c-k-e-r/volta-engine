@@ -2,7 +2,8 @@
 // and the GB/s of the blocks of the experts the routes touch. Routes are uniform over the global experts (fixed seed); this rank holds the
 // first `local` of them. The block bytes are a constant pattern, or pseudo-random with BENCH_RANDOM=1 (the IQ grids' lookups then miss as
 // real weights do; timing only either way: the values are not meaningful). BENCH_ROWS=a,b,... sets the row counts (prefill: the tile path
-// above 64 rows).
+// above 64 rows). BENCH_DUMP=<prefix>: pseudo-random inputs, and each row count's output after one forward written to <prefix>_<rows>.bin
+// (FP16, rows x hidden), to compare two runs of the same weights (a kernel path A/B; with BENCH_RANDOM=1 for meaningful values).
 //   bench_gguf_moe [TYPE] [hidden inter global local top_k]   default Q2_K 4096 2048 288 72 8 (GLM-5.3-Flash, expert-parallel at TP=4)
 //   DeepSeek-V4.1 IQ1_M build: bench_gguf_moe IQ1_S 5120 2304 384 96 6
 #include "engine/config.h"
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <random>
 #include <set>
+#include <string>
 #include <vector>
 
 using engine::modules::GgmlType;
@@ -54,6 +56,9 @@ int main( int argc, char** argv ) {
 		const int fields = engine::modules::ggml_scale_fields( type, off );
 		for ( size_t at = 0; at + blk.bytes <= random_bytes.size(); at += blk.bytes ) {
 			for ( int f = 0; f < fields; ++f ) { random_bytes[at + off[f]] = 0x00; random_bytes[at + off[f] + 1] = 0x20; }   // 2^-7
+			if ( type == GgmlType::IQ1_M ) {   // its FP16 scale is the top nibbles of the four scale words (bytes 48..55): 2^-7 as well
+				for ( int w = 0; w < 4; ++w ) random_bytes[at + 49 + 2 * w] = static_cast<uint8_t>( ( random_bytes[at + 49 + 2 * w] & 0x0f ) | ( w == 3 ? 0x20 : 0x00 ) );
+			}
 		}
 	}
 	// per set: the gate, up and down pointer arrays
@@ -107,7 +112,14 @@ int main( int argc, char** argv ) {
 		CUDA_CHECK( cudaMemcpy( d_w, tw.data(), tw.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
 		half* x = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( m ) * hidden * sizeof( half ), 256 ) );
 		half* o = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( m ) * hidden * sizeof( half ), 256 ) );
-		CUDA_CHECK( cudaMemsetAsync( x, 0x3c, static_cast<size_t>( m ) * hidden * sizeof( half ), stream ) );
+		const char* dump = std::getenv( "BENCH_DUMP" );
+		if ( dump != nullptr ) {
+			std::vector<half> xs( static_cast<size_t>( m ) * hidden );
+			std::mt19937 xr( 7 + m );
+			for ( half& v : xs ) v = __float2half( static_cast<float>( xr() % 2001 ) / 1000.0f - 1.0f );
+			CUDA_CHECK( cudaMemcpy( x, xs.data(), xs.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
+		}
+		else CUDA_CHECK( cudaMemsetAsync( x, 0x3c, static_cast<size_t>( m ) * hidden * sizeof( half ), stream ) );
 		auto run = [&]() {
 			for ( int s = 0; s < SETS; ++s ) {
 				engine::modules::MoEGguf::Table t;
@@ -123,6 +135,14 @@ int main( int argc, char** argv ) {
 		};
 		run();
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		if ( dump != nullptr ) {
+			std::vector<half> out( static_cast<size_t>( m ) * hidden );
+			CUDA_CHECK( cudaMemcpy( out.data(), o, out.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+			const std::string path = std::string( dump ) + "_" + std::to_string( m ) + ".bin";
+			FILE* f = std::fopen( path.c_str(), "wb" );
+			ENGINE_ASSERT( f != nullptr && std::fwrite( out.data(), sizeof( half ), out.size(), f ) == out.size(), "bench_gguf_moe: BENCH_DUMP write" );
+			std::fclose( f );
+		}
 		cudaGraph_t g;
 		cudaGraphExec_t ex;
 		CUDA_CHECK( cudaStreamBeginCapture( stream, cudaStreamCaptureModeGlobal ) );
