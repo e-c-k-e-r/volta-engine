@@ -135,7 +135,8 @@ bool Glm5NextPipeline::init(
 	mtp_on_ = runtime::options().speculator == "mtp";
 	mla_slots_ = config_.num_mla_layers + ( mtp_on_ ? 1 : 0 );
 	// Window prefill: chunks run layer by layer, the routed experts once over all their rows (not with the MTP head, which reads every prefill row)
-	window_ = ( !mtp_on_ && runtime::options().prefill_window > 1 ) ? std::min( runtime::options().prefill_window, 8 ) : 1;
+	const int pw = runtime::options().prefill_window < 0 ? 8 : runtime::options().prefill_window;   // -1: GLM's default, 8 chunks
+	window_ = ( !mtp_on_ && pw > 1 ) ? std::min( pw, 8 ) : 1;
 	// Routed experts: sharded over the ranks (every rank holds a quarter of every expert's intermediate width, moe_tp,
 	// default) or expert-parallel (72 whole experts per rank, forced by the two-tier expert cache). The sharded layout balances
 	// the load: each active expert costs every rank the same, where expert-parallel waits for the rank that drew the most.

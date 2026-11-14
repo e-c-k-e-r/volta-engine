@@ -593,7 +593,7 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 		ENGINE_ASSERT( config_.intermediate_size % 128 == 0 && spans >= tp, "DeepseekV41Pipeline: the expert width must split into 128-wide spans for every rank" );
 	}
 	max_group_ = expert_tp_ ? config_.num_experts : ( config_.num_experts + config_.tp_size - 1 ) / config_.tp_size;
-	window_ = std::max( 1, std::min( runtime::options().prefill_window, 16 ) );
+	window_ = std::max( 1, std::min( runtime::options().prefill_window, 16 ) );   // -1 (the default): off, the window's buffers cost residency
 	const size_t window_mark = arena.offset_bytes;
 	moe_scratch_ = engine::modules::MoE::alloc_scratch( arena, max_group_, config_.top_k, H, config_.intermediate_size, R * window_, false );
 	if ( window_ > 1 ) {
