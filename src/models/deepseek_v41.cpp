@@ -955,7 +955,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		// a GGUF conversion: every expert of a layer holds the same block types, whole experts on each rank
 		const auto* g0 = repo.find( ( p + "0.w1.weight" ).c_str() );
 		layers_[l].gguf_experts = g0 != nullptr && g0->dtype == pod::DType::GGUF;
-		ENGINE_ASSERT( !layers_[l].gguf_experts || !expert_tp_, "DeepseekV41Pipeline: GGUF experts are held whole on each rank (expert_shard off)" );
+		if ( layers_[l].gguf_experts ) expert_span_ = 256;   // slices of whole GGUF blocks (every layer's experts are of one kind)
 		for ( int e = 0; e < E && !layers_[l].gguf_experts; ++e ) {
 			// the widths of the three projections (a pack may give each its own): gate | up << 4 | down << 8, which orders and groups the experts
 			int sig = 0, sh = 0;
@@ -1018,7 +1018,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		backend::memcpy_sync( layers_[l].perm, perm.data(), E * sizeof( int ), backend::Copy::H2D );
 		for ( int e : mine_[l] ) {
 			// a slice's codes are its share of the 18 spans of the whole tensor
-			for ( const char* w : { ".w1", ".w2", ".w3" } ) expert_bytes[l][e] += repo.trellis_bytes( ( p + std::to_string( e ) + w ).c_str() ) / ( expert_tp_ ? config_.intermediate_size / 128 : 1 ) * static_cast<size_t>( expert_tp_ ? [&]() { int b0, n; expert_slice( e, rank_, &b0, &n ); return n; }() : 1 );
+			for ( const char* w : { ".w1", ".w2", ".w3" } ) expert_bytes[l][e] += repo.trellis_bytes( ( p + std::to_string( e ) + w ).c_str() ) / ( expert_tp_ ? config_.intermediate_size / expert_span_ : 1 ) * static_cast<size_t>( expert_tp_ ? [&]() { int b0, n; expert_slice( e, rank_, &b0, &n ); return n; }() : 1 );
 			code_bytes += expert_bytes[l][e];
 		}
 	}
@@ -1107,9 +1107,19 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 				const std::string b = p + std::to_string( e );
 				pod::MemoryArena* codes = resident[e] ? nullptr : &host_arena_;
 				if ( lw.gguf_experts ) {
-					mw.gate[i] = repo.load_linear( ( b + ".w1" ).c_str(), arena, 4, stream, codes );
-					mw.up[i] = repo.load_linear( ( b + ".w3" ).c_str(), arena, 4, stream, codes );
-					mw.down[i] = repo.load_linear( ( b + ".w2" ).c_str(), arena, 4, stream, codes );
+					if ( expert_tp_ ) {
+						// w1 / w3: this rank's output rows, w2: its input columns, in whole 256-wide blocks
+						int s0 = 0, sn = 0;
+						expert_slice( e, rank_, &s0, &sn );
+						mw.gate[i] = repo.load_linear_range( ( b + ".w1" ).c_str(), arena, 1, s0 * 16, sn * 16, stream, codes );
+						mw.up[i] = repo.load_linear_range( ( b + ".w3" ).c_str(), arena, 1, s0 * 16, sn * 16, stream, codes );
+						mw.down[i] = repo.load_linear_range( ( b + ".w2" ).c_str(), arena, 0, s0 * 16, sn * 16, stream, codes );
+					}
+					else {
+						mw.gate[i] = repo.load_linear( ( b + ".w1" ).c_str(), arena, 4, stream, codes );
+						mw.up[i] = repo.load_linear( ( b + ".w3" ).c_str(), arena, 4, stream, codes );
+						mw.down[i] = repo.load_linear( ( b + ".w2" ).c_str(), arena, 4, stream, codes );
+					}
 					need( mw.gate[i].is_valid() && mw.up[i].is_valid() && mw.down[i].is_valid(), b );
 					if ( codes ) on_host += expert_bytes[l][e];
 					continue;
@@ -1203,7 +1213,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 }
 
 void DeepseekV41Pipeline::expert_slice( int expert, int rank, int* begin, int* spans ) const {
-	const int total = config_.intermediate_size / 128, tp = config_.tp_size, extra = total % tp;
+	const int total = config_.intermediate_size / expert_span_, tp = config_.tp_size, extra = total % tp;
 	auto width = [&]( int r ) { return total / tp + ( ( r - expert % tp + tp ) % tp < extra ? 1 : 0 ); };
 	int b = 0;
 	for ( int r = 0; r < rank; ++r ) b += width( r );

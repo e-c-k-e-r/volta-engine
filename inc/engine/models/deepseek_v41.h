@@ -317,6 +317,7 @@ private:
 	// expert_shard: the intermediate width is 18 spans of 128; rank r of tp takes 18 / tp of them plus one of the 18 % tp extra, and which ranks get
 	// the extra rotates with the expert so every rank carries the same share of the bytes and of the work
 	void expert_slice( int expert, int rank, int* begin, int* spans ) const;
+	int expert_span_ = 128;   // the unit of an expert's slices (expert_shard): a 128-wide trellis span, or 256 inputs (a GGUF block) for GGUF experts
 	std::vector<std::vector<int>> mine_;   // [layer] this rank's checkpoint expert ids in engine order
 	std::vector<uint64_t> heat_total_;     // [layer][checkpoint expert] routes counted on this rank
 	std::vector<uint32_t> pending_;        // [layer][checkpoint expert] routes drained by expert_heat that the residency has not seen yet
