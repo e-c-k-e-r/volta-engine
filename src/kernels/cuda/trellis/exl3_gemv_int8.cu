@@ -52,50 +52,52 @@ int int8_max_k( int device ) {
 }
 
 template <int bits, int M, bool c_fp32, bool residual, bool stage_smem>
-void* sel() {
-	if constexpr ( gemv_int8_sq_threads( bits ) == 512 ) return (void*) exl3_gemv_int8_sq_kernel_w<bits, M, c_fp32, residual, stage_smem>;
-	else return (void*) exl3_gemv_int8_sq_kernel<bits, M, c_fp32, residual, stage_smem>;
+void* sel( bool split ) {
+	if constexpr ( gemv_int8_has_split( bits ) ) {
+		if ( split ) return (void*) exl3_gemv_int8_sq_kernel_w<bits, M, c_fp32, residual, stage_smem>;
+	}
+	return (void*) exl3_gemv_int8_sq_kernel<bits, M, c_fp32, residual, stage_smem>;
 }
 
 template <int bits, int M, bool c_fp32, bool residual>
-void* sel_stage( bool stage_smem ) {
+void* sel_stage( bool stage_smem, bool split ) {
 	if constexpr ( bits == 3 || bits == 5 || bits == 7 ) {
-		return stage_smem ? sel<bits, M, c_fp32, residual, true>()
-		                  : sel<bits, M, c_fp32, residual, false>();
+		return stage_smem ? sel<bits, M, c_fp32, residual, true>( split )
+		                  : sel<bits, M, c_fp32, residual, false>( split );
 	}
 	else {
 		(void) stage_smem;
-		return sel<bits, M, c_fp32, residual, false>();
+		return sel<bits, M, c_fp32, residual, false>( split );
 	}
 }
 
 template <int bits, int M>
-void* sel_c( bool c_fp32, bool residual ) {
-	if ( c_fp32 ) return residual ? sel_stage<bits, M, true, true>( false )
-	                              : sel_stage<bits, M, true, false>( int8_smem_for( bits ) );
-	return residual ? sel_stage<bits, M, false, true>( false )
-	                : sel_stage<bits, M, false, false>( int8_smem_for( bits ) );
+void* sel_c( bool c_fp32, bool residual, bool split ) {
+	if ( c_fp32 ) return residual ? sel_stage<bits, M, true, true>( false, split )
+	                              : sel_stage<bits, M, true, false>( int8_smem_for( bits ), split );
+	return residual ? sel_stage<bits, M, false, true>( false, split )
+	                : sel_stage<bits, M, false, false>( int8_smem_for( bits ), split );
 }
 
-void* select_kernel( int K, int M, bool c_fp32, bool residual ) {
+void* select_kernel( int K, int M, bool c_fp32, bool residual, bool split = false ) {
 	// M == 2 only reaches this path in plain int8 mode, and only the bit widths the models actually
 	// use are instantiated: the two-row variants double compile time for a shape we do not decode.
 	if ( M == 2 ) {
 		switch ( K ) {
-			case 4: return sel_c<4, 2>( c_fp32, residual );
-			case 5: return sel_c<5, 2>( c_fp32, residual );
+			case 4: return sel_c<4, 2>( c_fp32, residual, split );
+			case 5: return sel_c<5, 2>( c_fp32, residual, split );
 			default: return nullptr;
 		}
 	}
 	if ( M != 1 ) return nullptr;
 	switch ( K ) {
-		case 2: return sel_c<2, 1>( c_fp32, residual );
-		case 3: return sel_c<3, 1>( c_fp32, residual );
-		case 4: return sel_c<4, 1>( c_fp32, residual );
-		case 5: return sel_c<5, 1>( c_fp32, residual );
-		case 6: return sel_c<6, 1>( c_fp32, residual );
-		case 7: return sel_c<7, 1>( c_fp32, residual );
-		case 8: return sel_c<8, 1>( c_fp32, residual );
+		case 2: return sel_c<2, 1>( c_fp32, residual, split );
+		case 3: return sel_c<3, 1>( c_fp32, residual, split );
+		case 4: return sel_c<4, 1>( c_fp32, residual, split );
+		case 5: return sel_c<5, 1>( c_fp32, residual, split );
+		case 6: return sel_c<6, 1>( c_fp32, residual, split );
+		case 7: return sel_c<7, 1>( c_fp32, residual, split );
+		case 8: return sel_c<8, 1>( c_fp32, residual, split );
 		default: return nullptr;
 	}
 }
@@ -108,7 +110,7 @@ struct Decomp {
 	int rows_per;
 };
 
-Decomp decomp( int grid, int size_k, int size_n, int M, bool residual, int bits ) {
+Decomp decomp( int grid, int size_k, int size_n, int M, bool residual, bool split ) {
 	int rows_total = size_k / 16;
 	int nb256 = size_n / 256;
 	int r = CEIL_DIVIDE( rows_total * nb256, grid );
@@ -116,12 +118,12 @@ Decomp decomp( int grid, int size_k, int size_n, int M, bool residual, int bits 
 	rows_per = MAX( rows_per, SQ_MINROWS );
 	rows_per = MIN( rows_per, gemv_int8_sq_rows_max( M, residual ) );
 	rows_per = MIN( rows_per, ( rows_total + 7 ) & ~7 );
-	if ( gemv_int8_sq_threads( bits ) == 512 ) rows_per = gemv_int8_sq_fit( rows_per, rows_total, nb256, grid, gemv_int8_sq_rows_max( M, residual ) );
+	if ( split ) rows_per = gemv_int8_sq_fit( rows_per, rows_total, nb256, grid, gemv_int8_sq_rows_max( M, residual ) );
 	return { CEIL_DIVIDE( rows_total, rows_per ), rows_per };
 }
 
-size_t smem_for( int rows_per, int size_n, int M, bool residual, bool smem, int bits ) {
-	size_t stage = smem ? (size_t) 8 * GEMV_STAGE_D * 16 * bits * 4 : 0;
+size_t smem_for( int rows_per, int size_n, int M, bool residual, bool smem, int bits, bool split = false ) {
+	size_t stage = smem ? (size_t) ( split ? 16 : 8 ) * GEMV_STAGE_D * 16 * bits * 4 : 0;
 	return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * M * ( residual ? 2 : 1 )
 	     + stage + (size_t) 2 * M * 128 * 4;
 }
@@ -152,14 +154,19 @@ void exl3_gemv_int8_init( int device ) {
 		for ( int M : { 1, 2 } ) {
 			for ( bool fp32 : { false, true } ) {
 				for ( bool residual : { false, true } ) {
-					{
-						void* fn = select_kernel( bits, M, fp32, residual );
+					for ( bool split : { false, true } ) {
+						void* fn = select_kernel( bits, M, fp32, residual, split );
 						if ( !fn ) continue;
 						if ( int8_attr_set[device].count( fn ) ) continue;
 						bool smem = gemv_int8_stage_smem( bits );
 						int rows_max = gemv_int8_sq_rows_max( M, residual );
-						size_t smem_max = smem_for( rows_max, 0, M, residual, smem, bits );
-						(void) cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_max );
+						size_t smem_max = smem_for( rows_max, 0, M, residual, smem, bits, split && gemv_int8_has_split( bits ) );
+						// held to what the device grants next to the kernel's static shared memory (a request above it is rejected and leaves
+						// the 48 KB default, which the 512-thread kernels' staging can exceed)
+						cudaFuncAttributes fa{};
+						(void) cudaFuncGetAttributes( &fa, fn );
+						smem_max = MIN( smem_max, static_cast<size_t>( ENGINE_MAX_SMEM ) - fa.sharedSizeBytes );
+						CUDA_CHECK( cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_max ) );
 						// Match the tensor-core kernels' shared-memory carveout: these interleave with them
 						// (hundreds of launches per decoded token), and a smaller carveout makes the GPU
 						// drain and reconfigure the SMs on every transition.
@@ -225,26 +232,37 @@ bool exl3_gemv_int8(
 	// identical across M: row r of an M-row call is bit-identical to the same row run alone. Wider
 	// variants may then exceed their own resident-block count, which is fine (blocks never wait on
 	// each other; the last finisher of a column group runs its epilogue).
-	void* fn1 = select_kernel( K, 1, c_fp32, residual );
-	if ( !fn1 ) fn1 = fn;
-	const int M1 = ( fn1 == fn ) ? M : 1;
-	Decomp d = decomp( 6 * num_sms, size_k, size_n, M1, residual, K );
-	size_t smem_guess = smem_for( d.rows_per, size_n, M1, residual, smem, K );
-
-	int maxb = 1;
-	auto occ_key = std::make_pair( fn1, smem_guess );
-	auto occ_it = int8_occ_cache[device].find( occ_key );
-	if ( occ_it != int8_occ_cache[device].end() ) {
-		maxb = occ_it->second;
+	// The decomposition (grid, slice height) of a variant, sized from its one-row kernel's occupancy
+	auto plan = [&]( bool split, int* grid_out, Decomp* d_out ) {
+		void* fn1 = select_kernel( K, 1, c_fp32, residual, split );
+		if ( !fn1 ) fn1 = select_kernel( K, M, c_fp32, residual, split );
+		const int M1 = ( fn1 == select_kernel( K, M, c_fp32, residual, split ) ) ? M : 1;
+		Decomp d0 = decomp( 6 * num_sms, size_k, size_n, M1, residual, split );
+		size_t smem_guess = smem_for( d0.rows_per, size_n, M1, residual, smem, K, split );
+		int maxb = 1;
+		auto occ_key = std::make_pair( fn1, smem_guess );
+		auto occ_it = int8_occ_cache[device].find( occ_key );
+		if ( occ_it != int8_occ_cache[device].end() ) maxb = occ_it->second;
+		else {
+			(void) cudaOccupancyMaxActiveBlocksPerMultiprocessor( &maxb, fn1, split ? 512 : NUM_THREADS, smem_guess );
+			int8_occ_cache[device][occ_key] = maxb;
+		}
+		*grid_out = MIN( MAX( maxb, 1 ) * num_sms, 1024 );
+		*d_out = decomp( *grid_out, size_k, size_n, M, residual, split );
+	};
+	// The split kernel (two warps per column group over a unit's rows) where the 256-thread decomposition leaves blocks without a unit;
+	// the choice depends on the shape alone, so a row's result is the same at either row count
+	int grid = 0;
+	Decomp d{};
+	plan( false, &grid, &d );
+	bool split = false;
+	if ( gemv_int8_has_split( K ) && d.ksplit * ( size_n / 256 ) < grid ) {
+		split = true;
+		plan( true, &grid, &d );
 	}
-	else {
-		maxb = 1;
-		(void) cudaOccupancyMaxActiveBlocksPerMultiprocessor( &maxb, fn1, gemv_int8_sq_threads( K ), smem_guess );
-		int8_occ_cache[device][occ_key] = maxb;
-	}
-	int grid = MIN( MAX( maxb, 1 ) * num_sms, 1024 );
-	d = decomp( grid, size_k, size_n, M, residual, K );
-	size_t smem_bytes = smem_for( d.rows_per, size_n, M, residual, smem, K );
+	fn = select_kernel( K, M, c_fp32, residual, split );
+	if ( !fn ) return false;
+	size_t smem_bytes = smem_for( d.rows_per, size_n, M, residual, smem, K, split );
 	if ( d.ksplit > SQ_KSPLIT_CAP ) return false;
 	if ( size_n / 256 > SQ_COUNTERS_CAP ) return false;
 
@@ -266,7 +284,7 @@ bool exl3_gemv_int8(
 		(void*) &svh
 	};
 
-	cudaError_t err = cudaLaunchKernel( fn, dim3( grid ), dim3( gemv_int8_sq_threads( K ) ), kernel_args, smem_bytes, stream );
+	cudaError_t err = cudaLaunchKernel( fn, dim3( grid ), dim3( split ? 512 : NUM_THREADS ), kernel_args, smem_bytes, stream );
 	if ( err != cudaSuccess ) {
 		// Declining the fast path is only safe if nothing was enqueued. Swallowing the error here
 		// would leave the caller's fallback launch reporting a poisoned stream instead of the real

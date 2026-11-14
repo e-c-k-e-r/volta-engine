@@ -48,9 +48,10 @@ namespace cg_gemv = cooperative_groups;
 // extraction), or the smem-staged unit for the bit widths routed to it.
 
 #define NUM_THREADS 256
-// The 4-bit sq kernel runs 16 warps: each 256-column unit's rows split between two warps per column group (gemv_int8_unit_wide), so a
-// unit's serial row chain halves and an SM holds twice the warps without staging the slice's activations twice
-__host__ __device__ constexpr int gemv_int8_sq_threads(int bits) { return bits == 4 ? 512 : NUM_THREADS; }
+// The split sq kernels (3- to 5-bit) run 16 warps: each 256-column unit's rows are split between two warps per column group, so a unit's
+// serial row chain halves and an SM holds twice the warps without staging the slice's activations twice. The launcher takes them where the
+// 256-thread decomposition has fewer units than blocks (exl3_gemv_int8)
+__host__ __device__ constexpr bool gemv_int8_has_split(int bits) { return bits == 3 || bits == 4 || bits == 5; }
 
 // ---------------------------------------------------------------------------------------------------------
 // Extract 8 packed 16-bit trellis windows for positions t0..t0+7 as masked uint32s. Index math copied
@@ -606,14 +607,50 @@ __device__ __forceinline__ void gemv_int8_pair_row
 }
 #endif
 
+// Row-split units (SPLIT warps per block pair, each over a share of the slice's rows): after the in-warp reduction the writer lanes of
+// the upper halves park their sums, the lower half adds them (integer sums: exact, the split does not change the result). Returns false
+// for the threads that are done (the upper halves). Every thread of the block must call it.
+template <int M, int SPLIT>
+__device__ __forceinline__ bool gemv_int8_pair_combine(bool writer, int slot, int warp8, int half_id,
+    int* ia0, int* ia1, int* ib0, int* ib1, int* ja0, int* ja1, int* jb0, int* jb1)
+{
+    static_assert(SPLIT == 2, "two row halves");
+    __shared__ int comb[8][16][8 * M];
+    __syncthreads();
+    if (half_id == 1 && writer)
+    {
+        #pragma unroll
+        for (int r = 0; r < M; ++r)
+        {
+            int* c = comb[warp8][slot] + 8 * r;
+            c[0] = ia0[r]; c[1] = ia1[r]; c[2] = ib0[r]; c[3] = ib1[r];
+            c[4] = ja0[r]; c[5] = ja1[r]; c[6] = jb0[r]; c[7] = jb1[r];
+        }
+    }
+    __syncthreads();
+    if (half_id == 1) return false;
+    if (writer)
+    {
+        #pragma unroll
+        for (int r = 0; r < M; ++r)
+        {
+            const int* c = comb[warp8][slot] + 8 * r;
+            ia0[r] += c[0]; ia1[r] += c[1]; ib0[r] += c[2]; ib1[r] += c[3];
+            ja0[r] += c[4]; ja1[r] += c[5]; jb0[r] += c[6]; jb1[r] += c[7];
+        }
+    }
+    return true;
+}
+
 #if EXL3_VOLTA_LAYOUT
 // Volta tile order: the lane pair (l, l ^ 8) holds the two k halves of one column; the lanes with cs == 0 write the column of each block
-template <int M, bool residual, bool atomic = true>
+template <int M, bool residual, bool atomic = true, int SPLIT = 1>
 __device__ __forceinline__ void gemv_int8_pair_tail
 (
     int* __restrict__ accs, size_t acc_stride, int nbp, int lane, int size_n,
     int* ia0, int* ia1, int* ib0, int* ib1,
-    int* ja0, int* ja1, int* jb0, int* jb1
+    int* ja0, int* ja1, int* jb0, int* jb1,
+    int warp8 = 0, int half_id = 0
 )
 {
     (void) ia1; (void) ib1; (void) ja1; (void) jb1;
@@ -628,6 +665,8 @@ __device__ __forceinline__ void gemv_int8_pair_tail
             jb0[r] += __shfl_xor_sync(0xffffffff, jb0[r], 8);
         }
     }
+    if constexpr (SPLIT > 1)
+        if (!gemv_int8_pair_combine<M, SPLIT>(((lane >> 3) & 1) == 0, (lane & 7) | ((lane >> 4) << 3), warp8, half_id, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1)) return;
     if (((lane >> 3) & 1) == 0)
     {
         const int nA = (nbp * 2) * 16 + 8 * ((lane >> 2) & 1) + (lane & 3) + 4 * (lane >> 4);
@@ -662,12 +701,13 @@ __device__ __forceinline__ void gemv_int8_pair_tail
 #else
 // Shared reduction tail for the pair-per-warp generic units (atomic, or exclusive plain stores for
 // the per-slice partials of the sq kernel): four lanes share each n
-template <int M, bool residual, bool atomic = true>
+template <int M, bool residual, bool atomic = true, int SPLIT = 1>
 __device__ __forceinline__ void gemv_int8_pair_tail
 (
     int* __restrict__ accs, size_t acc_stride, int nbp, int lane, int size_n,
     int* ia0, int* ia1, int* ib0, int* ib1,
-    int* ja0, int* ja1, int* jb0, int* jb1
+    int* ja0, int* ja1, int* jb0, int* jb1,
+    int warp8 = 0, int half_id = 0
 )
 {
     #pragma unroll
@@ -689,6 +729,8 @@ __device__ __forceinline__ void gemv_int8_pair_tail
             }
         }
     }
+    if constexpr (SPLIT > 1)
+        if (!gemv_int8_pair_combine<M, SPLIT>((lane & 3) == 0, lane >> 2, warp8, half_id, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1)) return;
     if ((lane & 3) == 0)
     {
         int nA = (nbp * 2) * 16 + (lane >> 2);
@@ -732,7 +774,7 @@ __device__ __forceinline__ void gemv_int8_pair_tail
 
 // Narrow generic unit (any K): one (256-column x k-slice) unit, warp per adjacent block pair
 // processed sequentially with pointer-based extraction straight from global memory
-template <int bits, int M, bool residual, bool atomic = true>
+template <int bits, int M, bool residual, bool atomic = true, int TH = NUM_THREADS>
 __device__ __forceinline__ void gemv_int8_unit_narrow
 (
     const uint16_t* __restrict__ B,
@@ -746,8 +788,17 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
     int size_n
 )
 {
+    constexpr int SPLIT = TH / 256;
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
+    const int half_id = warp >> 3;
+    warp &= 7;
+    {
+        const int nh = (nrows + SPLIT - 1) / SPLIT, row0 = half_id * nh;
+        nrows = max(0, min(nh, nrows - row0));
+        kb0 += row0;
+        sh_as += row0 << 4;
+    }
     int nbp = nb256 * 8 + warp;
     const int row_stride = size_n * bits / 2;
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * (bits * 16);
@@ -762,14 +813,14 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
             sh_as + (kb << 4), slice_stride, c2, lane << 3,
             ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
     }
-    gemv_int8_pair_tail<M, residual, atomic>(accs, acc_stride, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+    gemv_int8_pair_tail<M, residual, atomic, SPLIT>(accs, acc_stride, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1, warp, half_id);
 }
 
 // Smem-staged generic unit: the warp stages its block pair's rows into a warp-private shared memory
 // slice with cp.async (coalesced 16 B chunks, one commit group per row, GEMV_STAGE_D rows deep) and
 // extracts from shared memory. Used for the K where scattered pointer extraction leaves the most
 // load latency exposed (3, 5, 7); warp-private slices need no block-level synchronization.
-template <int bits, int M, bool residual, bool atomic = true>
+template <int bits, int M, bool residual, bool atomic = true, int TH = NUM_THREADS>
 __device__ __forceinline__ void gemv_int8_unit_smem
 (
     const uint16_t* __restrict__ B,
@@ -787,12 +838,21 @@ __device__ __forceinline__ void gemv_int8_unit_smem
     constexpr int D = GEMV_STAGE_D;
     constexpr int pairwords = 16 * bits;
     constexpr int chunks = pairwords / 4;      // 16 B cp.async chunks per pair row
-    int warp = threadIdx.x >> 5;
+    constexpr int SPLIT = TH / 256;
     int lane = threadIdx.x & 31;
+    uint32_t* sb = sh_b + (threadIdx.x >> 5) * (D * pairwords);   // every warp stages its own rows
+    int warp = threadIdx.x >> 5;
+    const int half_id = warp >> 3;
+    warp &= 7;
+    {
+        const int nh = (nrows + SPLIT - 1) / SPLIT, row0 = half_id * nh;
+        nrows = max(0, min(nh, nrows - row0));
+        kb0 += row0;
+        sh_as += row0 << 4;
+    }
     int nbp = nb256 * 8 + warp;
     const int row_stride = size_n * bits / 2;
     const uint32_t* bp = ((const uint32_t*) B) + (size_t) kb0 * row_stride + (size_t) nbp * pairwords;
-    uint32_t* sb = sh_b + warp * (D * pairwords);
 
     auto stage_row = [&] (int kb)
     {
@@ -819,7 +879,7 @@ __device__ __forceinline__ void gemv_int8_unit_smem
             sh_as + (kb << 4), slice_stride, c2, lane << 3,
             ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
     }
-    gemv_int8_pair_tail<M, residual, atomic>(accs, acc_stride, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1);
+    gemv_int8_pair_tail<M, residual, atomic, SPLIT>(accs, acc_stride, nbp, lane, size_n, ia0, ia1, ib0, ib1, ja0, ja1, jb0, jb1, warp, half_id);
 }
 
 // K values routed to the smem-staged unit (measured on 3090: K=3 -13%; narrow wins for 2/6/8 which
@@ -1023,7 +1083,7 @@ __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
     return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
 }
 
-// The 512-thread kernel's grid is half the 256-thread one's, and the slice height rounded to 8 rows can leave a few more (slice x 256-column)
+// The split kernel's grid is half the 256-thread one's, and the slice height rounded to 8 rows can leave a few more (slice x 256-column)
 // units than it has blocks, which then run as a second wave of the whole unit time: take the next heights until the units fit (or the cap)
 __host__ __device__ inline int gemv_int8_sq_fit(int rows_per, int rows_total, int nb256, int grid, int cap)
 {
@@ -1031,7 +1091,7 @@ __host__ __device__ inline int gemv_int8_sq_fit(int rows_per, int rows_total, in
     return rows_per;
 }
 
-template <int bits, int M, bool c_fp32, bool residual, bool stage_smem>
+template <int bits, int M, bool c_fp32, bool residual, bool stage_smem, int TH>
 __device__ __forceinline__ void exl3_gemv_int8_sq_body
 (
     const half* __restrict__ A,
@@ -1060,7 +1120,7 @@ __device__ __forceinline__ void exl3_gemv_int8_sq_body
     rows_per = MAX(rows_per, SQ_MINROWS);
     rows_per = MIN(rows_per, gemv_int8_sq_rows_max(M, residual));
     rows_per = MIN(rows_per, (rows_total + 7) & ~7);
-    if (gemv_int8_sq_threads(bits) == 512) rows_per = gemv_int8_sq_fit(rows_per, rows_total, nb256_total, (int) gridDim.x, gemv_int8_sq_rows_max(M, residual));
+    if (TH == 512) rows_per = gemv_int8_sq_fit(rows_per, rows_total, nb256_total, (int) gridDim.x, gemv_int8_sq_rows_max(M, residual));
     int ksplit = CEIL_DIVIDE(rows_total, rows_per);
     int units = nb256_total * ksplit;
     int slice_stride = rows_per * 16;
@@ -1074,7 +1134,7 @@ __device__ __forceinline__ void exl3_gemv_int8_sq_body
     half* sh_ah = (half*) shmem;
     uint32_t* sh_as = shmem + rows_per * 8;
     uint32_t* sh_b = sh_as + slice_stride * M * (residual ? 2 : 1);
-    float* sh_tmp = (float*) (sh_b + (stage_smem ? 8 * GEMV_STAGE_D * 16 * bits : 0));
+    float* sh_tmp = (float*) (sh_b + (stage_smem ? (TH / 32) * GEMV_STAGE_D * 16 * bits : 0));
     __shared__ float sh_red[33];
     __shared__ int sh_last;
 
@@ -1088,17 +1148,17 @@ __device__ __forceinline__ void exl3_gemv_int8_sq_body
         int nrows = MIN(rows_per, rows_total - kb0);
         if (slice != prev_slice)
         {
-            gemv_int8_stage_slice<M, residual, gemv_int8_sq_threads(bits)>(A, size_m, size_k, suh, qsums + 4 * slice * M,
+            gemv_int8_stage_slice<M, residual, TH>(A, size_m, size_k, suh, qsums + 4 * slice * M,
                                                sh_ah, sh_as, slice_stride, sh_red, kb0, nrows);
             prev_slice = slice;
         }
         int* pacc = partials + (size_t) slice * M * pstride;
         if constexpr (bits == 4)
-            gemv_int8_unit_wide<M, residual, false, gemv_int8_sq_threads(bits)>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_wide<M, residual, false, TH>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
         else if constexpr (stage_smem)
-            gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_smem<bits, M, residual, false, TH>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n);
         else
-            gemv_int8_unit_narrow<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_narrow<bits, M, residual, false, TH>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
 
         // Completion counter: the ksplit-th contributor runs the epilogue for this 256-column group.
         // (sh_last reuse across iterations is ordered by the next iteration's __syncthreads.)
@@ -1115,14 +1175,14 @@ __device__ __forceinline__ void exl3_gemv_int8_sq_body
     }
 }
 
-// The kernels: 256 threads with the bounds the 3- and 5-bit tiles were tuned at, and the 4-bit one at 512 threads held to two blocks per SM
-// (64 registers; its two-row variant would otherwise take 84 and fit one block, against the grid the one-row variant's occupancy sizes)
+// The kernels: 256 threads with the bounds the tiles were tuned at, and the split one at 512 threads held to two blocks per SM (64 registers;
+// the two-row variants would otherwise take up to 84 and fit one block, against the grid the one-row variant's occupancy sizes)
 template <int bits, int M, bool c_fp32, bool residual, bool stage_smem>
 __global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_sq_kernel(const half* __restrict__ A, const uint16_t* __restrict__ B, void* __restrict__ C, const int size_m, const int size_k, const int size_n,
     int* __restrict__ locks, const half* __restrict__ suh, half* __restrict__ A_had, const half* __restrict__ svh)
 {
-    exl3_gemv_int8_sq_body<bits, M, c_fp32, residual, stage_smem>(A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh);
+    exl3_gemv_int8_sq_body<bits, M, c_fp32, residual, stage_smem, NUM_THREADS>(A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh);
 }
 
 template <int bits, int M, bool c_fp32, bool residual, bool stage_smem>
@@ -1130,5 +1190,5 @@ __global__ __launch_bounds__(512, 2)
 void exl3_gemv_int8_sq_kernel_w(const half* __restrict__ A, const uint16_t* __restrict__ B, void* __restrict__ C, const int size_m, const int size_k, const int size_n,
     int* __restrict__ locks, const half* __restrict__ suh, half* __restrict__ A_had, const half* __restrict__ svh)
 {
-    exl3_gemv_int8_sq_body<bits, M, c_fp32, residual, stage_smem>(A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh);
+    exl3_gemv_int8_sq_body<bits, M, c_fp32, residual, stage_smem, 512>(A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh);
 }
