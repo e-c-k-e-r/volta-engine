@@ -119,6 +119,7 @@ set(ENGINE_TUI_SOURCES
 set(ENGINE_HOST_SOURCES
 	src/core/arena.cpp
 	src/core/log.cpp
+	src/core/scratch.cpp
 	src/loader/safetensors.cpp
 	src/loader/gguf.cpp
 	src/loader/gguf_qwen35.cpp

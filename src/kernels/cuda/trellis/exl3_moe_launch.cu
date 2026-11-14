@@ -28,6 +28,18 @@ static void* moe_kernel_fn( int variant, int mode ) {
 
 static bool attr_done[ENGINE_NUM_GPUS][11] = {};
 
+// The largest per-thread stack frame of the run-time-width kernels (mixed packs, half widths): every width's tile code is a noinline call
+// whose frame the kernel carries, above the driver's 1 KB default
+size_t exl3_moe_mixed_stack_bytes() {
+	size_t most = 0;
+	for ( int variant : { 6, 7 } ) for ( int mode : { 0, 2, 3 } ) {
+		cudaFuncAttributes attr{};
+		CUDA_CHECK( cudaFuncGetAttributes( &attr, moe_kernel_fn( variant, mode ) ) );
+		if ( attr.localSizeBytes > most ) most = attr.localSizeBytes;
+	}
+	return most;
+}
+
 void exl3_moe_reset_caches() {
 	for ( auto& d : attr_done ) for ( bool& b : d ) b = false;
 }

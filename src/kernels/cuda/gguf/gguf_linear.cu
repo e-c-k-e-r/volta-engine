@@ -3,6 +3,7 @@
 // decoded once into shared memory (llama.cpp's own block decoders, ggml/dequantize.cuh, or a vectorized one for Q4_K) and multiplied
 // with all rows on the tensor cores. More rows (prefill chunks): the weight dequantized to FP16 by llama.cpp's converters (ggml/convert.cu) and one cuBLAS
 // GEMM. The ggml files are vendored unchanged.
+#include "engine/core/scratch.h"
 #include "engine/modules/gguf.h"
 #include "engine/core/batch.h"
 #include "engine/backend/runtime.h"
@@ -627,68 +628,36 @@ void mma_rows_kernel( const void* __restrict__ w, size_t row_bytes, const half* 
 	}
 }
 
-// Per-device state, each behind its own lock: a cudaMalloc waits for its device, whose queue may hold a collective the other ranks
-// have to join, so one rank must never hold a lock another rank's device is waiting behind
-std::mutex& device_mutex( int dev ) {
-	static std::mutex mu[64];
-	return mu[dev];
-}
-
-// The q8_1 activations of one call, per device, kept between calls (decode graphs capture the pointer): allocated at load
-// (LinearGguf::prepare) to cover a prefill chunk of 32K-wide rows, so it does not grow inside a forward
+// The q8_1 activations of one call, kept between calls (decode graphs capture the pointer): taken at load (LinearGguf::prepare) to cover a
+// prefill chunk of 32K-wide rows, so it does not grow inside a forward. Like the two buffers below, a block of the device's arena
 block_q8_1* q8_workspace( size_t blocks ) {
-	static block_q8_1* buf[64] = {};
-	static size_t cap[64] = {};
-	int dev = 0;
-	cudaGetDevice( &dev );
-	std::lock_guard<std::mutex> lk( device_mutex( dev ) );
-	if ( blocks > cap[dev] ) {
-		if ( buf[dev] ) cudaFree( buf[dev] );
-		const size_t want = std::max( blocks, static_cast<size_t>( pod::MAX_ROWS ) * 1024 );   // a prefill chunk of 32K-wide rows without regrowing
-		ENGINE_CHECK( cudaMalloc( &buf[dev], want * sizeof( block_q8_1 ) ) );
-		cap[dev] = want;
-	}
-	return buf[dev];
+	const size_t want = std::max( blocks, static_cast<size_t>( pod::MAX_ROWS ) * 1024 );
+	return static_cast<block_q8_1*>( engine::core::scratch( "gguf.q8_1", want * sizeof( block_q8_1 ) ) );
 }
 
-// The FP16 copy of one weight for the prefill GEMM, per device; grows to the largest weight (prefill runs eagerly, never inside a graph)
+// The FP16 copy of one weight for the prefill GEMM; grows to the largest weight (prefill runs eagerly, never inside a graph)
 half* recon_workspace( size_t elems, cudaStream_t stream ) {
-	static half* buf[64] = {};
-	static size_t cap[64] = {};
-	int dev = 0;
-	cudaGetDevice( &dev );
-	std::lock_guard<std::mutex> lk( device_mutex( dev ) );
-	if ( elems > cap[dev] ) {
-		ENGINE_CHECK( cudaStreamSynchronize( stream ) );   // the previous copy may still be read by queued work
-		if ( buf[dev] ) cudaFree( buf[dev] );
-		ENGINE_CHECK( cudaMalloc( &buf[dev], elems * sizeof( half ) ) );
-		cap[dev] = elems;
-	}
-	return buf[dev];
+	(void) stream;
+	return static_cast<half*>( engine::core::scratch( "gguf.recon", elems * sizeof( half ) ) );
 }
 
-// The tile kernel's split-k partial sums, per device, made at load (a fixed size: splits only fill the SMs of narrow weights) and the
-// device's SM count
+// The tile kernel's split-k partial sums (a fixed size: splits only fill the SMs of narrow weights) and the device's SM count
 constexpr size_t kPartFloats = static_cast<size_t>( 1 ) << 20;
 struct TileState {
 	float* part = nullptr;
 	int sms = 0;
 };
-TileState& tile_state() {
-	static TileState st[64];
+TileState tile_state() {
+	static int sms[64] = {};
 	int dev = 0;
 	cudaGetDevice( &dev );
-	std::lock_guard<std::mutex> lk( device_mutex( dev ) );
-	if ( st[dev].part == nullptr ) {
-		ENGINE_CHECK( cudaMalloc( &st[dev].part, kPartFloats * sizeof( float ) ) );
-		ENGINE_CHECK( cudaDeviceGetAttribute( &st[dev].sms, cudaDevAttrMultiProcessorCount, dev ) );
-	}
-	return st[dev];
+	if ( sms[dev] == 0 ) ENGINE_CHECK( cudaDeviceGetAttribute( &sms[dev], cudaDevAttrMultiProcessorCount, dev ) );
+	return { static_cast<float*>( engine::core::scratch( "gguf.tile_partials", kPartFloats * sizeof( float ) ) ), sms[dev] };
 }
 
 template <GgmlType T>
 void launch_tile( const void* w, const half* x, half* out, int n, int k, int m, GgufColTiling tiling, cudaStream_t stream ) {
-	const TileState& st = tile_state();
+	const TileState st = tile_state();
 	static int resident[64] = {};   // blocks of this type's kernel per SM, per device
 	int dev = 0;
 	cudaGetDevice( &dev );
@@ -706,7 +675,7 @@ void launch_tile( const void* w, const half* x, half* out, int n, int k, int m, 
 template <GgmlType T>
 void launch_mma( const void* w, const half* x, half* out, int n, int k, int m, GgufColTiling tiling, cudaStream_t stream ) {
 	using D = MmaDec<T>;
-	const TileState& st = tile_state();
+	const TileState st = tile_state();
 	const int blocks = ( n + kMmaRows - 1 ) / kMmaRows, groups = k / D::group;
 	// split along k into close to whole waves of resident blocks (three if they leave each warp a group), at least one group per warp
 	const int mt = m <= 8 ? 1 : 2;

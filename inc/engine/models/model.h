@@ -343,5 +343,7 @@ protected:
 // Registered architectures use the checkpoint config.json "model_type": qwen3_5, glm5_next. Anything else is unsupported.
 bool is_known_model_type( const std::string& model_type );
 std::unique_ptr<ModelPipeline> create_model_pipeline( const std::string& model_type );
+// The per-thread stack frame the model type's kernels need above the driver's default (0: none), set before the arena is sized
+size_t device_stack_bytes( const std::string& model_type );
 
 } // namespace engine::models

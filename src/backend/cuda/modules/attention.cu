@@ -1,3 +1,4 @@
+#include "engine/core/scratch.h"
 #include "engine/modules/attention.h"
 #include "engine/backend/cuda/activation.cuh"
 #include "engine/backend/cuda/reduce.cuh"
@@ -20,21 +21,10 @@ namespace {
 #define ATTN_MAX_HEAD_DIM 512   // the partials' stride (Gemma 4's full-attention layers: 512)
 #define ATTN_MAX_ROW_HEADS ( pod::MAX_BATCH * 16 )
 
-__device__ float g_attn_workspace[ATTN_MAX_ROW_HEADS * ATTN_MAX_CHUNKS * ( ATTN_MAX_HEAD_DIM + 2 )];
-
-// Device address of g_attn_workspace on the current GPU. The bare symbol in host code is the
-// host shadow, not a usable kernel argument; resolve once per device.
+// The split-KV partials of the decode and prefill kernels, sized for the bounds the launches assert, from the device's arena
 float* attn_workspace_ptr() {
-	static float* ptrs[ENGINE_NUM_GPUS] = {};
-	int dev = 0;
-	CUDA_CHECK( cudaGetDevice( &dev ) );
-	ENGINE_ASSERT( dev >= 0 && dev < ENGINE_NUM_GPUS, "attn_workspace_ptr: device out of range" );
-	if ( !ptrs[dev] ) {
-		void* p = nullptr;
-		CUDA_CHECK( cudaGetSymbolAddress( &p, g_attn_workspace ) );
-		ptrs[dev] = static_cast<float*>( p );
-	}
-	return ptrs[dev];
+	return static_cast<float*>( engine::core::scratch( "attention.partials",
+		static_cast<size_t>( ATTN_MAX_ROW_HEADS ) * ATTN_MAX_CHUNKS * ( ATTN_MAX_HEAD_DIM + 2 ) * sizeof( float ) ) );
 }
 
 __global__ void unpack_q_gate_kernel(

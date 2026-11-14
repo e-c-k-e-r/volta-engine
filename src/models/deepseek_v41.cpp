@@ -976,10 +976,9 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 	}
 	// placement: as many expert codes on the device as the arena holds (the same share of every layer's bytes; the hottest experts first when the
 	// route counts are known), the rest in pinned host memory
-	// headroom kept free in the arena after the weights: 1 GiB, or what vram_reserve_mib asks for (at least 256 MiB) when it is set below that: a pack that
-	// would just fit with the context's default reserve can be loaded fully resident by lowering both
-	const int reserve_opt = runtime::options().vram_reserve_mib;
-	const size_t margin = static_cast<size_t>( reserve_opt >= 0 && reserve_opt < 1024 ? std::max( reserve_opt, 256 ) : 1024 ) * 1024 * 1024;
+	// headroom kept free in the arena after the weights, for what the model allocates after the placement (the kernel modules' workspaces have
+	// their own budget, taken before the model loads)
+	const size_t margin = static_cast<size_t>( 256 ) << 20;
 	const size_t meta_bytes = static_cast<size_t>( L ) * ( expert_tp_ ? E : per_rank ) * ( expert_tp_ ? 3 * H + 3 * ( config_.intermediate_size / tp + 128 ) : 3 * ( 2 * H + 2 * config_.intermediate_size ) ) * 2 + ( 64ull << 20 );   // suh / svh and tables
 	const size_t free_now = arena.total_bytes - arena.offset_bytes;
 	if ( rank_ == 0 ) vision_reserve_ = DeepseekV41VisionTower::arena_bytes( model_dir, runtime::options().max_image_tokens );

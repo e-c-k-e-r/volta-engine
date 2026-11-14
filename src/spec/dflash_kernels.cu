@@ -1,3 +1,4 @@
+#include "engine/core/scratch.h"
 #include "engine/spec/dflash.h"
 #include "engine/backend/cuda/reduce.cuh"
 #include "engine/modules/norm.h"
@@ -795,7 +796,6 @@ constexpr int DFS_MAX_ROWS = 16, DFS_MAX_QHEADS = 64, DFS_MAX_SPLIT = 64;
 constexpr size_t DFS_SMEM = ( static_cast<size_t>( DFS_SLOTS ) * DFS_HD + static_cast<size_t>( DFS_BK ) * ( DFS_HD + 1 ) + static_cast<size_t>( DFS_SLOTS ) * DFS_BK + 3 * DFS_SLOTS ) * sizeof( float )
 	+ static_cast<size_t>( DFS_BK ) * DFS_HD * sizeof( half );
 
-__device__ float g_dfs_workspace[DFS_MAX_ROWS * DFS_MAX_QHEADS * DFS_MAX_SPLIT * DFS_WS_STRIDE];
 
 __global__ __launch_bounds__( 256 )
 void dflash_attn_split_kernel(
@@ -994,19 +994,13 @@ static bool dflash_attn_split_launch(
 	int nsplit = MAX( 1, MIN( ( 160 + base_blocks - 1 ) / base_blocks, MIN( ntiles, DFS_MAX_SPLIT ) ) );
 	const int keys_per_split = ( ( ntiles + nsplit - 1 ) / nsplit ) * DFS_BK;
 	nsplit = ( nkeys + keys_per_split - 1 ) / keys_per_split;
-	static float* ws_ptr[ENGINE_NUM_GPUS] = {};
-	int dev = 0;
-	CUDA_CHECK( cudaGetDevice( &dev ) );
-	ENGINE_ASSERT( dev >= 0 && dev < ENGINE_NUM_GPUS, "dflash_attn_split: device out of range" );
-	if ( !ws_ptr[dev] ) {
-		void* p = nullptr;
-		CUDA_CHECK( cudaGetSymbolAddress( &p, g_dfs_workspace ) );
-		ws_ptr[dev] = static_cast<float*>( p );
-	}
+	// the split partials, sized for the most rows, heads and splits a launch takes, from the device's arena
+	float* const ws = static_cast<float*>( engine::core::scratch( "dflash.attn_partials",
+		static_cast<size_t>( DFS_MAX_ROWS ) * DFS_MAX_QHEADS * DFS_MAX_SPLIT * DFS_WS_STRIDE * sizeof( float ) ) );
 	dflash_attn_split_kernel<<<dim3( kv_heads, qtiles, nsplit ), 256, DFS_SMEM, stream>>>(
-		q, kcache, vcache, ws_ptr[dev], rows, q_heads, kv_heads, nctx, first_ctx, ring_slots, ctx_layer,
+		q, kcache, vcache, ws, rows, q_heads, kv_heads, nctx, first_ctx, ring_slots, ctx_layer,
 		stride_slot, stride_layer, stride_head, own_slot, own_first_row, rsqrtf( static_cast<float>( head_dim ) ), nsplit, keys_per_split, causal, ctx_dev, base_blocks );
-	dflash_attn_split_reduce<<<dim3( q_heads, rows ), DFS_HD, 0, stream>>>( ws_ptr[dev], out, q_heads, nsplit );
+	dflash_attn_split_reduce<<<dim3( q_heads, rows ), DFS_HD, 0, stream>>>( ws, out, q_heads, nsplit );
 	return true;
 }
 #endif
@@ -1271,24 +1265,11 @@ void dflash2_topk(
 	int64_t stride_b = static_cast<int64_t>( rows ) * vocab;
 	int64_t stride_r = vocab;
 
-	// In real execution, persistent scratch buffers from DFlashSpeculator are used.
-	// For standalone invocation, we allocate static block scratch.
-	static float* s_part_v = nullptr;
-	static int* s_part_ix = nullptr;
-	static int* s_counters = nullptr;
-	static int s_alloc_capacity = 0;
-
-	int required_capacity = num_rows * splits * k;
-	if ( required_capacity > s_alloc_capacity ) {
-		if ( s_part_v ) (void) cudaFree( s_part_v );
-		if ( s_part_ix ) (void) cudaFree( s_part_ix );
-		if ( s_counters ) (void) cudaFree( s_counters );
-		(void) cudaMalloc( &s_part_v, required_capacity * sizeof( float ) );
-		(void) cudaMalloc( &s_part_ix, required_capacity * sizeof( int ) );
-		(void) cudaMalloc( &s_counters, num_rows * sizeof( int ) );
-		(void) cudaMemset( s_counters, 0, num_rows * sizeof( int ) );
-		s_alloc_capacity = required_capacity;
-	}
+	// the blocks' partial top-k and the rows' completion counters, from the device's arena
+	const size_t capacity = static_cast<size_t>( num_rows ) * splits * k;
+	float* const s_part_v = static_cast<float*>( engine::core::scratch( "dflash.topk_values", capacity * sizeof( float ) ) );
+	int* const s_part_ix = static_cast<int*>( engine::core::scratch( "dflash.topk_ids", capacity * sizeof( int ) ) );
+	int* const s_counters = static_cast<int*>( engine::core::scratch( "dflash.topk_counters", static_cast<size_t>( num_rows ) * sizeof( int ) ) );
 
 	CUDA_CHECK( cudaMemsetAsync( s_counters, 0, num_rows * sizeof( int ), stream ) );
 

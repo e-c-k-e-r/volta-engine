@@ -1,9 +1,11 @@
+#include "engine/core/scratch.h"
 #include "engine/modules/gemm.h"
 #include "trellis_context.h"
 #include "exl3_gemm.cuh"
 #include "exl3_gemv_int8.cuh"
 #include "exl3_kernel_map.cuh"
 #include "exl3_vl.cuh"
+#include <algorithm>
 #include <mutex>
 #include <cstdio>
 
@@ -16,10 +18,6 @@ namespace engine::modules {
 
 static int* g_locks[ENGINE_NUM_GPUS] = { nullptr };
 static int* g_int8_ws[ENGINE_NUM_GPUS] = { nullptr };
-static void* g_workspace[ENGINE_NUM_GPUS] = { nullptr };
-static size_t g_workspace_size[ENGINE_NUM_GPUS] = { 0 };
-static void* g_recon_ws[ENGINE_NUM_GPUS] = { nullptr };
-static size_t g_recon_ws_size[ENGINE_NUM_GPUS] = { 0 };
 static std::mutex g_trellis_ctx_mtx;
 
 // Persistent and cooperative launches size their grids to the SM count, which must be the card's own: 80 on a V100, 82 on a 3090,
@@ -105,47 +103,26 @@ int* trellis_get_int8_ws( int device ) {
 	return g_int8_ws[device];
 }
 
+// The activations of the trellis GEMM path (FP16 copies, Hadamard-rotated rows), at least 16 MiB, and the dequantized weight of the prefill
+// GEMM: blocks from the device's arena (engine::core::scratch), so a growth leaves the old block to the graphs captured with it
 half* trellis_get_workspace( int device, size_t bytes ) {
-	if ( device < 0 || device >= ENGINE_NUM_GPUS ) {
-		device = 0;
-	}
-	if ( g_workspace[device] == nullptr || g_workspace_size[device] < bytes ) {
-		std::lock_guard<std::mutex> lock( g_trellis_ctx_mtx );
-		if ( g_workspace[device] == nullptr || g_workspace_size[device] < bytes ) {
-			int orig_dev = 0;
-			(void) cudaGetDevice( &orig_dev );
-			(void) cudaSetDevice( device );
-			// A decode graph captured earlier holds the old pointer (and only ever needs its size), so the old buffer is
-			// retired, not freed: a large prefill chunk that outgrows 16 MiB must not leave graph replays dangling.
-			// Growth happens a handful of times, so the retired buffers cost a few tens of MiB at most.
-			g_workspace[device] = nullptr;
-			size_t alloc_bytes = bytes < ( 16 * 1024 * 1024 ) ? ( 16 * 1024 * 1024 ) : bytes;
-			CUDA_CHECK( cudaMalloc( &g_workspace[device], alloc_bytes ) );
-			g_workspace_size[device] = alloc_bytes;
-			(void) cudaSetDevice( orig_dev );
-		}
-	}
-	return static_cast<half*>( g_workspace[device] );
+	if ( device < 0 || device >= ENGINE_NUM_GPUS ) device = 0;
+	int orig_dev = 0;
+	(void) cudaGetDevice( &orig_dev );
+	(void) cudaSetDevice( device );
+	void* p = engine::core::scratch( "trellis.workspace", std::max<size_t>( bytes, 16 * 1024 * 1024 ) );
+	(void) cudaSetDevice( orig_dev );
+	return static_cast<half*>( p );
 }
 
 half* trellis_get_recon_ws( int device, size_t bytes ) {
 	if ( device < 0 || device >= ENGINE_NUM_GPUS ) device = 0;
-	if ( g_recon_ws[device] == nullptr || g_recon_ws_size[device] < bytes ) {
-		std::lock_guard<std::mutex> lock( g_trellis_ctx_mtx );
-		if ( g_recon_ws[device] == nullptr || g_recon_ws_size[device] < bytes ) {
-			int orig_dev = 0;
-			(void) cudaGetDevice( &orig_dev );
-			(void) cudaSetDevice( device );
-			if ( g_recon_ws[device] != nullptr ) {
-				CUDA_CHECK( cudaFree( g_recon_ws[device] ) );
-				g_recon_ws[device] = nullptr;
-			}
-			CUDA_CHECK( cudaMalloc( &g_recon_ws[device], bytes ) );
-			g_recon_ws_size[device] = bytes;
-			(void) cudaSetDevice( orig_dev );
-		}
-	}
-	return static_cast<half*>( g_recon_ws[device] );
+	int orig_dev = 0;
+	(void) cudaGetDevice( &orig_dev );
+	(void) cudaSetDevice( device );
+	void* p = engine::core::scratch( "trellis.recon", bytes );
+	(void) cudaSetDevice( orig_dev );
+	return static_cast<half*>( p );
 }
 
 // Empty kernel: whether it has an image for a device says whether the build targets that device's architecture
@@ -233,18 +210,6 @@ void trellis_context_destroy() {
 			(void) cudaSetDevice( d );
 			(void) cudaFree( g_int8_ws[d] );
 			g_int8_ws[d] = nullptr;
-		}
-		if ( g_recon_ws[d] != nullptr ) {
-			(void) cudaSetDevice( d );
-			(void) cudaFree( g_recon_ws[d] );
-			g_recon_ws[d] = nullptr;
-			g_recon_ws_size[d] = 0;
-		}
-		if ( g_workspace[d] != nullptr ) {
-			(void) cudaSetDevice( d );
-			(void) cudaFree( g_workspace[d] );
-			g_workspace[d] = nullptr;
-			g_workspace_size[d] = 0;
 		}
 	}
 }

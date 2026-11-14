@@ -75,6 +75,12 @@ inline bool last_error_ok() { return cudaGetLastError() == cudaSuccess; }
 inline void check_last_error() { ENGINE_CHECK( cudaGetLastError() ); }
 inline void clear_last_error() { (void) cudaGetLastError(); }
 inline void device_reset() { (void) cudaDeviceReset(); }
+// Per-thread stack of at least `bytes` on the current device: the driver reserves local memory for it on every resident thread at once
+inline void reserve_stack( size_t bytes ) {
+	size_t cur = 0;
+	ENGINE_CHECK( cudaDeviceGetLimit( &cur, cudaLimitStackSize ) );
+	if ( bytes > cur ) ENGINE_CHECK( cudaDeviceSetLimit( cudaLimitStackSize, bytes ) );
+}
 
 // Non-aborting forms for callers that report failure to their own caller (arena creation, loaders)
 inline bool set_device_try( int device ) { return cudaSetDevice( device ) == cudaSuccess; }

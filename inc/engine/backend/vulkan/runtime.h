@@ -47,6 +47,7 @@ bool last_error_ok();
 void check_last_error();
 void clear_last_error();
 void device_reset();
+inline void reserve_stack( size_t ) {}
 
 bool set_device_try( int device );
 size_t device_free_bytes( int device );   // 0 when unknown

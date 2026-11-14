@@ -7,6 +7,7 @@
 // Fragment layouts of m8n8k4 (measured on sm_70): a lane holds row p of A and column p of B (p = lane % 4 + 4 * (lane >= 16)), 4 consecutive
 // k each (B row-major: k row lane % 4, columns 4 (lane >= 16) + 0..3); its 8 accumulators are rows (lane & 1) + 4 (lane >= 16) and + 2,
 // columns (lane & 2) + {0, 1, 4, 5}, in the order (r, c) (r, c + 1) (r + 2, c) (r + 2, c + 1) and the same 4 columns on.
+#include "engine/core/scratch.h"
 #include "engine/modules/gemm.h"
 #include "engine/config.h"
 #include <cuda_fp16.h>
@@ -297,25 +298,16 @@ __global__ void split_reduce_kernel( const float* __restrict__ part, void* __res
 // captured graph may still use it), and growing only allocates, which a graph capture allows: whether a GEMM splits depends on its shape
 // alone, so a captured product sums in the same order as the eager one
 constexpr size_t kSplitFloats = size_t( 16 ) << 20;
-struct Space { float* part = nullptr; size_t cap = 0; };
-std::mutex g_space_mu;
-std::map<std::pair<int, cudaStream_t>, Space> g_spaces;
 // Bumped by reset_caches: each launch() configuration then sets its shared-memory attribute and reads its occupancy again
 std::atomic<int> g_launch_epoch{ 1 };
 
+// The split-K partial sums of a stream's launches, from the device's arena: powers of two from 64K floats, so a few growths cover every
+// shape (a growth leaves the smaller block behind, which a captured graph may still read)
 float* split_workspace( size_t floats, cudaStream_t stream ) {
-	auto& mu = g_space_mu;
-	auto& spaces = g_spaces;
-	int dev = 0;
-	cudaGetDevice( &dev );
-	std::lock_guard<std::mutex> lk( mu );
-	Space& sp = spaces[{ dev, stream }];
-	if ( floats > sp.cap ) {
-		const size_t cap = std::min( kSplitFloats, std::max( floats, 2 * sp.cap ) );
-		CUDA_CHECK( cudaMalloc( &sp.part, cap * sizeof( float ) ) );
-		sp.cap = cap;
-	}
-	return sp.part;
+	size_t cap = 65536;
+	while ( cap < floats ) cap *= 2;
+	cap = std::max( floats, std::min( cap, kSplitFloats ) );
+	return static_cast<float*>( engine::core::scratch( "gemm.split_partials", cap * sizeof( float ), reinterpret_cast<uintptr_t>( stream ) ) );
 }
 
 int sm_count() {
@@ -402,8 +394,6 @@ void Gemm::nn( const half* a, int lda, const half* w, int ldw, void* out, int ld
 namespace engine::modules {
 
 void Gemm::reset_caches() {
-	std::lock_guard<std::mutex> lk( g_space_mu );
-	g_spaces.clear();   // a device reset freed them
 	g_launch_epoch.fetch_add( 1 );
 }
 

@@ -221,4 +221,7 @@ void exl3_moe(
 	bool bits_half = false              // a width in that table is a half-integer rate (2.5 / 3.5 bpw): the kernel variant that holds those arms
 );
 
+// The largest per-thread stack frame of the persistent kernel's run-time-width variants (DeepSeek-V4.1's mixed-width packs)
+size_t exl3_moe_mixed_stack_bytes();
+
 } // namespace ext

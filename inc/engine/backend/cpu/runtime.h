@@ -60,6 +60,7 @@ inline bool last_error_ok() { return true; }
 inline void check_last_error() {}
 inline void clear_last_error() {}
 inline void device_reset() {}
+inline void reserve_stack( size_t ) {}
 
 inline bool set_device_try( int device ) { return device == 0; }
 // Available host memory in bytes (MemAvailable); 0 when unknown

@@ -93,7 +93,7 @@ Validated contexts:
 
 * tensor parallel over NVLink with a 2- or 4-rank all-reduce (`tp`, `--tp-size`): Qwen 1/2/4, GLM 1, 2 or 4, Flash-Next 1, 2 or 4; the Vulkan build does the same over several Vulkan devices with the all-reduce meeting in host memory the devices import
   * `--tp-size 2` is about 0.7x the speed of four; a second server on the other pair doubles the aggregate (`CUDA_VISIBLE_DEVICES`)
-* one arena per GPU, allocated at boot from the free memory minus a reserve (`arena_gib`, `vram_reserve_mib`); nothing allocates while decoding
+* one arena per GPU, allocated at boot from the free memory minus a reserve for what the CUDA driver takes later (`arena_gib`, `vram_reserve_mib`, 384 MiB); the kernels' workspaces come out of the arena (`scratch_mib`), and nothing allocates while decoding
 * up to `max_slots` concurrent sequences, `max_batch_size` of them stepped together; the scheduler thread owns the slots
 * the image embeddings and the vision tower run on rank 0 only
 

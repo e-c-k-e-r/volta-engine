@@ -1,3 +1,4 @@
+#include "engine/core/scratch.h"
 #include <condition_variable>
 #include "engine/models/qwen4_exp.h"
 #include "engine/modules/gguf.h"
@@ -147,7 +148,6 @@ Qwen4ExpPipeline::~Qwen4ExpPipeline() {
 		graphs_.reset();
 		if ( side_stream_ != nullptr ) backend::stream_destroy( side_stream_ );
 		if ( side_stream2_ != nullptr ) backend::stream_destroy( side_stream2_ );
-		if ( full_logits_mem_ != nullptr ) backend::device_free( full_logits_mem_ );
 		engine::core::arena_destroy( host_arena_ );
 	}
 }
@@ -1606,8 +1606,7 @@ const pod::TensorView& Qwen4ExpPipeline::gather_logits( int rows, const backend:
 	backend::set_device( rank_ );
 	const size_t V = config_.vocab_size;
 	if ( rows > full_logits_rows_ ) {
-		if ( full_logits_mem_ != nullptr ) backend::device_free( full_logits_mem_ );
-		full_logits_mem_ = backend::device_malloc( static_cast<size_t>( rows ) * V * sizeof( backend::half_t ) );
+		full_logits_mem_ = engine::core::scratch( "qwen4_exp.full_logits", static_cast<size_t>( rows ) * V * sizeof( backend::half_t ) );
 		full_logits_rows_ = rows;
 		const int shape[2] = { rows, config_.vocab_size };
 		full_logits_ = pod::make_tensor_2d( full_logits_mem_, pod::DType::FP16, shape[0], shape[1] );

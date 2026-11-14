@@ -4,6 +4,7 @@
 #include "engine/runtime/suffix_runner.h"
 #include "engine/runtime/dspark_runner.h"
 #include "engine/core/log.h"
+#include "engine/core/scratch.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #if ENGINE_BACKEND_CUDA
@@ -26,7 +27,6 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		LOG_ERROR( "ModelCluster: unsupported model_type '%s'\n", cfg.model_type.c_str() );
 		return false;
 	}
-	const bool is_glm = ( cfg.model_type == "glm5_next" );
 	const auto& opt = runtime::options();
 	tp_ = opt.tp > 0 ? opt.tp : cfg.tp;
 	if ( opt.expert_stream ) runtime::options().no_graphs = true;   // the layers' expert reads are host work between kernels
@@ -54,10 +54,11 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	}
 #endif
 	// The arena is a bump allocator over one up-front allocation per GPU. Unless a size is given (cfg.arena_bytes,
-	// arena_gib) it takes the device's free memory less a reserve for what lives outside it (graphs, workspaces, the
-	// CUDA context); vram_reserve_mib overrides the reserve. The model's own tables (KV pools, scratch) are sized by
-	// max_seq / max_slots, not by the arena, so a larger context needs no arena tuning.
-	const size_t reserve = ( opt.vram_reserve_mib >= 0 ? static_cast<size_t>( opt.vram_reserve_mib ) : ( is_glm ? 768ULL : 1536ULL ) ) * 1024 * 1024;
+	// arena_gib) it takes the device's free memory less a reserve for what the driver takes after it (kernel code loaded on
+	// first use, graph instances; vram_reserve_mib overrides it): the kernel modules' workspaces come out of the arena
+	// (engine::core::scratch) and the stack the model's kernels need is set before. The model's own tables (KV pools) are
+	// sized by max_seq / max_slots, not by the arena, so a larger context needs no arena tuning.
+	const size_t reserve = static_cast<size_t>( opt.vram_reserve_mib >= 0 ? opt.vram_reserve_mib : 384 ) * 1024 * 1024;
 	ENGINE_ASSERT( tp_ == 1 || tp_ == 2 || tp_ == ENGINE_NUM_GPUS, "ModelCluster::init: the collective supports tp 1, 2 or 4 ranks" );
 	created_ = true;
 	if ( tp_ > 1 ) engine::comm::init_4gpu_mesh( rings_, staging_ptrs_, flag_ptrs_, engine::comm::kMeshStagingBytes, tp_ );
@@ -65,6 +66,15 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	engine::modules::trellis_context_init_all();
 #endif
 
+	// A kernel whose stack frame is above the driver's limit (1 KB by default) makes it grow the local-memory reservation of the whole GPU at
+	// its first launch (160 MiB per KB on these cards), outside the arena: the limit goes up to the model's largest frame before the arena is
+	// sized from the free memory
+	if ( const size_t stack = engine::models::device_stack_bytes( cfg.model_type ); stack > 0 ) {
+		for ( int d = 0; d < tp_; ++d ) {
+			backend::set_device( d );
+			backend::reserve_stack( stack );
+		}
+	}
 	for ( int d = 0; d < tp_; ++d ) {
 		backend::set_device( d );
 		streams_[d] = backend::stream_create();
@@ -82,6 +92,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 			}
 		}
 		if ( !engine::core::arena_create( arenas_[d], d, arena_bytes ) ) return false;
+		engine::core::scratch_attach( d, &arenas_[d], static_cast<size_t>( std::max( opt.scratch_mib, 0 ) ) << 20 );   // the kernel modules' workspaces
 		models_[d] = engine::models::create_model_pipeline( cfg.model_type );
 		if ( !models_[d] ) return false;
 		models_[d]->set_tp_size( tp_ );
@@ -204,6 +215,7 @@ void ModelCluster::shutdown() {
 			backend::stream_destroy( streams_[d] );
 			streams_[d] = nullptr;
 		}
+		engine::core::scratch_detach( d );
 		engine::core::arena_destroy( arenas_[d] );
 	}
 	if ( tp_ > 1 ) engine::comm::destroy_4gpu_mesh( staging_ptrs_, flag_ptrs_ );

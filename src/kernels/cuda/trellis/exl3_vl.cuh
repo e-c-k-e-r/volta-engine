@@ -34,6 +34,7 @@ void exl3_moe( const void* hidden_state, void* output_state, const int64_t* expe
 	bool down_mcg, bool down_mul1, float act_limit, int num_active, const int4* active_experts, int num_groups, size_t out_plane_stride, int wide,
 	int hidden_dim, int intermediate_dim, int num_experts, cudaStream_t stream, int top_k, const uint8_t* bits_tab, bool bits_half );
 void exl3_moe_reset_caches();
+size_t exl3_moe_mixed_stack_bytes();
 } // namespace ext
 
 } // namespace exl3_vl

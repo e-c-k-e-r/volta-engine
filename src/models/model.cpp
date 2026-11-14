@@ -6,6 +6,7 @@
 #include "engine/models/qwen4_exp.h"
 #include "engine/models/deepseek_v41.h"
 #include "engine/loader/safetensors.h"
+#include "engine/modules/moe.h"
 #include <cstdio>
 
 namespace engine::models {
@@ -94,6 +95,15 @@ std::unique_ptr<ModelPipeline> create_model_pipeline( const std::string& model_t
 		return std::make_unique<Gemma4Pipeline>();
 	}
 	return nullptr;
+}
+
+size_t device_stack_bytes( const std::string& model_type ) {
+#if ENGINE_BACKEND_CUDA
+	if ( model_type == "deepseek_v41" ) return ext::exl3_moe_mixed_stack_bytes();   // its mixed-width packs take the run-time-width expert kernels
+#else
+	(void) model_type;
+#endif
+	return 0;
 }
 
 bool is_known_model_type( const std::string& model_type ) {
