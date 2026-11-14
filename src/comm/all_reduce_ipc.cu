@@ -36,6 +36,18 @@ __device__ __forceinline__ void ar_retire( uint32_t* local_flags, uint32_t seq )
 	}
 }
 
+// Publishes this rank's slot of the row (its stores fenced and the block synchronized before) and waits for every peer's: lane 0 releases
+// the flag while lane p polls peer p's, so the remote polls overlap; the barrier after hands the peers' slots to the whole block
+template <int NR>
+__device__ __forceinline__ void ar_publish_wait( uint32_t* const* flags, int rank, uint32_t stage, int row, uint32_t seq ) {
+	if ( threadIdx.x == 0 ) stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
+	if ( threadIdx.x < NR && static_cast<int>( threadIdx.x ) != rank ) {
+		const uint32_t* f = ar_flag( flags[threadIdx.x], stage, row, threadIdx.x );
+		while ( ldg_acquire_sys_u32( f ) < seq ) __nanosleep( 32 );
+	}
+	__syncthreads();
+}
+
 template <int NR>
 __global__ __launch_bounds__( 512 )
 void all_reduce_rms_norm_ring_kernel(
@@ -214,16 +226,7 @@ void all_reduce_ring_kernel(
 	__threadfence_system();
 	__syncthreads();
 
-	if ( threadIdx.x == 0 ) {
-		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
-		for ( int p = 0; p < NR; ++p ) {
-			if ( p == rank ) continue;
-			while ( ldg_acquire_sys_u32( ar_flag( flags[p], stage, row, p ) ) < seq ) {
-				__nanosleep( 32 );
-			}
-		}
-	}
-	__syncthreads();
+	ar_publish_wait<NR>( flags, rank, stage, row, seq );
 
 	const uint4* r_ptrs[NR];
 	#pragma unroll
@@ -285,14 +288,7 @@ void all_reduce_normed_add_kernel(
 	for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) my_slot[i] = src_y[i];
 	__threadfence_system();
 	__syncthreads();
-	if ( threadIdx.x == 0 ) {
-		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
-		for ( int p = 0; p < NR; ++p ) {
-			if ( p == rank ) continue;
-			while ( ldg_acquire_sys_u32( ar_flag( flags[p], stage, row, p ) ) < seq ) __nanosleep( 32 );
-		}
-	}
-	__syncthreads();
+	ar_publish_wait<NR>( flags, rank, stage, row, seq );
 	const uint4* r_ptrs[NR];
 	#pragma unroll
 	for ( int offset = 0; offset < NR; ++offset ) {
@@ -422,14 +418,7 @@ void all_reduce_gated_norm_kernel(
 	}
 	__threadfence_system();
 	__syncthreads();
-	if ( threadIdx.x == 0 ) {
-		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
-		for ( int p = 0; p < NR; ++p ) {
-			if ( p == rank ) continue;
-			while ( ldg_acquire_sys_u32( ar_flag( flags[p], stage, row, p ) ) < seq ) __nanosleep( 32 );
-		}
-	}
-	__syncthreads();
+	ar_publish_wait<NR>( flags, rank, stage, row, seq );
 
 	const uint4* r_ptrs[NR];
 	#pragma unroll
@@ -520,22 +509,14 @@ void all_reduce_hc_apply_kernel(
 	uint32_t* flags[4] = { f0, f1, f2, f3 };
 	const uint32_t seq = ar_next_seq( flags[rank] );
 	const uint32_t stage = seq & 3;
+	const uint4* src_y = ( (const uint4*) ( y + row * row_elems ) );
+	const uint4* r_ptrs[NR];
 	uint8_t* my_staging = static_cast<uint8_t*>( const_cast<void*>( peer_slots[rank] ) ) + ( (size_t) stage * 4 + rank ) * IPC_SLOT_BYTES;
 	uint4* my_slot = reinterpret_cast<uint4*>( my_staging ) + row * n4;
-	const uint4* src_y = ( (const uint4*) ( y + row * row_elems ) );
 	for ( size_t i = threadIdx.x; i < n4; i += blockDim.x ) my_slot[i] = src_y[i];
 	__threadfence_system();
 	__syncthreads();
-	if ( threadIdx.x == 0 ) {
-		stg_release_sys_u32( ar_flag( flags[rank], stage, row, rank ), seq );
-		for ( int p = 0; p < NR; ++p ) {
-			if ( p == rank ) continue;
-			while ( ldg_acquire_sys_u32( ar_flag( flags[p], stage, row, p ) ) < seq ) __nanosleep( 32 );
-		}
-	}
-	__syncthreads();
-
-	const uint4* r_ptrs[NR];
+	ar_publish_wait<NR>( flags, rank, stage, row, seq );
 	#pragma unroll
 	for ( int offset = 0; offset < NR; ++offset ) {
 		const int p = ( rank + offset ) % NR;
