@@ -13,7 +13,8 @@ using namespace engine::runtime;
 // row: the same near-tie then breaks one way in plain decoding and the other in a round (ties keep the lower id). A first difference is accepted when it is
 // exactly that: plain decoding's runner-up at that step, within one FP16 ulp of its pick. Replays the plain run's tokens as single rows to read the step's logits.
 // max_gap > 0 widens the tie to that many logits (joint rounds on Flash-Next: the router flips move a row's logits by a few tenths against single rows);
-// ulps widens it to that many FP16 ulps (Flash-Next's single rounds: its verify blocks land within two of a single row's logits).
+// ulps widens it to that many FP16 ulps (single rounds: a verify block lands within two of a single row's logits, whose int8 GEMV rounds apart from the block's
+// FP16 tiles).
 static bool one_ulp_tie( ModelCluster& mc, const std::vector<int>& prompt, const std::vector<int>& plain, size_t d, int spec_token, float max_gap = 0.0f, int ulps = 1 ) {
 	if ( d == 0 || d >= plain.size() ) return false;
 	mc.reset_slot( 0 );
@@ -152,7 +153,7 @@ int main( int argc, char** argv ) {
 		// the verify block against single rows, so it is held to the first three quarters of the continuation
 		// GLM's single-row and verify-block numerics differ by a few tenths of a logit, so it only has to agree for the first tokens
 		bool same = plain.tokens == spec.tokens || ( flash && plain.tokens.size() == spec.tokens.size() && d * 4 >= plain.tokens.size() * 3 ) || ( glm && d >= 8 );
-		if ( !same && d < spec.tokens.size() ) same = one_ulp_tie( mc, prompts[p], plain.tokens, d, spec.tokens[d], 0.0f, flash ? 2 : 1 );
+		if ( !same && d < spec.tokens.size() ) same = one_ulp_tie( mc, prompts[p], plain.tokens, d, spec.tokens[d], 0.0f, 2 );
 		const double rate = spec.proposed ? static_cast<double>( spec.accepted ) / spec.proposed : 0.0;
 		std::printf( "[%s] prompt %zu (%zu tokens): plain %.1f tok/s, MTP %.1f tok/s, accepted %d / %d (%.0f%%)\n", same ? "ok" : "FAIL", p, prompts[p].size(),
 			plain.decode_tok_s(), spec.decode_tok_s(), spec.accepted, spec.proposed, 100.0 * rate );
