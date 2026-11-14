@@ -1,8 +1,10 @@
 // Flash-Next decode router: time of MoERouter::route_softmax_topk (logits + softmax/top-k select) for 1..8 rows over 48 distinct weight
-// copies (cycled so the L2 does not hold them), the way a decode step meets 48 layers.
+// copies (cycled so the L2 does not hold them), the way a decode step meets 48 layers. GLM=1: GLM's sigmoid router (route_topk); DS=1:
+// DeepSeek-V4.1's sqrt-softplus router (DSV4::route, hidden 5120, 384 experts, top 6).
 //   bench_router [rows ...]
 #include "engine/core/arena.h"
 #include "engine/modules/moe.h"
+#include "engine/modules/dsv4.h"
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -10,7 +12,8 @@
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	const bool glm = std::getenv( "GLM" ) != nullptr;   // GLM: sigmoid scores with a selection bias (route_topk)
-	const int H = glm ? 4096 : 2560, E = glm ? 256 : 512, K = glm ? 8 : 10, LAYERS = 48;
+	const bool ds = std::getenv( "DS" ) != nullptr;
+	const int H = ds ? 5120 : glm ? 4096 : 2560, E = ds ? 384 : glm ? 256 : 512, K = ds ? 6 : glm ? 8 : 10, LAYERS = 48;
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	cudaStream_t stream;
 	CUDA_CHECK( cudaStreamCreate( &stream ) );
@@ -47,9 +50,17 @@ int main( int argc, char** argv ) {
 			for ( auto& v : hb ) v = __float2half( rnd() * 0.1f );
 			CUDA_CHECK( cudaMemcpy( bias.data, hb.data(), hb.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
 		}
+		float* fbias = static_cast<float*>( engine::core::arena_alloc( arena, E * sizeof( float ) ) );
+		float* scratch = static_cast<float*>( engine::core::arena_alloc( arena, engine::modules::DSV4::route_scratch_floats( rows, E ) * sizeof( float ) ) );
+		if ( ds ) {
+			std::vector<float> hb( E );
+			for ( auto& v : hb ) v = rnd() * 0.1f;
+			CUDA_CHECK( cudaMemcpy( fbias, hb.data(), hb.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+		}
 		auto run = [&]() {
 			for ( int l = 0; l < LAYERS; ++l ) {
-				if ( glm ) engine::modules::MoERouter::route_topk( x, w[l], bias, idx, wt, H, E, K, 2.5f, stream, rows );
+				if ( ds ) engine::modules::DSV4::route( x.ptr<const half>(), w[l].ptr<const half>(), fbias, nullptr, nullptr, nullptr, idx, wt, scratch, H, E, K, 1.5f, rows, stream );
+				else if ( glm ) engine::modules::MoERouter::route_topk( x, w[l], bias, idx, wt, H, E, K, 2.5f, stream, rows );
 				else engine::modules::MoERouter::route_softmax_topk( x, w[l], idx, wt, H, E, K, stream, rows );
 			}
 		};

@@ -798,32 +798,43 @@ __global__ void concat_groups_kernel( const half* __restrict__ in, half* __restr
 
 constexpr int ROUTE_SPLITS = DSV4::ROUTE_SPLITS;   // 16: 192 blocks of short slices for one row (4 left a long dependent loop on 48)
 
-// grid (rows, experts / 32, ROUTE_SPLITS), 256 threads: warp w sums its share of the block's hidden slice for 32 experts
-__global__ __launch_bounds__( 256 )
+// grid (rows, ROUTE_SPLITS, octet groups), 8 x kRouteOctets threads: thread (w, o) sums the eight experts of octet o (one 16-byte load of a w_t
+// row) over the w-th eighth of the block's hidden slice, each expert in the order of one thread per expert, and the eighths are summed in order
+constexpr int kRouteOctets = 4;
+__global__ __launch_bounds__( 8 * kRouteOctets )
 void route_partial_kernel( const half* __restrict__ x, const half* __restrict__ w_t, float* __restrict__ part, int hidden, int experts ) {
-	const int r = blockIdx.x, e = blockIdx.y * 32 + ( threadIdx.x & 31 ), warp = threadIdx.x >> 5;
+	const int r = blockIdx.x, z = blockIdx.y, ol = threadIdx.x % kRouteOctets, w = threadIdx.x / kRouteOctets, o = blockIdx.z * kRouteOctets + ol;
 	const int slice = hidden / ROUTE_SPLITS, per_warp = slice / 8;
-	const int d0 = blockIdx.z * slice + warp * per_warp;
+	const int d0 = z * slice + w * per_warp;
 	const half* xr = x + static_cast<size_t>( r ) * hidden;
-	float acc = 0.0f;
-	if ( e < experts ) {
-		#pragma unroll 8
-		for ( int d = d0; d < d0 + per_warp; ++d ) acc = fmaf( __half2float( xr[d] ), __half2float( w_t[static_cast<size_t>( d ) * experts + e] ), acc );
+	float acc[8] = {};
+	if ( o < experts / 8 ) {
+		#pragma unroll 
+		for ( int d = d0; d < d0 + per_warp; ++d ) {
+			const float xv = __half2float( xr[d] );
+			const uint4 wv = *reinterpret_cast<const uint4*>( w_t + static_cast<size_t>( d ) * experts + 8 * o );
+			const half* wh = reinterpret_cast<const half*>( &wv );
+			#pragma unroll
+			for ( int j = 0; j < 8; ++j ) acc[j] = fmaf( xv, __half2float( wh[j] ), acc[j] );
+		}
 	}
-	__shared__ float red[8][32];
-	red[warp][threadIdx.x & 31] = acc;
+	__shared__ float red[8][8 * kRouteOctets];   // [eighth][expert j of octet ol at j * kRouteOctets + ol]
+	#pragma unroll
+	for ( int j = 0; j < 8; ++j ) red[w][j * kRouteOctets + ol] = acc[j];
 	__syncthreads();
-	if ( warp == 0 && e < experts ) {
+	const int el = threadIdx.x, e = blockIdx.z * 8 * kRouteOctets + el;
+	if ( e < experts ) {
 		float v = 0.0f;
 		#pragma unroll
-		for ( int w = 0; w < 8; ++w ) v += red[w][threadIdx.x];
-		part[( static_cast<size_t>( r ) * ROUTE_SPLITS + blockIdx.z ) * experts + e] = v;
+		for ( int k = 0; k < 8; ++k ) v += red[k][( el % 8 ) * kRouteOctets + el / 8];
+		part[( static_cast<size_t>( r ) * ROUTE_SPLITS + z ) * experts + e] = v;
 	}
 }
 
-// One block per row, a thread per expert: the scores, then the top_k by rank without sequential rounds (moe.cu's router_select_kernel): every warp
-// ranks its 32 biased scores against each other (larger, or equal with the lower index, ranks first), its top_k go to a candidate list, and
-// the candidates are ranked against each other; the weights are the chosen experts' unbiased scores over their sum
+// One block per row, a thread per expert (whole warps): the scores, then the top_k by rank without sequential rounds (moe.cu's
+// router_select_kernel): every warp ranks its 32 biased scores against each other (larger, or equal with the lower index, ranks first) and
+// its top_k go to a packed candidate list (lanes past the experts as -inf), and the candidates are ranked against each other; the weights
+// are the chosen experts' unbiased scores over their sum (summed in rank order)
 __global__ __launch_bounds__( 512 )
 void route_select_kernel( const float* __restrict__ part, const float* __restrict__ bias, const float* __restrict__ bias_vl, const uint8_t* __restrict__ img_flags, const int* __restrict__ perm, int* __restrict__ idx_out, half* __restrict__ w_out,
 	int experts, int top_k, float scale ) {
@@ -843,8 +854,6 @@ void route_select_kernel( const float* __restrict__ part, const float* __restric
 		b = b != b ? -FLT_MAX : b;
 	}
 	s_raw[e] = s;
-	for ( int c = e; c < 16 * 16; c += blockDim.x ) { c_val[c] = -INFINITY; c_idx[c] = 0x7fffffff; }
-	__syncthreads();
 	{
 		int rank = 0;
 		#pragma unroll
@@ -852,24 +861,36 @@ void route_select_kernel( const float* __restrict__ part, const float* __restric
 			const float u = __shfl_sync( 0xffffffff, b, jj );
 			rank += ( u > b ) || ( u == b && jj < lane );
 		}
-		if ( rank < top_k && e < experts ) { c_val[warp * 16 + rank] = b; c_idx[warp * 16 + rank] = e; }
-	}
-	__syncthreads();
-	if ( e < 16 * 16 ) {
-		const float v = c_val[e];
-		const int vi = c_idx[e];
-		int rank = 0;
-		for ( int c = 0; c < 16 * 16; ++c ) rank += ( c_val[c] > v ) || ( c_val[c] == v && c_idx[c] < vi );
-		if ( rank < top_k && vi != 0x7fffffff ) chosen[rank] = vi;
-	}
-	__syncthreads();
-	if ( e == 0 ) {
-		float sum = 0.0f;
-		for ( int k = 0; k < top_k; ++k ) sum += s_raw[chosen[k]];
-		for ( int k = 0; k < top_k; ++k ) {
-			idx_out[r * top_k + k] = perm ? perm[chosen[k]] : chosen[k];
-			w_out[r * top_k + k] = __float2half_rn( s_raw[chosen[k]] / ( sum + 1e-20f ) * scale );
+		if ( rank < top_k ) {
+			c_val[warp * top_k + rank] = e < experts ? b : -INFINITY;
+			c_idx[warp * top_k + rank] = e < experts ? e : 0x7fffffff;
 		}
+	}
+	__syncthreads();
+	// candidate e / P against a P-th of the list on each of P consecutive lanes (P = 4, or 2 above top 8, so that P x candidates fit the block),
+	// the counts summed over shuffles
+	const int cands = static_cast<int>( blockDim.x / 32 ) * top_k, P = top_k > 8 ? 2 : 4, ci = e / P, pq = e % P, span = ( cands + P - 1 ) / P;
+	if ( e < ( cands + 31 ) / 32 * 32 * P ) {   // whole warps, so the shuffles see every lane of a group
+		const bool own = ci < cands;
+		const float v = own ? c_val[ci] : -INFINITY;
+		const int vi = own ? c_idx[ci] : 0x7fffffff;
+		int rank = 0;
+		const int c0 = pq * span, c1 = min( cands, c0 + span );
+		#pragma unroll 6
+		for ( int c = c0; c < c1; ++c ) rank += ( c_val[c] > v ) || ( c_val[c] == v && c_idx[c] < vi );
+		rank += __shfl_xor_sync( 0xffffffff, rank, 1 );
+		if ( P == 4 ) rank += __shfl_xor_sync( 0xffffffff, rank, 2 );
+		if ( own && pq == 0 && rank < top_k && vi != 0x7fffffff ) chosen[rank] = vi;
+	}
+	__syncthreads();
+	if ( warp != 0 ) return;
+	const int ck = lane < top_k ? chosen[lane] : 0;
+	const float sk = lane < top_k ? s_raw[ck] : 0.0f;
+	float sum = 0.0f;
+	for ( int k = 0; k < top_k; ++k ) sum += __shfl_sync( 0xffffffff, sk, k );
+	if ( lane < top_k ) {
+		idx_out[r * top_k + lane] = perm ? perm[ck] : ck;
+		w_out[r * top_k + lane] = __float2half_rn( sk / ( sum + 1e-20f ) * scale );
 	}
 }
 
@@ -1023,9 +1044,10 @@ void DSV4::concat_groups( const half* in, half* out, int groups, int n, int rows
 
 void DSV4::route( const half* x, const half* w_t, const float* bias, const float* bias_vl, const uint8_t* img_flags, const int* perm, int* idx_out, half* w_out, float* scratch, int hidden, int experts, int top_k,
 	float scale, int rows, cudaStream_t stream ) {
-	ENGINE_ASSERT( experts <= 512 && top_k <= 16 && hidden % ( ROUTE_SPLITS * 8 ) == 0, "DSV4::route: at most 512 experts, top 16, hidden a multiple of 128" );
-	route_partial_kernel<<<dim3( rows, ( experts + 31 ) / 32, ROUTE_SPLITS ), 256, 0, stream>>>( x, w_t, scratch, hidden, experts );
-	route_select_kernel<<<rows, 512, 0, stream>>>( scratch, bias, bias_vl, img_flags, perm, idx_out, w_out, experts, top_k, scale );
+	ENGINE_ASSERT( experts <= 512 && experts % 8 == 0 && top_k <= 16 && hidden % ( ROUTE_SPLITS * 8 ) == 0,
+		"DSV4::route: at most 512 experts (a multiple of 8), top 16, hidden a multiple of 128" );
+	route_partial_kernel<<<dim3( rows, ROUTE_SPLITS, ( experts / 8 + kRouteOctets - 1 ) / kRouteOctets ), 8 * kRouteOctets, 0, stream>>>( x, w_t, scratch, hidden, experts );
+	route_select_kernel<<<rows, ( experts + 31 ) / 32 * 32, 0, stream>>>( scratch, bias, bias_vl, img_flags, perm, idx_out, w_out, experts, top_k, scale );
 }
 
 void DSV4::hc_collapse_norm( const float* streams, const float* pre, const half* norm_w, half* out, float* post, float post_scale, int hidden, float eps, int rows,
