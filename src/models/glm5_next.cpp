@@ -540,62 +540,88 @@ void Glm5NextPipeline::release_tokens( int slot_id ) {
 	kv_dirty_ = true;
 }
 
-int Glm5NextPipeline::auto_resident( const engine::loader::SafeTensorsRepo& repo, int layer, size_t layers_begin, size_t experts_cost, int layers_done, int experts, size_t slot_bytes, int moe_layers,
-	const std::vector<std::array<size_t, 3>>* layer_bytes ) const {
+// expert_cache=auto, once every other weight is in the arena: how many experts of each tier layer stay resident, from the arena's free space
+// and what is still to come, counted from the checkpoint rather than estimated: every expert's signs and scales (resident or not), the
+// layers' pointer tables and route counts, the cold-expert staging when experts stay cold (two buffers of the largest layer's experts), the
+// resident-bias table, the speculator's reserve and a margin for the workspaces taken later. A resident expert's codes cost its own layer's
+// size. Every layer takes the largest common count, then what is left goes to the layers one more expert at a time, so less than one
+// expert's codes stay unused. keep: what the plan leaves free after the experts; largest: the largest expert's codes
+std::vector<int> Glm5NextPipeline::plan_experts( const engine::loader::SafeTensorsRepo& repo, const std::vector<int>& layers, const std::vector<std::array<size_t, 3>>& sizes,
+	int experts, int first_expert, size_t* keep, size_t* largest_out ) const {
 	constexpr double kGiB = 1073741824.0;
-	auto prefix = []( int l ) { return "model.language_model.layers." + std::to_string( l ) + "."; };
-	// What the layers loaded so far took in the arena (less their experts) against their checkpoint bytes, applied to the checkpoint bytes still to
-	// come: this layer's shared expert and the layers after it. The first estimate rests on the dense layers and one attention block; every
-	// later layer refines it
-	size_t counted = repo.bytes_of( prefix( layer ), { ".mlp.experts.", ".mlp.shared_experts." } ), total = 0;
-	for ( int l = 0; l < layer; ++l ) counted += repo.bytes_of( prefix( l ), { ".mlp.experts." } );
-	for ( int l = 0; l < config_.num_layers; ++l ) total += repo.bytes_of( prefix( l ), { ".mlp.experts." } );
-	const size_t used = arena_->offset_bytes - layers_begin - experts_cost;
-	const double per_ckpt_byte = counted ? static_cast<double>( used ) / static_cast<double>( counted ) : 1.0;
-	// The shared experts are cut over the ranks (shared_slice): only 1/tp of their checkpoint bytes land here
-	size_t shared_left = 0;
-	if ( hess_.empty() && runtime::options().shared_slice && config_.tp_size > 1 ) {
-		for ( int l = layer; l < config_.num_layers; ++l ) shared_left += repo.bytes_of( prefix( l ) + "mlp.shared_experts." );
+	auto up = []( size_t b, size_t a ) { return ( b + a - 1 ) / a * a; };
+	static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+	const size_t n = layers.size();
+	std::vector<size_t> slot( n );
+	size_t part_max[3] = {}, codes_all = 0;
+	for ( size_t i = 0; i < n; ++i ) {
+		slot[i] = sizes[i][0] + sizes[i][1] + sizes[i][2];
+		for ( int p = 0; p < 3; ++p ) part_max[p] = std::max( part_max[p], sizes[i][p] );
+		codes_all += slot[i] * static_cast<size_t>( experts );
 	}
-	const double shared_saved = static_cast<double>( shared_left ) * ( 1.0 - 1.0 / config_.tp_size );
-	const double rest_ckpt = std::max( 0.0, static_cast<double>( total > counted ? total - counted : 0 ) - shared_saved );
-	const size_t rest = static_cast<size_t>( per_ckpt_byte * rest_ckpt );
-	// An expert's codes in MoE layer i (a GGUF conversion's block types differ between layers; slot_bytes, the largest, sizes the staging)
-	auto slot_of = [&]( int i ) {
-		if ( layer_bytes == nullptr || i >= static_cast<int>( layer_bytes->size() ) ) return slot_bytes;
-		const auto& b = ( *layer_bytes )[i];
-		return b[0] + b[1] + b[2];
-	};
-	// The device-side tensors every expert keeps (signs, scales), resident or not
-	const size_t expert_all = repo.bytes_of( prefix( layer ) + "mlp.experts.0." );
-	const int layers_left = moe_layers - layers_done;
-	const size_t slot_here = slot_of( layers_done );
-	const size_t extras = ( expert_all > slot_here ? expert_all - slot_here : 0 ) * static_cast<size_t>( experts ) * static_cast<size_t>( layers_left );
-	// The speculator (rank 0 holds the selector codebooks, the others about half of the file), the MTP head, and a margin for what the estimate misses
-	const size_t speculator = rank_ == 0 ? reserve_after_weights_ : reserve_after_weights_ / 2;
-	const size_t head = mtp_on_ ? ( 768ULL << 20 ) : 0, margin = 256ULL << 20;
+	const size_t largest = part_max[0] + part_max[1] + part_max[2];   // the tier's slot_bytes, which sizes the staging buffers
+	// Every expert's tensors besides its codes (EXL3: the signs and scales of its projections; an expert's are the same in its layer), each
+	// allocation 256-aligned, then the layer's pointer table (MoE::init_device_ptrs) and route counts
+	char name[256];
+	size_t extras = 0;
+	for ( size_t i = 0; i < n; ++i ) {
+		size_t per_expert = 0;
+		for ( int p = 0; p < 3; ++p ) {
+			std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.%s.", layers[i], first_expert, kinds[p] );
+			const size_t all = repo.bytes_of( name );
+			per_expert += all > sizes[i][p] ? up( all - sizes[i][p], 256 ) + 4 * 256 : 0;
+		}
+		extras += per_expert * static_cast<size_t>( experts ) + up( 9 * static_cast<size_t>( experts ) * sizeof( void* ), 256 ) + up( static_cast<size_t>( experts ) * sizeof( uint32_t ), 256 );
+	}
+	const bool stage = runtime::options().expert_stage != 0 && !runtime::options().expert_stream && !runtime::options().expert_synth;
+	const size_t stage_tables = n * up( 9 * static_cast<size_t>( experts ) * sizeof( void* ), 256 ) + 4096 + 512;
+	auto staging = [&]( int fewest ) { return stage && fewest < experts ? 2 * static_cast<size_t>( experts - fewest ) * largest + stage_tables : 0; };
+	const size_t bias = runtime::options().route_resident_bias != 0.0 ? up( n * static_cast<size_t>( config_.num_experts ) * sizeof( float ), 256 ) : 0;
+	// the speculator: in the arena already when the cluster deferred the experts, else its reserve (rank 0 holds the selector codebooks,
+	// the others about half of the file)
+	const size_t speculator = defer_experts_ ? 0 : rank_ == 0 ? reserve_after_weights_ : reserve_after_weights_ / 2;
+	const size_t margin = 256ULL << 20;
 	const size_t free_now = arena_->total_bytes - arena_->offset_bytes;
-	const size_t other = rest + extras + speculator + head + margin;
-	ENGINE_ASSERT( free_now > other, "Glm5NextPipeline: expert_cache=auto: the arena cannot hold the other weights; set max_seq / kv_format smaller or give expert_cache" );
-	// The remaining layers share what is left evenly, each resident expert at its own layer's size; the estimate only improves, so the last
-	// layers take up the slack
-	size_t per_resident = 0;
-	for ( int i = layers_done; i < moe_layers; ++i ) per_resident += slot_of( i );
+	const size_t fixed = extras + bias + speculator + margin;
+	ENGINE_ASSERT( free_now > fixed, "Glm5NextPipeline: expert_cache=auto: the arena cannot hold the experts' signs and scales; set max_seq / kv_format smaller or give expert_cache" );
+	const size_t avail = free_now - fixed;
+	auto cost = [&]( const std::vector<int>& r ) {
+		size_t c = 0;
+		int fewest = experts;
+		for ( size_t i = 0; i < n; ++i ) {
+			c += static_cast<size_t>( r[i] ) * slot[i];
+			fewest = std::min( fewest, r[i] );
+		}
+		return c + staging( fewest );
+	};
 	const int floor_res = std::max( 1, experts / 10 );
-	auto fit = [&]( size_t reserved ) { return std::max( floor_res, std::min( experts, static_cast<int>( free_now > other + reserved ? ( free_now - other - reserved ) / per_resident : 0 ) ) ); };
-	// Prefill staging keeps two layers' cold experts in device scratch (sized by the first layer's count): leave room for it
-	const bool stage = runtime::options().expert_stage != 0 && !runtime::options().expert_stream;
-	int resident = fit( 0 );
-	if ( stage ) {
-		const int base = tier_.resident > 0 ? tier_.resident : resident;
-		resident = fit( 2 * static_cast<size_t>( experts - base ) * slot_bytes );
-		if ( tier_.resident == 0 ) resident = fit( 2 * static_cast<size_t>( experts - resident ) * slot_bytes );
+	std::vector<int> res( n, floor_res );
+	for ( int r = experts; r > floor_res; --r ) {
+		std::fill( res.begin(), res.end(), r );
+		if ( cost( res ) <= avail ) break;
+		std::fill( res.begin(), res.end(), floor_res );
 	}
-	if ( rank_ == 0 && layers_done == 0 ) {
-		LOG_INFO( "[experts] expert_cache auto: %d of %d experts per layer resident to start (%.1f%%), later layers take what the refined estimate leaves. Arena free %.2f GiB; still to load: other weights %.2f, expert scales %.2f, speculator %.2f%s; margin %.2f\n",
-			resident, experts, 100.0 * resident / experts, free_now / kGiB, rest / kGiB, extras / kGiB, speculator / kGiB, mtp_on_ ? " + MTP head 0.75" : "", margin / kGiB );
+	for ( bool grew = true; grew; ) {
+		grew = false;
+		for ( size_t i = 0; i < n; ++i ) {
+			if ( res[i] >= experts ) continue;
+			++res[i];
+			if ( cost( res ) <= avail ) grew = true;
+			else --res[i];
+		}
 	}
-	return resident;
+	*keep = speculator + margin;
+	*largest_out = largest;
+	if ( rank_ == 0 ) {
+		const int lo = *std::min_element( res.begin(), res.end() ), hi = *std::max_element( res.begin(), res.end() );
+		size_t resident_codes = 0;
+		for ( size_t i = 0; i < n; ++i ) resident_codes += static_cast<size_t>( res[i] ) * slot[i];
+		LOG_INFO( "[experts] expert_cache auto: %d to %d of %d experts per layer resident (%.1f%% of the codes) from %.2f GiB free once the other weights loaded: "
+			"codes %.2f of %.2f GiB, signs and scales %.2f, staging %.2f, speculator %.2f, margin %.2f\n",
+			lo, hi, experts, 100.0 * resident_codes / std::max<size_t>( 1, codes_all ), free_now / kGiB, resident_codes / kGiB, codes_all / kGiB, extras / kGiB,
+			staging( lo ) / kGiB, speculator / kGiB, margin / kGiB );
+	}
+	return res;
 }
 
 void Glm5NextPipeline::kv_prepare( const pod::BatchRows& rows, backend::stream_t stream ) {
@@ -652,7 +678,8 @@ void Glm5NextPipeline::rollback_state( int slot_id, backend::stream_t stream ) {
 
 bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t stream ) {
 	size_t bytes_before = arena_->offset_bytes;
-	engine::loader::SafeTensorsRepo repo;
+	auto repo_owner = std::make_shared<engine::loader::SafeTensorsRepo>();   // kept for load_experts
+	engine::loader::SafeTensorsRepo& repo = *repo_owner;
 	if ( !repo.open( model_dir ) ) {
 		LOG_ERROR( "[loader] FAILED to open model directory %s\n", model_dir );
 		return false;
@@ -662,9 +689,9 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 
 	// Dense groups quantized to NVFP4 at load from the BF16 tensors of a modelopt checkpoint (nvfp4_dense_src, nvfp4_dense); the
 	// routed experts stay EXL3. The dense MLP layers are NVFP4 in that checkpoint already and load as they are (group `dense`)
-	std::unique_ptr<engine::loader::SafeTensorsRepo> nv_repo;
+	std::shared_ptr<engine::loader::SafeTensorsRepo> nv_repo;
 	if ( const std::string& nv_dir = runtime::options().nvfp4_dense_src; !nv_dir.empty() && ( !runtime::options().nvfp4_dense.empty() || mtp_on_ || !runtime::options().nvfp4_expert_layers.empty() ) ) {
-		nv_repo = std::make_unique<engine::loader::SafeTensorsRepo>();
+		nv_repo = std::make_shared<engine::loader::SafeTensorsRepo>();
 		if ( !nv_repo->open( nv_dir.c_str() ) ) {
 			LOG_ERROR( "[loader] FAILED to open the NVFP4 directory %s\n", nv_dir.c_str() );
 			return false;
@@ -759,7 +786,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	const size_t layers_begin = arena_->offset_bytes;
 	size_t wb_attn = 0, wb_router = 0, wb_shared = 0, wb_dense = 0;   // [mem] weights breakdown (rank 0 log)
 	size_t experts_cost = 0;   // arena bytes the experts took so far (codes in device slots, signs and scales)
-	int auto_base = 0;
+	std::vector<int> moe_list;   // the MoE layers, whose routed experts load in 3b
 	for ( int L = 0; L < config_.num_layers; ++L ) {
 		auto& lw = layers_[L];
 		lw.is_moe = ( L >= 3 );
@@ -905,140 +932,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 				state_.moe.gguf_ws = engine::core::arena_alloc( *arena_, engine::modules::MoEGguf::scratch_bytes( config_.top_k, config_.hidden_size, inter_local ), 256 );
 			}
 			mw.num_local_experts = experts_per_rank;
-			// nvfp4_expert_layers: this layer's routed experts from the modelopt NVFP4 checkpoint, resident, outside the tier
-			size_t experts_cost_from = arena_->offset_bytes;
-			int nv_lo = -1, nv_hi = -1;
-			if ( const std::string& r = runtime::options().nvfp4_expert_layers; !r.empty() ) {
-				if ( std::sscanf( r.c_str(), "%d-%d", &nv_lo, &nv_hi ) == 1 ) nv_hi = nv_lo;
-			}
-			if ( nv_repo && L >= nv_lo && L <= nv_hi ) {
-				mw.type = pod::QuantType::NVFP4;
-				static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
-				for ( int e = 0; e < experts_per_rank; ++e ) {
-					pod::LinearWeight* dst[3] = { &mw.gate[e], &mw.up[e], &mw.down[e] };
-					for ( int p = 0; p < 3; ++p ) {
-						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", L, start_expert + e, kinds[p] );
-						*dst[p] = moe_tp_ ? nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, p < 2, rank_, config_.tp_size, stream ), name_buf )
-						                  : nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, true, 0, 1, stream ), name_buf );
-					}
-				}
-				if ( rank_ == 0 ) LOG_INFO( "[RANK 0] layer %d: routed experts from the NVFP4 checkpoint\n", L );
-			}
-			else {
-			// Tiered experts (expert_cache < 1): the codes of resident experts go to device slots, the rest to pinned host memory
-			double tier_fraction = engine::modules::ExpertTier::resident_fraction();
-			const bool resident_fraction_auto = tier_fraction <= 0.0;
-			experts_cost_from = arena_->offset_bytes;
-			int tier_layer = -1;
-			if ( tier_fraction < 1.0 ) {
-				if ( tier_layers_ == 0 ) {
-					size_t bytes[3];
-					const char* kinds[3] = { "gate_proj", "up_proj", "down_proj" };
-					for ( int p = 0; p < 3; ++p ) {
-						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", L, start_expert, kinds[p] );
-						bytes[p] = repo.trellis_bytes( name_buf );
-						if ( bytes[p] == 0 && runtime::options().expert_synth >= 2 ) bytes[p] = repo.synth_trellis_bytes( name_buf );
-						ENGINE_ASSERT( bytes[p] > 0, "Glm5NextPipeline: expert codes not found for the tier" );
-					}
-					int moe_layers = 0;
-					for ( int ll = 0; ll < config_.num_layers; ++ll ) moe_layers += ( ll >= 3 ) ? 1 : 0;
-					// a GGUF conversion's block types differ between layers: every MoE layer's own sizes
-					std::vector<std::array<size_t, 3>> per_layer;
-					if ( gguf_experts ) {
-						for ( int ll = 3; ll < config_.num_layers; ++ll ) {
-							std::array<size_t, 3> b{};
-							for ( int p = 0; p < 3; ++p ) {
-								std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", ll, start_expert, kinds[p] );
-								b[p] = repo.trellis_bytes( name_buf );
-								ENGINE_ASSERT( b[p] > 0, "Glm5NextPipeline: GGUF expert blocks not found for the tier" );
-							}
-							per_layer.push_back( b );
-						}
-					}
-					if ( tier_fraction <= 0.0 ) {
-						size_t largest = bytes[0] + bytes[1] + bytes[2];
-						if ( !per_layer.empty() ) {
-							largest = 0;
-							for ( int p = 0; p < 3; ++p ) {
-								size_t m = 0;
-								for ( const auto& b : per_layer ) m = std::max( m, b[p] );
-								largest += m;
-							}
-						}
-						auto_base = auto_resident( repo, L, layers_begin, experts_cost, 0, experts_per_rank, largest, moe_layers, per_layer.empty() ? nullptr : &per_layer );
-						tier_fraction = ( auto_base + 0.25 ) / experts_per_rank;
-#if !defined(USE_ROCM)
-						if ( tier_fraction < kFusedTierMinFraction ) state_.moe.coop_ctr = nullptr;
-#endif
-					}
-					tier_.start( experts_per_rank, tier_fraction, bytes, rank_, config_.tp_size, moe_layers, runtime::options().expert_stream, host_arena_,
-						per_layer.empty() ? nullptr : &per_layer );
-				}
-				experts_cost_from = arena_->offset_bytes;
-				int layer_resident = tier_.resident;
-				if ( resident_fraction_auto && tier_layers_ > 0 ) {
-					layer_resident = std::max( tier_.resident, auto_resident( repo, L, layers_begin, experts_cost, tier_layers_, experts_per_rank, tier_.slot_bytes, config_.num_layers - 3,
-						tier_.layer_bytes.empty() ? nullptr : &tier_.layer_bytes ) );
-				}
-				tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_, layer_resident ) );
-				tier_layer = tier_layers_++;
-				lw.tier_layer = tier_layer;
-			}
-			// resident GGUF experts on one rank each: one stack per part (expert-indexed kernels address them by stride)
-			ExpertStacks stacks;
-			char layer_prefix[96];
-			std::snprintf( layer_prefix, sizeof( layer_prefix ), "model.language_model.layers.%d", L );
-			const bool stacked = tier_layer < 0 && runtime::options().expert_synth < 2 &&
-				alloc_expert_stacks( repo, *arena_, layer_prefix, start_expert, experts_per_rank, stacks, moe_tp_ ? config_.tp_size : 1 );
-			for ( int e = 0; e < experts_per_rank; ++e ) {
-				int gid = start_expert + e;
-				pod::MemoryArena ca[3];
-				if ( tier_layer >= 0 ) for ( int p = 0; p < 3; ++p ) tier_.code_arena( tier_layer, e, p, ca[p] );
-				else if ( stacked ) for ( int p = 0; p < 3; ++p ) ca[p] = stacks.slot( e, p );
-				const bool own = tier_layer >= 0 || stacked;
-				pod::MemoryArena* cp[3] = { own ? &ca[0] : nullptr, own ? &ca[1] : nullptr, own ? &ca[2] : nullptr };
-				if ( runtime::options().expert_synth >= 2 ) {
-					// Timing only: experts that are not in the checkpoint. The resident ones are generated, a cold one is a copy of a resident one
-					ENGINE_ASSERT( tier_layer >= 0 && !moe_tp_, "Glm5NextPipeline: ENGINE_DEBUG_EXPERT_SYNTH=2 needs expert_cache < 1 on one rank" );
-					if ( e >= tier_.resident ) {
-						mw.gate[e] = mw.gate[e % tier_.resident];
-						mw.up[e] = mw.up[e % tier_.resident];
-						mw.down[e] = mw.down[e % tier_.resident];
-						continue;
-					}
-					static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
-					pod::LinearWeight* dst[3] = { &mw.gate[e], &mw.up[e], &mw.down[e] };
-					for ( int p = 0; p < 3; ++p ) {
-						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", L, gid, kinds[p] );
-						*dst[p] = repo.synth_linear( name_buf, *arena_, stream, cp[p] );
-						ENGINE_ASSERT( dst[p]->w0.data != nullptr, "Glm5NextPipeline: no entry for a generated expert in quantization_config.json" );
-					}
-					continue;
-				}
-
-				if ( tier_layer >= 0 && runtime::options().expert_stream ) {
-					static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
-					for ( int p = 0; p < 3; ++p ) {
-						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s.trellis", L, gid, kinds[p] );
-						int fd = -1; size_t off = 0, nb = 0;
-						ENGINE_ASSERT( repo.file_ref( name_buf, &fd, &off, &nb ), "Glm5NextPipeline: expert_stream: tensor not found" );
-						tier_.set_source( tier_layer, e, p, fd, off, nb );
-					}
-				}
-				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, gid );
-				mw.gate[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, config_.tp_size, stream, cp[0] ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[0] );
-
-				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, gid );
-				mw.up[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, config_.tp_size, stream, cp[1] ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[1] );
-
-				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, gid );
-				mw.down[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 0, rank_, config_.tp_size, stream, cp[2] ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[2] );
-			}
-			}
-			engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );
-			mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( experts_per_rank ) * sizeof( uint32_t ), 128 ) );
-			backend::memset_async( mw.heat, 0, static_cast<size_t>( experts_per_rank ) * sizeof( uint32_t ), stream );
-			experts_cost += arena_->offset_bytes - experts_cost_from;
+			moe_list.push_back( L );   // the routed experts load after every other weight (3b)
 
 			// Shared experts
 			wb_shared_start = arena_->offset_bytes;
@@ -1122,17 +1016,6 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		if ( lw.is_moe ) {
 			if ( !lw.router_weights.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: router_weights\n", rank_, L ); ++missing_count; }
 			if ( !lw.e_score_bias.data ) { LOG_ERROR( "[RANK %d L%d] MISSING: e_score_bias\n", rank_, L ); ++missing_count; }
-			int expert_miss = 0;
-			for ( int e = 0; e < experts_per_rank; ++e ) {
-				const auto& mw = lw.moe_weights;
-				if ( !mw.gate[e].is_valid() || !mw.up[e].is_valid() || !mw.down[e].is_valid() ) {
-					++expert_miss;
-				}
-			}
-			if ( expert_miss > 0 ) {
-				LOG_ERROR( "[RANK %d L%d] MISSING: %d/%d local experts invalid!\n", rank_, L, expert_miss, experts_per_rank );
-				missing_count += expert_miss;
-			}
 			if ( !lw.shared_expert.gate.is_valid() || !lw.shared_expert.up.is_valid() || !lw.shared_expert.down.is_valid() ) {
 				LOG_ERROR( "[RANK %d L%d] MISSING: shared_expert\n", rank_, L );
 				++missing_count;
@@ -1236,6 +1119,192 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		if ( rank_ == 0 ) LOG_INFO( "[RANK 0] MTP head from the NVFP4 checkpoint: layer %d, %d experts quantized to NVFP4 (this rank's %s)\n", L, head_experts, moe_tp_ ? "slice" : "whole experts" );
 	}
 
+	// 3b. The routed experts last: load_experts, now or (defer_experts) once the cluster has loaded the speculator
+	pending_ = std::make_unique<PendingExperts>();
+	pending_->repo = repo_owner;
+	pending_->nv_repo = nv_repo;
+	pending_->moe_list = std::move( moe_list );
+	pending_->bytes_before = bytes_before;
+	pending_->layers_begin = layers_begin;
+	pending_->wb_attn = wb_attn;
+	pending_->wb_router = wb_router;
+	pending_->wb_shared = wb_shared;
+	pending_->wb_dense = wb_dense;
+	pending_->missing_count = missing_count;
+	pending_->nv_count = nv_count;
+	pending_->nv_calibrated = nv_calibrated;
+	pending_->nv_groups = nv_groups;
+	if ( defer_experts_ ) return true;
+	return load_experts( stream );
+}
+
+// The routed experts (3b of load_weights), after every other weight, and after the speculator when deferred: expert_cache=auto places
+// them from the arena's exact free space (plan_experts)
+bool Glm5NextPipeline::load_experts( backend::stream_t stream ) {
+	if ( !pending_ ) return true;
+	backend::set_device( rank_ );
+	PendingExperts& pe = *pending_;
+	engine::loader::SafeTensorsRepo& repo = *pe.repo;
+	const std::shared_ptr<engine::loader::SafeTensorsRepo>& nv_repo = pe.nv_repo;
+	const std::vector<int>& moe_list = pe.moe_list;
+	int& missing_count = pe.missing_count;
+	int& nv_count = pe.nv_count;
+	const int nv_calibrated = pe.nv_calibrated;
+	const std::string& nv_groups = pe.nv_groups;
+	const size_t bytes_before = pe.bytes_before, layers_begin = pe.layers_begin;
+	const size_t wb_attn = pe.wb_attn, wb_router = pe.wb_router, wb_shared = pe.wb_shared, wb_dense = pe.wb_dense;
+	auto nv_check = [&]( pod::LinearWeight lw, const char* name ) {
+		if ( !lw.is_valid() ) { LOG_ERROR( "[RANK %d] MISSING (NVFP4): %s\n", rank_, name ); ++missing_count; }
+		++nv_count;
+		return lw;
+	};
+	char name_buf[256];
+	const int experts_per_rank = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
+	const int start_expert = moe_tp_ ? 0 : rank_ * experts_per_rank;
+	size_t experts_cost = 0;
+	size_t plan_keep = 0, plan_largest = 0;   // auto: what the plan left for after the weights, and the largest expert's codes
+	bool plan_auto = false;
+	{
+		int nv_lo = -1, nv_hi = -1;
+		if ( const std::string& r = runtime::options().nvfp4_expert_layers; !r.empty() ) {
+			if ( std::sscanf( r.c_str(), "%d-%d", &nv_lo, &nv_hi ) == 1 ) nv_hi = nv_lo;
+		}
+		auto nv_layer = [&]( int L ) { return nv_repo && L >= nv_lo && L <= nv_hi; };
+		// nvfp4_expert_layers: those layers' routed experts from the modelopt NVFP4 checkpoint, resident, outside the tier
+		for ( int L : moe_list ) {
+			if ( !nv_layer( L ) ) continue;
+			auto& mw = layers_[L].moe_weights;
+			const size_t experts_cost_from = arena_->offset_bytes;
+			mw.type = pod::QuantType::NVFP4;
+			static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+			for ( int e = 0; e < experts_per_rank; ++e ) {
+				pod::LinearWeight* dst[3] = { &mw.gate[e], &mw.up[e], &mw.down[e] };
+				for ( int p = 0; p < 3; ++p ) {
+					std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", L, start_expert + e, kinds[p] );
+					*dst[p] = moe_tp_ ? nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, p < 2, rank_, config_.tp_size, stream ), name_buf )
+					                  : nv_check( nv_repo->load_nvfp4_slice( name_buf, *arena_, true, 0, 1, stream ), name_buf );
+				}
+			}
+			if ( rank_ == 0 ) LOG_INFO( "[RANK 0] layer %d: routed experts from the NVFP4 checkpoint\n", L );
+			engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );
+			mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( experts_per_rank ) * sizeof( uint32_t ), 128 ) );
+			backend::memset_async( mw.heat, 0, static_cast<size_t>( experts_per_rank ) * sizeof( uint32_t ), stream );
+			experts_cost += arena_->offset_bytes - experts_cost_from;
+		}
+		std::vector<int> tier_list;
+		for ( int L : moe_list ) if ( !nv_layer( L ) ) tier_list.push_back( L );
+		// Tiered experts (expert_cache < 1, or auto): the codes of resident experts go to device slots, the rest to pinned host memory
+		double tier_fraction = engine::modules::ExpertTier::resident_fraction();
+		const bool use_tier = tier_fraction < 1.0 && !tier_list.empty();
+		plan_auto = use_tier && tier_fraction <= 0.0;
+		std::vector<int> plan;
+		if ( use_tier ) {
+			// every tier layer's expert code sizes (a GGUF conversion's block types differ between layers)
+			static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+			std::vector<std::array<size_t, 3>> per_layer;
+			for ( int L : tier_list ) {
+				std::array<size_t, 3> b{};
+				for ( int p = 0; p < 3; ++p ) {
+					std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", L, start_expert, kinds[p] );
+					b[p] = repo.trellis_bytes( name_buf );
+					if ( b[p] == 0 && runtime::options().expert_synth >= 2 ) b[p] = repo.synth_trellis_bytes( name_buf );
+					ENGINE_ASSERT( b[p] > 0, "Glm5NextPipeline: expert codes not found for the tier" );
+				}
+				per_layer.push_back( b );
+			}
+			if ( plan_auto ) {
+				plan = plan_experts( repo, tier_list, per_layer, experts_per_rank, start_expert, &plan_keep, &plan_largest );
+				tier_fraction = ( *std::min_element( plan.begin(), plan.end() ) + 0.25 ) / experts_per_rank;
+#if !defined(USE_ROCM)
+				if ( tier_fraction < kFusedTierMinFraction ) state_.moe.coop_ctr = nullptr;
+#endif
+			}
+			const size_t bytes0[3] = { per_layer[0][0], per_layer[0][1], per_layer[0][2] };
+			tier_.start( experts_per_rank, tier_fraction, bytes0, rank_, config_.tp_size, static_cast<int>( tier_list.size() ), runtime::options().expert_stream, host_arena_,
+				&per_layer );
+		}
+		for ( size_t li = 0; li < tier_list.size(); ++li ) {
+			const int L = tier_list[li];
+			auto& lw = layers_[L];
+			auto& mw = lw.moe_weights;
+			const size_t experts_cost_from = arena_->offset_bytes;
+			int tier_layer = -1;
+			if ( use_tier ) {
+				tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_, plan_auto ? plan[li] : tier_.resident ) );
+				tier_layer = tier_layers_++;
+				lw.tier_layer = tier_layer;
+			}
+			// resident GGUF experts on one rank each: one stack per part (expert-indexed kernels address them by stride)
+			ExpertStacks stacks;
+			char layer_prefix[96];
+			std::snprintf( layer_prefix, sizeof( layer_prefix ), "model.language_model.layers.%d", L );
+			const bool stacked = tier_layer < 0 && runtime::options().expert_synth < 2 &&
+				alloc_expert_stacks( repo, *arena_, layer_prefix, start_expert, experts_per_rank, stacks, moe_tp_ ? config_.tp_size : 1 );
+			for ( int e = 0; e < experts_per_rank; ++e ) {
+				int gid = start_expert + e;
+				pod::MemoryArena ca[3];
+				if ( tier_layer >= 0 ) for ( int p = 0; p < 3; ++p ) tier_.code_arena( tier_layer, e, p, ca[p] );
+				else if ( stacked ) for ( int p = 0; p < 3; ++p ) ca[p] = stacks.slot( e, p );
+				const bool own = tier_layer >= 0 || stacked;
+				pod::MemoryArena* cp[3] = { own ? &ca[0] : nullptr, own ? &ca[1] : nullptr, own ? &ca[2] : nullptr };
+				if ( runtime::options().expert_synth >= 2 ) {
+					// Timing only: experts that are not in the checkpoint. The resident ones are generated, a cold one is a copy of a resident one
+					ENGINE_ASSERT( tier_layer >= 0 && !moe_tp_, "Glm5NextPipeline: ENGINE_DEBUG_EXPERT_SYNTH=2 needs expert_cache < 1 on one rank" );
+					if ( e >= tier_.resident ) {
+						mw.gate[e] = mw.gate[e % tier_.resident];
+						mw.up[e] = mw.up[e % tier_.resident];
+						mw.down[e] = mw.down[e % tier_.resident];
+						continue;
+					}
+					static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+					pod::LinearWeight* dst[3] = { &mw.gate[e], &mw.up[e], &mw.down[e] };
+					for ( int p = 0; p < 3; ++p ) {
+						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", L, gid, kinds[p] );
+						*dst[p] = repo.synth_linear( name_buf, *arena_, stream, cp[p] );
+						ENGINE_ASSERT( dst[p]->w0.data != nullptr, "Glm5NextPipeline: no entry for a generated expert in quantization_config.json" );
+					}
+					continue;
+				}
+
+				if ( tier_layer >= 0 && runtime::options().expert_stream ) {
+					static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+					for ( int p = 0; p < 3; ++p ) {
+						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s.trellis", L, gid, kinds[p] );
+						int fd = -1; size_t off = 0, nb = 0;
+						ENGINE_ASSERT( repo.file_ref( name_buf, &fd, &off, &nb ), "Glm5NextPipeline: expert_stream: tensor not found" );
+						tier_.set_source( tier_layer, e, p, fd, off, nb );
+					}
+				}
+				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, gid );
+				mw.gate[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, config_.tp_size, stream, cp[0] ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[0] );
+
+				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, gid );
+				mw.up[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, config_.tp_size, stream, cp[1] ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[1] );
+
+				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, gid );
+				mw.down[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 0, rank_, config_.tp_size, stream, cp[2] ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[2] );
+			}
+			engine::modules::MoE::init_device_ptrs( mw, *arena_, stream );
+			mw.heat = static_cast<uint32_t*>( engine::core::arena_alloc( *arena_, static_cast<size_t>( experts_per_rank ) * sizeof( uint32_t ), 128 ) );
+			backend::memset_async( mw.heat, 0, static_cast<size_t>( experts_per_rank ) * sizeof( uint32_t ), stream );
+			experts_cost += arena_->offset_bytes - experts_cost_from;
+		}
+		for ( int L : moe_list ) {
+			const auto& lw = layers_[L];
+			int expert_miss = 0;
+			for ( int e = 0; e < experts_per_rank; ++e ) {
+				const auto& mw = lw.moe_weights;
+				if ( !mw.gate[e].is_valid() || !mw.up[e].is_valid() || !mw.down[e].is_valid() ) {
+					++expert_miss;
+				}
+			}
+			if ( expert_miss > 0 ) {
+				LOG_ERROR( "[RANK %d L%d] MISSING: %d/%d local experts invalid!\n", rank_, L, expert_miss, experts_per_rank );
+				missing_count += expert_miss;
+			}
+		}
+	}
+
 	tier_.stage_init( *arena_ );
 	if ( tier_.active() && runtime::options().route_resident_bias != 0.0 ) {
 		const size_t n = static_cast<size_t>( tier_layers_ ) * config_.num_experts;
@@ -1243,6 +1312,16 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		backend::memset_sync( resident_bias_, 0, n * sizeof( float ) );   // the cluster fills it once every rank is loaded
 	}
 	if ( tier_.active() && runtime::options().cpu_experts > 0.0 ) cpu_ = engine::cpu_moe::attach_cpu_experts( tier_, rank_, start_expert, config_.hidden_size, 10.0f, *arena_, stream );
+	if ( plan_auto ) {
+		// the plan against the arena: with experts cold, more than a few dozen experts' codes left free beyond what it keeps for after the
+		// weights means its count of what loads with the experts is off (it errs high by the tensors' alignment, tens of MiB)
+		const size_t left = arena_->total_bytes - arena_->offset_bytes;
+		bool cold = false;
+		for ( const auto& l : tier_.layers ) cold = cold || static_cast<int>( l.owner.size() ) < tier_.experts;
+		if ( cold && left > plan_keep + std::max<size_t>( 256ULL << 20, 8 * plan_largest ) )
+			LOG_WARN( "[RANK %d] [experts] expert_cache auto left %.2f GiB free, %.2f GiB more than it keeps for the speculator and margin, with experts cold\n", rank_,
+				left / 1073741824.0, ( left - plan_keep ) / 1073741824.0 );
+	}
 	size_t bytes_after = arena_->offset_bytes;
 	if ( rank_ <= 1 && runtime::options().mem_log ) {
 		constexpr double kGiB = 1073741824.0;
@@ -1274,6 +1353,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		backend::stream_sync( stream );
 	}
 	repo.close();
+	pending_.reset();
 	weights_loaded_ = true;
 	return true;
 }

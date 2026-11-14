@@ -22,6 +22,8 @@
 #include "engine/backend/types.h"
 #include <cstdint>
 #include <array>
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace engine::loader { class SafeTensorsRepo; }
@@ -200,6 +202,8 @@ public:
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void reset_state( int slot_id = 0 ) override;
 	void set_reserve_after_weights( size_t bytes ) override { reserve_after_weights_ = bytes; }
+	void defer_experts( bool on ) override { defer_experts_ = on; }
+	bool load_experts( backend::stream_t stream = nullptr ) override;
 	bool reserve_tokens( int slot_id, int tokens ) override;
 	void release_tokens( int slot_id ) override;
 	int pool_tokens() const override { return kv_pool_tokens_; }
@@ -248,6 +252,16 @@ private:
 	// Absorbed MLA: the cache holds the 512-wide KV latent per token, shared by all heads,
 	// instead of expanded per-head K / V (1 KiB vs 16 KiB per token per layer, so kv_pool_ is not allocated)
 	size_t reserve_after_weights_ = 0;
+	bool defer_experts_ = false;
+	// What load_weights hands load_experts (the routed experts load after every other weight, and after the speculator when deferred)
+	struct PendingExperts {
+		std::shared_ptr<engine::loader::SafeTensorsRepo> repo, nv_repo;
+		std::vector<int> moe_list;
+		size_t bytes_before = 0, layers_begin = 0, wb_attn = 0, wb_router = 0, wb_shared = 0, wb_dense = 0;
+		int missing_count = 0, nv_count = 0, nv_calibrated = 0;
+		std::string nv_groups;
+	};
+	std::unique_ptr<PendingExperts> pending_;
 	bool moe_tp_ = true;                // routed experts sharded over the ranks instead of expert-parallel
 	engine::modules::ExpertTier tier_;
 	pod::MemoryArena host_arena_{};     // pinned cold-expert tier
@@ -282,8 +296,8 @@ private:
 	pod::KVPages kv_pages() const;
 	// expert_cache=auto, before the experts of a MoE layer: the experts per layer the arena can hold for this and the layers after it, from the
 	// bytes the layers loaded so far took, the checkpoint size of the layers still to come, the speculator and a margin
-	int auto_resident( const engine::loader::SafeTensorsRepo& repo, int layer, size_t layers_begin, size_t experts_cost, int layers_done, int experts, size_t slot_bytes, int moe_layers,
-		const std::vector<std::array<size_t, 3>>* layer_bytes = nullptr ) const;
+	std::vector<int> plan_experts( const engine::loader::SafeTensorsRepo& repo, const std::vector<int>& layers, const std::vector<std::array<size_t, 3>>& sizes, int experts,
+		int first_expert, size_t* keep, size_t* largest ) const;   // expert_cache=auto: resident experts per tier layer
 	void kv_prepare( const pod::BatchRows& rows, backend::stream_t stream );   // pages for the rows' positions, table on the device
 	// One contiguous device range per page of the tokens [from, tokens) of a slot: fn( first token, tokens in the range )
 	template <typename F> void for_kv_ranges( int slot_id, int from, int tokens, F&& fn ) const;

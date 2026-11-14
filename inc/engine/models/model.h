@@ -116,6 +116,11 @@ public:
 	virtual void set_reserve_after_weights( size_t bytes ) { (void) bytes; }
 	virtual bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) = 0;
 	virtual bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) = 0;
+	// A model that sizes its routed experts from what the arena has left (expert_cache=auto) can load them after the speculator: with
+	// defer_experts( true ) before load_weights, load_weights stops before the experts and load_experts places them once the speculator is
+	// in. A model without the split loads everything in load_weights
+	virtual void defer_experts( bool on ) { (void) on; }
+	virtual bool load_experts( backend::stream_t stream = nullptr ) { (void) stream; return true; }
 
 	// 2. Token embedding: token_ids is a host array of `count` ids for rows 0..count-1
 	virtual void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) = 0;

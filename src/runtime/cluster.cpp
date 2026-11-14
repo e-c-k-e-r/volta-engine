@@ -120,6 +120,9 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		}
 	}
 	for ( int d = 0; d < tp_; ++d ) models_[d]->set_reserve_after_weights( draft_bytes );
+	// with a drafter to load, a model that sizes its experts from the arena's remainder places them after it (load_experts below)
+	const bool defer_experts = draft_bytes > 0;
+	for ( int d = 0; d < tp_; ++d ) models_[d]->defer_experts( defer_experts );
 	bool ok[ENGINE_NUM_GPUS] = {};
 	pool_.run( [&]( int d ) {
 		ok[d] = models_[d]->load_weights( cfg.model_dir.c_str(), streams_[d] );
@@ -176,6 +179,16 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	}
 
 	LOG_INFO( "[mem] GPU 0 arena: speculator %.2f GiB (%.2f GiB free)\n", ( arenas_[0].offset_bytes - mem_weights ) / kGiB, ( arenas_[0].total_bytes - arenas_[0].offset_bytes ) / kGiB );
+	if ( defer_experts ) {
+		const size_t mem_spec = arenas_[0].offset_bytes;
+		bool done[ENGINE_NUM_GPUS] = {};
+		pool_.run( [&]( int d ) {
+			done[d] = models_[d]->load_experts( streams_[d] );
+			backend::stream_sync( streams_[d] );
+		} );
+		for ( int d = 0; d < tp_; ++d ) if ( !done[d] ) return false;
+		LOG_INFO( "[mem] GPU 0 arena: routed experts %.2f GiB (%.2f GiB free)\n", ( arenas_[0].offset_bytes - mem_spec ) / kGiB, ( arenas_[0].total_bytes - arenas_[0].offset_bytes ) / kGiB );
+	}
 	// Image encoder last, into whatever the arena has left (rank 0)
 	models_[0]->load_vision( cfg.model_dir.c_str(), streams_[0] );
 
