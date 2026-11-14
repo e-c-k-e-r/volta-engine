@@ -545,6 +545,8 @@ void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, c
 		#pragma unroll
 		for ( int i = 0; i < 8; ++i ) acc[j][i] = make_float2( 0.0f, 0.0f );
 	}
+	half2 hq[HPW][8];
+	bool q_loaded = false;
 	for ( int k0 = kb; k0 < ke; k0 += ATT_TILE ) {
 		__syncthreads();
 		const int nk = min( ATT_TILE, ke - k0 );
@@ -555,29 +557,55 @@ void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, c
 			reinterpret_cast<int4*>( ks + k * ( HD / 2 ) )[c] = reinterpret_cast<const int4*>( src )[c];
 		}
 		__syncthreads();
-		for ( int k = 0; k < nk; ++k ) {
-			float2 kv[8];
+		if ( !q_loaded ) {   // the warp's heads' query dims in registers once q is in shared memory
 			#pragma unroll
-			for ( int i = 0; i < 8; ++i ) kv[i] = __half22float2( ks[k * ( HD / 2 ) + lane + 32 * i] );
+			for ( int j = 0; j < HPW; ++j )
+				#pragma unroll
+				for ( int i = 0; i < 8; ++i ) hq[j][i] = qs[( warp * HPW + j ) * ( HD / 2 ) + lane + 32 * i];
+			q_loaded = true;
+		}
+		// keys in pairs: both dot products and their warp sums in flight together, then the online-softmax steps of the two in key order
+		for ( int k = 0; k < nk; k += 2 ) {
+			const bool two = k + 1 < nk;
+			float2 kv0[8], kv1[8];
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) {
+				kv0[i] = __half22float2( ks[k * ( HD / 2 ) + lane + 32 * i] );
+				kv1[i] = two ? __half22float2( ks[( k + 1 ) * ( HD / 2 ) + lane + 32 * i] ) : make_float2( 0.0f, 0.0f );
+			}
 			#pragma unroll
 			for ( int j = 0; j < HPW; ++j ) {
-				const int h = warp * HPW + j;
-				float dot = 0.0f;
+				float d0 = 0.0f, d1 = 0.0f;
 				#pragma unroll
 				for ( int i = 0; i < 8; ++i ) {
-					const float2 qv = __half22float2( qs[h * ( HD / 2 ) + lane + 32 * i] );
-					dot = fmaf( qv.x, kv[i].x, fmaf( qv.y, kv[i].y, dot ) );
+					const float2 qv = __half22float2( hq[j][i] );
+					d0 = fmaf( qv.x, kv0[i].x, fmaf( qv.y, kv0[i].y, d0 ) );
+					d1 = fmaf( qv.x, kv1[i].x, fmaf( qv.y, kv1[i].y, d1 ) );
 				}
-				dot = engine::math::warp_sum( dot ) * scale;
-				const float mn = fmaxf( m[j], dot );
-				const float corr = expf( m[j] - mn ), p = expf( dot - mn );
-				l[j] = l[j] * corr + p;
-				#pragma unroll
-				for ( int i = 0; i < 8; ++i ) {
-					acc[j][i].x = acc[j][i].x * corr + p * kv[i].x;
-					acc[j][i].y = acc[j][i].y * corr + p * kv[i].y;
+				d0 = engine::math::warp_sum( d0 ) * scale;
+				d1 = engine::math::warp_sum( d1 ) * scale;
+				{
+					const float mn = fmaxf( m[j], d0 );
+					const float corr = expf( m[j] - mn ), p = expf( d0 - mn );
+					l[j] = l[j] * corr + p;
+					#pragma unroll
+					for ( int i = 0; i < 8; ++i ) {
+						acc[j][i].x = acc[j][i].x * corr + p * kv0[i].x;
+						acc[j][i].y = acc[j][i].y * corr + p * kv0[i].y;
+					}
+					m[j] = mn;
 				}
-				m[j] = mn;
+				if ( two ) {
+					const float mn = fmaxf( m[j], d1 );
+					const float corr = expf( m[j] - mn ), p = expf( d1 - mn );
+					l[j] = l[j] * corr + p;
+					#pragma unroll
+					for ( int i = 0; i < 8; ++i ) {
+						acc[j][i].x = acc[j][i].x * corr + p * kv1[i].x;
+						acc[j][i].y = acc[j][i].y * corr + p * kv1[i].y;
+					}
+					m[j] = mn;
+				}
 			}
 		}
 	}
@@ -620,7 +648,7 @@ void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, c
 
 // Merges the split-KV partials of one head of a row (grid rows x heads, 8 warps) and writes its output: every warp takes the row's maximum and
 // denominator over the splits (lane = split), the warps sum the weighted partials of every eighth split (lane layout as attend_kernel), and
-// warp 0 adds the eight sums in warp order and applies the rotary and FP8 epilogue
+// warp i adds the eight sums of dims i in warp order and applies the rotary and FP8 epilogue to them
 __global__ __launch_bounds__( ATT_THREADS )
 void att_combine_kernel( const float* __restrict__ ws, int nsplit, const float* __restrict__ sink, const float2* __restrict__ rope, half* __restrict__ o, int nh,
 	int rows_n, const pod::BatchRows* __restrict__ rows ) {
@@ -650,29 +678,24 @@ void att_combine_kernel( const float* __restrict__ ws, int nsplit, const float* 
 	#pragma unroll
 	for ( int i = 0; i < 8; ++i ) part[warp][lane + 32 * i] = v[i];
 	__syncthreads();
-	if ( warp != 0 ) return;
+	// the epilogue, warp i the dims of i (the eight sums in warp order, the rotary pairs in i = 7, the E4M3 grid per 32 dims): every warp
+	// takes the same denominator
 	float den = lane < nsplit ? base[lane * sstride + 1] * w_l : 0.0f;
 	#pragma unroll
 	for ( int off = 16; off > 0; off >>= 1 ) den += __shfl_xor_sync( 0xffffffff, den, off );
 	den += expf( sink[h] - M );
 	const float f = 1.0f / den;
+	const int i = warp;
+	float2 t = part[0][lane + 32 * i];
 	#pragma unroll
-	for ( int i = 0; i < 8; ++i ) {
-		float2 t = part[0][lane + 32 * i];
-		#pragma unroll
-		for ( int w = 1; w < ATT_THREADS / 32; ++w ) { t.x += part[w][lane + 32 * i].x; t.y += part[w][lane + 32 * i].y; }
-		v[i] = __half22float2( __floats2half2_rn( t.x * f, t.y * f ) );
-	}
-	const float2* cs_row = rope + static_cast<size_t>( rows->pos[r] ) * ( ROPE / 2 );
-	rot( v[7].x, v[7].y, cs_row[lane], true );
+	for ( int w = 1; w < ATT_THREADS / 32; ++w ) { t.x += part[w][lane + 32 * i].x; t.y += part[w][lane + 32 * i].y; }
+	float2 vi = __half22float2( __floats2half2_rn( t.x * f, t.y * f ) );
+	if ( i == 7 ) rot( vi.x, vi.y, rope[static_cast<size_t>( rows->pos[r] ) * ( ROPE / 2 ) + lane], true );
 	const int G = DSV4::GROUP_HEADS;
 	half* dst = o + ( static_cast<size_t>( h / G ) * rows_n + r ) * ( G * HD ) + static_cast<size_t>( h % G ) * HD;
-	#pragma unroll
-	for ( int i = 0; i < 8; ++i ) {
-		const float amax = group_max<16>( fmaxf( fabsf( v[i].x ), fabsf( v[i].y ) ) );
-		const float sc = e4m3_scale_pow2( amax );
-		reinterpret_cast<half2*>( dst )[lane + 32 * i] = __floats2half2_rn( q_e4m3( v[i].x, sc ), q_e4m3( v[i].y, sc ) );
-	}
+	const float amax = group_max<16>( fmaxf( fabsf( vi.x ), fabsf( vi.y ) ) );
+	const float sc = e4m3_scale_pow2( amax );
+	reinterpret_cast<half2*>( dst )[lane + 32 * i] = __floats2half2_rn( q_e4m3( vi.x, sc ), q_e4m3( vi.y, sc ) );
 }
 
 
@@ -1012,10 +1035,11 @@ void DSV4::attend( const half* q, const half* ring, const half* comp_kv, const i
 	const float2* rope = reinterpret_cast<const float2*>( rope_f );
 	const size_t smem = static_cast<size_t>( nh + ATT_TILE ) * ( HD / 2 ) * sizeof( half2 );
 	ENGINE_ASSERT( nh == 8 || nh == 16 || nh == 32, "DSV4::attend: heads per rank must be 8, 16 or 32" );
-	// decode batches with compressed entries split the keys over blocks (a single block per row leaves almost every SM idle, and its dependent
-	// loads miss the cache once the compressed cache outgrows it); window-only layers and prefill chunks stay on one block per row
+	// decode batches split the keys over blocks (a single block per row leaves almost every SM idle, and its dependent loads miss the cache
+	// once the compressed cache outgrows it); a window-only layer's 128 keys take a tile a block; prefill chunks stay on one block per row
 	int nsplit = 1;
 	if ( ws != nullptr && comp_kv != nullptr ) nsplit = rows == 1 ? 32 : rows == 2 ? 16 : rows <= 4 ? 8 : rows <= 16 ? 4 : 1;
+	else if ( ws != nullptr ) nsplit = rows <= 4 ? DSV4::WINDOW / ATT_TILE : rows <= 16 ? 2 : 1;
 	float* wsp = nsplit > 1 ? ws : nullptr;
 	const dim3 grid( rows, nsplit );
 	if ( nh == 32 ) {
