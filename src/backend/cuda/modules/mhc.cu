@@ -319,6 +319,7 @@ void hc_mix_finalize_body(
 	const int c1 = min( c0 + chunk_cols_c, D );
 	const float4* s4 = (const float4*)( streams + static_cast<size_t>( r ) * row_len );
 	const int D4 = D / 4;
+	#pragma unroll 4
 	for ( int c = c0 / 4 + tid; c < c1 / 4; c += nth ) {
 		float4 o = make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
 		#pragma unroll
@@ -395,7 +396,7 @@ void hc_collapse_norm_kernel(
 	half* s_col = reinterpret_cast<half*>( hcn_smem );
 	__shared__ bool last;
 	const int r = blockIdx.y;
-	hc_mix_partials_body<H, M_, float>( streams, fn, H * D, chunk_cols );
+	hc_mix_partials_split_body<H, M_>( streams, fn, H * D, chunk_cols, gridDim.x );
 	__syncthreads();
 	if ( threadIdx.x == 0 ) {
 		__threadfence();
