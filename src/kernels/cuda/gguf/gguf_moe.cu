@@ -62,18 +62,20 @@ __global__ void moe_dispatch_kernel( const int* __restrict__ topk, int routes, i
 // out[route][row] = expert row `row` . input of each route of the work item (the route's token's q8_1 row, or the route's own), scaled by
 // the route's weight when `weighted`. One warp per output row, kMoEWarps rows per block: expert rows are short (640 or 2560 values), too
 // short to keep a whole block of threads on one. IR: the items' most routes (a pass of rows tokens gives an expert at most rows routes, so
-// decode passes hold fewer accumulators); GU: the same row of the up projection (ptrs_up) too, into out_up, sharing the input loads
+// decode passes hold fewer accumulators); GU: the same row of the up projection (ptrs_up) too, into out_up, sharing the input loads.
+// Block row y takes items y, y + gridDim.y, ...
 template <GgmlType T, int IR, bool GU>
 __global__ __launch_bounds__( 32 * kMoEWarps )
 void moe_proj_kernel( const void* const* __restrict__ ptrs, const void* const* __restrict__ ptrs_up, const Item* __restrict__ items, const int* __restrict__ n_items,
 	const int* __restrict__ sorted, const block_q8_1* __restrict__ in, bool per_token, int k, int n, const half* __restrict__ topw, int top_k, bool weighted,
 	float* __restrict__ out, float* __restrict__ out_up ) {
 	using Tr = Traits<T>;
-	if ( static_cast<int>( blockIdx.y ) >= *n_items ) return;
-	const Item it = items[blockIdx.y];
 	const int row = blockIdx.x * kMoEWarps + threadIdx.y;
 	if ( row >= n ) return;
 	const int lane = threadIdx.x;
+	const int items_n = *n_items;
+	for ( int ii = blockIdx.y; ii < items_n; ii += gridDim.y ) {   // the pass's items, gridDim.y rows of blocks taking every gridDim.y-th
+	const Item it = items[ii];
 	const void* w = ptrs[it.expert];
 	const void* wu = GU ? ptrs_up[it.expert] : nullptr;
 	const int blocks_per_row = k / Tr::qk, y_blocks = k / QK8_1;
@@ -114,6 +116,7 @@ void moe_proj_kernel( const void* const* __restrict__ ptrs, const void* const* _
 		const int r = sorted[it.begin + lane];
 		out[static_cast<size_t>( r ) * n + row] = weighted ? v * __half2float( topw[r] ) : v;
 		if constexpr ( GU ) out_up[static_cast<size_t>( r ) * n + row] = vu;
+	}
 	}
 }
 
@@ -157,7 +160,8 @@ __global__ void moe_combine_kernel( const float* __restrict__ part, const int* _
 template <GgmlType T, int IR>
 void launch_proj_ir( const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n, const block_q8_1* in,
 	bool per_token, int k, int n, const half* topw, int top_k, bool weighted, float* out, float* out_up, cudaStream_t stream ) {
-	const dim3 grid( ( n + kMoEWarps - 1 ) / kMoEWarps, max_n ), block( 32, kMoEWarps );
+	// decode passes route to a few of max_n possible items: fewer rows of blocks, each looping over its share, leave no idle blocks
+	const dim3 grid( ( n + kMoEWarps - 1 ) / kMoEWarps, IR <= 4 ? std::min( max_n, 2 + 2 * IR ) : max_n ), block( 32, kMoEWarps );
 	if ( ptrs_up != nullptr ) moe_proj_kernel<T, IR, true><<<grid, block, 0, stream>>>( ptrs, ptrs_up, items, n_items, sorted, in, per_token, k, n, topw, top_k, weighted, out, out_up );
 	else moe_proj_kernel<T, IR, false><<<grid, block, 0, stream>>>( ptrs, nullptr, items, n_items, sorted, in, per_token, k, n, topw, top_k, weighted, out, nullptr );
 }
