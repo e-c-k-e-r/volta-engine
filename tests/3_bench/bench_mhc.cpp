@@ -1,5 +1,6 @@
 // GLM decode hyper-connection: time of HyperConnection::collapse_norm (mix, sinkhorn, collapse, RMSNorm) for 1..8 rows over 24 distinct
-// fn copies (cycled so the L2 does not hold them), the way a decode step meets its 156 sites; prints a checksum of the outputs.
+// fn copies (cycled so the L2 does not hold them), the way a decode step meets its 156 sites; prints a checksum of the outputs. DS=1:
+// DeepSeek-V4.1's lagged form (HyperConnection::collapse_lagged_norm, hidden 5120); SINK=n Sinkhorn iterations (20).
 //   bench_mhc [rows ...]
 #include "engine/core/arena.h"
 #include "engine/modules/mhc.h"
@@ -9,7 +10,8 @@
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	const int D = 4096, HC = 4, SITES = 24;
+	const bool ds = std::getenv( "DS" ) != nullptr;
+	const int D = ds ? 5120 : 4096, HC = 4, SITES = 24;
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	cudaStream_t stream;
 	CUDA_CHECK( cudaStreamCreate( &stream ) );
@@ -53,9 +55,13 @@ int main( int argc, char** argv ) {
 		auto inv = upload( pod::DType::FP32, rows, 0.0f, 0.0f, false );
 		auto logits = upload( pod::DType::FP32, rows * 24, 0.0f, 0.0f, false );
 		auto pre = upload( pod::DType::FP32, rows * HC, 0.0f, 0.0f, false );
+		auto pre_in = upload( pod::DType::FP32, rows * HC, 0.2f, 0.5f, false );
 		auto run = [&]() {
 			for ( int s = 0; s < SITES; ++s )
-				ENGINE_ASSERT( engine::modules::HyperConnection::collapse_norm( streams, fn[s], base[s], scale[s], norm_w, norm_out, post, comb, inv, logits, pre, D, std::getenv( "SINK" ) ? std::atoi( std::getenv( "SINK" ) ) : 20, 1e-6f, 1e-6f, 0.0f, stream, rows ), "collapse_norm" );
+				if ( ds ) ENGINE_ASSERT( engine::modules::HyperConnection::collapse_lagged_norm( streams.ptr<const float>(), fn[s].ptr<const float>(), base[s].ptr<const float>(),
+					scale[s].ptr<const float>(), pre_in.ptr<const float>(), norm_w.ptr<const half>(), norm_out.ptr<half>(), post.ptr<float>(), comb.ptr<float>(), inv.ptr<float>(),
+					logits.ptr<float>(), pre.ptr<float>(), D, std::getenv( "SINK" ) ? std::atoi( std::getenv( "SINK" ) ) : 20, 1e-6f, 1e-6f, 1.0f, stream, rows ), "collapse_lagged_norm" );
+				else ENGINE_ASSERT( engine::modules::HyperConnection::collapse_norm( streams, fn[s], base[s], scale[s], norm_w, norm_out, post, comb, inv, logits, pre, D, std::getenv( "SINK" ) ? std::atoi( std::getenv( "SINK" ) ) : 20, 1e-6f, 1e-6f, 0.0f, stream, rows ), "collapse_norm" );
 		};
 		for ( int i = 0; i < 5; ++i ) run();
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );

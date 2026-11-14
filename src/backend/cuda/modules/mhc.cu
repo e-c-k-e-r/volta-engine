@@ -103,6 +103,76 @@ void hc_mix_partials_body(
 	}
 }
 
+// hc_mix_partials_body over a block of NUM_THREADS threads: group q of NUM_THREADS_A threads computes the partials k of [k0(q), k1(q)) (the
+// M + 1 outputs split over the groups), each over the columns and in the order thread t % NUM_THREADS_A would, and reduces them the same way,
+// so the partials are bit-identical while four times the loads are in flight
+template <int H, int M_>
+__device__ __forceinline__
+void hc_mix_partials_split_body(
+	const float* __restrict__ streams,
+	const float* __restrict__ fn,
+	const int row_len,
+	const int chunk_cols,
+	const int chunks   // partials per row
+) {
+	constexpr int M = M_, G = NUM_THREADS / NUM_THREADS_A, PER = ( M + 1 + G - 1 ) / G;
+	const int r = blockIdx.y, q = threadIdx.x / NUM_THREADS_A, t = threadIdx.x % NUM_THREADS_A;
+	const int k0 = q * PER, k1 = min( M + 1, k0 + PER );
+	const int c0 = blockIdx.x * chunk_cols;
+	const int c1 = min( c0 + chunk_cols, row_len );
+	const float4* s4 = (const float4*)( streams + static_cast<size_t>( r ) * row_len );
+	const int row_len4 = row_len / 4;
+	float acc[PER];
+	#pragma unroll
+	for ( int i = 0; i < PER; ++i ) acc[i] = 0.0f;
+	// the thread's columns in passes of J: every load of a pass issued before any is used (clamped rows and columns: no branch on the loads)
+	constexpr int J = 2;
+	for ( int cb = c0 / 4 + t; cb < c1 / 4; cb += J * NUM_THREADS_A ) {
+		float4 sv[J], w[J][PER];
+		#pragma unroll
+		for ( int j = 0; j < J; ++j ) {
+			const int c = min( cb + j * NUM_THREADS_A, c1 / 4 - 1 );
+			sv[j] = s4[c];
+			#pragma unroll
+			for ( int i = 0; i < PER; ++i ) w[j][i] = ((const float4*) fn)[static_cast<size_t>( min( k0 + i, M - 1 ) ) * row_len4 + c];
+		}
+		#pragma unroll
+		for ( int j = 0; j < J; ++j ) {
+			if ( cb + j * NUM_THREADS_A >= c1 / 4 ) break;
+			#pragma unroll
+			for ( int i = 0; i < PER; ++i ) {
+				const int k = k0 + i;
+				if ( k == M ) {
+					acc[i] = fmaf( sv[j].x, sv[j].x, acc[i] );
+					acc[i] = fmaf( sv[j].y, sv[j].y, acc[i] );
+					acc[i] = fmaf( sv[j].z, sv[j].z, acc[i] );
+					acc[i] = fmaf( sv[j].w, sv[j].w, acc[i] );
+				}
+				else if ( k < M ) acc[i] += fmaf( sv[j].x, w[j][i].x, fmaf( sv[j].y, w[j][i].y, fmaf( sv[j].z, w[j][i].z, sv[j].w * w[j][i].w ) ) );
+			}
+		}
+	}
+	__shared__ float red[NUM_THREADS / 32][PER];
+	const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+	#pragma unroll
+	for ( int i = 0; i < PER; ++i ) {
+		float v = acc[i];
+		for ( int offset = 16; offset > 0; offset >>= 1 ) v += __shfl_down_sync( 0xffffffffu, v, offset );
+		if ( lane == 0 ) red[warp][i] = v;
+	}
+	__syncthreads();
+	if ( t < 32 ) {   // the group's first warp
+		float* out = g_mhc_partials + ( static_cast<size_t>( r ) * chunks + blockIdx.x ) * ( M + 1 );
+		for ( int i = lane; i < PER; i += 32 ) {
+			if ( k0 + i >= k1 ) break;
+			float v = 0.0f;
+			#pragma unroll
+			for ( int w = 0; w < NUM_THREADS_A / 32; ++w ) v += red[q * ( NUM_THREADS_A / 32 ) + w][i];
+			out[k0 + i] = v;
+		}
+	}
+}
+
 template <int H, int M_, typename FN_T>
 __global__ __launch_bounds__( NUM_THREADS_A )
 void hc_mix_partials_kernel(
@@ -473,9 +543,10 @@ void hc_finalize_norm_kernel(
 
 // The lagged form (DeepSeek-V4.1) in one launch: this sublayer's mixes as hc_collapse_norm_kernel computes them (post, comb, inv_rms, the mix
 // logits, the new pre into pre_buf; no collapsed row), while the sublayer input is the RMSNorm of the streams collapsed with the previous
-// sublayer's pre (pre_in), and post is then scaled by post_scale. The last block of a row runs the finalize and that norm with the per-thread
-// order and the reduction of DSV4::hc_collapse_norm's kernel (element d thread d % 256's, ascending), so the results are bit-identical to
-// HyperConnection::collapse + DSV4::hc_collapse_norm. The norm's row stays in registers: at most kLagPer x 256 values.
+// sublayer's pre (pre_in), and post is then scaled by post_scale. Grid (chunks + 1, rows): the chunk blocks' partials, the finalize on the last
+// of them to arrive, and in the extra block the norm, with the per-thread order and the reduction of DSV4::hc_collapse_norm's kernel (element d
+// thread d % 256's, ascending), so the results are bit-identical to HyperConnection::collapse + DSV4::hc_collapse_norm. The norm's row stays in
+// registers: at most kLagPer x 256 values.
 constexpr int kLagPer = 24;
 template <int H, int M_>
 __global__ __launch_bounds__( NUM_THREADS )
@@ -500,43 +571,46 @@ void hc_lagged_norm_kernel(
 	const float norm_eps,
 	const float post_scale
 ) {
+	// block x = chunks (the last of the row's): the input norm, which needs only pre_in, alongside the mixes
+	const int r = blockIdx.y, chunks = gridDim.x - 1;
+	if ( static_cast<int>( blockIdx.x ) == chunks ) {
+		const float p0 = pre_in[r * 4 + 0], p1 = pre_in[r * 4 + 1], p2 = pre_in[r * 4 + 2], p3 = pre_in[r * 4 + 3];
+		const float* s = streams + static_cast<size_t>( r ) * 4 * D;
+		float c[kLagPer], wv[kLagPer];
+		#pragma unroll
+		for ( int k = 0; k < kLagPer; ++k ) {
+			const int d = threadIdx.x + NUM_THREADS * k;
+			c[k] = d < D ? p0 * s[d] + p1 * s[D + d] + p2 * s[2 * D + d] + p3 * s[3 * D + d] : 0.0f;
+			wv[k] = d < D ? __half2float( norm_w[d] ) : 0.0f;
+		}
+		float ss = 0.0f;
+		#pragma unroll
+		for ( int k = 0; k < kLagPer; ++k ) if ( threadIdx.x + NUM_THREADS * k < D ) ss += c[k] * c[k];
+		__syncthreads();
+		ss = engine::math::block_sum<NUM_THREADS / 32>( ss );
+		const float inv = rsqrtf( ss / D + norm_eps );
+		#pragma unroll
+		for ( int k = 0; k < kLagPer; ++k ) {
+			const int d = threadIdx.x + NUM_THREADS * k;
+			if ( d < D ) norm_out[static_cast<size_t>( r ) * D + d] = __float2half_rn( c[k] * inv * wv[k] );
+		}
+		return;
+	}
 	__shared__ bool last;
-	const int r = blockIdx.y;
-	hc_mix_partials_body<H, M_, float>( streams, fn, H * D, chunk_cols );
+	hc_mix_partials_split_body<H, M_>( streams, fn, H * D, chunk_cols, chunks );
 	__syncthreads();
 	if ( threadIdx.x == 0 ) {
 		__threadfence();
 		const unsigned prev = atomicAdd( &g_mhc_arrivals[r], 1u );
-		last = prev == gridDim.x - 1;
+		last = prev == static_cast<unsigned>( chunks ) - 1;
 		if ( last ) g_mhc_arrivals[r] = 0;
 	}
 	__syncthreads();
 	if ( !last ) return;
 	__threadfence();
 	hc_mix_finalize_body<H, M_, false, true, false>( 0, 0, streams, base, scale, post, comb, nullptr, inv_rms_buf,
-		mix_logits_buf, pre_buf, D, gridDim.x, D, rms_eps, hc_eps, sinkhorn_iters );
+		mix_logits_buf, pre_buf, D, chunks, D, rms_eps, hc_eps, sinkhorn_iters );
 	__syncthreads();
-
-	const float p0 = pre_in[r * 4 + 0], p1 = pre_in[r * 4 + 1], p2 = pre_in[r * 4 + 2], p3 = pre_in[r * 4 + 3];
-	const float* s = streams + static_cast<size_t>( r ) * 4 * D;
-	float c[kLagPer], wv[kLagPer];
-	#pragma unroll
-	for ( int k = 0; k < kLagPer; ++k ) {
-		const int d = threadIdx.x + NUM_THREADS * k;
-		c[k] = d < D ? p0 * s[d] + p1 * s[D + d] + p2 * s[2 * D + d] + p3 * s[3 * D + d] : 0.0f;
-		wv[k] = d < D ? __half2float( norm_w[d] ) : 0.0f;
-	}
-	float ss = 0.0f;
-	#pragma unroll
-	for ( int k = 0; k < kLagPer; ++k ) if ( threadIdx.x + NUM_THREADS * k < D ) ss += c[k] * c[k];
-	__syncthreads();
-	ss = engine::math::block_sum<NUM_THREADS / 32>( ss );
-	const float inv = rsqrtf( ss / D + norm_eps );
-	#pragma unroll
-	for ( int k = 0; k < kLagPer; ++k ) {
-		const int d = threadIdx.x + NUM_THREADS * k;
-		if ( d < D ) norm_out[static_cast<size_t>( r ) * D + d] = __float2half_rn( c[k] * inv * wv[k] );
-	}
 	if ( threadIdx.x < H ) post[static_cast<size_t>( r ) * H + threadIdx.x] *= post_scale;
 }
 
@@ -818,7 +892,7 @@ bool HyperConnection::collapse_lagged_norm( const float* streams, const float* f
 	const int chunk_cols = ( ( row_len / chunksA + 4 * NUM_THREADS_A - 1 ) / ( 4 * NUM_THREADS_A ) ) * ( 4 * NUM_THREADS_A );
 	const int n_chunks_a = ( row_len + chunk_cols - 1 ) / chunk_cols;
 	if ( rows < 1 || rows > pod::MAX_BATCH || hidden_size > kLagPer * NUM_THREADS || n_chunks_a > chunksA ) return false;
-	hc_lagged_norm_kernel<4, 24><<<dim3( n_chunks_a, rows ), NUM_THREADS, 0, stream>>>( streams, fn, base, scale, pre_in, norm_weight, norm_out, post_out,
+	hc_lagged_norm_kernel<4, 24><<<dim3( n_chunks_a + 1, rows ), NUM_THREADS, 0, stream>>>( streams, fn, base, scale, pre_in, norm_weight, norm_out, post_out,
 		comb_out, inv_rms_buf, mix_logits_buf, pre_buf, hidden_size, chunk_cols, 1e-5f, eps, sinkhorn_iters, norm_eps, post_scale );
 	return true;
 }

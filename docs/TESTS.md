@@ -84,7 +84,7 @@ Not part of `gate.sh` (except `bench_decode`, `bench_accept` and `bench_prefill`
 | `bench_prefill` (`BENCH_GLM=1`, `BENCH_FLASH=1`; `[tokens] [chunk ...]`) | prefill tok/s for a synthetic prompt at several chunk sizes |
 | `bench_accept` | draft acceptance of speculative decoding on a spread of prompts (per-position candidates; `--nothink`; `--type <model> --model <dir> --draft <dir>` for another target and drafter) |
 | `bench_spec` | DFlash2 rounds against plain greedy decoding on the same prompts (output must be token-identical) |
-| `bench_mhc` | `HyperConnection::collapse_norm` per site for 1 to 8 rows (`SINK` sets the Sinkhorn iterations) |
+| `bench_mhc` | `HyperConnection::collapse_norm` per site for 1 to 8 rows (`SINK` sets the Sinkhorn iterations; `DS=1` DeepSeek-V4.1's lagged form, `collapse_lagged_norm`) |
 | `bench_router` (`GLM=1` for the sigmoid router, `DS=1` for DeepSeek-V4.1's) | router logits and top-k per layer over 48 cycled weight copies |
 | `bench_kda` | the KDA recurrent step (`GDN::recurrent_step_kda_rows`) per layer for 1 to 8 rows over cycled layer states; `BENCH_ITERS=1` for a profiler |
 | `bench_moe_prefill` | routed-MoE prefill time per `MoE::forward` on real GLM layer-3 experts (rank-0 partition), rows routed uniformly, at several chunk sizes |
