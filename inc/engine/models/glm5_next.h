@@ -21,6 +21,7 @@
 #include "engine/modules/linear.h"
 #include "engine/backend/types.h"
 #include <cstdint>
+#include <array>
 #include <vector>
 
 namespace engine::loader { class SafeTensorsRepo; }
@@ -281,7 +282,8 @@ private:
 	pod::KVPages kv_pages() const;
 	// expert_cache=auto, before the experts of a MoE layer: the experts per layer the arena can hold for this and the layers after it, from the
 	// bytes the layers loaded so far took, the checkpoint size of the layers still to come, the speculator and a margin
-	int auto_resident( const engine::loader::SafeTensorsRepo& repo, int layer, size_t layers_begin, size_t experts_cost, int layers_done, int experts, size_t slot_bytes, int moe_layers ) const;
+	int auto_resident( const engine::loader::SafeTensorsRepo& repo, int layer, size_t layers_begin, size_t experts_cost, int layers_done, int experts, size_t slot_bytes, int moe_layers,
+		const std::vector<std::array<size_t, 3>>* layer_bytes = nullptr ) const;
 	void kv_prepare( const pod::BatchRows& rows, backend::stream_t stream );   // pages for the rows' positions, table on the device
 	// One contiguous device range per page of the tokens [from, tokens) of a slot: fn( first token, tokens in the range )
 	template <typename F> void for_kv_ranges( int slot_id, int from, int tokens, F&& fn ) const;
