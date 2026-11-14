@@ -29,14 +29,16 @@ __global__ void rms_norm_kernel(
 	// Element i belongs to thread i % blockDim.x and is accumulated in ascending order, exactly as the plain loop
 	// did, so the result is bit-identical; but all of a thread's loads are issued before any is consumed (the row
 	// stays in registers for the second pass) instead of one dependent global load per step.
+	// The weights are loaded with the row, ahead of the reduction.
 	constexpr int kMaxPer = 24;
-	float v[kMaxPer];
+	float v[kMaxPer], w[kMaxPer];
 	const int per = ( hidden_size + static_cast<int>( blockDim.x ) - 1 ) / static_cast<int>( blockDim.x );
 	if ( per <= kMaxPer ) {
 		#pragma unroll
 		for ( int k = 0; k < kMaxPer; ++k ) {
 			const int i = tid + k * blockDim.x;
 			v[k] = ( i < hidden_size ) ? load_f( row_src + i ) : 0.0f;
+			w[k] = ( weight != nullptr && i < hidden_size ) ? ( __half2float( weight[i] ) + constant_bias ) : 1.0f;
 		}
 		#pragma unroll
 		for ( int k = 0; k < kMaxPer; ++k ) {
@@ -53,12 +55,6 @@ __global__ void rms_norm_kernel(
 	float inv_rms = rsqrtf( engine::math::block_sum<8>( local_sq ) / static_cast<float>( hidden_size ) + eps );
 
 	if ( per <= kMaxPer ) {
-		float w[kMaxPer];
-		#pragma unroll
-		for ( int k = 0; k < kMaxPer; ++k ) {
-			const int i = tid + k * blockDim.x;
-			w[k] = ( weight != nullptr && i < hidden_size ) ? ( __half2float( weight[i] ) + constant_bias ) : 1.0f;
-		}
 		#pragma unroll
 		for ( int k = 0; k < kMaxPer; ++k ) {
 			const int i = tid + k * blockDim.x;
