@@ -549,6 +549,16 @@ bool SafeTensorsRepo::open( const char* dir_path, bool mmproj ) {
 		}
 		std::sort( ggufs.begin(), ggufs.end() );
 		if ( ggufs.size() > 1 ) {
+			// a split model beside other GGUF files (DeepSeek-V4.1's shared Engram file, which a split's last part links to): its parts only
+			std::vector<std::string> parts;
+			for ( const std::string& f : ggufs ) {
+				int no = 0, count = 0;
+				const size_t at = f.rfind( "-of-" );
+				if ( at != std::string::npos && at >= 6 && std::sscanf( f.c_str() + at - 6, "-%5d-of-%5d.gguf", &no, &count ) == 2 && no >= 1 && no <= count ) parts.push_back( f );
+			}
+			if ( !parts.empty() && parts.size() < ggufs.size() ) ggufs = parts;
+		}
+		if ( ggufs.size() > 1 ) {
 			// the files of one split model (name-00001-of-0000N.gguf ... name-0000N-of-0000N.gguf), in order
 			bool split = static_cast<int>( ggufs.size() ) <= MAX_SHARDS;
 			for ( size_t i = 0; i < ggufs.size() && split; ++i ) {
@@ -1270,8 +1280,16 @@ pod::LinearWeight SafeTensorsRepo::load_linear_range(
 	pod::MemoryArena* code_arena
 ) {
 	char name_buf[512];
-	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
 	int shard = -1;
+	if ( const auto* gm = find( name_buf, &shard ); gm != nullptr && gm->dtype == pod::DType::GGUF ) {
+		// a GGUF weight [n, k]: output rows or input columns (whole blocks of the type) [begin16 * 16, (begin16 + count16) * 16)
+		ENGINE_ASSERT( slice_dim == 0 || slice_dim == 1, "load_linear_range: slice_dim is 0 (input) or 1 (output)" );
+		const int n = gm->shape[0], k = gm->shape[1];
+		if ( slice_dim == 1 ) return gguf_linear( shard, gm, arena, { { begin16 * 16, count16 * 16 } }, { { 0, k } }, 0, stream, code_arena );
+		return gguf_linear( shard, gm, arena, { { 0, n } }, { { begin16 * 16, count16 * 16 } }, 0, stream, code_arena );
+	}
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
 	const auto* meta = find( name_buf, &shard );
 	if ( !meta || shard < 0 || meta->ndim != 3 ) return pod::LinearWeight{};
 	const int BK = meta->shape[0], BN = meta->shape[1], B = meta->shape[2];

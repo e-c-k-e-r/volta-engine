@@ -32,6 +32,20 @@ bool gguf_linear_supported( GgmlType type ) { return gguf_cpu::supported( type )
 
 void LinearGguf::prepare() {}
 
+void LinearGguf::scale_blocks( void* w, GgmlType type, size_t bytes, float factor, backend::stream_t ) {
+	int off[2];
+	const int fields = ggml_scale_fields( type, off );
+	const GgmlBlock b = ggml_block( type );
+	ENGINE_ASSERT( fields > 0 && b.bytes > 0 && bytes % b.bytes == 0, "LinearGguf::scale_blocks: a block type without FP16 scale fields" );
+	uint8_t* p = static_cast<uint8_t*>( w );
+	for ( size_t at = 0; at < bytes; at += b.bytes ) {
+		for ( int f = 0; f < fields; ++f ) {
+			backend::half_t* h = reinterpret_cast<backend::half_t*>( p + at + off[f] );
+			*h = backend::from_float_half( backend::to_float( *h ) * factor );
+		}
+	}
+}
+
 void LinearGguf::dequant( const void* w, GgmlType type, int64_t elems, backend::half_t* out, backend::stream_t ) {
 	ENGINE_ASSERT( gguf_cpu::supported( type ), "LinearGguf::dequant: no CPU decoder for this block type" );
 	const GgmlBlock b = ggml_block( type );

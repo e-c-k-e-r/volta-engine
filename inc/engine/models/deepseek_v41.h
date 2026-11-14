@@ -80,6 +80,7 @@ struct DeepseekV41LayerWeights {
 	int idx_src = -1;         // the index-source layer whose selection this one uses
 	bool is_kv_source = false, is_index_source = false;
 	int engram = -1;          // engram slot (0, 1) or -1
+	bool gguf_experts = false;   // the routed experts are GGUF blocks (a GGUF conversion): their router weights carry the 1 / kOutScale the trellis downs hold
 	pod::TensorView attn_norm, ffn_norm, q_norm, kv_norm, sink;
 	pod::LinearWeight wq_a, wq_b, wkv, wo_b;
 	std::vector<pod::LinearWeight> wo_a;          // this rank's groups
@@ -328,6 +329,8 @@ private:
 	// engram: host hashing and row gathers, two device row buffers
 	struct EngramHost {
 		int vocab = 0, layers = 0, ngram = 0, heads = 0, pad = 0, dim = 256, block = 32;
+		bool iq4nl = false;                        // the tables are GGUF IQ4_NL blocks (a GGUF conversion), not FP8 rows with a block-scale table
+		size_t row_bytes = 256;                    // bytes of one table row
 		std::vector<int> token_map;
 		std::vector<int64_t> mult, primes, offsets;
 		const uint8_t* table[2] = {};

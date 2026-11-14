@@ -165,6 +165,7 @@ bool gguf_open( pod::SafeTensorsFile& st, const char* path, const pod::SafeTenso
 		else if ( s->arch_name == "glm5-next" ) have_arch = gguf_arch_glm5next( s->kv, &s->arch );
 		else if ( s->arch_name == "gemma4" ) have_arch = gguf_arch_gemma4( s->kv, &s->arch );
 		else if ( s->arch_name == "clip" ) have_arch = gguf_arch_clip( s->kv, &s->arch );
+		else if ( s->arch_name == "deepseek41" ) have_arch = gguf_arch_dsv41( s->kv, &s->arch );
 		if ( !have_arch ) {
 			LOG_ERROR( "[gguf] %s: architecture '%s' has no adapter\n", path, s->arch_name.c_str() );
 			safetensors_close( st );

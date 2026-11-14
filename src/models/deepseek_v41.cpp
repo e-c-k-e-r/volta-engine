@@ -9,6 +9,7 @@
 #include "engine/modules/swiglu.h"
 #include "engine/modules/embedding.h"
 #include "engine/modules/dsv4.h"
+#include "engine/modules/gguf.h"
 #include "engine/modules/trellis_bits.h"
 #include "engine/spec/dflash.h"
 #include "engine/spec/tap_ring.h"
@@ -236,6 +237,10 @@ pod::LinearWeight load_dense( engine::loader::SafeTensorsRepo& repo, const std::
 		return repo.load_linear( base.c_str(), arena, 4, stream );
 	}
 	if ( meta == nullptr || meta->ndim != 2 ) return {};
+	if ( meta->dtype == pod::DType::GGUF ) {
+		ENGINE_ASSERT( row0 == 0 && rows < 0 && col0 == 0 && cols < 0 && scale == 1.0f, "load_dense: windows are for FP8 tensors" );
+		return repo.load_linear( base.c_str(), arena, 4, stream );   // a GGUF conversion's block weight
+	}
 	const int n_all = meta->shape[0], k_all = meta->shape[1];
 	const int n = rows < 0 ? n_all : rows, k = cols < 0 ? k_all : cols;
 	const uint8_t* src = static_cast<const uint8_t*>( engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), meta ) );
@@ -675,13 +680,16 @@ bool DeepseekV41Pipeline::load_engram( const char* model_dir ) {
 		int sw = -1, ss = -1;
 		const auto* mw = repo_->find( ( pre + "weight" ).c_str(), &sw );
 		const auto* ms = repo_->find( ( pre + "scale" ).c_str(), &ss );
-		if ( mw == nullptr || ms == nullptr ) {
-			LOG_ERROR( "[deepseek_v41] Engram table %s not found: DeepSeek-V4.1-Flash shards 47 / 48 belong in the model directory\n", pre.c_str() );
+		// a GGUF conversion: IQ4_NL rows (a scale per 32 values inside the row), no scale table
+		eg_.iq4nl = mw != nullptr && mw->dtype == pod::DType::GGUF && mw->gguf_type == static_cast<uint32_t>( engine::modules::GgmlType::IQ4_NL );
+		if ( mw == nullptr || ( ms == nullptr && !eg_.iq4nl ) ) {
+			LOG_ERROR( "[deepseek_v41] Engram table %s not found: DeepSeek-V4.1-Flash shards 47 / 48 (or the GGUF Engram file, linked as the last part) belong in the model directory\n", pre.c_str() );
 			return false;
 		}
-		ENGINE_ASSERT( mw->shape[1] == eg_.dim && ms->shape[1] * eg_.block == eg_.dim, "Engram table shape" );
+		ENGINE_ASSERT( mw->shape[1] == eg_.dim && ( eg_.iq4nl || ms->shape[1] * eg_.block == eg_.dim ), "Engram table shape" );
+		eg_.row_bytes = eg_.iq4nl ? static_cast<size_t>( eg_.dim / 32 ) * 18 : static_cast<size_t>( eg_.dim );
 		eg_.table[e] = static_cast<const uint8_t*>( engine::loader::safetensors_get_data_cpu( *repo_->get_shard( sw ), mw ) );
-		eg_.scale[e] = static_cast<const uint8_t*>( engine::loader::safetensors_get_data_cpu( *repo_->get_shard( ss ), ms ) );
+		eg_.scale[e] = eg_.iq4nl ? nullptr : static_cast<const uint8_t*>( engine::loader::safetensors_get_data_cpu( *repo_->get_shard( ss ), ms ) );
 		// random 4 KB reads: the default readahead of a fault (128 KB and up) would read mostly unrelated rows
 		eg_.page = static_cast<size_t>( sysconf( _SC_PAGESIZE ) );
 		{
@@ -692,10 +700,12 @@ bool DeepseekV41Pipeline::load_engram( const char* model_dir ) {
 		// costs one random read instead of two
 		int fdw = -1, fds = -1;
 		size_t offw = 0, offs = 0, bytesw = 0, bytess = 0;
-		ENGINE_ASSERT( repo_->file_ref( ( pre + "weight" ).c_str(), &fdw, &offw, &bytesw ) && repo_->file_ref( ( pre + "scale" ).c_str(), &fds, &offs, &bytess ), "Engram table files" );
+		ENGINE_ASSERT( repo_->file_ref( ( pre + "weight" ).c_str(), &fdw, &offw, &bytesw ) && ( eg_.iq4nl || repo_->file_ref( ( pre + "scale" ).c_str(), &fds, &offs, &bytess ) ),
+			"Engram table files" );
 		eg_.fd[e] = fdw;
 		eg_.toff[e] = offw;
 		posix_fadvise( fdw, 0, 0, POSIX_FADV_RANDOM );
+		if ( eg_.iq4nl ) continue;
 		std::call_once( g_scale_once[e], [&]() {
 			g_scale_mem[e].resize( bytess );
 			for ( size_t at = 0; at < bytess; ) {
@@ -730,7 +740,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 	if ( rank_ == 0 ) {
 		int shard = -1;
 		const auto* meta = repo.find( "embed.weight", &shard );
-		need( meta != nullptr && meta->dtype == pod::DType::BF16, "embed.weight (BF16)" );
+		need( meta != nullptr && ( meta->dtype == pod::DType::BF16 || meta->dtype == pod::DType::GGUF ), "embed.weight (BF16 or GGUF)" );
 		if ( meta != nullptr ) {
 			const size_t bytes = static_cast<size_t>( config_.vocab_size ) * H * sizeof( uint16_t );
 			if ( g_embed_table.data == nullptr ) {
@@ -738,7 +748,8 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 				ENGINE_ASSERT( host != nullptr, "DeepseekV41Pipeline: pinned embedding allocation failed" );
 				g_embed_table = pod::make_tensor_2d( host, pod::DType::BF16, config_.vocab_size, H );
 			}
-			std::memcpy( g_embed_table.data, engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), meta ), bytes );
+			if ( meta->dtype == pod::DType::BF16 ) std::memcpy( g_embed_table.data, engine::loader::safetensors_get_data_cpu( *repo.get_shard( shard ), meta ), bytes );
+			else need( repo.copy_host_bf16( "embed.weight", static_cast<uint16_t*>( g_embed_table.data ), static_cast<size_t>( config_.vocab_size ) * H, stream ), "embed.weight (GGUF blocks)" );   // dequantized, rounded to BF16
 		}
 	}
 	embed_table_ = g_embed_table;
@@ -782,6 +793,15 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			}
 			const auto* meta = repo.find( ( name + ".weight" ).c_str() );
 			if ( meta == nullptr || meta->ndim != 2 ) return {};
+			if ( meta->dtype == pod::DType::GGUF ) {
+				// a GGUF conversion's block weight, the same slices; the output scale goes into the blocks' FP16 scales
+				pod::LinearWeight w = slice_dim < 0 ? repo.load_linear( name.c_str(), arena, bits, stream )
+					: begin >= 0 ? repo.load_linear_range( name.c_str(), arena, slice_dim, begin / 16, count / 16, stream )
+					: repo.load_linear_slice( name.c_str(), arena, bits, slice_dim, rank_, tp, stream );
+				if ( out_scale != 1.0f && w.is_valid() )
+					engine::modules::LinearGguf::scale_blocks( w.w0.data, static_cast<engine::modules::GgmlType>( w.gguf_type ), w.w0.size_bytes(), out_scale, stream );
+				return w;
+			}
 			const int n = meta->shape[0], k = meta->shape[1];
 			const int d = slice_dim == 1 ? n : k, b = begin >= 0 ? begin : rank_ * ( d / tp ), c = begin >= 0 ? count : d / tp;
 			if ( fp8_resident ) {
@@ -810,7 +830,8 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 				const auto* meta = repo.find( ( p + "attn.wo_a.weight" ).c_str() );
 				const int band = meta != nullptr ? meta->shape[0] / ( gl_ * tp ) : 0;
 				pod::LinearWeight w;
-				if ( meta != nullptr && fp8_resident ) w = load_fp8_resident( repo, p + "attn.wo_a", arena, ( rank_ * gl_ + g ) * band, band, 0, meta->shape[1], 0 );
+				if ( meta != nullptr && meta->dtype == pod::DType::GGUF ) w = repo.load_linear_range( ( p + "attn.wo_a" ).c_str(), arena, 1, ( rank_ * gl_ + g ) * band / 16, band / 16, stream );
+				else if ( meta != nullptr && fp8_resident ) w = load_fp8_resident( repo, p + "attn.wo_a", arena, ( rank_ * gl_ + g ) * band, band, 0, meta->shape[1], 0 );
 				if ( w.is_valid() ) fp8_scratch_elems_ = std::max<size_t>( fp8_scratch_elems_, static_cast<size_t>( w.w0.shape[0] ) * w.w0.shape[1] );
 				else if ( meta != nullptr ) w = load_dense( repo, p + "attn.wo_a", arena, stream, ( rank_ * gl_ + g ) * band, band, 0, meta->shape[1] );
 				lw.wo_a.push_back( w );
@@ -850,20 +871,33 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		// The shared expert is cut over the ranks in 128-wide spans (gate / up by output width, down by input width), each rank's partial output
 		// joining its routed experts' before the MoE all-reduce, instead of rank 0 running all of it while the others wait at that all-reduce. The
 		// spans split as expert 2's do (18 over 4 ranks: the two wider slices on ranks 2 and 3, rank 0 has the head and the sampling)
-		const bool sh_slice = runtime::options().shared_slice && tp > 1 && ring_ != nullptr && config_.intermediate_size % 128 == 0;
+		// (a GGUF conversion's K-quant blocks span 256 inputs of the down projection: 9 spans of 256 there)
+		const auto* sh_meta = repo.find( ( p + "ffn.shared_experts.w2.weight" ).c_str() );
+		const int span = sh_meta != nullptr && sh_meta->dtype == pod::DType::GGUF ? 256 : 128, spans = config_.intermediate_size / span;
+		const bool sh_slice = runtime::options().shared_slice && tp > 1 && ring_ != nullptr && config_.intermediate_size % span == 0 && spans >= tp;
 		if ( sh_slice || rank_ == 0 ) {
-			int s0 = 0, sn = config_.intermediate_size / 128;
-			if ( sh_slice ) expert_slice( 2, rank_, &s0, &sn );
+			int s0 = 0, sn = spans;
+			if ( sh_slice ) {
+				auto width = [&]( int r ) { return spans / tp + ( ( r - 2 + tp ) % tp < spans % tp ? 1 : 0 ); };
+				s0 = 0;
+				for ( int r = 0; r < rank_; ++r ) s0 += width( r );
+				sn = width( rank_ );
+			}
 			const int sd = sh_slice ? 1 : -1, si = sh_slice ? 0 : -1;
-			lw.sh_gate = lin( p + "ffn.shared_experts.w1", 4, sd, 1.0f, s0 * 128, sn * 128 );
-			lw.sh_up = lin( p + "ffn.shared_experts.w3", 4, sd, 1.0f, s0 * 128, sn * 128 );
-			lw.sh_down = lin( p + "ffn.shared_experts.w2", 4, si, 1.0f / kOutScale, s0 * 128, sn * 128 );
+			lw.sh_gate = lin( p + "ffn.shared_experts.w1", 4, sd, 1.0f, s0 * span, sn * span );
+			lw.sh_up = lin( p + "ffn.shared_experts.w3", 4, sd, 1.0f, s0 * span, sn * span );
+			lw.sh_down = lin( p + "ffn.shared_experts.w2", 4, si, 1.0f / kOutScale, s0 * span, sn * span );
 			need( lw.sh_gate.is_valid() && lw.sh_up.is_valid() && lw.sh_down.is_valid(), p + "shared expert" );
-			lw.sh_cols = sn * 128;
+			lw.sh_cols = sn * span;
 			need( lw.sh_gate.type != pod::QuantType::TRELLIS || static_cast<int>( lw.sh_gate.w2.numel() ) == lw.sh_cols, p + "shared expert width" );
 		}
 		if ( lw.engram >= 0 ) {
 			lw.e_wkv = load_dense( repo, p + "engram.wkv", arena, stream );
+			if ( repo.find( ( p + "engram.gate" ).c_str() ) ) {
+				lw.e_w = load_vec( repo, p + "engram.gate", arena, pod::DType::FP32 );   // a GGUF conversion stores q_weight * k_weight
+				need( lw.e_wkv.is_valid() && lw.e_w.data, p + "engram projection" );
+			}
+			else {
 			const pod::TensorView q = load_vec( repo, p + "engram.q_weight", arena, pod::DType::FP32 );
 			const pod::TensorView k = load_vec( repo, p + "engram.k_weight", arena, pod::DType::FP32 );
 			need( lw.e_wkv.is_valid() && q.data && k.data, p + "engram projection (shards 47 / 48)" );
@@ -874,6 +908,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 				for ( size_t i = 0; i < a.size(); ++i ) a[i] *= b[i];   // only ever used as a product
 				lw.e_w = q;
 				backend::memcpy_sync( lw.e_w.data, a.data(), a.size() * 4, backend::Copy::H2D );
+			}
 			}
 		}
 		lw.hc_attn_fn = load_vec( repo, p + "hc_attn_fn", arena, pod::DType::FP32 );
@@ -917,7 +952,11 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 	std::vector<std::vector<size_t>> expert_bytes( L, std::vector<size_t>( E, 0 ) );
 	for ( int l = 0; l < L; ++l ) {
 		const std::string p = "layers." + std::to_string( l ) + ".ffn.experts.";
-		for ( int e = 0; e < E; ++e ) {
+		// a GGUF conversion: every expert of a layer holds the same block types, whole experts on each rank
+		const auto* g0 = repo.find( ( p + "0.w1.weight" ).c_str() );
+		layers_[l].gguf_experts = g0 != nullptr && g0->dtype == pod::DType::GGUF;
+		ENGINE_ASSERT( !layers_[l].gguf_experts || !expert_tp_, "DeepseekV41Pipeline: GGUF experts are held whole on each rank (expert_shard off)" );
+		for ( int e = 0; e < E && !layers_[l].gguf_experts; ++e ) {
 			// the widths of the three projections (a pack may give each its own): gate | up << 4 | down << 8, which orders and groups the experts
 			int sig = 0, sh = 0;
 			for ( const char* w : { ".w1", ".w3", ".w2" } ) {
@@ -927,6 +966,9 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 				sh += 4;
 			}
 			bits[l][e] = sig;
+		}
+		if ( layers_[l].gguf_experts && moe_scratch_.gguf_ws == nullptr ) {
+			moe_scratch_.gguf_ws = engine::core::arena_alloc( arena, engine::modules::MoEGguf::scratch_bytes( config_.top_k, H, config_.intermediate_size ), 256 );
 		}
 		std::vector<std::vector<int>> per( tp );
 		if ( expert_tp_ ) {
@@ -1045,13 +1087,21 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			g.spans = spans_of( mine_[l][j] );
 			g.mw = std::make_unique<pod::MoELayerWeights>();
 			auto& mw = *g.mw;
-			mw.type = pod::QuantType::TRELLIS;
+			mw.type = lw.gguf_experts ? pod::QuantType::GGUF : pod::QuantType::TRELLIS;
 			mw.num_local_experts = g.count;
 			mw.top_k = config_.top_k;
 			for ( int i = 0; i < g.count; ++i ) {
 				const int e = mine_[l][j + i];
 				const std::string b = p + std::to_string( e );
 				pod::MemoryArena* codes = resident[e] ? nullptr : &host_arena_;
+				if ( lw.gguf_experts ) {
+					mw.gate[i] = repo.load_linear( ( b + ".w1" ).c_str(), arena, 4, stream, codes );
+					mw.up[i] = repo.load_linear( ( b + ".w3" ).c_str(), arena, 4, stream, codes );
+					mw.down[i] = repo.load_linear( ( b + ".w2" ).c_str(), arena, 4, stream, codes );
+					need( mw.gate[i].is_valid() && mw.up[i].is_valid() && mw.down[i].is_valid(), b );
+					if ( codes ) on_host += expert_bytes[l][e];
+					continue;
+				}
 				if ( expert_tp_ ) {
 					// w1 / w3: [hidden, intermediate], this rank's output columns; w2: [intermediate, hidden], its input rows
 					int s0 = 0, sn = 0;
@@ -1305,8 +1355,9 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 	auto advise = [this, &idx, pg, per, D, nb]() {
 		for ( size_t k = 0; k < idx.size(); ++k ) {
 			const int e = static_cast<int>( ( k / per ) % eg_.layers );
-			const uintptr_t w = reinterpret_cast<uintptr_t>( eg_.table[e] + static_cast<size_t>( idx[k] ) * D );
-			madvise( reinterpret_cast<void*>( w & ~( pg - 1 ) ), ( ( w + D - 1 ) & ~( pg - 1 ) ) - ( w & ~( pg - 1 ) ) + pg, MADV_WILLNEED );
+			const size_t rb = eg_.row_bytes;
+			const uintptr_t w = reinterpret_cast<uintptr_t>( eg_.table[e] + static_cast<size_t>( idx[k] ) * rb );
+			madvise( reinterpret_cast<void*>( w & ~( pg - 1 ) ), ( ( w + rb - 1 ) & ~( pg - 1 ) ) - ( w & ~( pg - 1 ) ) + pg, MADV_WILLNEED );
 		}
 	};
 	if ( phases == 3 ) advise();                       // one forward (decode, a short chunk): every rank requests its pages; a window reads its rows through engram_stage_start
@@ -1322,10 +1373,25 @@ void DeepseekV41Pipeline::engram_prepare( const pod::BatchRows& rows, backend::s
 			backend::half_t* dst = host_rows + ( static_cast<size_t>( e ) * pod::MAX_ROWS + r ) * cols;
 			for ( int c = 0; c < per; ++c ) {
 				const int64_t row = idx[( static_cast<size_t>( r ) * eg_.layers + e ) * per + c];
-				const uint8_t* w = stage ? stage->raw.data() + ( ( ( static_cast<size_t>( eg_.chunk_off[chunk] ) + r ) * eg_.layers + e ) * per + c ) * D
-				                         : eg_.table[e] + static_cast<size_t>( row ) * D;
-				const uint8_t* sc = eg_.scale[e] + static_cast<size_t>( row ) * nb;
+				const uint8_t* w = stage ? stage->raw.data() + ( ( ( static_cast<size_t>( eg_.chunk_off[chunk] ) + r ) * eg_.layers + e ) * per + c ) * eg_.row_bytes
+				                         : eg_.table[e] + static_cast<size_t>( row ) * eg_.row_bytes;
 				backend::half_t* o = dst + static_cast<size_t>( c ) * D;
+				if ( eg_.iq4nl ) {
+					// blocks of 32: an FP16 scale, then 16 bytes whose low nibbles are values 0..15 and high nibbles 16..31 (indices into the IQ4_NL grid)
+					static constexpr int8_t kGrid[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+					for ( int b = 0; b < D / 32; ++b ) {
+						const uint8_t* blk = w + static_cast<size_t>( b ) * 18;
+						backend::half_t dh;
+						std::memcpy( &dh, blk, sizeof( dh ) );
+						const float d = backend::to_float( dh );
+						for ( int j = 0; j < 16; ++j ) {
+							o[b * 32 + j] = backend::from_float_half( d * kGrid[blk[2 + j] & 15] );
+							o[b * 32 + 16 + j] = backend::from_float_half( d * kGrid[blk[2 + j] >> 4] );
+						}
+					}
+					continue;
+				}
+				const uint8_t* sc = eg_.scale[e] + static_cast<size_t>( row ) * nb;
 #if defined(__x86_64__)
 				if ( g_avx2 ) {
 					dequant_row_avx2( w, sc, nb, eg_.block, eg_.e4m3, reinterpret_cast<uint16_t*>( o ) );
@@ -1419,9 +1485,10 @@ void DeepseekV41Pipeline::engram_stage_start( const pod::BatchRows* chunks, int 
 	const int fds[2] = { eg_.fd[0], eg_.fd[1] };
 	const size_t offs[2] = { eg_.toff[0], eg_.toff[1] };
 	const cpu_set_t io = engram_io_cpus( config_.tp_size );
-	eg_.fetcher = std::thread( [todo, fds, offs, L, per, D, io]() {
+	const int row_bytes = static_cast<int>( eg_.row_bytes );
+	eg_.fetcher = std::thread( [todo, fds, offs, L, per, row_bytes, io]() {
 		if ( CPU_COUNT( &io ) > 0 ) pthread_setaffinity_np( pthread_self(), sizeof io, &io );   // the read threads it starts inherit this
-		for ( const auto& s : todo ) fetch_stage( s, fds, offs, L, per, D );
+		for ( const auto& s : todo ) fetch_stage( s, fds, offs, L, per, row_bytes );
 	} );
 }
 
@@ -1915,7 +1982,7 @@ void DeepseekV41Pipeline::ffn_front( DeepseekV41LayerWeights& lw, int m, backend
 		kOutScale, H, config_.norm_eps, m, stream );
 	pre_cur_ ^= 1;
 	DSV4::route( norm_x_.ptr<const backend::half_t>(), lw.router_w_t.ptr<const backend::half_t>(), lw.router_bias.ptr<const float>(), lw.router_bias_vl.data ? lw.router_bias_vl.ptr<const float>() : nullptr, experts > 0 ? nullptr : d_img_flag_, lw.perm, d_topk_idx_, d_topk_w_, route_scratch_,
-		H, experts > 0 ? experts : config_.num_experts, top_k > 0 ? top_k : config_.top_k, config_.route_scale, m, stream );
+		H, experts > 0 ? experts : config_.num_experts, top_k > 0 ? top_k : config_.top_k, config_.route_scale / ( experts == 0 && lw.gguf_experts ? kOutScale : 1.0f ), m, stream );
 }
 
 void DeepseekV41Pipeline::ffn_experts( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {

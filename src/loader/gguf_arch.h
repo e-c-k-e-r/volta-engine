@@ -60,6 +60,7 @@ bool gguf_arch_qwen4exp( const GgufKv& kv, GgufArch* out );
 bool gguf_arch_dflash( const GgufKv& kv, GgufArch* out );
 bool gguf_arch_glm5next( const GgufKv& kv, GgufArch* out );
 bool gguf_arch_gemma4( const GgufKv& kv, GgufArch* out );
-bool gguf_arch_clip( const GgufKv& kv, GgufArch* out );   // a vision projector (mmproj) file: Gemma 4's (projector type gemma4v)
+bool gguf_arch_clip( const GgufKv& kv, GgufArch* out );
+bool gguf_arch_dsv41( const GgufKv& kv, GgufArch* out );   // DeepSeek-V4.1-Flash (deepseek41)   // a vision projector (mmproj) file: Gemma 4's (projector type gemma4v)
 
 } // namespace engine::loader

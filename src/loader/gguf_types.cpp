@@ -34,6 +34,27 @@ GgmlBlock ggml_block( GgmlType type ) {
 	}
 }
 
+int ggml_scale_fields( GgmlType type, int* offsets ) {
+	// byte offsets of the FP16 fields a block's values are linear in (the vendored block_* layouts: d, and dmin / m where the type has one)
+	switch ( type ) {
+		case GgmlType::Q4_0: case GgmlType::Q5_0: case GgmlType::Q8_0: case GgmlType::IQ4_NL: case GgmlType::IQ4_XS:
+		case GgmlType::IQ2_XXS: case GgmlType::IQ2_XS: case GgmlType::IQ2_S: case GgmlType::IQ3_XXS: case GgmlType::IQ3_S: case GgmlType::IQ1_S:
+			offsets[0] = 0;
+			return 1;
+		case GgmlType::Q4_1: case GgmlType::Q5_1: case GgmlType::Q4_K: case GgmlType::Q5_K:
+			offsets[0] = 0;
+			offsets[1] = 2;
+			return 2;
+		case GgmlType::Q2_K:
+			offsets[0] = 80;
+			offsets[1] = 82;
+			return 2;
+		case GgmlType::Q3_K: offsets[0] = 108; return 1;
+		case GgmlType::Q6_K: offsets[0] = 208; return 1;
+		default: return 0;   // IQ1_M spreads its scale over the block's scale nibbles
+	}
+}
+
 const char* ggml_type_name( GgmlType type ) {
 	switch ( type ) {
 		case GgmlType::F32: return "F32";

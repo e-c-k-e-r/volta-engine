@@ -30,6 +30,8 @@ struct GgmlBlock {
 // Block geometry of a type (elems 0 for types this engine does not read)
 GgmlBlock ggml_block( GgmlType type );
 const char* ggml_type_name( GgmlType type );
+// The byte offsets in a block of the type's FP16 fields its values are proportional to (offsets holds 2): how many, 0 when there are none
+int ggml_scale_fields( GgmlType type, int* offsets );
 // The quantized types LinearGguf multiplies on the GPU
 bool gguf_linear_supported( GgmlType type );
 
@@ -47,6 +49,8 @@ struct LinearGguf {
 	static void prepare();
 	// out (FP16, `elems` values) = the blocks of w dequantized, in their stored order (elems a multiple of the block size)
 	static void dequant( const void* w, GgmlType type, int64_t elems, backend::half_t* out, backend::stream_t stream = nullptr );
+	// Multiplies the weight's values by a power of two in place (its blocks' FP16 scale fields): an output scale folded into a GGUF weight
+	static void scale_blocks( void* w, GgmlType type, size_t bytes, float factor, backend::stream_t stream = nullptr );
 };
 
 // GGUF routed experts (MoE::forward with QuantType::GGUF), route by route: the rows quantized to q8_1 once, each route's gate and up

@@ -715,6 +715,31 @@ bool mma_off() {
 
 } // namespace
 
+// One thread per block: its FP16 scale fields times the factor (a power of two: exact while the result stays normal)
+__global__ void scale_blocks_kernel( uint8_t* __restrict__ w, size_t blocks, int block_bytes, int off0, int off1, int fields, float factor ) {
+	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
+	if ( i >= blocks ) return;
+	uint8_t* blk = w + i * block_bytes;
+	half* d0 = reinterpret_cast<half*>( blk + off0 );
+	*d0 = __float2half_rn( __half2float( *d0 ) * factor );
+	if ( fields > 1 ) {
+		half* d1 = reinterpret_cast<half*>( blk + off1 );
+		*d1 = __float2half_rn( __half2float( *d1 ) * factor );
+	}
+}
+
+void LinearGguf::scale_blocks( void* w, GgmlType type, size_t bytes, float factor, backend::stream_t stream ) {
+	int off[2] = { 0, 0 };
+	const int fields = ggml_scale_fields( type, off );
+	const GgmlBlock b = ggml_block( type );
+	ENGINE_ASSERT( fields > 0 && b.bytes > 0 && bytes % b.bytes == 0, "LinearGguf::scale_blocks: a block type without FP16 scale fields" );
+	ENGINE_ASSERT( off[0] % 2 == 0 && off[1] % 2 == 0 && b.bytes % 2 == 0, "LinearGguf::scale_blocks: unaligned scale field" );
+	const size_t blocks = bytes / b.bytes;
+	if ( blocks == 0 ) return;
+	scale_blocks_kernel<<<static_cast<unsigned>( ( blocks + 255 ) / 256 ), 256, 0, stream>>>( static_cast<uint8_t*>( w ), blocks, b.bytes, off[0], off[1], fields, factor );
+	CUDA_CHECK( cudaGetLastError() );
+}
+
 void LinearGguf::prepare() {
 	q8_workspace( 1 );
 	tile_state();

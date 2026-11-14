@@ -109,7 +109,8 @@ public:
 	pod::LinearWeight synth_linear( const char* base_name, pod::MemoryArena& arena, backend::stream_t stream, pod::MemoryArena* code_arena = nullptr ) const;
 
 	// A range of a trellis linear [K / 16, N / 16, 16 * bits]: slice_dim 0 = input rows [begin16, begin16 + count16) (in 16-blocks, whole 128-wide
-	// Hadamard spans: its suh), slice_dim 1 = output columns (its svh); the other scale vector is loaded whole. The codes go to code_arena when given
+	// Hadamard spans: its suh), slice_dim 1 = output columns (its svh); the other scale vector is loaded whole. The codes go to code_arena when given.
+	// A GGUF weight takes the same range of its output rows or input columns (whole blocks of its type)
 	pod::LinearWeight load_linear_range(
 		const char* base_name,
 		pod::MemoryArena& arena,

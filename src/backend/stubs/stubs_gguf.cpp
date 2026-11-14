@@ -13,6 +13,11 @@ __attribute__(( weak )) void LinearGguf::dequant( const void*, GgmlType, int64_t
 	__builtin_unreachable();
 }
 
+__attribute__(( weak )) void LinearGguf::scale_blocks( void*, GgmlType, size_t, float, backend::stream_t ) {
+	ENGINE_UNSUPPORTED( "LinearGguf::scale_blocks" );
+	__builtin_unreachable();
+}
+
 __attribute__(( weak )) void LinearGguf::forward( const pod::TensorView&, const void*, GgmlType, int, int, pod::TensorView&, backend::stream_t, GgufColTiling ) {
 	ENGINE_UNSUPPORTED( "LinearGguf::forward" );
 	__builtin_unreachable();
