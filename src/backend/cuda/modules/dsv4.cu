@@ -796,7 +796,7 @@ __global__ void concat_groups_kernel( const half* __restrict__ in, half* __restr
 
 // ---- routing: partial logits over hidden slices (lane = expert, so the [hidden, E] weight reads coalesce), then one block per row selects -----
 
-constexpr int ROUTE_SPLITS = 4;
+constexpr int ROUTE_SPLITS = DSV4::ROUTE_SPLITS;   // 16: 192 blocks of short slices for one row (4 left a long dependent loop on 48)
 
 // grid (rows, experts / 32, ROUTE_SPLITS), 256 threads: warp w sums its share of the block's hidden slice for 32 experts
 __global__ __launch_bounds__( 256 )
@@ -807,6 +807,7 @@ void route_partial_kernel( const half* __restrict__ x, const half* __restrict__ 
 	const half* xr = x + static_cast<size_t>( r ) * hidden;
 	float acc = 0.0f;
 	if ( e < experts ) {
+		#pragma unroll 8
 		for ( int d = d0; d < d0 + per_warp; ++d ) acc = fmaf( __half2float( xr[d] ), __half2float( w_t[static_cast<size_t>( d ) * experts + e] ), acc );
 	}
 	__shared__ float red[8][32];
@@ -820,12 +821,17 @@ void route_partial_kernel( const half* __restrict__ x, const half* __restrict__ 
 	}
 }
 
+// One block per row, a thread per expert: the scores, then the top_k by rank without sequential rounds (moe.cu's router_select_kernel): every warp
+// ranks its 32 biased scores against each other (larger, or equal with the lower index, ranks first), its top_k go to a candidate list, and
+// the candidates are ranked against each other; the weights are the chosen experts' unbiased scores over their sum
 __global__ __launch_bounds__( 512 )
 void route_select_kernel( const float* __restrict__ part, const float* __restrict__ bias, const float* __restrict__ bias_vl, const uint8_t* __restrict__ img_flags, const int* __restrict__ perm, int* __restrict__ idx_out, half* __restrict__ w_out,
 	int experts, int top_k, float scale ) {
-	__shared__ float sel_v[512];
-	__shared__ int sel_i[512];
-	const int r = blockIdx.x, e = threadIdx.x;
+	__shared__ float s_raw[512];
+	__shared__ float c_val[16 * 16];
+	__shared__ int c_idx[16 * 16];
+	__shared__ int chosen[16];
+	const int r = blockIdx.x, e = threadIdx.x, lane = e & 31, warp = e >> 5;
 	float s = 0.0f, b = -FLT_MAX;
 	if ( e < experts ) {
 		float acc = 0.0f;
@@ -834,30 +840,35 @@ void route_select_kernel( const float* __restrict__ part, const float* __restric
 		const float sp = acc > 20.0f ? acc : log1pf( expf( acc ) );
 		s = sqrtf( sp );
 		b = s + ( ( img_flags != nullptr && bias_vl != nullptr && img_flags[r] ) ? bias_vl[e] : bias[e] );
+		b = b != b ? -FLT_MAX : b;
 	}
-	__shared__ int chosen[16];
-	__shared__ float chosen_s[16];
-	for ( int k = 0; k < top_k; ++k ) {
-		sel_v[e] = b;
-		sel_i[e] = e;
-		__syncthreads();
-		for ( int st = blockDim.x / 2; st > 0; st >>= 1 ) {
-			if ( e < st ) {
-				const float o = sel_v[e + st];
-				const int oi = sel_i[e + st];
-				if ( o > sel_v[e] || ( o == sel_v[e] && oi < sel_i[e] ) ) { sel_v[e] = o; sel_i[e] = oi; }
-			}
-			__syncthreads();
+	s_raw[e] = s;
+	for ( int c = e; c < 16 * 16; c += blockDim.x ) { c_val[c] = -INFINITY; c_idx[c] = 0x7fffffff; }
+	__syncthreads();
+	{
+		int rank = 0;
+		#pragma unroll
+		for ( int jj = 0; jj < 32; ++jj ) {
+			const float u = __shfl_sync( 0xffffffff, b, jj );
+			rank += ( u > b ) || ( u == b && jj < lane );
 		}
-		if ( e == sel_i[0] ) { chosen[k] = e; chosen_s[k] = s; b = -FLT_MAX; }
-		__syncthreads();
+		if ( rank < top_k && e < experts ) { c_val[warp * 16 + rank] = b; c_idx[warp * 16 + rank] = e; }
 	}
+	__syncthreads();
+	if ( e < 16 * 16 ) {
+		const float v = c_val[e];
+		const int vi = c_idx[e];
+		int rank = 0;
+		for ( int c = 0; c < 16 * 16; ++c ) rank += ( c_val[c] > v ) || ( c_val[c] == v && c_idx[c] < vi );
+		if ( rank < top_k && vi != 0x7fffffff ) chosen[rank] = vi;
+	}
+	__syncthreads();
 	if ( e == 0 ) {
 		float sum = 0.0f;
-		for ( int k = 0; k < top_k; ++k ) sum += chosen_s[k];
+		for ( int k = 0; k < top_k; ++k ) sum += s_raw[chosen[k]];
 		for ( int k = 0; k < top_k; ++k ) {
 			idx_out[r * top_k + k] = perm ? perm[chosen[k]] : chosen[k];
-			w_out[r * top_k + k] = __float2half_rn( chosen_s[k] / ( sum + 1e-20f ) * scale );
+			w_out[r * top_k + k] = __float2half_rn( s_raw[chosen[k]] / ( sum + 1e-20f ) * scale );
 		}
 	}
 }
@@ -1012,7 +1023,7 @@ void DSV4::concat_groups( const half* in, half* out, int groups, int n, int rows
 
 void DSV4::route( const half* x, const half* w_t, const float* bias, const float* bias_vl, const uint8_t* img_flags, const int* perm, int* idx_out, half* w_out, float* scratch, int hidden, int experts, int top_k,
 	float scale, int rows, cudaStream_t stream ) {
-	ENGINE_ASSERT( experts <= 512 && top_k <= 16 && hidden % ( ROUTE_SPLITS * 8 ) == 0, "DSV4::route: at most 512 experts, top 16, hidden a multiple of 32" );
+	ENGINE_ASSERT( experts <= 512 && top_k <= 16 && hidden % ( ROUTE_SPLITS * 8 ) == 0, "DSV4::route: at most 512 experts, top 16, hidden a multiple of 128" );
 	route_partial_kernel<<<dim3( rows, ( experts + 31 ) / 32, ROUTE_SPLITS ), 256, 0, stream>>>( x, w_t, scratch, hidden, experts );
 	route_select_kernel<<<rows, 512, 0, stream>>>( scratch, bias, bias_vl, img_flags, perm, idx_out, w_out, experts, top_k, scale );
 }

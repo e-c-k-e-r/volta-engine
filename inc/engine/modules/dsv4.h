@@ -90,7 +90,8 @@ struct DSV4 {
 	// w_t [hidden, E]; the chosen ids are written through perm (checkpoint id -> engine id). scratch: route_scratch_floats( rows, experts )
 	static void route( const backend::half_t* x, const backend::half_t* w_t, const float* bias, const float* bias_vl, const uint8_t* img_flags, const int* perm, int* idx_out, backend::half_t* w_out,
 		float* scratch, int hidden, int experts, int top_k, float scale, int rows, backend::stream_t stream );
-	static constexpr size_t route_scratch_floats( int rows, int experts ) { return static_cast<size_t>( rows ) * 4 * experts; }
+	static constexpr int ROUTE_SPLITS = 16;   // hidden slices of the partial logits
+	static constexpr size_t route_scratch_floats( int rows, int experts ) { return static_cast<size_t>( rows ) * ROUTE_SPLITS * experts; }
 
 	// Hyper-connection input with the lagged pre-mix: out = rmsnorm(sum_h pre[h] streams[h]) * norm_w (the sum in FP32, it exceeds FP16),
 	// and post[row][h] *= post_scale (the sublayer output is stored scaled down by that factor)
