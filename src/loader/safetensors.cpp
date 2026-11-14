@@ -1340,7 +1340,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_range(
 	const bool has_mul1 = find( name_buf, &dummy ) != nullptr;
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.mcg", base_name );
 	const bool has_mcg = find( name_buf, &dummy ) != nullptr;
-	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, B / 16, has_mul1, has_mcg ) );
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, engine::modules::trellis_code_from_u16( B ), has_mul1, has_mcg ) );   // the width code (half-integer rates too)
 }
 
 pod::LinearWeight SafeTensorsRepo::load_linear_slice_padded(
