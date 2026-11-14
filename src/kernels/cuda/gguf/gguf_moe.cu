@@ -188,7 +188,17 @@ constexpr int kTileRoutes = 16;         // routes of an item
 constexpr int kTileN = 32;              // output rows of a block: 26 KB of shared memory, three blocks an SM
 constexpr int kTileThreads = 256;       // 8 warps: the decode needs them to hide its loads
 constexpr int kTileLd = 256 + 16;       // halves per shared-memory row: one block of 256 inputs, padded to keep the WMMA rows 32-byte aligned
-constexpr size_t kTileSmem = static_cast<size_t>( kTileN + kTileRoutes ) * kTileLd * sizeof( half );
+
+// The block struct of a tile type (its bytes are staged in shared memory before the decode)
+template <GgmlType T> struct TileBlk;
+#define TILE_BLK( T, B ) template <> struct TileBlk<GgmlType::T> { using type = B; };
+TILE_BLK( IQ1_S, block_iq1_s ) TILE_BLK( IQ1_M, block_iq1_m ) TILE_BLK( IQ2_XXS, block_iq2_xxs ) TILE_BLK( IQ2_XS, block_iq2_xs ) TILE_BLK( IQ2_S, block_iq2_s )
+TILE_BLK( IQ3_XXS, block_iq3_xxs ) TILE_BLK( IQ3_S, block_iq3_s ) TILE_BLK( IQ4_XS, block_iq4_xs ) TILE_BLK( Q2_K, block_q2_K ) TILE_BLK( Q3_K, block_q3_K )
+TILE_BLK( Q4_K, block_q4_K ) TILE_BLK( Q5_K, block_q5_K ) TILE_BLK( Q6_K, block_q6_K )
+#undef TILE_BLK
+// bytes of a staged block in shared memory (its size rounded to 16), and the kernel's shared memory: the decoded tile, the routes' inputs and two steps of raw blocks
+template <GgmlType T> constexpr int tile_raw_ld() { return ( static_cast<int>( sizeof( typename TileBlk<T>::type ) ) + 15 ) / 16 * 16; }
+template <GgmlType T> constexpr size_t tile_smem() { return static_cast<size_t>( kTileN + kTileRoutes ) * kTileLd * sizeof( half ) + 2 * kTileN * tile_raw_ld<T>(); }
 
 // Eight values of an IQ block (sub-block ib of 8, eighth il of 4), as llama.cpp's dequantizers compute them
 template <GgmlType T>
@@ -292,27 +302,50 @@ __global__ __launch_bounds__( kTileThreads, 3 )
 void moe_tile_kernel( const void* const* __restrict__ ptrs, const Item* __restrict__ items, const int* __restrict__ n_items, const int* __restrict__ sorted,
 	const half* __restrict__ in, bool per_token, int k, int n, const half* __restrict__ topw, int top_k, float* __restrict__ out32, half* __restrict__ out16 ) {
 	using namespace nvcuda;
+	using Blk = typename TileBlk<T>::type;
+	constexpr int kTileRawLd = tile_raw_ld<T>();
+	static_assert( sizeof( Blk ) % 2 == 0, "blocks are whole 16-bit words" );
+	constexpr int RU = sizeof( Blk ) / 2, UNITS = kTileN * RU, PER = ( UNITS + kTileThreads - 1 ) / kTileThreads;   // 16-bit words of the tile's blocks
 	if ( static_cast<int>( blockIdx.y ) >= *n_items ) return;
 	extern __shared__ __align__( 32 ) unsigned char tile_smem[];
-	half* sW = reinterpret_cast<half*>( tile_smem );   // [kTileN][kTileLd]
-	half* sX = sW + kTileN * kTileLd;                  // [kTileRoutes][kTileLd]
+	half* sW = reinterpret_cast<half*>( tile_smem );                       // [kTileN][kTileLd]
+	half* sX = sW + kTileN * kTileLd;                                      // [kTileRoutes][kTileLd]
+	unsigned char* sR = reinterpret_cast<unsigned char*>( sX + kTileRoutes * kTileLd );   // [2][kTileN][kTileRawLd]: the raw blocks of this and the next step
 	__shared__ int s_route[kTileRoutes];
 	const Item it = items[blockIdx.y];
 	const int row0 = blockIdx.x * kTileN, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
 	if ( threadIdx.x < kTileRoutes ) s_route[threadIdx.x] = threadIdx.x < it.count ? sorted[it.begin + threadIdx.x] : -1;
-	__syncthreads();
-	const void* w = ptrs[it.expert];
+	const uint16_t* w = static_cast<const uint16_t*>( ptrs[it.expert] );
 	const int bpr = k / 256;
+	// the raw words of step kb's blocks (rows past n read as zero blocks: they decode to zeros), fetched a step ahead into registers
+	uint16_t rr[PER];
+	auto fetch = [&]( int kb ) {
+		#pragma unroll
+		for ( int p = 0; p < PER; ++p ) {
+			const int u = threadIdx.x + p * kTileThreads, row = u / RU, j = u % RU, gr = row0 + row;
+			rr[p] = u < UNITS && gr < n ? w[( static_cast<size_t>( gr ) * bpr + kb ) * RU + j] : 0;
+		}
+	};
+	auto stash = [&]( int buf ) {
+		#pragma unroll
+		for ( int p = 0; p < PER; ++p ) {
+			const int u = threadIdx.x + p * kTileThreads;
+			if ( u < UNITS ) reinterpret_cast<uint16_t*>( sR + ( buf * kTileN + u / RU ) * kTileRawLd )[u % RU] = rr[p];
+		}
+	};
+	fetch( 0 );
+	stash( 0 );
+	__syncthreads();
 	const int wn = ( warp & 1 ) * 16, kh = ( warp >> 1 ) * 64;   // the warp's rows and quarter of the inputs
 	wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
 	wmma::fill_fragment( acc, 0.0f );
 	for ( int kb = 0; kb < bpr; ++kb ) {
+		if ( kb + 1 < bpr ) fetch( kb + 1 );   // in flight while this step decodes and multiplies
+		const unsigned char* raw = sR + ( kb & 1 ) * kTileN * kTileRawLd;
 		#pragma unroll
 		for ( int i = 0; i < kTileN / 8; ++i ) {
-			const int r = warp * ( kTileN / 8 ) + i, gr = row0 + r;
-			half* y = sW + r * kTileLd;
-			if ( gr < n ) tile_dequant<T>( w, static_cast<int64_t>( gr ) * bpr + kb, y, lane );
-			else for ( int c = lane; c < 256; c += 32 ) y[c] = __float2half( 0.0f );
+			const int r = warp * ( kTileN / 8 ) + i;
+			tile_dequant<T>( raw + r * kTileRawLd, 0, sW + r * kTileLd, lane );
 		}
 		for ( int v = threadIdx.x; v < kTileRoutes * 32; v += kTileThreads ) {
 			const int j = v >> 5, c = v & 31, r = s_route[j];
@@ -329,6 +362,7 @@ void moe_tile_kernel( const void* const* __restrict__ ptrs, const Item* __restri
 			wmma::load_matrix_sync( b, sW + wn * kTileLd + kh + kk, kTileLd );
 			wmma::mma_sync( acc, a, b, acc );
 		}
+		if ( kb + 1 < bpr ) stash( ( kb + 1 ) & 1 );
 		__syncthreads();
 	}
 	// the four input quarters' pieces through shared memory, summed in order, to the routes' rows
@@ -353,10 +387,10 @@ void launch_tile( const void* const* ptrs, const Item* items, const int* n_items
 	int dev = 0;
 	cudaGetDevice( &dev );
 	if ( !attr[dev] ) {
-		CUDA_CHECK( cudaFuncSetAttribute( moe_tile_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( kTileSmem ) ) );
+		CUDA_CHECK( cudaFuncSetAttribute( moe_tile_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( tile_smem<T>() ) ) );
 		attr[dev] = true;
 	}
-	moe_tile_kernel<T><<<dim3( ( n + kTileN - 1 ) / kTileN, max_n ), kTileThreads, kTileSmem, stream>>>( ptrs, items, n_items, sorted, in, per_token, k, n, topw, top_k, out32, out16 );
+	moe_tile_kernel<T><<<dim3( ( n + kTileN - 1 ) / kTileN, max_n ), kTileThreads, tile_smem<T>(), stream>>>( ptrs, items, n_items, sorted, in, per_token, k, n, topw, top_k, out32, out16 );
 }
 
 void tile_proj( GgmlType type, const void* const* ptrs, const Item* items, const int* n_items, const int* sorted, int max_n, const half* in, bool per_token, int k,
