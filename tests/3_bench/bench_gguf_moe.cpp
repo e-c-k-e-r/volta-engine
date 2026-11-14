@@ -1,7 +1,10 @@
 // GGUF routed experts (MoEGguf::forward) at decode / verify row counts: time per layer over distinct expert sets (cold L2) in graph replay,
 // and the GB/s of the blocks of the experts the routes touch. Routes are uniform over the global experts (fixed seed); this rank holds the
-// first `local` of them. The block bytes are a constant pattern (timing only: the values are not meaningful).
+// first `local` of them. The block bytes are a constant pattern, or pseudo-random with BENCH_RANDOM=1 (the IQ grids' lookups then miss as
+// real weights do; timing only either way: the values are not meaningful). BENCH_ROWS=a,b,... sets the row counts (prefill: the tile path
+// above 64 rows).
 //   bench_gguf_moe [TYPE] [hidden inter global local top_k]   default Q2_K 4096 2048 288 72 8 (GLM-5.3-Flash, expert-parallel at TP=4)
+//   DeepSeek-V4.1 IQ1_M build: bench_gguf_moe IQ1_S 5120 2304 384 96 6
 #include "engine/config.h"
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
@@ -41,6 +44,18 @@ int main( int argc, char** argv ) {
 	const int SETS = std::max( 2, std::min( 16, static_cast<int>( 2.5e9 / static_cast<double>( set_bytes ) ) ) );
 	pod::MemoryArena arena;
 	ENGINE_ASSERT( engine::core::arena_create( arena, 0, static_cast<size_t>( SETS ) * set_bytes + ( 512ULL << 20 ) ), "arena" );
+	// pseudo-random block bytes with FP16 scale fields kept finite (one buffer, copied to every expert)
+	std::vector<uint8_t> random_bytes;
+	if ( const char* r = std::getenv( "BENCH_RANDOM" ); r != nullptr && std::atoi( r ) != 0 ) {
+		random_bytes.resize( std::max( up_bytes, down_bytes ) );
+		uint64_t st = 0x9e3779b97f4a7c15ull;
+		for ( auto& b : random_bytes ) { st = st * 6364136223846793005ull + 1442695040888963407ull; b = static_cast<uint8_t>( st >> 56 ); }
+		int off[2];
+		const int fields = engine::modules::ggml_scale_fields( type, off );
+		for ( size_t at = 0; at + blk.bytes <= random_bytes.size(); at += blk.bytes ) {
+			for ( int f = 0; f < fields; ++f ) { random_bytes[at + off[f]] = 0x00; random_bytes[at + off[f] + 1] = 0x20; }   // 2^-7
+		}
+	}
 	// per set: the gate, up and down pointer arrays
 	std::vector<void*> tables( SETS );
 	for ( int s = 0; s < SETS; ++s ) {
@@ -49,7 +64,8 @@ int main( int argc, char** argv ) {
 			for ( int e = 0; e < local; ++e ) {
 				const size_t b = p < 2 ? up_bytes : down_bytes;
 				void* d = engine::core::arena_alloc( arena, b, 256 );
-				CUDA_CHECK( cudaMemsetAsync( d, 0x11, b, stream ) );
+				if ( random_bytes.empty() ) CUDA_CHECK( cudaMemsetAsync( d, 0x11, b, stream ) );
+				else CUDA_CHECK( cudaMemcpy( d, random_bytes.data(), b, cudaMemcpyHostToDevice ) );
 				ptrs[p * local + e] = d;
 			}
 		}
@@ -62,7 +78,16 @@ int main( int argc, char** argv ) {
 	CUDA_CHECK( cudaEventCreate( &e1 ) );
 	std::mt19937 rng( 1 );
 	std::printf( "%s hidden %d inter %d, %d of %d experts local, top %d, %d sets\n", engine::modules::ggml_type_name( type ), hidden, inter, local, global, top_k, SETS );
-	for ( int m : { 1, 2, 4, 8, 16 } ) {
+	std::vector<int> row_counts = { 1, 2, 4, 8, 16 };
+	if ( const char* r = std::getenv( "BENCH_ROWS" ) ) {
+		row_counts.clear();
+		for ( const char* q = r; *q; ) {
+			row_counts.push_back( std::atoi( q ) );
+			while ( *q && *q != ',' ) ++q;
+			if ( *q == ',' ) ++q;
+		}
+	}
+	for ( int m : row_counts ) {
 		// distinct experts per row; the local ones the routes touch, for the bytes read
 		std::vector<int> topk( static_cast<size_t>( m ) * top_k );
 		std::set<int> hit;
@@ -114,7 +139,7 @@ int main( int argc, char** argv ) {
 		float ms = 0.0f;
 		CUDA_CHECK( cudaEventElapsedTime( &ms, e0, e1 ) );
 		const double us = 1000.0 * ms / iters / SETS, read = static_cast<double>( hit.size() ) * ( 2 * up_bytes + down_bytes );
-		std::printf( "  rows %2d: %3zu local experts hit, %8.2f us per layer, %6.1f GB/s of their blocks\n", m, hit.size(), us, read / us / 1e3 );
+		std::printf( "  rows %4d: %3zu local experts hit, %9.2f us per layer, %6.1f GB/s of their blocks\n", m, hit.size(), us, read / us / 1e3 );
 		CUDA_CHECK( cudaGraphExecDestroy( ex ) );
 		CUDA_CHECK( cudaGraphDestroy( g ) );
 	}
