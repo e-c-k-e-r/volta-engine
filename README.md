@@ -37,7 +37,7 @@ Most inference engines treat Volta (SM_70) as a second class citizen and fall ba
 
 ### Metrics
 
-Decode speed of one request through the streaming API on 4x V100-SXM2-32GB at 250 W, every expert on the GPUs (DeepSeek: 99%, 92% with its drafter), greedy, thinking off. Agent turns are replayed from a recorded Claude Code session (13-20K-token prompts); math and code are GSM8K and MBPP problems. Each model's best speculator for the kind of text:
+Decode speed of one request through the streaming API on 4x V100-SXM2-32GB at 250 W, every expert on the GPUs (DeepSeek: 91% with its drafter), greedy, thinking off. Agent turns are replayed from a recorded Claude Code session (13-20K-token prompts); math and code are GSM8K and MBPP problems. Each model's best speculator for the kind of text:
 
 | Model | Weights | Agent turns, tok/s | Math / code, tok/s |
 |---|---|---|---|
@@ -46,7 +46,7 @@ Decode speed of one request through the streaming API on 4x V100-SXM2-32GB at 25
 | Qwen3.8-Flash-Next | NVFP4 | 165 (MTP) | 267 / 266 (MTP / DFlash2) |
 | Qwen3.8-Flash-Next | EXL3 4.0 bpw, Volta order | 133 (MTP) | 197 / 184 (DFlash2) |
 | GLM-5.3-Flash | EXL3 3.05 bpw, Volta order | 85 (MTP) | 149 / 141 (DFlash2) |
-| DeepSeek-V4.1-Flash | EXL3 1.68 bpw | | 74 / 73 (DSpark) |
+| DeepSeek-V4.1-Flash | GGUF IQ1_M | | 89 / 89 (DSpark) |
 
 Which speculator wins depends on the text: the checkpoint's MTP head on agent turns, which copy much of their input, and the DFlash2 drafter on math and code. Every configuration measured (GGUF, both EXL3 tile orders, each speculator and MTP depth), step latency, prefill and the method are in [docs/PERFORMANCE.md](/docs/PERFORMANCE.md); perplexity per configuration and the EXL3 bit widths are in [docs/QUANTIZATION.md](/docs/QUANTIZATION.md).
 

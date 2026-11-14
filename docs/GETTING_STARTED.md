@@ -143,11 +143,13 @@ Qwen extras:
   `nvfp4_dense=kda,mla,idx,head,dense,shared` (experts stay EXL3: the NVFP4 experts do not fit in VRAM and the offload penalty rules them out). Calibration: run
   `ENGINE_HESSIAN_DIR=<dir> test_ppl --flash|--glm --calibrate --file <text>` (GLM: `ENGINE_HESSIAN_LAYERS=lo-hi`, a third of the layers per pass) and then
   `nvfp4_ldlq.py --model flash|glm`. Speed figures there are indicative (150 W cap, single runs).
-* **GGUF weights** (Qwen3.8-27B, llama.cpp's `qwen35` architecture, Qwen3.8-Flash-Next, `qwen4exp`, GLM-5.3-Flash, `glm5-next`, and Gemma 4, `gemma4`; block types Q4_0 to Q8_0, Q2_0, Q2_K to
+* **GGUF weights** (Qwen3.8-27B, llama.cpp's `qwen35` architecture, Qwen3.8-Flash-Next, `qwen4exp`, GLM-5.3-Flash, `glm5-next`, DeepSeek-V4.1-Flash, `deepseek41`, and Gemma 4, `gemma4`; block types Q4_0 to Q8_0, Q2_0, Q2_K to
   Q6_K and IQ1_S to IQ4_XS): a model directory holding the `.gguf` file, or every file of a split one (`-00001-of-0000N.gguf` ...), plus the
   original `config.json`, tokenizer files and chat template loads like a safetensors one. Projections keep their blocks (llama.cpp's integer
   dot products up to 8 rows, a tensor-core kernel decoding each block once for 9 to 16 rows, a dequantized FP16 GEMM for prefill chunks);
-  the routed experts of Flash-Next and GLM run route by route on the same dot products and take part in the expert tier (`expert_cache`); Flash-Next's n-gram
+  the routed experts of Flash-Next, GLM and DeepSeek run route by route on the same dot products in decode and verify blocks, and prefill chunks of
+  more than 64 rows decode each expert's weight tiles to FP16 once per 256 rows and multiply all of its routes on the tensor cores (K-quant and
+  IQ types); they take part in the expert tier (`expert_cache`); Flash-Next's n-gram
   table stays memory-mapped and is decoded row by row on the host; norms, embeddings and other small tensors are dequantized once at load.
   The 27B's MTP head is read from its GGUF file, and a DFlash2 drafter directory may hold a GGUF conversion (llama.cpp's `dflash`
   architecture) with the release's `config.json`; the vision projector (`mmproj`) is read for Gemma 4 only, and the MTP blocks of Flash-Next and GLM are not read.
@@ -161,7 +163,10 @@ Qwen extras:
   tables in `ngram_embedding.safetensors`, which the loader opens next to the shards; the other repositories do not carry them, so
   `model-00047-of-00048.safetensors` and `model-00048-of-00048.safetensors` of `deepseek-ai/DeepSeek-V4.1-Flash-1017` go into the model directory. Either way
   `python tests/tools/dsv41/engram_hash_tables.py <model dir>` (a venv with `torch`, `transformers` and `sympy`) writes the hashing tables the
-  engine reads, `engram_hash.bin`, once per directory. The routed experts that do not fit the arena stay in pinned host memory and are read in
+  engine reads, `engram_hash.bin`, once per directory. llama.cpp's `deepseek41` GGUF conversions load too (such as
+  `ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF`: a build's five parts and the shared Engram file `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`,
+  linked as the build's sixth part, in one directory with the original `config.json` without its `quantization_config`, the tokenizer files
+  and `engram_hash.bin`, whose tables are those of the GGUF's metadata); their Engram rows are IQ4_NL blocks, decoded on the host. The routed experts that do not fit the arena stay in pinned host memory and are read in
   place (62% resident for the 2.7 bpw checkpoint on four 32 GB GPUs). Its routing is concentrated (on agent text the hottest 10% of a layer's
   experts take half of the routes) and specialized by domain, so which experts are resident decides the speed: with `--set expert_heat_file=<path>`
   the route counts are saved at exit and the next start keeps the hottest experts on the device and balances the heat over the ranks. Counts from five

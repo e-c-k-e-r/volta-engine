@@ -2,8 +2,8 @@
 
 Serving speed, step latency and prefill for each model and weight format on the target machine, and how they were measured. The Qwen3.8-27B
 and Flash-Next numbers come from one session on 2026-11-12 (master 54e2f89), the GLM-5.3-Flash and DeepSeek-V4.1-Flash numbers from one on
-2026-11-13 (master da1f5be) with the same setup; speed depends on the power cap and clocks, so rerun the whole set rather than one table when
-either changes.
+2026-11-13 (master da1f5be) and DeepSeek's GGUF build's on 2026-11-14 (master 25e4e6f), with the same setup; speed depends on the power cap and
+clocks, so rerun the whole set rather than one table when either changes.
 
 ## Setup
 
@@ -12,7 +12,8 @@ either changes.
 * host: 2x Xeon Gold 6132, turbo on, no frequency cap; prefill and the host side of a speculative round slow down with a capped CPU
 * every expert resident on the GPUs (`expert_cache` 1, or `auto` where noted and it resolved to 100%), except DeepSeek-V4.1-Flash
   (`vram_reserve_mib=256`): rank 0 holds 99% of its expert codes and the other ranks all of theirs; with the DSpark drafter
-  (`vram_reserve_mib=512`) 92% and 95%. The rest are read from pinned host memory.
+  (`vram_reserve_mib=512`) 92% and 95%. Its GGUF IQ1_M build (the default 384 MiB reserve): 98% resident, 91% with DSpark. The rest are read from
+  pinned host memory.
 * one request at a time (`max_slots=1`), `max_seq=32768` (DeepSeek: 16384), greedy decoding, thinking off
 * weights:
 
@@ -28,6 +29,7 @@ either changes.
 | GLM-5.3-Flash | EXL3 3.05 bpw (head 6), stock order | `GLM-5.3-Flash-exl3-3.05bpw` |
 | | EXL3 3.05 bpw (head 6), Volta order | `GLM-5.3-Flash-exl3-3.05bpw-volta-cal` |
 | DeepSeek-V4.1-Flash | EXL3 1.68 bpw (head 6) | `DeepSeek-V4.1-Flash-1017-exl3-1.68bpw` |
+| | GGUF IQ1_M (GSQ-RCO, 1.75 bpw; the Engram table IQ4_NL) | `DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF` |
 
 * speculators:
   * MTP: the checkpoint's own head (GLM's comes from layer 45 of `GLM-5.3-Flash-NVFP4`), `mtp_depth` 7 unless noted. The head stops chaining
@@ -86,6 +88,8 @@ Decode tok/s, tokens per round in parentheses.
 | DeepSeek-V4.1-Flash | EXL3 1.68 bpw | none | | 35 | 35 | 35 |
 | | | DSpark | | 49 (2.12) | 74 (3.36) | 73 (3.37) |
 | | | suffix | | 34 (1.02) | 34 (1.01) | 38 (1.17) |
+| | GGUF IQ1_M | none | | 45 | 47 | 46 |
+| | | DSpark | | 56 (2.22) | 89 (3.50) | 89 (3.63) |
 
 DeepSeek's 16K window does not hold the agent replay's prompts.
 
