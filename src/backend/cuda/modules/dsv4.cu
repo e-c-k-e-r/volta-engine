@@ -618,46 +618,60 @@ void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, c
 	}
 }
 
-// Merges the split-KV partials of a row (grid rows, 8 warps, a warp owns nh / 8 heads, lane layout as attend_kernel) and writes its output
-template <int HPW>
+// Merges the split-KV partials of one head of a row (grid rows x heads, 8 warps) and writes its output: every warp takes the row's maximum and
+// denominator over the splits (lane = split), the warps sum the weighted partials of every eighth split (lane layout as attend_kernel), and
+// warp 0 adds the eight sums in warp order and applies the rotary and FP8 epilogue
 __global__ __launch_bounds__( ATT_THREADS )
 void att_combine_kernel( const float* __restrict__ ws, int nsplit, const float* __restrict__ sink, const float2* __restrict__ rope, half* __restrict__ o, int nh,
 	int rows_n, const pod::BatchRows* __restrict__ rows ) {
-	const int r = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-	const float2* cs_row = rope + static_cast<size_t>( rows->pos[r] ) * ( ROPE / 2 );
-	const int G = DSV4::GROUP_HEADS;
+	const int r = blockIdx.x, h = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+	__shared__ float2 part[ATT_THREADS / 32][HD / 2];
+	const size_t sstride = static_cast<size_t>( nh ) * ( HD + 2 );   // one split to the next
+	const float* base = ws + ( static_cast<size_t>( r ) * nsplit * nh + h ) * ( HD + 2 );
+	const float m_l = lane < nsplit ? base[lane * sstride] : -INFINITY;
+	float m = m_l;
 	#pragma unroll
-	for ( int j = 0; j < HPW; ++j ) {
-		const int h = warp * HPW + j;
-		float M = sink[h];
-		for ( int sp = 0; sp < nsplit; ++sp ) M = fmaxf( M, ws[( ( static_cast<size_t>( r ) * nsplit + sp ) * nh + h ) * ( HD + 2 )] );
-		float den = expf( sink[h] - M );
-		float2 v[8];
-		#pragma unroll
-		for ( int i = 0; i < 8; ++i ) v[i] = make_float2( 0.0f, 0.0f );
-		for ( int sp = 0; sp < nsplit; ++sp ) {
-			const float* p = ws + ( ( static_cast<size_t>( r ) * nsplit + sp ) * nh + h ) * ( HD + 2 );
-			const float w = expf( p[0] - M );
-			den += p[1] * w;
-			const float2* pa = reinterpret_cast<const float2*>( p + 2 );
-			#pragma unroll
-			for ( int i = 0; i < 8; ++i ) {
-				const float2 a = pa[lane + 32 * i];
-				v[i].x += a.x * w;
-				v[i].y += a.y * w;
-			}
-		}
-		const float f = 1.0f / den;
-		#pragma unroll
-		for ( int i = 0; i < 8; ++i ) v[i] = __half22float2( __floats2half2_rn( v[i].x * f, v[i].y * f ) );
-		rot( v[7].x, v[7].y, cs_row[lane], true );
-		half* dst = o + ( static_cast<size_t>( h / G ) * rows_n + r ) * ( G * HD ) + static_cast<size_t>( h % G ) * HD;
+	for ( int off = 16; off > 0; off >>= 1 ) m = fmaxf( m, __shfl_xor_sync( 0xffffffff, m, off ) );
+	const float M = fmaxf( m, sink[h] );
+	const float w_l = lane < nsplit ? expf( m_l - M ) : 0.0f;
+	float2 v[8];
+	#pragma unroll
+	for ( int i = 0; i < 8; ++i ) v[i] = make_float2( 0.0f, 0.0f );
+	for ( int sp = warp; sp < nsplit; sp += ATT_THREADS / 32 ) {
+		const float w = __shfl_sync( 0xffffffff, w_l, sp );
+		const float2* pa = reinterpret_cast<const float2*>( base + sp * sstride + 2 );
 		#pragma unroll
 		for ( int i = 0; i < 8; ++i ) {
-			const float amax = group_max<16>( fmaxf( fabsf( v[i].x ), fabsf( v[i].y ) ) );
-			const float sc = e4m3_scale_pow2( amax );
-			reinterpret_cast<half2*>( dst )[lane + 32 * i] = __floats2half2_rn( q_e4m3( v[i].x, sc ), q_e4m3( v[i].y, sc ) );
+			const float2 a = pa[lane + 32 * i];
+			v[i].x += a.x * w;
+			v[i].y += a.y * w;
 		}
+	}
+	#pragma unroll
+	for ( int i = 0; i < 8; ++i ) part[warp][lane + 32 * i] = v[i];
+	__syncthreads();
+	if ( warp != 0 ) return;
+	float den = lane < nsplit ? base[lane * sstride + 1] * w_l : 0.0f;
+	#pragma unroll
+	for ( int off = 16; off > 0; off >>= 1 ) den += __shfl_xor_sync( 0xffffffff, den, off );
+	den += expf( sink[h] - M );
+	const float f = 1.0f / den;
+	#pragma unroll
+	for ( int i = 0; i < 8; ++i ) {
+		float2 t = part[0][lane + 32 * i];
+		#pragma unroll
+		for ( int w = 1; w < ATT_THREADS / 32; ++w ) { t.x += part[w][lane + 32 * i].x; t.y += part[w][lane + 32 * i].y; }
+		v[i] = __half22float2( __floats2half2_rn( t.x * f, t.y * f ) );
+	}
+	const float2* cs_row = rope + static_cast<size_t>( rows->pos[r] ) * ( ROPE / 2 );
+	rot( v[7].x, v[7].y, cs_row[lane], true );
+	const int G = DSV4::GROUP_HEADS;
+	half* dst = o + ( static_cast<size_t>( h / G ) * rows_n + r ) * ( G * HD ) + static_cast<size_t>( h % G ) * HD;
+	#pragma unroll
+	for ( int i = 0; i < 8; ++i ) {
+		const float amax = group_max<16>( fmaxf( fabsf( v[i].x ), fabsf( v[i].y ) ) );
+		const float sc = e4m3_scale_pow2( amax );
+		reinterpret_cast<half2*>( dst )[lane + 32 * i] = __floats2half2_rn( q_e4m3( v[i].x, sc ), q_e4m3( v[i].y, sc ) );
 	}
 }
 
@@ -946,7 +960,7 @@ void DSV4::attend( const half* q, const half* ring, const half* comp_kv, const i
 	// decode batches with compressed entries split the keys over blocks (a single block per row leaves almost every SM idle, and its dependent
 	// loads miss the cache once the compressed cache outgrows it); window-only layers and prefill chunks stay on one block per row
 	int nsplit = 1;
-	if ( ws != nullptr && comp_kv != nullptr ) nsplit = rows == 1 ? 16 : rows <= 4 ? 8 : rows <= 16 ? 4 : 1;
+	if ( ws != nullptr && comp_kv != nullptr ) nsplit = rows == 1 ? 32 : rows == 2 ? 16 : rows <= 4 ? 8 : rows <= 16 ? 4 : 1;
 	float* wsp = nsplit > 1 ? ws : nullptr;
 	const dim3 grid( rows, nsplit );
 	if ( nh == 32 ) {
@@ -960,13 +974,8 @@ void DSV4::attend( const half* q, const half* ring, const half* comp_kv, const i
 		case 2: attend_kernel<2><<<grid, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride, wsp, win_floor ); break;
 		default: attend_kernel<4><<<grid, ATT_THREADS, smem, stream>>>( q, ring, comp_kv, sel, nsel, sink, rope, o, nh, layer, rows, d_rows, ring_slot_stride, comp_slot_stride, wsp, win_floor ); break;
 	}
-	if ( nsplit > 1 ) {
-		switch ( nh / 8 ) {
-			case 1: att_combine_kernel<1><<<rows, ATT_THREADS, 0, stream>>>( wsp, nsplit, sink, rope, o, nh, rows, d_rows ); break;
-			case 2: att_combine_kernel<2><<<rows, ATT_THREADS, 0, stream>>>( wsp, nsplit, sink, rope, o, nh, rows, d_rows ); break;
-			default: att_combine_kernel<4><<<rows, ATT_THREADS, 0, stream>>>( wsp, nsplit, sink, rope, o, nh, rows, d_rows ); break;
-		}
-	}
+	ENGINE_ASSERT( nsplit <= 32, "DSV4::attend: the combine reads one split per lane" );
+	if ( nsplit > 1 ) att_combine_kernel<<<dim3( rows, nh ), ATT_THREADS, 0, stream>>>( wsp, nsplit, sink, rope, o, nh, rows, d_rows );
 }
 
 void DSV4::tap_store( const float* streams, half* ring, int tap, int taps, int hidden, float scale, int floor_pos, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride,
