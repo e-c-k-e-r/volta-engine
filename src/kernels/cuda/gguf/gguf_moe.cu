@@ -317,22 +317,33 @@ void moe_tile_kernel( const void* const* __restrict__ ptrs, const Item* __restri
 	if ( threadIdx.x < kTileRoutes ) s_route[threadIdx.x] = threadIdx.x < it.count ? sorted[it.begin + threadIdx.x] : -1;
 	const uint16_t* w = static_cast<const uint16_t*>( ptrs[it.expert] );
 	const int bpr = k / 256;
-	// the raw words of step kb's blocks (rows past n read as zero blocks: they decode to zeros), fetched a step ahead into registers
+	// the raw words of step kb's blocks (rows past n read as zero blocks: they decode to zeros), fetched a step ahead into registers; each
+	// thread's words and their shared-memory places are fixed for the whole K loop
+	int src[PER], dst[PER];
+	#pragma unroll
+	for ( int p = 0; p < PER; ++p ) {
+		const int u = threadIdx.x + p * kTileThreads, row = u / RU, j = u % RU, gr = row0 + row;
+		src[p] = u < UNITS && gr < n ? gr * bpr * RU + j : -1;
+		dst[p] = u < UNITS ? row * ( kTileRawLd / 2 ) + j : -1;
+	}
 	uint16_t rr[PER];
 	auto fetch = [&]( int kb ) {
 		#pragma unroll
-		for ( int p = 0; p < PER; ++p ) {
-			const int u = threadIdx.x + p * kTileThreads, row = u / RU, j = u % RU, gr = row0 + row;
-			rr[p] = u < UNITS && gr < n ? w[( static_cast<size_t>( gr ) * bpr + kb ) * RU + j] : 0;
-		}
+		for ( int p = 0; p < PER; ++p ) rr[p] = src[p] >= 0 ? w[src[p] + kb * RU] : 0;
 	};
 	auto stash = [&]( int buf ) {
+		uint16_t* d = reinterpret_cast<uint16_t*>( sR + buf * kTileN * kTileRawLd );
 		#pragma unroll
-		for ( int p = 0; p < PER; ++p ) {
-			const int u = threadIdx.x + p * kTileThreads;
-			if ( u < UNITS ) reinterpret_cast<uint16_t*>( sR + ( buf * kTileN + u / RU ) * kTileRawLd )[u % RU] = rr[p];
-		}
+		for ( int p = 0; p < PER; ++p ) if ( dst[p] >= 0 ) d[dst[p]] = rr[p];
 	};
+	// the routes' input rows this thread copies (16 routes x 32 pieces of 8 halves over the threads)
+	constexpr int XPER = kTileRoutes * 32 / kTileThreads;
+	const half* xsrc[XPER];
+	#pragma unroll
+	for ( int i = 0; i < XPER; ++i ) {
+		const int v = threadIdx.x + i * kTileThreads, j = v >> 5, c = v & 31, r = j < it.count ? sorted[it.begin + j] : -1;
+		xsrc[i] = r >= 0 ? in + static_cast<size_t>( per_token ? r / top_k : r ) * k + c * 8 : nullptr;
+	}
 	fetch( 0 );
 	stash( 0 );
 	__syncthreads();
@@ -347,11 +358,11 @@ void moe_tile_kernel( const void* const* __restrict__ ptrs, const Item* __restri
 			const int r = warp * ( kTileN / 8 ) + i;
 			tile_dequant<T>( raw + r * kTileRawLd, 0, sW + r * kTileLd, lane );
 		}
-		for ( int v = threadIdx.x; v < kTileRoutes * 32; v += kTileThreads ) {
-			const int j = v >> 5, c = v & 31, r = s_route[j];
-			uint4 val = make_uint4( 0, 0, 0, 0 );
-			if ( r >= 0 ) val = *reinterpret_cast<const uint4*>( in + static_cast<size_t>( per_token ? r / top_k : r ) * k + kb * 256 + c * 8 );
-			*reinterpret_cast<uint4*>( sX + j * kTileLd + c * 8 ) = val;
+		#pragma unroll
+		for ( int i = 0; i < XPER; ++i ) {
+			const int v = threadIdx.x + i * kTileThreads;
+			const uint4 val = xsrc[i] != nullptr ? *reinterpret_cast<const uint4*>( xsrc[i] + kb * 256 ) : make_uint4( 0, 0, 0, 0 );
+			*reinterpret_cast<uint4*>( sX + ( v >> 5 ) * kTileLd + ( v & 31 ) * 8 ) = val;
 		}
 		__syncthreads();
 		#pragma unroll
