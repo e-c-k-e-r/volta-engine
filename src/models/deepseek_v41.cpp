@@ -770,27 +770,31 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		lw.sink = load_vec( repo, p + "attn.attn_sink", arena, pod::DType::FP32, rank_ * lh_, lh_ );
 		need( lw.attn_norm.data && lw.ffn_norm.data && lw.q_norm.data && lw.kv_norm.data && lw.sink.data, p + "norms / sink" );
 		// a projection of the pack: EXL3 (the trellis tensors, `bits` wide; slice_dim 1 / 0 = this rank's output columns / input rows, -1 whole), or the
-		// original FP8 weight with block scales (SAGE packs), dequantized to FP16; out_scale is the output scale folded into the weights (EXL3: into svh)
-		auto lin = [&]( const std::string& name, int bits, int slice_dim, float out_scale ) -> pod::LinearWeight {
+		// original FP8 weight with block scales (SAGE packs), dequantized to FP16; out_scale is the output scale folded into the weights (EXL3: into svh).
+		// begin >= 0: the slice is [begin, begin + count) of those columns / rows instead of this rank's even share
+		auto lin = [&]( const std::string& name, int bits, int slice_dim, float out_scale, int begin = -1, int count = 0 ) -> pod::LinearWeight {
 			if ( repo.find( ( name + ".trellis" ).c_str() ) ) {
-				pod::LinearWeight w = slice_dim < 0 ? repo.load_linear( name.c_str(), arena, bits, stream ) : repo.load_linear_slice( name.c_str(), arena, bits, slice_dim, rank_, tp, stream );
+				pod::LinearWeight w = slice_dim < 0 ? repo.load_linear( name.c_str(), arena, bits, stream )
+					: begin >= 0 ? repo.load_linear_range( name.c_str(), arena, slice_dim, begin / 16, count / 16, stream )
+					: repo.load_linear_slice( name.c_str(), arena, bits, slice_dim, rank_, tp, stream );
 				if ( out_scale != 1.0f && w.is_valid() ) scale_device_half( w.w2.ptr<backend::half_t>(), static_cast<size_t>( H ), out_scale, stream );
 				return w;
 			}
 			const auto* meta = repo.find( ( name + ".weight" ).c_str() );
 			if ( meta == nullptr || meta->ndim != 2 ) return {};
 			const int n = meta->shape[0], k = meta->shape[1];
+			const int d = slice_dim == 1 ? n : k, b = begin >= 0 ? begin : rank_ * ( d / tp ), c = begin >= 0 ? count : d / tp;
 			if ( fp8_resident ) {
 				// the output scale is a power of two: it goes into the block scales' exponents
 				const int shift = out_scale == 1.0f ? 0 : static_cast<int>( std::lround( std::log2( out_scale ) ) );
 				pod::LinearWeight w;
-				if ( slice_dim == 1 ) w = load_fp8_resident( repo, name, arena, rank_ * ( n / tp ), n / tp, 0, k, shift );
-				else if ( slice_dim == 0 ) w = load_fp8_resident( repo, name, arena, 0, n, rank_ * ( k / tp ), k / tp, shift );
+				if ( slice_dim == 1 ) w = load_fp8_resident( repo, name, arena, b, c, 0, k, shift );
+				else if ( slice_dim == 0 ) w = load_fp8_resident( repo, name, arena, 0, n, b, c, shift );
 				else w = load_fp8_resident( repo, name, arena, 0, n, 0, k, shift );
 				if ( w.is_valid() ) { fp8_scratch_elems_ = std::max<size_t>( fp8_scratch_elems_, static_cast<size_t>( w.w0.shape[0] ) * w.w0.shape[1] ); return w; }
 			}
-			if ( slice_dim == 1 ) return load_dense( repo, name, arena, stream, rank_ * ( n / tp ), n / tp, 0, k, out_scale );
-			if ( slice_dim == 0 ) return load_dense( repo, name, arena, stream, 0, n, rank_ * ( k / tp ), k / tp, out_scale );
+			if ( slice_dim == 1 ) return load_dense( repo, name, arena, stream, b, c, 0, k, out_scale );
+			if ( slice_dim == 0 ) return load_dense( repo, name, arena, stream, 0, n, b, c, out_scale );
 			return load_dense( repo, name, arena, stream, 0, n, 0, k, out_scale );
 		};
 		lw.wq_a = lin( p + "attn.wq_a", 4, -1, 1.0f );
@@ -843,11 +847,20 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			need( lw.router_bias.data != nullptr, p + "ffn.gate.bias" );
 			if ( repo.find( ( p + "ffn.gate.bias_vl" ).c_str() ) ) lw.router_bias_vl = load_vec( repo, p + "ffn.gate.bias_vl", arena, pod::DType::FP32 );
 		}
-		if ( rank_ == 0 ) {
-			lw.sh_gate = lin( p + "ffn.shared_experts.w1", 4, -1, 1.0f );
-			lw.sh_up = lin( p + "ffn.shared_experts.w3", 4, -1, 1.0f );
-			lw.sh_down = lin( p + "ffn.shared_experts.w2", 4, -1, 1.0f / kOutScale );
+		// The shared expert is cut over the ranks in 128-wide spans (gate / up by output width, down by input width), each rank's partial output
+		// joining its routed experts' before the MoE all-reduce, instead of rank 0 running all of it while the others wait at that all-reduce. The
+		// spans split as expert 2's do (18 over 4 ranks: the two wider slices on ranks 2 and 3, rank 0 has the head and the sampling)
+		const bool sh_slice = runtime::options().shared_slice && tp > 1 && ring_ != nullptr && config_.intermediate_size % 128 == 0;
+		if ( sh_slice || rank_ == 0 ) {
+			int s0 = 0, sn = config_.intermediate_size / 128;
+			if ( sh_slice ) expert_slice( 2, rank_, &s0, &sn );
+			const int sd = sh_slice ? 1 : -1, si = sh_slice ? 0 : -1;
+			lw.sh_gate = lin( p + "ffn.shared_experts.w1", 4, sd, 1.0f, s0 * 128, sn * 128 );
+			lw.sh_up = lin( p + "ffn.shared_experts.w3", 4, sd, 1.0f, s0 * 128, sn * 128 );
+			lw.sh_down = lin( p + "ffn.shared_experts.w2", 4, si, 1.0f / kOutScale, s0 * 128, sn * 128 );
 			need( lw.sh_gate.is_valid() && lw.sh_up.is_valid() && lw.sh_down.is_valid(), p + "shared expert" );
+			lw.sh_cols = sn * 128;
+			need( lw.sh_gate.type != pod::QuantType::TRELLIS || static_cast<int>( lw.sh_gate.w2.numel() ) == lw.sh_cols, p + "shared expert width" );
 		}
 		if ( lw.engram >= 0 ) {
 			lw.e_wkv = load_dense( repo, p + "engram.wkv", arena, stream );
@@ -1925,11 +1938,12 @@ void DeepseekV41Pipeline::ffn_experts( DeepseekV41LayerWeights& lw, int m, backe
 void DeepseekV41Pipeline::ffn_back( DeepseekV41LayerWeights& lw, int m, backend::stream_t stream ) {
 	using engine::modules::Linear;
 	const int H = config_.hidden_size;
-	if ( lw.sh_gate.is_valid() ) {
-		lin_fwd( norm_x_, lw.sh_gate, sh_g_, fp8_scratch_, stream );
-		lin_fwd( norm_x_, lw.sh_up, sh_u_, fp8_scratch_, stream );
-		engine::modules::SwiGLU::forward( sh_g_, sh_u_, sh_i_, stream, config_.swiglu_limit );
-		lin_fwd( sh_i_, lw.sh_down, sh_out_, fp8_scratch_, stream );
+	if ( lw.sh_cols > 0 ) {
+		pod::TensorView g = view( sh_g_, 0, sh_g_.shape[0], lw.sh_cols ), u = view( sh_u_, 0, sh_u_.shape[0], lw.sh_cols ), i = view( sh_i_, 0, sh_i_.shape[0], lw.sh_cols );
+		lin_fwd( norm_x_, lw.sh_gate, g, fp8_scratch_, stream );
+		lin_fwd( norm_x_, lw.sh_up, u, fp8_scratch_, stream );
+		engine::modules::SwiGLU::forward( g, u, i, stream, config_.swiglu_limit );
+		lin_fwd( i, lw.sh_down, sh_out_, fp8_scratch_, stream );
 		engine::modules::MoERouter::accumulate( moe_out_.ptr<backend::half_t>(), sh_out_.ptr<const backend::half_t>(), backend::from_float_half( 1.0f ), m * H, stream );
 	}
 }
@@ -2006,6 +2020,7 @@ bool DeepseekV41Pipeline::load_dspark( const char* dir, backend::stream_t stream
 			lw.sh_down = repo.load_linear( ( p + "ffn.shared_experts.w2" ).c_str(), arena, bits_of( p + "ffn.shared_experts.w2" ), stream );
 			need( lw.sh_gate.is_valid() && lw.sh_up.is_valid() && lw.sh_down.is_valid(), p + "shared expert" );
 			if ( lw.sh_down.is_valid() ) scale_device_half( lw.sh_down.w2.ptr<backend::half_t>(), static_cast<size_t>( H ), 1.0f / kOutScale, stream );
+			lw.sh_cols = config_.intermediate_size;
 		}
 		lw.hc_attn_fn = load_vec( repo, p + "hc_attn_fn", arena, pod::DType::FP32 );
 		lw.hc_attn_base = load_vec( repo, p + "hc_attn_base", arena, pod::DType::FP32 );

@@ -93,7 +93,8 @@ struct DeepseekV41LayerWeights {
 	// Mixed-width packs: every expert of the rank in one table (widths per expert), so a layer is one MoE launch instead of one per width signature;
 	// the groups keep the storage (swaps, heat slices)
 	std::unique_ptr<pod::MoELayerWeights> merged;
-	pod::LinearWeight sh_gate, sh_up, sh_down;     // rank 0
+	pod::LinearWeight sh_gate, sh_up, sh_down;     // the shared expert: 1/tp of its width on every rank (shared_slice), else all of it on rank 0
+	int sh_cols = 0;                               // its intermediate columns here (0: none on this rank)
 	// engram
 	pod::LinearWeight e_wkv;
 	pod::TensorView e_w;                           // q_weight * k_weight [4, hidden] FP32
