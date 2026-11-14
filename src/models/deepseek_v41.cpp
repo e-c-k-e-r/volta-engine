@@ -967,6 +967,12 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			}
 			bits[l][e] = sig;
 		}
+		if ( layers_[l].gguf_experts ) {
+			// one signature per combination of block types (a layer's experts share theirs), so the swap staging is per size
+			const auto type_of = [&]( const char* w ) { const auto* m = repo.find( ( p + "0" + w + ".weight" ).c_str() ); return m ? static_cast<int>( m->gguf_type ) & 63 : 0; };
+			const int sig = 1 << 20 | type_of( ".w1" ) | type_of( ".w3" ) << 6 | type_of( ".w2" ) << 12;
+			for ( int e = 0; e < E; ++e ) bits[l][e] = sig;
+		}
 		if ( layers_[l].gguf_experts && moe_scratch_.gguf_ws == nullptr ) {
 			moe_scratch_.gguf_ws = engine::core::arena_alloc( arena, engine::modules::MoEGguf::scratch_bytes( config_.top_k, H, config_.intermediate_size ), 256 );
 		}
@@ -1066,7 +1072,13 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		std::set<int> sigs;
 		for ( int l = 0; l < L; ++l ) for ( int e : mine_[l] ) sigs.insert( bits[l][e] );
 		size_t staging = 0;
-		for ( int sg : sigs ) staging += static_cast<size_t>( ( sg & 15 ) + ( ( sg >> 4 ) & 15 ) + ( ( sg >> 8 ) & 15 ) ) * ( static_cast<size_t>( H ) * config_.intermediate_size / 8 + 512 );
+		for ( int sg : sigs ) {
+			if ( sg >> 20 ) {   // GGUF block types: one expert's three projections, as a layer holding them has them
+				for ( int l = 0; l < L; ++l ) if ( !mine_[l].empty() && bits[l][mine_[l][0]] == sg ) { staging += expert_bytes[l][mine_[l][0]] + 3 * 512; break; }
+				continue;
+			}
+			staging += static_cast<size_t>( ( sg & 15 ) + ( ( sg >> 4 ) & 15 ) + ( ( sg >> 8 ) & 15 ) ) * ( static_cast<size_t>( H ) * config_.intermediate_size / 8 + 512 );
+		}
 		const size_t host_bytes = static_cast<size_t>( cold_bytes * 1.01 ) + 40 * 3 * 256 * 200 + ( 256ull << 20 ) + staging * ( expert_tp_ ? 4 : 1 );   // codes (each aligned to 256 B), the swap buffers, a margin
 		ENGINE_ASSERT( engine::core::arena_create_pinned( host_arena_, host_bytes ), "DeepseekV41Pipeline: pinned host arena for the cold experts failed" );
 	}
@@ -1256,6 +1268,7 @@ bool DeepseekV41Pipeline::rebalance_experts( backend::stream_t stream ) {
 				if ( hot < 0 || cool < 0 || eff[hot] < eff[cool] + eff[cool] / 2 + margin ) break;
 				pod::LinearWeight* set[3] = { g.mw->gate, g.mw->up, g.mw->down };
 				void** table = static_cast<void**>( g.mw->device_ptrs );
+				const size_t rows_per_part = g.mw->type == pod::QuantType::GGUF ? 1 : 3;   // a trellis table holds codes, suh and svh per projection, a GGUF one the blocks
 				for ( int p = 0; p < 3; ++p ) {
 					uint8_t* dev = const_cast<uint8_t*>( static_cast<const uint8_t*>( set[p][cool].w0.data ) );
 					uint8_t* host = const_cast<uint8_t*>( static_cast<const uint8_t*>( set[p][hot].w0.data ) );
@@ -1268,8 +1281,8 @@ bool DeepseekV41Pipeline::rebalance_experts( backend::stream_t stream ) {
 					set[p][hot].w0.data = dev;
 					stg = host;
 					void* nh = dev; void* nc = set[p][cool].w0.data;
-					backend::memcpy_sync( table + static_cast<size_t>( 3 * p ) * g.count + hot, &nh, sizeof( void* ), backend::Copy::H2D );
-					backend::memcpy_sync( table + static_cast<size_t>( 3 * p ) * g.count + cool, &nc, sizeof( void* ), backend::Copy::H2D );
+					backend::memcpy_sync( table + rows_per_part * p * g.count + hot, &nh, sizeof( void* ), backend::Copy::H2D );
+					backend::memcpy_sync( table + rows_per_part * p * g.count + cool, &nc, sizeof( void* ), backend::Copy::H2D );
 					if ( layers_[l].merged ) {   // the layer's table follows
 						void** mt = static_cast<void**>( layers_[l].merged->device_ptrs );
 						const size_t total = layers_[l].merged->num_local_experts, off = g.first - first0;
