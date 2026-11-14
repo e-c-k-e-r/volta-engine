@@ -45,6 +45,10 @@ struct LinearGguf {
 	// out[m, n] (FP16) = x[m, k] (FP16) times the weight w, n rows of k / elems blocks of `type`
 	static void forward( const pod::TensorView& x, const void* w, GgmlType type, int n, int k, pod::TensorView& out, backend::stream_t stream = nullptr,
 		GgufColTiling tiling = {} );
+	// Two weights of one type and width over the same x (columns in the activation's order) in one quantization and one launch, when forward
+	// would take the GEMV for both (decode rows): out1 [m, n1] = x . w1, out2 [m, n2] = x . w2, the same bits as two forwards. False: nothing ran
+	static bool forward2( const pod::TensorView& x, const void* w1, int n1, pod::TensorView& out1, const void* w2, int n2, pod::TensorView& out2, GgmlType type, int k,
+		backend::stream_t stream = nullptr );
 	// The current device's activation workspace and GEMM handle, made at load so no forward allocates (decode graphs, collectives)
 	static void prepare();
 	// out (FP16, `elems` values) = the blocks of w dequantized, in their stored order (elems a multiple of the block size)

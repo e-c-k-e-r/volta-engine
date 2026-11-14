@@ -36,11 +36,18 @@ __global__ void tile_columns_kernel( const half* __restrict__ x, half* __restric
 }
 
 // One block of kWarps warps per output row; every row of the batch in the same pass over the weight row
+// Rows n .. n + n2 - 1 (a second weight of the same type and width over the same input): row - n of w2 into out2
 template <GgmlType T, int M>
 __global__ __launch_bounds__( 32 * kWarps )
-void gemv_kernel( const void* __restrict__ w, const block_q8_1* __restrict__ y, half* __restrict__ out, int n, int k ) {
+void gemv_kernel( const void* __restrict__ w, const block_q8_1* __restrict__ y, half* __restrict__ out, int n, int k, const void* __restrict__ w2, half* __restrict__ out2 ) {
 	using Tr = Traits<T>;
-	const int row = blockIdx.x;
+	int row = blockIdx.x;
+	if ( row >= n ) {
+		row -= n;
+		w = w2;
+		out = out2;
+		n = gridDim.x - n;
+	}
 	const int tid = threadIdx.y * 32 + threadIdx.x;
 	const int blocks_per_row = k / Tr::qk, y_blocks = k / QK8_1;
 	constexpr int per_iter = Tr::vdr * kWarps * 32 / Tr::qi;
@@ -68,24 +75,80 @@ void gemv_kernel( const void* __restrict__ w, const block_q8_1* __restrict__ y, 
 	}
 }
 
+// One warp per output row, kWarpRows rows per block: rows of a few weight blocks leave most of a block of threads on one row idle, and its
+// barrier and reduction cost more than the row's work
+constexpr int kWarpRows = 8;
+template <GgmlType T, int M>
+__global__ __launch_bounds__( 32 * kWarpRows )
+void gemv_warp_kernel( const void* __restrict__ w, const block_q8_1* __restrict__ y, half* __restrict__ out, int n, int k, const void* __restrict__ w2, half* __restrict__ out2,
+	int n2 ) {
+	using Tr = Traits<T>;
+	int row = blockIdx.x * kWarpRows + threadIdx.y;
+	if ( row >= n + n2 ) return;
+	if ( row >= n ) {
+		row -= n;
+		w = w2;
+		out = out2;
+		n = n2;
+	}
+	const int lane = threadIdx.x;
+	const int blocks_per_row = k / Tr::qk, y_blocks = k / QK8_1;
+	constexpr int per_iter = Tr::vdr * 32 / Tr::qi;
+	const int kqs = Tr::vdr * ( lane % ( Tr::qi / Tr::vdr ) );
+	float acc[M] = {};
+	#pragma unroll 4
+	for ( int kbx = lane / ( Tr::qi / Tr::vdr ); kbx < blocks_per_row; kbx += per_iter ) {
+		const int kby = kbx * ( Tr::qk / QK8_1 );
+		#pragma unroll
+		for ( int j = 0; j < M; ++j ) acc[j] += Tr::dot( w, y + static_cast<size_t>( j ) * y_blocks + kby, row * blocks_per_row + kbx, kqs );
+	}
+	#pragma unroll
+	for ( int j = 0; j < M; ++j ) {
+		float v = acc[j];
+		#pragma unroll
+		for ( int o = 16; o > 0; o >>= 1 ) v += __shfl_xor_sync( 0xffffffff, v, o );
+		if ( lane == 0 ) out[static_cast<size_t>( j ) * n + row] = __float2half_rn( v );
+	}
+}
+
+// n2 > 0: the rows of a second weight w2 (same type and width) into out2 in the same launch
 template <GgmlType T>
-void launch_rows( const void* w, const block_q8_1* y, half* out, int n, int k, int m, cudaStream_t stream ) {
-	const dim3 grid( n ), block( 32, kWarps );
+void launch_rows( const void* w, const block_q8_1* y, half* out, int n, int k, int m, cudaStream_t stream, const void* w2 = nullptr, half* out2 = nullptr, int n2 = 0 ) {
+	// a warp per row when a block of kWarps warps would not get through one pass over the row
+	static const int mode = runtime::options().gguf_gemv_warp;
+	using Tr = Traits<T>;
+	if ( mode == 1 || ( mode < 0 && k < Tr::vdr * kWarps * 32 / Tr::qi * Tr::qk ) ) {
+		const dim3 grid( ( n + n2 + kWarpRows - 1 ) / kWarpRows ), block( 32, kWarpRows );
+		switch ( m ) {
+			case 1: gemv_warp_kernel<T, 1><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2, n2 ); break;
+			case 2: gemv_warp_kernel<T, 2><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2, n2 ); break;
+			case 3: gemv_warp_kernel<T, 3><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2, n2 ); break;
+			case 4: gemv_warp_kernel<T, 4><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2, n2 ); break;
+			case 5: gemv_warp_kernel<T, 5><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2, n2 ); break;
+			case 6: gemv_warp_kernel<T, 6><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2, n2 ); break;
+			case 7: gemv_warp_kernel<T, 7><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2, n2 ); break;
+			default: gemv_warp_kernel<T, 8><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2, n2 ); break;
+		}
+		return;
+	}
+	const dim3 grid( n + n2 ), block( 32, kWarps );
 	switch ( m ) {
-		case 1: gemv_kernel<T, 1><<<grid, block, 0, stream>>>( w, y, out, n, k ); break;
-		case 2: gemv_kernel<T, 2><<<grid, block, 0, stream>>>( w, y, out, n, k ); break;
-		case 3: gemv_kernel<T, 3><<<grid, block, 0, stream>>>( w, y, out, n, k ); break;
-		case 4: gemv_kernel<T, 4><<<grid, block, 0, stream>>>( w, y, out, n, k ); break;
-		case 5: gemv_kernel<T, 5><<<grid, block, 0, stream>>>( w, y, out, n, k ); break;
-		case 6: gemv_kernel<T, 6><<<grid, block, 0, stream>>>( w, y, out, n, k ); break;
-		case 7: gemv_kernel<T, 7><<<grid, block, 0, stream>>>( w, y, out, n, k ); break;
-		default: gemv_kernel<T, 8><<<grid, block, 0, stream>>>( w, y, out, n, k ); break;
+		case 1: gemv_kernel<T, 1><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2 ); break;
+		case 2: gemv_kernel<T, 2><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2 ); break;
+		case 3: gemv_kernel<T, 3><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2 ); break;
+		case 4: gemv_kernel<T, 4><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2 ); break;
+		case 5: gemv_kernel<T, 5><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2 ); break;
+		case 6: gemv_kernel<T, 6><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2 ); break;
+		case 7: gemv_kernel<T, 7><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2 ); break;
+		default: gemv_kernel<T, 8><<<grid, block, 0, stream>>>( w, y, out, n, k, w2, out2 ); break;
 	}
 }
 
 template <GgmlType T>
-void gemv_tiles( const void* w, const block_q8_1* y, half* out, int n, int k, int m, cudaStream_t stream ) {
-	for ( int r = 0; r < m; r += 8 ) launch_rows<T>( w, y + static_cast<size_t>( r ) * ( k / QK8_1 ), out + static_cast<size_t>( r ) * n, n, k, std::min( 8, m - r ), stream );
+void gemv_tiles( const void* w, const block_q8_1* y, half* out, int n, int k, int m, cudaStream_t stream, const void* w2 = nullptr, half* out2 = nullptr, int n2 = 0 ) {
+	for ( int r = 0; r < m; r += 8 )
+		launch_rows<T>( w, y + static_cast<size_t>( r ) * ( k / QK8_1 ), out + static_cast<size_t>( r ) * n, n, k, std::min( 8, m - r ), stream, w2,
+			out2 != nullptr ? out2 + static_cast<size_t>( r ) * n2 : nullptr, n2 );
 }
 
 // Tile kernel: kTileN weight rows per block, the reduction dimension in 256-value spans. Per span: the tile's raw blocks are copied to
@@ -761,6 +824,19 @@ bool gguf_linear_supported( GgmlType type ) {
 	}
 }
 
+// m rows of width k go through the tensor-core rows kernel (a type with a tensor-core decoder, from its min_rows on; a type whose blocks are
+// whole staging units needs rows that are too, the others realign every row)
+bool mma_takes( GgmlType type, int m, int k ) {
+	if ( m < 2 || m > kTileRows || mma_off() || k % 256 != 0 ) return false;
+	const size_t row_bytes = static_cast<size_t>( k / ggml_block( type ).elems ) * ggml_block( type ).bytes;
+	switch ( type ) {
+#define CASE( T ) case GgmlType::T: return m >= MmaDec<GgmlType::T>::min_rows && ( row_bytes % MmaDec<GgmlType::T>::align == 0 || MmaDec<GgmlType::T>::bytes % MmaDec<GgmlType::T>::align != 0 );
+		CASE( Q4_K ) CASE( Q5_K ) CASE( Q6_K ) CASE( IQ4_XS ) CASE( Q8_0 )
+#undef CASE
+		default: return false;
+	}
+}
+
 void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type, int n, int k, pod::TensorView& out, cudaStream_t stream,
 	GgufColTiling tiling ) {
 	const int m = x.shape[0];
@@ -781,10 +857,9 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	}
 	// up to 16 rows of a type with a tensor-core decoder (from its min_rows on: fewer go faster through the GEMV); a type whose blocks are whole
 	// staging units needs rows that are too, the others realign every row
-	if ( m >= 2 && !mma_off() && k % 256 == 0 ) {
-		const size_t row_bytes = static_cast<size_t>( k / ggml_block( type ).elems ) * ggml_block( type ).bytes;
+	if ( mma_takes( type, m, k ) ) {
 		switch ( type ) {
-#define CASE( T ) case GgmlType::T: if ( m >= MmaDec<GgmlType::T>::min_rows && ( row_bytes % MmaDec<GgmlType::T>::align == 0 || MmaDec<GgmlType::T>::bytes % MmaDec<GgmlType::T>::align != 0 ) ) { launch_mma<GgmlType::T>( w, x.ptr<const half>(), out.ptr<half>(), n, k, m, tiling, stream ); return; } break;
+#define CASE( T ) case GgmlType::T: launch_mma<GgmlType::T>( w, x.ptr<const half>(), out.ptr<half>(), n, k, m, tiling, stream ); return;
 			CASE( Q4_K ) CASE( Q5_K ) CASE( Q6_K ) CASE( IQ4_XS ) CASE( Q8_0 )
 #undef CASE
 			default: break;
@@ -811,6 +886,26 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 #undef CASE
 		default: ENGINE_ASSERT( false, "LinearGguf: unsupported block type" );
 	}
+}
+
+bool LinearGguf::forward2( const pod::TensorView& x, const void* w1, int n1, pod::TensorView& out1, const void* w2, int n2, pod::TensorView& out2, GgmlType type, int k,
+	cudaStream_t stream ) {
+	const int m = x.shape[0];
+	if ( m > kGemvRows || mma_takes( type, m, k ) ) return false;
+	ENGINE_ASSERT( x.dtype == pod::DType::FP16 && out1.dtype == pod::DType::FP16 && out2.dtype == pod::DType::FP16, "LinearGguf: FP16 activations and output" );
+	ENGINE_ASSERT( x.shape[1] == k && k % ggml_block( type ).elems == 0 && k % QK8_1 == 0, "LinearGguf: k does not match the weight's blocks" );
+	block_q8_1* y = q8_workspace( static_cast<size_t>( m ) * ( k / QK8_1 ) );
+	quantize_q8_1_kernel<<<dim3( ( k + 255 ) / 256, m ), 256, 0, stream>>>( x.ptr<const half>(), y, k, GgufColTiling{} );
+	half* o1 = out1.ptr<half>();
+	half* o2 = out2.ptr<half>();
+	switch ( type ) {
+#define CASE( T ) case GgmlType::T: gemv_tiles<GgmlType::T>( w1, y, o1, n1, k, m, stream, w2, o2, n2 ); break;
+		CASE( Q4_0 ) CASE( Q4_1 ) CASE( Q5_0 ) CASE( Q5_1 ) CASE( Q8_0 ) CASE( Q2_0 ) CASE( Q2_K ) CASE( Q3_K ) CASE( Q4_K ) CASE( Q5_K ) CASE( Q6_K )
+		CASE( IQ2_XXS ) CASE( IQ2_XS ) CASE( IQ2_S ) CASE( IQ3_XXS ) CASE( IQ3_S ) CASE( IQ1_S ) CASE( IQ1_M ) CASE( IQ4_NL ) CASE( IQ4_XS )
+#undef CASE
+		default: ENGINE_ASSERT( false, "LinearGguf: unsupported block type" );
+	}
+	return true;
 }
 
 } // namespace engine::modules

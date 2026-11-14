@@ -23,6 +23,11 @@ __attribute__(( weak )) void LinearGguf::forward( const pod::TensorView&, const 
 	__builtin_unreachable();
 }
 
+__attribute__(( weak )) bool LinearGguf::forward2( const pod::TensorView&, const void*, int, pod::TensorView&, const void*, int, pod::TensorView&, GgmlType, int,
+	backend::stream_t ) {
+	return false;
+}
+
 __attribute__(( weak )) size_t MoEGguf::scratch_bytes( int, int, int ) { return 0; }
 
 __attribute__(( weak )) void MoEGguf::forward( const Table&, const backend::half_t*, int, const int*, const backend::half_t*, int, backend::half_t*, void*, uint32_t*, backend::stream_t ) {

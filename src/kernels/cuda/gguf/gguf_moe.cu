@@ -61,11 +61,13 @@ __global__ void moe_dispatch_kernel( const int* __restrict__ topk, int routes, i
 
 // out[route][row] = expert row `row` . input of each route of the work item (the route's token's q8_1 row, or the route's own), scaled by
 // the route's weight when `weighted`. One warp per output row, kMoEWarps rows per block: expert rows are short (640 or 2560 values), too
-// short to keep a whole block of threads on one
-template <GgmlType T>
+// short to keep a whole block of threads on one. IR: the items' most routes (a pass of rows tokens gives an expert at most rows routes, so
+// decode passes hold fewer accumulators); GU: the same row of the up projection (ptrs_up) too, into out_up, sharing the input loads
+template <GgmlType T, int IR, bool GU>
 __global__ __launch_bounds__( 32 * kMoEWarps )
-void moe_proj_kernel( const void* const* __restrict__ ptrs, const Item* __restrict__ items, const int* __restrict__ n_items, const int* __restrict__ sorted,
-	const block_q8_1* __restrict__ in, bool per_token, int k, int n, const half* __restrict__ topw, int top_k, bool weighted, float* __restrict__ out ) {
+void moe_proj_kernel( const void* const* __restrict__ ptrs, const void* const* __restrict__ ptrs_up, const Item* __restrict__ items, const int* __restrict__ n_items,
+	const int* __restrict__ sorted, const block_q8_1* __restrict__ in, bool per_token, int k, int n, const half* __restrict__ topw, int top_k, bool weighted,
+	float* __restrict__ out, float* __restrict__ out_up ) {
 	using Tr = Traits<T>;
 	if ( static_cast<int>( blockIdx.y ) >= *n_items ) return;
 	const Item it = items[blockIdx.y];
@@ -73,34 +75,45 @@ void moe_proj_kernel( const void* const* __restrict__ ptrs, const Item* __restri
 	if ( row >= n ) return;
 	const int lane = threadIdx.x;
 	const void* w = ptrs[it.expert];
+	const void* wu = GU ? ptrs_up[it.expert] : nullptr;
 	const int blocks_per_row = k / Tr::qk, y_blocks = k / QK8_1;
-	const block_q8_1* y[kItemRoutes];
+	const block_q8_1* y[IR];
 	#pragma unroll
-	for ( int j = 0; j < kItemRoutes; ++j ) {
+	for ( int j = 0; j < IR; ++j ) {
 		const int r = sorted[it.begin + min( j, it.count - 1 )];
 		y[j] = in + static_cast<size_t>( per_token ? r / top_k : r ) * y_blocks;
 	}
 	constexpr int per_iter = Tr::vdr * 32 / Tr::qi;   // weight blocks a warp covers per iteration
-	float acc[kItemRoutes] = {};
+	float acc[IR] = {}, acc_u[IR] = {};
 	for ( int kbx = lane / ( Tr::qi / Tr::vdr ); kbx < blocks_per_row; kbx += per_iter ) {
 		const int kby = kbx * ( Tr::qk / QK8_1 );
 		const int kqs = Tr::vdr * ( lane % ( Tr::qi / Tr::vdr ) );
 		#pragma unroll
-		for ( int j = 0; j < kItemRoutes; ++j ) {
-			if ( j < it.count ) acc[j] += Tr::dot( w, y[j] + kby, row * blocks_per_row + kbx, kqs );
+		for ( int j = 0; j < IR; ++j ) {
+			if ( j < it.count ) {
+				acc[j] += Tr::dot( w, y[j] + kby, row * blocks_per_row + kbx, kqs );
+				if constexpr ( GU ) acc_u[j] += Tr::dot( wu, y[j] + kby, row * blocks_per_row + kbx, kqs );
+			}
 		}
 	}
 	#pragma unroll
-	for ( int j = 0; j < kItemRoutes; ++j ) {
+	for ( int j = 0; j < IR; ++j ) {
 		#pragma unroll
-		for ( int off = 16; off > 0; off >>= 1 ) acc[j] += __shfl_xor_sync( 0xffffffff, acc[j], off );
+		for ( int off = 16; off > 0; off >>= 1 ) {
+			acc[j] += __shfl_xor_sync( 0xffffffff, acc[j], off );
+			if constexpr ( GU ) acc_u[j] += __shfl_xor_sync( 0xffffffff, acc_u[j], off );
+		}
 	}
 	if ( lane < it.count ) {
-		float v = 0.0f;
+		float v = 0.0f, vu = 0.0f;
 		#pragma unroll
-		for ( int j = 0; j < kItemRoutes; ++j ) v = lane == j ? acc[j] : v;
+		for ( int j = 0; j < IR; ++j ) {
+			v = lane == j ? acc[j] : v;
+			vu = lane == j ? acc_u[j] : vu;
+		}
 		const int r = sorted[it.begin + lane];
 		out[static_cast<size_t>( r ) * n + row] = weighted ? v * __half2float( topw[r] ) : v;
+		if constexpr ( GU ) out_up[static_cast<size_t>( r ) * n + row] = vu;
 	}
 }
 
@@ -141,19 +154,30 @@ __global__ void moe_combine_kernel( const float* __restrict__ part, const int* _
 	out[i] = __float2half_rn( v );
 }
 
-// At most this many work items in a pass of `routes` routes: one per active expert, plus one per kItemRoutes more of its routes
-int max_items( int routes, int num_local ) { return std::min( routes, num_local + routes / kItemRoutes ); }
-
-template <GgmlType T>
-void launch_proj( const void* const* ptrs, const Item* items, const int* n_items, const int* sorted, int max_n, const block_q8_1* in, bool per_token, int k, int n,
-	const half* topw, int top_k, bool weighted, float* out, cudaStream_t stream ) {
-	moe_proj_kernel<T><<<dim3( ( n + kMoEWarps - 1 ) / kMoEWarps, max_n ), dim3( 32, kMoEWarps ), 0, stream>>>( ptrs, items, n_items, sorted, in, per_token, k, n, topw, top_k, weighted, out );
+template <GgmlType T, int IR>
+void launch_proj_ir( const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n, const block_q8_1* in,
+	bool per_token, int k, int n, const half* topw, int top_k, bool weighted, float* out, float* out_up, cudaStream_t stream ) {
+	const dim3 grid( ( n + kMoEWarps - 1 ) / kMoEWarps, max_n ), block( 32, kMoEWarps );
+	if ( ptrs_up != nullptr ) moe_proj_kernel<T, IR, true><<<grid, block, 0, stream>>>( ptrs, ptrs_up, items, n_items, sorted, in, per_token, k, n, topw, top_k, weighted, out, out_up );
+	else moe_proj_kernel<T, IR, false><<<grid, block, 0, stream>>>( ptrs, nullptr, items, n_items, sorted, in, per_token, k, n, topw, top_k, weighted, out, nullptr );
 }
 
-void proj( GgmlType type, const void* const* ptrs, const Item* items, const int* n_items, const int* sorted, int max_n, const block_q8_1* in, bool per_token, int k,
-	int n, const half* topw, int top_k, bool weighted, float* out, cudaStream_t stream ) {
+template <GgmlType T>
+void launch_proj( int ir, const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n, const block_q8_1* in,
+	bool per_token, int k, int n, const half* topw, int top_k, bool weighted, float* out, float* out_up, cudaStream_t stream ) {
+	switch ( ir ) {
+		case 1: launch_proj_ir<T, 1>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, weighted, out, out_up, stream ); break;
+		case 2: launch_proj_ir<T, 2>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, weighted, out, out_up, stream ); break;
+		case 4: launch_proj_ir<T, 4>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, weighted, out, out_up, stream ); break;
+		default: launch_proj_ir<T, kItemRoutes>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, weighted, out, out_up, stream ); break;
+	}
+}
+
+// ir: the items' most routes (1, 2, 4 or kItemRoutes); ptrs_up != null: gate (ptrs) and up of the same type in one launch, up into out_up
+void proj( GgmlType type, int ir, const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n,
+	const block_q8_1* in, bool per_token, int k, int n, const half* topw, int top_k, bool weighted, float* out, float* out_up, cudaStream_t stream ) {
 	switch ( type ) {
-#define CASE( T ) case GgmlType::T: launch_proj<GgmlType::T>( ptrs, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, weighted, out, stream ); break;
+#define CASE( T ) case GgmlType::T: launch_proj<GgmlType::T>( ir, ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, weighted, out, out_up, stream ); break;
 		CASE( Q4_0 ) CASE( Q4_1 ) CASE( Q5_0 ) CASE( Q5_1 ) CASE( Q8_0 ) CASE( Q2_0 ) CASE( Q2_K ) CASE( Q3_K ) CASE( Q4_K ) CASE( Q5_K ) CASE( Q6_K )
 		CASE( IQ2_XXS ) CASE( IQ2_XS ) CASE( IQ2_S ) CASE( IQ3_XXS ) CASE( IQ3_S ) CASE( IQ1_S ) CASE( IQ1_M ) CASE( IQ4_NL ) CASE( IQ4_XS )
 #undef CASE
@@ -866,15 +890,20 @@ void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx
 	auto* n_items = reinterpret_cast<int*>( ws + l.n_items );
 	auto* sorted = reinterpret_cast<int*>( ws + l.sorted );
 	for ( int r0 = 0; r0 < m; r0 += kMoERowsPerPass ) {
-		const int rn = std::min( kMoERowsPerPass, m - r0 ), routes = rn * top_k, mi = max_items( routes, t.num_local );
+		const int rn = std::min( kMoERowsPerPass, m - r0 ), routes = rn * top_k;
+		// a token routes to an expert once, so the pass's items hold at most rn routes each
+		const int ir = rn <= 1 ? 1 : rn <= 2 ? 2 : rn <= 4 ? 4 : kItemRoutes, mi = std::min( routes, t.num_local + routes / ir );
 		const int* ti = topk_idx + static_cast<size_t>( r0 ) * top_k;
 		const half* tw = topk_w + static_cast<size_t>( r0 ) * top_k;
-		moe_dispatch_kernel<<<1, 256, 2 * t.num_local * sizeof( int ), stream>>>( ti, routes, t.first_expert, t.num_local, items, n_items, sorted, heat, kItemRoutes );
+		moe_dispatch_kernel<<<1, 256, 2 * t.num_local * sizeof( int ), stream>>>( ti, routes, t.first_expert, t.num_local, items, n_items, sorted, heat, ir );
 		quantize_q8_1_kernel<<<dim3( ( t.hidden + 255 ) / 256, rn ), 256, 0, stream>>>( x + static_cast<size_t>( r0 ) * t.hidden, xq, t.hidden, GgufColTiling{} );
-		proj( t.type[0], gate, items, n_items, sorted, mi, xq, true, t.hidden, t.inter, tw, top_k, false, g, stream );
-		proj( t.type[1], up, items, n_items, sorted, mi, xq, true, t.hidden, t.inter, tw, top_k, false, u, stream );
+		if ( t.type[0] == t.type[1] ) proj( t.type[0], ir, gate, up, items, n_items, sorted, mi, xq, true, t.hidden, t.inter, tw, top_k, false, g, u, stream );
+		else {
+			proj( t.type[0], ir, gate, nullptr, items, n_items, sorted, mi, xq, true, t.hidden, t.inter, tw, top_k, false, g, nullptr, stream );
+			proj( t.type[1], ir, up, nullptr, items, n_items, sorted, mi, xq, true, t.hidden, t.inter, tw, top_k, false, u, nullptr, stream );
+		}
 		moe_act_q8_kernel<<<dim3( ( t.inter + 127 ) / 128, routes ), 128, 0, stream>>>( g, u, aq, t.inter, t.act_limit );
-		proj( t.type[2], down, items, n_items, sorted, mi, aq, false, t.inter, t.hidden, tw, top_k, true, part, stream );
+		proj( t.type[2], ir, down, nullptr, items, n_items, sorted, mi, aq, false, t.inter, t.hidden, tw, top_k, true, part, nullptr, stream );
 		moe_combine_kernel<<<( rn * t.hidden + 255 ) / 256, 256, 0, stream>>>( part, ti, t.first_expert, t.num_local, out + static_cast<size_t>( r0 ) * t.hidden, rn, top_k, t.hidden );
 	}
 }
