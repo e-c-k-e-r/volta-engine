@@ -3,7 +3,8 @@
 // first `local` of them. The block bytes are a constant pattern, or pseudo-random with BENCH_RANDOM=1 (the IQ grids' lookups then miss as
 // real weights do; timing only either way: the values are not meaningful). BENCH_ROWS=a,b,... sets the row counts (prefill: the tile path
 // above 64 rows). BENCH_DUMP=<prefix>: pseudo-random inputs, and each row count's output after one forward written to <prefix>_<rows>.bin
-// (FP16, rows x hidden), to compare two runs of the same weights (a kernel path A/B; with BENCH_RANDOM=1 for meaningful values).
+// (FP16, rows x hidden), to compare two runs of the same weights (a kernel path A/B; with BENCH_RANDOM=1 for meaningful values). BENCH_REUSE=p: each
+// row keeps each of the previous row's experts with probability p (consecutive tokens of a draft share experts), the rest uniform.
 //   bench_gguf_moe [TYPE] [hidden inter global local top_k]   default Q2_K 4096 2048 288 72 8 (GLM-5.3-Flash, expert-parallel at TP=4)
 //   DeepSeek-V4.1 IQ1_M build: bench_gguf_moe IQ1_S 5120 2304 384 96 6
 #include "engine/config.h"
@@ -83,6 +84,7 @@ int main( int argc, char** argv ) {
 	CUDA_CHECK( cudaEventCreate( &e1 ) );
 	std::mt19937 rng( 1 );
 	std::printf( "%s hidden %d inter %d, %d of %d experts local, top %d, %d sets\n", engine::modules::ggml_type_name( type ), hidden, inter, local, global, top_k, SETS );
+	const double reuse = std::getenv( "BENCH_REUSE" ) ? std::atof( std::getenv( "BENCH_REUSE" ) ) : 0.0;
 	std::vector<int> row_counts = { 1, 2, 4, 8, 16 };
 	if ( const char* r = std::getenv( "BENCH_ROWS" ) ) {
 		row_counts.clear();
@@ -96,9 +98,12 @@ int main( int argc, char** argv ) {
 		// distinct experts per row; the local ones the routes touch, for the bytes read
 		std::vector<int> topk( static_cast<size_t>( m ) * top_k );
 		std::set<int> hit;
+		std::set<int> prev;
 		for ( int r = 0; r < m; ++r ) {
 			std::set<int> row;
+			if ( reuse > 0.0 ) for ( int e : prev ) if ( ( rng() % 1000 ) < reuse * 1000 ) row.insert( e );   // the previous row's experts kept
 			while ( static_cast<int>( row.size() ) < top_k ) row.insert( static_cast<int>( rng() % global ) );
+			prev = row;
 			int j = 0;
 			for ( int e : row ) {
 				topk[static_cast<size_t>( r ) * top_k + j++] = e;

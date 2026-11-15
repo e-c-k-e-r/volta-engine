@@ -1,5 +1,5 @@
 // GGUF routed experts on CUDA (MoEGguf in engine/modules/gguf.h). The routes of a pass are grouped by expert into work items of up to
-// kItemRoutes routes; each projection is a GEMV of one output row per block and work item, the expert's weight row read once for all the
+// kItemRoutes routes; each projection is a GEMV of one output row per warp and work item, the expert's weight row read once for all the
 // item's routes through llama.cpp's vec_dot of the projection's block type (LinearGguf's multi-row GEMV structure). Routes of experts on
 // other ranks are left out, and the combine skips them. Prefill chunks (more rows than one pass of that path) take the tile path instead:
 // passes of kTileRowsPerPass rows, items of up to 16 or 32 routes, and per item a tile of output rows whose weight blocks are decoded
@@ -19,7 +19,9 @@ namespace {
 
 constexpr int kMoEWarps = 4;
 
-constexpr int kItemRoutes = 8;
+// Routes of a work item at most: an expert with more takes several items, each reading its weights (mostly from the L2 then); items of more
+// routes held accumulators for all of them in every warp, which halved the occupancy, and verify passes (4 to 16 rows) ran at half the speed
+constexpr int kItemRoutes = 2;
 
 // A work item: one local expert and up to kItemRoutes of its routes (route ids in `sorted`, from `begin`)
 struct Item {
@@ -114,11 +116,11 @@ __global__ void moe_dispatch_kernel( const int* __restrict__ topk, int routes, i
 
 // out[route][row] = expert row `row` . input of each route of the work item (the route's token's q8_1 row, or the route's own), scaled by
 // the route's weight when `weighted`. One warp per output row, kMoEWarps rows per block: expert rows are short (640 or 2560 values), too
-// short to keep a whole block of threads on one. IR: the items' most routes (a pass of rows tokens gives an expert at most rows routes, so
-// decode passes hold fewer accumulators); GU: the same row of the up projection (ptrs_up) too, into out_up, sharing the input loads.
+// short to keep a whole block of threads on one. IR: the items' most routes (1 for one-row passes, else kItemRoutes); GU: the same row of the
+// up projection (ptrs_up) too, into out_up, sharing the input loads.
 // Block row y takes items y, y + gridDim.y, ...
 template <GgmlType T, int IR, bool GU>
-__global__ __launch_bounds__( 32 * kMoEWarps, IR <= 2 ? 8 : 4 )
+__global__ __launch_bounds__( 32 * kMoEWarps, 8 )
 void moe_proj_kernel( const void* const* __restrict__ ptrs, const void* const* __restrict__ ptrs_up, const Item* __restrict__ items, const int* __restrict__ n_items,
 	const int* __restrict__ sorted, const block_q8_1* __restrict__ in, bool per_token, int k, int n, const half* __restrict__ topw, int top_k, bool weighted,
 	float* __restrict__ out, float* __restrict__ out_up ) {
@@ -272,8 +274,8 @@ void down_combine( GgmlType type, const void* const* ptrs, const Item* items, co
 template <GgmlType T, int IR>
 void launch_proj_ir( const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n, const block_q8_1* in,
 	bool per_token, int k, int n, const half* topw, int top_k, bool weighted, float* out, float* out_up, cudaStream_t stream ) {
-	// decode passes route to a few of max_n possible items: fewer rows of blocks, each looping over its share, leave no idle blocks
-	const dim3 grid( ( n + kMoEWarps - 1 ) / kMoEWarps, IR <= 4 ? std::min( max_n, 2 + 2 * IR ) : max_n ), block( 32, kMoEWarps );
+	// passes route to a few of max_n possible items: fewer rows of blocks, each looping over its share, leave no idle blocks
+	const dim3 grid( ( n + kMoEWarps - 1 ) / kMoEWarps, std::min( max_n, 2 + 2 * IR ) ), block( 32, kMoEWarps );
 	if ( ptrs_up != nullptr ) moe_proj_kernel<T, IR, true><<<grid, block, 0, stream>>>( ptrs, ptrs_up, items, n_items, sorted, in, per_token, k, n, topw, top_k, weighted, out, out_up );
 	else moe_proj_kernel<T, IR, false><<<grid, block, 0, stream>>>( ptrs, nullptr, items, n_items, sorted, in, per_token, k, n, topw, top_k, weighted, out, nullptr );
 }
@@ -281,15 +283,11 @@ void launch_proj_ir( const void* const* ptrs, const void* const* ptrs_up, const 
 template <GgmlType T>
 void launch_proj( int ir, const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n, const block_q8_1* in,
 	bool per_token, int k, int n, const half* topw, int top_k, bool weighted, float* out, float* out_up, cudaStream_t stream ) {
-	switch ( ir ) {
-		case 1: launch_proj_ir<T, 1>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, weighted, out, out_up, stream ); break;
-		case 2: launch_proj_ir<T, 2>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, weighted, out, out_up, stream ); break;
-		case 4: launch_proj_ir<T, 4>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, weighted, out, out_up, stream ); break;
-		default: launch_proj_ir<T, kItemRoutes>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, weighted, out, out_up, stream ); break;
-	}
+	if ( ir == 1 ) launch_proj_ir<T, 1>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, weighted, out, out_up, stream );
+	else launch_proj_ir<T, kItemRoutes>( ptrs, ptrs_up, items, n_items, sorted, max_n, in, per_token, k, n, topw, top_k, weighted, out, out_up, stream );
 }
 
-// ir: the items' most routes (1, 2, 4 or kItemRoutes); ptrs_up != null: gate (ptrs) and up of the same type in one launch, up into out_up
+// ir: the items' most routes (1 or kItemRoutes); ptrs_up != null: gate (ptrs) and up of the same type in one launch, up into out_up
 void proj( GgmlType type, int ir, const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n,
 	const block_q8_1* in, bool per_token, int k, int n, const half* topw, int top_k, bool weighted, float* out, float* out_up, cudaStream_t stream ) {
 	switch ( type ) {
@@ -1007,8 +1005,8 @@ void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx
 	auto* sorted = reinterpret_cast<int*>( ws + l.sorted );
 	for ( int r0 = 0; r0 < m; r0 += kMoERowsPerPass ) {
 		const int rn = std::min( kMoERowsPerPass, m - r0 ), routes = rn * top_k;
-		// a token routes to an expert once, so the pass's items hold at most rn routes each
-		const int ir = rn <= 1 ? 1 : rn <= 2 ? 2 : rn <= 4 ? 4 : kItemRoutes, mi = std::min( routes, t.num_local + routes / ir );
+		// a token routes to an expert once, so a one-row pass's items hold one route each
+		const int ir = rn <= 1 ? 1 : kItemRoutes, mi = std::min( routes, t.num_local + routes / ir );
 		const int* ti = topk_idx + static_cast<size_t>( r0 ) * top_k;
 		const half* tw = topk_w + static_cast<size_t>( r0 ) * top_k;
 		const int qx = ( t.hidden + 255 ) / 256;   // the dispatch block, then the blocks that quantize the pass's rows
