@@ -698,10 +698,12 @@ block_q8_1* q8_workspace( size_t blocks ) {
 	return static_cast<block_q8_1*>( engine::core::scratch( "gguf.q8_1", want * sizeof( block_q8_1 ) ) );
 }
 
-// The FP16 copy of one weight for the prefill GEMM; grows to the largest weight (prefill runs eagerly, never inside a graph)
+// The FP16 copy of one weight for the prefill GEMM, a slice of output rows at a time: taken at the slice size at the first call, so it does not
+// grow call by call (prefill runs eagerly, never inside a graph)
+constexpr size_t kReconBytes = static_cast<size_t>( 64 ) << 20;
 half* recon_workspace( size_t elems, cudaStream_t stream ) {
 	(void) stream;
-	return static_cast<half*>( engine::core::scratch( "gguf.recon", elems * sizeof( half ) ) );
+	return static_cast<half*>( engine::core::scratch( "gguf.recon", std::max( elems * sizeof( half ), kReconBytes ) ) );
 }
 
 // The tile kernel's split-k partial sums (a fixed size: splits only fill the SMs of narrow weights) and the device's SM count
@@ -1124,16 +1126,23 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	ENGINE_ASSERT( x.shape[1] == k && k % ggml_block( type ).elems == 0 && k % QK8_1 == 0, "LinearGguf: k does not match the weight's blocks" );
 	ENGINE_ASSERT( tiling.heads == 0 || ( tiling.dim > 0 && k % ( tiling.heads * tiling.dim ) == 0 ), "LinearGguf: tiling does not divide k" );
 	if ( m > kTileRows ) {
-		half* wf = recon_workspace( static_cast<size_t>( n ) * k + ( tiling.heads ? static_cast<size_t>( m ) * k : 0 ), stream );
-		if ( type == GgmlType::Q8_0R ) dequant_q8r_kernel<<<dim3( ( k / 8 + 255 ) / 256, n ), 256, 0, stream>>>( static_cast<const uint8_t*>( w ), wf, k );
-		else dequant( w, type, static_cast<int64_t>( n ) * k, wf, stream );
+		// the weight's FP16 copy in slices of output rows of at most kReconBytes, each slice's GEMM writing its columns of the output
+		const size_t row_bytes = static_cast<size_t>( k / ggml_block( type ).elems ) * ggml_block( type ).bytes;
+		const int nc = std::min( n, std::max( 128, static_cast<int>( kReconBytes / ( static_cast<size_t>( k ) * sizeof( half ) ) ) / 128 * 128 ) );
+		half* wf = recon_workspace( static_cast<size_t>( nc ) * k + ( tiling.heads ? static_cast<size_t>( m ) * k : 0 ), stream );
 		const half* xs = x.ptr<const half>();
 		if ( tiling.heads ) {
-			half* xt = wf + static_cast<size_t>( n ) * k;
+			half* xt = wf + static_cast<size_t>( nc ) * k;
 			tile_columns_kernel<<<dim3( ( k + 255 ) / 256, m ), 256, 0, stream>>>( xs, xt, k, tiling );
 			xs = xt;
 		}
-		Gemm::tn( xs, k, wf, k, out.data, n, false, m, n, k, 0.0f, stream );
+		for ( int n0 = 0; n0 < n; n0 += nc ) {
+			const int c = std::min( nc, n - n0 );
+			const uint8_t* ws = static_cast<const uint8_t*>( w ) + static_cast<size_t>( n0 ) * row_bytes;
+			if ( type == GgmlType::Q8_0R ) dequant_q8r_kernel<<<dim3( ( k / 8 + 255 ) / 256, c ), 256, 0, stream>>>( ws, wf, k );
+			else dequant( ws, type, static_cast<int64_t>( c ) * k, wf, stream );
+			Gemm::tn( xs, k, wf, k, out.ptr<half>() + n0, n, false, m, c, k, 0.0f, stream );
+		}
 		return;
 	}
 	if ( type == GgmlType::Q8_0R ) {   // up to 16 rows: the dp4a GEMV on the aligned runs

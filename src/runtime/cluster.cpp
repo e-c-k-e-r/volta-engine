@@ -69,7 +69,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	// A kernel whose stack frame is above the driver's limit (1 KB by default) makes it grow the local-memory reservation of the whole GPU at
 	// its first launch (160 MiB per KB on these cards), outside the arena: the limit goes up to the model's largest frame before the arena is
 	// sized from the free memory
-	if ( const size_t stack = engine::models::device_stack_bytes( cfg.model_type ); stack > 0 ) {
+	if ( const size_t stack = engine::models::device_stack_bytes( cfg.model_type, cfg.model_dir ); stack > 0 ) {
 		for ( int d = 0; d < tp_; ++d ) {
 			backend::set_device( d );
 			backend::reserve_stack( stack );

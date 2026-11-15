@@ -6,6 +6,7 @@
 #include "reconstruct.cuh"
 #include "hadamard.cuh"
 #include "exl3_vl.cuh"
+#include <algorithm>
 #include <cstdlib>
 #include "engine/runtime/options.h"
 
@@ -18,6 +19,9 @@ namespace {
 int recon_threshold() {
 	return 36;
 }
+
+// The dequantized weight of that HGEMM, a slice of columns at a time (the block is taken at this size once, so it does not grow call by call)
+constexpr size_t kReconBytes = static_cast<size_t>( 64 ) << 20;
 
 } // namespace
 
@@ -45,11 +49,14 @@ void LinearTrellis::forward_recon(
 	// Hadamard's scale is the final one, so 1/sqrt(128) as in the fused kernels.
 	constexpr float kRScale = 0.088388347648f;
 	half* xh = trellis_get_workspace( device, static_cast<size_t>( m ) * k * sizeof( half ) );
-	half* w = trellis_get_recon_ws( device, static_cast<size_t>( k ) * n * sizeof( half ) );
+	const int nc = std::min( n, std::max( 128, static_cast<int>( kReconBytes / ( static_cast<size_t>( k ) * sizeof( half ) ) ) / 128 * 128 ) );
+	half* w = trellis_get_recon_ws( device, std::max( static_cast<size_t>( k ) * nc * sizeof( half ), kReconBytes ) );
 	had_r_128( x.ptr<const half>(), xh, suh.ptr<const half>(), nullptr, kRScale, m, k, stream );
-	EXL3_TILES_CALL( volta_tiles, reconstruct_slice, w, trellis.ptr<const uint16_t>(), bits, mcg, mul1, k / 16, n, 0, stream );
-
-	Gemm::nn( xh, k, w, n, out.data, n, false, m, n, k, 0.0f, stream );
+	for ( int n0 = 0; n0 < n; n0 += nc ) {
+		const int c = std::min( nc, n - n0 );
+		EXL3_TILES_CALL( volta_tiles, reconstruct_cols, w, trellis.ptr<const uint16_t>(), bits, mcg, mul1, k / 16, c, n0, n, stream );
+		Gemm::nn( xh, k, w, c, out.ptr<half>() + n0, n, false, m, c, k, 0.0f, stream );
+	}
 	had_r_128( out.ptr<const half>(), out.ptr<half>(), nullptr, svh.ptr<const half>(), kRScale, m, n, stream );
 }
 

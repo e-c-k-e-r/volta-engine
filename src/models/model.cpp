@@ -8,6 +8,7 @@
 #include "engine/loader/safetensors.h"
 #include "engine/modules/moe.h"
 #include <cstdio>
+#include <filesystem>
 
 namespace engine::models {
 
@@ -97,11 +98,17 @@ std::unique_ptr<ModelPipeline> create_model_pipeline( const std::string& model_t
 	return nullptr;
 }
 
-size_t device_stack_bytes( const std::string& model_type ) {
+size_t device_stack_bytes( const std::string& model_type, const std::string& model_dir ) {
 #if ENGINE_BACKEND_CUDA
-	if ( model_type == "deepseek_v41" ) return ext::exl3_moe_mixed_stack_bytes();   // its mixed-width packs take the run-time-width expert kernels
+	// DeepSeek's mixed-width EXL3 packs take the run-time-width expert kernels; a GGUF conversion's experts never do
+	if ( model_type == "deepseek_v41" ) {
+		std::error_code ec;
+		for ( const auto& f : std::filesystem::directory_iterator( model_dir, ec ) ) if ( f.path().extension() == ".gguf" ) return 0;
+		return ext::exl3_moe_mixed_stack_bytes();
+	}
 #else
 	(void) model_type;
+	(void) model_dir;
 #endif
 	return 0;
 }

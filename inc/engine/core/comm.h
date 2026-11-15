@@ -8,8 +8,10 @@
 
 namespace engine::comm {
 
-// Staging bytes per device the mesh needs: 16 slots (4 stages x 4 ranks) of 3 MiB.
-static constexpr size_t kMeshStagingBytes = 16 * 6 * 1024 * 1024;
+// The most one all_reduce call takes (rows x width x 2 bytes; a larger tensor goes in row ranges), one staging slot.
+static constexpr size_t kAllReduceBytes = 6 * 1024 * 1024;
+// Staging bytes per device the mesh needs: 16 slots (4 stages x 4 ranks).
+static constexpr size_t kMeshStagingBytes = 16 * kAllReduceBytes;
 
 struct CollectiveRing {
 	int   rank;

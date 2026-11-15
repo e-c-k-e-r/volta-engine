@@ -263,7 +263,7 @@ constexpr auto reconstruct_had_kernel_instances = std::array{
 };
 #undef __
 
-void reconstruct_slice(
+void reconstruct_cols(
 	half* unpacked,
 	const uint16_t* packed,
 	int K,
@@ -272,10 +272,11 @@ void reconstruct_slice(
 	int rows,
 	int cols,
 	int64_t n_offset,
+	int stride,
 	cudaStream_t stream
 ) {
 	if ( K < 1 || K > 11 || ( K > 8 && !mul1 ) ) return;
-	int packed_cols = cols / 16;
+	int packed_cols = stride / 16;
 	int packed_n_offset = n_offset / 16;
 
 	dim3 blockDim( 256 );
@@ -292,6 +293,21 @@ void reconstruct_slice(
 		packed_cols,
 		packed_n_offset
 	);
+}
+
+// defined after reconstruct_cols: the Volta-order copy (namespace exl3_vl) must call its own
+void reconstruct_slice(
+	half* unpacked,
+	const uint16_t* packed,
+	int K,
+	bool mcg,
+	bool mul1,
+	int rows,
+	int cols,
+	int64_t n_offset,
+	cudaStream_t stream
+) {
+	reconstruct_cols( unpacked, packed, K, mcg, mul1, rows, cols, n_offset, cols, stream );
 }
 
 void reconstruct_had_slice(

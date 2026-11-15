@@ -146,7 +146,8 @@ public:
 	// DSpark block drafter (speculator=dspark, draft_model_dir = the directory quantize_dspark.py wrote): three blocks of window attention and a
 	// 128-expert MoE on the same hyper-connection streams, entered through main_proj from the trunk's stream means at layers 37 / 38 / 39. The
 	// main-KV rows of the window live in three extra layers of the window ring; see ModelPipeline::dspark_forward
-	void set_reserve_after_weights( size_t bytes ) override { reserve_after_ = bytes; }
+	void defer_experts( bool on ) override { defer_experts_ = on; }
+	bool load_experts( backend::stream_t stream = nullptr ) override;
 	bool load_dspark( const char* dir, backend::stream_t stream = nullptr ) override;
 	bool has_dspark() const override { return ds_.loaded; }
 	int dspark_block() const override { return ds_.block; }
@@ -181,6 +182,9 @@ private:
 	// phases: 1 = hashes and the page requests, 2 = gather and dequantize (and upload); a window requests the pages of all its chunks first
 	void engram_prepare( const pod::BatchRows& rows, backend::stream_t stream, int chunk = 0, bool upload = true, int phases = 3 );
 	void set_rows( int m );
+	void alloc_window( pod::MemoryArena& arena, int n, bool quiet = false );
+	// e_kv_ = the Engram projection of the layer's rows (a rank's columns of it gathered over the ranks when e_split_)
+	void engram_project( const DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );
 	void forward_body( int m, backend::stream_t stream );
 	void attention( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );
 	void ffn( int layer, DeepseekV41LayerWeights& lw, int m, backend::stream_t stream );
@@ -299,10 +303,14 @@ private:
 	void upload_sub_rows( const pod::BatchRows& rows, int a, int b, backend::stream_t stream );
 	const int* hint_tokens_ = nullptr;     // set_prefetch_hint
 	int hint_count_ = 0, hint_slot_ = 0, hint_pos0_ = 0;
-	size_t reserve_after_ = 0;
+	bool defer_experts_ = false;   // load_weights stops before the routed experts; load_experts places them (after the drafter)
+	std::string model_dir_;
+	size_t dense_bytes_ = 0;
 	int tap_floor_ = 0;
 	int win_layers_ = 0;
 	int window_ = 1;
+	bool auto_window_ = false;             // prefill_window -1: window_ is sized in load_experts from what the arena has left
+	size_t win_two_bytes_ = 0, win_chunk_bytes_ = 0;   // a window of two chunks, and each further chunk
 	std::vector<WinChunk> win_;
 	pod::TensorView win_norm_, win_moe_out_, win_moe_tmp_;
 	int* win_topk_idx_ = nullptr;
@@ -356,6 +364,8 @@ private:
 	} eg_;
 	std::vector<int> pending_tokens_;
 	pod::TensorView e_rows_[2], e_kv_;
+	pod::TensorView e_kv_part_;   // this rank's columns of the projection when e_split_
+	bool e_split_ = false;        // the Engram projection's output columns split over the ranks (formats that load column ranges)
 
 	// logits / sampling
 	pod::TensorView logits_, full_logits_;

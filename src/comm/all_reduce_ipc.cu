@@ -9,7 +9,7 @@
 namespace engine::comm {
 
 // One staging slot per (stage, rank). Sized for a 512-row prefill chunk at hidden 5120 (5 MiB); 16 slots per device.
-#define IPC_SLOT_BYTES ( 6 * 1024 * 1024 )
+#define IPC_SLOT_BYTES ( kAllReduceBytes )
 
 // Flag page layout (per rank, uint32 words): [stage(4)][row(512)][rank(4)] publish flags,
 // then a device-resident sequence counter and a block-retire counter. Sequence numbers live
