@@ -197,6 +197,52 @@ float rcp_ftz( const float x ) {
 #endif
 }
 
+// comb of one row from its mix logits: softmax of each group of H, then the Sinkhorn normalization, on one thread in registers (the shuffle version
+// spent ~0.3 us per iteration on its dependent chains); the sums are taken in the butterfly order of the shuffle reductions, so the bits are the same
+template <int H>
+__device__ __forceinline__
+void hc_sinkhorn_row( const float* __restrict__ mix, const float rmr, const float scale2, const float* __restrict__ base, const float hc_eps, const int sinkhorn_iters,
+	float* __restrict__ comb_row ) {
+	static_assert( H == 4, "the register Sinkhorn is written for 4 streams" );
+	float v[H][H];
+	#pragma unroll
+	for ( int g = 0; g < H; ++g ) {
+		float e[H];
+		#pragma unroll
+		for ( int k = 0; k < H; ++k ) e[k] = fmaf( mix[g * H + k] * rmr, scale2, base[g * H + k] );
+		const float m = fmaxf( fmaxf( e[0], e[1] ), fmaxf( e[2], e[3] ) );   // softmax over a group of H
+		#pragma unroll
+		for ( int k = 0; k < H; ++k ) e[k] = __expf( e[k] - m );
+		const float sum = ( e[0] + e[1] ) + ( e[2] + e[3] );
+		#pragma unroll
+		for ( int k = 0; k < H; ++k ) v[g][k] = e[k] * rcp_ftz( sum ) + hc_eps;
+	}
+	// column normalize, then (iters - 1) x (row, column)
+	#pragma unroll
+	for ( int k = 0; k < H; ++k ) {
+		const float cs = ( v[0][k] + v[1][k] ) + ( v[2][k] + v[3][k] );
+		#pragma unroll
+		for ( int g = 0; g < H; ++g ) v[g][k] = v[g][k] * rcp_ftz( cs + hc_eps );
+	}
+	for ( int it = 0; it < sinkhorn_iters - 1; ++it ) {
+		#pragma unroll
+		for ( int g = 0; g < H; ++g ) {
+			const float rs = ( v[g][0] + v[g][1] ) + ( v[g][2] + v[g][3] );
+			#pragma unroll
+			for ( int k = 0; k < H; ++k ) v[g][k] = v[g][k] * rcp_ftz( rs + hc_eps );
+		}
+		#pragma unroll
+		for ( int k = 0; k < H; ++k ) {
+			const float cs = ( v[0][k] + v[1][k] ) + ( v[2][k] + v[3][k] );
+			#pragma unroll
+			for ( int g = 0; g < H; ++g ) v[g][k] = v[g][k] * rcp_ftz( cs + hc_eps );
+		}
+	}
+	float4* out = reinterpret_cast<float4*>( comb_row );
+	#pragma unroll
+	for ( int g = 0; g < H; ++g ) out[g] = make_float4( v[g][0], v[g][1], v[g][2], v[g][3] );
+}
+
 template <int H, int M_, bool HEAD, bool HALF_OUT, bool COLLAPSE = true>
 __device__ __forceinline__
 void hc_mix_finalize_body(
@@ -225,13 +271,28 @@ void hc_mix_finalize_body(
 	__shared__ float mix_s[M + 1];
 	__shared__ float pre_s[H];
 	__shared__ float red_s[NUM_THREADS / 32][M + 1];
+	__shared__ float base_s[M], scale_s[3];
 	const int lane = threadIdx.x % 32;
 	const int warp = threadIdx.x / 32;
+	// the mix's base and scale (cold: once a layer) loaded beside the partials
+	if ( threadIdx.x >= NUM_THREADS - 32 && lane < M ) base_s[lane] = base[lane];
+	else if ( threadIdx.x >= NUM_THREADS - 64 && lane < ( HEAD ? 1 : 3 ) ) scale_s[lane] = scale[lane];
 	if ( lane <= M ) {
+		// the warp's partials loaded at once, then summed in the same ascending order (up to kFinLoads x 8 chunks in one round)
+		constexpr int kFinLoads = 8;
 		const float* p = g_mhc_partials + static_cast<size_t>( r ) * chunksA * ( M + 1 ) + lane;
 		float v = 0.0f;
-		for ( int i = warp; i < chunksA; i += NUM_THREADS / 32 ) {
-			v += p[static_cast<size_t>( i ) * ( M + 1 )];
+		for ( int i0 = warp; i0 < chunksA; i0 += kFinLoads * ( NUM_THREADS / 32 ) ) {
+			float pv[kFinLoads];
+			#pragma unroll
+			for ( int j = 0; j < kFinLoads; ++j ) {
+				const int i = i0 + j * ( NUM_THREADS / 32 );
+				pv[j] = i < chunksA ? p[static_cast<size_t>( i ) * ( M + 1 )] : 0.0f;
+			}
+			#pragma unroll
+			for ( int j = 0; j < kFinLoads; ++j ) {
+				if ( i0 + j * ( NUM_THREADS / 32 ) < chunksA ) v += pv[j];
+			}
 		}
 		red_s[warp][lane] = v;
 	}
@@ -247,7 +308,7 @@ void hc_mix_finalize_body(
 	__syncthreads();
 	float rmr = rsqrtf( mix_s[M] / static_cast<float>( row_len ) + rms_eps );
 	if ( threadIdx.x < H ) {
-		pre_s[threadIdx.x] = engine::math::sigmoid( fmaf( mix_s[threadIdx.x] * rmr, scale[0], base[threadIdx.x] ) ) + hc_eps;
+		pre_s[threadIdx.x] = engine::math::sigmoid( fmaf( mix_s[threadIdx.x] * rmr, scale_s[0], base_s[threadIdx.x] ) ) + hc_eps;
 	}
 	__syncthreads();
 
@@ -259,51 +320,10 @@ void hc_mix_finalize_body(
 	if ( sink_warp ) {
 		if ( threadIdx.x < H ) {
 			post[static_cast<size_t>( r ) * H + threadIdx.x] =
-				2.0f * engine::math::sigmoid( fmaf( mix_s[H + threadIdx.x] * rmr, scale[1], base[H + threadIdx.x] ) );
+				2.0f * engine::math::sigmoid( fmaf( mix_s[H + threadIdx.x] * rmr, scale_s[1], base_s[H + threadIdx.x] ) );
 		}
 
-		// One thread runs the whole H x H Sinkhorn in registers (the shuffle version spent ~0.3 us per iteration on its dependent chains);
-		// the sums are taken in the butterfly order of the shuffle reductions, so the bits are the same
-		static_assert( H == 4, "the register Sinkhorn is written for 4 streams" );
-		if ( threadIdx.x == 0 ) {
-			float v[H][H];
-			#pragma unroll
-			for ( int g = 0; g < H; ++g ) {
-				float e[H];
-				#pragma unroll
-				for ( int k = 0; k < H; ++k ) e[k] = fmaf( mix_s[2 * H + g * H + k] * rmr, scale[2], base[2 * H + g * H + k] );
-				const float m = fmaxf( fmaxf( e[0], e[1] ), fmaxf( e[2], e[3] ) );   // softmax over a group of H
-				#pragma unroll
-				for ( int k = 0; k < H; ++k ) e[k] = __expf( e[k] - m );
-				const float sum = ( e[0] + e[1] ) + ( e[2] + e[3] );
-				#pragma unroll
-				for ( int k = 0; k < H; ++k ) v[g][k] = e[k] * rcp_ftz( sum ) + hc_eps;
-			}
-			// column normalize, then (iters - 1) x (row, column)
-			#pragma unroll
-			for ( int k = 0; k < H; ++k ) {
-				const float cs = ( v[0][k] + v[1][k] ) + ( v[2][k] + v[3][k] );
-				#pragma unroll
-				for ( int g = 0; g < H; ++g ) v[g][k] = v[g][k] * rcp_ftz( cs + hc_eps );
-			}
-			for ( int it = 0; it < sinkhorn_iters - 1; ++it ) {
-				#pragma unroll
-				for ( int g = 0; g < H; ++g ) {
-					const float rs = ( v[g][0] + v[g][1] ) + ( v[g][2] + v[g][3] );
-					#pragma unroll
-					for ( int k = 0; k < H; ++k ) v[g][k] = v[g][k] * rcp_ftz( rs + hc_eps );
-				}
-				#pragma unroll
-				for ( int k = 0; k < H; ++k ) {
-					const float cs = ( v[0][k] + v[1][k] ) + ( v[2][k] + v[3][k] );
-					#pragma unroll
-					for ( int g = 0; g < H; ++g ) v[g][k] = v[g][k] * rcp_ftz( cs + hc_eps );
-				}
-			}
-			float4* out = reinterpret_cast<float4*>( comb + static_cast<size_t>( r ) * H * H );
-			#pragma unroll
-			for ( int g = 0; g < H; ++g ) out[g] = make_float4( v[g][0], v[g][1], v[g][2], v[g][3] );
-		}
+		if ( threadIdx.x == 0 ) hc_sinkhorn_row<H>( mix_s + 2 * H, rmr, scale_s[2], base_s + 2 * H, hc_eps, sinkhorn_iters, comb + static_cast<size_t>( r ) * H * H );
 		return;
 	}
 	if constexpr ( !COLLAPSE ) return;
@@ -406,23 +426,64 @@ void hc_collapse_norm_kernel(
 	}
 	__syncthreads();
 	if ( !last ) return;
+	// The finalize's first warp runs the Sinkhorn while the other seven collapse the row, and those seven normalize it without waiting for the
+	// first: the RMSNorm keeps rms_norm_kernel's per-thread order and block_sum's reduction (warp 1 also takes warp 0's threads' share), and the
+	// norm weights (cold) are loaded first, in eight-value vectors, while the finalize runs
+	const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+	constexpr int kWv = 4, kNormThreads = NUM_THREADS - 32;   // vectors a thread holds: rows of up to kWv x 8 x kNormThreads values
+	const bool vec = D % 8 == 0 && D <= kWv * 8 * kNormThreads;
+	uint4 wv[kWv];
+	#pragma unroll
+	for ( int j = 0; j < kWv; ++j ) {
+		const int c = tid - 32 + j * kNormThreads;
+		if ( vec && warp > 0 && c < D / 8 ) wv[j] = reinterpret_cast<const uint4*>( norm_w )[c];
+	}
 	__threadfence();
 	hc_mix_finalize_body<H, M_, false, true>( 0, 0, streams, base, scale, post, comb, s_col, inv_rms_buf,
 		mix_logits_buf, pre_buf, D, gridDim.x, D, rms_eps, hc_eps, sinkhorn_iters );
-	__syncthreads();
-
-	// RMSNorm over the collapsed row, as rms_norm_kernel: element i is thread i % 256's, ascending
-	const int tid = threadIdx.x;
-	float local_sq = 0.0f;
+	half* dst = norm_out + static_cast<size_t>( r ) * D;
+	if ( warp == 0 ) return;
+	asm volatile( "bar.sync 1, %0;" :: "n"( kNormThreads ) );   // the collapse of the seven warps
+	float local_sq = 0.0f, local_sq0 = 0.0f;
 	for ( int i = tid; i < D; i += NUM_THREADS ) {
 		const float v = __half2float( s_col[i] );
 		local_sq = fmaf( v, v, local_sq );
 	}
-	const float inv = rsqrtf( engine::math::block_sum<8>( local_sq ) / static_cast<float>( D ) + norm_eps );
-	half* dst = norm_out + static_cast<size_t>( r ) * D;
-	for ( int i = tid; i < D; i += NUM_THREADS ) {
-		const float w = __half2float( norm_w[i] ) + norm_bias;
-		dst[i] = __float2half_rn( __half2float( s_col[i] ) * w * inv );
+	if ( warp == 1 ) {
+		for ( int i = lane; i < D; i += NUM_THREADS ) {
+			const float v = __half2float( s_col[i] );
+			local_sq0 = fmaf( v, v, local_sq0 );
+		}
+	}
+	__shared__ float s_warp[NUM_THREADS / 32];
+	const float wsum = engine::math::warp_sum( local_sq );
+	const float wsum0 = engine::math::warp_sum( local_sq0 );
+	if ( lane == 0 ) {
+		s_warp[warp] = wsum;
+		if ( warp == 1 ) s_warp[0] = wsum0;
+	}
+	asm volatile( "bar.sync 1, %0;" :: "n"( kNormThreads ) );
+	const float inv = rsqrtf( engine::math::warp_sum( lane < NUM_THREADS / 32 ? s_warp[lane] : 0.0f ) / static_cast<float>( D ) + norm_eps );
+	if ( vec ) {
+		#pragma unroll
+		for ( int j = 0; j < kWv; ++j ) {
+			const int c = tid - 32 + j * kNormThreads;
+			if ( c >= D / 8 ) break;
+			const uint4 xv = reinterpret_cast<const uint4*>( s_col )[c];
+			const half* xh = reinterpret_cast<const half*>( &xv );
+			const half* wh = reinterpret_cast<const half*>( &wv[j] );
+			uint4 ov;
+			half* oh = reinterpret_cast<half*>( &ov );
+			#pragma unroll
+			for ( int e = 0; e < 8; ++e ) oh[e] = __float2half_rn( __half2float( xh[e] ) * ( __half2float( wh[e] ) + norm_bias ) * inv );
+			reinterpret_cast<uint4*>( dst )[c] = ov;
+		}
+	}
+	else {
+		for ( int i = tid - 32; i < D; i += kNormThreads ) {
+			const float w = __half2float( norm_w[i] ) + norm_bias;
+			dst[i] = __float2half_rn( __half2float( s_col[i] ) * w * inv );
+		}
 	}
 }
 

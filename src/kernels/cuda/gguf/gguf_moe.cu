@@ -26,10 +26,16 @@ struct Item {
 	int expert, begin, count, pad;
 };
 
-// Groups the pass's routes by local expert (counting sort in one block): items[0 .. *n_items) and the route ids in expert order; counts the
-// experts' routes into heat
+// Groups the pass's routes by local expert (counting sort in block 0): items[0 .. *n_items) and the route ids in expert order; counts the
+// experts' routes into heat. Blocks 1 .. (xq != nullptr) quantize the pass's rows of x to q8_1, qx blocks of 256 values a row
 __global__ void moe_dispatch_kernel( const int* __restrict__ topk, int routes, int first, int num_local, Item* __restrict__ items, int* __restrict__ n_items,
-	int* __restrict__ sorted, uint32_t* __restrict__ heat, int item_routes ) {
+	int* __restrict__ sorted, uint32_t* __restrict__ heat, int item_routes, const half* __restrict__ x = nullptr, block_q8_1* __restrict__ xq = nullptr, int k = 0,
+	int qx = 1 ) {
+	if ( blockIdx.x > 0 ) {
+		const int b = blockIdx.x - 1;
+		quantize_q8_1_at( x, xq, k, GgufColTiling{}, b / qx, b % qx * blockDim.x + threadIdx.x );
+		return;
+	}
 	extern __shared__ int sh[];
 	int* count = sh;                  // [num_local]
 	int* start = sh + num_local;      // [num_local]
@@ -40,15 +46,29 @@ __global__ void moe_dispatch_kernel( const int* __restrict__ topk, int routes, i
 		if ( e >= 0 && e < num_local ) atomicAdd( count + e, 1 );
 	}
 	__syncthreads();
-	if ( threadIdx.x == 0 ) {
+	if ( threadIdx.x < 32 ) {
+		// warp 0, 32 experts at a time: scans of the routes and the items give each expert its first route and first item (expert order)
+		const int lane = threadIdx.x;
 		int at = 0, n = 0;
-		for ( int e = 0; e < num_local; ++e ) {
-			start[e] = at;
-			for ( int b = 0; b < count[e]; b += item_routes ) items[n++] = Item{ e, at + b, min( item_routes, count[e] - b ), 0 };
-			if ( heat != nullptr && count[e] > 0 ) heat[e] += static_cast<uint32_t>( count[e] );
-			at += count[e];
+		for ( int e0 = 0; e0 < num_local; e0 += 32 ) {
+			const int e = e0 + lane;
+			const int c = e < num_local ? count[e] : 0, ni = ( c + item_routes - 1 ) / item_routes;
+			int sc = c, sn = ni;
+			#pragma unroll
+			for ( int o = 1; o < 32; o <<= 1 ) {
+				const int tc = __shfl_up_sync( 0xffffffff, sc, o ), tn = __shfl_up_sync( 0xffffffff, sn, o );
+				if ( lane >= o ) { sc += tc; sn += tn; }
+			}
+			if ( e < num_local ) {
+				const int a = at + sc - c;
+				start[e] = a;
+				for ( int b = 0, j = n + sn - ni; b < c; b += item_routes, ++j ) items[j] = Item{ e, a + b, min( item_routes, c - b ), 0 };
+				if ( heat != nullptr && c > 0 ) heat[e] += static_cast<uint32_t>( c );
+			}
+			at += __shfl_sync( 0xffffffff, sc, 31 );
+			n += __shfl_sync( 0xffffffff, sn, 31 );
 		}
-		*n_items = n;
+		if ( lane == 0 ) *n_items = n;
 	}
 	__syncthreads();
 	// route ids in route order within an expert (deterministic): one thread per expert walks the routes
@@ -65,7 +85,7 @@ __global__ void moe_dispatch_kernel( const int* __restrict__ topk, int routes, i
 // decode passes hold fewer accumulators); GU: the same row of the up projection (ptrs_up) too, into out_up, sharing the input loads.
 // Block row y takes items y, y + gridDim.y, ...
 template <GgmlType T, int IR, bool GU>
-__global__ __launch_bounds__( 32 * kMoEWarps )
+__global__ __launch_bounds__( 32 * kMoEWarps, IR <= 2 ? 8 : 4 )
 void moe_proj_kernel( const void* const* __restrict__ ptrs, const void* const* __restrict__ ptrs_up, const Item* __restrict__ items, const int* __restrict__ n_items,
 	const int* __restrict__ sorted, const block_q8_1* __restrict__ in, bool per_token, int k, int n, const half* __restrict__ topw, int top_k, bool weighted,
 	float* __restrict__ out, float* __restrict__ out_up ) {
@@ -899,8 +919,9 @@ void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx
 		const int ir = rn <= 1 ? 1 : rn <= 2 ? 2 : rn <= 4 ? 4 : kItemRoutes, mi = std::min( routes, t.num_local + routes / ir );
 		const int* ti = topk_idx + static_cast<size_t>( r0 ) * top_k;
 		const half* tw = topk_w + static_cast<size_t>( r0 ) * top_k;
-		moe_dispatch_kernel<<<1, 256, 2 * t.num_local * sizeof( int ), stream>>>( ti, routes, t.first_expert, t.num_local, items, n_items, sorted, heat, ir );
-		quantize_q8_1_kernel<<<dim3( ( t.hidden + 255 ) / 256, rn ), 256, 0, stream>>>( x + static_cast<size_t>( r0 ) * t.hidden, xq, t.hidden, GgufColTiling{} );
+		const int qx = ( t.hidden + 255 ) / 256;   // the dispatch block, then the blocks that quantize the pass's rows
+		moe_dispatch_kernel<<<1 + qx * rn, 256, 2 * t.num_local * sizeof( int ), stream>>>( ti, routes, t.first_expert, t.num_local, items, n_items, sorted, heat, ir,
+			x + static_cast<size_t>( r0 ) * t.hidden, xq, t.hidden, qx );
 		if ( t.type[0] == t.type[1] ) proj( t.type[0], ir, gate, up, items, n_items, sorted, mi, xq, true, t.hidden, t.inter, tw, top_k, false, g, u, stream );
 		else {
 			proj( t.type[0], ir, gate, nullptr, items, n_items, sorted, mi, xq, true, t.hidden, t.inter, tw, top_k, false, g, nullptr, stream );

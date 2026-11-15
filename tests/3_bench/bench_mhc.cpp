@@ -1,9 +1,11 @@
 // GLM decode hyper-connection: time of HyperConnection::collapse_norm (mix, sinkhorn, collapse, RMSNorm) for 1..8 rows over 24 distinct
 // fn copies (cycled so the L2 does not hold them), the way a decode step meets its 156 sites; prints a checksum of the outputs. DS=1:
-// DeepSeek-V4.1's lagged form (HyperConnection::collapse_lagged_norm, hidden 5120); SINK=n Sinkhorn iterations (20).
+// DeepSeek-V4.1's lagged form (HyperConnection::collapse_lagged_norm, hidden 5120); SINK=n Sinkhorn iterations (20). The hash covers the outputs bit
+// for bit (norm, post, comb of the last site).
 //   bench_mhc [rows ...]
 #include "engine/core/arena.h"
 #include "engine/modules/mhc.h"
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -56,12 +58,14 @@ int main( int argc, char** argv ) {
 		auto logits = upload( pod::DType::FP32, rows * 24, 0.0f, 0.0f, false );
 		auto pre = upload( pod::DType::FP32, rows * HC, 0.0f, 0.0f, false );
 		auto pre_in = upload( pod::DType::FP32, rows * HC, 0.2f, 0.5f, false );
+		const int sink = std::getenv( "SINK" ) ? std::atoi( std::getenv( "SINK" ) ) : 20;
 		auto run = [&]() {
 			for ( int s = 0; s < SITES; ++s )
 				if ( ds ) ENGINE_ASSERT( engine::modules::HyperConnection::collapse_lagged_norm( streams.ptr<const float>(), fn[s].ptr<const float>(), base[s].ptr<const float>(),
 					scale[s].ptr<const float>(), pre_in.ptr<const float>(), norm_w.ptr<const half>(), norm_out.ptr<half>(), post.ptr<float>(), comb.ptr<float>(), inv.ptr<float>(),
-					logits.ptr<float>(), pre.ptr<float>(), D, std::getenv( "SINK" ) ? std::atoi( std::getenv( "SINK" ) ) : 20, 1e-6f, 1e-6f, 1.0f, stream, rows ), "collapse_lagged_norm" );
-				else ENGINE_ASSERT( engine::modules::HyperConnection::collapse_norm( streams, fn[s], base[s], scale[s], norm_w, norm_out, post, comb, inv, logits, pre, D, std::getenv( "SINK" ) ? std::atoi( std::getenv( "SINK" ) ) : 20, 1e-6f, 1e-6f, 0.0f, stream, rows ), "collapse_norm" );
+					logits.ptr<float>(), pre.ptr<float>(), D, sink, 1e-6f, 1e-6f, 1.0f, stream, rows ), "collapse_lagged_norm" );
+				else ENGINE_ASSERT( engine::modules::HyperConnection::collapse_norm( streams, fn[s], base[s], scale[s], norm_w, norm_out, post, comb, inv, logits, pre, D,
+					sink, 1e-6f, 1e-6f, 0.0f, stream, rows ), "collapse_norm" );
 		};
 		for ( int i = 0; i < 5; ++i ) run();
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
@@ -87,7 +91,13 @@ int main( int argc, char** argv ) {
 		for ( auto v : ho ) sum += __half2float( v );
 		for ( auto v : hp ) sp += v;
 		for ( auto v : hc ) sc += v;
-		std::printf( "rows %d: %.2f us per site, graph replay; checksum norm %.6f post %.6f comb %.6f\n", rows, ms * 1000.0f / iters / SITES, sum, sp, sc );
+		uint64_t hash = 1469598103934665603ull;
+		auto mix = [&]( const void* p, size_t n ) { for ( size_t i = 0; i < n; ++i ) hash = ( hash ^ static_cast<const unsigned char*>( p )[i] ) * 1099511628211ull; };
+		mix( ho.data(), ho.size() * sizeof( half ) );
+		mix( hp.data(), hp.size() * sizeof( float ) );
+		mix( hc.data(), hc.size() * sizeof( float ) );
+		std::printf( "rows %d: %.2f us per site, graph replay; checksum norm %.6f post %.6f comb %.6f, hash %016llx\n", rows, ms * 1000.0f / iters / SITES, sum, sp, sc,
+			static_cast<unsigned long long>( hash ) );
 	}
 	return 0;
 }

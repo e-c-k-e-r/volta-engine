@@ -157,20 +157,23 @@ void router_logits_kernel(
 	for ( int d = threadIdx.x; d < 128; d += 32 ) s_x[d] = __half2float( x[d] );
 	__syncwarp();
 
-	const int expert = blockIdx.x * 32 + threadIdx.x;
+	// a pair of experts a thread (one 4-byte load a dim; an even expert count), each expert's sum in the same order
+	const int expert = ( blockIdx.x * 32 + threadIdx.x ) * 2;
 	if ( expert >= num_experts ) return;
-	const half* wcol = router_weights + static_cast<size_t>( d0 ) * num_experts + expert;
-	half w[128];
+	const half2* wcol = reinterpret_cast<const half2*>( router_weights + static_cast<size_t>( d0 ) * num_experts + expert );
+	half2 w[128];
 	#pragma unroll
 	for ( int j = 0; j < 128; ++j ) {
-		w[j] = __ldg( wcol + static_cast<size_t>( j ) * num_experts );
+		w[j] = __ldg( wcol + static_cast<size_t>( j ) * ( num_experts / 2 ) );
 	}
-	float logit = 0.0f;
+	float logit = 0.0f, logit2 = 0.0f;
 	#pragma unroll
 	for ( int j = 0; j < 128; ++j ) {
-		logit = fmaf( s_x[j], __half2float( w[j] ), logit );
+		logit = fmaf( s_x[j], __low2float( w[j] ), logit );
+		logit2 = fmaf( s_x[j], __high2float( w[j] ), logit2 );
 	}
-	partials[( static_cast<size_t>( m ) * gridDim.z + ks ) * num_experts + expert] = logit;
+	float* out = partials + ( static_cast<size_t>( m ) * gridDim.z + ks ) * num_experts + expert;
+	*reinterpret_cast<float2*>( out ) = make_float2( logit, logit2 );
 }
 
 // Many rows (prefill): the same sums, but a block takes ROUTER_ROW_GROUP rows, so the weight slice it holds in registers is read once for
@@ -218,18 +221,82 @@ void router_logits_rows_kernel(
 
 // The partial logits for the selection kernels to sum
 static float* launch_router_logits( const half* x, const half* router_weights, int hidden_size, int num_experts, int rows, cudaStream_t stream ) {
+	ENGINE_ASSERT( num_experts % 2 == 0, "MoERouter: the logits kernel takes the experts in pairs" );
 	float* partials = router_partials( hidden_size / 128, num_experts );
 	if ( rows > ROUTER_ROW_GROUP ) {
 		router_logits_rows_kernel<<<dim3( ( num_experts + 31 ) / 32, ( rows + ROUTER_ROW_GROUP - 1 ) / ROUTER_ROW_GROUP, hidden_size / 128 ), dim3( 32 ), 0, stream>>>(
 			x, router_weights, partials, hidden_size, num_experts, rows );
 	}
 	else {
-		router_logits_kernel<<<dim3( ( num_experts + 31 ) / 32, rows, hidden_size / 128 ), dim3( 32 ), 0, stream>>>( x, router_weights, partials, hidden_size, num_experts );
+		router_logits_kernel<<<dim3( ( num_experts + 63 ) / 64, rows, hidden_size / 128 ), dim3( 32 ), 0, stream>>>( x, router_weights, partials, hidden_size, num_experts );
 	}
 	return partials;
 }
 
-__global__ __launch_bounds__( 288 )
+// The selection of the two kernels below, every thread of the block calling it with its expert's score v (lanes past the experts -inf): the top_k by
+// rank without sequential rounds. Every warp ranks its 32 scores against each other (a rank counts the elements that beat the element: larger, or
+// equal with the lower index) and its top_k go to a packed candidate list; then every candidate is ranked against the list by P consecutive lanes, a
+// P-th of the list each (four entries a load), the counts summed over shuffles (P = 4, or 2 above top 8, so that P x candidates fit the block; the caller's block holds
+// them). The first top_k ranks are the selection, best first, ties to the lowest expert index: chosen[0 .. top_k), and their scores in val
+__device__ __forceinline__ void router_rank_select( float v, const bool valid, const int top_k, float* __restrict__ c_val, int* __restrict__ c_idx, int* __restrict__ chosen,
+	float* __restrict__ val ) {
+	const int e = threadIdx.x, lane = e & 31, warp = e >> 5;
+	v = valid && v == v ? v : -INFINITY;
+	int rank = 0;
+	#pragma unroll
+	for ( int jj = 0; jj < 32; ++jj ) {
+		const float u = __shfl_sync( 0xffffffff, v, jj );
+		rank += ( u > v ) || ( u == v && jj < lane );
+	}
+	// the list padded to P spans of whole float4s (-inf entries rank behind every candidate)
+	const int cands = static_cast<int>( blockDim.x / 32 ) * top_k, P = top_k > 8 ? 2 : 4, ci = e / P, pq = e % P, span = ( ( cands + P - 1 ) / P + 3 ) / 4 * 4;
+	if ( rank < top_k ) {
+		c_val[warp * top_k + rank] = v;
+		c_idx[warp * top_k + rank] = valid ? e : 0x7fffffff;
+	}
+	if ( e >= cands && e < P * span ) {
+		c_val[e] = -INFINITY;
+		c_idx[e] = 0x7fffffff;
+	}
+	__syncthreads();
+	if ( e < ( cands * P + 31 ) / 32 * 32 ) {   // whole warps, so the shuffles see every lane of a group
+		const bool own = ci < cands;
+		const float cv = own ? c_val[ci] : -INFINITY;
+		const int cvi = own ? c_idx[ci] : 0x7fffffff;
+		int r = 0, r2 = 0;
+		for ( int c = pq * span; c < ( pq + 1 ) * span; c += 4 ) {
+			const float4 u = *reinterpret_cast<const float4*>( &c_val[c] );
+			const int4 ui = *reinterpret_cast<const int4*>( &c_idx[c] );
+			r += ( u.x > cv ) || ( u.x == cv && ui.x < cvi );
+			r2 += ( u.y > cv ) || ( u.y == cv && ui.y < cvi );
+			r += ( u.z > cv ) || ( u.z == cv && ui.z < cvi );
+			r2 += ( u.w > cv ) || ( u.w == cv && ui.w < cvi );
+		}
+		r += r2;
+		r += __shfl_xor_sync( 0xffffffff, r, 1 );
+		if ( P == 4 ) r += __shfl_xor_sync( 0xffffffff, r, 2 );
+		if ( own && pq == 0 && r < top_k && cvi != 0x7fffffff ) {
+			chosen[r] = cvi;
+			if ( val != nullptr ) val[r] = cv;
+		}
+	}
+	__syncthreads();
+}
+
+// The k_slices partial logits of expert e of row m in slice order, all loads issued before the first add
+__device__ __forceinline__ float router_logit( const float* __restrict__ partials, int m, int e, int num_experts, int k_slices ) {
+	float p[ROUTER_MAX_KSLICES];
+	#pragma unroll
+	for ( int ks = 0; ks < ROUTER_MAX_KSLICES; ++ks ) p[ks] = ks < k_slices ? partials[( static_cast<size_t>( m ) * k_slices + ks ) * num_experts + e] : 0.0f;
+	float logit = 0.0f;
+	#pragma unroll
+	for ( int ks = 0; ks < ROUTER_MAX_KSLICES; ++ks ) if ( ks < k_slices ) logit += p[ks];
+	return logit;
+}
+
+// One block per row, a thread per expert (whole warps, the candidates of router_rank_select fitting): sigmoid scores, the selection on the scores
+// plus e_score_bias (and the steering biases), the weights from the raw scores of the chosen over their sum (in rank order)
+__global__ __launch_bounds__( 512 )
 void router_select_kernel(
 	const float* __restrict__ partials,
 	const half* __restrict__ e_score_bias,
@@ -244,22 +311,19 @@ void router_select_kernel(
 	float routed_scaling_factor,
 	int k_slices
 ) {
-	__shared__ float s_raw[288];
-	__shared__ float s_select[288];
+	__shared__ float s_raw[ROUTER_MAX_EXPERTS];
+	__shared__ __align__( 16 ) float c_val[16 * 16];
+	__shared__ __align__( 16 ) int c_idx[16 * 16];
+	__shared__ int s_sel[16];
 	const int m = blockIdx.x;
 	topk_indices += m * top_k;
 	topk_weights += m * top_k;
-	// One thread per expert: the k_slices partials are independent loads, all in flight at once (a lane looping over
-	// 9 experts x 32 slices serialized them, 22 us). Same ascending slice order, so the logit is bit-identical.
 	const int expert = threadIdx.x;
-	if ( expert < num_experts ) {
-		float logit = 0.0f;
-		#pragma unroll 8
-		for ( int ks = 0; ks < k_slices; ++ks ) {
-			logit += partials[( static_cast<size_t>( m ) * k_slices + ks ) * num_experts + expert];
-		}
-		const float raw_score = engine::math::sigmoid( logit );
-		float select_score = raw_score;
+	const bool valid = expert < num_experts;
+	float select_score = 0.0f;
+	if ( valid ) {
+		const float raw_score = engine::math::sigmoid( router_logit( partials, m, expert, num_experts, k_slices ) );
+		select_score = raw_score;
 		if ( e_score_bias != nullptr ) {
 			select_score += __half2float( e_score_bias[expert] );
 		}
@@ -267,64 +331,18 @@ void router_select_kernel(
 		if ( slot_bias != nullptr ) select_score += slot_bias[static_cast<size_t>( rows_desc->slot[m] ) * bias_stride + expert];
 		if ( expert_bias != nullptr ) select_score += expert_bias[expert];
 		s_raw[expert] = raw_score;
-		s_select[expert] = select_score;
 	}
-	__syncthreads();
-
-	// Top-k by rank, no sequential rounds (the selection of router_softmax_select_kernel): every warp ranks its 32 scores against each other,
-	// then the surviving candidates (at most top_k per warp) are ranked against each other. A rank counts the elements that beat the element
-	// (larger, or equal with the lower index), so the first top_k ranks are the selection, best first, ties to the lowest expert index
-	__shared__ __align__( 16 ) float s_cval[16 * 16];
-	__shared__ __align__( 16 ) int s_cidx[16 * 16];
-	__shared__ int s_sel[16];
-	for ( int c = threadIdx.x; c < 16 * 16; c += blockDim.x ) {
-		s_cval[c] = -INFINITY;
-		s_cidx[c] = 0x7fffffff;
-	}
-	__syncthreads();
-	{
-		const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-		float v = expert < num_experts ? s_select[expert] : -INFINITY;
-		v = v != v ? -INFINITY : v;
-		int rank = 0;
-		#pragma unroll
-		for ( int jj = 0; jj < 32; ++jj ) {
-			const float u = __shfl_sync( 0xffffffff, v, jj );
-			rank += ( u > v ) || ( u == v && jj < lane );
-		}
-		if ( rank < top_k && expert < num_experts ) {
-			s_cval[warp * 16 + rank] = v;
-			s_cidx[warp * 16 + rank] = expert;
-		}
-	}
-	__syncthreads();
-	if ( threadIdx.x < 16 * 16 ) {
-		const float v = s_cval[threadIdx.x];
-		const int vi = s_cidx[threadIdx.x];
-		int rank = 0, rank2 = 0;
-		#pragma unroll 8
-		for ( int c = 0; c < 16 * 16; c += 4 ) {
-			const float4 u = *reinterpret_cast<const float4*>( &s_cval[c] );
-			const int4 ui = *reinterpret_cast<const int4*>( &s_cidx[c] );
-			rank += ( u.x > v ) || ( u.x == v && ui.x < vi );
-			rank2 += ( u.y > v ) || ( u.y == v && ui.y < vi );
-			rank += ( u.z > v ) || ( u.z == v && ui.z < vi );
-			rank2 += ( u.w > v ) || ( u.w == v && ui.w < vi );
-		}
-		rank += rank2;
-		if ( rank < top_k && vi != 0x7fffffff ) s_sel[rank] = vi;
-	}
-	__syncthreads();
-	if ( threadIdx.x == 0 ) {
-		float sum_scores = 0.0f;
-		for ( int i = 0; i < top_k; ++i ) {
-			sum_scores += s_raw[s_sel[i]];
-		}
-		const float inv_sum = routed_scaling_factor / ( sum_scores + 1e-9f );
-		for ( int i = 0; i < top_k; ++i ) {
-			topk_indices[i] = s_sel[i];
-			topk_weights[i] = __float2half_rn( s_raw[s_sel[i]] * inv_sum );
-		}
+	router_rank_select( select_score, valid, top_k, c_val, c_idx, s_sel, nullptr );
+	if ( threadIdx.x >= 32 ) return;
+	const int lane = threadIdx.x;
+	const int ck = lane < top_k ? s_sel[lane] : 0;
+	const float sk = lane < top_k ? s_raw[ck] : 0.0f;
+	float sum_scores = 0.0f;
+	for ( int i = 0; i < top_k; ++i ) sum_scores += __shfl_sync( 0xffffffff, sk, i );
+	const float inv_sum = routed_scaling_factor / ( sum_scores + 1e-9f );
+	if ( lane < top_k ) {
+		topk_indices[lane] = ck;
+		topk_weights[lane] = __float2half_rn( sk * inv_sum );
 	}
 }
 
@@ -339,77 +357,29 @@ void router_softmax_select_kernel(
 	int k_slices,
 	int round_fp16
 ) {
-	__shared__ float s_logit[ROUTER_MAX_EXPERTS];
+	__shared__ __align__( 16 ) float c_val[16 * 16 * 2];
+	__shared__ __align__( 16 ) int c_idx[16 * 16 * 2];
+	__shared__ int s_sel[16];
+	__shared__ float s_val[16];
 	const int m = blockIdx.x;
 	topk_indices += m * top_k;
 	topk_weights += m * top_k;
 	const int expert = threadIdx.x;
-	if ( expert < num_experts ) {
-		float logit = 0.0f;
-		#pragma unroll 8
-		for ( int ks = 0; ks < k_slices; ++ks ) {
-			logit += partials[( static_cast<size_t>( m ) * k_slices + ks ) * num_experts + expert];
-		}
-		s_logit[expert] = round_fp16 ? __half2float( __float2half_rn( logit ) ) : logit;
+	const bool valid = expert < num_experts;
+	float logit = 0.0f;
+	if ( valid ) {
+		logit = router_logit( partials, m, expert, num_experts, k_slices );
+		logit = round_fp16 ? __half2float( __float2half_rn( logit ) ) : logit;
 	}
-	__syncthreads();
-	// Two-stage rank selection, no sequential rounds: (1) every warp ranks its 32 logits against each other (an element with top_k better ones in its own warp
-	// cannot be in the top_k), (2) the surviving candidates (at most top_k per warp, in fixed slots) are ranked against each other. A rank counts the
-	// elements that beat the element (larger, or equal with the lower index), so the first top_k ranks are the selection in order, ties to the lower index
-	__shared__ __align__( 16 ) float s_cval[16 * 16];
-	__shared__ __align__( 16 ) int s_cidx[16 * 16];
-	__shared__ int s_sel[16];
-	__shared__ float s_val[16];
-	for ( int c = threadIdx.x; c < 16 * 16; c += blockDim.x ) {
-		s_cval[c] = -INFINITY;
-		s_cidx[c] = 0x7fffffff;
-	}
-	__syncthreads();
-	{
-		const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-		float v = expert < num_experts ? s_logit[expert] : -INFINITY;
-		v = v != v ? -INFINITY : v;
-		int rank = 0;
-		#pragma unroll
-		for ( int jj = 0; jj < 32; ++jj ) {
-			const float u = __shfl_sync( 0xffffffff, v, jj );
-			rank += ( u > v ) || ( u == v && jj < lane );
-		}
-		if ( rank < top_k && expert < num_experts ) {
-			s_cval[warp * 16 + rank] = v;
-			s_cidx[warp * 16 + rank] = expert;
-		}
-	}
-	__syncthreads();
-	if ( threadIdx.x < 16 * 16 ) {
-		const float v = s_cval[threadIdx.x];
-		const int vi = s_cidx[threadIdx.x];
-		int rank = 0;
-		// Four candidates per load, two independent counters: the shared-memory latency is what this loop costs
-		int rank2 = 0;
-		#pragma unroll 8
-		for ( int c = 0; c < 16 * 16; c += 4 ) {
-			const float4 u = *reinterpret_cast<const float4*>( &s_cval[c] );
-			const int4 ui = *reinterpret_cast<const int4*>( &s_cidx[c] );
-			rank += ( u.x > v ) || ( u.x == v && ui.x < vi );
-			rank2 += ( u.y > v ) || ( u.y == v && ui.y < vi );
-			rank += ( u.z > v ) || ( u.z == v && ui.z < vi );
-			rank2 += ( u.w > v ) || ( u.w == v && ui.w < vi );
-		}
-		rank += rank2;
-		if ( rank < top_k && vi != 0x7fffffff ) {
-			s_sel[rank] = vi;
-			s_val[rank] = v;
-		}
-	}
-	__syncthreads();
-	if ( threadIdx.x == 0 ) {
-		float sum = 0.0f;
-		for ( int i = 0; i < top_k; ++i ) sum += __expf( s_val[i] - s_val[0] );
-		for ( int i = 0; i < top_k; ++i ) {
-			topk_indices[i] = s_sel[i];
-			topk_weights[i] = __float2half_rn( __expf( s_val[i] - s_val[0] ) / sum );
-		}
+	router_rank_select( logit, valid, top_k, c_val, c_idx, s_sel, s_val );
+	if ( threadIdx.x >= 32 ) return;
+	const int lane = threadIdx.x;
+	const float ex = lane < top_k ? __expf( s_val[lane] - s_val[0] ) : 0.0f;
+	float sum = 0.0f;
+	for ( int i = 0; i < top_k; ++i ) sum += __shfl_sync( 0xffffffff, ex, i );
+	if ( lane < top_k ) {
+		topk_indices[lane] = s_sel[lane];
+		topk_weights[lane] = __float2half_rn( ex / sum );
 	}
 }
 
@@ -584,7 +554,7 @@ void MoERouter::route_topk(
 ) {
 	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS, "MoERouter::route_topk: rows out of range" );
 	ENGINE_ASSERT( slot_bias == nullptr || d_rows != nullptr, "MoERouter::route_topk: a slot bias needs the rows' slots" );
-	ENGINE_ASSERT( top_k <= 16 && num_experts <= 288 && hidden_size % 128 == 0, "MoERouter::route_topk: top_k / num_experts / hidden_size out of range" );
+	ENGINE_ASSERT( top_k <= 16 && num_experts <= ROUTER_MAX_EXPERTS && hidden_size % 128 == 0, "MoERouter::route_topk: top_k / num_experts / hidden_size out of range" );
 	ENGINE_ASSERT( hidden_size / 128 <= ROUTER_MAX_KSLICES, "MoERouter::route_topk: hidden_size exceeds the router k slices" );
 	const float* partials = launch_router_logits( x.ptr<const half>(), router_weights.ptr<const half>(), hidden_size, num_experts, rows, stream );
 	router_select_kernel<<<dim3( rows ), dim3( ( num_experts + 31 ) / 32 * 32 ), 0, stream>>>(

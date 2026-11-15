@@ -5,6 +5,7 @@
 #include "engine/core/arena.h"
 #include "engine/modules/moe.h"
 #include "engine/modules/dsv4.h"
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -13,7 +14,7 @@ int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	const bool glm = std::getenv( "GLM" ) != nullptr;   // GLM: sigmoid scores with a selection bias (route_topk)
 	const bool ds = std::getenv( "DS" ) != nullptr;
-	const int H = ds ? 5120 : glm ? 4096 : 2560, E = ds ? 384 : glm ? 256 : 512, K = ds ? 6 : glm ? 8 : 10, LAYERS = 48;
+	const int H = ds ? 5120 : glm ? 4096 : 2560, E = ds ? 384 : glm ? 288 : 512, K = ds ? 6 : glm ? 8 : 10, LAYERS = 48;
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	cudaStream_t stream;
 	CUDA_CHECK( cudaStreamCreate( &stream ) );
@@ -81,10 +82,16 @@ int main( int argc, char** argv ) {
 		CUDA_CHECK( cudaEventElapsedTime( &ms, e0, e1 ) );
 		std::printf( "rows %d: %.1f us per layer (%.2f ms per 48 layers), graph replay\n", rows, ms * 1000.0f / iters / LAYERS, ms / iters );
 		std::vector<int> hi( rows * K );
+		std::vector<half> hw( rows * K );
 		CUDA_CHECK( cudaMemcpy( hi.data(), idx, hi.size() * sizeof( int ), cudaMemcpyDeviceToHost ) );
+		CUDA_CHECK( cudaMemcpy( hw.data(), wt, hw.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+		uint64_t hash = 1469598103934665603ull;   // every row's experts and weights, bit for bit
+		auto mix = [&]( const void* p, size_t n ) { for ( size_t i = 0; i < n; ++i ) hash = ( hash ^ static_cast<const unsigned char*>( p )[i] ) * 1099511628211ull; };
+		mix( hi.data(), hi.size() * sizeof( int ) );
+		mix( hw.data(), hw.size() * sizeof( half ) );
 		std::printf( "  row 0 top-k:" );
 		for ( int k = 0; k < K; ++k ) std::printf( " %d", hi[k] );
-		std::printf( "\n" );
+		std::printf( ", hash %016llx\n", static_cast<unsigned long long>( hash ) );
 	}
 	return 0;
 }
