@@ -814,8 +814,11 @@ pod::MoEScratch MoE::alloc_scratch(
 		const size_t slots = MOE_COOP_MAX_SLOTS;
 		s.coop_had_g = s.state_g;
 		s.coop_had_u = s.state_u;
-		s.coop_gu_g = reinterpret_cast<float*>( s.interm_g );
-		s.coop_gu_u = reinterpret_cast<float*>( s.interm_u );
+		// the gate / up partials of every split-k part: in the persistent kernel's staging when it holds them
+		const size_t gu_bytes = static_cast<size_t>( MOE_COOP_KSPLIT_MAX ) * slots * intermediate_size * sizeof( float );
+		const bool gu_alias = gu_bytes <= interm_elems * sizeof( half );
+		s.coop_gu_g = gu_alias ? reinterpret_cast<float*>( s.interm_g ) : static_cast<float*>( engine::core::arena_alloc( arena, gu_bytes ) );
+		s.coop_gu_u = gu_alias ? reinterpret_cast<float*>( s.interm_u ) : static_cast<float*>( engine::core::arena_alloc( arena, gu_bytes ) );
 		s.coop_act = static_cast<half*>( engine::core::arena_alloc( arena, slots * intermediate_size * sizeof( half ) ) );
 		s.coop_d_out = static_cast<float*>( engine::core::arena_alloc( arena, slots * hidden_size * sizeof( float ) ) );
 		const size_t ctr_bytes = static_cast<size_t>( moe_coop_ctr_len( hidden_size, intermediate_size ) ) * sizeof( int );
@@ -876,7 +879,7 @@ void MoE::forward(
 	const bool sharded = weights.num_local_experts > 72;
 	const int num_groups = sharded ? MOE_MAX_GROUPS : rows == 1 ? 1 : rows <= 16 ? 4 : MOE_MAX_GROUPS;
 	// Fused decode path: gate/up and down GEMV kernels over runs of rows that share an expert (exl3_moe_coop.cuh)
-	// 3 bpw (up to 8 routes: the integer tile) and 4 bpw experts, all mul1
+	// 1 to 4 bpw and the half-integer rates, mul1 experts (the int8 tile or the tensor-core one, by width, rows and tile order)
 	if ( weights.type == pod::QuantType::GGUF ) {
 		ENGINE_ASSERT( scratch.gguf_ws != nullptr && weights.device_ptrs != nullptr, "MoE::forward: GGUF experts need their scratch and init_device_ptrs" );
 		MoEGguf::Table t;

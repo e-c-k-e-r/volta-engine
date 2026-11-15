@@ -25,7 +25,7 @@ The model type is read from the checkpoint, never configured. Anything else is a
 | Feature | Status | Option | Covered by |
 |---|---|---|---|
 | EXL3 (trellis) GEMM / GEMV / MoE kernels, ported to SM70 | default | | `test_trellis`, `test_rows`, `test_moe` |
-| int8 dp4a GEMV and MoE tiles for short runs (the 7 / 8-bit projections, GLM experts up to 4 rows) | default | | `test_gemv_int8`, `bench_decode` |
+| int8 dp4a GEMV and MoE tiles for short runs (the 7 / 8-bit projections; experts up to 4 rows: every width in the stock tile order, 3 bits in the Volta order) | default | `moe_coop_mode` | `test_gemv_int8`, `bench_decode`, `bench_moe_routes` |
 | NVFP4 (compressed-tensors and modelopt), software-unpacked FP16 `m8n8k4` kernels | opt-in | `nvfp4_experts`, `nvfp4_dense`, `nvfp4_dense_src` | `test_nvfp4_linear`, `bench_nvfp4*` |
 | NVFP4 dense groups from a calibrated (LDLQ) directory instead of round-to-nearest | opt-in | `nvfp4_dense_dir`, `hessian_dir`, `hessian_layers` | `test_ppl`, `tests/tools/nvfp4_ldlq.py` |
 | Mixed checkpoints: EXL3 directory stays the model, NVFP4 pieces swapped in at load | opt-in | as above | `configs/flash_next_nvfp4.json`, `configs/qwen_nvfp4.json`, `configs/glm_256k.json` |

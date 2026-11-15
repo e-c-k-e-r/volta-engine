@@ -3,24 +3,32 @@
 //   bench_moe_routes [layer] [rows ...]   (with rows: prefill-sized calls, tokens routed uniformly over all 512 experts, rank 0's 128 are local)
 //   BENCH_GLM=1 bench_moe_routes [layer] [rows ...]   GLM-5.3-Flash's experts instead (H 4096, I 2048, 72 of 288 experts on rank 0, top 8); per-route times
 //   are also printed as GB/s of packed expert weights
+//   BENCH_DSV41=1 bench_moe_routes [layer] [rows ...]   DeepSeek-V4.1-Flash's EXL3 experts (H 5120, I 2304, rank 0's 96 of 384, top 6), each projection at
+//   its pack's width (the 1.68 bpw pack: 2 bits in some layers, 1.5 in the others)
+//   BENCH_CHECK=1: per route count, the default tile's output against the tensor-core tile's (moe_coop_mode 0)
 #include "engine/runtime/test_paths.h"
 #include "engine/config.h"
 #include "engine/core/arena.h"
 #include "engine/loader/safetensors.h"
 #include "engine/modules/moe.h"
+#include "engine/modules/trellis_bits.h"
+#include "engine/runtime/options.h"
 #include "trellis_context.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
+#include <algorithm>
 #include <vector>
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	const bool glm = std::getenv( "BENCH_GLM" ) != nullptr;
-	const char* dir = engine::runtime::test::model_path( glm ? "ENGINE_TEST_GLM_DIR" : "ENGINE_TEST_FLASH_DIR" );
-	const int BITS = std::getenv( "BENCH_BITS" ) ? std::atoi( std::getenv( "BENCH_BITS" ) ) : 4;   // the experts' bit width (Qwen3.8-Flash-Next-exl3: 2)
-	const int L = argc > 1 ? std::atoi( argv[1] ) : ( glm ? 3 : 10 );
-	const int H = glm ? 4096 : 2560, I = glm ? 2048 : 640, E = glm ? 72 : 128, K = glm ? 8 : 10;
-	const int TOTAL = glm ? 288 : 512;
+	const bool ds = std::getenv( "BENCH_DSV41" ) != nullptr;
+	const bool glm = !ds && std::getenv( "BENCH_GLM" ) != nullptr;
+	const char* dir = engine::runtime::test::model_path( ds ? "ENGINE_TEST_DSV41_DIR" : glm ? "ENGINE_TEST_GLM_DIR" : "ENGINE_TEST_FLASH_DIR" );
+	int BITS = std::getenv( "BENCH_BITS" ) ? std::atoi( std::getenv( "BENCH_BITS" ) ) : 4;   // the experts' bit width (Qwen3.8-Flash-Next-exl3: 2; DeepSeek: from the pack)
+	const int L = argc > 1 ? std::atoi( argv[1] ) : ( ds ? 3 : glm ? 3 : 10 );
+	const int H = ds ? 5120 : glm ? 4096 : 2560, I = ds ? 2304 : glm ? 2048 : 640, E = ds ? 96 : glm ? 72 : 128, K = ds ? 6 : glm ? 8 : 10;
+	const int TOTAL = ds ? 384 : glm ? 288 : 512;
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	engine::modules::trellis_context_init_all();
 	engine::modules::trellis_get_workspace( 0, 16 * 1024 * 1024 );
@@ -36,14 +44,28 @@ int main( int argc, char** argv ) {
 	mw.num_local_experts = E;
 	mw.top_k = K;
 	char name[256];
-	for ( int e = 0; e < E; ++e ) {
+	if ( ds ) {
+		std::snprintf( name, sizeof( name ), "layers.%d.ffn.experts.0.w1.trellis", L );
+		const auto* meta = repo.find( name );
+		ENGINE_ASSERT( meta != nullptr && meta->ndim == 3, "DeepSeek expert tensor" );
+		BITS = engine::modules::trellis_code_from_u16( meta->shape[2] );
+	}
+	for ( int e = 0; e < E && ds; ++e ) {
+		const char* w[3] = { "w1", "w3", "w2" };
+		pod::LinearWeight* dst[3] = { &mw.gate[e], &mw.up[e], &mw.down[e] };
+		for ( int q = 0; q < 3; ++q ) {
+			std::snprintf( name, sizeof( name ), "layers.%d.ffn.experts.%d.%s", L, e, w[q] );
+			*dst[q] = repo.load_linear( name, arena, BITS, stream );
+		}
+	}
+	for ( int e = 0; e < E && !ds; ++e ) {
 		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, e ); mw.gate[e] = repo.load_linear( name, arena, BITS, stream );
 		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, e ); mw.up[e] = repo.load_linear( name, arena, BITS, stream );
 		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, e ); mw.down[e] = repo.load_linear( name, arena, BITS, stream );
 	}
 	engine::modules::MoE::init_device_ptrs( mw, arena, stream );
 	std::printf( "[*] layer %d experts: bits %d, mul1 %d\n", L, mw.gate[0].bits, mw.gate[0].mul1 );
-	const double expert_bytes = 3.0 * H * I * mw.gate[0].bits / 8.0;   // packed trellis weights of one expert (gate + up + down)
+	const double expert_bytes = 3.0 * H * I * engine::modules::trellis_k2( mw.gate[0].bits ) / 16.0;   // packed trellis weights of one expert (gate + up + down)
 	std::printf( "[*] one expert: %.2f MB packed\n", expert_bytes / 1e6 );
 	int hs[2] = { 1, H };
 	auto x = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, hs, 2 );
@@ -65,7 +87,7 @@ int main( int argc, char** argv ) {
 	cudaEvent_t e0, e1;
 	CUDA_CHECK( cudaEventCreate( &e0 ) );
 	CUDA_CHECK( cudaEventCreate( &e1 ) );
-	std::vector<int> counts = { 0, 1, 2, 3, 4, 5, 6, 8, 10 };
+	std::vector<int> counts = ds ? std::vector<int>{ 0, 1, 2, 3, 4, 5, 6 } : std::vector<int>{ 0, 1, 2, 3, 4, 5, 6, 8, 10 };
 	if ( const char* only = std::getenv( "BENCH_ROUTES" ) ) counts = { std::atoi( only ) };   // a single route count (for a profiler)
 	for ( int n : counts ) {
 		std::vector<int> hi( SETS * K );
@@ -82,6 +104,24 @@ int main( int argc, char** argv ) {
 			}
 		}
 		CUDA_CHECK( cudaMemcpy( d_idx, hi.data(), hi.size() * sizeof( int ), cudaMemcpyHostToDevice ) );
+		if ( std::getenv( "BENCH_CHECK" ) && n > 0 ) {
+			// the default tile against the tensor-core one (moe_coop_mode 0) on the same routes
+			std::vector<half> o0( H ), o1( H );
+			auto& mode = engine::runtime::options().moe_coop_mode;
+			const int keep = mode;
+			mode = 0;
+			engine::modules::MoE::forward( x, mw, d_idx, d_w, out, 0, E, scratch, 0.0f, stream );
+			CUDA_CHECK( cudaMemcpy( o0.data(), out.data, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
+			mode = keep;
+			engine::modules::MoE::forward( x, mw, d_idx, d_w, out, 0, E, scratch, 0.0f, stream );
+			CUDA_CHECK( cudaMemcpy( o1.data(), out.data, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
+			double mx = 0, num = 0, den = 0;
+			for ( int i = 0; i < H; ++i ) {
+				const double a = __half2float( o0[i] ), b = __half2float( o1[i] );
+				mx = std::max( mx, std::abs( a - b ) ); num += ( a - b ) * ( a - b ); den += a * a;
+			}
+			std::printf( "  check %d routes: max |diff| %.3g, relative rms %.3g\n", n, mx, std::sqrt( num / std::max( den, 1e-30 ) ) );
+		}
 		for ( int it = 0; it < 4; ++it ) engine::modules::MoE::forward( x, mw, d_idx + ( it % SETS ) * K, d_w, out, 0, E, scratch, 0.0f, stream );
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		const int iters = 256;

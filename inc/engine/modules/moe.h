@@ -47,12 +47,12 @@ struct MoEScratch {
 	engine::backend::half_t*    planes = nullptr;         // [MOE_MAX_GROUPS, max_rows, hidden] per-group output planes
 	size_t   planes_bytes = 0;         // its size (the ROCm expert-grouped prefill path works in this memory)
 	// Fused decode path (exl3_moe_coop.cuh): scratch for up to 16 rows
-	engine::backend::half_t*    coop_had_g = nullptr;     // [128 slots, hidden]
+	engine::backend::half_t*    coop_had_g = nullptr;     // [MOE_COOP_MAX_SLOTS, hidden]
 	engine::backend::half_t*    coop_had_u = nullptr;
-	float*   coop_gu_g = nullptr;      // [2 split-k, 128 slots, intermediate]
+	float*   coop_gu_g = nullptr;      // [MOE_COOP_KSPLIT_MAX split-k, MOE_COOP_MAX_SLOTS, intermediate]
 	float*   coop_gu_u = nullptr;
-	engine::backend::half_t*    coop_act = nullptr;       // [128 slots, intermediate]
-	float*   coop_d_out = nullptr;     // [128 slots, hidden]
+	engine::backend::half_t*    coop_act = nullptr;       // [MOE_COOP_MAX_SLOTS, intermediate]
+	float*   coop_d_out = nullptr;     // [MOE_COOP_MAX_SLOTS, hidden]
 	int*     coop_ctr = nullptr;       // completion counters + run table, zero between calls
 	// NVFP4 experts (MOE_NVFP4_ROWS rows per pass)
 	engine::backend::half_t*    nv_h = nullptr;           // [rows * top_k, intermediate]

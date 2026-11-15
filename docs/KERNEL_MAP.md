@@ -12,7 +12,7 @@ Kernel family -> file -> tier -> what verifies it. Tiers are those of [CAPABILIT
 | int8 dp4a GEMV (M <= 2) | `exl3_gemv_int8.cu`, `exl3_gemv_int8_kernel.cuh` | CudaSm70 | `test_gemv_int8` |
 | Dequantize for large M (recon + HGEMM) | `reconstruct.cu`, `exl3_dq.cuh`, `codebook.cuh` | CudaSm70 (CPU: native threaded dequant) | `test_trellis`, `test_ops_linear` |
 | Hadamard rotation | `hadamard.cu`, `hadamard_inner.cuh` | CudaSm70 | `test_trellis` |
-| Fused MoE (persistent and cooperative, int8 tile) | `exl3_moe_kernel.cuh`, `exl3_moe_coop.cu`, `exl3_moe_common.cuh` | CudaSm70 | `test_moe`, `test_ops_moe`, `bench_moe_prefill` |
+| Fused MoE (persistent and cooperative, int8 tile) | `exl3_moe_kernel.cuh`, `exl3_moe_coop.cu`, `exl3_moe_common.cuh` | CudaSm70 | `test_moe`, `test_ops_moe`, `bench_moe_prefill`, `bench_moe_routes` |
 | Workspace state | `trellis_context.cu/.h` | n/a | used by every kernel above |
 
 ## NVFP4: `src/kernels/cuda/nvfp4/skinny_kernels.cu`
