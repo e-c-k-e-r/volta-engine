@@ -344,6 +344,34 @@ void ModelCluster::forward( const int* tokens, int count, int pos, int slot ) {
 	forward( tokens, pod::BatchRows::causal( count, pos, slot ) );
 }
 
+bool ModelCluster::forward_device( const int* d_tokens, const pod::BatchRows& rows, int* preds ) {
+	if ( mm_slots_ != 0 || !models_[0]->embeds_device_tokens() ) return false;
+	ForwardTimer timer{ rows.count };
+	// recorded here, in program order, before any rank queues its forward on stream 0
+	for ( int d = 1; d < tp_; ++d ) {
+		backend::set_device( d );
+		backend::stream_wait_peer( streams_[d], streams_[0], 0 );
+	}
+	int toks[ENGINE_NUM_GPUS][pod::MAX_BATCH];
+	float vals[ENGINE_NUM_GPUS][pod::MAX_BATCH];
+	int sharded[ENGINE_NUM_GPUS] = {};
+	pool_.run( [&]( int d ) {
+		models_[d]->embed_tokens_device( d_tokens, 0, rows.count, streams_[d] );
+		models_[d]->forward( rows, streams_[d] );
+		if ( preds != nullptr ) sharded[d] = models_[d]->sample_local( toks[d], vals[d], rows.count, streams_[d] ) ? 1 : 0;
+		if ( !sharded[d] ) backend::stream_sync( streams_[d] );
+	} );
+	if ( preds == nullptr ) return true;
+	backend::set_device( 0 );
+	if ( !sharded[0] ) {
+		models_[0]->sample_tokens( preds, rows.count, streams_[0] );
+		return true;
+	}
+	for ( int d = 1; d < tp_; ++d ) ENGINE_ASSERT( sharded[d] != 0, "ModelCluster::forward_device: vocabulary sharding must be uniform across ranks" );
+	merge_shard_argmax( toks, vals, rows.count, preds );
+	return true;
+}
+
 void ModelCluster::dspark_draft( int slot, int pos, int from, int win_start, int anchor, int* drafts, float* conf ) {
 	pool_.run( [&]( int d ) {
 		models_[d]->dspark_forward( slot, pos, from, win_start, anchor, streams_[d] );
@@ -578,6 +606,10 @@ void ModelCluster::sample( int* out, int count ) {
 	for ( int d = 1; d < tp_; ++d ) {
 		ENGINE_ASSERT( sharded[d] != 0, "ModelCluster::sample: vocabulary sharding must be uniform across ranks" );
 	}
+	merge_shard_argmax( toks, vals, count, out );
+}
+
+void ModelCluster::merge_shard_argmax( const int ( *toks )[pod::MAX_BATCH], const float ( *vals )[pod::MAX_BATCH], int count, int* out ) const {
 	for ( int r = 0; r < count; ++r ) {
 		int best = toks[0][r];
 		float best_val = vals[0][r];

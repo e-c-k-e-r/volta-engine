@@ -162,6 +162,8 @@ public:
 	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
 
 	void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) override;
+	bool embeds_device_tokens() const override { return true; }
+	void embed_tokens_device( const int* d_tokens, int src_dev, int count, backend::stream_t stream = nullptr ) override;
 	void forward( const pod::BatchRows& rows, backend::stream_t stream = nullptr ) override;
 	int window_chunks() const override { return window_; }
 	void forward_window( const int* tokens, const pod::BatchRows* chunks, int n, backend::stream_t stream = nullptr ) override;

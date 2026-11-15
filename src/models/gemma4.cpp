@@ -299,6 +299,15 @@ void Gemma4Pipeline::embed_tokens( const int* token_ids, int count, backend::str
 	engine::modules::Elementwise::scale_to_f32( hidden_states_, resid_, embed_scale_, stream );
 }
 
+void Gemma4Pipeline::embed_tokens_device( const int* d_tokens, int src_dev, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_ROWS, "Gemma4Pipeline::embed_tokens_device: count out of range" );
+	backend::set_device( rank_ );
+	backend::peer_copy_async( d_token_ids_, rank_, d_tokens, src_dev, count * sizeof( int ), stream );
+	set_rows( count );
+	engine::modules::Embedding::forward( embed_tokens_, d_token_ids_, count, hidden_states_, stream );
+	engine::modules::Elementwise::scale_to_f32( hidden_states_, resid_, embed_scale_, stream );
+}
+
 void Gemma4Pipeline::sample_tokens( int* out_preds, int count, backend::stream_t stream ) {
 	ENGINE_ASSERT( tp_size_ == 1, "Gemma4Pipeline::sample_tokens: vocabulary is sharded, use sample_local" );
 	ENGINE_ASSERT( count >= 1 && count <= last_rows_, "Gemma4Pipeline::sample_tokens: count exceeds last forward rows" );

@@ -1396,6 +1396,22 @@ void Glm5NextPipeline::embed_tokens( const int* token_ids, int count, backend::s
 	}
 }
 
+void Glm5NextPipeline::embed_tokens_device( const int* d_tokens, int src_dev, int count, backend::stream_t stream ) {
+	ENGINE_ASSERT( count >= 1 && count <= pod::MAX_ROWS, "Glm5NextPipeline::embed_tokens_device: count out of range" );
+	backend::set_device( rank_ );
+	set_rows( count );
+	if ( rank_ == 0 ) {
+		backend::peer_copy_async( d_token_ids_, rank_, d_tokens, src_dev, count * sizeof( int ), stream );
+		engine::modules::Embedding::forward( embed_tokens_, d_token_ids_, count, embed_rows_, stream );
+	}
+	else {
+		backend::memset_async( embed_rows_.data, 0, embed_rows_.size_bytes(), stream );
+	}
+	if ( ring_ ) {
+		ring_->all_reduce( embed_rows_, stream );
+	}
+}
+
 void Glm5NextPipeline::set_rows( int m ) {
 	hidden_states_.shape[0] = m;
 	norm_hidden_.shape[0] = m;

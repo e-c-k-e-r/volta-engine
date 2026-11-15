@@ -128,6 +128,8 @@ void DFlash2Runner::shutdown() {
 		backend::set_device( d );
 		spec_[d].destroy();
 	}
+	if ( h_draft_ != nullptr ) backend::host_free_pinned( h_draft_ );
+	h_draft_ = nullptr;
 	mc_ = nullptr;
 	owner_ = -1;
 	for ( bool& o : owned_ ) o = false;
@@ -197,6 +199,15 @@ void DFlash2Runner::step_stats( int* attempts, int* hits ) const {
 // The draft half of a round: the drafter backbone over the block [anchor, mask x K] and the slot's tapped context, each rank's head shard and local top-k,
 // the merge, the selector walk. h_draft receives [anchor, draft tokens...]; returns how many drafts the verify block carries (below 1: no room)
 int DFlash2Runner::draft_block( int slot, int anchor, int pos, float depth_threshold, int* h_draft ) {
+	const int active = draft_queue( slot, anchor, pos, depth_threshold );
+	backend::set_device( 0 );
+	backend::stream_sync( mc_->stream( 0 ) );
+	backend::check_last_error();
+	std::copy( h_draft_, h_draft_ + models::kDraftM, h_draft );
+	return active;
+}
+
+int DFlash2Runner::draft_queue( int slot, int anchor, int pos, float depth_threshold ) {
 	constexpr int M = models::kDraftM;
 	constexpr int K = M - 1;
 	ModelCluster& mc = *mc_;
@@ -284,9 +295,11 @@ int DFlash2Runner::draft_block( int slot, int anchor, int pos, float depth_thres
 	spec_[0].project_gate( M, s0 );
 	spec_[0].set_walk_anchor( anchor, s0 );
 	spec_[0].draft_select( spec_[0].merged_final_values_ptr(), spec_[0].merged_final_indices_ptr(), K, s0 );
-	backend::memcpy_async( h_draft, spec_[0].d_draft_tokens(), M * sizeof( int ), backend::Copy::D2H, s0 );
-	backend::stream_sync( s0 );
-	backend::check_last_error();
+	if ( h_draft_ == nullptr ) {
+		h_draft_ = static_cast<int*>( backend::host_alloc_pinned( M * sizeof( int ), backend::Pin::Default ) );
+		ENGINE_ASSERT( h_draft_ != nullptr, "DFlash2Runner: pinned draft buffer" );
+	}
+	backend::memcpy_async( h_draft_, spec_[0].d_draft_tokens(), M * sizeof( int ), backend::Copy::D2H, s0 );
 
 	// Depth: the whole block by default (what DFlash2 does natively). spec_depth_rate picks the size with the most expected tokens per
 	// millisecond; depth_threshold > 0 enables the survival-EMA truncation. Both are throughput options, off by default so acceptance is measurable.
@@ -318,8 +331,9 @@ void DFlash2Runner::offer_draft( int slot, const int* tokens, int n ) {
 	for ( int i = 0; i < offer_n_[slot]; ++i ) offer_tok_[slot][i] = tokens[i];
 }
 
-int DFlash2Runner::round_block( int slot, int anchor, int pos, float depth_threshold, int* h_draft, bool* offered ) {
+int DFlash2Runner::round_block( int slot, int anchor, int pos, float depth_threshold, int* h_draft, bool* offered, bool* queued ) {
 	*offered = false;
+	if ( queued != nullptr ) *queued = false;
 	if ( slot >= 0 && slot < kMaxSlots && offer_n_[slot] > 0 ) {
 		const int n = offer_n_[slot];
 		offer_n_[slot] = 0;
@@ -332,7 +346,9 @@ int DFlash2Runner::round_block( int slot, int anchor, int pos, float depth_thres
 	}
 	// An explicit threshold from the caller wins; otherwise the option
 	const float dt = depth_threshold > 0.0f ? depth_threshold : static_cast<float>( runtime::options().spec_depth );
-	return draft_block( slot, anchor, pos, dt, h_draft );
+	if ( queued == nullptr ) return draft_block( slot, anchor, pos, dt, h_draft );
+	*queued = true;
+	return draft_queue( slot, anchor, pos, dt );
 }
 
 void DFlash2Runner::observe( int proposed, int accepted ) {
@@ -396,8 +412,16 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	prof_t0_ = impl::now_ms();
 
 	int h_draft[M];
-	bool offered = false;
-	int active = round_block( slot, anchor, pos, depth_threshold, h_draft, &offered );
+	bool offered = false, queued = false;
+	int active = round_block( slot, anchor, pos, depth_threshold, h_draft, &offered, &queued );
+	// a queued block's tokens reach the host only with the verify (forward_device), or here when there is none
+	auto drafted = [&]() {
+		backend::set_device( 0 );
+		backend::stream_sync( s0 );
+		backend::check_last_error();
+		std::copy( h_draft_, h_draft_ + M, h_draft );
+	};
+	if ( active < 1 && queued ) drafted();
 	if ( active < 1 ) {
 		// No room to verify a block: fall back to the target's own prediction for the anchor.
 		mc.forward( &anchor, 1, pos, slot );
@@ -420,21 +444,29 @@ SpecResult DFlash2Runner::speculate( int slot, int anchor, int pos, float depth_
 	// 4. Batched verify of [anchor, c1..c_active] at positions [pos, pos + active]. Row 0 re-feeds the
 	// anchor (exllamav3 generator/job.py:384), so one forward yields both the draft verification and
 	// the anchor's own successor: row j's logits predict position pos+j+1, so cands[k] is checked
-	// against preds[k] with no shift.
-	int block[pod::MAX_BATCH];
-	block[0] = anchor;
-	for ( int i = 0; i < active; ++i ) block[1 + i] = cands[i];
-
+	// against preds[k] with no shift. A queued block is verified straight from the drafter's device tokens (d_draft_tokens holds
+	// [anchor, c1 ..]), the greedy argmax in the same queue; h_draft is read after it
 	mark( SpecProfile::CHECKPOINT );
 	mc.set_spec_snapshot( true );
 	mark( SpecProfile::VERIFY );
-	mc.forward( block, active + 1, pos, slot );
-	mark( SpecProfile::SAMPLE );
 	int preds[pod::MAX_BATCH];
+	bool have_preds = false;
+	if ( queued && mc.forward_device( spec_[0].d_draft_tokens(), pod::BatchRows::causal( active + 1, pos, slot ), sampled ? nullptr : preds ) ) {
+		have_preds = !sampled;
+		std::copy( h_draft_, h_draft_ + M, h_draft );
+	}
+	else {
+		if ( queued ) drafted();
+		int block[pod::MAX_BATCH];
+		block[0] = anchor;
+		for ( int i = 0; i < active; ++i ) block[1 + i] = cands[i];
+		mc.forward( block, active + 1, pos, slot );
+	}
+	mark( SpecProfile::SAMPLE );
 	Candidates cs[pod::MAX_BATCH];
 	const bool spool = TargetSpool::get().on();
 	if ( sampled ) mc.sample_topk( active + 1, cs );
-	else mc.sample( preds, active + 1 );
+	else if ( !have_preds ) mc.sample( preds, active + 1 );
 	if ( sampled && sp->logprobs >= 0 ) {
 		std::copy( cs, cs + active + 1, res.rows );
 		res.has_rows = true;

@@ -124,6 +124,17 @@ public:
 
 	// 2. Token embedding: token_ids is a host array of `count` ids for rows 0..count-1
 	virtual void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) = 0;
+	// 2b. The same from device memory: d_tokens holds the ids on device src_dev, and the caller has ordered this rank's stream after whatever
+	// writes them (a drafter's tokens, so the verify is queued before the host reads them). A model whose embedding reads the ids on the host
+	// (host-side lookups) keeps the default and is fed host ids
+	virtual bool embeds_device_tokens() const { return false; }
+	virtual void embed_tokens_device( const int* d_tokens, int src_dev, int count, backend::stream_t stream = nullptr ) {
+		(void) d_tokens;
+		(void) src_dev;
+		(void) count;
+		(void) stream;
+		ENGINE_ASSERT( false, "embed_tokens_device: the model embeds host ids only" );
+	}
 
 	// Prefill chunks run layer by layer as one window (a model that supports it returns more than 1): the chunks are consecutive causal rows of one
 	// slot, each above the decode sizes; only the last one's logits are kept (as LOGITS_LAST). Default: one chunk after the other

@@ -40,7 +40,9 @@ time (`-DENGINE_BACKEND=CUDA|CPU|VULKAN`); one build tree is one backend.
 - **CUDA graphs**: decode bodies are captured once per row count (`GraphCache`) and replayed; the prefill path runs eagerly in
   chunks of up to 512 rows.
 - **Speculation**: the DFlash2 drafter proposes a block, the target verifies it in one forward (per-row recurrent-state
-  snapshots make rollback free); an adaptive controller falls back to plain decode when speculation loses.
+  snapshots make rollback free); an adaptive controller falls back to plain decode when speculation loses. On targets that
+  embed from device ids (GLM, Qwen, Gemma) the verify and its argmax are queued behind the draft from the drafter's device
+  tokens, so the host reads the block only once the verify is done.
 - **Speculation sources**: besides DFlash2, `speculator=mtp` drafts with the checkpoint's own one-layer MTP head (Qwen, Flash-Next, GLM): it chains on
   its own output, keeps a KV layer per slot next to the model's, and verifies through the same batched forward.
 - **Images**: each model's vision tower (Qwen: 27 LayerNorm / GELU blocks; GLM: 24 RMSNorm / SwiGLU blocks with q/k norm; both 2-D rotary) runs on rank 0 and loads last, into what the arena has left; the server decodes and

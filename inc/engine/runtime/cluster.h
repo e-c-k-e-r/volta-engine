@@ -45,6 +45,10 @@ public:
 	// Embed + forward on all ranks (Mode A causal block or Mode B batched rows), synchronized.
 	void forward( const int* tokens, const pod::BatchRows& rows );
 	void forward( const int* tokens, int count, int pos, int slot );
+	// The same with the ids in device 0's memory, written by work already queued on rank 0's stream (a drafter's tokens): every rank's stream
+	// waits for that work on the device, so the forward is queued before the host has the ids. With preds, the greedy argmax of every row
+	// follows in the same queue (as sample). False (nothing run) when the model embeds host ids only or a slot has images
+	bool forward_device( const int* d_tokens, const pod::BatchRows& rows, int* preds );
 
 	// Chunked causal prefill of `count` tokens starting at pos 0 into `slot`.
 	// Returns the greedy prediction for the token following the prompt.
@@ -83,6 +87,8 @@ public:
 
 	// Greedy argmax of the last forward's first `count` rows (rank 0).
 	void sample( int* out, int count );
+	// the largest logit over the ranks' shard winners (ties keep the lower id)
+	void merge_shard_argmax( const int ( *toks )[pod::MAX_BATCH], const float ( *vals )[pod::MAX_BATCH], int count, int* out ) const;
 
 	// Top-16 candidates (merged across the vocabulary shards, descending) for each of the last forward's first
 	// `count` rows, for temperature / top-p sampling. Synchronizes.

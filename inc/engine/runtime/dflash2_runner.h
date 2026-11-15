@@ -53,8 +53,9 @@ public:
 	// (exact for a deterministic draft) and the correction / bonus token is drawn from the target's distribution.
 	SpecResult speculate( int slot, int anchor, int pos, float depth_threshold = -1.0f,
 		const SamplingParams* sp = nullptr, Rng* rng = nullptr ) override;
-	// The block of a round: the offered tokens when there are some (`offered` set), else the drafter's
-	int round_block( int slot, int anchor, int pos, float depth_threshold, int* h_draft, bool* offered );
+	// The block of a round: the offered tokens when there are some (`offered` set), else the drafter's. With `queued`, a drafted block is only
+	// queued (*queued set): its tokens are in the speculator's d_draft_tokens on rank 0's stream and reach h_draft once that stream is synced
+	int round_block( int slot, int anchor, int pos, float depth_threshold, int* h_draft, bool* offered, bool* queued = nullptr );
 
 	// Per-step draft accuracy where the step was reached (the loop breaks at the first mismatch, so
 	// step k is sampled exactly when steps 0..k-1 were accepted).
@@ -86,6 +87,9 @@ public:
 
 private:
 	int draft_block( int slot, int anchor, int pos, float depth_threshold, int* h_draft );
+	// draft_block without its host wait: the block is queued on rank 0's stream, its copy to h_draft_ behind it
+	int draft_queue( int slot, int anchor, int pos, float depth_threshold );
+	int* h_draft_ = nullptr;   // pinned [kDraftM]
 	void mark( SpecProfile::Stage stage );
 	bool diag_on_ = false;
 	DiagStats diag_;
