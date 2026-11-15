@@ -243,3 +243,32 @@ void exl3_gemv(
 		exl3_gemm( A, B, C, suh, A_had, svh, size_m, size_k, size_n, K, mcg, mul1, c_fp32, stream );
 	}
 }
+
+// count projections in one int8 launch (tensor t of input A[t]), where exl3_gemv would take the int8 path for each (false: run them one by one)
+bool exl3_gemv_multi(
+	const half* const* A,
+	int count,
+	const uint16_t* const* B,
+	void* const* C,
+	const half* const* suh,
+	const half* const* svh,
+	const int* size_n,
+	int size_m,
+	int size_k,
+	int K,
+	bool mcg,
+	bool mul1,
+	bool c_fp32,
+	cudaStream_t stream
+) {
+#if defined(USE_ROCM)
+	(void) A; (void) count; (void) B; (void) C; (void) suh; (void) svh; (void) size_n; (void) size_m; (void) size_k; (void) K; (void) mcg; (void) mul1;
+	(void) c_fp32; (void) stream;
+	return false;
+#else
+	int device = 0;
+	(void) cudaGetDevice( &device );
+	if ( EXL3_VOLTA_LAYOUT && size_m == 2 && K >= 4 ) return false;   // exl3_gemv's tensor-core choice at two rows in the Volta order
+	return exl3_gemv_int8_multi( A, count, B, C, suh, svh, size_n, size_m, size_k, K, mcg, mul1, c_fp32, device, stream );
+#endif
+}

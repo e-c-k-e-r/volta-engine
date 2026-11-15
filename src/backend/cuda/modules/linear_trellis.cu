@@ -132,6 +132,30 @@ void LinearTrellis::forward(
 	}
 }
 
+bool trellis_forward_multi( const pod::TensorView* x, int count, const pod::TensorView* trellis, const pod::TensorView* suh, const pod::TensorView* svh,
+	pod::TensorView* const* out, int bits, bool mcg, bool mul1, cudaStream_t stream, bool volta_tiles ) {
+	if ( count < 2 || count > 4 || bits > 8 ) return false;
+	const int m = x[0].shape[0], k = trellis[0].shape[0] * 16;
+	if ( m > 2 || k % 128 ) return false;
+	const bool c_fp32 = out[0]->dtype == pod::DType::FP32;
+	const half* A[4];
+	const uint16_t* B[4];
+	void* C[4];
+	const half* su[4];
+	const half* sv[4];
+	int n[4];
+	for ( int t = 0; t < count; ++t ) {
+		if ( trellis[t].shape[0] * 16 != k || x[t].shape[0] != m || x[t].shape[1] != k || ( out[t]->dtype == pod::DType::FP32 ) != c_fp32 ) return false;
+		A[t] = x[t].ptr<const half>();
+		B[t] = trellis[t].ptr<const uint16_t>();
+		C[t] = out[t]->data;
+		su[t] = suh[t].ptr<const half>();
+		sv[t] = svh[t].ptr<const half>();
+		n[t] = trellis[t].shape[1] * 16;
+	}
+	return EXL3_TILES_CALL( volta_tiles, exl3_gemv_multi, A, count, B, C, su, sv, n, m, k, bits, mcg, mul1, c_fp32, stream );
+}
+
 bool trellis_volta_tiles_supported() {
 #if ENGINE_EXL3_VL
 	// The Volta copies decode the order on SM_70 only (their SM_80+ code paths read the stock order)

@@ -125,7 +125,7 @@ Decomp decomp( int grid, int size_k, int size_n, int M, bool residual, bool spli
 size_t smem_for( int rows_per, int size_n, int M, bool residual, bool smem, int bits, bool split = false ) {
 	size_t stage = smem ? (size_t) ( split ? 16 : 8 ) * GEMV_STAGE_D * 16 * bits * 4 : 0;
 	return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * M * ( residual ? 2 : 1 )
-	     + stage + (size_t) 2 * M * 128 * 4;
+	     + stage + (size_t) gemv_int8_epi_floats( split ? 512 : NUM_THREADS, M ) * 4;
 }
 
 } // namespace
@@ -181,28 +181,15 @@ void exl3_gemv_int8_init( int device ) {
 	CUDA_CHECK( cudaSetDevice( cur ) );
 }
 
-bool exl3_gemv_int8(
-	const half* A,
-	const uint16_t* B,
-	void* C,
-	const half* suh,
-	half* A_had,
-	const half* svh,
-	int size_m,
-	int size_k,
-	int size_n,
-	int K,
-	bool mcg,
-	bool mul1,
-	bool c_fp32,
-	int device,
-	cudaStream_t stream
-) {
-	(void) A_had;
+namespace {
+
+// One sq launch over args.T tensors of the same input (args.nb filled): the decomposition of their summed width, a row's result the same
+// at either row count. False when the path declines (nothing enqueued)
+bool launch_sq( Int8SqArgs args, int K, bool mcg, bool mul1, bool c_fp32, int device, cudaStream_t stream ) {
+	const int size_m = args.size_m, size_k = args.size_k, size_n = 256 * args.nb[args.T];
 	if ( int8_mode() == 0 ) return false;
 	if ( mcg || !mul1 ) return false;          // dp4a path is mul1 (cb 2) only
-	if ( suh == nullptr || svh == nullptr ) return false;
-	if ( size_n % 256 ) return false;          // 256-column work unit
+	for ( int t = 0; t < args.T; ++t ) if ( args.suh[t] == nullptr || args.svh[t] == nullptr ) return false;
 	if ( size_k % 128 ) return false;
 	if ( K < 1 || K > int8_max_k( device ) ) return false;
 	if ( size_m < 1 || size_m > 2 ) return false;
@@ -264,36 +251,93 @@ bool exl3_gemv_int8(
 	if ( !fn ) return false;
 	size_t smem_bytes = smem_for( d.rows_per, size_n, M, residual, smem, K, split );
 	if ( d.ksplit > SQ_KSPLIT_CAP ) return false;
+	if ( args.T * d.ksplit * M > 4 * SQ_KSPLIT_CAP ) return false;   // the per-slice scales of every tensor
 	if ( size_n / 256 > SQ_COUNTERS_CAP ) return false;
 
 	int pstride = size_n * ( residual ? 2 : 1 );
 	size_t ws_ints = SQ_WS_RESERVED + (size_t) d.ksplit * M * pstride;
 	if ( ws_ints > (size_t) INT8_WS_INTS ) return false;
-	int* ws_ptr = ws;
+	args.locks = ws;
 
-	void* kernel_args[] = {
-		(void*) &A,
-		(void*) &B,
-		(void*) &C,
-		(void*) &size_m,
-		(void*) &size_k,
-		(void*) &size_n,
-		(void*) &ws_ptr,
-		(void*) &suh,
-		(void*) &A_had,
-		(void*) &svh
-	};
-
+	void* kernel_args[] = { (void*) &args };
 	cudaError_t err = cudaLaunchKernel( fn, dim3( grid ), dim3( split ? 512 : NUM_THREADS ), kernel_args, smem_bytes, stream );
 	if ( err != cudaSuccess ) {
 		// Declining the fast path is only safe if nothing was enqueued. Swallowing the error here
 		// would leave the caller's fallback launch reporting a poisoned stream instead of the real
 		// cause, so surface it and let the caller fall through with the state cleaned up.
-		std::printf( "[int8] launch failed (K=%d M=%d n=%d k=%d smem=%zu grid=%d): %s\n",
-			K, M, size_n, size_k, smem_bytes, grid, cudaGetErrorString( err ) );
+		std::printf( "[int8] launch failed (K=%d M=%d n=%d k=%d tensors=%d smem=%zu grid=%d): %s\n",
+			K, M, size_n, size_k, args.T, smem_bytes, grid, cudaGetErrorString( err ) );
 		std::fflush( stdout );
 		(void) cudaGetLastError();
 		return false;
 	}
 	return true;
+}
+
+} // namespace
+
+bool exl3_gemv_int8(
+	const half* A,
+	const uint16_t* B,
+	void* C,
+	const half* suh,
+	half* A_had,
+	const half* svh,
+	int size_m,
+	int size_k,
+	int size_n,
+	int K,
+	bool mcg,
+	bool mul1,
+	bool c_fp32,
+	int device,
+	cudaStream_t stream
+) {
+	(void) A_had;
+	if ( size_n % 256 ) return false;          // 256-column work unit
+	Int8SqArgs args{};
+	args.A[0] = A;
+	args.size_m = size_m;
+	args.size_k = size_k;
+	args.T = 1;
+	args.nb[1] = size_n / 256;
+	args.B[0] = B;
+	args.C[0] = C;
+	args.suh[0] = suh;
+	args.svh[0] = svh;
+	return launch_sq( args, K, mcg, mul1, c_fp32, device, stream );
+}
+
+bool exl3_gemv_int8_multi(
+	const half* const* A,
+	int count,
+	const uint16_t* const* B,
+	void* const* C,
+	const half* const* suh,
+	const half* const* svh,
+	const int* size_n,
+	int size_m,
+	int size_k,
+	int K,
+	bool mcg,
+	bool mul1,
+	bool c_fp32,
+	int device,
+	cudaStream_t stream
+) {
+	if ( count < 1 || count > SQ_MAX_TENSORS ) return false;
+	Int8SqArgs args{};
+	args.size_m = size_m;
+	args.size_k = size_k;
+	args.T = count;
+	for ( int t = 0; t < count; ++t ) {
+		if ( size_n[t] <= 0 || size_n[t] % 256 ) return false;
+		args.A[t] = A[t];
+		args.nb[t + 1] = args.nb[t] + size_n[t] / 256;
+		args.B[t] = B[t];
+		args.C[t] = C[t];
+		args.suh[t] = suh[t];
+		args.svh[t] = svh[t];
+	}
+	return launch_sq( args, K, mcg, mul1, c_fp32, device, stream );
 }

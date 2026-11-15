@@ -1,4 +1,4 @@
-// Tier 2 parity for the dp4a int8 GEMV (exl3_gemv_int8 sq kernel) on the Qwen TP4 per-rank shapes.
+// Tier 2 parity for the dp4a int8 GEMV (exl3_gemv_int8 sq kernel) on the Qwen TP4 per-rank shapes, and its several-projection launch.
 // Runs the same mul1 trellis weights through the int8 path and the fp16 tensor-core path, and checks
 // both against an FP32 CPU reference built from the reconstructed weights. Cosine similarity must be
 // >= 0.9999 and RMS relative error <= 0.005; the int8 path additionally has to stay within the
@@ -153,6 +153,84 @@ double run_shape(
 	return rms_b;
 }
 
+// Several projections of one input in one launch (trellis_forward_multi) against each run alone: the same products up to the rounding of
+// the other slice heights, a row the same in a two-row call as alone, replays identical
+void run_multi( int k_dim, std::initializer_list<int> widths, int K, pod::MemoryArena& arena, cudaStream_t stream, bool own_inputs = false ) {
+	const int T = static_cast<int>( widths.size() );
+	std::vector<int> n( widths );
+	engine::core::arena_reset( arena );
+	unsigned int seed = 12345u + static_cast<unsigned int>( k_dim );
+	auto rnd = [&] ( float scale ) -> half {
+		seed = seed * 1664525u + 1013904223u;
+		return __float2half_rn( ( static_cast<float>( seed & 0xffff ) / 65536.0f - 0.5f ) * scale );
+	};
+	auto upload_half = [&] ( pod::TensorView& tv, size_t count, float scale ) {
+		std::vector<half> h( count );
+		for ( auto& v : h ) v = rnd( scale );
+		CUDA_CHECK( cudaMemcpy( tv.data, h.data(), count * sizeof( half ), cudaMemcpyHostToDevice ) );
+	};
+	// own_inputs: each projection of its own input (the output groups of an attention layer)
+	std::vector<pod::TensorView> x1s( T ), x2s( T );
+	for ( int t = 0; t < T; ++t ) {
+		int xs[2] = { 2, k_dim };
+		if ( t == 0 || own_inputs ) {
+			x2s[t] = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, xs, 2 );
+			upload_half( x2s[t], 2 * static_cast<size_t>( k_dim ), 0.4f );
+		}
+		else x2s[t] = x2s[0];
+		x1s[t] = pod::make_tensor_2d( x2s[t].data, pod::DType::FP16, 1, k_dim );
+	}
+	std::vector<pod::TensorView> tr( T ), su( T ), sv( T ), o_alone( T ), o_multi( T ), o_multi2( T );
+	for ( int t = 0; t < T; ++t ) {
+		int ts[3] = { k_dim / 16, n[t] / 16, 16 * K };
+		tr[t] = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, ts, 3 );
+		std::vector<uint16_t> h( static_cast<size_t>( k_dim / 16 ) * ( n[t] / 16 ) * 16 * K );
+		for ( auto& v : h ) { seed = seed * 1664525u + 1013904223u; v = static_cast<uint16_t>( seed & 0xffff ); }
+		CUDA_CHECK( cudaMemcpy( tr[t].data, h.data(), h.size() * sizeof( uint16_t ), cudaMemcpyHostToDevice ) );
+		int ks[1] = { k_dim }, ns[1] = { n[t] };
+		su[t] = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ks, 1 );
+		sv[t] = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ns, 1 );
+		upload_half( su[t], k_dim, 0.2f );
+		upload_half( sv[t], n[t], 0.2f );
+		int os1[2] = { 1, n[t] }, os2[2] = { 2, n[t] };
+		o_alone[t] = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, os1, 2 );
+		o_multi[t] = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, os1, 2 );
+		o_multi2[t] = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, os2, 2 );
+		engine::modules::LinearTrellis::forward( x1s[t], tr[t], su[t], sv[t], o_alone[t], K, false, true, stream );
+	}
+	std::vector<pod::TensorView*> p1( T ), p2( T );
+	for ( int t = 0; t < T; ++t ) { p1[t] = &o_multi[t]; p2[t] = &o_multi2[t]; }
+	ENGINE_ASSERT( engine::modules::trellis_forward_multi( x1s.data(), T, tr.data(), su.data(), sv.data(), p1.data(), K, false, true, stream, false ), "multi: declined at one row" );
+	std::vector<std::vector<half>> first( T );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	for ( int t = 0; t < T; ++t ) {
+		first[t].resize( n[t] );
+		CUDA_CHECK( cudaMemcpy( first[t].data(), o_multi[t].data, n[t] * sizeof( half ), cudaMemcpyDeviceToHost ) );
+	}
+	ENGINE_ASSERT( engine::modules::trellis_forward_multi( x1s.data(), T, tr.data(), su.data(), sv.data(), p1.data(), K, false, true, stream, false ), "multi: replay declined" );
+	ENGINE_ASSERT( engine::modules::trellis_forward_multi( x2s.data(), T, tr.data(), su.data(), sv.data(), p2.data(), K, false, true, stream, false ), "multi: declined at two rows" );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	for ( int t = 0; t < T; ++t ) {
+		std::vector<half> a( n[t] ), m1( n[t] ), m2( 2 * static_cast<size_t>( n[t] ) );
+		CUDA_CHECK( cudaMemcpy( a.data(), o_alone[t].data, n[t] * sizeof( half ), cudaMemcpyDeviceToHost ) );
+		CUDA_CHECK( cudaMemcpy( m1.data(), o_multi[t].data, n[t] * sizeof( half ), cudaMemcpyDeviceToHost ) );
+		CUDA_CHECK( cudaMemcpy( m2.data(), o_multi2[t].data, m2.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+		double dss = 0.0, rss = 0.0, dot = 0.0, na = 0.0, nm = 0.0;
+		bool replay = true, rows = true;
+		for ( int j = 0; j < n[t]; ++j ) {
+			const double va = __half2float( a[j] ), vm = __half2float( m1[j] );
+			dss += ( va - vm ) * ( va - vm ); rss += va * va; dot += va * vm; na += va * va; nm += vm * vm;
+			replay = replay && __half_as_ushort( m1[j] ) == __half_as_ushort( first[t][j] );
+			rows = rows && __half_as_ushort( m1[j] ) == __half_as_ushort( m2[j] );
+		}
+		const double rms = std::sqrt( dss / ( rss + 1e-30 ) ), cos = dot / ( std::sqrt( na * nm ) + 1e-30 );
+		std::printf( "  multi k%-5d tensor %d of %d n%-5d %db%s | vs alone: cos %.7f rms %.2e | replay %s | row 0 of two rows %s\n", k_dim, t, T, n[t], K, own_inputs ? " (own input)" : "", cos, rms,
+			replay ? "identical" : "DIFFERS", rows ? "identical" : "DIFFERS" );
+		ENGINE_ASSERT( cos >= 0.99999 && rms <= 2e-3, "multi: differs from the projection alone beyond rounding" );
+		ENGINE_ASSERT( replay && rows, "multi: not deterministic, or a row depends on the call's row count" );
+	}
+}
+
 } // namespace
 
 int main() {
@@ -182,6 +260,12 @@ int main() {
 		{ "mlp gate/up 5b", 5120, 4352, 5 },
 	};
 	for ( const auto& sh : shapes ) run_shape( sh, 1, arena, stream );
+	// DeepSeek-V4.1's projections of one input (wq_a + wkv, the shared expert's gate + up, with the compressor's two), and of one input each
+	run_multi( 5120, { 1280, 512 }, 5, arena, stream );
+	run_multi( 5120, { 512, 512 }, 5, arena, stream );
+	run_multi( 5120, { 1280, 512, 512, 512 }, 5, arena, stream );
+	run_multi( 2560, { 1024, 1024 }, 4, arena, stream );
+	run_multi( 4096, { 1024, 1024 }, 5, arena, stream, true );   // the output groups (wo_a) of a rank
 
 	CUDA_CHECK( cudaStreamDestroy( stream ) );
 	engine::core::arena_destroy( arena );

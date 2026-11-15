@@ -35,6 +35,25 @@ void exl3_gemv(
 	cudaStream_t stream = nullptr
 );
 
+// count (2 to 4) projections in one launch, tensor t of input A[t] [size_m, size_k], where exl3_gemv would take the int8 GEMV for each:
+// every tensor of width K and the codebook flags, size_n[t] outputs, multiples of 256. False when the call does not qualify (nothing enqueued)
+bool exl3_gemv_multi(
+	const half* const* A,
+	int count,
+	const uint16_t* const* B,
+	void* const* C,
+	const half* const* suh,
+	const half* const* svh,
+	const int* size_n,
+	int size_m,
+	int size_k,
+	int K,
+	bool mcg,
+	bool mul1,
+	bool c_fp32,
+	cudaStream_t stream
+);
+
 #if defined(USE_ROCM)
 #include "../../rocm/trellis/exl3_rocm.cuh"
 #endif

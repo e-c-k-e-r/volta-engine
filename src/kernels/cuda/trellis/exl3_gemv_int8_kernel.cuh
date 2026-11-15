@@ -229,6 +229,22 @@ __device__ __forceinline__ void extract8_4bits_words(uint32_t a, uint32_t b,
 #define SQ_ROWS_MAX 512     // shared memory cap
 #define SQ_COUNTERS_CAP 4096                                    // fixed counter region: size_n up to 1M
 #define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP * 4)    // sq-private region at workspace start (counters + per-slice-per-row scales, m <= 4)
+#define SQ_MAX_TENSORS 4    // projections of the same input in one launch
+
+// The projections of one sq launch, at one width and input size: tensor t reads A[t] (size_m x size_k), owns the 256-column groups
+// nb[t] .. nb[t + 1) of the launch's decomposition and writes C[t] (size_m x 256 (nb[t + 1] - nb[t])). One tensor is a plain GEMV
+struct Int8SqArgs {
+    const half* A[SQ_MAX_TENSORS];
+    int size_m;
+    int size_k;
+    int T;
+    int nb[SQ_MAX_TENSORS + 1];
+    const uint16_t* B[SQ_MAX_TENSORS];
+    void* C[SQ_MAX_TENSORS];
+    const half* suh[SQ_MAX_TENSORS];
+    const half* svh[SQ_MAX_TENSORS];
+    int* locks;
+};
 
 // Wide unit (4 bpw): one (256-column x k-slice) unit, warp per adjacent block pair, uint2 loads.
 // M activation rows share the decoded weights: extraction and the B stream are amortized, each row
@@ -806,6 +822,7 @@ __device__ __forceinline__ void gemv_int8_unit_narrow
     int ia0[M] = {}, ia1[M] = {}, ib0[M] = {}, ib1[M] = {};
     int ja0[M] = {}, ja1[M] = {}, jb0[M] = {}, jb1[M] = {};
 
+    #pragma unroll 4
     for (int kb = 0; kb < nrows; ++kb)
     {
         const uint32_t* blockA = bp + (size_t) kb * row_stride;
@@ -1015,10 +1032,14 @@ __device__ __forceinline__ void gemv_int8_stage_slice
     __syncthreads();
 }
 
-// Epilogue for one 256-column group: deterministic fixed-order combine over the per-slice partials,
-// warp per (row, 128-span). Reads bypass L1 (__ldcg): the contributions arrived from other blocks
-// with no grid-wide barrier.
-template <int M, bool c_fp32, bool residual>
+// Epilogue for one 256-column group: deterministic fixed-order combine over the per-slice partials. Warp (g, j) of the block, j = 2 * row
+// + 128-span, sums the slices g, g + G, .. (G = TH / 128 groups, the same at either row count, so a row's result does not depend on M);
+// warp (0, j) then adds the G group sums in order and runs the output rotation. Reads bypass L1 (__ldcg): the contributions arrived from
+// other blocks with no grid-wide barrier. Every thread of the block calls it (it synchronizes the block).
+__host__ __device__ constexpr int gemv_int8_epi_groups(int TH) { return TH / 128; }
+__host__ __device__ constexpr int gemv_int8_epi_floats(int TH, int M) { return gemv_int8_epi_groups(TH) * 2 * M * 129; }
+
+template <int M, bool c_fp32, bool residual, int TH>
 __device__ __forceinline__ void gemv_int8_epilogue_group_sq
 (
     const int* __restrict__ partials,
@@ -1028,50 +1049,71 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
     int size_m,
     void* __restrict__ C,
     const half* __restrict__ svh,
-    float* __restrict__ sh_tmp,
+    float* __restrict__ sh_tmp,        // gemv_int8_epi_floats(TH, M): [G][2M][128] sums, then [G][2M] corrections
     int nb256,
     int size_n
 )
 {
+    constexpr int G = gemv_int8_epi_groups(TH);
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    int row = warp >> 1;
-    if (warp >= 2 * M || row >= size_m) return;
+    const int j = warp & 3, g = warp >> 2;   // 4 = 2 spans x the widest call's 2 rows
+    const int row = j >> 1;
+    const bool on = j < 2 * M && g < G && row < size_m;
     float k_inv  = __half2float(__ushort_as_half(0x1eee));
     float k_bias = __half2float(__ushort_as_half(0xc931));
     float aff = 1024.0f * k_inv + k_bias;
 
-    int base = nb256 * 256 + (warp & 1) * 128;
-    float* tmp = sh_tmp + warp * 128;
-    float acc[4] = {};
-    float corr = 0.0f;
-    for (int sl = 0; sl < ksplit; ++sl)
+    int base = nb256 * 256 + (j & 1) * 128;
+    float* part = sh_tmp + (g * 2 * M + j) * 128;
+    float* pcorr = sh_tmp + G * 2 * M * 128;
+    if (on)
     {
-        int idx = sl * M + row;
-        float q_s = qsums[4 * idx];
-        float suma = q_s * (float) ((const int*) qsums)[4 * idx + 1];
-        const int* p = partials + (size_t) idx * pstride + base;
-        #pragma unroll
-        for (int i = 0; i < 4; ++i)
-            acc[i] += q_s * (float) __ldcg(p + lane * 4 + i);
-        if constexpr (residual)
+        float acc[4] = {};
+        float corr = 0.0f;
+        for (int sl = g; sl < ksplit; sl += G)
         {
-            float q2_s = q_s * (1.0f / 254.0f);
-            suma += q2_s * (float) ((const int*) qsums)[4 * idx + 2];
+            int idx = sl * M + row;
+            float q_s = qsums[4 * idx];
+            float suma = q_s * (float) ((const int*) qsums)[4 * idx + 1];
+            const int* p = partials + (size_t) idx * pstride + base;
             #pragma unroll
             for (int i = 0; i < 4; ++i)
-                acc[i] += q2_s * (float) __ldcg(p + size_n + lane * 4 + i);
+                acc[i] += q_s * (float) __ldcg(p + lane * 4 + i);
+            if constexpr (residual)
+            {
+                float q2_s = q_s * (1.0f / 254.0f);
+                suma += q2_s * (float) ((const int*) qsums)[4 * idx + 2];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    acc[i] += q2_s * (float) __ldcg(p + size_n + lane * 4 + i);
+            }
+            corr += aff * suma;
         }
-        corr += aff * suma;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) part[lane * 4 + i] = acc[i];
+        if (lane == 0) pcorr[g * 2 * M + j] = corr;
+    }
+    __syncthreads();
+    if (!on || g != 0) return;
+    float acc[4] = {};
+    float corr = 0.0f;
+    #pragma unroll
+    for (int q = 0; q < G; ++q)
+    {
+        const float* pq = sh_tmp + (q * 2 * M + j) * 128;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) acc[i] += pq[lane * 4 + i];
+        corr += pcorr[q * 2 * M + j];
     }
     #pragma unroll
     for (int i = 0; i < 4; ++i)
-        tmp[lane * 4 + i] = k_inv * acc[i] + corr;
+        part[lane * 4 + i] = k_inv * acc[i] + corr;
     __syncwarp();
     if constexpr (c_fp32)
-        had_ff_r_128_inner<false, true>(tmp, ((float*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
+        had_ff_r_128_inner<false, true>(part, ((float*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
     else
-        had_fh_r_128_inner<false, true>(tmp, ((half*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
+        had_fh_r_128_inner<false, true>(part, ((half*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
 }
 
 // Shared-memory cap for the sq decomposition: row halfs (32 B/row) + M splat regions (64 B/row each,
@@ -1092,29 +1134,20 @@ __host__ __device__ inline int gemv_int8_sq_fit(int rows_per, int rows_total, in
 }
 
 template <int bits, int M, bool c_fp32, bool residual, bool stage_smem, int TH>
-__device__ __forceinline__ void exl3_gemv_int8_sq_body
-(
-    const half* __restrict__ A,
-    const uint16_t* __restrict__ B,
-    void* __restrict__ C,
-    const int size_m,       // 1 <= size_m <= M
-    const int size_k,
-    const int size_n,
-    int* __restrict__ locks,
-    const half* __restrict__ suh,
-    half* __restrict__ A_had,
-    const half* __restrict__ svh
-)
+__device__ __forceinline__ void exl3_gemv_int8_sq_body(const Int8SqArgs& args)
 {
     extern __shared__ uint32_t shmem[];
+    const int size_m = args.size_m;
+    const int size_k = args.size_k;
 
     // Work decomposition: rows_per multiple of 8 (whole 128-spans for the local Hadamard); the host
     // mirrors this for the shared memory size and workspace bound. Swept on 3090: the wall time is
     // ~one unit's duration as long as all (slice x 256-column) units fit in one wave of the grid, so
     // take the smallest slice height with units <= gridDim.x - but at least half-wave occupancy up
-    // to 32 rows, since very short slices inflate ksplit and the epilogue's serial per-slice combine
+    // to 32 rows, since very short slices inflate ksplit and the epilogue's serial per-slice combine.
+    // Several tensors split as one of their summed width
     int rows_total = size_k >> 4;
-    int nb256_total = size_n / 256;
+    int nb256_total = args.nb[args.T];
     int r = CEIL_DIVIDE(rows_total * nb256_total, (int) gridDim.x);
     int rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
     rows_per = MAX(rows_per, SQ_MINROWS);
@@ -1124,11 +1157,12 @@ __device__ __forceinline__ void exl3_gemv_int8_sq_body
     int ksplit = CEIL_DIVIDE(rows_total, rows_per);
     int units = nb256_total * ksplit;
     int slice_stride = rows_per * 16;
-    int pstride = size_n * (residual ? 2 : 1);
+    constexpr int RES = residual ? 2 : 1;
 
-    int* counters = locks;
-    float* qsums = (float*) (locks + SQ_COUNTERS_CAP);
-    int* partials = locks + SQ_WS_RESERVED;
+    // Per tensor t: the scales of its slices at qsums + 4 * t * ksplit * M, its partials after the earlier tensors' (ksplit x M x its width)
+    int* counters = args.locks;
+    float* qsums = (float*) (args.locks + SQ_COUNTERS_CAP);
+    int* partials = args.locks + SQ_WS_RESERVED;
 
     // Shared layout: [slice halfs][M x splats (+ M x residual splats)][B stage][epilogue tmp]
     half* sh_ah = (half*) shmem;
@@ -1139,20 +1173,29 @@ __device__ __forceinline__ void exl3_gemv_int8_sq_body
     __shared__ int sh_last;
 
     int t = threadIdx.x;
-    int prev_slice = -1;
+    int prev_slice = -1, prev_tensor = -1;
     for (int unit = blockIdx.x; unit < units; unit += gridDim.x)
     {
         int slice = unit / nb256_total;
-        int nb256 = unit % nb256_total;
+        int g = unit % nb256_total;
+        int tensor = 0;
+        while (tensor + 1 < args.T && g >= args.nb[tensor + 1]) ++tensor;
+        int nb256 = g - args.nb[tensor];
+        int size_n = (args.nb[tensor + 1] - args.nb[tensor]) * 256;
+        int pstride = size_n * RES;
+        int* part_t = partials + (size_t) ksplit * M * args.nb[tensor] * 256 * RES;
+        float* qs_t = qsums + 4 * tensor * ksplit * M;
         int kb0 = slice * rows_per;
         int nrows = MIN(rows_per, rows_total - kb0);
-        if (slice != prev_slice)
+        if (slice != prev_slice || tensor != prev_tensor)
         {
-            gemv_int8_stage_slice<M, residual, TH>(A, size_m, size_k, suh, qsums + 4 * slice * M,
+            gemv_int8_stage_slice<M, residual, TH>(args.A[tensor], size_m, size_k, args.suh[tensor], qs_t + 4 * slice * M,
                                                sh_ah, sh_as, slice_stride, sh_red, kb0, nrows);
             prev_slice = slice;
+            prev_tensor = tensor;
         }
-        int* pacc = partials + (size_t) slice * M * pstride;
+        const uint16_t* B = args.B[tensor];
+        int* pacc = part_t + (size_t) slice * M * pstride;
         if constexpr (bits == 4)
             gemv_int8_unit_wide<M, residual, false, TH>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
         else if constexpr (stage_smem)
@@ -1164,13 +1207,13 @@ __device__ __forceinline__ void exl3_gemv_int8_sq_body
         // (sh_last reuse across iterations is ordered by the next iteration's __syncthreads.)
         __threadfence();
         __syncthreads();
-        if (t == 0) sh_last = (atomicAdd(&counters[nb256], 1) == ksplit - 1) ? 1 : 0;
+        if (t == 0) sh_last = (atomicAdd(&counters[g], 1) == ksplit - 1) ? 1 : 0;
         __syncthreads();
         if (sh_last)
         {
-            gemv_int8_epilogue_group_sq<M, c_fp32, residual>(partials, qsums, pstride, ksplit, size_m,
-                                                             C, svh, sh_tmp, nb256, size_n);
-            if (t == 0) counters[nb256] = 0;
+            gemv_int8_epilogue_group_sq<M, c_fp32, residual, TH>(part_t, qs_t, pstride, ksplit, size_m,
+                                                                 args.C[tensor], args.svh[tensor], sh_tmp, nb256, size_n);
+            if (t == 0) counters[g] = 0;
         }
     }
 }
@@ -1179,16 +1222,14 @@ __device__ __forceinline__ void exl3_gemv_int8_sq_body
 // the two-row variants would otherwise take up to 84 and fit one block, against the grid the one-row variant's occupancy sizes)
 template <int bits, int M, bool c_fp32, bool residual, bool stage_smem>
 __global__ __launch_bounds__(NUM_THREADS)
-void exl3_gemv_int8_sq_kernel(const half* __restrict__ A, const uint16_t* __restrict__ B, void* __restrict__ C, const int size_m, const int size_k, const int size_n,
-    int* __restrict__ locks, const half* __restrict__ suh, half* __restrict__ A_had, const half* __restrict__ svh)
+void exl3_gemv_int8_sq_kernel(const Int8SqArgs args)
 {
-    exl3_gemv_int8_sq_body<bits, M, c_fp32, residual, stage_smem, NUM_THREADS>(A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh);
+    exl3_gemv_int8_sq_body<bits, M, c_fp32, residual, stage_smem, NUM_THREADS>(args);
 }
 
 template <int bits, int M, bool c_fp32, bool residual, bool stage_smem>
 __global__ __launch_bounds__(512, 2)
-void exl3_gemv_int8_sq_kernel_w(const half* __restrict__ A, const uint16_t* __restrict__ B, void* __restrict__ C, const int size_m, const int size_k, const int size_n,
-    int* __restrict__ locks, const half* __restrict__ suh, half* __restrict__ A_had, const half* __restrict__ svh)
+void exl3_gemv_int8_sq_kernel_w(const Int8SqArgs args)
 {
-    exl3_gemv_int8_sq_body<bits, M, c_fp32, residual, stage_smem, 512>(A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh);
+    exl3_gemv_int8_sq_body<bits, M, c_fp32, residual, stage_smem, 512>(args);
 }

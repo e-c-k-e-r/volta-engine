@@ -15,6 +15,8 @@ void exl3_gemm( const half* A, const uint16_t* B, void* C, const half* suh, half
 	bool mcg, bool mul1, bool c_fp32, cudaStream_t stream, int force_shape );
 void exl3_gemv( const half* A, const uint16_t* B, void* C, const half* suh, half* A_had, const half* svh, int size_m, int size_k, int size_n, int K,
 	bool mcg, bool mul1, bool c_fp32, cudaStream_t stream );
+bool exl3_gemv_multi( const half* const* A, int count, const uint16_t* const* B, void* const* C, const half* const* suh, const half* const* svh, const int* size_n,
+	int size_m, int size_k, int K, bool mcg, bool mul1, bool c_fp32, cudaStream_t stream );
 void reconstruct_slice( half* unpacked, const uint16_t* packed, int K, bool mcg, bool mul1, int rows, int cols, int64_t n_offset, cudaStream_t stream );
 void reconstruct_cols( half* unpacked, const uint16_t* packed, int K, bool mcg, bool mul1, int rows, int cols, int64_t n_offset, int stride, cudaStream_t stream );
 void reconstruct_had_slice( half* unpacked, const uint16_t* packed, const half* suh, const half* svh, int K, bool mcg, bool mul1, int rows, int cols,

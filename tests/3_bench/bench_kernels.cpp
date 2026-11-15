@@ -35,6 +35,8 @@ const Shape kShapes[] = {
 	{ "flash attn/gdn in", 2560, 4096 }, { "flash out", 4096, 2560 }, { "flash shared gate/up", 2560, 1024 }, { "flash lm_head/4", 2560, 62080 },
 	{ "glm kda in", 4096, 6144 }, { "glm k4096 n4096", 4096, 4096 }, { "glm k4096 n2048", 4096, 2048 }, { "glm k2048 n4096", 2048, 4096 },
 	{ "drafter gate/up", 5120, 17408 }, { "drafter down", 17408, 5120 },
+	{ "ds wq_a", 5120, 1280 }, { "ds wkv", 5120, 512 }, { "ds wq_b", 1280, 8192 }, { "ds wo_a group", 4096, 1024 }, { "ds wo_b", 2048, 5120 },
+	{ "ds idx wq_b", 1280, 4096 }, { "ds shared gate/up", 5120, 512 }, { "ds shared down", 512, 5120 },
 };
 
 struct Format { std::string name; int kind; int bits; bool volta; modules::GgmlType gtype; };   // kind 0 EXL3, 1 NVFP4, 2 GGUF

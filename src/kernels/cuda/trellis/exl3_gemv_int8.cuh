@@ -40,3 +40,23 @@ bool exl3_gemv_int8(
 	int device,
 	cudaStream_t stream
 );
+
+// count (2 to 4) projections in one launch (the column groups of all of them in one decomposition): tensor t of A[t] (size_m x size_k),
+// width code K and the codebook flags, size_n[t] outputs (multiples of 256). False when the path declines (nothing enqueued)
+bool exl3_gemv_int8_multi(
+	const half* const* A,
+	int count,
+	const uint16_t* const* B,
+	void* const* C,
+	const half* const* suh,
+	const half* const* svh,
+	const int* size_n,
+	int size_m,
+	int size_k,
+	int K,
+	bool mcg,
+	bool mul1,
+	bool c_fp32,
+	int device,
+	cudaStream_t stream
+);

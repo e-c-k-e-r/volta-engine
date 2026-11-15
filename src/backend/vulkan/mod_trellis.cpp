@@ -44,6 +44,12 @@ void LinearTrellis::forward_recon( const pod::TensorView& x, const pod::TensorVi
 	trellis_linear( x, trellis, suh, svh, out, bits, mcg, mul1, volta_tiles, stream );
 }
 
+// one projection at a time here
+bool trellis_forward_multi( const pod::TensorView*, int, const pod::TensorView*, const pod::TensorView*, const pod::TensorView*, pod::TensorView* const*, int, bool, bool,
+	backend::stream_t, bool ) {
+	return false;
+}
+
 bool trellis_volta_tiles_supported() {
 	return true;
 }

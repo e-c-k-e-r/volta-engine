@@ -326,9 +326,30 @@ void lin_fwd( const pod::TensorView& x, const pod::LinearWeight& w, pod::TensorV
 	else engine::modules::DSV4::linear_fp8( x.ptr<const backend::half_t>(), w.w0.ptr<const uint8_t>(), w.w1.ptr<const uint8_t>(), out.ptr<backend::half_t>(), x.shape[0], w.w0.shape[1], w.w0.shape[0], scratch, stream );
 }
 
-// Two projections of the same input: one GGUF launch when both are GGUF weights of one block type and width (and untiled) at decode rows
+// 2 to 4 projections in one launch when they are EXL3 weights of one width, codebook and tile order at one or two rows (the int8 GEMV over
+// their columns together): of the same input x, or projection i of xs[i]
+bool lin_trellis_multi( const pod::TensorView& x, int n, const pod::LinearWeight* const* w, pod::TensorView* const* out, backend::stream_t stream,
+	const pod::TensorView* xs = nullptr ) {
+	pod::TensorView tr[4], su[4], sv[4], in[4];
+	for ( int i = 0; i < n; ++i ) {
+		in[i] = xs != nullptr ? xs[i] : x;
+		if ( w[i]->type != pod::QuantType::TRELLIS || w[i]->bits != w[0]->bits || w[i]->mcg != w[0]->mcg || w[i]->volta_tiles != w[0]->volta_tiles ) return false;
+		tr[i] = w[i]->w0;
+		su[i] = w[i]->w1;
+		sv[i] = w[i]->w2;
+	}
+	return engine::modules::trellis_forward_multi( in, n, tr, su, sv, out, w[0]->bits, w[0]->mcg, !w[0]->mcg, stream, w[0]->volta_tiles );
+}
+
+// Two projections of the same input: one GGUF launch when both are GGUF weights of one block type and width (and untiled) at decode rows,
+// one EXL3 launch as lin_trellis_multi
 void lin_fwd2( const pod::TensorView& x, const pod::LinearWeight& wa, pod::TensorView& a, const pod::LinearWeight& wb, pod::TensorView& b, backend::half_t* scratch,
 	backend::stream_t stream ) {
+	{
+		const pod::LinearWeight* w[2] = { &wa, &wb };
+		pod::TensorView* o[2] = { &a, &b };
+		if ( lin_trellis_multi( x, 2, w, o, stream ) ) return;
+	}
 	if ( wa.type == pod::QuantType::GGUF && wb.type == pod::QuantType::GGUF && wa.gguf_type == wb.gguf_type && wa.gguf_k == wb.gguf_k && wa.gguf_tile_heads == 0 &&
 		wb.gguf_tile_heads == 0 && engine::modules::LinearGguf::forward2( x, wa.w0.data, wa.gguf_n, a, wb.w0.data, wb.gguf_n, b,
 			static_cast<engine::modules::GgmlType>( wa.gguf_type ), wa.gguf_k, stream ) )
@@ -2144,8 +2165,8 @@ void DeepseekV41Pipeline::attention_kv( int layer, DeepseekV41LayerWeights& lw, 
 	DSV4::window_store( kv_n_.ptr<const backend::half_t>(), win_ring_, rope, layer, m, d_rows_, win_slot_stride_, stream );
 	if ( lw.ratio > 0 && lw.is_kv_source ) {
 		const int s = lw.kv_src;
-		Linear::forward( norm_x_, lw.c_wkv, ckv_, stream );
-		if ( lw.ratio > 1 ) Linear::forward( norm_x_, lw.c_wgate, csc_, stream );
+		if ( lw.ratio > 1 ) lin_fwd2( norm_x_, lw.c_wkv, ckv_, lw.c_wgate, csc_, fp8_scratch_, stream );
+		else Linear::forward( norm_x_, lw.c_wkv, ckv_, stream );
 		DSV4::compress( ckv_.ptr<const backend::half_t>(), csc_.ptr<const backend::half_t>(), lw.c_norm.ptr<const backend::half_t>(), cring_kv_[s], cring_sc_[s],
 			latent_.ptr<backend::half_t>(), comp_kv_[s], rope, lw.ratio, m, d_rows_, cring_slot_stride_, comp_slot_stride_[s], eps, stream );
 		Linear::forward( latent_, lw.idx_wk, kraw_, stream );
@@ -2166,9 +2187,25 @@ void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int
 	trace_tensor( 1000 + layer, norm_x_, m, H, stream );
 
 	const float* rope = lw.ratio > 0 ? rope_comp_ : rope_plain_;
-	lin_fwd2( norm_x_, lw.wq_a, qr_, lw.wkv, kv_, fp8_scratch_, stream );
+	// the projections of norm_x: the queries' and keys' (and a compressing source's two) in one launch where they allow it
+	const bool comp_src = lw.ratio > 0 && lw.is_kv_source;
+	bool comp_done = false;
+	{
+		const pod::LinearWeight* w[4] = { &lw.wq_a, &lw.wkv, &lw.c_wkv, &lw.c_wgate };
+		pod::TensorView* o[4] = { &qr_, &kv_, &ckv_, &csc_ };
+		const int n = comp_src ? ( lw.ratio > 1 ? 4 : 3 ) : 2;
+		comp_done = n > 2 && lin_trellis_multi( norm_x_, n, w, o, stream );
+		if ( !comp_done ) lin_fwd2( norm_x_, lw.wq_a, qr_, lw.wkv, kv_, fp8_scratch_, stream );
+	}
 	RMSNorm::forward( qr_, lw.q_norm, qr_n_, eps, 0.0f, stream );
-	lin_fwd( qr_n_, lw.wq_b, q_, fp8_scratch_, stream );
+	// the queries' up-projection and an index source's (both of qr_n)
+	bool idx_q_done = false;
+	if ( lw.ratio > 0 && lw.is_index_source ) {
+		const pod::LinearWeight* w[2] = { &lw.wq_b, &lw.idx_wq_b };
+		pod::TensorView* o[2] = { &q_, &qi_ };
+		idx_q_done = lin_trellis_multi( qr_n_, 2, w, o, stream );
+	}
+	if ( !idx_q_done ) lin_fwd( qr_n_, lw.wq_b, q_, fp8_scratch_, stream );
 	RMSNorm::forward( kv_, lw.kv_norm, kv_n_, eps, 0.0f, stream );
 	trace_tensor( 3000 + layer, kv_n_, m, DSV4::HD, stream );
 	trace_tensor( 6000 + layer, q_, m, lh_ * DSV4::HD, stream );
@@ -2177,15 +2214,15 @@ void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int
 	if ( lw.ratio > 0 ) {
 		const int s = lw.kv_src;
 		if ( lw.is_kv_source ) {
-			Linear::forward( norm_x_, lw.c_wkv, ckv_, stream );
-			if ( lw.ratio > 1 ) Linear::forward( norm_x_, lw.c_wgate, csc_, stream );
+			if ( !comp_done && lw.ratio > 1 ) lin_fwd2( norm_x_, lw.c_wkv, ckv_, lw.c_wgate, csc_, fp8_scratch_, stream );
+			else if ( !comp_done ) Linear::forward( norm_x_, lw.c_wkv, ckv_, stream );
 			DSV4::compress( ckv_.ptr<const backend::half_t>(), csc_.ptr<const backend::half_t>(), lw.c_norm.ptr<const backend::half_t>(), cring_kv_[s], cring_sc_[s],
 				latent_.ptr<backend::half_t>(), comp_kv_[s], rope, lw.ratio, m, d_rows_, cring_slot_stride_, comp_slot_stride_[s], eps, stream );
 			Linear::forward( latent_, lw.idx_wk, kraw_, stream );
 			DSV4::index_key_store( kraw_.ptr<const backend::half_t>(), lw.idx_knorm.ptr<const backend::half_t>(), idx_k_[s], rope, lw.ratio, m, d_rows_, idx_slot_stride_[s], eps, stream );
 		}
 		if ( lw.is_index_source ) {
-			Linear::forward( qr_n_, lw.idx_wq_b, qi_, stream );
+			if ( !idx_q_done ) Linear::forward( qr_n_, lw.idx_wq_b, qi_, stream );
 			Linear::forward( norm_x_, lw.idx_wproj, wi_, stream );
 			const int cand_mode = layer == config_.candidate_source ? 1 : layer > config_.candidate_source ? 2 : 0;
 			DSV4::indexer( qi_.ptr<const backend::half_t>(), wi_.ptr<const backend::half_t>(), idx_k_[s], idx_scores_, idx_cand_, idx_sel_, idx_nsel_, rope, lw.ratio, src_cap_[s],
@@ -2196,10 +2233,24 @@ void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int
 	DSV4::attend( q_.ptr<const backend::half_t>(), win_ring_, comp, idx_sel_, idx_nsel_, lw.sink.ptr<const float>(), rope, o_g_.ptr<backend::half_t>(), lh_, layer, m, d_rows_,
 		win_slot_stride_, lw.ratio > 0 ? comp_slot_stride_[lw.kv_src] : 0, m <= pod::MAX_BATCH ? attend_ws_ : nullptr, stream, layer > trunc_layer_ ? win_floor_ : 0 );
 	const int G = DSV4::GROUP_HEADS * DSV4::HD, O = config_.o_lora_rank;
-	for ( int g = 0; g < gl_; ++g ) {
-		pod::TensorView in = view( o_g_, static_cast<size_t>( g ) * m * G, m, G );
-		pod::TensorView out = view( woa_out_, static_cast<size_t>( g ) * m * O, m, O );
-		lin_fwd( in, lw.wo_a[g], out, fp8_scratch_, stream );
+	{
+		// the rank's output groups (each of its own heads) in one launch where they allow it
+		pod::TensorView in[4], out[4];
+		const pod::LinearWeight* w[4] = {};
+		pod::TensorView* o[4] = {};
+		for ( int g = 0; g < gl_ && g < 4; ++g ) {
+			in[g] = view( o_g_, static_cast<size_t>( g ) * m * G, m, G );
+			out[g] = view( woa_out_, static_cast<size_t>( g ) * m * O, m, O );
+			w[g] = &lw.wo_a[g];
+			o[g] = &out[g];
+		}
+		if ( gl_ < 2 || gl_ > 4 || !lin_trellis_multi( in[0], gl_, w, o, stream, in ) ) {
+			for ( int g = 0; g < gl_; ++g ) {
+				pod::TensorView gi = view( o_g_, static_cast<size_t>( g ) * m * G, m, G );
+				pod::TensorView go = view( woa_out_, static_cast<size_t>( g ) * m * O, m, O );
+				lin_fwd( gi, lw.wo_a[g], go, fp8_scratch_, stream );
+			}
+		}
 	}
 	DSV4::concat_groups( woa_out_.ptr<const backend::half_t>(), woa_cat_.ptr<backend::half_t>(), gl_, O, m, stream );
 	lin_fwd( woa_cat_, lw.wo_b, attn_out_, fp8_scratch_, stream );
