@@ -1142,8 +1142,11 @@ pod::LinearWeight SafeTensorsRepo::gguf_linear( int shard, const pod::SafeTensor
 	ENGINE_ASSERT( mem != nullptr, "gguf_linear: arena full" );
 	pod::TensorView tv = pod::make_tensor_2d( mem, pod::DType::UINT8, n_local, static_cast<int>( local_row_bytes ) );
 	backend::memcpy_async( tv.data, h.data(), h.size(), backend::Copy::Auto, stream );
+	// dense weights in the backend's faster layout where it has one (routed experts keep the file's: the MoE kernels read it)
+	uint32_t held = meta->gguf_type;
+	if ( std::strstr( meta->name, ".experts." ) == nullptr ) held = static_cast<uint32_t>( engine::modules::LinearGguf::repack( tv.data, type, n_local, k_local, stream ) );
 	backend::stream_sync( stream );
-	pod::LinearWeight lw = pod::LinearWeight::make_gguf( tv, meta->gguf_type, k_local, n_local );
+	pod::LinearWeight lw = pod::LinearWeight::make_gguf( tv, held, k_local, n_local );
 	if ( meta->gguf_flags & engine::loader::GGUF_COLS_V_TILED ) {
 		// the gathered columns hold k_local / (v_per_k * head_dim) key heads per v
 		const engine::loader::GgufVHeads h = engine::loader::gguf_v_heads( shards_[shard] );

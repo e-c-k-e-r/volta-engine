@@ -13,6 +13,7 @@ GgmlBlock ggml_block( GgmlType type ) {
 		case GgmlType::Q5_0: return { 32, 22 };
 		case GgmlType::Q5_1: return { 32, 24 };
 		case GgmlType::Q8_0: return { 32, 34 };
+		case GgmlType::Q8_0R: return { 32, 34 };
 		case GgmlType::Q8_1: return { 32, 36 };
 		case GgmlType::Q2_K: return { 256, 84 };
 		case GgmlType::Q3_K: return { 256, 110 };
@@ -65,6 +66,7 @@ const char* ggml_type_name( GgmlType type ) {
 		case GgmlType::Q5_0: return "Q5_0";
 		case GgmlType::Q5_1: return "Q5_1";
 		case GgmlType::Q8_0: return "Q8_0";
+		case GgmlType::Q8_0R: return "Q8_0R";
 		case GgmlType::Q8_1: return "Q8_1";
 		case GgmlType::Q2_K: return "Q2_K";
 		case GgmlType::Q3_K: return "Q3_K";

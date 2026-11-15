@@ -89,11 +89,19 @@ int main( int argc, char** argv ) {
 			std::printf( "  %-8s not supported, skipped\n", modules::ggml_type_name( type ) );
 			continue;
 		}
+		// the file's layout, then the backend's repacked one where it has one (LinearGguf::repack, as the loader does for dense weights)
+		for ( int layout = 0; layout < 2; ++layout ) {
 		const size_t mark = arena.offset_bytes;
 		int bdims[2] = { f.n, static_cast<int>( f.blocks.size() / f.n ) };
 		pod::TensorView w = core::arena_alloc_tensor( arena, pod::DType::INT8, bdims, 2 );
 		backend::memcpy_sync( w.data, f.blocks.data(), f.blocks.size(), backend::Copy::H2D );
-		const pod::LinearWeight lw = pod::LinearWeight::make_gguf( w, static_cast<uint32_t>( f.type ), f.k, f.n );
+		const modules::GgmlType held = layout == 0 ? type : modules::LinearGguf::repack( w.data, type, f.n, f.k );
+		backend::device_sync();
+		if ( layout == 1 && held == type ) {
+			arena.offset_bytes = mark;
+			break;
+		}
+		const pod::LinearWeight lw = pod::LinearWeight::make_gguf( w, static_cast<uint32_t>( held ), f.k, f.n );
 		double worst_gemv = 0.0, worst_tile = 0.0, worst_gemm = 0.0;
 		std::vector<half_t> one_row;   // the 1-row product, which the first row of 2 to 8 rows must equal bit for bit on CPU
 		int row_mismatch = 0;
@@ -109,9 +117,10 @@ int main( int argc, char** argv ) {
 			backend::memcpy_sync( oh.data(), out.data, oh.size() * sizeof( half_t ), backend::Copy::D2H );
 			std::vector<float> o( oh.size() );
 			for ( size_t i = 0; i < o.size(); ++i ) o[i] = backend::to_float( oh[i] );
+			const int gemv_rows = layout ? 16 : 8;   // the repacked layout's GEMV takes up to 16 rows (q8 activations)
 			if ( rows == 1 ) one_row = oh;
-			else if ( rows <= 8 ) row_mismatch += std::memcmp( one_row.data(), oh.data(), one_row.size() * sizeof( half_t ) ) != 0;
-			if ( rows <= 8 ) worst_gemv = std::max( worst_gemv, rel_rms( o, f.ref_q, rows, f.n ) );
+			else if ( rows <= gemv_rows ) row_mismatch += std::memcmp( one_row.data(), oh.data(), one_row.size() * sizeof( half_t ) ) != 0;
+			if ( rows <= gemv_rows ) worst_gemv = std::max( worst_gemv, rel_rms( o, f.ref_q, rows, f.n ) );
 			else if ( rows <= 16 ) worst_tile = std::max( worst_tile, rel_rms( o, f.exact, rows, f.n ) );
 			else worst_gemm = std::max( worst_gemm, rel_rms( o, f.exact, rows, f.n ) );
 		}
@@ -139,14 +148,55 @@ int main( int argc, char** argv ) {
 #if defined(ENGINE_BACKEND_CPU)
 		const bool rows_agree = row_mismatch == 0;
 #else
-		const bool rows_agree = true;
+		const bool rows_agree = layout == 0 || row_mismatch == 0;   // the repacked GEMV takes every row the same way at 1 to 16 rows
 #endif
-		if ( !rows_agree ) std::printf( "  %-8s row 0 of %d of the 2-8 row products differs from the 1-row product\n", modules::ggml_type_name( type ), row_mismatch );
-		const bool ok = worst_gemv < ( sum_offset ? 3e-2 : 1e-2 ) && worst_tile < full_bound && worst_gemm < gemm_bound && rows_agree;
+		if ( !rows_agree ) std::printf( "  %-8s row 0 of %d of the 2-8 row products differs from the 1-row product\n", modules::ggml_type_name( held ), row_mismatch );
+		// the repacked layout's kernels for wide weights (from 2048 rows; the fixtures' are narrow): the fixture's rows repeated 6 times against the
+		// repeated reference, 1 to 16 rows, every row the 1-row product's
+		double worst_wide = 0.0;
+		int wide_mismatch = 0;
+		if ( layout == 1 ) {
+			constexpr int kRep = 6;
+			const size_t wb = f.blocks.size();
+			int wdims[2] = { f.n * kRep, static_cast<int>( wb / f.n ) };
+			pod::TensorView ww = core::arena_alloc_tensor( arena, pod::DType::INT8, wdims, 2 );
+			for ( int r = 0; r < kRep; ++r ) backend::memcpy_sync( static_cast<char*>( ww.data ) + r * wb, f.blocks.data(), wb, backend::Copy::H2D );
+			const modules::GgmlType wheld = modules::LinearGguf::repack( ww.data, type, f.n * kRep, f.k );
+			backend::device_sync();
+			const pod::LinearWeight lww = pod::LinearWeight::make_gguf( ww, static_cast<uint32_t>( wheld ), f.k, f.n * kRep );
+			std::vector<half_t> first;
+			for ( int rows : { 1, 2, 5, 8, 9, 13, 16 } ) {
+				if ( rows > f.m ) continue;
+				int xdims[2] = { rows, f.k }, odims[2] = { rows, f.n * kRep };
+				pod::TensorView x = core::arena_alloc_tensor( arena, pod::DType::FP16, xdims, 2 );
+				pod::TensorView out = core::arena_alloc_tensor( arena, pod::DType::FP16, odims, 2 );
+				backend::memcpy_sync( x.data, f.x.data(), static_cast<size_t>( rows ) * f.k * sizeof( half_t ), backend::Copy::H2D );
+				modules::Linear::forward( x, lww, out );
+				backend::device_sync();
+				std::vector<half_t> oh( static_cast<size_t>( rows ) * f.n * kRep );
+				backend::memcpy_sync( oh.data(), out.data, oh.size() * sizeof( half_t ), backend::Copy::D2H );
+				if ( rows == 1 ) first = oh;
+				else wide_mismatch += std::memcmp( first.data(), oh.data(), first.size() * sizeof( half_t ) ) != 0;
+				std::vector<float> o( static_cast<size_t>( rows ) * f.n ), ref( o.size() );
+				for ( int rep = 0; rep < kRep; ++rep ) {
+					for ( int i = 0; i < rows; ++i )
+						for ( int c = 0; c < f.n; ++c ) {
+							o[static_cast<size_t>( i ) * f.n + c] = backend::to_float( oh[static_cast<size_t>( i ) * f.n * kRep + rep * f.n + c] );
+							ref[static_cast<size_t>( i ) * f.n + c] = f.ref_q[static_cast<size_t>( i ) * f.n + c];
+						}
+					worst_wide = std::max( worst_wide, rel_rms( o, ref, rows, f.n ) );
+				}
+			}
+			std::printf( "  %-8s n %d (wide): 1-16 rows vs q8_1 reference %.2e, rows unlike the 1-row product %d\n", modules::ggml_type_name( wheld ), f.n * kRep,
+				worst_wide, wide_mismatch );
+		}
+		const bool ok = worst_gemv < ( sum_offset ? 3e-2 : 1e-2 ) && worst_tile < full_bound && worst_gemm < gemm_bound && rows_agree && worst_wide < 1e-2 &&
+			wide_mismatch == 0;
 		std::printf( "  %-8s n %d k %d: 1-8 rows vs q8_1 reference %.2e, 9-16 rows vs exact %.2e, 20 / 64 rows vs exact %.2e  %s\n",
-			modules::ggml_type_name( type ), f.n, f.k, worst_gemv, worst_tile, worst_gemm, ok ? "PASS" : "FAIL" );
+			modules::ggml_type_name( held ), f.n, f.k, worst_gemv, worst_tile, worst_gemm, ok ? "PASS" : "FAIL" );
 		fails += ok ? 0 : 1;
 		arena.offset_bytes = mark;
+		}
 	}
 	std::printf( "%s\n", fails ? "[-] GGUF linear FAIL" : "[+] GGUF linear PASS" );
 	return fails ? 1 : 0;

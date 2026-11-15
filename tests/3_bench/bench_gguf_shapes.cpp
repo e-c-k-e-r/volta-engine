@@ -56,16 +56,18 @@ int main( int argc, char** argv ) {
 			const int SETS = std::max( 2, std::min( 64, static_cast<int>( 2.0e9 / static_cast<double>( bytes ) ) ) );
 			std::vector<pod::TensorView> w( SETS );
 			int ws[1] = { static_cast<int>( bytes ) };
+			GgmlType held = type;   // the layout the loader leaves a dense weight in (LinearGguf::repack)
 			for ( int s = 0; s < SETS; ++s ) {
 				w[s] = engine::core::arena_alloc_tensor( arena, pod::DType::UINT8, ws, 1 );
 				backend::memset_async( w[s].data, 0x11, bytes, stream );
+				held = engine::modules::LinearGguf::repack( w[s].data, type, N, K, stream );
 			}
-			for ( int m : { 1, 2, 4, 8, 16 } ) {
+			for ( int m : { 1, 2, 4, 8, 12, 16 } ) {
 				int xs[2] = { m, K }, os[2] = { m, N };
 				pod::TensorView x = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, xs, 2 );
 				pod::TensorView o = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, os, 2 );
 				backend::memset_async( x.data, 0x3c, static_cast<size_t>( m ) * K * 2, stream );
-				auto run = [&]() { for ( int s = 0; s < SETS; ++s ) engine::modules::LinearGguf::forward( x, w[s].data, type, N, K, o, stream ); };
+				auto run = [&]() { for ( int s = 0; s < SETS; ++s ) engine::modules::LinearGguf::forward( x, w[s].data, held, N, K, o, stream ); };
 				run();
 				backend::stream_sync( stream );
 				backend::graph_capture_begin( stream );
@@ -76,7 +78,7 @@ int main( int argc, char** argv ) {
 				const int iters = 20;
 				const double ms = timed( [&] { for ( int it = 0; it < iters; ++it ) backend::graph_launch( ex, stream ); } );
 				const double us = 1000.0 * ms / iters / SETS;
-				std::printf( "%-7s K %5d N %5d M %2d: %7.2f us per call, %6.1f GB/s (blocks %.2f MB)\n", engine::modules::ggml_type_name( type ), K, N, m, us,
+				std::printf( "%-7s K %5d N %5d M %2d: %7.2f us per call, %6.1f GB/s (blocks %.2f MB)\n", engine::modules::ggml_type_name( held ), K, N, m, us,
 					static_cast<double>( bytes ) / ( us * 1e-6 ) / 1e9, static_cast<double>( bytes ) / 1e6 );
 				backend::graph_exec_destroy( ex );
 				backend::graph_destroy( g );

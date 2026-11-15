@@ -7,10 +7,10 @@
 namespace pod {
 
 struct MemoryArena {
-	void*  base_ptr;       // Device pointer returned by single cudaMalloc
-	size_t total_bytes;    // Total allocated VRAM (e.g. 30,720 MiB)
-	size_t offset_bytes;   // Bump offset for static reservations
-	bool   pinned;         // base_ptr is mapped pinned host memory (the cold-expert tier), not device memory
+	void*  base_ptr = nullptr;    // Device pointer returned by single cudaMalloc (null until arena_create: it frees what is there)
+	size_t total_bytes = 0;       // Total allocated VRAM (e.g. 30,720 MiB)
+	size_t offset_bytes = 0;      // Bump offset for static reservations
+	bool   pinned = false;        // base_ptr is mapped pinned host memory (the cold-expert tier), not device memory
 	bool   stream_skip = false;   // allocate the tensors but do not copy them from the checkpoint (expert_stream fills them before use)
 };
 

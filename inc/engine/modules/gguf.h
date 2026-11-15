@@ -20,6 +20,9 @@ enum class GgmlType : uint32_t {
 	Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, Q8_K = 15,
 	IQ2_XXS = 16, IQ2_XS = 17, IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23,
 	I8 = 24, I16 = 25, I32 = 26, I64 = 27, F64 = 28, IQ1_M = 29, BF16 = 30, MXFP4 = 39, NVFP4 = 40, Q2_0 = 42,
+	// Not a file type: Q8_0 repacked on the CUDA backend (LinearGguf::repack), each row its k int8 values then its k / 32 FP16 scales (the bytes of
+	// the row's Q8_0 blocks, 16-byte aligned for k a multiple of 256)
+	Q8_0R = 1008,
 };
 
 struct GgmlBlock {
@@ -55,6 +58,11 @@ struct LinearGguf {
 	static void dequant( const void* w, GgmlType type, int64_t elems, backend::half_t* out, backend::stream_t stream = nullptr );
 	// Multiplies the weight's values by a power of two in place (its blocks' FP16 scale fields): an output scale folded into a GGUF weight
 	static void scale_blocks( void* w, GgmlType type, size_t bytes, float factor, backend::stream_t stream = nullptr );
+	// The same for a weight of n rows of width k in any layout this backend holds (the repacked ones too)
+	static void scale_weight( void* w, GgmlType type, int n, int k, float factor, backend::stream_t stream = nullptr );
+	// A dense weight of n rows of width k just uploaded: converted in place to this backend's faster layout of the type, if it has one; returns
+	// the type the weight has now (unchanged where there is none)
+	static GgmlType repack( void* w, GgmlType type, int n, int k, backend::stream_t stream = nullptr );
 };
 
 // GGUF routed experts (MoE::forward with QuantType::GGUF), route by route: the rows quantized to q8_1 once, each route's gate and up

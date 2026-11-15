@@ -771,9 +771,266 @@ void launch_mma( const void* w, const half* x, half* out, int n, int k, int m, G
 	if ( used > 1 ) tile_reduce_kernel<<<( m * n + 255 ) / 256, 256, 0, stream>>>( st.part, out, n, m, used );
 }
 
+// ---- Q8_0R: Q8_0 repacked per row, the row's k int8 values then its k / 32 FP16 scales (16-byte aligned for k a multiple of 256) ----
+
+// One block per row, in place: the row's blocks to shared memory, then the values and the scales back in their own runs
+__global__ void q8r_repack_kernel( uint8_t* __restrict__ w, int k ) {
+	extern __shared__ __align__( 16 ) uint8_t q8r_row[];
+	const size_t row_bytes = static_cast<size_t>( k ) / 32 * sizeof( block_q8_0 );
+	uint8_t* row = w + static_cast<size_t>( blockIdx.x ) * row_bytes;
+	for ( int i = threadIdx.x; i < static_cast<int>( row_bytes / 16 ); i += blockDim.x ) reinterpret_cast<uint4*>( q8r_row )[i] = reinterpret_cast<const uint4*>( row )[i];
+	__syncthreads();
+	const block_q8_0* b = reinterpret_cast<const block_q8_0*>( q8r_row );
+	for ( int c = threadIdx.x; c < k / 16; c += blockDim.x ) {   // 16 values a thread: half a block's
+		uint4 v;
+		memcpy( &v, b[c / 2].qs + 16 * ( c % 2 ), 16 );
+		reinterpret_cast<uint4*>( row )[c] = v;
+	}
+	half* d = reinterpret_cast<half*>( row + k );
+	for ( int i = threadIdx.x; i < k / 32; i += blockDim.x ) memcpy( d + i, &b[i].d, sizeof( half ) );
+}
+
+// x [m, k] FP16 -> int8 [m][k] then FP32 scales [m][k / 32], quantize_q8_1_kernel's scale and rounding (the weight's column order)
+__global__ void quantize_q8s_kernel( const half* __restrict__ x, int8_t* __restrict__ q, float* __restrict__ d, int k, int m, GgufColTiling t ) {
+	const int row = blockIdx.y;
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( i >= k ) return;
+	const float xi = __half2float( x[static_cast<size_t>( row ) * k + tiled_source( i, t, k )] );
+	float amax = fabsf( xi );
+	#pragma unroll
+	for ( int o = 16; o > 0; o >>= 1 ) amax = fmaxf( amax, __shfl_xor_sync( 0xffffffff, amax, o ) );
+	const float dd = amax / 127.0f;
+	q[static_cast<size_t>( row ) * k + i] = amax == 0.0f ? 0 : static_cast<int8_t>( roundf( xi / dd ) );
+	if ( i % QK8_1 == 0 ) d[static_cast<size_t>( row ) * ( k / QK8_1 ) + i / QK8_1] = dd;
+	(void) m;
+}
+
+// WPR warps per output row, kWarpRows / WPR rows a block: each lane 16 consecutive values a step (one 16-byte load of the weight, one of each
+// activation row, four dp4a), scaled by the weight's and the row's block scales; rows n .. n + n2 - 1 are w2's into out2. M rows of activations,
+// at most 8; every row's sums the same for any m (the 1-row product bit for bit)
+template <int M, int WPR>
+__global__ __launch_bounds__( 32 * kWarpRows, M > 4 ? 2 : 4 )
+void gemv_q8r_kernel( const uint8_t* __restrict__ w, const int8_t* __restrict__ xq, const float* __restrict__ xd, half* __restrict__ out, int n, int k, int m,
+	const uint8_t* __restrict__ w2, half* __restrict__ out2, int n2 ) {
+	constexpr int kRows = kWarpRows / WPR;
+	int row = blockIdx.x * kRows + threadIdx.y / WPR;
+	const bool live = row < n + n2;
+	if ( WPR == 1 && !live ) return;
+	if ( row >= n ) {
+		row -= n;
+		w = w2;
+		out = out2;
+		n = n2;
+	}
+	const int lane = threadIdx.x, wtid = ( threadIdx.y % WPR ) * 32 + lane;
+	const uint8_t* wr = w + static_cast<size_t>( live ? row : 0 ) * ( static_cast<size_t>( k ) / 32 * sizeof( block_q8_0 ) );
+	const half* wd = reinterpret_cast<const half*>( wr + k );
+	float acc[M] = {};
+	if ( live ) {
+		#pragma unroll 2
+		for ( int c = wtid; c < k / 16; c += 32 * WPR ) {
+			const int4 wq = reinterpret_cast<const int4*>( wr )[c];
+			const float dw = __half2float( wd[c / 2] );
+			#pragma unroll
+			for ( int j = 0; j < M; ++j ) {
+				{
+					const int4 a = reinterpret_cast<const int4*>( xq + static_cast<size_t>( j ) * k )[c];
+					int sum = __dp4a( wq.x, a.x, 0 );
+					sum = __dp4a( wq.y, a.y, sum );
+					sum = __dp4a( wq.z, a.z, sum );
+					sum = __dp4a( wq.w, a.w, sum );
+					acc[j] = fmaf( dw * xd[static_cast<size_t>( j ) * ( k / QK8_1 ) + c / 2], static_cast<float>( sum ), acc[j] );
+				}
+			}
+		}
+	}
+	#pragma unroll
+	for ( int j = 0; j < M; ++j ) {
+		#pragma unroll
+		for ( int o = 16; o > 0; o >>= 1 ) acc[j] += __shfl_xor_sync( 0xffffffff, acc[j], o );
+	}
+	if constexpr ( WPR > 1 ) {
+		__shared__ float part[kWarpRows][M];
+		if ( lane == 0 ) {
+			#pragma unroll
+			for ( int j = 0; j < M; ++j ) part[threadIdx.y][j] = acc[j];
+		}
+		__syncthreads();
+		if ( !live || threadIdx.y % WPR != 0 ) return;
+		#pragma unroll
+		for ( int j = 0; j < M; ++j ) {
+			float v = 0.0f;
+			#pragma unroll
+			for ( int wi = 0; wi < WPR; ++wi ) v += part[threadIdx.y + wi][j];
+			acc[j] = v;
+		}
+	}
+	if ( lane == 0 ) {
+		#pragma unroll
+		for ( int j = 0; j < M; ++j ) out[static_cast<size_t>( j ) * n + row] = __float2half_rn( acc[j] );
+	}
+}
+
+// More than 8 activation rows: gemv_q8r_kernel<M, 1>'s steps with the activations staged in shared memory a tile of kQ8rTile values at a time
+// (16 rows of a 4096-wide row are 64 KB: through the L1 every step went to the L2). A lane takes the same chunks in the same order, so every row's
+// sums are those of the 1-row product
+constexpr int kQ8rTile = 1024;
+constexpr int kQ8rRpw = 2;   // weight rows a warp: each staged activation load serves R rows (a lane's chunks those of gemv_q8r_kernel<M, 1>)
+template <int M, int R>
+__global__ __launch_bounds__( 32 * kWarpRows, 2 )
+void gemv_q8r_xs_kernel( const uint8_t* __restrict__ w, const int8_t* __restrict__ xq, const float* __restrict__ xd, half* __restrict__ out, int n, int k, int m,
+	const uint8_t* __restrict__ w2, half* __restrict__ out2, int n2, int tile ) {
+	// tile values (a multiple of 512, so a lane's chunks run on across tiles): M rows of int8, then their scales
+	extern __shared__ __align__( 16 ) unsigned char q8r_xs[];
+	int8_t* sq = reinterpret_cast<int8_t*>( q8r_xs );
+	float* sd = reinterpret_cast<float*>( q8r_xs + static_cast<size_t>( M ) * tile );
+	const int row0 = ( blockIdx.x * kWarpRows + threadIdx.y ) * R;
+	const size_t row_bytes = static_cast<size_t>( k ) / 32 * sizeof( block_q8_0 );
+	const uint8_t* wr[R];
+	half* orow[R];
+	int on[R];
+	bool live[R];
+	#pragma unroll
+	for ( int r = 0; r < R; ++r ) {
+		int row = row0 + r;
+		live[r] = row < n + n2;
+		const uint8_t* wb = w;
+		half* ob = out;
+		int nb = n;
+		if ( row >= n ) { row -= n; wb = w2; ob = out2; nb = n2; }
+		wr[r] = wb + static_cast<size_t>( live[r] ? row : 0 ) * row_bytes;
+		orow[r] = ob + row;
+		on[r] = nb;
+	}
+	const int lane = threadIdx.x, tid = threadIdx.y * 32 + lane;
+	float acc[R][M] = {};
+	for ( int t0 = 0; t0 < k; t0 += tile ) {
+		const int tl = min( tile, k - t0 );
+		__syncthreads();
+		for ( int i = tid; i < M * ( tl / 16 ); i += 32 * kWarpRows ) {
+			const int j = i / ( tl / 16 ), c = i % ( tl / 16 );
+			reinterpret_cast<int4*>( sq + static_cast<size_t>( j ) * tile )[c] = j < m ? reinterpret_cast<const int4*>( xq + static_cast<size_t>( j ) * k + t0 )[c] : make_int4( 0, 0, 0, 0 );
+		}
+		for ( int i = tid; i < M * ( tl / QK8_1 ); i += 32 * kWarpRows ) {
+			const int j = i / ( tl / QK8_1 ), b = i % ( tl / QK8_1 );
+			sd[j * ( tile / QK8_1 ) + b] = j < m ? xd[static_cast<size_t>( j ) * ( k / QK8_1 ) + t0 / QK8_1 + b] : 0.0f;
+		}
+		__syncthreads();
+		for ( int c = lane; c < tl / 16; c += 32 ) {
+			int4 wq[R];
+			float dw[R];
+			#pragma unroll
+			for ( int r = 0; r < R; ++r ) {
+				wq[r] = reinterpret_cast<const int4*>( wr[r] + t0 )[c];
+				dw[r] = __half2float( reinterpret_cast<const half*>( wr[r] + k )[( t0 / 16 + c ) / 2] );
+			}
+			#pragma unroll
+			for ( int j = 0; j < M; ++j ) {
+				const int4 a = reinterpret_cast<const int4*>( sq + static_cast<size_t>( j ) * tile )[c];
+				const float da = sd[j * ( tile / QK8_1 ) + c / 2];
+				#pragma unroll
+				for ( int r = 0; r < R; ++r ) {
+					int sum = __dp4a( wq[r].x, a.x, 0 );
+					sum = __dp4a( wq[r].y, a.y, sum );
+					sum = __dp4a( wq[r].z, a.z, sum );
+					sum = __dp4a( wq[r].w, a.w, sum );
+					acc[r][j] = fmaf( dw[r] * da, static_cast<float>( sum ), acc[r][j] );
+				}
+			}
+		}
+	}
+	#pragma unroll
+	for ( int r = 0; r < R; ++r ) {
+		#pragma unroll
+		for ( int j = 0; j < M; ++j ) {
+			#pragma unroll
+			for ( int o = 16; o > 0; o >>= 1 ) acc[r][j] += __shfl_xor_sync( 0xffffffff, acc[r][j], o );
+		}
+		if ( lane == 0 && live[r] ) {
+			#pragma unroll
+			for ( int j = 0; j < M; ++j ) if ( j < m ) orow[r][static_cast<size_t>( j ) * on[r]] = __float2half_rn( acc[r][j] );
+		}
+	}
+}
+
+// out [n, k] FP16 from a Q8_0R weight (the prefill GEMM's operand)
+__global__ void dequant_q8r_kernel( const uint8_t* __restrict__ w, half* __restrict__ out, int k ) {
+	const int row = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;   // c: 8 values a thread
+	if ( c >= k / 8 ) return;
+	const uint8_t* wr = w + static_cast<size_t>( row ) * ( static_cast<size_t>( k ) / 32 * sizeof( block_q8_0 ) );
+	const float d = __half2float( reinterpret_cast<const half*>( wr + k )[c / 4] );
+	const int2 q = reinterpret_cast<const int2*>( wr )[c];
+	const int8_t* qb = reinterpret_cast<const int8_t*>( &q );
+	uint4 o;
+	half2* oh = reinterpret_cast<half2*>( &o );
+	#pragma unroll
+	for ( int j = 0; j < 4; ++j ) oh[j] = __floats2half2_rn( d * qb[2 * j], d * qb[2 * j + 1] );
+	reinterpret_cast<uint4*>( out + static_cast<size_t>( row ) * k )[c] = o;
+}
+
+__global__ void scale_q8r_kernel( uint8_t* __restrict__ w, int n, int k, float factor ) {
+	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x, per = k / 32;
+	if ( i >= static_cast<size_t>( n ) * per ) return;
+	half* d = reinterpret_cast<half*>( w + ( i / per ) * ( per * sizeof( block_q8_0 ) ) + k ) + i % per;
+	*d = __float2half_rn( __half2float( *d ) * factor );
+}
+
+// m rows (up to kTileRows) of a Q8_0R weight: the activations quantized once, then the GEMV (up to two weights over the same x: w2 into out2)
+void forward_q8r( const half* x, const void* w, int n, int k, int m, half* out, GgufColTiling tiling, cudaStream_t stream, const void* w2 = nullptr,
+	half* out2 = nullptr, int n2 = 0 );
+
 // Option gguf_mma false takes the tensor-core rows kernel out (the GEMV / tile paths), for A/B timing
 bool mma_off() {
 	return !engine::runtime::options().gguf_mma;
+}
+
+void forward_q8r( const half* x, const void* w, int n, int k, int m, half* out, GgufColTiling tiling, cudaStream_t stream, const void* w2, half* out2, int n2 ) {
+	ENGINE_ASSERT( m >= 1 && m <= kTileRows && k % 256 == 0, "LinearGguf: Q8_0R rows" );
+	block_q8_1* ws = q8_workspace( static_cast<size_t>( m ) * ( k / QK8_1 ) );   // m k int8 + m k / 32 floats: the same bytes as m rows of q8_1
+	int8_t* q = reinterpret_cast<int8_t*>( ws );
+	float* d = reinterpret_cast<float*>( q + static_cast<size_t>( m ) * k );
+	quantize_q8s_kernel<<<dim3( ( k + 255 ) / 256, m ), 256, 0, stream>>>( x, q, d, k, m, tiling );
+	const auto* wb = static_cast<const uint8_t*>( w );
+	const auto* wb2 = static_cast<const uint8_t*>( w2 );
+	// narrow weights (few rows to spread over the GPU): four warps a row, the row's sums in another order, but the same at every m
+	const bool narrow = n + n2 < 2048;
+	const dim3 block( 32, kWarpRows );
+	// rows r0 .. r0 + mr - 1 (up to 8) of the activations through gemv_q8r_kernel
+	auto rows8 = [&]( int r0, int mr ) {
+		const int8_t* qr = q + static_cast<size_t>( r0 ) * k;
+		const float* dr = d + static_cast<size_t>( r0 ) * ( k / QK8_1 );
+		half* o1 = out + static_cast<size_t>( r0 ) * n;
+		half* o2 = out2 != nullptr ? out2 + static_cast<size_t>( r0 ) * n2 : nullptr;
+		auto launch = [&]( auto mc, auto wc ) {
+			constexpr int M = decltype( mc )::value, WPR = decltype( wc )::value;
+			const dim3 grid( ( n + n2 + kWarpRows / WPR - 1 ) / ( kWarpRows / WPR ) );
+			gemv_q8r_kernel<M, WPR><<<grid, block, 0, stream>>>( wb, qr, dr, o1, n, k, mr, wb2, o2, n2 );
+		};
+		auto by_rows = [&]( auto wc ) {
+			switch ( mr ) {
+				case 1: launch( std::integral_constant<int, 1>{}, wc ); break;
+				case 2: launch( std::integral_constant<int, 2>{}, wc ); break;
+				case 3: launch( std::integral_constant<int, 3>{}, wc ); break;
+				case 4: launch( std::integral_constant<int, 4>{}, wc ); break;
+				case 5: launch( std::integral_constant<int, 5>{}, wc ); break;
+				case 6: launch( std::integral_constant<int, 6>{}, wc ); break;
+				case 7: launch( std::integral_constant<int, 7>{}, wc ); break;
+				default: launch( std::integral_constant<int, 8>{}, wc ); break;
+			}
+		};
+		if ( narrow ) by_rows( std::integral_constant<int, 4>{} );
+		else by_rows( std::integral_constant<int, 1>{} );
+	};
+	if ( m > 8 && !narrow ) {   // the activations through shared memory, kQ8rRpw rows a warp
+		const size_t smem = static_cast<size_t>( m <= 12 ? 12 : 16 ) * ( kQ8rTile + kQ8rTile / QK8_1 * sizeof( float ) );
+		const dim3 grid( ( n + n2 + kWarpRows * kQ8rRpw - 1 ) / ( kWarpRows * kQ8rRpw ) );
+		if ( m <= 12 ) gemv_q8r_xs_kernel<12, kQ8rRpw><<<grid, block, smem, stream>>>( wb, q, d, out, n, k, m, wb2, out2, n2, kQ8rTile );
+		else gemv_q8r_xs_kernel<16, kQ8rRpw><<<grid, block, smem, stream>>>( wb, q, d, out, n, k, m, wb2, out2, n2, kQ8rTile );
+	}
+	else {
+		// narrow: passes of 8 rows (the kernel's activation loads stay in the L1, and few blocks would wait on shared-memory tiles)
+		for ( int r0 = 0; r0 < m; r0 += 8 ) rows8( r0, std::min( 8, m - r0 ) );
+	}
 }
 
 } // namespace
@@ -819,9 +1076,32 @@ bool gguf_linear_supported( GgmlType type ) {
 		case GgmlType::Q4_0: case GgmlType::Q4_1: case GgmlType::Q5_0: case GgmlType::Q5_1: case GgmlType::Q8_0: case GgmlType::Q2_0:
 		case GgmlType::Q2_K: case GgmlType::Q3_K: case GgmlType::Q4_K: case GgmlType::Q5_K: case GgmlType::Q6_K:
 		case GgmlType::IQ2_XXS: case GgmlType::IQ2_XS: case GgmlType::IQ2_S: case GgmlType::IQ3_XXS: case GgmlType::IQ3_S:
-		case GgmlType::IQ1_S: case GgmlType::IQ1_M: case GgmlType::IQ4_NL: case GgmlType::IQ4_XS: return true;
+		case GgmlType::IQ1_S: case GgmlType::IQ1_M: case GgmlType::IQ4_NL: case GgmlType::IQ4_XS: case GgmlType::Q8_0R: return true;
 		default: return false;
 	}
+}
+
+GgmlType LinearGguf::repack( void* w, GgmlType type, int n, int k, cudaStream_t stream ) {
+	// Q8_0 rows of a multiple of 256 values: aligned runs of values and scales for the dp4a GEMV's 16-byte loads (the repack is in place: the row's
+	// bytes, rearranged)
+	static const bool on = engine::runtime::options().gguf_q8r;
+	if ( type != GgmlType::Q8_0 || !on || k % 256 != 0 || n <= 0 ) return type;
+	const size_t row_bytes = static_cast<size_t>( k ) / 32 * sizeof( block_q8_0 );
+	if ( row_bytes > 48 * 1024 ) return type;
+	q8r_repack_kernel<<<n, 256, row_bytes, stream>>>( static_cast<uint8_t*>( w ), k );
+	CUDA_CHECK( cudaGetLastError() );
+	return GgmlType::Q8_0R;
+}
+
+void LinearGguf::scale_weight( void* w, GgmlType type, int n, int k, float factor, cudaStream_t stream ) {
+	if ( type != GgmlType::Q8_0R ) {
+		const GgmlBlock b = ggml_block( type );
+		scale_blocks( w, type, static_cast<size_t>( n ) * ( k / b.elems ) * b.bytes, factor, stream );
+		return;
+	}
+	const size_t count = static_cast<size_t>( n ) * ( k / 32 );
+	scale_q8r_kernel<<<static_cast<unsigned>( ( count + 255 ) / 256 ), 256, 0, stream>>>( static_cast<uint8_t*>( w ), n, k, factor );
+	CUDA_CHECK( cudaGetLastError() );
 }
 
 // m rows of width k go through the tensor-core rows kernel (a type with a tensor-core decoder, from its min_rows on; a type whose blocks are
@@ -845,7 +1125,8 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	ENGINE_ASSERT( tiling.heads == 0 || ( tiling.dim > 0 && k % ( tiling.heads * tiling.dim ) == 0 ), "LinearGguf: tiling does not divide k" );
 	if ( m > kTileRows ) {
 		half* wf = recon_workspace( static_cast<size_t>( n ) * k + ( tiling.heads ? static_cast<size_t>( m ) * k : 0 ), stream );
-		dequant( w, type, static_cast<int64_t>( n ) * k, wf, stream );
+		if ( type == GgmlType::Q8_0R ) dequant_q8r_kernel<<<dim3( ( k / 8 + 255 ) / 256, n ), 256, 0, stream>>>( static_cast<const uint8_t*>( w ), wf, k );
+		else dequant( w, type, static_cast<int64_t>( n ) * k, wf, stream );
 		const half* xs = x.ptr<const half>();
 		if ( tiling.heads ) {
 			half* xt = wf + static_cast<size_t>( n ) * k;
@@ -853,6 +1134,10 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 			xs = xt;
 		}
 		Gemm::tn( xs, k, wf, k, out.data, n, false, m, n, k, 0.0f, stream );
+		return;
+	}
+	if ( type == GgmlType::Q8_0R ) {   // up to 16 rows: the dp4a GEMV on the aligned runs
+		forward_q8r( x.ptr<const half>(), w, n, k, m, out.ptr<half>(), tiling, stream );
 		return;
 	}
 	// up to 16 rows of a type with a tensor-core decoder (from its min_rows on: fewer go faster through the GEMV); a type whose blocks are whole
@@ -891,6 +1176,12 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 bool LinearGguf::forward2( const pod::TensorView& x, const void* w1, int n1, pod::TensorView& out1, const void* w2, int n2, pod::TensorView& out2, GgmlType type, int k,
 	cudaStream_t stream ) {
 	const int m = x.shape[0];
+	if ( type == GgmlType::Q8_0R ) {
+		if ( m > kTileRows ) return false;
+		ENGINE_ASSERT( x.dtype == pod::DType::FP16 && out1.dtype == pod::DType::FP16 && out2.dtype == pod::DType::FP16, "LinearGguf: FP16 activations and output" );
+		forward_q8r( x.ptr<const half>(), w1, n1, k, m, out1.ptr<half>(), GgufColTiling{}, stream, w2, out2.ptr<half>(), n2 );
+		return true;
+	}
 	if ( m > kGemvRows || mma_takes( type, m, k ) ) return false;
 	ENGINE_ASSERT( x.dtype == pod::DType::FP16 && out1.dtype == pod::DType::FP16 && out2.dtype == pod::DType::FP16, "LinearGguf: FP16 activations and output" );
 	ENGINE_ASSERT( x.shape[1] == k && k % ggml_block( type ).elems == 0 && k % QK8_1 == 0, "LinearGguf: k does not match the weight's blocks" );

@@ -810,7 +810,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 					: begin >= 0 ? repo.load_linear_range( name.c_str(), arena, slice_dim, begin / 16, count / 16, stream )
 					: repo.load_linear_slice( name.c_str(), arena, bits, slice_dim, rank_, tp, stream );
 				if ( out_scale != 1.0f && w.is_valid() )
-					engine::modules::LinearGguf::scale_blocks( w.w0.data, static_cast<engine::modules::GgmlType>( w.gguf_type ), w.w0.size_bytes(), out_scale, stream );
+					engine::modules::LinearGguf::scale_weight( w.w0.data, static_cast<engine::modules::GgmlType>( w.gguf_type ), w.gguf_n, w.gguf_k, out_scale, stream );
 				return w;
 			}
 			const int n = meta->shape[0], k = meta->shape[1];

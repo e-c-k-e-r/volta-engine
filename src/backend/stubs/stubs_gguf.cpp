@@ -18,6 +18,14 @@ __attribute__(( weak )) void LinearGguf::scale_blocks( void*, GgmlType, size_t, 
 	__builtin_unreachable();
 }
 
+// Backends without a repacked layout hold every weight in its file layout
+__attribute__(( weak )) GgmlType LinearGguf::repack( void*, GgmlType type, int, int, backend::stream_t ) { return type; }
+
+__attribute__(( weak )) void LinearGguf::scale_weight( void* w, GgmlType type, int n, int k, float factor, backend::stream_t stream ) {
+	const GgmlBlock b = ggml_block( type );
+	LinearGguf::scale_blocks( w, type, static_cast<size_t>( n ) * ( k / b.elems ) * b.bytes, factor, stream );
+}
+
 __attribute__(( weak )) void LinearGguf::forward( const pod::TensorView&, const void*, GgmlType, int, int, pod::TensorView&, backend::stream_t, GgufColTiling ) {
 	ENGINE_UNSUPPORTED( "LinearGguf::forward" );
 	__builtin_unreachable();
