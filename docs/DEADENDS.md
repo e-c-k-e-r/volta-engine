@@ -47,8 +47,9 @@ from the hardware of the time (4x V100, power caps as noted); relative results a
   kernel, under 2% end to end. The Volta tile order was built instead at the quantizer (`tile_layout: volta` checkpoints).
 * **Transcoding a low-bit EXL3 checkpoint to the Volta order.** The GLM 2.60 bpw re-encode lost the original's Hessian-guided rounding:
   perplexity 4.56 -> 33.3. Volta-order checkpoints are quantized from the original weights (`tests/tools/exl3_quantize.py`).
-* **Per-expert slices over all ranks for DeepSeek decode (`expert_shard`):** rank waiting fell from 40% to 6%, but the fused MoE kernels
-  cost per expert slot, not per byte (348 -> 815 ms), so the slowest rank got slower.
+* **Per-expert slices over all ranks for DeepSeek decode with EXL3 packs (`expert_shard`):** rank waiting fell from 40% to 6%, but the fused
+  MoE kernels cost per expert slot, not per byte (348 -> 815 ms), so the slowest rank got slower. GGUF experts, whose kernels cost about the
+  same per byte at any slice width, run sharded by default.
 
 ## Prefill and multi-GPU balance
 

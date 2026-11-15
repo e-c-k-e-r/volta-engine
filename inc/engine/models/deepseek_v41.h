@@ -316,6 +316,7 @@ private:
 	bool img_flag_dirty_ = false;          // the device flags hold ones that have not been cleared yet
 	void sync_image_flags( backend::stream_t stream );
 	bool expert_tp_ = false;               // every rank holds a slice of every expert (expert_shard) instead of whole experts
+	bool shard_auto_ = false;              // expert_shard -1: expert_tp_ follows the experts' format (GGUF: sharded), set in load_weights
 	// expert_shard: the intermediate width is 18 spans of 128; rank r of tp takes 18 / tp of them plus one of the 18 % tp extra, and which ranks get
 	// the extra rotates with the expert so every rank carries the same share of the bytes and of the work
 	void expert_slice( int expert, int rank, int* begin, int* spans ) const;

@@ -587,12 +587,14 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 		ds_.dkv = dev_tensor( arena, pod::DType::FP16, DSV4::WINDOW, DSV4::HD );
 		ds_.dkvn = dev_tensor( arena, pod::DType::FP16, DSV4::WINDOW, DSV4::HD );
 	}
-	expert_tp_ = runtime::options().expert_shard && config_.tp_size > 1;
+	// expert_shard -1 (auto) decides once the checkpoint shows the experts' format (load_weights): sharded for GGUF experts
+	expert_tp_ = runtime::options().expert_shard > 0 && config_.tp_size > 1;
+	shard_auto_ = runtime::options().expert_shard < 0 && config_.tp_size > 1;
 	{
 		const int spans = config_.intermediate_size / 128, tp = config_.tp_size;
 		ENGINE_ASSERT( config_.intermediate_size % 128 == 0 && spans >= tp, "DeepseekV41Pipeline: the expert width must split into 128-wide spans for every rank" );
 	}
-	max_group_ = expert_tp_ ? config_.num_experts : ( config_.num_experts + config_.tp_size - 1 ) / config_.tp_size;
+	max_group_ = expert_tp_ || shard_auto_ ? config_.num_experts : ( config_.num_experts + config_.tp_size - 1 ) / config_.tp_size;
 	window_ = std::max( 1, std::min( runtime::options().prefill_window, 16 ) );   // -1 (the default): off, the window's buffers cost residency
 	const size_t window_mark = arena.offset_bytes;
 	moe_scratch_ = engine::modules::MoE::alloc_scratch( arena, max_group_, config_.top_k, H, config_.intermediate_size, R * window_, false );
@@ -967,6 +969,10 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		const auto* g0 = repo.find( ( p + "0.w1.weight" ).c_str() );
 		layers_[l].gguf_experts = g0 != nullptr && g0->dtype == pod::DType::GGUF;
 		if ( layers_[l].gguf_experts ) expert_span_ = 256;   // slices of whole GGUF blocks (every layer's experts are of one kind)
+		if ( l == 0 && shard_auto_ ) {
+			expert_tp_ = layers_[0].gguf_experts;
+			if ( rank_ == 0 ) LOG_INFO( "[deepseek_v41] expert_shard auto: %s\n", expert_tp_ ? "GGUF experts, a slice of every expert on each rank" : "EXL3 experts, whole experts dealt to the ranks" );
+		}
 		for ( int e = 0; e < E && !layers_[l].gguf_experts; ++e ) {
 			// the widths of the three projections (a pack may give each its own): gate | up << 4 | down << 8, which orders and groups the experts
 			int sig = 0, sh = 0;
