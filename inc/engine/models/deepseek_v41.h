@@ -230,9 +230,9 @@ private:
 	float* rope_comp_ = nullptr;           // compressing layers (YaRN)
 
 	// caches
-	backend::half_t* win_ring_ = nullptr;  size_t win_slot_stride_ = 0;
-	std::vector<backend::half_t*> comp_kv_;  std::vector<size_t> comp_slot_stride_;
-	std::vector<backend::half_t*> idx_k_;    std::vector<size_t> idx_slot_stride_;
+	uint8_t* win_ring_ = nullptr;  size_t win_slot_stride_ = 0;   // cache rows as DSV4 packs them; strides in bytes
+	std::vector<uint8_t*> comp_kv_;  std::vector<size_t> comp_slot_stride_;
+	std::vector<uint8_t*> idx_k_;    std::vector<size_t> idx_slot_stride_;
 	std::vector<float*> cring_kv_, cring_sc_; size_t cring_slot_stride_ = 0;
 	std::vector<int> src_cap_;             // compressed entries per slot of each source
 
@@ -280,7 +280,7 @@ private:
 		std::vector<float> conf_w;               // rank 0: confidence head over [hidden | markov_rank]
 		backend::half_t* tap_ring = nullptr;     // [slot][WINDOW][taps][hidden]
 		size_t tap_stride = 0;
-		backend::half_t* blk_ring = nullptr;     // scratch window ring for the block's own keys
+		uint8_t* blk_ring = nullptr;             // scratch window ring for the block's own keys
 		pod::BatchRows* d_ing_rows = nullptr;
 		pod::BatchRows* d_blk_rows = nullptr;
 		pod::TensorView taps_in, mx_pre, mx, dkv, dkvn;   // [WINDOW rows, ...]

@@ -19,9 +19,13 @@ namespace engine::modules {
 //   attention output (wo_a input) : E4M3, one power-of-two scale per 32 values
 // rope: the layer's rotary table [positions][ROPE / 2] of (cos, sin) pairs.
 // Caches are position-indexed per slot, so a rewind needs no state copy:
-//   window ring [slot][layer][RING][HD]  at pos % RING (a row reads the last WINDOW positions; RING covers a chunk on top)
+//   window ring [slot][layer][RING] rows of WIN_ROW bytes at pos % RING (a row reads the last WINDOW positions; RING covers a chunk on top)
 //   compressor ring (ratio > 1) [slot][source][RING][HD] FP32 kv and score of the tokens of the group being filled
-//   compressed KV [slot][source][capacity][HD] and index keys [slot][source][capacity][IDX_DIM] at entry pos / ratio
+//   compressed KV [slot][source][capacity] entries of COMP_ROW bytes and index keys [slot][source][capacity] of IDX_ROW bytes at entry pos / ratio
+// The cache rows hold the grids' codes, which decode to exactly the halves of the reference's dequantization:
+//   window row      : HD E4M3 bytes in dim order, then HD / 32 E8M0 exponents
+//   compressed entry: HD / 2 bytes of E2M1 pairs (the even dim in the low nibble), then HD / 16 E4M3 scales
+//   index key       : IDX_DIM / 2 bytes of E2M1 pairs, then IDX_DIM / 32 E8M0 exponents, padded to 16 bytes
 struct DSV4 {
 	static constexpr int HD = 512;          // head dim = KV latent width
 	static constexpr int ROPE = 64;         // rotary dims (the last ROPE of a head)
@@ -32,9 +36,12 @@ struct DSV4 {
 	static constexpr int TOPK = 512;        // compressed entries a query keeps
 	static constexpr int GROUP_HEADS = 8;   // heads per wo_a group
 	static constexpr int SCORE_ROWS = 64;   // rows the indexer scores at a time
+	static constexpr int WIN_ROW = HD + HD / 32;                                      // bytes of a window row
+	static constexpr int COMP_ROW = HD / 2 + HD / 16;                                 // bytes of a compressed entry
+	static constexpr int IDX_ROW = ( IDX_DIM / 2 + IDX_DIM / 32 + 15 ) / 16 * 16;     // bytes of an index key
 
-	// kv [rows, HD] (normed) -> rope at pos, E4M3 grid -> ring[slot][layer][pos % RING]
-	static void window_store( const backend::half_t* kv, backend::half_t* ring, const float* rope, int layer, int rows,
+	// kv [rows, HD] (normed) -> rope at pos, E4M3 grid -> ring[slot][layer][pos % RING] (strides in bytes here and below)
+	static void window_store( const backend::half_t* kv, uint8_t* ring, const float* rope, int layer, int rows,
 		const pod::BatchRows* d_rows, size_t ring_slot_stride, backend::stream_t stream );
 
 	// Compressor of a source layer. ratio 1: latent = rmsnorm(ckv); ratio r > 1: ckv / score rows go to the ring first, and the row
@@ -42,11 +49,11 @@ struct DSV4 {
 	// The completing row writes the unrotated latent to latent_out[row] (for the index keys) and the compressed entry pos / r: the latent
 	// roped at the group's first position, on the E2M1 / E4M3-16 grid. Other rows leave latent_out untouched
 	static void compress( const backend::half_t* ckv, const backend::half_t* cscore, const backend::half_t* norm_w, float* cring_kv, float* cring_sc,
-		backend::half_t* latent_out, backend::half_t* comp_kv, const float* rope, int ratio, int rows, const pod::BatchRows* d_rows,
+		backend::half_t* latent_out, uint8_t* comp_kv, const float* rope, int ratio, int rows, const pod::BatchRows* d_rows,
 		size_t cring_slot_stride, size_t comp_slot_stride, float eps, backend::stream_t stream );
 
 	// Index keys of the completing rows: rmsnorm(kraw) (kraw = wk latent), rope at the group's first position, E2M1 / E8M0-32 grid -> idx_k
-	static void index_key_store( const backend::half_t* kraw, const backend::half_t* knorm_w, backend::half_t* idx_k, const float* rope, int ratio, int rows,
+	static void index_key_store( const backend::half_t* kraw, const backend::half_t* knorm_w, uint8_t* idx_k, const float* rope, int ratio, int rows,
 		const pod::BatchRows* d_rows, size_t idx_slot_stride, float eps, backend::stream_t stream );
 
 	// Indexer of an index-source layer. q [rows, IDX_HEADS * IDX_DIM] (rope at pos, E2M1 / E8M0-32 grid here), w [rows, IDX_HEADS] (weights_proj x):
@@ -55,7 +62,7 @@ struct DSV4 {
 	// sel[row][0..nsel) = the TOPK best t (all t when n <= TOPK). cand_mode 1 (the candidate source): before the top-k, cand[row] marks the best
 	// cand_blocks blocks of cand_block entries by their best score (the block holding entry n - 1 always kept); cand_mode 2: scores outside
 	// cand[row] do not compete. scores [SCORE_ROWS, cap] and cand [rows, cap / cand_block] are scratch (rows are scored in blocks of SCORE_ROWS)
-	static void indexer( const backend::half_t* q, const backend::half_t* w, const backend::half_t* idx_k, float* scores, uint8_t* cand, int* sel, int* nsel,
+	static void indexer( const backend::half_t* q, const backend::half_t* w, const uint8_t* idx_k, float* scores, uint8_t* cand, int* sel, int* nsel,
 		const float* rope, int ratio, int cap, int cand_mode, int cand_blocks, int cand_block, int rows, const pod::BatchRows* d_rows, size_t idx_slot_stride,
 		bool tensor_cores, backend::stream_t stream );
 
@@ -64,7 +71,7 @@ struct DSV4 {
 	// inverse-roped at pos, put on the E4M3-32 grid and written group-major: o[g][row][(h % GROUP_HEADS) * HD + d], g = h / GROUP_HEADS
 	// ws (attend_ws_floats( nh )) enables the split-KV decode path for up to MAX_BATCH rows; null runs one block per row. Window positions
 	// below win_floor are not attended (prefill truncation: the ring holds no entries of this layer for them)
-	static void attend( const backend::half_t* q, const backend::half_t* ring, const backend::half_t* comp_kv, const int* sel, const int* nsel,
+	static void attend( const backend::half_t* q, const uint8_t* ring, const uint8_t* comp_kv, const int* sel, const int* nsel,
 		const float* sink, const float* rope, backend::half_t* o, int nh, int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride,
 		size_t comp_slot_stride, float* ws, backend::stream_t stream, int win_floor = 0 );
 	static constexpr int ATTEND_PARTIALS = 80;   // rows x splits of the split-KV path
@@ -80,7 +87,7 @@ struct DSV4 {
 	// Attention of a drafter block: nh heads, query rows `rows` (positions d_rows->pos, slot 0 of the scratch), over the window ring's positions
 	// [w0, t] of `slot` (layer `layer` of ring) and all the block's own keys (blk: a scratch ring written by window_store at the block positions; the
 	// block is not causal). Same scaling, sink, inverse rotation and output grid as attend; ws as attend's (up to MAX_BATCH rows)
-	static void dspark_attend( const backend::half_t* q, const backend::half_t* ring, const backend::half_t* blk, const float* sink, const float* rope, backend::half_t* o,
+	static void dspark_attend( const backend::half_t* q, const uint8_t* ring, const uint8_t* blk, const float* sink, const float* rope, backend::half_t* o,
 		int nh, int layer, int rows, const pod::BatchRows* d_rows, int slot, int w0, int t, size_t ring_slot_stride, float* ws, backend::stream_t stream );
 
 	// out[row][g * n + c] = in[g][row][c] for g < groups

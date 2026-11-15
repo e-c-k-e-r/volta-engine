@@ -25,8 +25,14 @@ int main() {
 	CUDA_CHECK( cudaSetDevice( 0 ) );
 	constexpr int NH = DSV4::IDX_HEADS, D = DSV4::IDX_DIM;
 	const int cap = 65536, cand_block = 8, cand_blocks = 2048, max_pos = 66000, RMAX = 300;
-	std::vector<half> h_k( static_cast<size_t>( cap ) * D ), h_q( static_cast<size_t>( RMAX ) * NH * D ), h_w( static_cast<size_t>( RMAX ) * NH );
-	for ( auto& v : h_k ) v = __float2half( rnd() * 2.0f );
+	// packed keys (DSV4::IDX_ROW bytes): random E2M1 pairs, power-of-two scales from 1/2 to 2
+	std::vector<uint8_t> h_k( static_cast<size_t>( cap ) * DSV4::IDX_ROW, 0 );
+	std::vector<half> h_q( static_cast<size_t>( RMAX ) * NH * D ), h_w( static_cast<size_t>( RMAX ) * NH );
+	for ( int t = 0; t < cap; ++t ) {
+		uint8_t* key = h_k.data() + static_cast<size_t>( t ) * DSV4::IDX_ROW;
+		for ( int b = 0; b < D / 2; ++b ) key[b] = static_cast<uint8_t>( ( rnd() * 0.5f + 0.5f ) * 255.0f );
+		for ( int b = 0; b < D / 32; ++b ) key[D / 2 + b] = static_cast<uint8_t>( 126 + static_cast<int>( ( rnd() * 0.5f + 0.5f ) * 2.99f ) );
+	}
 	for ( auto& v : h_q ) v = __float2half( rnd() * 3.0f );
 	for ( auto& v : h_w ) v = __float2half( rnd() );
 	std::vector<float> h_rope( static_cast<size_t>( max_pos ) * DSV4::ROPE );
@@ -36,12 +42,13 @@ int main() {
 			h_rope[( static_cast<size_t>( p ) * ( DSV4::ROPE / 2 ) + i ) * 2] = std::cos( a );
 			h_rope[( static_cast<size_t>( p ) * ( DSV4::ROPE / 2 ) + i ) * 2 + 1] = std::sin( a );
 		}
-	half *d_k, *d_q, *d_w;
+	uint8_t* d_k;
+	half *d_q, *d_w;
 	float *d_rope, *d_scores[2];
 	uint8_t* d_cand[2];
 	int *d_sel[2], *d_nsel[2];
 	pod::BatchRows* d_rows;
-	CUDA_CHECK( cudaMalloc( &d_k, h_k.size() * 2 ) );
+	CUDA_CHECK( cudaMalloc( &d_k, h_k.size() ) );
 	CUDA_CHECK( cudaMalloc( &d_q, h_q.size() * 2 ) );
 	CUDA_CHECK( cudaMalloc( &d_w, h_w.size() * 2 ) );
 	CUDA_CHECK( cudaMalloc( &d_rope, h_rope.size() * 4 ) );
@@ -52,7 +59,7 @@ int main() {
 		CUDA_CHECK( cudaMalloc( &d_sel[v], static_cast<size_t>( RMAX ) * DSV4::TOPK * 4 ) );
 		CUDA_CHECK( cudaMalloc( &d_nsel[v], RMAX * 4 ) );
 	}
-	CUDA_CHECK( cudaMemcpy( d_k, h_k.data(), h_k.size() * 2, cudaMemcpyHostToDevice ) );
+	CUDA_CHECK( cudaMemcpy( d_k, h_k.data(), h_k.size(), cudaMemcpyHostToDevice ) );
 	CUDA_CHECK( cudaMemcpy( d_q, h_q.data(), h_q.size() * 2, cudaMemcpyHostToDevice ) );
 	CUDA_CHECK( cudaMemcpy( d_w, h_w.data(), h_w.size() * 2, cudaMemcpyHostToDevice ) );
 	CUDA_CHECK( cudaMemcpy( d_rope, h_rope.data(), h_rope.size() * 4, cudaMemcpyHostToDevice ) );

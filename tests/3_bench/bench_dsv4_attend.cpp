@@ -34,12 +34,34 @@ int main( int argc, char** argv ) {
 		CUDA_CHECK( cudaMemcpy( d, h.data(), n * sizeof( half ), cudaMemcpyHostToDevice ) );
 		return d;
 	};
-	const size_t ring_stride = static_cast<size_t>( DSV4::RING ) * DSV4::HD, comp_stride = static_cast<size_t>( entries ) * DSV4::HD;
-	std::vector<half*> q( LAYERS ), ring( LAYERS ), comp( LAYERS ), o( LAYERS );
+	// packed cache rows (DSV4): window rows of random E4M3 bytes (no NaN) at 2^-8, compressed entries of random E2M1 pairs with E4M3 scales
+	// from 1/4 to 1; a drafter block's own keys are window rows
+	const bool dspark = std::getenv( "BENCH_DSPARK" ) != nullptr;
+	auto upload_rows = [&]( int n, bool window ) {
+		const int row = window ? DSV4::WIN_ROW : DSV4::COMP_ROW;
+		std::vector<uint8_t> h( static_cast<size_t>( n ) * row );
+		for ( int e = 0; e < n; ++e ) {
+			uint8_t* r = h.data() + static_cast<size_t>( e ) * row;
+			const int nb = window ? DSV4::HD : DSV4::HD / 2, ns = window ? DSV4::HD / 32 : DSV4::HD / 16;
+			for ( int b = 0; b < nb; ++b ) {
+				uint8_t v = static_cast<uint8_t>( ( rnd() * 0.5f + 0.5f ) * 255.0f );
+				if ( window && ( v & 0x7f ) == 0x7f ) v ^= 1;
+				r[b] = v;
+			}
+			for ( int b = 0; b < ns; ++b ) r[nb + b] = window ? 127 - 8 : static_cast<uint8_t>( 0x28 + static_cast<int>( ( rnd() * 0.5f + 0.5f ) * 16.0f ) );
+		}
+		uint8_t* d = nullptr;
+		CUDA_CHECK( cudaMalloc( &d, h.size() ) );
+		CUDA_CHECK( cudaMemcpy( d, h.data(), h.size(), cudaMemcpyHostToDevice ) );
+		return d;
+	};
+	const size_t ring_stride = static_cast<size_t>( DSV4::RING ) * DSV4::WIN_ROW, comp_stride = static_cast<size_t>( entries ) * DSV4::COMP_ROW;
+	std::vector<half*> q( LAYERS ), o( LAYERS );
+	std::vector<uint8_t*> ring( LAYERS ), comp( LAYERS );
 	for ( int l = 0; l < LAYERS; ++l ) {
 		q[l] = upload_half( static_cast<size_t>( rows ) * nh * DSV4::HD, 1.0f );
-		ring[l] = upload_half( ring_stride, 1.0f );
-		comp[l] = upload_half( comp_stride, 1.0f );
+		ring[l] = upload_rows( DSV4::RING, true );
+		comp[l] = dspark ? upload_rows( DSV4::RING, true ) : upload_rows( entries, false );
 		CUDA_CHECK( cudaMalloc( &o[l], static_cast<size_t>( rows ) * nh * DSV4::HD * sizeof( half ) ) );
 	}
 	// the selected entries in ascending order, the sinks, and a rotary table up to the last position
@@ -68,7 +90,6 @@ int main( int argc, char** argv ) {
 	pod::BatchRows* d_rows = nullptr;
 	CUDA_CHECK( cudaMalloc( &d_rows, sizeof( pod::BatchRows ) ) );
 	CUDA_CHECK( cudaMemcpy( d_rows, &br, sizeof( pod::BatchRows ), cudaMemcpyHostToDevice ) );
-	const bool dspark = std::getenv( "BENCH_DSPARK" ) != nullptr;
 	const int t = ctx - 2, w0 = std::max( 0, t - DSV4::WINDOW + 1 );
 	auto run = [&]() {
 		for ( int l = 0; l < LAYERS; ++l ) {

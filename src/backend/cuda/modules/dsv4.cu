@@ -70,6 +70,107 @@ __device__ __forceinline__ float group_max( float v ) {
 	return v;
 }
 
+// ---- cache codes (DSV4's row layouts): grid value <-> code through the bits of a half, exact both ways -------------------------------------
+
+// an E4M3 grid value (|g| <= 448) -> its byte: g / 256 as a half has the code's exponent and mantissa in its bits 7..14
+__device__ __forceinline__ uint32_t e4m3_code( float g ) {
+	const uint32_t h = __half_as_ushort( __float2half_rn( g * ( 1.0f / 256.0f ) ) );
+	return ( ( h >> 8 ) & 0x80u ) | ( ( h >> 7 ) & 0x7fu );
+}
+__device__ __forceinline__ float e4m3_value( uint32_t b ) {
+	return __half2float( __ushort_as_half( static_cast<unsigned short>( ( ( b & 0x80u ) << 8 ) | ( ( b & 0x7fu ) << 7 ) ) ) ) * 256.0f;
+}
+// an E2M1 grid value (|g| <= 6) -> its nibble, the same way at g / 2^14
+__device__ __forceinline__ uint32_t e2m1_code( float g ) {
+	const uint32_t h = __half_as_ushort( __float2half_rn( g * ( 1.0f / 16384.0f ) ) );
+	return ( ( h >> 12 ) & 8u ) | ( ( h >> 9 ) & 7u );
+}
+// the two nibbles of a byte (low nibble first) as halves
+__device__ __forceinline__ half2 e2m1_pair( uint32_t b ) {
+	const uint32_t lo = ( ( b & 8u ) << 12 ) | ( ( b & 7u ) << 9 ), hi = ( ( b & 0x80u ) << 8 ) | ( ( b & 0x70u ) << 5 );
+	const uint32_t bits = lo | ( hi << 16 );
+	return __hmul2( *reinterpret_cast<const half2*>( &bits ), __float2half2_rn( 16384.0f ) );
+}
+// a power of two <-> its E8M0 byte
+__device__ __forceinline__ uint32_t e8m0_code( float s ) { return ( __float_as_uint( s ) >> 23 ) & 0xffu; }
+__device__ __forceinline__ float e8m0_value( uint32_t b ) { return __uint_as_float( b << 23 ); }
+
+// 2^k as a half (k from -24, the smallest subnormal, to 15)
+__device__ __forceinline__ half2 pow2_half2( int k ) {
+	const unsigned short b = static_cast<unsigned short>( k >= -14 ? ( k + 15 ) << 10 : 1 << ( k + 24 ) );
+	return __half2half2( __ushort_as_half( b ) );
+}
+
+// 8 dims of a window row from their E4M3 bytes and the block's E8M0 exponent: the codes times the power of two, rounded to halves as the
+// store's dequantization. The bytes become halves of value / 256 by placing their bits; one multiply by 256 * 2^(e - 127) then rounds the
+// exact product as the store's FP32 product and cast did (FP32 when that power of two is no half)
+__device__ __forceinline__ uint4 win_dec( uint2 b, uint32_t e ) {
+	const int k = static_cast<int>( e ) - 127 + 8;
+	uint4 out;
+	uint32_t* o = reinterpret_cast<uint32_t*>( &out );
+	if ( k >= -24 && k <= 15 ) {
+		const half2 s2 = pow2_half2( k );
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const uint32_t w = ( i < 2 ? b.x : b.y ) >> ( 16 * ( i & 1 ) );
+			const uint32_t bits = ( ( w & 0x80u ) << 8 ) | ( ( w & 0x7fu ) << 7 ) | ( ( w & 0x8000u ) << 16 ) | ( ( w & 0x7f00u ) << 15 );
+			const half2 h = __hmul2( *reinterpret_cast<const half2*>( &bits ), s2 );
+			o[i] = *reinterpret_cast<const uint32_t*>( &h );
+		}
+		return out;
+	}
+	const float s = e8m0_value( e );
+	#pragma unroll
+	for ( int i = 0; i < 4; ++i ) {
+		const uint32_t w = ( i < 2 ? b.x : b.y ) >> ( 16 * ( i & 1 ) );
+		const half2 h = __floats2half2_rn( e4m3_value( w & 0xffu ) * s, e4m3_value( ( w >> 8 ) & 0xffu ) * s );
+		o[i] = *reinterpret_cast<const uint32_t*>( &h );
+	}
+	return out;
+}
+// 8 dims of a compressed entry from their E2M1 pairs and the 16-block's E4M3 scale (the products are halves exactly)
+__device__ __forceinline__ uint4 comp_dec( uint32_t b, uint32_t sc ) {
+	const half2 s = __float2half2_rn( e4m3_value( sc ) );
+	uint4 out;
+	uint32_t* o = reinterpret_cast<uint32_t*>( &out );
+	#pragma unroll
+	for ( int i = 0; i < 4; ++i ) {
+		const half2 h = __hmul2( e2m1_pair( ( b >> ( 8 * i ) ) & 0xffu ), s );
+		o[i] = *reinterpret_cast<const uint32_t*>( &h );
+	}
+	return out;
+}
+// dims 8 c .. 8 c + 7 of a window row / a compressed entry
+__device__ __forceinline__ uint4 win_dims8( const uint8_t* row, int c ) { return win_dec( *reinterpret_cast<const uint2*>( row + 8 * c ), row[HD + c / 4] ); }
+__device__ __forceinline__ uint4 comp_dims8( const uint8_t* ent, int c ) { return comp_dec( *reinterpret_cast<const uint32_t*>( ent + 4 * c ), ent[HD / 2 + c / 2] ); }
+// dims 8 c .. 8 c + 7 of an index key: E2M1 pairs times the 32-block's power of two (as win_dec: the nibbles' halves are value / 2^14)
+__device__ __forceinline__ uint4 idx_dims8( const uint8_t* key, int c ) {
+	const uint32_t b = *reinterpret_cast<const uint32_t*>( key + 4 * c );
+	const uint32_t e = key[DSV4::IDX_DIM / 2 + c / 4];
+	const int k = static_cast<int>( e ) - 127 + 14;
+	uint4 out;
+	uint32_t* o = reinterpret_cast<uint32_t*>( &out );
+	if ( k >= -24 && k <= 15 ) {
+		const half2 s2 = pow2_half2( k );
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const uint32_t y = ( b >> ( 8 * i ) ) & 0xffu;
+			const uint32_t bits = ( ( y & 8u ) << 12 ) | ( ( y & 7u ) << 9 ) | ( ( ( y & 0x80u ) << 8 ) | ( ( y & 0x70u ) << 5 ) ) << 16;
+			const half2 h = __hmul2( *reinterpret_cast<const half2*>( &bits ), s2 );
+			o[i] = *reinterpret_cast<const uint32_t*>( &h );
+		}
+		return out;
+	}
+	const float s = e8m0_value( e );
+	#pragma unroll
+	for ( int i = 0; i < 4; ++i ) {
+		const float2 v = __half22float2( e2m1_pair( ( b >> ( 8 * i ) ) & 0xffu ) );
+		const half2 h = __floats2half2_rn( v.x * s, v.y * s );
+		o[i] = *reinterpret_cast<const uint32_t*>( &h );
+	}
+	return out;
+}
+
 // interleaved pair rotation: (a, b) -> (a c - b s, a s + b c); inverse with -s
 __device__ __forceinline__ void rot( float& a, float& b, float2 cs, bool inverse ) {
 	const float s = inverse ? -cs.y : cs.y;
@@ -87,7 +188,7 @@ __device__ __forceinline__ float block_sum( float v ) {
 // ---- window store: 128 threads, 4 dims each (a 32-block is 8 threads) -------------------------------------------------------------------
 
 __global__ __launch_bounds__( 128 )
-void window_store_kernel( const half* __restrict__ kv, half* __restrict__ ring, const float2* __restrict__ rope, int layer, const pod::BatchRows* __restrict__ rows,
+void window_store_kernel( const half* __restrict__ kv, uint8_t* __restrict__ ring, const float2* __restrict__ rope, int layer, const pod::BatchRows* __restrict__ rows,
 	size_t ring_slot_stride ) {
 	const int r = blockIdx.x, t = threadIdx.x, d0 = t * 4;
 	const int pos = rows->pos[r];
@@ -102,9 +203,12 @@ void window_store_kernel( const half* __restrict__ kv, half* __restrict__ ring, 
 	float amax = fmaxf( fmaxf( fabsf( v[0] ), fabsf( v[1] ) ), fmaxf( fabsf( v[2] ), fabsf( v[3] ) ) );
 	amax = group_max<8>( amax );
 	const float s = e4m3_scale_pow2( amax );
-	half* dst = ring + static_cast<size_t>( rows->slot[r] ) * ring_slot_stride + ( static_cast<size_t>( layer ) * DSV4::RING + pos % DSV4::RING ) * HD + d0;
+	uint8_t* row = ring + static_cast<size_t>( rows->slot[r] ) * ring_slot_stride + ( static_cast<size_t>( layer ) * DSV4::RING + pos % DSV4::RING ) * DSV4::WIN_ROW;
+	uint32_t codes = 0;
 	#pragma unroll
-	for ( int i = 0; i < 4; ++i ) dst[i] = __float2half_rn( q_e4m3( v[i], s ) );
+	for ( int i = 0; i < 4; ++i ) codes |= e4m3_code( q_e4m3( v[i], s ) / s ) << ( 8 * i );
+	*reinterpret_cast<uint32_t*>( row + d0 ) = codes;
+	if ( ( t & 7 ) == 0 ) row[HD + t / 8] = static_cast<uint8_t>( e8m0_code( s ) );
 }
 
 // ---- compressor ---------------------------------------------------------------------------------------------------------------------------
@@ -124,7 +228,7 @@ void compress_stage_kernel( const half* __restrict__ ckv, const half* __restrict
 // 128 threads, 4 dims each; the E2M1 scale covers 16 dims = 4 threads
 __global__ __launch_bounds__( 128 )
 void compress_pool_kernel( const half* __restrict__ ckv, const float* __restrict__ cring_kv, const float* __restrict__ cring_sc, const half* __restrict__ norm_w,
-	half* __restrict__ latent_out, half* __restrict__ comp_kv, const float2* __restrict__ rope, int ratio, const pod::BatchRows* __restrict__ rows,
+	half* __restrict__ latent_out, uint8_t* __restrict__ comp_kv, const float2* __restrict__ rope, int ratio, const pod::BatchRows* __restrict__ rows,
 	size_t cring_slot_stride, size_t comp_slot_stride, float eps ) {
 	const int r = blockIdx.x, t = threadIdx.x, d0 = t * 4;
 	const int pos = rows->pos[r];
@@ -165,14 +269,17 @@ void compress_pool_kernel( const half* __restrict__ ckv, const float* __restrict
 	float amax = fmaxf( fmaxf( fabsf( v[0] ), fabsf( v[1] ) ), fmaxf( fabsf( v[2] ), fabsf( v[3] ) ) );
 	amax = group_max<4>( amax );
 	const float s = e2m1_scale_e4m3( amax );
-	half* dst = comp_kv + static_cast<size_t>( rows->slot[r] ) * comp_slot_stride + static_cast<size_t>( pos / ratio ) * HD + d0;
+	uint8_t* ent = comp_kv + static_cast<size_t>( rows->slot[r] ) * comp_slot_stride + static_cast<size_t>( pos / ratio ) * DSV4::COMP_ROW;
+	uint32_t codes = 0;
 	#pragma unroll
-	for ( int i = 0; i < 4; ++i ) dst[i] = __float2half_rn( q_e2m1( v[i], s ) );
+	for ( int i = 0; i < 4; ++i ) codes |= e2m1_code( q_e2m1( v[i], s ) / s ) << ( 4 * i );
+	*reinterpret_cast<uint16_t*>( ent + d0 / 2 ) = static_cast<uint16_t>( codes );
+	if ( ( t & 3 ) == 0 ) ent[HD / 2 + t / 4] = static_cast<uint8_t>( e4m3_code( s ) );
 }
 
 // 128 threads, one dim each; a warp is one 32-block
 __global__ __launch_bounds__( 128 )
-void index_key_kernel( const half* __restrict__ kraw, const half* __restrict__ knorm_w, half* __restrict__ idx_k, const float2* __restrict__ rope, int ratio,
+void index_key_kernel( const half* __restrict__ kraw, const half* __restrict__ knorm_w, uint8_t* __restrict__ idx_k, const float2* __restrict__ rope, int ratio,
 	const pod::BatchRows* __restrict__ rows, size_t idx_slot_stride, float eps ) {
 	constexpr int D = DSV4::IDX_DIM;
 	const int r = blockIdx.x, d = threadIdx.x;
@@ -191,7 +298,11 @@ void index_key_kernel( const half* __restrict__ kraw, const half* __restrict__ k
 		x = ( d & 1 ) ? b : a;
 	}
 	const float s = e2m1_scale_pow2( group_max<32>( fabsf( x ) ) );
-	idx_k[static_cast<size_t>( rows->slot[r] ) * idx_slot_stride + static_cast<size_t>( pos / ratio ) * D + d] = __float2half_rn( q_e2m1( x, s ) );
+	const uint32_t code = e2m1_code( q_e2m1( x, s ) / s );
+	const uint32_t next = __shfl_down_sync( 0xffffffffu, code, 1 );
+	uint8_t* key = idx_k + static_cast<size_t>( rows->slot[r] ) * idx_slot_stride + static_cast<size_t>( pos / ratio ) * DSV4::IDX_ROW;
+	if ( ( d & 1 ) == 0 ) key[d / 2] = static_cast<uint8_t>( code | ( next << 4 ) );
+	if ( ( d & 31 ) == 0 ) key[D / 2 + d / 32] = static_cast<uint8_t>( e8m0_code( s ) );
 }
 
 // ---- indexer ----------------------------------------------------------------------------------------------------------------------------
@@ -201,7 +312,7 @@ constexpr int IDX_TILE = 64;   // keys per block
 // grid (rows, tiles), 256 threads. q is roped and put on the E2M1 grid per block (cheap: 4096 values), transposed in shared memory so
 // lane h reads q[d][h] without bank conflicts; each warp scores 8 keys, lane = head
 __global__ __launch_bounds__( 256 )
-void index_score_kernel( const half* __restrict__ q, const half* __restrict__ w, const half* __restrict__ idx_k, float* __restrict__ scores, const uint8_t* __restrict__ cand,
+void index_score_kernel( const half* __restrict__ q, const half* __restrict__ w, const uint8_t* __restrict__ idx_k, float* __restrict__ scores, const uint8_t* __restrict__ cand,
 	int cand_block, const float2* __restrict__ rope, int ratio, int cap, int row0, const pod::BatchRows* __restrict__ rows, size_t idx_slot_stride ) {
 	constexpr int NH = DSV4::IDX_HEADS, D = DSV4::IDX_DIM;
 	const int r = row0 + blockIdx.x, t0 = blockIdx.y * IDX_TILE;
@@ -215,7 +326,7 @@ void index_score_kernel( const half* __restrict__ q, const half* __restrict__ w,
 		if ( !any ) return;
 	}
 	__shared__ float qt[D][NH];
-	__shared__ half kt[IDX_TILE][D];
+	__shared__ __align__( 16 ) half kt[IDX_TILE][D];
 	__shared__ float ws[NH];
 	const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
 	// q: 4096 values, 16 per thread; a 32-block (one head's 32 dims) is two threads' halves... use one warp per head pass
@@ -237,11 +348,11 @@ void index_score_kernel( const half* __restrict__ q, const half* __restrict__ w,
 		for ( int i = 0; i < 4; ++i ) qt[d0 + i][h] = __half2float( __float2half_rn( q_e2m1( x[i], s ) ) );
 	}
 	if ( tid < NH ) ws[tid] = __half2float( w[static_cast<size_t>( r ) * NH + tid] ) * rsqrtf( static_cast<float>( D ) * NH );
-	const half* kbase = idx_k + static_cast<size_t>( rows->slot[r] ) * idx_slot_stride;
-	for ( int i = tid; i < IDX_TILE * D / 2; i += 256 ) {
-		const int k = i / ( D / 2 ), c = i % ( D / 2 );
+	const uint8_t* kbase = idx_k + static_cast<size_t>( rows->slot[r] ) * idx_slot_stride;
+	for ( int i = tid; i < IDX_TILE * D / 8; i += 256 ) {
+		const int k = i / ( D / 8 ), c = i % ( D / 8 );
 		const int t = t0 + k;
-		reinterpret_cast<half2*>( &kt[k][0] )[c] = t < n ? reinterpret_cast<const half2*>( kbase + static_cast<size_t>( t ) * D )[c] : __float2half2_rn( 0.0f );
+		reinterpret_cast<uint4*>( &kt[k][0] )[c] = t < n ? idx_dims8( kbase + static_cast<size_t>( t ) * DSV4::IDX_ROW, c ) : make_uint4( 0, 0, 0, 0 );
 	}
 	__syncthreads();
 	for ( int k = warp; k < IDX_TILE; k += 8 ) {
@@ -266,7 +377,7 @@ constexpr int IDX_TC_SPAN = 1024;   // keys per block
 constexpr int IDX_TC_LD = DSV4::IDX_DIM + 8;   // shared-memory row stride in halves: 272 bytes, so the fragment loads of 16 rows hit different banks
 
 __global__ __launch_bounds__( 256 )
-void index_score_tc_kernel( const half* __restrict__ q, const half* __restrict__ w, const half* __restrict__ idx_k, float* __restrict__ scores, const uint8_t* __restrict__ cand,
+void index_score_tc_kernel( const half* __restrict__ q, const half* __restrict__ w, const uint8_t* __restrict__ idx_k, float* __restrict__ scores, const uint8_t* __restrict__ cand,
 	int cand_block, const float2* __restrict__ rope, int ratio, int cap, int row0, int nr, const pod::BatchRows* __restrict__ rows, size_t idx_slot_stride ) {
 	constexpr int NH = DSV4::IDX_HEADS, D = DSV4::IDX_DIM;
 	const int lr0 = blockIdx.x * 2, span0 = blockIdx.y * IDX_TC_SPAN;
@@ -314,7 +425,7 @@ void index_score_tc_kernel( const half* __restrict__ q, const half* __restrict__
 		const int i = tid / NH, h = tid % NH;
 		ws[i][h] = live[i] ? __half2float( w[static_cast<size_t>( row0 + lr0 + i ) * NH + h] ) * rsqrtf( static_cast<float>( D ) * NH ) : 0.0f;
 	}
-	const half* kbase = idx_k + static_cast<size_t>( rows->slot[row0 + lr0] ) * idx_slot_stride;   // both rows are of one slot
+	const uint8_t* kbase = idx_k + static_cast<size_t>( rows->slot[row0 + lr0] ) * idx_slot_stride;   // both rows are of one slot
 	const int ri = warp >> 2, nt = ( warp >> 1 ) & 1, slab = warp & 1;
 	for ( int t0 = span0; t0 < span_end; t0 += IDX_TC_KEYS ) {
 		if ( cand != nullptr ) {   // after the candidate source: a tile whose blocks were all dropped is never read
@@ -328,10 +439,10 @@ void index_score_tc_kernel( const half* __restrict__ q, const half* __restrict__
 			if ( !any ) continue;
 		}
 		__syncthreads();   // the previous tile's shared memory is free (and the first iteration waits for the query)
-		for ( int i = tid; i < IDX_TC_KEYS * D / 2; i += 256 ) {
-			const int k = i / ( D / 2 ), c = i % ( D / 2 );
+		for ( int i = tid; i < IDX_TC_KEYS * D / 8; i += 256 ) {
+			const int k = i / ( D / 8 ), c = i % ( D / 8 );
 			const int t = t0 + k;
-			reinterpret_cast<half2*>( kt )[k * ( IDX_TC_LD / 2 ) + c] = t < nmax ? reinterpret_cast<const half2*>( kbase + static_cast<size_t>( t ) * D )[c] : __float2half2_rn( 0.0f );
+			*reinterpret_cast<uint4*>( kt + k * IDX_TC_LD + 8 * c ) = t < nmax ? idx_dims8( kbase + static_cast<size_t>( t ) * DSV4::IDX_ROW, c ) : make_uint4( 0, 0, 0, 0 );
 		}
 		__syncthreads();
 		wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
@@ -505,7 +616,7 @@ constexpr int ATT_THREADS = 256;
 // rotary pairs (half2 indices 224..255) sit in i = 7 and a 32-dim scale block is 16 lanes of one i
 template <int HPW>
 __global__ __launch_bounds__( ATT_THREADS )
-void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, const half* __restrict__ comp_kv, const int* __restrict__ sel, const int* __restrict__ nsel,
+void attend_kernel( const half* __restrict__ q, const uint8_t* __restrict__ ring, const uint8_t* __restrict__ comp_kv, const int* __restrict__ sel, const int* __restrict__ nsel,
 	const float* __restrict__ sink, const float2* __restrict__ rope, half* __restrict__ o, int nh, int layer, int rows_n, const pod::BatchRows* __restrict__ rows,
 	size_t ring_slot_stride, size_t comp_slot_stride, float* __restrict__ ws, int win_floor ) {
 	extern __shared__ half2 att_smem[];
@@ -521,8 +632,8 @@ void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, c
 		if ( c * 2 >= ROPE0 ) rot( v.x, v.y, cs_row[c - ROPE0 / 2], false );
 		qs[i] = __floats2half2_rn( v.x, v.y );
 	}
-	const half* wring = ring + static_cast<size_t>( rows->slot[r] ) * ring_slot_stride + static_cast<size_t>( layer ) * DSV4::RING * HD;
-	const half* cbase = comp_kv ? comp_kv + static_cast<size_t>( rows->slot[r] ) * comp_slot_stride : nullptr;
+	const uint8_t* wring = ring + static_cast<size_t>( rows->slot[r] ) * ring_slot_stride + static_cast<size_t>( layer ) * DSV4::RING * DSV4::WIN_ROW;
+	const uint8_t* cbase = comp_kv ? comp_kv + static_cast<size_t>( rows->slot[r] ) * comp_slot_stride : nullptr;
 	const int w0 = max( max( 0, win_floor ), pos - DSV4::WINDOW + 1 );
 	const int n_win = pos - w0 + 1;
 	const int n_cmp = comp_kv ? nsel[r] : 0;
@@ -552,11 +663,11 @@ void attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, c
 	for ( int k0 = kb; k0 < ke; k0 += ATT_TILE ) {
 		__syncthreads();
 		const int nk = min( ATT_TILE, ke - k0 );
-		for ( int i = tid; i < nk * ( HD / 8 ); i += ATT_THREADS ) {   // 16-byte loads
+		for ( int i = tid; i < nk * ( HD / 8 ); i += ATT_THREADS ) {   // 8 dims a thread
 			const int k = i / ( HD / 8 ), c = i % ( HD / 8 );
 			const int e = k0 + k;
-			const half* src = e < n_win ? wring + static_cast<size_t>( ( w0 + e ) % DSV4::RING ) * HD : cbase + static_cast<size_t>( srow[e - n_win] ) * HD;
-			reinterpret_cast<int4*>( ks + k * ( HD / 2 ) )[c] = reinterpret_cast<const int4*>( src )[c];
+			reinterpret_cast<uint4*>( ks + k * ( HD / 2 ) )[c] = e < n_win ? win_dims8( wring + static_cast<size_t>( ( w0 + e ) % DSV4::RING ) * DSV4::WIN_ROW, c )
+				: comp_dims8( cbase + static_cast<size_t>( srow[e - n_win] ) * DSV4::COMP_ROW, c );
 		}
 		__syncthreads();
 		if ( !q_loaded ) {   // the warp's heads' query dims in registers once q is in shared memory
@@ -720,7 +831,7 @@ static_assert( TC_BK * TC_KS * 2 <= TC_OFF_Q && 16 * TC_KS * 4 <= TC_OFF_Q, "K t
 
 template <bool DSPARK>
 __global__ __launch_bounds__( 256 )
-void attend_tc_kernel( const half* __restrict__ q, const half* __restrict__ ring, const half* __restrict__ comp_kv, const int* __restrict__ sel,
+void attend_tc_kernel( const half* __restrict__ q, const uint8_t* __restrict__ ring, const uint8_t* __restrict__ comp_kv, const int* __restrict__ sel,
 	const int* __restrict__ nsel, const float2* __restrict__ rope, int nh, int layer, const pod::BatchRows* __restrict__ rows, size_t ring_slot_stride,
 	size_t comp_slot_stride, float* __restrict__ ws, int win_floor, int dslot, int dw0, int dt, int rows_n ) {
 	extern __shared__ __align__( 16 ) unsigned char tc_smem[];
@@ -741,10 +852,11 @@ void attend_tc_kernel( const half* __restrict__ q, const half* __restrict__ ring
 	const float2* cs_row = rope + static_cast<size_t>( pos ) * ( ROPE / 2 );
 
 	// the row's keys: the window [w0, pos] (a drafter block: [dw0, dt] of slot dslot), then the selected entries (the block's own keys)
-	const half* wring = ring + static_cast<size_t>( DSPARK ? dslot : rows->slot[r] ) * ring_slot_stride + static_cast<size_t>( layer ) * DSV4::RING * HD;
+	const uint8_t* wring = ring + static_cast<size_t>( DSPARK ? dslot : rows->slot[r] ) * ring_slot_stride + static_cast<size_t>( layer ) * DSV4::RING * DSV4::WIN_ROW;
 	const int w0 = DSPARK ? dw0 : max( max( 0, win_floor ), pos - DSV4::WINDOW + 1 );
 	const int n_win = ( DSPARK ? dt : pos ) - w0 + 1;
-	const half* cbase = DSPARK || comp_kv == nullptr ? comp_kv : comp_kv + static_cast<size_t>( rows->slot[r] ) * comp_slot_stride;
+	// the block's own keys (DSPARK) are window rows too
+	const uint8_t* cbase = DSPARK || comp_kv == nullptr ? comp_kv : comp_kv + static_cast<size_t>( rows->slot[r] ) * comp_slot_stride;
 	const int total = n_win + ( DSPARK ? rows_n : comp_kv ? nsel[r] : 0 );
 	const int ntiles = ( total + TC_BK - 1 ) / TC_BK;
 	const int kb0 = ( blockIdx.y * ntiles / nsplit ) * TC_BK;
@@ -792,31 +904,46 @@ void attend_tc_kernel( const half* __restrict__ q, const half* __restrict__ ring
 		}
 	}
 
+	// a tile's codes are fetched a tile ahead (raw: window rows .x .y the E4M3 bytes, .z the exponent, .w 1; compressed entries .x the E2M1 pairs,
+	// .y the scale, .w 2; past the split's keys .w 0) and decoded when the tile is stored
 	const int st_p = lane & 15, st_cl = lane >> 4;
 	auto fetch = [&]( int kb, uint4 ( &pk )[4][2] ) {
-		const half* kp[2];
+		const uint8_t* kp[2];
+		bool win[2];
 		#pragma unroll
 		for ( int kk = 0; kk < 2; ++kk ) {
 			const int j = kb + 2 * st_p + kk;
-			kp[kk] = j >= kb1 ? nullptr : j < n_win ? wring + static_cast<size_t>( ( w0 + j ) % DSV4::RING ) * HD : cbase + static_cast<size_t>( sI[j - kb0] ) * HD;
+			win[kk] = DSPARK || j < n_win;
+			kp[kk] = j >= kb1 ? nullptr : j < n_win ? wring + static_cast<size_t>( ( w0 + j ) % DSV4::RING ) * DSV4::WIN_ROW
+				: cbase + static_cast<size_t>( sI[j - kb0] ) * ( DSPARK ? DSV4::WIN_ROW : DSV4::COMP_ROW );
 		}
-		#pragma unroll
-		for ( int j = 0; j < 4; ++j ) {
-			const int c = 2 * warp + st_cl + 16 * j;
-			#pragma unroll
-			for ( int kk = 0; kk < 2; ++kk ) pk[j][kk] = kp[kk] ? __ldg( reinterpret_cast<const uint4*>( kp[kk] + c * 8 ) ) : make_uint4( 0, 0, 0, 0 );
-		}
-	};
-	// one tile from pk, the next fetched into pn
-	auto tile = [&]( int kb, const uint4 ( &pk )[4][2], uint4 ( &pn )[4][2] ) {
 		#pragma unroll
 		for ( int j = 0; j < 4; ++j ) {
 			const int c = 2 * warp + st_cl + 16 * j;
 			#pragma unroll
 			for ( int kk = 0; kk < 2; ++kk ) {
+				if ( kp[kk] == nullptr ) pk[j][kk] = make_uint4( 0, 0, 0, 0 );
+				else if ( win[kk] ) {
+					const uint2 b = __ldg( reinterpret_cast<const uint2*>( kp[kk] + 8 * c ) );
+					pk[j][kk] = make_uint4( b.x, b.y, __ldg( kp[kk] + HD + c / 4 ), 1 );
+				}
+				else pk[j][kk] = make_uint4( __ldg( reinterpret_cast<const uint32_t*>( kp[kk] + 4 * c ) ), __ldg( kp[kk] + HD / 2 + c / 2 ), 0, 2 );
+			}
+		}
+	};
+	// one tile from pk, the next fetched into pn
+	auto tile = [&]( int kb, const uint4 ( &pk )[4][2], uint4 ( &pn )[4][2] ) {
+		uint4 dk[4][2];
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			const int c = 2 * warp + st_cl + 16 * j;
+			#pragma unroll
+			for ( int kk = 0; kk < 2; ++kk ) {
+				const uint4 raw = pk[j][kk];
+				dk[j][kk] = raw.w == 1 ? win_dec( make_uint2( raw.x, raw.y ), raw.z ) : raw.w == 2 ? comp_dec( raw.x, raw.y ) : make_uint4( 0, 0, 0, 0 );
 				uint2* kd = reinterpret_cast<uint2*>( sB + ( 2 * st_p + kk ) * TC_KS + c * 8 );
-				kd[0] = make_uint2( pk[j][kk].x, pk[j][kk].y );
-				kd[1] = make_uint2( pk[j][kk].z, pk[j][kk].w );
+				kd[0] = make_uint2( dk[j][kk].x, dk[j][kk].y );
+				kd[1] = make_uint2( dk[j][kk].z, dk[j][kk].w );
 			}
 		}
 		__syncthreads();
@@ -845,8 +972,8 @@ void attend_tc_kernel( const half* __restrict__ q, const half* __restrict__ ring
 		#pragma unroll
 		for ( int j = 0; j < 4; ++j ) {
 			const int c = 2 * warp + st_cl + 16 * j;
-			const half* v0 = reinterpret_cast<const half*>( &pk[j][0] );
-			const half* v1 = reinterpret_cast<const half*>( &pk[j][1] );
+			const half* v0 = reinterpret_cast<const half*>( &dk[j][0] );
+			const half* v1 = reinterpret_cast<const half*>( &dk[j][1] );
 			#pragma unroll
 			for ( int i = 0; i < 8; ++i ) *reinterpret_cast<half2*>( sB + ( c * 8 + i ) * TC_VS + 2 * st_p ) = __halves2half2( v0[i], v1[i] );
 		}
@@ -961,7 +1088,7 @@ void tap_gather_kernel( const half* __restrict__ ring, half* __restrict__ out, i
 // attend_kernel for a drafter block (see DSV4::dspark_attend): the keys are the ring window [w0, t] followed by the block's own rows_n keys
 template <int HPW>
 __global__ __launch_bounds__( ATT_THREADS )
-void dspark_attend_kernel( const half* __restrict__ q, const half* __restrict__ ring, const half* __restrict__ blk, const float* __restrict__ sink, const float2* __restrict__ rope,
+void dspark_attend_kernel( const half* __restrict__ q, const uint8_t* __restrict__ ring, const uint8_t* __restrict__ blk, const float* __restrict__ sink, const float2* __restrict__ rope,
 	half* __restrict__ o, int nh, int layer, int rows_n, const pod::BatchRows* __restrict__ rows, int slot, int w0, int t, size_t ring_slot_stride ) {
 	extern __shared__ half2 att_smem[];
 	half2* qs = att_smem;                       // [nh][HD / 2]
@@ -974,7 +1101,7 @@ void dspark_attend_kernel( const half* __restrict__ q, const half* __restrict__ 
 		if ( c * 2 >= ROPE0 ) rot( v.x, v.y, cs_row[c - ROPE0 / 2], false );
 		qs[i] = __floats2half2_rn( v.x, v.y );
 	}
-	const half* wring = ring + static_cast<size_t>( slot ) * ring_slot_stride + static_cast<size_t>( layer ) * DSV4::RING * HD;
+	const uint8_t* wring = ring + static_cast<size_t>( slot ) * ring_slot_stride + static_cast<size_t>( layer ) * DSV4::RING * DSV4::WIN_ROW;
 	const int n_win = t - w0 + 1;
 	const int total = n_win + rows_n;
 	const float scale = rsqrtf( static_cast<float>( HD ) );
@@ -993,8 +1120,8 @@ void dspark_attend_kernel( const half* __restrict__ q, const half* __restrict__ 
 		for ( int i = tid; i < nk * ( HD / 8 ); i += ATT_THREADS ) {
 			const int k = i / ( HD / 8 ), c = i % ( HD / 8 );
 			const int e = k0 + k;
-			const half* src = e < n_win ? wring + static_cast<size_t>( ( w0 + e ) % DSV4::RING ) * HD : blk + static_cast<size_t>( rows->pos[e - n_win] % DSV4::RING ) * HD;
-			reinterpret_cast<int4*>( ks + k * ( HD / 2 ) )[c] = reinterpret_cast<const int4*>( src )[c];
+			const uint8_t* src = e < n_win ? wring + static_cast<size_t>( ( w0 + e ) % DSV4::RING ) * DSV4::WIN_ROW : blk + static_cast<size_t>( rows->pos[e - n_win] % DSV4::RING ) * DSV4::WIN_ROW;
+			reinterpret_cast<uint4*>( ks + k * ( HD / 2 ) )[c] = win_dims8( src, c );
 		}
 		__syncthreads();
 		for ( int k = 0; k < nk; ++k ) {
@@ -1232,22 +1359,22 @@ void engram_gate_kernel( float* __restrict__ streams, const half* __restrict__ k
 
 } // namespace
 
-void DSV4::window_store( const half* kv, half* ring, const float* rope_f, int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride, cudaStream_t stream ) {
+void DSV4::window_store( const half* kv, uint8_t* ring, const float* rope_f, int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride, cudaStream_t stream ) {
 	window_store_kernel<<<rows, 128, 0, stream>>>( kv, ring, reinterpret_cast<const float2*>( rope_f ), layer, d_rows, ring_slot_stride );
 }
 
-void DSV4::compress( const half* ckv, const half* cscore, const half* norm_w, float* cring_kv, float* cring_sc, half* latent_out, half* comp_kv, const float* rope_f,
+void DSV4::compress( const half* ckv, const half* cscore, const half* norm_w, float* cring_kv, float* cring_sc, half* latent_out, uint8_t* comp_kv, const float* rope_f,
 	int ratio, int rows, const pod::BatchRows* d_rows, size_t cring_slot_stride, size_t comp_slot_stride, float eps, cudaStream_t stream ) {
 	if ( ratio > 1 ) compress_stage_kernel<<<rows, 128, 0, stream>>>( ckv, cscore, cring_kv, cring_sc, d_rows, cring_slot_stride );
 	compress_pool_kernel<<<rows, 128, 0, stream>>>( ckv, cring_kv, cring_sc, norm_w, latent_out, comp_kv, reinterpret_cast<const float2*>( rope_f ), ratio, d_rows, cring_slot_stride, comp_slot_stride, eps );
 }
 
-void DSV4::index_key_store( const half* kraw, const half* knorm_w, half* idx_k, const float* rope_f, int ratio, int rows, const pod::BatchRows* d_rows,
+void DSV4::index_key_store( const half* kraw, const half* knorm_w, uint8_t* idx_k, const float* rope_f, int ratio, int rows, const pod::BatchRows* d_rows,
 	size_t idx_slot_stride, float eps, cudaStream_t stream ) {
 	index_key_kernel<<<rows, DSV4::IDX_DIM, 0, stream>>>( kraw, knorm_w, idx_k, reinterpret_cast<const float2*>( rope_f ), ratio, d_rows, idx_slot_stride, eps );
 }
 
-void DSV4::indexer( const half* q, const half* w, const half* idx_k, float* scores, uint8_t* cand, int* sel, int* nsel, const float* rope_f, int ratio, int cap,
+void DSV4::indexer( const half* q, const half* w, const uint8_t* idx_k, float* scores, uint8_t* cand, int* sel, int* nsel, const float* rope_f, int ratio, int cap,
 	int cand_mode, int cand_blocks, int cand_block, int rows, const pod::BatchRows* d_rows, size_t idx_slot_stride, bool tensor_cores, cudaStream_t stream ) {
 	// the tensor-core scorer pairs consecutive rows of one slot: prefill chunks (decode blocks may mix slots and are a few rows anyway)
 	const bool tc = tensor_cores && rows > pod::MAX_BATCH;
@@ -1299,7 +1426,7 @@ int att_splits( int tiles, int rows ) {
 
 } // namespace
 
-void DSV4::attend( const half* q, const half* ring, const half* comp_kv, const int* sel, const int* nsel, const float* sink, const float* rope_f, half* o, int nh,
+void DSV4::attend( const half* q, const uint8_t* ring, const uint8_t* comp_kv, const int* sel, const int* nsel, const float* sink, const float* rope_f, half* o, int nh,
 	int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride, size_t comp_slot_stride, float* ws, cudaStream_t stream, int win_floor ) {
 	const float2* rope = reinterpret_cast<const float2*>( rope_f );
 	const size_t smem = static_cast<size_t>( nh + ATT_TILE ) * ( HD / 2 ) * sizeof( half2 );
@@ -1342,7 +1469,7 @@ void DSV4::tap_gather( const half* ring, half* out, int slot, int first, int n, 
 	tap_gather_kernel<<<n, 256, 0, stream>>>( ring, out, slot, first, taps * hidden, ring_slot_stride );
 }
 
-void DSV4::dspark_attend( const half* q, const half* ring, const half* blk, const float* sink, const float* rope_f, half* o, int nh, int layer, int rows, const pod::BatchRows* d_rows,
+void DSV4::dspark_attend( const half* q, const uint8_t* ring, const uint8_t* blk, const float* sink, const float* rope_f, half* o, int nh, int layer, int rows, const pod::BatchRows* d_rows,
 	int slot, int w0, int t, size_t ring_slot_stride, float* ws, cudaStream_t stream ) {
 	const float2* rope = reinterpret_cast<const float2*>( rope_f );
 	const size_t smem = static_cast<size_t>( nh + ATT_TILE ) * ( HD / 2 ) * sizeof( half2 );

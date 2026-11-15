@@ -493,8 +493,8 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 	// caches
 	ds_.enabled = runtime::options().speculator == "dspark";
 	win_layers_ = L + ( ds_.enabled ? ds_.blocks : 0 );   // the drafter's blocks keep the main-KV rows of the window in the layers after the trunk's
-	win_slot_stride_ = static_cast<size_t>( win_layers_ ) * DSV4::RING * DSV4::HD;
-	win_ring_ = dev_alloc<backend::half_t>( arena, S * win_slot_stride_ );
+	win_slot_stride_ = static_cast<size_t>( win_layers_ ) * DSV4::RING * DSV4::WIN_ROW;
+	win_ring_ = dev_alloc<uint8_t>( arena, S * win_slot_stride_ );
 	cring_slot_stride_ = static_cast<size_t>( DSV4::RING ) * DSV4::HD;
 	int max_cap = 0;
 	for ( int s : config_.kv_sources ) {
@@ -502,10 +502,10 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 		const int cap = config_.max_seq / ratio;
 		src_cap_.push_back( cap );
 		max_cap = std::max( max_cap, cap );
-		comp_slot_stride_.push_back( static_cast<size_t>( cap ) * DSV4::HD );
-		comp_kv_.push_back( dev_alloc<backend::half_t>( arena, S * comp_slot_stride_.back() ) );
-		idx_slot_stride_.push_back( static_cast<size_t>( cap ) * DSV4::IDX_DIM );
-		idx_k_.push_back( dev_alloc<backend::half_t>( arena, S * idx_slot_stride_.back() ) );
+		comp_slot_stride_.push_back( static_cast<size_t>( cap ) * DSV4::COMP_ROW );
+		comp_kv_.push_back( dev_alloc<uint8_t>( arena, S * comp_slot_stride_.back() ) );
+		idx_slot_stride_.push_back( static_cast<size_t>( cap ) * DSV4::IDX_ROW );
+		idx_k_.push_back( dev_alloc<uint8_t>( arena, S * idx_slot_stride_.back() ) );
 		cring_kv_.push_back( ratio > 1 ? dev_alloc<float>( arena, S * cring_slot_stride_ ) : nullptr );
 		cring_sc_.push_back( ratio > 1 ? dev_alloc<float>( arena, S * cring_slot_stride_ ) : nullptr );
 	}
@@ -582,7 +582,7 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 	if ( ds_.enabled ) {
 		ds_.tap_stride = static_cast<size_t>( DSV4::WINDOW ) * ds_.taps * H;
 		ds_.tap_ring = dev_alloc<backend::half_t>( arena, S * ds_.tap_stride );
-		ds_.blk_ring = dev_alloc<backend::half_t>( arena, static_cast<size_t>( DSV4::RING ) * DSV4::HD );
+		ds_.blk_ring = dev_alloc<uint8_t>( arena, static_cast<size_t>( DSV4::RING ) * DSV4::WIN_ROW );
 		ds_.d_ing_rows = dev_alloc<pod::BatchRows>( arena, 1 );
 		ds_.d_blk_rows = dev_alloc<pod::BatchRows>( arena, 1 );
 		ds_.taps_in = dev_tensor( arena, pod::DType::FP16, DSV4::WINDOW, ds_.taps * H );
@@ -2119,7 +2119,7 @@ void DeepseekV41Pipeline::attention( int layer, DeepseekV41LayerWeights& lw, int
 	trace_tensor( 3000 + layer, kv_n_, m, DSV4::HD, stream );
 	trace_tensor( 6000 + layer, q_, m, lh_ * DSV4::HD, stream );
 	DSV4::window_store( kv_n_.ptr<const backend::half_t>(), win_ring_, rope, layer, m, d_rows_, win_slot_stride_, stream );
-	const backend::half_t* comp = nullptr;
+	const uint8_t* comp = nullptr;
 	if ( lw.ratio > 0 ) {
 		const int s = lw.kv_src;
 		if ( lw.is_kv_source ) {
@@ -2480,14 +2480,14 @@ void DeepseekV41Pipeline::dspark_chain( const backend::half_t* const* peer_shard
 }
 
 
-// Snapshot layout: [window: layers x WINDOW x HD halves, the rows of positions tokens - WINDOW .. tokens - 1] then per kv source [compressed
-// entries [from / r, tokens / r) x HD halves | index keys of the same entries x IDX_DIM halves], then the Engram ids of [from, tokens) (int32)
+// Snapshot layout (the caches' packed rows, DSV4): [window: layers x WINDOW rows, positions tokens - WINDOW .. tokens - 1] then per kv source
+// [compressed entries [from / r, tokens / r) | index keys of the same entries], then the Engram ids of [from, tokens) (int32)
 size_t DeepseekV41Pipeline::seq_state_bytes( int from, int tokens, bool with_taps ) const {
 	if ( from < 0 || tokens <= from || tokens > config_.max_seq || from % 2 || tokens % 2 || !weights_loaded_ ) return 0;
-	size_t b = static_cast<size_t>( config_.num_layers ) * DSV4::WINDOW * DSV4::HD * sizeof( backend::half_t );
+	size_t b = static_cast<size_t>( config_.num_layers ) * DSV4::WINDOW * DSV4::WIN_ROW;
 	for ( int s : config_.kv_sources ) {
 		const int r = config_.compress_ratios[s];
-		b += static_cast<size_t>( tokens / r - from / r ) * ( DSV4::HD + DSV4::IDX_DIM ) * sizeof( backend::half_t );
+		b += static_cast<size_t>( tokens / r - from / r ) * ( DSV4::COMP_ROW + DSV4::IDX_ROW );
 	}
 	b += static_cast<size_t>( tokens - from ) * sizeof( int32_t ) + 256;
 	// the drafter's taps of the last WINDOW positions, in position order (the drafter re-derives its window KV from them)
@@ -2519,9 +2519,9 @@ void DeepseekV41Pipeline::copy_seq_rows( int slot_id, int from, int tokens, char
 	for ( size_t i = 0; i < config_.kv_sources.size(); ++i ) {
 		const int r = config_.compress_ratios[config_.kv_sources[i]];
 		const size_t e0 = from / r, n = static_cast<size_t>( tokens / r ) - e0;
-		const size_t kv_bytes = n * DSV4::HD * sizeof( backend::half_t ), idx_bytes = n * DSV4::IDX_DIM * sizeof( backend::half_t );
-		move( comp_kv_[i] + static_cast<size_t>( slot_id ) * comp_slot_stride_[i] + e0 * DSV4::HD, host, kv_bytes );
-		move( idx_k_[i] + static_cast<size_t>( slot_id ) * idx_slot_stride_[i] + e0 * DSV4::IDX_DIM, host + kv_bytes, idx_bytes );
+		const size_t kv_bytes = n * DSV4::COMP_ROW, idx_bytes = n * DSV4::IDX_ROW;
+		move( comp_kv_[i] + static_cast<size_t>( slot_id ) * comp_slot_stride_[i] + e0 * DSV4::COMP_ROW, host, kv_bytes );
+		move( idx_k_[i] + static_cast<size_t>( slot_id ) * idx_slot_stride_[i] + e0 * DSV4::IDX_ROW, host + kv_bytes, idx_bytes );
 		host += kv_bytes + idx_bytes;
 	}
 	// the Engram history is host memory
@@ -2538,14 +2538,14 @@ bool DeepseekV41Pipeline::save_seq_state( int slot_id, int from, int tokens, boo
 	backend::set_device( rank_ );
 	char* dst = static_cast<char*>( host_dst );
 	// the window: positions tokens - WINDOW .. tokens - 1 of every layer's ring (at most two contiguous runs)
-	const size_t row = static_cast<size_t>( DSV4::HD ) * sizeof( backend::half_t );
+	const size_t row = DSV4::WIN_ROW;
 	const int first = std::max( 0, tokens - DSV4::WINDOW );
 	for ( int l = 0; l < config_.num_layers; ++l ) {
-		const backend::half_t* ring = win_ring_ + static_cast<size_t>( slot_id ) * win_slot_stride_ + static_cast<size_t>( l ) * DSV4::RING * DSV4::HD;
+		const uint8_t* ring = win_ring_ + static_cast<size_t>( slot_id ) * win_slot_stride_ + static_cast<size_t>( l ) * DSV4::RING * row;
 		char* out = dst + static_cast<size_t>( l ) * DSV4::WINDOW * row;
 		for ( int p = first; p < tokens; ) {
 			const int r = p % DSV4::RING, n = std::min( tokens - p, DSV4::RING - r );
-			backend::memcpy_async( out + static_cast<size_t>( p - first ) * row, ring + static_cast<size_t>( r ) * DSV4::HD, static_cast<size_t>( n ) * row, backend::Copy::D2H, stream );
+			backend::memcpy_async( out + static_cast<size_t>( p - first ) * row, ring + static_cast<size_t>( r ) * row, static_cast<size_t>( n ) * row, backend::Copy::D2H, stream );
 			p += n;
 		}
 	}
@@ -2559,15 +2559,15 @@ bool DeepseekV41Pipeline::load_seq_state( int slot_id, int from, int tokens, boo
 	if ( seq_state_bytes( from, tokens, with_taps ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
 	backend::set_device( rank_ );
 	char* src = const_cast<char*>( static_cast<const char*>( host_src ) );
-	const size_t row = static_cast<size_t>( DSV4::HD ) * sizeof( backend::half_t );
+	const size_t row = DSV4::WIN_ROW;
 	if ( !kv_only ) {
 		const int first = std::max( 0, tokens - DSV4::WINDOW );
 		for ( int l = 0; l < config_.num_layers; ++l ) {
-			backend::half_t* ring = win_ring_ + static_cast<size_t>( slot_id ) * win_slot_stride_ + static_cast<size_t>( l ) * DSV4::RING * DSV4::HD;
+			uint8_t* ring = win_ring_ + static_cast<size_t>( slot_id ) * win_slot_stride_ + static_cast<size_t>( l ) * DSV4::RING * row;
 			const char* in = src + static_cast<size_t>( l ) * DSV4::WINDOW * row;
 			for ( int p = first; p < tokens; ) {
 				const int r = p % DSV4::RING, n = std::min( tokens - p, DSV4::RING - r );
-				backend::memcpy_async( ring + static_cast<size_t>( r ) * DSV4::HD, in + static_cast<size_t>( p - first ) * row, static_cast<size_t>( n ) * row, backend::Copy::H2D, stream );
+				backend::memcpy_async( ring + static_cast<size_t>( r ) * row, in + static_cast<size_t>( p - first ) * row, static_cast<size_t>( n ) * row, backend::Copy::H2D, stream );
 				p += n;
 			}
 		}
