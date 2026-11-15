@@ -490,7 +490,8 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 		backend::memcpy_sync( rope_plain_, plain.data(), plain.size() * sizeof( float ), backend::Copy::H2D );
 		backend::memcpy_sync( rope_comp_, comp.data(), comp.size() * sizeof( float ), backend::Copy::H2D );
 	}
-	// caches
+	// caches: the checkpoint's own FP8 / FP4 codes (DSV4), whatever kv_format says
+	if ( rank_ == 0 && !runtime::options().kv_format.empty() ) LOG_WARN( "[deepseek_v41] kv_format ignored: the caches keep the checkpoint's FP8 / FP4 codes\n" );
 	ds_.enabled = runtime::options().speculator == "dspark";
 	win_layers_ = L + ( ds_.enabled ? ds_.blocks : 0 );   // the drafter's blocks keep the main-KV rows of the window in the layers after the trunk's
 	win_slot_stride_ = static_cast<size_t>( win_layers_ ) * DSV4::RING * DSV4::WIN_ROW;
