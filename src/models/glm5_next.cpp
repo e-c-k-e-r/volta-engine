@@ -938,6 +938,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 				state_.moe.gguf_ws = engine::core::arena_alloc( *arena_, engine::modules::MoEGguf::scratch_bytes( config_.top_k, config_.hidden_size, inter_local ), 256 );
 			}
 			mw.num_local_experts = experts_per_rank;
+			mw.num_experts = config_.num_experts;
 			moe_list.push_back( L );   // the routed experts load after every other weight (3b)
 
 			// Shared experts

@@ -24,6 +24,9 @@ constexpr int kMoEWarps = 4;
 constexpr int kItemRoutes = 2;
 constexpr int kMoEWaveBlocks = 2560;   // four waves of moe_proj_kernel blocks on 80 SMs
 
+constexpr int kDispatchWarps = 8;   // moe_dispatch_kernel's block of 256 threads
+size_t dispatch_smem( int num_local ) { return static_cast<size_t>( 2 + kDispatchWarps ) * num_local * sizeof( int ); }
+
 // A work item: one local expert and up to kItemRoutes of its routes (route ids in `sorted`, from `begin`)
 struct Item {
 	int expert, begin, count, pad;
@@ -72,14 +75,31 @@ __global__ void moe_dispatch_kernel( const int* __restrict__ topk, int routes, i
 		if ( lane == 0 ) *n_items = total;
 		return;
 	}
+	// counting sort, stable: warp w takes routes [w seg, (w + 1) seg) in chunks of 32 and counts its routes per expert, a scan gives each expert
+	// its first route and items, then each warp's routes of an expert go after the earlier warps' (route order within an expert)
 	extern __shared__ int sh[];
-	int* count = sh;                  // [num_local]
-	int* start = sh + num_local;      // [num_local]
-	for ( int e = threadIdx.x; e < num_local; e += blockDim.x ) count[e] = 0;
+	int* count = sh;                    // [num_local]
+	int* start = sh + num_local;        // [num_local]
+	int* wcnt = sh + 2 * num_local;     // [kDispatchWarps][num_local]: a warp's routes per expert, then where its next one goes
+	const int warp = threadIdx.x >> 5, wl = threadIdx.x & 31;
+	const unsigned below = ( 1u << wl ) - 1;
+	for ( int i = threadIdx.x; i < ( 2 + kDispatchWarps ) * num_local; i += blockDim.x ) sh[i] = 0;
 	__syncthreads();
-	for ( int r = threadIdx.x; r < routes; r += blockDim.x ) {
-		const int e = topk[r] - first;
-		if ( e >= 0 && e < num_local ) atomicAdd( count + e, 1 );
+	const int seg = ( ( routes + kDispatchWarps - 1 ) / kDispatchWarps + 31 ) / 32 * 32;
+	const int s0 = warp * seg, s1 = min( routes, s0 + seg );
+	int* mine = wcnt + warp * num_local;
+	for ( int c = s0; c < s1; c += 32 ) {
+		const int e = c + wl < s1 ? topk[c + wl] - first : -1;
+		const bool ok = e >= 0 && e < num_local;
+		const unsigned peers = __match_any_sync( 0xffffffff, ok ? e : -1 );
+		if ( ok && ( peers & below ) == 0 ) mine[e] += __popc( peers );
+		__syncwarp();
+	}
+	__syncthreads();
+	for ( int e = threadIdx.x; e < num_local; e += blockDim.x ) {
+		int c = 0;
+		for ( int w = 0; w < kDispatchWarps; ++w ) c += wcnt[w * num_local + e];
+		count[e] = c;
 	}
 	__syncthreads();
 	if ( threadIdx.x < 32 ) {
@@ -107,11 +127,23 @@ __global__ void moe_dispatch_kernel( const int* __restrict__ topk, int routes, i
 		if ( lane == 0 ) *n_items = n;
 	}
 	__syncthreads();
-	// route ids in route order within an expert (deterministic): one thread per expert walks the routes
 	for ( int e = threadIdx.x; e < num_local; e += blockDim.x ) {
-		if ( count[e] == 0 ) continue;
-		int at = start[e];
-		for ( int r = 0; r < routes; ++r ) if ( topk[r] - first == e ) sorted[at++] = r;
+		int run = start[e];
+		for ( int w = 0; w < kDispatchWarps; ++w ) {
+			const int t = wcnt[w * num_local + e];
+			wcnt[w * num_local + e] = run;
+			run += t;
+		}
+	}
+	__syncthreads();
+	for ( int c = s0; c < s1; c += 32 ) {
+		const int e = c + wl < s1 ? topk[c + wl] - first : -1;
+		const bool ok = e >= 0 && e < num_local;
+		const unsigned peers = __match_any_sync( 0xffffffff, ok ? e : -1 );
+		if ( ok ) sorted[mine[e] + __popc( peers & below )] = c + wl;
+		__syncwarp();
+		if ( ok && ( peers & below ) == 0 ) mine[e] += __popc( peers );
+		__syncwarp();
 	}
 }
 
@@ -1021,12 +1053,14 @@ void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx
 		auto* sorted = reinterpret_cast<int*>( ws + l.sorted );
 		for ( int r0 = 0; r0 < m; r0 += kTileRowsPerPass ) {
 			const int rn = std::min( kTileRowsPerPass, m - r0 ), routes = rn * top_k;
-			// 32-route items once the local experts average more than about 12 routes in the pass (fewer decodes, at a lower occupancy)
-			const int rt = routes > 12 * 4 * t.num_local ? kTileRoutesMax : 16, mi = std::min( routes, t.num_local + routes / rt );
+			// 32-route items once the local experts average more than about 12 routes in the pass (fewer decodes, at a lower occupancy): a pass's
+			// routes over every rank's experts (experts sharded over the ranks: all of them local)
+			const int global = t.num_global > 0 ? t.num_global : 4 * t.num_local;
+			const int rt = routes > 12 * global ? kTileRoutesMax : 16, mi = std::min( routes, t.num_local + routes / rt );
 			const int* ti = topk_idx + static_cast<size_t>( r0 ) * top_k;
 			const half* tw = topk_w + static_cast<size_t>( r0 ) * top_k;
 			const half* xr = x + static_cast<size_t>( r0 ) * t.hidden;
-			moe_dispatch_kernel<<<1, 256, 2 * t.num_local * sizeof( int ), stream>>>( ti, routes, t.first_expert, t.num_local, items, n_items, sorted, heat, rt );
+			moe_dispatch_kernel<<<1, 256, dispatch_smem( t.num_local ), stream>>>( ti, routes, t.first_expert, t.num_local, items, n_items, sorted, heat, rt );
 			if ( t.type[0] == t.type[1] ) tile_proj( t.type[0], rt, gate, up, items, n_items, sorted, mi, xr, true, t.hidden, t.inter, tw, top_k, nullptr, a16, t.act_limit, stream );
 			else {
 				tile_proj( t.type[0], rt, gate, nullptr, items, n_items, sorted, mi, xr, true, t.hidden, t.inter, tw, top_k, nullptr, g16, 0.0f, stream );
@@ -1054,7 +1088,7 @@ void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx
 		const int* ti = topk_idx + static_cast<size_t>( r0 ) * top_k;
 		const half* tw = topk_w + static_cast<size_t>( r0 ) * top_k;
 		const int qx = ( t.hidden + 255 ) / 256;   // the dispatch block, then the blocks that quantize the pass's rows
-		moe_dispatch_kernel<<<1 + qx * rn, 256, 2 * t.num_local * sizeof( int ), stream>>>( ti, routes, t.first_expert, t.num_local, items, n_items, sorted, heat, ir,
+		moe_dispatch_kernel<<<1 + qx * rn, 256, dispatch_smem( t.num_local ), stream>>>( ti, routes, t.first_expert, t.num_local, items, n_items, sorted, heat, ir,
 			x + static_cast<size_t>( r0 ) * t.hidden, xq, t.hidden, qx );
 		if ( t.type[0] == t.type[1] ) proj( t.type[0], ir, gate, up, items, n_items, sorted, mi, xq, true, t.hidden, t.inter, tw, top_k, false, g, u, stream );
 		else {

@@ -130,6 +130,7 @@ int main( int argc, char** argv ) {
 				engine::modules::MoEGguf::Table t;
 				t.ptrs = static_cast<const void* const*>( tables[s] );
 				t.num_local = local;
+				t.num_global = global;
 				t.first_expert = 0;
 				t.type[0] = t.type[1] = t.type[2] = type;
 				t.hidden = hidden;

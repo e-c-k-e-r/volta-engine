@@ -17,6 +17,7 @@ namespace pod {
 struct MoELayerWeights {
 	QuantType type = QuantType::TRELLIS;
 	int num_local_experts = 72;
+	int num_experts = 0;               // the layer's experts over every rank (0: four ranks of num_local_experts each)
 	int top_k = 8;                     // routes per token the dispatch and the expert kernel expect
 	LinearWeight gate[MOE_MAX_EXPERTS];
 	LinearWeight up[MOE_MAX_EXPERTS];

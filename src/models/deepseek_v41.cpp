@@ -1112,6 +1112,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			auto& mw = *g.mw;
 			mw.type = lw.gguf_experts ? pod::QuantType::GGUF : pod::QuantType::TRELLIS;
 			mw.num_local_experts = g.count;
+			mw.num_experts = config_.num_experts;
 			mw.top_k = config_.top_k;
 			for ( int i = 0; i < g.count; ++i ) {
 				const int e = mine_[l][j + i];
