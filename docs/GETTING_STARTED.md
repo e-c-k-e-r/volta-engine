@@ -103,7 +103,8 @@ Qwen extras:
   on a different machine; each point of `expert_cache` costs 0.26 GiB, and the FP8 cache (`kv_format=fp8`, 1.2 GiB more) needs it below 1.
   `--set expert_cache=auto` picks the fraction itself: the largest the arena holds after the other weights, the drafter (its file size) and a 0.25 GiB
   margin; the first MoE layer starts from a conservative estimate and each later layer re-estimates from what was actually loaded, so the last
-  layers take up the slack (the log prints the plan and the resident range). GLM only; it uses the expert tier on any rank count.
+  layers take up the slack (the log prints the plan and the resident range). GLM only; it uses the expert tier on any rank count, except
+  that on four ranks a plan with every expert resident on every rank loads the experts sharded over the ranks instead, as `expert_cache=1` does.
   Prefill chunks (above 16 rows) copy each layer's cold experts once into device scratch, a layer ahead of the compute (`expert_stage`: auto = on, except for Flash-Next's
   trellis experts, where the persistent kernel's tiles read each cold expert about once and staging measured 15-25% slower at 256-row chunks and level at 512;
   2 x the cold experts of a layer, 126 MiB at 90% resident), instead of reading them over PCIe from every row tile: 4096 tokens in chunks of

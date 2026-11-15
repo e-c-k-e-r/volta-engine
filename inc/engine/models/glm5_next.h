@@ -265,6 +265,7 @@ private:
 	};
 	std::unique_ptr<PendingExperts> pending_;
 	bool moe_tp_ = true;                // routed experts sharded over the ranks instead of expert-parallel
+	bool moe_tp_auto_ = false;          // expert_cache=auto: sharded after all if every rank's plan holds all of its experts (load_experts)
 	engine::modules::ExpertTier tier_;
 	pod::MemoryArena host_arena_{};     // pinned cold-expert tier
 	int tier_layers_ = 0;

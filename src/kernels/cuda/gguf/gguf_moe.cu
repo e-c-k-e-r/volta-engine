@@ -1,7 +1,7 @@
 // GGUF routed experts on CUDA (MoEGguf in engine/modules/gguf.h). The routes of a pass are grouped by expert into work items of up to
-// kItemRoutes routes; each projection is a GEMV of one output row per warp and work item, the expert's weight row read once for all the
-// item's routes through llama.cpp's vec_dot of the projection's block type (LinearGguf's multi-row GEMV structure). Routes of experts on
-// other ranks are left out, and the combine skips them. Prefill chunks (more rows than one pass of that path) take the tile path instead:
+// kItemRoutes routes; the gate and up projections are a GEMV of one output row per warp and work item, the expert's weight row read once for
+// all the item's routes through llama.cpp's vec_dot of the projection's block type (LinearGguf's multi-row GEMV structure); the down projection
+// takes one output row of one token per warp over the token's routes and sums them as it goes. Routes of experts on other ranks are left out. Prefill chunks (more rows than one pass of that path) take the tile path instead:
 // passes of kTileRowsPerPass rows, items of up to 16 or 32 routes, and per item a tile of output rows whose weight blocks are decoded
 // to FP16 in shared memory once and multiplied with all the item's routes on the tensor cores (the vec_dot path decodes them per route).
 #include "engine/modules/gguf.h"
@@ -22,6 +22,7 @@ constexpr int kMoEWarps = 4;
 // Routes of a work item at most: an expert with more takes several items, each reading its weights (mostly from the L2 then); items of more
 // routes held accumulators for all of them in every warp, which halved the occupancy, and verify passes (4 to 16 rows) ran at half the speed
 constexpr int kItemRoutes = 2;
+constexpr int kMoEWaveBlocks = 2560;   // four waves of moe_proj_kernel blocks on 80 SMs
 
 // A work item: one local expert and up to kItemRoutes of its routes (route ids in `sorted`, from `begin`)
 struct Item {
@@ -259,6 +260,50 @@ void moe_down_combine_kernel( const void* const* __restrict__ ptrs, const Item* 
 	if ( lane == 0 ) out[row] = __float2half_rn( sum );
 }
 
+// A multi-row pass's down projection and combine by token: warp (row, token) runs over the token's routes to this rank's experts, the routes' loads
+// in flight together, and sums each route's weighted dot in its lanes, reduced once. For short rows (an expert's width sliced over the ranks: a few
+// blocks), where a (row, work item) warp pays its pointer chain and reductions per couple of blocks; an expert routed by several tokens is read
+// once per route instead of once per item (from the L2 after the first)
+template <GgmlType T>
+__global__ __launch_bounds__( 32 * kMoEWarps, 8 )
+void moe_down_tok_kernel( const void* const* __restrict__ ptrs, const int* __restrict__ topk, int first, int num_local, const block_q8_1* __restrict__ in, int k, int n,
+	const half* __restrict__ topw, int top_k, half* __restrict__ out ) {
+	using Tr = Traits<T>;
+	const int row = blockIdx.x * kMoEWarps + threadIdx.y;
+	if ( row >= n ) return;
+	const int t = blockIdx.y, lane = threadIdx.x;
+	const int blocks_per_row = k / Tr::qk, y_blocks = k / QK8_1;
+	constexpr int per_iter = Tr::vdr * 32 / Tr::qi;
+	const int kqs = Tr::vdr * ( lane % ( Tr::qi / Tr::vdr ) );
+	float acc = 0.0f;
+	#pragma unroll 4
+	for ( int s = 0; s < top_k; ++s ) {
+		const int r = t * top_k + s;
+		const int e = topk[r] - first;
+		if ( e < 0 || e >= num_local ) continue;   // the same for the whole warp
+		const void* w = ptrs[e];
+		const block_q8_1* y = in + static_cast<size_t>( r ) * y_blocks;
+		float a = 0.0f;
+		for ( int kbx = lane / ( Tr::qi / Tr::vdr ); kbx < blocks_per_row; kbx += per_iter ) a += Tr::dot( w, y + kbx * ( Tr::qk / QK8_1 ), row * blocks_per_row + kbx, kqs );
+		acc += a * __half2float( topw[r] );
+	}
+	#pragma unroll
+	for ( int off = 16; off > 0; off >>= 1 ) acc += __shfl_xor_sync( 0xffffffff, acc, off );
+	if ( lane == 0 ) out[static_cast<size_t>( t ) * n + row] = __float2half_rn( acc );
+}
+
+void down_tok( GgmlType type, const void* const* ptrs, const int* topk, int first, int num_local, const block_q8_1* in, int k, int n, const half* topw, int top_k, int rows,
+	half* out, cudaStream_t stream ) {
+	const dim3 grid( ( n + kMoEWarps - 1 ) / kMoEWarps, rows ), block( 32, kMoEWarps );
+	switch ( type ) {
+#define CASE( T ) case GgmlType::T: moe_down_tok_kernel<GgmlType::T><<<grid, block, 0, stream>>>( ptrs, topk, first, num_local, in, k, n, topw, top_k, out ); break;
+		CASE( Q4_0 ) CASE( Q4_1 ) CASE( Q5_0 ) CASE( Q5_1 ) CASE( Q8_0 ) CASE( Q2_0 ) CASE( Q2_K ) CASE( Q3_K ) CASE( Q4_K ) CASE( Q5_K ) CASE( Q6_K )
+		CASE( IQ2_XXS ) CASE( IQ2_XS ) CASE( IQ2_S ) CASE( IQ3_XXS ) CASE( IQ3_S ) CASE( IQ1_S ) CASE( IQ1_M ) CASE( IQ4_NL ) CASE( IQ4_XS )
+#undef CASE
+		default: ENGINE_ASSERT( false, "MoEGguf: unsupported expert block type" );
+	}
+}
+
 void down_combine( GgmlType type, const void* const* ptrs, const Item* items, const int* n_items, const int* sorted, const block_q8_1* in, int k, int n, const half* topw,
 	int top_k, half* out, cudaStream_t stream ) {
 	const dim3 grid( ( n + kMoEWarps - 1 ) / kMoEWarps ), block( 32, kMoEWarps );
@@ -274,8 +319,10 @@ void down_combine( GgmlType type, const void* const* ptrs, const Item* items, co
 template <GgmlType T, int IR>
 void launch_proj_ir( const void* const* ptrs, const void* const* ptrs_up, const Item* items, const int* n_items, const int* sorted, int max_n, const block_q8_1* in,
 	bool per_token, int k, int n, const half* topw, int top_k, bool weighted, float* out, float* out_up, cudaStream_t stream ) {
-	// passes route to a few of max_n possible items: fewer rows of blocks, each looping over its share, leave no idle blocks
-	const dim3 grid( ( n + kMoEWarps - 1 ) / kMoEWarps, std::min( max_n, 2 + 2 * IR ) ), block( 32, kMoEWarps );
+	// passes route to a few of max_n possible items: fewer rows of blocks, each looping over its share, leave no idle blocks; a short output
+	// (an expert's width sliced over the ranks) takes more rows of blocks, about four waves in all, or its last wave runs a few blocks long
+	const int gx = ( n + kMoEWarps - 1 ) / kMoEWarps;
+	const dim3 grid( gx, std::min( max_n, std::max( 2 + 2 * IR, kMoEWaveBlocks / gx ) ) ), block( 32, kMoEWarps );
 	if ( ptrs_up != nullptr ) moe_proj_kernel<T, IR, true><<<grid, block, 0, stream>>>( ptrs, ptrs_up, items, n_items, sorted, in, per_token, k, n, topw, top_k, weighted, out, out_up );
 	else moe_proj_kernel<T, IR, false><<<grid, block, 0, stream>>>( ptrs, nullptr, items, n_items, sorted, in, per_token, k, n, topw, top_k, weighted, out, nullptr );
 }
@@ -299,10 +346,9 @@ void proj( GgmlType type, int ir, const void* const* ptrs, const void* const* pt
 	}
 }
 
-// The scratch of one pass: the rows' q8_1, gate and up outputs, the activation's q8_1, the down partials, the work items and the routes in
-// expert order
+// The scratch of one pass: the rows' q8_1, gate and up outputs, the activation's q8_1, the work items and the routes in expert order
 struct Layout {
-	size_t xq, g, u, aq, part, items, n_items, sorted, total;
+	size_t xq, g, u, aq, items, n_items, sorted, total;
 };
 Layout layout( int top_k, int hidden, int inter ) {
 	const size_t R = MoEGguf::kMoERowsPerPass, routes = R * top_k;
@@ -312,8 +358,7 @@ Layout layout( int top_k, int hidden, int inter ) {
 	l.g = l.xq + up( R * ( hidden / QK8_1 ) * sizeof( block_q8_1 ) );
 	l.u = l.g + up( routes * inter * sizeof( float ) );
 	l.aq = l.u + up( routes * inter * sizeof( float ) );
-	l.part = l.aq + up( routes * ( inter / QK8_1 ) * sizeof( block_q8_1 ) );
-	l.items = l.part + up( routes * hidden * sizeof( float ) );
+	l.items = l.aq + up( routes * ( inter / QK8_1 ) * sizeof( block_q8_1 ) );
 	l.n_items = l.items + up( routes * sizeof( Item ) );
 	l.sorted = l.n_items + 256;
 	l.total = l.sorted + up( routes * sizeof( int ) );
@@ -999,7 +1044,6 @@ void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx
 	auto* g = reinterpret_cast<float*>( ws + l.g );
 	auto* u = reinterpret_cast<float*>( ws + l.u );
 	auto* aq = reinterpret_cast<block_q8_1*>( ws + l.aq );
-	auto* part = reinterpret_cast<float*>( ws + l.part );
 	auto* items = reinterpret_cast<Item*>( ws + l.items );
 	auto* n_items = reinterpret_cast<int*>( ws + l.n_items );
 	auto* sorted = reinterpret_cast<int*>( ws + l.sorted );
@@ -1022,8 +1066,7 @@ void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx
 			down_combine( t.type[2], down, items, n_items, sorted, aq, t.inter, t.hidden, tw, top_k, out + static_cast<size_t>( r0 ) * t.hidden, stream );
 			continue;
 		}
-		proj( t.type[2], ir, down, nullptr, items, n_items, sorted, mi, aq, false, t.inter, t.hidden, tw, top_k, true, part, nullptr, stream );
-		moe_combine_kernel<<<( rn * t.hidden + 255 ) / 256, 256, 0, stream>>>( part, ti, t.first_expert, t.num_local, out + static_cast<size_t>( r0 ) * t.hidden, rn, top_k, t.hidden );
+		down_tok( t.type[2], down, ti, t.first_expert, t.num_local, aq, t.inter, t.hidden, tw, top_k, rn, out + static_cast<size_t>( r0 ) * t.hidden, stream );
 	}
 }
 

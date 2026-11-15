@@ -25,6 +25,8 @@
 #include <unordered_map>
 #include <array>
 #include <algorithm>
+#include <condition_variable>
+#include <mutex>
 
 namespace engine::models {
 
@@ -141,7 +143,11 @@ bool Glm5NextPipeline::init(
 	// default) or expert-parallel (72 whole experts per rank, forced by the two-tier expert cache). The sharded layout balances
 	// the load: each active expert costs every rank the same, where expert-parallel waits for the rank that drew the most.
 	moe_tp_ = engine::modules::ExpertTier::resident_fraction() >= 1.0 && config_.tp_size == ENGINE_NUM_GPUS;
-	const int E_local = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
+	// expert_cache=auto plans the residency only once the other weights are in: when every rank then holds all of its experts, the experts load
+	// sharded after all (load_experts). Not with the MTP head or NVFP4 expert layers, which take their layout in load_weights
+	moe_tp_auto_ = engine::modules::ExpertTier::resident_fraction() <= 0.0 && config_.tp_size == ENGINE_NUM_GPUS && !mtp_on_ &&
+		runtime::options().nvfp4_expert_layers.empty() && runtime::options().expert_synth == 0 && !runtime::options().expert_stream;
+	const int E_local = moe_tp_ || moe_tp_auto_ ? config_.num_experts : config_.num_experts / config_.tp_size;
 
 	// 1. Router outputs + routed-MoE dispatch scratch
 	state_.d_topk_indices = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( int ) ) );
@@ -1138,6 +1144,30 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	return load_experts( stream );
 }
 
+namespace {
+
+// Every rank's vote, returned to all once the last has voted: load_experts runs on every rank at once (the cluster's rank threads)
+bool all_ranks_vote( bool mine, int ranks ) {
+	static std::mutex m;
+	static std::condition_variable cv;
+	static int arrived = 0, yes = 0, round = 0;
+	static bool result = false;
+	std::unique_lock<std::mutex> lock( m );
+	const int r = round;
+	yes += mine ? 1 : 0;
+	if ( ++arrived == ranks ) {
+		result = yes == ranks;
+		arrived = yes = 0;
+		++round;
+		cv.notify_all();
+		return result;
+	}
+	cv.wait( lock, [&] { return round != r; } );
+	return result;
+}
+
+} // namespace
+
 // The routed experts (3b of load_weights), after every other weight, and after the speculator when deferred: expert_cache=auto places
 // them from the arena's exact free space (plan_experts)
 bool Glm5NextPipeline::load_experts( backend::stream_t stream ) {
@@ -1159,8 +1189,8 @@ bool Glm5NextPipeline::load_experts( backend::stream_t stream ) {
 		return lw;
 	};
 	char name_buf[256];
-	const int experts_per_rank = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
-	const int start_expert = moe_tp_ ? 0 : rank_ * experts_per_rank;
+	int experts_per_rank = moe_tp_ ? config_.num_experts : config_.num_experts / config_.tp_size;
+	int start_expert = moe_tp_ ? 0 : rank_ * experts_per_rank;
 	size_t experts_cost = 0;
 	size_t plan_keep = 0, plan_largest = 0;   // auto: what the plan left for after the weights, and the largest expert's codes
 	bool plan_auto = false;
@@ -1195,7 +1225,7 @@ bool Glm5NextPipeline::load_experts( backend::stream_t stream ) {
 		for ( int L : moe_list ) if ( !nv_layer( L ) ) tier_list.push_back( L );
 		// Tiered experts (expert_cache < 1, or auto): the codes of resident experts go to device slots, the rest to pinned host memory
 		double tier_fraction = engine::modules::ExpertTier::resident_fraction();
-		const bool use_tier = tier_fraction < 1.0 && !tier_list.empty();
+		bool use_tier = tier_fraction < 1.0 && !tier_list.empty();
 		plan_auto = use_tier && tier_fraction <= 0.0;
 		std::vector<int> plan;
 		if ( use_tier ) {
@@ -1218,10 +1248,23 @@ bool Glm5NextPipeline::load_experts( backend::stream_t stream ) {
 #if !defined(USE_ROCM)
 				if ( tier_fraction < kFusedTierMinFraction ) state_.moe.coop_ctr = nullptr;
 #endif
+				// every expert resident on every rank: the sharded layout (as expert_cache=1) holds the same codes per rank and costs every rank the
+				// same for each active expert, where whole experts wait for the rank that drew the most
+				const bool whole = *std::min_element( plan.begin(), plan.end() ) >= experts_per_rank;
+				if ( moe_tp_auto_ && all_ranks_vote( whole, config_.tp_size ) ) {
+					moe_tp_ = true;
+					use_tier = plan_auto = false;
+					experts_per_rank = config_.num_experts;
+					start_expert = 0;
+					for ( int L : moe_list ) layers_[L].moe_weights.num_local_experts = experts_per_rank;
+					if ( rank_ == 0 ) LOG_INFO( "[experts] expert_cache auto: every expert resident on every rank, so the experts load sharded over the ranks\n" );
+				}
 			}
-			const size_t bytes0[3] = { per_layer[0][0], per_layer[0][1], per_layer[0][2] };
-			tier_.start( experts_per_rank, tier_fraction, bytes0, rank_, config_.tp_size, static_cast<int>( tier_list.size() ), runtime::options().expert_stream, host_arena_,
-				&per_layer );
+			if ( use_tier ) {
+				const size_t bytes0[3] = { per_layer[0][0], per_layer[0][1], per_layer[0][2] };
+				tier_.start( experts_per_rank, tier_fraction, bytes0, rank_, config_.tp_size, static_cast<int>( tier_list.size() ), runtime::options().expert_stream, host_arena_,
+					&per_layer );
+			}
 		}
 		for ( size_t li = 0; li < tier_list.size(); ++li ) {
 			const int L = tier_list[li];
