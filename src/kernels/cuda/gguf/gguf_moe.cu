@@ -36,6 +36,39 @@ __global__ void moe_dispatch_kernel( const int* __restrict__ topk, int routes, i
 		quantize_q8_1_at( x, xq, k, GgufColTiling{}, b / qx, b % qx * blockDim.x + threadIdx.x );
 		return;
 	}
+	if ( routes <= 32 ) {
+		// a decode pass, on one warp without barriers: lane r ranks its route among the pass's local ones (expert order, then route order), and the
+		// first route of each expert writes the expert's items after those of the experts before it: the same lists as the block below
+		if ( threadIdx.x >= 32 ) return;
+		const int lane = threadIdx.x;
+		const int e = lane < routes ? topk[lane] - first : -1;
+		const bool ok = e >= 0 && e < num_local;
+		const int key = ok ? e : 0x7fffffff;
+		int rank = 0, cnt = 0;
+		bool lead = ok;
+		#pragma unroll
+		for ( int j = 0; j < 32; ++j ) {
+			const int kj = __shfl_sync( 0xffffffff, key, j );
+			rank += kj < key || ( kj == key && j < lane );
+			cnt += kj == key;
+			lead = lead && !( kj == key && j < lane );
+		}
+		if ( ok ) sorted[rank] = lane;
+		const int ni = lead ? ( cnt + item_routes - 1 ) / item_routes : 0;
+		int before = 0, total = 0;
+		#pragma unroll
+		for ( int j = 0; j < 32; ++j ) {
+			const int nj = __shfl_sync( 0xffffffff, ni, j ), kj = __shfl_sync( 0xffffffff, key, j );
+			before += kj < key ? nj : 0;
+			total += nj;
+		}
+		if ( lead ) {
+			for ( int b = 0, i = before; b < cnt; b += item_routes, ++i ) items[i] = Item{ e, rank + b, min( item_routes, cnt - b ), 0 };
+			if ( heat != nullptr ) heat[e] += static_cast<uint32_t>( cnt );
+		}
+		if ( lane == 0 ) *n_items = total;
+		return;
+	}
 	extern __shared__ int sh[];
 	int* count = sh;                  // [num_local]
 	int* start = sh + num_local;      // [num_local]
@@ -175,6 +208,65 @@ __global__ void moe_combine_kernel( const float* __restrict__ part, const int* _
 		if ( e >= 0 && e < num_local ) v += part[( static_cast<size_t>( t ) * top_k + s ) * hidden + j];
 	}
 	out[i] = __float2half_rn( v );
+}
+
+// A one-row pass's down projection and combine in one launch: warp `row` takes every item (one route each: a token routes to an expert once), two
+// at a time, each dot as moe_proj_kernel's, and the weighted rows are summed in route order as moe_combine_kernel sums them: out is bit-identical
+// to the pair
+template <GgmlType T>
+__global__ __launch_bounds__( 32 * kMoEWarps, 8 )
+void moe_down_combine_kernel( const void* const* __restrict__ ptrs, const Item* __restrict__ items, const int* __restrict__ n_items, const int* __restrict__ sorted,
+	const block_q8_1* __restrict__ in, int k, int n, const half* __restrict__ topw, int top_k, half* __restrict__ out ) {
+	using Tr = Traits<T>;
+	const int row = blockIdx.x * kMoEWarps + threadIdx.y;
+	if ( row >= n ) return;
+	const int lane = threadIdx.x;
+	const int items_n = *n_items;
+	const int blocks_per_row = k / Tr::qk, y_blocks = k / QK8_1;
+	constexpr int per_iter = Tr::vdr * 32 / Tr::qi;
+	const int kqs = Tr::vdr * ( lane % ( Tr::qi / Tr::vdr ) );
+	float v_mine = 0.0f;   // lane i: item i's weighted value
+	int r_mine = -1;       // and its route
+	for ( int i = 0; i < items_n; i += 2 ) {
+		const bool two = i + 1 < items_n;
+		const Item a = items[i], b = items[two ? i + 1 : i];
+		const int ra = sorted[a.begin], rb = sorted[b.begin];
+		const void* wa = ptrs[a.expert];
+		const void* wb = ptrs[b.expert];
+		const block_q8_1* ya = in + static_cast<size_t>( ra ) * y_blocks;
+		const block_q8_1* yb = in + static_cast<size_t>( rb ) * y_blocks;
+		float acc_a = 0.0f, acc_b = 0.0f;
+		for ( int kbx = lane / ( Tr::qi / Tr::vdr ); kbx < blocks_per_row; kbx += per_iter ) {
+			const int kby = kbx * ( Tr::qk / QK8_1 );
+			acc_a += Tr::dot( wa, ya + kby, row * blocks_per_row + kbx, kqs );
+			if ( two ) acc_b += Tr::dot( wb, yb + kby, row * blocks_per_row + kbx, kqs );
+		}
+		#pragma unroll
+		for ( int off = 16; off > 0; off >>= 1 ) {
+			acc_a += __shfl_xor_sync( 0xffffffff, acc_a, off );
+			acc_b += __shfl_xor_sync( 0xffffffff, acc_b, off );
+		}
+		if ( lane == i ) { v_mine = acc_a * __half2float( topw[ra] ); r_mine = ra; }
+		if ( two && lane == i + 1 ) { v_mine = acc_b * __half2float( topw[rb] ); r_mine = rb; }
+	}
+	float sum = 0.0f;
+	for ( int s = 0; s < top_k; ++s ) {
+		const unsigned m = __ballot_sync( 0xffffffff, r_mine == s );
+		if ( m ) sum += __shfl_sync( 0xffffffff, v_mine, __ffs( m ) - 1 );
+	}
+	if ( lane == 0 ) out[row] = __float2half_rn( sum );
+}
+
+void down_combine( GgmlType type, const void* const* ptrs, const Item* items, const int* n_items, const int* sorted, const block_q8_1* in, int k, int n, const half* topw,
+	int top_k, half* out, cudaStream_t stream ) {
+	const dim3 grid( ( n + kMoEWarps - 1 ) / kMoEWarps ), block( 32, kMoEWarps );
+	switch ( type ) {
+#define CASE( T ) case GgmlType::T: moe_down_combine_kernel<GgmlType::T><<<grid, block, 0, stream>>>( ptrs, items, n_items, sorted, in, k, n, topw, top_k, out ); break;
+		CASE( Q4_0 ) CASE( Q4_1 ) CASE( Q5_0 ) CASE( Q5_1 ) CASE( Q8_0 ) CASE( Q2_0 ) CASE( Q2_K ) CASE( Q3_K ) CASE( Q4_K ) CASE( Q5_K ) CASE( Q6_K )
+		CASE( IQ2_XXS ) CASE( IQ2_XS ) CASE( IQ2_S ) CASE( IQ3_XXS ) CASE( IQ3_S ) CASE( IQ1_S ) CASE( IQ1_M ) CASE( IQ4_NL ) CASE( IQ4_XS )
+#undef CASE
+		default: ENGINE_ASSERT( false, "MoEGguf: unsupported expert block type" );
+	}
 }
 
 template <GgmlType T, int IR>
@@ -928,6 +1020,10 @@ void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx
 			proj( t.type[1], ir, up, nullptr, items, n_items, sorted, mi, xq, true, t.hidden, t.inter, tw, top_k, false, u, nullptr, stream );
 		}
 		moe_act_q8_kernel<<<dim3( ( t.inter + 127 ) / 128, routes ), 128, 0, stream>>>( g, u, aq, t.inter, t.act_limit );
+		if ( rn == 1 && top_k <= 32 ) {   // one token: its routes summed by the down projection's warps
+			down_combine( t.type[2], down, items, n_items, sorted, aq, t.inter, t.hidden, tw, top_k, out + static_cast<size_t>( r0 ) * t.hidden, stream );
+			continue;
+		}
 		proj( t.type[2], ir, down, nullptr, items, n_items, sorted, mi, aq, false, t.inter, t.hidden, tw, top_k, true, part, nullptr, stream );
 		moe_combine_kernel<<<( rn * t.hidden + 255 ) / 256, 256, 0, stream>>>( part, ti, t.first_expert, t.num_local, out + static_cast<size_t>( r0 ) * t.hidden, rn, top_k, t.hidden );
 	}
