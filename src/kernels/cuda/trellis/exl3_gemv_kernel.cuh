@@ -32,8 +32,9 @@
 
 // Split-K partials: [k_slice][row][col] FP32, summed in fixed slice order after a grid sync so the
 // output is bit-identical run to run (FP16 atomicAdd made the target forward nondeterministic).
-// Split-K only fires for size_n < 80 * 64 with at most 4 slices and EXL3_GEMV_MAX_M rows.
-#define EXL3_GEMV_SPLITK_MAX 4
+// Split-K only fires for size_n < 80 * 64 with at most EXL3_GEMV_SPLITK_MAX slices and EXL3_GEMV_MAX_M rows (narrow outputs at 6 rows,
+// DeepSeek-V4.1's 512-wide ones: 10 slices fill the SMs, 26 -> 16 us).
+#define EXL3_GEMV_SPLITK_MAX 10
 #define EXL3_GEMV_SPLITK_WS ( EXL3_GEMV_SPLITK_MAX * EXL3_GEMV_MAX_M * 5120 )
 __device__ float g_exl3_gemv_splitk_ws[EXL3_GEMV_SPLITK_WS];
 

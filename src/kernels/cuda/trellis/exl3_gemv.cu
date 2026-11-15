@@ -146,7 +146,7 @@ bool exl3_gemv_try_launch(
 	int gy = 1;
 
 	if ( cc == CC_OLD && gx < num_sms && size_k >= 1024 ) {
-		gy = MIN( 4, max_blocks / gx );
+		gy = MIN( EXL3_GEMV_SPLITK_MAX, max_blocks / gx );
 		gy = MIN( gy, MAX( 1, size_k / 512 ) );
 		// Deterministic split-K reduces through a fixed device workspace
 		if ( gy > 1 && static_cast<size_t>( gy ) * size_m * size_n > EXL3_GEMV_SPLITK_WS ) gy = 1;
