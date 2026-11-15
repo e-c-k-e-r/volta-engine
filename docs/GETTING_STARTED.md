@@ -169,8 +169,8 @@ Qwen extras:
   linked as the build's sixth part, in one directory with the original `config.json` without its `quantization_config`, the tokenizer files
   and `engram_hash.bin`, whose tables are those of the GGUF's metadata); their Engram rows are IQ4_NL blocks, decoded on the host. The routed experts take what the arena holds after the drafter (each rank sizes its share from its own remainder), and
   the prefill window (`prefill_window` -1) only what is left once every expert is resident. The experts that do not fit stay in pinned host memory and are read in
-  place (62% resident for the 2.7 bpw checkpoint on four 32 GB GPUs; the IQ1_M build and the 1.68 bpw EXL3 pack are fully resident with the DSpark drafter, without the image tower, at
-  16K). A layer with any expert in host memory runs its MoE on the host path, so even a few cold experts cost decode and verify time. Its routing is concentrated (on agent text the hottest 10% of a layer's
+  place (62% resident for the 2.7 bpw checkpoint on four 32 GB GPUs; with the 3-bit DSpark drafter the IQ1_M build is fully resident at 16K without the image tower, and the
+  1.68 bpw EXL3 pack up to 256K without it and at 16K with it; 128K with the tower takes `vram_reserve_mib=256`). A layer with any expert in host memory runs its MoE on the host path, so even a few cold experts cost decode and verify time. Its routing is concentrated (on agent text the hottest 10% of a layer's
   experts take half of the routes) and specialized by domain, so which experts are resident decides the speed: with `--set expert_heat_file=<path>`
   the route counts are saved at exit and the next start keeps the hottest experts on the device and balances the heat over the ranks. Counts from five
   recorded Claude Code turns put 95% of the routes of five other turns on resident experts (62% without), and a held-out turn decoded at 59 ms a token

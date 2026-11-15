@@ -191,6 +191,13 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	}
 	// Image encoder last, into whatever the arena has left (rank 0)
 	models_[0]->load_vision( cfg.model_dir.c_str(), streams_[0] );
+	if ( opt.mem_log ) {
+		for ( int d = 0; d < tp_; ++d ) {
+			LOG_INFO( "[mem] GPU %d after loading: arena %.0f / %.0f MiB used, %.0f MiB free outside it (reserve %.0f MiB)\n", d, arenas_[d].offset_bytes / 1048576.0,
+				arenas_[d].total_bytes / 1048576.0, backend::device_free_bytes( d ) / 1048576.0, reserve / 1048576.0 );
+		}
+		backend::set_device( 0 );
+	}
 
 	// arena_create on the third device leaves cudaErrorInvalidValue pending on this thread although every
 	// call it makes reports success (bisected with cudaPeekAtLastError; source inside the driver, not
