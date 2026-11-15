@@ -39,7 +39,7 @@ __attribute__(( weak )) void DSV4::tap_gather( const backend::half_t* ring, back
 	__builtin_unreachable();
 }
 
-__attribute__(( weak )) void DSV4::dspark_attend( const backend::half_t* q, const backend::half_t* ring, const backend::half_t* blk, const float* sink, const float* rope, backend::half_t* o, int nh, int layer, int rows, const pod::BatchRows* d_rows, int slot, int w0, int t, size_t ring_slot_stride, backend::stream_t stream ) {
+__attribute__(( weak )) void DSV4::dspark_attend( const backend::half_t* q, const backend::half_t* ring, const backend::half_t* blk, const float* sink, const float* rope, backend::half_t* o, int nh, int layer, int rows, const pod::BatchRows* d_rows, int slot, int w0, int t, size_t ring_slot_stride, float* ws, backend::stream_t stream ) {
 	ENGINE_UNSUPPORTED( "DSV4::dspark_attend" );
 	__builtin_unreachable();
 }

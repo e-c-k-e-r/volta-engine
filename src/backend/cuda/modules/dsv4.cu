@@ -1,8 +1,10 @@
 #include "engine/modules/dsv4.h"
 #include "engine/modules/linear.h"
 #include "engine/backend/cuda/reduce.cuh"
+#include "../../../kernels/cuda/mma_sm80.cuh"
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <algorithm>
 #include <cmath>
 #include <cfloat>
 
@@ -656,7 +658,10 @@ void att_combine_kernel( const float* __restrict__ ws, int nsplit, const float* 
 	__shared__ float2 part[ATT_THREADS / 32][HD / 2];
 	const size_t sstride = static_cast<size_t>( nh ) * ( HD + 2 );   // one split to the next
 	const float* base = ws + ( static_cast<size_t>( r ) * nsplit * nh + h ) * ( HD + 2 );
-	const float m_l = lane < nsplit ? base[lane * sstride] : -INFINITY;
+	// every global read the epilogue needs up front: the splits' (m, l) and warp 7's rotary pairs
+	const float2 ml = lane < nsplit ? *reinterpret_cast<const float2*>( base + lane * sstride ) : make_float2( -INFINITY, 0.0f );
+	const float2 cs = warp == 7 ? rope[static_cast<size_t>( rows->pos[r] ) * ( ROPE / 2 ) + lane] : make_float2( 0.0f, 0.0f );
+	const float m_l = ml.x;
 	float m = m_l;
 	#pragma unroll
 	for ( int off = 16; off > 0; off >>= 1 ) m = fmaxf( m, __shfl_xor_sync( 0xffffffff, m, off ) );
@@ -680,7 +685,7 @@ void att_combine_kernel( const float* __restrict__ ws, int nsplit, const float* 
 	__syncthreads();
 	// the epilogue, warp i the dims of i (the eight sums in warp order, the rotary pairs in i = 7, the E4M3 grid per 32 dims): every warp
 	// takes the same denominator
-	float den = lane < nsplit ? base[lane * sstride + 1] * w_l : 0.0f;
+	float den = lane < nsplit ? ml.y * w_l : 0.0f;
 	#pragma unroll
 	for ( int off = 16; off > 0; off >>= 1 ) den += __shfl_xor_sync( 0xffffffff, den, off );
 	den += expf( sink[h] - M );
@@ -690,12 +695,245 @@ void att_combine_kernel( const float* __restrict__ ws, int nsplit, const float* 
 	#pragma unroll
 	for ( int w = 1; w < ATT_THREADS / 32; ++w ) { t.x += part[w][lane + 32 * i].x; t.y += part[w][lane + 32 * i].y; }
 	float2 vi = __half22float2( __floats2half2_rn( t.x * f, t.y * f ) );
-	if ( i == 7 ) rot( vi.x, vi.y, rope[static_cast<size_t>( rows->pos[r] ) * ( ROPE / 2 ) + lane], true );
+	if ( i == 7 ) rot( vi.x, vi.y, cs, true );
 	const int G = DSV4::GROUP_HEADS;
 	half* dst = o + ( static_cast<size_t>( h / G ) * rows_n + r ) * ( G * HD ) + static_cast<size_t>( h % G ) * HD;
 	const float amax = group_max<16>( fmaxf( fabsf( vi.x ), fabsf( vi.y ) ) );
 	const float sc = e4m3_scale_pow2( amax );
 	reinterpret_cast<half2*>( dst )[lane + 32 * i] = __floats2half2_rn( q_e4m3( vi.x, sc ), q_e4m3( vi.y, sc ) );
+}
+
+// Split-KV attention on the tensor cores (mma.m8n8k4), the partials of attend_kernel for att_combine_kernel: a block takes one row, 16 of its
+// heads as the queries and its split's share of the row's keys in tiles of 32 (the window, then the selected compressed entries, or for a
+// drafter block its own keys). The tile layout follows latent_sparse_tc_kernel (mla_latent.cu): a tile's keys sit in registers, stored as
+// K for the scores (each warp 16 x 16 over 128 of the dims), then as V^T for the output (each warp 64 dims); the softmax takes 16 lanes a
+// head. The split's entry indices are staged in shared memory first and the next tile is fetched while this one is scored, so a tile waits
+// on no global load
+constexpr int TC_BK = 32, TC_KS = HD + 4, TC_VS = TC_BK + 4, TC_SS = TC_BK + 4;
+constexpr int TC_OFF_Q = HD * TC_VS * 2;   // V^T is the larger use of the K / V buffer
+constexpr int TC_OFF_S = TC_OFF_Q + 16 * TC_KS * 2;
+constexpr int TC_OFF_P = TC_OFF_S + 4 * 16 * TC_SS * 4;
+constexpr int TC_OFF_A = TC_OFF_P + 16 * TC_VS * 2;
+constexpr int TC_OFF_I = TC_OFF_A + 16 * 12;
+constexpr int TC_SMEM = TC_OFF_I + ( DSV4::WINDOW + DSV4::TOPK ) * 4;
+static_assert( TC_BK * TC_KS * 2 <= TC_OFF_Q && 16 * TC_KS * 4 <= TC_OFF_Q, "K tile and output fit the K / V buffer" );
+
+template <bool DSPARK>
+__global__ __launch_bounds__( 256 )
+void attend_tc_kernel( const half* __restrict__ q, const half* __restrict__ ring, const half* __restrict__ comp_kv, const int* __restrict__ sel,
+	const int* __restrict__ nsel, const float2* __restrict__ rope, int nh, int layer, const pod::BatchRows* __restrict__ rows, size_t ring_slot_stride,
+	size_t comp_slot_stride, float* __restrict__ ws, int win_floor, int dslot, int dw0, int dt, int rows_n ) {
+	extern __shared__ __align__( 16 ) unsigned char tc_smem[];
+	half* sB = reinterpret_cast<half*>( tc_smem );
+	half* sQ = reinterpret_cast<half*>( tc_smem + TC_OFF_Q );
+	float* sS = reinterpret_cast<float*>( tc_smem + TC_OFF_S );
+	half* sP = reinterpret_cast<half*>( tc_smem + TC_OFF_P );
+	float* sA = reinterpret_cast<float*>( tc_smem + TC_OFF_A );
+	float* sM = sA + 16;
+	float* sL = sM + 16;
+	int* sI = reinterpret_cast<int*>( tc_smem + TC_OFF_I );
+	float* sO = reinterpret_cast<float*>( tc_smem );
+
+	const int r = blockIdx.x, h0 = blockIdx.z * 16, nsplit = gridDim.y;
+	const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+	const int t = lane & 3, hi = lane >> 4, e = t + 4 * hi, qp = ( lane >> 2 ) & 3;
+	const int pos = rows->pos[r];
+	const float2* cs_row = rope + static_cast<size_t>( pos ) * ( ROPE / 2 );
+
+	// the row's keys: the window [w0, pos] (a drafter block: [dw0, dt] of slot dslot), then the selected entries (the block's own keys)
+	const half* wring = ring + static_cast<size_t>( DSPARK ? dslot : rows->slot[r] ) * ring_slot_stride + static_cast<size_t>( layer ) * DSV4::RING * HD;
+	const int w0 = DSPARK ? dw0 : max( max( 0, win_floor ), pos - DSV4::WINDOW + 1 );
+	const int n_win = ( DSPARK ? dt : pos ) - w0 + 1;
+	const half* cbase = DSPARK || comp_kv == nullptr ? comp_kv : comp_kv + static_cast<size_t>( rows->slot[r] ) * comp_slot_stride;
+	const int total = n_win + ( DSPARK ? rows_n : comp_kv ? nsel[r] : 0 );
+	const int ntiles = ( total + TC_BK - 1 ) / TC_BK;
+	const int kb0 = ( blockIdx.y * ntiles / nsplit ) * TC_BK;
+	const int kb1 = min( total, ( ( blockIdx.y + 1 ) * ntiles / nsplit ) * TC_BK );
+	for ( int j = max( kb0, n_win ) + tid; j < kb1; j += 256 ) {
+		const int c = j - n_win;
+		sI[j - kb0] = DSPARK ? rows->pos[c] % DSV4::RING : sel[static_cast<size_t>( r ) * DSV4::TOPK + c];
+	}
+
+	// q, roped (as attend_kernel: the rotary pairs through FP32, back to half)
+	for ( int u = tid; u < 16 * ( HD / 8 ); u += 256 ) {
+		const int qq = u >> 6, c = u & 63;
+		uint4 raw = *reinterpret_cast<const uint4*>( q + ( static_cast<size_t>( r ) * nh + h0 + qq ) * HD + c * 8 );
+		if ( c * 8 >= ROPE0 ) {
+			half2* h2 = reinterpret_cast<half2*>( &raw );
+			#pragma unroll
+			for ( int i = 0; i < 4; ++i ) {
+				float2 v = __half22float2( h2[i] );
+				rot( v.x, v.y, cs_row[c * 4 + i - ROPE0 / 2], false );
+				h2[i] = __floats2half2_rn( v.x, v.y );
+			}
+		}
+		uint2* dst = reinterpret_cast<uint2*>( sQ + qq * TC_KS + c * 8 );
+		dst[0] = make_uint2( raw.x, raw.y );
+		dst[1] = make_uint2( raw.z, raw.w );
+	}
+
+	const int s_kg = warp & 1, dq = warp >> 1;
+	const half* s_arow = sQ + ( 8 * ( qp >> 1 ) + e ) * TC_KS + dq * 128;
+	const half* s_brow = sB + ( s_kg * 16 + 8 * ( qp & 1 ) + e ) * TC_KS + dq * 128;
+	const half* v_row0 = sB + ( 64 * warp + qp + 4 * e ) * TC_VS;
+	const half* p_row = sP + e * TC_VS;
+	const float scale = rsqrtf( static_cast<float>( HD ) );
+
+	// softmax role: 16 lanes a head, 2 keys each
+	const int hrow = tid >> 4, sub = tid & 15;
+	float m_run = -1e30f, l_run = 0.0f;
+	float acc[2][2][8];
+	#pragma unroll
+	for ( int jj = 0; jj < 2; ++jj ) {
+		#pragma unroll
+		for ( int i = 0; i < 2; ++i ) {
+			#pragma unroll
+			for ( int c = 0; c < 8; ++c ) acc[jj][i][c] = 0.0f;
+		}
+	}
+
+	const int st_p = lane & 15, st_cl = lane >> 4;
+	auto fetch = [&]( int kb, uint4 ( &pk )[4][2] ) {
+		const half* kp[2];
+		#pragma unroll
+		for ( int kk = 0; kk < 2; ++kk ) {
+			const int j = kb + 2 * st_p + kk;
+			kp[kk] = j >= kb1 ? nullptr : j < n_win ? wring + static_cast<size_t>( ( w0 + j ) % DSV4::RING ) * HD : cbase + static_cast<size_t>( sI[j - kb0] ) * HD;
+		}
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			const int c = 2 * warp + st_cl + 16 * j;
+			#pragma unroll
+			for ( int kk = 0; kk < 2; ++kk ) pk[j][kk] = kp[kk] ? __ldg( reinterpret_cast<const uint4*>( kp[kk] + c * 8 ) ) : make_uint4( 0, 0, 0, 0 );
+		}
+	};
+	// one tile from pk, the next fetched into pn
+	auto tile = [&]( int kb, const uint4 ( &pk )[4][2], uint4 ( &pn )[4][2] ) {
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			const int c = 2 * warp + st_cl + 16 * j;
+			#pragma unroll
+			for ( int kk = 0; kk < 2; ++kk ) {
+				uint2* kd = reinterpret_cast<uint2*>( sB + ( 2 * st_p + kk ) * TC_KS + c * 8 );
+				kd[0] = make_uint2( pk[j][kk].x, pk[j][kk].y );
+				kd[1] = make_uint2( pk[j][kk].z, pk[j][kk].w );
+			}
+		}
+		__syncthreads();
+		if ( kb + TC_BK < kb1 ) fetch( kb + TC_BK, pn );
+		{
+			// two accumulation chains over the dims
+			float c0[8], c1[8];
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) c0[i] = c1[i] = 0.0f;
+			#pragma unroll 8
+			for ( int ks = 0; ks < 32; ks += 2 ) {
+				const uint2 a0 = *reinterpret_cast<const uint2*>( s_arow + 4 * ks ), a1 = *reinterpret_cast<const uint2*>( s_arow + 4 * ks + 4 );
+				const uint2 b0 = *reinterpret_cast<const uint2*>( s_brow + 4 * ks ), b1 = *reinterpret_cast<const uint2*>( s_brow + 4 * ks + 4 );
+				mma884( c0, a0.x, a0.y, b0.x, b0.y );
+				mma884( c1, a1.x, a1.y, b1.x, b1.y );
+			}
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) {
+				const int m = ( t & 1 ) + 2 * ( ( i >> 1 ) & 1 ) + 4 * hi;
+				const int n = ( i & 1 ) + 2 * ( t >> 1 ) + 4 * ( i >> 2 );
+				sS[dq * 16 * TC_SS + ( 8 * ( qp >> 1 ) + m ) * TC_SS + s_kg * 16 + 8 * ( qp & 1 ) + n] = c0[i] + c1[i];
+			}
+		}
+		__syncthreads();
+		// V^T over the scored K, beside the softmax
+		#pragma unroll
+		for ( int j = 0; j < 4; ++j ) {
+			const int c = 2 * warp + st_cl + 16 * j;
+			const half* v0 = reinterpret_cast<const half*>( &pk[j][0] );
+			const half* v1 = reinterpret_cast<const half*>( &pk[j][1] );
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) *reinterpret_cast<half2*>( sB + ( c * 8 + i ) * TC_VS + 2 * st_p ) = __halves2half2( v0[i], v1[i] );
+		}
+		{
+			float sv[2];
+			float mx = -1e30f;
+			#pragma unroll
+			for ( int j = 0; j < 2; ++j ) {
+				const int k = sub * 2 + j;
+				float sum4 = 0.0f;
+				#pragma unroll
+				for ( int d4 = 0; d4 < 4; ++d4 ) sum4 += sS[d4 * 16 * TC_SS + hrow * TC_SS + k];
+				sv[j] = ( kb + k < kb1 ) ? sum4 * scale : -1e30f;
+				mx = fmaxf( mx, sv[j] );
+			}
+			#pragma unroll
+			for ( int mask = 1; mask < 16; mask <<= 1 ) mx = fmaxf( mx, __shfl_xor_sync( 0xffffffff, mx, mask ) );
+			const float m_new = fmaxf( m_run, mx );
+			const float alpha = __expf( m_run - m_new );
+			const float p0 = sv[0] > -1e29f ? __expf( sv[0] - m_new ) : 0.0f;
+			const float p1 = sv[1] > -1e29f ? __expf( sv[1] - m_new ) : 0.0f;
+			float sum = p0 + p1;
+			#pragma unroll
+			for ( int mask = 1; mask < 16; mask <<= 1 ) sum += __shfl_xor_sync( 0xffffffff, sum, mask );
+			l_run = l_run * alpha + sum;
+			m_run = m_new;
+			*reinterpret_cast<half2*>( sP + hrow * TC_VS + sub * 2 ) = __floats2half2_rn( p0, p1 );
+			if ( sub == 0 ) sA[hrow] = alpha;
+		}
+		__syncthreads();
+		#pragma unroll
+		for ( int jj = 0; jj < 2; ++jj ) {
+			#pragma unroll
+			for ( int i = 0; i < 2; ++i ) {
+				#pragma unroll
+				for ( int c = 0; c < 8; ++c ) acc[jj][i][c] *= sA[8 * i + ( t & 1 ) + 2 * ( ( c >> 1 ) & 1 ) + 4 * hi];
+			}
+		}
+		#pragma unroll
+		for ( int kk = 0; kk < TC_BK / 4; ++kk ) {
+			uint2 b[2];
+			#pragma unroll
+			for ( int jj = 0; jj < 2; ++jj ) b[jj] = *reinterpret_cast<const uint2*>( v_row0 + 32 * jj * TC_VS + 4 * kk );
+			#pragma unroll
+			for ( int i = 0; i < 2; ++i ) {
+				const uint2 a = *reinterpret_cast<const uint2*>( p_row + 8 * i * TC_VS + 4 * kk );
+				#pragma unroll
+				for ( int jj = 0; jj < 2; ++jj ) mma884( acc[jj][i], a.x, a.y, b[jj].x, b[jj].y );
+			}
+		}
+		__syncthreads();
+	};
+	uint4 pa[4][2], pb[4][2];
+	__syncthreads();   // the entry indices
+	if ( kb0 < kb1 ) fetch( kb0, pa );
+	for ( int kb = kb0; kb < kb1; kb += 2 * TC_BK ) {
+		tile( kb, pa, pb );
+		if ( kb + TC_BK < kb1 ) tile( kb + TC_BK, pb, pa );
+	}
+
+	// the partial: m, l and the unnormalized output in natural dim order (attend_kernel's layout)
+	if ( sub == 0 ) {
+		sM[hrow] = m_run;
+		sL[hrow] = l_run;
+	}
+	#pragma unroll
+	for ( int jj = 0; jj < 2; ++jj ) {
+		#pragma unroll
+		for ( int i = 0; i < 2; ++i ) {
+			#pragma unroll
+			for ( int c = 0; c < 8; ++c ) {
+				const int m = ( t & 1 ) + 2 * ( ( c >> 1 ) & 1 ) + 4 * hi;
+				const int n = ( c & 1 ) + 2 * ( t >> 1 ) + 4 * ( c >> 2 );
+				sO[( 8 * i + m ) * TC_KS + 64 * warp + 32 * jj + qp + 4 * n] = acc[jj][i][c];
+			}
+		}
+	}
+	__syncthreads();
+	for ( int u = tid; u < 16 * ( HD / 2 ); u += 256 ) {
+		const int qq = u >> 8, d2 = u & 255;
+		float* p = ws + ( ( static_cast<size_t>( r ) * nsplit + blockIdx.y ) * nh + h0 + qq ) * ( HD + 2 );
+		if ( d2 == 0 ) {
+			p[0] = sM[qq];
+			p[1] = sL[qq];
+		}
+		reinterpret_cast<float2*>( p + 2 )[d2] = *reinterpret_cast<const float2*>( sO + qq * TC_KS + 2 * d2 );
+	}
 }
 
 
@@ -1030,11 +1268,49 @@ void DSV4::indexer( const half* q, const half* w, const half* idx_k, float* scor
 	}
 }
 
+namespace {
+
+// attend_tc_kernel: its mma.m8n8k4 form is SM_70's (the SM_80+ expansion is ~80 FFMA an instruction), 16 heads a block
+struct AttDevice {
+	int major = 0, sms = 0;
+};
+
+const AttDevice& att_device() {
+	static AttDevice d[ENGINE_NUM_GPUS];
+	int dev = 0;
+	cudaGetDevice( &dev );
+	if ( d[dev].major == 0 ) {
+		cudaDeviceGetAttribute( &d[dev].sms, cudaDevAttrMultiProcessorCount, dev );
+		cudaFuncSetAttribute( attend_tc_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, TC_SMEM );
+		cudaFuncSetAttribute( attend_tc_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, TC_SMEM );
+		cudaDeviceGetAttribute( &d[dev].major, cudaDevAttrComputeCapabilityMajor, dev );
+	}
+	return d[dev];
+}
+
+bool att_tc_ok( int nh ) { return nh % 16 == 0 && att_device().major == 7; }
+
+// A tile is a block's serial unit (its shared memory bound), so the splits spread a row's tiles evenly over at most a block an SM
+int att_splits( int tiles, int rows ) {
+	const int cap = std::max( 1, std::min( att_device().sms, DSV4::ATTEND_PARTIALS ) / rows );
+	const int per = ( tiles + cap - 1 ) / cap;
+	return std::min( 32, ( tiles + per - 1 ) / per );
+}
+
+} // namespace
+
 void DSV4::attend( const half* q, const half* ring, const half* comp_kv, const int* sel, const int* nsel, const float* sink, const float* rope_f, half* o, int nh,
 	int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride, size_t comp_slot_stride, float* ws, cudaStream_t stream, int win_floor ) {
 	const float2* rope = reinterpret_cast<const float2*>( rope_f );
 	const size_t smem = static_cast<size_t>( nh + ATT_TILE ) * ( HD / 2 ) * sizeof( half2 );
 	ENGINE_ASSERT( nh == 8 || nh == 16 || nh == 32, "DSV4::attend: heads per rank must be 8, 16 or 32" );
+	if ( ws != nullptr && att_tc_ok( nh ) ) {
+		const int nsplit = att_splits( ( DSV4::WINDOW + ( comp_kv ? DSV4::TOPK : 0 ) + TC_BK - 1 ) / TC_BK, rows );
+		attend_tc_kernel<false><<<dim3( rows, nsplit, nh / 16 ), 256, TC_SMEM, stream>>>( q, ring, comp_kv, sel, nsel, rope, nh, layer, d_rows, ring_slot_stride,
+			comp_slot_stride, ws, win_floor, 0, 0, 0, rows );
+		att_combine_kernel<<<dim3( rows, nh ), ATT_THREADS, 0, stream>>>( ws, nsplit, sink, rope, o, nh, rows, d_rows );
+		return;
+	}
 	// decode batches split the keys over blocks (a single block per row leaves almost every SM idle, and its dependent loads miss the cache
 	// once the compressed cache outgrows it); a window-only layer's 128 keys take a tile a block; prefill chunks stay on one block per row
 	int nsplit = 1;
@@ -1067,10 +1343,17 @@ void DSV4::tap_gather( const half* ring, half* out, int slot, int first, int n, 
 }
 
 void DSV4::dspark_attend( const half* q, const half* ring, const half* blk, const float* sink, const float* rope_f, half* o, int nh, int layer, int rows, const pod::BatchRows* d_rows,
-	int slot, int w0, int t, size_t ring_slot_stride, cudaStream_t stream ) {
+	int slot, int w0, int t, size_t ring_slot_stride, float* ws, cudaStream_t stream ) {
 	const float2* rope = reinterpret_cast<const float2*>( rope_f );
 	const size_t smem = static_cast<size_t>( nh + ATT_TILE ) * ( HD / 2 ) * sizeof( half2 );
 	ENGINE_ASSERT( nh == 8 || nh == 16 || nh == 32, "DSV4::dspark_attend: heads per rank must be 8, 16 or 32" );
+	if ( ws != nullptr && rows <= pod::MAX_BATCH && att_tc_ok( nh ) ) {
+		const int nsplit = att_splits( ( t - w0 + 1 + rows + TC_BK - 1 ) / TC_BK, rows );
+		attend_tc_kernel<true><<<dim3( rows, nsplit, nh / 16 ), 256, TC_SMEM, stream>>>( q, ring, blk, nullptr, nullptr, rope, nh, layer, d_rows, ring_slot_stride, 0, ws, 0,
+			slot, w0, t, rows );
+		att_combine_kernel<<<dim3( rows, nh ), ATT_THREADS, 0, stream>>>( ws, nsplit, sink, rope, o, nh, rows, d_rows );
+		return;
+	}
 	if ( nh == 32 ) {
 		static bool attr[ENGINE_NUM_GPUS] = {};
 		int dev = 0;

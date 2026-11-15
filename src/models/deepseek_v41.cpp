@@ -2271,7 +2271,7 @@ void DeepseekV41Pipeline::dspark_forward( int slot, int pos, int from, int win_s
 		RMSNorm::forward( kv_, lw.kv_norm, kv_n_, eps, 0.0f, stream );
 		DSV4::window_store( kv_n_.ptr<const backend::half_t>(), ds_.blk_ring, rope_plain_, 0, B, ds_.d_blk_rows, 0, stream );
 		DSV4::dspark_attend( q_.ptr<const backend::half_t>(), win_ring_, ds_.blk_ring, lw.sink.ptr<const float>(), rope_plain_, o_g_.ptr<backend::half_t>(), lh_, L + l, B,
-			ds_.d_blk_rows, slot, w0, t, win_slot_stride_, stream );
+			ds_.d_blk_rows, slot, w0, t, win_slot_stride_, attend_ws_, stream );
 		for ( int g = 0; g < gl_; ++g ) {
 			pod::TensorView in = view( o_g_, static_cast<size_t>( g ) * B * G, B, G );
 			pod::TensorView out = view( woa_out_, static_cast<size_t>( g ) * B * O, B, O );

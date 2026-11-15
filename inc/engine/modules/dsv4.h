@@ -67,7 +67,8 @@ struct DSV4 {
 	static void attend( const backend::half_t* q, const backend::half_t* ring, const backend::half_t* comp_kv, const int* sel, const int* nsel,
 		const float* sink, const float* rope, backend::half_t* o, int nh, int layer, int rows, const pod::BatchRows* d_rows, size_t ring_slot_stride,
 		size_t comp_slot_stride, float* ws, backend::stream_t stream, int win_floor = 0 );
-	static constexpr size_t attend_ws_floats( int nh ) { return static_cast<size_t>( 64 ) * nh * ( HD + 2 ); }   // rows x splits <= 64
+	static constexpr int ATTEND_PARTIALS = 80;   // rows x splits of the split-KV path
+	static constexpr size_t attend_ws_floats( int nh ) { return static_cast<size_t>( ATTEND_PARTIALS ) * nh * ( HD + 2 ); }
 
 	// DSpark drafter. Taps: the mean of the four hyper-connection streams of each row (times scale; the drafter's entry RMSNorm makes it scale-free),
 	// kept for the last WINDOW positions of every slot: ring[slot][pos % WINDOW][taps][hidden], tap = this layer's index among the taps. Rows below
@@ -78,9 +79,9 @@ struct DSV4 {
 	static void tap_gather( const backend::half_t* ring, backend::half_t* out, int slot, int first, int n, int taps, int hidden, size_t ring_slot_stride, backend::stream_t stream );
 	// Attention of a drafter block: nh heads, query rows `rows` (positions d_rows->pos, slot 0 of the scratch), over the window ring's positions
 	// [w0, t] of `slot` (layer `layer` of ring) and all the block's own keys (blk: a scratch ring written by window_store at the block positions; the
-	// block is not causal). Same scaling, sink, inverse rotation and output grid as attend
+	// block is not causal). Same scaling, sink, inverse rotation and output grid as attend; ws as attend's (up to MAX_BATCH rows)
 	static void dspark_attend( const backend::half_t* q, const backend::half_t* ring, const backend::half_t* blk, const float* sink, const float* rope, backend::half_t* o,
-		int nh, int layer, int rows, const pod::BatchRows* d_rows, int slot, int w0, int t, size_t ring_slot_stride, backend::stream_t stream );
+		int nh, int layer, int rows, const pod::BatchRows* d_rows, int slot, int w0, int t, size_t ring_slot_stride, float* ws, backend::stream_t stream );
 
 	// out[row][g * n + c] = in[g][row][c] for g < groups
 	static void concat_groups( const backend::half_t* in, backend::half_t* out, int groups, int n, int rows, backend::stream_t stream );

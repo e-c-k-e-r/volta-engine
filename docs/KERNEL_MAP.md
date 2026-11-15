@@ -33,6 +33,7 @@ mirrored implementation). Verified by `test_nvfp4_linear`, `test_ops_linear`.
 | `dsa.cu` | indexer projection, plane / pool update, score, top-k select | mixed | `test_dsa` (FP64 reference) |
 | `moe.cu`, `expert_tier.cu` | router, dispatch histogram / scatter, combine, two-tier expert residency | CudaSm70 | `test_moe`, `test_ops_moe` |
 | `mhc.cu` | hyper-connection mix, collapse + norm, update | Portable | `test_mhc`, `test_slang_kernels` |
+| `dsv4.cu` | DeepSeek-V4.1: window ring store, KV compressor, indexer (scalar and tensor-core scorer, top-k select), window + selected-entry attention (one block a row; tensor-core split-KV for decode, verify and the DSpark drafter), DSpark taps, routing, Engram gate, FP8 projections | CudaSm70 | `test_dsv4_indexer`, `test_dsv4_fp8`, `test_dsv4_engram`, `bench_dsv4_attend`, `test_dsv41` |
 | `norm.cu`, `rope.cu`, `swiglu.cu`, `embedding.cu` | RMSNorm (plain, heads, gated), RoPE, SwiGLU, embedding gather | Portable | `test_norm`, `test_rope`, `test_slang_kernels` |
 | `vision.cu` | vision tower operators: patch-embedding GEMM, LayerNorm, qkv bias + 2-D rotary, register-resident mma.m8n8k4 flash attention (head_dim 64 / 72; WMMA fallback up to 80), bias + GELU, position-embedding interpolation | CudaSm70 | `test_vision` |
 | `linear_trellis.cu` | trellis `Linear` dispatch (GEMM / GEMV / recon by M) | CudaSm70 | `test_ops_linear`, `bench_decode` |

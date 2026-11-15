@@ -1,12 +1,15 @@
 // DeepSeek-V4.1 decode attention (DSV4::attend with its split-KV combine) on one GPU: time per layer over 40 distinct layers' caches (cycled so
 // the L2 does not hold them), the window of 128 plus nsel selected compressed entries, as one rank's heads meet a decode step.
 //   bench_dsv4_attend [context=1100] [rows=1] [heads=16] [nsel=context/4, at most 512; 0 = a window-only layer]
+// BENCH_DSPARK=1 times DSV4::dspark_attend instead: a drafter block of `rows` rows over the window and the block's own keys. Layer 0's output is
+// compared with the same call without a workspace (one block a row, no split).
 #include "engine/config.h"
 #include "engine/core/arena.h"
 #include "engine/core/batch.h"
 #include "engine/modules/dsv4.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -65,9 +68,13 @@ int main( int argc, char** argv ) {
 	pod::BatchRows* d_rows = nullptr;
 	CUDA_CHECK( cudaMalloc( &d_rows, sizeof( pod::BatchRows ) ) );
 	CUDA_CHECK( cudaMemcpy( d_rows, &br, sizeof( pod::BatchRows ), cudaMemcpyHostToDevice ) );
+	const bool dspark = std::getenv( "BENCH_DSPARK" ) != nullptr;
+	const int t = ctx - 2, w0 = std::max( 0, t - DSV4::WINDOW + 1 );
 	auto run = [&]() {
-		for ( int l = 0; l < LAYERS; ++l )
-			DSV4::attend( q[l], ring[l], nsel > 0 ? comp[l] : nullptr, sel, nsel_d, sink, rope, o[l], nh, 0, rows, d_rows, ring_stride, comp_stride, ws, stream );
+		for ( int l = 0; l < LAYERS; ++l ) {
+			if ( dspark ) DSV4::dspark_attend( q[l], ring[l], comp[l], sink, rope, o[l], nh, 0, rows, d_rows, 0, w0, t, ring_stride, ws, stream );
+			else DSV4::attend( q[l], ring[l], nsel > 0 ? comp[l] : nullptr, sel, nsel_d, sink, rope, o[l], nh, 0, rows, d_rows, ring_stride, comp_stride, ws, stream );
+		}
 	};
 	run();
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
@@ -93,7 +100,25 @@ int main( int argc, char** argv ) {
 	CUDA_CHECK( cudaMemcpy( ho.data(), o[0], ho.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
 	double sum = 0.0;
 	for ( auto v : ho ) sum += std::fabs( __half2float( v ) );
-	std::printf( "context %d, rows %d, heads %d, %d selected: %.2f us per layer (graph replay over %d layers); checksum %.6f\n", ctx, rows, nh, nsel,
+	// layer 0 against one block a row (no workspace: the kernel without splits)
+	half* ref = nullptr;
+	CUDA_CHECK( cudaMalloc( &ref, ho.size() * sizeof( half ) ) );
+	if ( dspark ) DSV4::dspark_attend( q[0], ring[0], comp[0], sink, rope, ref, nh, 0, rows, d_rows, 0, w0, t, ring_stride, nullptr, stream );
+	else DSV4::attend( q[0], ring[0], nsel > 0 ? comp[0] : nullptr, sel, nsel_d, sink, rope, ref, nh, 0, rows, d_rows, ring_stride, comp_stride, nullptr, stream );
+	std::vector<half> hr( ho.size() );
+	CUDA_CHECK( cudaMemcpy( hr.data(), ref, hr.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+	double dot = 0.0, na = 0.0, nb = 0.0, maxd = 0.0;
+	size_t same = 0;
+	for ( size_t i = 0; i < ho.size(); ++i ) {
+		const double a = __half2float( ho[i] ), b = __half2float( hr[i] );
+		dot += a * b;
+		na += a * a;
+		nb += b * b;
+		maxd = std::max( maxd, std::fabs( a - b ) );
+		same += a == b;
+	}
+	std::printf( "%scontext %d, rows %d, heads %d, %d selected: %.2f us per layer (graph replay over %d layers); checksum %.6f\n", dspark ? "dspark, " : "", ctx, rows, nh, nsel,
 		ms * 1000.0f / iters / LAYERS, LAYERS, sum );
+	std::printf( "against one block a row: cos %.6f, max |d| %.4g, %.1f%% identical\n", dot / std::sqrt( na * nb ), maxd, 100.0 * same / ho.size() );
 	return 0;
 }
