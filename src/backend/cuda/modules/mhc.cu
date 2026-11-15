@@ -925,8 +925,9 @@ bool HyperConnection::collapse_norm(
 	// The finalize reads exactly chunksA partials per row, and the collapsed row has to fit shared memory
 	if ( n_chunks_a != chunksA || hidden_size * static_cast<int>( sizeof( half ) ) > 48 * 1024 ) return false;
 	const size_t smem = static_cast<size_t>( hidden_size ) * sizeof( half );
-	if ( rows > pod::MAX_BATCH && runtime::options().hc_rows ) {
-		// Prefill: row-blocked partials, then the finalize and norm of each row (bit-identical to the fused kernel below)
+	if ( rows >= 4 && runtime::options().hc_rows ) {
+		// From 4 rows on (verify blocks, prefill): row-blocked partials, then the finalize and norm of each row (bit-identical to the fused kernel
+		// below, whose blocks re-read the mixing matrix for every row)
 		constexpr int RB = 4;
 		hc_mix_partials_rows_kernel<4, 24, RB><<<dim3( n_chunks_a, ( rows + RB - 1 ) / RB ), NUM_THREADS_A, 0, stream>>>(
 			streams.ptr<const float>(), fn.ptr<const float>(), row_len, chunk_cols, rows );

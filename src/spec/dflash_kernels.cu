@@ -113,8 +113,10 @@ void dflash_f16_gemv_nt_kernel(
 }
 
 // Skinny variant for up to MR rows (the LM head at decode / verify): one warp per output column streams the weight
-// row once with 128-bit loads and accumulates all rows, instead of re-reading it per row. k % 8 == 0.
-template <int MR>
+// row once with 128-bit loads and accumulates all rows, instead of re-reading it per row. k % 8 == 0. HOIST: the weight's values converted
+// once a step and each group of 8 rows' activations loaded before the first is used (8 rows and more, or narrow weights, whose few warps wait
+// on every load); every row's sums in the same order either way
+template <int MR, bool HOIST>
 __global__ __launch_bounds__(256)
 void dflash_f16_gemv_skinny_kernel(
 	const half* __restrict__ w,
@@ -129,22 +131,54 @@ void dflash_f16_gemv_skinny_kernel(
 	float acc[MR];
 	#pragma unroll
 	for ( int r = 0; r < MR; ++r ) acc[r] = 0.0f;
-	for ( int k0 = lane * 8; k0 < k; k0 += 256 ) {
-		const uint4 wv = __ldcs( reinterpret_cast<const uint4*>( wc + k0 ) );
-		const half2* w2 = reinterpret_cast<const half2*>( &wv );
-		#pragma unroll
-		for ( int r = 0; r < MR; ++r ) {
-			if ( r < m ) {
-				const uint4 xv = __ldg( reinterpret_cast<const uint4*>( x + static_cast<int64_t>( r ) * k + k0 ) );
-				const half2* x2 = reinterpret_cast<const half2*>( &xv );
-				float a = acc[r];
-				#pragma unroll
-				for ( int j = 0; j < 4; ++j ) {
-					const float2 wf = __half22float2( w2[j] ), xf = __half22float2( x2[j] );
-					a = fmaf( wf.x, xf.x, a );
-					a = fmaf( wf.y, xf.y, a );
+	if constexpr ( !HOIST ) {
+		for ( int k0 = lane * 8; k0 < k; k0 += 256 ) {
+			const uint4 wv = __ldcs( reinterpret_cast<const uint4*>( wc + k0 ) );
+			const half2* w2 = reinterpret_cast<const half2*>( &wv );
+			#pragma unroll
+			for ( int r = 0; r < MR; ++r ) {
+				if ( r < m ) {
+					const uint4 xv = __ldg( reinterpret_cast<const uint4*>( x + static_cast<int64_t>( r ) * k + k0 ) );
+					const half2* x2 = reinterpret_cast<const half2*>( &xv );
+					float a = acc[r];
+					#pragma unroll
+					for ( int j = 0; j < 4; ++j ) {
+						const float2 wf = __half22float2( w2[j] ), xf = __half22float2( x2[j] );
+						a = fmaf( wf.x, xf.x, a );
+						a = fmaf( wf.y, xf.y, a );
+					}
+					acc[r] = a;
 				}
-				acc[r] = a;
+			}
+		}
+	}
+	else {
+		for ( int k0 = lane * 8; k0 < k; k0 += 256 ) {
+			const uint4 wv = __ldcs( reinterpret_cast<const uint4*>( wc + k0 ) );
+			const half2* w2 = reinterpret_cast<const half2*>( &wv );
+			float2 wf[4];
+			#pragma unroll
+			for ( int j = 0; j < 4; ++j ) wf[j] = __half22float2( w2[j] );
+			constexpr int G = MR < 8 ? MR : 8;
+			#pragma unroll
+			for ( int r0 = 0; r0 < MR; r0 += G ) {
+				uint4 xv[G];
+				#pragma unroll
+				for ( int r = 0; r < G; ++r ) if ( r0 + r < m ) xv[r] = __ldg( reinterpret_cast<const uint4*>( x + static_cast<int64_t>( r0 + r ) * k + k0 ) );
+				#pragma unroll
+				for ( int r = 0; r < G; ++r ) {
+					if ( r0 + r < m ) {
+						const half2* x2 = reinterpret_cast<const half2*>( &xv[r] );
+						float a = acc[r0 + r];
+						#pragma unroll
+						for ( int j = 0; j < 4; ++j ) {
+							const float2 xf = __half22float2( x2[j] );
+							a = fmaf( wf[j].x, xf.x, a );
+							a = fmaf( wf[j].y, xf.y, a );
+						}
+						acc[r0 + r] = a;
+					}
+				}
 			}
 		}
 	}
@@ -1063,9 +1097,11 @@ void dflash_f16_gemv_nt(
 	const int warps = threads >> 5;
 	if ( m <= 16 && k % 8 == 0 ) {
 		const int blocks = ( n + warps - 1 ) / warps;
-		if ( m <= 4 ) dflash_f16_gemv_skinny_kernel<4><<<blocks, threads, 0, stream>>>( w, x, out, n, k, m );
-		else if ( m <= 8 ) dflash_f16_gemv_skinny_kernel<8><<<blocks, threads, 0, stream>>>( w, x, out, n, k, m );
-		else dflash_f16_gemv_skinny_kernel<16><<<blocks, threads, 0, stream>>>( w, x, out, n, k, m );
+		const bool narrow = n < 2048;   // too few warps to hide a load each
+		if ( m <= 4 && !narrow ) dflash_f16_gemv_skinny_kernel<4, false><<<blocks, threads, 0, stream>>>( w, x, out, n, k, m );
+		else if ( m <= 4 ) dflash_f16_gemv_skinny_kernel<4, true><<<blocks, threads, 0, stream>>>( w, x, out, n, k, m );
+		else if ( m <= 8 ) dflash_f16_gemv_skinny_kernel<8, true><<<blocks, threads, 0, stream>>>( w, x, out, n, k, m );
+		else dflash_f16_gemv_skinny_kernel<16, true><<<blocks, threads, 0, stream>>>( w, x, out, n, k, m );
 		return;
 	}
 	const int64_t warps_needed = static_cast<int64_t>( m ) * n;

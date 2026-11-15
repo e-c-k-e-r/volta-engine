@@ -85,6 +85,7 @@ Not part of `gate.sh` (except `bench_decode`, `bench_accept` and `bench_prefill`
 | `bench_accept` | draft acceptance of speculative decoding on a spread of prompts (per-position candidates; `--nothink`; `--type <model> --model <dir> --draft <dir>` for another target and drafter) |
 | `bench_spec` | DFlash2 rounds against plain greedy decoding on the same prompts (output must be token-identical) |
 | `bench_mhc` | `HyperConnection::collapse_norm` per site for 1 to 8 rows and a hash of the outputs, bit for bit (`SINK` sets the Sinkhorn iterations; `DS=1` DeepSeek-V4.1's lagged form, `collapse_lagged_norm`) |
+| `bench_f16_gemv` (`[N K ...]`) | the plain FP16 GEMV (FP16 linears, the drafter's projections, GLM's indexer) at 1 to 16 rows over cycled weight copies: time per call, GB/s and a hash of the outputs |
 | `bench_router` (`GLM=1` for the sigmoid router, `DS=1` for DeepSeek-V4.1's) | router logits and top-k per layer over 48 cycled weight copies, and a hash of every row's experts and weights |
 | `bench_dsv4_attend` (`[context rows heads nsel]`) | DeepSeek-V4.1 decode attention (`DSV4::attend` with its split-KV combine) on one GPU, time per layer over 40 cycled layers' caches; `nsel` 0 runs a window-only layer |
 | `bench_kda` | the KDA recurrent step (`GDN::recurrent_step_kda_rows`) per layer for 1 to 8 rows over cycled layer states; `BENCH_ITERS=1` for a profiler |
