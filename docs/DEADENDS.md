@@ -49,7 +49,13 @@ from the hardware of the time (4x V100, power caps as noted); relative results a
   perplexity 4.56 -> 33.3. Volta-order checkpoints are quantized from the original weights (`tests/tools/exl3_quantize.py`).
 * **Per-expert slices over all ranks for DeepSeek decode with EXL3 packs (`expert_shard`):** rank waiting fell from 40% to 6%, but the fused
   MoE kernels cost per expert slot, not per byte (348 -> 815 ms), so the slowest rank got slower. GGUF experts, whose kernels cost about the
-  same per byte at any slice width, run sharded by default.
+  same per byte at any slice width, run sharded by default. With the int8 MoE tile at every width it is level: decode -3%, verify +2-3%,
+  speculative decode unchanged, 340 MiB more per rank of slice tables.
+* **A k-sliced EXL3 GEMV of 2 to 16 rows on the fused MoE's tile** (blocks rotating their own input slice, the last block of a column group
+  finishing it, no grid-wide barrier): level with the tensor-core GEMV at 3 to 8 rows (both are bound by decoding the stock tile order, whose
+  tiles need operand shuffles for the MMA), slower at 9 to 16 (a decode per 8-row half), and at 2 rows 0.58 to 0.91 of the int8 GEMV on smaller
+  projections, but a 2-row call then rounds differently from the 1-row decode, which speculative verification needs to match (Flash-Next's
+  MTP greedy check failed). DeepSeek-V4.1's verify: 38.8 -> 38.3 ms a round.
 
 ## Prefill and multi-GPU balance
 
