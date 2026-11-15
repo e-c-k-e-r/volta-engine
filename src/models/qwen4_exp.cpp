@@ -614,6 +614,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		ENGINE_ASSERT( per_rank <= MOE_MAX_EXPERTS, "Qwen4ExpPipeline: experts per rank exceed MOE_MAX_EXPERTS" );
 		mw.num_local_experts = per_rank;
 		mw.num_experts = config_.num_experts;
+		mw.host_experts = engine::modules::ExpertTier::resident_fraction() < 1.0;
 		mw.top_k = config_.top_k;
 		// Tiered experts (expert_cache < 1): the codes of resident experts go to device slots, the rest to pinned host memory; the scales
 		// (NVFP4) and sign vectors (trellis) stay on the device

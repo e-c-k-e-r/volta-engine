@@ -4,7 +4,8 @@
 // real weights do; timing only either way: the values are not meaningful). BENCH_ROWS=a,b,... sets the row counts (prefill: the tile path
 // above 64 rows). BENCH_DUMP=<prefix>: pseudo-random inputs, and each row count's output after one forward written to <prefix>_<rows>.bin
 // (FP16, rows x hidden), to compare two runs of the same weights (a kernel path A/B; with BENCH_RANDOM=1 for meaningful values). BENCH_REUSE=p: each
-// row keeps each of the previous row's experts with probability p (consecutive tokens of a draft share experts), the rest uniform.
+// row keeps each of the previous row's experts with probability p (consecutive tokens of a draft share experts), the rest uniform. BENCH_HOST=1 takes
+// the path of experts read from host memory (the down projection by work item).
 //   bench_gguf_moe [TYPE] [hidden inter global local top_k]   default Q2_K 4096 2048 288 72 8 (GLM-5.3-Flash, expert-parallel at TP=4)
 //   DeepSeek-V4.1 IQ1_M build: bench_gguf_moe IQ1_S 5120 2304 384 96 6
 #include "engine/config.h"
@@ -131,6 +132,7 @@ int main( int argc, char** argv ) {
 				t.ptrs = static_cast<const void* const*>( tables[s] );
 				t.num_local = local;
 				t.num_global = global;
+				t.host_experts = std::getenv( "BENCH_HOST" ) != nullptr;   // the path for experts read from host memory (the weights here stay on the device)
 				t.first_expert = 0;
 				t.type[0] = t.type[1] = t.type[2] = type;
 				t.hidden = hidden;

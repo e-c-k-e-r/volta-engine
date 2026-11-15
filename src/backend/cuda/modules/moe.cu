@@ -883,6 +883,7 @@ void MoE::forward(
 		t.ptrs = static_cast<const void* const*>( weights.staged_ptrs != nullptr ? weights.staged_ptrs : weights.device_ptrs );   // a prefill layer reads its cold experts from the stage buffer
 		t.num_local = weights.num_local_experts;
 		t.num_global = weights.num_experts;
+		t.host_experts = weights.host_experts;
 		t.first_expert = start_expert;
 		t.type[0] = static_cast<GgmlType>( weights.gate[0].gguf_type );
 		t.type[1] = static_cast<GgmlType>( weights.up[0].gguf_type );

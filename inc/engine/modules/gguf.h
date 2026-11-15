@@ -75,6 +75,7 @@ struct MoEGguf {
 		const void* const* ptrs = nullptr;
 		int num_local = 0, first_expert = 0;   // global id of local expert 0
 		int num_global = 0;                    // experts over every rank (0: four ranks of num_local each)
+		bool host_experts = false;             // some experts read from host memory: the down projection reads each expert once per pass
 		GgmlType type[3] = {};                 // gate, up, down
 		int hidden = 0, inter = 0;
 		float act_limit = 0.0f;                // > 0: the SwiGLU clamp (gate <= limit, up in [-limit, limit])

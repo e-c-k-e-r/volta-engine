@@ -1275,6 +1275,7 @@ bool Glm5NextPipeline::load_experts( backend::stream_t stream ) {
 			int tier_layer = -1;
 			if ( use_tier ) {
 				tier_.add_layer( &mw, *arena_, host_arena_, tier_.initial_set( tier_layers_, plan_auto ? plan[li] : tier_.resident ) );
+				mw.host_experts = static_cast<int>( tier_.layers.back().owner.size() ) < tier_.experts;
 				tier_layer = tier_layers_++;
 				lw.tier_layer = tier_layer;
 			}

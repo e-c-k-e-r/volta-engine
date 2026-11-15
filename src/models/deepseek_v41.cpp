@@ -1098,6 +1098,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 		auto& lw = layers_[l];
 		const std::string p = "layers." + std::to_string( l ) + ".ffn.experts.";
 		const std::vector<char> resident = pick_resident( l );
+		const bool layer_cold = std::any_of( mine_[l].begin(), mine_[l].end(), [&]( int e ) { return !resident[e]; } );
 		int j = 0;
 		while ( j < static_cast<int>( mine_[l].size() ) ) {
 			int k = j;
@@ -1113,6 +1114,7 @@ bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t
 			mw.type = lw.gguf_experts ? pod::QuantType::GGUF : pod::QuantType::TRELLIS;
 			mw.num_local_experts = g.count;
 			mw.num_experts = config_.num_experts;
+			mw.host_experts = layer_cold;
 			mw.top_k = config_.top_k;
 			for ( int i = 0; i < g.count; ++i ) {
 				const int e = mine_[l][j + i];

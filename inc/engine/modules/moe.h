@@ -18,6 +18,7 @@ struct MoELayerWeights {
 	QuantType type = QuantType::TRELLIS;
 	int num_local_experts = 72;
 	int num_experts = 0;               // the layer's experts over every rank (0: four ranks of num_local_experts each)
+	bool host_experts = false;         // some experts' codes are read from host memory (a tier's cold experts): a pass reads each expert once
 	int top_k = 8;                     // routes per token the dispatch and the expert kernel expect
 	LinearWeight gate[MOE_MAX_EXPERTS];
 	LinearWeight up[MOE_MAX_EXPERTS];

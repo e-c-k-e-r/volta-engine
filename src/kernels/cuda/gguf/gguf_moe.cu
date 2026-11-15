@@ -1,7 +1,8 @@
 // GGUF routed experts on CUDA (MoEGguf in engine/modules/gguf.h). The routes of a pass are grouped by expert into work items of up to
 // kItemRoutes routes; the gate and up projections are a GEMV of one output row per warp and work item, the expert's weight row read once for
 // all the item's routes through llama.cpp's vec_dot of the projection's block type (LinearGguf's multi-row GEMV structure); the down projection
-// takes one output row of one token per warp over the token's routes and sums them as it goes. Routes of experts on other ranks are left out. Prefill chunks (more rows than one pass of that path) take the tile path instead:
+// takes one output row of one token per warp over the token's routes and sums them as it goes (by work item, then a combine, when experts are
+// read from host memory). Routes of experts on other ranks are left out. Prefill chunks (more rows than one pass of that path) take the tile path instead:
 // passes of kTileRowsPerPass rows, items of up to 16 or 32 routes, and per item a tile of output rows whose weight blocks are decoded
 // to FP16 in shared memory once and multiplied with all the item's routes on the tensor cores (the vec_dot path decodes them per route).
 #include "engine/modules/gguf.h"
@@ -378,9 +379,10 @@ void proj( GgmlType type, int ir, const void* const* ptrs, const void* const* pt
 	}
 }
 
-// The scratch of one pass: the rows' q8_1, gate and up outputs, the activation's q8_1, the work items and the routes in expert order
+// The scratch of one pass: the rows' q8_1, gate and up outputs, the activation's q8_1, the down partials, the work items and the routes in
+// expert order
 struct Layout {
-	size_t xq, g, u, aq, items, n_items, sorted, total;
+	size_t xq, g, u, aq, part, items, n_items, sorted, total;
 };
 Layout layout( int top_k, int hidden, int inter ) {
 	const size_t R = MoEGguf::kMoERowsPerPass, routes = R * top_k;
@@ -390,7 +392,8 @@ Layout layout( int top_k, int hidden, int inter ) {
 	l.g = l.xq + up( R * ( hidden / QK8_1 ) * sizeof( block_q8_1 ) );
 	l.u = l.g + up( routes * inter * sizeof( float ) );
 	l.aq = l.u + up( routes * inter * sizeof( float ) );
-	l.items = l.aq + up( routes * ( inter / QK8_1 ) * sizeof( block_q8_1 ) );
+	l.part = l.aq + up( routes * ( inter / QK8_1 ) * sizeof( block_q8_1 ) );
+	l.items = l.part + up( routes * hidden * sizeof( float ) );
 	l.n_items = l.items + up( routes * sizeof( Item ) );
 	l.sorted = l.n_items + 256;
 	l.total = l.sorted + up( routes * sizeof( int ) );
@@ -1078,6 +1081,7 @@ void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx
 	auto* g = reinterpret_cast<float*>( ws + l.g );
 	auto* u = reinterpret_cast<float*>( ws + l.u );
 	auto* aq = reinterpret_cast<block_q8_1*>( ws + l.aq );
+	auto* part = reinterpret_cast<float*>( ws + l.part );
 	auto* items = reinterpret_cast<Item*>( ws + l.items );
 	auto* n_items = reinterpret_cast<int*>( ws + l.n_items );
 	auto* sorted = reinterpret_cast<int*>( ws + l.sorted );
@@ -1100,7 +1104,13 @@ void MoEGguf::forward( const Table& t, const half* x, int m, const int* topk_idx
 			down_combine( t.type[2], down, items, n_items, sorted, aq, t.inter, t.hidden, tw, top_k, out + static_cast<size_t>( r0 ) * t.hidden, stream );
 			continue;
 		}
-		down_tok( t.type[2], down, ti, t.first_expert, t.num_local, aq, t.inter, t.hidden, tw, top_k, rn, out + static_cast<size_t>( r0 ) * t.hidden, stream );
+		if ( !t.host_experts ) {
+			down_tok( t.type[2], down, ti, t.first_expert, t.num_local, aq, t.inter, t.hidden, tw, top_k, rn, out + static_cast<size_t>( r0 ) * t.hidden, stream );
+			continue;
+		}
+		// experts in host memory: the work items read each expert once (by token, an expert of several routes would cross the link once a route)
+		proj( t.type[2], ir, down, nullptr, items, n_items, sorted, mi, aq, false, t.inter, t.hidden, tw, top_k, true, part, nullptr, stream );
+		moe_combine_kernel<<<( rn * t.hidden + 255 ) / 256, 256, 0, stream>>>( part, ti, t.first_expert, t.num_local, out + static_cast<size_t>( r0 ) * t.hidden, rn, top_k, t.hidden );
 	}
 }
 
