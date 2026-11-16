@@ -203,8 +203,13 @@ private:
 	std::vector<MmLayout> slot_mm_;   // per slot
 	int mm_slots_ = 0;                // slots with a non-empty layout
 	std::map<size_t, std::vector<void*>> snapshot_free_[ENGINE_NUM_GPUS]; // pinned buffers by rounded size
+	size_t snapshot_free_bytes_[ENGINE_NUM_GPUS] = {};                    // what those lists hold, at most snapshot_free_cap()
 	std::mutex snapshot_mtx_;
 	std::thread snapshot_prewarm_;
+	std::thread snapshot_release_;   // unpins the buffers the free lists do not keep, off the caller's thread
+	std::mutex snapshot_release_mtx_;
+	size_t snapshot_free_cap() const;
+	void release_pinned( std::vector<void*> buffers );
 	RankPool pool_;
 };
 

@@ -212,11 +212,16 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 void ModelCluster::shutdown() {
 	if ( !created_ ) return;
 	if ( snapshot_prewarm_.joinable() ) snapshot_prewarm_.join();
+	{
+		std::lock_guard<std::mutex> lock( snapshot_release_mtx_ );
+		if ( snapshot_release_.joinable() ) snapshot_release_.join();
+	}
 	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
 		for ( auto& kv : snapshot_free_[d] ) {
 			for ( void* p : kv.second ) backend::host_free_pinned( p );
 		}
 		snapshot_free_[d].clear();
+		snapshot_free_bytes_[d] = 0;
 	}
 	created_ = false;
 	initialized_ = false;
@@ -711,6 +716,7 @@ bool ModelCluster::alloc_snapshot( int from, int tokens, bool with_taps, size_t 
 			if ( !list.empty() ) {
 				p = list.back();
 				list.pop_back();
+				snapshot_free_bytes_[d] -= bytes;
 			}
 		}
 		if ( !p ) {
@@ -768,13 +774,14 @@ void ModelCluster::prewarm_snapshots( const std::vector<SnapshotPlan>& plan ) {
 				for ( ;; ) {
 					{
 						std::lock_guard<std::mutex> lock( snapshot_mtx_ );
-						if ( static_cast<int>( snapshot_free_[d][w.first].size() ) >= w.second ) break;
+						if ( static_cast<int>( snapshot_free_[d][w.first].size() ) >= w.second || snapshot_free_bytes_[d] + w.first > snapshot_free_cap() ) break;
 					}
 					void* p = backend::host_alloc_pinned( w.first, backend::Pin::Default );
 					if ( !p ) break;
 					{
 						std::lock_guard<std::mutex> lock( snapshot_mtx_ );
 						snapshot_free_[d][w.first].push_back( p );
+						snapshot_free_bytes_[d] += w.first;
 					}
 					// each pin holds the driver for ~0.2 s: leave room for the scheduler's decode steps in between
 					std::this_thread::sleep_for( std::chrono::milliseconds( 250 ) );
@@ -805,13 +812,40 @@ bool ModelCluster::load_snapshot( int slot, const SeqSnapshot& snap, bool kv_onl
 	return true;
 }
 
+// Freed snapshots keep their pinned buffers for the next one of the same rounded size, up to snapshot_free_cap() per GPU: an agent's
+// snapshots grow turn by turn, so a buffer of an earlier size is rarely taken again, and kept without a bound they pinned host memory
+// far past the prefix cache's budget. What the lists do not keep is unpinned on a thread of its own (an unpin takes the driver a while)
+size_t ModelCluster::snapshot_free_cap() const {
+	const size_t budget = static_cast<size_t>( std::max( runtime::options().prefix_cache_gib, 0 ) ) << 30;
+	return std::max<size_t>( size_t( 1 ) << 30, budget / static_cast<size_t>( std::max( tp_, 1 ) ) / 8 );
+}
+
+void ModelCluster::release_pinned( std::vector<void*> buffers ) {
+	std::lock_guard<std::mutex> lock( snapshot_release_mtx_ );
+	if ( snapshot_release_.joinable() ) snapshot_release_.join();
+	snapshot_release_ = std::thread( [buffers = std::move( buffers )]() {
+		backend::set_device( 0 );
+		for ( void* p : buffers ) backend::host_free_pinned( p );
+	} );
+}
+
 void ModelCluster::free_snapshot( SeqSnapshot* snap ) {
-	std::lock_guard<std::mutex> lock( snapshot_mtx_ );
-	for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
-		if ( snap->host[d] ) snapshot_free_[d][snap->bytes].push_back( snap->host[d] );
-		snap->host[d] = nullptr;
+	std::vector<void*> drop;
+	{
+		std::lock_guard<std::mutex> lock( snapshot_mtx_ );
+		for ( int d = 0; d < ENGINE_NUM_GPUS; ++d ) {
+			if ( snap->host[d] ) {
+				if ( snapshot_free_bytes_[d] + snap->bytes <= snapshot_free_cap() ) {
+					snapshot_free_[d][snap->bytes].push_back( snap->host[d] );
+					snapshot_free_bytes_[d] += snap->bytes;
+				}
+				else drop.push_back( snap->host[d] );
+			}
+			snap->host[d] = nullptr;
+		}
+		snap->tokens = 0;
 	}
-	snap->tokens = 0;
+	if ( !drop.empty() ) release_pinned( std::move( drop ) );
 }
 
 void ModelCluster::reset_slot( int slot ) {
