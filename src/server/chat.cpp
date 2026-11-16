@@ -164,6 +164,17 @@ void inline_glm_image_markers( nlohmann::ordered_json& messages ) {
 	}
 }
 
+// Image parts as a text note, for a model loaded without a vision tower
+void omit_images( nlohmann::ordered_json& messages ) {
+	for ( auto& m : messages ) {
+		if ( !m.is_object() || !m.contains( "content" ) || !m["content"].is_array() ) continue;
+		for ( auto& part : m["content"] ) {
+			if ( part.is_object() && part.value( "type", std::string() ) == "image" )
+				part = { { "type", "text" }, { "text", "[image omitted: this model cannot view images]" } };
+		}
+	}
+}
+
 // Gemma 4's template takes tool results as tool_responses ({ name, response }) on the tool message: the results of consecutive tool
 // messages go into one, each named after the call its tool_call_id answers (text parts joined; other parts are dropped)
 void gemma_tool_messages( nlohmann::ordered_json& messages ) {
@@ -266,7 +277,10 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 		return false;
 	}
 	if ( vars["messages"].is_array() ) fold_system_messages( vars["messages"] );
-	if ( family == engine::loader::ModelFamily::GLM && !req.images.empty() && vars["messages"].is_array() ) inline_glm_image_markers( vars["messages"] );
+	// Without a vision tower an image part becomes a note in the text, so an agent that reads an image file carries on instead of failing
+	const bool see = !req.images.empty() && gen.vision_params() && gen.tokenizer().get_special_token( image_pad_name( family ) ) >= 0;
+	if ( !req.images.empty() && !see && vars["messages"].is_array() ) omit_images( vars["messages"] );
+	if ( family == engine::loader::ModelFamily::GLM && see && vars["messages"].is_array() ) inline_glm_image_markers( vars["messages"] );
 	if ( family == engine::loader::ModelFamily::GEMMA ) {
 		if ( vars["messages"].is_array() ) gemma_tool_messages( vars["messages"] );
 		vars["bos_token"] = gen.tokenizer().decode_token( gen.tokenizer().get_special_token( "<bos>" ) );
@@ -298,13 +312,9 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 	// The GLM template always opens <think>; non-thinking mode closes it right away (GLM-4.5 convention)
 	if ( !thinking && family == engine::loader::ModelFamily::GLM && ends_with( *prompt, "<think>" ) ) *prompt += "</think>";
 	*tokens = encode_prompt( gen.tokenizer(), *prompt );
-	if ( !req.images.empty() ) {
+	if ( see ) {
 		const engine::loader::VisionParams* vp = gen.vision_params();
 		const int pad_id = gen.tokenizer().get_special_token( image_pad_name( family ) );
-		if ( !vp || pad_id < 0 ) {
-			err->message = "this model was loaded without a vision tower, so it cannot take image input";
-			return false;
-		}
 		for ( const std::string& bytes : req.images ) {
 			engine::loader::DecodedImage dec;
 			auto prep = std::make_shared<engine::loader::PreparedImage>();

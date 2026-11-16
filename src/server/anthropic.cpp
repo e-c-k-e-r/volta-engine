@@ -19,6 +19,13 @@ bool fail( ApiError* err, const std::string& message, const char* type = "invali
 	return false;
 }
 
+// A document block as text: a plain-text source is inlined, a PDF (or other encoded source) becomes a note the agent can act on
+std::string document_text( const json& b ) {
+	const json src = b.contains( "source" ) && b["source"].is_object() ? b["source"] : json::object();
+	if ( src.value( "type", std::string() ) == "text" && src.contains( "data" ) && src["data"].is_string() ) return src["data"].get<std::string>();
+	return "[document omitted: this model cannot read " + src.value( "media_type", std::string( "this document type" ) ) + " files; extract its text with a tool instead]";
+}
+
 // Concatenated text of a string-or-blocks value (system, tool_result content)
 bool text_of( const json& v, std::string* out, ApiError* err ) {
 	if ( v.is_null() ) return true;
@@ -30,6 +37,7 @@ bool text_of( const json& v, std::string* out, ApiError* err ) {
 	for ( const auto& b : v ) {
 		if ( b.is_string() ) *out += b.get<std::string>();
 		else if ( b.is_object() && b.value( "type", std::string() ) == "text" && b.contains( "text" ) && b["text"].is_string() ) *out += b["text"].get<std::string>();
+		else if ( b.is_object() && b.value( "type", std::string() ) == "document" ) *out += document_text( b );
 		else if ( b.is_object() && b.contains( "type" ) && b["type"].is_string() ) return fail( err, "unsupported content block type '" + b["type"].get<std::string>() + "' (only text is supported)" );
 		else return fail( err, "malformed content block" );
 	}
@@ -65,6 +73,7 @@ bool tool_content( const json& v, json* out, std::vector<std::string>* images, A
 	for ( const auto& b : v ) {
 		const std::string type = b.is_object() ? b.value( "type", std::string() ) : std::string( b.is_string() ? "text" : "" );
 		if ( type == "text" ) parts.push_back( { { "type", "text" }, { "text", b.is_string() ? b.get<std::string>() : b.value( "text", std::string() ) } } );
+		else if ( type == "document" ) parts.push_back( { { "type", "text" }, { "text", document_text( b ) } } );
 		else if ( type == "image" ) {
 			json part;
 			if ( !image_part( b, &part, images, err ) ) return false;
@@ -125,6 +134,10 @@ bool normalize_messages( const json& j, json* out, std::vector<std::string>* ima
 				const std::string type = b.is_object() ? b.value( "type", std::string() ) : std::string( b.is_string() ? "text" : "" );
 				if ( type == "text" ) {
 					pending += b.is_string() ? b.get<std::string>() : b.value( "text", std::string() );
+					has_pending = true;
+				}
+				else if ( type == "document" ) {
+					pending += document_text( b );
 					has_pending = true;
 				}
 				else if ( type == "image" ) {
