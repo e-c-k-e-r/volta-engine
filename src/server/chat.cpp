@@ -457,8 +457,13 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	g.probe_directions = req.probe_directions;
 	g.probe_keep_norm = req.probe_keep_norm;
 	g.think_penalty = req.think_penalty;
-	if ( in_reasoning && req.thinking_budget > 0 ) {
-		g.reasoning_budget = req.thinking_budget;
+	int budget = req.thinking_budget;
+	if ( budget <= 0 && engine::runtime::options().thinking_budget != 0 ) {
+		const int half = max_tokens / 2;
+		budget = engine::runtime::options().thinking_budget < 0 ? half : std::min( engine::runtime::options().thinking_budget, half > 0 ? half : INT_MAX );
+	}
+	if ( in_reasoning && budget > 0 ) {
+		g.reasoning_budget = budget;
 		g.reasoning_close = gen.tokenizer().encode( family == engine::loader::ModelFamily::GLM ? "</think>" : "\n</think>\n\n", false );
 		g.think_close_id = gen.tokenizer().get_special_token( "</think>" );
 	}
