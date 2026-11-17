@@ -873,6 +873,7 @@ if(ENGINE_GPU)
 		tests/3_bench/bench_h3_gemm.cpp
 		tests/3_bench/h3_text_repeat.cpp
 		tests/3_bench/p2p_check.cpp
+		tests/3_bench/bench_hop.cpp
 		tests/2_parity/test_h3_attn.cpp
 		tests/2_parity/test_h3_audio.cpp
 		tests/2_parity/test_h3_audio_enc.cpp
