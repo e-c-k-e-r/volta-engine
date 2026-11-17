@@ -450,23 +450,42 @@ void SafeTensorsRepo::close() {
 
 namespace {
 
-// An EXL3 checkpoint names its tile order in quantization_config.json ("tile_layout": "volta"; absent = the stock order). The kernels read either,
+// An EXL3 checkpoint names its tile order in quantization_config.json ("tile_layout": "volta"; absent = the stock order), and the weights the
+// quantizer skipped (--skip: they keep the template's order) in "tile_layout_stock", a list of substrings of their names. The kernels read either order,
 // per weight; the other order would decode to noise without any error. Searches the file's text; nothing is parsed.
-bool exl3_volta_tiles( const char* dir ) {
+struct TileLayout {
+	bool volta = false;
+	std::vector<std::string> stock;
+};
+
+TileLayout exl3_tile_layout( const char* dir ) {
+	TileLayout out;
 	char path[1200];
 	std::snprintf( path, sizeof( path ), "%s/quantization_config.json", dir );
 	const int fd = ::open( path, O_RDONLY );
-	if ( fd < 0 ) return false;
+	if ( fd < 0 ) return out;
 	struct stat st;
-	if ( fstat( fd, &st ) != 0 || st.st_size <= 0 ) { ::close( fd ); return false; }
+	if ( fstat( fd, &st ) != 0 || st.st_size <= 0 ) { ::close( fd ); return out; }
 	void* map = mmap( nullptr, static_cast<size_t>( st.st_size ), PROT_READ, MAP_PRIVATE, fd, 0 );
 	::close( fd );
-	if ( map == MAP_FAILED ) return false;
+	if ( map == MAP_FAILED ) return out;
 	const std::string text( static_cast<const char*>( map ), static_cast<size_t>( st.st_size ) );
 	munmap( map, static_cast<size_t>( st.st_size ) );
-	if ( text.find( "\"quant_method\"" ) == std::string::npos || text.find( "\"exl3\"" ) == std::string::npos ) return false;
+	if ( text.find( "\"quant_method\"" ) == std::string::npos || text.find( "\"exl3\"" ) == std::string::npos ) return out;
 	const size_t at = text.find( "\"tile_layout\"" );
-	return at != std::string::npos && text.compare( text.find( '"', text.find( ':', at ) ), 7, "\"volta\"" ) == 0;
+	out.volta = at != std::string::npos && text.compare( text.find( '"', text.find( ':', at ) ), 7, "\"volta\"" ) == 0;
+	const size_t sa = out.volta ? text.find( "\"tile_layout_stock\"" ) : std::string::npos;
+	if ( sa != std::string::npos ) {
+		const size_t open_at = text.find( '[', sa ), close_at = text.find( ']', open_at );
+		for ( size_t p = open_at; p != std::string::npos && close_at != std::string::npos; ) {
+			p = text.find( '"', p + 1 );
+			const size_t q = p == std::string::npos ? p : text.find( '"', p + 1 );
+			if ( q == std::string::npos || q > close_at ) break;
+			out.stock.push_back( text.substr( p + 1, q - p - 1 ) );
+			p = q;
+		}
+	}
+	return out;
 }
 
 } // namespace
@@ -475,7 +494,9 @@ bool SafeTensorsRepo::open( const char* dir_path, bool mmproj ) {
 	close();
 	std::strncpy( dir_path_, dir_path, sizeof( dir_path_ ) - 1 );
 	dir_path_[sizeof( dir_path_ ) - 1] = '\0';
-	volta_tiles_ = !mmproj && exl3_volta_tiles( dir_path );
+	const TileLayout layout = mmproj ? TileLayout() : exl3_tile_layout( dir_path );
+	volta_tiles_ = layout.volta;
+	stock_names_ = layout.stock;
 	ENGINE_ASSERT( !volta_tiles_ || engine::modules::trellis_volta_tiles_supported(),
 		"this EXL3 checkpoint is in the Volta tile order (tile_layout in quantization_config.json), which this build's GPU kernels do not read (SM_70 CUDA, CPU and Vulkan builds do)" );
 

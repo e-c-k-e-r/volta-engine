@@ -315,9 +315,13 @@ public:
 	}
 	// The EXL3 tiles of this checkpoint are in the Volta order (quantization_config.json "tile_layout": "volta"); every trellis weight it loads carries it
 	bool volta_tiles() const { return volta_tiles_; }
-	// The tile order of one weight: the checkpoint's, except for the vision tower (model.visual.*), which the quantizer skips (exl3_quantize.py
-	// --skip model.visual: the tower keeps the template's stock order whatever tile_layout says)
-	bool volta_tiles_for( const char* base_name ) const { return volta_tiles_ && std::strncmp( base_name, "model.visual.", 13 ) != 0; }
+	// The tile order of one weight: the checkpoint's, except for the weights its quantization_config.json lists in "tile_layout_stock" (substrings of their
+	// names: what the quantizer skipped keeps the template's stock order, e.g. the vision tower)
+	bool volta_tiles_for( const char* base_name ) const {
+		if ( !volta_tiles_ ) return false;
+		for ( const std::string& s : stock_names_ ) if ( std::strstr( base_name, s.c_str() ) != nullptr ) return false;
+		return true;
+	}
 
 private:
 	// A GGUF block tensor as a LinearWeight: the given row ranges, and of each row the given column ranges (whole blocks), the column order
@@ -332,6 +336,7 @@ private:
 	int num_shards_ = 0;
 	char dir_path_[1024];
 	bool volta_tiles_ = false;
+	std::vector<std::string> stock_names_;   // tile_layout_stock
 
 	pod::LinearWeight tiles( pod::LinearWeight lw, const char* base_name ) const {
 		lw.volta_tiles = volta_tiles_for( base_name );

@@ -137,6 +137,18 @@ def hessian_path(hmap, name):
     return None
 
 
+def layout_cfg(qcfg, a):
+    """The tile order entries of the output's quantization_config.json: the order of the quantized tensors, and, when a stock template's tensors are
+    skipped (--skip: they keep the template's version), their names as "tile_layout_stock" so the loader reads those in the stock order."""
+    if a.order != "volta":
+        return {}
+    out = {"tile_layout": "volta"}
+    skips = [x for x in a.skip.split(",") if x]
+    if skips and qcfg.get("tile_layout") != "volta":
+        out["tile_layout_stock"] = skips
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
@@ -275,7 +287,7 @@ def main():
 
     if not os.path.exists(qpath) and not a.plan and not a.helper:
         os.makedirs(a.out, exist_ok=True)
-        json.dump(dict(qcfg, **({"tile_layout": "volta"} if a.order == "volta" else {})), open(os.path.join(a.out, "quantization_config.json"), "w"), indent=4)
+        json.dump(dict(qcfg, **layout_cfg(qcfg, a)), open(os.path.join(a.out, "quantization_config.json"), "w"), indent=4)
     for fn in sorted(os.listdir(a.template)):
         p = os.path.join(a.template, fn)
         if a.helper and fn != a.helper: continue
@@ -287,7 +299,7 @@ def main():
             if os.path.isfile(p) and fn != "model.safetensors.index.json" or fn == "model.safetensors.index.json":
                 if fn == "quantization_config.json":
                     cfg = json.load(open(p))
-                    if a.order == "volta": cfg["tile_layout"] = "volta"
+                    cfg.update(layout_cfg(cfg, a))
                     json.dump(cfg, open(os.path.join(a.out, fn), "w"), indent=4)
                 else:
                     srcp = os.path.join(a.src, fn)
