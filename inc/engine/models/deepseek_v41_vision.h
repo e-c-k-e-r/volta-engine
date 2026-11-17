@@ -3,6 +3,8 @@
 #include "engine/core/arena.h"
 #include "engine/core/tensor.h"
 #include "engine/models/vision_tower.h"
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace engine::models {
@@ -24,6 +26,11 @@ struct DeepseekV41VisionConfig {
 	// tensor-core GEMM needs; the zero columns add nothing
 	int patch_cols() const { return ( patch_dim() + 7 ) / 8 * 8; }
 };
+
+// The tower's geometry and the image processor settings from the checkpoint's config.json vision_config, for images of up to max_image_tokens
+// tokens (the checkpoint's own limit applies too, *max_tokens); out_hidden is the aligner's width, which the caller reads from its tensors. False
+// without a usable vision_config. Shared by the GPU tower and the host one (host_vision.h)
+bool dsv41_vision_config( const char* model_dir, int max_image_tokens, DeepseekV41VisionConfig* cfg, engine::loader::VisionParams* params, int* max_tokens );
 
 // The DeepSeek-V4.1 image encoder (inference/vision.py): a patch projection, RMSNorm + SwiGLU ViT blocks over the whole image with a fused
 // qkv projection and 2-D rotary (half the rotated pairs by the row, half by the column), a final norm, then the aligner: downsample x downsample
@@ -77,5 +84,8 @@ private:
 	backend::half_t* d_al1_ = nullptr;
 	backend::half_t* d_out_ = nullptr;
 };
+
+// The tower on the host CPU (host_vision.h): the checkpoint's EXL3 projections decoded once into FP16, or the dense weights of the model's vision projector GGUF
+std::unique_ptr<VisionTower> make_host_dsv41_tower( const char* model_dir, const char* mmproj_dir, int max_tokens, const std::vector<int>& cpus, std::string* error );
 
 } // namespace engine::models

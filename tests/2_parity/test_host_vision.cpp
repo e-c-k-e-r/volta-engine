@@ -1,10 +1,11 @@
-// The GLM-5 vision tower on the host CPU (vision_cpu) against the engine's own tower on the device backend, on one image:
+// The GLM-5 or DeepSeek-V4.1 vision tower on the host CPU (vision_cpu) against the engine's own tower on the device backend, on one image:
 //   test_host_vision <model dir> <image> [max_tokens (576)] [cpus (default plan)] [mmproj dir]
 // Both encode the same prepared image; the rows are compared by cosine and the two encode times are printed. The host tower decodes the EXL3
 // weights to FP16 once and multiplies densely, the device tower runs the fused kernels, so the rows agree up to FP16 rounding order. With an mmproj
 // directory a second host tower takes the original BF16 weights from the vision projector GGUF: its rows are compared with the EXL3 tower's
 // (they differ by the quantization of the tower, not by arithmetic).
 #include "engine/models/glm5_vision.h"
+#include "engine/models/deepseek_v41_vision.h"
 #include "engine/models/host_vision.h"
 #include "engine/loader/image.h"
 #include "engine/runtime/cpu_expert_attach.h"
@@ -54,8 +55,18 @@ int main( int argc, char** argv ) {
 	pod::MemoryArena arena;
 	engine::core::arena_create( arena, 0, 3ULL << 30 );
 	auto stream = backend::stream_create();
-	models::Glm5VisionTower device;
-	if ( !device.load( model.c_str(), arena, max_tokens * 4, stream ) ) { std::printf( "test_host_vision: FAIL (device tower load)\n" ); return 1; }
+	// DeepSeek or GLM, by the checkpoint's architecture
+	bool ds = false;
+	{
+		std::ifstream cf( model + "/config.json" );
+		const std::string text( ( std::istreambuf_iterator<char>( cf ) ), std::istreambuf_iterator<char>() );
+		ds = text.find( "DeepseekV41" ) != std::string::npos || text.find( "deepseek_v41" ) != std::string::npos;
+	}
+	models::Glm5VisionTower glm_tower;
+	models::DeepseekV41VisionTower ds_tower;
+	models::VisionTower& device = ds ? static_cast<models::VisionTower&>( ds_tower ) : static_cast<models::VisionTower&>( glm_tower );
+	const bool loaded = ds ? ds_tower.load( model.c_str(), arena, max_tokens, stream ) : glm_tower.load( model.c_str(), arena, max_tokens * 4, stream );
+	if ( !loaded ) { std::printf( "test_host_vision: FAIL (device tower load)\n" ); return 1; }
 
 	std::string err;
 	auto host = models::make_host_vision_tower( model.c_str(), "", max_tokens, cpus, &err );
@@ -65,7 +76,7 @@ int main( int argc, char** argv ) {
 	if ( !loader::decode_image( png.data(), png.size(), &dec, &err ) ) { std::printf( "test_host_vision: FAIL (decode: %s)\n", err.c_str() ); return 1; }
 	loader::PreparedImage img;
 	if ( !loader::prepare_image( dec, device.params(), &img, &err ) ) { std::printf( "test_host_vision: FAIL (prepare: %s)\n", err.c_str() ); return 1; }
-	std::printf( "image %dx%d -> %dx%d patches (%d tokens)\n", dec.width, dec.height, img.grid_h, img.grid_w, img.num_patches() / 4 );
+	std::printf( "image %dx%d -> %dx%d patches (%d tokens)\n", dec.width, dec.height, img.grid_h, img.grid_w, ds ? img.span_tokens() : img.num_patches() / 4 );
 
 	std::vector<backend::half_t> a, b, b2;
 	auto t0 = std::chrono::steady_clock::now();
@@ -79,7 +90,7 @@ int main( int argc, char** argv ) {
 	const double t_host2 = seconds( t0 );
 	if ( a.size() != b.size() || a.empty() ) { std::printf( "test_host_vision: FAIL (sizes %zu vs %zu)\n", a.size(), b.size() ); return 1; }
 
-	const int tokens = img.num_patches() / 4, hidden = static_cast<int>( a.size() / tokens );
+	const int hidden = ds ? 5120 : 4096, tokens = static_cast<int>( a.size() / hidden );
 	// row cosines of two outputs: minimum, mean, largest |difference|
 	auto compare = [&]( const std::vector<backend::half_t>& u, const std::vector<backend::half_t>& v, double* min_cos, double* mean_cos, double* max_abs ) {
 		*min_cos = 1.0;
@@ -117,7 +128,7 @@ int main( int argc, char** argv ) {
 			nv[t] = std::sqrt( nb );
 		}
 		std::sort( cs.begin(), cs.end() );
-		const int w = img.grid_w / 2;
+		const int w = ds ? img.llm_w + 1 : img.grid_w / 2;   // tokens per row of the span (DeepSeek: with the newline)
 		std::printf( "lowest rows, %s:", what );
 		for ( int i = 0; i < 6 && i < tokens; ++i ) std::printf( "  (%d,%d) cos %.3f norms %.1f/%.1f", cs[i].second / w, cs[i].second % w, cs[i].first, nu[cs[i].second], nv[cs[i].second] );
 		std::printf( "\n" );

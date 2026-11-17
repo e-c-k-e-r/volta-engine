@@ -15,6 +15,12 @@
 #include <cmath>
 #include <fstream>
 #include <iterator>
+#include "host_vision_ops.h"
+#include "engine/kernels/cpu/cpu_util.h"
+#include <chrono>
+#include <mutex>
+#include <memory>
+#include <string>
 
 namespace engine::models {
 
@@ -67,29 +73,38 @@ size_t DeepseekV41VisionTower::arena_bytes( const char* model_dir, int max_image
 	return bytes;
 }
 
-bool DeepseekV41VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int max_image_tokens, backend::stream_t stream ) {
+bool dsv41_vision_config( const char* model_dir, int max_image_tokens, DeepseekV41VisionConfig* out_cfg, engine::loader::VisionParams* out_params, int* out_max_tokens ) {
+	DeepseekV41VisionConfig cfg;
+	engine::loader::VisionParams params;
 	const nlohmann::json cfg_json = read_json( std::string( model_dir ) + "/config.json" );
 	if ( cfg_json.is_discarded() || !cfg_json.contains( "vision_config" ) ) return false;
 	const auto& vc = cfg_json["vision_config"];
-	cfg_.depth = vc.value( "num_hidden_layers", cfg_.depth );
-	cfg_.hidden = vc.value( "hidden_size", cfg_.hidden );
-	cfg_.heads = vc.value( "num_attention_heads", cfg_.heads );
-	cfg_.intermediate = vc.value( "intermediate_size", cfg_.intermediate );
-	cfg_.patch_size = vc.value( "patch_size", cfg_.patch_size );
-	cfg_.downsample = vc.value( "downsample_ratio", cfg_.downsample );
-	cfg_.rope_theta = vc.value( "rope_theta", cfg_.rope_theta );
-	if ( cfg_.head_dim() != 64 ) {
-		LOG_WARN( "[vision] unsupported DeepSeek vision geometry (head_dim %d)\n", cfg_.head_dim() );
+	cfg.depth = vc.value( "num_hidden_layers", cfg.depth );
+	cfg.hidden = vc.value( "hidden_size", cfg.hidden );
+	cfg.heads = vc.value( "num_attention_heads", cfg.heads );
+	cfg.intermediate = vc.value( "intermediate_size", cfg.intermediate );
+	cfg.patch_size = vc.value( "patch_size", cfg.patch_size );
+	cfg.downsample = vc.value( "downsample_ratio", cfg.downsample );
+	cfg.rope_theta = vc.value( "rope_theta", cfg.rope_theta );
+	if ( cfg.head_dim() != 64 ) {
+		LOG_WARN( "[vision] unsupported DeepSeek vision geometry (head_dim %d)\n", cfg.head_dim() );
 		return false;
 	}
-	max_tokens_ = std::min( max_image_tokens, vc.value( "max_image_tokens", max_image_tokens ) );
-	max_patches_ = max_tokens_ * cfg_.downsample * cfg_.downsample;
+	const int max_tokens = std::min( max_image_tokens, vc.value( "max_image_tokens", max_image_tokens ) );
+	params.deepseek = true;
+	params.patch_size = cfg.patch_size;
+	params.downsample = cfg.downsample;
+	params.max_tokens = max_tokens;
+	params.min_pixels = vc.value( "min_pixels", 544 * 544 );
+	*out_cfg = cfg;
+	*out_params = params;
+	*out_max_tokens = max_tokens;
+	return true;
+}
 
-	params_.deepseek = true;
-	params_.patch_size = cfg_.patch_size;
-	params_.downsample = cfg_.downsample;
-	params_.max_tokens = max_tokens_;
-	params_.min_pixels = vc.value( "min_pixels", 544 * 544 );
+bool DeepseekV41VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int max_image_tokens, backend::stream_t stream ) {
+	if ( !dsv41_vision_config( model_dir, max_image_tokens, &cfg_, &params_, &max_tokens_ ) ) return false;
+	max_patches_ = max_tokens_ * cfg_.downsample * cfg_.downsample;
 
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) return false;
@@ -318,6 +333,293 @@ bool DeepseekV41VisionTower::encode( const engine::loader::PreparedImage& img, s
 	}
 	out->insert( out->end(), end_.begin(), end_.end() );
 	return true;
+}
+
+
+// ---- the same tower on the host CPU (vision_cpu, host_vision.h): the arithmetic of encode() above over decoded panels or dense weights ----
+
+
+namespace {
+
+namespace cpu = engine::kernels::cpu;
+using namespace hv;
+
+class HostDsv41Tower : public VisionTower {
+public:
+	bool load( const char* model_dir, const char* mmproj_dir, int max_tokens, const std::vector<int>& cpus, std::string* error );
+	bool loaded() const override { return loaded_; }
+	const engine::loader::VisionParams& params() const override { return params_; }
+	bool encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, backend::stream_t stream ) override;
+
+private:
+	struct Block {
+		std::vector<float> norm1_w, norm2_w, q_b, k_b, v_b, wo_b;
+		Lin q, k, v, wo, gate, up, down;
+	};
+
+	bool loaded_ = false;
+	DeepseekV41VisionConfig cfg_;
+	engine::loader::VisionParams params_;
+	int max_patches_ = 0, max_tokens_ = 0;
+	std::unique_ptr<Par> par_;
+	std::mutex mtx_;
+	Scratch scratch_;
+	std::vector<Block> blocks_;
+	Dense patch_w_;
+	std::vector<float> patch_b_, norm_w_, al_b1_, al_b2_;
+	Lin al1_, al2_;
+	std::vector<uint16_t> start_, end_, newline_;   // the delimiter embeddings of an image span
+	std::vector<float> hidden_;
+	std::vector<uint16_t> ln_, q_, k_, v_, attn_, tmp_, gate_, up_, mlp_, cat_, al_;
+};
+
+bool HostDsv41Tower::load( const char* model_dir, const char* mmproj_dir, int max_tokens, const std::vector<int>& cpus, std::string* error ) {
+	const auto t0 = std::chrono::steady_clock::now();
+	if ( !dsv41_vision_config( model_dir, max_tokens, &cfg_, &params_, &max_tokens_ ) ) {
+		*error = "the checkpoint has no usable DeepSeek vision_config";
+		return false;
+	}
+	max_patches_ = max_tokens_ * cfg_.downsample * cfg_.downsample;
+	par_ = std::make_unique<Par>( cpus );
+	Par::Pin pin( *par_ );
+	engine::loader::SafeTensorsRepo repo;
+	const bool from_mmproj = mmproj_dir != nullptr && mmproj_dir[0] != '\0';
+	if ( !repo.open( from_mmproj ? mmproj_dir : model_dir, from_mmproj ) ) {
+		*error = std::string( "cannot open the " ) + ( from_mmproj ? "vision projector in " : "checkpoint " ) + ( from_mmproj ? mmproj_dir : model_dir );
+		return false;
+	}
+	std::string err;
+	const int H = cfg_.hidden;
+	auto vec = [&]( const std::string& name ) { return load_vec( repo, name, &err ); };
+	std::vector<LinSource> sources;
+	std::vector<Lin*> targets;
+	auto want = [&]( const std::string& name, Lin* dst ) {
+		LinSource s;
+		if ( !find_lin( repo, name, &s, &err ) ) return false;
+		sources.push_back( s );
+		targets.push_back( dst );
+		return true;
+	};
+
+	{
+		const std::vector<uint16_t> w = load_f16( repo, "vision.patch_embed.proj.weight", &err );
+		if ( w.size() != static_cast<size_t>( H ) * cfg_.patch_dim() || H % 16 != 0 ) {
+			*error = "vision: patch embedding shape " + err;
+			return false;
+		}
+		patch_w_ = pack_nk( w.data(), H, cfg_.patch_dim() );
+	}
+	patch_b_ = vec( "vision.patch_embed.proj.bias" );
+	norm_w_ = vec( "vision.norm.weight" );
+	blocks_.resize( cfg_.depth );
+	for ( int i = 0; i < cfg_.depth; ++i ) {
+		const std::string p = "vision.blocks." + std::to_string( i ) + ".";
+		Block& b = blocks_[i];
+		b.norm1_w = vec( p + "norm1.weight" );
+		b.norm2_w = vec( p + "norm2.weight" );
+		b.wo_b = vec( p + "attn.wo.bias" );
+		// the biases of q / k / v: separate in the EXL3 checkpoint, fused in the BF16 tensors and in a vision projector GGUF
+		if ( repo.find( ( p + "attn.q_proj.bias" ).c_str() ) ) {
+			b.q_b = vec( p + "attn.q_proj.bias" );
+			b.k_b = vec( p + "attn.k_proj.bias" );
+			b.v_b = vec( p + "attn.v_proj.bias" );
+		}
+		else {
+			const std::vector<float> qkv = vec( repo.find( ( p + "attn.qkv.bias" ).c_str() ) ? p + "attn.qkv.bias" : p + "attn.wqkv.bias" );
+			if ( qkv.size() == static_cast<size_t>( 3 ) * H ) {
+				b.q_b.assign( qkv.begin(), qkv.begin() + H );
+				b.k_b.assign( qkv.begin() + H, qkv.begin() + 2 * H );
+				b.v_b.assign( qkv.begin() + 2 * H, qkv.end() );
+			}
+			else err += " (no q / k / v bias)";
+		}
+		if ( !want( p + "attn.q_proj", &b.q ) || !want( p + "attn.k_proj", &b.k ) || !want( p + "attn.v_proj", &b.v ) || !want( p + "attn.wo", &b.wo ) ||
+		     !want( p + "mlp.gate_proj", &b.gate ) || !want( p + "mlp.up_proj", &b.up ) || !want( p + "mlp.w2", &b.down ) ) {
+			*error = err;
+			return false;
+		}
+	}
+	al_b1_ = vec( "aligner.w1.bias" );
+	al_b2_ = vec( "aligner.w2.bias" );
+	start_ = load_f16( repo, "image_start", &err );
+	end_ = load_f16( repo, "image_end", &err );
+	newline_ = load_f16( repo, "image_newline", &err );
+	if ( !want( "aligner.w1", &al1_ ) || !want( "aligner.w2", &al2_ ) || !err.empty() ) {
+		*error = err;
+		return false;
+	}
+	decode_all( *par_, sources, targets );
+	repo.close();
+	cfg_.out_hidden = al2_.d.n;
+	if ( static_cast<int>( start_.size() ) != cfg_.out_hidden || end_.size() != start_.size() || newline_.size() != start_.size() || al1_.d.k != H * cfg_.downsample * cfg_.downsample ) {
+		*error = "vision: the aligner or the delimiter embeddings do not fit the tower";
+		return false;
+	}
+
+	size_t bytes = patch_w_.w.size() * 2 + ( al1_.d.w.size() + al2_.d.w.size() ) * 2;
+	for ( const Block& b : blocks_ ) bytes += ( b.q.d.w.size() + b.k.d.w.size() + b.v.d.w.size() + b.wo.d.w.size() + b.gate.d.w.size() + b.up.d.w.size() + b.down.d.w.size() ) * 2;
+	loaded_ = true;
+	LOG_INFO( "[vision] DeepSeek tower on the host CPU: %d blocks, up to %d patches (%d tokens), %.2f GiB of decoded weights, %d threads, loaded in %.1f s\n", cfg_.depth,
+		max_patches_, max_tokens_, bytes / 1073741824.0, par_->threads(), std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() );
+	return true;
+}
+
+bool HostDsv41Tower::encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, backend::stream_t ) {
+	if ( !loaded_ ) return false;
+	const int m = img.num_patches();
+	const int R = cfg_.downsample, tokens = img.llm_h * img.llm_w;
+	if ( m < 1 || m > max_patches_ || img.llm_h < 1 || img.llm_w < 1 || img.span_tokens() > max_tokens_ ) {
+		LOG_WARN( "[vision] image has %d patches and %d tokens, limits are %d and %d\n", m, img.span_tokens(), max_patches_, max_tokens_ );
+		return false;
+	}
+	std::lock_guard<std::mutex> lock( mtx_ );
+	Par& par = *par_;
+	Par::Pin pin( par );
+	const auto t0 = std::chrono::steady_clock::now();
+	const int H = cfg_.hidden, I = cfg_.intermediate, O = cfg_.out_hidden, hd = cfg_.head_dim(), P = cfg_.patch_dim(), half = hd / 2;
+	auto fit = []( auto& v, size_t n ) { if ( v.size() < n ) v.resize( n ); };
+	const size_t mh = static_cast<size_t>( m ) * H, mi = static_cast<size_t>( m ) * I;
+	fit( hidden_, mh );
+	for ( auto* v : { &ln_, &q_, &k_, &v_, &attn_, &tmp_ } ) fit( *v, mh );
+	for ( auto* v : { &gate_, &up_, &mlp_ } ) fit( *v, mi );
+
+	// 2-D rotary of the raster grid: the first 16 of the 32 frequencies turn with the row, the last 16 with the column; both halves of the 64-wide
+	// head use the same 32 (rotate_half pairs channel i with i + 32)
+	std::vector<float> cs( static_cast<size_t>( m ) * hd ), sn( static_cast<size_t>( m ) * hd );
+	{
+		const int quarter = hd / 4;
+		for ( int y = 0; y < img.grid_h; ++y )
+			for ( int x = 0; x < img.grid_w; ++x ) {
+				const size_t row = static_cast<size_t>( y ) * img.grid_w + x;
+				for ( int j = 0; j < 2 * quarter; ++j ) {
+					const int f = j % quarter;
+					const double inv = 1.0 / std::pow( static_cast<double>( cfg_.rope_theta ), 2.0 * f / half );
+					const double a = ( j < quarter ? y : x ) * inv;
+					cs[row * hd + j] = cs[row * hd + j + half] = static_cast<float>( std::cos( a ) );
+					sn[row * hd + j] = sn[row * hd + j + half] = static_cast<float>( std::sin( a ) );
+				}
+			}
+	}
+
+	// Patch embedding: the patches narrowed to FP16, times the kernel, plus its bias; the residual stream stays FP32
+	fit( scratch_.xin, static_cast<size_t>( m ) * P );
+	fit( scratch_.raw, mh );
+	par.run( m, 16, [&]( int64_t r0, int64_t r1 ) {
+		thread_local std::vector<uint16_t> h;
+		h.resize( P );
+		for ( int64_t r = r0; r < r1; ++r ) {
+			cpu::float_to_half( img.patches.data() + static_cast<size_t>( r ) * P, h.data(), P );
+			cpu::half_to_float( h.data(), scratch_.xin.data() + static_cast<size_t>( r ) * P, P );
+		}
+	} );
+	gemm( par, scratch_.xin.data(), m, patch_w_, scratch_.raw.data() );
+	par.run( m, 16, [&]( int64_t r0, int64_t r1 ) {
+		for ( int64_t r = r0; r < r1; ++r )
+			for ( int c = 0; c < H; ++c ) hidden_[static_cast<size_t>( r ) * H + c] = scratch_.raw[static_cast<size_t>( r ) * H + c] + patch_b_[c];
+	} );
+
+	const float scale = 1.0f / std::sqrt( static_cast<float>( hd ) );
+	for ( const Block& b : blocks_ ) {
+		rms_norm( par, hidden_.data(), b.norm1_w.data(), ln_.data(), m, H, cfg_.eps );
+		forward( par, scratch_, b.q, ln_.data(), m, q_.data() );
+		forward( par, scratch_, b.k, ln_.data(), m, k_.data() );
+		forward( par, scratch_, b.v, ln_.data(), m, v_.data() );
+		// bias and the 2-D rotary on q and k (rotate_half: channel d pairs with d + 32 inside every head), bias only on v
+		par.run( m, 4, [&]( int64_t r0, int64_t r1 ) {
+			thread_local std::vector<float> t;
+			t.resize( H );
+			for ( int64_t row = r0; row < r1; ++row ) {
+				const float* c = cs.data() + static_cast<size_t>( row ) * hd;
+				const float* s = sn.data() + static_cast<size_t>( row ) * hd;
+				for ( int which = 0; which < 3; ++which ) {
+					uint16_t* p = ( which == 0 ? q_.data() : which == 1 ? k_.data() : v_.data() ) + static_cast<size_t>( row ) * H;
+					const float* bias = which == 0 ? b.q_b.data() : which == 1 ? b.k_b.data() : b.v_b.data();
+					cpu::half_to_float( p, t.data(), H );
+					for ( int i = 0; i < H; ++i ) t[i] += bias[i];
+					if ( which < 2 ) {
+						for ( int head = 0; head < cfg_.heads; ++head ) {
+							float* th = t.data() + head * hd;
+							for ( int d = 0; d < half; ++d ) {
+								const float a = th[d], bb = th[d + half];
+								th[d] = a * c[d] - bb * s[d];
+								th[d + half] = bb * c[d + half] + a * s[d + half];
+							}
+						}
+					}
+					cpu::float_to_half( t.data(), p, H );
+				}
+			}
+		} );
+		attention( par, scratch_, q_.data(), k_.data(), v_.data(), attn_.data(), m, cfg_.heads, scale );
+		forward( par, scratch_, b.wo, attn_.data(), m, tmp_.data() );
+		bias_residual( par, hidden_.data(), tmp_.data(), b.wo_b.data(), m, H );
+
+		rms_norm( par, hidden_.data(), b.norm2_w.data(), ln_.data(), m, H, cfg_.eps );
+		forward( par, scratch_, b.gate, ln_.data(), m, gate_.data() );
+		forward( par, scratch_, b.up, ln_.data(), m, up_.data() );
+		swiglu( par, gate_.data(), up_.data(), mlp_.data(), static_cast<int64_t>( m ) * I, 0.0f );
+		forward( par, scratch_, b.down, mlp_.data(), m, tmp_.data() );
+		// no bias on the down projection
+		par.run( m, 8, [&]( int64_t r0, int64_t r1 ) {
+			thread_local std::vector<float> t;
+			t.resize( H );
+			for ( int64_t r = r0; r < r1; ++r ) {
+				cpu::half_to_float( tmp_.data() + static_cast<size_t>( r ) * H, t.data(), H );
+				float* h = hidden_.data() + static_cast<size_t>( r ) * H;
+				for ( int i = 0; i < H; ++i ) h[i] += t[i];
+			}
+		} );
+	}
+	rms_norm( par, hidden_.data(), norm_w_.data(), ln_.data(), m, H, cfg_.eps );
+
+	// The aligner's R x R unfold (F.unfold on the zero-padded grid, kernel and stride R): token (ty, tx) takes channel c of patch (ty * R + ky, tx * R + kx)
+	// at column c * R * R + ky * R + kx
+	const int K = H * R * R;
+	fit( cat_, static_cast<size_t>( tokens ) * K );
+	fit( al_, static_cast<size_t>( tokens ) * O );
+	std::fill( cat_.begin(), cat_.begin() + static_cast<size_t>( tokens ) * K, static_cast<uint16_t>( 0 ) );
+	par.run( tokens, 4, [&]( int64_t t0r, int64_t t1r ) {
+		for ( int64_t tk = t0r; tk < t1r; ++tk ) {
+			const int ty = static_cast<int>( tk / img.llm_w ), tx = static_cast<int>( tk % img.llm_w );
+			uint16_t* dst = cat_.data() + static_cast<size_t>( tk ) * K;
+			for ( int ky = 0; ky < R; ++ky )
+				for ( int kx = 0; kx < R; ++kx ) {
+					const int y = ty * R + ky, x = tx * R + kx;
+					if ( y >= img.grid_h || x >= img.grid_w ) continue;
+					const uint16_t* src = ln_.data() + ( static_cast<size_t>( y ) * img.grid_w + x ) * H;
+					for ( int c = 0; c < H; ++c ) dst[static_cast<size_t>( c ) * R * R + ky * R + kx] = src[c];
+				}
+		}
+	} );
+	forward( par, scratch_, al1_, cat_.data(), tokens, al_.data() );
+	gelu_erf( par, al_.data(), al_b1_.data(), tokens, O );
+	std::vector<uint16_t> rows( static_cast<size_t>( tokens ) * O );
+	forward( par, scratch_, al2_, al_.data(), tokens, rows.data() );
+	add_bias( par, rows.data(), al_b2_.data(), tokens, O );
+
+	// [start] ([image] * llm_w + [newline]) * llm_h [end]
+	const size_t span = static_cast<size_t>( img.span_tokens() );
+	out->resize( span * O );
+	uint16_t* o = reinterpret_cast<uint16_t*>( out->data() );
+	std::memcpy( o, start_.data(), static_cast<size_t>( O ) * sizeof( uint16_t ) );
+	o += O;
+	for ( int ty = 0; ty < img.llm_h; ++ty ) {
+		std::memcpy( o, rows.data() + static_cast<size_t>( ty ) * img.llm_w * O, static_cast<size_t>( img.llm_w ) * O * sizeof( uint16_t ) );
+		o += static_cast<size_t>( img.llm_w ) * O;
+		std::memcpy( o, newline_.data(), static_cast<size_t>( O ) * sizeof( uint16_t ) );
+		o += O;
+	}
+	std::memcpy( o, end_.data(), static_cast<size_t>( O ) * sizeof( uint16_t ) );
+	LOG_INFO( "[vision] host encode: %d patches in %.1f s\n", m, std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() );
+	return true;
+}
+
+} // namespace
+
+std::unique_ptr<VisionTower> make_host_dsv41_tower( const char* model_dir, const char* mmproj_dir, int max_tokens, const std::vector<int>& cpus, std::string* error ) {
+	auto t = std::make_unique<HostDsv41Tower>();
+	if ( !t->load( model_dir, mmproj_dir, max_tokens, cpus, error ) ) return nullptr;
+	return t;
 }
 
 } // namespace engine::models

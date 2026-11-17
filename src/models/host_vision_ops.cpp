@@ -302,6 +302,13 @@ std::vector<uint16_t> load_f16( const engine::loader::SafeTensorsRepo& repo, con
 	return h;
 }
 
+std::vector<float> load_vec( const engine::loader::SafeTensorsRepo& repo, const std::string& name, std::string* error ) {
+	const std::vector<uint16_t> h = load_f16( repo, name, error );
+	std::vector<float> f( h.size() );
+	cpu::half_to_float( h.data(), f.data(), h.size() );
+	return f;
+}
+
 // ---- row-wise operators ----
 
 void rms_norm( Par& par, const float* x, const float* w, uint16_t* out, int m, int n, float eps ) {
@@ -363,14 +370,17 @@ void add_bias( Par& par, uint16_t* x, const float* bias, int m, int n ) {
 	} );
 }
 
-void gelu_erf( Par& par, uint16_t* x, int m, int n ) {
+void gelu_erf( Par& par, uint16_t* x, const float* bias, int m, int n ) {
 	par.run( m, 8, [&]( int64_t r0, int64_t r1 ) {
 		thread_local std::vector<float> t;
 		t.resize( n );
 		for ( int64_t r = r0; r < r1; ++r ) {
 			uint16_t* row = x + static_cast<size_t>( r ) * n;
 			cpu::half_to_float( row, t.data(), n );
-			for ( int i = 0; i < n; ++i ) t[i] = 0.5f * t[i] * ( 1.0f + std::erf( t[i] * 0.7071067811865476f ) );
+			for ( int i = 0; i < n; ++i ) {
+				const float v = bias ? t[i] + bias[i] : t[i];
+				t[i] = 0.5f * v * ( 1.0f + std::erf( v * 0.7071067811865476f ) );
+			}
 			cpu::float_to_half( t.data(), row, n );
 		}
 	} );

@@ -103,6 +103,8 @@ void forward( Par& par, Scratch& s, const Lin& lin, const uint16_t* x, int m, ui
 
 // A checkpoint vector as FP32 (FP16, BF16 or FP32 on disk); empty with *error set when absent
 std::vector<float> load_f32( const engine::loader::SafeTensorsRepo& repo, const std::string& name, std::string* error );
+// A norm weight or bias as the device towers hold it: rounded to FP16 (BF16 and FP32 checkpoints convert), then as FP32
+std::vector<float> load_vec( const engine::loader::SafeTensorsRepo& repo, const std::string& name, std::string* error );
 // The same as FP16 bits
 std::vector<uint16_t> load_f16( const engine::loader::SafeTensorsRepo& repo, const std::string& name, std::string* error );
 
@@ -114,17 +116,11 @@ void layer_norm( Par& par, const uint16_t* x, const float* w, const float* b, ui
 void bias_residual( Par& par, float* hidden, const uint16_t* y, const float* bias, int m, int n );
 // x = round( x + bias ), bias null: x unchanged
 void add_bias( Par& par, uint16_t* x, const float* bias, int m, int n );
-void gelu_erf( Par& par, uint16_t* x, int m, int n );
+// x = round( gelu_erf( x + bias ) ), bias null: none
+void gelu_erf( Par& par, uint16_t* x, const float* bias, int m, int n );
 // out = silu( min( gate, limit ) ) * clamp( up, -limit, limit ) (limit <= 0: plain silu( gate ) * up)
 void swiglu( Par& par, const uint16_t* gate, const uint16_t* up, uint16_t* out, int64_t count, float limit );
 // Bidirectional attention over all m rows: q, k, v, out [m][heads * 64] FP16; scratch floats of the three inputs are kept in `s`
 void attention( Par& par, Scratch& s, const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* out, int m, int heads, float scale );
 
 } // namespace engine::models::hv
-
-namespace engine::models {
-
-// The host tower of one architecture (host_vision.cpp picks it); nullptr with *error set when it cannot be loaded
-std::unique_ptr<VisionTower> make_host_glm5_tower( const char* model_dir, const char* mmproj_dir, int max_tokens, const std::vector<int>& cpus, std::string* error );
-
-} // namespace engine::models

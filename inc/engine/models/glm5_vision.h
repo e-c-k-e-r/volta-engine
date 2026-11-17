@@ -4,6 +4,8 @@
 #include "engine/core/tensor.h"
 #include "engine/modules/linear.h"
 #include "engine/models/vision_tower.h"
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace engine::models {
@@ -76,5 +78,8 @@ private:
 	backend::half_t* d_mmlp_ = nullptr;
 	backend::half_t* d_out_ = nullptr;
 };
+
+// The tower on the host CPU (host_vision.h): the checkpoint's EXL3 projections decoded once into FP16, or the dense weights of the model's vision projector GGUF
+std::unique_ptr<VisionTower> make_host_glm5_tower( const char* model_dir, const char* mmproj_dir, int max_tokens, const std::vector<int>& cpus, std::string* error );
 
 } // namespace engine::models

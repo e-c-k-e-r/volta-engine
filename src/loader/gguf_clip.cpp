@@ -1,5 +1,6 @@
 // GGUF architecture clip (llama.cpp's mmproj files) for the projector types gemma4v (Gemma 4's vision tower and embedding projection under the
-// Hugging Face names Gemma4VisionTower loads) and glm5v (GLM-5's tower and merger under the checkpoint's model.visual.* names). The converter keeps every tensor as it is (norms F32, projections BF16) except the
+// Hugging Face names Gemma4VisionTower loads), glm5v (GLM-5's tower and merger under the checkpoint's model.visual.* names) and deepseek41v
+// (DeepSeek-V4.1's tower, aligner and delimiter embeddings under the checkpoint's vision.* / aligner.* names). The converter keeps every tensor as it is (norms F32, projections BF16) except the
 // patch embedding, which it stores as a conv kernel [n, channel, y, x]: the PatchChwToHwc transform restores [n, y * x * channel].
 #include "gguf_arch.h"
 #include <cstdio>
@@ -111,6 +112,60 @@ void map_glm5v( const GgufArch&, const GgufKv& kv, const std::string& g, std::ve
 	}
 }
 
+// DeepSeek-V4.1 (deepseek41v): the tower as the checkpoint has it: a fused qkv (weight cut into q / k / v row ranges, the fused bias kept and sliced by
+// the tower), the attention output with its bias, the gate / up / down projections without biases, the aligner's two linears (mm.1, mm.2) and the
+// three delimiter embeddings of an image span
+const Name kDsBlock[] = {
+	{ "ln1.weight", "norm1.weight" },
+	{ "ln2.weight", "norm2.weight" },
+	{ "attn_qkv.bias", "attn.qkv.bias" },
+	{ "attn_out.weight", "attn.wo.weight" },
+	{ "attn_out.bias", "attn.wo.bias" },
+	{ "ffn_gate.weight", "mlp.gate_proj.weight" },
+	{ "ffn_up.weight", "mlp.up_proj.weight" },
+	{ "ffn_down.weight", "mlp.w2.weight" },
+};
+
+const Name kDsTop[] = {
+	{ "v.patch_embd.weight", "vision.patch_embed.proj.weight" },
+	{ "v.patch_embd.bias", "vision.patch_embed.proj.bias" },
+	{ "v.post_ln.weight", "vision.norm.weight" },
+	{ "mm.1.weight", "aligner.w1.weight" },
+	{ "mm.1.bias", "aligner.w1.bias" },
+	{ "mm.2.weight", "aligner.w2.weight" },
+	{ "mm.2.bias", "aligner.w2.bias" },
+	{ "v.token_embd.img_start", "image_start" },
+	{ "v.token_embd.img_end", "image_end" },
+	{ "v.image_newline", "image_newline" },
+};
+
+void map_deepseek41v( const GgufArch&, const GgufKv& kv, const std::string& g, std::vector<GgufMapped>* out ) {
+	auto emit = [&]( const std::string& name, int64_t row_begin = 0, int64_t rows = -1 ) {
+		GgufMapped m;
+		m.name = name;
+		m.row_begin = row_begin;
+		m.rows = rows;
+		out->push_back( std::move( m ) );
+	};
+	for ( const Name& n : kDsTop ) {
+		if ( g == n.gguf ) { emit( n.hf ); return; }
+	}
+	int layer = -1, used = 0;
+	if ( std::sscanf( g.c_str(), "v.blk.%d.%n", &layer, &used ) != 1 || used == 0 ) return;
+	const std::string rest = g.substr( static_cast<size_t>( used ) ), base = "vision.blocks." + std::to_string( layer ) + ".";
+	if ( rest == "attn_qkv.weight" ) {
+		const int64_t hidden = kv.get( "clip.vision.embedding_length" );
+		if ( hidden <= 0 ) return;
+		emit( base + "attn.q_proj.weight", 0, hidden );
+		emit( base + "attn.k_proj.weight", hidden, hidden );
+		emit( base + "attn.v_proj.weight", 2 * hidden, hidden );
+		return;
+	}
+	for ( const Name& n : kDsBlock ) {
+		if ( rest == n.gguf ) { emit( base + n.hf ); return; }
+	}
+}
+
 } // namespace
 
 bool gguf_arch_clip( const GgufKv& kv, GgufArch* out ) {
@@ -121,6 +176,7 @@ bool gguf_arch_clip( const GgufKv& kv, GgufArch* out ) {
 	}
 	if ( type == "gemma4v" ) out->map = map_gemma4v;
 	else if ( type == "glm5v" ) out->map = map_glm5v;
+	else if ( type == "deepseek41v" ) out->map = map_deepseek41v;
 	else return false;
 	return true;
 }

@@ -147,7 +147,6 @@ set(ENGINE_HOST_SOURCES
 	src/models/qwen3_vision.cpp
 	src/models/glm5_vision.cpp
 	src/models/host_vision.cpp
-	src/models/host_vision_glm.cpp
 	src/models/host_vision_ops.cpp
 	src/models/deepseek_v41_vision.cpp
 	src/models/glm5_next.cpp
