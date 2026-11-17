@@ -6,6 +6,7 @@
 // (they differ by the quantization of the tower, not by arithmetic).
 #include "engine/models/glm5_vision.h"
 #include "engine/models/deepseek_v41_vision.h"
+#include "engine/models/qwen3_vision.h"
 #include "engine/models/host_vision.h"
 #include "engine/loader/image.h"
 #include "engine/runtime/cpu_expert_attach.h"
@@ -56,16 +57,18 @@ int main( int argc, char** argv ) {
 	engine::core::arena_create( arena, 0, 3ULL << 30 );
 	auto stream = backend::stream_create();
 	// DeepSeek or GLM, by the checkpoint's architecture
-	bool ds = false;
+	bool ds = false, qwen = false;
 	{
 		std::ifstream cf( model + "/config.json" );
 		const std::string text( ( std::istreambuf_iterator<char>( cf ) ), std::istreambuf_iterator<char>() );
 		ds = text.find( "DeepseekV41" ) != std::string::npos || text.find( "deepseek_v41" ) != std::string::npos;
+		qwen = !ds && ( text.find( "Qwen" ) != std::string::npos || text.find( "qwen" ) != std::string::npos ) && text.find( "glm" ) == std::string::npos;
 	}
 	models::Glm5VisionTower glm_tower;
 	models::DeepseekV41VisionTower ds_tower;
-	models::VisionTower& device = ds ? static_cast<models::VisionTower&>( ds_tower ) : static_cast<models::VisionTower&>( glm_tower );
-	const bool loaded = ds ? ds_tower.load( model.c_str(), arena, max_tokens, stream ) : glm_tower.load( model.c_str(), arena, max_tokens * 4, stream );
+	models::Qwen3VisionTower qwen_tower;
+	models::VisionTower& device = ds ? static_cast<models::VisionTower&>( ds_tower ) : qwen ? static_cast<models::VisionTower&>( qwen_tower ) : static_cast<models::VisionTower&>( glm_tower );
+	const bool loaded = ds ? ds_tower.load( model.c_str(), arena, max_tokens, stream ) : qwen ? qwen_tower.load( model.c_str(), arena, max_tokens * 4, stream ) : glm_tower.load( model.c_str(), arena, max_tokens * 4, stream );
 	if ( !loaded ) { std::printf( "test_host_vision: FAIL (device tower load)\n" ); return 1; }
 
 	std::string err;
@@ -90,7 +93,7 @@ int main( int argc, char** argv ) {
 	const double t_host2 = seconds( t0 );
 	if ( a.size() != b.size() || a.empty() ) { std::printf( "test_host_vision: FAIL (sizes %zu vs %zu)\n", a.size(), b.size() ); return 1; }
 
-	const int hidden = ds ? 5120 : 4096, tokens = static_cast<int>( a.size() / hidden );
+	const int hidden = ds ? 5120 : qwen ? qwen_tower.config().out_hidden : 4096, tokens = static_cast<int>( a.size() / hidden );
 	// row cosines of two outputs: minimum, mean, largest |difference|
 	auto compare = [&]( const std::vector<backend::half_t>& u, const std::vector<backend::half_t>& v, double* min_cos, double* mean_cos, double* max_abs ) {
 		*min_cos = 1.0;

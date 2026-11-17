@@ -112,15 +112,19 @@ std::vector<uint16_t> load_f16( const engine::loader::SafeTensorsRepo& repo, con
 void rms_norm( Par& par, const float* x, const float* w, uint16_t* out, int m, int n, float eps );
 // out = LayerNorm( x ) * w + b, x FP16
 void layer_norm( Par& par, const uint16_t* x, const float* w, const float* b, uint16_t* out, int m, int n, float eps );
+// The same from the FP32 residual stream
+void layer_norm( Par& par, const float* x, const float* w, const float* b, uint16_t* out, int m, int n, float eps );
 // hidden += y + bias
 void bias_residual( Par& par, float* hidden, const uint16_t* y, const float* bias, int m, int n );
 // x = round( x + bias ), bias null: x unchanged
 void add_bias( Par& par, uint16_t* x, const float* bias, int m, int n );
 // x = round( gelu_erf( x + bias ) ), bias null: none
 void gelu_erf( Par& par, uint16_t* x, const float* bias, int m, int n );
+// x = round( gelu_tanh( x + bias ) ), bias null: none
+void gelu_tanh( Par& par, uint16_t* x, const float* bias, int m, int n );
 // out = silu( min( gate, limit ) ) * clamp( up, -limit, limit ) (limit <= 0: plain silu( gate ) * up)
 void swiglu( Par& par, const uint16_t* gate, const uint16_t* up, uint16_t* out, int64_t count, float limit );
-// Bidirectional attention over all m rows: q, k, v, out [m][heads * 64] FP16; scratch floats of the three inputs are kept in `s`
-void attention( Par& par, Scratch& s, const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* out, int m, int heads, float scale );
+// Bidirectional attention over all m rows: q, k, v, out [m][heads * head_dim] FP16 (head_dim a multiple of 8, at most 128); scratch floats of the three inputs are kept in `s`
+void attention( Par& par, Scratch& s, const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* out, int m, int heads, float scale, int head_dim = 64 );
 
 } // namespace engine::models::hv

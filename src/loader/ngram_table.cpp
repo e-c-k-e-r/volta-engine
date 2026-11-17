@@ -98,6 +98,11 @@ bool NgramTable::open( const std::string& path ) {
 		if ( s == 0 ) rows_per_shard_ = shape[0];
 		shards_.push_back( reinterpret_cast<const uint16_t*>( p ) );
 	}
+	// a table stored as one tensor (the published EXL3 checkpoints) is a single shard of every row
+	if ( shards_.empty() && tensor( ".trellis", &p, &shape ) ) {
+		rows_per_shard_ = shape[0];
+		shards_.push_back( reinterpret_cast<const uint16_t*>( p ) );
+	}
 	ENGINE_ASSERT( !shards_.empty() && rows_per_shard_ > 0, "NgramTable: no shards" );
 	// mul1 codebook, bit-exact with decode_3inst<2> (fp16): (1024 + byte sum of s * MUL1) * k_inv + k_bias
 	const float k_inv = half_bits_to_float( 0x1eee ), k_bias = half_bits_to_float( 0xc931 );

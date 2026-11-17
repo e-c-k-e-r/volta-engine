@@ -1,6 +1,7 @@
 // GGUF architecture clip (llama.cpp's mmproj files) for the projector types gemma4v (Gemma 4's vision tower and embedding projection under the
 // Hugging Face names Gemma4VisionTower loads), glm5v (GLM-5's tower and merger under the checkpoint's model.visual.* names) and deepseek41v
-// (DeepSeek-V4.1's tower, aligner and delimiter embeddings under the checkpoint's vision.* / aligner.* names). The converter keeps every tensor as it is (norms F32, projections BF16) except the
+// (DeepSeek-V4.1's tower, aligner and delimiter embeddings under the checkpoint's vision.* / aligner.* names) and qwen3vl_merger (the Qwen3-VL tower
+// of Flash-Next under model.visual.*). The converter keeps every tensor as it is (norms F32, projections BF16) except the
 // patch embedding, which it stores as a conv kernel [n, channel, y, x]: the PatchChwToHwc transform restores [n, y * x * channel].
 #include "gguf_arch.h"
 #include <cstdio>
@@ -166,6 +167,63 @@ void map_deepseek41v( const GgufArch&, const GgufKv& kv, const std::string& g, s
 	}
 }
 
+// Qwen3-VL tower (qwen3vl_merger): the tower as the checkpoint has it, with the fused qkv (weight cut into q / k / v row ranges, the fused bias
+// kept and sliced by the tower), the patch embedding cut along the temporal axis into two conv kernels (.t0 and .t1 here; the tower joins them),
+// the position table, and the merger's norm and two linears (mm.0, mm.2)
+const Name kQwenBlock[] = {
+	{ "ln1.weight", "norm1.weight" },
+	{ "ln1.bias", "norm1.bias" },
+	{ "ln2.weight", "norm2.weight" },
+	{ "ln2.bias", "norm2.bias" },
+	{ "attn_qkv.bias", "attn.qkv.bias" },
+	{ "attn_out.weight", "attn.proj.weight" },
+	{ "attn_out.bias", "attn.proj.bias" },
+	{ "ffn_up.weight", "mlp.linear_fc1.weight" },
+	{ "ffn_up.bias", "mlp.linear_fc1.bias" },
+	{ "ffn_down.weight", "mlp.linear_fc2.weight" },
+	{ "ffn_down.bias", "mlp.linear_fc2.bias" },
+};
+
+const Name kQwenTop[] = {
+	{ "v.patch_embd.weight", "model.visual.patch_embed.proj.weight.t0" },
+	{ "v.patch_embd.weight.1", "model.visual.patch_embed.proj.weight.t1" },
+	{ "v.patch_embd.bias", "model.visual.patch_embed.proj.bias" },
+	{ "v.position_embd.weight", "model.visual.pos_embed.weight" },
+	{ "v.post_ln.weight", "model.visual.merger.norm.weight" },
+	{ "v.post_ln.bias", "model.visual.merger.norm.bias" },
+	{ "mm.0.weight", "model.visual.merger.linear_fc1.weight" },
+	{ "mm.0.bias", "model.visual.merger.linear_fc1.bias" },
+	{ "mm.2.weight", "model.visual.merger.linear_fc2.weight" },
+	{ "mm.2.bias", "model.visual.merger.linear_fc2.bias" },
+};
+
+void map_qwen3vl( const GgufArch&, const GgufKv& kv, const std::string& g, std::vector<GgufMapped>* out ) {
+	auto emit = [&]( const std::string& name, int64_t row_begin = 0, int64_t rows = -1 ) {
+		GgufMapped m;
+		m.name = name;
+		m.row_begin = row_begin;
+		m.rows = rows;
+		out->push_back( std::move( m ) );
+	};
+	for ( const Name& n : kQwenTop ) {
+		if ( g == n.gguf ) { emit( n.hf ); return; }
+	}
+	int layer = -1, used = 0;
+	if ( std::sscanf( g.c_str(), "v.blk.%d.%n", &layer, &used ) != 1 || used == 0 ) return;
+	const std::string rest = g.substr( static_cast<size_t>( used ) ), base = "model.visual.blocks." + std::to_string( layer ) + ".";
+	if ( rest == "attn_qkv.weight" ) {
+		const int64_t hidden = kv.get( "clip.vision.embedding_length" );
+		if ( hidden <= 0 ) return;
+		emit( base + "attn.q_proj.weight", 0, hidden );
+		emit( base + "attn.k_proj.weight", hidden, hidden );
+		emit( base + "attn.v_proj.weight", 2 * hidden, hidden );
+		return;
+	}
+	for ( const Name& n : kQwenBlock ) {
+		if ( rest == n.gguf ) { emit( base + n.hf ); return; }
+	}
+}
+
 } // namespace
 
 bool gguf_arch_clip( const GgufKv& kv, GgufArch* out ) {
@@ -177,6 +235,7 @@ bool gguf_arch_clip( const GgufKv& kv, GgufArch* out ) {
 	if ( type == "gemma4v" ) out->map = map_gemma4v;
 	else if ( type == "glm5v" ) out->map = map_glm5v;
 	else if ( type == "deepseek41v" ) out->map = map_deepseek41v;
+	else if ( type == "qwen3vl_merger" ) out->map = map_qwen3vl;
 	else return false;
 	return true;
 }

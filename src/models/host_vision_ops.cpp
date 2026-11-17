@@ -344,6 +344,24 @@ void layer_norm( Par& par, const uint16_t* x, const float* w, const float* b, ui
 	} );
 }
 
+void layer_norm( Par& par, const float* x, const float* w, const float* b, uint16_t* out, int m, int n, float eps ) {
+	par.run( m, 8, [&]( int64_t r0, int64_t r1 ) {
+		thread_local std::vector<float> t;
+		t.resize( n );
+		for ( int64_t r = r0; r < r1; ++r ) {
+			const float* xr = x + static_cast<size_t>( r ) * n;
+			float s = 0.0f;
+			for ( int i = 0; i < n; ++i ) s += xr[i];
+			const float mean = s / n;
+			float q = 0.0f;
+			for ( int i = 0; i < n; ++i ) q += ( xr[i] - mean ) * ( xr[i] - mean );
+			const float inv = 1.0f / std::sqrt( q / n + eps );
+			for ( int i = 0; i < n; ++i ) t[i] = ( xr[i] - mean ) * inv * w[i] + b[i];
+			cpu::float_to_half( t.data(), out + static_cast<size_t>( r ) * n, n );
+		}
+	} );
+}
+
 void bias_residual( Par& par, float* hidden, const uint16_t* y, const float* bias, int m, int n ) {
 	par.run( m, 8, [&]( int64_t r0, int64_t r1 ) {
 		thread_local std::vector<float> t;
@@ -386,6 +404,23 @@ void gelu_erf( Par& par, uint16_t* x, const float* bias, int m, int n ) {
 	} );
 }
 
+void gelu_tanh( Par& par, uint16_t* x, const float* bias, int m, int n ) {
+	par.run( m, 8, [&]( int64_t r0, int64_t r1 ) {
+		thread_local std::vector<float> t;
+		t.resize( n );
+		for ( int64_t r = r0; r < r1; ++r ) {
+			uint16_t* row = x + static_cast<size_t>( r ) * n;
+			cpu::half_to_float( row, t.data(), n );
+			for ( int i = 0; i < n; ++i ) {
+				const float v = bias ? t[i] + bias[i] : t[i];
+				const float u = 0.7978845608028654f * ( v + 0.044715f * v * v * v );
+				t[i] = 0.5f * v * ( 1.0f + std::tanh( u ) );
+			}
+			cpu::float_to_half( t.data(), row, n );
+		}
+	} );
+}
+
 void swiglu( Par& par, const uint16_t* gate, const uint16_t* up, uint16_t* out, int64_t count, float limit ) {
 	constexpr int64_t kPiece = 4096;
 	par.run( ( count + kPiece - 1 ) / kPiece, 1, [&]( int64_t p0, int64_t p1 ) {
@@ -409,12 +444,15 @@ void swiglu( Par& par, const uint16_t* gate, const uint16_t* up, uint16_t* out, 
 
 namespace {
 
-HV_AVX2 float dot64( const float* a, const float* b ) {
+// n a multiple of 8
+HV_AVX2 float dotn( const float* a, const float* b, int n ) {
 	__m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
-	for ( int i = 0; i < 64; i += 16 ) {
+	int i = 0;
+	for ( ; i + 16 <= n; i += 16 ) {
 		s0 = _mm256_fmadd_ps( _mm256_loadu_ps( a + i ), _mm256_loadu_ps( b + i ), s0 );
 		s1 = _mm256_fmadd_ps( _mm256_loadu_ps( a + i + 8 ), _mm256_loadu_ps( b + i + 8 ), s1 );
 	}
+	if ( i < n ) s0 = _mm256_fmadd_ps( _mm256_loadu_ps( a + i ), _mm256_loadu_ps( b + i ), s0 );
 	s0 = _mm256_add_ps( s0, s1 );
 	__m128 r = _mm_add_ps( _mm256_castps256_ps128( s0 ), _mm256_extractf128_ps( s0, 1 ) );
 	r = _mm_add_ps( r, _mm_movehl_ps( r, r ) );
@@ -422,15 +460,15 @@ HV_AVX2 float dot64( const float* a, const float* b ) {
 	return _mm_cvtss_f32( r );
 }
 
-HV_AVX2 void axpy64( float* acc, float p, const float* v ) {
+HV_AVX2 void axpyn( float* acc, float p, const float* v, int n ) {
 	const __m256 pv = _mm256_set1_ps( p );
-	for ( int i = 0; i < 64; i += 8 ) _mm256_storeu_ps( acc + i, _mm256_fmadd_ps( pv, _mm256_loadu_ps( v + i ), _mm256_loadu_ps( acc + i ) ) );
+	for ( int i = 0; i < n; i += 8 ) _mm256_storeu_ps( acc + i, _mm256_fmadd_ps( pv, _mm256_loadu_ps( v + i ), _mm256_loadu_ps( acc + i ) ) );
 }
 
 } // namespace
 
-void attention( Par& par, Scratch& s, const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* out, int m, int heads, float scale ) {
-	constexpr int kHead = 64;
+void attention( Par& par, Scratch& s, const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* out, int m, int heads, float scale, int head_dim ) {
+	const int kHead = head_dim;
 	const int width = heads * kHead;
 	const size_t total = static_cast<size_t>( m ) * width;
 	for ( auto* f : { &s.qf, &s.kf, &s.vf } ) if ( f->size() < total ) f->resize( total );
@@ -450,13 +488,13 @@ void attention( Par& par, Scratch& s, const uint16_t* q, const uint16_t* k, cons
 	par.run( static_cast<int64_t>( m ) * heads, 4, [&]( int64_t i0, int64_t i1 ) {
 		thread_local std::vector<float> sc;
 		sc.resize( m );
-		float acc[kHead];
+		float acc[128];
 		for ( int64_t i = i0; i < i1; ++i ) {
 			const int qi = static_cast<int>( i / heads ), head = static_cast<int>( i % heads );
 			const float* qr = qf + static_cast<size_t>( qi ) * width + head * kHead;
 			float mx = -INFINITY;
 			for ( int j = 0; j < m; ++j ) {
-				sc[j] = dot64( qr, kf + static_cast<size_t>( j ) * width + head * kHead );
+				sc[j] = dotn( qr, kf + static_cast<size_t>( j ) * width + head * kHead, kHead );
 				mx = std::max( mx, sc[j] );
 			}
 			float l = 0.0f;
@@ -464,7 +502,7 @@ void attention( Par& par, Scratch& s, const uint16_t* q, const uint16_t* k, cons
 			for ( int j = 0; j < m; ++j ) {
 				const float p = std::exp( sc[j] - mx );
 				l += p;
-				axpy64( acc, p, vf + static_cast<size_t>( j ) * width + head * kHead );
+				axpyn( acc, p, vf + static_cast<size_t>( j ) * width + head * kHead, kHead );
 			}
 			const float inv = 1.0f / l;
 			for ( int d = 0; d < kHead; ++d ) acc[d] *= inv;

@@ -7,6 +7,7 @@
 #include "engine/models/vision_tower.h"
 #include "engine/backend/types.h"
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,10 @@ struct Qwen3VisionConfig {
 	int head_dim() const { return hidden / heads; }
 	int patch_dim() const { return 3 * temporal_patch_size * patch_size * patch_size; }
 };
+
+// The tower's geometry and the processor settings (config.json vision_config) for images of up to max_patches patches; false without a vision_config.
+// Shared by the GPU tower and the host one (host_vision.h)
+bool qwen3_vision_config( const char* model_dir, int max_patches, Qwen3VisionConfig* cfg, engine::loader::VisionParams* params );
 
 // The Qwen3-VL image encoder (patch embedding, 2-D rotary ViT blocks, patch merger) on one device. Weights come from the
 // checkpoint's model.visual.* tensors (trellis-quantized projections, FP16 norms / biases / embeddings).
@@ -87,5 +92,9 @@ private:
 	backend::half_t* d_merged_fc1_ = nullptr;
 	backend::half_t* d_out_ = nullptr;
 };
+
+// The same tower on the host CPU (vision_cpu, host_vision.h): the EXL3 projections decoded once, or a dense checkpoint's weights. max_tokens: language-model
+// tokens of the largest image. Without DeepStack taps (nullptr and *error set for a checkpoint with them)
+std::unique_ptr<VisionTower> make_host_qwen3_tower( const char* model_dir, const char* mmproj_dir, int max_tokens, const std::vector<int>& cpus, std::string* error );
 
 } // namespace engine::models

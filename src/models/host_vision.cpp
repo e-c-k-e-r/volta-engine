@@ -2,6 +2,7 @@
 #include "engine/models/host_vision.h"
 #include "engine/models/glm5_vision.h"
 #include "engine/models/deepseek_v41_vision.h"
+#include "engine/models/qwen3_vision.h"
 #include "engine/kernels/cpu/cpu_util.h"
 #include <cctype>
 
@@ -27,7 +28,8 @@ std::unique_ptr<VisionTower> make_host_vision_tower( const char* model_dir, cons
 	for ( char& c : arch ) c = static_cast<char>( std::tolower( static_cast<unsigned char>( c ) ) );
 	if ( arch.find( "glm" ) != std::string::npos ) return make_host_glm5_tower( model_dir, mmproj_dir, max_tokens, cpus, error );
 	if ( arch.find( "deepseek" ) != std::string::npos ) return make_host_dsv41_tower( model_dir, mmproj_dir, max_tokens, cpus, error );
-	*error = "no host vision tower for the architecture '" + arch + "' yet (GLM-5, DeepSeek-V4.1)";
+	if ( arch.find( "qwen" ) != std::string::npos ) return make_host_qwen3_tower( model_dir, mmproj_dir, max_tokens, cpus, error );
+	*error = "no host vision tower for the architecture '" + arch + "' yet (GLM-5, DeepSeek-V4.1, Qwen3-VL-style)";
 	return nullptr;
 }
 

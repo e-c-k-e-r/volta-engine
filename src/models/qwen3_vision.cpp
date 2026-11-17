@@ -13,28 +13,44 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include "host_vision_ops.h"
+#include "engine/kernels/cpu/cpu_util.h"
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 namespace engine::models {
 
-bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream, bool allow_dense ) {
+bool qwen3_vision_config( const char* model_dir, int max_patches, Qwen3VisionConfig* out_cfg, engine::loader::VisionParams* out_params ) {
+	Qwen3VisionConfig cfg;
+	engine::loader::VisionParams params;
 	const auto cfg_json = read_json( std::string( model_dir ) + "/config.json" );
 	if ( cfg_json.is_discarded() || !cfg_json.contains( "vision_config" ) ) return false;
 	const auto& vc = cfg_json["vision_config"];
-	cfg_.depth = vc.value( "depth", cfg_.depth );
-	cfg_.hidden = vc.value( "hidden_size", cfg_.hidden );
-	cfg_.heads = vc.value( "num_heads", cfg_.heads );
-	cfg_.intermediate = vc.value( "intermediate_size", cfg_.intermediate );
-	cfg_.out_hidden = vc.value( "out_hidden_size", cfg_.out_hidden );
-	cfg_.patch_size = vc.value( "patch_size", cfg_.patch_size );
-	cfg_.merge_size = vc.value( "spatial_merge_size", cfg_.merge_size );
-	cfg_.temporal_patch_size = vc.value( "temporal_patch_size", cfg_.temporal_patch_size );
-	cfg_.num_position_embeddings = vc.value( "num_position_embeddings", cfg_.num_position_embeddings );
-	cfg_.deepstack_blocks.clear();
-	for ( const auto& d : vc.value( "deepstack_visual_indexes", nlohmann::json::array() ) ) { cfg_.deepstack_blocks.push_back( d.get<int>() ); }
-	params_.patch_size = cfg_.patch_size;
-	params_.merge_size = cfg_.merge_size;
-	params_.temporal_patch_size = cfg_.temporal_patch_size;
-	params_.max_pixels = max_patches * cfg_.patch_size * cfg_.patch_size;
+	cfg.depth = vc.value( "depth", cfg.depth );
+	cfg.hidden = vc.value( "hidden_size", cfg.hidden );
+	cfg.heads = vc.value( "num_heads", cfg.heads );
+	cfg.intermediate = vc.value( "intermediate_size", cfg.intermediate );
+	cfg.out_hidden = vc.value( "out_hidden_size", cfg.out_hidden );
+	cfg.patch_size = vc.value( "patch_size", cfg.patch_size );
+	cfg.merge_size = vc.value( "spatial_merge_size", cfg.merge_size );
+	cfg.temporal_patch_size = vc.value( "temporal_patch_size", cfg.temporal_patch_size );
+	cfg.num_position_embeddings = vc.value( "num_position_embeddings", cfg.num_position_embeddings );
+	cfg.deepstack_blocks.clear();
+	for ( const auto& d : vc.value( "deepstack_visual_indexes", nlohmann::json::array() ) ) { cfg.deepstack_blocks.push_back( d.get<int>() ); }
+	params.patch_size = cfg.patch_size;
+	params.merge_size = cfg.merge_size;
+	params.temporal_patch_size = cfg.temporal_patch_size;
+	params.max_pixels = max_patches * cfg.patch_size * cfg.patch_size;
+	*out_cfg = cfg;
+	*out_params = params;
+	return true;
+}
+
+bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream, bool allow_dense ) {
+	if ( !qwen3_vision_config( model_dir, max_patches, &cfg_, &params_ ) ) return false;
 
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) return false;
@@ -300,6 +316,332 @@ bool Qwen3VisionTower::encode( const engine::loader::PreparedImage& img, std::ve
 	backend::memcpy_async( out->data(), d_out_, out->size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
 	backend::stream_sync( stream );   // also covers the staging vectors above
 	return true;
+}
+
+// ---- the same tower on the host CPU (vision_cpu, host_vision.h): the arithmetic of encode() above over decoded panels or dense weights ----
+
+namespace {
+
+namespace cpu = engine::kernels::cpu;
+using namespace hv;
+
+class HostQwen3Tower : public VisionTower {
+public:
+	bool load( const char* model_dir, const char* mmproj_dir, int max_tokens, const std::vector<int>& cpus, std::string* error );
+	bool loaded() const override { return loaded_; }
+	const engine::loader::VisionParams& params() const override { return params_; }
+	bool encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, backend::stream_t stream ) override;
+
+private:
+	struct Block {
+		std::vector<float> norm1_w, norm1_b, norm2_w, norm2_b, q_b, k_b, v_b, proj_b, fc1_b, fc2_b;
+		Lin q, k, v, proj, fc1, fc2;
+	};
+
+	bool loaded_ = false;
+	Qwen3VisionConfig cfg_;
+	engine::loader::VisionParams params_;
+	int max_patches_ = 0;
+	std::unique_ptr<Par> par_;
+	std::mutex mtx_;
+	Scratch scratch_;
+	std::vector<Block> blocks_;
+	Dense patch_w_;
+	std::vector<float> patch_b_, merge_norm_w_, merge_norm_b_, merge_fc1_b_, merge_fc2_b_;
+	int mlp_width_ = 0;                 // the MLP's width as the projections hold it (padded for EXL3)
+	std::vector<uint16_t> pos_table_;   // [num_position_embeddings, hidden] FP16 bits
+	Lin merge_fc1_, merge_fc2_;
+	std::vector<float> hidden_, pos_;
+	std::vector<uint16_t> ln_, q_, k_, v_, attn_, tmp_, mlp_, merged_, mfc1_, out_;
+};
+
+bool HostQwen3Tower::load( const char* model_dir, const char* mmproj_dir, int max_tokens, const std::vector<int>& cpus, std::string* error ) {
+	const auto t0 = std::chrono::steady_clock::now();
+	max_patches_ = max_tokens * 4;
+	if ( !qwen3_vision_config( model_dir, max_patches_, &cfg_, &params_ ) ) {
+		*error = "the checkpoint has no usable Qwen vision_config";
+		return false;
+	}
+	if ( !cfg_.deepstack_blocks.empty() || cfg_.merge_size != 2 || cfg_.head_dim() % 8 != 0 || cfg_.head_dim() > 128 || cfg_.hidden % 16 != 0 ) {
+		*error = "the host Qwen tower does not support DeepStack taps, a merge size other than 2 or this head width";
+		return false;
+	}
+	par_ = std::make_unique<Par>( cpus );
+	Par::Pin pin( *par_ );
+	engine::loader::SafeTensorsRepo repo;
+	const bool from_mmproj = mmproj_dir != nullptr && mmproj_dir[0] != '\0';
+	if ( !repo.open( from_mmproj ? mmproj_dir : model_dir, from_mmproj ) ) {
+		*error = std::string( "cannot open the " ) + ( from_mmproj ? "vision projector in " : "checkpoint " ) + ( from_mmproj ? mmproj_dir : model_dir );
+		return false;
+	}
+	std::string err;
+	const int H = cfg_.hidden;
+	auto vec = [&]( const std::string& name ) { return load_vec( repo, name, &err ); };
+
+	std::vector<LinSource> sources;
+	std::vector<Lin*> targets;
+	auto want = [&]( const std::string& name, Lin* dst ) {
+		LinSource s;
+		if ( !find_lin( repo, name, &s, &err ) ) return false;
+		sources.push_back( s );
+		targets.push_back( dst );
+		return true;
+	};
+
+	{
+		// [hidden, 3, T, P, P] in the checkpoint; a vision projector GGUF has one [hidden, 3, P, P] kernel per temporal frame (.t0, .t1)
+		const int P2 = cfg_.patch_size * cfg_.patch_size, T = cfg_.temporal_patch_size;
+		std::vector<uint16_t> w;
+		if ( repo.find( "model.visual.patch_embed.proj.weight" ) ) w = load_f16( repo, "model.visual.patch_embed.proj.weight", &err );
+		else if ( T == 2 && repo.find( "model.visual.patch_embed.proj.weight.t0" ) && repo.find( "model.visual.patch_embed.proj.weight.t1" ) ) {
+			const std::vector<uint16_t> t0 = load_f16( repo, "model.visual.patch_embed.proj.weight.t0", &err ), t1 = load_f16( repo, "model.visual.patch_embed.proj.weight.t1", &err );
+			if ( t0.size() == static_cast<size_t>( H ) * 3 * P2 && t1.size() == t0.size() ) {
+				w.resize( static_cast<size_t>( H ) * cfg_.patch_dim() );
+				for ( int o = 0; o < H; ++o )
+					for ( int c = 0; c < 3; ++c )
+						for ( int q = 0; q < P2; ++q ) {
+							w[static_cast<size_t>( o ) * cfg_.patch_dim() + ( c * T + 0 ) * P2 + q] = t0[( static_cast<size_t>( o ) * 3 + c ) * P2 + q];
+							w[static_cast<size_t>( o ) * cfg_.patch_dim() + ( c * T + 1 ) * P2 + q] = t1[( static_cast<size_t>( o ) * 3 + c ) * P2 + q];
+						}
+			}
+		}
+		if ( w.size() != static_cast<size_t>( H ) * cfg_.patch_dim() ) {
+			*error = "vision: patch embedding shape " + err;
+			return false;
+		}
+		patch_w_ = pack_nk( w.data(), H, cfg_.patch_dim() );
+	}
+	patch_b_ = vec( "model.visual.patch_embed.proj.bias" );
+	pos_table_ = load_f16( repo, "model.visual.pos_embed.weight", &err );
+	if ( pos_table_.size() != static_cast<size_t>( cfg_.num_position_embeddings ) * H ) {
+		*error = "vision: pos_embed shape " + err;
+		return false;
+	}
+
+	blocks_.resize( cfg_.depth );
+	for ( int i = 0; i < cfg_.depth; ++i ) {
+		const std::string p = "model.visual.blocks." + std::to_string( i ) + ".";
+		Block& b = blocks_[i];
+		b.norm1_w = vec( p + "norm1.weight" );
+		b.norm1_b = vec( p + "norm1.bias" );
+		b.norm2_w = vec( p + "norm2.weight" );
+		b.norm2_b = vec( p + "norm2.bias" );
+		const bool fused = !repo.find( ( p + "attn.q_proj.trellis" ).c_str() ) && !repo.find( ( p + "attn.q_proj.weight" ).c_str() ) && repo.find( ( p + "attn.qkv.weight" ).c_str() );
+		if ( fused ) {   // a dense checkpoint of the original release: [3 hidden, hidden] and its bias, cut into thirds
+			const pod::SafeTensorMeta* wm = repo.find( ( p + "attn.qkv.weight" ).c_str() );
+			const char* raw = static_cast<const char*>( repo.cpu_data( ( p + "attn.qkv.weight" ).c_str() ) );
+			const size_t esz = wm && wm->dtype == pod::DType::FP32 ? 4 : 2;
+			if ( !wm || !raw || wm->ndim != 2 || wm->shape[0] != 3 * H || wm->shape[1] != H ) {
+				*error = "vision: fused qkv shape in block " + std::to_string( i );
+				return false;
+			}
+			Lin* part[3] = { &b.q, &b.k, &b.v };
+			for ( int t = 0; t < 3; ++t ) {
+				LinSource s;
+				s.name = p + "attn.qkv";
+				s.dense = raw + static_cast<size_t>( t ) * H * H * esz;
+				s.dtype = wm->dtype;
+				s.n = H;
+				s.k = H;
+				sources.push_back( s );
+				targets.push_back( part[t] );
+			}
+			const std::vector<float> qkv = vec( p + "attn.qkv.bias" );
+			if ( qkv.size() == static_cast<size_t>( 3 ) * H ) {
+				b.q_b.assign( qkv.begin(), qkv.begin() + H );
+				b.k_b.assign( qkv.begin() + H, qkv.begin() + 2 * H );
+				b.v_b.assign( qkv.begin() + 2 * H, qkv.end() );
+			}
+		}
+		else {
+			if ( repo.find( ( p + "attn.q_proj.bias" ).c_str() ) ) {   // separate in the EXL3 checkpoint, fused in a vision projector GGUF
+				b.q_b = vec( p + "attn.q_proj.bias" );
+				b.k_b = vec( p + "attn.k_proj.bias" );
+				b.v_b = vec( p + "attn.v_proj.bias" );
+			}
+			else {
+				const std::vector<float> qkv = vec( p + "attn.qkv.bias" );
+				if ( qkv.size() == static_cast<size_t>( 3 ) * H ) {
+					b.q_b.assign( qkv.begin(), qkv.begin() + H );
+					b.k_b.assign( qkv.begin() + H, qkv.begin() + 2 * H );
+					b.v_b.assign( qkv.begin() + 2 * H, qkv.end() );
+				}
+				else err += " (no q / k / v bias)";
+			}
+			if ( !want( p + "attn.q_proj", &b.q ) || !want( p + "attn.k_proj", &b.k ) || !want( p + "attn.v_proj", &b.v ) ) {
+				*error = err;
+				return false;
+			}
+		}
+		b.proj_b = vec( p + "attn.proj.bias" );
+		b.fc1_b = vec( p + "mlp.linear_fc1.bias" );
+		b.fc2_b = vec( p + "mlp.linear_fc2.bias" );
+		if ( !want( p + "attn.proj", &b.proj ) || !want( p + "mlp.linear_fc1", &b.fc1 ) || !want( p + "mlp.linear_fc2", &b.fc2 ) ) {
+			*error = err;
+			return false;
+		}
+	}
+	merge_norm_w_ = vec( "model.visual.merger.norm.weight" );
+	merge_norm_b_ = vec( "model.visual.merger.norm.bias" );
+	merge_fc1_b_ = vec( "model.visual.merger.linear_fc1.bias" );
+	merge_fc2_b_ = vec( "model.visual.merger.linear_fc2.bias" );
+	if ( !want( "model.visual.merger.linear_fc1", &merge_fc1_ ) || !want( "model.visual.merger.linear_fc2", &merge_fc2_ ) || !err.empty() ) {
+		*error = err;
+		return false;
+	}
+	decode_all( *par_, sources, targets );
+	repo.close();
+	// EXL3 pads the MLP width (4304) to a multiple of 128 (4352): the first projection then produces the padded columns (zero: the padded weight rows are),
+	// so the bias gets zeros there and the MLP buffers use the padded width
+	mlp_width_ = blocks_[0].fc1.d.n;
+	for ( Block& b : blocks_ ) {
+		if ( b.fc1.d.n != mlp_width_ || b.fc2.d.k != mlp_width_ || mlp_width_ < cfg_.intermediate ) {
+			*error = "vision: MLP projection widths do not agree";
+			return false;
+		}
+		b.fc1_b.resize( mlp_width_, 0.0f );
+	}
+
+	size_t bytes = patch_w_.w.size() * 2 + pos_table_.size() * 2;
+	for ( const Lin* l : targets ) bytes += l->d.w.size() * 2;
+	loaded_ = true;
+	LOG_INFO( "[vision] Qwen tower on the host CPU: %d blocks, up to %d patches (%d tokens), %.2f GiB of decoded weights, %d threads, loaded in %.1f s\n", cfg_.depth,
+		max_patches_, max_tokens, bytes / 1073741824.0, par_->threads(), std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() );
+	return true;
+}
+
+bool HostQwen3Tower::encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, backend::stream_t ) {
+	if ( !loaded_ ) return false;
+	const int m = img.num_patches();
+	if ( m < 4 || m > max_patches_ ) {
+		LOG_WARN( "[vision] image has %d patches, limit is %d\n", m, max_patches_ );
+		return false;
+	}
+	std::lock_guard<std::mutex> lock( mtx_ );
+	Par& par = *par_;
+	Par::Pin pin( par );
+	const auto t0 = std::chrono::steady_clock::now();
+	const int H = cfg_.hidden, hd = cfg_.head_dim(), I = mlp_width_, O = cfg_.out_hidden, P = cfg_.patch_dim(), mrg = 4;
+	const int tokens = m / mrg, mw = H * mrg;
+	auto fit = []( auto& v, size_t n ) { if ( v.size() < n ) v.resize( n ); };
+	const size_t mh = static_cast<size_t>( m ) * H, mi = static_cast<size_t>( m ) * I;
+	fit( hidden_, mh );
+	fit( pos_, mh );
+	for ( auto* v : { &ln_, &q_, &k_, &v_, &attn_, &tmp_ } ) fit( *v, mh );
+	fit( mlp_, mi );
+
+	std::vector<float> cs, sn;
+	vision_rotary_tables( img.grid_h, img.grid_w, cfg_.merge_size, hd, &cs, &sn );
+
+	// The position table interpolated bilinearly to the image's grid, in the patches' (merge block) order, rounded to FP16
+	{
+		const int gh = img.grid_h, gw = img.grid_w, merge = cfg_.merge_size, mm = merge * merge, blocks_w = gw / merge;
+		const int side = static_cast<int>( std::lround( std::sqrt( static_cast<double>( cfg_.num_position_embeddings ) ) ) );
+		par.run( m, 16, [&]( int64_t r0, int64_t r1 ) {
+			for ( int64_t row = r0; row < r1; ++row ) {
+				const int blk = static_cast<int>( row / mm ), within = static_cast<int>( row % mm );
+				const int by = blk / blocks_w, bx = blk % blocks_w;
+				const int y = by * merge + within / merge, x = bx * merge + within % merge;
+				const float hy = gh == 1 ? 0.0f : static_cast<float>( y ) * ( side - 1 ) / ( gh - 1 );
+				const float wx = gw == 1 ? 0.0f : static_cast<float>( x ) * ( side - 1 ) / ( gw - 1 );
+				const int hf = static_cast<int>( hy ), wf = static_cast<int>( wx );
+				const int hc = std::min( hf + 1, side - 1 ), wc = std::min( wf + 1, side - 1 );
+				const float dh = hy - hf, dw = wx - wf;
+				const uint16_t* t00 = pos_table_.data() + ( static_cast<size_t>( hf ) * side + wf ) * H;
+				const uint16_t* t01 = pos_table_.data() + ( static_cast<size_t>( hf ) * side + wc ) * H;
+				const uint16_t* t10 = pos_table_.data() + ( static_cast<size_t>( hc ) * side + wf ) * H;
+				const uint16_t* t11 = pos_table_.data() + ( static_cast<size_t>( hc ) * side + wc ) * H;
+				for ( int d = 0; d < H; ++d ) {
+					const float val = ( 1 - dh ) * ( 1 - dw ) * h2f( t00[d] ) + ( 1 - dh ) * dw * h2f( t01[d] ) + dh * ( 1 - dw ) * h2f( t10[d] ) + dh * dw * h2f( t11[d] );
+					pos_[static_cast<size_t>( row ) * H + d] = h2f( f2h( val ) );
+				}
+			}
+		} );
+	}
+
+	// Patch embedding: the patches narrowed to FP16, times the convolution kernel, plus its bias and the position rows; the residual stream stays FP32
+	fit( scratch_.xin, static_cast<size_t>( m ) * P );
+	fit( scratch_.raw, mh );
+	par.run( m, 16, [&]( int64_t r0, int64_t r1 ) {
+		thread_local std::vector<uint16_t> h;
+		h.resize( P );
+		for ( int64_t r = r0; r < r1; ++r ) {
+			cpu::float_to_half( img.patches.data() + static_cast<size_t>( r ) * P, h.data(), P );
+			cpu::half_to_float( h.data(), scratch_.xin.data() + static_cast<size_t>( r ) * P, P );
+		}
+	} );
+	gemm( par, scratch_.xin.data(), m, patch_w_, scratch_.raw.data() );
+	par.run( m, 16, [&]( int64_t r0, int64_t r1 ) {
+		for ( int64_t r = r0; r < r1; ++r )
+			for ( int c = 0; c < H; ++c ) hidden_[static_cast<size_t>( r ) * H + c] = scratch_.raw[static_cast<size_t>( r ) * H + c] + patch_b_[c] + pos_[static_cast<size_t>( r ) * H + c];
+	} );
+
+	const float scale = 1.0f / std::sqrt( static_cast<float>( hd ) );
+	const int half_dim = hd / 2;
+	for ( const Block& b : blocks_ ) {
+		layer_norm( par, hidden_.data(), b.norm1_w.data(), b.norm1_b.data(), ln_.data(), m, H, cfg_.eps );
+		forward( par, scratch_, b.q, ln_.data(), m, q_.data() );
+		forward( par, scratch_, b.k, ln_.data(), m, k_.data() );
+		forward( par, scratch_, b.v, ln_.data(), m, v_.data() );
+		// bias and the 2-D rotary (rotate-half layout) on q and k, the bias on v
+		par.run( m, 4, [&]( int64_t r0, int64_t r1 ) {
+			float t[128];
+			for ( int64_t row = r0; row < r1; ++row ) {
+				const float* c = cs.data() + static_cast<size_t>( row ) * hd;
+				const float* s = sn.data() + static_cast<size_t>( row ) * hd;
+				for ( int head = 0; head < cfg_.heads; ++head ) {
+					const size_t base = static_cast<size_t>( row ) * H + static_cast<size_t>( head ) * hd;
+					for ( int which = 0; which < 3; ++which ) {
+						uint16_t* p = ( which == 0 ? q_.data() : which == 1 ? k_.data() : v_.data() ) + base;
+						const float* bias = ( which == 0 ? b.q_b.data() : which == 1 ? b.k_b.data() : b.v_b.data() ) + static_cast<size_t>( head ) * hd;
+						cpu::half_to_float( p, t, hd );
+						for ( int d = 0; d < hd; ++d ) t[d] += bias[d];
+						if ( which < 2 ) {
+							for ( int d = 0; d < half_dim; ++d ) {
+								const float a = t[d], bb = t[d + half_dim];
+								t[d] = a * c[d] - bb * s[d];
+								t[d + half_dim] = bb * c[d + half_dim] + a * s[d + half_dim];
+							}
+						}
+						cpu::float_to_half( t, p, hd );
+					}
+				}
+			}
+		} );
+		attention( par, scratch_, q_.data(), k_.data(), v_.data(), attn_.data(), m, cfg_.heads, scale, hd );
+		forward( par, scratch_, b.proj, attn_.data(), m, tmp_.data() );
+		bias_residual( par, hidden_.data(), tmp_.data(), b.proj_b.data(), m, H );
+
+		layer_norm( par, hidden_.data(), b.norm2_w.data(), b.norm2_b.data(), ln_.data(), m, H, cfg_.eps );
+		forward( par, scratch_, b.fc1, ln_.data(), m, mlp_.data() );
+		gelu_tanh( par, mlp_.data(), b.fc1_b.data(), m, I );
+		forward( par, scratch_, b.fc2, mlp_.data(), m, tmp_.data() );
+		bias_residual( par, hidden_.data(), tmp_.data(), b.fc2_b.data(), m, H );
+	}
+
+	// The patch merger: LayerNorm over the width, four consecutive rows read as one row, two projections
+	const size_t to = static_cast<size_t>( tokens ) * O, tw = static_cast<size_t>( tokens ) * mw;
+	fit( merged_, tw );
+	fit( mfc1_, tw );
+	fit( out_, to );
+	layer_norm( par, hidden_.data(), merge_norm_w_.data(), merge_norm_b_.data(), merged_.data(), m, H, cfg_.eps );
+	forward( par, scratch_, merge_fc1_, merged_.data(), tokens, mfc1_.data() );
+	gelu_erf( par, mfc1_.data(), merge_fc1_b_.data(), tokens, mw );
+	forward( par, scratch_, merge_fc2_, mfc1_.data(), tokens, out_.data() );
+	add_bias( par, out_.data(), merge_fc2_b_.data(), tokens, O );
+
+	out->resize( to );
+	std::memcpy( out->data(), out_.data(), to * sizeof( uint16_t ) );
+	LOG_INFO( "[vision] host encode: %d patches in %.1f s\n", m, std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() );
+	return true;
+}
+
+} // namespace
+
+std::unique_ptr<VisionTower> make_host_qwen3_tower( const char* model_dir, const char* mmproj_dir, int max_tokens, const std::vector<int>& cpus, std::string* error ) {
+	auto t = std::make_unique<HostQwen3Tower>();
+	if ( !t->load( model_dir, mmproj_dir, max_tokens, cpus, error ) ) return nullptr;
+	return t;
 }
 
 } // namespace engine::models
