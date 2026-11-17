@@ -1,5 +1,5 @@
-// GGUF architecture clip (llama.cpp's mmproj files) for the projector type gemma4v: Gemma 4's vision tower and embedding projection
-// under the Hugging Face names Gemma4VisionTower loads. The converter keeps every tensor as it is (norms F32, projections BF16) except the
+// GGUF architecture clip (llama.cpp's mmproj files) for the projector types gemma4v (Gemma 4's vision tower and embedding projection under the
+// Hugging Face names Gemma4VisionTower loads) and glm5v (GLM-5's tower and merger under the checkpoint's model.visual.* names). The converter keeps every tensor as it is (norms F32, projections BF16) except the
 // patch embedding, which it stores as a conv kernel [n, channel, y, x]: the PatchChwToHwc transform restores [n, y * x * channel].
 #include "gguf_arch.h"
 #include <cstdio>
@@ -50,12 +50,78 @@ void map_gemma4v( const GgufArch&, const GgufKv&, const std::string& g, std::vec
 	}
 }
 
+// GLM-5 (glm5v): the converter keeps the tower as the checkpoint has it (norms and biases F32, projections BF16) except the fused qkv, which stays
+// fused (the weight is cut into q / k / v row ranges here; the tower slices the fused bias), and the patch embedding, which it cuts along the
+// temporal axis into two conv kernels [n, channel, y, x] (.t0 and .t1 here; the tower joins them into [n, channel, t, y, x])
+const Name kGlmBlock[] = {
+	{ "ln1.weight", "norm1.weight" },
+	{ "ln2.weight", "norm2.weight" },
+	{ "attn_q_norm.weight", "attn.q_norm.weight" },
+	{ "attn_k_norm.weight", "attn.k_norm.weight" },
+	{ "attn_qkv.bias", "attn.qkv.bias" },
+	{ "attn_out.weight", "attn.proj.weight" },
+	{ "attn_out.bias", "attn.proj.bias" },
+	{ "ffn_gate.weight", "mlp.gate_proj.weight" },
+	{ "ffn_gate.bias", "mlp.gate_proj.bias" },
+	{ "ffn_up.weight", "mlp.up_proj.weight" },
+	{ "ffn_up.bias", "mlp.up_proj.bias" },
+	{ "ffn_down.weight", "mlp.down_proj.weight" },
+	{ "ffn_down.bias", "mlp.down_proj.bias" },
+};
+
+const Name kGlmTop[] = {
+	{ "v.patch_embd.weight", "model.visual.patch_embed.proj.weight.t0" },
+	{ "v.patch_embd.weight.1", "model.visual.patch_embed.proj.weight.t1" },
+	{ "v.patch_embd.bias", "model.visual.patch_embed.proj.bias" },
+	{ "v.post_ln.weight", "model.visual.post_layernorm.weight" },
+	{ "mm.patch_merger.weight", "model.visual.downsample.weight" },
+	{ "mm.patch_merger.bias", "model.visual.downsample.bias" },
+	{ "mm.model.fc.weight", "model.visual.merger.proj.weight" },
+	{ "mm.post_norm.weight", "model.visual.merger.post_projection_norm.weight" },
+	{ "mm.post_norm.bias", "model.visual.merger.post_projection_norm.bias" },
+	{ "mm.gate.weight", "model.visual.merger.gate_proj.weight" },
+	{ "mm.up.weight", "model.visual.merger.up_proj.weight" },
+	{ "mm.down.weight", "model.visual.merger.down_proj.weight" },
+};
+
+void map_glm5v( const GgufArch&, const GgufKv& kv, const std::string& g, std::vector<GgufMapped>* out ) {
+	auto emit = [&]( const std::string& name, int64_t row_begin = 0, int64_t rows = -1 ) {
+		GgufMapped m;
+		m.name = name;
+		m.row_begin = row_begin;
+		m.rows = rows;
+		out->push_back( std::move( m ) );
+	};
+	for ( const Name& n : kGlmTop ) {
+		if ( g == n.gguf ) { emit( n.hf ); return; }
+	}
+	int layer = -1, used = 0;
+	if ( std::sscanf( g.c_str(), "v.blk.%d.%n", &layer, &used ) != 1 || used == 0 ) return;
+	const std::string rest = g.substr( static_cast<size_t>( used ) ), base = "model.visual.blocks." + std::to_string( layer ) + ".";
+	if ( rest == "attn_qkv.weight" ) {
+		const int64_t hidden = kv.get( "clip.vision.embedding_length" );
+		if ( hidden <= 0 ) return;
+		emit( base + "attn.q_proj.weight", 0, hidden );
+		emit( base + "attn.k_proj.weight", hidden, hidden );
+		emit( base + "attn.v_proj.weight", 2 * hidden, hidden );
+		return;
+	}
+	for ( const Name& n : kGlmBlock ) {
+		if ( rest == n.gguf ) { emit( base + n.hf ); return; }
+	}
+}
+
 } // namespace
 
 bool gguf_arch_clip( const GgufKv& kv, GgufArch* out ) {
-	const auto it = kv.strings.find( "clip.vision.projector_type" );
-	if ( it == kv.strings.end() || it->second != "gemma4v" ) return false;
-	out->map = map_gemma4v;
+	std::string type;
+	for ( const char* key : { "clip.vision.projector_type", "clip.projector_type" } ) {
+		const auto it = kv.strings.find( key );
+		if ( it != kv.strings.end() ) { type = it->second; break; }
+	}
+	if ( type == "gemma4v" ) out->map = map_gemma4v;
+	else if ( type == "glm5v" ) out->map = map_glm5v;
+	else return false;
 	return true;
 }
 

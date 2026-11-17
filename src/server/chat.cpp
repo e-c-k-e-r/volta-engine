@@ -280,7 +280,6 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 	// Without a vision tower an image part becomes a note in the text, so an agent that reads an image file carries on instead of failing
 	const bool see = !req.images.empty() && gen.vision_params() && gen.tokenizer().get_special_token( image_pad_name( family ) ) >= 0;
 	if ( !req.images.empty() && !see && vars["messages"].is_array() ) omit_images( vars["messages"] );
-	if ( family == engine::loader::ModelFamily::GLM && see && vars["messages"].is_array() ) inline_glm_image_markers( vars["messages"] );
 	if ( family == engine::loader::ModelFamily::GEMMA ) {
 		if ( vars["messages"].is_array() ) gemma_tool_messages( vars["messages"] );
 		vars["bos_token"] = gen.tokenizer().decode_token( gen.tokenizer().get_special_token( "<bos>" ) );
@@ -304,6 +303,8 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 		escape_control_text( vars["messages"], ctl );
 		if ( vars.contains( "tools" ) ) escape_control_text( vars["tools"], ctl );
 	}
+	// After the escaping: the markers are the model's own special tokens, not text a user typed
+	if ( family == engine::loader::ModelFamily::GLM && see && vars["messages"].is_array() ) inline_glm_image_markers( vars["messages"] );
 	std::string terr;
 	if ( !gen.chat_template().render_json( vars.dump(), prompt, &terr ) ) {
 		err->message = "the chat template rejected this conversation: " + terr;
@@ -338,6 +339,8 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 			err->message = "the conversation holds " + std::to_string( images->size() ) + " images but the chat template placed " + std::to_string( pads ) + " (images are only allowed in user and tool messages)";
 			return false;
 		}
+		// vision_cpu encodes here, on the request's own thread, before the request queues for a slot
+		for ( const auto& im : *images ) gen.prefetch_image( im );
 		int img_begin = -1, img_end = -1;
 		image_markers( family, gen.tokenizer(), &img_begin, &img_end );
 		*tokens = expand_image_tokens( *tokens, pad_id, *images, img_begin, img_end );

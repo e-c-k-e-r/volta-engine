@@ -5,6 +5,8 @@
 #include "engine/modules/expert_tier.h"
 #include "engine/runtime/cpu_expert_mailbox.h"
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace engine::cpu_moe {
 
@@ -24,6 +26,10 @@ struct CpuExpertHandle {
 // CPU-layout copy (trellis or NVFP4, from its pinned host codes and device scale vectors) and keeps that true across swaps. The experts of tier
 // layer i are numbered first_expert + e; act_limit is the SwiGLU clamp of the model (0 = plain SiLU)
 CpuExpertHandle attach_cpu_experts( modules::ExpertTier& tier, int rank, int first_expert, int hidden, float act_limit, pod::MemoryArena& device, backend::stream_t stream );
+
+// The logical CPUs of a host worker pool that must stay clear of the GPU rank threads (the vision_cpu encoder): the list when given (e.g. "10-19,24"),
+// otherwise one thread per physical core of the last NUMA node, or of the only node from core 4 on; empty without NUMA information
+std::vector<int> host_worker_cpus( const std::string& list );
 
 // Stops the CPU expert service and frees its host state (the model's teardown, before the device contexts are destroyed)
 void detach_cpu_experts();

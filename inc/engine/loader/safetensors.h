@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstring>
+
 #include "engine/config.h"
 #include "engine/core/tensor.h"
 #include "engine/core/arena.h"
@@ -313,6 +315,9 @@ public:
 	}
 	// The EXL3 tiles of this checkpoint are in the Volta order (quantization_config.json "tile_layout": "volta"); every trellis weight it loads carries it
 	bool volta_tiles() const { return volta_tiles_; }
+	// The tile order of one weight: the checkpoint's, except for the vision tower (model.visual.*), which the quantizer skips (exl3_quantize.py
+	// --skip model.visual: the tower keeps the template's stock order whatever tile_layout says)
+	bool volta_tiles_for( const char* base_name ) const { return volta_tiles_ && std::strncmp( base_name, "model.visual.", 13 ) != 0; }
 
 private:
 	// A GGUF block tensor as a LinearWeight: the given row ranges, and of each row the given column ranges (whole blocks), the column order
@@ -328,8 +333,8 @@ private:
 	char dir_path_[1024];
 	bool volta_tiles_ = false;
 
-	pod::LinearWeight tiles( pod::LinearWeight lw ) const {
-		lw.volta_tiles = volta_tiles_;
+	pod::LinearWeight tiles( pod::LinearWeight lw, const char* base_name ) const {
+		lw.volta_tiles = volta_tiles_for( base_name );
 		return lw;
 	}
 

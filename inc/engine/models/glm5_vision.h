@@ -25,6 +25,10 @@ struct Glm5VisionConfig {
 	int patch_dim() const { return 3 * temporal_patch_size * patch_size * patch_size; }
 };
 
+// The tower's geometry and the checkpoint's image processor settings (config.json vision_config, processor_config.json) for images of up to
+// max_patches patches; false without a usable vision_config. Shared by the GPU tower and the host one (host_vision.h)
+bool glm5_vision_config( const char* model_dir, int max_patches, Glm5VisionConfig* cfg, engine::loader::VisionParams* params );
+
 // The GLM-5 image encoder: patch embedding, RMSNorm + SwiGLU ViT blocks with per-head q / k norm and 2-D rotary, a stride-2
 // convolution that merges 2x2 patches, and a SwiGLU projector into the language model's hidden size. Weights are the checkpoint's
 // model.visual.* tensors (trellis projections, FP16 norms / biases).

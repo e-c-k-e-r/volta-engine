@@ -3,6 +3,8 @@
 #include "engine/runtime/mtp_runner.h"
 #include "engine/runtime/suffix_runner.h"
 #include "engine/runtime/dspark_runner.h"
+#include "engine/runtime/cpu_expert_attach.h"
+#include "engine/models/host_vision.h"
 #include "engine/core/log.h"
 #include "engine/core/scratch.h"
 #include "engine/runtime/options.h"
@@ -190,7 +192,14 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		LOG_INFO( "[mem] GPU 0 arena: routed experts %.2f GiB (%.2f GiB free)\n", ( arenas_[0].offset_bytes - mem_spec ) / kGiB, ( arenas_[0].total_bytes - arenas_[0].offset_bytes ) / kGiB );
 	}
 	// Image encoder last, into whatever the arena has left (rank 0)
-	models_[0]->load_vision( cfg.model_dir.c_str(), streams_[0] );
+	if ( opt.vision_cpu > 0 ) {
+		if ( opt.max_image_tokens > 0 ) LOG_WARN( "[vision] vision_cpu is set: max_image_tokens %d is ignored, no tower loads on the GPU\n", opt.max_image_tokens );
+		const std::string vdir = opt.vision_dir.empty() ? cfg.model_dir : opt.vision_dir;
+		std::string verr;
+		host_vision_ = engine::models::make_host_vision_tower( vdir.c_str(), opt.vision_mmproj.c_str(), opt.vision_cpu, cpu_moe::host_worker_cpus( opt.vision_cpus ), &verr );
+		if ( !host_vision_ ) LOG_WARN( "[vision] vision_cpu: %s; image input stays off\n", verr.c_str() );
+	}
+	else models_[0]->load_vision( cfg.model_dir.c_str(), streams_[0] );
 	if ( opt.mem_log ) {
 		for ( int d = 0; d < tp_; ++d ) {
 			LOG_INFO( "[mem] GPU %d after loading: arena %.0f / %.0f MiB used, %.0f MiB free outside it (reserve %.0f MiB)\n", d, arenas_[d].offset_bytes / 1048576.0,
@@ -268,6 +277,7 @@ void ModelCluster::set_slot_mm( int slot, MmLayout layout ) {
 }
 
 bool ModelCluster::encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out ) {
+	if ( host_vision_ ) return host_vision_->encode( image, out, nullptr );
 	backend::set_device( 0 );
 	return models_[0]->encode_image( image, out, streams_[0] );
 }

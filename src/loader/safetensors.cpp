@@ -1089,7 +1089,7 @@ pod::LinearWeight SafeTensorsRepo::synth_linear( const char* base_name, pod::Mem
 	backend::memcpy_async( suh.data, signs.data(), static_cast<size_t>( k ) * 2, backend::Copy::H2D, stream );
 	backend::memcpy_async( svh.data, small.data(), static_cast<size_t>( n ) * 2, backend::Copy::H2D, stream );
 	backend::stream_sync( stream );   // the host buffers are reused by the next call
-	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, bits, true, false ) );
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, bits, true, false ), base_name );
 }
 
 size_t SafeTensorsRepo::bytes_with_prefix( const char* prefix ) const {
@@ -1200,7 +1200,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear(
 	const bool has_mcg = ( find( name_buf, &dummy_shard ) != nullptr );
 
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : bits;
-	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ) );
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ), base_name );
 }
 
 pod::LinearWeight SafeTensorsRepo::load_linear_slice(
@@ -1260,7 +1260,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.svh", base_name );
 		pod::TensorView svh = load( name_buf, arena, stream, pod::DType::FP16 );
 
-		return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ) );
+		return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ), base_name );
 	}
 	else {
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.suh", base_name );
@@ -1269,7 +1269,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.svh", base_name );
 		pod::TensorView svh = load_slice( name_buf, arena, 0, rank, tp_size, stream, pod::DType::FP16 );
 
-		return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ) );
+		return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ), base_name );
 	}
 }
 
@@ -1343,7 +1343,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_range(
 	const bool has_mul1 = find( name_buf, &dummy ) != nullptr;
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.mcg", base_name );
 	const bool has_mcg = find( name_buf, &dummy ) != nullptr;
-	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, engine::modules::trellis_code_from_u16( B ), has_mul1, has_mcg ) );   // the width code (half-integer rates too)
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, engine::modules::trellis_code_from_u16( B ), has_mul1, has_mcg ), base_name );   // the width code (half-integer rates too)
 }
 
 pod::LinearWeight SafeTensorsRepo::load_linear_slice_padded(
@@ -1452,7 +1452,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_cols_padded(
 	const bool has_mcg = ( find( name_buf, &dummy_shard ) != nullptr );
 
 	int actual_bits = engine::modules::trellis_code_from_u16( B );
-	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits ? actual_bits : bits, has_mul1, has_mcg ) );
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits ? actual_bits : bits, has_mul1, has_mcg ), base_name );
 }
 
 pod::LinearWeight SafeTensorsRepo::load_linear_slice_fused(
@@ -1555,7 +1555,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_fused(
 	backend::stream_sync( stream );
 
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : bits;
-	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits ) );
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits ), base_name_a );
 }
 
 pod::LinearWeight SafeTensorsRepo::load_grouped_trellis_slice(
@@ -1606,7 +1606,7 @@ pod::LinearWeight SafeTensorsRepo::load_grouped_trellis_slice(
 	const bool has_mcg = ( find( name_buf, &dummy_shard ) != nullptr );
 
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : 5;
-	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ) );
+	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ), base_name );
 }
 
 pod::TensorView SafeTensorsRepo::load_grouped_slice(

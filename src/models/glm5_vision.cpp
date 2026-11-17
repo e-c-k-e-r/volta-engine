@@ -14,42 +14,51 @@
 
 namespace engine::models {
 
-bool Glm5VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream ) {
+bool glm5_vision_config( const char* model_dir, int max_patches, Glm5VisionConfig* out_cfg, engine::loader::VisionParams* out_params ) {
+	Glm5VisionConfig cfg;
+	engine::loader::VisionParams params;
 	const nlohmann::json cfg_json = read_json( std::string( model_dir ) + "/config.json" );
 	if ( cfg_json.is_discarded() || !cfg_json.contains( "vision_config" ) ) return false;
 	const auto& vc = cfg_json["vision_config"];
-	cfg_.depth = vc.value( "depth", cfg_.depth );
-	cfg_.hidden = vc.value( "hidden_size", cfg_.hidden );
-	cfg_.heads = vc.value( "num_heads", cfg_.heads );
-	cfg_.intermediate = vc.value( "intermediate_size", cfg_.intermediate );
-	cfg_.out_hidden = vc.value( "out_hidden_size", cfg_.out_hidden );
-	cfg_.merger_intermediate = vc.value( "projection_intermediate_size", cfg_.merger_intermediate );
-	cfg_.patch_size = vc.value( "patch_size", cfg_.patch_size );
-	cfg_.merge_size = vc.value( "spatial_merge_size", cfg_.merge_size );
-	cfg_.temporal_patch_size = vc.value( "temporal_patch_size", cfg_.temporal_patch_size );
-	cfg_.eps = vc.value( "rms_norm_eps", cfg_.eps );
-	cfg_.swiglu_limit = vc.value( "swiglu_limit", cfg_.swiglu_limit );
-	if ( cfg_.head_dim() != 64 || cfg_.merge_size != 2 ) {
-		LOG_WARN( "[vision] unsupported GLM vision geometry (head_dim %d, merge %d)\n", cfg_.head_dim(), cfg_.merge_size );
+	cfg.depth = vc.value( "depth", cfg.depth );
+	cfg.hidden = vc.value( "hidden_size", cfg.hidden );
+	cfg.heads = vc.value( "num_heads", cfg.heads );
+	cfg.intermediate = vc.value( "intermediate_size", cfg.intermediate );
+	cfg.out_hidden = vc.value( "out_hidden_size", cfg.out_hidden );
+	cfg.merger_intermediate = vc.value( "projection_intermediate_size", cfg.merger_intermediate );
+	cfg.patch_size = vc.value( "patch_size", cfg.patch_size );
+	cfg.merge_size = vc.value( "spatial_merge_size", cfg.merge_size );
+	cfg.temporal_patch_size = vc.value( "temporal_patch_size", cfg.temporal_patch_size );
+	cfg.eps = vc.value( "rms_norm_eps", cfg.eps );
+	cfg.swiglu_limit = vc.value( "swiglu_limit", cfg.swiglu_limit );
+	if ( cfg.head_dim() != 64 || cfg.merge_size != 2 ) {
+		LOG_WARN( "[vision] unsupported GLM vision geometry (head_dim %d, merge %d)\n", cfg.head_dim(), cfg.merge_size );
 		return false;
 	}
 
-	params_.patch_size = cfg_.patch_size;
-	params_.merge_size = cfg_.merge_size;
-	params_.temporal_patch_size = cfg_.temporal_patch_size;
-	params_.canvas = true;
-	params_.max_pixels = max_patches * cfg_.patch_size * cfg_.patch_size;
+	params.patch_size = cfg.patch_size;
+	params.merge_size = cfg.merge_size;
+	params.temporal_patch_size = cfg.temporal_patch_size;
+	params.canvas = true;
+	params.max_pixels = max_patches * cfg.patch_size * cfg.patch_size;
 	const nlohmann::json pc = read_json( std::string( model_dir ) + "/processor_config.json" );
 	if ( !pc.is_discarded() && pc.contains( "image_processor" ) ) {
 		const auto& ip = pc["image_processor"];
 		if ( ip.contains( "image_mean" ) && ip["image_mean"].size() == 3 && ip.contains( "image_std" ) && ip["image_std"].size() == 3 ) {
 			for ( int c = 0; c < 3; ++c ) {
-				params_.mean[c] = ip["image_mean"][c].get<float>();
-				params_.stddev[c] = ip["image_std"][c].get<float>();
+				params.mean[c] = ip["image_mean"][c].get<float>();
+				params.stddev[c] = ip["image_std"][c].get<float>();
 			}
 		}
-		params_.min_pixels = ip.value( "min_image_tokens", 16 ) * cfg_.merge_size * cfg_.merge_size * cfg_.patch_size * cfg_.patch_size;
+		params.min_pixels = ip.value( "min_image_tokens", 16 ) * cfg.merge_size * cfg.merge_size * cfg.patch_size * cfg.patch_size;
 	}
+	*out_cfg = cfg;
+	*out_params = params;
+	return true;
+}
+
+bool Glm5VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream ) {
+	if ( !glm5_vision_config( model_dir, max_patches, &cfg_, &params_ ) ) return false;
 
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) return false;

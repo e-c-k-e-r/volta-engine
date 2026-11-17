@@ -5,6 +5,7 @@
 #include "engine/core/comm.h"
 #include "engine/core/batch.h"
 #include "engine/models/model.h"
+#include "engine/models/vision_tower.h"
 #include "engine/runtime/rank_pool.h"
 #include "engine/runtime/dflash2_runner.h"
 #include "engine/runtime/speculator.h"
@@ -134,7 +135,9 @@ public:
 	// image embeddings in place of the placeholder tokens' embeddings; set it before prefilling, reset_slot clears it.
 	void set_slot_mm( int slot, MmLayout layout );
 	void apply_mrope( pod::BatchRows& rows ) const;
-	const engine::loader::VisionParams* vision_params() const { return models_[0]->vision_params(); }
+	const engine::loader::VisionParams* vision_params() const { return host_vision_ ? &host_vision_->params() : models_[0]->vision_params(); }
+	// True when the vision_cpu tower on the host encodes the images: any thread may call encode_image then, unlike with the on-GPU tower
+	bool host_vision() const { return host_vision_ != nullptr; }
 	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out );
 	void checkpoint( int slot );
 	void rollback( int slot );
@@ -187,6 +190,7 @@ public:
 	int tp() const { return tp_; }
 
 private:
+	std::unique_ptr<engine::models::VisionTower> host_vision_;   // vision_cpu: the image encoder on the host CPU
 	bool created_ = false;
 	bool initialized_ = false;
 	bool resident_bias_logged_ = false;   // route_resident_bias: the first update logs the table

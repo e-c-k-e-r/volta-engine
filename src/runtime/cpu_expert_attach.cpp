@@ -50,6 +50,16 @@ std::vector<int> first_threads( int node, int skip_below ) {
 	return out;
 }
 
+int numa_nodes() {
+	int nodes = 0;
+	while ( nodes < 64 ) {
+		char path[96];
+		std::snprintf( path, sizeof path, "/sys/devices/system/node/node%d/cpulist", nodes );
+		if ( std::FILE* f = std::fopen( path, "r" ) ) { std::fclose( f ); ++nodes; } else break;
+	}
+	return nodes;
+}
+
 // The plan is made once, by the first tier attached (its expert format picks the default node); later calls read it
 CpuPlan g_plan;
 bool g_plan_made = false;
@@ -67,12 +77,7 @@ const CpuPlan& make_cpu_plan( bool nvfp4 ) {
 		CpuPlan p;
 		p.node = opt.cpu_expert_node;
 		if ( !opt.cpu_expert_cpus.empty() ) { p.cpus = Service::parse_cpus( opt.cpu_expert_cpus ); return p; }
-		int nodes = 0;
-		while ( nodes < 64 ) {
-			char path[96];
-			std::snprintf( path, sizeof path, "/sys/devices/system/node/node%d/cpulist", nodes );
-			if ( std::FILE* f = std::fopen( path, "r" ) ) { std::fclose( f ); ++nodes; } else break;
-		}
+		const int nodes = numa_nodes();
 		if ( nodes == 0 ) return p;   // no NUMA information: the service's default (4 unpinned threads)
 		const int node = p.node >= 0 && p.node < nodes ? p.node : nvfp4 ? 0 : nodes - 1;
 		p.cpus = first_threads( node, node == 0 ? kRankCores : 0 );
@@ -153,5 +158,13 @@ CpuExpertHandle attach_cpu_experts( modules::ExpertTier& tier, int rank, int fir
 }
 
 void detach_cpu_experts() { Service::get().quiesce(); }
+
+std::vector<int> host_worker_cpus( const std::string& list ) {
+	if ( !list.empty() ) return Service::parse_cpus( list );
+	const int nodes = numa_nodes();
+	if ( nodes == 0 ) return {};
+	// The last node, away from the GPU rank threads; on a single node its cores from kRankCores on
+	return first_threads( nodes - 1, nodes == 1 ? kRankCores : 0 );
+}
 
 }   // namespace engine::cpu_moe

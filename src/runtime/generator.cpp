@@ -542,7 +542,12 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 	slot.req.images.clear();
 }
 
+void Generator::prefetch_image( const GenerationRequest::Image& im ) {
+	if ( cluster_.host_vision() ) image_embeddings( im );
+}
+
 std::shared_ptr<const std::vector<backend::half_t>> Generator::image_embeddings( const GenerationRequest::Image& im ) {
+	std::lock_guard<std::mutex> lock( image_mtx_ );
 	auto it = image_cache_.find( im.hash );
 	if ( it != image_cache_.end() ) {
 		image_cache_lru_.remove( im.hash );

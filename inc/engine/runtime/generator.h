@@ -230,6 +230,9 @@ public:
 	int max_context() const { return cluster_.metadata().max_seq_len; }
 	// Image preprocessing parameters of the loaded vision tower; null when the model takes no images
 	const engine::loader::VisionParams* vision_params() const { return cluster_.vision_params(); }
+	// With vision_cpu: encodes an image on the calling (request) thread and caches the rows, so the scheduler finds them ready and the slots keep
+	// decoding meanwhile; a no-op for the on-GPU tower, which only the scheduler thread may drive
+	void prefetch_image( const GenerationRequest::Image& im );
 	int vocab_size() const { return cluster_.metadata().vocab_size; }
 	int num_slots() const { return num_slots_; }
 	bool steer_enabled() const { return cluster_.steer_enabled(); }
@@ -321,6 +324,7 @@ private:
 	std::unordered_map<uint64_t, std::shared_ptr<const std::vector<backend::half_t>>> image_cache_;
 	std::list<uint64_t> image_cache_lru_;
 	size_t image_cache_bytes_ = 0;
+	std::mutex image_mtx_;   // the cache and the encode: request threads prefetch while the scheduler reads
 
 	engine::server::ServerConfig config_;
 	ModelCluster cluster_;

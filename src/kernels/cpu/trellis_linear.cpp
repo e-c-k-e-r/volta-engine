@@ -195,6 +195,44 @@ TilesFn tiles_fn( int bits, bool avx2 ) {
 	}
 }
 
+// Position p of a tile owns the 16-bit window that starts at stream bit (p * bits + bits - 16) mod 256 * bits (MSB first inside the little-endian u32
+// words of the tile); the tile's order maps the position to a weight (row, column). Stock: lane L = p / 8, i = p % 8 is row (L & 3) * 2 + (i & 1) +
+// 8 * ((i >> 1) & 1), column 2 * (L / 8 + 4 * (i >> 2)) + ((L >> 2) & 1); Volta (tile_layout volta): lane 4 (2 (row >> 3) + (column >> 3)) + (column & 3) +
+// 16 ((column >> 2) & 1), i = 4 ((row >> 2) & 1) + (row & 3). The position of every (row, column), then inverted
+std::array<uint16_t, 256> position_to_element( bool volta ) {
+	std::array<uint16_t, 256> map{};
+	for ( int r = 0; r < 16; ++r )
+		for ( int c = 0; c < 16; ++c ) {
+			int lane = ( ( c >> 1 ) & 3 ) * 8 + ( c & 1 ) * 4 + ( ( r >> 1 ) & 3 ), i = ( ( c >> 1 ) >> 2 ) * 4 + ( r >> 3 ) * 2 + ( r & 1 );
+			if ( volta ) {
+				lane = 4 * ( 2 * ( r >> 3 ) + ( c >> 3 ) ) + ( c & 3 ) + 16 * ( ( c >> 2 ) & 1 );
+				i = ( ( r >> 2 ) & 1 ) * 4 + ( r & 3 );
+			}
+			map[lane * 8 + i] = static_cast<uint16_t>( r * 16 + c );
+		}
+	return map;
+}
+
+// The codebook value of every weight of the tiles as FP16 panels (see dequantize_panels), once per weight
+void dequantize_tiles( const uint16_t* trellis, int kt, int nt, int bits, bool volta, uint16_t* out ) {
+	const std::array<uint16_t, 256> map = position_to_element( volta );
+	const int total = 256 * bits, words = total / 32, k = kt * 16;
+	std::array<uint32_t, 8 * 8> wd{};
+	for ( int n = 0; n < nt; ++n )
+		for ( int t = 0; t < kt; ++t ) {
+			const uint16_t* tile = trellis + ( static_cast<size_t>( t ) * nt + n ) * 16 * bits;
+			for ( int j = 0; j < words; ++j ) wd[j] = ld32( tile, j );
+			float v[256];
+			for ( int p = 0; p < 256; ++p ) {
+				const int q0 = ( p * bits + bits - 16 + total ) % total;
+				const uint64_t two = ( static_cast<uint64_t>( wd[( q0 >> 5 ) % words] ) << 32 ) | wd[( ( q0 >> 5 ) + 1 ) % words];
+				const uint32_t w = static_cast<uint32_t>( two >> ( 48 - ( q0 & 31 ) ) ) & 0xffffu;
+				v[map[p]] = std::fma( static_cast<float>( 1024u + byte_sum( w ) ), kC1, kC2 );
+			}
+			for ( int r = 0; r < 16; ++r ) float_to_half( v + r * 16, out + ( static_cast<size_t>( n ) * k + static_cast<size_t>( t ) * 16 + r ) * 16, 16 );
+		}
+}
+
 }   // namespace
 bool TrellisLinear::supported( int bits ) { return bits >= 1 && bits <= 8; }
 
@@ -217,6 +255,17 @@ TrellisLinear::TrellisLinear( const uint16_t* trellis, int kt, int nt, int bits,
 	svh_.resize( static_cast<size_t>( nt ) * 16 );
 	half_to_float( suh, suh_.data(), suh_.size() );
 	half_to_float( svh, svh_.data(), svh_.size() );
+}
+
+TrellisLinear::TrellisLinear( int kt, int nt, int bits, const uint16_t* suh, const uint16_t* svh ) : kt_( kt ), nt_( nt ), bits_( bits ) {
+	suh_.resize( static_cast<size_t>( kt ) * 16 );
+	svh_.resize( static_cast<size_t>( nt ) * 16 );
+	half_to_float( suh, suh_.data(), suh_.size() );
+	half_to_float( svh, svh_.data(), svh_.size() );
+}
+
+void TrellisLinear::dequantize_panels( const uint16_t* trellis, int kt, int nt, int bits, bool volta, uint16_t* panels ) {
+	dequantize_tiles( trellis, kt, nt, bits, volta, panels );
 }
 
 void TrellisLinear::prepare_block( const float* x, int b, float* xin ) const {
