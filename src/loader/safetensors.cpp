@@ -636,8 +636,9 @@ bool SafeTensorsRepo::open( const char* dir_path, bool mmproj ) {
 	}
 
 	// Tensors a checkpoint keeps outside its index: GLM-5.3 ships the DSA k-pool gate / APE in kpool_aux.safetensors, exllamav3's DeepSeek-V4.1
-	// conversions the Engram tables in ngram_embedding.safetensors, the published Flash-Next EXL3 branches the vision tower in vision_k6.safetensors
-	for ( const char* aux : { "kpool_aux.safetensors", "ngram_embedding.safetensors", "vision_k6.safetensors" } ) {
+	// conversions the Engram tables in ngram_embedding.safetensors, the published Flash-Next EXL3 branches the vision tower in vision_k6.safetensors (4.05 bpw)
+	// and the MTP head's hyper-connection mixer in mtp_hyper_connection_mixer_patch.safetensors (3.05 bpw)
+	for ( const char* aux : { "kpool_aux.safetensors", "ngram_embedding.safetensors", "vision_k6.safetensors", "mtp_hyper_connection_mixer_patch.safetensors" } ) {
 		if ( std::find( shard_files.begin(), shard_files.end(), std::string( aux ) ) != shard_files.end() ) continue;
 		char aux_path[1024];
 		std::snprintf( aux_path, sizeof( aux_path ), "%s/%s", dir_path, aux );
