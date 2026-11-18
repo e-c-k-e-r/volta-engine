@@ -25,7 +25,7 @@ clocks, so rerun the whole set rather than one table when either changes.
 | Flash-Next | EXL3 4.0 bpw (head 6), Volta tile order, from the base model | `Qwen3.8-Flash-Next-volta-cal` |
 | | EXL3 4.0 bpw (head 6), stock order, the Swift fine-tune | `Swift-Qwen3.8-Flash-Next-exl3-4.00bpw` |
 | | NVFP4 experts as shipped, dense groups quantized to NVFP4 at load (`nvfp4_dense=all`) | `Qwen3.8-Flash-Next-NVFP4` |
-| | GGUF IQ3_S, the Swift fine-tune | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` |
+| | GGUF IQ3_S (GSQ-RCO of the base model) | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` |
 | GLM-5.3-Flash | EXL3 3.05 bpw (head 6), stock order | `GLM-5.3-Flash-exl3-3.05bpw` |
 | | EXL3 3.05 bpw (head 6), Volta order | `GLM-5.3-Flash-exl3-3.05bpw-volta-cal` |
 | DeepSeek-V4.1-Flash | EXL3 1.68 bpw (head 6) | `DeepSeek-V4.1-Flash-1017-exl3-1.68bpw` |
@@ -80,7 +80,7 @@ Decode tok/s, tokens per round in parentheses.
 | | EXL3 4.0 bpw, stock order (Swift) | DFlash2 | 96 (3.63) | 105 (3.40) | 169 (5.59) | 172 (5.63) |
 | | NVFP4 | MTP | 165 (4.09) | 187 (3.63) | 267 (5.84) | 247 (5.29) |
 | | NVFP4 | DFlash2 | 130 (3.31) | 167 (3.40) | 264 (5.48) | 266 (5.29) |
-| | GGUF IQ3_S (Swift) | DFlash2 | 100 (3.79) | 101 (3.44) | 165 (5.54) | 156 (5.28) |
+| | GGUF IQ3_S (GSQ-RCO) | DFlash2 | 100 (3.79) | 101 (3.44) | 165 (5.54) | 156 (5.28) |
 | GLM-5.3-Flash | EXL3 3.05 bpw, stock order | MTP | 73 (3.42) | 82 (2.94) | 99 (3.94) | 86 (3.85) |
 | | EXL3 3.05 bpw, stock order | DFlash2 | 67 (3.39) | 81 (3.52) | 127 (5.55) | 114 (5.30) |
 | | EXL3 3.05 bpw, Volta order | MTP | 85 (3.50) | 97 (2.90) | 111 (3.70) | 101 (3.86) |
