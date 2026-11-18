@@ -324,7 +324,7 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	// MoE: router outputs, the dispatch / expert scratch for this rank's experts, and the shared expert's buffers
 	topk_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( int ) ) );
 	topk_w_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.top_k * sizeof( backend::half_t ) ) );
-	moe_scratch_ = engine::modules::MoE::alloc_scratch( arena, config_.num_experts / tp_, config_.top_k, H, config_.moe_intermediate, R, !runtime::options().nvfp4_experts.empty() );
+	moe_scratch_ = engine::modules::MoE::alloc_scratch( arena, config_.num_experts / tp_, config_.top_k, H, config_.moe_intermediate, R, !runtime::options().nvfp4_experts.empty() || !runtime::options().mtp_head_dir.empty() );
 	int sh_shape[2] = { R, config_.shared_intermediate };
 	sh_gate_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, sh_shape, 2 );
 	sh_up_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, sh_shape, 2 );
@@ -382,6 +382,16 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		}
 		LOG_INFO( "[RANK %d] routed experts from the NVFP4 checkpoint %s\n", rank_, nv_dir.c_str() );
 	}
+	// mtp_head_dir: a checkpoint that holds only the MTP head (the routed experts of the main layers stay the model's own)
+	std::unique_ptr<engine::loader::SafeTensorsRepo> head_repo;
+	if ( const std::string& head_dir = runtime::options().mtp_head_dir; !head_dir.empty() && runtime::options().speculator == "mtp" ) {
+		head_repo = std::make_unique<engine::loader::SafeTensorsRepo>();
+		if ( !head_repo->open( head_dir.c_str() ) ) {
+			LOG_ERROR( "[loader] FAILED to open the MTP head directory %s\n", head_dir.c_str() );
+			return false;
+		}
+		LOG_INFO( "[RANK %d] MTP head from the NVFP4 checkpoint %s\n", rank_, head_dir.c_str() );
+	}
 	std::unique_ptr<engine::loader::SafeTensorsRepo> ov_repo;
 	if ( const std::string& ov_dir = runtime::options().nvfp4_dense_dir; !ov_dir.empty() ) {
 		ov_repo = std::make_unique<engine::loader::SafeTensorsRepo>();
@@ -418,8 +428,8 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 	}
 
 	// The MTP head comes from the NVFP4 checkpoint when mtp_nvfp4 is set: its dense tensors are BF16 there and its experts FP8 with block scales
-	const bool mtp_nv = mtp_on_ && runtime::options().mtp_nvfp4;
-	if ( mtp_nv && !nv_repo ) {
+	const bool mtp_nv = mtp_on_ && ( runtime::options().mtp_nvfp4 || head_repo );
+	if ( mtp_nv && !nv_repo && !head_repo ) {
 		LOG_ERROR( "[RANK %d] mtp_nvfp4 needs nvfp4_experts (the checkpoint that holds the head)\n", rank_ );
 		return false;
 	}
@@ -711,6 +721,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 		// MTP head: one full-attention block with its own gated-residual sites and MoE, the input combine and its own mixer
 		mtp_layer_.is_full_attention = true;
 		in_mtp = true;
+		if ( head_repo ) nv_repo = std::move( head_repo );   // from here on only the head reads the NVFP4 checkpoint (the experts of the main layers are loaded)
 		if ( mtp_nv ) {
 			src = nv_repo.get();
 			LOG_INFO( "[RANK %d] MTP head from the NVFP4 checkpoint (FP8 experts and BF16 dense tensors quantized to NVFP4)\n", rank_ );
