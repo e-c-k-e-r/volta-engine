@@ -9,7 +9,10 @@
 //   hess_compare score --src <original> --tensors A,B,... (--hess-dir <capture dir> [--ranks 4] | --route <route dump>) --exl3 <dir> [--exl3 <dir> ...]
 //     each tensor of each EXL3 checkpoint (its codebook and tile order as the checkpoint names them) against the original, the proxy error under
 //     one mean Hessian: the capture's file for the tensor (as volta_quantize maps them), or for a routed expert's down projection the Hessian of
-//     its activation over the route dump's rows
+//     its activation over the route dump's rows; an EXL3 directory may be volta_quantize's <out>/.partial (each file names its order and codebook).
+//     --affinity-eps E: routed experts under their routing-weighted Hessians instead (the dump's routing weights, quant/expert_hessian.h)
+//   hess_compare routes --src <original> --route <route dump> --layers L,L,... [--top 32]
+//     per layer the experts the most rows route to, most first, and their projections as a volta_quantize --only list
 #include "engine/config.h"
 #include "engine/quant/exl3_quantize.h"
 #include "engine/modules/trellis.h"
@@ -254,7 +257,8 @@ int cross( int argc, char** argv ) {
 }
 
 // The tensor <base> of an EXL3 checkpoint: width from the trellis shape, codebook from the markers, tile order from quantization_config.json
-// ("tile_layout": "volta", with "tile_layout_stock" substrings that keep the stock order)
+// ("tile_layout": "volta", with "tile_layout_stock" substrings that keep the stock order); in a volta_quantize .partial directory (no
+// quantization_config.json) both from the tensor's file metadata
 bool load_exl3( engine::tools::quant::StRepo& repo, const std::string& base, engine::quant::Exl3Tensor& t, int& code, int& cb, bool& volta ) {
 	const auto* tr = repo.find( base + ".trellis" );
 	const auto* su = repo.find( base + ".suh" );
@@ -269,6 +273,16 @@ bool load_exl3( engine::tools::quant::StRepo& repo, const std::string& base, eng
 	t.svh.assign( reinterpret_cast<const uint16_t*>( sv->data ), reinterpret_cast<const uint16_t*>( sv->data ) + sv->bytes / 2 );
 	volta = false;
 	std::ifstream f( repo.dir() + "/quantization_config.json" );
+	if ( !f ) {
+		const auto it = repo.weight_map().find( base + ".trellis" );
+		const auto* file = it == repo.weight_map().end() ? nullptr : repo.shard( it->second );
+		if ( file ) {
+			const auto& m = file->metadata();
+			const auto lay = m.find( "tile_layout" ), cbk = m.find( "codebook" );
+			volta = lay != m.end() && lay->second == "volta";
+			if ( cbk != m.end() ) cb = cbk->second == "mul1" ? 2 : cbk->second == "mcg" ? 1 : 0;
+		}
+	}
 	if ( f ) {
 		std::stringstream ss;
 		ss << f.rdbuf();
@@ -289,6 +303,7 @@ int score( int argc, char** argv ) {
 	std::string src, hess_dir, route;
 	std::vector<std::string> tensors, dirs;
 	int ranks = 4, device = 0;
+	float aff_eps = 0.0f;
 	for ( int i = 2; i + 1 < argc; i += 2 ) {
 		const std::string k = argv[i], v = argv[i + 1];
 		if ( k == "--src" ) src = v;
@@ -300,6 +315,7 @@ int score( int argc, char** argv ) {
 		else if ( k == "--ranks" ) ranks = std::stoi( v );
 		else if ( k == "--exl3" ) dirs.push_back( v );
 		else if ( k == "--device" ) device = std::stoi( v );
+		else if ( k == "--affinity-eps" ) aff_eps = std::stof( v );
 	}
 	if ( src.empty() || tensors.empty() || dirs.empty() || ( hess_dir.empty() && route.empty() ) ) {
 		std::fprintf( stderr, "usage: hess_compare score --src <original> --tensors A,B (--hess-dir <dir> [--ranks 4] | --route <dump>) --exl3 <dir> ...\n" );
@@ -308,7 +324,7 @@ int score( int argc, char** argv ) {
 	CUDA_CHECK( cudaSetDevice( device ) );
 	engine::modules::trellis_context_init_all();
 	engine::tools::quant::Model model;
-	if ( !model.read( dirs[0] ) ) return 1;
+	if ( !model.read( src ) ) return 1;
 	engine::tools::quant::SourceWeights sw;
 	if ( !sw.open( src ) ) return 1;
 	std::vector<std::unique_ptr<engine::tools::quant::StRepo>> repos;
@@ -318,10 +334,46 @@ int score( int argc, char** argv ) {
 	}
 	engine::tools::quant::RouteRows rr;
 	if ( !route.empty() && !rr.open( route, model.hidden ) ) return 1;
+	if ( aff_eps > 0.0f && ( route.empty() || !rr.has_weights() ) ) {
+		std::fprintf( stderr, "hess_compare score: --affinity-eps needs a route dump with its routing weights (<dump>.w)\n" );
+		return 2;
+	}
 	engine::tools::quant::ExpertHessian eh;
 	int x_layer = -1;
 	void* d_x = nullptr;
 	int64_t x_rows = 0;
+	// With affinity: per expert of the loaded layer its routed rows and weights
+	std::vector<std::vector<int>> e_rows;
+	std::vector<std::vector<float>> e_w;
+	auto ensure_layer = [&]( int layer ) {
+		if ( x_layer == layer ) return true;
+		if ( d_x ) CUDA_CHECK( cudaFree( d_x ) );
+		d_x = nullptr;
+		x_layer = -1;
+		std::vector<uint16_t> rows;
+		if ( !rr.read( layer, 0, rows ) ) return false;
+		x_rows = static_cast<int64_t>( rows.size() / model.hidden );
+		CUDA_CHECK( cudaMalloc( &d_x, rows.size() * 2 ) );
+		CUDA_CHECK( cudaMemcpy( d_x, rows.data(), rows.size() * 2, cudaMemcpyHostToDevice ) );
+		e_rows.assign( std::max( model.experts, 0 ), {} );
+		e_w.assign( e_rows.size(), {} );
+		if ( aff_eps > 0.0f ) {
+			std::vector<int> ids;
+			std::vector<float> w;
+			int K = 0;
+			if ( !rr.routes( layer, 0, ids, w, K ) ) return false;
+			for ( int64_t r = 0; r < x_rows; ++r ) {
+				for ( int j = 0; j < K; ++j ) {
+					const int e = ids[static_cast<size_t>( r ) * K + j];
+					if ( e < 0 || e >= static_cast<int>( e_rows.size() ) ) continue;
+					e_rows[e].push_back( static_cast<int>( r ) );
+					e_w[e].push_back( w[static_cast<size_t>( r ) * K + j] );
+				}
+			}
+		}
+		x_layer = layer;
+		return true;
+	};
 	std::vector<double> sum_ratio( dirs.size(), 0.0 );
 	int scored = 0;
 	std::printf( "[*] hess_compare score: proxy error under the mean Hessian, checkpoints:" );
@@ -339,23 +391,27 @@ int score( int argc, char** argv ) {
 		// The mean Hessian: the capture's file(s), block diagonal over the ranks, or the expert's activation over the route rows
 		std::vector<float> H( static_cast<size_t>( in ) * in, 0.0f );
 		bool have = false;
+		const bool aff_gu = aff_eps > 0.0f && pt.gate_up_expert >= 0 && !pt.hess.empty();
 		if ( pt.down_layer >= 0 && !route.empty() ) {
-			if ( x_layer != pt.down_layer ) {
-				if ( d_x ) CUDA_CHECK( cudaFree( d_x ) );
-				std::vector<uint16_t> rows;
-				if ( !rr.read( pt.down_layer, 0, rows ) ) continue;
-				x_rows = static_cast<int64_t>( rows.size() / model.hidden );
-				CUDA_CHECK( cudaMalloc( &d_x, rows.size() * 2 ) );
-				CUDA_CHECK( cudaMemcpy( d_x, rows.data(), rows.size() * 2, cudaMemcpyHostToDevice ) );
-				x_layer = pt.down_layer;
-			}
+			if ( !ensure_layer( pt.down_layer ) ) continue;
 			const std::string pre = pt.src_layer_prefix + "." + std::to_string( pt.down_expert );
-			float *g = nullptr, *u = nullptr, *h = nullptr;
+			float *g = nullptr, *u = nullptr, *h = nullptr, *rw = nullptr;
 			CUDA_CHECK( cudaMalloc( &g, static_cast<size_t>( out ) * in * 4 ) );
 			CUDA_CHECK( cudaMalloc( &u, static_cast<size_t>( out ) * in * 4 ) );
 			CUDA_CHECK( cudaMalloc( &h, H.size() * 4 ) );
+			double ws = 0.0;
+			if ( aff_eps > 0.0f ) {
+				std::vector<float> hw( static_cast<size_t>( x_rows ), 0.0f );
+				for ( size_t j = 0; j < e_rows[pt.down_expert].size(); ++j ) {
+					hw[e_rows[pt.down_expert][j]] = e_w[pt.down_expert][j];
+					ws += e_w[pt.down_expert][j];
+				}
+				CUDA_CHECK( cudaMalloc( &rw, hw.size() * 4 ) );
+				CUDA_CHECK( cudaMemcpy( rw, hw.data(), hw.size() * 4, cudaMemcpyHostToDevice ) );
+			}
 			have = sw.load( pre + ".gate_proj", g, nullptr ) && sw.load( pre + ".up_proj", u, nullptr ) &&
-				eh.compute( d_x, x_rows, out, g, u, in, model.swiglu_limit, h, nullptr );
+				eh.compute( d_x, x_rows, out, g, u, in, model.swiglu_limit, h, nullptr, ws > 0.0 ? rw : nullptr, ws, aff_eps );
+			if ( rw ) CUDA_CHECK( cudaFree( rw ) );
 			if ( have ) {
 				CUDA_CHECK( cudaDeviceSynchronize() );
 				CUDA_CHECK( cudaMemcpy( H.data(), h, H.size() * 4, cudaMemcpyDeviceToHost ) );
@@ -364,6 +420,34 @@ int score( int argc, char** argv ) {
 			CUDA_CHECK( cudaFree( g ) );
 			CUDA_CHECK( cudaFree( u ) );
 			CUDA_CHECK( cudaFree( h ) );
+		} else if ( aff_gu && ensure_layer( pt.layer ) && !e_rows[pt.gate_up_expert].empty() ) {
+			// The expert's routing-weighted input Hessian over the dump's rows routed to it, plus eps of the capture's mean
+			Hess part;
+			have = pt.hess.size() == 1 && read_hess( pt.hess[0], part ) && part.k == in;
+			if ( have ) {
+				std::vector<float> hin( H.size() );
+				for ( size_t i = 0; i < hin.size(); ++i ) hin[i] = static_cast<float>( part.h[i] / static_cast<double>( part.rows ) );
+				const auto& er = e_rows[pt.gate_up_expert];
+				const auto& ew = e_w[pt.gate_up_expert];
+				double ws = 0.0;
+				for ( float v : ew ) ws += v;
+				float *d_in = nullptr, *d_out = nullptr, *d_w = nullptr;
+				int* d_idx = nullptr;
+				CUDA_CHECK( cudaMalloc( &d_in, H.size() * 4 ) );
+				CUDA_CHECK( cudaMalloc( &d_out, H.size() * 4 ) );
+				CUDA_CHECK( cudaMalloc( &d_w, ew.size() * 4 ) );
+				CUDA_CHECK( cudaMalloc( &d_idx, er.size() * 4 ) );
+				CUDA_CHECK( cudaMemcpy( d_in, hin.data(), H.size() * 4, cudaMemcpyHostToDevice ) );
+				CUDA_CHECK( cudaMemcpy( d_w, ew.data(), ew.size() * 4, cudaMemcpyHostToDevice ) );
+				CUDA_CHECK( cudaMemcpy( d_idx, er.data(), er.size() * 4, cudaMemcpyHostToDevice ) );
+				have = eh.affinity_input( d_x, x_rows, in, d_idx, d_w, static_cast<int>( er.size() ), ws, aff_eps, d_in, d_out, nullptr );
+				CUDA_CHECK( cudaDeviceSynchronize() );
+				if ( have ) CUDA_CHECK( cudaMemcpy( H.data(), d_out, H.size() * 4, cudaMemcpyDeviceToHost ) );
+				CUDA_CHECK( cudaFree( d_in ) );
+				CUDA_CHECK( cudaFree( d_out ) );
+				CUDA_CHECK( cudaFree( d_w ) );
+				CUDA_CHECK( cudaFree( d_idx ) );
+			}
 		} else if ( !pt.hess.empty() ) {
 			int off = 0;
 			have = true;
@@ -432,7 +516,55 @@ int score( int argc, char** argv ) {
 
 } // namespace
 
+int routes( int argc, char** argv ) {
+	std::string src, route;
+	std::vector<int> layers;
+	int top = 32;
+	for ( int i = 2; i + 1 < argc; i += 2 ) {
+		const std::string k = argv[i], v = argv[i + 1];
+		if ( k == "--src" ) src = v;
+		else if ( k == "--route" ) route = v;
+		else if ( k == "--top" ) top = std::stoi( v );
+		else if ( k == "--layers" ) {
+			std::stringstream ss( v );
+			for ( std::string item; std::getline( ss, item, ',' ); ) if ( !item.empty() ) layers.push_back( std::stoi( item ) );
+		}
+	}
+	if ( src.empty() || route.empty() || layers.empty() ) {
+		std::fprintf( stderr, "usage: hess_compare routes --src <original> --route <route dump> --layers L,L,... [--top 32]\n" );
+		return 2;
+	}
+	engine::tools::quant::Model model;
+	if ( !model.read( src ) || model.experts <= 0 ) return 1;
+	engine::tools::quant::RouteRows rr;
+	if ( !rr.open( route, model.hidden ) ) return 1;
+	std::string only;
+	for ( int layer : layers ) {
+		std::vector<int64_t> n;
+		if ( !rr.counts( layer, model.experts, n ) ) {
+			std::printf( "  layer %d: no rows\n", layer );
+			continue;
+		}
+		std::vector<int> order( model.experts );
+		for ( int e = 0; e < model.experts; ++e ) order[e] = e;
+		std::stable_sort( order.begin(), order.end(), [&]( int a, int b ) { return n[a] > n[b]; } );
+		int64_t total = 0, kept = 0;
+		for ( int64_t v : n ) total += v;
+		std::printf( "  layer %d (%lld routes):", layer, static_cast<long long>( total ) );
+		for ( int i = 0; i < top && i < model.experts; ++i ) {
+			kept += n[order[i]];
+			std::printf( " %d (%lld)", order[i], static_cast<long long>( n[order[i]] ) );
+			only += ( only.empty() ? "" : "," ) + std::string( "language_model.layers." ) + std::to_string( layer ) + ".mlp.experts." +
+				std::to_string( order[i] ) + ".";
+		}
+		std::printf( "  = %.1f%% of the routes\n", total ? 100.0 * kept / total : 0.0 );
+	}
+	std::printf( "--only %s\n", only.c_str() );
+	return 0;
+}
+
 int main( int argc, char** argv ) {
+	if ( argc >= 2 && !std::strcmp( argv[1], "routes" ) ) return routes( argc, argv );
 	if ( argc >= 4 && !std::strcmp( argv[1], "stats" ) ) return stats( argv[2], argv[3] );
 	if ( argc >= 2 && !std::strcmp( argv[1], "cross" ) ) return cross( argc, argv );
 	if ( argc >= 2 && !std::strcmp( argv[1], "score" ) ) return score( argc, argv );

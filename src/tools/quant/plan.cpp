@@ -93,7 +93,7 @@ bool Model::read( const std::string& dir ) {
 
 void hessian_sources( const Model& m, const std::string& dir, int ranks, PlanTensor& t ) {
 	t.hess.clear();
-	t.down_layer = t.down_expert = -1;
+	t.down_layer = t.down_expert = t.gate_up_expert = -1;
 	if ( dir.empty() ) return;
 	// The LM head's input: site 5 on GLM, site 4 otherwise, recorded under layer 0
 	if ( t.base == "lm_head" ) {
@@ -133,6 +133,9 @@ void hessian_sources( const Model& m, const std::string& dir, int ranks, PlanTen
 		return;
 	}
 	if ( s.site < 0 ) return;
+	static const std::regex gu_re( R"(^mlp\.experts\.(\d+)\.(gate_proj|up_proj)$)" );
+	std::smatch gm;
+	if ( std::regex_match( rest, gm, gu_re ) ) t.gate_up_expert = std::stoi( gm[1].str() );
 	t.hess = site_files( dir, layer, s.site, s.per_rank, ranks );
 }
 

@@ -6,8 +6,15 @@
 // written at the end in the template's layout (--no-assemble stops before, a later run without it writes them).
 //
 //   volta_quantize --src <original> --template <exl3 dir> --out <dir> [--hess <capture dir>] [--route <route dump>] [--order volta|stock]
-//                  [--devices 0,1,2,3] [--only SUBSTRING] [--skip A,B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] [--redo]
-//                  [--plan] [--no-scaled-hessian] [--no-assemble]
+//                  [--devices 0,1,2,3] [--only A,B] [--skip A,B] [--bits B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] [--redo]
+//                  [--plan] [--no-scaled-hessian] [--affinity-eps E] [--no-assemble]
+//
+// --affinity-eps weights each routed expert's Hessians by routing (exllamav3 1.6.7's --moe_affinity_eps, see quant/expert_hessian.h): its gate
+// and up projections get their own input Hessian from the route dump's rows routed to it, so they are quantized expert by expert; needs the
+// dump's routing weights (<route dump>.w)
+//
+// --bits sets every quantized tensor's width (1 to 8, or 1.5 / 2.5 / 3.5 with the mul1 codebook) instead of the template's: rate ladders on a
+// sample (--only) for screening the quantizer
 #include "engine/config.h"
 #include "engine/core/log.h"
 #include "engine/modules/trellis_bits.h"
@@ -44,8 +51,9 @@ using engine::quant::Exl3Tensor;
 namespace {
 
 struct Args {
-	std::string src, tmpl, out, hess, route, only;
-	std::vector<std::string> skip;
+	std::string src, tmpl, out, hess, route;
+	std::vector<std::string> only, skip;
+	int code = 0;   // --bits as a width code, 0: the template's
 	std::vector<int> devices = { 0 };
 	bool volta = true;
 	int ranks = 4;
@@ -56,6 +64,7 @@ struct Args {
 	bool plan = false;
 	bool assemble = true;
 	bool scaled = true;
+	float aff_eps = 0.0f;
 	float sigma_reg = 0.025f;
 };
 
@@ -84,7 +93,16 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--out" ) a.out = val();
 		else if ( k == "--hess" ) a.hess = val();
 		else if ( k == "--route" ) a.route = val();
-		else if ( k == "--only" ) a.only = val();
+		else if ( k == "--only" ) a.only = split( val(), ',' );
+		else if ( k == "--bits" ) {
+			const float b = std::stof( val() );
+			const int K = static_cast<int>( b );
+			a.code = b == static_cast<float>( K ) ? K : K + engine::modules::TRELLIS_HALF_CODE;
+			if ( K < 1 || K > 8 || ( b != static_cast<float>( K ) && ( b - K != 0.5f || K > 3 ) ) ) {
+				LOG_ERROR( "[volta_quantize] --bits %s: 1 to 8, or 1.5, 2.5, 3.5", argv[i] );
+				return false;
+			}
+		}
 		else if ( k == "--skip" ) a.skip = split( val(), ',' );
 		else if ( k == "--order" ) a.volta = val() != "stock";
 		else if ( k == "--ranks" ) a.ranks = std::stoi( val() );
@@ -96,6 +114,7 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--plan" ) a.plan = true;
 		else if ( k == "--no-scaled-hessian" ) a.scaled = false;
 		else if ( k == "--no-assemble" ) a.assemble = false;
+		else if ( k == "--affinity-eps" ) a.aff_eps = std::stof( val() );
 		else if ( k == "--devices" ) {
 			a.devices.clear();
 			for ( const auto& d : split( val(), ',' ) ) a.devices.push_back( std::stoi( d ) );
@@ -106,8 +125,8 @@ bool parse( int argc, char** argv, Args& a ) {
 	}
 	if ( a.src.empty() || a.tmpl.empty() || ( a.out.empty() && !a.plan ) ) {
 		LOG_ERROR( "usage: volta_quantize --src <original> --template <exl3 dir> --out <dir> [--hess <capture dir>] [--route <route dump>] "
-				   "[--order volta|stock] [--devices 0,1] [--only S] [--skip A,B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] "
-				   "[--redo] [--plan] [--no-scaled-hessian] [--no-assemble]" );
+				   "[--order volta|stock] [--devices 0,1] [--only A,B] [--skip A,B] [--bits B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] "
+				   "[--redo] [--plan] [--no-scaled-hessian] [--affinity-eps E] [--no-assemble]" );
 		return false;
 	}
 	return true;
@@ -155,6 +174,7 @@ bool read_hessian( const std::string& path, int& k, int64_t& rows, std::vector<f
 struct Item {
 	std::vector<int> tensors;       // indices into the plan
 	bool expert_down = false;
+	bool expert_gate_up = false;    // affinity-weighted: a layer's expert gate / up projections, expert by expert
 	int layer = -1;
 	std::string key;                // Hessian files joined, or "" (none)
 	int64_t tiles = 0;
@@ -194,9 +214,11 @@ bool write_partial( const Args& a, const q::PlanTensor& t, const Exl3Tensor& r )
 	outs[2].shape = { t.n };
 	outs[2].owned.resize( r.svh.size() * 2 );
 	std::memcpy( outs[2].owned.data(), r.svh.data(), outs[2].owned.size() );
+	// The tile order and codebook too, so the result reads on its own (hess_compare score on a .partial directory)
 	char err[32];
 	std::snprintf( err, sizeof( err ), "%.8g", r.proxy_err );
-	return q::st_write( partial_path( a, t.base ), outs, { { "proxy_err", err } } );
+	return q::st_write( partial_path( a, t.base ), outs,
+		{ { "proxy_err", err }, { "tile_layout", a.volta ? "volta" : "stock" }, { "codebook", t.cb == 2 ? "mul1" : t.cb == 1 ? "mcg" : "3inst" } } );
 }
 
 struct DBuf {
@@ -219,6 +241,30 @@ struct DBuf {
 	}
 };
 
+// The capture's Hessian of a tensor's input (k x k) on the device: its file, or the per-rank blocks of a row-parallel input on the diagonal (the
+// cross-rank covariance is not captured); the sum over the rows, or with `mean` divided by them
+bool read_capture( const q::PlanTensor& t, int k, bool mean, int64_t& rows, float* d_dst, cudaStream_t stream ) {
+	std::vector<float> full( static_cast<size_t>( k ) * k, 0.0f ), part;
+	int off = 0;
+	rows = 0;
+	for ( const auto& path : t.hess ) {
+		int kr = 0;
+		int64_t r = 0;
+		if ( !read_hessian( path, kr, r, part ) || off + kr > k ) return false;
+		for ( int i = 0; i < kr; ++i ) std::memcpy( &full[static_cast<size_t>( off + i ) * k + off], &part[static_cast<size_t>( i ) * kr], kr * 4 );
+		off += kr;
+		rows = r;
+	}
+	if ( off != k ) return false;
+	if ( mean && rows > 0 ) {
+		const float s = static_cast<float>( 1.0 / static_cast<double>( rows ) );
+		for ( auto& v : full ) v *= s;
+	}
+	CUDA_CHECK( cudaMemcpyAsync( d_dst, full.data(), full.size() * 4, cudaMemcpyHostToDevice, stream ) );
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	return true;
+}
+
 // One device: takes items until none are left
 void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 	const Args& a = *sh.a;
@@ -236,8 +282,52 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 	int x_layer = -1;
 	void* d_x = nullptr;
 	int64_t x_rows = 0;
-	DBuf hsum, gate, up;
+	DBuf hsum, gate, up, hin, row_w, d_rw;
 	std::vector<float*> weights;
+	// The layer's route-dump rows on the device; with affinity weights, per expert its routed rows and their weights
+	std::vector<std::vector<int>> e_rows;
+	std::vector<std::vector<float>> e_w;
+	auto ensure_layer = [&]( int layer ) {
+		if ( x_layer == layer ) return true;
+		if ( d_x ) CUDA_CHECK( cudaFree( d_x ) );
+		d_x = nullptr;
+		x_layer = -1;
+		std::vector<uint16_t> rows;
+		if ( !sh.route.read( layer, a.route_rows, rows ) ) {
+			LOG_ERROR( "[volta_quantize] the route dump has no rows of layer %d", layer );
+			return false;
+		}
+		x_rows = static_cast<int64_t>( rows.size() / sh.model->hidden );
+		CUDA_CHECK( cudaMalloc( &d_x, rows.size() * 2 ) );
+		CUDA_CHECK( cudaMemcpyAsync( d_x, rows.data(), rows.size() * 2, cudaMemcpyHostToDevice, stream ) );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		e_rows.assign( std::max( sh.model->experts, 0 ), {} );
+		e_w.assign( e_rows.size(), {} );
+		if ( a.aff_eps > 0.0f ) {
+			std::vector<int> ids;
+			std::vector<float> w;
+			int K = 0;
+			if ( !sh.route.routes( layer, a.route_rows, ids, w, K ) ) {
+				LOG_ERROR( "[volta_quantize] the route dump has no routing weights for layer %d", layer );
+				return false;
+			}
+			for ( int64_t r = 0; r < x_rows; ++r ) {
+				for ( int j = 0; j < K; ++j ) {
+					const int e = ids[static_cast<size_t>( r ) * K + j];
+					if ( e < 0 || e >= static_cast<int>( e_rows.size() ) ) continue;
+					e_rows[e].push_back( static_cast<int>( r ) );
+					e_w[e].push_back( w[static_cast<size_t>( r ) * K + j] );
+				}
+			}
+		}
+		x_layer = layer;
+		return true;
+	};
+	auto w_sum = [&]( int e ) {
+		double s = 0.0;
+		for ( float v : e_w[e] ) s += v;
+		return s;
+	};
 
 	for ( size_t idx; ( idx = sh.next.fetch_add( 1 ) ) < sh.items.size(); ) {
 		const Item& it = sh.items[idx];
@@ -251,29 +341,28 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 
 		if ( it.expert_down ) {
 			// The layer's rows on the device, then per expert: its activation's Hessian, the factor, the down projection
-			if ( x_layer != it.layer ) {
-				if ( d_x ) CUDA_CHECK( cudaFree( d_x ) );
-				d_x = nullptr;
-				std::vector<uint16_t> rows;
-				if ( !sh.route.read( it.layer, a.route_rows, rows ) ) {
-					LOG_ERROR( "[volta_quantize] the route dump has no rows of layer %d", it.layer );
-					sh.failures++;
-					continue;
-				}
-				x_rows = static_cast<int64_t>( rows.size() / sh.model->hidden );
-				CUDA_CHECK( cudaMalloc( &d_x, rows.size() * 2 ) );
-				CUDA_CHECK( cudaMemcpyAsync( d_x, rows.data(), rows.size() * 2, cudaMemcpyHostToDevice, stream ) );
-				CUDA_CHECK( cudaStreamSynchronize( stream ) );
-				x_layer = it.layer;
+			if ( !ensure_layer( it.layer ) ) {
+				sh.failures++;
+				continue;
 			}
 			for ( int ti : it.tensors ) {
 				const q::PlanTensor& t = sh.plan[ti];
 				const int inter = t.k, hidden = t.n;
 				const std::string pre = t.src_layer_prefix + "." + std::to_string( t.down_expert );
+				// Affinity: the expert's routing weight per row (0 where it is not routed); never routed: the plain Hessian
+				const double ws = a.aff_eps > 0.0f ? w_sum( t.down_expert ) : 0.0;
+				const float* rw = nullptr;
+				if ( ws > 0.0 && row_w.fit( static_cast<size_t>( x_rows ) ) ) {
+					std::vector<float> h( static_cast<size_t>( x_rows ), 0.0f );
+					for ( size_t j = 0; j < e_rows[t.down_expert].size(); ++j ) h[e_rows[t.down_expert][j]] = e_w[t.down_expert][j];
+					CUDA_CHECK( cudaMemcpyAsync( row_w.p, h.data(), h.size() * 4, cudaMemcpyHostToDevice, stream ) );
+					CUDA_CHECK( cudaStreamSynchronize( stream ) );
+					rw = row_w.p;
+				}
 				ok = gate.fit( static_cast<size_t>( hidden ) * inter ) && up.fit( static_cast<size_t>( hidden ) * inter ) &&
 					hsum.fit( static_cast<size_t>( inter ) * inter ) && src.load( pre + ".gate_proj", gate.p, stream ) &&
 					src.load( pre + ".up_proj", up.p, stream ) &&
-					eh.compute( d_x, x_rows, hidden, gate.p, up.p, inter, sh.model->swiglu_limit, hsum.p, stream ) &&
+					eh.compute( d_x, x_rows, hidden, gate.p, up.p, inter, sh.model->swiglu_limit, hsum.p, stream, rw, ws, a.aff_eps ) &&
 					engine::quant::exl3_input_factor( factor, hsum.p, inter, x_rows, a.sigma_reg, hash64( t.base + "#in", a.seed ), stream, !a.scaled );
 				factor_key.clear();
 				float* w = nullptr;
@@ -285,31 +374,65 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 				o.scale_hint = out[0].g_scale;   // the next expert's scale search starts from this one's
 				done.emplace_back( ti, std::move( out[0] ) );
 			}
+		} else if ( it.expert_gate_up ) {
+			// Affinity: the layer input's mean Hessian, then per expert its own Hessian (routed rows weighted, plus eps of the mean), its factor,
+			// its gate and up projections
+			const int k = first.k;
+			int64_t rows = 0;
+			ok = ensure_layer( it.layer ) && hin.fit( static_cast<size_t>( k ) * k ) && hsum.fit( static_cast<size_t>( k ) * k ) &&
+				read_capture( first, k, true, rows, hin.p, stream );
+			std::map<int, std::vector<int>> by_expert;
+			for ( int ti : it.tensors ) by_expert[sh.plan[ti].gate_up_expert].push_back( ti );
+			for ( const auto& kv : by_expert ) {
+				if ( !ok ) break;
+				const int e = kv.first;
+				const double ws = w_sum( e );
+				const int nr = static_cast<int>( e_rows[e].size() );
+				int* d_idx = nullptr;
+				if ( ws > 0.0 ) {
+					ok = cudaMalloc( &d_idx, static_cast<size_t>( nr ) * sizeof( int ) ) == cudaSuccess && d_rw.fit( static_cast<size_t>( nr ) );
+					if ( ok ) {
+						CUDA_CHECK( cudaMemcpyAsync( d_idx, e_rows[e].data(), static_cast<size_t>( nr ) * sizeof( int ), cudaMemcpyHostToDevice, stream ) );
+						CUDA_CHECK( cudaMemcpyAsync( d_rw.p, e_w[e].data(), static_cast<size_t>( nr ) * sizeof( float ), cudaMemcpyHostToDevice, stream ) );
+						ok = eh.affinity_input( d_x, x_rows, k, d_idx, d_rw.p, nr, ws, a.aff_eps, hin.p, hsum.p, stream );
+						CUDA_CHECK( cudaStreamSynchronize( stream ) );
+					}
+				} else {
+					// Never routed in the calibration: the layer input's Hessian as it is
+					CUDA_CHECK( cudaMemcpyAsync( hsum.p, hin.p, static_cast<size_t>( k ) * k * 4, cudaMemcpyDeviceToDevice, stream ) );
+				}
+				if ( d_idx ) CUDA_CHECK( cudaFree( d_idx ) );
+				// The same input sign flips as the shared factor of the plain recipe (one seed per input)
+				ok = ok && engine::quant::exl3_input_factor( factor, hsum.p, k, 1, a.sigma_reg, hash64( it.key, a.seed ), stream, !a.scaled );
+				factor_key.clear();
+				std::vector<const float*> ws_;
+				std::vector<int> ns;
+				std::vector<uint64_t> seeds;
+				for ( int ti : kv.second ) {
+					if ( !ok ) break;
+					const q::PlanTensor& t = sh.plan[ti];
+					float* w = nullptr;
+					ok = cudaMalloc( &w, static_cast<size_t>( t.k ) * t.n * sizeof( float ) ) == cudaSuccess && src.load( t.base, w, stream );
+					if ( w ) weights.push_back( w );
+					ws_.push_back( w );
+					ns.push_back( t.n );
+					seeds.push_back( hash64( t.base, a.seed ) );
+				}
+				std::vector<Exl3Tensor> out;
+				ok = ok && engine::quant::exl3_quantize_group( factor, ws_, ns, seeds, o, out, stream );
+				for ( float* w : weights ) CUDA_CHECK( cudaFree( w ) );
+				weights.clear();
+				if ( !ok ) break;
+				o.scale_hint = out.front().g_scale;
+				for ( size_t i = 0; i < kv.second.size(); ++i ) done.emplace_back( kv.second[i], std::move( out[i] ) );
+			}
 		} else {
 			// The shared input factor, kept while consecutive items use it
 			if ( it.key != factor_key || it.key.empty() ) {
 				factor_key.clear();
 				const int k = first.k;
 				int64_t rows = 0;
-				if ( !it.key.empty() ) {
-					ok = hsum.fit( static_cast<size_t>( k ) * k );
-					std::vector<float> full( static_cast<size_t>( k ) * k, 0.0f ), part;
-					int off = 0;
-					for ( const auto& path : first.hess ) {
-						int kr = 0;
-						int64_t r = 0;
-						if ( !read_hessian( path, kr, r, part ) || off + kr > k ) {
-							ok = false;
-							break;
-						}
-						// Per-rank blocks of a row-parallel input on the diagonal (the cross-rank covariance is not captured)
-						for ( int i = 0; i < kr; ++i ) std::memcpy( &full[static_cast<size_t>( off + i ) * k + off], &part[static_cast<size_t>( i ) * kr], kr * 4 );
-						off += kr;
-						rows = r;
-					}
-					ok = ok && off == k;
-					if ( ok ) CUDA_CHECK( cudaMemcpyAsync( hsum.p, full.data(), full.size() * 4, cudaMemcpyHostToDevice, stream ) );
-				}
+				if ( !it.key.empty() ) ok = hsum.fit( static_cast<size_t>( k ) * k ) && read_capture( first, k, false, rows, hsum.p, stream );
 				const uint64_t fseed = hash64( it.key.empty() ? first.base + "#in" : it.key, a.seed );
 				ok = ok && engine::quant::exl3_input_factor( factor, it.key.empty() ? nullptr : hsum.p, k, rows, a.sigma_reg, fseed, stream, !a.scaled );
 				if ( ok ) factor_key = it.key;
@@ -509,7 +632,8 @@ int main( int argc, char** argv ) {
 		q::PlanTensor t;
 		t.base = kv.first.substr( 0, kv.first.size() - 8 );
 		if ( t.base.find( "ngram_embedding" ) != std::string::npos ) continue;
-		bool skipped = !a.only.empty() && t.base.find( a.only ) == std::string::npos;
+		bool skipped = !a.only.empty();
+		for ( const auto& s : a.only ) skipped = skipped && t.base.find( s ) == std::string::npos;
 		for ( const auto& s : a.skip ) skipped = skipped || t.base.find( s ) != std::string::npos;
 		// A Volta template's stock-order exceptions stay as they are (a requantization would be in the Volta order)
 		for ( const auto& s : tmpl_stock ) skipped = skipped || t.base.find( s ) != std::string::npos;
@@ -521,6 +645,13 @@ int main( int argc, char** argv ) {
 		if ( !e || e->shape.size() != 3 ) continue;
 		t.code = engine::modules::trellis_code_from_u16( static_cast<int>( e->shape[2] ) );
 		t.cb = tmpl.has( t.base + ".mul1" ) ? 2 : tmpl.has( t.base + ".mcg" ) ? 1 : 0;
+		if ( a.code ) {
+			if ( a.code > engine::modules::TRELLIS_HALF_CODE && t.cb != 2 ) {
+				LOG_ERROR( "[volta_quantize] %s: a half-integer --bits needs the mul1 codebook", t.base.c_str() );
+				return 2;
+			}
+			t.code = a.code;
+		}
 		t.k = static_cast<int>( e->shape[0] ) * 16;
 		t.n = static_cast<int>( e->shape[1] ) * 16;
 		int so = 0, si = 0;
@@ -549,6 +680,10 @@ int main( int argc, char** argv ) {
 	if ( a.plan ) return 0;
 
 	if ( !a.route.empty() && !sh.route.open( a.route, model.hidden ) ) return 1;
+	if ( a.aff_eps > 0.0f && ( a.route.empty() || !sh.route.has_weights() ) ) {
+		LOG_ERROR( "[volta_quantize] --affinity-eps needs a route dump with its routing weights (<route dump>.w)" );
+		return 2;
+	}
 	mkdir( a.out.c_str(), 0755 );
 	mkdir( ( a.out + "/.partial" ).c_str(), 0755 );
 
@@ -561,13 +696,17 @@ int main( int argc, char** argv ) {
 		if ( !a.redo && exists( partial_path( a, t.base ) ) ) continue;
 		std::string files;
 		for ( const auto& h : t.hess ) files += h + ";";
-		const std::string key = t.down_layer >= 0 ? "down:" + std::to_string( t.down_layer ) + ":" + std::to_string( t.code ) + ":" + std::to_string( t.cb )
-			: files.empty() ? "none:" + t.base
-							: files + std::to_string( t.code ) + ":" + std::to_string( t.cb );
+		const bool aff = a.aff_eps > 0.0f && t.gate_up_expert >= 0 && !files.empty();
+		const std::string rate = std::to_string( t.code ) + ":" + std::to_string( t.cb );
+		const std::string key = t.down_layer >= 0 ? "down:" + std::to_string( t.down_layer ) + ":" + rate
+			: aff                 ? "aff:" + files + rate
+			: files.empty()       ? "none:" + t.base
+								  : files + rate;
 		if ( !by_key.count( key ) ) {
 			key_order.push_back( key );
 			Item it;
 			it.expert_down = t.down_layer >= 0;
+			it.expert_gate_up = aff;
 			it.layer = t.down_layer >= 0 ? t.down_layer : t.layer;
 			it.key = files;
 			by_key[key] = it;
@@ -583,7 +722,9 @@ int main( int argc, char** argv ) {
 			const auto& t = sh.plan[ti];
 			// about five fp32 copies of its columns, and with scaled Hessians its own k x k factor
 			const size_t tb = static_cast<size_t>( t.k ) * t.n * 4 * 5 + ( a.scaled ? static_cast<size_t>( t.k ) * t.k * 4 : 0 );
-			const bool full = g.expert_down ? cur.tensors.size() >= 32 : ( !cur.tensors.empty() && bytes + tb > a.budget );
+			// (affinity gate / up: 32 experts' pairs, which the plan's name order keeps together)
+			const bool full = g.expert_down ? cur.tensors.size() >= 32 : g.expert_gate_up ? cur.tensors.size() >= 64
+															: ( !cur.tensors.empty() && bytes + tb > a.budget );
 			if ( full ) {
 				sh.items.push_back( cur );
 				cur.tensors.clear();

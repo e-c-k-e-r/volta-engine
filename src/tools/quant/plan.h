@@ -28,6 +28,7 @@ struct PlanTensor {
 	int down_layer = -1;       // routed expert down projection: the route-dump layer and expert whose activation gives the Hessian
 	int down_expert = -1;
 	std::string src_layer_prefix;    // for a down projection: the "<...>.mlp.experts" prefix of the expert's gate / up projections
+	int gate_up_expert = -1;   // routed expert gate / up projection: its expert (affinity-weighted Hessians)
 	int layer = -1;            // decoder layer (ordering), -1 none
 };
 

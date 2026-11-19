@@ -907,15 +907,17 @@ void Qwen4ExpPipeline::trace_rows( int tag, const void* dev, bool streams, int m
 }
 
 // Router output of the m rows: per row top_k expert ids then top_k weights, as floats
-// Debug (route_dump): record {layer, rows, first position, K}, the rows' expert ids (int32) and the router's input rows (FP16)
+// Debug (route_dump): record {layer, rows, first position, K}, the rows' expert ids (int32) and the router's input rows (FP16); the rows' routing
+// weights (FP32, rows x K) go to <route_dump>.w in the same record order
 void Qwen4ExpPipeline::dump_router( int m, backend::stream_t stream ) {
 	static const std::string& path = runtime::options().route_dump;
 	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH || !hess_on_ || hess_layer_ < runtime::options().route_dump_from ) return;      // a replay that switched capture off (the prefix shared with an earlier session) writes nothing
 	const int K = config_.top_k, H = config_.hidden_size;
 	std::vector<int> ids( static_cast<size_t>( m ) * K );
-	std::vector<backend::half_t> x( static_cast<size_t>( m ) * H );
+	std::vector<backend::half_t> x( static_cast<size_t>( m ) * H ), w( ids.size() );
 	backend::stream_sync( stream );
 	backend::memcpy_async( ids.data(), topk_idx_, ids.size() * sizeof( int ), backend::Copy::D2H, stream );
+	backend::memcpy_async( w.data(), topk_w_, w.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
 	backend::memcpy_async( x.data(), mixed_.data, x.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
 	backend::stream_sync( stream );
 	if ( FILE* f = std::fopen( path.c_str(), "ab" ) ) {
@@ -923,6 +925,12 @@ void Qwen4ExpPipeline::dump_router( int m, backend::stream_t stream ) {
 		std::fwrite( hdr, sizeof( int ), 4, f );
 		std::fwrite( ids.data(), sizeof( int ), ids.size(), f );
 		std::fwrite( x.data(), sizeof( backend::half_t ), x.size(), f );
+		std::fclose( f );
+	}
+	if ( FILE* f = std::fopen( ( path + ".w" ).c_str(), "ab" ) ) {
+		std::vector<float> wf( w.size() );
+		for ( size_t i = 0; i < w.size(); ++i ) wf[i] = backend::to_float( w[i] );
+		std::fwrite( wf.data(), sizeof( float ), wf.size(), f );
 		std::fclose( f );
 	}
 }

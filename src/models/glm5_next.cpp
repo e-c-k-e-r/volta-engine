@@ -2098,12 +2098,14 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				);
 				static const std::string& dump_path = runtime::options().route_dump;
 				if ( !dump_path.empty() && rank_ == 0 && m > pod::MAX_BATCH && hess_on_ ) {
-					// Debug (route_dump): {layer, rows, first position, K}, the rows' expert ids (int32), the router's input rows (FP16)
+					// Debug (route_dump): {layer, rows, first position, K}, the rows' expert ids (int32), the router's input rows (FP16); the
+					// routing weights (FP32, rows x K) to <route_dump>.w in the same record order
 					const int K = config_.top_k;
 					std::vector<int> ids( static_cast<size_t>( m ) * K );
-					std::vector<backend::half_t> xr( static_cast<size_t>( m ) * H );
+					std::vector<backend::half_t> xr( static_cast<size_t>( m ) * H ), wr( ids.size() );
 					backend::stream_sync( stream );
 					backend::memcpy_async( ids.data(), state_.d_topk_indices, ids.size() * sizeof( int ), backend::Copy::D2H, stream );
+					backend::memcpy_async( wr.data(), state_.d_topk_weights, wr.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
 					backend::memcpy_async( xr.data(), norm_hidden_.data, xr.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
 					backend::stream_sync( stream );
 					if ( FILE* f = std::fopen( dump_path.c_str(), "ab" ) ) {
@@ -2111,6 +2113,12 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 						std::fwrite( hdr, sizeof( int ), 4, f );
 						std::fwrite( ids.data(), sizeof( int ), ids.size(), f );
 						std::fwrite( xr.data(), sizeof( backend::half_t ), xr.size(), f );
+						std::fclose( f );
+					}
+					if ( FILE* f = std::fopen( ( dump_path + ".w" ).c_str(), "ab" ) ) {
+						std::vector<float> wf( wr.size() );
+						for ( size_t i = 0; i < wr.size(); ++i ) wf[i] = backend::to_float( wr[i] );
+						std::fwrite( wf.data(), sizeof( float ), wf.size(), f );
 						std::fclose( f );
 					}
 				}
