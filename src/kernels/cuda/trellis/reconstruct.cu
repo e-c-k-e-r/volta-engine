@@ -2,7 +2,7 @@
 #include "reconstruct.cuh"
 #include "util.cuh"
 #include "ptx.cuh"
-#include "exl3_dq.cuh"
+#include "exl3_dq_ext.cuh"
 #include "hadamard_inner.cuh"
 #include "engine/modules/trellis_bits.h"
 #include <array>
@@ -12,6 +12,8 @@ __global__ __launch_bounds__( 256 )
 void reconstruct_kernel(
 	half* __restrict__ g_unpacked,
 	const uint16_t* __restrict__ g_packed,
+	const uint16_t* __restrict__ g_starts,
+	const uint8_t* __restrict__ g_gains,
 	int packed_blocks_n,
 	int packed_n_offset
 ) {
@@ -26,6 +28,7 @@ void reconstruct_kernel(
 	int out_blocks_n = tiles_n * 8;
 
 	__shared__ uint32_t s_packed[8][packed_size / 2];
+	const size_t tile_idx = (size_t) k * packed_blocks_n + packed_n_offset + n + warp_id;
 	g_packed += ( k * packed_blocks_n + packed_n_offset + n ) * packed_size;
 	if ( t < packed_size ) {
 		( (int4*) s_packed )[t] = ( (int4*) g_packed )[t];
@@ -33,7 +36,8 @@ void reconstruct_kernel(
 	__syncthreads();
 
 	FragB frag[2];
-	dq_dispatch<K, cb>( s_packed[warp_id], lane_id * 8, frag[0], frag[1] );
+	dq_dispatch_ext<K, cb>( s_packed[warp_id], lane_id * 8, frag[0], frag[1], g_starts ? g_starts[tile_idx] : 0u, g_starts != nullptr, g_gains != nullptr,
+		g_gains ? tile_gain2( g_gains[tile_idx] ) : __half2half2( __ushort_as_half( 0x3c00 ) ) );
 
 	__shared__ half2 tile[16][8][8];
 
@@ -106,6 +110,8 @@ __global__ __launch_bounds__( RH_THREADS )
 void reconstruct_had_kernel(
 	half* __restrict__ g_unpacked,
 	const uint16_t* __restrict__ g_packed,
+	const uint16_t* __restrict__ g_starts,
+	const uint8_t* __restrict__ g_gains,
 	const half* __restrict__ suh,
 	const half* __restrict__ svh,
 	int packed_blocks_n,
@@ -143,7 +149,9 @@ void reconstruct_had_kernel(
 		int j = ( warp_id / 8 ) * ( 8 / ( RH_THREADS / 256 ) ) + jj;
 		int wn = warp_id % 8;
 		FragB frag[2];
-		dq_dispatch<K, cb>( s_packed[j][wn], lane_id * 8, frag[0], frag[1] );
+		const size_t tile_idx = (size_t) ( kb * 8 + j ) * packed_blocks_n + packed_n_offset + n + wn;
+		dq_dispatch_ext<K, cb>( s_packed[j][wn], lane_id * 8, frag[0], frag[1], g_starts ? g_starts[tile_idx] : 0u, g_starts != nullptr,
+			g_gains != nullptr, g_gains ? tile_gain2( g_gains[tile_idx] ) : __half2half2( __ushort_as_half( 0x3c00 ) ) );
 
 #if EXL3_VOLTA_LAYOUT
 		{
@@ -263,18 +271,10 @@ constexpr auto reconstruct_had_kernel_instances = std::array{
 };
 #undef __
 
-void reconstruct_cols(
-	half* unpacked,
-	const uint16_t* packed,
-	int K,
-	bool mcg,
-	bool mul1,
-	int rows,
-	int cols,
-	int64_t n_offset,
-	int stride,
-	cudaStream_t stream
-) {
+namespace {
+
+void reconstruct_cols_impl( half* unpacked, const uint16_t* packed, const uint16_t* starts, const uint8_t* gains, int K, bool mcg, bool mul1, int rows,
+	int cols, int64_t n_offset, int stride, cudaStream_t stream ) {
 	if ( K < 1 || K > 11 || ( K > 8 && !mul1 ) ) return;
 	int packed_cols = stride / 16;
 	int packed_n_offset = n_offset / 16;
@@ -290,9 +290,33 @@ void reconstruct_cols(
 	reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>(
 		unpacked,
 		packed,
+		starts,
+		gains,
 		packed_cols,
 		packed_n_offset
 	);
+}
+
+} // namespace
+
+void reconstruct_cols(
+	half* unpacked,
+	const uint16_t* packed,
+	int K,
+	bool mcg,
+	bool mul1,
+	int rows,
+	int cols,
+	int64_t n_offset,
+	int stride,
+	cudaStream_t stream
+) {
+	reconstruct_cols_impl( unpacked, packed, nullptr, nullptr, K, mcg, mul1, rows, cols, n_offset, stride, stream );
+}
+
+void reconstruct_slice_ext( half* unpacked, const uint16_t* packed, const uint16_t* starts, const uint8_t* gains, int K, bool mcg, bool mul1, int rows,
+	int cols, int64_t n_offset, cudaStream_t stream ) {
+	reconstruct_cols_impl( unpacked, packed, starts, gains, K, mcg, mul1, rows, cols, n_offset, cols, stream );
 }
 
 // defined after reconstruct_cols: the Volta-order copy (namespace exl3_vl) must call its own
@@ -310,19 +334,8 @@ void reconstruct_slice(
 	reconstruct_cols( unpacked, packed, K, mcg, mul1, rows, cols, n_offset, cols, stream );
 }
 
-void reconstruct_had_slice(
-	half* unpacked,
-	const uint16_t* packed,
-	const half* suh,
-	const half* svh,
-	int K,
-	bool mcg,
-	bool mul1,
-	int rows,
-	int cols,
-	int64_t n_offset,
-	cudaStream_t stream
-) {
+void reconstruct_had_slice_ext( half* unpacked, const uint16_t* packed, const uint16_t* starts, const uint8_t* gains, const half* suh, const half* svh,
+	int K, bool mcg, bool mul1, int rows, int cols, int64_t n_offset, cudaStream_t stream ) {
 	if ( K < 1 || K > 11 || ( K > 8 && !mul1 ) ) return;
 	int packed_cols = cols / 16;
 	int packed_n_offset = n_offset / 16;
@@ -338,9 +351,27 @@ void reconstruct_had_slice(
 	reconstruct_had_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>(
 		unpacked,
 		packed,
+		starts,
+		gains,
 		suh,
 		svh,
 		packed_cols,
 		packed_n_offset
 	);
+}
+
+void reconstruct_had_slice(
+	half* unpacked,
+	const uint16_t* packed,
+	const half* suh,
+	const half* svh,
+	int K,
+	bool mcg,
+	bool mul1,
+	int rows,
+	int cols,
+	int64_t n_offset,
+	cudaStream_t stream
+) {
+	reconstruct_had_slice_ext( unpacked, packed, nullptr, nullptr, suh, svh, K, mcg, mul1, rows, cols, n_offset, stream );
 }

@@ -21,9 +21,23 @@
 __host__ __device__ constexpr int exl3e_num_threads( int K ) { return K >= 7 ? ( 32768 >> K ) : 512; }
 __host__ __device__ constexpr int exl3e_min_blocks( int K ) { return K == 6 ? 1 : 1024 / exl3e_num_threads( K ); }
 
-// Shared memory of the integer-rate kernel: staged tile, argmin scratch, and from K = 2 on both cost arrays
+// Shared memory of the integer-rate kernel: staged tile, cost scales, argmin scratch, and from K = 2 on both cost arrays
 __host__ __device__ constexpr int exl3e_shmem( int K ) {
-	return ( K >= EXL3E_SHARED_COSTS_MIN_K ? 2 * ( 65536 >> K ) * 2 : 0 ) + 256 * 2 + 64 + 128;
+	return ( K >= EXL3E_SHARED_COSTS_MIN_K ? 2 * ( 65536 >> K ) * 2 : 0 ) + 2 * 256 * 2 + 64 + 128;
+}
+
+// Weighted metric (per-position weights w, the cost sum w_i e_i^2): the stored costs are the running costs divided by the weight of their position,
+// so a step stays e^2 plus an in-cost, and the costs it stores are scaled once by w(ri) / w(ri + 1), the same factor for every state (the argmin
+// and the pinned pass are unchanged). scale[ri] for the 256 ring positions; 1 everywhere without weights
+__device__ __forceinline__ void exl3e_load_scales( const float* weights, half* scale, int nt ) {
+	for ( int i = threadIdx.x; i < 256; i += nt ) {
+		float s = 1.0f;
+		if ( weights ) {
+			const float a = weights[i], b = weights[( i + 1 ) & 255];
+			s = a > 0.0f && b > 0.0f ? a / b : 1.0f;
+		}
+		scale[i] = __float2half_rn( s );
+	}
 }
 
 __device__ __forceinline__ uint32_t exl3e_warp_min( uint32_t value ) {
@@ -105,7 +119,8 @@ struct Exl3eDecoder {
 // allowed), and the chosen in-state of every out-state into the history row of ri
 template <int K, int cb, int NT>
 __device__ __forceinline__ void exl3e_step( half w, const half* costs_in, half* costs_out, uint16_t* hist_row, bool first, int pre_state,
-	bool write_hist ) {
+	bool write_hist, bool weighted, half scale ) {
+	const half2 scale2 = __half2half2( scale );
 	constexpr int Kr = 16 - K;
 	constexpr int max_q = 1 << K;
 	constexpr int edges = 65536 >> K;
@@ -145,7 +160,7 @@ __device__ __forceinline__ void exl3e_step( half w, const half* costs_in, half* 
 				min_in_edge1 = in_edge_idx;
 			}
 		}
-		reinterpret_cast<half2*>( costs_out )[out_edge_idx >> 1] = min_err2;
+		reinterpret_cast<half2*>( costs_out )[out_edge_idx >> 1] = weighted ? __hmul2( min_err2, scale2 ) : min_err2;
 		if ( write_hist ) {
 			hist_row[out_edge_idx] = (uint16_t) min_in_edge0;
 			hist_row[out_edge_idx + 1] = (uint16_t) min_in_edge1;
@@ -154,15 +169,18 @@ __device__ __forceinline__ void exl3e_step( half w, const half* costs_in, half* 
 }
 
 // Integer rate K (1..8), codebook cb (0 3INST, 1 mcg, 2 mul1). One block per tile; temp_costs (K < 2) holds 2 * (65536 >> K) halves per tile
-// of the batch, temp_edges 256 * (65536 >> K) per tile
+// of the batch, temp_edges 256 * (65536 >> K) per tile; weights (256 per tile, stream order, or null: plain squared error) weight the metric.
+// open: no ring, one pass from position 0 with a free start state (not packable: the first positions' windows hold bits from before the tile)
 template <int K, int cb>
 __global__ __launch_bounds__( exl3e_num_threads( K ), exl3e_min_blocks( K ) )
 void exl3_encode_tiles_kernel(
 	const float* __restrict__ input_tiles,
+	const float* __restrict__ weights,
 	float* __restrict__ output_tiles,
 	uint16_t* __restrict__ output_indices,
 	half* __restrict__ temp_costs_ptr,
-	uint16_t* __restrict__ temp_edges_ptr
+	uint16_t* __restrict__ temp_edges_ptr,
+	int open
 ) {
 	constexpr int NT = exl3e_num_threads( K );
 	constexpr int edges = 65536 >> K;
@@ -178,13 +196,17 @@ void exl3_encode_tiles_kernel(
 
 	half* sh_input_tile = (half*) sh;
 	sh += 256 * sizeof( half );
+	half* sh_scale = (half*) sh;
+	sh += 256 * sizeof( half );
 	sh += 32 * sizeof( half );
 	int* sh_idx = (int*) sh;
 	sh += 32 * sizeof( int );
 	half* temp_costs = K >= EXL3E_SHARED_COSTS_MIN_K ? (half*) sh : temp_costs_ptr + (size_t) 2 * edges * tile_idx;
 	half* temp_costs_inc = temp_costs + edges;
+	const bool weighted = weights != nullptr;
 
 	for ( int i = thread; i < 256; i += NT ) sh_input_tile[i] = __float2half_rn( input_tile[i] );
+	exl3e_load_scales( weighted ? weights + 256 * tile_idx : nullptr, sh_scale, NT );
 	__syncthreads();
 
 	auto forward = [&]( int roll, int pre_state ) {
@@ -195,7 +217,7 @@ void exl3_encode_tiles_kernel(
 			temp_costs_inc = t;
 			// The first pass only traces back to position 0, so its history for the rolled second half (ri >= 128) is never read
 			exl3e_step<K, cb, NT>( sh_input_tile[ri], temp_costs_inc, temp_costs, temp_edges + (size_t) edges * ri, i == 0, pre_state,
-				pre_state >= 0 || ri < 128 );
+				pre_state >= 0 || ri < 128 || open, weighted, sh_scale[ri] );
 			__syncthreads();
 		}
 	};
@@ -218,6 +240,11 @@ void exl3_encode_tiles_kernel(
 		return sh_idx[0];
 	};
 
+	if ( open ) {
+		forward( 0, -1 );
+		backward( 0, true, exl3e_argmin<NT>( temp_costs, edges, sh_idx ) );
+		return;
+	}
 	forward( 128, -1 );
 	const int end_state = backward( 128, false, exl3e_argmin<NT>( temp_costs, edges, sh_idx ) );
 	forward( 0, end_state );
@@ -231,7 +258,8 @@ void exl3_encode_tiles_kernel(
 
 template <int KIN, int KOUT>
 __device__ __forceinline__ void exl3e_half_step( half w, const half* costs_in, half* costs_out, uint16_t* hist_row, bool first, int pre_state,
-	bool write_hist ) {
+	bool write_hist, bool weighted, half scale ) {
+	const half2 scale2 = __half2half2( scale );
 	constexpr int Kr = 16 - KOUT;
 	constexpr int max_q = 1 << KOUT;
 	constexpr int edges_out = 65536 >> KOUT;
@@ -275,7 +303,7 @@ __device__ __forceinline__ void exl3e_half_step( half w, const half* costs_in, h
 				min_in_edge1 = in_edge_idx;
 			}
 		}
-		reinterpret_cast<half2*>( costs_out )[out_edge_idx >> 1] = min_err2;
+		reinterpret_cast<half2*>( costs_out )[out_edge_idx >> 1] = weighted ? __hmul2( min_err2, scale2 ) : min_err2;
 		if ( write_hist ) {
 			hist_row[out_edge_idx] = (uint16_t) min_in_edge0;
 			hist_row[out_edge_idx + 1] = (uint16_t) min_in_edge1;
@@ -287,10 +315,12 @@ template <int KA, uint32_t MASK>
 __global__ __launch_bounds__( EXL3E_HALF_NT, 2 )
 void exl3_encode_tiles_half_kernel(
 	const float* __restrict__ input_tiles,
+	const float* __restrict__ weights,
 	float* __restrict__ output_tiles,
 	uint16_t* __restrict__ output_indices,
 	half* __restrict__ temp_costs_ptr,
-	uint16_t* __restrict__ temp_edges_ptr
+	uint16_t* __restrict__ temp_edges_ptr,
+	int open
 ) {
 	constexpr int NT = EXL3E_HALF_NT;
 	constexpr int KB = KA + 1;
@@ -309,12 +339,16 @@ void exl3_encode_tiles_half_kernel(
 
 	half* sh_input_tile = (half*) sh;
 	sh += 256 * sizeof( half );
+	half* sh_scale = (half*) sh;
+	sh += 256 * sizeof( half );
 	int* sh_idx = (int*) sh;
 
 	half* temp_costs = temp_costs_ptr + (size_t) 2 * edges_max * tile_idx;
 	half* temp_costs_inc = temp_costs + edges_max;
+	const bool weighted = weights != nullptr;
 
 	for ( int i = thread; i < 256; i += NT ) sh_input_tile[i] = __float2half_rn( input_tile[i] );
+	exl3e_load_scales( weighted ? weights + 256 * tile_idx : nullptr, sh_scale, NT );
 	__syncthreads();
 
 	auto forward = [&]( int roll, int pre_state ) {
@@ -324,23 +358,24 @@ void exl3_encode_tiles_half_kernel(
 			temp_costs = temp_costs_inc;
 			temp_costs_inc = t;
 			const bool first = i == 0;
-			const bool write_hist = pre_state >= 0 || ri < 128;
+			const bool write_hist = pre_state >= 0 || ri < 128 || open;
 			uint16_t* hist_row = temp_edges + (size_t) edges_max * ri;
 			const half w = sh_input_tile[ri];
+			const half sc = sh_scale[ri];
 			// KIN = D(ri), KOUT = D(ri + 1)
 			const int din = ( MASK >> ( ri & 15 ) ) & 1, dout = ( MASK >> ( ( ri + 1 ) & 15 ) ) & 1;
 			switch ( din * 2 + dout ) {
 				case 0: {
-					exl3e_half_step<KA, KA>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist );
+					exl3e_half_step<KA, KA>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, weighted, sc );
 				} break;
 				case 1: {
-					exl3e_half_step<KA, KB>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist );
+					exl3e_half_step<KA, KB>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, weighted, sc );
 				} break;
 				case 2: {
-					exl3e_half_step<KB, KA>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist );
+					exl3e_half_step<KB, KA>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, weighted, sc );
 				} break;
 				default: {
-					exl3e_half_step<KB, KB>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist );
+					exl3e_half_step<KB, KB>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, weighted, sc );
 				} break;
 			}
 			__syncthreads();
@@ -366,6 +401,11 @@ void exl3_encode_tiles_half_kernel(
 		return sh_idx[0];
 	};
 
+	if ( open ) {
+		forward( 0, -1 );
+		backward( 0, true, exl3e_argmin<NT>( temp_costs, edges_last, sh_idx ) );
+		return;
+	}
 	forward( 128, -1 );
 	const int end_state = backward( 128, false, exl3e_argmin<NT>( temp_costs, edges_last, sh_idx ) );
 	forward( 0, end_state );

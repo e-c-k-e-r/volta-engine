@@ -22,6 +22,10 @@ struct Exl3QuantOptions {
 	int out_scales = -1;      // per-output-channel scales: -1 auto (on), 0 off, 1 on
 	bool refit = true;        // refit the channel scales after quantization (needs a Hessian)
 	bool scaled_hessian = true; // one factor per projection with its input scales folded in; false: the input's shared factor (needs one)
+	bool ldl_metric = false;  // the Viterbi weights each row's squared error by its block's LDL diagonal (CurveTQ's metric; needs scaled_hessian)
+	bool open_trellis = false; // no tail-biting ring: a free start state per tile (the bits before its stream), Exl3Tensor::starts
+	bool tile_gain = false;   // a gain per tile, the least-squares one (in the LDL metric with ldl_metric), 8 bits: g = (896 + c) / 1024, applied
+	                          // before the error feedback sees the tile; Exl3Tensor::gains
 	float scale_hint = 0.0f;  // where the global scale search starts (a like tensor's g_scale): the fine grid around it, the coarse grid only when its
 	                          // minimum is at an edge; 0: the coarse grid first. A group starts each projection at the one before's
 };
@@ -51,6 +55,8 @@ struct Exl3Tensor {
 	std::vector<uint16_t> svh;      // n fp16 bits (output scales and signs)
 	double proxy_err = 0.0;         // tr(E^T H E) / tr(W^T H W) of what is stored, the damping taken out of H; fallback: |E|^2 / |W|^2
 	float g_scale = 1.0f;
+	std::vector<uint16_t> starts;   // open_trellis: k / 16 x n / 16 start states (the 16 - K bits before a tile's stream, in its low bits)
+	std::vector<uint8_t> gains;     // tile_gain: k / 16 x n / 16 gain codes
 };
 
 // weights[i]: device fp32 k x ns[i], input-major (the transpose of a [out, in] checkpoint tensor); ns[i] % 128 == 0, k % 128 == 0. seeds[i]

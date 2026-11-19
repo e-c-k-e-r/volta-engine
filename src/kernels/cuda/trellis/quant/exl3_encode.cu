@@ -60,7 +60,7 @@ Launch launch_for( int code, int cb ) {
 	ENGINE_ASSERT( l.kernel, "exl3_encode: no kernel for this width code" );
 	if ( trellis_is_half( code ) ) {
 		l.threads = EXL3E_HALF_NT;
-		l.shmem = 256 * sizeof( half ) + 32 * sizeof( int ) + 128;
+		l.shmem = 2 * 256 * sizeof( half ) + 32 * sizeof( int ) + 128;
 	} else {
 		l.threads = exl3e_num_threads( code );
 		l.shmem = exl3e_shmem( code );
@@ -176,7 +176,7 @@ void exl3_encode_scratch_free( Exl3EncodeScratch& s ) {
 }
 
 void exl3_encode_tiles( const float* tiles, float* decoded, uint16_t* windows, int num_tiles, int code, int cb, const Exl3EncodeScratch& s,
-	backend::stream_t stream ) {
+	backend::stream_t stream, const float* weights, bool open ) {
 	ENGINE_ASSERT( s.edges && s.code == code && s.tiles > 0, "exl3_encode_tiles: scratch was allocated for another width code" );
 	const Launch l = launch_for( code, cb );
 	// One resident wave at most per launch: more blocks would only queue on the same scratch
@@ -185,8 +185,8 @@ void exl3_encode_tiles( const float* tiles, float* decoded, uint16_t* windows, i
 	for ( int b0 = 0; b0 < num_tiles; b0 += batch ) {
 		const int n = num_tiles - b0 < batch ? num_tiles - b0 : batch;
 		const size_t off = static_cast<size_t>( b0 ) * 256;
-		l.kernel<<<n, l.threads, l.shmem, st>>>( tiles + off, decoded + off, windows + off, static_cast<half*>( s.costs ),
-			static_cast<uint16_t*>( s.edges ) );
+		l.kernel<<<n, l.threads, l.shmem, st>>>( tiles + off, weights ? weights + off : nullptr, decoded + off, windows + off,
+			static_cast<half*>( s.costs ), static_cast<uint16_t*>( s.edges ), open ? 1 : 0 );
 		CUDA_CHECK( cudaPeekAtLastError() );
 	}
 }

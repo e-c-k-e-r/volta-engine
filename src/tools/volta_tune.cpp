@@ -6,6 +6,12 @@
 //
 //   volta_tune --src <original> --exl3 <dir> --route <route dump with its .w> --out <dir> --layers L,L,... [--steps 100] [--lr 0.001]
 //              [--max-rows 8192] [--devices 0,1,2,3]
+//
+// --route-q <dump> switches to block tuning (QTIP's block stage for the routed experts): the dump is of the same text through the quantized
+// model, so its rows carry the error of every layer before; all of a layer's experts are tuned together so that the quantized routed MoE
+// output on those rows (the quantized model's routing) matches the original's on the reference rows of --route (the reference routing), in
+// batches of --batch tokens, every tenth token held out for the step choice; --eval-ref / --eval-q, a reference and a quantized dump of
+// held-out text, report the block error there before and after. One layer per device.
 #include "engine/config.h"
 #include "engine/core/log.h"
 #include "engine/train/grad.h"
@@ -24,6 +30,8 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <memory>
+#include <random>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -43,6 +51,8 @@ struct Args {
 	int steps = 100;
 	float lr = 1e-3f;
 	int max_rows = 8192;
+	std::string route_q, eval_ref, eval_q;   // block tuning
+	int batch = 4096;
 };
 
 std::vector<int> int_list( const std::string& s ) {
@@ -64,6 +74,10 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--steps" ) a.steps = std::stoi( v );
 		else if ( k == "--lr" ) a.lr = std::stof( v );
 		else if ( k == "--max-rows" ) a.max_rows = std::stoi( v );
+		else if ( k == "--route-q" ) a.route_q = v;
+		else if ( k == "--eval-ref" ) a.eval_ref = v;
+		else if ( k == "--eval-q" ) a.eval_q = v;
+		else if ( k == "--batch" ) a.batch = std::stoi( v );
 		else {
 			LOG_ERROR( "[volta_tune] unknown argument %s", k.c_str() );
 			return false;
@@ -71,7 +85,7 @@ bool parse( int argc, char** argv, Args& a ) {
 	}
 	if ( a.src.empty() || a.exl3.empty() || a.route.empty() || a.out.empty() || a.layers.empty() ) {
 		LOG_ERROR( "usage: volta_tune --src <original> --exl3 <dir> --route <route dump> --out <dir> --layers L,L,... [--steps 100] [--lr 0.001] "
-				   "[--max-rows 8192] [--devices 0,1,2,3]" );
+				   "[--max-rows 8192] [--devices 0,1,2,3] [--route-q <dump> [--batch 4096] [--eval-ref <dump> --eval-q <dump>]]" );
 		return false;
 	}
 	return true;
@@ -350,6 +364,361 @@ void worker( Shared& sh, int device ) {
 	CUDA_CHECK( cudaStreamDestroy( st ) );
 }
 
+// ---- block tuning -------------------------------------------------------------------------------------------------------------------------
+
+struct IBuf {
+	int* p = nullptr;
+	size_t n = 0;
+	IBuf() = default;
+	IBuf( const IBuf& ) = delete;
+	IBuf& operator=( const IBuf& ) = delete;
+	~IBuf() {
+		if ( p ) cudaFree( p );
+	}
+	int* upload( const std::vector<int>& h, cudaStream_t st ) {
+		if ( h.size() > n ) {
+			if ( p ) CUDA_CHECK( cudaFree( p ) );
+			CUDA_CHECK( cudaMalloc( &p, std::max<size_t>( h.size(), 1 ) * sizeof( int ) ) );
+			n = h.size();
+		}
+		if ( !h.empty() ) CUDA_CHECK( cudaMemcpyAsync( p, h.data(), h.size() * sizeof( int ), cudaMemcpyHostToDevice, st ) );
+		return p;
+	}
+};
+
+// One layer of a route dump on the host: rows (FP16, rows x hidden), expert ids and routing weights (rows x K)
+struct Dump {
+	int64_t rows = 0;
+	int K = 0;
+	std::vector<uint16_t> x;
+	std::vector<int> ids;
+	std::vector<float> w;
+	bool read( const std::string& path, int hidden, int layer ) {
+		q::RouteRows rr;
+		if ( !rr.open( path, hidden ) || !rr.has_weights() ) return false;
+		if ( !rr.read( layer, 0, x ) || !rr.routes( layer, 0, ids, w, K ) ) return false;
+		rows = static_cast<int64_t>( x.size() / hidden );
+		return rows > 0;
+	}
+};
+
+// The routed pairs of a set of rows, packed by expert: the dump row, the position in the set, the routing weight; off: experts + 1 offsets
+struct Routed {
+	std::vector<int> src, pos, off;
+	std::vector<float> p;
+};
+
+Routed route_rows( const Dump& d, const int* rows, int n, int experts ) {
+	Routed r;
+	r.off.assign( experts + 1, 0 );
+	for ( int b = 0; b < n; ++b ) {
+		for ( int j = 0; j < d.K; ++j ) {
+			const int e = d.ids[static_cast<size_t>( rows[b] ) * d.K + j];
+			if ( e >= 0 && e < experts ) r.off[e + 1]++;
+		}
+	}
+	for ( int e = 0; e < experts; ++e ) r.off[e + 1] += r.off[e];
+	const int total = r.off[experts];
+	r.src.resize( total );
+	r.pos.resize( total );
+	r.p.resize( total );
+	std::vector<int> fill( r.off.begin(), r.off.end() - 1 );
+	for ( int b = 0; b < n; ++b ) {
+		for ( int j = 0; j < d.K; ++j ) {
+			const size_t i = static_cast<size_t>( rows[b] ) * d.K + j;
+			const int e = d.ids[i];
+			if ( e < 0 || e >= experts ) continue;
+			const int at = fill[e]++;
+			r.src[at] = rows[b];
+			r.pos[at] = b;
+			r.p[at] = d.w[i];
+		}
+	}
+	return r;
+}
+
+// The original routed MoE output of every row of a dump (rows x hidden, device): its routing over the source experts
+bool reference_outputs( tr::Blas& blas, q::SourceWeights& src, const Dump& d, const std::vector<std::string>& prefixes, int H, int I, float limit,
+	float* Y, cudaStream_t st ) {
+	Buf X, Wg, Wu, Wd, G, U, A, O;
+	IBuf dx_src, dx_pos;
+	Buf dx_p;
+	uint16_t* Xd = nullptr;
+	CUDA_CHECK( cudaMalloc( &Xd, d.x.size() * 2 ) );
+	CUDA_CHECK( cudaMemcpyAsync( Xd, d.x.data(), d.x.size() * 2, cudaMemcpyHostToDevice, st ) );
+	CUDA_CHECK( cudaMemsetAsync( Y, 0, static_cast<size_t>( d.rows ) * H * sizeof( float ), st ) );
+	std::vector<int> all( d.rows );
+	for ( int64_t r = 0; r < d.rows; ++r ) all[r] = static_cast<int>( r );
+	const Routed R = route_rows( d, all.data(), static_cast<int>( d.rows ), static_cast<int>( prefixes.size() ) );
+	const int* sp = dx_src.upload( R.src, st );
+	const int* pp = dx_pos.upload( R.pos, st );
+	const float* wp = dx_p.upload( R.p, st );
+	constexpr int CH = 4096;
+	bool ok = true;
+	for ( size_t e = 0; e < prefixes.size() && ok; ++e ) {
+		const int o = R.off[e], n = R.off[e + 1] - R.off[e];
+		if ( n == 0 ) continue;
+		ok = src.load( prefixes[e] + ".gate_proj", Wg.fit( static_cast<size_t>( H ) * I ), st ) && src.load( prefixes[e] + ".up_proj", Wu.fit( static_cast<size_t>( H ) * I ), st ) &&
+			src.load( prefixes[e] + ".down_proj", Wd.fit( static_cast<size_t>( I ) * H ), st );
+		for ( int c0 = 0; c0 < n && ok; c0 += CH ) {
+			const int c = std::min( CH, n - c0 );
+			tr::gather_rows( Xd, true, sp + o + c0, nullptr, c, H, X.fit( static_cast<size_t>( CH ) * H ), st );
+			blas.gemm( false, false, c, I, H, 1.0f, X.p, Wg.p, 0.0f, G.fit( static_cast<size_t>( CH ) * I ) );
+			blas.gemm( false, false, c, I, H, 1.0f, X.p, Wu.p, 0.0f, U.fit( static_cast<size_t>( CH ) * I ) );
+			tr::swiglu_forward( G.p, U.p, A.fit( static_cast<size_t>( CH ) * I ), static_cast<size_t>( c ) * I, limit, st );
+			blas.gemm( false, false, c, H, I, 1.0f, A.p, Wd.p, 0.0f, O.fit( static_cast<size_t>( CH ) * H ) );
+			tr::scatter_add_rows( O.p, pp + o + c0, wp + o + c0, c, H, Y, st );
+		}
+	}
+	CUDA_CHECK( cudaStreamSynchronize( st ) );
+	CUDA_CHECK( cudaFree( Xd ) );
+	return ok;
+}
+
+// One layer: every routed expert's scales against the original routed MoE output, on rows that carry the quantized model's upstream error
+bool block_layer( const Args& a, const q::Model& model, int layer, int device, std::mutex& log_mu ) {
+	CUDA_CHECK( cudaSetDevice( device ) );
+	cudaStream_t st = nullptr;
+	CUDA_CHECK( cudaStreamCreateWithFlags( &st, cudaStreamNonBlocking ) );
+	const auto t0 = std::chrono::steady_clock::now();
+	const int H = model.hidden, E = model.experts;
+	const float limit = model.swiglu_limit;
+	q::SourceWeights src;
+	q::StRepo repo;
+	if ( !src.open( a.src ) || !repo.open( a.exl3 ) ) return false;
+	// The layer's experts in the EXL3 directory
+	static const std::regex gate_re( R"(^(.*\.layers\.(\d+)\.mlp\.experts)\.(\d+)\.gate_proj\.trellis$)" );
+	std::string base;
+	for ( const auto& kv : repo.weight_map() ) {
+		std::smatch m;
+		if ( std::regex_match( kv.first, m, gate_re ) && std::stoi( m[2].str() ) == layer && m[1].str().find( "mtp." ) != 0 ) {
+			base = m[1].str();
+			break;
+		}
+	}
+	if ( base.empty() ) {
+		LOG_ERROR( "[volta_tune] layer %d: no routed experts in %s", layer, a.exl3.c_str() );
+		return false;
+	}
+	std::vector<std::string> prefixes( E );
+	for ( int e = 0; e < E; ++e ) prefixes[e] = base + "." + std::to_string( e );
+	Dump dref, dq;
+	if ( !dref.read( a.route, H, layer ) || !dq.read( a.route_q, H, layer ) || dref.rows != dq.rows ) {
+		LOG_ERROR( "[volta_tune] layer %d: the reference and quantized dumps (with routing weights) must hold the same rows", layer );
+		return false;
+	}
+	tr::Blas blas( st );
+	// The quantized experts: cores, base scales, parameters
+	std::vector<std::unique_ptr<Proj>> projs( static_cast<size_t>( E ) * 3 );
+	int I = 0;
+	for ( int e = 0; e < E; ++e ) {
+		const char* names[3] = { ".gate_proj", ".up_proj", ".down_proj" };
+		for ( int k = 0; k < 3; ++k ) {
+			auto p = std::make_unique<Proj>();
+			if ( !q::exl3_read( repo, prefixes[e] + names[k], p->r ) ) {
+				LOG_ERROR( "[volta_tune] %s%s: not in %s", prefixes[e].c_str(), names[k], a.exl3.c_str() );
+				return false;
+			}
+			const int kk = p->r.t.k, nn = p->r.t.n;
+			if ( k == 0 ) I = nn;
+			q::exl3_decode( p->r, p->core.fit( static_cast<size_t>( kk ) * nn ), true );
+			std::vector<float> u( kk ), v( nn );
+			for ( int i = 0; i < kk; ++i ) u[i] = h2f( p->r.t.suh[i] );
+			for ( int i = 0; i < nn; ++i ) v[i] = h2f( p->r.t.svh[i] );
+			p->s0u.upload( u, st );
+			p->s0v.upload( v, st );
+			p->su.upload( u, st );
+			p->sv.upload( v, st );
+			for ( Buf* b : { &p->gu, &p->au, &p->mu, &p->vu, &p->bu, &p->tu } ) CUDA_CHECK( cudaMemsetAsync( b->fit( kk ), 0, kk * sizeof( float ), st ) );
+			for ( Buf* b : { &p->gv, &p->av, &p->mv, &p->vv, &p->bv, &p->tv } ) CUDA_CHECK( cudaMemsetAsync( b->fit( nn ), 0, nn * sizeof( float ), st ) );
+			projs[static_cast<size_t>( e ) * 3 + k] = std::move( p );
+		}
+	}
+	// The original outputs over the reference rows (train / held-out rows of the same dump), and over the held-out text
+	Buf Yref;
+	if ( !reference_outputs( blas, src, dref, prefixes, H, I, limit, Yref.fit( static_cast<size_t>( dref.rows ) * H ), st ) ) return false;
+	Dump eref, eq;
+	Buf Yeval;
+	const bool eval = !a.eval_ref.empty() && !a.eval_q.empty();
+	if ( eval && ( !eref.read( a.eval_ref, H, layer ) || !eq.read( a.eval_q, H, layer ) || eref.rows != eq.rows ||
+				   !reference_outputs( blas, src, eref, prefixes, H, I, limit, Yeval.fit( static_cast<size_t>( eref.rows ) * H ), st ) ) ) {
+		LOG_ERROR( "[volta_tune] layer %d: the held-out dumps do not pair up", layer );
+		return false;
+	}
+	uint16_t *Xq = nullptr, *Xe = nullptr;
+	CUDA_CHECK( cudaMalloc( &Xq, dq.x.size() * 2 ) );
+	CUDA_CHECK( cudaMemcpyAsync( Xq, dq.x.data(), dq.x.size() * 2, cudaMemcpyHostToDevice, st ) );
+	if ( eval ) {
+		CUDA_CHECK( cudaMalloc( &Xe, eq.x.size() * 2 ) );
+		CUDA_CHECK( cudaMemcpyAsync( Xe, eq.x.data(), eq.x.size() * 2, cudaMemcpyHostToDevice, st ) );
+	}
+	std::vector<int> train, val;
+	for ( int64_t r = 0; r < dq.rows; ++r ) ( r % 10 == 9 ? val : train ).push_back( static_cast<int>( r ) );
+	const int B = std::min<int>( a.batch, static_cast<int>( train.size() ) );
+	const size_t P = static_cast<size_t>( B ) * dq.K;   // routed pairs of a batch
+	Buf Xp, Zg, G, Zu, U, A, Zd, Yd, dA, dG, dU, dYd, Yb, Yt, dY, Sn, Sk, pw;
+	for ( Buf* b : { &Xp, &Zd, &Yd, &dYd } ) b->fit( P * H );
+	for ( Buf* b : { &Zg, &G, &Zu, &U, &A, &dA, &dG, &dU } ) b->fit( P * I );
+	for ( Buf* b : { &Yb, &Yt, &dY, &Sn, &Sk } ) b->fit( static_cast<size_t>( B ) * H );
+	IBuf isrc, ipos, irows;
+
+	// The quantized block over a set of rows (positions 0 .. n of the set); with backward the scale gradients of its relative error
+	auto pass = [&]( const uint16_t* X, const Dump& d, const int* rows, int n, const float* Yr, bool backward ) {
+		const Routed R = route_rows( d, rows, n, E );
+		const int* sp = isrc.upload( R.src, st );
+		const int* pp = ipos.upload( R.pos, st );
+		const float* wp = pw.upload( R.p, st );
+		const std::vector<int> rv( rows, rows + n );
+		tr::gather_rows( Yr, false, irows.upload( rv, st ), nullptr, n, H, Yt.p, st );
+		CUDA_CHECK( cudaMemsetAsync( Yb.p, 0, static_cast<size_t>( n ) * H * sizeof( float ), st ) );
+		for ( int e = 0; e < E; ++e ) {
+			const int o = R.off[e], m = R.off[e + 1] - R.off[e];
+			if ( !m ) continue;
+			Proj &g = *projs[e * 3], &u = *projs[e * 3 + 1], &dn = *projs[e * 3 + 2];
+			tr::ScaledLinear lg{ H, I, g.core.p, g.su.p, g.sv.p, g.gu.p, g.gv.p }, lu{ H, I, u.core.p, u.su.p, u.sv.p, u.gu.p, u.gv.p },
+				ld{ I, H, dn.core.p, dn.su.p, dn.sv.p, dn.gu.p, dn.gv.p };
+			const size_t oh = static_cast<size_t>( o ) * H, oi = static_cast<size_t>( o ) * I;
+			tr::gather_rows( X, true, sp + o, nullptr, m, H, Xp.p + oh, st );
+			tr::scaled_linear_forward( blas, lg, Xp.p + oh, m, Zg.p + oi, G.p + oi, Sk.p );
+			tr::scaled_linear_forward( blas, lu, Xp.p + oh, m, Zu.p + oi, U.p + oi, Sk.p );
+			tr::swiglu_forward( G.p + oi, U.p + oi, A.p + oi, static_cast<size_t>( m ) * I, limit, st );
+			tr::scaled_linear_forward( blas, ld, A.p + oi, m, Zd.p + oh, Yd.p + oh, Sk.p );
+			tr::scatter_add_rows( Yd.p + oh, pp + o, wp + o, m, H, Yb.p, st );
+		}
+		const double En = tr::weighted_sq_norm( Yt.p, nullptr, n, H, st );
+		const double L = tr::weighted_sq_error( Yb.p, Yt.p, nullptr, n, H, backward ? dY.p : nullptr, static_cast<float>( 1.0 / En ), st );
+		if ( backward ) {
+			for ( auto& p : projs ) {
+				CUDA_CHECK( cudaMemsetAsync( p->gu.p, 0, p->r.t.k * sizeof( float ), st ) );
+				CUDA_CHECK( cudaMemsetAsync( p->gv.p, 0, p->r.t.n * sizeof( float ), st ) );
+			}
+			for ( int e = 0; e < E; ++e ) {
+				const int o = R.off[e], m = R.off[e + 1] - R.off[e];
+				if ( !m ) continue;
+				Proj &g = *projs[e * 3], &u = *projs[e * 3 + 1], &dn = *projs[e * 3 + 2];
+				tr::ScaledLinear lg{ H, I, g.core.p, g.su.p, g.sv.p, g.gu.p, g.gv.p }, lu{ H, I, u.core.p, u.su.p, u.sv.p, u.gu.p, u.gv.p },
+					ld{ I, H, dn.core.p, dn.su.p, dn.sv.p, dn.gu.p, dn.gv.p };
+				const size_t oh = static_cast<size_t>( o ) * H, oi = static_cast<size_t>( o ) * I;
+				tr::gather_rows( dY.p, false, pp + o, wp + o, m, H, dYd.p + oh, st );
+				tr::scaled_linear_backward( blas, ld, A.p + oi, Zd.p + oh, dYd.p + oh, m, dA.p + oi, Sn.p, Sk.p );
+				tr::swiglu_backward( G.p + oi, U.p + oi, dA.p + oi, dG.p + oi, dU.p + oi, static_cast<size_t>( m ) * I, limit, st );
+				tr::scaled_linear_backward( blas, lg, Xp.p + oh, Zg.p + oi, dG.p + oi, m, nullptr, Sn.p, Sk.p );
+				tr::scaled_linear_backward( blas, lu, Xp.p + oh, Zu.p + oi, dU.p + oi, m, nullptr, Sn.p, Sk.p );
+			}
+		}
+		return std::make_pair( L, En );
+	};
+	// The relative error over a whole row set, in batches
+	auto set_error = [&]( const uint16_t* X, const Dump& d, const std::vector<int>& rows, const float* Yr ) {
+		double L = 0.0, En = 0.0;
+		for ( size_t b0 = 0; b0 < rows.size(); b0 += B ) {
+			const int n = static_cast<int>( std::min<size_t>( B, rows.size() - b0 ) );
+			const auto r = pass( X, d, rows.data() + b0, n, Yr, false );
+			L += r.first;
+			En += r.second;
+		}
+		return L / En;
+	};
+	auto apply = [&]() {
+		for ( auto& p : projs ) {
+			tr::exp_scale( p->s0u.p, p->au.p, p->su.p, p->r.t.k, st );
+			tr::exp_scale( p->s0v.p, p->av.p, p->sv.p, p->r.t.n, st );
+		}
+	};
+	auto copy = [&]( bool to_best ) {
+		for ( auto& p : projs ) {
+			CUDA_CHECK( cudaMemcpyAsync( to_best ? p->bu.p : p->au.p, to_best ? p->au.p : p->bu.p, p->r.t.k * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
+			CUDA_CHECK( cudaMemcpyAsync( to_best ? p->bv.p : p->av.p, to_best ? p->av.p : p->bv.p, p->r.t.n * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
+		}
+	};
+	std::vector<int> all_eval;
+	if ( eval ) {
+		for ( int64_t r = 0; r < eq.rows; ++r ) all_eval.push_back( static_cast<int>( r ) );
+	}
+	const double val0 = set_error( Xq, dq, val, Yref.p );
+	const double ev0 = eval ? set_error( Xe, eq, all_eval, Yeval.p ) : 0.0;
+	std::mt19937 rng( 1234 + layer );
+	std::shuffle( train.begin(), train.end(), rng );
+	tr::AdamOptions o;
+	o.lr = a.lr;
+	double best = val0, train_err = 0.0;
+	int best_step = 0;
+	size_t at = 0;
+	for ( int step = 1; step <= a.steps; ++step ) {
+		if ( at + B > train.size() ) {
+			std::shuffle( train.begin(), train.end(), rng );
+			at = 0;
+		}
+		const auto r = pass( Xq, dq, train.data() + at, B, Yref.p, true );
+		at += B;
+		train_err = r.first / r.second;
+		for ( auto& p : projs ) {
+			tr::mul( p->su.p, p->gu.p, p->tu.p, p->r.t.k, st );
+			tr::mul( p->sv.p, p->gv.p, p->tv.p, p->r.t.n, st );
+			tr::adam_step( p->au.p, p->tu.p, p->mu.p, p->vu.p, p->r.t.k, step, o, st );
+			tr::adam_step( p->av.p, p->tv.p, p->mv.p, p->vv.p, p->r.t.n, step, o, st );
+		}
+		apply();
+		if ( step % 25 == 0 || step == a.steps ) {
+			const double v = set_error( Xq, dq, val, Yref.p );
+			if ( v < best ) {
+				best = v;
+				best_step = step;
+				copy( true );
+			}
+		}
+	}
+	// The best step's scales in FP16 as stored; no gain on the held-out rows: unchanged
+	double val1 = val0, ev1 = ev0;
+	if ( best_step > 0 ) {
+		copy( false );
+		apply();
+		for ( auto& p : projs ) {
+			std::vector<float> u( p->r.t.k ), v( p->r.t.n );
+			CUDA_CHECK( cudaMemcpyAsync( u.data(), p->su.p, u.size() * sizeof( float ), cudaMemcpyDeviceToHost, st ) );
+			CUDA_CHECK( cudaMemcpyAsync( v.data(), p->sv.p, v.size() * sizeof( float ), cudaMemcpyDeviceToHost, st ) );
+			CUDA_CHECK( cudaStreamSynchronize( st ) );
+			for ( size_t i = 0; i < u.size(); ++i ) u[i] = h2f( p->r.t.suh[i] = f2h( u[i] ) );
+			for ( size_t i = 0; i < v.size(); ++i ) v[i] = h2f( p->r.t.svh[i] = f2h( v[i] ) );
+			p->su.upload( u, st );
+			p->sv.upload( v, st );
+		}
+		val1 = set_error( Xq, dq, val, Yref.p );
+		if ( eval ) ev1 = set_error( Xe, eq, all_eval, Yeval.p );
+	}
+	const bool gain = best_step > 0 && val1 < val0;
+	char note[200];
+	std::snprintf( note, sizeof( note ), "block %s: held-out rows %.6g -> %.6g at step %d", gain ? "tuned" : "unchanged", val0, gain ? val1 : val0, best_step );
+	bool ok = true;
+	for ( auto& p : projs ) {
+		if ( !gain ) {
+			std::vector<float> u( p->r.t.k ), v( p->r.t.n );
+			CUDA_CHECK( cudaMemcpyAsync( u.data(), p->s0u.p, u.size() * sizeof( float ), cudaMemcpyDeviceToHost, st ) );
+			CUDA_CHECK( cudaMemcpyAsync( v.data(), p->s0v.p, v.size() * sizeof( float ), cudaMemcpyDeviceToHost, st ) );
+			CUDA_CHECK( cudaStreamSynchronize( st ) );
+			for ( size_t i = 0; i < u.size(); ++i ) p->r.t.suh[i] = f2h( u[i] );
+			for ( size_t i = 0; i < v.size(); ++i ) p->r.t.svh[i] = f2h( v[i] );
+		}
+	}
+	for ( int e = 0; e < E && ok; ++e ) {
+		const char* names[3] = { ".gate_proj", ".up_proj", ".down_proj" };
+		for ( int k = 0; k < 3; ++k ) {
+			const Proj& p = *projs[e * 3 + k];
+			ok = ok && q::exl3_write_partial( a.out + "/.partial/" + prefixes[e] + names[k] + ".safetensors", prefixes[e] + names[k], p.r.t, p.r.code, p.r.cb, p.r.volta,
+				{ { "tune", note } } );
+		}
+	}
+	CUDA_CHECK( cudaFree( Xq ) );
+	if ( Xe ) CUDA_CHECK( cudaFree( Xe ) );
+	CUDA_CHECK( cudaStreamDestroy( st ) );
+	const double secs = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
+	std::lock_guard<std::mutex> lock( log_mu );
+	LOG_INFO( "[volta_tune] GPU %d: layer %d block, %lld rows (%zu held out), %d steps of %d: train %.5f, held-out rows %.5f -> %.5f (step %d, %s)%s, %.1f min",
+		device, layer, static_cast<long long>( dq.rows ), val.size(), a.steps, B, train_err, val0, gain ? val1 : val0, best_step, gain ? "tuned" : "unchanged",
+		eval ? ( " | held-out text " + std::to_string( ev0 ) + " -> " + std::to_string( gain ? ev1 : ev0 ) ).c_str() : "", secs / 60.0 );
+	return ok;
+}
+
 } // namespace
 
 int main( int argc, char** argv ) {
@@ -360,6 +729,23 @@ int main( int argc, char** argv ) {
 	if ( !model.read( a.src ) || model.experts <= 0 || model.hidden <= 0 ) {
 		LOG_ERROR( "[volta_tune] %s is not a mixture-of-experts model", a.src.c_str() );
 		return 2;
+	}
+	if ( !a.route_q.empty() ) {
+		mkdir( a.out.c_str(), 0755 );
+		mkdir( ( a.out + "/.partial" ).c_str(), 0755 );
+		std::mutex log_mu;
+		std::atomic<size_t> next{ 0 };
+		std::atomic<int> failures{ 0 };
+		std::vector<std::thread> threads;
+		for ( int d : a.devices ) {
+			threads.emplace_back( [&, d]() {
+				for ( size_t i; ( i = next.fetch_add( 1 ) ) < a.layers.size(); ) {
+					if ( !block_layer( a, model, a.layers[i], d, log_mu ) ) failures++;
+				}
+			} );
+		}
+		for ( auto& t : threads ) t.join();
+		return failures ? 1 : 0;
 	}
 	q::RouteRows rr;
 	if ( !rr.open( a.route, model.hidden ) || !rr.has_weights() ) {

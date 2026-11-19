@@ -6,6 +6,7 @@
 //   (d) a group of two weights gives each the error it gets alone
 //   (e) (a) in the stock tile order as well
 //   (f) (a) with the input's shared factor instead of the scaled per-weight ones (and both errors printed)
+//   (g) (a) with the LDL-weighted Viterbi metric at 2 and 3 bits (and its error next to the plain metric's)
 #include "engine/config.h"
 #include "engine/quant/exl3_quantize.h"
 #include "engine/modules/trellis.h"
@@ -226,6 +227,21 @@ int main() {
 		std::printf( "  (f) 3 bits, weight 0: scaled factors %.6f, shared factor %.6f (%+.1f%%)\n", proxy[3], out[0].proxy_err,
 			100.0 * ( proxy[3] / out[0].proxy_err - 1.0 ) );
 		engine::quant::exl3_input_factor_free( f_shared );
+	}
+
+	// (g) the LDL-weighted metric: stored against reported, and its error next to the plain metric's
+	for ( int code = 2; code <= 3; ++code ) {
+		engine::quant::Exl3QuantOptions o;
+		o.code = code;
+		o.volta = volta;
+		o.ldl_metric = true;
+		std::vector<engine::quant::Exl3Tensor> out;
+		ENGINE_ASSERT( engine::quant::exl3_quantize_group( f, both, p.ns, seeds, o, out, nullptr ), "quantize failed" );
+		const double stored = stored_proxy( p, 0, out[0], code, o.cb, volta );
+		std::snprintf( line, sizeof( line ), "(g) %d bits, LDL metric: reported %.6f, stored %.6f", code, out[0].proxy_err, stored );
+		check( close( out[0].proxy_err, stored, 0.03 ), line );
+		std::printf( "  (g) %d bits, weight 0: LDL metric %.6f, plain metric %.6f (%+.1f%%)\n", code, out[0].proxy_err, proxy[code],
+			100.0 * ( out[0].proxy_err / proxy[code] - 1.0 ) );
 	}
 
 	// (e) the stock order

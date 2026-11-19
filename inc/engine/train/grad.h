@@ -59,6 +59,11 @@ struct AdamOptions {
 };
 void adam_step( float* p, const float* g, float* m, float* v, size_t n, int step, const AdamOptions& o, backend::stream_t stream );
 
+// Rows by index (a routed expert's rows of a batch): dst[i] = src[idx[i]] (FP16 source, half_src; FP32 otherwise), times w[i] when w is given
+void gather_rows( const void* src, bool half_src, const int* idx, const float* w, int n, int cols, float* dst, backend::stream_t stream );
+// dst[idx[i]] += w[i] * src[i] (w null: 1); idx without repeats within one call
+void scatter_add_rows( const float* src, const int* idx, const float* w, int n, int cols, float* dst, backend::stream_t stream );
+
 // Multiplicative parameters: out = base * exp( a ); the gradient of a is out * ( the gradient of out ), mul
 void exp_scale( const float* base, const float* a, float* out, size_t n, backend::stream_t stream );
 void mul( const float* x, const float* y, float* out, size_t n, backend::stream_t stream );

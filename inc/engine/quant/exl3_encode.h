@@ -26,9 +26,11 @@ bool exl3_encode_scratch_alloc( Exl3EncodeScratch& s, int code, int cb, int tile
 void exl3_encode_scratch_free( Exl3EncodeScratch& s );
 
 // num_tiles x 256 floats (stream order) to the decoded values and the windows of the cheapest tail-biting path, num_tiles x 256 each, in
-// launches of the scratch's tile count
+// launches of the scratch's tile count. The path's cost is the sum of squared errors, or with weights (num_tiles x 256 positive floats, stream
+// order) the weighted sum. open: no tail-biting ring, a free start state (offline only: the windows of a tile's first positions then hold
+// bits from before it, which the packed format cannot store)
 void exl3_encode_tiles( const float* tiles, float* decoded, uint16_t* windows, int num_tiles, int code, int cb, const Exl3EncodeScratch& s,
-	backend::stream_t stream );
+	backend::stream_t stream, const float* weights = nullptr, bool open = false );
 
 // num_tiles x 256 windows to num_tiles x trellis_tile_u16( code ) packed words
 void exl3_pack_tiles( uint16_t* packed, const uint16_t* windows, int num_tiles, int code, backend::stream_t stream );

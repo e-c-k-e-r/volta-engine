@@ -14,6 +14,7 @@ struct Exl3Read {
 	int code = 0;
 	int cb = 0;
 	bool volta = false;
+	// The extended trellis' tile companions (in t: starts, gains), when the tensor has them: <base>.tstart, <base>.tgain
 };
 
 // The tensor <base> (.trellis, .suh, .svh): width from the trellis shape, codebook from the markers, tile order from quantization_config.json
@@ -21,11 +22,12 @@ struct Exl3Read {
 // both from the tensor's file metadata
 bool exl3_read( StRepo& repo, const std::string& base, Exl3Read& out );
 
-// The dense weight, input-major k x n fp32 on the device (FP16 decode as inference has it); unit_scales: the core alone, with suh / svh taken as 1
+// The dense weight, input-major k x n fp32 on the device (FP16 decode as inference has it, tile starts and gains included); unit_scales: the core
+// alone, with suh / svh taken as 1
 bool exl3_decode( const Exl3Read& r, float* out, bool unit_scales = false );
 
-// A per-tensor result file (volta_quantize's <out>/.partial/<base>.safetensors): trellis, suh, svh, and metadata naming the tile order and
-// codebook, plus `extra`
+// A per-tensor result file (volta_quantize's <out>/.partial/<base>.safetensors): trellis, suh, svh (and the tile companions <base>.tstart,
+// <base>.tgain when the tensor has them), and metadata naming the tile order and codebook, plus `extra`
 bool exl3_write_partial( const std::string& path, const std::string& base, const engine::quant::Exl3Tensor& t, int code, int cb, bool volta,
 	const std::map<std::string, std::string>& extra );
 

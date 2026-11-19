@@ -3,10 +3,13 @@
 //   (a) the row-weighted squared-error loss against the host forward
 //   (b) the gradients of the six scale vectors and of the input against central differences of the host loss, with SiLU and with GLM's limit
 //   (c) Adam steps on multiplicative scale parameters lower the loss
+//   (d) gather_rows (FP16 and FP32 sources, with and without per-row weights) and scatter_add_rows against the host, exactly
 #include "engine/config.h"
 #include "engine/train/grad.h"
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <cstring>
+#include <cuda_fp16.h>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -202,6 +205,65 @@ int main() {
 		}
 		std::snprintf( line, sizeof( line ), "(c) 30 Adam steps on the scales: loss %.4f -> %.4f", L0, L );
 		check( L < 0.95 * L0, line );
+	}
+	// (d) row gathers and scatters: 40 rows picked out of 300 (no repeats), 64 columns
+	{
+		const int N = 300, C = 64, M = 40;
+		std::vector<int> idx( N );
+		for ( int i = 0; i < N; ++i ) idx[i] = i;
+		std::shuffle( idx.begin(), idx.end(), rng );
+		idx.resize( M );
+		std::vector<float> src( static_cast<size_t>( N ) * C ), wr( M ), dst0( static_cast<size_t>( N ) * C );
+		std::vector<uint16_t> src16( src.size() );
+		for ( size_t i = 0; i < src.size(); ++i ) {
+			const half h = __float2half_rn( static_cast<float>( gauss( rng ) ) );
+			src[i] = __half2float( h );
+			std::memcpy( &src16[i], &h, 2 );
+		}
+		for ( auto& v : wr ) v = static_cast<float>( uni( rng ) );
+		for ( auto& v : dst0 ) v = static_cast<float>( gauss( rng ) );
+		float *d_src = up( std::vector<double>( src.begin(), src.end() ) ), *d_w = up( std::vector<double>( wr.begin(), wr.end() ) ),
+			  *d_out = zeros( static_cast<size_t>( M ) * C ), *d_dst = up( std::vector<double>( dst0.begin(), dst0.end() ) );
+		int* d_idx = nullptr;
+		uint16_t* d_src16 = nullptr;
+		CUDA_CHECK( cudaMalloc( &d_idx, M * sizeof( int ) ) );
+		CUDA_CHECK( cudaMemcpy( d_idx, idx.data(), M * sizeof( int ), cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMalloc( &d_src16, src16.size() * 2 ) );
+		CUDA_CHECK( cudaMemcpy( d_src16, src16.data(), src16.size() * 2, cudaMemcpyHostToDevice ) );
+		size_t bad = 0;
+		for ( int half_src = 0; half_src < 2; ++half_src ) {
+			for ( int weighted = 0; weighted < 2; ++weighted ) {
+				engine::train::gather_rows( half_src ? static_cast<const void*>( d_src16 ) : d_src, half_src != 0, d_idx, weighted ? d_w : nullptr, M, C, d_out, st );
+				CUDA_CHECK( cudaStreamSynchronize( st ) );
+				const std::vector<float> got = down( d_out, static_cast<size_t>( M ) * C );
+				for ( int r = 0; r < M; ++r ) {
+					for ( int c = 0; c < C; ++c ) {
+						const float want = src[static_cast<size_t>( idx[r] ) * C + c] * ( weighted ? wr[r] : 1.0f );
+						bad += got[static_cast<size_t>( r ) * C + c] != want;
+					}
+				}
+			}
+		}
+		std::snprintf( line, sizeof( line ), "(d) gather_rows: %zu of %d values differ from the host's", bad, 4 * M * C );
+		check( bad == 0, line );
+		// scatter: dst[idx[r]] += w[r] * out[r] with out = the last gather (FP16 source, weighted)
+		const std::vector<float> outv = down( d_out, static_cast<size_t>( M ) * C );
+		engine::train::scatter_add_rows( d_out, d_idx, d_w, M, C, d_dst, st );
+		CUDA_CHECK( cudaStreamSynchronize( st ) );
+		const std::vector<float> got = down( d_dst, dst0.size() );
+		std::vector<float> want = dst0;
+		for ( int r = 0; r < M; ++r ) {
+			// the device fuses the multiply into the add (one rounding)
+			for ( int c = 0; c < C; ++c ) {
+				float& d = want[static_cast<size_t>( idx[r] ) * C + c];
+				d = std::fma( wr[r], outv[static_cast<size_t>( r ) * C + c], d );
+			}
+		}
+		size_t sbad = 0;
+		for ( size_t i = 0; i < want.size(); ++i ) sbad += got[i] != want[i];
+		std::snprintf( line, sizeof( line ), "(d) scatter_add_rows: %zu of %zu values differ from the host's", sbad, want.size() );
+		check( sbad == 0, line );
+		for ( void* q : { (void*) d_src, (void*) d_w, (void*) d_out, (void*) d_dst, (void*) d_idx, (void*) d_src16 } ) CUDA_CHECK( cudaFree( q ) );
 	}
 	std::printf( fails ? "=== TRAIN GRAD: %d FAILURE(S) ===\n" : "=== TRAIN GRAD: PASS ===\n", fails );
 	return fails ? 1 : 0;

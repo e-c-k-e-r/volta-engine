@@ -42,3 +42,9 @@ void reconstruct_had_slice(
 	int64_t n_offset,
 	cudaStream_t stream = nullptr
 );
+
+// With the tile companions of an extended trellis: starts (uint16 per tile, the bits before its stream) and gains (uint8 per tile), either null
+void reconstruct_slice_ext( half* unpacked, const uint16_t* packed, const uint16_t* starts, const uint8_t* gains, int K, bool mcg, bool mul1, int rows,
+	int cols, int64_t n_offset, cudaStream_t stream );
+void reconstruct_had_slice_ext( half* unpacked, const uint16_t* packed, const uint16_t* starts, const uint8_t* gains, const half* suh, const half* svh,
+	int K, bool mcg, bool mul1, int rows, int cols, int64_t n_offset, cudaStream_t stream );

@@ -7,7 +7,10 @@
 //
 //   volta_quantize --src <original> --template <exl3 dir> --out <dir> [--hess <capture dir>] [--route <route dump>] [--order volta|stock]
 //                  [--devices 0,1,2,3] [--only A,B] [--skip A,B] [--bits B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] [--redo]
-//                  [--plan] [--no-scaled-hessian] [--affinity-eps E] [--no-assemble]
+//                  [--plan] [--no-scaled-hessian] [--affinity-eps E] [--ldl-metric] [--open-trellis] [--tile-gain] [--no-assemble]
+//
+// --open-trellis stores each tile's start state (<base>.tstart) instead of wrapping its stream, --tile-gain an 8-bit gain per tile (<base>.tgain):
+// the extended trellis, which the reconstruct path and the tools decode; until the inference paths do, only with --no-assemble
 //
 // --affinity-eps weights each routed expert's Hessians by routing (exllamav3 1.6.7's --moe_affinity_eps, see quant/expert_hessian.h): its gate
 // and up projections get their own input Hessian from the route dump's rows routed to it, so they are quantized expert by expert; needs the
@@ -66,6 +69,7 @@ struct Args {
 	bool assemble = true;
 	bool scaled = true;
 	float aff_eps = 0.0f;
+	bool ldl_metric = false, open_trellis = false, tile_gain = false;
 	float sigma_reg = 0.025f;
 };
 
@@ -116,6 +120,9 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--no-scaled-hessian" ) a.scaled = false;
 		else if ( k == "--no-assemble" ) a.assemble = false;
 		else if ( k == "--affinity-eps" ) a.aff_eps = std::stof( val() );
+		else if ( k == "--ldl-metric" ) a.ldl_metric = true;
+		else if ( k == "--open-trellis" ) a.open_trellis = true;
+		else if ( k == "--tile-gain" ) a.tile_gain = true;
 		else if ( k == "--devices" ) {
 			a.devices.clear();
 			for ( const auto& d : split( val(), ',' ) ) a.devices.push_back( std::stoi( d ) );
@@ -127,7 +134,7 @@ bool parse( int argc, char** argv, Args& a ) {
 	if ( a.src.empty() || a.tmpl.empty() || ( a.out.empty() && !a.plan ) ) {
 		LOG_ERROR( "usage: volta_quantize --src <original> --template <exl3 dir> --out <dir> [--hess <capture dir>] [--route <route dump>] "
 				   "[--order volta|stock] [--devices 0,1] [--only A,B] [--skip A,B] [--bits B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] "
-				   "[--redo] [--plan] [--no-scaled-hessian] [--affinity-eps E] [--no-assemble]" );
+				   "[--redo] [--plan] [--no-scaled-hessian] [--affinity-eps E] [--ldl-metric] [--open-trellis] [--tile-gain] [--no-assemble]" );
 		return false;
 	}
 	return true;
@@ -584,6 +591,13 @@ int main( int argc, char** argv ) {
 	opts.volta = a.volta;
 	opts.sigma_reg = a.sigma_reg;
 	opts.scaled_hessian = a.scaled;
+	opts.ldl_metric = a.ldl_metric;
+	opts.open_trellis = a.open_trellis;
+	opts.tile_gain = a.tile_gain;
+	if ( ( a.open_trellis || a.tile_gain ) && a.assemble ) {
+		LOG_ERROR( "[volta_quantize] the engine's inference paths do not read tile starts / gains yet: --open-trellis / --tile-gain need --no-assemble" );
+		return 2;
+	}
 	const std::string os = qcfg.is_discarded() ? "auto" : qcfg.value( "out_scales", "auto" );
 	opts.out_scales = os == "always" ? 1 : os == "never" ? 0 : -1;
 	// Tile orders: a stock output from a Volta template cannot mark what stays in the Volta order, and --only with an order other than the template's

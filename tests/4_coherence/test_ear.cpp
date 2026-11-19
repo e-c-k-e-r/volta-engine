@@ -3,7 +3,7 @@
 // draft model of the reference in speculative sampling (one minus the total variation distance of the two distributions). Only
 // generated tokens are scored, never the prompt. Three steps, each run with the model the step is about (ENGINE_TEST_QWEN_DIR,
 // ENGINE_TEST_FLASH_DIR or ENGINE_TEST_GLM_DIR selects the checkpoint, as for test_ppl):
-//   test_ear [--flash | --glm] --generate CORPUS [--prompts tests/data/ear_prompts.json] [--max-new 768] [--seed 1]
+//   test_ear [--flash | --glm] --generate CORPUS [--prompts tests/data/ear_prompts.json] [--max-new 768] [--seed 1] [--text-out DIR]
 //       the reference model answers every prompt (its chat template, its generation_config.json sampling settings); writes the
 //       token streams and which tokens it generated
 //   test_ear [--flash | --glm] --reference CORPUS REF [--top 256] [--chunk 1]
@@ -114,7 +114,7 @@ void teacher_forced( ModelCluster& mc, const std::vector<Sample>& samples, int c
 
 int main( int argc, char** argv ) {
 	bool glm = false, flash = false;
-	std::string mode, corpus_path, ref_path, prompts_path = std::string( TEST_DATA_DIR ) + "/ear_prompts.json";
+	std::string mode, corpus_path, ref_path, text_out, prompts_path = std::string( TEST_DATA_DIR ) + "/ear_prompts.json";
 	int max_new = 768, top = 256, chunk = 1;
 	uint64_t seed = 1;
 	for ( int i = 1; i < argc; ++i ) {
@@ -127,6 +127,7 @@ int main( int argc, char** argv ) {
 			ref_path = argv[++i];
 		}
 		else if ( !std::strcmp( argv[i], "--prompts" ) && i + 1 < argc ) prompts_path = argv[++i];
+		else if ( !std::strcmp( argv[i], "--text-out" ) && i + 1 < argc ) text_out = argv[++i];
 		else if ( !std::strcmp( argv[i], "--max-new" ) && i + 1 < argc ) max_new = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--top" ) && i + 1 < argc ) top = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--chunk" ) && i + 1 < argc ) chunk = std::atoi( argv[++i] );
@@ -190,6 +191,15 @@ int main( int argc, char** argv ) {
 				mc.sample_topk( 1, &c );
 			}
 			std::printf( "[*] %-12s prompt %4d tokens, generated %4d\n", s.kind.c_str(), s.prompt, static_cast<int>( s.ids.size() ) - s.prompt );
+			// --text-out: the conversation as text (the rendered prompt, then the generation), which test_ppl --calibrate --prompts replays as
+			// calibration rows of the model's own answers
+			if ( !text_out.empty() ) {
+				char name[32];
+				std::snprintf( name, sizeof( name ), "/s%04zu.prompt.txt", samples.size() );
+				std::ofstream tf( text_out + name, std::ios::binary );
+				tf << text << tok.decode( std::vector<int>( s.ids.begin() + s.prompt, s.ids.end() ) );
+				ENGINE_ASSERT( tf.good(), "test_ear: cannot write --text-out" );
+			}
 			samples.push_back( std::move( s ) );
 		}
 		write_corpus( corpus_path.c_str(), samples );

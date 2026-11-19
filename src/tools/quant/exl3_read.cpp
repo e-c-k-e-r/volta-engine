@@ -28,6 +28,12 @@ bool exl3_read( StRepo& repo, const std::string& base, Exl3Read& out ) {
 	t.trellis.assign( reinterpret_cast<const uint16_t*>( tr->data ), reinterpret_cast<const uint16_t*>( tr->data ) + tr->bytes / 2 );
 	t.suh.assign( reinterpret_cast<const uint16_t*>( su->data ), reinterpret_cast<const uint16_t*>( su->data ) + su->bytes / 2 );
 	t.svh.assign( reinterpret_cast<const uint16_t*>( sv->data ), reinterpret_cast<const uint16_t*>( sv->data ) + sv->bytes / 2 );
+	t.starts.clear();
+	t.gains.clear();
+	if ( const auto* e = repo.find( base + ".tstart" ) ) {
+		t.starts.assign( reinterpret_cast<const uint16_t*>( e->data ), reinterpret_cast<const uint16_t*>( e->data ) + e->bytes / 2 );
+	}
+	if ( const auto* e = repo.find( base + ".tgain" ) ) t.gains.assign( e->data, e->data + e->bytes );
 	out.volta = false;
 	std::ifstream f( repo.dir() + "/quantization_config.json" );
 	if ( !f ) {
@@ -73,8 +79,20 @@ bool exl3_decode( const Exl3Read& r, float* out, bool unit_scales ) {
 		CUDA_CHECK( cudaMemcpy( d_suh, t.suh.data(), t.k * 2, cudaMemcpyHostToDevice ) );
 		CUDA_CHECK( cudaMemcpy( d_svh, t.svh.data(), t.n * 2, cudaMemcpyHostToDevice ) );
 	}
-	EXL3_TILES_CALL( r.volta, reconstruct_had_slice, d_w, d_trellis, reinterpret_cast<const half*>( d_suh ), reinterpret_cast<const half*>( d_svh ),
-		r.code, r.cb == 1, r.cb == 2, t.k, t.n, 0, nullptr );
+	uint16_t* d_starts = nullptr;
+	uint8_t* d_gains = nullptr;
+	if ( !t.starts.empty() ) {
+		CUDA_CHECK( cudaMalloc( &d_starts, t.starts.size() * 2 ) );
+		CUDA_CHECK( cudaMemcpy( d_starts, t.starts.data(), t.starts.size() * 2, cudaMemcpyHostToDevice ) );
+	}
+	if ( !t.gains.empty() ) {
+		CUDA_CHECK( cudaMalloc( &d_gains, t.gains.size() ) );
+		CUDA_CHECK( cudaMemcpy( d_gains, t.gains.data(), t.gains.size(), cudaMemcpyHostToDevice ) );
+	}
+	EXL3_TILES_CALL( r.volta, reconstruct_had_slice_ext, d_w, d_trellis, d_starts, d_gains, reinterpret_cast<const half*>( d_suh ),
+		reinterpret_cast<const half*>( d_svh ), r.code, r.cb == 1, r.cb == 2, t.k, t.n, 0, nullptr );
+	if ( d_starts ) CUDA_CHECK( cudaFree( d_starts ) );
+	if ( d_gains ) CUDA_CHECK( cudaFree( d_gains ) );
 	std::vector<half> h( static_cast<size_t>( t.k ) * t.n );
 	CUDA_CHECK( cudaMemcpy( h.data(), d_w, h.size() * 2, cudaMemcpyDeviceToHost ) );
 	std::vector<float> f( h.size() );
@@ -90,6 +108,23 @@ bool exl3_decode( const Exl3Read& r, float* out, bool unit_scales ) {
 bool exl3_write_partial( const std::string& path, const std::string& base, const engine::quant::Exl3Tensor& t, int code, int cb, bool volta,
 	const std::map<std::string, std::string>& extra ) {
 	std::vector<StOut> outs( 3 );
+	if ( !t.starts.empty() ) {
+		StOut o;
+		o.name = base + ".tstart";
+		o.dtype = "U16";
+		o.shape = { t.k / 16, t.n / 16 };
+		o.owned.resize( t.starts.size() * 2 );
+		std::memcpy( o.owned.data(), t.starts.data(), o.owned.size() );
+		outs.push_back( std::move( o ) );
+	}
+	if ( !t.gains.empty() ) {
+		StOut o;
+		o.name = base + ".tgain";
+		o.dtype = "U8";
+		o.shape = { t.k / 16, t.n / 16 };
+		o.owned.assign( t.gains.begin(), t.gains.end() );
+		outs.push_back( std::move( o ) );
+	}
 	const int words = engine::modules::trellis_tile_u16( code );
 	outs[0].name = base + ".trellis";
 	outs[0].dtype = "I16";

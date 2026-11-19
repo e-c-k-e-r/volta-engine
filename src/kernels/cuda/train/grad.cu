@@ -3,6 +3,7 @@
 #include "engine/config.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cmath>
 #include <vector>
 
@@ -104,6 +105,22 @@ __global__ void k_exp_scale( const float* base, const float* a, float* out, size
 	TRAIN_LOOP( i, n ) out[i] = base[i] * expf( a[i] );
 }
 
+__global__ void k_gather_rows( const void* src, bool half_src, const int* idx, const float* w, int n, int cols, float* dst ) {
+	TRAIN_LOOP( i, (size_t) n * cols ) {
+		const size_t r = i / cols, c = i % cols;
+		const size_t s = (size_t) idx[r] * cols + c;
+		const float v = half_src ? __half2float( static_cast<const __half*>( src )[s] ) : static_cast<const float*>( src )[s];
+		dst[i] = w ? v * w[r] : v;
+	}
+}
+
+__global__ void k_scatter_add_rows( const float* src, const int* idx, const float* w, int n, int cols, float* dst ) {
+	TRAIN_LOOP( i, (size_t) n * cols ) {
+		const size_t r = i / cols;
+		dst[(size_t) idx[r] * cols + i % cols] += w ? w[r] * src[i] : src[i];
+	}
+}
+
 __global__ void k_mul( const float* x, const float* y, float* out, size_t n ) {
 	TRAIN_LOOP( i, n ) out[i] = x[i] * y[i];
 }
@@ -179,6 +196,14 @@ double weighted_sq_norm( const float* t, const float* w, int rows, int n, backen
 void adam_step( float* p, const float* g, float* m, float* v, size_t n, int step, const AdamOptions& o, backend::stream_t stream ) {
 	const float c1 = 1.0f - std::pow( o.beta1, static_cast<float>( step ) ), c2 = 1.0f - std::pow( o.beta2, static_cast<float>( step ) );
 	k_adam<<<blocks_for( n ), 256, 0, cu( stream )>>>( p, g, m, v, n, o.lr, o.beta1, o.beta2, o.eps, c1, c2 );
+}
+
+void gather_rows( const void* src, bool half_src, const int* idx, const float* w, int n, int cols, float* dst, backend::stream_t stream ) {
+	if ( n > 0 ) k_gather_rows<<<blocks_for( (size_t) n * cols ), 256, 0, cu( stream )>>>( src, half_src, idx, w, n, cols, dst );
+}
+
+void scatter_add_rows( const float* src, const int* idx, const float* w, int n, int cols, float* dst, backend::stream_t stream ) {
+	if ( n > 0 ) k_scatter_add_rows<<<blocks_for( (size_t) n * cols ), 256, 0, cu( stream )>>>( src, idx, w, n, cols, dst );
 }
 
 void exp_scale( const float* base, const float* a, float* out, size_t n, backend::stream_t stream ) {
