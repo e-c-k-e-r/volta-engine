@@ -13,6 +13,10 @@
 //     --affinity-eps E: routed experts under their routing-weighted Hessians instead (the dump's routing weights, quant/expert_hessian.h)
 //   hess_compare routes --src <original> --route <route dump> --layers L,L,... [--top 32]
 //     per layer the experts the most rows route to, most first, and their projections as a volta_quantize --only list
+//   hess_compare moe --src <original> --route <route dump with its .w> --layers L,L,... [--max-rows 8192] --exl3 <dir> [--exl3 <dir> ...]
+//     each routed expert of the first directory: its output's error against the original expert's over the dump's rows routed to it, each row
+//     weighted by its routing weight squared (its share of the MoE block's output), relative to the original output; per layer the mean, and
+//     each directory relative to [0]
 #include "engine/config.h"
 #include "engine/quant/exl3_quantize.h"
 #include "engine/modules/trellis.h"
@@ -20,6 +24,9 @@
 #include "trellis_context.h"
 #include "exl3_vl.cuh"
 #include "engine/modules/trellis_bits.h"
+#include "engine/train/grad.h"
+#include "quant/exl3_read.h"
+#include <regex>
 #include "quant/expert_hessian.h"
 #include "quant/plan.h"
 #include "quant/source.h"
@@ -161,30 +168,6 @@ struct DevHess {
 	}
 };
 
-// The stored tensor back to fp32 k x n in the original basis
-bool decode( const engine::quant::Exl3Tensor& t, int code, int cb, bool volta, float* out ) {
-	uint16_t *d_trellis = nullptr, *d_suh = nullptr, *d_svh = nullptr;
-	half* d_w = nullptr;
-	CUDA_CHECK( cudaMalloc( &d_trellis, t.trellis.size() * 2 ) );
-	CUDA_CHECK( cudaMalloc( &d_suh, t.k * 2 ) );
-	CUDA_CHECK( cudaMalloc( &d_svh, t.n * 2 ) );
-	CUDA_CHECK( cudaMalloc( &d_w, static_cast<size_t>( t.k ) * t.n * 2 ) );
-	CUDA_CHECK( cudaMemcpy( d_trellis, t.trellis.data(), t.trellis.size() * 2, cudaMemcpyHostToDevice ) );
-	CUDA_CHECK( cudaMemcpy( d_suh, t.suh.data(), t.k * 2, cudaMemcpyHostToDevice ) );
-	CUDA_CHECK( cudaMemcpy( d_svh, t.svh.data(), t.n * 2, cudaMemcpyHostToDevice ) );
-	EXL3_TILES_CALL( volta, reconstruct_had_slice, d_w, d_trellis, reinterpret_cast<const half*>( d_suh ), reinterpret_cast<const half*>( d_svh ), code,
-		cb == 1, cb == 2, t.k, t.n, 0, nullptr );
-	std::vector<half> h( static_cast<size_t>( t.k ) * t.n );
-	CUDA_CHECK( cudaMemcpy( h.data(), d_w, h.size() * 2, cudaMemcpyDeviceToHost ) );
-	std::vector<float> f( h.size() );
-	for ( size_t i = 0; i < h.size(); ++i ) f[i] = __half2float( h[i] );
-	CUDA_CHECK( cudaMemcpy( out, f.data(), f.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
-	CUDA_CHECK( cudaFree( d_trellis ) );
-	CUDA_CHECK( cudaFree( d_suh ) );
-	CUDA_CHECK( cudaFree( d_svh ) );
-	CUDA_CHECK( cudaFree( d_w ) );
-	return true;
-}
 
 int cross( int argc, char** argv ) {
 	std::string src, tensor, fa, fb;
@@ -238,7 +221,12 @@ int cross( int argc, char** argv ) {
 		std::vector<engine::quant::Exl3Tensor> res;
 		ENGINE_ASSERT( engine::quant::exl3_quantize_group( f, { w }, { out }, { seed + 1 }, o, res, nullptr ), "quantization failed" );
 		engine::quant::exl3_input_factor_free( f );
-		decode( res[0], o.code, o.cb, volta, q );
+		engine::tools::quant::Exl3Read r;
+		r.t = res[0];
+		r.code = o.code;
+		r.cb = o.cb;
+		r.volta = volta;
+		engine::tools::quant::exl3_decode( r, q );
 		return res[0].proxy_err;
 	};
 	const double own_a = quantize( ha, qa ), own_b = quantize( hb, qb );
@@ -256,48 +244,6 @@ int cross( int argc, char** argv ) {
 	return 0;
 }
 
-// The tensor <base> of an EXL3 checkpoint: width from the trellis shape, codebook from the markers, tile order from quantization_config.json
-// ("tile_layout": "volta", with "tile_layout_stock" substrings that keep the stock order); in a volta_quantize .partial directory (no
-// quantization_config.json) both from the tensor's file metadata
-bool load_exl3( engine::tools::quant::StRepo& repo, const std::string& base, engine::quant::Exl3Tensor& t, int& code, int& cb, bool& volta ) {
-	const auto* tr = repo.find( base + ".trellis" );
-	const auto* su = repo.find( base + ".suh" );
-	const auto* sv = repo.find( base + ".svh" );
-	if ( !tr || !su || !sv || tr->shape.size() != 3 ) return false;
-	t.k = static_cast<int>( tr->shape[0] ) * 16;
-	t.n = static_cast<int>( tr->shape[1] ) * 16;
-	code = engine::modules::trellis_code_from_u16( static_cast<int>( tr->shape[2] ) );
-	cb = repo.has( base + ".mul1" ) ? 2 : repo.has( base + ".mcg" ) ? 1 : 0;
-	t.trellis.assign( reinterpret_cast<const uint16_t*>( tr->data ), reinterpret_cast<const uint16_t*>( tr->data ) + tr->bytes / 2 );
-	t.suh.assign( reinterpret_cast<const uint16_t*>( su->data ), reinterpret_cast<const uint16_t*>( su->data ) + su->bytes / 2 );
-	t.svh.assign( reinterpret_cast<const uint16_t*>( sv->data ), reinterpret_cast<const uint16_t*>( sv->data ) + sv->bytes / 2 );
-	volta = false;
-	std::ifstream f( repo.dir() + "/quantization_config.json" );
-	if ( !f ) {
-		const auto it = repo.weight_map().find( base + ".trellis" );
-		const auto* file = it == repo.weight_map().end() ? nullptr : repo.shard( it->second );
-		if ( file ) {
-			const auto& m = file->metadata();
-			const auto lay = m.find( "tile_layout" ), cbk = m.find( "codebook" );
-			volta = lay != m.end() && lay->second == "volta";
-			if ( cbk != m.end() ) cb = cbk->second == "mul1" ? 2 : cbk->second == "mcg" ? 1 : 0;
-		}
-	}
-	if ( f ) {
-		std::stringstream ss;
-		ss << f.rdbuf();
-		const auto j = nlohmann::json::parse( ss.str(), nullptr, false );
-		if ( !j.is_discarded() && j.value( "tile_layout", "" ) == "volta" ) {
-			volta = true;
-			if ( j.contains( "tile_layout_stock" ) ) {
-				for ( const auto& s : j["tile_layout_stock"] ) {
-					if ( s.is_string() && base.find( s.get<std::string>() ) != std::string::npos ) volta = false;
-				}
-			}
-		}
-	}
-	return true;
-}
 
 int score( int argc, char** argv ) {
 	std::string src, hess_dir, route;
@@ -479,18 +425,16 @@ int score( int argc, char** argv ) {
 		std::printf( "  %-62s", base.c_str() );
 		std::vector<double> errs;
 		for ( size_t c = 0; c < repos.size(); ++c ) {
-			engine::quant::Exl3Tensor t;
-			int code = 0, cb = 0;
-			bool volta = false;
-			if ( !load_exl3( *repos[c], base, t, code, cb, volta ) || t.k != in || t.n != out ) {
+			engine::tools::quant::Exl3Read r;
+			if ( !engine::tools::quant::exl3_read( *repos[c], base, r ) || r.t.k != in || r.t.n != out ) {
 				std::printf( "   [%zu] -", c );
 				errs.push_back( -1.0 );
 				continue;
 			}
-			decode( t, code, cb, volta, q );
+			engine::tools::quant::exl3_decode( r, q );
 			const double e = engine::quant::exl3_proxy_error( w, q, d_h, in, out, nullptr );
 			errs.push_back( e );
-			std::printf( "   [%zu] %.6f (%d%s bits)", c, e, engine::modules::trellis_k2( code ) / 2, engine::modules::trellis_k2( code ) % 2 ? ".5" : "" );
+			std::printf( "   [%zu] %.6f (%d%s bits)", c, e, engine::modules::trellis_k2( r.code ) / 2, engine::modules::trellis_k2( r.code ) % 2 ? ".5" : "" );
 		}
 		std::printf( "\n" );
 		if ( errs.size() > 1 && errs[0] > 0.0 ) {
@@ -563,7 +507,156 @@ int routes( int argc, char** argv ) {
 	return 0;
 }
 
+int moe( int argc, char** argv ) {
+	std::string src, route;
+	std::vector<std::string> dirs;
+	std::vector<int> layers;
+	int max_rows = 8192;
+	for ( int i = 2; i + 1 < argc; i += 2 ) {
+		const std::string k = argv[i], v = argv[i + 1];
+		if ( k == "--src" ) src = v;
+		else if ( k == "--route" ) route = v;
+		else if ( k == "--exl3" ) dirs.push_back( v );
+		else if ( k == "--max-rows" ) max_rows = std::stoi( v );
+		else if ( k == "--layers" ) {
+			std::stringstream ss( v );
+			for ( std::string item; std::getline( ss, item, ',' ); ) if ( !item.empty() ) layers.push_back( std::stoi( item ) );
+		}
+	}
+	if ( src.empty() || route.empty() || dirs.empty() || layers.empty() ) {
+		std::fprintf( stderr, "usage: hess_compare moe --src <original> --route <route dump> --layers L,... [--max-rows 8192] --exl3 <dir> ...\n" );
+		return 2;
+	}
+	engine::tools::quant::Model model;
+	if ( !model.read( src ) || model.experts <= 0 ) return 1;
+	engine::tools::quant::RouteRows rr;
+	if ( !rr.open( route, model.hidden ) || !rr.has_weights() ) {
+		std::fprintf( stderr, "hess_compare moe: %s needs its routing weights (.w)\n", route.c_str() );
+		return 2;
+	}
+	engine::tools::quant::SourceWeights sw;
+	if ( !sw.open( src ) ) return 1;
+	std::vector<std::unique_ptr<engine::tools::quant::StRepo>> repos;
+	for ( const auto& d : dirs ) {
+		repos.push_back( std::make_unique<engine::tools::quant::StRepo>() );
+		if ( !repos.back()->open( d ) ) return 1;
+	}
+	engine::modules::trellis_context_init_all();
+	engine::train::Blas blas( nullptr );
+	const int H = model.hidden;
+	const float limit = model.swiglu_limit;
+	auto dev = []( size_t n ) {
+		float* p = nullptr;
+		CUDA_CHECK( cudaMalloc( &p, n * sizeof( float ) ) );
+		return p;
+	};
+	static const std::regex gate_re( R"(^(.*\.layers\.(\d+)\.mlp\.experts\.(\d+))\.gate_proj\.trellis$)" );
+	std::printf( "[*] hess_compare moe: expert output error over the routed rows, checkpoints:" );
+	for ( size_t c = 0; c < dirs.size(); ++c ) std::printf( " [%zu] %s", c, dirs[c].c_str() );
+	std::printf( "\n" );
+	std::vector<double> all_sum( dirs.size(), 0.0 ), all_ratio( dirs.size(), 0.0 );
+	int all_n = 0;
+	for ( int layer : layers ) {
+		std::vector<std::pair<int, std::string>> experts;
+		for ( const auto& kv : repos[0]->weight_map() ) {
+			std::smatch m;
+			if ( std::regex_match( kv.first, m, gate_re ) && std::stoi( m[2].str() ) == layer && m[1].str().find( "mtp." ) != 0 ) {
+				experts.emplace_back( std::stoi( m[3].str() ), m[1].str() );
+			}
+		}
+		std::sort( experts.begin(), experts.end() );
+		std::vector<uint16_t> x;
+		std::vector<int> ids;
+		std::vector<float> w;
+		int K = 0;
+		if ( experts.empty() || !rr.read( layer, 0, x ) || !rr.routes( layer, 0, ids, w, K ) ) continue;
+		const int64_t rows = static_cast<int64_t>( x.size() / H );
+		std::vector<double> sum( dirs.size(), 0.0 ), ratio( dirs.size(), 0.0 );
+		int n_scored = 0;
+		for ( const auto& ex : experts ) {
+			std::vector<float> xs, ws;
+			std::vector<int> mine;
+			std::vector<float> pw;
+			for ( int64_t r = 0; r < rows; ++r ) {
+				for ( int j = 0; j < K; ++j ) {
+					if ( ids[static_cast<size_t>( r ) * K + j] == ex.first ) {
+						mine.push_back( static_cast<int>( r ) );
+						pw.push_back( w[static_cast<size_t>( r ) * K + j] );
+					}
+				}
+			}
+			if ( mine.size() < 16 ) continue;
+			const int stride = std::max<int>( 1, ( static_cast<int>( mine.size() ) + max_rows - 1 ) / max_rows );
+			for ( size_t i = 0; i < mine.size(); i += stride ) {
+				const uint16_t* row = x.data() + static_cast<size_t>( mine[i] ) * H;
+				for ( int c = 0; c < H; ++c ) {
+					half h;
+					std::memcpy( &h, &row[c], 2 );
+					xs.push_back( __half2float( h ) );
+				}
+				ws.push_back( pw[i] * pw[i] );
+			}
+			const int n = static_cast<int>( ws.size() );
+			engine::tools::quant::Exl3Read r0;
+			if ( !engine::tools::quant::exl3_read( *repos[0], ex.second + ".gate_proj", r0 ) ) continue;
+			const int I = r0.t.n;
+			float *dX = dev( xs.size() ), *dW = dev( ws.size() ), *Wg = dev( static_cast<size_t>( H ) * I ), *Wu = dev( static_cast<size_t>( H ) * I ),
+				  *Wd = dev( static_cast<size_t>( I ) * H ), *G = dev( static_cast<size_t>( n ) * I ), *U = dev( static_cast<size_t>( n ) * I ),
+				  *A = dev( static_cast<size_t>( n ) * I ), *Yr = dev( static_cast<size_t>( n ) * H ), *Y = dev( static_cast<size_t>( n ) * H );
+			CUDA_CHECK( cudaMemcpy( dX, xs.data(), xs.size() * 4, cudaMemcpyHostToDevice ) );
+			CUDA_CHECK( cudaMemcpy( dW, ws.data(), ws.size() * 4, cudaMemcpyHostToDevice ) );
+			auto run = [&]( float* out ) {
+				blas.gemm( false, false, n, I, H, 1.0f, dX, Wg, 0.0f, G );
+				blas.gemm( false, false, n, I, H, 1.0f, dX, Wu, 0.0f, U );
+				engine::train::swiglu_forward( G, U, A, static_cast<size_t>( n ) * I, limit, nullptr );
+				blas.gemm( false, false, n, H, I, 1.0f, A, Wd, 0.0f, out );
+			};
+			bool ok = sw.load( ex.second + ".gate_proj", Wg, nullptr ) && sw.load( ex.second + ".up_proj", Wu, nullptr ) &&
+				sw.load( ex.second + ".down_proj", Wd, nullptr );
+			std::vector<double> errs;
+			if ( ok ) {
+				CUDA_CHECK( cudaDeviceSynchronize() );
+				run( Yr );
+				const double E = engine::train::weighted_sq_norm( Yr, dW, n, H, nullptr );
+				for ( size_t c = 0; c < repos.size() && ok; ++c ) {
+					engine::tools::quant::Exl3Read rg, ru, rd;
+					ok = engine::tools::quant::exl3_read( *repos[c], ex.second + ".gate_proj", rg ) &&
+						engine::tools::quant::exl3_read( *repos[c], ex.second + ".up_proj", ru ) &&
+						engine::tools::quant::exl3_read( *repos[c], ex.second + ".down_proj", rd ) && engine::tools::quant::exl3_decode( rg, Wg ) &&
+						engine::tools::quant::exl3_decode( ru, Wu ) && engine::tools::quant::exl3_decode( rd, Wd );
+					if ( !ok ) break;
+					run( Y );
+					errs.push_back( engine::train::weighted_sq_error( Y, Yr, dW, n, H, nullptr, 0.0f, nullptr ) / E );
+				}
+			}
+			for ( float* p : { dX, dW, Wg, Wu, Wd, G, U, A, Yr, Y } ) CUDA_CHECK( cudaFree( p ) );
+			if ( !ok || errs.empty() || errs[0] <= 0.0 ) continue;
+			for ( size_t c = 0; c < errs.size(); ++c ) {
+				sum[c] += errs[c];
+				ratio[c] += errs[c] / errs[0];
+			}
+			++n_scored;
+		}
+		if ( !n_scored ) continue;
+		std::printf( "  layer %2d, %3d experts: mean error", layer, n_scored );
+		for ( size_t c = 0; c < dirs.size(); ++c ) std::printf( "  [%zu] %.5f (x%.4f)", c, sum[c] / n_scored, ratio[c] / n_scored );
+		std::printf( "\n" );
+		for ( size_t c = 0; c < dirs.size(); ++c ) {
+			all_sum[c] += sum[c];
+			all_ratio[c] += ratio[c];
+		}
+		all_n += n_scored;
+	}
+	if ( all_n ) {
+		std::printf( "  all %d experts: mean error", all_n );
+		for ( size_t c = 0; c < dirs.size(); ++c ) std::printf( "  [%zu] %.5f (x%.4f)", c, all_sum[c] / all_n, all_ratio[c] / all_n );
+		std::printf( "\n" );
+	}
+	return 0;
+}
+
 int main( int argc, char** argv ) {
+	if ( argc >= 2 && !std::strcmp( argv[1], "moe" ) ) return moe( argc, argv );
 	if ( argc >= 2 && !std::strcmp( argv[1], "routes" ) ) return routes( argc, argv );
 	if ( argc >= 4 && !std::strcmp( argv[1], "stats" ) ) return stats( argv[2], argv[3] );
 	if ( argc >= 2 && !std::strcmp( argv[1], "cross" ) ) return cross( argc, argv );

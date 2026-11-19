@@ -19,6 +19,7 @@
 #include "engine/core/log.h"
 #include "engine/modules/trellis_bits.h"
 #include "engine/quant/exl3_quantize.h"
+#include "quant/exl3_read.h"
 #include "quant/expert_hessian.h"
 #include "quant/plan.h"
 #include "quant/source.h"
@@ -197,28 +198,9 @@ struct Shared {
 std::string partial_path( const Args& a, const std::string& base ) { return a.out + "/.partial/" + base + ".safetensors"; }
 
 bool write_partial( const Args& a, const q::PlanTensor& t, const Exl3Tensor& r ) {
-	std::vector<q::StOut> outs( 3 );
-	const int words = engine::modules::trellis_tile_u16( t.code );
-	outs[0].name = t.base + ".trellis";
-	outs[0].dtype = "I16";
-	outs[0].shape = { t.k / 16, t.n / 16, words };
-	outs[0].owned.resize( r.trellis.size() * 2 );
-	std::memcpy( outs[0].owned.data(), r.trellis.data(), outs[0].owned.size() );
-	outs[1].name = t.base + ".suh";
-	outs[1].dtype = "F16";
-	outs[1].shape = { t.k };
-	outs[1].owned.resize( r.suh.size() * 2 );
-	std::memcpy( outs[1].owned.data(), r.suh.data(), outs[1].owned.size() );
-	outs[2].name = t.base + ".svh";
-	outs[2].dtype = "F16";
-	outs[2].shape = { t.n };
-	outs[2].owned.resize( r.svh.size() * 2 );
-	std::memcpy( outs[2].owned.data(), r.svh.data(), outs[2].owned.size() );
-	// The tile order and codebook too, so the result reads on its own (hess_compare score on a .partial directory)
 	char err[32];
 	std::snprintf( err, sizeof( err ), "%.8g", r.proxy_err );
-	return q::st_write( partial_path( a, t.base ), outs,
-		{ { "proxy_err", err }, { "tile_layout", a.volta ? "volta" : "stock" }, { "codebook", t.cb == 2 ? "mul1" : t.cb == 1 ? "mcg" : "3inst" } } );
+	return q::exl3_write_partial( partial_path( a, t.base ), t.base, r, t.code, t.cb, a.volta, { { "proxy_err", err } } );
 }
 
 struct DBuf {

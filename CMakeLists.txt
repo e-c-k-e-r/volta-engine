@@ -520,6 +520,16 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	target_link_libraries(engine_quant PUBLIC engine_kernels CUDA::cusolver)
 	set_target_properties(engine_quant PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+	# Training primitives (FP32 elementwise and reduction kernels, the scaled linear on cuBLAS, Adam) that gradient passes are built from
+	add_library(engine_train STATIC
+		src/kernels/cuda/train/grad.cu
+	)
+	target_link_libraries(engine_train PUBLIC engine_kernels)
+	set_target_properties(engine_train PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	add_executable(test_train_grad tests/2_parity/test_train_grad.cpp)
+	target_link_libraries(test_train_grad PRIVATE engine_train)
+	set_target_properties(test_train_grad PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 	# The encoder on Gaussian tiles at every width: error against the rate's bound, and the packed codes decoded by reconstruct in both tile orders
 	add_executable(test_exl3_encode tests/2_parity/test_exl3_encode.cpp)
 	target_link_libraries(test_exl3_encode PRIVATE engine_quant)
@@ -537,6 +547,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 		src/tools/quant/plan.cpp
 		src/tools/quant/source.cu
 		src/tools/quant/expert_hessian.cu
+		src/tools/quant/exl3_read.cpp
 	)
 	target_include_directories(engine_quant_tools PUBLIC ${PROJECT_SOURCE_DIR}/src/tools)
 	target_link_libraries(engine_quant_tools PUBLIC engine_quant)
@@ -547,9 +558,14 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	target_link_libraries(volta_quantize PRIVATE engine_quant_tools)
 	set_target_properties(volta_quantize PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+	# Block-output tuning of routed experts' EXL3 scales against the original experts over the route dump's rows
+	add_executable(volta_tune src/tools/volta_tune.cpp)
+	target_link_libraries(volta_tune PRIVATE engine_quant_tools engine_train)
+	set_target_properties(volta_tune PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 	# Two Hessian captures against each other: the matrices, and the quantization each leads to
 	add_executable(hess_compare tests/tools/hess_compare.cpp)
-	target_link_libraries(hess_compare PRIVATE engine_quant_tools)
+	target_link_libraries(hess_compare PRIVATE engine_quant_tools engine_train)
 	set_target_properties(hess_compare PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 	add_executable(test_expert_hessian tests/2_parity/test_expert_hessian.cpp)
 	target_link_libraries(test_expert_hessian PRIVATE engine_quant_tools)
