@@ -407,8 +407,10 @@ float ldlq_drift( int code ) {
 }
 
 // The global scale that minimizes the sampled tile error: a wrapped diagonal of tiles three wide (every tile row and column at least once) plus
-// the tiles of highest and lowest RMS; a coarse grid on a third of them, a fine grid around its minimum on all, refined by a parabola
-float scale_search( Ctx& c, const float* W, int k, int n, const engine::quant::Exl3QuantOptions& o, const engine::quant::Exl3EncodeScratch& sc ) {
+// the tiles of highest and lowest RMS; a coarse grid on a third of them, a fine grid around its minimum on all, refined by a parabola. From a
+// hint the fine grid goes around it first, and the coarse grid runs only when that grid's minimum is at an edge
+float scale_search( Ctx& c, const float* W, int k, int n, const engine::quant::Exl3QuantOptions& o, const engine::quant::Exl3EncodeScratch& sc,
+	float hint ) {
 	const int tk = k / 16, tn = n / 16, width = 3;
 	const int diag_len = std::max( tk, tn );
 	std::vector<int2> picks;
@@ -463,29 +465,37 @@ float scale_search( Ctx& c, const float* W, int k, int n, const engine::quant::E
 		return mse;
 	};
 
+	// The fine grid around a centre: its minimum (an index of 0 or 4 is an edge) and the parabola's scale through it and its neighbours
+	const float step = 0.075f;
+	auto fine_search = [&]( float centre, int& best ) {
+		std::vector<float> fine;
+		for ( int i = 0; i < 5; ++i ) fine.push_back( centre + step * ( i - 2 ) );
+		const auto m2 = eval( fine, d_picks.p, S );
+		best = static_cast<int>( std::min_element( m2.begin(), m2.end() ) - m2.begin() );
+		double offset = 0.0;
+		if ( best > 0 && best < 4 ) {
+			const double y0 = m2[best - 1], y1 = m2[best], y2 = m2[best + 1];
+			const double denom = y0 - 2.0 * y1 + y2;
+			offset = denom > 0.0 ? 0.5 * ( y0 - y2 ) / denom : 0.0;
+			offset = std::max( -0.5, std::min( 0.5, offset ) );
+		}
+		return std::max( fine[best] + static_cast<float>( offset ) * step, 0.01f );
+	};
+	int best = 0;
+	if ( hint >= 0.2f ) {
+		const float s = fine_search( hint, best );
+		if ( best > 0 && best < 4 ) return s;
+	}
 	std::vector<float> coarse;
 	for ( int i = 0; i < 10; ++i ) coarse.push_back( 0.1f + 0.2f * i );
 	const auto m1 = eval( coarse, d_subs.p, Ssub );
-	const float centre = coarse[std::min_element( m1.begin(), m1.end() ) - m1.begin()];
-	const float step = 0.075f;
-	std::vector<float> fine;
-	for ( int i = 0; i < 5; ++i ) fine.push_back( centre + step * ( i - 2 ) );
-	const auto m2 = eval( fine, d_picks.p, S );
-	const int best = static_cast<int>( std::min_element( m2.begin(), m2.end() ) - m2.begin() );
-	double offset = 0.0;
-	if ( best > 0 && best < 4 ) {
-		const double y0 = m2[best - 1], y1 = m2[best], y2 = m2[best + 1];
-		const double denom = y0 - 2.0 * y1 + y2;
-		offset = denom > 0.0 ? 0.5 * ( y0 - y2 ) / denom : 0.0;
-		offset = std::max( -0.5, std::min( 0.5, offset ) );
-	}
-	return std::max( fine[best] + static_cast<float>( offset ) * step, 0.01f );
+	return fine_search( coarse[std::min_element( m1.begin(), m1.end() ) - m1.begin()], best );
 }
 
 // The weight (k x n, in place) to the encoder's domain: output scales and signs, the right rotation, input scales and signs, the left rotation,
-// the global scale. su / sv receive the factors the stored suh / svh carry
+// the global scale (its search from `hint`, see scale_search). su / sv receive the factors the stored suh / svh carry
 void regularize( Ctx& c, float* W, float* tmp, int k, int n, const std::vector<float>& su_signs, uint64_t seed,
-	const engine::quant::Exl3QuantOptions& o, const engine::quant::Exl3EncodeScratch& sc, std::vector<float>& su, std::vector<float>& sv,
+	const engine::quant::Exl3QuantOptions& o, const engine::quant::Exl3EncodeScratch& sc, float hint, std::vector<float>& su, std::vector<float>& sv,
 	float& g_scale ) {
 	sv = random_signs( n, seed );
 	DBuf<double> acc( std::max( k, n ) );
@@ -530,7 +540,7 @@ void regularize( Ctx& c, float* W, float* tmp, int k, int n, const std::vector<f
 	k_scale_rows<<<grid_for( (size_t) k * n ), 256, 0, c.stream>>>( W, k, n, vec.p, true );
 	had_left( c, W, tmp, k, n );
 
-	g_scale = scale_search( c, W, k, n, o, sc );
+	g_scale = scale_search( c, W, k, n, o, sc, hint );
 	k_scale<<<grid_for( (size_t) k * n ), 256, 0, c.stream>>>( W, (size_t) k * n, g_scale );
 	for ( auto& v : su ) v /= g_scale;
 }
@@ -833,7 +843,7 @@ bool exl3_quantize_group( const Exl3InputFactor& f, const std::vector<const floa
 	for ( int b = 0; b < count; ++b ) {
 		const int n = ns[b];
 		CUDA_CHECK( cudaMemcpyAsync( Wr.p, weights[b], (size_t) k * n * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
-		regularize( c, Wr.p, tmp.p, k, n, su_signs, seeds[b], o, sc, su[b], sv[b], out[b].g_scale );
+		regularize( c, Wr.p, tmp.p, k, n, su_signs, seeds[b], o, sc, b ? out[b - 1].g_scale : o.scale_hint, su[b], sv[b], out[b].g_scale );
 		CUDA_CHECK( cudaMemcpy2DAsync( Wcat.p + off[b], (size_t) N * sizeof( float ), Wr.p, (size_t) n * sizeof( float ), (size_t) n * sizeof( float ),
 			k, cudaMemcpyDeviceToDevice, st ) );
 		if ( scaled ) {

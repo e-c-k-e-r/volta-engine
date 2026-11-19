@@ -22,6 +22,8 @@ struct Exl3QuantOptions {
 	int out_scales = -1;      // per-output-channel scales: -1 auto (on), 0 off, 1 on
 	bool refit = true;        // refit the channel scales after quantization (needs a Hessian)
 	bool scaled_hessian = true; // one factor per projection with its input scales folded in; false: the input's shared factor (needs one)
+	float scale_hint = 0.0f;  // where the global scale search starts (a like tensor's g_scale): the fine grid around it, the coarse grid only when its
+	                          // minimum is at an edge; 0: the coarse grid first. A group starts each projection at the one before's
 };
 
 // The input side shared by the projections of one input. Without a usable Hessian (no rows, or a diagonal that is zero or not finite) the

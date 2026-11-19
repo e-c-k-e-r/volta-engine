@@ -3,11 +3,11 @@
 // are quantized with the Hessians of an engine capture (test_ppl --calibrate with hessian_dir), the routed experts' down projections with the
 // Hessians of their own activations over the route dump's rows. Work items (the projections of one input, in chunks, or a layer's expert down
 // projections) are spread over the devices; every finished tensor is kept in <out>/.partial, so a run continues where it stopped; the shards are
-// written at the end in the template's layout.
+// written at the end in the template's layout (--no-assemble stops before, a later run without it writes them).
 //
 //   volta_quantize --src <original> --template <exl3 dir> --out <dir> [--hess <capture dir>] [--route <route dump>] [--order volta|stock]
 //                  [--devices 0,1,2,3] [--only SUBSTRING] [--skip A,B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] [--redo]
-//                  [--plan] [--no-scaled-hessian]
+//                  [--plan] [--no-scaled-hessian] [--no-assemble]
 #include "engine/config.h"
 #include "engine/core/log.h"
 #include "engine/modules/trellis_bits.h"
@@ -54,6 +54,7 @@ struct Args {
 	uint64_t seed = 0;
 	bool redo = false;
 	bool plan = false;
+	bool assemble = true;
 	bool scaled = true;
 	float sigma_reg = 0.025f;
 };
@@ -94,6 +95,7 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--redo" ) a.redo = true;
 		else if ( k == "--plan" ) a.plan = true;
 		else if ( k == "--no-scaled-hessian" ) a.scaled = false;
+		else if ( k == "--no-assemble" ) a.assemble = false;
 		else if ( k == "--devices" ) {
 			a.devices.clear();
 			for ( const auto& d : split( val(), ',' ) ) a.devices.push_back( std::stoi( d ) );
@@ -105,7 +107,7 @@ bool parse( int argc, char** argv, Args& a ) {
 	if ( a.src.empty() || a.tmpl.empty() || ( a.out.empty() && !a.plan ) ) {
 		LOG_ERROR( "usage: volta_quantize --src <original> --template <exl3 dir> --out <dir> [--hess <capture dir>] [--route <route dump>] "
 				   "[--order volta|stock] [--devices 0,1] [--only S] [--skip A,B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] "
-				   "[--redo] [--plan] [--no-scaled-hessian]" );
+				   "[--redo] [--plan] [--no-scaled-hessian] [--no-assemble]" );
 		return false;
 	}
 	return true;
@@ -280,6 +282,7 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 				ok = ok && engine::quant::exl3_quantize_group( factor, { w }, { hidden }, { hash64( t.base, a.seed ) }, o, out, stream );
 				if ( w ) CUDA_CHECK( cudaFree( w ) );
 				if ( !ok ) break;
+				o.scale_hint = out[0].g_scale;   // the next expert's scale search starts from this one's
 				done.emplace_back( ti, std::move( out[0] ) );
 			}
 		} else {
@@ -604,6 +607,11 @@ int main( int argc, char** argv ) {
 	if ( sh.failures ) {
 		LOG_ERROR( "[volta_quantize] %d work items failed: the shards are not written (a rerun continues with what is missing)", sh.failures.load() );
 		return 1;
+	}
+	if ( !a.assemble ) {
+		LOG_INFO( "[volta_quantize] quantized into %s/.partial (%.1f min), shards not written (--no-assemble)", a.out.c_str(),
+			std::chrono::duration<double>( std::chrono::steady_clock::now() - sh.t0 ).count() / 60.0 );
+		return 0;
 	}
 	int kept = 0;
 	if ( !assemble( a, sh.plan, a.volta && !tmpl_volta ? stock_kept : std::vector<std::string>(), kept ) ) {
