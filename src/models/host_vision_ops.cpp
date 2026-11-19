@@ -444,71 +444,99 @@ void swiglu( Par& par, const uint16_t* gate, const uint16_t* up, uint16_t* out, 
 
 namespace {
 
-// n a multiple of 8
-HV_AVX2 float dotn( const float* a, const float* b, int n ) {
-	__m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
-	int i = 0;
-	for ( ; i + 16 <= n; i += 16 ) {
-		s0 = _mm256_fmadd_ps( _mm256_loadu_ps( a + i ), _mm256_loadu_ps( b + i ), s0 );
-		s1 = _mm256_fmadd_ps( _mm256_loadu_ps( a + i + 8 ), _mm256_loadu_ps( b + i + 8 ), s1 );
-	}
-	if ( i < n ) s0 = _mm256_fmadd_ps( _mm256_loadu_ps( a + i ), _mm256_loadu_ps( b + i ), s0 );
-	s0 = _mm256_add_ps( s0, s1 );
-	__m128 r = _mm_add_ps( _mm256_castps256_ps128( s0 ), _mm256_extractf128_ps( s0, 1 ) );
-	r = _mm_add_ps( r, _mm_movehl_ps( r, r ) );
-	r = _mm_add_ss( r, _mm_shuffle_ps( r, r, 1 ) );
-	return _mm_cvtss_f32( r );
+// e^x for x <= 0 (the softmax's shifted scores): 2^n times a degree-5 polynomial of the remainder, relative error about 1e-7
+HV_AVX2 __m256 exp_neg( __m256 x ) {
+	x = _mm256_max_ps( x, _mm256_set1_ps( -87.0f ) );
+	const __m256 t = _mm256_mul_ps( x, _mm256_set1_ps( 1.44269504089f ) );
+	const __m256 n = _mm256_round_ps( t, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC );
+	__m256 r = _mm256_fnmadd_ps( n, _mm256_set1_ps( 0.693359375f ), x );
+	r = _mm256_fnmadd_ps( n, _mm256_set1_ps( -2.12194440e-4f ), r );
+	__m256 p = _mm256_set1_ps( 1.9875691500e-4f );
+	p = _mm256_fmadd_ps( p, r, _mm256_set1_ps( 1.3981999507e-3f ) );
+	p = _mm256_fmadd_ps( p, r, _mm256_set1_ps( 8.3334519073e-3f ) );
+	p = _mm256_fmadd_ps( p, r, _mm256_set1_ps( 4.1665795894e-2f ) );
+	p = _mm256_fmadd_ps( p, r, _mm256_set1_ps( 1.6666665459e-1f ) );
+	p = _mm256_fmadd_ps( p, r, _mm256_set1_ps( 5.0000001201e-1f ) );
+	p = _mm256_fmadd_ps( p, _mm256_mul_ps( r, r ), _mm256_add_ps( r, _mm256_set1_ps( 1.0f ) ) );
+	const __m256i e = _mm256_slli_epi32( _mm256_add_epi32( _mm256_cvtps_epi32( n ), _mm256_set1_epi32( 127 ) ), 23 );
+	return _mm256_mul_ps( p, _mm256_castsi256_ps( e ) );
 }
 
-HV_AVX2 void axpyn( float* acc, float p, const float* v, int n ) {
-	const __m256 pv = _mm256_set1_ps( p );
-	for ( int i = 0; i < n; i += 8 ) _mm256_storeu_ps( acc + i, _mm256_fmadd_ps( pv, _mm256_loadu_ps( v + i ), _mm256_loadu_ps( acc + i ) ) );
+// The softmax of the first m of the mp scores of a row (mp a multiple of 16: the rest are padding keys, set to zero), in place
+HV_AVX2 void softmax_row( float* s, int m, int mp ) {
+	float mx = -INFINITY;
+	for ( int j = 0; j < m; ++j ) mx = std::max( mx, s[j] );
+	const __m256 vm = _mm256_set1_ps( mx );
+	for ( int j = 0; j < mp; j += 8 ) _mm256_storeu_ps( s + j, exp_neg( _mm256_sub_ps( _mm256_loadu_ps( s + j ), vm ) ) );
+	for ( int j = m; j < mp; ++j ) s[j] = 0.0f;
+	__m256 acc = _mm256_setzero_ps();
+	for ( int j = 0; j < mp; j += 8 ) acc = _mm256_add_ps( acc, _mm256_loadu_ps( s + j ) );
+	__m128 r = _mm_add_ps( _mm256_castps256_ps128( acc ), _mm256_extractf128_ps( acc, 1 ) );
+	r = _mm_add_ps( r, _mm_movehl_ps( r, r ) );
+	r = _mm_add_ss( r, _mm_shuffle_ps( r, r, 1 ) );
+	const __m256 inv = _mm256_set1_ps( 1.0f / _mm_cvtss_f32( r ) );
+	for ( int j = 0; j < mp; j += 8 ) _mm256_storeu_ps( s + j, _mm256_mul_ps( _mm256_loadu_ps( s + j ), inv ) );
 }
 
 } // namespace
 
+// Per head: the keys as panels [mp / 16][head_dim][16] (the scores Q K^T are a product over them) and the values transposed into panels
+// [hdp / 16][mp][16] (the output P V is a product over those), then blocks of queries: scores by gemm, softmax per row, output by gemm.
 void attention( Par& par, Scratch& s, const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* out, int m, int heads, float scale, int head_dim ) {
-	const int kHead = head_dim;
-	const int width = heads * kHead;
-	const size_t total = static_cast<size_t>( m ) * width;
-	for ( auto* f : { &s.qf, &s.kf, &s.vf } ) if ( f->size() < total ) f->resize( total );
-	const struct { const uint16_t* src; float* dst; float mul; } conv[3] = { { q, s.qf.data(), scale }, { k, s.kf.data(), 1.0f }, { v, s.vf.data(), 1.0f } };
-	for ( const auto& c : conv ) {
-		par.run( m, 16, [&]( int64_t r0, int64_t r1 ) {
-			for ( int64_t r = r0; r < r1; ++r ) {
-				float* d = c.dst + static_cast<size_t>( r ) * width;
-				cpu::half_to_float( c.src + static_cast<size_t>( r ) * width, d, width );
-				if ( c.mul != 1.0f ) for ( int i = 0; i < width; ++i ) d[i] *= c.mul;
-			}
+	const int hd = head_dim, hdp = ( hd + 15 ) / 16 * 16, mp = ( m + 15 ) / 16 * 16, width = heads * hd;
+	constexpr int kBlockRows = 384;
+	Dense kd, vd;
+	kd.k = hd;
+	kd.n = mp;
+	kd.w.assign( static_cast<size_t>( mp ) * hd, 0 );
+	vd.k = mp;
+	vd.n = hdp;
+	vd.w.assign( static_cast<size_t>( mp ) * hdp, 0 );
+	const size_t qb = static_cast<size_t>( std::min( m, kBlockRows ) );
+	if ( s.qf.size() < qb * hd ) s.qf.resize( qb * hd );
+	if ( s.kf.size() < qb * mp ) s.kf.resize( qb * mp );
+	if ( s.vf.size() < qb * hdp ) s.vf.resize( qb * hdp );
+	for ( int head = 0; head < heads; ++head ) {
+		const int off = head * hd;
+		// keys: panel p holds the keys 16p .. 16p+15, the padding keys stay zero
+		par.run( mp / 16, 1, [&]( int64_t p0, int64_t p1 ) {
+			for ( int64_t p = p0; p < p1; ++p )
+				for ( int c = 0; c < 16; ++c ) {
+					const int j = static_cast<int>( p ) * 16 + c;
+					if ( j >= m ) continue;
+					const uint16_t* src = k + static_cast<size_t>( j ) * width + off;
+					uint16_t* dst = kd.w.data() + static_cast<size_t>( p ) * hd * 16 + c;
+					for ( int i = 0; i < hd; ++i ) dst[static_cast<size_t>( i ) * 16] = src[i];
+				}
 		} );
-	}
-	const float* qf = s.qf.data();
-	const float* kf = s.kf.data();
-	const float* vf = s.vf.data();
-	par.run( static_cast<int64_t>( m ) * heads, 4, [&]( int64_t i0, int64_t i1 ) {
-		thread_local std::vector<float> sc;
-		sc.resize( m );
-		float acc[128];
-		for ( int64_t i = i0; i < i1; ++i ) {
-			const int qi = static_cast<int>( i / heads ), head = static_cast<int>( i % heads );
-			const float* qr = qf + static_cast<size_t>( qi ) * width + head * kHead;
-			float mx = -INFINITY;
-			for ( int j = 0; j < m; ++j ) {
-				sc[j] = dotn( qr, kf + static_cast<size_t>( j ) * width + head * kHead, kHead );
-				mx = std::max( mx, sc[j] );
-			}
-			float l = 0.0f;
-			std::fill( acc, acc + kHead, 0.0f );
-			for ( int j = 0; j < m; ++j ) {
-				const float p = std::exp( sc[j] - mx );
-				l += p;
-				axpyn( acc, p, vf + static_cast<size_t>( j ) * width + head * kHead, kHead );
-			}
-			const float inv = 1.0f / l;
-			for ( int d = 0; d < kHead; ++d ) acc[d] *= inv;
-			cpu::float_to_half( acc, out + static_cast<size_t>( qi ) * width + head * kHead, kHead );
+		// values: panel p holds the output columns 16p .. 16p+15 for every key j (the padding keys and columns stay zero)
+		par.run( ( m + 63 ) / 64, 1, [&]( int64_t c0, int64_t c1 ) {
+			for ( int64_t cj = c0; cj < c1; ++cj )
+				for ( int j = static_cast<int>( cj ) * 64; j < std::min( m, static_cast<int>( cj ) * 64 + 64 ); ++j ) {
+					const uint16_t* src = v + static_cast<size_t>( j ) * width + off;
+					for ( int d = 0; d < hd; ++d ) vd.w[( static_cast<size_t>( d / 16 ) * mp + j ) * 16 + d % 16] = src[d];
+				}
+		} );
+		for ( int q0 = 0; q0 < m; q0 += kBlockRows ) {
+			const int rows = std::min( kBlockRows, m - q0 );
+			par.run( rows, 16, [&]( int64_t r0, int64_t r1 ) {
+				for ( int64_t r = r0; r < r1; ++r ) {
+					float* dst = s.qf.data() + static_cast<size_t>( r ) * hd;
+					cpu::half_to_float( q + static_cast<size_t>( q0 + r ) * width + off, dst, hd );
+					for ( int i = 0; i < hd; ++i ) dst[i] *= scale;
+				}
+			} );
+			gemm( par, s.qf.data(), rows, kd, s.kf.data() );                      // scores [rows][mp]
+			par.run( rows, 8, [&]( int64_t r0, int64_t r1 ) {
+				for ( int64_t r = r0; r < r1; ++r ) softmax_row( s.kf.data() + static_cast<size_t>( r ) * mp, m, mp );
+			} );
+			gemm( par, s.kf.data(), rows, vd, s.vf.data() );                      // output [rows][hdp]
+			par.run( rows, 16, [&]( int64_t r0, int64_t r1 ) {
+				for ( int64_t r = r0; r < r1; ++r )
+					cpu::float_to_half( s.vf.data() + static_cast<size_t>( r ) * hdp, out + static_cast<size_t>( q0 + r ) * width + off, hd );
+			} );
 		}
-	} );
+	}
 }
 
 } // namespace engine::models::hv
