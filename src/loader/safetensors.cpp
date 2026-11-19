@@ -1,3 +1,6 @@
+#include <thread>
+#include <chrono>
+#include <atomic>
 #include "engine/modules/trellis_bits.h"
 #include "engine/modules/trellis.h"
 #include "engine/loader/safetensors.h"
@@ -991,14 +994,96 @@ bool SafeTensorsRepo::copy_host_bf16( const char* name, uint16_t* dst, size_t el
 	return true;
 }
 
+namespace {
+
+// A token embedding stored as a trellis (exllamav3 1.6: <key>.trellis [rows, groups * (1 + 16 K)] int16 and <key>.signs [groups, 256] FP16): a row is `groups` rings of
+// 256 values, each a ring scale (FP16) and 16 K words of K-bit symbols read through the MUL1 codebook like the Engram rows (a state stacks the symbols of the positions i, i - 1,
+// ..., modulo the ring), then an orthonormal Walsh-Hadamard transform over the ring and the sign vector of its group. Decoded to BF16 rows of groups * 256 columns.
+bool decode_trellis_embedding( const uint16_t* trellis, int64_t rows, int row_words, const uint16_t* signs, int groups, uint16_t* out ) {
+	if ( groups <= 0 || row_words % groups != 0 ) return false;
+	const int ring_words = row_words / groups, K = ( ring_words - 1 ) / 16;
+	if ( K < 1 || K > 8 || ring_words != 1 + 16 * K ) return false;
+	constexpr int kDim = 256;
+	const int words = 16 * K, mask = ( 1 << K ) - 1, taps = ( 15 + K ) / K;
+	auto half_f = []( uint16_t b ) { _Float16 h; std::memcpy( &h, &b, 2 ); return static_cast<float>( h ); };
+	std::vector<float> codebook( 65536 ), sign( static_cast<size_t>( groups ) * kDim );
+	{
+		const float k_inv = half_f( 0x1eee ), k_bias = half_f( 0xc931 );
+		for ( uint32_t st = 0; st < 65536; ++st ) {
+			const uint32_t prod = st * 0x83DCD12Du;
+			const float h = static_cast<float>( 1024 + ( prod & 255 ) + ( ( prod >> 8 ) & 255 ) + ( ( prod >> 16 ) & 255 ) + ( prod >> 24 ) );
+			volatile float t = h * k_inv;
+			const _Float16 r = static_cast<_Float16>( t + k_bias );
+			codebook[st] = static_cast<float>( r );
+		}
+		for ( size_t i = 0; i < sign.size(); ++i ) sign[i] = half_f( signs[i] );
+	}
+	const int cols = groups * kDim;
+	std::atomic<int64_t> next{ 0 };
+	auto work = [&]() {
+		std::vector<float> v( kDim );
+		std::vector<int> sym( kDim );
+		for ( ;; ) {
+			const int64_t r0 = next.fetch_add( 64 );
+			if ( r0 >= rows ) break;
+			for ( int64_t r = r0; r < std::min<int64_t>( r0 + 64, rows ); ++r ) {
+				for ( int g = 0; g < groups; ++g ) {
+					const uint16_t* ring = trellis + static_cast<size_t>( r ) * row_words + static_cast<size_t>( g ) * ring_words;
+					const float scale = half_f( ring[0] );
+					const uint16_t* w = ring + 1;
+					for ( int i = 0; i < kDim; ++i ) {
+						const int bit = i * K, idx = bit >> 4;
+						const uint32_t win = static_cast<uint32_t>( w[idx] ) | ( static_cast<uint32_t>( w[( idx + 1 ) % words] ) << 16 );
+						sym[i] = static_cast<int>( ( win >> ( bit & 15 ) ) & mask );
+					}
+					for ( int i = 0; i < kDim; ++i ) {
+						uint32_t st = 0;
+						for ( int j = 0; j < taps; ++j ) st |= static_cast<uint32_t>( sym[( i - j + kDim ) % kDim] ) << ( j * K );
+						v[i] = codebook[st & 0xFFFF] * scale;
+					}
+					for ( int h = 1; h < kDim; h *= 2 )
+						for ( int b = 0; b < kDim; b += 2 * h )
+							for ( int k = 0; k < h; ++k ) {
+								const float a = v[b + k], c = v[b + k + h];
+								v[b + k] = a + c;
+								v[b + k + h] = a - c;
+							}
+					uint16_t* dst = out + static_cast<size_t>( r ) * cols + static_cast<size_t>( g ) * kDim;
+					for ( int i = 0; i < kDim; ++i ) {
+						const float f = v[i] * 0.0625f * sign[static_cast<size_t>( g ) * kDim + i];
+						uint32_t u;
+						std::memcpy( &u, &f, 4 );
+						u += 0x7fffu + ( ( u >> 16 ) & 1u );
+						dst[i] = static_cast<uint16_t>( u >> 16 );
+					}
+				}
+			}
+		}
+	};
+	const unsigned n = std::max( 1u, std::min( 16u, std::thread::hardware_concurrency() ) );
+	std::vector<std::thread> pool;
+	for ( unsigned t = 1; t < n; ++t ) pool.emplace_back( work );
+	work();
+	for ( auto& t : pool ) t.join();
+	return true;
+}
+
+} // namespace
+
 pod::TensorView SafeTensorsRepo::shared_host_bf16( const char* name, backend::stream_t stream ) {
 	static std::mutex mu;
 	static std::map<std::string, pod::TensorView> tables;
 	std::lock_guard<std::mutex> lk( mu );
 	if ( const auto it = tables.find( name ); it != tables.end() ) return it->second;
 	const auto* meta = find( name );
-	if ( meta == nullptr || meta->ndim != 2 ) return pod::TensorView{};
-	const int rows = meta->shape[0], cols = meta->shape[1];
+	// a table stored as a trellis (<base>.trellis + <base>.signs) is decoded to BF16 here
+	std::string base( name );
+	if ( base.size() > 7 && base.compare( base.size() - 7, 7, ".weight" ) == 0 ) base.resize( base.size() - 7 );
+	const auto* tm = meta == nullptr ? find( ( base + ".trellis" ).c_str() ) : nullptr;
+	const auto* sm = tm != nullptr ? find( ( base + ".signs" ).c_str() ) : nullptr;
+	if ( meta == nullptr && !( tm != nullptr && sm != nullptr && tm->ndim == 2 && sm->ndim == 2 ) ) return pod::TensorView{};
+	if ( meta != nullptr && meta->ndim != 2 ) return pod::TensorView{};
+	const int rows = meta != nullptr ? meta->shape[0] : tm->shape[0], cols = meta != nullptr ? meta->shape[1] : sm->shape[0] * 256;
 	const size_t n = static_cast<size_t>( rows ) * cols;
 	auto* dst = static_cast<uint16_t*>( backend::host_alloc_pinned( n * sizeof( uint16_t ), backend::Pin::MappedPortable ) );
 	if ( dst == nullptr ) {
@@ -1006,7 +1091,15 @@ pod::TensorView SafeTensorsRepo::shared_host_bf16( const char* name, backend::st
 		LOG_WARN( "[SafeTensorsRepo] %s: no mapped pinned host memory on this backend, kept on the device instead\n", name );
 		return pod::TensorView{};
 	}
-	if ( !copy_host_bf16( name, dst, n, stream ) ) {
+	bool ok;
+	if ( meta != nullptr ) ok = copy_host_bf16( name, dst, n, stream );
+	else {
+		const auto t0 = std::chrono::steady_clock::now();
+		ok = decode_trellis_embedding( static_cast<const uint16_t*>( cpu_data( ( base + ".trellis" ).c_str() ) ), rows, static_cast<int>( tm->shape[1] ),
+			static_cast<const uint16_t*>( cpu_data( ( base + ".signs" ).c_str() ) ), static_cast<int>( sm->shape[0] ), dst );
+		if ( ok ) LOG_INFO( "[SafeTensorsRepo] %s decoded from its trellis: %d rows x %d columns in %.1f s\n", base.c_str(), rows, cols, std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() );
+	}
+	if ( !ok ) {
 		backend::host_free_pinned( dst );
 		return pod::TensorView{};
 	}
