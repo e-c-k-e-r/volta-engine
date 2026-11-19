@@ -13,6 +13,8 @@
 //     --affinity-eps E: routed experts under their routing-weighted Hessians instead (the dump's routing weights, quant/expert_hessian.h)
 //   hess_compare routes --src <original> --route <route dump> --layers L,L,... [--top 32]
 //     per layer the experts the most rows route to, most first, and their projections as a volta_quantize --only list
+//   hess_compare merge <out dir> <dir> <dir> ...
+//     the capture files every directory has, summed (Hessian sums and row counts: a calibration mixed by token count)
 //   hess_compare moe --src <original> --route <route dump with its .w> --layers L,L,... [--max-rows 8192] --exl3 <dir> [--exl3 <dir> ...]
 //     each routed expert of the first directory: its output's error against the original expert's over the dump's rows routed to it, each row
 //     weighted by its routing weight squared (its share of the MoE block's output), relative to the original output; per layer the mean, and
@@ -655,7 +657,61 @@ int moe( int argc, char** argv ) {
 	return 0;
 }
 
+int merge( int argc, char** argv ) {
+	if ( argc < 5 ) {
+		std::fprintf( stderr, "usage: hess_compare merge <out dir> <dir> <dir> ...\n" );
+		return 2;
+	}
+	const std::string out = argv[2];
+	std::vector<std::string> dirs( argv + 3, argv + argc );
+	mkdir( out.c_str(), 0755 );
+	DIR* d = opendir( dirs[0].c_str() );
+	if ( !d ) return 1;
+	std::vector<std::string> names;
+	while ( dirent* e = readdir( d ) ) {
+		const std::string n = e->d_name;
+		if ( n.size() > 4 && n.compare( n.size() - 4, 4, ".f32" ) == 0 ) names.push_back( n );
+	}
+	closedir( d );
+	std::sort( names.begin(), names.end() );
+	int merged = 0, skipped = 0;
+	for ( const auto& n : names ) {
+		Hess sum;
+		bool ok = true;
+		for ( const auto& dir : dirs ) {
+			Hess h;
+			if ( !read_hess( dir + "/" + n, h ) || ( sum.k && h.k != sum.k ) ) {
+				ok = false;
+				break;
+			}
+			if ( !sum.k ) {
+				sum = std::move( h );
+				continue;
+			}
+			for ( size_t i = 0; i < sum.h.size(); ++i ) sum.h[i] += h.h[i];
+			sum.rows += h.rows;
+		}
+		if ( !ok ) {
+			++skipped;
+			continue;
+		}
+		FILE* f = std::fopen( ( out + "/" + n ).c_str(), "wb" );
+		const int32_t hdr[2] = { 0x48455353, sum.k };
+		ok = f && std::fwrite( hdr, 4, 2, f ) == 2 && std::fwrite( &sum.rows, 8, 1, f ) == 1 &&
+			std::fwrite( sum.h.data(), 4, sum.h.size(), f ) == sum.h.size();
+		if ( f ) std::fclose( f );
+		if ( !ok ) {
+			std::fprintf( stderr, "hess_compare merge: cannot write %s/%s\n", out.c_str(), n.c_str() );
+			return 1;
+		}
+		++merged;
+	}
+	std::printf( "[*] hess_compare merge: %d files summed into %s, %d not in every directory\n", merged, out.c_str(), skipped );
+	return 0;
+}
+
 int main( int argc, char** argv ) {
+	if ( argc >= 2 && !std::strcmp( argv[1], "merge" ) ) return merge( argc, argv );
 	if ( argc >= 2 && !std::strcmp( argv[1], "moe" ) ) return moe( argc, argv );
 	if ( argc >= 2 && !std::strcmp( argv[1], "routes" ) ) return routes( argc, argv );
 	if ( argc >= 4 && !std::strcmp( argv[1], "stats" ) ) return stats( argv[2], argv[3] );

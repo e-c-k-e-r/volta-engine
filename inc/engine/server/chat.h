@@ -104,8 +104,9 @@ public:
 bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatRequest req, uint64_t request_id,
 	std::shared_ptr<Responder> responder, const ConnPtr& conn, ApiError* err );
 
-// Prompt length of a request without generating (count_tokens).
-bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, int* tokens, ApiError* err );
+// Prompt length of a request without generating (count_tokens); with dump_requests its rendered prompt is written as a generation's is
+bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, uint64_t request_id, int* tokens,
+	ApiError* err );
 
 // Protocol front ends (openai.cpp, anthropic.cpp)
 class ChatProtocol {

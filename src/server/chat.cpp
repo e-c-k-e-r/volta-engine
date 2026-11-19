@@ -367,13 +367,26 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 	return true;
 }
 
+// dump_requests: the rendered prompt as req_<id>.prompt.txt, special tokens as their text
+void dump_prompt( engine::runtime::Generator& gen, const std::string& prompt, uint64_t request_id ) {
+	if ( runtime::options().dump_requests.empty() ) return;
+	const std::string path = runtime::options().dump_requests + "/req_" + std::to_string( request_id ) + ".prompt.txt";
+	if ( FILE* f = std::fopen( path.c_str(), "wb" ) ) {
+		const std::string shown = unescape_prompt( gen.tokenizer(), prompt );
+		std::fwrite( shown.data(), 1, shown.size(), f );
+		std::fclose( f );
+	}
+}
+
 } // namespace
 
-bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, int* tokens, ApiError* err ) {
+bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, uint64_t request_id, int* tokens,
+	ApiError* err ) {
 	std::string prompt;
 	std::vector<int> ids;
 	ImageList images;
 	if ( !render_prompt( gen, cfg, req, &prompt, &ids, &images, err ) ) return false;
+	dump_prompt( gen, prompt, request_id );
 	*tokens = static_cast<int>( ids.size() );
 	return true;
 }
@@ -398,14 +411,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	ImageList images;
 	if ( !render_prompt( gen, cfg, req, &prompt, &tokens, &images, err ) ) return false;
 	responder->on_prompt( static_cast<int>( tokens.size() ) );
-	if ( !runtime::options().dump_requests.empty() ) {
-		const std::string path = runtime::options().dump_requests + "/req_" + std::to_string( request_id ) + ".prompt.txt";
-		if ( FILE* f = std::fopen( path.c_str(), "wb" ) ) {
-			const std::string shown = unescape_prompt( gen.tokenizer(), prompt );
-			std::fwrite( shown.data(), 1, shown.size(), f );
-			std::fclose( f );
-		}
-	}
+	dump_prompt( gen, prompt, request_id );
 
 	const bool in_reasoning = ends_with( prompt, "<think>\n" ) || ends_with( prompt, "<think>" );
 	auto state = std::make_shared<ChatState>(

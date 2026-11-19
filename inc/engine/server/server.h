@@ -56,6 +56,8 @@ private:
 	void handle_api_experts( const ConnPtr& conn );
 	void handle_chat( const ConnPtr& conn, const HttpRequest& req, ChatProtocol& protocol );
 	void handle_count_tokens( const ConnPtr& conn, const HttpRequest& req, ChatProtocol& protocol );
+	// dump_requests: the request body as req_<next id>.json
+	void dump_body( const HttpRequest& req );
 
 	ServerConfig config_;
 	int listen_fd_ = -1;

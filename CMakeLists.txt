@@ -558,6 +558,11 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	target_link_libraries(volta_quantize PRIVATE engine_quant_tools)
 	set_target_properties(volta_quantize PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+	# Anthropic request bodies from recorded Claude Code sessions (rendered by the server's count_tokens with dump_requests: calibration prompts)
+	add_executable(volta_sessions src/tools/volta_sessions.cpp)
+	target_link_libraries(volta_sessions PRIVATE engine_quant_tools)
+	set_target_properties(volta_sessions PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 	# Block-output tuning of routed experts' EXL3 scales against the original experts over the route dump's rows
 	add_executable(volta_tune src/tools/volta_tune.cpp)
 	target_link_libraries(volta_tune PRIVATE engine_quant_tools engine_train)

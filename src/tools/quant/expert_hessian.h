@@ -19,7 +19,7 @@ namespace engine::tools::quant {
 
 class RouteRows {
 public:
-	// One pass over the record headers; the rows are read per layer
+	// One pass over the record headers; the rows are read per layer. path: one dump, or several comma-separated (their rows in that order)
 	bool open( const std::string& path, int hidden );
 	int64_t rows( int layer ) const;
 	// The layer's rows (at most max_rows, 0 = all) as FP16 bits, rows x hidden
@@ -36,8 +36,9 @@ private:
 		int rows;
 		int k;            // expert ids per row, int32 before the rows' data
 		int64_t w_offset; // of the routing weights in <path>.w
+		int file;         // which dump of the list
 	};
-	std::string path_;
+	std::vector<std::string> paths_;
 	int hidden_ = 0;
 	bool has_w_ = false;
 	std::map<int, std::vector<Rec>> by_layer_;

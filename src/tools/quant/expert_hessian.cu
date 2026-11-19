@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <sys/stat.h>
@@ -78,36 +79,65 @@ bool grow( void*& p, size_t& have, size_t want ) {
 } // namespace
 
 bool RouteRows::open( const std::string& path, int hidden ) {
-	path_ = path;
+	paths_.clear();
+	for ( size_t p = 0; p <= path.size(); ) {
+		const size_t q = std::min( path.find( ',', p ), path.size() );
+		if ( q > p ) paths_.push_back( path.substr( p, q - p ) );
+		p = q + 1;
+	}
 	hidden_ = hidden;
 	by_layer_.clear();
-	FILE* f = std::fopen( path.c_str(), "rb" );
-	if ( !f ) {
-		LOG_ERROR( "[volta_quantize] cannot open the route dump %s", path.c_str() );
-		return false;
-	}
-	int64_t pos = 0, wpos = 0;
-	int hdr[4];
-	while ( std::fread( hdr, sizeof( int ), 4, f ) == 4 ) {
-		const int layer = hdr[0], rows = hdr[1], K = hdr[3];
-		if ( rows <= 0 || K <= 0 ) {
-			LOG_ERROR( "[volta_quantize] %s: bad record at byte %lld", path.c_str(), static_cast<long long>( pos ) );
-			std::fclose( f );
+	has_w_ = !paths_.empty();
+	for ( int fi = 0; fi < static_cast<int>( paths_.size() ); ++fi ) {
+		const std::string& fp = paths_[fi];
+		FILE* f = std::fopen( fp.c_str(), "rb" );
+		if ( !f ) {
+			LOG_ERROR( "[volta_quantize] cannot open the route dump %s", fp.c_str() );
 			return false;
 		}
-		const int64_t ids = static_cast<int64_t>( rows ) * K * 4, data = static_cast<int64_t>( rows ) * hidden * 2;
-		by_layer_[layer].push_back( { pos + 16 + ids, rows, K, wpos } );
-		pos += 16 + ids + data;
-		wpos += ids;
-		if ( fseeko( f, pos, SEEK_SET ) != 0 ) break;
+		int64_t pos = 0, wpos = 0;
+		int hdr[4];
+		while ( std::fread( hdr, sizeof( int ), 4, f ) == 4 ) {
+			const int layer = hdr[0], rows = hdr[1], K = hdr[3];
+			if ( rows <= 0 || K <= 0 ) {
+				LOG_ERROR( "[volta_quantize] %s: bad record at byte %lld", fp.c_str(), static_cast<long long>( pos ) );
+				std::fclose( f );
+				return false;
+			}
+			const int64_t ids = static_cast<int64_t>( rows ) * K * 4, data = static_cast<int64_t>( rows ) * hidden * 2;
+			by_layer_[layer].push_back( { pos + 16 + ids, rows, K, wpos, fi } );
+			pos += 16 + ids + data;
+			wpos += ids;
+			if ( fseeko( f, pos, SEEK_SET ) != 0 ) break;
+		}
+		std::fclose( f );
+		// The routing weights, when the dump has them for every record
+		struct stat st {};
+		const bool w = stat( ( fp + ".w" ).c_str(), &st ) == 0 && static_cast<int64_t>( st.st_size ) == wpos;
+		if ( stat( ( fp + ".w" ).c_str(), &st ) == 0 && !w ) LOG_WARN( "[volta_quantize] %s.w does not match the dump's records: no routing weights", fp.c_str() );
+		has_w_ = has_w_ && w;
 	}
-	std::fclose( f );
-	// The routing weights, when the dump has them for every record
-	struct stat st {};
-	has_w_ = stat( ( path + ".w" ).c_str(), &st ) == 0 && static_cast<int64_t>( st.st_size ) == wpos;
-	if ( stat( ( path + ".w" ).c_str(), &st ) == 0 && !has_w_ ) LOG_WARN( "[volta_quantize] %s.w does not match the dump's records: no routing weights", path.c_str() );
 	return true;
 }
+
+namespace {
+
+// One open FILE per dump of a list (and its weights file), closed with the reader
+struct Files {
+	std::vector<FILE*> f;
+	explicit Files( size_t n ) : f( n, nullptr ) {}
+	~Files() {
+		for ( FILE* x : f ) {
+			if ( x ) std::fclose( x );
+		}
+	}
+	FILE* get( size_t i, const std::string& path ) {
+		if ( !f[i] ) f[i] = std::fopen( path.c_str(), "rb" );
+		return f[i];
+	}
+};
+
+} // namespace
 
 bool RouteRows::routes( int layer, int64_t max_rows, std::vector<int>& ids, std::vector<float>& w, int& K ) const {
 	const auto it = by_layer_.find( layer );
@@ -117,21 +147,20 @@ bool RouteRows::routes( int layer, int64_t max_rows, std::vector<int>& ids, std:
 	if ( max_rows > 0 && total > max_rows ) total = max_rows;
 	ids.resize( static_cast<size_t>( total ) * K );
 	w.resize( ids.size() );
-	FILE* f = std::fopen( path_.c_str(), "rb" );
-	FILE* fw = std::fopen( ( path_ + ".w" ).c_str(), "rb" );
-	bool ok = f && fw;
+	Files files( paths_.size() ), wfiles( paths_.size() );
+	bool ok = true;
 	int64_t done = 0;
 	for ( const auto& r : it->second ) {
 		if ( !ok || done >= total ) break;
+		FILE* f = files.get( r.file, paths_[r.file] );
+		FILE* fw = wfiles.get( r.file, paths_[r.file] + ".w" );
 		const int64_t take = r.rows < total - done ? r.rows : total - done;
 		const size_t n = static_cast<size_t>( take ) * K;
-		ok = r.k == K && fseeko( f, r.offset - static_cast<int64_t>( r.rows ) * r.k * 4, SEEK_SET ) == 0 &&
+		ok = f && fw && r.k == K && fseeko( f, r.offset - static_cast<int64_t>( r.rows ) * r.k * 4, SEEK_SET ) == 0 &&
 			std::fread( ids.data() + static_cast<size_t>( done ) * K, 4, n, f ) == n && fseeko( fw, r.w_offset, SEEK_SET ) == 0 &&
 			std::fread( w.data() + static_cast<size_t>( done ) * K, 4, n, fw ) == n;
 		done += take;
 	}
-	if ( f ) std::fclose( f );
-	if ( fw ) std::fclose( fw );
 	return ok;
 }
 
@@ -147,20 +176,19 @@ bool RouteRows::counts( int layer, int experts, std::vector<int64_t>& out ) cons
 	out.assign( experts, 0 );
 	const auto it = by_layer_.find( layer );
 	if ( it == by_layer_.end() ) return false;
-	FILE* f = std::fopen( path_.c_str(), "rb" );
-	if ( !f ) return false;
+	Files files( paths_.size() );
 	std::vector<int32_t> ids;
-	bool ok = true;
 	for ( const auto& r : it->second ) {
+		FILE* f = files.get( r.file, paths_[r.file] );
 		ids.resize( static_cast<size_t>( r.rows ) * r.k );
-		ok = fseeko( f, r.offset - static_cast<int64_t>( ids.size() ) * 4, SEEK_SET ) == 0 && std::fread( ids.data(), 4, ids.size(), f ) == ids.size();
-		if ( !ok ) break;
+		if ( !f || fseeko( f, r.offset - static_cast<int64_t>( ids.size() ) * 4, SEEK_SET ) != 0 || std::fread( ids.data(), 4, ids.size(), f ) != ids.size() ) {
+			return false;
+		}
 		for ( int32_t e : ids ) {
 			if ( e >= 0 && e < experts ) out[e]++;
 		}
 	}
-	std::fclose( f );
-	return ok;
+	return true;
 }
 
 bool RouteRows::read( int layer, int64_t max_rows, std::vector<uint16_t>& out ) const {
@@ -169,21 +197,19 @@ bool RouteRows::read( int layer, int64_t max_rows, std::vector<uint16_t>& out ) 
 	int64_t total = rows( layer );
 	if ( max_rows > 0 && total > max_rows ) total = max_rows;
 	out.resize( static_cast<size_t>( total ) * hidden_ );
-	FILE* f = std::fopen( path_.c_str(), "rb" );
-	if ( !f ) return false;
+	Files files( paths_.size() );
 	int64_t done = 0;
 	for ( const auto& r : it->second ) {
 		if ( done >= total ) break;
+		FILE* f = files.get( r.file, paths_[r.file] );
 		const int64_t take = r.rows < total - done ? r.rows : total - done;
-		if ( fseeko( f, r.offset, SEEK_SET ) != 0 ||
+		if ( !f || fseeko( f, r.offset, SEEK_SET ) != 0 ||
 			std::fread( out.data() + static_cast<size_t>( done ) * hidden_, 2, static_cast<size_t>( take ) * hidden_, f ) !=
 				static_cast<size_t>( take ) * hidden_ ) {
-			std::fclose( f );
 			return false;
 		}
 		done += take;
 	}
-	std::fclose( f );
 	return true;
 }
 

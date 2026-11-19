@@ -366,17 +366,20 @@ void VoltaServer::handle_metrics_prometheus( const ConnPtr& conn ) {
 	send_response( conn, 200, "text/plain; version=0.0.4", std::string( buf, static_cast<size_t>( n ) ) );
 }
 
+void VoltaServer::dump_body( const HttpRequest& req ) {
+	if ( runtime::options().dump_requests.empty() ) return;
+	const std::string path = runtime::options().dump_requests + "/req_" + std::to_string( next_req_id_.load() ) + ".json";
+	if ( FILE* f = std::fopen( path.c_str(), "wb" ) ) {
+		std::fwrite( req.body.data(), 1, req.body.size(), f );
+		std::fclose( f );
+	}
+}
+
 void VoltaServer::handle_chat( const ConnPtr& conn, const HttpRequest& req, ChatProtocol& protocol ) {
 	const bool anthropic = protocol.anthropic_errors();
 	ChatRequest cr;
 	ApiError err;
-	if ( !runtime::options().dump_requests.empty() ) {
-		const std::string path = runtime::options().dump_requests + "/req_" + std::to_string( next_req_id_.load() ) + ".json";
-		if ( FILE* f = std::fopen( path.c_str(), "wb" ) ) {
-			std::fwrite( req.body.data(), 1, req.body.size(), f );
-			std::fclose( f );
-		}
-	}
+	dump_body( req );
 	if ( !protocol.parse( req.body, &cr, &err ) ) return send_error( conn, err.status, err.type, err.message, anthropic );
 	if ( cr.model.empty() ) cr.model = model_name_;
 	const uint64_t id = next_req_id_++;
@@ -390,9 +393,10 @@ void VoltaServer::handle_count_tokens( const ConnPtr& conn, const HttpRequest& r
 	ChatRequest cr;
 	ApiError err;
 	int tokens = 0;
-	if ( !protocol.parse( req.body, &cr, &err ) || !count_chat_tokens( *generator_, config_, cr, &tokens, &err ) ) {
-		return send_error( conn, err.status, err.type, err.message, true );
-	}
+	dump_body( req );
+	if ( !protocol.parse( req.body, &cr, &err ) ) return send_error( conn, err.status, err.type, err.message, true );
+	const uint64_t id = next_req_id_++;
+	if ( !count_chat_tokens( *generator_, config_, cr, id, &tokens, &err ) ) return send_error( conn, err.status, err.type, err.message, true );
 	send_json( conn, 200, nlohmann::json( { { "input_tokens", tokens } } ).dump() );
 }
 
