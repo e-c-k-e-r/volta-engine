@@ -508,6 +508,51 @@ add_executable(test_trellis_order tests/2_parity/test_trellis_order.cpp)
 target_link_libraries(test_trellis_order PRIVATE engine_kernels)
 set_target_properties(test_trellis_order PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+# The EXL3 quantizer (src/kernels/cuda/trellis/quant): a library of its own, so the inference targets do not compile the trellis encoder
+if(ENGINE_BACKEND STREQUAL "CUDA")
+	add_library(engine_quant STATIC
+		src/kernels/cuda/trellis/quant/exl3_encode.cu
+		src/kernels/cuda/trellis/quant/exl3_encode_lo.cu
+		src/kernels/cuda/trellis/quant/exl3_encode_hi.cu
+		src/kernels/cuda/trellis/quant/exl3_quantize.cu
+	)
+	# cuSOLVER for the Hessian factorization and the scale refit's linear systems (the quantizer only)
+	target_link_libraries(engine_quant PUBLIC engine_kernels CUDA::cusolver)
+	set_target_properties(engine_quant PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	# The encoder on Gaussian tiles at every width: error against the rate's bound, and the packed codes decoded by reconstruct in both tile orders
+	add_executable(test_exl3_encode tests/2_parity/test_exl3_encode.cpp)
+	target_link_libraries(test_exl3_encode PRIVATE engine_quant)
+	set_target_properties(test_exl3_encode PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	# The quantizer on synthetic weights and Hessians: the reported proxy error against the decoded checkpoint tensors, the rate ladder, the error
+	# feedback against none, a group against its members alone
+	add_executable(test_exl3_quantize tests/2_parity/test_exl3_quantize.cpp)
+	target_link_libraries(test_exl3_quantize PRIVATE engine_quant)
+	set_target_properties(test_exl3_quantize PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	# The quantization tools' common parts: safetensors files, the template plan, the original's weights, expert down Hessians
+	add_library(engine_quant_tools STATIC
+		src/tools/quant/st_io.cpp
+		src/tools/quant/plan.cpp
+		src/tools/quant/source.cu
+		src/tools/quant/expert_hessian.cu
+	)
+	target_include_directories(engine_quant_tools PUBLIC ${PROJECT_SOURCE_DIR}/src/tools)
+	target_link_libraries(engine_quant_tools PUBLIC engine_quant)
+	set_target_properties(engine_quant_tools PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	# EXL3 quantization of a checkpoint (template layout, engine Hessian captures, expert down Hessians from the route dump), over the GPUs
+	add_executable(volta_quantize src/tools/volta_quantize.cpp)
+	target_link_libraries(volta_quantize PRIVATE engine_quant_tools)
+	set_target_properties(volta_quantize PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	# Two Hessian captures against each other: the matrices, and the quantization each leads to
+	add_executable(hess_compare tests/tools/hess_compare.cpp)
+	target_link_libraries(hess_compare PRIVATE engine_quant_tools)
+	set_target_properties(hess_compare PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+endif()
+
 add_executable(test_trellis_layout tests/2_parity/test_trellis_layout.cpp)
 target_link_libraries(test_trellis_layout PRIVATE engine_kernels)
 set_target_properties(test_trellis_layout PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

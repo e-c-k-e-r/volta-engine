@@ -991,8 +991,8 @@ void MoE::forward(
 			const int K_up = weights.bits_dev ? weights.bits_max : weights.up[0].bits;
 			const int K_down = weights.bits_dev ? weights.bits_max : weights.down[0].bits;
 			ENGINE_ASSERT( weights.device_ptrs != nullptr, "MoE::forward: init_device_ptrs not called" );
-			auto kok = []( int b ) { return ( b >= 1 && b <= 5 ) || ( b >= 9 && b <= 11 ); };
-			ENGINE_ASSERT( kok( K_gate ) && kok( K_up ) && kok( K_down ), "MoE::forward: persistent trellis MoE kernel is instantiated for 1 to 5-bit experts and 1.5 / 2.5 / 3.5 bpw" );
+			auto kok = []( int b ) { return ( b >= 1 && b <= 6 ) || ( b >= 9 && b <= 11 ); };
+			ENGINE_ASSERT( kok( K_gate ) && kok( K_up ) && kok( K_down ), "MoE::forward: persistent trellis MoE kernel is instantiated for 1 to 6-bit experts (6: one width for gate, up and down) and 1.5 / 2.5 / 3.5 bpw" );
 
 			const int wide = rows > 128 && runtime::options().moe_prefill_tile ? 3 : rows > 8 ? 2 : 0;
 			// moe_heavy_rows: the experts of this chunk routed by at least that many rows run as FP16 dequantization + a tensor-core GEMM after the
