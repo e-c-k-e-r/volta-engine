@@ -9,6 +9,7 @@
 #define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
 
 #include "exl3_dq.cuh"
+#include "exl3_dq_ext.cuh"
 // For exl3_gemm_smem_bytes(), the shared definition of this kernel's shared memory footprint
 #include "exl3_kernel_map.cuh"
 
@@ -52,7 +53,8 @@
 // size_m <= 8 row handling.
 // ---------------------------------------------------------------------------
 #if EXL3_VOLTA && EXL3_SM70_HMMA
-template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
+// EXT: the extended trellis, B's per-tile start states (tstart) and gain codes (tgain) indexed [k / 16][n / 16], either null
+template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool EXT = false>
 inline __device__
 void exl3_gemm_kernel_inner_m64
 (
@@ -63,7 +65,9 @@ void exl3_gemm_kernel_inner_m64
     const int size_k,
     const int size_n,
     int* __restrict__ locks,
-    const half* post_scale
+    const half* post_scale,
+    const uint16_t* __restrict__ tstart = nullptr,
+    const uint8_t* __restrict__ tgain = nullptr
 )
 {
     constexpr int TM = TILESIZE_M;   // 32 or 64 rows: 2 or 4 row-blocks sharing one decode of the B fragments
@@ -290,6 +294,13 @@ void exl3_gemm_kernel_inner_m64
             int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
             const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * engine::modules::trellis_tile_u16( bits ));
 
+            if constexpr (EXT)
+            {
+                const size_t tidx = (size_t) (slice1_k * TILEBLOCKS_K + sub_k) * blocks_n + slice1_n * TILEBLOCKS_N + sub_n2;
+                dq_dispatch_ext<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1], tstart ? tstart[tidx] : 0u, tstart != nullptr,
+                    tgain != nullptr, tgain ? tile_gain2(tgain[tidx]) : __half2half2(__ushort_as_half(0x3c00)));
+            }
+            else
             dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
         }
 
@@ -578,7 +589,8 @@ void exl3_gemm_kernel_inner_m64
 }
 #endif  // EXL3_VOLTA && EXL3_SM70_HMMA
 
-template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
+// EXT: the extended trellis, B's per-tile start states (tstart) and gain codes (tgain) indexed [k / 16][n / 16], either null
+template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool EXT = false>
 inline __device__
 void exl3_gemm_kernel_inner
 (
@@ -589,7 +601,9 @@ void exl3_gemm_kernel_inner
     const int size_k,
     const int size_n,
     int* __restrict__ locks,
-    const half* post_scale
+    const half* post_scale,
+    const uint16_t* __restrict__ tstart = nullptr,
+    const uint8_t* __restrict__ tgain = nullptr
 )
 {
     const int TILEBLOCKS_M = MAX(1, TILESIZE_M / 16);
@@ -922,6 +936,13 @@ void exl3_gemm_kernel_inner
             int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
             const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * engine::modules::trellis_tile_u16( bits ));
 
+            if constexpr (EXT)
+            {
+                const size_t tidx = (size_t) (slice1_k * TILEBLOCKS_K + sub_k) * blocks_n + slice1_n * TILEBLOCKS_N + sub_n2;
+                dq_dispatch_ext<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1], tstart ? tstart[tidx] : 0u, tstart != nullptr,
+                    tgain != nullptr, tgain ? tile_gain2(tgain[tidx]) : __half2half2(__ushort_as_half(0x3c00)));
+            }
+            else
             dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
         }
 

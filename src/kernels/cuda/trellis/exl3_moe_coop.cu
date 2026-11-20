@@ -7,6 +7,7 @@ namespace cg = cooperative_groups;
 #include "util.cuh"
 #include "ptx.cuh"
 #include "exl3_dq.cuh"
+#include "exl3_dq_ext.cuh"
 #include "engine/modules/trellis_bits.h"
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
@@ -216,7 +217,8 @@ __device__ __forceinline__ bool read_run( const MoeCoopParams& p, int run_idx, i
 // GEMV tile: one column group of an (nrows, k) x (k, n) product, the rows being the run's slots (row r reads A at
 // A2 + rows[r] * a_stride2 half2 and writes C at rows[r] * c_stride), the whole block splitting k across its warps.
 // Body follows exl3_gemv_kernel (MMODE 1, CFG 0) for 3 bpw with register dequant.
-template <int BITS_, int cb, int WN_>
+// EXT: the extended trellis, tile start states (tstart) and gain codes (tgain) indexed [k slice][column tile], either null
+template <int BITS_, int cb, int WN_, bool EXT = false>
 __device__ __forceinline__ void gemv_tile(
 	const uint32_t* __restrict__ B32,
 	const half2* __restrict__ A2,
@@ -229,7 +231,9 @@ __device__ __forceinline__ void gemv_tile(
 	int k_end,
 	int ntiles,
 	int group,                          // block column group of tile_cols<WN_>() columns
-	float* __restrict__ sh_red          // [WKK][ROWS][TCOLS]
+	float* __restrict__ sh_red,         // [WKK][ROWS][TCOLS]
+	const uint16_t* __restrict__ tstart = nullptr,
+	const uint8_t* __restrict__ tgain = nullptr
 ) {
 	constexpr int WN = WN_;
 	constexpr bool HALF = BITS_ > 8;             // the half-integer rates 1.5, 2.5 and 3.5 (width codes 9 to 11, mul1 only)
@@ -292,6 +296,19 @@ __device__ __forceinline__ void gemv_tile(
 		// 4 bpw: a tile is 32 words, one per lane; a window spans the previous lane's word and the lane's own
 		x_src_a = ( lane + 31 ) & 31;
 		x_src_b = lane;
+	}
+	// Extended trellis: the lanes whose low window word wraps around to the tile's end (a lane decodes positions 8 lane .. 8 lane + 7)
+	[[maybe_unused]] bool wrap_a = false, wrap7 = false, wrap3 = false;
+	if constexpr ( EXT ) {
+		if constexpr ( HALF ) {
+			constexpr int KA = BITS_ - 8, bits2 = 2 * KA + 1, gspan = 18 + 3 * KA;
+			const int e7r = ( ( lane << 2 ) + 4 ) * bits2;
+			wrap7 = e7r - gspan < 0;
+			wrap3 = e7r - 2 * bits2 - gspan < 0;
+		}
+		else if constexpr ( BITS_ == 3 || BITS_ == 1 ) wrap_a = ( ( lane << 3 ) + 1 ) * BITS_ < 16;
+		else if constexpr ( BITS_ == 2 ) wrap_a = ( lane >> 1 ) == 0;
+		else wrap_a = lane == 0;
 	}
 
 	const uint32_t* bp = B32 + static_cast<size_t>( ks0 ) * slice_stride + ( group * WN + wn ) * GW + lane;
@@ -360,32 +377,65 @@ __device__ __forceinline__ void gemv_tile(
 			#pragma unroll
 			for ( int t = 0; t < WNT; ++t ) {
 				FragB f0, f1;
+				// Extended trellis: this tile's start word (all lanes read the same entry)
+				[[maybe_unused]] size_t tidx = 0;
+				[[maybe_unused]] bool hs = false;
+				[[maybe_unused]] uint32_t sw = 0;
+				if constexpr ( EXT ) {
+					tidx = static_cast<size_t>( ks0 + i ) * ntiles + ( group * WN + wn ) * WNT + t;
+					if ( tstart ) {
+						sw = tstart[tidx];
+						hs = true;
+					}
+				}
 				if constexpr ( HALF ) {
 					// one tile per warp load, the trailing lanes idle (28 or 20 words of 32)
 					#define XP( i ) ( ( x_pack >> ( 5 * ( i ) ) ) & 31u )   // 0: lo7, 1: hi7, 2: s7, 3: lo3, 4: hi3, 5: s3
-					const uint32_t a7 = __shfl_sync( 0xffffffffu, bw[t], XP( 0 ) );
+					uint32_t a7 = __shfl_sync( 0xffffffffu, bw[t], XP( 0 ) );
 					const uint32_t b7 = __shfl_sync( 0xffffffffu, bw[t], XP( 1 ) );
-					const uint32_t a3 = __shfl_sync( 0xffffffffu, bw[t], XP( 3 ) );
+					uint32_t a3 = __shfl_sync( 0xffffffffu, bw[t], XP( 3 ) );
 					const uint32_t b3 = __shfl_sync( 0xffffffffu, bw[t], XP( 4 ) );
+					if constexpr ( EXT ) {
+						if ( hs && wrap7 ) a7 = sw;
+						if ( hs && wrap3 ) a3 = sw;
+					}
 					exl3_gemv_ns::dq8_regs_half<BITS_ - 8, cb>( a7, b7, XP( 2 ), a3, b3, XP( 5 ), f0, f1 );
 					#undef XP
 				}
 				else if constexpr ( BITS_ == 3 || BITS_ == 1 ) {
-					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+					uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
 					const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
+					if constexpr ( EXT ) {
+						if ( hs && wrap_a ) awv = sw;
+					}
 					exl3_gemv_ns::dq8_regs_kbits<cb, BITS_>( awv, bwv, x_s2, f0, f1 );
 				}
 				else if constexpr ( BITS_ == 2 ) {
 					// tile t lives in lanes (t & 1) * 16 .. + 15 of load t / 2
 					const uint32_t w = bw[t >> 1];
 					const int base = ( t & 1 ) << 4;
-					const uint32_t awv = __shfl_sync( 0xffffffffu, w, base + x_src_a );
+					uint32_t awv = __shfl_sync( 0xffffffffu, w, base + x_src_a );
 					const uint32_t bwv = __shfl_sync( 0xffffffffu, w, base + x_src_b );
+					if constexpr ( EXT ) {
+						if ( hs && wrap_a ) awv = sw;
+					}
 					exl3_gemv_ns::dq8_regs_2bits<cb>( awv, bwv, lane << 3, f0, f1 );
 				}
 				else {
-					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+					uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+					if constexpr ( EXT ) {
+						if ( hs && wrap_a ) awv = sw;
+					}
 					exl3_gemv_ns::dq8_regs_4bits<cb>( awv, bw[t], f0, f1 );
+				}
+				if constexpr ( EXT ) {
+					if ( tgain ) {
+						const half2 g = tile_gain2( tgain[tidx] );
+						f0[0] = __hmul2( f0[0], g );
+						f0[1] = __hmul2( f0[1], g );
+						f1[0] = __hmul2( f1[0], g );
+						f1[1] = __hmul2( f1[1], g );
+					}
 				}
 #if EXL3_VOLTA_LAYOUT
 				// the lane's eight decoded values are its m8n8k4 B operands (f0 = k chunk 2 * (q >> 1), f1 the next one)
@@ -416,32 +466,65 @@ __device__ __forceinline__ void gemv_tile(
 			#pragma unroll
 			for ( int t = 0; t < WNT; ++t ) {
 				FragB f0, f1;
+				// Extended trellis: this tile's start word (all lanes read the same entry)
+				[[maybe_unused]] size_t tidx = 0;
+				[[maybe_unused]] bool hs = false;
+				[[maybe_unused]] uint32_t sw = 0;
+				if constexpr ( EXT ) {
+					tidx = static_cast<size_t>( ks0 + i ) * ntiles + ( group * WN + wn ) * WNT + t;
+					if ( tstart ) {
+						sw = tstart[tidx];
+						hs = true;
+					}
+				}
 				if constexpr ( HALF ) {
 					// one tile per warp load, the trailing lanes idle (28 or 20 words of 32)
 					#define XP( i ) ( ( x_pack >> ( 5 * ( i ) ) ) & 31u )   // 0: lo7, 1: hi7, 2: s7, 3: lo3, 4: hi3, 5: s3
-					const uint32_t a7 = __shfl_sync( 0xffffffffu, bw[t], XP( 0 ) );
+					uint32_t a7 = __shfl_sync( 0xffffffffu, bw[t], XP( 0 ) );
 					const uint32_t b7 = __shfl_sync( 0xffffffffu, bw[t], XP( 1 ) );
-					const uint32_t a3 = __shfl_sync( 0xffffffffu, bw[t], XP( 3 ) );
+					uint32_t a3 = __shfl_sync( 0xffffffffu, bw[t], XP( 3 ) );
 					const uint32_t b3 = __shfl_sync( 0xffffffffu, bw[t], XP( 4 ) );
+					if constexpr ( EXT ) {
+						if ( hs && wrap7 ) a7 = sw;
+						if ( hs && wrap3 ) a3 = sw;
+					}
 					exl3_gemv_ns::dq8_regs_half<BITS_ - 8, cb>( a7, b7, XP( 2 ), a3, b3, XP( 5 ), f0, f1 );
 					#undef XP
 				}
 				else if constexpr ( BITS_ == 3 || BITS_ == 1 ) {
-					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+					uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
 					const uint32_t bwv = __shfl_sync( 0xffffffffu, bw[t], x_src_b );
+					if constexpr ( EXT ) {
+						if ( hs && wrap_a ) awv = sw;
+					}
 					exl3_gemv_ns::dq8_regs_kbits<cb, BITS_>( awv, bwv, x_s2, f0, f1 );
 				}
 				else if constexpr ( BITS_ == 2 ) {
 					// tile t lives in lanes (t & 1) * 16 .. + 15 of load t / 2
 					const uint32_t w = bw[t >> 1];
 					const int base = ( t & 1 ) << 4;
-					const uint32_t awv = __shfl_sync( 0xffffffffu, w, base + x_src_a );
+					uint32_t awv = __shfl_sync( 0xffffffffu, w, base + x_src_a );
 					const uint32_t bwv = __shfl_sync( 0xffffffffu, w, base + x_src_b );
+					if constexpr ( EXT ) {
+						if ( hs && wrap_a ) awv = sw;
+					}
 					exl3_gemv_ns::dq8_regs_2bits<cb>( awv, bwv, lane << 3, f0, f1 );
 				}
 				else {
-					const uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+					uint32_t awv = __shfl_sync( 0xffffffffu, bw[t], x_src_a );
+					if constexpr ( EXT ) {
+						if ( hs && wrap_a ) awv = sw;
+					}
 					exl3_gemv_ns::dq8_regs_4bits<cb>( awv, bw[t], f0, f1 );
+				}
+				if constexpr ( EXT ) {
+					if ( tgain ) {
+						const half2 g = tile_gain2( tgain[tidx] );
+						f0[0] = __hmul2( f0[0], g );
+						f0[1] = __hmul2( f0[1], g );
+						f1[0] = __hmul2( f1[0], g );
+						f1[1] = __hmul2( f1[1], g );
+					}
 				}
 				exl3_gemv_ns::mma_ab_h( a01, a23, f0, ch[t][0] );
 				exl3_gemv_ns::mma_ab_h( a01, a23, f1, ch[t][1] );
@@ -974,25 +1057,27 @@ void rot_kernel( const MoeCoopParams p ) {
 // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (output rotation, svh, activation,
 // down-input rotation) by the last arrival per (slot, chunk)
 // gemv_tile at the width of the block's projection (BITS_ == 0 kernels: experts whose projections differ in width)
-template <int cb, int WN_>
+template <int cb, int WN_, bool EXT = false>
 __device__ __forceinline__ void gemv_tile_dyn(
 	int bits, const uint32_t* __restrict__ B32, const half2* __restrict__ A2, size_t a_stride2, const int* __restrict__ rows, int nrows,
-	float* __restrict__ C, size_t c_stride, int k_begin, int k_end, int ntiles, int group, float* __restrict__ sh_red
+	float* __restrict__ C, size_t c_stride, int k_begin, int k_end, int ntiles, int group, float* __restrict__ sh_red,
+	const uint16_t* __restrict__ tstart = nullptr, const uint8_t* __restrict__ tgain = nullptr
 ) {
 	switch ( bits ) {
-		case 1: gemv_tile<1, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
-		case 2: gemv_tile<2, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
-		case 3: gemv_tile<3, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
-		case 9: gemv_tile<9, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
-		case 10: gemv_tile<10, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
-		case 11: gemv_tile<11, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
-		default: gemv_tile<4, cb, WN_>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red ); break;
+		case 1: gemv_tile<1, cb, WN_, EXT>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red, tstart, tgain ); break;
+		case 2: gemv_tile<2, cb, WN_, EXT>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red, tstart, tgain ); break;
+		case 3: gemv_tile<3, cb, WN_, EXT>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red, tstart, tgain ); break;
+		case 9: gemv_tile<9, cb, WN_, EXT>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red, tstart, tgain ); break;
+		case 10: gemv_tile<10, cb, WN_, EXT>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red, tstart, tgain ); break;
+		case 11: gemv_tile<11, cb, WN_, EXT>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red, tstart, tgain ); break;
+		default: gemv_tile<4, cb, WN_, EXT>( B32, A2, a_stride2, rows, nrows, C, c_stride, k_begin, k_end, ntiles, group, sh_red, tstart, tgain ); break;
 	}
 }
 
-template <int BITS_, int cb, int WN_, int MODE>
+template <int BITS_, int cb, int WN_, int MODE, bool EXT = false>
 __global__ __launch_bounds__( THREADS )
 void a_kernel( const MoeCoopParams p ) {
+	static_assert( !EXT || MODE == 0, "the extended trellis decodes on the tensor-core tile" );
 	constexpr int TCOLS = tile_cols<WN_>();
 	constexpr int GPC = tile_gpc<WN_>();
 	constexpr int CPB = tile_cpb<WN_>();
@@ -1043,6 +1128,14 @@ void a_kernel( const MoeCoopParams p ) {
 
 	{
 		const uint32_t* B32 = reinterpret_cast<const uint32_t*>( ( is_gate ? p.g_trellis : p.u_trellis )[local] );
+		[[maybe_unused]] const uint16_t* ts = nullptr;
+		[[maybe_unused]] const uint8_t* tg = nullptr;
+		if constexpr ( EXT ) {
+			const uint16_t* const* tt = is_gate ? p.g_tstart : p.u_tstart;
+			const uint8_t* const* gt = is_gate ? p.g_tgain : p.u_tgain;
+			ts = tt ? tt[local] : nullptr;
+			tg = gt ? gt[local] : nullptr;
+		}
 		// Partial output rows of split ks live at slot + ks * slots
 		float* C = ( is_gate ? p.gu_g : p.gu_u ) + static_cast<size_t>( ks ) * ( p.bsz * p.topk ) * p.I;
 		// Tile mode: 0 tensor core, 1 int8 one row, 2 int8 any width, 3 int8 up to 4 rows and tensor core above
@@ -1055,10 +1148,10 @@ void a_kernel( const MoeCoopParams p ) {
 			}
 		}
 		if constexpr ( BITS_ == 0 ) {
-			gemv_tile_dyn<cb, WN_>( p.bits_tab ? static_cast<int>( p.bits_tab[( is_gate ? 0 : p.num_local ) + local] ) : ( is_gate ? p.bits_g : p.bits_u ), B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red );
+			gemv_tile_dyn<cb, WN_, EXT>( p.bits_tab ? static_cast<int>( p.bits_tab[( is_gate ? 0 : p.num_local ) + local] ) : ( is_gate ? p.bits_g : p.bits_u ), B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red, ts, tg );
 		}
 		else if constexpr ( MODE == 0 || MODE == 3 ) {
-			if ( !done ) gemv_tile<BITS_, cb, WN_>( B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red );
+			if ( !done ) gemv_tile<BITS_, cb, WN_, EXT>( B32, A2, a_stride2, sh_rows, nrows, C, p.I, k_begin, k_end, p.I / 16, group, sh_red, ts, tg );
 		}
 	}
 
@@ -1107,9 +1200,10 @@ void a_kernel( const MoeCoopParams p ) {
 
 // Kernel B: down GEMV per (expert run, group); the last arrival of a (token, chunk) reduces the token's slots (rotation, svh,
 // routing weight) in a fixed order and stores the row
-template <int BITS_, int cb, int WN_, int MODE>
+template <int BITS_, int cb, int WN_, int MODE, bool EXT = false>
 __global__ __launch_bounds__( THREADS )
 void b_kernel( const MoeCoopParams p ) {
+	static_assert( !EXT || MODE == 0, "the extended trellis decodes on the tensor-core tile" );
 	constexpr int TCOLS = tile_cols<WN_>();
 	constexpr int GPC = tile_gpc<WN_>();
 	constexpr int CPB = tile_cpb<WN_>();
@@ -1136,6 +1230,12 @@ void b_kernel( const MoeCoopParams p ) {
 
 	{
 		const uint32_t* B32 = reinterpret_cast<const uint32_t*>( p.d_trellis[local] );
+		[[maybe_unused]] const uint16_t* ts = nullptr;
+		[[maybe_unused]] const uint8_t* tg = nullptr;
+		if constexpr ( EXT ) {
+			ts = p.d_tstart ? p.d_tstart[local] : nullptr;
+			tg = p.d_tgain ? p.d_tgain[local] : nullptr;
+		}
 		bool done = false;
 		if constexpr ( MODE > 0 && BITS_ != 0 ) {
 			if ( MODE != 3 || nrows <= 4 ) {
@@ -1146,12 +1246,12 @@ void b_kernel( const MoeCoopParams p ) {
 			}
 		}
 		if constexpr ( BITS_ == 0 ) {
-			gemv_tile_dyn<cb, WN_>( p.bits_tab ? static_cast<int>( p.bits_tab[2 * p.num_local + local] ) : p.bits_d, B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
-				0, p.I / 16, p.H / 16, group, sh_red );
+			gemv_tile_dyn<cb, WN_, EXT>( p.bits_tab ? static_cast<int>( p.bits_tab[2 * p.num_local + local] ) : p.bits_d, B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
+				0, p.I / 16, p.H / 16, group, sh_red, ts, tg );
 		}
 		else if constexpr ( MODE == 0 || MODE == 3 ) {
-			if ( !done ) gemv_tile<BITS_, cb, WN_>( B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
-				0, p.I / 16, p.H / 16, group, sh_red );
+			if ( !done ) gemv_tile<BITS_, cb, WN_, EXT>( B32, reinterpret_cast<const half2*>( p.act_out ), static_cast<size_t>( p.I ) / 2, sh_rows, nrows, p.d_out, p.H,
+				0, p.I / 16, p.H / 16, group, sh_red, ts, tg );
 		}
 	}
 
@@ -1215,16 +1315,16 @@ constexpr int LAUNCH_WN = 4;   // warps along n of both stages (other widths, 8 
 
 // The gate / up and down launches of width code B (0: a width per expert from the table) and tile mode M, the kernels' shared-memory
 // opt-in once per device
-template <int B, int M>
+template <int B, int M, bool EXT = false>
 void launch_ab( const MoeCoopParams& p, int grid_a, int grid_b, int smem_a, int smem_b, int device, cudaStream_t stream ) {
 	static bool optin[ENGINE_NUM_GPUS] = {};
 	if ( device >= 0 && device < ENGINE_NUM_GPUS && !optin[device] ) {
-		coop_smem_optin( (void*) a_kernel<B, 2, LAUNCH_WN, M> );
-		coop_smem_optin( (void*) b_kernel<B, 2, LAUNCH_WN, M> );
+		coop_smem_optin( (void*) a_kernel<B, 2, LAUNCH_WN, M, EXT> );
+		coop_smem_optin( (void*) b_kernel<B, 2, LAUNCH_WN, M, EXT> );
 		optin[device] = true;
 	}
-	a_kernel<B, 2, LAUNCH_WN, M><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
-	b_kernel<B, 2, LAUNCH_WN, M><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
+	a_kernel<B, 2, LAUNCH_WN, M, EXT><<<dim3( grid_a ), dim3( THREADS ), smem_a, stream>>>( p );
+	b_kernel<B, 2, LAUNCH_WN, M, EXT><<<dim3( grid_b ), dim3( THREADS ), smem_b, stream>>>( p );
 	CUDA_CHECK( cudaGetLastError() );
 }
 
@@ -1284,7 +1384,9 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 	// a forward at 1-2 local routes, 272 -> 142 at 3; 6 rows 0.66 -> 0.41 ms a layer; Flash-Next's 4 bpw at 1-4 routes 55 -> 35 us), the
 	// Volta order at 3 bits only (its 4 bpw tensor-core tile is level with the int8 one to 4 routes and ahead above)
 	const bool i8_tile = p.bits == 3 || !EXL3_VOLTA_LAYOUT;
-	const int mode = mixed ? 0 : forced >= 0 ? forced : !i8_tile ? 0 : p.bsz == 1 ? 1 : ( EXL3_VOLTA_LAYOUT && p.bsz >= 3 ) ? 0 : 3;
+	// The extended trellis (tile starts / gains) decodes on the tensor-core tile only
+	const bool ext = p.extended();
+	const int mode = mixed || ext ? 0 : forced >= 0 ? forced : !i8_tile ? 0 : p.bsz == 1 ? 1 : ( EXL3_VOLTA_LAYOUT && p.bsz >= 3 ) ? 0 : 3;
 	// int8 activation staging: 2 x 16 B per k-tile per k-slab and row (stage_rows), or splatted words (4x) for runs of up to 2 rows in
 	// the Volta tile order when that fits the opt-in limit (GLM's hidden 4096; DeepSeek-V4.1's 5120 keeps the bytes)
 	constexpr int wkk = WK / WN;
@@ -1314,9 +1416,17 @@ void exl3_moe_coop_launch( const MoeCoopParams& p_in, int device, cudaStream_t s
 		rot_kernel<<<dim3( MAX( 1, CEIL_DIVIDE( rot_warps, THREADS / 32 ) ) ), dim3( THREADS ), 0, stream>>>( p );
 	}
 	using exl3_moe_coop_ns::launch_ab;
-	if ( mixed ) { launch_ab<0, 0>( p, grid_a, grid_b, smem_a, smem_b, device, stream ); return; }
+	if ( mixed ) {
+		if ( ext ) launch_ab<0, 0, true>( p, grid_a, grid_b, smem_a, smem_b, device, stream );
+		else launch_ab<0, 0>( p, grid_a, grid_b, smem_a, smem_b, device, stream );
+		return;
+	}
 	auto by_mode = [&]( auto bits_c ) {
 		constexpr int B = decltype( bits_c )::value;
+		if ( ext ) {
+			launch_ab<B, 0, true>( p, grid_a, grid_b, smem_a, smem_b, device, stream );
+			return;
+		}
 		switch ( mode ) {
 			case 1: launch_ab<B, 1>( p, grid_a, grid_b, smem_a, smem_b, device, stream ); break;
 			case 2:   // int8 at any run width: an A/B mode of the 3-bit tile

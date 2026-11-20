@@ -144,6 +144,9 @@ void MoERouter::exl3_moe_dispatch( const int* selected_experts, const backend::h
 
 // Pointer tables are a CUDA-side convenience (device array of per-expert pointers); the CPU path reads LinearWeight directly
 void MoE::init_device_ptrs( pod::MoELayerWeights& weights, pod::MemoryArena&, backend::stream_t ) {
+	for ( int e = 0; e < weights.num_local_experts; ++e ) {
+		ENGINE_ASSERT( !weights.gate[e].extended() && !weights.up[e].extended() && !weights.down[e].extended(), "MoE (CPU): the extended trellis (tile starts / gains) runs on CUDA only" );
+	}
 	weights.device_ptrs = nullptr;
 }
 

@@ -716,6 +716,25 @@ void MoE::init_device_ptrs(
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		}
 		weights.device_ptrs = d_ptrs;
+		bool extended = false;
+		for ( int e = 0; e < E; ++e ) extended = extended || weights.gate[e].extended() || weights.up[e].extended() || weights.down[e].extended();
+		if ( extended ) {
+			// The tile companions sit in a table of their own: the expert tier copies and rewrites only the code rows above, the companions never move
+			std::vector<const void*> h_ext( 6 * E );
+			for ( int e = 0; e < E; ++e ) {
+				const pod::LinearWeight* lw[3] = { &weights.gate[e], &weights.up[e], &weights.down[e] };
+				for ( int q = 0; q < 3; ++q ) {
+					h_ext[q * E + e] = lw[q]->w3.data;
+					h_ext[( 3 + q ) * E + e] = lw[q]->w4.data;
+				}
+			}
+			void* d_ext = engine::core::arena_alloc( arena, 6 * E * sizeof( const void* ) );
+			CUDA_CHECK( cudaMemcpyAsync( d_ext, h_ext.data(), 6 * E * sizeof( const void* ), cudaMemcpyHostToDevice, stream ) );
+			if ( stream ) {
+				CUDA_CHECK( cudaStreamSynchronize( stream ) );
+			}
+			weights.ext_ptrs = d_ext;
+		}
 
 		// Experts whose widths differ within the layer: a per-expert width table for the kernels, the widest tile named in bits_max.
 		// (DeepSeek-V4.1's merged layers build their own after this call; the 2.60 bpw GLM is uniform per layer, 2.5, 3.5 or 4 bpw.)
@@ -948,6 +967,15 @@ void MoE::forward(
 		p.d_trellis = reinterpret_cast<const uint16_t* const*>( d_ptrs + 6 * E );
 		p.d_suh = reinterpret_cast<const half* const*>( d_ptrs + 7 * E );
 		p.d_svh = reinterpret_cast<const half* const*>( d_ptrs + 8 * E );
+		if ( weights.ext_ptrs != nullptr ) {
+			const void** x_ptrs = static_cast<const void**>( weights.ext_ptrs );
+			p.g_tstart = reinterpret_cast<const uint16_t* const*>( x_ptrs + 0 * E );
+			p.u_tstart = reinterpret_cast<const uint16_t* const*>( x_ptrs + 1 * E );
+			p.d_tstart = reinterpret_cast<const uint16_t* const*>( x_ptrs + 2 * E );
+			p.g_tgain = reinterpret_cast<const uint8_t* const*>( x_ptrs + 3 * E );
+			p.u_tgain = reinterpret_cast<const uint8_t* const*>( x_ptrs + 4 * E );
+			p.d_tgain = reinterpret_cast<const uint8_t* const*>( x_ptrs + 5 * E );
+		}
 		p.had_g = scratch.coop_had_g;
 		p.had_u = scratch.coop_had_u;
 		p.gu_g = scratch.coop_gu_g;
@@ -961,6 +989,7 @@ void MoE::forward(
 		CUDA_CHECK( cudaGetDevice( &device ) );
 		CUDA_CHECK( cudaMemsetAsync( p.out, 0, static_cast<size_t>( rows ) * p.H * sizeof( half ), stream ) );
 #if defined(USE_ROCM)
+		ENGINE_ASSERT( weights.ext_ptrs == nullptr, "MoE::forward (ROCm): the extended trellis (tile starts / gains) runs on the CUDA coop kernels only" );
 		// Prefill chunks: the routes grouped by expert (the planes buffer, unused here, is its workspace); else blocks of MOE_COOP_MAX_ROWS rows
 		// (the scratch holds that many slots)
 		p.grp_ws = scratch.planes;
@@ -1003,7 +1032,8 @@ void MoE::forward(
 			const int H = x.shape[x.ndim - 1], Iw = weights.up[0].w2.shape[0];
 			const int routes = rows * weights.top_k;
 			const HeavyBufs hb = scratch.heavy_ws != nullptr ? heavy_bufs( scratch, E, H, Iw ) : HeavyBufs{};
-			const bool plan = scratch.heavy_ws != nullptr && heavy_min > 0 && rows >= heavy_min && routes <= scratch.heavy_routes && hb.piece >= 64;
+			// (the heavy experts' dequantization reads plain trellises: extended experts stay in the quantized kernel)
+			const bool plan = scratch.heavy_ws != nullptr && heavy_min > 0 && rows >= heavy_min && routes <= scratch.heavy_routes && hb.piece >= 64 && weights.ext_ptrs == nullptr;
 			auto dispatch = [&]( const int* sel, uint32_t* heat ) {
 				MoERouter::exl3_moe_dispatch( sel, d_topk_weights, scratch.expert_count, scratch.token_sorted, scratch.weight_sorted, scratch.cursors, E,
 					start_expert, end_expert, scratch.active_experts, stream, rows, wide == 3 ? 32 : wide == 2 ? 16 : 4, heat, weights.top_k );
@@ -1079,7 +1109,8 @@ void MoE::forward(
 				E,
 				stream,
 				weights.top_k,
-				weights.bits_dev, weights.bits_half
+				weights.bits_dev, weights.bits_half,
+				static_cast<const void* const*>( weights.ext_ptrs )
 			);
 			if ( num_groups > 1 ) {
 				if ( plane_elems % 8 == 0 && num_groups <= MOE_MAX_GROUPS ) {

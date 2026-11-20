@@ -10,7 +10,7 @@
 //                  [--plan] [--no-scaled-hessian] [--affinity-eps E] [--ldl-metric] [--open-trellis] [--tile-gain] [--no-assemble]
 //
 // --open-trellis stores each tile's start state (<base>.tstart) instead of wrapping its stream, --tile-gain an 8-bit gain per tile (<base>.tgain):
-// the extended trellis, which the reconstruct path and the tools decode; until the inference paths do, only with --no-assemble
+// the extended trellis, for the routed experts only (the engine's MoE kernels decode it; every other tensor stays plain)
 //
 // --affinity-eps weights each routed expert's Hessians by routing (exllamav3 1.6.7's --moe_affinity_eps, see quant/expert_hessian.h): its gate
 // and up projections get their own input Hessian from the route dump's rows routed to it, so they are quantized expert by expert; needs the
@@ -204,6 +204,9 @@ struct Shared {
 
 std::string partial_path( const Args& a, const std::string& base ) { return a.out + "/.partial/" + base + ".safetensors"; }
 
+// A routed expert's projection (".experts.<e>." in its name; a shared expert's is ".shared_expert." or ".shared_experts.")
+bool routed_expert( const std::string& base ) { return base.find( ".experts." ) != std::string::npos; }
+
 bool write_partial( const Args& a, const q::PlanTensor& t, const Exl3Tensor& r ) {
 	char err[32];
 	std::snprintf( err, sizeof( err ), "%.8g", r.proxy_err );
@@ -325,6 +328,7 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 		Exl3QuantOptions o = base_opts;
 		o.code = first.code;
 		o.cb = first.cb;
+		if ( !routed_expert( first.base ) ) o.open_trellis = o.tile_gain = false;   // the extended trellis decodes in the MoE kernels only
 		std::vector<std::pair<int, Exl3Tensor>> done;
 		bool ok = true;
 
@@ -563,9 +567,42 @@ bool assemble( const Args& a, const std::vector<q::PlanTensor>& plan, std::vecto
 			o.view = use->data;
 			o.view_bytes = use->bytes;
 			outs.push_back( std::move( o ) );
+			// An extended trellis' tile companions follow its trellis
+			if ( suf == "trellis" && quantized.count( base ) && parts[base] ) {
+				for ( const char* c : { ".tstart", ".tgain" } ) {
+					const q::StEntry* ce = parts[base]->find( base + c );
+					if ( !ce ) continue;
+					q::StOut oc;
+					oc.name = base + c;
+					oc.dtype = ce->dtype;
+					oc.shape = ce->shape;
+					oc.view = ce->data;
+					oc.view_bytes = ce->bytes;
+					outs.push_back( std::move( oc ) );
+				}
+			}
 		}
 		if ( !q::st_write( to, outs, tf.metadata() ) ) return false;
 		LOG_INFO( "[volta_quantize] wrote %s", fn.c_str() );
+	}
+	// The index names every tensor of the shards it lists (the tile companions are not in the template's); files it does not list (a vision
+	// tower's own file, the n-gram table) stay out of it
+	if ( exists( a.out + "/model.safetensors.index.json" ) ) {
+		auto idx = nlohmann::json::parse( read_text( a.out + "/model.safetensors.index.json" ), nullptr, false );
+		if ( !idx.is_discarded() && idx.contains( "weight_map" ) ) {
+			std::set<std::string> listed;
+			for ( auto it = idx["weight_map"].begin(); it != idx["weight_map"].end(); ++it ) if ( it.value().is_string() ) listed.insert( it.value().get<std::string>() );
+			nlohmann::json wm = nlohmann::json::object();
+			for ( const auto& fn : files ) {
+				if ( !listed.count( fn ) ) continue;
+				q::StFile of;
+				if ( !of.open( a.out + "/" + fn ) ) return false;
+				for ( const auto& name : of.names() ) wm[name] = fn;
+			}
+			for ( auto it = idx["weight_map"].begin(); it != idx["weight_map"].end(); ++it ) if ( !wm.contains( it.key() ) ) wm[it.key()] = it.value();
+			idx["weight_map"] = wm;
+			std::ofstream( a.out + "/model.safetensors.index.json" ) << idx.dump( 2 ) << "\n";
+		}
 	}
 	// A template without a quantization_config.json (the GLM drafter): a minimal one
 	if ( !exists( a.tmpl + "/quantization_config.json" ) ) std::ofstream( a.out + "/quantization_config.json" ) << layout_config( a, "", stock_kept ) << "\n";
@@ -594,10 +631,6 @@ int main( int argc, char** argv ) {
 	opts.ldl_metric = a.ldl_metric;
 	opts.open_trellis = a.open_trellis;
 	opts.tile_gain = a.tile_gain;
-	if ( ( a.open_trellis || a.tile_gain ) && a.assemble ) {
-		LOG_ERROR( "[volta_quantize] the engine's inference paths do not read tile starts / gains yet: --open-trellis / --tile-gain need --no-assemble" );
-		return 2;
-	}
 	const std::string os = qcfg.is_discarded() ? "auto" : qcfg.value( "out_scales", "auto" );
 	opts.out_scales = os == "always" ? 1 : os == "never" ? 0 : -1;
 	// Tile orders: a stock output from a Volta template cannot mark what stays in the Volta order, and --only with an order other than the template's

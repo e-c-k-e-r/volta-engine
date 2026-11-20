@@ -66,6 +66,8 @@ public:
 	void close();
 
 	const pod::SafeTensorMeta* find( const char* name, int* out_shard_idx = nullptr ) const;
+	// An extended trellis (tile starts / gains beside the codes) loads only whole (load_linear): a slicing reader stops on one
+	void refuse_companions( const char* base_name, const char* reader ) const;
 
 	pod::TensorView load(
 		const char* name,

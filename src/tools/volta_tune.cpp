@@ -11,7 +11,8 @@
 // model, so its rows carry the error of every layer before; all of a layer's experts are tuned together so that the quantized routed MoE
 // output on those rows (the quantized model's routing) matches the original's on the reference rows of --route (the reference routing), in
 // batches of --batch tokens, every tenth token held out for the step choice; --eval-ref / --eval-q, a reference and a quantized dump of
-// held-out text, report the block error there before and after. One layer per device.
+// held-out text, report the block error there before and after. Each error comes with its floor: the original experts on the quantized
+// model's rows against the same targets (the error of the layers before, not this layer's). One layer per device.
 #include "engine/config.h"
 #include "engine/core/log.h"
 #include "engine/train/grad.h"
@@ -637,6 +638,22 @@ bool block_layer( const Args& a, const q::Model& model, int layer, int device, s
 	}
 	const double val0 = set_error( Xq, dq, val, Yref.p );
 	const double ev0 = eval ? set_error( Xe, eq, all_eval, Yeval.p ) : 0.0;
+	// The floor: the original experts on the quantized model's rows (its upstream error and its routing) against the same targets, the part
+	// of the error that is not this layer's quantization
+	double floor_val = 0.0, floor_ev = 0.0;
+	{
+		Buf Yf, Wv;
+		if ( !reference_outputs( blas, src, dq, prefixes, H, I, limit, Yf.fit( static_cast<size_t>( dq.rows ) * H ), st ) ) return false;
+		std::vector<float> wv( static_cast<size_t>( dq.rows ), 0.0f );
+		for ( int r : val ) wv[r] = 1.0f;
+		const float* wp = Wv.upload( wv, st );
+		floor_val = tr::weighted_sq_error( Yf.p, Yref.p, wp, static_cast<int>( dq.rows ), H, nullptr, 0.0f, st ) / tr::weighted_sq_norm( Yref.p, wp, static_cast<int>( dq.rows ), H, st );
+		if ( eval ) {
+			if ( !reference_outputs( blas, src, eq, prefixes, H, I, limit, Yf.fit( static_cast<size_t>( eq.rows ) * H ), st ) ) return false;
+			floor_ev = tr::weighted_sq_error( Yf.p, Yeval.p, nullptr, static_cast<int>( eq.rows ), H, nullptr, 0.0f, st ) /
+				tr::weighted_sq_norm( Yeval.p, nullptr, static_cast<int>( eq.rows ), H, st );
+		}
+	}
 	std::mt19937 rng( 1234 + layer );
 	std::shuffle( train.begin(), train.end(), rng );
 	tr::AdamOptions o;
@@ -713,9 +730,10 @@ bool block_layer( const Args& a, const q::Model& model, int layer, int device, s
 	CUDA_CHECK( cudaStreamDestroy( st ) );
 	const double secs = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
 	std::lock_guard<std::mutex> lock( log_mu );
-	LOG_INFO( "[volta_tune] GPU %d: layer %d block, %lld rows (%zu held out), %d steps of %d: train %.5f, held-out rows %.5f -> %.5f (step %d, %s)%s, %.1f min",
-		device, layer, static_cast<long long>( dq.rows ), val.size(), a.steps, B, train_err, val0, gain ? val1 : val0, best_step, gain ? "tuned" : "unchanged",
-		eval ? ( " | held-out text " + std::to_string( ev0 ) + " -> " + std::to_string( gain ? ev1 : ev0 ) ).c_str() : "", secs / 60.0 );
+	LOG_INFO( "[volta_tune] GPU %d: layer %d block, %lld rows (%zu held out), %d steps of %d: train %.5f, held-out rows %.5f -> %.5f (step %d, %s; floor %.5f)%s, %.1f min",
+		device, layer, static_cast<long long>( dq.rows ), val.size(), a.steps, B, train_err, val0, gain ? val1 : val0, best_step, gain ? "tuned" : "unchanged", floor_val,
+		eval ? ( " | held-out text " + std::to_string( ev0 ) + " -> " + std::to_string( gain ? ev1 : ev0 ) + " (floor " + std::to_string( floor_ev ) + ")" ).c_str() : "",
+		secs / 60.0 );
 	return ok;
 }
 

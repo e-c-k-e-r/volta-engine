@@ -65,6 +65,10 @@ struct MoeCoopParams {
 	// ROCm expert-grouped prefill (exl3_moe.cu): memory for its per-wave buffers
 	void* grp_ws;
 	size_t grp_ws_bytes;
+	// The extended trellis, per local expert: tile start states and gain codes (null tables: plain trellises; a null entry: that expert has none)
+	const uint16_t* const* g_tstart = nullptr; const uint16_t* const* u_tstart = nullptr; const uint16_t* const* d_tstart = nullptr;
+	const uint8_t* const* g_tgain = nullptr; const uint8_t* const* u_tgain = nullptr; const uint8_t* const* d_tgain = nullptr;
+	bool extended() const { return g_tstart || u_tstart || d_tstart || g_tgain || u_tgain || d_tgain; }
 };
 
 inline int moe_coop_ctr_len( int H, int I ) {

@@ -1315,7 +1315,25 @@ pod::LinearWeight SafeTensorsRepo::load_linear(
 	const bool has_mcg = ( find( name_buf, &dummy_shard ) != nullptr );
 
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : bits;
-	return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ), base_name );
+	pod::LinearWeight lw = tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ), base_name );
+	// The extended trellis' tile companions, when the tensor has them (whole tensors only: see refuse_companions)
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.tstart", base_name );
+	if ( find( name_buf, &dummy_shard ) != nullptr ) lw.w3 = load( name_buf, arena, stream );
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.tgain", base_name );
+	if ( find( name_buf, &dummy_shard ) != nullptr ) lw.w4 = load( name_buf, arena, stream );
+	return lw;
+}
+
+void SafeTensorsRepo::refuse_companions( const char* base_name, const char* reader ) const {
+	char name_buf[512];
+	int shard = -1;
+	for ( const char* ext : { ".tstart", ".tgain" } ) {
+		std::snprintf( name_buf, sizeof( name_buf ), "%s%s", base_name, ext );
+		if ( find( name_buf, &shard ) != nullptr ) {
+			LOG_ERROR( "%s: '%s' is an extended trellis (tile starts / gains), which only load_linear reads (whole tensors)\n", reader, base_name );
+			ENGINE_ASSERT( false, "an extended trellis needs a whole-tensor load" );
+		}
+	}
 }
 
 pod::LinearWeight SafeTensorsRepo::load_linear_slice(
@@ -1328,6 +1346,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 	backend::stream_t stream,
 	pod::MemoryArena* code_arena
 ) {
+	refuse_companions( base_name, "load_linear_slice" );
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
 	if ( find( name_buf ) == nullptr && tp_size > 1 ) {
@@ -1397,6 +1416,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_range(
 	backend::stream_t stream,
 	pod::MemoryArena* code_arena
 ) {
+	refuse_companions( base_name, "load_linear_range" );
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
 	int shard = -1;
@@ -1470,6 +1490,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_padded(
 	int pad_cols,
 	backend::stream_t stream
 ) {
+	refuse_companions( base_name, "load_linear_slice_padded" );
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
 	int gguf_shard = -1;
@@ -1496,6 +1517,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_cols_padded(
 	int pad_cols,
 	backend::stream_t stream
 ) {
+	refuse_companions( base_name, "load_linear_cols_padded" );
 	char name_buf[512];
 	int shard = -1;
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
@@ -1580,6 +1602,8 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_fused(
 	int tp_size,
 	backend::stream_t stream
 ) {
+	refuse_companions( base_name_a, "load_linear_slice_fused" );
+	refuse_companions( base_name_b, "load_linear_slice_fused" );
 	char name_buf_a[512];
 	char name_buf_b[512];
 	std::snprintf( name_buf_a, sizeof( name_buf_a ), "%s.trellis", base_name_a );
@@ -1682,6 +1706,7 @@ pod::LinearWeight SafeTensorsRepo::load_grouped_trellis_slice(
 	int rank,
 	backend::stream_t stream
 ) {
+	refuse_companions( base_name, "load_grouped_trellis_slice" );
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
 	int gguf_shard = -1;

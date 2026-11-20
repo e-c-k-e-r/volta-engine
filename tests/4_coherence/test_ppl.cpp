@@ -4,7 +4,8 @@
 //   test_ppl --calibrate --file TEXT --seq 2048 --tokens N   cuts the text into independent rows of 2048 tokens (the slot restarts at each), as calibration rows are
 //   test_ppl --calibrate --prompts DIR [--tokens N] [--chunk C]   replays the rendered prompts a server wrote with dump_requests (req_N.prompt.txt, chat-template tokens
 //   intact): only the last request of each session is used, and the rows it shares with an earlier session (the system prompt and tool schemas) run without
-//   adding to the Hessians, so every distinct token counts once; --tokens stops after N counted rows
+//   adding to the Hessians, so every distinct token counts once; --tokens stops after N counted rows; --stride K counts every K-th chunk past that prefix
+//   (the others run without adding), spreading a token budget over long sessions instead of spending it on the first ones
 //   test_ppl --prompts DIR [--select hold|train] [--sessions N]   without --calibrate: perplexity of the assistant turns of the sessions (prefix rows run without logits; chat models are
 //   not trained on system and user text, whose loss is meaningless, so only the tokens between <|im_start|>assistant and <|im_end|> after the shared prefix are scored); --select hold takes every 10th session in name order, train the rest
 //   test_ppl --flash --qbench qbench_prompts.md [--chunk C]   scores only the response tokens of each traced row (input as context), the
@@ -31,7 +32,7 @@ int main( int argc, char** argv ) {
 	bool glm = false, flash = false, calibrate = false;
 	int n_tokens = 6000, chunk = 512;
 	std::string file, nll_out, qbench, prompts_dir;
-	int seq = 0, max_sessions = 0, skip_override = 0, show_miss = 0;
+	int seq = 0, max_sessions = 0, skip_override = 0, show_miss = 0, stride = 1;
 	std::string select;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
@@ -48,6 +49,7 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--show-miss" ) && i + 1 < argc ) show_miss = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--skip" ) && i + 1 < argc ) skip_override = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--sessions" ) && i + 1 < argc ) max_sessions = std::atoi( argv[++i] );
+		else if ( !std::strcmp( argv[i], "--stride" ) && i + 1 < argc ) stride = std::max( 1, std::atoi( argv[++i] ) );
 	}
 	// --calibrate with ENGINE_CALIB_MTP set (Flash-Next): the MTP head runs after every forward on the same rows (hidden stack of position p with the token
 	// of p + 1), so ENGINE_HESSIAN_DIR also collects the head's sites (layers 48 and 49 of the file names); the head keeps its own KV like in serving
@@ -212,10 +214,12 @@ int main( int argc, char** argv ) {
 					if ( snap_at < 1024 ) snap_at = 0;
 				}
 			}
+			int chunk_i = 0;   // chunks past the shared prefix, for --stride
 			for ( size_t off = start; off < ids.size(); ) {
-				const bool counting = off >= shared;
+				bool counting = off >= shared;
+				if ( counting && stride > 1 ) counting = chunk_i++ % stride == 0;
 				size_t end = std::min( ids.size(), off + static_cast<size_t>( chunk ) );
-				if ( !counting && end > shared ) end = shared;
+				if ( off < shared && end > shared ) end = shared;
 				if ( snap_at && off < snap_at && end > snap_at ) end = snap_at;
 				const int count = static_cast<int>( end - off );
 				mc.set_hessian_capture( counting );

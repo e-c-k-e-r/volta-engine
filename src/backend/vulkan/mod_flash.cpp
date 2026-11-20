@@ -167,6 +167,9 @@ void MoERouter::route_softmax_topk( const pod::TensorView& x, const pod::TensorV
 
 // Pointer tables are a CUDA-side convenience; the Vulkan path reads the LinearWeight array directly
 void MoE::init_device_ptrs( pod::MoELayerWeights& weights, pod::MemoryArena&, backend::stream_t ) {
+	for ( int e = 0; e < weights.num_local_experts; ++e ) {
+		ENGINE_ASSERT( !weights.gate[e].extended() && !weights.up[e].extended() && !weights.down[e].extended(), "MoE (Vulkan): the extended trellis (tile starts / gains) runs on CUDA only" );
+	}
 	weights.device_ptrs = nullptr;
 }
 

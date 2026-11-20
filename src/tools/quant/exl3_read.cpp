@@ -10,10 +10,44 @@
 #include <cuda_fp16.h>
 #include <cstring>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
 namespace engine::tools::quant {
+
+namespace {
+
+// A directory's tile order from its quantization_config.json (tens of MB for a whole model: read once per directory, not per tensor)
+struct Layout {
+	bool present = false, volta = false;
+	std::vector<std::string> stock;   // tile_layout_stock: name parts kept in the stock order
+};
+
+const Layout& dir_layout( const std::string& dir ) {
+	static std::mutex mu;
+	static std::map<std::string, Layout> cache;
+	std::lock_guard<std::mutex> lock( mu );
+	const auto it = cache.find( dir );
+	if ( it != cache.end() ) return it->second;
+	Layout& l = cache[dir];
+	std::ifstream f( dir + "/quantization_config.json" );
+	if ( !f ) return l;
+	l.present = true;
+	std::stringstream ss;
+	ss << f.rdbuf();
+	const auto j = nlohmann::json::parse( ss.str(), nullptr, false );
+	if ( !j.is_discarded() && j.value( "tile_layout", "" ) == "volta" ) {
+		l.volta = true;
+		if ( j.contains( "tile_layout_stock" ) ) {
+			for ( const auto& x : j["tile_layout_stock"] ) if ( x.is_string() ) l.stock.push_back( x.get<std::string>() );
+		}
+	}
+	return l;
+}
+
+} // namespace
 
 bool exl3_read( StRepo& repo, const std::string& base, Exl3Read& out ) {
 	auto& t = out.t;
@@ -35,8 +69,8 @@ bool exl3_read( StRepo& repo, const std::string& base, Exl3Read& out ) {
 	}
 	if ( const auto* e = repo.find( base + ".tgain" ) ) t.gains.assign( e->data, e->data + e->bytes );
 	out.volta = false;
-	std::ifstream f( repo.dir() + "/quantization_config.json" );
-	if ( !f ) {
+	const Layout& lay_dir = dir_layout( repo.dir() );
+	if ( !lay_dir.present ) {
 		const auto it = repo.weight_map().find( base + ".trellis" );
 		const auto* file = it == repo.weight_map().end() ? nullptr : repo.shard( it->second );
 		if ( file ) {
@@ -47,16 +81,9 @@ bool exl3_read( StRepo& repo, const std::string& base, Exl3Read& out ) {
 		}
 		return true;
 	}
-	std::stringstream ss;
-	ss << f.rdbuf();
-	const auto j = nlohmann::json::parse( ss.str(), nullptr, false );
-	if ( !j.is_discarded() && j.value( "tile_layout", "" ) == "volta" ) {
+	if ( lay_dir.volta ) {
 		out.volta = true;
-		if ( j.contains( "tile_layout_stock" ) ) {
-			for ( const auto& s : j["tile_layout_stock"] ) {
-				if ( s.is_string() && base.find( s.get<std::string>() ) != std::string::npos ) out.volta = false;
-			}
-		}
+		for ( const auto& part : lay_dir.stock ) if ( base.find( part ) != std::string::npos ) out.volta = false;
 	}
 	return true;
 }

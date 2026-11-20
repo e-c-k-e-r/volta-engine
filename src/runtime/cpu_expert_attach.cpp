@@ -102,6 +102,7 @@ std::unique_ptr<Linear> make_linear( const pod::LinearWeight& lw, Service& svc )
 	}
 	ENGINE_ASSERT( lw.type == pod::QuantType::TRELLIS && lw.mul1 && kernels::cpu::TrellisLinear::supported( lw.bits ), "cpu_experts: experts must be NVFP4 or mul1 trellis" );
 	ENGINE_ASSERT( !lw.volta_tiles, "cpu_experts: the CPU expert kernel reads the stock EXL3 tile order, not the Volta one (tile_layout volta): use cpu_experts=0 or a stock-order checkpoint" );
+	ENGINE_ASSERT( !lw.extended(), "cpu_experts: the CPU expert kernel does not decode an extended trellis (tile starts / gains): use cpu_experts=0" );
 	const int kt = lw.w0.shape[0], nt = lw.w0.shape[1], bits = lw.bits;
 	std::vector<uint16_t> suh( static_cast<size_t>( kt ) * 16 ), svh( static_cast<size_t>( nt ) * 16 );
 	backend::memcpy_sync( suh.data(), lw.w1.data, suh.size() * 2, backend::Copy::D2H );

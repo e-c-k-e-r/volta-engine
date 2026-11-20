@@ -24,6 +24,17 @@
 #define EXL3_GEMM_BASE_THREADS 256
 #endif
 
+// The tile companions of extended trellis experts: per projection a table of num_experts pointers (MoELayerWeights::ext_ptrs), null entries
+// for plain experts; the plain kernels take the struct and leave it unread
+struct MoeExtTables {
+	const uint16_t* const* gate_start;
+	const uint16_t* const* up_start;
+	const uint16_t* const* down_start;
+	const uint8_t* const* gate_gain;
+	const uint8_t* const* up_gain;
+	const uint8_t* const* down_gain;
+};
+
 #define EXL3_MOE_KERNEL_ARGS                    \
 	const half* __restrict__ hidden_state,      \
 	half* __restrict__ temp_state_g,            \

@@ -9,11 +9,15 @@
 #include "engine/modules/moe.h"
 #include "engine/modules/swiglu.h"
 #include "trellis_context.h"
+#include "reconstruct.cuh"
+#include "exl3_vl.cuh"
+#include "exl3_moe_coop.cuh"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 #include <algorithm>
+#include <random>
 
 int main() {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
@@ -88,6 +92,8 @@ int main() {
 		CUDA_CHECK( cudaMemcpy( sv.data, hv.data(), n * 2, cudaMemcpyHostToDevice ) );
 		return pod::LinearWeight::make_trellis( tv, su, sv, bits, true, false );
 	};
+	// MOE_FIRST=n (Flash-Next): the experts from id n on (another rank's partition)
+	const int first = std::getenv( "MOE_FIRST" ) ? std::atoi( std::getenv( "MOE_FIRST" ) ) : 0;
 	for ( int e = 0; e < E; ++e ) {
 		if ( synth ) {
 			mw.gate[e] = synth_linear( H, I, sig[0] );
@@ -104,16 +110,20 @@ int main() {
 			}
 			continue;
 		}
-		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, e );
+		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, e + first );
 		mw.gate[e] = repo.load_linear( name, arena, EBITS, stream );
-		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, e );
+		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.up_proj", L, e + first );
 		mw.up[e] = repo.load_linear( name, arena, EBITS, stream );
-		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, e );
+		std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.down_proj", L, e + first );
 		mw.down[e] = repo.load_linear( name, arena, EBITS, stream );
 	}
 	engine::modules::MoE::init_device_ptrs( mw, arena, stream );
 	std::printf( "[*] experts: bits g/u/d = %d/%d/%d, mul1 g/u/d = %d/%d/%d\n",
 		mw.gate[0].bits, mw.up[0].bits, mw.down[0].bits, mw.gate[0].mul1, mw.up[0].mul1, mw.down[0].mul1 );
+	// A checkpoint of the extended trellis (tile starts / gains): Linear::forward refuses it, so the single-row parity is left out and the
+	// MOE_EXT checks run on the checkpoint's own experts and tile order
+	const bool ext_real = !synth && mw.ext_ptrs != nullptr;
+	if ( ext_real ) std::printf( "[*] extended trellis experts (%s tile order)\n", mw.gate[0].volta_tiles ? "Volta" : "stock" );
 
 	// Inputs: x ~ U(-1, 1); routes include out-of-partition experts (>= 72) that must be skipped
 	int h_idx[10] = { 3, 17, 40, 71, 100, 5, 250, 66 };
@@ -146,39 +156,41 @@ int main() {
 	CUDA_CHECK( cudaMemcpy( d_idx, h_idx, sizeof( h_idx ), cudaMemcpyHostToDevice ) );
 	CUDA_CHECK( cudaMemcpy( d_w, h_w.data(), K * sizeof( half ), cudaMemcpyHostToDevice ) );
 
-	// Reference: per-expert Linear path (the validated pre-refactor decode path)
-	CUDA_CHECK( cudaMemset( ref.data, 0, ref.size_bytes() ) );
-	for ( int k = 0; k < K; ++k ) {
-		if ( h_idx[k] >= E ) continue;
-		const int e = h_idx[k];
-		engine::modules::Linear::forward( x, mw.gate[e], g, stream );
-		engine::modules::Linear::forward( x, mw.up[e], u, stream );
-		engine::modules::SwiGLU::forward( g, u, inter, stream, 10.0f );
-		engine::modules::Linear::forward( inter, mw.down[e], eo, stream );
-		engine::modules::MoERouter::accumulate( ref.ptr<half>(), eo.ptr<const half>(), h_w[k], H, stream );
-	}
-
 	auto scratch = engine::modules::MoE::alloc_scratch( arena, E, K, H, I );
-	engine::modules::MoE::forward( x, mw, d_idx, d_w, out, 0, E, scratch, 10.0f, stream );
-	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	if ( !ext_real ) {
+		// Reference: per-expert Linear path (the validated pre-refactor decode path)
+		CUDA_CHECK( cudaMemset( ref.data, 0, ref.size_bytes() ) );
+		for ( int k = 0; k < K; ++k ) {
+			if ( h_idx[k] >= E ) continue;
+			const int e = h_idx[k];
+			engine::modules::Linear::forward( x, mw.gate[e], g, stream );
+			engine::modules::Linear::forward( x, mw.up[e], u, stream );
+			engine::modules::SwiGLU::forward( g, u, inter, stream, 10.0f );
+			engine::modules::Linear::forward( inter, mw.down[e], eo, stream );
+			engine::modules::MoERouter::accumulate( ref.ptr<half>(), eo.ptr<const half>(), h_w[k], H, stream );
+		}
 
-	std::vector<half> h_ref( H ), h_out( H );
-	CUDA_CHECK( cudaMemcpy( h_ref.data(), ref.data, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
-	CUDA_CHECK( cudaMemcpy( h_out.data(), out.data, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
-	double dot = 0, na = 0, nb = 0, maxd = 0, maxr = 0;
-	for ( int i = 0; i < H; ++i ) {
-		const double a = __half2float( h_ref[i] ), b = __half2float( h_out[i] );
-		dot += a * b;
-		na += a * a;
-		nb += b * b;
-		maxd = std::fmax( maxd, std::fabs( a - b ) );
-		maxr = std::fmax( maxr, std::fabs( a ) );
+		engine::modules::MoE::forward( x, mw, d_idx, d_w, out, 0, E, scratch, 10.0f, stream );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+
+		std::vector<half> h_ref( H ), h_out( H );
+		CUDA_CHECK( cudaMemcpy( h_ref.data(), ref.data, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
+		CUDA_CHECK( cudaMemcpy( h_out.data(), out.data, H * sizeof( half ), cudaMemcpyDeviceToHost ) );
+		double dot = 0, na = 0, nb = 0, maxd = 0, maxr = 0;
+		for ( int i = 0; i < H; ++i ) {
+			const double a = __half2float( h_ref[i] ), b = __half2float( h_out[i] );
+			dot += a * b;
+			na += a * a;
+			nb += b * b;
+			maxd = std::fmax( maxd, std::fabs( a - b ) );
+			maxr = std::fmax( maxr, std::fabs( a ) );
+		}
+		const double cos = dot / ( std::sqrt( na ) * std::sqrt( nb ) + 1e-12 );
+		std::printf( "[*] MoE::forward vs reference: cos=%.6f max_abs=%.4f (ref max %.4f, |ref|=%.3f |out|=%.3f)\n",
+			cos, maxd, maxr, std::sqrt( na ), std::sqrt( nb ) );
+		const bool pass = cos >= 0.9999;
+		std::printf( "[%c] MoE PARITY %s\n", pass ? '+' : '-', pass ? "PASS" : "FAIL" );
 	}
-	const double cos = dot / ( std::sqrt( na ) * std::sqrt( nb ) + 1e-12 );
-	std::printf( "[*] MoE::forward vs reference: cos=%.6f max_abs=%.4f (ref max %.4f, |ref|=%.3f |out|=%.3f)\n",
-		cos, maxd, maxr, std::sqrt( na ), std::sqrt( nb ) );
-	const bool pass = cos >= 0.9999;
-	std::printf( "[%c] MoE PARITY %s\n", pass ? '+' : '-', pass ? "PASS" : "FAIL" );
 
 	// Multi-row: R rows routed into a narrow expert set so several experts exceed the 8-token chunk. Reference is
 	// the single-row MoE::forward per row (the validated path).
@@ -257,6 +269,165 @@ int main() {
 		multi_pass = multi_pass && c >= 0.9999;
 	}
 	std::printf( "[%c] MoE MULTI-ROW %s\n", multi_pass ? '+' : '-', multi_pass ? "PASS" : "FAIL" );
+
+	// MOE_EXT=1 (with MOE_SYNTH): the extended trellis, random tile starts and gains on every expert, in both tile orders: the coop kernels at 1 to
+	// 16 rows against a host product with the weights reconstruct_had_slice_ext gives (the quantizer's decode), the persistent kernel's 4-, 16- and
+	// 32-row tiles at 24 to 200 rows against those rows one at a time; the same routes with the companions dropped must miss
+	if ( ( synth && std::getenv( "MOE_EXT" ) ) || ext_real ) {
+		bool ext_pass = true;
+		std::mt19937 rng( 4242u );
+		auto attach = [&]( pod::LinearWeight& lw ) {
+			const int k = lw.w1.shape[0], n = lw.w2.shape[0], tiles = ( k / 16 ) * ( n / 16 );
+			const int d0 = lw.bits > 8 ? lw.bits - 8 : lw.bits;   // the start holds the 16 - d0 bits before the stream
+			std::vector<uint16_t> st( tiles );
+			std::vector<uint8_t> gn( tiles );
+			for ( auto& s : st ) s = static_cast<uint16_t>( rng() & ( ( 1u << ( 16 - d0 ) ) - 1 ) );
+			for ( auto& g : gn ) g = static_cast<uint8_t>( rng() & 255u );
+			int shp[2] = { k / 16, n / 16 };
+			lw.w3 = engine::core::arena_alloc_tensor( arena, pod::DType::UINT16, shp, 2 );
+			lw.w4 = engine::core::arena_alloc_tensor( arena, pod::DType::UINT8, shp, 2 );
+			CUDA_CHECK( cudaMemcpy( lw.w3.data, st.data(), st.size() * 2, cudaMemcpyHostToDevice ) );
+			CUDA_CHECK( cudaMemcpy( lw.w4.data, gn.data(), gn.size(), cudaMemcpyHostToDevice ) );
+		};
+		if ( synth ) {
+			for ( int e = 0; e < E; ++e ) { attach( mw.gate[e] ); attach( mw.up[e] ); attach( mw.down[e] ); }
+			engine::modules::MoE::init_device_ptrs( mw, arena, stream );
+		}
+		ENGINE_ASSERT( mw.ext_ptrs != nullptr, "test_moe: no companion table" );
+		const int NE = 10;   // routes go to experts 0 .. NE - 1 or out of the partition
+		half* d_dense = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( H ) * I * sizeof( half ) ) );
+		const int R = 200, RC = MOE_COOP_MAX_ROWS;   // rows in all, rows of the host reference
+		int rs[2] = { R, H };
+		auto xr = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rs, 2 );
+		auto outr = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rs, 2 );
+		int* d_idx_r = static_cast<int*>( engine::core::arena_alloc( arena, R * K * sizeof( int ) ) );
+		half* d_w_r = static_cast<half*>( engine::core::arena_alloc( arena, R * K * sizeof( half ) ) );
+		std::vector<half> hxr( static_cast<size_t>( R ) * H ), hwr( R * K );
+		std::vector<int> hir( R * K );
+		for ( auto& v : hxr ) v = __float2half( std::uniform_real_distribution<float>( -1.0f, 1.0f )( rng ) );
+		for ( int r = 0; r < R; ++r ) {
+			int used[400] = {};
+			for ( int k = 0; k < K; ++k ) {
+				int e;
+				do e = rng() % 4 == 0 ? E + static_cast<int>( rng() % 200 ) : static_cast<int>( rng() % NE ); while ( used[e] );
+				used[e] = 1;
+				hir[r * K + k] = e;
+				hwr[r * K + k] = __float2half( h_wf[k] );
+			}
+		}
+		CUDA_CHECK( cudaMemcpy( xr.data, hxr.data(), hxr.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMemcpy( d_idx_r, hir.data(), hir.size() * sizeof( int ), cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMemcpy( d_w_r, hwr.data(), hwr.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
+		auto scratch_r = engine::modules::MoE::alloc_scratch( arena, E, K, H, I, R );
+		for ( int vt = ext_real ? static_cast<int>( mw.gate[0].volta_tiles ) : 0; vt < ( ext_real ? static_cast<int>( mw.gate[0].volta_tiles ) + 1 : ENGINE_EXL3_VL ? 2 : 1 ); ++vt ) {
+			if ( !ext_real ) for ( int e = 0; e < E; ++e ) mw.gate[e].volta_tiles = mw.up[e].volta_tiles = mw.down[e].volta_tiles = vt == 1;
+			// the experts' dense weights, [k, n] row-major
+			auto dense = [&]( const pod::LinearWeight& lw ) {
+				const int k = lw.w1.shape[0], n = lw.w2.shape[0];
+				EXL3_TILES_CALL( lw.volta_tiles, reconstruct_had_slice_ext, d_dense, lw.w0.ptr<const uint16_t>(), lw.w3.ptr<const uint16_t>(), lw.w4.ptr<const uint8_t>(),
+					lw.w1.ptr<const half>(), lw.w2.ptr<const half>(), lw.bits, lw.mcg, lw.mul1, k, n, 0, stream );
+				std::vector<half> hw( static_cast<size_t>( k ) * n );
+				CUDA_CHECK( cudaMemcpyAsync( hw.data(), d_dense, hw.size() * sizeof( half ), cudaMemcpyDeviceToHost, stream ) );
+				CUDA_CHECK( cudaStreamSynchronize( stream ) );
+				std::vector<float> f( hw.size() );
+				for ( size_t i = 0; i < f.size(); ++i ) f[i] = __half2float( hw[i] );
+				return f;
+			};
+			std::vector<std::vector<float>> wg( NE ), wu( NE ), wd( NE );
+			for ( int e = 0; e < NE; ++e ) { wg[e] = dense( mw.gate[e] ); wu[e] = dense( mw.up[e] ); wd[e] = dense( mw.down[e] ); }
+			// FP16 roundings where the kernels store FP16: the gate / up outputs, the activation, the down output
+			auto r16 = []( float v ) { return __half2float( __float2half( v ) ); };
+			auto reference = [&]( int r, std::vector<float>& o ) {
+				o.assign( H, 0.0f );
+				std::vector<float> g( I ), u( I ), a( I ), d( H );
+				for ( int k = 0; k < K; ++k ) {
+					const int e = hir[r * K + k];
+					if ( e >= E ) continue;
+					std::fill( g.begin(), g.end(), 0.0f );
+					std::fill( u.begin(), u.end(), 0.0f );
+					for ( int h = 0; h < H; ++h ) {
+						const float xv = __half2float( hxr[static_cast<size_t>( r ) * H + h] );
+						const float* pg = wg[e].data() + static_cast<size_t>( h ) * I;
+						const float* pu = wu[e].data() + static_cast<size_t>( h ) * I;
+						for ( int i = 0; i < I; ++i ) { g[i] += xv * pg[i]; u[i] += xv * pu[i]; }
+					}
+					for ( int i = 0; i < I; ++i ) {
+						const float gv = std::fmin( r16( g[i] ), 10.0f ), uv = std::fmax( -10.0f, std::fmin( r16( u[i] ), 10.0f ) );
+						a[i] = r16( gv / ( 1.0f + std::exp( -gv ) ) * uv );
+					}
+					std::fill( d.begin(), d.end(), 0.0f );
+					for ( int i = 0; i < I; ++i ) {
+						const float* pd = wd[e].data() + static_cast<size_t>( i ) * H;
+						for ( int h = 0; h < H; ++h ) d[h] += a[i] * pd[h];
+					}
+					for ( int h = 0; h < H; ++h ) o[h] += __half2float( hwr[r * K + k] ) * r16( d[h] );
+				}
+			};
+			std::vector<std::vector<float>> want( RC );
+			for ( int r = 0; r < RC; ++r ) reference( r, want[r] );
+			auto cosine = [&]( const std::vector<half>& got, int rows ) {
+				double dot = 0, na = 0, nb = 0;
+				for ( int r = 0; r < rows; ++r ) for ( int h = 0; h < H; ++h ) {
+					const double a = want[r][h], b = __half2float( got[static_cast<size_t>( r ) * H + h] );
+					dot += a * b; na += a * a; nb += b * b;
+				}
+				return dot / ( std::sqrt( na ) * std::sqrt( nb ) + 1e-12 );
+			};
+			for ( int rows : { 1, 2, 3, 5, 8, 16 } ) {
+				pod::TensorView x1 = pod::make_tensor_2d( xr.ptr<half>(), pod::DType::FP16, rows, H );
+				pod::TensorView o1 = pod::make_tensor_2d( outr.ptr<half>(), pod::DType::FP16, rows, H );
+				ENGINE_ASSERT( engine::modules::MoE::fused_decode( mw, scratch_r, rows ), "test_moe: the extended experts must take the coop kernels" );
+				std::vector<half> got( static_cast<size_t>( rows ) * H ), plain( got.size() );
+				engine::modules::MoE::forward( x1, mw, d_idx_r, d_w_r, o1, 0, E, scratch_r, 10.0f, stream );
+				CUDA_CHECK( cudaStreamSynchronize( stream ) );
+				CUDA_CHECK( cudaMemcpy( got.data(), o1.data, got.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+				void* const keep = mw.ext_ptrs;
+				mw.ext_ptrs = nullptr;
+				engine::modules::MoE::forward( x1, mw, d_idx_r, d_w_r, o1, 0, E, scratch_r, 10.0f, stream );
+				CUDA_CHECK( cudaStreamSynchronize( stream ) );
+				mw.ext_ptrs = keep;
+				CUDA_CHECK( cudaMemcpy( plain.data(), o1.data, plain.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+				const double c = cosine( got, rows ), cp = cosine( plain, rows );
+				std::printf( "[*] extended %s order, %2d rows vs reference: cos=%.6f (companions dropped: %.6f)\n", vt ? "Volta" : "stock", rows, c, cp );
+				ext_pass = ext_pass && c >= 0.9999 && ( ext_real || cp < 0.9995 );   // a real checkpoint's companions are near the plain decode
+			}
+			// The persistent kernel against the rows one at a time (the coop kernels, checked above)
+			std::vector<half> per_row( static_cast<size_t>( R ) * H );
+			for ( int r = 0; r < R; ++r ) {
+				pod::TensorView x1 = pod::make_tensor_2d( xr.ptr<half>() + static_cast<size_t>( r ) * H, pod::DType::FP16, 1, H );
+				pod::TensorView o1 = pod::make_tensor_2d( outr.ptr<half>(), pod::DType::FP16, 1, H );
+				engine::modules::MoE::forward( x1, mw, d_idx_r + r * K, d_w_r + r * K, o1, 0, E, scratch_r, 10.0f, stream );
+				CUDA_CHECK( cudaMemcpyAsync( per_row.data() + static_cast<size_t>( r ) * H, o1.data, H * sizeof( half ), cudaMemcpyDeviceToHost, stream ) );
+			}
+			CUDA_CHECK( cudaStreamSynchronize( stream ) );
+			auto cos_rows = [&]( const std::vector<half>& got, int rows ) {
+				double dot = 0, na = 0, nb = 0;
+				for ( size_t i = 0; i < static_cast<size_t>( rows ) * H; ++i ) {
+					const double a = __half2float( per_row[i] ), b = __half2float( got[i] );
+					dot += a * b; na += a * a; nb += b * b;
+				}
+				return dot / ( std::sqrt( na ) * std::sqrt( nb ) + 1e-12 );
+			};
+			for ( int rows : { 24, 64, 200 } ) {
+				pod::TensorView x1 = pod::make_tensor_2d( xr.ptr<half>(), pod::DType::FP16, rows, H );
+				pod::TensorView o1 = pod::make_tensor_2d( outr.ptr<half>(), pod::DType::FP16, rows, H );
+				std::vector<half> got( static_cast<size_t>( rows ) * H ), plain( got.size() );
+				engine::modules::MoE::forward( x1, mw, d_idx_r, d_w_r, o1, 0, E, scratch_r, 10.0f, stream );
+				CUDA_CHECK( cudaStreamSynchronize( stream ) );
+				CUDA_CHECK( cudaMemcpy( got.data(), o1.data, got.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+				void* const keep = mw.ext_ptrs;
+				mw.ext_ptrs = nullptr;
+				engine::modules::MoE::forward( x1, mw, d_idx_r, d_w_r, o1, 0, E, scratch_r, 10.0f, stream );
+				CUDA_CHECK( cudaStreamSynchronize( stream ) );
+				mw.ext_ptrs = keep;
+				CUDA_CHECK( cudaMemcpy( plain.data(), o1.data, plain.size() * sizeof( half ), cudaMemcpyDeviceToHost ) );
+				const double c = cos_rows( got, rows ), cp = cos_rows( plain, rows );
+				std::printf( "[*] extended %s order, %3d rows (persistent) vs per-row: cos=%.6f (companions dropped: %.6f)\n", vt ? "Volta" : "stock", rows, c, cp );
+				ext_pass = ext_pass && c >= 0.9999 && ( ext_real || cp < 0.9995 );   // a real checkpoint's companions are near the plain decode
+			}
+		}
+		std::printf( "[%c] MoE EXTENDED %s\n", ext_pass ? '+' : '-', ext_pass ? "PASS" : "FAIL" );
+	}
 	repo.close();
 	engine::core::arena_destroy( arena );
 	engine::modules::trellis_context_destroy();

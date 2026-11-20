@@ -23,6 +23,8 @@ struct LinearWeight {
 	TensorView w0{};    // Trellis: codes / NVFP4: packed nibbles
 	TensorView w1{};    // Trellis: suh   / NVFP4: fp8 block scales
 	TensorView w2{};    // Trellis: svh
+	TensorView w3{};    // Trellis, extended: per-tile start states ([k / 16, n / 16] uint16, the bits before a tile's stream), or empty
+	TensorView w4{};    // Trellis, extended: per-tile gain codes ([k / 16, n / 16] uint8, gain (896 + c) / 1024), or empty
 	float      alpha = 1.0f;
 	int        bits = 4;
 	bool       mul1 = false;
@@ -31,6 +33,9 @@ struct LinearWeight {
 	uint32_t   gguf_type = 0; // GGUF: engine::modules::GgmlType of w0's blocks
 	int        gguf_k = 0, gguf_n = 0;
 	int        gguf_tile_heads = 0, gguf_tile_dim = 0;   // GGUF: input columns in tiled V-head order (see GgufColTiling); 0: as the activation
+
+	// A trellis with tile companions (start states, gains): only the paths that decode them may run it
+	bool extended() const { return type == QuantType::TRELLIS && ( w3.data != nullptr || w4.data != nullptr ); }
 
 	// Trellis and GGUF projections run through one workspace per device (rotated or q8_1 activations, split-K partials): two of them must not
 	// run on different streams at once
@@ -130,6 +135,7 @@ struct Linear {
 
 		switch ( weight.type ) {
 			case pod::QuantType::TRELLIS: {
+				ENGINE_ASSERT( !weight.extended(), "Linear::forward: an extended trellis (tile starts / gains) runs only on the MoE paths that decode it" );
 				LinearTrellis::forward(
 					x,
 					weight.w0,

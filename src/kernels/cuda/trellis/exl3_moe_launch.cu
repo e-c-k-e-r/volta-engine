@@ -9,25 +9,29 @@
 
 namespace ext {
 
-// The persistent kernel of a (bits, output tile) variant and row mode (0: 4-row tile, 2: 16 rows, 3: the wide prefill tile)
-static void* moe_kernel_fn( int variant, int mode ) {
+// The persistent kernel of a (bits, output tile) variant and row mode (0: 4-row tile, 2: 16 rows, 3: the wide prefill tile); EXT: the copy for
+// experts of the extended trellis (tile starts / gains)
+template<bool EXT>
+static void* moe_kernel_fn_t( int variant, int mode ) {
 	switch ( variant ) {
-		case 0: return mode == 3 ? (void*) exl3_moe_kernel<3, 256, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2> : (void*) exl3_moe_kernel<3, 256, 2, 0>;
-		case 1: return mode == 3 ? (void*) exl3_moe_kernel<3, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<3, 128, 2, 2> : (void*) exl3_moe_kernel<3, 128, 2, 0>;
-		case 3: return mode == 3 ? (void*) exl3_moe_kernel<2, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<2, 128, 2, 2> : (void*) exl3_moe_kernel<2, 128, 2, 0>;
-		case 4: return mode == 3 ? (void*) exl3_moe_kernel<5, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<5, 128, 2, 2> : (void*) exl3_moe_kernel<5, 128, 2, 0>;
-		case 5: return mode == 3 ? (void*) exl3_moe_kernel<1, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<1, 128, 2, 2> : (void*) exl3_moe_kernel<1, 128, 2, 0>;
-		case 8: return mode == 3 ? (void*) exl3_moe_kernel<10, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<10, 128, 2, 2> : (void*) exl3_moe_kernel<10, 128, 2, 0>;
-		case 9: return mode == 3 ? (void*) exl3_moe_kernel<11, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<11, 128, 2, 2> : (void*) exl3_moe_kernel<11, 128, 2, 0>;
-		case 10: return mode == 3 ? (void*) exl3_moe_kernel<9, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<9, 128, 2, 2> : (void*) exl3_moe_kernel<9, 128, 2, 0>;
-		case 11: return mode == 3 ? (void*) exl3_moe_kernel<6, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<6, 128, 2, 2> : (void*) exl3_moe_kernel<6, 128, 2, 0>;
-		case 7: return mode == 3 ? (void*) exl3_moe_kernel<MOE_BITS_HALF_DYN, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<MOE_BITS_HALF_DYN, 128, 2, 2> : (void*) exl3_moe_kernel<MOE_BITS_HALF_DYN, 128, 2, 0>;
-		case 6: return mode == 3 ? (void*) exl3_moe_kernel<0, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<0, 128, 2, 2> : (void*) exl3_moe_kernel<0, 128, 2, 0>;
-		default: return mode == 3 ? (void*) exl3_moe_kernel<4, 128, 2, 3> : mode == 2 ? (void*) exl3_moe_kernel<4, 128, 2, 2> : (void*) exl3_moe_kernel<4, 128, 2, 0>;
+		case 0: return mode == 3 ? (void*) exl3_moe_kernel<3, 256, 2, 3, EXT> : mode == 2 ? (void*) exl3_moe_kernel<3, 256, 2, 2, EXT> : (void*) exl3_moe_kernel<3, 256, 2, 0, EXT>;
+		case 1: return mode == 3 ? (void*) exl3_moe_kernel<3, 128, 2, 3, EXT> : mode == 2 ? (void*) exl3_moe_kernel<3, 128, 2, 2, EXT> : (void*) exl3_moe_kernel<3, 128, 2, 0, EXT>;
+		case 3: return mode == 3 ? (void*) exl3_moe_kernel<2, 128, 2, 3, EXT> : mode == 2 ? (void*) exl3_moe_kernel<2, 128, 2, 2, EXT> : (void*) exl3_moe_kernel<2, 128, 2, 0, EXT>;
+		case 4: return mode == 3 ? (void*) exl3_moe_kernel<5, 128, 2, 3, EXT> : mode == 2 ? (void*) exl3_moe_kernel<5, 128, 2, 2, EXT> : (void*) exl3_moe_kernel<5, 128, 2, 0, EXT>;
+		case 5: return mode == 3 ? (void*) exl3_moe_kernel<1, 128, 2, 3, EXT> : mode == 2 ? (void*) exl3_moe_kernel<1, 128, 2, 2, EXT> : (void*) exl3_moe_kernel<1, 128, 2, 0, EXT>;
+		case 8: return mode == 3 ? (void*) exl3_moe_kernel<10, 128, 2, 3, EXT> : mode == 2 ? (void*) exl3_moe_kernel<10, 128, 2, 2, EXT> : (void*) exl3_moe_kernel<10, 128, 2, 0, EXT>;
+		case 9: return mode == 3 ? (void*) exl3_moe_kernel<11, 128, 2, 3, EXT> : mode == 2 ? (void*) exl3_moe_kernel<11, 128, 2, 2, EXT> : (void*) exl3_moe_kernel<11, 128, 2, 0, EXT>;
+		case 10: return mode == 3 ? (void*) exl3_moe_kernel<9, 128, 2, 3, EXT> : mode == 2 ? (void*) exl3_moe_kernel<9, 128, 2, 2, EXT> : (void*) exl3_moe_kernel<9, 128, 2, 0, EXT>;
+		case 11: return mode == 3 ? (void*) exl3_moe_kernel<6, 128, 2, 3, EXT> : mode == 2 ? (void*) exl3_moe_kernel<6, 128, 2, 2, EXT> : (void*) exl3_moe_kernel<6, 128, 2, 0, EXT>;
+		case 7: return mode == 3 ? (void*) exl3_moe_kernel<MOE_BITS_HALF_DYN, 128, 2, 3, EXT> : mode == 2 ? (void*) exl3_moe_kernel<MOE_BITS_HALF_DYN, 128, 2, 2, EXT> : (void*) exl3_moe_kernel<MOE_BITS_HALF_DYN, 128, 2, 0, EXT>;
+		case 6: return mode == 3 ? (void*) exl3_moe_kernel<0, 128, 2, 3, EXT> : mode == 2 ? (void*) exl3_moe_kernel<0, 128, 2, 2, EXT> : (void*) exl3_moe_kernel<0, 128, 2, 0, EXT>;
+		default: return mode == 3 ? (void*) exl3_moe_kernel<4, 128, 2, 3, EXT> : mode == 2 ? (void*) exl3_moe_kernel<4, 128, 2, 2, EXT> : (void*) exl3_moe_kernel<4, 128, 2, 0, EXT>;
 	}
 }
 
-static bool attr_done[ENGINE_NUM_GPUS][12] = {};
+static void* moe_kernel_fn( int variant, int mode, bool ext = false ) { return ext ? moe_kernel_fn_t<true>( variant, mode ) : moe_kernel_fn_t<false>( variant, mode ); }
+
+static bool attr_done[ENGINE_NUM_GPUS][2][12] = {};   // [device][extended][variant]
 
 // The largest per-thread stack frame of the run-time-width kernels (mixed packs, half widths): every width's tile code is a noinline call
 // whose frame the kernel carries, above the driver's 1 KB default
@@ -42,7 +46,7 @@ size_t exl3_moe_mixed_stack_bytes() {
 }
 
 void exl3_moe_reset_caches() {
-	for ( auto& d : attr_done ) for ( bool& b : d ) b = false;
+	for ( auto& d : attr_done ) for ( auto& x : d ) for ( bool& b : x ) b = false;
 }
 
 void exl3_moe(
@@ -74,7 +78,8 @@ void exl3_moe(
 	int num_experts,
 	cudaStream_t stream,
 	int top_k,
-	const uint8_t* bits_tab, bool has_half
+	const uint8_t* bits_tab, bool has_half,
+	const void* const* ext_tables
 ) {
 	(void) gate_mcg; (void) gate_mul1; (void) up_mcg; (void) up_mul1; (void) down_mcg; (void) down_mul1;
 	(void) num_active;
@@ -97,6 +102,19 @@ void exl3_moe(
 	int max_tokens_per_expert = wide == 3 ? 32 : wide == 2 ? 16 : 4; // rows per expert pass (the GEMM tile); larger batches run in chunks
 	int concurrency = num_groups;
 	int chunk_all = 1; // experts above max_tokens_per_expert tokens are evaluated in chunks of max_tokens_per_expert
+
+	// The extended trellis: the 6 x num_experts companion table (gate / up / down starts, then gains), else the plain kernels and null tables
+	const bool extended = ext_tables != nullptr;
+	MoeExtTables xt{};
+	if ( extended ) {
+		const void* const* t = ext_tables;
+		xt.gate_start = reinterpret_cast<const uint16_t* const*>( t + 0 * num_experts );
+		xt.up_start = reinterpret_cast<const uint16_t* const*>( t + 1 * num_experts );
+		xt.down_start = reinterpret_cast<const uint16_t* const*>( t + 2 * num_experts );
+		xt.gate_gain = reinterpret_cast<const uint8_t* const*>( t + 3 * num_experts );
+		xt.up_gain = reinterpret_cast<const uint8_t* const*>( t + 4 * num_experts );
+		xt.down_gain = reinterpret_cast<const uint8_t* const*>( t + 5 * num_experts );
+	}
 
 	void* kernel_args[] = {
 		(void*) &_hidden_state,
@@ -132,7 +150,8 @@ void exl3_moe(
 		(void*) &locks,
 		(void*) &active_experts,
 		(void*) &out_plane_stride,
-		(void*) &bits_tab
+		(void*) &bits_tab,
+		(void*) &xt
 	};
 
 	// 3-bit experts with a 256-divisible intermediate width (GLM) run 256-wide output tiles; every other shape (4-bit experts, and
@@ -148,16 +167,16 @@ void exl3_moe(
 	const bool tile128 = mixed || K_gate != 3 || intermediate_dim % 256 != 0;
 	ENGINE_ASSERT( intermediate_dim % ( tile128 ? 128 : 256 ) == 0, "exl3_moe: intermediate width vs the output tile" );
 	const int variant = mixed ? ( has_half ? 7 : 6 ) : K_gate == 9 ? 10 : K_gate == 10 ? 8 : K_gate == 11 ? 9 : K_gate == 6 ? 11 : K_gate == 5 ? 4 : K_gate == 4 ? 2 : K_gate == 2 ? 3 : K_gate == 1 ? 5 : ( tile128 ? 1 : 0 );   // 0: <3,256>, 1: <3,128>, 2: <4,128>, 3: <2,128>, 4: <5,128> (DeepSeek-V4.1's few 5-bit experts), 5: <1,128>, 11: <6,128>
-	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_done[device][variant] ) {
-		void* fns[3] = { moe_kernel_fn( variant, 0 ), moe_kernel_fn( variant, 2 ), moe_kernel_fn( variant, 3 ) };
+	if ( device >= 0 && device < ENGINE_NUM_GPUS && !attr_done[device][extended][variant] ) {
+		void* fns[3] = { moe_kernel_fn( variant, 0, extended ), moe_kernel_fn( variant, 2, extended ), moe_kernel_fn( variant, 3, extended ) };
 		for ( void* fn : fns ) CUDA_CHECK( cudaFuncSetAttribute( fn, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX ) );
-		attr_done[device][variant] = true;
+		attr_done[device][extended][variant] = true;
 	}
 
 	// The wide kernel carries the 16-row GEMM tile as well; keeping it out of the decode kernel preserves its registers
 	// Output-tile width of the expert GEMMs: 256 is 18-29% faster than 128 below 64 rows on both the sharded and the whole-expert
 	// layouts (fewer K-split reductions per weight decoded) and level at 512
-	void* moe_fn = moe_kernel_fn( variant, wide == 3 ? 3 : wide == 2 ? 2 : 0 );
+	void* moe_fn = moe_kernel_fn( variant, wide == 3 ? 3 : wide == 2 ? 2 : 0, extended );
 #if defined(USE_ROCM)
 	// RDNA grants a workgroup 64 KB, below the 90 KB cap the CUDA launch reserves: request what the tile uses (the 16-row tile's
 	// footprint, ~22 KB at most; the decode variant's 4-row tile needs less)

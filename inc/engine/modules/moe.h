@@ -25,6 +25,7 @@ struct MoELayerWeights {
 	LinearWeight down[MOE_MAX_EXPERTS];
 	void* device_ptrs = nullptr;
 	void* staged_ptrs = nullptr;       // tier (trellis or NVFP4): a table of the same layout whose cold experts point at device scratch; set by ExpertTier for the length of a prefill layer
+	void* ext_ptrs = nullptr;          // extended trellis experts (tile starts / gains, always resident): a device table [gate | up | down starts][E] then [gate | up | down gains][E], else null
 	uint32_t* heat = nullptr;          // [num_local_experts] routes per expert since the last reset (device), optional
 	// Trellis experts whose widths differ (DeepSeek-V4.1 mixed-width packs): a device table [gate | up | down][num_local_experts] of each expert's
 	// width per projection, and the widest; the kernels then pick each projection's instantiation per expert. Null: gate[0].bits etc. hold for all
@@ -220,7 +221,8 @@ void exl3_moe(
 	engine::backend::stream_t stream = nullptr,
 	int top_k = 8,                  // routes per token (the kernel argument num_experts_per_tok)
 	const uint8_t* bits_tab = nullptr,  // per-expert widths [gate | up | down][num_experts] (the K arguments then give the widest); null: K_gate / K_up / K_down for all
-	bool bits_half = false              // a width in that table is a half-integer rate (2.5 / 3.5 bpw): the kernel variant that holds those arms
+	bool bits_half = false,             // a width in that table is a half-integer rate (2.5 / 3.5 bpw): the kernel variant that holds those arms
+	const void* const* ext_tables = nullptr   // extended trellis experts: MoELayerWeights::ext_ptrs (their tile starts / gains); null: plain experts
 );
 
 // The largest per-thread stack frame of the persistent kernel's run-time-width variants (DeepSeek-V4.1's mixed-width packs)

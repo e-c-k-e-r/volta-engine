@@ -55,9 +55,31 @@ __device__ __noinline__ void moe_gemm_m64(
 }
 #endif
 
+// The tile wrappers for experts of the extended trellis (tile starts / gains): separate functions, so the plain ones keep their signatures
+template<int t_bits, int MOE_TILESIZE_N, int cb, int TK, int TM, int FS>
+__device__ __noinline__ void moe_gemm_ext(
+	const half* in_addr, const uint16_t* trellis, half* out_addr, int rows, int dim_k, int dim_n, int* locks, const uint16_t* tstart, const uint8_t* tgain
+) {
+	exl3_gemm_kernel_inner<t_bits, false, cb, TM, TK, MOE_TILESIZE_N, MOE_SH_STAGES, FS, false, true>(
+		in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, nullptr, tstart, tgain
+	);
+}
+
+#if EXL3_VOLTA && EXL3_SM70_HMMA
+template<int t_bits, int MOE_TILESIZE_N, int cb, int TK, int TM, int FS>
+__device__ __noinline__ void moe_gemm_m64_ext(
+	const half* in_addr, const uint16_t* trellis, half* out_addr, int rows, int dim_k, int dim_n, int* locks, const uint16_t* tstart, const uint8_t* tgain
+) {
+	exl3_gemm_kernel_inner_m64<t_bits, false, cb, TM, TK, MOE_TILESIZE_N, MOE_SH_STAGES, FS, false, true>(
+		in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, nullptr, tstart, tgain
+	);
+}
+#endif
+
 // Expert GEMM over `rows` gathered tokens. wide = 0: the 4-row tile only (decode); 2: 16-row tile above 4 rows; 3 (prefill chunks): 16-row tile
 // for 5..16 rows and a 32-row tile above, which decodes each weight tile once for both row blocks.
-template<int t_bits, int MOE_TILESIZE_N, int cb, int wide>
+// EXT: the extended trellis, the expert's tile starts / gains (either null)
+template<int t_bits, int MOE_TILESIZE_N, int cb, int wide, bool EXT = false>
 __device__ inline void moe_gemm(
 	const half* in_addr,
 	const uint16_t* trellis,
@@ -65,8 +87,26 @@ __device__ inline void moe_gemm(
 	int rows,
 	int dim_k,
 	int dim_n,
-	int* locks
+	int* locks,
+	const uint16_t* tstart = nullptr,
+	const uint8_t* tgain = nullptr
 ) {
+	if constexpr ( EXT ) {
+		constexpr int FS = wide == 3 ? MOE_PREFILL_FRAG_STAGES : MOE_FRAG_STAGES;
+#if EXL3_VOLTA && EXL3_SM70_HMMA
+		if constexpr ( wide == 3 ) if ( rows > 16 ) {
+			if ( rows > 32 ) moe_gemm_m64_ext<t_bits, MOE_TILESIZE_N, cb, MOE_TILESIZE_K, 64, FS>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain );
+			else moe_gemm_m64_ext<t_bits, MOE_TILESIZE_N, cb, MOE_TILESIZE_K, 32, FS>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain );
+			return;
+		}
+#endif
+		if constexpr ( wide >= 2 ) if ( rows > 4 ) {
+			moe_gemm_ext<t_bits, MOE_TILESIZE_N, cb, MOE_TILESIZE_K, 16, FS>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain );
+			return;
+		}
+		moe_gemm_ext<t_bits, MOE_TILESIZE_N, cb, MOE_TILESIZE_K, 4, FS>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain );
+		return;
+	}
 #if EXL3_VOLTA && EXL3_SM70_HMMA
 	if constexpr ( wide == 3 ) if ( rows > 16 ) {
 		if ( rows > 32 ) moe_gemm_m64<t_bits, MOE_TILESIZE_N, cb, MOE_TILESIZE_K, 64, MOE_PREFILL_FRAG_STAGES>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks );
@@ -86,7 +126,7 @@ __device__ inline void moe_gemm(
 // layers that hold half-integer rates (width codes 9, 10 and 11: 1.5, 2.5 and 3.5 bpw) beside 2, 3 and 4 bpw. The two switches are separate kernels
 // because the arms add up in the kernel's stack frame (local memory is reserved for it per resident thread).
 #define MOE_BITS_HALF_DYN 100
-template<int t_bits, int MOE_TILESIZE_N, int cb, int wide>
+template<int t_bits, int MOE_TILESIZE_N, int cb, int wide, bool EXT = false>
 __device__ inline void moe_gemm_k(
 	int bits,
 	const half* in_addr,
@@ -95,28 +135,30 @@ __device__ inline void moe_gemm_k(
 	int rows,
 	int dim_k,
 	int dim_n,
-	int* locks
+	int* locks,
+	const uint16_t* tstart = nullptr,
+	const uint8_t* tgain = nullptr
 ) {
 	if constexpr ( t_bits == MOE_BITS_HALF_DYN ) {
 		switch ( bits ) {
-			case 2: moe_gemm<2, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
-			case 3: moe_gemm<3, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
-			case 9: moe_gemm<9, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
-			case 10: moe_gemm<10, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
-			case 11: moe_gemm<11, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
-			default: moe_gemm<4, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
+			case 2: moe_gemm<2, MOE_TILESIZE_N, cb, wide, EXT>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain ); break;
+			case 3: moe_gemm<3, MOE_TILESIZE_N, cb, wide, EXT>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain ); break;
+			case 9: moe_gemm<9, MOE_TILESIZE_N, cb, wide, EXT>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain ); break;
+			case 10: moe_gemm<10, MOE_TILESIZE_N, cb, wide, EXT>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain ); break;
+			case 11: moe_gemm<11, MOE_TILESIZE_N, cb, wide, EXT>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain ); break;
+			default: moe_gemm<4, MOE_TILESIZE_N, cb, wide, EXT>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain ); break;
 		}
 	}
 	else if constexpr ( t_bits != 0 ) {
-		moe_gemm<t_bits, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks );
+		moe_gemm<t_bits, MOE_TILESIZE_N, cb, wide, EXT>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain );
 	}
 	else {
 		switch ( bits ) {
-			case 1: moe_gemm<1, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
-			case 2: moe_gemm<2, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
-			case 3: moe_gemm<3, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
-			case 4: moe_gemm<4, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
-			default: moe_gemm<5, MOE_TILESIZE_N, cb, wide>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks ); break;
+			case 1: moe_gemm<1, MOE_TILESIZE_N, cb, wide, EXT>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain ); break;
+			case 2: moe_gemm<2, MOE_TILESIZE_N, cb, wide, EXT>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain ); break;
+			case 3: moe_gemm<3, MOE_TILESIZE_N, cb, wide, EXT>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain ); break;
+			case 4: moe_gemm<4, MOE_TILESIZE_N, cb, wide, EXT>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain ); break;
+			default: moe_gemm<5, MOE_TILESIZE_N, cb, wide, EXT>( in_addr, trellis, out_addr, rows, dim_k, dim_n, locks, tstart, tgain ); break;
 		}
 	}
 }
@@ -223,9 +265,10 @@ __device__ inline void moe_had_d_out(
 	}
 }
 
-template<int t_bits, int MOE_TILESIZE_N, int cb, int wide>
+// EXT: experts of the extended trellis, their tile starts / gains from ext_tables (MoELayerWeights::ext_ptrs); plain kernels ignore the tables
+template<int t_bits, int MOE_TILESIZE_N, int cb, int wide, bool EXT = false>
 __global__ __launch_bounds__( EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16, ( wide == 3 ? MOE_PREFILL_BLOCKS_PER_SM : 1 ) )
-void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
+void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS, const MoeExtTables ext_tables ) {
 	const int group_idx = blockIdx.z;
 	const int block_idx = blockIdx.x;
 	const int group_size = gridDim.x;
@@ -262,6 +305,12 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
 		const uint16_t* exp_down_trellis = down_trellis[expert_idx];
 		const half* exp_down_suh = down_suh[expert_idx];
 		const half* exp_down_svh = down_svh[expert_idx];
+		[[maybe_unused]] const uint16_t *g_ts = nullptr, *u_ts = nullptr, *d_ts = nullptr;
+		[[maybe_unused]] const uint8_t *g_tg = nullptr, *u_tg = nullptr, *d_tg = nullptr;
+		if constexpr ( EXT ) {
+			g_ts = ext_tables.gate_start[expert_idx]; u_ts = ext_tables.up_start[expert_idx]; d_ts = ext_tables.down_start[expert_idx];
+			g_tg = ext_tables.gate_gain[expert_idx]; u_tg = ext_tables.up_gain[expert_idx]; d_tg = ext_tables.down_gain[expert_idx];
+		}
 
 		for ( int row0 = 0; row0 < token_count; row0 += max_tokens_per_expert ) {
 			int rows = MIN( max_tokens_per_expert, token_count - row0 );
@@ -275,8 +324,8 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
 					hidden_dim, warp_idx0, warps_per_group, group_idx, group_size, barrier_counters_sense
 				);
 
-				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( bits_tab ? bits_tab[expert_idx] : K_gate, temp_state_g, exp_gate_trellis, temp_intermediate_g, rows, hidden_dim, intermediate_dim, locks );
-				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( bits_tab ? bits_tab[num_experts + expert_idx] : K_up, temp_state_u, exp_up_trellis, temp_intermediate_u, rows, hidden_dim, intermediate_dim, locks );
+				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide, EXT>( bits_tab ? bits_tab[expert_idx] : K_gate, temp_state_g, exp_gate_trellis, temp_intermediate_g, rows, hidden_dim, intermediate_dim, locks, g_ts, g_tg );
+				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide, EXT>( bits_tab ? bits_tab[num_experts + expert_idx] : K_up, temp_state_u, exp_up_trellis, temp_intermediate_u, rows, hidden_dim, intermediate_dim, locks, u_ts, u_tg );
 			}
 			else {
 				moe_gather_gu_in<false>(
@@ -285,7 +334,7 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
 					hidden_dim, warp_idx0, warps_per_group, group_idx, group_size, barrier_counters_sense
 				);
 
-				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( bits_tab ? bits_tab[num_experts + expert_idx] : K_up, temp_state_u, exp_up_trellis, temp_intermediate_u, rows, hidden_dim, intermediate_dim, locks );
+				moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide, EXT>( bits_tab ? bits_tab[num_experts + expert_idx] : K_up, temp_state_u, exp_up_trellis, temp_intermediate_u, rows, hidden_dim, intermediate_dim, locks, u_ts, u_tg );
 			}
 			group_barrier( group_idx, group_size, barrier_counters_sense );
 
@@ -296,7 +345,7 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS ) {
 				warp_idx0, warps_per_group, group_idx, group_size, barrier_counters_sense
 			);
 
-			moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide>( bits_tab ? bits_tab[2 * num_experts + expert_idx] : K_down, temp_intermediate_g, exp_down_trellis, temp_state_g, rows, intermediate_dim, hidden_dim, locks );
+			moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide, EXT>( bits_tab ? bits_tab[2 * num_experts + expert_idx] : K_down, temp_intermediate_g, exp_down_trellis, temp_state_g, rows, intermediate_dim, hidden_dim, locks, d_ts, d_tg );
 			group_barrier( group_idx, group_size, barrier_counters_sense );
 
 			moe_had_d_out( temp_state_g, output_state, exp_down_svh, rows, top_x, weights, hidden_dim, warp_idx0, warps_per_group );
