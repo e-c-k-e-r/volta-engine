@@ -25,6 +25,9 @@ void reconstruct_slice_ext( half* unpacked, const uint16_t* packed, const uint16
 	int cols, int64_t n_offset, cudaStream_t stream );
 void reconstruct_had_slice_ext( half* unpacked, const uint16_t* packed, const uint16_t* starts, const uint8_t* gains, const half* suh, const half* svh,
 	int K, bool mcg, bool mul1, int rows, int cols, int64_t n_offset, cudaStream_t stream );
+void reconstruct_had_batch( const void* const* table, int count, int K, bool mcg, bool mul1, int rows, int cols, bool half_out, cudaStream_t stream );
+void reconstruct_had_block( void* out, const uint16_t* packed, const uint16_t* starts, const uint8_t* gains, int K, bool mcg, bool mul1, int k0, int rows,
+	int n0, int cols, int stride, bool half_out, cudaStream_t stream );
 void exl3_moe_coop_launch( const MoeCoopParams& p, int device, cudaStream_t stream );
 
 void exl3_gemm_init_all_attrs( int device );

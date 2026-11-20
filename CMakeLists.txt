@@ -523,12 +523,25 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	# Training primitives (FP32 elementwise and reduction kernels, the scaled linear on cuBLAS, Adam) that gradient passes are built from
 	add_library(engine_train STATIC
 		src/kernels/cuda/train/grad.cu
+		src/kernels/cuda/train/qwen4_exp.cu
+		src/train/qwen4_exp.cpp
 	)
 	target_link_libraries(engine_train PUBLIC engine_kernels)
 	set_target_properties(engine_train PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 	add_executable(test_train_grad tests/2_parity/test_train_grad.cpp)
 	target_link_libraries(test_train_grad PRIVATE engine_train)
 	set_target_properties(test_train_grad PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	add_executable(test_train_qwen4_exp tests/2_parity/test_train_qwen4_exp.cpp)
+	target_link_libraries(test_train_qwen4_exp PRIVATE engine_train)
+	set_target_properties(test_train_qwen4_exp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	add_executable(test_train_qwen4_exp_layer tests/2_parity/test_train_qwen4_exp_layer.cpp)
+	target_link_libraries(test_train_qwen4_exp_layer PRIVATE engine_train)
+	set_target_properties(test_train_qwen4_exp_layer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	if(NCCL_LIBRARY)
+		add_executable(test_train_qwen4_exp_tp tests/2_parity/test_train_qwen4_exp_tp.cpp)
+		target_link_libraries(test_train_qwen4_exp_tp PRIVATE engine_train)
+		set_target_properties(test_train_qwen4_exp_tp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	endif()
 
 	# The encoder on Gaussian tiles at every width: error against the rate's bound, and the packed codes decoded by reconstruct in both tile orders
 	add_executable(test_exl3_encode tests/2_parity/test_exl3_encode.cpp)
@@ -567,6 +580,9 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	add_executable(volta_tune src/tools/volta_tune.cpp)
 	target_link_libraries(volta_tune PRIVATE engine_quant_tools engine_train)
 	set_target_properties(volta_tune PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	add_executable(volta_e2e src/tools/volta_e2e.cpp)
+	target_link_libraries(volta_e2e PRIVATE engine_quant_tools engine_train)
+	set_target_properties(volta_e2e PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# Two Hessian captures against each other: the matrices, and the quantization each leads to
 	add_executable(hess_compare tests/tools/hess_compare.cpp)

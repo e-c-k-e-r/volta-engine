@@ -906,6 +906,25 @@ void Qwen4ExpPipeline::trace_rows( int tag, const void* dev, bool streams, int m
 	}
 }
 
+// Debug (train_inputs): record {kind, rows, first position, cols a, cols b}, then the rows of a (FP16) and of b (FP16, cols b may be 0). Kind 0: the
+// token embeddings; 1: the PLE layer's n-gram key and value rows
+void Qwen4ExpPipeline::dump_train_input( int kind, const void* a, int m, int cols_a, const void* b, int cols_b, backend::stream_t stream ) {
+	static const std::string& path = runtime::options().train_inputs;
+	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH ) return;
+	std::vector<backend::half_t> ha( static_cast<size_t>( m ) * cols_a ), hb( static_cast<size_t>( m ) * cols_b );
+	backend::stream_sync( stream );
+	backend::memcpy_async( ha.data(), a, ha.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+	if ( cols_b > 0 ) backend::memcpy_async( hb.data(), b, hb.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
+	if ( FILE* f = std::fopen( path.c_str(), "ab" ) ) {
+		const int hdr[5] = { kind, m, key_hint_ - m, cols_a, cols_b };
+		std::fwrite( hdr, sizeof( int ), 5, f );
+		std::fwrite( ha.data(), sizeof( backend::half_t ), ha.size(), f );
+		if ( cols_b > 0 ) std::fwrite( hb.data(), sizeof( backend::half_t ), hb.size(), f );
+		std::fclose( f );
+	}
+}
+
 // Router output of the m rows: per row top_k expert ids then top_k weights, as floats
 // Debug (route_dump): record {layer, rows, first position, K}, the rows' expert ids (int32) and the router's input rows (FP16); the rows' routing
 // weights (FP32, rows x K) go to <route_dump>.w in the same record order
@@ -1218,6 +1237,7 @@ void Qwen4ExpPipeline::ple_forward( int m, backend::stream_t stream ) {
 		engine::modules::Linear::forward( ple_emb_, ple_.key_proj, ple_key_, stream );
 		engine::modules::Linear::forward( ple_emb_, ple_.value_proj, ple_value_, stream );
 	}
+	dump_train_input( 1, ple_key_.data, m, hc * H, ple_value_.data, H, stream );
 	engine::modules::PLE::gate_and_norm( ple_key_.ptr<const backend::half_t>(), ple_value_.ptr<const backend::half_t>(), streams_.ptr<const float>(),
 		ple_.norm_key.ptr<const backend::half_t>(), ple_.norm_query.ptr<const backend::half_t>(), ple_.norm_conv.ptr<const backend::half_t>(),
 		ple_gated_, ple_normed_, m, H, hc, config_.rms_norm_eps, 1.0f / std::sqrt( static_cast<float>( H ) ), stream );
@@ -1370,6 +1390,7 @@ void Qwen4ExpPipeline::mlp_site( const Qwen4ExpLayerWeights& lw, int L, int m, b
 void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 	const int H = config_.hidden_size, hc = config_.hc_mult;
 	apply_pending_ = false;
+	dump_train_input( 0, embed_rows_.data, m, H, nullptr, 0, stream );
 	engine::modules::GatedResidual::init_streams( embed_rows_.ptr<const backend::half_t>(), streams_.ptr<float>(), m, H, hc, stream );
 	trace_rows( 1000, streams_.data, true, m, stream );
 	int linear_idx = 0, attn_idx = 0;

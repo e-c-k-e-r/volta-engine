@@ -28,6 +28,7 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -86,12 +87,16 @@ void softmax_row( const backend::half_t* l, int V, std::vector<double>& p ) {
 }
 
 // Teacher-forced pass over every sample, `chunk` rows per forward; calls scored( sample, position, probabilities ) for each generated
-// token (the distribution that predicts it)
+// token (the distribution that predicts it), in order. A chunk's host work (the softmax over the vocabulary and scored) runs on a worker
+// thread while the next chunk's forward runs, two logits buffers taking turns
 template <typename F>
 void teacher_forced( ModelCluster& mc, const std::vector<Sample>& samples, int chunk, F scored ) {
 	const int V = mc.metadata().vocab_size;
-	std::vector<backend::half_t> logits( static_cast<size_t>( chunk ) * V );
+	std::vector<backend::half_t> logits[2] = { std::vector<backend::half_t>( static_cast<size_t>( chunk ) * V ),
+		std::vector<backend::half_t>( static_cast<size_t>( chunk ) * V ) };
 	std::vector<double> p( V );
+	std::thread worker;
+	int buf = 0;
 	for ( size_t si = 0; si < samples.size(); ++si ) {
 		const Sample& s = samples[si];
 		const int n = static_cast<int>( s.ids.size() );
@@ -101,13 +106,18 @@ void teacher_forced( ModelCluster& mc, const std::vector<Sample>& samples, int c
 		for ( int off = s.prompt - 1; off + 1 < n; off += chunk ) {
 			const int count = std::min( chunk, n - 1 - off );
 			mc.forward( s.ids.data() + off, pod::BatchRows::causal( count, off, 0, pod::BatchRows::LOGITS_ALL ) );
-			mc.read_logits( count, logits.data() );
-			for ( int r = 0; r < count; ++r ) {
-				softmax_row( logits.data() + static_cast<size_t>( r ) * V, V, p );
-				scored( si, off + r + 1, p );
-			}
+			mc.read_logits( count, logits[buf].data() );
+			if ( worker.joinable() ) worker.join();   // the previous chunk's rows scored first (and its buffer free again)
+			worker = std::thread( [&, si, off, count, b = buf] {
+				for ( int r = 0; r < count; ++r ) {
+					softmax_row( logits[b].data() + static_cast<size_t>( r ) * V, V, p );
+					scored( si, off + r + 1, p );
+				}
+			} );
+			buf ^= 1;
 		}
 	}
+	if ( worker.joinable() ) worker.join();
 }
 
 } // namespace

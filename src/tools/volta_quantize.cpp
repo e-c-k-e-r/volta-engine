@@ -469,7 +469,7 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 			continue;
 		}
 		const double rate = tiles / std::max( total, 1e-9 );
-		LOG_INFO( "[volta_quantize] GPU %d: %s%s, %zu tensors, %d bits%s, mean proxy error %.5f, %.1f s (%.0f%%, %.0f tiles/s, %.0f min left)", device,
+		LOG_INFO( "[volta_quantize] GPU %d: %s%s, %zu tensors, %d%s bits, mean proxy error %.5f, %.1f s (%.0f%%, %.0f tiles/s, %.0f min left)", device,
 			first.base.c_str(), it.tensors.size() > 1 ? " ..." : "", done.size(), engine::modules::trellis_k2( o.code ) / 2,
 			engine::modules::trellis_k2( o.code ) % 2 ? ".5" : "", err_sum / std::max<size_t>( done.size(), 1 ), secs,
 			100.0 * tiles / std::max<int64_t>( sh.tiles_total, 1 ), rate, ( sh.tiles_total - tiles ) / std::max( rate, 1e-9 ) / 60.0 );

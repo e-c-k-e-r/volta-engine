@@ -105,17 +105,18 @@ constexpr auto reconstruct_kernel_instances = std::array{
 
 #define RH_THREADS 256
 
-template <int K, int cb>
-__global__ __launch_bounds__( RH_THREADS )
-void reconstruct_had_kernel(
-	half* __restrict__ g_unpacked,
+// The body of reconstruct_had_kernel. OUT 0: FP16 times the scales; with unit scales, 1: FP32 out (g_unpacked then a float*), 2: FP16 out
+template <int K, int cb, int OUT>
+__device__ __forceinline__ void reconstruct_had_body(
+	void* __restrict__ g_unpacked,
 	const uint16_t* __restrict__ g_packed,
 	const uint16_t* __restrict__ g_starts,
 	const uint8_t* __restrict__ g_gains,
 	const half* __restrict__ suh,
 	const half* __restrict__ svh,
 	int packed_blocks_n,
-	int packed_n_offset
+	int packed_n_offset,
+	int k_block_offset   // the first 128-row block of the codes (the output starts at row 0)
 ) {
 	constexpr int packed_size = engine::modules::trellis_tile_u16( K );
 	constexpr float r_scale = 0.08838834764831845f;
@@ -124,6 +125,7 @@ void reconstruct_had_kernel(
 	int lane_id = t % 32;
 	int warp_id = t / 32;
 	int kb = blockIdx.y;
+	const int kbp = kb + k_block_offset;
 	int nb = blockIdx.x;
 	int n = nb * 8;
 	int row_len = gridDim.x * 128;
@@ -140,7 +142,7 @@ void reconstruct_had_kernel(
 		int j = u / ( 8 * j_int4 );
 		int r = u % ( 8 * j_int4 );
 		const uint16_t* gp = g_packed +
-			( (size_t) ( ( kb * 8 + j ) * packed_blocks_n + packed_n_offset + n ) ) * packed_size;
+			( (size_t) ( ( kbp * 8 + j ) * packed_blocks_n + packed_n_offset + n ) ) * packed_size;
 		( (int4*) s_packed[j] )[r] = ( (const int4*) gp )[r];
 	}
 	__syncthreads();
@@ -149,7 +151,7 @@ void reconstruct_had_kernel(
 		int j = ( warp_id / 8 ) * ( 8 / ( RH_THREADS / 256 ) ) + jj;
 		int wn = warp_id % 8;
 		FragB frag[2];
-		const size_t tile_idx = (size_t) ( kb * 8 + j ) * packed_blocks_n + packed_n_offset + n + wn;
+		const size_t tile_idx = (size_t) ( kbp * 8 + j ) * packed_blocks_n + packed_n_offset + n + wn;
 		dq_dispatch_ext<K, cb>( s_packed[j][wn], lane_id * 8, frag[0], frag[1], g_starts ? g_starts[tile_idx] : 0u, g_starts != nullptr,
 			g_gains != nullptr, g_gains ? tile_gain2( g_gains[tile_idx] ) : __half2half2( __ushort_as_half( 0x3c00 ) ) );
 
@@ -239,7 +241,7 @@ void reconstruct_had_kernel(
 	__syncthreads();
 
 	constexpr int ROWS_PW = 128 / ( RH_THREADS / 32 );
-	const half4 sv4 = ( (const half4*) svh )[nb * 32 + lane_id];
+	const half4 sv4 = OUT != 0 ? half4{} : ( (const half4*) svh )[nb * 32 + lane_id];
 	#pragma unroll
 	for ( int rr = 0; rr < ROWS_PW; ++rr ) {
 		int R = warp_id * ROWS_PW + rr;
@@ -254,12 +256,55 @@ void reconstruct_had_kernel(
 		half2 h23 = __hmul2( __floats2half2_rn( s0 - s1, d0 - d1 ), rs2 );
 		h01 = shuffle_had_h2x32( h01, lane_id );
 		h23 = shuffle_had_h2x32( h23, lane_id );
-		half2 su2 = __half2half2( suh[kb * 128 + R] );
-		half4 v;
-		v.x = __hmul2( __hmul2( h01, su2 ), sv4.x );
-		v.y = __hmul2( __hmul2( h23, su2 ), sv4.y );
-		*( (half4*) ( g_unpacked + (size_t) ( kb * 128 + R ) * row_len + nb * 128 + lane_id * 4 ) ) = v;
+		const size_t at = (size_t) ( kb * 128 + R ) * row_len + nb * 128 + lane_id * 4;
+		if constexpr ( OUT == 1 ) {
+			*( (float4*) ( static_cast<float*>( g_unpacked ) + at ) ) = make_float4( __low2float( h01 ), __high2float( h01 ), __low2float( h23 ), __high2float( h23 ) );
+		}
+		else if constexpr ( OUT == 2 ) {
+			half4 v;
+			v.x = h01;
+			v.y = h23;
+			*( (half4*) ( static_cast<half*>( g_unpacked ) + at ) ) = v;
+		}
+		else {
+			half2 su2 = __half2half2( suh[kb * 128 + R] );
+			half4 v;
+			v.x = __hmul2( __hmul2( h01, su2 ), sv4.x );
+			v.y = __hmul2( __hmul2( h23, su2 ), sv4.y );
+			*( (half4*) ( static_cast<half*>( g_unpacked ) + at ) ) = v;
+		}
 	}
+}
+
+template <int K, int cb>
+__global__ __launch_bounds__( RH_THREADS )
+void reconstruct_had_kernel(
+	half* __restrict__ g_unpacked,
+	const uint16_t* __restrict__ g_packed,
+	const uint16_t* __restrict__ g_starts,
+	const uint8_t* __restrict__ g_gains,
+	const half* __restrict__ suh,
+	const half* __restrict__ svh,
+	int packed_blocks_n,
+	int packed_n_offset
+) {
+	reconstruct_had_body<K, cb, 0>( g_unpacked, g_packed, g_starts, g_gains, suh, svh, packed_blocks_n, packed_n_offset, 0 );
+}
+
+// Unit scales, FP32 (OUT 1) or FP16 (OUT 2): batch z of a table of 4 * count pointers (codes, starts, gains, out per entry; whole tensors), or
+// without a table one block of rows and columns of the tensor given directly
+template <int K, int cb, int OUT>
+__global__ __launch_bounds__( RH_THREADS )
+void reconstruct_had_batch_kernel( const void* const* __restrict__ table, int count, int packed_blocks_n, int packed_n_offset, int k_block_offset, void* out,
+	const uint16_t* packed, const uint16_t* starts, const uint8_t* gains ) {
+	const int z = blockIdx.z;
+	if ( table ) {
+		out = const_cast<void*>( table[3 * count + z] );
+		packed = static_cast<const uint16_t*>( table[z] );
+		starts = static_cast<const uint16_t*>( table[count + z] );
+		gains = static_cast<const uint8_t*>( table[2 * count + z] );
+	}
+	reconstruct_had_body<K, cb, OUT>( out, packed, starts, gains, nullptr, nullptr, packed_blocks_n, packed_n_offset, k_block_offset );
 }
 
 #define __(i, cb) reconstruct_had_kernel<i, cb>
@@ -268,6 +313,22 @@ constexpr auto reconstruct_had_kernel_instances = std::array{
 	__(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
 	__(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
 	__(9, 2), __(10, 2), __(11, 2)   // the half-integer rates 1.5, 2.5, 3.5 (mul1 only)
+};
+#undef __
+#define __(i, cb) reconstruct_had_batch_kernel<i, cb, 1>
+constexpr auto reconstruct_had_batch_f32_instances = std::array{
+	__(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
+	__(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
+	__(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+	__(9, 2), __(10, 2), __(11, 2)
+};
+#undef __
+#define __(i, cb) reconstruct_had_batch_kernel<i, cb, 2>
+constexpr auto reconstruct_had_batch_f16_instances = std::array{
+	__(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
+	__(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
+	__(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+	__(9, 2), __(10, 2), __(11, 2)
 };
 #undef __
 
@@ -358,6 +419,27 @@ void reconstruct_had_slice_ext( half* unpacked, const uint16_t* packed, const ui
 		packed_cols,
 		packed_n_offset
 	);
+}
+
+void reconstruct_had_batch( const void* const* table, int count, int K, bool mcg, bool mul1, int rows, int cols, bool half_out, cudaStream_t stream ) {
+	if ( count <= 0 || K < 1 || K > 11 || ( K > 8 && !mul1 ) ) return;
+	int cbi = K - 1;
+	if ( K > 8 ) cbi = 24 + K - 9;
+	else if ( mcg ) cbi += 8;
+	else if ( mul1 ) cbi += 16;
+	const auto fn = half_out ? reconstruct_had_batch_f16_instances[cbi] : reconstruct_had_batch_f32_instances[cbi];
+	fn<<<dim3( cols / 128, rows / 128, count ), RH_THREADS, 0, stream>>>( table, count, cols / 16, 0, 0, nullptr, nullptr, nullptr, nullptr );
+}
+
+void reconstruct_had_block( void* out, const uint16_t* packed, const uint16_t* starts, const uint8_t* gains, int K, bool mcg, bool mul1, int k0, int rows,
+	int n0, int cols, int stride, bool half_out, cudaStream_t stream ) {
+	if ( K < 1 || K > 11 || ( K > 8 && !mul1 ) ) return;
+	int cbi = K - 1;
+	if ( K > 8 ) cbi = 24 + K - 9;
+	else if ( mcg ) cbi += 8;
+	else if ( mul1 ) cbi += 16;
+	const auto fn = half_out ? reconstruct_had_batch_f16_instances[cbi] : reconstruct_had_batch_f32_instances[cbi];
+	fn<<<dim3( cols / 128, rows / 128, 1 ), RH_THREADS, 0, stream>>>( nullptr, 1, stride / 16, n0 / 16, k0 / 128, out, packed, starts, gains );
 }
 
 void reconstruct_had_slice(

@@ -1,6 +1,10 @@
 // Teacher-forced perplexity of a text file on a served model: the same tokens run through chunked prefill with every row's logits read back,
 // so two builds (or two kernel paths) can be compared on a quality metric instead of greedy tokens. Optionally writes the per-token NLL.
-//   test_ppl [--glm | --flash] [--file PATH] [--tokens N] [--chunk C] [--nll OUT.bin]
+//   test_ppl [--glm | --flash] [--file PATH] [--tokens N] [--chunk C] [--nll OUT.bin] [--topk-out OUT.bin [--topk K]]
+//     --topk-out: the model's distribution at every position as a teacher (volta_e2e): int32 magic 0x4b504f54, tokens N, seq, K, the N token ids,
+//     then per position K ids (int32, most likely first), their probabilities (FP32) and the mass outside them (FP32)
+//   --kl-teacher FILE (a --topk-out file of the same text and settings): also KL( teacher || model ) per position, over the teacher's top K plus
+//     its lumped tail, averaged (--kl-from P: only the positions from P on, e.g. the sequences volta_e2e holds out)
 //   test_ppl --calibrate --file TEXT --seq 2048 --tokens N   cuts the text into independent rows of 2048 tokens (the slot restarts at each), as calibration rows are
 //   test_ppl --calibrate --prompts DIR [--tokens N] [--chunk C]   replays the rendered prompts a server wrote with dump_requests (req_N.prompt.txt, chat-template tokens
 //   intact): only the last request of each session is used, and the rows it shares with an earlier session (the system prompt and tool schemas) run without
@@ -22,7 +26,9 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <filesystem>
+#include <sched.h>
 
 using namespace engine::runtime;
 namespace backend = engine::backend;
@@ -31,8 +37,8 @@ int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	bool glm = false, flash = false, calibrate = false;
 	int n_tokens = 6000, chunk = 512;
-	std::string file, nll_out, qbench, prompts_dir;
-	int seq = 0, max_sessions = 0, skip_override = 0, show_miss = 0, stride = 1;
+	std::string file, nll_out, qbench, prompts_dir, topk_out, kl_teacher;
+	int seq = 0, max_sessions = 0, skip_override = 0, show_miss = 0, stride = 1, topk = 128, kl_from = 0;
 	std::string select;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
@@ -43,6 +49,10 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--qbench" ) && i + 1 < argc ) qbench = argv[++i];
 		else if ( !std::strcmp( argv[i], "--calibrate" ) ) calibrate = true;
 		else if ( !std::strcmp( argv[i], "--nll" ) && i + 1 < argc ) nll_out = argv[++i];
+		else if ( !std::strcmp( argv[i], "--topk-out" ) && i + 1 < argc ) topk_out = argv[++i];
+		else if ( !std::strcmp( argv[i], "--topk" ) && i + 1 < argc ) topk = std::atoi( argv[++i] );
+		else if ( !std::strcmp( argv[i], "--kl-teacher" ) && i + 1 < argc ) kl_teacher = argv[++i];
+		else if ( !std::strcmp( argv[i], "--kl-from" ) && i + 1 < argc ) kl_from = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--prompts" ) && i + 1 < argc ) prompts_dir = argv[++i];
 		else if ( !std::strcmp( argv[i], "--seq" ) && i + 1 < argc ) seq = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--select" ) && i + 1 < argc ) select = argv[++i];
@@ -368,11 +378,121 @@ int main( int argc, char** argv ) {
 	const int V = mc.metadata().vocab_size;
 	mc.reset_slot( 0 );
 	std::vector<backend::half_t> logits( static_cast<size_t>( chunk ) * V );
+	FILE* tf = nullptr;
+	if ( !topk_out.empty() ) {
+		tf = std::fopen( topk_out.c_str(), "wb" );
+		ENGINE_ASSERT( tf != nullptr, "test_ppl: cannot write --topk-out" );
+		const int hdr[4] = { 0x4b504f54, n_tokens, seq, topk };
+		std::fwrite( hdr, sizeof( int ), 4, tf );
+		std::fwrite( ids.data(), sizeof( int ), n_tokens, tf );
+	}
+	// A stored teacher to measure against: its tokens must be these
+	std::vector<int> kt_ids;
+	std::vector<float> kt_p, kt_tail;
+	int kt_k = 0;
+	if ( !kl_teacher.empty() ) {
+		FILE* kf = std::fopen( kl_teacher.c_str(), "rb" );
+		int hdr[4] = {};
+		ENGINE_ASSERT( kf && std::fread( hdr, sizeof( int ), 4, kf ) == 4 && hdr[0] == 0x4b504f54 && hdr[1] == n_tokens && hdr[2] == seq,
+			"test_ppl: --kl-teacher is not a --topk-out file of this text and settings" );
+		kt_k = hdr[3];
+		std::vector<int> toks( n_tokens );
+		ENGINE_ASSERT( std::fread( toks.data(), sizeof( int ), n_tokens, kf ) == static_cast<size_t>( n_tokens ) && toks == ids, "test_ppl: --kl-teacher holds other tokens" );
+		kt_ids.resize( static_cast<size_t>( n_tokens ) * kt_k );
+		kt_p.resize( kt_ids.size() );
+		kt_tail.resize( n_tokens );
+		for ( int r = 0; r < n_tokens; ++r ) {
+			ENGINE_ASSERT( std::fread( kt_ids.data() + static_cast<size_t>( r ) * kt_k, sizeof( int ), kt_k, kf ) == static_cast<size_t>( kt_k ) &&
+				std::fread( kt_p.data() + static_cast<size_t>( r ) * kt_k, sizeof( float ), kt_k, kf ) == static_cast<size_t>( kt_k ) &&
+				std::fread( &kt_tail[r], sizeof( float ), 1, kf ) == 1, "test_ppl: --kl-teacher is short" );
+		}
+		std::fclose( kf );
+	}
+	double kl_sum = 0.0;
+	size_t kl_n = 0;
 	std::vector<float> nll;
 	nll.reserve( n_tokens );
 	double total = 0.0;
+	// Per row of a chunk: the softmax's max and sum once, then the teacher's top K and the rest (--topk-out), the KL against a stored teacher
+	// and the NLL; the rows run in parallel over the process's cores (the GPUs wait on this host work otherwise), the results are written and
+	// summed in row order
+	struct RowOut {
+		std::vector<int> ids;
+		std::vector<float> p;
+		float tail = 0.0f, nl = 0.0f;
+		double kl = 0.0;
+		bool has_kl = false, has_nl = false;
+		int top = 0;
+	};
+	std::vector<RowOut> outs( chunk );
+	for ( RowOut& o : outs ) {
+		o.ids.resize( topk );
+		o.p.resize( topk );
+	}
+	int workers = 1;
+	{
+		cpu_set_t cs;
+		if ( sched_getaffinity( 0, sizeof( cs ), &cs ) == 0 ) workers = CPU_COUNT( &cs );
+		workers = std::max( 1, std::min( { workers, chunk, 16 } ) );
+	}
+	std::vector<std::vector<float>> w_all( workers, std::vector<float>( V ) );
+	std::vector<std::vector<int>> w_order( tf ? workers : 0, std::vector<int>( V ) );
+	auto row_work = [&]( int w, int r, int off ) {
+		RowOut& o = outs[r];
+		const backend::half_t* l = logits.data() + static_cast<size_t>( r ) * V;
+		std::vector<float>& t_all = w_all[w];
+		float mx = -1e30f;
+		int top = 0;
+		for ( int v = 0; v < V; ++v ) {
+			t_all[v] = backend::to_float( l[v] );
+			if ( t_all[v] > mx ) {
+				mx = t_all[v];
+				top = v;
+			}
+		}
+		double sum = 0.0;
+		for ( int v = 0; v < V; ++v ) sum += std::exp( static_cast<double>( t_all[v] - mx ) );
+		o.top = top;
+		if ( tf ) {
+			// the teacher at this position: softmax over the vocabulary, the top K and the rest
+			std::vector<int>& order = w_order[w];
+			for ( int v = 0; v < V; ++v ) order[v] = v;
+			auto better = [&]( int a, int b ) { return t_all[a] > t_all[b] || ( t_all[a] == t_all[b] && a < b ); };
+			std::nth_element( order.begin(), order.begin() + topk, order.end(), better );
+			std::sort( order.begin(), order.begin() + topk, better );
+			double in = 0.0;
+			for ( int j = 0; j < topk; ++j ) {
+				o.ids[j] = order[j];
+				o.p[j] = static_cast<float>( std::exp( static_cast<double>( t_all[order[j]] - mx ) ) / sum );
+				in += o.p[j];
+			}
+			o.tail = static_cast<float>( std::max( 0.0, 1.0 - in ) );
+		}
+		const size_t row = static_cast<size_t>( off + r );
+		o.has_kl = kt_k > 0 && off + r >= kl_from;
+		if ( o.has_kl ) {
+			// KL( teacher || model ) at this position: the teacher's top entries and its tail against the model's mass outside them
+			const double lse = std::log( sum ) + mx;
+			double k = 0.0, qs = 0.0;
+			for ( int j = 0; j < kt_k; ++j ) {
+				const double lq = t_all[kt_ids[row * kt_k + j]] - lse, pp = kt_p[row * kt_k + j];
+				qs += std::exp( lq );
+				if ( pp > 0.0 ) k += pp * ( std::log( pp ) - lq );
+			}
+			const double pt = kt_tail[row], qt = std::max( 1.0 - qs, 1e-12 );
+			if ( pt > 0.0 ) k += pt * ( std::log( pt ) - std::log( qt ) );
+			o.kl = k;
+		}
+		o.has_nl = off + r + 1 < n_tokens;
+		if ( o.has_nl ) o.nl = static_cast<float>( std::log( sum ) + mx - t_all[ids[off + r + 1]] );
+	};
 	for ( int off = 0; off + 1 < n_tokens; ) {
 		const int pos = seq > 0 ? off % seq : off;   // --seq: independent rows, the slot restarts at each
+		// --kl-from over independent rows (no teacher written): a whole row before the measured positions adds nothing, skip it
+		if ( seq > 0 && pos == 0 && kt_k > 0 && !tf && off + seq <= kl_from ) {
+			off += seq;
+			continue;
+		}
 		if ( seq > 0 && pos == 0 ) mc.reset_slot( 0 );
 		const int count = std::min( { chunk, n_tokens - off, seq > 0 ? seq - pos : chunk } );
 		mc.forward( ids.data() + off, pod::BatchRows::causal( count, pos, 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );
@@ -382,27 +502,40 @@ int main( int argc, char** argv ) {
 		}
 		if ( calibrate ) { off += count; continue; }   // forward only: ENGINE_HESSIAN_DIR collects its statistics in the layers
 		mc.read_logits( count, logits.data() );
-		for ( int r = 0; r < count && off + r + 1 < n_tokens; ++r ) {
-			const backend::half_t* l = logits.data() + static_cast<size_t>( r ) * V;
-			float mx = -1e30f;
-			for ( int v = 0; v < V; ++v ) mx = std::fmax( mx, backend::to_float( l[v] ) );
-			double sum = 0.0;
-			for ( int v = 0; v < V; ++v ) sum += std::exp( static_cast<double>( backend::to_float( l[v] ) - mx ) );
-			const float nl = static_cast<float>( std::log( sum ) + mx - backend::to_float( l[ids[off + r + 1]] ) );
-			if ( show_miss > 0 && nl > 10.0f && static_cast<int>( nll.size() ) % 25 == 0 ) {   // every 25th position of the badly predicted ones: the target and the model's top guess
-				int top = 0;
-				for ( int v = 1; v < V; ++v ) if ( backend::to_float( l[v] ) > backend::to_float( l[top] ) ) top = v;
-				std::printf( "[miss] pos %d target %d (%s) top %d (%s) nll %.1f\n", off + r + 1, ids[off + r + 1], tok.decode( { ids[off + r + 1] } ).c_str(), top, tok.decode( { top } ).c_str(), nl );
+		{
+			const int nw = std::min( workers, count );
+			std::vector<std::thread> th;
+			for ( int w = 1; w < nw; ++w ) th.emplace_back( [&, w] { for ( int r = w; r < count; r += nw ) row_work( w, r, off ); } );
+			for ( int r = 0; r < count; r += nw ) row_work( 0, r, off );
+			for ( auto& t : th ) t.join();
+		}
+		for ( int r = 0; r < count; ++r ) {
+			const RowOut& o = outs[r];
+			if ( tf ) {
+				std::fwrite( o.ids.data(), sizeof( int ), topk, tf );
+				std::fwrite( o.p.data(), sizeof( float ), topk, tf );
+				std::fwrite( &o.tail, sizeof( float ), 1, tf );
+			}
+			if ( o.has_kl ) {
+				kl_sum += o.kl;
+				++kl_n;
+			}
+			if ( !o.has_nl ) continue;
+			if ( show_miss > 0 && o.nl > 10.0f && static_cast<int>( nll.size() ) % 25 == 0 ) {   // every 25th position of the badly predicted ones: the target and the model's top guess
+				std::printf( "[miss] pos %d target %d (%s) top %d (%s) nll %.1f\n", off + r + 1, ids[off + r + 1], tok.decode( { ids[off + r + 1] } ).c_str(), o.top,
+					tok.decode( { o.top } ).c_str(), o.nl );
 				if ( --show_miss == 0 ) show_miss = -1;
 			}
-			nll.push_back( nl );
-			total += nl;
+			nll.push_back( o.nl );
+			total += o.nl;
 		}
 		off += count;
 	}
+	if ( tf ) std::fclose( tf );
 	if ( calibrate ) { mc.shutdown(); return 0; }
 	const double mean = total / nll.size();
 	std::printf( "[*] %zu predicted tokens: mean NLL %.4f, perplexity %.3f\n", nll.size(), mean, std::exp( mean ) );
+	if ( kl_n > 0 ) std::printf( "[*] KL( teacher || model ) over %zu positions: %.6f per token\n", kl_n, kl_sum / kl_n );
 	if ( !nll_out.empty() ) {
 		if ( FILE* f = std::fopen( nll_out.c_str(), "wb" ) ) {
 			std::fwrite( nll.data(), sizeof( float ), nll.size(), f );

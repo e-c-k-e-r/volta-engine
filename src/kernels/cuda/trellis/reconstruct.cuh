@@ -48,3 +48,10 @@ void reconstruct_slice_ext( half* unpacked, const uint16_t* packed, const uint16
 	int cols, int64_t n_offset, cudaStream_t stream );
 void reconstruct_had_slice_ext( half* unpacked, const uint16_t* packed, const uint16_t* starts, const uint8_t* gains, const half* suh, const half* svh,
 	int K, bool mcg, bool mul1, int rows, int cols, int64_t n_offset, cudaStream_t stream );
+// count whole [rows, cols] tensors of one format with unit scales into FP32 (half_out: FP16): table (device) holds 4 * count pointers, the
+// codes of every entry, then their starts, gains (either null) and outputs
+void reconstruct_had_batch( const void* const* table, int count, int K, bool mcg, bool mul1, int rows, int cols, bool half_out, cudaStream_t stream );
+// Rows k0 .. k0 + rows and columns n0 .. n0 + cols (multiples of 128) of a tensor stride columns wide with unit scales, into [rows, cols] FP32
+// (half_out: FP16)
+void reconstruct_had_block( void* out, const uint16_t* packed, const uint16_t* starts, const uint8_t* gains, int K, bool mcg, bool mul1, int k0, int rows,
+	int n0, int cols, int stride, bool half_out, cudaStream_t stream );
