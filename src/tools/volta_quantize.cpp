@@ -16,7 +16,7 @@
 //
 // --scale-search: how a tensor whose global scale starts from a like one's (the next projection of a group, a layer's next expert down
 // projection) searches it: full (the fine grid of five on the whole sample), light (three scales on a lighter sample, the full grid when the
-// minimum is at an edge) or hint (that scale as it is)
+// minimum is at an edge) or hint (that scale as it is; the default)
 //
 // --open-trellis stores each tile's start state (<base>.tstart) instead of wrapping its stream, --tile-gain an 8-bit gain per tile (<base>.tgain):
 // the extended trellis, for the routed experts only (the engine's MoE kernels decode it; every other tensor stays plain)
@@ -81,7 +81,7 @@ struct Args {
 	float aff_eps = 0.0f;
 	bool ldl_metric = false, open_trellis = false, tile_gain = false;
 	float sigma_reg = 0.025f;
-	int scale_search = 2;   // --scale-search full / light / hint (Exl3QuantOptions::scale_search)
+	int scale_search = 0;   // --scale-search full / light / hint (the default; Exl3QuantOptions::scale_search)
 };
 
 std::vector<std::string> split( const std::string& s, char sep ) {
