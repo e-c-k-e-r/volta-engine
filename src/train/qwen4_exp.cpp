@@ -364,7 +364,7 @@ struct Model::Impl {
 	bool train_norms = true;
 	bool train_dense = false;   // the small dense tensors trained too (set before the load): the hyper-connection sites' inject mixes, GDN's
 	                            // in_proj_a / b, A_log, dt_bias and convolution, the shared expert's gate, PLE's convolution
-	float dense_lr = 0.03f;     // their learning rate, a fraction of the step's
+	float dense_lr = 0.1f;      // their learning rate, a fraction of the step's
 	bool train_router = false;  // the routers' weights trained too (set before the load; in dense_p at dense_lr)
 	bool opt_host = false;      // the optimizer state in host memory
 	int opt_bits = 32;          // Adam's moments: 32 (FP32) or 8 (block-wise)

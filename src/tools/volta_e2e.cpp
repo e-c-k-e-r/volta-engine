@@ -16,7 +16,7 @@
 // step streams the state through in parts). The memory per component is logged after the first step.
 //
 //   volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] [--fp16 1]
-//             [--norms 1] [--dense 0] [--dense-lr 0.03] [--router 0] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
+//             [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
 //             [--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]
 //   --check-trace: a trace_layers file of the model's engine forward over the first sequence (test_ppl --calibrate --chunk 512): every layer of
 //     the training form fed the engine's input streams of that layer, its output against the engine's, and the first sequence's embedding
@@ -59,7 +59,7 @@ struct Args {
 	std::vector<int> devices = { 0, 1, 2, 3 };
 	int steps = 64, batch = 4, hold = 4, eval_every = 16, warmup = 2, train = 0, adam_bits = 32;
 	bool write = true, timing = false, tp = true, fp16 = true, norms = true, dense = false, router = false, opt_host = false;
-	float lr = 1e-3f, lr_min = 0.1f, dense_lr = 0.03f;
+	float lr = 1e-3f, lr_min = 0.1f, dense_lr = 0.1f;
 };
 
 // The learning rate of a step (from 1): linear warmup, then a cosine from lr (the first step after the warmup) to lr * lr_min (the last step)
@@ -126,7 +126,7 @@ bool parse( int argc, char** argv, Args& a ) {
 	}
 	if ( a.model.empty() || a.inputs.empty() || a.teacher.empty() || a.out.empty() || ( a.adam_bits != 32 && a.adam_bits != 8 ) ) {
 		LOG_ERROR( "usage: volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] "
-			"[--fp16 1] [--norms 1] [--dense 0] [--dense-lr 0.03] [--router 0] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
+			"[--fp16 1] [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
 			"[--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]" );
 		return false;
 	}

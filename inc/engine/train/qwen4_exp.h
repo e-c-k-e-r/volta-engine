@@ -273,7 +273,7 @@ public:
 	// The small dense tensors trained too (before load; off by default): the hyper-connection sites' inject mixes, GDN's in_proj_a / b, A_log,
 	// dt_bias and convolution, the shared expert's gate and PLE's convolution, as additive deltas like the norms (dense_tensors lists them), at
 	// lr_scale times the learning rate (a row of them feeds a dot product: Adam's per-entry step adds up over its width)
-	void set_train_dense( bool on, float lr_scale = 0.03f );
+	void set_train_dense( bool on, float lr_scale = 0.1f );
 	// The routers' weights trained too (before load; off by default), with the small dense tensors' learning rate (dense_tensors lists them)
 	void set_train_router( bool on );
 	// Where Adam's state lives (before load): on the device (the default) or with host, in pinned host memory, streamed through the device in
