@@ -11,6 +11,7 @@
 #include <cublas_v2.h>
 #include <cusolverDn.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -466,7 +467,8 @@ float ldlq_drift( int code ) {
 
 // The global scale that minimizes the sampled tile error: a wrapped diagonal of tiles three wide (every tile row and column at least once) plus
 // the tiles of highest and lowest RMS; a coarse grid on a third of them, a fine grid around its minimum on all, refined by a parabola. From a
-// hint the fine grid goes around it first, and the coarse grid runs only when that grid's minimum is at an edge
+// hint the fine grid goes around it first, and the coarse grid runs only when that grid's minimum is at an edge (scale_search 1: three
+// scales on a lighter sample before that; 0: the hint itself)
 float scale_search( Ctx& c, const float* W, int k, int n, const engine::quant::Exl3QuantOptions& o, const engine::quant::Exl3EncodeScratch& sc,
 	float hint ) {
 	const int tk = k / 16, tn = n / 16, width = 3;
@@ -540,6 +542,22 @@ float scale_search( Ctx& c, const float* W, int k, int n, const engine::quant::E
 		return std::max( fine[best] + static_cast<float>( offset ) * step, 0.01f );
 	};
 	int best = 0;
+	if ( hint >= 0.2f && o.scale_search == 0 ) return hint;
+	if ( hint >= 0.2f && o.scale_search == 1 ) {
+		// three scales around the hint on the one-wide diagonal and the extreme tiles; the parabola through them unless the minimum is at an edge
+		std::vector<int2> light;
+		for ( int ii = 0; ii < diag_len; ++ii ) light.push_back( picks[static_cast<size_t>( ii ) * width] );
+		light.insert( light.end(), picks.begin() + static_cast<size_t>( diag_len ) * width, picks.end() );
+		DBuf<int2> d_light( light.size() );
+		CUDA_CHECK( cudaMemcpyAsync( d_light.p, light.data(), light.size() * sizeof( int2 ), cudaMemcpyHostToDevice, c.stream ) );
+		const std::vector<float> three = { hint - step, hint, hint + step };
+		const auto m3 = eval( three, d_light.p, static_cast<int>( light.size() ) );
+		const double denom = m3[0] - 2.0 * m3[1] + m3[2];
+		if ( m3[1] <= m3[0] && m3[1] <= m3[2] && denom > 0.0 ) {
+			const double offset = std::max( -0.5, std::min( 0.5, 0.5 * ( m3[0] - m3[2] ) / denom ) );
+			return std::max( hint + static_cast<float>( offset ) * step, 0.01f );
+		}
+	}
 	if ( hint >= 0.2f ) {
 		const float s = fine_search( hint, best );
 		if ( best > 0 && best < 4 ) return s;
@@ -865,9 +883,20 @@ void exl3_input_factor_free( Exl3InputFactor& f ) {
 }
 
 bool exl3_quantize_group( const Exl3InputFactor& f, const std::vector<const float*>& weights, const std::vector<int>& ns,
-	const std::vector<uint64_t>& seeds, const Exl3QuantOptions& o, std::vector<Exl3Tensor>& out, backend::stream_t stream ) {
+	const std::vector<uint64_t>& seeds, const Exl3QuantOptions& o, std::vector<Exl3Tensor>& out, backend::stream_t stream, Exl3QuantTimes* times ) {
 	auto st = static_cast<cudaStream_t>( stream );
 	Ctx& c = ctx( st );
+	// the time since the last mark into *slot (with times)
+	auto t_mark = std::chrono::steady_clock::now();
+	auto lap = [&]( double Exl3QuantTimes::*slot ) {
+		if ( !times ) return;
+		CUDA_CHECK( cudaStreamSynchronize( st ) );
+		const auto now = std::chrono::steady_clock::now();
+		times->*slot += std::chrono::duration<double>( now - t_mark ).count();
+		t_mark = now;
+	};
+	if ( times ) CUDA_CHECK( cudaStreamSynchronize( st ) );
+	t_mark = std::chrono::steady_clock::now();
 	const int k = f.k;
 	const int count = static_cast<int>( weights.size() );
 	ENGINE_ASSERT( count > 0 && ns.size() == weights.size() && seeds.size() == weights.size(), "exl3_quantize_group: one size and seed per weight" );
@@ -923,6 +952,7 @@ bool exl3_quantize_group( const Exl3InputFactor& f, const std::vector<const floa
 		regularize( c, Wr.p, tmp.p, k, n, su_signs, seeds[b], o, sc, b ? out[b - 1].g_scale : o.scale_hint, su[b], sv[b], out[b].g_scale );
 		CUDA_CHECK( cudaMemcpy2DAsync( Wcat.p + off[b], (size_t) N * sizeof( float ), Wr.p, (size_t) n * sizeof( float ), (size_t) n * sizeof( float ),
 			k, cudaMemcpyDeviceToDevice, st ) );
+		lap( &Exl3QuantTimes::regularize );
 		if ( scaled ) {
 			// P diag(su) H diag(su) P with the full input scales (the global scale cancels in the block-normalized factor)
 			to_device( dsu.p, su[b], st );
@@ -931,12 +961,14 @@ bool exl3_quantize_group( const Exl3InputFactor& f, const std::vector<const floa
 				exl3_encode_scratch_free( sc );
 				return false;
 			}
+			lap( &Exl3QuantTimes::factor );
 		}
 	}
 
 	DBuf<uint8_t> gains( o.tile_gain ? (size_t) tiles_k * tn_all : 0 );
 	ldlq( c, Wcat.p, fb, k, N, o, sc, Qcat.p, enc.p, o.tile_gain ? gains.p : nullptr );
 	exl3_encode_scratch_free( sc );
+	lap( &Exl3QuantTimes::ldlq );
 
 	DBuf<float> vec( std::max( k, n_max ) ), e( (size_t) k * n_max );
 	DBuf<uint16_t> codes( (size_t) tiles_k * ( n_max / 16 ) * 256 ), packed( (size_t) tiles_k * ( n_max / 16 ) * words ), halfs( std::max( k, n_max ) );
@@ -1008,6 +1040,7 @@ bool exl3_quantize_group( const Exl3InputFactor& f, const std::vector<const floa
 		CUDA_CHECK( cudaMemcpyAsync( t.svh.data(), halfs.p, n * sizeof( uint16_t ), cudaMemcpyDeviceToHost, st ) );
 		CUDA_CHECK( cudaStreamSynchronize( st ) );
 	}
+	lap( &Exl3QuantTimes::finish );
 	return true;
 }
 

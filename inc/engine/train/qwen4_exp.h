@@ -190,16 +190,13 @@ struct Config {
 	bool full_attention( int layer ) const { return ( layer + 1 ) % full_interval == 0; }
 };
 
-// One EXL3 tensor with trainable scales (device buffers of k or n floats)
+// One EXL3 tensor with trainable scales (device buffers of k or n floats; the optimizer's state of them is the model's)
 struct Tuned {
 	std::string name;
 	pod::LinearWeight w;                       // the packed codes, as the engine loads them
 	int k = 0, n = 0;
-	float *s0u = nullptr, *s0v = nullptr;      // the checkpoint's scales
-	float *au = nullptr, *av = nullptr;        // trainable log deltas
 	float *su = nullptr, *sv = nullptr;        // current scales
 	float *gu = nullptr, *gv = nullptr;        // gradients with respect to su / sv, accumulated
-	float *mu = nullptr, *vu = nullptr, *mv = nullptr, *vv = nullptr;   // Adam moments of au / av
 };
 
 // A trainable dense tensor (the weights of a norm: the hyper-connection sites', attention's q / k norms, GDN's gated norm, PLE's), as an
@@ -258,12 +255,18 @@ public:
 	// Phase timing (synchronizes the stream at every phase boundary): on, the seconds per phase accumulate until reported and reset
 	void set_timing( bool on );
 	std::string timing_report( bool reset = true );
+	// The device memory by component: the arena's codes, the dense copies, the kept outputs, the workspace's peak so far, the scale pools
+	std::string memory_report() const;
 
 	// The tensors this rank holds (with ranks > 1: the shared ones and its own experts), and the norm weights (every rank holds them all)
 	std::vector<Tuned*> tensors();
 	std::vector<Dense*> dense_tensors();
 	// The norm weights trained along with the scales (on by default); off: their gradients are computed but not applied
 	void set_train_norms( bool on );
+	// Where Adam's state lives (before load): on the device (the default) or with host, in pinned host memory, streamed through the device in
+	// parts for each step (the same kernels, the same result; the device keeps the current values, their gradients and one part); its moments
+	// FP32 (32) or 8-bit block-wise (8, engine/train/adam8.h)
+	void set_optimizer( bool host, int moment_bits );
 	void zero_grads();
 	// Adam on every tensor's log deltas and the norm weights' deltas from the accumulated gradients (times grad_scale; the shared tensors' and
 	// the norms' summed over the ranks first), then the current values

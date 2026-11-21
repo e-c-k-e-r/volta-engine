@@ -3,11 +3,17 @@
 // are quantized with the Hessians of an engine capture (test_ppl --calibrate with hessian_dir), the routed experts' down projections with the
 // Hessians of their own activations over the route dump's rows. Work items (the projections of one input, in chunks, or a layer's expert down
 // projections) are spread over the devices; every finished tensor is kept in <out>/.partial, so a run continues where it stopped; the shards are
-// written at the end in the template's layout (--no-assemble stops before, a later run without it writes them).
+// written at the end in the template's layout (--no-assemble stops before, a later run without it writes them). The devices' seconds by phase
+// are logged at the end.
 //
 //   volta_quantize --src <original> --template <exl3 dir> --out <dir> [--hess <capture dir>] [--route <route dump>] [--order volta|stock]
 //                  [--devices 0,1,2,3] [--only A,B] [--skip A,B] [--bits B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] [--redo]
-//                  [--plan] [--no-scaled-hessian] [--affinity-eps E] [--ldl-metric] [--open-trellis] [--tile-gain] [--no-assemble]
+//                  [--plan] [--no-scaled-hessian] [--affinity-eps E] [--ldl-metric] [--open-trellis] [--tile-gain] [--scale-search full|light|hint]
+//                  [--no-assemble]
+//
+// --scale-search: how a tensor whose global scale starts from a like one's (the next projection of a group, a layer's next expert down
+// projection) searches it: full (the fine grid of five on the whole sample), light (three scales on a lighter sample, the full grid when the
+// minimum is at an edge) or hint (that scale as it is)
 //
 // --open-trellis stores each tile's start state (<base>.tstart) instead of wrapping its stream, --tile-gain an 8-bit gain per tile (<base>.tgain):
 // the extended trellis, for the routed experts only (the engine's MoE kernels decode it; every other tensor stays plain)
@@ -71,6 +77,7 @@ struct Args {
 	float aff_eps = 0.0f;
 	bool ldl_metric = false, open_trellis = false, tile_gain = false;
 	float sigma_reg = 0.025f;
+	int scale_search = 2;   // --scale-search full / light / hint (Exl3QuantOptions::scale_search)
 };
 
 std::vector<std::string> split( const std::string& s, char sep ) {
@@ -123,6 +130,14 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--ldl-metric" ) a.ldl_metric = true;
 		else if ( k == "--open-trellis" ) a.open_trellis = true;
 		else if ( k == "--tile-gain" ) a.tile_gain = true;
+		else if ( k == "--scale-search" ) {
+			const std::string v = val();
+			a.scale_search = v == "full" ? 2 : v == "light" ? 1 : v == "hint" ? 0 : -1;
+			if ( a.scale_search < 0 ) {
+				LOG_ERROR( "[volta_quantize] --scale-search %s: full, light or hint", v.c_str() );
+				return false;
+			}
+		}
 		else if ( k == "--devices" ) {
 			a.devices.clear();
 			for ( const auto& d : split( val(), ',' ) ) a.devices.push_back( std::stoi( d ) );
@@ -134,7 +149,8 @@ bool parse( int argc, char** argv, Args& a ) {
 	if ( a.src.empty() || a.tmpl.empty() || ( a.out.empty() && !a.plan ) ) {
 		LOG_ERROR( "usage: volta_quantize --src <original> --template <exl3 dir> --out <dir> [--hess <capture dir>] [--route <route dump>] "
 				   "[--order volta|stock] [--devices 0,1] [--only A,B] [--skip A,B] [--bits B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] "
-				   "[--redo] [--plan] [--no-scaled-hessian] [--affinity-eps E] [--ldl-metric] [--open-trellis] [--tile-gain] [--no-assemble]" );
+				   "[--redo] [--plan] [--no-scaled-hessian] [--affinity-eps E] [--ldl-metric] [--open-trellis] [--tile-gain] [--scale-search full|light|hint] "
+				   "[--no-assemble]" );
 		return false;
 	}
 	return true;
@@ -200,6 +216,15 @@ struct Shared {
 	std::mutex log_mu;
 	std::chrono::steady_clock::time_point t0;
 	q::RouteRows route;
+	// seconds per phase over the workers (under log_mu)
+	std::vector<std::pair<std::string, double>> phases;
+	void add_phase( const std::string& name, double s ) {
+		for ( auto& p : phases ) if ( p.first == name ) {
+			p.second += s;
+			return;
+		}
+		phases.emplace_back( name, s );
+	}
 };
 
 std::string partial_path( const Args& a, const std::string& base ) { return a.out + "/.partial/" + base + ".safetensors"; }
@@ -320,6 +345,16 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 		for ( float v : e_w[e] ) s += v;
 		return s;
 	};
+	// Phase times: the source loads, the Hessians (read or computed), the input factors, the partials written, and exl3_quantize_group's own
+	double t_load = 0.0, t_hess = 0.0, t_factor = 0.0, t_write = 0.0;
+	engine::quant::Exl3QuantTimes qt;
+	auto timed = [&]( double& slot, auto&& f ) {
+		const auto t0 = std::chrono::steady_clock::now();
+		const bool r = f();
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		slot += std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
+		return r;
+	};
 
 	for ( size_t idx; ( idx = sh.next.fetch_add( 1 ) ) < sh.items.size(); ) {
 		const Item& it = sh.items[idx];
@@ -353,15 +388,18 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 					rw = row_w.p;
 				}
 				ok = gate.fit( static_cast<size_t>( hidden ) * inter ) && up.fit( static_cast<size_t>( hidden ) * inter ) &&
-					hsum.fit( static_cast<size_t>( inter ) * inter ) && src.load( pre + ".gate_proj", gate.p, stream ) &&
-					src.load( pre + ".up_proj", up.p, stream ) &&
-					eh.compute( d_x, x_rows, hidden, gate.p, up.p, inter, sh.model->swiglu_limit, hsum.p, stream, rw, ws, a.aff_eps ) &&
-					engine::quant::exl3_input_factor( factor, hsum.p, inter, x_rows, a.sigma_reg, hash64( t.base + "#in", a.seed ), stream, !a.scaled );
+					hsum.fit( static_cast<size_t>( inter ) * inter ) &&
+					timed( t_load, [&] { return src.load( pre + ".gate_proj", gate.p, stream ) && src.load( pre + ".up_proj", up.p, stream ); } ) &&
+					timed( t_hess, [&] { return eh.compute( d_x, x_rows, hidden, gate.p, up.p, inter, sh.model->swiglu_limit, hsum.p, stream, rw, ws, a.aff_eps ); } ) &&
+					timed( t_factor, [&] {
+						return engine::quant::exl3_input_factor( factor, hsum.p, inter, x_rows, a.sigma_reg, hash64( t.base + "#in", a.seed ), stream, !a.scaled );
+					} );
 				factor_key.clear();
 				float* w = nullptr;
-				ok = ok && cudaMalloc( &w, static_cast<size_t>( inter ) * hidden * sizeof( float ) ) == cudaSuccess && src.load( t.base, w, stream );
+				ok = ok && cudaMalloc( &w, static_cast<size_t>( inter ) * hidden * sizeof( float ) ) == cudaSuccess &&
+					timed( t_load, [&] { return src.load( t.base, w, stream ); } );
 				std::vector<Exl3Tensor> out;
-				ok = ok && engine::quant::exl3_quantize_group( factor, { w }, { hidden }, { hash64( t.base, a.seed ) }, o, out, stream );
+				ok = ok && engine::quant::exl3_quantize_group( factor, { w }, { hidden }, { hash64( t.base, a.seed ) }, o, out, stream, &qt );
 				if ( w ) CUDA_CHECK( cudaFree( w ) );
 				if ( !ok ) break;
 				o.scale_hint = out[0].g_scale;   // the next expert's scale search starts from this one's
@@ -373,7 +411,7 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 			const int k = first.k;
 			int64_t rows = 0;
 			ok = ensure_layer( it.layer ) && hin.fit( static_cast<size_t>( k ) * k ) && hsum.fit( static_cast<size_t>( k ) * k ) &&
-				read_capture( first, k, true, rows, hin.p, stream );
+				timed( t_hess, [&] { return read_capture( first, k, true, rows, hin.p, stream ); } );
 			std::map<int, std::vector<int>> by_expert;
 			for ( int ti : it.tensors ) by_expert[sh.plan[ti].gate_up_expert].push_back( ti );
 			for ( const auto& kv : by_expert ) {
@@ -387,8 +425,7 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 					if ( ok ) {
 						CUDA_CHECK( cudaMemcpyAsync( d_idx, e_rows[e].data(), static_cast<size_t>( nr ) * sizeof( int ), cudaMemcpyHostToDevice, stream ) );
 						CUDA_CHECK( cudaMemcpyAsync( d_rw.p, e_w[e].data(), static_cast<size_t>( nr ) * sizeof( float ), cudaMemcpyHostToDevice, stream ) );
-						ok = eh.affinity_input( d_x, x_rows, k, d_idx, d_rw.p, nr, ws, a.aff_eps, hin.p, hsum.p, stream );
-						CUDA_CHECK( cudaStreamSynchronize( stream ) );
+						ok = timed( t_hess, [&] { return eh.affinity_input( d_x, x_rows, k, d_idx, d_rw.p, nr, ws, a.aff_eps, hin.p, hsum.p, stream ); } );
 					}
 				} else {
 					// Never routed in the calibration: the layer input's Hessian as it is
@@ -396,7 +433,9 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 				}
 				if ( d_idx ) CUDA_CHECK( cudaFree( d_idx ) );
 				// The same input sign flips as the shared factor of the plain recipe (one seed per input)
-				ok = ok && engine::quant::exl3_input_factor( factor, hsum.p, k, 1, a.sigma_reg, hash64( it.key, a.seed ), stream, !a.scaled );
+				ok = ok && timed( t_factor, [&] {
+					return engine::quant::exl3_input_factor( factor, hsum.p, k, 1, a.sigma_reg, hash64( it.key, a.seed ), stream, !a.scaled );
+				} );
 				factor_key.clear();
 				std::vector<const float*> ws_;
 				std::vector<int> ns;
@@ -405,14 +444,15 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 					if ( !ok ) break;
 					const q::PlanTensor& t = sh.plan[ti];
 					float* w = nullptr;
-					ok = cudaMalloc( &w, static_cast<size_t>( t.k ) * t.n * sizeof( float ) ) == cudaSuccess && src.load( t.base, w, stream );
+					ok = cudaMalloc( &w, static_cast<size_t>( t.k ) * t.n * sizeof( float ) ) == cudaSuccess &&
+						timed( t_load, [&] { return src.load( t.base, w, stream ); } );
 					if ( w ) weights.push_back( w );
 					ws_.push_back( w );
 					ns.push_back( t.n );
 					seeds.push_back( hash64( t.base, a.seed ) );
 				}
 				std::vector<Exl3Tensor> out;
-				ok = ok && engine::quant::exl3_quantize_group( factor, ws_, ns, seeds, o, out, stream );
+				ok = ok && engine::quant::exl3_quantize_group( factor, ws_, ns, seeds, o, out, stream, &qt );
 				for ( float* w : weights ) CUDA_CHECK( cudaFree( w ) );
 				weights.clear();
 				if ( !ok ) break;
@@ -425,9 +465,12 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 				factor_key.clear();
 				const int k = first.k;
 				int64_t rows = 0;
-				if ( !it.key.empty() ) ok = hsum.fit( static_cast<size_t>( k ) * k ) && read_capture( first, k, false, rows, hsum.p, stream );
+				if ( !it.key.empty() )
+					ok = hsum.fit( static_cast<size_t>( k ) * k ) && timed( t_hess, [&] { return read_capture( first, k, false, rows, hsum.p, stream ); } );
 				const uint64_t fseed = hash64( it.key.empty() ? first.base + "#in" : it.key, a.seed );
-				ok = ok && engine::quant::exl3_input_factor( factor, it.key.empty() ? nullptr : hsum.p, k, rows, a.sigma_reg, fseed, stream, !a.scaled );
+				ok = ok && timed( t_factor, [&] {
+					return engine::quant::exl3_input_factor( factor, it.key.empty() ? nullptr : hsum.p, k, rows, a.sigma_reg, fseed, stream, !a.scaled );
+				} );
 				if ( ok ) factor_key = it.key;
 			}
 			std::vector<const float*> ws;
@@ -439,14 +482,15 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 				if ( !ok ) break;
 				const q::PlanTensor& t = sh.plan[ti];
 				float* w = nullptr;
-				ok = cudaMalloc( &w, static_cast<size_t>( t.k ) * t.n * sizeof( float ) ) == cudaSuccess && src.load( t.base, w, stream );
+				ok = cudaMalloc( &w, static_cast<size_t>( t.k ) * t.n * sizeof( float ) ) == cudaSuccess &&
+					timed( t_load, [&] { return src.load( t.base, w, stream ); } );
 				if ( w ) weights.push_back( w );
 				ws.push_back( w );
 				ns.push_back( t.n );
 				seeds.push_back( hash64( t.base, a.seed ) );
 			}
 			std::vector<Exl3Tensor> out;
-			ok = ok && engine::quant::exl3_quantize_group( factor, ws, ns, seeds, o, out, stream );
+			ok = ok && engine::quant::exl3_quantize_group( factor, ws, ns, seeds, o, out, stream, &qt );
 			for ( float* w : weights ) CUDA_CHECK( cudaFree( w ) );
 			weights.clear();
 			if ( ok ) {
@@ -456,7 +500,7 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 
 		double err_sum = 0.0;
 		for ( const auto& d : done ) {
-			if ( !write_partial( a, sh.plan[d.first], d.second ) ) ok = false;
+			if ( !timed( t_write, [&] { return write_partial( a, sh.plan[d.first], d.second ); } ) ) ok = false;
 			err_sum += d.second.proxy_err;
 		}
 		const int64_t tiles = sh.tiles_done += it.tiles;
@@ -477,6 +521,11 @@ void worker( Shared& sh, int device, const Exl3QuantOptions& base_opts ) {
 	engine::quant::exl3_input_factor_free( factor );
 	if ( d_x ) CUDA_CHECK( cudaFree( d_x ) );
 	CUDA_CHECK( cudaStreamDestroy( stream ) );
+	std::lock_guard<std::mutex> lock( sh.log_mu );
+	const std::pair<const char*, double> ph[] = { { "source loads", t_load }, { "Hessians (read or computed)", t_hess }, { "input factors", t_factor },
+		{ "regularize and the scale search", qt.regularize }, { "scaled Hessian factors", qt.factor }, { "LDLQ through the encoder", qt.ldlq },
+		{ "back rotation, refit, packing", qt.finish }, { "partials written", t_write } };
+	for ( const auto& p : ph ) sh.add_phase( p.first, p.second );
 }
 
 // The output's quantization_config.json: the template's, with the tile order of what was quantized. From a stock template, what stays as the
@@ -631,6 +680,7 @@ int main( int argc, char** argv ) {
 	opts.ldl_metric = a.ldl_metric;
 	opts.open_trellis = a.open_trellis;
 	opts.tile_gain = a.tile_gain;
+	opts.scale_search = a.scale_search;
 	const std::string os = qcfg.is_discarded() ? "auto" : qcfg.value( "out_scales", "auto" );
 	opts.out_scales = os == "always" ? 1 : os == "never" ? 0 : -1;
 	// Tile orders: a stock output from a Volta template cannot mark what stays in the Volta order, and --only with an order other than the template's
@@ -774,6 +824,18 @@ int main( int argc, char** argv ) {
 	std::vector<std::thread> threads;
 	for ( int d : a.devices ) threads.emplace_back( worker, std::ref( sh ), d, opts );
 	for ( auto& t : threads ) t.join();
+	{
+		// the devices' seconds per phase (each device's sum; the stream synchronized at every boundary)
+		double total = 0.0;
+		for ( const auto& p : sh.phases ) total += p.second;
+		std::string rep;
+		char line[160];
+		for ( const auto& p : sh.phases ) {
+			std::snprintf( line, sizeof( line ), "\n  %-36s %9.1f s  %5.1f%%", p.first.c_str(), p.second, total > 0 ? 100.0 * p.second / total : 0.0 );
+			rep += line;
+		}
+		LOG_INFO( "[volta_quantize] device seconds by phase, over %zu device(s):%s", a.devices.size(), rep.c_str() );
+	}
 	if ( sh.failures ) {
 		LOG_ERROR( "[volta_quantize] %d work items failed: the shards are not written (a rerun continues with what is missing)", sh.failures.load() );
 		return 1;

@@ -7,11 +7,13 @@
 // checkpoint (the input's files, its shards rewritten with the new FP16 scales and norms). The learning rate warms up linearly over
 // --warmup steps, then follows a cosine to --lr-min (a fraction of --lr) at the last step. --fp16 0 runs the tuned tensors' products in
 // FP32 instead of on the tensor cores; --norms 0 keeps the norms' weights as they are. --train N trains on the first N sequences only
-// (the held-out ones unchanged: how the gain grows with the data).
+// (the held-out ones unchanged: how the gain grows with the data). --adam-bits 8 keeps Adam's moments as 8-bit block-wise codes; --opt-host 1
+// keeps the optimizer's state in pinned host memory (the devices hold the current values, their gradients and one part of the state: each
+// step streams the state through in parts). The memory per component is logged after the first step.
 //
 //   volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] [--fp16 1]
 //             [--norms 1] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
-//             [--timing 0|1] [--check-trace FILE]
+//             [--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]
 //   --check-trace: a trace_layers file of the model's engine forward over the first sequence (test_ppl --calibrate --chunk 512): every layer of
 //     the training form fed the engine's input streams of that layer, its output against the engine's, and the first sequence's embedding
 //     streams against the engine's; then exits (the layer split)
@@ -50,8 +52,8 @@ namespace q = engine::tools::quant;
 struct Args {
 	std::string model, inputs, teacher, out, check_trace;
 	std::vector<int> devices = { 0, 1, 2, 3 };
-	int steps = 64, batch = 4, hold = 4, eval_every = 16, warmup = 2, train = 0;
-	bool write = true, timing = false, tp = true, fp16 = true, norms = true;
+	int steps = 64, batch = 4, hold = 4, eval_every = 16, warmup = 2, train = 0, adam_bits = 32;
+	bool write = true, timing = false, tp = true, fp16 = true, norms = true, opt_host = false;
 	float lr = 1e-3f, lr_min = 0.1f;
 };
 
@@ -96,6 +98,8 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--tp" ) a.tp = v != "0";
 		else if ( k == "--fp16" ) a.fp16 = v != "0";
 		else if ( k == "--norms" ) a.norms = v != "0";
+		else if ( k == "--opt-host" ) a.opt_host = v != "0";
+		else if ( k == "--adam-bits" ) a.adam_bits = std::stoi( v );
 		else if ( k == "--write" ) a.write = v != "0";
 		else if ( k == "--timing" ) a.timing = v != "0";
 		else if ( k == "--check-trace" ) a.check_trace = v;
@@ -112,10 +116,10 @@ bool parse( int argc, char** argv, Args& a ) {
 			return false;
 		}
 	}
-	if ( a.model.empty() || a.inputs.empty() || a.teacher.empty() || a.out.empty() ) {
+	if ( a.model.empty() || a.inputs.empty() || a.teacher.empty() || a.out.empty() || ( a.adam_bits != 32 && a.adam_bits != 8 ) ) {
 		LOG_ERROR( "usage: volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] "
 			"[--fp16 1] [--norms 1] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
-			"[--timing 0|1] [--check-trace FILE]" );
+			"[--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]" );
 		return false;
 	}
 	return true;
@@ -304,6 +308,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		const int dev = a.devices[r];
 		CUDA_CHECK( cudaSetDevice( dev ) );
 		auto m = std::make_unique<tq::Model>();
+		m->set_optimizer( a.opt_host, a.adam_bits );
 		ok[r] = m->load( a.model, 0, cfg.layers, dev, T, r, n, comms[r] ) ? 1 : 0;
 		m->set_fp16( a.fp16 );
 		m->set_train_norms( a.norms );
@@ -388,6 +393,18 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			}
 			o.lr = lr_at( a, step );
 			m->adam( o, step, 1.0f / ( static_cast<float>( a.batch ) * T ) );
+			if ( step == 1 ) {
+				// the memory by component once the workspace has seen a whole step, in rank order
+				const double G = 1073741824.0;
+				const double own = ( ( 3.0 + cfg.layers ) * rows_l + static_cast<double>( Tl ) * H + static_cast<double>( T ) * ( flat + H + 1 ) +
+					static_cast<double>( T ) * d.k ) * sizeof( float ) + static_cast<double>( T ) * flat * 2 + static_cast<double>( T ) * d.k * sizeof( int );
+				const std::string rep = m->memory_report();
+				bar.wait();
+				for ( int g = 0; g < n; ++g ) {
+					if ( g == r ) LOG_INFO( "[volta_e2e] rank %d memory after step 1:\n%s  layer inputs and streams (volta_e2e)  %6.2f GiB", r, rep.c_str(), own / G );
+					bar.wait();
+				}
+			}
 			if ( a.timing ) {
 				const std::string rep = m->timing_report();
 				bar.wait();   // the reports in rank order
@@ -479,6 +496,7 @@ int main( int argc, char** argv ) {
 		s.dev = a.devices[g];
 		const int first = cfg.layers * g / G, last = cfg.layers * ( g + 1 ) / G;
 		s.m = std::make_unique<tq::Model>();
+		s.m->set_optimizer( a.opt_host, a.adam_bits );
 		if ( !s.m->load( a.model, first, last, s.dev, T ) ) return 1;
 		s.m->set_fp16( a.fp16 );
 		s.m->set_train_norms( a.norms );

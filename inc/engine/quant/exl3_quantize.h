@@ -28,6 +28,8 @@ struct Exl3QuantOptions {
 	                          // before the error feedback sees the tile; Exl3Tensor::gains
 	float scale_hint = 0.0f;  // where the global scale search starts (a like tensor's g_scale): the fine grid around it, the coarse grid only when its
 	                          // minimum is at an edge; 0: the coarse grid first. A group starts each projection at the one before's
+	int scale_search = 2;     // from a hint: 2 the fine grid of five on the whole sample, 1 three scales on a one-wide diagonal (five when the
+	                          // minimum is at an edge), 0 the hint as it is; without a hint always the coarse grid, then the fine one
 };
 
 // The input side shared by the projections of one input. Without a usable Hessian (no rows, or a diagonal that is zero or not finite) the
@@ -59,10 +61,19 @@ struct Exl3Tensor {
 	std::vector<uint8_t> gains;     // tile_gain: k / 16 x n / 16 gain codes
 };
 
+// Seconds per phase of exl3_quantize_group, added to (each phase boundary then synchronizes the stream)
+struct Exl3QuantTimes {
+	double regularize = 0.0;   // channel scales, rotations and the global scale search (its trial encodes)
+	double factor = 0.0;       // each projection's scaled Hessian factor (scaled_hessian)
+	double ldlq = 0.0;         // the blocks through the encoder with the error feedback
+	double finish = 0.0;       // the back rotation, the scale refit and proxy error, the packing and the copies out
+};
+
 // weights[i]: device fp32 k x ns[i], input-major (the transpose of a [out, in] checkpoint tensor); ns[i] % 128 == 0, k % 128 == 0. seeds[i]
-// draws the output sign flips. The weights are not modified
+// draws the output sign flips. The weights are not modified. times: the phases' seconds added there (null: not timed)
 bool exl3_quantize_group( const Exl3InputFactor& f, const std::vector<const float*>& weights, const std::vector<int>& ns,
-	const std::vector<uint64_t>& seeds, const Exl3QuantOptions& o, std::vector<Exl3Tensor>& out, backend::stream_t stream );
+	const std::vector<uint64_t>& seeds, const Exl3QuantOptions& o, std::vector<Exl3Tensor>& out, backend::stream_t stream,
+	Exl3QuantTimes* times = nullptr );
 
 // tr(E^T H E) / tr(W^T H W) with E = W - Q, from device fp32 W, Q (k x n) and H (k x k, e.g. a mean Hessian)
 double exl3_proxy_error( const float* W, const float* Q, const float* H, int k, int n, backend::stream_t stream );

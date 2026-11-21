@@ -1,5 +1,6 @@
 // Training primitives (engine/train/grad.h): FP32 elementwise kernels, reductions, the scaled linear on cuBLAS, Adam.
 #include "engine/train/grad.h"
+#include "engine/train/adam8.h"
 #include "engine/config.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -170,6 +171,50 @@ __global__ void k_adam_add( const float* w0, float* a, float* w, const float* g,
 	}
 }
 
+// Adam with 8-bit moments, one block per moment block: decode, step, the block's new absmax, encode (LOG: s = s0 e^a, else s = s0 + a)
+template <bool LOG>
+__global__ void k_adam8( const float* s0, float* a, float* s, const float* g, uint8_t* mq, uint8_t* vq, float* mmax, float* vmax, size_t n, size_t base,
+	int step, float gs, float lr, float b1, float b2, float eps, float c1, float c2 ) {
+	namespace q8 = engine::train::adam8;
+	__shared__ float red[2][q8::kBlock / 32];
+	const size_t blk = blockIdx.x, i = blk * q8::kBlock + threadIdx.x;
+	float m = 0.0f, v = 0.0f;
+	if ( i < n ) {
+		m = q8::dec_m( mq[i], mmax[blk] );
+		v = q8::dec_v( vq[i], vmax[blk] );
+		const float gi = LOG ? g[i] * s[i] * gs : g[i] * gs;
+		float ai = a[i];
+		q8::step( gi, m, v, ai, lr, b1, b2, eps, c1, c2, true );
+		a[i] = ai;
+		s[i] = LOG ? s0[i] * expf( ai ) : s0[i] + ai;
+	}
+	float am = fabsf( m ), av = sqrtf( v );   // the largest |m| and root of v
+	for ( int o = 16; o > 0; o >>= 1 ) {
+		am = fmaxf( am, __shfl_xor_sync( 0xffffffffu, am, o ) );
+		av = fmaxf( av, __shfl_xor_sync( 0xffffffffu, av, o ) );
+	}
+	const int w = threadIdx.x / 32, nw = q8::kBlock / 32;
+	if ( ( threadIdx.x & 31 ) == 0 ) {
+		red[0][w] = am;
+		red[1][w] = av;
+	}
+	__syncthreads();
+	am = red[0][0];
+	av = red[1][0];
+	for ( int j = 1; j < nw; ++j ) {
+		am = fmaxf( am, red[0][j] );
+		av = fmaxf( av, red[1][j] );
+	}
+	if ( i < n ) {
+		mq[i] = q8::enc_m( m, am, q8::draw( base + i, step, q8::kSaltM ) );
+		vq[i] = q8::enc_v( v, av, q8::draw( base + i, step, q8::kSaltV ) );
+	}
+	if ( threadIdx.x == 0 ) {
+		mmax[blk] = am;
+		vmax[blk] = av;
+	}
+}
+
 __global__ void k_exp_scale( const float* base, const float* a, float* out, size_t n ) {
 	TRAIN_LOOP( i, n ) out[i] = base[i] * expf( a[i] );
 }
@@ -331,6 +376,26 @@ void adam_deltas( const float* w0, float* a, float* w, const float* g, float* m,
 	backend::stream_t stream ) {
 	const float c1 = 1.0f - std::pow( o.beta1, static_cast<float>( step ) ), c2 = 1.0f - std::pow( o.beta2, static_cast<float>( step ) );
 	if ( n > 0 ) k_adam_add<<<blocks_for( n ), 256, 0, cu( stream )>>>( w0, a, w, g, m, v, n, grad_scale, o.lr, o.beta1, o.beta2, o.eps, c1, c2 );
+}
+
+void adam_log_scales8( const float* s0, float* a, float* s, const float* g, uint8_t* mq, uint8_t* vq, float* mmax, float* vmax, size_t n, int step,
+	float grad_scale, const AdamOptions& o, backend::stream_t stream, size_t base ) {
+	const float c1 = 1.0f - std::pow( o.beta1, static_cast<float>( step ) ), c2 = 1.0f - std::pow( o.beta2, static_cast<float>( step ) );
+	const size_t nb = ( n + adam8::kBlock - 1 ) / adam8::kBlock;
+	ENGINE_ASSERT( base % adam8::kBlock == 0, "adam_log_scales8: a part starts at a moment block" );
+	if ( n > 0 )
+		k_adam8<true><<<static_cast<unsigned>( nb ), adam8::kBlock, 0, cu( stream )>>>( s0, a, s, g, mq, vq, mmax, vmax, n, base, step, grad_scale, o.lr,
+			o.beta1, o.beta2, o.eps, c1, c2 );
+}
+
+void adam_deltas8( const float* w0, float* a, float* w, const float* g, uint8_t* mq, uint8_t* vq, float* mmax, float* vmax, size_t n, int step,
+	float grad_scale, const AdamOptions& o, backend::stream_t stream, size_t base ) {
+	const float c1 = 1.0f - std::pow( o.beta1, static_cast<float>( step ) ), c2 = 1.0f - std::pow( o.beta2, static_cast<float>( step ) );
+	const size_t nb = ( n + adam8::kBlock - 1 ) / adam8::kBlock;
+	ENGINE_ASSERT( base % adam8::kBlock == 0, "adam_deltas8: a part starts at a moment block" );
+	if ( n > 0 )
+		k_adam8<false><<<static_cast<unsigned>( nb ), adam8::kBlock, 0, cu( stream )>>>( w0, a, w, g, mq, vq, mmax, vmax, n, base, step, grad_scale, o.lr,
+			o.beta1, o.beta2, o.eps, c1, c2 );
 }
 
 void gather_rows( const void* src, bool half_src, const int* idx, const float* w, int n, int cols, float* dst, backend::stream_t stream ) {

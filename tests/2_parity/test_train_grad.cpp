@@ -4,8 +4,11 @@
 //   (b) the gradients of the six scale vectors and of the input against central differences of the host loss, with SiLU and with GLM's limit
 //   (c) Adam steps on multiplicative scale parameters lower the loss
 //   (d) gather_rows (FP16 and FP32 sources, with and without per-row weights) and scatter_add_rows against the host, exactly
+//   (e) Adam's kernels against a host reference, FP32 and 8-bit block-wise moments, log scales and additive deltas; updated in parts against
+//       one update (bit for bit); 8-bit moments optimizing a noisy quadratic as FP32 ones do; the 8-bit codes' round trip
 #include "engine/config.h"
 #include "engine/train/grad.h"
+#include "engine/train/adam8.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstring>
@@ -74,6 +77,13 @@ float* up( const std::vector<double>& v ) {
 	return d;
 }
 
+float* up( const std::vector<float>& f ) {
+	float* d = nullptr;
+	CUDA_CHECK( cudaMalloc( &d, std::max<size_t>( f.size(), 1 ) * sizeof( float ) ) );
+	CUDA_CHECK( cudaMemcpy( d, f.data(), f.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+	return d;
+}
+
 float* zeros( size_t n ) {
 	float* d = nullptr;
 	CUDA_CHECK( cudaMalloc( &d, n * sizeof( float ) ) );
@@ -85,6 +95,44 @@ std::vector<float> down( const float* d, size_t n ) {
 	std::vector<float> h( n );
 	CUDA_CHECK( cudaMemcpy( h.data(), d, n * sizeof( float ), cudaMemcpyDeviceToHost ) );
 	return h;
+}
+
+// Adam on the host, the reference of the device kernels (adam8.h's steps): log scales (s = s0 e^a) or additive (s = s0 + a); FP32 moments
+// m / v or, with m null, the 8-bit ones block by block
+void host_adam( bool log_scales, const float* s0, float* a, float* s, const float* g, float* m, float* v, uint8_t* mq, uint8_t* vq, float* mmax,
+	float* vmax, size_t n, int step, const engine::train::AdamOptions& o ) {
+	namespace q8 = engine::train::adam8;
+	const float c1 = 1.0f - std::pow( o.beta1, static_cast<float>( step ) ), c2 = 1.0f - std::pow( o.beta2, static_cast<float>( step ) );
+	constexpr size_t B = q8::kBlock;
+	float bm[B], bv[B];
+	for ( size_t b = 0; b * B < n; ++b ) {
+		const size_t i0 = b * B, i1 = std::min( n, i0 + B );
+		float am = 0.0f, av = 0.0f;
+		for ( size_t i = i0; i < i1; ++i ) {
+			float mi = m ? m[i] : q8::dec_m( mq[i], mmax[b] ), vi = m ? v[i] : q8::dec_v( vq[i], vmax[b] );
+			const float gi = log_scales ? g[i] * s[i] : g[i];
+			float ai = a[i];
+			q8::step( gi, mi, vi, ai, o.lr, o.beta1, o.beta2, o.eps, c1, c2, m == nullptr );
+			a[i] = ai;
+			s[i] = log_scales ? s0[i] * std::exp( ai ) : s0[i] + ai;
+			if ( m ) {
+				m[i] = mi;
+				v[i] = vi;
+				continue;
+			}
+			bm[i - i0] = mi;
+			bv[i - i0] = vi;
+			am = std::max( am, std::fabs( mi ) );
+			av = std::max( av, std::sqrt( vi ) );
+		}
+		if ( m ) continue;
+		for ( size_t i = i0; i < i1; ++i ) {
+			mq[i] = q8::enc_m( bm[i - i0], am, q8::draw( i, step, q8::kSaltM ) );
+			vq[i] = q8::enc_v( bv[i - i0], av, q8::draw( i, step, q8::kSaltV ) );
+		}
+		mmax[b] = am;
+		vmax[b] = av;
+	}
 }
 
 } // namespace
@@ -264,6 +312,159 @@ int main() {
 		std::snprintf( line, sizeof( line ), "(d) scatter_add_rows: %zu of %zu values differ from the host's", sbad, want.size() );
 		check( sbad == 0, line );
 		for ( void* q : { (void*) d_src, (void*) d_w, (void*) d_out, (void*) d_dst, (void*) d_idx, (void*) d_src16 } ) CUDA_CHECK( cudaFree( q ) );
+	}
+	// (e) Adam's variants: 50 steps on 100000 log-scale parameters (a partial last moment block) with gradients over six decades (a level per
+	// 256 values, three decades within), the device and the host each with FP32 and 8-bit moments; then the additive form; and the 8-bit
+	// codes' round trip
+	{
+		namespace q8 = engine::train::adam8;
+		const size_t n = 100000, nb = ( n + q8::kBlock - 1 ) / q8::kBlock;
+		std::vector<float> s0( n ), mag( n );
+		std::uniform_real_distribution<float> us( 0.5f, 2.0f ), ue( -5.0f, 1.0f ), uw( -1.5f, 1.5f );
+		std::normal_distribution<float> gn( 0.0f, 1.0f );
+		float level = 1.0f;
+		for ( size_t i = 0; i < n; ++i ) {
+			if ( i % q8::kBlock == 0 ) level = std::pow( 10.0f, ue( rng ) );
+			s0[i] = us( rng );
+			mag[i] = level * std::pow( 10.0f, uw( rng ) );
+		}
+		std::vector<std::vector<float>> grads( 50, std::vector<float>( n ) );
+		for ( auto& g : grads ) for ( size_t i = 0; i < n; ++i ) g[i] = gn( rng ) * mag[i];
+		engine::train::AdamOptions o;
+		o.lr = 1e-3f;
+		// one variant's deltas a after the steps (log: s = s0 e^a, else s = s0 + a): mode 0 the device, 1 the host reference, 2 the device in
+		// parts of 100 moment blocks (as a host-resident state goes through it)
+		auto run = [&]( bool log, int mode, int bits ) {
+			std::vector<float> a( n, 0.0f ), s = s0, m( n, 0.0f ), v( n, 0.0f ), mmax( nb, 0.0f ), vmax( nb, 0.0f );
+			std::vector<uint8_t> mq( n, 0 ), vq( n, 0 );
+			if ( mode == 1 ) {
+				for ( int k = 1; k <= 50; ++k )
+					host_adam( log, s0.data(), a.data(), s.data(), grads[k - 1].data(), bits == 32 ? m.data() : nullptr, v.data(), mq.data(), vq.data(), mmax.data(),
+						vmax.data(), n, k, o );
+				return a;
+			}
+			float *d_s0 = up( s0 ), *d_a = up( a ), *d_s = up( s ), *d_g = up( a ), *d_m = up( m ), *d_v = up( v ), *d_mm = up( mmax ), *d_vm = up( vmax );
+			uint8_t *d_mq = nullptr, *d_vq = nullptr;
+			CUDA_CHECK( cudaMalloc( &d_mq, n ) );
+			CUDA_CHECK( cudaMalloc( &d_vq, n ) );
+			CUDA_CHECK( cudaMemset( d_mq, 0, n ) );
+			CUDA_CHECK( cudaMemset( d_vq, 0, n ) );
+			const size_t part = mode == 2 ? 100 * q8::kBlock : n;
+			for ( int k = 1; k <= 50; ++k ) {
+				CUDA_CHECK( cudaMemcpy( d_g, grads[k - 1].data(), n * sizeof( float ), cudaMemcpyHostToDevice ) );
+				for ( size_t o0 = 0; o0 < n; o0 += part ) {
+					const size_t c = std::min( part, n - o0 ), b0 = o0 / q8::kBlock;
+					float *ps0 = d_s0 + o0, *pa = d_a + o0, *ps = d_s + o0, *pg = d_g + o0;
+					if ( bits == 32 && log ) engine::train::adam_log_scales( ps0, pa, ps, pg, d_m + o0, d_v + o0, c, k, 1.0f, o, st );
+					else if ( bits == 32 ) engine::train::adam_deltas( ps0, pa, ps, pg, d_m + o0, d_v + o0, c, k, 1.0f, o, st );
+					else if ( log ) engine::train::adam_log_scales8( ps0, pa, ps, pg, d_mq + o0, d_vq + o0, d_mm + b0, d_vm + b0, c, k, 1.0f, o, st, o0 );
+					else engine::train::adam_deltas8( ps0, pa, ps, pg, d_mq + o0, d_vq + o0, d_mm + b0, d_vm + b0, c, k, 1.0f, o, st, o0 );
+				}
+			}
+			CUDA_CHECK( cudaStreamSynchronize( st ) );
+			a = down( d_a, n );
+			for ( void* q : { (void*) d_s0, (void*) d_a, (void*) d_s, (void*) d_g, (void*) d_m, (void*) d_v, (void*) d_mm, (void*) d_vm, (void*) d_mq, (void*) d_vq } )
+				CUDA_CHECK( cudaFree( q ) );
+			return a;
+		};
+		// the largest difference over the largest delta, and the relative L2 difference
+		auto cmp = [&]( const std::vector<float>& x, const std::vector<float>& y, double& worst ) {
+			double num = 0.0, den = 0.0, amax = 0.0;
+			worst = 0.0;
+			for ( size_t i = 0; i < n; ++i ) {
+				num += ( double( x[i] ) - y[i] ) * ( double( x[i] ) - y[i] );
+				den += double( y[i] ) * y[i];
+				amax = std::max( amax, std::fabs( double( y[i] ) ) );
+				worst = std::max( worst, std::fabs( double( x[i] ) - y[i] ) );
+			}
+			worst /= amax;
+			return std::sqrt( num / den );
+		};
+		for ( int log = 1; log >= 0; --log ) {
+			const auto d32 = run( log, 0, 32 ), h32 = run( log, 1, 32 ), p32 = run( log, 2, 32 ), d8 = run( log, 0, 8 ), h8 = run( log, 1, 8 ), p8 = run( log, 2, 8 );
+			double w1, w2, w3;
+			const double r1 = cmp( h32, d32, w1 ), r2 = cmp( h8, d8, w2 ), r3 = cmp( d8, d32, w3 );
+			const char* form = log ? "log scales" : "additive";
+			std::snprintf( line, sizeof( line ), "(e) Adam, %s: device against the host reference, FP32 moments: largest difference %.2e of the largest delta", form, w1 );
+			check( w1 < 1e-4, line );
+			std::snprintf( line, sizeof( line ), "(e) Adam, %s: device against the host reference, 8-bit moments: relative L2 %.2e, largest %.2e", form, r2, w2 );
+			check( r2 < 1e-3, line );
+			const bool same = std::memcmp( p32.data(), d32.data(), n * sizeof( float ) ) == 0 && std::memcmp( p8.data(), d8.data(), n * sizeof( float ) ) == 0;
+			std::snprintf( line, sizeof( line ), "(e) Adam, %s: the state updated in parts equals one update, FP32 and 8-bit: %s", form, same ? "bit for bit" : "no" );
+			check( same, line );
+			std::snprintf( line, sizeof( line ), "(e) Adam, %s: 8-bit against FP32 moments after 50 steps: relative L2 %.4f, largest %.4f (no outliers)", form, r3, w3 );
+			check( w3 < 0.5, line );
+			(void) r1;
+		}
+		// optimization: L = sum c ( a - t )^2 with c over six decades and noisy gradients, 300 additive steps from 0; the 8-bit moments reach
+		// the FP32 ones' loss
+		{
+			std::vector<float> t( n ), c( n );
+			std::normal_distribution<float> tn( 0.0f, 0.05f );
+			for ( size_t i = 0; i < n; ++i ) {
+				t[i] = tn( rng );
+				c[i] = mag[i];
+			}
+			std::vector<float> zero( n, 0.0f );
+			auto loss = [&]( const std::vector<float>& a ) {
+				double L = 0.0;
+				for ( size_t i = 0; i < n; ++i ) L += double( c[i] ) * ( a[i] - t[i] ) * ( a[i] - t[i] );
+				return L;
+			};
+			auto quad = [&]( int bits ) {
+				std::mt19937 nr( 5 );
+				std::vector<float> a( n, 0.0f ), w( n, 0.0f ), m( n, 0.0f ), v( n, 0.0f ), mmax( nb, 0.0f ), vmax( nb, 0.0f ), g( n );
+				std::vector<uint8_t> mq( n, 0 ), vq( n, 0 );
+				float *d_w0 = up( zero ), *d_a = up( a ), *d_w = up( a ), *d_g = up( a ), *d_m = up( m ), *d_v = up( v ), *d_mm = up( mmax ), *d_vm = up( vmax );
+				uint8_t *d_mq = nullptr, *d_vq = nullptr;
+				CUDA_CHECK( cudaMalloc( &d_mq, n ) );
+				CUDA_CHECK( cudaMalloc( &d_vq, n ) );
+				CUDA_CHECK( cudaMemset( d_mq, 0, n ) );
+				CUDA_CHECK( cudaMemset( d_vq, 0, n ) );
+				engine::train::AdamOptions qo;
+				qo.lr = 2e-3f;
+				for ( int k = 1; k <= 300; ++k ) {
+					for ( size_t i = 0; i < n; ++i ) g[i] = 2.0f * c[i] * ( a[i] - t[i] ) + 0.02f * c[i] * gn( nr );
+					CUDA_CHECK( cudaMemcpy( d_g, g.data(), n * sizeof( float ), cudaMemcpyHostToDevice ) );
+					if ( bits == 32 ) engine::train::adam_deltas( d_w0, d_a, d_w, d_g, d_m, d_v, n, k, 1.0f, qo, st );
+					else engine::train::adam_deltas8( d_w0, d_a, d_w, d_g, d_mq, d_vq, d_mm, d_vm, n, k, 1.0f, qo, st );
+					CUDA_CHECK( cudaStreamSynchronize( st ) );
+					a = down( d_a, n );
+				}
+				for ( void* q : { (void*) d_w0, (void*) d_a, (void*) d_w, (void*) d_g, (void*) d_m, (void*) d_v, (void*) d_mm, (void*) d_vm, (void*) d_mq, (void*) d_vq } )
+					CUDA_CHECK( cudaFree( q ) );
+				return loss( a );
+			};
+			const double L0 = loss( zero ), l32 = quad( 32 ), l8 = quad( 8 );
+			std::snprintf( line, sizeof( line ), "(e) Adam on a noisy quadratic, 300 steps: loss %.4g -> %.4g with FP32 moments, %.4g with 8-bit", L0, l32, l8 );
+			check( l32 < 0.05 * L0 && l8 < 1.1 * l32, line );
+		}
+		// codes: |decode( encode( y ) ) - y| within half a step (1/16 of y) above the subnormal range when rounded to the nearest, within a step
+		// when stochastic and unbiased over the draws (v: its root); 0 and the absmax exact
+		double worst = 0.0, worst_sr = 0.0, bias = 0.0;
+		int counted = 0;
+		for ( int i = 0; i < 20000; ++i ) {
+			const float y = std::pow( 10.0f, ue( rng ) - 1.0f ), m = ( i & 1 ) ? -y : y;
+			const float bm = q8::dec_m( q8::enc_m( m, 1.0f ), 1.0f ), br = std::sqrt( q8::dec_v( q8::enc_v( y * y, 1.0f ), 1.0f ) );
+			if ( y > std::ldexp( 1.0f, -13 ) ) worst = std::max( worst, std::fabs( double( bm ) - m ) / y );
+			worst = std::max( worst, std::fabs( double( br ) - y ) / y );
+			if ( y <= std::ldexp( 1.0f, -13 ) ) continue;
+			double mean = 0.0;
+			for ( int k = 0; k < 256; ++k ) {
+				const float sm = q8::dec_m( q8::enc_m( m, 1.0f, q8::draw( i, k, q8::kSaltM ) ), 1.0f );
+				worst_sr = std::max( worst_sr, std::fabs( double( sm ) - m ) / y );
+				mean += sm;
+			}
+			bias += ( mean / 256.0 - m ) / m;   // signed, relative: averages to 0 when unbiased
+			++counted;
+		}
+		bias = std::fabs( bias / std::max( counted, 1 ) );
+		const bool ends = q8::dec_m( q8::enc_m( 0.0f, 1.0f ), 1.0f ) == 0.0f && q8::dec_m( q8::enc_m( -1.0f, 1.0f ), 1.0f ) == -1.0f &&
+			q8::dec_v( q8::enc_v( 1.0f, 1.0f ), 1.0f ) == 1.0f;
+		std::snprintf( line, sizeof( line ), "(e) 8-bit codes: worst relative round trip %.4f nearest (half a step 0.0625), %.4f stochastic (a step 0.125)", worst, worst_sr );
+		check( worst <= 0.0625 + 1e-6 && worst_sr <= 0.125 + 1e-6, line );
+		std::snprintf( line, sizeof( line ), "(e) 8-bit codes: stochastic rounding's mean relative bias %.5f; 0 and the absmax exact: %s", bias, ends ? "yes" : "no" );
+		check( bias < 1e-3 && ends, line );
 	}
 	std::printf( fails ? "=== TRAIN GRAD: %d FAILURE(S) ===\n" : "=== TRAIN GRAD: PASS ===\n", fails );
 	return fails ? 1 : 0;

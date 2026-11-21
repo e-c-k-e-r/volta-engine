@@ -5,6 +5,7 @@
 // recomputed from its input when its backward runs.
 #include "engine/backend/types.h"
 #include <cstddef>
+#include <cstdint>
 
 namespace engine::train {
 
@@ -84,6 +85,13 @@ void adam_log_scales( const float* s0, float* a, float* s, const float* g, float
 // Adam on additive deltas, w = w0 + a: the step on a from g (the gradient with respect to w, times grad_scale), then w
 void adam_deltas( const float* w0, float* a, float* w, const float* g, float* m, float* v, size_t n, int step, float grad_scale, const AdamOptions& o,
 	backend::stream_t stream );
+// The same two with 8-bit block-wise moments (engine/train/adam8.h): codes mq / vq per value, per block of 256 the largest |m| (mmax) and
+// root of v (vmax); all zero at the start. base: where these n values start in the whole state (a multiple of 256), when it is updated in
+// parts (the rounding draws follow the whole state's indices: parts give the result of one call)
+void adam_log_scales8( const float* s0, float* a, float* s, const float* g, uint8_t* mq, uint8_t* vq, float* mmax, float* vmax, size_t n, int step,
+	float grad_scale, const AdamOptions& o, backend::stream_t stream, size_t base = 0 );
+void adam_deltas8( const float* w0, float* a, float* w, const float* g, uint8_t* mq, uint8_t* vq, float* mmax, float* vmax, size_t n, int step,
+	float grad_scale, const AdamOptions& o, backend::stream_t stream, size_t base = 0 );
 
 // Rows by index (a routed expert's rows of a batch): dst[i] = src[idx[i]] (FP16 source, half_src; FP32 otherwise), times w[i] when w is given
 void gather_rows( const void* src, bool half_src, const int* idx, const float* w, int n, int cols, float* dst, backend::stream_t stream );
