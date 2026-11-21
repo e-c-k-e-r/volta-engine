@@ -22,8 +22,9 @@
 __host__ __device__ constexpr int exl3e_k1_shared_costs() { return 1; }
 __host__ __device__ constexpr int exl3e_half_shared_costs( int KA ) { return KA == 1 ? 1 : KA == 2 ? 1 : 2; }
 
-// Threads per block: each step has 32768 >> K pairs of out-states, so from K = 7 on a 512-thread block would leave most threads idle
-__host__ __device__ constexpr int exl3e_num_threads( int K ) { return K >= 7 ? ( 32768 >> K ) : 512; }
+// Threads per block: each step has 32768 >> K pairs of out-states, so from K = 7 on a 512-thread block would leave most threads idle; K = 1's
+// shared cost array allows one block per SM, so it takes 1024 threads to keep the SM's warps
+__host__ __device__ constexpr int exl3e_num_threads( int K ) { return K >= 7 ? ( 32768 >> K ) : K == 1 ? 1024 : 512; }
 __host__ __device__ constexpr int exl3e_min_blocks( int K ) { return K == 6 ? 1 : 1024 / exl3e_num_threads( K ); }
 
 // Shared memory of the integer-rate kernel: staged tile, cost scales, argmin scratch, and from K = 2 on both cost arrays (K = 1:
@@ -289,10 +290,11 @@ void exl3_encode_tiles_kernel(
 
 // Half-integer rate KA + 0.5 (mul1 only): the window advances by D(i) = KA + bit (i mod 16) of MASK bits at position i (MASK 0xAAAA alternates
 // KA and KA + 1). The node between positions i - 1 and i is the (16 - D(i))-bit overlap of their windows. Costs and history in global scratch,
-// sized for the wider node space (65536 >> KA)
-#define EXL3E_HALF_NT 512
+// sized for the wider node space (65536 >> KA). Threads per block: KA = 1's shared cost array allows one block per SM, so it takes 1024 threads
+// to keep the SM's warps; the others 512, two blocks
+__host__ __device__ constexpr int exl3e_half_threads( int KA ) { return KA == 1 ? 1024 : 512; }
 
-template <int KIN, int KOUT>
+template <int KIN, int KOUT, int NT>
 __device__ __forceinline__ void exl3e_half_step( half w, const half* costs_in, half* costs_out, uint8_t* hist_row, bool first, int pre_state,
 	bool write_hist, bool weighted, half scale ) {
 	static_assert( exl3e_packed_hist( KOUT ), "exl3e_half_step: the half-integer rates' candidates fit the packed history" );
@@ -302,7 +304,7 @@ __device__ __forceinline__ void exl3e_half_step( half w, const half* costs_in, h
 	constexpr int edges_out = 65536 >> KOUT;
 	const half2 w2 = __half2half2( w );
 	const half2 inf2 = __half2half2( EXL3E_H_INF );
-	for ( int out_edge_idx = 2 * threadIdx.x; out_edge_idx < edges_out; out_edge_idx += 2 * EXL3E_HALF_NT ) {
+	for ( int out_edge_idx = 2 * threadIdx.x; out_edge_idx < edges_out; out_edge_idx += 2 * NT ) {
 		int in_edge_idx = out_edge_idx >> KIN;
 		uint32_t p0 = (uint32_t) out_edge_idx * 0x83DCD12Du;
 		uint32_t p1 = p0 + 0x83DCD12Du;
@@ -347,7 +349,7 @@ __device__ __forceinline__ void exl3e_half_step( half w, const half* costs_in, h
 }
 
 template <int KA, uint32_t MASK>
-__global__ __launch_bounds__( EXL3E_HALF_NT, 2 )
+__global__ __launch_bounds__( exl3e_half_threads( KA ), KA == 1 ? 1 : 2 )
 void exl3_encode_tiles_half_kernel(
 	const float* __restrict__ input_tiles,
 	const float* __restrict__ weights,
@@ -357,7 +359,7 @@ void exl3_encode_tiles_half_kernel(
 	uint16_t* __restrict__ temp_edges_ptr,
 	int open
 ) {
-	constexpr int NT = EXL3E_HALF_NT;
+	constexpr int NT = exl3e_half_threads( KA );
 	constexpr int KB = KA + 1;
 	constexpr int edges_max = 65536 >> KA;
 	// Both passes end on position 255 or 127, whose out-width is set by D(0) (the ring wraps)
@@ -405,16 +407,16 @@ void exl3_encode_tiles_half_kernel(
 			const int din = ( MASK >> ( ri & 15 ) ) & 1, dout = ( MASK >> ( ( ri + 1 ) & 15 ) ) & 1;
 			switch ( din * 2 + dout ) {
 				case 0: {
-					exl3e_half_step<KA, KA>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, weighted, sc );
+					exl3e_half_step<KA, KA, NT>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, weighted, sc );
 				} break;
 				case 1: {
-					exl3e_half_step<KA, KB>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, weighted, sc );
+					exl3e_half_step<KA, KB, NT>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, weighted, sc );
 				} break;
 				case 2: {
-					exl3e_half_step<KB, KA>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, weighted, sc );
+					exl3e_half_step<KB, KA, NT>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, weighted, sc );
 				} break;
 				default: {
-					exl3e_half_step<KB, KB>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, weighted, sc );
+					exl3e_half_step<KB, KB, NT>( w, temp_costs_inc, temp_costs, hist_row, first, pre_state, write_hist, weighted, sc );
 				} break;
 			}
 			__syncthreads();

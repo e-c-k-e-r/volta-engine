@@ -59,7 +59,7 @@ Launch launch_for( int code, int cb ) {
 	l.kernel = kernel_for( code, cb );
 	ENGINE_ASSERT( l.kernel, "exl3_encode: no kernel for this width code" );
 	if ( trellis_is_half( code ) ) {
-		l.threads = EXL3E_HALF_NT;
+		l.threads = exl3e_half_threads( trellis_base_bits( code ) );
 		l.shmem = exl3e_half_shmem( trellis_base_bits( code ) );
 	} else {
 		l.threads = exl3e_num_threads( code );
