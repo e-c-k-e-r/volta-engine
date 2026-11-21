@@ -34,9 +34,9 @@ namespace engine::train::qwen4_exp {
 // row of segment i is i % wrows (w null: weights of 1); inv[segments] is kept
 void rms_forward( const float* x, const float* w, int wrows, bool one_plus, bool mean, int segments, int n, float eps, float* inv, float* y,
 	backend::stream_t stream );
-// dx += the gradient through the norm at the same x and inv (the weights are frozen)
+// dx += the gradient through the norm at the same x and inv; with dw, the weights' gradient as well ([wrows, n], +=)
 void rms_backward( const float* x, const float* w, int wrows, bool one_plus, bool mean, int segments, int n, const float* inv, const float* dy, float* dx,
-	backend::stream_t stream );
+	backend::stream_t stream, float* dw = nullptr );
 
 // The hyper-connection site before each sublayer (dense weights, FP32 copies): streams x [rows, hc, hidden] in, the sublayer input mixed
 // [rows, hidden] and the post gates [rows, hc] out
@@ -47,6 +47,7 @@ struct HcWeights {
 	const float* down = nullptr;    // [rank, hc * hidden]
 	const float* up = nullptr;      // [hc * hidden, rank]
 	const float* inject = nullptr;  // [hc, hc * hidden], null on the final mixer (no post gates)
+	float* gnorm = nullptr;         // the norm weights' gradient (+=, null: not wanted)
 };
 // What the backward reads (rows x the size given): inv rows * hc, normed rows * flat, zt rows * rank, t rows * rank, u rows * flat (sigmoid
 // inputs of the up mix), zi rows * hc
@@ -54,7 +55,8 @@ struct HcCache {
 	float *inv = nullptr, *normed = nullptr, *zt = nullptr, *t = nullptr, *u = nullptr, *zi = nullptr;
 };
 void hc_forward( Blas& b, const HcWeights& w, const float* x, int rows, const HcCache& c, float* mixed, float* post );
-// dx += from dmixed [rows, hidden] and dpost [rows, hc] (null on the final mixer); scratch: 2 * rows * flat + rows * rank + rows * hc floats
+// dx += from dmixed [rows, hidden] and dpost [rows, hc] (null on the final mixer), and the norm weights' gradient into w.gnorm when given;
+// scratch: 2 * rows * flat + rows * rank + rows * hc floats
 void hc_backward( Blas& b, const HcWeights& w, const float* x, int rows, const HcCache& c, const float* dmixed, const float* dpost, float* dx, float* scratch );
 size_t hc_scratch_floats( const HcWeights& w, int rows );
 
@@ -71,10 +73,11 @@ void conv4_silu_backward( const float* s, const float* w, int rows, int channels
 void sigmoid_gate_forward( const float* a, const float* g, float* o, size_t n, backend::stream_t stream );
 void sigmoid_gate_backward( const float* a, const float* g, const float* dout, float* da, float* dg, size_t n, backend::stream_t stream );
 
-// GDN's output norm per head of n: y = x * inv * gamma * sigmoid( z ), inv = rsqrt( mean( x^2 ) + eps ); backward adds into dx and dz
+// GDN's output norm per head of n: y = x * inv * gamma * sigmoid( z ), inv = rsqrt( mean( x^2 ) + eps ); backward adds into dx and dz, and
+// with dgamma into gamma's gradient [n]
 void gated_rms_forward( const float* x, const float* z, const float* gamma, int segments, int n, float eps, float* inv, float* y, backend::stream_t stream );
 void gated_rms_backward( const float* x, const float* z, const float* gamma, int segments, int n, const float* inv, const float* dy, float* dx, float* dz,
-	backend::stream_t stream );
+	backend::stream_t stream, float* dgamma = nullptr );
 
 // Softmax routing over the top k logits of each row (selection fixed): w[r, j] = softmax_j( logit[r, ids[r, j]] ); backward from dw [rows, k] to
 // dlogit [rows, k] (overwrites)
@@ -199,6 +202,15 @@ struct Tuned {
 	float *mu = nullptr, *vu = nullptr, *mv = nullptr, *vv = nullptr;   // Adam moments of au / av
 };
 
+// A trainable dense tensor (the weights of a norm: the hyper-connection sites', attention's q / k norms, GDN's gated norm, PLE's), as an
+// additive delta on the checkpoint's values: its name, current values and gradient (device buffers of n floats)
+struct Dense {
+	std::string name;
+	float* w = nullptr;
+	float* g = nullptr;
+	int n = 0;
+};
+
 // The KL head's teacher per row: its top tk token ids and probabilities and the mass outside them
 struct Teacher {
 	const int* ids = nullptr;     // [rows, tk] (device)
@@ -247,15 +259,20 @@ public:
 	void set_timing( bool on );
 	std::string timing_report( bool reset = true );
 
-	// The tensors this rank holds (with ranks > 1: the shared ones and its own experts)
+	// The tensors this rank holds (with ranks > 1: the shared ones and its own experts), and the norm weights (every rank holds them all)
 	std::vector<Tuned*> tensors();
+	std::vector<Dense*> dense_tensors();
+	// The norm weights trained along with the scales (on by default); off: their gradients are computed but not applied
+	void set_train_norms( bool on );
 	void zero_grads();
-	// Adam on every tensor's log deltas from the accumulated gradients (times grad_scale; the shared tensors' summed over the ranks first),
-	// then the current scales
+	// Adam on every tensor's log deltas and the norm weights' deltas from the accumulated gradients (times grad_scale; the shared tensors' and
+	// the norms' summed over the ranks first), then the current values
 	void adam( const AdamOptions& o, int step, float grad_scale );
-	// The current scales kept as the best (on the device), and the kept ones per tensor name as FP16 (input, output) at the end
+	// The current values kept as the best (on the device), and the kept ones at the end as FP16: per tensor name its (input, output) scales,
+	// per norm weight name its values
 	void keep_best();
 	void best_scales( std::vector<std::pair<std::string, std::pair<std::vector<uint16_t>, std::vector<uint16_t>>>>& out );
+	void best_dense( std::vector<std::pair<std::string, std::vector<uint16_t>>>& out );
 
 private:
 	struct Impl;

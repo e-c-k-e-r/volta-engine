@@ -66,6 +66,13 @@ void grads( q::Model& m, Grads& g ) {
 		for ( int i = 0; i < t->k; ++i ) e.first[i] += u[i];
 		for ( int i = 0; i < t->n; ++i ) e.second[i] += v[i];
 	}
+	// the norm weights (every rank holds them all; its partial sum, rank 0 alone for the PLE layer's)
+	for ( q::Dense* d : m.dense_tensors() ) {
+		const std::vector<float> u = down( d->g, d->n );
+		auto& e = g[d->name];
+		if ( e.first.empty() ) e.first.assign( d->n, 0.0f );
+		for ( int i = 0; i < d->n; ++i ) e.first[i] += u[i];
+	}
 }
 
 // The worst relative difference over the tensors of a kind (name fragment) with a nonzero reference gradient
@@ -198,6 +205,7 @@ int main( int argc, char** argv ) {
 		compare_grads( g_ref, g_tp, c.full_attention( L ) ? ".self_attn." : ".linear_attn.", c.full_attention( L ) ? "attention" : "GDN" );
 		compare_grads( g_ref, g_tp, ".shared_expert.", "shared expert" );
 		compare_grads( g_ref, g_tp, ".experts.", "routed experts" );
+		compare_grads( g_ref, g_tp, "norm", "norm weight" );
 	}
 	{
 		// The head on the last layer's range
@@ -281,6 +289,7 @@ int main( int argc, char** argv ) {
 		std::snprintf( line, sizeof( line ), "streams' gradient: relative difference %.3g", rel( dx_tp, dx_ref ) );
 		check( rel( dx_tp, dx_ref ) < 1e-4, line );
 		compare_grads( g_ref, g_tp, "lm_head", "lm_head" );
+		compare_grads( g_ref, g_tp, "hyper_connection_mixer.hc_norm", "final mixer norm" );
 	}
 	for ( ncclComm_t cm : comms ) ncclCommDestroy( cm );
 	std::printf( "[%c] test_train_qwen4_exp_tp: %d failure(s)\n", fails ? '-' : '+', fails );

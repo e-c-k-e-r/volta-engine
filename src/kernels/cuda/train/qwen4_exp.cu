@@ -5,6 +5,7 @@
 #include "engine/backend/cuda/rope_math.cuh"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <algorithm>
 #include <cmath>
 
 namespace engine::train::qwen4_exp {
@@ -61,6 +62,27 @@ __global__ void k_rms_bwd( const float* x, const float* w, int wrows, bool one_p
 	const float iv = inv[seg];
 	const float c = iv * iv * iv * s / ( mean ? static_cast<float>( n ) : 1.0f );
 	for ( int i = threadIdx.x; i < n; i += blockDim.x ) dx[base + i] += iv * dy[base + i] * weight_at( w, wrows, one_plus, seg, n, i ) - x[base + i] * c;
+}
+
+// A norm's weight gradient: dw[row, i] += sum over the segments of that weight row (seg % wrows == row) of dy x inv (times sigmoid( z ) for the
+// gated norm); block (256 columns, weight row, a chunk of its segments), the chunks' sums added atomically
+__global__ void k_norm_dw( const float* x, const float* z, const float* inv, const float* dy, int segments, int wrows, int n, int per_chunk, float* dw ) {
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( i >= n ) return;
+	const int row = blockIdx.y;
+	const int s0 = row + blockIdx.z * per_chunk * wrows, s1 = min( segments, s0 + per_chunk * wrows );
+	float acc = 0.0f;
+	for ( int seg = s0; seg < s1; seg += wrows ) {
+		const size_t j = static_cast<size_t>( seg ) * n + i;
+		const float v = dy[j] * x[j] * inv[seg];
+		acc += z ? v * sigmoidf_( z[j] ) : v;
+	}
+	atomicAdd( &dw[static_cast<size_t>( row ) * n + i], acc );
+}
+
+void norm_dw( const float* x, const float* z, const float* inv, const float* dy, int segments, int wrows, int n, float* dw, cudaStream_t st ) {
+	const int per_row = ( segments + wrows - 1 ) / wrows, chunks = std::max( 1, std::min( 64, per_row / 64 ) ), per_chunk = ( per_row + chunks - 1 ) / chunks;
+	k_norm_dw<<<dim3( ( n + 255 ) / 256, wrows, chunks ), 256, 0, st>>>( x, z, inv, dy, segments, wrows, n, per_chunk, dw );
 }
 
 __global__ void k_silu( const float* z, float* t, size_t n ) {
@@ -765,8 +787,9 @@ void rms_forward( const float* x, const float* w, int wrows, bool one_plus, bool
 }
 
 void rms_backward( const float* x, const float* w, int wrows, bool one_plus, bool mean, int segments, int n, const float* inv, const float* dy, float* dx,
-	backend::stream_t stream ) {
+	backend::stream_t stream, float* dw ) {
 	k_rms_bwd<<<segments, 256, 0, cu( stream )>>>( x, w, wrows, one_plus, mean, n, inv, dy, dx );
+	if ( dw ) norm_dw( x, nullptr, inv, dy, segments, wrows, n, dw, cu( stream ) );   // d / dw of x inv ( 1 + w ) or x inv w: x inv
 }
 
 void hc_forward( Blas& b, const HcWeights& w, const float* x, int rows, const HcCache& c, float* mixed, float* post ) {
@@ -802,7 +825,7 @@ void hc_backward( Blas& b, const HcWeights& w, const float* x, int rows, const H
 		k_post_bwd<<<blocks_for( (size_t) rows * w.hc ), 256, 0, st>>>( c.zi, dpost, dzi, (size_t) rows * w.hc );
 		b.gemm( false, false, rows, flat, w.hc, 1.0f / w.hc, dzi, w.inject, 1.0f, dnormed );
 	}
-	rms_backward( x, w.norm, w.hc, true, true, rows * w.hc, w.hidden, c.inv, dnormed, dx, b.stream() );
+	rms_backward( x, w.norm, w.hc, true, true, rows * w.hc, w.hidden, c.inv, dnormed, dx, b.stream(), w.gnorm );
 }
 
 void apply_forward( float* x, const float* post, const float* y, int rows, int hidden, int hc, backend::stream_t stream ) {
@@ -835,8 +858,9 @@ void gated_rms_forward( const float* x, const float* z, const float* gamma, int 
 }
 
 void gated_rms_backward( const float* x, const float* z, const float* gamma, int segments, int n, const float* inv, const float* dy, float* dx, float* dz,
-	backend::stream_t stream ) {
+	backend::stream_t stream, float* dgamma ) {
 	k_grms_bwd<<<segments, 256, 0, cu( stream )>>>( x, z, gamma, n, inv, dy, dx, dz );
+	if ( dgamma ) norm_dw( x, z, inv, dy, segments, 1, n, dgamma, cu( stream ) );
 }
 
 void topk_softmax_backward( const float* w, const float* dw, int rows, int k, float* dlogit, backend::stream_t stream ) {

@@ -154,6 +154,27 @@ int main( int argc, char** argv ) {
 			std::snprintf( line, sizeof( line ), "%-56s scales: error %.3g of %.3g (s %.3g)", t->name.c_str(), w, gm, get( t->su, 0 ) );
 			check( w <= 3e-2 * gm + 1e-4, line );
 		}
+		// Norm weights: the largest-gradient channel and a random one of each of the layer's norms (absolute steps: additive deltas)
+		for ( q::Dense* d : m.dense_tensors() ) {
+			const std::vector<float> gd = down( d->g, d->n );
+			double w = 0.0, gm = 0.0;
+			for ( int s = 0; s < 2; ++s ) {
+				int ch = std::uniform_int_distribution<int>( 0, d->n - 1 )( rng );
+				if ( s == 0 ) ch = static_cast<int>( std::max_element( gd.begin(), gd.end(), []( float a, float b ) { return std::fabs( a ) < std::fabs( b ); } ) - gd.begin() );
+				const float w0 = get( d->w, ch ), h = 1e-3f + 1e-2f * std::fabs( w0 );
+				set( d->w, ch, w0 + h );
+				const double lp = loss();
+				set( d->w, ch, w0 - h );
+				const double lm = loss();
+				set( d->w, ch, w0 );
+				const double fd = ( lp - lm ) / ( 2 * h );
+				w = std::max( w, std::fabs( fd - gd[ch] ) );
+				gm = std::max( gm, std::fabs( fd ) );
+			}
+			const std::string nm = d->name.substr( d->name.find( "layers." ) == std::string::npos ? 0 : d->name.find( "layers." ) );
+			std::snprintf( line, sizeof( line ), "%-56s norm weights: error %.3g of %.3g", nm.c_str(), w, gm );
+			check( w <= 3e-2 * gm + 1e-4, line );
+		}
 		{
 			// the backward without a kept forward (the sublayers recomputed) gives the same input gradient
 			m.forward( L, x, y, T, pk, pv );

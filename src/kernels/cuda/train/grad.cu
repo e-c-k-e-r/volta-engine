@@ -156,6 +156,20 @@ __global__ void k_adam_log( const float* s0, float* a, float* s, const float* g,
 	}
 }
 
+__global__ void k_adam_add( const float* w0, float* a, float* w, const float* g, float* m, float* v, size_t n, float gs, float lr, float b1, float b2, float eps,
+	float c1, float c2 ) {
+	TRAIN_LOOP( i, n ) {
+		const float gi = g[i] * gs;
+		const float mi = b1 * m[i] + ( 1.0f - b1 ) * gi;
+		const float vi = b2 * v[i] + ( 1.0f - b2 ) * gi * gi;
+		m[i] = mi;
+		v[i] = vi;
+		const float ai = a[i] - lr * ( mi / c1 ) / ( sqrtf( vi / c2 ) + eps );
+		a[i] = ai;
+		w[i] = w0[i] + ai;
+	}
+}
+
 __global__ void k_exp_scale( const float* base, const float* a, float* out, size_t n ) {
 	TRAIN_LOOP( i, n ) out[i] = base[i] * expf( a[i] );
 }
@@ -311,6 +325,12 @@ void adam_log_scales( const float* s0, float* a, float* s, const float* g, float
 	backend::stream_t stream ) {
 	const float c1 = 1.0f - std::pow( o.beta1, static_cast<float>( step ) ), c2 = 1.0f - std::pow( o.beta2, static_cast<float>( step ) );
 	if ( n > 0 ) k_adam_log<<<blocks_for( n ), 256, 0, cu( stream )>>>( s0, a, s, g, m, v, n, grad_scale, o.lr, o.beta1, o.beta2, o.eps, c1, c2 );
+}
+
+void adam_deltas( const float* w0, float* a, float* w, const float* g, float* m, float* v, size_t n, int step, float grad_scale, const AdamOptions& o,
+	backend::stream_t stream ) {
+	const float c1 = 1.0f - std::pow( o.beta1, static_cast<float>( step ) ), c2 = 1.0f - std::pow( o.beta2, static_cast<float>( step ) );
+	if ( n > 0 ) k_adam_add<<<blocks_for( n ), 256, 0, cu( stream )>>>( w0, a, w, g, m, v, n, grad_scale, o.lr, o.beta1, o.beta2, o.eps, c1, c2 );
 }
 
 void gather_rows( const void* src, bool half_src, const int* idx, const float* w, int n, int cols, float* dst, backend::stream_t stream ) {

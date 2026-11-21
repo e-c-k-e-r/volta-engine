@@ -81,6 +81,9 @@ void adam_step( float* p, const float* g, float* m, float* v, size_t n, int step
 // s from the new a
 void adam_log_scales( const float* s0, float* a, float* s, const float* g, float* m, float* v, size_t n, int step, float grad_scale, const AdamOptions& o,
 	backend::stream_t stream );
+// Adam on additive deltas, w = w0 + a: the step on a from g (the gradient with respect to w, times grad_scale), then w
+void adam_deltas( const float* w0, float* a, float* w, const float* g, float* m, float* v, size_t n, int step, float grad_scale, const AdamOptions& o,
+	backend::stream_t stream );
 
 // Rows by index (a routed expert's rows of a batch): dst[i] = src[idx[i]] (FP16 source, half_src; FP32 otherwise), times w[i] when w is given
 void gather_rows( const void* src, bool half_src, const int* idx, const float* w, int n, int cols, float* dst, backend::stream_t stream );

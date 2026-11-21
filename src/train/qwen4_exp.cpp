@@ -136,11 +136,11 @@ struct Layer {
 	HcWeights ahc, mhc;
 	// GDN (this rank's key heads from k0h, value heads from v0h; conv_l: the convolution of their channels)
 	Tuned qkv, z, out;
-	float *A = nullptr, *B = nullptr, *A_log = nullptr, *dt_bias = nullptr, *conv_l = nullptr, *norm = nullptr;
+	float *A = nullptr, *B = nullptr, *A_log = nullptr, *dt_bias = nullptr, *conv_l = nullptr, *norm = nullptr, *g_norm = nullptr;
 	int kh_l = 0, vh_l = 0, k0h = 0, v0h = 0;
 	// attention (this rank's query heads from q0h, key / value heads from kv0)
 	Tuned q, k, v, o;
-	float *q_norm = nullptr, *k_norm = nullptr;
+	float *q_norm = nullptr, *k_norm = nullptr, *g_q_norm = nullptr, *g_k_norm = nullptr;
 	int hq_l = 0, hk_l = 0, q0h = 0, kv0 = 0;
 	// MoE
 	float* router = nullptr;
@@ -150,6 +150,7 @@ struct Layer {
 	float* sh_gate = nullptr;
 	// PLE
 	float *ple_nk = nullptr, *ple_nq = nullptr, *ple_nc = nullptr, *ple_conv = nullptr;
+	float *g_ple_nk = nullptr, *g_ple_nq = nullptr, *g_ple_nc = nullptr;   // their gradients (rank 0: the PLE layer runs whole on every rank)
 	// the sublayer outputs of a kept forward (the rank's rows), for the next backward
 	float *cyA = nullptr, *cyM = nullptr;
 	bool cached = false;
@@ -167,6 +168,9 @@ struct Model::Impl {
 	Pool ws;                    // per-call workspace
 	ParamPool shared_p;         // the scales of the tensors every rank holds
 	ParamPool expert_p;         // the scales of this rank's experts
+	ParamPool norm_p;           // the norm weights (s0: the checkpoint's, a: additive deltas, s: current)
+	std::vector<Dense> dense_t; // per norm weight its name and buffers in norm_p
+	bool train_norms = true;
 	std::vector<Layer> layers;
 	int first = 0;
 	int rank = 0, ranks = 1;
@@ -269,6 +273,27 @@ struct Model::Impl {
 		return f;
 	}
 
+	// A norm's weights, trainable: the checkpoint's values (s0) and the current ones (returned) in norm_p, its gradient into *grad (null where this
+	// rank adds none: grad itself null)
+	float* norm_weights( const std::string& name, float** grad ) {
+		const size_t mark = arena.offset_bytes;
+		pod::TensorView t = repo.load( name.c_str(), arena, st, pod::DType::FP16 );
+		ENGINE_ASSERT( t.data != nullptr, "qwen4_exp training model: a norm's weights are missing" );
+		const size_t n = t.numel(), o = norm_p.take( n );
+		half_to_float( t.data, norm_p.s0 + o, n, st );
+		CUDA_CHECK( cudaMemcpyAsync( norm_p.s + o, norm_p.s0 + o, n * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
+		CUDA_CHECK( cudaStreamSynchronize( st ) );
+		arena.offset_bytes = mark;
+		Dense d;
+		d.name = name;
+		d.w = norm_p.s + o;
+		d.g = norm_p.g + o;
+		d.n = static_cast<int>( n );
+		dense_t.push_back( d );
+		if ( grad ) *grad = norm_p.g + o;
+		return norm_p.s + o;
+	}
+
 	Tuned tuned( const std::string& name, bool expert ) {
 		Tuned t;
 		t.name = name;
@@ -293,7 +318,7 @@ struct Model::Impl {
 		w.hc = cfg.hc;
 		w.rank = cfg.rank;
 		w.eps = cfg.eps;
-		w.norm = dense( pre + ".hc_norm.weight" );
+		w.norm = norm_weights( pre + ".hc_norm.weight", &w.gnorm );
 		w.down = dense( pre + ".input_mix_weight_down.weight" );
 		w.up = dense( pre + ".input_mix_weight_up.weight" );
 		w.inject = inject ? dense( pre + ".block_inject_weight.weight" ) : nullptr;
@@ -371,6 +396,7 @@ Model::~Model() {
 	p_->ws.release();
 	p_->shared_p.release();
 	p_->expert_p.release();
+	p_->norm_p.release();
 	if ( p_->ones_f ) cudaFree( p_->ones_f );
 	engine::core::arena_destroy( p_->arena );
 	if ( p_->st ) cudaStreamDestroy( p_->st );
@@ -442,6 +468,9 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 		const size_t gdn = ( H + C ) + ( H + CV ) + ( CV + H ), att = ( H + 2 * QD ) + 2 * ( H + KD ) + ( QD + H ), sh = 3 * ( H + c.shared_inter );
 		m.shared_p.init( nl * ( std::max( gdn, att ) + sh + 64 ) + ( m.head ? H + c.vocab + 64 : 0 ) );
 		m.expert_p.init( static_cast<size_t>( nl ) * owned * 3 * ( H + I + 8 ) + 64 );
+		const size_t flat = static_cast<size_t>( c.hc ) * H;
+		m.norm_p.init( nl * ( 2 * flat + 2 * c.head_dim + c.lin_d + 64 ) + 4 * flat + 256 );
+		m.dense_t.reserve( static_cast<size_t>( nl ) * 4 + 8 );
 	}
 	const size_t ones = std::max<size_t>( c.vocab, 65536 );
 	CUDA_CHECK( cudaMalloc( &m.ones_f, ones * sizeof( float ) ) );
@@ -466,8 +495,8 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 			lw.k = m.tuned( pre + ".self_attn.k_proj", false );
 			lw.v = m.tuned( pre + ".self_attn.v_proj", false );
 			lw.o = m.tuned( pre + ".self_attn.o_proj", false );
-			lw.q_norm = m.dense( pre + ".self_attn.q_norm.weight" );
-			lw.k_norm = m.dense( pre + ".self_attn.k_norm.weight" );
+			lw.q_norm = m.norm_weights( pre + ".self_attn.q_norm.weight", &lw.g_q_norm );
+			lw.k_norm = m.norm_weights( pre + ".self_attn.k_norm.weight", &lw.g_k_norm );
 		}
 		else {
 			lw.kh_l = c.lin_k / ranks;
@@ -481,7 +510,7 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 			lw.B = m.dense( pre + ".linear_attn.in_proj_b.weight" );
 			lw.A_log = m.dense( pre + ".linear_attn.A_log" );
 			lw.dt_bias = m.dense( pre + ".linear_attn.dt_bias" );
-			lw.norm = m.dense( pre + ".linear_attn.norm.weight" );
+			lw.norm = m.norm_weights( pre + ".linear_attn.norm.weight", &lw.g_norm );
 			// the convolution's channels of this rank's heads: its q, k and v column blocks, [C_l, 4]
 			const float* conv = m.dense( pre + ".linear_attn.conv1d.weight" );
 			const size_t D = c.lin_d, GQK = c.lin_k * D, CQK = lw.kh_l * D, CV = lw.vh_l * D;
@@ -516,9 +545,10 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 		lw.sd = m.tuned( pre + ".mlp.shared_expert.down_proj", false );
 		lw.sh_gate = m.dense( pre + ".mlp.shared_expert_gate.weight" );
 		if ( lw.ple ) {
-			lw.ple_nk = m.dense( pre + ".ple.norm_key.weight" );
-			lw.ple_nq = m.dense( pre + ".ple.norm_query.weight" );
-			lw.ple_nc = m.dense( pre + ".ple.norm_conv.weight" );
+			// every rank runs the PLE layer whole: rank 0 alone adds its norms' gradients
+			lw.ple_nk = m.norm_weights( pre + ".ple.norm_key.weight", rank == 0 ? &lw.g_ple_nk : nullptr );
+			lw.ple_nq = m.norm_weights( pre + ".ple.norm_query.weight", rank == 0 ? &lw.g_ple_nq : nullptr );
+			lw.ple_nc = m.norm_weights( pre + ".ple.norm_conv.weight", rank == 0 ? &lw.g_ple_nc : nullptr );
 			lw.ple_conv = m.dense( pre + ".ple.conv1d.weight" );
 		}
 		lw.cyA = m.state.f( Rl * H );
@@ -827,7 +857,7 @@ void Model::Impl::gdn( Layer& lw, const float* mix, int T, float* y, const float
 		float* dO = ws.f( TR * CV );
 		lin_bwd( lw.out, Tout, o, Zout, dy, T, dO, false, vo );
 		float *doraw = ws.fz( TR * CV, st ), *dZo = ws.fz( TR * CV, st );
-		gated_rms_backward( oraw, Zo, lw.norm, T * vh, D, io, dO, doraw, dZo, st );
+		gated_rms_backward( oraw, Zo, lw.norm, T * vh, D, io, dO, doraw, dZo, st, lw.g_norm );
 		float *dqn = ws.fz( TR * CQK, st ), *dkn = ws.fz( TR * CQK, st ), *dv = ws.fz( TR * CV, st ), *dgate = ws.fz( TR * vh, st ), *dbeta = ws.fz( TR * vh, st );
 		float* gscr = ws.f( gdn_scratch_floats( vh, kGdnChunk ) );
 		gdn_backward( qn, kn, v, gate, beta, T, kh, vh, scale, kGdnChunk, ck, doraw, dqn, dkn, dv, dgate, dbeta, gscr, st );
@@ -893,8 +923,8 @@ void Model::Impl::attention( Layer& lw, const float* mix, int T, float* y, const
 		rope_backward( dqn, T, hq, d, cfg.rot_dim, cfg.rope_theta, st );
 		rope_backward( dkn, T, hk, d, cfg.rot_dim, cfg.rope_theta, st );
 		float *dq = ws.fz( TR * QD, st ), *dK = ws.fz( TR * KD, st );
-		rms_backward( q, lw.q_norm, 1, true, true, T * hq, d, iq, dqn, dq, st );
-		rms_backward( K, lw.k_norm, 1, true, true, T * hk, d, ik, dkn, dK, st );
+		rms_backward( q, lw.q_norm, 1, true, true, T * hq, d, iq, dqn, dq, st, lw.g_q_norm );
+		rms_backward( K, lw.k_norm, 1, true, true, T * hk, d, ik, dkn, dK, st, lw.g_k_norm );
 		float* dQG = ws.f( TR * 2 * QD );
 		pack_q_gate( dq, dgate, T, hq, d, dQG, st );
 		lin_bwd( lw.q, Tq, mix, Zq, dQG, T, dmix, true, vq );
@@ -1040,12 +1070,18 @@ void Model::Impl::run( int L, const float* x_in, float* x_out, int T, const floa
 	conv4_silu_backward( ps, lw.ple_conv, T, static_cast<int>( flat ), 3, dx0f, dpn, st );
 	float* dgated = ws.f( TR * flat );
 	CUDA_CHECK( cudaMemcpyAsync( dgated, dx0f, TR * flat * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
-	rms_backward( gated, lw.ple_nc, hc, true, true, T * hc, H, ip, dpn, dgated, st );
+	rms_backward( gated, lw.ple_nc, hc, true, true, T * hc, H, ip, dpn, dgated, st, lw.g_ple_nc );
 	float *dv_unused = ws.f( TR * H ), *dsg = ws.f( TR * hc ), *dg = ws.f( TR * hc ), *dqn = ws.fz( TR * flat, st );
 	apply_backward( dgated, sg, ple_v, T, H, hc, dv_unused, dsg, st );
 	ple_gate_backward( g, dsg, dg, TR * hc, st );
 	seg_dot_backward_b( kn, dg, T * hc, H, ple_scale, dqn, st );
-	rms_backward( xf, lw.ple_nq, hc, true, true, T * hc, H, iq, dqn, dxf, st );
+	rms_backward( xf, lw.ple_nq, hc, true, true, T * hc, H, iq, dqn, dxf, st, lw.g_ple_nq );
+	if ( lw.g_ple_nk ) {
+		// the key norm's weights through dkn (the key rows themselves are inputs: their gradient is dropped)
+		float *dkn = ws.fz( TR * flat, st ), *dk_unused = ws.fz( TR * flat, st );
+		seg_dot_backward_b( qn, dg, T * hc, H, ple_scale, dkn, st );
+		rms_backward( ple_k, lw.ple_nk, hc, true, true, T * hc, H, ik, dkn, dk_unused, st, lw.g_ple_nk );
+	}
 	if ( ranks > 1 ) CUDA_CHECK( cudaMemcpyAsync( dx_in, dxf + row0 * flat, TL * flat * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
 	phase( "ple bwd" );
 }
@@ -1157,9 +1193,17 @@ std::vector<Tuned*> Model::tensors() {
 	return v;
 }
 
+std::vector<Dense*> Model::dense_tensors() {
+	std::vector<Dense*> v;
+	for ( Dense& d : p_->dense_t ) v.push_back( &d );
+	return v;
+}
+
+void Model::set_train_norms( bool on ) { p_->train_norms = on; }
+
 void Model::zero_grads() {
 	CUDA_CHECK( cudaSetDevice( device_ ) );
-	for ( ParamPool* P : { &p_->shared_p, &p_->expert_p } ) CUDA_CHECK( cudaMemsetAsync( P->g, 0, P->used * sizeof( float ), p_->st ) );
+	for ( ParamPool* P : { &p_->shared_p, &p_->expert_p, &p_->norm_p } ) CUDA_CHECK( cudaMemsetAsync( P->g, 0, P->used * sizeof( float ), p_->st ) );
 }
 
 void Model::adam( const AdamOptions& o, int step, float grad_scale ) {
@@ -1167,15 +1211,33 @@ void Model::adam( const AdamOptions& o, int step, float grad_scale ) {
 	CUDA_CHECK( cudaSetDevice( device_ ) );
 	m.sum_ranks( m.shared_p.g, m.shared_p.used );
 	for ( ParamPool* P : { &m.shared_p, &m.expert_p } ) adam_log_scales( P->s0, P->a, P->s, P->g, P->m, P->v, P->used, step, grad_scale, o, m.st );
+	if ( m.train_norms ) {
+		m.sum_ranks( m.norm_p.g, m.norm_p.used );
+		ParamPool& P = m.norm_p;
+		adam_deltas( P.s0, P.a, P.s, P.g, P.m, P.v, P.used, step, grad_scale, o, m.st );
+	}
 	CUDA_CHECK( cudaStreamSynchronize( m.st ) );
 }
 
 void Model::keep_best() {
 	CUDA_CHECK( cudaSetDevice( device_ ) );
-	for ( ParamPool* P : { &p_->shared_p, &p_->expert_p } )
+	for ( ParamPool* P : { &p_->shared_p, &p_->expert_p, &p_->norm_p } )
 		CUDA_CHECK( cudaMemcpyAsync( P->best, P->s, P->used * sizeof( float ), cudaMemcpyDeviceToDevice, p_->st ) );
 	CUDA_CHECK( cudaStreamSynchronize( p_->st ) );
 }
+
+namespace {
+
+std::vector<uint16_t> to_fp16( const float* src, int n ) {
+	std::vector<uint16_t> h( n );
+	for ( int j = 0; j < n; ++j ) {
+		const __half v = __float2half( src[j] );
+		std::memcpy( &h[j], &v, 2 );
+	}
+	return h;
+}
+
+} // namespace
 
 void Model::best_scales( std::vector<std::pair<std::string, std::pair<std::vector<uint16_t>, std::vector<uint16_t>>>>& out ) {
 	CUDA_CHECK( cudaSetDevice( device_ ) );
@@ -1187,15 +1249,17 @@ void Model::best_scales( std::vector<std::pair<std::string, std::pair<std::vecto
 	}
 	auto fp16 = [&]( const float* dev, int n ) {
 		const int i = pools[0]->holds( dev ) ? 0 : 1;
-		const float* src = hb[i].data() + ( dev - pools[i]->s );
-		std::vector<uint16_t> h( n );
-		for ( int j = 0; j < n; ++j ) {
-			const __half v = __float2half( src[j] );
-			std::memcpy( &h[j], &v, 2 );
-		}
-		return h;
+		return to_fp16( hb[i].data() + ( dev - pools[i]->s ), n );
 	};
 	for ( Tuned* t : tensors() ) out.push_back( { t->name, { fp16( t->su, t->k ), fp16( t->sv, t->n ) } } );
+}
+
+void Model::best_dense( std::vector<std::pair<std::string, std::vector<uint16_t>>>& out ) {
+	CUDA_CHECK( cudaSetDevice( device_ ) );
+	const ParamPool& P = p_->norm_p;
+	std::vector<float> hb( P.used );
+	CUDA_CHECK( cudaMemcpy( hb.data(), P.best, hb.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
+	for ( const Dense& d : p_->dense_t ) out.push_back( { d.name, to_fp16( hb.data() + ( d.w - P.s ), d.n ) } );
 }
 
 } // namespace engine::train::qwen4_exp

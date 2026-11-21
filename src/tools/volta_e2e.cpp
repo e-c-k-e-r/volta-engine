@@ -1,15 +1,17 @@
 // volta_e2e: end-to-end tuning of a Flash-Next (qwen4_exp) EXL3 checkpoint's scales against a teacher's distributions: every EXL3 tensor's
-// input and output scales (the trellis codes, norms and dense weights frozen) by Adam on KL( teacher || model ) over token sequences, the
-// model in training form (engine/train/qwen4_exp.h), each layer recomputed from its saved input in the backward. With --tp 1 (the default)
-// the devices run it tensor parallel, one host thread each; --tp 0 splits the 48 layers over them instead (a layer whole on one device, the
-// streams and their gradients crossing at the boundaries, one device busy at a time). The last sequences are held out: their KL is measured
-// before training and every --eval-every steps, and the scales of the best held-out KL are written as a new checkpoint (the input's files,
-// its shards rewritten with the new FP16 scales). The learning rate warms up linearly over --warmup steps, then follows a cosine to
-// --lr-min (a fraction of --lr) at the last step. --fp16 0 runs the tuned tensors' products in FP32 instead of on the tensor cores.
+// input and output scales and the norms' weights (the trellis codes and the other dense weights frozen) by Adam on KL( teacher || model )
+// over token sequences, the model in training form (engine/train/qwen4_exp.h), each layer recomputed from its saved input in the backward.
+// With --tp 1 (the default) the devices run it tensor parallel, one host thread each; --tp 0 splits the 48 layers over them instead (a
+// layer whole on one device, the streams and their gradients crossing at the boundaries, one device busy at a time). The last sequences are
+// held out: their KL is measured before training and every --eval-every steps, and the values of the best held-out KL are written as a new
+// checkpoint (the input's files, its shards rewritten with the new FP16 scales and norms). The learning rate warms up linearly over
+// --warmup steps, then follows a cosine to --lr-min (a fraction of --lr) at the last step. --fp16 0 runs the tuned tensors' products in
+// FP32 instead of on the tensor cores; --norms 0 keeps the norms' weights as they are. --train N trains on the first N sequences only
+// (the held-out ones unchanged: how the gain grows with the data).
 //
 //   volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] [--fp16 1]
-//             [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--eval-every 16] [--write 0|1] [--timing 0|1]
-//             [--check-trace FILE]
+//             [--norms 1] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
+//             [--timing 0|1] [--check-trace FILE]
 //   --check-trace: a trace_layers file of the model's engine forward over the first sequence (test_ppl --calibrate --chunk 512): every layer of
 //     the training form fed the engine's input streams of that layer, its output against the engine's, and the first sequence's embedding
 //     streams against the engine's; then exits (the layer split)
@@ -48,8 +50,8 @@ namespace q = engine::tools::quant;
 struct Args {
 	std::string model, inputs, teacher, out, check_trace;
 	std::vector<int> devices = { 0, 1, 2, 3 };
-	int steps = 64, batch = 4, hold = 4, eval_every = 16, warmup = 2;
-	bool write = true, timing = false, tp = true, fp16 = true;
+	int steps = 64, batch = 4, hold = 4, eval_every = 16, warmup = 2, train = 0;
+	bool write = true, timing = false, tp = true, fp16 = true, norms = true;
 	float lr = 1e-3f, lr_min = 0.1f;
 };
 
@@ -61,12 +63,19 @@ float lr_at( const Args& a, int step ) {
 	return static_cast<float>( a.lr * ( a.lr_min + ( 1.0 - a.lr_min ) * 0.5 * ( 1.0 + std::cos( 3.14159265358979 * t ) ) ) );
 }
 
-using Scales = std::map<std::string, std::pair<std::vector<uint16_t>, std::vector<uint16_t>>>;
+// The kept values to write: per EXL3 tensor its (suh, svh), per tuned norm weight its values (FP16 each)
+struct Best {
+	std::map<std::string, std::pair<std::vector<uint16_t>, std::vector<uint16_t>>> scales;
+	std::map<std::string, std::vector<uint16_t>> dense;
+};
 
-void add_best( tq::Model& m, Scales& out ) {
+void add_best( tq::Model& m, Best& out ) {
 	std::vector<std::pair<std::string, std::pair<std::vector<uint16_t>, std::vector<uint16_t>>>> v;
 	m.best_scales( v );
-	for ( auto& e : v ) out[e.first] = std::move( e.second );
+	for ( auto& e : v ) out.scales[e.first] = std::move( e.second );
+	std::vector<std::pair<std::string, std::vector<uint16_t>>> d;
+	m.best_dense( d );
+	for ( auto& e : d ) out.dense[e.first] = std::move( e.second );
 }
 
 bool parse( int argc, char** argv, Args& a ) {
@@ -79,12 +88,14 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--steps" ) a.steps = std::stoi( v );
 		else if ( k == "--batch" ) a.batch = std::stoi( v );
 		else if ( k == "--hold" ) a.hold = std::stoi( v );
+		else if ( k == "--train" ) a.train = std::stoi( v );
 		else if ( k == "--eval-every" ) a.eval_every = std::stoi( v );
 		else if ( k == "--lr" ) a.lr = std::stof( v );
 		else if ( k == "--lr-min" ) a.lr_min = std::stof( v );
 		else if ( k == "--warmup" ) a.warmup = std::stoi( v );
 		else if ( k == "--tp" ) a.tp = v != "0";
 		else if ( k == "--fp16" ) a.fp16 = v != "0";
+		else if ( k == "--norms" ) a.norms = v != "0";
 		else if ( k == "--write" ) a.write = v != "0";
 		else if ( k == "--timing" ) a.timing = v != "0";
 		else if ( k == "--check-trace" ) a.check_trace = v;
@@ -102,8 +113,9 @@ bool parse( int argc, char** argv, Args& a ) {
 		}
 	}
 	if ( a.model.empty() || a.inputs.empty() || a.teacher.empty() || a.out.empty() ) {
-		LOG_ERROR( "usage: volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] [--fp16 1] "
-			"[--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--eval-every 16] [--write 0|1] [--timing 0|1] [--check-trace FILE]" );
+		LOG_ERROR( "usage: volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] "
+			"[--fp16 1] [--norms 1] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
+			"[--timing 0|1] [--check-trace FILE]" );
 		return false;
 	}
 	return true;
@@ -188,8 +200,10 @@ void up_half( Stage& s, const uint16_t* src, size_t n, float* dst ) {
 	tq::half_to_float( s.staging, dst, n, s.m->stream() );
 }
 
-// The output checkpoint: every file of the input, the shards with their tuned scales replaced
-bool write_out( const Args& a, const Scales& best_scales, int& replaced ) {
+// The output checkpoint: every file of the input, the shards with their tuned scales and norm weights replaced (the norms as FP16, whatever
+// the checkpoint stored them in: the engine computes with them in FP16)
+bool write_out( const Args& a, const Best& best, int& replaced ) {
+	const auto& best_scales = best.scales;
 	std::filesystem::create_directories( a.out );
 	replaced = 0;
 	for ( const auto& e : std::filesystem::directory_iterator( a.model ) ) {
@@ -213,11 +227,21 @@ bool write_out( const Args& a, const Scales& best_scales, int& replaced ) {
 			const size_t dot = name.rfind( '.' );
 			const std::string base = name.substr( 0, dot ), suf = name.substr( dot + 1 );
 			const auto it = best_scales.find( base );
+			const auto dt = best.dense.find( name );
 			if ( it != best_scales.end() && ( suf == "suh" || suf == "svh" ) && en->dtype == "F16" ) {
 				const auto& v = suf == "suh" ? it->second.first : it->second.second;
 				ENGINE_ASSERT( v.size() * 2 == en->bytes, "volta_e2e: a scale vector's size differs from the checkpoint's" );
 				o2.owned.resize( en->bytes );
 				std::memcpy( o2.owned.data(), v.data(), en->bytes );
+				++replaced;
+			}
+			else if ( dt != best.dense.end() ) {
+				size_t numel = 1;
+				for ( auto d : en->shape ) numel *= static_cast<size_t>( d );
+				ENGINE_ASSERT( dt->second.size() == numel, "volta_e2e: a norm's size differs from the checkpoint's" );
+				o2.dtype = "F16";
+				o2.owned.resize( numel * 2 );
+				std::memcpy( o2.owned.data(), dt->second.data(), numel * 2 );
 				++replaced;
 			}
 			else {
@@ -257,6 +281,7 @@ private:
 // held-out and training KL is the whole sum, rank 0 reports it
 int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 	const int n = static_cast<int>( a.devices.size() ), T = d.seq, S = d.sequences(), train_n = S - a.hold, H = cfg.hidden, hc = cfg.hc, flat = hc * H;
+	const int train_used = a.train > 0 ? std::min( a.train, train_n ) : train_n;
 	if ( T % n != 0 ) {
 		LOG_ERROR( "[volta_e2e] %d-token sequences do not split over %d ranks", T, n );
 		return 1;
@@ -270,7 +295,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 	}
 	Barrier bar( n );
 	std::vector<int> ok( n, 1 );
-	std::vector<Scales> kept( n );
+	std::vector<Best> kept( n );
 	double best = 0.0;
 	int best_step = 0;
 	const auto t0 = std::chrono::steady_clock::now();
@@ -281,6 +306,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		auto m = std::make_unique<tq::Model>();
 		ok[r] = m->load( a.model, 0, cfg.layers, dev, T, r, n, comms[r] ) ? 1 : 0;
 		m->set_fp16( a.fp16 );
+		m->set_train_norms( a.norms );
 		bar.wait();
 		for ( int g = 0; g < n; ++g ) if ( !ok[g] ) return;
 		const cudaStream_t st = static_cast<cudaStream_t>( m->stream() );
@@ -358,7 +384,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			double kl = 0.0;
 			for ( int b = 0; b < a.batch; ++b ) {
 				kl += run( sq, true );
-				sq = ( sq + 1 ) % train_n;
+				sq = ( sq + 1 ) % train_used;
 			}
 			o.lr = lr_at( a, step );
 			m->adam( o, step, 1.0f / ( static_cast<float>( a.batch ) * T ) );
@@ -405,11 +431,14 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		LOG_INFO( "[volta_e2e] done (--write 0: no checkpoint written): best held-out KL %.6f per token at step %d", best, best_step );
 		return 0;
 	}
-	Scales all;
-	for ( Scales& s : kept ) for ( auto& e : s ) all[e.first] = std::move( e.second );
+	Best all;
+	for ( Best& s : kept ) {
+		for ( auto& e : s.scales ) all.scales[e.first] = std::move( e.second );
+		for ( auto& e : s.dense ) all.dense[e.first] = std::move( e.second );
+	}
 	int replaced = 0;
 	if ( !write_out( a, all, replaced ) ) return 1;
-	LOG_INFO( "[volta_e2e] done: %s, %d scale vectors from step %d (held-out KL %.6f per token), %.1f min", a.out.c_str(), replaced, best_step, best,
+	LOG_INFO( "[volta_e2e] done: %s, %d scale vectors and norms from step %d (held-out KL %.6f per token), %.1f min", a.out.c_str(), replaced, best_step, best,
 		std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() / 60.0 );
 	return 0;
 }
@@ -437,7 +466,8 @@ int main( int argc, char** argv ) {
 		LOG_ERROR( "[volta_e2e] %d sequences of %d tokens: none left for training after %d held out", S, T, a.hold );
 		return 1;
 	}
-	LOG_INFO( "[volta_e2e] %d sequences of %d tokens (%d held out), teacher top %d", S, T, a.hold, d.k );
+	const int train_used = a.train > 0 ? std::min( a.train, train_n ) : train_n;
+	LOG_INFO( "[volta_e2e] %d sequences of %d tokens (%d held out, %d of the others trained on), teacher top %d", S, T, a.hold, train_used, d.k );
 	const int G = static_cast<int>( a.devices.size() );
 #if defined( ENGINE_HAVE_NCCL )
 	if ( a.tp && G > 1 && a.check_trace.empty() ) return train_tp( a, cfg, d );
@@ -451,6 +481,7 @@ int main( int argc, char** argv ) {
 		s.m = std::make_unique<tq::Model>();
 		if ( !s.m->load( a.model, first, last, s.dev, T ) ) return 1;
 		s.m->set_fp16( a.fp16 );
+		s.m->set_train_norms( a.norms );
 		CUDA_CHECK( cudaSetDevice( s.dev ) );
 		const size_t bytes = static_cast<size_t>( T ) * flat * sizeof( float );
 		for ( float** p : { &s.x, &s.y, &s.dx, &s.dy } ) CUDA_CHECK( cudaMalloc( p, bytes ) );
@@ -644,7 +675,7 @@ int main( int argc, char** argv ) {
 		double kl = 0.0;
 		for ( int b = 0; b < a.batch; ++b ) {
 			kl += run( sq, true );
-			sq = ( sq + 1 ) % train_n;
+			sq = ( sq + 1 ) % train_used;
 		}
 		const float gs = 1.0f / ( static_cast<float>( a.batch ) * T );
 		o.lr = lr_at( a, step );
@@ -668,11 +699,11 @@ int main( int argc, char** argv ) {
 		LOG_INFO( "[volta_e2e] done (--write 0: no checkpoint written): best held-out KL %.6f per token at step %d", best, best_step );
 		return 0;
 	}
-	Scales best_scales;
+	Best best_scales;
 	for ( Stage& s : st ) add_best( *s.m, best_scales );
 	int replaced = 0;
 	if ( !write_out( a, best_scales, replaced ) ) return 1;
-	LOG_INFO( "[volta_e2e] done: %s, %d scale vectors from step %d (held-out KL %.6f per token), %.1f min", a.out.c_str(), replaced, best_step, best,
+	LOG_INFO( "[volta_e2e] done: %s, %d scale vectors and norms from step %d (held-out KL %.6f per token), %.1f min", a.out.c_str(), replaced, best_step, best,
 		std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() / 60.0 );
 	return 0;
 }
