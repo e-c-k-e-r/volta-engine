@@ -69,7 +69,8 @@ struct DBuf {
 	}
 };
 
-// Per device: the library handles, the scaled 128-point Hadamard and the factorization status word
+// Per device and stream (several workers may share a device, each on its own stream): the library handles, the scaled 128-point Hadamard and
+// the factorization status word
 struct Ctx {
 	cublasHandle_t blas = nullptr;
 	cusolverDnHandle_t solver = nullptr;
@@ -80,11 +81,11 @@ struct Ctx {
 
 Ctx& ctx( cudaStream_t stream ) {
 	static std::mutex mu;
-	static std::map<int, Ctx> per_device;
+	static std::map<std::pair<int, cudaStream_t>, Ctx> per_stream;
 	int dev = 0;
 	CUDA_CHECK( cudaGetDevice( &dev ) );
 	std::lock_guard<std::mutex> lock( mu );
-	Ctx& c = per_device[dev];
+	Ctx& c = per_stream[{ dev, stream }];
 	if ( !c.blas ) {
 		EXL3Q_BLAS( cublasCreate( &c.blas ) );
 		EXL3Q_SOLVER( cusolverDnCreate( &c.solver ) );

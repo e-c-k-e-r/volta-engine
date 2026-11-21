@@ -9,7 +9,10 @@
 //   volta_quantize --src <original> --template <exl3 dir> --out <dir> [--hess <capture dir>] [--route <route dump>] [--order volta|stock]
 //                  [--devices 0,1,2,3] [--only A,B] [--skip A,B] [--bits B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] [--redo]
 //                  [--plan] [--no-scaled-hessian] [--affinity-eps E] [--ldl-metric] [--open-trellis] [--tile-gain] [--scale-search full|light|hint]
-//                  [--no-assemble]
+//                  [--workers 1] [--no-assemble]
+//
+// --workers N: N threads per device, each on its own stream (one's host work and small kernels overlap another's encoder), each holding an
+// item's buffers
 //
 // --scale-search: how a tensor whose global scale starts from a like one's (the next projection of a group, a layer's next expert down
 // projection) searches it: full (the fine grid of five on the whole sample), light (three scales on a lighter sample, the full grid when the
@@ -67,6 +70,7 @@ struct Args {
 	std::vector<int> devices = { 0 };
 	bool volta = true;
 	int ranks = 4;
+	int workers = 1;   // --workers: threads per device, each on its own stream (one's host work overlaps another's kernels)
 	int64_t route_rows = 0;
 	size_t budget = size_t( 8192 ) << 20;
 	uint64_t seed = 0;
@@ -138,6 +142,7 @@ bool parse( int argc, char** argv, Args& a ) {
 				return false;
 			}
 		}
+		else if ( k == "--workers" ) a.workers = std::max( 1, std::stoi( val() ) );
 		else if ( k == "--devices" ) {
 			a.devices.clear();
 			for ( const auto& d : split( val(), ',' ) ) a.devices.push_back( std::stoi( d ) );
@@ -149,7 +154,7 @@ bool parse( int argc, char** argv, Args& a ) {
 	if ( a.src.empty() || a.tmpl.empty() || ( a.out.empty() && !a.plan ) ) {
 		LOG_ERROR( "usage: volta_quantize --src <original> --template <exl3 dir> --out <dir> [--hess <capture dir>] [--route <route dump>] "
 				   "[--order volta|stock] [--devices 0,1] [--only A,B] [--skip A,B] [--bits B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] "
-				   "[--redo] [--plan] [--no-scaled-hessian] [--affinity-eps E] [--ldl-metric] [--open-trellis] [--tile-gain] [--scale-search full|light|hint] "
+				   "[--redo] [--plan] [--no-scaled-hessian] [--affinity-eps E] [--ldl-metric] [--open-trellis] [--tile-gain] [--scale-search full|light|hint] [--workers 1] "
 				   "[--no-assemble]" );
 		return false;
 	}
@@ -822,7 +827,8 @@ int main( int argc, char** argv ) {
 
 	sh.t0 = std::chrono::steady_clock::now();
 	std::vector<std::thread> threads;
-	for ( int d : a.devices ) threads.emplace_back( worker, std::ref( sh ), d, opts );
+	for ( int w = 0; w < a.workers; ++w )
+		for ( int d : a.devices ) threads.emplace_back( worker, std::ref( sh ), d, opts );
 	for ( auto& t : threads ) t.join();
 	{
 		// the devices' seconds per phase (each device's sum; the stream synchronized at every boundary)
