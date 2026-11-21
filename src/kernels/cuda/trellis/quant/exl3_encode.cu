@@ -60,7 +60,7 @@ Launch launch_for( int code, int cb ) {
 	ENGINE_ASSERT( l.kernel, "exl3_encode: no kernel for this width code" );
 	if ( trellis_is_half( code ) ) {
 		l.threads = EXL3E_HALF_NT;
-		l.shmem = 2 * 256 * sizeof( half ) + 32 * sizeof( int ) + 128;
+		l.shmem = exl3e_half_shmem( trellis_base_bits( code ) );
 	} else {
 		l.threads = exl3e_num_threads( code );
 		l.shmem = exl3e_shmem( code );
@@ -75,7 +75,11 @@ Launch launch_for( int code, int cb ) {
 // Out-states of a step: 65536 >> K (half-integer rates: of the narrower shift, the widest node space)
 size_t states( int code ) { return static_cast<size_t>( 65536 >> trellis_base_bits( code ) ); }
 
-size_t edges_bytes( int code, int tiles ) { return static_cast<size_t>( tiles ) * 256 * states( code ) * sizeof( uint16_t ); }
+// The history: a byte per pair of out-states (the half-integer rates and K <= 4, exl3e_packed_hist), else a 16-bit in-state per out-state
+size_t edges_bytes( int code, int tiles ) {
+	const bool packed = trellis_is_half( code ) || exl3e_packed_hist( code );
+	return static_cast<size_t>( tiles ) * 256 * ( packed ? states( code ) / 2 : states( code ) * sizeof( uint16_t ) );
+}
 
 size_t costs_bytes( int code, int tiles ) {
 	const bool global = trellis_is_half( code ) || code < EXL3E_SHARED_COSTS_MIN_K;
