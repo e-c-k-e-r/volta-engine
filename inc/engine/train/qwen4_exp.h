@@ -86,6 +86,8 @@ void gated_rms_backward( const float* x, const float* z, const float* gamma, int
 // Softmax routing over the top k logits of each row (selection fixed): w[r, j] = softmax_j( logit[r, ids[r, j]] ); backward from dw [rows, k] to
 // dlogit [rows, k] (overwrites)
 void topk_softmax_backward( const float* w, const float* dw, int rows, int k, float* dlogit, backend::stream_t stream );
+// The selected slots' values as dense rows: out[r, ids[r, j]] += v[r, j] (out [rows, experts]; a row's ids distinct)
+void slots_to_dense( const float* v, const int* ids, int rows, int k, int experts, float* out, backend::stream_t stream );
 
 // GDN's gated delta rule per value head h (its key head h / ( vh / kh )), head dims 128: for each value column c,
 //   u = S_c . k_t, d = beta_t ( v_t[c] - e^gate_t u ), S_c = e^gate_t S_c + d k_t, o_t[c] = scale S_c . q_t
@@ -272,6 +274,8 @@ public:
 	// dt_bias and convolution, the shared expert's gate and PLE's convolution, as additive deltas like the norms (dense_tensors lists them), at
 	// lr_scale times the learning rate (a row of them feeds a dot product: Adam's per-entry step adds up over its width)
 	void set_train_dense( bool on, float lr_scale = 0.03f );
+	// The routers' weights trained too (before load; off by default), with the small dense tensors' learning rate (dense_tensors lists them)
+	void set_train_router( bool on );
 	// Where Adam's state lives (before load): on the device (the default) or with host, in pinned host memory, streamed through the device in
 	// parts for each step (the same kernels, the same result; the device keeps the current values, their gradients and one part); its moments
 	// FP32 (32) or 8-bit block-wise (8, engine/train/adam8.h)

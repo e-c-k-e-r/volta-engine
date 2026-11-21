@@ -151,6 +151,7 @@ int main( int argc, char** argv ) {
 			CUDA_CHECK( cudaSetDevice( 0 ) );
 			q::Model m;
 			m.set_train_dense( true );
+			m.set_train_router( true );
 			if ( !m.load( dir, L, L + 1, 0, T ) ) return 1;
 			float *x = up( hx.data(), hx.size() ), *R = up( hr.data(), hr.size() ), *pk = up( hk.data(), hk.size() ), *pv = up( hv.data(), hv.size() ), *y, *dx;
 			CUDA_CHECK( cudaMalloc( &y, hx.size() * sizeof( float ) ) );
@@ -173,6 +174,7 @@ int main( int argc, char** argv ) {
 			CUDA_CHECK( cudaSetDevice( r ) );
 			q::Model m;
 			m.set_train_dense( true );
+			m.set_train_router( true );
 			ok[r] = m.load( dir, L, L + 1, r, T, r, n, comms[r] );
 			if ( !ok[r] ) std::abort();   // the other ranks would wait on it forever
 			const size_t o = static_cast<size_t>( r ) * Tl * flat, cnt = static_cast<size_t>( Tl ) * flat;
@@ -211,6 +213,7 @@ int main( int argc, char** argv ) {
 		compare_grads( g_ref, g_tp, "norm", "norm weight" );
 		compare_grads( g_ref, g_tp, "block_inject", "inject mix" );
 		compare_grads( g_ref, g_tp, "shared_expert_gate", "shared expert gate" );
+		compare_grads( g_ref, g_tp, "mlp.gate.weight", "router" );
 		if ( L == c.ple_layer ) compare_grads( g_ref, g_tp, "ple.conv1d", "PLE convolution" );
 	}
 	{

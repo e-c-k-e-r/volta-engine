@@ -244,6 +244,13 @@ __global__ void k_grms_bwd( const float* x, const float* z, const float* gamma, 
 	}
 }
 
+__global__ void k_slots_to_dense( const float* v, const int* ids, int rows, int k, int experts, float* out ) {
+	Q4E_LOOP( i, (size_t) rows * k ) {
+		const int r = static_cast<int>( i / k ), e = ids[i];
+		if ( e >= 0 && e < experts ) out[static_cast<size_t>( r ) * experts + e] += v[i];
+	}
+}
+
 __global__ void k_topk_softmax_bwd( const float* w, const float* dw, int rows, int k, float* dlogit ) {
 	Q4E_LOOP( r, (size_t) rows ) {
 		float s = 0.0f;
@@ -886,6 +893,10 @@ void gated_rms_backward( const float* x, const float* z, const float* gamma, int
 
 void topk_softmax_backward( const float* w, const float* dw, int rows, int k, float* dlogit, backend::stream_t stream ) {
 	k_topk_softmax_bwd<<<blocks_for( rows ), 256, 0, cu( stream )>>>( w, dw, rows, k, dlogit );
+}
+
+void slots_to_dense( const float* v, const int* ids, int rows, int k, int experts, float* out, backend::stream_t stream ) {
+	if ( rows > 0 ) k_slots_to_dense<<<blocks_for( (size_t) rows * k ), 256, 0, cu( stream )>>>( v, ids, rows, k, experts, out );
 }
 
 size_t gdn_ckpt_floats( int rows, int vh, int chunk ) {

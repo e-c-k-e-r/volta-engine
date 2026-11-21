@@ -326,6 +326,7 @@ struct Layer {
 	// trained small dense tensors (train_dense): the whole tensors' gradients (this rank adds its heads' rows), the whole convolution [C, 4]
 	float *g_A = nullptr, *g_B = nullptr, *g_A_log = nullptr, *g_dt_bias = nullptr, *conv_full = nullptr, *g_conv = nullptr;
 	float *g_sh_gate = nullptr, *g_ple_conv = nullptr;
+	float* g_router = nullptr;   // train_router: the router's gradient (this rank's routes' share)
 	// attention (this rank's query heads from q0h, key / value heads from kv0)
 	Tuned q, k, v, o;
 	float *q_norm = nullptr, *k_norm = nullptr, *g_q_norm = nullptr, *g_k_norm = nullptr;
@@ -364,6 +365,7 @@ struct Model::Impl {
 	bool train_dense = false;   // the small dense tensors trained too (set before the load): the hyper-connection sites' inject mixes, GDN's
 	                            // in_proj_a / b, A_log, dt_bias and convolution, the shared expert's gate, PLE's convolution
 	float dense_lr = 0.03f;     // their learning rate, a fraction of the step's
+	bool train_router = false;  // the routers' weights trained too (set before the load; in dense_p at dense_lr)
 	bool opt_host = false;      // the optimizer state in host memory
 	int opt_bits = 32;          // Adam's moments: 32 (FP32) or 8 (block-wise)
 	std::vector<Layer> layers;
@@ -753,7 +755,11 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 					extra += al( static_cast<size_t>( 2 * c.lin_k + c.lin_v ) / ranks * c.lin_d * 4 * 2 );   // the rank's channels of it
 				}
 			}
-			dense_w( pre + ".mlp.gate.weight", true );
+			if ( m.train_router ) {
+				dense_w( pre + ".mlp.gate.weight", false );
+				trained += ( numel( pre + ".mlp.gate.weight" ) + 3 ) / 4 * 4;
+			}
+			else dense_w( pre + ".mlp.gate.weight", true );
 			for ( int e = m.e0; e < m.e1; ++e )
 				for ( const char* p : { "gate_proj", "up_proj", "down_proj" } ) linear( pre + ".mlp.experts." + std::to_string( e ) + "." + p );
 			for ( const char* p : { "gate_proj", "up_proj", "down_proj" } ) linear( pre + ".mlp.shared_expert." + p );
@@ -783,7 +789,7 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 		m.expert_p.init( static_cast<size_t>( nl ) * owned * 3 * ( H + I + 8 ) + 64, m.opt_host, m.opt_bits );
 		const size_t flat = static_cast<size_t>( c.hc ) * H;
 		m.norm_p.init( nl * ( 2 * flat + 2 * c.head_dim + c.lin_d + 64 ) + 4 * flat + 256, m.opt_host, m.opt_bits );
-		if ( m.train_dense ) m.dense_p.init( trained + 64, m.opt_host, m.opt_bits );
+		if ( m.train_dense || m.train_router ) m.dense_p.init( trained + 64, m.opt_host, m.opt_bits );
 		m.dense_t.reserve( static_cast<size_t>( nl ) * 12 + 8 );
 	}
 	const size_t ones = std::max<size_t>( c.vocab, 65536 );
@@ -854,7 +860,8 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 			}
 			m.arena.offset_bytes = mark;
 		}
-		lw.d16[kRouter] = m.dense( pre + ".mlp.gate.weight" );
+		if ( m.train_router ) lw.router = m.pooled( m.dense_p, pre + ".mlp.gate.weight", &lw.g_router );
+		else lw.d16[kRouter] = m.dense( pre + ".mlp.gate.weight" );
 		lw.eg.resize( E );
 		lw.eu.resize( E );
 		lw.ed.resize( E );
@@ -1146,6 +1153,12 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 		float* dl = ws.f( static_cast<size_t>( T ) * K );
 		topk_softmax_backward( w, dw, T, K, dl, st );
 		router_input_backward( dl, ids, lw.router, T, K, H, dmix, st );
+		if ( lw.g_router ) {
+			// the router's weights: dR = dL^T mix with dL the selected logits' gradients as dense rows (this rank's routes' share)
+			float* dL = ws.fz( static_cast<size_t>( T ) * E, st );
+			slots_to_dense( dl, ids, T, K, E, dL, st );
+			blas->gemm( true, false, E, H, T, 1.0f, dL, mix, 1.0f, lw.g_router );
+		}
 	}
 	phase( "moe router bwd" );
 	CUDA_CHECK( cudaStreamSynchronize( st ) );   // the host route lists above are released with the stack
@@ -1600,7 +1613,7 @@ void Model::adam( const AdamOptions& o, int step, float grad_scale ) {
 		m.sum_ranks( m.norm_p.g, m.norm_p.used );
 		m.norm_p.step( false, o, step, grad_scale, m.st );
 	}
-	if ( m.train_dense ) {
+	if ( m.train_dense || m.train_router ) {
 		// a dense row feeds a dot product: Adam's step of about lr on every entry moves it by up to lr times its width, so these take a
 		// fraction of the rate
 		AdamOptions od = o;
@@ -1615,6 +1628,8 @@ void Model::set_train_dense( bool on, float lr_scale ) {
 	p_->train_dense = on;
 	p_->dense_lr = lr_scale;
 }
+
+void Model::set_train_router( bool on ) { p_->train_router = on; }
 
 void Model::set_optimizer( bool host, int moment_bits ) {
 	ENGINE_ASSERT( moment_bits == 32 || moment_bits == 8, "qwen4_exp training model: Adam's moments are 32 or 8 bits" );

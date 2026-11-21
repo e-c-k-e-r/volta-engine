@@ -9,13 +9,14 @@
 // FP32 instead of on the tensor cores; --norms 0 keeps the norms' weights as they are; --dense 1 trains the small dense tensors too (the
 // hyper-connection sites' inject mixes, GDN's in_proj_a / b, A_log, dt_bias and convolution, the shared expert's gate, PLE's convolution;
 // additive deltas like the norms, written back as FP16) at --dense-lr times the learning rate (a row of them feeds a dot product, so
-// Adam's per-entry step adds up over its width). --train N trains on the first N sequences only
+// Adam's per-entry step adds up over its width); --router 1 trains the routers' weights at that rate as well. --train N trains on the first
+// N sequences only
 // (the held-out ones unchanged: how the gain grows with the data). --adam-bits 8 keeps Adam's moments as 8-bit block-wise codes; --opt-host 1
 // keeps the optimizer's state in pinned host memory (the devices hold the current values, their gradients and one part of the state: each
 // step streams the state through in parts). The memory per component is logged after the first step.
 //
 //   volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] [--fp16 1]
-//             [--norms 1] [--dense 0] [--dense-lr 0.03] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
+//             [--norms 1] [--dense 0] [--dense-lr 0.03] [--router 0] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
 //             [--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]
 //   --check-trace: a trace_layers file of the model's engine forward over the first sequence (test_ppl --calibrate --chunk 512): every layer of
 //     the training form fed the engine's input streams of that layer, its output against the engine's, and the first sequence's embedding
@@ -57,7 +58,7 @@ struct Args {
 	std::string model, inputs, teacher, out, check_trace;
 	std::vector<int> devices = { 0, 1, 2, 3 };
 	int steps = 64, batch = 4, hold = 4, eval_every = 16, warmup = 2, train = 0, adam_bits = 32;
-	bool write = true, timing = false, tp = true, fp16 = true, norms = true, dense = false, opt_host = false;
+	bool write = true, timing = false, tp = true, fp16 = true, norms = true, dense = false, router = false, opt_host = false;
 	float lr = 1e-3f, lr_min = 0.1f, dense_lr = 0.03f;
 };
 
@@ -104,6 +105,7 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--norms" ) a.norms = v != "0";
 		else if ( k == "--dense" ) a.dense = v != "0";
 		else if ( k == "--dense-lr" ) a.dense_lr = std::stof( v );
+		else if ( k == "--router" ) a.router = v != "0";
 		else if ( k == "--opt-host" ) a.opt_host = v != "0";
 		else if ( k == "--adam-bits" ) a.adam_bits = std::stoi( v );
 		else if ( k == "--write" ) a.write = v != "0";
@@ -124,7 +126,7 @@ bool parse( int argc, char** argv, Args& a ) {
 	}
 	if ( a.model.empty() || a.inputs.empty() || a.teacher.empty() || a.out.empty() || ( a.adam_bits != 32 && a.adam_bits != 8 ) ) {
 		LOG_ERROR( "usage: volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] "
-			"[--fp16 1] [--norms 1] [--dense 0] [--dense-lr 0.03] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
+			"[--fp16 1] [--norms 1] [--dense 0] [--dense-lr 0.03] [--router 0] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
 			"[--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]" );
 		return false;
 	}
@@ -361,6 +363,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		auto m = std::make_unique<tq::Model>();
 		m->set_optimizer( a.opt_host, a.adam_bits );
 		m->set_train_dense( a.dense, a.dense_lr );
+		m->set_train_router( a.router );
 		ok[r] = m->load( a.model, 0, cfg.layers, dev, T, r, n, comms[r] ) ? 1 : 0;
 		m->set_fp16( a.fp16 );
 		m->set_train_norms( a.norms );
@@ -550,6 +553,7 @@ int main( int argc, char** argv ) {
 		s.m = std::make_unique<tq::Model>();
 		s.m->set_optimizer( a.opt_host, a.adam_bits );
 		s.m->set_train_dense( a.dense, a.dense_lr );
+		s.m->set_train_router( a.router );
 		if ( !s.m->load( a.model, first, last, s.dev, T ) ) return 1;
 		s.m->set_fp16( a.fp16 );
 		s.m->set_train_norms( a.norms );

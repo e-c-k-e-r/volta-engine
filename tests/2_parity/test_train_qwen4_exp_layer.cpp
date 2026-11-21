@@ -1,7 +1,8 @@
 // Tier 2 (checkpoint): one qwen4_exp training layer (engine/train/qwen4_exp.h, Model) of an EXL3 checkpoint against central differences of
 // its own forward: random input streams (and n-gram rows for the PLE layer), the loss sum( R * layer( x ) ); the input gradient on sampled
 // entries and the scale gradients of sampled channels (the routing held at the unperturbed input's selection) of several tensors (attention or GDN projections, the shared expert, routed experts),
-// and the weight gradients of the norms and the small dense tensors (trainable here; the forward checked against their FP16 copies).
+// and the weight gradients of the norms, the small dense tensors and the router (trainable here; the forward checked against their FP16
+// copies).
 //   TRAIN_MODEL_DIR=<EXL3 Flash-Next checkpoint> test_train_qwen4_exp_layer [layer ...]   (default: 1, the PLE + GDN layer, and 3, attention)
 #include "engine/config.h"
 #include "engine/train/qwen4_exp.h"
@@ -61,7 +62,8 @@ int main( int argc, char** argv ) {
 	const int T = 24;
 	for ( int L : layers ) {
 		q::Model m;
-		m.set_train_dense( true );   // the small dense tensors' gradients checked with the norms'
+		m.set_train_dense( true );   // the small dense tensors' and the router's gradients checked with the norms'
+		m.set_train_router( true );
 		if ( !m.load( dir, L, L + 1, 0, T ) ) {
 			std::printf( "[-] cannot load layer %d of %s\n", L, dir );
 			return 1;
