@@ -48,6 +48,7 @@ struct HcWeights {
 	const float* up = nullptr;      // [hc * hidden, rank]
 	const float* inject = nullptr;  // [hc, hc * hidden], null on the final mixer (no post gates)
 	float* gnorm = nullptr;         // the norm weights' gradient (+=, null: not wanted)
+	float* ginject = nullptr;       // the inject mix's gradient (+=, null: not wanted)
 };
 // What the backward reads (rows x the size given): inv rows * hc, normed rows * flat, zt rows * rank, t rows * rank, u rows * flat (sigmoid
 // inputs of the up mix), zi rows * hc
@@ -68,6 +69,9 @@ void apply_backward( const float* dx, const float* post, const float* y, int row
 // Causal convolution over rows per channel with SiLU: s[t, c] = sum_j w[c, j] x[t - ( 3 - j ) dil, c] (rows before 0 are 0), y = silu( s ); s kept
 void conv4_silu_forward( const float* x, const float* w, int rows, int channels, int dil, float* s, float* y, backend::stream_t stream );
 void conv4_silu_backward( const float* s, const float* w, int rows, int channels, int dil, const float* dy, float* dx, backend::stream_t stream );
+// Its weight gradient: dw[c, j] += sum_t dy[t, c] silu'( s[t, c] ) x[t - ( 3 - j ) dil, c] over the first `channels` columns of x, s and dy
+// (rows of stride ld)
+void conv4_silu_dw( const float* x, const float* s, const float* dy, int rows, int channels, int ld, int dil, float* dw, backend::stream_t stream );
 
 // o = a * sigmoid( g ), elementwise; backward adds into da and dg
 void sigmoid_gate_forward( const float* a, const float* g, float* o, size_t n, backend::stream_t stream );
@@ -258,11 +262,16 @@ public:
 	// The device memory by component: the arena's codes, the dense copies, the kept outputs, the workspace's peak so far, the scale pools
 	std::string memory_report() const;
 
-	// The tensors this rank holds (with ranks > 1: the shared ones and its own experts), and the norm weights (every rank holds them all)
+	// The tensors this rank holds (with ranks > 1: the shared ones and its own experts), and the trainable dense tensors: the norm weights and,
+	// with set_train_dense, the small dense ones (every rank holds them all)
 	std::vector<Tuned*> tensors();
 	std::vector<Dense*> dense_tensors();
 	// The norm weights trained along with the scales (on by default); off: their gradients are computed but not applied
 	void set_train_norms( bool on );
+	// The small dense tensors trained too (before load; off by default): the hyper-connection sites' inject mixes, GDN's in_proj_a / b, A_log,
+	// dt_bias and convolution, the shared expert's gate and PLE's convolution, as additive deltas like the norms (dense_tensors lists them), at
+	// lr_scale times the learning rate (a row of them feeds a dot product: Adam's per-entry step adds up over its width)
+	void set_train_dense( bool on, float lr_scale = 0.03f );
 	// Where Adam's state lives (before load): on the device (the default) or with host, in pinned host memory, streamed through the device in
 	// parts for each step (the same kernels, the same result; the device keeps the current values, their gradients and one part); its moments
 	// FP32 (32) or 8-bit block-wise (8, engine/train/adam8.h)

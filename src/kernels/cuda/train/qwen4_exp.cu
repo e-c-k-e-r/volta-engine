@@ -188,6 +188,22 @@ __global__ void k_conv4_bwd( const float* s, const float* w, int rows, int chann
 	}
 }
 
+// dw[c, j] += sum_t ds[t, c] x[t - ( 3 - j ) dil, c], ds = dy silu'( s ); x, s, dy rows of stride ld, channels c < n (one thread each)
+__global__ void k_conv4_dw( const float* x, const float* s, const float* dy, int rows, int n, int ld, int dil, float* dw ) {
+	const int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( c >= n ) return;
+	float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	for ( int t = 0; t < rows; ++t ) {
+		const size_t o = static_cast<size_t>( t ) * ld + c;
+		const float sg = sigmoidf_( s[o] ), ds = dy[o] * sg * ( 1.0f + s[o] * ( 1.0f - sg ) );
+		for ( int j = 0; j < 4; ++j ) {
+			const int src = t - ( 3 - j ) * dil;
+			if ( src >= 0 ) acc[j] += ds * x[static_cast<size_t>( src ) * ld + c];
+		}
+	}
+	for ( int j = 0; j < 4; ++j ) dw[static_cast<size_t>( c ) * 4 + j] += acc[j];
+}
+
 __global__ void k_sig_gate( const float* a, const float* g, float* o, size_t n ) {
 	Q4E_LOOP( i, n ) o[i] = a[i] * sigmoidf_( g[i] );
 }
@@ -824,6 +840,7 @@ void hc_backward( Blas& b, const HcWeights& w, const float* x, int rows, const H
 	if ( w.inject != nullptr && dpost != nullptr ) {
 		k_post_bwd<<<blocks_for( (size_t) rows * w.hc ), 256, 0, st>>>( c.zi, dpost, dzi, (size_t) rows * w.hc );
 		b.gemm( false, false, rows, flat, w.hc, 1.0f / w.hc, dzi, w.inject, 1.0f, dnormed );
+		if ( w.ginject ) b.gemm( true, false, w.hc, flat, rows, 1.0f / w.hc, dzi, c.normed, 1.0f, w.ginject );
 	}
 	rms_backward( x, w.norm, w.hc, true, true, rows * w.hc, w.hidden, c.inv, dnormed, dx, b.stream(), w.gnorm );
 }
@@ -843,6 +860,10 @@ void conv4_silu_forward( const float* x, const float* w, int rows, int channels,
 
 void conv4_silu_backward( const float* s, const float* w, int rows, int channels, int dil, const float* dy, float* dx, backend::stream_t stream ) {
 	k_conv4_bwd<<<blocks_for( (size_t) rows * channels ), 256, 0, cu( stream )>>>( s, w, rows, channels, dil, dy, dx );
+}
+
+void conv4_silu_dw( const float* x, const float* s, const float* dy, int rows, int channels, int ld, int dil, float* dw, backend::stream_t stream ) {
+	if ( channels > 0 ) k_conv4_dw<<<( channels + 127 ) / 128, 128, 0, cu( stream )>>>( x, s, dy, rows, channels, ld, dil, dw );
 }
 
 void sigmoid_gate_forward( const float* a, const float* g, float* o, size_t n, backend::stream_t stream ) {

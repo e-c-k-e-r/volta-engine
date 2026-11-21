@@ -1,6 +1,7 @@
 // Tier 2 (checkpoint): one qwen4_exp training layer (engine/train/qwen4_exp.h, Model) of an EXL3 checkpoint against central differences of
 // its own forward: random input streams (and n-gram rows for the PLE layer), the loss sum( R * layer( x ) ); the input gradient on sampled
-// entries and the scale gradients of sampled channels (the routing held at the unperturbed input's selection) of several tensors (attention or GDN projections, the shared expert, routed experts).
+// entries and the scale gradients of sampled channels (the routing held at the unperturbed input's selection) of several tensors (attention or GDN projections, the shared expert, routed experts),
+// and the weight gradients of the norms and the small dense tensors (trainable here; the forward checked against their FP16 copies).
 //   TRAIN_MODEL_DIR=<EXL3 Flash-Next checkpoint> test_train_qwen4_exp_layer [layer ...]   (default: 1, the PLE + GDN layer, and 3, attention)
 #include "engine/config.h"
 #include "engine/train/qwen4_exp.h"
@@ -9,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -59,6 +61,7 @@ int main( int argc, char** argv ) {
 	const int T = 24;
 	for ( int L : layers ) {
 		q::Model m;
+		m.set_train_dense( true );   // the small dense tensors' gradients checked with the norms'
 		if ( !m.load( dir, L, L + 1, 0, T ) ) {
 			std::printf( "[-] cannot load layer %d of %s\n", L, dir );
 			return 1;
@@ -90,6 +93,16 @@ int main( int argc, char** argv ) {
 			return s;
 		};
 		loss();   // the routing of this input, then held for every perturbation
+		{
+			// the same layer with its small dense tensors as FP16 copies (not trained): the same forward, bit for bit
+			const std::vector<float> y_t = down( y, nx );
+			q::Model m2;
+			if ( !m2.load( dir, L, L + 1, 0, T ) ) return 1;
+			m2.set_fp16( false );
+			m2.forward( L, x, y, T, pk, pv );
+			const bool same = std::memcmp( down( y, nx ).data(), y_t.data(), nx * sizeof( float ) ) == 0;
+			check( same, "forward with the small dense tensors trained against as FP16 copies: bit for bit" );
+		}
 		m.freeze_routing( true );
 		// the backward after a kept forward (reusing its sublayer outputs), as the training runs it
 		m.forward( L, x, y, T, pk, pv, true );
@@ -154,14 +167,14 @@ int main( int argc, char** argv ) {
 			std::snprintf( line, sizeof( line ), "%-56s scales: error %.3g of %.3g (s %.3g)", t->name.c_str(), w, gm, get( t->su, 0 ) );
 			check( w <= 3e-2 * gm + 1e-4, line );
 		}
-		// Norm weights: the largest-gradient channel and a random one of each of the layer's norms (absolute steps: additive deltas)
+		// Norm weights and the small dense tensors: the largest-gradient entry and a random one of each (absolute steps: additive deltas)
 		for ( q::Dense* d : m.dense_tensors() ) {
 			const std::vector<float> gd = down( d->g, d->n );
 			double w = 0.0, gm = 0.0;
 			for ( int s = 0; s < 2; ++s ) {
 				int ch = std::uniform_int_distribution<int>( 0, d->n - 1 )( rng );
 				if ( s == 0 ) ch = static_cast<int>( std::max_element( gd.begin(), gd.end(), []( float a, float b ) { return std::fabs( a ) < std::fabs( b ); } ) - gd.begin() );
-				const float w0 = get( d->w, ch ), h = 1e-3f + 1e-2f * std::fabs( w0 );
+				const float w0 = get( d->w, ch ), h = 4e-3f + 1e-2f * std::fabs( w0 );
 				set( d->w, ch, w0 + h );
 				const double lp = loss();
 				set( d->w, ch, w0 - h );
@@ -172,7 +185,7 @@ int main( int argc, char** argv ) {
 				gm = std::max( gm, std::fabs( fd ) );
 			}
 			const std::string nm = d->name.substr( d->name.find( "layers." ) == std::string::npos ? 0 : d->name.find( "layers." ) );
-			std::snprintf( line, sizeof( line ), "%-56s norm weights: error %.3g of %.3g", nm.c_str(), w, gm );
+			std::snprintf( line, sizeof( line ), "%-56s weights: error %.3g of %.3g", nm.c_str(), w, gm );
 			check( w <= 3e-2 * gm + 1e-4, line );
 		}
 		{

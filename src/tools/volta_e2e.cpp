@@ -6,13 +6,16 @@
 // held out: their KL is measured before training and every --eval-every steps, and the values of the best held-out KL are written as a new
 // checkpoint (the input's files, its shards rewritten with the new FP16 scales and norms). The learning rate warms up linearly over
 // --warmup steps, then follows a cosine to --lr-min (a fraction of --lr) at the last step. --fp16 0 runs the tuned tensors' products in
-// FP32 instead of on the tensor cores; --norms 0 keeps the norms' weights as they are. --train N trains on the first N sequences only
+// FP32 instead of on the tensor cores; --norms 0 keeps the norms' weights as they are; --dense 1 trains the small dense tensors too (the
+// hyper-connection sites' inject mixes, GDN's in_proj_a / b, A_log, dt_bias and convolution, the shared expert's gate, PLE's convolution;
+// additive deltas like the norms, written back as FP16) at --dense-lr times the learning rate (a row of them feeds a dot product, so
+// Adam's per-entry step adds up over its width). --train N trains on the first N sequences only
 // (the held-out ones unchanged: how the gain grows with the data). --adam-bits 8 keeps Adam's moments as 8-bit block-wise codes; --opt-host 1
 // keeps the optimizer's state in pinned host memory (the devices hold the current values, their gradients and one part of the state: each
 // step streams the state through in parts). The memory per component is logged after the first step.
 //
 //   volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] [--fp16 1]
-//             [--norms 1] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
+//             [--norms 1] [--dense 0] [--dense-lr 0.03] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
 //             [--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]
 //   --check-trace: a trace_layers file of the model's engine forward over the first sequence (test_ppl --calibrate --chunk 512): every layer of
 //     the training form fed the engine's input streams of that layer, its output against the engine's, and the first sequence's embedding
@@ -20,7 +23,8 @@
 //
 // The inputs come from the model itself (test_ppl --flash --calibrate --file TEXT --seq S --tokens N --chunk 512 with train_inputs set:
 // its token embeddings and the PLE layer's n-gram rows), the teacher from the reference model on the same text (test_ppl --flash --file TEXT
-// --seq S --tokens N --chunk 16 --topk-out FILE).
+// --seq S --tokens N --chunk 16 --topk-out FILE). --inputs and --teacher take comma-separated lists (pairwise, one text each): their sequences
+// in that order, so the held-out ones are the last file's last.
 #include "engine/config.h"
 #include "engine/core/log.h"
 #include "engine/train/qwen4_exp.h"
@@ -53,8 +57,8 @@ struct Args {
 	std::string model, inputs, teacher, out, check_trace;
 	std::vector<int> devices = { 0, 1, 2, 3 };
 	int steps = 64, batch = 4, hold = 4, eval_every = 16, warmup = 2, train = 0, adam_bits = 32;
-	bool write = true, timing = false, tp = true, fp16 = true, norms = true, opt_host = false;
-	float lr = 1e-3f, lr_min = 0.1f;
+	bool write = true, timing = false, tp = true, fp16 = true, norms = true, dense = false, opt_host = false;
+	float lr = 1e-3f, lr_min = 0.1f, dense_lr = 0.03f;
 };
 
 // The learning rate of a step (from 1): linear warmup, then a cosine from lr (the first step after the warmup) to lr * lr_min (the last step)
@@ -98,6 +102,8 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--tp" ) a.tp = v != "0";
 		else if ( k == "--fp16" ) a.fp16 = v != "0";
 		else if ( k == "--norms" ) a.norms = v != "0";
+		else if ( k == "--dense" ) a.dense = v != "0";
+		else if ( k == "--dense-lr" ) a.dense_lr = std::stof( v );
 		else if ( k == "--opt-host" ) a.opt_host = v != "0";
 		else if ( k == "--adam-bits" ) a.adam_bits = std::stoi( v );
 		else if ( k == "--write" ) a.write = v != "0";
@@ -118,7 +124,7 @@ bool parse( int argc, char** argv, Args& a ) {
 	}
 	if ( a.model.empty() || a.inputs.empty() || a.teacher.empty() || a.out.empty() || ( a.adam_bits != 32 && a.adam_bits != 8 ) ) {
 		LOG_ERROR( "usage: volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] "
-			"[--fp16 1] [--norms 1] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
+			"[--fp16 1] [--norms 1] [--dense 0] [--dense-lr 0.03] [--steps 64] [--batch 4] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
 			"[--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]" );
 		return false;
 	}
@@ -184,6 +190,51 @@ bool read_inputs( const std::string& path, int H, int flat, Data& d ) {
 	if ( rows < static_cast<size_t>( d.n ) || d.pk.size() / flat < static_cast<size_t>( d.n ) ) {
 		LOG_ERROR( "[volta_e2e] %s: %zu embedding and %zu PLE rows for %d teacher positions", path.c_str(), rows, d.pk.size() / flat, d.n );
 		return false;
+	}
+	return true;
+}
+
+// Comma-separated teacher and inputs files, pairwise (the same text each), as one data set in their order: the held-out sequences are the
+// last file's last ones
+bool read_data( const std::string& teachers, const std::string& inputs, int H, int flat, Data& d ) {
+	auto split = []( const std::string& s ) {
+		std::vector<std::string> out;
+		for ( size_t p = 0; p <= s.size(); ) {
+			const size_t e = std::min( s.find( ',', p ), s.size() );
+			if ( e > p ) out.push_back( s.substr( p, e - p ) );
+			p = e + 1;
+		}
+		return out;
+	};
+	const std::vector<std::string> ts = split( teachers ), is = split( inputs );
+	if ( ts.empty() || ts.size() != is.size() ) {
+		LOG_ERROR( "[volta_e2e] %zu teacher files for %zu inputs files", ts.size(), is.size() );
+		return false;
+	}
+	for ( size_t f = 0; f < ts.size(); ++f ) {
+		Data e;
+		if ( !read_teacher( ts[f], e ) || !read_inputs( is[f], H, flat, e ) ) return false;
+		if ( f == 0 ) {
+			const size_t n = static_cast<size_t>( e.n );
+			e.emb.resize( n * H );
+			e.pk.resize( n * flat );
+			e.pv.resize( n * H );
+			d = std::move( e );
+			continue;
+		}
+		if ( e.seq != d.seq || e.k != d.k || e.n % e.seq != 0 || d.n % d.seq != 0 ) {
+			LOG_ERROR( "[volta_e2e] %s: sequences of %d with top %d after %d / %d (or not whole sequences)", ts[f].c_str(), e.seq, e.k, d.seq, d.k );
+			return false;
+		}
+		const size_t n = static_cast<size_t>( e.n );
+		d.tokens.insert( d.tokens.end(), e.tokens.begin(), e.tokens.end() );
+		d.ids.insert( d.ids.end(), e.ids.begin(), e.ids.end() );
+		d.p.insert( d.p.end(), e.p.begin(), e.p.end() );
+		d.tail.insert( d.tail.end(), e.tail.begin(), e.tail.end() );
+		d.emb.insert( d.emb.end(), e.emb.begin(), e.emb.begin() + n * H );
+		d.pk.insert( d.pk.end(), e.pk.begin(), e.pk.begin() + n * flat );
+		d.pv.insert( d.pv.end(), e.pv.begin(), e.pv.begin() + n * H );
+		d.n += e.n;
 	}
 	return true;
 }
@@ -309,6 +360,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		CUDA_CHECK( cudaSetDevice( dev ) );
 		auto m = std::make_unique<tq::Model>();
 		m->set_optimizer( a.opt_host, a.adam_bits );
+		m->set_train_dense( a.dense, a.dense_lr );
 		ok[r] = m->load( a.model, 0, cfg.layers, dev, T, r, n, comms[r] ) ? 1 : 0;
 		m->set_fp16( a.fp16 );
 		m->set_train_norms( a.norms );
@@ -474,7 +526,7 @@ int main( int argc, char** argv ) {
 	}
 	const int H = cfg.hidden, hc = cfg.hc, flat = hc * H;
 	Data d;
-	if ( !read_teacher( a.teacher, d ) || !read_inputs( a.inputs, H, flat, d ) ) {
+	if ( !read_data( a.teacher, a.inputs, H, flat, d ) ) {
 		LOG_ERROR( "[volta_e2e] cannot read the teacher (%s) or the inputs (%s)", a.teacher.c_str(), a.inputs.c_str() );
 		return 1;
 	}
@@ -497,6 +549,7 @@ int main( int argc, char** argv ) {
 		const int first = cfg.layers * g / G, last = cfg.layers * ( g + 1 ) / G;
 		s.m = std::make_unique<tq::Model>();
 		s.m->set_optimizer( a.opt_host, a.adam_bits );
+		s.m->set_train_dense( a.dense, a.dense_lr );
 		if ( !s.m->load( a.model, first, last, s.dev, T ) ) return 1;
 		s.m->set_fp16( a.fp16 );
 		s.m->set_train_norms( a.norms );

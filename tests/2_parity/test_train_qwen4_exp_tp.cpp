@@ -1,6 +1,7 @@
 // Tier 2 (checkpoint): the tensor-parallel qwen4_exp training model (engine/train/qwen4_exp.h, Model over ranks with NCCL) against the
 // single-device one on the same layers and inputs: a layer's output streams, its input gradient from sum( R * layer( x ) ) and the scale
-// gradients (the shared tensors' summed over the ranks, the experts' from their rank); then the head on the last layer's range: the KL,
+// gradients (the shared tensors' summed over the ranks, the experts' from their rank), the norm weights' and the small dense tensors' (all
+// trainable); then the head on the last layer's range: the KL,
 // the streams' gradient and lm_head's scale gradients.
 //   TRAIN_MODEL_DIR=<EXL3 Flash-Next checkpoint> test_train_qwen4_exp_tp [layer ...]   (default: 1, the PLE + GDN layer, and 3, attention;
 //   all visible devices as the ranks)
@@ -149,6 +150,7 @@ int main( int argc, char** argv ) {
 		{
 			CUDA_CHECK( cudaSetDevice( 0 ) );
 			q::Model m;
+			m.set_train_dense( true );
 			if ( !m.load( dir, L, L + 1, 0, T ) ) return 1;
 			float *x = up( hx.data(), hx.size() ), *R = up( hr.data(), hr.size() ), *pk = up( hk.data(), hk.size() ), *pv = up( hv.data(), hv.size() ), *y, *dx;
 			CUDA_CHECK( cudaMalloc( &y, hx.size() * sizeof( float ) ) );
@@ -170,6 +172,7 @@ int main( int argc, char** argv ) {
 		for ( int r = 0; r < n; ++r ) th.emplace_back( [&, r] {
 			CUDA_CHECK( cudaSetDevice( r ) );
 			q::Model m;
+			m.set_train_dense( true );
 			ok[r] = m.load( dir, L, L + 1, r, T, r, n, comms[r] );
 			if ( !ok[r] ) std::abort();   // the other ranks would wait on it forever
 			const size_t o = static_cast<size_t>( r ) * Tl * flat, cnt = static_cast<size_t>( Tl ) * flat;
@@ -206,6 +209,9 @@ int main( int argc, char** argv ) {
 		compare_grads( g_ref, g_tp, ".shared_expert.", "shared expert" );
 		compare_grads( g_ref, g_tp, ".experts.", "routed experts" );
 		compare_grads( g_ref, g_tp, "norm", "norm weight" );
+		compare_grads( g_ref, g_tp, "block_inject", "inject mix" );
+		compare_grads( g_ref, g_tp, "shared_expert_gate", "shared expert gate" );
+		if ( L == c.ple_layer ) compare_grads( g_ref, g_tp, "ple.conv1d", "PLE convolution" );
 	}
 	{
 		// The head on the last layer's range
