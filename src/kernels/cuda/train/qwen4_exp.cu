@@ -267,124 +267,220 @@ __global__ void k_topk_softmax_bwd( const float* w, const float* dw, int rows, i
 constexpr int GD = 128;   // head dim (keys and values)
 constexpr int GW = 16;    // value columns per block, a warp each
 
-__device__ __forceinline__ float warp_sum_( float v ) {
-	for ( int o = 16; o > 0; o >>= 1 ) v += __shfl_xor_sync( 0xffffffffu, v, o );
-	return v;
+// The forward's row tiles: kGdnTile rows of the key head's k and q, the value head's e^gate, beta and k . q, and the block's 16 value columns,
+// staged in shared memory, the next tile's loads in flight while a tile is used
+constexpr int kGdnTile = 16;
+
+// Block (head, 16 columns, sequence) of 8 warps, a half-warp per column holding its state row in 8 values per lane (element r * 16 + l);
+// the rows hold gridDim.z sequences of rows / gridDim.z, each starting from a zero state. o_t[c] = scale S_c . q_t after the update is
+// e^gate (S_c . q_t) + d (k_t . q_t) from the state before it, so both sums of a row run together
+__global__ __launch_bounds__( 256 )
+void k_gdn_fwd( const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v, const float* __restrict__ gate,
+	const float* __restrict__ beta, int rows, int kh, int vh, float scale, int chunk, float* __restrict__ ckpt, float* __restrict__ o ) {
+	__shared__ float4 sk4[kGdnTile * GD / 4], sq4[kGdnTile * GD / 4];
+	__shared__ float sg[kGdnTile], sb[kGdnTile], skq[kGdnTile], sv[kGdnTile][GW];
+	const int h = blockIdx.x, c0 = blockIdx.y * GW, tid = threadIdx.x, w = tid >> 5, lane = tid & 31, l = lane & 15, khh = h / ( vh / kh );
+	const int cl = w * 2 + ( lane >> 4 ), c = c0 + cl;
+	const int L = rows / gridDim.z, nch = ( L + chunk - 1 ) / chunk, s0 = blockIdx.z * L, s1 = s0 + L;
+	const float* sk = reinterpret_cast<const float*>( sk4 );
+	const float* sq = reinterpret_cast<const float*>( sq4 );
+	// this thread's share of a tile: row tid / 16 of k and q (8 values each: two float4 at part tid % 16), one v value, gate or beta
+	const int lr = tid >> 4, lp = tid & 15;
+	float4 pk[2], pq[2];
+	float pv = 0.0f, pgb = 0.0f;
+	auto fetch = [&]( int t0 ) {
+		const int t = t0 + lr;
+		if ( t < s1 ) {
+			const float4* kt = reinterpret_cast<const float4*>( k + ( static_cast<size_t>( t ) * kh + khh ) * GD ) + lp * 2;
+			const float4* qt = reinterpret_cast<const float4*>( q + ( static_cast<size_t>( t ) * kh + khh ) * GD ) + lp * 2;
+			pk[0] = kt[0]; pk[1] = kt[1]; pq[0] = qt[0]; pq[1] = qt[1];
+			pv = v[( static_cast<size_t>( t ) * vh + h ) * GD + c0 + lp];
+		}
+		else {
+			pk[0] = pk[1] = pq[0] = pq[1] = make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
+			pv = 0.0f;
+		}
+		const int tg = t0 + ( tid & 15 );
+		if ( tid < 32 ) pgb = tg >= s1 ? 0.0f : tid < 16 ? expf( gate[static_cast<size_t>( tg ) * vh + h] ) : beta[static_cast<size_t>( tg ) * vh + h];
+	};
+	float S[8];
+	for ( int r = 0; r < 8; ++r ) S[r] = 0.0f;
+	fetch( s0 );
+	for ( int t0 = s0; t0 < s1; t0 += kGdnTile ) {
+		__syncthreads();   // the previous tile used
+		sk4[lr * ( GD / 4 ) + lp * 2] = pk[0]; sk4[lr * ( GD / 4 ) + lp * 2 + 1] = pk[1];
+		sq4[lr * ( GD / 4 ) + lp * 2] = pq[0]; sq4[lr * ( GD / 4 ) + lp * 2 + 1] = pq[1];
+		sv[lr][lp] = pv;
+		if ( tid < 16 ) sg[tid] = pgb;
+		else if ( tid < 32 ) sb[tid - 16] = pgb;
+		__syncthreads();
+		{
+			// k . q of the tile's rows: rows w * 2 + half-warp
+			const int i = w * 2 + ( lane >> 4 );
+			float kq = 0.0f;
+			for ( int r = 0; r < 8; ++r ) kq = fmaf( sk[i * GD + r * 16 + l], sq[i * GD + r * 16 + l], kq );
+			for ( int m = 8; m > 0; m >>= 1 ) kq += __shfl_xor_sync( 0xffffffffu, kq, m );
+			if ( l == 0 ) skq[i] = kq;
+		}
+		if ( t0 + kGdnTile < s1 ) fetch( t0 + kGdnTile );
+		__syncthreads();
+		const int n = min( kGdnTile, s1 - t0 );
+		for ( int i = 0; i < n; ++i ) {
+			const int t = t0 + i;
+			if ( ( t - s0 ) % chunk == 0 ) {
+				float* ck = ckpt + ( ( ( static_cast<size_t>( blockIdx.z ) * nch + ( t - s0 ) / chunk ) * vh + h ) * GD + c ) * GD;
+				for ( int r = 0; r < 8; ++r ) ck[r * 16 + l] = S[r];
+			}
+			float kk[8], u = 0.0f, sqv = 0.0f;
+			for ( int r = 0; r < 8; ++r ) {
+				kk[r] = sk[i * GD + r * 16 + l];
+				u = fmaf( S[r], kk[r], u );
+				sqv = fmaf( S[r], sq[i * GD + r * 16 + l], sqv );
+			}
+			for ( int m = 8; m > 0; m >>= 1 ) {
+				u += __shfl_xor_sync( 0xffffffffu, u, m );
+				sqv += __shfl_xor_sync( 0xffffffffu, sqv, m );
+			}
+			const float g = sg[i], d = sb[i] * ( sv[i][cl] - g * u );
+			for ( int r = 0; r < 8; ++r ) S[r] = fmaf( g, S[r], d * kk[r] );
+			if ( l == 0 ) o[( static_cast<size_t>( t ) * vh + h ) * GD + c] = ( g * sqv + d * skq[i] ) * scale;
+		}
+	}
 }
 
-// Block (head, 16 columns, sequence), a warp per column holding its state row in 4 values per lane (element r * 32 + lane); the rows hold
-// gridDim.z sequences of rows / gridDim.z, each starting from a zero state
-__global__ __launch_bounds__( GW * 32 )
-void k_gdn_fwd( const float* q, const float* k, const float* v, const float* gate, const float* beta, int rows, int kh, int vh, float scale, int chunk,
-	float* ckpt, float* o ) {
-	const int h = blockIdx.x, c = blockIdx.y * GW + threadIdx.x / 32, lane = threadIdx.x & 31, khh = h / ( vh / kh );
-	const int L = rows / gridDim.z, nch = ( L + chunk - 1 ) / chunk, s0 = blockIdx.z * L;
-	float S[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-	for ( int t = s0; t < s0 + L; ++t ) {
-		if ( ( t - s0 ) % chunk == 0 ) {
-			float* ck = ckpt + ( ( ( static_cast<size_t>( blockIdx.z ) * nch + ( t - s0 ) / chunk ) * vh + h ) * GD + c ) * GD;
-			for ( int r = 0; r < 4; ++r ) ck[r * 32 + lane] = S[r];
-		}
-		const float* kt = k + ( static_cast<size_t>( t ) * kh + khh ) * GD;
-		const float* qt = q + ( static_cast<size_t>( t ) * kh + khh ) * GD;
-		float kk[4], qq[4];
-		for ( int r = 0; r < 4; ++r ) { kk[r] = kt[r * 32 + lane]; qq[r] = qt[r * 32 + lane]; }
-		const float g = expf( gate[static_cast<size_t>( t ) * vh + h] ), bt = beta[static_cast<size_t>( t ) * vh + h];
-		const float vc = v[( static_cast<size_t>( t ) * vh + h ) * GD + c];
-		float u = 0.0f;
-		for ( int r = 0; r < 4; ++r ) u += S[r] * kk[r];
-		u = warp_sum_( u );
-		const float d = bt * ( vc - g * u );
-		float oc = 0.0f;
-		for ( int r = 0; r < 4; ++r ) {
-			S[r] = g * S[r] + d * kk[r];
-			oc += S[r] * qq[r];
-		}
-		oc = warp_sum_( oc );
-		if ( lane == 0 ) o[( static_cast<size_t>( t ) * vh + h ) * GD + c] = oc * scale;
-	}
-}
+// The backward's sub-chunks: kGdnSub rows whose states a thread holds in registers at once
+constexpr int kGdnSub = 8;
 
-// One chunk of the backward (chunk n of each sequence): the chunk's states recomputed from its checkpoint into sb, then its rows in reverse
-// with dS carried in carry
-__global__ __launch_bounds__( GW * 32 )
-void k_gdn_bwd( const float* q, const float* k, const float* v, const float* gate, const float* beta, int rows, int kh, int vh, float scale, int chunk,
-	int n, const float* ckpt, const float* dout, float* dq, float* dk, float* dv, float* dgate, float* dbeta, float* sbuf, float* carry ) {
-	__shared__ float s_dq[GD], s_dk[GD], s_g[2];
-	const int h = blockIdx.x, c = blockIdx.y * GW + threadIdx.x / 32, lane = threadIdx.x & 31, khh = h / ( vh / kh );
-	const int L = rows / gridDim.z, nch = ( L + chunk - 1 ) / chunk, s0 = blockIdx.z * L;
-	const int t0 = s0 + n * chunk, t1 = min( s0 + L, t0 + chunk );
-	const size_t hs = ( static_cast<size_t>( blockIdx.z ) * vh + h ) * GD + c;
-	float* sb = sbuf + hs * chunk * GD;
-	float S[4];
-	const float* ck = ckpt + ( ( ( static_cast<size_t>( blockIdx.z ) * nch + n ) * vh + h ) * GD + c ) * GD;
-	for ( int r = 0; r < 4; ++r ) S[r] = ck[r * 32 + lane];
-	for ( int t = t0; t < t1; ++t ) {
-		for ( int r = 0; r < 4; ++r ) sb[static_cast<size_t>( t - t0 ) * GD + r * 32 + lane] = S[r];
-		const float* kt = k + ( static_cast<size_t>( t ) * kh + khh ) * GD;
-		float kk[4];
-		for ( int r = 0; r < 4; ++r ) kk[r] = kt[r * 32 + lane];
-		const float g = expf( gate[static_cast<size_t>( t ) * vh + h] ), bt = beta[static_cast<size_t>( t ) * vh + h];
-		const float vc = v[( static_cast<size_t>( t ) * vh + h ) * GD + c];
-		float u = 0.0f;
-		for ( int r = 0; r < 4; ++r ) u += S[r] * kk[r];
-		u = warp_sum_( u );
-		const float d = bt * ( vc - g * u );
-		for ( int r = 0; r < 4; ++r ) S[r] = g * S[r] + d * kk[r];
+// The backward, block (head, 16 columns, sequence) of 8 warps in the forward's layout, the chunks last first and dS in registers throughout.
+// Per chunk: from its checkpoint the states at its sub-chunks' starts (into sub, a column's kGdnSub-row sub-checkpoints); then per
+// sub-chunk, last first, its states recomputed into registers and its rows in reverse. A row's sums over the block's columns (dq, dk,
+// dbeta, dgate) go through per-warp partials in shared memory (two buffers, one barrier a row; shared float atomics are compare-and-swap
+// loops on SM70) and one global add per entry
+__global__ __launch_bounds__( 256, 2 )
+void k_gdn_bwd( const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v, const float* __restrict__ gate,
+	const float* __restrict__ beta, int rows, int kh, int vh, float scale, int chunk, const float* __restrict__ ckpt, const float* __restrict__ dout,
+	float* dq, float* dk, float* dv, float* dgate, float* dbeta, float* __restrict__ sub ) {
+	__shared__ float4 sk4[kGdnSub * GD / 4], sq4[kGdnSub * GD / 4];
+	__shared__ float sg[kGdnSub], sb[kGdnSub], sv[kGdnSub][GW], sdo[kGdnSub][GW], su[kGdnSub][GW], sd[kGdnSub][GW];
+	__shared__ float sp[2][8][2 * GD], sc[2][2][GW];   // per warp a row's dq | dk partials; per column its dbeta, dgate terms
+	const int h = blockIdx.x, c0 = blockIdx.y * GW, tid = threadIdx.x, w = tid >> 5, lane = tid & 31, l = lane & 15, khh = h / ( vh / kh );
+	const int cl = w * 2 + ( lane >> 4 ), c = c0 + cl;
+	const int L = rows / gridDim.z, nch = ( L + chunk - 1 ) / chunk, s0 = blockIdx.z * L, s1 = s0 + L, nsub = ( chunk + kGdnSub - 1 ) / kGdnSub;
+	const float* skf = reinterpret_cast<const float*>( sk4 );
+	const float* sqf = reinterpret_cast<const float*>( sq4 );
+	float* subc = sub + ( ( static_cast<size_t>( blockIdx.z ) * vh + h ) * GD + c ) * nsub * GD;
+	int buf = 0;
+	// rows [t0, t0 + n) into the tiles: k, e^gate, beta, v, with all also q and dout
+	auto stage = [&]( int t0, int n, bool all ) {
+		__syncthreads();
+		const int r = tid >> 5, p = tid & 31;
+		const size_t kb = ( static_cast<size_t>( t0 + r ) * kh + khh ) * GD;
+		sk4[tid] = r < n ? reinterpret_cast<const float4*>( k + kb )[p] : make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
+		if ( all ) sq4[tid] = r < n ? reinterpret_cast<const float4*>( q + kb )[p] : make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
+		const int rv = ( tid & 127 ) >> 4, j = tid & 15;
+		const size_t vb = ( static_cast<size_t>( t0 + rv ) * vh + h ) * GD + c0 + j;
+		if ( tid < 128 ) sv[rv][j] = rv < n ? v[vb] : 0.0f;
+		else if ( all ) sdo[rv][j] = rv < n ? dout[vb] : 0.0f;
+		if ( tid < kGdnSub ) sg[tid] = tid < n ? expf( gate[static_cast<size_t>( t0 + tid ) * vh + h] ) : 0.0f;
+		else if ( tid < 2 * kGdnSub ) sb[tid - kGdnSub] = tid - kGdnSub < n ? beta[static_cast<size_t>( t0 + tid - kGdnSub ) * vh + h] : 0.0f;
+		__syncthreads();
+	};
+	float dS[8];
+	for ( int r = 0; r < 8; ++r ) dS[r] = 0.0f;
+	for ( int n = nch - 1; n >= 0; --n ) {
+		const int cs = s0 + n * chunk, ce = min( s1, cs + chunk ), ns = ( ce - cs + kGdnSub - 1 ) / kGdnSub;
+		const float* ck = ckpt + ( ( ( static_cast<size_t>( blockIdx.z ) * nch + n ) * vh + h ) * GD + c ) * GD;
+		float S[8];
+		for ( int r = 0; r < 8; ++r ) S[r] = ck[r * 16 + l];
+		// the states at the starts of sub-chunks 1 .. ns - 1 (the last one stays in S)
+		for ( int j = 0; j + 1 < ns; ++j ) {
+			stage( cs + j * kGdnSub, kGdnSub, false );
+			for ( int i = 0; i < kGdnSub; ++i ) {
+				float kk[8], u = 0.0f;
+				for ( int r = 0; r < 8; ++r ) {
+					kk[r] = skf[i * GD + r * 16 + l];
+					u = fmaf( S[r], kk[r], u );
+				}
+				for ( int m = 8; m > 0; m >>= 1 ) u += __shfl_xor_sync( 0xffffffffu, u, m );
+				const float g = sg[i], d = sb[i] * ( sv[i][cl] - g * u );
+				for ( int r = 0; r < 8; ++r ) S[r] = fmaf( g, S[r], d * kk[r] );
+			}
+			if ( j + 2 < ns ) for ( int r = 0; r < 8; ++r ) subc[( j + 1 ) * GD + r * 16 + l] = S[r];
+		}
+		for ( int j = ns - 1; j >= 0; --j ) {
+			const int t0 = cs + j * kGdnSub, nr = min( kGdnSub, ce - t0 );
+			if ( j < ns - 1 ) {
+				const float* from = j == 0 ? ck : subc + j * GD;
+				for ( int r = 0; r < 8; ++r ) S[r] = from[r * 16 + l];
+			}
+			stage( t0, nr, true );
+			// the sub-chunk's states before each row (Sx), u and d per row and column
+			float Sx[kGdnSub][8];
+#pragma unroll
+			for ( int i = 0; i < kGdnSub; ++i ) {
+				for ( int r = 0; r < 8; ++r ) Sx[i][r] = S[r];
+				if ( i < nr ) {
+					float kk[8], u = 0.0f;
+					for ( int r = 0; r < 8; ++r ) {
+						kk[r] = skf[i * GD + r * 16 + l];
+						u = fmaf( S[r], kk[r], u );
+					}
+					for ( int m = 8; m > 0; m >>= 1 ) u += __shfl_xor_sync( 0xffffffffu, u, m );
+					const float g = sg[i], d = sb[i] * ( sv[i][cl] - g * u );
+					if ( l == 0 ) {
+						su[i][cl] = u;
+						sd[i][cl] = d;
+					}
+					for ( int r = 0; r < 8; ++r ) S[r] = fmaf( g, S[r], d * kk[r] );
+				}
+			}
+			__syncwarp();
+#pragma unroll
+			for ( int i = kGdnSub - 1; i >= 0; --i ) {
+				if ( i >= nr ) continue;
+				const int t = t0 + i;
+				const float g = sg[i], bt = sb[i], u = su[i][cl], d = sd[i][cl], sdoc = scale * sdo[i][cl];
+				float kk[8], dqc[8], dd = 0.0f, dgp = 0.0f;
+				for ( int r = 0; r < 8; ++r ) {
+					kk[r] = skf[i * GD + r * 16 + l];
+					dqc[r] = sdoc * fmaf( g, Sx[i][r], d * kk[r] );   // scale doc S_t
+					dS[r] = fmaf( sdoc, sqf[i * GD + r * 16 + l], dS[r] );
+					dd = fmaf( dS[r], kk[r], dd );
+					dgp = fmaf( dS[r], Sx[i][r], dgp );
+				}
+				for ( int m = 8; m > 0; m >>= 1 ) {
+					dd += __shfl_xor_sync( 0xffffffffu, dd, m );
+					dgp += __shfl_xor_sync( 0xffffffffu, dgp, m );
+				}
+				const float du = -bt * g * dd;
+				for ( int r = 0; r < 8; ++r ) {
+					float dkc = fmaf( dS[r], d, Sx[i][r] * du );
+					dS[r] = fmaf( g, dS[r], du * kk[r] );
+					const float a = dqc[r] + __shfl_xor_sync( 0xffffffffu, dqc[r], 16 );
+					dkc += __shfl_xor_sync( 0xffffffffu, dkc, 16 );
+					if ( lane < 16 ) {
+						sp[buf][w][r * 16 + l] = a;
+						sp[buf][w][GD + r * 16 + l] = dkc;
+					}
+				}
+				if ( l == 0 ) {
+					dv[( static_cast<size_t>( t ) * vh + h ) * GD + c] += bt * dd;
+					sc[buf][0][cl] = dd * ( sv[i][cl] - g * u );
+					sc[buf][1][cl] = ( dgp - bt * dd * u ) * g;
+				}
+				__syncthreads();
+				float s = 0.0f;
+				for ( int x = 0; x < 8; ++x ) s += sp[buf][x][tid];
+				atomicAdd( ( tid < GD ? dq : dk ) + ( static_cast<size_t>( t ) * kh + khh ) * GD + ( tid & ( GD - 1 ) ), s );
+				if ( tid < 2 ) {
+					float z = 0.0f;
+					for ( int x = 0; x < GW; ++x ) z += sc[buf][tid][x];
+					atomicAdd( ( tid == 0 ? dbeta : dgate ) + static_cast<size_t>( t ) * vh + h, z );
+				}
+				buf ^= 1;
+			}
+		}
 	}
-	float dS[4];
-	float* cy = carry + hs * GD;
-	for ( int r = 0; r < 4; ++r ) dS[r] = cy[r * 32 + lane];
-	for ( int t = t1 - 1; t >= t0; --t ) {
-		if ( threadIdx.x < GD ) { s_dq[threadIdx.x] = 0.0f; s_dk[threadIdx.x] = 0.0f; }
-		if ( threadIdx.x < 2 ) s_g[threadIdx.x] = 0.0f;
-		__syncthreads();
-		const float* kt = k + ( static_cast<size_t>( t ) * kh + khh ) * GD;
-		const float* qt = q + ( static_cast<size_t>( t ) * kh + khh ) * GD;
-		float kk[4], qq[4], Sp[4], St[4];
-		for ( int r = 0; r < 4; ++r ) {
-			kk[r] = kt[r * 32 + lane];
-			qq[r] = qt[r * 32 + lane];
-			Sp[r] = sb[static_cast<size_t>( t - t0 ) * GD + r * 32 + lane];
-		}
-		const float g = expf( gate[static_cast<size_t>( t ) * vh + h] ), bt = beta[static_cast<size_t>( t ) * vh + h];
-		const float vc = v[( static_cast<size_t>( t ) * vh + h ) * GD + c];
-		float u = 0.0f;
-		for ( int r = 0; r < 4; ++r ) u += Sp[r] * kk[r];
-		u = warp_sum_( u );
-		const float d = bt * ( vc - g * u );
-		for ( int r = 0; r < 4; ++r ) St[r] = g * Sp[r] + d * kk[r];
-		const float doc = dout[( static_cast<size_t>( t ) * vh + h ) * GD + c];
-		for ( int r = 0; r < 4; ++r ) {
-			dS[r] += scale * doc * qq[r];
-			atomicAdd( &s_dq[r * 32 + lane], scale * St[r] * doc );
-		}
-		float dd = 0.0f, dg = 0.0f;
-		for ( int r = 0; r < 4; ++r ) { dd += dS[r] * kk[r]; dg += dS[r] * Sp[r]; }
-		dd = warp_sum_( dd );
-		dg = warp_sum_( dg );
-		const float du = -bt * g * dd;
-		for ( int r = 0; r < 4; ++r ) {
-			atomicAdd( &s_dk[r * 32 + lane], dS[r] * d + Sp[r] * du );
-			dS[r] = g * dS[r] + du * kk[r];
-		}
-		if ( lane == 0 ) {
-			dv[( static_cast<size_t>( t ) * vh + h ) * GD + c] += bt * dd;
-			atomicAdd( &s_g[0], dd * ( vc - g * u ) );
-			atomicAdd( &s_g[1], dg - bt * dd * u );
-		}
-		__syncthreads();
-		if ( threadIdx.x < GD ) {
-			atomicAdd( &dq[( static_cast<size_t>( t ) * kh + khh ) * GD + threadIdx.x], s_dq[threadIdx.x] );
-			atomicAdd( &dk[( static_cast<size_t>( t ) * kh + khh ) * GD + threadIdx.x], s_dk[threadIdx.x] );
-		}
-		if ( threadIdx.x == 0 ) {
-			atomicAdd( &dbeta[static_cast<size_t>( t ) * vh + h], s_g[0] );
-			atomicAdd( &dgate[static_cast<size_t>( t ) * vh + h], s_g[1] * g );
-		}
-		__syncthreads();
-	}
-	for ( int r = 0; r < 4; ++r ) cy[r * 32 + lane] = dS[r];
 }
 
 __global__ void k_gdn_gates( const float* a, const float* b, const float* A_log, const float* dt_bias, int rows, int vh, float* gate, float* beta ) {
@@ -917,26 +1013,21 @@ size_t gdn_ckpt_floats( int rows, int vh, int chunk, int seqs ) {
 }
 
 size_t gdn_scratch_floats( int vh, int chunk, int seqs ) {
-	return static_cast<size_t>( seqs ) * vh * GD * GD * ( chunk + 1 );
+	return static_cast<size_t>( seqs ) * vh * GD * GD * ( ( chunk + kGdnSub - 1 ) / kGdnSub );
 }
 
 void gdn_forward( const float* q, const float* k, const float* v, const float* gate, const float* beta, int rows, int kh, int vh, float scale, int chunk,
 	float* ckpt, float* o, backend::stream_t stream, int seqs ) {
 	ENGINE_ASSERT( vh % kh == 0, "gdn_forward: value heads must be a multiple of the key heads" );
 	ENGINE_ASSERT( seqs > 0 && rows % seqs == 0, "gdn_forward: the rows must hold whole sequences" );
-	k_gdn_fwd<<<dim3( vh, GD / GW, seqs ), GW * 32, 0, cu( stream )>>>( q, k, v, gate, beta, rows, kh, vh, scale, chunk, ckpt, o );
+	k_gdn_fwd<<<dim3( vh, GD / GW, seqs ), 256, 0, cu( stream )>>>( q, k, v, gate, beta, rows, kh, vh, scale, chunk, ckpt, o );
 }
 
 void gdn_backward( const float* q, const float* k, const float* v, const float* gate, const float* beta, int rows, int kh, int vh, float scale, int chunk,
 	const float* ckpt, const float* dout, float* dq, float* dk, float* dv, float* dgate, float* dbeta, float* scratch, backend::stream_t stream, int seqs ) {
 	ENGINE_ASSERT( seqs > 0 && rows % seqs == 0, "gdn_backward: the rows must hold whole sequences" );
-	float* sbuf = scratch;
-	float* carry = scratch + static_cast<size_t>( seqs ) * vh * GD * GD * chunk;
-	CUDA_CHECK( cudaMemsetAsync( carry, 0, static_cast<size_t>( seqs ) * vh * GD * GD * sizeof( float ), cu( stream ) ) );
-	for ( int n = ( rows / seqs + chunk - 1 ) / chunk - 1; n >= 0; --n ) {
-		k_gdn_bwd<<<dim3( vh, GD / GW, seqs ), GW * 32, 0, cu( stream )>>>( q, k, v, gate, beta, rows, kh, vh, scale, chunk, n, ckpt, dout, dq, dk, dv,
-			dgate, dbeta, sbuf, carry );
-	}
+	k_gdn_bwd<<<dim3( vh, GD / GW, seqs ), 256, 0, cu( stream )>>>( q, k, v, gate, beta, rows, kh, vh, scale, chunk, ckpt, dout, dq, dk, dv, dgate, dbeta,
+		scratch );
 }
 
 void gdn_gates_forward( const float* a, const float* b, const float* A_log, const float* dt_bias, int rows, int vh, float* gate, float* beta,

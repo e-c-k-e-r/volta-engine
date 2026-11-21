@@ -370,6 +370,99 @@ void test_gdn() {
 		eg, eb );
 	check( ef < 1e-5 && eq < 1e-3 && ek < 1e-3 && ev < 1e-3 && eg < 1e-3 && eb < 1e-3, line );
 	for ( float* p : { d_q, d_k, d_v, d_g, d_b, d_o, d_R, d_ck, d_scr, d_dq, d_dk, d_dv, d_dg, d_db } ) cudaFree( p );
+	{
+		// The forward at a layer's shape on one of four ranks (4 key heads, 12 value heads, chunks of 64) over 512 rows
+		const int Rb = 512, khb = 4, vhb = 12;
+		auto unitb = [&]( Vec x, int heads ) {
+			for ( int r = 0; r < Rb * heads; ++r ) {
+				double n = 0.0;
+				for ( int i = 0; i < D; ++i ) n += x[static_cast<size_t>( r ) * D + i] * x[static_cast<size_t>( r ) * D + i];
+				for ( int i = 0; i < D; ++i ) x[static_cast<size_t>( r ) * D + i] /= std::sqrt( n );
+			}
+			return x;
+		};
+		const Vec qb = unitb( randv( static_cast<size_t>( Rb ) * khb * D ), khb ), kb = unitb( randv( qb.size() ), khb ), vb = randv( static_cast<size_t>( Rb ) * vhb * D );
+		Vec gb = randv( static_cast<size_t>( Rb ) * vhb, 0.05 ), bb( gb.size() );
+		for ( auto& x : gb ) x = -std::fabs( x );
+		for ( auto& x : bb ) x = std::uniform_real_distribution<double>( 0.1, 0.9 )( rng );
+		float *b_q = up( qb ), *b_k = up( kb ), *b_v = up( vb ), *b_g = up( gb ), *b_b = up( bb ), *b_o = zeros( vb.size() );
+		float* b_ck = zeros( q::gdn_ckpt_floats( Rb, vhb, 64 ) );
+		q::gdn_forward( b_q, b_k, b_v, b_g, b_b, Rb, khb, vhb, static_cast<float>( scale ), 64, b_ck, b_o, nullptr );
+		const double eo = rel( down( b_o, vb.size() ), h_gdn( qb, kb, vb, gb, bb, Rb, khb, vhb, scale ) );
+		std::snprintf( line, sizeof( line ), "%d rows of %d key and %d value heads, chunks of 64: forward %.2e", Rb, khb, vhb, eo );
+		check( eo < 1e-5, line );
+		for ( float* p : { b_q, b_k, b_v, b_g, b_b, b_o, b_ck } ) cudaFree( p );
+	}
+	{
+		// Sequences of 37 rows (the forward's tiles of 16; chunks of 24, the backward's sub-chunks of 8: partial ones of each) in one call:
+		// each from a zero state, against the host recurrence per sequence; the backward against the single-sequence call on each
+		const int L = 37, ns = 3, R3 = ns * L, ch = 24;
+		auto unit3 = [&]( Vec x ) {
+			for ( int r = 0; r < R3 * kh; ++r ) {
+				double n = 0.0;
+				for ( int i = 0; i < D; ++i ) n += x[static_cast<size_t>( r ) * D + i] * x[static_cast<size_t>( r ) * D + i];
+				for ( int i = 0; i < D; ++i ) x[static_cast<size_t>( r ) * D + i] /= std::sqrt( n );
+			}
+			return x;
+		};
+		const Vec q3 = unit3( randv( static_cast<size_t>( R3 ) * kh * D ) ), k3 = unit3( randv( q3.size() ) ), v3 = randv( static_cast<size_t>( R3 ) * vh * D );
+		Vec g3 = randv( static_cast<size_t>( R3 ) * vh, 0.3 ), b3( g3.size() );
+		for ( auto& x : g3 ) x = -std::fabs( x );
+		for ( auto& x : b3 ) x = std::uniform_real_distribution<double>( 0.1, 0.9 )( rng );
+		const Vec R3v = randv( v3.size() );
+		float *e_q = up( q3 ), *e_k = up( k3 ), *e_v = up( v3 ), *e_g = up( g3 ), *e_b = up( b3 ), *e_o = zeros( v3.size() ), *e_R = up( R3v );
+		float *e_ck = zeros( q::gdn_ckpt_floats( R3, vh, ch, ns ) ), *e_scr = zeros( q::gdn_scratch_floats( vh, ch, ns ) );
+		float *e_dq = zeros( q3.size() ), *e_dk = zeros( k3.size() ), *e_dv = zeros( v3.size() ), *e_dg = zeros( g3.size() ), *e_db = zeros( b3.size() );
+		q::gdn_forward( e_q, e_k, e_v, e_g, e_b, R3, kh, vh, static_cast<float>( scale ), ch, e_ck, e_o, nullptr, ns );
+		q::gdn_backward( e_q, e_k, e_v, e_g, e_b, R3, kh, vh, static_cast<float>( scale ), ch, e_ck, e_R, e_dq, e_dk, e_dv, e_dg, e_db, e_scr, nullptr, ns );
+		Vec ref;
+		for ( int s = 0; s < ns; ++s ) {
+			auto part = [&]( const Vec& x, size_t per ) { return Vec( x.begin() + s * L * per, x.begin() + ( s + 1 ) * L * per ); };
+			const Vec o_s = h_gdn( part( q3, kh * D ), part( k3, kh * D ), part( v3, vh * D ), part( g3, vh ), part( b3, vh ), L, kh, vh, scale );
+			ref.insert( ref.end(), o_s.begin(), o_s.end() );
+		}
+		const double e3 = rel( down( e_o, v3.size() ), ref );
+		// the backward: each sequence alone (one-sequence calls on its rows) gives the same gradients
+		std::vector<Vec> g1( 5 );
+		for ( int s = 0; s < ns; ++s ) {
+			const size_t oq = static_cast<size_t>( s ) * L * kh * D, ov = static_cast<size_t>( s ) * L * vh * D, og = static_cast<size_t>( s ) * L * vh;
+			float *f_ck = zeros( q::gdn_ckpt_floats( L, vh, ch ) ), *f_scr = zeros( q::gdn_scratch_floats( vh, ch ) ), *f_o = zeros( static_cast<size_t>( L ) * vh * D );
+			float *f_dq = zeros( static_cast<size_t>( L ) * kh * D ), *f_dk = zeros( static_cast<size_t>( L ) * kh * D ), *f_dv = zeros( static_cast<size_t>( L ) * vh * D );
+			float *f_dg = zeros( static_cast<size_t>( L ) * vh ), *f_db = zeros( static_cast<size_t>( L ) * vh );
+			q::gdn_forward( e_q + oq, e_k + oq, e_v + ov, e_g + og, e_b + og, L, kh, vh, static_cast<float>( scale ), ch, f_ck, f_o, nullptr );
+			q::gdn_backward( e_q + oq, e_k + oq, e_v + ov, e_g + og, e_b + og, L, kh, vh, static_cast<float>( scale ), ch, f_ck, e_R + ov, f_dq, f_dk, f_dv, f_dg, f_db,
+				f_scr, nullptr );
+			const size_t n5[5] = { static_cast<size_t>( L ) * kh * D, static_cast<size_t>( L ) * kh * D, static_cast<size_t>( L ) * vh * D, static_cast<size_t>( L ) * vh,
+				static_cast<size_t>( L ) * vh };
+			float* f5[5] = { f_dq, f_dk, f_dv, f_dg, f_db };
+			for ( int j = 0; j < 5; ++j ) {
+				const Vec x = down( f5[j], n5[j] );
+				g1[j].insert( g1[j].end(), x.begin(), x.end() );
+			}
+			for ( float* p : { f_ck, f_scr, f_o, f_dq, f_dk, f_dv, f_dg, f_db } ) cudaFree( p );
+		}
+		double eb3 = 0.0;
+		float* e5[5] = { e_dq, e_dk, e_dv, e_dg, e_db };
+		for ( int j = 0; j < 5; ++j ) eb3 = std::max( eb3, rel( down( e5[j], g1[j].size() ), g1[j] ) );
+		// and the sums over columns (dq, dk, dgate) against central differences of the host recurrence per sequence
+		auto host3 = [&]( const Vec& qq, const Vec& kk, const Vec& gg ) {
+			double s = 0.0;
+			for ( int sq = 0; sq < ns; ++sq ) {
+				auto part = [&]( const Vec& x, size_t per ) { return Vec( x.begin() + sq * L * per, x.begin() + ( sq + 1 ) * L * per ); };
+				const Vec o_s = h_gdn( part( qq, kh * D ), part( kk, kh * D ), part( v3, vh * D ), part( gg, vh ), part( b3, vh ), L, kh, vh, scale );
+				const Vec r_s = part( R3v, vh * D );
+				s += dot( r_s, o_s );
+			}
+			return s;
+		};
+		const double fq = fd_rel( [&]( const Vec& x ) { return host3( x, k3, g3 ); }, q3, down( e_dq, q3.size() ) );
+		const double fk = fd_rel( [&]( const Vec& x ) { return host3( q3, x, g3 ); }, k3, down( e_dk, k3.size() ) );
+		const double fg = fd_rel( [&]( const Vec& x ) { return host3( q3, k3, x ); }, g3, down( e_dg, g3.size() ) );
+		std::snprintf( line, sizeof( line ), "%d sequences of %d rows in one call, chunks of %d: forward %.2e, gradients against each alone %.2e, dq %.2e, dk %.2e, dgate %.2e",
+			ns, L, ch, e3, eb3, fq, fk, fg );
+		check( e3 < 1e-5 && eb3 < 1e-5 && fq < 1e-3 && fk < 1e-3 && fg < 1e-3, line );
+		for ( float* p : { e_q, e_k, e_v, e_g, e_b, e_o, e_R, e_ck, e_scr, e_dq, e_dk, e_dv, e_dg, e_db } ) cudaFree( p );
+	}
 	// The gates
 	const int gr = 9;
 	const Vec a = randv( static_cast<size_t>( gr ) * vh, 2.0 ), b = randv( a.size() ), Alog = randv( vh, 0.5 ), dt = randv( vh, 0.5 );
