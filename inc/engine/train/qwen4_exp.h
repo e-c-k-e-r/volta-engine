@@ -66,12 +66,16 @@ size_t hc_scratch_floats( const HcWeights& w, int rows );
 void apply_forward( float* x, const float* post, const float* y, int rows, int hidden, int hc, backend::stream_t stream );
 void apply_backward( const float* dx, const float* post, const float* y, int rows, int hidden, int hc, float* dy, float* dpost, backend::stream_t stream );
 
-// Causal convolution over rows per channel with SiLU: s[t, c] = sum_j w[c, j] x[t - ( 3 - j ) dil, c] (rows before 0 are 0), y = silu( s ); s kept
-void conv4_silu_forward( const float* x, const float* w, int rows, int channels, int dil, float* s, float* y, backend::stream_t stream );
-void conv4_silu_backward( const float* s, const float* w, int rows, int channels, int dil, const float* dy, float* dx, backend::stream_t stream );
+// Causal convolution over rows per channel with SiLU: s[t, c] = sum_j w[c, j] x[t - ( 3 - j ) dil, c] (rows before their sequence's start
+// are 0; the rows hold sequences of seq_len, 0 meaning one), y = silu( s ); s kept
+void conv4_silu_forward( const float* x, const float* w, int rows, int channels, int dil, float* s, float* y, backend::stream_t stream,
+	int seq_len = 0 );
+void conv4_silu_backward( const float* s, const float* w, int rows, int channels, int dil, const float* dy, float* dx, backend::stream_t stream,
+	int seq_len = 0 );
 // Its weight gradient: dw[c, j] += sum_t dy[t, c] silu'( s[t, c] ) x[t - ( 3 - j ) dil, c] over the first `channels` columns of x, s and dy
 // (rows of stride ld)
-void conv4_silu_dw( const float* x, const float* s, const float* dy, int rows, int channels, int ld, int dil, float* dw, backend::stream_t stream );
+void conv4_silu_dw( const float* x, const float* s, const float* dy, int rows, int channels, int ld, int dil, float* dw, backend::stream_t stream,
+	int seq_len = 0 );
 
 // o = a * sigmoid( g ), elementwise; backward adds into da and dg
 void sigmoid_gate_forward( const float* a, const float* g, float* o, size_t n, backend::stream_t stream );
@@ -91,14 +95,16 @@ void slots_to_dense( const float* v, const int* ids, int rows, int k, int expert
 
 // GDN's gated delta rule per value head h (its key head h / ( vh / kh )), head dims 128: for each value column c,
 //   u = S_c . k_t, d = beta_t ( v_t[c] - e^gate_t u ), S_c = e^gate_t S_c + d k_t, o_t[c] = scale S_c . q_t
-// from a zero state. q, k [rows, kh, 128], v and o [rows, vh, 128], gate and beta [rows, vh]. The forward keeps the state before every
-// chunk-th row in ckpt; the backward recomputes each chunk from its checkpoint, last chunk first, and adds into dq, dk, dv, dgate, dbeta
-size_t gdn_ckpt_floats( int rows, int vh, int chunk );
-size_t gdn_scratch_floats( int vh, int chunk );
+// from a zero state at the start of each of the seqs sequences of rows / seqs. q, k [rows, kh, 128], v and o [rows, vh, 128], gate and beta
+// [rows, vh]. The forward keeps the state before every chunk-th row of a sequence in ckpt; the backward recomputes each chunk from its
+// checkpoint, last chunk first, and adds into dq, dk, dv, dgate, dbeta
+size_t gdn_ckpt_floats( int rows, int vh, int chunk, int seqs = 1 );
+size_t gdn_scratch_floats( int vh, int chunk, int seqs = 1 );
 void gdn_forward( const float* q, const float* k, const float* v, const float* gate, const float* beta, int rows, int kh, int vh, float scale, int chunk,
-	float* ckpt, float* o, backend::stream_t stream );
+	float* ckpt, float* o, backend::stream_t stream, int seqs = 1 );
 void gdn_backward( const float* q, const float* k, const float* v, const float* gate, const float* beta, int rows, int kh, int vh, float scale, int chunk,
-	const float* ckpt, const float* dout, float* dq, float* dk, float* dv, float* dgate, float* dbeta, float* scratch, backend::stream_t stream );
+	const float* ckpt, const float* dout, float* dq, float* dk, float* dv, float* dgate, float* dbeta, float* scratch, backend::stream_t stream,
+	int seqs = 1 );
 
 // GDN's gates from the dense projections a = X A^T, b = X B^T [rows, vh]: gate = -exp( A_log ) softplus( a + dt_bias ), beta = sigmoid( b );
 // backward to da, db (overwrites)
@@ -108,9 +114,9 @@ void gdn_gates_backward( const float* a, const float* b, const float* A_log, con
 	float* da, float* db, backend::stream_t stream );
 
 // Attention pieces. RoPE on the first rot_dim channels of every head (pairs i, i + rot_dim / 2, the inference kernel's frequencies and fast
-// sin / cos), the position of row r being r; in place, the backward rotating gradients back
-void rope_forward( float* x, int rows, int heads, int head_dim, int rot_dim, float base, backend::stream_t stream );
-void rope_backward( float* dx, int rows, int heads, int head_dim, int rot_dim, float base, backend::stream_t stream );
+// sin / cos), the position of row r being r % seq_len (0: rows); in place, the backward rotating gradients back
+void rope_forward( float* x, int rows, int heads, int head_dim, int rot_dim, float base, backend::stream_t stream, int seq_len = 0 );
+void rope_backward( float* dx, int rows, int heads, int head_dim, int rot_dim, float base, backend::stream_t stream, int seq_len = 0 );
 // q_proj's interleaved [rows, heads, 2 * head_dim] output into q and gate [rows, heads, head_dim], and the gradients back
 void unpack_q_gate( const float* qg, int rows, int heads, int head_dim, float* q, float* gate, backend::stream_t stream );
 void pack_q_gate( const float* dq, const float* dgate, int rows, int heads, int head_dim, float* dqg, backend::stream_t stream );
@@ -241,11 +247,11 @@ public:
 	int ranks() const { return ranks_; }
 	backend::stream_t stream() const;
 
-	// Layer L forward: x_out = layer( x_in ) over rows of one sequence from position 0 (x_in, x_out: the rank's rows; ple_k, ple_v: all rows).
-	// keep: the sublayer outputs are kept for the layer's next backward, which then skips their recompute
-	void forward( int L, const float* x_in, float* x_out, int rows, const float* ple_k, const float* ple_v, bool keep = false );
+	// Layer L forward: x_out = layer( x_in ) over rows of seqs sequences of rows / seqs, each from position 0 (x_in, x_out: the rank's rows;
+	// ple_k, ple_v: all rows). keep: the sublayer outputs are kept for the layer's next backward, which then skips their recompute
+	void forward( int L, const float* x_in, float* x_out, int rows, const float* ple_k, const float* ple_v, bool keep = false, int seqs = 1 );
 	// Its backward: dx_in (overwritten) from dx_out, the forward recomputed from x_in; scale gradients accumulate in every tensor's gu / gv
-	void backward( int L, const float* x_in, const float* dx_out, float* dx_in, int rows, const float* ple_k, const float* ple_v );
+	void backward( int L, const float* x_in, const float* dx_out, float* dx_in, int rows, const float* ple_k, const float* ple_v, int seqs = 1 );
 	// The head on the final streams x (the rank's rows): KL( teacher || model ) summed over all rows (returned; the teacher's rows: all);
 	// with dx, its gradient (overwritten) and the lm_head scale gradients
 	double head( const float* x, int rows, const Teacher& t, float* dx );

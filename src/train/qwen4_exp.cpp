@@ -379,6 +379,7 @@ struct Model::Impl {
 	bool head = false;
 	float* ones_f = nullptr;
 	int max_rows = 0;
+	int seqs = 1;               // the current layer call's sequences (its rows: seqs of T / seqs)
 	bool frozen = false;
 	bool fp16 = true;           // the tensor-core products (decoded cores in FP16)
 	bool timing = false;
@@ -624,7 +625,8 @@ struct Model::Impl {
 		scaled_linear_backward( *blas, sl( t, T, v ), X, Z, dY, rows, dX, sn, sk, add );
 	}
 
-	void run( int L, const float* x_in, float* x_out, int T, const float* ple_k, const float* ple_v, const float* dx_out, float* dx_in, bool keep );
+	void run( int L, const float* x_in, float* x_out, int T, const float* ple_k, const float* ple_v, const float* dx_out, float* dx_in, bool keep,
+		int n_seqs );
 	// Sublayers on mixed [T, hidden] (all rows) -> y [T, hidden], with ranks > 1 the rank's partial sum; with dy (all rows), the backward
 	// into dmix (+=, partial) after the forward
 	void gdn( Layer& lw, const float* mix, int T, float* y, const float* dy, float* dmix );
@@ -1190,8 +1192,9 @@ void Model::Impl::gdn( Layer& lw, const float* mix, int T, float* y, const float
 	blas->gemm( false, true, T, vh, H, 1.0f, mix, Al, 0.0f, a );
 	blas->gemm( false, true, T, vh, H, 1.0f, mix, Bl, 0.0f, b );
 	gdn_gates_forward( a, b, lw.A_log + lw.v0h, lw.dt_bias + lw.v0h, T, vh, gate, beta, st );
+	const int S = T / seqs;   // a sequence's rows
 	float *sconv = ws.f( TR * C ), *Cv = ws.f( TR * C );
-	conv4_silu_forward( QKV, lw.conv_l, T, C, 1, sconv, Cv, st );
+	conv4_silu_forward( QKV, lw.conv_l, T, C, 1, sconv, Cv, st, S );
 	float *qr = ws.f( TR * CQK ), *kr = ws.f( TR * CQK ), *v = ws.f( TR * CV ), *qn = ws.f( TR * CQK ), *kn = ws.f( TR * CQK );
 	float *iq = ws.f( TR * kh ), *ik = ws.f( TR * kh );
 	copy_cols( Cv, C, 0, qr, CQK, 0, T, CQK, false, st );
@@ -1199,10 +1202,10 @@ void Model::Impl::gdn( Layer& lw, const float* mix, int T, float* y, const float
 	copy_cols( Cv, C, 2 * CQK, v, CV, 0, T, CV, false, st );
 	rms_forward( qr, nullptr, 1, false, false, T * kh, D, 1e-6f, iq, qn, st );
 	rms_forward( kr, nullptr, 1, false, false, T * kh, D, 1e-6f, ik, kn, st );
-	float* ck = ws.f( gdn_ckpt_floats( T, vh, kGdnChunk ) );
+	float* ck = ws.f( gdn_ckpt_floats( T, vh, kGdnChunk, seqs ) );
 	float* oraw = ws.f( TR * CV );
 	const float scale = 1.0f / std::sqrt( static_cast<float>( D ) );
-	gdn_forward( qn, kn, v, gate, beta, T, kh, vh, scale, kGdnChunk, ck, oraw, st );
+	gdn_forward( qn, kn, v, gate, beta, T, kh, vh, scale, kGdnChunk, ck, oraw, st, seqs );
 	float *io = ws.f( TR * vh ), *o = ws.f( TR * CV ), *Zout = ws.f( TR * H );
 	gated_rms_forward( oraw, Zo, lw.norm, T * vh, D, 1e-6f, io, o, st );
 	lin_fwd( lw.out, Tout, o, T, Zout, y, vo );
@@ -1212,8 +1215,8 @@ void Model::Impl::gdn( Layer& lw, const float* mix, int T, float* y, const float
 		float *doraw = ws.fz( TR * CV, st ), *dZo = ws.fz( TR * CV, st );
 		gated_rms_backward( oraw, Zo, lw.norm, T * vh, D, io, dO, doraw, dZo, st, lw.g_norm );
 		float *dqn = ws.fz( TR * CQK, st ), *dkn = ws.fz( TR * CQK, st ), *dv = ws.fz( TR * CV, st ), *dgate = ws.fz( TR * vh, st ), *dbeta = ws.fz( TR * vh, st );
-		float* gscr = ws.f( gdn_scratch_floats( vh, kGdnChunk ) );
-		gdn_backward( qn, kn, v, gate, beta, T, kh, vh, scale, kGdnChunk, ck, doraw, dqn, dkn, dv, dgate, dbeta, gscr, st );
+		float* gscr = ws.f( gdn_scratch_floats( vh, kGdnChunk, seqs ) );
+		gdn_backward( qn, kn, v, gate, beta, T, kh, vh, scale, kGdnChunk, ck, doraw, dqn, dkn, dv, dgate, dbeta, gscr, st, seqs );
 		// dC [T, C]: the q, k and v column blocks (the norms' gradients through blocks of their own)
 		float* dC = ws.f( TR * C );
 		float* dkr = ws.fz( TR * CQK, st );
@@ -1224,11 +1227,11 @@ void Model::Impl::gdn( Layer& lw, const float* mix, int T, float* y, const float
 		copy_cols( dkr, CQK, 0, dC, C, CQK, T, CQK, false, st );
 		copy_cols( dv, CV, 0, dC, C, 2 * CQK, T, CV, false, st );
 		float* dQKV = ws.fz( TR * C, st );
-		conv4_silu_backward( sconv, lw.conv_l, T, C, 1, dC, dQKV, st );
+		conv4_silu_backward( sconv, lw.conv_l, T, C, 1, dC, dQKV, st, S );
 		if ( lw.g_conv ) {
 			for ( int j = 0; j < 3; ++j ) {
 				const ConvBlock bl = conv_block( lw, j );
-				conv4_silu_dw( QKV + bl.to, sconv + bl.to, dC + bl.to, T, static_cast<int>( bl.n ), C, 1, lw.g_conv + bl.from * 4, st );
+				conv4_silu_dw( QKV + bl.to, sconv + bl.to, dC + bl.to, T, static_cast<int>( bl.n ), C, 1, lw.g_conv + bl.from * 4, st, S );
 			}
 		}
 		float *da = ws.f( TR * vh ), *db = ws.f( TR * vh );
@@ -1274,11 +1277,17 @@ void Model::Impl::attention( Layer& lw, const float* mix, int T, float* y, const
 	unpack_q_gate( QG, T, hq, d, q, gate, st );
 	rms_forward( q, lw.q_norm, 1, true, true, T * hq, d, cfg.eps, iq, qn, st );
 	rms_forward( K, lw.k_norm, 1, true, true, T * hk, d, cfg.eps, ik, kn, st );
-	rope_forward( qn, T, hq, d, cfg.rot_dim, cfg.rope_theta, st );
-	rope_forward( kn, T, hk, d, cfg.rot_dim, cfg.rope_theta, st );
-	float *S = ws.f( TR * TR ), *O = ws.f( TR * QD ), *Gd = ws.f( TR * QD ), *Zo = ws.f( TR * H );
+	// per sequence of SL rows: RoPE positions from its start, the causal attention within it
+	const int SL = T / seqs;
+	const size_t SR = static_cast<size_t>( SL );
+	rope_forward( qn, T, hq, d, cfg.rot_dim, cfg.rope_theta, st, SL );
+	rope_forward( kn, T, hk, d, cfg.rot_dim, cfg.rope_theta, st, SL );
+	float *S = ws.f( SR * SR ), *O = ws.f( TR * QD ), *Gd = ws.f( TR * QD ), *Zo = ws.f( TR * H );
 	const float scale = 1.0f / std::sqrt( static_cast<float>( d ) );
-	attention_forward( *blas, qn, kn, V, T, hq, hk, d, scale, S, O );
+	for ( int s = 0; s < seqs; ++s ) {
+		const size_t r0 = static_cast<size_t>( s ) * SR;
+		attention_forward( *blas, qn + r0 * QD, kn + r0 * KD, V + r0 * KD, SL, hq, hk, d, scale, S, O + r0 * QD );
+	}
 	sigmoid_gate_forward( O, gate, Gd, TR * QD, st );
 	lin_fwd( lw.o, To, Gd, T, Zo, y, vo );
 	if ( dy ) {
@@ -1286,10 +1295,14 @@ void Model::Impl::attention( Layer& lw, const float* mix, int T, float* y, const
 		lin_bwd( lw.o, To, Gd, Zo, dy, T, dGd, false, vo );
 		float *dO = ws.fz( TR * QD, st ), *dgate = ws.fz( TR * QD, st );
 		sigmoid_gate_backward( O, gate, dGd, dO, dgate, TR * QD, st );
-		float *dqn = ws.fz( TR * QD, st ), *dkn = ws.fz( TR * KD, st ), *dV = ws.fz( TR * KD, st ), *dP = ws.f( TR * TR );
-		attention_backward( *blas, qn, kn, V, T, hq, hk, d, scale, dO, dqn, dkn, dV, S, dP );
-		rope_backward( dqn, T, hq, d, cfg.rot_dim, cfg.rope_theta, st );
-		rope_backward( dkn, T, hk, d, cfg.rot_dim, cfg.rope_theta, st );
+		float *dqn = ws.fz( TR * QD, st ), *dkn = ws.fz( TR * KD, st ), *dV = ws.fz( TR * KD, st ), *dP = ws.f( SR * SR );
+		for ( int s = 0; s < seqs; ++s ) {
+			const size_t r0 = static_cast<size_t>( s ) * SR;
+			attention_backward( *blas, qn + r0 * QD, kn + r0 * KD, V + r0 * KD, SL, hq, hk, d, scale, dO + r0 * QD, dqn + r0 * QD, dkn + r0 * KD,
+				dV + r0 * KD, S, dP );
+		}
+		rope_backward( dqn, T, hq, d, cfg.rot_dim, cfg.rope_theta, st, SL );
+		rope_backward( dkn, T, hk, d, cfg.rot_dim, cfg.rope_theta, st, SL );
 		float *dq = ws.fz( TR * QD, st ), *dK = ws.fz( TR * KD, st );
 		rms_backward( q, lw.q_norm, 1, true, true, T * hq, d, iq, dqn, dq, st, lw.g_q_norm );
 		rms_backward( K, lw.k_norm, 1, true, true, T * hk, d, ik, dkn, dK, st, lw.g_k_norm );
@@ -1302,10 +1315,13 @@ void Model::Impl::attention( Layer& lw, const float* mix, int T, float* y, const
 	ws.off = mark;
 }
 
-void Model::Impl::run( int L, const float* x_in, float* x_out, int T, const float* ple_k, const float* ple_v, const float* dx_out, float* dx_in, bool keep ) {
+void Model::Impl::run( int L, const float* x_in, float* x_out, int T, const float* ple_k, const float* ple_v, const float* dx_out, float* dx_in, bool keep,
+	int n_seqs ) {
 	Layer& lw = layers[L - first];
 	const bool bwd = dx_out != nullptr;
 	ENGINE_ASSERT( T % ranks == 0 && T <= max_rows, "qwen4_exp training model: the rows exceed the workspace or do not split over the ranks" );
+	ENGINE_ASSERT( n_seqs > 0 && T % n_seqs == 0, "qwen4_exp training model: the rows do not hold whole sequences" );
+	seqs = n_seqs;
 	ws.reset( st );
 	unpack( lw );
 	const int H = cfg.hidden, hc = cfg.hc, Tl = T / ranks;
@@ -1339,7 +1355,7 @@ void Model::Impl::run( int L, const float* x_in, float* x_out, int T, const floa
 		ple_gate_forward( g, sg, TR * hc, st );
 		apply_forward( gated, sg, ple_v, T, H, hc, st );
 		rms_forward( gated, lw.ple_nc, hc, true, true, T * hc, H, cfg.eps, ip, pn, st );
-		conv4_silu_forward( pn, lw.ple_conv, T, static_cast<int>( flat ), 3, ps, act, st );
+		conv4_silu_forward( pn, lw.ple_conv, T, static_cast<int>( flat ), 3, ps, act, st, T / seqs );
 		copy_cols( gated, static_cast<int>( flat ), 0, x0f, static_cast<int>( flat ), 0, T, static_cast<int>( flat ), true, st );
 		copy_cols( act, static_cast<int>( flat ), 0, x0f, static_cast<int>( flat ), 0, T, static_cast<int>( flat ), true, st );
 		if ( ranks > 1 ) CUDA_CHECK( cudaMemcpyAsync( x0, x0f + row0 * flat, TL * flat * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
@@ -1436,8 +1452,8 @@ void Model::Impl::run( int L, const float* x_in, float* x_out, int T, const floa
 	float* dxf = ranks == 1 ? dx_in : ws.f( TR * flat );
 	CUDA_CHECK( cudaMemcpyAsync( dxf, dx0f, TR * flat * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
 	float* dpn = ws.fz( TR * flat, st );
-	conv4_silu_backward( ps, lw.ple_conv, T, static_cast<int>( flat ), 3, dx0f, dpn, st );
-	if ( lw.g_ple_conv ) conv4_silu_dw( pn, ps, dx0f, T, static_cast<int>( flat ), static_cast<int>( flat ), 3, lw.g_ple_conv, st );
+	conv4_silu_backward( ps, lw.ple_conv, T, static_cast<int>( flat ), 3, dx0f, dpn, st, T / seqs );
+	if ( lw.g_ple_conv ) conv4_silu_dw( pn, ps, dx0f, T, static_cast<int>( flat ), static_cast<int>( flat ), 3, lw.g_ple_conv, st, T / seqs );
 	float* dgated = ws.f( TR * flat );
 	CUDA_CHECK( cudaMemcpyAsync( dgated, dx0f, TR * flat * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
 	rms_backward( gated, lw.ple_nc, hc, true, true, T * hc, H, ip, dpn, dgated, st, lw.g_ple_nc );
@@ -1456,14 +1472,14 @@ void Model::Impl::run( int L, const float* x_in, float* x_out, int T, const floa
 	phase( "ple bwd" );
 }
 
-void Model::forward( int L, const float* x_in, float* x_out, int rows, const float* ple_k, const float* ple_v, bool keep ) {
+void Model::forward( int L, const float* x_in, float* x_out, int rows, const float* ple_k, const float* ple_v, bool keep, int seqs ) {
 	CUDA_CHECK( cudaSetDevice( device_ ) );
-	p_->run( L, x_in, x_out, rows, ple_k, ple_v, nullptr, nullptr, keep );
+	p_->run( L, x_in, x_out, rows, ple_k, ple_v, nullptr, nullptr, keep, seqs );
 }
 
-void Model::backward( int L, const float* x_in, const float* dx_out, float* dx_in, int rows, const float* ple_k, const float* ple_v ) {
+void Model::backward( int L, const float* x_in, const float* dx_out, float* dx_in, int rows, const float* ple_k, const float* ple_v, int seqs ) {
 	CUDA_CHECK( cudaSetDevice( device_ ) );
-	p_->run( L, x_in, nullptr, rows, ple_k, ple_v, dx_out, dx_in, false );
+	p_->run( L, x_in, nullptr, rows, ple_k, ple_v, dx_out, dx_in, false, seqs );
 }
 
 double Model::head( const float* x, int rows, const Teacher& t, float* dx ) {

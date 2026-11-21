@@ -2,7 +2,7 @@
 // its own forward: random input streams (and n-gram rows for the PLE layer), the loss sum( R * layer( x ) ); the input gradient on sampled
 // entries and the scale gradients of sampled channels (the routing held at the unperturbed input's selection) of several tensors (attention or GDN projections, the shared expert, routed experts),
 // and the weight gradients of the norms, the small dense tensors and the router (trainable here; the forward checked against their FP16
-// copies).
+// copies); then two sequences through one call against each alone.
 //   TRAIN_MODEL_DIR=<EXL3 Flash-Next checkpoint> test_train_qwen4_exp_layer [layer ...]   (default: 1, the PLE + GDN layer, and 3, attention)
 #include "engine/config.h"
 #include "engine/train/qwen4_exp.h"
@@ -249,6 +249,73 @@ int main( int argc, char** argv ) {
 			std::printf( "    (the worst scale gradient: %s)\n", at.c_str() );
 		}
 		for ( float* p : { x, y, R, dx, pk, pv } ) cudaFree( p );
+		{
+			// Two sequences of 100 rows (GDN chunks of 64: one whole and one part each) through one call against each alone: the layer's change,
+			// the input gradient and every gradient of the tensors (the two alone accumulating)
+			const int Ts = 100, Tb = 2 * Ts;
+			q::Model mb;
+			mb.set_train_dense( true );
+			mb.set_train_router( true );
+			if ( !mb.load( dir, L, L + 1, 0, Tb ) ) return 1;
+			// FP32 products: with FP16 ones the roundings turn the libraries' other summation orders at other row counts into differences
+			// of the FP16 path's own size
+			mb.set_fp16( false );
+			const size_t nb = static_cast<size_t>( Tb ) * flat, ns = static_cast<size_t>( Ts ) * flat, H = static_cast<size_t>( c.hidden );
+			std::vector<float> bx( nb ), br( nb ), bk( nb ), bv( Tb * H );
+			for ( auto& v : bx ) v = nd( rng );
+			for ( auto& v : br ) v = nd( rng );
+			for ( auto& v : bk ) v = nd( rng );
+			for ( auto& v : bv ) v = 0.3f * nd( rng );
+			float *xb, *yb, *Rb, *dxb, *pkb, *pvb;
+			for ( float** p : { &xb, &yb, &Rb, &dxb, &pkb } ) CUDA_CHECK( cudaMalloc( p, nb * sizeof( float ) ) );
+			CUDA_CHECK( cudaMalloc( &pvb, bv.size() * sizeof( float ) ) );
+			CUDA_CHECK( cudaMemcpy( xb, bx.data(), nb * sizeof( float ), cudaMemcpyHostToDevice ) );
+			CUDA_CHECK( cudaMemcpy( Rb, br.data(), nb * sizeof( float ), cudaMemcpyHostToDevice ) );
+			CUDA_CHECK( cudaMemcpy( pkb, bk.data(), nb * sizeof( float ), cudaMemcpyHostToDevice ) );
+			CUDA_CHECK( cudaMemcpy( pvb, bv.data(), bv.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+			auto grads = [&]() {
+				std::vector<float> all;
+				for ( q::Tuned* t : mb.tensors() ) {
+					const std::vector<float> u = down( t->gu, t->k ), v = down( t->gv, t->n );
+					all.insert( all.end(), u.begin(), u.end() );
+					all.insert( all.end(), v.begin(), v.end() );
+				}
+				for ( q::Dense* d : mb.dense_tensors() ) {
+					const std::vector<float> g2 = down( d->g, d->n );
+					all.insert( all.end(), g2.begin(), g2.end() );
+				}
+				return all;
+			};
+			auto rel = []( const std::vector<float>& a, const std::vector<float>& b ) {
+				double d = 0.0, n = 0.0;
+				for ( size_t i = 0; i < a.size(); ++i ) {
+					d += ( a[i] - b[i] ) * ( a[i] - b[i] );
+					n += static_cast<double>( b[i] ) * b[i];
+				}
+				return std::sqrt( d / ( n + 1e-30 ) );
+			};
+			mb.forward( L, xb, yb, Tb, pkb, pvb, true, 2 );
+			std::vector<float> cb = down( yb, nb );
+			mb.zero_grads();
+			mb.backward( L, xb, Rb, dxb, Tb, pkb, pvb, 2 );
+			const std::vector<float> gb = down( dxb, nb ), wb = grads();
+			mb.zero_grads();
+			for ( int s = 0; s < 2; ++s ) {
+				const size_t o = s * ns, ov = static_cast<size_t>( s ) * Ts * H;
+				mb.forward( L, xb + o, yb + o, Ts, pkb + o, pvb + ov, true );
+				mb.backward( L, xb + o, Rb + o, dxb + o, Ts, pkb + o, pvb + ov );
+			}
+			std::vector<float> c1 = down( yb, nb );
+			const std::vector<float> g1 = down( dxb, nb ), w1 = grads();
+			for ( size_t i = 0; i < nb; ++i ) {
+				cb[i] -= bx[i];
+				c1[i] -= bx[i];
+			}
+			std::snprintf( line, sizeof( line ), "two sequences in one call against each alone: the layer's change %.3g, input gradient %.3g, weights' %.3g",
+				rel( cb, c1 ), rel( gb, g1 ), rel( wb, w1 ) );
+			check( rel( cb, c1 ) < 1e-5 && rel( gb, g1 ) < 1e-5 && rel( wb, w1 ) < 1e-5, line );
+			for ( float* p : { xb, yb, Rb, dxb, pkb, pvb } ) cudaFree( p );
+		}
 	}
 	std::printf( "[%c] test_train_qwen4_exp_layer: %d failure(s)\n", fails ? '-' : '+', fails );
 	return fails ? 1 : 0;

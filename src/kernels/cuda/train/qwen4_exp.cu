@@ -158,13 +158,14 @@ __global__ void k_apply_bwd_dpost( const float* dx, const float* y, int hidden, 
 	if ( threadIdx.x == 0 ) dpost[rs] = acc;
 }
 
-__global__ void k_conv4_fwd( const float* x, const float* w, int rows, int channels, int dil, float* s, float* y ) {
+// The causal convolutions see their own sequence only: rows in sequences of L, a tap before its sequence's first row is 0
+__global__ void k_conv4_fwd( const float* x, const float* w, int rows, int channels, int dil, int L, float* s, float* y ) {
 	Q4E_LOOP( i, (size_t) rows * channels ) {
 		const int t = static_cast<int>( i / channels ), c = static_cast<int>( i % channels );
 		float acc = 0.0f;
 		for ( int j = 0; j < 4; ++j ) {
 			const int src = t - ( 3 - j ) * dil;
-			if ( src >= 0 ) acc += w[static_cast<size_t>( c ) * 4 + j] * x[static_cast<size_t>( src ) * channels + c];
+			if ( t % L >= ( 3 - j ) * dil ) acc += w[static_cast<size_t>( c ) * 4 + j] * x[static_cast<size_t>( src ) * channels + c];
 		}
 		s[i] = acc;
 		y[i] = acc * sigmoidf_( acc );
@@ -172,13 +173,13 @@ __global__ void k_conv4_fwd( const float* x, const float* w, int rows, int chann
 }
 
 // dx[t, c] += sum_j w[c, j] ds[t + ( 3 - j ) dil, c], ds = dy silu'( s )
-__global__ void k_conv4_bwd( const float* s, const float* w, int rows, int channels, int dil, const float* dy, float* dx ) {
+__global__ void k_conv4_bwd( const float* s, const float* w, int rows, int channels, int dil, int L, const float* dy, float* dx ) {
 	Q4E_LOOP( i, (size_t) rows * channels ) {
 		const int t = static_cast<int>( i / channels ), c = static_cast<int>( i % channels );
 		float acc = 0.0f;
 		for ( int j = 0; j < 4; ++j ) {
 			const int dst = t + ( 3 - j ) * dil;
-			if ( dst < rows ) {
+			if ( t % L + ( 3 - j ) * dil < L ) {
 				const size_t o = static_cast<size_t>( dst ) * channels + c;
 				const float sg = sigmoidf_( s[o] );
 				acc += w[static_cast<size_t>( c ) * 4 + j] * dy[o] * sg * ( 1.0f + s[o] * ( 1.0f - sg ) );
@@ -188,20 +189,23 @@ __global__ void k_conv4_bwd( const float* s, const float* w, int rows, int chann
 	}
 }
 
-// dw[c, j] += sum_t ds[t, c] x[t - ( 3 - j ) dil, c], ds = dy silu'( s ); x, s, dy rows of stride ld, channels c < n (one thread each)
-__global__ void k_conv4_dw( const float* x, const float* s, const float* dy, int rows, int n, int ld, int dil, float* dw ) {
+// dw[c, j] += sum_t ds[t, c] x[t - ( 3 - j ) dil, c], ds = dy silu'( s ); x, s, dy rows of stride ld, channels c < n (a thread each), the
+// rows in blockIdx.y's span of kConvDwRows (the spans' sums added atomically)
+constexpr int kConvDwRows = 64;
+__global__ void k_conv4_dw( const float* x, const float* s, const float* dy, int rows, int n, int ld, int dil, int L, float* dw ) {
 	const int c = blockIdx.x * blockDim.x + threadIdx.x;
 	if ( c >= n ) return;
 	float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-	for ( int t = 0; t < rows; ++t ) {
+	const int t1 = min( rows, static_cast<int>( blockIdx.y + 1 ) * kConvDwRows );
+	for ( int t = blockIdx.y * kConvDwRows; t < t1; ++t ) {
 		const size_t o = static_cast<size_t>( t ) * ld + c;
 		const float sg = sigmoidf_( s[o] ), ds = dy[o] * sg * ( 1.0f + s[o] * ( 1.0f - sg ) );
 		for ( int j = 0; j < 4; ++j ) {
 			const int src = t - ( 3 - j ) * dil;
-			if ( src >= 0 ) acc[j] += ds * x[static_cast<size_t>( src ) * ld + c];
+			if ( t % L >= ( 3 - j ) * dil ) acc[j] += ds * x[static_cast<size_t>( src ) * ld + c];
 		}
 	}
-	for ( int j = 0; j < 4; ++j ) dw[static_cast<size_t>( c ) * 4 + j] += acc[j];
+	for ( int j = 0; j < 4; ++j ) atomicAdd( &dw[static_cast<size_t>( c ) * 4 + j], acc[j] );
 }
 
 __global__ void k_sig_gate( const float* a, const float* g, float* o, size_t n ) {
@@ -268,15 +272,17 @@ __device__ __forceinline__ float warp_sum_( float v ) {
 	return v;
 }
 
-// Block (head, 16 columns), a warp per column holding its state row in 4 values per lane (element r * 32 + lane)
+// Block (head, 16 columns, sequence), a warp per column holding its state row in 4 values per lane (element r * 32 + lane); the rows hold
+// gridDim.z sequences of rows / gridDim.z, each starting from a zero state
 __global__ __launch_bounds__( GW * 32 )
 void k_gdn_fwd( const float* q, const float* k, const float* v, const float* gate, const float* beta, int rows, int kh, int vh, float scale, int chunk,
 	float* ckpt, float* o ) {
 	const int h = blockIdx.x, c = blockIdx.y * GW + threadIdx.x / 32, lane = threadIdx.x & 31, khh = h / ( vh / kh );
+	const int L = rows / gridDim.z, nch = ( L + chunk - 1 ) / chunk, s0 = blockIdx.z * L;
 	float S[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-	for ( int t = 0; t < rows; ++t ) {
-		if ( t % chunk == 0 ) {
-			float* ck = ckpt + ( ( static_cast<size_t>( t / chunk ) * vh + h ) * GD + c ) * GD;
+	for ( int t = s0; t < s0 + L; ++t ) {
+		if ( ( t - s0 ) % chunk == 0 ) {
+			float* ck = ckpt + ( ( ( static_cast<size_t>( blockIdx.z ) * nch + ( t - s0 ) / chunk ) * vh + h ) * GD + c ) * GD;
 			for ( int r = 0; r < 4; ++r ) ck[r * 32 + lane] = S[r];
 		}
 		const float* kt = k + ( static_cast<size_t>( t ) * kh + khh ) * GD;
@@ -299,16 +305,19 @@ void k_gdn_fwd( const float* q, const float* k, const float* v, const float* gat
 	}
 }
 
-// One chunk of the backward: the chunk's states recomputed from its checkpoint into sb, then its rows in reverse with dS carried in carry
+// One chunk of the backward (chunk n of each sequence): the chunk's states recomputed from its checkpoint into sb, then its rows in reverse
+// with dS carried in carry
 __global__ __launch_bounds__( GW * 32 )
 void k_gdn_bwd( const float* q, const float* k, const float* v, const float* gate, const float* beta, int rows, int kh, int vh, float scale, int chunk,
 	int n, const float* ckpt, const float* dout, float* dq, float* dk, float* dv, float* dgate, float* dbeta, float* sbuf, float* carry ) {
 	__shared__ float s_dq[GD], s_dk[GD], s_g[2];
 	const int h = blockIdx.x, c = blockIdx.y * GW + threadIdx.x / 32, lane = threadIdx.x & 31, khh = h / ( vh / kh );
-	const int t0 = n * chunk, t1 = min( rows, t0 + chunk );
-	float* sb = sbuf + ( static_cast<size_t>( h ) * GD + c ) * chunk * GD;
+	const int L = rows / gridDim.z, nch = ( L + chunk - 1 ) / chunk, s0 = blockIdx.z * L;
+	const int t0 = s0 + n * chunk, t1 = min( s0 + L, t0 + chunk );
+	const size_t hs = ( static_cast<size_t>( blockIdx.z ) * vh + h ) * GD + c;
+	float* sb = sbuf + hs * chunk * GD;
 	float S[4];
-	const float* ck = ckpt + ( ( static_cast<size_t>( n ) * vh + h ) * GD + c ) * GD;
+	const float* ck = ckpt + ( ( ( static_cast<size_t>( blockIdx.z ) * nch + n ) * vh + h ) * GD + c ) * GD;
 	for ( int r = 0; r < 4; ++r ) S[r] = ck[r * 32 + lane];
 	for ( int t = t0; t < t1; ++t ) {
 		for ( int r = 0; r < 4; ++r ) sb[static_cast<size_t>( t - t0 ) * GD + r * 32 + lane] = S[r];
@@ -324,7 +333,7 @@ void k_gdn_bwd( const float* q, const float* k, const float* v, const float* gat
 		for ( int r = 0; r < 4; ++r ) S[r] = g * S[r] + d * kk[r];
 	}
 	float dS[4];
-	float* cy = carry + ( static_cast<size_t>( h ) * GD + c ) * GD;
+	float* cy = carry + hs * GD;
 	for ( int r = 0; r < 4; ++r ) dS[r] = cy[r * 32 + lane];
 	for ( int t = t1 - 1; t >= t0; --t ) {
 		if ( threadIdx.x < GD ) { s_dq[threadIdx.x] = 0.0f; s_dk[threadIdx.x] = 0.0f; }
@@ -401,12 +410,12 @@ __global__ void k_gdn_gates_bwd( const float* a, const float* b, const float* A_
 
 // ---- attention ----
 // One thread per (row, head, pair)
-__global__ void k_rope( float* x, int rows, int heads, int head_dim, int rot_dim, float base, float sign ) {
+__global__ void k_rope( float* x, int rows, int heads, int head_dim, int rot_dim, float base, float sign, int seq_len ) {
 	const int pairs = rot_dim / 2;
 	Q4E_LOOP( i, (size_t) rows * heads * pairs ) {
 		const int p = static_cast<int>( i % pairs );
 		const size_t rh = i / pairs;
-		const int r = static_cast<int>( rh / heads );
+		const int r = static_cast<int>( rh / heads ) % seq_len;   // the position in its sequence
 		float c, s;
 		engine::math::rope_cos_sin<true>( r, p, rot_dim, base, c, s );
 		s *= sign;
@@ -861,16 +870,20 @@ void apply_backward( const float* dx, const float* post, const float* y, int row
 	k_apply_bwd_dpost<<<rows * hc, 256, 0, cu( stream )>>>( dx, y, hidden, hc, dpost );
 }
 
-void conv4_silu_forward( const float* x, const float* w, int rows, int channels, int dil, float* s, float* y, backend::stream_t stream ) {
-	k_conv4_fwd<<<blocks_for( (size_t) rows * channels ), 256, 0, cu( stream )>>>( x, w, rows, channels, dil, s, y );
+void conv4_silu_forward( const float* x, const float* w, int rows, int channels, int dil, float* s, float* y, backend::stream_t stream, int seq_len ) {
+	k_conv4_fwd<<<blocks_for( (size_t) rows * channels ), 256, 0, cu( stream )>>>( x, w, rows, channels, dil, seq_len > 0 ? seq_len : rows, s, y );
 }
 
-void conv4_silu_backward( const float* s, const float* w, int rows, int channels, int dil, const float* dy, float* dx, backend::stream_t stream ) {
-	k_conv4_bwd<<<blocks_for( (size_t) rows * channels ), 256, 0, cu( stream )>>>( s, w, rows, channels, dil, dy, dx );
+void conv4_silu_backward( const float* s, const float* w, int rows, int channels, int dil, const float* dy, float* dx, backend::stream_t stream,
+	int seq_len ) {
+	k_conv4_bwd<<<blocks_for( (size_t) rows * channels ), 256, 0, cu( stream )>>>( s, w, rows, channels, dil, seq_len > 0 ? seq_len : rows, dy, dx );
 }
 
-void conv4_silu_dw( const float* x, const float* s, const float* dy, int rows, int channels, int ld, int dil, float* dw, backend::stream_t stream ) {
-	if ( channels > 0 ) k_conv4_dw<<<( channels + 127 ) / 128, 128, 0, cu( stream )>>>( x, s, dy, rows, channels, ld, dil, dw );
+void conv4_silu_dw( const float* x, const float* s, const float* dy, int rows, int channels, int ld, int dil, float* dw, backend::stream_t stream,
+	int seq_len ) {
+	if ( channels > 0 && rows > 0 )
+		k_conv4_dw<<<dim3( ( channels + 127 ) / 128, ( rows + kConvDwRows - 1 ) / kConvDwRows ), 128, 0, cu( stream )>>>( x, s, dy, rows, channels, ld, dil,
+			seq_len > 0 ? seq_len : rows, dw );
 }
 
 void sigmoid_gate_forward( const float* a, const float* g, float* o, size_t n, backend::stream_t stream ) {
@@ -899,28 +912,30 @@ void slots_to_dense( const float* v, const int* ids, int rows, int k, int expert
 	if ( rows > 0 ) k_slots_to_dense<<<blocks_for( (size_t) rows * k ), 256, 0, cu( stream )>>>( v, ids, rows, k, experts, out );
 }
 
-size_t gdn_ckpt_floats( int rows, int vh, int chunk ) {
-	return static_cast<size_t>( ( rows + chunk - 1 ) / chunk ) * vh * GD * GD;
+size_t gdn_ckpt_floats( int rows, int vh, int chunk, int seqs ) {
+	return static_cast<size_t>( seqs ) * ( ( rows / seqs + chunk - 1 ) / chunk ) * vh * GD * GD;
 }
 
-size_t gdn_scratch_floats( int vh, int chunk ) {
-	return static_cast<size_t>( vh ) * GD * GD * ( chunk + 1 );
+size_t gdn_scratch_floats( int vh, int chunk, int seqs ) {
+	return static_cast<size_t>( seqs ) * vh * GD * GD * ( chunk + 1 );
 }
 
 void gdn_forward( const float* q, const float* k, const float* v, const float* gate, const float* beta, int rows, int kh, int vh, float scale, int chunk,
-	float* ckpt, float* o, backend::stream_t stream ) {
+	float* ckpt, float* o, backend::stream_t stream, int seqs ) {
 	ENGINE_ASSERT( vh % kh == 0, "gdn_forward: value heads must be a multiple of the key heads" );
-	k_gdn_fwd<<<dim3( vh, GD / GW ), GW * 32, 0, cu( stream )>>>( q, k, v, gate, beta, rows, kh, vh, scale, chunk, ckpt, o );
+	ENGINE_ASSERT( seqs > 0 && rows % seqs == 0, "gdn_forward: the rows must hold whole sequences" );
+	k_gdn_fwd<<<dim3( vh, GD / GW, seqs ), GW * 32, 0, cu( stream )>>>( q, k, v, gate, beta, rows, kh, vh, scale, chunk, ckpt, o );
 }
 
 void gdn_backward( const float* q, const float* k, const float* v, const float* gate, const float* beta, int rows, int kh, int vh, float scale, int chunk,
-	const float* ckpt, const float* dout, float* dq, float* dk, float* dv, float* dgate, float* dbeta, float* scratch, backend::stream_t stream ) {
+	const float* ckpt, const float* dout, float* dq, float* dk, float* dv, float* dgate, float* dbeta, float* scratch, backend::stream_t stream, int seqs ) {
+	ENGINE_ASSERT( seqs > 0 && rows % seqs == 0, "gdn_backward: the rows must hold whole sequences" );
 	float* sbuf = scratch;
-	float* carry = scratch + static_cast<size_t>( vh ) * GD * GD * chunk;
-	CUDA_CHECK( cudaMemsetAsync( carry, 0, static_cast<size_t>( vh ) * GD * GD * sizeof( float ), cu( stream ) ) );
-	for ( int n = ( rows + chunk - 1 ) / chunk - 1; n >= 0; --n ) {
-		k_gdn_bwd<<<dim3( vh, GD / GW ), GW * 32, 0, cu( stream )>>>( q, k, v, gate, beta, rows, kh, vh, scale, chunk, n, ckpt, dout, dq, dk, dv, dgate, dbeta,
-			sbuf, carry );
+	float* carry = scratch + static_cast<size_t>( seqs ) * vh * GD * GD * chunk;
+	CUDA_CHECK( cudaMemsetAsync( carry, 0, static_cast<size_t>( seqs ) * vh * GD * GD * sizeof( float ), cu( stream ) ) );
+	for ( int n = ( rows / seqs + chunk - 1 ) / chunk - 1; n >= 0; --n ) {
+		k_gdn_bwd<<<dim3( vh, GD / GW, seqs ), GW * 32, 0, cu( stream )>>>( q, k, v, gate, beta, rows, kh, vh, scale, chunk, n, ckpt, dout, dq, dk, dv,
+			dgate, dbeta, sbuf, carry );
 	}
 }
 
@@ -934,12 +949,14 @@ void gdn_gates_backward( const float* a, const float* b, const float* A_log, con
 	k_gdn_gates_bwd<<<blocks_for( (size_t) rows * vh ), 256, 0, cu( stream )>>>( a, b, A_log, dt_bias, rows, vh, dgate, dbeta, da, db );
 }
 
-void rope_forward( float* x, int rows, int heads, int head_dim, int rot_dim, float base, backend::stream_t stream ) {
-	k_rope<<<blocks_for( (size_t) rows * heads * ( rot_dim / 2 ) ), 256, 0, cu( stream )>>>( x, rows, heads, head_dim, rot_dim, base, 1.0f );
+void rope_forward( float* x, int rows, int heads, int head_dim, int rot_dim, float base, backend::stream_t stream, int seq_len ) {
+	k_rope<<<blocks_for( (size_t) rows * heads * ( rot_dim / 2 ) ), 256, 0, cu( stream )>>>( x, rows, heads, head_dim, rot_dim, base, 1.0f,
+		seq_len > 0 ? seq_len : rows );
 }
 
-void rope_backward( float* dx, int rows, int heads, int head_dim, int rot_dim, float base, backend::stream_t stream ) {
-	k_rope<<<blocks_for( (size_t) rows * heads * ( rot_dim / 2 ) ), 256, 0, cu( stream )>>>( dx, rows, heads, head_dim, rot_dim, base, -1.0f );
+void rope_backward( float* dx, int rows, int heads, int head_dim, int rot_dim, float base, backend::stream_t stream, int seq_len ) {
+	k_rope<<<blocks_for( (size_t) rows * heads * ( rot_dim / 2 ) ), 256, 0, cu( stream )>>>( dx, rows, heads, head_dim, rot_dim, base, -1.0f,
+		seq_len > 0 ? seq_len : rows );
 }
 
 void unpack_q_gate( const float* qg, int rows, int heads, int head_dim, float* q, float* gate, backend::stream_t stream ) {
