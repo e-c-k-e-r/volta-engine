@@ -9,8 +9,9 @@
 // FP32 instead of on the tensor cores; --norms 0 keeps the norms' weights as they are; --dense 1 trains the small dense tensors too (the
 // hyper-connection sites' inject mixes, GDN's in_proj_a / b, A_log, dt_bias and convolution, the shared expert's gate, PLE's convolution;
 // additive deltas like the norms, written back as FP16) at --dense-lr times the learning rate (a row of them feeds a dot product, so
-// Adam's per-entry step adds up over its width); --router 1 trains the routers' weights at that rate as well. --train N trains on the first
-// N sequences only
+// Adam's per-entry step adds up over its width); --router 1 trains the routers' weights at that rate as well. --gains 1 trains the tensors'
+// 8-bit tile gains (straight through: FP32 values, the codes set from them after each step, written back as codes) at --gains-lr times the
+// learning rate. --train N trains on the first N sequences only
 // (the held-out ones unchanged: how the gain grows with the data). --adam-bits 8 keeps Adam's moments as 8-bit block-wise codes; --opt-host 1
 // keeps the optimizer's state in pinned host memory (the devices hold the current values, their gradients and one part of the state: each
 // step streams the state through in parts). --seqs N runs up to N of a step's --batch sequences (and of the held-out ones) through each
@@ -18,7 +19,7 @@
 // component is logged after the first step.
 //
 //   volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] [--fp16 1]
-//             [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--steps 64] [--batch 4] [--seqs 1] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
+//             [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--hc 0] [--hc-lr 0.1] [--gains 0] [--gains-lr 1] [--steps 64] [--batch 4] [--seqs 1] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
 //             [--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]
 //   --check-trace: a trace_layers file of the model's engine forward over the first sequence (test_ppl --calibrate --chunk 512): every layer of
 //     the training form fed the engine's input streams of that layer, its output against the engine's, and the first sequence's embedding
@@ -60,9 +61,10 @@ namespace q = engine::tools::quant;
 struct Args {
 	std::string model, inputs, teacher, out, check_trace;
 	std::vector<int> devices = { 0, 1, 2, 3 };
-	int steps = 64, batch = 4, seqs = 1, hold = 4, eval_every = 16, warmup = 2, train = 0, adam_bits = 32, ckpt_host = -1, keep = -1, check_inputs = 0;
-	bool write = true, timing = false, tp = true, fp16 = true, norms = true, dense = false, router = false, opt_host = false, qsa = true, shuffle = false;
-	float lr = 1e-3f, lr_min = 0.1f, dense_lr = 0.1f;
+	int steps = 64, batch = 4, seqs = 1, hold = 4, eval_every = 16, warmup = 2, train = 0, adam_bits = 32, ckpt_host = -1, keep = -1, check_inputs = 0, route_cand = 0;
+	bool write = true, timing = false, tp = true, fp16 = true, norms = true, dense = false, router = false, opt_host = false, qsa = true, shuffle = false, hc = false,
+		gains = false;
+	float lr = 1e-3f, lr_min = 0.1f, dense_lr = 0.1f, hc_lr = 0.1f, gains_lr = 1.0f;
 };
 
 // The learning rate of a step (from 1): linear warmup, then a cosine from lr (the first step after the warmup) to lr * lr_min (the last step)
@@ -98,6 +100,7 @@ struct TrainOrder {
 struct Best {
 	std::map<std::string, std::pair<std::vector<uint16_t>, std::vector<uint16_t>>> scales;
 	std::map<std::string, std::vector<uint16_t>> dense;
+	std::map<std::string, std::vector<uint8_t>> gains;   // per EXL3 tensor its tile gains' codes (--gains)
 };
 
 void add_best( tq::Model& m, Best& out ) {
@@ -107,6 +110,9 @@ void add_best( tq::Model& m, Best& out ) {
 	std::vector<std::pair<std::string, std::vector<uint16_t>>> d;
 	m.best_dense( d );
 	for ( auto& e : d ) out.dense[e.first] = std::move( e.second );
+	std::vector<std::pair<std::string, std::vector<uint8_t>>> gv;
+	m.best_gains( gv );
+	for ( auto& e : gv ) out.gains[e.first] = std::move( e.second );
 }
 
 bool parse( int argc, char** argv, Args& a ) {
@@ -135,6 +141,11 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--dense" ) a.dense = v != "0";
 		else if ( k == "--dense-lr" ) a.dense_lr = std::stof( v );
 		else if ( k == "--router" ) a.router = v != "0";
+		else if ( k == "--hc" ) a.hc = v != "0";
+		else if ( k == "--hc-lr" ) a.hc_lr = std::stof( v );
+		else if ( k == "--route-cand" ) a.route_cand = std::stoi( v );
+		else if ( k == "--gains" ) a.gains = v != "0";
+		else if ( k == "--gains-lr" ) a.gains_lr = std::stof( v );
 		else if ( k == "--opt-host" ) a.opt_host = v != "0";
 		else if ( k == "--adam-bits" ) a.adam_bits = std::stoi( v );
 		else if ( k == "--write" ) a.write = v != "0";
@@ -156,7 +167,7 @@ bool parse( int argc, char** argv, Args& a ) {
 	}
 	if ( a.model.empty() || a.teacher.empty() || a.out.empty() || ( a.adam_bits != 32 && a.adam_bits != 8 ) || a.seqs < 1 ) {
 		LOG_ERROR( "usage: volta_e2e --model <EXL3 dir> --teacher <topk file> --out <dir> [--inputs <train_inputs file>] [--devices 0,1,2,3] [--tp 1] "
-			"[--fp16 1] [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--steps 64] [--batch 4] [--seqs 1] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
+			"[--fp16 1] [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--hc 0] [--hc-lr 0.1] [--gains 0] [--gains-lr 1] [--steps 64] [--batch 4] [--seqs 1] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
 			"[--adam-bits 32|8] [--opt-host 0|1] [--ckpt-host -1|0|1] [--keep -1|0|1] [--qsa 1] [--timing 0|1] [--check-trace FILE]" );
 		return false;
 	}
@@ -348,7 +359,13 @@ bool write_out( const Args& a, const Best& best, int& replaced ) {
 			const std::string base = name.substr( 0, dot ), suf = name.substr( dot + 1 );
 			const auto it = best_scales.find( base );
 			const auto dt = best.dense.find( name );
-			if ( it != best_scales.end() && ( suf == "suh" || suf == "svh" ) && en->dtype == "F16" ) {
+			const auto gt = suf == "tgain" ? best.gains.find( base ) : best.gains.end();
+			if ( gt != best.gains.end() ) {
+				ENGINE_ASSERT( gt->second.size() == en->bytes, "volta_e2e: a tensor's tile gains differ in count from the checkpoint's" );
+				o2.owned.assign( gt->second.begin(), gt->second.end() );
+				++replaced;
+			}
+			else if ( it != best_scales.end() && ( suf == "suh" || suf == "svh" ) && en->dtype == "F16" ) {
 				const auto& v = suf == "suh" ? it->second.first : it->second.second;
 				ENGINE_ASSERT( v.size() * 2 == en->bytes, "volta_e2e: a scale vector's size differs from the checkpoint's" );
 				o2.owned.resize( en->bytes );
@@ -434,6 +451,9 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		m->set_optimizer( a.opt_host, a.adam_bits );
 		m->set_train_dense( a.dense, a.dense_lr );
 		m->set_train_router( a.router );
+		m->set_train_hc( a.hc, a.hc_lr );
+		m->set_train_gains( a.gains, a.gains_lr );
+		m->set_route_candidates( a.route_cand );
 		m->set_keep_outputs( keep );
 		ok[r] = m->load( a.model, 0, cfg.layers, dev, R, r, n, comms[r] ) ? 1 : 0;
 		m->set_fp16( a.fp16 );
@@ -746,6 +766,9 @@ int main( int argc, char** argv ) {
 		s.m->set_optimizer( a.opt_host, a.adam_bits );
 		s.m->set_train_dense( a.dense, a.dense_lr );
 		s.m->set_train_router( a.router );
+		s.m->set_train_hc( a.hc, a.hc_lr );
+		s.m->set_train_gains( a.gains, a.gains_lr );
+		s.m->set_route_candidates( a.route_cand );
 		s.m->set_keep_outputs( a.keep != 0 );
 		if ( !s.m->load( a.model, first, last, s.dev, R ) ) return 1;
 		s.m->set_fp16( a.fp16 );

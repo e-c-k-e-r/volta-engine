@@ -7,39 +7,28 @@
 #include "engine/modules/trellis_bits.h"
 #include <array>
 
+// The 8 tiles from tile0 (gains applied, unit scales, before the rotations) into tile: 16 rows of 8 tiles' 8 column pairs; the block's 256
+// threads, synchronized after
 template <int K, int cb>
-__global__ __launch_bounds__( 256 )
-void reconstruct_kernel(
-	half* __restrict__ g_unpacked,
-	const uint16_t* __restrict__ g_packed,
-	const uint16_t* __restrict__ g_starts,
-	const uint8_t* __restrict__ g_gains,
-	int packed_blocks_n,
-	int packed_n_offset
-) {
+__device__ __forceinline__ void decode_strip( half2 ( &tile )[16][8][8], const uint16_t* __restrict__ g_packed, const uint16_t* __restrict__ g_starts,
+	const uint8_t* __restrict__ g_gains, size_t tile0 ) {
 	constexpr int packed_size = engine::modules::trellis_tile_u16( K );
 
 	int t = threadIdx.x;
 	int lane_id = t % 32;
 	int warp_id = t / 32;
-	int k = blockIdx.y;
-	int n = blockIdx.x * 8;
-	int tiles_n = gridDim.x;
-	int out_blocks_n = tiles_n * 8;
 
 	__shared__ uint32_t s_packed[8][packed_size / 2];
-	const size_t tile_idx = (size_t) k * packed_blocks_n + packed_n_offset + n + warp_id;
-	g_packed += ( k * packed_blocks_n + packed_n_offset + n ) * packed_size;
+	const size_t tile_idx = tile0 + warp_id;
+	g_packed += tile0 * packed_size;
 	if ( t < packed_size ) {
-		( (int4*) s_packed )[t] = ( (int4*) g_packed )[t];
+		( (int4*) s_packed )[t] = ( (const int4*) g_packed )[t];
 	}
 	__syncthreads();
 
 	FragB frag[2];
 	dq_dispatch_ext<K, cb>( s_packed[warp_id], lane_id * 8, frag[0], frag[1], g_starts ? g_starts[tile_idx] : 0u, g_starts != nullptr, g_gains != nullptr,
 		g_gains ? tile_gain2( g_gains[tile_idx] ) : __half2half2( __ushort_as_half( 0x3c00 ) ) );
-
-	__shared__ half2 tile[16][8][8];
 
 #if EXL3_VOLTA_LAYOUT
 	// Volta tile order: lane (q, t_, hh) holds value 4 * s + i = element (k = 4 * (2 * (q >> 1) + s) + i, column 8 * (q & 1) + t_ + 4 * hh)
@@ -86,12 +75,72 @@ void reconstruct_kernel(
 	}
 #endif
 	__syncthreads();
+}
+
+template <int K, int cb>
+__global__ __launch_bounds__( 256 )
+void reconstruct_kernel(
+	half* __restrict__ g_unpacked,
+	const uint16_t* __restrict__ g_packed,
+	const uint16_t* __restrict__ g_starts,
+	const uint8_t* __restrict__ g_gains,
+	int packed_blocks_n,
+	int packed_n_offset
+) {
+	int t = threadIdx.x;
+	int k = blockIdx.y;
+	int n = blockIdx.x * 8;
+	int tiles_n = gridDim.x;
+	int out_blocks_n = tiles_n * 8;
+
+	__shared__ half2 tile[16][8][8];
+	decode_strip<K, cb>( tile, g_packed, g_starts, g_gains, (size_t) k * packed_blocks_n + packed_n_offset + n );
 
 	int r = t / 16;
 	int c = t % 16;
 	int4* tile_int4 = (reinterpret_cast<int4*>( tile ));
 	int4* out_int4 = ( (int4*) g_unpacked ) + ( k * 16 + r ) * 2 * out_blocks_n + n * 2 + c;
 	*out_int4 = tile_int4[t];
+}
+
+// Per tile of a strip of 8 (block (x, y): the view's tile row y, its tiles 8 x .. 8 x + 7): dg[tile] += sum over the tile of dT o R / g, R the
+// decoded tile (its gain g applied) and dT [rows, ld] the view's gradient of the cores before the rotations. tile_row0: the view's first tile
+// row of the tensor; table (batch z): 5 * count pointers, the codes, starts, gains, dT and dg of every entry (whole tensors)
+template <int K, int cb>
+__global__ __launch_bounds__( 256 )
+void tile_gain_grad_kernel( const void* const* __restrict__ table, int count, int packed_blocks_n, int packed_n_offset, int tile_row0, int ld,
+	const uint16_t* packed, const uint16_t* starts, const uint8_t* gains, const float* dT, float* dg ) {
+	if ( table ) {
+		const int z = blockIdx.z;
+		packed = static_cast<const uint16_t*>( table[z] );
+		starts = static_cast<const uint16_t*>( table[count + z] );
+		gains = static_cast<const uint8_t*>( table[2 * count + z] );
+		dT = static_cast<const float*>( table[3 * count + z] );
+		dg = static_cast<float*>( const_cast<void*>( table[4 * count + z] ) );
+	}
+	const int t = threadIdx.x, lane = t % 32;
+	const int k = blockIdx.y, n = blockIdx.x * 8;
+	const size_t tile0 = (size_t) ( tile_row0 + k ) * packed_blocks_n + packed_n_offset + n;
+	__shared__ half2 tile[16][8][8];
+	__shared__ float acc[8];
+	if ( t < 8 ) acc[t] = 0.0f;
+	decode_strip<K, cb>( tile, packed, starts, gains, tile0 );
+	// thread t: row t / 16 of the strip, its columns 8 ( t % 16 ) .. + 7 (tile ( t % 16 ) / 2)
+	const int r = t / 16, c = t % 16;
+	const half* v = reinterpret_cast<const half*>( &tile[0][0][0] ) + r * 128 + c * 8;
+	const float* d = dT + (size_t) ( k * 16 + r ) * ld + n * 16 + c * 8;
+	const float4 d0 = *reinterpret_cast<const float4*>( d ), d1 = *reinterpret_cast<const float4*>( d + 4 );
+	float s = __half2float( v[0] ) * d0.x + __half2float( v[1] ) * d0.y + __half2float( v[2] ) * d0.z + __half2float( v[3] ) * d0.w +
+		__half2float( v[4] ) * d1.x + __half2float( v[5] ) * d1.y + __half2float( v[6] ) * d1.z + __half2float( v[7] ) * d1.w;
+	// lanes 2 q, 2 q + 1, 2 q + 16, 2 q + 17 hold tile q of the warp's two rows
+	s += __shfl_xor_sync( 0xffffffff, s, 1 );
+	s += __shfl_xor_sync( 0xffffffff, s, 16 );
+	if ( lane < 16 && !( lane & 1 ) ) atomicAdd( &acc[lane / 2], s );
+	__syncthreads();
+	if ( t < 8 ) {
+		const float g = gains ? ( 896.0f + gains[tile0 + t] ) * ( 1.0f / 1024.0f ) : 1.0f;
+		dg[tile0 + t] += acc[t] / g;
+	}
 }
 
 #define __(i, cb) reconstruct_kernel<i, cb>
@@ -331,6 +380,14 @@ constexpr auto reconstruct_had_batch_f16_instances = std::array{
 	__(9, 2), __(10, 2), __(11, 2)
 };
 #undef __
+#define __(i, cb) tile_gain_grad_kernel<i, cb>
+constexpr auto tile_gain_grad_instances = std::array{
+	__(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
+	__(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
+	__(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+	__(9, 2), __(10, 2), __(11, 2)
+};
+#undef __
 
 namespace {
 
@@ -440,6 +497,27 @@ void reconstruct_had_block( void* out, const uint16_t* packed, const uint16_t* s
 	else if ( mul1 ) cbi += 16;
 	const auto fn = half_out ? reconstruct_had_batch_f16_instances[cbi] : reconstruct_had_batch_f32_instances[cbi];
 	fn<<<dim3( cols / 128, rows / 128, 1 ), RH_THREADS, 0, stream>>>( nullptr, 1, stride / 16, n0 / 16, k0 / 128, out, packed, starts, gains );
+}
+
+void tile_gain_grad( const float* dT, float* dg, const uint16_t* packed, const uint16_t* starts, const uint8_t* gains, int K, bool mcg, bool mul1, int k0,
+	int rows, int n0, int cols, int stride, cudaStream_t stream ) {
+	if ( K < 1 || K > 11 || ( K > 8 && !mul1 ) || rows <= 0 ) return;
+	int cbi = K - 1;
+	if ( K > 8 ) cbi = 24 + K - 9;
+	else if ( mcg ) cbi += 8;
+	else if ( mul1 ) cbi += 16;
+	tile_gain_grad_instances[cbi]<<<dim3( cols / 128, rows / 16, 1 ), 256, 0, stream>>>( nullptr, 1, stride / 16, n0 / 16, k0 / 16, cols, packed, starts,
+		gains, dT, dg );
+}
+
+void tile_gain_grad_batch( const void* const* table, int count, int K, bool mcg, bool mul1, int rows, int cols, cudaStream_t stream ) {
+	if ( count <= 0 || K < 1 || K > 11 || ( K > 8 && !mul1 ) ) return;
+	int cbi = K - 1;
+	if ( K > 8 ) cbi = 24 + K - 9;
+	else if ( mcg ) cbi += 8;
+	else if ( mul1 ) cbi += 16;
+	tile_gain_grad_instances[cbi]<<<dim3( cols / 128, rows / 16, count ), 256, 0, stream>>>( table, count, cols / 16, 0, 0, cols, nullptr, nullptr, nullptr,
+		nullptr, nullptr );
 }
 
 void reconstruct_had_slice(

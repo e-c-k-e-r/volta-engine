@@ -49,6 +49,7 @@ struct HcWeights {
 	const float* inject = nullptr;  // [hc, hc * hidden], null on the final mixer (no post gates)
 	float* gnorm = nullptr;         // the norm weights' gradient (+=, null: not wanted)
 	float* ginject = nullptr;       // the inject mix's gradient (+=, null: not wanted)
+	float *gdown = nullptr, *gup = nullptr;   // the down / up mixes' gradients (+=, null: not wanted)
 };
 // What the backward reads (rows x the size given): inv rows * hc, normed rows * flat, zt rows * rank, t rows * rank, u rows * flat (sigmoid
 // inputs of the up mix), zi rows * hc
@@ -90,6 +91,13 @@ void gated_rms_backward( const float* x, const float* z, const float* gamma, int
 // Softmax routing over the top k logits of each row (selection fixed): w[r, j] = softmax_j( logit[r, ids[r, j]] ); backward from dw [rows, k] to
 // dlogit [rows, k] (overwrites)
 void topk_softmax_backward( const float* w, const float* dw, int rows, int k, float* dlogit, backend::stream_t stream );
+// Routing candidates: per row its slots sids [rows, k + c], the k selected (ids) then the c best of the other experts by logit, with weights
+// sw (w, then 0) and wp [rows, c], the weight a candidate would take in the softmax over the selected ones and itself. The backward from the
+// slots' dw (dy against each slot's expert output) to dl [rows, k + c]: the selected logits' gradients through their softmax, and a
+// candidate's wp ( dw - sum_j w_j dw_j ) (its logit's gradient were it in the softmax at a vanishing weight: the swap-in direction)
+void route_candidates( const float* logits, const int* ids, const float* w, int rows, int experts, int k, int c, int* sids, float* sw, float* wp,
+	backend::stream_t stream );
+void route_candidates_backward( const float* sw, const float* dw, const float* wp, int rows, int k, int c, float* dl, backend::stream_t stream );
 // The selected slots' values as dense rows: out[r, ids[r, j]] += v[r, j] (out [rows, experts]; a row's ids distinct)
 void slots_to_dense( const float* v, const int* ids, int rows, int k, int experts, float* out, backend::stream_t stream );
 
@@ -215,6 +223,13 @@ void mul_scaled( const float* x, const float* y, float s, float* out, size_t n, 
 // x = FP16( x ), elementwise
 void round_to_half( float* x, size_t n, backend::stream_t stream );
 
+// out = ( in diag( col_scale ) ) H per 128 columns of each row (col_scale null: ones; H the EXL3 cores' 128-point Hadamard, unit norm; in
+// place allowed): rotates a product's input or output gradient into the frame of the trellis tiles
+void had_rows( const float* in, const float* col_scale, int rows, int cols, float* out, backend::stream_t stream );
+// The tile gains' 8-bit codes from their values, g = ( 896 + c ) / 1024 (nearest, clamped), and back
+void gain_codes( const float* g, uint8_t* codes, size_t n, backend::stream_t stream );
+void gain_values( const uint8_t* codes, float* g, size_t n, backend::stream_t stream );
+
 // ---- the model ----
 
 struct Config {
@@ -235,6 +250,7 @@ struct Tuned {
 	int k = 0, n = 0;
 	float *su = nullptr, *sv = nullptr;        // current scales
 	float *gu = nullptr, *gv = nullptr;        // gradients with respect to su / sv, accumulated
+	float *tg = nullptr, *gtg = nullptr;       // with trained tile gains: their values (k / 16 x n / 16; w.w4 holds their codes) and gradients
 };
 
 // A trainable dense tensor (the weights of a norm: the hyper-connection sites', attention's q / k norms, GDN's gated norm, PLE's), as an
@@ -313,6 +329,18 @@ public:
 	// Room for every layer's kept sublayer outputs (before load; on by default): off, a kept forward keeps nothing and the backward
 	// recomputes the sublayers (the room is two rows of hidden per row and layer: long sequences)
 	void set_keep_outputs( bool on );
+	// Routing candidates (0: off): in the backward each row's next n experts by logit after its selected ones run too as zero-weight routes (the
+	// output unchanged), their logits given the gradient of being swapped in (route_candidates_backward), so that the router and its input
+	// learn selections the KL prefers; ~n / top_k more routed-expert work in the backward
+	void set_route_candidates( int n );
+	// The hyper-connection sites' down and up mixes trained too (before load; off by default), as additive deltas at lr_scale times the
+	// learning rate (dense_tensors lists them; every rank holds them all: rank rows of hc * hidden each way, ~636M values on Flash-Next)
+	void set_train_hc( bool on, float lr_scale = 0.1f );
+	// The tile gains of every trained tensor that has them trained too (before load; off by default): FP32 values in the scale pools at
+	// lr_scale times the learning rate, the codes the forward decodes set from them after each step (nearest, straight through: the gradient
+	// is the value's), their gradient from the product's input and output gradient rotated into the tiles' frame (one more product per
+	// tensor in the backward)
+	void set_train_gains( bool on, float lr_scale = 1.0f );
 	// Where Adam's state lives (before load): on the device (the default) or with host, in pinned host memory, streamed through the device in
 	// parts for each step (the same kernels, the same result; the device keeps the current values, their gradients and one part); its moments
 	// FP32 (32) or 8-bit block-wise (8, engine/train/adam8.h)
@@ -326,6 +354,8 @@ public:
 	void keep_best();
 	void best_scales( std::vector<std::pair<std::string, std::pair<std::vector<uint16_t>, std::vector<uint16_t>>>>& out );
 	void best_dense( std::vector<std::pair<std::string, std::vector<uint16_t>>>& out );
+	// with trained tile gains, per tensor name the kept gains' codes
+	void best_gains( std::vector<std::pair<std::string, std::vector<uint8_t>>>& out );
 
 private:
 	struct Impl;

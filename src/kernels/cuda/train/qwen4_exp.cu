@@ -777,6 +777,70 @@ __global__ void k_router_topk( const float* logits, int experts, int k, int* ids
 	}
 }
 
+// Block per row, a thread per expert: the row's slots (its k selected experts, then the c best of the others, ties to the lowest index) with
+// their weights (the selected ones' and 0), and the weight each candidate would take in the softmax over the selected ones and itself
+__global__ void k_route_candidates( const float* logits, const int* ids, const float* w, int experts, int k, int c, int* sids, float* sw, float* wp ) {
+	__shared__ float s_v[32];
+	__shared__ int s_i[32];
+	__shared__ int s_taken[1024];
+	const int r = blockIdx.x, e = threadIdx.x, ks = k + c;
+	const float* lr = logits + static_cast<size_t>( r ) * experts;
+	if ( e < experts ) s_taken[e] = 0;
+	__syncthreads();
+	if ( e < k ) s_taken[ids[static_cast<size_t>( r ) * k + e]] = 1;
+	__syncthreads();
+	const float my = e < experts ? lr[e] : -INFINITY;
+	for ( int j = 0; j < c; ++j ) {
+		const bool taken = e >= experts || s_taken[e];
+		float v = taken ? -INFINITY : my;
+		int idx = taken ? 0x7fffffff : e;
+		for ( int o = 16; o > 0; o >>= 1 ) {
+			const float ov = __shfl_xor_sync( 0xffffffffu, v, o );
+			const int oi = __shfl_xor_sync( 0xffffffffu, idx, o );
+			if ( ov > v || ( ov == v && oi < idx ) ) { v = ov; idx = oi; }
+		}
+		if ( ( e & 31 ) == 0 ) { s_v[e >> 5] = v; s_i[e >> 5] = idx; }
+		__syncthreads();
+		if ( e == 0 ) {
+			float bv = s_v[0];
+			int bi = s_i[0];
+			for ( int i = 1; i < ( blockDim.x >> 5 ); ++i ) if ( s_v[i] > bv || ( s_v[i] == bv && s_i[i] < bi ) ) { bv = s_v[i]; bi = s_i[i]; }
+			sids[static_cast<size_t>( r ) * ks + k + j] = bi;
+			s_taken[bi] = 1;
+		}
+		__syncthreads();
+	}
+	if ( e == 0 ) {
+		float mx = -INFINITY;
+		for ( int j = 0; j < k; ++j ) mx = fmaxf( mx, lr[ids[static_cast<size_t>( r ) * k + j]] );
+		float sum = 0.0f;
+		for ( int j = 0; j < k; ++j ) sum += expf( lr[ids[static_cast<size_t>( r ) * k + j]] - mx );
+		for ( int j = 0; j < k; ++j ) {
+			sids[static_cast<size_t>( r ) * ks + j] = ids[static_cast<size_t>( r ) * k + j];
+			sw[static_cast<size_t>( r ) * ks + j] = w[static_cast<size_t>( r ) * k + j];
+		}
+		for ( int j = 0; j < c; ++j ) {
+			const float ec = expf( lr[sids[static_cast<size_t>( r ) * ks + k + j]] - mx );
+			sw[static_cast<size_t>( r ) * ks + k + j] = 0.0f;
+			wp[static_cast<size_t>( r ) * c + j] = ec / ( sum + ec );
+		}
+	}
+}
+
+// Per row of ks = k + c slots: the selected ones' logit gradients through their softmax, dl = w ( dw - s ) with s = sum_j w_j dw_j (the routes'
+// output against dy), and a candidate's wp ( dw - s ): the gradient of its logit were it in the softmax at a vanishing weight
+__global__ void k_route_candidates_bwd( const float* sw, const float* dw, const float* wp, int rows, int k, int c, float* dl ) {
+	Q4E_LOOP( r, (size_t) rows ) {
+		const int ks = k + c;
+		const float* wr = sw + r * ks;
+		const float* dr = dw + r * ks;
+		float s = 0.0f;
+		for ( int j = 0; j < k; ++j ) s += wr[j] * dr[j];
+		for ( int j = 0; j < k; ++j ) dl[r * ks + j] = wr[j] * ( dr[j] - s );
+		for ( int j = 0; j < c; ++j ) dl[r * ks + k + j] = wp[r * c + j] * ( dr[k + j] - s );
+	}
+}
+
 // ---- PLE gate, segment dots, column copies, routing pieces ----
 __global__ void k_ple_gate( const float* g, float* sg, size_t n ) {
 	Q4E_LOOP( i, n ) {
@@ -821,6 +885,43 @@ __global__ void k_half_to_float( const half* h, float* f, size_t n ) {
 
 __global__ void k_round_half( float* x, size_t n ) {
 	Q4E_LOOP( i, n ) x[i] = __half2float( __float2half_rn( x[i] ) );
+}
+
+// A warp per 128 values of a row: lane l holds values 4 l .. 4 l + 3; the Sylvester transform, a butterfly per index bit, scaled to unit norm
+__global__ void k_had_rows( const float* in, const float* col_scale, int rows, int cols, float* out ) {
+	const size_t w = ( static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x ) / 32;
+	const int lane = threadIdx.x % 32, blocks = cols / 128;
+	if ( w >= static_cast<size_t>( rows ) * blocks ) return;
+	const size_t r = w / blocks;
+	const int c = static_cast<int>( w % blocks ) * 128 + lane * 4;
+	float4 v = *reinterpret_cast<const float4*>( in + r * cols + c );
+	if ( col_scale ) {
+		const float4 s = *reinterpret_cast<const float4*>( col_scale + c );
+		v.x *= s.x;
+		v.y *= s.y;
+		v.z *= s.z;
+		v.w *= s.w;
+	}
+	float a0 = v.x + v.y, a1 = v.x - v.y, a2 = v.z + v.w, a3 = v.z - v.w;
+	float x[4] = { a0 + a2, a1 + a3, a0 - a2, a1 - a3 };
+	#pragma unroll
+	for ( int b = 1; b < 32; b <<= 1 ) {
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const float p = __shfl_xor_sync( 0xffffffff, x[i], b );
+			x[i] = ( lane & b ) ? p - x[i] : x[i] + p;
+		}
+	}
+	constexpr float s = 0.08838834764831845f;
+	*reinterpret_cast<float4*>( out + r * cols + c ) = make_float4( x[0] * s, x[1] * s, x[2] * s, x[3] * s );
+}
+
+__global__ void k_gain_codes( const float* g, uint8_t* codes, size_t n ) {
+	Q4E_LOOP( i, n ) codes[i] = static_cast<uint8_t>( fminf( fmaxf( rintf( g[i] * 1024.0f - 896.0f ), 0.0f ), 255.0f ) );
+}
+
+__global__ void k_gain_values( const uint8_t* codes, float* g, size_t n ) {
+	Q4E_LOOP( i, n ) g[i] = ( 896.0f + codes[i] ) * ( 1.0f / 1024.0f );
 }
 
 __global__ void k_router_input_bwd( const float* dlogit, const int* ids, const float* R, int rows, int k, int hidden, float* dX ) {
@@ -1120,7 +1221,9 @@ void hc_backward( Blas& b, const HcWeights& w, const float* x, int rows, const H
 	float* dzi = dt + static_cast<size_t>( rows ) * w.rank;
 	k_hc_mix_bwd<<<blocks_for( (size_t) rows * flat ), 256, 0, st>>>( c.u, c.normed, dmixed, rows, w.hidden, w.hc, dnormed, du );
 	b.gemm( false, false, rows, w.rank, flat, 1.0f, du, w.up, 0.0f, dt );
+	if ( w.gup ) b.gemm( true, false, flat, w.rank, rows, 1.0f, du, c.t, 1.0f, w.gup );   // u = t up^T
 	k_silu_bwd<<<blocks_for( (size_t) rows * w.rank ), 256, 0, st>>>( c.zt, dt, (size_t) rows * w.rank );
+	if ( w.gdown ) b.gemm( true, false, w.rank, flat, rows, 1.0f / w.hc, dt, c.normed, 1.0f, w.gdown );   // zt = normed down^T / hc
 	b.gemm( false, false, rows, flat, w.rank, 1.0f / w.hc, dt, w.down, 1.0f, dnormed );
 	if ( w.inject != nullptr && dpost != nullptr ) {
 		k_post_bwd<<<blocks_for( (size_t) rows * w.hc ), 256, 0, st>>>( c.zi, dpost, dzi, (size_t) rows * w.hc );
@@ -1175,6 +1278,16 @@ void gated_rms_backward( const float* x, const float* z, const float* gamma, int
 
 void topk_softmax_backward( const float* w, const float* dw, int rows, int k, float* dlogit, backend::stream_t stream ) {
 	k_topk_softmax_bwd<<<blocks_for( rows ), 256, 0, cu( stream )>>>( w, dw, rows, k, dlogit );
+}
+
+void route_candidates( const float* logits, const int* ids, const float* w, int rows, int experts, int k, int c, int* sids, float* sw, float* wp,
+	backend::stream_t stream ) {
+	ENGINE_ASSERT( experts <= 1024, "route_candidates: up to 1024 experts" );
+	if ( rows > 0 ) k_route_candidates<<<rows, ( experts + 31 ) / 32 * 32, 0, cu( stream )>>>( logits, ids, w, experts, k, c, sids, sw, wp );
+}
+
+void route_candidates_backward( const float* sw, const float* dw, const float* wp, int rows, int k, int c, float* dl, backend::stream_t stream ) {
+	if ( rows > 0 ) k_route_candidates_bwd<<<blocks_for( rows ), 256, 0, cu( stream )>>>( sw, dw, wp, rows, k, c, dl );
 }
 
 void slots_to_dense( const float* v, const int* ids, int rows, int k, int experts, float* out, backend::stream_t stream ) {
@@ -1322,6 +1435,19 @@ void copy_cols( const float* src, int src_ld, int src_col, float* dst, int dst_l
 
 void half_to_float( const void* h, float* f, size_t n, backend::stream_t stream ) {
 	k_half_to_float<<<blocks_for( n ), 256, 0, cu( stream )>>>( static_cast<const half*>( h ), f, n );
+}
+
+void had_rows( const float* in, const float* col_scale, int rows, int cols, float* out, backend::stream_t stream ) {
+	const size_t threads = static_cast<size_t>( rows ) * ( cols / 128 ) * 32;
+	if ( threads > 0 ) k_had_rows<<<static_cast<unsigned>( ( threads + 255 ) / 256 ), 256, 0, cu( stream )>>>( in, col_scale, rows, cols, out );
+}
+
+void gain_codes( const float* g, uint8_t* codes, size_t n, backend::stream_t stream ) {
+	if ( n > 0 ) k_gain_codes<<<blocks_for( n ), 256, 0, cu( stream )>>>( g, codes, n );
+}
+
+void gain_values( const uint8_t* codes, float* g, size_t n, backend::stream_t stream ) {
+	if ( n > 0 ) k_gain_values<<<blocks_for( n ), 256, 0, cu( stream )>>>( codes, g, n );
 }
 
 void round_to_half( float* x, size_t n, backend::stream_t stream ) {

@@ -24,6 +24,7 @@
 #include "engine/spec/tap_ring.h"
 #include "engine/modules/norm.h"
 #include "engine/modules/rope.h"
+#include <map>
 #include <mutex>
 #include "engine/modules/linear.h"
 #if ENGINE_BACKEND_CUDA
@@ -954,6 +955,145 @@ void Qwen4ExpPipeline::dump_router( int m, backend::stream_t stream ) {
 	}
 }
 
+// Debug (qsa_dump): record {attention layer, rows, first position, words}, then per row its key count (-1: within the budget, dense) and
+// words of its selected pools as bits (pool p: bit p % 32 of word p / 32)
+void Qwen4ExpPipeline::dump_qsa( int attn_idx, int m, backend::stream_t stream ) {
+	static const std::string& path = runtime::options().qsa_dump;
+	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH ) return;
+	using engine::modules::DSA;
+	const int words = ( key_hint_ / DSA::POOL + 31 ) / 32;
+	std::vector<int> idx( static_cast<size_t>( m ) * DSA::KPAD ), nk( m );
+	backend::stream_sync( stream );
+	backend::memcpy_async( idx.data(), qsa_idx_, idx.size() * sizeof( int ), backend::Copy::D2H, stream );
+	backend::memcpy_async( nk.data(), qsa_nkeys_, nk.size() * sizeof( int ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
+	std::vector<uint32_t> bits( static_cast<size_t>( m ) * words, 0u );
+	for ( int r = 0; r < m; ++r ) {
+		if ( nk[r] < 0 ) continue;
+		for ( int s = 0; s < DSA::SEL_POOLS; ++s ) {
+			const int p = idx[static_cast<size_t>( r ) * DSA::KPAD + s * DSA::POOL] / DSA::POOL;
+			if ( p >= 0 && p / 32 < words ) bits[static_cast<size_t>( r ) * words + p / 32] |= 1u << ( p % 32 );
+		}
+	}
+	if ( FILE* f = std::fopen( path.c_str(), "ab" ) ) {
+		const int hdr[4] = { attn_idx, m, key_hint_ - m, words };
+		std::fwrite( hdr, sizeof( int ), 4, f );
+		std::fwrite( nk.data(), sizeof( int ), nk.size(), f );
+		std::fwrite( bits.data(), sizeof( uint32_t ), bits.size(), f );
+		std::fclose( f );
+	}
+}
+
+namespace {
+
+// The recorded selections a replay reads (loaded once for every rank): per layer the route_dump records' ids and weights in order, per
+// attention layer the qsa_dump records (first position, rows' key counts, words of pool bits)
+struct ReplayFiles {
+	std::mutex mu;
+	bool routes_loaded = false, qsa_loaded = false;
+	std::map<int, std::vector<std::pair<std::vector<int>, std::vector<backend::half_t>>>> routes;
+	struct Qsa { int pos0 = 0, words = 0; std::vector<int> nk; std::vector<uint32_t> bits; };
+	std::map<int, std::vector<Qsa>> qsa;
+};
+
+ReplayFiles& replay_files() {
+	static ReplayFiles f;
+	return f;
+}
+
+} // namespace
+
+void Qwen4ExpPipeline::replay_routes( int m, backend::stream_t stream ) {
+	static const std::string& path = runtime::options().route_replay;
+	if ( path.empty() || m <= pod::MAX_BATCH ) return;
+	auto& rf = replay_files();
+	const int K = config_.top_k, H = config_.hidden_size;
+	{
+		std::lock_guard<std::mutex> lk( rf.mu );
+		if ( !rf.routes_loaded ) {
+			rf.routes_loaded = true;
+			FILE* f = std::fopen( path.c_str(), "rb" );
+			FILE* fw = std::fopen( ( path + ".w" ).c_str(), "rb" );
+			int hdr[4];
+			while ( f && fw && std::fread( hdr, sizeof( int ), 4, f ) == 4 ) {
+				std::vector<int> ids( static_cast<size_t>( hdr[1] ) * hdr[3] );
+				std::vector<float> wf( ids.size() );
+				if ( std::fread( ids.data(), sizeof( int ), ids.size(), f ) != ids.size() || std::fseek( f, static_cast<long>( hdr[1] ) * H * 2, SEEK_CUR ) != 0 ||
+					std::fread( wf.data(), sizeof( float ), wf.size(), fw ) != wf.size() ) break;
+				std::vector<backend::half_t> w( wf.size() );
+				for ( size_t i = 0; i < wf.size(); ++i ) w[i] = backend::from_float_half( wf[i] );
+				rf.routes[hdr[0]].emplace_back( std::move( ids ), std::move( w ) );
+			}
+			if ( f ) std::fclose( f );
+			if ( fw ) std::fclose( fw );
+			size_t n = 0;
+			for ( const auto& e : rf.routes ) n += e.second.size();
+			LOG_INFO( "[route replay] %zu records over %zu layers from %s", n, rf.routes.size(), path.c_str() );
+		}
+	}
+	const auto it = rf.routes.find( hess_layer_ );
+	const int at = replay_next_[hess_layer_]++;
+	if ( it == rf.routes.end() || at >= static_cast<int>( it->second.size() ) ) return;
+	const auto& rec = it->second[at];
+	ENGINE_ASSERT( rec.first.size() == static_cast<size_t>( m ) * K, "route replay: a record's rows differ from the forward's (another text or chunking)" );
+	backend::memcpy_async( topk_idx_, rec.first.data(), rec.first.size() * sizeof( int ), backend::Copy::H2D, stream );
+	backend::memcpy_async( topk_w_, rec.second.data(), rec.second.size() * sizeof( backend::half_t ), backend::Copy::H2D, stream );
+	backend::stream_sync( stream );
+}
+
+void Qwen4ExpPipeline::replay_qsa( int attn_idx, int m, backend::stream_t stream ) {
+	static const std::string& path = runtime::options().qsa_replay;
+	if ( path.empty() || m <= pod::MAX_BATCH ) return;
+	using engine::modules::DSA;
+	auto& rf = replay_files();
+	{
+		std::lock_guard<std::mutex> lk( rf.mu );
+		if ( !rf.qsa_loaded ) {
+			rf.qsa_loaded = true;
+			if ( FILE* f = std::fopen( path.c_str(), "rb" ) ) {
+				int hdr[4];
+				while ( std::fread( hdr, sizeof( int ), 4, f ) == 4 ) {
+					ReplayFiles::Qsa q;
+					q.pos0 = hdr[2];
+					q.words = hdr[3];
+					q.nk.resize( hdr[1] );
+					q.bits.resize( static_cast<size_t>( hdr[1] ) * hdr[3] );
+					if ( std::fread( q.nk.data(), sizeof( int ), q.nk.size(), f ) != q.nk.size() ||
+						std::fread( q.bits.data(), sizeof( uint32_t ), q.bits.size(), f ) != q.bits.size() ) break;
+					rf.qsa[hdr[0]].push_back( std::move( q ) );
+				}
+				std::fclose( f );
+			}
+			LOG_INFO( "[qsa replay] %zu attention layers from %s", rf.qsa.size(), path.c_str() );
+		}
+	}
+	const auto it = rf.qsa.find( attn_idx );
+	const int at = replay_next_[128 + attn_idx]++;
+	if ( it == rf.qsa.end() || at >= static_cast<int>( it->second.size() ) ) return;
+	const ReplayFiles::Qsa& q = it->second[at];
+	ENGINE_ASSERT( static_cast<int>( q.nk.size() ) == m && q.pos0 == key_hint_ - m, "qsa replay: a record's rows differ from the forward's (another text or chunking)" );
+	// each row's recorded pools as token lists (pools ascending, then the incomplete tail), as DSA::select lays them out
+	std::vector<int> idx( static_cast<size_t>( m ) * DSA::KPAD, 0 ), nk( m );
+	for ( int r = 0; r < m; ++r ) {
+		nk[r] = q.nk[r];
+		if ( q.nk[r] < 0 ) continue;
+		int* out = idx.data() + static_cast<size_t>( r ) * DSA::KPAD;
+		int n = 0;
+		for ( int w = 0; w < q.words; ++w ) {
+			for ( uint32_t b = q.bits[static_cast<size_t>( r ) * q.words + w]; b; b &= b - 1 ) {
+				const int p = w * 32 + __builtin_ctz( b );
+				for ( int j = 0; j < DSA::POOL && n < DSA::SEL_POOLS * DSA::POOL; ++j ) out[n++] = p * DSA::POOL + j;
+			}
+		}
+		const int vis = q.pos0 + r + 1, tail = vis % DSA::POOL;
+		for ( int j = 0; j < tail; ++j ) out[n++] = vis - tail + j;
+		nk[r] = n;
+	}
+	backend::memcpy_async( qsa_idx_, idx.data(), idx.size() * sizeof( int ), backend::Copy::H2D, stream );
+	backend::memcpy_async( qsa_nkeys_, nk.data(), nk.size() * sizeof( int ), backend::Copy::H2D, stream );
+	backend::stream_sync( stream );
+}
+
 void Qwen4ExpPipeline::trace_route( int tag, int m, backend::stream_t stream ) {
 	static const std::string& path = runtime::options().trace_layers;
 	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH ) return;
@@ -1063,6 +1203,8 @@ void Qwen4ExpPipeline::attention_forward( const Qwen4ExpLayerWeights& lw, int at
 	if ( sparse ) {
 		QSA::score( qsa_q_.ptr<const backend::half_t>(), qsa_pool_, qsa_scores_, qsa_max_pools_, attn_idx, qsa_max_pools_, m, d_rows_, qsa_pool_slot_, sx );
 		engine::modules::DSA::select( qsa_scores_, qsa_max_pools_, qsa_idx_, qsa_nkeys_, m, d_rows_, sx );
+		dump_qsa( attn_idx, m, sx );
+		replay_qsa( attn_idx, m, sx );
 	}
 	engine::modules::Linear::forward( mixed_, lw.k_proj, k_buf_, sk );
 	engine::modules::RMSNorm::forward_heads( k_buf_, lw.k_norm, kv_heads_, hd, config_.rms_norm_eps, 1.0f, sk );
@@ -1266,6 +1408,7 @@ void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backe
 	engine::modules::MoERouter::route_softmax_topk( mixed_, lw.router, topk_idx_, topk_w_, H, config_.num_experts, config_.top_k, stream, m );
 	if ( &lw == &layers_[0] ) trace_route( 700, m, stream );
 	dump_router( m, stream );
+	replay_routes( m, stream );
 	const int per_rank = config_.num_experts / tp_;
 	// Plain SiLU gating (no swiglu limit): act_limit 0
 	// A prefill chunk reads the layer's cold experts from device scratch, copied a layer ahead (the tier's explicit copy; reading them from host memory per

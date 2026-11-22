@@ -66,6 +66,13 @@ void grads( q::Model& m, Grads& g ) {
 		}
 		for ( int i = 0; i < t->k; ++i ) e.first[i] += u[i];
 		for ( int i = 0; i < t->n; ++i ) e.second[i] += v[i];
+		if ( t->gtg ) {
+			const size_t nt = static_cast<size_t>( t->k / 16 ) * ( t->n / 16 );
+			const std::vector<float> w = down( t->gtg, nt );
+			auto& eg = g[t->name + ".tgain"];
+			if ( eg.first.empty() ) eg.first.assign( nt, 0.0f );
+			for ( size_t i = 0; i < nt; ++i ) eg.first[i] += w[i];
+		}
 	}
 	// the norm weights (every rank holds them all; its partial sum, rank 0 alone for the PLE layer's)
 	for ( q::Dense* d : m.dense_tensors() ) {
@@ -152,6 +159,8 @@ int main( int argc, char** argv ) {
 			q::Model m;
 			m.set_train_dense( true );
 			m.set_train_router( true );
+			m.set_train_hc( true );
+			m.set_train_gains( true );
 			if ( !m.load( dir, L, L + 1, 0, T ) ) return 1;
 			float *x = up( hx.data(), hx.size() ), *R = up( hr.data(), hr.size() ), *pk = up( hk.data(), hk.size() ), *pv = up( hv.data(), hv.size() ), *y, *dx;
 			CUDA_CHECK( cudaMalloc( &y, hx.size() * sizeof( float ) ) );
@@ -175,6 +184,8 @@ int main( int argc, char** argv ) {
 			q::Model m;
 			m.set_train_dense( true );
 			m.set_train_router( true );
+			m.set_train_hc( true );
+			m.set_train_gains( true );
 			ok[r] = m.load( dir, L, L + 1, r, T, r, n, comms[r] );
 			if ( !ok[r] ) std::abort();   // the other ranks would wait on it forever
 			const size_t o = static_cast<size_t>( r ) * Tl * flat, cnt = static_cast<size_t>( Tl ) * flat;
@@ -210,8 +221,10 @@ int main( int argc, char** argv ) {
 		compare_grads( g_ref, g_tp, c.full_attention( L ) ? ".self_attn." : ".linear_attn.", c.full_attention( L ) ? "attention" : "GDN" );
 		compare_grads( g_ref, g_tp, ".shared_expert.", "shared expert" );
 		compare_grads( g_ref, g_tp, ".experts.", "routed experts" );
+		compare_grads( g_ref, g_tp, ".tgain", "routed experts' tile gain" );
 		compare_grads( g_ref, g_tp, "norm", "norm weight" );
 		compare_grads( g_ref, g_tp, "block_inject", "inject mix" );
+		compare_grads( g_ref, g_tp, "input_mix_weight", "hyper-connection down / up mix" );
 		compare_grads( g_ref, g_tp, "shared_expert_gate", "shared expert gate" );
 		compare_grads( g_ref, g_tp, "mlp.gate.weight", "router" );
 		if ( L == c.ple_layer ) compare_grads( g_ref, g_tp, "ple.conv1d", "PLE convolution" );

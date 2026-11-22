@@ -362,13 +362,21 @@ struct Model::Impl {
 	ParamPool expert_p;         // the scales of this rank's experts
 	ParamPool norm_p;           // the norm weights (s0: the checkpoint's, a: additive deltas, s: current)
 	ParamPool dense_p;          // with train_dense, the small dense tensors (as norm_p)
-	std::vector<Dense> dense_t; // per trainable dense tensor its name and buffers in norm_p or dense_p
+	ParamPool hc_p;             // with train_hc, the hyper-connection sites' down / up mixes (as norm_p)
+	std::vector<Dense> dense_t; // per trainable dense tensor its name and buffers in norm_p, dense_p or hc_p
 	bool train_norms = true;
 	bool train_dense = false;   // the small dense tensors trained too (set before the load): the hyper-connection sites' inject mixes, GDN's
 	                            // in_proj_a / b, A_log, dt_bias and convolution, the shared expert's gate, PLE's convolution
 	float dense_lr = 0.1f;      // their learning rate, a fraction of the step's
 	bool train_router = false;  // the routers' weights trained too (set before the load; in dense_p at dense_lr)
 	bool keep_outputs = true;   // room for every layer's kept sublayer outputs (set before the load; off: a kept forward recomputes them)
+	int route_cand = 0;         // per row the next-best experts given the gradient of being swapped in (moe)
+	bool train_hc = false;      // the hyper-connection sites' down / up mixes trained too (set before the load; in hc_p at hc_lr)
+	float hc_lr = 0.1f;
+	bool train_gains = false;   // the tile gains trained too (set before the load; at gain_lr, additive like the norms)
+	float gain_lr = 1.0f;
+	ParamPool gain_sp, gain_ep; // their values: of the shared tensors, of this rank's experts
+	uint8_t *gcodes_s = nullptr, *gcodes_e = nullptr;   // and their codes, at the pools' offsets (the tensors' w4 point here)
 	bool opt_host = false;      // the optimizer state in host memory
 	int opt_bits = 32;          // Adam's moments: 32 (FP32) or 8 (block-wise)
 	std::vector<Layer> layers;
@@ -588,7 +596,34 @@ struct Model::Impl {
 		t.gv = P.g + ov;
 		half_to_float( t.w.w1.data, t.su, t.k, st );   // the checkpoint's values (the pool's reference copy taken after the load)
 		half_to_float( t.w.w2.data, t.sv, t.n, st );
+		if ( train_gains && t.w.w4.data ) {
+			// the tile gains: values from the codes, the codes moved next to the others (set from the values after each step)
+			ParamPool& G = expert ? gain_ep : gain_sp;
+			uint8_t* codes = ( expert ? gcodes_e : gcodes_s ) + G.used;
+			const size_t nt = static_cast<size_t>( t.k / 16 ) * ( t.n / 16 ), o = G.take( nt );
+			CUDA_CHECK( cudaMemcpyAsync( codes, t.w.w4.data, nt, cudaMemcpyDeviceToDevice, st ) );
+			t.w.w4.data = codes;
+			gain_values( codes, G.s + o, nt, st );
+			t.tg = G.s + o;
+			t.gtg = G.g + o;
+		}
 		return t;
+	}
+
+	// The tile gains' gradient of t over the view from its product's input X [rows, v.k] and output gradient dY [rows, v.n]: the gradient with
+	// respect to the tiles R (the core H R H) is ( X diag( su ) H )^T ( dY diag( sv ) H )
+	void gain_bwd( const Tuned& t, const float* X, const float* dY, int rows, const View& v ) {
+		if ( t.gtg == nullptr || rows <= 0 ) return;
+		const size_t mark = ws.off;
+		float* Xr = ws.f( static_cast<size_t>( rows ) * v.k );
+		float* dYr = ws.f( static_cast<size_t>( rows ) * v.n );
+		float* dR = ws.f( static_cast<size_t>( v.k ) * v.n );
+		had_rows( X, t.su + v.r0, rows, v.k, Xr, st );
+		had_rows( dY, t.sv + v.c0, rows, v.n, dYr, st );
+		blas->gemm( true, false, v.k, v.n, rows, 1.0f, Xr, dYr, 0.0f, dR );
+		EXL3_TILES_CALL( t.w.volta_tiles, tile_gain_grad, dR, t.gtg, static_cast<const uint16_t*>( t.w.w0.data ), static_cast<const uint16_t*>( t.w.w3.data ),
+			static_cast<const uint8_t*>( t.w.w4.data ), t.w.bits, t.w.mcg, t.w.mul1, v.r0, v.k, v.c0, v.n, t.n, st );
+		ws.off = mark;
 	}
 
 	// An EXL3 tensor used but not trained: its scales in the state pool, no gradients
@@ -615,8 +650,14 @@ struct Model::Impl {
 		w.rank = cfg.rank;
 		w.eps = cfg.eps;
 		w.norm = norm_weights( pre + ".hc_norm.weight", &w.gnorm );
-		d16[0] = dense( pre + ".input_mix_weight_down.weight" );
-		d16[1] = dense( pre + ".input_mix_weight_up.weight" );
+		if ( train_hc ) {
+			w.down = pooled( hc_p, pre + ".input_mix_weight_down.weight", &w.gdown );
+			w.up = pooled( hc_p, pre + ".input_mix_weight_up.weight", &w.gup );
+		}
+		else {
+			d16[0] = dense( pre + ".input_mix_weight_down.weight" );
+			d16[1] = dense( pre + ".input_mix_weight_up.weight" );
+		}
 		if ( inject && train_dense ) w.inject = pooled( dense_p, pre + ".block_inject_weight.weight", &w.ginject );
 		else if ( inject ) d16[2] = dense( pre + ".block_inject_weight.weight" );
 		return w;
@@ -670,6 +711,7 @@ struct Model::Impl {
 		float* sn = ws.f( static_cast<size_t>( rows ) * v.n );
 		float* sk = ws.f( static_cast<size_t>( rows ) * v.k );
 		scaled_linear_backward( *blas, sl( t, T, v ), X, Z, dY, rows, dX, sn, sk, add );
+		gain_bwd( t, X, dY, rows, v );
 	}
 
 	void run( int L, const float* x_in, float* x_out, int T, const float* ple_k, const float* ple_v, const float* dx_out, float* dx_in, bool keep,
@@ -696,6 +738,10 @@ Model::~Model() {
 	p_->expert_p.release();
 	p_->norm_p.release();
 	p_->dense_p.release();
+	p_->hc_p.release();
+	p_->gain_sp.release();
+	p_->gain_ep.release();
+	for ( uint8_t* c : { p_->gcodes_s, p_->gcodes_e } ) if ( c ) cudaFree( c );
 	if ( p_->ones_f ) cudaFree( p_->ones_f );
 	engine::core::arena_destroy( p_->arena );
 	if ( p_->st ) cudaStreamDestroy( p_->st );
@@ -752,6 +798,8 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 	// copies, the convolution's channels, the kept sublayer outputs and the expert tables
 	const size_t Rl = static_cast<size_t>( max_rows ) / ranks;
 	size_t trained = 0;   // values of the trained small dense tensors (train_dense)
+	size_t hc_trained = 0;   // and of the trained hyper-connection mixes (train_hc)
+	size_t gains_s = 0, gains_e = 0;   // the trained tile gains (train_gains): of the shared tensors, of this rank's experts
 	{
 		auto al = []( size_t b ) { return ( b + 255 ) / 256 * 256; };
 		auto numel = [&]( const std::string& name ) -> size_t {
@@ -762,10 +810,12 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 			return n;
 		};
 		size_t codes = 0, dense_b = 0, dense_max = 0;
-		auto linear = [&]( const std::string& base ) {
+		// an EXL3 tensor; gains: its trained tile gains' count (null: not trained)
+		auto linear = [&]( const std::string& base, size_t* gains ) {
 			codes += al( m.repo.trellis_bytes( base.c_str() ) ) + al( numel( base + ".suh" ) * 2 ) + al( numel( base + ".svh" ) * 2 );
 			for ( const char* s : { ".tstart", ".tgain" } )
 				if ( const pod::SafeTensorMeta* t = m.repo.find( ( base + s ).c_str() ) ) codes += al( t->size_bytes );
+			if ( gains && m.train_gains ) *gains += ( numel( base + ".tgain" ) + 3 ) / 4 * 4;
 		};
 		auto dense_w = [&]( const std::string& name, bool copy ) {
 			const size_t n = numel( name );
@@ -780,8 +830,13 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 		};
 		auto hc_site = [&]( const std::string& pre, bool inject ) {
 			dense_w( pre + ".hc_norm.weight", false );
-			dense_w( pre + ".input_mix_weight_down.weight", true );
-			dense_w( pre + ".input_mix_weight_up.weight", true );
+			for ( const char* mix : { ".input_mix_weight_down.weight", ".input_mix_weight_up.weight" } ) {
+				if ( !m.train_hc ) dense_w( pre + mix, true );
+				else {
+					dense_w( pre + mix, false );
+					hc_trained += ( numel( pre + mix ) + 3 ) / 4 * 4;
+				}
+			}
 			if ( inject ) small( pre + ".block_inject_weight.weight" );
 		};
 		size_t extra = 0;
@@ -790,18 +845,18 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 			hc_site( pre + ".attn_hyper_connection", true );
 			hc_site( pre + ".mlp_hyper_connection", true );
 			if ( c.full_attention( L ) ) {
-				for ( const char* p : { "q_proj", "k_proj", "v_proj", "o_proj" } ) linear( pre + ".self_attn." + p );
+				for ( const char* p : { "q_proj", "k_proj", "v_proj", "o_proj" } ) linear( pre + ".self_attn." + p, &gains_s );
 				dense_w( pre + ".self_attn.q_norm.weight", false );
 				dense_w( pre + ".self_attn.k_norm.weight", false );
 				if ( m.repo.find( ( pre + ".self_attn.indexer.index_qk_proj.suh" ).c_str() ) ) {
-					linear( pre + ".self_attn.indexer.index_qk_proj" );
+					linear( pre + ".self_attn.indexer.index_qk_proj", nullptr );
 					dense_w( pre + ".self_attn.indexer.q_layernorm.weight", true );
 					dense_w( pre + ".self_attn.indexer.k_layernorm.weight", true );
 					extra += al( static_cast<size_t>( H + kQsaProj ) * sizeof( float ) );
 				}
 			}
 			else {
-				for ( const char* p : { "in_proj_qkv", "in_proj_z", "out_proj" } ) linear( pre + ".linear_attn." + p );
+				for ( const char* p : { "in_proj_qkv", "in_proj_z", "out_proj" } ) linear( pre + ".linear_attn." + p, &gains_s );
 				for ( const char* p : { "in_proj_a.weight", "in_proj_b.weight", "A_log", "dt_bias" } ) small( pre + ".linear_attn." + p );
 				dense_w( pre + ".linear_attn.norm.weight", false );
 				if ( m.train_dense ) small( pre + ".linear_attn.conv1d.weight" );
@@ -816,8 +871,8 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 			}
 			else dense_w( pre + ".mlp.gate.weight", true );
 			for ( int e = m.e0; e < m.e1; ++e )
-				for ( const char* p : { "gate_proj", "up_proj", "down_proj" } ) linear( pre + ".mlp.experts." + std::to_string( e ) + "." + p );
-			for ( const char* p : { "gate_proj", "up_proj", "down_proj" } ) linear( pre + ".mlp.shared_expert." + p );
+				for ( const char* p : { "gate_proj", "up_proj", "down_proj" } ) linear( pre + ".mlp.experts." + std::to_string( e ) + "." + p, &gains_e );
+			for ( const char* p : { "gate_proj", "up_proj", "down_proj" } ) linear( pre + ".mlp.shared_expert." + p, &gains_s );
 			small( pre + ".mlp.shared_expert_gate.weight" );
 			if ( L == c.ple_layer ) {
 				for ( const char* p : { "norm_key", "norm_query", "norm_conv" } ) dense_w( pre + ".ple." + p + ".weight", false );
@@ -827,7 +882,7 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 		}
 		if ( m.head ) {
 			hc_site( "model.language_model.hyper_connection_mixer", false );
-			linear( "lm_head" );
+			linear( "lm_head", &gains_s );
 		}
 		const size_t arena_b = codes + al( dense_max * 2 ) + ( 16ull << 20 );
 		if ( !engine::core::arena_create( m.arena, device, arena_b ) ) {
@@ -845,7 +900,14 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 		const size_t flat = static_cast<size_t>( c.hc ) * H;
 		m.norm_p.init( nl * ( 2 * flat + 2 * c.head_dim + c.lin_d + 64 ) + 4 * flat + 256, m.opt_host, m.opt_bits );
 		if ( m.train_dense || m.train_router ) m.dense_p.init( trained + 64, m.opt_host, m.opt_bits );
-		m.dense_t.reserve( static_cast<size_t>( nl ) * 12 + 8 );
+		if ( m.train_hc ) m.hc_p.init( hc_trained + 64, m.opt_host, m.opt_bits );
+		if ( m.train_gains ) {
+			m.gain_sp.init( gains_s + 64, m.opt_host, m.opt_bits );
+			m.gain_ep.init( gains_e + 64, m.opt_host, m.opt_bits );
+			CUDA_CHECK( cudaMalloc( &m.gcodes_s, m.gain_sp.cap ) );
+			CUDA_CHECK( cudaMalloc( &m.gcodes_e, m.gain_ep.cap ) );
+		}
+		m.dense_t.reserve( static_cast<size_t>( nl ) * 16 + 10 );
 	}
 	const size_t ones = std::max<size_t>( c.vocab, 65536 );
 	CUDA_CHECK( cudaMalloc( &m.ones_f, ones * sizeof( float ) ) );
@@ -971,7 +1033,7 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 		m.lm = m.tuned( "lm_head", false );
 	}
 	CUDA_CHECK( cudaStreamSynchronize( m.st ) );
-	for ( ParamPool* P : { &m.shared_p, &m.expert_p, &m.norm_p, &m.dense_p } ) P->start( m.st );
+	for ( ParamPool* P : { &m.shared_p, &m.expert_p, &m.norm_p, &m.dense_p, &m.hc_p, &m.gain_sp, &m.gain_ep } ) P->start( m.st );
 	CUDA_CHECK( cudaStreamSynchronize( m.st ) );
 	// The workspace starts at a layer's streams and grows to what the calls need
 	m.ws.init( static_cast<size_t>( max_rows ) * c.hc * c.hidden * sizeof( float ) * 8 );
@@ -1056,11 +1118,28 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 		CUDA_CHECK( cudaStreamSynchronize( st ) );
 		kept = h_ids;
 	}
+	// The routes by slot: the K selected and, with route_cand (backward only), the next-best route_cand experts as zero-weight slots: their
+	// outputs computed (the forward unchanged) so that their logits get the gradient of being swapped in
+	const int C = dy && route_cand > 0 ? route_cand : 0, KS = K + C;
+	int* sids = ids;
+	float* sw = w;
+	float* wp = nullptr;
+	std::vector<int> h_cand;
+	if ( C ) {
+		sids = ws.i( static_cast<size_t>( T ) * KS );
+		sw = ws.f( static_cast<size_t>( T ) * KS );
+		wp = ws.f( static_cast<size_t>( T ) * C );
+		route_candidates( logits, ids, w, T, E, K, C, sids, sw, wp, st );
+		h_cand.resize( static_cast<size_t>( T ) * KS );
+		CUDA_CHECK( cudaMemcpyAsync( h_cand.data(), sids, h_cand.size() * sizeof( int ), cudaMemcpyDeviceToHost, st ) );
+		CUDA_CHECK( cudaStreamSynchronize( st ) );
+	}
+	const std::vector<int>& h_slots = C ? h_cand : h_ids;
 	// This rank's routed experts in groups of similar route counts (largest first): a group's routes are padded to its largest count (zero
 	// rows), so that each of its products is one strided batch over its experts' cores, decoded together (FP16 with fp16, else FP32)
 	const int I = cfg.inter;
 	std::vector<int> cnt( E, 0 ), order;
-	for ( int id : h_ids ) cnt[id]++;
+	for ( int id : h_slots ) cnt[id]++;
 	for ( int e = e0; e < e1; ++e ) if ( cnt[e] > 0 ) order.push_back( e );
 	std::stable_sort( order.begin(), order.end(), [&]( int a, int b ) { return cnt[a] > cnt[b]; } );
 	struct Group { int first, count, m, p0; };   // experts order[first, first + count), padded rows from p0, m per expert
@@ -1078,16 +1157,16 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 		groups.push_back( g );
 	}
 	// per padded row its source row and slot, per slot its padded row (-1: another rank's expert); per group its experts and decode jobs
-	std::vector<int> ints( static_cast<size_t>( 2 ) * P + h_ids.size() + order.size(), -1 );
-	int *prow_h = ints.data(), *pslot_h = prow_h + P, *inv_h = pslot_h + P, *gexp_h = inv_h + h_ids.size();
+	std::vector<int> ints( static_cast<size_t>( 2 ) * P + h_slots.size() + order.size(), -1 );
+	int *prow_h = ints.data(), *pslot_h = prow_h + P, *inv_h = pslot_h + P, *gexp_h = inv_h + h_slots.size();
 	{
 		std::vector<int> base( E, -1 ), fill( E, 0 );
 		for ( const Group& g : groups ) for ( int i = 0; i < g.count; ++i ) {
 			base[order[g.first + i]] = g.p0 + i * g.m;
 			gexp_h[g.first + i] = order[g.first + i];
 		}
-		for ( int r = 0; r < T; ++r ) for ( int j = 0; j < K; ++j ) {
-			const int s = r * K + j, e = h_ids[s];
+		for ( int r = 0; r < T; ++r ) for ( int j = 0; j < KS; ++j ) {
+			const int s = r * KS + j, e = h_slots[s];
 			if ( base[e] < 0 ) continue;
 			const int p = base[e] + fill[e]++;
 			prow_h[p] = r;
@@ -1098,9 +1177,12 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 	float* Wk[3];   // the group's cores per kind: [count, H, I] gate and up, [count, I, H] down (FP16 or FP32 elements)
 	const size_t esz = fp16 ? 2 : 4;
 	for ( float*& p : Wk ) p = static_cast<float*>( ws.raw( static_cast<size_t>( kGroupExperts ) * H * I * esz ) );
-	struct Job { int off, count, bits, kind; bool mcg, mul1, volta; };
+	// with trained tile gains (backward), per expert of a group the gradient with respect to its tiles, one kind at a time
+	const bool gains = dy && train_gains && gain_ep.used > 0;
+	float* dRk = gains ? ws.f( static_cast<size_t>( kGroupExperts ) * H * I ) : nullptr;
+	struct Job { int off, count, bits, kind; bool mcg, mul1, volta; int goff; };
 	std::vector<std::vector<Job>> jobs( groups.size() );
-	std::vector<const void*> tab_h;
+	std::vector<const void*> tab_h, gtab_h;   // gtab_h: per job the tile gains' table (codes, starts, gains, dR, gradients)
 	{
 		const std::vector<Tuned>* kinds[] = { &lw.eg, &lw.eu, &lw.ed };
 		for ( size_t gi = 0; gi < groups.size(); ++gi ) for ( int kd = 0; kd < 3; ++kd ) {
@@ -1117,11 +1199,17 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 						done[j] = true;
 					}
 				}
-				Job jb{ static_cast<int>( tab_h.size() ), static_cast<int>( same.size() ), w0.bits, kd, w0.mcg, w0.mul1, w0.volta_tiles };
+				Job jb{ static_cast<int>( tab_h.size() ), static_cast<int>( same.size() ), w0.bits, kd, w0.mcg, w0.mul1, w0.volta_tiles,
+					static_cast<int>( gtab_h.size() ) };
 				for ( int q = 0; q < 4; ++q ) for ( int j : same ) {
 					const pod::LinearWeight& wj = ( *kinds[kd] )[order[g.first + j]].w;
 					tab_h.push_back( q == 0 ? wj.w0.data : q == 1 ? wj.w3.data : q == 2 ? wj.w4.data :
 						static_cast<const void*>( reinterpret_cast<char*>( Wk[kd] ) + static_cast<size_t>( j ) * H * I * esz ) );
+				}
+				if ( gains ) for ( int q = 0; q < 5; ++q ) for ( int j : same ) {
+					const Tuned& tj = ( *kinds[kd] )[order[g.first + j]];
+					gtab_h.push_back( q == 0 ? tj.w.w0.data : q == 1 ? tj.w.w3.data : q == 2 ? tj.w.w4.data :
+						q == 3 ? static_cast<const void*>( dRk + static_cast<size_t>( j ) * H * I ) : static_cast<const void*>( tj.gtg ) );
 				}
 				jobs[gi].push_back( jb );
 			}
@@ -1131,8 +1219,13 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 	const void** d_tab = static_cast<const void**>( ws.raw( std::max<size_t>( tab_h.size(), 1 ) * sizeof( void* ) ) );
 	CUDA_CHECK( cudaMemcpyAsync( d_ints, ints.data(), ints.size() * sizeof( int ), cudaMemcpyHostToDevice, st ) );
 	if ( !tab_h.empty() ) CUDA_CHECK( cudaMemcpyAsync( d_tab, tab_h.data(), tab_h.size() * sizeof( void* ), cudaMemcpyHostToDevice, st ) );
-	const int *d_prow = d_ints, *d_pslot = d_prow + P, *d_inv = d_pslot + P, *d_gexp = d_inv + h_ids.size();
-	float* dw = dy ? ws.fz( static_cast<size_t>( T ) * K, st ) : nullptr;   // the routing weights' gradient by slot
+	const void** d_gtab = nullptr;
+	if ( !gtab_h.empty() ) {
+		d_gtab = static_cast<const void**>( ws.raw( gtab_h.size() * sizeof( void* ) ) );
+		CUDA_CHECK( cudaMemcpyAsync( d_gtab, gtab_h.data(), gtab_h.size() * sizeof( void* ), cudaMemcpyHostToDevice, st ) );
+	}
+	const int *d_prow = d_ints, *d_pslot = d_prow + P, *d_inv = d_pslot + P, *d_gexp = d_inv + h_slots.size();
+	float* dw = dy ? ws.fz( static_cast<size_t>( T ) * KS, st ) : nullptr;   // dy against each slot's expert output
 	phase( "moe routing" );
 	// Routed experts, group by group (tables: su, sv, gu, gv per kind)
 	{
@@ -1149,6 +1242,7 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 		void* A16 = fp16 ? ws.raw( PH * 2 ) : nullptr;
 		float* rinv = fp16 ? ws.f( Pmax ) : nullptr;
 		float* Xs = fp16 ? nullptr : ws.f( PH );
+		float *Xh = gains ? ws.f( PH ) : nullptr, *Yh = gains ? ws.f( PH ) : nullptr;
 		for ( size_t gi = 0; gi < groups.size(); ++gi ) {
 			const Group& g = groups[gi];
 			const int Pg = g.count * g.m, m = g.m, n = g.count;
@@ -1188,11 +1282,23 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 			route_swiglu( Zg, Zu, gx, m, tab( 0, 1 ), tab( 1, 1 ), Pg, I, Gm, Um, Am, st );
 			prod( Am, tab( 2, 0 ), I, H, false, Wk[2], Zd );
 			route_scale( Zd, gx, m, tab( 2, 1 ), Pg, H, Yr, false, st );
-			if ( y ) route_combine( Yr, d_inv, g.p0, Pg, w, T, K, H, y, st );
+			if ( y ) route_combine( Yr, d_inv, g.p0, Pg, sw, T, KS, H, y, st );
 			if ( !dy ) continue;
-			// down: dsv += colsum( dY Zd ), dAk = ( dY sv ) Td^T, dsu += colsum( dAk A )
-			route_gather( dy, pr, ps, w, Pg, H, dYr, st );
+			// kind kd's tile gains: per expert dR = ( X su H )^T ( dY sv H ) over its slab of rows (kk inputs, nn outputs), then its tiles' sums
+			auto gain_kind = [&]( int kd, const float* X, int kk, const float* dYk, int nn ) {
+				route_scale( X, gx, m, tab( kd, 0 ), Pg, kk, Xh, false, st );
+				had_rows( Xh, nullptr, Pg, kk, Xh, st );
+				route_scale( dYk, gx, m, tab( kd, 1 ), Pg, nn, Yh, false, st );
+				had_rows( Yh, nullptr, Pg, nn, Yh, st );
+				blas->gemm_strided( true, false, kk, nn, m, 1.0f, Xh, static_cast<long long>( m ) * kk, Yh, static_cast<long long>( m ) * nn, 0.0f, dRk,
+					static_cast<long long>( kk ) * nn, n );
+				for ( const Job& j : jobs[gi] )
+					if ( j.kind == kd ) EXL3_TILES_CALL( j.volta, tile_gain_grad_batch, d_gtab + j.goff, j.count, j.bits, j.mcg, j.mul1, kk, nn, st );
+			};
+			// down: dsv += colsum( dY Zd ), dAk = ( dY sv ) Td^T, dsu += colsum( dAk A ) (a candidate slot's dY: zero, its weight)
+			route_gather( dy, pr, ps, sw, Pg, H, dYr, st );
 			route_dots_pad( dy, pr, ps, Yr, Pg, H, dw, st );
+			if ( gains ) gain_kind( 2, Am, I, dYr, H );
 			seg_colsum_prod( dYr, Zd, m, H, n, gx, tab( 2, 3 ), st );
 			prod( dYr, tab( 2, 1 ), H, I, true, Wk[2], dAk );
 			seg_colsum_prod( dAk, Am, m, I, n, gx, tab( 2, 2 ), st );
@@ -1200,25 +1306,30 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 			// gate and up: dsv += colsum( dG Zg ), dXk = ( dG sv ) T^T, dsu += colsum( dXk X ), dX = dXk su
 			seg_colsum_prod( dG, Zg, m, I, n, gx, tab( 0, 3 ), st );
 			seg_colsum_prod( dU, Zu, m, I, n, gx, tab( 1, 3 ), st );
+			if ( gains ) {
+				gain_kind( 0, Xg, H, dG, I );
+				gain_kind( 1, Xg, H, dU, I );
+			}
 			prod( dG, tab( 0, 1 ), I, H, true, Wk[0], dXg );
 			prod( dU, tab( 1, 1 ), I, H, true, Wk[1], dXu );
 			seg_colsum_prod( dXg, Xg, m, H, n, gx, tab( 0, 2 ), st );
 			seg_colsum_prod( dXu, Xg, m, H, n, gx, tab( 1, 2 ), st );
 			route_scale( dXg, gx, m, tab( 0, 0 ), Pg, H, dYr, false, st );
 			route_scale( dXu, gx, m, tab( 1, 0 ), Pg, H, dYr, true, st );
-			route_combine( dYr, d_inv, g.p0, Pg, nullptr, T, K, H, dmix, st );
+			route_combine( dYr, d_inv, g.p0, Pg, nullptr, T, KS, H, dmix, st );
 		}
 	}
 	phase( dy ? "moe routed experts fwd+bwd" : "moe routed experts fwd" );
 	if ( dy ) {
 		// The routing weights' gradient (this rank's routes) into the router input
-		float* dl = ws.f( static_cast<size_t>( T ) * K );
-		topk_softmax_backward( w, dw, T, K, dl, st );
-		router_input_backward( dl, ids, lw.router, T, K, H, dmix, st );
+		float* dl = ws.f( static_cast<size_t>( T ) * KS );
+		if ( C ) route_candidates_backward( sw, dw, wp, T, K, C, dl, st );
+		else topk_softmax_backward( w, dw, T, K, dl, st );
+		router_input_backward( dl, sids, lw.router, T, KS, H, dmix, st );
 		if ( lw.g_router ) {
-			// the router's weights: dR = dL^T mix with dL the selected logits' gradients as dense rows (this rank's routes' share)
+			// the router's weights: dR = dL^T mix with dL the slots' logit gradients as dense rows (this rank's routes' share)
 			float* dL = ws.fz( static_cast<size_t>( T ) * E, st );
-			slots_to_dense( dl, ids, T, K, E, dL, st );
+			slots_to_dense( dl, sids, T, KS, E, dL, st );
 			blas->gemm( true, false, E, H, T, 1.0f, dL, mix, 1.0f, lw.g_router );
 		}
 	}
@@ -1566,8 +1677,8 @@ double Model::head( const float* x, int rows, const Teacher& t, float* dx ) {
 	// this rank's vocabulary columns (whole 128-column blocks)
 	const int vb = V / 128, v0 = vb * m.rank / m.ranks * 128, v1 = vb * ( m.rank + 1 ) / m.ranks * 128;
 	m.ws.reset( m.st );
-	m.fhc.down = m.unpack( m.fhc16[0] );
-	m.fhc.up = m.unpack( m.fhc16[1] );
+	if ( m.fhc16[0].p ) m.fhc.down = m.unpack( m.fhc16[0] );   // else trained (train_hc): in dense_p
+	if ( m.fhc16[1].p ) m.fhc.up = m.unpack( m.fhc16[1] );
 	HcCache c;
 	c.inv = m.ws.f( TL * cfg_.hc ); c.normed = m.ws.f( TL * flat ); c.zt = m.ws.f( TL * cfg_.rank ); c.t = m.ws.f( TL * cfg_.rank ); c.u = m.ws.f( TL * flat );
 	c.zi = m.ws.f( TL * cfg_.hc );
@@ -1612,6 +1723,7 @@ double Model::head( const float* x, int rows, const Teacher& t, float* dx ) {
 		scaled_linear_forward( *m.blas, m.sl( m.lm, Tc, v ), mixF, rows, Zc, Lc, scr );
 		kl_grad( Lc, rows, v.n, c0, lt, ut, t.ids, gq, t.tk, dl, m.st );
 		scaled_linear_backward( *m.blas, m.sl( m.lm, Tc, v ), mixF, Zc, dl, rows, dmixF_part, sn, sk, true );
+		m.gain_bwd( m.lm, mixF, dl, rows, v );
 	}
 	float* dmixF = m.reduce_rows( dmixF_part, TL * H );
 	CUDA_CHECK( cudaMemsetAsync( dx, 0, TL * flat * sizeof( float ), m.st ) );
@@ -1651,24 +1763,26 @@ std::string Model::memory_report() const {
 	const Impl& m = *p_;
 	const double G = 1073741824.0;
 	size_t fr = 0, tot = 0, pd = 0, ph = 0;
-	for ( const ParamPool* P : { &m.shared_p, &m.expert_p, &m.norm_p, &m.dense_p } ) {
+	for ( const ParamPool* P : { &m.shared_p, &m.expert_p, &m.norm_p, &m.dense_p, &m.hc_p, &m.gain_sp, &m.gain_ep } ) {
 		pd += P->device_bytes();
 		ph += P->host_bytes();
 	}
+	pd += m.gain_sp.cap + m.gain_ep.cap;   // the gains' codes
 	CUDA_CHECK( cudaSetDevice( device_ ) );
 	CUDA_CHECK( cudaMemGetInfo( &fr, &tot ) );
-	char out[800];
+	char out[900];
 	std::snprintf( out, sizeof( out ),
 		"  codes and FP16 scales (arena)   %6.2f GiB of %.2f\n"
 		"  dense copies (FP16)             %6.2f GiB\n"
 		"  kept sublayer outputs           %6.2f GiB\n"
 		"  state pool                      %6.2f GiB of %.2f\n"
 		"  workspace (peak)                %6.2f GiB of %.2f\n"
-		"  scale pools                     %6.2f GiB (shared %zu, experts %zu, norms %zu, small dense %zu values; Adam state %s, %d-bit moments; %.2f GiB on the host)\n"
+		"  scale pools                     %6.2f GiB (shared %zu, experts %zu, norms %zu, small dense %zu, hyper-connection mixes %zu, tile gains %zu + %zu "
+		"values; Adam state %s, %d-bit moments; %.2f GiB on the host)\n"
 		"  device in use                   %6.2f GiB of %.2f\n",
 		m.arena.offset_bytes / G, m.arena.total_bytes / G, m.dense_bytes / G, m.kept_bytes / G, m.state.off / G, m.state.cap / G, m.ws.peak / G,
-		m.ws.cap() / G, pd / G, m.shared_p.used, m.expert_p.used, m.norm_p.used, m.dense_p.used, m.opt_host ? "on the host" : "on the device", m.opt_bits, ph / G,
-		( tot - fr ) / G, tot / G );
+		m.ws.cap() / G, pd / G, m.shared_p.used, m.expert_p.used, m.norm_p.used, m.dense_p.used, m.hc_p.used, m.gain_sp.used, m.gain_ep.used,
+		m.opt_host ? "on the host" : "on the device", m.opt_bits, ph / G, ( tot - fr ) / G, tot / G );
 	return out;
 }
 
@@ -1692,7 +1806,7 @@ void Model::set_train_norms( bool on ) { p_->train_norms = on; }
 
 void Model::zero_grads() {
 	CUDA_CHECK( cudaSetDevice( device_ ) );
-	for ( ParamPool* P : { &p_->shared_p, &p_->expert_p, &p_->norm_p, &p_->dense_p } )
+	for ( ParamPool* P : { &p_->shared_p, &p_->expert_p, &p_->norm_p, &p_->dense_p, &p_->hc_p, &p_->gain_sp, &p_->gain_ep } )
 		if ( P->used ) CUDA_CHECK( cudaMemsetAsync( P->g, 0, P->used * sizeof( float ), p_->st ) );
 }
 
@@ -1713,7 +1827,26 @@ void Model::adam( const AdamOptions& o, int step, float grad_scale ) {
 		m.sum_ranks( m.dense_p.g, m.dense_p.used );
 		m.dense_p.step( false, od, step, grad_scale, m.st );
 	}
+	if ( m.train_hc ) {
+		AdamOptions oh = o;
+		oh.lr *= m.hc_lr;
+		m.sum_ranks( m.hc_p.g, m.hc_p.used );
+		m.hc_p.step( false, oh, step, grad_scale, m.st );
+	}
+	if ( m.train_gains ) {
+		AdamOptions og = o;
+		og.lr *= m.gain_lr;
+		m.sum_ranks( m.gain_sp.g, m.gain_sp.used );
+		for ( ParamPool* P : { &m.gain_sp, &m.gain_ep } ) P->step( false, og, step, grad_scale, m.st );
+		gain_codes( m.gain_sp.s, m.gcodes_s, m.gain_sp.used, m.st );
+		gain_codes( m.gain_ep.s, m.gcodes_e, m.gain_ep.used, m.st );
+	}
 	CUDA_CHECK( cudaStreamSynchronize( m.st ) );
+}
+
+void Model::set_train_gains( bool on, float lr_scale ) {
+	p_->train_gains = on;
+	p_->gain_lr = lr_scale;
 }
 
 void Model::set_train_dense( bool on, float lr_scale ) {
@@ -1725,6 +1858,16 @@ void Model::set_train_router( bool on ) { p_->train_router = on; }
 
 void Model::set_keep_outputs( bool on ) { p_->keep_outputs = on; }
 
+void Model::set_route_candidates( int n ) {
+	ENGINE_ASSERT( n >= 0 && cfg_.top_k + n <= 16, "qwen4_exp training model: at most 16 routes and candidates a row" );
+	p_->route_cand = n;
+}
+
+void Model::set_train_hc( bool on, float lr_scale ) {
+	p_->train_hc = on;
+	p_->hc_lr = lr_scale;
+}
+
 void Model::set_optimizer( bool host, int moment_bits ) {
 	ENGINE_ASSERT( moment_bits == 32 || moment_bits == 8, "qwen4_exp training model: Adam's moments are 32 or 8 bits" );
 	p_->opt_host = host;
@@ -1733,7 +1876,7 @@ void Model::set_optimizer( bool host, int moment_bits ) {
 
 void Model::keep_best() {
 	CUDA_CHECK( cudaSetDevice( device_ ) );
-	for ( ParamPool* P : { &p_->shared_p, &p_->expert_p, &p_->norm_p, &p_->dense_p } ) P->keep_best( p_->st );
+	for ( ParamPool* P : { &p_->shared_p, &p_->expert_p, &p_->norm_p, &p_->dense_p, &p_->hc_p, &p_->gain_sp, &p_->gain_ep } ) P->keep_best( p_->st );
 	CUDA_CHECK( cudaStreamSynchronize( p_->st ) );
 }
 
@@ -1764,11 +1907,26 @@ void Model::best_scales( std::vector<std::pair<std::string, std::pair<std::vecto
 
 void Model::best_dense( std::vector<std::pair<std::string, std::vector<uint16_t>>>& out ) {
 	CUDA_CHECK( cudaSetDevice( device_ ) );
-	const ParamPool* pools[] = { &p_->norm_p, &p_->dense_p };
-	const std::vector<float> hb[] = { pools[0]->best_values(), pools[1]->best_values() };
+	const ParamPool* pools[] = { &p_->norm_p, &p_->dense_p, &p_->hc_p };
+	const std::vector<float> hb[] = { pools[0]->best_values(), pools[1]->best_values(), pools[2]->best_values() };
 	for ( const Dense& d : p_->dense_t ) {
-		const int i = pools[0]->holds( d.w ) ? 0 : 1;
+		const int i = pools[0]->holds( d.w ) ? 0 : pools[1]->holds( d.w ) ? 1 : 2;
 		out.push_back( { d.name, to_fp16( hb[i].data() + ( d.w - pools[i]->s ), d.n ) } );
+	}
+}
+
+void Model::best_gains( std::vector<std::pair<std::string, std::vector<uint8_t>>>& out ) {
+	CUDA_CHECK( cudaSetDevice( device_ ) );
+	if ( !p_->train_gains ) return;
+	const ParamPool* pools[] = { &p_->gain_sp, &p_->gain_ep };
+	const std::vector<float> hb[] = { pools[0]->best_values(), pools[1]->best_values() };
+	for ( Tuned* t : tensors() ) {
+		if ( t->tg == nullptr ) continue;
+		const int i = pools[0]->holds( t->tg ) ? 0 : 1;
+		const float* g = hb[i].data() + ( t->tg - pools[i]->s );
+		std::vector<uint8_t> c( static_cast<size_t>( t->k / 16 ) * ( t->n / 16 ) );
+		for ( size_t j = 0; j < c.size(); ++j ) c[j] = static_cast<uint8_t>( std::clamp( std::nearbyint( g[j] * 1024.0f - 896.0f ), 0.0f, 255.0f ) );
+		out.push_back( { t->name, std::move( c ) } );
 	}
 }
 

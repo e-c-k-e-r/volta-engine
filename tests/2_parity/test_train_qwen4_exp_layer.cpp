@@ -2,7 +2,7 @@
 // its own forward: random input streams (and n-gram rows for the PLE layer), the loss sum( R * layer( x ) ); the input gradient on sampled
 // entries and the scale gradients of sampled channels (the routing held at the unperturbed input's selection) of several tensors (attention or GDN projections, the shared expert, routed experts),
 // and the weight gradients of the norms, the small dense tensors and the router (trainable here; the forward checked against their FP16
-// copies); then two sequences through one call against each alone.
+// copies), the tile gains' gradients by their sum against the scales'; then two sequences through one call against each alone.
 //   TRAIN_MODEL_DIR=<EXL3 Flash-Next checkpoint> test_train_qwen4_exp_layer [layer ...]   (default: 1, the PLE + GDN layer, and 3, attention)
 #include "engine/config.h"
 #include "engine/train/qwen4_exp.h"
@@ -62,8 +62,10 @@ int main( int argc, char** argv ) {
 	const int T = 24;
 	for ( int L : layers ) {
 		q::Model m;
-		m.set_train_dense( true );   // the small dense tensors' and the router's gradients checked with the norms'
+		m.set_train_dense( true );   // the small dense tensors', the router's and the hyper-connection mixes' gradients checked with the norms'
 		m.set_train_router( true );
+		m.set_train_hc( true );
+		m.set_train_gains( true );
 		if ( !m.load( dir, L, L + 1, 0, T ) ) {
 			std::printf( "[-] cannot load layer %d of %s\n", L, dir );
 			return 1;
@@ -168,6 +170,21 @@ int main( int argc, char** argv ) {
 			}
 			std::snprintf( line, sizeof( line ), "%-56s scales: error %.3g of %.3g (s %.3g)", t->name.c_str(), w, gm, get( t->su, 0 ) );
 			check( w <= 3e-2 * gm + 1e-4, line );
+			if ( t->tg ) {
+				// the tile gains (8-bit codes: no central differences at their step): scaling every gain scales the weight as scaling every
+				// input scale does, so sum_t g_t dL / dg_t = sum_i su_i dL / dsu_i = sum_j sv_j dL / dsv_j (the per-tile sums: test_train_qwen4_exp)
+				const size_t nt = static_cast<size_t>( t->k / 16 ) * ( t->n / 16 );
+				const std::vector<float> tg = down( t->tg, nt ), gt = down( t->gtg, nt ), su = down( t->su, t->k ), sv = down( t->sv, t->n );
+				double sg = 0.0, ss = 0.0, sw = 0.0, mg = 0.0;
+				for ( size_t i = 0; i < nt; ++i ) {
+					sg += static_cast<double>( tg[i] ) * gt[i];
+					mg += std::fabs( static_cast<double>( tg[i] ) * gt[i] );
+				}
+				for ( int i = 0; i < t->k; ++i ) ss += static_cast<double>( su[i] ) * gu[i];
+				for ( int j = 0; j < t->n; ++j ) sw += static_cast<double>( sv[j] ) * gv[j];
+				std::snprintf( line, sizeof( line ), "%-56s gains: sum g dg %.4g, sum su dsu %.4g, sum sv dsv %.4g", t->name.c_str(), sg, ss, sw );
+				check( std::fabs( sg - ss ) <= 1e-2 * mg + 1e-6 && std::fabs( sg - sw ) <= 1e-2 * mg + 1e-6, line );
+			}
 		}
 		// Norm weights and the small dense tensors: the largest-gradient entry and a random one of each (absolute steps: additive deltas)
 		for ( q::Dense* d : m.dense_tensors() ) {
@@ -256,6 +273,8 @@ int main( int argc, char** argv ) {
 			q::Model mb;
 			mb.set_train_dense( true );
 			mb.set_train_router( true );
+			mb.set_train_hc( true );
+			mb.set_train_gains( true );
 			if ( !mb.load( dir, L, L + 1, 0, Tb ) ) return 1;
 			// FP32 products: with FP16 ones the roundings turn the libraries' other summation orders at other row counts into differences
 			// of the FP16 path's own size
@@ -279,6 +298,10 @@ int main( int argc, char** argv ) {
 					const std::vector<float> u = down( t->gu, t->k ), v = down( t->gv, t->n );
 					all.insert( all.end(), u.begin(), u.end() );
 					all.insert( all.end(), v.begin(), v.end() );
+					if ( t->gtg ) {
+						const std::vector<float> g2 = down( t->gtg, static_cast<size_t>( t->k / 16 ) * ( t->n / 16 ) );
+						all.insert( all.end(), g2.begin(), g2.end() );
+					}
 				}
 				for ( q::Dense* d : mb.dense_tensors() ) {
 					const std::vector<float> g2 = down( d->g, d->n );

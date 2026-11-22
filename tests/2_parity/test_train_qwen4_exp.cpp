@@ -3,6 +3,9 @@
 // sample of input entries. Small shapes; no checkpoint.
 #include "engine/config.h"
 #include "engine/train/qwen4_exp.h"
+#include "engine/modules/trellis_bits.h"
+#include "reconstruct.cuh"
+#include "exl3_vl.cuh"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <algorithm>
@@ -877,6 +880,120 @@ void test_kl() {
 	}
 }
 
+// The 128-point Sylvester transform at unit norm, in place
+void h_had128( double* v ) {
+	for ( int h = 1; h < 128; h <<= 1 )
+		for ( int i = 0; i < 128; i += 2 * h )
+			for ( int j = i; j < i + h; ++j ) {
+				const double a = v[j], b = v[j + h];
+				v[j] = a + b;
+				v[j + h] = a - b;
+			}
+	for ( int i = 0; i < 128; ++i ) v[i] *= 1.0 / std::sqrt( 128.0 );
+}
+
+void test_tile_gains() {
+	std::printf( "(j) tile gains: the cores' rotations, had_rows, the gains' gradient over a view (random 2-bit mul1 codes with starts and gains)\n" );
+	const int k = 256, n = 384, rows = 24, K = 2, tiles = ( k / 16 ) * ( n / 16 ), tu = engine::modules::trellis_tile_u16( K );
+	const int r0 = 128, vk = 128, c0 = 128, vn = 256;   // the view: whole 128-blocks inside the tensor
+	std::uniform_int_distribution<int> u16( 0, 65535 ), u8( 0, 255 );
+	std::vector<uint16_t> h_codes( static_cast<size_t>( tiles ) * tu ), h_starts( tiles );
+	std::vector<uint8_t> h_gains( tiles );
+	for ( auto& c : h_codes ) c = static_cast<uint16_t>( u16( rng ) );
+	for ( auto& s : h_starts ) s = static_cast<uint16_t>( u16( rng ) );
+	for ( auto& g : h_gains ) g = static_cast<uint8_t>( u8( rng ) );
+	uint16_t *codes, *starts;
+	uint8_t* gains;
+	CUDA_CHECK( cudaMalloc( &codes, h_codes.size() * 2 ) );
+	CUDA_CHECK( cudaMalloc( &starts, h_starts.size() * 2 ) );
+	CUDA_CHECK( cudaMalloc( &gains, h_gains.size() ) );
+	CUDA_CHECK( cudaMemcpy( codes, h_codes.data(), h_codes.size() * 2, cudaMemcpyHostToDevice ) );
+	CUDA_CHECK( cudaMemcpy( starts, h_starts.data(), h_starts.size() * 2, cudaMemcpyHostToDevice ) );
+	CUDA_CHECK( cudaMemcpy( gains, h_gains.data(), h_gains.size(), cudaMemcpyHostToDevice ) );
+	const Vec X = randv( static_cast<size_t>( rows ) * vk ), dY = randv( static_cast<size_t>( rows ) * vn );
+	Vec su = randv( k, 0.2 ), sv = randv( n, 0.2 );
+	for ( auto& s : su ) s = std::exp( s );
+	for ( auto& s : sv ) s = std::exp( s );
+	float *d_X = up( X ), *d_dY = up( dY ), *d_su = up( su ), *d_sv = up( sv );
+	float *Wc = zeros( static_cast<size_t>( k ) * n ), *Xr = zeros( X.size() ), *dYr = zeros( dY.size() ), *dR = zeros( static_cast<size_t>( vk ) * vn );
+	float* dg = zeros( tiles );
+	half* R16;
+	CUDA_CHECK( cudaMalloc( &R16, static_cast<size_t>( k ) * n * 2 ) );
+	engine::train::Blas blas( nullptr );
+	char line[200];
+	for ( const bool volta : { false, true } ) {
+#if !ENGINE_EXL3_VL
+		if ( volta ) continue;
+#endif
+		const char* order = volta ? "Volta tile order" : "stock tile order";
+		// the tiles R (gains applied) and the core H R H as the trainer decodes it (FP32 out, FP16 inside)
+		EXL3_TILES_CALL( volta, reconstruct_slice_ext, R16, codes, starts, gains, K, false, true, k / 16, n, 0, nullptr );
+		EXL3_TILES_CALL( volta, reconstruct_had_block, Wc, codes, starts, gains, K, false, true, 0, k, 0, n, n, false, nullptr );
+		std::vector<half> hr( static_cast<size_t>( k ) * n );
+		CUDA_CHECK( cudaDeviceSynchronize() );
+		CUDA_CHECK( cudaMemcpy( hr.data(), R16, hr.size() * 2, cudaMemcpyDeviceToHost ) );
+		Vec R( hr.size() );
+		for ( size_t i = 0; i < R.size(); ++i ) R[i] = __half2float( hr[i] );
+		const Vec W = down( Wc, R.size() );
+		{
+			// H R H per 128 x 128 block: along each row's columns, then along each column's rows
+			Vec ref = R;
+			for ( int r = 0; r < k; ++r ) for ( int b = 0; b < n; b += 128 ) h_had128( &ref[static_cast<size_t>( r ) * n + b] );
+			std::vector<double> col( 128 );
+			for ( int c = 0; c < n; ++c ) for ( int b = 0; b < k; b += 128 ) {
+				for ( int i = 0; i < 128; ++i ) col[i] = ref[static_cast<size_t>( b + i ) * n + c];
+				h_had128( col.data() );
+				for ( int i = 0; i < 128; ++i ) ref[static_cast<size_t>( b + i ) * n + c] = col[i];
+			}
+			double d2 = 0.0, n2 = 0.0;
+			for ( size_t i = 0; i < ref.size(); ++i ) {
+				d2 += ( W[i] - ref[i] ) * ( W[i] - ref[i] );
+				n2 += ref[i] * ref[i];
+			}
+			std::snprintf( line, sizeof( line ), "%s: the decoded core against H R H of the decoded tiles: relative error %.3g", order, std::sqrt( d2 / n2 ) );
+			check( std::sqrt( d2 / n2 ) < 2e-3, line );
+		}
+		// had_rows on the view's input and output gradient (with the view's scales), against the host
+		q::had_rows( d_X, d_su + r0, rows, vk, Xr, nullptr );
+		q::had_rows( d_dY, d_sv + c0, rows, vn, dYr, nullptr );
+		Vec xr( X.size() ), yr( dY.size() );
+		for ( int r = 0; r < rows; ++r ) {
+			for ( int i = 0; i < vk; ++i ) xr[static_cast<size_t>( r ) * vk + i] = X[static_cast<size_t>( r ) * vk + i] * su[r0 + i];
+			for ( int j = 0; j < vn; ++j ) yr[static_cast<size_t>( r ) * vn + j] = dY[static_cast<size_t>( r ) * vn + j] * sv[c0 + j];
+			for ( int b = 0; b < vk; b += 128 ) h_had128( &xr[static_cast<size_t>( r ) * vk + b] );
+			for ( int b = 0; b < vn; b += 128 ) h_had128( &yr[static_cast<size_t>( r ) * vn + b] );
+		}
+		const Vec gx = down( Xr, xr.size() ), gy = down( dYr, yr.size() );
+		double e = 0.0, m = 0.0;
+		for ( size_t i = 0; i < xr.size(); ++i ) e = std::max( e, std::fabs( gx[i] - xr[i] ) ), m = std::max( m, std::fabs( xr[i] ) );
+		for ( size_t i = 0; i < yr.size(); ++i ) e = std::max( e, std::fabs( gy[i] - yr[i] ) ), m = std::max( m, std::fabs( yr[i] ) );
+		std::snprintf( line, sizeof( line ), "%s: had_rows against the host: max error %.3g of %.3g", order, e, m );
+		check( e < 1e-5 * m, line );
+		// the gains' gradient over the view: per tile sum( dR o R ) / g with dR = Xr^T dYr, the tiles outside the view untouched
+		CUDA_CHECK( cudaMemset( dg, 0, tiles * sizeof( float ) ) );
+		blas.gemm( true, false, vk, vn, rows, 1.0f, Xr, dYr, 0.0f, dR );
+		EXL3_TILES_CALL( volta, tile_gain_grad, dR, dg, codes, starts, gains, K, false, true, r0, vk, c0, vn, n, nullptr );
+		const Vec g = down( dg, tiles );
+		Vec ref( tiles, 0.0 );
+		for ( int i = 0; i < vk; ++i ) for ( int j = 0; j < vn; ++j ) {
+			double s = 0.0;
+			for ( int r = 0; r < rows; ++r ) s += xr[static_cast<size_t>( r ) * vk + i] * yr[static_cast<size_t>( r ) * vn + j];
+			const int t = ( ( r0 + i ) / 16 ) * ( n / 16 ) + ( c0 + j ) / 16;
+			ref[t] += s * R[static_cast<size_t>( r0 + i ) * n + c0 + j] / ( ( 896.0 + h_gains[t] ) / 1024.0 );
+		}
+		e = 0.0;
+		m = 0.0;
+		for ( int t = 0; t < tiles; ++t ) e = std::max( e, std::fabs( g[t] - ref[t] ) ), m = std::max( m, std::fabs( ref[t] ) );
+		std::snprintf( line, sizeof( line ), "%s: tile gains' gradient over the view against the host: max error %.3g of %.3g", order, e, m );
+		check( e < 1e-4 * m, line );
+	}
+	for ( float* x : { d_X, d_dY, d_su, d_sv, Wc, Xr, dYr, dR, dg } ) cudaFree( x );
+	cudaFree( R16 );
+	cudaFree( codes );
+	cudaFree( starts );
+	cudaFree( gains );
+}
+
 } // namespace
 
 int main() {
@@ -891,6 +1008,7 @@ int main() {
 	test_attention();
 	test_routing_ple();
 	test_kl();
+	test_tile_gains();
 	std::printf( "[%c] test_train_qwen4_exp: %d failure(s)\n", fails ? '-' : '+', fails );
 	return fails ? 1 : 0;
 }

@@ -198,6 +198,11 @@ private:
 	void copy_pool_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	void trace_route( int tag, int m, backend::stream_t stream );
 	void dump_router( int m, backend::stream_t stream );
+	void dump_qsa( int attn_idx, int m, backend::stream_t stream );
+	// Debug (route_replay, qsa_replay): the next recorded selection of this layer replaces the one just computed
+	void replay_routes( int m, backend::stream_t stream );
+	void replay_qsa( int attn_idx, int m, backend::stream_t stream );
+	int replay_next_[256] = {};   // per layer (routes) and 128 + attention layer (QSA): the next record
 	void dump_train_input( int kind, const void* a, int m, int cols_a, const void* b, int cols_b, backend::stream_t stream );
 	void trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols = 0 );
 	// Calibration (hessian_dir): x^T x of a projection input, accumulated over prefill rows into site `site` of layer `layer`
