@@ -311,7 +311,11 @@ public:
 	// into the router's input (and with set_train_router the router); router_kl() returns the sum of those KL values since the last call (rank
 	// 0's, the training backward's and the evaluation forward's; the others 0)
 	void set_router_teacher( const std::vector<Teacher>& per_layer, float weight );
-	double router_kl();
+	// shared (not null): the share of the teacher's top-k experts the selections held over the same calls
+	double router_kl( double* shared = nullptr );
+	// Router calibration (EAC-MoE's layer-wise router calibration in end-to-end form): forward calls add the routing term's gradient to the
+	// routers alone (with set_train_router; no backward needed), each router fitting the teacher's routing on this model's own inputs
+	void set_router_calibration( bool on );
 
 	// The trainable tensors' products on the tensor cores (the default: FP16 cores, activations and gradients rounded to FP16 per row at a
 	// power-of-two scale, FP32 accumulation; everything else FP32), or off: FP32 products

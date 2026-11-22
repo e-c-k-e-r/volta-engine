@@ -392,6 +392,8 @@ struct Model::Impl {
 	float router_w = 0.0f;
 	double router_kl_sum = 0.0;
 	bool count_router_kl = false;   // this call's router KL counts (the training backward, an evaluation forward)
+	bool router_calib = false;      // router calibration: the forward adds the term's gradient to the routers (set_train_router) alone
+	int64_t router_hits = 0, router_slots = 0;   // the selections' share of the teacher's top-k, counted with the KL
 	std::vector<ExpertAccum> acc;
 	float* acc_buf = nullptr;
 	std::vector<std::vector<uint16_t>> saved_codes, saved_starts;   // per expert and kind (3 e + kind)
@@ -1166,15 +1168,23 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 			kl_finish( mx, sx, sl, rt->p, rt->tail, T, rt->tk, lt, gq, ut, kl, st );
 			if ( count_router_kl ) {
 				std::vector<float> h( TR );
+				std::vector<int> tid( TR * rt->tk );
 				CUDA_CHECK( cudaMemcpyAsync( h.data(), kl, TR * sizeof( float ), cudaMemcpyDeviceToHost, st ) );
+				CUDA_CHECK( cudaMemcpyAsync( tid.data(), rt->ids, tid.size() * sizeof( int ), cudaMemcpyDeviceToHost, st ) );
 				CUDA_CHECK( cudaStreamSynchronize( st ) );
 				for ( float v : h ) router_kl_sum += v;
+				// the share of the teacher's top-k (its first K ids, by logit) this call's selection holds
+				for ( int r = 0; r < T; ++r )
+					for ( int j = 0; j < K; ++j )
+						for ( int q = 0; q < K && q < rt->tk; ++q ) router_hits += h_ids[static_cast<size_t>( r ) * K + j] == tid[static_cast<size_t>( r ) * rt->tk + q];
+				router_slots += static_cast<int64_t>( T ) * K;
 			}
-			if ( dy ) {
+			// with dy the term's gradient into the router's input (and the router); router calibration: in the forward, the router's alone
+			if ( dy || ( router_calib && lw.g_router ) ) {
 				CUDA_CHECK( cudaMemcpyAsync( Lc, logits, TE * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
 				float* dl = ws.f( TE );
 				kl_grad( Lc, T, E, 0, lt, ut, rt->ids, gq, rt->tk, dl, st );
-				blas->gemm( false, false, T, H, E, router_w, dl, lw.router, 1.0f, dmix );
+				if ( dy ) blas->gemm( false, false, T, H, E, router_w, dl, lw.router, 1.0f, dmix );
 				if ( lw.g_router ) blas->gemm( true, false, E, H, T, router_w, dl, mix, 1.0f, lw.g_router );
 			}
 			ws.off = mark_r;
@@ -1822,9 +1832,13 @@ void Model::set_router_teacher( const std::vector<Teacher>& per_layer, float wei
 	p_->router_w = weight;
 }
 
-double Model::router_kl() {
+void Model::set_router_calibration( bool on ) { p_->router_calib = on; }
+
+double Model::router_kl( double* shared ) {
 	const double s = p_->router_kl_sum;
+	if ( shared ) *shared = p_->router_slots ? static_cast<double>( p_->router_hits ) / static_cast<double>( p_->router_slots ) : 0.0;
 	p_->router_kl_sum = 0.0;
+	p_->router_hits = p_->router_slots = 0;
 	return s;
 }
 

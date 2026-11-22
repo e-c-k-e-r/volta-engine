@@ -101,8 +101,9 @@ bool validate_config( const char* model_dir, const Qwen4ExpConfig& c ) {
 	return ok;
 }
 
-// The router kernel reads the gate as [hidden, experts]; the checkpoint stores [experts, hidden]
-pod::TensorView load_router_transposed( engine::loader::SafeTensorsRepo& repo, const char* name, pod::MemoryArena& arena ) {
+// The router kernel reads the gate as [hidden, experts]; the checkpoint stores [experts, hidden]. rows (not null): also the stored layout,
+// [experts, hidden], for router_dump's logits GEMM (out = x w^T)
+pod::TensorView load_router_transposed( engine::loader::SafeTensorsRepo& repo, const char* name, pod::MemoryArena& arena, pod::TensorView* rows = nullptr ) {
 	int shard_idx = -1;
 	const auto* meta = repo.find( name, &shard_idx );
 	if ( !meta || shard_idx < 0 ) return pod::TensorView{};
@@ -129,6 +130,11 @@ pod::TensorView load_router_transposed( engine::loader::SafeTensorsRepo& repo, c
 		std::vector<backend::half_t> t( static_cast<size_t>( H ) * E );
 		for ( int e = 0; e < E; ++e ) for ( int d = 0; d < H; ++d ) t[static_cast<size_t>( d ) * E + e] = src[static_cast<size_t>( e ) * H + d];
 		backend::memcpy_sync( tv.data, t.data(), t.size() * sizeof( backend::half_t ), backend::Copy::H2D );
+	}
+	if ( rows ) {
+		int rshape[2] = { E, H };
+		*rows = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rshape, 2 );
+		if ( rows->data ) backend::memcpy_sync( rows->data, src, static_cast<size_t>( E ) * H * sizeof( backend::half_t ), backend::Copy::H2D );
 	}
 	return tv;
 }
@@ -611,7 +617,7 @@ bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t st
 
 		// MoE: replicated router, 128 whole experts per rank, shared expert (replicated, run on one rank) and its gate
 		std::snprintf( nm, sizeof( nm ), "%s.mlp.gate.weight", pre );
-		lw.router = load_router_transposed( *src, nm, *arena_ );
+		lw.router = load_router_transposed( *src, nm, *arena_, runtime::options().router_dump.empty() ? nullptr : &lw.router_rows );
 		if ( !lw.router.data ) { LOG_ERROR( "[RANK %d] MISSING %s\n", rank_, nm ); ++missing; }
 		auto& mw = lw.experts;
 		const bool nv_experts = nv_repo && ( !in_mtp || mtp_nv );
@@ -964,7 +970,8 @@ void Qwen4ExpPipeline::dump_router_logits( const Qwen4ExpLayerWeights& lw, int m
 	if ( path.empty() || router_logits_ == nullptr || rank_ != 0 || m <= pod::MAX_BATCH ) return;
 	constexpr int TK = 16;
 	const int E = config_.num_experts, H = config_.hidden_size;
-	engine::modules::Vision::dense_gemm( mixed_.ptr<const backend::half_t>(), lw.router.ptr<const backend::half_t>(), router_logits_, gemm_rows( m ), E, H, stream );
+	if ( lw.router_rows.data == nullptr ) return;   // the MTP block's router is not kept in rows
+	engine::modules::Vision::dense_gemm( mixed_.ptr<const backend::half_t>(), lw.router_rows.ptr<const backend::half_t>(), router_logits_, gemm_rows( m ), E, H, stream );
 	std::vector<backend::half_t> lg( static_cast<size_t>( m ) * E );
 	backend::stream_sync( stream );
 	backend::memcpy_async( lg.data(), router_logits_, lg.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );

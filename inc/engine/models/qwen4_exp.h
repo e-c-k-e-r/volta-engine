@@ -94,7 +94,8 @@ struct Qwen4ExpLayerWeights {
 	pod::TensorView idx_q_norm, idx_k_norm;
 
 	// MoE: router, expert-parallel routed experts, shared expert + its gate
-	pod::TensorView router;
+	pod::TensorView router;          // [hidden, experts] (the router kernel's layout)
+	pod::TensorView router_rows;     // router_dump: [experts, hidden] (the checkpoint's)
 	pod::MoELayerWeights experts;
 	pod::LinearWeight shared_gate, shared_up, shared_down;
 	pod::TensorView shared_expert_gate;

@@ -66,6 +66,7 @@ namespace q = engine::tools::quant;
 struct Args {
 	std::string model, inputs, teacher, out, check_trace, check_routes, router_teacher;
 	float router_kl = 0.0f;                    // --router-kl: the routing distillation term's weight (0: off)
+	bool router_calib = false;                 // --router-calib 1: router calibration (forward passes, the routers alone; with --router 1)
 	int router_l0 = 0, router_l1 = 1 << 20;    // --router-kl-layers A-B: its layers
 	std::vector<int> devices = { 0, 1, 2, 3 };
 	int steps = 64, batch = 4, seqs = 1, hold = 4, eval_every = 16, warmup = 2, train = 0, adam_bits = 32, ckpt_host = -1, keep = -1, check_inputs = 0, route_cand = 0;
@@ -174,6 +175,7 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--check-routes" ) a.check_routes = v;
 		else if ( k == "--router-teacher" ) a.router_teacher = v;
 		else if ( k == "--router-kl" ) a.router_kl = std::stof( v );
+		else if ( k == "--router-calib" ) a.router_calib = v != "0";
 		else if ( k == "--router-kl-layers" ) {
 			const size_t dash = v.find( '-' );
 			a.router_l0 = std::stoi( v.substr( 0, dash ) );
@@ -541,6 +543,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		m->set_fp16( a.fp16 );
 		m->set_train_norms( a.norms );
 		m->set_qsa( a.qsa );
+		m->set_router_calibration( a.router_calib );
 		std::unique_ptr<tq::Inputs> inp;
 		if ( ok[r] && !d.dumped() ) {
 			inp = std::make_unique<tq::Inputs>();
@@ -704,7 +707,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			return kl;
 		};
 		// with the routing teacher, the routing KL per token and layer of the last held-out pass (rank 0)
-		double ho_router = 0.0;
+		double ho_router = 0.0, ho_shared = 0.0, tr_shared = 0.0;
 		auto held_out = [&]() {
 			double kl = 0.0;
 			m->router_kl();
@@ -713,14 +716,14 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 				for ( int sq = s0; sq < std::min( S, s0 + P ); ++sq ) sqs.push_back( sq );
 				kl += run( sqs, false );
 			}
-			ho_router = m->router_kl() / ( static_cast<double>( a.hold ) * T * std::max( r_layers_n, 1 ) );
+			ho_router = m->router_kl( &ho_shared ) / ( static_cast<double>( a.hold ) * T * std::max( r_layers_n, 1 ) );
 			return kl / ( static_cast<double>( a.hold ) * T );
 		};
-		auto routing_note = [&]( double v ) {
+		auto routing_note = [&]( double v, double sh ) {
 			std::string s;
 			if ( routing ) {
-				char b[64];
-				std::snprintf( b, sizeof( b ), ", routing KL %.4f per layer", v );
+				char b[96];
+				std::snprintf( b, sizeof( b ), ", routing KL %.4f per layer (%.1f%% of the teacher's experts picked)", v, 100.0 * sh );
 				s = b;
 			}
 			return s;
@@ -728,7 +731,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		const auto th0 = std::chrono::steady_clock::now();
 		double my_best = held_out();
 		if ( r == 0 )
-			LOG_INFO( "[volta_e2e] held-out KL before tuning %.6f per token%s (%.1f s)", my_best, routing_note( ho_router ).c_str(),
+			LOG_INFO( "[volta_e2e] held-out KL before tuning %.6f per token%s (%.1f s)", my_best, routing_note( ho_router, ho_shared ).c_str(),
 				std::chrono::duration<double>( std::chrono::steady_clock::now() - th0 ).count() );
 		m->keep_best();
 		if ( a.reencode >= 0 ) {
@@ -791,7 +794,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			for ( int b = 0; b < a.batch; b += P ) {
 				std::vector<int> sqs;
 				for ( int i = b; i < std::min( a.batch, b + P ); ++i ) sqs.push_back( order.at( used++ ) );
-				kl += run( sqs, true );
+				kl += run( sqs, !a.router_calib );   // router calibration: forward passes (the routers' gradient comes with them)
 			}
 			o.lr = lr_at( a, step );
 			m->adam( o, step, 1.0f / ( static_cast<float>( a.batch ) * T ) );
@@ -815,17 +818,17 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 					bar.wait();
 				}
 			}
-			const double tr_router = m->router_kl() / ( static_cast<double>( a.batch ) * T * std::max( r_layers_n, 1 ) );
+			const double tr_router = m->router_kl( &tr_shared ) / ( static_cast<double>( a.batch ) * T * std::max( r_layers_n, 1 ) );
 			if ( r == 0 )
 				LOG_INFO( "[volta_e2e] step %d: train KL %.6f per token%s, lr %.3g, %.1f s", step, kl / ( static_cast<double>( a.batch ) * T ),
-					routing_note( tr_router ).c_str(), o.lr, std::chrono::duration<double>( std::chrono::steady_clock::now() - ts ).count() );
+					routing_note( tr_router, tr_shared ).c_str(), o.lr, std::chrono::duration<double>( std::chrono::steady_clock::now() - ts ).count() );
 			if ( step % a.eval_every == 0 || step == a.steps ) {
 				const bool was = a.timing;
 				if ( was ) m->set_timing( false );
 				const double ho = held_out();
 				if ( was ) m->set_timing( true );
 				if ( r == 0 )
-					LOG_INFO( "[volta_e2e] step %d: held-out KL %.6f per token%s (best %.6f at step %d)", step, ho, routing_note( ho_router ).c_str(),
+					LOG_INFO( "[volta_e2e] step %d: held-out KL %.6f per token%s (best %.6f at step %d)", step, ho, routing_note( ho_router, ho_shared ).c_str(),
 						std::min( ho, my_best ), ho < my_best ? step : my_step );
 				if ( ho < my_best ) {
 					my_best = ho;
