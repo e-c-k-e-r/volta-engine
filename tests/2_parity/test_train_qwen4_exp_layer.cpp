@@ -264,30 +264,36 @@ int main( int argc, char** argv ) {
 				m.forward( L, x, y, T, pk, pv );
 				return static_cast<double>( w ) * m.router_kl();
 			};
-			const double kl0 = loss_r() / w / T;
-			m.forward( L, x, y, T, pk, pv, true );
-			m.zero_grads();
-			m.backward( L, x, R0, dx, T, pk, pv );
-			m.router_kl();
-			const std::vector<float> gr = down( dx, nx );
-			double wr = 0.0, gmr = 0.0;
-			for ( int s = 0; s < 12; ++s ) {
-				// entries with a large gradient and random ones
-				size_t i = std::uniform_int_distribution<size_t>( 0, nx - 1 )( rng );
-				if ( s < 4 ) i = static_cast<size_t>( std::max_element( gr.begin(), gr.end(), []( float a, float b ) { return std::fabs( a ) < std::fabs( b ); } ) - gr.begin() ) + s;
-				i = std::min( i, nx - 1 );
-				const float x0 = hx[i], h = 1e-2f * std::max( 1.0f, std::fabs( x0 ) );
-				set( x, i, x0 + h );
-				const double lp = loss_r();
-				set( x, i, x0 - h );
-				const double lm = loss_r();
-				set( x, i, x0 );
-				const double fd = ( lp - lm ) / ( 2 * h );
-				wr = std::max( wr, std::fabs( fd - gr[i] ) );
-				gmr = std::max( gmr, std::fabs( fd ) );
+			// the distribution's KL, then the top-k boundary's margins (the selection held, so that the margin terms are smooth)
+			for ( const float margin : { 0.0f, 0.5f } ) {
+				m.set_router_margin( margin );
+				const double kl0 = loss_r() / w / T;
+				m.forward( L, x, y, T, pk, pv, true );
+				m.zero_grads();
+				m.backward( L, x, R0, dx, T, pk, pv );
+				m.router_kl();
+				const std::vector<float> gr = down( dx, nx );
+				double wr = 0.0, gmr = 0.0;
+				for ( int s = 0; s < 12; ++s ) {
+					// entries with a large gradient and random ones
+					size_t i = std::uniform_int_distribution<size_t>( 0, nx - 1 )( rng );
+					if ( s < 4 ) i = static_cast<size_t>( std::max_element( gr.begin(), gr.end(), []( float a, float b ) { return std::fabs( a ) < std::fabs( b ); } ) - gr.begin() ) + s;
+					i = std::min( i, nx - 1 );
+					const float x0 = hx[i], h = 1e-3f * std::max( 1.0f, std::fabs( x0 ) );
+					set( x, i, x0 + h );
+					const double lp = loss_r();
+					set( x, i, x0 - h );
+					const double lm = loss_r();
+					set( x, i, x0 );
+					const double fd = ( lp - lm ) / ( 2 * h );
+					wr = std::max( wr, std::fabs( fd - gr[i] ) );
+					gmr = std::max( gmr, std::fabs( fd ) );
+				}
+				std::snprintf( line, sizeof( line ), "router distillation alone (%s %.3g per row), input gradient: max error %.3g of max %.3g",
+					margin > 0.0f ? "margins" : "KL", kl0, wr, gmr );
+				check( gmr > 0.0 && wr <= 3e-2 * gmr + 1e-6, line );
 			}
-			std::snprintf( line, sizeof( line ), "router distillation alone (KL %.3g per row), input gradient: max error %.3g of max %.3g", kl0, wr, gmr );
-			check( gmr > 0.0 && wr <= 3e-2 * gmr + 1e-6, line );
+			m.set_router_margin( 0.0f );
 			cudaFree( R0 );
 			m.set_router_teacher( {}, 0.0f );
 			for ( void* p : { (void*) d_tid, (void*) d_tp, (void*) d_tt } ) cudaFree( p );

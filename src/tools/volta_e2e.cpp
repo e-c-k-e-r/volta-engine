@@ -67,6 +67,7 @@ struct Args {
 	std::string model, inputs, teacher, out, check_trace, check_routes, router_teacher;
 	float router_kl = 0.0f;                    // --router-kl: the routing distillation term's weight (0: off)
 	bool router_calib = false;                 // --router-calib 1: router calibration (forward passes, the routers alone; with --router 1)
+	float router_margin = 0.0f;                // --router-margin D: the routing term as the top-k boundary's margins (D > 0) instead of the KL
 	int router_l0 = 0, router_l1 = 1 << 20;    // --router-kl-layers A-B: its layers
 	std::vector<int> devices = { 0, 1, 2, 3 };
 	int steps = 64, batch = 4, seqs = 1, hold = 4, eval_every = 16, warmup = 2, train = 0, adam_bits = 32, ckpt_host = -1, keep = -1, check_inputs = 0, route_cand = 0;
@@ -176,6 +177,7 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--router-teacher" ) a.router_teacher = v;
 		else if ( k == "--router-kl" ) a.router_kl = std::stof( v );
 		else if ( k == "--router-calib" ) a.router_calib = v != "0";
+		else if ( k == "--router-margin" ) a.router_margin = std::stof( v );
 		else if ( k == "--router-kl-layers" ) {
 			const size_t dash = v.find( '-' );
 			a.router_l0 = std::stoi( v.substr( 0, dash ) );
@@ -544,6 +546,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		m->set_train_norms( a.norms );
 		m->set_qsa( a.qsa );
 		m->set_router_calibration( a.router_calib );
+		m->set_router_margin( a.router_margin );
 		std::unique_ptr<tq::Inputs> inp;
 		if ( ok[r] && !d.dumped() ) {
 			inp = std::make_unique<tq::Inputs>();

@@ -394,6 +394,7 @@ struct Model::Impl {
 	bool count_router_kl = false;   // this call's router KL counts (the training backward, an evaluation forward)
 	bool router_calib = false;      // router calibration: the forward adds the term's gradient to the routers (set_train_router) alone
 	int64_t router_hits = 0, router_slots = 0;   // the selections' share of the teacher's top-k, counted with the KL
+	float router_margin = 0.0f;     // > 0: the routing term is route_margin's (the top-k boundary) at this margin instead of the KL
 	std::vector<ExpertAccum> acc;
 	float* acc_buf = nullptr;
 	std::vector<std::vector<uint16_t>> saved_codes, saved_starts;   // per expert and kind (3 e + kind)
@@ -1154,18 +1155,34 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 		if ( rt && rank == 0 && router_w > 0.0f && ( dy || count_router_kl ) ) {
 			const size_t TE = static_cast<size_t>( T ) * E, TR = static_cast<size_t>( T );
 			const size_t mark_r = ws.off;
-			float* Lc = ws.f( TE );
-			CUDA_CHECK( cudaMemcpyAsync( Lc, logits, TE * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
-			float *mx = ws.f( TR ), *sx = ws.fz( TR, st ), *sl = ws.fz( TR * rt->tk, st );
-			{
-				std::vector<float> ninf( TR, -INFINITY );
-				CUDA_CHECK( cudaMemcpyAsync( mx, ninf.data(), TR * sizeof( float ), cudaMemcpyHostToDevice, st ) );
-				CUDA_CHECK( cudaStreamSynchronize( st ) );
+			const bool grad = dy || ( router_calib && lw.g_router );
+			float *kl = nullptr, *dl = nullptr;   // per row the term, and its logit gradient (grad)
+			if ( router_margin > 0.0f ) {
+				// the top-k boundary's margins instead of the distribution's KL
+				kl = ws.f( TR );
+				dl = ws.fz( TE, st );
+				route_margin( logits, ids, rt->ids, T, E, K, rt->tk, router_margin, dl, kl, st );
 			}
-			kl_lse_update( Lc, T, E, mx, sx, st );
-			kl_gather( Lc, T, E, 0, rt->ids, rt->tk, sl, st );
-			float *lt = ws.f( TR ), *gq = ws.f( TR * rt->tk ), *kl = ws.f( TR ), *ut = ws.f( TR );
-			kl_finish( mx, sx, sl, rt->p, rt->tail, T, rt->tk, lt, gq, ut, kl, st );
+			else {
+				float* Lc = ws.f( TE );
+				CUDA_CHECK( cudaMemcpyAsync( Lc, logits, TE * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
+				float *mx = ws.f( TR ), *sx = ws.fz( TR, st ), *sl = ws.fz( TR * rt->tk, st );
+				{
+					std::vector<float> ninf( TR, -INFINITY );
+					CUDA_CHECK( cudaMemcpyAsync( mx, ninf.data(), TR * sizeof( float ), cudaMemcpyHostToDevice, st ) );
+					CUDA_CHECK( cudaStreamSynchronize( st ) );
+				}
+				kl_lse_update( Lc, T, E, mx, sx, st );
+				kl_gather( Lc, T, E, 0, rt->ids, rt->tk, sl, st );
+				float *lt = ws.f( TR ), *gq = ws.f( TR * rt->tk ), *ut = ws.f( TR );
+				kl = ws.f( TR );
+				kl_finish( mx, sx, sl, rt->p, rt->tail, T, rt->tk, lt, gq, ut, kl, st );
+				if ( grad ) {
+					CUDA_CHECK( cudaMemcpyAsync( Lc, logits, TE * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
+					dl = ws.f( TE );
+					kl_grad( Lc, T, E, 0, lt, ut, rt->ids, gq, rt->tk, dl, st );
+				}
+			}
 			if ( count_router_kl ) {
 				std::vector<float> h( TR );
 				std::vector<int> tid( TR * rt->tk );
@@ -1180,10 +1197,7 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 				router_slots += static_cast<int64_t>( T ) * K;
 			}
 			// with dy the term's gradient into the router's input (and the router); router calibration: in the forward, the router's alone
-			if ( dy || ( router_calib && lw.g_router ) ) {
-				CUDA_CHECK( cudaMemcpyAsync( Lc, logits, TE * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
-				float* dl = ws.f( TE );
-				kl_grad( Lc, T, E, 0, lt, ut, rt->ids, gq, rt->tk, dl, st );
+			if ( grad ) {
 				if ( dy ) blas->gemm( false, false, T, H, E, router_w, dl, lw.router, 1.0f, dmix );
 				if ( lw.g_router ) blas->gemm( true, false, E, H, T, router_w, dl, mix, 1.0f, lw.g_router );
 			}
@@ -1833,6 +1847,8 @@ void Model::set_router_teacher( const std::vector<Teacher>& per_layer, float wei
 }
 
 void Model::set_router_calibration( bool on ) { p_->router_calib = on; }
+
+void Model::set_router_margin( float delta ) { p_->router_margin = delta; }
 
 double Model::router_kl( double* shared ) {
 	const double s = p_->router_kl_sum;

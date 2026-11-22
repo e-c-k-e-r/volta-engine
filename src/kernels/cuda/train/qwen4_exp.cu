@@ -827,6 +827,69 @@ __global__ void k_route_candidates( const float* logits, const int* ids, const f
 	}
 }
 
+// Routing margins per row, a warp each (lane 0 the pairs): A the teacher's top k (its first k ids), B the model's selection; every wrong pick w
+// (in B, not in A) against every miss m (in A, not in B): softplus( l_w - l_m + delta ); the weakest agreed pick c against the strongest expert
+// neither picks d: softplus( delta - ( l_c - l_d ) ). loss[r] = the row's sum; dl (rows x experts, zeroed) receives its gradient
+__global__ void k_route_margin( const float* logits, const int* sel, const int* tid, int rows, int experts, int k, int tk, float delta, float* dl,
+	float* loss ) {
+	const int row = static_cast<int>( ( static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x ) / 32 ), lane = threadIdx.x % 32;
+	if ( row >= rows ) return;
+	const float* l = logits + static_cast<size_t>( row ) * experts;
+	const int *B = sel + static_cast<size_t>( row ) * k, *A = tid + static_cast<size_t>( row ) * tk;
+	float* d = dl + static_cast<size_t>( row ) * experts;
+	float best = -INFINITY;
+	int bi = -1;
+	for ( int e = lane; e < experts; e += 32 ) {
+		bool in = false;
+		for ( int j = 0; j < k; ++j ) in = in || A[j] == e || B[j] == e;
+		if ( !in && l[e] > best ) {
+			best = l[e];
+			bi = e;
+		}
+	}
+	for ( int o = 16; o > 0; o >>= 1 ) {
+		const float ob = __shfl_xor_sync( 0xffffffff, best, o );
+		const int oi = __shfl_xor_sync( 0xffffffff, bi, o );
+		if ( ob > best || ( ob == best && oi >= 0 && ( bi < 0 || oi < bi ) ) ) {
+			best = ob;
+			bi = oi;
+		}
+	}
+	if ( lane != 0 ) return;
+	auto in_set = []( const int* s, int n, int e ) {
+		for ( int j = 0; j < n; ++j )
+			if ( s[j] == e ) return true;
+		return false;
+	};
+	auto softplus = []( float x ) { return x > 20.0f ? x : log1pf( expf( x ) ); };
+	auto sigm = []( float x ) { return 1.0f / ( 1.0f + expf( -x ) ); };
+	float ls = 0.0f;
+	for ( int a = 0; a < k; ++a ) {
+		const int w = B[a];
+		if ( in_set( A, k, w ) ) continue;
+		for ( int b = 0; b < k; ++b ) {
+			const int m = A[b];
+			if ( in_set( B, k, m ) ) continue;
+			const float x = l[w] - l[m] + delta;
+			ls += softplus( x );
+			const float g = sigm( x );
+			d[w] += g;
+			d[m] -= g;
+		}
+	}
+	int c = -1;
+	for ( int a = 0; a < k; ++a )
+		if ( in_set( B, k, A[a] ) && ( c < 0 || l[A[a]] < l[c] ) ) c = A[a];
+	if ( c >= 0 && bi >= 0 ) {
+		const float x = delta - ( l[c] - l[bi] );
+		ls += softplus( x );
+		const float g = sigm( x );
+		d[c] -= g;
+		d[bi] += g;
+	}
+	loss[row] = ls;
+}
+
 // Per row of ks = k + c slots: the selected ones' logit gradients through their softmax, dl = w ( dw - s ) with s = sum_j w_j dw_j (the routes'
 // output against dy), and a candidate's wp ( dw - s ): the gradient of its logit were it in the softmax at a vanishing weight
 __global__ void k_route_candidates_bwd( const float* sw, const float* dw, const float* wp, int rows, int k, int c, float* dl ) {
@@ -1288,6 +1351,12 @@ void route_candidates( const float* logits, const int* ids, const float* w, int 
 	backend::stream_t stream ) {
 	ENGINE_ASSERT( experts <= 1024, "route_candidates: up to 1024 experts" );
 	if ( rows > 0 ) k_route_candidates<<<rows, ( experts + 31 ) / 32 * 32, 0, cu( stream )>>>( logits, ids, w, experts, k, c, sids, sw, wp );
+}
+
+void route_margin( const float* logits, const int* sel, const int* tid, int rows, int experts, int k, int tk, float delta, float* dl, float* loss,
+	backend::stream_t stream ) {
+	if ( rows > 0 ) k_route_margin<<<static_cast<unsigned>( ( static_cast<size_t>( rows ) * 32 + 255 ) / 256 ), 256, 0, cu( stream )>>>( logits, sel, tid, rows,
+		experts, k, tk, delta, dl, loss );
 }
 
 void route_candidates_backward( const float* sw, const float* dw, const float* wp, int rows, int k, int c, float* dl, backend::stream_t stream ) {

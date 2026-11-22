@@ -98,6 +98,11 @@ void topk_softmax_backward( const float* w, const float* dw, int rows, int k, fl
 void route_candidates( const float* logits, const int* ids, const float* w, int rows, int experts, int k, int c, int* sids, float* sw, float* wp,
 	backend::stream_t stream );
 void route_candidates_backward( const float* sw, const float* dw, const float* wp, int rows, int k, int c, float* dl, backend::stream_t stream );
+// Routing margins (the top-k boundary, DREAM-MoE / VSRAQ's structure term): per row with A the teacher's top k (the first k of its tk ids) and
+// B the selection sel, softplus( l_w - l_m + delta ) for every wrong pick w against every miss m, and softplus( delta - ( l_c - l_d ) ) for the
+// weakest agreed pick c against the strongest expert neither picks d; loss[r] the row's sum, dl (zeroed, rows x experts) its logit gradient
+void route_margin( const float* logits, const int* sel, const int* tid, int rows, int experts, int k, int tk, float delta, float* dl, float* loss,
+	backend::stream_t stream );
 // The selected slots' values as dense rows: out[r, ids[r, j]] += v[r, j] (out [rows, experts]; a row's ids distinct)
 void slots_to_dense( const float* v, const int* ids, int rows, int k, int experts, float* out, backend::stream_t stream );
 
@@ -316,6 +321,8 @@ public:
 	// Router calibration (EAC-MoE's layer-wise router calibration in end-to-end form): forward calls add the routing term's gradient to the
 	// routers alone (with set_train_router; no backward needed), each router fitting the teacher's routing on this model's own inputs
 	void set_router_calibration( bool on );
+	// delta > 0: the routing term is the top-k boundary's margins (route_margin) at delta instead of the KL; router_kl() then sums those
+	void set_router_margin( float delta );
 
 	// The trainable tensors' products on the tensor cores (the default: FP16 cores, activations and gradients rounded to FP16 per row at a
 	// power-of-two scale, FP32 accumulation; everything else FP32), or off: FP32 products
