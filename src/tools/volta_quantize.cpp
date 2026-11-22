@@ -7,7 +7,7 @@
 // are logged at the end.
 //
 //   volta_quantize --src <original> --template <exl3 dir> --out <dir> [--hess <capture dir>] [--route <route dump>] [--order volta|stock]
-//                  [--devices 0,1,2,3] [--only A,B] [--skip A,B] [--bits B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] [--redo]
+//                  [--devices 0,1,2,3] [--only A,B] [--skip A,B] [--bits B] [--widths FILE] [--only-widths] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] [--redo]
 //                  [--plan] [--no-scaled-hessian] [--affinity-eps E] [--ldl-metric] [--open-trellis] [--tile-gain] [--scale-search full|light|hint]
 //                  [--workers 1] [--no-assemble]
 //
@@ -26,7 +26,9 @@
 // dump's routing weights (<route dump>.w)
 //
 // --bits sets every quantized tensor's width (1 to 8, or 1.5 / 2.5 / 3.5 with the mul1 codebook) instead of the template's: rate ladders on a
-// sample (--only) for screening the quantizer
+// sample (--only) for screening the quantizer. --widths FILE sets them per tensor: lines of "<regex> <bits>" ('#' starts a comment), a tensor
+// taking the first pattern its name matches (the others: --bits or the template's); --only-widths requantizes the tensors a pattern matches
+// only (the rest kept from the template, as with --only): another width allocation of an existing checkpoint
 #include "engine/config.h"
 #include "engine/core/log.h"
 #include "engine/modules/trellis_bits.h"
@@ -47,6 +49,7 @@
 #include <dirent.h>
 #include <fstream>
 #include <map>
+#include <regex>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -67,6 +70,8 @@ struct Args {
 	std::string src, tmpl, out, hess, route;
 	std::vector<std::string> only, skip;
 	int code = 0;   // --bits as a width code, 0: the template's
+	std::vector<std::pair<std::regex, int>> widths;   // --widths: per tensor name pattern a width code (the first match; none: --bits or the template's)
+	bool only_widths = false;                         // --only-widths: the tensors a --widths pattern matches only (as --only)
 	std::vector<int> devices = { 0 };
 	bool volta = true;
 	int ranks = 4;
@@ -83,6 +88,13 @@ struct Args {
 	float sigma_reg = 0.025f;
 	int scale_search = 0;   // --scale-search full / light / hint (the default; Exl3QuantOptions::scale_search)
 };
+
+// A width in bits as a trellis width code (1 to 8, or 1.5 / 2.5 / 3.5), 0: none of them
+int width_code( float b ) {
+	const int K = static_cast<int>( b );
+	if ( K < 1 || K > 8 || ( b != static_cast<float>( K ) && ( b - K != 0.5f || K > 3 ) ) ) return 0;
+	return b == static_cast<float>( K ) ? K : K + engine::modules::TRELLIS_HALF_CODE;
+}
 
 std::vector<std::string> split( const std::string& s, char sep ) {
 	std::vector<std::string> out;
@@ -111,14 +123,33 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--route" ) a.route = val();
 		else if ( k == "--only" ) a.only = split( val(), ',' );
 		else if ( k == "--bits" ) {
-			const float b = std::stof( val() );
-			const int K = static_cast<int>( b );
-			a.code = b == static_cast<float>( K ) ? K : K + engine::modules::TRELLIS_HALF_CODE;
-			if ( K < 1 || K > 8 || ( b != static_cast<float>( K ) && ( b - K != 0.5f || K > 3 ) ) ) {
+			if ( ( a.code = width_code( std::stof( val() ) ) ) == 0 ) {
 				LOG_ERROR( "[volta_quantize] --bits %s: 1 to 8, or 1.5, 2.5, 3.5", argv[i] );
 				return false;
 			}
 		}
+		else if ( k == "--widths" ) {
+			const std::string path = val();
+			std::ifstream f( path );
+			if ( !f ) {
+				LOG_ERROR( "[volta_quantize] --widths %s: cannot read", path.c_str() );
+				return false;
+			}
+			std::string line;
+			while ( std::getline( f, line ) ) {
+				std::istringstream ls( line );
+				std::string re;
+				float b = 0.0f;
+				if ( !( ls >> re ) || re[0] == '#' ) continue;
+				const int c = ( ls >> b ) ? width_code( b ) : 0;
+				if ( c == 0 ) {
+					LOG_ERROR( "[volta_quantize] --widths %s: '%s': a pattern and a width (1 to 8, or 1.5, 2.5, 3.5)", path.c_str(), line.c_str() );
+					return false;
+				}
+				a.widths.emplace_back( std::regex( re ), c );
+			}
+		}
+		else if ( k == "--only-widths" ) a.only_widths = true;
 		else if ( k == "--skip" ) a.skip = split( val(), ',' );
 		else if ( k == "--order" ) a.volta = val() != "stock";
 		else if ( k == "--ranks" ) a.ranks = std::stoi( val() );
@@ -153,7 +184,7 @@ bool parse( int argc, char** argv, Args& a ) {
 	}
 	if ( a.src.empty() || a.tmpl.empty() || ( a.out.empty() && !a.plan ) ) {
 		LOG_ERROR( "usage: volta_quantize --src <original> --template <exl3 dir> --out <dir> [--hess <capture dir>] [--route <route dump>] "
-				   "[--order volta|stock] [--devices 0,1] [--only A,B] [--skip A,B] [--bits B] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] "
+				   "[--order volta|stock] [--devices 0,1] [--only A,B] [--skip A,B] [--bits B] [--widths FILE] [--only-widths] [--ranks 4] [--route-rows N] [--budget-mb 8192] [--seed N] "
 				   "[--redo] [--plan] [--no-scaled-hessian] [--affinity-eps E] [--ldl-metric] [--open-trellis] [--tile-gain] [--scale-search full|light|hint] [--workers 1] "
 				   "[--no-assemble]" );
 		return false;
@@ -716,8 +747,10 @@ int main( int argc, char** argv ) {
 		q::PlanTensor t;
 		t.base = kv.first.substr( 0, kv.first.size() - 8 );
 		if ( t.base.find( "ngram_embedding" ) != std::string::npos ) continue;
-		bool skipped = !a.only.empty();
+		bool skipped = !a.only.empty() || a.only_widths;
 		for ( const auto& s : a.only ) skipped = skipped && t.base.find( s ) == std::string::npos;
+		if ( a.only_widths )
+			for ( const auto& w : a.widths ) skipped = skipped && !std::regex_search( t.base, w.first );
 		for ( const auto& s : a.skip ) skipped = skipped || t.base.find( s ) != std::string::npos;
 		// A Volta template's stock-order exceptions stay as they are (a requantization would be in the Volta order)
 		for ( const auto& s : tmpl_stock ) skipped = skipped || t.base.find( s ) != std::string::npos;
@@ -729,12 +762,19 @@ int main( int argc, char** argv ) {
 		if ( !e || e->shape.size() != 3 ) continue;
 		t.code = engine::modules::trellis_code_from_u16( static_cast<int>( e->shape[2] ) );
 		t.cb = tmpl.has( t.base + ".mul1" ) ? 2 : tmpl.has( t.base + ".mcg" ) ? 1 : 0;
-		if ( a.code ) {
-			if ( a.code > engine::modules::TRELLIS_HALF_CODE && t.cb != 2 ) {
-				LOG_ERROR( "[volta_quantize] %s: a half-integer --bits needs the mul1 codebook", t.base.c_str() );
+		int code = a.code;
+		for ( const auto& w : a.widths ) {
+			if ( std::regex_search( t.base, w.first ) ) {
+				code = w.second;
+				break;
+			}
+		}
+		if ( code ) {
+			if ( code > engine::modules::TRELLIS_HALF_CODE && t.cb != 2 ) {
+				LOG_ERROR( "[volta_quantize] %s: a half-integer width needs the mul1 codebook", t.base.c_str() );
 				return 2;
 			}
-			t.code = a.code;
+			t.code = code;
 		}
 		t.k = static_cast<int>( e->shape[0] ) * 16;
 		t.n = static_cast<int>( e->shape[1] ) * 16;
