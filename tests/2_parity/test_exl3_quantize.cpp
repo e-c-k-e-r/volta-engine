@@ -7,6 +7,8 @@
 //   (e) (a) in the stock tile order as well
 //   (f) (a) with the input's shared factor instead of the scaled per-weight ones (and both errors printed)
 //   (g) (a) with the LDL-weighted Viterbi metric at 2 and 3 bits (and its error next to the plain metric's)
+//   (h) re-encoding a 2-bit open-trellis tensor with tile gains (scales and gains held): toward its own tiles it gives back its codes, toward
+//       a nudged target a small error; the metric solve's M D = G
 #include "engine/config.h"
 #include "engine/quant/exl3_quantize.h"
 #include "engine/modules/trellis.h"
@@ -254,6 +256,85 @@ int main() {
 		const double stored = stored_proxy( p, 0, out[0], 3, o.cb, false );
 		std::snprintf( line, sizeof( line ), "(e) 3 bits, stock order: reported %.6f, stored %.6f", out[0].proxy_err, stored );
 		check( close( out[0].proxy_err, stored, 0.03 ), line );
+	}
+
+	// (h) re-encoding (code updates): an open-trellis tensor with tile gains (2 bits, and 1.5 bpw: a half rate) encoded anew toward its own
+	// decoded tiles, its scales and gains held, gives back its codes and start states exactly; toward a nudged target, a small error; and the
+	// metric solve M D = G checked through tr( D^T M D ) = tr( D^T G )
+	for ( const int code : { 2, engine::modules::TRELLIS_HALF_CODE + 1 } ) {
+		engine::quant::Exl3QuantOptions o;
+		o.code = code;
+		o.volta = volta;
+		o.open_trellis = true;
+		o.tile_gain = true;
+		std::vector<engine::quant::Exl3Tensor> out;
+		ENGINE_ASSERT( engine::quant::exl3_quantize_group( f, { p.d_w[0] }, { p.ns[0] }, { seeds[0] }, o, out, nullptr ), "quantize failed" );
+		const engine::quant::Exl3Tensor& t = out[0];
+		const int k = t.k, n = t.n;
+		const size_t kn = static_cast<size_t>( k ) * n;
+		uint16_t *d_trellis, *d_starts;
+		uint8_t* d_gains;
+		half* d_r16;
+		float *d_r, *d_su, *d_g;
+		CUDA_CHECK( cudaMalloc( &d_trellis, t.trellis.size() * 2 ) );
+		CUDA_CHECK( cudaMalloc( &d_starts, t.starts.size() * 2 ) );
+		CUDA_CHECK( cudaMalloc( &d_gains, t.gains.size() ) );
+		CUDA_CHECK( cudaMalloc( &d_r16, kn * 2 ) );
+		CUDA_CHECK( cudaMalloc( &d_r, kn * 4 ) );
+		CUDA_CHECK( cudaMalloc( &d_g, kn * 4 ) );
+		CUDA_CHECK( cudaMalloc( &d_su, k * 4 ) );
+		CUDA_CHECK( cudaMemcpy( d_trellis, t.trellis.data(), t.trellis.size() * 2, cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMemcpy( d_starts, t.starts.data(), t.starts.size() * 2, cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaMemcpy( d_gains, t.gains.data(), t.gains.size(), cudaMemcpyHostToDevice ) );
+		std::vector<float> su( k );
+		for ( int i = 0; i < k; ++i ) {
+			half h;
+			std::memcpy( &h, &t.suh[i], 2 );
+			su[i] = __half2float( h );
+		}
+		CUDA_CHECK( cudaMemcpy( d_su, su.data(), k * 4, cudaMemcpyHostToDevice ) );
+		EXL3_TILES_CALL( volta, reconstruct_slice_ext, d_r16, d_trellis, d_starts, d_gains, code, false, true, k / 16, n, 0, nullptr );
+		std::vector<half> r16( kn );
+		CUDA_CHECK( cudaDeviceSynchronize() );
+		CUDA_CHECK( cudaMemcpy( r16.data(), d_r16, kn * 2, cudaMemcpyDeviceToHost ) );
+		std::vector<float> R( kn );
+		for ( size_t i = 0; i < kn; ++i ) R[i] = __half2float( r16[i] );
+		CUDA_CHECK( cudaMemcpy( d_r, R.data(), kn * 4, cudaMemcpyHostToDevice ) );
+		engine::quant::Exl3QuantOptions ro = o;
+		ro.tile_gain = false;
+		engine::quant::Exl3Tensor same;
+		ENGINE_ASSERT( engine::quant::exl3_reencode( d_r, p.d_hsum, ROWS, d_su, d_gains, k, n, ro, same, nullptr ), "re-encode failed" );
+		const bool codes_same = same.trellis == t.trellis && same.starts == t.starts;
+		std::snprintf( line, sizeof( line ), "(h) code %d, re-encoded toward its own tiles: codes and starts %s, proxy error %.3g", code,
+			codes_same ? "identical" : "DIFFER", same.proxy_err );
+		check( codes_same && same.proxy_err < 1e-6, line );
+		// a nudged target: 30% of the tiles' RMS in random directions (3% moves no code: far inside the 2-bit grid's cells)
+		std::mt19937 rng( 5u );
+		std::normal_distribution<float> g( 0.0f, 1.0f );
+		double rr = 0.0;
+		for ( float v : R ) rr += static_cast<double>( v ) * v;
+		const float s = 0.3f * static_cast<float>( std::sqrt( rr / kn ) );
+		std::vector<float> T( R ), G( kn );
+		for ( size_t i = 0; i < kn; ++i ) T[i] += s * g( rng );
+		for ( auto& v : G ) v = g( rng );
+		CUDA_CHECK( cudaMemcpy( d_r, T.data(), kn * 4, cudaMemcpyHostToDevice ) );
+		engine::quant::Exl3Tensor moved;
+		ENGINE_ASSERT( engine::quant::exl3_reencode( d_r, p.d_hsum, ROWS, d_su, d_gains, k, n, ro, moved, nullptr ), "re-encode failed" );
+		size_t changed = 0;
+		for ( size_t i = 0; i < moved.trellis.size(); ++i ) changed += moved.trellis[i] != t.trellis[i];
+		std::snprintf( line, sizeof( line ), "(h) toward a target 30%% off: proxy error %.4g (the quantization's %.4g), %.1f%% of the code words moved",
+			moved.proxy_err, t.proxy_err, 100.0 * changed / moved.trellis.size() );
+		check( std::isfinite( moved.proxy_err ) && moved.proxy_err < 0.5 && changed > 0, line );
+		CUDA_CHECK( cudaMemcpy( d_g, G.data(), kn * 4, cudaMemcpyHostToDevice ) );
+		double dmd = 0.0;
+		ENGINE_ASSERT( engine::quant::exl3_metric_solve( d_g, d_r, p.d_hsum, ROWS, d_su, k, n, 0.025f, &dmd, nullptr, nullptr ), "metric solve failed" );
+		std::vector<float> D( kn );
+		CUDA_CHECK( cudaMemcpy( D.data(), d_g, kn * 4, cudaMemcpyDeviceToHost ) );
+		double dg = 0.0;
+		for ( size_t i = 0; i < kn; ++i ) dg += static_cast<double>( D[i] ) * G[i];
+		std::snprintf( line, sizeof( line ), "(h) metric solve: tr( D^T M D ) %.6g, tr( D^T G ) %.6g", dmd, dg );
+		check( close( dmd, dg, 1e-3 ), line );
+		for ( void* q : { (void*) d_trellis, (void*) d_starts, (void*) d_gains, (void*) d_r16, (void*) d_r, (void*) d_g, (void*) d_su } ) cudaFree( q );
 	}
 
 	engine::quant::exl3_input_factor_free( f );

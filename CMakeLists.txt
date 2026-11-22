@@ -528,7 +528,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 		src/train/qwen4_exp.cpp
 		src/train/qwen4_exp_inputs.cpp
 	)
-	target_link_libraries(engine_train PUBLIC engine_kernels)
+	target_link_libraries(engine_train PUBLIC engine_kernels engine_quant)
 	set_target_properties(engine_train PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 	add_executable(test_train_grad tests/2_parity/test_train_grad.cpp)
 	target_link_libraries(test_train_grad PRIVATE engine_train)

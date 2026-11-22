@@ -75,6 +75,29 @@ bool exl3_quantize_group( const Exl3InputFactor& f, const std::vector<const floa
 	const std::vector<uint64_t>& seeds, const Exl3QuantOptions& o, std::vector<Exl3Tensor>& out, backend::stream_t stream,
 	Exl3QuantTimes* times = nullptr );
 
+// One quantized projection's tiles encoded anew toward a target in its own frame, its channel scales and tile gains held: T (device, k x n) the
+// target of the tiles R (the weight is diag( su ) H R H diag( sv ), H the 128-point Hadamard blocks), h_sum the k x k sum of x^T x over `rows`
+// input rows (device, original basis), su (device, k) the projection's input scales with their signs, gains (device, k / 16 x n / 16; null:
+// none) the tiles' gain codes, each tile encoded at its gain. The LDL feedback runs in the metric P diag( su ) H diag( su ) P of the damped
+// mean Hessian, as quantization's. Out: trellis, starts (open_trellis) and proxy_err, tr( E^T M E ) / tr( T^T M T ) in that metric M
+// step (optional): feedback off encodes each tile on its own toward its target (no LDL feedback: from a target next to the current tiles, the
+// feedback carries every flipped tile's error into the rows before it); with D (the target made as T = R - eta D from the current tiles R) and
+// G (k x n, a loss's gradient with respect to R), lin receives < G, Q - R > (that loss's change to first order) and quad ( Q - R )^T M ( Q - R ),
+// Q the new tiles
+struct Exl3ReencodeStep {
+	bool feedback = true;
+	const float* D = nullptr;
+	const float* G = nullptr;
+	float eta = 0.0f;
+	double lin = 0.0, quad = 0.0;
+};
+bool exl3_reencode( const float* T, const float* h_sum, int64_t rows, const float* su, const uint8_t* gains, int k, int n, const Exl3QuantOptions& o,
+	Exl3Tensor& out, backend::stream_t stream, Exl3ReencodeStep* step = nullptr );
+// G (device, k x n) overwritten by M^-1 G in that metric M of a projection (as exl3_reencode's, damped by sigma_reg); d_norm2 = tr( D^T M D ) of
+// the result and t_norm2 = tr( T^T M T ) of T (k x n; either null: not wanted)
+bool exl3_metric_solve( float* G, const float* T, const float* h_sum, int64_t rows, const float* su, int k, int n, float sigma_reg, double* d_norm2,
+	double* t_norm2, backend::stream_t stream );
+
 // tr(E^T H E) / tr(W^T H W) with E = W - Q, from device fp32 W, Q (k x n) and H (k x k, e.g. a mean Hessian)
 double exl3_proxy_error( const float* W, const float* Q, const float* H, int k, int n, backend::stream_t stream );
 

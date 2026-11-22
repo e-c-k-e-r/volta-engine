@@ -8,6 +8,7 @@
 #include "engine/loader/safetensors.h"
 #include "reconstruct.cuh"
 #include "exl3_vl.cuh"
+#include "engine/quant/exl3_quantize.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #if defined( ENGINE_HAVE_NCCL )
@@ -377,6 +378,18 @@ struct Model::Impl {
 	float gain_lr = 1.0f;
 	ParamPool gain_sp, gain_ep; // their values: of the shared tensors, of this rank's experts
 	uint8_t *gcodes_s = nullptr, *gcodes_e = nullptr;   // and their codes, at the pools' offsets (the tensors' w4 point here)
+	// code updates (set_accumulate): per expert of this rank, the sums of layer acc_layer's backward (dR: gate, up, down; Hx: the gate / up
+	// input's Hessian, Ha: down's), D in place of dR after reencode_prepare; the loaded codes and starts kept for restore_codes
+	struct ExpertAccum {
+		float* dR[3] = { nullptr, nullptr, nullptr };
+		float *Hx = nullptr, *Ha = nullptr;
+		int64_t rows = 0;
+	};
+	int acc_layer = -1;
+	bool acc_prepared = false;
+	std::vector<ExpertAccum> acc;
+	float* acc_buf = nullptr;
+	std::vector<std::vector<uint16_t>> saved_codes, saved_starts;   // per expert and kind (3 e + kind)
 	bool opt_host = false;      // the optimizer state in host memory
 	int opt_bits = 32;          // Adam's moments: 32 (FP32) or 8 (block-wise)
 	std::vector<Layer> layers;
@@ -686,6 +699,13 @@ struct Model::Impl {
 		}
 	}
 
+	// t's tiles R (gains applied, unit scales, before the rotations: the core is H R H) into R [k, n] FP32, through R16 (room for them in FP16)
+	void decode_tiles( const Tuned& t, float* R, uint16_t* R16 ) {
+		EXL3_TILES_CALL( t.w.volta_tiles, reconstruct_slice_ext, reinterpret_cast<half*>( R16 ), static_cast<const uint16_t*>( t.w.w0.data ),
+			static_cast<const uint16_t*>( t.w.w3.data ), static_cast<const uint8_t*>( t.w.w4.data ), t.w.bits, t.w.mcg, t.w.mul1, t.k / 16, t.n, 0, st );
+		half_to_float( R16, R, static_cast<size_t>( t.k ) * t.n, st );
+	}
+
 	ScaledLinear sl( Tuned& t, const float* T, const View& v ) {
 		ScaledLinear l;
 		l.k = v.k;
@@ -742,6 +762,7 @@ Model::~Model() {
 	p_->gain_sp.release();
 	p_->gain_ep.release();
 	for ( uint8_t* c : { p_->gcodes_s, p_->gcodes_e } ) if ( c ) cudaFree( c );
+	if ( p_->acc_buf ) cudaFree( p_->acc_buf );
 	if ( p_->ones_f ) cudaFree( p_->ones_f );
 	engine::core::arena_destroy( p_->arena );
 	if ( p_->st ) cudaStreamDestroy( p_->st );
@@ -1180,6 +1201,8 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 	// with trained tile gains (backward), per expert of a group the gradient with respect to its tiles, one kind at a time
 	const bool gains = dy && train_gains && gain_ep.used > 0;
 	float* dRk = gains ? ws.f( static_cast<size_t>( kGroupExperts ) * H * I ) : nullptr;
+	// with set_accumulate on this layer, per expert the gradient with respect to its tiles and its inputs' Hessians added up (code updates)
+	const bool accum = dy && acc_layer == static_cast<int>( &lw - layers.data() ) && !acc.empty();
 	struct Job { int off, count, bits, kind; bool mcg, mul1, volta; int goff; };
 	std::vector<std::vector<Job>> jobs( groups.size() );
 	std::vector<const void*> tab_h, gtab_h;   // gtab_h: per job the tile gains' table (codes, starts, gains, dR, gradients)
@@ -1242,7 +1265,7 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 		void* A16 = fp16 ? ws.raw( PH * 2 ) : nullptr;
 		float* rinv = fp16 ? ws.f( Pmax ) : nullptr;
 		float* Xs = fp16 ? nullptr : ws.f( PH );
-		float *Xh = gains ? ws.f( PH ) : nullptr, *Yh = gains ? ws.f( PH ) : nullptr;
+		float *Xh = gains || accum ? ws.f( PH ) : nullptr, *Yh = gains || accum ? ws.f( PH ) : nullptr;
 		for ( size_t gi = 0; gi < groups.size(); ++gi ) {
 			const Group& g = groups[gi];
 			const int Pg = g.count * g.m, m = g.m, n = g.count;
@@ -1285,20 +1308,35 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 			if ( y ) route_combine( Yr, d_inv, g.p0, Pg, sw, T, KS, H, y, st );
 			if ( !dy ) continue;
 			// kind kd's tile gains: per expert dR = ( X su H )^T ( dY sv H ) over its slab of rows (kk inputs, nn outputs), then its tiles' sums
+			// (with accum, also each expert's dR summed, and its input's Hessian: X^T X over its rows, the padding's zero)
 			auto gain_kind = [&]( int kd, const float* X, int kk, const float* dYk, int nn ) {
 				route_scale( X, gx, m, tab( kd, 0 ), Pg, kk, Xh, false, st );
 				had_rows( Xh, nullptr, Pg, kk, Xh, st );
 				route_scale( dYk, gx, m, tab( kd, 1 ), Pg, nn, Yh, false, st );
 				had_rows( Yh, nullptr, Pg, nn, Yh, st );
-				blas->gemm_strided( true, false, kk, nn, m, 1.0f, Xh, static_cast<long long>( m ) * kk, Yh, static_cast<long long>( m ) * nn, 0.0f, dRk,
-					static_cast<long long>( kk ) * nn, n );
-				for ( const Job& j : jobs[gi] )
-					if ( j.kind == kd ) EXL3_TILES_CALL( j.volta, tile_gain_grad_batch, d_gtab + j.goff, j.count, j.bits, j.mcg, j.mul1, kk, nn, st );
+				if ( gains ) {
+					blas->gemm_strided( true, false, kk, nn, m, 1.0f, Xh, static_cast<long long>( m ) * kk, Yh, static_cast<long long>( m ) * nn, 0.0f,
+						dRk, static_cast<long long>( kk ) * nn, n );
+					for ( const Job& j : jobs[gi] )
+						if ( j.kind == kd ) EXL3_TILES_CALL( j.volta, tile_gain_grad_batch, d_gtab + j.goff, j.count, j.bits, j.mcg, j.mul1, kk, nn, st );
+				}
+				if ( !accum ) return;
+				for ( int j = 0; j < n; ++j ) {
+					const int e = order[g.first + j];
+					ExpertAccum& A = acc[e - e0];
+					const size_t o = static_cast<size_t>( j ) * m;
+					blas->gemm( true, false, kk, nn, m, 1.0f, Xh + o * kk, Yh + o * nn, 1.0f, A.dR[kd] );
+					if ( kd == 0 ) {
+						blas->gemm( true, false, kk, kk, m, 1.0f, X + o * kk, X + o * kk, 1.0f, A.Hx );
+						A.rows += cnt[e];
+					}
+					if ( kd == 2 ) blas->gemm( true, false, kk, kk, m, 1.0f, X + o * kk, X + o * kk, 1.0f, A.Ha );
+				}
 			};
 			// down: dsv += colsum( dY Zd ), dAk = ( dY sv ) Td^T, dsu += colsum( dAk A ) (a candidate slot's dY: zero, its weight)
 			route_gather( dy, pr, ps, sw, Pg, H, dYr, st );
 			route_dots_pad( dy, pr, ps, Yr, Pg, H, dw, st );
-			if ( gains ) gain_kind( 2, Am, I, dYr, H );
+			if ( gains || accum ) gain_kind( 2, Am, I, dYr, H );
 			seg_colsum_prod( dYr, Zd, m, H, n, gx, tab( 2, 3 ), st );
 			prod( dYr, tab( 2, 1 ), H, I, true, Wk[2], dAk );
 			seg_colsum_prod( dAk, Am, m, I, n, gx, tab( 2, 2 ), st );
@@ -1306,7 +1344,7 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 			// gate and up: dsv += colsum( dG Zg ), dXk = ( dG sv ) T^T, dsu += colsum( dXk X ), dX = dXk su
 			seg_colsum_prod( dG, Zg, m, I, n, gx, tab( 0, 3 ), st );
 			seg_colsum_prod( dU, Zu, m, I, n, gx, tab( 1, 3 ), st );
-			if ( gains ) {
+			if ( gains || accum ) {
 				gain_kind( 0, Xg, H, dG, I );
 				gain_kind( 1, Xg, H, dU, I );
 			}
@@ -1847,6 +1885,167 @@ void Model::adam( const AdamOptions& o, int step, float grad_scale ) {
 void Model::set_train_gains( bool on, float lr_scale ) {
 	p_->train_gains = on;
 	p_->gain_lr = lr_scale;
+}
+
+void Model::set_accumulate( int L ) {
+	Impl& m = *p_;
+	CUDA_CHECK( cudaSetDevice( device_ ) );
+	const int li = L < 0 ? -1 : L - first_;
+	ENGINE_ASSERT( li < static_cast<int>( m.layers.size() ), "qwen4_exp training model: set_accumulate outside the loaded layers" );
+	if ( li == m.acc_layer ) return;
+	if ( m.acc_buf ) CUDA_CHECK( cudaFree( m.acc_buf ) );
+	m.acc_buf = nullptr;
+	m.acc.clear();
+	m.acc_prepared = false;
+	m.acc_layer = li;
+	if ( li < 0 ) return;
+	const size_t H = cfg_.hidden, I = cfg_.inter, per = 3 * H * I + H * H + I * I, ne = static_cast<size_t>( m.e1 - m.e0 );
+	CUDA_CHECK( cudaMalloc( &m.acc_buf, ne * per * sizeof( float ) ) );
+	CUDA_CHECK( cudaMemsetAsync( m.acc_buf, 0, ne * per * sizeof( float ), m.st ) );
+	m.acc.resize( ne );
+	for ( size_t e = 0; e < ne; ++e ) {
+		float* b = m.acc_buf + e * per;
+		for ( int kd = 0; kd < 3; ++kd ) m.acc[e].dR[kd] = b + kd * H * I;
+		m.acc[e].Hx = b + 3 * H * I;
+		m.acc[e].Ha = b + 3 * H * I + H * H;
+	}
+	CUDA_CHECK( cudaStreamSynchronize( m.st ) );
+}
+
+namespace {
+
+// A routed expert projection's quantization options as it was encoded
+engine::quant::Exl3QuantOptions reencode_options( const pod::LinearWeight& w ) {
+	engine::quant::Exl3QuantOptions o;
+	o.code = w.bits;
+	o.cb = w.mul1 ? 2 : w.mcg ? 1 : 0;
+	o.volta = w.volta_tiles;
+	o.open_trellis = w.w3.data != nullptr;
+	o.tile_gain = false;   // held: each tile encoded at its gain
+	return o;
+}
+
+} // namespace
+
+double Model::reencode_prepare( bool feedback ) {
+	Impl& m = *p_;
+	CUDA_CHECK( cudaSetDevice( device_ ) );
+	ENGINE_ASSERT( m.acc_layer >= 0 && !m.acc_prepared, "qwen4_exp training model: reencode_prepare without accumulated sums" );
+	Layer& lw = m.layers[m.acc_layer];
+	std::vector<Tuned>* kinds[] = { &lw.eg, &lw.eu, &lw.ed };
+	const size_t HI = static_cast<size_t>( cfg_.hidden ) * cfg_.inter;
+	float *R = m.ws.f( HI ), *D = m.ws.f( HI );
+	auto* R16 = static_cast<uint16_t*>( m.ws.raw( HI * 2 ) );
+	double sums[2] = { 0.0, 0.0 };
+	m.saved_codes.assign( m.acc.size() * 3, {} );
+	m.saved_starts.assign( m.acc.size() * 3, {} );
+	for ( size_t e = 0; e < m.acc.size(); ++e ) for ( int kd = 0; kd < 3; ++kd ) {
+		Tuned& t = ( *kinds[kd] )[m.e0 + e];
+		std::vector<uint16_t>& sc = m.saved_codes[3 * e + kd];
+		sc.resize( t.w.w0.numel() );
+		CUDA_CHECK( cudaMemcpy( sc.data(), t.w.w0.data, sc.size() * 2, cudaMemcpyDeviceToHost ) );
+		if ( t.w.w3.data ) {
+			std::vector<uint16_t>& ss = m.saved_starts[3 * e + kd];
+			ss.resize( t.w.w3.numel() );
+			CUDA_CHECK( cudaMemcpy( ss.data(), t.w.w3.data, ss.size() * 2, cudaMemcpyDeviceToHost ) );
+		}
+		Impl::ExpertAccum& A = m.acc[e];
+		if ( A.rows == 0 ) continue;
+		m.decode_tiles( t, R, R16 );
+		double dn = 0.0, tn = 0.0;
+		if ( feedback ) {
+			// the step D = M^-1 G and the norms in the metric
+			CUDA_CHECK( cudaMemcpyAsync( D, A.dR[kd], HI * sizeof( float ), cudaMemcpyDeviceToDevice, m.st ) );
+			ENGINE_ASSERT( engine::quant::exl3_metric_solve( D, R, kd < 2 ? A.Hx : A.Ha, A.rows, t.su, t.k, t.n, 0.025f, &dn, &tn, m.st ),
+				"qwen4_exp training model: the re-encode metric's factorization failed" );
+		}
+		else {
+			// the step G itself and the plain norms
+			dn = engine::train::weighted_sq_norm( A.dR[kd], nullptr, t.k, t.n, m.st );
+			tn = engine::train::weighted_sq_norm( R, nullptr, t.k, t.n, m.st );
+		}
+		sums[0] += dn;
+		sums[1] += tn;
+	}
+	m.acc_prepared = true;
+	float s2[2] = { static_cast<float>( sums[0] ), static_cast<float>( sums[1] ) };
+	float* d2 = m.ws.f( 2 );
+	CUDA_CHECK( cudaMemcpyAsync( d2, s2, sizeof( s2 ), cudaMemcpyHostToDevice, m.st ) );
+	m.sum_ranks( d2, 2 );
+	CUDA_CHECK( cudaMemcpyAsync( s2, d2, sizeof( s2 ), cudaMemcpyDeviceToHost, m.st ) );
+	CUDA_CHECK( cudaStreamSynchronize( m.st ) );
+	m.ws.reset( m.st );
+	return s2[1] > 0.0f ? std::sqrt( static_cast<double>( s2[0] ) / s2[1] ) : 0.0;
+}
+
+double Model::reencode( float eta, bool feedback, double* lin, double* quad ) {
+	Impl& m = *p_;
+	CUDA_CHECK( cudaSetDevice( device_ ) );
+	ENGINE_ASSERT( m.acc_prepared, "qwen4_exp training model: reencode before reencode_prepare" );
+	Layer& lw = m.layers[m.acc_layer];
+	std::vector<Tuned>* kinds[] = { &lw.eg, &lw.eu, &lw.ed };
+	const size_t HI = static_cast<size_t>( cfg_.hidden ) * cfg_.inter;
+	float *T = m.ws.f( HI ), *D = m.ws.f( HI );
+	auto* R16 = static_cast<uint16_t*>( m.ws.raw( HI * 2 ) );
+	double err = 0.0, sums[2] = { 0.0, 0.0 };
+	int count = 0;
+	for ( size_t e = 0; e < m.acc.size(); ++e ) for ( int kd = 0; kd < 3; ++kd ) {
+		Impl::ExpertAccum& A = m.acc[e];
+		if ( A.rows == 0 ) continue;
+		Tuned& t = ( *kinds[kd] )[m.e0 + e];
+		const float* H = kd < 2 ? A.Hx : A.Ha;
+		m.decode_tiles( t, T, R16 );
+		// the step: with the feedback D = M^-1 G (the encode's metric M), else G itself (each tile encoded on its own, in the plain metric)
+		const float* dir = A.dR[kd];
+		if ( feedback ) {
+			CUDA_CHECK( cudaMemcpyAsync( D, A.dR[kd], HI * sizeof( float ), cudaMemcpyDeviceToDevice, m.st ) );
+			ENGINE_ASSERT( engine::quant::exl3_metric_solve( D, T, H, A.rows, t.su, t.k, t.n, 0.025f, nullptr, nullptr, m.st ),
+				"qwen4_exp training model: the re-encode metric's factorization failed" );
+			dir = D;
+		}
+		add_scaled( T, dir, -eta, HI, m.st );
+		engine::quant::Exl3Tensor out;
+		engine::quant::Exl3ReencodeStep step;
+		step.feedback = feedback;
+		step.D = dir;
+		step.G = A.dR[kd];
+		step.eta = eta;
+		ENGINE_ASSERT( engine::quant::exl3_reencode( T, H, A.rows, t.su, static_cast<const uint8_t*>( t.w.w4.data ), t.k, t.n, reencode_options( t.w ),
+			out, m.st, &step ), "qwen4_exp training model: a re-encode failed" );
+		sums[0] += step.lin;
+		sums[1] += step.quad;
+		ENGINE_ASSERT( out.trellis.size() == static_cast<size_t>( t.w.w0.numel() ), "qwen4_exp training model: a re-encode's codes differ in size" );
+		CUDA_CHECK( cudaMemcpyAsync( const_cast<void*>( t.w.w0.data ), out.trellis.data(), out.trellis.size() * 2, cudaMemcpyHostToDevice, m.st ) );
+		if ( t.w.w3.data ) CUDA_CHECK( cudaMemcpyAsync( const_cast<void*>( t.w.w3.data ), out.starts.data(), out.starts.size() * 2, cudaMemcpyHostToDevice, m.st ) );
+		CUDA_CHECK( cudaStreamSynchronize( m.st ) );
+		err += out.proxy_err;
+		++count;
+	}
+	float s2[2] = { static_cast<float>( sums[0] ), static_cast<float>( sums[1] ) };
+	float* d2 = m.ws.f( 2 );
+	CUDA_CHECK( cudaMemcpyAsync( d2, s2, sizeof( s2 ), cudaMemcpyHostToDevice, m.st ) );
+	m.sum_ranks( d2, 2 );
+	CUDA_CHECK( cudaMemcpyAsync( s2, d2, sizeof( s2 ), cudaMemcpyDeviceToHost, m.st ) );
+	CUDA_CHECK( cudaStreamSynchronize( m.st ) );
+	if ( lin ) *lin = s2[0];
+	if ( quad ) *quad = s2[1];
+	m.ws.reset( m.st );
+	return count ? err / count : 0.0;
+}
+
+void Model::restore_codes() {
+	Impl& m = *p_;
+	CUDA_CHECK( cudaSetDevice( device_ ) );
+	if ( m.acc_layer < 0 || m.saved_codes.empty() ) return;
+	Layer& lw = m.layers[m.acc_layer];
+	std::vector<Tuned>* kinds[] = { &lw.eg, &lw.eu, &lw.ed };
+	for ( size_t e = 0; e < m.acc.size(); ++e ) for ( int kd = 0; kd < 3; ++kd ) {
+		Tuned& t = ( *kinds[kd] )[m.e0 + e];
+		const std::vector<uint16_t>& sc = m.saved_codes[3 * e + kd];
+		CUDA_CHECK( cudaMemcpy( const_cast<void*>( t.w.w0.data ), sc.data(), sc.size() * 2, cudaMemcpyHostToDevice ) );
+		const std::vector<uint16_t>& ss = m.saved_starts[3 * e + kd];
+		if ( !ss.empty() ) CUDA_CHECK( cudaMemcpy( const_cast<void*>( t.w.w3.data ), ss.data(), ss.size() * 2, cudaMemcpyHostToDevice ) );
+	}
 }
 
 void Model::set_train_dense( bool on, float lr_scale ) {

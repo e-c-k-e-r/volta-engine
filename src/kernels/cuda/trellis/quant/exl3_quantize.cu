@@ -255,6 +255,18 @@ __global__ void k_tile_gain( const float* target, float* dec, const float* w, ui
 	dec[i] = d * ( 1.0f + ( c - 128 ) * ( 1.0f / 1024.0f ) );
 }
 
+__global__ void k_axpy( float* x, const float* y, float a, size_t n ) {
+	EXL3Q_LOOP( i, n ) x[i] += a * y[i];
+}
+
+// Held tile gains: a block row's tn tiles (stream order) divided (div) or multiplied by their gains g = ( 896 + c ) / 1024
+__global__ void k_tile_fixed_gain( float* x, const uint8_t* codes, int tn, bool div ) {
+	EXL3Q_LOOP( i, (size_t) tn * 256 ) {
+		const float g = ( 896.0f + codes[i >> 8] ) * ( 1.0f / 1024.0f );
+		x[i] = div ? x[i] / g : x[i] * g;
+	}
+}
+
 // The metric weights of a block row's tiles in stream order: tile t takes those of its factor f[t] (k apart) at rows row .. row + 16
 __global__ void k_gather_weights( const float* row_w, const int* f, int k, int row, int tn, bool volta, float* out ) {
 	EXL3Q_LOOP( i, (size_t) tn * 256 ) {
@@ -660,9 +672,10 @@ void feedback_gemm( Ctx& c, const Feedback& fb, int k, int N, int m, int p, int 
 }
 
 // The 16-row blocks of W (k x N) from the last to the first: each one's rows plus the LDL feedback of the error left in the rows after it through
-// the encoder, every column of every projection in one launch per block; Q receives the decoded weight, enc the tile codes (k / 16 x N / 16 x 256)
+// the encoder, every column of every projection in one launch per block; Q receives the decoded weight, enc the tile codes (k / 16 x N / 16 x 256).
+// gains: the tiles' least-squares gains fitted and applied (out); held: each tile encoded at its given gain instead (in)
 void ldlq( Ctx& c, const float* W, const Feedback& fb, int k, int N, const engine::quant::Exl3QuantOptions& o,
-	const engine::quant::Exl3EncodeScratch& sc, float* Q, uint16_t* enc, uint8_t* gains ) {
+	const engine::quant::Exl3EncodeScratch& sc, float* Q, uint16_t* enc, uint8_t* gains, const uint8_t* held = nullptr ) {
 	const int tn = N / 16;
 	const bool feedback = fb.any();
 	DBuf<float> prod( feedback ? (size_t) k * N : 0 ), comp( (size_t) 16 * N ), err( (size_t) SPAN * N ), tiles( (size_t) tn * 256 ),
@@ -700,9 +713,11 @@ void ldlq( Ctx& c, const float* W, const Feedback& fb, int k, int N, const engin
 				cp = comp.p;
 			}
 			k_gather_block<<<grid_for( (size_t) N * 16 ), 256, 0, c.stream>>>( W + (size_t) row * N, cp, N, o.volta, tiles.p );
+			if ( held ) k_tile_fixed_gain<<<grid_for( (size_t) tn * 256 ), 256, 0, c.stream>>>( tiles.p, held + (size_t) ( row / 16 ) * tn, tn, true );
 			if ( weighted ) k_gather_weights<<<grid_for( (size_t) tn * 256 ), 256, 0, c.stream>>>( fb.row_w, tile_f.p, k, row, tn, o.volta, tw.p );
 			engine::quant::exl3_encode_tiles( tiles.p, dec.p, win.p, tn, o.code, o.cb, sc, c.stream, weighted ? tw.p : nullptr, o.open_trellis );
-			if ( gains ) k_tile_gain<<<tn, 256, 0, c.stream>>>( tiles.p, dec.p, weighted ? tw.p : nullptr, gains + (size_t) ( row / 16 ) * tn );
+			if ( held ) k_tile_fixed_gain<<<grid_for( (size_t) tn * 256 ), 256, 0, c.stream>>>( dec.p, held + (size_t) ( row / 16 ) * tn, tn, false );
+			else if ( gains ) k_tile_gain<<<tn, 256, 0, c.stream>>>( tiles.p, dec.p, weighted ? tw.p : nullptr, gains + (size_t) ( row / 16 ) * tn );
 			k_scatter_block<<<grid_for( (size_t) N * 16 ), 256, 0, c.stream>>>( dec.p, win.p, N, o.volta, Q + (size_t) row * N,
 				enc + (size_t) ( row / 16 ) * tn * 256 );
 		}
@@ -1042,6 +1057,121 @@ bool exl3_quantize_group( const Exl3InputFactor& f, const std::vector<const floa
 		CUDA_CHECK( cudaStreamSynchronize( st ) );
 	}
 	lap( &Exl3QuantTimes::finish );
+	return true;
+}
+
+} // namespace engine::quant
+
+namespace {
+
+// A projection's metric P diag( su ) H diag( su ) P (R, k x k) of the damped mean Hessian of h_sum over rows (as exl3_input_factor); tmp: k x k
+void projection_metric( Ctx& c, const float* h_sum, int64_t rows, const float* su, int k, float sigma_reg, float* R, float* tmp ) {
+	const size_t kk = (size_t) k * k;
+	DBuf<float> dg( k );
+	CUDA_CHECK( cudaMemcpyAsync( tmp, h_sum, kk * sizeof( float ), cudaMemcpyDeviceToDevice, c.stream ) );
+	k_scale<<<grid_for( kk ), 256, 0, c.stream>>>( tmp, kk, static_cast<float>( 1.0 / static_cast<double>( rows ) ) );
+	k_get_diag<<<grid_for( k ), 256, 0, c.stream>>>( tmp, k, dg.p );
+	const auto d = to_host( dg.p, k, c.stream );
+	const double diag_mean = std::accumulate( d.begin(), d.end(), 0.0 ) / k;
+	k_add_diag<<<grid_for( k ), 256, 0, c.stream>>>( tmp, k, static_cast<float>( sigma_reg * diag_mean ) );
+	DBuf<float> t2( kk );
+	ENGINE_ASSERT( t2.p, "exl3_quantize: no memory for the metric" );
+	rotate_hessian( c, tmp, su, k, R, t2.p );
+}
+
+} // namespace
+
+namespace engine::quant {
+
+bool exl3_metric_solve( float* G, const float* T, const float* h_sum, int64_t rows, const float* su, int k, int n, float sigma_reg, double* d_norm2,
+	double* t_norm2, backend::stream_t stream ) {
+	auto st = static_cast<cudaStream_t>( stream );
+	Ctx& c = ctx( st );
+	ENGINE_ASSERT( k % HAD == 0 && rows > 0, "exl3_metric_solve: the input size must be a multiple of 128, with rows" );
+	const size_t kk = (size_t) k * k;
+	DBuf<float> R( kk ), U( kk ), MX( (size_t) k * n );
+	if ( !R.p || !U.p || !MX.p ) return false;
+	projection_metric( c, h_sum, rows, su, k, sigma_reg, R.p, U.p );
+	CUDA_CHECK( cudaMemcpyAsync( U.p, R.p, kk * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
+	if ( !cholesky( c, U.p, k ) ) return false;
+	// G row-major k x n is G^T column-major (n x k): D^T = G^T M^-1 = G^T U^-1 U^-T with M = U^T U (U: the column-major upper factor)
+	const float one = 1.0f;
+	EXL3Q_BLAS( cublasStrsm( c.blas, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, n, k, &one, U.p, k, G, n ) );
+	EXL3Q_BLAS( cublasStrsm( c.blas, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT, n, k, &one, U.p, k, G, n ) );
+	if ( d_norm2 ) {
+		gemm( c, false, false, k, n, k, 1.0f, R.p, k, G, n, 0.0f, MX.p, n );
+		*d_norm2 = sum_prod( c, G, MX.p, k, n );
+	}
+	if ( t_norm2 ) {
+		gemm( c, false, false, k, n, k, 1.0f, R.p, k, T, n, 0.0f, MX.p, n );
+		*t_norm2 = sum_prod( c, T, MX.p, k, n );
+	}
+	CUDA_CHECK( cudaStreamSynchronize( st ) );
+	return true;
+}
+
+bool exl3_reencode( const float* T, const float* h_sum, int64_t rows, const float* su, const uint8_t* gains, int k, int n, const Exl3QuantOptions& o,
+	Exl3Tensor& out, backend::stream_t stream, Exl3ReencodeStep* step ) {
+	auto st = static_cast<cudaStream_t>( stream );
+	Ctx& c = ctx( st );
+	ENGINE_ASSERT( k % HAD == 0 && n % HAD == 0 && rows > 0, "exl3_reencode: sizes must be multiples of 128, with rows" );
+	const size_t kk = (size_t) k * k, kn = (size_t) k * n;
+	const int tiles_k = k / 16, tn = n / 16, words = trellis_tile_u16( o.code );
+	const bool feedback = !step || step->feedback;
+	Exl3EncodeScratch sc;
+	if ( !exl3_encode_scratch_alloc( sc, o.code, o.cb ) ) return false;
+	DBuf<float> R( kk ), tmp( kk ), L( feedback ? kk : 0 ), Q( kn ), row_w( feedback && o.ldl_metric ? k : 0 );
+	DBuf<uint16_t> enc( (size_t) tiles_k * tn * 256 ), packed( (size_t) tiles_k * tn * words );
+	if ( !R.p || !tmp.p || ( feedback && !L.p ) || !Q.p || !enc.p || !packed.p ) {
+		exl3_encode_scratch_free( sc );
+		return false;
+	}
+	// the projection's metric (and with the feedback its factor)
+	projection_metric( c, h_sum, rows, su, k, o.sigma_reg, R.p, tmp.p );
+	Feedback fb;
+	if ( feedback ) {
+		DBuf<float> R2( kk );
+		ENGINE_ASSERT( R2.p, "exl3_reencode: no memory for the factorization" );
+		CUDA_CHECK( cudaMemcpyAsync( R2.p, R.p, kk * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
+		if ( !block_ldl_factor( c, R2.p, k, o.sigma_reg, L.p, o.ldl_metric ? row_w.p : nullptr ) ) {
+			exl3_encode_scratch_free( sc );
+			return false;
+		}
+		fb.each = L.p;
+		fb.row_w = o.ldl_metric ? row_w.p : nullptr;
+		fb.off = { 0 };
+		fb.n = { n };
+	}
+	ldlq( c, T, fb, k, n, o, sc, Q.p, enc.p, nullptr, gains );
+	exl3_encode_scratch_free( sc );
+	// tr( E^T M E ) / tr( T^T M T ) in the frame
+	{
+		DBuf<float> he( kn ), ht( kn );
+		ENGINE_ASSERT( he.p && ht.p, "exl3_reencode: no memory for the proxy error" );
+		gemm( c, false, false, k, n, k, 1.0f, R.p, k, T, n, 0.0f, ht.p, n );
+		const double den = sum_prod( c, T, ht.p, k, n );
+		out.proxy_err = proxy_error( c, T, Q.p, R.p, k, n, 0.0, den, ht.p, he.p );   // ht reused for E (k x n; tmp is k x k)
+		if ( step && step->D ) {
+			// dQ = Q - ( T + eta D ), the change from the tiles the target was made from: < G, dQ > and dQ^T M dQ
+			k_sub<<<grid_for( kn ), 256, 0, st>>>( ht.p, Q.p, T, kn );
+			k_axpy<<<grid_for( kn ), 256, 0, st>>>( ht.p, step->D, -step->eta, kn );
+			step->lin = step->G ? sum_prod( c, ht.p, step->G, k, n ) : 0.0;
+			gemm( c, false, false, k, n, k, 1.0f, R.p, k, ht.p, n, 0.0f, he.p, n );
+			step->quad = sum_prod( c, ht.p, he.p, k, n );
+		}
+	}
+	out.k = k;
+	out.n = n;
+	exl3_pack_tiles( packed.p, enc.p, tiles_k * tn, o.code, st );
+	if ( o.open_trellis ) {
+		DBuf<uint16_t> st16( (size_t) tiles_k * tn );
+		k_tile_starts<<<grid_for( (size_t) tiles_k * tn ), 256, 0, st>>>( enc.p, tiles_k * tn, trellis_base_bits( o.code ), st16.p );
+		out.starts.resize( (size_t) tiles_k * tn );
+		CUDA_CHECK( cudaMemcpyAsync( out.starts.data(), st16.p, out.starts.size() * sizeof( uint16_t ), cudaMemcpyDeviceToHost, st ) );
+	}
+	out.trellis.resize( (size_t) tiles_k * tn * words );
+	CUDA_CHECK( cudaMemcpyAsync( out.trellis.data(), packed.p, out.trellis.size() * sizeof( uint16_t ), cudaMemcpyDeviceToHost, st ) );
+	CUDA_CHECK( cudaStreamSynchronize( st ) );
 	return true;
 }
 

@@ -924,6 +924,10 @@ __global__ void k_gain_values( const uint8_t* codes, float* g, size_t n ) {
 	Q4E_LOOP( i, n ) g[i] = ( 896.0f + codes[i] ) * ( 1.0f / 1024.0f );
 }
 
+__global__ void k_add_scaled( float* x, const float* y, float a, size_t n ) {
+	Q4E_LOOP( i, n ) x[i] += a * y[i];
+}
+
 __global__ void k_router_input_bwd( const float* dlogit, const int* ids, const float* R, int rows, int k, int hidden, float* dX ) {
 	Q4E_LOOP( i, (size_t) rows * hidden ) {
 		const size_t r = i / hidden, d = i % hidden;
@@ -1448,6 +1452,10 @@ void gain_codes( const float* g, uint8_t* codes, size_t n, backend::stream_t str
 
 void gain_values( const uint8_t* codes, float* g, size_t n, backend::stream_t stream ) {
 	if ( n > 0 ) k_gain_values<<<blocks_for( n ), 256, 0, cu( stream )>>>( codes, g, n );
+}
+
+void add_scaled( float* x, const float* y, float a, size_t n, backend::stream_t stream ) {
+	if ( n > 0 ) k_add_scaled<<<blocks_for( n ), 256, 0, cu( stream )>>>( x, y, a, n );
 }
 
 void round_to_half( float* x, size_t n, backend::stream_t stream ) {

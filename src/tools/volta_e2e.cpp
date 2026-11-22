@@ -11,7 +11,10 @@
 // additive deltas like the norms, written back as FP16) at --dense-lr times the learning rate (a row of them feeds a dot product, so
 // Adam's per-entry step adds up over its width); --router 1 trains the routers' weights at that rate as well. --gains 1 trains the tensors'
 // 8-bit tile gains (straight through: FP32 values, the codes set from them after each step, written back as codes) at --gains-lr times the
-// learning rate. --train N trains on the first N sequences only
+// learning rate. --reencode L moves layer L's routed experts' codes instead of training (with --tp 1): their tile gradients and routed-input
+// Hessians summed over the training sequences, then each --reencode-steps size re-encoded (each tile on its own toward R - eta G, or with
+// --reencode-feedback 1 the LDL feedback toward R - eta M^-1 G), measured on the held-out sequences and undone (Model::reencode). --train N
+// trains on the first N sequences only
 // (the held-out ones unchanged: how the gain grows with the data). --adam-bits 8 keeps Adam's moments as 8-bit block-wise codes; --opt-host 1
 // keeps the optimizer's state in pinned host memory (the devices hold the current values, their gradients and one part of the state: each
 // step streams the state through in parts). --seqs N runs up to N of a step's --batch sequences (and of the held-out ones) through each
@@ -19,7 +22,7 @@
 // component is logged after the first step.
 //
 //   volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] [--fp16 1]
-//             [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--hc 0] [--hc-lr 0.1] [--gains 0] [--gains-lr 1] [--steps 64] [--batch 4] [--seqs 1] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
+//             [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--hc 0] [--hc-lr 0.1] [--gains 0] [--gains-lr 1] [--reencode L] [--reencode-steps 0,0.003,0.01,0.03,0.1] [--reencode-feedback 0] [--steps 64] [--batch 4] [--seqs 1] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
 //             [--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]
 //   --check-trace: a trace_layers file of the model's engine forward over the first sequence (test_ppl --calibrate --chunk 512): every layer of
 //     the training form fed the engine's input streams of that layer, its output against the engine's, and the first sequence's embedding
@@ -65,6 +68,9 @@ struct Args {
 	bool write = true, timing = false, tp = true, fp16 = true, norms = true, dense = false, router = false, opt_host = false, qsa = true, shuffle = false, hc = false,
 		gains = false;
 	float lr = 1e-3f, lr_min = 0.1f, dense_lr = 0.1f, hc_lr = 0.1f, gains_lr = 1.0f;
+	int reencode = -1;                                         // code updates of this layer's routed experts instead of training
+	bool reencode_feedback = false;                            // with the LDL feedback (else each tile on its own)
+	std::vector<float> reencode_steps = { 0.0f, 0.003f, 0.01f, 0.03f, 0.1f };
 };
 
 // The learning rate of a step (from 1): linear warmup, then a cosine from lr (the first step after the warmup) to lr * lr_min (the last step)
@@ -144,6 +150,16 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--hc" ) a.hc = v != "0";
 		else if ( k == "--hc-lr" ) a.hc_lr = std::stof( v );
 		else if ( k == "--route-cand" ) a.route_cand = std::stoi( v );
+		else if ( k == "--reencode" ) a.reencode = std::stoi( v );
+		else if ( k == "--reencode-feedback" ) a.reencode_feedback = v != "0";
+		else if ( k == "--reencode-steps" ) {
+			a.reencode_steps.clear();
+			for ( size_t p = 0; p <= v.size(); ) {
+				const size_t e = std::min( v.find( ',', p ), v.size() );
+				if ( e > p ) a.reencode_steps.push_back( std::stof( v.substr( p, e - p ) ) );
+				p = e + 1;
+			}
+		}
 		else if ( k == "--gains" ) a.gains = v != "0";
 		else if ( k == "--gains-lr" ) a.gains_lr = std::stof( v );
 		else if ( k == "--opt-host" ) a.opt_host = v != "0";
@@ -167,7 +183,7 @@ bool parse( int argc, char** argv, Args& a ) {
 	}
 	if ( a.model.empty() || a.teacher.empty() || a.out.empty() || ( a.adam_bits != 32 && a.adam_bits != 8 ) || a.seqs < 1 ) {
 		LOG_ERROR( "usage: volta_e2e --model <EXL3 dir> --teacher <topk file> --out <dir> [--inputs <train_inputs file>] [--devices 0,1,2,3] [--tp 1] "
-			"[--fp16 1] [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--hc 0] [--hc-lr 0.1] [--gains 0] [--gains-lr 1] [--steps 64] [--batch 4] [--seqs 1] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
+			"[--fp16 1] [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--hc 0] [--hc-lr 0.1] [--gains 0] [--gains-lr 1] [--reencode L] [--reencode-steps 0,0.003,0.01,0.03,0.1] [--reencode-feedback 0] [--steps 64] [--batch 4] [--seqs 1] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
 			"[--adam-bits 32|8] [--opt-host 0|1] [--ckpt-host -1|0|1] [--keep -1|0|1] [--qsa 1] [--timing 0|1] [--check-trace FILE]" );
 		return false;
 	}
@@ -591,6 +607,49 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		if ( r == 0 )
 			LOG_INFO( "[volta_e2e] held-out KL before tuning %.6f per token (%.1f s)", my_best, std::chrono::duration<double>( std::chrono::steady_clock::now() - th0 ).count() );
 		m->keep_best();
+		if ( a.reencode >= 0 ) {
+			// Code updates of one layer's routed experts: their gradients with respect to the tiles and their inputs' Hessians summed over the
+			// training sequences, then each step size (a fraction of the tiles' norm in the quantization metric) re-encoded, measured, undone
+			const auto ta = std::chrono::steady_clock::now();
+			m->set_accumulate( a.reencode );
+			m->zero_grads();
+			for ( int s0 = 0; s0 < train_used; s0 += P ) {
+				std::vector<int> sqs;
+				for ( int sq = s0; sq < std::min( train_used, s0 + P ); ++sq ) sqs.push_back( sq );
+				run( sqs, true );
+			}
+			const double rho = m->reencode_prepare( a.reencode_feedback );
+			// the KL on the first (up to) 20 training sequences too: whether a step lowers the loss it was taken on
+			const int tn = std::min( train_used, 20 );
+			auto train_kl = [&]() {
+				double kl = 0.0;
+				for ( int s0 = 0; s0 < tn; s0 += P ) {
+					std::vector<int> sqs;
+					for ( int sq = s0; sq < std::min( tn, s0 + P ); ++sq ) sqs.push_back( sq );
+					kl += run( sqs, false );
+				}
+				return kl / ( static_cast<double>( tn ) * T );
+			};
+			const double tr0 = train_kl();
+			if ( r == 0 )
+				LOG_INFO( "[volta_e2e] layer %d: gradient and Hessian sums over %d sequences, %.0f s; |D| / |R| %.4g (%s); KL on %d of them %.6f",
+					a.reencode, train_used, std::chrono::duration<double>( std::chrono::steady_clock::now() - ta ).count(), rho,
+					a.reencode_feedback ? "D = M^-1 G, in the metric" : "D = G, plain", tn, tr0 );
+			for ( float s : a.reencode_steps ) {
+				const auto tr = std::chrono::steady_clock::now();
+				const float eta = rho > 0.0 ? static_cast<float>( s / rho ) : 0.0f;
+				double lin = 0.0, quad = 0.0;
+				const double pe = m->reencode( eta, a.reencode_feedback, &lin, &quad );
+				const double ho = held_out(), tk = train_kl();
+				if ( r == 0 )
+					LOG_INFO( "[volta_e2e] layer %d re-encoded at a step of %.3g of |R| (eta %.4g%s): proxy error %.4g (rank 0), first-order change %.3g per "
+						"training token (dQ^T M dQ %.3g), held-out KL %.6f (before %.6f), training KL %.6f (before %.6f), %.0f s", a.reencode, s, eta,
+						a.reencode_feedback ? ", with the feedback" : "", pe, lin / ( static_cast<double>( train_used ) * T ), quad, ho, my_best, tk, tr0,
+						std::chrono::duration<double>( std::chrono::steady_clock::now() - tr ).count() );
+				m->restore_codes();
+			}
+			m->set_accumulate( -1 );
+		}
 		if ( a.timing ) {
 			m->set_timing( true );
 			m->timing_report();
@@ -601,7 +660,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		order.n = train_used;
 		order.shuffle = a.shuffle;
 		engine::train::AdamOptions o;
-		for ( int step = 1; step <= a.steps; ++step ) {
+		for ( int step = 1; step <= ( a.reencode >= 0 ? 0 : a.steps ); ++step ) {
 			const auto ts = std::chrono::steady_clock::now();
 			m->zero_grads();
 			double kl = 0.0;

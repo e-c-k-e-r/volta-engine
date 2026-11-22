@@ -229,6 +229,8 @@ void had_rows( const float* in, const float* col_scale, int rows, int cols, floa
 // The tile gains' 8-bit codes from their values, g = ( 896 + c ) / 1024 (nearest, clamped), and back
 void gain_codes( const float* g, uint8_t* codes, size_t n, backend::stream_t stream );
 void gain_values( const uint8_t* codes, float* g, size_t n, backend::stream_t stream );
+// x += a y, elementwise
+void add_scaled( float* x, const float* y, float a, size_t n, backend::stream_t stream );
 
 // ---- the model ----
 
@@ -341,6 +343,19 @@ public:
 	// is the value's), their gradient from the product's input and output gradient rotated into the tiles' frame (one more product per
 	// tensor in the backward)
 	void set_train_gains( bool on, float lr_scale = 1.0f );
+	// Code updates of layer L's routed experts on this rank (the V step of PV-tuning). set_accumulate( L ) (after load; -1 off) has each backward
+	// add, per expert, the gradient G with respect to its projections' tiles R (in their frame: ( X diag( su ) H )^T ( dY diag( sv ) H ), the
+	// weight diag( su ) H R H diag( sv )) and its inputs' Hessian sums over the rows routed to it, on the device (~48 MB an expert). The step
+	// D is M^-1 G in the projection's quantization metric M (its input Hessian in the tiles' frame with its input scales folded in) with the LDL
+	// feedback, or G itself without (each tile encoded on its own, in the plain metric). reencode_prepare( feedback ) keeps the loaded codes and
+	// returns sqrt( sum |D|^2 / sum |R|^2 ) over every rank's experts (in M with the feedback, else plain). reencode( eta, feedback ) then
+	// encodes every projection anew toward R - eta D, its scales and tile gains held (engine/quant/exl3_quantize.h, exl3_reencode), in place of
+	// its codes, and returns the mean proxy error of those encodes; lin and quad (summed over the ranks) receive sum < G, Q - R > (the summed
+	// loss's change to first order) and sum ( Q - R )^T M ( Q - R ). restore_codes() puts the loaded codes back
+	void set_accumulate( int L );
+	double reencode_prepare( bool feedback = false );
+	double reencode( float eta, bool feedback = false, double* lin = nullptr, double* quad = nullptr );
+	void restore_codes();
 	// Where Adam's state lives (before load): on the device (the default) or with host, in pinned host memory, streamed through the device in
 	// parts for each step (the same kernels, the same result; the device keeps the current values, their gradients and one part); its moments
 	// FP32 (32) or 8-bit block-wise (8, engine/train/adam8.h)
