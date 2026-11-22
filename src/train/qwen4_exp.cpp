@@ -1773,6 +1773,8 @@ double Model::head( const float* x, int rows, const Teacher& t, float* dx ) {
 
 void Model::freeze_routing( bool on ) { p_->frozen = on; }
 
+const std::vector<int>& Model::selection( int L ) const { return p_->last_ids.at( static_cast<size_t>( L - first_ ) ); }
+
 void Model::set_timing( bool on ) { p_->timing = on; }
 
 void Model::set_fp16( bool on ) { p_->fp16 = on; }

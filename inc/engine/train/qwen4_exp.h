@@ -303,6 +303,8 @@ public:
 	// Routing held fixed at the selection of each layer's last call (for gradient checks across a perturbation; the weights still follow
 	// the logits); off: every call selects
 	void freeze_routing( bool on );
+	// Layer L's routed experts of its last call: rows x top_k ids (host)
+	const std::vector<int>& selection( int L ) const;
 
 	// The trainable tensors' products on the tensor cores (the default: FP16 cores, activations and gradients rounded to FP16 per row at a
 	// power-of-two scale, FP32 accumulation; everything else FP32), or off: FP32 products

@@ -26,7 +26,9 @@
 //             [--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]
 //   --check-trace: a trace_layers file of the model's engine forward over the first sequence (test_ppl --calibrate --chunk 512): every layer of
 //     the training form fed the engine's input streams of that layer, its output against the engine's, and the first sequence's embedding
-//     streams against the engine's; then exits (the layer split)
+//     streams against the engine's; then exits (the layer split). The trace may come from another checkpoint of the model (the same text
+//     and inputs): each layer's own deviation from it. --check-routes FILE (a route_dump of that run): per layer, fed that run's input and
+//     chained, the share of its routed experts this model picks too
 //
 // The inputs come from the model itself (test_ppl --flash --calibrate --file TEXT --seq S --tokens N --chunk 512 with train_inputs set:
 // its token embeddings and the PLE layer's n-gram rows), the teacher from the reference model on the same text (test_ppl --flash --file TEXT
@@ -62,7 +64,7 @@ namespace tq = engine::train::qwen4_exp;
 namespace q = engine::tools::quant;
 
 struct Args {
-	std::string model, inputs, teacher, out, check_trace;
+	std::string model, inputs, teacher, out, check_trace, check_routes;
 	std::vector<int> devices = { 0, 1, 2, 3 };
 	int steps = 64, batch = 4, seqs = 1, hold = 4, eval_every = 16, warmup = 2, train = 0, adam_bits = 32, ckpt_host = -1, keep = -1, check_inputs = 0, route_cand = 0;
 	bool write = true, timing = false, tp = true, fp16 = true, norms = true, dense = false, router = false, opt_host = false, qsa = true, shuffle = false, hc = false,
@@ -167,6 +169,7 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--write" ) a.write = v != "0";
 		else if ( k == "--timing" ) a.timing = v != "0";
 		else if ( k == "--check-trace" ) a.check_trace = v;
+		else if ( k == "--check-routes" ) a.check_routes = v;
 		else if ( k == "--check-inputs" ) a.check_inputs = std::stoi( v );
 		else if ( k == "--devices" ) {
 			a.devices.clear();
@@ -881,6 +884,37 @@ int main( int argc, char** argv ) {
 			std::memcpy( dst.data() + static_cast<size_t>( p0 ) * cols, v.data(), std::min<size_t>( m, T - p0 ) * cols * sizeof( float ) );
 		}
 		std::fclose( f );
+		// --check-routes: another run's route_dump of the same text and chunking (its routed experts per layer and row), compared with this
+		// model's selections: per row the share of that run's top-k experts this one picks too
+		std::map<int, std::vector<int>> ref_ids;
+		if ( !a.check_routes.empty() ) {
+			FILE* fr = std::fopen( a.check_routes.c_str(), "rb" );
+			if ( !fr ) return 1;
+			int rh[4];
+			while ( std::fread( rh, sizeof( int ), 4, fr ) == 4 ) {
+				const int layer = rh[0], m = rh[1], p0 = rh[2], K = rh[3];
+				std::vector<int> v( static_cast<size_t>( m ) * K );
+				if ( std::fread( v.data(), sizeof( int ), v.size(), fr ) != v.size() ) break;
+				std::fseek( fr, static_cast<long>( 2 ) * m * H, SEEK_CUR );   // the router input rows (FP16)
+				if ( K != cfg.top_k || p0 >= T ) continue;
+				auto& dst = ref_ids[layer];
+				dst.resize( static_cast<size_t>( T ) * K );
+				std::memcpy( dst.data() + static_cast<size_t>( p0 ) * K, v.data(), std::min( m, T - p0 ) * K * sizeof( int ) );
+			}
+			std::fclose( fr );
+		}
+		auto overlap = [&]( const tq::Model& mm, int L ) -> double {
+			const auto it = ref_ids.find( L );
+			if ( it == ref_ids.end() ) return -1.0;
+			const std::vector<int>& mine = mm.selection( L );
+			const int K = cfg.top_k;
+			if ( mine.size() < static_cast<size_t>( T ) * K ) return -1.0;
+			long hit = 0;
+			for ( int rr = 0; rr < T; ++rr )
+				for ( int j = 0; j < K; ++j )
+					for ( int q = 0; q < K; ++q ) hit += mine[static_cast<size_t>( rr ) * K + q] == it->second[static_cast<size_t>( rr ) * K + j];
+			return static_cast<double>( hit ) / ( static_cast<double>( T ) * K );
+		};
 		auto relerr = [&]( const std::vector<float>& a1, const std::vector<float>& b1 ) {
 			double d = 0.0, n2 = 0.0;
 			for ( size_t i = 0; i < b1.size(); ++i ) { d += ( a1[i] - b1[i] ) * ( a1[i] - b1[i] ); n2 += b1[i] * b1[i]; }
@@ -914,8 +948,10 @@ int main( int argc, char** argv ) {
 				std::vector<float> dt( host.size() ), de( host.size() );
 				const std::vector<float>& ref = tr[600 + L];
 				for ( size_t i = 0; i < host.size(); ++i ) { dt[i] = host[i] - in[i]; de[i] = ref[i] - in[i]; }
-				LOG_INFO( "[volta_e2e] check: layer %2d (%s%s): output streams %.3g, the layer's change %.3g", L, cfg.full_attention( L ) ? "attention" : "GDN",
-					L == cfg.ple_layer ? " + PLE" : "", relerr( host, ref ), relerr( dt, de ) );
+				char rt[64] = "";
+				if ( overlap( *s.m, L ) >= 0.0 ) std::snprintf( rt, sizeof( rt ), ", routes shared %.1f%%", 100.0 * overlap( *s.m, L ) );
+				LOG_INFO( "[volta_e2e] check: layer %2d (%s%s): output streams %.3g, the layer's change %.3g%s", L, cfg.full_attention( L ) ? "attention" : "GDN",
+					L == cfg.ple_layer ? " + PLE" : "", relerr( host, ref ), relerr( dt, de ), rt );
 			}
 		}
 		{
@@ -934,7 +970,10 @@ int main( int argc, char** argv ) {
 					s.m->forward( L, c, s.x, T, s.pk, s.pv );
 					CUDA_CHECK( cudaStreamSynchronize( static_cast<cudaStream_t>( s.m->stream() ) ) );
 					CUDA_CHECK( cudaMemcpy( host.data(), s.x, host.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
-					if ( L % 4 == 0 || L == cfg.layers - 1 ) LOG_INFO( "[volta_e2e] check: chained, after layer %2d: streams %.3g", L, relerr( host, tr[600 + L] ) );
+					char rt[64] = "";
+					if ( overlap( *s.m, L ) >= 0.0 ) std::snprintf( rt, sizeof( rt ), ", routes shared %.1f%%", 100.0 * overlap( *s.m, L ) );
+					if ( L % 4 == 0 || L == cfg.layers - 1 || rt[0] )
+						LOG_INFO( "[volta_e2e] check: chained, after layer %2d: streams %.3g%s", L, relerr( host, tr[600 + L] ), rt );
 				}
 				if ( g + 1 < G ) handoff( st[g + 1], st[g + 1].x, s, s.x, T );
 			}
