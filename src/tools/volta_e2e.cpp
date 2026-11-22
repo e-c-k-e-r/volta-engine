@@ -64,7 +64,9 @@ namespace tq = engine::train::qwen4_exp;
 namespace q = engine::tools::quant;
 
 struct Args {
-	std::string model, inputs, teacher, out, check_trace, check_routes;
+	std::string model, inputs, teacher, out, check_trace, check_routes, router_teacher;
+	float router_kl = 0.0f;                    // --router-kl: the routing distillation term's weight (0: off)
+	int router_l0 = 0, router_l1 = 1 << 20;    // --router-kl-layers A-B: its layers
 	std::vector<int> devices = { 0, 1, 2, 3 };
 	int steps = 64, batch = 4, seqs = 1, hold = 4, eval_every = 16, warmup = 2, train = 0, adam_bits = 32, ckpt_host = -1, keep = -1, check_inputs = 0, route_cand = 0;
 	bool write = true, timing = false, tp = true, fp16 = true, norms = true, dense = false, router = false, opt_host = false, qsa = true, shuffle = false, hc = false,
@@ -170,6 +172,13 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--timing" ) a.timing = v != "0";
 		else if ( k == "--check-trace" ) a.check_trace = v;
 		else if ( k == "--check-routes" ) a.check_routes = v;
+		else if ( k == "--router-teacher" ) a.router_teacher = v;
+		else if ( k == "--router-kl" ) a.router_kl = std::stof( v );
+		else if ( k == "--router-kl-layers" ) {
+			const size_t dash = v.find( '-' );
+			a.router_l0 = std::stoi( v.substr( 0, dash ) );
+			a.router_l1 = dash == std::string::npos ? a.router_l0 + 1 : std::stoi( v.substr( dash + 1 ) ) + 1;
+		}
 		else if ( k == "--check-inputs" ) a.check_inputs = std::stoi( v );
 		else if ( k == "--devices" ) {
 			a.devices.clear();
@@ -201,6 +210,10 @@ struct Data {
 	std::vector<float> p, tail;      // [n, k], [n]
 	std::vector<uint16_t> emb;       // [n, H] FP16
 	std::vector<uint16_t> pk, pv;    // [n, flat], [n, H] FP16
+	// the routing teacher (--router-teacher): per row and layer its rk most likely experts and their probabilities
+	int rk = 0, rl = 0;
+	std::vector<int16_t> r_ids;      // [n, rl, rk]
+	std::vector<float> r_p;          // [n, rl, rk]
 	int sequences() const { return seq > 0 ? n / seq : 0; }
 	bool dumped() const { return !emb.empty(); }   // the inputs read from files, else made from the tokens (tq::Inputs)
 	// the tokens of the sequences sqs end to end
@@ -210,6 +223,56 @@ struct Data {
 		return t;
 	}
 };
+
+// router_dump files (comma-separated, the teacher files' texts in their order, --seq sequences, chunks of any size): per row of every
+// sequence and layer the 16 largest router logits as probabilities (their exp less the log-sum-exp). A layer-0 record at position 0 opens
+// the next sequence; records past the model's layers (the MTP block's) are skipped
+bool read_router_teacher( const std::string& list, int layers, Data& d ) {
+	d.rl = layers;
+	d.rk = 16;
+	d.r_ids.assign( static_cast<size_t>( d.n ) * layers * d.rk, -1 );
+	d.r_p.assign( d.r_ids.size(), 0.0f );
+	int s = -1;
+	for ( size_t p0 = 0; p0 <= list.size(); ) {
+		const size_t e = std::min( list.find( ',', p0 ), list.size() );
+		const std::string path = list.substr( p0, e - p0 );
+		p0 = e + 1;
+		if ( path.empty() ) continue;
+		FILE* f = std::fopen( path.c_str(), "rb" );
+		if ( !f ) return false;
+		int hdr[4];
+		while ( std::fread( hdr, sizeof( int ), 4, f ) == 4 ) {
+			const int L = hdr[0], m = hdr[1], pos = hdr[2], K = hdr[3];
+			if ( K != d.rk ) {
+				std::fclose( f );
+				return false;
+			}
+			std::vector<int16_t> ids( static_cast<size_t>( m ) * K );
+			std::vector<uint16_t> lg( ids.size() );
+			std::vector<float> lse( m );
+			if ( std::fread( ids.data(), 2, ids.size(), f ) != ids.size() || std::fread( lg.data(), 2, lg.size(), f ) != lg.size() ||
+				std::fread( lse.data(), 4, lse.size(), f ) != lse.size() )
+				break;
+			if ( L == 0 && pos == 0 ) ++s;
+			if ( L >= layers || s < 0 || ( s + 1 ) * d.seq > d.n ) continue;
+			for ( int r = 0; r < m && pos + r < d.seq; ++r ) {
+				const size_t at = ( ( static_cast<size_t>( s ) * d.seq + pos + r ) * layers + L ) * K;
+				for ( int j = 0; j < K; ++j ) {
+					__half_raw hr;
+					hr.x = lg[static_cast<size_t>( r ) * K + j];
+					d.r_ids[at + j] = ids[static_cast<size_t>( r ) * K + j];
+					d.r_p[at + j] = std::exp( __half2float( __half( hr ) ) - lse[r] );
+				}
+			}
+		}
+		std::fclose( f );
+	}
+	if ( ( s + 1 ) * d.seq != d.n ) {
+		LOG_ERROR( "[volta_e2e] the routing teacher holds %d sequences, the teacher %d", s + 1, d.sequences() );
+		return false;
+	}
+	return true;
+}
 
 bool read_teacher( const std::string& path, Data& d ) {
 	FILE* f = std::fopen( path.c_str(), "rb" );
@@ -492,6 +555,49 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		int* t_ids;
 		uint16_t* staging;
 		for ( float** p : { &x, &dx, &dy } ) CUDA_CHECK( cudaMalloc( p, rows_l * sizeof( float ) ) );
+		// the routing teacher of a pass's rows (rank 0: it alone adds the term), per layer its ids, probabilities and the mass outside them
+		const bool routing = a.router_kl > 0.0f && !d.r_ids.empty() && r == 0;
+		int *r_ids = nullptr;
+		float *r_p = nullptr, *r_tail = nullptr;
+		std::vector<tq::Teacher> r_layers;
+		if ( routing ) {
+			const size_t per = static_cast<size_t>( cfg.layers ) * R * d.rk;
+			CUDA_CHECK( cudaMalloc( &r_ids, per * sizeof( int ) ) );
+			CUDA_CHECK( cudaMalloc( &r_p, per * sizeof( float ) ) );
+			CUDA_CHECK( cudaMalloc( &r_tail, static_cast<size_t>( cfg.layers ) * R * sizeof( float ) ) );
+		}
+		// the routing teacher's rows of the sequences sqs (end to end) into its buffers, then handed to the model
+		auto routing_targets = [&]( const std::vector<int>& sqs ) {
+			if ( !routing ) return;
+			const int Rc = static_cast<int>( sqs.size() ) * T, K = d.rk;
+			std::vector<int> hi( static_cast<size_t>( cfg.layers ) * Rc * K );
+			std::vector<float> hp( hi.size() ), ht( static_cast<size_t>( cfg.layers ) * Rc );
+			for ( int L = 0; L < cfg.layers; ++L )
+				for ( size_t si = 0; si < sqs.size(); ++si )
+					for ( int t = 0; t < T; ++t ) {
+						const size_t row = si * T + t, src = ( ( static_cast<size_t>( sqs[si] ) * T + t ) * d.rl + L ) * K, dst = ( L * static_cast<size_t>( Rc ) + row ) * K;
+						float sum = 0.0f;
+						for ( int j = 0; j < K; ++j ) {
+							hi[dst + j] = d.r_ids[src + j];
+							sum += hp[dst + j] = d.r_p[src + j];
+						}
+						ht[L * static_cast<size_t>( Rc ) + row] = std::max( 0.0f, 1.0f - sum );
+					}
+			CUDA_CHECK( cudaMemcpyAsync( r_ids, hi.data(), hi.size() * sizeof( int ), cudaMemcpyHostToDevice, st ) );
+			CUDA_CHECK( cudaMemcpyAsync( r_p, hp.data(), hp.size() * sizeof( float ), cudaMemcpyHostToDevice, st ) );
+			CUDA_CHECK( cudaMemcpyAsync( r_tail, ht.data(), ht.size() * sizeof( float ), cudaMemcpyHostToDevice, st ) );
+			CUDA_CHECK( cudaStreamSynchronize( st ) );
+			r_layers.assign( cfg.layers, tq::Teacher{} );
+			for ( int L = std::max( 0, a.router_l0 ); L < std::min( cfg.layers, a.router_l1 ); ++L ) {
+				tq::Teacher& tt = r_layers[L];
+				tt.ids = r_ids + static_cast<size_t>( L ) * Rc * K;
+				tt.p = r_p + static_cast<size_t>( L ) * Rc * K;
+				tt.tail = r_tail + static_cast<size_t>( L ) * Rc;
+				tt.tk = K;
+			}
+			m->set_router_teacher( r_layers, a.router_kl );
+		};
+		const int r_layers_n = std::max( 0, std::min( cfg.layers, a.router_l1 ) - std::max( 0, a.router_l0 ) );
 		CUDA_CHECK( cudaMalloc( &emb, static_cast<size_t>( Rl ) * H * sizeof( float ) ) );
 		CUDA_CHECK( cudaMalloc( &pk, static_cast<size_t>( R ) * flat * sizeof( float ) ) );
 		CUDA_CHECK( cudaMalloc( &pv, static_cast<size_t>( R ) * H * sizeof( float ) ) );
@@ -544,6 +650,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		auto run = [&]( const std::vector<int>& sqs, bool train ) -> double {
 			const int c = static_cast<int>( sqs.size() ), Rc = c * T, Rcl = Rc / n;
 			inputs( sqs, Rc, Rcl );
+			routing_targets( sqs );
 			const size_t xb = static_cast<size_t>( Rcl ) * flat * sizeof( float );
 			float* x0 = ckpt_host ? cbuf[0] : x;
 			for ( int h = 0; h < hc; ++h ) tq::copy_cols( emb, H, 0, x0, flat, h * H, Rcl, H, false, st );
@@ -596,19 +703,33 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			}
 			return kl;
 		};
+		// with the routing teacher, the routing KL per token and layer of the last held-out pass (rank 0)
+		double ho_router = 0.0;
 		auto held_out = [&]() {
 			double kl = 0.0;
+			m->router_kl();
 			for ( int s0 = train_n; s0 < S; s0 += P ) {
 				std::vector<int> sqs;
 				for ( int sq = s0; sq < std::min( S, s0 + P ); ++sq ) sqs.push_back( sq );
 				kl += run( sqs, false );
 			}
+			ho_router = m->router_kl() / ( static_cast<double>( a.hold ) * T * std::max( r_layers_n, 1 ) );
 			return kl / ( static_cast<double>( a.hold ) * T );
+		};
+		auto routing_note = [&]( double v ) {
+			std::string s;
+			if ( routing ) {
+				char b[64];
+				std::snprintf( b, sizeof( b ), ", routing KL %.4f per layer", v );
+				s = b;
+			}
+			return s;
 		};
 		const auto th0 = std::chrono::steady_clock::now();
 		double my_best = held_out();
 		if ( r == 0 )
-			LOG_INFO( "[volta_e2e] held-out KL before tuning %.6f per token (%.1f s)", my_best, std::chrono::duration<double>( std::chrono::steady_clock::now() - th0 ).count() );
+			LOG_INFO( "[volta_e2e] held-out KL before tuning %.6f per token%s (%.1f s)", my_best, routing_note( ho_router ).c_str(),
+				std::chrono::duration<double>( std::chrono::steady_clock::now() - th0 ).count() );
 		m->keep_best();
 		if ( a.reencode >= 0 ) {
 			// Code updates of one layer's routed experts: their gradients with respect to the tiles and their inputs' Hessians summed over the
@@ -694,16 +815,18 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 					bar.wait();
 				}
 			}
+			const double tr_router = m->router_kl() / ( static_cast<double>( a.batch ) * T * std::max( r_layers_n, 1 ) );
 			if ( r == 0 )
-				LOG_INFO( "[volta_e2e] step %d: train KL %.6f per token, lr %.3g, %.1f s", step, kl / ( static_cast<double>( a.batch ) * T ), o.lr,
-					std::chrono::duration<double>( std::chrono::steady_clock::now() - ts ).count() );
+				LOG_INFO( "[volta_e2e] step %d: train KL %.6f per token%s, lr %.3g, %.1f s", step, kl / ( static_cast<double>( a.batch ) * T ),
+					routing_note( tr_router ).c_str(), o.lr, std::chrono::duration<double>( std::chrono::steady_clock::now() - ts ).count() );
 			if ( step % a.eval_every == 0 || step == a.steps ) {
 				const bool was = a.timing;
 				if ( was ) m->set_timing( false );
 				const double ho = held_out();
 				if ( was ) m->set_timing( true );
 				if ( r == 0 )
-					LOG_INFO( "[volta_e2e] step %d: held-out KL %.6f per token (best %.6f at step %d)", step, ho, std::min( ho, my_best ), ho < my_best ? step : my_step );
+					LOG_INFO( "[volta_e2e] step %d: held-out KL %.6f per token%s (best %.6f at step %d)", step, ho, routing_note( ho_router ).c_str(),
+						std::min( ho, my_best ), ho < my_best ? step : my_step );
 				if ( ho < my_best ) {
 					my_best = ho;
 					my_step = step;
@@ -716,7 +839,8 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			best = my_best;
 			best_step = my_step;
 		}
-		for ( float* p : { x, dx, dy, emb, pk, pv, t_p, t_tail } ) cudaFree( p );
+		for ( float* p : { x, dx, dy, emb, pk, pv, t_p, t_tail, r_p, r_tail } ) if ( p ) cudaFree( p );
+		if ( r_ids ) cudaFree( r_ids );
 		cudaFree( t_ids );
 		cudaFree( staging );
 		for ( float* c : ckpt ) ckpt_host ? cudaFreeHost( c ) : cudaFree( c );
@@ -762,6 +886,10 @@ int main( int argc, char** argv ) {
 	Data d;
 	if ( !read_data( a.teacher, a.inputs, H, flat, d ) ) {
 		LOG_ERROR( "[volta_e2e] cannot read the teacher (%s) or the inputs (%s)", a.teacher.c_str(), a.inputs.c_str() );
+		return 1;
+	}
+	if ( !a.router_teacher.empty() && !read_router_teacher( a.router_teacher, cfg.layers, d ) ) {
+		LOG_ERROR( "[volta_e2e] cannot read the routing teacher (%s)", a.router_teacher.c_str() );
 		return 1;
 	}
 	const int T = d.seq, S = d.sequences(), train_n = S - a.hold;
@@ -941,6 +1069,7 @@ int main( int argc, char** argv ) {
 			for ( int L = s.m->first(); L < s.m->last(); ++L ) {
 				const std::vector<float>& in = L == 0 ? tr[1000] : tr[600 + L - 1];
 				CUDA_CHECK( cudaMemcpy( s.x, in.data(), in.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+				CUDA_CHECK( cudaDeviceSynchronize() );   // a pageable copy's DMA may outlive the call; the model's stream does not wait for it
 				s.m->forward( L, s.x, s.y, T, s.pk, s.pv );
 				CUDA_CHECK( cudaStreamSynchronize( static_cast<cudaStream_t>( s.m->stream() ) ) );
 				CUDA_CHECK( cudaMemcpy( host.data(), s.y, host.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
@@ -987,6 +1116,7 @@ int main( int argc, char** argv ) {
 			CUDA_CHECK( cudaMemcpy( sl.t_ids, d.ids.data(), static_cast<size_t>( T ) * d.k * sizeof( int ), cudaMemcpyHostToDevice ) );
 			CUDA_CHECK( cudaMemcpy( sl.t_p, d.p.data(), static_cast<size_t>( T ) * d.k * sizeof( float ), cudaMemcpyHostToDevice ) );
 			CUDA_CHECK( cudaMemcpy( sl.t_tail, d.tail.data(), static_cast<size_t>( T ) * sizeof( float ), cudaMemcpyHostToDevice ) );
+			CUDA_CHECK( cudaDeviceSynchronize() );
 			tq::Teacher t;
 			t.ids = sl.t_ids; t.p = sl.t_p; t.tail = sl.t_tail; t.tk = d.k;
 			LOG_INFO( "[volta_e2e] check: head on the engine's final streams, first sequence: KL %.6f per token", sl.m->head( sl.x, T, t, nullptr ) / T );

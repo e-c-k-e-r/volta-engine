@@ -216,6 +216,8 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	int h_shape[2] = { R, H };
 	embed_rows_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	mixed_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
+	if ( !runtime::options().router_dump.empty() )
+		router_logits_ = static_cast<backend::half_t*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * config_.num_experts * sizeof( backend::half_t ) ) );
 	y_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 	int st_shape[3] = { R, config_.hc_mult, H };
 	streams_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, st_shape, 3 );
@@ -955,6 +957,45 @@ void Qwen4ExpPipeline::dump_router( int m, backend::stream_t stream ) {
 	}
 }
 
+// Debug (router_dump): record {layer, rows, first position, 16}, the rows' 16 largest router logits as expert ids (int16, rows x 16) and logits
+// (FP16, rows x 16), then each row's log-sum-exp over all experts (FP32)
+void Qwen4ExpPipeline::dump_router_logits( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream ) {
+	static const std::string& path = runtime::options().router_dump;
+	if ( path.empty() || router_logits_ == nullptr || rank_ != 0 || m <= pod::MAX_BATCH ) return;
+	constexpr int TK = 16;
+	const int E = config_.num_experts, H = config_.hidden_size;
+	engine::modules::Vision::dense_gemm( mixed_.ptr<const backend::half_t>(), lw.router.ptr<const backend::half_t>(), router_logits_, gemm_rows( m ), E, H, stream );
+	std::vector<backend::half_t> lg( static_cast<size_t>( m ) * E );
+	backend::stream_sync( stream );
+	backend::memcpy_async( lg.data(), router_logits_, lg.size() * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+	backend::stream_sync( stream );
+	std::vector<int16_t> ids( static_cast<size_t>( m ) * TK );
+	std::vector<backend::half_t> top( ids.size() );
+	std::vector<float> lse( m ), row( E );
+	std::vector<int> ord( E );
+	for ( int r = 0; r < m; ++r ) {
+		float mx = -INFINITY;
+		for ( int e = 0; e < E; ++e ) mx = std::max( mx, row[e] = backend::to_float( lg[static_cast<size_t>( r ) * E + e] ) );
+		double s = 0.0;
+		for ( int e = 0; e < E; ++e ) s += std::exp( static_cast<double>( row[e] - mx ) );
+		lse[r] = mx + static_cast<float>( std::log( s ) );
+		for ( int e = 0; e < E; ++e ) ord[e] = e;
+		std::partial_sort( ord.begin(), ord.begin() + TK, ord.end(), [&]( int a, int b ) { return row[a] > row[b] || ( row[a] == row[b] && a < b ); } );
+		for ( int j = 0; j < TK; ++j ) {
+			ids[static_cast<size_t>( r ) * TK + j] = static_cast<int16_t>( ord[j] );
+			top[static_cast<size_t>( r ) * TK + j] = lg[static_cast<size_t>( r ) * E + ord[j]];
+		}
+	}
+	if ( FILE* f = std::fopen( path.c_str(), "ab" ) ) {
+		const int hdr[4] = { hess_layer_, m, key_hint_ - m, TK };
+		std::fwrite( hdr, sizeof( int ), 4, f );
+		std::fwrite( ids.data(), sizeof( int16_t ), ids.size(), f );
+		std::fwrite( top.data(), sizeof( backend::half_t ), top.size(), f );
+		std::fwrite( lse.data(), sizeof( float ), lse.size(), f );
+		std::fclose( f );
+	}
+}
+
 // Debug (qsa_dump): record {attention layer, rows, first position, words}, then per row its key count (-1: within the budget, dense) and
 // words of its selected pools as bits (pool p: bit p % 32 of word p / 32)
 void Qwen4ExpPipeline::dump_qsa( int attn_idx, int m, backend::stream_t stream ) {
@@ -1408,6 +1449,7 @@ void Qwen4ExpPipeline::moe_forward( const Qwen4ExpLayerWeights& lw, int m, backe
 	engine::modules::MoERouter::route_softmax_topk( mixed_, lw.router, topk_idx_, topk_w_, H, config_.num_experts, config_.top_k, stream, m );
 	if ( &lw == &layers_[0] ) trace_route( 700, m, stream );
 	dump_router( m, stream );
+	dump_router_logits( lw, m, stream );
 	replay_routes( m, stream );
 	const int per_rank = config_.num_experts / tp_;
 	// Plain SiLU gating (no swiglu limit): act_limit 0

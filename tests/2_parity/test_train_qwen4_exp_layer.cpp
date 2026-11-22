@@ -42,6 +42,8 @@ float get( const float* d, size_t i ) {
 void set( float* d, size_t i, float v ) {
 	CUDA_CHECK( cudaDeviceSynchronize() );
 	CUDA_CHECK( cudaMemcpy( d + i, &v, sizeof( float ), cudaMemcpyHostToDevice ) );
+	// a copy from pageable memory may return before its DMA lands, and the model's stream does not wait for the default stream
+	CUDA_CHECK( cudaDeviceSynchronize() );
 }
 
 } // namespace
@@ -89,6 +91,7 @@ int main( int argc, char** argv ) {
 		CUDA_CHECK( cudaMemcpy( R, hr.data(), nx * sizeof( float ), cudaMemcpyHostToDevice ) );
 		CUDA_CHECK( cudaMemcpy( pk, hk.data(), hk.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
 		CUDA_CHECK( cudaMemcpy( pv, hv.data(), hv.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+		CUDA_CHECK( cudaDeviceSynchronize() );
 		auto loss = [&]() {
 			m.forward( L, x, y, T, pk, pv );
 			const std::vector<float> h = down( y, nx );
@@ -116,6 +119,8 @@ int main( int argc, char** argv ) {
 		const std::vector<float> g = down( dx, nx );
 		// Input gradient on sampled entries
 		double worst = 0.0, gmax = 0.0;
+		size_t worst_i = 0;
+		double worst_fd = 0.0, worst_l0 = 0.0, worst_lp = 0.0, worst_lm = 0.0;
 		for ( int s = 0; s < 12; ++s ) {
 			const size_t i = std::uniform_int_distribution<size_t>( 0, nx - 1 )( rng );
 			const float x0 = hx[i], h = 1e-2f * std::max( 1.0f, std::fabs( x0 ) );
@@ -125,11 +130,21 @@ int main( int argc, char** argv ) {
 			const double lm = loss();
 			set( x, i, x0 );
 			const double fd = ( lp - lm ) / ( 2 * h );
-			worst = std::max( worst, std::fabs( fd - g[i] ) );
+			if ( std::fabs( fd - g[i] ) > worst ) {
+				worst = std::fabs( fd - g[i] );
+				worst_i = i;
+				worst_fd = fd;
+				worst_lp = lp;
+				worst_lm = lm;
+				worst_l0 = loss();
+			}
 			gmax = std::max( gmax, std::fabs( fd ) );
 		}
 		char line[200];
 		std::snprintf( line, sizeof( line ), "input gradient, 12 entries: max error %.3g of max %.3g", worst, gmax );
+		if ( worst > 2e-2 * gmax + 1e-3 )
+			std::printf( "    (entry %zu: differences %.6g, analytic %.6g; loss %.9g, at +h %.9g, at -h %.9g)\n", worst_i, worst_fd, g[worst_i], worst_l0, worst_lp,
+				worst_lm );
 		check( worst <= 2e-2 * gmax + 1e-3, line );
 		// Scale gradients: a few tensors, a few channels each
 		std::vector<q::Tuned*> ts = m.tensors();
@@ -206,6 +221,76 @@ int main( int argc, char** argv ) {
 			const std::string nm = d->name.substr( d->name.find( "layers." ) == std::string::npos ? 0 : d->name.find( "layers." ) );
 			std::snprintf( line, sizeof( line ), "%-56s weights: error %.3g of %.3g", nm.c_str(), w, gm );
 			check( w <= 3e-2 * gm + 1e-4, line );
+		}
+		{
+			// Router distillation: a random routing teacher (16 experts per row with probabilities, the rest as the tail) at weight 0.7; the loss
+			// sum( R * layer( x ) ) + 0.7 KL( teacher || router ), its input gradient against central differences
+			const int TK = 16, E = c.experts;
+			std::vector<int> tid( static_cast<size_t>( T ) * TK );
+			std::vector<float> tp( tid.size() ), tt( T );
+			std::vector<int> perm( E );
+			for ( int r = 0; r < T; ++r ) {
+				for ( int e = 0; e < E; ++e ) perm[e] = e;
+				std::shuffle( perm.begin(), perm.end(), rng );
+				float s = 0.0f;
+				for ( int j = 0; j < TK; ++j ) {
+					tid[static_cast<size_t>( r ) * TK + j] = perm[j];
+					s += tp[static_cast<size_t>( r ) * TK + j] = std::exp( nd( rng ) );
+				}
+				for ( int j = 0; j < TK; ++j ) tp[static_cast<size_t>( r ) * TK + j] *= 0.9f / s;
+				tt[r] = 0.1f;
+			}
+			int* d_tid;
+			float *d_tp, *d_tt;
+			CUDA_CHECK( cudaMalloc( &d_tid, tid.size() * sizeof( int ) ) );
+			CUDA_CHECK( cudaMalloc( &d_tp, tp.size() * sizeof( float ) ) );
+			CUDA_CHECK( cudaMalloc( &d_tt, tt.size() * sizeof( float ) ) );
+			CUDA_CHECK( cudaMemcpy( d_tid, tid.data(), tid.size() * sizeof( int ), cudaMemcpyHostToDevice ) );
+			CUDA_CHECK( cudaMemcpy( d_tp, tp.data(), tp.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+			CUDA_CHECK( cudaMemcpy( d_tt, tt.data(), tt.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+			CUDA_CHECK( cudaDeviceSynchronize() );
+			q::Teacher tch;
+			tch.ids = d_tid;
+			tch.p = d_tp;
+			tch.tail = d_tt;
+			tch.tk = TK;
+			// the term alone (no output gradient: R zero), so that its gradient is what the differences see
+			const float w = 0.7f;
+			m.set_router_teacher( { tch }, w );
+			float* R0;
+			CUDA_CHECK( cudaMalloc( &R0, nx * sizeof( float ) ) );
+			CUDA_CHECK( cudaMemset( R0, 0, nx * sizeof( float ) ) );
+			auto loss_r = [&]() {
+				m.forward( L, x, y, T, pk, pv );
+				return static_cast<double>( w ) * m.router_kl();
+			};
+			const double kl0 = loss_r() / w / T;
+			m.forward( L, x, y, T, pk, pv, true );
+			m.zero_grads();
+			m.backward( L, x, R0, dx, T, pk, pv );
+			m.router_kl();
+			const std::vector<float> gr = down( dx, nx );
+			double wr = 0.0, gmr = 0.0;
+			for ( int s = 0; s < 12; ++s ) {
+				// entries with a large gradient and random ones
+				size_t i = std::uniform_int_distribution<size_t>( 0, nx - 1 )( rng );
+				if ( s < 4 ) i = static_cast<size_t>( std::max_element( gr.begin(), gr.end(), []( float a, float b ) { return std::fabs( a ) < std::fabs( b ); } ) - gr.begin() ) + s;
+				i = std::min( i, nx - 1 );
+				const float x0 = hx[i], h = 1e-2f * std::max( 1.0f, std::fabs( x0 ) );
+				set( x, i, x0 + h );
+				const double lp = loss_r();
+				set( x, i, x0 - h );
+				const double lm = loss_r();
+				set( x, i, x0 );
+				const double fd = ( lp - lm ) / ( 2 * h );
+				wr = std::max( wr, std::fabs( fd - gr[i] ) );
+				gmr = std::max( gmr, std::fabs( fd ) );
+			}
+			std::snprintf( line, sizeof( line ), "router distillation alone (KL %.3g per row), input gradient: max error %.3g of max %.3g", kl0, wr, gmr );
+			check( gmr > 0.0 && wr <= 3e-2 * gmr + 1e-6, line );
+			cudaFree( R0 );
+			m.set_router_teacher( {}, 0.0f );
+			for ( void* p : { (void*) d_tid, (void*) d_tp, (void*) d_tt } ) cudaFree( p );
 		}
 		{
 			// the backward without a kept forward (the sublayers recomputed) gives the same input gradient
@@ -292,6 +377,7 @@ int main( int argc, char** argv ) {
 			CUDA_CHECK( cudaMemcpy( Rb, br.data(), nb * sizeof( float ), cudaMemcpyHostToDevice ) );
 			CUDA_CHECK( cudaMemcpy( pkb, bk.data(), nb * sizeof( float ), cudaMemcpyHostToDevice ) );
 			CUDA_CHECK( cudaMemcpy( pvb, bv.data(), bv.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
+			CUDA_CHECK( cudaDeviceSynchronize() );
 			auto grads = [&]() {
 				std::vector<float> all;
 				for ( q::Tuned* t : mb.tensors() ) {

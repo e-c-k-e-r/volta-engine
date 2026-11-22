@@ -198,6 +198,7 @@ private:
 	void copy_pool_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	void trace_route( int tag, int m, backend::stream_t stream );
 	void dump_router( int m, backend::stream_t stream );
+	void dump_router_logits( const Qwen4ExpLayerWeights& lw, int m, backend::stream_t stream );
 	void dump_qsa( int attn_idx, int m, backend::stream_t stream );
 	// Debug (route_replay, qsa_replay): the next recorded selection of this layer replaces the one just computed
 	void replay_routes( int m, backend::stream_t stream );
@@ -261,6 +262,7 @@ private:
 	pod::TensorView embed_rows_;      // [R, hidden] fp16
 	pod::TensorView streams_;         // [R, hc, hidden] fp32
 	pod::TensorView mixed_;           // [R, hidden] fp16: the sublayer input
+	backend::half_t* router_logits_ = nullptr;   // router_dump: [R, experts] fp16
 	pod::TensorView y_;               // [R, hidden] fp16: the sublayer output
 	float* post_ = nullptr;           // [R, hc]
 	float* gr_scratch_ = nullptr;

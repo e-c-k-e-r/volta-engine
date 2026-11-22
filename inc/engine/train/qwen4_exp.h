@@ -305,6 +305,13 @@ public:
 	void freeze_routing( bool on );
 	// Layer L's routed experts of its last call: rows x top_k ids (host)
 	const std::vector<int>& selection( int L ) const;
+	// Routing teacher (router distillation): per layer of the range (index L - first; an empty entry: none there) a teacher's router
+	// distribution over the current call's rows (all of them: every rank routes every row), as its top tk experts' ids and probabilities and
+	// the mass outside them (device). Each layer then adds weight * KL( teacher || softmax( router logits ) ) per row to the loss, its gradient
+	// into the router's input (and with set_train_router the router); router_kl() returns the sum of those KL values since the last call (rank
+	// 0's, the training backward's and the evaluation forward's; the others 0)
+	void set_router_teacher( const std::vector<Teacher>& per_layer, float weight );
+	double router_kl();
 
 	// The trainable tensors' products on the tensor cores (the default: FP16 cores, activations and gradients rounded to FP16 per row at a
 	// power-of-two scale, FP32 accumulation; everything else FP32), or off: FP32 products

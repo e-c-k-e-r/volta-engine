@@ -387,6 +387,11 @@ struct Model::Impl {
 	};
 	int acc_layer = -1;
 	bool acc_prepared = false;
+	// router distillation (set_router_teacher): per layer of the range the teacher rows of the current call, the term's weight, the KL summed
+	std::vector<Teacher> router_t;
+	float router_w = 0.0f;
+	double router_kl_sum = 0.0;
+	bool count_router_kl = false;   // this call's router KL counts (the training backward, an evaluation forward)
 	std::vector<ExpertAccum> acc;
 	float* acc_buf = nullptr;
 	std::vector<std::vector<uint16_t>> saved_codes, saved_starts;   // per expert and kind (3 e + kind)
@@ -1139,6 +1144,42 @@ void Model::Impl::moe( Layer& lw, const float* mix, int T, float* y, const float
 		CUDA_CHECK( cudaStreamSynchronize( st ) );
 		kept = h_ids;
 	}
+	// Router distillation (rank 0: every rank routes every row): KL( teacher || softmax( logits ) ) per row, with dy its gradient times the
+	// term's weight into the router's input (and the router)
+	{
+		const size_t li = static_cast<size_t>( &lw - layers.data() );
+		const Teacher* rt = li < router_t.size() && router_t[li].ids ? &router_t[li] : nullptr;
+		if ( rt && rank == 0 && router_w > 0.0f && ( dy || count_router_kl ) ) {
+			const size_t TE = static_cast<size_t>( T ) * E, TR = static_cast<size_t>( T );
+			const size_t mark_r = ws.off;
+			float* Lc = ws.f( TE );
+			CUDA_CHECK( cudaMemcpyAsync( Lc, logits, TE * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
+			float *mx = ws.f( TR ), *sx = ws.fz( TR, st ), *sl = ws.fz( TR * rt->tk, st );
+			{
+				std::vector<float> ninf( TR, -INFINITY );
+				CUDA_CHECK( cudaMemcpyAsync( mx, ninf.data(), TR * sizeof( float ), cudaMemcpyHostToDevice, st ) );
+				CUDA_CHECK( cudaStreamSynchronize( st ) );
+			}
+			kl_lse_update( Lc, T, E, mx, sx, st );
+			kl_gather( Lc, T, E, 0, rt->ids, rt->tk, sl, st );
+			float *lt = ws.f( TR ), *gq = ws.f( TR * rt->tk ), *kl = ws.f( TR ), *ut = ws.f( TR );
+			kl_finish( mx, sx, sl, rt->p, rt->tail, T, rt->tk, lt, gq, ut, kl, st );
+			if ( count_router_kl ) {
+				std::vector<float> h( TR );
+				CUDA_CHECK( cudaMemcpyAsync( h.data(), kl, TR * sizeof( float ), cudaMemcpyDeviceToHost, st ) );
+				CUDA_CHECK( cudaStreamSynchronize( st ) );
+				for ( float v : h ) router_kl_sum += v;
+			}
+			if ( dy ) {
+				CUDA_CHECK( cudaMemcpyAsync( Lc, logits, TE * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
+				float* dl = ws.f( TE );
+				kl_grad( Lc, T, E, 0, lt, ut, rt->ids, gq, rt->tk, dl, st );
+				blas->gemm( false, false, T, H, E, router_w, dl, lw.router, 1.0f, dmix );
+				if ( lw.g_router ) blas->gemm( true, false, E, H, T, router_w, dl, mix, 1.0f, lw.g_router );
+			}
+			ws.off = mark_r;
+		}
+	}
 	// The routes by slot: the K selected and, with route_cand (backward only), the next-best route_cand experts as zero-weight slots: their
 	// outputs computed (the forward unchanged) so that their logits get the gradient of being swapped in
 	const int C = dy && route_cand > 0 ? route_cand : 0, KS = K + C;
@@ -1542,6 +1583,7 @@ void Model::Impl::run( int L, const float* x_in, float* x_out, int T, const floa
 	ENGINE_ASSERT( T % ranks == 0 && T <= max_rows, "qwen4_exp training model: the rows exceed the workspace or do not split over the ranks" );
 	ENGINE_ASSERT( n_seqs > 0 && T % n_seqs == 0, "qwen4_exp training model: the rows do not hold whole sequences" );
 	seqs = n_seqs;
+	count_router_kl = bwd || !keep;   // a kept forward is the training's: its backward counts
 	keep = keep && keep_outputs;
 	ws.reset( st );
 	unpack( lw );
@@ -1774,6 +1816,17 @@ double Model::head( const float* x, int rows, const Teacher& t, float* dx ) {
 void Model::freeze_routing( bool on ) { p_->frozen = on; }
 
 const std::vector<int>& Model::selection( int L ) const { return p_->last_ids.at( static_cast<size_t>( L - first_ ) ); }
+
+void Model::set_router_teacher( const std::vector<Teacher>& per_layer, float weight ) {
+	p_->router_t = per_layer;
+	p_->router_w = weight;
+}
+
+double Model::router_kl() {
+	const double s = p_->router_kl_sum;
+	p_->router_kl_sum = 0.0;
+	return s;
+}
 
 void Model::set_timing( bool on ) { p_->timing = on; }
 

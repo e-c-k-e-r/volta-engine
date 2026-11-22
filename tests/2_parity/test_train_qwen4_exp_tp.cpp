@@ -41,6 +41,8 @@ float* up( const float* h, size_t n ) {
 	float* d = nullptr;
 	CUDA_CHECK( cudaMalloc( &d, n * sizeof( float ) ) );
 	CUDA_CHECK( cudaMemcpy( d, h, n * sizeof( float ), cudaMemcpyHostToDevice ) );
+	// a copy from pageable memory may return before its DMA lands, and the model's stream does not wait for the default stream
+	CUDA_CHECK( cudaDeviceSynchronize() );
 	return d;
 }
 
