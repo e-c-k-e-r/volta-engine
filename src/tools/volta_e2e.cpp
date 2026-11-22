@@ -48,6 +48,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -59,8 +60,8 @@ namespace q = engine::tools::quant;
 struct Args {
 	std::string model, inputs, teacher, out, check_trace;
 	std::vector<int> devices = { 0, 1, 2, 3 };
-	int steps = 64, batch = 4, seqs = 1, hold = 4, eval_every = 16, warmup = 2, train = 0, adam_bits = 32;
-	bool write = true, timing = false, tp = true, fp16 = true, norms = true, dense = false, router = false, opt_host = false;
+	int steps = 64, batch = 4, seqs = 1, hold = 4, eval_every = 16, warmup = 2, train = 0, adam_bits = 32, ckpt_host = -1, keep = -1, check_inputs = 0;
+	bool write = true, timing = false, tp = true, fp16 = true, norms = true, dense = false, router = false, opt_host = false, qsa = true, shuffle = false;
 	float lr = 1e-3f, lr_min = 0.1f, dense_lr = 0.1f;
 };
 
@@ -71,6 +72,27 @@ float lr_at( const Args& a, int step ) {
 	const double t = std::min( 1.0, static_cast<double>( step - a.warmup - 1 ) / span );
 	return static_cast<float>( a.lr * ( a.lr_min + ( 1.0 - a.lr_min ) * 0.5 * ( 1.0 + std::cos( 3.14159265358979 * t ) ) ) );
 }
+
+// The training sequences in the order they are used: i-th of the run (cycling over n), in file order, or with shuffle in a new permutation
+// each pass over them (fixed seeds: every rank and every run the same order)
+struct TrainOrder {
+	int n = 1;
+	bool shuffle = false;
+	int epoch = -1;
+	std::vector<int> perm;
+	int at( long i ) {
+		if ( !shuffle ) return static_cast<int>( i % n );
+		const int e = static_cast<int>( i / n );
+		if ( e != epoch ) {
+			perm.resize( n );
+			for ( int j = 0; j < n; ++j ) perm[j] = j;
+			std::mt19937 rng( 1234u + static_cast<unsigned>( e ) );
+			std::shuffle( perm.begin(), perm.end(), rng );
+			epoch = e;
+		}
+		return perm[i % n];
+	}
+};
 
 // The kept values to write: per EXL3 tensor its (suh, svh), per tuned norm weight its values (FP16 each)
 struct Best {
@@ -97,6 +119,10 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--steps" ) a.steps = std::stoi( v );
 		else if ( k == "--batch" ) a.batch = std::stoi( v );
 		else if ( k == "--seqs" ) a.seqs = std::stoi( v );
+		else if ( k == "--ckpt-host" ) a.ckpt_host = std::stoi( v );
+		else if ( k == "--keep" ) a.keep = std::stoi( v );
+		else if ( k == "--qsa" ) a.qsa = v != "0";
+		else if ( k == "--shuffle" ) a.shuffle = v != "0";
 		else if ( k == "--hold" ) a.hold = std::stoi( v );
 		else if ( k == "--train" ) a.train = std::stoi( v );
 		else if ( k == "--eval-every" ) a.eval_every = std::stoi( v );
@@ -114,6 +140,7 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--write" ) a.write = v != "0";
 		else if ( k == "--timing" ) a.timing = v != "0";
 		else if ( k == "--check-trace" ) a.check_trace = v;
+		else if ( k == "--check-inputs" ) a.check_inputs = std::stoi( v );
 		else if ( k == "--devices" ) {
 			a.devices.clear();
 			for ( size_t p = 0; p <= v.size(); ) {
@@ -127,10 +154,10 @@ bool parse( int argc, char** argv, Args& a ) {
 			return false;
 		}
 	}
-	if ( a.model.empty() || a.inputs.empty() || a.teacher.empty() || a.out.empty() || ( a.adam_bits != 32 && a.adam_bits != 8 ) || a.seqs < 1 ) {
-		LOG_ERROR( "usage: volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] "
+	if ( a.model.empty() || a.teacher.empty() || a.out.empty() || ( a.adam_bits != 32 && a.adam_bits != 8 ) || a.seqs < 1 ) {
+		LOG_ERROR( "usage: volta_e2e --model <EXL3 dir> --teacher <topk file> --out <dir> [--inputs <train_inputs file>] [--devices 0,1,2,3] [--tp 1] "
 			"[--fp16 1] [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--steps 64] [--batch 4] [--seqs 1] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
-			"[--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]" );
+			"[--adam-bits 32|8] [--opt-host 0|1] [--ckpt-host -1|0|1] [--keep -1|0|1] [--qsa 1] [--timing 0|1] [--check-trace FILE]" );
 		return false;
 	}
 	return true;
@@ -145,6 +172,13 @@ struct Data {
 	std::vector<uint16_t> emb;       // [n, H] FP16
 	std::vector<uint16_t> pk, pv;    // [n, flat], [n, H] FP16
 	int sequences() const { return seq > 0 ? n / seq : 0; }
+	bool dumped() const { return !emb.empty(); }   // the inputs read from files, else made from the tokens (tq::Inputs)
+	// the tokens of the sequences sqs end to end
+	std::vector<int> tokens_of( const std::vector<int>& sqs ) const {
+		std::vector<int> t;
+		for ( int s : sqs ) t.insert( t.end(), tokens.begin() + static_cast<size_t>( s ) * seq, tokens.begin() + static_cast<size_t>( s + 1 ) * seq );
+		return t;
+	}
 };
 
 bool read_teacher( const std::string& path, Data& d ) {
@@ -212,15 +246,16 @@ bool read_data( const std::string& teachers, const std::string& inputs, int H, i
 		return out;
 	};
 	const std::vector<std::string> ts = split( teachers ), is = split( inputs );
-	if ( ts.empty() || ts.size() != is.size() ) {
+	const bool dumped = !is.empty();   // else the inputs are made from the tokens
+	if ( ts.empty() || ( dumped && ts.size() != is.size() ) ) {
 		LOG_ERROR( "[volta_e2e] %zu teacher files for %zu inputs files", ts.size(), is.size() );
 		return false;
 	}
 	for ( size_t f = 0; f < ts.size(); ++f ) {
 		Data e;
-		if ( !read_teacher( ts[f], e ) || !read_inputs( is[f], H, flat, e ) ) return false;
+		if ( !read_teacher( ts[f], e ) || ( dumped && !read_inputs( is[f], H, flat, e ) ) ) return false;
 		if ( f == 0 ) {
-			const size_t n = static_cast<size_t>( e.n );
+			const size_t n = dumped ? static_cast<size_t>( e.n ) : 0;
 			e.emb.resize( n * H );
 			e.pk.resize( n * flat );
 			e.pv.resize( n * H );
@@ -231,7 +266,7 @@ bool read_data( const std::string& teachers, const std::string& inputs, int H, i
 			LOG_ERROR( "[volta_e2e] %s: sequences of %d with top %d after %d / %d (or not whole sequences)", ts[f].c_str(), e.seq, e.k, d.seq, d.k );
 			return false;
 		}
-		const size_t n = static_cast<size_t>( e.n );
+		const size_t n = dumped ? static_cast<size_t>( e.n ) : 0;
 		d.tokens.insert( d.tokens.end(), e.tokens.begin(), e.tokens.end() );
 		d.ids.insert( d.ids.end(), e.ids.begin(), e.ids.end() );
 		d.p.insert( d.p.end(), e.p.begin(), e.p.end() );
@@ -372,6 +407,13 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		return 1;
 	}
 	const int P = a.seqs, R = P * T, Rl = R / n;   // a pass's sequences and rows (all, the rank's)
+	// the layer inputs in host memory past 4 GiB of them a device (--ckpt-host -1); the kept sublayer outputs only within 2 GiB (--keep -1)
+	const double in_bytes = static_cast<double>( cfg.layers ) * Rl * flat * sizeof( float ), kept_bytes = 2.0 * cfg.layers * Rl * H * sizeof( float );
+	const bool ckpt_host = a.ckpt_host < 0 ? in_bytes > 4.0 * ( 1 << 30 ) : a.ckpt_host > 0;
+	const bool keep = a.keep < 0 ? kept_bytes <= 2.0 * ( 1 << 30 ) : a.keep > 0;
+	LOG_INFO( "[volta_e2e] %d rows a pass, %d a rank: layer inputs %.1f GiB (%s), kept sublayer outputs %s", R, Rl, in_bytes / ( 1 << 30 ),
+		ckpt_host ? "host" : "device", keep ? "on" : "off (recomputed)" );
+	std::vector<uint16_t> ple16;   // the pass's n-gram rows (inputs made from the tokens), shared by the ranks
 	std::vector<ncclComm_t> comms( n, nullptr );
 	std::vector<int> devs = a.devices;
 	if ( ncclCommInitAll( comms.data(), n, devs.data() ) != ncclSuccess ) {
@@ -392,9 +434,17 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		m->set_optimizer( a.opt_host, a.adam_bits );
 		m->set_train_dense( a.dense, a.dense_lr );
 		m->set_train_router( a.router );
+		m->set_keep_outputs( keep );
 		ok[r] = m->load( a.model, 0, cfg.layers, dev, R, r, n, comms[r] ) ? 1 : 0;
 		m->set_fp16( a.fp16 );
 		m->set_train_norms( a.norms );
+		m->set_qsa( a.qsa );
+		std::unique_ptr<tq::Inputs> inp;
+		if ( ok[r] && !d.dumped() ) {
+			inp = std::make_unique<tq::Inputs>();
+			if ( !inp->open( a.model, dev, m->stream() ) ) ok[r] = 0;
+			else if ( r == 0 ) ple16.resize( static_cast<size_t>( R ) * inp->ple_dim() );
+		}
 		bar.wait();
 		for ( int g = 0; g < n; ++g ) if ( !ok[g] ) return;
 		const cudaStream_t st = static_cast<cudaStream_t>( m->stream() );
@@ -410,13 +460,24 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		CUDA_CHECK( cudaMalloc( &t_ids, static_cast<size_t>( R ) * d.k * sizeof( int ) ) );
 		CUDA_CHECK( cudaMalloc( &t_p, static_cast<size_t>( R ) * d.k * sizeof( float ) ) );
 		CUDA_CHECK( cudaMalloc( &t_tail, static_cast<size_t>( R ) * sizeof( float ) ) );
+		// Every layer's input for the backward: on the device, or with ckpt_host in pinned host memory, a layer's input copied out on a side
+		// stream while the layer runs (two device buffers taking turns) and copied back ahead of its backward
 		std::vector<float*> ckpt( cfg.layers );
-		for ( float*& c : ckpt ) CUDA_CHECK( cudaMalloc( &c, rows_l * sizeof( float ) ) );
+		float* cbuf[2] = { nullptr, nullptr };
+		cudaStream_t cst = nullptr;
+		cudaEvent_t ev_in[2], ev_cp[2], ev_free[2];
+		if ( ckpt_host ) {
+			for ( float*& c : ckpt ) CUDA_CHECK( cudaMallocHost( &c, rows_l * sizeof( float ) ) );
+			for ( float*& b : cbuf ) CUDA_CHECK( cudaMalloc( &b, rows_l * sizeof( float ) ) );
+			CUDA_CHECK( cudaStreamCreateWithFlags( &cst, cudaStreamNonBlocking ) );
+			for ( int i = 0; i < 2; ++i ) for ( cudaEvent_t* e : { &ev_in[i], &ev_cp[i], &ev_free[i] } ) CUDA_CHECK( cudaEventCreateWithFlags( e, cudaEventDisableTiming ) );
+		}
+		else for ( float*& c : ckpt ) CUDA_CHECK( cudaMalloc( &c, rows_l * sizeof( float ) ) );
 		{
 			size_t fr = 0, tot = 0;
 			CUDA_CHECK( cudaMemGetInfo( &fr, &tot ) );
-			LOG_INFO( "[volta_e2e] rank %d (device %d): all layers, experts %d-%d of %d, %.1f GiB free", r, dev, cfg.experts * r / n, cfg.experts * ( r + 1 ) / n - 1,
-				cfg.experts, fr / 1073741824.0 );
+			LOG_INFO( "[volta_e2e] rank %d (device %d): all layers, experts %d-%d of %d, %.1f GiB free%s", r, dev, cfg.experts * r / n, cfg.experts * ( r + 1 ) / n - 1,
+				cfg.experts, fr / 1073741824.0, ckpt_host ? " (layer inputs in host memory)" : "" );
 		}
 		// rows [r0, r1) of the sequences sqs laid end to end (cols FP16 values per row) into dst as FP32
 		auto up = [&]( const uint16_t* src, size_t cols, const std::vector<int>& sqs, size_t r0, size_t r1, float* dst ) {
@@ -424,28 +485,74 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			tq::half_to_float( staging, dst, got * cols, st );
 			CUDA_CHECK( cudaStreamSynchronize( st ) );
 		};
+		// A pass's inputs: this rank's rows' embeddings, every row's PLE rows (made from the tokens: the n-gram lookups split over the ranks)
+		auto inputs = [&]( const std::vector<int>& sqs, int Rc, int Rcl ) {
+			if ( d.dumped() ) {
+				up( d.emb.data(), H, sqs, static_cast<size_t>( r ) * Rcl, static_cast<size_t>( r + 1 ) * Rcl, emb );
+				up( d.pk.data(), flat, sqs, 0, Rc, pk );
+				up( d.pv.data(), H, sqs, 0, Rc, pv );
+				return;
+			}
+			const std::vector<int> ids = d.tokens_of( sqs );
+			inp->embed( ids.data() + static_cast<size_t>( r ) * Rcl, Rcl, emb );
+			const size_t D = inp->ple_dim();
+			bar.wait();   // every rank's projection of the previous pass is done with the buffer
+			for ( size_t s = 0; s < sqs.size(); ++s ) inp->ple_rows( ids.data() + s * T, T, r, n, ple16.data() + s * T * D );
+			bar.wait();
+			inp->ple_project( ple16.data(), Rc, pk, pv );
+		};
 		// Sequences sqs (up to --seqs) in one pass: the forward over all layers (saving each layer's input), the KL head, optionally the backward
 		auto run = [&]( const std::vector<int>& sqs, bool train ) -> double {
 			const int c = static_cast<int>( sqs.size() ), Rc = c * T, Rcl = Rc / n;
-			up( d.emb.data(), H, sqs, static_cast<size_t>( r ) * Rcl, static_cast<size_t>( r + 1 ) * Rcl, emb );
-			for ( int h = 0; h < hc; ++h ) tq::copy_cols( emb, H, 0, x, flat, h * H, Rcl, H, false, st );
-			up( d.pk.data(), flat, sqs, 0, Rc, pk );
-			up( d.pv.data(), H, sqs, 0, Rc, pv );
-			const size_t xl = static_cast<size_t>( Rcl ) * flat;
+			inputs( sqs, Rc, Rcl );
+			const size_t xb = static_cast<size_t>( Rcl ) * flat * sizeof( float );
+			float* x0 = ckpt_host ? cbuf[0] : x;
+			for ( int h = 0; h < hc; ++h ) tq::copy_cols( emb, H, 0, x0, flat, h * H, Rcl, H, false, st );
 			for ( int L = 0; L < cfg.layers; ++L ) {
-				CUDA_CHECK( cudaMemcpyAsync( ckpt[L], x, xl * sizeof( float ), cudaMemcpyDeviceToDevice, st ) );
-				m->forward( L, ckpt[L], x, Rc, pk, pv, train, c );
+				if ( !ckpt_host ) {
+					CUDA_CHECK( cudaMemcpyAsync( ckpt[L], x, xb, cudaMemcpyDeviceToDevice, st ) );
+					m->forward( L, ckpt[L], x, Rc, pk, pv, train, c );
+					continue;
+				}
+				float *in = cbuf[L & 1], *out = cbuf[( L + 1 ) & 1];
+				if ( train ) {
+					if ( L >= 1 ) CUDA_CHECK( cudaStreamWaitEvent( st, ev_cp[( L + 1 ) & 1], 0 ) );   // out was the previous layer's input: copied out
+					CUDA_CHECK( cudaEventRecord( ev_in[L & 1], st ) );
+					CUDA_CHECK( cudaStreamWaitEvent( cst, ev_in[L & 1], 0 ) );
+					CUDA_CHECK( cudaMemcpyAsync( ckpt[L], in, xb, cudaMemcpyDeviceToHost, cst ) );
+					CUDA_CHECK( cudaEventRecord( ev_cp[L & 1], cst ) );
+				}
+				m->forward( L, in, out, Rc, pk, pv, train, c );
 			}
+			float* xf = ckpt_host ? cbuf[cfg.layers & 1] : x;
 			seq_teacher( d, T, sqs, t_ids, t_p, t_tail, st );
 			tq::Teacher t;
 			t.ids = t_ids;
 			t.p = t_p;
 			t.tail = t_tail;
 			t.tk = d.k;
-			const double kl = m->head( x, Rc, t, train ? dx : nullptr );
+			const double kl = m->head( xf, Rc, t, train ? dx : nullptr );
 			if ( !train ) return kl;
+			if ( !ckpt_host ) {
+				for ( int L = cfg.layers - 1; L >= 0; --L ) {
+					m->backward( L, ckpt[L], dx, dy, Rc, pk, pv, c );
+					std::swap( dx, dy );
+				}
+				return kl;
+			}
+			// the inputs back, a layer ahead: into the buffer its layer's parity owns, once that buffer's last reader is done
+			for ( int i = 0; i < 2; ++i ) CUDA_CHECK( cudaEventRecord( ev_free[i], st ) );
+			auto fetch = [&]( int L ) {
+				CUDA_CHECK( cudaStreamWaitEvent( cst, ev_free[L & 1], 0 ) );
+				CUDA_CHECK( cudaMemcpyAsync( cbuf[L & 1], ckpt[L], xb, cudaMemcpyHostToDevice, cst ) );
+				CUDA_CHECK( cudaEventRecord( ev_in[L & 1], cst ) );
+			};
+			fetch( cfg.layers - 1 );
 			for ( int L = cfg.layers - 1; L >= 0; --L ) {
-				m->backward( L, ckpt[L], dx, dy, Rc, pk, pv, c );
+				if ( L >= 1 ) fetch( L - 1 );
+				CUDA_CHECK( cudaStreamWaitEvent( st, ev_in[L & 1], 0 ) );
+				m->backward( L, cbuf[L & 1], dx, dy, Rc, pk, pv, c );
+				CUDA_CHECK( cudaEventRecord( ev_free[L & 1], st ) );
 				std::swap( dx, dy );
 			}
 			return kl;
@@ -468,7 +575,11 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			m->set_timing( true );
 			m->timing_report();
 		}
-		int my_step = 0, sq = 0;
+		int my_step = 0;
+		long used = 0;
+		TrainOrder order;
+		order.n = train_used;
+		order.shuffle = a.shuffle;
 		engine::train::AdamOptions o;
 		for ( int step = 1; step <= a.steps; ++step ) {
 			const auto ts = std::chrono::steady_clock::now();
@@ -476,10 +587,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			double kl = 0.0;
 			for ( int b = 0; b < a.batch; b += P ) {
 				std::vector<int> sqs;
-				for ( int i = b; i < std::min( a.batch, b + P ); ++i ) {
-					sqs.push_back( sq );
-					sq = ( sq + 1 ) % train_used;
-				}
+				for ( int i = b; i < std::min( a.batch, b + P ); ++i ) sqs.push_back( order.at( used++ ) );
 				kl += run( sqs, true );
 			}
 			o.lr = lr_at( a, step );
@@ -529,7 +637,12 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		for ( float* p : { x, dx, dy, emb, pk, pv, t_p, t_tail } ) cudaFree( p );
 		cudaFree( t_ids );
 		cudaFree( staging );
-		for ( float* c : ckpt ) cudaFree( c );
+		for ( float* c : ckpt ) ckpt_host ? cudaFreeHost( c ) : cudaFree( c );
+		if ( ckpt_host ) {
+			for ( float* b : cbuf ) cudaFree( b );
+			for ( int i = 0; i < 2; ++i ) for ( cudaEvent_t e : { ev_in[i], ev_cp[i], ev_free[i] } ) cudaEventDestroy( e );
+			cudaStreamDestroy( cst );
+		}
 		bar.wait();   // every rank done with the communicators before any model goes
 	} );
 	for ( auto& t : th ) t.join();
@@ -577,9 +690,51 @@ int main( int argc, char** argv ) {
 	const int train_used = a.train > 0 ? std::min( a.train, train_n ) : train_n;
 	LOG_INFO( "[volta_e2e] %d sequences of %d tokens (%d held out, %d of the others trained on), teacher top %d", S, T, a.hold, train_used, d.k );
 	const int G = static_cast<int>( a.devices.size() );
+	if ( a.check_inputs > 0 ) {
+		// The inputs made from the tokens against the dumped ones (--inputs) for the first N sequences: relative error per kind
+		if ( !d.dumped() ) return 1;
+		CUDA_CHECK( cudaSetDevice( a.devices[0] ) );
+		cudaStream_t s0;
+		CUDA_CHECK( cudaStreamCreate( &s0 ) );
+		tq::Inputs inp;
+		if ( !inp.open( a.model, a.devices[0], s0 ) ) return 1;
+		float *e, *k, *v;
+		CUDA_CHECK( cudaMalloc( &e, static_cast<size_t>( T ) * H * sizeof( float ) ) );
+		CUDA_CHECK( cudaMalloc( &k, static_cast<size_t>( T ) * flat * sizeof( float ) ) );
+		CUDA_CHECK( cudaMalloc( &v, static_cast<size_t>( T ) * H * sizeof( float ) ) );
+		std::vector<uint16_t> p16( static_cast<size_t>( T ) * inp.ple_dim() );
+		auto rel = [&]( const float* dev, const uint16_t* ref, size_t cnt ) {
+			std::vector<float> h( cnt );
+			CUDA_CHECK( cudaMemcpy( h.data(), dev, cnt * sizeof( float ), cudaMemcpyDeviceToHost ) );
+			double dd = 0.0, nn = 0.0;
+			for ( size_t i = 0; i < cnt; ++i ) {
+				__half_raw hr;
+				hr.x = ref[i];
+				const double r = __half2float( __half( hr ) );
+				dd += ( h[i] - r ) * ( h[i] - r );
+				nn += r * r;
+			}
+			return std::sqrt( dd / ( nn + 1e-30 ) );
+		};
+		for ( int sq = 0; sq < std::min( a.check_inputs, S ); ++sq ) {
+			const std::vector<int> ids = d.tokens_of( { sq } );
+			const size_t b = static_cast<size_t>( sq ) * T;
+			inp.embed( ids.data(), T, e );
+			inp.ple_rows( ids.data(), T, 0, 1, p16.data() );
+			inp.ple_project( p16.data(), T, k, v );
+			LOG_INFO( "[volta_e2e] check: sequence %d inputs from its tokens against the dumped ones: embeddings %.3g, PLE keys %.3g, values %.3g", sq,
+				rel( e, d.emb.data() + b * H, static_cast<size_t>( T ) * H ), rel( k, d.pk.data() + b * flat, static_cast<size_t>( T ) * flat ),
+				rel( v, d.pv.data() + b * H, static_cast<size_t>( T ) * H ) );
+		}
+		return 0;
+	}
 #if defined( ENGINE_HAVE_NCCL )
 	if ( a.tp && G > 1 && a.check_trace.empty() ) return train_tp( a, cfg, d );
 #endif
+	if ( !d.dumped() ) {
+		LOG_ERROR( "[volta_e2e] inputs made from the tokens need --tp 1 over several devices (else give --inputs)" );
+		return 1;
+	}
 	// Stages: the layers split evenly over the devices
 	const int P = a.check_trace.empty() ? a.seqs : 1, R = P * T;   // a pass's sequences and rows
 	std::vector<Stage> st( G );
@@ -591,9 +746,11 @@ int main( int argc, char** argv ) {
 		s.m->set_optimizer( a.opt_host, a.adam_bits );
 		s.m->set_train_dense( a.dense, a.dense_lr );
 		s.m->set_train_router( a.router );
+		s.m->set_keep_outputs( a.keep != 0 );
 		if ( !s.m->load( a.model, first, last, s.dev, R ) ) return 1;
 		s.m->set_fp16( a.fp16 );
 		s.m->set_train_norms( a.norms );
+		s.m->set_qsa( a.qsa );
 		CUDA_CHECK( cudaSetDevice( s.dev ) );
 		const size_t bytes = static_cast<size_t>( R ) * flat * sizeof( float );
 		for ( float** p : { &s.x, &s.y, &s.dx, &s.dy } ) CUDA_CHECK( cudaMalloc( p, bytes ) );
@@ -787,17 +944,17 @@ int main( int argc, char** argv ) {
 	if ( a.timing ) for ( Stage& s : st ) { s.m->set_timing( true ); s.m->timing_report(); }
 	int best_step = 0;
 	engine::train::AdamOptions o;
-	int sq = 0;
+	long used = 0;
+	TrainOrder order;
+	order.n = train_used;
+	order.shuffle = a.shuffle;
 	for ( int step = 1; step <= a.steps; ++step ) {
 		const auto ts = std::chrono::steady_clock::now();
 		for ( Stage& s : st ) s.m->zero_grads();
 		double kl = 0.0;
 		for ( int b = 0; b < a.batch; b += P ) {
 			std::vector<int> sqs;
-			for ( int i = b; i < std::min( a.batch, b + P ); ++i ) {
-				sqs.push_back( sq );
-				sq = ( sq + 1 ) % train_used;
-			}
+			for ( int i = b; i < std::min( a.batch, b + P ); ++i ) sqs.push_back( order.at( used++ ) );
 			kl += run( sqs, true );
 		}
 		const float gs = 1.0f / ( static_cast<float>( a.batch ) * T );

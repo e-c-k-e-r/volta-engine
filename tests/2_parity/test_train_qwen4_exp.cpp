@@ -4,6 +4,7 @@
 #include "engine/config.h"
 #include "engine/train/qwen4_exp.h"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -552,6 +553,139 @@ void test_attention() {
 		std::snprintf( line, sizeof( line ), "%d rows, %d q / %d kv heads: forward %.2e, dq %.2e, dk %.2e, dv %.2e", T, hq, hk, ef, eq, ek, ev );
 		check( ef < 1e-5 && eq < 1e-3 && ek < 1e-3 && ev < 1e-3, line );
 		for ( float* p : { d_q, d_k, d_v, d_o, d_R, d_s, d_p, d_dq, d_dk, d_dv } ) cudaFree( p );
+	}
+	{
+		// QSA past its budget, at a budget of 4 pools (16 tokens) over 70 rows: the indexer's queries and pool keys against the host (the
+		// same FP16 roundings), the selection against the host's scores of the device's queries and keys (every selected pool scoring at
+		// least every other visible one, one FP16 step of slack), and the attention over it in query blocks of 32 against the host's
+		// masked attention and central differences
+		const int L = 70, budget = 4, np = L / q::kQsaPool, words = ( np + 31 ) / 32, rot_i = 64, D = q::kQsaDim, QH = q::kQsaHeads;
+		const double eps = 1e-6, theta = 10000.0;
+		auto r16 = []( double x ) { return static_cast<double>( __half2float( __float2half_rn( static_cast<float>( x ) ) ) ); };
+		const Vec qk = randv( static_cast<size_t>( L ) * q::kQsaProj ), qw = randv( D, 0.2 ), kw = randv( D, 0.2 );
+		auto up_half = [&]( const Vec& v ) {
+			std::vector<__half> h( v.size() );
+			for ( size_t i = 0; i < v.size(); ++i ) h[i] = __float2half_rn( static_cast<float>( v[i] ) );
+			void* p = nullptr;
+			CUDA_CHECK( cudaMalloc( &p, h.size() * 2 ) );
+			CUDA_CHECK( cudaMemcpy( p, h.data(), h.size() * 2, cudaMemcpyHostToDevice ) );
+			return p;
+		};
+		void *d_qw = up_half( qw ), *d_kw = up_half( kw );
+		float *d_qk = up( qk ), *d_qi = zeros( static_cast<size_t>( L ) * QH * D ), *d_rk = zeros( static_cast<size_t>( L ) * D ), *d_pool = zeros( static_cast<size_t>( np ) * D );
+		q::qsa_queries( d_qk, L, L, d_qw, rot_i, static_cast<float>( theta ), static_cast<float>( eps ), d_qi, d_rk, nullptr );
+		q::qsa_pools( d_rk, 1, L, d_kw, rot_i, static_cast<float>( theta ), static_cast<float>( eps ), d_pool, nullptr );
+		// host: rmsnorm * (1 + w) in FP16, rope at a position, FP16
+		auto norm_rope = [&]( const double* x, const Vec& w, int pos ) {
+			Vec y( D );
+			double ms = 0.0;
+			for ( int c = 0; c < D; ++c ) ms += x[c] * x[c];
+			ms /= D;
+			for ( int c = 0; c < D; ++c ) y[c] = r16( x[c] / std::sqrt( ms + eps ) * ( 1.0 + r16( w[c] ) ) );
+			Vec o = y;
+			for ( int c = 0; c < rot_i; ++c ) {
+				const int i = c % ( rot_i / 2 );
+				const double a = pos * std::pow( theta, -2.0 * i / rot_i ), cs = std::cos( a ), sn = std::sin( a );
+				o[c] = c < rot_i / 2 ? y[c] * cs - y[c + rot_i / 2] * sn : y[c] * cs + y[c - rot_i / 2] * sn;
+			}
+			for ( double& v : o ) v = r16( v );
+			return o;
+		};
+		Vec hq_( static_cast<size_t>( L ) * QH * D ), hp( static_cast<size_t>( np ) * D );
+		for ( int r = 0; r < L; ++r ) for ( int h = 0; h < QH; ++h ) {
+			double x[128];
+			for ( int c = 0; c < D; ++c ) x[c] = r16( qk[static_cast<size_t>( r ) * q::kQsaProj + h * D + c] );
+			const Vec o = norm_rope( x, qw, r );
+			std::copy( o.begin(), o.end(), hq_.begin() + ( static_cast<size_t>( r ) * QH + h ) * D );
+		}
+		for ( int p = 0; p < np; ++p ) {
+			double x[128];
+			for ( int c = 0; c < D; ++c ) {
+				double a = 0.0;
+				for ( int j = 0; j < q::kQsaPool; ++j ) a += r16( qk[static_cast<size_t>( p * q::kQsaPool + j ) * q::kQsaProj + QH * D + c] );
+				x[c] = r16( a / q::kQsaPool );
+			}
+			const Vec o = norm_rope( x, kw, p * q::kQsaPool );
+			std::copy( o.begin(), o.end(), hp.begin() + static_cast<size_t>( p ) * D );
+		}
+		const Vec dqi = down( d_qi, hq_.size() ), dpool = down( d_pool, hp.size() );
+		const double eqi = rel( dqi, hq_ ), epl = rel( dpool, hp );
+		// the selection
+		uint32_t* d_bits = nullptr;
+		CUDA_CHECK( cudaMalloc( &d_bits, static_cast<size_t>( L ) * words * 4 ) );
+		float* d_scr = zeros( q::qsa_scratch_floats( L, 32 ) );
+		q::qsa_select( d_qi, d_pool, L, budget, 32, d_scr, d_bits, nullptr );
+		std::vector<uint32_t> bits( static_cast<size_t>( L ) * words );
+		CUDA_CHECK( cudaMemcpy( bits.data(), d_bits, bits.size() * 4, cudaMemcpyDeviceToHost ) );
+		int bad = 0, sparse_rows = 0;
+		for ( int p = 0; p < L; ++p ) {
+			const int bound = ( p + 1 ) / q::kQsaPool;
+			int nsel = 0;
+			for ( int x = 0; x < np; ++x ) nsel += ( bits[static_cast<size_t>( p ) * words + x / 32] >> ( x % 32 ) ) & 1;
+			if ( bound <= budget ) { bad += nsel != 0; continue; }
+			++sparse_rows;
+			std::vector<double> sc( bound );
+			for ( int x = 0; x < bound; ++x ) {
+				double t = 0.0;
+				for ( int h = 0; h < QH; ++h ) {
+					double z = 0.0;
+					for ( int c = 0; c < D; ++c ) z += dqi[( static_cast<size_t>( p ) * QH + h ) * D + c] * dpool[static_cast<size_t>( x ) * D + c];
+					t += std::max( z, 0.0 );
+				}
+				sc[x] = r16( t / std::sqrt( static_cast<double>( D ) ) );
+			}
+			double lo_sel = 1e300, hi_out = -1e300;
+			for ( int x = 0; x < bound; ++x ) {
+				const bool s = ( bits[static_cast<size_t>( p ) * words + x / 32] >> ( x % 32 ) ) & 1;
+				if ( s ) lo_sel = std::min( lo_sel, sc[x] ); else hi_out = std::max( hi_out, sc[x] );
+			}
+			bad += nsel != budget || lo_sel < hi_out - std::fabs( hi_out ) * 1e-3;
+		}
+		// the attention over the selection, query blocks of 32
+		const int aq = 2, ak = 1, ad = 16;
+		const Vec av = randv( static_cast<size_t>( L ) * aq * ad ), kv2 = randv( static_cast<size_t>( L ) * ak * ad ), vv2 = randv( kv2.size() ), R2 = randv( av.size() );
+		auto sees = [&]( int p, int j ) {
+			if ( j > p ) return false;
+			const int vis = p + 1;
+			if ( vis / q::kQsaPool <= budget || j >= vis - vis % q::kQsaPool ) return true;
+			return static_cast<bool>( ( bits[static_cast<size_t>( p ) * words + ( j / 4 ) / 32] >> ( ( j / 4 ) % 32 ) ) & 1 );
+		};
+		auto h_mattn = [&]( const Vec& qq, const Vec& kk, const Vec& vv ) {
+			Vec o( qq.size(), 0.0 );
+			for ( int h = 0; h < aq; ++h ) for ( int i = 0; i < L; ++i ) {
+				Vec sc( i + 1, -1e300 );
+				double m = -1e300, sum = 0.0;
+				for ( int j = 0; j <= i; ++j ) {
+					if ( !sees( i, j ) ) continue;
+					double z = 0.0;
+					for ( int c = 0; c < ad; ++c ) z += qq[( static_cast<size_t>( i ) * aq + h ) * ad + c] * kk[static_cast<size_t>( j ) * ad + c];
+					sc[j] = z * 0.25;
+					m = std::max( m, sc[j] );
+				}
+				for ( int j = 0; j <= i; ++j ) if ( sees( i, j ) ) { sc[j] = std::exp( sc[j] - m ); sum += sc[j]; } else sc[j] = 0.0;
+				for ( int j = 0; j <= i; ++j ) for ( int c = 0; c < ad; ++c ) o[( static_cast<size_t>( i ) * aq + h ) * ad + c] += sc[j] / sum * vv[static_cast<size_t>( j ) * ad + c];
+			}
+			return o;
+		};
+		engine::train::Blas blas( nullptr );
+		float *d_q = up( av ), *d_k = up( kv2 ), *d_v = up( vv2 ), *d_o = zeros( av.size() ), *d_R = up( R2 ), *d_s = zeros( 32 * L ), *d_p = zeros( 32 * L );
+		float *d_dq = zeros( av.size() ), *d_dk = zeros( kv2.size() ), *d_dv = zeros( vv2.size() );
+		q::QsaSelection sel;
+		sel.bits = d_bits;
+		sel.words = words;
+		sel.budget = budget;
+		q::attention_forward( blas, d_q, d_k, d_v, L, aq, ak, ad, 0.25f, d_s, d_o, sel, 32 );
+		q::attention_backward( blas, d_q, d_k, d_v, L, aq, ak, ad, 0.25f, d_R, d_dq, d_dk, d_dv, d_s, d_p, sel, 32 );
+		const double ea = rel( down( d_o, av.size() ), h_mattn( av, kv2, vv2 ) );
+		const double gq = fd_rel( [&]( const Vec& x ) { return dot( R2, h_mattn( x, kv2, vv2 ) ); }, av, down( d_dq, av.size() ) );
+		const double gk = fd_rel( [&]( const Vec& x ) { return dot( R2, h_mattn( av, x, vv2 ) ); }, kv2, down( d_dk, kv2.size() ) );
+		const double gv = fd_rel( [&]( const Vec& x ) { return dot( R2, h_mattn( av, kv2, x ) ); }, vv2, down( d_dv, vv2.size() ) );
+		char line[220];
+		std::snprintf( line, sizeof( line ), "QSA (budget %d pools, %d rows): queries %.2e, pool keys %.2e; selection: %d of %d rows past the budget off; attention %.2e, dq %.2e, dk %.2e, dv %.2e",
+			budget, L, eqi, epl, bad, sparse_rows, ea, gq, gk, gv );
+		check( eqi < 2e-3 && epl < 2e-3 && bad == 0 && sparse_rows > 0 && ea < 1e-5 && gq < 1e-3 && gk < 1e-3 && gv < 1e-3, line );
+		for ( float* p : { d_qk, d_qi, d_rk, d_pool, d_scr, d_q, d_k, d_v, d_o, d_R, d_s, d_p, d_dq, d_dk, d_dv } ) cudaFree( p );
+		cudaFree( d_qw ); cudaFree( d_kw ); cudaFree( d_bits );
 	}
 	{
 		const Vec qg = randv( static_cast<size_t>( T ) * hq * 2 * d );

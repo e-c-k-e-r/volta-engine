@@ -120,12 +120,35 @@ void rope_backward( float* dx, int rows, int heads, int head_dim, int rot_dim, f
 // q_proj's interleaved [rows, heads, 2 * head_dim] output into q and gate [rows, heads, head_dim], and the gradients back
 void unpack_q_gate( const float* qg, int rows, int heads, int head_dim, float* q, float* gate, backend::stream_t stream );
 void pack_q_gate( const float* dq, const float* dgate, int rows, int heads, int head_dim, float* dqg, backend::stream_t stream );
-// Causal softmax attention with grouped key / value heads (q [rows, hq, d], k and v [rows, hk, d], q head h reads kv head h / ( hq / hk )):
-// o = softmax( scale q k^T, causal ) v. One rows x rows score buffer (s) is reused per head; the backward recomputes the scores and adds
-// into dq, dk, dv (dp: a second rows x rows buffer)
-void attention_forward( Blas& b, const float* q, const float* k, const float* v, int rows, int hq, int hk, int d, float scale, float* s, float* o );
+// QSA, the attention's key selection past its budget (engine/modules/qsa.h): a query at position p sees every earlier key while it has at
+// most budget complete pools of kQsaPool tokens (p + 1 <= budget * kQsaPool + 3), else only the budget pools the indexer scores best (ties in
+// pool order) and its incomplete tail. The selection is held fixed (no gradient through it), like the routing
+constexpr int kQsaHeads = 4, kQsaDim = 128, kQsaPool = 4, kQsaProj = ( kQsaHeads + 1 ) * kQsaDim, kQsaBudget = 512;
+constexpr int kQsaMaxWords = 1024;   // a row's selection bits: up to 32768 pools (131072 tokens)
+// A sequence's selection: per position words of pool bits (bits null: every row sees every earlier key)
+struct QsaSelection {
+	const uint32_t* bits = nullptr;
+	int words = 0;
+	int budget = kQsaBudget;
+};
+// The indexer on a sequence's rows (rows a multiple of seq_len; positions restart at each): qk [rows, kQsaProj] = X index_qk_proj; q
+// [rows, kQsaHeads, kQsaDim] normed (q_norm: the FP16 weight) and roped at the row's position, raw_k [rows, kQsaDim]; the pools' keys
+// [seqs, seq_len / kQsaPool, kQsaDim] from raw_k (k_norm); the inference kernels' FP16 roundings throughout
+void qsa_queries( const float* qk, int rows, int seq_len, const void* q_norm, int rot_dim, float theta, float eps, float* q, float* raw_k,
+	backend::stream_t stream );
+void qsa_pools( const float* raw_k, int seqs, int seq_len, const void* k_norm, int rot_dim, float theta, float eps, float* pools, backend::stream_t stream );
+// One sequence's selection (q, pools: its rows' and its pools'), qblock rows of scores at a time (scratch: qsa_scratch_floats); bits [seq_len,
+// words] with words = ( seq_len / kQsaPool + 31 ) / 32
+size_t qsa_scratch_floats( int seq_len, int qblock );
+void qsa_select( const float* q, const float* pools, int seq_len, int budget, int qblock, float* scratch, uint32_t* bits, backend::stream_t stream );
+
+// Causal softmax attention with grouped key / value heads over one sequence (q [rows, hq, d], k and v [rows, hk, d], q head h reads kv head
+// h / ( hq / hk )): o = softmax( scale q k^T, causal, the keys sel lets each row see ) v, qblock query rows at a time (0: all). One
+// qblock x rows score buffer (s) is reused per head; the backward recomputes the scores and adds into dq, dk, dv (dp: a second such buffer)
+void attention_forward( Blas& b, const float* q, const float* k, const float* v, int rows, int hq, int hk, int d, float scale, float* s, float* o,
+	const QsaSelection& sel = {}, int qblock = 0 );
 void attention_backward( Blas& b, const float* q, const float* k, const float* v, int rows, int hq, int hk, int d, float scale, const float* dout, float* dq,
-	float* dk, float* dv, float* s, float* dp );
+	float* dk, float* dv, float* s, float* dp, const QsaSelection& sel = {}, int qblock = 0 );
 
 // Softmax routing: the k largest logits of each row [rows, experts] (ties to the lowest expert index), ids [rows, k] best first and weights
 // w [rows, k] = softmax over those k logits (experts <= 1024)
@@ -188,6 +211,9 @@ void kl_grad( const float* logits, int rows, int nc, int c0, const float* lt, co
 void router_given( const float* logits, const int* ids, int rows, int experts, int k, float* w, backend::stream_t stream );
 // out = x * y * s, elementwise
 void mul_scaled( const float* x, const float* y, float s, float* out, size_t n, backend::stream_t stream );
+
+// x = FP16( x ), elementwise
+void round_to_half( float* x, size_t n, backend::stream_t stream );
 
 // ---- the model ----
 
@@ -263,6 +289,8 @@ public:
 	// The trainable tensors' products on the tensor cores (the default: FP16 cores, activations and gradients rounded to FP16 per row at a
 	// power-of-two scale, FP32 accumulation; everything else FP32), or off: FP32 products
 	void set_fp16( bool on );
+	// The attention's QSA selection past its budget (on by default: as the engine attends), or off: dense attention at every length
+	void set_qsa( bool on );
 
 	// Phase timing (synchronizes the stream at every phase boundary): on, the seconds per phase accumulate until reported and reset
 	void set_timing( bool on );
@@ -282,6 +310,9 @@ public:
 	void set_train_dense( bool on, float lr_scale = 0.1f );
 	// The routers' weights trained too (before load; off by default), with the small dense tensors' learning rate (dense_tensors lists them)
 	void set_train_router( bool on );
+	// Room for every layer's kept sublayer outputs (before load; on by default): off, a kept forward keeps nothing and the backward
+	// recomputes the sublayers (the room is two rows of hidden per row and layer: long sequences)
+	void set_keep_outputs( bool on );
 	// Where Adam's state lives (before load): on the device (the default) or with host, in pinned host memory, streamed through the device in
 	// parts for each step (the same kernels, the same result; the device keeps the current values, their gradients and one part); its moments
 	// FP32 (32) or 8-bit block-wise (8, engine/train/adam8.h)
@@ -301,6 +332,26 @@ private:
 	std::unique_ptr<Impl> p_;
 	Config cfg_;
 	int first_ = 0, last_ = 0, device_ = 0, rank_ = 0, ranks_ = 1;
+};
+
+// A sequence's inputs from its token ids (positions from 0), as the engine makes them: the token embeddings (FP16 rows) and the PLE layer's
+// n-gram key and value rows (FP16 rows of the n-gram table's lookups through the layer's key / value projections). The n-gram lookups run on
+// the host (ple_rows, rows part, part + parts, .. of a shared FP16 buffer [n, ple_dim()], so that ranks split them), the rest on the device
+class Inputs {
+public:
+	Inputs();
+	~Inputs();
+	bool open( const std::string& model_dir, int device, backend::stream_t stream );
+	int ple_dim() const;
+	// out [n, hidden] (FP32 of the FP16 rows)
+	void embed( const int* ids, int n, float* out );
+	void ple_rows( const int* ids, int n, int part, int parts, uint16_t* emb ) const;
+	// key [n, hc hidden], value [n, hidden] from emb [n, ple_dim()] (host, FP16)
+	void ple_project( const uint16_t* emb, int n, float* key, float* value );
+
+private:
+	struct Impl;
+	std::unique_ptr<Impl> p_;
 };
 
 } // namespace engine::train::qwen4_exp

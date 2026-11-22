@@ -101,6 +101,8 @@ public:
 	// ([rows, vocab_size], row-major). Reassembles the TP shards when the LM head is sharded.
 	// Diagnostic / test path: synchronizes and issues per-row peer copies.
 	void read_logits( int rows, backend::half_t* host_dst );
+	// The same reassembled logits left on device 0 ([rows, vocab_size] FP16), ready in order on the returned stream (no copy, no sync)
+	const backend::half_t* device_logits( int rows, backend::stream_t* stream );
 	int sample_one();
 	// Adapts the routed-expert residency (expert_cache) to the routing seen since the last call; false when no model tiers
 	bool rebalance_experts();

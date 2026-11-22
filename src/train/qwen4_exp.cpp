@@ -331,6 +331,8 @@ struct Layer {
 	Tuned q, k, v, o;
 	float *q_norm = nullptr, *k_norm = nullptr, *g_q_norm = nullptr, *g_k_norm = nullptr;
 	int hq_l = 0, hk_l = 0, q0h = 0, kv0 = 0;
+	Tuned idx;               // the QSA indexer's projection (frozen: it only selects)
+	Half idx_qn, idx_kn;     // its query and key norms
 	// MoE
 	float* router = nullptr;
 	std::vector<Tuned> eg, eu, ed;   // this rank's experts loaded, the others empty
@@ -366,6 +368,7 @@ struct Model::Impl {
 	                            // in_proj_a / b, A_log, dt_bias and convolution, the shared expert's gate, PLE's convolution
 	float dense_lr = 0.1f;      // their learning rate, a fraction of the step's
 	bool train_router = false;  // the routers' weights trained too (set before the load; in dense_p at dense_lr)
+	bool keep_outputs = true;   // room for every layer's kept sublayer outputs (set before the load; off: a kept forward recomputes them)
 	bool opt_host = false;      // the optimizer state in host memory
 	int opt_bits = 32;          // Adam's moments: 32 (FP32) or 8 (block-wise)
 	std::vector<Layer> layers;
@@ -401,6 +404,35 @@ struct Model::Impl {
 	std::vector<std::vector<int>> last_ids;   // per layer of the range: the last call's selection
 	static constexpr int kLmChunk = 8192;
 	static constexpr int kGdnChunk = 64;
+	static constexpr int kAttnBlock = 1024;   // attention query rows per block of scores (longer sequences)
+	static constexpr int kQsaBlock = 1024;    // indexer query rows per block of pool scores
+	bool qsa_on = true;                       // the attention's QSA selection past its budget (off: dense)
+	// The selection's words per row for sequences of SL rows (0: the attention stays dense: no row past the budget, no indexer, or off)
+	int qsa_words( const Layer& lw, int SL ) const {
+		if ( !qsa_on || lw.idx.k == 0 || SL / kQsaPool <= kQsaBudget ) return 0;
+		return ( SL / kQsaPool + 31 ) / 32;
+	}
+	// The selection of every row (the indexer over all T rows, sequences of SL) in the workspace; the same on every rank
+	uint32_t* qsa_selection( Layer& lw, const float* mix, int T, int SL ) {
+		const int ns = T / SL, np = SL / kQsaPool, words = ( np + 31 ) / 32;
+		const size_t TR = static_cast<size_t>( T );
+		auto* bits = reinterpret_cast<uint32_t*>( ws.i( TR * words ) );
+		const size_t mark = ws.off;
+		float* Ti = ws.f( static_cast<size_t>( lw.idx.k ) * lw.idx.n );
+		float *Zi = ws.f( TR * kQsaProj ), *qk = ws.f( TR * kQsaProj );
+		lin_fwd( lw.idx, Ti, mix, T, Zi, qk );
+		float *qi = ws.f( TR * kQsaHeads * kQsaDim ), *rk = ws.f( TR * kQsaDim ), *pools = ws.f( static_cast<size_t>( ns ) * np * kQsaDim );
+		qsa_queries( qk, T, SL, lw.idx_qn.p, cfg.rot_dim, cfg.rope_theta, cfg.eps, qi, rk, st );
+		qsa_pools( rk, ns, SL, lw.idx_kn.p, cfg.rot_dim, cfg.rope_theta, cfg.eps, pools, st );
+		const int qb = std::min( kQsaBlock, SL );
+		float* scr = ws.f( qsa_scratch_floats( SL, qb ) );
+		for ( int s = 0; s < ns; ++s ) {
+			qsa_select( qi + static_cast<size_t>( s ) * SL * kQsaHeads * kQsaDim, pools + static_cast<size_t>( s ) * np * kQsaDim, SL, kQsaBudget, qb, scr,
+				bits + static_cast<size_t>( s ) * SL * words, st );
+		}
+		ws.off = mark;   // the selection stays
+		return bits;
+	}
 	// routed experts per group, and padded routes per group (or one expert's routes when more)
 	static constexpr int kGroupExperts = 32;
 	static constexpr int kGroupRows = 4096;
@@ -555,6 +587,21 @@ struct Model::Impl {
 		t.sv = P.s + ov;
 		t.gv = P.g + ov;
 		half_to_float( t.w.w1.data, t.su, t.k, st );   // the checkpoint's values (the pool's reference copy taken after the load)
+		half_to_float( t.w.w2.data, t.sv, t.n, st );
+		return t;
+	}
+
+	// An EXL3 tensor used but not trained: its scales in the state pool, no gradients
+	Tuned untrained( const std::string& name ) {
+		Tuned t;
+		t.name = name;
+		t.w = repo.load_linear( name.c_str(), arena, 4, st );
+		ENGINE_ASSERT( t.w.w0.data != nullptr && t.w.type == pod::QuantType::TRELLIS, "qwen4_exp training model: an EXL3 tensor is missing" );
+		t.k = t.w.w1.shape[0];
+		t.n = t.w.w2.shape[0];
+		t.su = static_cast<float*>( state.raw( static_cast<size_t>( t.k ) * sizeof( float ) ) );
+		t.sv = static_cast<float*>( state.raw( static_cast<size_t>( t.n ) * sizeof( float ) ) );
+		half_to_float( t.w.w1.data, t.su, t.k, st );
 		half_to_float( t.w.w2.data, t.sv, t.n, st );
 		return t;
 	}
@@ -746,6 +793,12 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 				for ( const char* p : { "q_proj", "k_proj", "v_proj", "o_proj" } ) linear( pre + ".self_attn." + p );
 				dense_w( pre + ".self_attn.q_norm.weight", false );
 				dense_w( pre + ".self_attn.k_norm.weight", false );
+				if ( m.repo.find( ( pre + ".self_attn.indexer.index_qk_proj.suh" ).c_str() ) ) {
+					linear( pre + ".self_attn.indexer.index_qk_proj" );
+					dense_w( pre + ".self_attn.indexer.q_layernorm.weight", true );
+					dense_w( pre + ".self_attn.indexer.k_layernorm.weight", true );
+					extra += al( static_cast<size_t>( H + kQsaProj ) * sizeof( float ) );
+				}
 			}
 			else {
 				for ( const char* p : { "in_proj_qkv", "in_proj_z", "out_proj" } ) linear( pre + ".linear_attn." + p );
@@ -770,7 +823,7 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 				for ( const char* p : { "norm_key", "norm_query", "norm_conv" } ) dense_w( pre + ".ple." + p + ".weight", false );
 				small( pre + ".ple.conv1d.weight" );
 			}
-			extra += 2 * al( Rl * H * sizeof( float ) ) + al( static_cast<size_t>( 12 ) * E * sizeof( float* ) );
+			extra += ( m.keep_outputs ? 2 * al( Rl * H * sizeof( float ) ) : 0 ) + al( static_cast<size_t>( 12 ) * E * sizeof( float* ) );
 		}
 		if ( m.head ) {
 			hc_site( "model.language_model.hyper_connection_mixer", false );
@@ -819,6 +872,11 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 			lw.o = m.tuned( pre + ".self_attn.o_proj", false );
 			lw.q_norm = m.norm_weights( pre + ".self_attn.q_norm.weight", &lw.g_q_norm );
 			lw.k_norm = m.norm_weights( pre + ".self_attn.k_norm.weight", &lw.g_k_norm );
+			if ( m.repo.find( ( pre + ".self_attn.indexer.index_qk_proj.suh" ).c_str() ) ) {
+				lw.idx = m.untrained( pre + ".self_attn.indexer.index_qk_proj" );
+				lw.idx_qn = m.dense( pre + ".self_attn.indexer.q_layernorm.weight" );
+				lw.idx_kn = m.dense( pre + ".self_attn.indexer.k_layernorm.weight" );
+			}
 		}
 		else {
 			lw.kh_l = c.lin_k / ranks;
@@ -897,9 +955,11 @@ bool Model::load( const std::string& dir, int first, int last, int device, int m
 			if ( m.train_dense ) lw.ple_conv = m.pooled( m.dense_p, pre + ".ple.conv1d.weight", rank == 0 ? &lw.g_ple_conv : nullptr );
 			else lw.d16[kPleConv] = m.dense( pre + ".ple.conv1d.weight" );
 		}
-		lw.cyA = m.state.f( Rl * H );
-		lw.cyM = m.state.f( Rl * H );
-		m.kept_bytes += 2 * Rl * H * sizeof( float );
+		if ( m.keep_outputs ) {
+			lw.cyA = m.state.f( Rl * H );
+			lw.cyM = m.state.f( Rl * H );
+			m.kept_bytes += 2 * Rl * H * sizeof( float );
+		}
 		m.layers.push_back( std::move( lw ) );
 		m.last_ids.emplace_back();
 		CUDA_CHECK( cudaStreamSynchronize( m.st ) );
@@ -1277,16 +1337,27 @@ void Model::Impl::attention( Layer& lw, const float* mix, int T, float* y, const
 	unpack_q_gate( QG, T, hq, d, q, gate, st );
 	rms_forward( q, lw.q_norm, 1, true, true, T * hq, d, cfg.eps, iq, qn, st );
 	rms_forward( K, lw.k_norm, 1, true, true, T * hk, d, cfg.eps, ik, kn, st );
-	// per sequence of SL rows: RoPE positions from its start, the causal attention within it
+	// per sequence of SL rows: RoPE positions from its start, the causal attention within it, past the QSA budget over the selected keys only
 	const int SL = T / seqs;
 	const size_t SR = static_cast<size_t>( SL );
 	rope_forward( qn, T, hq, d, cfg.rot_dim, cfg.rope_theta, st, SL );
 	rope_forward( kn, T, hk, d, cfg.rot_dim, cfg.rope_theta, st, SL );
-	float *S = ws.f( SR * SR ), *O = ws.f( TR * QD ), *Gd = ws.f( TR * QD ), *Zo = ws.f( TR * H );
+	const int words = qsa_words( lw, SL );
+	uint32_t* bits = words > 0 ? qsa_selection( lw, mix, T, SL ) : nullptr;
+	const int QB = SL > kAttnBlock ? kAttnBlock : SL;   // query rows per block of scores
+	float *S = ws.f( static_cast<size_t>( QB ) * SR ), *O = ws.f( TR * QD ), *Gd = ws.f( TR * QD ), *Zo = ws.f( TR * H );
 	const float scale = 1.0f / std::sqrt( static_cast<float>( d ) );
+	auto sel_of = [&]( int s ) {
+		QsaSelection q;
+		if ( bits ) {
+			q.bits = bits + static_cast<size_t>( s ) * SR * words;
+			q.words = words;
+		}
+		return q;
+	};
 	for ( int s = 0; s < seqs; ++s ) {
 		const size_t r0 = static_cast<size_t>( s ) * SR;
-		attention_forward( *blas, qn + r0 * QD, kn + r0 * KD, V + r0 * KD, SL, hq, hk, d, scale, S, O + r0 * QD );
+		attention_forward( *blas, qn + r0 * QD, kn + r0 * KD, V + r0 * KD, SL, hq, hk, d, scale, S, O + r0 * QD, sel_of( s ), QB );
 	}
 	sigmoid_gate_forward( O, gate, Gd, TR * QD, st );
 	lin_fwd( lw.o, To, Gd, T, Zo, y, vo );
@@ -1295,11 +1366,11 @@ void Model::Impl::attention( Layer& lw, const float* mix, int T, float* y, const
 		lin_bwd( lw.o, To, Gd, Zo, dy, T, dGd, false, vo );
 		float *dO = ws.fz( TR * QD, st ), *dgate = ws.fz( TR * QD, st );
 		sigmoid_gate_backward( O, gate, dGd, dO, dgate, TR * QD, st );
-		float *dqn = ws.fz( TR * QD, st ), *dkn = ws.fz( TR * KD, st ), *dV = ws.fz( TR * KD, st ), *dP = ws.f( SR * SR );
+		float *dqn = ws.fz( TR * QD, st ), *dkn = ws.fz( TR * KD, st ), *dV = ws.fz( TR * KD, st ), *dP = ws.f( static_cast<size_t>( QB ) * SR );
 		for ( int s = 0; s < seqs; ++s ) {
 			const size_t r0 = static_cast<size_t>( s ) * SR;
 			attention_backward( *blas, qn + r0 * QD, kn + r0 * KD, V + r0 * KD, SL, hq, hk, d, scale, dO + r0 * QD, dqn + r0 * QD, dkn + r0 * KD,
-				dV + r0 * KD, S, dP );
+				dV + r0 * KD, S, dP, sel_of( s ), QB );
 		}
 		rope_backward( dqn, T, hq, d, cfg.rot_dim, cfg.rope_theta, st, SL );
 		rope_backward( dkn, T, hk, d, cfg.rot_dim, cfg.rope_theta, st, SL );
@@ -1322,6 +1393,7 @@ void Model::Impl::run( int L, const float* x_in, float* x_out, int T, const floa
 	ENGINE_ASSERT( T % ranks == 0 && T <= max_rows, "qwen4_exp training model: the rows exceed the workspace or do not split over the ranks" );
 	ENGINE_ASSERT( n_seqs > 0 && T % n_seqs == 0, "qwen4_exp training model: the rows do not hold whole sequences" );
 	seqs = n_seqs;
+	keep = keep && keep_outputs;
 	ws.reset( st );
 	unpack( lw );
 	const int H = cfg.hidden, hc = cfg.hc, Tl = T / ranks;
@@ -1487,7 +1559,9 @@ double Model::head( const float* x, int rows, const Teacher& t, float* dx ) {
 	CUDA_CHECK( cudaSetDevice( device_ ) );
 	ENGINE_ASSERT( m.head, "qwen4_exp training model: this range has no head" );
 	ENGINE_ASSERT( rows % m.ranks == 0 && rows <= m.max_rows, "qwen4_exp training model: the rows exceed the workspace or do not split over the ranks" );
-	const int H = cfg_.hidden, V = cfg_.vocab, NC = Impl::kLmChunk, Tl = rows / m.ranks;
+	// vocabulary chunks of up to kLmChunk columns, narrower for many rows (a chunk's buffers hold at most kLmChunk^2 values each)
+	const int NC = std::max( 1024, std::min( Impl::kLmChunk, Impl::kLmChunk / 128 * Impl::kLmChunk / std::max( rows, 1 ) * 128 ) );
+	const int H = cfg_.hidden, V = cfg_.vocab, Tl = rows / m.ranks;
 	const size_t TR = static_cast<size_t>( rows ), TL = static_cast<size_t>( Tl ), flat = static_cast<size_t>( cfg_.hc ) * H;
 	// this rank's vocabulary columns (whole 128-column blocks)
 	const int vb = V / 128, v0 = vb * m.rank / m.ranks * 128, v1 = vb * ( m.rank + 1 ) / m.ranks * 128;
@@ -1552,6 +1626,8 @@ void Model::freeze_routing( bool on ) { p_->frozen = on; }
 void Model::set_timing( bool on ) { p_->timing = on; }
 
 void Model::set_fp16( bool on ) { p_->fp16 = on; }
+
+void Model::set_qsa( bool on ) { p_->qsa_on = on; }
 
 std::string Model::timing_report( bool reset ) {
 	std::vector<std::pair<double, std::string>> v;
@@ -1646,6 +1722,8 @@ void Model::set_train_dense( bool on, float lr_scale ) {
 }
 
 void Model::set_train_router( bool on ) { p_->train_router = on; }
+
+void Model::set_keep_outputs( bool on ) { p_->keep_outputs = on; }
 
 void Model::set_optimizer( bool host, int moment_bits ) {
 	ENGINE_ASSERT( moment_bits == 32 || moment_bits == 8, "qwen4_exp training model: Adam's moments are 32 or 8 bits" );

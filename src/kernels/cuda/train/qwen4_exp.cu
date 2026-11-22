@@ -539,12 +539,24 @@ __global__ void k_pack_qg( const float* dq, const float* dg, int rows, int heads
 }
 
 // One block per row i of a rows x rows score matrix: softmax over j <= i, zero above
-__global__ void k_causal_softmax( float* s, int rows ) {
+// The keys a query at position p sees: causal, and past the QSA budget (more than budget complete pools of kQsaPool tokens) only its
+// selected pools (bits: a row of words per position) and its incomplete tail
+__device__ __forceinline__ bool qsa_sees( int p, int j, const uint32_t* row_bits, int budget ) {
+	if ( j > p ) return false;
+	const int vis = p + 1;
+	if ( row_bits == nullptr || vis / kQsaPool <= budget || j >= vis - vis % kQsaPool ) return true;
+	const int pool = j / kQsaPool;
+	return ( row_bits[pool >> 5] >> ( pool & 31 ) ) & 1u;
+}
+
+// Softmax per row of a query block (rows r0 .. r0 + gridDim.x of the sequence, ld keys), over the keys it sees (the others 0)
+__global__ void k_attn_softmax( float* s, int ld, int r0, const uint32_t* bits, int words, int budget ) {
 	__shared__ float sh[32];
-	const int i = blockIdx.x;
-	float* row = s + static_cast<size_t>( i ) * rows;
+	const int i = blockIdx.x, p = r0 + i;
+	float* row = s + static_cast<size_t>( i ) * ld;
+	const uint32_t* rb = bits ? bits + static_cast<size_t>( p ) * words : nullptr;
 	float m = -INFINITY;
-	for ( int j = threadIdx.x; j <= i; j += blockDim.x ) m = fmaxf( m, row[j] );
+	for ( int j = threadIdx.x; j <= p; j += blockDim.x ) if ( qsa_sees( p, j, rb, budget ) ) m = fmaxf( m, row[j] );
 	for ( int o = 16; o > 0; o >>= 1 ) m = fmaxf( m, __shfl_xor_sync( 0xffffffffu, m, o ) );
 	__syncthreads();
 	if ( ( threadIdx.x & 31 ) == 0 ) sh[threadIdx.x >> 5] = m;
@@ -552,22 +564,179 @@ __global__ void k_causal_softmax( float* s, int rows ) {
 	m = -INFINITY;
 	for ( int w = 0; w < ( blockDim.x >> 5 ); ++w ) m = fmaxf( m, sh[w] );
 	float sum = 0.0f;
-	for ( int j = threadIdx.x; j <= i; j += blockDim.x ) sum += expf( row[j] - m );
+	for ( int j = threadIdx.x; j <= p; j += blockDim.x ) if ( qsa_sees( p, j, rb, budget ) ) sum += expf( row[j] - m );
 	sum = block_sum256( sum, sh );
 	const float inv = 1.0f / sum;
-	for ( int j = threadIdx.x; j < rows; j += blockDim.x ) row[j] = j <= i ? expf( row[j] - m ) * inv : 0.0f;
+	for ( int j = threadIdx.x; j < ld; j += blockDim.x ) row[j] = qsa_sees( p, j, rb, budget ) ? expf( row[j] - m ) * inv : 0.0f;
 }
 
-// dp <- p ( dp - sum_j p dp ), per row
-__global__ void k_softmax_bwd( const float* p, float* dp, int rows ) {
+// dp <- p ( dp - sum_j p dp ), per row of ld (p is 0 where a row sees nothing)
+__global__ void k_softmax_bwd( const float* p, float* dp, int ld ) {
 	__shared__ float sh[32];
 	const int i = blockIdx.x;
-	const float* pr = p + static_cast<size_t>( i ) * rows;
-	float* dr = dp + static_cast<size_t>( i ) * rows;
+	const float* pr = p + static_cast<size_t>( i ) * ld;
+	float* dr = dp + static_cast<size_t>( i ) * ld;
 	float s = 0.0f;
-	for ( int j = threadIdx.x; j <= i; j += blockDim.x ) s += pr[j] * dr[j];
+	for ( int j = threadIdx.x; j < ld; j += blockDim.x ) s += pr[j] * dr[j];
 	s = block_sum256( s, sh );
-	for ( int j = threadIdx.x; j < rows; j += blockDim.x ) dr[j] = j <= i ? pr[j] * ( dr[j] - s ) : 0.0f;
+	for ( int j = threadIdx.x; j < ld; j += blockDim.x ) dr[j] = pr[j] * ( dr[j] - s );
+}
+
+// ---- QSA: Flash-Next's selection of key pools past its budget (engine/modules/qsa.h), held fixed like the routing (no gradient) ----
+__device__ __forceinline__ float h16( float x ) { return __half2float( __float2half_rn( x ) ); }
+
+// Sum over a block of 128 threads (all get it)
+__device__ __forceinline__ float block_sum128_( float v, float* sh ) {
+	for ( int o = 16; o > 0; o >>= 1 ) v += __shfl_xor_sync( 0xffffffffu, v, o );
+	__syncthreads();
+	if ( ( threadIdx.x & 31 ) == 0 ) sh[threadIdx.x >> 5] = v;
+	__syncthreads();
+	return sh[0] + sh[1] + sh[2] + sh[3];
+}
+
+__device__ __forceinline__ float qsa_rope( float x, float partner, int d, int pos, int rot_dim, float theta ) {
+	const int half_rot = rot_dim / 2;
+	if ( d >= rot_dim ) return x;
+	float c, s;
+	engine::math::rope_cos_sin<false>( pos, d % half_rot, rot_dim, theta, c, s );
+	return d < half_rot ? x * c - partner * s : x * c + partner * s;
+}
+
+// Block (row, head) of 128 threads, the inference kernel's roundings: the projection's output in FP16, q = rmsnorm * (1 + w) in FP16, roped at
+// the row's position in its sequence; head kQsaHeads: the raw key (FP16) into raw_k [rows, 128]
+__global__ __launch_bounds__( 128 )
+void k_qsa_q( const float* qk, const __half* qw, int seq_len, int rot_dim, float theta, float eps, float* q, float* raw_k ) {
+	__shared__ float xs[kQsaDim], sh[4];
+	const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x, pos = r % seq_len;
+	const float x = h16( qk[static_cast<size_t>( r ) * kQsaProj + h * kQsaDim + d] );
+	if ( h == kQsaHeads ) {
+		raw_k[static_cast<size_t>( r ) * kQsaDim + d] = x;
+		return;
+	}
+	const float ms = block_sum128_( x * x, sh ) / kQsaDim;
+	const float xn = h16( x * rsqrtf( ms + eps ) * ( 1.0f + __half2float( qw[d] ) ) );
+	xs[d] = xn;
+	__syncthreads();
+	const int half_rot = rot_dim / 2;
+	const float partner = d < rot_dim ? xs[d < half_rot ? d + half_rot : d - half_rot] : 0.0f;
+	q[( static_cast<size_t>( r ) * kQsaHeads + h ) * kQsaDim + d] = h16( qsa_rope( xn, partner, d, pos, rot_dim, theta ) );
+}
+
+// Block (pool, sequence): the pool's key = rope at its first position( rmsnorm( mean of its raw keys, FP16 ) * (1 + w) ), FP16
+__global__ __launch_bounds__( 128 )
+void k_qsa_pool( const float* raw_k, const __half* kw, int seq_len, int rot_dim, float theta, float eps, float* pools ) {
+	__shared__ float xs[kQsaDim], sh[4];
+	const int p = blockIdx.x, s = blockIdx.y, d = threadIdx.x, np = seq_len / kQsaPool;
+	const float* rk = raw_k + ( static_cast<size_t>( s ) * seq_len + static_cast<size_t>( p ) * kQsaPool ) * kQsaDim;
+	float acc = 0.0f;
+	for ( int j = 0; j < kQsaPool; ++j ) acc += rk[j * kQsaDim + d];
+	const float mean = h16( acc / kQsaPool );
+	const float ms = block_sum128_( mean * mean, sh ) / kQsaDim;
+	const float xn = h16( mean * rsqrtf( ms + eps ) * ( 1.0f + __half2float( kw[d] ) ) );
+	xs[d] = xn;
+	__syncthreads();
+	const int half_rot = rot_dim / 2;
+	const float partner = d < rot_dim ? xs[d < half_rot ? d + half_rot : d - half_rot] : 0.0f;
+	pools[( static_cast<size_t>( s ) * np + p ) * kQsaDim + d] = h16( qsa_rope( xn, partner, d, p * kQsaPool, rot_dim, theta ) );
+}
+
+// Grid (pool tiles of 128, query rows r0 ..): score[i][p] = scale sum_h relu( q[h] . key[p] ) (FP16) for the pools p < (pos + 1) / kQsaPool of the
+// rows past the budget
+__global__ __launch_bounds__( 128 )
+void k_qsa_score( const float* q, const float* pools, int r0, int np, int budget, float scale, float* scores ) {
+	__shared__ float qs[kQsaHeads * kQsaDim];
+	const int i = blockIdx.y, pos = r0 + i, bound = ( pos + 1 ) / kQsaPool;
+	if ( bound <= budget ) return;
+	for ( int x = threadIdx.x; x < kQsaHeads * kQsaDim; x += 128 ) qs[x] = q[static_cast<size_t>( pos ) * kQsaHeads * kQsaDim + x];
+	__syncthreads();
+	const int p = blockIdx.x * 128 + threadIdx.x;
+	if ( p >= bound ) return;
+	const float4* key = reinterpret_cast<const float4*>( pools + static_cast<size_t>( p ) * kQsaDim );
+	float s[kQsaHeads] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	for ( int d4 = 0; d4 < kQsaDim / 4; ++d4 ) {
+		const float4 kv = key[d4];
+		for ( int h = 0; h < kQsaHeads; ++h ) {
+			const float* qh = qs + h * kQsaDim + d4 * 4;
+			s[h] = fmaf( qh[0], kv.x, fmaf( qh[1], kv.y, fmaf( qh[2], kv.z, fmaf( qh[3], kv.w, s[h] ) ) ) );
+		}
+	}
+	float total = 0.0f;
+	for ( int h = 0; h < kQsaHeads; ++h ) total += fmaxf( s[h], 0.0f );
+	scores[static_cast<size_t>( i ) * np + p] = h16( total * scale );
+}
+
+__device__ __forceinline__ unsigned qsa_key( float s ) {
+	const unsigned b = __half_as_ushort( __float2half_rn( s ) );
+	return ( b & 0x8000u ) ? ( ~b & 0xFFFFu ) : ( b | 0x8000u );
+}
+
+// Block per query row: the budget best pools by FP16 score (ties at the threshold in pool order, as DSA::select) as bits of the row's words;
+// rows within the budget get no bits (they see every key)
+__global__ __launch_bounds__( 1024 )
+void k_qsa_select( const float* scores, int np, int r0, int budget, int words, uint32_t* bits ) {
+	__shared__ int hist[256];
+	__shared__ uint32_t s_bits[kQsaMaxWords];
+	__shared__ int s_b1, s_above1, s_thr, s_need_eq, s_wsum[32], s_carry_eq;
+	const int i = blockIdx.x, t = threadIdx.x, pos = r0 + i, bound = ( pos + 1 ) / kQsaPool;
+	uint32_t* out = bits + static_cast<size_t>( pos ) * words;
+	for ( int w = t; w < words; w += 1024 ) s_bits[w] = 0u;
+	if ( bound <= budget ) {
+		for ( int w = t; w < words; w += 1024 ) out[w] = 0u;
+		return;
+	}
+	const float* sc = scores + static_cast<size_t>( i ) * np;
+	if ( t < 256 ) hist[t] = 0;
+	__syncthreads();
+	for ( int p = t; p < bound; p += 1024 ) atomicAdd( &hist[qsa_key( sc[p] ) >> 8], 1 );
+	__syncthreads();
+	if ( t == 0 ) {
+		int cum = 0, b = 255;
+		for ( ; b > 0; --b ) {
+			if ( cum + hist[b] >= budget ) break;
+			cum += hist[b];
+		}
+		s_b1 = b;
+		s_above1 = cum;
+	}
+	__syncthreads();
+	if ( t < 256 ) hist[t] = 0;
+	__syncthreads();
+	for ( int p = t; p < bound; p += 1024 ) {
+		const unsigned key = qsa_key( sc[p] );
+		if ( ( key >> 8 ) == static_cast<unsigned>( s_b1 ) ) atomicAdd( &hist[key & 255u], 1 );
+	}
+	__syncthreads();
+	if ( t == 0 ) {
+		const int rem = budget - s_above1;
+		int cum = 0, b = 255;
+		for ( ; b > 0; --b ) {
+			if ( cum + hist[b] >= rem ) break;
+			cum += hist[b];
+		}
+		s_thr = ( s_b1 << 8 ) | b;
+		s_need_eq = rem - cum;
+		s_carry_eq = 0;
+	}
+	__syncthreads();
+	const unsigned thr = static_cast<unsigned>( s_thr );
+	const int need_eq = s_need_eq;
+	// strictly better pools all; the ties at the threshold first in pool order
+	for ( int base = 0; base < bound; base += 1024 ) {
+		const int p = base + t;
+		const unsigned key = p < bound ? qsa_key( sc[p] ) : 0u;
+		const bool gt = p < bound && key > thr, eq = p < bound && key == thr;
+		const unsigned be = __ballot_sync( 0xffffffffu, eq );
+		if ( ( t & 31 ) == 0 ) s_wsum[t >> 5] = __popc( be );
+		__syncthreads();
+		int we = 0;
+		for ( int w2 = 0; w2 < ( t >> 5 ); ++w2 ) we += s_wsum[w2];
+		const int pos_eq = s_carry_eq + we + __popc( be & ( ( 1u << ( t & 31 ) ) - 1u ) );
+		if ( gt || ( eq && pos_eq < need_eq ) ) atomicOr( &s_bits[p >> 5], 1u << ( p & 31 ) );
+		__syncthreads();
+		if ( t == 0 ) for ( int w2 = 0; w2 < 32; ++w2 ) s_carry_eq += s_wsum[w2];
+		__syncthreads();
+	}
+	for ( int w = t; w < words; w += 1024 ) out[w] = s_bits[w];
 }
 
 // ---- routing ----
@@ -648,6 +817,10 @@ __global__ void k_copy_cols( const float* src, int src_ld, int src_col, float* d
 
 __global__ void k_half_to_float( const half* h, float* f, size_t n ) {
 	Q4E_LOOP( i, n ) f[i] = __half2float( h[i] );
+}
+
+__global__ void k_round_half( float* x, size_t n ) {
+	Q4E_LOOP( i, n ) x[i] = __half2float( __float2half_rn( x[i] ) );
 }
 
 __global__ void k_router_input_bwd( const float* dlogit, const int* ids, const float* R, int rows, int k, int hidden, float* dX ) {
@@ -1058,32 +1231,67 @@ void pack_q_gate( const float* dq, const float* dgate, int rows, int heads, int 
 	k_pack_qg<<<blocks_for( (size_t) rows * heads * head_dim ), 256, 0, cu( stream )>>>( dq, dgate, rows, heads, head_dim, dqg );
 }
 
-void attention_forward( Blas& b, const float* q, const float* k, const float* v, int rows, int hq, int hk, int d, float scale, float* s, float* o ) {
-	const int group = hq / hk;
-	for ( int h = 0; h < hq; ++h ) {
-		const int kv = h / group;
-		b.gemm( false, true, rows, rows, d, scale, q + static_cast<size_t>( h ) * d, hq * d, k + static_cast<size_t>( kv ) * d, hk * d, 0.0f, s, rows );
-		k_causal_softmax<<<rows, 256, 0, cu( b.stream() )>>>( s, rows );
-		b.gemm( false, false, rows, d, rows, 1.0f, s, rows, v + static_cast<size_t>( kv ) * d, hk * d, 0.0f, o + static_cast<size_t>( h ) * d, hq * d );
+void attention_forward( Blas& b, const float* q, const float* k, const float* v, int rows, int hq, int hk, int d, float scale, float* s, float* o,
+	const QsaSelection& sel, int qblock ) {
+	const int group = hq / hk, qb = qblock > 0 ? std::min( qblock, rows ) : rows;
+	for ( int r0 = 0; r0 < rows; r0 += qb ) {
+		const int m = std::min( qb, rows - r0 ), n = r0 + m;   // the block's query rows and the keys they see
+		for ( int h = 0; h < hq; ++h ) {
+			const int kv = h / group;
+			b.gemm( false, true, m, n, d, scale, q + static_cast<size_t>( r0 ) * hq * d + static_cast<size_t>( h ) * d, hq * d, k + static_cast<size_t>( kv ) * d,
+				hk * d, 0.0f, s, n );
+			k_attn_softmax<<<m, 256, 0, cu( b.stream() )>>>( s, n, r0, sel.bits, sel.words, sel.budget );
+			b.gemm( false, false, m, d, n, 1.0f, s, n, v + static_cast<size_t>( kv ) * d, hk * d, 0.0f, o + static_cast<size_t>( r0 ) * hq * d + static_cast<size_t>( h ) * d,
+				hq * d );
+		}
 	}
 }
 
 void attention_backward( Blas& b, const float* q, const float* k, const float* v, int rows, int hq, int hk, int d, float scale, const float* dout, float* dq,
-	float* dk, float* dv, float* s, float* dp ) {
-	const int group = hq / hk;
-	for ( int h = 0; h < hq; ++h ) {
-		const int kv = h / group;
-		const float* qh = q + static_cast<size_t>( h ) * d;
-		const float* kh = k + static_cast<size_t>( kv ) * d;
-		const float* vh = v + static_cast<size_t>( kv ) * d;
-		const float* doh = dout + static_cast<size_t>( h ) * d;
-		b.gemm( false, true, rows, rows, d, scale, qh, hq * d, kh, hk * d, 0.0f, s, rows );
-		k_causal_softmax<<<rows, 256, 0, cu( b.stream() )>>>( s, rows );
-		b.gemm( true, false, rows, d, rows, 1.0f, s, rows, doh, hq * d, 1.0f, dv + static_cast<size_t>( kv ) * d, hk * d );
-		b.gemm( false, true, rows, rows, d, 1.0f, doh, hq * d, vh, hk * d, 0.0f, dp, rows );
-		k_softmax_bwd<<<rows, 256, 0, cu( b.stream() )>>>( s, dp, rows );
-		b.gemm( false, false, rows, d, rows, scale, dp, rows, kh, hk * d, 1.0f, dq + static_cast<size_t>( h ) * d, hq * d );
-		b.gemm( true, false, rows, d, rows, scale, dp, rows, qh, hq * d, 1.0f, dk + static_cast<size_t>( kv ) * d, hk * d );
+	float* dk, float* dv, float* s, float* dp, const QsaSelection& sel, int qblock ) {
+	const int group = hq / hk, qb = qblock > 0 ? std::min( qblock, rows ) : rows;
+	for ( int r0 = 0; r0 < rows; r0 += qb ) {
+		const int m = std::min( qb, rows - r0 ), n = r0 + m;
+		const size_t qo = static_cast<size_t>( r0 ) * hq * d;
+		for ( int h = 0; h < hq; ++h ) {
+			const int kv = h / group;
+			const float* qh = q + qo + static_cast<size_t>( h ) * d;
+			const float* kh = k + static_cast<size_t>( kv ) * d;
+			const float* vh = v + static_cast<size_t>( kv ) * d;
+			const float* doh = dout + qo + static_cast<size_t>( h ) * d;
+			b.gemm( false, true, m, n, d, scale, qh, hq * d, kh, hk * d, 0.0f, s, n );
+			k_attn_softmax<<<m, 256, 0, cu( b.stream() )>>>( s, n, r0, sel.bits, sel.words, sel.budget );
+			b.gemm( true, false, n, d, m, 1.0f, s, n, doh, hq * d, 1.0f, dv + static_cast<size_t>( kv ) * d, hk * d );
+			b.gemm( false, true, m, n, d, 1.0f, doh, hq * d, vh, hk * d, 0.0f, dp, n );
+			k_softmax_bwd<<<m, 256, 0, cu( b.stream() )>>>( s, dp, n );
+			b.gemm( false, false, m, d, n, scale, dp, n, kh, hk * d, 1.0f, dq + qo + static_cast<size_t>( h ) * d, hq * d );
+			b.gemm( true, false, n, d, m, scale, dp, n, qh, hq * d, 1.0f, dk + static_cast<size_t>( kv ) * d, hk * d );
+		}
+	}
+}
+
+void qsa_queries( const float* qk, int rows, int seq_len, const void* q_norm, int rot_dim, float theta, float eps, float* q, float* raw_k,
+	backend::stream_t stream ) {
+	k_qsa_q<<<dim3( rows, kQsaHeads + 1 ), 128, 0, cu( stream )>>>( qk, static_cast<const __half*>( q_norm ), seq_len, rot_dim, theta, eps, q, raw_k );
+}
+
+void qsa_pools( const float* raw_k, int seqs, int seq_len, const void* k_norm, int rot_dim, float theta, float eps, float* pools, backend::stream_t stream ) {
+	const int np = seq_len / kQsaPool;
+	if ( np > 0 ) k_qsa_pool<<<dim3( np, seqs ), 128, 0, cu( stream )>>>( raw_k, static_cast<const __half*>( k_norm ), seq_len, rot_dim, theta, eps, pools );
+}
+
+size_t qsa_scratch_floats( int seq_len, int qblock ) {
+	return static_cast<size_t>( qblock ) * ( seq_len / kQsaPool );
+}
+
+void qsa_select( const float* q, const float* pools, int seq_len, int budget, int qblock, float* scratch, uint32_t* bits, backend::stream_t stream ) {
+	const int np = seq_len / kQsaPool, words = ( np + 31 ) / 32;
+	ENGINE_ASSERT( words <= kQsaMaxWords, "qsa_select: the sequence has more pools than the selection holds" );
+	const float scale = 1.0f / std::sqrt( static_cast<float>( kQsaDim ) );
+	for ( int r0 = 0; r0 < seq_len; r0 += qblock ) {
+		const int m = std::min( qblock, seq_len - r0 );
+		if ( np > 0 ) k_qsa_score<<<dim3( ( np + 127 ) / 128, m ), 128, 0, cu( stream )>>>( q, pools, r0, np, budget, scale, scratch );
+		k_qsa_select<<<m, 1024, 0, cu( stream )>>>( scratch, np, r0, budget, words, bits );
 	}
 }
 
@@ -1114,6 +1322,10 @@ void copy_cols( const float* src, int src_ld, int src_col, float* dst, int dst_l
 
 void half_to_float( const void* h, float* f, size_t n, backend::stream_t stream ) {
 	k_half_to_float<<<blocks_for( n ), 256, 0, cu( stream )>>>( static_cast<const half*>( h ), f, n );
+}
+
+void round_to_half( float* x, size_t n, backend::stream_t stream ) {
+	k_round_half<<<blocks_for( n ), 256, 0, cu( stream )>>>( x, n );
 }
 
 void router_input_backward( const float* dlogit, const int* ids, const float* R, int rows, int k, int hidden, float* dX, backend::stream_t stream ) {

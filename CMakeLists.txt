@@ -223,6 +223,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/qsa.cu
 	src/backend/cuda/modules/dsv4.cu
 	src/backend/cuda/modules/embedding.cu
+	src/backend/cuda/modules/logit_rows.cu
 	src/backend/cuda/modules/vision.cu
 	src/backend/cuda/modules/linear_trellis.cu
 	src/video/h3_dit.cu
@@ -525,6 +526,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 		src/kernels/cuda/train/grad.cu
 		src/kernels/cuda/train/qwen4_exp.cu
 		src/train/qwen4_exp.cpp
+		src/train/qwen4_exp_inputs.cpp
 	)
 	target_link_libraries(engine_train PUBLIC engine_kernels)
 	set_target_properties(engine_train PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

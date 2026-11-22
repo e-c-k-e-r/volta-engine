@@ -5,6 +5,7 @@
 //     then per position K ids (int32, most likely first), their probabilities (FP32) and the mass outside them (FP32)
 //   --kl-teacher FILE (a --topk-out file of the same text and settings): also KL( teacher || model ) per position, over the teacher's top K plus
 //     its lumped tail, averaged (--kl-from P: only the positions from P on, e.g. the sequences volta_e2e holds out)
+//   --bins B1,B2,..: the NLL (and the KL) also averaged by position within a row (--seq) or session (--prompts), [0, B1), .., [Bn, end)
 //   test_ppl --calibrate --file TEXT --seq 2048 --tokens N   cuts the text into independent rows of 2048 tokens (the slot restarts at each), as calibration rows are
 //   test_ppl --calibrate --prompts DIR [--tokens N] [--chunk C]   replays the rendered prompts a server wrote with dump_requests (req_N.prompt.txt, chat-template tokens
 //   intact): only the last request of each session is used, and the rows it shares with an earlier session (the system prompt and tool schemas) run without
@@ -18,6 +19,7 @@
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"
 #include "engine/backend/numeric.h"
+#include "engine/modules/logit_rows.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -33,6 +35,32 @@
 using namespace engine::runtime;
 namespace backend = engine::backend;
 
+// --bins: a value's mean by position (within a row or session), positions [0, B1), [B1, B2), .., [Bn, end)
+struct PosBins {
+	std::vector<int> edges;
+	std::vector<double> sum;
+	std::vector<size_t> n;
+	void init( const std::vector<int>& e ) {
+		edges = e;
+		sum.assign( e.size() + 1, 0.0 );
+		n.assign( e.size() + 1, 0 );
+	}
+	void add( int pos, double v ) {
+		if ( edges.empty() ) return;
+		const size_t b = std::upper_bound( edges.begin(), edges.end(), pos ) - edges.begin();
+		sum[b] += v;
+		++n[b];
+	}
+	void print( const char* what ) const {
+		for ( size_t b = 0; b < n.size() && !edges.empty(); ++b ) {
+			if ( n[b] == 0 ) continue;
+			const int lo = b == 0 ? 0 : edges[b - 1];
+			if ( b < edges.size() ) std::printf( "[*]   %s at positions %d-%d: %.6f (%zu tokens)\n", what, lo, edges[b] - 1, sum[b] / n[b], n[b] );
+			else std::printf( "[*]   %s at positions %d-: %.6f (%zu tokens)\n", what, lo, sum[b] / n[b], n[b] );
+		}
+	}
+};
+
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	bool glm = false, flash = false, calibrate = false;
@@ -40,6 +68,7 @@ int main( int argc, char** argv ) {
 	std::string file, nll_out, qbench, prompts_dir, topk_out, kl_teacher;
 	int seq = 0, max_sessions = 0, skip_override = 0, show_miss = 0, stride = 1, topk = 128, kl_from = 0;
 	std::string select;
+	std::vector<int> bin_edges;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
 		else if ( !std::strcmp( argv[i], "--flash" ) ) flash = true;
@@ -53,6 +82,10 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--topk" ) && i + 1 < argc ) topk = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--kl-teacher" ) && i + 1 < argc ) kl_teacher = argv[++i];
 		else if ( !std::strcmp( argv[i], "--kl-from" ) && i + 1 < argc ) kl_from = std::atoi( argv[++i] );
+		else if ( !std::strcmp( argv[i], "--bins" ) && i + 1 < argc ) {
+			std::stringstream ss( argv[++i] );
+			for ( std::string b; std::getline( ss, b, ',' ); ) if ( !b.empty() ) bin_edges.push_back( std::atoi( b.c_str() ) );
+		}
 		else if ( !std::strcmp( argv[i], "--prompts" ) && i + 1 < argc ) prompts_dir = argv[++i];
 		else if ( !std::strcmp( argv[i], "--seq" ) && i + 1 < argc ) seq = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--select" ) && i + 1 < argc ) select = argv[++i];
@@ -65,7 +98,8 @@ int main( int argc, char** argv ) {
 	// of p + 1), so ENGINE_HESSIAN_DIR also collects the head's sites (layers 48 and 49 of the file names); the head keeps its own KV like in serving
 	const bool mtp_calib = calibrate && flash && std::getenv( "ENGINE_CALIB_MTP" ) != nullptr;
 	if ( mtp_calib ) setenv( "ENGINE_SPECULATOR", "mtp", 1 );
-	if ( !calibrate && prompts_dir.empty() && chunk > pod::MAX_BATCH ) {
+	if ( !calibrate && prompts_dir.empty() && chunk > pod::MAX_BATCH && !flash ) {
+		// (Flash-Next gathers the logits of any chunk)
 		std::printf( "[test_ppl] chunk %d clamped to %d: the gathered logits hold a decode batch (--calibrate reads none and takes any chunk)\n", chunk, pod::MAX_BATCH );
 		chunk = pod::MAX_BATCH;
 	}
@@ -134,9 +168,12 @@ int main( int argc, char** argv ) {
 			}
 			if ( skip_override > 0 ) skip = static_cast<size_t>( skip_override );
 			const int V = mc.metadata().vocab_size;
-			std::vector<backend::half_t> logits( static_cast<size_t>( pod::MAX_BATCH ) * V );
+			const int score_rows = flash ? chunk : pod::MAX_BATCH;   // (Flash-Next gathers the logits of any chunk)
+			std::vector<backend::half_t> logits( static_cast<size_t>( score_rows ) * V );
 			double total = 0.0;
 			long n = 0;
+			PosBins sess_bins;
+			sess_bins.init( bin_edges );
 			// GLM's turns are <|assistant|> ... up to the next role tag (<|user|>, <|observation|> or <|system|>, which the model emits to end its turn); Qwen's are <|im_start|>assistant\n ... <|im_end|>
 			const std::vector<int> open_assistant = tok.encode( glm ? "<|assistant|>" : "<|im_start|>assistant\n", false );
 			std::vector<int> turn_end;
@@ -161,22 +198,60 @@ int main( int argc, char** argv ) {
 				long sn = 0;
 				for ( size_t off = 0; off + 1 < ids.size(); ) {
 					const bool scoring = off + 1 >= skip;
-					const size_t step = scoring ? static_cast<size_t>( pod::MAX_BATCH ) : static_cast<size_t>( chunk );
+					const size_t step = scoring ? static_cast<size_t>( score_rows ) : static_cast<size_t>( chunk );
 					size_t end = std::min( ids.size(), off + step );
 					if ( !scoring && end + 1 > skip ) end = skip - 1;
 					const int count = static_cast<int>( end - off );
 					mc.forward( ids.data() + off, pod::BatchRows::causal( count, static_cast<int>( off ), 0, scoring ? pod::BatchRows::LOGITS_ALL : pod::BatchRows::LOGITS_NONE ) );
 					if ( scoring ) {
+						std::vector<double> row_nl( count, 0.0 );
+#if defined( ENGINE_BACKEND_CUDA ) && ENGINE_BACKEND_CUDA == 1
+						// the rows' NLL on the device where the logits are (engine::modules::LogitRows)
+						{
+							static int* d_tgt = nullptr;
+							static float* d_nll = nullptr;
+							static int cap = 0;
+							if ( count > cap ) {
+								if ( d_tgt ) { backend::device_free( d_tgt ); backend::device_free( d_nll ); }
+								d_tgt = static_cast<int*>( backend::device_malloc( count * sizeof( int ) ) );
+								d_nll = static_cast<float*>( backend::device_malloc( count * sizeof( float ) ) );
+								cap = count;
+							}
+							std::vector<int> tgt( count );
+							for ( int r = 0; r < count; ++r ) tgt[r] = off + r + 1 < ids.size() && in_assistant[off + r + 1] ? ids[off + r + 1] : -1;
+							backend::stream_t ls = nullptr;
+							const backend::half_t* dl = mc.device_logits( count, &ls );
+							backend::memcpy_async( d_tgt, tgt.data(), count * sizeof( int ), backend::Copy::H2D, ls );
+							engine::modules::LogitRows::score( dl, count, V, d_tgt, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr, d_nll, nullptr, nullptr,
+								ls );
+							std::vector<float> h( count );
+							backend::memcpy_async( h.data(), d_nll, count * sizeof( float ), backend::Copy::D2H, ls );
+							backend::stream_sync( ls );
+							for ( int r = 0; r < count; ++r ) row_nl[r] = h[r];
+						}
+#else
 						mc.read_logits( count, logits.data() );
-						for ( int r = 0; r < count && off + r + 1 < ids.size(); ++r ) {
+						// the rows' softmax over the vocabulary in parallel over the process's cores, summed in row order
+						auto score_row = [&]( int r ) {
+							if ( off + r + 1 >= ids.size() || !in_assistant[off + r + 1] ) return;
 							const backend::half_t* l = logits.data() + static_cast<size_t>( r ) * V;
 							float mx = -1e30f;
 							for ( int v = 0; v < V; ++v ) mx = std::fmax( mx, backend::to_float( l[v] ) );
 							double sum = 0.0;
 							for ( int v = 0; v < V; ++v ) sum += std::exp( static_cast<double>( backend::to_float( l[v] ) - mx ) );
-							if ( !in_assistant[off + r + 1] ) continue;
-							st += std::log( sum ) + mx - backend::to_float( l[ids[off + r + 1]] );
+							row_nl[r] = std::log( sum ) + mx - backend::to_float( l[ids[off + r + 1]] );
+						};
+						const int nw = std::max( 1, std::min( count, 16 ) );
+						std::vector<std::thread> th;
+						for ( int w = 1; w < nw; ++w ) th.emplace_back( [&, w] { for ( int r = w; r < count; r += nw ) score_row( r ); } );
+						for ( int r = 0; r < count; r += nw ) score_row( r );
+						for ( auto& t : th ) t.join();
+#endif
+						for ( int r = 0; r < count; ++r ) {
+							if ( off + r + 1 >= ids.size() || !in_assistant[off + r + 1] ) continue;
+							st += row_nl[r];
 							++sn;
+							sess_bins.add( static_cast<int>( off ) + r, row_nl[r] );
 						}
 					}
 					off = end;
@@ -186,6 +261,7 @@ int main( int argc, char** argv ) {
 				std::printf( "[*] session %zu: %zu tokens, %ld scored, NLL %.4f\n", si, ids.size(), sn, sn ? st / sn : 0.0 );
 			}
 			std::printf( "[*] %ld predicted tokens in %zu sessions (assistant turns only, after a prefix of %zu tokens): mean NLL %.4f, perplexity %.3f\n", n, all_ids.size(), skip, total / std::max( n, 1L ), std::exp( total / std::max( n, 1L ) ) );
+			sess_bins.print( "NLL" );
 			mc.shutdown();
 			return 0;
 		}
@@ -410,6 +486,9 @@ int main( int argc, char** argv ) {
 	}
 	double kl_sum = 0.0;
 	size_t kl_n = 0;
+	PosBins nll_bins, kl_bins;
+	nll_bins.init( bin_edges );
+	kl_bins.init( bin_edges );
 	std::vector<float> nll;
 	nll.reserve( n_tokens );
 	double total = 0.0;
@@ -435,6 +514,55 @@ int main( int argc, char** argv ) {
 		if ( sched_getaffinity( 0, sizeof( cs ), &cs ) == 0 ) workers = CPU_COUNT( &cs );
 		workers = std::max( 1, std::min( { workers, chunk, 16 } ) );
 	}
+#if defined( ENGINE_BACKEND_CUDA ) && ENGINE_BACKEND_CUDA == 1
+	// The rows' statistics on the device where the logits are (engine::modules::LogitRows): only they come back to the host
+	const size_t kmax = static_cast<size_t>( std::max( tf ? topk : 0, kt_k ) );
+	auto dev = [&]( size_t bytes ) { return backend::device_malloc( std::max<size_t>( bytes, 16 ) ); };
+	int *d_tgt = static_cast<int*>( dev( chunk * sizeof( int ) ) ), *d_ids = static_cast<int*>( dev( chunk * kmax * sizeof( int ) ) );
+	int *d_top = static_cast<int*>( dev( chunk * sizeof( int ) ) ), *d_tids = static_cast<int*>( dev( chunk * kmax * sizeof( int ) ) );
+	float *d_p = static_cast<float*>( dev( chunk * kmax * sizeof( float ) ) ), *d_tail = static_cast<float*>( dev( chunk * sizeof( float ) ) );
+	float *d_tp = static_cast<float*>( dev( chunk * kmax * sizeof( float ) ) ), *d_ttail = static_cast<float*>( dev( chunk * sizeof( float ) ) );
+	float *d_nll = static_cast<float*>( dev( chunk * sizeof( float ) ) ), *d_kl = static_cast<float*>( dev( chunk * sizeof( float ) ) );
+	std::vector<int> h_tgt( chunk ), h_ids( chunk * kmax ), h_top( chunk );
+	std::vector<float> h_p( chunk * kmax ), h_tail( chunk ), h_nll( chunk ), h_kl( chunk );
+	auto device_rows = [&]( int count, int off ) {
+		backend::stream_t ls = nullptr;
+		const backend::half_t* dl = mc.device_logits( count, &ls );
+		for ( int r = 0; r < count; ++r ) h_tgt[r] = off + r + 1 < n_tokens ? ids[off + r + 1] : -1;
+		backend::memcpy_async( d_tgt, h_tgt.data(), count * sizeof( int ), backend::Copy::H2D, ls );
+		if ( kt_k > 0 ) {
+			const size_t o = static_cast<size_t>( off ) * kt_k;
+			backend::memcpy_async( d_tids, kt_ids.data() + o, count * kt_k * sizeof( int ), backend::Copy::H2D, ls );
+			backend::memcpy_async( d_tp, kt_p.data() + o, count * kt_k * sizeof( float ), backend::Copy::H2D, ls );
+			backend::memcpy_async( d_ttail, kt_tail.data() + off, count * sizeof( float ), backend::Copy::H2D, ls );
+		}
+		const int k = tf ? topk : 0;
+		engine::modules::LogitRows::score( dl, count, V, d_tgt, k, d_ids, d_p, d_tail, kt_k > 0 ? d_tids : nullptr, d_tp, d_ttail, kt_k, nullptr, d_nll, d_top,
+			kt_k > 0 ? d_kl : nullptr, ls );
+		backend::memcpy_async( h_nll.data(), d_nll, count * sizeof( float ), backend::Copy::D2H, ls );
+		backend::memcpy_async( h_top.data(), d_top, count * sizeof( int ), backend::Copy::D2H, ls );
+		if ( k > 0 ) {
+			backend::memcpy_async( h_ids.data(), d_ids, count * k * sizeof( int ), backend::Copy::D2H, ls );
+			backend::memcpy_async( h_p.data(), d_p, count * k * sizeof( float ), backend::Copy::D2H, ls );
+			backend::memcpy_async( h_tail.data(), d_tail, count * sizeof( float ), backend::Copy::D2H, ls );
+		}
+		if ( kt_k > 0 ) backend::memcpy_async( h_kl.data(), d_kl, count * sizeof( float ), backend::Copy::D2H, ls );
+		backend::stream_sync( ls );
+		for ( int r = 0; r < count; ++r ) {
+			RowOut& o = outs[r];
+			o.top = h_top[r];
+			if ( k > 0 ) {
+				std::copy( h_ids.begin() + static_cast<size_t>( r ) * k, h_ids.begin() + static_cast<size_t>( r + 1 ) * k, o.ids.begin() );
+				std::copy( h_p.begin() + static_cast<size_t>( r ) * k, h_p.begin() + static_cast<size_t>( r + 1 ) * k, o.p.begin() );
+				o.tail = h_tail[r];
+			}
+			o.has_kl = kt_k > 0 && off + r >= kl_from;
+			o.kl = h_kl[r];
+			o.has_nl = off + r + 1 < n_tokens;
+			o.nl = h_nll[r];
+		}
+	};
+#endif
 	std::vector<std::vector<float>> w_all( workers, std::vector<float>( V ) );
 	std::vector<std::vector<int>> w_order( tf ? workers : 0, std::vector<int>( V ) );
 	auto row_work = [&]( int w, int r, int off ) {
@@ -501,6 +629,9 @@ int main( int argc, char** argv ) {
 			if ( c >= 1 ) mc.mtp_step( 0, pos, c, ids.data() + off + 1, 0, 0, false );
 		}
 		if ( calibrate ) { off += count; continue; }   // forward only: ENGINE_HESSIAN_DIR collects its statistics in the layers
+#if defined( ENGINE_BACKEND_CUDA ) && ENGINE_BACKEND_CUDA == 1
+		device_rows( count, off );
+#else
 		mc.read_logits( count, logits.data() );
 		{
 			const int nw = std::min( workers, count );
@@ -509,6 +640,7 @@ int main( int argc, char** argv ) {
 			for ( int r = 0; r < count; r += nw ) row_work( 0, r, off );
 			for ( auto& t : th ) t.join();
 		}
+#endif
 		for ( int r = 0; r < count; ++r ) {
 			const RowOut& o = outs[r];
 			if ( tf ) {
@@ -519,6 +651,7 @@ int main( int argc, char** argv ) {
 			if ( o.has_kl ) {
 				kl_sum += o.kl;
 				++kl_n;
+				kl_bins.add( pos + r, o.kl );
 			}
 			if ( !o.has_nl ) continue;
 			if ( show_miss > 0 && o.nl > 10.0f && static_cast<int>( nll.size() ) % 25 == 0 ) {   // every 25th position of the badly predicted ones: the target and the model's top guess
@@ -528,6 +661,7 @@ int main( int argc, char** argv ) {
 			}
 			nll.push_back( o.nl );
 			total += o.nl;
+			nll_bins.add( pos + r, o.nl );
 		}
 		off += count;
 	}
@@ -536,6 +670,8 @@ int main( int argc, char** argv ) {
 	const double mean = total / nll.size();
 	std::printf( "[*] %zu predicted tokens: mean NLL %.4f, perplexity %.3f\n", nll.size(), mean, std::exp( mean ) );
 	if ( kl_n > 0 ) std::printf( "[*] KL( teacher || model ) over %zu positions: %.6f per token\n", kl_n, kl_sum / kl_n );
+	nll_bins.print( "NLL" );
+	if ( kl_n > 0 ) kl_bins.print( "KL" );
 	if ( !nll_out.empty() ) {
 		if ( FILE* f = std::fopen( nll_out.c_str(), "wb" ) ) {
 			std::fwrite( nll.data(), sizeof( float ), nll.size(), f );

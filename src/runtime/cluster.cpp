@@ -659,6 +659,19 @@ void ModelCluster::read_logits( int rows, backend::half_t* host_dst ) {
 	backend::stream_sync( streams_[0] );
 }
 
+const backend::half_t* ModelCluster::device_logits( int rows, backend::stream_t* stream ) {
+	backend::set_device( 0 );
+	const backend::half_t* peer_shards[ENGINE_NUM_GPUS] = { nullptr };
+	int peer_cols = 0;
+	for ( int d = 0; d < tp_; ++d ) {
+		peer_shards[d] = models_[d]->shard_logits_ptr();
+		peer_cols = models_[d]->shard_logits_cols();
+	}
+	const pod::TensorView& full = models_[0]->gather_logits( rows, peer_shards, peer_cols, streams_[0] );
+	*stream = streams_[0];
+	return static_cast<const backend::half_t*>( full.data );
+}
+
 int ModelCluster::sample_one() {
 	int tok = -1;
 	sample( &tok, 1 );
