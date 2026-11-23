@@ -222,7 +222,11 @@ namespace {
 template <typename Part>
 float part_value( const Part& p, int r, int c ) {
 	if ( !p.fp8 ) return bf16_or_fp16_to_float( p.w + ( static_cast<size_t>( r ) * p.K + c ) * 2, p.bf16 );
-	return e4m3_to_float( p.w[static_cast<size_t>( r ) * p.K + c] ) * bf16_or_fp16_to_float( p.sc + ( static_cast<size_t>( r / 128 ) * p.sK + c / 128 ) * 2, true );
+	const size_t si = static_cast<size_t>( r / 128 ) * p.sK + c / 128;
+	float d;
+	if ( p.sc32 ) std::memcpy( &d, p.sc + si * 4, 4 );
+	else d = bf16_or_fp16_to_float( p.sc + si * 2, true );
+	return e4m3_to_float( p.w[static_cast<size_t>( r ) * p.K + c] ) * d;
 }
 
 }  // namespace
@@ -238,8 +242,8 @@ pod::LinearWeight SafeTensorsRepo::quantize_nvfp4_concat(
 	pod::MemoryArena& arena,
 	backend::stream_t stream
 ) {
-	// A source is BF16 / FP16, or FP8 E4M3 with 128 x 128 block scales (<base>.weight_scale_inv, BF16, the multiplier of the dequantized block)
-	struct Part { const uint8_t* w; bool bf16; int N, K; bool fp8; const uint8_t* sc; int sK; };
+	// A source is BF16 / FP16, or FP8 E4M3 with 128 x 128 block scales (<base>.weight_scale_inv, BF16 or F32, the multiplier of the dequantized block)
+	struct Part { const uint8_t* w; bool bf16; int N, K; bool fp8; const uint8_t* sc; int sK; bool sc32; };
 	std::vector<Part> src_parts( parts );
 	char name[300];
 	float amax = 0.0f;
@@ -248,14 +252,15 @@ pod::LinearWeight SafeTensorsRepo::quantize_nvfp4_concat(
 		const auto* mp = find( name );
 		if ( !mp || mp->ndim != 2 ) return pod::LinearWeight{};
 		std::snprintf( name, sizeof( name ), "%s.weight_scale_inv", base_names[i] );
-		const bool fp8 = mp->dtype == pod::DType::UINT8 && find( name ) != nullptr;
+		const pod::SafeTensorMeta* sm = find( name );
+		const bool fp8 = mp->dtype == pod::DType::UINT8 && sm != nullptr;
 		if ( !fp8 && mp->dtype != pod::DType::BF16 && mp->dtype != pod::DType::FP16 ) return pod::LinearWeight{};
 		const uint8_t* sc = fp8 ? static_cast<const uint8_t*>( cpu_data( name ) ) : nullptr;
 		std::snprintf( name, sizeof( name ), "%s.weight", base_names[i] );
 		const uint8_t* w = static_cast<const uint8_t*>( cpu_data( name ) );
 		if ( !w || ( fp8 && !sc ) ) return pod::LinearWeight{};
 		ENGINE_ASSERT( !fp8 || ( mp->shape[0] % 128 == 0 && mp->shape[1] % 128 == 0 ), "quantize_nvfp4: FP8 sources need 128-multiple dimensions" );
-		src_parts[i] = { w, mp->dtype == pod::DType::BF16, mp->shape[0], mp->shape[1], fp8, sc, mp->shape[1] / 128 };
+		src_parts[i] = { w, mp->dtype == pod::DType::BF16, mp->shape[0], mp->shape[1], fp8, sc, mp->shape[1] / 128, fp8 && sm->dtype == pod::DType::FP32 };
 		ENGINE_ASSERT( src_parts[i].K == src_parts[0].K && k0 % 16 == 0 && kcount % 64 == 0 && k0 + kcount <= src_parts[i].K, "quantize_nvfp4: bad K range" );
 		ENGINE_ASSERT( n_begin[i] >= 0 && n_begin[i] + n_count[i] <= src_parts[i].N, "quantize_nvfp4: bad N range" );
 		// Global scale from the whole tensors (so every rank's slice of one matrix shares it): the largest block scale maps to the E4M3 maximum

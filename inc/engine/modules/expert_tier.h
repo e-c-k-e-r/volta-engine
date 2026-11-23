@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <algorithm>
 #include <array>
 #include <vector>
 
@@ -32,6 +33,7 @@ struct ExpertTier {
 		std::vector<int> slot_of;            // expert -> slot, -1 when cold
 		std::vector<int> owner;              // slot -> expert
 		std::vector<uint8_t*> host;          // expert -> its pinned buffer when cold
+		std::vector<uint8_t> streamed;       // expert_stream: expert -> 1 when it is cold and read into the ring before the layer runs (else kept in RAM)
 		std::vector<uint64_t> score;         // decayed route counts
 		std::vector<uint64_t> total;         // route counts since the first run (saved to / seeded from expert_heat_file)
 		struct Src { int fd = -1; size_t off = 0, bytes = 0; };
@@ -50,6 +52,7 @@ struct ExpertTier {
 	std::vector<std::array<size_t, 3>> layer_bytes;   // per layer, when start() was given them (empty: every layer is part_bytes)
 	std::vector<Layer> layers;
 	uint8_t* ring = nullptr;                 // expert_stream: the one pinned buffer every layer's cold experts are read into before the layer runs
+	int host_keep = 0;                       // expert_stream: cold experts per layer kept in pinned host memory instead (expert_stream_host_gib)
 	uint64_t swaps = 0, window_routes = 0, window_hits = 0;
 	int max_swaps = -1;                      // per layer per rebalance; <0 = derived from the byte budget expert_swap_mib
 	std::string heat_path;                   // expert_heat_file of this rank (empty: no persistence)
@@ -76,7 +79,7 @@ struct ExpertTier {
 	static double resident_fraction();
 
 	bool active() const { return resident < experts; }
-	size_t cold_bytes_per_layer() const { return static_cast<size_t>( experts - resident ) * slot_bytes; }
+	size_t cold_bytes_per_layer() const { return static_cast<size_t>( std::max( 0, experts - resident - host_keep ) ) * slot_bytes; }
 
 	// Sizes the tier for `experts` local experts per layer and the byte sizes of one expert's gate / up / down codes
 	void configure( int experts_per_layer, double fraction, const size_t bytes[3], const std::string& heat_file = std::string() );

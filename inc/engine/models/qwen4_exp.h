@@ -20,7 +20,7 @@
 
 namespace engine::models {
 
-// Qwen3.8-Flash-Next (qwen4_exp), see docs/FLASH_NEXT.md. Defaults are the shipped checkpoint's; load_weights checks them against config.json.
+// Qwen3.8-Flash-Next (qwen4_exp), see docs/MODELS.md. Defaults are the shipped checkpoint's; load_weights checks them against config.json.
 struct Qwen4ExpConfig {
 	int num_layers = 48;
 	int hidden_size = 2560;

@@ -13,7 +13,7 @@
 #   glm_dflash      the same with the EXL3 DFlash2 drafter
 #   glm_dflash_fp16 the same with the FP16 DFlash2 drafter
 #   glm_mtp         the same with the NVFP4 checkpoint's MTP head (layer 45, experts quantized to NVFP4 at load), depth 7, no drafter
-#   glm_256k        GLM at 256K, 2 slots: fp8 latent cache, 85% of the experts resident, drafter (docs/GETTING_STARTED.md)
+#   glm_256k        GLM at 256K, 2 slots: fp8 latent cache, 85% of the experts resident, drafter (docs/MODELS.md)
 #   qwen_mtp        Qwen3.8-27B EXL3 + its own MTP head
 #   flash_mtp7      Flash-Next EXL3 4.0 bpw + NVFP4 experts / dense groups, MTP depth 7 (default)
 #   flash_mtp4      the same at MTP depth 4 (their contract: 5-row verify)

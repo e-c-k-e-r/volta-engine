@@ -4,7 +4,7 @@
 
 namespace engine::modules {
 
-// Qwen4Exp gated residual over fp32 streams x [rows, hc, hidden] (see docs/FLASH_NEXT.md):
+// Qwen4Exp gated residual over fp32 streams x [rows, hc, hidden] (see docs/MODELS.md):
 //   normed = x * rsqrt(mean_d(x^2) + eps) * (1 + norm_w)            per stream
 //   t      = silu(normed.flat @ down^T / hc)                         [rows, rank]
 //   mixed  = mean_s( sigmoid(t @ up^T) * normed )                    [rows, hidden] fp16, the sublayer input

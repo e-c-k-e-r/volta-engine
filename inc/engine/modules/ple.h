@@ -5,7 +5,7 @@
 
 namespace engine::modules {
 
-// Device side of the Qwen4Exp n-gram embedding layer (PLE); see docs/FLASH_NEXT.md. All streams are fp32 [rows, hc, hidden].
+// Device side of the Qwen4Exp n-gram embedding layer (PLE); see docs/MODELS.md. All streams are fp32 [rows, hc, hidden].
 struct PLE {
 	static constexpr int RING = 16;   // per-slot ring of the last normed columns (conv state: (taps - 1) * dilation = 9 positions)
 

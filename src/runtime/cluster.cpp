@@ -495,6 +495,17 @@ int ModelCluster::span_safe_end( int slot, int from, int end ) const {
 	return end;
 }
 
+void ModelCluster::forward_window( const int* tokens, const pod::BatchRows* chunks, int n ) {
+	ENGINE_ASSERT( n >= 1 && n <= window_chunks() && mm_slots_ == 0, "ModelCluster::forward_window: window size, or a model with images" );
+	int rows = 0;
+	for ( int c = 0; c < n; ++c ) rows += chunks[c].count;
+	ForwardTimer timer{ rows };
+	pool_.run( [&]( int d ) {
+		models_[d]->forward_window( tokens, chunks, n, streams_[d] );
+		backend::stream_sync( streams_[d] );
+	} );
+}
+
 int ModelCluster::prefill( const int* tokens, int count, int slot, int chunk, Candidates* last_cands, int pos0 ) {
 	ENGINE_ASSERT( count >= 1, "ModelCluster::prefill: empty prompt" );
 	const int max_rows = metadata().max_rows;

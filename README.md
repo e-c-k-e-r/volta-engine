@@ -19,7 +19,7 @@ Accepts either OpenAI-formatted payloads via `/v1/chat/completions`, or the Anth
 
 A monitor page of possibly-useful runtime statistics are provided via `/monitor`.
 
-Additional details can be referenced via the verbose [docs/GETTING_STARTED.md](/docs/GETTING_STARTED.md).
+Additional details are in [docs/GETTING_STARTED.md](/docs/GETTING_STARTED.md) (building and running) and [docs/MODELS.md](/docs/MODELS.md) (per-model setup); [docs/README.md](/docs/README.md) indexes the rest.
 
 ## Why?
 
@@ -31,11 +31,29 @@ Most inference engines treat Volta (SM_70) as a second class citizen and fall ba
 * llama.cpp is a mixed bag, and forking it dooms it to never get rebased without headaches (and submitting it as a valid PR is a fools errand).
 * Strata targets one model (Qwen3.8-Flash-Next) really well, but neglects the specialized coverage for SM_70, and is geared towards lower end specs.
 
-### Features
+### Why not?
 
-*to-do: fill out later*
+This project was slopped up over a weekend. CUDA is NOT my expertise (Vulkan is).
 
-### Metrics
+I don't intend to turn this into an actual project beyond a side-hobby, as existing solutions should be servicable enough for most people's usecases (in other words, I don't indend to extend this as a competitive engine).
+
+A slim amount of [models](/src/models/) and weight formats (EXL3, NVFP4, GGUF) are supported, but extending them shouldn't be too much of a hassle.
+
+Supported, tested configurations are narrow, as it's limited to what I currently have on hand, so gaps in coverage may exist. On the other side, some values may end up hard-coded, or undocumented, that may only pertain to a specific system used during development.
+
+## Features
+
+* models: Qwen3.8-27B, GLM-5.3-Flash, Qwen3.8-Flash-Next, Gemma 4 31B and DeepSeek-V4.1-Flash, plus MiniMax-H3 video + audio generation
+* weight formats: EXL3 (stock or Volta tile order), NVFP4 and GGUF, and EXL3 checkpoints with NVFP4 experts or dense groups swapped in at load
+* serving: OpenAI and Anthropic APIs with reasoning and tool-call parsing, a prefix cache in pinned host RAM, up to 256K context, a `/monitor` page
+* speculative decoding: DFlash2 / DFlash drafters, the checkpoint's own MTP head, DeepSeek's DSpark drafter, or suffix matching on the request's own text
+* image input on every text model
+* two-tier expert residency for the MoE models (hot experts on the GPUs, the rest in pinned host RAM)
+* backends: CUDA (SM_70, SM_86, SM_89), ROCm (RDNA), CPU and Vulkan
+
+The full list, with the docs for each part, is in [docs/README.md](/docs/README.md).
+
+## Metrics
 
 Decode speed of one request through the streaming API on 4x V100-SXM2-32GB at 250 W, every expert on the GPUs (DeepSeek: 91% with its drafter), greedy, thinking off. Agent turns are replayed from a recorded Claude Code session (13-20K-token prompts); math and code are GSM8K and MBPP problems. Each model's best speculator for the kind of text:
 
@@ -51,16 +69,6 @@ Decode speed of one request through the streaming API on 4x V100-SXM2-32GB at 25
 Which speculator wins depends on the text: the checkpoint's MTP head on agent turns, which copy much of their input, and the DFlash2 drafter on math and code. Every configuration measured (GGUF, both EXL3 tile orders, each speculator and MTP depth), step latency, prefill and the method are in [docs/PERFORMANCE.md](/docs/PERFORMANCE.md); perplexity per configuration and the EXL3 bit widths are in [docs/QUANTIZATION.md](/docs/QUANTIZATION.md).
 
 A model's weight format largely decides its speed (NVFP4 decodes faster than EXL3 trellis at a similar size, and a smaller EXL3 quant faster than a bigger one), at the cost of perplexity.
-
-### Why not?
-
-This project was slopped up over a weekend. CUDA is NOT my expertise (Vulkan is).
-
-I don't intend to turn this into an actual project beyond a side-hobby, as existing solutions should be servicable enough for most people's usecases (in other words, I don't indend to extend this as a competitive engine).
-
-A slim amount of [models](/src/models/) and weight formats (EXL3, NVFP4) are supported, but extending them shouldn't be too much of a hassle.
-
-Supported, tested configurations are narrow, as it's limited to what I currently have on hand, so gaps in coverage may exist. On the other side, some values may end up hard-coded, or undocumented, that may only pertain to a specific system used during development.
 
 ## Notices
 

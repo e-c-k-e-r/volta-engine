@@ -28,6 +28,10 @@ public:
 	void speculate_joint( int n, const int* slots, const int* anchors, const int* poss, const SamplingParams* const* sps, Rng* const* rngs, SpecResult* out ) override;
 	void on_prefill_chunk( int slot, const int* tokens, int rows, int pos0 ) override;
 	void on_dense_row( int slot, int token, int pos, int row ) override;
+	// spec_suffix: a suffix match over the request's own text is verified in place of the head's chain for that round (the catch-up still runs, so
+	// the head's KV stays whole)
+	void offer_draft( int slot, const int* tokens, int n ) override;
+	bool takes_offered_draft() const override { return true; }
 	bool needs_taps() const override { return false; }
 	void step_stats( int* attempts, int* hits ) const override;
 
@@ -43,6 +47,8 @@ private:
 		int pend_pos = 0;    // position of the first pending row
 		int pend_n = 0;      // pending rows (hidden kept in the model); 0 = none (cold start or after a restore)
 		int pend_tok[8] = {};   // tokens following pending rows 0 .. pend_n - 2
+		int offer_n = 0;        // offered draft for the next round (offer_draft), 0 = none
+		int offer_tok[models::kDraftM] = {};
 	};
 	SlotState st_[kMaxSlots];
 	int depth_ = 3;

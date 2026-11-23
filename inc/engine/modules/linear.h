@@ -14,7 +14,7 @@ enum class QuantType : uint8_t {
 	FP16,
 	TRELLIS,
 	NVFP4,
-	FP8,     // the original block-scaled weight, applied by DSV4::linear_fp8 (DeepSeek-V4.1 SAGE packs): w0 FP8 E4M3 [n, k], w1 E8M0 scales [n / 32, k / 32]
+	FP8,     // the original block-scaled weight: w0 FP8 E4M3 [n, k] and w1 E8M0 scales [n / 32, k / 32] (DeepSeek-V4.1 SAGE packs, DSV4::linear_fp8), or F32 scales [n / 128, k / 128] (DeepSeek-V3-style checkpoints: FP8MoE experts)
 	GGUF     // a GGUF block type as stored in the file: w0 = n rows of k / elems blocks (bytes), gguf_type the block type, k and n in gguf_k / gguf_n
 };
 

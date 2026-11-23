@@ -1,8 +1,8 @@
 // GGUF linear on CUDA. Up to kGemvRows rows (decode, verify blocks): the activations quantized to q8_1, then one GEMV kernel per block
 // type built on llama.cpp's vec_dot functions (ggml/vecdotq.cuh). Up to kTileRows rows: every 256-value span of a tile of weight rows is
 // decoded once into shared memory (llama.cpp's own block decoders, ggml/dequantize.cuh, or a vectorized one for Q4_K) and multiplied
-// with all rows on the tensor cores. More rows (prefill chunks): the weight dequantized to FP16 by llama.cpp's converters (ggml/convert.cu) and one cuBLAS
-// GEMM. The ggml files are vendored unchanged.
+// with all rows on the tensor cores. More rows (prefill chunks): the weight dequantized to FP16 by llama.cpp's converters (ggml/convert.cu) and one tensor-core
+// GEMM (Gemm::tn). The ggml files are vendored unchanged.
 #include "engine/core/scratch.h"
 #include "engine/modules/gguf.h"
 #include "engine/core/batch.h"

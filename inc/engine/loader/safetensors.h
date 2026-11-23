@@ -103,8 +103,24 @@ public:
 	pod::TensorView shared_host_bf16( const char* name, backend::stream_t stream = nullptr );
 	// A [rows, cols] tensor converted to BF16 into dst (rows * cols values; BF16, FP16, FP32 or GGUF blocks); false when it is missing
 	bool copy_host_bf16( const char* name, uint16_t* dst, size_t elems, backend::stream_t stream = nullptr );
-	// Bytes of the codes of `base_name`: its trellis, or the blocks of a GGUF weight (0 when it is neither)
+	// Bytes of the codes of `base_name`: its trellis, the blocks of a GGUF weight, or the bytes of an FP8 block-scaled weight (0 when it is none)
 	size_t trellis_bytes( const char* base_name ) const;
+	// An FP8 E4M3 weight with 128 x 128 block scales (DeepSeek-V3-style checkpoints, GLM-5.3-Flash): `<base_name>.weight` [n, k] E4M3 beside
+	// `<base_name>.weight_scale_inv` [n / 128, k / 128] (F32 or BF16, the multiplier of the decoded value). The readers that convert (load,
+	// load_slice, load_grouped_slice and the dense fallbacks) dequantize it; load_fp8_slice keeps it as it is stored
+	bool fp8_block_weight( const char* base_name ) const;
+	// Such a weight as QuantType::FP8 (codes tagged (k, n) as the FP16 form, F32 scales [n / 128, k / 128]): split_n takes this rank's output
+	// rows, otherwise its inputs (whole 128-wide blocks either way). The codes go to code_arena when given (an expert tier slot; a streamed cold
+	// one is allocated and left unwritten), the scales to `arena`
+	pod::LinearWeight load_fp8_slice(
+		const char* base_name,
+		pod::MemoryArena& arena,
+		bool split_n,
+		int rank,
+		int parts,
+		backend::stream_t stream = nullptr,
+		pod::MemoryArena* code_arena = nullptr
+	);
 	// Where a tensor's bytes are in its shard file (an open descriptor, absolute offset), for reads that bypass the mmap
 	bool file_ref( const char* tensor_name, int* fd, size_t* offset, size_t* bytes ) const;
 	// expert_synth=2 (timing only): an expert linear that is not in the checkpoint, generated with the shape and bit width the
@@ -331,6 +347,14 @@ private:
 	// (pad_rows zero rows: an LM head padded to its shard width); the blocks go to code_arena when given (an expert tier slot)
 	pod::LinearWeight gguf_linear( int shard, const pod::SafeTensorMeta* meta, pod::MemoryArena& arena, const std::vector<std::pair<int, int>>& rows,
 		const std::vector<std::pair<int, int>>& cols, int pad_rows, backend::stream_t stream, pod::MemoryArena* code_arena = nullptr );
+
+	// The FP8 block-scaled tensor `name` (a `.weight` of fp8_block_weight) dequantized to FP32 in `hold`, whose meta the converting readers take
+	// instead of the file's for the length of the call; any other tensor's meta is returned as it is
+	struct FloatView {
+		pod::SafeTensorMeta meta{};
+		std::vector<float> values;
+	};
+	const pod::SafeTensorMeta* fp8_float_view( const char* name, const pod::SafeTensorMeta* meta, FloatView& hold ) const;
 
 	static constexpr int MAX_SHARDS = 128;
 	pod::SafeTensorsFile shards_[MAX_SHARDS];

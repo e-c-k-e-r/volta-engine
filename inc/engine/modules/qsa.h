@@ -5,7 +5,7 @@
 
 namespace engine::modules {
 
-// QSA indexer of Qwen3.8-Flash-Next (reference: exllamav3 QSAIndexer; docs/FLASH_NEXT.md). Like the GLM DSA indexer it scores every
+// QSA indexer of Qwen3.8-Flash-Next (reference: exllamav3 QSAIndexer; docs/MODELS.md). Like the GLM DSA indexer it scores every
 // complete pool of POOL tokens and keeps the best SEL_POOLS pools plus the incomplete tail; selection and expansion to token lists reuse
 // DSA::select (same pool size, budget and list width). What differs:
 //   per token : [q (4 heads x 128) | k (128)] = index_qk_proj x ; q = rmsnorm(q) * (1 + w_q), roped on the first rot_dim dims at the row's

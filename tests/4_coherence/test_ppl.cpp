@@ -20,6 +20,7 @@
 #include "engine/loader/tokenizer.h"
 #include "engine/backend/numeric.h"
 #include "engine/modules/logit_rows.h"
+#include "engine/runtime/options.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -98,9 +99,9 @@ int main( int argc, char** argv ) {
 	// of p + 1), so ENGINE_HESSIAN_DIR also collects the head's sites (layers 48 and 49 of the file names); the head keeps its own KV like in serving
 	const bool mtp_calib = calibrate && flash && std::getenv( "ENGINE_CALIB_MTP" ) != nullptr;
 	if ( mtp_calib ) setenv( "ENGINE_SPECULATOR", "mtp", 1 );
-	if ( !calibrate && prompts_dir.empty() && chunk > pod::MAX_BATCH && !flash ) {
-		// (Flash-Next gathers the logits of any chunk)
-		std::printf( "[test_ppl] chunk %d clamped to %d: the gathered logits hold a decode batch (--calibrate reads none and takes any chunk)\n", chunk, pod::MAX_BATCH );
+	if ( !calibrate && prompts_dir.empty() && chunk > pod::MAX_BATCH && !flash && !( glm && engine::runtime::options().glm_logit_rows >= chunk ) ) {
+		// (Flash-Next gathers the logits of any chunk, GLM those of glm_logit_rows rows)
+		std::printf( "[test_ppl] chunk %d clamped to %d: the gathered logits hold a decode batch (--calibrate reads none and takes any chunk; GLM: set glm_logit_rows)\n", chunk, pod::MAX_BATCH );
 		chunk = pod::MAX_BATCH;
 	}
 	const char* model_dir = glm ? test::GLM_DIR : ( flash ? test::FLASH_DIR : test::QWEN_DIR );
@@ -453,7 +454,12 @@ int main( int argc, char** argv ) {
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	const int V = mc.metadata().vocab_size;
 	mc.reset_slot( 0 );
-	std::vector<backend::half_t> logits( static_cast<size_t>( chunk ) * V );
+	// GLM with a prefill window and glm_logit_rows for it: several chunks per forward, layer by layer (the routed experts of a layer read once
+	// per window: streamed experts are read from disk once per window instead of once per chunk), every row's logits kept
+	const int win = glm && chunk > pod::MAX_BATCH ? std::max( 1, std::min( { mc.window_chunks(), engine::runtime::options().glm_logit_rows / chunk, 16 } ) ) : 1;
+	const int span = win * chunk;   // rows of one forward at most
+	if ( win > 1 ) std::printf( "[test_ppl] %d chunks of %d rows per forward (prefill window)\n", win, chunk );
+	std::vector<backend::half_t> logits( static_cast<size_t>( span ) * V );
 	FILE* tf = nullptr;
 	if ( !topk_out.empty() ) {
 		tf = std::fopen( topk_out.c_str(), "wb" );
@@ -503,7 +509,7 @@ int main( int argc, char** argv ) {
 		bool has_kl = false, has_nl = false;
 		int top = 0;
 	};
-	std::vector<RowOut> outs( chunk );
+	std::vector<RowOut> outs( span );
 	for ( RowOut& o : outs ) {
 		o.ids.resize( topk );
 		o.p.resize( topk );
@@ -518,13 +524,13 @@ int main( int argc, char** argv ) {
 	// The rows' statistics on the device where the logits are (engine::modules::LogitRows): only they come back to the host
 	const size_t kmax = static_cast<size_t>( std::max( tf ? topk : 0, kt_k ) );
 	auto dev = [&]( size_t bytes ) { return backend::device_malloc( std::max<size_t>( bytes, 16 ) ); };
-	int *d_tgt = static_cast<int*>( dev( chunk * sizeof( int ) ) ), *d_ids = static_cast<int*>( dev( chunk * kmax * sizeof( int ) ) );
-	int *d_top = static_cast<int*>( dev( chunk * sizeof( int ) ) ), *d_tids = static_cast<int*>( dev( chunk * kmax * sizeof( int ) ) );
-	float *d_p = static_cast<float*>( dev( chunk * kmax * sizeof( float ) ) ), *d_tail = static_cast<float*>( dev( chunk * sizeof( float ) ) );
-	float *d_tp = static_cast<float*>( dev( chunk * kmax * sizeof( float ) ) ), *d_ttail = static_cast<float*>( dev( chunk * sizeof( float ) ) );
-	float *d_nll = static_cast<float*>( dev( chunk * sizeof( float ) ) ), *d_kl = static_cast<float*>( dev( chunk * sizeof( float ) ) );
-	std::vector<int> h_tgt( chunk ), h_ids( chunk * kmax ), h_top( chunk );
-	std::vector<float> h_p( chunk * kmax ), h_tail( chunk ), h_nll( chunk ), h_kl( chunk );
+	int *d_tgt = static_cast<int*>( dev( span * sizeof( int ) ) ), *d_ids = static_cast<int*>( dev( span * kmax * sizeof( int ) ) );
+	int *d_top = static_cast<int*>( dev( span * sizeof( int ) ) ), *d_tids = static_cast<int*>( dev( span * kmax * sizeof( int ) ) );
+	float *d_p = static_cast<float*>( dev( span * kmax * sizeof( float ) ) ), *d_tail = static_cast<float*>( dev( span * sizeof( float ) ) );
+	float *d_tp = static_cast<float*>( dev( span * kmax * sizeof( float ) ) ), *d_ttail = static_cast<float*>( dev( span * sizeof( float ) ) );
+	float *d_nll = static_cast<float*>( dev( span * sizeof( float ) ) ), *d_kl = static_cast<float*>( dev( span * sizeof( float ) ) );
+	std::vector<int> h_tgt( span ), h_ids( span * kmax ), h_top( span );
+	std::vector<float> h_p( span * kmax ), h_tail( span ), h_nll( span ), h_kl( span );
 	auto device_rows = [&]( int count, int off ) {
 		backend::stream_t ls = nullptr;
 		const backend::half_t* dl = mc.device_logits( count, &ls );
@@ -622,8 +628,21 @@ int main( int argc, char** argv ) {
 			continue;
 		}
 		if ( seq > 0 && pos == 0 ) mc.reset_slot( 0 );
-		const int count = std::min( { chunk, n_tokens - off, seq > 0 ? seq - pos : chunk } );
-		mc.forward( ids.data() + off, pod::BatchRows::causal( count, pos, 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );
+		int count = std::min( { win > 1 && !calibrate ? span : chunk, n_tokens - off, seq > 0 ? seq - pos : span } );
+		if ( count > chunk ) {
+			// a window of whole chunks above the decode sizes (a short tail runs on its own next)
+			pod::BatchRows w[16];
+			int n = 0, rows = 0;
+			while ( n < win && count - rows > pod::MAX_BATCH ) {
+				const int c = std::min( chunk, count - rows );
+				w[n++] = pod::BatchRows::causal( c, pos + rows, 0, pod::BatchRows::LOGITS_ALL );
+				rows += c;
+			}
+			count = rows;
+			if ( n >= 2 ) mc.forward_window( ids.data() + off, w, n );
+			else mc.forward( ids.data() + off, w[0] );
+		}
+		else mc.forward( ids.data() + off, pod::BatchRows::causal( count, pos, 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );
 		if ( mtp_calib ) {
 			const int c = std::min( { count, n_tokens - off - 1, seq > 0 ? seq - pos - 1 : count } );   // a row's last position has no next token inside the row
 			if ( c >= 1 ) mc.mtp_step( 0, pos, c, ids.data() + off + 1, 0, 0, false );

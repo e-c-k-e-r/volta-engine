@@ -58,6 +58,11 @@ public:
 	// LM head except for the final row of the final chunk.
 	// pos0: position of tokens[0] (a prefill that resumes from a restored prefix starts there)
 	int prefill( const int* tokens, int count, int slot, int chunk = 0, Candidates* last_cands = nullptr, int pos0 = 0 );
+	// A window of consecutive prefill chunks of one slot (each above MAX_BATCH rows, at most window_chunks() of them) run layer by layer, as prefill
+	// runs long prompts. GLM: when every chunk asks for LOGITS_ALL (a scoring pass), every row of the window has logits after it (device_logits /
+	// read_logits of the window's total rows; glm_logit_rows must hold them)
+	void forward_window( const int* tokens, const pod::BatchRows* chunks, int n );
+	int window_chunks() const { return models_[0]->window_chunks(); }
 	// Where a forward of the slot's positions [from, end) may stop when the model's images are bidirectional (a forward holds whole images):
 	// an end inside an image moves back to the image's start, or past its end when the image starts at `from`; otherwise `end`
 	int span_safe_end( int slot, int from, int end ) const;

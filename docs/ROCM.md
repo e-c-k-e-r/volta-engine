@@ -38,7 +38,10 @@ code for.
   exllamav3 does on ROCm. `MMA_SM80` is 1 on ROCm, so a `#elif defined(USE_ROCM)` after `#if MMA_SM80` is never compiled: a ROCm form
   goes in the `#if` itself (`#if MMA_SM80 && !defined(USE_ROCM)` for the CUDA one).
 
-Decode graphs work on ROCm (HIP graphs; the EXL3 GEMV is a plain launch) and are on by default. `ENGINE_DEBUG_NO_GRAPHS=1` runs eager.
+Decode graphs work on ROCm (HIP graphs; the EXL3 GEMV is a plain launch) and are on by default. `--set no_graphs=true` runs eager (the tests take
+`ENGINE_DEBUG_NO_GRAPHS=1`).
+
+GGUF weights take the CUDA GGUF kernels (`src/kernels/cuda/gguf`), which build as HIP with the rest and have no RDNA form; the figures below are EXL3 and NVFP4.
 
 ## Shared memory
 
@@ -73,7 +76,7 @@ sources include them under `USE_ROCM`.
 The GEMV (`src/kernels/rocm/trellis/exl3_gemv.cu`, after upstream exllamav3's RDNA GEMV) is a plain launch: the input and output
 Hadamard transforms are their own launches, and between them a kernel accumulates `v_dot2_f32_f16` straight from the trellis
 decoder's fragments (each lane quad owns two output columns), one block per 16 columns with its warps splitting K. The CUDA GEMV is
-one cooperative kernel on `mma.sync`, emulated on ROCm (under 1 tok/s on Qwen3.8-27B-exl3).
+one cooperative kernel on `mma.sync`, which ROCm would run on the emulation.
 
 The GEMM (`src/kernels/rocm/trellis/exl3_gemm.cu`) keeps the same structure (the Hadamard rotations are separate launches, one block per 16 output
 columns, the warps split K) and multiplies on the native wave32 WMMA. A warp decodes each 16 x 16 trellis tile once, stages it column-major in shared memory,
@@ -81,16 +84,17 @@ loads the B fragment from there (lane l holds column l & 15), and every 16-row b
 rotated rows. A warp decodes the next tile into a second buffer while the current one is multiplied and loads the next A fragments ahead; a block has 16 warps up
 to 32 rows and 8 at 64 rows (the fixed-order reduction needs their partial tiles in shared memory). The packed weight is read once, so the FP16 copy of the weight that dequantize + hipBLAS writes and re-reads (2.4 GB for the Qwen
 LM head) never exists. The warps' partial tiles are summed in a fixed order through shared memory, so a result does not depend on scheduling. It takes
-bit widths 1 to 8 and all codebooks, FP16 output, widths that are multiples of 128. `ENGINE_DEBUG_EXL3_GEMV_MAX_M` (default 4) and
-`ENGINE_DEBUG_EXL3_WMMA_MAX_M` (default 64; 0 sends everything above the GEMV to dequantize + hipBLAS) move the two boundaries. `test_prefill_linear` checks it
+bit widths 1 to 8 and all codebooks, FP16 output, widths that are multiples of 128. The debug options `exl3_gemv_max_m` (default 4) and
+`exl3_wmma_max_m` (default 64; 0 sends everything above the GEMV to dequantize + hipBLAS) move the two boundaries. `test_prefill_linear` checks it
 against the dequantized product on the Qwen per-rank and unsharded shapes at 3 to 6 bits for 5 to 64 rows.
 
 NVFP4 linears are routed by rows too: the dequantize + GEMM path writes and re-reads the whole weight as FP16 on every call, about 8x the
 packed bytes, so up to 16 rows they take a SIMT GEMV (`rocm_nvfp4_gemv`, skinny_kernels.cu)
 that decodes each lane's codes in registers and accumulates with `v_dot2_f32_f16`, reading the packed weight once. Above 16 rows (prefill chunks) a fused dequantize + GEMM on the native WMMA (`rocm_nvfp4_gemm_kernel`, 128 x 128 x 32 tiles) decodes the
-weight straight into shared memory. `ENGINE_DEBUG_NVFP4_HIPBLAS=1` takes dequantize + hipBLAS instead, whose FP16 scratch can move as it
-grows (which a captured graph cannot follow; decode graphs, at most 8 rows, never take that path). `ENGINE_DEBUG_MOE_GEMV=1` runs the
-expert-grouped EXL3 MoE on the v_dot2 GEMV instead of its WMMA kernels.
+weight straight into shared memory. `nvfp4_hipblas=true` takes dequantize + hipBLAS instead, whose FP16 scratch can move as it
+grows (which a captured graph cannot follow; decode graphs, at most 8 rows, never take that path). `moe_gemv=true` runs the
+expert-grouped EXL3 MoE on the v_dot2 GEMV instead of its WMMA kernels. These are debug options: `--set key=value` on the server, `ENGINE_DEBUG_<KEY>` for
+the tests.
 
 Attention with head_dim 256 (Qwen's full-attention layers) takes the WMMA kernel (`src/kernels/rocm/attn_wmma.cuh`) for prefill chunks and
 for rows of one slot (a verify block shares the K/V tiles across its rows). One decode row, or rows of distinct slots, take the decode kernel
@@ -104,8 +108,8 @@ A config's `tp_size` must not exceed the GPUs present (the files in configs/ are
 ## Cooperative launches
 
 The EXL3 GEMV's `grid.sync()` needs every block resident at once. On ROCm its grid is one block per CU rather than HIP's occupancy
-figure: a full-width projection at that figure hung a 7900 XTX in the first decode forward (the kernel walks its column tiles, so
-the grid size only changes how many each block takes). `test_trellis` runs a full-width GEMV for this.
+figure, which does not guarantee that (the kernel walks its column tiles, so the grid size only changes how many each block takes).
+`test_trellis` runs a full-width GEMV for this.
 
 ## Tests
 
@@ -131,7 +135,7 @@ One RX 7900 XTX (24 GB, 303 W cap, stock clocks), decode graphs on. Qwen3.8-27B 
 
 | | Plain token | 8 / 12 / 16-row verify | Prefill |
 |---|---|---|---|
-| NVFP4 (head quantized, `nvfp4_dense=head`; not re-run for this table) | 21.6 ms (46 tok/s) | 27 ms (8 rows) | 1123 tok/s |
+| NVFP4 (head quantized, `nvfp4_dense=head`) | 21.6 ms (46 tok/s) | 27 ms (8 rows) | 1123 tok/s |
 | EXL3 4.0 bpw, 8K context | 26.7 ms (37 tok/s) | 37.0 / 39.7 / 43.8 ms | 1089 tok/s |
 | EXL3 4.0 bpw, 32K context | 28.8 ms (35 tok/s) | 41.3 ms (8), 51.4 ms (16) | |
 
@@ -143,8 +147,5 @@ Served with `bench_serve.py` (one stream, 256 tokens, the contract sampling T = 
 | DFlash2, greedy | | 128, 150, 130, 89 tok/s | 0.65, 0.79, 0.69, 0.41 |
 | the checkpoint's MTP head | 158 tok/s | 114, 88, 89, 63 tok/s | 0.74, 0.56, 0.58, 0.46 |
 
-Qwen3.8-Flash-Next with 2 bpw experts (`expert_cache` 0.4, 8192-token window): a plain token 61.0 ms (16.4 tok/s), an 8-row verify block 380.6 ms, prefill 189 tok/s (4096 tokens, 512-row chunks). Served without speculation: 17 to 28 tok/s, 22 s to the first token for a 4K prompt and 40 s for an 8K one. The cold experts cross PCIe (x8) on every token and prefill chunk, which sets these figures; the kernel changes above do not move them (a plain token was 61.1 and 61.9 ms with and without them). The MTP head cannot be loaded from this checkpoint (the three `mtp.hyper_connection_mixer` tensors are not in it); `mtp_nvfp4` takes the head from the NVFP4 checkpoint, whose 124 GB of experts need about 66 GB of pinned host memory for the cold tier at `expert_cache` 0.4, more than this machine's 32 GB, so Flash-Next with MTP has not been measured here.
-
-* NVFP4 target with the DFlash2 EXL3 5.0 bpw drafter, natural 8K prompts (`tests/3_bench/bench_serve.py`): 129, 153, 145 and 75 tok/s, 37 ms per round (27 ms verify, 9.5 ms drafter).
-* The NVFP4 GEMVs read the packed weights at 80 to 90% of the 920 GB/s a plain read kernel reaches on this card; the prefill GEMM reaches 73 of the ~96 TFLOP/s the WMMA peaks at.
-* An EXL3 plain token at 8K context is about 1900 kernel launches: the GEMVs take about 20 ms of it, attention about 1 ms and the Hadamard rotations (two per linear) about 1 ms (rocprofv3 kernel trace of `bench_decode`). A verify block of 8 rows costs 1.4 times a token at 8K context (37 ms), 12 rows 39.7 ms and 16 rows 43.8 ms (`bench_decode` with `BENCH_VL=8,12,16`).
+Qwen3.8-Flash-Next with 2 bpw experts (`expert_cache` 0.4, 8192-token window): a plain token 61.0 ms (16.4 tok/s), an 8-row verify block 380.6 ms, prefill 189 tok/s (4096 tokens, 512-row chunks); served without speculation 17 to 28 tok/s. The cold experts are read over PCIe (x8) on every token and
+prefill chunk.

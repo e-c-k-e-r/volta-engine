@@ -203,6 +203,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/kernels/cuda/gguf/gguf_linear.cu
 	src/kernels/cuda/gemm/gemm_f16.cu
 	src/kernels/cuda/gguf/gguf_moe.cu
+	src/kernels/cuda/fp8/fp8_moe.cu
 	src/kernels/cuda/gguf/ggml/convert.cu
 	src/backend/cuda/modules/norm.cu
 	src/backend/cuda/modules/swiglu.cu
@@ -679,6 +680,9 @@ set_target_properties(test_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_B
 add_executable(test_gguf_linear tests/2_parity/test_gguf_linear.cpp)
 target_link_libraries(test_gguf_linear PRIVATE engine_kernels)
 set_target_properties(test_gguf_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_fp8_moe tests/2_parity/test_fp8_moe.cpp)
+target_link_libraries(test_fp8_moe PRIVATE engine_kernels)
+set_target_properties(test_fp8_moe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 # Test Norm & Elementwise Parity
 add_executable(test_norm tests/2_parity/test_norm.cpp)
@@ -726,6 +730,9 @@ set_target_properties(bench_gguf_shapes PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${P
 add_executable(bench_gguf_moe tests/3_bench/bench_gguf_moe.cpp)
 target_link_libraries(bench_gguf_moe PRIVATE engine_kernels)
 set_target_properties(bench_gguf_moe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(bench_fp8_moe tests/3_bench/bench_fp8_moe.cpp)
+target_link_libraries(bench_fp8_moe PRIVATE engine_kernels)
+set_target_properties(bench_fp8_moe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 add_executable(bench_decode tests/3_bench/bench_decode.cpp)
 target_link_libraries(bench_decode PRIVATE engine_kernels)
 set_target_properties(bench_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
@@ -954,7 +961,7 @@ if(NOT ENGINE_BACKEND STREQUAL "CPU")
 endif()
 include(${PROJECT_SOURCE_DIR}/cmake/ops_tests_linear.cmake OPTIONAL)
 include(${PROJECT_SOURCE_DIR}/cmake/ops_tests_attention.cmake OPTIONAL)
-# MiniMax-H3: parity tests, benches and the CLI (GPU configurations; on ROCm it builds but is not supported, see docs/GETTING_STARTED.md)
+# MiniMax-H3: parity tests, benches and the CLI (GPU configurations; on ROCm it builds but is not supported, see docs/ROCM.md)
 if(ENGINE_GPU)
 	set(H3_TOOLS
 		tests/3_bench/bench_h3_attn.cpp

@@ -114,6 +114,13 @@ void MtpRunner::on_dense_row( int slot, int token, int pos, int row ) {
 	S.pend_n = 1;
 }
 
+void MtpRunner::offer_draft( int slot, const int* tokens, int n ) {
+	if ( !owns( slot ) ) return;
+	SlotState& S = st_[slot];
+	S.offer_n = MIN( MAX( n, 0 ), models::kDraftM - 1 );
+	for ( int i = 0; i < S.offer_n; ++i ) S.offer_tok[i] = tokens[i];
+}
+
 SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_threshold, const SamplingParams* sp, Rng* rng ) {
 	( void ) depth_threshold;
 	ENGINE_ASSERT( owns( slot ), "MtpRunner::speculate: slot does not own the speculator" );
@@ -126,6 +133,8 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 	ENGINE_ASSERT( !sampled || rng != nullptr, "MtpRunner::speculate: sampling needs an Rng" );
 
 	int active = MIN( depth_, meta.max_seq_len - pos - 2 );
+	const int offered = MIN( S.offer_n, meta.max_seq_len - pos - 2 );
+	S.offer_n = 0;
 	if ( S.pend_n < 1 || S.pend_pos + S.pend_n != pos || active < 1 ) {
 		// No pending hidden to draft from (cold start, a restored prefix, or no room): one plain target step for the anchor, which
 		// leaves its hidden as the pending row of the next round
@@ -168,7 +177,14 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 	}
 	int cands[pod::MAX_BATCH];
 	auto t_catch = std::chrono::steady_clock::now();
-	if ( !mc.mtp_chain( slot, S.pend_pos, S.pend_n, toks, off + S.hist_base, pos, drafted, cands ) ) {
+	if ( offered >= 1 ) {
+		// an offered draft: the head only catches up over the pending rows (its KV of those positions), and the offer is verified as a chain would be
+		mc.mtp_step( slot, S.pend_pos, S.pend_n, toks, 2, off + S.hist_base, false );
+		for ( int i = 0; i < offered; ++i ) cands[i] = S.offer_tok[i];
+		drafted = offered;
+		t_catch = std::chrono::steady_clock::now();
+	}
+	else if ( !mc.mtp_chain( slot, S.pend_pos, S.pend_n, toks, off + S.hist_base, pos, drafted, cands ) ) {
 		mc.mtp_step( slot, S.pend_pos, S.pend_n, toks, 2, off + S.hist_base, true );
 		cands[0] = mc.sample_one();
 		t_catch = std::chrono::steady_clock::now();
@@ -201,7 +217,7 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 	const auto t_verify = std::chrono::steady_clock::now();
 	// 3. Acceptance (see DFlash2Runner::speculate)
 	for ( int k = 0; k < active; ++k ) {
-		++att_[k];
+		if ( offered < 1 ) ++att_[k];
 		if ( sampled ) {
 			bool acc = false;
 			const int tok = spec_step( cs[k], *sp, cands[k], *rng, &acc );
@@ -214,7 +230,7 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 			res.emitted[res.emitted_count++] = preds[k];
 			break;
 		}
-		++hit_[k];
+		if ( offered < 1 ) ++hit_[k];
 		res.emitted[res.emitted_count++] = cands[k];
 		res.accepted++;
 	}
@@ -222,9 +238,10 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 		res.emitted[res.emitted_count++] = sampled ? sample_token( cs[active], *sp, *rng ) : preds[active];
 	}
 
-	// Survival of draft step k given that the steps before it were accepted (observed only where it was reached)
+	// Survival of draft step k given that the steps before it were accepted (observed only where it was reached; the head's own chains only)
 	constexpr float kEma = 0.2f;
-	for ( int k = 0; k <= res.accepted && k < active; ++k ) cond_[k] = ( 1.0f - kEma ) * cond_[k] + kEma * ( k < res.accepted ? 1.0f : 0.0f );
+	if ( offered < 1 )
+		for ( int k = 0; k <= res.accepted && k < active; ++k ) cond_[k] = ( 1.0f - kEma ) * cond_[k] + kEma * ( k < res.accepted ? 1.0f : 0.0f );
 
 	// 4. Keep the committed rows' hidden for the next round's catch-up; repair the recurrent state when a draft was rejected
 	S.hist_base = kHalf - S.hist_base;
@@ -241,7 +258,7 @@ SpecResult MtpRunner::speculate( int slot, int anchor, int pos, float depth_thre
 		LOG_DEBUG( "[mtp] round: catch-up %.1f ms (%d rows), %d draft steps %.1f ms, verify %.1f ms, tail %.1f ms; accepted %d of %d\n", ms( t_round, t_catch ), catch_rows, active - 1,
 			ms( t_catch, t_draft ), ms( t_draft, t_verify ), ms( t_verify, t_end ), res.accepted, active );
 	}
-	sparse_round_end( sparse, &res, 1, std::chrono::duration<double, std::milli>( t_draft - t_catch ).count(), active - 1,
+	sparse_round_end( sparse, &res, 1, std::chrono::duration<double, std::milli>( t_draft - t_catch ).count(), offered >= 1 ? 0 : active - 1,
 		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_round ).count() );
 	return res;
 }
@@ -262,7 +279,7 @@ void MtpRunner::speculate_joint( int n, const int* slots, const int* anchors, co
 		ENGINE_ASSERT( owns( slots[i] ), "MtpRunner::speculate_joint: slot does not own the speculator" );
 		const SlotState& S = st_[slots[i]];
 		const int active = MIN( depth_, meta.max_seq_len - poss[i] - 2 );
-		if ( S.pend_n >= 1 && S.pend_pos + S.pend_n == poss[i] && active >= 1 ) {
+		if ( S.pend_n >= 1 && S.pend_pos + S.pend_n == poss[i] && active >= 1 && S.offer_n == 0 ) {   // (a slot with an offered draft runs on its own)
 			J[k++] = i;
 			catch_rows += S.pend_n;
 			depth = MIN( depth, active );

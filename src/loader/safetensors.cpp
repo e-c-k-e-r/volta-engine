@@ -9,6 +9,7 @@
 #include "engine/core/log.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
+#include "engine/quant/fp4_fp8.h"
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -687,6 +688,8 @@ pod::TensorView SafeTensorsRepo::load(
 		return pod::TensorView{};
 	}
 	meta = engine::loader::gguf_float_view( shards_[shard_idx], meta, stream );   // a GGUF block tensor read as floats: dequantized once
+	FloatView fp8_hold;
+	meta = fp8_float_view( name, meta, fp8_hold );   // an FP8 block-scaled weight read as floats
 
 	pod::DType out_dtype = target_dtype;
 	if ( target_dtype == pod::DType::AUTO ) {
@@ -740,6 +743,20 @@ pod::TensorView SafeTensorsRepo::load(
 		backend::memcpy_async( tv.data, h_fp16.data(), total_elems * sizeof( backend::half_t ), backend::Copy::Auto, stream );
 		backend::stream_sync( stream );
 	}
+	else if ( ( meta->dtype == pod::DType::BF16 || meta->dtype == pod::DType::FP16 ) && out_dtype == pod::DType::FP32 ) {
+		// the original GLM checkpoint's mHC mixers are BF16 where its conversions hold FP32
+		std::vector<float> h_f32( total_elems );
+		for ( size_t i = 0; i < total_elems; ++i ) {
+			const uint16_t v = static_cast<const uint16_t*>( src_cpu )[i];
+			if ( meta->dtype == pod::DType::BF16 ) {
+				const uint32_t u = static_cast<uint32_t>( v ) << 16;
+				std::memcpy( &h_f32[i], &u, sizeof( float ) );
+			}
+			else h_f32[i] = backend::to_float( static_cast<const backend::half_t*>( src_cpu )[i] );
+		}
+		backend::memcpy_async( tv.data, h_f32.data(), total_elems * sizeof( float ), backend::Copy::Auto, stream );
+		backend::stream_sync( stream );
+	}
 	else if ( ( meta->dtype == pod::DType::FP32 || meta->dtype == pod::DType::FP16 ) && out_dtype == pod::DType::BF16 ) {
 		// GGUF embeddings stored as F32 / F16, or dequantized from blocks: round to BF16 (nearest even)
 		std::vector<uint16_t> h_bf16( total_elems );
@@ -753,6 +770,11 @@ pod::TensorView SafeTensorsRepo::load(
 		backend::stream_sync( stream );
 	}
 	else {
+		// same-width types copied as they are (raw codes); a width change has no conversion here and would copy the wrong bytes
+		if ( get_dtype_size( out_dtype ) != get_dtype_size( meta->dtype ) ) {
+			LOG_ERROR( "[SafeTensorsRepo] %s: no conversion from its dtype to the one requested\n", name );
+			ENGINE_ASSERT( false, "SafeTensorsRepo::load: unsupported dtype conversion" );
+		}
 		backend::memcpy_async( tv.data, src_cpu, meta->size_bytes, backend::Copy::Auto, stream );
 		backend::stream_sync( stream );
 	}
@@ -779,6 +801,8 @@ pod::TensorView SafeTensorsRepo::load_slice(
 		return pod::TensorView{};
 	}
 	meta = engine::loader::gguf_float_view( shards_[shard_idx], meta, stream );
+	FloatView fp8_hold;
+	meta = fp8_float_view( name, meta, fp8_hold );
 
 	ENGINE_ASSERT( slice_dim >= 0 && slice_dim < meta->ndim, "Invalid slice_dim" );
 
@@ -1113,12 +1137,116 @@ size_t SafeTensorsRepo::trellis_bytes( const char* base_name ) const {
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
 	const pod::SafeTensorMeta* meta = find( name_buf );
 	if ( meta == nullptr ) {
-		// a GGUF weight: its blocks are the codes
+		// a GGUF weight: its blocks are the codes; an FP8 one: its bytes
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
 		meta = find( name_buf );
-		if ( meta == nullptr || meta->dtype != pod::DType::GGUF ) return 0;
+		if ( meta == nullptr || ( meta->dtype != pod::DType::GGUF && !fp8_block_weight( base_name ) ) ) return 0;
 	}
 	return static_cast<size_t>( meta->size_bytes );
+}
+
+namespace {
+
+// Element i of a block-scale tensor (F32 or BF16)
+float block_scale( const pod::SafeTensorMeta* m, const void* data, size_t i ) {
+	if ( m->dtype == pod::DType::FP32 ) return static_cast<const float*>( data )[i];
+	const uint32_t bits = static_cast<uint32_t>( static_cast<const uint16_t*>( data )[i] ) << 16;
+	float f;
+	std::memcpy( &f, &bits, 4 );
+	return f;
+}
+
+// The 256 E4M3 values
+const float* e4m3_table() {
+	static const std::array<float, 256> t = [] {
+		std::array<float, 256> v{};
+		for ( int b = 0; b < 256; ++b ) v[b] = engine::quant::e4m3_to_float( static_cast<unsigned>( b ) );
+		return v;
+	}();
+	return t.data();
+}
+
+} // namespace
+
+bool SafeTensorsRepo::fp8_block_weight( const char* base_name ) const {
+	char name_buf[512];
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
+	const pod::SafeTensorMeta* w = find( name_buf );
+	if ( w == nullptr || w->dtype != pod::DType::UINT8 || w->ndim != 2 ) return false;
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.weight_scale_inv", base_name );
+	const pod::SafeTensorMeta* s = find( name_buf );
+	return s != nullptr && s->ndim == 2 && ( s->dtype == pod::DType::FP32 || s->dtype == pod::DType::BF16 ) && s->shape[0] == ( w->shape[0] + 127 ) / 128 &&
+		s->shape[1] == ( w->shape[1] + 127 ) / 128;
+}
+
+const pod::SafeTensorMeta* SafeTensorsRepo::fp8_float_view( const char* name, const pod::SafeTensorMeta* meta, FloatView& hold ) const {
+	const size_t len = std::strlen( name );
+	if ( meta == nullptr || meta->dtype != pod::DType::UINT8 || len < 7 || std::strcmp( name + len - 7, ".weight" ) != 0 ) return meta;
+	const std::string base( name, len - 7 );
+	if ( !fp8_block_weight( base.c_str() ) ) return meta;
+	const std::string sname = base + ".weight_scale_inv";
+	const pod::SafeTensorMeta* sm = find( sname.c_str() );
+	const uint8_t* q = static_cast<const uint8_t*>( cpu_data( name ) );
+	const void* s = cpu_data( sname.c_str() );
+	ENGINE_ASSERT( q != nullptr && s != nullptr, "fp8_float_view: no CPU data for the weight or its scales" );
+	const size_t n = static_cast<size_t>( meta->shape[0] ), k = static_cast<size_t>( meta->shape[1] ), sk = static_cast<size_t>( sm->shape[1] );
+	const float* lut = e4m3_table();
+	hold.values.resize( n * k );
+	for ( size_t r = 0; r < n; ++r ) {
+		const uint8_t* qr = q + r * k;
+		float* out = hold.values.data() + r * k;
+		for ( size_t c0 = 0; c0 < k; c0 += 128 ) {
+			const float d = block_scale( sm, s, ( r / 128 ) * sk + c0 / 128 );
+			for ( size_t c = c0; c < std::min( k, c0 + 128 ); ++c ) out[c] = lut[qr[c]] * d;
+		}
+	}
+	hold.meta = *meta;
+	hold.meta.dtype = pod::DType::FP32;
+	hold.meta.size_bytes = n * k * sizeof( float );
+	hold.meta.host = hold.values.data();
+	return &hold.meta;
+}
+
+pod::LinearWeight SafeTensorsRepo::load_fp8_slice( const char* base_name, pod::MemoryArena& arena, bool split_n, int rank, int parts, backend::stream_t stream,
+	pod::MemoryArena* code_arena ) {
+	if ( !fp8_block_weight( base_name ) ) return pod::LinearWeight{};
+	char wname[512], sname[512];
+	std::snprintf( wname, sizeof( wname ), "%s.weight", base_name );
+	std::snprintf( sname, sizeof( sname ), "%s.weight_scale_inv", base_name );
+	int shard = -1;
+	const pod::SafeTensorMeta* wm = find( wname, &shard );
+	const pod::SafeTensorMeta* sm = find( sname );
+	const int n = wm->shape[0], k = wm->shape[1];
+	ENGINE_ASSERT( n % 128 == 0 && k % 128 == 0, "load_fp8_slice: the weight must be whole 128 x 128 blocks" );
+	const int nl = split_n ? n / parts : n, kl = split_n ? k : k / parts;
+	ENGINE_ASSERT( ( split_n ? n : k ) % ( parts * 128 ) == 0, "load_fp8_slice: a rank's slice must be whole 128-wide blocks" );
+	const int n0 = split_n ? rank * nl : 0, k0 = split_n ? 0 : rank * kl;
+	pod::MemoryArena& ca = code_arena ? *code_arena : arena;
+	void* codes = engine::core::arena_alloc( ca, static_cast<size_t>( nl ) * kl, 256 );
+	ENGINE_ASSERT( codes != nullptr, "load_fp8_slice: arena full" );
+	if ( !ca.stream_skip ) {
+		const uint8_t* src = static_cast<const uint8_t*>( safetensors_get_data_cpu( shards_[shard], wm ) );
+		ENGINE_ASSERT( src != nullptr, "load_fp8_slice: no CPU data for the weight" );
+		if ( kl == k ) backend::memcpy_async( codes, src + static_cast<size_t>( n0 ) * k, static_cast<size_t>( nl ) * k, backend::Copy::Auto, stream );
+		else {
+			std::vector<uint8_t> h( static_cast<size_t>( nl ) * kl );
+			for ( int r = 0; r < nl; ++r ) std::memcpy( h.data() + static_cast<size_t>( r ) * kl, src + static_cast<size_t>( r ) * k + k0, kl );
+			backend::memcpy_async( codes, h.data(), h.size(), backend::Copy::Auto, stream );
+		}
+		backend::stream_sync( stream );
+	}
+	const void* sdata = cpu_data( sname );
+	ENGINE_ASSERT( sdata != nullptr, "load_fp8_slice: no CPU data for the scales" );
+	const int sn = nl / 128, sk = kl / 128, sk_all = k / 128;
+	std::vector<float> hs( static_cast<size_t>( sn ) * sk );
+	for ( int i = 0; i < sn; ++i )
+		for ( int j = 0; j < sk; ++j ) hs[static_cast<size_t>( i ) * sk + j] = block_scale( sm, sdata, static_cast<size_t>( n0 / 128 + i ) * sk_all + k0 / 128 + j );
+	const int sshape[2] = { sn, sk };
+	pod::TensorView scales = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, sshape, 2 );
+	ENGINE_ASSERT( scales.data != nullptr, "load_fp8_slice: arena full" );
+	backend::memcpy_async( scales.data, hs.data(), hs.size() * sizeof( float ), backend::Copy::Auto, stream );
+	backend::stream_sync( stream );
+	return pod::LinearWeight::make_fp8( pod::make_tensor_2d( codes, pod::DType::UINT8, kl, nl ), scales );
 }
 
 
@@ -1349,8 +1477,10 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 	refuse_companions( base_name, "load_linear_slice" );
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
-	if ( find( name_buf ) == nullptr && tp_size > 1 ) {
-		// Unquantized checkpoint (the DFlash2 drafter's own release): a dense [n, k] weight. Trellis slice_dim 1 splits
+	char weight_buf[512];
+	std::snprintf( weight_buf, sizeof( weight_buf ), "%s.weight", base_name );
+	if ( find( name_buf ) == nullptr && ( tp_size > 1 || find( weight_buf ) != nullptr ) ) {
+		// Unquantized checkpoint (the DFlash2 drafter's own release, an FP8 one dequantized): a dense [n, k] weight. Trellis slice_dim 1 splits
 		// the output dimension n (dense dim 0), slice_dim 0 splits the input dimension k (dense dim 1).
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
 		int shard = -1;
@@ -1525,6 +1655,13 @@ pod::LinearWeight SafeTensorsRepo::load_linear_cols_padded(
 		// the output rows of the column blocks (16 per block), then the pad rows (zero blocks: exactly 0 logits)
 		ENGINE_ASSERT( ( col_block_begin + col_blocks ) * 16 <= gm->shape[0], "column range outside the tensor" );
 		return gguf_linear( shard, gm, arena, { { col_block_begin * 16, col_blocks * 16 } }, { { 0, gm->shape[1] } }, pad_cols, stream );
+	}
+
+	// A dense [n, k] weight (an unquantized checkpoint's head): the rows of the column blocks as FP16, then the zero pad rows
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
+	if ( find( name_buf ) == nullptr ) {
+		std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
+		return load_dense_rows_padded( name_buf, arena, col_block_begin * 16, col_blocks * 16, pad_cols, stream );
 	}
 
 	// Trellis: rank's column slice, zero-padded to pad_cols. The pad rows are never read for a token
@@ -1766,6 +1903,8 @@ pod::TensorView SafeTensorsRepo::load_grouped_slice(
 		return pod::TensorView{};
 	}
 	meta = engine::loader::gguf_float_view( shards_[shard_idx], meta, stream );
+	FloatView fp8_hold;
+	meta = fp8_float_view( name, meta, fp8_hold );
 
 	int total_group_size = 0;
 	int total_rank_size = 0;

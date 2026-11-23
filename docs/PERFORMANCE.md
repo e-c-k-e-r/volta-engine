@@ -151,18 +151,6 @@ Cold prompts of 10-13K new tokens, tok/s:
 | GLM-5.3-Flash | EXL3 3.05 bpw, stock order | 970-990 |
 | | EXL3 3.05 bpw, Volta order | 1010-1040 |
 
-In the Volta tile order a lane's decoded values are the operands of two k-chunks rather than two row groups, so a lane keeps a partial sum
-per row half: the trellis MoE prefill takes 128-column tiles in that order, which hold as many accumulators as the stock order's 256-column
-tiles.
-
-## Settings for several requests
-
-| Requests at once | `max_slots` | Other settings |
-|---|---|---|
-| 1 | 1 or 2 | `spec_suffix=8` when the output copies its input |
-| 2 | 2 | the same, `prefill_budget_ms=300` if token gaps matter more than prompt speed |
-| 3 to 4 | 4 | the same; the slots share the KV pool, so their contexts add up to `kv_pool` tokens |
-
 ## Reproducing
 
 ```
@@ -173,4 +161,5 @@ curl -s localhost:8000/api/stats                                             # b
 ENGINE_TP=4 BENCH_VL=2,4,8,12,16 build/bench_decode [--glm | --flash]         # step latency; ENGINE_TEST_<ROLE>_DIR picks the checkpoint
 ```
 
-Record each GPU's power limit and clocks with the numbers, and compare runs only at the same cap and clocks.
+Record each GPU's power limit and clocks with the numbers, and compare runs only at the same cap and clocks. Settings for serving several requests
+at once are in [SERVER.md](SERVER.md#settings-for-several-requests).

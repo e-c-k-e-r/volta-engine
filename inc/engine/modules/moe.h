@@ -24,7 +24,7 @@ struct MoELayerWeights {
 	LinearWeight up[MOE_MAX_EXPERTS];
 	LinearWeight down[MOE_MAX_EXPERTS];
 	void* device_ptrs = nullptr;
-	void* staged_ptrs = nullptr;       // tier (trellis or NVFP4): a table of the same layout whose cold experts point at device scratch; set by ExpertTier for the length of a prefill layer
+	void* staged_ptrs = nullptr;       // tier (trellis, NVFP4 or FP8): a table of the same layout whose cold experts point at device scratch; set by ExpertTier for the length of a prefill layer
 	void* ext_ptrs = nullptr;          // extended trellis experts (tile starts / gains, always resident): a device table [gate | up | down starts][E] then [gate | up | down gains][E], else null
 	uint32_t* heat = nullptr;          // [num_local_experts] routes per expert since the last reset (device), optional
 	// Trellis experts whose widths differ (DeepSeek-V4.1 mixed-width packs): a device table [gate | up | down][num_local_experts] of each expert's
@@ -62,6 +62,8 @@ struct MoEScratch {
 	int*     nv_ctr = nullptr;         // [hidden / 32], zero between calls
 	// GGUF experts (MoEGguf::scratch_bytes; the owner allocates it once it knows the experts are GGUF)
 	void*    gguf_ws = nullptr;
+	// FP8 experts (FP8MoE::scratch_bytes; allocated by the owner the same way)
+	void*    fp8_ws = nullptr;
 	// Heavy experts of a prefill chunk (option moe_heavy_rows): masked routes, the heavy routes' tokens and weights and the expert mask (an expert's
 	// rows are worked on in the planes buffer); allocated when the option is on
 	void*    heavy_ws = nullptr;

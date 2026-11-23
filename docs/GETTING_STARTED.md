@@ -8,6 +8,8 @@ CUDA 12.x (13+ drops SM_70) and CMake 3.24+ with Ninja. The CUDA build is the pr
 cmake -S . -B build -G Ninja && cmake --build build
 ```
 
+A full CUDA build takes a while (the trellis kernels are template heavy); incremental builds are quick.
+
 ### Build time
 
 The EXL3 GEMM kernels are the bulk of a from-scratch CUDA build: each (bit width, codebook) pair is its own generated translation unit, so the
@@ -47,6 +49,8 @@ CUDA 12.x builds all three; CUDA 13 builds 86 / 89 only (configuration fails if 
 
 AMD RDNA GPUs (RX 7000 / 9000) build with `-DENGINE_BACKEND=ROCM`: see [ROCM.md](ROCM.md).
 
+### CPU and Vulkan
+
 CPU and Vulkan builds are separate build trees (no CUDA toolchain needed):
 
 ```
@@ -54,146 +58,56 @@ cmake -S . -B build_cpu -G Ninja -DENGINE_BACKEND=CPU
 cmake -S . -B build_vk  -G Ninja -DENGINE_BACKEND=VULKAN
 ```
 
-The CPU and Vulkan builds run the portable parts on reference kernels, so they are slow by design:
-* the CPU build compiles for the build host (`-march=native`: AVX2, FMA, F16C, about 2x on the reference kernels; `-DENGINE_CPU_NATIVE=OFF` for a portable binary) and runs Qwen and Flash-Next on one rank
-  * Flash-Next needs ~66 GiB of host memory, and answers a chat request with the CUDA engine's text (see [TESTS.md](TESTS.md) for timings)
-* the Vulkan build runs Qwen on one device, or tensor-parallel over several (`tp` 2 or 4: one Vulkan device per rank, the all-reduce meets in host memory, which the devices read and write themselves where they import it and share timeline semaphores, else through the host threads; execution is eager); Flash-Next needs the four devices. Models with trellis or FP16 routed experts need `ENGINE_DEBUG_NO_GRAPHS=1` on one device (that MoE reads its routes back on the host; resident GGUF experts stay on the device; with `tp` above 1 graphs are off anyway)
-* the DFlash2 speculator is CUDA only, and the MTP head has not been run on Vulkan
-* MiniMax-H3 is CUDA only
+They run the portable parts on reference kernels (GGUF projections on llama.cpp's CPU kernels and Vulkan shaders), so they are slow by design:
+* the CPU build compiles for the build host (`-march=native`: AVX2, FMA, F16C, about 2x on the reference kernels; `-DENGINE_CPU_NATIVE=OFF` for a
+  portable binary) and runs a model on one rank; Flash-Next needs ~66 GiB of host memory
+* the Vulkan build runs a model on one device, or tensor-parallel over several (`tp` 2 or 4: one Vulkan device per rank, the all-reduce meets in host
+  memory, which the devices read and write themselves where they import it and share timeline semaphores, else through the host threads; execution
+  is eager); Flash-Next needs four devices. Models with trellis or FP16 routed experts need eager execution on one device (`--set no_graphs=true`;
+  that MoE reads its routes back on the host; resident GGUF experts stay on the device; with `tp` above 1 graphs are off anyway)
+* the routed experts are all resident (no expert tier); the MTP head runs on both (`test_mtp` passes the 27B GGUF on CPU and Vulkan)
+* DeepSeek-V4.1, the DFlash / DFlash2 / DSpark drafters and MiniMax-H3 are CUDA only (the ROCm build compiles MiniMax-H3 but does not run it,
+  see [ROCM.md](ROCM.md#not-supported-on-rocm))
 
-NCCL is optional (CMake looks for it): it enables tensor parallelism for MiniMax-H3, see [video.md](video.md).
+Which models and formats were checked against CUDA on each backend is in [TESTS.md](TESTS.md); the per-function table is [CAPABILITIES.md](CAPABILITIES.md).
 
-A full CUDA build takes a while (the trellis kernels are template heavy); incremental builds are quick.
+NCCL is optional (CMake looks for it): it enables tensor parallelism for MiniMax-H3, see [VIDEO.md](VIDEO.md).
 
 ## Run the server
 
 ```
 taskset -c 0-9 build/volta_server --model-dir /path/to/Qwen3.8-27B-exl3 \
 	--speculative --draft-model-dir /path/to/Qwen3.8-27B-DFlash2-EXL3-5.0bpw --port 8000
+taskset -c 0-9 build/volta_server --config configs/example_qwen.json      # the same from a launch file
 ```
 
-The model type is read from the checkpoint (`qwen3_5`, `glm5_next`, `qwen4_exp` or `deepseek_v41`; a MiniMax-H3 pipeline directory starts the video service, see [video.md](video.md)); anything else is a fatal error. Configuration (launch
-file, `--set key=value`, `ENGINE_*` variables, debug switches) is described in [CONFIG.md](CONFIG.md); `configs/` has examples.
-The server speaks the OpenAI chat API (`/v1/chat/completions`, `/v1/models`) and the Anthropic API (`/v1/messages`,
-`/v1/messages/count_tokens`), so Claude Code can use it with `ANTHROPIC_BASE_URL=http://host:8000`. `/health`, `/metrics`
-(JSON) and `/metrics/prometheus` are also served. `/monitor` is a live page (Monokai or Tomorrow Night theme): throughput, slots with context fill, per-GPU power / clocks / temperature / throttle reasons (NVML, loaded at run time), token-gap and TTFT percentiles, speculation, prefix cache, recent requests, and for MoE models a layer-by-expert routing heat map with the load per rank. It reads `/api/stats` and `/api/experts` (JSON); `expert_stats=false` turns the routing counters off. In a terminal, `build/volta_top [host[:port]]` shows the throughput, slots and GPUs of a running server from the same `/api/stats`, and `volta_server --tui` runs that view inside the server (the console output moves to its Log tab; `q` returns to plain output).
+The model type is read from the checkpoint (`qwen3_5`, `glm5_next`, `qwen4_exp`, `gemma4` or `deepseek_v41`; a MiniMax-H3 pipeline directory starts
+the video service, see [VIDEO.md](VIDEO.md)); anything else is a fatal error. Configuration (launch file, `--set key=value`, `ENGINE_*` variables, debug
+switches) is described in [CONFIG.md](CONFIG.md): flags win over the launch file and the file over the environment, so set options with `--set` or in the
+file's `options` object, and check the startup log. `configs/` has examples.
 
-Useful options for agent workloads: a large context (`--set max_seq=262144 --set max_slots=2`) and the prefix cache
-(`prefix_cache_gib`), which keeps the system prompt and earlier turns resident in pinned host RAM so a long conversation is
-not prefilled again on every turn. When a request ends, a snapshot of everything the slot has read, prompt and reply, is stored as well
-(`prefix_cache_reply`, on by default): an agent's next request renders the reply back into its prompt, so it resumes after the reply
-instead of reading it again. On Qwen3.8-27B in Claude Code sessions with thinking on, the next prompt repeated every token of the reply in 21
-of 23 turns (the other two were `Edit` calls, whose arguments the client re-serializes in another order), and the tokens read per turn fell
-from a median of 671 to 362. The resumed tokens show up in the usage (OpenAI `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens`, with `input_tokens` excluding them).
+The server speaks the OpenAI chat API and the Anthropic API (Claude Code connects with `ANTHROPIC_BASE_URL=http://host:8000`) and serves a `/monitor`
+page; the endpoints, the monitor and the terminal dashboard (`volta_top`, `--tui`) are described in [SERVER.md](SERVER.md), with the settings for
+several requests at once. For agent workloads, a large context (`--set max_seq=262144 --set max_slots=2`) and the prefix cache (`prefix_cache_gib`,
+pinned host RAM; see [FEATURES.md](FEATURES.md#attention-and-the-cache)) keep a long conversation from being prefilled again on every turn.
 
-Qwen extras:
+`--tp-size 2` runs one model on two GPUs; a second server on the other pair (`CUDA_VISIBLE_DEVICES=2,3`) serves alongside it
+([FEATURES.md](FEATURES.md#parallelism-and-scheduling)).
 
-* **Images**: the checkpoint's vision tower loads after the weights (`max_image_tokens`, default 1024 language-model tokens per
-  image, 0 turns it off). Send OpenAI `image_url` parts (base64 `data:` URLs) or Anthropic `image` blocks (base64 sources),
-  also inside Anthropic `tool_result` blocks; remote URLs are not fetched. GLM has its own tower (24 blocks, RMSNorm / SwiGLU, 2x2 conv merge); it is loaded last, into what is
-  left of the arena. GLM with the DFlash2 drafter leaves about 5 MiB, so images stay off (the log says so and requests answer 400)
-  unless memory is freed, for example `--set expert_cache=0.95` keeps 5% of the routed experts in host RAM.
-* **GLM at 256K context, 2 slots and the drafter** (4x 32 GB): the latent cache is stored in 4 bits and the two slots share one pool of 262144
-  tokens (`kv_pool`, below), and every routed expert fits on the GPUs: `--set max_seq=262144 --set max_slots=2 --set kv_format=nvfp4
-  --set kv_pool=262144 --set expert_cache=1.0 --speculative --draft-model-dir <DFlash2>` (images off). Per GPU the arena holds 1.7 GiB of
-  buffers and caches (the latent cache 0.8 of them), 28.6 GiB of weights and the 0.6 GiB drafter, leaving 0.08 GiB; `--set mem_log=true` prints this
-  as `[mem]` lines at startup. The shared expert and the dense MLP of the first three layers are cut over the ranks (`shared_slice`), which saves 0.6 GiB a GPU, and the attention workspace is sized
-  for the 2K keys a row attends to once the indexer selects, not for the whole context. Verified at 200K (a 200K prompt: first token after 248 s;
-  two 128K prompts do not fit the pool together, so the second waits for the first) with GPU memory at 32.4 of 32.5 GiB. `configs/glm_256k.json` uses `expert_cache=auto` instead, which leaves a margin
-  on a different machine; each point of `expert_cache` costs 0.26 GiB, and the FP8 cache (`kv_format=fp8`, 1.2 GiB more) needs it below 1.
-  `--set expert_cache=auto` picks the fraction itself: the largest the arena holds after the other weights, the drafter (its file size) and a 0.25 GiB
-  margin; the first MoE layer starts from a conservative estimate and each later layer re-estimates from what was actually loaded, so the last
-  layers take up the slack (the log prints the plan and the resident range). GLM only; it uses the expert tier on any rank count, except
-  that on four ranks a plan with every expert resident on every rank loads the experts sharded over the ranks instead, as `expert_cache=1` does.
-  Prefill chunks (above 16 rows) copy each layer's cold experts once into device scratch, a layer ahead of the compute (`expert_stage`: auto = on, except for Flash-Next's
-  trellis experts, where the persistent kernel's tiles read each cold expert about once and staging measured 15-25% slower at 256-row chunks and level at 512;
-  2 x the cold experts of a layer, 126 MiB at 90% resident), instead of reading them over PCIe from every row tile: 4096 tokens in chunks of
-  1024 ran at 534 tok/s against 306 at `expert_cache=0.9`, and 721 against 589 at 0.97.
-  Decode keeps the fused MoE kernels while at least 75% of the experts are resident (below that the persistent kernel reads the cold experts a
-  little faster): at 99% resident a token takes 19.0 ms against 15.5 ms with every expert resident (16.3 ms with the PCIe reads taken out; the
-  rest is cold-expert traffic, 2.7 ms for one row and 7.6 ms for an 8-row verify), and 28.5 ms before.
-  `--set route_resident_bias=0.1` adds 0.1 to the router selection score of every resident expert (the weights stay the raw scores), so
-  near-ties go to experts on the device; the table follows the residency after every rebalance. On GLM 3.05 bpw at `expert_cache=0.4` (29 of 72
-  experts per rank resident), 16 chat prompts of 256 greedy tokens, one slot, no drafter, decode / share of routes to resident experts /
-  held-out prose perplexity (12,000 tokens, from the same resident sets): bias 0: 6.13 tok/s / 0.47 / 7.661; 0.02: 7.08 / 0.55 / 7.653;
-  0.05: 8.23 / 0.64 / 7.667; 0.1: 10.45 / 0.75 / 7.698; 0.2: 13.53 / 0.85 / 7.801. The routing change alters greedy text from early on.
-  `--set kv_pool=262144` lets the two slots share one pool of that many tokens instead of owning 256K each (0.95 GiB per GPU less at the 4-bit
-  cache, which the expert cache or the drafter can use): a request starts once the pool holds its prompt, otherwise it queues, and one that
-  grows past the pool ends with finish reason `length`.
-  The 4-bit cache moves the perplexity of GLM by +0.008 NLL against FP16 on 3000 tokens (FP8: +0.001). `kv_format` on GLM applies to the
-  single latent tensor: `k8v4` stores it as 8-bit. With images on, the vision tower takes its memory from the same arena.
-* **Qwen3.8-Flash-Next** (`qwen4_exp`, the 100 GB exl3 checkpoint): runs on all four GPUs only (experts are placed whole, 128 per rank), about 18 GiB of
-  the arena per GPU at an 8K window. Plain decode is about 31 tok/s; `--speculative --set speculator=mtp` drafts with the checkpoint's own MTP head and
-  roughly doubles it with identical greedy output. Full-attention layers use the model's QSA block selection past 2048 tokens of context; the 256K window
-  with 2 slots fits (24.3 of 29.8 GiB per GPU). Images use the checkpoint's own tower. Prefix caching, tools and thinking behave as for Qwen.
-* **DFlash2 with several slots (GLM)**: every slot keeps its own drafter context and tap ring (80 MiB of taps and 10 MiB of drafter K/V per slot on each
-  GPU), so concurrent requests all speculate. With two slots a round drafts each slot's block in turn and verifies both in one target forward, which reads the
-  weights and the experts the rows share once (`spec_joint`, on by default for DFlash2; `spec_joint=0` runs one slot's round per step, `draft_per_slot=false` goes
-  back to one context that the newest request takes over). The speculative verify records each KDA row's inputs and replays the accepted rows
-  instead of keeping a 36 MiB state snapshot per row. Two concurrent streams of repetitive text: 149 tok/s aggregate with joint rounds, 137 interleaved,
-  122 with one speculating slot and 97 for plain batched decode; on typical agent text (about 3 tokens a round) the controller keeps plain batched decode
-  with two streams, which is the faster choice there.
-* **MTP speculation**: `--speculative --set speculator=mtp` drafts with the checkpoint's own multi-token-prediction head and
-  needs no draft model (about 1.7x plain decoding against 2.4x for DFlash2 on the same prompts, and it saves the drafter's VRAM). GLM-5.3-Flash takes its head from the
-  NVFP4 checkpoint (`nvfp4_dense_src`, quantized to NVFP4 at load; example `configs/glm_mtp.json`) and runs as fast as with the DFlash2 drafter.
-* **NVFP4 weights** (modelopt NVFP4 checkpoints of the same models; details and numbers in [FLASH_NEXT.md](FLASH_NEXT.md), examples `configs/flash_next_nvfp4.json`,
-  `configs/glm_256k.json` for 256K shared by four slots; the Qwen NVFP4 checkpoint runs as it is, `configs/qwen_nvfp4.json`): the EXL3 directory stays the model directory and supplies everything not replaced. Flash-Next:
-  `nvfp4_experts=<NVFP4 dir>` takes the routed experts from the NVFP4 checkpoint (and is also the BF16 source for dense tensors), `nvfp4_dense=<groups>`
-  (`gdn,attn,idx,head,shared_gate,shared_up` recommended; `all` adds `shared_down`, which costs perplexity) quantizes those dense groups at load, and
-  `nvfp4_dense_dir=<dir>` loads calibrated tensors made by `tests/tools/nvfp4_ldlq.py` instead of round-to-nearest. GLM-5.3-Flash: `nvfp4_dense_src=<NVFP4 dir>` plus
-  `nvfp4_dense=kda,mla,idx,head,dense,shared` (experts stay EXL3: the NVFP4 experts do not fit in VRAM and the offload penalty rules them out). Calibration: run
-  `ENGINE_HESSIAN_DIR=<dir> test_ppl --flash|--glm --calibrate --file <text>` (GLM: `ENGINE_HESSIAN_LAYERS=lo-hi`, a third of the layers per pass) and then
-  `nvfp4_ldlq.py --model flash|glm`. Speed figures there are indicative (150 W cap, single runs).
-* **GGUF weights** (Qwen3.8-27B, llama.cpp's `qwen35` architecture, Qwen3.8-Flash-Next, `qwen4exp`, GLM-5.3-Flash, `glm5-next`, DeepSeek-V4.1-Flash, `deepseek41`, and Gemma 4, `gemma4`; block types Q4_0 to Q8_0, Q2_0, Q2_K to
-  Q6_K and IQ1_S to IQ4_XS): a model directory holding the `.gguf` file, or every file of a split one (`-00001-of-0000N.gguf` ...), plus the
-  original `config.json`, tokenizer files and chat template loads like a safetensors one. Projections keep their blocks (llama.cpp's integer
-  dot products up to 8 rows, a tensor-core kernel decoding each block once for 9 to 16 rows, a dequantized FP16 GEMM for prefill chunks);
-  the routed experts of Flash-Next, GLM and DeepSeek run route by route on the same dot products in decode and verify blocks, and prefill chunks of
-  more than 64 rows decode each expert's weight tiles to FP16 once per 256 rows and multiply all of its routes on the tensor cores (K-quant and
-  IQ types); they take part in the expert tier (`expert_cache`); Flash-Next's n-gram
-  table stays memory-mapped and is decoded row by row on the host; norms, embeddings and other small tensors are dequantized once at load.
-  The 27B's MTP head is read from its GGUF file, and a DFlash2 drafter directory may hold a GGUF conversion (llama.cpp's `dflash`
-  architecture) with the release's `config.json`; the vision projector (`mmproj`) is read for Gemma 4 only, and the MTP blocks of Flash-Next and GLM are not read.
-  The CPU backend runs GGUF projections through llama.cpp's CPU kernels (its AVX2 / AVX-512 dot products, the activations quantized to
-  q8_0, q8_1 or q8_K by type; the q8_K types through ik_llama.cpp's iqk kernels), the Vulkan backend through llama.cpp's mat-vec and matmul shaders
-  (src/kernels/vulkan/ggml, compiled with glslc) and Slang kernels (src/kernels/slang/gguf.slang), every type but Q2_0; on CPU and Vulkan the routed experts of Flash-Next and GLM
-  run expert by expert on those projections (the experts resident: no expert tier there). `embed_host` falls back to a per-device copy on a backend
-  without device-readable pinned host memory (Vulkan).
-* **DeepSeek-V4.1-Flash** (`deepseek_v41`, exllamav3's own EXL3 conversions such as `turboderp/DeepSeek-V4.1-Flash-1017-exl3` (its 1.68 bpw
-  experts are 1.5 and 2 bpw) or those of the sudoingX / 0xSero layout; example `configs/deepseek_v41.json`): exllamav3's releases keep the Engram
-  tables in `ngram_embedding.safetensors`, which the loader opens next to the shards; the other repositories do not carry them, so
-  `model-00047-of-00048.safetensors` and `model-00048-of-00048.safetensors` of `deepseek-ai/DeepSeek-V4.1-Flash-1017` go into the model directory. Either way
-  `python tests/tools/dsv41/engram_hash_tables.py <model dir>` (a venv with `torch`, `transformers` and `sympy`) writes the hashing tables the
-  engine reads, `engram_hash.bin`, once per directory. llama.cpp's `deepseek41` GGUF conversions load too (such as
-  `ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF`: a build's five parts and the shared Engram file `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`,
-  linked as the build's sixth part, in one directory with the original `config.json` without its `quantization_config`, the tokenizer files
-  and `engram_hash.bin`, whose tables are those of the GGUF's metadata); their Engram rows are IQ4_NL blocks, decoded on the host. The routed experts take what the arena holds after the drafter (each rank sizes its share from its own remainder), and
-  the prefill window (`prefill_window` -1) only what is left once every expert is resident. The experts that do not fit stay in pinned host memory and are read in
-  place (62% resident for the 2.7 bpw checkpoint on four 32 GB GPUs; with the 3-bit DSpark drafter the IQ1_M build is fully resident at 16K without the image tower, and the
-  1.68 bpw EXL3 pack up to 256K without it and at 16K with it; 128K with the tower takes `vram_reserve_mib=256`). A layer with any expert in host memory runs its MoE on the host path, so even a few cold experts cost decode and verify time. Its routing is concentrated (on agent text the hottest 10% of a layer's
-  experts take half of the routes) and specialized by domain, so which experts are resident decides the speed: with `--set expert_heat_file=<path>`
-  the route counts are saved at exit and the next start keeps the hottest experts on the device and balances the heat over the ranks. Counts from five
-  recorded Claude Code turns put 95% of the routes of five other turns on resident experts (62% without), and a held-out turn decoded at 59 ms a token
-  instead of 196 and prefilled at 188 tok/s instead of 84; a placement made on one kind of text slows down a very different one (a story: 46% resident). Images are supported: the checkpoint's ViT and aligner (`max_image_tokens`, 576 in `configs/deepseek_v41.json`; 9 patches per token, the span adds a start, an end and a newline token per row) run on rank 0 in 80 ms for a 31x51-patch image, image tokens route with the checkpoint's `bias_vl` and stay out of the Engram n-grams, and a prompt with images prefills chunk by chunk. The tower's 0.9 GiB plus scratch come out of rank 0's resident experts (57% -> 54%): decode is 2.5% slower, a 4-row verify block 5%, prefill 5-10%; `max_image_tokens=0` turns it off. A prompt prefills at 176 tok/s with the experts crossing the host link once per 512-row chunk (every expert is used by a chunk, and the 42% in host memory are read each time, 39 GB per GPU for 5000 tokens); `prefill_window=16` (1.5 GiB per rank with the MoE scratch, taken before the experts are placed) runs up to sixteen chunks layer by layer so they cross once per window: 435 tok/s on 5065 tokens (a second prefill in the process; the first pays about 6 s of one-time kernel loads), 456 instead of 254 on 19367, with the same output. By default (`prefill_truncate=-1`) layers 20-39 (the ones that read layer 20's shared compressed KV) run only for the last 2541 rows of a prefill call, which is exact (`0` runs every row through every layer): earlier rows write layer 20's window entries, compressed KV and index keys and stop there (DeepInfer's YoCo prefill truncation, with the exact length that Maya uses). Time to first token without the drafter, full / exact / `prefill_truncate=140` (DeepInfer's default, approximate): 4,007 tokens 10.1 / 8.9 / 6.1 s, 16,364 tokens 36.7 / 25.1 / 19.5 s, 49,060 tokens 112.8 / 76.1 / 58.8 s. Two full prefills of the same prompt give the same greedy tokens, with first-token distributions that differ slightly (KL up to 1e-2 over the top 16 on these prompts: the routed experts' outputs are summed in a varying order); the exact mode stays at that level (64 identical greedy tokens on three of five prompts, 57 and 40 on the others), the approximate one is up to 9 times above it. Speculation needs no draft model here: `speculator=suffix` (with `use_speculation` and `spec_suffix`, both set in `configs/deepseek_v41.json`) verifies the text that followed the last earlier occurrence of the request's current suffix in one forward; a block of 4 rows costs about 2x a single row because the cold experts' reads are shared. Rewriting a 170-line file decodes at 30-33 tok/s instead of 20 (71% of the proposed tokens accepted), prose is unchanged. The checkpoint's own block drafter (DSpark: three small blocks of window attention and a 128-expert MoE, entered through the trunk's stream means at layers 37-39, with a bigram head and a confidence head) is the other source: `tests/tools/dsv41/quantize_dspark.py` turns its FP8 / MXFP4 tensors into EXL3 (experts at 3 bits: 5.1 GiB for the three blocks, accepted drafts within 1.4% of the original; at 2 bits 3.5 GiB, within 5%) plus the official tensors it needs, and `speculator=dspark` with `draft_model_dir` set to that directory loads it (about 1.3 GiB per rank, the trunk's resident experts 57% -> 50% with the image tower). A round drafts 5 tokens in 6-9 ms, keeps those whose confidence (`dspark_conf`) passes, and verifies them in one forward. With the experts warm (`expert_heat_file`), decode is 16.0 tok/s instead of 11.1 on code (3.0 drafts accepted per round), 15.8 instead of 10.7 on a maths answer (3.3), 9.6 instead of 8.8 on prose (0.9). Rounds are verified exactly, but a 6-row block and a 1-row step differ in 0.8% of the argmaxes (fp16 near-ties of the trunk), so the output of a speculative run can leave the plain run's at such a token. `configs/deepseek_v41.json` uses it (`speculator=dspark`, `dspark_conf` 0.7, no `spec_suffix`; point `draft_model_dir` at the quantized drafter). Through the server, steady-state decode in tok/s (plain / suffix 4 / drafter at 0.7): code rewrite that copies its input 20.0 / 31.5 / 30.2, new Python code 18.1 / 18.2 / 22.6, maths 17.5 / 16.6 / 23.0, new C++ 19.9 / 21.6 / 30.8, prose 16.0 / 16.2 / 15.9; confidence 0.5 and 0.3 are 1-3% slower, and adding `spec_suffix` to the drafter is 1-2 tok/s slower everywhere, because an offered suffix block replaces the drafter's own. Long prompts work: with `max_seq` 262144 a needle in a 238,812-token prompt is found (681 s of prefill, 351 tok/s, decode 98 ms a token; 905 s, 264 tok/s and 129 ms before the tensor-core indexer scorer and the Engram read-ahead), and a 119,749-token prompt prefills in 329 s (364 tok/s; 513 s with the scalar indexer scorer and the page-fault Engram reads) with the right answer and the same output. The indexer scores every earlier compressed entry for every row, so its cost grows with the square of the prompt (20% of the kernel time at 60K with the scalar scorer); prefill rows are scored on tensor cores (`indexer_tc`), 4-5x the scalar kernel. The Engram lookups of a prefill window are read ahead: rank 0 reads the next window's table rows (a queue of 96 `pread`s on cores that are not pinned to a rank, the scale tables held in memory so a row costs one random read) into shared staging while the current window runs, and every rank dequantizes from it (AVX2), so a prompt of new text prefills as fast as a repeated one (41.9K new tokens: 114.0 s cold, 114.1 s repeated, 368 tok/s; the drive does 6.7K random 4K reads a second at queue depth 1 and 200K at 64 or more). Packs that keep the original FP8 attention, shared-expert and indexer weights and quantize only the routed experts (the SAGE 1.62 bpw build: experts at 1 to 4 bits, each of an expert's three projections at its own width) load as they are: the FP8 tensors with their block scales stay FP8 in device memory (`fp8_resident`; 4 GiB of dense weights on rank 0 instead of 7) and are applied by a GEMV that decodes them in registers up to 16 rows, a dequantize into a scratch and the dense GEMM above; the decode and prefill expert kernels take a width per projection (1 to 4 bits, and the dense GEMM has a 1-bit instance for the mul1 codebook), and a layer's experts run as one launch with a per-expert width table (`merge_expert_groups`; false: one launch per combination of widths). Its experts (25.3 GiB per rank) fit in the four 32 GB cards with `prefill_window=1 vram_reserve_mib=500` (no host-memory experts): 29.8 tok/s decode on a 1100-token prompt, a 19,367-token needle found at 542 tok/s of prefill, the same greedy tokens as the 2.7 bpw pack on both; with the default window and reserve 90% of the experts are resident (33 ms a token with the residency rebalance). The pack's Engram tables are the original's, the same files as the 2.7 bpw pack's. Prefix-cache snapshots carry the trunk taps of the last 128 positions (3.9 MB each, also for the periodic checkpoints): a restored slot re-derives the drafter's window KV from them and keeps speculating (a 2217-token prompt restored in 0.1 s, then 28-32 tok/s on the code rewrite). While serving, every `expert_adapt_every` steps the experts routed to most often move into device memory in exchange for the least used resident ones of the same bit width (a story from that placement: about 118 -> 75 ms a token over 400 tokens). The prompt format is the checkpoint's `encoding/encoding.py`, built in
-  (no chat template): thinking and reasoning effort (low 50, medium 60, high 75, max 100), tools as DSML tool calls. The prefix cache works (a snapshot holds the
-  compressed KV and index keys of its positions plus the last 128 window rows of each layer). The caches keep the codes of the checkpoint's own grids (window rows
-  E4M3, compressed entries and index keys E2M1, each with its block scales), every rank a full copy: about 0.9 KB per token of a slot, plus 0.75 KB per token of
-  `max_seq` for the rotary tables and the indexer's scores.
-* **Gemma 4 31B** (`gemma4`, the text model of `google/gemma-4-31B-it`): EXL3 (exllamav3's conversions), NVFP4 (modelopt: the MLP in NVFP4,
-  attention and the tied head dense; `nvfp4_dense=attn,head` quantizes those at load, which on one GPU is needed to fit and takes minutes) and GGUF
-  (llama.cpp's `gemma4` architecture, e.g. the QAT Q4_0 release; the directory also needs the original `config.json`, tokenizer files and chat
-  template). The 50 sliding-window layers keep a ring of 1536 positions per slot (the window and one prefill chunk: 1.3 GB at TP=1), the 10
-  full-attention layers every position (80 KB a token at TP=1, 20 KB per rank at TP=4); prefix-cache snapshots keep the sliding layers' last window. The DFlash drafter `z-lab/gemma-4-31B-it-DFlash` (a DFlash v1 `DFlashDraftModel`: no convs
-  or selector, the head's argmax per row, a 16-row block of which the first 8 rows are verified, one full-attention layer whose context is every
-  position: the drafter takes each prefill chunk's taps as they are written, so a prompt longer than the 2048-position tap ring stays whole) loads through `draft_model_dir`, also as an EXL3 conversion. Attention (head_dim 256 with the window, and 512) runs on
-  the tensor-core prefill kernels for every row count (SM_80+ builds take the scalar kernel for 512, ROCm builds for the sliding layers too). At TP=4 decode is 20 ms a token,
-  about 110 tok/s with the drafter (4.3 tokens a round on the bench prompts), and a 3019-token prompt prefills in 1.6 s. Images: the checkpoint's vision tower (27 ViT blocks with a 2-D rotary, 3 x 3 pooling into
-  at most 280 soft tokens, `max_image_tokens` caps that) runs on rank 0 from the BF16 `model.vision_tower.*` tensors (1.1 GB; 124 ms for a
-  1008 x 576 image on CUDA; also on the CPU and Vulkan backends); an image's tokens attend to the whole image on the sliding-window layers and causally on the full-attention ones (the
-  Hugging Face masks), and a prefill forward never splits an image. A GGUF directory's tower is its `mmproj` file (llama.cpp's
-  `clip` architecture with the `gemma4v` projector).
-* **Two GPUs per instance**: `--tp-size 2` runs one model on two GPUs (about 0.7x the speed of four); start a second server with
-  `CUDA_VISIBLE_DEVICES=2,3` on the other pair for twice the aggregate throughput. GLM runs on 1, 2 or 4 GPUs (on two, the experts need the expert tier, `expert_cache` below 1, to fit).
+## Models
+
+Per-model setup (checkpoints, weight formats, speculators, images, model-specific options) is in [MODELS.md](MODELS.md):
+
+| Model | Type | Example launch files |
+|---|---|---|
+| [Qwen3.8-27B](MODELS.md#qwen38-27b-qwen3_5) | `qwen3_5` | `configs/example_qwen.json`, `configs/qwen_agent.json` (256K, 2 slots), `configs/qwen_nvfp4.json` |
+| [GLM-5.3-Flash](MODELS.md#glm-53-flash-glm5_next) | `glm5_next` | `configs/glm_256k.json` (256K, 4 slots, DFlash2), `configs/glm_volta.json` (Volta tile order), `configs/glm_mtp.json` (MTP) |
+| [Qwen3.8-Flash-Next](MODELS.md#qwen38-flash-next-qwen4_exp) | `qwen4_exp` | `configs/flash_next_nvfp4.json`, `configs/flash_next_nvfp4_only.json`, `configs/flash_next_dflash2.json`, `configs/flash_next_cpu_experts.json` |
+| [Gemma 4 31B](MODELS.md#gemma-4-31b-gemma4) | `gemma4` | none: `--model-dir` and, for the DFlash drafter, `--speculative --draft-model-dir` |
+| [DeepSeek-V4.1-Flash](MODELS.md#deepseek-v41-flash-deepseek_v41) | `deepseek_v41` | `configs/deepseek_v41.json` (DSpark drafter; the model directory needs `engram_hash.bin`) |
+| MiniMax-H3 (video) | | [VIDEO.md](VIDEO.md) |
+
+Speed per model and format is in [PERFORMANCE.md](PERFORMANCE.md), bit widths and perplexity in [QUANTIZATION.md](QUANTIZATION.md).
 
 ## Tests
 
@@ -203,4 +117,4 @@ checks), `fast` (tests that need no checkpoint), `models` (tests that load check
 fingerprint), `bench` and `compare <tag>`. GPU tests run under `taskset -c 0-9`. See [TESTS.md](TESTS.md) for the inventory
 and [CAPABILITIES.md](CAPABILITIES.md) for which module functions each backend implements.
 
-Benchmark baselines depend on the GPU power cap: record one per power limit (`results/baseline_<tag>.txt`).
+Benchmark baselines depend on the GPU power cap: record one per power limit (`gate.sh baseline <tag>` writes `results/baseline_<tag>.txt`).

@@ -1,4 +1,4 @@
-# HARDWARE_SM70.md — Physical Architecture & Invariants
+# Hardware: Tesla V100 (SM70)
 
 This document establishes the immutable physical constants and constraints of the target hardware cluster: **4× NVIDIA Tesla V100-SXM2-32GB**. Every kernel, memory layout, and scheduling decision in `volta-engine` must adhere to these specifications.
 
@@ -10,7 +10,7 @@ This document establishes the immutable physical constants and constraints of th
 - **NUMA Affinity**: 
   - The SXM2 baseboard is physically attached to the PCIe root complex of **NUMA Node 0**.
   - All engine threads must bind to **CPU cores 0–9** (`taskset -c 0-9`).
-  - Accessing GPUs from NUMA Node 1 incurs an inter-socket UPI bridge penalty, degrading host-device DMA bandwidth and IPC latency by **20–25%**.
+  - Threads on NUMA Node 1 reach the GPUs across the inter-socket UPI link (host-device DMA and IPC included).
 - **Host Memory**: 64+ GB DDR4 RAM.
 
 ---
@@ -77,12 +77,17 @@ Per GPU specifications:
   $$\text{mma.sync.aligned.m8n8k4.row.col}$$
 - All NVFP4 inference on Volta uses **software nibble unpacking to FP16 registers** before issuing `m8n8k4`.
 
-### 5.3 Independent Thread Scheduling & Warp Convergence
+### 5.3 No BF16 Arithmetic
+- BF16 tensor-core and arithmetic support arrived with Ampere (SM80); Volta computes in FP16 / FP32.
+- BF16 checkpoint tensors are converted to FP16 at load (`src/loader/safetensors.cpp`) for every kernel that computes with them; an embedding table may stay
+  BF16, since its gather converts the rows it reads.
+
+### 5.4 Independent Thread Scheduling & Warp Convergence
 - Volta features Independent Thread Scheduling with per-thread program counters and call stacks.
 - Threads within a warp do not execute in implicit lockstep.
 - **Rule**: Never spin-poll on shared memory or NVLink IPC memory flags without `__syncwarp()` or explicit memory fences (`ld.acquire.sys`, `st.release.sys`).
 
-### 5.4 Cooperative Grid Sync (`cg::this_grid().sync()`) Ceiling
+### 5.5 Cooperative Grid Sync (`cg::this_grid().sync()`) Ceiling
 - Cooperative groups require **all blocks in the grid to be active simultaneously**.
 - Volta GV100 has **80 SMs**.
 - If a kernel's shared memory / register allocation allows only 1 resident block per SM:
@@ -90,11 +95,11 @@ Per GPU specifications:
 - Launching $\ge 81$ blocks will cause the first 80 blocks to wait at `grid.sync()` for the 81st block, which cannot be scheduled until one of the first 80 exits $\rightarrow$ **Permanent hardware deadlock**.
 - **Rule**: Never use cooperative grid sync for layers where grid size exceeds resident capacity (e.g. wide MLP layers where $N / 128 > 80$).
 
-### 5.5 Tensor-core fragment layouts (probed, for kernels that bypass WMMA's opaque fragments)
+### 5.6 Tensor-core fragment layouts (probed, for kernels that bypass WMMA's opaque fragments)
 - **`mma.m8n8k4`**: four independent 8 x 8 x 4 products per warp, one per octet (lanes {0-3, 16-19} + 4 * o). In an octet, lane (t = lane & 3, h = lane >> 4) supplies A row t + 4 h and
   B column t + 4 h (four k values each, a0 = k0 k1, a1 = k2 k3; only the k order must agree on both sides) and holds D[m][n] with m = (t & 1) + 2 ((reg >> 1) & 1) + 4 h, n = (reg & 1) + 2 (t >> 1) + 4 (reg >> 2).
 - **WMMA 16 x 16 FP32 accumulator** (what `h3_attn.cu` does its online softmax on): element `i` (0..7) of lane `lane` sits at
   row = (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4 + 2 * ((i >> 1) & 1) and col = ((lane >> 1) & 1) * 2 + ((lane >> 3) & 1) * 8 + (i & 1) + 4 * ((i >> 2) & 1). A row's elements are spread over
   lanes that differ in bits 1 and 3, so a row reduction is two `shfl_xor` steps (2 and 8). The accumulator layout is not the `matrix_a` layout: P goes through shared memory between the two products.
 - Register budget: a head_dim-128 attention warp holds Q (64 registers), the FP32 output (64) and the score tile (32) and sits at the 255-register limit; padding shared-memory rows by 16 halves removes
-  most bank conflicts (worth ~15%).
+  most bank conflicts.

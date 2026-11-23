@@ -6,6 +6,7 @@
 #include "engine/modules/trellis.h"
 #include "engine/backend/cuda/activation.cuh"
 #include "engine/modules/nvfp4_moe.h"
+#include "engine/modules/fp8_moe.h"
 #include "engine/runtime/options.h"
 #include "trellis_context.h"
 #include "exl3_moe_coop.cuh"
@@ -799,6 +800,23 @@ void MoE::init_device_ptrs(
 		CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		weights.device_ptrs = d;
 	}
+	if ( weights.type == pod::QuantType::FP8 ) {
+		// 6 pointer arrays as NVFP4's: gate codes / scales, up codes / scales, down codes / scales
+		const int E = weights.num_local_experts;
+		std::vector<const void*> h_ptrs( 6 * E );
+		for ( int e = 0; e < E; ++e ) {
+			const pod::LinearWeight* lw[3] = { &weights.gate[e], &weights.up[e], &weights.down[e] };
+			for ( int p = 0; p < 3; ++p ) {
+				ENGINE_ASSERT( lw[p]->w1.dtype == pod::DType::FP32, "MoE::init_device_ptrs: FP8 experts take F32 128 x 128 block scales" );
+				h_ptrs[( 2 * p ) * E + e] = lw[p]->w0.data;
+				h_ptrs[( 2 * p + 1 ) * E + e] = lw[p]->w1.data;
+			}
+		}
+		void* d = engine::core::arena_alloc( arena, 6 * E * sizeof( const void* ) );
+		CUDA_CHECK( cudaMemcpyAsync( d, h_ptrs.data(), 6 * E * sizeof( const void* ), cudaMemcpyHostToDevice, stream ) );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		weights.device_ptrs = d;
+	}
 }
 
 pod::MoEScratch MoE::alloc_scratch(
@@ -862,7 +880,7 @@ pod::MoEScratch MoE::alloc_scratch(
 
 bool MoE::fused_decode( const pod::MoELayerWeights& weights, const pod::MoEScratch& scratch, int rows ) {
 	const int ebits = weights.bits_dev ? weights.bits_max : weights.gate[0].bits;
-	if ( weights.type == pod::QuantType::NVFP4 || weights.type == pod::QuantType::GGUF ) return true;   // no trellis workspace
+	if ( weights.type == pod::QuantType::NVFP4 || weights.type == pod::QuantType::GGUF || weights.type == pod::QuantType::FP8 ) return true;   // no trellis workspace
 #if defined(USE_ROCM)
 	const bool bits_ok = ebits >= 1 && ebits <= 8;   // the ROCm launch (exl3_moe.cu) takes any width
 #else
@@ -914,6 +932,22 @@ void MoE::forward(
 		t.inter = weights.gate[0].gguf_n;
 		t.act_limit = act_limit;
 		MoEGguf::forward( t, x.ptr<const half>(), rows, d_topk_indices, d_topk_weights, weights.top_k, out.ptr<half>(), scratch.gguf_ws, weights.heat, stream );
+		return;
+	}
+	if ( weights.type == pod::QuantType::FP8 ) {
+		ENGINE_ASSERT( scratch.fp8_ws != nullptr && weights.device_ptrs != nullptr, "MoE::forward: FP8 experts need their scratch and init_device_ptrs" );
+		const int E = weights.num_local_experts;
+		const void* const* pp = static_cast<const void* const*>( weights.staged_ptrs != nullptr ? weights.staged_ptrs : weights.device_ptrs );
+		FP8ExpertTable t;
+		t.gate_c = reinterpret_cast<const uint8_t* const*>( pp + 0 * E ); t.gate_s = reinterpret_cast<const float* const*>( pp + 1 * E );
+		t.up_c = reinterpret_cast<const uint8_t* const*>( pp + 2 * E );   t.up_s = reinterpret_cast<const float* const*>( pp + 3 * E );
+		t.down_c = reinterpret_cast<const uint8_t* const*>( pp + 4 * E ); t.down_s = reinterpret_cast<const float* const*>( pp + 5 * E );
+		t.num_local = E;
+		t.min_expert = start_expert;
+		t.num_global = weights.num_experts;
+		t.hidden = x.shape[x.ndim - 1];
+		t.inter = weights.gate[0].w0.shape[1];   // the codes are tagged (k, n)
+		FP8MoE::forward( t, x.ptr<const half>(), rows, d_topk_indices, d_topk_weights, weights.top_k, out.ptr<half>(), scratch.fp8_ws, weights.heat, act_limit, stream );
 		return;
 	}
 	if ( weights.type == pod::QuantType::NVFP4 ) {

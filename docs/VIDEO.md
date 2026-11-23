@@ -1,8 +1,8 @@
-# `src/video/` (MiniMax-H3)
+# MiniMax-H3 (video and audio generation)
 
-This section of the project handles MiniMax-H3, a rectified-flow diffusion transformer that denoises video and audio latents jointly. Everything here is CUDA only, and the model runs through either:
+`src/video/` handles MiniMax-H3, a rectified-flow diffusion transformer that denoises video and audio latents jointly. Everything here is CUDA only, and the model runs through either:
 * `h3_generate`: a command line tool for a single job (or a few, with `--repeat`)
-* the video service of `volta_server`: a job queue, an HTTP API, and a (barely tested) web page
+* the video service of `volta_server`: a job queue, an HTTP API, and a web page
 
 Supported tasks:
 * text to video and audio (T2VA)
@@ -18,7 +18,7 @@ Text, reference rows, and the two latent streams are packed into one token seque
 
 | Stage | Component | Notes |
 |---|---|---|
-| plan | layout, sigma schedule, noise | `h3_pipeline.cu`, `h3_image.cpp`; the noise generator is the engine's own (`H3Gaussian`), so a seed does not reproduce 1Cat's torch noise |
+| plan | layout, sigma schedule, noise | `h3_pipeline.cu`, `h3_image.cpp`; the noise generator is the engine's own (`H3Gaussian`), so a seed does not reproduce the reference implementation's torch noise |
 | references | video VAE encoder (3-D conv, causal), image encoder, audio VAE encoder | only FL2VA keyframes and Ref2VA; tiles are spread over the GPUs |
 | text | Qwen3-VL language model (first 50 decoder layers), plus its vision tower for images and video frames | BF16 layers streamed from disk, or an EXL3 / NVFP4 conversion resident on the GPUs |
 | denoise | the transformer: 50 blocks + 2 token-refiner blocks, hidden 5376, 56 heads x 128, MLP 14336 (fc1 28672 wide, gated), patch (1,2,2), 24 video / 32 audio latent channels | 4 or 8 Euler steps (eta 0), flow shift 12 / 3 (video / audio) with the turbo adapters, per-step reset of the condition rows |
@@ -101,7 +101,7 @@ Routes:
 * `/health`, `/metrics`, `/metrics/prometheus`
 
 A job body is `{prompt, width, height, frames, steps, seed, turbo, loras:[{file,scale}], images:[{data,frame_index}], ref_images, ref_videos, ref_audios}` with base64 uploads.
-Optional `video_shift` / `audio_shift` (0 or absent = the defaults: video 6 with a 768p adapter else 12, audio 3; otherwise 0.5 to 40) set the flow shift of each modality's sigma schedule. A larger audio shift spends more of a few-step schedule at low noise, which cleans up the audio of the 4-step turbo adapters (a shift of 6 gives about the high-frequency energy of the 8-step adapter). The page has the two inputs under the video settings.
+Optional `video_shift` / `audio_shift` (0 or absent = the defaults: video 6 with a 768p adapter else 12, audio 3; otherwise 0.5 to 40) set the flow shift of each modality's sigma schedule. A larger audio shift spends more of a few-step schedule at low noise. The page has the two inputs under the video settings.
 
 Settings live in the launch config's `video` object, documented in [CONFIG.md](CONFIG.md): `dit`, `dit_ref2va`, `lora_dirs`, `out_dir`, `devices`, `max_rows`, `resident`, `resident_idle_s`, `tensor_parallel`, `text_encoder`, and `resident_decoders`, `captioner`.
 
@@ -216,7 +216,7 @@ The attention kernel, WMMA on Volta.
 * the online softmax runs on the accumulators
 * head_dim 128 (full and causal) and 64 (the VAE decoder), about 54 TF/s on the DiT shape
 * a key-range variant carries the running (max, sum, output) between calls, which sequence parallelism uses
-* register use is at the limit of 255, so small source changes can cost 10% or more: check `bench_h3_attn` after touching it
+* register use is at the limit of 255: check `bench_h3_attn` after changing it
 
 See [HARDWARE_SM70.md](HARDWARE_SM70.md) for the fragment layouts.
 
@@ -236,12 +236,13 @@ Measured on four V100 at a 225 W power limit (at 150 W the cards run at about 68
 
 * every run logs fingerprints (prompt, noise, each step's velocity, the final latents), so a change that should not alter results can be checked from the log
 * H3 has outlier activations (per-element magnitudes in the hundreds), so the residual stream and the wide-range projections stay FP32
-* work on a non-blocking stream must order itself against default-stream uploads (`cudaStreamSynchronize(nullptr)` first), which was the cause of a few "random" results
+* work on a non-blocking stream must order itself against default-stream uploads (`cudaStreamSynchronize(nullptr)` first)
 * the quantized text kernels grow per-device workspaces lazily under a global lock, so they are sized at load, before any collective (a rank growing one mid-forward deadlocks the others in NCCL)
 
 ## Tests
 
-The goldens come from the official code (`tests/tools/h3_*.py`, written to `~/Documents/h3`). Each test prints a cosine or PSNR and `ok` / `FAIL`.
+The goldens come from the official code: `tests/tools/h3_*.py` write safetensors files that the tests take on their command line (each test's usage line
+names its inputs). Each test prints a cosine or PSNR and `ok` / `FAIL`; the expected values:
 
 * `test_h3_dit`, `test_h3_dit_sp`, `test_h3_dit_tp`: transformer forward on one GPU, sequence-parallel, and tensor-parallel (2 and 4 GPUs, with and without the turbo adapter). Expect video cosine >= 0.999996 and audio >= 0.99997.
 * `test_h3_attn`, `bench_h3_attn`: attention against a CPU softmax (full, causal, key ranges, head_dim 64 / 128), and TF/s at the DiT shape
@@ -258,4 +259,3 @@ The goldens come from the official code (`tests/tools/h3_*.py`, written to `~/Do
 * a prompt of more than about 8.6K text rows is rejected under tensor parallelism and with the resident text tower, and the packed sequence is limited by `video.max_rows` (default 36000)
 * NVFP4 text conditioning degrades on image-conditioned prompts, and its effect on the generated video is untested
 * MP4 muxing, reference-video decoding, and thumbnails call the `ffmpeg` / `ffprobe` binaries
-* results are deterministic per configuration, but not comparable to 1Cat's for the same seed

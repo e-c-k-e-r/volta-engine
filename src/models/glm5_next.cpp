@@ -9,6 +9,7 @@
 #include "engine/modules/gdn.h"
 #include "engine/modules/dsa.h"
 #include "engine/modules/gguf.h"
+#include "engine/modules/fp8_moe.h"
 #include "engine/modules/embedding.h"
 #include "engine/modules/cpu_experts.h"
 #include "engine/runtime/cpu_expert_attach.h"
@@ -789,6 +790,34 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 	static constexpr int GLM_CONV_CHANNELS[3] = { 8192, 8192, 8192 };
 	const int GLM_CONV_RANK_CHANNELS[3] = { 8192 / config_.tp_size, 8192 / config_.tp_size, 8192 / config_.tp_size };
 
+	// The original checkpoint keeps q / k / v and their convolutions as three tensors each: this rank's channels of each (`group` rows of
+	// every tensor, dimension 0), stacked in that order as one FP16 tensor, as a quantized checkpoint's fused qkv_proj / conv1d hold them
+	auto stack_parts = [&]( const char* const* names, int group ) {
+		int shape[4] = {};
+		int ndim = 0;
+		size_t row_elems = 1;
+		{
+			const pod::SafeTensorMeta* m = repo.find( names[0] );
+			if ( m == nullptr ) return pod::TensorView{};
+			ndim = m->ndim;
+			for ( int d = 0; d < ndim; ++d ) shape[d] = m->shape[d];
+			for ( int d = 1; d < ndim; ++d ) row_elems *= static_cast<size_t>( m->shape[d] );
+		}
+		const int rank_rows = group / config_.tp_size;
+		shape[0] = 3 * rank_rows;
+		pod::TensorView out = engine::core::arena_alloc_tensor( *arena_, pod::DType::FP16, shape, ndim );
+		const size_t keep = arena_->offset_bytes;
+		for ( int i = 0; i < 3; ++i ) {
+			const pod::TensorView part = repo.load_grouped_slice( names[i], *arena_, &group, &rank_rows, 1, rank_, 0, stream, pod::DType::FP16 );
+			ENGINE_ASSERT( part.data != nullptr && part.shape[0] == rank_rows, "Glm5NextPipeline: a q / k / v part of the original checkpoint" );
+			backend::memcpy_async( out.ptr<backend::half_t>() + static_cast<size_t>( i ) * rank_rows * row_elems, part.data, rank_rows * row_elems * sizeof( backend::half_t ),
+				backend::Copy::D2D, stream );
+		}
+		backend::stream_sync( stream );
+		arena_->offset_bytes = keep;   // the staging copies are dead
+		return out;
+	};
+
 	const size_t layers_begin = arena_->offset_bytes;
 	size_t wb_attn = 0, wb_router = 0, wb_shared = 0, wb_dense = 0;   // [mem] weights breakdown (rank 0 log)
 	size_t experts_cost = 0;   // arena bytes the experts took so far (codes in device slots, signs and scales)
@@ -824,13 +853,39 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 				if ( has_ov( qp[0] ) ) { ++nv_calibrated; lw.qkv = nv_check( ov_repo->load_nvfp4_concat( qp, begin, count, 3, 0, config_.hidden_size, 0, *arena_, stream ), name_buf ); }
 				else lw.qkv = nv_check( nv_repo->quantize_nvfp4_concat( qp, begin, count, 3, 0, config_.hidden_size, 0, *arena_, stream ), name_buf );
 			}
+			else if ( !repo.find( trellis_name ) ) {
+				// the original checkpoint: q / k / v as three BF16 [8192, 4096] tensors, this rank's 2048 rows of each in FP16 (an MLA layer has none)
+				char pn[3][300];
+				const char* parts[3] = { "q_proj", "k_proj", "v_proj" };
+				const char* pp[3];
+				for ( int i = 0; i < 3; ++i ) {
+					std::snprintf( pn[i], sizeof( pn[i] ), "model.language_model.layers.%d.self_attn.%s.weight", L, parts[i] );
+					pp[i] = pn[i];
+				}
+				if ( repo.find( pn[0] ) ) {
+					const pod::TensorView w = stack_parts( pp, 8192 );
+					if ( w.data ) lw.qkv = pod::LinearWeight::make_fp16( pod::make_tensor_2d( w.data, pod::DType::FP16, w.shape[1], w.shape[0] ) );
+				}
+				else lw.qkv = repo.load_grouped_trellis_slice( name_buf, *arena_, GLM_QKV_BLOCKS, GLM_QKV_RANK_BLOCKS, 3, rank_, stream );   // a GGUF conversion's
+			}
 			else lw.qkv = repo.load_grouped_trellis_slice( name_buf, *arena_, GLM_QKV_BLOCKS, GLM_QKV_RANK_BLOCKS, 3, rank_, stream );
 		}
 		lw.is_linear_attn = lw.qkv.is_valid();
 
 		if ( lw.is_linear_attn ) {
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.conv1d.weight", L );
-			lw.conv1d_weights = repo.load_grouped_slice( name_buf, *arena_, GLM_CONV_CHANNELS, GLM_CONV_RANK_CHANNELS, 3, rank_, 0, stream );
+			if ( repo.find( name_buf ) ) lw.conv1d_weights = repo.load_grouped_slice( name_buf, *arena_, GLM_CONV_CHANNELS, GLM_CONV_RANK_CHANNELS, 3, rank_, 0, stream );
+			else {
+				// the original checkpoint: q_conv1d / k_conv1d / v_conv1d [8192, 1, 4]
+				char pn[3][300];
+				const char* parts[3] = { "q_conv1d", "k_conv1d", "v_conv1d" };
+				const char* pp[3];
+				for ( int i = 0; i < 3; ++i ) {
+					std::snprintf( pn[i], sizeof( pn[i] ), "model.language_model.layers.%d.self_attn.%s.weight", L, parts[i] );
+					pp[i] = pn[i];
+				}
+				lw.conv1d_weights = stack_parts( pp, 8192 );
+			}
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.self_attn.A_log", L );
 			lw.A_log = repo.load_slice( name_buf, *arena_, 0, rank_, config_.tp_size, stream, pod::DType::FP16 );
@@ -932,10 +987,16 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.0.gate_proj.weight", L );
 			const pod::SafeTensorMeta* em = repo.find( name_buf );
 			const bool gguf_experts = em != nullptr && em->dtype == pod::DType::GGUF;
-			mw.type = gguf_experts ? pod::QuantType::GGUF : pod::QuantType::TRELLIS;
+			// the original checkpoint: FP8 E4M3 experts with 128 x 128 block scales, run as they are stored (FP8MoE)
+			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.0.gate_proj", L );
+			const bool fp8_experts = !gguf_experts && repo.fp8_block_weight( name_buf );
+			mw.type = gguf_experts ? pod::QuantType::GGUF : fp8_experts ? pod::QuantType::FP8 : pod::QuantType::TRELLIS;
+			const int inter_local = moe_tp_ ? config_.intermediate_size / config_.tp_size : config_.intermediate_size;
 			if ( gguf_experts && state_.moe.gguf_ws == nullptr ) {
-				const int inter_local = moe_tp_ ? config_.intermediate_size / config_.tp_size : config_.intermediate_size;
 				state_.moe.gguf_ws = engine::core::arena_alloc( *arena_, engine::modules::MoEGguf::scratch_bytes( config_.top_k, config_.hidden_size, inter_local ), 256 );
+			}
+			if ( fp8_experts && state_.moe.fp8_ws == nullptr ) {
+				state_.moe.fp8_ws = engine::core::arena_alloc( *arena_, engine::modules::FP8MoE::scratch_bytes( config_.top_k, config_.hidden_size, inter_local ), 256 );
 			}
 			mw.num_local_experts = experts_per_rank;
 			mw.num_experts = config_.num_experts;
@@ -1311,14 +1372,26 @@ bool Glm5NextPipeline::load_experts( backend::stream_t stream ) {
 					continue;
 				}
 
+				const bool fp8 = mw.type == pod::QuantType::FP8;
 				if ( tier_layer >= 0 && runtime::options().expert_stream ) {
 					static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
 					for ( int p = 0; p < 3; ++p ) {
-						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s.trellis", L, gid, kinds[p] );
+						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s.%s", L, gid, kinds[p], fp8 ? "weight" : "trellis" );
 						int fd = -1; size_t off = 0, nb = 0;
 						ENGINE_ASSERT( repo.file_ref( name_buf, &fd, &off, &nb ), "Glm5NextPipeline: expert_stream: tensor not found" );
 						tier_.set_source( tier_layer, e, p, fd, off, nb );
 					}
+				}
+				if ( fp8 ) {
+					// gate / up by output rows, down by inputs when the experts are sharded over the ranks
+					static const char* const kinds[3] = { "gate_proj", "up_proj", "down_proj" };
+					pod::LinearWeight* dst[3] = { &mw.gate[e], &mw.up[e], &mw.down[e] };
+					const int part = moe_tp_ ? rank_ : 0, parts = moe_tp_ ? config_.tp_size : 1;
+					for ( int p = 0; p < 3; ++p ) {
+						std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.%s", L, gid, kinds[p] );
+						*dst[p] = repo.load_fp8_slice( name_buf, *arena_, p < 2, part, parts, stream, cp[p] );
+					}
+					continue;
 				}
 				std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.experts.%d.gate_proj", L, gid );
 				mw.gate[e] = moe_tp_ ? repo.load_linear_slice( name_buf, *arena_, 4, 1, rank_, config_.tp_size, stream, cp[0] ) : repo.load_linear( name_buf, *arena_, 4, stream, cp[0] );
@@ -1727,8 +1800,11 @@ void Glm5NextPipeline::forward_window( const int* tokens, const pod::BatchRows* 
 	};
 	const pod::BatchRows& last = chunks[n - 1];
 	lm_mode_ = last.logits_mode;
-	last_rows_ = ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : last.count );
-	ENGINE_ASSERT( last_rows_ <= logit_rows_, "Glm5NextPipeline::forward_window: more logit rows than the buffer holds" );
+	// a scoring pass (every chunk LOGITS_ALL): the logits of every row of the window, chunk c's at rows off[c] ..
+	bool all = true;
+	for ( int c = 0; c < n; ++c ) all = all && chunks[c].logits_mode == pod::BatchRows::LOGITS_ALL;
+	last_rows_ = all ? total : ( lm_mode_ == pod::BatchRows::LOGITS_NONE ) ? 0 : ( lm_mode_ == pod::BatchRows::LOGITS_LAST ? 1 : last.count );
+	ENGINE_ASSERT( last_rows_ <= logit_rows_, "Glm5NextPipeline::forward_window: more logit rows than the buffer holds (ENGINE_DEBUG_GLM_LOGIT_ROWS)" );
 
 	for ( int c = 0; c < n; ++c ) {
 		const int m = bind( c );
@@ -1752,7 +1828,18 @@ void Glm5NextPipeline::forward_window( const int* tokens, const pod::BatchRows* 
 		layer_body( layer, lw, total, stream, kPhaseExperts );
 		for ( int c = 0; c < n; ++c ) layer_body( layer, lw, bind( c ), stream, kPhaseShared | kPhaseCombine | kPhasePost );
 	}
-	forward_head( bind( n - 1 ), stream );
+	if ( all ) {
+		for ( int c = 0; c < n; ++c ) {
+			const int m = bind( c );
+			engine::modules::HyperHead::mean( hidden_streams_, hidden_states_, H, stream, m );
+			engine::modules::RMSNorm::forward( hidden_states_, final_norm_, norm_hidden_, 1e-5f, 0.0f, stream );
+			pod::TensorView lc = pod::make_tensor_2d( logits_.ptr<backend::half_t>() + static_cast<size_t>( off[c] ) * lm_shard_cols_, pod::DType::FP16, m, lm_shard_cols_ );
+			engine::modules::Linear::forward( norm_hidden_, lm_head_, lc, stream );
+			steer_penalize( lc, 0, m, stream );
+		}
+		logits_.shape[0] = total;
+	}
+	else forward_head( bind( n - 1 ), stream );
 
 	hidden_streams_ = hs0;
 	norm_hidden_ = nh0;
