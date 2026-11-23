@@ -34,8 +34,16 @@
 // its token embeddings and the PLE layer's n-gram rows), the teacher from the reference model on the same text (test_ppl --flash --file TEXT
 // --seq S --tokens N --chunk 16 --topk-out FILE). --inputs and --teacher take comma-separated lists (pairwise, one text each): their sequences
 // in that order, so the held-out ones are the last file's last.
+//
+// A GLM-5.3-Flash checkpoint (engine/train/glm5_next.h; config.json's model_type) trains tensor parallel only, its scales and norms (none of
+// the other trained kinds), from the teacher files alone (the inputs are the teacher tokens' embeddings); its routed experts' codes stay in
+// pinned host memory, staged a layer ahead (--expert-gib G: whole layers' codes kept on each device up to G GiB, spread over the layers,
+// fewer staged). --check-trace takes a trace_layers file of the engine on the first held-out sequence (test_ppl
+// --glm --seq S --tokens S --chunk 512, prefill_window 1): the training form's streams after every layer, chained from the embeddings,
+// against the engine's at its traced rows (each chunk's last).
 #include "engine/config.h"
 #include "engine/core/log.h"
+#include "engine/train/glm5_next.h"
 #include "engine/train/qwen4_exp.h"
 #include "quant/st_io.h"
 #include <cuda_runtime.h>
@@ -43,24 +51,30 @@
 #if defined( ENGINE_HAVE_NCCL )
 #include <nccl.h>
 #endif
+#include <nlohmann/json.hpp>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <random>
+#include <sstream>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace {
 
 namespace tq = engine::train::qwen4_exp;
+namespace g5 = engine::train::glm5_next;
 namespace q = engine::tools::quant;
 
 struct Args {
@@ -74,6 +88,7 @@ struct Args {
 	bool write = true, timing = false, tp = true, fp16 = true, norms = true, dense = false, router = false, opt_host = false, qsa = true, shuffle = false, hc = false,
 		gains = false;
 	float lr = 1e-3f, lr_min = 0.1f, dense_lr = 0.1f, hc_lr = 0.1f, gains_lr = 1.0f;
+	double expert_gib = 0.0;                                   // GLM: routed experts' codes kept on each device up to this size (whole layers)
 	int reencode = -1;                                         // code updates of this layer's routed experts instead of training
 	bool reencode_feedback = false;                            // with the LDL feedback (else each tile on its own)
 	std::vector<float> reencode_steps = { 0.0f, 0.003f, 0.01f, 0.03f, 0.1f };
@@ -127,6 +142,15 @@ void add_best( tq::Model& m, Best& out ) {
 	for ( auto& e : gv ) out.gains[e.first] = std::move( e.second );
 }
 
+void add_best( g5::Model& m, Best& out ) {
+	std::vector<std::pair<std::string, std::pair<std::vector<uint16_t>, std::vector<uint16_t>>>> v;
+	m.best_scales( v );
+	for ( auto& e : v ) out.scales[e.first] = std::move( e.second );
+	std::vector<std::pair<std::string, std::vector<uint16_t>>> d;
+	m.best_dense( d );
+	for ( auto& e : d ) out.dense[e.first] = std::move( e.second );
+}
+
 bool parse( int argc, char** argv, Args& a ) {
 	for ( int i = 1; i + 1 < argc; i += 2 ) {
 		const std::string k = argv[i], v = argv[i + 1];
@@ -169,6 +193,7 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--gains" ) a.gains = v != "0";
 		else if ( k == "--gains-lr" ) a.gains_lr = std::stof( v );
 		else if ( k == "--opt-host" ) a.opt_host = v != "0";
+		else if ( k == "--expert-gib" ) a.expert_gib = std::stod( v );
 		else if ( k == "--adam-bits" ) a.adam_bits = std::stoi( v );
 		else if ( k == "--write" ) a.write = v != "0";
 		else if ( k == "--timing" ) a.timing = v != "0";
@@ -500,9 +525,25 @@ private:
 };
 
 #if defined( ENGINE_HAVE_NCCL )
-// Tensor parallel over the devices (engine/train/qwen4_exp.h): one host thread per rank, all of them running the same steps; every rank's
-// held-out and training KL is the whole sum, rank 0 reports it
-int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
+// GLM-5.3-Flash's --check-trace: the engine's trace_layers records of one sequence (the last row of each chunk after every layer: tag the
+// layer, then its four streams; test_ppl --glm --seq S --tokens S --chunk 512 with prefill_window 1), by tag and position
+std::map<int, std::map<int, std::vector<float>>> read_glm_trace( const std::string& path, int flat ) {
+	std::map<int, std::map<int, std::vector<float>>> tr;
+	FILE* f = std::fopen( path.c_str(), "rb" );
+	if ( !f ) return tr;
+	int hdr[3];
+	std::vector<float> row( flat );
+	while ( std::fread( hdr, sizeof( int ), 3, f ) == 3 && std::fread( row.data(), sizeof( float ), row.size(), f ) == row.size() )
+		tr[hdr[0]][hdr[2] + hdr[1] - 1] = row;
+	std::fclose( f );
+	return tr;
+}
+
+// Tensor parallel over the devices (engine/train/qwen4_exp.h, engine/train/glm5_next.h): one host thread per rank, all of them running the same
+// steps; every rank's held-out and training KL is the whole sum, rank 0 reports it. GLM-5.3-Flash's inputs are its token embeddings (emb)
+template <class M, class C>
+int train_tp( const Args& a, const C& cfg, const Data& d, const g5::Embedding* emb_tab = nullptr ) {
+	constexpr bool glm = std::is_same_v<M, g5::Model>;
 	const int n = static_cast<int>( a.devices.size() ), T = d.seq, S = d.sequences(), train_n = S - a.hold, H = cfg.hidden, hc = cfg.hc, flat = hc * H;
 	const int train_used = a.train > 0 ? std::min( a.train, train_n ) : train_n;
 	if ( T % n != 0 ) {
@@ -525,6 +566,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 	}
 	Barrier bar( n );
 	std::vector<int> ok( n, 1 );
+	std::vector<std::array<double, 3>> trace_err( n );   // --check-trace (GLM): per rank a layer's squared error, squared norm, positions
 	std::vector<Best> kept( n );
 	double best = 0.0;
 	int best_step = 0;
@@ -533,22 +575,27 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 	for ( int r = 0; r < n; ++r ) th.emplace_back( [&, r] {
 		const int dev = a.devices[r];
 		CUDA_CHECK( cudaSetDevice( dev ) );
-		auto m = std::make_unique<tq::Model>();
+		auto m = std::make_unique<M>();
 		m->set_optimizer( a.opt_host, a.adam_bits );
-		m->set_train_dense( a.dense, a.dense_lr );
-		m->set_train_router( a.router );
-		m->set_train_hc( a.hc, a.hc_lr );
-		m->set_train_gains( a.gains, a.gains_lr );
-		m->set_route_candidates( a.route_cand );
+		if constexpr ( glm ) m->set_expert_host( true, a.expert_gib );
+		else {
+			m->set_train_dense( a.dense, a.dense_lr );
+			m->set_train_router( a.router );
+			m->set_train_hc( a.hc, a.hc_lr );
+			m->set_train_gains( a.gains, a.gains_lr );
+			m->set_route_candidates( a.route_cand );
+		}
 		m->set_keep_outputs( keep );
 		ok[r] = m->load( a.model, 0, cfg.layers, dev, R, r, n, comms[r] ) ? 1 : 0;
 		m->set_fp16( a.fp16 );
 		m->set_train_norms( a.norms );
-		m->set_qsa( a.qsa );
-		m->set_router_calibration( a.router_calib );
-		m->set_router_margin( a.router_margin );
+		if constexpr ( !glm ) {
+			m->set_qsa( a.qsa );
+			m->set_router_calibration( a.router_calib );
+			m->set_router_margin( a.router_margin );
+		}
 		std::unique_ptr<tq::Inputs> inp;
-		if ( ok[r] && !d.dumped() ) {
+		if ( !glm && ok[r] && !d.dumped() ) {
 			inp = std::make_unique<tq::Inputs>();
 			if ( !inp->open( a.model, dev, m->stream() ) ) ok[r] = 0;
 			else if ( r == 0 ) ple16.resize( static_cast<size_t>( R ) * inp->ple_dim() );
@@ -562,7 +609,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		uint16_t* staging;
 		for ( float** p : { &x, &dx, &dy } ) CUDA_CHECK( cudaMalloc( p, rows_l * sizeof( float ) ) );
 		// the routing teacher of a pass's rows (rank 0: it alone adds the term), per layer its ids, probabilities and the mass outside them
-		const bool routing = a.router_kl > 0.0f && !d.r_ids.empty() && r == 0;
+		const bool routing = !glm && a.router_kl > 0.0f && !d.r_ids.empty() && r == 0;
 		int *r_ids = nullptr;
 		float *r_p = nullptr, *r_tail = nullptr;
 		std::vector<tq::Teacher> r_layers;
@@ -601,12 +648,15 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 				tt.tail = r_tail + static_cast<size_t>( L ) * Rc;
 				tt.tk = K;
 			}
-			m->set_router_teacher( r_layers, a.router_kl );
+			if constexpr ( !glm ) m->set_router_teacher( r_layers, a.router_kl );
 		};
 		const int r_layers_n = std::max( 0, std::min( cfg.layers, a.router_l1 ) - std::max( 0, a.router_l0 ) );
 		CUDA_CHECK( cudaMalloc( &emb, static_cast<size_t>( Rl ) * H * sizeof( float ) ) );
-		CUDA_CHECK( cudaMalloc( &pk, static_cast<size_t>( R ) * flat * sizeof( float ) ) );
-		CUDA_CHECK( cudaMalloc( &pv, static_cast<size_t>( R ) * H * sizeof( float ) ) );
+		pk = pv = nullptr;   // the PLE rows (Flash-Next)
+		if ( !glm ) {
+			CUDA_CHECK( cudaMalloc( &pk, static_cast<size_t>( R ) * flat * sizeof( float ) ) );
+			CUDA_CHECK( cudaMalloc( &pv, static_cast<size_t>( R ) * H * sizeof( float ) ) );
+		}
 		CUDA_CHECK( cudaMalloc( &staging, static_cast<size_t>( R ) * flat * 2 ) );
 		CUDA_CHECK( cudaMalloc( &t_ids, static_cast<size_t>( R ) * d.k * sizeof( int ) ) );
 		CUDA_CHECK( cudaMalloc( &t_p, static_cast<size_t>( R ) * d.k * sizeof( float ) ) );
@@ -637,7 +687,16 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			CUDA_CHECK( cudaStreamSynchronize( st ) );
 		};
 		// A pass's inputs: this rank's rows' embeddings, every row's PLE rows (made from the tokens: the n-gram lookups split over the ranks)
+		std::vector<float> emb_h;   // GLM: the rank's embedding rows
 		auto inputs = [&]( const std::vector<int>& sqs, int Rc, int Rcl ) {
+			if ( glm ) {
+				const std::vector<int> ids = d.tokens_of( sqs );
+				emb_h.resize( static_cast<size_t>( Rcl ) * H );
+				emb_tab->rows( ids.data() + static_cast<size_t>( r ) * Rcl, Rcl, emb_h.data() );
+				CUDA_CHECK( cudaMemcpyAsync( emb, emb_h.data(), emb_h.size() * sizeof( float ), cudaMemcpyHostToDevice, st ) );
+				CUDA_CHECK( cudaStreamSynchronize( st ) );
+				return;
+			}
 			if ( d.dumped() ) {
 				up( d.emb.data(), H, sqs, static_cast<size_t>( r ) * Rcl, static_cast<size_t>( r + 1 ) * Rcl, emb );
 				up( d.pk.data(), flat, sqs, 0, Rc, pk );
@@ -652,18 +711,114 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			bar.wait();
 			inp->ple_project( ple16.data(), Rc, pk, pv );
 		};
+		// a layer's forward and backward (Flash-Next's with the PLE rows)
+		auto forward = [&]( int L, const float* in, float* out, int rows, bool keep_out, int seqs ) {
+			if constexpr ( glm ) m->forward( L, in, out, rows, keep_out, seqs );
+			else m->forward( L, in, out, rows, pk, pv, keep_out, seqs );
+		};
+		auto backward = [&]( int L, const float* in, const float* dout, float* din, int rows, int seqs ) {
+			if constexpr ( glm ) m->backward( L, in, dout, din, rows, seqs );
+			else m->backward( L, in, dout, din, rows, pk, pv, seqs );
+		};
+		if constexpr ( glm ) {
+			if ( !a.check_trace.empty() ) {
+				// --check-trace: the first held-out sequence through the layers, each layer's output streams at the traced positions this
+				// rank holds against the engine's (chained: each layer on the training form's previous output)
+				const auto tr = read_glm_trace( a.check_trace, flat );
+				// the engine's routed experts of every row (the trace's .route file: per MoE layer and chunk the layer, rows, first position,
+				// then the rows' expert ids and FP16 weights)
+				std::map<int, std::vector<int>> routes;
+				if ( r == 0 ) {
+					if ( FILE* f = std::fopen( ( a.check_trace + ".route" ).c_str(), "rb" ) ) {
+						int rh[3];
+						const int K = cfg.top_k;
+						while ( std::fread( rh, sizeof( int ), 3, f ) == 3 ) {
+							std::vector<int> v( static_cast<size_t>( rh[1] ) * K );
+							if ( std::fread( v.data(), sizeof( int ), v.size(), f ) != v.size() ) break;
+							std::fseek( f, static_cast<long>( v.size() ) * 2, SEEK_CUR );
+							auto& dst = routes[rh[0]];
+							dst.resize( static_cast<size_t>( T ) * K, -1 );
+							for ( int rr = 0; rr < rh[1] && rh[2] + rr < T; ++rr )
+								std::copy( v.begin() + static_cast<size_t>( rr ) * K, v.begin() + static_cast<size_t>( rr + 1 ) * K,
+									dst.begin() + static_cast<size_t>( rh[2] + rr ) * K );
+						}
+						std::fclose( f );
+					}
+				}
+				const int s0 = train_n, Tl = T / n;
+				inputs( { s0 }, T, Tl );
+				for ( int h = 0; h < hc; ++h ) tq::copy_cols( emb, H, 0, x, flat, h * H, Tl, H, false, st );
+				std::vector<float> host( static_cast<size_t>( Tl ) * flat );
+				for ( int L = 0; L < cfg.layers; ++L ) {
+					forward( L, x, dy, T, false, 1 );
+					std::swap( x, dy );
+					CUDA_CHECK( cudaStreamSynchronize( st ) );
+					CUDA_CHECK( cudaMemcpy( host.data(), x, host.size() * sizeof( float ), cudaMemcpyDeviceToHost ) );
+					const auto it = tr.find( L );
+					double dd = 0.0, nn = 0.0;
+					int rows = 0;
+					if ( it != tr.end() )
+						for ( const auto& pr : it->second ) {
+							const int lr = pr.first - r * Tl;
+							if ( lr < 0 || lr >= Tl ) continue;
+							for ( int j = 0; j < flat; ++j ) {
+								const double e = host[static_cast<size_t>( lr ) * flat + j] - pr.second[j];
+								dd += e * e;
+								nn += static_cast<double>( pr.second[j] ) * pr.second[j];
+							}
+							++rows;
+						}
+					trace_err[r] = { dd, nn, static_cast<double>( rows ) };
+					bar.wait();
+					if ( r == 0 ) {
+						double D = 0.0, N = 0.0, cnt = 0.0;
+						for ( const auto& e : trace_err ) {
+							D += e[0];
+							N += e[1];
+							cnt += e[2];
+						}
+						// the share of the engine's routed experts this forward picks too (every row)
+						char rt[64] = "";
+						const auto ri = routes.find( L );
+						if ( cfg.moe( L ) && ri != routes.end() && m->selection( L ).size() == ri->second.size() ) {
+							const std::vector<int>& mine = m->selection( L );
+							const int K = cfg.top_k;
+							long hit = 0, tot = 0;
+							for ( int rr = 0; rr < T; ++rr ) {
+								if ( ri->second[static_cast<size_t>( rr ) * K] < 0 ) continue;
+								for ( int j = 0; j < K; ++j )
+									for ( int q = 0; q < K; ++q ) hit += mine[static_cast<size_t>( rr ) * K + q] == ri->second[static_cast<size_t>( rr ) * K + j];
+								tot += K;
+							}
+							std::snprintf( rt, sizeof( rt ), ", routes shared %.2f%%", tot ? 100.0 * hit / tot : 0.0 );
+						}
+						LOG_INFO( "[volta_e2e] check: chained, after layer %2d (%s): streams at %.0f traced positions, relative error %.3g%s", L,
+							cfg.full_attention( L ) ? "MLA" : "KDA", cnt, std::sqrt( D / ( N + 1e-30 ) ), rt );
+					}
+					bar.wait();
+				}
+				for ( float* p : { x, dx, dy, emb, t_p, t_tail } ) cudaFree( p );
+				for ( float* c : ckpt ) ckpt_host ? cudaFreeHost( c ) : cudaFree( c );
+				cudaFree( t_ids );
+				cudaFree( staging );
+				bar.wait();   // every rank done with the communicators before any model goes
+				return;
+			}
+		}
 		// Sequences sqs (up to --seqs) in one pass: the forward over all layers (saving each layer's input), the KL head, optionally the backward
 		auto run = [&]( const std::vector<int>& sqs, bool train ) -> double {
 			const int c = static_cast<int>( sqs.size() ), Rc = c * T, Rcl = Rc / n;
 			inputs( sqs, Rc, Rcl );
 			routing_targets( sqs );
+			// the teacher's rows before the layers (after them a copy of the next pass's codes may hold the copy engine)
+			seq_teacher( d, T, sqs, t_ids, t_p, t_tail, st );
 			const size_t xb = static_cast<size_t>( Rcl ) * flat * sizeof( float );
 			float* x0 = ckpt_host ? cbuf[0] : x;
 			for ( int h = 0; h < hc; ++h ) tq::copy_cols( emb, H, 0, x0, flat, h * H, Rcl, H, false, st );
 			for ( int L = 0; L < cfg.layers; ++L ) {
 				if ( !ckpt_host ) {
 					CUDA_CHECK( cudaMemcpyAsync( ckpt[L], x, xb, cudaMemcpyDeviceToDevice, st ) );
-					m->forward( L, ckpt[L], x, Rc, pk, pv, train, c );
+					forward( L, ckpt[L], x, Rc, train, c );
 					continue;
 				}
 				float *in = cbuf[L & 1], *out = cbuf[( L + 1 ) & 1];
@@ -674,10 +829,9 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 					CUDA_CHECK( cudaMemcpyAsync( ckpt[L], in, xb, cudaMemcpyDeviceToHost, cst ) );
 					CUDA_CHECK( cudaEventRecord( ev_cp[L & 1], cst ) );
 				}
-				m->forward( L, in, out, Rc, pk, pv, train, c );
+				forward( L, in, out, Rc, train, c );
 			}
 			float* xf = ckpt_host ? cbuf[cfg.layers & 1] : x;
-			seq_teacher( d, T, sqs, t_ids, t_p, t_tail, st );
 			tq::Teacher t;
 			t.ids = t_ids;
 			t.p = t_p;
@@ -687,7 +841,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			if ( !train ) return kl;
 			if ( !ckpt_host ) {
 				for ( int L = cfg.layers - 1; L >= 0; --L ) {
-					m->backward( L, ckpt[L], dx, dy, Rc, pk, pv, c );
+					backward( L, ckpt[L], dx, dy, Rc, c );
 					std::swap( dx, dy );
 				}
 				return kl;
@@ -703,7 +857,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			for ( int L = cfg.layers - 1; L >= 0; --L ) {
 				if ( L >= 1 ) fetch( L - 1 );
 				CUDA_CHECK( cudaStreamWaitEvent( st, ev_in[L & 1], 0 ) );
-				m->backward( L, cbuf[L & 1], dx, dy, Rc, pk, pv, c );
+				backward( L, cbuf[L & 1], dx, dy, Rc, c );
 				CUDA_CHECK( cudaEventRecord( ev_free[L & 1], st ) );
 				std::swap( dx, dy );
 			}
@@ -711,15 +865,20 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		};
 		// with the routing teacher, the routing KL per token and layer of the last held-out pass (rank 0)
 		double ho_router = 0.0, ho_shared = 0.0, tr_shared = 0.0;
+		// the routing KL since the last call (Flash-Next's routing teacher), and the share of the teacher's experts picked into sh
+		auto router_kl = [&]( double* sh ) -> double {
+			if constexpr ( glm ) return 0.0;
+			else return m->router_kl( sh );
+		};
 		auto held_out = [&]() {
 			double kl = 0.0;
-			m->router_kl();
+			router_kl( nullptr );
 			for ( int s0 = train_n; s0 < S; s0 += P ) {
 				std::vector<int> sqs;
 				for ( int sq = s0; sq < std::min( S, s0 + P ); ++sq ) sqs.push_back( sq );
 				kl += run( sqs, false );
 			}
-			ho_router = m->router_kl( &ho_shared ) / ( static_cast<double>( a.hold ) * T * std::max( r_layers_n, 1 ) );
+			ho_router = router_kl( &ho_shared ) / ( static_cast<double>( a.hold ) * T * std::max( r_layers_n, 1 ) );
 			return kl / ( static_cast<double>( a.hold ) * T );
 		};
 		auto routing_note = [&]( double v, double sh ) {
@@ -737,7 +896,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 			LOG_INFO( "[volta_e2e] held-out KL before tuning %.6f per token%s (%.1f s)", my_best, routing_note( ho_router, ho_shared ).c_str(),
 				std::chrono::duration<double>( std::chrono::steady_clock::now() - th0 ).count() );
 		m->keep_best();
-		if ( a.reencode >= 0 ) {
+		if constexpr ( !glm ) if ( a.reencode >= 0 ) {
 			// Code updates of one layer's routed experts: their gradients with respect to the tiles and their inputs' Hessians summed over the
 			// training sequences, then each step size (a fraction of the tiles' norm in the quantization metric) re-encoded, measured, undone
 			const auto ta = std::chrono::steady_clock::now();
@@ -821,7 +980,7 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 					bar.wait();
 				}
 			}
-			const double tr_router = m->router_kl( &tr_shared ) / ( static_cast<double>( a.batch ) * T * std::max( r_layers_n, 1 ) );
+			const double tr_router = router_kl( &tr_shared ) / ( static_cast<double>( a.batch ) * T * std::max( r_layers_n, 1 ) );
 			if ( r == 0 )
 				LOG_INFO( "[volta_e2e] step %d: train KL %.6f per token%s, lr %.3g, %.1f s", step, kl / ( static_cast<double>( a.batch ) * T ),
 					routing_note( tr_router, tr_shared ).c_str(), o.lr, std::chrono::duration<double>( std::chrono::steady_clock::now() - ts ).count() );
@@ -875,7 +1034,55 @@ int train_tp( const Args& a, const tq::Config& cfg, const Data& d ) {
 		std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() / 60.0 );
 	return 0;
 }
+
+// A GLM-5.3-Flash checkpoint: tensor parallel, its inputs the token embeddings, the scales and norms trained (no small dense tensors, routers,
+// tile gains or code updates)
+int train_glm( const Args& a ) {
+	g5::Config cfg;
+	if ( !cfg.read( a.model ) ) {
+		LOG_ERROR( "[volta_e2e] %s: not a GLM-5.3-Flash config.json the training forms cover", a.model.c_str() );
+		return 1;
+	}
+	if ( !a.inputs.empty() || !a.router_teacher.empty() || a.reencode >= 0 || a.dense || a.router || a.hc || a.gains || a.route_cand > 0 || a.router_calib ) {
+		LOG_ERROR( "[volta_e2e] GLM-5.3-Flash: the scales and norms only (no --inputs, --dense, --router, --hc, --gains, --route-cand, --reencode, --router-*)" );
+		return 1;
+	}
+	if ( !a.tp || a.devices.size() < 2 ) {
+		LOG_ERROR( "[volta_e2e] GLM-5.3-Flash trains tensor parallel (--tp 1 over several devices)" );
+		return 1;
+	}
+	Data d;
+	if ( !read_data( a.teacher, "", cfg.hidden, cfg.hc * cfg.hidden, d ) ) {
+		LOG_ERROR( "[volta_e2e] cannot read the teacher (%s)", a.teacher.c_str() );
+		return 1;
+	}
+	const int S = d.sequences(), train_n = S - a.hold;
+	if ( train_n < 1 || a.hold < 1 ) {
+		LOG_ERROR( "[volta_e2e] %d sequences of %d tokens: %d held out leave none for training (or none held out)", S, d.seq, a.hold );
+		return 1;
+	}
+	LOG_INFO( "[volta_e2e] GLM-5.3-Flash: %d sequences of %d tokens (%d held out, %d of the others trained on), teacher top %d", S, d.seq, a.hold,
+		a.train > 0 ? std::min( a.train, train_n ) : train_n, d.k );
+	g5::Embedding emb;
+	if ( !emb.open( a.model ) || emb.hidden() != cfg.hidden ) {
+		LOG_ERROR( "[volta_e2e] %s: no token embeddings", a.model.c_str() );
+		return 1;
+	}
+	return train_tp<g5::Model>( a, cfg, d, &emb );
+}
 #endif
+
+// The checkpoint's config.json names a GLM-5.3-Flash text model
+bool glm_checkpoint( const std::string& dir ) {
+	std::ifstream f( dir + "/config.json" );
+	if ( !f ) return false;
+	std::stringstream ss;
+	ss << f.rdbuf();
+	const auto j = nlohmann::json::parse( ss.str(), nullptr, false );
+	if ( j.is_discarded() ) return false;
+	const auto& t = j.contains( "text_config" ) ? j["text_config"] : j;
+	return t.value( "model_type", std::string() ).rfind( "glm5_next", 0 ) == 0;
+}
 
 } // namespace
 
@@ -883,6 +1090,14 @@ int main( int argc, char** argv ) {
 	std::setvbuf( stdout, nullptr, _IOLBF, 0 );
 	Args a;
 	if ( !parse( argc, argv, a ) ) return 2;
+	if ( glm_checkpoint( a.model ) ) {
+#if defined( ENGINE_HAVE_NCCL )
+		return train_glm( a );
+#else
+		LOG_ERROR( "[volta_e2e] GLM-5.3-Flash trains tensor parallel, which needs NCCL" );
+		return 1;
+#endif
+	}
 	tq::Config cfg;
 	if ( !cfg.read( a.model ) ) {
 		LOG_ERROR( "[volta_e2e] %s: no config.json", a.model.c_str() );
@@ -945,7 +1160,7 @@ int main( int argc, char** argv ) {
 		return 0;
 	}
 #if defined( ENGINE_HAVE_NCCL )
-	if ( a.tp && G > 1 && a.check_trace.empty() ) return train_tp( a, cfg, d );
+	if ( a.tp && G > 1 && a.check_trace.empty() ) return train_tp<tq::Model>( a, cfg, d );
 #endif
 	if ( !d.dumped() ) {
 		LOG_ERROR( "[volta_e2e] inputs made from the tokens need --tp 1 over several devices (else give --inputs)" );

@@ -526,8 +526,12 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	add_library(engine_train STATIC
 		src/kernels/cuda/train/grad.cu
 		src/kernels/cuda/train/qwen4_exp.cu
+		src/kernels/cuda/train/glm5_mhc.cu
+		src/kernels/cuda/train/glm5_kda.cu
+		src/kernels/cuda/train/glm5_moe.cu
 		src/train/qwen4_exp.cpp
 		src/train/qwen4_exp_inputs.cpp
+		src/train/glm5_next.cpp
 	)
 	target_link_libraries(engine_train PUBLIC engine_kernels engine_quant)
 	set_target_properties(engine_train PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
@@ -537,6 +541,11 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	add_executable(test_train_qwen4_exp tests/2_parity/test_train_qwen4_exp.cpp)
 	target_link_libraries(test_train_qwen4_exp PRIVATE engine_train)
 	set_target_properties(test_train_qwen4_exp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	foreach(part mhc kda moe layer)
+		add_executable(test_train_glm5_${part} tests/2_parity/test_train_glm5_${part}.cpp)
+		target_link_libraries(test_train_glm5_${part} PRIVATE engine_train)
+		set_target_properties(test_train_glm5_${part} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	endforeach()
 	add_executable(test_train_qwen4_exp_layer tests/2_parity/test_train_qwen4_exp_layer.cpp)
 	target_link_libraries(test_train_qwen4_exp_layer PRIVATE engine_train)
 	set_target_properties(test_train_qwen4_exp_layer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
@@ -544,6 +553,9 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 		add_executable(test_train_qwen4_exp_tp tests/2_parity/test_train_qwen4_exp_tp.cpp)
 		target_link_libraries(test_train_qwen4_exp_tp PRIVATE engine_train)
 		set_target_properties(test_train_qwen4_exp_tp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+		add_executable(test_train_glm5_tp tests/2_parity/test_train_glm5_tp.cpp)
+		target_link_libraries(test_train_glm5_tp PRIVATE engine_train)
+		set_target_properties(test_train_glm5_tp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 	endif()
 
 	# The encoder on Gaussian tiles at every width: error against the rate's bound, and the packed codes decoded by reconstruct in both tile orders

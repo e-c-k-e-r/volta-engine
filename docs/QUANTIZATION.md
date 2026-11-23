@@ -406,3 +406,15 @@ KL( teacher || model ) over token sequences.
   embedding streams with the engine's, then exits; the trace may come from another checkpoint of the model on the same text, giving each layer's own
   deviation from it. With it, `--check-routes FILE` (a `route_dump` of that run) gives per layer, fed that run's input and chained, the share of its
   routed experts this model picks too.
+* **GLM-5.3-Flash.** A GLM checkpoint (its `config.json` names `glm5_next`) runs `engine/train/glm5_next.h`'s training form, tensor parallel only: the mHC
+  sites with the Sinkhorn mix unrolled in the backward, KDA (`engine/train/glm5_kda.h`) and MLA by heads, the dense MLP and the shared expert on each
+  device's rows, the routed experts by expert with sigmoid routing and the clamp after the SiLU (`engine/train/glm5_moe.h`), the head as the streams'
+  mean, the final norm and lm_head. It tunes every EXL3 tensor's scales and the norms' weights (the sites' input norms, KDA's output norm, MLA's
+  q-lora and kv-lora norms, the final norm); the other kinds above are Flash-Next's. The inputs are the teacher tokens' embeddings (no `--inputs`).
+  The routed experts' codes (about 26.5 GiB a device at 3.05 bits) stay in pinned host memory and each MoE layer's are copied to one of two device
+  stages a layer ahead of its use; `--expert-gib G` keeps whole layers' codes on each device up to G GiB instead, spread over the layers so that the
+  staged copies overlap with the resident layers' work. `--check-trace` takes the engine's `trace_layers` file of the first held-out sequence
+  (`test_ppl --glm --seq S --tokens S --chunk 512` with `prefill_window` 1: the last row of each chunk after every layer) and compares the training
+  form's streams after every layer, chained from the embeddings, at those rows, with the share of the engine's routed experts (the trace's `.route`
+  file) it picks too. `test_train_glm5_layer` and `test_train_glm5_tp` check the layers and the head against central differences and the tensor-parallel
+  form against one device ([TESTS.md](TESTS.md)).
