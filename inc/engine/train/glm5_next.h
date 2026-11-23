@@ -3,7 +3,8 @@
 // The GLM-5.3-Flash (glm5_next) training model over its EXL3 checkpoint, for the end-to-end tuning of the quantized tensors' scales (as
 // engine/train/qwen4_exp.h's Model for Flash-Next): a contiguous range of decoder layers on one device (and the head when the range ends
 // the model), each layer's forward and its backward from the layer's input streams, the forward recomputed. Every EXL3 tensor's input and
-// output scales are trainable as log deltas on the checkpoint's own (su = s0u e^au, sv = s0v e^av), and the norm weights as additive deltas;
+// output scales are trainable as log deltas on the checkpoint's own (su = s0u e^au, sv = s0v e^av), and the norm weights as log deltas too (GLM's
+// are plain weights of very different sizes);
 // everything else is frozen. Streams are [rows, 4, hidden] FP32, sequences from position 0.
 //
 // The layer: the mHC site before each sublayer (engine/train/glm5_mhc.h), KDA (engine/train/glm5_kda.h) or MLA (dense causal attention: the

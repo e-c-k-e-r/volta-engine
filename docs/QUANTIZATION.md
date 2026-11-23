@@ -410,7 +410,8 @@ KL( teacher || model ) over token sequences.
   sites with the Sinkhorn mix unrolled in the backward, KDA (`engine/train/glm5_kda.h`) and MLA by heads, the dense MLP and the shared expert on each
   device's rows, the routed experts by expert with sigmoid routing and the clamp after the SiLU (`engine/train/glm5_moe.h`), the head as the streams'
   mean, the final norm and lm_head. It tunes every EXL3 tensor's scales and the norms' weights (the sites' input norms, KDA's output norm, MLA's
-  q-lora and kv-lora norms, the final norm); the other kinds above are Flash-Next's. The inputs are the teacher tokens' embeddings (no `--inputs`).
+  q-lora and kv-lora norms, the final norm), the norms as log deltas too (GLM's are plain weights, from about 0.02 to 1.5); the other kinds above
+  are Flash-Next's. The inputs are the teacher tokens' embeddings (no `--inputs`).
   The routed experts' codes (about 26.5 GiB a device at 3.05 bits) stay in pinned host memory and each MoE layer's are copied to one of two device
   stages a layer ahead of its use; `--expert-gib G` keeps whole layers' codes on each device up to G GiB instead, spread over the layers so that the
   staged copies overlap with the resident layers' work. `--check-trace` takes the engine's `trace_layers` file of the first held-out sequence

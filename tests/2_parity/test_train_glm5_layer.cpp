@@ -272,6 +272,42 @@ int main( int argc, char** argv ) {
 			each.insert( each.end(), second.begin(), second.end() );
 			std::snprintf( line, sizeof( line ), "two sequences in one call against each alone: relative difference %.3g", rel( both, each ) );
 			check( rel( both, each ) < 1e-5, line );
+			// and the backward: the input gradient and every tensor's gradients of one call over both against the two alone (their sums)
+			std::vector<float> hr2( 2 * nx );
+			for ( auto& v : hr2 ) v = nd( rng );
+			float* R2;
+			CUDA_CHECK( cudaMalloc( &R2, 2 * nx * sizeof( float ) ) );
+			CUDA_CHECK( cudaMemcpy( R2, hr2.data(), 2 * nx * sizeof( float ), cudaMemcpyHostToDevice ) );
+			CUDA_CHECK( cudaDeviceSynchronize() );
+			auto all_grads = [&]() {
+				std::vector<float> v;
+				for ( g5::Tuned* t : m.tensors() ) {
+					const std::vector<float> u = down( t->gu, t->k ), w = down( t->gv, t->n );
+					v.insert( v.end(), u.begin(), u.end() );
+					v.insert( v.end(), w.begin(), w.end() );
+				}
+				for ( g5::Dense* d : m.dense_tensors() ) {
+					const std::vector<float> u = down( d->g, d->n );
+					v.insert( v.end(), u.begin(), u.end() );
+				}
+				return v;
+			};
+			m.forward( L, x, y, 2 * T, true, 2 );
+			m.zero_grads();
+			m.backward( L, x, R2, dx, 2 * T, 2 );
+			const std::vector<float> dx_both = down( dx, 2 * nx ), g_both = all_grads();
+			m.zero_grads();
+			m.forward( L, x, y, T, true );
+			m.backward( L, x, R2, dx, T );
+			std::vector<float> dx_each = down( dx, nx );
+			m.forward( L, x + nx, y, T, true );
+			m.backward( L, x + nx, R2 + nx, dx, T );
+			const std::vector<float> dx_second = down( dx, nx ), g_each = all_grads();
+			dx_each.insert( dx_each.end(), dx_second.begin(), dx_second.end() );
+			std::snprintf( line, sizeof( line ), "two sequences in one call against each alone: input gradient %.3g, every tensor's gradients %.3g", rel( dx_both, dx_each ),
+				rel( g_both, g_each ) );
+			check( rel( dx_both, dx_each ) < 1e-4 && rel( g_both, g_each ) < 1e-4, line );
+			cudaFree( R2 );
 		}
 		if ( m.has_head() ) {
 			// The head (the streams' mean, the final norm, lm_head, the KL to a random teacher of the top 16 and a tail) against central

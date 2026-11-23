@@ -158,7 +158,7 @@ struct Model::Impl {
 	Workspace ws;
 	ParamPool shared_p;              // the scales of the tensors every rank holds
 	ParamPool expert_p;              // the scales of this rank's experts
-	ParamPool norm_p;                // the norm weights (s0: the checkpoint's, a: additive deltas, s: current)
+	ParamPool norm_p;                // the norm weights (s0: the checkpoint's, a: log deltas, s: current)
 	std::vector<Dense> dense_t;
 	bool train_norms = true;
 	bool keep_outputs = true;
@@ -280,7 +280,7 @@ struct Model::Impl {
 		ENGINE_ASSERT( t != nullptr, "glm5_next training model: a tensor is missing" );
 		return t->shape[0];
 	}
-	// A trainable dense tensor in pool P (additive deltas): its current values (returned; the checkpoint's become the pool's reference after the
+	// A trainable dense tensor in pool P: its current values (returned; the checkpoint's become the pool's reference after the
 	// load), its gradient into *grad
 	float* pooled( ParamPool& P, const std::string& name, float** grad ) {
 		const size_t mark = arena.offset_bytes;
@@ -1377,8 +1377,10 @@ void Model::adam( const AdamOptions& o, int step, float grad_scale ) {
 	m.sum_ranks( m.shared_p.g, m.shared_p.used );
 	for ( ParamPool* P : { &m.shared_p, &m.expert_p } ) P->step( true, o, step, grad_scale, m.st );
 	if ( m.train_norms ) {
+		// log deltas like the scales: GLM's norm weights are plain (no 1 + w), from about 0.02 to 1.5, so an additive step would be a
+		// different relative change on each
 		m.sum_ranks( m.norm_p.g, m.norm_p.used );
-		m.norm_p.step( false, o, step, grad_scale, m.st );
+		m.norm_p.step( true, o, step, grad_scale, m.st );
 	}
 	CUDA_CHECK( cudaStreamSynchronize( m.st ) );
 }
