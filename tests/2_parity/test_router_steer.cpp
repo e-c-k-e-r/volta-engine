@@ -41,7 +41,13 @@ int main() {
 	for ( float& v : xv ) v = rnd();
 	for ( float& v : wv ) v = rnd() * 0.1f;
 	for ( float& v : bv ) v = rnd() * 0.02f;
-	const pod::TensorView x = upload( xv, { M, H } ), w = upload( wv, { H, E } ), b = upload( bv, { E } );   // router weights are [hidden][experts]
+	const pod::TensorView x = upload( xv, { M, H } ), w = upload( wv, { H, E } );   // router weights are [hidden][experts]
+	pod::TensorView b;   // the selection bias, FP32
+	{
+		const int be[1] = { E };
+		b = core::arena_alloc_tensor( arena, pod::DType::FP32, be, 1 );
+		backend::memcpy_sync( b.data, bv.data(), bv.size() * sizeof( float ), backend::Copy::H2D );
+	}
 	int* d_idx = static_cast<int*>( core::arena_alloc( arena, static_cast<size_t>( M ) * K * sizeof( int ) ) );
 	half_t* d_w = static_cast<half_t*>( core::arena_alloc( arena, static_cast<size_t>( M ) * K * sizeof( half_t ) ) );
 	float* d_bias = static_cast<float*>( core::arena_alloc( arena, static_cast<size_t>( S ) * E * sizeof( float ) ) );

@@ -78,7 +78,7 @@ struct MoERouter {
 	static void route_topk(
 		const pod::TensorView& x,
 		const pod::TensorView& router_weights,
-		const pod::TensorView& e_score_bias,
+		const pod::TensorView& e_score_bias,   // FP32 [num_experts] (or none)
 		int* d_topk_indices,
 		backend::half_t* d_topk_weights,
 		int hidden_size,

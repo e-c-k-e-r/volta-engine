@@ -45,11 +45,11 @@ int main( int argc, char** argv ) {
 		int* idx = static_cast<int*>( engine::core::arena_alloc( arena, rows * K * sizeof( int ) ) );
 		half* wt = static_cast<half*>( engine::core::arena_alloc( arena, rows * K * sizeof( half ) ) );
 		int bs[1] = { E };
-		auto bias = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, bs, 1 );
+		auto bias = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, bs, 1 );
 		{
-			std::vector<half> hb( E );
-			for ( auto& v : hb ) v = __float2half( rnd() * 0.1f );
-			CUDA_CHECK( cudaMemcpy( bias.data, hb.data(), hb.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
+			std::vector<float> hb( E );
+			for ( auto& v : hb ) v = rnd() * 0.1f;
+			CUDA_CHECK( cudaMemcpy( bias.data, hb.data(), hb.size() * sizeof( float ), cudaMemcpyHostToDevice ) );
 		}
 		float* fbias = static_cast<float*>( engine::core::arena_alloc( arena, E * sizeof( float ) ) );
 		float* scratch = static_cast<float*>( engine::core::arena_alloc( arena, engine::modules::DSV4::route_scratch_floats( rows, E ) * sizeof( float ) ) );

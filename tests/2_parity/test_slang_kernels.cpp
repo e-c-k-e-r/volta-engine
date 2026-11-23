@@ -273,16 +273,18 @@ int main() {
 		const int rows = 3, E = 288, K = 8, slices = 32, maxs = 32;
 		std::vector<float> partials( static_cast<size_t>( rows ) * maxs * 288 );
 		for ( auto& v : partials ) v = frand( 0.25f );
-		Buf bias( E, 0.1f );
+		std::vector<float> hb( E );   // the selection bias, FP32
+		for ( auto& v : hb ) v = frand( 0.1f );
+		float* d_bias = static_cast<float*>( backend::device_malloc( E * sizeof( float ) ) );
+		backend::memcpy_sync( d_bias, hb.data(), E * sizeof( float ), backend::Copy::H2D );
 		float* d_part = static_cast<float*>( backend::device_malloc( partials.size() * 4 ) );
 		backend::memcpy_sync( d_part, partials.data(), partials.size() * 4, backend::Copy::H2D );
 		int* d_idx = static_cast<int*>( backend::device_malloc( rows * K * sizeof( int ) ) );
 		Buf w( rows * K );
-		slang_router_select( d_part, bias.d, d_idx, w.d, rows, E, K, slices, maxs, 2.5f, s );
+		slang_router_select( d_part, d_bias, d_idx, w.d, rows, E, K, slices, maxs, 2.5f, s );
 		backend::stream_sync( s );
 		std::vector<int> idx( rows * K );
 		backend::memcpy_sync( idx.data(), d_idx, idx.size() * 4, backend::Copy::D2H );
-		auto hb = bias.get();
 		std::vector<double> ref( rows * K );
 		bool ok = true;
 		for ( int r = 0; r < rows; ++r ) {
@@ -290,7 +292,7 @@ int main() {
 			for ( int e = 0; e < E; ++e ) {
 				float logit = 0; for ( int ks = 0; ks < slices; ++ks ) logit += partials[( static_cast<size_t>( r ) * maxs + ks ) * 288 + e];
 				raw[e] = 1.0f / ( 1.0f + std::exp( -logit ) );
-				sel[e] = raw[e] + __half2float( hb[e] );
+				sel[e] = raw[e] + hb[e];
 			}
 			std::vector<int> chosen; double total = 0;
 			for ( int k = 0; k < K; ++k ) {
@@ -301,7 +303,7 @@ int main() {
 		}
 		std::printf( "  %-22s expert ids vs CPU  %s\n", "router_select", ok ? "PASS" : "FAIL" );
 		pass = ok && compare_ref( "router_select weights", ref, w.get() ) && pass;
-		backend::device_free( d_part ); backend::device_free( d_idx );
+		backend::device_free( d_part ); backend::device_free( d_idx ); backend::device_free( d_bias );
 	}
 	{ // l2_norm_heads (q and k slices of a packed row, q scaled) and gated_rmsnorm, against the engine kernels
 		const int rows = 3, kh = 4, hd = 128, stride = 2 * kh * hd + 512;

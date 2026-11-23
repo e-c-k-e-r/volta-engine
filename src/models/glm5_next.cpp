@@ -86,6 +86,12 @@ pod::TensorView load_router_weights_glm(
 	return tv;
 }
 
+// The router's selection bias (e_score_correction_bias [experts]) in FP32: its values sit near 8 to 12 with gaps of about 1e-4 between
+// them, which FP16 (spacing up to 0.008 there) folds onto a few dozen levels, reordering the near-ties of the selection
+pod::TensorView load_route_bias_glm( engine::loader::SafeTensorsRepo& repo, const char* name, pod::MemoryArena& arena, backend::stream_t stream ) {
+	return repo.load( name, arena, stream, pod::DType::FP32 );
+}
+
 } // namespace impl
 
 Glm5NextPipeline::Glm5NextPipeline() = default;
@@ -980,7 +986,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 			lw.router_weights = impl::load_router_weights_glm( repo, name_buf, *arena_, stream );
 
 			std::snprintf( name_buf, sizeof( name_buf ), "model.language_model.layers.%d.mlp.gate.e_score_correction_bias", L );
-			lw.e_score_bias = repo.load( name_buf, *arena_, stream, pod::DType::FP16 );
+			lw.e_score_bias = impl::load_route_bias_glm( repo, name_buf, *arena_, stream );
 
 			wb_router += arena_->offset_bytes - wb_attn_end;
 			// 72 local experts for this rank
@@ -1160,7 +1166,8 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		}
 		lw.router_weights = impl::load_router_weights_glm( *nv_repo, nm( "mlp.gate.weight" ), *arena_, stream );
 		if ( !lw.router_weights.data ) { LOG_ERROR( "[RANK %d] MISSING (MTP): %s\n", rank_, name_buf ); ++missing_count; }
-		lw.e_score_bias = bf( "mlp.gate.e_score_correction_bias" );
+		lw.e_score_bias = impl::load_route_bias_glm( *nv_repo, nm( "mlp.gate.e_score_correction_bias" ), *arena_, stream );
+		if ( !lw.e_score_bias.data ) { LOG_ERROR( "[RANK %d] MISSING (MTP): %s\n", rank_, name_buf ); ++missing_count; }
 		auto& mw = lw.moe_weights;
 		mw.type = pod::QuantType::NVFP4;
 		// The head's experts follow the layer layout of the trunk: every expert's intermediate width sliced over the ranks (moe_tp_), or

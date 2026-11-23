@@ -300,7 +300,7 @@ __device__ __forceinline__ float router_logit( const float* __restrict__ partial
 __global__ __launch_bounds__( 512 )
 void router_select_kernel(
 	const float* __restrict__ partials,
-	const half* __restrict__ e_score_bias,
+	const float* __restrict__ e_score_bias,
 	const float* __restrict__ slot_bias,
 	const pod::BatchRows* __restrict__ rows_desc,
 	int bias_stride,
@@ -326,7 +326,7 @@ void router_select_kernel(
 		const float raw_score = engine::math::sigmoid( router_logit( partials, m, expert, num_experts, k_slices ) );
 		select_score = raw_score;
 		if ( e_score_bias != nullptr ) {
-			select_score += __half2float( e_score_bias[expert] );
+			select_score += e_score_bias[expert];
 		}
 		// steering: the slot's bias moves the expert in or out of the selection; the weights still come from the raw scores
 		if ( slot_bias != nullptr ) select_score += slot_bias[static_cast<size_t>( rows_desc->slot[m] ) * bias_stride + expert];
@@ -560,7 +560,7 @@ void MoERouter::route_topk(
 	const float* partials = launch_router_logits( x.ptr<const half>(), router_weights.ptr<const half>(), hidden_size, num_experts, rows, stream );
 	router_select_kernel<<<dim3( rows ), dim3( ( num_experts + 31 ) / 32 * 32 ), 0, stream>>>(
 		partials,
-		e_score_bias.ptr<const half>(),
+		e_score_bias.ptr<const float>(),
 		slot_bias,
 		d_rows,
 		bias_stride,

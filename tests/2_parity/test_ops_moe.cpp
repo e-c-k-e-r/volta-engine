@@ -33,6 +33,18 @@ static pod::TensorView upload_half( const std::vector<float>& v, std::initialize
 	return t;
 }
 
+// FP32 values as the FP16 upload would hold them (the router's selection bias is FP32; the goldens were taken with FP16-rounded values)
+static pod::TensorView upload_half_values( const std::vector<float>& v, std::initializer_list<int> shape ) {
+	int s[4] = {};
+	int nd = 0;
+	for ( int d : shape ) s[nd++] = d;
+	pod::TensorView t = core::arena_alloc_tensor( g_arena, pod::DType::FP32, s, nd );
+	std::vector<float> f( v.size() );
+	for ( size_t i = 0; i < v.size(); ++i ) f[i] = backend::to_float( backend::from_float_half( v[i] ) );
+	backend::memcpy_sync( t.data, f.data(), f.size() * sizeof( float ), backend::Copy::H2D );
+	return t;
+}
+
 static pod::TensorView upload_codes( GoldenRng& rng, int k, int n, int bits ) {
 	std::vector<uint16_t> c( static_cast<size_t>( k / 16 ) * ( n / 16 ) * 16 * bits );
 	for ( auto& v : c ) v = static_cast<uint16_t>( rng.next() );
@@ -145,7 +157,7 @@ int main( int argc, char** argv ) {
 	const pod::MoEScratch sc_shard = modules::MoE::alloc_scratch( g_arena, 8, TOPK, H, I, max_rows );
 
 	auto router_w = upload_half( uniform_vec( rng, static_cast<size_t>( H ) * E, 0.2f ), { H, E } );
-	auto router_bias = upload_half( uniform_vec( rng, E, 0.1f ), { E } );
+	auto router_bias = upload_half_values( uniform_vec( rng, E, 0.1f ), { E } );
 
 	std::vector<Case> cases;
 	for ( int m : row_list ) {

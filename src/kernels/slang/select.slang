@@ -69,7 +69,7 @@ void batched_argmax(uint3 gid : SV_GroupID, uniform ArgmaxParams p) {
 // choose top_k experts by raw + bias[e], weight = raw / sum(raw of chosen) * scale (FP16 out)
 struct RouterParams {
 	float* partials;
-	half* bias;           // may be null
+	float* bias;          // may be null (FP32: GLM's values sit near 8 to 12, closer together than FP16 resolves there)
 	int* topk_idx;
 	half* topk_w;
 	int num_experts;      // <= 288
@@ -97,7 +97,7 @@ void router_select(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform
 			logit += p.partials[(int64_t(row) * p.max_slices + ks) * 288 + e];
 		let raw = sigmoid_f(logit);
 		s_raw[e] = raw;
-		s_sel[e] = raw + (p.has_bias != 0 ? float(p.bias[e]) : 0.0f);
+		s_sel[e] = raw + (p.has_bias != 0 ? p.bias[e] : 0.0f);
 	}
 	GroupMemoryBarrierWithGroupSync();
 	if (e == 0) {
@@ -134,7 +134,7 @@ void router_select(uint3 gid : SV_GroupID, uniform RouterParams p) {
 		for (int ks = 0; ks < p.k_slices; ++ks)
 			logit += p.partials[(int64_t(row) * p.max_slices + ks) * 288 + e];
 		raw[e] = sigmoid_f(logit);
-		sel[e] = raw[e] + (p.has_bias != 0 ? float(p.bias[e]) : 0.0f);
+		sel[e] = raw[e] + (p.has_bias != 0 ? p.bias[e] : 0.0f);
 	}
 	int chosen[16];
 	for (int j = 0; j < 16; ++j) chosen[j] = -1;

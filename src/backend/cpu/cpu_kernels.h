@@ -66,7 +66,7 @@ struct SoftcapParams { half* x; int n; float cap; };
 struct SumPlanesParams { half* planes; half* out_; int n; int groups; };
 struct AccumParams { half* accum; half* expert_out; float weight; int n; };
 struct ArgmaxParams { half* logits; int* out_idx; float* out_val; int numel; int batch_size; int index_offset; int row_stride; int has_val; };
-struct RouterParams { float* partials; half* bias; int* topk_idx; half* topk_w; int num_experts; int top_k; int k_slices; int max_slices; float scale; int has_bias; };
+struct RouterParams { float* partials; float* bias; int* topk_idx; half* topk_w; int num_experts; int top_k; int k_slices; int max_slices; float scale; int has_bias; };
 
 struct L2Params { half* qkv; int num_k_heads; int head_dim; int scale_q; int64_t row_stride; };
 struct GatesParams { half* norm_hidden; half* in_proj_a; half* in_proj_b; half* A_log; half* dt_bias; float* gate_out; float* beta_out; int num_v_heads; int hidden_size; int has_a_log; int has_dt_bias; };

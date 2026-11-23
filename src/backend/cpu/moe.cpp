@@ -41,7 +41,7 @@ void MoERouter::route_topk( const pod::TensorView& x, const pod::TensorView& rou
 		}
 	}
 	const bool has_bias = e_score_bias.data != nullptr;
-	RouterParams p{ partials.data(), const_cast<half*>( e_score_bias.ptr<const half>() ), d_topk_indices, reinterpret_cast<half*>( d_topk_weights ), num_experts, top_k, slices, slices, routed_scaling_factor, has_bias ? 1 : 0 };
+	RouterParams p{ partials.data(), const_cast<float*>( e_score_bias.ptr<const float>() ), d_topk_indices, reinterpret_cast<half*>( d_topk_weights ), num_experts, top_k, slices, slices, routed_scaling_factor, has_bias ? 1 : 0 };
 	impl::cpu_dispatch( ::router_select, &p, static_cast<uint32_t>( rows ) );
 }
 
