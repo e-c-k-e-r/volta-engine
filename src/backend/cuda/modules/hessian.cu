@@ -26,8 +26,10 @@ __global__ void transpose_pad_kernel( const half* __restrict__ x, half* __restri
 } // namespace
 
 void Hessian::accumulate( float* h, const half* x, int rows, int k, cudaStream_t stream ) {
-	// H [k, k] += x^T x: with xt = x^T ([k, rows], rows padded to 16 bytes), H = xt xt^T, the GEMM's weights-as-rows form
-	static std::mutex mu;
+	// H [k, k] += x^T x: with xt = x^T ([k, rows], rows padded to 16 bytes), H = xt xt^T, the GEMM's weights-as-rows form. A buffer per
+	// device behind a lock of its own: a rank growing its buffer waits for its stream, whose collectives need the other ranks to go on
+	// (one lock for all would hold them before their side of the collective)
+	static std::mutex mu[64];
 	static half* buf[64] = {};
 	static size_t cap[64] = {};
 	int device = 0;
@@ -36,7 +38,7 @@ void Hessian::accumulate( float* h, const half* x, int rows, int k, cudaStream_t
 	const size_t need = static_cast<size_t>( rows8 ) * k;
 	half* xt = nullptr;
 	{
-		std::lock_guard<std::mutex> lk( mu );
+		std::lock_guard<std::mutex> lk( mu[device] );
 		if ( need > cap[device] ) {
 			CUDA_CHECK( cudaStreamSynchronize( stream ) );   // calibration runs eagerly: the old buffer's readers are done
 			if ( buf[device] ) CUDA_CHECK( cudaFree( buf[device] ) );
