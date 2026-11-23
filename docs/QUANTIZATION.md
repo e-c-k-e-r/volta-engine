@@ -182,8 +182,8 @@ The speed side of the same configurations is in [PERFORMANCE.md](PERFORMANCE.md)
 | all of `kda,mla,idx,head,dense,shared`, round to nearest | 1.812 |
 | all, calibrated (`nvfp4_ldlq.py --model glm`, `ENGINE_HESSIAN_LAYERS=lo-hi` in three passes) | 1.804 |
 
-Against the original FP8 checkpoint (`test_ppl --glm --tokens 8192 --chunk 512` on the default text, prefill windows of 8 chunks, `glm_logit_rows=4096`): the
-FP8 model 1.3809 NLL, the EXL3 3.05 bpw copy 1.3926, KL( FP8 || 3.05 ) 0.0415 per token over the FP8 model's top 128.
+Against the original FP8 checkpoint (`test_ppl --glm --tokens 8192 --chunk 512` on the default text, the docs/ folder as of commit c233440, prefill windows
+of 8 chunks, `glm_logit_rows=4096`): the FP8 model 1.3846 NLL, the EXL3 3.05 bpw copy 1.3979, KL( FP8 || 3.05 ) 0.0414 per token over the FP8 model's top 128.
 
 The calibrated tensors are the ones the GLM configurations use (`configs/glm_256k.json`). GLM is sensitive to rounding-level noise whatever the format (a different
 prefill chunking moves its logits by 0.2 to 0.7), so differences of a few thousandths between runs are within what the sampling and the router flips produce.

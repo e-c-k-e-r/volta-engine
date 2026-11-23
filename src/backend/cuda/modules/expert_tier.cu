@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <thread>
 #include <mutex>
+#include <chrono>
 #include <unistd.h>
 #include <fstream>
 #include <numeric>
@@ -46,7 +47,7 @@ void ExpertTier::start( int experts_per_layer, double fraction, const size_t byt
 		cold = streamed ? std::max( cold, static_cast<size_t>( experts - resident - host_keep ) * slot ) : cold + static_cast<size_t>( experts - resident ) * slot;
 		stage += slot;
 	}
-	if ( streamed ) cold += static_cast<size_t>( host_keep ) * all_slots + static_cast<size_t>( layers ) * 256;
+	if ( streamed ) cold = 2 * cold + 512 + static_cast<size_t>( host_keep ) * all_slots + static_cast<size_t>( layers ) * 256;   // two rings and the kept experts
 	if ( runtime::options().expert_synth ) cold = 0;
 	ENGINE_ASSERT( engine::core::arena_create_pinned( host, cold + stage + 256 ), "ExpertTier: pinned expert tier allocation failed" );
 }
@@ -129,20 +130,24 @@ void ExpertTier::save_heat() {
 }
 
 ExpertTier::~ExpertTier() {
+	if ( prefetch.joinable() ) prefetch.join();
 	save_heat();
 }
 
 void ExpertTier::stage_init( pod::MemoryArena& device ) {
-	if ( !active() || layers.empty() || runtime::options().expert_synth || runtime::options().expert_stream || runtime::options().expert_stage == 0 ) return;
+	if ( !active() || layers.empty() || runtime::options().expert_synth || runtime::options().expert_stage == 0 ) return;
 	if ( runtime::options().expert_stage < 0 && stage_auto_off ) return;
 	for ( const Layer& l : layers ) cold_max = std::max( cold_max, experts - static_cast<int>( l.owner.size() ) );
 	const size_t tables = layers.size() * 9 * static_cast<size_t>( experts ) * sizeof( void* );
-	const size_t need = 2 * static_cast<size_t>( cold_max ) * slot_bytes + tables + 4096;
+	// expert_stream: one buffer, as a layer's cold experts are read from the checkpoint once the previous layer has finished (the copy cannot run ahead)
+	const int bufs = runtime::options().expert_stream ? 1 : 2;
+	const size_t need = bufs * static_cast<size_t>( cold_max ) * slot_bytes + tables + 4096;
 	if ( cold_max == 0 || device.total_bytes - device.offset_bytes < need ) {
 		if ( cold_max > 0 ) LOG_WARN( "[experts] prefill staging off: it needs %.2f GiB of the arena, %.2f GiB are free\n", need / 1073741824.0, ( device.total_bytes - device.offset_bytes ) / 1073741824.0 );
 		return;
 	}
-	for ( int i = 0; i < 2; ++i ) stage_buf[i] = static_cast<uint8_t*>( engine::core::arena_alloc( device, static_cast<size_t>( cold_max ) * slot_bytes, 256 ) );
+	for ( int i = 0; i < bufs; ++i ) stage_buf[i] = static_cast<uint8_t*>( engine::core::arena_alloc( device, static_cast<size_t>( cold_max ) * slot_bytes, 256 ) );
+	if ( bufs == 1 ) stage_buf[1] = stage_buf[0];
 	for ( Layer& l : layers ) {
 		// The pointer table of the layer's experts: trellis 9 pointer rows, NVFP4 6 pointer rows then 3 rows of float global scales, FP8 6 pointer rows
 		const size_t table_bytes = l.mw->type == pod::QuantType::NVFP4 ? 6 * static_cast<size_t>( experts ) * sizeof( void* ) + 3 * static_cast<size_t>( experts ) * sizeof( float )
@@ -161,7 +166,7 @@ void ExpertTier::stage_init( pod::MemoryArena& device ) {
 		( i < layers.size() ? ev_ready : ev_free ).push_back( ev );
 	}
 	staging_on = true;
-	LOG_INFO( "[experts] prefill staging on: 2 x %d cold experts (%.0f MiB) in device scratch\n", cold_max, 2.0 * cold_max * slot_bytes / 1048576.0 );
+	LOG_INFO( "[experts] prefill staging on: %d x %d cold experts (%.0f MiB) in device scratch\n", bufs, cold_max, static_cast<double>( bufs ) * cold_max * slot_bytes / 1048576.0 );
 }
 
 void ExpertTier::stage_prefetch( int layer, cudaStream_t stream ) {
@@ -240,7 +245,10 @@ void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, 
 		l.slot_of[resident_set[s]] = s;
 		l.owner[s] = resident_set[s];
 	}
-	if ( stream_mode() && ring == nullptr ) ring = static_cast<uint8_t*>( engine::core::arena_alloc( host, cold_bytes_per_layer(), 256 ) );   // the largest layer's
+	if ( stream_mode() && ring[0] == nullptr ) {   // the largest layer's
+		for ( int i = 0; i < 2; ++i ) ring[i] = static_cast<uint8_t*>( engine::core::arena_alloc( host, cold_bytes_per_layer(), 256 ) );
+	}
+	uint8_t* const my_ring = ring[layers.size() & 1];
 	l.src.assign( static_cast<size_t>( experts ) * 3, Layer::Src{} );
 	l.streamed.assign( experts, 0 );
 	size_t cold_i = 0;
@@ -249,7 +257,7 @@ void ExpertTier::add_layer( pod::MoELayerWeights* mw, pod::MemoryArena& device, 
 		if ( l.slot_of[e] >= 0 || runtime::options().expert_synth ) continue;
 		// streamed: the first host_keep cold experts keep a buffer of their own (loaded once), the others share the ring
 		if ( stream_mode() && kept >= host_keep ) {
-			l.host[e] = ring + cold_i * slot_bytes;
+			l.host[e] = my_ring + cold_i * slot_bytes;
 			l.streamed[e] = 1;
 			++cold_i;
 			continue;
@@ -292,13 +300,10 @@ void ExpertTier::set_source( int layer, int expert, int part, int fd, size_t off
 	layers[layer].src[static_cast<size_t>( expert ) * 3 + part] = Layer::Src{ mine, off, bytes };
 }
 
-void ExpertTier::stream_fill( int layer, cudaStream_t stream ) {
-	// The previous layer's kernels still read the shared buffer
-	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+void ExpertTier::stream_read( int layer ) {
 	const Layer& l = layers[layer];
 	std::vector<int> cold;
 	for ( int e = 0; e < experts; ++e ) if ( l.host[e] != nullptr && l.streamed[e] ) cold.push_back( e );
-	if ( cold.empty() ) return;
 	const int nthreads = 8;
 	std::vector<std::thread> pool;
 	for ( int t = 0; t < nthreads; ++t ) {
@@ -308,12 +313,12 @@ void ExpertTier::stream_fill( int layer, cudaStream_t stream ) {
 				size_t dst_off = 0;
 				for ( int p = 0; p < 3; ++p ) {
 					const Layer::Src& s = l.src[static_cast<size_t>( e ) * 3 + p];
-					ENGINE_ASSERT( s.fd >= 0 && s.bytes == l.part_bytes[p], "ExpertTier::stream_fill: no source for a cold expert" );
+					ENGINE_ASSERT( s.fd >= 0 && s.bytes == l.part_bytes[p], "ExpertTier::stream_read: no source for a cold expert" );
 					size_t done = 0;
 					while ( done < s.bytes ) {
 						const ssize_t n = pread( s.fd, l.host[e] + dst_off + done, s.bytes - done, static_cast<off_t>( s.off + done ) );
-						if ( n <= 0 ) LOG_ERROR( "ExpertTier::stream_fill: pread returned %zd (errno %d) at offset %zu of %zu bytes\n", n, errno, s.off + done, s.bytes );
-						ENGINE_ASSERT( n > 0, "ExpertTier::stream_fill: read failed" );
+						if ( n <= 0 ) LOG_ERROR( "ExpertTier::stream_read: pread returned %zd (errno %d) at offset %zu of %zu bytes\n", n, errno, s.off + done, s.bytes );
+						ENGINE_ASSERT( n > 0, "ExpertTier::stream_read: read failed" );
 						done += static_cast<size_t>( n );
 					}
 					dst_off += l.part_bytes[p];
@@ -322,6 +327,31 @@ void ExpertTier::stream_fill( int layer, cudaStream_t stream ) {
 		} );
 	}
 	for ( auto& th : pool ) th.join();
+}
+
+void ExpertTier::stream_fill( int layer, cudaStream_t stream ) {
+	// The previous layer's kernels (and its staging copy) still read its ring, which the next layer's background read reuses
+	const auto t0 = std::chrono::steady_clock::now();
+	CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	const auto t1 = std::chrono::steady_clock::now();
+	// this layer's experts: read in the background while the previous layer ran, or (a first layer, or out of order) now
+	bool ready = false;
+	if ( prefetch.joinable() ) {
+		prefetch.join();
+		ready = prefetched == layer;
+	}
+	if ( !ready ) stream_read( layer );
+	const auto t2 = std::chrono::steady_clock::now();
+	// the next layer's during this one (its ring is the previous layer's, which the GPU has finished with)
+	const int next = ( layer + 1 ) % static_cast<int>( layers.size() );
+	prefetched = -1;
+	if ( next != layer && ( next & 1 ) != ( layer & 1 ) ) {
+		prefetched = next;
+		prefetch = std::thread( [this, next]() { stream_read( next ); } );
+	}
+	auto ms = []( auto a, auto b ) { return std::chrono::duration<double, std::milli>( b - a ).count(); };
+	LOG_DEBUG( "[experts] stream_fill layer %d: %.1f ms waiting for the GPU, then %.1f ms for its experts (%s)\n", layer, ms( t0, t1 ), ms( t1, t2 ),
+		ready ? "read in the background" : "read now" );
 }
 
 int ExpertTier::rebalance( int layer, cudaStream_t stream ) {

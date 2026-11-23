@@ -155,6 +155,7 @@ Qwen4ExpPipeline::~Qwen4ExpPipeline() {
 		graphs_.reset();
 		if ( side_stream_ != nullptr ) backend::stream_destroy( side_stream_ );
 		if ( side_stream2_ != nullptr ) backend::stream_destroy( side_stream2_ );
+		tier_.stream_wait();
 		engine::core::arena_destroy( host_arena_ );
 	}
 }

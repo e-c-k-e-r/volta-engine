@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <vector>
+#include <thread>
 
 namespace engine::modules {
 
@@ -51,7 +52,11 @@ struct ExpertTier {
 	size_t slot_bytes = 0;
 	std::vector<std::array<size_t, 3>> layer_bytes;   // per layer, when start() was given them (empty: every layer is part_bytes)
 	std::vector<Layer> layers;
-	uint8_t* ring = nullptr;                 // expert_stream: the one pinned buffer every layer's cold experts are read into before the layer runs
+	// expert_stream: two pinned buffers the layers' streamed cold experts are read into (layer i's in ring[i % 2]): while a layer runs, the next
+	// one's are read in the background (prefetch, of layer `prefetched`)
+	uint8_t* ring[2] = {};
+	std::thread prefetch;
+	int prefetched = -1;
 	int host_keep = 0;                       // expert_stream: cold experts per layer kept in pinned host memory instead (expert_stream_host_gib)
 	uint64_t swaps = 0, window_routes = 0, window_hits = 0;
 	int max_swaps = -1;                      // per layer per rebalance; <0 = derived from the byte budget expert_swap_mib
@@ -106,6 +111,8 @@ struct ExpertTier {
 	static bool stream_mode();
 	void set_source( int layer, int expert, int part, int fd, size_t off, size_t bytes );
 	void stream_fill( int layer, backend::stream_t stream );
+	void stream_read( int layer );   // the layer's streamed cold experts from the checkpoint into its ring (parallel pread)
+	void stream_wait() { if ( prefetch.joinable() ) prefetch.join(); }   // before the host memory the rings live in is released
 	// Reads and clears the layer counters, updates the scores and performs up to max_swaps exchanges; returns swaps done
 	int rebalance( int layer, backend::stream_t stream );
 	double hit_rate() const { return window_routes ? static_cast<double>( window_hits ) / static_cast<double>( window_routes ) : 1.0; }

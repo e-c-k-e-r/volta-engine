@@ -580,9 +580,10 @@ std::vector<int> Glm5NextPipeline::plan_experts( const engine::loader::SafeTenso
 		}
 		extras += per_expert * static_cast<size_t>( experts ) + up( 9 * static_cast<size_t>( experts ) * sizeof( void* ), 256 ) + up( static_cast<size_t>( experts ) * sizeof( uint32_t ), 256 );
 	}
-	const bool stage = runtime::options().expert_stage != 0 && !runtime::options().expert_stream && !runtime::options().expert_synth;
+	const bool stage = runtime::options().expert_stage != 0 && !runtime::options().expert_synth;
 	const size_t stage_tables = n * up( 9 * static_cast<size_t>( experts ) * sizeof( void* ), 256 ) + 4096 + 512;
-	auto staging = [&]( int fewest ) { return stage && fewest < experts ? 2 * static_cast<size_t>( experts - fewest ) * largest + stage_tables : 0; };
+	const size_t stage_bufs = runtime::options().expert_stream ? 1 : 2;   // (ExpertTier::stage_init)
+	auto staging = [&]( int fewest ) { return stage && fewest < experts ? stage_bufs * static_cast<size_t>( experts - fewest ) * largest + stage_tables : 0; };
 	const size_t bias = runtime::options().route_resident_bias != 0.0 ? up( n * static_cast<size_t>( config_.num_experts ) * sizeof( float ), 256 ) : 0;
 	// the speculator: in the arena already when the cluster deferred the experts, else its reserve (rank 0 holds the selector codebooks,
 	// the others about half of the file)
@@ -2303,7 +2304,8 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 						tier_.layers[tl].cpu_owner_dev, cpu_.frac, lw.moe_weights.heat, cpu_.mb, cpu_.ctl, tl, stream );
 				}
 				const bool staged = tl >= 0 && m > pod::MAX_BATCH && tier_.prefill_staging() && tier_.stage_begin( tl, stream );
-				if ( staged && layer + 1 < config_.num_layers ) tier_.stage_prefetch( layers_[layer + 1].tier_layer, stream );
+				// (streamed experts: the next layer's are read from the checkpoint only when it starts, so its copy cannot be issued ahead)
+				if ( staged && layer + 1 < config_.num_layers && !engine::modules::ExpertTier::stream_mode() ) tier_.stage_prefetch( layers_[layer + 1].tier_layer, stream );
 				engine::modules::MoE::forward(
 					norm_hidden_, lw.moe_weights,
 					state_.d_topk_indices, state_.d_topk_weights,
@@ -2511,6 +2513,7 @@ void Glm5NextPipeline::destroy() {
 		if ( side_stream2_ != nullptr ) backend::stream_destroy( side_stream2_ );
 		side_stream_ = side_stream2_ = nullptr;
 	}
+	tier_.stream_wait();   // a background read of streamed experts writes into host_arena_
 	engine::core::arena_destroy( host_arena_ );
 	if ( h_argmax_idx_ != nullptr ) {
 		engine::core::host_free_pinned( h_argmax_idx_ );
