@@ -4,7 +4,9 @@
 //     --topk-out: the model's distribution at every position as a teacher (volta_e2e): int32 magic 0x4b504f54, tokens N, seq, K, the N token ids,
 //     then per position K ids (int32, most likely first), their probabilities (FP32) and the mass outside them (FP32)
 //   --kl-teacher FILE (a --topk-out file of the same text and settings): also KL( teacher || model ) per position, over the teacher's top K plus
-//     its lumped tail, averaged (--kl-from P: only the positions from P on, e.g. the sequences volta_e2e holds out)
+//     its lumped tail, averaged (--kl-from P: only the positions from P on, e.g. the sequences volta_e2e holds out), and the expected
+//     acceptance rate sum min( teacher, model ) (over the teacher's top K; with the overlap of the two tails as the upper bound) and top-1
+//     agreement over the same positions
 //   --bins B1,B2,..: the NLL (and the KL) also averaged by position within a row (--seq) or session (--prompts), [0, B1), .., [Bn, end)
 //   GLM: with glm_logit_rows at a prefill window's rows (prefill_window chunks of --chunk), each forward is a window of chunks run layer by layer,
 //   every row scored; --seq rows shorter than a window fill it with several rows, one slot each (max_slots of them)
@@ -492,8 +494,8 @@ int main( int argc, char** argv ) {
 		}
 		std::fclose( kf );
 	}
-	double kl_sum = 0.0;
-	size_t kl_n = 0;
+	double kl_sum = 0.0, ear_sum = 0.0, ear_hi_sum = 0.0;
+	size_t kl_n = 0, top1_n = 0;
 	PosBins nll_bins, kl_bins;
 	nll_bins.init( bin_edges );
 	kl_bins.init( bin_edges );
@@ -507,7 +509,7 @@ int main( int argc, char** argv ) {
 		std::vector<int> ids;
 		std::vector<float> p;
 		float tail = 0.0f, nl = 0.0f;
-		double kl = 0.0;
+		double kl = 0.0, ear = 0.0, ear_hi = 0.0;   // against the teacher: KL, and the expected acceptance rate's lower and upper bound
 		bool has_kl = false, has_nl = false;
 		int top = 0;
 	};
@@ -531,8 +533,9 @@ int main( int argc, char** argv ) {
 	float *d_p = static_cast<float*>( dev( span * kmax * sizeof( float ) ) ), *d_tail = static_cast<float*>( dev( span * sizeof( float ) ) );
 	float *d_tp = static_cast<float*>( dev( span * kmax * sizeof( float ) ) ), *d_ttail = static_cast<float*>( dev( span * sizeof( float ) ) );
 	float *d_nll = static_cast<float*>( dev( span * sizeof( float ) ) ), *d_kl = static_cast<float*>( dev( span * sizeof( float ) ) );
+	float* d_ear = static_cast<float*>( dev( span * 2 * sizeof( float ) ) );
 	std::vector<int> h_tgt( span ), h_ids( span * kmax ), h_top( span );
-	std::vector<float> h_p( span * kmax ), h_tail( span ), h_nll( span ), h_kl( span );
+	std::vector<float> h_p( span * kmax ), h_tail( span ), h_nll( span ), h_kl( span ), h_ear( span * 2 );
 	// GLM gathers the full-vocabulary rows of a window in slices (its gather buffer holds 1024 rows); the other models a forward's rows at once
 	const int gather_rows = glm ? 1024 : span;
 	auto device_rows = [&]( int count, int off ) {
@@ -551,7 +554,7 @@ int main( int argc, char** argv ) {
 			}
 			const size_t dk = static_cast<size_t>( r0 ) * k, dt = static_cast<size_t>( r0 ) * kt_k;
 			engine::modules::LogitRows::score( dl, n, V, d_tgt + r0, k, d_ids + dk, d_p + dk, d_tail + r0, kt_k > 0 ? d_tids + dt : nullptr, d_tp + dt, d_ttail + r0,
-				kt_k, nullptr, d_nll + r0, d_top + r0, kt_k > 0 ? d_kl + r0 : nullptr, ls );
+				kt_k, nullptr, d_nll + r0, d_top + r0, kt_k > 0 ? d_kl + r0 : nullptr, ls, kt_k > 0 ? d_ear + 2 * static_cast<size_t>( r0 ) : nullptr );
 			backend::stream_sync( ls );   // the next slice's gather reuses the buffer
 		}
 		backend::memcpy_async( h_nll.data(), d_nll, count * sizeof( float ), backend::Copy::D2H, ls );
@@ -561,7 +564,10 @@ int main( int argc, char** argv ) {
 			backend::memcpy_async( h_p.data(), d_p, count * k * sizeof( float ), backend::Copy::D2H, ls );
 			backend::memcpy_async( h_tail.data(), d_tail, count * sizeof( float ), backend::Copy::D2H, ls );
 		}
-		if ( kt_k > 0 ) backend::memcpy_async( h_kl.data(), d_kl, count * sizeof( float ), backend::Copy::D2H, ls );
+		if ( kt_k > 0 ) {
+			backend::memcpy_async( h_kl.data(), d_kl, count * sizeof( float ), backend::Copy::D2H, ls );
+			backend::memcpy_async( h_ear.data(), d_ear, count * 2 * sizeof( float ), backend::Copy::D2H, ls );
+		}
 		backend::stream_sync( ls );
 		for ( int r = 0; r < count; ++r ) {
 			RowOut& o = outs[r];
@@ -573,6 +579,8 @@ int main( int argc, char** argv ) {
 			}
 			o.has_kl = kt_k > 0 && off + r >= kl_from;
 			o.kl = h_kl[r];
+			o.ear = h_ear[2 * static_cast<size_t>( r )];
+			o.ear_hi = h_ear[2 * static_cast<size_t>( r ) + 1];
 			o.has_nl = off + r + 1 < n_tokens;
 			o.nl = h_nll[r];
 		}
@@ -616,15 +624,18 @@ int main( int argc, char** argv ) {
 		if ( o.has_kl ) {
 			// KL( teacher || model ) at this position: the teacher's top entries and its tail against the model's mass outside them
 			const double lse = std::log( sum ) + mx;
-			double k = 0.0, qs = 0.0;
+			double k = 0.0, qs = 0.0, agree = 0.0;
 			for ( int j = 0; j < kt_k; ++j ) {
 				const double lq = t_all[kt_ids[row * kt_k + j]] - lse, pp = kt_p[row * kt_k + j];
 				qs += std::exp( lq );
 				if ( pp > 0.0 ) k += pp * ( std::log( pp ) - lq );
+				agree += std::min( pp, std::exp( lq ) );
 			}
 			const double pt = kt_tail[row], qt = std::max( 1.0 - qs, 1e-12 );
 			if ( pt > 0.0 ) k += pt * ( std::log( pt ) - std::log( qt ) );
 			o.kl = k;
+			o.ear = agree;
+			o.ear_hi = agree + std::min( pt, std::max( 1.0 - qs, 0.0 ) );
 		}
 		o.has_nl = off + r + 1 < n_tokens;
 		if ( o.has_nl ) o.nl = static_cast<float>( std::log( sum ) + mx - t_all[ids[off + r + 1]] );
@@ -696,6 +707,9 @@ int main( int argc, char** argv ) {
 			}
 			if ( o.has_kl ) {
 				kl_sum += o.kl;
+				ear_sum += o.ear;
+				ear_hi_sum += o.ear_hi;
+				top1_n += o.top == kt_ids[static_cast<size_t>( off + r ) * kt_k];   // the teacher's entries are larger first
 				++kl_n;
 				kl_bins.add( seq > 0 ? ( off + r ) % seq : off + r, o.kl );
 			}
@@ -715,7 +729,11 @@ int main( int argc, char** argv ) {
 	if ( calibrate ) { mc.shutdown(); return 0; }
 	const double mean = total / nll.size();
 	std::printf( "[*] %zu predicted tokens: mean NLL %.4f, perplexity %.3f\n", nll.size(), mean, std::exp( mean ) );
-	if ( kl_n > 0 ) std::printf( "[*] KL( teacher || model ) over %zu positions: %.6f per token\n", kl_n, kl_sum / kl_n );
+	if ( kl_n > 0 ) {
+		std::printf( "[*] KL( teacher || model ) over %zu positions: %.6f per token\n", kl_n, kl_sum / kl_n );
+		std::printf( "[*] EAR against the teacher over %zu positions: %.4f (with the tails' overlap %.4f), top-1 agreement %.2f%%\n", kl_n, ear_sum / kl_n,
+			ear_hi_sum / kl_n, 100.0 * top1_n / kl_n );
+	}
 	nll_bins.print( "NLL" );
 	if ( kl_n > 0 ) kl_bins.print( "KL" );
 	if ( !nll_out.empty() ) {

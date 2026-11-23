@@ -196,7 +196,8 @@ prefill chunking moves its logits by 0.2 to 0.7), so differences of a few thousa
 * MiniMax-H3 text tower: EXL3 6 bpw 0.999999 cosine against the BF16 hidden states (0.999957 with an image), the NVFP4 build 0.999913 text-only and 0.9737 with an
   image ([VIDEO.md](VIDEO.md)).
 * `test_ear` measures the expected acceptance rate of a quantized model against a reference model on the reference's own generations, per kind of text
-  ([TESTS.md](TESTS.md)); `test_ppl --kl-teacher` the KL against a reference's stored distributions.
+  ([TESTS.md](TESTS.md)); `test_ppl --kl-teacher` the KL, the expected acceptance rate and the top-1 agreement against a reference's stored
+  distributions over every position of a text.
 
 ## Quantizing EXL3 with the engine
 

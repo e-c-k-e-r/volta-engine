@@ -31,7 +31,7 @@ __device__ __forceinline__ double block_sum( double v, double* sh ) {
 __global__ __launch_bounds__( kThreads )
 void k_logit_rows( const half* __restrict__ logits, int vocab, const int* __restrict__ target, int k, int* __restrict__ ids, float* __restrict__ p,
 	float* __restrict__ tail, const int* __restrict__ t_ids, const float* __restrict__ t_p, const float* __restrict__ t_tail, int tk, double* __restrict__ lse_out,
-	float* __restrict__ nll, int* __restrict__ top, float* __restrict__ kl ) {
+	float* __restrict__ nll, int* __restrict__ top, float* __restrict__ kl, float* __restrict__ ear ) {
 	__shared__ double shd[32];
 	__shared__ float shm[32];
 	__shared__ int shi[32];
@@ -153,18 +153,24 @@ void k_logit_rows( const half* __restrict__ logits, int vocab, const int* __rest
 		in = block_sum( in, shd );
 		if ( t == 0 && tail ) tail[r] = static_cast<float>( fmax( 0.0, 1.0 - in ) );
 	}
-	if ( tk > 0 && kl ) {
-		double qs = 0.0, part = 0.0;
+	if ( tk > 0 && ( kl || ear ) ) {
+		double qs = 0.0, part = 0.0, agree = 0.0;
 		if ( t < tk ) {
 			const double lq = __half2float( row[t_ids[static_cast<size_t>( r ) * tk + t]] ) - lse, pp = t_p[static_cast<size_t>( r ) * tk + t];
 			qs = exp( lq );
 			if ( pp > 0.0 ) part = pp * ( log( pp ) - lq );
+			agree = fmin( pp, qs );
 		}
 		qs = block_sum( qs, shd );
 		part = block_sum( part, shd );
+		agree = block_sum( agree, shd );
 		if ( t == 0 ) {
 			const double pt = t_tail[r], qt = fmax( 1.0 - qs, 1e-12 );
-			kl[r] = static_cast<float>( part + ( pt > 0.0 ? pt * ( log( pt ) - log( qt ) ) : 0.0 ) );
+			if ( kl ) kl[r] = static_cast<float>( part + ( pt > 0.0 ? pt * ( log( pt ) - log( qt ) ) : 0.0 ) );
+			if ( ear ) {
+				ear[2 * static_cast<size_t>( r )] = static_cast<float>( agree );
+				ear[2 * static_cast<size_t>( r ) + 1] = static_cast<float>( agree + fmin( pt, fmax( 1.0 - qs, 0.0 ) ) );
+			}
 		}
 	}
 }
@@ -172,10 +178,11 @@ void k_logit_rows( const half* __restrict__ logits, int vocab, const int* __rest
 } // namespace
 
 void LogitRows::score( const backend::half_t* logits, int rows, int vocab, const int* target, int k, int* ids, float* p, float* tail, const int* t_ids,
-	const float* t_p, const float* t_tail, int tk, double* lse, float* nll, int* top, float* kl, backend::stream_t stream ) {
+	const float* t_p, const float* t_tail, int tk, double* lse, float* nll, int* top, float* kl, backend::stream_t stream, float* ear ) {
 	ENGINE_ASSERT( k <= MAX_K && tk <= kThreads, "LogitRows::score: at most MAX_K top entries and 1024 teacher entries" );
 	if ( rows <= 0 ) return;
-	k_logit_rows<<<rows, kThreads, 0, stream>>>( reinterpret_cast<const half*>( logits ), vocab, target, k, ids, p, tail, t_ids, t_p, t_tail, tk, lse, nll, top, kl );
+	k_logit_rows<<<rows, kThreads, 0, stream>>>( reinterpret_cast<const half*>( logits ), vocab, target, k, ids, p, tail, t_ids, t_p, t_tail, tk, lse, nll, top, kl,
+		ear );
 }
 
 } // namespace engine::modules
