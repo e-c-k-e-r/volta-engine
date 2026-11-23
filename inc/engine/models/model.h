@@ -139,6 +139,8 @@ public:
 	// Prefill chunks run layer by layer as one window (a model that supports it returns more than 1): the chunks are consecutive causal rows of one
 	// slot, each above the decode sizes; only the last one's logits are kept (as LOGITS_LAST). Default: one chunk after the other
 	virtual int window_chunks() const { return 1; }
+	// gather_logits takes every shard pointer it is given, its own rank's too, so a caller can gather rows from a later row of the forward
+	virtual bool gathers_offset_rows() const { return false; }
 	virtual void forward_window( const int* tokens, const pod::BatchRows* chunks, int n, backend::stream_t stream = nullptr ) {
 		int off = 0;
 		for ( int c = 0; c < n; ++c ) {

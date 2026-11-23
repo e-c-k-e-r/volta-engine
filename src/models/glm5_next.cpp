@@ -139,7 +139,7 @@ bool Glm5NextPipeline::init(
 	mla_slots_ = config_.num_mla_layers + ( mtp_on_ ? 1 : 0 );
 	// Window prefill: chunks run layer by layer, the routed experts once over all their rows (not with the MTP head, which reads every prefill row)
 	const int pw = runtime::options().prefill_window < 0 ? 8 : runtime::options().prefill_window;   // -1: GLM's default, 8 chunks
-	window_ = ( !mtp_on_ && pw > 1 ) ? std::min( pw, 8 ) : 1;
+	window_ = ( !mtp_on_ && pw > 1 ) ? std::min( pw, 16 ) : 1;
 	// Routed experts: sharded over the ranks (every rank holds a quarter of every expert's intermediate width, moe_tp,
 	// default) or expert-parallel (72 whole experts per rank, forced by the two-tier expert cache). The sharded layout balances
 	// the load: each active expert costs every rank the same, where expert-parallel waits for the rank that drew the most.
@@ -380,8 +380,9 @@ bool Glm5NextPipeline::init(
 		d_samp_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( B ) * 16 * sizeof( int ) ) );
 		backend::memset_sync( samp_counters_, 0, B * sizeof( int ) );
 		if ( rank_ == 0 ) {
-			// Only whole-distribution consumers (the drafter's tests) need the gathered logits
-			int full_shape[2] = { logit_rows_, config_.vocab_size };
+			// Only whole-distribution consumers need the gathered logits (the drafter's tests; a scoring tool, which gathers a window's rows in slices
+			// of at most 1024: gather_logits takes the peers' shard pointers at the slice's first row)
+			int full_shape[2] = { std::min( logit_rows_, kFullLogitRows ), config_.vocab_size };
 			full_logits_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, full_shape, 2 );
 		}
 	}
@@ -1617,7 +1618,7 @@ const pod::TensorView& Glm5NextPipeline::gather_logits(
 	backend::stream_t stream
 ) {
 	ENGINE_ASSERT( rank_ == 0, "Glm5NextPipeline::gather_logits: only rank 0 materializes the full vocabulary" );
-	ENGINE_ASSERT( rows >= 1 && rows <= last_rows_, "Glm5NextPipeline::gather_logits: rows exceeds last forward rows" );
+	ENGINE_ASSERT( rows >= 1 && rows <= last_rows_ && rows <= std::min( logit_rows_, kFullLogitRows ), "Glm5NextPipeline::gather_logits: rows exceeds last forward rows or the gather buffer" );
 	ENGINE_ASSERT( peer_shard_cols == lm_shard_cols_, "Glm5NextPipeline::gather_logits: shard width mismatch" );
 	full_logits_.shape[0] = rows;
 	// Row r of the gathered buffer is [shard 0 | shard 1 | ...]: source rows are lm_shard_cols_ apart (pad included),
@@ -1625,7 +1626,8 @@ const pod::TensorView& Glm5NextPipeline::gather_logits(
 	for ( int d = 0; d < config_.tp_size; ++d ) {
 		const size_t shard_elems = static_cast<size_t>( 128 * lm_shard_spans( config_.vocab_size, config_.tp_size, d ) );
 		const size_t shard_off = static_cast<size_t>( lm_shard_offset( config_.vocab_size, config_.tp_size, d ) );
-		const backend::half_t* src_base = ( d == rank_ ) ? logits_.ptr<const backend::half_t>() : peer_shard_ptrs[d];
+		// every shard pointer given (this rank's too) may start at a later row of the forward: gather_offset_rows
+		const backend::half_t* src_base = peer_shard_ptrs[d] != nullptr ? peer_shard_ptrs[d] : d == rank_ ? logits_.ptr<const backend::half_t>() : nullptr;
 		ENGINE_ASSERT( src_base != nullptr, "Glm5NextPipeline::gather_logits: missing peer shard pointer" );
 		for ( int r = 0; r < rows; ++r ) {
 			const backend::half_t* src = src_base + static_cast<size_t>( r ) * lm_shard_cols_;
@@ -1774,7 +1776,7 @@ void Glm5NextPipeline::forward_window( const int* tokens, const pod::BatchRows* 
 	const int H = config_.hidden_size;
 	const int R = pod::MAX_ROWS;
 	const int K = config_.top_k;
-	int off[9] = {};
+	int off[17] = {};
 	for ( int c = 0; c < n; ++c ) {
 		ENGINE_ASSERT( chunks[c].count > pod::MAX_BATCH && chunks[c].count <= R, "Glm5NextPipeline::forward_window: chunk size out of range" );
 		off[c + 1] = off[c] + chunks[c].count;

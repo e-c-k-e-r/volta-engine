@@ -166,6 +166,7 @@ public:
 	void embed_tokens_device( const int* d_tokens, int src_dev, int count, backend::stream_t stream = nullptr ) override;
 	void forward( const pod::BatchRows& rows, backend::stream_t stream = nullptr ) override;
 	int window_chunks() const override { return window_; }
+	bool gathers_offset_rows() const override { return true; }
 	void forward_window( const int* tokens, const pod::BatchRows* chunks, int n, backend::stream_t stream = nullptr ) override;
 	void sample_tokens( int* out_preds, int count, backend::stream_t stream = nullptr ) override;
 	bool sample_local( int* out_tokens, float* out_vals, int count, backend::stream_t stream = nullptr ) override;
@@ -335,6 +336,7 @@ private:
 	ModelMetadata metadata_;
 	Glm5NextConfig config_;
 	int rank_ = 0;
+	static constexpr int kFullLogitRows = 1024;   // rows the gathered full-vocabulary buffer holds (rank 0)
 	int logit_rows_ = 16;   // rows the logits buffers hold
 	int lh_ = 16;   // attention heads of this rank (MLA and KDA): 64 / tp_size
 	pod::MemoryArena* arena_ = nullptr;

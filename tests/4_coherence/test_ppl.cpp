@@ -6,6 +6,8 @@
 //   --kl-teacher FILE (a --topk-out file of the same text and settings): also KL( teacher || model ) per position, over the teacher's top K plus
 //     its lumped tail, averaged (--kl-from P: only the positions from P on, e.g. the sequences volta_e2e holds out)
 //   --bins B1,B2,..: the NLL (and the KL) also averaged by position within a row (--seq) or session (--prompts), [0, B1), .., [Bn, end)
+//   GLM: with glm_logit_rows at a prefill window's rows (prefill_window chunks of --chunk), each forward is a window of chunks run layer by layer,
+//   every row scored; --seq rows shorter than a window fill it with several rows, one slot each (max_slots of them)
 //   test_ppl --calibrate --file TEXT --seq 2048 --tokens N   cuts the text into independent rows of 2048 tokens (the slot restarts at each), as calibration rows are
 //   test_ppl --calibrate --prompts DIR [--tokens N] [--chunk C]   replays the rendered prompts a server wrote with dump_requests (req_N.prompt.txt, chat-template tokens
 //   intact): only the last request of each session is used, and the rows it shares with an earlier session (the system prompt and tool schemas) run without
@@ -531,20 +533,27 @@ int main( int argc, char** argv ) {
 	float *d_nll = static_cast<float*>( dev( span * sizeof( float ) ) ), *d_kl = static_cast<float*>( dev( span * sizeof( float ) ) );
 	std::vector<int> h_tgt( span ), h_ids( span * kmax ), h_top( span );
 	std::vector<float> h_p( span * kmax ), h_tail( span ), h_nll( span ), h_kl( span );
+	// GLM gathers the full-vocabulary rows of a window in slices (its gather buffer holds 1024 rows); the other models a forward's rows at once
+	const int gather_rows = glm ? 1024 : span;
 	auto device_rows = [&]( int count, int off ) {
-		backend::stream_t ls = nullptr;
-		const backend::half_t* dl = mc.device_logits( count, &ls );
-		for ( int r = 0; r < count; ++r ) h_tgt[r] = off + r + 1 < n_tokens ? ids[off + r + 1] : -1;
-		backend::memcpy_async( d_tgt, h_tgt.data(), count * sizeof( int ), backend::Copy::H2D, ls );
-		if ( kt_k > 0 ) {
-			const size_t o = static_cast<size_t>( off ) * kt_k;
-			backend::memcpy_async( d_tids, kt_ids.data() + o, count * kt_k * sizeof( int ), backend::Copy::H2D, ls );
-			backend::memcpy_async( d_tp, kt_p.data() + o, count * kt_k * sizeof( float ), backend::Copy::H2D, ls );
-			backend::memcpy_async( d_ttail, kt_tail.data() + off, count * sizeof( float ), backend::Copy::H2D, ls );
-		}
 		const int k = tf ? topk : 0;
-		engine::modules::LogitRows::score( dl, count, V, d_tgt, k, d_ids, d_p, d_tail, kt_k > 0 ? d_tids : nullptr, d_tp, d_ttail, kt_k, nullptr, d_nll, d_top,
-			kt_k > 0 ? d_kl : nullptr, ls );
+		backend::stream_t ls = nullptr;
+		for ( int r0 = 0; r0 < count; r0 += gather_rows ) {
+			const int n = std::min( gather_rows, count - r0 ), o0 = off + r0;
+			const backend::half_t* dl = mc.device_logits( n, &ls, r0 );
+			for ( int r = 0; r < n; ++r ) h_tgt[r0 + r] = o0 + r + 1 < n_tokens ? ids[o0 + r + 1] : -1;
+			backend::memcpy_async( d_tgt + r0, h_tgt.data() + r0, n * sizeof( int ), backend::Copy::H2D, ls );
+			if ( kt_k > 0 ) {
+				const size_t o = static_cast<size_t>( o0 ) * kt_k, d = static_cast<size_t>( r0 ) * kt_k;
+				backend::memcpy_async( d_tids + d, kt_ids.data() + o, n * kt_k * sizeof( int ), backend::Copy::H2D, ls );
+				backend::memcpy_async( d_tp + d, kt_p.data() + o, n * kt_k * sizeof( float ), backend::Copy::H2D, ls );
+				backend::memcpy_async( d_ttail + r0, kt_tail.data() + o0, n * sizeof( float ), backend::Copy::H2D, ls );
+			}
+			const size_t dk = static_cast<size_t>( r0 ) * k, dt = static_cast<size_t>( r0 ) * kt_k;
+			engine::modules::LogitRows::score( dl, n, V, d_tgt + r0, k, d_ids + dk, d_p + dk, d_tail + r0, kt_k > 0 ? d_tids + dt : nullptr, d_tp + dt, d_ttail + r0,
+				kt_k, nullptr, d_nll + r0, d_top + r0, kt_k > 0 ? d_kl + r0 : nullptr, ls );
+			backend::stream_sync( ls );   // the next slice's gather reuses the buffer
+		}
 		backend::memcpy_async( h_nll.data(), d_nll, count * sizeof( float ), backend::Copy::D2H, ls );
 		backend::memcpy_async( h_top.data(), d_top, count * sizeof( int ), backend::Copy::D2H, ls );
 		if ( k > 0 ) {
@@ -627,22 +636,40 @@ int main( int argc, char** argv ) {
 			off += seq;
 			continue;
 		}
-		if ( seq > 0 && pos == 0 ) mc.reset_slot( 0 );
-		int count = std::min( { win > 1 && !calibrate ? span : chunk, n_tokens - off, seq > 0 ? seq - pos : span } );
-		if ( count > chunk ) {
-			// a window of whole chunks above the decode sizes (a short tail runs on its own next)
+		// --seq rows shorter than a window (GLM): several whole rows in one window, row k in slot k (at most max_slots rows), every chunk above the
+		// decode sizes
+		const int cpr = seq > 0 ? ( seq + chunk - 1 ) / chunk : 0;   // chunks per row
+		const int group = seq > 0 && pos == 0 && win > 1 && !calibrate && seq > pod::MAX_BATCH && ( seq % chunk == 0 || seq % chunk > pod::MAX_BATCH )
+			? std::min( { win / std::max( cpr, 1 ), std::max( 1, engine::runtime::options().max_slots ), ( n_tokens - off ) / seq } ) : 0;
+		int count = 0;
+		if ( group >= 2 ) {
 			pod::BatchRows w[16];
-			int n = 0, rows = 0;
-			while ( n < win && count - rows > pod::MAX_BATCH ) {
-				const int c = std::min( chunk, count - rows );
-				w[n++] = pod::BatchRows::causal( c, pos + rows, 0, pod::BatchRows::LOGITS_ALL );
-				rows += c;
+			int n = 0;
+			for ( int k = 0; k < group; ++k ) {
+				mc.reset_slot( k );
+				for ( int p = 0; p < seq; p += chunk ) w[n++] = pod::BatchRows::causal( std::min( chunk, seq - p ), p, k, pod::BatchRows::LOGITS_ALL );
 			}
-			count = rows;
-			if ( n >= 2 ) mc.forward_window( ids.data() + off, w, n );
-			else mc.forward( ids.data() + off, w[0] );
+			count = group * seq;
+			mc.forward_window( ids.data() + off, w, n );
 		}
-		else mc.forward( ids.data() + off, pod::BatchRows::causal( count, pos, 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );
+		else {
+			if ( seq > 0 && pos == 0 ) mc.reset_slot( 0 );
+			count = std::min( { win > 1 && !calibrate ? span : chunk, n_tokens - off, seq > 0 ? seq - pos : span } );
+			if ( count > chunk ) {
+				// a window of whole chunks above the decode sizes (a short tail runs on its own next)
+				pod::BatchRows w[16];
+				int n = 0, rows = 0;
+				while ( n < win && count - rows > pod::MAX_BATCH ) {
+					const int c = std::min( chunk, count - rows );
+					w[n++] = pod::BatchRows::causal( c, pos + rows, 0, pod::BatchRows::LOGITS_ALL );
+					rows += c;
+				}
+				count = rows;
+				if ( n >= 2 ) mc.forward_window( ids.data() + off, w, n );
+				else mc.forward( ids.data() + off, w[0] );
+			}
+			else mc.forward( ids.data() + off, pod::BatchRows::causal( count, pos, 0, calibrate && !flash ? pod::BatchRows::LOGITS_NONE : pod::BatchRows::LOGITS_ALL ) );
+		}
 		if ( mtp_calib ) {
 			const int c = std::min( { count, n_tokens - off - 1, seq > 0 ? seq - pos - 1 : count } );   // a row's last position has no next token inside the row
 			if ( c >= 1 ) mc.mtp_step( 0, pos, c, ids.data() + off + 1, 0, 0, false );
@@ -670,7 +697,7 @@ int main( int argc, char** argv ) {
 			if ( o.has_kl ) {
 				kl_sum += o.kl;
 				++kl_n;
-				kl_bins.add( pos + r, o.kl );
+				kl_bins.add( seq > 0 ? ( off + r ) % seq : off + r, o.kl );
 			}
 			if ( !o.has_nl ) continue;
 			if ( show_miss > 0 && o.nl > 10.0f && static_cast<int>( nll.size() ) % 25 == 0 ) {   // every 25th position of the badly predicted ones: the target and the model's top guess
@@ -680,7 +707,7 @@ int main( int argc, char** argv ) {
 			}
 			nll.push_back( o.nl );
 			total += o.nl;
-			nll_bins.add( pos + r, o.nl );
+			nll_bins.add( seq > 0 ? ( off + r ) % seq : off + r, o.nl );
 		}
 		off += count;
 	}

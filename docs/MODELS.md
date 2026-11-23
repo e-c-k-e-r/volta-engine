@@ -63,9 +63,10 @@ build/volta_server --model-dir <Qwen3.8-27B-exl3> --speculative --set speculator
   dequantized inside the expert GEMM), the other FP8 tensors and the BF16 ones are converted to FP16 at load, and q / k / v and their convolutions are
   stacked per rank as the conversions' fused `qkv_proj` / `conv1d` hold them. Its experts are larger than host RAM: `expert_cache=auto` with
   `expert_stream=true` reads the cold experts of each layer from the checkpoint before the layer runs, and `expert_stream_host_gib` keeps that many GiB
-  of them per rank in pinned RAM instead (read once at load). Prefill is disk-bound; a teacher pass over a text file is
-  `test_ppl --glm --chunk 512 --topk-out <file>` with `glm_logit_rows` at the prefill window's rows (4096 for 8 chunks of 512), each window scoring
-  every row. It can also be the source of the MTP head (`nvfp4_dense_src=<GLM-5.3-Flash>`: layer 45 quantized to NVFP4 from FP8 at load).
+  of them per rank in pinned RAM instead (read once at load); with the expert tier's staging each layer's cold experts are copied to the device once
+  per prefill window, and the next layer's are read from the checkpoint while a layer runs. A teacher pass over a text file is
+  `test_ppl --glm --chunk 512 --topk-out <file>` with `glm_logit_rows` at the prefill window's rows (8192 for `prefill_window=16` chunks of 512), each
+  window scoring every row; with `--seq` rows shorter than a window, one window holds several rows, one slot each (`max_slots` of them). It can also be the source of the MTP head (`nvfp4_dense_src=<GLM-5.3-Flash>`: layer 45 quantized to NVFP4 from FP8 at load).
 * `tp` 1, 2 or 4; on two GPUs the experts need the expert tier (`expert_cache` below 1) to fit. At `tp` 4 with every expert resident, the experts
   are sharded over the ranks. `shared_slice` (on) cuts the shared expert and the dense MLP of layers 0-2 over the ranks.
 * Speculation: the DFlash2 drafter (`draft_model_dir`, taps of layers 5, 14, 24, 33 and 42) keeps a drafter context and tap ring per slot, so

@@ -670,13 +670,15 @@ void ModelCluster::read_logits( int rows, backend::half_t* host_dst ) {
 	backend::stream_sync( streams_[0] );
 }
 
-const backend::half_t* ModelCluster::device_logits( int rows, backend::stream_t* stream ) {
+const backend::half_t* ModelCluster::device_logits( int rows, backend::stream_t* stream, int row0 ) {
 	backend::set_device( 0 );
+	ENGINE_ASSERT( row0 == 0 || models_[0]->gathers_offset_rows(), "ModelCluster::device_logits: this model gathers from the first row only" );
 	const backend::half_t* peer_shards[ENGINE_NUM_GPUS] = { nullptr };
 	int peer_cols = 0;
 	for ( int d = 0; d < tp_; ++d ) {
-		peer_shards[d] = models_[d]->shard_logits_ptr();
 		peer_cols = models_[d]->shard_logits_cols();
+		peer_shards[d] = models_[d]->shard_logits_ptr();
+		if ( peer_shards[d] != nullptr && row0 > 0 ) peer_shards[d] += static_cast<size_t>( row0 ) * peer_cols;
 	}
 	const pod::TensorView& full = models_[0]->gather_logits( rows, peer_shards, peer_cols, streams_[0] );
 	*stream = streams_[0];
