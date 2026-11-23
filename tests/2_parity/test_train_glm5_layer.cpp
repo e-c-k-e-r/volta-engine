@@ -363,6 +363,39 @@ int main( int argc, char** argv ) {
 			}
 			std::snprintf( line, sizeof( line ), "head (KL %.4g per row): streams' gradient, 12 entries: max error %.3g of max %.3g", kl0 / T, w, gm );
 			check( w <= 3e-2 * gm + 1e-4, line );
+			{
+				// the objective KL / 2 + TV / 2 (set_tv_weight): its streams' gradient against central differences of it (TV kinks only where a
+				// probability equals the teacher's)
+				m.set_tv_weight( 0.5f );
+				auto obj = [&]() {
+					double tv = 0.0;
+					const double k = m.head( x, T, t, nullptr, &tv );
+					return 0.5 * k + 0.5 * tv;
+				};
+				double tv0 = 0.0;
+				m.zero_grads();
+				m.head( x, T, t, dx, &tv0 );
+				const std::vector<float> go = down( dx, nx );
+				double wo = 0.0, gmo = 0.0;
+				for ( int s = 0; s < 12; ++s ) {
+					const size_t i = std::uniform_int_distribution<size_t>( 0, nx - 1 )( rng );
+					const float x0 = hs[i], h = 1e-2f * std::max( 1.0f, std::fabs( x0 ) );
+					set( x, i, x0 + h );
+					const double lp = obj();
+					set( x, i, x0 - h );
+					const double lm = obj();
+					set( x, i, x0 );
+					const double fd = ( lp - lm ) / ( 2 * h );
+					wo = std::max( wo, std::fabs( fd - go[i] ) );
+					gmo = std::max( gmo, std::fabs( fd ) );
+				}
+				std::snprintf( line, sizeof( line ), "head, KL / 2 + TV / 2 (TV %.4g per row): streams' gradient, 12 entries: max error %.3g of max %.3g", tv0 / T, wo,
+					gmo );
+				check( wo <= 3e-2 * gmo + 1e-4, line );
+				m.set_tv_weight( 0.0f );
+				m.zero_grads();
+				m.head( x, T, t, dx );   // the KL's gradients again, for the checks below
+			}
 			for ( g5::Tuned* tl : m.tensors() ) {
 				if ( tl->name != "lm_head" ) continue;
 				const std::vector<float> gu = down( tl->gu, tl->k ), gv = down( tl->gv, tl->n );

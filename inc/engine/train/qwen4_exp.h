@@ -212,9 +212,11 @@ void route_dots_pad( const float* dY, const int* prow, const int* pslot, const f
 void kl_lse_update( const float* logits, int rows, int nc, float* m, float* s, backend::stream_t stream );
 void kl_gather( float* logits, int rows, int nc, int c0, const int* ids, int tk, float* sl, backend::stream_t stream );
 // After the last chunk: lt = log of the model's mass outside the top (unnormalized: m + log s), kl [rows], the top entries' gradients gq
-// [rows, tk] = q - p (as p expm1( log q - log p )) and the tail's ut = q_tail - p_tail, made to sum to zero
+// [rows, tk] = q - p (as p expm1( log q - log p )) and the tail's ut = q_tail - p_tail, made to sum to zero. tv_weight w > 0: the gradients
+// are those of ( 1 - w ) KL + w TV instead, TV the total variation over the same buckets ( sum |q - p| / 2: one less the expected acceptance
+// rate with the tails' overlap); tv (null: not wanted) receives each row's TV
 void kl_finish( const float* m, const float* s, const float* sl, const float* p, const float* tail, int rows, int tk, float* lt, float* gq, float* ut, float* kl,
-	backend::stream_t stream );
+	backend::stream_t stream, float tv_weight = 0.0f, float* tv = nullptr );
 // The running max and sum of ranks vocabulary slices ([ranks, rows] each, as gathered) into one (m, s [rows])
 void kl_lse_combine( const float* m_all, const float* s_all, int ranks, int rows, float* m, float* s, backend::stream_t stream );
 // dlogit of a chunk (overwrites dl): exp( logit - lt ) ut for the columns outside the top, gq at the teacher's ids
@@ -301,9 +303,11 @@ public:
 	void forward( int L, const float* x_in, float* x_out, int rows, const float* ple_k, const float* ple_v, bool keep = false, int seqs = 1 );
 	// Its backward: dx_in (overwritten) from dx_out, the forward recomputed from x_in; scale gradients accumulate in every tensor's gu / gv
 	void backward( int L, const float* x_in, const float* dx_out, float* dx_in, int rows, const float* ple_k, const float* ple_v, int seqs = 1 );
-	// The head on the final streams x (the rank's rows): KL( teacher || model ) summed over all rows (returned; the teacher's rows: all);
-	// with dx, its gradient (overwritten) and the lm_head scale gradients
-	double head( const float* x, int rows, const Teacher& t, float* dx );
+	// The head on the final streams x (the rank's rows): KL( teacher || model ) summed over all rows (returned; the teacher's rows: all), and
+	// into tv_sum the total variation summed (kl_finish); with dx, the objective's gradient (overwritten) and the lm_head scale gradients
+	double head( const float* x, int rows, const Teacher& t, float* dx, double* tv_sum = nullptr );
+	// The head's objective: ( 1 - w ) KL + w TV (0, the default: the KL alone)
+	void set_tv_weight( float w );
 
 	// Routing held fixed at the selection of each layer's last call (for gradient checks across a perturbation; the weights still follow
 	// the logits); off: every call selects

@@ -1165,9 +1165,11 @@ __global__ void k_kl_gather( float* logits, int rows, int nc, int c0, const int*
 }
 
 // One thread per row. Bucket log-probabilities against the full LSE (the tail and the top entries combined stably); the gradients from
-// log differences: q - p = p expm1( log q - log p ); then g = u - q sum( u ) over the buckets so that they sum to zero
+// log differences: q - p = p expm1( log q - log p ); then g = u - q sum( u ) over the buckets so that they sum to zero. With w > 0 the
+// buckets' u are those of ( 1 - w ) KL + w TV, TV = ( sum |q - p| ) / 2 over the buckets (dTV / dq = sign( q - p ) / 2, u = q dTV / dq: the
+// same zero-sum step makes it the logits' gradient), and tv[r] the row's TV
 __global__ void k_kl_finish( const float* m, const float* s, const float* sl, const float* p, const float* tail, int rows, int tk, float* lt, float* gq,
-	float* ut, float* kl ) {
+	float* ut, float* kl, float w, float* tv ) {
 	Q4E_LOOP( r, (size_t) rows ) {
 		const float ltr = s[r] > 0.0f ? m[r] + logf( s[r] ) : -INFINITY;
 		float mx = ltr;
@@ -1197,6 +1199,27 @@ __global__ void k_kl_finish( const float* m, const float* s, const float* sl, co
 		}
 		else u_t = expf( lqt );
 		usum += u_t;
+		if ( w > 0.0f ) {
+			// the TV term: per bucket q sign( q - p ) / 2, mixed into u
+			float d = 0.0f;
+			usum = 0.0f;
+			for ( int j = 0; j < tk; ++j ) {
+				const float q = expf( sl[r * tk + j] - lse ), pp = p[r * tk + j], g = 0.5f * ( q > pp ? 1.0f : q < pp ? -1.0f : 0.0f );
+				d += fabsf( q - pp );
+				gq[r * tk + j] = ( 1.0f - w ) * gq[r * tk + j] + w * q * g;
+				usum += gq[r * tk + j];
+			}
+			const float q = expf( lqt ), g = 0.5f * ( q > pt ? 1.0f : q < pt ? -1.0f : 0.0f );
+			d += fabsf( q - pt );
+			u_t = ( 1.0f - w ) * u_t + w * q * g;
+			usum += u_t;
+			if ( tv ) tv[r] = 0.5f * d;
+		}
+		else if ( tv ) {
+			float d = fabsf( expf( lqt ) - pt );
+			for ( int j = 0; j < tk; ++j ) d += fabsf( expf( sl[r * tk + j] - lse ) - p[r * tk + j] );
+			tv[r] = 0.5f * d;
+		}
 		// zero sum: subtract q_bucket * sum( u )
 		for ( int j = 0; j < tk; ++j ) gq[r * tk + j] -= expf( sl[r * tk + j] - lse ) * usum;
 		ut[r] = u_t - expf( lqt ) * usum;
@@ -1587,8 +1610,8 @@ void kl_gather( float* logits, int rows, int nc, int c0, const int* ids, int tk,
 }
 
 void kl_finish( const float* m, const float* s, const float* sl, const float* p, const float* tail, int rows, int tk, float* lt, float* gq, float* ut, float* kl,
-	backend::stream_t stream ) {
-	k_kl_finish<<<blocks_for( rows ), 256, 0, cu( stream )>>>( m, s, sl, p, tail, rows, tk, lt, gq, ut, kl );
+	backend::stream_t stream, float tv_weight, float* tv ) {
+	k_kl_finish<<<blocks_for( rows ), 256, 0, cu( stream )>>>( m, s, sl, p, tail, rows, tk, lt, gq, ut, kl, tv_weight, tv );
 }
 
 void kl_lse_combine( const float* m_all, const float* s_all, int ranks, int rows, float* m, float* s, backend::stream_t stream ) {

@@ -177,6 +177,7 @@ struct Model::Impl {
 	bool frozen = false;
 	bool fp16 = true;
 	bool timing = false;
+	float tv_weight = 0.0f;          // the head's objective ( 1 - w ) KL + w TV
 	std::map<std::string, double> times;
 	std::chrono::steady_clock::time_point t_mark;
 	std::vector<std::vector<int>> last_ids;
@@ -1217,7 +1218,7 @@ void Model::backward( int L, const float* x_in, const float* dx_out, float* dx_i
 	p_->run( L, x_in, nullptr, rows, dx_out, dx_in, false, seqs );
 }
 
-double Model::head( const float* x, int rows, const Teacher& t, float* dx ) {
+double Model::head( const float* x, int rows, const Teacher& t, float* dx, double* tv_sum ) {
 	Impl& m = *p_;
 	CUDA_CHECK( cudaSetDevice( device_ ) );
 	ENGINE_ASSERT( m.head, "glm5_next training model: this range has no head" );
@@ -1257,13 +1258,16 @@ double Model::head( const float* x, int rows, const Teacher& t, float* dx ) {
 		m.sum_ranks( sl, TR * t.tk );
 	}
 	m.phase( "head fwd" );
-	float *lt = m.ws.f( TR ), *gq = m.ws.f( TR * t.tk ), *kl = m.ws.f( TR ), *ut = m.ws.f( TR );
-	q4::kl_finish( mx, sx, sl, t.p, t.tail, rows, t.tk, lt, gq, ut, kl, m.st );
-	std::vector<float> h_kl( TR );
+	float *lt = m.ws.f( TR ), *gq = m.ws.f( TR * t.tk ), *kl = m.ws.f( TR ), *ut = m.ws.f( TR ), *tvr = m.ws.f( TR );
+	q4::kl_finish( mx, sx, sl, t.p, t.tail, rows, t.tk, lt, gq, ut, kl, m.st, m.tv_weight, tvr );
+	std::vector<float> h_kl( TR ), h_tv( TR );
 	CUDA_CHECK( cudaMemcpyAsync( h_kl.data(), kl, TR * sizeof( float ), cudaMemcpyDeviceToHost, m.st ) );
+	CUDA_CHECK( cudaMemcpyAsync( h_tv.data(), tvr, TR * sizeof( float ), cudaMemcpyDeviceToHost, m.st ) );
 	CUDA_CHECK( cudaStreamSynchronize( m.st ) );
-	double total = 0.0;
+	double total = 0.0, tv_total = 0.0;
 	for ( float v : h_kl ) total += v;
+	for ( float v : h_tv ) tv_total += v;
+	if ( tv_sum ) *tv_sum = tv_total;
 	if ( dx == nullptr ) return total;
 	float *dhn_part = m.ws.fz( TR * H, m.st ), *dl = m.ws.f( TR * NC ), *sn = m.ws.f( TR * NC ), *sk = m.ws.f( TR * H );
 	for ( int c0 = v0; c0 < v1; c0 += NC ) {
@@ -1287,6 +1291,11 @@ void Model::freeze_routing( bool on ) { p_->frozen = on; }
 const std::vector<int>& Model::selection( int L ) const { return p_->last_ids.at( static_cast<size_t>( L - first_ ) ); }
 
 void Model::set_fp16( bool on ) { p_->fp16 = on; }
+
+void Model::set_tv_weight( float w ) {
+	ENGINE_ASSERT( w >= 0.0f && w <= 1.0f, "glm5_next training model: the TV weight is in [0, 1]" );
+	p_->tv_weight = w;
+}
 
 void Model::set_expert_host( bool on, double device_gib ) {
 	p_->expert_host = on;

@@ -77,9 +77,12 @@ public:
 	void forward( int L, const float* x_in, float* x_out, int rows, bool keep = false, int seqs = 1 );
 	// Its backward: dx_in (overwritten) from dx_out, the forward recomputed from x_in; scale gradients accumulate in every tensor's gu / gv
 	void backward( int L, const float* x_in, const float* dx_out, float* dx_in, int rows, int seqs = 1 );
-	// The head on the final streams x (the rank's rows): KL( teacher || model ) summed over all rows (returned; the teacher's rows: all);
-	// with dx, its gradient (overwritten) and the lm_head scale gradients
-	double head( const float* x, int rows, const Teacher& t, float* dx );
+	// The head on the final streams x (the rank's rows): KL( teacher || model ) summed over all rows (returned; the teacher's rows: all), and
+	// into tv_sum the total variation summed (over the teacher's top entries and the lumped tail: one less the expected acceptance rate with the
+	// tails' overlap); with dx, the objective's gradient (overwritten) and the lm_head scale gradients
+	double head( const float* x, int rows, const Teacher& t, float* dx, double* tv_sum = nullptr );
+	// The head's objective: ( 1 - w ) KL + w TV (0, the default: the KL alone; 1: the total variation, which the acceptance rate measures)
+	void set_tv_weight( float w );
 
 	// Routing held fixed at the selection of each layer's last call (for gradient checks across a perturbation; the weights still follow
 	// the logits); off: every call selects

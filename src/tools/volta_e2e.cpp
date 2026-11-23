@@ -19,11 +19,13 @@
 // keeps the optimizer's state in pinned host memory (the devices hold the current values, their gradients and one part of the state: each
 // step streams the state through in parts). --seqs N runs up to N of a step's --batch sequences (and of the held-out ones) through each
 // layer call together (the same gradients; more rows per product, the layer inputs and the workspace N times larger). The memory per
-// component is logged after the first step.
+// component is logged after the first step. --tv w (with --tp 1) trains ( 1 - w ) KL + w TV instead of the KL, TV the total variation over the
+// teacher's top entries and the lumped tail (one less the expected acceptance rate, which the logs give beside the KL); the best held-out
+// value of that objective picks the values written.
 //
 //   volta_e2e --model <EXL3 dir> --inputs <train_inputs file> --teacher <topk file> --out <dir> [--devices 0,1,2,3] [--tp 1] [--fp16 1]
 //             [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--hc 0] [--hc-lr 0.1] [--gains 0] [--gains-lr 1] [--reencode L] [--reencode-steps 0,0.003,0.01,0.03,0.1] [--reencode-feedback 0] [--steps 64] [--batch 4] [--seqs 1] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1]
-//             [--adam-bits 32|8] [--opt-host 0|1] [--timing 0|1] [--check-trace FILE]
+//             [--adam-bits 32|8] [--opt-host 0|1] [--tv 0] [--timing 0|1] [--check-trace FILE]
 //   --check-trace: a trace_layers file of the model's engine forward over the first sequence (test_ppl --calibrate --chunk 512): every layer of
 //     the training form fed the engine's input streams of that layer, its output against the engine's, and the first sequence's embedding
 //     streams against the engine's; then exits (the layer split). The trace may come from another checkpoint of the model (the same text
@@ -89,6 +91,7 @@ struct Args {
 		gains = false;
 	float lr = 1e-3f, lr_min = 0.1f, dense_lr = 0.1f, hc_lr = 0.1f, gains_lr = 1.0f;
 	double expert_gib = 0.0;                                   // GLM: routed experts' codes kept on each device up to this size (whole layers)
+	float tv = 0.0f;                                           // the objective ( 1 - tv ) KL + tv TV (TV: one less the acceptance rate)
 	int reencode = -1;                                         // code updates of this layer's routed experts instead of training
 	bool reencode_feedback = false;                            // with the LDL feedback (else each tile on its own)
 	std::vector<float> reencode_steps = { 0.0f, 0.003f, 0.01f, 0.03f, 0.1f };
@@ -194,6 +197,7 @@ bool parse( int argc, char** argv, Args& a ) {
 		else if ( k == "--gains-lr" ) a.gains_lr = std::stof( v );
 		else if ( k == "--opt-host" ) a.opt_host = v != "0";
 		else if ( k == "--expert-gib" ) a.expert_gib = std::stod( v );
+		else if ( k == "--tv" ) a.tv = std::stof( v );
 		else if ( k == "--adam-bits" ) a.adam_bits = std::stoi( v );
 		else if ( k == "--write" ) a.write = v != "0";
 		else if ( k == "--timing" ) a.timing = v != "0";
@@ -222,10 +226,11 @@ bool parse( int argc, char** argv, Args& a ) {
 			return false;
 		}
 	}
-	if ( a.model.empty() || a.teacher.empty() || a.out.empty() || ( a.adam_bits != 32 && a.adam_bits != 8 ) || a.seqs < 1 ) {
+	if ( a.model.empty() || a.teacher.empty() || a.out.empty() || ( a.adam_bits != 32 && a.adam_bits != 8 ) || a.seqs < 1 || a.tv < 0.0f || a.tv > 1.0f ||
+		( a.tv > 0.0f && !a.tp ) ) {
 		LOG_ERROR( "usage: volta_e2e --model <EXL3 dir> --teacher <topk file> --out <dir> [--inputs <train_inputs file>] [--devices 0,1,2,3] [--tp 1] "
 			"[--fp16 1] [--norms 1] [--dense 0] [--dense-lr 0.1] [--router 0] [--hc 0] [--hc-lr 0.1] [--gains 0] [--gains-lr 1] [--reencode L] [--reencode-steps 0,0.003,0.01,0.03,0.1] [--reencode-feedback 0] [--steps 64] [--batch 4] [--seqs 1] [--lr 1e-3] [--warmup 2] [--lr-min 0.1] [--hold 4] [--train N] [--eval-every 16] [--write 0|1] "
-			"[--adam-bits 32|8] [--opt-host 0|1] [--ckpt-host -1|0|1] [--keep -1|0|1] [--qsa 1] [--timing 0|1] [--check-trace FILE]" );
+			"[--adam-bits 32|8] [--opt-host 0|1] [--tv 0] [--ckpt-host -1|0|1] [--keep -1|0|1] [--qsa 1] [--timing 0|1] [--check-trace FILE]" );
 		return false;
 	}
 	return true;
@@ -589,6 +594,7 @@ int train_tp( const Args& a, const C& cfg, const Data& d, const g5::Embedding* e
 		ok[r] = m->load( a.model, 0, cfg.layers, dev, R, r, n, comms[r] ) ? 1 : 0;
 		m->set_fp16( a.fp16 );
 		m->set_train_norms( a.norms );
+		m->set_tv_weight( a.tv );
 		if constexpr ( !glm ) {
 			m->set_qsa( a.qsa );
 			m->set_router_calibration( a.router_calib );
@@ -806,6 +812,7 @@ int train_tp( const Args& a, const C& cfg, const Data& d, const g5::Embedding* e
 			}
 		}
 		// Sequences sqs (up to --seqs) in one pass: the forward over all layers (saving each layer's input), the KL head, optionally the backward
+		double tv_acc = 0.0;   // the head's total variation summed since the last reset (one less the acceptance rate, per token)
 		auto run = [&]( const std::vector<int>& sqs, bool train ) -> double {
 			const int c = static_cast<int>( sqs.size() ), Rc = c * T, Rcl = Rc / n;
 			inputs( sqs, Rc, Rcl );
@@ -837,7 +844,9 @@ int train_tp( const Args& a, const C& cfg, const Data& d, const g5::Embedding* e
 			t.p = t_p;
 			t.tail = t_tail;
 			t.tk = d.k;
-			const double kl = m->head( xf, Rc, t, train ? dx : nullptr );
+			double tv = 0.0;
+			const double kl = m->head( xf, Rc, t, train ? dx : nullptr, &tv );
+			tv_acc += tv;
 			if ( !train ) return kl;
 			if ( !ckpt_host ) {
 				for ( int L = cfg.layers - 1; L >= 0; --L ) {
@@ -864,23 +873,28 @@ int train_tp( const Args& a, const C& cfg, const Data& d, const g5::Embedding* e
 			return kl;
 		};
 		// with the routing teacher, the routing KL per token and layer of the last held-out pass (rank 0)
-		double ho_router = 0.0, ho_shared = 0.0, tr_shared = 0.0;
+		double ho_router = 0.0, ho_shared = 0.0, tr_shared = 0.0, ho_tv = 0.0;
 		// the routing KL since the last call (Flash-Next's routing teacher), and the share of the teacher's experts picked into sh
 		auto router_kl = [&]( double* sh ) -> double {
 			if constexpr ( glm ) return 0.0;
 			else return m->router_kl( sh );
 		};
+		// the held-out KL per token (returned) and TV per token (ho_tv)
 		auto held_out = [&]() {
 			double kl = 0.0;
 			router_kl( nullptr );
+			tv_acc = 0.0;
 			for ( int s0 = train_n; s0 < S; s0 += P ) {
 				std::vector<int> sqs;
 				for ( int sq = s0; sq < std::min( S, s0 + P ); ++sq ) sqs.push_back( sq );
 				kl += run( sqs, false );
 			}
 			ho_router = router_kl( &ho_shared ) / ( static_cast<double>( a.hold ) * T * std::max( r_layers_n, 1 ) );
+			ho_tv = tv_acc / ( static_cast<double>( a.hold ) * T );
 			return kl / ( static_cast<double>( a.hold ) * T );
 		};
+		// the objective the steps take (--tv w: ( 1 - w ) KL + w TV), which picks the best values
+		auto objective = [&]( double kl, double tv ) { return ( 1.0 - a.tv ) * kl + a.tv * tv; };
 		auto routing_note = [&]( double v, double sh ) {
 			std::string s;
 			if ( routing ) {
@@ -891,9 +905,10 @@ int train_tp( const Args& a, const C& cfg, const Data& d, const g5::Embedding* e
 			return s;
 		};
 		const auto th0 = std::chrono::steady_clock::now();
-		double my_best = held_out();
+		const double kl0 = held_out();
+		double my_best = objective( kl0, ho_tv );
 		if ( r == 0 )
-			LOG_INFO( "[volta_e2e] held-out KL before tuning %.6f per token%s (%.1f s)", my_best, routing_note( ho_router, ho_shared ).c_str(),
+			LOG_INFO( "[volta_e2e] held-out KL before tuning %.6f per token, EAR %.4f%s (%.1f s)", kl0, 1.0 - ho_tv, routing_note( ho_router, ho_shared ).c_str(),
 				std::chrono::duration<double>( std::chrono::steady_clock::now() - th0 ).count() );
 		m->keep_best();
 		if constexpr ( !glm ) if ( a.reencode >= 0 ) {
@@ -953,11 +968,13 @@ int train_tp( const Args& a, const C& cfg, const Data& d, const g5::Embedding* e
 			const auto ts = std::chrono::steady_clock::now();
 			m->zero_grads();
 			double kl = 0.0;
+			tv_acc = 0.0;
 			for ( int b = 0; b < a.batch; b += P ) {
 				std::vector<int> sqs;
 				for ( int i = b; i < std::min( a.batch, b + P ); ++i ) sqs.push_back( order.at( used++ ) );
 				kl += run( sqs, !a.router_calib );   // router calibration: forward passes (the routers' gradient comes with them)
 			}
+			const double tr_tv = tv_acc / ( static_cast<double>( a.batch ) * T );
 			o.lr = lr_at( a, step );
 			m->adam( o, step, 1.0f / ( static_cast<float>( a.batch ) * T ) );
 			if ( step == 1 ) {
@@ -982,16 +999,16 @@ int train_tp( const Args& a, const C& cfg, const Data& d, const g5::Embedding* e
 			}
 			const double tr_router = router_kl( &tr_shared ) / ( static_cast<double>( a.batch ) * T * std::max( r_layers_n, 1 ) );
 			if ( r == 0 )
-				LOG_INFO( "[volta_e2e] step %d: train KL %.6f per token%s, lr %.3g, %.1f s", step, kl / ( static_cast<double>( a.batch ) * T ),
+				LOG_INFO( "[volta_e2e] step %d: train KL %.6f per token, EAR %.4f%s, lr %.3g, %.1f s", step, kl / ( static_cast<double>( a.batch ) * T ), 1.0 - tr_tv,
 					routing_note( tr_router, tr_shared ).c_str(), o.lr, std::chrono::duration<double>( std::chrono::steady_clock::now() - ts ).count() );
 			if ( step % a.eval_every == 0 || step == a.steps ) {
 				const bool was = a.timing;
 				if ( was ) m->set_timing( false );
-				const double ho = held_out();
+				const double hkl = held_out(), ho = objective( hkl, ho_tv );
 				if ( was ) m->set_timing( true );
 				if ( r == 0 )
-					LOG_INFO( "[volta_e2e] step %d: held-out KL %.6f per token%s (best %.6f at step %d)", step, ho, routing_note( ho_router, ho_shared ).c_str(),
-						std::min( ho, my_best ), ho < my_best ? step : my_step );
+					LOG_INFO( "[volta_e2e] step %d: held-out KL %.6f per token, EAR %.4f%s (objective %.6f, best %.6f at step %d)", step, hkl, 1.0 - ho_tv,
+						routing_note( ho_router, ho_shared ).c_str(), ho, std::min( ho, my_best ), ho < my_best ? step : my_step );
 				if ( ho < my_best ) {
 					my_best = ho;
 					my_step = step;
@@ -1020,7 +1037,7 @@ int train_tp( const Args& a, const C& cfg, const Data& d, const g5::Embedding* e
 	for ( ncclComm_t c : comms ) if ( c ) ncclCommDestroy( c );
 	for ( int g = 0; g < n; ++g ) if ( !ok[g] ) return 1;
 	if ( !a.write ) {
-		LOG_INFO( "[volta_e2e] done (--write 0: no checkpoint written): best held-out KL %.6f per token at step %d", best, best_step );
+		LOG_INFO( "[volta_e2e] done (--write 0: no checkpoint written): best held-out objective %.6f per token at step %d", best, best_step );
 		return 0;
 	}
 	Best all;
@@ -1030,8 +1047,8 @@ int train_tp( const Args& a, const C& cfg, const Data& d, const g5::Embedding* e
 	}
 	int replaced = 0;
 	if ( !write_out( a, all, replaced ) ) return 1;
-	LOG_INFO( "[volta_e2e] done: %s, %d scale vectors and norms from step %d (held-out KL %.6f per token), %.1f min", a.out.c_str(), replaced, best_step, best,
-		std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() / 60.0 );
+	LOG_INFO( "[volta_e2e] done: %s, %d scale vectors and norms from step %d (held-out objective %.6f per token), %.1f min", a.out.c_str(), replaced, best_step,
+		best, std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() / 60.0 );
 	return 0;
 }
 
