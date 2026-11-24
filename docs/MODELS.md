@@ -83,6 +83,10 @@ build/volta_server --model-dir <Qwen3.8-27B-exl3> --speculative --set speculator
   * `kv_format=nvfp4` stores the single latent tensor in 4 bits (`fp8`, `k8v4` = 8 bits; against FP16 the 4-bit cache moves the perplexity by +0.008 NLL
     on 3000 tokens, FP8 by +0.001); `kv_pool=<tokens>` lets the slots share one pool of KV pages
     instead of owning `max_seq` each: a request starts once the pool holds its prompt, and one that grows past it ends with finish reason `length`.
+  * `kv_shard=true` (with `kv_pool`, 2 or 4 GPUs) spreads the latent cache over the GPUs: page p of a slot lives on GPU p % tp, which stores its
+    rows, and the attention reads the rows it selects from the GPU that holds them over NVLink, so each GPU keeps a quarter of the latent pages at
+    tp 4. The pooled indexer keys stay on every GPU. A GPU then reads the owner's copy of a row, which can differ from its own in the last
+    bit (each GPU sums the all-reduce starting from its own part), so the results match the unsharded cache up to that rounding.
   * with the expert tier, `expert_stage` copies a layer's cold experts once into device scratch for prefill chunks, `route_resident_bias` adds a bias to the
     router score of resident experts (near-ties go to the device; it changes the routing), `cpu_experts` hands part of the cold experts to the CPU.
   * `prefill_window` (default 8) prefills several chunks layer by layer so the routed experts run once over all their rows; `moe_heavy_rows=256` runs an

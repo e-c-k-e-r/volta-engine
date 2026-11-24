@@ -115,6 +115,8 @@ public:
 	// Bytes the arena must still hold after the weights (the speculator's); a model sizing something from the free arena keeps them back. Before load_weights
 	virtual void set_reserve_after_weights( size_t bytes ) { (void) bytes; }
 	virtual bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) = 0;
+	// After every rank's init, before load_weights: the other ranks' pipelines (index = rank), for state one rank reads from another (GLM's kv_shard)
+	virtual void link_ranks( ModelPipeline* const* ranks, int n ) { (void) ranks; (void) n; }
 	virtual bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) = 0;
 	// A model that sizes its routed experts from what the arena has left (expert_cache=auto) can load them after the speculator: with
 	// defer_experts( true ) before load_weights, load_weights stops before the experts and load_experts places them once the speculator is

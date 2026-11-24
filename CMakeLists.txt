@@ -925,6 +925,10 @@ add_executable(test_kv_pages tests/2_parity/test_kv_pages.cpp)
 target_link_libraries(test_kv_pages PRIVATE engine_kernels)
 set_target_properties(test_kv_pages PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+add_executable(test_kv_shard tests/2_parity/test_kv_shard.cpp)
+target_link_libraries(test_kv_shard PRIVATE engine_kernels)
+set_target_properties(test_kv_shard PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(bench_expert_heat tests/3_bench/bench_expert_heat.cpp)
 target_link_libraries(bench_expert_heat PRIVATE engine_kernels)
 set_target_properties(bench_expert_heat PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

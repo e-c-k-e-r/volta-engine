@@ -252,7 +252,29 @@ bool Glm5NextPipeline::init(
 			latent_slot_stride_ = static_cast<size_t>( mla_slots_ ) * kv_pool_tokens_ * 512;
 			cache_slots = 1;
 			if ( rank_ == 0 ) LOG_INFO( "[kv] shared token pool: %d tokens in pages of %d for %d slots of up to %d tokens\n", kv_pool_tokens_, page, S, config_.max_seq );
+#if ENGINE_BACKEND_CUDA
+			kv_shard_ = runtime::options().kv_shard && config_.tp_size > 1;
+#endif
+			if ( kv_shard_ ) {
+				// A rank's share of the pages, plus one per slot: every slot's first page is on rank 0
+				const int tp = config_.tp_size;
+				kv_shard_pages_ = ( kv_pool_tokens_ / page + tp - 1 ) / tp + S;
+				shard_table_.assign( kv_table_.size(), 0 );
+				shard_free_.assign( tp, {} );
+				for ( auto& f : shard_free_ ) for ( int p = kv_shard_pages_ - 1; p >= 0; --p ) f.push_back( p );
+				d_shard_table_ = static_cast<int*>( engine::core::arena_alloc( arena, shard_table_.size() * sizeof( int ), 128 ) );
+				d_shard_bases_ = static_cast<void**>( engine::core::arena_alloc( arena, 2 * ENGINE_NUM_GPUS * sizeof( void* ), 128 ) );
+				int sync_shape[2] = { 1, 128 };
+				shard_sync_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, sync_shape, 2 );
+				ENGINE_ASSERT( d_shard_table_ != nullptr && d_shard_bases_ != nullptr && shard_sync_.data != nullptr, "Glm5NextPipeline::init: arena exhausted allocating the kv_shard tables" );
+				backend::memset_sync( d_shard_table_, 0, shard_table_.size() * sizeof( int ) );
+				backend::memset_sync( d_shard_bases_, 0, 2 * ENGINE_NUM_GPUS * sizeof( void* ) );
+				backend::memset_sync( shard_sync_.data, 0, 128 * sizeof( backend::half_t ) );
+				latent_slot_stride_ = static_cast<size_t>( mla_slots_ ) * kv_shard_pages_ * page * 512;
+				if ( rank_ == 0 ) LOG_INFO( "[kv] kv_shard: the latent cache spread over %d GPUs, %d pages of %d tokens per GPU\n", tp, kv_shard_pages_, page );
+			}
 		}
+		if ( runtime::options().kv_shard && !kv_shard_ && rank_ == 0 ) LOG_WARN( "[kv] kv_shard needs kv_pool, tp 2 or 4 and the CUDA build: the latent cache stays on every GPU\n" );
 		// kv_format applies to the latent as one tensor: k8v4 stores it as 8-bit (K precision), the others as named
 		const std::string& fmt = engine::runtime::options().kv_format;
 		if ( fmt == "fp8" ) latent_q_ = pod::KVQ::E5M2;
@@ -513,7 +535,29 @@ pod::KVRef Glm5NextPipeline::latent_ref() const {
 	r.kq = latent_q_;
 	r.vq = latent_q_;
 	r.pages = kv_pages();
+	if ( kv_shard_ ) {
+		r.pages.shard_table = d_shard_table_;
+		r.pages.shard_bases = d_shard_bases_;
+		r.pages.ranks = config_.tp_size;
+		r.pages.rank = rank_;
+		r.pages.shard_pool_tokens = static_cast<size_t>( kv_shard_pages_ ) << kKvPageShift;
+	}
 	return r;
+}
+
+void Glm5NextPipeline::link_ranks( engine::models::ModelPipeline* const* ranks, int n ) {
+	if ( !kv_shard_ ) return;
+	ENGINE_ASSERT( n == config_.tp_size, "Glm5NextPipeline::link_ranks: one pipeline per rank" );
+	// The owners' arrays, read through peer access (the collective's setup enables it between every pair)
+	void* bases[2 * ENGINE_NUM_GPUS] = {};
+	for ( int r = 0; r < n; ++r ) {
+		const auto* p = dynamic_cast<const Glm5NextPipeline*>( ranks[r] );
+		ENGINE_ASSERT( p != nullptr && p->kv_shard_ && p->kv_shard_pages_ == kv_shard_pages_, "Glm5NextPipeline::link_ranks: every rank needs the same kv_shard pool" );
+		bases[r] = p->latent_cache_;
+		bases[n + r] = p->latent_scales_;
+	}
+	backend::set_device( rank_ );
+	backend::memcpy_sync( d_shard_bases_, bases, 2 * n * sizeof( void* ), backend::Copy::H2D );
 }
 
 pod::KVPages Glm5NextPipeline::kv_pages() const {
@@ -533,9 +577,23 @@ bool Glm5NextPipeline::reserve_tokens( int slot_id, int tokens ) {
 	int& have = kv_slot_pages_[slot_id];
 	if ( need <= have ) return true;
 	if ( static_cast<int>( kv_free_.size() ) < need - have ) return false;
+	if ( kv_shard_ ) {
+		const int tp = config_.tp_size;
+		for ( int o = 0; o < tp; ++o ) {
+			int pages = 0;
+			for ( int lp = have; lp < need; ++lp ) pages += lp % tp == o;
+			if ( static_cast<int>( shard_free_[o].size() ) < pages ) return false;
+		}
+	}
 	for ( ; have < need; ++have ) {
-		kv_table_[static_cast<size_t>( slot_id ) * kv_pages_per_slot_ + have] = kv_free_.back();
+		const size_t at = static_cast<size_t>( slot_id ) * kv_pages_per_slot_ + have;
+		kv_table_[at] = kv_free_.back();
 		kv_free_.pop_back();
+		if ( kv_shard_ ) {
+			auto& f = shard_free_[have % config_.tp_size];
+			shard_table_[at] = f.back();
+			f.pop_back();
+		}
 	}
 	kv_dirty_ = true;
 	return true;
@@ -546,9 +604,13 @@ void Glm5NextPipeline::release_tokens( int slot_id ) {
 	if ( kv_pool_tokens_ == 0 ) return;
 	// Highest page first, so a slot that starts again takes the pool's lowest pages in order
 	for ( int i = kv_slot_pages_[slot_id] - 1; i >= 0; --i ) {
-		int& e = kv_table_[static_cast<size_t>( slot_id ) * kv_pages_per_slot_ + i];
-		kv_free_.push_back( e );
-		e = 0;
+		const size_t at = static_cast<size_t>( slot_id ) * kv_pages_per_slot_ + i;
+		kv_free_.push_back( kv_table_[at] );
+		kv_table_[at] = 0;
+		if ( kv_shard_ ) {
+			shard_free_[i % config_.tp_size].push_back( shard_table_[at] );
+			shard_table_[at] = 0;
+		}
 	}
 	kv_slot_pages_[slot_id] = 0;
 	kv_dirty_ = true;
@@ -646,6 +708,7 @@ void Glm5NextPipeline::kv_prepare( const pod::BatchRows& rows, backend::stream_t
 	}
 	if ( !kv_dirty_ ) return;
 	backend::memcpy_async( d_kv_table_, kv_table_.data(), kv_table_.size() * sizeof( int ), backend::Copy::H2D, stream );
+	if ( kv_shard_ ) backend::memcpy_async( d_shard_table_, shard_table_.data(), shard_table_.size() * sizeof( int ), backend::Copy::H2D, stream );
 	kv_dirty_ = false;
 }
 
@@ -2083,6 +2146,11 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 					backend::stream_join( stream, sk );
 					backend::stream_join( stream, sx );
 				}
+				if ( kv_shard_ ) {
+					// Every rank's rows of this forward stored before any rank reads them (a reduction that completes only once every peer took part)
+					pod::TensorView sync = shard_sync_;
+					ring_->all_reduce( sync, stream );
+				}
 				engine::modules::MLALatent::attend( latent_ref(), q_lat, o_lat, mla_idx, config_.max_seq, m, lh_, kv_ref, latent_ws_, key_hint_, stream, sel_idx, sel_n, ws_seq_ );
 				static const bool dsa_diag = runtime::options().dsa_diag;
 				if ( dsa_diag && sel_idx != nullptr && m > pod::MAX_BATCH && rank_ == 0 && lh_ == 16 ) {
@@ -2577,12 +2645,20 @@ void Glm5NextPipeline::copy_seq_rows( int slot_id, int from, int tokens, char* h
 			move( dsa_pool_ + static_cast<size_t>( slot_id ) * dsa_pool_stride_ + ( static_cast<size_t>( layer ) * NP + pool_from ) * D, h_pool, pool_bytes );
 			continue;
 		}
-		// Pooled: one range per page. The pooled key of tokens [4p, 4p + 4) sits in the page of token 4p.
+		// Pooled: one range per page. The pooled key of tokens [4p, 4p + 4) sits in the page of token 4p. With kv_shard a rank moves the latent
+		// rows of its own pages only (its host copy keeps the layout, the other ranks' rows unset): a page's owner follows from its position,
+		// so a restore puts every row back on the rank that saved it
 		for_kv_ranges( slot_id, from, tokens, [&]( int t, int n, size_t phys ) {
-			const size_t lat_off = ( static_cast<size_t>( layer ) * kv_pool_tokens_ + phys ) * 512;
+			const int lp = t >> kKvPageShift;
+			const bool own = !kv_shard_ || lp % config_.tp_size == rank_;
+			const size_t lat_phys = kv_shard_ ? ( static_cast<size_t>( shard_table_[static_cast<size_t>( slot_id ) * kv_pages_per_slot_ + lp] ) << kKvPageShift ) + ( t & ( ( 1 << kKvPageShift ) - 1 ) ) : phys;
+			const size_t lat_pool = kv_shard_ ? static_cast<size_t>( kv_shard_pages_ ) << kKvPageShift : static_cast<size_t>( kv_pool_tokens_ );
+			const size_t lat_off = ( static_cast<size_t>( layer ) * lat_pool + lat_phys ) * 512;
 			const size_t rel = static_cast<size_t>( t - from ) * 512;
-			move( static_cast<char*>( latent_cache_ ) + latent_data_bytes( lat_off ), h_lat + latent_data_bytes( rel ), latent_data_bytes( static_cast<size_t>( n ) * 512 ) );
-			if ( lat_scale_bytes ) move( static_cast<char*>( latent_scales_ ) + latent_scale_bytes( lat_off ), h_scale + latent_scale_bytes( rel ), latent_scale_bytes( static_cast<size_t>( n ) * 512 ) );
+			if ( own ) {
+				move( static_cast<char*>( latent_cache_ ) + latent_data_bytes( lat_off ), h_lat + latent_data_bytes( rel ), latent_data_bytes( static_cast<size_t>( n ) * 512 ) );
+				if ( lat_scale_bytes ) move( static_cast<char*>( latent_scales_ ) + latent_scale_bytes( lat_off ), h_scale + latent_scale_bytes( rel ), latent_scale_bytes( static_cast<size_t>( n ) * 512 ) );
+			}
 			const int p0 = t / pool, p1 = ( t + n + pool - 1 ) / pool;   // pools touching [t, t + n)
 			if ( p1 > p0 ) {
 				const size_t pool_off = ( static_cast<size_t>( layer ) * ( kv_pool_tokens_ / pool ) + ( phys - static_cast<size_t>( t - p0 * pool ) ) / pool ) * D;

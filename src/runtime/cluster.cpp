@@ -106,6 +106,11 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		models_[d]->set_speculation( spec );
 		if ( !models_[d]->init( d, arenas_[d], ( tp_ > 1 ) ? &rings_[d] : nullptr ) ) return false;
 	}
+	{
+		engine::models::ModelPipeline* ranks[ENGINE_NUM_GPUS] = {};
+		for ( int d = 0; d < tp_; ++d ) ranks[d] = models_[d].get();
+		for ( int d = 0; d < tp_; ++d ) models_[d]->link_ranks( ranks, tp_ );
+	}
 
 	constexpr double kGiB = 1073741824.0;
 	const size_t mem_buffers = arenas_[0].offset_bytes;

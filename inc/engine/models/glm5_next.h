@@ -298,6 +298,19 @@ private:
 	int* d_kv_table_ = nullptr;
 	bool kv_dirty_ = false;
 	pod::KVPages kv_pages() const;
+	// kv_shard (with kv_pool, tp > 1): the latent of logical page lp lives on rank lp % tp, in that rank's latent pool of kv_shard_pages_ pages.
+	// Every rank keeps the whole table and the tp free lists (the same calls on every rank keep them equal) and holds only its own pages; the
+	// pooled indexer keys stay in the replicated pool above
+	bool kv_shard_ = false;
+	int kv_shard_pages_ = 0;
+	std::vector<int> shard_table_;              // [slots][pages per slot]: the page of each logical page on its owner
+	std::vector<std::vector<int>> shard_free_;  // per owner rank: its free pages
+	int* d_shard_table_ = nullptr;
+	void** d_shard_bases_ = nullptr;            // [data of rank 0..tp-1][scales of rank 0..tp-1]
+	pod::TensorView shard_sync_;                // [1, 128]: a store-to-attend barrier over the ring (a rank reads rows its peers stored in the same layer)
+public:
+	void link_ranks( engine::models::ModelPipeline* const* ranks, int n ) override;
+private:
 	// expert_cache=auto, before the experts of a MoE layer: the experts per layer the arena can hold for this and the layers after it, from the
 	// bytes the layers loaded so far took, the checkpoint size of the layers still to come, the speculator and a margin
 	std::vector<int> plan_experts( const engine::loader::SafeTensorsRepo& repo, const std::vector<int>& layers, const std::vector<std::array<size_t, 3>>& sizes, int experts,

@@ -63,6 +63,14 @@ struct KVPages {
 	int shift = 0;            // log2(tokens per page)
 	int per_slot = 0;         // logical pages of one slot
 	size_t pool_tokens = 0;   // tokens of one layer in the pool (the layer stride)
+	// kv_shard (GLM's latent cache): the logical page lp of a slot lives on rank lp % ranks, in that rank's page
+	// shard_table[slot * per_slot + lp] of its own arrays, shard_bases[rank] (data) and shard_bases[ranks + rank] (scales),
+	// device pointers every rank can read (peer access); shard_pool_tokens tokens per layer. ranks 0: not sharded
+	const int* shard_table = nullptr;
+	void* const* shard_bases = nullptr;
+	int ranks = 0;
+	int rank = 0;
+	size_t shard_pool_tokens = 0;
 
 	// Token index of (slot, pos) within one layer's array
 	__host__ __device__ size_t token( int slot, int pos ) const {

@@ -79,7 +79,7 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 			}
 			std::sort( files.begin(), files.end() );
 			for ( const std::string& f : files ) fp += f + "\n";
-			fp += "kv_format " + opt.kv_format + "\nnvfp4_experts " + opt.nvfp4_experts + "\nmtp_head_dir " + opt.mtp_head_dir + "\nnvfp4_dense_dir " + opt.nvfp4_dense_dir + "\nnvfp4_dense " + opt.nvfp4_dense +
+			fp += "kv_format " + opt.kv_format + ( opt.kv_shard ? "\nkv_shard" : "" ) + "\nnvfp4_experts " + opt.nvfp4_experts + "\nmtp_head_dir " + opt.mtp_head_dir + "\nnvfp4_dense_dir " + opt.nvfp4_dense_dir + "\nnvfp4_dense " + opt.nvfp4_dense +
 				"\nranks " + std::to_string( cluster_.tp() ) + "\nalign " + std::to_string( cluster_.snapshot_align() ) + "\nbytes " +
 				std::to_string( cluster_.snapshot_bytes( 0, cluster_.snapshot_align() ) ) + " " + std::to_string( cluster_.snapshot_bytes( 0, cluster_.snapshot_align(), true ) ) + "\n";
 			prefix_cache_->enable_disk( dir, fp, static_cast<size_t>( std::max( 1, opt.prefix_cache_disk_gib ) ) << 30 );

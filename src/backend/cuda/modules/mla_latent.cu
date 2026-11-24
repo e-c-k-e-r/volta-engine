@@ -131,6 +131,13 @@ __device__ __forceinline__ uint4 latent_ld8( const void* data, const void* scale
 	return kv_decode8_h<Q>( kv_fetch8<Q>( data, scales, idx ) );
 }
 
+// Where key `pos` of one (slot, layer) lives: its arrays (this rank's, or with kv_shard the owner's) and its element offset in them
+struct LatentSrc {
+	const void* data;
+	const void* scales;
+	size_t off;
+};
+
 // Element offset of key `pos` of one (slot, layer): the per-slot layout, or the shared pool's pages (pod::KVPages)
 struct LatentAddr {
 	pod::KVPages pg;
@@ -139,19 +146,37 @@ struct LatentAddr {
 	__device__ __forceinline__ size_t operator()( int pos ) const {
 		return pg.table ? base + pg.token( slot, pos ) * LORA : base + static_cast<size_t>( pos ) * LORA;
 	}
+	// The page's owner and its offset there (kv_shard: page lp on rank lp % ranks, in the page shard_table gives); data / scales otherwise
+	__device__ __forceinline__ int owner( int pos ) const { return ( pos >> pg.shift ) % pg.ranks; }
+	__device__ __forceinline__ size_t shard_off( int pos ) const {
+		const int lp = pos >> pg.shift;
+		return base + ( ( static_cast<size_t>( pg.shard_table[static_cast<size_t>( slot ) * pg.per_slot + lp] ) << pg.shift ) + ( pos & ( ( 1 << pg.shift ) - 1 ) ) ) * LORA;
+	}
+	__device__ __forceinline__ LatentSrc src( int pos, const void* data, const void* scales ) const {
+		if ( pg.ranks > 0 ) {
+			const int o = owner( pos );
+			return { pg.shard_bases[o], pg.shard_bases[pg.ranks + o], shard_off( pos ) };
+		}
+		return { data, scales, ( *this )( pos ) };
+	}
 };
 
 __device__ __forceinline__ LatentAddr latent_addr( const pod::KVPages& pg, int slot, size_t slot_stride, int layer, int max_seq ) {
-	return { pg, pg.table ? static_cast<size_t>( layer ) * pg.pool_tokens * LORA : static_cast<size_t>( slot ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA, slot };
+	const size_t base = pg.ranks > 0 ? static_cast<size_t>( layer ) * pg.shard_pool_tokens * LORA
+		: pg.table ? static_cast<size_t>( layer ) * pg.pool_tokens * LORA : static_cast<size_t>( slot ) * slot_stride + static_cast<size_t>( layer ) * max_seq * LORA;
+	return { pg, base, slot };
 }
 
-// One block per row; a thread quantizes one unit (kv_unit<Q>() elements) at a time
+// One block per row; a thread quantizes one unit (kv_unit<Q>() elements) at a time. With kv_shard a rank writes the rows of its own pages
+// (every rank has every row: the latent projection is replicated)
 template <KVQ Q>
 __global__ void store_latent_kernel( void* __restrict__ data, void* __restrict__ scales, const half* __restrict__ c, int layer, int max_seq, int rows, pod::SlotRef slot, pod::KVPages pg ) {
 	constexpr int U = kv_unit<Q>();
 	const int r = blockIdx.x;
 	const int pos = slot.rows->pos[slot.row + r];
-	const size_t off = latent_addr( pg, slot.rows->slot[slot.row + r], slot.stride, layer, max_seq )( pos );
+	const LatentAddr la = latent_addr( pg, slot.rows->slot[slot.row + r], slot.stride, layer, max_seq );
+	if ( pg.ranks > 0 && la.owner( pos ) != pg.rank ) return;
+	const size_t off = pg.ranks > 0 ? la.shard_off( pos ) : la( pos );
 	for ( int u = threadIdx.x; u < LORA / U; u += blockDim.x ) kv_store_unit<Q>( data, scales, off + static_cast<size_t>( u ) * U, c + static_cast<size_t>( r ) * LORA + u * U );
 }
 
@@ -212,7 +237,8 @@ void latent_attn_kernel(
 				uint4 raw = make_uint4( 0, 0, 0, 0 );
 				if ( k < nk ) {
 					const int key = nsel >= 0 ? lst[kb + k] : kb + k;
-					raw = latent_ld8<Q>( cache, cscale, kaddr( key ) + c8 * 8 );
+					const LatentSrc ks = kaddr.src( key, cache, cscale );
+					raw = latent_ld8<Q>( ks.data, ks.scales, ks.off + c8 * 8 );
 				}
 				*reinterpret_cast<uint4*>( sc + k * CS + c8 * 8 ) = raw;
 			}
@@ -403,13 +429,16 @@ void latent_prefill_tc_kernel(
 	const int st_p = lane & 15, st_cl = lane >> 4;
 	uint4 pk[4][2];
 	auto fetch = [&]( int kb ) {
+		LatentSrc ks[2];
+		#pragma unroll
+		for ( int kk = 0; kk < 2; ++kk ) ks[kk] = kaddr.src( min( kb + 2 * st_p + kk, max_pos ), cache, cscale );
 		#pragma unroll
 		for ( int j = 0; j < 4; ++j ) {
 			const int c = 2 * warp + st_cl + 16 * j;
 			#pragma unroll
 			for ( int kk = 0; kk < 2; ++kk ) {
 				const int key = 2 * st_p + kk;
-				pk[j][kk] = ( kb + key <= max_pos ) ? latent_ld8<Q>( cache, cscale, kaddr( kb + key ) + c * 8 ) : make_uint4( 0, 0, 0, 0 );
+				pk[j][kk] = ( kb + key <= max_pos ) ? latent_ld8<Q>( ks[kk].data, ks[kk].scales, ks[kk].off + c * 8 ) : make_uint4( 0, 0, 0, 0 );
 			}
 		}
 	};
@@ -747,17 +776,19 @@ void latent_sparse_tc_kernel(
 	uint4 pk[4][2];
 	auto fetch = [&]( int kb ) {
 		int kpos[2];
+		LatentSrc ks[2];
 		#pragma unroll
 		for ( int kk = 0; kk < 2; ++kk ) {
 			const int j = kb + 2 * st_p + kk;
 			kpos[kk] = j < n_keys ? ( lst ? lst[j] : j ) : -1;
+			ks[kk] = kaddr.src( max( kpos[kk], 0 ), cache, cscale );
 		}
 		#pragma unroll
 		for ( int j = 0; j < 4; ++j ) {
 			const int c = 2 * warp + st_cl + 16 * j;
 			#pragma unroll
 			for ( int kk = 0; kk < 2; ++kk ) {
-				pk[j][kk] = kpos[kk] >= 0 ? latent_ld8<Q>( cache, cscale, kaddr( kpos[kk] ) + c * 8 ) : make_uint4( 0, 0, 0, 0 );
+				pk[j][kk] = kpos[kk] >= 0 ? latent_ld8<Q>( ks[kk].data, ks[kk].scales, ks[kk].off + c * 8 ) : make_uint4( 0, 0, 0, 0 );
 			}
 		}
 	};
