@@ -1474,7 +1474,6 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 	backend::stream_t stream,
 	pod::MemoryArena* code_arena
 ) {
-	refuse_companions( base_name, "load_linear_slice" );
 	char name_buf[512];
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
 	char weight_buf[512];
@@ -1517,6 +1516,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : bits;
 
+	pod::LinearWeight lw;
 	if ( slice_dim == 0 ) {
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.suh", base_name );
 		pod::TensorView suh = load_slice( name_buf, arena, 0, rank, tp_size, stream, pod::DType::FP16 );
@@ -1524,7 +1524,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.svh", base_name );
 		pod::TensorView svh = load( name_buf, arena, stream, pod::DType::FP16 );
 
-		return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ), base_name );
+		lw = tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ), base_name );
 	}
 	else {
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.suh", base_name );
@@ -1533,8 +1533,14 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 		std::snprintf( name_buf, sizeof( name_buf ), "%s.svh", base_name );
 		pod::TensorView svh = load_slice( name_buf, arena, 0, rank, tp_size, stream, pod::DType::FP16 );
 
-		return tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ), base_name );
+		lw = tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ), base_name );
 	}
+	// The extended trellis' tile companions ([K / 16, N / 16], per tile like the codes' first two dimensions): the same rows or columns of tiles
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.tstart", base_name );
+	if ( find( name_buf, &dummy_shard ) != nullptr ) lw.w3 = load_slice( name_buf, arena, slice_dim, rank, tp_size, stream );
+	std::snprintf( name_buf, sizeof( name_buf ), "%s.tgain", base_name );
+	if ( find( name_buf, &dummy_shard ) != nullptr ) lw.w4 = load_slice( name_buf, arena, slice_dim, rank, tp_size, stream );
+	return lw;
 }
 
 pod::LinearWeight SafeTensorsRepo::load_linear_range(

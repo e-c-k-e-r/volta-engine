@@ -306,8 +306,9 @@ calibration mixed by their token counts; `tests/tools/hess_merge.py --out DIR --
   `<base>.tstart` (uint16 per tile); `--tile-gain` stores a gain per tile as `<base>.tgain` (8 bits, the value (896 + c) / 1024, fitted by least
   squares before the error feedback sees the tile). A tensor's companions are its flag. Both options apply to the routed experts only: the engine's
   MoE kernels on CUDA decode them (the coop decode kernels on their tensor-core tile, the persistent prefill kernel at every row tile, both tile
-  orders), and the loader reads them with whole expert tensors. Dense layers, the heavy-expert path (`moe_heavy_rows`), CPU and Vulkan experts, ROCm's
-  coop kernels and sliced expert loads refuse an extended tensor. `reconstruct_slice_ext` and `reconstruct_had_slice_ext` decode them, and the tools
+  orders), and the loader reads them with whole expert tensors or a rank's slice of them (GLM's sharded experts: the companions cut by the same
+  tile rows or columns as the codes). Dense layers, the heavy-expert path (`moe_heavy_rows`), CPU and Vulkan experts, ROCm's coop kernels and the
+  range readers refuse an extended tensor. `reconstruct_slice_ext` and `reconstruct_had_slice_ext` decode them, and the tools
   read and write them; `hess_compare` scores `.partial` results that have them.
 
 `test_exl3_encode` and `test_exl3_quantize` test the encoder and the quantizer, `test_expert_hessian` the expert Hessians ([TESTS.md](TESTS.md)).
