@@ -50,6 +50,17 @@ struct DSA {
 
 	// Top SEL_POOLS pools per row, expanded to token indices + tail: idx[r][0 .. nkeys[r]); nkeys[r] = -1 marks a dense row
 	static void select( const backend::half_t* scores, int score_stride, int* idx, int* nkeys, int rows, const pod::BatchRows* d_rows, backend::stream_t stream );
+
+	// kv_shard (pages.ranks > 0): a 128-pool tile is one page, and a rank keeps the pools of its own pages (page p on rank p % ranks, at the
+	// page pages.shard_table gives in pool_plane), builds only those (pool_update) and scores only those (score: scores[r][(page / ranks) * 128
+	// + pool in page], score_stride at least shard_score_stride( max_seq, ranks )). select_local then keeps the rank's best SEL_POOLS of them
+	// by (score, lowest pool), cand_id / cand_key [rows][SEL_POOLS] (pool, fp16 score key), cand_n [rows] (-1: dense row); select_merge reads
+	// every rank's candidates (cand_ptrs: [ids of rank 0..ranks-1][keys ...][counts ...], peer pointers once the ranks are past a barrier)
+	// and writes the selection select would have made over all the pools, in the same order
+	static int shard_score_stride( int max_seq, int ranks ) { return ( ( max_seq / POOL + 127 ) / 128 + ranks - 1 ) / ranks * 128; }
+	static void select_local( const backend::half_t* scores, int score_stride, int* cand_id, unsigned short* cand_key, int* cand_n, int rows,
+		const pod::BatchRows* d_rows, const pod::KVPages& pages, backend::stream_t stream );
+	static void select_merge( void* const* cand_ptrs, int ranks, int* idx, int* nkeys, int rows, const pod::BatchRows* d_rows, backend::stream_t stream );
 };
 
 } // namespace engine::modules

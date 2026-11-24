@@ -86,6 +86,11 @@ void prep_kernel( const half* __restrict__ proj, const half* __restrict__ ln_w, 
 	if ( d < H ) w_out[static_cast<size_t>( r ) * H + d] = pr[DSA::DIM + d];
 }
 
+// kv_shard: token index of (slot, pos) in the arrays of the rank that holds its page
+__device__ __forceinline__ size_t shard_token( const pod::KVPages& pg, int slot, int pos ) {
+	return ( static_cast<size_t>( pg.shard_table[static_cast<size_t>( slot ) * pg.per_slot + ( pos >> pg.shift )] ) << pg.shift ) + ( pos & ( ( 1 << pg.shift ) - 1 ) );
+}
+
 // One block per row, 128 threads; only the row that completes a pool does work
 __global__ __launch_bounds__( 128 )
 void pool_kernel( const half* __restrict__ plane, half* __restrict__ pool_plane, const half* __restrict__ ape, int layer, int max_seq,
@@ -94,6 +99,8 @@ void pool_kernel( const half* __restrict__ plane, half* __restrict__ pool_plane,
 	const int pos = rows->pos[r];
 	if ( ( pos & ( P - 1 ) ) != P - 1 ) return;
 	const int slot = rows->slot[r];
+	// kv_shard: the pool belongs to the rank that holds its page
+	if ( pg.ranks > 0 && ( ( pos - ( P - 1 ) ) >> pg.shift ) % pg.ranks != pg.rank ) return;
 	const half* base = plane + static_cast<size_t>( slot ) * plane_slot_stride + static_cast<size_t>( layer ) * DSA::PLANE_CAP * DSA::PLANE;
 	float k[P], g[P];
 	float mx = -1e30f;
@@ -112,7 +119,8 @@ void pool_kernel( const half* __restrict__ plane, half* __restrict__ pool_plane,
 		acc += e * k[j];
 	}
 	// The pooled key of tokens [pool * P, pool * P + P): the page holding them is that of the pool's first token
-	const size_t at = pg.table ? static_cast<size_t>( layer ) * ( pg.pool_tokens / P ) + pg.token( slot, pos - ( P - 1 ) ) / P
+	const size_t at = pg.ranks > 0 ? static_cast<size_t>( layer ) * ( pg.shard_pool_tokens / P ) + shard_token( pg, slot, pos - ( P - 1 ) ) / P
+	                : pg.table ? static_cast<size_t>( layer ) * ( pg.pool_tokens / P ) + pg.token( slot, pos - ( P - 1 ) ) / P
 	                           : static_cast<size_t>( layer ) * ( max_seq / P ) + pos / P;
 	pool_plane[( pg.table ? 0 : static_cast<size_t>( slot ) * pool_slot_stride ) + at * D + d] = __float2half_rn( acc / sum );
 }
@@ -129,19 +137,23 @@ void score_kernel( const half* __restrict__ q_idx, const half* __restrict__ w, c
 	const int r = blockIdx.x;
 	const int pos = rows->pos[r];
 	const int bound = ( pos + 1 ) / P;
-	if ( bound <= DSA::SEL_POOLS || blockIdx.y * 128 >= bound ) return; // dense row, or tile past the visible pools
+	// kv_shard: block y scores page y * ranks + rank (a tile of 128 pools is one page) into the rank's columns [y * 128, y * 128 + 128)
+	const int tile = pg.ranks > 0 ? static_cast<int>( blockIdx.y ) * pg.ranks + pg.rank : static_cast<int>( blockIdx.y );
+	if ( bound <= DSA::SEL_POOLS || tile * 128 >= bound ) return; // dense row, or tile past the visible pools
 	const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
 	for ( int i = threadIdx.x; i < H * D / 8; i += 128 ) reinterpret_cast<uint4*>( sq )[i] = reinterpret_cast<const uint4*>( q_idx + static_cast<size_t>( r ) * H * D )[i];
 	if ( threadIdx.x < H ) sw[threadIdx.x] = __half2float( w[static_cast<size_t>( r ) * H + threadIdx.x] );
 	__syncthreads();
 	const int slot = rows->slot[r];
-	const half* keys = pg.table ? pool_plane + static_cast<size_t>( layer ) * ( pg.pool_tokens / P ) * D
+	const half* keys = pg.ranks > 0 ? pool_plane + static_cast<size_t>( layer ) * ( pg.shard_pool_tokens / P ) * D
+	                 : pg.table ? pool_plane + static_cast<size_t>( layer ) * ( pg.pool_tokens / P ) * D
 	                            : pool_plane + static_cast<size_t>( slot ) * pool_slot_stride + static_cast<size_t>( layer ) * ( max_seq / P ) * D;
+	const int col0 = pg.ranks > 0 ? static_cast<int>( blockIdx.y ) * 128 - tile * 128 : 0;   // score column of pool p: col0 + p
 	for ( int c = 0; c < 2; ++c ) {
-		const int p0 = blockIdx.y * 128 + ( warp * 2 + c ) * 16;
+		const int p0 = tile * 128 + ( warp * 2 + c ) * 16;
 		if ( p0 >= bound ) break;
 		// A 16-pool tile is 64 tokens, inside one page
-		const half* kt = keys + ( pg.table ? pg.token( slot, p0 * P ) / P : static_cast<size_t>( p0 ) ) * D;
+		const half* kt = keys + ( pg.ranks > 0 ? shard_token( pg, slot, p0 * P ) / P : pg.table ? pg.token( slot, p0 * P ) / P : static_cast<size_t>( p0 ) ) * D;
 		wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1;
 		wmma::fill_fragment( acc0, 0.0f );
 		wmma::fill_fragment( acc1, 0.0f );
@@ -163,7 +175,7 @@ void score_kernel( const half* __restrict__ q_idx, const half* __restrict__ w, c
 		#pragma unroll
 		for ( int h = 0; h < 16; ++h ) acc = fmaf( fmaxf( sl[warp][( h0 + h ) * 16 + pl], 0.0f ), sw[h0 + h], acc );
 		acc += __shfl_xor_sync( 0xffffffffu, acc, 16 );
-		if ( lane < 16 && p0 + pl < bound ) scores[static_cast<size_t>( r ) * score_stride + p0 + pl] = __float2half_rn( acc * rsqrtf( static_cast<float>( D * H ) ) );
+		if ( lane < 16 && p0 + pl < bound ) scores[static_cast<size_t>( r ) * score_stride + col0 + p0 + pl] = __float2half_rn( acc * rsqrtf( static_cast<float>( D * H ) ) );
 		__syncwarp();
 	}
 }
@@ -173,27 +185,17 @@ __device__ __forceinline__ unsigned score_key( half s ) {
 	return ( b & 0x8000u ) ? ( ~b & 0xFFFFu ) : ( b | 0x8000u );
 }
 
-// Block per row: radix select of the SEL_POOLS best pools by fp16 score (two 8-bit passes), ties at the threshold taken in
-// pool order, then expansion to token indices and the raw tail
-__global__ __launch_bounds__( 1024 )
-void select_kernel( const half* __restrict__ scores, int score_stride, int* __restrict__ idx, int* __restrict__ nkeys,
-	const pod::BatchRows* __restrict__ rows ) {
+// Block of 1024 threads: radix select of the K best of n entries by key (two 8-bit passes), ties at the threshold taken in entry order.
+// get( i ) gives entry i's (key, id). s_sel[0 .. K): the ids, strictly better entries first, then the ties, each in entry order; s_key
+// (when set) their keys. n > K
+template <typename Get>
+__device__ void select_top( int n, int K, Get get, int* s_sel, unsigned short* s_key ) {
 	__shared__ int hist[256];
-	__shared__ int s_sel[DSA::SEL_POOLS];
-	__shared__ int s_b1, s_above1, s_thr, s_need_eq, s_n_gt, s_n_eq, s_wsum[32], s_carry_gt, s_carry_eq;
-	const int r = blockIdx.x, t = threadIdx.x;
-	const int pos = rows->pos[r];
-	const int vis = pos + 1;
-	const int bound = vis / P;
-	if ( bound <= DSA::SEL_POOLS ) {
-		if ( t == 0 ) nkeys[r] = -1;
-		return;
-	}
-	const half* sc = scores + static_cast<size_t>( r ) * score_stride;
-	const int K = DSA::SEL_POOLS;
+	__shared__ int s_b1, s_above1, s_thr, s_need_eq, s_wsum[32], s_carry_gt, s_carry_eq;
+	const int t = threadIdx.x;
 	if ( t < 256 ) hist[t] = 0;
 	__syncthreads();
-	for ( int p = t; p < bound; p += 1024 ) atomicAdd( &hist[score_key( sc[p] ) >> 8], 1 );
+	for ( int i = t; i < n; i += 1024 ) atomicAdd( &hist[get( i ).x >> 8], 1 );
 	__syncthreads();
 	if ( t == 0 ) {
 		int cum = 0, b = 255;
@@ -207,8 +209,8 @@ void select_kernel( const half* __restrict__ scores, int score_stride, int* __re
 	__syncthreads();
 	if ( t < 256 ) hist[t] = 0;
 	__syncthreads();
-	for ( int p = t; p < bound; p += 1024 ) {
-		const unsigned key = score_key( sc[p] );
+	for ( int i = t; i < n; i += 1024 ) {
+		const unsigned key = get( i ).x;
 		if ( ( key >> 8 ) == static_cast<unsigned>( s_b1 ) ) atomicAdd( &hist[key & 255u], 1 );
 	}
 	__syncthreads();
@@ -228,12 +230,13 @@ void select_kernel( const half* __restrict__ scores, int score_stride, int* __re
 	const unsigned thr = static_cast<unsigned>( s_thr );
 	const int need_eq = s_need_eq;
 	const int total_gt = K - need_eq;
-	// Compaction in pool order: strictly better pools first-come into [0, total_gt), ties into [total_gt, K)
-	for ( int base = 0; base < bound; base += 1024 ) {
-		const int p = base + t;
-		unsigned key = 0;
-		if ( p < bound ) key = score_key( sc[p] );
-		const bool gt = p < bound && key > thr, eq = p < bound && key == thr;
+	// Compaction in entry order: strictly better entries first-come into [0, total_gt), ties into [total_gt, K)
+	for ( int base = 0; base < n; base += 1024 ) {
+		const int i = base + t;
+		uint2 e = make_uint2( 0u, 0u );
+		if ( i < n ) e = get( i );
+		const unsigned key = e.x;
+		const bool gt = i < n && key > thr, eq = i < n && key == thr;
 		const unsigned lane_mask = ( 1u << ( t & 31 ) ) - 1u;
 		const unsigned bg = __ballot_sync( 0xffffffff, gt ), be = __ballot_sync( 0xffffffff, eq );
 		if ( ( t & 31 ) == 0 ) s_wsum[t >> 5] = __popc( bg ) | ( __popc( be ) << 16 );
@@ -245,8 +248,14 @@ void select_kernel( const half* __restrict__ scores, int score_stride, int* __re
 		}
 		const int pos_gt = s_carry_gt + wg + __popc( bg & lane_mask );
 		const int pos_eq = s_carry_eq + we + __popc( be & lane_mask );
-		if ( gt && pos_gt < total_gt ) s_sel[pos_gt] = p;
-		if ( eq && pos_eq < need_eq ) s_sel[total_gt + pos_eq] = p;
+		if ( gt && pos_gt < total_gt ) {
+			s_sel[pos_gt] = static_cast<int>( e.y );
+			if ( s_key ) s_key[pos_gt] = static_cast<unsigned short>( key );
+		}
+		if ( eq && pos_eq < need_eq ) {
+			s_sel[total_gt + pos_eq] = static_cast<int>( e.y );
+			if ( s_key ) s_key[total_gt + pos_eq] = static_cast<unsigned short>( key );
+		}
 		__syncthreads();
 		if ( t == 0 ) {
 			int tg = 0, te = 0;
@@ -259,11 +268,127 @@ void select_kernel( const half* __restrict__ scores, int score_stride, int* __re
 		}
 		__syncthreads();
 	}
+}
+
+// Row r's list: the selected pools' tokens, then the raw tail of its incomplete pool
+__device__ void expand_selection( int r, int vis, const int* s_sel, int* __restrict__ idx, int* __restrict__ nkeys ) {
+	const int t = threadIdx.x, K = DSA::SEL_POOLS;
 	int* out = idx + static_cast<size_t>( r ) * DSA::KPAD;
 	for ( int i = t; i < K * P; i += 1024 ) out[i] = s_sel[i / P] * P + ( i % P );
 	const int tail = vis % P;
 	if ( t < P - 1 && t < tail ) out[K * P + t] = vis - tail + t;
 	if ( t == 0 ) nkeys[r] = K * P + tail;
+}
+
+// Block per row: the SEL_POOLS best pools by fp16 score, ties at the threshold taken in pool order, expanded to token indices and the raw tail
+__global__ __launch_bounds__( 1024 )
+void select_kernel( const half* __restrict__ scores, int score_stride, int* __restrict__ idx, int* __restrict__ nkeys,
+	const pod::BatchRows* __restrict__ rows ) {
+	__shared__ int s_sel[DSA::SEL_POOLS];
+	const int r = blockIdx.x;
+	const int vis = rows->pos[r] + 1;
+	const int bound = vis / P;
+	if ( bound <= DSA::SEL_POOLS ) {
+		if ( threadIdx.x == 0 ) nkeys[r] = -1;
+		return;
+	}
+	const half* sc = scores + static_cast<size_t>( r ) * score_stride;
+	select_top( bound, DSA::SEL_POOLS, [&]( int p ) { return make_uint2( score_key( sc[p] ), static_cast<unsigned>( p ) ); }, s_sel, nullptr );
+	__syncthreads();
+	expand_selection( r, vis, s_sel, idx, nkeys );
+}
+
+// kv_shard, block per row: the rank's own pools (pages rank, rank + ranks, ..., at columns (page / ranks) * 128 + pool in page), its best
+// SEL_POOLS of them by (score, lowest pool) as candidates, or all of them when it has no more
+__global__ __launch_bounds__( 1024 )
+void select_local_kernel( const half* __restrict__ scores, int score_stride, int* __restrict__ cand_id, unsigned short* __restrict__ cand_key,
+	int* __restrict__ cand_n, const pod::BatchRows* __restrict__ rows, int ranks, int rank ) {
+	__shared__ int s_sel[DSA::SEL_POOLS];
+	__shared__ unsigned short s_key[DSA::SEL_POOLS];
+	const int r = blockIdx.x, t = threadIdx.x, K = DSA::SEL_POOLS;
+	const int bound = ( rows->pos[r] + 1 ) / P;
+	if ( bound <= K ) {
+		if ( t == 0 ) cand_n[r] = -1;
+		return;
+	}
+	const half* sc = scores + static_cast<size_t>( r ) * score_stride;
+	// The rank's pools below bound: its whole pages, then the page bound falls in when it is the rank's
+	const int full = bound / 128, rem = bound % 128;
+	const int n = ( full > rank ? ( full - rank + ranks - 1 ) / ranks : 0 ) * 128 + ( rem > 0 && full % ranks == rank ? rem : 0 );
+	auto get = [&]( int c ) { return make_uint2( score_key( sc[c] ), static_cast<unsigned>( ( ( c >> 7 ) * ranks + rank ) * 128 + ( c & 127 ) ) ); };
+	int* out_id = cand_id + static_cast<size_t>( r ) * K;
+	unsigned short* out_key = cand_key + static_cast<size_t>( r ) * K;
+	if ( n <= K ) {
+		for ( int c = t; c < n; c += 1024 ) {
+			const uint2 e = get( c );
+			out_id[c] = static_cast<int>( e.y );
+			out_key[c] = static_cast<unsigned short>( e.x );
+		}
+		if ( t == 0 ) cand_n[r] = n;
+		return;
+	}
+	select_top( n, K, get, s_sel, s_key );
+	__syncthreads();
+	for ( int i = t; i < K; i += 1024 ) {
+		out_id[i] = s_sel[i];
+		out_key[i] = s_key[i];
+	}
+	if ( t == 0 ) cand_n[r] = K;
+}
+
+// kv_shard, block per row: every rank's candidates (they hold the best SEL_POOLS of all the pools: each of those is among its own rank's
+// best by the same order), sorted by pool, then the selection select_kernel makes over all the pools, in its order
+__global__ __launch_bounds__( 1024 )
+void select_merge_kernel( void* const* __restrict__ cand_ptrs, int ranks, int* __restrict__ idx, int* __restrict__ nkeys,
+	const pod::BatchRows* __restrict__ rows ) {
+	constexpr int CAP = ENGINE_NUM_GPUS * DSA::SEL_POOLS;
+	__shared__ int s_id[CAP];
+	__shared__ unsigned short s_k[CAP];
+	__shared__ int s_sel[DSA::SEL_POOLS];
+	__shared__ int s_off[ENGINE_NUM_GPUS + 1];
+	const int r = blockIdx.x, t = threadIdx.x, K = DSA::SEL_POOLS;
+	const int vis = rows->pos[r] + 1;
+	if ( vis / P <= K ) {
+		if ( t == 0 ) nkeys[r] = -1;
+		return;
+	}
+	if ( t == 0 ) {
+		s_off[0] = 0;
+		for ( int o = 0; o < ranks; ++o ) s_off[o + 1] = s_off[o] + max( 0, static_cast<const int*>( cand_ptrs[2 * ranks + o] )[r] );
+	}
+	__syncthreads();
+	for ( int o = 0; o < ranks; ++o ) {
+		const int* id = static_cast<const int*>( cand_ptrs[o] ) + static_cast<size_t>( r ) * K;
+		const unsigned short* key = static_cast<const unsigned short*>( cand_ptrs[ranks + o] ) + static_cast<size_t>( r ) * K;
+		for ( int i = t; i < s_off[o + 1] - s_off[o]; i += 1024 ) {
+			s_id[s_off[o] + i] = id[i];
+			s_k[s_off[o] + i] = key[i];
+		}
+	}
+	const int n = s_off[ranks];
+	for ( int i = n + t; i < CAP; i += 1024 ) s_id[i] = 0x7fffffff;
+	__syncthreads();
+	// Bitonic sort by pool (distinct)
+	for ( int size = 2; size <= CAP; size <<= 1 ) {
+		for ( int stride = size >> 1; stride > 0; stride >>= 1 ) {
+			for ( int i = t; i < CAP / 2; i += 1024 ) {
+				const int lo = 2 * i - ( i & ( stride - 1 ) ), hi = lo + stride;
+				const bool up = ( lo & size ) == 0;
+				if ( ( s_id[lo] > s_id[hi] ) == up ) {
+					const int a = s_id[lo];
+					s_id[lo] = s_id[hi];
+					s_id[hi] = a;
+					const unsigned short b = s_k[lo];
+					s_k[lo] = s_k[hi];
+					s_k[hi] = b;
+				}
+			}
+			__syncthreads();
+		}
+	}
+	select_top( n, K, [&]( int i ) { return make_uint2( s_k[i], static_cast<unsigned>( s_id[i] ) ); }, s_sel, nullptr );
+	__syncthreads();
+	expand_selection( r, vis, s_sel, idx, nkeys );
 }
 
 } // namespace
@@ -290,12 +415,26 @@ void DSA::pool_update( const half* plane, half* pool_plane, const half* ape, int
 void DSA::score( const half* q_idx, const half* w, const half* pool_plane, half* scores, int score_stride, int layer, int max_seq, int rows,
 	const pod::BatchRows* d_rows, size_t pool_slot_stride, cudaStream_t stream, const pod::KVPages& pages ) {
 	ENGINE_ASSERT( max_seq % 64 == 0, "DSA score: max_seq must be a multiple of 64" );
+	ENGINE_ASSERT( pages.ranks == 0 || ( pages.shift == 9 && score_stride >= shard_score_stride( max_seq, pages.ranks ) ),
+		"DSA score: kv_shard needs pages of 512 tokens (a 128-pool tile per page) and the rank's score columns" );
 	const int tiles = ( max_seq / P + 127 ) / 128;
-	score_kernel<<<dim3( rows, tiles ), dim3( 128 ), 0, stream>>>( q_idx, w, pool_plane, scores, score_stride, layer, max_seq, d_rows, pool_slot_stride, pages );
+	score_kernel<<<dim3( rows, pages.ranks > 0 ? ( tiles + pages.ranks - 1 ) / pages.ranks : tiles ), dim3( 128 ), 0, stream>>>( q_idx, w, pool_plane, scores,
+		score_stride, layer, max_seq, d_rows, pool_slot_stride, pages );
 }
 
 void DSA::select( const half* scores, int score_stride, int* idx, int* nkeys, int rows, const pod::BatchRows* d_rows, cudaStream_t stream ) {
 	select_kernel<<<dim3( rows ), dim3( 1024 ), 0, stream>>>( scores, score_stride, idx, nkeys, d_rows );
+}
+
+void DSA::select_local( const half* scores, int score_stride, int* cand_id, unsigned short* cand_key, int* cand_n, int rows, const pod::BatchRows* d_rows,
+	const pod::KVPages& pages, cudaStream_t stream ) {
+	ENGINE_ASSERT( pages.ranks > 0, "DSA::select_local: kv_shard only" );
+	select_local_kernel<<<dim3( rows ), dim3( 1024 ), 0, stream>>>( scores, score_stride, cand_id, cand_key, cand_n, d_rows, pages.ranks, pages.rank );
+}
+
+void DSA::select_merge( void* const* cand_ptrs, int ranks, int* idx, int* nkeys, int rows, const pod::BatchRows* d_rows, cudaStream_t stream ) {
+	ENGINE_ASSERT( ranks >= 1 && ranks <= ENGINE_NUM_GPUS, "DSA::select_merge: ranks" );
+	select_merge_kernel<<<dim3( rows ), dim3( 1024 ), 0, stream>>>( cand_ptrs, ranks, idx, nkeys, d_rows );
 }
 
 } // namespace engine::modules

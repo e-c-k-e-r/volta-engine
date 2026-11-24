@@ -308,6 +308,14 @@ private:
 	int* d_shard_table_ = nullptr;
 	void** d_shard_bases_ = nullptr;            // [data of rank 0..tp-1][scales of rank 0..tp-1]
 	pod::TensorView shard_sync_;                // [1, 128]: a store-to-attend barrier over the ring (a rank reads rows its peers stored in the same layer)
+	// kv_shard's indexer: a rank keeps, builds and scores the pools of its own pages, picks its best DSA::SEL_POOLS per row as candidates,
+	// and after the barrier merges every rank's into the selection
+	int* cand_id_ = nullptr;                    // [rows][DSA::SEL_POOLS]
+	unsigned short* cand_key_ = nullptr;        // [rows][DSA::SEL_POOLS]
+	int* cand_n_ = nullptr;                     // [rows]
+	void** d_cand_ptrs_ = nullptr;              // [ids of rank 0..tp-1][keys ...][counts ...]
+	int dsa_score_stride_ = 0;                  // columns of dsa_scores_ per row
+	pod::KVPages index_pages() const;           // kv_pages() with the kv_shard fields: the indexer's pools are spread like the latent
 public:
 	void link_ranks( engine::models::ModelPipeline* const* ranks, int n ) override;
 private:

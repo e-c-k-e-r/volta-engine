@@ -306,14 +306,25 @@ bool Glm5NextPipeline::init(
 		if ( dsa_ ) {
 			const int NP = config_.max_seq / engine::modules::DSA::POOL;
 			dsa_plane_stride_ = static_cast<size_t>( mla_slots_ ) * engine::modules::DSA::PLANE_CAP * engine::modules::DSA::PLANE;
-			dsa_pool_stride_ = static_cast<size_t>( mla_slots_ ) * ( kv_pool_tokens_ > 0 ? kv_pool_tokens_ / engine::modules::DSA::POOL : NP ) * engine::modules::DSA::DIM;
+			// kv_shard: a rank's pools are those of its latent pages, and it scores only those
+			const int pool_tokens = kv_shard_ ? kv_shard_pages_ << kKvPageShift : kv_pool_tokens_;
+			dsa_pool_stride_ = static_cast<size_t>( mla_slots_ ) * ( kv_pool_tokens_ > 0 ? pool_tokens / engine::modules::DSA::POOL : NP ) * engine::modules::DSA::DIM;
+			dsa_score_stride_ = kv_shard_ ? engine::modules::DSA::shard_score_stride( config_.max_seq, config_.tp_size ) : NP;
 			auto halves = [&]( size_t n ) { return static_cast<backend::half_t*>( engine::core::arena_alloc( arena, n * sizeof( backend::half_t ), 128 ) ); };
 			dsa_plane_ = halves( static_cast<size_t>( S ) * dsa_plane_stride_ );
 			dsa_pool_ = halves( cache_slots * dsa_pool_stride_ );
 			dsa_proj_ = halves( static_cast<size_t>( R ) * engine::modules::DSA::PROJ );
 			dsa_w_ = halves( static_cast<size_t>( R ) * engine::modules::DSA::HEADS );
 			dsa_q_ = halves( static_cast<size_t>( R ) * engine::modules::DSA::HEADS * engine::modules::DSA::DIM );
-			dsa_scores_ = halves( static_cast<size_t>( R ) * NP );
+			dsa_scores_ = halves( static_cast<size_t>( R ) * dsa_score_stride_ );
+			if ( kv_shard_ ) {
+				const size_t K = engine::modules::DSA::SEL_POOLS;
+				cand_id_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * K * sizeof( int ), 128 ) );
+				cand_key_ = static_cast<unsigned short*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * K * sizeof( unsigned short ), 128 ) );
+				cand_n_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * sizeof( int ), 128 ) );
+				d_cand_ptrs_ = static_cast<void**>( engine::core::arena_alloc( arena, 3 * ENGINE_NUM_GPUS * sizeof( void* ), 128 ) );
+				ENGINE_ASSERT( cand_id_ && cand_key_ && cand_n_ && d_cand_ptrs_, "Glm5NextPipeline::init: arena exhausted allocating the kv_shard candidates" );
+			}
 			dsa_idx_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * engine::modules::DSA::KPAD * sizeof( int ), 128 ) );
 			dsa_nk_ = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( R ) * sizeof( int ), 128 ) );
 			ENGINE_ASSERT( dsa_plane_ && dsa_pool_ && dsa_proj_ && dsa_w_ && dsa_q_ && dsa_scores_ && dsa_idx_ && dsa_nk_, "Glm5NextPipeline::init: arena exhausted allocating the DSA state" );
@@ -558,6 +569,26 @@ void Glm5NextPipeline::link_ranks( engine::models::ModelPipeline* const* ranks, 
 	}
 	backend::set_device( rank_ );
 	backend::memcpy_sync( d_shard_bases_, bases, 2 * n * sizeof( void* ), backend::Copy::H2D );
+	if ( !dsa_ ) return;
+	void* cands[3 * ENGINE_NUM_GPUS] = {};
+	for ( int r = 0; r < n; ++r ) {
+		const auto* p = static_cast<const Glm5NextPipeline*>( ranks[r] );
+		cands[r] = p->cand_id_;
+		cands[n + r] = p->cand_key_;
+		cands[2 * n + r] = p->cand_n_;
+	}
+	backend::memcpy_sync( d_cand_ptrs_, cands, 3 * n * sizeof( void* ), backend::Copy::H2D );
+}
+
+pod::KVPages Glm5NextPipeline::index_pages() const {
+	pod::KVPages pg = kv_pages();
+	if ( kv_shard_ ) {
+		pg.shard_table = d_shard_table_;
+		pg.ranks = config_.tp_size;
+		pg.rank = rank_;
+		pg.shard_pool_tokens = static_cast<size_t>( kv_shard_pages_ ) << kKvPageShift;
+	}
+	return pg;
 }
 
 pod::KVPages Glm5NextPipeline::kv_pages() const {
@@ -2088,7 +2119,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				DSA::prep( dsa_proj_, lw.idx_ln_w.ptr<backend::half_t>(), lw.idx_ln_b.ptr<backend::half_t>(), dsa_plane_, dsa_w_, mla_idx, config_.max_seq, m,
 					d_rows_, dsa_plane_stride_, sk );
 				DSA::pool_update( dsa_plane_, dsa_pool_, lw.idx_ape.ptr<backend::half_t>(), mla_idx, config_.max_seq, m, d_rows_,
-					dsa_plane_stride_, dsa_pool_stride_, sk, kv_pages() );
+					dsa_plane_stride_, dsa_pool_stride_, sk, index_pages() );
 			}
 
 			// Project Q: q_a_proj -> q_a_norm -> q_b_proj
@@ -2107,6 +2138,7 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 
 			const int* sel_idx = nullptr;
 			const int* sel_n = nullptr;
+			bool sel_merge = false;   // kv_shard: the ranks' candidates still to merge after the barrier
 			if ( mla_dsa ) {
 				using engine::modules::DSA;
 				// Selection matters once a row sees more than topk tokens; decode graphs always run it (rows below the
@@ -2118,9 +2150,13 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 						backend::stream_fork( sk, sx );       // the scores read the pool
 					}
 					engine::modules::Linear::forward( q_lora_norm_buf_, lw.idx_wq_b, qi, sx );
-					DSA::score( dsa_q_, dsa_w_, dsa_pool_, dsa_scores_, config_.max_seq / DSA::POOL, mla_idx, config_.max_seq, m,
-						d_rows_, dsa_pool_stride_, sx, kv_pages() );
-					DSA::select( dsa_scores_, config_.max_seq / DSA::POOL, dsa_idx_, dsa_nk_, m, d_rows_, sx );
+					DSA::score( dsa_q_, dsa_w_, dsa_pool_, dsa_scores_, dsa_score_stride_, mla_idx, config_.max_seq, m,
+						d_rows_, dsa_pool_stride_, sx, index_pages() );
+					if ( kv_shard_ ) {
+						DSA::select_local( dsa_scores_, dsa_score_stride_, cand_id_, cand_key_, cand_n_, m, d_rows_, index_pages(), sx );
+						sel_merge = true;
+					}
+					else DSA::select( dsa_scores_, dsa_score_stride_, dsa_idx_, dsa_nk_, m, d_rows_, sx );
 					sel_idx = dsa_idx_;
 					sel_n = dsa_nk_;
 				}
@@ -2147,9 +2183,11 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 					backend::stream_join( stream, sx );
 				}
 				if ( kv_shard_ ) {
-					// Every rank's rows of this forward stored before any rank reads them (a reduction that completes only once every peer took part)
+					// Every rank's rows of this forward and its indexer candidates written before any rank reads them (a reduction that
+					// completes only once every peer took part), then the candidates merged into the selection
 					pod::TensorView sync = shard_sync_;
 					ring_->all_reduce( sync, stream );
+					if ( sel_merge ) engine::modules::DSA::select_merge( d_cand_ptrs_, config_.tp_size, dsa_idx_, dsa_nk_, m, d_rows_, stream );
 				}
 				engine::modules::MLALatent::attend( latent_ref(), q_lat, o_lat, mla_idx, config_.max_seq, m, lh_, kv_ref, latent_ws_, key_hint_, stream, sel_idx, sel_n, ws_seq_ );
 				static const bool dsa_diag = runtime::options().dsa_diag;
@@ -2659,9 +2697,9 @@ void Glm5NextPipeline::copy_seq_rows( int slot_id, int from, int tokens, char* h
 				move( static_cast<char*>( latent_cache_ ) + latent_data_bytes( lat_off ), h_lat + latent_data_bytes( rel ), latent_data_bytes( static_cast<size_t>( n ) * 512 ) );
 				if ( lat_scale_bytes ) move( static_cast<char*>( latent_scales_ ) + latent_scale_bytes( lat_off ), h_scale + latent_scale_bytes( rel ), latent_scale_bytes( static_cast<size_t>( n ) * 512 ) );
 			}
-			const int p0 = t / pool, p1 = ( t + n + pool - 1 ) / pool;   // pools touching [t, t + n)
-			if ( p1 > p0 ) {
-				const size_t pool_off = ( static_cast<size_t>( layer ) * ( kv_pool_tokens_ / pool ) + ( phys - static_cast<size_t>( t - p0 * pool ) ) / pool ) * D;
+			const int p0 = t / pool, p1 = ( t + n + pool - 1 ) / pool;   // pools touching [t, t + n) (kv_shard: in the page's owner's pools)
+			if ( p1 > p0 && own ) {
+				const size_t pool_off = ( static_cast<size_t>( layer ) * ( lat_pool / pool ) + ( ( kv_shard_ ? lat_phys : phys ) - static_cast<size_t>( t - p0 * pool ) ) / pool ) * D;
 				move( dsa_pool_ + pool_off, h_pool + static_cast<size_t>( p0 - pool_from ) * D * sizeof( backend::half_t ), static_cast<size_t>( p1 - p0 ) * D * sizeof( backend::half_t ) );
 			}
 		} );

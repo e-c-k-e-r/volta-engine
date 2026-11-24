@@ -235,6 +235,155 @@ int main() {
 		}
 	}
 
-	std::printf( all_ok ? "[+] PASS kv_shard: the latent cache over %d GPUs reads as the one-GPU pool\n" : "[-] FAIL kv_shard differs from the one-GPU pool (%d GPUs)\n", RK );
+	// ---------------------------------------------------------------- indexer: pools, scores, local candidates and their merge
+	{
+		constexpr int Dd = DSA::DIM, Pp = DSA::POOL, HH = DSA::HEADS;
+		const int mseq = 16384, ps = mseq / PAGE, NP = mseq / Pp;
+		const int NI[S] = { 12000, 9000 };   // above 512 pools per rank at 4 ranks: the local selection keeps a top 512, not everything
+		const int ptok = S * mseq + 2 * PAGE, spages = ( ptok / PAGE + RK - 1 ) / RK + S;
+		std::vector<int> perm2( ptok / PAGE );
+		std::iota( perm2.begin(), perm2.end(), 0 );
+		std::shuffle( perm2.begin(), perm2.end(), g_rng );
+		std::vector<std::vector<int>> own2( RK, std::vector<int>( spages ) );
+		for ( auto& o : own2 ) {
+			std::iota( o.begin(), o.end(), 0 );
+			std::shuffle( o.begin(), o.end(), g_rng );
+		}
+		std::vector<int> t2( static_cast<size_t>( S ) * ps, 0 ), st2( t2.size(), 0 ), tk( RK, 0 );
+		for ( int s = 0; s < S; ++s ) {
+			for ( int lp = 0; lp < ( NI[s] + PAGE - 1 ) / PAGE; ++lp ) {
+				t2[static_cast<size_t>( s ) * ps + lp] = perm2[s * ps + lp];
+				st2[static_cast<size_t>( s ) * ps + lp] = own2[lp % RK][tk[lp % RK]++];
+			}
+		}
+		const size_t plane_stride = static_cast<size_t>( L ) * DSA::PLANE_CAP * DSA::PLANE;
+		const int sstride = DSA::shard_score_stride( mseq, RK );
+		// Inputs shared by every device
+		std::vector<std::vector<half>> proj( S, std::vector<half>( static_cast<size_t>( mseq ) * DSA::PROJ ) );
+		for ( auto& v : proj ) for ( auto& x : v ) x = __float2half( 1.3f * rnd() );
+		std::vector<half> lnw( Dd ), lnb( Dd ), ape( Pp * Dd );
+		for ( auto& x : lnw ) x = __float2half( 1.0f + 0.2f * rnd() );
+		for ( auto& x : lnb ) x = __float2half( 0.1f * rnd() );
+		for ( auto& x : ape ) x = __float2half( 0.5f * rnd() );
+		const int R = 6;
+		const int slots[R] = { 0, 1, 0, 1, 0, 0 }, poss[R] = { NI[0] - 1, NI[1] - 1, NI[0] - 40, NI[1] - 3, 2100, 6000 };
+		std::vector<half> hq( static_cast<size_t>( R ) * HH * Dd ), hw( static_cast<size_t>( R ) * HH );
+		for ( auto& x : hq ) x = __float2half( 0.9f * rnd() );
+		for ( auto& x : hw ) x = __float2half( rnd() );
+		struct Dev { int *table, *shard; half *plane, *pool, *proj, *lnw, *lnb, *ape, *q, *w, *sc; int *cid, *cn, *idx, *nk; unsigned short* ckey; void** cptr; pod::BatchRows* rows; pod::KVPages pg; };
+		std::vector<Dev> dv( V );
+		for ( int v = 0; v < V; ++v ) {
+			CUDA_CHECK( cudaSetDevice( gpu( v ) ) );
+			Dev& d = dv[v];
+			d.table = upload_vec( t2 );
+			d.shard = upload_vec( st2 );
+			d.plane = dev<half>( S * plane_stride );
+			d.pool = dev<half>( static_cast<size_t>( L ) * ( ( v < RK ? spages * PAGE : ptok ) / Pp ) * Dd );
+			d.proj = dev<half>( static_cast<size_t>( mseq ) * DSA::PROJ );
+			d.lnw = upload_vec( lnw );
+			d.lnb = upload_vec( lnb );
+			d.ape = upload_vec( ape );
+			d.q = upload_vec( hq );
+			d.w = dev<half>( static_cast<size_t>( 512 ) * HH );   // prep writes a chunk's head weights (500 rows)
+			d.sc = dev<half>( static_cast<size_t>( R ) * ( v < RK ? sstride : NP ) );
+			d.cid = dev<int>( static_cast<size_t>( R ) * DSA::SEL_POOLS );
+			d.ckey = dev<unsigned short>( static_cast<size_t>( R ) * DSA::SEL_POOLS );
+			d.cn = dev<int>( R );
+			d.idx = dev<int>( static_cast<size_t>( R ) * DSA::KPAD );
+			d.nk = dev<int>( R );
+			d.rows = dev<pod::BatchRows>( 1 );
+			d.pg.table = d.table;
+			d.pg.shift = SHIFT;
+			d.pg.per_slot = ps;
+			d.pg.pool_tokens = ptok;
+			if ( v < RK ) {
+				d.pg.shard_table = d.shard;
+				d.pg.ranks = RK;
+				d.pg.rank = v;
+				d.pg.shard_pool_tokens = static_cast<size_t>( spages ) * PAGE;
+			}
+		}
+		for ( int v = 0; v < RK; ++v ) {
+			std::vector<void*> cp( 3 * RK );
+			for ( int o = 0; o < RK; ++o ) {
+				cp[o] = dv[o].cid;
+				cp[RK + o] = dv[o].ckey;
+				cp[2 * RK + o] = dv[o].cn;
+			}
+			CUDA_CHECK( cudaSetDevice( v ) );
+			dv[v].cptr = upload_vec( cp );
+		}
+		auto put_rows = [&]( int v, const pod::BatchRows& br ) {
+			CUDA_CHECK( cudaSetDevice( gpu( v ) ) );
+			CUDA_CHECK( cudaMemcpy( dv[v].rows, &br, sizeof( br ), cudaMemcpyHostToDevice ) );
+		};
+		// The planes and pools of both slots, in chunks of 500 rows, on every rank and the one-GPU pool
+		for ( int s = 0; s < S; ++s ) {
+			for ( int v = 0; v < V; ++v ) {
+				CUDA_CHECK( cudaSetDevice( gpu( v ) ) );
+				CUDA_CHECK( cudaMemcpy( dv[v].proj, proj[s].data(), proj[s].size() * sizeof( half ), cudaMemcpyHostToDevice ) );
+			}
+			for ( int p0 = 0; p0 < NI[s]; p0 += 500 ) {
+				const int n = std::min( 500, NI[s] - p0 );
+				for ( int v = 0; v < V; ++v ) {
+					put_rows( v, pod::BatchRows::causal( n, p0, s ) );
+					Dev& d = dv[v];
+					DSA::prep( d.proj + static_cast<size_t>( p0 ) * DSA::PROJ, d.lnw, d.lnb, d.plane, d.w, layer, mseq, n, d.rows, plane_stride, nullptr );
+					DSA::pool_update( d.plane, d.pool, d.ape, layer, mseq, n, d.rows, plane_stride, 0, nullptr, d.pg );
+					CUDA_CHECK( cudaDeviceSynchronize() );
+				}
+			}
+		}
+		// prep wrote the head weights of the last chunk into w: put the query's back
+		for ( int v = 0; v < V; ++v ) {
+			CUDA_CHECK( cudaSetDevice( gpu( v ) ) );
+			CUDA_CHECK( cudaMemcpy( dv[v].w, hw.data(), hw.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
+			put_rows( v, pod::BatchRows::batched( R, slots, poss ) );
+		}
+		// One GPU: score + select. The ranks: score + their candidates, then (all done) the merge on the first and the last rank
+		{
+			Dev& d = dv[RK];
+			CUDA_CHECK( cudaSetDevice( 0 ) );
+			DSA::score( d.q, d.w, d.pool, d.sc, NP, layer, mseq, R, d.rows, 0, nullptr, d.pg );
+			DSA::select( d.sc, NP, d.idx, d.nk, R, d.rows, nullptr );
+			CUDA_CHECK( cudaDeviceSynchronize() );
+		}
+		for ( int v = 0; v < RK; ++v ) {
+			Dev& d = dv[v];
+			CUDA_CHECK( cudaSetDevice( v ) );
+			DSA::score( d.q, d.w, d.pool, d.sc, sstride, layer, mseq, R, d.rows, 0, nullptr, d.pg );
+			DSA::select_local( d.sc, sstride, d.cid, d.ckey, d.cn, R, d.rows, d.pg, nullptr );
+			CUDA_CHECK( cudaDeviceSynchronize() );
+		}
+		std::vector<int> ref_idx( static_cast<size_t>( R ) * DSA::KPAD ), ref_nk( R );
+		CUDA_CHECK( cudaSetDevice( 0 ) );
+		CUDA_CHECK( cudaMemcpy( ref_idx.data(), dv[RK].idx, ref_idx.size() * sizeof( int ), cudaMemcpyDeviceToHost ) );
+		CUDA_CHECK( cudaMemcpy( ref_nk.data(), dv[RK].nk, R * sizeof( int ), cudaMemcpyDeviceToHost ) );
+		int selected_rows = 0, local_full = 0;
+		for ( int r = 0; r < R; ++r ) selected_rows += ref_nk[r] > 0;
+		{
+			std::vector<int> cn( R );
+			CUDA_CHECK( cudaMemcpy( cn.data(), dv[0].cn, R * sizeof( int ), cudaMemcpyDeviceToHost ) );
+			for ( int r = 0; r < R; ++r ) local_full += cn[r] == DSA::SEL_POOLS;
+		}
+		for ( const int v : { 0, RK - 1 } ) {
+			Dev& d = dv[v];
+			CUDA_CHECK( cudaSetDevice( v ) );
+			DSA::select_merge( d.cptr, RK, d.idx, d.nk, R, d.rows, nullptr );
+			CUDA_CHECK( cudaDeviceSynchronize() );
+			std::vector<int> idx( ref_idx.size() ), nk( R );
+			CUDA_CHECK( cudaMemcpy( idx.data(), d.idx, idx.size() * sizeof( int ), cudaMemcpyDeviceToHost ) );
+			CUDA_CHECK( cudaMemcpy( nk.data(), d.nk, R * sizeof( int ), cudaMemcpyDeviceToHost ) );
+			bool same = nk == ref_nk;
+			for ( int r = 0; r < R && same; ++r ) {
+				if ( ref_nk[r] > 0 ) same = std::memcmp( idx.data() + static_cast<size_t>( r ) * DSA::KPAD, ref_idx.data() + static_cast<size_t>( r ) * DSA::KPAD, ref_nk[r] * sizeof( int ) ) == 0;
+			}
+			std::printf( "  indexer pool_update + score + local candidates + merge, rank %d of %d: %s (%d selected rows, %d with a full local top %d on rank 0)\n", v, RK,
+				same ? "identical to the one-GPU selection" : "DIFFERENT", selected_rows, local_full, DSA::SEL_POOLS );
+			all_ok = all_ok && same && selected_rows > 0 && local_full > 0;
+		}
+	}
+
+	std::printf( all_ok ? "[+] PASS kv_shard: the latent cache and the indexer over %d GPUs read as the one-GPU pool\n" : "[-] FAIL kv_shard differs from the one-GPU pool (%d GPUs)\n", RK );
 	return all_ok ? 0 : 1;
 }
