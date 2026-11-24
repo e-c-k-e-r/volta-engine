@@ -648,9 +648,9 @@ int main( int argc, char** argv ) {
 			continue;
 		}
 		// --seq rows shorter than a window (GLM): several whole rows in one window, row k in slot k (at most max_slots rows), every chunk above the
-		// decode sizes
+		// decode sizes. A calibration pass takes the windows too (the same rows reach the statistics; streamed experts are read once a window)
 		const int cpr = seq > 0 ? ( seq + chunk - 1 ) / chunk : 0;   // chunks per row
-		const int group = seq > 0 && pos == 0 && win > 1 && !calibrate && seq > pod::MAX_BATCH && ( seq % chunk == 0 || seq % chunk > pod::MAX_BATCH )
+		const int group = seq > 0 && pos == 0 && win > 1 && seq > pod::MAX_BATCH && ( seq % chunk == 0 || seq % chunk > pod::MAX_BATCH )
 			? std::min( { win / std::max( cpr, 1 ), std::max( 1, engine::runtime::options().max_slots ), ( n_tokens - off ) / seq } ) : 0;
 		int count = 0;
 		if ( group >= 2 ) {
@@ -665,7 +665,7 @@ int main( int argc, char** argv ) {
 		}
 		else {
 			if ( seq > 0 && pos == 0 ) mc.reset_slot( 0 );
-			count = std::min( { win > 1 && !calibrate ? span : chunk, n_tokens - off, seq > 0 ? seq - pos : span } );
+			count = std::min( { win > 1 ? span : chunk, n_tokens - off, seq > 0 ? seq - pos : span } );
 			if ( count > chunk ) {
 				// a window of whole chunks above the decode sizes (a short tail runs on its own next)
 				pod::BatchRows w[16];
