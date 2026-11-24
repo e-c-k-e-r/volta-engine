@@ -582,7 +582,7 @@ std::vector<int> Glm5NextPipeline::plan_experts( const engine::loader::SafeTenso
 		size_t per_expert = 0;
 		for ( int p = 0; p < 3; ++p ) {
 			std::snprintf( name, sizeof( name ), "model.language_model.layers.%d.mlp.experts.%d.%s.", layers[i], first_expert, kinds[p] );
-			const size_t all = repo.bytes_of( name );
+			const size_t all = runtime::options().tile_gains ? repo.bytes_of( name ) : repo.bytes_of( name, { ".tgain" } );
 			per_expert += all > sizes[i][p] ? up( all - sizes[i][p], 256 ) + 4 * 256 : 0;
 		}
 		extras += per_expert * static_cast<size_t>( experts ) + up( 9 * static_cast<size_t>( experts ) * sizeof( void* ), 256 ) + up( static_cast<size_t>( experts ) * sizeof( uint32_t ), 256 );

@@ -307,7 +307,8 @@ calibration mixed by their token counts; `tests/tools/hess_merge.py --out DIR --
   squares before the error feedback sees the tile). A tensor's companions are its flag. Both options apply to the routed experts only: the engine's
   MoE kernels on CUDA decode them (the coop decode kernels on their tensor-core tile, the persistent prefill kernel at every row tile, both tile
   orders), and the loader reads them with whole expert tensors or a rank's slice of them (GLM's sharded experts: the companions cut by the same
-  tile rows or columns as the codes). Dense layers, the heavy-expert path (`moe_heavy_rows`), CPU and Vulkan experts, ROCm's coop kernels and the
+  tile rows or columns as the codes); `tile_gains=false` leaves the gains on disk, so the tiles decode at gain 1 and the arena keeps a byte per
+  tile (the starts cannot be left out: a tile's first positions decode from them). Dense layers, the heavy-expert path (`moe_heavy_rows`), CPU and Vulkan experts, ROCm's coop kernels and the
   range readers refuse an extended tensor. `reconstruct_slice_ext` and `reconstruct_had_slice_ext` decode them, and the tools
   read and write them; `hess_compare` scores `.partial` results that have them.
 

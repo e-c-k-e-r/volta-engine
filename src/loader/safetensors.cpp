@@ -7,6 +7,7 @@
 #include "engine/loader/gguf.h"
 #include "engine/modules/gguf.h"
 #include "engine/core/log.h"
+#include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
 #include "engine/quant/fp4_fp8.h"
@@ -1444,11 +1445,11 @@ pod::LinearWeight SafeTensorsRepo::load_linear(
 
 	int actual_bits = ( tr.data && tr.ndim >= 3 ) ? ( engine::modules::trellis_code_from_u16( tr.shape[2] ) ) : bits;
 	pod::LinearWeight lw = tiles( pod::LinearWeight::make_trellis( tr, suh, svh, actual_bits, has_mul1, has_mcg ), base_name );
-	// The extended trellis' tile companions, when the tensor has them (whole tensors only: see refuse_companions)
+	// The extended trellis' tile companions, when the tensor has them (the gains unless tile_gains is off)
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.tstart", base_name );
 	if ( find( name_buf, &dummy_shard ) != nullptr ) lw.w3 = load( name_buf, arena, stream );
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.tgain", base_name );
-	if ( find( name_buf, &dummy_shard ) != nullptr ) lw.w4 = load( name_buf, arena, stream );
+	if ( runtime::options().tile_gains && find( name_buf, &dummy_shard ) != nullptr ) lw.w4 = load( name_buf, arena, stream );
 	return lw;
 }
 
@@ -1539,7 +1540,7 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice(
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.tstart", base_name );
 	if ( find( name_buf, &dummy_shard ) != nullptr ) lw.w3 = load_slice( name_buf, arena, slice_dim, rank, tp_size, stream );
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.tgain", base_name );
-	if ( find( name_buf, &dummy_shard ) != nullptr ) lw.w4 = load_slice( name_buf, arena, slice_dim, rank, tp_size, stream );
+	if ( runtime::options().tile_gains && find( name_buf, &dummy_shard ) != nullptr ) lw.w4 = load_slice( name_buf, arena, slice_dim, rank, tp_size, stream );
 	return lw;
 }
 
