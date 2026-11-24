@@ -18,11 +18,17 @@
 #include <iterator>
 
 using namespace engine;
-using engine::runtime::test::QWEN_DIR;
 
 int main( int argc, char** argv ) {
-	const char* dir = ( argc > 1 ) ? argv[1] : QWEN_DIR;
-	const char* image = ( argc > 2 ) ? argv[2] : TEST_DATA_DIR "/image_wide.png";
+	// test_vision [--model qwen3_5 | glm5_next | DIR] [IMAGE]: the tower of that checkpoint (default Qwen's)
+	const engine::runtime::test::TestModel tm = engine::runtime::test::model_arg( argc, argv, "qwen3_5" );
+	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "glm5_next" ), "test_vision: --model qwen3_5 or glm5_next" );
+	const char* dir = tm.dir.c_str();
+	const char* image = TEST_DATA_DIR "/image_wide.png";
+	for ( int i = 1; i < argc; ++i ) {
+		if ( std::string( argv[i] ) == "--model" ) ++i;
+		else image = argv[i];
+	}
 	backend::set_device( 0 );
 	engine::modules::trellis_context_init_all();
 	pod::MemoryArena arena;
@@ -64,9 +70,7 @@ int main( int argc, char** argv ) {
 			return 1;
 		}
 	}
-	// --glm: the GLM checkpoint's tower; the default is Qwen's
-	bool glm = false;
-	for ( int i = 1; i < argc; ++i ) glm = glm || std::string( argv[i] ) == "--glm";
+	const bool glm = tm.is( "glm5_next" );
 	std::unique_ptr<models::VisionTower> tower_ptr;
 	bool loaded = false;
 	if ( glm ) {

@@ -115,32 +115,32 @@ tier2_models() {
 	run dsv41_vision gpu ./test_dsv41_vision $DSV41 $vg
 	run prefix_restore_dsv41 gpu ./test_dsv41 $DSV41 $ROOT/tests/data/dsv41_prompt_ids.txt 24 snap=1000 max_image_tokens=0
 	# one model per process, as the engine runs (a second cluster in one process is not a supported configuration)
-	run coherence gpu ./test_coherence --qwen-only
-	run coherence_glm gpu ./test_coherence --glm-only
-	run coherence_tp2 sh -c "ENGINE_TP=2 taskset -c 0-9 ./test_coherence --qwen-only --speculative"
+	run coherence gpu ./test_coherence --model qwen3_5
+	run coherence_glm gpu ./test_coherence --model glm5_next
+	run coherence_tp2 sh -c "ENGINE_TP=2 taskset -c 0-9 ./test_coherence --model qwen3_5 --speculative"
 	run prefix_restore gpu ./test_prefix_restore
 	run prefix_restore_spec gpu ./test_prefix_restore --spec
 	run mtp_greedy gpu ./test_mtp
-	run mtp_greedy_flash gpu ./test_mtp --flash
+	run mtp_greedy_flash gpu ./test_mtp --model qwen4_exp
 	# the GLM decode options (side_streams, hc_fuse) must not change the output of test_glm_rows in the NVFP4 dense configuration
 	run glm_option_identity $ROOT/tests/tools/glm_option_identity.sh
 	run vision_tower gpu ./test_vision
-	run vision_tower_glm gpu ./test_vision $(model_dir ENGINE_TEST_GLM_DIR) $ROOT/tests/data/image_wide.png --glm
+	run vision_tower_glm gpu ./test_vision --model glm5_next $ROOT/tests/data/image_wide.png
 	run prefix_restore_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore"
-	run prefix_restore_glm gpu ./test_prefix_restore --glm
-	run prefix_restore_glm_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore --glm"
-	run prefix_restore_flash gpu ./test_prefix_restore --flash
+	run prefix_restore_glm gpu ./test_prefix_restore --model glm5_next
+	run prefix_restore_glm_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore --model glm5_next"
+	run prefix_restore_flash gpu ./test_prefix_restore --model qwen4_exp
 	run sampling_qwen gpu ./test_sampling_gpu
-	run sampling_glm gpu ./test_sampling_gpu --glm
+	run sampling_glm gpu ./test_sampling_gpu --model glm5_next
 }
 
 tier2() { tier2_fast; tier2_models; }
 
 benches() {
 	local f=$out/bench_numbers.txt; : > $f
-	for m in "" "--glm"; do
-		run bench_decode$m gpu ./bench_decode $m
-		grep -E "M=1 |Mode A|Mode B" $out/bench_decode$m.log | sed "s/^/decode$m: /" >> $f
+	for m in qwen3_5 glm5_next; do
+		run bench_decode_$m gpu ./bench_decode --model $m
+		grep -E "M=1 |Mode A|Mode B" $out/bench_decode_$m.log | sed "s/^/decode_$m: /" >> $f
 	done
 	run bench_accept gpu ./bench_accept
 	grep -E "regime|tok/s" $out/bench_accept.log | tail -3 | sed 's/^/accept: /' >> $f
@@ -154,11 +154,11 @@ benches() {
 needles() {
 	run needle_qwen gpu ./test_longctx --tokens 8000 --depth 50
 	run needle_qwen_spec gpu ./test_longctx --spec --tokens 8000 --depth 70
-	run needle_glm gpu ./test_longctx --glm --tokens 8000 --depth 50
-	run needle_glm_spec gpu ./test_longctx --glm --spec --tokens 8000 --depth 30
-	ENGINE_PREFILL_WINDOW=4 ENGINE_MAX_SEQ=16384 run needle_glm_window gpu ./test_longctx --glm --tokens 14000 --depth 10   # GLM defaults to a 12288 window
-	run needle_flash gpu ./test_longctx --flash --tokens 8000 --depth 50
-	run needle_flash_qsa gpu ./test_longctx --flash --tokens 12000 --depth 40
+	run needle_glm gpu ./test_longctx --model glm5_next --tokens 8000 --depth 50
+	run needle_glm_spec gpu ./test_longctx --model glm5_next --spec --tokens 8000 --depth 30
+	ENGINE_PREFILL_WINDOW=4 ENGINE_MAX_SEQ=16384 run needle_glm_window gpu ./test_longctx --model glm5_next --tokens 14000 --depth 10   # GLM defaults to a 12288 window
+	run needle_flash gpu ./test_longctx --model qwen4_exp --tokens 8000 --depth 50
+	run needle_flash_qsa gpu ./test_longctx --model qwen4_exp --tokens 12000 --depth 40
 }
 
 fingerprint() { # one line per binary: md5 of per-kernel registers/stack/smem
@@ -181,8 +181,8 @@ case $mode in
 		ninja > $out/build.log 2>&1 || { echo "[FAIL] build"; fails=$((fails+1)); }
 		fingerprint > $out/fingerprint.txt
 		compare_fp fingerprint $out/fingerprint.txt $ROOT/tests/baselines/fingerprint.txt || fails=$((fails+1))
-		run coherence gpu ./test_coherence --qwen-only
-		run coherence_glm gpu ./test_coherence --glm-only ;;
+		run coherence gpu ./test_coherence --model qwen3_5
+		run coherence_glm gpu ./test_coherence --model glm5_next ;;
 	fingerprint) fingerprint > $ROOT/tests/baselines/fingerprint.txt; cat $ROOT/tests/baselines/fingerprint.txt ;;
 	sass)
 		ninja > $out/build.log 2>&1 || { echo "[FAIL] build"; fails=$((fails+1)); }
@@ -224,7 +224,8 @@ def load(p):
 	d = {}
 	for line in open(p):
 		m = re.match(r"(.*?):\s*(.*?)\s*:\s*([0-9.]+) ms", line)
-		if m: d[(m.group(1), m.group(2))] = float(m.group(3))
+		# (baselines saved before --model named their decode lines "decode" and "decode--glm")
+		if m: d[({"decode": "decode_qwen3_5", "decode--glm": "decode_glm5_next"}.get(m.group(1), m.group(1)), m.group(2))] = float(m.group(3))
 	return d
 a, b = load(sys.argv[1]), load(sys.argv[2])
 bad = 0

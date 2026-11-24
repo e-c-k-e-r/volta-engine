@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Map file for exl3_quantize.py --hess: which Hessian file(s) of a GLM-5.3-Flash capture (test_ppl --glm --calibrate with ENGINE_HESSIAN_DIR) serve which tensor of the EXL3 checkpoint
+"""Map file for exl3_quantize.py --hess: which Hessian file(s) of a GLM-5.3-Flash capture (test_ppl --model glm5_next --calibrate with ENGINE_HESSIAN_DIR) serve which tensor of the EXL3 checkpoint
 (the names of the template checkpoint, not of the original: GLM's linear attention is one fused qkv_proj there).
 
   glm_hess_map.py --dir <capture dir> --src <original weights> --out map.json [--ranks 4] [--down-dir DIR] [--assume-down]

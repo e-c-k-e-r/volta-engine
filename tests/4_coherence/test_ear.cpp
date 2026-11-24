@@ -1,15 +1,15 @@
 // Expected acceptance rate (EAR) of a quantized model against a reference model, on text the reference model generated itself:
 // per scored token, sum over the vocabulary of min( p_ref, p_quant ), the acceptance rate the quantized model would get as the
 // draft model of the reference in speculative sampling (one minus the total variation distance of the two distributions). Only
-// generated tokens are scored, never the prompt. Three steps, each run with the model the step is about (ENGINE_TEST_QWEN_DIR,
-// ENGINE_TEST_FLASH_DIR or ENGINE_TEST_GLM_DIR selects the checkpoint, as for test_ppl):
-//   test_ear [--flash | --glm] --generate CORPUS [--prompts tests/data/ear_prompts.json] [--max-new 768] [--seed 1] [--text-out DIR]
+// generated tokens are scored, never the prompt. Three steps, each run with the model the step is about (--model qwen3_5, the default,
+// qwen4_exp or glm5_next: that family's test checkpoint, as for test_ppl; or a checkpoint directory):
+//   test_ear [--model M] --generate CORPUS [--prompts tests/data/ear_prompts.json] [--max-new 768] [--seed 1] [--text-out DIR]
 //       the reference model answers every prompt (its chat template, its generation_config.json sampling settings); writes the
 //       token streams and which tokens it generated
-//   test_ear [--flash | --glm] --reference CORPUS REF [--top 256] [--chunk 1]
+//   test_ear [--model M] --reference CORPUS REF [--top 256] [--chunk 1]
 //       the reference model teacher-forced over the corpus: the top entries of every scored token's distribution and the mass
 //       left outside them
-//   test_ear [--flash | --glm] --compare CORPUS REF [--chunk 1]
+//   test_ear [--model M] --compare CORPUS REF [--chunk 1]
 //       the quantized model over the same corpus: EAR per kind of text and overall (a lower bound: the reference's tail is
 //       counted as disagreeing; the gap to the upper bound is printed), KL divergence over the top entries plus the lumped tail,
 //       and how often both models' most likely token is the same
@@ -123,13 +123,11 @@ void teacher_forced( ModelCluster& mc, const std::vector<Sample>& samples, int c
 } // namespace
 
 int main( int argc, char** argv ) {
-	bool glm = false, flash = false;
 	std::string mode, corpus_path, ref_path, text_out, prompts_path = std::string( TEST_DATA_DIR ) + "/ear_prompts.json";
 	int max_new = 768, top = 256, chunk = 1;
 	uint64_t seed = 1;
 	for ( int i = 1; i < argc; ++i ) {
-		if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
-		else if ( !std::strcmp( argv[i], "--flash" ) ) flash = true;
+		if ( !std::strcmp( argv[i], "--model" ) && i + 1 < argc ) ++i;
 		else if ( !std::strcmp( argv[i], "--generate" ) && i + 1 < argc ) { mode = "generate"; corpus_path = argv[++i]; }
 		else if ( ( !std::strcmp( argv[i], "--reference" ) || !std::strcmp( argv[i], "--compare" ) ) && i + 2 < argc ) {
 			mode = argv[i] + 2;
@@ -148,15 +146,17 @@ int main( int argc, char** argv ) {
 		}
 	}
 	if ( mode.empty() ) {
-		std::printf( "usage: test_ear [--flash | --glm] --generate CORPUS | --reference CORPUS REF | --compare CORPUS REF\n" );
+		std::printf( "usage: test_ear [--model M] --generate CORPUS | --reference CORPUS REF | --compare CORPUS REF\n" );
 		return 2;
 	}
 	chunk = std::max( 1, std::min( chunk, pod::MAX_BATCH ) );
-	const char* model_dir = glm ? test::GLM_DIR : ( flash ? test::FLASH_DIR : test::QWEN_DIR );
+	const test::TestModel tm = test::model_arg( argc, argv, "qwen3_5" );
+	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "qwen4_exp" ) || tm.is( "glm5_next" ), "test_ear: --model qwen3_5, qwen4_exp or glm5_next" );
+	const char* model_dir = tm.dir.c_str();
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm5_next" : ( flash ? "qwen4_exp" : "qwen3_5" );
-	cfg.model_dir = model_dir;
+	cfg.model_type = tm.type;
+	cfg.model_dir = tm.dir;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	const int V = mc.metadata().vocab_size;
 

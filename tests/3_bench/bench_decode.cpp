@@ -124,16 +124,18 @@ void bench_model( const char* type, const char* dir, int steps ) {
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	bool qwen = true;
-	bool glm = false, flash = false;
+	// --model M (repeatable: an architecture or a checkpoint directory), --all: Qwen3.8-27B, GLM and Flash-Next; Qwen3.8-27B without either
+	test::refuse_family_flags( argc, argv );
+	std::vector<test::TestModel> models;
 	for ( int i = 1; i < argc; ++i ) {
-		if ( !std::strcmp( argv[i], "--glm" ) || !std::strcmp( argv[i], "--glm-only" ) ) { qwen = false; glm = true; }
-		else if ( !std::strcmp( argv[i], "--flash" ) ) { qwen = false; flash = true; }
-		else if ( !std::strcmp( argv[i], "--all" ) ) { qwen = true; glm = true; flash = true; }
+		if ( !std::strcmp( argv[i], "--model" ) && i + 1 < argc ) models.push_back( test::resolve_model( argv[++i] ) );
+		else if ( !std::strcmp( argv[i], "--all" ) ) for ( const char* t : { "qwen3_5", "glm5_next", "qwen4_exp" } ) models.push_back( test::resolve_model( t ) );
 	}
-	if ( qwen ) impl::bench_model( "qwen3_5", test::QWEN_DIR, 50 );
-	if ( glm ) impl::bench_model( "glm5_next", test::GLM_DIR, 30 );
-	if ( flash ) impl::bench_model( "qwen4_exp", test::FLASH_DIR, 50 );
+	if ( models.empty() ) models.push_back( test::resolve_model( "qwen3_5" ) );
+	for ( const test::TestModel& m : models ) {
+		ENGINE_ASSERT( m.is( "qwen3_5" ) || m.is( "glm5_next" ) || m.is( "qwen4_exp" ), "bench_decode: --model qwen3_5, glm5_next or qwen4_exp" );
+		impl::bench_model( m.type.c_str(), m.dir.c_str(), m.is( "glm5_next" ) ? 30 : 50 );
+	}
 	std::printf( "\n[+] Benchmark complete.\n" );
 	return 0;
 }

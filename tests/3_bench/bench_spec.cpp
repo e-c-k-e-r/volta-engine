@@ -45,11 +45,14 @@ bool diagnose( ModelCluster& mc, const std::vector<int>& prompt, const std::vect
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	const bool glm = ( argc > 1 && !std::strcmp( argv[1], "--glm" ) );
+	// --model qwen3_5 (the default), glm5_next or a checkpoint directory of either (with that family's test drafter)
+	const test::TestModel tm = test::model_arg( argc, argv, "qwen3_5" );
+	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "glm5_next" ), "bench_spec: --model qwen3_5 or glm5_next" );
+	const bool glm = tm.is( "glm5_next" );
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm5_next" : "qwen3_5";
-	cfg.model_dir = glm ? test::GLM_DIR : test::QWEN_DIR;
+	cfg.model_type = tm.type;
+	cfg.model_dir = tm.dir;
 	cfg.draft_model_dir = glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	mc.warm_graphs( 8 );

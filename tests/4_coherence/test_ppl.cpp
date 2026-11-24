@@ -1,6 +1,6 @@
 // Teacher-forced perplexity of a text file on a served model: the same tokens run through chunked prefill with every row's logits read back,
 // so two builds (or two kernel paths) can be compared on a quality metric instead of greedy tokens. Optionally writes the per-token NLL.
-//   test_ppl [--glm | --flash] [--file PATH] [--tokens N] [--chunk C] [--nll OUT.bin] [--topk-out OUT.bin [--topk K]]
+//   test_ppl [--model <architecture | checkpoint dir>] [--file PATH] [--tokens N] [--chunk C] [--nll OUT.bin] [--topk-out OUT.bin [--topk K]]
 //     --topk-out: the model's distribution at every position as a teacher (volta_e2e): int32 magic 0x4b504f54, tokens N, seq, K, the N token ids,
 //     then per position K ids (int32, most likely first), their probabilities (FP32) and the mass outside them (FP32)
 //   --kl-teacher FILE (a --topk-out file of the same text and settings): also KL( teacher || model ) per position, over the teacher's top K plus
@@ -17,8 +17,9 @@
 //   (the others run without adding), spreading a token budget over long sessions instead of spending it on the first ones
 //   test_ppl --prompts DIR [--select hold|train] [--sessions N]   without --calibrate: perplexity of the assistant turns of the sessions (prefix rows run without logits; chat models are
 //   not trained on system and user text, whose loss is meaningless, so only the tokens between <|im_start|>assistant and <|im_end|> after the shared prefix are scored); --select hold takes every 10th session in name order, train the rest
-//   test_ppl --flash --qbench qbench_prompts.md [--chunk C]   scores only the response tokens of each traced row (input as context), the
+//   test_ppl --model qwen4_exp --qbench qbench_prompts.md [--chunk C]   scores only the response tokens of each traced row (input as context), the
 //   quantity the checkpoint's model card reports as PPL
+// --model: qwen3_5 (the default), qwen4_exp or glm5_next for that family's test checkpoint (tests/models.env), or a checkpoint directory.
 // The default text is the docs/ folder concatenated; ids never include special tokens.
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"
@@ -68,15 +69,14 @@ struct PosBins {
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	bool glm = false, flash = false, calibrate = false;
+	bool calibrate = false;
 	int n_tokens = 6000, chunk = 512;
 	std::string file, nll_out, qbench, prompts_dir, topk_out, kl_teacher;
 	int seq = 0, max_sessions = 0, skip_override = 0, show_miss = 0, stride = 1, topk = 128, kl_from = 0;
 	std::string select;
 	std::vector<int> bin_edges;
 	for ( int i = 1; i < argc; ++i ) {
-		if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
-		else if ( !std::strcmp( argv[i], "--flash" ) ) flash = true;
+		if ( !std::strcmp( argv[i], "--model" ) && i + 1 < argc ) ++i;
 		else if ( !std::strcmp( argv[i], "--file" ) && i + 1 < argc ) file = argv[++i];
 		else if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--chunk" ) && i + 1 < argc ) chunk = std::atoi( argv[++i] );
@@ -99,6 +99,9 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--sessions" ) && i + 1 < argc ) max_sessions = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--stride" ) && i + 1 < argc ) stride = std::max( 1, std::atoi( argv[++i] ) );
 	}
+	const test::TestModel tm = test::model_arg( argc, argv, "qwen3_5" );
+	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "qwen4_exp" ) || tm.is( "glm5_next" ), "test_ppl: --model qwen3_5, qwen4_exp or glm5_next" );
+	const bool glm = tm.is( "glm5_next" ), flash = tm.is( "qwen4_exp" );
 	// --calibrate with ENGINE_CALIB_MTP set (Flash-Next): the MTP head runs after every forward on the same rows (hidden stack of position p with the token
 	// of p + 1), so ENGINE_HESSIAN_DIR also collects the head's sites (layers 48 and 49 of the file names); the head keeps its own KV like in serving
 	const bool mtp_calib = calibrate && flash && std::getenv( "ENGINE_CALIB_MTP" ) != nullptr;
@@ -108,7 +111,7 @@ int main( int argc, char** argv ) {
 		std::printf( "[test_ppl] chunk %d clamped to %d: the gathered logits hold a decode batch (--calibrate reads none and takes any chunk; GLM: set glm_logit_rows)\n", chunk, pod::MAX_BATCH );
 		chunk = pod::MAX_BATCH;
 	}
-	const char* model_dir = glm ? test::GLM_DIR : ( flash ? test::FLASH_DIR : test::QWEN_DIR );
+	const char* model_dir = tm.dir.c_str();
 	engine::loader::Tokenizer tok;
 	ENGINE_ASSERT( tok.load( model_dir ), "tokenizer load failed" );
 
@@ -139,7 +142,7 @@ int main( int argc, char** argv ) {
 		std::printf( "[*] %zu prompt dumps, %zu sessions\n", all.size(), leaves.size() );
 		ModelCluster mc;
 		ClusterConfig cfg;
-		cfg.model_type = glm ? "glm5_next" : ( flash ? "qwen4_exp" : "qwen3_5" );
+		cfg.model_type = tm.type;
 		cfg.model_dir = model_dir;
 		cfg.speculate = mtp_calib;
 		ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
@@ -376,7 +379,7 @@ int main( int argc, char** argv ) {
 		std::printf( "[*] qbench: %zu rows parsed\n", rows.size() );
 		ModelCluster mc;
 		ClusterConfig cfg;
-		cfg.model_type = glm ? "glm5_next" : ( flash ? "qwen4_exp" : "qwen3_5" );
+		cfg.model_type = tm.type;
 		cfg.model_dir = model_dir;
 		ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 		const int V = mc.metadata().vocab_size;
@@ -452,7 +455,7 @@ int main( int argc, char** argv ) {
 
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm5_next" : ( flash ? "qwen4_exp" : "qwen3_5" );
+	cfg.model_type = tm.type;
 	cfg.model_dir = model_dir;
 	cfg.speculate = mtp_calib;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );

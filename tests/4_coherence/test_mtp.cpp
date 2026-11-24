@@ -35,19 +35,20 @@ static bool one_ulp_tie( ModelCluster& mc, const std::vector<int>& prompt, const
 }
 
 int main( int argc, char** argv ) {
-	// --flash: Qwen3.8-Flash-Next (qwen4_exp) instead of Qwen3.8-27B; --glm: GLM-5.3-Flash (the head comes from the NVFP4 checkpoint named by
+	// --model qwen3_5 (the default), qwen4_exp, glm5_next or a checkpoint directory (GLM: the head comes from the NVFP4 checkpoint named by
 	// ENGINE_NVFP4_DENSE_SRC)
-	const bool flash = argc > 1 && std::string( argv[1] ) == "--flash";
-	const bool glm = argc > 1 && std::string( argv[1] ) == "--glm";
-	// --joint (with --flash): two prompts speculate together, their blocks verified in one forward (joint rounds), each held to its own plain greedy run
-	const bool joint = flash && argc > 2 && std::string( argv[2] ) == "--joint";
+	const test::TestModel tm = test::model_arg( argc, argv, "qwen3_5" );
+	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "qwen4_exp" ) || tm.is( "glm5_next" ), "test_mtp: --model qwen3_5, qwen4_exp or glm5_next" );
+	const bool flash = tm.is( "qwen4_exp" ), glm = tm.is( "glm5_next" );
+	auto has = [&]( const char* f ) { for ( int a = 1; a < argc; ++a ) if ( std::string( argv[a] ) == f ) return true; return false; };
+	// --joint (Flash-Next): two prompts speculate together, their blocks verified in one forward (joint rounds), each held to its own plain greedy run
+	const bool joint = flash && has( "--joint" );
 	// --interleave: slot 0 speculates while slot 1's long prompt is prefilled in pieces between its rounds (what the generator does when a request arrives
 	// during decoding); both slots must give exactly the tokens they give alone, since the pieces and the rounds are separate forwards
-	const bool interleave = argc > 2 && std::string( argv[2] ) == "--interleave";
-	// --short (anywhere): only the short prompt (the CPU and Vulkan builds, where the long one takes long to prefill)
-	bool short_only = false;
-	for ( int a = 1; a < argc; ++a ) short_only = short_only || std::string( argv[a] ) == "--short";
-	const char* dir = glm ? test::GLM_DIR : flash ? test::FLASH_DIR : test::QWEN_DIR;
+	const bool interleave = has( "--interleave" );
+	// --short: only the short prompt (the CPU and Vulkan builds, where the long one takes long to prefill)
+	const bool short_only = has( "--short" );
+	const char* dir = tm.dir.c_str();
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	setenv( "ENGINE_SPECULATOR", "mtp", 1 );
 	engine::loader::Tokenizer tok;
@@ -74,7 +75,7 @@ int main( int argc, char** argv ) {
 
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm5_next" : flash ? "qwen4_exp" : "qwen3_5";
+	cfg.model_type = tm.type;
 	cfg.model_dir = dir;
 	cfg.speculate = true;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );

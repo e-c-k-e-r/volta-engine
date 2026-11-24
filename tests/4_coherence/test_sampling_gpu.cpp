@@ -45,12 +45,15 @@ std::vector<int> run_sampled( ModelCluster& mc, const std::vector<int>& prompt, 
 } // namespace
 
 int main( int argc, char** argv ) {
-	const bool glm = argc > 1 && std::strcmp( argv[1], "--glm" ) == 0;
+	// --model qwen3_5 (the default), glm5_next or a checkpoint directory of either (with that family's test drafter)
+	const test::TestModel tm = test::model_arg( argc, argv, "qwen3_5" );
+	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "glm5_next" ), "test_sampling_gpu: --model qwen3_5 or glm5_next" );
+	const bool glm = tm.is( "glm5_next" );
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm5_next" : "qwen3_5";
-	cfg.model_dir = glm ? test::GLM_DIR : test::QWEN_DIR;
+	cfg.model_type = tm.type;
+	cfg.model_dir = tm.dir;
 	cfg.draft_model_dir = glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	mc.warm_graphs( 8 );
@@ -61,7 +64,7 @@ int main( int argc, char** argv ) {
 	};
 	// An open-ended prompt for the seed-sensitivity check: peaked answers legitimately repeat across seeds.
 	engine::loader::Tokenizer tok;
-	ENGINE_ASSERT( tok.load( glm ? test::GLM_DIR : test::QWEN_DIR ), "tokenizer load failed" );
+	ENGINE_ASSERT( tok.load( tm.dir.c_str() ), "tokenizer load failed" );
 	if ( glm ) {
 		// Plain-text prompts: the T->0 == greedy and seed checks do not depend on chat formatting
 		prompts.clear();

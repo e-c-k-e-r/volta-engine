@@ -1,7 +1,7 @@
 // Multiple-choice scoring: per task, one prefill of the prompt (tokenized without special tokens) and the log-softmax of the last row's
 // logits at each answer's single token; the prediction is the most likely answer. The output rows follow llama.cpp's mc-score (task,
 // predicted answer, correct answer, then every answer's log-probability), so a run compares task by task with one of llama.cpp.
-//   test_mc [--flash | --glm] TASKS OUT [--start S] [--n N]
+//   test_mc [--model qwen3_5 | qwen4_exp | glm5_next | DIR] TASKS OUT [--start S] [--n N]
 // TASKS: JSON list of { "prompt": text, "answers": [text, ...], "correct": index }; OUT is appended to from --start on (a resumed run)
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"
@@ -22,20 +22,18 @@ namespace backend = engine::backend;
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	bool glm = false, flash = false;
 	const char* tasks_path = nullptr;
 	const char* out_path = nullptr;
 	int start = 0, count = -1;
 	for ( int i = 1; i < argc; ++i ) {
-		if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
-		else if ( !std::strcmp( argv[i], "--flash" ) ) flash = true;
+		if ( !std::strcmp( argv[i], "--model" ) && i + 1 < argc ) ++i;
 		else if ( !std::strcmp( argv[i], "--start" ) && i + 1 < argc ) start = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--n" ) && i + 1 < argc ) count = std::atoi( argv[++i] );
 		else if ( !tasks_path ) tasks_path = argv[i];
 		else if ( !out_path ) out_path = argv[i];
 	}
 	if ( !tasks_path || !out_path ) {
-		std::printf( "usage: test_mc [--flash | --glm] TASKS OUT [--start S] [--n N]\n" );
+		std::printf( "usage: test_mc [--model M] TASKS OUT [--start S] [--n N]\n" );
 		return 2;
 	}
 	std::ifstream tf( tasks_path );
@@ -43,12 +41,14 @@ int main( int argc, char** argv ) {
 	const nlohmann::json tasks = nlohmann::json::parse( tf );
 	const int end = count < 0 ? static_cast<int>( tasks.size() ) : std::min( static_cast<int>( tasks.size() ), start + count );
 
-	const char* model_dir = glm ? test::GLM_DIR : ( flash ? test::FLASH_DIR : test::QWEN_DIR );
+	const test::TestModel tm = test::model_arg( argc, argv, "qwen3_5" );
+	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "qwen4_exp" ) || tm.is( "glm5_next" ), "test_mc: --model qwen3_5, qwen4_exp or glm5_next" );
+	const char* model_dir = tm.dir.c_str();
 	engine::loader::Tokenizer tok;
 	ENGINE_ASSERT( tok.load( model_dir ), "tokenizer load failed" );
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm5_next" : ( flash ? "qwen4_exp" : "qwen3_5" );
+	cfg.model_type = tm.type;
 	cfg.model_dir = model_dir;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	const int V = mc.metadata().vocab_size;

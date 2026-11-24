@@ -1,6 +1,6 @@
 // Writes the full-vocabulary logits after a fixed prompt to a file (FP16), for comparing two builds or two checkpoints of one model
-// (cosine and top-k overlap, tests/tools/compare_logits.py). GLM by default; --flash and --qwen pick the others.
-//   diag_logits_dump <out.bin> [--flash | --qwen]    (ENGINE_TEST_*_DIR picks the checkpoint)
+// (cosine and top-k overlap, tests/tools/compare_logits.py). GLM's test checkpoint by default.
+//   diag_logits_dump <out.bin> [--model qwen3_5 | qwen4_exp | glm5_next | DIR]
 #include "engine/runtime/test_driver.h"
 #include <cstdio>
 #include <cstring>
@@ -10,13 +10,13 @@ using namespace engine::runtime;
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	if ( argc < 2 ) { std::printf( "usage: diag_logits_dump <out.bin> [--flash | --qwen]\n" ); return 2; }
-	bool flash = false, qwen = false;
-	for ( int i = 2; i < argc; ++i ) { flash = flash || !std::strcmp( argv[i], "--flash" ); qwen = qwen || !std::strcmp( argv[i], "--qwen" ); }
+	if ( argc < 2 ) { std::printf( "usage: diag_logits_dump <out.bin> [--model M]\n" ); return 2; }
+	const test::TestModel tm = test::model_arg( argc, argv, "glm5_next" );
+	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "qwen4_exp" ) || tm.is( "glm5_next" ), "diag_logits_dump: --model qwen3_5, qwen4_exp or glm5_next" );
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = qwen ? "qwen3_5" : flash ? "qwen4_exp" : "glm5_next";
-	cfg.model_dir = qwen ? test::QWEN_DIR : flash ? test::FLASH_DIR : test::GLM_DIR;
+	cfg.model_type = tm.type;
+	cfg.model_dir = tm.dir;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );
 	std::vector<int> ids( 48 );
 	uint32_t st = 4242u;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <nlohmann/json.hpp>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <list>
@@ -62,4 +64,67 @@ inline const char* model_path( const char* role ) {
 	return interned.back().c_str();
 }
 
+
+// The test checkpoint of an architecture (the model_type of its config.json), from tests/models.env; nullptr for an unknown name
+inline const char* model_role( const std::string& type ) {
+	if ( type == "qwen3_5" ) return "ENGINE_TEST_QWEN_DIR";
+	if ( type == "qwen4_exp" ) return "ENGINE_TEST_FLASH_DIR";
+	if ( type == "glm5_next" ) return "ENGINE_TEST_GLM_DIR";
+	if ( type == "deepseek_v41" ) return "ENGINE_TEST_DSV41_DIR";
+	if ( type == "gemma4" ) return "ENGINE_TEST_GEMMA_DIR";
+	return nullptr;
+}
+
+// The top-level model_type of a checkpoint's config.json ("" when it has none; text_config / vision_config carry their own)
+inline std::string config_model_type( const std::string& dir ) {
+	std::ifstream in( dir + "/config.json" );
+	const nlohmann::json j = nlohmann::json::parse( in, nullptr, false );
+	return !j.is_discarded() && j.is_object() && j.contains( "model_type" ) && j["model_type"].is_string() ? j["model_type"].get<std::string>() : "";
+}
+
+// The checkpoint a test runs on: --model <name | dir>. An architecture name (qwen3_5, qwen4_exp, glm5_next, deepseek_v41, gemma4) takes
+// that family's test checkpoint (tests/models.env); a directory (an argument with a '/') runs that checkpoint, its architecture read from
+// its config.json. Without --model, `fallback` (an architecture name; empty: no model). Exits on an argument neither resolves.
+struct TestModel {
+	std::string type, dir;
+	bool is( const char* t ) const { return type == t; }
+	explicit operator bool() const { return !type.empty(); }
+};
+
+inline TestModel resolve_model( const std::string& arg ) {
+	TestModel m;
+	if ( arg.find( '/' ) != std::string::npos ) {
+		m.dir = arg;
+		m.type = config_model_type( arg );
+	}
+	else if ( const char* role = model_role( arg ) ) {
+		m.type = arg;
+		m.dir = model_path( role );
+	}
+	if ( m.type.empty() || !model_role( m.type ) ) {
+		std::fprintf( stderr, "[-] --model %s: neither an architecture (qwen3_5, qwen4_exp, glm5_next, deepseek_v41, gemma4) nor a checkpoint directory with one in its config.json\n", arg.c_str() );
+		std::exit( 2 );
+	}
+	return m;
+}
+
+// The family flags --model replaced: a tool that ignores unknown arguments would otherwise run its default model
+inline void refuse_family_flags( int argc, char** argv ) {
+	for ( int i = 1; i < argc; ++i ) {
+		const std::string a = argv[i];
+		if ( a == "--glm" || a == "--flash" || a == "--qwen" || a == "--glm-only" || a == "--qwen-only" || a == "--gemma" || a == "--type" ) {
+			std::fprintf( stderr, "[-] %s is gone: --model <architecture | checkpoint dir> (qwen3_5, qwen4_exp, glm5_next, deepseek_v41, gemma4)\n", a.c_str() );
+			std::exit( 2 );
+		}
+	}
+}
+
+// --model's value in argv (a tool's own argument loop skips "--model" and the value after it)
+inline TestModel model_arg( int argc, char** argv, const char* fallback ) {
+	refuse_family_flags( argc, argv );
+	for ( int i = 1; i + 1 < argc; ++i ) {
+		if ( std::string( argv[i] ) == "--model" ) return resolve_model( argv[i + 1] );
+	}
+	return fallback && *fallback ? resolve_model( fallback ) : TestModel{};
+}
 } // namespace engine::runtime::test

@@ -49,8 +49,8 @@ for the language models' dense products (on ROCm it forwards to hipBLAS). Verifi
 | `gdn.cu` | GDN / KDA projections, conv1d, recurrent step, per-row snapshots | `test_gdn`, `test_slang_kernels`, `test_ops_attention` |
 | `mla_latent.cu` | absorbed latent attention (dense, sparse, split-KV; latent cache FP16, FP8, int8 or NVFP4 via kv_format) | `test_mla_latent`, `test_ref_attention` |
 | `gated_residual.cu` | Flash-Next gated residual (norm, low-rank gate, mix, post gate, apply), MTP stream norm / broadcast, shared-expert gate | `test_gr_tc`, `test_gr_decode`, `test_ops_flash` |
-| `ple.cu` (with the host table reader `src/loader/ngram_table.cpp`: mul1 ring codec, hashing) | Flash-Next n-gram embedding layer: gate, grouped norms, dilated conv ring | `test_ops_flash`, `test_prefix_restore --flash` |
-| `qsa.cu` (+ `attention.cu` `forward_sparse`, `dsa.cu` `select`) | Flash-Next QSA indexer: q / k prep, pooled keys, scoring, token-list sparse GQA attention | `test_sparse_attn`, `test_ops_flash`, `test_longctx --flash` (`gate.sh needle`) |
+| `ple.cu` (with the host table reader `src/loader/ngram_table.cpp`: mul1 ring codec, hashing) | Flash-Next n-gram embedding layer: gate, grouped norms, dilated conv ring | `test_ops_flash`, `test_prefix_restore --model qwen4_exp` |
+| `qsa.cu` (+ `attention.cu` `forward_sparse`, `dsa.cu` `select`) | Flash-Next QSA indexer: q / k prep, pooled keys, scoring, token-list sparse GQA attention | `test_sparse_attn`, `test_ops_flash`, `test_longctx --model qwen4_exp` (`gate.sh needle`) |
 | `dsa.cu` | indexer projection, plane / pool update, score, top-k select | `test_dsa` (FP64 reference) |
 | `moe.cu`, `expert_tier.cu` | router, dispatch histogram / scatter, combine, two-tier expert residency | `test_moe`, `test_ops_moe` |
 | `cpu_experts.cu` | the device half of the CPU expert path: post the routes handed to the CPU, wait for its answer, add it | `test_cpu_bridge` |

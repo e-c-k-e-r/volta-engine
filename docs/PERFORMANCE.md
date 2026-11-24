@@ -158,7 +158,7 @@ build/volta_server --model-dir <checkpoint> --use-speculation --set speculator=<
     --set tp=4 --set max_slots=1 --set max_seq=32768 --set max_image_tokens=0
 tests/tools/agent_replay_run.py <turns.json> <out.json> --max-tokens 300      # the agent replay and the chat set; 768 for GSM8K and MBPP
 curl -s localhost:8000/api/stats                                             # before and after a set: rounds and accepted drafts
-ENGINE_TP=4 BENCH_VL=2,4,8,12,16 build/bench_decode [--glm | --flash]         # step latency; ENGINE_TEST_<ROLE>_DIR picks the checkpoint
+ENGINE_TP=4 BENCH_VL=2,4,8,12,16 build/bench_decode [--model glm5_next | qwen4_exp | DIR]   # step latency
 ```
 
 Record each GPU's power limit and clocks with the numbers, and compare runs only at the same cap and clocks. Settings for serving several requests

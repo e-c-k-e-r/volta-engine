@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Map file for exl3_quantize.py --hess: which Hessian file(s) of a Qwen3.8-Flash-Next capture (test_ppl --flash --calibrate with ENGINE_HESSIAN_DIR) serve which tensor.
+"""Map file for exl3_quantize.py --hess: which Hessian file(s) of a Qwen3.8-Flash-Next capture (test_ppl --model qwen4_exp --calibrate with ENGINE_HESSIAN_DIR) serve which tensor.
 
   flash_hess_map.py --dir <capture dir> --src <original weights> --out map.json [--ranks 4] [--down-dir DIR]
 

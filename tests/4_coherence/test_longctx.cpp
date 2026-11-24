@@ -1,6 +1,6 @@
 // Long-context needle retrieval: a filler prompt of ~N tokens with a secret code buried at a given depth, greedy
 // (or speculative) decode, and a check that the answer carries the code. Context window set by ENGINE_MAX_SEQ (Qwen).
-//   test_longctx [--glm | --flash] [--tokens N] [--depth PCT] [--spec]
+//   test_longctx [--model qwen3_5 | qwen4_exp | glm5_next | DIR] [--tokens N] [--depth PCT] [--spec]
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"
 #include "engine/loader/chat_template.h"
@@ -12,18 +12,20 @@ using namespace engine::runtime;
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	bool glm = false, spec = false, flash = false;
+	bool spec = false;
 	int n_tokens = 8000;
 	int depth = 50;
 	for ( int i = 1; i < argc; ++i ) {
-		if ( !std::strcmp( argv[i], "--glm" ) ) glm = true;
-		else if ( !std::strcmp( argv[i], "--flash" ) ) flash = true;
+		if ( !std::strcmp( argv[i], "--model" ) && i + 1 < argc ) ++i;
 		else if ( !std::strcmp( argv[i], "--spec" ) ) spec = true;
 		else if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--depth" ) && i + 1 < argc ) depth = std::atoi( argv[++i] );
 	}
+	const test::TestModel tm = test::model_arg( argc, argv, "qwen3_5" );
+	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "qwen4_exp" ) || tm.is( "glm5_next" ), "test_longctx: --model qwen3_5, qwen4_exp or glm5_next" );
+	const bool glm = tm.is( "glm5_next" );
 	engine::loader::Tokenizer tok;
-	const char* model_dir = glm ? test::GLM_DIR : ( flash ? test::FLASH_DIR : test::QWEN_DIR );
+	const char* model_dir = tm.dir.c_str();
 	ENGINE_ASSERT( tok.load( model_dir ), "tokenizer load failed" );
 	engine::loader::ChatTemplate chat;
 	ENGINE_ASSERT( chat.load( model_dir ), "chat template load failed" );
@@ -66,7 +68,7 @@ int main( int argc, char** argv ) {
 
 	ModelCluster mc;
 	ClusterConfig cfg;
-	cfg.model_type = glm ? "glm5_next" : ( flash ? "qwen4_exp" : "qwen3_5" );
+	cfg.model_type = tm.type;
 	cfg.model_dir = model_dir;
 	if ( spec ) cfg.draft_model_dir = glm ? test::GLM_DRAFT_DIR : test::QWEN_DRAFT_DIR;
 	ENGINE_ASSERT( mc.init( cfg ), "ModelCluster init failed" );

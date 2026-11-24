@@ -65,7 +65,7 @@ build/volta_server --model-dir <Qwen3.8-27B-exl3> --speculative --set speculator
   `expert_stream=true` reads the cold experts of each layer from the checkpoint before the layer runs, and `expert_stream_host_gib` keeps that many GiB
   of them per rank in pinned RAM instead (read once at load); with the expert tier's staging each layer's cold experts are copied to the device once
   per prefill window, and the next layer's are read from the checkpoint while a layer runs. A teacher pass over a text file is
-  `test_ppl --glm --chunk 512 --topk-out <file>` with `glm_logit_rows` at the prefill window's rows (8192 for `prefill_window=16` chunks of 512), each
+  `test_ppl --model glm5_next --chunk 512 --topk-out <file>` with `glm_logit_rows` at the prefill window's rows (8192 for `prefill_window=16` chunks of 512), each
   window scoring every row; with `--seq` rows shorter than a window, one window holds several rows, one slot each (`max_slots` of them). It can also be the source of the MTP head (`nvfp4_dense_src=<GLM-5.3-Flash>`: layer 45 quantized to NVFP4 from FP8 at load).
 * `tp` 1, 2 or 4; on two GPUs the experts need the expert tier (`expert_cache` below 1) to fit. At `tp` 4 with every expert resident, the experts
   are sharded over the ranks. `shared_slice` (on) cuts the shared expert and the dense MLP of layers 0-2 over the ranks.
@@ -148,7 +148,7 @@ The final mixer is the same without `post` and gives the head's input.
     (`configs/flash_next_nvfp4_only.json`); the n-gram table is read in place from its FP8 shards.
   * GGUF: llama.cpp's `qwen4exp` architecture. Its MTP block is not read; `mtp_head_dir=<NVFP4 dir>` takes the head from the NVFP4 checkpoint.
   * calibrated NVFP4 dense tensors come from `tests/tools/nvfp4_ldlq.py --model flash|glm` over the Hessians that
-    `ENGINE_HESSIAN_DIR=<dir> test_ppl --flash|--glm --calibrate --file <text>` writes (GLM: `ENGINE_HESSIAN_LAYERS=lo-hi`, a third of the layers per pass).
+    `ENGINE_HESSIAN_DIR=<dir> test_ppl --model qwen4_exp|glm5_next --calibrate --file <text>` writes (GLM: `ENGINE_HESSIAN_LAYERS=lo-hi`, a third of the layers per pass).
 * Speculation: `--speculative --set speculator=mtp` drafts with the checkpoint's head (state per slot; `mtp_depth`, default 7, is the most draft
   tokens per round). The DFlash2 drafter (`draft_model_dir` = `Qwen3.8-Flash-Next-DFlash2`, `configs/flash_next_dflash2.json`) drafts a block per round
   from the outputs of layers 5, 15, 25, 35 and 45 (each the mean of the four streams), kept in a per-slot ring of the last 2048 positions that

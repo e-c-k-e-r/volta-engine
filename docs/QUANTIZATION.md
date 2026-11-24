@@ -134,7 +134,7 @@ the BF16 ones. `Qwen3.8-27B-QUASAR-NVFP4` runs as it is (`configs/qwen_nvfp4.jso
 
 ### Calibration
 
-`ENGINE_HESSIAN_DIR=<dir> test_ppl --flash|--glm --calibrate --file <text> --tokens N` (with `ENGINE_MAX_SEQ` above N; GLM a third of the layers per pass with
+`ENGINE_HESSIAN_DIR=<dir> test_ppl --model qwen4_exp|glm5_next --calibrate --file <text> --tokens N` (with `ENGINE_MAX_SEQ` above N; GLM a third of the layers per pass with
 `ENGINE_HESSIAN_LAYERS=lo-hi`) accumulates x^T x of every dense projection input and writes one file per site (the capture is described below).
 `tests/tools/nvfp4_ldlq.py --src <BF16 source> --hess <dir> --out <dir> --model flash|glm [--groups ...] [--layers ...] [--tp 4] [--rtn]` then runs block LDLQ
 (damping 2.5% of the mean diagonal, Cholesky, 16-row blocks from the last to the first with the propagated error, the NVFP4 tile quantizer in place of the trellis
@@ -147,7 +147,7 @@ Perplexity values are reported in their mean NLL forms.
 
 ### Flash-Next
 
-`test_ppl --flash --qbench <checkpoint>/qbench_prompts.md`: nine traced prompts of the converter's qbench set, 20,487 scored response tokens. Lower is better; the
+`test_ppl --model qwen4_exp --qbench <checkpoint>/qbench_prompts.md`: nine traced prompts of the converter's qbench set, 20,487 scored response tokens. Lower is better; the
 model card gives 1.3825 for BF16.
 
 | Configuration | Perplexity | Over BF16 |
@@ -167,7 +167,7 @@ The speed side of the same configurations is in [PERFORMANCE.md](PERFORMANCE.md)
 
 ### GLM-5.3-Flash
 
-`test_ppl --glm --chunk 8 --file <text> --tokens 12000` on held-out text, with the routed experts at EXL3 3.05 bpw, run with
+`test_ppl --model glm5_next --chunk 8 --file <text> --tokens 12000` on held-out text, with the routed experts at EXL3 3.05 bpw, run with
 `ENGINE_EXPERT_CACHE=0.9 ENGINE_VRAM_RESERVE_MIB=3500 ENGINE_MAX_IMAGE_TOKENS=0` to leave room for the dequantization workspace.
 
 | Dense groups | Perplexity |
@@ -182,7 +182,7 @@ The speed side of the same configurations is in [PERFORMANCE.md](PERFORMANCE.md)
 | all of `kda,mla,idx,head,dense,shared`, round to nearest | 1.812 |
 | all, calibrated (`nvfp4_ldlq.py --model glm`, `ENGINE_HESSIAN_LAYERS=lo-hi` in three passes) | 1.804 |
 
-Against the original FP8 checkpoint (`test_ppl --glm --tokens 8192 --chunk 512` on the default text, the docs/ folder as of commit c233440, prefill windows
+Against the original FP8 checkpoint (`test_ppl --model glm5_next --tokens 8192 --chunk 512` on the default text, the docs/ folder as of commit c233440, prefill windows
 of 8 chunks, `glm_logit_rows=4096`): the FP8 model 1.3846 NLL, the EXL3 3.05 bpw copy 1.3979, KL( FP8 || 3.05 ) 0.0414 per token over the FP8 model's top 128.
 
 The calibrated tensors are the ones the GLM configurations use (`configs/glm_256k.json`). GLM is sensitive to rounding-level noise whatever the format (a different
@@ -233,7 +233,7 @@ codebook), calibrated by Hessians the engine captures while it runs the model. T
 
 ### Hessian capture
 
-`ENGINE_HESSIAN_DIR=<dir> [ENGINE_HESSIAN_LAYERS=<lo-hi>] test_ppl [--flash | --glm] --calibrate --prompts <dump dir> [--select train] [--tokens N] [--chunk 512]`
+`ENGINE_HESSIAN_DIR=<dir> [ENGINE_HESSIAN_LAYERS=<lo-hi>] test_ppl [--model qwen4_exp | glm5_next] --calibrate --prompts <dump dir> [--select train] [--tokens N] [--chunk 512]`
 replays the last request of each session (the rows a session shares with an earlier one, its system prompt and tool schemas, run without adding, so every distinct
 token counts once; `--select train` leaves out every tenth session for scoring, `--stride K` counts every K-th chunk past the shared prefix), and `--file <text>
 --seq 2048` replays plain text. Files are `L<layer>_s<site>_r<rank>.f32` (x^T x and the row count), written at shutdown; `tests/tools/hess_check.py` checks a
@@ -396,10 +396,10 @@ KL( teacher || model ) over token sequences.
   attention at every length), the attention runs in blocks of 1024 query rows, `--ckpt-host` keeps the saved layer inputs in pinned host memory
   (copied out on a side stream while a layer runs and back a layer ahead of its backward; -1, the default: past 4 GiB of them) and `--keep` the
   sublayer outputs kept from the forward (-1: within 2 GiB, else recomputed in the backward).
-* **Data.** The teacher comes from the reference model on the text (`test_ppl --flash --file TEXT --seq S --tokens N --chunk 512 --topk-out FILE`: the
+* **Data.** The teacher comes from the reference model on the text (`test_ppl --model qwen4_exp --file TEXT --seq S --tokens N --chunk 512 --topk-out FILE`: the
   top K tokens of every position and the mass outside them); the model's own inputs (its token embeddings and the PLE layer's n-gram rows) are made
   from the teacher file's tokens as the engine makes them (`engine::train::qwen4_exp::Inputs`; with `--tp 1`), or read from `--inputs` files of
-  `test_ppl --flash --calibrate` with the debug option `train_inputs` set (`--check-inputs N` compares the two on the first N sequences); `--teacher`
+  `test_ppl --model qwen4_exp --calibrate` with the debug option `train_inputs` set (`--check-inputs N` compares the two on the first N sequences); `--teacher`
   (and `--inputs`) take comma-separated lists, read as one set of sequences in their order, `--shuffle 1` trains on them in a new order each pass.
 * **Output.** The values of the best held-out KL are written as a new checkpoint (the input's files, its shards with the tuned scales, norm weights
   and dense tensors in FP16, the precision the engine computes them in); `--write 0` writes nothing. `test_ppl --kl-teacher FILE` measures any
@@ -418,7 +418,7 @@ KL( teacher || model ) over token sequences.
   The routed experts' codes (about 26.5 GiB a device at 3.05 bits) stay in pinned host memory and each MoE layer's are copied to one of two device
   stages a layer ahead of its use; `--expert-gib G` keeps whole layers' codes on each device up to G GiB instead, spread over the layers so that the
   staged copies overlap with the resident layers' work. `--check-trace` takes the engine's `trace_layers` file of the first held-out sequence
-  (`test_ppl --glm --seq S --tokens S --chunk 512` with `prefill_window` 1: the last row of each chunk after every layer) and compares the training
+  (`test_ppl --model glm5_next --seq S --tokens S --chunk 512` with `prefill_window` 1: the last row of each chunk after every layer) and compares the training
   form's streams after every layer, chained from the embeddings, at those rows, with the share of the engine's routed experts (the trace's `.route`
   file) it picks too. `test_train_glm5_layer` and `test_train_glm5_tp` check the layers and the head against central differences and the tensor-parallel
   form against one device ([TESTS.md](TESTS.md)).

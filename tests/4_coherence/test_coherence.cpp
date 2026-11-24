@@ -1,6 +1,7 @@
 // Tier-4 coherence gate: greedy (T=0) determinism against golden token sequences on TP=4.
 //   default        : autoregressive decode per prompt (Mode A chunked prefill + M=1 decode)
 //   --speculative  : DFlash2 rounds; output must be token-identical to greedy decode
+//   --model M      : qwen3_5 or glm5_next (or a checkpoint directory of either) only; both test checkpoints without it
 //   Mode B check   : all prompts decoded concurrently in independent slots (when slots allow)
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"
@@ -200,23 +201,22 @@ int run_model( const char* type, const char* dir, const char* draft, const std::
 } // namespace impl
 
 int main( int argc, char** argv ) {
-	bool run_qwen = true;
-	bool run_glm = true;
+	// --model qwen3_5 | glm5_next | DIR: that model only (its family's goldens and test drafter); both test checkpoints without it
 	bool spec = false;
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	for ( int a = 1; a < argc; ++a ) {
-		if ( !std::strcmp( argv[a], "--qwen-only" ) ) run_glm = false;
-		else if ( !std::strcmp( argv[a], "--glm-only" ) ) run_qwen = false;
-		else if ( !std::strcmp( argv[a], "--speculative" ) ) spec = true;
+		if ( !std::strcmp( argv[a], "--speculative" ) ) spec = true;
 	}
+	const test::TestModel only = test::model_arg( argc, argv, "" );
+	ENGINE_ASSERT( !only || only.is( "qwen3_5" ) || only.is( "glm5_next" ), "test_coherence: --model qwen3_5 or glm5_next" );
 	std::printf( "=== Tier-4 coherence gate (%s) ===\n", spec ? "DFlash2 speculative" : "greedy autoregressive" );
 
 	int failures = 0;
-	if ( run_qwen ) {
-		failures += impl::run_model( "qwen3_5", test::QWEN_DIR, test::QWEN_DRAFT_DIR, impl::qwen_cases(), spec );
+	if ( !only || only.is( "qwen3_5" ) ) {
+		failures += impl::run_model( "qwen3_5", only ? only.dir.c_str() : test::QWEN_DIR, test::QWEN_DRAFT_DIR, impl::qwen_cases(), spec );
 	}
-	if ( run_glm ) {
-		failures += impl::run_model( "glm5_next", test::GLM_DIR, test::GLM_DRAFT_DIR, impl::glm_cases(), spec );
+	if ( !only || only.is( "glm5_next" ) ) {
+		failures += impl::run_model( "glm5_next", only ? only.dir.c_str() : test::GLM_DIR, test::GLM_DRAFT_DIR, impl::glm_cases(), spec );
 	}
 	ENGINE_ASSERT( failures == 0, "coherence gate failed" );
 	std::printf( "=== COHERENCE GATE COMPLETE: ALL PASS ===\n" );
