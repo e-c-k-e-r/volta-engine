@@ -1,6 +1,7 @@
 // Teacher-forced perplexity of a text file on a served model: the same tokens run through chunked prefill with every row's logits read back,
 // so two builds (or two kernel paths) can be compared on a quality metric instead of greedy tokens. Optionally writes the per-token NLL.
-//   test_ppl [--model <architecture | checkpoint dir>] [--file PATH] [--tokens N] [--chunk C] [--nll OUT.bin] [--topk-out OUT.bin [--topk K]]
+//   test_ppl [--model <architecture | checkpoint dir>] [--file PATH | --ids PATH] [--tokens N] [--chunk C] [--nll OUT.bin] [--topk-out OUT.bin [--topk K]]
+//     --ids: token ids, whitespace separated, instead of a text (another engine's tokens of a text, e.g. from a llama-perplexity logits file)
 //     --topk-out: the model's distribution at every position as a teacher (volta_e2e): int32 magic 0x4b504f54, tokens N, seq, K, the N token ids,
 //     then per position K ids (int32, most likely first), their probabilities (FP32) and the mass outside them (FP32)
 //   --kl-teacher FILE (a --topk-out file of the same text and settings): also KL( teacher || model ) per position, over the teacher's top K plus
@@ -71,13 +72,14 @@ int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	bool calibrate = false;
 	int n_tokens = 6000, chunk = 512;
-	std::string file, nll_out, qbench, prompts_dir, topk_out, kl_teacher;
+	std::string file, ids_file, nll_out, qbench, prompts_dir, topk_out, kl_teacher;
 	int seq = 0, max_sessions = 0, skip_override = 0, show_miss = 0, stride = 1, topk = 128, kl_from = 0;
 	std::string select;
 	std::vector<int> bin_edges;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--model" ) && i + 1 < argc ) ++i;
 		else if ( !std::strcmp( argv[i], "--file" ) && i + 1 < argc ) file = argv[++i];
+		else if ( !std::strcmp( argv[i], "--ids" ) && i + 1 < argc ) ids_file = argv[++i];
 		else if ( !std::strcmp( argv[i], "--tokens" ) && i + 1 < argc ) n_tokens = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--chunk" ) && i + 1 < argc ) chunk = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--qbench" ) && i + 1 < argc ) qbench = argv[++i];
@@ -438,8 +440,14 @@ int main( int argc, char** argv ) {
 			text += ss.str() + "\n\n";
 		}
 	}
-	// Encode in pieces of ~4 KB cut at line ends (the tokenizer is quadratic in the length of a run of text without a split point)
+	// Encode in pieces of ~4 KB cut at line ends (the tokenizer is quadratic in the length of a run of text without a split point); --ids: the
+	// token ids as given (another engine's tokens, so a comparison of the two sees the same rows)
 	std::vector<int> ids;
+	if ( !ids_file.empty() ) {
+		std::ifstream f( ids_file );
+		for ( int t; f >> t; ) ids.push_back( t );
+		text.clear();
+	}
 	for ( size_t at = 0; at < text.size(); ) {
 		size_t end = std::min( text.size(), at + 4096 );
 		if ( end < text.size() ) {
@@ -450,7 +458,7 @@ int main( int argc, char** argv ) {
 		ids.insert( ids.end(), part.begin(), part.end() );
 		at = end;
 	}
-	ENGINE_ASSERT( static_cast<int>( ids.size() ) > n_tokens, "text too short for --tokens" );
+	ENGINE_ASSERT( static_cast<int>( ids.size() ) >= n_tokens, "text too short for --tokens" );
 	ids.resize( n_tokens );
 
 	ModelCluster mc;
