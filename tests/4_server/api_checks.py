@@ -38,7 +38,6 @@ TOOLS = [{"type": "function", "function": {"name": "get_weather", "description":
 # models, health
 code, body = urllib.request.urlopen(BASE + "/v1/models").status, json.loads(urllib.request.urlopen(BASE + "/v1/models").read())
 check(code == 200 and body["data"][0]["object"] == "model", "GET /v1/models")
-IS_GLM = "GLM" in body["data"][0]["id"]
 CTX = body["data"][0]["context_length"]
 
 # plain completion, thinking off by default
@@ -51,8 +50,9 @@ check("reasoning_content" not in j["choices"][0]["message"] and j["usage"]["comp
 code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "What is 2+2?"}], "max_tokens": 400, "reasoning_effort": "low"})
 j = json.loads(body)
 m = j["choices"][0]["message"]
-# GLM may skip its reasoning when the effort is low: only the answer is required there
-check(code == 200 and (m.get("reasoning_content") or IS_GLM) and "4" in (m["content"] or ""), "reasoning_content separated from content", body)
+# a model may skip its reasoning when the effort is low (GLM): whatever it reasons stays out of the content
+check(code == 200 and "4" in (m["content"] or "") and "think>" not in (m["content"] or "") and "think>" not in (m.get("reasoning_content") or ""),
+      "reasoning_content separated from content", body)
 
 # length finish
 code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "Count to 100."}], "max_tokens": 5})
@@ -195,6 +195,10 @@ if "prefix_cache" in metrics:
     code, body = post("/v1/messages", {"model": "claude-x", "max_tokens": 4, "system": "You answer from these facts, briefly. " + facts, "messages": [{"role": "user", "content": "What is the code for district 7? Number only."}]})
     u = json.loads(body)["usage"]
     check(code == 200 and u["cache_read_input_tokens"] > 3000 and u["input_tokens"] < 500, "Anthropic usage reports cache_read_input_tokens", u)
+    # streamed, message_start already carries the split (the request is admitted before its first event)
+    code, resp = post("/v1/messages", {"model": "claude-x", "max_tokens": 4, "stream": True, "system": "You answer from these facts, briefly. " + facts, "messages": [{"role": "user", "content": "What is the code for district 7? Number only."}]}, stream=True)
+    us = [e["message"]["usage"] for e in sse(resp) if isinstance(e, dict) and e.get("type") == "message_start"]
+    check(code == 200 and us and us[0].get("cache_read_input_tokens", 0) > 3000 and us[0]["input_tokens"] < 500, "Anthropic message_start reports cache_read_input_tokens", us)
 
 # ---- images (both models run their checkpoint's vision tower)
 IMG = base64.b64encode(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "image_shapes.png"), "rb").read()).decode()

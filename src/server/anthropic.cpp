@@ -3,6 +3,7 @@
 
 #define JSON_NOEXCEPTION 1
 #include "engine/server/json_safe.h"
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 
@@ -208,6 +209,10 @@ public:
 	}
 
 	void on_prompt( int n ) override { prompt_tokens_ = n; }
+	void on_admit( int cached ) override {
+		cached_tokens_ = cached;
+		if ( stream_ ) ensure_started();   // message_start with the prompt split (a write error shows in the next on_wait)
+	}
 
 	bool on_event( const OutputEvent& ev ) override {
 		const Kind kind = ev.type == OutputEvent::Type::Reasoning ? Kind::Thinking : ev.type == OutputEvent::Type::Content ? Kind::Text : Kind::Tool;
@@ -241,8 +246,18 @@ public:
 
 	bool on_wait() override {
 		if ( !stream_ ) return true;
-		if ( !ensure_started() ) return false;   // message_start goes out at once, so the client sees the response begin
 		const auto now = std::chrono::steady_clock::now();
+		if ( !started_ ) {
+			// the response headers go out at once; message_start waits for the slot (on_admit) so its usage splits the prompt like
+			// message_delta's, unless the request is still queued after kQueuedStart
+			if ( !sse_started_ ) {
+				sse_started_ = true;
+				queued_since_ = now;
+				if ( !start_sse( conn_ ) ) return false;
+			}
+			if ( now - queued_since_ < kQueuedStart ) return true;
+			if ( !ensure_started() ) return false;
+		}
 		if ( now - last_ping_ < std::chrono::seconds( 10 ) ) return true;
 		last_ping_ = now;
 		return event( "ping", { { "type", "ping" } } );
@@ -286,10 +301,16 @@ private:
 	bool ensure_started() {
 		if ( started_ ) return true;
 		started_ = true;
-		if ( !start_sse( conn_ ) ) return false;
+		if ( !sse_started_ ) {
+			sse_started_ = true;
+			if ( !start_sse( conn_ ) ) return false;
+		}
+		// The prompt split like message_delta's usage once the slot told how much came from the prefix cache; a stream started while the
+		// request was still queued carries the whole prompt as input_tokens
+		json usage = { { "input_tokens", prompt_tokens_ - std::max( 0, cached_tokens_ ) }, { "output_tokens", 1 } };
+		if ( cached_tokens_ >= 0 ) usage["cache_read_input_tokens"] = cached_tokens_;
 		return event( "message_start", { { "type", "message_start" }, { "message", { { "id", message_id_ }, { "type", "message" }, { "role", "assistant" }, { "model", model_ },
-			{ "content", json::array() }, { "stop_reason", nullptr }, { "stop_sequence", nullptr },
-			{ "usage", { { "input_tokens", prompt_tokens_ }, { "output_tokens", 1 } } } } } } );
+			{ "content", json::array() }, { "stop_reason", nullptr }, { "stop_sequence", nullptr }, { "usage", usage } } } } );
 	}
 
 	bool open_block( const json& block ) {
@@ -319,7 +340,10 @@ private:
 	std::string model_, message_id_;
 	uint64_t id_;
 	int prompt_tokens_ = 0;
-	bool started_ = false, block_open_ = false;
+	int cached_tokens_ = -1;   // -1 until the request takes its slot
+	static constexpr std::chrono::seconds kQueuedStart{ 30 };
+	bool sse_started_ = false, started_ = false, block_open_ = false;   // response headers sent; message_start sent
+	std::chrono::steady_clock::time_point queued_since_;
 	int block_index_ = 0;
 	int tool_index_ = 0;
 	Kind cur_ = Kind::None;
@@ -395,6 +419,10 @@ public:
 			if ( t == "enabled" || t == "adaptive" ) r.enable_thinking = 1;
 			else if ( t == "disabled" ) r.enable_thinking = 0;
 		}
+		// The effort the client asks for (Claude Code sends output_config.effort, high by default), mapped onto the model's own levels like the
+		// OpenAI endpoint's reasoning_effort; without one the chat template's default applies
+		if ( j.contains( "output_config" ) && j["output_config"].is_object() && j["output_config"].contains( "effort" ) && j["output_config"]["effort"].is_string() )
+			r.reasoning_effort = j["output_config"]["effort"].get<std::string>();
 		// runtime steering (server option steer): a control-vector file by name, its strength and scope, and the reflection-marker logit penalty
 		if ( j.contains( "steer_vector" ) && j["steer_vector"].is_string() ) r.steer_vector = j["steer_vector"].get<std::string>();
 		if ( j.contains( "steer_scale" ) && j["steer_scale"].is_number() ) r.steer_scale = j["steer_scale"].get<float>();

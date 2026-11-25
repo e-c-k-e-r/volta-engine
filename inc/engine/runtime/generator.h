@@ -124,6 +124,8 @@ struct GenerationRequest {
 	// returning false cancels it. The server checks the connection here and keeps a stream alive.
 	std::function<bool()> on_wait;
 	std::chrono::steady_clock::time_point last_wait;
+	// Called once, from the scheduler thread, when the request takes its slot: the prompt tokens the prefix cache already holds
+	std::function<void( int cached_tokens )> on_admit;
 	// Called once, from the scheduler thread, when the request leaves its slot.
 	std::function<void( FinishReason reason, const std::string& matched_stop, const SlotMetrics& metrics )> on_finish;
 };

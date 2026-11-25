@@ -1531,6 +1531,65 @@ private:
 			}
 			return out;
 		}
+		if ( f == "sort" ) {
+			// Jinja2's sort: stable, ascending unless reverse=true, strings compared case-insensitively unless case_sensitive=true,
+			// numbers as numbers, by attribute=name when given
+			bool reverse = !args.empty() && args[0].truthy(), case_sensitive = false;
+			std::string attribute;
+			for ( const auto& kv : n.kw ) {
+				if ( kv.first == "reverse" ) reverse = eval( *kv.second ).truthy();
+				if ( kv.first == "case_sensitive" ) case_sensitive = eval( *kv.second ).truthy();
+				if ( kv.first == "attribute" ) attribute = to_str( eval( *kv.second ) );
+			}
+			if ( v.kind != Value::Kind::List ) return v;
+			std::vector<Value> items( v.list->begin(), v.list->end() );
+			auto key_of = [&]( const Value& x ) -> const Value& {
+				const Value* a = !attribute.empty() && x.kind == Value::Kind::Map ? x.find( attribute ) : nullptr;
+				return a ? *a : x;
+			};
+			auto numeric = []( const Value& x ) { return x.kind == Value::Kind::Int || x.kind == Value::Kind::Float || x.kind == Value::Kind::Bool; };
+			auto less = [&]( const Value& xa, const Value& xb ) {
+				const Value &a = key_of( xa ), &b = key_of( xb );
+				if ( numeric( a ) && numeric( b ) ) {
+					const double da = a.kind == Value::Kind::Float ? a.f : static_cast<double>( as_int( a ) );
+					const double db = b.kind == Value::Kind::Float ? b.f : static_cast<double>( as_int( b ) );
+					return da < db;
+				}
+				std::string sa = to_str( a ), sb = to_str( b );
+				if ( !case_sensitive ) {
+					for ( char& c : sa ) c = static_cast<char>( std::tolower( static_cast<unsigned char>( c ) ) );
+					for ( char& c : sb ) c = static_cast<char>( std::tolower( static_cast<unsigned char>( c ) ) );
+				}
+				return sa < sb;
+			};
+			std::stable_sort( items.begin(), items.end(), [&]( const Value& a, const Value& b ) { return reverse ? less( b, a ) : less( a, b ); } );
+			Value out = Value::make_list();
+			for ( const Value& x : items ) out.push( x );
+			return out;
+		}
+		if ( f == "unique" ) {
+			// the items in order, each kept at its first occurrence (Jinja2's unique: strings compared case-insensitively unless
+			// case_sensitive=true, by attribute=name when given)
+			bool case_sensitive = false;
+			std::string attribute;
+			for ( const auto& kv : n.kw ) {
+				if ( kv.first == "case_sensitive" ) case_sensitive = eval( *kv.second ).truthy();
+				if ( kv.first == "attribute" ) attribute = to_str( eval( *kv.second ) );
+			}
+			Value out = Value::make_list();
+			if ( v.kind != Value::Kind::List ) return out;
+			std::vector<std::string> seen;
+			for ( const Value& x : *v.list ) {
+				const Value* a = !attribute.empty() && x.kind == Value::Kind::Map ? x.find( attribute ) : nullptr;
+				const Value& key = a ? *a : x;
+				std::string k = key.kind == Value::Kind::Str ? "s:" + key.s : "j:" + to_json( key );
+				if ( !case_sensitive && key.kind == Value::Kind::Str ) for ( char& c : k ) c = static_cast<char>( std::tolower( static_cast<unsigned char>( c ) ) );
+				if ( std::find( seen.begin(), seen.end(), k ) != seen.end() ) continue;
+				seen.push_back( k );
+				out.push( x );
+			}
+			return out;
+		}
 		if ( f == "map" ) {
 			// map( 'filter' ) with a one-argument string filter, or map( attribute = 'name' )
 			std::string attribute;

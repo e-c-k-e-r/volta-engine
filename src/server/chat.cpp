@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <map>
+#include <mutex>
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -47,11 +48,13 @@ std::string effort_for( engine::loader::ModelFamily fam, const std::string& e ) 
 	return "xhigh";
 }
 
-// Chat templates accept a system message only at the start, but clients (Claude Code) also send system content later in
-// the conversation. Leading system messages are folded into one system message; a later one becomes a user message in
-// place, so the history stays append-only: the prompt of turn k+1 starts with the prompt of turn k, which is what the
-// prefix cache matches on. (Folding them all into the front would rewrite the system prompt every turn.)
-void fold_system_messages( nlohmann::ordered_json& messages ) {
+// Many chat templates accept a system message only at the start, but clients (Claude Code) also send system content later in
+// the conversation (its environment block and updates). Leading system messages are folded into one system message; a later
+// one stays a system message where the template renders one there, else it becomes a user message in place (later_as_user),
+// so the history stays append-only: the prompt of turn k+1 starts with the prompt of turn k, which is what the prefix cache
+// matches on. (Folding them all into the front would rewrite the system prompt every turn.) As a user turn it would also move
+// the template's last user message, before which some templates drop the reasoning of earlier replies
+void fold_system_messages( nlohmann::ordered_json& messages, bool later_as_user ) {
 	auto text_of = []( const nlohmann::ordered_json& m ) {
 		std::string text;
 		const auto& c = m["content"];
@@ -71,7 +74,7 @@ void fold_system_messages( nlohmann::ordered_json& messages ) {
 		}
 		leading = false;
 		if ( is_system ) {
-			out.push_back( { { "role", "user" }, { "content", text_of( m ) } } );
+			out.push_back( { { "role", later_as_user ? "user" : "system" }, { "content", text_of( m ) } } );
 			continue;
 		}
 		out.push_back( m );
@@ -80,6 +83,18 @@ void fold_system_messages( nlohmann::ordered_json& messages ) {
 	if ( !system.empty() ) result.push_back( { { "role", "system" }, { "content", system } } );
 	for ( auto& m : out ) result.push_back( m );
 	messages = std::move( result );
+}
+
+// Whether the template renders a system message once the conversation has started: a probe conversation, rendered once per
+// template, with a marker in a later system message (a template may reject one, or drop it)
+bool takes_later_system( const engine::loader::ChatTemplate& t ) {
+	static std::mutex mu;
+	static std::map<const engine::loader::ChatTemplate*, bool> known;
+	std::lock_guard<std::mutex> lk( mu );
+	if ( const auto it = known.find( &t ); it != known.end() ) return it->second;
+	const std::string marker = "later-system-probe-5e1f";
+	const std::string out = t.render( { { "system", "s" }, { "user", "u" }, { "assistant", "a" }, { "system", marker }, { "user", "v" } } );
+	return known[&t] = out.find( marker ) != std::string::npos;
 }
 
 } // namespace
@@ -276,7 +291,7 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 		err->message = "messages could not be normalized";
 		return false;
 	}
-	if ( vars["messages"].is_array() ) fold_system_messages( vars["messages"] );
+	if ( vars["messages"].is_array() ) fold_system_messages( vars["messages"], !takes_later_system( gen.chat_template() ) );
 	// Without a vision tower an image part becomes a note in the text, so an agent that reads an image file carries on instead of failing
 	const bool see = !req.images.empty() && gen.vision_params() && gen.tokenizer().get_special_token( image_pad_name( family ) ) >= 0;
 	if ( !req.images.empty() && !see && vars["messages"].is_array() ) omit_images( vars["messages"] );
@@ -506,6 +521,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		return true;
 	};
 	g.on_wait = [state]() { return !state->conn->closed() && state->responder->on_wait(); };
+	g.on_admit = [state]( int cached ) { state->responder->on_admit( cached ); };
 	if ( req.logprobs >= 0 ) {
 		const engine::loader::Tokenizer* tk = &gen.tokenizer();
 		g.on_logprobs = [state, tk]( const std::vector<engine::runtime::TokenLogprob>& entries ) {

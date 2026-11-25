@@ -600,6 +600,7 @@ bool Generator::prefill_slot( int s, int budget ) {
 		slot.pf_resumed = pos;
 		LOG_INFO( "[req %llu] slot %d: %d prompt tokens, %d from the prefix cache, waited %.1f s for the slot\n", static_cast<unsigned long long>( slot.req.req_id ), s, n, pos,
 			slot.metrics.queue_ms / 1000.0 );
+		if ( slot.req.on_admit ) slot.req.on_admit( pos );
 		if ( pos == 0 ) cluster_.reset_slot( s );
 		if ( !slot.req.images.empty() ) {
 			MmLayout layout;

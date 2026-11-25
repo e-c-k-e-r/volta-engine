@@ -51,7 +51,11 @@ The launch file (`--config`), `--set key=value`, `ENGINE_*` environment variable
 
 * `chat.cpp`: the protocol-independent request. It renders the prompt through the model's Jinja chat template (DeepSeek-V4.1: the built-in port of the checkpoint's `encoding/encoding.py`, `src/loader/deepseek_encoding.cpp`), applies server defaults (sampling, max tokens), and starts the generation.
   * message content is tokenized as plain text: the template's role markers are real special tokens, but the same strings inside message content are escaped first (`escape_control_text`), so quoted source cannot end or open a turn
-  * an API reasoning effort is mapped onto what the model's template accepts (DeepSeek-V4.1: low 50, medium 60, high 75, max 100)
+  * an API reasoning effort (OpenAI `reasoning_effort`, Anthropic `output_config.effort`, which Claude Code sends as `high`) is mapped onto
+    what the model's template accepts (GLM: low, high, or the template's max for xhigh / max; DeepSeek-V4.1: low 50, medium 60, high 75,
+    max 100); a request without one gets the template's default
+  * system messages after the first turn (Claude Code's environment updates) stay system turns when the template renders one there (a probe
+    render per template); otherwise they become user turns, and leading system messages fold into the template's system prompt
   * for Gemma 4 the tool results of consecutive tool messages go into one message's `tool_responses`, named after the calls they answer, as its template expects
   * without a loaded vision tower an image part becomes the text note `[image omitted: this model cannot view images]`, so a request with images still runs
 * `openai.cpp`, `anthropic.cpp`: the two protocol front ends. Each parses its payload into a chat request, and writes one response (streamed or not) from parsed pieces as they arrive.
@@ -59,6 +63,8 @@ The launch file (`--config`), `--set key=value`, `ENGINE_*` environment variable
   * images arrive as base64 `data:` URLs (OpenAI `image_url`) or `image` blocks (Anthropic), also inside `tool_result` blocks. Remote URLs are not fetched.
   * `tool_choice` `required` / a named function tells the model to call a tool (best effort, no constrained decoding)
 * usage reports the prefix cache hits: OpenAI `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens` (with `input_tokens` excluding them)
+  * a streamed Anthropic response sends its headers at once and `message_start` when the request takes its slot, so that usage already
+    splits the prompt; a request still queued after 30 s gets `message_start` with the whole prompt as `input_tokens`, then pings
 
 ## `output_parser.cpp`
 

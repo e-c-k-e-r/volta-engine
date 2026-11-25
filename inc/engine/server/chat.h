@@ -92,6 +92,8 @@ public:
 	virtual ~Responder() = default;
 	// Parsed pieces in order. Returning false cancels the generation.
 	virtual void on_prompt( int prompt_tokens ) { (void) prompt_tokens; }
+	// When the request takes its slot: the prompt tokens read from the prefix cache (before the first on_event; on_wait may come earlier)
+	virtual void on_admit( int cached_tokens ) { (void) cached_tokens; }
 	virtual bool on_event( const OutputEvent& ev ) = 0;
 	// With ChatRequest::logprobs: the entries of the tokens whose text the next on_event calls carry
 	virtual void on_logprobs( const std::vector<LogprobOut>& entries ) { (void) entries; }

@@ -59,6 +59,20 @@ CONVS = {
     "args_types": ([U("search"),
         A("ok", tool_calls=[TC("search", {"query": "a \"b\"\nc", "limit": 3, "opts": {"x": [1, 2.5, None, True]}}, "c1")]),
         T("none", tool_call_id="c1")], TOOLS),
+    # results out of call order (templates that pair them back by id sort them), duplicate ids (no reordering)
+    "parallel_reordered": ([U("Weather in Paris and Rome?"),
+        A("", reasoning_content="two calls", tool_calls=[TC("get_weather", {"city": "Paris"}, "c2"), TC("get_weather", {"city": "Rome"}, "c1")]),
+        T("24 C", tool_call_id="c1"), T("18 C", tool_call_id="c2")], TOOLS),
+    "parallel_dup_ids": ([U("Weather in Paris and Rome?"),
+        A("", tool_calls=[TC("get_weather", {"city": "Paris"}, "c1"), TC("get_weather", {"city": "Rome"}, "c1")]),
+        T("18 C", tool_call_id="c1"), T("24 C", tool_call_id="c1")], TOOLS),
+    # an agent loop's shape: reasoning in earlier turns, a system message after the first turns (an environment update)
+    "agent_later_system": ([S("Be an agent."), U("Weather in Paris?"),
+        A("Checking.", reasoning_content="need the tool", tool_calls=[TC("get_weather", {"city": "Paris"}, "call_1")]),
+        T("18 C, cloudy", tool_call_id="call_1"),
+        S("# Environment update\n - cwd changed"),
+        A("It is 18 C.", reasoning_content="answer it"),
+        U("And Rome?")], TOOLS),
 }
 
 OPTS = [
@@ -72,7 +86,7 @@ OPTS = [
 ]
 
 out = {"templates": {}}
-for name in ("qwen3_5", "glm5_next", "gemma4"):
+for name in ("qwen3_5", "glm5_next", "glm5_next_upstream", "gemma4"):
     path = os.path.join(data, name + "_chat_template.jinja")
     tpl = env.from_string(open(path, encoding="utf-8").read())
     cases = []
