@@ -122,8 +122,9 @@ tier2_models() {
 	run prefix_restore_spec gpu ./test_prefix_restore --spec
 	run mtp_greedy gpu ./test_mtp
 	run mtp_greedy_flash gpu ./test_mtp --model qwen4_exp
-	# the GLM decode options (side_streams, hc_fuse) must not change the output of test_glm_rows in the NVFP4 dense configuration
-	run glm_option_identity $ROOT/tests/tools/glm_option_identity.sh
+	# the GLM decode options (side_streams, hc_fuse) must not change the output of test_glm_rows in the NVFP4 dense configuration; out of the
+	# gate: that configuration needs the modelopt NVFP4 GLM checkpoint, which is not kept (the Volta-layout EXL3 serves at comparable speed)
+	# run glm_option_identity $ROOT/tests/tools/glm_option_identity.sh
 	run vision_tower gpu ./test_vision
 	run vision_tower_glm gpu ./test_vision --model glm5_next $ROOT/tests/data/image_wide.png
 	run prefix_restore_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore"
