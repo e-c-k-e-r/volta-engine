@@ -107,13 +107,15 @@ tier2_models() {
 	run tokenizer_cases_glm ./test_tokenizer_file $(model_dir ENGINE_TEST_GLM_DIR) --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
 	run tokenizer_cases_flash ./test_tokenizer_file $(model_dir ENGINE_TEST_FLASH_DIR) --cases $ROOT/tests/data/tokenizer_cases_qwen4_exp.json
 	run tokenizer_cases_deepseek ./test_tokenizer_file $DSV41 --cases $ROOT/tests/data/tokenizer_cases_deepseek_v41.json
-	run tokenizer_cases_gemma ./test_tokenizer_file $(model_dir ENGINE_TEST_GEMMA_DIR) --cases $ROOT/tests/data/tokenizer_cases_gemma4.json
+	# out of the gate until a Gemma 4 checkpoint is kept again
+	# run tokenizer_cases_gemma ./test_tokenizer_file $(model_dir ENGINE_TEST_GEMMA_DIR) --cases $ROOT/tests/data/tokenizer_cases_gemma4.json
 	run dsv41_encoding ./test_dsv41_encoding $DSV41
+	# DeepSeek-V4.1 weights: out of the gate until a quantized checkpoint is kept again (the role names the original, for its tokenizer and encoding/)
 	# the vision tower against the checkpoint reference (FP32): the goldens come from the reference's torch code (needs the exllamav3 venv), made once
-	local vg=$ROOT/results/dsv41_vision_golden
-	[[ -f $vg/emb32.f32 ]] || run dsv41_vision_golden ${DSV41_PYTHON:-$HOME/Programs/exllamav3/.venv/bin/python} $ROOT/tests/tools/dsv41/vision_golden.py $DSV41 $vg
-	run dsv41_vision gpu ./test_dsv41_vision $DSV41 $vg
-	run prefix_restore_dsv41 gpu ./test_dsv41 $DSV41 $ROOT/tests/data/dsv41_prompt_ids.txt 24 snap=1000 max_image_tokens=0
+	# local vg=$ROOT/results/dsv41_vision_golden
+	# [[ -f $vg/emb32.f32 ]] || run dsv41_vision_golden ${DSV41_PYTHON:-$HOME/Programs/exllamav3/.venv/bin/python} $ROOT/tests/tools/dsv41/vision_golden.py $DSV41 $vg
+	# run dsv41_vision gpu ./test_dsv41_vision $DSV41 $vg
+	# run prefix_restore_dsv41 gpu ./test_dsv41 $DSV41 $ROOT/tests/data/dsv41_prompt_ids.txt 24 snap=1000 max_image_tokens=0
 	# one model per process, as the engine runs (a second cluster in one process is not a supported configuration)
 	run coherence gpu ./test_coherence --model qwen3_5
 	run coherence_glm gpu ./test_coherence --model glm5_next
