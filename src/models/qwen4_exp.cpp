@@ -2069,4 +2069,22 @@ bool Qwen4ExpPipeline::load_seq_state( int slot_id, int from, int tokens, bool w
 	return true;
 }
 
+bool Qwen4ExpPipeline::seq_rows_span( int from, int tokens, bool with_taps, size_t* offset, size_t* bytes ) const {
+	const size_t all = seq_state_bytes( from, tokens, with_taps );
+	if ( all == 0 ) return false;
+	const size_t ring = static_cast<size_t>( engine::modules::PLE::RING ) * config_.hc_mult * config_.hidden_size * sizeof( backend::half_t );
+	*offset = ( state_.slot_gdn_floats + state_.slot_conv_floats ) * sizeof( float ) + ring + kCtxBytes + ( with_taps ? tap_snapshot_bytes( tokens ) : 0 );
+	*bytes = all - *offset;
+	return true;
+}
+
+bool Qwen4ExpPipeline::load_seq_rows( int slot_id, int from, int tokens, const void* rows, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens, false ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+	backend::set_device( rank_ );
+	char* kv_src = const_cast<char*>( static_cast<const char*>( rows ) );
+	kv_src += copy_kv_rows( slot_id, from, tokens, kv_src, false, stream );
+	copy_pool_rows( slot_id, from, tokens, kv_src, false, stream );
+	return true;
+}
+
 } // namespace engine::models

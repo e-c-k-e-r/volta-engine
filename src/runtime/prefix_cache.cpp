@@ -13,7 +13,8 @@ namespace engine::runtime {
 namespace {
 
 constexpr char kDiskMagic[4] = { 'V', 'P', 'C', 'S' };
-constexpr int32_t kDiskVersion = 1;
+constexpr int32_t kDiskVersion = 2;   // 2: the flags word also marks a stripped node (version 1 files read as unstripped)
+constexpr int32_t kFlagTaps = 1, kFlagRowsOnly = 2;
 
 uint64_t fnv1a( const void* data, size_t n, uint64_t h = 1469598103934665603ULL ) {
 	const unsigned char* p = static_cast<const unsigned char*>( data );
@@ -21,9 +22,10 @@ uint64_t fnv1a( const void* data, size_t n, uint64_t h = 1469598103934665603ULL 
 	return h;
 }
 
-// File: char[4] "VPCS", int32 version, from, tokens, with_taps, ranks, int64 bytes per rank, int32 tokens[tokens], then every rank's bytes
+// File: char[4] "VPCS", int32 version, from, tokens, flags (kFlagTaps, kFlagRowsOnly), ranks, int64 bytes per rank, int32 tokens[tokens],
+// then every rank's bytes
 struct DiskHeader {
-	int32_t version, from, tokens, with_taps, ranks;
+	int32_t version, from, tokens, flags, ranks;
 	int64_t bytes;
 };
 
@@ -32,8 +34,9 @@ bool read_header( std::FILE* f, DiskHeader* h, std::vector<int>* tokens ) {
 	if ( std::fread( magic, 1, 4, f ) != 4 || std::memcmp( magic, kDiskMagic, 4 ) != 0 ) return false;
 	int32_t v[5];
 	if ( std::fread( v, sizeof( int32_t ), 5, f ) != 5 || std::fread( &h->bytes, sizeof( int64_t ), 1, f ) != 1 ) return false;
-	h->version = v[0]; h->from = v[1]; h->tokens = v[2]; h->with_taps = v[3]; h->ranks = v[4];
-	if ( h->version != kDiskVersion || h->tokens <= 0 || h->from < 0 || h->from >= h->tokens || h->bytes <= 0 ) return false;
+	h->version = v[0]; h->from = v[1]; h->tokens = v[2]; h->flags = v[3]; h->ranks = v[4];
+	if ( h->version < 1 || h->version > kDiskVersion || h->tokens <= 0 || h->from < 0 || h->from >= h->tokens || h->bytes <= 0 ) return false;
+	if ( h->version == 1 ) h->flags &= kFlagTaps;
 	tokens->resize( static_cast<size_t>( h->tokens ) );
 	return std::fread( tokens->data(), sizeof( int ), tokens->size(), f ) == tokens->size();
 }
@@ -84,7 +87,8 @@ bool PrefixCache::enable_disk( const std::string& dir, const std::string& finger
 		std::fclose( f );
 		if ( !ok ) continue;
 		d.from = h.from;
-		d.with_taps = h.with_taps != 0;
+		d.with_taps = ( h.flags & kFlagTaps ) != 0;
+		d.rows_only = ( h.flags & kFlagRowsOnly ) != 0;
 		d.bytes = static_cast<size_t>( h.bytes );
 		d.path = p;
 		d.last_used = static_cast<uint64_t>( std::filesystem::last_write_time( de.path(), ec ).time_since_epoch().count() );
@@ -163,6 +167,7 @@ void PrefixCache::spill( Entry* e, bool own_buffers ) {
 		d.tokens = e->tokens;
 		d.from = e->snap.from;
 		d.with_taps = e->snap.with_taps;
+		d.rows_only = e->snap.rows_only;
 		d.bytes = e->snap.bytes;
 		d.path = job.path;
 		d.last_used = static_cast<uint64_t>( std::filesystem::file_time_type::clock::now().time_since_epoch().count() );
@@ -178,7 +183,7 @@ bool PrefixCache::write_file( const WriteJob& job ) {
 	const std::string tmp = job.path + ".tmp";
 	std::FILE* f = std::fopen( tmp.c_str(), "wb" );
 	if ( !f ) return false;
-	const int32_t v[5] = { kDiskVersion, job.snap.from, job.snap.tokens, job.snap.with_taps ? 1 : 0, cluster_.tp() };
+	const int32_t v[5] = { kDiskVersion, job.snap.from, job.snap.tokens, ( job.snap.with_taps ? kFlagTaps : 0 ) | ( job.snap.rows_only ? kFlagRowsOnly : 0 ), cluster_.tp() };
 	const int64_t bytes = static_cast<int64_t>( job.snap.bytes );
 	bool ok = std::fwrite( kDiskMagic, 1, 4, f ) == 4 && std::fwrite( v, sizeof( int32_t ), 5, f ) == 5 && std::fwrite( &bytes, sizeof( int64_t ), 1, f ) == 1 &&
 		std::fwrite( job.tokens.data(), sizeof( int ), job.tokens.size(), f ) == job.tokens.size();
@@ -228,6 +233,7 @@ PrefixCache::Entry* PrefixCache::load_disk( size_t index, Entry* parent ) {
 	}
 	ModelCluster::SeqSnapshot snap;
 	if ( !cluster_.alloc_snapshot( d.from, static_cast<int>( d.tokens.size() ), d.with_taps, d.bytes, &snap ) ) return nullptr;
+	snap.rows_only = d.rows_only;
 	std::FILE* f = std::fopen( d.path.c_str(), "rb" );
 	if ( !f ) {
 		// another server sharing the disk budget evicted it
@@ -255,6 +261,12 @@ PrefixCache::Entry* PrefixCache::load_disk( size_t index, Entry* parent ) {
 		std::lock_guard<std::mutex> lock( disk_mtx_ );
 		for ( DiskEntry& x : disk_ ) if ( x.path == d.path ) x.last_used = static_cast<uint64_t>( std::filesystem::file_time_type::clock::now().time_since_epoch().count() );
 	}
+	// RAM may still hold the node stripped (the file kept its state): the read gives it the state back instead of a second node
+	if ( Entry* same = exact( d.tokens ) ) {
+		if ( !snap.rows_only && same->snap.rows_only ) return refill( same, snap ) ? same : nullptr;
+		cluster_.free_snapshot( &snap );
+		return same;
+	}
 	Entry* e = insert( parent, d.tokens, snap, false );
 	if ( e ) e->on_disk = true;
 	return e;
@@ -270,7 +282,7 @@ PrefixCache::Entry* PrefixCache::promote( const std::vector<int>& prompt, Entry*
 		for ( size_t k = 0; k < disk_.size(); ++k ) {
 			const DiskEntry& d = disk_[k];
 			const size_t n = d.tokens.size();
-			if ( !d.ready || n >= prompt.size() || n <= ram_len || ( best < disk_.size() && n <= disk_[best].tokens.size() ) ) continue;
+			if ( !d.ready || d.rows_only || n >= prompt.size() || n <= ram_len || ( best < disk_.size() && n <= disk_[best].tokens.size() ) ) continue;
 			if ( std::equal( d.tokens.begin(), d.tokens.end(), prompt.begin() ) ) best = k;
 		}
 		if ( best == disk_.size() ) return ram_best;
@@ -311,7 +323,7 @@ PrefixCache::Entry* PrefixCache::find( const std::vector<int>& prompt ) {
 	Entry* best = nullptr;
 	for ( auto& e : entries_ ) {
 		const size_t n = e->tokens.size();
-		if ( n >= prompt.size() || ( best && n <= best->tokens.size() ) ) continue;
+		if ( e->snap.rows_only || n >= prompt.size() || ( best && n <= best->tokens.size() ) ) continue;
 		if ( std::equal( e->tokens.begin(), e->tokens.end(), prompt.begin() ) ) best = e.get();
 	}
 	if ( disk_on() ) best = promote( prompt, best );
@@ -319,6 +331,16 @@ PrefixCache::Entry* PrefixCache::find( const std::vector<int>& prompt ) {
 		touch_chain( best );
 		stats_.hits++;
 		stats_.hit_tokens += best->tokens.size();
+	}
+	return best;
+}
+
+PrefixCache::Entry* PrefixCache::deepest( const std::vector<int>& tokens ) {
+	Entry* best = nullptr;
+	for ( auto& e : entries_ ) {
+		const size_t n = e->tokens.size();
+		if ( n >= tokens.size() || ( best && n <= best->tokens.size() ) ) continue;
+		if ( std::equal( e->tokens.begin(), e->tokens.end(), tokens.begin() ) ) best = e.get();
 	}
 	return best;
 }
@@ -331,6 +353,7 @@ PrefixCache::Entry* PrefixCache::exact( const std::vector<int>& tokens ) {
 }
 
 bool PrefixCache::restore( int slot, Entry* entry ) {
+	if ( entry->snap.rows_only ) return false;   // no state to resume from
 	std::vector<Entry*> chain;
 	for ( Entry* e = entry; e; e = e->parent ) chain.push_back( e );
 	std::reverse( chain.begin(), chain.end() );
@@ -350,21 +373,64 @@ void PrefixCache::remove( size_t index ) {
 bool PrefixCache::evict_for( size_t incoming, const Entry* protect ) {
 	size_t held = stats().bytes;
 	while ( held + incoming > budget_ ) {
+		// The least recently used of: a leaf off the protected chain (dropped), a node with children or on the protected chain (the incoming
+		// node's parent gains its child only after this) that still holds a state (stripped to its KV rows). A stripped leaf holds nothing
+		// anyone resumes from or through, so it goes first. A chain shares its last use, so a tie takes the shallower node: a session's oldest
+		// turns lose their state first
 		size_t victim = entries_.size();
+		bool strip = false;
 		for ( size_t k = 0; k < entries_.size(); ++k ) {
 			const Entry* e = entries_[k].get();
-			if ( e->pinned || e->children > 0 ) continue;
+			if ( e->pinned ) continue;
 			bool guarded = false;
 			for ( const Entry* p = protect; p; p = p->parent ) guarded = guarded || p == e;
-			if ( guarded ) continue;
-			if ( victim == entries_.size() || e->last_used < entries_[victim]->last_used ) victim = k;
+			const bool leaf = e->children == 0 && !guarded;
+			if ( leaf && e->snap.rows_only ) { victim = k; strip = false; break; }
+			if ( !leaf && ( e->snap.rows_only || e->keep_state ) ) continue;
+			const Entry* v = victim < entries_.size() ? entries_[victim].get() : nullptr;
+			if ( !v || e->last_used < v->last_used || ( e->last_used == v->last_used && e->tokens.size() < v->tokens.size() ) ) {
+				victim = k;
+				strip = !leaf;
+			}
 		}
 		if ( victim == entries_.size() ) return false; // nothing evictable
-		held -= cost( entries_[victim]->snap, cluster_.tp() );
-		if ( disk_on() ) spill( entries_[victim].get(), true );   // to a file instead of dropping it (its buffers go with the write)
+		Entry* v = entries_[victim].get();
+		if ( strip ) {
+			ModelCluster::SeqSnapshot rows;
+			if ( !cluster_.rows_snapshot( v->snap, &rows ) ) {
+				v->keep_state = true;
+				continue;
+			}
+			held = held - cost( v->snap, cluster_.tp() ) + cost( rows, cluster_.tp() );
+			// the whole node to a file, as an eviction would (the writer takes its buffers): a later lookup can read the state back
+			if ( disk_on() ) spill( v, true );
+			if ( v->snap.host[0] ) cluster_.free_snapshot( &v->snap );   // no file write took them (none, or the file was there)
+			v->snap = rows;
+			stats_.strips++;
+			continue;
+		}
+		held -= cost( v->snap, cluster_.tp() );
+		if ( disk_on() ) spill( v, true );   // to a file instead of dropping it (its buffers go with the write)
 		remove( victim );
 		stats_.evictions++;
 	}
+	return true;
+}
+
+bool PrefixCache::refill( Entry* entry, ModelCluster::SeqSnapshot snap ) {
+	if ( !entry->snap.rows_only ) {
+		cluster_.free_snapshot( &snap );
+		return true;
+	}
+	const size_t incoming = cost( snap, cluster_.tp() ), current = cost( entry->snap, cluster_.tp() );
+	if ( !evict_for( incoming > current ? incoming - current : 0, entry ) ) {
+		cluster_.free_snapshot( &snap );
+		return false;
+	}
+	cluster_.free_snapshot( &entry->snap );
+	entry->snap = snap;
+	entry->keep_state = false;
+	touch_chain( entry );
 	return true;
 }
 

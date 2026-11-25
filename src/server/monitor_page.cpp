@@ -325,7 +325,7 @@ function render(s) {
 	const sp = s.speculation;
 	$('spec').innerHTML = sv.speculation ? tile('accept rate', fmt(sp.accept_rate * 100, 1) + '%', sp.accept_rate > .6 ? 'good' : 'warn') + tile('tokens / round', fmt(sp.tokens_per_round, 2)) + tile('rounds', fmt(sp.rounds)) + tile('drafted', fmt(sp.proposed)) : '<span class="dim">speculation is off</span>';
 	const pc = s.prefix_cache;
-	$('prefix').innerHTML = pc ? tile('hit rate', fmt(pc.lookups ? pc.hits / pc.lookups * 100 : 0, 0) + '%', 'good') + tile('tokens saved', fmt(pc.hit_tokens)) + tile('entries', fmt(pc.entries)) + tile('evictions', fmt(pc.evictions), pc.evictions ? 'warn' : '') +
+	$('prefix').innerHTML = pc ? tile('hit rate', fmt(pc.lookups ? pc.hits / pc.lookups * 100 : 0, 0) + '%', 'good') + tile('tokens saved', fmt(pc.hit_tokens)) + tile('entries', fmt(pc.entries)) + tile('evictions', fmt(pc.evictions), pc.evictions ? 'warn' : '') + tile('stripped', fmt(pc.strips)) +
 		'<div class="tile" style="grid-column:1/-1"><span>pinned host RAM ' + gib(pc.bytes) + ' of ' + gib(pc.budget_bytes) + '</span>' + bar(pc.budget_bytes ? pc.bytes / pc.budget_bytes : 0, 'p') + '</div>' : '<span class="dim">prefix cache is off</span>';
 
 	// recent

@@ -137,21 +137,31 @@ int main( int argc, char** argv ) {
 		mc.free_snapshot( &snap );
 	}
 
-	// A snapshot without taps resumes a slot that decodes without the drafter, with the same tokens
+	// A snapshot without taps resumes a slot that decodes without the drafter: the prefill after it matches the same two-part prefill
+	// exactly. The control decodes speculatively, so its greedy tokens may part from the plain decode's at a near tie (reported only)
 	if ( spec ) {
 		const int cut = chunk * ( ( n / 2 ) / chunk );
 		mc.reset_slot( 0 );
 		mc.prefill( ids.data(), cut, 0 );
 		ModelCluster::SeqSnapshot nt;
 		ENGINE_ASSERT( mc.save_snapshot( 0, 0, cut, &nt, false ), "save_snapshot failed" );
+		Candidates split_c;
+		const std::vector<int> split = decode( mc, mc.prefill( ids.data() + cut, n - cut, 0, 0, &split_c, cut ), n, 0, 48 );
 		const int ts = slot_of( 1 );
 		mc.reset_slot( ts );
 		ENGINE_ASSERT( mc.load_snapshot( ts, nt ), "load_snapshot failed" );
-		const int first = mc.prefill( ids.data() + cut, n - cut, ts, 0, nullptr, cut );
+		Candidates nt_c;
+		const int first = mc.prefill( ids.data() + cut, n - cut, ts, 0, &nt_c, cut );
 		const bool plain = !mc.spec_owns( ts );
 		const std::vector<int> t = decode( mc, first, n, ts, 48 );
-		std::printf( "%s snapshot without taps: drafter %s, tokens %s\n", plain && t == cold ? "[+]" : "[-]", plain ? "released" : "STILL OWNS", t == cold ? "identical" : "DIFFER" );
-		failures += plain && t == cold ? 0 : 1;
+		float diff = 0.0f;
+		for ( int j = 0; j < nt_c.n; ++j ) diff = std::max( diff, std::fabs( nt_c.logits[j] - split_c.logits[j] ) );
+		size_t agree = 0;
+		while ( agree < t.size() && agree < split.size() && t[agree] == split[agree] ) ++agree;
+		const bool ok = plain && diff == 0.0f;
+		std::printf( "%s snapshot without taps: drafter %s, max |dlogit| %.4g; plain decode agrees with the speculative control for %zu of %zu tokens\n",
+			ok ? "[+]" : "[-]", plain ? "released" : "STILL OWNS", diff, agree, split.size() );
+		failures += ok ? 0 : 1;
 		mc.free_snapshot( &nt );
 	}
 
@@ -320,6 +330,90 @@ int main( int argc, char** argv ) {
 			st.bytes / 1048576.0, small.budget() / 1048576.0 );
 		expect( st.evictions >= 1 && small.exact( prefix( 900 ) ) && small.exact( prefix( 960 ) ) && !small.exact( prefix( 950 ) ), "the older leaf went; the pinned root and the used chain stayed" );
 		small.clear();
+
+		// An agent session's chain (a node per turn) in a budget that holds every node's KV rows but only three states: nodes the chain
+		// has passed drop their state instead of the inserts failing once nothing is a leaf
+		// (the largest node sizes the budget: tap rows grow with a node's depth up to the drafter's ring)
+		const int step = 512, last = 4096;
+		ModelCluster::SeqSnapshot probe = snap_at( last - step, last ), probe_rows;
+		if ( mc.rows_snapshot( probe, &probe_rows ) ) {
+			const size_t full = probe.bytes * mc.tp(), rows = probe_rows.bytes * mc.tp();
+			mc.free_snapshot( &probe_rows );
+			std::printf( "[*] a 512-token node at %d: %.0f MiB with its state, %.0f MiB as KV rows (all ranks)\n", last, full / 1048576.0, rows / 1048576.0 );
+			const std::string dir = "/tmp/volta_prefix_strip_test_" + std::to_string( getpid() );
+			Candidates step_ctl_c;
+			std::vector<int> step_ctl;
+			{
+				PrefixCache chain( mc, full * 3 + rows * ( last / step ) );
+				mc.reset_slot( 0 );
+				PrefixCache::Entry* p = nullptr;
+				bool all = true;
+				for ( int cp = step; cp <= last && all; cp += step ) {
+					mc.prefill( ids.data() + cp - step, step, 0, 0, nullptr, cp - step );
+					ModelCluster::SeqSnapshot sn;
+					ENGINE_ASSERT( mc.save_snapshot( 0, p ? static_cast<int>( p->tokens.size() ) : 0, cp, &sn ), "save_snapshot failed" );
+					p = chain.insert( p, prefix( cp ), sn, cp == step );
+					all = p != nullptr;
+				}
+				// the control: the slot that built the chain prefills the rest
+				const int ctl_first = mc.prefill( ids.data() + last, n - last, 0, 0, &step_ctl_c, last );
+				step_ctl = decode( mc, ctl_first, n, 0, 48 );
+				const PrefixCache::Stats cst = chain.stats();
+				std::printf( "    %zu of %d nodes: %llu stripped, %llu evicted, %.0f of %.0f MiB\n", cst.entries, last / step, static_cast<unsigned long long>( cst.strips ),
+					static_cast<unsigned long long>( cst.evictions ), cst.bytes / 1048576.0, chain.budget() / 1048576.0 );
+				expect( all && cst.strips > 0 && cst.evictions == 0, "a chain longer than the budget's states keeps growing: passed nodes drop their state" );
+				PrefixCache::Entry* deep = chain.find( ids );
+				expect( deep && deep->tokens.size() == static_cast<size_t>( last ) && !deep->snap.rows_only, "the deepest node is still a resume point" );
+				const int ss = slot_of( 3 );
+				mc.reset_slot( ss );
+				expect( deep && chain.restore( ss, deep ), "restore through the stripped ancestors" );
+				Candidates strip_c;
+				const int strip_first = mc.prefill( ids.data() + last, n - last, ss, 0, &strip_c, last );
+				const std::vector<int> strip_tokens = decode( mc, strip_first, n, ss, 48 );
+				float strip_diff = 0.0f;
+				for ( int j = 0; j < strip_c.n; ++j ) strip_diff = std::max( strip_diff, std::fabs( strip_c.logits[j] - step_ctl_c.logits[j] ) );
+				expect( strip_tokens == step_ctl && strip_diff == 0.0f, "a restore through stripped ancestors continues like the chain's own prefill" );
+				std::printf( "    restore through stripped ancestors: max |dlogit| %.4g\n", strip_diff );
+				// a prompt diverging inside the chain resumes from the deepest node on its path that kept its state
+				std::vector<int> fork = prefix( last );
+				fork[2600] ^= 1;
+				PrefixCache::Entry* fe = chain.find( fork );
+				PrefixCache::Entry* at2560 = chain.exact( prefix( 2560 ) );
+				expect( fe && !fe->snap.rows_only && fe->tokens.size() <= 2560 && at2560 && ( at2560->snap.rows_only == ( fe->tokens.size() < 2560 ) ),
+					"a diverging prompt resumes from the deepest ancestor with a state" );
+				// a prefill passing a stripped node gives it its state back (in the chain's steps: the refilled rows replace the ones its
+				// descendants were computed on, which the disk case below restores through)
+				if ( at2560 && at2560->snap.rows_only ) {
+					mc.reset_slot( 0 );
+					for ( int cp = step; cp <= 2560; cp += step ) mc.prefill( ids.data() + cp - step, step, 0, 0, nullptr, cp - step );
+					ModelCluster::SeqSnapshot sn;
+					ENGINE_ASSERT( mc.save_snapshot( 0, static_cast<int>( at2560->parent->tokens.size() ), 2560, &sn ), "save_snapshot failed" );
+					expect( chain.refill( at2560, sn ) && chain.find( fork ) == at2560, "a refilled node is a resume point again" );
+				}
+				// the disk tier keeps the stripped nodes as such (written when the cache goes)
+				expect( chain.enable_disk( dir, "test_prefix_restore strip", size_t( 64 ) << 30 ), "disk tier on (stripped chain)" );
+			}
+			PrefixCache back( mc, size_t( 64 ) << 30 );
+			back.enable_disk( dir, "test_prefix_restore strip", size_t( 64 ) << 30 );
+			PrefixCache::Entry* bd = back.find( ids );
+			int stripped_back = 0;
+			for ( PrefixCache::Entry* e = bd; e; e = e->parent ) stripped_back += e->snap.rows_only ? 1 : 0;
+			const int bs = slot_of( 3 );
+			mc.reset_slot( bs );
+			expect( bd && bd->tokens.size() == static_cast<size_t>( last ) && stripped_back > 0 && back.restore( bs, bd ), "the stripped chain is read back from disk and restored" );
+			Candidates back_c;
+			const int back_first = mc.prefill( ids.data() + last, n - last, bs, 0, &back_c, last );
+			const std::vector<int> back_tokens = decode( mc, back_first, n, bs, 48 );
+			float back_diff = 0.0f;
+			for ( int j = 0; j < back_c.n; ++j ) back_diff = std::max( back_diff, std::fabs( back_c.logits[j] - step_ctl_c.logits[j] ) );
+			expect( back_tokens == step_ctl && back_diff == 0.0f, "a restore of the stripped chain from disk continues like the chain's own prefill" );
+			std::printf( "    stripped chain from disk (%d stripped ancestors): max |dlogit| %.4g\n", stripped_back, back_diff );
+			back.clear();
+			std::error_code ec;
+			std::filesystem::remove_all( dir, ec );
+		}
+		else std::printf( "[*] this model's snapshots hold no state to drop: the stripping cases do not apply\n" );
+		mc.free_snapshot( &probe );
 	}
 	if ( spec ) {
 		std::printf( "[*] warm runs: proposed %d accepted %d (acceptance %.2f)\n", g_proposed, g_accepted, g_proposed ? static_cast<double>( g_accepted ) / g_proposed : 0.0 );

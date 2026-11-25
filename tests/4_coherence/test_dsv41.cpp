@@ -221,20 +221,34 @@ int main( int argc, char** argv ) {
 		mc.prefill( prompt.data() + P1, P2 - P1, 0, 0, nullptr, P1 );
 		ENGINE_ASSERT( mc.save_snapshot( 0, P1, P2, &s2, false ), "test_dsv41: save [P1, P2)" );
 		std::vector<int> other( prompt.rbegin(), prompt.rend() );
-		mc.reset_slot( 0 );
-		mc.prefill( other.data(), static_cast<int>( other.size() ), 0 );
-		mc.reset_slot( 0 );
-		ENGINE_ASSERT( mc.load_snapshot( 0, s1, true ) && mc.load_snapshot( 0, s2, false ), "test_dsv41: load" );
-		std::vector<int> toks;
-		int tok = mc.prefill( prompt.data() + P2, static_cast<int>( prompt.size() ) - P2, 0, 0, nullptr, P2 );
-		toks.push_back( tok );
-		for ( int pos = static_cast<int>( prompt.size() ); static_cast<int>( toks.size() ) < static_cast<int>( st.tokens.size() ) && !mc.is_eos( tok ); ) {
-			mc.forward( &tok, 1, pos++, 0 );
-			tok = mc.sample_one();
+		auto restored = [&]( const ModelCluster::SeqSnapshot& parent ) {
+			mc.reset_slot( 0 );
+			mc.prefill( other.data(), static_cast<int>( other.size() ), 0 );
+			mc.reset_slot( 0 );
+			ENGINE_ASSERT( mc.load_snapshot( 0, parent, true ) && mc.load_snapshot( 0, s2, false ), "test_dsv41: load" );
+			std::vector<int> toks;
+			int tok = mc.prefill( prompt.data() + P2, static_cast<int>( prompt.size() ) - P2, 0, 0, nullptr, P2 );
 			toks.push_back( tok );
-		}
-		const bool same = toks == st.tokens;
+			for ( int pos = static_cast<int>( prompt.size() ); static_cast<int>( toks.size() ) < static_cast<int>( st.tokens.size() ) && !mc.is_eos( tok ); ) {
+				mc.forward( &tok, 1, pos++, 0 );
+				tok = mc.sample_one();
+				toks.push_back( tok );
+			}
+			return toks;
+		};
+		const std::vector<int> toks = restored( s1 );
+		bool same = toks == st.tokens;
 		std::printf( "[%c] snapshot round trip at %d / %d of %zu tokens: continuation %s (%zu tokens)\n", same ? '+' : '-', P1, P2, prompt.size(), same ? "identical" : "DIFFERS", toks.size() );
+		// the parent stripped to its KV rows (how the prefix cache makes room in a long chain): the same restore through it
+		ModelCluster::SeqSnapshot r1;
+		if ( mc.rows_snapshot( s1, &r1 ) ) {
+			const std::vector<int> rt = restored( r1 );
+			const bool rsame = rt == st.tokens;
+			std::printf( "[%c] the same through the parent's KV rows alone (%zu of %zu bytes per rank): continuation %s\n", rsame ? '+' : '-', r1.bytes, s1.bytes,
+				rsame ? "identical" : "DIFFERS" );
+			same = same && rsame;
+			mc.free_snapshot( &r1 );
+		}
 		mc.free_snapshot( &s1 );
 		mc.free_snapshot( &s2 );
 		if ( !same ) { mc.shutdown(); return 1; }

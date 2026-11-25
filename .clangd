@@ -1,5 +1,9 @@
 # clangd reads build/compile_commands.json (linked at the repository root); the CPU and Vulkan backends are compiled only by their
-# own configurations (build_cpu, build_vk), so their sources take those databases.
+# own configurations (build_cpu, build_vk), so their sources take those databases. Headers here include what their includers use, so
+# the unused-include check is off.
+Diagnostics:
+  UnusedIncludes: None
+---
 If:
   PathMatch: src/backend/cpu/.*
 CompileFlags:

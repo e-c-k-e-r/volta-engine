@@ -141,6 +141,8 @@ public:
 	size_t seq_state_bytes( int from, int tokens, bool with_taps ) const override;
 	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
 	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;
+	bool seq_rows_span( int from, int tokens, bool with_taps, size_t* offset, size_t* bytes ) const override;
+	bool load_seq_rows( int slot_id, int from, int tokens, const void* rows, backend::stream_t stream = nullptr ) override;
 	void reset_state( int slot_id = 0 ) override;
 	bool has_mtp() const override { return mtp_on_; }
 	void set_hessian_capture( bool on ) override { hess_.enable( on ); }

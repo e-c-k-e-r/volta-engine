@@ -16,8 +16,11 @@ namespace engine::runtime {
 // Host-RAM store of sequence snapshots keyed by the exact token prefix they cover, organized as a tree: a node holds the
 // KV rows of its own segment [parent.tokens, tokens) plus the recurrent state at its end, so a chain of checkpoints along
 // one prompt stores every KV row once. A request resumes from the deepest node whose tokens are a proper prefix of its
-// prompt (at least one token must remain to produce logits). Eviction is least-recently-used over leaves; pinned nodes
-// (the shared system-prompt root) and nodes with children stay. Not thread safe: scheduler thread only.
+// prompt (at least one token must remain to produce logits). Making room is least-recently-used over two kinds of victims: a leaf
+// is dropped, and a node with children (or the parent of the node being stored) drops its state (ModelCluster::rows_snapshot), keeping the KV rows its descendants restore through, so
+// a long agent session (one node per turn, each with a full recurrent state and tap ring) does not fill the budget with states of
+// turns nobody resumes from. A stripped node is no resume point until a prefill passing it stores its state again (refill). Pinned
+// nodes (the shared system-prompt root) are neither dropped nor stripped. Not thread safe: scheduler thread only.
 //
 // Disk tier (optional, a directory): an evicted node is written to a file instead of being dropped (by a writer thread, which frees its host
 // buffers afterwards), every node is written when the cache is destroyed, and the files found at start are indexed, so a prefix survives a
@@ -30,10 +33,11 @@ public:
 		std::vector<int> tokens;        // the whole prefix
 		Entry* parent = nullptr;
 		int children = 0;
-		ModelCluster::SeqSnapshot snap; // KV rows [parent->tokens.size() or 0, tokens.size()) + state at the end
+		ModelCluster::SeqSnapshot snap; // KV rows [parent->tokens.size() or 0, tokens.size()) + state at the end (none once stripped)
 		uint64_t last_used = 0;
 		bool pinned = false;
 		bool on_disk = false;           // a file holds the same node (an eviction just frees it)
+		bool keep_state = false;        // stripping failed (the model cannot drop its state): only eviction makes room
 	};
 
 	struct Stats {
@@ -42,6 +46,7 @@ public:
 		uint64_t hit_tokens = 0;     // prompt tokens not prefilled thanks to hits
 		uint64_t inserts = 0;
 		uint64_t evictions = 0;
+		uint64_t strips = 0;         // nodes that dropped their state to make room
 		size_t entries = 0;
 		size_t bytes = 0;            // pinned host bytes held by entries, all ranks
 		uint64_t disk_hits = 0;      // lookups served (in part) from files
@@ -56,9 +61,15 @@ public:
 	// directory cannot be created.
 	bool enable_disk( const std::string& dir, const std::string& fingerprint, size_t disk_budget );
 
-	// Deepest entry whose tokens are a proper prefix of prompt; nullptr if none. Counts a lookup, marks the chain used.
+	// Deepest entry with a state whose tokens are a proper prefix of prompt (a resume point); nullptr if none. Counts a lookup, marks
+	// the chain used.
 	Entry* find( const std::vector<int>& prompt );
+	// Deepest entry, stripped or not, whose tokens are a proper prefix of tokens: the parent a new node of that prefix chains to
+	Entry* deepest( const std::vector<int>& tokens );
 	Entry* exact( const std::vector<int>& tokens );
+	// Gives a stripped entry a full snapshot of the same prefix again (from = its parent's tokens), so it is a resume point once more.
+	// Takes ownership of snap (freed on failure). False if it did not fit.
+	bool refill( Entry* entry, ModelCluster::SeqSnapshot snap );
 	// Writes the entry's chain into the slot (ancestors' KV first, then the entry's KV, state and taps). False on failure.
 	bool restore( int slot, Entry* entry );
 	// Adds a node under `parent` (nullptr: a root). Takes ownership of snap (freed on failure). The parent and its ancestors
@@ -79,6 +90,7 @@ private:
 		std::vector<int> tokens;
 		int from = 0;
 		bool with_taps = false;
+		bool rows_only = false;  // a stripped node: an ancestor to read back, not a resume point
 		size_t bytes = 0;        // per rank
 		std::string path;
 		uint64_t last_used = 0;

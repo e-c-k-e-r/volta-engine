@@ -748,6 +748,7 @@ bool ModelCluster::alloc_snapshot( int from, int tokens, bool with_taps, size_t 
 	snap->from = from;
 	snap->with_taps = with_taps;
 	snap->tokens = tokens;
+	snap->rows_only = false;
 	snap->bytes = bytes;
 	for ( int d = 0; d < tp_; ++d ) {
 		void* p = nullptr;
@@ -833,10 +834,11 @@ void ModelCluster::prewarm_snapshots( const std::vector<SnapshotPlan>& plan ) {
 }
 
 bool ModelCluster::load_snapshot( int slot, const SeqSnapshot& snap, bool kv_only ) {
-	if ( snap.tokens <= 0 || !snap.host[0] ) return false;
+	if ( snap.tokens <= 0 || !snap.host[0] || ( snap.rows_only && !kv_only ) ) return false;
 	int ok[ENGINE_NUM_GPUS] = {};
 	pool_.run( [&]( int d ) {
-		ok[d] = models_[d]->load_seq_state( slot, snap.from, snap.tokens, snap.with_taps, snap.host[d], kv_only, streams_[d] ) ? 1 : 0;
+		ok[d] = ( snap.rows_only ? models_[d]->load_seq_rows( slot, snap.from, snap.tokens, snap.host[d], streams_[d] )
+		                         : models_[d]->load_seq_state( slot, snap.from, snap.tokens, snap.with_taps, snap.host[d], kv_only, streams_[d] ) ) ? 1 : 0;
 		backend::stream_sync( streams_[d] );
 	} );
 	for ( int d = 0; d < tp_; ++d ) {
@@ -887,6 +889,22 @@ void ModelCluster::free_snapshot( SeqSnapshot* snap ) {
 		snap->tokens = 0;
 	}
 	if ( !drop.empty() ) release_pinned( std::move( drop ) );
+}
+
+bool ModelCluster::rows_snapshot( const SeqSnapshot& snap, SeqSnapshot* out ) {
+	constexpr size_t kRound = size_t( 8 ) << 20;   // the buffer classes of save_snapshot
+	if ( snap.rows_only || snap.tokens <= 0 || !snap.host[0] ) return false;
+	size_t offset[ENGINE_NUM_GPUS] = {}, rows[ENGINE_NUM_GPUS] = {}, need = 0;
+	for ( int d = 0; d < tp_; ++d ) {
+		if ( !models_[d]->seq_rows_span( snap.from, snap.tokens, snap.with_taps, &offset[d], &rows[d] ) || offset[d] + rows[d] > snap.bytes ) return false;
+		need = std::max( need, rows[d] );
+	}
+	const size_t cls = ( need + kRound - 1 ) / kRound * kRound;
+	if ( cls >= snap.bytes ) return false;   // nothing to gain
+	if ( !alloc_snapshot( snap.from, snap.tokens, false, cls, out ) ) return false;
+	pool_.run( [&]( int d ) { std::memcpy( out->host[d], static_cast<const char*>( snap.host[d] ) + offset[d], rows[d] ); } );
+	out->rows_only = true;
+	return true;
 }
 
 void ModelCluster::reset_slot( int slot ) {

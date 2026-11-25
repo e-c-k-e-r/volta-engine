@@ -76,7 +76,7 @@ std::string VoltaServer::stats_json() {
 	j["history"] = { { "t", t }, { "decode", dec }, { "prefill", pf }, { "active", act } };
 	if ( met.prefix_enabled ) {
 		j["prefix_cache"] = { { "lookups", met.prefix.lookups }, { "hits", met.prefix.hits }, { "hit_tokens", met.prefix.hit_tokens }, { "inserts", met.prefix.inserts },
-			{ "evictions", met.prefix.evictions }, { "entries", met.prefix.entries }, { "bytes", met.prefix.bytes }, { "budget_bytes", static_cast<uint64_t>( std::max( 0, opt.prefix_cache_gib ) ) << 30 } };
+			{ "evictions", met.prefix.evictions }, { "strips", met.prefix.strips }, { "entries", met.prefix.entries }, { "bytes", met.prefix.bytes }, { "budget_bytes", static_cast<uint64_t>( std::max( 0, opt.prefix_cache_gib ) ) << 30 } };
 		if ( !opt.prefix_cache_dir.empty() ) j["prefix_cache"]["disk"] = { { "hits", met.prefix.disk_hits }, { "entries", met.prefix.disk_entries }, { "bytes", met.prefix.disk_bytes } };
 	}
 	std::vector<GpuReading> gpus;

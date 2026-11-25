@@ -261,7 +261,6 @@ private:
 		bool pf_started = false;
 		int pf_pos = 0;                  // next prompt position to prefill
 		int pf_resumed = 0;              // prompt tokens restored from the prefix cache
-		PrefixCache::Entry* pf_node = nullptr;   // deepest cache node of the prompt so far
 		std::vector<GenerationRequest::Checkpoint> pf_cps;
 		size_t pf_cp_next = 0;
 		int pf_last_cp = -1;
@@ -299,7 +298,7 @@ private:
 	double pf_rows_ = 0.0;   // prefill_budget_ms: the piece size (rows) the next piece starts with
 	int pf_cooldown_left_ = 0;   // prefill_cooldown: the steps still to run without a prompt piece
 	int pf_rr_ = 0;   // the slot after which the next prefilling slot is looked for
-	PrefixCache::Entry* store_prefix( int s, PrefixCache::Entry* parent, int tokens, bool pinned, bool with_taps );
+	PrefixCache::Entry* store_prefix( int s, int tokens, bool pinned, bool with_taps );
 	static constexpr int kPrefixMinTokens = 512;
 	// Commits `tok` to slot s's output; returns true when the request finished.
 	static int loop_detect_mode();

@@ -475,13 +475,18 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 		const int fed = std::min( slot.current_pos, static_cast<int>( slot.all_tokens.size() ) );
 		if ( fed > static_cast<int>( slot.req.prompt_tokens.size() ) && fed >= kPrefixMinTokens && fed % cluster_.snapshot_align() == 0 ) {
 			const std::vector<int> key( slot.all_tokens.begin(), slot.all_tokens.begin() + fed );
-			// the parent is looked up again: the prompt's own nodes may have been evicted while the reply was decoding
-			PrefixCache::Entry* parent = prefix_cache_->exact( key ) ? nullptr : prefix_cache_->find( key );
+			// the parent is looked up again: the prompt's own nodes may have been evicted while the reply was decoding. A node of exactly this
+			// prefix that lost its state gets it back
+			PrefixCache::Entry* same = prefix_cache_->exact( key );
+			PrefixCache::Entry* parent = same ? same->parent : prefix_cache_->deepest( key );
 			const int parent_tokens = parent ? static_cast<int>( parent->tokens.size() ) : 0;
-			if ( !prefix_cache_->exact( key ) ) {
+			if ( !same || same->snap.rows_only ) {
 				const auto t_store = std::chrono::steady_clock::now();
 				ModelCluster::SeqSnapshot snap;
-				if ( cluster_.save_snapshot( s, parent_tokens, fed, &snap, true ) ) prefix_cache_->insert( parent, key, snap, false );
+				if ( cluster_.save_snapshot( s, parent_tokens, fed, &snap, true ) ) {
+					if ( same ) prefix_cache_->refill( same, snap );
+					else prefix_cache_->insert( parent, key, snap, false );
+				}
 				LOG_DEBUG( "[gen] slot %d: reply snapshot at %d stored in %.0f ms\n", s, fed,
 					std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_store ).count() );
 			}
@@ -585,16 +590,12 @@ bool Generator::prefill_slot( int s, int budget ) {
 		const std::vector<int>& key_prompt = slot.key_tokens.empty() ? prompt : slot.key_tokens;
 		// Resume from the deepest cached prefix of the prompt, else start cold (which also hands the drafter to this slot)
 		int pos = 0;
-		slot.pf_node = nullptr;
 		if ( prefix_cache_ && !slot.steer_prompt && n >= kPrefixMinTokens ) {
 			if ( PrefixCache::Entry* hit = prefix_cache_->find( key_prompt ) ) {
 				const auto t_restore = std::chrono::steady_clock::now();
 				const bool restored = prefix_cache_->restore( s, hit );
 				slot.metrics.restore_ms += std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_restore ).count();
-				if ( restored ) {
-					slot.pf_node = hit;
-					pos = static_cast<int>( hit->tokens.size() );
-				}
+				if ( restored ) pos = static_cast<int>( hit->tokens.size() );
 			}
 		}
 		slot.pf_resumed = pos;
@@ -635,6 +636,9 @@ bool Generator::prefill_slot( int s, int budget ) {
 			for ( auto& cp : slot.pf_cps ) cp.pos -= cp.pos % align;
 			const int interval = runtime::options().prefix_interval;
 			for ( int p = interval; interval > 0 && p < n - kPrefixMinTokens; p += interval ) slot.pf_cps.push_back( { p, false, cluster_.has_speculator() && cluster_.speculator().cheap_snapshot_taps() } );
+			// the prompt parts from a cached chain below a node that lost its state: the prefill stores it there again (a resume point at the fork)
+			if ( PrefixCache::Entry* d = prefix_cache_->deepest( key_prompt ); d && d->snap.rows_only && static_cast<int>( d->tokens.size() ) > pos )
+				slot.pf_cps.push_back( { static_cast<int>( d->tokens.size() ), false, true } );
 			std::sort( slot.pf_cps.begin(), slot.pf_cps.end(), []( const GenerationRequest::Checkpoint& a, const GenerationRequest::Checkpoint& b ) { return a.pos < b.pos || ( a.pos == b.pos && a.pinned > b.pinned ); } );
 		}
 		if ( prefix_cache_ && !slot.pf_cps.empty() ) {
@@ -706,11 +710,10 @@ bool Generator::prefill_slot( int s, int budget ) {
 			slot.pf_last_cp = end;
 			++slot.pf_cp_next;
 			const auto t_cp = std::chrono::steady_clock::now();
-			slot.pf_node = store_prefix( s, slot.pf_node, pos, cp->pinned, cp->taps );
+			slot.pf_chain_ok = store_prefix( s, pos, cp->pinned, cp->taps ) != nullptr;
 			const double cp_ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t_cp ).count();
 			slot.metrics.store_ms += cp_ms;
 			LOG_DEBUG( "[gen] slot %d checkpoint at %d stored in %.0f ms\n", s, pos, cp_ms );
-			slot.pf_chain_ok = slot.pf_node != nullptr;
 		}
 		slot.pf_pos = pos;
 		if ( budget > 0 && fed >= budget ) return false;
@@ -719,10 +722,18 @@ bool Generator::prefill_slot( int s, int budget ) {
 
 // Snapshots slot s's prompt up to `tokens` as a child of `parent` (KV rows since the parent only). Returns the cache node for
 // that prefix, an existing one if present, or nullptr if it could not be stored.
-PrefixCache::Entry* Generator::store_prefix( int s, PrefixCache::Entry* parent, int tokens, bool pinned, bool with_taps ) {
+PrefixCache::Entry* Generator::store_prefix( int s, int tokens, bool pinned, bool with_taps ) {
 	const std::vector<int>& full = slots_[s].key_tokens.empty() ? slots_[s].req.prompt_tokens : slots_[s].key_tokens;
 	const std::vector<int> key( full.begin(), full.begin() + tokens );
-	if ( PrefixCache::Entry* e = prefix_cache_->exact( key ) ) return e;
+	// the parent is looked up by its tokens: another slot's store may have evicted the node this prefill resumed from or stored last
+	// (a prefill spans scheduler iterations), and a node with no state further down the prompt holds rows this one need not repeat
+	PrefixCache::Entry* parent = prefix_cache_->deepest( key );
+	if ( PrefixCache::Entry* e = prefix_cache_->exact( key ) ) {
+		// a node that lost its state (its descendants restore through its KV rows) is a resume point again once the prefill passes it
+		ModelCluster::SeqSnapshot snap;
+		if ( e->snap.rows_only && cluster_.save_snapshot( s, e->parent ? static_cast<int>( e->parent->tokens.size() ) : 0, tokens, &snap, with_taps ) ) prefix_cache_->refill( e, snap );
+		return e;
+	}
 	ModelCluster::SeqSnapshot snap;
 	if ( !cluster_.save_snapshot( s, parent ? static_cast<int>( parent->tokens.size() ) : 0, tokens, &snap, with_taps ) ) return nullptr;
 	return prefix_cache_->insert( parent, key, snap, pinned );

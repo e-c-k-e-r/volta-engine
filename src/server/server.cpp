@@ -336,7 +336,8 @@ void VoltaServer::handle_metrics( const ConnPtr& conn ) {
 	m["gpu_vram_used_bytes"] = metrics.gpu_vram_used_bytes;
 	if ( metrics.prefix_enabled ) {
 		m["prefix_cache"] = { { "lookups", metrics.prefix.lookups }, { "hits", metrics.prefix.hits }, { "hit_tokens", metrics.prefix.hit_tokens },
-			{ "inserts", metrics.prefix.inserts }, { "evictions", metrics.prefix.evictions }, { "entries", metrics.prefix.entries }, { "bytes", metrics.prefix.bytes } };
+			{ "inserts", metrics.prefix.inserts }, { "evictions", metrics.prefix.evictions }, { "strips", metrics.prefix.strips }, { "entries", metrics.prefix.entries },
+			{ "bytes", metrics.prefix.bytes } };
 	}
 	send_json( conn, 200, m.dump( 2 ) + "\n" );
 }
@@ -360,6 +361,7 @@ void VoltaServer::handle_metrics_prometheus( const ConnPtr& conn ) {
 		line( "volta_prefix_cache_hits_total", "counter", static_cast<double>( m.prefix.hits ) );
 		line( "volta_prefix_cache_hit_tokens_total", "counter", static_cast<double>( m.prefix.hit_tokens ) );
 		line( "volta_prefix_cache_evictions_total", "counter", static_cast<double>( m.prefix.evictions ) );
+		line( "volta_prefix_cache_strips_total", "counter", static_cast<double>( m.prefix.strips ) );
 		line( "volta_prefix_cache_entries", "gauge", static_cast<double>( m.prefix.entries ) );
 		line( "volta_prefix_cache_bytes", "gauge", static_cast<double>( m.prefix.bytes ) );
 	}

@@ -73,6 +73,7 @@ public:
 		int from = 0;                      // the snapshot holds KV rows [from, tokens); a chain links from = the parent's tokens
 		int tokens = 0;
 		bool with_taps = false;            // carries the drafter tap rows: a restore keeps speculating
+		bool rows_only = false;            // only the KV rows (rows_snapshot dropped the state): loads kv_only, as a chain ancestor
 		size_t bytes = 0;                  // per rank
 		void* host[ENGINE_NUM_GPUS] = {};
 	};
@@ -90,6 +91,9 @@ public:
 	// then the node being resumed from.
 	bool load_snapshot( int slot, const SeqSnapshot& snap, bool kv_only = false );
 	void free_snapshot( SeqSnapshot* snap );
+	// A copy of a snapshot's KV rows alone (rows_only: the recurrent state and tap rows dropped), what a chain ancestor needs, at a
+	// fraction of the bytes when the state is large. False when the model cannot, the copy would not be smaller, or host memory runs out
+	bool rows_snapshot( const SeqSnapshot& snap, SeqSnapshot* out );
 
 	// Greedy argmax of the last forward's first `count` rows (rank 0).
 	void sample( int* out, int count );

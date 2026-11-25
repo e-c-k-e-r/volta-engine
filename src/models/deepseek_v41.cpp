@@ -2683,6 +2683,22 @@ bool DeepseekV41Pipeline::load_seq_state( int slot_id, int from, int tokens, boo
 	return true;
 }
 
+// The KV rows sit between the window rings (before) and the drafter's taps (after)
+bool DeepseekV41Pipeline::seq_rows_span( int from, int tokens, bool with_taps, size_t* offset, size_t* bytes ) const {
+	if ( seq_state_bytes( from, tokens, with_taps ) == 0 ) return false;
+	*offset = static_cast<size_t>( config_.num_layers ) * DSV4::WINDOW * DSV4::WIN_ROW;
+	*bytes = seq_state_bytes( from, tokens, false ) - *offset;
+	return true;
+}
+
+bool DeepseekV41Pipeline::load_seq_rows( int slot_id, int from, int tokens, const void* rows, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens, false ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+	backend::set_device( rank_ );
+	copy_seq_rows( slot_id, from, tokens, const_cast<char*>( static_cast<const char*>( rows ) ), false, stream );
+	backend::stream_sync( stream );
+	return true;
+}
+
 void DeepseekV41Pipeline::sample_tokens( int* out_preds, int count, backend::stream_t stream ) {
 	(void) out_preds; (void) count; (void) stream;
 	ENGINE_ASSERT( false, "DeepseekV41Pipeline::sample_tokens: the vocabulary is sharded, use sample_local" );

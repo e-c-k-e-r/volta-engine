@@ -200,6 +200,8 @@ public:
 	bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) override;
 	bool read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream = nullptr ) override;
 	bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) override;
+	bool seq_rows_span( int from, int tokens, bool with_taps, size_t* offset, size_t* bytes ) const override;
+	bool load_seq_rows( int slot_id, int from, int tokens, const void* rows, backend::stream_t stream = nullptr ) override;
 
 	void checkpoint_state( int slot_id, backend::stream_t stream = nullptr ) override;
 	void rollback_state( int slot_id, backend::stream_t stream = nullptr ) override;

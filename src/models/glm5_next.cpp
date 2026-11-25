@@ -2745,5 +2745,21 @@ bool Glm5NextPipeline::load_seq_state( int slot_id, int from, int tokens, bool w
 	return true;
 }
 
+bool Glm5NextPipeline::seq_rows_span( int from, int tokens, bool with_taps, size_t* offset, size_t* bytes ) const {
+	const size_t all = seq_state_bytes( from, tokens, with_taps );
+	if ( all == 0 ) return false;
+	*offset = ( state_.slot_kda_floats + state_.slot_conv_floats ) * sizeof( float ) + dsa_plane_stride_ * sizeof( backend::half_t ) + ( with_taps ? tap_snapshot_bytes( tokens ) : 0 );
+	*bytes = all - *offset;
+	return true;
+}
+
+bool Glm5NextPipeline::load_seq_rows( int slot_id, int from, int tokens, const void* rows, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens, false ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+	if ( !reserve_tokens( slot_id, tokens ) ) return false;
+	backend::set_device( rank_ );
+	copy_seq_rows( slot_id, from, tokens, const_cast<char*>( static_cast<const char*>( rows ) ), false, stream );
+	return true;
+}
+
 
 } // namespace engine::models

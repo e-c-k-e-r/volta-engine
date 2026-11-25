@@ -295,6 +295,11 @@ public:
 	virtual size_t seq_state_bytes( int from, int tokens, bool with_taps ) const { (void) from; (void) tokens; (void) with_taps; return 0; }
 	virtual bool save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream = nullptr ) { (void) slot_id; (void) from; (void) tokens; (void) with_taps; (void) host_dst; (void) stream; return false; }
 	virtual bool load_seq_state( int slot_id, int from, int tokens, bool with_taps, const void* host_src, bool kv_only, backend::stream_t stream = nullptr ) { (void) slot_id; (void) from; (void) tokens; (void) with_taps; (void) host_src; (void) kv_only; (void) stream; return false; }
+	// Where a snapshot's KV rows [from, tokens) sit in its buffer (what a kv_only load reads), so a chain ancestor can drop the rest (its state
+	// and tap rows, superseded by the descendant being resumed) and keep only these bytes; false when the model cannot. load_seq_rows writes
+	// such a rows-only copy into the slot as a kv_only load of the whole snapshot would
+	virtual bool seq_rows_span( int from, int tokens, bool with_taps, size_t* offset, size_t* bytes ) const { (void) from; (void) tokens; (void) with_taps; (void) offset; (void) bytes; return false; }
+	virtual bool load_seq_rows( int slot_id, int from, int tokens, const void* rows, backend::stream_t stream = nullptr ) { (void) slot_id; (void) from; (void) tokens; (void) rows; (void) stream; return false; }
 
 	// 5c. Multimodal input. inject_embeddings overwrites rows [dst_row, dst_row + rows) of the last embed_tokens with
 	// precomputed embeddings (host [rows, hidden] FP16); call it between embed_tokens and forward. The image encoder runs on

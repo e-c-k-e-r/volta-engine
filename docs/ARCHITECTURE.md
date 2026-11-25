@@ -70,7 +70,9 @@ backend.
   response streams through a responder that parses reasoning and tool calls out of the text as it is generated. Connections
   have a non-blocking outbound queue, so a slow client cannot stall generation.
 - **Prefix cache**: sequence snapshots (recurrent state, KV rows, drafter taps) in pinned host RAM, stored as a tree of
-  segments keyed by exact token prefixes; a request resumes from the deepest cached prefix of its prompt.
+  segments keyed by exact token prefixes; a request resumes from the deepest cached prefix of its prompt that holds a state.
+  Making room drops the least recently used leaf or strips a node with descendants to its KV rows (its state and taps go), so
+  an agent session's chain of turns keeps growing; a later prefill passing a stripped node stores its state again.
 
 ## Tiers and tests
 

@@ -623,4 +623,21 @@ bool Gemma4Pipeline::load_seq_state( int slot_id, int from, int tokens, bool wit
 	return true;
 }
 
+bool Gemma4Pipeline::seq_rows_span( int from, int tokens, bool with_taps, size_t* offset, size_t* bytes ) const {
+	const size_t all = seq_state_bytes( from, tokens, with_taps );
+	if ( all == 0 ) return false;
+	*offset = with_taps ? tap_snapshot_bytes( tokens ) : 0;
+	*bytes = all - *offset;
+	return true;
+}
+
+bool Gemma4Pipeline::load_seq_rows( int slot_id, int from, int tokens, const void* rows, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens, false ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+	backend::set_device( rank_ );
+	char* src = const_cast<char*>( static_cast<const char*>( rows ) );
+	copy_kv_rows( swa_pool_, slot_id, from, tokens, src, false, stream );
+	copy_kv_rows( full_pool_, slot_id, from, tokens, src + pool_rows_bytes( swa_pool_, tokens - kept_from( swa_pool_, config_.swa_window, from, tokens ) ), false, stream );
+	return true;
+}
+
 } // namespace engine::models

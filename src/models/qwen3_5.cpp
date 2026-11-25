@@ -1151,4 +1151,19 @@ bool Qwen3_5Pipeline::load_seq_state( int slot_id, int from, int tokens, bool wi
 	return true;
 }
 
+bool Qwen3_5Pipeline::seq_rows_span( int from, int tokens, bool with_taps, size_t* offset, size_t* bytes ) const {
+	const size_t all = seq_state_bytes( from, tokens, with_taps );
+	if ( all == 0 ) return false;
+	*offset = ( state_.slot_gdn_floats + state_.slot_conv_floats ) * sizeof( float ) + ( with_taps ? tap_snapshot_bytes( tokens ) : 0 );
+	*bytes = all - *offset;
+	return true;
+}
+
+bool Qwen3_5Pipeline::load_seq_rows( int slot_id, int from, int tokens, const void* rows, backend::stream_t stream ) {
+	if ( seq_state_bytes( from, tokens, false ) == 0 || slot_id < 0 || slot_id >= config_.max_slots ) return false;
+	backend::set_device( rank_ );
+	copy_kv_rows( slot_id, from, tokens, const_cast<char*>( static_cast<const char*>( rows ) ), false, stream );
+	return true;
+}
+
 } // namespace engine::models
