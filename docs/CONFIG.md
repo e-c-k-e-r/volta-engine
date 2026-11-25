@@ -19,7 +19,7 @@ values are fatal errors. The model type is never configured: it is read from the
 | `api_key` | `--api-key` | empty | when set, `/v1/*` requests must carry it as `Authorization: Bearer KEY` or `x-api-key: KEY` (Claude Code sends `ANTHROPIC_API_KEY` as the latter); `/health`, `/metrics` and the monitor stay open |
 | `max_batch_size` | `--max-batch-size` | 8 | concurrent decode slots the scheduler may fill (capped by `max_slots`) |
 | `default_max_tokens` | `--max-tokens` | 256 | `max_tokens` for requests that omit it |
-| `default_temperature`, `default_top_p`, `default_top_k` | `--temperature` | from the checkpoint's `generation_config.json` | sampling defaults for requests that omit them (`presence_penalty` and `repetition_penalty` are also taken from that file when it sets them) |
+| `default_temperature`, `default_top_p`, `default_top_k` | `--temperature` | from the checkpoint's `generation_config.json` (`do_sample: false`: temperature 0), else the defaults OpenAI's and Anthropic's APIs document: temperature 1, top_p 1, no top_k (the sampler's 16 candidates) | sampling defaults for requests that omit them (`presence_penalty` and `repetition_penalty` are also taken from that file when it sets them) |
 | `default_enable_thinking` | | false | thinking on for requests that do not say |
 | `request_timeout_s` | | 30 | seconds a connection may stay silent before its request is complete |
 | `video` | see below | | MiniMax-H3 settings |

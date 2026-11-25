@@ -2,6 +2,7 @@
 #include "engine/core/log.h"
 #include "engine/models/model.h"
 #include "engine/runtime/options.h"
+#include "engine/runtime/sampling.h"
 
 #define JSON_NOEXCEPTION 1
 #include <nlohmann/json.hpp>
@@ -171,7 +172,7 @@ values are fatal errors. The model type is never configured: it is read from the
 | `api_key` | `--api-key` | empty | when set, `/v1/*` requests must carry it as `Authorization: Bearer KEY` or `x-api-key: KEY` (Claude Code sends `ANTHROPIC_API_KEY` as the latter); `/health`, `/metrics` and the monitor stay open |
 | `max_batch_size` | `--max-batch-size` | 8 | concurrent decode slots the scheduler may fill (capped by `max_slots`) |
 | `default_max_tokens` | `--max-tokens` | 256 | `max_tokens` for requests that omit it |
-| `default_temperature`, `default_top_p`, `default_top_k` | `--temperature` | from the checkpoint's `generation_config.json` | sampling defaults for requests that omit them (`presence_penalty` and `repetition_penalty` are also taken from that file when it sets them) |
+| `default_temperature`, `default_top_p`, `default_top_k` | `--temperature` | from the checkpoint's `generation_config.json` (`do_sample: false`: temperature 0), else the defaults OpenAI's and Anthropic's APIs document: temperature 1, top_p 1, no top_k (the sampler's 16 candidates) | sampling defaults for requests that omit them (`presence_penalty` and `repetition_penalty` are also taken from that file when it sets them) |
 | `default_enable_thinking` | | false | thinking on for requests that do not say |
 | `request_timeout_s` | | 30 | seconds a connection may stay silent before its request is complete |
 | `video` | see below | | MiniMax-H3 settings |
@@ -413,6 +414,7 @@ bool ServerConfig::resolve() {
 			while ( ( n = std::fread( buf, 1, sizeof( buf ), f ) ) > 0 ) text.append( buf, n );
 			std::fclose( f );
 			auto g = nlohmann::json::parse( text, nullptr, false );
+			if ( !g.is_discarded() && !g.value( "do_sample", true ) && default_temperature < 0.0f ) default_temperature = 0.0f;   // the checkpoint asks for greedy decoding
 			if ( !g.is_discarded() && g.value( "do_sample", true ) ) {
 				if ( default_temperature < 0.0f && g.contains( "temperature" ) && g["temperature"].is_number() ) default_temperature = g["temperature"].get<float>();
 				if ( default_top_p < 0.0f && g.contains( "top_p" ) && g["top_p"].is_number() ) default_top_p = g["top_p"].get<float>();
@@ -421,9 +423,11 @@ bool ServerConfig::resolve() {
 				if ( g.contains( "repetition_penalty" ) && g["repetition_penalty"].is_number() ) default_repetition_penalty = g["repetition_penalty"].get<float>();
 			}
 		}
-		if ( default_temperature < 0.0f ) default_temperature = 0.0f;
+		// Neither set: the defaults OpenAI's and Anthropic's APIs document for a request that omits them (temperature 1, top_p 1 or none), and
+		// top_k none, which is the sampler's whole candidate list
+		if ( default_temperature < 0.0f ) default_temperature = 1.0f;
 		if ( default_top_p < 0.0f ) default_top_p = 1.0f;
-		if ( default_top_k < 0 ) default_top_k = 16;
+		if ( default_top_k < 0 ) default_top_k = engine::runtime::kSampleTopK;
 		LOG_INFO( "Sampling defaults: temperature %.2f, top_p %.2f, top_k %d, presence penalty %.2f, repetition penalty %.2f\n", default_temperature, default_top_p, default_top_k,
 			default_presence_penalty, default_repetition_penalty );
 	}
