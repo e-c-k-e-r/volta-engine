@@ -7,7 +7,7 @@ namespace {
 }
 #include "shaders_cuda.h"
 
-void slang_embed_tokens( void* table_bf16, void* token_ids, void* out, int hidden, int rows, cudaStream_t s ) {
-	EmbedParams_0 p{ (uint16_t*) table_bf16, (int*) token_ids, (__half*) out, hidden };
+void slang_embed_tokens( void* table_bf16, void* token_ids, void* out, int hidden, int rows, int vocab, cudaStream_t s ) {
+	EmbedParams_0 p{ (uint16_t*) table_bf16, (int*) token_ids, (__half*) out, hidden, vocab };
 	embed_tokens<<<dim3( ( hidden + 255 ) / 256, rows ), 256, 0, s>>>( p );
 }

@@ -19,7 +19,7 @@ using namespace engine::backend;
 struct NormParams { uint64_t src, dst, weight; int hidden_size, has_weight; float eps, bias; };
 struct AddParams { uint64_t hidden, residual; int n; };
 struct SwigluParams { uint64_t gate, up, out_; int n; float limit; int gelu; };
-struct EmbedParams { uint64_t table, token_ids, out_; int hidden_size; };
+struct EmbedParams { uint64_t table, token_ids, out_; int hidden_size, rows; };
 struct RopeParams { uint64_t q, k, pos; int num_q_heads, num_kv_heads, head_dim, rot_dim, interleaved; float freq_base; int rot_pairs; };
 struct ArgmaxParams { uint64_t logits, out_idx, out_val; int numel, batch_size, index_offset, row_stride, has_val; };
 static_assert( sizeof( NormParams ) == 40 && sizeof( AddParams ) == 24 && sizeof( SwigluParams ) == 40, "push layout" );
@@ -147,7 +147,7 @@ int main() {
 		Dev<uint16_t> dt( table );
 		Dev<int> di( ids );
 		Dev<half_t> dout( static_cast<size_t>( rows * hs ) );
-		EmbedParams p{ dt.addr(), di.addr(), dout.addr(), hs };
+		EmbedParams p{ dt.addr(), di.addr(), dout.addr(), hs, vocab };
 		vk::dispatch( nullptr, pl, &p, ( hs + 255 ) / 256, rows );
 		stream_sync( nullptr );
 		std::vector<double> ref( size_t( rows ) * hs );

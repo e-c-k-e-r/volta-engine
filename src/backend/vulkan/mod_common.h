@@ -37,7 +37,7 @@ struct HeadNormParams { uint64_t qk, weight; int num_heads, head_dim, has_weight
 struct AddParams { uint64_t hidden, residual; int n; };
 struct SwigluParams { uint64_t gate, up, out_; int n; float limit; int gelu; };
 struct SwigluFusedParams { uint64_t gate_up, out_; int inter_dim, total; float limit; };
-struct EmbedParams { uint64_t table, token_ids, out_; int hidden_size; };
+struct EmbedParams { uint64_t table, token_ids, out_; int hidden_size, rows; };
 struct RopeParams { uint64_t q, k, pos; int num_q_heads, num_kv_heads, head_dim, rot_dim, interleaved; float freq_base; int rot_pairs; };
 struct NormF32Params { uint64_t src, dst, weight; int hidden_size, has_weight; float eps, bias; };
 struct AddNormedParams { uint64_t resid, y, weight; int hidden_size, has_weight; float eps, bias, scale; };

@@ -8,7 +8,7 @@ namespace engine::modules {
 void Embedding::forward( const pod::TensorView& table, const int* token_ids, int count, pod::TensorView& out, backend::stream_t ) {
 	ENGINE_ASSERT( table.dtype == pod::DType::BF16, "Embedding::forward expects a BF16 table" );
 	const int hidden = table.shape[1];
-	EmbedParams p{ const_cast<uint16_t*>( table.ptr<const uint16_t>() ), const_cast<int*>( token_ids ), out.ptr<half>(), hidden };
+	EmbedParams p{ const_cast<uint16_t*>( table.ptr<const uint16_t>() ), const_cast<int*>( token_ids ), out.ptr<half>(), hidden, table.shape[0] };
 	impl::cpu_dispatch( ::embed_tokens, &p, ( hidden + 255 ) / 256, count );
 }
 

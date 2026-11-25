@@ -198,7 +198,8 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	target_compile_definitions(engine_vk_modules PRIVATE SLANG_SPV_DIR="${PROJECT_BINARY_DIR}/slang")
 	set(ENGINE_VK_OBJECTS $<TARGET_OBJECTS:engine_vk_host> $<TARGET_OBJECTS:engine_vk_modules>)
 
-	add_executable(test_vulkan_smoke tests/2_parity/test_vulkan_smoke.cpp $<TARGET_OBJECTS:engine_vk_modules>)
+	# the module objects without the host ones, but for the GGUF block table their stubs size weights with
+	add_executable(test_vulkan_smoke tests/2_parity/test_vulkan_smoke.cpp src/loader/gguf_types.cpp $<TARGET_OBJECTS:engine_vk_modules>)
 	target_link_libraries(test_vulkan_smoke PRIVATE engine_backend_vulkan)
 	add_dependencies(test_vulkan_smoke slang_kernels)
 

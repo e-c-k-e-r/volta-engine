@@ -283,7 +283,9 @@ calibration mixed by their token counts; `tests/tools/hess_merge.py --out DIR --
   around its minimum; a projection after the first in a group, or a layer's next expert down projection, starts the fine grid at the previous one's
   scale and runs the coarse grid only when the minimum lands on an edge; `--scale-search hint`, the default, takes that previous one as it is, `light`
   tries three scales around it on a lighter sample first, `full` runs the fine grid); its block LDL factor is that of the Hessian with its own input
-  scales folded in (exllamav3 1.6.7's `scaled_hessian`; `--no-scaled-hessian`: one factor of the sign-flipped Hessian per input); the 16-row blocks
+  scales folded in (exllamav3 1.6.7's `scaled_hessian`; `--no-scaled-hessian`: one factor of the sign-flipped Hessian per input), its diagonal held
+  at 1e-3 of its mean before the Hadamard rotation (a channel the weight barely reads would otherwise fall below fp32 resolution once mixed
+  with live ones and fail the factorization); the 16-row blocks
   are quantized from the last to the first with the LDL error feedback; two rounds refit the stored scales (`suh`, `svh`) to the quantized weight in
   the Hessian metric. `--ldl-metric` weights each element's squared error in the Viterbi search by its row's diagonal of the block's LDL metric. The
   reported proxy error is tr(E^T H E) / tr(W^T H W) of what is stored, with the damping taken out of H.

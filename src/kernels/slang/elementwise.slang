@@ -71,8 +71,9 @@ void swiglu_fused(uint3 tid : SV_DispatchThreadID, uniform SwigluFusedParams p) 
 	}
 }
 
-// table: BF16 bits; grid x covers the hidden dimension, y is the row
-struct EmbedParams { uint16_t* table; int* token_ids; half* out_; int hidden_size; };
+// table: BF16 bits, `rows` of them; grid x covers the hidden dimension, y is the row. An id outside the table (the argmax of a row of NaN
+// logits is -1) reads row 0
+struct EmbedParams { uint16_t* table; int* token_ids; half* out_; int hidden_size; int rows; };
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -80,7 +81,8 @@ void embed_tokens(uint3 tid : SV_DispatchThreadID, uniform EmbedParams p) {
 	let col = int(tid.x);
 	let row = int(tid.y);
 	if (col < p.hidden_size) {
-		let src = int64_t(p.token_ids[row]) * p.hidden_size + col;
+		let t = p.token_ids[row];
+		let src = int64_t(t >= 0 && t < p.rows ? t : 0) * p.hidden_size + col;
 		p.out_[int64_t(row) * p.hidden_size + col] = half(asfloat(uint(p.table[src]) << 16));
 	}
 }

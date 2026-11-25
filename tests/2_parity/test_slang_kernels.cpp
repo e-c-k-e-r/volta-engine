@@ -201,13 +201,13 @@ int main() {
 		for ( auto& v : table ) { const float f = frand( 2.0f ); uint32_t bits; std::memcpy( &bits, &f, 4 ); v = static_cast<uint16_t>( bits >> 16 ); }
 		void* d_table = backend::device_malloc( table.size() * 2 );
 		backend::memcpy_sync( d_table, table.data(), table.size() * 2, backend::Copy::H2D );
-		int ids[count] = { 3, 511, 0, 77, 200, 5, 400 };
+		int ids[count] = { 3, 511, 0, 77, 200, -1, 400 };   // -1 (a NaN row's argmax): row 0 on both paths
 		void* d_ids = backend::device_malloc( sizeof( ids ) );
 		backend::memcpy_sync( d_ids, ids, sizeof( ids ), backend::Copy::H2D );
 		Buf o1( count * hidden ), o2( count * hidden );
 		pod::TensorView tt = pod::make_tensor_2d( d_table, pod::DType::BF16, vocab, hidden ), to = pod::make_tensor_2d( o1.d, pod::DType::FP16, count, hidden );
 		modules::Embedding::forward( tt, static_cast<const int*>( d_ids ), count, to, s );
-		slang_embed_tokens( d_table, d_ids, o2.d, hidden, count, s );
+		slang_embed_tokens( d_table, d_ids, o2.d, hidden, count, vocab, s );
 		backend::stream_sync( s );
 		pass = compare( "embed_tokens", o1.get(), o2.get() ) && pass;
 		backend::device_free( d_table );

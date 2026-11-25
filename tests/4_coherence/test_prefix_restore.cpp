@@ -1,7 +1,7 @@
-// Tier 2: a slot restored from a sequence snapshot continues exactly like a cold prefill. Prefills the first `cut`
-// tokens, snapshots the slot (recurrent state + KV rows), restores into other slots and prefills only the tail; the
-// next-token candidates and 16 greedy continuation tokens must match the cold run. An aligned cut (a multiple of the
-// prefill chunk) reproduces the cold chunk boundaries and must match bit for bit.
+// Tier 2: a slot restored from a sequence snapshot continues exactly like the slot it was saved from. Prefills the first
+// `cut` tokens, snapshots the slot (recurrent state + KV rows), restores into other slots and prefills only the tail; the
+// next-token candidates and the greedy continuation must match, bit for bit, the same two-part prefill without a snapshot
+// (which differs from the cold run where the chunk or prefill-window boundaries move with the cut; printed for reference).
 //   test_prefix_restore [--model qwen3_5 | qwen4_exp | glm5_next | gemma4 | DIR] [--draft <dir>] [--spec] [--tokens N] [--cut N ...]   (ENGINE_KV_FORMAT=fp8|k8v4|nvfp4 selects a quantized KV cache; GLM stores its latent in that format)
 #include "engine/runtime/test_driver.h"
 #include "engine/runtime/prefix_cache.h"
@@ -188,6 +188,14 @@ int main( int argc, char** argv ) {
 			ENGINE_ASSERT( parent, "insert failed" );
 			pos = cp;
 		}
+		// Control: the slot that built the chain prefills the rest of the prompt. Its parts are not the cold run's (a prefill window
+		// spans the cut points there), so a restore must reproduce this control exactly, like the cuts above
+		Candidates chain_ctl_c;
+		const int chain_ctl_first = mc.prefill( ids.data() + 4096, n - 4096, 0, 0, &chain_ctl_c, 4096 );
+		const std::vector<int> chain_ctl = decode( mc, chain_ctl_first, n, 0, 48 );
+		float chain_ctl_vs_cold = 0.0f;
+		for ( int j = 0; j < chain_ctl_c.n; ++j ) chain_ctl_vs_cold = std::max( chain_ctl_vs_cold, std::fabs( chain_ctl_c.logits[j] - cold_c.logits[j] ) );
+		std::printf( "[*] chain prefill (1024, 2560, 4096, rest) vs cold: max |dlogit| %.4g, tokens %s\n", chain_ctl_vs_cold, chain_ctl == cold ? "identical" : "differ" );
 		const PrefixCache::Stats chain_stats = cache.stats();
 		const size_t flat = 3 * mc.snapshot_bytes( 0, 4096, true ) * mc.tp();
 		std::printf( "[*] chain of 3 snapshots holds %.0f MiB (3 flat snapshots of 4096 tokens: %.0f MiB)\n", chain_stats.bytes / 1048576.0, flat / 1048576.0 );
@@ -202,8 +210,8 @@ int main( int argc, char** argv ) {
 		const int chain_first = mc.prefill( ids.data() + 4096, n - 4096, cs, 0, &chain_c, 4096 );
 		const std::vector<int> chain_tokens = decode( mc, chain_first, n, cs, 48 );
 		float chain_diff = 0.0f;
-		for ( int j = 0; j < chain_c.n; ++j ) chain_diff = std::max( chain_diff, std::fabs( chain_c.logits[j] - cold_c.logits[j] ) );
-		expect( chain_tokens == cold && chain_diff < 0.25f, "a chain restore continues like the cold run" );
+		for ( int j = 0; j < chain_c.n; ++j ) chain_diff = std::max( chain_diff, std::fabs( chain_c.logits[j] - chain_ctl_c.logits[j] ) );
+		expect( chain_tokens == chain_ctl && chain_diff == 0.0f, "a chain restore continues like the chain's own prefill" );
 		std::printf( "    chain restore: max |dlogit| %.4g\n", chain_diff );
 
 		std::vector<int> other = prefix( 4096 );
@@ -244,8 +252,8 @@ int main( int argc, char** argv ) {
 			const int disk_first = mc.prefill( ids.data() + 4096, n - 4096, ds, 0, &disk_c, 4096 );
 			const std::vector<int> disk_tokens = decode( mc, disk_first, n, ds, 48 );
 			float disk_diff = 0.0f;
-			for ( int j = 0; j < disk_c.n; ++j ) disk_diff = std::max( disk_diff, std::fabs( disk_c.logits[j] - cold_c.logits[j] ) );
-			expect( disk_tokens == cold && disk_diff < 0.25f, "a restore from disk continues like the cold run" );
+			for ( int j = 0; j < disk_c.n; ++j ) disk_diff = std::max( disk_diff, std::fabs( disk_c.logits[j] - chain_ctl_c.logits[j] ) );
+			expect( disk_tokens == chain_ctl && disk_diff == 0.0f, "a restore from disk continues like the chain's own prefill" );
 			std::printf( "    disk restore: max |dlogit| %.4g\n", disk_diff );
 
 			// shared budget: a cache of another fingerprint under the same root evicts the oldest file of any directory first

@@ -15,6 +15,11 @@ namespace {
 #define NUM_THREADS 256
 #define NUM_THREADS_A 64
 
+// FP32 stream sums into FP16, saturated at the FP16 range (a row whose streams outgrow it, as a sink row's can, would turn into inf and,
+// through the norm after it, NaN); a NaN stays NaN
+__device__ __forceinline__ float sat_fp16( float x ) { return x > 65504.0f ? 65504.0f : x < -65504.0f ? -65504.0f : x; }
+__device__ __forceinline__ half2 sat_half2( float a, float b ) { return __floats2half2_rn( sat_fp16( a ), sat_fp16( b ) ); }
+
 // Per-row partial sums: up to MAX_ROWS rows x 64 chunks x (M + 1) values
 __device__ float g_mhc_partials[pod::MAX_ROWS * 64 * 25];
 
@@ -352,8 +357,8 @@ void hc_mix_finalize_body(
 		}
 		if ( HALF_OUT ) {
 			half2* out2 = (half2*)( static_cast<half*>( collapsed ) + static_cast<size_t>( r ) * out_stride );
-			out2[c * 2] = __floats2half2_rn( o.x, o.y );
-			out2[c * 2 + 1] = __floats2half2_rn( o.z, o.w );
+			out2[c * 2] = sat_half2( o.x, o.y );
+			out2[c * 2 + 1] = sat_half2( o.z, o.w );
 		}
 		else {
 			((float4*)( static_cast<float*>( collapsed ) + static_cast<size_t>( r ) * out_stride ))[c] = o;
@@ -772,8 +777,8 @@ __global__ void mhc_hyperhead_mean_kernel(
 			o.w += s.w;
 		}
 		half2* out2 = (half2*)( final_hidden + idx );
-		out2[0] = __floats2half2_rn( o.x * 0.25f, o.y * 0.25f );
-		out2[1] = __floats2half2_rn( o.z * 0.25f, o.w * 0.25f );
+		out2[0] = sat_half2( o.x * 0.25f, o.y * 0.25f );
+		out2[1] = sat_half2( o.z * 0.25f, o.w * 0.25f );
 	}
 }
 

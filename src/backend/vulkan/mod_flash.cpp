@@ -144,6 +144,15 @@ void DSA::select( const backend::half_t* scores, int score_stride, int* idx, int
 	vki::launch( "dsa_select", p, stream, rows );
 }
 
+// kv_shard's per-rank selection reads paged pools spread over the GPUs: CUDA only (the Vulkan backend has no shared token pool)
+void DSA::select_local( const backend::half_t*, int, int*, unsigned short*, int*, int, const pod::BatchRows*, const pod::KVPages&, backend::stream_t ) {
+	ENGINE_ASSERT( false, "DSA::select_local (Vulkan): kv_shard needs the CUDA backend" );
+}
+
+void DSA::select_merge( void* const*, int, int*, int*, int, const pod::BatchRows*, backend::stream_t ) {
+	ENGINE_ASSERT( false, "DSA::select_merge (Vulkan): kv_shard needs the CUDA backend" );
+}
+
 void Attention::forward_sparse( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
 	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, const int* idx, const int* nkeys, int idx_stride, backend::stream_t stream ) {
 	ENGINE_ASSERT( kv.ring == 0, "Attention::forward_sparse: no ring caches" );

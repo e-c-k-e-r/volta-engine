@@ -43,13 +43,13 @@ struct HeadNormParams { half* qk; half* weight; int num_heads; int head_dim; int
 struct AddParams { half* hidden; half* residual; int n; };
 struct SwigluParams { half* gate; half* up; half* out_; int n; float limit; int gelu; };
 struct SwigluFusedParams { half* gate_up; half* out_; int inter_dim; int total; float limit; };
-struct EmbedParams { uint16_t* table; int* token_ids; half* out_; int hidden_size; };
+struct EmbedParams { uint16_t* table; int* token_ids; half* out_; int hidden_size; int rows; };
 struct RopeParams { half* q; half* k; int* pos; int num_q_heads; int num_kv_heads; int head_dim; int rot_dim; int interleaved; float freq_base; int rot_pairs; };
 
 struct SumPlanesParams { half* planes; half* out_; int n; int groups; };
 struct AccumParams { half* accum; half* expert_out; float weight; int n; };
 struct ArgmaxParams { half* logits; int* out_idx; float* out_val; int numel; int batch_size; int index_offset; int row_stride; int has_val; };
-struct RouterParams { float* partials; half* bias; int* topk_idx; half* topk_w; int num_experts; int top_k; int k_slices; int max_slices; float scale; int has_bias; };
+struct RouterParams { float* partials; float* bias; int* topk_idx; half* topk_w; int num_experts; int top_k; int k_slices; int max_slices; float scale; int has_bias; };
 
 struct L2Params { half* qkv; int num_k_heads; int head_dim; int scale_q; int64_t row_stride; };
 struct GatesParams { half* norm_hidden; half* in_proj_a; half* in_proj_b; half* A_log; half* dt_bias; float* gate_out; float* beta_out; int num_v_heads; int hidden_size; int has_a_log; int has_dt_bias; };
@@ -187,7 +187,7 @@ int main() {
 		for ( size_t i = 0; i < table.size(); ++i ) { tf[i] = frand( 2.0f ); uint32_t b; std::memcpy( &b, &tf[i], 4 ); table[i] = b >> 16; }
 		int ids[count] = { 3, 63, 0, 17 };
 		std::vector<half> out( count * hs );
-		EmbedParams p{ table.data(), ids, out.data(), hs };
+		EmbedParams p{ table.data(), ids, out.data(), hs, vocab };
 		dispatch( embed_tokens, &p, ( hs + 255 ) / 256, count );
 		std::vector<double> ref( count * hs );
 		for ( int r = 0; r < count; ++r ) for ( int c = 0; c < hs; ++c ) {
@@ -252,7 +252,8 @@ int main() {
 		const int rows = 2, E = 288, K = 8, slices = 32, maxs = 32;
 		std::vector<float> partials( static_cast<size_t>( rows ) * maxs * 288 );
 		for ( auto& v : partials ) v = frand( 0.25f );
-		auto bias = make( E, 0.1f );
+		std::vector<float> bias( E );   // the selection bias, FP32
+		for ( auto& v : bias ) v = frand( 0.1f );
 		int idx[rows * K];
 		std::vector<half> w( rows * K );
 		RouterParams p{ partials.data(), bias.data(), idx, w.data(), E, K, slices, maxs, 2.5f, 1 };
@@ -264,7 +265,7 @@ int main() {
 			for ( int e = 0; e < E; ++e ) {
 				float logit = 0; for ( int ks = 0; ks < slices; ++ks ) logit += partials[( static_cast<size_t>( r ) * maxs + ks ) * 288 + e];
 				raw[e] = 1.0f / ( 1.0f + std::exp( -logit ) );
-				sel[e] = raw[e] + static_cast<float>( bias[e] );
+				sel[e] = raw[e] + bias[e];
 			}
 			std::vector<int> chosen; double total = 0;
 			for ( int k = 0; k < K; ++k ) {

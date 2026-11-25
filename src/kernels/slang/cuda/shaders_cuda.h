@@ -9,7 +9,7 @@ void slang_rms_norm_heads( void* qk, void* weight, int rows, int heads, int head
 void slang_add_residual( void* hidden, void* residual, int n, cudaStream_t s );
 void slang_swiglu( void* gate, void* up, void* out, int n, float limit, cudaStream_t s );
 void slang_swiglu_fused( void* gate_up, void* out, int inter_dim, int total, float limit, cudaStream_t s );
-void slang_embed_tokens( void* table_bf16, void* token_ids, void* out, int hidden, int rows, cudaStream_t s );
+void slang_embed_tokens( void* table_bf16, void* token_ids, void* out, int hidden, int rows, int vocab, cudaStream_t s );
 void slang_rope( void* q, void* k, void* pos, int rows, int q_heads, int kv_heads, int head_dim, int rot_dim, int interleaved, float base, cudaStream_t s );
 void slang_moe_sum_planes( void* planes, void* out, int n, int groups, cudaStream_t s );
 void slang_moe_accumulate( void* accum, void* expert_out, float weight, int n, cudaStream_t s );

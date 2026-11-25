@@ -141,6 +141,10 @@ __global__ void k_get_diag( const float* H, int k, float* d ) {
 	EXL3Q_LOOP( i, (size_t) k ) d[i] = H[i * k + i];
 }
 
+__global__ void k_floor_diag( float* H, int k, float v ) {
+	EXL3Q_LOOP( i, (size_t) k ) H[i * k + i] = fmaxf( H[i * k + i], v );
+}
+
 // X[r, c] scaled by v[r] (rows) or v[c] (cols), multiplied or divided
 __global__ void k_scale_rows( float* X, int rows, int cols, const float* v, bool divide ) {
 	EXL3Q_LOOP( i, (size_t) rows * cols ) {
@@ -798,11 +802,25 @@ double refit( Ctx& c, const float* W, float* Q, const float* H, int k, int n, fl
 
 // ---- factorization --------------------------------------------------------------------------------------------------------------------------
 
+// Floor of a scaled Hessian's diagonal, as a share of its mean (exllamav3 1.6.7+ scaled_ldl): an input channel the weight barely reads (its
+// scale orders of magnitude under the rest) takes its share of the damping down with it, and once the Hadamard mixes it with live channels
+// that falls below what fp32 resolves, so a matrix positive definite on paper stops factoring. Such channels are held far under the live
+// ones; an error left in them does not reach the output either way
+constexpr float kScaledDiagFloor = 1e-3f;
+
 // R (k x k, damped) times s on both sides, rotated by the Hadamard on both sides: P S R S P (s = the sign flips, or a projection's full input
-// scales: then the metric of its regularized weight)
-void rotate_hessian( Ctx& c, const float* H, const float* s, int k, float* R, float* tmp ) {
+// scales: then the metric of its regularized weight, its diagonal held at kScaledDiagFloor of its mean before the rotation)
+void rotate_hessian( Ctx& c, const float* H, const float* s, int k, float* R, float* tmp, bool scaled = false ) {
 	CUDA_CHECK( cudaMemcpyAsync( R, H, (size_t) k * k * sizeof( float ), cudaMemcpyDeviceToDevice, c.stream ) );
 	k_scale_sym<<<grid_for( (size_t) k * k ), 256, 0, c.stream>>>( R, k, s );
+	if ( scaled ) {
+		DBuf<float> dg( k );
+		ENGINE_ASSERT( dg.p, "exl3_quantize: no memory for the diagonal" );
+		k_get_diag<<<grid_for( k ), 256, 0, c.stream>>>( R, k, dg.p );
+		const auto d = to_host( dg.p, k, c.stream );
+		const double mean = std::accumulate( d.begin(), d.end(), 0.0 ) / k;
+		k_floor_diag<<<grid_for( k ), 256, 0, c.stream>>>( R, k, static_cast<float>( kScaledDiagFloor * mean ) );
+	}
 	had_right( c, R, tmp, k, k );
 	had_left( c, R, tmp, k, k );
 }
@@ -972,7 +990,7 @@ bool exl3_quantize_group( const Exl3InputFactor& f, const std::vector<const floa
 		if ( scaled ) {
 			// P diag(su) H diag(su) P with the full input scales (the global scale cancels in the block-normalized factor)
 			to_device( dsu.p, su[b], st );
-			rotate_hessian( c, f.H, dsu.p, k, R.p, Rtmp.p );
+			rotate_hessian( c, f.H, dsu.p, k, R.p, Rtmp.p, true );
 			if ( !block_ldl_factor( c, R.p, k, o.sigma_reg, Ls.p + kk * b, metric ? row_w.p + (size_t) k * b : nullptr ) ) {
 				exl3_encode_scratch_free( sc );
 				return false;
@@ -1076,7 +1094,7 @@ void projection_metric( Ctx& c, const float* h_sum, int64_t rows, const float* s
 	k_add_diag<<<grid_for( k ), 256, 0, c.stream>>>( tmp, k, static_cast<float>( sigma_reg * diag_mean ) );
 	DBuf<float> t2( kk );
 	ENGINE_ASSERT( t2.p, "exl3_quantize: no memory for the metric" );
-	rotate_hessian( c, tmp, su, k, R, t2.p );
+	rotate_hessian( c, tmp, su, k, R, t2.p, true );
 }
 
 } // namespace

@@ -56,7 +56,7 @@ struct HeadNormParams { half* qk; half* weight; int num_heads; int head_dim; int
 struct AddParams { half* hidden; half* residual; int n; };
 struct SwigluParams { half* gate; half* up; half* out_; int n; float limit; int gelu; };
 struct SwigluFusedParams { half* gate_up; half* out_; int inter_dim; int total; float limit; };
-struct EmbedParams { uint16_t* table; int* token_ids; half* out_; int hidden_size; };
+struct EmbedParams { uint16_t* table; int* token_ids; half* out_; int hidden_size; int rows; };
 struct RopeParams { half* q; half* k; int* pos; int num_q_heads; int num_kv_heads; int head_dim; int rot_dim; int interleaved; float freq_base; int rot_pairs; };
 struct NormF32Params { float* src; half* dst; half* weight; int hidden_size; int has_weight; float eps; float bias; };
 struct AddNormedParams { float* resid; half* y; half* weight; int hidden_size; int has_weight; float eps; float bias; float scale; };
