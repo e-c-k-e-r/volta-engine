@@ -23,7 +23,7 @@ Additional details are in [docs/GETTING_STARTED.md](/docs/GETTING_STARTED.md) (b
 
 ## Why?
 
-This aims to milk every drop of perf from my V100s with the realistic goal of serving GLM-5.3-Flash at acceptable quantization.
+This aims to milk every drop of perf from my V100s with the realistic goal of serving GLM-5.3-Flash as lossless-ly as possible.
 
 Most inference engines treat Volta (SM_70) as a second class citizen and fall back to eager, unfused kernels. Existing solutions do come with their pros and cons:
 * 1Cat-vLLM boasts the best performance out of the box, but only really guarantees that with NVFP4 weights and quite a hefty stack. Models that require higher quantization like GLM-5.3-Flash are boxed out (and solutions like `vllm-exl3` are severely capped).
@@ -33,11 +33,9 @@ Most inference engines treat Volta (SM_70) as a second class citizen and fall ba
 
 ### Why not?
 
-This project was slopped up over a weekend. CUDA is NOT my expertise (Vulkan is).
+This project is heavily slopped. Strict tests are in place to ensure lossless-ness and corrrectness, but those only go so far. A lot of the documentation is a heavy reflection of this slop.
 
-I don't intend to turn this into an actual project beyond a side-hobby, as existing solutions should be servicable enough for most people's usecases (in other words, I don't indend to extend this as a competitive engine).
-
-A slim amount of [models](/src/models/) and weight formats (EXL3, NVFP4, GGUF) are supported, but extending them shouldn't be too much of a hassle.
+I am *heavily* prone to sidequests with heavily experimental/exotic features (such as extended trellis quantization) whose mileage HEAVILY varies.
 
 Supported, tested configurations are narrow, as it's limited to what I currently have on hand, so gaps in coverage may exist. On the other side, some values may end up hard-coded, or undocumented, that may only pertain to a specific system used during development.
 
@@ -45,8 +43,8 @@ Supported, tested configurations are narrow, as it's limited to what I currently
 
 * models: Qwen3.8-27B, GLM-5.3-Flash, Qwen3.8-Flash-Next, Gemma 4 31B and DeepSeek-V4.1-Flash, plus MiniMax-H3 video + audio generation
 * weight formats: EXL3 (stock or Volta tile order), NVFP4 and GGUF, and EXL3 checkpoints with NVFP4 experts or dense groups swapped in at load
-* serving: OpenAI and Anthropic APIs with reasoning and tool-call parsing, a prefix cache in pinned host RAM, up to 256K context, a `/monitor` page
-* speculative decoding: DFlash2 / DFlash drafters, the checkpoint's own MTP head, DeepSeek's DSpark drafter, or suffix matching on the request's own text
+* serving: OpenAI and Anthropic APIs with reasoning and tool-call parsing, a prefix cache in pinned host RAM, a `/monitor` page
+* speculative decoding: MTP, DFlash(2), DSpark
 * image input on every text model
 * two-tier expert residency for the MoE models (hot experts on the GPUs, the rest in pinned host RAM)
 * backends: CUDA (SM_70, SM_86, SM_89), ROCm (RDNA), CPU and Vulkan
