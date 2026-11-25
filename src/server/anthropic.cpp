@@ -151,11 +151,8 @@ bool normalize_messages( const json& j, json* out, std::vector<std::string>* ima
 				else if ( type == "tool_result" ) {
 					flush();
 					json tc;
+					// is_error adds nothing to the text (OpenRouter passes an error result on as it is; Claude Code's text says what failed)
 					if ( !tool_content( b.contains( "content" ) ? b["content"] : json(), &tc, images, err ) ) return false;
-					if ( b.value( "is_error", false ) ) {
-						if ( tc.is_string() && !tc.get<std::string>().empty() ) tc = "Error: " + tc.get<std::string>();
-						else if ( tc.is_array() ) tc.insert( tc.begin(), { { "type", "text" }, { "text", "Error:" } } );
-					}
 					out->push_back( { { "role", "tool" }, { "tool_call_id", b.value( "tool_use_id", std::string() ) }, { "content", tc } } );
 				}
 				else {

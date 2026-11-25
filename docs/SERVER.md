@@ -54,8 +54,9 @@ The launch file (`--config`), `--set key=value`, `ENGINE_*` environment variable
   * an API reasoning effort (OpenAI `reasoning_effort`, Anthropic `output_config.effort`, which Claude Code sends as `high`) is mapped onto
     what the model's template accepts (GLM: low, high, or the template's max for xhigh / max; DeepSeek-V4.1: low 50, medium 60, high 75,
     max 100); a request without one gets the template's default
-  * system messages after the first turn (Claude Code's environment updates) stay system turns when the template renders one there (a probe
-    render per template); otherwise they become user turns, and leading system messages fold into the template's system prompt
+  * system messages before the first reply (Claude Code's environment block) join the system prompt, each on a new line; later ones
+    (its environment updates) stay system turns where the template renders one there (a probe render per template), else user turns
+  * a tool result's `is_error` adds nothing to its text
   * for Gemma 4 the tool results of consecutive tool messages go into one message's `tool_responses`, named after the calls they answer, as its template expects
   * without a loaded vision tower an image part becomes the text note `[image omitted: this model cannot view images]`, so a request with images still runs
 * `openai.cpp`, `anthropic.cpp`: the two protocol front ends. Each parses its payload into a chat request, and writes one response (streamed or not) from parsed pieces as they arrive.

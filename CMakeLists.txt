@@ -629,6 +629,11 @@ add_executable(test_tokenizer_file tests/2_parity/test_tokenizer_file.cpp)
 target_link_libraries(test_tokenizer_file PRIVATE engine_kernels)
 set_target_properties(test_tokenizer_file PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+# Recorded API requests rendered as the server would, from a checkpoint's tokenizer and chat template alone (no weights, no GPU)
+add_executable(render_requests tests/4_server/render_requests.cpp)
+target_link_libraries(render_requests PRIVATE engine_kernels)
+set_target_properties(render_requests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 add_executable(test_tokenizer tests/2_parity/test_tokenizer.cpp)
 target_link_libraries(test_tokenizer PRIVATE engine_kernels)
 set_target_properties(test_tokenizer PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

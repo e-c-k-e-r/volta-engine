@@ -49,11 +49,11 @@ std::string effort_for( engine::loader::ModelFamily fam, const std::string& e ) 
 }
 
 // Many chat templates accept a system message only at the start, but clients (Claude Code) also send system content later in
-// the conversation (its environment block and updates). Leading system messages are folded into one system message; a later
-// one stays a system message where the template renders one there, else it becomes a user message in place (later_as_user),
-// so the history stays append-only: the prompt of turn k+1 starts with the prompt of turn k, which is what the prefix cache
-// matches on. (Folding them all into the front would rewrite the system prompt every turn.) As a user turn it would also move
-// the template's last user message, before which some templates drop the reasoning of earlier replies
+// the conversation (its environment block after the first user message, updates further on). The system messages before the first
+// reply join the system prompt, each on a new line (as OpenRouter passes them on); a later one stays a system message where the
+// template renders one there, else it becomes a user message in place (later_as_user), so the history stays append-only: the
+// prompt of turn k+1 starts with the prompt of turn k, which is what the prefix cache matches on. (Folding them all into the front
+// would rewrite the system prompt every turn.)
 void fold_system_messages( nlohmann::ordered_json& messages, bool later_as_user ) {
 	auto text_of = []( const nlohmann::ordered_json& m ) {
 		std::string text;
@@ -64,15 +64,16 @@ void fold_system_messages( nlohmann::ordered_json& messages, bool later_as_user 
 	};
 	std::string system;
 	nlohmann::ordered_json out = nlohmann::ordered_json::array();
-	bool leading = true;
+	bool replied = false;
 	for ( const auto& m : messages ) {
-		const bool is_system = m.value( "role", std::string() ) == "system";
-		if ( is_system && leading ) {
+		const std::string role = m.value( "role", std::string() );
+		const bool is_system = role == "system";
+		if ( is_system && !replied ) {
 			const std::string text = text_of( m );
-			if ( !text.empty() ) system += ( system.empty() ? "" : "\n\n" ) + text;
+			if ( !text.empty() ) system += ( system.empty() ? "" : "\n" ) + text;
 			continue;
 		}
-		leading = false;
+		replied = replied || role == "assistant";
 		if ( is_system ) {
 			out.push_back( { { "role", later_as_user ? "user" : "system" }, { "content", text_of( m ) } } );
 			continue;
@@ -274,12 +275,17 @@ std::string unescape_prompt( const engine::loader::Tokenizer& tok, const std::st
 }
 
 // Prompt plus reply tokens a request can hold: generation stops one verify block (MAX_BATCH rows) short of the window
-int reply_window( engine::runtime::Generator& gen ) {
-	return gen.max_context() - pod::MAX_BATCH - 1;
+int reply_window( int max_context ) {
+	return max_context - pod::MAX_BATCH - 1;
 }
 
-bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ImageList* images, ApiError* err ) {
-	const auto family = gen.chat_template().model_family();
+PromptModel prompt_model( engine::runtime::Generator& gen ) {
+	return { gen.chat_template(), gen.tokenizer(), gen.vision_params(), gen.max_context(),
+		[&gen]( const engine::runtime::GenerationRequest::Image& im ) { gen.prefetch_image( im ); } };
+}
+
+bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ImageList* images, ApiError* err ) {
+	const auto family = m.chat_template.model_family();
 
 	bool thinking = req.enable_thinking >= 0 ? req.enable_thinking != 0 : cfg.default_enable_thinking;
 	const std::string effort = effort_for( family, req.reasoning_effort );
@@ -291,13 +297,13 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 		err->message = "messages could not be normalized";
 		return false;
 	}
-	if ( vars["messages"].is_array() ) fold_system_messages( vars["messages"], !takes_later_system( gen.chat_template() ) );
+	if ( vars["messages"].is_array() ) fold_system_messages( vars["messages"], !takes_later_system( m.chat_template ) );
 	// Without a vision tower an image part becomes a note in the text, so an agent that reads an image file carries on instead of failing
-	const bool see = !req.images.empty() && gen.vision_params() && gen.tokenizer().get_special_token( image_pad_name( family ) ) >= 0;
+	const bool see = !req.images.empty() && m.vision && m.tokenizer.get_special_token( image_pad_name( family ) ) >= 0;
 	if ( !req.images.empty() && !see && vars["messages"].is_array() ) omit_images( vars["messages"] );
 	if ( family == engine::loader::ModelFamily::GEMMA ) {
 		if ( vars["messages"].is_array() ) gemma_tool_messages( vars["messages"] );
-		vars["bos_token"] = gen.tokenizer().decode_token( gen.tokenizer().get_special_token( "<bos>" ) );
+		vars["bos_token"] = m.tokenizer.decode_token( m.tokenizer.get_special_token( "<bos>" ) );
 	}
 	// tool_choice required / named: say so on the last user turn (not after a tool result, or the model would loop on it)
 	if ( !req.tools_json.empty() && ( req.require_tool || !req.force_tool.empty() ) && vars["messages"].is_array() && !vars["messages"].empty() &&
@@ -314,23 +320,23 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 	if ( !effort.empty() ) vars["reasoning_effort"] = effort;
 
 	{
-		const std::vector<std::string> ctl = gen.tokenizer().control_tokens();
+		const std::vector<std::string> ctl = m.tokenizer.control_tokens();
 		escape_control_text( vars["messages"], ctl );
 		if ( vars.contains( "tools" ) ) escape_control_text( vars["tools"], ctl );
 	}
 	// After the escaping: the markers are the model's own special tokens, not text a user typed
 	if ( family == engine::loader::ModelFamily::GLM && see && vars["messages"].is_array() ) inline_glm_image_markers( vars["messages"] );
 	std::string terr;
-	if ( !gen.chat_template().render_json( vars.dump(), prompt, &terr ) ) {
+	if ( !m.chat_template.render_json( vars.dump(), prompt, &terr ) ) {
 		err->message = "the chat template rejected this conversation: " + terr;
 		return false;
 	}
 	// The GLM template always opens <think>; non-thinking mode closes it right away (GLM-4.5 convention)
 	if ( !thinking && family == engine::loader::ModelFamily::GLM && ends_with( *prompt, "<think>" ) ) *prompt += "</think>";
-	*tokens = encode_prompt( gen.tokenizer(), *prompt );
+	*tokens = encode_prompt( m.tokenizer, *prompt );
 	if ( see ) {
-		const engine::loader::VisionParams* vp = gen.vision_params();
-		const int pad_id = gen.tokenizer().get_special_token( image_pad_name( family ) );
+		const engine::loader::VisionParams* vp = m.vision;
+		const int pad_id = m.tokenizer.get_special_token( image_pad_name( family ) );
 		for ( const std::string& bytes : req.images ) {
 			engine::loader::DecodedImage dec;
 			auto prep = std::make_shared<engine::loader::PreparedImage>();
@@ -355,9 +361,9 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 			return false;
 		}
 		// vision_cpu encodes here, on the request's own thread, before the request queues for a slot
-		for ( const auto& im : *images ) gen.prefetch_image( im );
+		if ( m.prefetch_image ) for ( const auto& im : *images ) m.prefetch_image( im );
 		int img_begin = -1, img_end = -1;
-		image_markers( family, gen.tokenizer(), &img_begin, &img_end );
+		image_markers( family, m.tokenizer, &img_begin, &img_end );
 		*tokens = expand_image_tokens( *tokens, pad_id, *images, img_begin, img_end );
 		int at = 0, k = 0;
 		for ( size_t i = 0; i < tokens->size(); ++i ) {
@@ -369,9 +375,9 @@ bool render_prompt( engine::runtime::Generator& gen, const ServerConfig& cfg, co
 			}
 		}
 	}
-	const int ctx = gen.max_context();
-	if ( req.strict_context && static_cast<int>( tokens->size() ) >= reply_window( gen ) ) {
-		err->message = "prompt is too long: " + std::to_string( tokens->size() ) + " tokens > " + std::to_string( reply_window( gen ) ) + " maximum";
+	const int ctx = m.max_context;
+	if ( req.strict_context && static_cast<int>( tokens->size() ) >= reply_window( ctx ) ) {
+		err->message = "prompt is too long: " + std::to_string( tokens->size() ) + " tokens > " + std::to_string( reply_window( ctx ) ) + " maximum";
 		return false;
 	}
 	if ( tokens->empty() || static_cast<int>( tokens->size() ) + 1 >= ctx ) {
@@ -395,12 +401,22 @@ void dump_prompt( engine::runtime::Generator& gen, const std::string& prompt, ui
 
 } // namespace
 
+bool render_chat_prompt( const PromptModel& model, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens,
+	ApiError* err ) {
+	ImageList images;
+	return render_prompt( model, cfg, req, prompt, tokens, &images, err );
+}
+
+std::string shown_prompt( const engine::loader::Tokenizer& tok, const std::string& prompt ) {
+	return unescape_prompt( tok, prompt );
+}
+
 bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, uint64_t request_id, int* tokens,
 	ApiError* err ) {
 	std::string prompt;
 	std::vector<int> ids;
 	ImageList images;
-	if ( !render_prompt( gen, cfg, req, &prompt, &ids, &images, err ) ) return false;
+	if ( !render_prompt( prompt_model( gen ), cfg, req, &prompt, &ids, &images, err ) ) return false;
 	dump_prompt( gen, prompt, request_id );
 	*tokens = static_cast<int>( ids.size() );
 	return true;
@@ -424,7 +440,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	std::string prompt;
 	std::vector<int> tokens;
 	ImageList images;
-	if ( !render_prompt( gen, cfg, req, &prompt, &tokens, &images, err ) ) return false;
+	if ( !render_prompt( prompt_model( gen ), cfg, req, &prompt, &tokens, &images, err ) ) return false;
 	responder->on_prompt( static_cast<int>( tokens.size() ) );
 	dump_prompt( gen, prompt, request_id );
 
@@ -433,9 +449,9 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		OutputParser( family, in_reasoning, tool_schemas_from_json( req.tools_json ) ), std::move( responder ), conn );
 
 	const int max_tokens = req.max_tokens > 0 ? req.max_tokens : cfg.default_max_tokens;
-	if ( req.strict_context && static_cast<int>( tokens.size() ) + max_tokens > reply_window( gen ) ) {
+	if ( req.strict_context && static_cast<int>( tokens.size() ) + max_tokens > reply_window( gen.max_context() ) ) {
 		err->message = "input length and `max_tokens` exceed context limit: " + std::to_string( tokens.size() ) + " + " + std::to_string( max_tokens ) + " > " +
-			std::to_string( reply_window( gen ) ) + ", decrease input length or `max_tokens` and try again";
+			std::to_string( reply_window( gen.max_context() ) ) + ", decrease input length or `max_tokens` and try again";
 		return false;
 	}
 

@@ -110,6 +110,23 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, uint64_t request_id, int* tokens,
 	ApiError* err );
 
+// What rendering a request reads from the model: its chat template, tokenizer, vision tower (nullptr: an image becomes a note in the
+// text) and context window. The server takes them from its generator; tools without weights load the template and tokenizer alone
+struct PromptModel {
+	const engine::loader::ChatTemplate& chat_template;
+	const engine::loader::Tokenizer& tokenizer;
+	const engine::loader::VisionParams* vision = nullptr;
+	int max_context = 0;
+	std::function<void( const engine::runtime::GenerationRequest::Image& )> prefetch_image;   // vision_cpu: encode before the request queues
+};
+
+// The prompt a request renders to, as the server feeds it to the model (prompt text with special tokens escaped, and its token ids)
+bool render_chat_prompt( const PromptModel& model, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens,
+	ApiError* err );
+
+// The prompt text with its special tokens as their text (what dump_requests writes)
+std::string shown_prompt( const engine::loader::Tokenizer& tok, const std::string& prompt );
+
 // Protocol front ends (openai.cpp, anthropic.cpp)
 class ChatProtocol {
 public:
