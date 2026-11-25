@@ -122,6 +122,81 @@ bool normalize_messages( const json& messages, json* out, std::vector<std::strin
 	return true;
 }
 
+// The sampling and generation fields both OpenAI endpoints take (chat and text completion), extensions included
+bool generation_options( const json& j, ChatRequest* r, ApiError* err ) {
+	if ( j.contains( "temperature" ) && j["temperature"].is_number() ) {
+		r->temperature = j["temperature"].get<float>();
+		if ( r->temperature < 0.0f || r->temperature > 2.0f ) return fail( err, "temperature must be between 0 and 2" );
+	}
+	if ( j.contains( "top_p" ) && j["top_p"].is_number() ) r->top_p = j["top_p"].get<float>();
+	if ( j.contains( "top_k" ) && j["top_k"].is_number_integer() ) r->top_k = j["top_k"].get<int>();
+	if ( j.contains( "seed" ) && j["seed"].is_number_integer() ) r->seed = j["seed"].get<uint64_t>();
+	for ( const char* key : { "presence_penalty", "frequency_penalty" } ) {
+		if ( j.contains( key ) && j[key].is_number() ) {
+			const float v = j[key].get<float>();
+			if ( v < -2.0f || v > 2.0f ) return fail( err, std::string( key ) + " must be between -2 and 2" );
+			( key[0] == 'p' ? r->presence_penalty : r->frequency_penalty ) = v;
+		}
+	}
+	if ( j.contains( "repetition_penalty" ) && j["repetition_penalty"].is_number() ) {
+		r->repetition_penalty = j["repetition_penalty"].get<float>();
+		if ( r->repetition_penalty <= 0.0f ) return fail( err, "repetition_penalty must be positive" );
+	}
+	if ( j.contains( "stop" ) ) {
+		if ( j["stop"].is_string() ) r->stop.push_back( j["stop"].get<std::string>() );
+		else if ( j["stop"].is_array() ) {
+			for ( const auto& s : j["stop"] ) {
+				if ( !s.is_string() ) return fail( err, "stop must be a string or an array of strings" );
+				r->stop.push_back( s.get<std::string>() );
+			}
+		}
+		else if ( !j["stop"].is_null() ) return fail( err, "stop must be a string or an array of strings" );
+	}
+	if ( j.contains( "stop_on_loop" ) && j["stop_on_loop"].is_boolean() ) r->stop_on_loop = j["stop_on_loop"].get<bool>() ? 1 : 0;
+	r->stream = j.value( "stream", false );
+	if ( j.contains( "stream_options" ) && j["stream_options"].is_object() ) r->include_usage = j["stream_options"].value( "include_usage", false );
+	// runtime steering (server option steer): a control-vector file by name, its strength and scope, and the reflection-marker logit penalty
+	if ( j.contains( "steer_vector" ) && j["steer_vector"].is_string() ) r->steer_vector = j["steer_vector"].get<std::string>();
+	if ( j.contains( "steer_scale" ) && j["steer_scale"].is_number() ) r->steer_scale = j["steer_scale"].get<float>();
+	if ( j.contains( "steer_scope" ) && j["steer_scope"].is_string() ) r->steer_scope = j["steer_scope"].get<std::string>();
+	if ( j.contains( "priority" ) && j["priority"].is_number_integer() ) r->priority = j["priority"].get<int>();
+	if ( j.contains( "probes" ) ) {
+		if ( j["probes"].is_string() ) {
+			const std::string v = j["probes"].get<std::string>();
+			for ( size_t p = 0; p < v.size(); ) {
+				const size_t q = std::min( v.find( ',', p ), v.size() );
+				if ( q > p ) r->probes.push_back( v.substr( p, q - p ) );
+				p = q + 1;
+			}
+		}
+		else if ( j["probes"].is_array() ) {
+			for ( const auto& x : j["probes"] ) {
+				if ( !x.is_string() ) return fail( err, "probes must be a string or an array of strings" );
+				r->probes.push_back( x.get<std::string>() );
+			}
+		}
+		else return fail( err, "probes must be a string or an array of strings" );
+	}
+	if ( j.contains( "steer_gate_threshold" ) && j["steer_gate_threshold"].is_number() ) r->probe_threshold = j["steer_gate_threshold"].get<float>();
+	if ( j.contains( "steer_edit_strength" ) && j["steer_edit_strength"].is_number() ) r->probe_edit_strength = j["steer_edit_strength"].get<float>();
+	if ( j.contains( "steer_hedge_strength" ) && j["steer_hedge_strength"].is_number() ) r->probe_hedge_strength = j["steer_hedge_strength"].get<float>();
+	if ( j.contains( "steer_push" ) && j["steer_push"].is_number() ) r->probe_push = j["steer_push"].get<float>();
+	if ( j.contains( "steer_directions" ) && j["steer_directions"].is_number() ) r->probe_directions = j["steer_directions"].get<float>();
+	if ( j.contains( "steer_keep_norm" ) && ( j["steer_keep_norm"].is_number() || j["steer_keep_norm"].is_boolean() ) ) r->probe_keep_norm = j["steer_keep_norm"].is_boolean() ? ( j["steer_keep_norm"].get<bool>() ? 1.0f : 0.0f ) : j["steer_keep_norm"].get<float>();
+	if ( j.contains( "steer_edit_layers" ) && j["steer_edit_layers"].is_string() ) r->probe_edit_layers = j["steer_edit_layers"].get<std::string>();
+	if ( j.contains( "steer_probe" ) && j["steer_probe"].is_boolean() ) r->steer_probe = j["steer_probe"].get<bool>();
+	if ( j.contains( "think_penalty" ) && j["think_penalty"].is_number() ) r->think_penalty = j["think_penalty"].get<float>();
+	return true;
+}
+
+json usage_json( const Usage& u ) {
+	json j = { { "prompt_tokens", u.prompt_tokens }, { "completion_tokens", u.completion_tokens }, { "total_tokens", u.prompt_tokens + u.completion_tokens }, { "prompt_tokens_details", { { "cached_tokens", u.cached_tokens } } },
+		{ "ttft_ms", u.ttft_ms }, { "decode_tok_s", u.decode_tok_s } };
+	if ( u.gate_score >= 0.0f || u.gate_fired ) j["steer_gate"] = { { "score", u.gate_score }, { "fired", u.gate_fired } };
+	if ( !u.probes.empty() ) j["probes"] = probes_json( u.probes );
+	return j;
+}
+
 class OpenAIResponder : public Responder {
 public:
 	OpenAIResponder( const ChatRequest& req, ConnPtr conn, uint64_t id )
@@ -212,14 +287,6 @@ private:
 		return { { "id", completion_id_ }, { "object", "chat.completion.chunk" }, { "created", created_ }, { "model", model_ } };
 	}
 
-	static json usage_json( const Usage& u ) {
-		json j = { { "prompt_tokens", u.prompt_tokens }, { "completion_tokens", u.completion_tokens }, { "total_tokens", u.prompt_tokens + u.completion_tokens }, { "prompt_tokens_details", { { "cached_tokens", u.cached_tokens } } },
-			{ "ttft_ms", u.ttft_ms }, { "decode_tok_s", u.decode_tok_s } };
-		if ( u.gate_score >= 0.0f || u.gate_fired ) j["steer_gate"] = { { "score", u.gate_score }, { "fired", u.gate_fired } };
-		if ( !u.probes.empty() ) j["probes"] = probes_json( u.probes );
-		return j;
-	}
-
 	bool sse( const json& j ) { return conn_->write_all( "data: " + dump_safe( j ) + "\n\n" ); }
 
 	bool ensure_started() {
@@ -285,8 +352,6 @@ public:
 			if ( tc.is_string() && tc == "required" ) r.require_tool = true;
 			else if ( tc.is_object() && tc.contains( "function" ) && tc["function"].is_object() ) r.force_tool = tc["function"].value( "name", std::string() );
 		}
-		r.stream = j.value( "stream", false );
-		if ( j.contains( "stream_options" ) && j["stream_options"].is_object() ) r.include_usage = j["stream_options"].value( "include_usage", false );
 		for ( const char* key : { "max_completion_tokens", "max_tokens" } ) {
 			if ( j.contains( key ) && j[key].is_number_integer() ) {
 				r.max_tokens = j[key].get<int>();
@@ -294,20 +359,7 @@ public:
 				break;
 			}
 		}
-		if ( j.contains( "temperature" ) && j["temperature"].is_number() ) {
-			r.temperature = j["temperature"].get<float>();
-			if ( r.temperature < 0.0f || r.temperature > 2.0f ) return fail( err, "temperature must be between 0 and 2" );
-		}
-		if ( j.contains( "top_p" ) && j["top_p"].is_number() ) r.top_p = j["top_p"].get<float>();
-		if ( j.contains( "top_k" ) && j["top_k"].is_number_integer() ) r.top_k = j["top_k"].get<int>();
-		if ( j.contains( "seed" ) && j["seed"].is_number_integer() ) r.seed = j["seed"].get<uint64_t>();
-		for ( const char* key : { "presence_penalty", "frequency_penalty" } ) {
-			if ( j.contains( key ) && j[key].is_number() ) {
-				const float v = j[key].get<float>();
-				if ( v < -2.0f || v > 2.0f ) return fail( err, std::string( key ) + " must be between -2 and 2" );
-				( key[0] == 'p' ? r.presence_penalty : r.frequency_penalty ) = v;
-			}
-		}
+		if ( !generation_options( j, &r, err ) ) return false;
 		if ( j.value( "logprobs", false ) ) {
 			r.logprobs = 0;
 			if ( j.contains( "top_logprobs" ) && j["top_logprobs"].is_number_integer() ) {
@@ -315,21 +367,6 @@ public:
 				if ( r.logprobs < 0 || r.logprobs > 20 ) return fail( err, "top_logprobs must be between 0 and 20" );
 			}
 		}
-		if ( j.contains( "repetition_penalty" ) && j["repetition_penalty"].is_number() ) {
-			r.repetition_penalty = j["repetition_penalty"].get<float>();
-			if ( r.repetition_penalty <= 0.0f ) return fail( err, "repetition_penalty must be positive" );
-		}
-		if ( j.contains( "stop" ) ) {
-			if ( j["stop"].is_string() ) r.stop.push_back( j["stop"].get<std::string>() );
-			else if ( j["stop"].is_array() ) {
-				for ( const auto& s : j["stop"] ) {
-					if ( !s.is_string() ) return fail( err, "stop must be a string or an array of strings" );
-					r.stop.push_back( s.get<std::string>() );
-				}
-			}
-			else if ( !j["stop"].is_null() ) return fail( err, "stop must be a string or an array of strings" );
-		}
-		if ( j.contains( "stop_on_loop" ) && j["stop_on_loop"].is_boolean() ) r.stop_on_loop = j["stop_on_loop"].get<bool>() ? 1 : 0;
 		if ( j.contains( "reasoning_effort" ) && j["reasoning_effort"].is_string() ) r.reasoning_effort = j["reasoning_effort"].get<std::string>();
 		for ( const char* key : { "thinking_budget_tokens", "max_reasoning_tokens" } ) {
 			if ( j.contains( key ) && j[key].is_number_integer() ) r.thinking_budget = j[key].get<int>();
@@ -339,37 +376,6 @@ public:
 			const json& k = j["chat_template_kwargs"];
 			if ( k.contains( "enable_thinking" ) && k["enable_thinking"].is_boolean() ) r.enable_thinking = k["enable_thinking"].get<bool>() ? 1 : 0;
 		}
-		// runtime steering (server option steer): a control-vector file by name, its strength and scope, and the reflection-marker logit penalty
-		if ( j.contains( "steer_vector" ) && j["steer_vector"].is_string() ) r.steer_vector = j["steer_vector"].get<std::string>();
-		if ( j.contains( "steer_scale" ) && j["steer_scale"].is_number() ) r.steer_scale = j["steer_scale"].get<float>();
-		if ( j.contains( "steer_scope" ) && j["steer_scope"].is_string() ) r.steer_scope = j["steer_scope"].get<std::string>();
-		if ( j.contains( "priority" ) && j["priority"].is_number_integer() ) r.priority = j["priority"].get<int>();
-		if ( j.contains( "probes" ) ) {
-			if ( j["probes"].is_string() ) {
-				const std::string v = j["probes"].get<std::string>();
-				for ( size_t p = 0; p < v.size(); ) {
-					const size_t q = std::min( v.find( ',', p ), v.size() );
-					if ( q > p ) r.probes.push_back( v.substr( p, q - p ) );
-					p = q + 1;
-				}
-			}
-			else if ( j["probes"].is_array() ) {
-				for ( const auto& x : j["probes"] ) {
-					if ( !x.is_string() ) return fail( err, "probes must be a string or an array of strings" );
-					r.probes.push_back( x.get<std::string>() );
-				}
-			}
-			else return fail( err, "probes must be a string or an array of strings" );
-		}
-		if ( j.contains( "steer_gate_threshold" ) && j["steer_gate_threshold"].is_number() ) r.probe_threshold = j["steer_gate_threshold"].get<float>();
-		if ( j.contains( "steer_edit_strength" ) && j["steer_edit_strength"].is_number() ) r.probe_edit_strength = j["steer_edit_strength"].get<float>();
-		if ( j.contains( "steer_hedge_strength" ) && j["steer_hedge_strength"].is_number() ) r.probe_hedge_strength = j["steer_hedge_strength"].get<float>();
-		if ( j.contains( "steer_push" ) && j["steer_push"].is_number() ) r.probe_push = j["steer_push"].get<float>();
-		if ( j.contains( "steer_directions" ) && j["steer_directions"].is_number() ) r.probe_directions = j["steer_directions"].get<float>();
-		if ( j.contains( "steer_keep_norm" ) && ( j["steer_keep_norm"].is_number() || j["steer_keep_norm"].is_boolean() ) ) r.probe_keep_norm = j["steer_keep_norm"].is_boolean() ? ( j["steer_keep_norm"].get<bool>() ? 1.0f : 0.0f ) : j["steer_keep_norm"].get<float>();
-		if ( j.contains( "steer_edit_layers" ) && j["steer_edit_layers"].is_string() ) r.probe_edit_layers = j["steer_edit_layers"].get<std::string>();
-		if ( j.contains( "steer_probe" ) && j["steer_probe"].is_boolean() ) r.steer_probe = j["steer_probe"].get<bool>();
-		if ( j.contains( "think_penalty" ) && j["think_penalty"].is_number() ) r.think_penalty = j["think_penalty"].get<float>();
 		*out = std::move( r );
 		return true;
 	}
@@ -379,8 +385,177 @@ public:
 	}
 };
 
+// Code points in UTF-8 text (the legacy logprobs' text_offset counts characters)
+size_t utf8_chars( const std::string& s ) {
+	size_t n = 0;
+	for ( unsigned char c : s ) n += ( c & 0xC0 ) != 0x80;
+	return n;
+}
+
+// OpenAI's legacy text completion (/v1/completions): choices[].text, the legacy logprobs object (tokens, token_logprobs, top_logprobs,
+// text_offset), streamed as text_completion chunks
+class CompletionResponder : public Responder {
+public:
+	CompletionResponder( const ChatRequest& req, ConnPtr conn, uint64_t id )
+		: conn_( std::move( conn ) ), stream_( req.stream ), include_usage_( req.include_usage ), logprobs_( req.logprobs >= 0 ), echo_( req.echo ), model_( req.model ),
+		  created_( static_cast<int64_t>( std::time( nullptr ) ) ) {
+		completion_id_ = "cmpl-" + std::to_string( id );
+	}
+
+	void on_raw_prompt( const std::string& text ) override {
+		if ( !echo_ ) return;
+		prefix_ = text;
+		offset_ = utf8_chars( text );
+	}
+
+	bool on_event( const OutputEvent& ev ) override {
+		if ( ev.type != OutputEvent::Type::Content ) return true;
+		if ( !stream_ ) {
+			text_ += ev.text;
+			return true;
+		}
+		return send_text( ev.text, nullptr );
+	}
+
+	bool on_wait() override {
+		if ( !stream_ ) return true;
+		if ( !ensure_started() ) return false;
+		const auto now = std::chrono::steady_clock::now();
+		if ( now - last_ping_ < std::chrono::seconds( 10 ) ) return true;
+		last_ping_ = now;
+		return conn_->write_all( ": keepalive\n\n" );
+	}
+
+	void on_logprobs( const std::vector<LogprobOut>& entries ) override {
+		for ( const LogprobOut& e : entries ) {
+			json top = json::object();
+			for ( const auto& t : e.top ) top[t.first] = t.second;
+			lp_.tokens.push_back( e.token );
+			lp_.values.push_back( e.logprob );
+			lp_.top.push_back( std::move( top ) );
+			lp_.offsets.push_back( offset_ );
+			offset_ += utf8_chars( e.token );
+		}
+	}
+
+	void on_finish( engine::runtime::FinishReason reason, const std::string&, bool, const Usage& usage ) override {
+		using engine::runtime::FinishReason;
+		const char* finish = reason == FinishReason::Length ? "length" : "stop";
+		if ( reason == FinishReason::Cancelled || conn_->closed() ) {
+			conn_->close_now();
+			return;
+		}
+		if ( stream_ ) {
+			if ( !ensure_started() || !send_text( "", finish ) ) return;
+			if ( include_usage_ ) {
+				json u = chunk();
+				u["choices"] = json::array();
+				u["usage"] = usage_json( usage );
+				if ( !sse( u ) ) return;
+			}
+			conn_->write_all( "data: [DONE]\n\n" );
+			conn_->finish();
+			return;
+		}
+		json choice = { { "text", prefix_ + text_ }, { "index", 0 }, { "logprobs", logprobs_ ? take_logprobs() : json( nullptr ) }, { "finish_reason", finish } };
+		json resp = { { "id", completion_id_ }, { "object", "text_completion" }, { "created", created_ }, { "model", model_ },
+			{ "choices", json::array( { choice } ) }, { "usage", usage_json( usage ) } };
+		send_json( conn_, 200, dump_safe( resp ) );
+	}
+
+private:
+	struct Logprobs {
+		json tokens = json::array(), values = json::array(), top = json::array(), offsets = json::array();
+	};
+
+	json chunk() const { return { { "id", completion_id_ }, { "object", "text_completion" }, { "created", created_ }, { "model", model_ } }; }
+
+	// the entries gathered since the last call, as the legacy logprobs object
+	json take_logprobs() {
+		json j = { { "tokens", lp_.tokens }, { "token_logprobs", lp_.values }, { "top_logprobs", lp_.top }, { "text_offset", lp_.offsets } };
+		lp_ = Logprobs();
+		return j;
+	}
+
+	bool sse( const json& j ) { return conn_->write_all( "data: " + dump_safe( j ) + "\n\n" ); }
+
+	bool ensure_started() {
+		if ( started_ ) return true;
+		started_ = true;
+		if ( !start_sse( conn_ ) ) return false;
+		return prefix_.empty() || send_text( prefix_, nullptr );   // echo: the prompt leads the stream
+	}
+
+	bool send_text( const std::string& text, const char* finish ) {
+		if ( !ensure_started() ) return false;
+		json c = chunk();
+		const bool lp = logprobs_ && ( !lp_.tokens.empty() || finish );
+		c["choices"] = json::array( { { { "text", text }, { "index", 0 }, { "logprobs", lp ? take_logprobs() : json( nullptr ) },
+			{ "finish_reason", finish ? json( finish ) : json( nullptr ) } } } );
+		return sse( c );
+	}
+
+	ConnPtr conn_;
+	bool stream_, include_usage_, logprobs_, echo_;
+	std::string model_, completion_id_;
+	int64_t created_;
+	bool started_ = false;
+	std::string prefix_, text_;
+	size_t offset_ = 0;   // characters before the next token (the echoed prompt counts)
+	Logprobs lp_;
+	std::chrono::steady_clock::time_point last_ping_ = std::chrono::steady_clock::now();
+};
+
+// POST /v1/completions: a prompt (a string, token ids, or a one-element array of either) completed as plain text, with the defaults OpenAI
+// documents for the endpoint (max_tokens 16; temperature and top_p as the server's defaults, which follow the API's when the checkpoint sets none)
+class OpenAICompletionProtocol : public ChatProtocol {
+public:
+	bool parse( const std::string& body, ChatRequest* out, ApiError* err ) override {
+		json j = json::parse( body, nullptr, false );
+		if ( j.is_discarded() || !j.is_object() ) return fail( err, "the request body is not valid JSON" );
+		ChatRequest r;
+		r.raw = true;
+		r.model = j.value( "model", std::string() );
+		if ( !j.contains( "prompt" ) ) return fail( err, "prompt is required" );
+		json p = j["prompt"];
+		if ( p.is_array() && p.size() == 1 && ( p[0].is_string() || p[0].is_array() ) ) p = json( p[0] );
+		if ( p.is_string() ) r.raw_prompt = p.get<std::string>();
+		else if ( p.is_array() && !p.empty() && p[0].is_number_integer() ) {
+			for ( const auto& t : p ) {
+				if ( !t.is_number_integer() ) return fail( err, "prompt token ids must be integers" );
+				r.raw_tokens.push_back( t.get<int>() );
+			}
+		}
+		else if ( p.is_array() && p.size() > 1 ) return fail( err, "one prompt per request: a batch of prompts is not supported" );
+		else return fail( err, "prompt must be a string, an array of token ids, or a one-element array of either" );
+		for ( const char* key : { "n", "best_of" } ) {
+			if ( j.contains( key ) && !j[key].is_null() && !( j[key].is_number_integer() && j[key].get<int>() == 1 ) ) return fail( err, std::string( key ) + " other than 1 is not supported" );
+		}
+		if ( j.contains( "suffix" ) && !j["suffix"].is_null() && !( j["suffix"].is_string() && j["suffix"].get<std::string>().empty() ) ) return fail( err, "suffix is not supported" );
+		if ( j.contains( "echo" ) && j["echo"].is_boolean() ) r.echo = j["echo"].get<bool>();
+		r.max_tokens = 16;   // the endpoint's documented default
+		if ( j.contains( "max_tokens" ) && !j["max_tokens"].is_null() ) {
+			if ( !j["max_tokens"].is_number_integer() || j["max_tokens"].get<int>() <= 0 ) return fail( err, "max_tokens must be a positive integer" );
+			r.max_tokens = j["max_tokens"].get<int>();
+		}
+		if ( !generation_options( j, &r, err ) ) return false;
+		if ( j.contains( "logprobs" ) && !j["logprobs"].is_null() ) {
+			if ( !j["logprobs"].is_number_integer() || j["logprobs"].get<int>() < 0 || j["logprobs"].get<int>() > 5 ) return fail( err, "logprobs must be an integer between 0 and 5" );
+			r.logprobs = j["logprobs"].get<int>();
+			if ( r.echo ) return fail( err, "echo with logprobs is not supported: the prompt's log-probabilities are not computed" );
+		}
+		*out = std::move( r );
+		return true;
+	}
+
+	std::shared_ptr<Responder> make_responder( const ChatRequest& req, const ConnPtr& conn, uint64_t request_id ) override {
+		return std::make_shared<CompletionResponder>( req, conn, request_id );
+	}
+};
+
 } // namespace
 
 std::unique_ptr<ChatProtocol> make_openai_protocol() { return std::make_unique<OpenAIProtocol>(); }
+std::unique_ptr<ChatProtocol> make_openai_completion_protocol() { return std::make_unique<OpenAICompletionProtocol>(); }
 
 } // namespace engine::server

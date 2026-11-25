@@ -104,6 +104,37 @@ try:
 except urllib.error.HTTPError as e:
     check(e.code == 404, "404 on unknown path")
 
+# ---- OpenAI /v1/completions: the prompt as given (no chat template), plain text back, the legacy shapes and the endpoint's documented defaults
+code, body = post("/v1/completions", {"model": "x", "prompt": "The capital of France is", "max_tokens": 8})
+j = json.loads(body)
+ch = j["choices"][0] if code == 200 else {}
+check(code == 200 and j["object"] == "text_completion" and "Paris" in ch.get("text", "") and ch.get("finish_reason") in ("stop", "length"), "text completion", body)
+check(code == 200 and j["usage"]["prompt_tokens"] >= 4 and 0 < j["usage"]["completion_tokens"] <= 8 and ch.get("logprobs") is None, "text completion usage", body)
+code, body = post("/v1/completions", {"prompt": "Count upward: 1, 2, 3, 4, 5, 6,"})
+j = json.loads(body)
+check(code == 200 and j["usage"]["completion_tokens"] == 16 and j["choices"][0]["finish_reason"] == "length", "max_tokens defaults to 16 (the endpoint's documented default)", body[:300])
+code, body = post("/v1/completions", {"prompt": "1, 2, 3, 4,", "max_tokens": 16, "stop": [" 7"]})
+t = json.loads(body)["choices"][0]["text"] if code == 200 else ""
+check(code == 200 and " 5" in t and " 7" not in t, "text completion stop", body)
+code, body = post("/v1/completions", {"prompt": "The capital of France is", "max_tokens": 4, "echo": True})
+check(code == 200 and json.loads(body)["choices"][0]["text"].startswith("The capital of France is"), "echo leads with the prompt", body)
+code, body = post("/v1/completions", {"prompt": "The capital of France is", "max_tokens": 4, "logprobs": 2})
+j = json.loads(body) if code == 200 else {}
+lp = j.get("choices", [{}])[0].get("logprobs") or {}
+check(code == 200 and len(lp.get("tokens", [])) == j["usage"]["completion_tokens"] and all(x <= 0 for x in lp["token_logprobs"]) and
+    all(1 <= len(d) <= 3 for d in lp["top_logprobs"]) and lp["text_offset"] == sorted(lp["text_offset"]), "legacy logprobs object", body)
+code, body = post("/v1/completions", {"prompt": [[11, 12, 13]], "max_tokens": 2})
+check(code == 200 and json.loads(body)["usage"]["prompt_tokens"] == 3, "token-id prompt", body)
+code, resp = post("/v1/completions", {"prompt": "1, 2, 3,", "max_tokens": 6, "stream": True, "stream_options": {"include_usage": True}}, stream=True)
+ev = sse(resp)
+text = "".join(e["choices"][0]["text"] for e in ev if e != "[DONE]" and e.get("choices"))
+check(ev and ev[-1] == "[DONE]" and all(e["object"] == "text_completion" for e in ev if e != "[DONE]") and " 4" in text and
+    any(e != "[DONE]" and e.get("usage", {}).get("completion_tokens") for e in ev), "streamed text completion", ev[-3:] if ev else ev)
+for bad, what in (({"prompt": "x", "n": 2}, "n > 1"), ({"prompt": "x", "suffix": "y"}, "suffix"), ({"prompt": ["a", "b"]}, "a batch of prompts"),
+                  ({"prompt": "x", "echo": True, "logprobs": 1}, "echo with logprobs"), ({"prompt": [10**9]}, "a token id outside the vocabulary"), ({"nope": 1}, "missing prompt")):
+    code, body = post("/v1/completions", bad)
+    check(code == 400 and "error" in json.loads(body), "400 for " + what + " (completions)", body)
+
 # ---- Anthropic /v1/messages
 A_TOOLS = [{"name": "get_weather", "description": "Get weather for a city", "cache_control": {"type": "ephemeral"},
     "input_schema": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}]

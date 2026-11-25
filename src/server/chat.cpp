@@ -453,11 +453,38 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	std::string prompt;
 	std::vector<int> tokens;
 	ImageList images;
-	if ( !render_prompt( prompt_model( gen ), cfg, req, &prompt, &tokens, &images, err ) ) return false;
+	if ( req.raw ) {
+		// a text completion: the prompt as given, no chat template
+		if ( req.raw_tokens.empty() ) {
+			prompt = req.raw_prompt;
+			tokens = gen.tokenizer().encode( prompt, false );
+		}
+		else {
+			for ( int t : req.raw_tokens ) {
+				if ( t < 0 || t >= static_cast<int>( gen.tokenizer().vocab_size() ) ) {
+					err->message = "prompt token id " + std::to_string( t ) + " is outside the vocabulary";
+					return false;
+				}
+			}
+			tokens = req.raw_tokens;
+			prompt = gen.tokenizer().decode( tokens );
+		}
+		if ( tokens.empty() ) {
+			err->message = "the prompt is empty";
+			return false;
+		}
+		if ( static_cast<int>( tokens.size() ) + 1 >= gen.max_context() ) {
+			err->message = "this prompt is " + std::to_string( tokens.size() ) + " tokens; the context window is " + std::to_string( gen.max_context() );
+			err->type = "context_length_exceeded";
+			return false;
+		}
+		responder->on_raw_prompt( prompt );
+	}
+	else if ( !render_prompt( prompt_model( gen ), cfg, req, &prompt, &tokens, &images, err ) ) return false;
 	responder->on_prompt( static_cast<int>( tokens.size() ) );
 	dump_prompt( gen, prompt, request_id );
 
-	const bool in_reasoning = ends_with( prompt, "<think>\n" ) || ends_with( prompt, "<think>" );
+	const bool in_reasoning = !req.raw && ( ends_with( prompt, "<think>\n" ) || ends_with( prompt, "<think>" ) );
 	auto state = std::make_shared<ChatState>(
 		OutputParser( family, in_reasoning, tool_schemas_from_json( req.tools_json ) ), std::move( responder ), conn );
 
@@ -540,8 +567,10 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		add( prompt.find( ds ? "<｜User｜>" : glm ? "<|user|>" : gemma ? "<|turn>user" : "<|im_start|>user" ), true, 1024 );
 		add( prompt.rfind( ds ? "<｜Assistant｜>" : glm ? "<|assistant|>" : gemma ? "<|turn>model" : "<|im_start|>assistant" ), false, 512 );
 	}
-	g.on_text = [state]( const std::string& delta ) {
+	const bool raw = req.raw;
+	g.on_text = [state, raw]( const std::string& delta ) {
 		if ( state->conn->closed() ) return false;
+		if ( raw ) return state->responder->on_event( { OutputEvent::Type::Content, delta, {} } );   // plain text: nothing to parse out
 		std::vector<OutputEvent> events;
 		state->parser.feed( delta, events );
 		for ( const OutputEvent& ev : events ) {

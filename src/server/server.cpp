@@ -79,6 +79,7 @@ bool VoltaServer::init( const ServerConfig& config ) {
 			return false;
 		}
 		openai_ = make_openai_protocol();
+		completions_ = make_openai_completion_protocol();
 		anthropic_ = make_anthropic_protocol();
 	}
 	register_routes();
@@ -287,6 +288,12 @@ void VoltaServer::register_routes() {
 		if ( r.method != "POST" ) return send_error( c, 405, "invalid_request_error", "use POST" );
 		handle_chat( c, r, *openai_ );
 	} );
+	if ( completions_ ) {
+		router_.add( "*", "/v1/completions", [this]( const ConnPtr& c, const HttpRequest& r ) {
+			if ( r.method != "POST" ) return send_error( c, 405, "invalid_request_error", "use POST" );
+			handle_chat( c, r, *completions_ );
+		} );
+	}
 	if ( anthropic_ ) {
 		router_.add( "*", "/v1/messages", [this]( const ConnPtr& c, const HttpRequest& r ) {
 			if ( r.method != "POST" ) return send_error( c, 405, "invalid_request_error", "use POST", true );

@@ -36,6 +36,11 @@ Owns the socket, the router, and the model-family choice.
 
 Routes:
 * `POST /v1/chat/completions` (OpenAI), `GET /v1/models`
+* `POST /v1/completions` (OpenAI's legacy text completion): the prompt is tokenized as given, without a chat template (special-token strings in it
+  are those tokens, nothing is prepended; token ids are accepted too), and the reply comes back as plain text with the legacy shapes (`choices[].text`,
+  `logprobs` as `tokens` / `token_logprobs` / `top_logprobs` / `text_offset`, `text_completion` stream chunks, `echo`). `max_tokens` defaults to 16
+  as the API documents; one prompt per request, `n` / `best_of` other than 1 and `suffix` are refused, as is `echo` with `logprobs` (prompt
+  log-probabilities are not computed)
 * `POST /v1/messages` and `/v1/messages/count_tokens` (Anthropic), so Claude Code can use it with `ANTHROPIC_BASE_URL=http://host:8000`. Claude Code assumes a 200K window for a model it does not know, so give it the server's (`context_length` in `GET /v1/models`) with `CLAUDE_CODE_MAX_CONTEXT_TOKENS=<max_seq>`; it then compacts in time. A messages request that does not fit is refused with the API's own errors (`prompt is too long: N tokens > W maximum`, ``input length and `max_tokens` exceed context limit: N + M > W``), which Claude Code acts on (compacting, or retrying with a smaller `max_tokens`); W is `max_seq` minus one verify block. The OpenAI route instead ends the reply at the window (finish reason `length`)
 * `GET /health` (also `/`), `/metrics` (JSON), `/metrics/prometheus`
 * `GET /monitor`, `/api/stats`, `/api/experts`. The recent requests in `/api/stats` carry the split of the time before the first token: `queue_ms` (waiting for a slot; `ttft_ms` counts from the slot being taken), `restore_ms` (prefix cache resume), `prefill_ms` (prefill kernels), `store_ms` (checkpoint stores); the rest of `ttft_ms` went to other slots' decode steps. The server prints two lines per request, one when it takes a slot and one when it finishes
@@ -59,7 +64,7 @@ The launch file (`--config`), `--set key=value`, `ENGINE_*` environment variable
   * a tool result's `is_error` adds nothing to its text
   * for Gemma 4 the tool results of consecutive tool messages go into one message's `tool_responses`, named after the calls they answer, as its template expects
   * without a loaded vision tower an image part becomes the text note `[image omitted: this model cannot view images]`, so a request with images still runs
-* `openai.cpp`, `anthropic.cpp`: the two protocol front ends. Each parses its payload into a chat request, and writes one response (streamed or not) from parsed pieces as they arrive.
+* `openai.cpp`, `anthropic.cpp`: the protocol front ends (OpenAI chat and text completion, Anthropic messages). Each parses its payload into a chat request, and writes one response (streamed or not) from parsed pieces as they arrive; a text completion is a chat request in raw mode, its prompt taken as given and its reply passed through unparsed.
   * tools are accepted in either shape (`{"type":"function","function":{...}}` or Anthropic's `{name, description, input_schema}`)
   * tool search (Anthropic): a tool with `defer_loading: true` is left out of the template's tool list, and a `tool_reference` block in a
     `tool_result` becomes the named tool's definition at that place (as the tool list renders one entry), so a tool a session discovers

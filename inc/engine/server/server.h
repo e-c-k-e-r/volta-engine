@@ -71,6 +71,7 @@ private:
 	std::map<int, ConnPtr> conns_; // epoll thread only
 	Router router_;
 	std::unique_ptr<ChatProtocol> openai_;
+	std::unique_ptr<ChatProtocol> completions_;   // /v1/completions
 	std::unique_ptr<ChatProtocol> anthropic_;
 	std::atomic<uint64_t> next_req_id_{ 1 };
 	std::string model_name_;

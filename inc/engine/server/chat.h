@@ -32,6 +32,12 @@ struct ChatRequest {
 	// tool result shows their definition there
 	std::vector<std::string> deferred_tools;
 	std::vector<std::string> images; // encoded image files in prompt order; messages_json refers to them as {"type": "image"} parts
+	// a text completion (OpenAI /v1/completions): the prompt as given instead of messages through the chat template (its special-token strings
+	// are those tokens, nothing is prepended), and the reply as plain text (no reasoning or tool-call parsing)
+	bool raw = false;
+	std::string raw_prompt;
+	std::vector<int> raw_tokens;     // the prompt as token ids instead of raw_prompt
+	bool echo = false;               // the reply starts with the prompt's text
 	bool stream = false;
 	bool include_usage = false;  // OpenAI stream_options.include_usage
 	int max_tokens = 0;          // 0: server default
@@ -95,6 +101,8 @@ public:
 	virtual ~Responder() = default;
 	// Parsed pieces in order. Returning false cancels the generation.
 	virtual void on_prompt( int prompt_tokens ) { (void) prompt_tokens; }
+	// A text completion's prompt as text (decoded when it came as token ids), before generation starts
+	virtual void on_raw_prompt( const std::string& text ) { (void) text; }
 	// When the request takes its slot: the prompt tokens read from the prefix cache (before the first on_event; on_wait may come earlier)
 	virtual void on_admit( int cached_tokens ) { (void) cached_tokens; }
 	virtual bool on_event( const OutputEvent& ev ) = 0;
@@ -141,6 +149,7 @@ public:
 };
 
 std::unique_ptr<ChatProtocol> make_openai_protocol();
+std::unique_ptr<ChatProtocol> make_openai_completion_protocol();   // /v1/completions
 std::unique_ptr<ChatProtocol> make_anthropic_protocol();
 
 // Shared by the protocol parsers: JSON array text of the OpenAI "tools" value normalized to {"type","function"} form
