@@ -1,0 +1,18 @@
+# clangd reads build/compile_commands.json (linked at the repository root); the CPU and Vulkan backends are compiled only by their
+# own configurations (build_cpu, build_vk), so their sources take those databases.
+If:
+  PathMatch: src/backend/cpu/.*
+CompileFlags:
+  CompilationDatabase: build_cpu
+---
+If:
+  PathMatch: src/backend/vulkan/.*
+CompileFlags:
+  CompilationDatabase: build_vk
+---
+# The CUDA sources' commands are nvcc's: its own flags mean nothing to clang, so they are dropped and the sources parse as CUDA for SM 70
+If:
+  PathMatch: .*\.(cu|cuh)
+CompileFlags:
+  Remove: [-forward-unknown-to-host-compiler, --expt-relaxed-constexpr, -Wno-deprecated-gpu-targets, -diag-suppress, "--generate-code=*", -Xcompiler, -x]
+  Add: [-xcuda, --cuda-gpu-arch=sm_70, --no-cuda-version-check]

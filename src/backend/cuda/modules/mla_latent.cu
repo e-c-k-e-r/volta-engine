@@ -1174,7 +1174,7 @@ void attend_q( const pod::KVRef& kv, const pod::TensorView& q_lat, pod::TensorVi
 		return;
 	}
 	for ( int row0 = slot.row; row0 < slot.row + rows; row0 += pod::MAX_BATCH ) {
-		const int M = min( pod::MAX_BATCH, slot.row + rows - row0 );
+		const int M = std::min( pod::MAX_BATCH, slot.row + rows - row0 );
 		const size_t off = static_cast<size_t>( row0 - slot.row ) * heads * LORA;
 		latent_attn_kernel<16, Q><<<dim3( M, n_chunks ), dim3( 512 ), smem, stream>>>(
 			q_lat.ptr<const half>() + off, cache, cscale, o_lat.ptr<half>() + off, workspace, slot.stride, kv.pages, layer, max_seq, slot.rows, row0, n_chunks, scale, sel_idx, sel_n );

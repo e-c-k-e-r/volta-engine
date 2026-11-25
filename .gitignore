@@ -24,3 +24,6 @@ results/
 venv/
 tests/local.env
 __pycache__/
+
+# clangd: the root link to build/compile_commands.json
+/compile_commands.json

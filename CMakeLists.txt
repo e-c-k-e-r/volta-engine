@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
 
+# compile_commands.json in the build directory, for clangd (the repository root's compile_commands.json links to build/'s)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Computing backend: exactly one (CUDA, ROCM, CPU or VULKAN). Chosen before project() so the CPU and Vulkan configurations never enable the CUDA language.
 # ROCM compiles the CUDA sources as HIP (src/backend/rocm: compat.h, force-included, and stand-ins for the CUDA headers).
 set(ENGINE_BACKEND "CUDA" CACHE STRING "Computing backend: CUDA, ROCM, CPU or VULKAN")
