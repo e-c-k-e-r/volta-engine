@@ -284,7 +284,8 @@ PromptModel prompt_model( engine::runtime::Generator& gen ) {
 		[&gen]( const engine::runtime::GenerationRequest::Image& im ) { gen.prefetch_image( im ); } };
 }
 
-bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ImageList* images, ApiError* err ) {
+bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ImageList* images, ApiError* err,
+	std::string* vars_json = nullptr ) {
 	const auto family = m.chat_template.model_family();
 
 	bool thinking = req.enable_thinking >= 0 ? req.enable_thinking != 0 : cfg.default_enable_thinking;
@@ -327,6 +328,7 @@ bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatReq
 	// After the escaping: the markers are the model's own special tokens, not text a user typed
 	if ( family == engine::loader::ModelFamily::GLM && see && vars["messages"].is_array() ) inline_glm_image_markers( vars["messages"] );
 	std::string terr;
+	if ( vars_json ) *vars_json = vars.dump();
 	if ( !m.chat_template.render_json( vars.dump(), prompt, &terr ) ) {
 		err->message = "the chat template rejected this conversation: " + terr;
 		return false;
@@ -402,9 +404,9 @@ void dump_prompt( engine::runtime::Generator& gen, const std::string& prompt, ui
 } // namespace
 
 bool render_chat_prompt( const PromptModel& model, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens,
-	ApiError* err ) {
+	ApiError* err, std::string* vars_json ) {
 	ImageList images;
-	return render_prompt( model, cfg, req, prompt, tokens, &images, err );
+	return render_prompt( model, cfg, req, prompt, tokens, &images, err, vars_json );
 }
 
 std::string shown_prompt( const engine::loader::Tokenizer& tok, const std::string& prompt ) {

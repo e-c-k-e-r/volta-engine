@@ -120,9 +120,10 @@ struct PromptModel {
 	std::function<void( const engine::runtime::GenerationRequest::Image& )> prefetch_image;   // vision_cpu: encode before the request queues
 };
 
-// The prompt a request renders to, as the server feeds it to the model (prompt text with special tokens escaped, and its token ids)
+// The prompt a request renders to, as the server feeds it to the model (prompt text with special tokens escaped, and its token ids);
+// vars_json (optional) receives the variables the chat template renders (messages, tools and options, as JSON)
 bool render_chat_prompt( const PromptModel& model, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens,
-	ApiError* err );
+	ApiError* err, std::string* vars_json = nullptr );
 
 // The prompt text with its special tokens as their text (what dump_requests writes)
 std::string shown_prompt( const engine::loader::Tokenizer& tok, const std::string& prompt );

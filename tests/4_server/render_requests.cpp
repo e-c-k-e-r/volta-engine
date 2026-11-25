@@ -1,6 +1,8 @@
 // Renders recorded Anthropic Messages requests (req_*.json, as a client sent them) the way volta_server would, without loading weights:
 // the checkpoint's tokenizer and chat template (or DeepSeek's built-in encoding), the server's request parsing and prompt rendering.
-// Prints each request's prompt length and writes the prompt with its special tokens as text (what dump_requests writes).
+// Prints each request's prompt length and writes the prompt with its special tokens as text (what dump_requests writes) and, as
+// req_N.vars.json, the variables the chat template rendered (messages, tools and options after the server's conversion), and as
+// req_N.ids.txt the prompt's token ids, one a line.
 //   render_requests <checkpoint dir> <dir of req_*.json> [out dir]
 #include "engine/loader/chat_template.h"
 #include "engine/loader/tokenizer.h"
@@ -42,11 +44,11 @@ int main( int argc, char** argv ) {
 	for ( const fs::path& p : reqs ) {
 		engine::server::ChatRequest req;
 		engine::server::ApiError err;
-		std::string prompt;
+		std::string prompt, vars;
 		std::vector<int> tokens;
 		std::ostringstream body;
 		body << std::ifstream( p ).rdbuf();
-		if ( !protocol->parse( body.str(), &req, &err ) || !engine::server::render_chat_prompt( model, cfg, req, &prompt, &tokens, &err ) ) {
+		if ( !protocol->parse( body.str(), &req, &err ) || !engine::server::render_chat_prompt( model, cfg, req, &prompt, &tokens, &err, &vars ) ) {
 			std::printf( "%s: error %s\n", p.filename().c_str(), err.message.c_str() );
 			++failed;
 			continue;
@@ -54,9 +56,13 @@ int main( int argc, char** argv ) {
 		std::printf( "%s: %zu tokens\n", p.filename().c_str(), tokens.size() );
 		if ( !out.empty() ) {
 			const std::string shown = engine::server::shown_prompt( tok, prompt );
-			if ( FILE* f = std::fopen( ( fs::path( out ) / ( p.stem().string() + ".prompt.txt" ) ).c_str(), "wb" ) ) {
-				std::fwrite( shown.data(), 1, shown.size(), f );
-				std::fclose( f );
+			std::string ids;
+			for ( int t : tokens ) ids += std::to_string( t ) + "\n";
+			for ( const auto& [suffix, text] : { std::pair<const char*, const std::string*>{ ".prompt.txt", &shown }, { ".vars.json", &vars }, { ".ids.txt", &ids } } ) {
+				if ( FILE* f = std::fopen( ( fs::path( out ) / ( p.stem().string() + suffix ) ).c_str(), "wb" ) ) {
+					std::fwrite( text->data(), 1, text->size(), f );
+					std::fclose( f );
+				}
 			}
 		}
 	}
