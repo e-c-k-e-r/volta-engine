@@ -28,6 +28,9 @@ struct ChatRequest {
 	std::string model;
 	std::string messages_json;
 	std::string tools_json;      // empty: no tools
+	// tools_json entries the template's tool list leaves out (Anthropic defer_loading): the output parser knows them, and a tool_reference in a
+	// tool result shows their definition there
+	std::vector<std::string> deferred_tools;
 	std::vector<std::string> images; // encoded image files in prompt order; messages_json refers to them as {"type": "image"} parts
 	bool stream = false;
 	bool include_usage = false;  // OpenAI stream_options.include_usage

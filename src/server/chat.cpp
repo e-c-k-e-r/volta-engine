@@ -315,7 +315,18 @@ bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatReq
 		if ( last["content"].is_string() ) last["content"] = last["content"].get<std::string>() + hint;
 		else if ( last["content"].is_array() ) last["content"].push_back( { { "type", "text" }, { "text", hint } } );
 	}
-	if ( !req.tools_json.empty() ) vars["tools"] = nlohmann::ordered_json::parse( req.tools_json, nullptr, false );
+	if ( !req.tools_json.empty() ) {
+		nlohmann::ordered_json tools = nlohmann::ordered_json::parse( req.tools_json, nullptr, false );
+		if ( tools.is_array() && !req.deferred_tools.empty() ) {
+			nlohmann::ordered_json listed = nlohmann::ordered_json::array();
+			for ( const auto& t : tools ) {
+				const std::string name = t.contains( "function" ) ? t["function"].value( "name", std::string() ) : std::string();
+				if ( std::find( req.deferred_tools.begin(), req.deferred_tools.end(), name ) == req.deferred_tools.end() ) listed.push_back( t );
+			}
+			tools = listed;
+		}
+		if ( !tools.is_array() || !tools.empty() ) vars["tools"] = tools;
+	}
 	vars["add_generation_prompt"] = true;
 	vars["enable_thinking"] = thinking;
 	if ( !effort.empty() ) vars["reasoning_effort"] = effort;

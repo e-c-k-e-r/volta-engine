@@ -1,11 +1,14 @@
 #include "engine/server/chat.h"
 #include "engine/loader/image.h"
+#include "engine/loader/jinja.h"
 
 #define JSON_NOEXCEPTION 1
 #include "engine/server/json_safe.h"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <map>
+#include <set>
 
 namespace engine::server {
 
@@ -18,6 +21,55 @@ bool fail( ApiError* err, const std::string& message, const char* type = "invali
 	err->type = type;
 	err->message = message;
 	return false;
+}
+
+// Tool search: a tool with defer_loading stays out of the template's tool list (the prompt's prefix), and a tool_reference block in a tool
+// result expands there to the tool's definition, as the template's tool list shows one (Python json.dumps of the {"type": "function",
+// "function": ...} entry), so a tool a session discovers joins the conversation without changing the prompt before it (Anthropic's API
+// documents the same: deferred tools are not in the system-prompt prefix, a tool_reference expands inline)
+struct ToolDefs {
+	std::map<std::string, std::string> text;   // every tool's definition by name
+	std::set<std::string> deferred;
+};
+
+bool tool_defs( const json& tools, ToolDefs* out, ApiError* err ) {
+	if ( !tools.is_array() ) return true;
+	for ( const auto& t : tools ) {
+		bool ok = false;
+		const std::string one = normalize_tools( json::array( { t } ).dump(), &ok );
+		if ( !ok ) continue;   // the tools check below reports malformed tools
+		const json entry = json::parse( one, nullptr, false );
+		const std::string name = entry[0]["function"]["name"].get<std::string>();
+		out->text[name] = engine::loader::jinja::to_json( engine::loader::jinja::from_json( entry[0].dump() ) );
+		if ( t.value( "defer_loading", false ) ) out->deferred.insert( name );
+	}
+	if ( !out->text.empty() && out->deferred.size() == out->text.size() ) return fail( err, "at least one tool must have defer_loading false" );
+	return true;
+}
+
+// tool_result content with its tool_reference blocks replaced by the definitions they name (one text block for a run of references)
+bool expand_tool_references( const json& v, const ToolDefs& defs, json* out, ApiError* err ) {
+	*out = v;
+	if ( !v.is_array() ) return true;
+	*out = json::array();
+	std::string run;
+	bool in_run = false;
+	for ( const auto& b : v ) {
+		if ( b.is_object() && b.value( "type", std::string() ) == "tool_reference" ) {
+			const std::string name = b.value( "tool_name", std::string() );
+			const auto it = defs.text.find( name );
+			if ( it == defs.text.end() ) return fail( err, "tool_reference to '" + name + "', which is not in tools" );
+			run += ( in_run ? "\n" : "" ) + it->second;
+			in_run = true;
+			continue;
+		}
+		if ( in_run ) out->push_back( { { "type", "text" }, { "text", run } } );
+		run.clear();
+		in_run = false;
+		out->push_back( b );
+	}
+	if ( in_run ) out->push_back( { { "type", "text" }, { "text", run } } );
+	return true;
 }
 
 // A document block as text: a plain-text source is inlined, a PDF (or other encoded source) becomes a note the agent can act on
@@ -86,7 +138,7 @@ bool tool_content( const json& v, json* out, std::vector<std::string>* images, A
 	return true;
 }
 
-bool normalize_messages( const json& j, json* out, std::vector<std::string>* images, ApiError* err ) {
+bool normalize_messages( const json& j, const ToolDefs& defs, json* out, std::vector<std::string>* images, ApiError* err ) {
 	*out = json::array();
 	if ( j.contains( "system" ) && !j["system"].is_null() ) {
 		std::string sys;
@@ -150,9 +202,10 @@ bool normalize_messages( const json& j, json* out, std::vector<std::string>* ima
 				}
 				else if ( type == "tool_result" ) {
 					flush();
-					json tc;
+					json tc, expanded;
 					// is_error adds nothing to the text (OpenRouter passes an error result on as it is; Claude Code's text says what failed)
-					if ( !tool_content( b.contains( "content" ) ? b["content"] : json(), &tc, images, err ) ) return false;
+					if ( !expand_tool_references( b.contains( "content" ) ? b["content"] : json(), defs, &expanded, err ) ||
+						!tool_content( expanded, &tc, images, err ) ) return false;
 					out->push_back( { { "role", "tool" }, { "tool_call_id", b.value( "tool_use_id", std::string() ) }, { "content", tc } } );
 				}
 				else {
@@ -356,9 +409,12 @@ public:
 		ChatRequest r;
 		r.model = j.value( "model", std::string() );
 		r.strict_context = true;   // the messages API refuses what does not fit, with errors its clients parse
+		ToolDefs defs;
+		if ( !tool_defs( j.contains( "tools" ) ? j["tools"] : json(), &defs, err ) ) return false;
 		json messages;
-		if ( !normalize_messages( j, &messages, &r.images, err ) ) return false;
+		if ( !normalize_messages( j, defs, &messages, &r.images, err ) ) return false;
 		r.messages_json = messages.dump();
+		r.deferred_tools.assign( defs.deferred.begin(), defs.deferred.end() );
 
 		bool tools_off = j.contains( "tool_choice" ) && j["tool_choice"].is_object() && j["tool_choice"].value( "type", std::string() ) == "none";
 		if ( j.contains( "tools" ) && j["tools"].is_array() && !j["tools"].empty() && !tools_off ) {

@@ -61,6 +61,10 @@ The launch file (`--config`), `--set key=value`, `ENGINE_*` environment variable
   * without a loaded vision tower an image part becomes the text note `[image omitted: this model cannot view images]`, so a request with images still runs
 * `openai.cpp`, `anthropic.cpp`: the two protocol front ends. Each parses its payload into a chat request, and writes one response (streamed or not) from parsed pieces as they arrive.
   * tools are accepted in either shape (`{"type":"function","function":{...}}` or Anthropic's `{name, description, input_schema}`)
+  * tool search (Anthropic): a tool with `defer_loading: true` is left out of the template's tool list, and a `tool_reference` block in a
+    `tool_result` becomes the named tool's definition at that place (as the tool list renders one entry), so a tool a session discovers
+    (Claude Code's ToolSearch) does not change the prompt before it and the prefix cache still holds. The model can call a deferred tool
+    either way. A reference to a tool missing from `tools`, or a request whose tools are all deferred, is refused as the API refuses it
   * images arrive as base64 `data:` URLs (OpenAI `image_url`) or `image` blocks (Anthropic), also inside `tool_result` blocks. Remote URLs are not fetched.
   * `tool_choice` `required` / a named function tells the model to call a tool (best effort, no constrained decoding)
 * usage reports the prefix cache hits: OpenAI `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens` (with `input_tokens` excluding them)

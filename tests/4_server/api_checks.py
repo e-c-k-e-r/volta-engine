@@ -165,6 +165,30 @@ for raw in resp:
 tu = [b for b in blocks.values() if b["block"]["type"] == "tool_use"]
 check(stop_reason == "tool_use" and len(tu) == 1 and json.loads(tu[0]["json"]) == {"city": "Paris", "days": 3}, "streamed tool_use input_json_delta", blocks)
 
+# ---- tool search (Claude Code's ToolSearch): a defer_loading tool is out of the tool list until a tool_reference in a tool result shows it there
+SEARCH = {"name": "ToolSearch", "description": "Load the definitions of deferred tools by name or keyword", "input_schema": {"type": "object",
+    "properties": {"query": {"type": "string"}}, "required": ["query"]}}
+DEFERRED = [SEARCH, dict({k: v for k, v in A_TOOLS[0].items() if k != "cache_control"}, defer_loading=True)]
+LISTED = [SEARCH, {k: v for k, v in A_TOOLS[0].items() if k != "cache_control"}]
+ask = [{"role": "user", "content": "What is the weather in Paris for 3 days?"}]
+c_def = json.loads(post("/v1/messages/count_tokens", {"tools": DEFERRED, "messages": ask})[1]).get("input_tokens", 0)
+c_list = json.loads(post("/v1/messages/count_tokens", {"tools": LISTED, "messages": ask})[1]).get("input_tokens", 0)
+check(0 < c_def < c_list, "a deferred tool is not in the prompt's tool list", (c_def, c_list))
+found = ask + [{"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_s", "name": "ToolSearch", "input": {"query": "weather"}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_s", "content": [{"type": "tool_reference", "tool_name": "get_weather"}]}]}]
+c_found = json.loads(post("/v1/messages/count_tokens", {"tools": DEFERRED, "messages": found})[1]).get("input_tokens", 0)
+check(c_found > c_def + 20, "a tool_reference shows the tool's definition in the tool result", (c_def, c_found))
+code, body = post("/v1/messages", {"max_tokens": 300, "tools": DEFERRED, "messages": found})
+j = json.loads(body)
+uses = [b for b in j.get("content", []) if b["type"] == "tool_use"]
+check(code == 200 and j["stop_reason"] == "tool_use" and len(uses) == 1 and uses[0]["name"] == "get_weather" and uses[0]["input"] == {"city": "Paris", "days": 3},
+    "the model calls a tool it found through tool search, arguments typed per its schema", body)
+bad = found[:-1] + [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_s", "content": [{"type": "tool_reference", "tool_name": "nope"}]}]}]
+code, body = post("/v1/messages", {"max_tokens": 16, "tools": DEFERRED, "messages": bad})
+check(code == 400 and "nope" in body, "a tool_reference to a tool missing from tools is refused", body)
+code, body = post("/v1/messages", {"max_tokens": 16, "tools": [dict(t, defer_loading=True) for t in LISTED], "messages": ask})
+check(code == 400 and "defer_loading" in body, "a request whose tools are all deferred is refused", body)
+
 code, body = post("/v1/messages/count_tokens", {"messages": [{"role": "user", "content": "Capital of France?"}]})
 check(code == 200 and json.loads(body)["input_tokens"] > 5, "count_tokens", body)
 code, body = post("/v1/messages", {"max_tokens": 5, "messages": []})
