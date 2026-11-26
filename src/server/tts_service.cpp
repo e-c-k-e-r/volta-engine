@@ -3,6 +3,7 @@
 // read once and kept.
 #include "engine/server/tts.h"
 #include "engine/core/log.h"
+#include "engine/loader/image.h"
 #include "engine/tts/tts.h"
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
@@ -12,6 +13,28 @@
 #include <mutex>
 
 namespace engine::server {
+
+namespace {
+
+std::string base64_encode( const std::string& in ) {
+	static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	std::string out;
+	out.reserve( ( in.size() + 2 ) / 3 * 4 );
+	size_t i = 0;
+	for ( ; i + 2 < in.size(); i += 3 ) {
+		const uint32_t v = ( static_cast<uint8_t>( in[i] ) << 16 ) | ( static_cast<uint8_t>( in[i + 1] ) << 8 ) | static_cast<uint8_t>( in[i + 2] );
+		out += T[v >> 18]; out += T[( v >> 12 ) & 63]; out += T[( v >> 6 ) & 63]; out += T[v & 63];
+	}
+	if ( i < in.size() ) {
+		const uint32_t v = ( static_cast<uint8_t>( in[i] ) << 16 ) | ( i + 1 < in.size() ? static_cast<uint8_t>( in[i + 1] ) << 8 : 0 );
+		out += T[v >> 18]; out += T[( v >> 12 ) & 63];
+		out += i + 1 < in.size() ? T[( v >> 6 ) & 63] : '=';
+		out += '=';
+	}
+	return out;
+}
+
+}  // namespace
 
 struct TtsService::Impl {
 	TtsConfig cfg;
@@ -50,7 +73,8 @@ struct TtsService::Impl {
 			return send_error( c, 400, "invalid_request_error", "input (the text to speak) is required" );
 		}
 		const std::string format = j.contains( "response_format" ) && j["response_format"].is_string() ? j["response_format"].get<std::string>() : "wav";
-		if ( format != "wav" ) { return send_error( c, 400, "invalid_request_error", "response_format: only \"wav\" is supported" ); }
+		// "wav": the WAV file itself; "json": {"audio": base64 WAV, "sample_rate", "duration"} (for pages that would rather not handle a binary body)
+		if ( format != "wav" && format != "json" ) { return send_error( c, 400, "invalid_request_error", "response_format: \"wav\" or \"json\"" ); }
 		// typed reads (the server builds without exceptions, where a mistyped get would abort): false names the bad field
 		std::string bad;
 		auto num = [&]( const char* k, float def ) {
@@ -76,7 +100,19 @@ struct TtsService::Impl {
 		if ( o.steps < 1 || o.steps > 100 ) { return send_error( c, 400, "invalid_request_error", "steps must be between 1 and 100" ); }
 		std::string error;
 		const Voice* v = nullptr;
-		if ( j.contains( "voice" ) && j["voice"].is_string() && !j["voice"].get<std::string>().empty() ) {
+		Voice uploaded;
+		const bool named = j.contains( "voice" ) && j["voice"].is_string() && !j["voice"].get<std::string>().empty();
+		if ( j.contains( "voice_audio" ) && !j["voice_audio"].is_null() ) {
+			// the voice prompt in the request: a base64 WAV, bare or as a data URL ("data:audio/wav;base64,...")
+			if ( named ) { return send_error( c, 400, "invalid_request_error", "give voice or voice_audio, not both" ); }
+			if ( !j["voice_audio"].is_string() ) { return send_error( c, 400, "invalid_request_error", "bad type for voice_audio" ); }
+			std::string b64 = j["voice_audio"].get<std::string>(), wav;
+			const size_t comma = b64.find( "base64," );
+			if ( comma != std::string::npos ) { b64 = b64.substr( comma + 7 ); }
+			if ( !engine::loader::base64_decode( b64, &wav ) || wav.empty() ) { return send_error( c, 400, "invalid_request_error", "voice_audio holds invalid base64" ); }
+			if ( !engine::tts::Tts::parse_wav( wav, uploaded.audio, uploaded.rate, &error ) ) { return send_error( c, 400, "invalid_request_error", "voice_audio: " + error ); }
+			v = &uploaded;
+		} else if ( named ) {
 			v = voice( j["voice"].get<std::string>(), error );
 			if ( !v ) { return send_error( c, 400, "invalid_request_error", error ); }
 		}
@@ -90,7 +126,11 @@ struct TtsService::Impl {
 		const double dt = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
 		const double secs = audio.size() / static_cast<double>( tts.sample_rate() );
 		LOG_INFO( "tts: %.1f s of speech in %.2f s (%.1fx real time)\n", secs, dt, secs / std::max( dt, 1e-9 ) );
-		send_response( c, 200, "audio/wav", engine::tts::Tts::wav_bytes( audio, tts.sample_rate() ) );
+		const std::string wav = engine::tts::Tts::wav_bytes( audio, tts.sample_rate() );
+		if ( format == "json" ) {
+			return send_json( c, 200, nlohmann::json( { { "audio", base64_encode( wav ) }, { "format", "wav" }, { "sample_rate", tts.sample_rate() }, { "duration", secs } } ).dump() );
+		}
+		send_response( c, 200, "audio/wav", wav );
 	}
 
 	void handle_voices( const ConnPtr& c ) {
