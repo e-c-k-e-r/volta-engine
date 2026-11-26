@@ -67,6 +67,11 @@ namespace {
 // residual is what comes back, in `residual`; without one the sum comes back in x. Collective: every rank calls it.
 struct ArSumParams { uint64_t parts, res, out_; int64_t rank_stride, slot_off; int n, nranks, has_res; };
 
+// From this many bytes the reduction is a reduce-scatter and an all-gather through the host block (each rank sums a slice of every partial
+// into the block's result slot, then every rank copies the whole result back): each device reads n + n bytes over the bus instead of nranks n,
+// at the cost of a second round of signals. Prefill chunks only (a decode's rows stay under it, so the captured forwards keep one round)
+constexpr size_t kScatterBytes = size_t( 1 ) << 20;
+
 void reduce_on_devices( HostMesh* m, int rank, int nranks, pod::TensorView& x, pod::TensorView* residual, size_t n, backend::stream_t stream ) {
 	DeviceMesh& d = m->dev;
 	// this reduction's value (stream_signal_next advances the count to it); every rank counts in step, so a captured forward replays with fresh
@@ -85,10 +90,26 @@ void reduce_on_devices( HostMesh* m, int rank, int nranks, pod::TensorView& x, p
 	backend::vk::stream_wait_counter( stream, sems, k, &d.count[rank] );
 	const int64_t halfs = static_cast<int64_t>( d.slot_bytes / sizeof( backend::half_t ) );
 	pod::TensorView& out = residual != nullptr ? *residual : x;
-	ArSumParams p{ reinterpret_cast<uint64_t>( block ), residual != nullptr ? reinterpret_cast<uint64_t>( residual->data ) : 0, reinterpret_cast<uint64_t>( out.data ), 2 * halfs,
-		static_cast<int64_t>( slot ) * halfs, static_cast<int>( n ), nranks, residual != nullptr ? 1 : 0 };
-	const uint64_t groups = ( n + 255 ) / 256;
-	backend::impl::launch( "ar_sum", p, stream, static_cast<uint32_t>( std::min<uint64_t>( groups, 65535 ) ), static_cast<uint32_t>( ( groups + 65534 ) / 65535 ) );
+	const uint64_t res = residual != nullptr ? reinterpret_cast<uint64_t>( residual->data ) : 0;
+	auto sum = [&]( size_t lo, size_t hi, uint64_t dst ) {
+		// parts + lo: rank r's slot at r * rank_stride + slot_off from it; the residual and dst at lo already
+		ArSumParams p{ reinterpret_cast<uint64_t>( block ) + lo * sizeof( backend::half_t ), res != 0 ? res + lo * sizeof( backend::half_t ) : 0, dst, 2 * halfs,
+			static_cast<int64_t>( slot ) * halfs, static_cast<int>( hi - lo ), nranks, residual != nullptr ? 1 : 0 };
+		const uint64_t groups = ( hi - lo + 255 ) / 256;
+		backend::impl::launch( "ar_sum", p, stream, static_cast<uint32_t>( std::min<uint64_t>( groups, 65535 ) ), static_cast<uint32_t>( ( groups + 65534 ) / 65535 ) );
+	};
+	if ( bytes < kScatterBytes ) {
+		sum( 0, n, reinterpret_cast<uint64_t>( out.data ) );
+		return;
+	}
+	// this rank's slice (whole 16-byte groups) summed into the result slot; once every rank has signalled that, the whole result copied back.
+	// The result slot is free again: every rank writes its next slice only after the next first round, which follows its copy of this one
+	const size_t lo = n / 8 * rank / nranks * 8, hi = rank + 1 == nranks ? n : n / 8 * ( rank + 1 ) / nranks * 8;
+	uint8_t* result = block + 2 * static_cast<size_t>( nranks ) * d.slot_bytes;
+	if ( hi > lo ) sum( lo, hi, reinterpret_cast<uint64_t>( result ) + lo * sizeof( backend::half_t ) );
+	backend::vk::stream_signal_next( stream, d.own[rank], &d.count[rank] );
+	backend::vk::stream_wait_counter( stream, sems, k, &d.count[rank] );
+	backend::memcpy_async( out.data, result, bytes, backend::Copy::D2D, stream );
 }
 
 void reduce_through_host( const CollectiveRing& ring, pod::TensorView& x, pod::TensorView* residual, backend::stream_t stream ) {
@@ -186,7 +207,7 @@ void init_4gpu_mesh( CollectiveRing rings[ENGINE_NUM_GPUS], void* staging_ptrs[E
 		}
 		if ( ok ) {
 			d.slot_bytes = ( kHostSlotBytes + align - 1 ) / align * align;
-			d.bytes = d.slot_bytes * 2 * static_cast<size_t>( ranks );
+			d.bytes = d.slot_bytes * ( 2 * static_cast<size_t>( ranks ) + 1 );   // two slots per rank, then the reduce-scatter's result
 			d.host = static_cast<uint8_t*>( std::aligned_alloc( align, d.bytes ) );
 			ok = d.host != nullptr;
 		}

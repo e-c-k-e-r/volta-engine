@@ -118,7 +118,7 @@ int main( int argc, char** argv ) {
 			std::printf( "  %d ranks: only %d Vulkan devices, skipped\n", ranks, have );
 			continue;
 		}
-		for ( int rows : { 1, 7, 64 } ) {
+		for ( int rows : { 1, 7, 64, 333 } ) {   // 333 rows: past the reduce-scatter's size, with an uneven slice per rank
 			fails += run( ranks, rows, 5120, false );
 			fails += run( ranks, rows, 5120, true );
 		}

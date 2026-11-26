@@ -37,14 +37,22 @@ int main( int argc, char** argv ) {
 	};
 	const int d = 1536, F = 4096, H = 24, hd = 64;
 	auto* x = static_cast<backend::half_t*>( A( static_cast<size_t>( L ) * F * 2 ) );
-	auto* w = static_cast<backend::half_t*>( A( static_cast<size_t>( 2 * F ) * d * 2 ) );
-	void* c = A( static_cast<size_t>( L ) * 2 * F * 4 );
+	const size_t w_elems = static_cast<size_t>( 2 * F ) * d * 3;   // the extra shapes' room too
+	auto* w = static_cast<backend::half_t*>( A( w_elems * 2 ) );
+	void* c = A( static_cast<size_t>( L ) * 3 * F * 4 );
 	struct G { const char* name; int N, K; bool c32; };
 	const G gemms[] = { { "qkv", 3 * d, d, false }, { "gate", d, d, false }, { "out", d, d, true }, { "up", 2 * F, d, false }, { "down", d, F, true } };
 	std::printf( "GEMMs over %d positions:\n", L );
 	for ( const G& g : gemms ) {
 		const double ms = time_ms( [&] { TtsOps::gemm( x, w, c, L, g.N, g.K, g.c32 ); }, reps );
 		std::printf( "  %-5s %5d x %5d x %5d %s: %8.3f ms  %6.2f TFLOP/s\n", g.name, L, g.N, g.K, g.c32 ? "f32" : "f16", ms, 2.0 * L * g.N * g.K / ms * 1e-9 );
+	}
+	// more FP16-out shapes from the command line: bench_tts_ops L reps N K [N K ...]
+	for ( int i = 3; i + 1 < argc; i += 2 ) {
+		const int N = std::atoi( argv[i] ), K = std::atoi( argv[i + 1] );
+		ENGINE_ASSERT( static_cast<size_t>( N ) * K <= w_elems && K <= F && N <= 6 * F, "bench_tts_ops: shape beyond the buffers" );
+		const double ms = time_ms( [&] { TtsOps::gemm( x, w, c, L, N, K, false ); }, reps );
+		std::printf( "  extra %5d x %5d x %5d f16: %8.3f ms  %6.2f TFLOP/s\n", L, N, K, ms, 2.0 * L * N * K / ms * 1e-9 );
 	}
 	// one row's attention (the whole pass taken as one row)
 	auto* q = static_cast<backend::half_t*>( A( static_cast<size_t>( L ) * d * 2 ) );
