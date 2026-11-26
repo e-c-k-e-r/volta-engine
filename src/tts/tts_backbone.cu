@@ -54,8 +54,30 @@ void TtsModel::alloc_workspace() {
 }
 
 // C [M, N] = A [M, K] @ W [N, K]^T (row-major; FP32 or FP16 out, FP32 accumulation)
+namespace {
+__global__ void k_half_to_float( const half* x, float* y, size_t n ) {
+	for ( size_t i = blockIdx.x * static_cast<size_t>( blockDim.x ) + threadIdx.x; i < n; i += static_cast<size_t>( gridDim.x ) * blockDim.x ) { y[i] = __half2float( x[i] ); }
+}
+}  // namespace
+
 void TtsModel::gemm( const half* A, const half* W, void* C, int M, int N, int K, bool c32 ) {
 	const float alpha = 1.0f, beta = 0.0f;
+#if defined(USE_ROCM)
+	if ( c32 ) {
+		// hipBLAS's FP16-in / FP32-out GEMMs take kernels without the matrix cores on RDNA3 (Tensile HSS MT64x32x8: half of a generation's GPU
+		// time): the FP16-out GEMM (WMMA), then widened. The result is rounded to FP16 once, as vall_e's bf16 autocast rounds it to bf16
+		const size_t n = static_cast<size_t>( M ) * N;
+		if ( n > c16_elems_ ) {
+			if ( c16_ ) { cudaFree( c16_ ); }
+			CUDA_CHECK( cudaMalloc( &c16_, n * sizeof( half ) ) );
+			c16_elems_ = n;
+		}
+		CUBLAS_CHECK( cublasGemmEx( static_cast<cublasHandle_t>( blas_ ), CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, W, CUDA_R_16F, K, A, CUDA_R_16F, K, &beta, c16_,
+			CUDA_R_16F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT ) );
+		k_half_to_float<<<static_cast<int>( std::min<size_t>( 4096, ( n + 255 ) / 256 ) ), 256>>>( c16_, static_cast<float*>( C ), n );
+		return;
+	}
+#endif
 	CUBLAS_CHECK( cublasGemmEx( static_cast<cublasHandle_t>( blas_ ), CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, W, CUDA_R_16F, K, A, CUDA_R_16F, K, &beta, C,
 		c32 ? CUDA_R_32F : CUDA_R_16F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT ) );
 }

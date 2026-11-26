@@ -106,6 +106,8 @@ private:
 	Sampling sampling_;
 	TtsWeights w_;
 	void* blas_ = nullptr;  // cublasHandle_t
+	half* c16_ = nullptr;   // ROCm: the FP16 result of an FP32-out GEMM before it's widened (gemm)
+	size_t c16_elems_ = 0;
 	struct Workspace {
 		float *x = nullptr, *a = nullptr, *S = nullptr;
 		half *xn = nullptr, *qkv = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr, *g = nullptr, *y = nullptr, *up = nullptr, *act = nullptr, *P = nullptr, *vals = nullptr;
