@@ -24,6 +24,9 @@ python -m vall_e.export codec codec.sft                                     # th
 tts_generate --model model.sft --codec codec.sft --text "Hello there." --prompt voice.wav --wav out.wav
 ```
 
+The server (CONFIG.md, the `tts` section) also has a page at `/tts` (at `/` when it serves speech alone): text, a named or uploaded voice,
+the sampling settings, and the session's results with players and downloads.
+
 The export's guidance is the default (v2.0 3.0 / 2.0, the distilled v2.0-fast 0 / 0, older exports 6.0 / 2.0); `--cfg` / `--cfg-prompt` override it.
 
 ## Parity (tts_generate --golden, test_tts_g2p, test_tts_resample; references from vall_e/golden.py in FP32)

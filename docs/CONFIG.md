@@ -29,7 +29,8 @@ values are fatal errors. The model type is never configured: it is read from the
 ## vall-e (text to speech)
 
 With a `tts` section the server adds `POST /v1/audio/speech` (OpenAI's request: `input`, `voice`, `response_format` `"wav"`, `speed`; and vall-e's
-`language` (default `en`; Japanese as kana), `seed`, `cfg`, `cfg_prompt`, `steps`, `duration` in seconds) and `GET /v1/audio/voices`, beside the language
+`language` (default `en`; Japanese as kana), `seed`, `cfg`, `cfg_prompt`, `steps`, `duration` in seconds, `temperature`, `flow_steps`, `sway`, `pause`
+between sentences in seconds, `trim`) and `GET /v1/audio/voices`, beside the language
 model; without a `model_dir` it serves speech alone. Needs a build with libespeak-ng. For pages: `voice_audio` gives the voice prompt in the request as a
 base64 WAV (bare or a `data:` URL) instead of a named `voice`, and `response_format` `"json"` answers `{"audio": base64 WAV, "sample_rate", "duration"}`.
 

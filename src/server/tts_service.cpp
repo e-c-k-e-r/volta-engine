@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <map>
 #include <mutex>
+#include <random>
 
 namespace engine::server {
 
@@ -94,7 +95,19 @@ struct TtsService::Impl {
 			if ( j["seed"].is_number_unsigned() ) { o.seed = j["seed"].get<uint64_t>(); } else { bad = "seed"; }
 		}
 		const float speed = num( "speed", 1.0f );   // OpenAI's speed: 0.25 to 4, here the inverse of the length scale
+		o.flow_steps = static_cast<int>( num( "flow_steps", 8.0f ) );
+		o.sway = num( "sway", -1.0f );
+		o.temperature = num( "temperature", 1.0f );
+		o.pause = num( "pause", 0.25f );
+		if ( j.contains( "trim" ) && !j["trim"].is_null() ) {
+			if ( j["trim"].is_boolean() ) { o.trim = j["trim"].get<bool>(); } else { bad = "trim"; }
+		}
 		if ( !bad.empty() ) { return send_error( c, 400, "invalid_request_error", "bad type for " + bad ); }
+		if ( o.flow_steps < 1 || o.flow_steps > 64 ) { return send_error( c, 400, "invalid_request_error", "flow_steps must be between 1 and 64" ); }
+		if ( o.temperature < 0.0f || o.temperature > 2.0f ) { return send_error( c, 400, "invalid_request_error", "temperature must be between 0 and 2" ); }
+		if ( o.sway < -1.0f || o.sway > 1.0f ) { return send_error( c, 400, "invalid_request_error", "sway must be between -1 and 1" ); }
+		if ( o.pause < 0.0f || o.pause > 5.0f ) { return send_error( c, 400, "invalid_request_error", "pause must be between 0 and 5 seconds" ); }
+		if ( o.duration > 300.0f ) { return send_error( c, 400, "invalid_request_error", "duration is at most 300 seconds" ); }
 		if ( speed < 0.25f || speed > 4.0f ) { return send_error( c, 400, "invalid_request_error", "speed must be between 0.25 and 4" ); }
 		o.length_scale = 1.0f / speed;
 		if ( o.steps < 1 || o.steps > 100 ) { return send_error( c, 400, "invalid_request_error", "steps must be between 1 and 100" ); }
@@ -116,6 +129,7 @@ struct TtsService::Impl {
 			v = voice( j["voice"].get<std::string>(), error );
 			if ( !v ) { return send_error( c, 400, "invalid_request_error", error ); }
 		}
+		if ( !o.seed ) { o.seed = ( static_cast<uint64_t>( std::random_device{}() ) << 20 ) ^ std::random_device{}(); o.seed &= ( 1ull << 52 ) - 1; }   // known, so it can be returned (and fits a JS number)
 		cudaSetDevice( cfg.device );
 		const auto t0 = std::chrono::steady_clock::now();
 		std::vector<float> audio;
@@ -128,9 +142,25 @@ struct TtsService::Impl {
 		LOG_INFO( "tts: %.1f s of speech in %.2f s (%.1fx real time)\n", secs, dt, secs / std::max( dt, 1e-9 ) );
 		const std::string wav = engine::tts::Tts::wav_bytes( audio, tts.sample_rate() );
 		if ( format == "json" ) {
-			return send_json( c, 200, nlohmann::json( { { "audio", base64_encode( wav ) }, { "format", "wav" }, { "sample_rate", tts.sample_rate() }, { "duration", secs } } ).dump() );
+			return send_json( c, 200, nlohmann::json( { { "audio", base64_encode( wav ) }, { "format", "wav" }, { "sample_rate", tts.sample_rate() }, { "duration", secs },
+				{ "seed", o.seed }, { "elapsed", dt } } ).dump() );
 		}
 		send_response( c, 200, "audio/wav", wav );
+	}
+
+	void handle_info( const ConnPtr& c, bool key_required ) {
+		const auto& s = tts.model().default_sampling();
+		std::string name = cfg.model;
+		const size_t slash = name.find_last_of( '/' );
+		if ( slash != std::string::npos ) { name = name.substr( slash + 1 ); }
+		nlohmann::json names = nlohmann::json::array();
+		{
+			std::lock_guard<std::mutex> lock( voice_mu );
+			for ( const auto& kv : voices ) { names.push_back( kv.first ); }
+		}
+		const auto& mc = tts.model().config();
+		send_json( c, 200, nlohmann::json( { { "model", name }, { "layers", mc.layers }, { "d_model", mc.d_model }, { "sample_rate", tts.sample_rate() },
+			{ "cfg", s.cfg }, { "cfg_prompt", s.cfg_prompt }, { "steps", s.steps }, { "voices", names }, { "key_required", key_required } } ).dump() );
 	}
 
 	void handle_voices( const ConnPtr& c ) {
@@ -163,13 +193,17 @@ bool TtsService::init( const ServerConfig& config ) {
 	return true;
 }
 
-void TtsService::register_routes( Router& router, bool alone ) {
+const char* tts_page_html();
+
+void TtsService::register_routes( Router& router, bool alone, bool key_required ) {
 	Impl* p = p_.get();
+	router.add( "GET", "/tts", []( const ConnPtr& c, const HttpRequest& ) { send_response( c, 200, "text/html; charset=utf-8", tts_page_html() ); } );
+	router.add( "GET", "/api/tts/info", [p, key_required]( const ConnPtr& c, const HttpRequest& ) { p->handle_info( c, key_required ); } );
 	router.add( "*", "/v1/audio/speech", [p]( const ConnPtr& c, const HttpRequest& r ) { p->handle_speech( c, r ); }, true );
 	router.add( "GET", "/v1/audio/voices", [p]( const ConnPtr& c, const HttpRequest& ) { p->handle_voices( c ); } );
 	if ( alone ) {
 		router.add( "GET", "/health", []( const ConnPtr& c, const HttpRequest& ) { send_json( c, 200, R"({"status":"ok","model":"vall_e"})" ); } );
-		router.add( "GET", "/", []( const ConnPtr& c, const HttpRequest& ) { send_json( c, 200, R"({"status":"ok","model":"vall_e"})" ); } );
+		router.add( "GET", "/", []( const ConnPtr& c, const HttpRequest& ) { send_response( c, 200, "text/html; charset=utf-8", tts_page_html() ); } );
 	}
 }
 

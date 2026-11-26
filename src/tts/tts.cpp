@@ -101,6 +101,8 @@ bool Tts::synthesize( const std::string& text, const std::vector<float>& prompt_
 	if ( o.cfg >= 0.0f ) { s.cfg = o.cfg; }
 	if ( o.cfg_prompt >= 0.0f ) { s.cfg_prompt = o.cfg_prompt; }
 	s.steps = o.steps;
+	s.flow_steps = o.flow_steps;
+	s.sway = o.sway;
 	// the prompt: 44.1 kHz, its first 10 s, encoded, in patches (the last frame repeated to a whole patch, as to_patches)
 	std::vector<uint8_t> prompt;
 	if ( !prompt_audio.empty() ) {
@@ -142,7 +144,7 @@ bool Tts::synthesize( const std::string& text, const std::vector<float>& prompt_
 		for ( int st = 0; st < s.steps; ++st ) {
 			const int target = TtsModel::revealed_after( st, s.steps, La );
 			noise[st].resize( static_cast<size_t>( target - done ) * c.values() );
-			for ( float& v : noise[st] ) { v = normal( rng ); }
+			for ( float& v : noise[st] ) { v = normal( rng ) * o.temperature; }   // flow_sample: randn * temperature
 			done = target;
 		}
 		const auto digits = model_.generate( t, prompt, n, order, noise, s );

@@ -18,6 +18,9 @@ struct SynthOptions {
 	std::string language = "en";
 	float cfg = -1.0f, cfg_prompt = -1.0f;  // < 0: the export's own (TtsModel::default_sampling)
 	int steps = 25;
+	int flow_steps = 8;         // Euler steps of the flow head per revealed patch
+	float sway = -1.0f;         // the flow steps' sway grid (< 0: more steps near the noise end, as F5-TTS)
+	float temperature = 1.0f;   // the flow head's starting noise scale
 	float length_scale = 1.0f;  // on each sentence's predicted length
 	float duration = -1.0f;     // seconds for the whole text (shared out by phonemes); < 0: predicted
 	float pause = 0.25f;        // seconds between sentences

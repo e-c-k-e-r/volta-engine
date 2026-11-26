@@ -16,8 +16,8 @@ public:
 
 	// Loads the model and codec onto tts.device and lists tts.voices_dir's voices.
 	bool init( const ServerConfig& config );
-	// Adds /v1/audio/speech and /v1/audio/voices (and /health when alone).
-	void register_routes( Router& router, bool alone );
+	// Adds /v1/audio/speech, /v1/audio/voices, the page at /tts (and /, with /health, when alone) and /api/tts/info (key_required: /v1/* need the api_key).
+	void register_routes( Router& router, bool alone, bool key_required );
 
 private:
 	struct Impl;

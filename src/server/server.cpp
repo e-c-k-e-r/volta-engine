@@ -287,7 +287,7 @@ bool VoltaServer::parse_request( const ConnPtr& conn, HttpRequest* req ) {
 void VoltaServer::register_routes() {
 #ifdef ENGINE_TTS
 	if ( tts_ ) {
-		tts_->register_routes( router_, config_.model_type == "vall_e" );
+		tts_->register_routes( router_, config_.model_type == "vall_e", !config_.api_key.empty() );
 		if ( config_.model_type == "vall_e" ) return;
 	}
 #endif
