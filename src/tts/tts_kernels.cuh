@@ -114,6 +114,21 @@ __global__ void k_softmax( const float* S, half* P, int n, float scale ) {
 	for ( int j = threadIdx.x; j < n; j += blockDim.x ) { P[r * n + j] = __float2half( __expf( ( s[j] - m ) * scale ) * inv ); }
 }
 
+// k_softmax over FP16 scores already scaled (ROCm: the scores GEMM writes FP16 to stay on the matrix cores); FP32 inside
+__global__ void k_softmax_h( const half* S, half* P, int n ) {
+	const size_t r = blockIdx.x;
+	const half* s = S + r * n;
+	float m = -INFINITY;
+	for ( int j = threadIdx.x; j < n; j += blockDim.x ) { m = fmaxf( m, __half2float( s[j] ) ); }
+	m = engine::math::block_max<32>( m );
+	float sum = 0.0f;
+	for ( int j = threadIdx.x; j < n; j += blockDim.x ) { sum += __expf( __half2float( s[j] ) - m ); }
+	__syncthreads();
+	sum = engine::math::block_sum<32>( sum );
+	const float inv = 1.0f / sum;
+	for ( int j = threadIdx.x; j < n; j += blockDim.x ) { P[r * n + j] = __float2half( __expf( __half2float( s[j] ) - m ) * inv ); }
+}
+
 // o [H, L, hd] (head_major) or [L, H * hd] -> y [L, H * hd], times sigmoid(g [L, H * hd]) if g (the attention output gate)
 __global__ void k_heads_gate( const half* o, const half* g, half* y, int L, int H, int hd, bool head_major ) {
 	const int p = blockIdx.x;

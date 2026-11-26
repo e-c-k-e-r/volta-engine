@@ -29,7 +29,7 @@ the sampling settings, and the session's results with players and downloads. A n
 
 Each demasking step runs the backbone over its guidance rows (cond, null, promptless) in one pass of up to 2560 positions: the linears see
 them as one block, attention stays within each row (on CUDA the fused WMMA attention kernel of the video service, `h3_attention`; on ROCm,
-where that kernel isn't correct, batched GEMMs around a softmax).
+where that kernel isn't correct, batched GEMMs around a softmax, the scores in FP16 so hipBLAS keeps them on the matrix cores).
 
 The export's guidance is the default (v2.0 3.0 / 2.0, the distilled v2.0-fast 0 / 0, older exports 6.0 / 2.0); `--cfg` / `--cfg-prompt` override it.
 
@@ -61,6 +61,7 @@ language model also uses, they queue with its work instead of overlapping it.
 - No language detection (vall_e's `auto`): requests name the language.
 - Voices are single WAV files; vall_e's multi-clip folder prompts (speaker-embedding and MOS selection) aren't ported.
 - Speed (a 7 s line with a voice prompt, one run of tts_generate): V100 v2.0 4.7x real time, v2.0-fast 6.9x, the 225M 8.8x; RX 7900 XTX
-  (measured before the guidance rows shared a pass) v2.0 about 4.3x, v2.0-fast 8x, the 225M 9.5x. The backbone is compute-bound (a pass
+  4.3x / 5.9x / 5.7x (the same cold run: first-call kernel loads and the prompt's encoding weigh more there), and served warm with a named
+  voice v2.0 5.4x, v2.0-fast 7.9x, the 225M 10x. The backbone is compute-bound (a pass
   over ~670 positions is ~1 TFLOP); on a V100 a v2.0 generation's GPU time is ~57% the backbone's GEMMs, ~21% the FP32 codec, ~11%
   attention.

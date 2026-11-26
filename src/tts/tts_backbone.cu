@@ -176,10 +176,20 @@ void TtsModel::hidden( const TtsRow* const* rows, int n, float* out, std::vector
 				const int nh = std::min( hg, H - h0 );
 				const size_t at = ( static_cast<size_t>( h0 ) * L + s ) * hd;   // [H, L, hd]: this row's positions of head h0, heads L * hd apart
 				// S[h] = Q[h] K[h]^T, row-major [Lr(q), Lr(k)]
+#if defined(USE_ROCM)
+				// FP16 scores, already scaled: hipBLAS takes a kernel without the matrix cores for FP32 output (Tensile HSS MT64x32x8, a fifth of
+				// a generation's GPU time with its softmax); the scaled scores of QK-normed heads are small, and FP16 holds them to ~1e-3
+				half* S16 = reinterpret_cast<half*>( ws_.S );
+				CUBLAS_CHECK( cublasGemmStridedBatchedEx( blas, CUBLAS_OP_T, CUBLAS_OP_N, Lr, Lr, hd, &scale, ws_.k + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd,
+					ws_.q + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd, &zero, S16, CUDA_R_16F, Lr, static_cast<long long>( Lr ) * Lr, nh, CUBLAS_COMPUTE_32F,
+					CUBLAS_GEMM_DEFAULT ) );
+				kern::k_softmax_h<<<nh * Lr, 256>>>( S16, ws_.P, Lr );
+#else
 				CUBLAS_CHECK( cublasGemmStridedBatchedEx( blas, CUBLAS_OP_T, CUBLAS_OP_N, Lr, Lr, hd, &one, ws_.k + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd,
 					ws_.q + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd, &zero, ws_.S, CUDA_R_32F, Lr, static_cast<long long>( Lr ) * Lr, nh, CUBLAS_COMPUTE_32F,
 					CUBLAS_GEMM_DEFAULT ) );
 				kern::k_softmax<<<nh * Lr, 256>>>( ws_.S, ws_.P, Lr, scale );
+#endif
 				// O[h] = P[h] V[h], row-major [Lr, hd]
 				CUBLAS_CHECK( cublasGemmStridedBatchedEx( blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, Lr, Lr, &one, ws_.v + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd,
 					ws_.P, CUDA_R_16F, Lr, static_cast<long long>( Lr ) * Lr, &zero, ws_.o + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd, nh, CUBLAS_COMPUTE_32F,
