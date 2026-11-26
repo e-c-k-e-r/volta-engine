@@ -50,8 +50,9 @@ void TtsModel::demask_step( const std::vector<int>& text, const std::vector<uint
 	const int R = guided ? ( s.cfg_prompt > 0.0f && !prompt.empty() ? 3 : 2 ) : 1;
 	// the backbone over the guidance rows (as many in one pass as MAX_LEN holds), their hidden states at the revealed positions gathered
 	// into fw_.hh [R * k, d]
+	backend::stream_t st = stream_;
 	int* pos = fw_.pos;
-	backend::memcpy_sync( pos, reveal.data(), k * sizeof( int ), Copy::H2D );
+	backend::memcpy_async( pos, reveal.data(), k * sizeof( int ), Copy::H2D, st );
 	TtsRow rows[3];
 	for ( int r = 0; r < R; ++r ) {
 		if ( r != 1 ) { rows[r].text = text; }
@@ -67,15 +68,15 @@ void TtsModel::demask_step( const std::vector<int>& text, const std::vector<uint
 		hidden( pass, r1 - r0, fw_.h, nullptr );
 		for ( int r = r0, at = 0; r < r1; at += rows[r++].length() ) {
 			const int offset = at + static_cast<int>( rows[r].text.size() + rows[r].prompt.size() / V );
-			TtsOps::gather_rows( fw_.h, pos, offset, fw_.hh + static_cast<size_t>( r ) * k * d, k, d );
+			TtsOps::gather_rows( fw_.h, pos, offset, fw_.hh + static_cast<size_t>( r ) * k * d, k, d, st );
 		}
 		r0 = r1;
 	}
 	const int N = R * k;
 	// cond(h): the same for every flow step
-	TtsOps::gemm( fw_.hh, w_.f_cond, fw_.cond, N, W, d, true );
-	TtsOps::add_bias( fw_.cond, w_.f_cond_b, N, W );
-	backend::memcpy_sync( fw_.x, noise, static_cast<size_t>( k ) * V * 4, Copy::H2D );
+	TtsOps::gemm( fw_.hh, w_.f_cond, fw_.cond, N, W, d, true, st );
+	TtsOps::add_bias( fw_.cond, w_.f_cond_b, N, W, st );
+	backend::memcpy_async( fw_.x, noise, static_cast<size_t>( k ) * V * 4, Copy::H2D, st );
 	// the sway grid of flow_sample
 	std::vector<double> grid( s.flow_steps + 1 );
 	for ( int i = 0; i <= s.flow_steps; ++i ) {
@@ -87,38 +88,40 @@ void TtsModel::demask_step( const std::vector<int>& text, const std::vector<uint
 	for ( int j = 0; j < s.flow_steps; ++j ) {
 		const float t = static_cast<float>( grid[j] );
 		// time MLP -> temb [W]; c = cond + temb; sc = silu(c)
-		TtsOps::time_embedding( t, fw_.tvec );
-		TtsOps::gemm( fw_.tvec, w_.f_time0, fw_.t0, 1, W, 256, true );
-		TtsOps::bias_act( fw_.t0, w_.f_time0_b, fw_.t0h, 1, W, true );
-		TtsOps::gemm( fw_.t0h, w_.f_time2, fw_.temb, 1, W, W, true );
-		TtsOps::add_bias( fw_.temb, w_.f_time2_b, 1, W );
-		TtsOps::cond_silu( fw_.cond, fw_.temb, fw_.sc, N, W );
+		TtsOps::time_embedding( t, fw_.tvec, st );
+		TtsOps::gemm( fw_.tvec, w_.f_time0, fw_.t0, 1, W, 256, true, st );
+		TtsOps::bias_act( fw_.t0, w_.f_time0_b, fw_.t0h, 1, W, true, st );
+		TtsOps::gemm( fw_.t0h, w_.f_time2, fw_.temb, 1, W, W, true, st );
+		TtsOps::add_bias( fw_.temb, w_.f_time2_b, 1, W, st );
+		TtsOps::cond_silu( fw_.cond, fw_.temb, fw_.sc, N, W, st );
 		// x -> inp(x) for every row
-		TtsOps::replicate( fw_.x, fw_.xin, k * V, R );
-		TtsOps::gemm( fw_.xin, w_.f_inp, fw_.xf, N, W, V, true );
-		TtsOps::add_bias( fw_.xf, w_.f_inp_b, N, W );
+		TtsOps::replicate( fw_.x, fw_.xin, k * V, R, st );
+		TtsOps::gemm( fw_.xin, w_.f_inp, fw_.xf, N, W, V, true, st );
+		TtsOps::add_bias( fw_.xf, w_.f_inp_b, N, W, st );
 		for ( const TtsFlowBlock& b : w_.flow_blocks ) {
-			TtsOps::gemm( fw_.sc, b.mod, fw_.mod, N, 3 * W, W, true );
-			TtsOps::add_bias( fw_.mod, b.mod_b, N, 3 * W );
-			TtsOps::ln_mod( fw_.xf, fw_.mod, 3 * W, fw_.ln, N, W );
-			TtsOps::gemm( fw_.ln, b.mlp0, fw_.m1, N, 2 * W, W, true );
-			TtsOps::bias_act( fw_.m1, b.mlp0_b, fw_.m1h, N, 2 * W, true );
-			TtsOps::gemm( fw_.m1h, b.mlp2, fw_.m2, N, W, 2 * W, true );
-			TtsOps::gate_add( fw_.xf, fw_.m2, b.mlp2_b, fw_.mod, 3 * W, N, W );
+			TtsOps::gemm( fw_.sc, b.mod, fw_.mod, N, 3 * W, W, true, st );
+			TtsOps::add_bias( fw_.mod, b.mod_b, N, 3 * W, st );
+			TtsOps::ln_mod( fw_.xf, fw_.mod, 3 * W, fw_.ln, N, W, st );
+			TtsOps::gemm( fw_.ln, b.mlp0, fw_.m1, N, 2 * W, W, true, st );
+			TtsOps::bias_act( fw_.m1, b.mlp0_b, fw_.m1h, N, 2 * W, true, st );
+			TtsOps::gemm( fw_.m1h, b.mlp2, fw_.m2, N, W, 2 * W, true, st );
+			TtsOps::gate_add( fw_.xf, fw_.m2, b.mlp2_b, fw_.mod, 3 * W, N, W, st );
 		}
-		TtsOps::gemm( fw_.sc, w_.f_final_mod, fw_.mod, N, 2 * W, W, true );
-		TtsOps::add_bias( fw_.mod, w_.f_final_mod_b, N, 2 * W );
-		TtsOps::ln_mod( fw_.xf, fw_.mod, 2 * W, fw_.ln, N, W );
-		TtsOps::gemm( fw_.ln, w_.f_out, fw_.v, N, V, W, true );
-		TtsOps::guide_step( fw_.v, w_.f_out_b, fw_.x, vt_dev, k * V, V, R, s.cfg, s.cfg_prompt, static_cast<float>( grid[j + 1] - grid[j] ) );
+		TtsOps::gemm( fw_.sc, w_.f_final_mod, fw_.mod, N, 2 * W, W, true, st );
+		TtsOps::add_bias( fw_.mod, w_.f_final_mod_b, N, 2 * W, st );
+		TtsOps::ln_mod( fw_.xf, fw_.mod, 2 * W, fw_.ln, N, W, st );
+		TtsOps::gemm( fw_.ln, w_.f_out, fw_.v, N, V, W, true, st );
+		TtsOps::guide_step( fw_.v, w_.f_out_b, fw_.x, vt_dev, k * V, V, R, s.cfg, s.cfg_prompt, static_cast<float>( grid[j + 1] - grid[j] ), st );
 		if ( vtaps ) {
-			backend::memcpy_sync( vt.data(), vt_dev, vt.size() * 4, Copy::D2H );
+			backend::memcpy_async( vt.data(), vt_dev, vt.size() * 4, Copy::D2H, st );
+			backend::stream_sync( st );
 			vtaps->push_back( vt );
 		}
 	}
-	TtsOps::snap( fw_.x, fw_.snapped, k * V );
+	TtsOps::snap( fw_.x, fw_.snapped, k * V, st );
 	std::vector<uint8_t> snapped( static_cast<size_t>( k ) * V );
-	backend::memcpy_sync( snapped.data(), fw_.snapped, snapped.size(), Copy::D2H );
+	backend::memcpy_async( snapped.data(), fw_.snapped, snapped.size(), Copy::D2H, st );
+	backend::stream_sync( st );
 	for ( int i = 0; i < k; ++i ) {
 		std::copy( snapped.begin() + static_cast<size_t>( i ) * V, snapped.begin() + static_cast<size_t>( i + 1 ) * V, digits.begin() + static_cast<size_t>( reveal[i] ) * V );
 		masked[reveal[i]] = 0;

@@ -42,8 +42,9 @@ scores, in batches of heads within 128 MiB), and the codec with its activations 
 by 42 MB a second; when the GPU has no room for them the request fails with an error.
 
 Beside a language model the server loads the TTS first, so the model's arena is sized from what is left on that GPU (GLM slices its
-experts over every rank, so its expert cache shrinks by that much on each). The TTS kernels run on the default stream: on a GPU the
-language model also uses, they queue with its work instead of overlapping it.
+experts over every rank, so its expert cache shrinks by that much on each). The model and the codec run on streams of their own, so on a GPU
+the language model also uses, a synthesis shares the GPU with the model's forwards (on Vulkan too: each stream records into its own command
+pool, and the threads of the two share the device).
 
 ## Parity (tts_generate --golden, test_tts_g2p, test_tts_resample; references from vall_e/golden.py in FP32; on ROCm, CUDA and Vulkan)
 

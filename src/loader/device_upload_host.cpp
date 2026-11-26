@@ -22,7 +22,8 @@ size_t DeviceUploader::numel( const pod::SafeTensorMeta* m ) {
 
 void* DeviceUploader::raw( const pod::SafeTensorMeta* m ) {
 	void* d = engine::core::arena_alloc( arena, m->size_bytes );
-	backend::memcpy_sync( d, safetensors_get_data_cpu( st, m ), m->size_bytes, backend::Copy::H2D );
+	backend::memcpy_async( d, safetensors_get_data_cpu( st, m ), m->size_bytes, backend::Copy::H2D, stream );
+	backend::stream_sync( stream );
 	return d;
 }
 
@@ -49,7 +50,8 @@ Tout* convert( DeviceUploader& u, const pod::SafeTensorMeta* m ) {
 	std::vector<Tout> host( n );
 	for ( size_t i = 0; i < n; ++i ) { store( load( src, m->dtype, i ), &host[i] ); }
 	Tout* d = static_cast<Tout*>( engine::core::arena_alloc( u.arena, n * sizeof( Tout ) ) );
-	backend::memcpy_sync( d, host.data(), n * sizeof( Tout ), backend::Copy::H2D );
+	backend::memcpy_async( d, host.data(), n * sizeof( Tout ), backend::Copy::H2D, u.stream );
+	backend::stream_sync( u.stream );
 	return d;
 }
 

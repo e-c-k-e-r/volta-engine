@@ -73,7 +73,7 @@ void GatedResidual::mix(
 void GatedResidual::gemm_f32( const backend::half_t* a, const backend::half_t* w, float* out, int m, int n, int k, bool accumulate, backend::stream_t stream ) {
 	if ( m > 8 && k % 32 == 0 ) {
 		constexpr int kTiles = 160;
-		const int tm = m >= 128 ? 128 : 64;   // the matmul's tile (ggml_f16_matmul: large from 128 rows)
+		const int tm = 64;   // the matmul's tile (ggml_f16_matmul's 64 x 64)
 		const int tiles_mn = ( ( n + tm - 1 ) / tm ) * ( ( m + tm - 1 ) / tm );
 		int k_split = k;
 		if ( tiles_mn < kTiles && k >= 2048 ) {

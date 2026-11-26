@@ -10,6 +10,7 @@
 // each convolution is GEMMs over chunks of time.
 #pragma once
 
+#include "engine/backend/types.h"
 #include "engine/core/arena.h"
 #include "engine/loader/safetensors.h"
 #include <cstdint>
@@ -64,6 +65,7 @@ private:
 	std::vector<EncStage> enc_;
 	std::vector<DecStage> dec_;
 	const float* dec_post_alpha_ = nullptr;
+	backend::stream_t stream_ = nullptr;  // the codec's own stream
 	pod::SafeTensorsFile st_;
 	pod::MemoryArena arena_ {};
 	// activations (each the largest [C, T] of either half) and the GEMM chunks' columns / outputs

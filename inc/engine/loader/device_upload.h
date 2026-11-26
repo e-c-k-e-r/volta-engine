@@ -15,8 +15,10 @@ struct DeviceUploader {
 	const pod::SafeTensorsFile& st;
 	pod::MemoryArena& arena;
 	const char* tag = "upload";  // the log prefix for missing tensors
+	backend::stream_t stream = nullptr;  // the copies' stream on the host-converting backends (each upload complete when it returns)
 
-	DeviceUploader( const pod::SafeTensorsFile& st_, pod::MemoryArena& arena_, const char* tag_ = "upload" ) : st( st_ ), arena( arena_ ), tag( tag_ ) {}
+	DeviceUploader( const pod::SafeTensorsFile& st_, pod::MemoryArena& arena_, const char* tag_ = "upload", backend::stream_t stream_ = nullptr )
+		: st( st_ ), arena( arena_ ), tag( tag_ ), stream( stream_ ) {}
 
 	// The tensor's entry; logs an error and returns nullptr if it's missing
 	const pod::SafeTensorMeta* find( const std::string& name ) const;

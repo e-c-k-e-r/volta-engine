@@ -1,5 +1,6 @@
 // Vulkan backend implementation: headless compute device, BDA allocations, streams as deferred command buffers, graphs as
-// pre-recorded command buffers. One logical device per process (selected by ENGINE_VK_DEVICE or set_device), single-threaded.
+// pre-recorded command buffers. A logical device per rank (selected by ENGINE_VK_DEVICE and set_device); several threads may share a device as
+// long as each stream is used by one thread at a time.
 #include "engine/backend/vulkan/device.h"
 
 #include <vulkan/vulkan.h>
@@ -10,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -51,7 +53,6 @@ struct Ctx {
 	VkDevice device = VK_NULL_HANDLE;
 	VkQueue queue = VK_NULL_HANDLE;
 	uint32_t family = 0;
-	VkCommandPool pool = VK_NULL_HANDLE;
 	VkPhysicalDeviceMemoryProperties mem{};
 	VkPhysicalDeviceProperties props{};
 	PFN_vkCmdPushDescriptorSetKHR push_descriptor = nullptr;
@@ -61,12 +62,16 @@ struct Ctx {
 	size_t host_import_align = 0;   // VK_KHR_push_descriptor: storage buffers bound inside the command buffer
 	bool int_dot = false;   // shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product) enabled: packed 4 x int8 dot products
 	bool budget = false;    // VK_EXT_memory_budget: the heaps' budget and usage (the driver's and other processes' allocations included)
+	bool sg32 = false;      // VK_EXT_subgroup_size_control: pipelines created with a required subgroup size of 32 (the device's default is another)
 	// vulkan_profile: a timestamp before and after every dispatch (pairs in qpool, the pipeline of each in qwho), read at the next sync
 	VkQueryPool qpool = VK_NULL_HANDLE;
 	uint32_t qused = 0;
 	bool qreset = true;
 	std::vector<const vk::Pipeline*> qwho;
 	bool rte16 = false;   // shaderRoundingModeRTEFloat16: float -> half conversions can be made round-to-nearest-even
+	// Shared by the threads that use the device (a language model's and the TTS's, say): the allocation table and the staging pool are taken
+	// under mu; every stream records into command buffers of its own pool, so threads on different streams never share a pool
+	std::mutex mu;
 	std::map<uint64_t, Alloc> allocs; // keyed by device address
 	std::multimap<size_t, Staging> staging_pool;   // idle pooled staging buffers by capacity
 	size_t staging_pool_bytes = 0;
@@ -104,9 +109,17 @@ struct GraphSync {
 	std::vector<uint64_t> wait_val;
 };
 
+// A stream's command pool, shared with the graphs captured on it (a graph may outlive its stream)
+struct CmdPool {
+	VkDevice device = VK_NULL_HANDLE;
+	VkCommandPool pool = VK_NULL_HANDLE;
+	~CmdPool() { if ( pool ) vkDestroyCommandPool( device, pool, nullptr ); }
+};
+
 struct vk_stream {
 	VkSemaphore timeline = VK_NULL_HANDLE;
 	uint64_t value = 0;
+	std::shared_ptr<CmdPool> pool;
 	VkCommandBuffer cb = VK_NULL_HANDLE; // currently recording (or null)
 	bool capture = false;
 	size_t capture_nodes = 0;
@@ -126,6 +139,7 @@ struct vk_stream {
 // A captured sequence: command buffers split where a cross-device sync was recorded (segs.size() == syncs.size() + 1). parity_ctr: the first
 // counted signal's counter, parity the parity of its value at capture (the collective's double-buffered slots alternate from it)
 struct vk_graph {
+	std::shared_ptr<CmdPool> pool;   // the capturing stream's: the segments' pool
 	std::vector<VkCommandBuffer> segs;
 	std::vector<GraphSync> syncs;
 	uint64_t* parity_ctr = nullptr;
@@ -165,6 +179,8 @@ bool init_instance() {
 	return n > 0;
 }
 
+vk_stream* make_stream( Ctx& g );
+
 // Device `dev` (logical): physical device base + dev
 bool init_context( int dev ) {
 	std::lock_guard<std::mutex> lock( sh.mu );
@@ -185,7 +201,7 @@ bool init_context( int dev ) {
 	}
 
 	// Feature requirements of the Slang SPIR-V: PhysicalStorageBufferAddresses, Float16, Int64 (+ Int16 for the BF16 table)
-	bool has_dot_ext = false, has_push_desc = false, has_host_import = false, has_sem_fd = false, has_mem_fd = false, has_budget = false;
+	bool has_dot_ext = false, has_push_desc = false, has_host_import = false, has_sem_fd = false, has_mem_fd = false, has_budget = false, has_sg_ctl = false;
 	{
 		uint32_t en = 0;
 		vkEnumerateDeviceExtensionProperties( g.phys, nullptr, &en, nullptr );
@@ -198,19 +214,42 @@ bool init_context( int dev ) {
 			has_sem_fd = has_sem_fd || std::strcmp( e.extensionName, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME ) == 0;
 			has_mem_fd = has_mem_fd || std::strcmp( e.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME ) == 0;
 			has_budget = has_budget || std::strcmp( e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME ) == 0;
+			has_sg_ctl = has_sg_ctl || std::strcmp( e.extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME ) == 0;
 		}
 	}
+	// The kernels that reduce over a warp (subgroup operations, lane = thread % 32) take subgroups of 32: a device whose compute subgroups are
+	// another size by default (AMD's wave64, Intel's SIMD8 / 16) gets every pipeline created with a required subgroup size of 32 where it allows it
+	VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sgp{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT };
+	VkPhysicalDeviceSubgroupProperties sg{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, has_sg_ctl ? &sgp : nullptr };
+	{
+		VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sg };
+		vkGetPhysicalDeviceProperties2( g.phys, &p2 );
+	}
+	VkPhysicalDeviceSubgroupSizeControlFeaturesEXT fsg{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT };
 	VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR fdot{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR };
-	VkPhysicalDeviceVulkan11Features f11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, has_dot_ext ? &fdot : nullptr };
+	void* query_chain = nullptr;
+	if ( has_sg_ctl ) { fsg.pNext = query_chain; query_chain = &fsg; }
+	if ( has_dot_ext ) { fdot.pNext = query_chain; query_chain = &fdot; }
+	VkPhysicalDeviceVulkan11Features f11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, query_chain };
 	VkPhysicalDeviceVulkan12Features f12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f11 };
 	VkPhysicalDeviceFeatures2 f2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12 };
 	vkGetPhysicalDeviceFeatures2( g.phys, &f2 );
 	if ( !f12.bufferDeviceAddress || !f12.shaderFloat16 || !f12.timelineSemaphore || !f2.features.shaderInt64 ) return false;
 
 	g.int_dot = has_dot_ext && fdot.shaderIntegerDotProduct == VK_TRUE;
+	if ( sg.subgroupSize != 32 ) {
+		g.sg32 = has_sg_ctl && fsg.subgroupSizeControl == VK_TRUE && sgp.minSubgroupSize <= 32 && sgp.maxSubgroupSize >= 32 &&
+			( sgp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT ) != 0;
+		if ( !g.sg32 ) std::fprintf( stderr, "[-] Vulkan backend: %s runs subgroups of %u and can't be made to run 32 (the warp-wide kernels assume 32)\n", g.props.deviceName, sg.subgroupSize );
+	}
+	VkPhysicalDeviceSubgroupSizeControlFeaturesEXT want_sg{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT };
+	want_sg.subgroupSizeControl = VK_TRUE;
 	VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR want_dot{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR };
 	want_dot.shaderIntegerDotProduct = VK_TRUE;
-	VkPhysicalDeviceVulkan11Features want11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, g.int_dot ? &want_dot : nullptr };
+	void* want_chain = nullptr;
+	if ( g.sg32 ) { want_sg.pNext = want_chain; want_chain = &want_sg; }
+	if ( g.int_dot ) { want_dot.pNext = want_chain; want_chain = &want_dot; }
+	VkPhysicalDeviceVulkan11Features want11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, want_chain };
 	want11.storageBuffer16BitAccess = f11.storageBuffer16BitAccess;
 	want11.uniformAndStorageBuffer16BitAccess = f11.uniformAndStorageBuffer16BitAccess;
 	VkPhysicalDeviceVulkan12Features want12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &want11 };
@@ -248,6 +287,7 @@ bool init_context( int dev ) {
 	if ( has_host_import ) exts.push_back( VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME );
 	if ( has_sem_fd ) exts.push_back( VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME );
 	if ( has_budget ) exts.push_back( VK_EXT_MEMORY_BUDGET_EXTENSION_NAME );
+	if ( g.sg32 ) exts.push_back( VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME );
 	dci.enabledExtensionCount = static_cast<uint32_t>( exts.size() );
 	dci.ppEnabledExtensionNames = exts.data();
 	if ( vkCreateDevice( g.phys, &dci, nullptr, &g.device ) != VK_SUCCESS ) return false;
@@ -263,12 +303,10 @@ bool init_context( int dev ) {
 	}
 	vkGetDeviceQueue( g.device, g.family, 0, &g.queue );
 
-	VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-	pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-	pci.queueFamilyIndex = g.family;
-	if ( vkCreateCommandPool( g.device, &pci, nullptr, &g.pool ) != VK_SUCCESS ) return false;
 	g.get_address = reinterpret_cast<PFN_vkGetBufferDeviceAddress>( vkGetDeviceProcAddr( g.device, "vkGetBufferDeviceAddress" ) );
-	g.ok = g.get_address != nullptr;
+	if ( g.get_address == nullptr ) return false;
+	g.default_stream = make_stream( g );   // here, once: the threads sharing the device all see it
+	g.ok = true;
 	return g.ok;
 }
 
@@ -312,6 +350,7 @@ bool create_buffer( size_t bytes, bool host, VkBuffer& buf, VkDeviceMemory& mem,
 // Device pointer -> (buffer, offset)
 bool resolve( const void* p, VkBuffer& buf, VkDeviceSize& off ) {
 	const uint64_t a = reinterpret_cast<uint64_t>( p );
+	std::lock_guard<std::mutex> lk( cur().mu );
 	auto it = cur().allocs.upper_bound( a );
 	if ( it == cur().allocs.begin() ) return false;
 	--it;
@@ -329,9 +368,9 @@ bool is_device_ptr( const void* p ) {
 
 vk_stream* resolve_stream( stream_t s ) { return s ? s : cur().default_stream; }
 
-VkCommandBuffer begin_cb( bool reusable ) {
+VkCommandBuffer begin_cb( VkCommandPool pool, bool reusable ) {
 	VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-	ai.commandPool = cur().pool;
+	ai.commandPool = pool;
 	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 	ai.commandBufferCount = 1;
 	VkCommandBuffer cb;
@@ -397,7 +436,7 @@ void prof_harvest() {
 
 VkCommandBuffer recording( vk_stream* s ) {
 	if ( !s->cb ) {
-		s->cb = begin_cb( s->capture );
+		s->cb = begin_cb( s->pool->pool, s->capture );
 		if ( profiling() && !s->capture ) {
 			Ctx& c = cur();
 			if ( c.qpool == VK_NULL_HANDLE ) {
@@ -548,11 +587,14 @@ void sync( vk_stream* s ) {
 	if ( profiling() ) prof_harvest();
 	for ( auto& st : s->staging ) {
 		if ( st.host_dst ) std::memcpy( st.host_dst, st.map, st.bytes );
-		if ( st.capacity <= kPoolMax && cur().staging_pool_bytes + st.capacity <= kPoolLimit ) {
-			st.host_dst = nullptr;
-			cur().staging_pool_bytes += st.capacity;
-			cur().staging_pool.emplace( st.capacity, st );
-			continue;
+		{
+			std::lock_guard<std::mutex> lk( cur().mu );
+			if ( st.capacity <= kPoolMax && cur().staging_pool_bytes + st.capacity <= kPoolLimit ) {
+				st.host_dst = nullptr;
+				cur().staging_pool_bytes += st.capacity;
+				cur().staging_pool.emplace( st.capacity, st );
+				continue;
+			}
 		}
 		vkUnmapMemory( cur().device, st.memory );
 		vkDestroyBuffer( cur().device, st.buffer, nullptr );
@@ -560,18 +602,26 @@ void sync( vk_stream* s ) {
 	}
 	s->staging.clear();
 	s->staging_bytes = 0;
-	if ( !s->inflight.empty() ) vkFreeCommandBuffers( cur().device, cur().pool, uint32_t( s->inflight.size() ), s->inflight.data() );
+	if ( !s->inflight.empty() ) vkFreeCommandBuffers( cur().device, s->pool->pool, uint32_t( s->inflight.size() ), s->inflight.data() );
 	s->inflight.clear();
 }
 
-vk_stream* make_stream() {
+// A stream of device g: its timeline and its own command pool
+vk_stream* make_stream( Ctx& g ) {
 	auto* s = new vk_stream();
 	VkSemaphoreTypeCreateInfo ti{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
 	ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
 	VkSemaphoreCreateInfo ci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ti };
-	ENGINE_CHECK( vkCreateSemaphore( cur().device, &ci, nullptr, &s->timeline ) );
+	ENGINE_CHECK( vkCreateSemaphore( g.device, &ci, nullptr, &s->timeline ) );
+	VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+	pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+	pci.queueFamilyIndex = g.family;
+	s->pool = std::make_shared<CmdPool>();
+	s->pool->device = g.device;
+	ENGINE_CHECK( vkCreateCommandPool( g.device, &pci, nullptr, &s->pool->pool ) );
 	return s;
 }
+vk_stream* make_stream() { return make_stream( cur() ); }
 
 
 // SPIR-V float -> half conversions without a rounding-mode decoration are round-toward-zero on NVIDIA's Vulkan driver, while the CUDA
@@ -702,12 +752,17 @@ bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, strea
 			cap = kPoolMin;
 			while ( cap < bytes ) cap <<= 1;
 		}
-		if ( auto it = cur().staging_pool.find( cap ); it != cur().staging_pool.end() ) {
-			st_buf = it->second;
-			cur().staging_pool.erase( it );
-			cur().staging_pool_bytes -= cap;
+		bool pooled = false;
+		{
+			std::lock_guard<std::mutex> lk( cur().mu );
+			if ( auto it = cur().staging_pool.find( cap ); it != cur().staging_pool.end() ) {
+				st_buf = it->second;
+				cur().staging_pool.erase( it );
+				cur().staging_pool_bytes -= cap;
+				pooled = true;
+			}
 		}
-		else if ( !create_buffer( cap, true, st_buf.buffer, st_buf.memory, &st_buf.map ) ) return false;
+		if ( !pooled && !create_buffer( cap, true, st_buf.buffer, st_buf.memory, &st_buf.map ) ) return false;
 		st_buf.bytes = bytes;
 		st_buf.capacity = cap;
 		if ( dir == Copy::H2D ) {
@@ -827,6 +882,7 @@ void* device_malloc_try( size_t bytes ) {
 	VkBufferDeviceAddressInfo ai{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
 	ai.buffer = a.buffer;
 	const uint64_t addr = cur().get_address( cur().device, &ai );
+	std::lock_guard<std::mutex> lk( cur().mu );
 	cur().allocs[addr] = a;
 	cur().allocated += a.size;
 	return reinterpret_cast<void*>( addr );
@@ -838,13 +894,18 @@ void* device_malloc( size_t bytes ) {
 }
 void device_free( void* p ) {
 	if ( !p ) return;
-	auto it = cur().allocs.find( reinterpret_cast<uint64_t>( p ) );
-	if ( it == cur().allocs.end() ) return;
+	Alloc a{};
+	{
+		std::lock_guard<std::mutex> lk( cur().mu );
+		auto it = cur().allocs.find( reinterpret_cast<uint64_t>( p ) );
+		if ( it == cur().allocs.end() ) return;
+		a = it->second;
+		cur().allocated -= a.size;
+		cur().allocs.erase( it );
+	}
 	{ std::lock_guard<std::mutex> qlk( cur().queue_mu ); vkQueueWaitIdle( cur().queue ); } // cudaFree synchronizes implicitly
-	vkDestroyBuffer( cur().device, it->second.buffer, nullptr );
-	vkFreeMemory( cur().device, it->second.memory, nullptr );
-	cur().allocated -= it->second.size;
-	cur().allocs.erase( it );
+	vkDestroyBuffer( cur().device, a.buffer, nullptr );
+	vkFreeMemory( cur().device, a.memory, nullptr );
 }
 
 void graph_capture_begin( stream_t st ) {
@@ -866,6 +927,7 @@ graph_t graph_capture_end( stream_t st ) {
 		return nullptr;
 	}
 	auto* gr = new vk_graph();
+	gr->pool = s->pool;
 	if ( !s->cb ) recording( s ); // the last segment (empty, or the whole capture)
 	pay_held( s, s->cb );
 	ENGINE_CHECK( vkEndCommandBuffer( s->cb ) );
@@ -914,7 +976,7 @@ void graph_launch( graph_exec_t e, stream_t st ) {
 void graph_destroy( graph_t gr ) {
 	if ( !gr ) return;
 	{ std::lock_guard<std::mutex> qlk( cur().queue_mu ); vkQueueWaitIdle( cur().queue ); }
-	if ( !gr->segs.empty() ) vkFreeCommandBuffers( cur().device, cur().pool, static_cast<uint32_t>( gr->segs.size() ), gr->segs.data() );
+	if ( !gr->segs.empty() ) vkFreeCommandBuffers( gr->pool->device, gr->pool->pool, static_cast<uint32_t>( gr->segs.size() ), gr->segs.data() );
 	delete gr;
 }
 void graph_exec_destroy( graph_exec_t e ) { graph_destroy( e ); }
@@ -989,6 +1051,9 @@ Pipeline* create_pipeline( const char* spv_path, uint32_t push_bytes, uint32_t b
 		return nullptr;
 	}
 	cpi.stage.module = p->module;
+	VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rsg{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT };
+	rsg.requiredSubgroupSize = 32;
+	if ( cur().sg32 ) cpi.stage.pNext = &rsg;
 	if ( spec_count > 0 ) cpi.stage.pSpecializationInfo = &si;
 	cpi.layout = p->layout;
 	if ( vkCreateComputePipelines( cur().device, VK_NULL_HANDLE, 1, &cpi, nullptr, &p->pipeline ) != VK_SUCCESS ) {
@@ -1044,8 +1109,12 @@ void dispatch_bound( stream_t st, Pipeline* p, const void* push, const void* con
 		ENGINE_ASSERT( resolve( buffers[i], buf, off ), "Vulkan backend: a bound buffer is not a device allocation" );
 		ENGINE_ASSERT( off % cur().props.limits.minStorageBufferOffsetAlignment == 0, "Vulkan backend: a bound buffer is misaligned" );
 		const uint64_t a = reinterpret_cast<uint64_t>( buffers[i] );
-		auto it = --cur().allocs.upper_bound( a );
-		const VkDeviceSize left = it->second.size - off;
+		VkDeviceSize left = 0;
+		{
+			std::lock_guard<std::mutex> lk( cur().mu );
+			auto it = --cur().allocs.upper_bound( a );
+			left = it->second.size - off;
+		}
 		info[i] = { buf, off, std::min<VkDeviceSize>( left, cur().props.limits.maxStorageBufferRange ) };
 		writes[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
 		writes[i].dstBinding = i;
@@ -1111,6 +1180,7 @@ void* import_host_memory( void* host, size_t bytes ) {
 	VkBufferDeviceAddressInfo ai{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
 	ai.buffer = a.buffer;
 	const uint64_t addr = cur().get_address( cur().device, &ai );
+	std::lock_guard<std::mutex> lk( cur().mu );
 	cur().allocs[addr] = a;   // not counted in `allocated`: host memory
 	return reinterpret_cast<void*>( addr );
 }

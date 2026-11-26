@@ -24,10 +24,12 @@ constexpr size_t CHUNK = 16u << 20;  // floats of a GEMM chunk's columns, and of
 }  // namespace
 
 NemoCodec::~NemoCodec() {
+	if ( stream_ ) { backend::stream_sync( stream_ ); }
 	for ( float* p : { x_, cur_, a_, b_, acc_, cols_, ph_ } ) { if ( p ) { backend::device_free( p ); } }
 	if ( digits_ ) { backend::device_free( digits_ ); }
 	engine::loader::safetensors_close( st_ );
 	if ( arena_.base_ptr ) { engine::core::arena_destroy( arena_ ); }
+	if ( stream_ ) { backend::stream_destroy( stream_ ); }
 }
 
 bool NemoCodec::load( const std::string& path, int device ) {
@@ -103,7 +105,8 @@ bool NemoCodec::load( const std::string& path, int device ) {
 		LOG_ERROR( "codec: can't allocate the weight arena" );
 		return false;
 	}
-	engine::loader::DeviceUploader u( st_, arena_, "codec" );
+	stream_ = backend::stream_create();
+	engine::loader::DeviceUploader u( st_, arena_, "codec", stream_ );
 	bool ok = true;
 	auto F32 = [&]( const std::string& n ) { const float* p = u.f32( n ); ok &= p != nullptr; return p; };
 	auto conv = [&]( const std::string& p, int co, int ci, int k, int dil, int stride = 1 ) {
@@ -175,7 +178,8 @@ bool NemoCodec::load( const std::string& path, int device ) {
 			}
 		}
 		float* dev = static_cast<float*>( engine::core::arena_alloc( arena_, big.size() * 4 ) );
-		backend::memcpy_sync( dev, big.data(), big.size() * 4, backend::Copy::H2D );
+		backend::memcpy_async( dev, big.data(), big.size() * 4, backend::Copy::H2D, stream_ );
+		backend::stream_sync( stream_ );
 		st.up.w = dev;
 		st.up.b = F32( "audio_decoder.up_sample_conv_layers." + p + ".conv.bias" );
 		st.up.co = co; st.up.ci = C; st.up.s = s;
@@ -225,34 +229,34 @@ bool NemoCodec::reserve( int n_frames ) {
 int NemoCodec::conv( const Conv& c, const float* x, float* y, int T ) {
 	const int T_out = ( T + 2 * c.pad - c.dil * ( c.k - 1 ) - 1 ) / c.stride + 1;
 	ENGINE_ASSERT( c.pad < T, "codec: input shorter than a convolution's reflection padding" );
-	CodecOps::conv( x, c.w, c.b, y, c.ci, c.co, c.k, c.dil, c.stride, c.pad, T, T_out, cols_, CHUNK );
+	CodecOps::conv( x, c.w, c.b, y, c.ci, c.co, c.k, c.dil, c.stride, c.pad, T, T_out, cols_, CHUNK, stream_ );
 	return T_out;
 }
 
 void NemoCodec::up_conv( const UpConv& u, const float* x, float* y, int T_in ) {
-	CodecOps::up_conv( x, u.w, u.b, y, u.ci, u.co, u.s, T_in, cols_, ph_, CHUNK );
+	CodecOps::up_conv( x, u.w, u.b, y, u.ci, u.co, u.s, T_in, cols_, ph_, CHUNK, stream_ );
 }
 
 void NemoCodec::act( const float* x, float* y, const float* alpha, int C, int T ) {
-	CodecOps::act( x, y, alpha, C, T );
+	CodecOps::act( x, y, alpha, C, T, stream_ );
 }
 
 void NemoCodec::res_layer( const ResLayer& r, int C, int T ) {
 	// the mean of the branches, each a chain of x + skip(act(in(act(x)))) from the layer's input
 	const size_t n = static_cast<size_t>( C ) * T;
 	for ( size_t b = 0; b < r.size(); ++b ) {
-		backend::memcpy_async( cur_, x_, n * 4, backend::Copy::D2D, nullptr );
+		backend::memcpy_async( cur_, x_, n * 4, backend::Copy::D2D, stream_ );
 		for ( const ResBlock& rb : r[b] ) {
 			act( cur_, a_, rb.alpha_in, C, T );
 			conv( rb.in, a_, b_, T );
 			act( b_, b_, rb.alpha_skip, C, T );
 			conv( rb.skip, b_, a_, T );
-			CodecOps::axpy( cur_, a_, 1.0f, 1.0f, n );
+			CodecOps::axpy( cur_, a_, 1.0f, 1.0f, n, stream_ );
 		}
-		if ( b == 0 ) { backend::memcpy_async( acc_, cur_, n * 4, backend::Copy::D2D, nullptr ); }
-		else { CodecOps::axpy( acc_, cur_, 1.0f, 1.0f, n ); }
+		if ( b == 0 ) { backend::memcpy_async( acc_, cur_, n * 4, backend::Copy::D2D, stream_ ); }
+		else { CodecOps::axpy( acc_, cur_, 1.0f, 1.0f, n, stream_ ); }
 	}
-	CodecOps::axpy( x_, acc_, 0.0f, 1.0f / static_cast<float>( r.size() ), n );
+	CodecOps::axpy( x_, acc_, 0.0f, 1.0f / static_cast<float>( r.size() ), n, stream_ );
 }
 
 std::vector<float> NemoCodec::decode( const std::vector<uint8_t>& digits, int n_frames ) {
@@ -260,8 +264,8 @@ std::vector<float> NemoCodec::decode( const std::vector<uint8_t>& digits, int n_
 	ENGINE_ASSERT( static_cast<int>( digits.size() ) >= n_frames * 32, "codec: fewer digits than frames" );
 	ENGINE_ASSERT( n_frames >= 4, "codec: at least 4 frames" );
 	if ( !reserve( n_frames ) ) { return {}; }
-	backend::memcpy_sync( digits_, digits.data(), static_cast<size_t>( n_frames ) * 32, Copy::H2D );
-	CodecOps::dequant( digits_, a_, n_frames, cfg_.levels.data() );
+	backend::memcpy_async( digits_, digits.data(), static_cast<size_t>( n_frames ) * 32, Copy::H2D, stream_ );
+	CodecOps::dequant( digits_, a_, n_frames, cfg_.levels.data(), stream_ );
 	conv( dec_pre_, a_, x_, n_frames );
 	int C = cfg_.dec_channels, T = n_frames;
 	for ( const DecStage& st : dec_ ) {
@@ -274,10 +278,11 @@ std::vector<float> NemoCodec::decode( const std::vector<uint8_t>& digits, int n_
 	}
 	act( x_, x_, dec_post_alpha_, C, T );
 	conv( dec_post_, x_, a_, T );
-	CodecOps::clamp( a_, static_cast<size_t>( T ) );
+	CodecOps::clamp( a_, static_cast<size_t>( T ), stream_ );
 	backend::check_last_error();
 	std::vector<float> out( T );
-	backend::memcpy_sync( out.data(), a_, static_cast<size_t>( T ) * 4, Copy::D2H );
+	backend::memcpy_async( out.data(), a_, static_cast<size_t>( T ) * 4, Copy::D2H, stream_ );
+	backend::stream_sync( stream_ );
 	return out;
 }
 
@@ -288,8 +293,8 @@ std::vector<uint8_t> NemoCodec::encode( const std::vector<float>& audio ) {
 	ENGINE_ASSERT( n_frames >= 4, "codec: at least 4 frames of audio" );
 	if ( !reserve( n_frames ) ) { return {}; }
 	int T = n_frames * spf, C = cfg_.enc_channels;
-	backend::memset_sync( a_, 0, static_cast<size_t>( T ) * 4 );   // zero-padded to whole frames
-	backend::memcpy_sync( a_, audio.data(), audio.size() * 4, Copy::H2D );
+	backend::memset_async( a_, 0, static_cast<size_t>( T ) * 4, stream_ );   // zero-padded to whole frames
+	backend::memcpy_async( a_, audio.data(), audio.size() * 4, Copy::H2D, stream_ );
 	conv( enc_pre_, a_, x_, T );
 	for ( const EncStage& st : enc_ ) {
 		res_layer( st.res, C, T );
@@ -301,10 +306,11 @@ std::vector<uint8_t> NemoCodec::encode( const std::vector<float>& audio ) {
 	ENGINE_ASSERT( T == n_frames, "codec: the encoder's frame count" );
 	act( x_, x_, nullptr, C, T );
 	conv( enc_post_, x_, a_, T );
-	CodecOps::quant( a_, digits_, T, cfg_.levels.data(), cfg_.fsq_eps );
+	CodecOps::quant( a_, digits_, T, cfg_.levels.data(), cfg_.fsq_eps, stream_ );
 	backend::check_last_error();
 	std::vector<uint8_t> out( static_cast<size_t>( T ) * 32 );
-	backend::memcpy_sync( out.data(), digits_, out.size(), Copy::D2H );
+	backend::memcpy_async( out.data(), digits_, out.size(), Copy::D2H, stream_ );
+	backend::stream_sync( stream_ );
 	return out;
 }
 

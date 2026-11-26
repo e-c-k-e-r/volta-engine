@@ -54,7 +54,7 @@ void TtsModel::alloc_workspace() {
 	const int rot = static_cast<int>( cfg_.head_dim() * cfg_.rot_frac ) / 2 * 2;
 	ws_.rope_cs = static_cast<float*>( A( L * rot / 2 * 4 ) );
 	ws_.rope_sn = static_cast<float*>( A( L * rot / 2 * 4 ) );
-	if ( rot ) { TtsOps::rope_table( ws_.rope_cs, ws_.rope_sn, MAX_LEN, rot, cfg_.rope_theta ); }
+	if ( rot ) { TtsOps::rope_table( ws_.rope_cs, ws_.rope_sn, MAX_LEN, rot, cfg_.rope_theta, stream_ ); }
 	alloc_flow_workspace();
 }
 
@@ -93,22 +93,25 @@ void TtsModel::hidden( const TtsRow* const* rows, int n, float* out, std::vector
 			std::copy( row.target.begin(), row.target.end(), digits.begin() + static_cast<size_t>( s + Lt + Lp ) * V );
 		}
 	}
-	backend::memcpy_sync( ws_.ids, ids.data(), L * 4, Copy::H2D );
-	backend::memcpy_sync( ws_.pos, pos.data(), L * 4, Copy::H2D );
-	backend::memcpy_sync( ws_.kind, kind.data(), L, Copy::H2D );
-	backend::memcpy_sync( ws_.masked, masked.data(), L, Copy::H2D );
-	backend::memcpy_sync( ws_.digits, digits.data(), digits.size(), Copy::H2D );
+	// the host vectors are copied out before each call returns
+	backend::stream_t s = stream_;
+	backend::memcpy_async( ws_.ids, ids.data(), L * 4, Copy::H2D, s );
+	backend::memcpy_async( ws_.pos, pos.data(), L * 4, Copy::H2D, s );
+	backend::memcpy_async( ws_.kind, kind.data(), L, Copy::H2D, s );
+	backend::memcpy_async( ws_.masked, masked.data(), L, Copy::H2D, s );
+	backend::memcpy_async( ws_.digits, digits.data(), digits.size(), Copy::H2D, s );
 
 	// embeddings: audio_in(values) + bias everywhere (the text / mask / query positions are overwritten), then the mix
-	TtsOps::digits_values( ws_.digits, ws_.vals, L * V );
-	TtsOps::gemm( ws_.vals, w_.audio_in, ws_.a, L, d, V, true );
-	TtsOps::add_bias( ws_.a, w_.audio_in_b, L, d );
-	TtsOps::embed_mix( ws_.x, ws_.a, w_.text, ws_.ids, ws_.kind, ws_.masked, w_.mask_emb, w_.len_q, w_.segment, w_.mode + static_cast<size_t>( rows[0]->mode ) * d, L, d );
+	TtsOps::digits_values( ws_.digits, ws_.vals, L * V, s );
+	TtsOps::gemm( ws_.vals, w_.audio_in, ws_.a, L, d, V, true, s );
+	TtsOps::add_bias( ws_.a, w_.audio_in_b, L, d, s );
+	TtsOps::embed_mix( ws_.x, ws_.a, w_.text, ws_.ids, ws_.kind, ws_.masked, w_.mask_emb, w_.len_q, w_.segment, w_.mode + static_cast<size_t>( rows[0]->mode ) * d, L, d, s );
 
 	auto tap = [&]( const float* src ) {
 		if ( !taps ) { return; }
 		taps->emplace_back( static_cast<size_t>( L ) * d );
-		backend::memcpy_sync( taps->back().data(), src, static_cast<size_t>( L ) * d * 4, Copy::D2H );
+		backend::memcpy_async( taps->back().data(), src, static_cast<size_t>( L ) * d * 4, Copy::D2H, s );
+		backend::stream_sync( s );
 	};
 	const int rot = static_cast<int>( hd * cfg_.rot_frac ) / 2 * 2;
 	const float scale = 1.0f / std::sqrt( static_cast<float>( hd ) );
@@ -116,24 +119,24 @@ void TtsModel::hidden( const TtsRow* const* rows, int n, float* out, std::vector
 	const float* branch = nullptr;   // the MLP's output, added into the residual stream by the next norm
 	for ( const TtsBlock& b : w_.blocks ) {
 		// attention
-		TtsOps::add_rms_norm( ws_.x, branch, b.n1, L, d, EPS_FP32, ws_.xn, nullptr );
+		TtsOps::add_rms_norm( ws_.x, branch, b.n1, L, d, EPS_FP32, ws_.xn, nullptr, s );
 		tap( ws_.x );
-		TtsOps::gemm( ws_.xn, b.qkv, ws_.qkv, L, 3 * d, d, false );
-		TtsOps::qk_norm_rope( ws_.qkv, b.q_norm, b.k_norm, ws_.q, ws_.k, ws_.v, ws_.pos, L, H, hd, rot, ws_.rope_cs, ws_.rope_sn, EPS_QK, head_major );
+		TtsOps::gemm( ws_.xn, b.qkv, ws_.qkv, L, 3 * d, d, false, s );
+		TtsOps::qk_norm_rope( ws_.qkv, b.q_norm, b.k_norm, ws_.q, ws_.k, ws_.v, ws_.pos, L, H, hd, rot, ws_.rope_cs, ws_.rope_sn, EPS_QK, head_major, s );
 		for ( int r = 0; r < n; ++r ) {
-			TtsOps::attention( ws_.q, ws_.k, ws_.v, ws_.o, start[r], start[r + 1] - start[r], L, H, hd, scale, ws_.attn, ws_.attn_bytes );
+			TtsOps::attention( ws_.q, ws_.k, ws_.v, ws_.o, start[r], start[r + 1] - start[r], L, H, hd, scale, ws_.attn, ws_.attn_bytes, s );
 		}
-		if ( b.gate ) { TtsOps::gemm( ws_.xn, b.gate, ws_.g, L, d, d, false ); }
-		TtsOps::heads_gate( ws_.o, b.gate ? ws_.g : nullptr, ws_.y, L, H, hd, head_major );
-		TtsOps::gemm( ws_.y, b.out, ws_.a, L, d, d, true );
+		if ( b.gate ) { TtsOps::gemm( ws_.xn, b.gate, ws_.g, L, d, d, false, s ); }
+		TtsOps::heads_gate( ws_.o, b.gate ? ws_.g : nullptr, ws_.y, L, H, hd, head_major, s );
+		TtsOps::gemm( ws_.y, b.out, ws_.a, L, d, d, true, s );
 		// MLP (the attention's output added first)
-		TtsOps::add_rms_norm( ws_.x, ws_.a, b.n2, L, d, EPS_FP32, ws_.xn, nullptr );
-		TtsOps::gemm( ws_.xn, b.up, ws_.up, L, 2 * F, d, false );
-		TtsOps::swiglu( ws_.up, ws_.act, L, F );
-		TtsOps::gemm( ws_.act, b.down, ws_.a, L, d, F, true );
+		TtsOps::add_rms_norm( ws_.x, ws_.a, b.n2, L, d, EPS_FP32, ws_.xn, nullptr, s );
+		TtsOps::gemm( ws_.xn, b.up, ws_.up, L, 2 * F, d, false, s );
+		TtsOps::swiglu( ws_.up, ws_.act, L, F, s );
+		TtsOps::gemm( ws_.act, b.down, ws_.a, L, d, F, true, s );
 		branch = ws_.a;
 	}
-	TtsOps::add_rms_norm( ws_.x, branch, w_.norm, L, d, EPS_FP32, nullptr, out );
+	TtsOps::add_rms_norm( ws_.x, branch, w_.norm, L, d, EPS_FP32, nullptr, out, s );
 	backend::check_last_error();
 	tap( out );
 }
@@ -151,9 +154,10 @@ int TtsModel::predict_length( const std::vector<int>& text, const std::vector<ui
 	const int d = cfg_.d_model;
 	std::vector<float> h( d ), w( d );
 	float bias = 0.0f;
-	backend::memcpy_sync( h.data(), fw_.h + static_cast<size_t>( row.length() - 1 ) * d, d * 4, Copy::D2H );
-	backend::memcpy_sync( w.data(), w_.length_w, d * 4, Copy::D2H );
-	backend::memcpy_sync( &bias, w_.length_b, 4, Copy::D2H );
+	backend::memcpy_async( h.data(), fw_.h + static_cast<size_t>( row.length() - 1 ) * d, d * 4, Copy::D2H, stream_ );
+	backend::memcpy_async( w.data(), w_.length_w, d * 4, Copy::D2H, stream_ );
+	backend::memcpy_async( &bias, w_.length_b, 4, Copy::D2H, stream_ );
+	backend::stream_sync( stream_ );
 	double s = bias;
 	for ( int i = 0; i < d; ++i ) { s += static_cast<double>( h[i] ) * w[i]; }
 	if ( log_patches ) { *log_patches = static_cast<float>( s ); }

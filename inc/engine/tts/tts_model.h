@@ -110,6 +110,7 @@ private:
 	Sampling sampling_;
 	TtsWeights w_;
 	int device_ = 0;
+	backend::stream_t stream_ = nullptr;  // the model's own stream (beside a language model on the same GPU, the two overlap)
 	struct Workspace {
 		float *x = nullptr, *a = nullptr;
 		void* attn = nullptr;  // the attention's scratch (TtsOps::attention_scratch bytes)

@@ -15,8 +15,8 @@ namespace engine::backend::impl {
 vk::Pipeline* kernel( const char* name, uint32_t push_bytes ) {
 	// Pipelines belong to a VkDevice: one cache per device (the rank threads call this concurrently)
 	static std::map<std::string, vk::Pipeline*> caches[ENGINE_NUM_GPUS];
-	static std::mutex mu;
-	std::lock_guard<std::mutex> lock( mu );
+	static std::mutex mus[ENGINE_NUM_GPUS];
+	std::lock_guard<std::mutex> lock( mus[get_device()] );
 	auto& cache = caches[get_device()];
 	auto it = cache.find( name );
 	if ( it != cache.end() ) return it->second;
@@ -31,6 +31,8 @@ vk::Pipeline* kernel( const char* name, uint32_t push_bytes ) {
 void* scratch( int slot, size_t bytes, stream_t stream ) {
 	struct Slot { void* p = nullptr; size_t bytes = 0; };
 	static std::vector<Slot> all_slots[ENGINE_NUM_GPUS];   // per device: a scratch buffer lives on the device that was current when it was made
+	static std::mutex mus[ENGINE_NUM_GPUS];   // the threads sharing a device share its slots (a slot itself belongs to one caller at a time)
+	std::lock_guard<std::mutex> lock( mus[get_device()] );
 	auto& slots = all_slots[get_device()];
 	vk::scratch_use( stream );
 	if ( slot >= static_cast<int>( slots.size() ) ) slots.resize( slot + 1 );

@@ -1,4 +1,5 @@
 #include "engine/tts/tts_model.h"
+#include "engine/backend/runtime.h"
 #include "engine/core/log.h"
 #include "engine/loader/device_upload.h"
 #include <nlohmann/json.hpp>
@@ -6,9 +7,11 @@
 namespace engine::tts {
 
 TtsModel::~TtsModel() {
+	if ( stream_ ) { backend::stream_sync( stream_ ); }
 	engine::loader::safetensors_close( st_ );
 	if ( arena_.base_ptr ) { engine::core::arena_destroy( arena_ ); }
 	if ( ws_arena_.base_ptr ) { engine::core::arena_destroy( ws_arena_ ); }
+	if ( stream_ ) { backend::stream_destroy( stream_ ); }
 }
 
 bool TtsModel::load( const std::string& path, int device ) {
@@ -70,7 +73,8 @@ bool TtsModel::load( const std::string& path, int device ) {
 		LOG_ERROR( "tts: can't allocate the weight arena" );
 		return false;
 	}
-	engine::loader::DeviceUploader u( st_, arena_, "tts" );
+	stream_ = backend::stream_create();
+	engine::loader::DeviceUploader u( st_, arena_, "tts", stream_ );
 	bool ok = true;
 	auto F32 = [&]( const std::string& n ) { const float* p = u.f32( n ); ok &= p != nullptr; return p; };
 	auto F16 = [&]( const std::string& n ) { const half* p = u.f16( n ); ok &= p != nullptr; return p; };

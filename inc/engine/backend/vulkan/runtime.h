@@ -8,6 +8,8 @@
 // in src/backend/vulkan. Streams record command buffers that are submitted on sync; a "graph" is a pre-recorded command
 // buffer. Device pointers are buffer device addresses (BDA) carried in void*.
 //
+// Several threads on one device: each stream records into its own command pool, and the allocation table and staging pool are locked, so
+// threads may share a device as long as a stream (the default one included) is used by one thread at a time.
 // Several devices: set_device(d) makes device d current for the calling thread (one context per device). A device pointer is only valid on the
 // device that allocated it, and other devices may hand out the same addresses, so a copy between devices must be peer_copy_async (through the host)
 // and never a plain memcpy_async of a foreign pointer. Not implemented (asserts): mapped pinned host memory (returns nullptr), memset with
