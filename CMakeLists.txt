@@ -1031,6 +1031,22 @@ if(ENGINE_GPU)
 	add_executable(tts_generate src/tts/tts_generate_main.cpp)
 	target_link_libraries(tts_generate PRIVATE engine_kernels)
 	set_target_properties(tts_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	# the TTS text front-end (vall_e's g2p through espeak-ng; GPL-3.0, which the AGPL-3.0 allows combining with): built
+	# when libespeak-ng is installed, with its parity test against vall_e's phonemes
+	find_library(ESPEAK_NG_LIBRARY espeak-ng)
+	find_path(ESPEAK_NG_INCLUDE espeak-ng/speak_lib.h)
+	if(ESPEAK_NG_LIBRARY AND ESPEAK_NG_INCLUDE)
+		add_library(engine_tts_g2p STATIC src/tts/g2p.cpp)
+		target_include_directories(engine_tts_g2p PUBLIC ${PROJECT_SOURCE_DIR}/inc ${PROJECT_SOURCE_DIR}/deps/json/single_include ${ESPEAK_NG_INCLUDE})
+		target_link_libraries(engine_tts_g2p PUBLIC ${ESPEAK_NG_LIBRARY})
+		target_compile_definitions(tts_generate PRIVATE ENGINE_TTS_G2P=1)
+		target_link_libraries(tts_generate PRIVATE engine_tts_g2p)
+		add_executable(test_tts_g2p tests/2_parity/test_tts_g2p.cpp)
+		target_link_libraries(test_tts_g2p PRIVATE engine_tts_g2p)
+		set_target_properties(test_tts_g2p PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	else()
+		message(STATUS "libespeak-ng not found: tts_generate without its text front-end")
+	endif()
 
 	# NCCL is optional: it enables tensor parallelism (the transformer and the text tower over several GPUs) and bench_allreduce
 	if(ENGINE_BACKEND STREQUAL "CUDA")
