@@ -46,6 +46,11 @@ bool TtsModel::load( const std::string& path, int device ) {
 			return false;
 		}
 		cfg_.vocab = nlohmann::json::parse( *vocab ).get<std::vector<std::string>>();
+		if ( const std::string* guidance = engine::loader::safetensors_metadata( st_, "guidance" ) ) {
+			auto g = nlohmann::json::parse( *guidance );
+			sampling_.cfg = g.value( "cfg", sampling_.cfg );
+			sampling_.cfg_prompt = g.value( "cfg_prompt", sampling_.cfg_prompt );
+		}
 	} catch ( const std::exception& e ) {
 		LOG_ERROR( "tts: bad config metadata: %s", e.what() );
 		return false;

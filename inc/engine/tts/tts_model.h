@@ -73,6 +73,9 @@ public:
 		int steps = 25, flow_steps = 8;
 		float cfg = 6.0f, cfg_prompt = 2.0f, sway = -1.0f;
 	};
+	// The sampling the export was tuned for: its "guidance" metadata (vall_e/export.py --cfg / --cfg-prompt: v2.0 3.0 / 2.0,
+	// a distilled model 0 / 0), else the 225M models' 6.0 / 2.0, as vall_e/tts.py defaults
+	const Sampling& default_sampling() const { return sampling_; }
 	// One demasking step (vall_e/model.py demask_flow): the backbone over the guidance rows (cond; null without text and
 	// prompt; promptless, with cfg_prompt) at the current target digits [La * values] / masked [La], then the guided flow
 	// head from noise [k * values] at the `reveal` positions, whose snapped digits are written into digits (and their
@@ -96,6 +99,7 @@ private:
 	void gemm( const half* A, const half* W, void* C, int M, int N, int K, bool c32 );
 
 	TtsConfig cfg_;
+	Sampling sampling_;
 	TtsWeights w_;
 	void* blas_ = nullptr;  // cublasHandle_t
 	struct Workspace {

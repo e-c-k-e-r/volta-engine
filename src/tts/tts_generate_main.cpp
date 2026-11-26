@@ -1,4 +1,4 @@
-// tts_generate: the vall-e v3 TTS model from the command line.
+// tts_generate: the vall-e v3 TTS model from the command line (guidance: the export's own, or --cfg / --cfg-prompt).
 //   tts_generate --model <export.sft>                        load and report
 //   tts_generate --model <export.sft> --golden <case.safetensors>
 //       parity against a vall_e/golden.py reference: the backbone at demask step 0 (the input of every block, the final
@@ -8,8 +8,10 @@
 //       [frames, 32] (decode them with the codec in Python)
 #include "engine/loader/safetensors.h"
 #include "engine/tts/tts_model.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstring>
@@ -54,7 +56,7 @@ static void write_npy_u8( const std::string& path, const std::vector<uint8_t>& v
 	std::fclose( f );
 }
 
-static int check_demask( engine::tts::TtsModel& m, const char* path, const std::string& out ) {
+static int check_demask( engine::tts::TtsModel& m, const char* path, const std::string& out, const engine::tts::TtsModel::Sampling& s ) {
 	pod::SafeTensorsFile g;
 	engine::loader::safetensors_open( g, path );
 	const auto& c = m.config();
@@ -63,7 +65,6 @@ static int check_demask( engine::tts::TtsModel& m, const char* path, const std::
 	std::vector<int> text( text64.begin(), text64.end() ), order( order64.begin(), order64.end() );
 	std::vector<uint8_t> prompt( prompt64.begin(), prompt64.end() );
 	const int n_frames = static_cast<int>( nf[0] ), La = static_cast<int>( order.size() );
-	engine::tts::TtsModel::Sampling s;
 	std::vector<std::vector<float>> noise( s.steps );
 	for ( int st = 0; st < s.steps; ++st ) { noise[st] = f32( g, "noise_" + std::to_string( st ) ); }
 	// teacher-forced: each step from the reference's digits after the previous step
@@ -127,11 +128,15 @@ static int check_backbone( engine::tts::TtsModel& m, const char* path ) {
 		rows[r].target.assign( static_cast<size_t>( La ) * V, 0 );
 		rows[r].masked.assign( La, 1 );
 	}
-	std::printf( "%s: text %zu, prompt %zu patches, target %d patches\n", path, text.size(), prompt.size() / V, La );
+	// the rows golden.py's guidance ran: cond, then null (with guidance), then promptless (with speaker guidance)
+	const pod::SafeTensorMeta* h0 = safetensors_find( g, "step0_hidden_0" );
+	if ( !h0 ) { std::fprintf( stderr, "golden: no step0_hidden_0\n" ); return 1; }
+	const int R = std::min( 3, static_cast<int>( h0->shape[0] ) );
+	std::printf( "%s: text %zu, prompt %zu patches, target %d patches, %d guidance row%s\n", path, text.size(), prompt.size() / V, La, R, R == 1 ? "" : "s" );
 	float* out = nullptr;
 	cudaMalloc( &out, static_cast<size_t>( engine::tts::TtsModel::MAX_LEN ) * d * 4 );
 	double worst = 1.0;
-	for ( int r = 0; r < 3; ++r ) {
+	for ( int r = 0; r < R; ++r ) {
 		std::vector<std::vector<float>> taps;
 		m.hidden( rows[r], out, &taps );
 		const int L = rows[r].length();
@@ -162,13 +167,16 @@ static int check_backbone( engine::tts::TtsModel& m, const char* path ) {
 
 int main( int argc, char** argv ) {
 	std::string model, golden, out;
+	float cfg = -1.0f, cfg_prompt = -1.0f;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--model" ) && i + 1 < argc ) { model = argv[++i]; }
 		else if ( !std::strcmp( argv[i], "--golden" ) && i + 1 < argc ) { golden = argv[++i]; }
 		else if ( !std::strcmp( argv[i], "--out" ) && i + 1 < argc ) { out = argv[++i]; }
+		else if ( !std::strcmp( argv[i], "--cfg" ) && i + 1 < argc ) { cfg = std::strtof( argv[++i], nullptr ); }
+		else if ( !std::strcmp( argv[i], "--cfg-prompt" ) && i + 1 < argc ) { cfg_prompt = std::strtof( argv[++i], nullptr ); }
 	}
 	if ( model.empty() ) {
-		std::fprintf( stderr, "usage: tts_generate --model <vall-e v3 export .sft> [--golden <golden.py case .safetensors>]\n" );
+		std::fprintf( stderr, "usage: tts_generate --model <vall-e v3 export .sft> [--golden <golden.py case .safetensors>] [--cfg x] [--cfg-prompt x]\n" );
 		return 2;
 	}
 	engine::tts::TtsModel m;
@@ -177,9 +185,14 @@ int main( int argc, char** argv ) {
 	std::printf( "loaded %s: %d layers, d_model %d, %d heads (head_dim %d), ffn %d, patch %d, flow %d x %d, %d modes, length head %s, %zu phonemes; %.0f MB of weights\n",
 		model.c_str(), c.layers, c.d_model, c.heads, c.head_dim(), c.ffn(), c.patch, c.flow_depth, c.flow_width, c.n_modes, c.length ? "yes" : "no",
 		c.vocab.size(), m.weight_bytes() / 1048576.0 );
+	// the export's own guidance unless given (a golden made at other settings: golden.py's meta.json names them)
+	engine::tts::TtsModel::Sampling s = m.default_sampling();
+	if ( cfg >= 0.0f ) { s.cfg = cfg; }
+	if ( cfg_prompt >= 0.0f ) { s.cfg_prompt = cfg_prompt; }
+	std::printf( "guidance %.2f, speaker guidance %.2f\n", s.cfg, s.cfg_prompt );
 	if ( !golden.empty() ) {
 		const int rb = check_backbone( m, golden.c_str() );
-		const int rd = check_demask( m, golden.c_str(), out );
+		const int rd = check_demask( m, golden.c_str(), out, s );
 		return rb | rd;
 	}
 	return 0;
