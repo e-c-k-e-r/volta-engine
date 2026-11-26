@@ -1,7 +1,6 @@
 #include "engine/tts/tts_model.h"
 #include "engine/core/log.h"
 #include "engine/loader/device_upload.h"
-#include <cublas_v2.h>
 #include <nlohmann/json.hpp>
 
 namespace engine::tts {
@@ -10,8 +9,6 @@ TtsModel::~TtsModel() {
 	engine::loader::safetensors_close( st_ );
 	if ( arena_.base_ptr ) { engine::core::arena_destroy( arena_ ); }
 	if ( ws_arena_.base_ptr ) { engine::core::arena_destroy( ws_arena_ ); }
-	if ( blas_ ) { cublasDestroy( static_cast<cublasHandle_t>( blas_ ) ); }
-	if ( c16_ ) { cudaFree( c16_ ); }
 }
 
 bool TtsModel::load( const std::string& path, int device ) {

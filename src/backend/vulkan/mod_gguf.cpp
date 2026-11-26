@@ -519,7 +519,9 @@ bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int
 	if ( k_split <= 0 || k_split > k ) k_split = k;
 	const uint32_t splits = static_cast<uint32_t>( ( k + k_split - 1 ) / k_split );
 	const uint32_t uk = static_cast<uint32_t>( k ), un = static_cast<uint32_t>( n ), um = static_cast<uint32_t>( m );
-	const bool large = m >= 128;
+	// the 64 x 64 tiles at every size: the 128 x 128 ones measured slower on the V100 for every shape tried (bench_tts_ops), as many workgroups
+	// or not
+	const bool large = false;
 	vk::Pipeline* mm = nullptr;
 	if ( f32_out ) {
 		static std::mutex mu;
@@ -545,6 +547,42 @@ bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int
 	const void* bufs[3] = { w, x, out };
 	const MmqTile tile = mmq_tile( GgmlType::F16, large );
 	vk::dispatch_bound( stream, mm, &mp, bufs, ( ( un + tile.spec[1] - 1 ) / tile.spec[1] ) * splits, ( um + tile.spec[2] - 1 ) / tile.spec[2], 1 );
+	return true;
+}
+
+// The FP32 matmul (ggml_mm_f32.spv, the F16 matmul's tiles): ALIGNED (vec4 loads, no K bound checks) where k is a multiple of BK and the rows
+// 16-byte aligned, else the scalar loads with K bounds from the same SPIR-V
+bool ggml_f32_matmul( const void* a, const void* b, void* d, int m, int n, int k, int stride_d, stream_t stream ) {
+	using namespace ::engine::modules;
+	auto aligned = []( const void* p ) { return reinterpret_cast<uintptr_t>( p ) % 16 == 0; };
+	if ( !aligned( a ) || !aligned( b ) || !aligned( d ) ) return false;
+	const bool large = false;   // as ggml_f16_matmul's
+	const bool al = k % 32 == 0;
+	static std::mutex mu;
+	static vk::Pipeline* cache[64][2][2] = {};
+	static bool tried[64][2][2] = {};
+	vk::Pipeline* mm = nullptr;
+	{
+		std::lock_guard<std::mutex> lk( mu );
+		const int dev = backend::get_device();
+		if ( !tried[dev][large][al] && backend::vk::bound_pipelines() ) {
+			tried[dev][large][al] = true;
+			const char* dir = std::getenv( "ENGINE_SPV_DIR" );
+			const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + "/ggml_mm_f32.spv";
+			const MmqTile tile = mmq_tile( GgmlType::F16, large );
+			uint32_t spec[12];
+			for ( int i = 0; i < 11; ++i ) spec[i] = tile.spec[i];
+			spec[11] = al ? 1 : 0;
+			cache[dev][large][al] = backend::vk::pipeline_create_bound( path.c_str(), sizeof( MmqParams ), 3, spec, 12 );
+		}
+		mm = cache[dev][large][al];
+	}
+	if ( mm == nullptr ) return false;
+	const uint32_t uk = static_cast<uint32_t>( k ), un = static_cast<uint32_t>( n ), um = static_cast<uint32_t>( m );
+	MmqParams mp{ um, un, uk, uk, uk, static_cast<uint32_t>( stride_d ), um * uk, un * uk, un * static_cast<uint32_t>( stride_d ), 0u, 1u, uk, 1u, 1u, 1u, 1u };
+	const void* bufs[3] = { a, b, d };
+	const MmqTile tile = mmq_tile( GgmlType::F16, large );
+	vk::dispatch_bound( stream, mm, &mp, bufs, ( um + tile.spec[1] - 1 ) / tile.spec[1], ( un + tile.spec[2] - 1 ) / tile.spec[2], 1 );
 	return true;
 }
 

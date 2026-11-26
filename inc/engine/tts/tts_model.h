@@ -4,9 +4,9 @@
 // (vall_e/export.py: an FP16 safetensors file with "config" and "vocab" JSON in its metadata).
 #pragma once
 
+#include "engine/backend/types.h"
 #include "engine/core/arena.h"
 #include "engine/loader/safetensors.h"
-#include <cuda_fp16.h>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -25,6 +25,8 @@ struct TtsConfig {
 	int ffn() const { return d_model * 8 / 3 / 64 * 64; }
 	int values() const { return patch * 32; }  // FSQ scalars per position
 };
+
+using half = backend::half_t;
 
 struct TtsBlock {
 	const float *n1 = nullptr, *n2 = nullptr, *q_norm = nullptr, *k_norm = nullptr;
@@ -103,18 +105,16 @@ public:
 private:
 	void alloc_workspace();
 	void alloc_flow_workspace();
-	void gemm( const half* A, const half* W, void* C, int M, int N, int K, bool c32 );
 
 	TtsConfig cfg_;
 	Sampling sampling_;
 	TtsWeights w_;
 	int device_ = 0;
-	void* blas_ = nullptr;  // cublasHandle_t
-	half* c16_ = nullptr;   // ROCm: the FP16 result of an FP32-out GEMM before it's widened (gemm)
-	size_t c16_elems_ = 0;
 	struct Workspace {
-		float *x = nullptr, *a = nullptr, *S = nullptr;
-		half *xn = nullptr, *qkv = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr, *g = nullptr, *y = nullptr, *up = nullptr, *act = nullptr, *P = nullptr, *vals = nullptr;
+		float *x = nullptr, *a = nullptr;
+		void* attn = nullptr;  // the attention's scratch (TtsOps::attention_scratch bytes)
+		size_t attn_bytes = 0;
+		half *xn = nullptr, *qkv = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr, *g = nullptr, *y = nullptr, *up = nullptr, *act = nullptr, *vals = nullptr;
 		int *ids = nullptr, *pos = nullptr;  // pos: each position's place in its row
 		uint8_t *kind = nullptr, *masked = nullptr, *digits = nullptr;
 		float *rope_cs = nullptr, *rope_sn = nullptr;  // [MAX_LEN, rot / 2]

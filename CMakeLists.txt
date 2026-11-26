@@ -193,6 +193,19 @@ set(ENGINE_HOST_SOURCES
 	${ENGINE_TUI_SOURCES}
 )
 
+# vall-e TTS: the model and codec (host code over engine/modules/tts.h, built with the CUDA, ROCm and Vulkan backends); the text front-end,
+# the pipeline and the server's speech endpoint when libespeak-ng is installed (GPL-3.0, which the AGPL-3.0 allows combining with); without it
+# the model and codec build alone (tts_generate's golden checks)
+set(ENGINE_TTS_SOURCES src/tts/tts_model.cpp src/tts/tts_backbone.cpp src/tts/tts_flow.cpp src/tts/codec.cpp)
+find_library(ESPEAK_NG_LIBRARY espeak-ng)
+find_path(ESPEAK_NG_INCLUDE espeak-ng/speak_lib.h)
+if(ESPEAK_NG_LIBRARY AND ESPEAK_NG_INCLUDE)
+	set(ENGINE_TTS ON)
+	list(APPEND ENGINE_TTS_SOURCES src/tts/g2p.cpp src/tts/tts.cpp src/server/tts_service.cpp src/server/tts_page.cpp)
+else()
+	message(STATUS "libespeak-ng not found: vall-e TTS without its text front-end, pipeline and speech endpoint")
+endif()
+
 if(ENGINE_GPU)
 # CUDA device code and its launch drivers (compiled only for the GPU backends; as HIP in the ROCM configuration)
 set(ENGINE_DEVICE_SOURCES
@@ -232,6 +245,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/backend/cuda/modules/logit_rows.cu
 	src/backend/cuda/modules/vision.cu
 	src/backend/cuda/modules/linear_trellis.cu
+	src/backend/cuda/modules/tts.cu
 	src/video/h3_dit.cu
 	src/video/h3_vae.cu
 	src/video/h3_audio.cu
@@ -250,27 +264,12 @@ set(ENGINE_DEVICE_SOURCES
 	src/video/h3_stage_decode.cu
 	src/kernels/cuda/h3/h3_attn.cu
 	src/loader/device_upload.cu
-	src/tts/tts_model.cu
-	src/tts/tts_backbone.cu
-	src/tts/tts_flow.cu
-	src/tts/codec.cu
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
 	src/spec/dflash_backbone.cu
 	src/spec/tap_ring.cu
 )
-set(ENGINE_CORE_SOURCES ${ENGINE_HOST_SOURCES} ${ENGINE_DEVICE_SOURCES})
-
-# vall-e TTS end to end (the text front-end, the pipeline and the server's speech endpoint): when libespeak-ng is installed (GPL-3.0,
-# which the AGPL-3.0 allows combining with); without it the model and codec build alone (tts_generate's golden checks)
-find_library(ESPEAK_NG_LIBRARY espeak-ng)
-find_path(ESPEAK_NG_INCLUDE espeak-ng/speak_lib.h)
-if(ESPEAK_NG_LIBRARY AND ESPEAK_NG_INCLUDE)
-	set(ENGINE_TTS ON)
-	list(APPEND ENGINE_CORE_SOURCES src/tts/g2p.cpp src/tts/tts.cpp src/server/tts_service.cpp src/server/tts_page.cpp)
-else()
-	message(STATUS "libespeak-ng not found: vall-e TTS without its text front-end, pipeline and speech endpoint")
-endif()
+set(ENGINE_CORE_SOURCES ${ENGINE_HOST_SOURCES} ${ENGINE_DEVICE_SOURCES} ${ENGINE_TTS_SOURCES})
 
 # EXL3 GEMM instantiations: one generated translation unit per (bit width, codebook) so the template-heavy kernels compile in parallel
 # (exl3_instances.cu alone took 450 s). Codebook 0 is 3inst, 1 mcg, 2 mul1; every checkpoint is made with one of them.
@@ -1061,6 +1060,9 @@ if(ENGINE_GPU)
 	add_executable(tts_generate src/tts/tts_generate_main.cpp)
 	target_link_libraries(tts_generate PRIVATE engine_kernels)
 	set_target_properties(tts_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	add_executable(bench_tts_ops tests/3_bench/bench_tts_ops.cpp)
+	target_link_libraries(bench_tts_ops PRIVATE engine_kernels)
+	set_target_properties(bench_tts_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# NCCL is optional: it enables tensor parallelism (the transformer and the text tower over several GPUs) and bench_allreduce
 	if(ENGINE_BACKEND STREQUAL "CUDA")

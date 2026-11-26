@@ -163,7 +163,7 @@ Not parsed: `n` above 1.
 | CUDA SM70 | the primary build: everything above |
 | ROCm | the CUDA sources built as HIP for RDNA (wave32) GPUs, with RDNA forms of the hot kernels; see [ROCM.md](ROCM.md) |
 | CPU | one rank: Qwen, Flash-Next and Gemma 4 checked against CUDA logits (`test_cpu_forward`); reference kernels, GGUF through llama.cpp's and ik_llama.cpp's CPU kernels; slow by design |
-| Vulkan | one device or tensor-parallel over 2 or 4 devices (all-reduce in shared host memory; a captured decode graph is split at its cross-device syncs): Qwen, Flash-Next (GGUF and NVFP4 experts), Gemma 4 and GLM's GGUF experts checked against CUDA (`test_vulkan_forward`); quantized KV; GGUF through llama.cpp's shaders; trellis or FP16 routed experts read their routes back, so those decode forwards run eagerly |
+| Vulkan | one device or tensor-parallel over 2 or 4 devices (all-reduce in shared host memory; a captured decode graph is split at its cross-device syncs): Qwen, Flash-Next (GGUF and NVFP4 experts), Gemma 4 and GLM's GGUF experts checked against CUDA (`test_vulkan_forward`); quantized KV; GGUF through llama.cpp's shaders; trellis or FP16 routed experts read their routes back, so those decode forwards run eagerly; the vall-e TTS and its codec (`tts_generate --golden`, the speech endpoint) |
 
-The DFlash2 drafter, DeepSeek-V4.1 and the video service need the CUDA backend (CUDA or ROCm builds); the MTP head runs on CPU and Vulkan too (`test_mtp`). The
+The DFlash2 drafter, DeepSeek-V4.1 and the video service need the CUDA backend (CUDA or ROCm builds); the TTS runs on CUDA, ROCm and Vulkan; the MTP head runs on CPU and Vulkan too (`test_mtp`). The
 per-function table is [CAPABILITIES.md](CAPABILITIES.md).

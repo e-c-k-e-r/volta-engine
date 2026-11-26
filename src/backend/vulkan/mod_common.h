@@ -31,6 +31,9 @@ bool ggml_f16_linear( const void* w, const void* x, void* out, int m, int n, int
 // The matmul alone, its output FP16 or (f32_out) FP32: false where it does not apply (k not a multiple of 32, operands not 16-byte aligned).
 // k_split > 0 (a multiple of 32): the K range in slabs of k_split, slab s's partial product into out + s * m * n (ceil( k / k_split ) of them)
 bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, stream_t stream, int k_split = 0 );
+// FP32: d [n rows of stride_d][m] = a [m, k] times b [n, k]^T (d[j * stride_d + i] = a row i . b row j), on llama.cpp's matmul; false where it
+// does not apply (no bound pipelines, operands not 16-byte aligned)
+bool ggml_f32_matmul( const void* a, const void* b, void* d, int m, int n, int k, int stride_d, stream_t stream );
 
 template<typename P>
 inline void launch( const char* name, const P& p, stream_t s, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1 ) {

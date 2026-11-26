@@ -122,6 +122,36 @@ void tiled( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorVie
 	else if ( q4 ) vki::launch( "fa_finish", r, stream, static_cast<uint32_t>( num_q_heads ), static_cast<uint32_t>( count ) );
 }
 
+// head_dim 64: fa_dense_64 (a thread per query, 32 a workgroup); else fa_attn without slots, up to 16 query vectors a workgroup, the splits as
+// tiled's (their partials in a scratch of their own: the callers are the TTS and vision towers, which may run beside a language model's forward)
+void dense( const backend::half_t* q, const backend::half_t* k, const backend::half_t* v, backend::half_t* out, int rows, int keys, int num_q_heads, int num_kv_heads,
+	int head_dim, float scale, backend::stream_t stream ) {
+	ENGINE_ASSERT( head_dim <= 512 && head_dim % 16 == 0 && num_kv_heads > 0 && num_q_heads % num_kv_heads == 0, "Attention (Vulkan): head_dim a multiple of 16 up to 512, GQA" );
+	if ( head_dim == 64 ) {
+		struct FaDenseParams { uint64_t q, k, v, out_; int rows, keys, heads, kv_heads; float scale; };
+		const FaDenseParams p{ vki::dp( q ), vki::dp( k ), vki::dp( v ), vki::dp( out ), rows, keys, num_q_heads, num_kv_heads, scale };
+		vki::launch( "fa_dense_64", p, stream, static_cast<uint32_t>( ( rows + 31 ) / 32 ), static_cast<uint32_t>( num_q_heads ) );
+		return;
+	}
+	const int G = num_q_heads / num_kv_heads;
+	ENGINE_ASSERT( G <= 16, "Attention (Vulkan): at most 16 query heads per KV head" );
+	const int group_rows = std::max( 1, 16 / G );
+	const int groups = ( rows + group_rows - 1 ) / group_rows;
+	const int R = std::min( group_rows, rows ) * G, hw = head_dim / 2;
+	const int bc = R * hw + 32 * ( hw + 1 ) <= kFaPoolWords ? 32 : 16;
+	const size_t per_split = static_cast<size_t>( rows ) * num_q_heads * ( head_dim + 2 ) * sizeof( float );
+	const int blocks = groups * num_kv_heads;
+	int splits = std::min( { kMaxSplits, ( kTargetGroups + blocks - 1 ) / blocks, ( keys + bc - 1 ) / bc, static_cast<int>( kFaScratch / per_split ) } );
+	splits = std::max( splits, 1 );
+	const bool direct = splits == 1;
+	float* part = direct ? nullptr : static_cast<float*>( vki::scratch( 41, kFaScratch, stream ) );
+	vki::FaParams p{ vki::dp( q ), vki::dp( k ), vki::dp( v ), 0, vki::dp( out ), 0, 0, 0, 0, num_q_heads, num_kv_heads, head_dim, keys, 0, scale, 0, 0,
+		static_cast<int>( pod::KVQ::F16 ), static_cast<int>( pod::KVQ::F16 ), 0, 0, 0, 0, rows, group_rows, splits, bc, direct ? 1 : 0, vki::dp( part ), 1 };
+	vki::launch( "fa_attn", p, stream, static_cast<uint32_t>( groups ), static_cast<uint32_t>( num_kv_heads ), static_cast<uint32_t>( splits ) );
+	vki::FaReduceParams r{ vki::dp( part ), 0, vki::dp( out ), rows, num_q_heads, head_dim, splits, 0, static_cast<int>( pod::KVQ::F16 ) };
+	if ( !direct ) vki::launch( "fa_reduce", r, stream, static_cast<uint32_t>( num_q_heads ), static_cast<uint32_t>( rows ) );
+}
+
 } // namespace vk_attn
 
 namespace {

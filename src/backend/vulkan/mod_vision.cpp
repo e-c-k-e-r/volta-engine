@@ -1,5 +1,6 @@
 // Vulkan backend: the vision-tower operators on the Slang kernels of src/kernels/slang/vision.slang (norms, patch embedding, interpolated position
 // table, rotary with biases, bidirectional attention, bias / activation / residual helpers, the merger's gather); the dense GEMM is the plain FP16 GEMM.
+#include "mod_attention.h"
 #include "mod_common.h"
 #include "engine/modules/linear.h"
 #include "engine/modules/vision.h"
@@ -89,8 +90,10 @@ void Vision::dense_gemm( const backend::half_t* a, const backend::half_t* w, bac
 	LinearPlainGEMV::forward( w, a, out, m, n, k, stream );
 }
 
+// The tiled attention (fa_attn without slots) where its head_dim applies (a multiple of 16), else the SIMT kernel
 void Vision::attention( const backend::half_t* q, const backend::half_t* k, const backend::half_t* v, backend::half_t* out, int m, int heads, int head_dim, float scale, backend::stream_t stream ) {
-	attention_simt( q, k, v, out, m, heads, head_dim, scale, stream );
+	if ( head_dim % 16 == 0 && head_dim <= 512 ) vk_attn::dense( q, k, v, out, m, m, heads, heads, head_dim, scale, stream );
+	else attention_simt( q, k, v, out, m, heads, head_dim, scale, stream );
 }
 
 void Vision::attention_simt( const backend::half_t* q, const backend::half_t* k, const backend::half_t* v, backend::half_t* out, int m, int heads, int head_dim, float scale, backend::stream_t stream ) {

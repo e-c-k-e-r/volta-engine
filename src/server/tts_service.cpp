@@ -2,11 +2,11 @@
 // route's thread; engine::tts::Tts serializes syntheses itself. Voices are the WAV files of tts.voices_dir, by file name without the extension,
 // read once and kept.
 #include "engine/server/tts.h"
+#include "engine/backend/runtime.h"
 #include "engine/core/log.h"
 #include "engine/loader/image.h"
 #include "engine/tts/audio.h"
 #include "engine/tts/tts.h"
-#include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 #include <chrono>
 #include <dirent.h>
@@ -42,7 +42,7 @@ struct TtsService::Impl {
 			std::vector<float> audio;
 			int rate = 0;
 			if ( !engine::tts::read_wav( cfg.voices_dir + "/" + name + ".wav", audio, rate, &error ) ) { return nullptr; }
-			cudaSetDevice( cfg.device );
+			engine::backend::set_device( cfg.device );
 			if ( !tts.encode_prompt( audio, rate, it->second.codes, &error ) ) { return nullptr; }
 			it->second.loaded = true;
 		}
@@ -109,7 +109,7 @@ struct TtsService::Impl {
 			std::vector<float> pcm;
 			int rate = 0;
 			if ( !engine::tts::parse_wav( wav, pcm, rate, &error ) ) { return send_error( c, 400, "invalid_request_error", "voice_audio: " + error ); }
-			cudaSetDevice( cfg.device );
+			engine::backend::set_device( cfg.device );
 			if ( !tts.encode_prompt( pcm, rate, uploaded.codes, &error ) ) { return send_error( c, 400, "invalid_request_error", "voice_audio: " + error ); }
 			v = &uploaded;
 		} else if ( named ) {
@@ -117,7 +117,7 @@ struct TtsService::Impl {
 			if ( !v ) { return send_error( c, 400, "invalid_request_error", error ); }
 		}
 		if ( !o.seed ) { o.seed = ( static_cast<uint64_t>( std::random_device{}() ) << 20 ) ^ std::random_device{}(); o.seed &= ( 1ull << 52 ) - 1; }   // known, so it can be returned (and fits a JS number)
-		cudaSetDevice( cfg.device );
+		engine::backend::set_device( cfg.device );
 		const auto t0 = std::chrono::steady_clock::now();
 		std::vector<float> audio;
 		static const std::vector<uint8_t> none;
@@ -169,14 +169,13 @@ bool TtsService::init( const ServerConfig& config ) {
 		LOG_ERROR( "tts: \"codec\" (python -m vall_e.export codec) is required with \"model\"\n" );
 		return false;
 	}
-	cudaSetDevice( p_->cfg.device );
-	size_t free0 = 0, free1 = 0, total = 0;
-	cudaMemGetInfo( &free0, &total );
+	engine::backend::set_device( p_->cfg.device );
+	const size_t free0 = engine::backend::device_free_bytes( p_->cfg.device );
 	if ( !p_->tts.load( p_->cfg.model, p_->cfg.codec, p_->cfg.device ) ) {
 		LOG_ERROR( "tts: failed to load %s / %s\n", p_->cfg.model.c_str(), p_->cfg.codec.c_str() );
 		return false;
 	}
-	cudaMemGetInfo( &free1, &total );
+	const size_t free1 = engine::backend::device_free_bytes( p_->cfg.device );
 	p_->scan_voices();
 	const auto& s = p_->tts.model().default_sampling();
 	LOG_INFO( "tts: %s on GPU %d, %.2f GiB (guidance %.1f / %.1f), %zu voices\n", p_->cfg.model.c_str(), p_->cfg.device, ( free0 - free1 ) / 1073741824.0, s.cfg,

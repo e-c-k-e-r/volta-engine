@@ -64,7 +64,6 @@ private:
 	std::vector<EncStage> enc_;
 	std::vector<DecStage> dec_;
 	const float* dec_post_alpha_ = nullptr;
-	void* blas_ = nullptr;  // cublasHandle_t
 	pod::SafeTensorsFile st_;
 	pod::MemoryArena arena_ {};
 	// activations (each the largest [C, T] of either half) and the GEMM chunks' columns / outputs

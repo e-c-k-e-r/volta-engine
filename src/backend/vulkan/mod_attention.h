@@ -18,4 +18,9 @@ void tiled( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorVie
 	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, float scale, int window,
 	bool one_slot, int key_hint );
 
+// Bidirectional attention outside a cache (fa_attn without slots): q / out [rows][num_q_heads][head_dim] against every key of k / v
+// [keys][num_kv_heads][head_dim]
+void dense( const backend::half_t* q, const backend::half_t* k, const backend::half_t* v, backend::half_t* out, int rows, int keys, int num_q_heads, int num_kv_heads,
+	int head_dim, float scale, backend::stream_t stream );
+
 } // namespace engine::modules::vk_attn

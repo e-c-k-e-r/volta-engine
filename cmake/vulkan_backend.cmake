@@ -66,8 +66,19 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			COMMENT "slangc ${entry} -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
+	# vall-e TTS and NeMo codec operators (src/kernels/slang/tts.slang)
+	foreach(entry tts_digits_values tts_embed_mix tts_add_norm tts_add_bias tts_qk_norm_rope tts_heads_gate tts_swiglu tts_gather_rows tts_bias_act tts_cond_silu
+		tts_ln_mod tts_gate_add tts_replicate tts_guide_step tts_snap codec_dequant codec_quant codec_act codec_cols codec_up_cols codec_interleave codec_channel_bias
+		codec_axpy codec_clamp)
+		set(sout ${SLANG_OUT}/${entry}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/tts.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/tts.slang
+			COMMENT "slangc ${entry} -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
 	# Tiled attention (src/kernels/slang/fa.slang)
-	foreach(entry fa_attn fa_decode_256 fa_decode_512 fa_reduce fa_finish)
+	foreach(entry fa_attn fa_decode_256 fa_decode_512 fa_reduce fa_finish fa_dense_64)
 		set(sout ${SLANG_OUT}/${entry}.spv)
 		add_custom_command(OUTPUT ${sout}
 			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/fa.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
@@ -206,6 +217,15 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			DEPENDS ${GGML_VK_DEPS}
 			COMMENT "glslc ggml mul_mm f16 -> f32 -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
+		# the FP32 matmul (the TTS codec's convolutions): vec4 loads where ALIGNED, scalar ones with K bounds otherwise
+		set(sout ${SLANG_OUT}/ggml_mm_f32.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${GLSLC} -fshader-stage=compute --target-env=vulkan1.2 -O -DACC_TYPE=float -DACC_TYPEV2=vec2 -DACC_TYPE_VEC4=vec4
+				-DFLOAT_TYPE=float -DFLOAT_TYPEV2=vec2 -DFLOAT_TYPEV4=vec4 -DFLOAT_TYPEV8=mat2x4 -DDATA_A_F32=1 -DLOAD_VEC_A=4
+				-DLOAD_VEC_B=4 -DB_TYPE=vec4 -DB_TYPE_SCALAR=float -DB_TYPEV4=vec4 -DD_TYPE=float ${GGML_VK_DIR}/mul_mm.comp -o ${sout}
+			DEPENDS ${GGML_VK_DEPS}
+			COMMENT "glslc ggml mul_mm f32 -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
 	else()
 		message(STATUS "glslc not found: the Vulkan GGUF projections run on the Slang kernels alone")
 	endif()
@@ -213,7 +233,16 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	add_dependencies(slang_kernels flash_spv)
 
 	file(GLOB ENGINE_VK_MODULE_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/src/backend/vulkan/mod_*.cpp ${PROJECT_SOURCE_DIR}/src/backend/vulkan/stubs_*.cpp ${PROJECT_SOURCE_DIR}/src/backend/stubs/*.cpp)
-	add_library(engine_vk_host OBJECT ${ENGINE_HOST_SOURCES})
+	# the host sources, the TTS (its text front-end and endpoint with libespeak-ng, which every target linking these objects then links) and the
+	# dense-weight uploader that converts on the host
+	if(ENGINE_TTS)
+		add_compile_definitions(ENGINE_TTS=1)
+		target_link_libraries(engine_backend_vulkan PUBLIC ${ESPEAK_NG_LIBRARY})
+	endif()
+	add_library(engine_vk_host OBJECT ${ENGINE_HOST_SOURCES} ${ENGINE_TTS_SOURCES} ${PROJECT_SOURCE_DIR}/src/loader/device_upload_host.cpp)
+	if(ENGINE_TTS)
+		target_include_directories(engine_vk_host PRIVATE ${ESPEAK_NG_INCLUDE})
+	endif()
 	add_library(engine_vk_modules OBJECT ${ENGINE_VK_MODULE_SOURCES})
 	target_link_libraries(engine_vk_modules PUBLIC engine_backend_vulkan)
 	target_compile_definitions(engine_vk_modules PRIVATE SLANG_SPV_DIR="${PROJECT_BINARY_DIR}/slang")
@@ -276,6 +305,15 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 		add_dependencies(${t} slang_kernels)
 		set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 	endforeach()
+
+	# vall-e TTS from the command line and its golden checks (same source as the CUDA build's)
+	add_executable(tts_generate src/tts/tts_generate_main.cpp ${ENGINE_VK_OBJECTS})
+	target_link_libraries(tts_generate PRIVATE engine_backend_vulkan pthread)
+	add_dependencies(tts_generate slang_kernels)
+	add_executable(bench_tts_ops tests/3_bench/bench_tts_ops.cpp ${ENGINE_VK_OBJECTS})
+	target_link_libraries(bench_tts_ops PRIVATE engine_backend_vulkan pthread)
+	add_dependencies(bench_tts_ops slang_kernels)
+	set_target_properties(tts_generate bench_tts_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# The server entry point, to show how far the host sources link (the quantized linears and attention are stubs)
 	add_executable(volta_server src/server/main.cpp ${ENGINE_VK_OBJECTS})

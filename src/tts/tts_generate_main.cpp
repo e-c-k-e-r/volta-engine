@@ -9,6 +9,7 @@
 //       [frames, 32]; with --codec, the codec's decode of the reference's digits against the golden's wav and its encode
 //       of the prompt's audio against the prompt's digits, and --wav
 //       writes the free-running generation as audio
+#include "engine/backend/runtime.h"
 #include "engine/kernels/cpu/cpu_util.h"
 #include "engine/loader/safetensors.h"
 #include "engine/tts/audio.h"
@@ -22,7 +23,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
-#include <cuda_runtime.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -74,7 +74,7 @@ static int check_codec( engine::tts::NemoCodec& codec, const char* path ) {
 	std::vector<uint8_t> digits( d64.begin(), d64.end() );
 	const int n_frames = static_cast<int>( digits.size() / 32 );
 	codec.decode( digits, n_frames );   // warm-up (buffers, kernel loads), then timed
-	cudaDeviceSynchronize();
+	engine::backend::device_sync();
 	const auto t0 = std::chrono::steady_clock::now();
 	const auto wav = codec.decode( digits, n_frames );
 	const double dt = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
@@ -102,7 +102,7 @@ static int check_encode( engine::tts::NemoCodec& codec, const char* path ) {
 	if ( audio.empty() ) { std::printf( "codec encoder: no prompt_wav in the golden (python -m vall_e.golden stores it)\n" ); return 0; }
 	const auto ref = i64( g, "prompt" );
 	codec.encode( audio );   // warm-up, then timed
-	cudaDeviceSynchronize();
+	engine::backend::device_sync();
 	const auto t0 = std::chrono::steady_clock::now();
 	const auto digits = codec.encode( audio );
 	const double dt = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
@@ -163,7 +163,7 @@ static int check_demask( engine::tts::TtsModel& m, const char* path, const std::
 	const double tf = agree / double( total );
 	std::printf( "\nteacher-forced agreement %.5f -> %s\n", tf, tf > 0.995 ? "PASS" : "FAIL" );
 	// free-running
-	cudaDeviceSynchronize();
+	engine::backend::device_sync();
 	const auto t0 = std::chrono::steady_clock::now();
 	const auto digits = m.generate( text, prompt, n_frames, order, noise, s );
 	const double dt = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
@@ -228,8 +228,7 @@ static int check_backbone( engine::tts::TtsModel& m, const char* path ) {
 	if ( !h0 ) { std::fprintf( stderr, "golden: no step0_hidden_0\n" ); return 1; }
 	const int R = std::min( 3, static_cast<int>( h0->shape[0] ) );
 	std::printf( "%s: text %zu, prompt %zu patches, target %d patches, %d guidance row%s\n", path, text.size(), prompt.size() / V, La, R, R == 1 ? "" : "s" );
-	float* out = nullptr;
-	cudaMalloc( &out, static_cast<size_t>( engine::tts::TtsModel::MAX_LEN ) * d * 4 );
+	float* out = static_cast<float*>( engine::backend::device_malloc( static_cast<size_t>( engine::tts::TtsModel::MAX_LEN ) * d * 4 ) );
 	double worst = 1.0;
 	for ( int r = 0; r < R; ++r ) {
 		std::vector<std::vector<float>> taps;
@@ -255,7 +254,7 @@ static int check_backbone( engine::tts::TtsModel& m, const char* path ) {
 		std::printf( "\n" );
 	}
 	std::printf( "worst cosine %.5f (1 - cos %.3e) -> %s\n", worst, 1.0 - worst, worst > 0.999 ? "PASS" : "FAIL" );
-	cudaFree( out );
+	engine::backend::device_free( out );
 	engine::loader::safetensors_close( g );
 	return worst > 0.999 ? 0 : 1;
 }

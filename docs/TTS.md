@@ -9,12 +9,13 @@ volta_server serves it as `POST /v1/audio/speech` (see CONFIG.md, the `tts` sect
 | Piece | Source | What it reproduces |
 |---|---|---|
 | Text front-end | src/tts/g2p.cpp | vall_e/emb/g2p.py `encode` and phonemizer 3.3's espeak backend, through libespeak-ng |
-| Model | src/tts/tts_model.cu, tts_backbone.cu, tts_flow.cu | vall_e/model.py: the backbone, the length head, the flow head and the demasking loop with guidance |
-| Codec | src/tts/codec.cu | the NeMo codec's HiFi-GAN encoder, FSQ and HiFi-GAN decoder, in FP32 |
+| Model | src/tts/tts_model.cpp, tts_backbone.cpp, tts_flow.cpp | vall_e/model.py: the backbone, the length head, the flow head and the demasking loop with guidance |
+| Codec | src/tts/codec.cpp | the NeMo codec's HiFi-GAN encoder, FSQ and HiFi-GAN decoder, in FP32 |
 | Pipeline | src/tts/tts.cpp, audio.cpp | vall_e/tts.py `TTS.generate`: the prompt (mono, resampled as torchaudio does, its first 10 s), sentence splitting past 160 phonemes, trailing-silence trimming, pauses; WAV files in and out |
 
-The model and codec build in every GPU configuration; the front-end, the pipeline and the endpoint need libespeak-ng at build time (`ENGINE_TTS`; GPL-3.0,
-which the AGPL-3.0 allows combining with).
+The model and the codec are host code over the backend's TTS operators (engine/modules/tts.h: `TtsOps`, `CodecOps`): src/backend/cuda/modules/tts.cu
+on CUDA and ROCm, src/backend/vulkan/mod_tts.cpp with src/kernels/slang/tts.slang on Vulkan. They build in the CUDA, ROCm and Vulkan configurations;
+the front-end, the pipeline and the endpoint need libespeak-ng at build time (`ENGINE_TTS`; GPL-3.0, which the AGPL-3.0 allows combining with).
 
 ## Files
 
@@ -29,7 +30,8 @@ the sampling settings, and the session's results with players and downloads. A n
 
 Each demasking step runs the backbone over its guidance rows (cond, null, promptless) in one pass of up to 2560 positions: the linears see
 them as one block, attention stays within each row (on CUDA the fused WMMA attention kernel of the video service, `h3_attention`; on ROCm,
-where that kernel isn't correct, batched GEMMs around a softmax, the scores in FP16 so hipBLAS keeps them on the matrix cores).
+where that kernel isn't correct, batched GEMMs around a softmax, the scores in FP16 so hipBLAS keeps them on the matrix cores; on Vulkan `fa_dense_64`,
+FP32 scores). On Vulkan the GEMMs are llama.cpp's matmul shaders: FP16 operands with FP32 sums for the backbone and the flow head, FP32 for the codec.
 
 The export's guidance is the default (v2.0 3.0 / 2.0, the distilled v2.0-fast 0 / 0, older exports 6.0 / 2.0); `--cfg` / `--cfg-prompt` override it.
 
@@ -43,14 +45,14 @@ Beside a language model the server loads the TTS first, so the model's arena is 
 experts over every rank, so its expert cache shrinks by that much on each). The TTS kernels run on the default stream: on a GPU the
 language model also uses, they queue with its work instead of overlapping it.
 
-## Parity (tts_generate --golden, test_tts_g2p, test_tts_resample; references from vall_e/golden.py in FP32; on ROCm and CUDA)
+## Parity (tts_generate --golden, test_tts_g2p, test_tts_resample; references from vall_e/golden.py in FP32; on ROCm, CUDA and Vulkan)
 
 | Check | Result |
 |---|---|
 | Backbone hidden states, step 0 | cosine 1.00000 at every block (v2.0, v2.0-fast, v1.2) |
 | Demasking, teacher-forced | 99.82-99.90% of revealed digits equal (v2.0 / v2.0-fast), 99.65-99.72% (v1.2) |
 | Length head | log length within 0.004; frames equal or one off at a rounding boundary |
-| Codec decoder | 118-125 dB SNR against vall_e's decode |
+| Codec decoder | 118-125 dB SNR against vall_e's decode (Vulkan: 110-122 dB) |
 | Codec encoder + FSQ | every digit of a 6 s prompt equal |
 | Text front-end | 11608 of 11609 store texts equal (en, de, fr, ko, zh: all 2000; ja: 1608 of 1609 kana lines) |
 | Prompt resampling | 141-145 dB SNR against torchaudio (16, 22.05, 24, 48 kHz) |
@@ -62,6 +64,7 @@ language model also uses, they queue with its work instead of overlapping it.
 - Voices are single WAV files; vall_e's multi-clip folder prompts (speaker-embedding and MOS selection) aren't ported.
 - Speed (a 7 s line with a voice prompt, one run of tts_generate): V100 v2.0 4.7x real time, v2.0-fast 6.9x, the 225M 8.8x; RX 7900 XTX
   4.3x / 5.9x / 5.7x (the same cold run: first-call kernel loads and the prompt's encoding weigh more there), and served warm with a named
-  voice v2.0 5.4x, v2.0-fast 7.9x, the 225M 10x. The backbone is compute-bound (a pass
+  voice v2.0 5.4x, v2.0-fast 7.9x, the 225M 10x; V100 under Vulkan, served without a voice: v2.0 1.3x (no tensor cores through Vulkan on
+  Volta: the GEMMs run on the FP32 units). The backbone is compute-bound (a pass
   over ~670 positions is ~1 TFLOP); on a V100 a v2.0 generation's GPU time is ~57% the backbone's GEMMs, ~21% the FP32 codec, ~11%
   attention.

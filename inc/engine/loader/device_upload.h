@@ -1,10 +1,11 @@
 // Dense weights from an open safetensors file into a device arena: raw bytes, or converted to FP32 / FP16 (from FP32,
-// FP16 or BF16). Shared by the dense (non-LLM) models: the H3 video models and the TTS model.
+// FP16 or BF16). Shared by the dense (non-LLM) models: the H3 video models and the TTS model. CUDA converts on the device
+// (device_upload.cu), the other backends on the host (device_upload_host.cpp).
 #pragma once
 
+#include "engine/backend/types.h"
 #include "engine/core/arena.h"
 #include "engine/loader/safetensors.h"
-#include <cuda_fp16.h>
 #include <cstddef>
 #include <string>
 
@@ -24,7 +25,7 @@ struct DeviceUploader {
 	void* raw( const pod::SafeTensorMeta* m );
 	// The tensor converted to FP32 / FP16 (nullptr if missing); f16 also reports a matrix's [rows, cols]
 	const float* f32( const std::string& name );
-	const half* f16( const std::string& name, int* rows = nullptr, int* cols = nullptr );
+	const backend::half_t* f16( const std::string& name, int* rows = nullptr, int* cols = nullptr );
 };
 
 } // namespace engine::loader

@@ -111,7 +111,12 @@ The H3 tests take the checkpoints and their goldens (safetensors files written b
 tiles in shared memory (16-byte loads, FP16 products accumulated in FP32), and splits a long key range over workgroups whose partials `fa_reduce` combines;
 a decode or short verify on an FP16 cache with head_dim 256 or 512 takes `fa_decode_256` / `fa_decode_512` (the same grid and partials, no tiles: each
 lane holds its dimensions of the query vectors and accumulators, each warp streams its keys from the cache and sums their dot products across the warp);
-`test_vulkan_attention` holds both against `ref_attention` on the same device. `nvfp4.slang` holds the Vulkan NVFP4 linear (`nvfp4_gemm`) and
+`test_vulkan_attention` holds both against `ref_attention` on the same device. Without a cache (no slots) `fa_attn` attends dense rows to every key,
+and `fa_dense_64` is the head_dim 64 form of that (a thread per query with its accumulators in registers, a warp per quarter of each 64-key tile,
+FP32 scores): bidirectional attention for the TTS backbone and the vision towers (`test_ops_vision`, `tts_generate --golden`). `tts.slang` holds the
+TTS and NeMo codec operators of the Vulkan build (embedding mix, the norms, QK norm + RoPE, gate, SwiGLU, the flow head's AdaLN and guided step,
+FSQ, the codec's K-major columns, HalfSnake, interleave); the CUDA forms are `src/backend/cuda/modules/tts.cu`, and the Vulkan GEMMs are llama.cpp's
+FP16 matmul (FP16 or FP32 out) and its FP32 one (`bench_tts_ops`). `nvfp4.slang` holds the Vulkan NVFP4 linear (`nvfp4_gemm`) and
 the NVFP4 experts (`nvfp4_moe_gate_up`, `nvfp4_moe_down`: a workgroup per 32-column tile and route, a lane per column of the prepacked layout,
 the weights rounded to FP16 as the CUDA kernels round them), held against the CUDA kernels by `test_ops_linear` and `test_ops_moe`. `kv_codec.slang` holds the KV cache element codecs (FP8, int8, Q4, NVFP4 with
 their scales) that `kv_store_q` and the attention kernels (`ref_attention`, `fa`, the QSA sparse attention in `flash`, the latent attention in `glm`) share; the stored bytes and scales are checked bit for bit against the CUDA kernels by
