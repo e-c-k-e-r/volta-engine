@@ -19,7 +19,6 @@ constexpr int kGemvRows = 16;
 struct TrHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };
 struct TrGemvParams { uint64_t codes, x, y; int m, k, n, cb, volta; };
 struct TrDequantParams { uint64_t codes, out_; int k, n, cb, volta; };
-struct TrSplitSumParams { uint64_t out_, parts; int64_t n; int splits; };
 
 // The kernel of width code `code` (one SPIR-V per code): trellis_gemv_c4 and the like, the _dot form (the codebook's byte sum as a packed dot
 // product) where the device has shaderIntegerDotProduct
@@ -54,21 +53,7 @@ void trellis_linear( const pod::TensorView& x, const pod::TensorView& trellis, c
 		const TrDequantParams d{ vki::dp( trellis.data ), vki::dp( w ), k, n, cb, volta ? 1 : 0 };
 		// a workgroup per four K tiles of a column tile (k a multiple of 128: whole groups of four)
 		vki::launch( per_code( "trellis_dequant", code ), d, stream, static_cast<uint32_t>( ( k / 64 ) * ( n / 16 ) ) );
-		// few output tiles over a long K: the K range in slabs that keep about kTiles workgroups busy, their FP32 partials summed in order
-		constexpr int kTiles = 160;
-		const int tiles_mn = ( ( m + 63 ) / 64 ) * ( ( n + 63 ) / 64 );
-		if ( tiles_mn < kTiles && k >= 2048 ) {
-			const int want = std::min( 16, ( kTiles + tiles_mn - 1 ) / tiles_mn );
-			const int k_split = ( ( k + want - 1 ) / want + 255 ) / 256 * 256;
-			const int splits = ( k + k_split - 1 ) / k_split;
-			const int64_t elems = static_cast<int64_t>( m ) * n;
-			float* parts = static_cast<float*>( vki::scratch( 3, static_cast<size_t>( splits ) * elems * sizeof( float ), stream ) );
-			ENGINE_ASSERT( vki::ggml_f16_matmul( w, xh, parts, m, n, k, true, stream, k_split ), "LinearTrellis (Vulkan): the FP16 matmul" );
-			const TrSplitSumParams q{ vki::dp( y ), vki::dp( parts ), elems, splits };
-			const int64_t groups = ( elems + 255 ) / 256;
-			vki::launch( "trellis_split_sum", q, stream, static_cast<uint32_t>( std::min<int64_t>( groups, 65535 ) ), static_cast<uint32_t>( ( groups + 65534 ) / 65535 ) );
-		}
-		else ENGINE_ASSERT( vki::ggml_f16_matmul( w, xh, y, m, n, k, false, stream ), "LinearTrellis (Vulkan): the FP16 matmul" );
+		ENGINE_ASSERT( vki::ggml_f16_matmul_split( w, xh, y, m, n, k, stream ), "LinearTrellis (Vulkan): the FP16 matmul" );
 	}
 	const TrHadParams h2{ vki::dp( y ), vki::dp( out.data ), 0, vki::dp( svh.data ), n, kRScale };
 	vki::launch( "trellis_had128", h2, stream, n / 128, m );

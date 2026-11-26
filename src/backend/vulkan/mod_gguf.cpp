@@ -550,6 +550,25 @@ bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int
 	return true;
 }
 
+// FP16 out = x * w^T, a long K over few output tiles split into slabs that keep about kTiles workgroups busy, their FP32 partials summed in
+// order (trellis.slang's trellis_split_sum; scratch slot 3)
+bool ggml_f16_matmul_split( const void* w, const void* x, void* out, int m, int n, int k, stream_t stream ) {
+	constexpr int kTiles = 160;
+	const int tiles_mn = ( ( m + 63 ) / 64 ) * ( ( n + 63 ) / 64 );
+	if ( tiles_mn >= kTiles || k < 2048 ) return ggml_f16_matmul( w, x, out, m, n, k, false, stream );
+	const int want = std::min( 16, ( kTiles + tiles_mn - 1 ) / tiles_mn );
+	const int k_split = ( ( k + want - 1 ) / want + 255 ) / 256 * 256;
+	const int splits = ( k + k_split - 1 ) / k_split;
+	const int64_t elems = static_cast<int64_t>( m ) * n;
+	float* parts = static_cast<float*>( scratch( 3, static_cast<size_t>( splits ) * elems * sizeof( float ), stream ) );
+	if ( !ggml_f16_matmul( w, x, parts, m, n, k, true, stream, k_split ) ) return false;
+	struct SplitSumParams { uint64_t out_, parts; int64_t n; int splits; };
+	const SplitSumParams q{ dp( out ), dp( parts ), elems, splits };
+	const int64_t groups = ( elems + 255 ) / 256;
+	launch( "trellis_split_sum", q, stream, static_cast<uint32_t>( std::min<int64_t>( groups, 65535 ) ), static_cast<uint32_t>( ( groups + 65534 ) / 65535 ) );
+	return true;
+}
+
 // The FP32 matmul (ggml_mm_f32.spv, the F16 matmul's tiles): ALIGNED (vec4 loads, no K bound checks) where k is a multiple of BK and the rows
 // 16-byte aligned, else the scalar loads with K bounds from the same SPIR-V
 bool ggml_f32_matmul( const void* a, const void* b, void* d, int m, int n, int k, int stride_d, stream_t stream ) {
