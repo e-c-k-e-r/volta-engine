@@ -20,9 +20,9 @@
 using namespace engine;
 
 int main( int argc, char** argv ) {
-	// test_vision [--model qwen3_5 | glm5_next | DIR] [IMAGE]: the tower of that checkpoint (default Qwen's)
+	// test_vision [--model qwen3_5 | qwen4_exp | glm5_next | DIR] [IMAGE]: the tower of that checkpoint (default Qwen's; Flash-Next has the same tower)
 	const engine::runtime::test::TestModel tm = engine::runtime::test::model_arg( argc, argv, "qwen3_5" );
-	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "glm5_next" ), "test_vision: --model qwen3_5 or glm5_next" );
+	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "qwen4_exp" ) || tm.is( "glm5_next" ), "test_vision: --model qwen3_5, qwen4_exp or glm5_next" );
 	const char* dir = tm.dir.c_str();
 	const char* image = TEST_DATA_DIR "/image_wide.png";
 	for ( int i = 1; i < argc; ++i ) {

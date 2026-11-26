@@ -1639,7 +1639,15 @@ pod::LinearWeight SafeTensorsRepo::load_linear_slice_padded(
 	}
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
 	const auto* meta = find( name_buf );
-	if ( !meta ) return pod::LinearWeight{};
+	if ( !meta ) {
+		// a dense [n, k] weight (an NVFP4 checkpoint keeps the head BF16): this rank's rows as FP16, then the zero pad rows
+		std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
+		const auto* dm = find( name_buf );
+		if ( !dm || dm->ndim != 2 ) return pod::LinearWeight{};
+		ENGINE_ASSERT( dm->shape[0] % tp_size == 0, "load_linear_slice_padded: the dense head's rows must divide across ranks" );
+		const int local = dm->shape[0] / tp_size;
+		return load_dense_rows_padded( name_buf, arena, rank * local, local, pad_cols, stream );
+	}
 	ENGINE_ASSERT( meta->ndim == 3 && meta->shape[1] % tp_size == 0, "Trellis column count must divide across ranks" );
 	const int local_blocks = meta->shape[1] / tp_size;
 	return load_linear_cols_padded( base_name, arena, bits, rank * local_blocks, local_blocks, pad_cols, stream );
@@ -1861,6 +1869,21 @@ pod::LinearWeight SafeTensorsRepo::load_grouped_trellis_slice(
 		return gguf_linear( gguf_shard, meta, arena, rows, { { 0, meta->shape[1] } }, 0, stream );
 	}
 	std::snprintf( name_buf, sizeof( name_buf ), "%s.trellis", base_name );
+	if ( find( name_buf ) == nullptr ) {
+		// a dense [n, k] weight (an NVFP4 checkpoint keeps it BF16): the groups' output rows, this rank's share of each, as one FP16 matrix
+		std::snprintf( name_buf, sizeof( name_buf ), "%s.weight", base_name );
+		const auto* dm = find( name_buf );
+		if ( !dm || dm->ndim != 2 ) return pod::LinearWeight{};
+		std::vector<int> group_rows( num_groups ), rank_rows( num_groups );
+		for ( int g = 0; g < num_groups; ++g ) {
+			group_rows[g] = group_channel_blocks[g] * 16;
+			rank_rows[g] = rank_channel_blocks[g] * 16;
+		}
+		pod::TensorView w = load_grouped_slice( name_buf, arena, group_rows.data(), rank_rows.data(), num_groups, rank, 0, stream, pod::DType::FP16 );
+		if ( !w.data ) return pod::LinearWeight{};
+		std::swap( w.shape[0], w.shape[1] );   // [n, k] in memory, tagged [k, n] for make_fp16
+		return pod::LinearWeight::make_fp16( w );
+	}
 	pod::TensorView tr = load_grouped_slice(
 		name_buf, arena, group_channel_blocks, rank_channel_blocks, num_groups, rank, 1, stream, pod::DType::UINT16
 	);

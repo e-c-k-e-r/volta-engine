@@ -108,6 +108,7 @@ public:
 
 	using ModelPipeline::forward;
 
+	void set_model_dir( const char* dir ) override;
 	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
 	bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) override;
 
@@ -328,6 +329,10 @@ private:
 	std::vector<Qwen4ExpLayerWeights> layers_;
 
 	Qwen3VisionTower vision_;   // rank 0 only
+
+	// The model directory is a modelopt NVFP4 checkpoint: its routed experts NVFP4, everything else BF16 (FP16 here unless nvfp4_dense
+	// quantizes a group), the MTP head's experts FP8 (quantized to NVFP4 at load)
+	bool nv_model_ = false;
 
 	// MTP head
 	bool mtp_on_ = false;

@@ -42,8 +42,8 @@ alphabet = " \t\n\r.,;:'\"!?-_/\\()[]{}<>@#$%^&*+=|~`0123456789abcXYZéüñ日�
 for _ in range(60):
     texts.append("".join(rng.choice(alphabet) for _ in range(rng.randrange(1, 60))))
 
-for model, out in (("Qwen3.8-27B-exl3", "qwen3_5"), ("GLM-5.3-Flash-exl3-3.05bpw", "glm5_next"), ("Swift-Qwen3.8-Flash-Next-exl3-4.00bpw", "qwen4_exp"),
-                   ("DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw", "deepseek_v41"), ("gemma-4-31b-it-exl3", "gemma4")):
+for model, out in (("Qwen3.8-27B-QUASAR-NVFP4", "qwen3_5"), ("GLM-5.3-Flash-exl3-3.05bpw-volta-cal", "glm5_next"), ("Qwen3.8-Flash-Next-NVFP4", "qwen4_exp"),
+                   ("/mnt/programs/models/DeepSeek-V4.1-Flash-1017", "deepseek_v41"), ("gemma-4-31b-it-exl3", "gemma4")):
     if only and only != out:
         continue
     tok = Tokenizer.from_file(os.path.join(root, model, "tokenizer.json"))

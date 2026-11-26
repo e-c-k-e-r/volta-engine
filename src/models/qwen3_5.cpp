@@ -271,7 +271,7 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 	// NVFP4 checkpoint (compressed-tensors): projections are W4A16 through the skinny NVFP4 kernels, the LM head is a dense
 	// BF16 matrix served as FP16.
 	const bool fp4 = repo.find( "model.language_model.layers.0.mlp.gate_proj.weight_packed" ) != nullptr;
-	if ( fp4 ) LOG_ERROR( "[RANK %d] NVFP4 checkpoint\n", rank_ );
+	if ( fp4 ) LOG_INFO( "[RANK %d] NVFP4 checkpoint\n", rank_ );
 
 	// 3. LM Head, sharded across the vocabulary dimension
 	if ( fp4 ) {
@@ -438,10 +438,10 @@ bool Qwen3_5Pipeline::load_weights( const char* model_dir, backend::stream_t str
 	}
 
 	if ( mtp_on_ ) {
-		// the head of an EXL3 checkpoint, or the MTP block of a GGUF conversion (its blocks as they are in the file)
-		const pod::SafeTensorMeta* fc_gguf = repo.find( "mtp.fc.weight" );
-		ENGINE_ASSERT( !fp4 && ( repo.find( "mtp.fc.trellis" ) != nullptr || ( fc_gguf != nullptr && fc_gguf->dtype == pod::DType::GGUF ) ),
-			"speculator=mtp: the checkpoint has no quantized MTP head (mtp.*)" );
+		// the head of an EXL3 checkpoint, the MTP block of a GGUF conversion (its blocks as they are in the file), or an NVFP4 checkpoint's head
+		// (BF16 there: FP16 projections, like the other unquantized tensors)
+		ENGINE_ASSERT( repo.find( "mtp.fc.trellis" ) != nullptr || repo.find( "mtp.fc.weight" ) != nullptr || repo.find( "mtp.fc.weight_packed" ) != nullptr,
+			"speculator=mtp: the checkpoint has no MTP head (mtp.*)" );
 		mtp_fc_ = load_row( "mtp.fc", 4 );
 		mtp_pre_norm_e_ = repo.load( "mtp.pre_fc_norm_embedding.weight", *arena_, stream, pod::DType::FP16 );
 		mtp_pre_norm_h_ = repo.load( "mtp.pre_fc_norm_hidden.weight", *arena_, stream, pod::DType::FP16 );

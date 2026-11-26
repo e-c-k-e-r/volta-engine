@@ -7,12 +7,10 @@
 	"request_timeout_s": 30,
 	"options": {
 		"speculator": "mtp",
-		"mtp_nvfp4": true,
 		"max_seq": 262144,
 		"max_slots": 4,
 		"kv_format": "nvfp4",
 		"prefix_cache_gib": 64,
-		"nvfp4_experts": "/path/to/Qwen3.8-Flash-Next-NVFP4",
 		"nvfp4_dense": "all"
 	}
 }

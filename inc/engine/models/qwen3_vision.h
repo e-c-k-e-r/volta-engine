@@ -38,9 +38,10 @@ bool qwen3_vision_config( const char* model_dir, int max_patches, Qwen3VisionCon
 // checkpoint's model.visual.* tensors (trellis-quantized projections, FP16 norms / biases / embeddings).
 class Qwen3VisionTower : public VisionTower {
 public:
-	// False without a vision_config or without the quantized visual tensors (the checkpoint then serves text only). allow_dense also accepts an unquantized
-	// checkpoint (BF16 / FP16 `.weight` tensors, the fused `attn.qkv` of the original release): the projections run as FP16 matrices.
-	bool load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream, bool allow_dense = false );
+	// False without a vision_config or without the visual tensors (the checkpoint then serves text only). The tower is trellis-quantized, or
+	// unquantized (BF16 / FP16 `.weight` tensors, the fused `attn.qkv` of the original release, as an NVFP4 checkpoint keeps it): the projections
+	// then run as FP16 matrices. allow_dense false refuses the unquantized kind.
+	bool load( const char* model_dir, pod::MemoryArena& arena, int max_patches, backend::stream_t stream, bool allow_dense = true );
 	bool loaded() const override { return loaded_; }
 	const Qwen3VisionConfig& config() const { return cfg_; }
 	const engine::loader::VisionParams& params() const override { return params_; }

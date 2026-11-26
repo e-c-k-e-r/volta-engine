@@ -60,7 +60,7 @@ bool Qwen3VisionTower::load( const char* model_dir, pod::MemoryArena& arena, int
 	const bool dense = !trellis && allow_dense && repo.find( "model.visual.merger.linear_fc1.weight" ) &&
 		( repo.find( "model.visual.blocks.0.attn.q_proj.weight" ) || ( fused_qkv_ = repo.find( "model.visual.blocks.0.attn.qkv.weight" ) != nullptr ) );
 	if ( !trellis && !dense ) {
-		LOG_WARN( "[vision] checkpoint has no quantized vision tower; image input disabled\n" );
+		LOG_WARN( "[vision] checkpoint has no vision tower; image input disabled\n" );
 		repo.close();
 		return false;
 	}

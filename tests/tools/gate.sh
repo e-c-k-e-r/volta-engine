@@ -134,7 +134,8 @@ tier2_models() {
 	run prefix_restore_glm_fp8 sh -c "ENGINE_KV_FORMAT=fp8 taskset -c 0-9 ./test_prefix_restore --model glm5_next"
 	run prefix_restore_flash gpu ./test_prefix_restore --model qwen4_exp
 	run sampling_qwen gpu ./test_sampling_gpu
-	run sampling_glm gpu ./test_sampling_gpu --model glm5_next
+	# expert_cache auto, as served: the checkpoint and the BF16 test drafter do not fit with every expert resident
+	run sampling_glm sh -c "ENGINE_EXPERT_CACHE=auto taskset -c 0-9 ./test_sampling_gpu --model glm5_next"
 }
 
 tier2() { tier2_fast; tier2_models; }

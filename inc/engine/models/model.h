@@ -112,6 +112,8 @@ public:
 	// drafter's tap ring only for DFlash2
 	enum class Speculation { None, Mtp, DFlash, Other };
 	void set_speculation( Speculation s ) { speculation_ = s; }
+	// The checkpoint directory load_weights will read (call before init()): a model whose buffers depend on the checkpoint's format reads it here
+	virtual void set_model_dir( const char* dir ) { (void) dir; }
 	// Bytes the arena must still hold after the weights (the speculator's); a model sizing something from the free arena keeps them back. Before load_weights
 	virtual void set_reserve_after_weights( size_t bytes ) { (void) bytes; }
 	virtual bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) = 0;

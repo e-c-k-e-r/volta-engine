@@ -146,8 +146,9 @@ The final mixer is the same without `post` and gives the head's input.
     `head`, `shared_gate`, `shared_up`, `shared_down`, `shared`, `all`; `gdn,attn,idx,head,shared_gate,shared_up` is the recommended set, `shared_down`
     costs perplexity), `nvfp4_dense_dir` loads calibrated tensors instead of round-to-nearest, `mtp_nvfp4=true` reads the MTP head from the NVFP4 checkpoint
     (its FP8 experts and BF16 dense tensors quantized to NVFP4 at load).
-  * NVFP4 only: `model_dir` and `nvfp4_experts` both point at the NVFP4 checkpoint, with `nvfp4_dense=all` and `mtp_nvfp4=true`
-    (`configs/flash_next_nvfp4_only.json`); the n-gram table is read in place from its FP8 shards.
+  * NVFP4 only: the NVFP4 checkpoint as `model_dir`. Its routed experts load as they are, its BF16 tensors (the dense projections, the head,
+    the hyper-connections, the vision tower) as FP16, and the MTP head's FP8 experts are quantized to NVFP4 at load; `nvfp4_dense=<groups>`
+    quantizes dense groups (and with `all` the MTP head's) to NVFP4 instead (`configs/flash_next_nvfp4_only.json`: `all`, the smallest). The n-gram table is read in place from its FP8 shards.
   * GGUF: llama.cpp's `qwen4exp` architecture. Its MTP block is not read; `mtp_head_dir=<NVFP4 dir>` takes the head from the NVFP4 checkpoint.
   * calibrated NVFP4 dense tensors come from `tests/tools/nvfp4_ldlq.py --model flash|glm` over the Hessians that
     `ENGINE_HESSIAN_DIR=<dir> test_ppl --model qwen4_exp|glm5_next --calibrate --file <text>` writes (GLM: `ENGINE_HESSIAN_LAYERS=lo-hi`, a third of the layers per pass).

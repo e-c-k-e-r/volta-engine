@@ -104,6 +104,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 			: cfg.speculate && ( opt.speculator == "dspark" || opt.speculator == "suffix" ) ? Spec::Other
 			: !cfg.draft_model_dir.empty() ? Spec::DFlash : cfg.spec_rows ? Spec::Other : Spec::None;
 		models_[d]->set_speculation( spec );
+		models_[d]->set_model_dir( cfg.model_dir.c_str() );
 		if ( !models_[d]->init( d, arenas_[d], ( tp_ > 1 ) ? &rings_[d] : nullptr ) ) return false;
 	}
 	{
