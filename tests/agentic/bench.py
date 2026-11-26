@@ -154,10 +154,10 @@ def run(args):
     meta = {"client": version, "base_url": args.base_url, "model": args.model, "thinking": args.thinking, "max_turns": args.max_turns, "timeout_s": args.timeout,
             "repeats": args.repeats, "tier": args.tier, "revision": git_rev(), "date": time.strftime("%Y-%m-%d %H:%M:%S")}
     json.dump(meta, open(os.path.join(args.out, "meta.json"), "w"), indent=2)
-    env = {"ANTHROPIC_BASE_URL": args.base_url, "ANTHROPIC_API_KEY": args.api_key, "ANTHROPIC_MODEL": args.model, "ANTHROPIC_SMALL_FAST_MODEL": args.model,
+    env = {"ANTHROPIC_BASE_URL": args.base_url, "ANTHROPIC_API_KEY": args.api_key, "ANTHROPIC_MODEL": args.model, "ANTHROPIC_DEFAULT_HAIKU_MODEL": args.model,
            "DISABLE_TELEMETRY": "1", "DISABLE_ERROR_REPORTING": "1", "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
            "API_TIMEOUT_MS": str(args.timeout * 1000)}
-    # Claude Code assumes a 200K window for a model it does not know and compacts only near that; the server's real window (context_length of
+    # Claude Code assumes a window for a model it does not know (1M since v2.1.323, 200K before) and compacts only near that; the server's real window (context_length of
     # /v1/models, which volta_server reports) makes it compact in time
     window = context_length(args.base_url, args.api_key)
     if window:

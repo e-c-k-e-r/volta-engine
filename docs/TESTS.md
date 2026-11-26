@@ -215,7 +215,7 @@ Not part of `gate.sh`; they run against a running server.
 
 `tests/agentic/bench.py` runs the Claude Code CLI against any server that speaks the Anthropic messages API (`volta_server` serves `/v1/messages`) and scores it on
 small software tasks. It needs only a base URL and a model name; nothing in it is specific to this engine. When the server reports its window (`context_length` in
-`GET /v1/models`) the client gets it as `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so it compacts within the window instead of the 200K it assumes for an unknown model.
+`GET /v1/models`) the client gets it as `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so it compacts within the window instead of the one it assumes for an unknown model (1M since Claude Code v2.1.323, 200K before).
 
 ```
 tests/agentic/bench.py selftest [--tier T] [--only ID,ID] [--tasks-dir DIR]
