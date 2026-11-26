@@ -21,6 +21,14 @@ struct VideoConfig {
 	bool tensor_parallel = false;       // shard the transformer over the GPUs by heads / MLP width (a quarter of the weights each) instead of by rows (needs NCCL)
 };
 
+// vall-e text to speech (the "tts" section; engine/server/tts.h): beside the language model, or alone when there is no model_dir
+struct TtsConfig {
+	std::string model;      // a vall-e export (.sft); empty = no speech endpoint
+	std::string codec;      // the NeMo codec export (python -m vall_e.export codec)
+	std::string voices_dir; // WAV voice prompts, named by file name
+	int device = 0;
+};
+
 struct ServerConfig {
 	std::string host = "0.0.0.0";
 	std::string api_key;         // non-empty: /v1/* requests need it (Authorization: Bearer KEY or x-api-key: KEY)
@@ -38,7 +46,7 @@ struct ServerConfig {
 	bool default_enable_thinking = false; // requests without an explicit setting (reasoning_effort / thinking enable it)
 
 	std::string model_type;      // deduced by resolve() from <model_dir>/config.json (qwen3_5 | glm5_next)
-	std::string model_dir;       // required
+	std::string model_dir;       // required, unless tts.model is set (then a TTS-only server, model_type "vall_e")
 	std::string draft_model_dir; // required with use_speculation
 	bool use_speculation = false;
 	bool load_weights = true;
@@ -46,6 +54,7 @@ struct ServerConfig {
 	bool tui = false;             // a terminal dashboard in this process (the console output moves into its log tab); needs a terminal
 	int tp_size = 4;
 	VideoConfig video;
+	TtsConfig tts;
 
 	bool load_from_json( const char* json_path );
 	// Parses --config and the CLI, then resolves and validates (model_dir, model_type, draft dir). Exits with status 2 on error.

@@ -139,6 +139,24 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 			}
 		}
 	}
+	// "tts": { "model": ..., "codec": ..., "voices_dir": ..., "device": N }
+	if ( j.contains( "tts" ) ) {
+		if ( !j["tts"].is_object() ) {
+			LOG_ERROR( "Error: \"tts\" must be an object\n" );
+			return false;
+		}
+		for ( auto it = j["tts"].begin(); it != j["tts"].end(); ++it ) {
+			const std::string& k = it.key();
+			if ( k == "model" && it->is_string() ) tts.model = it->get<std::string>();
+			else if ( k == "codec" && it->is_string() ) tts.codec = it->get<std::string>();
+			else if ( k == "voices_dir" && it->is_string() ) tts.voices_dir = it->get<std::string>();
+			else if ( k == "device" && it->is_number_integer() ) tts.device = it->get<int>();
+			else {
+				LOG_ERROR( "Error: unknown or invalid \"tts\" key: %s\n", k.c_str() );
+				return false;
+			}
+		}
+	}
 	// "options": { "max_seq": 32768, "kv_format": "fp8", ... } -> runtime::Options fields
 	if ( j.contains( "options" ) && j["options"].is_object() ) {
 		for ( auto& [key, val] : j["options"].items() ) {
@@ -176,7 +194,21 @@ values are fatal errors. The model type is never configured: it is read from the
 | `default_enable_thinking` | | false | thinking on for requests that do not say |
 | `request_timeout_s` | | 30 | seconds a connection may stay silent before its request is complete |
 | `video` | see below | | MiniMax-H3 settings |
+| `tts` | see below | | vall-e text to speech |
 | `options` | `--set key=value` | | the options below |
+
+## vall-e (text to speech)
+
+With a `tts` section the server adds `POST /v1/audio/speech` (OpenAI's request: `input`, `voice`, `response_format` `"wav"`, `speed`; and vall-e's
+`language` (default `en`; Japanese as kana), `seed`, `cfg`, `cfg_prompt`, `steps`, `duration` in seconds) and `GET /v1/audio/voices`, beside the language
+model; without a `model_dir` it serves speech alone. Needs a build with libespeak-ng.
+
+| `tts` key | Default | Description |
+|---|---|---|
+| `model` | none | a vall-e export (`.sft`, python -m vall_e.export); its guidance is the default |
+| `codec` | required with `model` | the NeMo codec export (python -m vall_e.export codec) |
+| `voices_dir` | none | WAV voice prompts (any rate; the first 10 s are used), each a voice named by its file name |
+| `device` | 0 | the GPU |
 
 ## MiniMax-H3 (video and audio generation)
 
@@ -353,6 +385,10 @@ void ServerConfig::parse_cli_args( int argc, char** argv ) {
 }
 
 bool ServerConfig::resolve() {
+	if ( model_dir.empty() && !tts.model.empty() ) {
+		model_type = "vall_e";   // text to speech alone
+		return true;
+	}
 	if ( model_dir.empty() ) {
 		LOG_ERROR( "FATAL: model_dir is required (--model-dir or \"model_dir\" in the launch config)\n" );
 		return false;

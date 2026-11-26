@@ -72,6 +72,10 @@ bool VoltaServer::init( const ServerConfig& config ) {
 	if ( config_.model_type == "minimax_h3" ) {
 		// video + audio generation: the job service owns the GPUs, there is no language-model runtime
 		if ( !init_video() ) return false;
+	} else if ( config_.model_type == "vall_e" ) {
+		// text to speech alone
+		model_name_ = "vall_e";
+		if ( !init_tts() ) return false;
 	} else {
 		generator_ = std::make_unique<engine::runtime::Generator>();
 		if ( !generator_->init( config_ ) ) {
@@ -81,6 +85,7 @@ bool VoltaServer::init( const ServerConfig& config ) {
 		openai_ = make_openai_protocol();
 		completions_ = make_openai_completion_protocol();
 		anthropic_ = make_anthropic_protocol();
+		if ( !config_.tts.model.empty() && !init_tts() ) return false;
 	}
 	register_routes();
 
@@ -102,6 +107,17 @@ bool VoltaServer::init_video() {
 	LOG_ERROR( "Failed to initialize the video service.\n" );
 #else
 	LOG_ERROR( "MiniMax-H3 video generation needs the CUDA backend.\n" );
+#endif
+	return false;
+}
+
+bool VoltaServer::init_tts() {
+#ifdef ENGINE_TTS
+	tts_ = std::make_unique<TtsService>();
+	if ( tts_->init( config_ ) ) return true;
+	LOG_ERROR( "Failed to initialize the TTS service.\n" );
+#else
+	LOG_ERROR( "vall-e TTS needs a build with libespeak-ng.\n" );
 #endif
 	return false;
 }
@@ -269,6 +285,12 @@ bool VoltaServer::parse_request( const ConnPtr& conn, HttpRequest* req ) {
 }
 
 void VoltaServer::register_routes() {
+#ifdef ENGINE_TTS
+	if ( tts_ ) {
+		tts_->register_routes( router_, config_.model_type == "vall_e" );
+		if ( config_.model_type == "vall_e" ) return;
+	}
+#endif
 #ifdef ENGINE_BACKEND_CUDA
 	if ( video_ ) { // the video service answers /health and /metrics itself; the chat and monitor routes need a language-model runtime
 		video_->register_routes( router_ );

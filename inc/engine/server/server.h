@@ -9,6 +9,9 @@
 #ifdef ENGINE_BACKEND_CUDA
 #include "engine/server/video.h"
 #endif
+#ifdef ENGINE_TTS
+#include "engine/server/tts.h"
+#endif
 
 #include <atomic>
 #include <functional>
@@ -39,6 +42,7 @@ public:
 
 private:
 	bool init_video();
+	bool init_tts();
 	bool setup_socket();
 	void handle_new_connection();
 	void handle_readable( int fd );
@@ -67,6 +71,9 @@ private:
 	std::unique_ptr<engine::runtime::Generator> generator_;
 #ifdef ENGINE_BACKEND_CUDA
 	std::unique_ptr<VideoService> video_; // minimax_h3 checkpoints: the generation service instead of the language-model runtime
+#endif
+#ifdef ENGINE_TTS
+	std::unique_ptr<TtsService> tts_; // the "tts" section: speech beside the language model, or alone (model_type vall_e)
 #endif
 	std::map<int, ConnPtr> conns_; // epoll thread only
 	Router router_;

@@ -12,6 +12,9 @@
 #include "engine/loader/safetensors.h"
 #include "engine/tts/codec.h"
 #include "engine/tts/tts_model.h"
+#ifdef ENGINE_TTS
+#include "engine/tts/tts.h"
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -273,7 +276,8 @@ static int check_backbone( engine::tts::TtsModel& m, const char* path ) {
 }
 
 int main( int argc, char** argv ) {
-	std::string model, golden, out, codec_path, wav_out;
+	std::string model, golden, out, codec_path, wav_out, text, prompt_path, language = "en";
+	unsigned long long seed = 0;
 	float cfg = -1.0f, cfg_prompt = -1.0f;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--model" ) && i + 1 < argc ) { model = argv[++i]; }
@@ -281,13 +285,45 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--out" ) && i + 1 < argc ) { out = argv[++i]; }
 		else if ( !std::strcmp( argv[i], "--codec" ) && i + 1 < argc ) { codec_path = argv[++i]; }
 		else if ( !std::strcmp( argv[i], "--wav" ) && i + 1 < argc ) { wav_out = argv[++i]; }
+		else if ( !std::strcmp( argv[i], "--text" ) && i + 1 < argc ) { text = argv[++i]; }
+		else if ( !std::strcmp( argv[i], "--prompt" ) && i + 1 < argc ) { prompt_path = argv[++i]; }
+		else if ( !std::strcmp( argv[i], "--language" ) && i + 1 < argc ) { language = argv[++i]; }
+		else if ( !std::strcmp( argv[i], "--seed" ) && i + 1 < argc ) { seed = std::strtoull( argv[++i], nullptr, 10 ); }
 		else if ( !std::strcmp( argv[i], "--cfg" ) && i + 1 < argc ) { cfg = std::strtof( argv[++i], nullptr ); }
 		else if ( !std::strcmp( argv[i], "--cfg-prompt" ) && i + 1 < argc ) { cfg_prompt = std::strtof( argv[++i], nullptr ); }
 	}
 	if ( model.empty() ) {
 		std::fprintf( stderr, "usage: tts_generate --model <vall-e v3 export .sft> [--golden <golden.py case .safetensors>] [--cfg x] [--cfg-prompt x]\n"
-			"  [--codec <codec .sft> [--wav <out.wav>]]\n" );
+			"  [--codec <codec .sft> [--wav <out.wav>]]\n"
+			"  tts_generate --model <.sft> --codec <codec .sft> --text \"...\" [--prompt voice.wav] [--language en] [--seed n] --wav out.wav\n" );
 		return 2;
+	}
+	if ( !text.empty() ) {
+#ifdef ENGINE_TTS
+		// text to speech end to end (engine::tts::Tts, as vall_e/tts.py)
+		if ( codec_path.empty() || wav_out.empty() ) { std::fprintf( stderr, "--text needs --codec and --wav\n" ); return 2; }
+		engine::tts::Tts tts;
+		if ( !tts.load( model, codec_path ) ) { return 1; }
+		std::vector<float> prompt, audio;
+		int rate = 0;
+		std::string err;
+		if ( !prompt_path.empty() && !engine::tts::Tts::read_wav( prompt_path, prompt, rate, &err ) ) { std::fprintf( stderr, "%s\n", err.c_str() ); return 1; }
+		engine::tts::SynthOptions o;
+		o.language = language;
+		o.seed = seed;
+		o.cfg = cfg;
+		o.cfg_prompt = cfg_prompt;
+		const auto t0 = std::chrono::steady_clock::now();
+		if ( !tts.synthesize( text, prompt, rate, o, audio, &err ) ) { std::fprintf( stderr, "%s\n", err.c_str() ); return 1; }
+		const double dt = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
+		write_wav( wav_out, audio, tts.sample_rate() );
+		std::printf( "wrote %s: %.2f s of speech in %.2f s (%.1fx real time)\n", wav_out.c_str(), audio.size() / static_cast<double>( tts.sample_rate() ), dt,
+			audio.size() / static_cast<double>( tts.sample_rate() ) / dt );
+		return 0;
+#else
+		std::fprintf( stderr, "--text needs a build with libespeak-ng (the text front-end)\n" );
+		return 2;
+#endif
 	}
 	engine::tts::TtsModel m;
 	if ( !m.load( model ) ) { return 1; }

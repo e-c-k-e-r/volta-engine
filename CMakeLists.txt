@@ -259,6 +259,17 @@ set(ENGINE_DEVICE_SOURCES
 )
 set(ENGINE_CORE_SOURCES ${ENGINE_HOST_SOURCES} ${ENGINE_DEVICE_SOURCES})
 
+# vall-e TTS end to end (the text front-end, the pipeline and the server's speech endpoint): when libespeak-ng is installed (GPL-3.0,
+# which the AGPL-3.0 allows combining with); without it the model and codec build alone (tts_generate's golden checks)
+find_library(ESPEAK_NG_LIBRARY espeak-ng)
+find_path(ESPEAK_NG_INCLUDE espeak-ng/speak_lib.h)
+if(ESPEAK_NG_LIBRARY AND ESPEAK_NG_INCLUDE)
+	set(ENGINE_TTS ON)
+	list(APPEND ENGINE_CORE_SOURCES src/tts/g2p.cpp src/tts/tts.cpp src/server/tts_service.cpp)
+else()
+	message(STATUS "libespeak-ng not found: vall-e TTS without its text front-end, pipeline and speech endpoint")
+endif()
+
 # EXL3 GEMM instantiations: one generated translation unit per (bit width, codebook) so the template-heavy kernels compile in parallel
 # (exl3_instances.cu alone took 450 s). Codebook 0 is 3inst, 1 mcg, 2 mul1; every checkpoint is made with one of them.
 set(ENGINE_EXL3_CODEBOOKS "0;1;2" CACHE STRING "EXL3 codebooks to build GEMM kernels for (0: 3inst, 1: mcg, 2: mul1). A checkpoint using a codebook that is left out fails to start; fewer codebooks compile proportionally faster")
@@ -359,6 +370,17 @@ add_library(engine_kernels STATIC
 	${ENGINE_CORE_SOURCES}
 	${TRELLIS_SOURCES}
 )
+if(ENGINE_TTS)
+	target_include_directories(engine_kernels PUBLIC ${ESPEAK_NG_INCLUDE})
+	target_link_libraries(engine_kernels PUBLIC ${ESPEAK_NG_LIBRARY})
+	target_compile_definitions(engine_kernels PUBLIC ENGINE_TTS=1)
+	add_executable(test_tts_g2p tests/2_parity/test_tts_g2p.cpp)
+	target_link_libraries(test_tts_g2p PRIVATE engine_kernels)
+	set_target_properties(test_tts_g2p PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	add_executable(test_tts_resample tests/2_parity/test_tts_resample.cpp)
+	target_link_libraries(test_tts_resample PRIVATE engine_kernels)
+	set_target_properties(test_tts_resample PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+endif()
 # cuBLAS for the MiniMax-H3 video sources (the language models' GEMMs are the engine's own, src/kernels/cuda/gemm); hipBLAS on ROCm, where
 # the engine's GEMM forwards to it
 if(ENGINE_BACKEND STREQUAL "ROCM")
@@ -1031,22 +1053,6 @@ if(ENGINE_GPU)
 	add_executable(tts_generate src/tts/tts_generate_main.cpp)
 	target_link_libraries(tts_generate PRIVATE engine_kernels)
 	set_target_properties(tts_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-	# the TTS text front-end (vall_e's g2p through espeak-ng; GPL-3.0, which the AGPL-3.0 allows combining with): built
-	# when libespeak-ng is installed, with its parity test against vall_e's phonemes
-	find_library(ESPEAK_NG_LIBRARY espeak-ng)
-	find_path(ESPEAK_NG_INCLUDE espeak-ng/speak_lib.h)
-	if(ESPEAK_NG_LIBRARY AND ESPEAK_NG_INCLUDE)
-		add_library(engine_tts_g2p STATIC src/tts/g2p.cpp)
-		target_include_directories(engine_tts_g2p PUBLIC ${PROJECT_SOURCE_DIR}/inc ${PROJECT_SOURCE_DIR}/deps/json/single_include ${ESPEAK_NG_INCLUDE})
-		target_link_libraries(engine_tts_g2p PUBLIC ${ESPEAK_NG_LIBRARY})
-		target_compile_definitions(tts_generate PRIVATE ENGINE_TTS_G2P=1)
-		target_link_libraries(tts_generate PRIVATE engine_tts_g2p)
-		add_executable(test_tts_g2p tests/2_parity/test_tts_g2p.cpp)
-		target_link_libraries(test_tts_g2p PRIVATE engine_tts_g2p)
-		set_target_properties(test_tts_g2p PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-	else()
-		message(STATUS "libespeak-ng not found: tts_generate without its text front-end")
-	endif()
 
 	# NCCL is optional: it enables tensor parallelism (the transformer and the text tower over several GPUs) and bench_allreduce
 	if(ENGINE_BACKEND STREQUAL "CUDA")
