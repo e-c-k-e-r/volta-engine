@@ -308,7 +308,7 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	// otherwise the Slang kernels: up to 8 rows a subgroup per column with FP16 activations, more a workgroup per 64 x 64 tile
 	backend::vk::Pipeline* mmv = m <= kMmvMaxRows ? mmv_pipeline( type, m ) : nullptr;
 	// more than 16 rows: llama.cpp's matmuls, the large tiles from 128 rows
-	const bool large = m >= 128;
+	const bool large = false;   // the 64 x 64 tiles, as ggml_f16_matmul's (the 128 x 128 ones measured slower on the V100 at prefill chunks too)
 	backend::vk::Pipeline* mmq = m > kDotMaxRows && k % 128 == 0 ? mmq_pipeline( type, large ) : nullptr;
 	if ( mmq != nullptr ) {
 		// the rows as q8_1 x4 blocks (36 words per 128 values), then the matmul in BM x BN tiles of output rows x activation rows
