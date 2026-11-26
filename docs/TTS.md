@@ -43,5 +43,5 @@ The export's guidance is the default (v2.0 3.0 / 2.0, the distilled v2.0-fast 0 
 - Japanese must be given as kana: vall_e reads kanji through pykakasi's dictionary, which isn't ported (kanji are refused with a message).
 - No language detection (vall_e's `auto`): requests name the language.
 - Voices are single WAV files; vall_e's multi-clip folder prompts (speaker-embedding and MOS selection) aren't ported.
-- Speed is about vall_e's (v2.0 2.5x real time, v2.0-fast 4.8x on an RX 7900 XTX): the backbone's attention is plain batched GEMMs and the guidance
-  rows run one after another.
+- Speed (RX 7900 XTX, a 7 s line): v2.0 about 4.3x real time, v2.0-fast 8x, the 225M 9.5x. The backbone is compute-bound (a pass over ~670
+  positions is ~1 TFLOP); its attention is still plain batched GEMMs with a separate softmax (5% of the time).
