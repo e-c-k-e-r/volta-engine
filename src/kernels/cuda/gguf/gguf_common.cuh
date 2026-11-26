@@ -62,23 +62,25 @@ static __device__ __forceinline__ int tiled_source( int i, GgufColTiling t, int 
 	return ( head * ( k / per_v ) + v ) * t.dim + d;
 }
 
-// x [m, k] FP16 -> y [m][k / 32] q8_1 (llama.cpp's quantize_q8_1: scale amax / 127, the block sum of the unquantized values), in the
-// weight's column order
+// x [m, k] FP16 -> y [m][k / 32] q8_1 (llama.cpp's quantize_q8_1: scale amax / 127, and d times the block sum of the quantized values), in
+// the weight's column order. The vec_dot of the offset and minimum types (Q4_0, Q4_1, Q5_0, Q5_1, IQ1_S, IQ1_M) take their offset term from that
+// sum: of the quantized values it cancels against the main term exactly, and a row is the product of the dequantized weight with the q8_1
+// activations (the sum of the unquantized ones, as llama.cpp once had it, weights the rounding by the unsigned codes: ~1.3% per Q4_0 projection)
 // Values i of row `row` (a thread each, whole warps on whole q8_1 blocks)
 static __device__ __forceinline__ void quantize_q8_1_at( const half* __restrict__ x, block_q8_1* __restrict__ y, int k, GgufColTiling t, int row, int i ) {
 	if ( i >= k ) return;
 	const float xi = __half2float( x[static_cast<size_t>( row ) * k + tiled_source( i, t, k )] );
-	float amax = fabsf( xi ), sum = xi;
+	float amax = fabsf( xi );
 	#pragma unroll
-	for ( int o = 16; o > 0; o >>= 1 ) {
-		amax = fmaxf( amax, __shfl_xor_sync( 0xffffffff, amax, o ) );
-		sum += __shfl_xor_sync( 0xffffffff, sum, o );
-	}
+	for ( int o = 16; o > 0; o >>= 1 ) amax = fmaxf( amax, __shfl_xor_sync( 0xffffffff, amax, o ) );
 	const float d = amax / 127.0f;
 	const int8_t q = amax == 0.0f ? 0 : static_cast<int8_t>( roundf( xi / d ) );
+	int sum = q;
+	#pragma unroll
+	for ( int o = 16; o > 0; o >>= 1 ) sum += __shfl_xor_sync( 0xffffffff, sum, o );
 	block_q8_1& b = y[static_cast<size_t>( row ) * ( k / QK8_1 ) + i / QK8_1];
 	b.qs[i % QK8_1] = q;
-	if ( i % QK8_1 == 0 ) b.ds = make_half2( d, sum );
+	if ( i % QK8_1 == 0 ) b.ds = make_half2( d, d * static_cast<float>( sum ) );
 }
 
 static __global__ void quantize_q8_1_kernel( const half* __restrict__ x, block_q8_1* __restrict__ y, int k, GgufColTiling t ) {

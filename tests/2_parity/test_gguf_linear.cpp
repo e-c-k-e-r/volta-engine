@@ -125,11 +125,15 @@ int main( int argc, char** argv ) {
 			else worst_gemm = std::max( worst_gemm, rel_rms( o, f.exact, rows, f.n ) );
 		}
 		// The GEMV: FP16 output rounding stays well under 1e-2 against the q8_1 reference. The types whose offset or minimum comes from the q8_1
-		// block's half-precision sum of the activations (llama.cpp's formulation: Q4_0, Q4_1, Q5_0, Q5_1, and IQ1_S / IQ1_M for their delta) lose
-		// more, because that term nearly cancels the main dot product: a numpy emulation of the same formula gives the same 1.3% on Q4_0, so
-		// their bound is 3e-2. The tile kernel and the GEMM read FP16 activations and the exactly dequantized weight: FP16 rounding only
+		// block's sum (Q4_0, Q4_1, Q5_0, Q5_1, and IQ1_S / IQ1_M for their delta) meet it on CUDA, whose quantizer stores d times the sum of the
+		// quantized values as llama.cpp's does (the sum of the unquantized ones put them ~1.3% off on Q4_0); the CPU and Vulkan backends keep 3e-2
+		// for them. The tile kernel and the GEMM read FP16 activations and the exactly dequantized weight: FP16 rounding only
+#if defined(ENGINE_BACKEND_CPU) || defined(ENGINE_BACKEND_VULKAN)
 		const bool sum_offset = type == modules::GgmlType::Q4_0 || type == modules::GgmlType::Q4_1 || type == modules::GgmlType::Q5_0 ||
 			type == modules::GgmlType::Q5_1 || type == modules::GgmlType::IQ1_S || type == modules::GgmlType::IQ1_M;
+#else
+		const bool sum_offset = false;
+#endif
 		// The CPU backend (llama.cpp's CPU kernels) quantizes the activations at every row count (q8_0, q8_1 or q8_K by type): there the 9-16 and
 		// 20-row products meet the exact one at the GEMV's bound; from 32 rows ik_llama.cpp's iqk GEMM also requantizes each weight tile to
 		// int8 (its Q8_K_R8 / Q8_0_R8 repack), a little more: 1.5e-2

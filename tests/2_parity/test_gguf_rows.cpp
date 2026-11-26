@@ -1,7 +1,7 @@
 // A GGUF checkpoint's own projections through Linear::forward on random activations at the row counts of each path (the 1-8 row GEMV with
 // q8_1 activations, the 9-16 row kernels, the 64-row dequantize-and-GEMM): row 0's relative error against the product, in double, of the
 // weight as LinearGguf::dequant decodes it with the FP16 activations. Without fixtures, for the shapes of a real model; fails when a
-// GEMV row is off by more than the q8_1 bound of the offset types (3e-2).
+// GEMV row is off by more than 1e-2 (the q8_1 activations alone: ~5e-3; an offset term from the unquantized activations' sum: ~1.3e-2).
 //   test_gguf_rows <model dir> <tensor base name> [more names...]
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
@@ -84,7 +84,7 @@ int main( int argc, char** argv ) {
 			std::printf( " %d:%.2e", rows, rel );
 		}
 		std::printf( "\n" );
-		fails += worst > 3e-2;
+		fails += worst > 1e-2;
 		arena.offset_bytes = mark;
 	}
 	std::printf( "[%s] test_gguf_rows\n", fails ? "FAIL" : "PASS" );

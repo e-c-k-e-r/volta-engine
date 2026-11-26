@@ -111,16 +111,17 @@ __global__ void moe_act_q8_kernel( const float* __restrict__ g, const float* __r
 		uv = fmaxf( -limit, fminf( uv, limit ) );
 	}
 	const float a = gv / ( 1.0f + __expf( -gv ) ) * uv;
-	float amax = fabsf( a ), sum = a;
+	float amax = fabsf( a );
 	#pragma unroll
-	for ( int o = 16; o > 0; o >>= 1 ) {
-		amax = fmaxf( amax, __shfl_xor_sync( 0xffffffff, amax, o ) );
-		sum += __shfl_xor_sync( 0xffffffff, sum, o );
-	}
+	for ( int o = 16; o > 0; o >>= 1 ) amax = fmaxf( amax, __shfl_xor_sync( 0xffffffff, amax, o ) );
 	const float d = amax / 127.0f;
+	const int8_t qv = amax == 0.0f ? 0 : static_cast<int8_t>( roundf( a / d ) );
+	int sum = qv;   // d times the sum of the quantized values, as quantize_q8_1_at
+	#pragma unroll
+	for ( int o = 16; o > 0; o >>= 1 ) sum += __shfl_xor_sync( 0xffffffff, sum, o );
 	block_q8_1& b = q[static_cast<size_t>( r ) * ( inter / QK8_1 ) + i / QK8_1];
-	b.qs[i % QK8_1] = amax == 0.0f ? 0 : static_cast<int8_t>( roundf( a / d ) );
-	if ( i % QK8_1 == 0 ) b.ds = make_half2( d, sum );
+	b.qs[i % QK8_1] = qv;
+	if ( i % QK8_1 == 0 ) b.ds = make_half2( d, d * static_cast<float>( sum ) );
 }
 
 // A one-row pass's down projection and combine in one launch: warp `row` takes every item (one route each: a token routes to an expert once), two
