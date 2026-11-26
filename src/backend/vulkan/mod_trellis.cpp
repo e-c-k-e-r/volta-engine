@@ -1,8 +1,12 @@
-// Vulkan backend: EXL3 trellis linear (rotate, dequantize, GEMM, rotate) on the portable reference kernels ref_had128,
-// ref_trellis_reconstruct and ref_gemm_f16. The dequantized [k, n] weight of the call goes to a device scratch buffer, so the
-// cost per call is one reconstruction pass plus a tiled GEMM: correct, not fast. Same math as src/backend/cpu/linear_trellis.cpp.
+// Vulkan backend: EXL3 trellis linear on src/kernels/slang/trellis.slang. The input rotated by had128 (x * suh); up to 16 rows a GEMV over the
+// packed tiles (trellis_gemv1 / _gemv / _gemv16), more the weight decoded to FP16 [n, k] (trellis_dequant, into a scratch) for llama.cpp's FP16
+// matmul (split over K when few output tiles would run); the output rotated back (had128, then * svh). Same math as
+// src/backend/cpu/linear_trellis.cpp; every width code, both tile orders.
 #include "mod_common.h"
 #include "engine/modules/trellis.h"
+#include "engine/modules/trellis_bits.h"
+#include <algorithm>
+#include <cstdio>
 
 namespace engine::modules {
 
@@ -10,38 +14,74 @@ namespace {
 namespace vki = ::engine::backend::impl;
 
 constexpr float kRScale = 0.08838834764831845f; // 1 / sqrt( 128 )
+constexpr int kGemvRows = 16;
 
-void trellis_linear( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, bool volta, backend::stream_t stream ) {
+struct TrHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };
+struct TrGemvParams { uint64_t codes, x, y; int m, k, n, cb, volta; };
+struct TrDequantParams { uint64_t codes, out_; int k, n, cb, volta; };
+struct TrSplitSumParams { uint64_t out_, parts; int64_t n; int splits; };
+
+// The kernel of width code `code` (one SPIR-V per code): trellis_gemv_c4 and the like, the _dot form (the codebook's byte sum as a packed dot
+// product) where the device has shaderIntegerDotProduct
+const char* per_code( const char* stem, int code ) {
+	static thread_local char name[48];
+	std::snprintf( name, sizeof( name ), "%s_c%d%s", stem, code, backend::vk::int_dot() ? "_dot" : "" );
+	return name;
+}
+
+void trellis_linear( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int code, bool mcg,
+	bool mul1, bool volta, bool recon, backend::stream_t stream ) {
 	const int m = x.shape[0];
 	const int k = trellis.shape[0] * 16;
 	const int n = trellis.shape[1] * 16;
 	ENGINE_ASSERT( k % 128 == 0 && n % 128 == 0, "LinearTrellis (Vulkan): dims must be multiples of 128" );
 	ENGINE_ASSERT( x.dtype == pod::DType::FP16 && x.shape[1] == k, "LinearTrellis (Vulkan): x must be FP16 [m, k]" );
 	ENGINE_ASSERT( out.dtype == pod::DType::FP16, "LinearTrellis (Vulkan): FP16 output only" );
+	ENGINE_ASSERT( trellis.ndim < 3 || trellis.shape[2] == trellis_tile_u16( code ), "LinearTrellis (Vulkan): the tiles' width does not match the code" );
+	ENGINE_ASSERT( code >= 1 && code <= 11, "LinearTrellis (Vulkan): width code out of range" );
 	const int cb = mcg ? 1 : ( mul1 ? 2 : 0 );
-	const size_t kn = static_cast<size_t>( k ) * n;
-	// Scratch slots: 0 = dequantized weight, 1 = rotated input, 2 = GEMM output
-	void* w = vki::scratch( 0, kn * 2, stream );
+	// Scratch slots: 0 = dequantized weight, 1 = rotated input, 2 = product
 	void* xh = vki::scratch( 1, static_cast<size_t>( m ) * k * 2, stream );
 	void* y = vki::scratch( 2, static_cast<size_t>( m ) * n * 2, stream );
-	vki::RefHadParams h1{ vki::dp( x.data ), vki::dp( xh ), vki::dp( suh.data ), 0, k, kRScale };
-	vki::launch( "ref_had128", h1, stream, k / 128, m );
-	vki::RefReconParams rp{ vki::dp( trellis.data ), vki::dp( w ), k, n, bits, cb, volta ? 1 : 0 };
-	vki::launch( "ref_trellis_reconstruct", rp, stream, static_cast<uint32_t>( ( kn + 255 ) / 256 ) );
-	vki::RefGemmParams gp{ vki::dp( xh ), vki::dp( w ), vki::dp( y ), m, k, n };
-	vki::launch( "ref_gemm_f16", gp, stream, ( n + 15 ) / 16, ( m + 15 ) / 16 );
-	vki::RefHadParams h2{ vki::dp( y ), vki::dp( out.data ), 0, vki::dp( svh.data ), n, kRScale };
-	vki::launch( "ref_had128", h2, stream, n / 128, m );
+	const TrHadParams h1{ vki::dp( x.data ), vki::dp( xh ), vki::dp( suh.data ), 0, k, kRScale };
+	vki::launch( "trellis_had128", h1, stream, k / 128, m );
+	if ( m <= kGemvRows && !recon ) {
+		const TrGemvParams g{ vki::dp( trellis.data ), vki::dp( xh ), vki::dp( y ), m, k, n, cb, volta ? 1 : 0 };
+		vki::launch( per_code( m == 1 ? "trellis_gemv1" : m <= 8 ? "trellis_gemv" : "trellis_gemv16", code ), g, stream, n / 16 );
+	}
+	else {
+		void* w = vki::scratch( 0, static_cast<size_t>( k ) * n * 2, stream );
+		const TrDequantParams d{ vki::dp( trellis.data ), vki::dp( w ), k, n, cb, volta ? 1 : 0 };
+		// a workgroup per four K tiles of a column tile (k a multiple of 128: whole groups of four)
+		vki::launch( per_code( "trellis_dequant", code ), d, stream, static_cast<uint32_t>( ( k / 64 ) * ( n / 16 ) ) );
+		// few output tiles over a long K: the K range in slabs that keep about kTiles workgroups busy, their FP32 partials summed in order
+		constexpr int kTiles = 160;
+		const int tiles_mn = ( ( m + 63 ) / 64 ) * ( ( n + 63 ) / 64 );
+		if ( tiles_mn < kTiles && k >= 2048 ) {
+			const int want = std::min( 16, ( kTiles + tiles_mn - 1 ) / tiles_mn );
+			const int k_split = ( ( k + want - 1 ) / want + 255 ) / 256 * 256;
+			const int splits = ( k + k_split - 1 ) / k_split;
+			const int64_t elems = static_cast<int64_t>( m ) * n;
+			float* parts = static_cast<float*>( vki::scratch( 3, static_cast<size_t>( splits ) * elems * sizeof( float ), stream ) );
+			ENGINE_ASSERT( vki::ggml_f16_matmul( w, xh, parts, m, n, k, true, stream, k_split ), "LinearTrellis (Vulkan): the FP16 matmul" );
+			const TrSplitSumParams q{ vki::dp( y ), vki::dp( parts ), elems, splits };
+			const int64_t groups = ( elems + 255 ) / 256;
+			vki::launch( "trellis_split_sum", q, stream, static_cast<uint32_t>( std::min<int64_t>( groups, 65535 ) ), static_cast<uint32_t>( ( groups + 65534 ) / 65535 ) );
+		}
+		else ENGINE_ASSERT( vki::ggml_f16_matmul( w, xh, y, m, n, k, false, stream ), "LinearTrellis (Vulkan): the FP16 matmul" );
+	}
+	const TrHadParams h2{ vki::dp( y ), vki::dp( out.data ), 0, vki::dp( svh.data ), n, kRScale };
+	vki::launch( "trellis_had128", h2, stream, n / 128, m );
 }
 
 }
 
 void LinearTrellis::forward( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, backend::stream_t stream, bool volta_tiles ) {
-	trellis_linear( x, trellis, suh, svh, out, bits, mcg, mul1, volta_tiles, stream );
+	trellis_linear( x, trellis, suh, svh, out, bits, mcg, mul1, volta_tiles, false, stream );
 }
 
 void LinearTrellis::forward_recon( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, backend::stream_t stream, bool volta_tiles ) {
-	trellis_linear( x, trellis, suh, svh, out, bits, mcg, mul1, volta_tiles, stream );
+	trellis_linear( x, trellis, suh, svh, out, bits, mcg, mul1, volta_tiles, true, stream );
 }
 
 // one projection at a time here

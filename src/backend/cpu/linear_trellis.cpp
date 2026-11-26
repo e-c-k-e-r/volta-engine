@@ -4,6 +4,7 @@
 // cpu_kernels.h first: the Slang prelude defines int4, which the backend shim only declares when the prelude is absent
 #include "cpu_kernels.h"
 #include "engine/modules/trellis.h"
+#include "engine/modules/trellis_bits.h"
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
@@ -40,6 +41,14 @@ void had_rows( const half* src, half* dst, const half* pre, const half* post, in
 // Codebook index of the reference decoder: 0 = 3INST, 1 = MCG, 2 = MUL1
 int codebook( bool mcg, bool mul1 ) {
 	return mcg ? 1 : ( mul1 ? 2 : 0 );
+}
+
+// The first stream bit of position p's 16-bit window in a tile of `total` bits, width code `code` (trellis_bits.h: a half-integer rate's
+// windows end K and K + 1 bits apart, alternately)
+inline int window_start( int p, int code, int total ) {
+	const int end = trellis_is_half( code ) ? ( p >> 1 ) * ( 2 * trellis_base_bits( code ) + 1 ) + ( ( p & 1 ) ? 2 * trellis_base_bits( code ) + 1 : trellis_base_bits( code ) )
+		: ( p + 1 ) * code;
+	return ( end - 16 + total ) % total;
 }
 
 float half_to_float( half h ) {
@@ -93,7 +102,7 @@ void decode_tile_avx2( const uint8_t* stream, int total, int bits, int cb, uint1
 	const __m256 c1 = _mm256_set1_ps( hbits_to_float( 0x1eeeu ) ), c2 = _mm256_set1_ps( hbits_to_float( 0xc931u ) );
 	alignas( 32 ) int q0s[8];
 	for ( int p0 = 0; p0 < 256; p0 += 8 ) {
-		for ( int l = 0; l < 8; ++l ) q0s[l] = ( ( p0 + l ) * bits + bits - 16 + total ) % total;
+		for ( int l = 0; l < 8; ++l ) q0s[l] = window_start( p0 + l, bits, total );
 		const __m256i q0 = _mm256_load_si256( reinterpret_cast<const __m256i*>( q0s ) );
 		const __m256i idx = _mm256_srli_epi32( q0, 3 );
 		const __m256i shift = _mm256_sub_epi32( _mm256_set1_epi32( 16 ), _mm256_and_si256( q0, _mm256_set1_epi32( 7 ) ) );
@@ -129,13 +138,14 @@ void decode_tile_avx2( const uint8_t* stream, int total, int bits, int cb, uint1
 void reconstruct_native( const uint16_t* codes, half* out, int k, int n, int bits, int cb, bool volta ) {
 	static_assert( sizeof( half ) == 2, "reconstruct_native: half must be 16 bits" );
 	const int tiles_n = n / 16;
-	const int total = 256 * bits;
+	const int tile_u16 = trellis_tile_u16( bits );
+	const int total = tile_u16 * 16;
 	impl::cpu_parallel_for( k / 16, 1, [&]( int64_t kt0, int64_t kt1 ) {
 		std::vector<uint8_t> stream( static_cast<size_t>( total / 8 ) + 4 );
 		uint16_t vals[256];
 		for ( int64_t kt = kt0; kt < kt1; ++kt ) {
 			for ( int nt = 0; nt < tiles_n; ++nt ) {
-				const uint16_t* tile = codes + ( kt * tiles_n + nt ) * 16 * bits;
+				const uint16_t* tile = codes + ( kt * tiles_n + nt ) * tile_u16;
 				for ( int wd = 0; wd < total / 32; ++wd ) {
 					const uint32_t word = static_cast<uint32_t>( tile[wd * 2] ) | ( static_cast<uint32_t>( tile[wd * 2 + 1] ) << 16 );
 					stream[wd * 4 + 0] = static_cast<uint8_t>( word >> 24 );
@@ -148,7 +158,7 @@ void reconstruct_native( const uint16_t* codes, half* out, int k, int n, int bit
 				decode_tile_avx2( stream.data(), total, bits, cb, vals );
 #else
 				for ( int p = 0; p < 256; ++p ) {
-					const int q0 = ( p * bits + bits - 16 + total ) % total;
+					const int q0 = window_start( p, bits, total );
 					const uint8_t* b = stream.data() + ( q0 >> 3 );
 					const uint32_t v = ( static_cast<uint32_t>( b[0] ) << 24 ) | ( static_cast<uint32_t>( b[1] ) << 16 ) | ( static_cast<uint32_t>( b[2] ) << 8 ) | b[3];
 					vals[p] = decode_window( ( v >> ( 16 - ( q0 & 7 ) ) ) & 0xffffu, cb );

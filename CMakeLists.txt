@@ -1063,6 +1063,9 @@ if(ENGINE_GPU)
 	add_executable(bench_tts_ops tests/3_bench/bench_tts_ops.cpp)
 	target_link_libraries(bench_tts_ops PRIVATE engine_kernels)
 	set_target_properties(bench_tts_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	add_executable(bench_trellis_shapes tests/3_bench/bench_trellis_shapes.cpp)
+	target_link_libraries(bench_trellis_shapes PRIVATE engine_kernels)
+	set_target_properties(bench_trellis_shapes PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# NCCL is optional: it enables tensor parallelism (the transformer and the text tower over several GPUs) and bench_allreduce
 	if(ENGINE_BACKEND STREQUAL "CUDA")

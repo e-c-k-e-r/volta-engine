@@ -1,4 +1,5 @@
-// Op-level golden test for the Linear module (trellis at 3/4/5/6 bits with MUL1 and MCG and at 3/4 bits in the Volta tile order, rows 1/4/40, plain FP16, NVFP4).
+// Op-level golden test for the Linear module (trellis at 3/4/5/6 bits with MUL1 and MCG, MUL1 at 1/2/7/8 bits and the half-integer rates, the Volta
+// tile order at 2/3/4/8 bits and 2.5, rows 1/4/40, plain FP16, NVFP4).
 // ONE source for both configurations through the module API:
 //   --dump <dir>   run in the CUDA build: computes with the real kernels, writes golden outputs
 //   --check <dir>  recompute with the built backend and compare (tier 2) against the golden files
@@ -9,6 +10,7 @@
 #include "engine/backend/tiers.h"
 #include "engine/core/arena.h"
 #include "engine/modules/linear.h"
+#include "engine/modules/trellis_bits.h"
 #include <vector>
 
 using namespace engine;
@@ -28,7 +30,7 @@ static pod::TensorView upload_half( const std::vector<float>& v, std::initialize
 }
 
 static pod::TensorView upload_codes( const std::vector<uint16_t>& v, int k, int n, int bits ) {
-	int s[3] = { k / 16, n / 16, 16 * bits };
+	int s[3] = { k / 16, n / 16, modules::trellis_tile_u16( bits ) };
 	pod::TensorView t = core::arena_alloc_tensor( g_arena, pod::DType::UINT16, s, 3 );
 	backend::memcpy_sync( t.data, v.data(), v.size() * sizeof( uint16_t ), backend::Copy::H2D );
 	return t;
@@ -56,7 +58,7 @@ static std::vector<float> sign_vec( GoldenRng& rng, size_t n ) {
 }
 
 static std::vector<uint16_t> code_vec( GoldenRng& rng, int k, int n, int bits ) {
-	std::vector<uint16_t> c( static_cast<size_t>( k / 16 ) * ( n / 16 ) * 16 * bits );
+	std::vector<uint16_t> c( static_cast<size_t>( k / 16 ) * ( n / 16 ) * modules::trellis_tile_u16( bits ) );
 	for ( auto& v : c ) v = static_cast<uint16_t>( rng.next() );
 	return c;
 }
@@ -94,8 +96,25 @@ int main( int argc, char** argv ) {
 			}
 		}
 	}
+	// the other widths of the MUL1 codebook: 1, 2, 7 and 8 bits and the half-integer rates 1.5, 2.5, 3.5 (codes 9 to 11, trellis_bits.h)
+	for ( int bits : { 1, 2, 7, 8, 9, 10, 11 } ) {
+		GoldenRng rng( 3000u + 17u * static_cast<uint32_t>( bits ) );
+		auto codes = upload_codes( code_vec( rng, k, n, bits ), k, n, bits );
+		auto suh = upload_half( sign_vec( rng, k ), { k } );
+		auto svh = upload_half( sign_vec( rng, n ), { n } );
+		const pod::LinearWeight lw = pod::LinearWeight::make_trellis( codes, suh, svh, bits, true, false );
+		for ( int m : row_list ) {
+			auto x = upload_half( uniform_vec( rng, static_cast<size_t>( m ) * k, 1.0f ), { m, k } );
+			int os[2] = { m, n };
+			pod::TensorView out = core::arena_alloc_tensor( g_arena, pod::DType::FP16, os, 2 );
+			modules::Linear::forward( x, lw, out );
+			char nm[64];
+			std::snprintf( nm, sizeof( nm ), "trellis_mul1_c%d_m%d", bits, m );
+			cases.push_back( { nm, download_half( out ) } );
+		}
+	}
 	// the Volta tile order (LinearWeight::volta_tiles) on the same kind of random words: each backend's own decode of that order
-	for ( int bits : { 3, 4 } ) {
+	for ( int bits : { 3, 4, 2, 8, 10 } ) {
 		GoldenRng rng( 5000u + 17u * static_cast<uint32_t>( bits ) );
 		auto codes = upload_codes( code_vec( rng, k, n, bits ), k, n, bits );
 		auto suh = upload_half( sign_vec( rng, k ), { k } );

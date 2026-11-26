@@ -66,6 +66,39 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			COMMENT "slangc ${entry} -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
+	# EXL3 trellis linear (src/kernels/slang/trellis.slang): the rotation once, the GEMV and the dequantization once per width code
+	foreach(entry trellis_had128 trellis_split_sum)
+		set(sout ${SLANG_OUT}/${entry}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/trellis.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/trellis.slang
+			COMMENT "slangc ${entry} -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
+	foreach(code 1 2 3 4 5 6 7 8 9 10 11)
+		# trellis_gemv (up to 8 rows: 2 tiles a step), trellis_gemv1 (one row: 4 tiles a step), trellis_gemv16 (up to 16 rows), trellis_dequant;
+		# each also with the codebook's byte sum as a packed dot product (_dot, devices with shaderIntegerDotProduct)
+		foreach(variant trellis_gemv:trellis_gemv:8:2 trellis_gemv1:trellis_gemv:1:4 trellis_gemv16:trellis_gemv:16:1 trellis_dequant:trellis_dequant:8:1)
+			string(REPLACE ":" ";" vparts ${variant})
+			list(GET vparts 0 vname)
+			list(GET vparts 1 entry)
+			list(GET vparts 2 vrows)
+			list(GET vparts 3 vunroll)
+			foreach(dot 0 1)
+				set(suffix "")
+				if(dot)
+					set(suffix "_dot")
+				endif()
+				set(sout ${SLANG_OUT}/${vname}_c${code}${suffix}.spv)
+				add_custom_command(OUTPUT ${sout}
+					COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/trellis.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -DTR_CODE=${code}
+						-DTR_GEMV_ROWS=${vrows} -DTR_UNROLL=${vunroll} -DTR_THREADS=256 -DTR_DOT=${dot} -o ${sout}
+					DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/trellis.slang
+					COMMENT "slangc ${vname} (code ${code}${suffix}) -> spirv")
+				list(APPEND VK_FLASH_SPV ${sout})
+			endforeach()
+		endforeach()
+	endforeach()
 	# vall-e TTS and NeMo codec operators (src/kernels/slang/tts.slang)
 	foreach(entry tts_digits_values tts_embed_mix tts_add_norm tts_add_bias tts_qk_norm_rope tts_heads_gate tts_swiglu tts_gather_rows tts_bias_act tts_cond_silu
 		tts_ln_mod tts_gate_add tts_replicate tts_guide_step tts_snap codec_dequant codec_quant codec_act codec_cols codec_up_cols codec_interleave codec_channel_bias
@@ -313,7 +346,10 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	add_executable(bench_tts_ops tests/3_bench/bench_tts_ops.cpp ${ENGINE_VK_OBJECTS})
 	target_link_libraries(bench_tts_ops PRIVATE engine_backend_vulkan pthread)
 	add_dependencies(bench_tts_ops slang_kernels)
-	set_target_properties(tts_generate bench_tts_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	add_executable(bench_trellis_shapes tests/3_bench/bench_trellis_shapes.cpp ${ENGINE_VK_OBJECTS})
+	target_link_libraries(bench_trellis_shapes PRIVATE engine_backend_vulkan pthread)
+	add_dependencies(bench_trellis_shapes slang_kernels)
+	set_target_properties(tts_generate bench_tts_ops bench_trellis_shapes PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# The server entry point, to show how far the host sources link (the quantized linears and attention are stubs)
 	add_executable(volta_server src/server/main.cpp ${ENGINE_VK_OBJECTS})
