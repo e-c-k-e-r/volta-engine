@@ -120,7 +120,8 @@ FP16 matmul (FP16 or FP32 out) and its FP32 one (`bench_tts_ops`). `trellis.slan
 with the codebook's byte sum as a packed dot product where the device has one): `trellis_had128` (the rotations, a butterfly), `trellis_gemv`
 (up to 16 rows: a warp per 16 x 16 tile, a lane's 8 windows funnel shifts of three words, the codebook on FP16 pairs, FP32 sums) and
 `trellis_dequant` (the weight decoded to FP16 [n, k] for llama.cpp's matmul, staged for whole-row writes), held against the CUDA kernels by
-`test_ops_linear` (`bench_trellis_shapes`). `nvfp4.slang` holds the Vulkan NVFP4 linear (`nvfp4_gemm`) and
+`test_ops_linear` (`bench_trellis_shapes`). `nvfp4.slang` holds the Vulkan NVFP4 linear (`nvfp4_gemv` up to 8 rows: a lane per column of a
+32-column tile, its weights decoded once per K group for every row; `nvfp4_dequant` for llama.cpp's matmul beyond; `nvfp4_gemm` the reference) and
 the NVFP4 experts (`nvfp4_moe_gate_up`, `nvfp4_moe_down`: a workgroup per 32-column tile and route, a lane per column of the prepacked layout,
 the weights rounded to FP16 as the CUDA kernels round them), held against the CUDA kernels by `test_ops_linear` and `test_ops_moe`. `kv_codec.slang` holds the KV cache element codecs (FP8, int8, Q4, NVFP4 with
 their scales) that `kv_store_q` and the attention kernels (`ref_attention`, `fa`, the QSA sparse attention in `flash`, the latent attention in `glm`) share; the stored bytes and scales are checked bit for bit against the CUDA kernels by
