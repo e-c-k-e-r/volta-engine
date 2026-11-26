@@ -38,6 +38,11 @@ void* shared_timeline_import( int fd );  // that semaphore on the current device
 void stream_signal( stream_t s, void* sem, uint64_t value );
 // What is recorded on s from now on waits until every sems[i] reaches values[i]
 void stream_wait( stream_t s, void* const* sems, const uint64_t* values, int n );
+// The forms a graph capture holds (the fixed-value ones make a capture fall back to running): stream_signal_next advances *counter and signals
+// sem with the new value, stream_wait_counter waits until every sems[i] reaches *counter; a replay advances and reads the counters again, so a
+// collective whose every rank keeps one counter in step replays with fresh values
+void stream_signal_next( stream_t s, void* sem, uint64_t* counter );
+void stream_wait_counter( stream_t s, void* const* sems, int n, const uint64_t* counter );
 
 // Record bind + push constants + dispatch( gx, gy, gz workgroups ) + a compute/transfer barrier into the stream
 // (nullptr = default stream; in a run of independent ops the barrier waits for the next command). While a graph capture is active this records into the graph.

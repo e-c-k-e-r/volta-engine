@@ -16,9 +16,13 @@
 #include <cmath>
 #include <vector>
 
-// The option table lives in the host library, which the module-only smoke binaries do not link: bind it weakly (no option = defaults)
+// The option table and the arena live in the host library, which the module-only smoke binaries do not link: bind them weakly (no option =
+// defaults; those binaries build no NVFP4 expert table)
 namespace engine::runtime {
 __attribute__(( weak )) Options& options();
+}
+namespace engine::core {
+__attribute__(( weak )) void* arena_alloc( pod::MemoryArena& arena, size_t bytes, size_t alignment );
 }
 
 namespace engine::modules {
@@ -58,11 +62,37 @@ void GatedResidual::mix(
 	const int has_inject = inject != nullptr ? 1 : 0;
 	vki::GrGateParams g{ vki::dp( normed ), vki::dp( down ), vki::dp( inject ), vki::dp( t ), vki::dp( post ), flat, rank, hc, has_inject };
 	vki::launch( "gr_gate", g, stream, rank + ( has_inject ? hc : 0 ), rows );
+	ENGINE_ASSERT( rank % 8 == 0 && rank <= 512 && hc <= 4 && reinterpret_cast<uintptr_t>( up ) % 16 == 0, "GatedResidual::mix (Vulkan): rank a multiple of 8 up to 512, hc up to 4" );
 	vki::GrUpMixParams u{ vki::dp( normed ), vki::dp( up ), vki::dp( t ), vki::dp( mixed ), hidden, hc, rank, rows };
-	vki::launch( "gr_up_mix", u, stream, tiles( hidden, 64 ), rows );
+	vki::launch( "gr_up_mix", u, stream, tiles( hidden, 4 ) );
 }
 
+// llama.cpp's FP16 matmul with an FP32 output where it applies, else the Slang kernel (a thread per output). A long K over few output tiles
+// (normed @ [down; inject]^T: k = hc * hidden, n = rank + hc) splits into slabs that keep about kTiles workgroups busy; split slabs, and an
+// accumulate, go to scratch and are summed in order
 void GatedResidual::gemm_f32( const backend::half_t* a, const backend::half_t* w, float* out, int m, int n, int k, bool accumulate, backend::stream_t stream ) {
+	if ( m > 8 && k % 32 == 0 ) {
+		constexpr int kTiles = 160;
+		const int tm = m >= 128 ? 128 : 64;   // the matmul's tile (ggml_f16_matmul: large from 128 rows)
+		const int tiles_mn = ( ( n + tm - 1 ) / tm ) * ( ( m + tm - 1 ) / tm );
+		int k_split = k;
+		if ( tiles_mn < kTiles && k >= 2048 ) {
+			const int want = std::min( 16, ( kTiles + tiles_mn - 1 ) / tiles_mn );
+			k_split = ( ( k + want - 1 ) / want + 255 ) / 256 * 256;
+		}
+		const int splits = ( k + k_split - 1 ) / k_split;
+		const int64_t elems = static_cast<int64_t>( m ) * n;
+		const bool direct = splits == 1 && !accumulate;
+		float* dst = direct ? out : static_cast<float*>( vki::scratch( 34, static_cast<size_t>( splits ) * elems * sizeof( float ), stream ) );
+		if ( vki::ggml_f16_matmul( w, a, dst, m, n, k, true, stream, k_split ) ) {
+			if ( !direct ) {
+				vki::GrSplitSumParams q{ vki::dp( out ), vki::dp( dst ), elems, splits, accumulate ? 1 : 0 };
+				const int64_t groups = ( elems + 255 ) / 256;
+				vki::launch( "gr_split_sum", q, stream, static_cast<uint32_t>( std::min<int64_t>( groups, 65535 ) ), static_cast<uint32_t>( ( groups + 65534 ) / 65535 ) );
+			}
+			return;
+		}
+	}
 	vki::GrGemmParams p{ vki::dp( a ), vki::dp( w ), vki::dp( out ), m, n, k, accumulate ? 1 : 0 };
 	vki::launch( "gr_gemm_f32", p, stream, tiles( n, 64 ), m );
 }
@@ -168,18 +198,43 @@ void Attention::forward_sparse( const pod::KVRef& kv, const pod::TensorView& q, 
 
 void MoERouter::route_softmax_topk( const pod::TensorView& x, const pod::TensorView& router_weights, int* d_topk_indices, backend::half_t* d_topk_weights, int hidden_size, int num_experts,
 	int top_k, backend::stream_t stream, int rows ) {
-	ENGINE_ASSERT( rows >= 1 && top_k <= 16 && top_k <= num_experts && num_experts <= 512, "MoERouter::route_softmax_topk (Vulkan): rows / top_k / num_experts out of range" );
+	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS && top_k <= 16 && top_k <= num_experts && num_experts <= 512 && hidden_size % 128 == 0,
+		"MoERouter::route_softmax_topk (Vulkan): rows / top_k / num_experts / hidden_size out of range" );
 	static const int round_fp16 = ( engine::runtime::options != nullptr && engine::runtime::options().router_fp16 ) ? 1 : 0;
-	vki::RouterParams p{ vki::dp( x.data ), vki::dp( router_weights.data ), vki::dp( d_topk_indices ), vki::dp( d_topk_weights ), hidden_size, num_experts, top_k, round_fp16 };
-	vki::launch( "router_softmax_topk", p, stream, rows );
+	// the slices' logits for MAX_ROWS rows, sized once (a captured forward must never see it move)
+	const int slices = hidden_size / 128;
+	float* partials = static_cast<float*>( vki::scratch( 33, static_cast<size_t>( pod::MAX_ROWS ) * slices * num_experts * sizeof( float ), stream ) );
+	vki::RouterSmParams p{ vki::dp( x.data ), vki::dp( router_weights.data ), vki::dp( partials ), vki::dp( d_topk_indices ), vki::dp( d_topk_weights ), hidden_size,
+		num_experts, top_k, round_fp16, slices };
+	vki::launch( "router_sm_partials", p, stream, tiles( num_experts, 64 ), static_cast<uint32_t>( slices ), static_cast<uint32_t>( rows ) );
+	vki::launch( "router_sm_select", p, stream, static_cast<uint32_t>( rows ) );
 }
 
-// Pointer tables are a CUDA-side convenience; the Vulkan path reads the LinearWeight array directly
-void MoE::init_device_ptrs( pod::MoELayerWeights& weights, pod::MemoryArena&, backend::stream_t ) {
+// The host paths read the LinearWeight array directly; NVFP4 experts also get the CUDA layout's device table for nvfp4_moe_*: six pointer
+// arrays (gate codes / scales, up codes / scales, down codes / scales), then the three global-scale arrays
+void MoE::init_device_ptrs( pod::MoELayerWeights& weights, pod::MemoryArena& arena, backend::stream_t stream ) {
 	for ( int e = 0; e < weights.num_local_experts; ++e ) {
 		ENGINE_ASSERT( !weights.gate[e].extended() && !weights.up[e].extended() && !weights.down[e].extended(), "MoE (Vulkan): the extended trellis (tile starts / gains) runs on CUDA only" );
 	}
 	weights.device_ptrs = nullptr;
+	if ( weights.type != pod::QuantType::NVFP4 ) return;
+	const int E = weights.num_local_experts;
+	std::vector<const void*> ptrs( 6 * E );
+	std::vector<float> g( 3 * E );
+	for ( int e = 0; e < E; ++e ) {
+		const pod::LinearWeight* lw[3] = { &weights.gate[e], &weights.up[e], &weights.down[e] };
+		for ( int p = 0; p < 3; ++p ) {
+			ptrs[( 2 * p ) * E + e] = lw[p]->w0.data;
+			ptrs[( 2 * p + 1 ) * E + e] = lw[p]->w1.data;
+			g[p * E + e] = lw[p]->alpha;
+		}
+	}
+	const size_t pb = ptrs.size() * sizeof( const void* );
+	char* d = static_cast<char*>( engine::core::arena_alloc( arena, pb + g.size() * sizeof( float ) ) );
+	backend::memcpy_async( d, ptrs.data(), pb, backend::Copy::H2D, stream );
+	backend::memcpy_async( d + pb, g.data(), g.size() * sizeof( float ), backend::Copy::H2D, stream );
+	backend::stream_sync( stream );
+	weights.device_ptrs = d;
 }
 
 bool MoE::fused_decode( const pod::MoELayerWeights&, const pod::MoEScratch&, int ) { return false; }
@@ -192,8 +247,8 @@ pod::MoEScratch MoE::alloc_scratch( pod::MemoryArena&, int, int, int, int, int, 
 // the host and batched per expert (one trellis dequantization per weight and expert); the weighted sum runs on the device in route order.
 void MoE::forward( const pod::TensorView& x, const pod::MoELayerWeights& weights, const int* d_topk_indices, const backend::half_t* d_topk_weights, pod::TensorView& out, int start_expert, int end_expert,
 	const pod::MoEScratch&, float act_limit, backend::stream_t stream ) {
-	ENGINE_ASSERT( weights.type == pod::QuantType::TRELLIS || weights.type == pod::QuantType::FP16 || weights.type == pod::QuantType::GGUF,
-		"MoE::forward (Vulkan): TRELLIS, FP16 or GGUF experts only" );
+	ENGINE_ASSERT( weights.type == pod::QuantType::TRELLIS || weights.type == pod::QuantType::FP16 || weights.type == pod::QuantType::GGUF ||
+		weights.type == pod::QuantType::NVFP4, "MoE::forward (Vulkan): TRELLIS, FP16, GGUF or NVFP4 experts only" );
 	// GGUF experts on few rows: on the device (no route read-back), when the experts are stacked
 	if ( moe_gguf_device( x, weights, d_topk_indices, d_topk_weights, out, start_expert, end_expert, act_limit, stream ) ) return;
 	const int rows = ( out.ndim >= 2 && out.shape[0] > 0 ) ? out.shape[0] : 1;
@@ -201,7 +256,51 @@ void MoE::forward( const pod::TensorView& x, const pod::MoELayerWeights& weights
 	const int E = weights.num_local_experts;
 	const int topk = weights.top_k;
 	const pod::LinearWeight& ref = weights.up[0];
-	const int inter = ref.type == pod::QuantType::TRELLIS ? ref.w2.shape[0] : ref.type == pod::QuantType::GGUF ? ref.gguf_n : ref.w0.shape[1];
+	// NVFP4 experts on the device: a workgroup per (tile, route), then the routes combined in order. Up to MAX_BATCH rows every route in place
+	// (a local one computes, another leaves at once), h and the routes' outputs in scratch sized for MAX_BATCH rows (a captured forward must never
+	// see it move); a prefill chunk (eager) reads its routes back and runs just the local ones, expert by expert
+	if ( weights.type == pod::QuantType::NVFP4 && weights.device_ptrs != nullptr && weights.staged_ptrs == nullptr ) {
+		const int inter = ref.w0.shape[0];   // up's packed codes are [inter, hidden / 2] bytes
+		ENGINE_ASSERT( hidden % 64 == 0 && inter % 64 == 0 && hidden <= 8192 && inter <= 8192, "MoE::forward (Vulkan): NVFP4 experts need hidden and inter multiples of 64, at most 8192" );
+		const bool decode = rows <= pod::MAX_BATCH;
+		const size_t routes_max = static_cast<size_t>( decode ? pod::MAX_BATCH : rows ) * topk;
+		backend::half_t* h = static_cast<backend::half_t*>( vki::scratch( decode ? 31 : 35, routes_max * inter * sizeof( backend::half_t ), stream ) );
+		backend::half_t* route_out = static_cast<backend::half_t*>( vki::scratch( decode ? 32 : 36, routes_max * hidden * sizeof( backend::half_t ), stream ) );
+		uint32_t routes = static_cast<uint32_t>( rows * topk );
+		int* order = nullptr;
+		if ( !decode ) {
+			std::vector<int> idx( static_cast<size_t>( rows ) * topk );
+			backend::memcpy_async( idx.data(), d_topk_indices, idx.size() * sizeof( int ), backend::Copy::D2H, stream );
+			backend::stream_sync( stream );
+			std::vector<std::vector<int>> by( E );
+			for ( int i = 0; i < rows * topk; ++i ) {
+				const int e = idx[i] - start_expert;
+				if ( e >= 0 && e < E ) by[e].push_back( i );
+			}
+			std::vector<int> list;
+			list.reserve( idx.size() );
+			for ( const auto& v : by ) list.insert( list.end(), v.begin(), v.end() );
+			routes = static_cast<uint32_t>( list.size() );
+			if ( routes > 0 ) {
+				order = static_cast<int*>( vki::scratch( 37, idx.size() * sizeof( int ), stream ) );
+				backend::memcpy_async( order, list.data(), list.size() * sizeof( int ), backend::Copy::H2D, stream );
+			}
+		}
+		const char* tbl = static_cast<const char*>( weights.device_ptrs );
+		const uint64_t gs = vki::dp( tbl + 6 * E * sizeof( const void* ) );
+		if ( routes > 0 ) {
+			vki::Nvfp4MoeParams pg{ vki::dp( tbl ), gs, vki::dp( x.data ), vki::dp( d_topk_indices ), vki::dp( h ), vki::dp( order ), topk, E, start_expert, hidden, inter, act_limit };
+			vki::launch( "nvfp4_moe_gate_up", pg, stream, static_cast<uint32_t>( inter / 32 ), routes );
+			vki::Nvfp4MoeParams pd{ vki::dp( tbl ), gs, vki::dp( h ), vki::dp( d_topk_indices ), vki::dp( route_out ), vki::dp( order ), topk, E, start_expert, hidden, inter, act_limit };
+			vki::launch( "nvfp4_moe_down", pd, stream, static_cast<uint32_t>( hidden / 32 ), routes );
+		}
+		vki::MoeCombineParams pc{ vki::dp( route_out ), vki::dp( d_topk_weights ), vki::dp( d_topk_indices ), vki::dp( out.data ), hidden, topk, start_expert, end_expert };
+		vki::launch( "moe_combine_routes", pc, stream, tiles( hidden, 256 ), rows );
+		return;
+	}
+	// NVFP4: up's packed codes are [inter, hidden / 2] bytes
+	const int inter = ref.type == pod::QuantType::TRELLIS ? ref.w2.shape[0] : ref.type == pod::QuantType::GGUF ? ref.gguf_n
+		: ref.type == pod::QuantType::NVFP4 ? ref.w0.shape[0] : ref.w0.shape[1];
 	std::vector<int> idx( static_cast<size_t>( rows ) * topk );
 	backend::memcpy_async( idx.data(), d_topk_indices, idx.size() * sizeof( int ), backend::Copy::D2H, stream );
 	backend::stream_sync( stream );

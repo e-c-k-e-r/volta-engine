@@ -97,22 +97,53 @@ void gr_gate(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform GrGat
 
 struct GrUpMixParams { float* normed; half* up; float* t_in; half* mixed; int hidden; int hc; int rank; int rows; };
 
-// Thread (d, row): mixed = mean_s( sigmoid(up[s * hidden + d] . t) * normed[s][d] )
+// A warp per d: mixed[r][d] = mean_s( sigmoid( up[s * hidden + d] . t[r] ) * normed[r][s][d] ) for every row. The warp holds d's hc rows of up
+// (rank values each, as 16-byte runs: rank a multiple of 8, at most 512; hc at most 4) and runs the rows by, each dot product summed across it
 [shader("compute")]
-[numthreads(64, 1, 1)]
+[numthreads(128, 1, 1)]
 void gr_up_mix(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform GrUpMixParams p) {
-	let d = int(gid.x) * 64 + int(tid.x);
-	let r = int(gid.y);
-	if (d >= p.hidden) return;
-	float* tr = p.t_in + int64_t(r) * p.rank;
-	float outv = 0.0f;
-	for (int s = 0; s < p.hc; ++s) {
-		half* u = p.up + (int64_t(s) * p.hidden + d) * p.rank;
-		float acc = 0.0f;
-		for (int k = 0; k < p.rank; ++k) acc = fma(tr[k], float(u[k]), acc);
-		outv += sigm(acc) * p.normed[(int64_t(r) * p.hc + s) * p.hidden + d];
+	let lane = int(tid.x) & 31;
+	let d = int(gid.x) * 4 + (int(tid.x) >> 5);
+	if (d >= p.hidden) return;   // the whole warp leaves together
+	let nvec = p.rank / 8;
+	uint4 w[4][2];
+	[ForceUnroll]
+	for (int s = 0; s < 4; ++s) {
+		[ForceUnroll]
+		for (int j = 0; j < 2; ++j) {
+			let v = lane + 32 * j;
+			w[s][j] = (s < p.hc && v < nvec) ? loadAligned<16>((uint4*)(p.up + (int64_t(s) * p.hidden + d) * p.rank + v * 8)) : uint4(0u, 0u, 0u, 0u);
+		}
 	}
-	p.mixed[int64_t(r) * p.hidden + d] = half(outv / p.hc);
+	for (int r = 0; r < p.rows; ++r) {
+		float* tr = p.t_in + int64_t(r) * p.rank;
+		float tv[2][8];
+		[ForceUnroll]
+		for (int j = 0; j < 2; ++j) {
+			let v = lane + 32 * j;
+			[ForceUnroll]
+			for (int i = 0; i < 8; ++i) tv[j][i] = v < nvec ? tr[v * 8 + i] : 0.0f;
+		}
+		float outv = 0.0f;
+		[ForceUnroll]
+		for (int s = 0; s < 4; ++s) {
+			if (s < p.hc) {
+				float acc = 0.0f;
+				[ForceUnroll]
+				for (int j = 0; j < 2; ++j) {
+					let q = uint4(w[s][j].x, w[s][j].y, w[s][j].z, w[s][j].w);
+					[ForceUnroll]
+					for (int i = 0; i < 4; ++i) {
+						let h2 = bit_cast<half2>(q[i]);
+						acc = fma(tv[j][2 * i], float(h2.x), acc);
+						acc = fma(tv[j][2 * i + 1], float(h2.y), acc);
+					}
+				}
+				outv += sigm(WaveActiveSum(acc)) * p.normed[(int64_t(r) * p.hc + s) * p.hidden + d];
+			}
+		}
+		if (lane == 0) p.mixed[int64_t(r) * p.hidden + d] = half(outv / p.hc);
+	}
 }
 
 struct GrApplyParams { float* x; float* post; half* y; int hidden; int hc; };
@@ -187,6 +218,19 @@ void gr_gemm_f32(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform G
 	for (int i = 0; i < p.k; ++i) acc = fma(float(ar[i]), float(wr[i]), acc);
 	let o = int64_t(r) * p.n + c;
 	p.out_[o] = p.accumulate != 0 ? p.out_[o] + acc : acc;
+}
+
+struct GrSplitSumParams { float* out_; float* parts; int64_t n; int splits; int accumulate; };
+
+// out (+)= the sum of splits slabs of n values in order (FP32): gemm_f32's split-K partials, its accumulate over a product written apart
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void gr_split_sum(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform GrSplitSumParams p) {
+	let i = (int64_t(gid.y) * 65535 + int64_t(gid.x)) * 256 + int64_t(tid.x);
+	if (i >= p.n) return;
+	float acc = p.accumulate != 0 ? p.out_[i] : 0.0f;
+	for (int s = 0; s < p.splits; ++s) acc += p.parts[int64_t(s) * p.n + i];
+	p.out_[i] = acc;
 }
 
 struct GrGateActParams { float* z; half* t_hi; half* t_lo; float* post; int ld; int rank; int hc; int has_inject; };
@@ -559,38 +603,71 @@ void sparse_attn(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform S
 
 // ---------------------------------------------------------------- softmax top-k router, MoE gather / combine
 
-struct RouterParams { half* x; half* w; int* topk_idx; half* topk_w; int hidden; int experts; int top_k; int round_fp16; };
+// The Qwen family's routing (MoERouter::route_softmax_topk): router_sm_partials writes each 128-dim slice's logits (a thread per (expert,
+// slice, row)), router_sm_select sums a row's slices in ascending order (a thread per expert), then picks the top_k a round at a time (the
+// largest left, ties to the lowest index: a subgroup's, then the workgroup's) and takes the softmax over just those
+struct RouterSmParams { half* x; half* w; float* partials; int* topk_idx; half* topk_w; int hidden; int experts; int top_k; int round_fp16; int slices; };
 
-groupshared float s_logit[512];
-
-// Group per row: logits (an expert per thread, strided), then the top_k largest (ties to the lowest index) and the softmax over just those
 [shader("compute")]
-[numthreads(256, 1, 1)]
-void router_softmax_topk(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform RouterParams p) {
-	let t = int(tid.x);
+[numthreads(64, 1, 1)]
+void router_sm_partials(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform RouterSmParams p) {
+	let e = int(gid.x) * 64 + int(tid.x);
+	let ks = int(gid.y);
+	let r = int(gid.z);
+	if (e >= p.experts) return;
+	half* xr = p.x + int64_t(r) * p.hidden + ks * 128;
+	float acc = 0.0f;
+	for (int j = 0; j < 128; ++j) acc = fma(float(xr[j]), float(p.w[int64_t(ks * 128 + j) * p.experts + e]), acc);
+	p.partials[(int64_t(r) * p.slices + ks) * p.experts + e] = acc;
+}
+
+groupshared float s_rv[32];
+groupshared int s_ri[32];
+groupshared int s_pick[16];
+groupshared float s_pval[16];
+
+[shader("compute")]
+[numthreads(512, 1, 1)]
+void router_sm_select(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform RouterSmParams p) {
+	let e = int(tid.x);
 	let r = int(gid.x);
-	half* xr = p.x + int64_t(r) * p.hidden;
-	for (int e = t; e < p.experts; e += 256) {
+	float v = -3.0e38f;
+	if (e < p.experts) {
 		float acc = 0.0f;
-		for (int d = 0; d < p.hidden; ++d) acc = fma(float(xr[d]), float(p.w[int64_t(d) * p.experts + e]), acc);
-		s_logit[e] = p.round_fp16 != 0 ? float(half(acc)) : acc;
+		for (int ks = 0; ks < p.slices; ++ks) acc += p.partials[(int64_t(r) * p.slices + ks) * p.experts + e];
+		v = p.round_fp16 != 0 ? float(half(acc)) : acc;
 	}
-	GroupMemoryBarrierWithGroupSync();
-	if (t == 0) {
-		float val[16];
-		for (int i = 0; i < p.top_k; ++i) {
-			float best = -1e30f;
-			int bi = -1;
-			for (int e = 0; e < p.experts; ++e) {
-				if (s_logit[e] > best) { best = s_logit[e]; bi = e; }
-			}
-			s_logit[bi] = -3.0e38f;
-			val[i] = best;
-			p.topk_idx[int64_t(r) * p.top_k + i] = bi;
+	let warps = (p.experts + 31) / 32;
+	for (int k = 0; k < p.top_k; ++k) {
+		let wm = WaveActiveMax(v);
+		let wi = WaveActiveMin(v == wm ? e : 0x7fffffff);
+		if ((e & 31) == 0) {
+			s_rv[e >> 5] = wm;
+			s_ri[e >> 5] = wi;
 		}
+		GroupMemoryBarrierWithGroupSync();
+		if (e == 0) {
+			float best = s_rv[0];
+			int bi = s_ri[0];
+			for (int w = 1; w < warps; ++w) {
+				if (s_rv[w] > best || (s_rv[w] == best && s_ri[w] < bi)) {
+					best = s_rv[w];
+					bi = s_ri[w];
+				}
+			}
+			s_pick[k] = bi;
+			s_pval[k] = best;
+		}
+		GroupMemoryBarrierWithGroupSync();
+		if (e == s_pick[k]) v = -3.0e38f;
+	}
+	if (e == 0) {
 		float sum = 0.0f;
-		for (int i = 0; i < p.top_k; ++i) sum += exp(val[i] - val[0]);
-		for (int i = 0; i < p.top_k; ++i) p.topk_w[int64_t(r) * p.top_k + i] = half(exp(val[i] - val[0]) / sum);
+		for (int i = 0; i < p.top_k; ++i) sum += exp(s_pval[i] - s_pval[0]);
+		for (int i = 0; i < p.top_k; ++i) {
+			p.topk_idx[int64_t(r) * p.top_k + i] = s_pick[i];
+			p.topk_w[int64_t(r) * p.top_k + i] = half(exp(s_pval[i] - s_pval[0]) / sum);
+		}
 	}
 }
 

@@ -37,8 +37,8 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 
 	# Vulkan-only Slang kernels (src/kernels/slang/flash.slang: Flash-Next gated residual, PLE, QSA, selection, sparse attention, router, MoE combine);
 	# the CPU backend has plain C++ for these
-	set(VK_FLASH_ENTRIES gr_init gr_norm gr_gate gr_up_mix gr_apply gr_sigmoid_gated gr_stream_norm gr_add_broadcast gr_gemm_f32 gr_gate_act gr_up_epilogue
-		ple_gate ple_conv ple_ring qsa_prep qsa_pool_update qsa_score dsa_select sparse_attn router_softmax_topk moe_combine_routes)
+	set(VK_FLASH_ENTRIES gr_init gr_norm gr_gate gr_up_mix gr_apply gr_sigmoid_gated gr_stream_norm gr_add_broadcast gr_gemm_f32 gr_split_sum gr_gate_act gr_up_epilogue
+		ple_gate ple_conv ple_ring qsa_prep qsa_pool_update qsa_score dsa_select sparse_attn router_sm_partials router_sm_select moe_combine_routes)
 	set(VK_FLASH_SPV "")
 	foreach(entry ${VK_FLASH_ENTRIES})
 		set(sout ${SLANG_OUT}/${entry}.spv)
@@ -75,12 +75,15 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			COMMENT "slangc ${entry} -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
-	# NVFP4 W4A16 linear (src/kernels/slang/nvfp4.slang)
-	add_custom_command(OUTPUT ${SLANG_OUT}/nvfp4_gemm.spv
-		COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/nvfp4.slang -target spirv -stage compute -entry nvfp4_gemm -DENGINE_TARGET_CPU=0 -o ${SLANG_OUT}/nvfp4_gemm.spv
-		DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/nvfp4.slang
-		COMMENT "slangc nvfp4_gemm -> spirv")
-	list(APPEND VK_FLASH_SPV ${SLANG_OUT}/nvfp4_gemm.spv)
+	# NVFP4 W4A16 linear and the NVFP4 experts (src/kernels/slang/nvfp4.slang)
+	foreach(entry nvfp4_gemm nvfp4_moe_gate_up nvfp4_moe_down)
+		set(sout ${SLANG_OUT}/${entry}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/nvfp4.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/nvfp4.slang
+			COMMENT "slangc ${entry} -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
 	# GGUF block weights (src/kernels/slang/gguf.slang)
 	foreach(entry gguf_gemv_sg gguf_quantize_q8 gguf_gemm_tile gguf_dequant gguf_permute_rows gguf_quantize_q8_1x4 moe_local_ids moe_row_map)
 		set(sout ${SLANG_OUT}/${entry}.spv)
@@ -194,6 +197,15 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 				COMMENT "glslc ggml mul_mm_id ${tname} -> spirv")
 			list(APPEND VK_FLASH_SPV ${sout})
 		endforeach()
+		# the FP16 matmul with FP32 output (GatedResidual::gemm_f32)
+		set(sout ${SLANG_OUT}/ggml_mm_1_f32.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${GLSLC} -fshader-stage=compute --target-env=vulkan1.2 -O -DFLOAT16=1 -DACC_TYPE=float -DACC_TYPEV2=vec2 -DACC_TYPE_VEC4=vec4
+				-DFLOAT_TYPE=float16_t -DFLOAT_TYPEV2=f16vec2 -DFLOAT_TYPEV4=f16vec4 -DFLOAT_TYPEV8=f16mat2x4 -DDATA_A_F16=1 -DLOAD_VEC_A=8
+				-DLOAD_VEC_B=8 -DB_TYPE=f16mat2x4 -DB_TYPE_SCALAR=float16_t -DB_TYPEV4=f16vec4 -DD_TYPE=float ${GGML_VK_DIR}/mul_mm.comp -o ${sout}
+			DEPENDS ${GGML_VK_DEPS}
+			COMMENT "glslc ggml mul_mm f16 -> f32 -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
 	else()
 		message(STATUS "glslc not found: the Vulkan GGUF projections run on the Slang kernels alone")
 	endif()

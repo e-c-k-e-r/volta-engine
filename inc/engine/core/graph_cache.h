@@ -17,7 +17,8 @@ namespace engine::core {
 //   call 1 for m : eager (lazy one-time setup such as smem attributes happens outside capture)
 //   call 2 for m : capture (thread-local mode, the ranks capture concurrently) + instantiate
 //   call 3+      : cudaGraphLaunch
-// no_graphs=1 (Options::no_graphs) forces eager execution.
+// no_graphs=1 (Options::no_graphs) forces eager execution. A backend that cannot hold some command of the body in a graph runs that capture
+// instead and returns no graph (Vulkan: a flush or a host transfer); the row count then stays eager.
 class GraphCache {
 public:
 	GraphCache() {
@@ -37,7 +38,7 @@ public:
 		return;
 #else
 		// Prefill chunks (above the decode sizes) run eagerly: a graph per chunk size would never be replayed.
-		if ( !enabled_ || stream == nullptr || m > pod::MAX_BATCH ) {
+		if ( !enabled_ || stream == nullptr || m > pod::MAX_BATCH || eager_[m][variant] ) {
 			body( stream );
 			return;
 		}
@@ -51,6 +52,11 @@ public:
 			backend::graph_capture_begin( stream );
 			body( stream );
 			backend::graph_t graph = backend::graph_capture_end( stream );
+			if ( graph == nullptr ) {
+				eager_[m][variant] = true;
+				if ( backend::get_device() == 0 ) LOG_DEBUG( "[graph] m=%d decode body not capturable here: eager\n", m );
+				return;
+			}
 			const size_t nodes = backend::graph_node_count( graph );
 			exec = backend::graph_instantiate( graph );
 			backend::graph_destroy( graph );
@@ -72,6 +78,7 @@ public:
 					exec_[m][v] = nullptr;
 				}
 				warm_[m][v] = false;
+				eager_[m][v] = false;
 			}
 		}
 	}
@@ -82,6 +89,7 @@ public:
 private:
 	backend::graph_exec_t exec_[pod::MAX_BATCH + 1][2] = {};
 	bool warm_[pod::MAX_BATCH + 1][2] = {};
+	bool eager_[pod::MAX_BATCH + 1][2] = {};   // the backend could not capture the body for this row count
 	bool enabled_ = true;
 	unsigned long long replays_ = 0;
 };

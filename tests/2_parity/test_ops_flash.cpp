@@ -181,6 +181,19 @@ void test_gated_residual() {
 		half_t* mixed3 = zeros<half_t>( static_cast<size_t>( R ) * H );
 		GatedResidual::up_epilogue( u, normed, mixed3, R, H, HC, nullptr );
 		emit( "gr_up_epilogue", dl( mixed3, static_cast<size_t>( R ) * H ) );
+
+		// gemm_f32 at prefill row counts (Vulkan: the matmul from 9 rows): z's shape, accumulated, and u's (k = rank)
+		const int RM = 40;
+		half_t* a_hi = up( rh( rng, static_cast<size_t>( RM ) * FLAT, 1.0f ) );
+		half_t* a_lo = up( rh( rng, static_cast<size_t>( RM ) * FLAT, 0.001f ) );
+		float* zm = zeros<float>( static_cast<size_t>( RM ) * ld );
+		GatedResidual::gemm_f32( a_hi, dcat, zm, RM, ld, FLAT, false, nullptr );
+		GatedResidual::gemm_f32( a_lo, dcat, zm, RM, ld, FLAT, true, nullptr );
+		emit( "gr_gemm_f32_m40", dlf( zm, static_cast<size_t>( RM ) * ld ) );
+		half_t* tm = up( rh( rng, static_cast<size_t>( RM ) * RANK, 1.0f ) );
+		float* um = zeros<float>( static_cast<size_t>( RM ) * FLAT );
+		GatedResidual::gemm_f32( tm, upw, um, RM, FLAT, RANK, false, nullptr );
+		emit( "gr_gemm_f32_up_m40", dlf( um, static_cast<size_t>( RM ) * FLAT ) );
 	}
 
 	// apply: x[:, s, :] += post[:, s] * y

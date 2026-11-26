@@ -40,12 +40,12 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 	}
 #endif
 #if ENGINE_BACKEND_VULKAN
-	// Several Vulkan devices share nothing but the host: the all-reduce goes through it (src/backend/vulkan/mod_comm.cpp), which a graph cannot contain
+	// Several Vulkan devices share nothing but the host: the all-reduce goes through it (src/backend/vulkan/mod_comm.cpp), its cross-device
+	// semaphores split a captured forward into segments that a replay submits in turn
 	if ( tp_ > backend::device_count() ) {
 		LOG_ERROR( "ModelCluster: tp %d requested, %d Vulkan devices available\n", tp_, backend::device_count() );
 		return false;
 	}
-	if ( tp_ > 1 ) runtime::options().no_graphs = true;
 #endif
 #if ENGINE_BACKEND_CUDA
 	// The configs in configs/ are written for four GPUs: on a smaller machine say so here, not from inside the collective's setup

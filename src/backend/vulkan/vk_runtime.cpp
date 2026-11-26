@@ -93,12 +93,26 @@ inline Ctx& cur() { return gs[t_dev]; }
 
 } // namespace
 
+// A cross-device sync point of a capture: after its segment the signals (at launch each counter advanced, its semaphore signalled with the new
+// value; the capture-time values for a capture that falls back to running), before the next segment the waits (at their counters' values)
+struct GraphSync {
+	std::vector<VkSemaphore> sig;
+	std::vector<uint64_t*> sig_ctr;
+	std::vector<uint64_t> sig_val;
+	std::vector<VkSemaphore> wait;
+	std::vector<const uint64_t*> wait_ctr;
+	std::vector<uint64_t> wait_val;
+};
+
 struct vk_stream {
 	VkSemaphore timeline = VK_NULL_HANDLE;
 	uint64_t value = 0;
 	VkCommandBuffer cb = VK_NULL_HANDLE; // currently recording (or null)
 	bool capture = false;
 	size_t capture_nodes = 0;
+	std::vector<VkCommandBuffer> cap_segs;   // capture: the closed segments, segment i followed by cap_syncs[i]
+	std::vector<GraphSync> cap_syncs;
+	bool capture_failed = false;             // a command the capture cannot hold ran it (capture_abort): graph_capture_end returns no graph
 	bool concurrent = false;   // inside concurrent_begin / concurrent_end: a command's barrier is owed (held) until the next command or the end
 	bool held = false;
 	bool run_scratch = false;  // an op of the run took a scratch buffer since its last full barrier
@@ -109,8 +123,14 @@ struct vk_stream {
 	std::vector<uint64_t> extra_wait_values, extra_signal_values;
 };
 
+// A captured sequence: command buffers split where a cross-device sync was recorded (segs.size() == syncs.size() + 1). parity_ctr: the first
+// counted signal's counter, parity the parity of its value at capture (the collective's double-buffered slots alternate from it)
 struct vk_graph {
-	VkCommandBuffer cb = VK_NULL_HANDLE;
+	std::vector<VkCommandBuffer> segs;
+	std::vector<GraphSync> syncs;
+	uint64_t* parity_ctr = nullptr;
+	uint64_t parity = 0;
+	VkSemaphore parity_sem = VK_NULL_HANDLE;
 	size_t nodes = 0;
 };
 
@@ -465,8 +485,50 @@ void submit( vk_stream* s, VkCommandBuffer cb ) {
 	ENGINE_CHECK( vkQueueSubmit( cur().queue, 1, &si, VK_NULL_HANDLE ) );
 }
 
+// The next submission's signals of sync g (values ++*ctr at a launch, the recorded ones when a capture falls back) and waits of sync g (values
+// *ctr at a launch, the recorded ones otherwise)
+void add_signals( vk_stream* s, const GraphSync& g, bool launch ) {
+	for ( size_t i = 0; i < g.sig.size(); ++i ) {
+		s->extra_signal.push_back( g.sig[i] );
+		s->extra_signal_values.push_back( launch ? ++*g.sig_ctr[i] : g.sig_val[i] );
+	}
+}
+void add_waits( vk_stream* s, const GraphSync& g, bool launch ) {
+	for ( size_t i = 0; i < g.wait.size(); ++i ) {
+		s->extra_wait.push_back( g.wait[i] );
+		s->extra_wait_values.push_back( launch ? *g.wait_ctr[i] : g.wait_val[i] );
+	}
+}
+
+// Capture: the commands recorded so far as a closed segment (an empty one when there are none), followed by a new sync point
+void close_segment( vk_stream* s ) {
+	VkCommandBuffer cb = recording( s );
+	pay_held( s, cb );
+	ENGINE_CHECK( vkEndCommandBuffer( cb ) );
+	s->cap_segs.push_back( cb );
+	s->cb = VK_NULL_HANDLE;
+	s->cap_syncs.emplace_back();
+}
+
+// A command the capture cannot hold (a flush, a host transfer): the segments recorded so far run now with their recorded sync values, the open
+// one becomes the stream's eager buffer (the last sync point's waits ahead of it), and the rest of the body records eagerly; graph_capture_end
+// then returns no graph
+void capture_abort( vk_stream* s ) {
+	s->capture = false;
+	s->capture_failed = true;
+	for ( size_t i = 0; i < s->cap_segs.size(); ++i ) {
+		if ( i > 0 ) add_waits( s, s->cap_syncs[i - 1], false );
+		add_signals( s, s->cap_syncs[i], false );
+		submit( s, s->cap_segs[i] );
+		s->inflight.push_back( s->cap_segs[i] );
+	}
+	if ( !s->cap_syncs.empty() ) add_waits( s, s->cap_syncs.back(), false );
+	s->cap_segs.clear();
+	s->cap_syncs.clear();
+}
+
 void flush( vk_stream* s ) {
-	ENGINE_ASSERT( !s->capture, "Vulkan backend: stream flush during graph capture" );
+	if ( s->capture ) capture_abort( s );
 	if ( !s->cb ) return;
 	pay_held( s, s->cb );
 	barrier( s->cb, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT );
@@ -631,7 +693,7 @@ bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, strea
 		VkBufferCopy r{ soff, doff, bytes };
 		vkCmdCopyBuffer( command_cb( s ), sb, db, 1, &r );
 	} else {
-		ENGINE_ASSERT( !s->capture, "Vulkan backend: host transfers inside a graph capture not implemented" );
+		if ( s->capture ) capture_abort( s );   // a host transfer cannot be replayed: the capture falls back to running
 		// Bound the host memory held by staging buffers of in-flight transfers (a weight load copies tens of GiB)
 		if ( s->staging_bytes + bytes > ( size_t( 1 ) << 29 ) && s->staging_bytes > 0 ) sync( s );
 		Staging st_buf;
@@ -792,40 +854,67 @@ void graph_capture_begin( stream_t st ) {
 	ENGINE_ASSERT( !s->capture, "Vulkan backend: nested graph capture" );
 	flush( s );
 	s->capture = true;
+	s->capture_failed = false;
 	s->capture_nodes = 0;
 }
+// nullptr when the capture fell back to running (capture_abort)
 graph_t graph_capture_end( stream_t st ) {
 	vk_stream* s = resolve_stream( st );
-	ENGINE_ASSERT( s->capture, "Vulkan backend: graph_capture_end without begin" );
+	ENGINE_ASSERT( s->capture || s->capture_failed, "Vulkan backend: graph_capture_end without begin" );
+	if ( s->capture_failed ) {
+		s->capture_failed = false;
+		return nullptr;
+	}
 	auto* gr = new vk_graph();
-	if ( !s->cb ) recording( s ); // empty capture
+	if ( !s->cb ) recording( s ); // the last segment (empty, or the whole capture)
 	pay_held( s, s->cb );
 	ENGINE_CHECK( vkEndCommandBuffer( s->cb ) );
-	gr->cb = s->cb;
+	gr->segs = std::move( s->cap_segs );
+	gr->segs.push_back( s->cb );
+	gr->syncs = std::move( s->cap_syncs );
+	for ( const GraphSync& g : gr->syncs ) {
+		if ( g.sig.empty() ) continue;
+		gr->parity_ctr = g.sig_ctr[0];
+		gr->parity = g.sig_val[0] & 1;
+		gr->parity_sem = g.sig[0];
+		break;
+	}
 	gr->nodes = s->capture_nodes;
+	s->cap_segs.clear();
+	s->cap_syncs.clear();
 	s->cb = VK_NULL_HANDLE;
 	s->capture = false;
 	return gr;
 }
-// The recorded command buffer is the executable: it moves to the executable object, so destroying the graph afterwards (as GraphCache does right
-// after instantiating) does not free what the executable still replays
+// The recorded command buffers are the executable: they move to the executable object, so destroying the graph afterwards (as GraphCache does
+// right after instantiating) does not free what the executable still replays
 graph_exec_t graph_instantiate( graph_t gr ) {
-	auto* e = new vk_graph();
-	e->cb = gr->cb;
-	e->nodes = gr->nodes;
-	gr->cb = VK_NULL_HANDLE;
+	auto* e = new vk_graph( std::move( *gr ) );
+	gr->segs.clear();
 	return e;
 }
 size_t graph_node_count( graph_t gr ) { return gr->nodes; }
+// The segments in order, each sync point's signals with fresh counter values and its waits ahead of the next segment. A replay whose first
+// counted signal would take the other parity than at capture first signals once more (every rank of the collective in step), so the slots the
+// segments use alternate as they did
 void graph_launch( graph_exec_t e, stream_t st ) {
 	vk_stream* s = resolve_stream( st );
 	flush( s );
-	submit( s, e->cb );
+	if ( e->parity_ctr != nullptr && ( ( *e->parity_ctr + 1 ) & 1 ) != e->parity ) {
+		s->extra_signal.push_back( e->parity_sem );
+		s->extra_signal_values.push_back( ++*e->parity_ctr );
+		submit( s, VK_NULL_HANDLE );
+	}
+	for ( size_t i = 0; i < e->segs.size(); ++i ) {
+		if ( i > 0 ) add_waits( s, e->syncs[i - 1], true );
+		if ( i < e->syncs.size() ) add_signals( s, e->syncs[i], true );
+		submit( s, e->segs[i] );
+	}
 }
 void graph_destroy( graph_t gr ) {
 	if ( !gr ) return;
 	{ std::lock_guard<std::mutex> qlk( cur().queue_mu ); vkQueueWaitIdle( cur().queue ); }
-	if ( gr->cb ) vkFreeCommandBuffers( cur().device, cur().pool, 1, &gr->cb );
+	if ( !gr->segs.empty() ) vkFreeCommandBuffers( cur().device, cur().pool, static_cast<uint32_t>( gr->segs.size() ), gr->segs.data() );
 	delete gr;
 }
 void graph_exec_destroy( graph_exec_t e ) { graph_destroy( e ); }
@@ -1070,11 +1159,12 @@ void* shared_timeline_import( int fd ) {
 	return h;
 }
 
+// Fixed values cannot be replayed: inside a capture the capture falls back to running (flush)
 void stream_signal( stream_t st, void* sem, uint64_t value ) {
 	ctx();
 	if ( !cur().default_stream ) cur().default_stream = make_stream();
 	vk_stream* s = resolve_stream( st );
-	ENGINE_ASSERT( !s->capture, "Vulkan backend: stream_signal inside a graph capture" );
+	if ( s->capture ) flush( s );
 	s->extra_signal.push_back( static_cast<SharedSemaphore*>( sem )->sem );
 	s->extra_signal_values.push_back( value );
 	if ( s->cb ) flush( s );
@@ -1085,11 +1175,51 @@ void stream_wait( stream_t st, void* const* sems, const uint64_t* values, int n 
 	ctx();
 	if ( !cur().default_stream ) cur().default_stream = make_stream();
 	vk_stream* s = resolve_stream( st );
-	ENGINE_ASSERT( !s->capture, "Vulkan backend: stream_wait inside a graph capture" );
-	if ( s->cb ) flush( s );   // only what comes after waits
+	if ( s->cb || s->capture ) flush( s );   // only what comes after waits
 	for ( int i = 0; i < n; ++i ) {
 		s->extra_wait.push_back( static_cast<SharedSemaphore*>( sems[i] )->sem );
 		s->extra_wait_values.push_back( values[i] );
+	}
+}
+
+void stream_signal_next( stream_t st, void* sem, uint64_t* counter ) {
+	ctx();
+	if ( !cur().default_stream ) cur().default_stream = make_stream();
+	vk_stream* s = resolve_stream( st );
+	const uint64_t v = ++*counter;
+	const VkSemaphore vs = static_cast<SharedSemaphore*>( sem )->sem;
+	if ( !s->capture ) {
+		s->extra_signal.push_back( vs );
+		s->extra_signal_values.push_back( v );
+		if ( s->cb ) flush( s );
+		else submit( s, VK_NULL_HANDLE );
+		return;
+	}
+	close_segment( s );
+	GraphSync& g = s->cap_syncs.back();
+	g.sig.push_back( vs );
+	g.sig_ctr.push_back( counter );
+	g.sig_val.push_back( v );
+}
+
+void stream_wait_counter( stream_t st, void* const* sems, int n, const uint64_t* counter ) {
+	ctx();
+	if ( !cur().default_stream ) cur().default_stream = make_stream();
+	vk_stream* s = resolve_stream( st );
+	if ( !s->capture ) {
+		if ( s->cb ) flush( s );   // only what comes after waits
+		for ( int i = 0; i < n; ++i ) {
+			s->extra_wait.push_back( static_cast<SharedSemaphore*>( sems[i] )->sem );
+			s->extra_wait_values.push_back( *counter );
+		}
+		return;
+	}
+	if ( s->cb != VK_NULL_HANDLE || s->cap_syncs.empty() ) close_segment( s );
+	GraphSync& g = s->cap_syncs.back();
+	for ( int i = 0; i < n; ++i ) {
+		g.wait.push_back( static_cast<SharedSemaphore*>( sems[i] )->sem );
+		g.wait_ctr.push_back( counter );
+		g.wait_val.push_back( *counter );
 	}
 }
 

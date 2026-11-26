@@ -506,14 +506,45 @@ bool ggml_f16_linear( const void* w, const void* x, void* out, int m, int n, int
 		vk::dispatch_bound( stream, mmv, &mp, bufs, gx, 1, gz );
 		return true;
 	}
-	if ( k % 128 != 0 ) return false;
+	return ggml_f16_matmul( w, x, out, m, n, k, false, stream, 0 );
+}
+
+// The matmul alone (FP16 or FP32 output): ALIGNED drops the K bound checks, so k (and k_split) a multiple of the tiles' BK of 32. A split K
+// runs ceil( k / k_split ) times as many workgroups (the shader's split index is the x group over the row blocks), each slab's partial in its own
+// m x n of out
+bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, stream_t stream, int k_split ) {
+	using namespace ::engine::modules;
+	auto aligned = []( const void* p ) { return reinterpret_cast<uintptr_t>( p ) % 16 == 0; };
+	if ( k % 32 != 0 || k_split % 32 != 0 || !aligned( w ) || !aligned( x ) || !aligned( out ) ) return false;
+	if ( k_split <= 0 || k_split > k ) k_split = k;
+	const uint32_t splits = static_cast<uint32_t>( ( k + k_split - 1 ) / k_split );
+	const uint32_t uk = static_cast<uint32_t>( k ), un = static_cast<uint32_t>( n ), um = static_cast<uint32_t>( m );
 	const bool large = m >= 128;
-	vk::Pipeline* mm = mm_pipeline( GgmlType::F16, large );
+	vk::Pipeline* mm = nullptr;
+	if ( f32_out ) {
+		static std::mutex mu;
+		static vk::Pipeline* cache[64][2] = {};
+		static bool tried[64][2] = {};
+		std::lock_guard<std::mutex> lk( mu );
+		const int dev = backend::get_device();
+		if ( !tried[dev][large] && backend::vk::bound_pipelines() ) {
+			tried[dev][large] = true;
+			const char* dir = std::getenv( "ENGINE_SPV_DIR" );
+			const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + "/ggml_mm_1_f32.spv";
+			const MmqTile tile = mmq_tile( GgmlType::F16, large );
+			uint32_t spec[12];
+			for ( int i = 0; i < 11; ++i ) spec[i] = tile.spec[i];
+			spec[11] = 1;   // ALIGNED
+			cache[dev][large] = backend::vk::pipeline_create_bound( path.c_str(), sizeof( MmqParams ), 3, spec, 12 );
+		}
+		mm = cache[dev][large];
+	}
+	else mm = mm_pipeline( GgmlType::F16, large );
 	if ( mm == nullptr ) return false;
-	MmqParams mp{ un, um, uk, uk, uk, un, un * uk, um * uk, um * un, 0u, 1u, uk, 1u, 1u, 1u, 1u };
+	MmqParams mp{ un, um, uk, uk, uk, un, un * uk, um * uk, um * un, 0u, 1u, static_cast<uint32_t>( k_split ), 1u, 1u, 1u, 1u };
 	const void* bufs[3] = { w, x, out };
 	const MmqTile tile = mmq_tile( GgmlType::F16, large );
-	vk::dispatch_bound( stream, mm, &mp, bufs, ( un + tile.spec[1] - 1 ) / tile.spec[1], ( um + tile.spec[2] - 1 ) / tile.spec[2], 1 );
+	vk::dispatch_bound( stream, mm, &mp, bufs, ( ( un + tile.spec[1] - 1 ) / tile.spec[1] ) * splits, ( um + tile.spec[2] - 1 ) / tile.spec[2], 1 );
 	return true;
 }
 

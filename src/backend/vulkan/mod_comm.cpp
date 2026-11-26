@@ -69,20 +69,20 @@ struct ArSumParams { uint64_t parts, res, out_; int64_t rank_stride, slot_off; i
 
 void reduce_on_devices( HostMesh* m, int rank, int nranks, pod::TensorView& x, pod::TensorView* residual, size_t n, backend::stream_t stream ) {
 	DeviceMesh& d = m->dev;
-	const uint64_t v = ++d.count[rank];
+	// this reduction's value (stream_signal_next advances the count to it); every rank counts in step, so a captured forward replays with fresh
+	// values, its slots alternating as at capture (graph_launch keeps the parity)
+	const uint64_t v = d.count[rank] + 1;
 	const size_t slot = v & 1, bytes = n * sizeof( backend::half_t );
 	uint8_t* block = static_cast<uint8_t*>( d.block[rank] );
 	backend::memcpy_async( block + ( static_cast<size_t>( rank ) * 2 + slot ) * d.slot_bytes, x.data, bytes, backend::Copy::D2D, stream );
-	backend::vk::stream_signal( stream, d.own[rank], v );
+	backend::vk::stream_signal_next( stream, d.own[rank], &d.count[rank] );
 	void* sems[ENGINE_NUM_GPUS];
-	uint64_t values[ENGINE_NUM_GPUS];
 	int k = 0;
 	for ( int p = 0; p < nranks; ++p ) {
 		if ( p == rank ) continue;
-		sems[k] = d.peer[rank][p];
-		values[k++] = v;
+		sems[k++] = d.peer[rank][p];
 	}
-	backend::vk::stream_wait( stream, sems, values, k );
+	backend::vk::stream_wait_counter( stream, sems, k, &d.count[rank] );
 	const int64_t halfs = static_cast<int64_t>( d.slot_bytes / sizeof( backend::half_t ) );
 	pod::TensorView& out = residual != nullptr ? *residual : x;
 	ArSumParams p{ reinterpret_cast<uint64_t>( block ), residual != nullptr ? reinterpret_cast<uint64_t>( residual->data ) : 0, reinterpret_cast<uint64_t>( out.data ), 2 * halfs,

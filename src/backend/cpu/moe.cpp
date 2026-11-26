@@ -160,14 +160,16 @@ pod::MoEScratch MoE::alloc_scratch( pod::MemoryArena&, int, int, int, int, int, 
 // Routes are batched per expert (one dequantization per weight and expert, not per route); the weighted sum runs in FP32 in route
 // order and is rounded to FP16 once.
 void MoE::forward( const pod::TensorView& x, const pod::MoELayerWeights& weights, const int* d_topk_indices, const backend::half_t* d_topk_weights, pod::TensorView& out, int start_expert, int end_expert, const pod::MoEScratch&, float act_limit, backend::stream_t stream ) {
-	ENGINE_ASSERT( weights.type == pod::QuantType::TRELLIS || weights.type == pod::QuantType::FP16 || weights.type == pod::QuantType::GGUF,
-		"MoE::forward (CPU): TRELLIS, FP16 or GGUF experts only" );
+	ENGINE_ASSERT( weights.type == pod::QuantType::TRELLIS || weights.type == pod::QuantType::FP16 || weights.type == pod::QuantType::GGUF ||
+		weights.type == pod::QuantType::NVFP4, "MoE::forward (CPU): TRELLIS, FP16, GGUF or NVFP4 experts only" );
 	const int rows = ( out.ndim >= 2 && out.shape[0] > 0 ) ? out.shape[0] : 1;
 	const int hidden = out.shape[out.ndim - 1];
 	const int E = weights.num_local_experts;
 	const int topk = weights.top_k;
 	const pod::LinearWeight& ref = weights.up[0];
-	const int inter = ref.type == pod::QuantType::TRELLIS ? ref.w2.shape[0] : ref.type == pod::QuantType::GGUF ? ref.gguf_n : ref.w0.shape[1];
+	// NVFP4: up's packed codes are [inter, hidden / 2] bytes
+	const int inter = ref.type == pod::QuantType::TRELLIS ? ref.w2.shape[0] : ref.type == pod::QuantType::GGUF ? ref.gguf_n
+		: ref.type == pod::QuantType::NVFP4 ? ref.w0.shape[0] : ref.w0.shape[1];
 	const backend::half_t* xp = x.ptr<const backend::half_t>();
 	std::vector<backend::half_t> route_out( static_cast<size_t>( rows ) * topk * hidden );
 	for ( int le = 0; le < E; ++le ) {

@@ -26,8 +26,11 @@ vk::Pipeline* kernel( const char* name, uint32_t push_bytes );
 void* scratch( int slot, size_t bytes, stream_t stream );
 
 // out [m, n] = x [m, k] times the FP16 weights w [n, k] on llama.cpp's FP16 mat-vec (up to 8 rows, a row's sum whatever the row count) or
-// matmul (k a multiple of 128), mod_gguf.cpp; false where neither applies (no bound pipelines, operands not 16-byte aligned, k not a multiple of 8)
+// matmul (k a multiple of 32), mod_gguf.cpp; false where neither applies (no bound pipelines, operands not 16-byte aligned, k not a multiple of 8)
 bool ggml_f16_linear( const void* w, const void* x, void* out, int m, int n, int k, stream_t stream );
+// The matmul alone, its output FP16 or (f32_out) FP32: false where it does not apply (k not a multiple of 32, operands not 16-byte aligned).
+// k_split > 0 (a multiple of 32): the K range in slabs of k_split, slab s's partial product into out + s * m * n (ceil( k / k_split ) of them)
+bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, stream_t stream, int k_split = 0 );
 
 template<typename P>
 inline void launch( const char* name, const P& p, stream_t s, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1 ) {
@@ -103,6 +106,7 @@ struct BiasResidualParams { uint64_t hidden, y, bias; int64_t total; int n; };
 // NVFP4 linear (src/kernels/slang/nvfp4.slang)
 namespace engine::backend::impl {
 struct Nvfp4Params { uint64_t codes, scales, x, out_; int m, k, n; float gm; };
+struct Nvfp4MoeParams { uint64_t tbl, gs, x, route_idx, out_, order; int topk, num_local, min_expert, hidden, inter; float act_limit; };
 } // namespace engine::backend::impl
 
 // GLM kernels (src/kernels/slang/glm.slang)
@@ -133,6 +137,7 @@ struct GrSigGatedParams { uint64_t y, sh, x, w; int hidden; };
 struct GrStreamNormParams { uint64_t x, w, out_; int hidden, hc; float eps; };
 struct GrBroadcastParams { uint64_t h, e, streams; int hidden, hc; };
 struct GrGemmParams { uint64_t a, w, out_; int m, n, k, accumulate; };
+struct GrSplitSumParams { uint64_t out_, parts; int64_t n; int splits, accumulate; };
 struct GrGateActParams { uint64_t z, t_hi, t_lo, post; int ld, rank, hc, has_inject; };
 struct GrUpEpilogueParams { uint64_t u, normed, mixed; int hidden, hc; };
 struct PleGateParams { uint64_t key, value, streams, wk, wq, wc, gated, normed; int hidden, hc; float eps, gate_scale; };
@@ -143,6 +148,6 @@ struct QsaPoolParams { uint64_t ring, pool_plane, kw, slots, pos; int layer; int
 struct QsaScoreParams { uint64_t q, pool_plane, scores, slots, pos; int score_stride, layer, max_pools; int64_t pool_slot_stride; float scale; };
 struct SelectParams { uint64_t scores, idx, nkeys, pos; int score_stride, kpad; };
 struct SparseAttnParams { uint64_t q, k, v, gate, out_, slots, pos, idx, nkeys; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, idx_stride, has_gate; float scale; uint64_t ks, vs; int kq, vq; };
-struct RouterParams { uint64_t x, w, topk_idx, topk_w; int hidden, experts, top_k, round_fp16; };
+struct RouterSmParams { uint64_t x, w, partials, topk_idx, topk_w; int hidden, experts, top_k, round_fp16, slices; };
 struct MoeCombineParams { uint64_t route_out, topk_w, topk_idx, out_; int hidden, top_k, start_expert, end_expert; };
 } // namespace engine::backend::impl

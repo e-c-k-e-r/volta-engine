@@ -98,7 +98,21 @@ static pod::LinearWeight make_gguf_expert( GoldenRng& rng, int k, int n, modules
 	return pod::LinearWeight::make_gguf( t, static_cast<uint32_t>( type ), k, n );
 }
 
-static pod::MoELayerWeights g_full, g_shard, g_gguf_full, g_gguf_shard;
+// An NVFP4 expert in the loader's prepacked layout (codes [n, k / 2] bytes, block scales [n, k / 16]): random code bytes, E4M3 block scales with
+// exponents 5 - 9 (no NaN), a small global scale so the products stay in FP16 range
+static pod::LinearWeight make_nvfp4_expert( GoldenRng& rng, int k, int n, float alpha ) {
+	std::vector<uint8_t> hc( static_cast<size_t>( n ) * k / 2 ), hs( static_cast<size_t>( n ) * k / 16 );
+	for ( auto& v : hc ) v = static_cast<uint8_t>( rng.next() );
+	for ( auto& v : hs ) v = static_cast<uint8_t>( ( ( rng.next() & 1 ) << 7 ) | ( ( 5 + rng.next() % 5 ) << 3 ) | ( rng.next() & 7 ) );
+	int cs[2] = { n, k / 2 }, ss[2] = { n, k / 16 };
+	pod::TensorView codes = core::arena_alloc_tensor( g_arena, pod::DType::UINT8, cs, 2 );
+	pod::TensorView scales = core::arena_alloc_tensor( g_arena, pod::DType::UINT8, ss, 2 );
+	backend::memcpy_sync( codes.data, hc.data(), hc.size(), backend::Copy::H2D );
+	backend::memcpy_sync( scales.data, hs.data(), hs.size(), backend::Copy::H2D );
+	return pod::LinearWeight::make_nvfp4( codes, scales, alpha );
+}
+
+static pod::MoELayerWeights g_full, g_shard, g_gguf_full, g_gguf_shard, g_nv_full, g_nv_shard;
 
 struct Case {
 	std::string name;
@@ -155,6 +169,25 @@ int main( int argc, char** argv ) {
 	modules::MoE::init_device_ptrs( g_shard, g_arena );
 	const pod::MoEScratch sc_full = modules::MoE::alloc_scratch( g_arena, E, TOPK, H, I, max_rows );
 	const pod::MoEScratch sc_shard = modules::MoE::alloc_scratch( g_arena, 8, TOPK, H, I, max_rows );
+	// NVFP4 experts (CUDA: the NVFP4 expert kernels; Vulkan: its device kernels up to 16 rows, the host path beyond; CPU: the host path)
+	g_nv_full.type = g_nv_shard.type = pod::QuantType::NVFP4;
+	g_nv_full.num_local_experts = E;
+	g_nv_shard.num_local_experts = 8;
+	g_nv_full.top_k = g_nv_shard.top_k = TOPK;
+	for ( int e = 0; e < E; ++e ) {
+		g_nv_full.gate[e] = make_nvfp4_expert( rng, H, I, 0.002f );
+		g_nv_full.up[e] = make_nvfp4_expert( rng, H, I, 0.0025f );
+		g_nv_full.down[e] = make_nvfp4_expert( rng, I, H, 0.003f );
+	}
+	for ( int e = 0; e < 8; ++e ) {
+		g_nv_shard.gate[e] = g_nv_full.gate[4 + e];
+		g_nv_shard.up[e] = g_nv_full.up[4 + e];
+		g_nv_shard.down[e] = g_nv_full.down[4 + e];
+	}
+	modules::MoE::init_device_ptrs( g_nv_full, g_arena );
+	modules::MoE::init_device_ptrs( g_nv_shard, g_arena );
+	const pod::MoEScratch sc_nv_full = modules::MoE::alloc_scratch( g_arena, E, TOPK, H, I, max_rows, true );
+	const pod::MoEScratch sc_nv_shard = modules::MoE::alloc_scratch( g_arena, 8, TOPK, H, I, max_rows, true );
 
 	auto router_w = upload_half( uniform_vec( rng, static_cast<size_t>( H ) * E, 0.2f ), { H, E } );
 	auto router_bias = upload_half_values( uniform_vec( rng, E, 0.1f ), { E } );
@@ -190,6 +223,14 @@ int main( int argc, char** argv ) {
 			if ( shard ) modules::MoE::forward( x, g_gguf_shard, d_idx, d_w, out, 4, 12, sc_gguf );
 			else modules::MoE::forward( x, g_gguf_full, d_idx, d_w, out, 0, E, sc_gguf );
 			std::snprintf( nm, sizeof( nm ), "gguf%s_%s_m%d", softmax ? "_sm" : "", shard ? "shard" : "full", m );
+			cases.push_back( { nm, download_half( out.data, out.numel() ) } );
+		}
+		for ( int shard = 0; shard < 2; ++shard ) {
+			int os[2] = { m, H };
+			pod::TensorView out = core::arena_alloc_tensor( g_arena, pod::DType::FP16, os, 2 );
+			if ( shard ) modules::MoE::forward( x, g_nv_shard, d_idx, d_w, out, 4, 12, sc_nv_shard );
+			else modules::MoE::forward( x, g_nv_full, d_idx, d_w, out, 0, E, sc_nv_full );
+			std::snprintf( nm, sizeof( nm ), "nvfp4%s_%s_m%d", softmax ? "_sm" : "", shard ? "shard" : "full", m );
 			cases.push_back( { nm, download_half( out.data, out.numel() ) } );
 		}
 	}
