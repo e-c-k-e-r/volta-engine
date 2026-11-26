@@ -6,7 +6,8 @@
 //       hidden states) for the three guidance rows (cond / null / promptless); then the demasking loop teacher-forced (every
 //       step from the reference's previous digits: how many revealed digits agree, and the step-0 guided velocities),
 //       and a free-running generation from the reference's reveal order and noise, written with --out as .npy digits
-//       [frames, 32]; with --codec, the codec's decode of the reference's digits against the golden's wav, and --wav
+//       [frames, 32]; with --codec, the codec's decode of the reference's digits against the golden's wav and its encode
+//       of the prompt's audio against the prompt's digits, and --wav
 //       writes the free-running generation as audio
 #include "engine/loader/safetensors.h"
 #include "engine/tts/codec.h"
@@ -77,7 +78,7 @@ static void write_wav( const std::string& path, const std::vector<float>& x, int
 }
 
 // The codec against the golden: its reference digits decoded here and by vall_e (the golden's wav, FP32): SNR and the worst sample
-static int check_codec( engine::tts::CodecDecoder& codec, const char* path ) {
+static int check_codec( engine::tts::NemoCodec& codec, const char* path ) {
 	pod::SafeTensorsFile g;
 	if ( !engine::loader::safetensors_open( g, path ) ) { std::fprintf( stderr, "can't open %s\n", path ); return 1; }
 	const auto d64 = i64( g, "digits" );
@@ -105,8 +106,31 @@ static int check_codec( engine::tts::CodecDecoder& codec, const char* path ) {
 	return snr > 60.0 ? 0 : 1;
 }
 
+// The codec's encoder against the golden: the prompt's audio encoded here, against the prompt digits vall_e encoded
+static int check_encode( engine::tts::NemoCodec& codec, const char* path ) {
+	pod::SafeTensorsFile g;
+	if ( !engine::loader::safetensors_open( g, path ) ) { std::fprintf( stderr, "can't open %s\n", path ); return 1; }
+	const auto audio = f32( g, "prompt_wav" );
+	if ( audio.empty() ) { std::printf( "codec encoder: no prompt_wav in the golden (python -m vall_e.golden stores it)\n" ); return 0; }
+	const auto ref = i64( g, "prompt" );
+	codec.encode( audio );   // warm-up, then timed
+	cudaDeviceSynchronize();
+	const auto t0 = std::chrono::steady_clock::now();
+	const auto digits = codec.encode( audio );
+	const double dt = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
+	// the golden's prompt is whole patches: compare the frames both have
+	const size_t n = std::min( digits.size(), ref.size() );
+	long same = 0;
+	for ( size_t i = 0; i < n; ++i ) { same += digits[i] == ref[i]; }
+	const double agree = same / static_cast<double>( n );
+	std::printf( "codec encoder: %.2f s of audio -> %zu frames in %.0f ms, %.5f of the reference's digits (%zu frames) -> %s\n",
+		audio.size() / static_cast<double>( codec.config().sample_rate ), digits.size() / 32, dt * 1e3, agree, ref.size() / 32, agree > 0.999 ? "PASS" : "FAIL" );
+	engine::loader::safetensors_close( g );
+	return agree > 0.999 ? 0 : 1;
+}
+
 static int check_demask( engine::tts::TtsModel& m, const char* path, const std::string& out, const engine::tts::TtsModel::Sampling& s,
-	engine::tts::CodecDecoder* codec, const std::string& wav_out ) {
+	engine::tts::NemoCodec* codec, const std::string& wav_out ) {
 	pod::SafeTensorsFile g;
 	engine::loader::safetensors_open( g, path );
 	const auto& c = m.config();
@@ -262,7 +286,7 @@ int main( int argc, char** argv ) {
 	}
 	if ( model.empty() ) {
 		std::fprintf( stderr, "usage: tts_generate --model <vall-e v3 export .sft> [--golden <golden.py case .safetensors>] [--cfg x] [--cfg-prompt x]\n"
-			"  [--codec <codec decoder .sft> [--wav <out.wav>]]\n" );
+			"  [--codec <codec .sft> [--wav <out.wav>]]\n" );
 		return 2;
 	}
 	engine::tts::TtsModel m;
@@ -276,13 +300,13 @@ int main( int argc, char** argv ) {
 	if ( cfg >= 0.0f ) { s.cfg = cfg; }
 	if ( cfg_prompt >= 0.0f ) { s.cfg_prompt = cfg_prompt; }
 	std::printf( "guidance %.2f, speaker guidance %.2f\n", s.cfg, s.cfg_prompt );
-	engine::tts::CodecDecoder codec;
+	engine::tts::NemoCodec codec;
 	const bool have_codec = !codec_path.empty();
 	if ( have_codec && !codec.load( codec_path ) ) { return 1; }
 	if ( !golden.empty() ) {
 		const int rl = check_length( m, golden.c_str() );
 		const int rb = check_backbone( m, golden.c_str() );
-		const int rc = have_codec ? check_codec( codec, golden.c_str() ) : 0;
+		const int rc = have_codec ? check_codec( codec, golden.c_str() ) | check_encode( codec, golden.c_str() ) : 0;
 		const int rd = check_demask( m, golden.c_str(), out, s, have_codec ? &codec : nullptr, wav_out );
 		return rl | rb | rc | rd;
 	}
