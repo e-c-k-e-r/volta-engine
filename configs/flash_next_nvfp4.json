@@ -1,5 +1,5 @@
 {
-	"model_dir": "/path/to/Swift-Qwen3.8-Flash-Next-exl3-4.00bpw",
+	"model_dir": "/path/to/Qwen3.8-Flash-Next-NVFP4",
 	"use_speculation": true,
 	"tp_size": 4,
 	"port": 8000,
@@ -11,8 +11,6 @@
 		"max_slots": 4,
 		"kv_format": "nvfp4",
 		"prefix_cache_gib": 64,
-		"nvfp4_experts": "/path/to/Qwen3.8-Flash-Next-NVFP4",
-		"nvfp4_dense_dir": "/path/to/Qwen3.8-Flash-Next-NVFP4-dense",
-		"nvfp4_dense": "gdn,attn,idx,head,shared_gate,shared_up"
+		"vram_reserve_mib": 1536
 	}
 }

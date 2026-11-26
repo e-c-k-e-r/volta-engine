@@ -1546,7 +1546,7 @@ bool Glm5NextPipeline::load_experts( backend::stream_t stream ) {
 	size_t bytes_after = arena_->offset_bytes;
 	if ( rank_ <= 1 && runtime::options().mem_log ) {
 		constexpr double kGiB = 1073741824.0;
-		LOG_INFO( "[mem] rank %d weights: before the layers (lm_head, final norm) %.3f GiB, attention + norms + hyper-connections %.3f, routers %.3f, shared experts %.3f, dense MLPs %.3f, experts %.3f (codes, signs, scales), MTP head and the rest %.3f\n",
+		LOG_INFO( "[mem] rank %d weights: before the layers (lm_head, final norm) %.3f GiB, attention + norms + hyper-connections %.3f, routers %.3f, shared experts %.3f, dense MLPs %.3f, experts %.3f (codes, signs, scales), the rest %.3f (the MTP head when speculating with it, the drafter when the cluster loaded it before the experts)\n",
 			rank_, ( layers_begin - bytes_before ) / kGiB, wb_attn / kGiB, wb_router / kGiB, wb_shared / kGiB, wb_dense / kGiB, experts_cost / kGiB,
 			( bytes_after - layers_begin - wb_attn - wb_router - wb_shared - wb_dense - experts_cost ) / kGiB );
 	}
