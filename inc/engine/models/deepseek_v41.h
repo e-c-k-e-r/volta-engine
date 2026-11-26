@@ -110,6 +110,7 @@ public:
 
 	using ModelPipeline::forward;
 
+	bool check_config( bool log ) override { return read_config( checkpoint_dir_.c_str(), log ); }
 	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
 	bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) override;
 	void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) override;
@@ -177,7 +178,7 @@ private:
 	static constexpr int kTopkTile = 4096;
 	static constexpr float kOutScale = 8.0f;   // sublayer outputs are stored divided by this (the BOS row's massive activation exceeds FP16)
 
-	bool read_config( const char* model_dir );
+	bool read_config( const char* model_dir, bool log );
 	bool load_engram( const char* model_dir );
 	// moves the snapshot rows of [from, tokens) of a slot between the caches and host memory (layout: see seq_state_bytes)
 	void copy_seq_rows( int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );

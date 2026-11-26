@@ -153,6 +153,7 @@ public:
 
 	using ModelPipeline::forward;
 
+	bool check_config( bool log ) override;
 	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
 	bool init( const Glm5NextConfig& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
 	bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) override;

@@ -107,6 +107,7 @@ tier2_models() {
 	run tokenizer_cases_glm ./test_tokenizer_file $(model_dir ENGINE_TEST_GLM_DIR) --cases $ROOT/tests/data/tokenizer_cases_glm5_next.json
 	run tokenizer_cases_flash ./test_tokenizer_file $(model_dir ENGINE_TEST_FLASH_DIR) --cases $ROOT/tests/data/tokenizer_cases_qwen4_exp.json
 	run tokenizer_cases_deepseek ./test_tokenizer_file $DSV41 --cases $ROOT/tests/data/tokenizer_cases_deepseek_v41.json
+	run config_check ./test_config_check $(model_dir ENGINE_TEST_QWEN_DIR) $(model_dir ENGINE_TEST_GLM_DIR) $(model_dir ENGINE_TEST_FLASH_DIR) $DSV41 $(model_dir ENGINE_TEST_GEMMA_DIR)
 	# out of the gate until a Gemma 4 checkpoint is kept again
 	# run tokenizer_cases_gemma ./test_tokenizer_file $(model_dir ENGINE_TEST_GEMMA_DIR) --cases $ROOT/tests/data/tokenizer_cases_gemma4.json
 	run dsv41_encoding ./test_dsv41_encoding $DSV41

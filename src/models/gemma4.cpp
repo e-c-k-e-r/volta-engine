@@ -337,9 +337,15 @@ bool Gemma4Pipeline::init( const Gemma4Config& config, int rank, pod::MemoryAren
 	return true;
 }
 
+bool Gemma4Pipeline::check_config( bool log ) {
+	(void) log;   // read_gemma4_config always says why it fails
+	Gemma4Config c;
+	return read_gemma4_config( checkpoint_dir_.c_str(), &c );
+}
+
 bool Gemma4Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
 	Gemma4Config config;
-	if ( !model_dir_.empty() && !read_gemma4_config( model_dir_.c_str(), &config ) ) return false;
+	if ( !checkpoint_dir_.empty() && !read_gemma4_config( checkpoint_dir_.c_str(), &config ) ) return false;
 	if ( runtime::options().max_seq > 0 ) config.max_seq = runtime::options().max_seq;
 	if ( runtime::options().max_slots > 0 ) config.max_slots = runtime::options().max_slots;
 	return init( config, device_id, arena, ring );

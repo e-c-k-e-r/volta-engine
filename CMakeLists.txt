@@ -145,6 +145,7 @@ set(ENGINE_HOST_SOURCES
 	src/loader/image.cpp
 	src/loader/ngram_table.cpp
 	src/models/model.cpp
+	src/models/config_check.cpp
 	src/models/qwen3_5.cpp
 	src/models/steer_host.cpp
 	src/models/sparse_head_host.cpp
@@ -728,6 +729,9 @@ set_target_properties(test_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_B
 add_executable(test_gguf_linear tests/2_parity/test_gguf_linear.cpp)
 target_link_libraries(test_gguf_linear PRIVATE engine_kernels)
 set_target_properties(test_gguf_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_config_check tests/2_parity/test_config_check.cpp)
+target_link_libraries(test_config_check PRIVATE engine_kernels)
+set_target_properties(test_config_check PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 add_executable(test_gguf_rows tests/2_parity/test_gguf_rows.cpp)
 target_link_libraries(test_gguf_rows PRIVATE engine_kernels)
 set_target_properties(test_gguf_rows PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

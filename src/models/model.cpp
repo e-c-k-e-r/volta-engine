@@ -133,4 +133,11 @@ bool is_known_model_type( const std::string& model_type ) {
 	return model_type == "qwen3_5" || model_type == "glm5_next" || model_type == "qwen4_exp" || model_type == "deepseek_v41" || model_type == "gemma4";
 }
 
+bool check_model_config( const std::string& model_type, const char* model_dir, bool log ) {
+	std::unique_ptr<ModelPipeline> p = create_model_pipeline( model_type );
+	if ( !p ) return false;
+	p->set_model_dir( model_dir );
+	return p->check_config( log );
+}
+
 } // namespace engine::models

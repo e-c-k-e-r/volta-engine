@@ -103,7 +103,7 @@ public:
 
 	using ModelPipeline::forward;
 
-	void set_model_dir( const char* dir ) override { model_dir_ = dir != nullptr ? dir : ""; }
+	bool check_config( bool log ) override;
 	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
 	bool init( const Gemma4Config& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
 	bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) override;
@@ -174,7 +174,6 @@ private:
 	int tap_shift_ = 0;
 
 	Gemma4Config config_;
-	std::string model_dir_;
 	ModelMetadata metadata_;
 	int rank_ = 0;
 	pod::MemoryArena* arena_ = nullptr;

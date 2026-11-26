@@ -1,6 +1,7 @@
 #include "engine/core/scratch.h"
 #include <condition_variable>
 #include "engine/models/qwen4_exp.h"
+#include "engine/models/config_check.h"
 #include "engine/modules/gguf.h"
 #include "engine/modules/sparse_head.h"
 #include "engine/core/log.h"
@@ -71,45 +72,48 @@ bool modelopt_checkpoint( const char* model_dir ) {
 	return j["quantization_config"].value( "quant_method", std::string() ) == "modelopt";
 }
 
-// Checks the hard-coded defaults of Qwen4ExpConfig against the checkpoint's config.json
-bool validate_config( const char* model_dir, const Qwen4ExpConfig& c ) {
-	std::ifstream in( std::string( model_dir ) + "/config.json" );
-	if ( !in ) {
-		LOG_ERROR( "Qwen4ExpPipeline: %s/config.json is unreadable\n", model_dir );
-		return false;
-	}
-	std::stringstream ss;
-	ss << in.rdbuf();
-	const auto j = nlohmann::json::parse( ss.str(), nullptr, false );
-	if ( j.is_discarded() ) return false;
-	const auto& t = j.contains( "text_config" ) ? j["text_config"] : j;
-	bool ok = true;
-	auto check = [&]( const char* key, int want ) {
-		const int got = t.value( key, -1 );
-		if ( got != want ) {
-			LOG_ERROR( "Qwen4ExpPipeline: config %s is %d, the engine is built for %d\n", key, got, want );
-			ok = false;
-		}
-	};
-	check( "num_hidden_layers", c.num_layers );
-	check( "hidden_size", c.hidden_size );
-	check( "vocab_size", c.vocab_size );
-	check( "hc_count", c.hc_mult );
-	check( "num_attention_heads", c.num_q_heads );
-	check( "num_key_value_heads", c.num_kv_heads );
-	check( "head_dim", c.head_dim );
-	check( "linear_num_key_heads", c.linear_num_k_heads );
-	check( "linear_num_value_heads", c.linear_num_v_heads );
-	check( "linear_key_head_dim", c.linear_head_dim );
-	check( "num_experts", c.num_experts );
-	check( "num_experts_per_tok", c.top_k );
-	check( "moe_intermediate_size", c.moe_intermediate );
-	check( "shared_expert_intermediate_size", c.shared_intermediate );
-	check( "indexer_n_heads", c.indexer_heads );
-	check( "indexer_head_dim", c.indexer_head_dim );
-	check( "indexer_budget", c.indexer_budget );
-	check( "indexer_compress_ratio", c.indexer_compress );
-	return ok;
+// The checkpoint's config.json against the layout Qwen4ExpConfig implements (ConfigCheck)
+bool check_layout( const char* model_dir, const Qwen4ExpConfig& c, bool log ) {
+	ConfigCheck k( model_dir, "qwen4_exp", log );
+	k.expect_int( "num_hidden_layers", c.num_layers );
+	k.expect_int( "hidden_size", c.hidden_size );
+	k.expect_int( "vocab_size", c.vocab_size );
+	k.expect_int( "hc_count", c.hc_mult );
+	k.expect_int( "hc_lowrank", c.hc_rank );
+	k.expect_int( "num_attention_heads", c.num_q_heads );
+	k.expect_int( "num_key_value_heads", c.num_kv_heads );
+	k.expect_int( "head_dim", c.head_dim );
+	k.expect_num( "partial_rotary_factor", static_cast<double>( c.rot_dim ) / c.head_dim );
+	k.expect_num( "rope_parameters.rope_theta", c.rope_theta );
+	k.expect_int( "full_attention_interval", 4 );
+	std::vector<std::string> types( c.num_layers );
+	for ( int L = 0; L < c.num_layers; ++L ) types[L] = c.is_full_attention( L ) ? "full_attention" : "linear_attention";
+	k.expect_strs( "layer_types", types );
+	k.expect_int( "linear_num_key_heads", c.linear_num_k_heads );
+	k.expect_int( "linear_num_value_heads", c.linear_num_v_heads );
+	k.expect_int( "linear_key_head_dim", c.linear_head_dim );
+	k.expect_int( "linear_value_head_dim", c.linear_head_dim );
+	k.expect_int( "linear_conv_kernel_dim", 4 );
+	k.expect_int( "num_experts", c.num_experts );
+	k.expect_int( "num_experts_per_tok", c.top_k );
+	k.expect_int( "moe_intermediate_size", c.moe_intermediate );
+	k.expect_int( "shared_expert_intermediate_size", c.shared_intermediate );
+	k.expect_int( "indexer_n_heads", c.indexer_heads );
+	k.expect_int( "indexer_head_dim", c.indexer_head_dim );
+	k.expect_int( "indexer_kv_heads", 1 );
+	k.expect_int( "indexer_budget", c.indexer_budget );
+	k.expect_int( "indexer_compress_ratio", c.indexer_compress );
+	k.expect_ints( "ple_layer_ids", { c.ple_layer + 1 } );   // the config counts the n-gram layer one past the decoder layer its tensors sit in
+	k.expect_int( "ple_embed_dim", c.ple_embed_dim );
+	k.expect_int( "ple_conv_kernel_size", 4 );
+	k.expect_int( "ngram_size", 3 );
+	k.expect_int( "heads_per_ngram", 8 );
+	k.expect_num( "rms_norm_eps", c.rms_norm_eps );
+	k.expect_str( "hidden_act", "silu" );
+	k.expect_str( "output_gate_type", "sigmoid" );
+	k.expect_bool( "attention_bias", false );
+	k.expect_bool( "tie_word_embeddings", false );
+	return k.ok();
 }
 
 // The router kernel reads the gate as [hidden, experts]; the checkpoint stores [experts, hidden]. rows (not null): also the stored layout,
@@ -171,7 +175,12 @@ Qwen4ExpPipeline::~Qwen4ExpPipeline() {
 	}
 }
 
-void Qwen4ExpPipeline::set_model_dir( const char* dir ) { nv_model_ = dir != nullptr && modelopt_checkpoint( dir ); }
+bool Qwen4ExpPipeline::check_config( bool log ) { return check_layout( checkpoint_dir_.c_str(), config_, log ); }
+
+void Qwen4ExpPipeline::set_model_dir( const char* dir ) {
+	ModelPipeline::set_model_dir( dir );
+	nv_model_ = dir != nullptr && modelopt_checkpoint( dir );
+}
 
 bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
 	const size_t mem_start = arena.offset_bytes;
@@ -185,6 +194,7 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	}
 #endif
 	tp_ = ( ring != nullptr ) ? requested_tp_ : 1;
+	if ( !checkpoint_dir_.empty() && !check_config( rank_ == 0 ) ) return false;
 	if ( runtime::options().max_seq > 0 ) config_.max_seq = runtime::options().max_seq;
 	if ( runtime::options().max_slots > 0 ) config_.max_slots = runtime::options().max_slots;
 	if ( tp_ != 1 && tp_ != 2 && tp_ != 4 ) {
@@ -388,7 +398,6 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 }
 
 bool Qwen4ExpPipeline::load_weights( const char* model_dir, backend::stream_t stream ) {
-	if ( !validate_config( model_dir, config_ ) ) return false;
 	const size_t mem_weights_start = arena_->offset_bytes;
 	size_t wb_experts = 0, wb_shared = 0;   // [mem] weights breakdown (mem_log)
 	engine::loader::SafeTensorsRepo repo;

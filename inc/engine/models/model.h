@@ -117,8 +117,13 @@ public:
 	// drafter's tap ring only for DFlash2
 	enum class Speculation { None, Mtp, DFlash, Other };
 	void set_speculation( Speculation s ) { speculation_ = s; }
-	// The checkpoint directory load_weights will read (call before init()): a model whose buffers depend on the checkpoint's format reads it here
-	virtual void set_model_dir( const char* dir ) { (void) dir; }
+	// The checkpoint directory load_weights will read (call before init()): init checks its config.json against the layout the model implements
+	// (or reads the layout from it), and a model whose buffers depend on the checkpoint's format reads that here
+	virtual void set_model_dir( const char* dir ) { checkpoint_dir_ = dir != nullptr ? dir : ""; }
+	// That checkpoint's config.json against the layout the model implements (ConfigCheck; Gemma 4 reads its layout from it instead): false,
+	// with the differences logged when log is set, for a variant of the architecture the model doesn't implement. No device work: init runs it
+	// first, check_model_config without a device
+	virtual bool check_config( bool log ) { (void) log; return true; }
 	// Bytes the arena must still hold after the weights (the speculator's); a model sizing something from the free arena keeps them back. Before load_weights
 	virtual void set_reserve_after_weights( size_t bytes ) { (void) bytes; }
 	virtual bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) = 0;
@@ -367,6 +372,7 @@ public:
 	virtual const ModelMetadata& get_metadata() const = 0;
 
 protected:
+	std::string checkpoint_dir_;   // set_model_dir's (empty: init uses the built-in layout unchecked, as standalone tests do)
 	int requested_tp_ = ENGINE_NUM_GPUS;
 	Speculation speculation_ = Speculation::DFlash;   // what a model allocates for when nobody says (standalone tests)
 };
@@ -374,6 +380,8 @@ protected:
 // Factory helper to instantiate models dynamically
 // Registered architectures use the checkpoint config.json "model_type": qwen3_5, glm5_next. Anything else is unsupported.
 bool is_known_model_type( const std::string& model_type );
+// The checkpoint's config.json against the layout of the model_type's pipeline (ModelPipeline::check_config), without a device
+bool check_model_config( const std::string& model_type, const char* model_dir, bool log = true );
 std::unique_ptr<ModelPipeline> create_model_pipeline( const std::string& model_type );
 // The per-thread stack frame the model's kernels need above the driver's default (0: none), set before the arena is sized
 size_t device_stack_bytes( const std::string& model_type, const std::string& model_dir );

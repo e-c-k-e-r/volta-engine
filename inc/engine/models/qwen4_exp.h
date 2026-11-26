@@ -109,6 +109,7 @@ public:
 	using ModelPipeline::forward;
 
 	void set_model_dir( const char* dir ) override;
+	bool check_config( bool log ) override;
 	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
 	bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) override;
 

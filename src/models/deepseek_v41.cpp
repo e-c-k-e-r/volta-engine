@@ -1,4 +1,5 @@
 #include "engine/models/deepseek_v41.h"
+#include "engine/models/config_check.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/backend/runtime.h"
@@ -436,56 +437,58 @@ bool DeepseekV41Pipeline::expert_heat( std::vector<uint32_t>& out, int& layers, 
 	return true;
 }
 
-bool DeepseekV41Pipeline::read_config( const char* model_dir ) {
-	std::ifstream f( std::string( model_dir ) + "/config.json" );
-	if ( !f ) { LOG_ERROR( "[deepseek_v41] no config.json in %s\n", model_dir ); return false; }
-	const nlohmann::json j = nlohmann::json::parse( f, nullptr, false );
-	if ( j.is_discarded() ) return false;
-	const nlohmann::json& t = j.contains( "text_config" ) ? j["text_config"] : j;
-	bool ok = true;
-	auto check = [&]( const char* key, auto expect ) {
-		if ( !t.contains( key ) ) return;
-		const auto v = t[key].get<decltype( expect )>();
-		if ( v != expect ) { LOG_ERROR( "[deepseek_v41] config %s differs from the layout this engine implements\n", key ); ok = false; }
-	};
-	check( "num_hidden_layers", config_.num_layers );
-	check( "hidden_size", config_.hidden_size );
-	check( "num_attention_heads", config_.num_heads );
-	check( "head_dim", DSV4::HD );
-	check( "qk_rope_head_dim", DSV4::ROPE );
-	check( "q_lora_rank", config_.q_lora_rank );
-	check( "o_groups", config_.o_groups );
-	check( "o_lora_rank", config_.o_lora_rank );
-	check( "n_routed_experts", config_.num_experts );
-	check( "num_experts_per_tok", config_.top_k );
-	check( "moe_intermediate_size", config_.intermediate_size );
-	check( "vocab_size", config_.vocab_size );
-	check( "sliding_window", DSV4::WINDOW );
-	check( "index_n_heads", DSV4::IDX_HEADS );
-	check( "index_head_dim", DSV4::IDX_DIM );
-	check( "index_topk", DSV4::TOPK );
-	check( "hc_mult", 4 );
-	check( "kv_source_layer_ids", config_.kv_sources );
-	check( "index_source_layer_ids", config_.index_sources );
-	check( "engram_layer_ids", config_.engram_layers );
-	check( "candidate_source_layer_id", config_.candidate_source );
-	check( "candidate_topk_blocks", config_.candidate_blocks );
-	check( "candidate_block_size", config_.candidate_block );
-	check( "engram_n_heads", config_.engram_heads );
-	check( "engram_head_dim", config_.engram_head_dim );
-	check( "engram_max_ngram_size", config_.engram_ngram );
-	if ( t.contains( "compress_ratios" ) ) {
-		std::vector<int> r = t["compress_ratios"].get<std::vector<int>>();
-		r.resize( config_.num_layers );
-		if ( r != config_.compress_ratios ) { LOG_ERROR( "[deepseek_v41] compress_ratios differ from the implemented layout\n" ); ok = false; }
-	}
-	if ( t.contains( "routed_scaling_factor" ) ) config_.route_scale = t["routed_scaling_factor"].get<float>();
-	if ( t.contains( "swiglu_limit" ) ) config_.swiglu_limit = t["swiglu_limit"].get<float>();
-	if ( t.contains( "rms_norm_eps" ) ) config_.norm_eps = t["rms_norm_eps"].get<float>();
-	if ( t.contains( "eos_token_id" ) ) config_.eos_id = t["eos_token_id"].get<int>();
-	else if ( j.contains( "eos_token_id" ) ) config_.eos_id = j["eos_token_id"].get<int>();
-	if ( t.contains( "scoring_func" ) && t["scoring_func"] != "sqrtsoftplus" ) { LOG_ERROR( "[deepseek_v41] scoring_func must be sqrtsoftplus\n" ); ok = false; }
-	return ok;
+// The checkpoint's config.json against the implemented layout (ConfigCheck), and the few values taken from it (the routing scale, the SwiGLU
+// limit, the norm eps, the eos id)
+bool DeepseekV41Pipeline::read_config( const char* model_dir, bool log ) {
+	ConfigCheck k( model_dir, "deepseek_v41", log );
+	auto ints = []( const std::vector<int>& v ) { return std::vector<int64_t>( v.begin(), v.end() ); };
+	k.expect_int( "num_hidden_layers", config_.num_layers );
+	k.expect_int( "hidden_size", config_.hidden_size );
+	k.expect_int( "num_attention_heads", config_.num_heads );
+	k.expect_int( "num_key_value_heads", 1 );
+	k.expect_int( "head_dim", DSV4::HD );
+	k.expect_int( "qk_rope_head_dim", DSV4::ROPE );
+	k.expect_int( "q_lora_rank", config_.q_lora_rank );
+	k.expect_int( "o_groups", config_.o_groups );
+	k.expect_int( "o_lora_rank", config_.o_lora_rank );
+	k.expect_int( "n_routed_experts", config_.num_experts );
+	k.expect_int( "n_shared_experts", 1 );
+	k.expect_int( "num_experts_per_tok", config_.top_k );
+	k.expect_int( "moe_intermediate_size", config_.intermediate_size );
+	k.expect_int( "vocab_size", config_.vocab_size );
+	k.expect_int( "sliding_window", DSV4::WINDOW );
+	k.expect_int( "index_n_heads", DSV4::IDX_HEADS );
+	k.expect_int( "index_head_dim", DSV4::IDX_DIM );
+	k.expect_int( "index_topk", DSV4::TOPK );
+	k.expect_int( "hc_mult", 4 );
+	k.expect_int( "hc_sinkhorn_iters", 20 );
+	k.expect_ints( "compress_ratios", ints( config_.compress_ratios ), true );   // the MTP layers' entries follow
+	k.expect_ints( "kv_source_layer_ids", ints( config_.kv_sources ) );
+	k.expect_ints( "index_source_layer_ids", ints( config_.index_sources ) );
+	k.expect_ints( "engram_layer_ids", ints( config_.engram_layers ) );
+	k.expect_int( "candidate_source_layer_id", config_.candidate_source );
+	k.expect_int( "candidate_topk_blocks", config_.candidate_blocks );
+	k.expect_int( "candidate_block_size", config_.candidate_block );
+	k.expect_int( "engram_n_heads", config_.engram_heads );
+	k.expect_int( "engram_head_dim", config_.engram_head_dim );
+	k.expect_int( "engram_max_ngram_size", config_.engram_ngram );
+	k.expect_num( "rope_theta", config_.rope_theta );
+	k.expect_num( "compress_rope_theta", config_.compress_rope_theta );
+	k.expect_str( "rope_scaling.rope_type", "yarn" );
+	k.expect_num( "rope_scaling.factor", config_.rope_factor );
+	k.expect_int( "rope_scaling.original_max_position_embeddings", config_.rope_original_len );
+	k.expect_num( "rope_scaling.beta_fast", config_.beta_fast );
+	k.expect_num( "rope_scaling.beta_slow", config_.beta_slow );
+	k.expect_str( "scoring_func", "sqrtsoftplus" );
+	k.expect_str( "topk_method", "noaux_tc" );
+	k.expect_bool( "norm_topk_prob", true );
+	k.expect_str( "hidden_act", "silu" );
+	k.expect_bool( "attention_bias", false );
+	k.read_num( "routed_scaling_factor", &config_.route_scale );
+	k.read_num( "swiglu_limit", &config_.swiglu_limit );
+	k.read_num( "rms_norm_eps", &config_.norm_eps );
+	k.read_int( "eos_token_id", &config_.eos_id );
+	return k.ok();
 }
 
 bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
@@ -493,6 +496,7 @@ bool DeepseekV41Pipeline::init( int device_id, pod::MemoryArena& arena, engine::
 	arena_ = &arena;
 	ring_ = ring;
 	config_.tp_size = ring != nullptr ? requested_tp_ : 1;
+	if ( !checkpoint_dir_.empty() && !read_config( checkpoint_dir_.c_str(), rank_ == 0 ) ) return false;
 	ENGINE_ASSERT( config_.tp_size == 1 || config_.tp_size == 2 || config_.tp_size == 4, "DeepSeek-V4.1 runs on 1, 2 or 4 ranks" );
 	if ( runtime::options().max_seq > 0 ) config_.max_seq = runtime::options().max_seq;
 	if ( runtime::options().max_slots > 0 ) config_.max_slots = runtime::options().max_slots;
@@ -802,7 +806,6 @@ int all_ranks_min( int mine, int ranks ) {
 
 bool DeepseekV41Pipeline::load_weights( const char* model_dir, backend::stream_t stream ) {
 	backend::set_device( rank_ );
-	if ( !read_config( model_dir ) ) return false;
 	model_dir_ = model_dir;
 	repo_ = std::make_unique<engine::loader::SafeTensorsRepo>();
 	if ( !repo_->open( model_dir ) ) { LOG_ERROR( "[deepseek_v41] cannot open %s\n", model_dir ); return false; }

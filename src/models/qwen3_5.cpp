@@ -1,4 +1,5 @@
 #include "engine/models/qwen3_5.h"
+#include "engine/models/config_check.h"
 #include "engine/modules/sparse_head.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
@@ -224,8 +225,39 @@ bool Qwen3_5Pipeline::init(
 	return true;
 }
 
+// The checkpoint's config.json against the layout Qwen3_5Config implements (ConfigCheck)
+bool Qwen3_5Pipeline::check_config( bool log ) {
+	const Qwen3_5Config c;
+	ConfigCheck k( checkpoint_dir_.c_str(), "qwen3_5", log );
+	k.expect_int( "num_hidden_layers", c.num_layers );
+	k.expect_int( "hidden_size", c.hidden_size );
+	k.expect_int( "intermediate_size", c.intermediate_size );
+	k.expect_int( "vocab_size", c.vocab_size );
+	k.expect_int( "num_attention_heads", c.full_num_q_heads );
+	k.expect_int( "num_key_value_heads", c.full_num_kv_heads );
+	k.expect_int( "head_dim", c.full_head_dim );
+	k.expect_num( "partial_rotary_factor", static_cast<double>( c.full_rot_dim ) / c.full_head_dim );
+	k.expect_num( "rope_parameters.rope_theta", c.rope_theta );
+	k.expect_int( "full_attention_interval", c.num_layers / c.num_attn_layers );
+	std::vector<std::string> types( c.num_layers );
+	for ( int L = 0; L < c.num_layers; ++L ) types[L] = ( L + 1 ) % 4 == 0 ? "full_attention" : "linear_attention";
+	k.expect_strs( "layer_types", types );
+	k.expect_int( "linear_num_key_heads", c.linear_num_k_heads );
+	k.expect_int( "linear_num_value_heads", c.linear_num_v_heads );
+	k.expect_int( "linear_key_head_dim", c.linear_head_dim );
+	k.expect_int( "linear_value_head_dim", c.linear_head_dim );
+	k.expect_int( "linear_conv_kernel_dim", 4 );
+	k.expect_num( "rms_norm_eps", c.rms_norm_eps );
+	k.expect_str( "hidden_act", "silu" );
+	k.expect_bool( "attn_output_gate", true );
+	k.expect_bool( "attention_bias", false );
+	k.expect_bool( "tie_word_embeddings", false );
+	return k.ok();
+}
+
 bool Qwen3_5Pipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
 	Qwen3_5Config config;
+	if ( !checkpoint_dir_.empty() && !check_config( device_id == 0 ) ) return false;
 	if ( runtime::options().max_seq > 0 ) config.max_seq = runtime::options().max_seq;  // context window (KV pool size)
 	if ( runtime::options().max_slots > 0 ) config.max_slots = runtime::options().max_slots;
 	return init( config, device_id, arena, ring );

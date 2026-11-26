@@ -1,4 +1,6 @@
 #include "engine/models/glm5_next.h"
+#include "engine/models/config_check.h"
+#include "engine/modules/mla.h"
 #include "engine/core/log.h"
 #include "engine/runtime/options.h"
 #include "engine/modules/hessian.h"
@@ -478,8 +480,62 @@ bool Glm5NextPipeline::init(
 	return true;
 }
 
+// The checkpoint's config.json against the layout this pipeline implements (ConfigCheck): the sizes of Glm5NextConfig and the module
+// constants (MLA's latent and head widths, the DSA indexer's, the KDA heads), and the literals the forward uses (norm eps, the routing scale,
+// the SwiGLU limit, the hyper-connections' streams, Sinkhorn steps and eps, the KDA gate's bound)
+bool Glm5NextPipeline::check_config( bool log ) {
+	const Glm5NextConfig c;
+	ConfigCheck k( checkpoint_dir_.c_str(), "glm5_next", log );
+	k.expect_int( "num_hidden_layers", c.num_layers );
+	k.expect_int( "hidden_size", c.hidden_size );
+	k.expect_int( "intermediate_size", c.dense_intermediate_size );
+	k.expect_int( "moe_intermediate_size", c.intermediate_size );
+	k.expect_int( "n_routed_experts", c.num_experts );
+	k.expect_int( "num_experts_per_tok", c.top_k );
+	k.expect_int( "n_shared_experts", 1 );
+	k.expect_int( "first_k_dense_replace", 3 );
+	k.expect_int( "n_group", 1 );
+	k.expect_int( "topk_group", 1 );
+	k.expect_bool( "norm_topk_prob", true );
+	k.expect_str( "scoring_func", "sigmoid" );
+	k.expect_str( "topk_method", "noaux_tc" );
+	k.expect_num( "routed_scaling_factor", 2.5 );
+	k.expect_num( "swiglu_limit", 10.0 );
+	k.expect_int( "vocab_size", c.vocab_size );
+	k.expect_num( "rms_norm_eps", 1e-5 );
+	k.expect_int( "num_attention_heads", 64 );
+	k.expect_int( "kv_lora_rank", engine::modules::MLALatent::LORA );
+	k.expect_int( "q_lora_rank", 1536 );
+	k.expect_int( "qk_nope_head_dim", engine::modules::MLALatent::HEAD );
+	k.expect_int( "v_head_dim", engine::modules::MLALatent::HEAD );
+	k.expect_int( "qk_rope_head_dim", 0 );
+	k.expect_int( "index_n_heads", engine::modules::DSA::HEADS );
+	k.expect_int( "index_head_dim", engine::modules::DSA::DIM );
+	k.expect_int( "index_kpool", engine::modules::DSA::POOL );
+	k.expect_int( "index_topk", engine::modules::DSA::TOPK );
+	k.expect_int( "linear_attn_config.num_heads", 64 );
+	k.expect_int( "linear_attn_config.head_dim", 128 );
+	k.expect_int( "linear_attn_config.short_conv_kernel_size", 4 );
+	k.expect_num( "linear_attn_config.gate_lower_bound", -5.0 );
+	k.expect_int( "hc_mult", 4 );
+	k.expect_int( "hc_sinkhorn_iters", 20 );
+	k.expect_num( "hc_eps", 1e-6 );
+	std::vector<std::string> attn( c.num_layers ), mlp( c.num_layers );
+	for ( int L = 0; L < c.num_layers; ++L ) {
+		attn[L] = L % 4 == 3 && L < c.num_layers - 1 ? "deepseek_sparse_attention" : "linear_attention";
+		mlp[L] = L < 3 ? "dense" : "sparse";
+	}
+	k.expect_strs( "layer_types", attn );
+	k.expect_strs( "mlp_layer_types", mlp );
+	k.expect_str( "hidden_act", "silu" );
+	k.expect_bool( "attention_bias", false );
+	k.expect_bool( "tie_word_embeddings", false );
+	return k.ok();
+}
+
 bool Glm5NextPipeline::init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) {
 	Glm5NextConfig config;
+	if ( !checkpoint_dir_.empty() && !check_config( device_id == 0 ) ) return false;
 	if ( runtime::options().max_seq > 0 ) config.max_seq = runtime::options().max_seq;  // context window (KV pool size)
 	if ( runtime::options().max_slots > 0 ) config.max_slots = runtime::options().max_slots;
 	return init( config, device_id, arena, ring );

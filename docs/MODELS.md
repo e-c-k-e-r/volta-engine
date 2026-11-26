@@ -1,7 +1,9 @@
 # Models
 
 One section per model type. The type is read from the checkpoint's `config.json` (`model_type`), never configured; anything else is a fatal
-error at start, and a MiniMax-H3 pipeline directory starts the video service instead ([VIDEO.md](VIDEO.md)). Options are described in
+error at start, and a MiniMax-H3 pipeline directory starts the video service instead ([VIDEO.md](VIDEO.md)). Every pipeline but Gemma 4's
+implements one layout (its fine-tunes share it): before allocating anything it checks the config's sizes, layer kinds and constants against it and
+refuses another variant with each differing field named (`test_config_check`). Gemma 4 reads its layout from the config. Options are described in
 [CONFIG.md](CONFIG.md), weight formats, bit widths and perplexity in [QUANTIZATION.md](QUANTIZATION.md), speed in [PERFORMANCE.md](PERFORMANCE.md),
 and the features shared by every model (prefix cache, expert tier, speculation, images, serving) in [FEATURES.md](FEATURES.md).
 
