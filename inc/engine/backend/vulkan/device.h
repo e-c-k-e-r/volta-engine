@@ -40,8 +40,11 @@ void stream_signal( stream_t s, void* sem, uint64_t value );
 void stream_wait( stream_t s, void* const* sems, const uint64_t* values, int n );
 
 // Record bind + push constants + dispatch( gx, gy, gz workgroups ) + a compute/transfer barrier into the stream
-// (nullptr = default stream). While a graph capture is active this records into the graph.
+// (nullptr = default stream; in a run of independent ops the barrier waits for the next command). While a graph capture is active this records into the graph.
 void dispatch( stream_t s, Pipeline* p, const void* push, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1 );
+// An op takes a shared scratch buffer: in a run of independent ops a second op doing so is ordered after everything before it (the two would
+// share the buffer)
+void scratch_use( stream_t s );
 // dispatch for a pipeline_create_bound pipeline: buffers[i] (device pointers, 16-byte aligned) bound at binding i, each up to the end of
 // its allocation
 void dispatch_bound( stream_t s, Pipeline* p, const void* push, const void* const* buffers, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1 );

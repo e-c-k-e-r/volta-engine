@@ -4,6 +4,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include "engine/runtime/options.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,11 @@
 #include <mutex>
 #include <string>
 #include <vector>
+
+// The option table lives in the host library, which the module-only smoke binaries do not link: bound weakly (no option = defaults)
+namespace engine::runtime {
+__attribute__(( weak )) Options& options();
+}
 
 namespace engine::backend {
 
@@ -55,6 +61,11 @@ struct Ctx {
 	size_t host_import_align = 0;   // VK_KHR_push_descriptor: storage buffers bound inside the command buffer
 	bool int_dot = false;   // shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product) enabled: packed 4 x int8 dot products
 	bool budget = false;    // VK_EXT_memory_budget: the heaps' budget and usage (the driver's and other processes' allocations included)
+	// vulkan_profile: a timestamp before and after every dispatch (pairs in qpool, the pipeline of each in qwho), read at the next sync
+	VkQueryPool qpool = VK_NULL_HANDLE;
+	uint32_t qused = 0;
+	bool qreset = true;
+	std::vector<const vk::Pipeline*> qwho;
 	bool rte16 = false;   // shaderRoundingModeRTEFloat16: float -> half conversions can be made round-to-nearest-even
 	std::map<uint64_t, Alloc> allocs; // keyed by device address
 	std::multimap<size_t, Staging> staging_pool;   // idle pooled staging buffers by capacity
@@ -88,6 +99,9 @@ struct vk_stream {
 	VkCommandBuffer cb = VK_NULL_HANDLE; // currently recording (or null)
 	bool capture = false;
 	size_t capture_nodes = 0;
+	bool concurrent = false;   // inside concurrent_begin / concurrent_end: a command's barrier is owed (held) until the next command or the end
+	bool held = false;
+	bool run_scratch = false;  // an op of the run took a scratch buffer since its last full barrier
 	std::vector<VkCommandBuffer> inflight;
 	std::vector<Staging> staging;
 	size_t staging_bytes = 0;
@@ -107,6 +121,7 @@ struct Pipeline {
 	VkPipeline pipeline = VK_NULL_HANDLE;
 	VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;   // pipelines with storage-buffer bindings (pipeline_create_bound)
 	uint32_t push_bytes = 0, buffers = 0;
+	std::string name;   // its .spv file's name (vulkan_profile's rows)
 };
 } // namespace vk
 
@@ -307,9 +322,92 @@ VkCommandBuffer begin_cb( bool reusable ) {
 	return cb;
 }
 
+// vulkan_profile (eager forwards; captured graphs are not timed): every dispatch's GPU time between a timestamp before it and one after its
+// barrier, summed per pipeline at each sync and printed at exit
+constexpr uint32_t kProfQueries = 65536;
+std::mutex g_prof_mu;
+std::map<std::string, std::pair<double, uint64_t>> g_prof;   // pipeline name -> (ms, dispatches)
+double g_prof_span = 0.0;                                     // ms from the first to the last timestamp of each sync's batch, summed
+
+void prof_report() {
+	std::lock_guard<std::mutex> lk( g_prof_mu );
+	if ( g_prof.empty() ) return;
+	std::vector<std::pair<std::string, std::pair<double, uint64_t>>> rows( g_prof.begin(), g_prof.end() );
+	std::sort( rows.begin(), rows.end(), []( const auto& a, const auto& b ) { return a.second.first > b.second.first; } );
+	double total = 0.0;
+	for ( const auto& r : rows ) total += r.second.first;
+	std::fprintf( stderr, "[vulkan_profile] %.2f ms in %zu kernels' dispatches (each with its barrier), %.2f ms from first to last timestamp\n", total, rows.size(),
+		g_prof_span );
+	for ( const auto& r : rows ) {
+		std::fprintf( stderr, "  %-34s %9llu calls %10.3f ms %9.2f us/call %5.1f%%\n", r.first.c_str(), static_cast<unsigned long long>( r.second.second ),
+			r.second.first, 1000.0 * r.second.first / static_cast<double>( r.second.second ), 100.0 * r.second.first / total );
+	}
+}
+
+bool profiling() {
+	static const bool on = [] {
+		const bool o = engine::runtime::options != nullptr && engine::runtime::options().vulkan_profile;
+		if ( o ) std::atexit( prof_report );
+		return o;
+	}();
+	return on;
+}
+
+// The pairs written since the last harvest, once the work that wrote them is done (sync)
+void prof_harvest() {
+	Ctx& c = cur();
+	if ( c.qused == 0 ) return;
+	std::vector<uint64_t> ts( c.qused );
+	ENGINE_CHECK( vkGetQueryPoolResults( c.device, c.qpool, 0, c.qused, ts.size() * sizeof( uint64_t ), ts.data(), sizeof( uint64_t ),
+		VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT ) );
+	const double ms_per_tick = c.props.limits.timestampPeriod * 1e-6;
+	{
+		std::lock_guard<std::mutex> lk( g_prof_mu );
+		for ( size_t i = 0; i < c.qwho.size(); ++i ) {
+			auto& e = g_prof[c.qwho[i]->name];
+			e.first += static_cast<double>( ts[2 * i + 1] - ts[2 * i] ) * ms_per_tick;
+			++e.second;
+		}
+		g_prof_span += static_cast<double>( ts[c.qused - 1] - ts[0] ) * ms_per_tick;
+	}
+	c.qused = 0;
+	c.qwho.clear();
+	c.qreset = true;
+}
+
 VkCommandBuffer recording( vk_stream* s ) {
-	if ( !s->cb ) s->cb = begin_cb( s->capture );
+	if ( !s->cb ) {
+		s->cb = begin_cb( s->capture );
+		if ( profiling() && !s->capture ) {
+			Ctx& c = cur();
+			if ( c.qpool == VK_NULL_HANDLE ) {
+				VkQueryPoolCreateInfo qi{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+				qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+				qi.queryCount = kProfQueries;
+				ENGINE_CHECK( vkCreateQueryPool( c.device, &qi, nullptr, &c.qpool ) );
+			}
+			if ( c.qreset ) {
+				vkCmdResetQueryPool( s->cb, c.qpool, 0, kProfQueries );
+				c.qreset = false;
+			}
+		}
+	}
 	return s->cb;
+}
+
+// A timed dispatch's opening timestamp (true: close it with prof_end after the dispatch and its barrier)
+bool prof_begin( vk_stream* s, VkCommandBuffer cb ) {
+	Ctx& c = cur();
+	if ( !profiling() || s->capture || c.qpool == VK_NULL_HANDLE || c.qreset || c.qused + 2 > kProfQueries ) return false;
+	vkCmdWriteTimestamp( cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.qpool, c.qused );
+	return true;
+}
+
+void prof_end( VkCommandBuffer cb, const vk::Pipeline* p ) {
+	Ctx& c = cur();
+	vkCmdWriteTimestamp( cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c.qpool, c.qused + 1 );
+	c.qwho.push_back( p );
+	c.qused += 2;
 }
 
 // Everything recorded so far is visible to everything recorded next (and to the host at the end of the buffer)
@@ -318,6 +416,23 @@ void barrier( VkCommandBuffer cb, VkPipelineStageFlags dst = VK_PIPELINE_STAGE_C
 	mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
 	mb.dstAccessMask = dst_access;
 	vkCmdPipelineBarrier( cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, dst, 0, 1, &mb, 0, nullptr, 0, nullptr );
+}
+// Before a command: the barrier its predecessor owes (in a run of independent ops, unless concurrent_next waived it)
+void pay_held( vk_stream* s, VkCommandBuffer cb ) {
+	if ( !s->held ) return;
+	barrier( cb );
+	s->held = false;
+}
+// After a command: its barrier, now or (in a run) before the next command
+void after_command( vk_stream* s, VkCommandBuffer cb ) {
+	if ( s->concurrent ) s->held = true;
+	else barrier( cb );
+}
+// The command buffer a command is recorded into, its predecessor's barrier paid
+VkCommandBuffer command_cb( vk_stream* s ) {
+	VkCommandBuffer cb = recording( s );
+	pay_held( s, cb );
+	return cb;
 }
 
 // The stream's own timeline orders its submissions; the shared semaphores of stream_wait / stream_signal ride along on the next one
@@ -353,6 +468,7 @@ void submit( vk_stream* s, VkCommandBuffer cb ) {
 void flush( vk_stream* s ) {
 	ENGINE_ASSERT( !s->capture, "Vulkan backend: stream flush during graph capture" );
 	if ( !s->cb ) return;
+	pay_held( s, s->cb );
 	barrier( s->cb, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT );
 	ENGINE_CHECK( vkEndCommandBuffer( s->cb ) );
 	submit( s, s->cb );
@@ -367,6 +483,7 @@ void sync( vk_stream* s ) {
 	wi.pSemaphores = &s->timeline;
 	wi.pValues = &s->value;
 	ENGINE_CHECK( vkWaitSemaphores( cur().device, &wi, UINT64_MAX ) );
+	if ( profiling() ) prof_harvest();
 	for ( auto& st : s->staging ) {
 		if ( st.host_dst ) std::memcpy( st.host_dst, st.map, st.bytes );
 		if ( st.capacity <= kPoolMax && cur().staging_pool_bytes + st.capacity <= kPoolLimit ) {
@@ -478,6 +595,26 @@ void device_sync() {
 	{ std::lock_guard<std::mutex> qlk( cur().queue_mu ); vkQueueWaitIdle( cur().queue ); }
 }
 
+// A run of independent ops: off under vulkan_profile, which times each dispatch with its barrier
+void concurrent_begin( stream_t st ) {
+	ctx();
+	if ( !cur().default_stream ) cur().default_stream = make_stream();
+	vk_stream* s = resolve_stream( st );
+	ENGINE_ASSERT( !s->concurrent, "Vulkan backend: nested concurrent_begin" );
+	s->concurrent = !profiling();
+}
+void concurrent_next( stream_t st ) {
+	vk_stream* s = resolve_stream( st );
+	s->held = false;
+}
+void concurrent_end( stream_t st ) {
+	vk_stream* s = resolve_stream( st );
+	if ( s->held && s->cb ) barrier( s->cb );
+	s->held = false;
+	s->concurrent = false;
+	s->run_scratch = false;
+}
+
 bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, stream_t st ) {
 	ctx();
 	if ( !cur().default_stream ) cur().default_stream = make_stream();
@@ -492,7 +629,7 @@ bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, strea
 	if ( dir == Copy::D2D ) {
 		if ( !resolve( dst, db, doff ) || !resolve( src, sb, soff ) ) return false;
 		VkBufferCopy r{ soff, doff, bytes };
-		vkCmdCopyBuffer( recording( s ), sb, db, 1, &r );
+		vkCmdCopyBuffer( command_cb( s ), sb, db, 1, &r );
 	} else {
 		ENGINE_ASSERT( !s->capture, "Vulkan backend: host transfers inside a graph capture not implemented" );
 		// Bound the host memory held by staging buffers of in-flight transfers (a weight load copies tens of GiB)
@@ -515,17 +652,17 @@ bool memcpy_async_try( void* dst, const void* src, size_t bytes, Copy dir, strea
 			if ( !resolve( dst, db, doff ) ) return false;
 			std::memcpy( st_buf.map, src, bytes );
 			VkBufferCopy r{ 0, doff, bytes };
-			vkCmdCopyBuffer( recording( s ), st_buf.buffer, db, 1, &r );
+			vkCmdCopyBuffer( command_cb( s ), st_buf.buffer, db, 1, &r );
 		} else {
 			if ( !resolve( src, sb, soff ) ) return false;
 			st_buf.host_dst = dst;
 			VkBufferCopy r{ soff, 0, bytes };
-			vkCmdCopyBuffer( recording( s ), sb, st_buf.buffer, 1, &r );
+			vkCmdCopyBuffer( command_cb( s ), sb, st_buf.buffer, 1, &r );
 		}
 		s->staging.push_back( st_buf );
 		s->staging_bytes += bytes;
 	}
-	barrier( s->cb );
+	after_command( s, s->cb );
 	if ( s->capture ) ++s->capture_nodes;
 	return true;
 }
@@ -568,8 +705,8 @@ void memset_async( void* dst, int value, size_t bytes, stream_t st ) {
 	ENGINE_ASSERT( resolve( dst, b, off ), "Vulkan backend: memset on an unknown device pointer" );
 	ENGINE_ASSERT( off % 4 == 0 && bytes % 4 == 0, "Vulkan backend: memset with unaligned address/size not implemented" );
 	const uint32_t byte = uint32_t( value ) & 0xffu;
-	vkCmdFillBuffer( recording( s ), b, off, bytes, byte * 0x01010101u );
-	barrier( s->cb );
+	vkCmdFillBuffer( command_cb( s ), b, off, bytes, byte * 0x01010101u );
+	after_command( s, s->cb );
 	if ( s->capture ) ++s->capture_nodes;
 }
 void memset_sync( void* dst, int value, size_t bytes ) {
@@ -662,6 +799,7 @@ graph_t graph_capture_end( stream_t st ) {
 	ENGINE_ASSERT( s->capture, "Vulkan backend: graph_capture_end without begin" );
 	auto* gr = new vk_graph();
 	if ( !s->cb ) recording( s ); // empty capture
+	pay_held( s, s->cb );
 	ENGINE_CHECK( vkEndCommandBuffer( s->cb ) );
 	gr->cb = s->cb;
 	gr->nodes = s->capture_nodes;
@@ -721,6 +859,12 @@ Pipeline* create_pipeline( const char* spv_path, uint32_t push_bytes, uint32_t b
 
 	auto* p = new Pipeline();
 	p->push_bytes = push_bytes;
+	{
+		std::string n( spv_path );
+		n = n.substr( n.find_last_of( '/' ) + 1 );
+		if ( n.size() > 4 && n.compare( n.size() - 4, 4, ".spv" ) == 0 ) n.resize( n.size() - 4 );
+		p->name = n;
+	}
 	VkShaderModuleCreateInfo smi{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
 	smi.codeSize = code.size() * 4;
 	smi.pCode = code.data();
@@ -785,11 +929,13 @@ void dispatch( stream_t st, Pipeline* p, const void* push, uint32_t gx, uint32_t
 	ctx();
 	if ( !cur().default_stream ) cur().default_stream = make_stream();
 	vk_stream* s = resolve_stream( st );
-	VkCommandBuffer cb = recording( s );
+	VkCommandBuffer cb = command_cb( s );
+	const bool timed = prof_begin( s, cb );
 	vkCmdBindPipeline( cb, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline );
 	if ( p->push_bytes ) vkCmdPushConstants( cb, p->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, p->push_bytes, push );
 	vkCmdDispatch( cb, gx, gy, gz );
-	barrier( cb );
+	after_command( s, cb );
+	if ( timed ) prof_end( cb, p );
 	if ( s->capture ) ++s->capture_nodes;
 }
 
@@ -797,7 +943,8 @@ void dispatch_bound( stream_t st, Pipeline* p, const void* push, const void* con
 	ctx();
 	if ( !cur().default_stream ) cur().default_stream = make_stream();
 	vk_stream* s = resolve_stream( st );
-	VkCommandBuffer cb = recording( s );
+	VkCommandBuffer cb = command_cb( s );
+	const bool timed = prof_begin( s, cb );
 	vkCmdBindPipeline( cb, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline );
 	// each binding: from the pointer to the end of its allocation (at most maxStorageBufferRange)
 	std::vector<VkDescriptorBufferInfo> info( p->buffers );
@@ -820,8 +967,21 @@ void dispatch_bound( stream_t st, Pipeline* p, const void* push, const void* con
 	cur().push_descriptor( cb, VK_PIPELINE_BIND_POINT_COMPUTE, p->layout, 0, p->buffers, writes.data() );
 	if ( p->push_bytes ) vkCmdPushConstants( cb, p->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, p->push_bytes, push );
 	vkCmdDispatch( cb, gx, gy, gz );
-	barrier( cb );
+	after_command( s, cb );
+	if ( timed ) prof_end( cb, p );
 	if ( s->capture ) ++s->capture_nodes;
+}
+
+void scratch_use( stream_t st ) {
+	ctx();
+	if ( !cur().default_stream ) cur().default_stream = make_stream();
+	vk_stream* s = resolve_stream( st );
+	if ( !s->concurrent ) return;
+	if ( s->run_scratch && s->cb ) {
+		barrier( s->cb );
+		s->held = false;
+	}
+	s->run_scratch = true;
 }
 
 bool bound_pipelines() { return ctx().push_descriptor != nullptr; }

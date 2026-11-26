@@ -56,10 +56,13 @@ void Elementwise::softcap( pod::TensorView& x, float cap, backend::stream_t stre
 }
 
 void Elementwise::add_normed( pod::TensorView& resid, const pod::TensorView& y, const pod::TensorView& weight, float eps, float constant_bias, float scale,
-	backend::stream_t stream ) {
+	backend::stream_t stream, pod::TensorView* next, const pod::TensorView* next_weight ) {
 	ENGINE_ASSERT( resid.dtype == pod::DType::FP32 && y.dtype == pod::DType::FP16, "Elementwise::add_normed: FP32 residual, FP16 input" );
 	const int hidden_size = y.shape[y.ndim - 1];
-	vki::AddNormedParams p{ vki::dp( resid.data ), vki::dp( y.data ), vki::dp( weight.data ), hidden_size, weight.data != nullptr, eps, constant_bias, scale };
+	const int next_mode = next == nullptr ? 0 : ( next_weight == nullptr ? 1 : 2 );
+	vki::AddNormedParams p{ vki::dp( resid.data ), vki::dp( y.data ), vki::dp( weight.data ), hidden_size, weight.data != nullptr, eps, constant_bias, scale,
+		vki::dp( next != nullptr ? next->data : nullptr ), vki::dp( next_weight != nullptr ? next_weight->data : nullptr ), next_mode,
+		next_weight != nullptr && next_weight->data != nullptr };
 	vki::launch( "add_normed", p, stream, static_cast<int>( y.numel() / hidden_size ) );
 }
 

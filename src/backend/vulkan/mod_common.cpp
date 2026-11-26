@@ -32,6 +32,7 @@ void* scratch( int slot, size_t bytes, stream_t stream ) {
 	struct Slot { void* p = nullptr; size_t bytes = 0; };
 	static std::vector<Slot> all_slots[ENGINE_NUM_GPUS];   // per device: a scratch buffer lives on the device that was current when it was made
 	auto& slots = all_slots[get_device()];
+	vk::scratch_use( stream );
 	if ( slot >= static_cast<int>( slots.size() ) ) slots.resize( slot + 1 );
 	Slot& s = slots[slot];
 	if ( bytes > s.bytes ) {

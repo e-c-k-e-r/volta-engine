@@ -271,9 +271,10 @@ __global__ void softcap_kernel( half* __restrict__ x, size_t n, float cap, float
 	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
 	if ( i < n ) x[i] = __float2half_rn( cap * tanhf( __half2float( x[i] ) * inv_cap ) );
 }
-// resid = ( resid + rms_norm( y ) * w ) * scale, a block per row; resid FP32, y FP16
+// resid = ( resid + rms_norm( y ) * w ) * scale, a block per row; resid FP32, y FP16. With next (next_mode 1: as it is, 2: normalized with
+// next_w as rms_norm_kernel does, element i a thread's in ascending order) the new row also as FP16
 __global__ void add_normed_kernel( float* __restrict__ resid, const half* __restrict__ y, const half* __restrict__ weight, int hidden_size,
-	float eps, float constant_bias, float scale ) {
+	float eps, float constant_bias, float scale, half* __restrict__ next, const half* __restrict__ next_w, int next_mode ) {
 	const half* row_y = y + static_cast<int64_t>( blockIdx.x ) * hidden_size;
 	float* row_r = resid + static_cast<int64_t>( blockIdx.x ) * hidden_size;
 	float local_sq = 0.0f;
@@ -282,9 +283,21 @@ __global__ void add_normed_kernel( float* __restrict__ resid, const half* __rest
 		local_sq = fmaf( v, v, local_sq );
 	}
 	const float inv_rms = rsqrtf( engine::math::block_sum<8>( local_sq ) / static_cast<float>( hidden_size ) + eps );
+	float next_sq = 0.0f;
 	for ( int i = threadIdx.x; i < hidden_size; i += blockDim.x ) {
 		const float w = weight != nullptr ? __half2float( weight[i] ) + constant_bias : 1.0f;
-		row_r[i] = ( row_r[i] + __half2float( row_y[i] ) * inv_rms * w ) * scale;
+		const float r = ( row_r[i] + __half2float( row_y[i] ) * inv_rms * w ) * scale;
+		row_r[i] = r;
+		if ( next_mode == 1 ) next[static_cast<int64_t>( blockIdx.x ) * hidden_size + i] = __float2half_rn( r );
+		next_sq = fmaf( r, r, next_sq );
+	}
+	if ( next_mode != 2 ) return;
+	__syncthreads();   // block_sum's shared totals, read by every thread above
+	const float next_inv = rsqrtf( engine::math::block_sum<8>( next_sq ) / static_cast<float>( hidden_size ) + eps );
+	half* row_n = next + static_cast<int64_t>( blockIdx.x ) * hidden_size;
+	for ( int i = threadIdx.x; i < hidden_size; i += blockDim.x ) {
+		const float w = next_w != nullptr ? __half2float( next_w[i] ) + constant_bias : 1.0f;
+		row_n[i] = __float2half_rn( row_r[i] * w * next_inv );
 	}
 }
 
@@ -323,11 +336,13 @@ void Elementwise::ple_mix( const pod::TensorView& proj, const pod::TensorView& t
 }
 
 void Elementwise::add_normed( pod::TensorView& resid, const pod::TensorView& y, const pod::TensorView& weight, float eps, float constant_bias,
-	float scale, cudaStream_t stream ) {
+	float scale, cudaStream_t stream, pod::TensorView* next, const pod::TensorView* next_weight ) {
 	ENGINE_ASSERT( resid.dtype == pod::DType::FP32 && y.dtype == pod::DType::FP16, "Elementwise::add_normed: FP32 residual, FP16 input" );
 	const int hidden_size = y.shape[y.ndim - 1];
 	const int rows = static_cast<int>( y.numel() / hidden_size );
-	add_normed_kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>( resid.ptr<float>(), y.ptr<const half>(), weight.ptr<const half>(), hidden_size, eps, constant_bias, scale );
+	const int next_mode = next == nullptr ? 0 : ( next_weight == nullptr ? 1 : 2 );
+	add_normed_kernel<<<dim3( rows ), dim3( 256 ), 0, stream>>>( resid.ptr<float>(), y.ptr<const half>(), weight.ptr<const half>(), hidden_size, eps, constant_bias, scale,
+		next != nullptr ? next->ptr<half>() : nullptr, next_weight != nullptr ? next_weight->ptr<const half>() : nullptr, next_mode );
 }
 
 void Elementwise::scale_to_f32( const pod::TensorView& x, pod::TensorView& out, float scale, cudaStream_t stream ) {

@@ -44,6 +44,8 @@ struct Elementwise {
 
 	// resid = ( resid + rms_norm( y ) * ( weight + constant_bias ) ) * scale, row by row: a post-norm sublayer added to an FP32
 	// residual stream, then a per-layer scalar (Gemma 4's sandwich norms and layer_scalar). An empty weight is an unweighted norm.
+	// With next: the new resid rows also into next (FP16), normalized as RMSNorm::forward does with *next_weight (the next sublayer's norm,
+	// the same bits), or as they are without next_weight
 	static void add_normed(
 		pod::TensorView& resid,
 		const pod::TensorView& y,
@@ -51,7 +53,9 @@ struct Elementwise {
 		float eps,
 		float constant_bias,
 		float scale,
-		backend::stream_t stream = nullptr
+		backend::stream_t stream = nullptr,
+		pod::TensorView* next = nullptr,
+		const pod::TensorView* next_weight = nullptr
 	);
 
 	// out = x * scale, FP16 in, FP32 out (an embedding into an FP32 residual stream)

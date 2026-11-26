@@ -25,6 +25,10 @@ vk::Pipeline* kernel( const char* name, uint32_t push_bytes );
 // Device scratch buffer of at least `bytes` for slot `slot`; grows by reallocation (syncs `stream` first: recorded commands may reference the old buffer)
 void* scratch( int slot, size_t bytes, stream_t stream );
 
+// out [m, n] = x [m, k] times the FP16 weights w [n, k] on llama.cpp's FP16 mat-vec (up to 8 rows, a row's sum whatever the row count) or
+// matmul (k a multiple of 128), mod_gguf.cpp; false where neither applies (no bound pipelines, operands not 16-byte aligned, k not a multiple of 8)
+bool ggml_f16_linear( const void* w, const void* x, void* out, int m, int n, int k, stream_t stream );
+
 template<typename P>
 inline void launch( const char* name, const P& p, stream_t s, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1 ) {
 	static_assert( sizeof( P ) <= 256, "push-constant block exceeds the 256-byte limit" );
@@ -40,7 +44,7 @@ struct SwigluFusedParams { uint64_t gate_up, out_; int inter_dim, total; float l
 struct EmbedParams { uint64_t table, token_ids, out_; int hidden_size, rows; };
 struct RopeParams { uint64_t q, k, pos; int num_q_heads, num_kv_heads, head_dim, rot_dim, interleaved; float freq_base; int rot_pairs; };
 struct NormF32Params { uint64_t src, dst, weight; int hidden_size, has_weight; float eps, bias; };
-struct AddNormedParams { uint64_t resid, y, weight; int hidden_size, has_weight; float eps, bias, scale; };
+struct AddNormedParams { uint64_t resid, y, weight; int hidden_size, has_weight; float eps, bias, scale; uint64_t next, next_weight; int next_mode, has_next_weight; };
 struct PleMixParams { uint64_t proj, tok, weight, out_; int rows, layers, dim; float eps, tok_scale, out_scale; };
 struct ScaleF32Params { uint64_t x, out_; int n; float scale; };
 struct SoftcapParams { uint64_t x; int n; float cap; };
@@ -69,7 +73,7 @@ struct RefReconParams { uint64_t codes, out_; int k_dim, n_dim, bits, cb, volta;
 struct RefHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };
 struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq, window, ring; uint64_t key_end, bidir; };
 struct FaParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq, window, ring; uint64_t key_end, bidir;
-	int rows, group_rows, splits, bc, direct; uint64_t part; };
+	int rows, group_rows, splits, bc, direct; uint64_t part; int parts; };
 struct FaReduceParams { uint64_t part, gate, out_; int rows, num_q_heads, head_dim, splits, has_gate, vq; };
 struct RefUnpackParams { uint64_t qg, q, gate; int total, head_dim; };
 } // namespace engine::backend::impl

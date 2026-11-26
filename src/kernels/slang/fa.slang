@@ -41,6 +41,7 @@ struct FaParams {
 	int bc;           // keys per tile: 16 or 32
 	int direct;       // one split: the output itself (normalized, gated when has_gate); else the split's share into part
 	float* part;      // [split][rows][num_q_heads][head_dim] (the output unnormalized), then [split][rows][num_q_heads][2] (the running max and sum)
+	int parts;        // fa_decode: workgroups per row group (grid x = groups * parts), each a run of at most its RM query vectors
 };
 
 static const int FA_THREADS = 128;
@@ -68,6 +69,11 @@ half2 fa_pack(float a, float b) {
 	return half2(half(a), half(b));
 }
 
+// The 8 halves at element e (a multiple of 8) as one 16-byte load: a plain uint4 pointer load is only 4-byte aligned in the SPIR-V
+uint4 fa_ld16(half* base, int64_t e) {
+	return loadAligned<16>((uint4*)(base + e));
+}
+
 // Keys kt .. kt + nk - 1 of the K (is_k) or V cache into the pool at `at`, a row of head_dim / 2 words per key, rows head_dim / 2 + 1 apart,
 // zeros past nk. FP16: 16-byte loads, four in flight per thread before their stores; a quantized format through kv_load
 void fa_stage(FaParams p, bool is_k, int at, int kt, int nk, int64_t base, int row_elems, int t) {
@@ -88,7 +94,7 @@ void fa_stage(FaParams p, bool is_k, int at, int kt, int nk, int64_t base, int r
 				if (i < nvec && key < nk) {
 					let ps = kt + key;
 					let off = base + int64_t(p.ring > 0 ? ps % p.ring : ps) * row_elems + (i % vpr) * 8;
-					buf[u] = ((uint4*)src)[off / 8];
+					buf[u] = fa_ld16(src, off);
 				}
 			}
 			[ForceUnroll]
@@ -295,6 +301,230 @@ void fa_attn(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform FaPar
 	}
 }
 
+// fa_decode: fa_attn's grid, partials and output for an FP16 cache and few query vectors (a decode or a short verify), with no tiles: a lane
+// holds 8 * NV dimensions of each of the workgroup's query vectors (vectors v0 .. v0 + R - 1 of its row group, R <= RM; head_dim 256 * NV) and
+// of their accumulators; each warp streams its share of the split's keys from the cache, 4 / NV at a time (their K and V rows loaded together,
+// 16 bytes a lane per 256 dimensions), every key's dot products summed across the warp (half2 products in FP16 per lane, the lanes in FP32), the
+// softmax the running one per vector; the four warps' maxima, sums and accumulators are merged in shared memory at the end. A split without
+// keys writes only its (empty) sum.
+groupshared float s_wm[4 * 8];
+groupshared float s_wl[4 * 8];
+
+void fa_decode_body<let NV : int, let RM : int>(uint3 gid, int t, FaParams p) {
+	static const int DC = 4 / NV;   // keys per warp step
+	let lane = t & 31;
+	let warp = t >> 5;
+	let kv_head = int(gid.y);
+	let split = int(gid.z);
+	let G = p.num_q_heads / p.num_kv_heads;
+	let grp = int(gid.x) / p.parts;
+	let v0 = (int(gid.x) % p.parts) * RM;
+	let r0 = grp * p.group_rows;
+	let nr = min(p.group_rows, p.rows - r0);
+	let R = min(RM, nr * G - v0);
+	let hd = p.head_dim;
+	let row_elems = p.num_kv_heads * hd;
+	let q_all = int64_t(p.rows) * p.num_q_heads;
+
+	// each row's key range, and the group's
+	if (t < nr) {
+		let r = r0 + t;
+		let ps = p.pos[r];
+		let end = (p.window > 0 && p.bidir != nullptr && p.bidir[0] != 0) ? p.key_end[r] : ps + 1;
+		s_end[t] = p.ring > 0 ? end : min(end, p.max_seq);
+		s_first[t] = p.window > 0 ? max(0, ps + 1 - p.window) : 0;
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (t == 0) {
+		int lo = s_first[0];
+		int hi = s_end[0];
+		for (int i = 1; i < nr; ++i) {
+			lo = min(lo, s_first[i]);
+			hi = max(hi, s_end[i]);
+		}
+		let share = ((hi - lo + p.splits - 1) / p.splits + 4 * DC - 1) / (4 * DC) * (4 * DC);
+		let k_lo = lo + split * share;
+		s_range[0] = k_lo;
+		s_range[1] = min(hi, k_lo + share);
+	}
+	GroupMemoryBarrierWithGroupSync();
+	let k_lo = s_range[0];
+	let k_hi = s_range[1];
+	if (k_lo >= k_hi) {
+		// no keys: an empty sum (fa_reduce skips the split)
+		if (p.direct == 0 && t < R) {
+			let qv = v0 + t;
+			let oo = int64_t(r0 + qv / G) * p.num_q_heads + kv_head * G + qv % G;
+			let po = int64_t(p.splits) * q_all * hd + (int64_t(split) * q_all + oo) * 2;
+			p.part[po] = -1e30f;
+			p.part[po + 1] = 0.0f;
+		}
+		return;
+	}
+	let base = int64_t(p.slots[r0]) * p.slot_stride + int64_t(p.layer_idx) * p.max_seq * row_elems + kv_head * hd;
+
+	// the lane's dimensions of the query vectors, scaled: d = 256 u + 8 lane + j
+	half2 q[RM][4 * NV];
+	int first[RM], end[RM];
+	[ForceUnroll]
+	for (int a = 0; a < RM; ++a) {
+		let qv = v0 + min(a, R - 1);
+		first[a] = s_first[qv / G];
+		end[a] = s_end[qv / G];
+		let qo = (int64_t(r0 + qv / G) * p.num_q_heads + kv_head * G + qv % G) * hd;
+		[ForceUnroll]
+		for (int u = 0; u < NV; ++u) {
+			let w = fa_ld16(p.q, qo + u * 256 + lane * 8);
+			let x = uint4(w.x, w.y, w.z, w.w);
+			[ForceUnroll]
+			for (int c = 0; c < 4; ++c) {
+				let h = bit_cast<half2>(x[c]);
+				q[a][u * 4 + c] = fa_pack(float(h.x) * p.scale, float(h.y) * p.scale);
+			}
+		}
+	}
+	float m[RM], l[RM], o[RM][8 * NV];
+	[ForceUnroll]
+	for (int a = 0; a < RM; ++a) {
+		m[a] = -1e30f;
+		l[a] = 0.0f;
+		[ForceUnroll]
+		for (int d = 0; d < 8 * NV; ++d) o[a][d] = 0.0f;
+	}
+
+	// the warp's keys: steps of DC keys, the warps taking turns
+	for (int kc = k_lo + warp * DC; kc < k_hi; kc += 4 * DC) {
+		uint4 kr[DC][NV], vr[DC][NV];
+		[ForceUnroll]
+		for (int c = 0; c < DC; ++c) {
+			let ps = kc + c;
+			let off = base + int64_t(p.ring > 0 ? ps % p.ring : ps) * row_elems + lane * 8;
+			[ForceUnroll]
+			for (int u = 0; u < NV; ++u) {
+				kr[c][u] = ps < k_hi ? fa_ld16(p.k, off + u * 256) : uint4(0u, 0u, 0u, 0u);
+				vr[c][u] = ps < k_hi ? fa_ld16(p.v, off + u * 256) : uint4(0u, 0u, 0u, 0u);
+			}
+		}
+		[ForceUnroll]
+		for (int a = 0; a < RM; ++a) {
+			if (a < R) {
+				float s[DC];
+				float mx = m[a];
+				[ForceUnroll]
+				for (int c = 0; c < DC; ++c) {
+					half2 acc = half2(half(0.0f), half(0.0f));
+					[ForceUnroll]
+					for (int u = 0; u < NV; ++u) {
+						let x = uint4(kr[c][u].x, kr[c][u].y, kr[c][u].z, kr[c][u].w);
+						[ForceUnroll]
+						for (int w = 0; w < 4; ++w) acc += q[a][u * 4 + w] * bit_cast<half2>(x[w]);
+					}
+					let ps = kc + c;
+					let dot = WaveActiveSum(float(acc.x) + float(acc.y));
+					s[c] = (ps < k_hi && ps >= first[a] && ps < end[a]) ? dot : -1e30f;
+					mx = max(mx, s[c]);
+				}
+				let alpha = exp(m[a] - mx);
+				float pc[DC];
+				float sum = 0.0f;
+				[ForceUnroll]
+				for (int c = 0; c < DC; ++c) {
+					pc[c] = s[c] > -1e29f ? exp(s[c] - mx) : 0.0f;
+					sum += pc[c];
+				}
+				l[a] = l[a] * alpha + sum;
+				m[a] = mx;
+				[ForceUnroll]
+				for (int u = 0; u < NV; ++u) {
+					[ForceUnroll]
+					for (int w = 0; w < 4; ++w) {
+						float a0 = o[a][u * 8 + 2 * w] * alpha;
+						float a1 = o[a][u * 8 + 2 * w + 1] * alpha;
+						[ForceUnroll]
+						for (int c = 0; c < DC; ++c) {
+							let x = uint4(vr[c][u].x, vr[c][u].y, vr[c][u].z, vr[c][u].w);
+							let h = bit_cast<half2>(x[w]);
+							a0 = fma(pc[c], float(h.x), a0);
+							a1 = fma(pc[c], float(h.y), a1);
+						}
+						o[a][u * 8 + 2 * w] = a0;
+						o[a][u * 8 + 2 * w + 1] = a1;
+					}
+				}
+			}
+		}
+	}
+
+	// the warps merged: their maxima and sums, then each warp's accumulators scaled to the common maximum (as float bits in the pool)
+	if (lane == 0) {
+		[ForceUnroll]
+		for (int a = 0; a < RM; ++a) {
+			if (a < R) {
+				s_wm[warp * 8 + a] = m[a];
+				s_wl[warp * 8 + a] = l[a];
+			}
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+	[ForceUnroll]
+	for (int a = 0; a < RM; ++a) {
+		if (a < R) {
+			float M = s_wm[a];
+			[ForceUnroll]
+			for (int w = 1; w < 4; ++w) M = max(M, s_wm[w * 8 + a]);
+			let f = m[a] > -1e29f ? exp(m[a] - M) : 0.0f;
+			[ForceUnroll]
+			for (int u = 0; u < NV; ++u) {
+				[ForceUnroll]
+				for (int j = 0; j < 8; ++j) s_pool[(warp * RM + a) * hd + u * 256 + lane * 8 + j] = bit_cast<half2>(o[a][u * 8 + j] * f);
+			}
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+	for (int i = t; i < R * hd; i += FA_THREADS) {
+		let a = i / hd;
+		let d = i % hd;
+		float M = s_wm[a];
+		[ForceUnroll]
+		for (int w = 1; w < 4; ++w) M = max(M, s_wm[w * 8 + a]);
+		float L = 0.0f;
+		float val = 0.0f;
+		[ForceUnroll]
+		for (int w = 0; w < 4; ++w) {
+			let mw = s_wm[w * 8 + a];
+			L += s_wl[w * 8 + a] > 0.0f ? s_wl[w * 8 + a] * exp(mw - M) : 0.0f;
+			val += bit_cast<float>(s_pool[(w * RM + a) * hd + d]);
+		}
+		let qv = v0 + a;
+		let oo = int64_t(r0 + qv / G) * p.num_q_heads + kv_head * G + qv % G;
+		if (p.direct != 0) {
+			let gi = oo * hd + d;
+			let g = p.has_gate != 0 ? 1.0f / (1.0f + exp(-float(p.gate[gi]))) : 1.0f;
+			p.out_[gi] = half((L > 0.0f ? val / L : 0.0f) * g);
+		}
+		else {
+			p.part[(int64_t(split) * q_all + oo) * hd + d] = val;
+			if (d == 0) {
+				let po = int64_t(p.splits) * q_all * hd + (int64_t(split) * q_all + oo) * 2;
+				p.part[po] = M;
+				p.part[po + 1] = L;
+			}
+		}
+	}
+}
+
+[shader("compute")]
+[numthreads(128, 1, 1)]
+void fa_decode_256(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform FaParams p) {
+	fa_decode_body<1, 8>(gid, int(tid.x), p);
+}
+
+[shader("compute")]
+[numthreads(128, 1, 1)]
+void fa_decode_512(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform FaParams p) {
+	fa_decode_body<2, 4>(gid, int(tid.x), p);
+}
+
 // The splits of fa_attn combined: a workgroup of 128 per (row, query head), out = sum_s e^(m_s - M) o_s / sum_s e^(m_s - M) l_s, then the Q4
 // values' inverse Walsh-Hadamard rotation per 64 and the gate
 struct FaReduceParams {
@@ -311,7 +541,7 @@ struct FaReduceParams {
 
 groupshared float s_o[512];
 groupshared float s_w[64];
-groupshared float s_sl[64];
+groupshared float s_sg[8];   // the four subgroups' maxima, then their weighted sums
 groupshared float s_inv;
 
 [shader("compute")]
@@ -322,22 +552,24 @@ void fa_reduce(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform FaR
 	let hd = p.head_dim;
 	let q_all = int64_t(p.rows) * p.num_q_heads;
 	let stride = q_all * hd;
-	// every split's running max and sum at once (a thread each), then the weights
-	if (t < 64) {
+	// every split's running max and sum at once (a thread each, at most 64 splits), their maximum and the weights' sum over the subgroups
+	float ms = -1e30f, ls = 0.0f;
+	if (t < p.splits) {
 		let at = int64_t(p.splits) * stride + ( int64_t(t) * q_all + oo ) * 2;
-		s_w[t] = t < p.splits ? p.part[at] : -1e30f;
-		s_sl[t] = t < p.splits ? p.part[at + 1] : 0.0f;
+		ms = p.part[at];
+		ls = p.part[at + 1];
 	}
+	let wmax = WaveActiveMax(ls > 0.0f ? ms : -1e30f);
+	if ((t & 31) == 0) s_sg[t >> 5] = wmax;
+	GroupMemoryBarrierWithGroupSync();
+	let mx = max(max(s_sg[0], s_sg[1]), max(s_sg[2], s_sg[3]));
+	let w = ls > 0.0f ? exp(ms - mx) : 0.0f;
+	if (t < 64) s_w[t] = w;
+	let wsum = WaveActiveSum(w * ls);
+	if ((t & 31) == 0) s_sg[4 + (t >> 5)] = wsum;
 	GroupMemoryBarrierWithGroupSync();
 	if (t == 0) {
-		float mx = -1e30f;
-		for (int s = 0; s < p.splits; ++s) if (s_sl[s] > 0.0f) mx = max(mx, s_w[s]);
-		float l = 0.0f;
-		for (int s = 0; s < p.splits; ++s) {
-			let w = s_sl[s] > 0.0f ? exp(s_w[s] - mx) : 0.0f;
-			s_w[s] = w;
-			l += w * s_sl[s];
-		}
+		let l = (s_sg[4] + s_sg[5]) + (s_sg[6] + s_sg[7]);
 		s_inv = l > 0.0f ? 1.0f / l : 0.0f;
 	}
 	GroupMemoryBarrierWithGroupSync();
@@ -350,7 +582,7 @@ void fa_reduce(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform FaR
 			[ForceUnroll]
 			for (int u = 0; u < 4; ++u) {
 				let s = s0 + u;
-				v[u] = (s < p.splits && s_w[s] > 0.0f) ? ((float4*)p.part)[(s * stride + oo * hd + d4) / 4] : float4(0.0f, 0.0f, 0.0f, 0.0f);
+				v[u] = (s < p.splits && s_w[s] > 0.0f) ? loadAligned<16>((float4*)(p.part + s * stride + oo * hd + d4)) : float4(0.0f, 0.0f, 0.0f, 0.0f);
 			}
 			[ForceUnroll]
 			for (int u = 0; u < 4; ++u) {

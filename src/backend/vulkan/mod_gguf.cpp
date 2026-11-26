@@ -106,7 +106,7 @@ constexpr int kMmvMaxRows = 8;
 int mmv_rows( GgmlType t ) {
 	switch ( t ) {
 		case GgmlType::Q8_0: return 1;
-		case GgmlType::Q4_0: case GgmlType::Q4_1: case GgmlType::Q5_0: case GgmlType::Q5_1:
+		case GgmlType::F16: case GgmlType::Q4_0: case GgmlType::Q4_1: case GgmlType::Q5_0: case GgmlType::Q5_1:
 		case GgmlType::Q2_K: case GgmlType::Q3_K: case GgmlType::Q4_K: case GgmlType::Q5_K: case GgmlType::Q6_K: return 2;
 		default: return 4;
 	}
@@ -165,11 +165,11 @@ backend::vk::Pipeline* mmq_pipeline( GgmlType type, bool large ) {
 	return p;
 }
 
-// llama.cpp's matmul with the weight dequantized as it loads (mul_mm.comp, one SPIR-V per lookup-table type without an int8 matmul): the
-// same tiles as the int8 one (the quant BK of 32) and ALIGNED (vector loads; k a multiple of the tile's 64 / 128)
+// llama.cpp's matmul with the weight dequantized as it loads (mul_mm.comp, one SPIR-V per lookup-table type without an int8 matmul, and
+// FP16 weights): the same tiles as the int8 one (the quant BK of 32) and ALIGNED (vector loads; k a multiple of the tile's 64 / 128)
 bool mm_type( GgmlType t ) {
 	switch ( t ) {
-		case GgmlType::IQ2_XXS: case GgmlType::IQ2_XS: case GgmlType::IQ3_XXS: case GgmlType::IQ1_S: case GgmlType::IQ4_NL: case GgmlType::IQ2_S:
+		case GgmlType::F16: case GgmlType::IQ2_XXS: case GgmlType::IQ2_XS: case GgmlType::IQ3_XXS: case GgmlType::IQ1_S: case GgmlType::IQ4_NL: case GgmlType::IQ2_S:
 		case GgmlType::IQ1_M: return true;
 		default: return false;
 	}
@@ -488,3 +488,33 @@ bool moe_gguf_device( const pod::TensorView& x, const pod::MoELayerWeights& w, c
 }
 
 } // namespace engine::modules
+
+namespace engine::backend::impl {
+
+bool ggml_f16_linear( const void* w, const void* x, void* out, int m, int n, int k, stream_t stream ) {
+	using namespace ::engine::modules;
+	auto aligned = []( const void* p ) { return reinterpret_cast<uintptr_t>( p ) % 16 == 0; };
+	if ( k % 8 != 0 || !aligned( w ) || !aligned( x ) || !aligned( out ) ) return false;
+	const uint32_t uk = static_cast<uint32_t>( k ), un = static_cast<uint32_t>( n ), um = static_cast<uint32_t>( m );
+	if ( m <= kMmvMaxRows ) {
+		vk::Pipeline* mmv = mmv_pipeline( GgmlType::F16, m );
+		if ( mmv == nullptr ) return false;
+		MmvParams mp{ uk, uk, uk, un, uk * un, uk, un, 0u, 0u, 1u, 1u, 1u, 1u };
+		const void* bufs[5] = { w, x, out, out, out };
+		const uint32_t groups = ( un + mmv_rows( GgmlType::F16 ) - 1 ) / mmv_rows( GgmlType::F16 );
+		const uint32_t gx = std::min<uint32_t>( groups, 65535u ), gz = ( groups + gx - 1 ) / gx;
+		vk::dispatch_bound( stream, mmv, &mp, bufs, gx, 1, gz );
+		return true;
+	}
+	if ( k % 128 != 0 ) return false;
+	const bool large = m >= 128;
+	vk::Pipeline* mm = mm_pipeline( GgmlType::F16, large );
+	if ( mm == nullptr ) return false;
+	MmqParams mp{ un, um, uk, uk, uk, un, un * uk, um * uk, um * un, 0u, 1u, uk, 1u, 1u, 1u, 1u };
+	const void* bufs[3] = { w, x, out };
+	const MmqTile tile = mmq_tile( GgmlType::F16, large );
+	vk::dispatch_bound( stream, mm, &mp, bufs, ( un + tile.spec[1] - 1 ) / tile.spec[1], ( um + tile.spec[2] - 1 ) / tile.spec[2], 1 );
+	return true;
+}
+
+} // namespace engine::backend::impl

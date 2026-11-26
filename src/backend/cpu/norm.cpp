@@ -47,11 +47,12 @@ void Elementwise::add_residual( pod::TensorView& hidden, const pod::TensorView& 
 }
 
 void Elementwise::add_normed( pod::TensorView& resid, const pod::TensorView& y, const pod::TensorView& weight, float eps, float constant_bias,
-	float scale, backend::stream_t ) {
+	float scale, backend::stream_t, pod::TensorView* next, const pod::TensorView* next_weight ) {
 	ENGINE_ASSERT( resid.dtype == pod::DType::FP32 && y.dtype == pod::DType::FP16, "Elementwise::add_normed: FP32 residual, FP16 input" );
 	const int hidden_size = y.shape[y.ndim - 1];
 	AddNormedParams p{ resid.ptr<float>(), const_cast<half*>( y.ptr<const half>() ), const_cast<half*>( weight.ptr<const half>() ), hidden_size, weight.data != nullptr,
-		eps, constant_bias, scale };
+		eps, constant_bias, scale, next != nullptr ? next->ptr<half>() : nullptr, next_weight != nullptr ? const_cast<half*>( next_weight->ptr<const half>() ) : nullptr,
+		next == nullptr ? 0 : ( next_weight == nullptr ? 1 : 2 ), next_weight != nullptr && next_weight->data != nullptr };
 	impl::cpu_dispatch( ::add_normed, &p, static_cast<uint32_t>( y.numel() / hidden_size ) );
 }
 

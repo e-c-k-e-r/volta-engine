@@ -35,6 +35,10 @@ inline void stream_join( stream_t, stream_t ) {}
 // Cross-device ordering (the CUDA one waits on the device): here the side stream is drained from the host
 inline void stream_wait_peer( stream_t, stream_t side, int ) { stream_sync( side ); }
 inline void device_sync() {}
+// A run of independent ops (see the CUDA header): the calling thread runs them one after the other
+inline void concurrent_begin( stream_t ) {}
+inline void concurrent_next( stream_t ) {}
+inline void concurrent_end( stream_t ) {}
 
 inline void memcpy_async( void* dst, const void* src, size_t bytes, Copy, stream_t ) { if ( bytes ) std::memmove( dst, src, bytes ); }
 inline void memcpy2d_async( void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, Copy, stream_t ) {

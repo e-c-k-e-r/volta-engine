@@ -76,7 +76,8 @@ void reference( const pod::KVRef& kv, const pod::TensorView& q, const pod::Tenso
 // them; else a row each. A group's keys go to `splits` workgroups (the kernel shares out the range it finds, so a decode graph replays at any
 // length), as many as keep about kTargetGroups busy within what the range can reach: the window (plus a chunk and an image), the prefill's
 // key_hint, or max_seq. The splits' partials take a fixed scratch, sized once (a captured forward must never see it move), which also bounds
-// their number
+// their number. A decode or short verify on an FP16 cache with head_dim 256 or 512 takes fa_decode instead: a group is every row of the call
+// (one_slot) or one row, its query vectors over `parts` workgroups of at most kDecodeVectors, when two of those hold them
 constexpr int kFaPoolWords = 10496, kTargetGroups = 160, kMaxSplits = 64;
 constexpr size_t kFaScratch = size_t( 16 ) << 20;
 
@@ -88,18 +89,23 @@ void tiled( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorVie
 	ENGINE_ASSERT( kv.vq != pod::KVQ::Q4 || head_dim % 64 == 0, "Attention (Vulkan): Q4 values need head_dim % 64 == 0" );
 	const int G = num_q_heads / num_kv_heads;
 	ENGINE_ASSERT( G <= 16, "Attention (Vulkan): at most 16 query heads per KV head" );
-	const int group_rows = one_slot ? std::max( 1, 16 / G ) : 1;
+	const int kDecodeVectors = head_dim == 256 ? 8 : 4;
+	const int decode_rows = one_slot ? count : 1;
+	const bool decode = kv.kq == pod::KVQ::F16 && kv.vq == pod::KVQ::F16 && ( head_dim == 256 || head_dim == 512 ) && decode_rows * G <= 2 * kDecodeVectors;
+	const int group_rows = decode ? decode_rows : one_slot ? std::max( 1, 16 / G ) : 1;
 	const int groups = ( count + group_rows - 1 ) / group_rows;
+	const int parts = decode ? ( group_rows * G + kDecodeVectors - 1 ) / kDecodeVectors : 1;
 	const int R = std::min( group_rows, count ) * G, hw = head_dim / 2;
-	const int bc = R * hw + 32 * ( hw + 1 ) <= kFaPoolWords ? 32 : 16;
+	// keys per tile (fa_attn), per share of a split (fa_decode: four warps' steps of 4 keys)
+	const int bc = decode ? 16 : R * hw + 32 * ( hw + 1 ) <= kFaPoolWords ? 32 : 16;
 	// the keys a group can span
 	const int rows_span = one_slot ? group_rows : 1;
 	int span = window > 0 ? window + rows_span + pod::MAX_ROWS : max_seq;
 	if ( key_hint > 0 ) span = std::min( span, key_hint );   // positions below it (an image never crosses a chunk)
 	if ( kv.ring == 0 ) span = std::min( span, max_seq );
 	const size_t per_split = static_cast<size_t>( count ) * num_q_heads * ( head_dim + 2 ) * sizeof( float );   // the output and its max and sum
-	int splits = std::min( { kMaxSplits, ( kTargetGroups + groups * num_kv_heads - 1 ) / ( groups * num_kv_heads ), ( span + bc - 1 ) / bc,
-		static_cast<int>( kFaScratch / per_split ) } );
+	const int blocks = groups * parts * num_kv_heads;
+	int splits = std::min( { kMaxSplits, ( kTargetGroups + blocks - 1 ) / blocks, ( span + bc - 1 ) / bc, static_cast<int>( kFaScratch / per_split ) } );
 	splits = std::max( splits, 1 );
 	const bool q4 = kv.vq == pod::KVQ::Q4;
 	const bool direct = splits == 1;
@@ -108,8 +114,9 @@ void tiled( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorVie
 	vki::FaParams p{ vki::dp( q.data ), vki::dp( kv.k ), vki::dp( kv.v ), vki::dp( gate.data ), vki::dp( out.data ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ),
 		static_cast<int64_t>( slot_stride ), layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate && !( direct && q4 ) ? 1 : 0,
 		scale > 0.0f ? scale : 1.0f / std::sqrt( static_cast<float>( head_dim ) ), vki::dp( kv.ks ), vki::dp( kv.vs ), static_cast<int>( kv.kq ), static_cast<int>( kv.vq ),
-		window, kv.ring, vki::rows_key_end( d_rows ), vki::rows_bidir( d_rows ), count, group_rows, splits, bc, direct ? 1 : 0, vki::dp( part ) };
-	vki::launch( "fa_attn", p, stream, static_cast<uint32_t>( groups ), static_cast<uint32_t>( num_kv_heads ), static_cast<uint32_t>( splits ) );
+		window, kv.ring, vki::rows_key_end( d_rows ), vki::rows_bidir( d_rows ), count, group_rows, splits, bc, direct ? 1 : 0, vki::dp( part ), parts };
+	const char* kernel = !decode ? "fa_attn" : head_dim == 256 ? "fa_decode_256" : "fa_decode_512";
+	vki::launch( kernel, p, stream, static_cast<uint32_t>( groups * parts ), static_cast<uint32_t>( num_kv_heads ), static_cast<uint32_t>( splits ) );
 	vki::FaReduceParams r{ vki::dp( part ), vki::dp( gate.data ), vki::dp( out.data ), count, num_q_heads, head_dim, splits, has_gate ? 1 : 0, static_cast<int>( kv.vq ) };
 	if ( !direct ) vki::launch( "fa_reduce", r, stream, static_cast<uint32_t>( num_q_heads ), static_cast<uint32_t>( count ) );
 	else if ( q4 ) vki::launch( "fa_finish", r, stream, static_cast<uint32_t>( num_q_heads ), static_cast<uint32_t>( count ) );

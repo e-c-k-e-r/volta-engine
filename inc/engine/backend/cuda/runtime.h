@@ -46,6 +46,12 @@ inline void stream_wait_peer( stream_t main, stream_t side, int side_dev ) {
 	ENGINE_CHECK( cudaStreamWaitEvent( main, events[side_dev], 0 ) );
 }
 inline void device_sync() { ENGINE_CHECK( cudaDeviceSynchronize() ); }
+// A run of independent ops on one stream: between concurrent_begin and concurrent_end, concurrent_next ends an op that the next op of the
+// run does not read (nor write what it reads), so a backend that orders every command after the previous one may overlap the two (Vulkan
+// leaves out the barrier between them). An op's own commands stay ordered. No-ops here: a stream runs its kernels in order
+inline void concurrent_begin( stream_t ) {}
+inline void concurrent_next( stream_t ) {}
+inline void concurrent_end( stream_t ) {}
 
 inline void memcpy_async( void* dst, const void* src, size_t bytes, Copy dir, stream_t s ) {
 	ENGINE_CHECK( cudaMemcpyAsync( dst, src, bytes, copy_kind( dir ), s ) );

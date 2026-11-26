@@ -157,12 +157,11 @@ void CollectiveRing::all_reduce_gated_norm( pod::TensorView& y, float* streams, 
 	modules::GatedResidual::norm( streams, norm_w, normed, nullptr, nullptr, rows, hidden, hc, eps, nullptr, nullptr, stream );
 }
 
-// The reduction, then the sandwich-norm add and the next norm as the module calls they are on the NVLink path's fused kernel
+// The reduction, then the sandwich-norm add with the next norm as the module call it is on the NVLink path's fused kernel
 void CollectiveRing::all_reduce_normed_add( pod::TensorView& y, pod::TensorView& resid, const pod::TensorView& w_post, float scale, const pod::TensorView* w_next,
 	pod::TensorView* out, float eps, float constant_bias, backend::stream_t stream ) {
 	all_reduce( y, stream );
-	modules::Elementwise::add_normed( resid, y, w_post, eps, constant_bias, scale, stream );
-	if ( w_next != nullptr ) modules::RMSNorm::forward( resid, *w_next, *out, eps, constant_bias, stream );
+	modules::Elementwise::add_normed( resid, y, w_post, eps, constant_bias, scale, stream, w_next != nullptr ? out : nullptr, w_next );
 }
 
 void init_4gpu_mesh( CollectiveRing rings[ENGINE_NUM_GPUS], void* staging_ptrs[ENGINE_NUM_GPUS], void* flag_ptrs[ENGINE_NUM_GPUS], size_t, int ranks ) {

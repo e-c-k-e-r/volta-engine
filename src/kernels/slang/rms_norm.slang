@@ -14,7 +14,8 @@ struct NormParams {
 };
 
 // An FP32 residual stream (Gemma 4): rms_norm_f32 normalizes FP32 rows into FP16; add_normed adds a normalized FP16 sublayer output to it and
-// scales the sum: resid = ( resid + rms_norm( y ) * w ) * scale
+// scales the sum: resid = ( resid + rms_norm( y ) * w ) * scale, and with next_mode the new rows into next as FP16 too (1: as they are, 2:
+// normalized as rms_norm_f32 does, with next_weight)
 struct NormF32Params {
 	float* src;
 	half* dst;
@@ -34,6 +35,10 @@ struct AddNormedParams {
 	float eps;
 	float bias;
 	float scale;
+	half* next;
+	half* next_weight;
+	int next_mode;
+	int has_next_weight;
 };
 
 // Gemma 4's per-layer inputs: proj and tok [rows, layers * dim] hold each row's layer slices; out [layers, rows, dim] =
@@ -158,9 +163,27 @@ void add_normed(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform Ad
 		GroupMemoryBarrierWithGroupSync();
 	}
 	let inv = inv_rms_from(s_red[0], p.hidden_size, p.eps);
+	half* row_n = p.next + int64_t(gid.x) * p.hidden_size;
+	float nsq = 0.0f;
 	for (int i = t; i < p.hidden_size; i += 256) {
 		let w = p.has_weight != 0 ? float(p.weight[i]) + p.bias : 1.0f;
-		row_r[i] = (row_r[i] + float(row_y[i]) * inv * w) * p.scale;
+		let r = (row_r[i] + float(row_y[i]) * inv * w) * p.scale;
+		row_r[i] = r;
+		if (p.next_mode == 1) row_n[i] = half(r);
+		nsq = fma(r, r, nsq);
+	}
+	if (p.next_mode != 2) return;
+	GroupMemoryBarrierWithGroupSync();   // every thread has read s_red[0]
+	s_red[t] = nsq;
+	GroupMemoryBarrierWithGroupSync();
+	for (int s = 128; s > 0; s >>= 1) {
+		if (t < s) s_red[t] += s_red[t + s];
+		GroupMemoryBarrierWithGroupSync();
+	}
+	let ninv = inv_rms_from(s_red[0], p.hidden_size, p.eps);
+	for (int i = t; i < p.hidden_size; i += 256) {
+		let w = p.has_next_weight != 0 ? float(p.next_weight[i]) + p.bias : 1.0f;
+		row_n[i] = half(row_r[i] * w * ninv);
 	}
 }
 
@@ -255,9 +278,20 @@ void add_normed(uint3 gid : SV_GroupID, uniform AddNormedParams p) {
 		sq = fma(v, v, sq);
 	}
 	let inv = inv_rms_from(sq, p.hidden_size, p.eps);
+	half* row_n = p.next + int64_t(gid.x) * p.hidden_size;
+	float nsq = 0.0f;
 	for (int i = 0; i < p.hidden_size; ++i) {
 		let w = p.has_weight != 0 ? float(p.weight[i]) + p.bias : 1.0f;
-		row_r[i] = (row_r[i] + float(row_y[i]) * inv * w) * p.scale;
+		let r = (row_r[i] + float(row_y[i]) * inv * w) * p.scale;
+		row_r[i] = r;
+		if (p.next_mode == 1) row_n[i] = half(r);
+		nsq = fma(r, r, nsq);
+	}
+	if (p.next_mode != 2) return;
+	let ninv = inv_rms_from(nsq, p.hidden_size, p.eps);
+	for (int i = 0; i < p.hidden_size; ++i) {
+		let w = p.has_next_weight != 0 ? float(p.next_weight[i]) + p.bias : 1.0f;
+		row_n[i] = half(row_r[i] * w * ninv);
 	}
 }
 

@@ -6,6 +6,7 @@ Rules
 - Include only `engine/backend/*.h` for device or vendor concepts. No `<cuda_*.h>`, `<cublas*>`, `cuda*` calls, `dim3`, or `<<<>>>` in host-only files.
 - Types: use the aliases from `types.h`: `backend::stream_t`, `backend::half_t`, `backend::bf16_t`, `backend::graph_t`, `backend::graph_exec_t`. Never spell `half`, `__half`, `__nv_bfloat16`, `cudaStream_t`.
 - Calls: use the inline forwards in `runtime.h` (device, stream, memcpy/memset, pinned memory, graph capture and replay). Copy direction is `backend::Copy`, pinned flavor is `backend::Pin`.
+- Independent ops: `concurrent_begin` / `concurrent_next` / `concurrent_end` bracket a run of module calls none of which reads what an earlier one of the run writes (q / k / v projections of one input, the head norms, gate and up). The Vulkan backend, which otherwise orders every command after the one before, leaves out the barrier at each `concurrent_next` (an op's own commands stay ordered, and two ops of a run that take a module scratch buffer are ordered); CUDA and CPU ignore them.
 - Scalar conversions on the host (weight conversion in loaders): `numeric.h` (`to_float`, `from_float_half`, `from_float_bf16`), round to nearest even.
 - Kernel launches stay in modules/spec/comm (`src/modules`, `src/spec`, `src/kernels`), never in host-only files.
 

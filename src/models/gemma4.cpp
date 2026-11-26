@@ -752,9 +752,10 @@ void Gemma4Pipeline::forward( const pod::BatchRows& rows, backend::stream_t stre
 // One decoder layer over the m rows of rows_ (resid_ in and out):
 //   x += post_attn_norm( attn( input_norm( x ) ) ); x += post_ffn_norm( mlp( pre_ffn_norm( x ) ) );
 //   [ x += post_ple_norm( ple_proj( gelu( ple_gate( x ) ) * the layer's per-layer input ) ) ]; x *= layer_scalar
-// With TP the reductions of the two sublayer outputs carry the sandwich-norm add and the next norm (all_reduce_normed_add): the attention one writes
-// the pre-FFN norm, the FFN one the next layer's input norm (next_norm, without per-layer inputs), so that layer starts from norm_hidden_
-// (input_normed). Returns whether the next input norm was written. A KV-sharing layer projects only its queries and attends with its source's K / V.
+// Each sandwich-norm add writes the next norm (with TP inside the reduction, all_reduce_normed_add): the attention one the pre-FFN norm, the
+// last one the next layer's input norm (next_norm), so that layer starts from norm_hidden_ (input_normed); with per-layer inputs the FFN one
+// writes the residual as FP16 for their gate. Returns whether the next input norm was written. A KV-sharing layer projects only its queries and
+// attends with its source's K / V.
 bool Gemma4Pipeline::layer_forward( const Gemma4LayerWeights& lw, int layer, int m, backend::stream_t stream, bool input_normed, const pod::TensorView* next_norm ) {
 	using namespace engine::modules;
 	const float eps = config_.rms_norm_eps;
@@ -770,18 +771,33 @@ bool Gemma4Pipeline::layer_forward( const Gemma4LayerWeights& lw, int layer, int
 	pod::TensorView k = pod::make_tensor_2d( k_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, kvh * hd );
 	pod::TensorView v = pod::make_tensor_2d( v_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, kvh * hd );
 	pod::TensorView o = pod::make_tensor_2d( attn_out_.ptr<backend::half_t>(), pod::DType::FP16, m, q_heads_ * hd );
+	// the projections, then the head norms, each a run of independent ops
+	const bool k_eq_v = lw.is_full && config_.full_k_eq_v;   // full layers with K = V take V from the raw K projection (attention_k_eq_v)
+	backend::concurrent_begin( stream );
 	Linear::forward( norm_hidden_, lw.q_proj, q, stream );
+	if ( !lw.shared_kv ) {
+		backend::concurrent_next( stream );
+		Linear::forward( norm_hidden_, lw.k_proj, k, stream );
+		if ( !k_eq_v ) {
+			backend::concurrent_next( stream );
+			Linear::forward( norm_hidden_, lw.v_proj, v, stream );
+		}
+	}
+	backend::concurrent_end( stream );
+	if ( !lw.shared_kv && k_eq_v ) backend::memcpy_async( v.data, k.data, k.size_bytes(), backend::Copy::D2D, stream );
+	backend::concurrent_begin( stream );
 	RMSNorm::forward_heads( q, lw.q_norm, q_heads_, hd, eps, 0.0f, stream );
+	if ( !lw.shared_kv ) {
+		backend::concurrent_next( stream );
+		RMSNorm::forward_heads( k, lw.k_norm, kvh, hd, eps, 0.0f, stream );
+		backend::concurrent_next( stream );
+		RMSNorm::forward_heads( v, pod::TensorView{}, kvh, hd, eps, 0.0f, stream );   // unweighted v_norm
+	}
+	backend::concurrent_end( stream );
 	const float theta = lw.is_full ? config_.full_rope_theta : config_.swa_rope_theta;
 	const int rot_pairs = lw.is_full ? config_.full_rot_pairs : 0;
 	if ( lw.shared_kv ) RoPE::forward( q, k, q_heads_, 0, hd, hd, rows_, m, theta, stream, false, rot_pairs );   // the queries only
 	else {
-		Linear::forward( norm_hidden_, lw.k_proj, k, stream );
-		// Full layers with K = V take V from the raw K projection (attention_k_eq_v)
-		if ( lw.is_full && config_.full_k_eq_v ) backend::memcpy_async( v.data, k.data, k.size_bytes(), backend::Copy::D2D, stream );
-		else Linear::forward( norm_hidden_, lw.v_proj, v, stream );
-		RMSNorm::forward_heads( k, lw.k_norm, kvh, hd, eps, 0.0f, stream );
-		RMSNorm::forward_heads( v, pod::TensorView{}, kvh, hd, eps, 0.0f, stream );   // unweighted v_norm
 		RoPE::forward( q, k, q_heads_, kvh, hd, hd, rows_, m, theta, stream, false, rot_pairs );
 		Attention::store_kv_cache( kv, k, v, pool.slot_stride_elems, kv_layer, rows_, m, kvh, hd, pool.max_seq_len, stream );
 	}
@@ -794,14 +810,16 @@ bool Gemma4Pipeline::layer_forward( const Gemma4LayerWeights& lw, int layer, int
 	if ( fuse ) ring_->all_reduce_normed_add( mlp_out_, resid_, lw.post_attn_norm, 1.0f, &lw.pre_ffn_norm, &norm_hidden_, eps, 0.0f, stream );
 	else {
 		if ( ring_ ) ring_->all_reduce( mlp_out_, stream );
-		Elementwise::add_normed( resid_, mlp_out_, lw.post_attn_norm, eps, 0.0f, 1.0f, stream );
-		RMSNorm::forward( resid_, lw.pre_ffn_norm, norm_hidden_, eps, 0.0f, stream );
+		Elementwise::add_normed( resid_, mlp_out_, lw.post_attn_norm, eps, 0.0f, 1.0f, stream, &norm_hidden_, &lw.pre_ffn_norm );
 	}
 	pod::TensorView gate = pod::make_tensor_2d( gate_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, lw.inter );
 	pod::TensorView up = pod::make_tensor_2d( up_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, lw.inter );
 	pod::TensorView act = pod::make_tensor_2d( mlp_inter_.ptr<backend::half_t>(), pod::DType::FP16, m, lw.inter );
+	backend::concurrent_begin( stream );
 	Linear::forward( norm_hidden_, lw.gate_proj, gate, stream );
+	backend::concurrent_next( stream );
 	Linear::forward( norm_hidden_, lw.up_proj, up, stream );
+	backend::concurrent_end( stream );
 	SwiGLU::forward( gate, up, act, stream, 0.0f, true );   // gelu_tanh( gate ) * up
 	Linear::forward( act, lw.down_proj, mlp_out_, stream );
 	const bool ple = config_.ple_dim > 0;
@@ -812,19 +830,23 @@ bool Gemma4Pipeline::layer_forward( const Gemma4LayerWeights& lw, int layer, int
 	}
 	else {
 		if ( ring_ ) ring_->all_reduce( mlp_out_, stream );
-		Elementwise::add_normed( resid_, mlp_out_, lw.post_ffn_norm, eps, 0.0f, ple ? 1.0f : lw.layer_scalar, stream );
+		// with per-layer inputs the residual as FP16 for their gate, else the next layer's input norm
+		pod::TensorView* next = ple || next_norm != nullptr ? &norm_hidden_ : nullptr;
+		Elementwise::add_normed( resid_, mlp_out_, lw.post_ffn_norm, eps, 0.0f, ple ? 1.0f : lw.layer_scalar, stream, next, ple ? nullptr : next_norm );
+		if ( !ple ) return next_norm != nullptr;
 	}
 	if ( ple ) {
 		// the gate reads the residual stream itself (FP16 for the projection), every rank the whole of it
 		const int D = config_.ple_dim;
-		Vision::f32_to_f16( resid_.ptr<const float>(), norm_hidden_.ptr<backend::half_t>(), static_cast<size_t>( m ) * config_.hidden_size, stream );
+		if ( fuse ) Vision::f32_to_f16( resid_.ptr<const float>(), norm_hidden_.ptr<backend::half_t>(), static_cast<size_t>( m ) * config_.hidden_size, stream );
 		pod::TensorView pg = pod::make_tensor_2d( gate_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, D );
 		pod::TensorView pa = pod::make_tensor_2d( up_buf_.ptr<backend::half_t>(), pod::DType::FP16, m, D );
 		const pod::TensorView slice = pod::make_tensor_2d( ple_.ptr<backend::half_t>() + ( static_cast<size_t>( layer ) * ple_m_ + ple_row0_ ) * D, pod::DType::FP16, m, D );
 		Linear::forward( norm_hidden_, lw.ple_gate, pg, stream );
 		SwiGLU::forward( pg, slice, pa, stream, 0.0f, true );   // gelu_tanh( gate ) * the slice
 		Linear::forward( pa, lw.ple_proj, mlp_out_, stream );
-		Elementwise::add_normed( resid_, mlp_out_, lw.post_ple_norm, eps, 0.0f, lw.layer_scalar, stream );
+		Elementwise::add_normed( resid_, mlp_out_, lw.post_ple_norm, eps, 0.0f, lw.layer_scalar, stream, next_norm != nullptr ? &norm_hidden_ : nullptr, next_norm );
+		return next_norm != nullptr;
 	}
 	return false;
 }

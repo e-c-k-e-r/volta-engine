@@ -101,7 +101,7 @@ int main( int argc, char** argv ) {
 		decoded.push_back( tok );
 	}
 	if ( steps > 0 ) {
-		std::printf( "  decode %.0f ms per step\n", ms_since( t_decode ) / steps );
+		std::printf( "  decode %.2f ms per step\n", ms_since( t_decode ) / steps );
 		std::printf( "  decoded:" );
 		for ( int t : decoded ) std::printf( " %d", t );
 		std::printf( "\n" );

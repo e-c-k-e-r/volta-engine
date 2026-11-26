@@ -32,6 +32,11 @@ inline void stream_join( stream_t, stream_t ) {}
 // Cross-device ordering (the CUDA one waits on the device): here the side stream is drained from the host
 inline void stream_wait_peer( stream_t, stream_t side, int ) { stream_sync( side ); }
 void device_sync();
+// A run of independent ops (see concurrent_begin in the CUDA header): every command of the stream is followed by a barrier, except where
+// concurrent_next marks the end of an op whose successor in the run does not read it, so those two overlap on the GPU
+void concurrent_begin( stream_t s );
+void concurrent_next( stream_t s );
+void concurrent_end( stream_t s );
 
 void memcpy_async( void* dst, const void* src, size_t bytes, Copy dir, stream_t s );
 void memcpy2d_async( void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, Copy dir, stream_t s );
