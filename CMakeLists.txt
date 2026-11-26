@@ -251,6 +251,7 @@ set(ENGINE_DEVICE_SOURCES
 	src/tts/tts_model.cu
 	src/tts/tts_backbone.cu
 	src/tts/tts_flow.cu
+	src/tts/codec.cu
 	src/spec/dflash_kernels.cu
 	src/spec/dflash_speculator.cu
 	src/spec/dflash_backbone.cu

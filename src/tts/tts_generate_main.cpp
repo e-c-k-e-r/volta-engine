@@ -6,10 +6,13 @@
 //       hidden states) for the three guidance rows (cond / null / promptless); then the demasking loop teacher-forced (every
 //       step from the reference's previous digits: how many revealed digits agree, and the step-0 guided velocities),
 //       and a free-running generation from the reference's reveal order and noise, written with --out as .npy digits
-//       [frames, 32] (decode them with the codec in Python)
+//       [frames, 32]; with --codec, the codec's decode of the reference's digits against the golden's wav, and --wav
+//       writes the free-running generation as audio
 #include "engine/loader/safetensors.h"
+#include "engine/tts/codec.h"
 #include "engine/tts/tts_model.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -57,7 +60,53 @@ static void write_npy_u8( const std::string& path, const std::vector<uint8_t>& v
 	std::fclose( f );
 }
 
-static int check_demask( engine::tts::TtsModel& m, const char* path, const std::string& out, const engine::tts::TtsModel::Sampling& s ) {
+// 16-bit PCM mono WAV
+static void write_wav( const std::string& path, const std::vector<float>& x, int rate ) {
+	FILE* f = std::fopen( path.c_str(), "wb" );
+	if ( !f ) { std::fprintf( stderr, "can't write %s\n", path.c_str() ); return; }
+	const uint32_t data = static_cast<uint32_t>( x.size() * 2 ), riff = 36 + data, fmt = 16, rate_ = rate, bps = rate * 2;
+	const uint16_t pcm = 1, ch = 1, align = 2, bits = 16;
+	std::fwrite( "RIFF", 1, 4, f ); std::fwrite( &riff, 4, 1, f ); std::fwrite( "WAVEfmt ", 1, 8, f ); std::fwrite( &fmt, 4, 1, f );
+	std::fwrite( &pcm, 2, 1, f ); std::fwrite( &ch, 2, 1, f ); std::fwrite( &rate_, 4, 1, f ); std::fwrite( &bps, 4, 1, f );
+	std::fwrite( &align, 2, 1, f ); std::fwrite( &bits, 2, 1, f ); std::fwrite( "data", 1, 4, f ); std::fwrite( &data, 4, 1, f );
+	for ( float v : x ) {
+		const int16_t q = static_cast<int16_t>( std::lrint( std::max( -1.0f, std::min( 1.0f, v ) ) * 32767.0f ) );
+		std::fwrite( &q, 2, 1, f );
+	}
+	std::fclose( f );
+}
+
+// The codec against the golden: its reference digits decoded here and by vall_e (the golden's wav, FP32): SNR and the worst sample
+static int check_codec( engine::tts::CodecDecoder& codec, const char* path ) {
+	pod::SafeTensorsFile g;
+	if ( !engine::loader::safetensors_open( g, path ) ) { std::fprintf( stderr, "can't open %s\n", path ); return 1; }
+	const auto d64 = i64( g, "digits" );
+	const auto ref = f32( g, "wav" );
+	std::vector<uint8_t> digits( d64.begin(), d64.end() );
+	const int n_frames = static_cast<int>( digits.size() / 32 );
+	codec.decode( digits, n_frames );   // warm-up (buffers, kernel loads), then timed
+	cudaDeviceSynchronize();
+	const auto t0 = std::chrono::steady_clock::now();
+	const auto wav = codec.decode( digits, n_frames );
+	const double dt = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
+	if ( ref.size() != wav.size() ) {
+		std::printf( "codec: %zu samples, the reference %zu -> FAIL\n", wav.size(), ref.size() );
+		return 1;
+	}
+	double sig = 0, err = 0, worst = 0;
+	for ( size_t i = 0; i < wav.size(); ++i ) {
+		const double e = wav[i] - ref[i];
+		sig += static_cast<double>( ref[i] ) * ref[i]; err += e * e; worst = std::max( worst, std::fabs( e ) );
+	}
+	const double snr = 10.0 * std::log10( sig / std::max( err, 1e-30 ) );
+	std::printf( "codec: %d frames -> %zu samples in %.0f ms (%.0fx real time), SNR %.1f dB against vall_e's decode, worst sample %.2e -> %s\n", n_frames,
+		wav.size(), dt * 1e3, wav.size() / static_cast<double>( codec.config().sample_rate ) / dt, snr, worst, snr > 60.0 ? "PASS" : "FAIL" );
+	engine::loader::safetensors_close( g );
+	return snr > 60.0 ? 0 : 1;
+}
+
+static int check_demask( engine::tts::TtsModel& m, const char* path, const std::string& out, const engine::tts::TtsModel::Sampling& s,
+	engine::tts::CodecDecoder* codec, const std::string& wav_out ) {
 	pod::SafeTensorsFile g;
 	engine::loader::safetensors_open( g, path );
 	const auto& c = m.config();
@@ -102,14 +151,22 @@ static int check_demask( engine::tts::TtsModel& m, const char* path, const std::
 	const double tf = agree / double( total );
 	std::printf( "\nteacher-forced agreement %.5f -> %s\n", tf, tf > 0.995 ? "PASS" : "FAIL" );
 	// free-running
+	cudaDeviceSynchronize();
+	const auto t0 = std::chrono::steady_clock::now();
 	const auto digits = m.generate( text, prompt, n_frames, order, noise, s );
+	const double dt = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
 	const auto ref = i64( g, "digits" );
 	long same = 0;
 	for ( size_t i = 0; i < digits.size(); ++i ) { same += digits[i] == ref[i]; }
-	std::printf( "free-running: %d frames, %.3f of digits equal to the reference's (bf16 vs fp32 Python: 0.58-0.72)\n", n_frames, same / double( digits.size() ) );
+	std::printf( "free-running: %d frames in %.2f s (%d steps), %.3f of digits equal to the reference's (bf16 vs fp32 Python: 0.58-0.72)\n", n_frames, dt,
+		s.steps, same / double( digits.size() ) );
 	if ( !out.empty() ) {
 		write_npy_u8( out, digits, n_frames, 32 );
 		std::printf( "wrote %s\n", out.c_str() );
+	}
+	if ( codec && !wav_out.empty() ) {
+		write_wav( wav_out, codec->decode( digits, n_frames ), codec->config().sample_rate );
+		std::printf( "wrote %s\n", wav_out.c_str() );
 	}
 	engine::loader::safetensors_close( g );
 	return tf > 0.995 ? 0 : 1;
@@ -192,17 +249,20 @@ static int check_backbone( engine::tts::TtsModel& m, const char* path ) {
 }
 
 int main( int argc, char** argv ) {
-	std::string model, golden, out;
+	std::string model, golden, out, codec_path, wav_out;
 	float cfg = -1.0f, cfg_prompt = -1.0f;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--model" ) && i + 1 < argc ) { model = argv[++i]; }
 		else if ( !std::strcmp( argv[i], "--golden" ) && i + 1 < argc ) { golden = argv[++i]; }
 		else if ( !std::strcmp( argv[i], "--out" ) && i + 1 < argc ) { out = argv[++i]; }
+		else if ( !std::strcmp( argv[i], "--codec" ) && i + 1 < argc ) { codec_path = argv[++i]; }
+		else if ( !std::strcmp( argv[i], "--wav" ) && i + 1 < argc ) { wav_out = argv[++i]; }
 		else if ( !std::strcmp( argv[i], "--cfg" ) && i + 1 < argc ) { cfg = std::strtof( argv[++i], nullptr ); }
 		else if ( !std::strcmp( argv[i], "--cfg-prompt" ) && i + 1 < argc ) { cfg_prompt = std::strtof( argv[++i], nullptr ); }
 	}
 	if ( model.empty() ) {
-		std::fprintf( stderr, "usage: tts_generate --model <vall-e v3 export .sft> [--golden <golden.py case .safetensors>] [--cfg x] [--cfg-prompt x]\n" );
+		std::fprintf( stderr, "usage: tts_generate --model <vall-e v3 export .sft> [--golden <golden.py case .safetensors>] [--cfg x] [--cfg-prompt x]\n"
+			"  [--codec <codec decoder .sft> [--wav <out.wav>]]\n" );
 		return 2;
 	}
 	engine::tts::TtsModel m;
@@ -216,11 +276,15 @@ int main( int argc, char** argv ) {
 	if ( cfg >= 0.0f ) { s.cfg = cfg; }
 	if ( cfg_prompt >= 0.0f ) { s.cfg_prompt = cfg_prompt; }
 	std::printf( "guidance %.2f, speaker guidance %.2f\n", s.cfg, s.cfg_prompt );
+	engine::tts::CodecDecoder codec;
+	const bool have_codec = !codec_path.empty();
+	if ( have_codec && !codec.load( codec_path ) ) { return 1; }
 	if ( !golden.empty() ) {
 		const int rl = check_length( m, golden.c_str() );
 		const int rb = check_backbone( m, golden.c_str() );
-		const int rd = check_demask( m, golden.c_str(), out, s );
-		return rl | rb | rd;
+		const int rc = have_codec ? check_codec( codec, golden.c_str() ) : 0;
+		const int rd = check_demask( m, golden.c_str(), out, s, have_codec ? &codec : nullptr, wav_out );
+		return rl | rb | rc | rd;
 	}
 	return 0;
 }
