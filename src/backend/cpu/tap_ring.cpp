@@ -13,21 +13,21 @@ void dflash_publish_taps(
 	const int* d_owner,
 	int m,
 	int tap,
-	int H,
+	const TapSlice& slice,
 	int cap,
-	backend::stream_t,
-	int taps_n
+	backend::stream_t
 ) {
-	ENGINE_ASSERT( taps_n == 5, "dflash_publish_taps (CPU): five taps per position" );
+	ENGINE_ASSERT( slice.taps_n == 5 && slice.whole(), "dflash_publish_taps (CPU): five taps per position, the whole row" );
+	const int H = slice.hidden;
 	TapStoreParams p{ taps, const_cast<half*>( hidden ), const_cast<int*>( d_rows->slot ), const_cast<int*>( d_rows->pos ), const_cast<int*>( d_owner ), m, tap, H, cap };
 	impl::cpu_dispatch( ::dflash_store_taps, &p, ( H + 255 ) / 256, m );
 }
 
-void dflash_publish_taps_slots( backend::half_t*, const backend::half_t*, const pod::BatchRows*, int, int, int, int, size_t, backend::stream_t, int ) {
+void dflash_publish_taps_slots( backend::half_t*, const backend::half_t*, const pod::BatchRows*, int, int, const TapSlice&, int, size_t, backend::stream_t ) {
 	ENGINE_UNSUPPORTED( "dflash_publish_taps_slots" );
 }
 
-void dflash_publish_taps_slots_f32( backend::half_t*, const float*, const pod::BatchRows*, int, int, int, int, size_t, backend::stream_t, int ) {
+void dflash_publish_taps_slots_f32( backend::half_t*, const float*, const pod::BatchRows*, int, int, const TapSlice&, int, size_t, backend::stream_t ) {
 	ENGINE_UNSUPPORTED( "dflash_publish_taps_slots_f32" );
 }
 

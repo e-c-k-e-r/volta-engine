@@ -96,7 +96,7 @@ bool Qwen3_5Pipeline::init(
 	// The ring is per position, not per slot (a per-slot ring would cost ~840 MiB per rank), so only
 	// one slot may publish into it: rows from every other slot are skipped on device. The owner is a
 	// device scalar so the captured forward graph stays valid when it changes. -1 publishes nothing.
-	if ( speculation_ == Speculation::DFlash ) engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, config_.hidden_size, 1, false );
+	if ( speculation_ == Speculation::DFlash ) engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, config_.hidden_size, 1, false, rank_, tp_ranks_ );
 	draft_hooks_.embedding = &embed_tokens_;
 	d_token_ids_ = static_cast<int*>( engine::core::arena_alloc( arena, R * sizeof( int ) ) );
 	d_rows_ = static_cast<pod::BatchRows*>( engine::core::arena_alloc( arena, sizeof( pod::BatchRows ) ) );
@@ -892,7 +892,7 @@ void Qwen3_5Pipeline::forward_body( int m, backend::stream_t stream ) {
 			if ( layer != config_.tap_layers[tap] ) continue;
 			engine::spec::dflash_publish_taps(
 				draft_.taps.ptr<backend::half_t>(), hidden_states_.ptr<const backend::half_t>(), d_rows_, draft_.taps_owner,
-				m, tap, config_.hidden_size, draft_hooks_.taps_cap, stream );
+				m, tap, draft_hooks_.tap_slice, draft_hooks_.taps_cap, stream );
 		}
 	}
 
@@ -1069,7 +1069,7 @@ constexpr size_t kSeqAlign = 256;
 
 size_t Qwen3_5Pipeline::tap_snapshot_bytes( int tokens ) const {
 	if ( !snap_taps_ ) return 0;
-	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * draft_hooks_.taps_n * config_.hidden_size * sizeof( backend::half_t );
+	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * draft_hooks_.tap_slice.cols * sizeof( backend::half_t );
 }
 
 // Bytes (data + scales) of the K or V rows [from, tokens) of one layer
@@ -1117,7 +1117,7 @@ void Qwen3_5Pipeline::copy_kv_rows( int slot_id, int from, int tokens, char* hos
 
 bool Qwen3_5Pipeline::read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream ) {
 	backend::set_device( rank_ );
-	return read_draft_taps( draft_hooks_, slot_id, config_.max_slots, first_pos, count, config_.hidden_size, host_dst, stream );
+	return read_draft_taps( draft_hooks_, slot_id, config_.max_slots, first_pos, count, host_dst, stream );
 }
 
 bool Qwen3_5Pipeline::save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream ) {

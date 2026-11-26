@@ -270,6 +270,72 @@ int main( int argc, char** argv ) {
 		std::printf( "[+] Test 2 Passed: 100%% bit-exact chained tokens match.\n" );
 	}
 
+	// -----------------------------------------------------------------------
+	// Test 2b: the walk over codebook rows staged by vocabulary shard (a tensor-parallel drafter) against the whole codebooks
+	// -----------------------------------------------------------------------
+	std::printf( "\n[*] Test 2b: staged selector walk over vocabulary shards...\n" );
+	{
+		const int M = 8, k = 16, rank = 256, vocab = 1000, ranks = 4, SR = M * k + 1;
+		const int off[ranks] = { 0, 256, 512, 768 }, cols[ranks] = { 256, 256, 256, 232 };
+		const int anchor = 900;   // in rank 3's shard
+		std::vector<half> pred( static_cast<size_t>( vocab ) * rank ), succ( pred.size() ), gate( static_cast<size_t>( M ) * rank );
+		for ( size_t i = 0; i < pred.size(); ++i ) {
+			pred[i] = host_float_to_half( static_cast<float>( static_cast<int>( ( i * 7 ) % 23 ) - 11 ) * 0.02f );
+			succ[i] = host_float_to_half( static_cast<float>( static_cast<int>( ( i * 5 ) % 29 ) - 14 ) * 0.02f );
+		}
+		for ( size_t i = 0; i < gate.size(); ++i ) gate[i] = host_float_to_half( static_cast<float>( static_cast<int>( i % 13 ) - 6 ) * 0.05f );
+		// every rank's local top-k ids (inside its shard, distinct per row), and the merged rows: 16 of their union per row
+		std::vector<int> part( static_cast<size_t>( ranks ) * M * k ), cands( static_cast<size_t>( M ) * k );
+		std::vector<float> unary( cands.size() );
+		for ( int d = 0; d < ranks; ++d )
+			for ( int r = 0; r < M; ++r )
+				for ( int p = 0; p < k; ++p ) part[( static_cast<size_t>( d ) * M + r ) * k + p] = off[d] + ( r * 37 + p * 11 + d * 5 ) % cols[d];
+		for ( int r = 0; r < M; ++r )
+			for ( int c = 0; c < k; ++c ) {
+				const int d = ( c + r ) % ranks, p = c / 4 + r % 3;
+				cands[r * k + c] = part[( static_cast<size_t>( d ) * M + r ) * k + p];
+				unary[r * k + c] = static_cast<float>( ( r * 7 + c * 3 ) % 11 - 5 ) * 0.03f;
+			}
+		auto up = [&]( const void* h, size_t bytes ) {
+			void* p = engine::core::arena_alloc( arena, bytes );
+			CUDA_CHECK( cudaMemcpyAsync( p, h, bytes, cudaMemcpyHostToDevice, stream ) );
+			return p;
+		};
+		const half* d_pred = static_cast<const half*>( up( pred.data(), pred.size() * sizeof( half ) ) );
+		const half* d_succ = static_cast<const half*>( up( succ.data(), succ.size() * sizeof( half ) ) );
+		const half* d_gate = static_cast<const half*>( up( gate.data(), gate.size() * sizeof( half ) ) );
+		const int* d_part = static_cast<const int*>( up( part.data(), part.size() * sizeof( int ) ) );
+		const int* d_cands = static_cast<const int*>( up( cands.data(), cands.size() * sizeof( int ) ) );
+		const float* d_unary = static_cast<const float*>( up( unary.data(), unary.size() * sizeof( float ) ) );
+		const int* d_anchor = static_cast<const int*>( up( &anchor, sizeof( int ) ) );
+		half* d_stage = static_cast<half*>( engine::core::arena_alloc( arena, static_cast<size_t>( ranks ) * 2 * SR * rank * sizeof( half ) ) );
+		int* d_out = static_cast<int*>( engine::core::arena_alloc( arena, 2 * M * sizeof( int ) ) );
+		float* d_conf = static_cast<float*>( engine::core::arena_alloc( arena, 2 * M * sizeof( float ) ) );
+		// each rank stages from its own shard of the codebooks
+		for ( int d = 0; d < ranks; ++d ) {
+			engine::spec::dflash2_stage_book_rows( d_pred + static_cast<size_t>( off[d] ) * rank, d_succ + static_cast<size_t>( off[d] ) * rank, off[d], cols[d],
+				d_part + static_cast<size_t>( d ) * M * k, M * k, anchor, d_stage + static_cast<size_t>( d ) * 2 * SR * rank, rank, stream );
+		}
+		engine::spec::dflash2_selector_walk( d_unary + k, d_cands + k, d_gate + rank, d_pred, d_succ, d_anchor, d_out, d_conf, 1, M - 1, k, rank, stream );
+		engine::spec::WalkStage st;
+		st.part_ix = d_part;
+		st.ranks = ranks;
+		st.part_rows = M;
+		st.stage_rows = SR;
+		st.row0 = 1;
+		st.anchor_rank = 3;
+		engine::spec::dflash2_selector_walk( d_unary + k, d_cands + k, d_gate + rank, d_stage, d_stage, d_anchor, d_out + M, d_conf + M, 1, M - 1, k, rank, stream, &st );
+		std::vector<int> h_out( 2 * M );
+		std::vector<float> h_conf( 2 * M );
+		CUDA_CHECK( cudaMemcpyAsync( h_out.data(), d_out, h_out.size() * sizeof( int ), cudaMemcpyDeviceToHost, stream ) );
+		CUDA_CHECK( cudaMemcpyAsync( h_conf.data(), d_conf, h_conf.size() * sizeof( float ), cudaMemcpyDeviceToHost, stream ) );
+		CUDA_CHECK( cudaStreamSynchronize( stream ) );
+		for ( int i = 0; i < M; ++i ) {
+			ENGINE_ASSERT( h_out[i] == h_out[M + i] && h_conf[i] == h_conf[M + i], "staged selector walk differs from the walk over whole codebooks" );
+		}
+		std::printf( "[+] Test 2b Passed: the staged walk picks the same tokens with the same confidences.\n" );
+	}
+
 
 	// -----------------------------------------------------------------------
 	// Test 5: SafeTensorsRepo Draft Model Weight Discovery

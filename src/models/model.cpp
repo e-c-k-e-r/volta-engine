@@ -7,15 +7,25 @@
 #include "engine/models/deepseek_v41.h"
 #include "engine/loader/safetensors.h"
 #include "engine/modules/moe.h"
+#include "engine/runtime/options.h"
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 
 namespace engine::models {
 
-void alloc_draft_taps( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int max_seq, int hidden, int slots, bool per_slot, int taps_n ) {
+void alloc_draft_taps( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int max_seq, int hidden, int slots, bool per_slot, int rank, int tp, int taps_n ) {
 	hooks.taps_cap = MAX( MIN( max_seq, 2048 ), 256 );
 	hooks.taps_n = taps_n;
-	const int tap_cols = taps_n * hidden;
+#if defined(ENGINE_BACKEND_CUDA) && ENGINE_BACKEND_CUDA == 1
+	constexpr bool cuda = true;   // the drafters are CUDA only
+#else
+	constexpr bool cuda = false;
+#endif
+	const auto& opt = runtime::options();
+	const bool shard = cuda && tp > 1 && opt.draft_tp && opt.dflash_hessian_dir.empty() && ( taps_n * hidden ) % ( tp * 128 ) == 0;
+	const int tap_cols = shard ? taps_n * hidden / tp : taps_n * hidden;
+	hooks.tap_slice = { hidden, taps_n, shard ? rank * tap_cols : 0, tap_cols };
 	int shape[2] = { ( per_slot ? slots : 1 ) * hooks.taps_cap, tap_cols };
 	if ( per_slot ) hooks.taps_slot_stride = static_cast<size_t>( hooks.taps_cap ) * tap_cols;
 	s.taps = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, shape, 2 );
@@ -26,20 +36,26 @@ void alloc_draft_taps( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch&
 	hooks.taps_owner = s.taps_owner;
 }
 
-bool read_draft_taps( const DraftHooks& hooks, int slot_id, int slots, int first_pos, int count, int hidden, backend::half_t* host_dst, backend::stream_t stream ) {
+bool read_draft_taps( const DraftHooks& hooks, int slot_id, int slots, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream ) {
 	const int cap = hooks.taps_cap;
 	if ( hooks.taps == nullptr || slot_id < 0 || slot_id >= slots || first_pos < 0 || count <= 0 || count > cap ) return false;
 	if ( hooks.taps_slot_stride == 0 && slot_id != 0 ) return false;   // one shared ring: only a single-slot server reads it unambiguously
-	const size_t row = static_cast<size_t>( hooks.taps_n ) * hidden;
+	const engine::spec::TapSlice& sl = hooks.tap_slice;
+	const size_t row = static_cast<size_t>( sl.taps_n ) * sl.hidden, kept = static_cast<size_t>( sl.cols );
 	const backend::half_t* ring = hooks.taps + static_cast<size_t>( slot_id ) * hooks.taps_slot_stride;
+	std::vector<backend::half_t> part( sl.whole() ? 0 : static_cast<size_t>( count ) * kept );
+	backend::half_t* dst = sl.whole() ? host_dst : part.data();
 	// Position p lives in ring row p % cap: at most two contiguous runs
 	for ( int done = 0; done < count; ) {
 		const int r = ( first_pos + done ) % cap;
 		const int n = MIN( count - done, cap - r );
-		backend::memcpy_async( host_dst + static_cast<size_t>( done ) * row, ring + static_cast<size_t>( r ) * row, static_cast<size_t>( n ) * row * sizeof( backend::half_t ), backend::Copy::D2H, stream );
+		backend::memcpy_async( dst + static_cast<size_t>( done ) * kept, ring + static_cast<size_t>( r ) * kept, static_cast<size_t>( n ) * kept * sizeof( backend::half_t ), backend::Copy::D2H, stream );
 		done += n;
 	}
 	backend::stream_sync( stream );
+	if ( !sl.whole() ) {
+		for ( int i = 0; i < count; ++i ) std::copy_n( part.data() + i * kept, kept, host_dst + i * row + sl.col0 );
+	}
 	return true;
 }
 

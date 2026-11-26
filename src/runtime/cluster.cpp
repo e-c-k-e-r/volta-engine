@@ -738,7 +738,12 @@ void ModelCluster::warm_graphs( int max_m, int slot ) {
 }
 
 bool ModelCluster::read_taps( int slot, int first_pos, int count, backend::half_t* host_dst ) {
-	return models_[0]->read_taps( slot, first_pos, count, host_dst, streams_[0] );
+	// a sharded ring: every rank writes the columns it keeps
+	const int ranks = models_[0]->draft_hooks().tap_slice.whole() ? 1 : tp_;
+	for ( int d = 0; d < ranks; ++d ) {
+		if ( !models_[d]->read_taps( slot, first_pos, count, host_dst, streams_[d] ) ) return false;
+	}
+	return true;
 }
 
 size_t ModelCluster::snapshot_bytes( int from, int tokens, bool with_taps ) const {

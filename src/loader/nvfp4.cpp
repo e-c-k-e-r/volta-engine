@@ -8,6 +8,7 @@
 //   scale   the e4m3 byte of (n, g), copied raw
 // Streams are [tile][group][lane].
 #include "engine/loader/safetensors.h"
+#include "engine/loader/gguf.h"
 #include "engine/quant/fp4_fp8.h"
 #include "engine/backend/runtime.h"
 #include "engine/backend/numeric.h"
@@ -424,11 +425,12 @@ pod::LinearWeight SafeTensorsRepo::load_dense_rows_padded(
 	int shard = -1;
 	const auto* meta = find( weight_name, &shard );
 	if ( !meta || meta->ndim != 2 ) return pod::LinearWeight{};
+	meta = engine::loader::gguf_float_view( shards_[shard], meta, stream );   // a GGUF block tensor read as FP16
 	ENGINE_ASSERT( row_begin + row_count <= meta->shape[0], "load_dense_rows_padded: row range" );
 	ENGINE_ASSERT( meta->dtype == pod::DType::BF16 || meta->dtype == pod::DType::FP16, "load_dense_rows_padded: BF16/FP16 only" );
 	const size_t K = meta->shape[1];
 	const size_t rows = static_cast<size_t>( row_count ) + pad_rows;
-	const uint16_t* src = static_cast<const uint16_t*>( cpu_data( weight_name ) ) + static_cast<size_t>( row_begin ) * K;
+	const uint16_t* src = static_cast<const uint16_t*>( safetensors_get_data_cpu( shards_[shard], meta ) ) + static_cast<size_t>( row_begin ) * K;
 	std::vector<backend::half_t> out( rows * K );
 	for ( size_t i = 0; i < static_cast<size_t>( row_count ) * K; ++i ) {
 		if ( meta->dtype == pod::DType::FP16 ) {

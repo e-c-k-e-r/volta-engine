@@ -119,7 +119,7 @@ bool Gemma4Pipeline::init( const Gemma4Config& config, int rank, pod::MemoryAren
 
 	// DFlash drafter: a tap ring per slot (the hidden after each tapped layer) and the head scratch
 	if ( speculation_ == Speculation::DFlash ) {
-		engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, H, S, true, Gemma4Config::kTaps );
+		engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, H, S, true, rank_, tp_size_, Gemma4Config::kTaps );
 		engine::models::alloc_draft_head( arena, draft_hooks_, draft_, H, lm_shard_cols_, kTopkTile, rank_ * lm_shard_real_cols_, lm_shard_real_cols_ );
 		draft_hooks_.embedding = &embed_tokens_;
 		draft_hooks_.embed_scale = embed_scale_;
@@ -407,7 +407,7 @@ bool Gemma4Pipeline::inject_embeddings( const backend::half_t* host_rows, int ds
 
 bool Gemma4Pipeline::read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream ) {
 	backend::set_device( rank_ );
-	return read_draft_taps( draft_hooks_, slot_id, config_.max_slots, first_pos, count, config_.hidden_size, host_dst, stream );
+	return read_draft_taps( draft_hooks_, slot_id, config_.max_slots, first_pos, count, host_dst, stream );
 }
 
 void Gemma4Pipeline::forward( const pod::BatchRows& rows, backend::stream_t stream ) {
@@ -496,8 +496,8 @@ void Gemma4Pipeline::forward_body( int m, backend::stream_t stream ) {
 		// Drafter taps: the hidden after the tapped layers, into each row's slot ring (slot and position from d_rows_: graph-replayable)
 		for ( int tap = 0; tap < Gemma4Config::kTaps && draft_.taps.data != nullptr; ++tap ) {
 			if ( L != config_.tap_layers[tap] + tap_shift_ ) continue;
-			engine::spec::dflash_publish_taps_slots_f32( draft_.taps.ptr<backend::half_t>(), resid_.ptr<const float>(), d_rows_, m, tap, config_.hidden_size,
-				draft_hooks_.taps_cap, draft_hooks_.taps_slot_stride, stream, Gemma4Config::kTaps );
+			engine::spec::dflash_publish_taps_slots_f32( draft_.taps.ptr<backend::half_t>(), resid_.ptr<const float>(), d_rows_, m, tap, draft_hooks_.tap_slice,
+				draft_hooks_.taps_cap, draft_hooks_.taps_slot_stride, stream );
 		}
 	}
 
@@ -554,7 +554,7 @@ size_t pool_rows_bytes( const engine::runtime::KVCachePool& pool, int rows ) {
 
 size_t Gemma4Pipeline::tap_snapshot_bytes( int tokens ) const {
 	if ( !snap_taps_ || draft_.taps.data == nullptr ) return 0;
-	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * draft_hooks_.taps_n * config_.hidden_size * sizeof( backend::half_t );
+	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * draft_hooks_.tap_slice.cols * sizeof( backend::half_t );
 }
 
 size_t Gemma4Pipeline::seq_state_bytes( int from, int tokens, bool with_taps ) const {

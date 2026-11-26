@@ -23,9 +23,11 @@ void DFlashSpeculator::ingest_context( const half* tapped_states, int n_ctx, int
 	const int kvh_local = config_.num_kv_heads / tp_size_;
 	const int rope_pairs = hd / 2;
 	const int tn = config_.num_target_layer_ids;   // tapped target layers per position
+	const int row = fc_rows_ ? tap_slice_.cols : tn * H;   // columns of a tap row here: this rank's share of a sharded ring
 	// fc is column-parallel on the output. At tp > 1 each rank computes its H/tp columns, writes them into
 	// a zeroed full-width buffer and a sum across ranks gathers them (x + 0 is exact), so the norm and
-	// every later stage see the full-width row on every rank.
+	// every later stage see the full-width row on every rank. Over a sharded tap ring fc is row-parallel instead: each rank projects its
+	// own columns of the taps to a partial [rows, H] and the all-reduce sums them.
 	ENGINE_ASSERT( tp_size_ == 1 || ring_ != nullptr, "DFlashSpeculator::ingest_context: TP > 1 needs set_ring" );
 	if ( n_ctx > 0 && fc_.is_valid() ) {
 		for ( int base = 0; base < n_ctx; base += ctx_chunk_ ) {
@@ -33,14 +35,22 @@ void DFlashSpeculator::ingest_context( const half* tapped_states, int n_ctx, int
 			// taps_ring_cap > 0 means `tapped_states` is a position-indexed ring rather than a packed
 			// [n_ctx, 5*H] block, so the chunk's first row sits at (ctx_pos0 + base) % cap.
 			const size_t tap_off = ( taps_ring_cap > 0 )
-				? static_cast<size_t>( ( ctx_pos0 + base ) % taps_ring_cap ) * tn * H
-				: static_cast<size_t>( base ) * tn * H;
+				? static_cast<size_t>( ( ctx_pos0 + base ) % taps_ring_cap ) * row
+				: static_cast<size_t>( base ) * row;
 			const pod::TensorView taps_in = pod::make_tensor_2d(
 				const_cast<half*>( tapped_states ) + tap_off,
-				pod::DType::FP16, cnt, tn * H );
+				pod::DType::FP16, cnt, row );
 			pod::TensorView fc_out = pod::make_tensor_2d( bb_ctx_fc_.ptr<half>(), pod::DType::FP16, cnt, H );
 			hess_.accumulate( L, 0, taps_in.data, tn * H, cnt, stream );
-			if ( !fc_sharded_ ) {
+			if ( fc_rows_ ) {
+				engine::modules::Linear::forward( taps_in, fc_, fc_out, stream );
+				// The ring all-reduce handles at most 16 rows per launch (one block per row).
+				for ( int r0 = 0; r0 < cnt; r0 += 16 ) {
+					pod::TensorView part = pod::make_tensor_2d( fc_out.ptr<half>() + static_cast<size_t>( r0 ) * H, pod::DType::FP16, MIN( 16, cnt - r0 ), H );
+					ring_->all_reduce( part, stream );
+				}
+			}
+			else if ( !fc_sharded_ ) {
 				engine::modules::Linear::forward( taps_in, fc_, fc_out, stream );
 			}
 			else {
@@ -484,12 +494,32 @@ void DFlashSpeculator::draft_select(
 		dflash_argmax_draft( ix, kk, d_anchor_, d_draft_tokens_, rows, stream );
 		return;
 	}
+	if ( books_sharded_ ) {
+		// the rows every rank staged (book_stage), found through the ranks' local candidate ids in the merge staging
+		WalkStage st;
+		st.part_ix = merged_cand_indices_ptr( 0 );
+		st.ranks = cand_ranks_;
+		st.part_rows = config_.block_size;
+		st.stage_rows = stage_rows_;
+		st.row0 = 1;
+		st.anchor_rank = anchor_rank_;
+		dflash2_selector_walk( vals + kk, ix + kk, d_gate_ + config_.selector_rank, book_stage( 0 ), book_stage( 0 ), d_anchor_, d_draft_tokens_, d_conf_,
+			1, rows, kk, config_.selector_rank, stream, &st );
+		return;
+	}
 	dflash2_selector_walk(
 		vals + kk, ix + kk, d_gate_ + config_.selector_rank,
 		pred_codebook_.ptr<const half>(), succ_codebook_.ptr<const half>(),
 		d_anchor_, d_draft_tokens_, d_conf_,
 		1, rows, kk, config_.selector_rank, stream
 	);
+}
+
+void DFlashSpeculator::stage_book_rows( const int* cand_idx, int anchor, cudaStream_t stream ) {
+	CUDA_CHECK( cudaSetDevice( device_ ) );
+	ENGINE_ASSERT( books_sharded_ && pred_codebook_.data != nullptr, "stage_book_rows: the codebooks are not sharded" );
+	dflash2_stage_book_rows( pred_codebook_.ptr<const half>(), succ_codebook_.ptr<const half>(), book_off_, book_cols_, cand_idx, stage_rows_ - 1, anchor,
+		book_stage( 0 ), config_.selector_rank, stream );
 }
 
 void DFlashSpeculator::set_walk_anchor( int anchor, cudaStream_t stream ) {

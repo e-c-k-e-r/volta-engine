@@ -9,6 +9,7 @@
 #include "engine/loader/image.h"
 #include "engine/backend/types.h"
 #include "engine/modules/steer.h"
+#include "engine/spec/tap_ring.h"
 #include <string>
 
 namespace engine::loader { class SafeTensorsRepo; }
@@ -27,9 +28,10 @@ static constexpr int kSnapRows = pod::MAX_BATCH;
 // stable for the model's lifetime, so a captured graph may bake them in.
 struct DraftHooks {
 	const pod::TensorView* embedding = nullptr; // [vocab, hidden] table (replicated on every rank)
-	const backend::half_t* taps = nullptr;                 // [taps_cap, taps_n * hidden] position-indexed tap ring
+	const backend::half_t* taps = nullptr;                 // [taps_cap, tap_slice.cols] position-indexed tap ring
 	int taps_cap = 0;
 	int taps_n = 5;                             // tapped layers per position
+	engine::spec::TapSlice tap_slice;           // the columns of a position's taps_n * hidden this rank keeps (its share when the drafter's fc is row-parallel)
 	float embed_scale = 1.0f;                   // the model's multiplier of its embedding rows (Gemma 4: sqrt( hidden ))
 	int* taps_owner = nullptr;                  // device scalar: slot whose rows publish taps (-1: none)
 	size_t taps_slot_stride = 0;                // elements between the slots' rings when every slot has its own (taps_owner is then unused); 0: one ring, one owner
@@ -53,10 +55,13 @@ struct DraftScratch {
 
 // The tap ring: taps_cap = clamp( max_seq, 256, 2048 ) positions of [taps_n, hidden] per ring. per_slot gives every one of `slots` slots its own ring
 // (hooks.taps_slot_stride is set); otherwise one position-indexed ring is shared and taps_owner names the slot that publishes into it.
-void alloc_draft_taps( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int max_seq, int hidden, int slots, bool per_slot, int taps_n = 5 );
+// Rank `rank` of `tp` keeps its contiguous 1 / tp of each position's taps when the drafter runs tensor-parallel with its fc row-parallel over them
+// (draft_tp on CUDA, whole 128-wide Hadamard blocks per rank, no drafter Hessian capture); hooks.tap_slice says which columns it keeps.
+void alloc_draft_taps( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int max_seq, int hidden, int slots, bool per_slot, int rank, int tp, int taps_n = 5 );
 
-// Copy the taps of positions [first_pos, first_pos + count) of a slot's ring to the host (the read_taps of every model with a drafter)
-bool read_draft_taps( const DraftHooks& hooks, int slot_id, int slots, int first_pos, int count, int hidden, backend::half_t* host_dst, backend::stream_t stream );
+// Copy the taps of positions [first_pos, first_pos + count) of a slot's ring to the host (the read_taps of every model with a drafter): this
+// rank's columns of each [taps_n * hidden] row of host_dst
+bool read_draft_taps( const DraftHooks& hooks, int slot_id, int slots, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream );
 
 // The drafter's head scratch: lm_in, the head shard's logits and the per-rank candidate top-k buffers, wired into the hooks
 void alloc_draft_head( pod::MemoryArena& arena, DraftHooks& hooks, DraftScratch& s, int hidden, int lm_shard_cols, int tile, int shard_offset, int shard_real_cols );
@@ -213,8 +218,8 @@ public:
 	// reads this rank's embedding, the tap ring and a head-shard top-k through one descriptor, and
 	// asks the model to run the head over caller-provided hidden rows.
 	virtual const DraftHooks& draft_hooks() const { static const DraftHooks none; return none; }
-	// Copies the drafter taps of positions [first_pos, first_pos + count) of a slot (count rows of taps_n * hidden halves) to host memory; false without a tap ring
-	// or when count exceeds the ring
+	// Copies the drafter taps of positions [first_pos, first_pos + count) of a slot to host memory (count rows of taps_n * hidden halves, of which this rank
+	// writes the columns it keeps); false without a tap ring or when count exceeds the ring
 	virtual bool read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream = nullptr ) {
 		(void) slot_id; (void) first_pos; (void) count; (void) host_dst; (void) stream;
 		return false;

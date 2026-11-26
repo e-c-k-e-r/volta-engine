@@ -430,7 +430,7 @@ bool Glm5NextPipeline::init(
 	// 6. DFlash2 attachment: a position-indexed tap ring per slot (every slot's rows publish to its own, so each can feed the drafter), head scratch,
 	// candidate top-k scratch
 	if ( speculation_ == Speculation::DFlash ) {
-		engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, config_.hidden_size, S, true );
+		engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, config_.hidden_size, S, true, rank_, config_.tp_size );
 		// embedding: set when the table is loaded (host-resident, shared by every rank)
 		int tap_shape[2] = { R, config_.hidden_size };
 		tap_tmp_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, tap_shape, 2 );
@@ -2500,11 +2500,12 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 		// Tapped layer states for the DFlash2 drafter: position-indexed ring, owner/slot/position read on device.
 		// The tapped hidden state of an mHC layer is the mean of its four residual streams (as HyperHead).
 		for ( int tap = 0; tap < 5 && draft_.taps.data != nullptr; ++tap ) {
-			if ( layer != config_.tap_layers[tap] ) continue;
+			int src0, dst0, n;
+			if ( layer != config_.tap_layers[tap] || !draft_hooks_.tap_slice.span( tap, &src0, &dst0, &n ) ) continue;   // (a sharded ring: none of this tap kept here)
 			engine::spec::dflash_reduce_streams( hidden_streams_.ptr<const float>(), tap_tmp_.ptr<backend::half_t>(), m, H, 0, stream );
 			engine::spec::dflash_publish_taps_slots(
 				draft_.taps.ptr<backend::half_t>(), tap_tmp_.ptr<const backend::half_t>(), d_rows_,
-				m, tap, H, draft_hooks_.taps_cap, draft_hooks_.taps_slot_stride, stream );
+				m, tap, draft_hooks_.tap_slice, draft_hooks_.taps_cap, draft_hooks_.taps_slot_stride, stream );
 		}
 
 		trace_row( layer );
@@ -2641,7 +2642,7 @@ void Glm5NextPipeline::destroy() {
 // small ring of recent per-token index rows (the whole slot is stored; it is part of the state, not of the segment).
 size_t Glm5NextPipeline::tap_snapshot_bytes( int tokens ) const {
 	if ( !snap_taps_ ) return 0;
-	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * draft_hooks_.taps_n * config_.hidden_size * sizeof( backend::half_t );
+	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * draft_hooks_.tap_slice.cols * sizeof( backend::half_t );
 }
 
 size_t Glm5NextPipeline::seq_state_bytes( int from, int tokens, bool with_taps ) const {
@@ -2708,7 +2709,7 @@ void Glm5NextPipeline::copy_seq_rows( int slot_id, int from, int tokens, char* h
 
 bool Glm5NextPipeline::read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream ) {
 	backend::set_device( rank_ );
-	return read_draft_taps( draft_hooks_, slot_id, config_.max_slots, first_pos, count, config_.hidden_size, host_dst, stream );
+	return read_draft_taps( draft_hooks_, slot_id, config_.max_slots, first_pos, count, host_dst, stream );
 }
 
 bool Glm5NextPipeline::save_seq_state( int slot_id, int from, int tokens, bool with_taps, void* host_dst, backend::stream_t stream ) {

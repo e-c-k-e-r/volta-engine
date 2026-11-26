@@ -6,7 +6,25 @@
 
 namespace engine::spec {
 
-// Publishes row r of `hidden` ([m, H]) as tap `tap` of the position-indexed ring (taps [cap, taps_n * H]) when the row's
+// The columns of a position's tap row (taps_n taps of hidden, one after the other) that a rank's ring keeps: the whole row, or the rank's
+// contiguous share of it when the drafter's fc is row-parallel over the row (each rank then projects its own columns and the partial sums are
+// all-reduced)
+struct TapSlice {
+	int hidden = 0, taps_n = 0;   // the whole row: taps_n * hidden columns
+	int col0 = 0, cols = 0;       // the kept columns [col0, col0 + cols)
+	bool whole() const { return col0 == 0 && cols == taps_n * hidden; }
+	// Tap `tap`'s part of the kept columns: hidden columns [*src0, *src0 + *n) land at column *dst0 of the kept row; false when the rank keeps none of it
+	bool span( int tap, int* src0, int* dst0, int* n ) const {
+		const int a = MAX( tap * hidden, col0 ), b = MIN( ( tap + 1 ) * hidden, col0 + cols );
+		if ( a >= b ) return false;
+		*src0 = a - tap * hidden;
+		*dst0 = a - col0;
+		*n = b - a;
+		return true;
+	}
+};
+
+// Publishes row r of `hidden` ([m, hidden]) as tap `tap` of the position-indexed ring (taps [cap, slice.cols]) when the row's
 // slot owns the ring. Slot, position and owner come from device memory so the launch is graph-replayable.
 void dflash_publish_taps(
 	backend::half_t* taps,
@@ -15,13 +33,12 @@ void dflash_publish_taps(
 	const int* d_owner,
 	int m,
 	int tap,
-	int H,
+	const TapSlice& slice,
 	int cap,
-	backend::stream_t stream,
-	int taps_n = 5
+	backend::stream_t stream
 );
 
-// The same with one ring per slot (taps [slots, cap, taps_n * H], slot_stride elements apart): every row publishes to its own slot's ring, so several slots can
+// The same with one ring per slot (taps [slots, cap, slice.cols], slot_stride elements apart): every row publishes to its own slot's ring, so several slots can
 // feed a drafter at once. CUDA only (the backends without it keep the single owner ring).
 void dflash_publish_taps_slots(
 	backend::half_t* taps,
@@ -29,11 +46,10 @@ void dflash_publish_taps_slots(
 	const pod::BatchRows* d_rows,
 	int m,
 	int tap,
-	int H,
+	const TapSlice& slice,
 	int cap,
 	size_t slot_stride,
-	backend::stream_t stream,
-	int taps_n = 5
+	backend::stream_t stream
 );
 
 // The same from FP32 rows (a model whose residual stream is FP32), rounded to FP16
@@ -43,11 +59,10 @@ void dflash_publish_taps_slots_f32(
 	const pod::BatchRows* d_rows,
 	int m,
 	int tap,
-	int H,
+	const TapSlice& slice,
 	int cap,
 	size_t slot_stride,
-	backend::stream_t stream,
-	int taps_n
+	backend::stream_t stream
 );
 
 // Reduces mHC residual streams [m, 4, H] (FP32) to one FP16 hidden row per token: mode 0 = mean of the four streams,

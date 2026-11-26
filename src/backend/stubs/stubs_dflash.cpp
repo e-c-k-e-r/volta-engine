@@ -68,6 +68,11 @@ __attribute__(( weak )) void DFlashSpeculator::draft_select( const float* vals, 
 	__builtin_unreachable();
 }
 
+__attribute__(( weak )) void DFlashSpeculator::stage_book_rows( const int* cand_idx, int anchor, backend::stream_t stream ) {
+	ENGINE_UNSUPPORTED( "DFlashSpeculator::stage_book_rows" );
+	__builtin_unreachable();
+}
+
 __attribute__(( weak )) void DFlashSpeculator::destroy() {
 	// Nothing to release: init() is unsupported on this backend
 }

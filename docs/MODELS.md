@@ -164,7 +164,7 @@ The final mixer is the same without `post` and gives the head's input.
   generation with `end_turn` and no visible output.
 
 ```
-build/volta_server --config configs/flash_next_nvfp4.json      # EXL3 trunk, NVFP4 experts and dense groups, MTP, 256K x 4 slots
+build/volta_server --config configs/flash_next_nvfp4.json      # the NVFP4 checkpoint, MTP, 256K x 4 slots
 build/volta_server --model-dir <Flash-Next EXL3> --speculative --set speculator=mtp
 ```
 

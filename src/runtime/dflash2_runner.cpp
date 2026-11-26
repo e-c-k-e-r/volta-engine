@@ -105,11 +105,15 @@ bool DFlash2Runner::init( ModelCluster& mc, const std::string& draft_dir ) {
 
 	tp_ = runtime::options().draft_tp ? mc.tp() : 1;
 	per_slot_ = runtime::options().draft_per_slot && mc.model( 0 ).draft_hooks().taps_slot_stride > 0 && meta.max_slots <= kMaxSlots;
+	// a sharded tap ring (every rank keeps its share of the tap rows) needs the drafter on every rank, where fc is row-parallel over the shares
+	ENGINE_ASSERT( mc.model( 0 ).draft_hooks().tap_slice.whole() || tp_ == mc.tp(), "DFlash2Runner: a sharded tap ring needs the tensor-parallel drafter" );
 	bool loaded = true;
 	for ( int d = 0; d < tp_; ++d ) {
 		backend::set_device( d );
 		if ( per_slot_ ) spec_[d].set_contexts( meta.max_slots );
 		spec_[d].set_candidate_ranks( mc.tp() );
+		spec_[d].set_tap_slice( mc.model( d ).draft_hooks().tap_slice );
+		if ( tp_ > 1 ) spec_[d].set_vocab_shard( mc.model( d ).draft_hooks().shard_offset, mc.model( d ).draft_hooks().shard_real_cols );
 		if ( tp_ > 1 ) spec_[d].set_ring( mc.ring( d ) );
 		const size_t mem0 = mc.arena( d ).offset_bytes;
 		if ( !spec_[d].init( cfg, d, mc.arena( d ), mc.stream( d ), d, tp_ ) ) return false;
@@ -227,6 +231,8 @@ int DFlash2Runner::draft_queue( int slot, int anchor, int pos, float depth_thres
 			spec_[d].draft_backbone( *hk.embedding, anchor, hk.taps + static_cast<size_t>( per_slot_ ? slot : 0 ) * hk.taps_slot_stride, pos, hk.taps_cap, mc.stream( d ) );
 			backend::memcpy_async( hk.lm_in, spec_[d].draft_hidden().data, hid_bytes, backend::Copy::D2D, mc.stream( d ) );
 			mc.model( d ).draft_head_topk( M, mc.stream( d ) );
+			// the codebook rows of this rank's candidates (and of the anchor when its shard holds it) for the walk on rank 0
+			if ( spec_[d].books_sharded() ) spec_[d].stage_book_rows( hk.cand_idx, anchor, mc.stream( d ) );
 		} );
 	}
 	else {
@@ -259,9 +265,9 @@ int DFlash2Runner::draft_queue( int slot, int anchor, int pos, float depth_thres
 			const int H = mc.metadata().hidden_size;
 			ENGINE_ASSERT( pos <= hk0.taps_cap, "dump: context longer than the tap ring" );
 			std::vector<backend::half_t> taps( static_cast<size_t>( pos ) * hk0.taps_n * H ), hid( static_cast<size_t>( M ) * H );
+			ENGINE_ASSERT( pos == 0 || mc.read_taps( per_slot_ ? slot : 0, 0, pos, taps.data() ), "dump: the tap ring could not be read" );
 			backend::set_device( 0 );
 			backend::stream_sync( s0 );
-			backend::memcpy_sync( taps.data(), hk0.taps, taps.size() * sizeof( backend::half_t ), backend::Copy::D2H );
 			backend::memcpy_sync( hid.data(), spec_[0].draft_hidden().data, hid.size() * sizeof( backend::half_t ), backend::Copy::D2H );
 			FILE* f = std::fopen( "/tmp/draft_dump.bin", "wb" );
 			if ( f == nullptr ) LOG_ERROR( "[dump] cannot write /tmp/draft_dump.bin\n" );
@@ -280,10 +286,13 @@ int DFlash2Runner::draft_queue( int slot, int anchor, int pos, float depth_thres
 	const size_t val_bytes = static_cast<size_t>( M ) * models::kDraftTopK * sizeof( float );
 	const size_t idx_bytes = static_cast<size_t>( M ) * models::kDraftTopK * sizeof( int );
 	backend::set_device( 0 );
+	int anchor_rank = 0;
 	for ( int d = 0; d < mc.tp(); ++d ) {
 		const auto& hk = mc.model( d ).draft_hooks();
 		backend::peer_copy_async( spec_[0].merged_cand_values_ptr( d ), 0, hk.cand_vals, d, val_bytes, s0 );
 		backend::peer_copy_async( spec_[0].merged_cand_indices_ptr( d ), 0, hk.cand_idx, d, idx_bytes, s0 );
+		if ( spec_[0].books_sharded() && d > 0 ) backend::peer_copy_async( spec_[0].book_stage( d ), 0, spec_[d].book_stage( 0 ), d, spec_[0].book_stage_elems() * sizeof( backend::half_t ), s0 );
+		if ( anchor >= hk.shard_offset && anchor < hk.shard_offset + hk.shard_real_cols ) anchor_rank = d;
 	}
 	engine::spec::dflash2_topk_merge(
 		spec_[0].merged_cand_values_ptr( 0 ), spec_[0].merged_cand_indices_ptr( 0 ),
@@ -294,6 +303,7 @@ int DFlash2Runner::draft_queue( int slot, int anchor, int pos, float depth_thres
 	mark( SpecProfile::WALK );
 	spec_[0].project_gate( M, s0 );
 	spec_[0].set_walk_anchor( anchor, s0 );
+	spec_[0].set_walk_anchor_rank( anchor_rank );
 	spec_[0].draft_select( spec_[0].merged_final_values_ptr(), spec_[0].merged_final_indices_ptr(), K, s0 );
 	if ( h_draft_ == nullptr ) {
 		h_draft_ = static_cast<int*>( backend::host_alloc_pinned( M * sizeof( int ), backend::Pin::Default ) );

@@ -101,12 +101,12 @@ bool DFlashSpeculator::init(
 	draft_hidden_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, h_shape, 2 );
 
 	// Merge staging for the distributed per-row candidate top-k. Rank d's slice starts at d * rows * k
-	// and every rank writes the same width, so the merge can walk them with one stride.
+	// and every rank writes the same width, so the merge can walk them with one stride; the merged top-k follows the last rank's.
 	{
 		const int mr = M;
 		// cand_ranks_, not tp_size_: the drafter runs unsharded on rank 0 while the target's head is
 		// sharded, and sizing this from tp_size_ let rank 1's slice land on top of the index buffer.
-		const int mel = cand_ranks_ * mr * top_k;
+		const int mel = ( cand_ranks_ + 1 ) * mr * top_k;
 		int mv[1] = { mel };
 		merge_vals_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, mv, 1 );
 		merge_ix_ = engine::core::arena_alloc_tensor( arena, pod::DType::INT32, mv, 1 );
@@ -209,25 +209,32 @@ bool DFlashSpeculator::init(
 	drafter_v_ = ctxs_[0].v;
 	kv_len_ = 0;
 
-	int ctx_tap_shape[2] = { ctx_chunk_, config_.num_target_layer_ids * H };
-	bb_ctx_fc_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ctx_tap_shape, 2 );
 	int ctx_shape[2] = { ctx_chunk_, H };
+	bb_ctx_fc_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ctx_shape, 2 );
 	bb_ctx_normed_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ctx_shape, 2 );
 	int ctx_res_shape[2] = { ctx_chunk_, H };
 	bb_ctx_resid_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP32, ctx_res_shape, 2 );
 
-	// Default dummy codebooks (for standalone benchmarks or tests without weights on disk)
-	// Only the output rank (0) runs the selector walk, so the other ranks of a TP drafter skip the 254 MiB. DFlash v1 has no selector.
-	if ( rank_ == 0 && config_.version >= 2 ) {
-		int cb_shape[2] = { config_.vocab_size, sel_rank };
+	// Default dummy codebooks (for standalone benchmarks or tests without weights on disk). The walk runs on the output rank (0): it keeps
+	// them whole unless the drafter is tensor-parallel, where every rank keeps the rows of its head's vocabulary shard and stages the rows
+	// its candidates need each round. DFlash v1 has no selector.
+	books_sharded_ = TP > 1 && book_cols_ > 0 && config_.version >= 2;
+	if ( config_.version >= 2 && ( rank_ == 0 || books_sharded_ ) ) {
+		int cb_shape[2] = { books_sharded_ ? book_cols_ : config_.vocab_size, sel_rank };
 		pred_codebook_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, cb_shape, 2 );
 		succ_codebook_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, cb_shape, 2 );
+	}
+	if ( books_sharded_ ) {
+		stage_rows_ = M * top_k + 1;
+		int st_shape[2] = { ( rank_ == 0 ? cand_ranks_ : 1 ) * 2 * stage_rows_, sel_rank };
+		book_stage_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, st_shape, 2 );
 	}
 
 	if ( rank_ == 0 ) {
 		const size_t kv_bytes = 2 * kv_elems * sizeof( half ) * ctxs_.size();
-		const size_t book_bytes = config_.version >= 2 ? 2 * static_cast<size_t>( config_.vocab_size ) * sel_rank * sizeof( half ) : 0;
-		if ( engine::runtime::options().mem_log ) LOG_INFO( "[mem] drafter rank 0: KV ring %.0f MiB, selector codebooks %.0f MiB (rank 0 only)\n", kv_bytes / 1048576.0, book_bytes / 1048576.0 );
+		const size_t book_bytes = pred_codebook_.data ? 2 * pred_codebook_.size_bytes() : 0;
+		if ( engine::runtime::options().mem_log ) LOG_INFO( "[mem] drafter rank 0: KV ring %.0f MiB, selector codebooks %.0f MiB (%s)\n", kv_bytes / 1048576.0, book_bytes / 1048576.0,
+			books_sharded_ ? "its vocabulary shard, every rank holds its own" : "rank 0 only" );
 	}
 	initialized_ = true;
 	return true;
@@ -379,12 +386,19 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 	}
 	const int L = config_.num_hidden_layers;
 
-	// Context projection: the tapped target states (taps * H) -> H. Column-parallel on the output with an
-	// all-gather back to full width, so the 82 MB weight is a quarter per rank instead of replicated.
-	// Column-parallel only when every rank's slice is whole 128-wide Hadamard blocks (Gemma 4's 5376 / 4 = 1344 is not: every rank
-	// then runs the whole fc)
-	fc_sharded_ = TP > 1 && ( H / TP ) % 128 == 0;
-	fc_ = load_shard( repo, "fc", *arena_, 1, R, fc_sharded_ ? TP : 1, stream );
+	// Context projection: the tapped target states (taps * H) -> H. Over a sharded tap ring it is row-parallel: rank R holds the input
+	// columns its ring keeps ([R * cols, (R + 1) * cols) of the row, which the target sized to whole 128-wide Hadamard blocks) and the partial
+	// outputs are all-reduced. Otherwise column-parallel on the output with an all-gather back to full width, so the 82 MB weight is a quarter
+	// per rank instead of replicated; that only when every rank's slice is whole 128-wide Hadamard blocks (Gemma 4's 5376 / 4 = 1344 is not:
+	// every rank then runs the whole fc)
+	fc_rows_ = TP > 1 && !tap_slice_.whole();
+	fc_sharded_ = !fc_rows_ && TP > 1 && ( H / TP ) % 128 == 0;
+	if ( fc_rows_ ) {
+		ENGINE_ASSERT( tap_slice_.cols * TP == config_.num_target_layer_ids * H && tap_slice_.col0 == R * tap_slice_.cols && engine::runtime::options().dflash_hessian_dir.empty(),
+			"dflash2: a sharded tap ring is the rank's contiguous 1 / tp of every tap row (and no Hessian capture)" );
+		fc_ = load_shard( repo, "fc", *arena_, 0, R, TP, stream );
+	}
+	else fc_ = load_shard( repo, "fc", *arena_, 1, R, fc_sharded_ ? TP : 1, stream );
 	if ( fc_.type == pod::QuantType::TRELLIS && fc_.bits > 6 ) {
 		// The 8-bit EXL3 fc has no fused-GEMM instantiation (only 2..6 bits are built); run it as the dense FP16 shard
 		// an unquantized checkpoint would give.
@@ -394,20 +408,22 @@ bool DFlashSpeculator::load_weights( const char* model_dir, cudaStream_t stream 
 	fc_norm_ = repo.load( "hidden_norm.weight", *arena_, stream, pod::DType::FP16 );
 	final_norm_ = repo.load( "norm.weight", *arena_, stream, pod::DType::FP16 );
 
-	// Candidate selector: read by the walk on the output rank (0) only.
-	if ( R == 0 && config_.version >= 2 ) {
+	// Candidate selector: the walk runs on the output rank (0); the codebooks are whole there, or every rank's vocabulary shard of them.
+	if ( config_.version >= 2 && ( R == 0 || books_sharded_ ) ) {
 		// into the codebooks init() reserved (a standalone run without weights keeps them as they are)
 		auto into = [&]( const char* name, pod::TensorView& book ) {
 			pod::MemoryArena in_book{ book.data, book.size_bytes(), 0, false };
-			const pod::TensorView t = repo.load( name, book.data ? in_book : *arena_, stream, pod::DType::FP16 );
+			pod::MemoryArena& a = book.data ? in_book : *arena_;
+			const pod::TensorView t = books_sharded_
+				? pod::make_tensor_2d( repo.load_dense_rows_padded( name, a, book_off_, book_cols_, 0, stream ).w0.data, pod::DType::FP16, book_cols_, config_.selector_rank )
+				: repo.load( name, a, stream, pod::DType::FP16 );
 			ENGINE_ASSERT( !book.data || !t.data || t.data == book.data, "dflash2: a codebook does not fit the reserved one" );
 			if ( t.data ) book = t;
 		};
 		into( "candidate_selector.predecessor_codebook", pred_codebook_ );
-		into( "candidate_selector.successor_codebook", succ_codebook_ );
-		// The selector's hidden projection is a plain FP16 [rank, hidden] matrix, not a trellis tensor, so
+		into( "candidate_selector.successor_codebook", succ_codebook_ );		// The selector's hidden projection is a plain FP16 [rank, hidden] matrix, not a trellis tensor, so
 		// it cannot go through load_linear. Stored as a raw weight for a small dedicated GEMV.
-		hidden_proj_w_ = load_dense_proj( repo, "candidate_selector.hidden_projection", *arena_, stream );
+		if ( R == 0 ) hidden_proj_w_ = load_dense_proj( repo, "candidate_selector.hidden_projection", *arena_, stream );
 	}
 
 	// Backbone. The residual stream stays full width and replicated; only heads and the MLP

@@ -267,12 +267,17 @@ void dflash2_selector_walk_kernel(
 	float* __restrict__ conf,               // [bsz, rows + 1] or nullptr
 	const int rows,
 	const int k,
-	const int rank
+	const int rank,
+	const WalkStage st                      // st.part_ix: the codebook rows are staged (pred_cb = succ_cb = the stage)
 ) {
 	extern __shared__ float smem[];
 	float* a_g = smem;                      // [rank]: A[pred] * gate[i]
 	float* scores = smem + rank;            // [k]
 	__shared__ int s_pred;
+	__shared__ int s_pred_row;              // the predecessor's row in pred_cb: its token id, or its stage row
+	__shared__ int s_cand_row[32];          // staged: each candidate's predecessor-book stage row
+	const bool staged = st.part_ix != nullptr;
+	const int64_t book = staged ? static_cast<int64_t>( st.stage_rows ) * rank : 0;   // from a rank's predecessor rows to its successor rows
 
 	const int b = blockIdx.x;
 	const int t = threadIdx.x;
@@ -280,14 +285,14 @@ void dflash2_selector_walk_kernel(
 
 	if ( t == 0 ) {
 		s_pred = anchor[b];
+		s_pred_row = staged ? st.anchor_rank * 2 * st.stage_rows + st.stage_rows - 1 : s_pred;
 		out[static_cast<int64_t>( b ) * ( rows + 1 )] = s_pred;
 		if ( conf ) conf[static_cast<int64_t>( b ) * ( rows + 1 )] = 1.0f;
 	}
 	__syncthreads();
 
 	for ( int i = 0; i < rows; ++i ) {
-		const int pred = s_pred;
-		const half* a_row = pred_cb + static_cast<int64_t>( pred ) * rank;
+		const half* a_row = pred_cb + static_cast<int64_t>( s_pred_row ) * rank;
 		const half* g_row = gate + ( static_cast<int64_t>( b ) * rows + i ) * rank;
 
 		for ( int r = t; r < rank; r += WALK_THREADS ) {
@@ -299,7 +304,20 @@ void dflash2_selector_walk_kernel(
 		const float* u_row = unary + ( static_cast<int64_t>( b ) * rows + i ) * k;
 
 		for ( int c = warp; c < k; c += WALK_THREADS / 32 ) {
-			const half* b_row = succ_cb + static_cast<int64_t>( c_row[c] ) * rank;
+			int64_t row = c_row[c];
+			if ( staged ) {
+				// the candidate's place among the ranks' local top-k of its block row (exactly one rank's shard holds its id)
+				const int prow = ( st.row0 + i ) * 16;
+				int hit = -1;
+				for ( int e = lane; e < st.ranks * 16; e += 32 ) {
+					if ( st.part_ix[static_cast<int64_t>( e / 16 ) * st.part_rows * 16 + prow + e % 16] == c_row[c] ) hit = e;
+				}
+				const unsigned found = __ballot_sync( 0xffffffff, hit >= 0 );
+				hit = found ? __shfl_sync( 0xffffffff, hit, __ffs( found ) - 1 ) : 0;
+				row = static_cast<int64_t>( hit / 16 ) * 2 * st.stage_rows + prow + hit % 16;
+				if ( lane == 0 ) s_cand_row[c] = static_cast<int>( row );
+			}
+			const half* b_row = succ_cb + book + row * rank;
 			float dot = 0.0f;
 			for ( int r = lane; r < rank; r += 32 ) {
 				dot += a_g[r] * __half2float( b_row[r] );
@@ -322,6 +340,7 @@ void dflash2_selector_walk_kernel(
 				}
 			}
 			s_pred = c_row[best];
+			s_pred_row = staged ? s_cand_row[best] : s_pred;
 			out[static_cast<int64_t>( b ) * ( rows + 1 ) + i + 1] = s_pred;
 			if ( conf ) {
 				float sum_exp = 0.0f;
@@ -1271,14 +1290,40 @@ void dflash2_selector_walk(
 	int rows,
 	int k,
 	int rank,
-	cudaStream_t stream
+	cudaStream_t stream,
+	const WalkStage* stage
 ) {
 	if ( bsz <= 0 || rows <= 0 ) return;
+	ENGINE_ASSERT( stage == nullptr || ( k <= 32 && bsz == 1 ), "dflash2_selector_walk: a staged walk takes one block of at most 32 candidates per row" );
 	size_t smem = ( rank + k ) * sizeof( float );
 	dim3 grid( bsz, 1 );
 	dflash2_selector_walk_kernel<<<grid, WALK_THREADS, smem, stream>>>(
-		unary, cands, gate, pred_cb, succ_cb, anchor, out_tokens, conf, rows, k, rank
+		unary, cands, gate, pred_cb, succ_cb, anchor, out_tokens, conf, rows, k, rank, stage ? *stage : WalkStage{}
 	);
+}
+
+// One block per staged row: blocks 0..n-1 copy candidate j's two rows, block n the anchor's predecessor row (when this shard holds it)
+__global__ void dflash2_stage_book_rows_kernel( const int4* __restrict__ pred_cb, const int4* __restrict__ succ_cb, int book_off, int book_cols,
+	const int* __restrict__ cand, int n, int anchor, int4* __restrict__ stage, int vecs ) {
+	const int j = blockIdx.x;
+	const int id = j < n ? cand[j] : anchor;
+	const int local = id - book_off;
+	const bool own = local >= 0 && local < book_cols;
+	if ( j == n && !own ) return;
+	const int64_t book = static_cast<int64_t>( n + 1 ) * vecs;   // the predecessor rows, then the successor rows
+	for ( int v = threadIdx.x; v < vecs; v += blockDim.x ) {
+		// a candidate outside the shard cannot happen (the head's local top-k is its own shard); zeros keep a broken one finite
+		stage[static_cast<int64_t>( j ) * vecs + v] = own ? pred_cb[static_cast<int64_t>( local ) * vecs + v] : make_int4( 0, 0, 0, 0 );
+		if ( j < n ) stage[book + static_cast<int64_t>( j ) * vecs + v] = own ? succ_cb[static_cast<int64_t>( local ) * vecs + v] : make_int4( 0, 0, 0, 0 );
+	}
+}
+
+void dflash2_stage_book_rows( const half* pred_cb, const half* succ_cb, int book_off, int book_cols, const int* cand, int n, int anchor, half* stage, int rank,
+	cudaStream_t stream ) {
+	ENGINE_ASSERT( rank % 8 == 0, "dflash2_stage_book_rows: the selector rank is a multiple of 8" );
+	const int vecs = rank / 8;
+	dflash2_stage_book_rows_kernel<<<n + 1, MIN( vecs, 256 ), 0, stream>>>( reinterpret_cast<const int4*>( pred_cb ), reinterpret_cast<const int4*>( succ_cb ),
+		book_off, book_cols, cand, n, anchor, reinterpret_cast<int4*>( stage ), vecs );
 }
 
 void dflash2_topk(

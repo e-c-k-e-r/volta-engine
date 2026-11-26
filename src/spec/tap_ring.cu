@@ -7,7 +7,12 @@ namespace {
 __device__ __forceinline__ half tap_value( half v ) { return v; }
 __device__ __forceinline__ half tap_value( float v ) { return __float2half_rn( v ); }
 
-// T = half, or float for a model whose residual stream is FP32 (Gemma 4); a position row holds taps_n taps of H
+// The columns one launch moves: hidden columns [src0, src0 + n) of a [m, H] row to column dst0 of a ring row of `row` columns
+struct TapSpan {
+	int src0, dst0, n, H, row;
+};
+
+// T = half, or float for a model whose residual stream is FP32 (Gemma 4)
 template <typename T>
 __global__ void dflash_store_taps_kernel(
 	half* __restrict__ taps,
@@ -15,19 +20,17 @@ __global__ void dflash_store_taps_kernel(
 	const pod::BatchRows* __restrict__ rows,
 	const int* __restrict__ owner,
 	int m,
-	int tap,
-	int H,
-	int cap,
-	int taps_n
+	TapSpan sp,
+	int cap
 ) {
 	const int r = blockIdx.y;
 	if ( r >= m ) return;
 	if ( rows->slot[r] != *owner ) return;
 	const int pos = rows->pos[r];
 	if ( pos < 0 ) return;
-	half* dst = taps + static_cast<size_t>( pos % cap ) * taps_n * H + static_cast<size_t>( tap ) * H;
-	const T* src = hidden + static_cast<size_t>( r ) * H;
-	for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < H; i += blockDim.x ) dst[i] = tap_value( src[i] );
+	half* dst = taps + static_cast<size_t>( pos % cap ) * sp.row + sp.dst0;
+	const T* src = hidden + static_cast<size_t>( r ) * sp.H + sp.src0;
+	for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < sp.n; i += gridDim.x * blockDim.x ) dst[i] = tap_value( src[i] );
 }
 
 template <typename T>
@@ -36,19 +39,24 @@ __global__ void dflash_store_taps_slots_kernel(
 	const T* __restrict__ hidden,
 	const pod::BatchRows* __restrict__ rows,
 	int m,
-	int tap,
-	int H,
+	TapSpan sp,
 	int cap,
-	size_t slot_stride,
-	int taps_n
+	size_t slot_stride
 ) {
 	const int r = blockIdx.y;
 	if ( r >= m ) return;
 	const int pos = rows->pos[r];
 	if ( pos < 0 ) return;
-	half* dst = taps + static_cast<size_t>( rows->slot[r] ) * slot_stride + static_cast<size_t>( pos % cap ) * taps_n * H + static_cast<size_t>( tap ) * H;
-	const T* src = hidden + static_cast<size_t>( r ) * H;
-	for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < H; i += blockDim.x ) dst[i] = tap_value( src[i] );
+	half* dst = taps + static_cast<size_t>( rows->slot[r] ) * slot_stride + static_cast<size_t>( pos % cap ) * sp.row + sp.dst0;
+	const T* src = hidden + static_cast<size_t>( r ) * sp.H + sp.src0;
+	for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < sp.n; i += gridDim.x * blockDim.x ) dst[i] = tap_value( src[i] );
+}
+
+// The span of `tap` in the slice; false when the rank keeps none of it (nothing to launch)
+bool tap_span( const TapSlice& sl, int tap, TapSpan* sp ) {
+	sp->H = sl.hidden;
+	sp->row = sl.cols;
+	return sl.span( tap, &sp->src0, &sp->dst0, &sp->n );
 }
 
 __global__ void reduce_streams_kernel( const float* __restrict__ streams, half* __restrict__ out, int H, int mode ) {
@@ -71,13 +79,14 @@ void dflash_publish_taps(
 	const int* d_owner,
 	int m,
 	int tap,
-	int H,
+	const TapSlice& slice,
 	int cap,
-	cudaStream_t stream,
-	int taps_n
+	cudaStream_t stream
 ) {
-	dim3 g( ( H + 255 ) / 256, m );
-	dflash_store_taps_kernel<half><<<g, 256, 0, stream>>>( taps, hidden, d_rows, d_owner, m, tap, H, cap, taps_n );
+	TapSpan sp;
+	if ( !tap_span( slice, tap, &sp ) ) return;
+	dim3 g( ( sp.n + 255 ) / 256, m );
+	dflash_store_taps_kernel<half><<<g, 256, 0, stream>>>( taps, hidden, d_rows, d_owner, m, sp, cap );
 }
 
 void dflash_publish_taps_slots(
@@ -86,20 +95,23 @@ void dflash_publish_taps_slots(
 	const pod::BatchRows* d_rows,
 	int m,
 	int tap,
-	int H,
+	const TapSlice& slice,
 	int cap,
 	size_t slot_stride,
-	cudaStream_t stream,
-	int taps_n
+	cudaStream_t stream
 ) {
-	dim3 g( ( H + 255 ) / 256, m );
-	dflash_store_taps_slots_kernel<half><<<g, 256, 0, stream>>>( taps, hidden, d_rows, m, tap, H, cap, slot_stride, taps_n );
+	TapSpan sp;
+	if ( !tap_span( slice, tap, &sp ) ) return;
+	dim3 g( ( sp.n + 255 ) / 256, m );
+	dflash_store_taps_slots_kernel<half><<<g, 256, 0, stream>>>( taps, hidden, d_rows, m, sp, cap, slot_stride );
 }
 
-void dflash_publish_taps_slots_f32( half* taps, const float* hidden, const pod::BatchRows* d_rows, int m, int tap, int H, int cap, size_t slot_stride,
-	cudaStream_t stream, int taps_n ) {
-	dim3 g( ( H + 255 ) / 256, m );
-	dflash_store_taps_slots_kernel<float><<<g, 256, 0, stream>>>( taps, hidden, d_rows, m, tap, H, cap, slot_stride, taps_n );
+void dflash_publish_taps_slots_f32( half* taps, const float* hidden, const pod::BatchRows* d_rows, int m, int tap, const TapSlice& slice, int cap, size_t slot_stride,
+	cudaStream_t stream ) {
+	TapSpan sp;
+	if ( !tap_span( slice, tap, &sp ) ) return;
+	dim3 g( ( sp.n + 255 ) / 256, m );
+	dflash_store_taps_slots_kernel<float><<<g, 256, 0, stream>>>( taps, hidden, d_rows, m, sp, cap, slot_stride );
 }
 
 void dflash_reduce_streams( const float* streams, half* out, int m, int H, int mode, cudaStream_t stream ) {

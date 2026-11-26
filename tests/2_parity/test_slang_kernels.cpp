@@ -472,7 +472,7 @@ int main() {
 		owner.set( { 0 } );
 		Buf hidden( m * H ), t1( cap * 5 * H ), t2( cap * 5 * H );
 		t2.set( t1.get() );
-		spec::dflash_publish_taps( t1.d, hidden.d, rws.d, owner.d, m, tap, H, cap, s );
+		spec::dflash_publish_taps( t1.d, hidden.d, rws.d, owner.d, m, tap, spec::TapSlice{ H, 5, 0, 5 * H }, cap, s );
 		slang_dflash_store_taps( t2.d, hidden.d, rws.slots(), rws.pos(), owner.d, m, tap, H, cap, s );
 		backend::stream_sync( s );
 		pass = compare( "dflash_store_taps", t1.get(), t2.get() ) && pass;

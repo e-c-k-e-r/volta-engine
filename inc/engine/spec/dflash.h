@@ -12,6 +12,7 @@
 #include "engine/modules/linear.h"
 #include "engine/modules/hessian.h"
 #include "engine/backend/types.h"
+#include "engine/spec/tap_ring.h"
 
 namespace pod {
 
@@ -118,7 +119,26 @@ void dflash_scale_f32( float* x, int n, float s, backend::stream_t stream = null
 // The DFlash v1 draft: out[0] = *d_anchor, out[1 + i] = ix[( 1 + i ) * k] (the best merged candidate of block row 1 + i), i < rows
 void dflash_argmax_draft( const int* ix, int k, const int* d_anchor, int* out, int rows, backend::stream_t stream = nullptr );
 
-// Pure CUDA candidate selector walk (greedy chained walk)
+// The walk over staged codebook rows instead of whole codebooks (a tensor-parallel drafter keeps its vocabulary shard of each codebook): rank
+// d's stage holds, per codebook, the rows of its own candidates in the order of its local top-k (part_ix rank d, part_rows rows of 16) and
+// then the anchor's predecessor row when its shard holds the anchor. Row j of rank d's book b (0 predecessor, 1 successor) is
+// stage[( ( d * 2 + b ) * stage_rows + j ) * rank]; the walk finds each merged candidate among the ranks' local ids
+struct WalkStage {
+	const int* part_ix = nullptr;   // [ranks, part_rows * 16] the ranks' local candidate ids (the merge's input)
+	int ranks = 0;
+	int part_rows = 0;
+	int stage_rows = 0;             // part_rows * 16 + 1
+	int row0 = 0;                   // the part_ix row of walk step 0 (the walk starts at block row 1)
+	int anchor_rank = 0;            // the rank whose stage holds the anchor's predecessor row
+};
+
+// Stages a rank's codebook rows for the walk (WalkStage): the predecessor and successor rows of the n local candidates cand ([n] global ids,
+// all inside the shard [book_off, book_off + book_cols) whose rows pred_cb / succ_cb hold) at rows 0..n-1 of the stage's two books, and
+// the anchor's predecessor row at row n when the shard holds it
+void dflash2_stage_book_rows( const backend::half_t* pred_cb, const backend::half_t* succ_cb, int book_off, int book_cols, const int* cand, int n, int anchor,
+	backend::half_t* stage, int rank, backend::stream_t stream = nullptr );
+
+// Pure CUDA candidate selector walk (greedy chained walk). With `stage`, pred_cb and succ_cb are both the stage base (WalkStage)
 void dflash2_selector_walk(
 	const float* unary,       // [bsz, rows, k]
 	const int* cands,          // [bsz, rows, k]
@@ -132,7 +152,8 @@ void dflash2_selector_walk(
 	int rows,
 	int k,
 	int rank,
-	backend::stream_t stream = nullptr
+	backend::stream_t stream = nullptr,
+	const WalkStage* stage = nullptr
 );
 
 // Pure CUDA Top-K extraction from logits
@@ -315,6 +336,24 @@ public:
 	// Number of target LM-head ranks that contribute a candidate slice to the merge. The drafter's own
 	// tp_size is 1 while the head is sharded, so the merge staging cannot be sized from tp_size_.
 	void set_candidate_ranks( int ranks ) { cand_ranks_ = MAX( ranks, 1 ); }
+	// The columns of each tap row this rank's ring keeps (DraftHooks::tap_slice), before load_weights: a rank's share of a sharded ring makes fc
+	// row-parallel over those columns (each rank projects its own, the partial sums are all-reduced)
+	void set_tap_slice( const TapSlice& slice ) { tap_slice_ = slice; }
+	// The rows of the target head's vocabulary shard (DraftHooks::shard_offset / shard_real_cols), before init: a tensor-parallel drafter keeps
+	// those rows of each selector codebook instead of rank 0 keeping them whole. Every rank then stages the rows of its own candidates
+	// (stage_book_rows), rank 0 collects the stages (book_stage) and the walk reads them there
+	void set_vocab_shard( int offset, int cols ) {
+		book_off_ = offset;
+		book_cols_ = cols;
+	}
+	bool books_sharded() const { return books_sharded_; }
+	// This rank's stage of the round: the codebook rows of its local candidates cand_idx ([kDraftM, kDraftTopK] global ids) and of the anchor
+	void stage_book_rows( const int* cand_idx, int anchor, backend::stream_t stream = nullptr );
+	// Rank d's stage in rank 0's collection (rank 0's own is d = 0; another rank has only its own, d = 0)
+	backend::half_t* book_stage( int d ) { return book_stage_.ptr<backend::half_t>() + static_cast<size_t>( d ) * book_stage_elems(); }
+	size_t book_stage_elems() const { return static_cast<size_t>( 2 ) * stage_rows_ * config_.selector_rank; }
+	// The rank whose stage holds the anchor's predecessor row (the owner of its vocabulary shard), for the next walk
+	void set_walk_anchor_rank( int d ) { anchor_rank_ = d; }
 	~DFlashSpeculator();
 
 	bool init(
@@ -396,11 +435,12 @@ public:
 	const pod::TensorView& draft_hidden() const { return draft_hidden_; }
 
 	// Merge staging for the distributed per-row top-k. Rank d's [rows, k] local top-k lands at
-	// base + d * rows * k, and the merge reduces those tp_size * k candidates to the global top-k.
+	// base + d * rows * k, and the merge reduces those tp_size * k candidates to the global top-k, written past them (the walk over staged
+	// codebook rows still reads the ranks' local ids).
 	float* merged_cand_values_ptr( int d ) { return merge_vals_.ptr<float>() + static_cast<size_t>( d ) * merge_stride(); }
 	int* merged_cand_indices_ptr( int d ) { return merge_ix_.ptr<int>() + static_cast<size_t>( d ) * merge_stride(); }
-	float* merged_final_values_ptr() { return merge_vals_.ptr<float>(); }
-	int* merged_final_indices_ptr() { return merge_ix_.ptr<int>(); }
+	float* merged_final_values_ptr() { return merged_cand_values_ptr( cand_ranks_ ); }
+	int* merged_final_indices_ptr() { return merged_cand_indices_ptr( cand_ranks_ ); }
 	int merge_stride() const { return config_.block_size * config_.selector_top_k; }
 
 	// One draft round of the drafter backbone.
@@ -463,9 +503,16 @@ private:
 	// Weights loaded via SafeTensorsRepo
 	pod::LinearWeight fc_;
 	bool fc_sharded_ = false;   // fc column-parallel across the drafter's ranks (otherwise whole on every rank)
+	bool fc_rows_ = false;      // fc row-parallel over this rank's columns of a sharded tap ring
+	TapSlice tap_slice_;        // unset: the taps arrive as whole rows
 	pod::TensorView fc_norm_;
-	pod::TensorView pred_codebook_;
+	pod::TensorView pred_codebook_;   // [vocab, selector_rank], or the rows of this rank's vocabulary shard (books_sharded_)
 	pod::TensorView succ_codebook_;
+	int book_off_ = 0, book_cols_ = 0;
+	bool books_sharded_ = false;
+	int stage_rows_ = 0;              // kDraftM * kDraftTopK + 1 (WalkStage::stage_rows)
+	pod::TensorView book_stage_;      // [ranks (rank 0) or 1, 2, stage_rows_, selector_rank]
+	int anchor_rank_ = 0;
 	pod::LinearWeight hidden_proj_;
 	pod::TensorView hidden_proj_w_;    // [rank, hidden] plain FP16, selector gate projection
 	DFlashLayer layers_[8];        // num_hidden_layers of them are valid
@@ -526,7 +573,7 @@ private:
 	pod::TensorView bb_dyn_a_, bb_dyn_m_;     // [8, conv_proj_out] FP16, before the side split
 	pod::TensorView bb_coef_a0_, bb_coef_a1_;  // [8, taps, groups] FP32, attention-conv sides
 	pod::TensorView bb_coef_m0_, bb_coef_m1_;  // [8, taps, groups] FP32, mlp-conv sides
-	pod::TensorView bb_ctx_fc_;     // [CTX_CHUNK, taps * hidden] FP16 context taps
+	pod::TensorView bb_ctx_fc_;     // [CTX_CHUNK, hidden] FP16 fc output of the context rows
 	pod::TensorView bb_ctx_normed_; // [CTX_CHUNK, hidden] FP16
 	pod::TensorView bb_ctx_resid_;  // [CTX_CHUNK, hidden] FP32, discarded
 	// The projected context is a ring of ring_len_ slots (ingested row i in slot i % ring_len_); the block's own transient K/V live in

@@ -322,7 +322,7 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	// per-rank candidate top-k scratch. The MTP head has no use for them
 	draft_taps_on_ = !mtp_on_ && speculation_ == Speculation::DFlash;
 	if ( draft_taps_on_ ) {
-		engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, H, S, true );
+		engine::models::alloc_draft_taps( arena, draft_hooks_, draft_, config_.max_seq, H, S, true, rank_, tp_ );
 		draft_hooks_.embedding = &embed_table_;   // loaded by load_weights; the hooks point at the member
 		int tap_shape[2] = { R, H };
 		tap_tmp_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, tap_shape, 2 );
@@ -1629,10 +1629,12 @@ void Qwen4ExpPipeline::forward_body( int m, backend::stream_t stream ) {
 		if ( snap_taps_ ) {
 			for ( int tap = 0; tap < 5; ++tap ) {
 				if ( L != config_.tap_layers[tap] ) continue;
-				flush_apply( m, stream );
+				flush_apply( m, stream );   // on every rank, so the ranks' streams take the same path to the next site
+				int src0, dst0, n;
+				if ( !draft_hooks_.tap_slice.span( tap, &src0, &dst0, &n ) ) continue;   // a sharded ring keeps none of this tap here
 				engine::spec::dflash_reduce_streams( streams_.ptr<const float>(), tap_tmp_.ptr<backend::half_t>(), m, H, 0, stream );
 				engine::spec::dflash_publish_taps_slots( draft_.taps.ptr<backend::half_t>(), tap_tmp_.ptr<const backend::half_t>(), d_rows_,
-					m, tap, H, draft_hooks_.taps_cap, draft_hooks_.taps_slot_stride, stream );
+					m, tap, draft_hooks_.tap_slice, draft_hooks_.taps_cap, draft_hooks_.taps_slot_stride, stream );
 			}
 		}
 		trace_rows( 600 + L, streams_.data, true, m, stream );
@@ -1955,7 +1957,7 @@ void Qwen4ExpPipeline::draft_head_topk( int rows, backend::stream_t stream ) {
 
 bool Qwen4ExpPipeline::read_taps( int slot_id, int first_pos, int count, backend::half_t* host_dst, backend::stream_t stream ) {
 	backend::set_device( rank_ );
-	return read_draft_taps( draft_hooks_, slot_id, config_.max_slots, first_pos, count, config_.hidden_size, host_dst, stream );
+	return read_draft_taps( draft_hooks_, slot_id, config_.max_slots, first_pos, count, host_dst, stream );
 }
 
 void Qwen4ExpPipeline::reset_state( int slot_id ) {
@@ -1984,7 +1986,7 @@ size_t kv_segment_bytes( pod::KVQ q, size_t row_elems, int rows ) {
 
 size_t Qwen4ExpPipeline::tap_snapshot_bytes( int tokens ) const {
 	if ( !snap_taps_ ) return 0;
-	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * draft_hooks_.taps_n * config_.hidden_size * sizeof( backend::half_t );
+	return static_cast<size_t>( std::min( tokens, draft_hooks_.taps_cap ) ) * draft_hooks_.tap_slice.cols * sizeof( backend::half_t );
 }
 
 size_t Qwen4ExpPipeline::seq_state_bytes( int from, int tokens, bool with_taps ) const {
