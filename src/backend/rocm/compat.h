@@ -68,6 +68,9 @@ using nv_bfloat162 = __hip_bfloat162;
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaDeviceReset hipDeviceReset
+#define cudaDeviceGetLimit hipDeviceGetLimit
+#define cudaDeviceSetLimit hipDeviceSetLimit
+#define cudaLimitStackSize hipLimitStackSize
 #define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
 #define cudaMemGetInfo hipMemGetInfo
@@ -156,6 +159,7 @@ inline hipError_t cudaGetSymbolAddress( void** ptr, const T& symbol ) {
 #define __ballot_sync( mask, pred ) ( (unsigned) ( __ballot( pred ) & (unsigned long long) (unsigned) ( mask ) ) )
 #define __all_sync( mask, pred ) __all( pred )
 #define __any_sync( mask, pred ) __any( pred )
+#define __match_any_sync( mask, value ) ( (unsigned) ( __match_any( value ) & (unsigned long long) (unsigned) ( mask ) ) )
 #define __syncwarp( ... ) __syncwarp()
 
 #if defined(__HIPCC__)
@@ -188,6 +192,17 @@ __device__ __forceinline__ unsigned int rocm_dp4a_us( unsigned int a, unsigned i
 	#pragma unroll
 	for ( int i = 0; i < 4; ++i ) s += static_cast<int>( ( a >> ( 8 * i ) ) & 0xffu ) * static_cast<int>( static_cast<int8_t>( ( b >> ( 8 * i ) ) & 0xffu ) );
 	return static_cast<unsigned int>( s );
+}
+
+// The byte-wise SIMD intrinsics ggml's vecdotq.cuh uses, which HIP lacks (no RDNA3 instruction either), in 32-bit SWAR: __vsub4 subtracts
+// each byte modulo 256 (the high bits kept out of the borrow chain, then restored); __vcmpne4 sets each byte that differs to 0xff
+__device__ __forceinline__ unsigned int __vsub4( unsigned int a, unsigned int b ) {
+	return ( ( a | 0x80808080u ) - ( b & 0x7f7f7f7fu ) ) ^ ( ( a ^ ~b ) & 0x80808080u );
+}
+__device__ __forceinline__ unsigned int __vcmpne4( unsigned int a, unsigned int b ) {
+	const unsigned int x = a ^ b;
+	const unsigned int nz = ( ( ( x & 0x7f7f7f7fu ) + 0x7f7f7f7fu ) | x ) & 0x80808080u;   // each nonzero byte's high bit
+	return ( nz >> 7 ) * 0xffu;
 }
 
 // __ldcs (streaming) is only a cache hint: a nontemporal load. __ldcg (L2, bypassing L1) is load-bearing where kernels read what other

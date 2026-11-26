@@ -357,8 +357,12 @@ __global__ void tile_reduce_kernel( const float* __restrict__ part, half* __rest
 constexpr int kMmaWarps = 4, kMmaRows = 32;
 
 __device__ __forceinline__ void mma884( float d[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1 ) {
+#if defined(USE_ROCM)
+	__builtin_trap();   // no m8n8k4 on RDNA: mma_takes never picks this kernel there
+#else
 	asm( "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};"
 		: "+f"( d[0] ), "+f"( d[1] ), "+f"( d[2] ), "+f"( d[3] ), "+f"( d[4] ), "+f"( d[5] ), "+f"( d[6] ), "+f"( d[7] ) : "r"( a0 ), "r"( a1 ), "r"( b0 ), "r"( b1 ) );
+#endif
 }
 
 __device__ __forceinline__ uint32_t h2u( half2 h ) { return *reinterpret_cast<const uint32_t*>( &h ); }
@@ -1109,6 +1113,9 @@ void LinearGguf::scale_weight( void* w, GgmlType type, int n, int k, float facto
 // m rows of width k go through the tensor-core rows kernel (a type with a tensor-core decoder, from its min_rows on; a type whose blocks are
 // whole staging units needs rows that are too, the others realign every row)
 bool mma_takes( GgmlType type, int m, int k ) {
+#if defined(USE_ROCM)
+	return false;   // the kernel is Volta's m8n8k4: the tile kernel takes these rows
+#endif
 	if ( m < 2 || m > kTileRows || mma_off() || k % 256 != 0 ) return false;
 	const size_t row_bytes = static_cast<size_t>( k / ggml_block( type ).elems ) * ggml_block( type ).bytes;
 	switch ( type ) {

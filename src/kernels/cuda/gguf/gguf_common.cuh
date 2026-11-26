@@ -48,7 +48,11 @@ GGUF_TRAITS( IQ4_XS, block_iq4_xs, QK_K, QI4_XS, VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_i
 // A warp asks the L2 for all of a weight row's lines at once (a line a lane), so the row's later blocks do not wait on DRAM one vec_dot
 // step after another
 static __device__ __forceinline__ void prefetch_row( const void* row, int bytes, int lane ) {
+#if defined(USE_ROCM)
+	( void ) row; ( void ) bytes; ( void ) lane;   // only a hint: RDNA3 has no L2 prefetch instruction
+#else
 	for ( int o = lane * 128; o < bytes; o += 32 * 128 ) asm volatile( "prefetch.global.L2 [%0];" :: "l"( static_cast<const char*>( row ) + o ) );
+#endif
 }
 
 // The activation column a weight column reads: tiled [v][head][dim] against grouped [head][v][dim]

@@ -202,6 +202,19 @@ float rcp_ftz( const float x ) {
 #endif
 }
 
+// A barrier over the block's last N threads, the first warp having returned (named barrier 1). RDNA has no named barriers, but a wave
+// that has ended leaves s_barrier's count, and one kept running with no active lanes reaches the same barriers, so the block's barrier
+// is the same thing there
+template <int N>
+__device__ __forceinline__
+void bar_sync_tail() {
+#if defined(USE_ROCM)
+	__syncthreads();
+#else
+	asm volatile( "bar.sync 1, %0;" :: "n"( N ) );
+#endif
+}
+
 // comb of one row from its mix logits: softmax of each group of H, then the Sinkhorn normalization, on one thread in registers (the shuffle version
 // spent ~0.3 us per iteration on its dependent chains); the sums are taken in the butterfly order of the shuffle reductions, so the bits are the same
 template <int H>
@@ -448,7 +461,7 @@ void hc_collapse_norm_kernel(
 		mix_logits_buf, pre_buf, D, gridDim.x, D, rms_eps, hc_eps, sinkhorn_iters );
 	half* dst = norm_out + static_cast<size_t>( r ) * D;
 	if ( warp == 0 ) return;
-	asm volatile( "bar.sync 1, %0;" :: "n"( kNormThreads ) );   // the collapse of the seven warps
+	bar_sync_tail<kNormThreads>();   // the collapse of the seven warps
 	float local_sq = 0.0f, local_sq0 = 0.0f;
 	for ( int i = tid; i < D; i += NUM_THREADS ) {
 		const float v = __half2float( s_col[i] );
@@ -467,7 +480,7 @@ void hc_collapse_norm_kernel(
 		s_warp[warp] = wsum;
 		if ( warp == 1 ) s_warp[0] = wsum0;
 	}
-	asm volatile( "bar.sync 1, %0;" :: "n"( kNormThreads ) );
+	bar_sync_tail<kNormThreads>();
 	const float inv = rsqrtf( engine::math::warp_sum( lane < NUM_THREADS / 32 ? s_warp[lane] : 0.0f ) / static_cast<float>( D ) + norm_eps );
 	if ( vec ) {
 		#pragma unroll

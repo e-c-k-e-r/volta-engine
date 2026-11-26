@@ -551,8 +551,8 @@ void moe_tile_kernel( const void* const* __restrict__ ptrs, const void* const* _
 	static_assert( sizeof( Blk ) % 2 == 0, "blocks are whole 16-bit words" );
 	constexpr int RU = sizeof( Blk ) / 2, UNITS = kTileN * RU, PER = ( UNITS + kTileThreads - 1 ) / kTileThreads;   // 16-bit words of the tile's blocks
 	if ( static_cast<int>( blockIdx.y ) >= *n_items ) return;
-	extern __shared__ __align__( 32 ) unsigned char tile_smem[];
-	half* sW = reinterpret_cast<half*>( tile_smem );                       // [kTileN][kTileLd]
+	extern __shared__ __align__( 32 ) unsigned char tile_buf[];
+	half* sW = reinterpret_cast<half*>( tile_buf );                       // [kTileN][kTileLd]
 	half* sX = sW + kTileN * kTileLd;                                      // [RT][kTileLd]
 	unsigned char* sR = reinterpret_cast<unsigned char*>( sX + RT * kTileLd );   // [2][kTileN][kTileRawLd]: the raw blocks of this and the next step
 	__shared__ int s_route[RT];
@@ -631,7 +631,7 @@ void moe_tile_kernel( const void* const* __restrict__ ptrs, const void* const* _
 		__syncthreads();
 	}
 	// the four input quarters' pieces through shared memory, summed in order, to the routes' rows
-	float* sC = reinterpret_cast<float*>( tile_smem );   // [4][RT][kTileN + 4]
+	float* sC = reinterpret_cast<float*>( tile_buf );   // [4][RT][kTileN + 4]
 	constexpr int ldc = kTileN + 4;
 	#pragma unroll
 	for ( int f = 0; f < RF; ++f ) wmma::store_matrix_sync( sC + ( ( warp >> 1 ) * RT + f * 16 ) * ldc + wn, acc[f], ldc, wmma::mem_row_major );
@@ -689,8 +689,8 @@ void moe_tile884_kernel( const void* const* __restrict__ ptrs, const void* const
 	constexpr int SETS = 4 / R, PIECES = 8 / SETS, CQ = 4 / R;   // row sets; input pieces (warps per row set); chunks of a quarter a step
 	constexpr int G = RT / 8;                                     // groups of 8 routes
 	if ( static_cast<int>( blockIdx.y ) >= *n_items ) return;
-	extern __shared__ __align__( 32 ) unsigned char tile_smem[];
-	half* sX = reinterpret_cast<half*>( tile_smem );                                  // [RT][kTileLd]
+	extern __shared__ __align__( 32 ) unsigned char tile_buf[];
+	half* sX = reinterpret_cast<half*>( tile_buf );                                  // [RT][kTileLd]
 	unsigned char* sR = reinterpret_cast<unsigned char*>( sX + RT * kTileLd );       // [2][kTileN][kRawLd]
 	__shared__ int s_route[RT];
 	const Item it = items[blockIdx.y];
@@ -767,7 +767,7 @@ void moe_tile884_kernel( const void* const* __restrict__ ptrs, const void* const
 		if ( kb + 1 < bpr ) stash( ( kb + 1 ) & 1 );
 		__syncthreads();
 	}
-	float* sC = reinterpret_cast<float*>( tile_smem );   // [PIECES][RT][kTileN + 4]
+	float* sC = reinterpret_cast<float*>( tile_buf );   // [PIECES][RT][kTileN + 4]
 	constexpr int ldc = kTileN + 4;
 	#pragma unroll
 	for ( int h = 0; h < R; ++h )
