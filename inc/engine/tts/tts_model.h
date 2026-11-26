@@ -86,6 +86,10 @@ public:
 	// (golden.py's draws, or the caller's own). Returns the frames' digits [n_frames * 32]
 	std::vector<uint8_t> generate( const std::vector<int>& text, const std::vector<uint8_t>& prompt, int n_frames, const std::vector<int>& order,
 		const std::vector<std::vector<float>>& noise, const Sampling& s );
+	// The length head (vall_e/model.py predict_length; exports with config "length"): a query position after [text | prompt]
+	// in LEN mode, whose final hidden state the head (FP32) maps to the log of the target's length in patches. Returns the
+	// length in frames (exp, times the patch, rounded half to even as Python's round, at least 1); log_patches: the raw output
+	int predict_length( const std::vector<int>& text, const std::vector<uint8_t>& prompt, float* log_patches = nullptr );
 	// How many patches step s of `steps` has revealed in total, of La
 	static int revealed_after( int s, int steps, int La );
 	const TtsConfig& config() const { return cfg_; }

@@ -7,7 +7,9 @@
 #include "engine/kernels/dense.cuh"
 #include "tts_kernels.cuh"
 #include <cublas_v2.h>
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace engine::tts {
 
@@ -125,6 +127,27 @@ void TtsModel::hidden( const TtsRow& row, float* out, std::vector<std::vector<fl
 	engine::dense::k_norm_mod<float><<<L, 256>>>( ws_.x, nullptr, nullptr, 0, w_.norm, nullptr, nullptr, 0, nullptr, d, EPS_FP32, out );
 	CUDA_CHECK( cudaGetLastError() );
 	tap( out );
+}
+
+int TtsModel::predict_length( const std::vector<int>& text, const std::vector<uint8_t>& prompt, float* log_patches ) {
+	ENGINE_ASSERT( w_.length_w, "tts: this export has no length head" );
+	TtsRow row;
+	row.text = text;
+	row.prompt = prompt;
+	row.mode = 2;
+	row.len_query = true;
+	hidden( row, fw_.h, nullptr );
+	// one d-long dot product: the query's hidden state and the head's weights on the host, in double as the reference's FP32 sum
+	const int d = cfg_.d_model;
+	std::vector<float> h( d ), w( d );
+	float bias = 0.0f;
+	CUDA_CHECK( cudaMemcpy( h.data(), fw_.h + static_cast<size_t>( row.length() - 1 ) * d, d * 4, cudaMemcpyDeviceToHost ) );
+	CUDA_CHECK( cudaMemcpy( w.data(), w_.length_w, d * 4, cudaMemcpyDeviceToHost ) );
+	CUDA_CHECK( cudaMemcpy( &bias, w_.length_b, 4, cudaMemcpyDeviceToHost ) );
+	double s = bias;
+	for ( int i = 0; i < d; ++i ) { s += static_cast<double>( h[i] ) * w[i]; }
+	if ( log_patches ) { *log_patches = static_cast<float>( s ); }
+	return std::max( 1, static_cast<int>( std::nearbyint( std::exp( s ) * cfg_.patch ) ) );
 }
 
 } // namespace engine::tts

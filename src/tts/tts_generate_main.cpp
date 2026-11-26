@@ -1,6 +1,7 @@
 // tts_generate: the vall-e v3 TTS model from the command line (guidance: the export's own, or --cfg / --cfg-prompt).
 //   tts_generate --model <export.sft>                        load and report
 //   tts_generate --model <export.sft> --golden <case.safetensors>
+//       the length head (its frame count, and the raw log patches where stored);
 //       parity against a vall_e/golden.py reference: the backbone at demask step 0 (the input of every block, the final
 //       hidden states) for the three guidance rows (cond / null / promptless); then the demasking loop teacher-forced (every
 //       step from the reference's previous digits: how many revealed digits agree, and the step-0 guided velocities),
@@ -114,6 +115,31 @@ static int check_demask( engine::tts::TtsModel& m, const char* path, const std::
 	return tf > 0.995 ? 0 : 1;
 }
 
+// The length head against the golden's: its raw output (log patches, where golden.py stored it) within 0.01, 1% of the length, and
+// the frame count within one (FP16 activations against an FP32 reference move the output by up to ~0.004, which tips a length
+// sitting near a rounding boundary; the head's own error against real lengths is ~15%)
+static int check_length( engine::tts::TtsModel& m, const char* path ) {
+	if ( !m.config().length ) { std::printf( "length head: none in this export\n" ); return 0; }
+	pod::SafeTensorsFile g;
+	if ( !engine::loader::safetensors_open( g, path ) ) { std::fprintf( stderr, "can't open %s\n", path ); return 1; }
+	const auto text64 = i64( g, "text" ), prompt64 = i64( g, "prompt" ), nf = i64( g, "n_frames" );
+	std::vector<int> text( text64.begin(), text64.end() );
+	std::vector<uint8_t> prompt( prompt64.begin(), prompt64.end() );
+	float lp = 0.0f;
+	const int n = m.predict_length( text, prompt, &lp );
+	const auto ref_lp = f32( g, "log_patches" );
+	bool ok = std::abs( n - static_cast<int>( nf[0] ) ) <= 1;
+	if ( ref_lp.empty() ) {
+		std::printf( "length head: %d frames (reference %d; log patches %.5f) -> %s\n", n, static_cast<int>( nf[0] ), lp, ok ? "PASS" : "FAIL" );
+	} else {
+		ok &= std::fabs( lp - ref_lp[0] ) < 0.01f;
+		std::printf( "length head: %d frames (reference %d), log patches %.5f (reference %.5f, diff %+.5f) -> %s\n", n, static_cast<int>( nf[0] ), lp, ref_lp[0],
+			lp - ref_lp[0], ok ? "PASS" : "FAIL" );
+	}
+	engine::loader::safetensors_close( g );
+	return ok ? 0 : 1;
+}
+
 static int check_backbone( engine::tts::TtsModel& m, const char* path ) {
 	pod::SafeTensorsFile g;
 	if ( !engine::loader::safetensors_open( g, path ) ) { std::fprintf( stderr, "can't open %s\n", path ); return 1; }
@@ -191,9 +217,10 @@ int main( int argc, char** argv ) {
 	if ( cfg_prompt >= 0.0f ) { s.cfg_prompt = cfg_prompt; }
 	std::printf( "guidance %.2f, speaker guidance %.2f\n", s.cfg, s.cfg_prompt );
 	if ( !golden.empty() ) {
+		const int rl = check_length( m, golden.c_str() );
 		const int rb = check_backbone( m, golden.c_str() );
 		const int rd = check_demask( m, golden.c_str(), out, s );
-		return rb | rd;
+		return rl | rb | rd;
 	}
 	return 0;
 }
