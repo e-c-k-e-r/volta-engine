@@ -68,6 +68,9 @@ namespace engine::backend::impl {
 struct RefReconParams { uint64_t codes, out_; int k_dim, n_dim, bits, cb, volta; };
 struct RefHadParams { uint64_t src, dst, pre, post; int cols; float r_scale; };
 struct RefAttnParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq, window, ring; uint64_t key_end, bidir; };
+struct FaParams { uint64_t q, k, v, gate, out_, slots, pos; int64_t slot_stride; int layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate; float scale; uint64_t ks, vs; int kq, vq, window, ring; uint64_t key_end, bidir;
+	int rows, group_rows, splits, bc, direct; uint64_t part; };
+struct FaReduceParams { uint64_t part, gate, out_; int rows, num_q_heads, head_dim, splits, has_gate, vq; };
 struct RefUnpackParams { uint64_t qg, q, gate; int total, head_dim; };
 } // namespace engine::backend::impl
 

@@ -107,8 +107,10 @@ The H3 tests take the checkpoints and their goldens (safetensors files written b
 `*.slang` compile to CUDA (launchers in `slang/cuda`), SPIR-V and host C++. Reference kernels (`ref_gemm`, `ref_trellis`,
 `ref_attention`, `ref_latent`) are the parity oracle for the CPU and Vulkan backends. Verified by `test_slang_kernels` (CUDA),
 `test_slang_cpu` (host), `test_ref_linear`, `test_ref_attention`, `test_vulkan_kernels`, `test_vulkan_ref`, `test_cpu_smoke`.
-`kv_codec.slang` holds the KV cache element codecs (FP8, int8, Q4, NVFP4 with their scales) that `kv_store_q` and the attention kernels (`ref_attention`, the QSA
-sparse attention in `flash`, the latent attention in `glm`) share; the stored bytes and scales are checked bit for bit against the CUDA kernels by
+`fa.slang` is the Vulkan backend's attention (decode and prefill): a workgroup takes a KV head's query heads for up to 16 query vectors, stages K and V
+tiles in shared memory (16-byte loads, FP16 products accumulated in FP32), and splits a long key range over workgroups whose partials `fa_reduce` combines;
+`test_vulkan_attention` holds it against `ref_attention` on the same device. `kv_codec.slang` holds the KV cache element codecs (FP8, int8, Q4, NVFP4 with
+their scales) that `kv_store_q` and the attention kernels (`ref_attention`, `fa`, the QSA sparse attention in `flash`, the latent attention in `glm`) share; the stored bytes and scales are checked bit for bit against the CUDA kernels by
 `test_ops_attention` and `test_ops_flash` (dumped on CUDA, checked on CPU and Vulkan).
 
 ## Speculation and communication

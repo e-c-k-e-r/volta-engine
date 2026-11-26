@@ -66,6 +66,15 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			COMMENT "slangc ${entry} -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
+	# Tiled attention (src/kernels/slang/fa.slang)
+	foreach(entry fa_attn fa_reduce fa_finish)
+		set(sout ${SLANG_OUT}/${entry}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/fa.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/fa.slang ${SLANG_COMMON}
+			COMMENT "slangc ${entry} -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
 	# NVFP4 W4A16 linear (src/kernels/slang/nvfp4.slang)
 	add_custom_command(OUTPUT ${SLANG_OUT}/nvfp4_gemm.spv
 		COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/nvfp4.slang -target spirv -stage compute -entry nvfp4_gemm -DENGINE_TARGET_CPU=0 -o ${SLANG_OUT}/nvfp4_gemm.spv
@@ -235,6 +244,12 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	target_link_libraries(test_vulkan_forward PRIVATE engine_backend_vulkan pthread)
 	add_dependencies(test_vulkan_forward slang_kernels)
 	set_target_properties(test_vulkan_forward PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	# The tiled attention against the reference kernel on the same device
+	add_executable(test_vulkan_attention tests/2_parity/test_vulkan_attention.cpp ${ENGINE_VK_OBJECTS})
+	target_link_libraries(test_vulkan_attention PRIVATE engine_backend_vulkan pthread)
+	add_dependencies(test_vulkan_attention slang_kernels)
+	set_target_properties(test_vulkan_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# Gemma 4 vision tower against the exllamav3 golden (same source as the CUDA build's)
 	add_executable(test_gemma4_vision tests/2_parity/test_gemma4_vision.cpp ${ENGINE_VK_OBJECTS})

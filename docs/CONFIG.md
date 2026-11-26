@@ -219,6 +219,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | `spec_joint` | int | `-1` | `ENGINE_DEBUG_SPEC_JOINT` | per-slot speculators: one verify forward for the blocks of the speculating slots (MTP: one draft chain too; DFlash2: the blocks are drafted in turn and verified together); 1 on, 0 one slot per round, -1 the speculator's default (DFlash2 on, MTP off) |
 | `spec_interleave` | bool | `true` | `ENGINE_DEBUG_SPEC_INTERLEAVE` | speculators with a context per slot (MTP): interleave one slot's round per step; false steps all active slots plainly together while more than one decodes (A/B) |
 | `no_graphs` | bool | `false` | `ENGINE_DEBUG_NO_GRAPHS` | eager execution, no CUDA graphs |
+| `vulkan_attn_ref` | bool | `false` | `ENGINE_DEBUG_VULKAN_ATTN_REF` | Vulkan: attention on the portable reference kernel (ref_attn_decode, a workgroup per head and row) instead of the tiled one (fa_attn) (A/B) |
 | `dump_requests` | string | `(empty)` | `ENGINE_DEBUG_DUMP_REQUESTS` | directory: write every API request body and rendered prompt there, and at its end the prompt and generated token ids (req_N.tokens: int32 prompt length, int32 count, the ids) |
 | `dflash_tap_shift` | int | `0` | `ENGINE_DEBUG_DFLASH_TAP_SHIFT` | DFlash v1 drafters (Gemma 4): tap i is the output of target layer target_layer_ids[i] + this (A/B) |
 | `dflash_embed_scale` | bool | `true` | `ENGINE_DEBUG_DFLASH_EMBED_SCALE` | DFlash v1 drafters: the block's embedding rows carry the target's embedding scale (Gemma 4: sqrt(hidden)); false = the raw table rows (A/B) |

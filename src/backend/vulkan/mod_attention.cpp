@@ -1,9 +1,18 @@
-// Vulkan backend: FP16 KV store, decode / prefill attention and the Q/gate unpack. Attention runs the portable reference kernel ref_attn_decode:
-// row m attends causally to positions 0..pos[m] of slot slot[m], so prefill is the same dispatch over a run of ascending positions
+// Vulkan backend: KV store, decode / prefill attention and the Q/gate unpack. Attention runs the tiled kernels of fa.slang (fa_attention below),
+// or with vulkan_attn_ref the portable reference kernel ref_attn_decode: row m attends causally to positions 0..pos[m] of slot slot[m], so
+// prefill is the same dispatch over a run of ascending positions
 #include "mod_common.h"
+#include "mod_attention.h"
 #include "engine/modules/attention.h"
 #include "engine/backend/tiers.h"
+#include "engine/runtime/options.h"
+#include <algorithm>
 #include <cmath>
+
+// The option table lives in the host library, which the module-only smoke binaries do not link: bound weakly, as in mod_flash.cpp
+namespace engine::runtime {
+__attribute__(( weak )) Options& options();
+}
 
 namespace engine::modules {
 
@@ -49,10 +58,10 @@ void Attention::store_kv_cache(
 	vki::launch( "kv_store_f16", pv, stream, groups );
 }
 
-namespace {
+namespace vk_attn {
 
-void ref_attention( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
-	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, float scale = 0.0f, int window = 0 ) {
+void reference( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
+	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, float scale, int window ) {
 	ENGINE_ASSERT( kv.ring == 0 || ( window > 0 && window <= kv.ring && kv.ring == max_seq ), "Attention (Vulkan): a ring cache holds a sliding window of max_seq rows" );
 	ENGINE_ASSERT( head_dim <= 512 && num_kv_heads > 0 && num_q_heads % num_kv_heads == 0, "Attention (Vulkan): head_dim <= 512 and GQA only" );
 	vki::RefAttnParams p{ vki::dp( q.data ), vki::dp( kv.k ), vki::dp( kv.v ), vki::dp( gate.data ), vki::dp( out.data ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ),
@@ -63,16 +72,72 @@ void ref_attention( const pod::KVRef& kv, const pod::TensorView& q, const pod::T
 	vki::launch( "ref_attn_decode", p, stream, num_q_heads, count );
 }
 
+// The tiled attention (fa.slang). one_slot: the rows share a slot (a prefill chunk), so a workgroup takes up to 16 / (q heads per KV head) of
+// them; else a row each. A group's keys go to `splits` workgroups (the kernel shares out the range it finds, so a decode graph replays at any
+// length), as many as keep about kTargetGroups busy within what the range can reach: the window (plus a chunk and an image), the prefill's
+// key_hint, or max_seq. The splits' partials take a fixed scratch, sized once (a captured forward must never see it move), which also bounds
+// their number
+constexpr int kFaPoolWords = 10496, kTargetGroups = 160, kMaxSplits = 64;
+constexpr size_t kFaScratch = size_t( 16 ) << 20;
+
+void tiled( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
+	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, float scale, int window,
+	bool one_slot, int key_hint ) {
+	ENGINE_ASSERT( kv.ring == 0 || ( window > 0 && window <= kv.ring && kv.ring == max_seq ), "Attention (Vulkan): a ring cache holds a sliding window of max_seq rows" );
+	ENGINE_ASSERT( head_dim <= 512 && head_dim % 16 == 0 && num_kv_heads > 0 && num_q_heads % num_kv_heads == 0, "Attention (Vulkan): head_dim a multiple of 16 up to 512, GQA" );
+	ENGINE_ASSERT( kv.vq != pod::KVQ::Q4 || head_dim % 64 == 0, "Attention (Vulkan): Q4 values need head_dim % 64 == 0" );
+	const int G = num_q_heads / num_kv_heads;
+	ENGINE_ASSERT( G <= 16, "Attention (Vulkan): at most 16 query heads per KV head" );
+	const int group_rows = one_slot ? std::max( 1, 16 / G ) : 1;
+	const int groups = ( count + group_rows - 1 ) / group_rows;
+	const int R = std::min( group_rows, count ) * G, hw = head_dim / 2;
+	const int bc = R * hw + 32 * ( hw + 1 ) <= kFaPoolWords ? 32 : 16;
+	// the keys a group can span
+	const int rows_span = one_slot ? group_rows : 1;
+	int span = window > 0 ? window + rows_span + pod::MAX_ROWS : max_seq;
+	if ( key_hint > 0 ) span = std::min( span, key_hint );   // positions below it (an image never crosses a chunk)
+	if ( kv.ring == 0 ) span = std::min( span, max_seq );
+	const size_t per_split = static_cast<size_t>( count ) * num_q_heads * ( head_dim + 2 ) * sizeof( float );   // the output and its max and sum
+	int splits = std::min( { kMaxSplits, ( kTargetGroups + groups * num_kv_heads - 1 ) / ( groups * num_kv_heads ), ( span + bc - 1 ) / bc,
+		static_cast<int>( kFaScratch / per_split ) } );
+	splits = std::max( splits, 1 );
+	const bool q4 = kv.vq == pod::KVQ::Q4;
+	const bool direct = splits == 1;
+	float* part = splits > 1 ? static_cast<float*>( vki::scratch( 40, kFaScratch, stream ) ) : nullptr;
+	const bool has_gate = gate.data != nullptr;
+	vki::FaParams p{ vki::dp( q.data ), vki::dp( kv.k ), vki::dp( kv.v ), vki::dp( gate.data ), vki::dp( out.data ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ),
+		static_cast<int64_t>( slot_stride ), layer_idx, num_q_heads, num_kv_heads, head_dim, max_seq, has_gate && !( direct && q4 ) ? 1 : 0,
+		scale > 0.0f ? scale : 1.0f / std::sqrt( static_cast<float>( head_dim ) ), vki::dp( kv.ks ), vki::dp( kv.vs ), static_cast<int>( kv.kq ), static_cast<int>( kv.vq ),
+		window, kv.ring, vki::rows_key_end( d_rows ), vki::rows_bidir( d_rows ), count, group_rows, splits, bc, direct ? 1 : 0, vki::dp( part ) };
+	vki::launch( "fa_attn", p, stream, static_cast<uint32_t>( groups ), static_cast<uint32_t>( num_kv_heads ), static_cast<uint32_t>( splits ) );
+	vki::FaReduceParams r{ vki::dp( part ), vki::dp( gate.data ), vki::dp( out.data ), count, num_q_heads, head_dim, splits, has_gate ? 1 : 0, static_cast<int>( kv.vq ) };
+	if ( !direct ) vki::launch( "fa_reduce", r, stream, static_cast<uint32_t>( num_q_heads ), static_cast<uint32_t>( count ) );
+	else if ( q4 ) vki::launch( "fa_finish", r, stream, static_cast<uint32_t>( num_q_heads ), static_cast<uint32_t>( count ) );
+}
+
+} // namespace vk_attn
+
+namespace {
+
+bool attn_ref() {
+	static const bool ref = engine::runtime::options != nullptr && engine::runtime::options().vulkan_attn_ref;
+	return ref;
+}
+
 }
 
 void Attention::forward_decode( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
 	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, float scale, int window ) {
-	ref_attention( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream, scale, window );
+	if ( attn_ref() ) vk_attn::reference( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream, scale, window );
+	else vk_attn::tiled( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream, scale, window, false, 0 );
 }
 
+// per_row false: the rows share a slot (the CUDA kernels' tensor-core form), so they share the K / V tiles of a workgroup
 void Attention::forward_prefill( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
-	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, int, bool, float scale, int window ) {
-	ref_attention( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream, scale, window );
+	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, int key_hint, bool per_row, float scale,
+	int window ) {
+	if ( attn_ref() ) vk_attn::reference( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream, scale, window );
+	else vk_attn::tiled( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream, scale, window, !per_row, key_hint );
 }
 
 void Attention::unpack_q_gate( const pod::TensorView& q_gate, pod::TensorView& q, pod::TensorView& gate, int num_q_heads, int head_dim, backend::stream_t stream ) {
