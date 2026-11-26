@@ -4,6 +4,7 @@
 #include "engine/server/tts.h"
 #include "engine/core/log.h"
 #include "engine/loader/image.h"
+#include "engine/tts/audio.h"
 #include "engine/tts/tts.h"
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
@@ -14,28 +15,6 @@
 #include <random>
 
 namespace engine::server {
-
-namespace {
-
-std::string base64_encode( const std::string& in ) {
-	static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-	std::string out;
-	out.reserve( ( in.size() + 2 ) / 3 * 4 );
-	size_t i = 0;
-	for ( ; i + 2 < in.size(); i += 3 ) {
-		const uint32_t v = ( static_cast<uint8_t>( in[i] ) << 16 ) | ( static_cast<uint8_t>( in[i + 1] ) << 8 ) | static_cast<uint8_t>( in[i + 2] );
-		out += T[v >> 18]; out += T[( v >> 12 ) & 63]; out += T[( v >> 6 ) & 63]; out += T[v & 63];
-	}
-	if ( i < in.size() ) {
-		const uint32_t v = ( static_cast<uint8_t>( in[i] ) << 16 ) | ( i + 1 < in.size() ? static_cast<uint8_t>( in[i + 1] ) << 8 : 0 );
-		out += T[v >> 18]; out += T[( v >> 12 ) & 63];
-		out += i + 1 < in.size() ? T[( v >> 6 ) & 63] : '=';
-		out += '=';
-	}
-	return out;
-}
-
-}  // namespace
 
 struct TtsService::Impl {
 	TtsConfig cfg;
@@ -60,7 +39,7 @@ struct TtsService::Impl {
 		auto it = voices.find( name );
 		if ( it == voices.end() ) { error = "no voice \"" + name + "\" (GET /v1/audio/voices lists them)"; return nullptr; }
 		if ( !it->second.loaded ) {
-			if ( !engine::tts::Tts::read_wav( cfg.voices_dir + "/" + name + ".wav", it->second.audio, it->second.rate, &error ) ) { return nullptr; }
+			if ( !engine::tts::read_wav( cfg.voices_dir + "/" + name + ".wav", it->second.audio, it->second.rate, &error ) ) { return nullptr; }
 			it->second.loaded = true;
 		}
 		return &it->second;
@@ -123,7 +102,7 @@ struct TtsService::Impl {
 			const size_t comma = b64.find( "base64," );
 			if ( comma != std::string::npos ) { b64 = b64.substr( comma + 7 ); }
 			if ( !engine::loader::base64_decode( b64, &wav ) || wav.empty() ) { return send_error( c, 400, "invalid_request_error", "voice_audio holds invalid base64" ); }
-			if ( !engine::tts::Tts::parse_wav( wav, uploaded.audio, uploaded.rate, &error ) ) { return send_error( c, 400, "invalid_request_error", "voice_audio: " + error ); }
+			if ( !engine::tts::parse_wav( wav, uploaded.audio, uploaded.rate, &error ) ) { return send_error( c, 400, "invalid_request_error", "voice_audio: " + error ); }
 			v = &uploaded;
 		} else if ( named ) {
 			v = voice( j["voice"].get<std::string>(), error );
@@ -140,9 +119,9 @@ struct TtsService::Impl {
 		const double dt = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
 		const double secs = audio.size() / static_cast<double>( tts.sample_rate() );
 		LOG_INFO( "tts: %.1f s of speech in %.2f s (%.1fx real time)\n", secs, dt, secs / std::max( dt, 1e-9 ) );
-		const std::string wav = engine::tts::Tts::wav_bytes( audio, tts.sample_rate() );
+		const std::string wav = engine::tts::wav_bytes( audio, tts.sample_rate() );
 		if ( format == "json" ) {
-			return send_json( c, 200, nlohmann::json( { { "audio", base64_encode( wav ) }, { "format", "wav" }, { "sample_rate", tts.sample_rate() }, { "duration", secs },
+			return send_json( c, 200, nlohmann::json( { { "audio", engine::loader::base64_encode( wav ) }, { "format", "wav" }, { "sample_rate", tts.sample_rate() }, { "duration", secs },
 				{ "seed", o.seed }, { "elapsed", dt } } ).dump() );
 		}
 		send_response( c, 200, "audio/wav", wav );
@@ -183,13 +162,17 @@ bool TtsService::init( const ServerConfig& config ) {
 		return false;
 	}
 	cudaSetDevice( p_->cfg.device );
+	size_t free0 = 0, free1 = 0, total = 0;
+	cudaMemGetInfo( &free0, &total );
 	if ( !p_->tts.load( p_->cfg.model, p_->cfg.codec, p_->cfg.device ) ) {
 		LOG_ERROR( "tts: failed to load %s / %s\n", p_->cfg.model.c_str(), p_->cfg.codec.c_str() );
 		return false;
 	}
+	cudaMemGetInfo( &free1, &total );
 	p_->scan_voices();
 	const auto& s = p_->tts.model().default_sampling();
-	LOG_INFO( "tts: %s on GPU %d (guidance %.1f / %.1f), %zu voices\n", p_->cfg.model.c_str(), p_->cfg.device, s.cfg, s.cfg_prompt, p_->voices.size() );
+	LOG_INFO( "tts: %s on GPU %d, %.2f GiB (guidance %.1f / %.1f), %zu voices\n", p_->cfg.model.c_str(), p_->cfg.device, ( free0 - free1 ) / 1073741824.0, s.cfg,
+		s.cfg_prompt, p_->voices.size() );
 	return true;
 }
 

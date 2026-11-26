@@ -3,6 +3,7 @@
 // from the backbone's hidden states, guided (classifier-free and speaker guidance) and Euler-integrated, then snapped to
 // the FSQ grid.
 #include "engine/tts/tts_model.h"
+#include "engine/backend/cuda/activation.cuh"
 #include "engine/core/blas_check.h"
 #include "engine/core/log.h"
 #include "engine/kernels/dense.cuh"
@@ -33,7 +34,7 @@ __global__ void k_bias_act_half( const float* x, const float* b, half* y, int ro
 	const size_t n = static_cast<size_t>( rows ) * cols;
 	for ( size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x; i < n; i += static_cast<size_t>( gridDim.x ) * blockDim.x ) {
 		float v = x[i] + ( b ? b[i % cols] : 0.0f );
-		if ( act ) { v = v / ( 1.0f + __expf( -v ) ); }
+		if ( act ) { v = engine::math::silu( v ); }
 		y[i] = __float2half( v );
 	}
 }
@@ -43,7 +44,7 @@ __global__ void k_cond_silu( const float* cond, const float* temb, half* sc, int
 	const size_t n = static_cast<size_t>( rows ) * W;
 	for ( size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x; i < n; i += static_cast<size_t>( gridDim.x ) * blockDim.x ) {
 		const float v = cond[i] + temb[i % W];
-		sc[i] = __float2half( v / ( 1.0f + __expf( -v ) ) );
+		sc[i] = __float2half( engine::math::silu( v ) );
 	}
 }
 
@@ -129,6 +130,7 @@ void TtsModel::alloc_flow_workspace() {
 	fw_.t0h = static_cast<half*>( A( W * 2 ) );
 	fw_.temb = static_cast<float*>( A( W * 4 ) );
 	fw_.snapped = static_cast<uint8_t*>( A( N * V ) );
+	fw_.pos = static_cast<int*>( A( MAX_LEN * sizeof( int ) ) );
 }
 
 int TtsModel::revealed_after( int s, int steps, int La ) {
@@ -142,8 +144,7 @@ void TtsModel::demask_step( const std::vector<int>& text, const std::vector<uint
 	const bool guided = s.cfg > 1.0f;
 	const int R = guided ? ( s.cfg_prompt > 0.0f && !prompt.empty() ? 3 : 2 ) : 1;
 	// the backbone over each guidance row, its hidden states at the revealed positions gathered into fw_.hh [R * k, d]
-	int* pos = nullptr;
-	CUDA_CHECK( cudaMalloc( &pos, k * sizeof( int ) ) );
+	int* pos = fw_.pos;
 	CUDA_CHECK( cudaMemcpy( pos, reveal.data(), k * sizeof( int ), cudaMemcpyHostToDevice ) );
 	for ( int r = 0; r < R; ++r ) {
 		TtsRow row;
@@ -155,7 +156,6 @@ void TtsModel::demask_step( const std::vector<int>& text, const std::vector<uint
 		const int offset = static_cast<int>( row.text.size() + row.prompt.size() / V );
 		kern::k_gather_half<<<k, 256>>>( fw_.h, pos, offset, fw_.hh + static_cast<size_t>( r ) * k * d, d );
 	}
-	CUDA_CHECK( cudaFree( pos ) );
 	const int N = R * k;
 	// cond(h): the same for every flow step
 	gemm( fw_.hh, w_.f_cond, fw_.cond, N, W, d, true );

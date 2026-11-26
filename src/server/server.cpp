@@ -77,6 +77,8 @@ bool VoltaServer::init( const ServerConfig& config ) {
 		model_name_ = "vall_e";
 		if ( !init_tts() ) return false;
 	} else {
+		// speech first: the language model's arena is sized from the memory left, so it makes room on the TTS GPU
+		if ( !config_.tts.model.empty() && !init_tts() ) return false;
 		generator_ = std::make_unique<engine::runtime::Generator>();
 		if ( !generator_->init( config_ ) ) {
 			LOG_ERROR( "Failed to initialize Generator runtime.\n" );
@@ -85,7 +87,6 @@ bool VoltaServer::init( const ServerConfig& config ) {
 		openai_ = make_openai_protocol();
 		completions_ = make_openai_completion_protocol();
 		anthropic_ = make_anthropic_protocol();
-		if ( !config_.tts.model.empty() && !init_tts() ) return false;
 	}
 	register_routes();
 

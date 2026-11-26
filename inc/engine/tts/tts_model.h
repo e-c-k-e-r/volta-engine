@@ -105,6 +105,7 @@ private:
 	TtsConfig cfg_;
 	Sampling sampling_;
 	TtsWeights w_;
+	int device_ = 0;
 	void* blas_ = nullptr;  // cublasHandle_t
 	half* c16_ = nullptr;   // ROCm: the FP16 result of an FP32-out GEMM before it's widened (gemm)
 	size_t c16_elems_ = 0;
@@ -118,6 +119,7 @@ private:
 		float *h = nullptr, *cond = nullptr, *c = nullptr, *mod = nullptr, *xf = nullptr, *m2 = nullptr, *m1 = nullptr, *v = nullptr, *x = nullptr, *temb = nullptr, *t0 = nullptr;
 		half *hh = nullptr, *sc = nullptr, *ln = nullptr, *m1h = nullptr, *xin = nullptr, *tvec = nullptr, *t0h = nullptr;
 		uint8_t* snapped = nullptr;
+		int* pos = nullptr;  // the revealed positions of a step
 	} fw_;
 	pod::MemoryArena ws_arena_ {};
 	pod::SafeTensorsFile st_;

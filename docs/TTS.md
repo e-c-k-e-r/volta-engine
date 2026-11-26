@@ -11,7 +11,7 @@ volta_server serves it as `POST /v1/audio/speech` (see CONFIG.md, the `tts` sect
 | Text front-end | src/tts/g2p.cpp | vall_e/emb/g2p.py `encode` and phonemizer 3.3's espeak backend, through libespeak-ng |
 | Model | src/tts/tts_model.cu, tts_backbone.cu, tts_flow.cu | vall_e/model.py: the backbone, the length head, the flow head and the demasking loop with guidance |
 | Codec | src/tts/codec.cu | the NeMo codec's HiFi-GAN encoder, FSQ and HiFi-GAN decoder, in FP32 |
-| Pipeline | src/tts/tts.cpp | vall_e/tts.py `TTS.generate`: the prompt (mono, resampled as torchaudio does, its first 10 s), sentence splitting past 160 phonemes, trailing-silence trimming, pauses |
+| Pipeline | src/tts/tts.cpp, audio.cpp | vall_e/tts.py `TTS.generate`: the prompt (mono, resampled as torchaudio does, its first 10 s), sentence splitting past 160 phonemes, trailing-silence trimming, pauses; WAV files in and out |
 
 The model and codec build in every GPU configuration; the front-end, the pipeline and the endpoint need libespeak-ng at build time (`ENGINE_TTS`; GPL-3.0,
 which the AGPL-3.0 allows combining with).
@@ -29,14 +29,24 @@ the sampling settings, and the session's results with players and downloads.
 
 The export's guidance is the default (v2.0 3.0 / 2.0, the distilled v2.0-fast 0 / 0, older exports 6.0 / 2.0); `--cfg` / `--cfg-prompt` override it.
 
-## Parity (tts_generate --golden, test_tts_g2p, test_tts_resample; references from vall_e/golden.py in FP32)
+## Memory
+
+v2.0 takes 3.0 GiB of its GPU at load: the weights (1.4 GiB), the model's workspaces for rows of up to 2560 positions (the attention scores
+in batches of heads within 128 MiB), and the codec with its activations for 10 s of audio. A longer sentence grows the codec's activations
+by 42 MB a second; when the GPU has no room for them the request fails with an error.
+
+Beside a language model the server loads the TTS first, so the model's arena is sized from what is left on that GPU (GLM slices its
+experts over every rank, so its expert cache shrinks by that much on each). The TTS kernels run on the default stream: on a GPU the
+language model also uses, they queue with its work instead of overlapping it.
+
+## Parity (tts_generate --golden, test_tts_g2p, test_tts_resample; references from vall_e/golden.py in FP32; on ROCm and CUDA)
 
 | Check | Result |
 |---|---|
 | Backbone hidden states, step 0 | cosine 1.00000 at every block (v2.0, v2.0-fast, v1.2) |
 | Demasking, teacher-forced | 99.82-99.90% of revealed digits equal (v2.0 / v2.0-fast), 99.65-99.72% (v1.2) |
 | Length head | log length within 0.004; frames equal or one off at a rounding boundary |
-| Codec decoder | 121-125 dB SNR against vall_e's decode |
+| Codec decoder | 118-125 dB SNR against vall_e's decode |
 | Codec encoder + FSQ | every digit of a 6 s prompt equal |
 | Text front-end | 11608 of 11609 store texts equal (en, de, fr, ko, zh: all 2000; ja: 1608 of 1609 kana lines) |
 | Prompt resampling | 141-145 dB SNR against torchaudio (16, 22.05, 24, 48 kHz) |
@@ -46,5 +56,6 @@ The export's guidance is the default (v2.0 3.0 / 2.0, the distilled v2.0-fast 0 
 - Japanese must be given as kana: vall_e reads kanji through pykakasi's dictionary, which isn't ported (kanji are refused with a message).
 - No language detection (vall_e's `auto`): requests name the language.
 - Voices are single WAV files; vall_e's multi-clip folder prompts (speaker-embedding and MOS selection) aren't ported.
-- Speed (RX 7900 XTX, a 7 s line): v2.0 about 4.3x real time, v2.0-fast 8x, the 225M 9.5x. The backbone is compute-bound (a pass over ~670
-  positions is ~1 TFLOP); its attention is still plain batched GEMMs with a separate softmax (5% of the time).
+- Speed (a 7 s line with a voice prompt): RX 7900 XTX v2.0 about 4.3x real time, v2.0-fast 8x, the 225M 9.5x; V100 v2.0 3.5x, v2.0-fast
+  6.2x, the 225M 7.0x. The backbone is compute-bound (a pass over ~670 positions is ~1 TFLOP); its attention is still plain batched GEMMs
+  with a separate softmax (5% of the time).

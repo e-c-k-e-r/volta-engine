@@ -44,6 +44,28 @@ bool base64_decode( const std::string& in, std::string* out ) {
 	return true;
 }
 
+std::string base64_encode( const std::string& in ) {
+	static const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	std::string out;
+	out.reserve( ( in.size() + 2 ) / 3 * 4 );
+	size_t i = 0;
+	for ( ; i + 2 < in.size(); i += 3 ) {
+		const uint32_t v = ( static_cast<uint8_t>( in[i] ) << 16 ) | ( static_cast<uint8_t>( in[i + 1] ) << 8 ) | static_cast<uint8_t>( in[i + 2] );
+		out += alphabet[v >> 18];
+		out += alphabet[( v >> 12 ) & 63];
+		out += alphabet[( v >> 6 ) & 63];
+		out += alphabet[v & 63];
+	}
+	if ( i < in.size() ) {
+		const uint32_t v = ( static_cast<uint8_t>( in[i] ) << 16 ) | ( i + 1 < in.size() ? static_cast<uint8_t>( in[i + 1] ) << 8 : 0 );
+		out += alphabet[v >> 18];
+		out += alphabet[( v >> 12 ) & 63];
+		out += i + 1 < in.size() ? alphabet[( v >> 6 ) & 63] : '=';
+		out += '=';
+	}
+	return out;
+}
+
 bool decode_image( const uint8_t* data, size_t size, DecodedImage* out, std::string* error ) {
 	int w = 0, h = 0, c = 0;
 	uint8_t* px = stbi_load_from_memory( data, static_cast<int>( size ), &w, &h, &c, 4 );

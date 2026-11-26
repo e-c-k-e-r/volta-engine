@@ -138,6 +138,7 @@ set(ENGINE_HOST_SOURCES
 	src/video/h3_vae_config.cpp
 	src/video/h3_image.cpp
 	src/video/h3_refs.cpp
+	src/tts/audio.cpp
 	src/loader/chat_template.cpp
 	src/loader/deepseek_encoding.cpp
 	src/loader/jinja.cpp
@@ -377,10 +378,10 @@ if(ENGINE_TTS)
 	add_executable(test_tts_g2p tests/2_parity/test_tts_g2p.cpp)
 	target_link_libraries(test_tts_g2p PRIVATE engine_kernels)
 	set_target_properties(test_tts_g2p PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
-	add_executable(test_tts_resample tests/2_parity/test_tts_resample.cpp)
-	target_link_libraries(test_tts_resample PRIVATE engine_kernels)
-	set_target_properties(test_tts_resample PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 endif()
+add_executable(test_tts_resample tests/2_parity/test_tts_resample.cpp)
+target_link_libraries(test_tts_resample PRIVATE engine_kernels)
+set_target_properties(test_tts_resample PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 # cuBLAS for the MiniMax-H3 video sources (the language models' GEMMs are the engine's own, src/kernels/cuda/gemm); hipBLAS on ROCm, where
 # the engine's GEMM forwards to it
 if(ENGINE_BACKEND STREQUAL "ROCM")

@@ -38,13 +38,6 @@ public:
 	int sample_rate() const { return codec_.config().sample_rate; }
 	const TtsModel& model() const { return model_; }
 
-	// WAV files: PCM 8 / 16 / 24 / 32-bit or IEEE float, channels averaged (as TTS._load); 16-bit PCM out
-	static bool read_wav( const std::string& path, std::vector<float>& mono, int& rate, std::string* error = nullptr );
-	static bool parse_wav( const std::string& bytes, std::vector<float>& mono, int& rate, std::string* error = nullptr );
-	static std::string wav_bytes( const std::vector<float>& x, int rate );
-	// torchaudio.functional.resample (sinc_interp_hann, lowpass_filter_width 6, rolloff 0.99), in FP32 as it computes it
-	static std::vector<float> resample( const std::vector<float>& x, int from, int to );
-
 private:
 	std::vector<std::vector<int>> split( const std::string& text, const std::string& language );
 

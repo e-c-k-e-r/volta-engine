@@ -15,6 +15,7 @@ TtsModel::~TtsModel() {
 }
 
 bool TtsModel::load( const std::string& path, int device ) {
+	device_ = device;
 	if ( !engine::loader::safetensors_open( st_, path.c_str() ) ) {
 		LOG_ERROR( "tts: can't open %s", path.c_str() );
 		return false;
@@ -26,42 +27,49 @@ bool TtsModel::load( const std::string& path, int device ) {
 		LOG_ERROR( "tts: %s isn't a vall-e v3 export (no format / config / vocab metadata)", path.c_str() );
 		return false;
 	}
-	try {
-		auto c = nlohmann::json::parse( *config );
-		cfg_.n_text = c.at( "n_text" );
-		cfg_.d_model = c.at( "d_model" );
-		cfg_.layers = c.at( "layers" );
-		cfg_.heads = c.at( "heads" );
-		cfg_.patch = c.value( "patch", 2 );
-		cfg_.rot_frac = c.value( "rot_frac", 1.0f );
-		cfg_.rope_theta = c.value( "rope_theta", 10000.0f );
-		cfg_.gated = c.value( "gated", true );
-		cfg_.qk_norm = c.value( "qk_norm", true );
-		cfg_.flow_width = c.value( "flow_width", 512 );
-		cfg_.flow_depth = c.value( "flow_depth", 4 );
-		cfg_.n_modes = c.value( "n_modes", 3 );
-		cfg_.length = c.value( "length", false );
-		cfg_.text_prenet = c.value( "text_prenet", 0 );
-		if ( c.value( "head", std::string( "classifier" ) ) != "flow" || c.value( "ar", false ) || c.value( "n_lang", 0 ) || c.value( "ctc", false ) ) {
-			LOG_ERROR( "tts: only flow-head NAR models without accent / CTC heads are supported" );
-			return false;
-		}
-		cfg_.vocab = nlohmann::json::parse( *vocab ).get<std::vector<std::string>>();
-		if ( const std::string* guidance = engine::loader::safetensors_metadata( st_, "guidance" ) ) {
-			auto g = nlohmann::json::parse( *guidance );
+	// the engine builds without exceptions: the metadata is checked before it's read (a mistyped value would abort)
+	const auto c = nlohmann::json::parse( *config, nullptr, false );
+	const auto voc = nlohmann::json::parse( *vocab, nullptr, false );
+	bool good = c.is_object() && voc.is_array();
+	for ( const char* k : { "n_text", "d_model", "layers", "heads" } ) { good = good && c.contains( k ) && c[k].is_number_integer(); }
+	for ( size_t i = 0; good && i < voc.size(); ++i ) { good = voc[i].is_string(); }
+	if ( !good ) {
+		LOG_ERROR( "tts: bad config / vocab metadata in %s", path.c_str() );
+		return false;
+	}
+	cfg_.n_text = c["n_text"];
+	cfg_.d_model = c["d_model"];
+	cfg_.layers = c["layers"];
+	cfg_.heads = c["heads"];
+	cfg_.patch = c.value( "patch", 2 );
+	cfg_.rot_frac = c.value( "rot_frac", 1.0f );
+	cfg_.rope_theta = c.value( "rope_theta", 10000.0f );
+	cfg_.gated = c.value( "gated", true );
+	cfg_.qk_norm = c.value( "qk_norm", true );
+	cfg_.flow_width = c.value( "flow_width", 512 );
+	cfg_.flow_depth = c.value( "flow_depth", 4 );
+	cfg_.n_modes = c.value( "n_modes", 3 );
+	cfg_.length = c.value( "length", false );
+	cfg_.text_prenet = c.value( "text_prenet", 0 );
+	if ( c.value( "head", std::string( "classifier" ) ) != "flow" || c.value( "ar", false ) || c.value( "n_lang", 0 ) || c.value( "ctc", false ) ) {
+		LOG_ERROR( "tts: only flow-head NAR models without accent / CTC heads are supported" );
+		return false;
+	}
+	cfg_.vocab = voc.get<std::vector<std::string>>();
+	if ( const std::string* guidance = engine::loader::safetensors_metadata( st_, "guidance" ) ) {
+		const auto g = nlohmann::json::parse( *guidance, nullptr, false );
+		if ( g.is_object() ) {
 			sampling_.cfg = g.value( "cfg", sampling_.cfg );
 			sampling_.cfg_prompt = g.value( "cfg_prompt", sampling_.cfg_prompt );
 		}
-	} catch ( const std::exception& e ) {
-		LOG_ERROR( "tts: bad config metadata: %s", e.what() );
-		return false;
 	}
 	if ( cfg_.text_prenet ) {
 		LOG_ERROR( "tts: the text pre-net isn't ported yet" );
 		return false;
 	}
 
-	if ( !engine::core::arena_create( arena_, device, st_.file_size * 2 + ( 64ull << 20 ) ) ) {
+	// the weights as stored (matrices FP16), plus room for the vectors widened to FP32 (norms, biases, embeddings of a few rows)
+	if ( !engine::core::arena_create( arena_, device, st_.file_size + ( 64ull << 20 ) ) ) {
 		LOG_ERROR( "tts: can't allocate the weight arena" );
 		return false;
 	}

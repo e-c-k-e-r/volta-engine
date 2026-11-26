@@ -34,6 +34,9 @@ public:
 	std::vector<float> decode( const std::vector<uint8_t>& digits, int n_frames );
 	// audio (44.1 kHz mono, [-1, 1]) -> digits [n_frames * 32], zero-padded to whole frames first (as AudioCodecModel.encode)
 	std::vector<uint8_t> encode( const std::vector<float>& audio );
+	// The activations for n_frames frames either way (each the largest [C, T]: ~0.5 MB a frame in all, 42 MB a second); kept and grown on demand by
+	// decode / encode, which return nothing when the GPU has no room for them. False if it hasn't
+	bool reserve( int n_frames );
 	const CodecConfig& config() const { return cfg_; }
 	~NemoCodec();
 
@@ -55,7 +58,6 @@ private:
 	void up_conv( const UpConv& u, const float* x, float* y, int T_in );
 	void act( const float* x, float* y, const float* alpha, int C, int T );
 	void res_layer( const ResLayer& r, int C, int T );  // x_ in place (cur_, a_, b_, acc_ as scratch)
-	void reserve( int n_frames );
 
 	CodecConfig cfg_;
 	Conv enc_pre_, enc_post_, dec_pre_, dec_post_;

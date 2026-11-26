@@ -17,21 +17,25 @@ namespace engine::tts {
 // bf16 autocast the model was trained and is served with, the q / k norms see bf16 projections (2^-7)
 static constexpr float EPS_FP32 = 1.1920929e-7f;
 static constexpr float EPS_QK = 0.0078125f;
+// The attention scores (FP32) and probabilities (FP16) of the heads taken at once: all 24 of v2.0's for rows up to ~960 positions, 3 at
+// MAX_LEN (one head needs 39 MiB there)
+static constexpr size_t ATTN_BYTES = 128ull << 20;
 
 int TtsRow::length() const {
 	return static_cast<int>( text.size() ) + static_cast<int>( prompt.size() / 64 ) + ( len_query ? 1 : static_cast<int>( masked.size() ) );
 }
 
 void TtsModel::alloc_workspace() {
-	const size_t L = MAX_LEN, d = cfg_.d_model, H = cfg_.heads, F = cfg_.ffn(), V = cfg_.values();
-	const size_t bytes = L * d * 4 * 2 + H * L * L * ( 4 + 2 ) + L * d * 2 * 9 + L * 3 * d * 2 + L * 2 * F * 2 + L * F * 2 + L * V * 3 + L * 16 + ( 64 << 20 )
+	const size_t L = MAX_LEN, d = cfg_.d_model, F = cfg_.ffn(), V = cfg_.values();
+	static_assert( ATTN_BYTES >= static_cast<size_t>( MAX_LEN ) * MAX_LEN * ( 4 + 2 ), "one head's scores at MAX_LEN" );
+	const size_t bytes = L * d * 4 * 2 + ATTN_BYTES + L * d * 2 * 9 + L * 3 * d * 2 + L * 2 * F * 2 + L * F * 2 + L * V * 3 + L * 16 + ( 64 << 20 )
 		+ 3 * L * ( d * 6 + cfg_.flow_width * 4 * 12 + V * 16 ) + ( 16 << 20 );  // + the flow head's (tts_flow.cu)
-	ENGINE_ASSERT( engine::core::arena_create( ws_arena_, 0, bytes ), "tts: can't allocate the workspace" );
+	ENGINE_ASSERT( engine::core::arena_create( ws_arena_, device_, bytes ), "tts: can't allocate the workspace" );
 	auto A = [&]( size_t n ) { return engine::core::arena_alloc( ws_arena_, n ); };
 	ws_.x = static_cast<float*>( A( L * d * 4 ) );
 	ws_.a = static_cast<float*>( A( L * d * 4 ) );
-	ws_.S = static_cast<float*>( A( H * L * L * 4 ) );
-	ws_.P = static_cast<half*>( A( H * L * L * 2 ) );
+	ws_.S = static_cast<float*>( A( ATTN_BYTES / 6 * 4 ) );
+	ws_.P = static_cast<half*>( A( ATTN_BYTES / 6 * 2 ) );
 	ws_.xn = static_cast<half*>( A( L * d * 2 ) );
 	ws_.qkv = static_cast<half*>( A( L * 3 * d * 2 ) );
 	ws_.q = static_cast<half*>( A( L * d * 2 ) );
@@ -54,12 +58,6 @@ void TtsModel::alloc_workspace() {
 }
 
 // C [M, N] = A [M, K] @ W [N, K]^T (row-major; FP32 or FP16 out, FP32 accumulation)
-namespace {
-__global__ void k_half_to_float( const half* x, float* y, size_t n ) {
-	for ( size_t i = blockIdx.x * static_cast<size_t>( blockDim.x ) + threadIdx.x; i < n; i += static_cast<size_t>( gridDim.x ) * blockDim.x ) { y[i] = __half2float( x[i] ); }
-}
-}  // namespace
-
 void TtsModel::gemm( const half* A, const half* W, void* C, int M, int N, int K, bool c32 ) {
 	const float alpha = 1.0f, beta = 0.0f;
 #if defined(USE_ROCM)
@@ -74,7 +72,7 @@ void TtsModel::gemm( const half* A, const half* W, void* C, int M, int N, int K,
 		}
 		CUBLAS_CHECK( cublasGemmEx( static_cast<cublasHandle_t>( blas_ ), CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, W, CUDA_R_16F, K, A, CUDA_R_16F, K, &beta, c16_,
 			CUDA_R_16F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT ) );
-		k_half_to_float<<<static_cast<int>( std::min<size_t>( 4096, ( n + 255 ) / 256 ) ), 256>>>( c16_, static_cast<float*>( C ), n );
+		engine::dense::k_convert<<<static_cast<int>( std::min<size_t>( 4096, ( n + 255 ) / 256 ) ), 256>>>( c16_, static_cast<float*>( C ), n );
 		return;
 	}
 #endif
@@ -122,19 +120,26 @@ void TtsModel::hidden( const TtsRow& row, float* out, std::vector<std::vector<fl
 	const int rot = static_cast<int>( hd * cfg_.rot_frac ) / 2 * 2;
 	const float scale = 1.0f / std::sqrt( static_cast<float>( hd ) );
 	const float one = 1.0f, zero = 0.0f;
+	const int hg = std::min( H, static_cast<int>( ATTN_BYTES / 6 / ( static_cast<size_t>( L ) * L ) ) );   // heads per batch of scores
 	for ( const TtsBlock& b : w_.blocks ) {
 		tap( ws_.x );
 		// attention
 		engine::dense::k_norm_mod<half><<<L, 256>>>( ws_.x, nullptr, nullptr, 0, b.n1, nullptr, nullptr, 0, nullptr, d, EPS_FP32, ws_.xn );
 		gemm( ws_.xn, b.qkv, ws_.qkv, L, 3 * d, d, false );
 		kern::k_qk_norm_rope<<<L * H, hd, 2 * hd * sizeof( float )>>>( ws_.qkv, b.q_norm, b.k_norm, ws_.q, ws_.k, ws_.v, L, H, hd, rot, cfg_.rope_theta, EPS_QK );
-		// S[h] = Q[h] K[h]^T, row-major [L(q), L(k)]
-		CUBLAS_CHECK( cublasGemmStridedBatchedEx( blas, CUBLAS_OP_T, CUBLAS_OP_N, L, L, hd, &one, ws_.k, CUDA_R_16F, hd, static_cast<long long>( L ) * hd,
-			ws_.q, CUDA_R_16F, hd, static_cast<long long>( L ) * hd, &zero, ws_.S, CUDA_R_32F, L, static_cast<long long>( L ) * L, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT ) );
-		kern::k_softmax<<<H * L, 256>>>( ws_.S, ws_.P, L, scale );
-		// O[h] = P[h] V[h], row-major [L, hd]
-		CUBLAS_CHECK( cublasGemmStridedBatchedEx( blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L, &one, ws_.v, CUDA_R_16F, hd, static_cast<long long>( L ) * hd,
-			ws_.P, CUDA_R_16F, L, static_cast<long long>( L ) * L, &zero, ws_.o, CUDA_R_16F, hd, static_cast<long long>( L ) * hd, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT ) );
+		for ( int h0 = 0; h0 < H; h0 += hg ) {
+			const int nh = std::min( hg, H - h0 );
+			const size_t at = static_cast<size_t>( h0 ) * L * hd;
+			// S[h] = Q[h] K[h]^T, row-major [L(q), L(k)]
+			CUBLAS_CHECK( cublasGemmStridedBatchedEx( blas, CUBLAS_OP_T, CUBLAS_OP_N, L, L, hd, &one, ws_.k + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd,
+				ws_.q + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd, &zero, ws_.S, CUDA_R_32F, L, static_cast<long long>( L ) * L, nh, CUBLAS_COMPUTE_32F,
+				CUBLAS_GEMM_DEFAULT ) );
+			kern::k_softmax<<<nh * L, 256>>>( ws_.S, ws_.P, L, scale );
+			// O[h] = P[h] V[h], row-major [L, hd]
+			CUBLAS_CHECK( cublasGemmStridedBatchedEx( blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L, &one, ws_.v + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd,
+				ws_.P, CUDA_R_16F, L, static_cast<long long>( L ) * L, &zero, ws_.o + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd, nh, CUBLAS_COMPUTE_32F,
+				CUBLAS_GEMM_DEFAULT ) );
+		}
 		if ( b.gate ) { gemm( ws_.xn, b.gate, ws_.g, L, d, d, false ); }
 		kern::k_heads_gate<<<L, 256>>>( ws_.o, b.gate ? ws_.g : nullptr, ws_.y, L, H, hd );
 		gemm( ws_.y, b.out, ws_.a, L, d, d, true );

@@ -9,7 +9,9 @@
 //       [frames, 32]; with --codec, the codec's decode of the reference's digits against the golden's wav and its encode
 //       of the prompt's audio against the prompt's digits, and --wav
 //       writes the free-running generation as audio
+#include "engine/kernels/cpu/cpu_util.h"
 #include "engine/loader/safetensors.h"
+#include "engine/tts/audio.h"
 #include "engine/tts/codec.h"
 #include "engine/tts/tts_model.h"
 #ifdef ENGINE_TTS
@@ -37,12 +39,6 @@ static std::vector<int64_t> i64( const pod::SafeTensorsFile& g, const char* name
 	return std::vector<int64_t>( p, p + m->size_bytes / 8 );
 }
 
-static float h2f( uint16_t h ) {
-	const uint32_t s = ( h >> 15 ) & 1, e = ( h >> 10 ) & 31, f = h & 1023;
-	float v = e == 0 ? std::ldexp( static_cast<float>( f ), -24 ) : e == 31 ? INFINITY : std::ldexp( static_cast<float>( f | 1024 ), static_cast<int>( e ) - 25 );
-	return s ? -v : v;
-}
-
 static std::vector<float> f32( const pod::SafeTensorsFile& g, const std::string& name ) {
 	const pod::SafeTensorMeta* m = safetensors_find( g, name.c_str() );
 	if ( !m ) { return {}; }
@@ -66,18 +62,7 @@ static void write_npy_u8( const std::string& path, const std::vector<uint8_t>& v
 
 // 16-bit PCM mono WAV
 static void write_wav( const std::string& path, const std::vector<float>& x, int rate ) {
-	FILE* f = std::fopen( path.c_str(), "wb" );
-	if ( !f ) { std::fprintf( stderr, "can't write %s\n", path.c_str() ); return; }
-	const uint32_t data = static_cast<uint32_t>( x.size() * 2 ), riff = 36 + data, fmt = 16, rate_ = rate, bps = rate * 2;
-	const uint16_t pcm = 1, ch = 1, align = 2, bits = 16;
-	std::fwrite( "RIFF", 1, 4, f ); std::fwrite( &riff, 4, 1, f ); std::fwrite( "WAVEfmt ", 1, 8, f ); std::fwrite( &fmt, 4, 1, f );
-	std::fwrite( &pcm, 2, 1, f ); std::fwrite( &ch, 2, 1, f ); std::fwrite( &rate_, 4, 1, f ); std::fwrite( &bps, 4, 1, f );
-	std::fwrite( &align, 2, 1, f ); std::fwrite( &bits, 2, 1, f ); std::fwrite( "data", 1, 4, f ); std::fwrite( &data, 4, 1, f );
-	for ( float v : x ) {
-		const int16_t q = static_cast<int16_t>( std::lrint( std::max( -1.0f, std::min( 1.0f, v ) ) * 32767.0f ) );
-		std::fwrite( &q, 2, 1, f );
-	}
-	std::fclose( f );
+	if ( !engine::tts::write_wav( path, x, rate ) ) { std::fprintf( stderr, "can't write %s\n", path.c_str() ); }
 }
 
 // The codec against the golden: its reference digits decoded here and by vall_e (the golden's wav, FP32): SNR and the worst sample
@@ -259,7 +244,7 @@ static int check_backbone( engine::tts::TtsModel& m, const char* path ) {
 			double dot = 0, na = 0, nb = 0;
 			for ( int p = 0; p < L; ++p ) {
 				for ( int e = 0; e < d; ++e ) {
-					const double a = taps[l][static_cast<size_t>( p ) * d + e], b = h2f( gh[( static_cast<size_t>( r ) * Lpad + p ) * d + e] );
+					const double a = taps[l][static_cast<size_t>( p ) * d + e], b = engine::kernels::cpu::half_bits_to_float( gh[( static_cast<size_t>( r ) * Lpad + p ) * d + e] );
 					dot += a * b; na += a * a; nb += b * b;
 				}
 			}
@@ -307,7 +292,7 @@ int main( int argc, char** argv ) {
 		std::vector<float> prompt, audio;
 		int rate = 0;
 		std::string err;
-		if ( !prompt_path.empty() && !engine::tts::Tts::read_wav( prompt_path, prompt, rate, &err ) ) { std::fprintf( stderr, "%s\n", err.c_str() ); return 1; }
+		if ( !prompt_path.empty() && !engine::tts::read_wav( prompt_path, prompt, rate, &err ) ) { std::fprintf( stderr, "%s\n", err.c_str() ); return 1; }
 		engine::tts::SynthOptions o;
 		o.language = language;
 		o.seed = seed;

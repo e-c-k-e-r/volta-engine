@@ -65,6 +65,8 @@ std::vector<float> resize_bicubic( const uint8_t* rgb, int in_h, int in_w, int o
 
 // Standard-alphabet base64 (padding and ASCII whitespace tolerated). False on any other character.
 bool base64_decode( const std::string& in, std::string* out );
+// Standard-alphabet base64 with padding
+std::string base64_encode( const std::string& in );
 
 uint64_t hash_bytes( const void* data, size_t size, uint64_t seed = 0xcbf29ce484222325ULL );
 

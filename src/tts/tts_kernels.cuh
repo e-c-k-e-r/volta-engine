@@ -4,7 +4,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include "engine/backend/cuda/activation.cuh"
 #include "engine/backend/cuda/reduce.cuh"
+#include "engine/backend/cuda/rope_math.cuh"
 
 namespace engine::tts::kern {
 
@@ -52,9 +54,8 @@ __global__ void k_qk_norm_rope( const half* qkv, const float* qn, const float* k
 		float o = sh[which * hd + c];
 		if ( c < rot ) {
 			const int half_rot = rot / 2, i = c % half_rot;
-			const float freq = powf( theta, -2.0f * i / rot );
 			float s, co;
-			sincosf( p * freq, &s, &co );
+			engine::math::rope_cos_sin<false>( p, i, rot, theta, co, s );
 			const float x1 = sh[which * hd + i], x2 = sh[which * hd + i + half_rot];
 			o = c < half_rot ? x1 * co - x2 * s : x2 * co + x1 * s;
 		}
@@ -84,7 +85,7 @@ __global__ void k_heads_gate( const half* o, const half* g, half* y, int L, int 
 	for ( int c = threadIdx.x; c < H * hd; c += blockDim.x ) {
 		const int h = c / hd, e = c % hd;
 		float v = __half2float( o[( static_cast<size_t>( h ) * L + p ) * hd + e] );
-		if ( g ) { v *= 1.0f / ( 1.0f + __expf( -__half2float( g[static_cast<size_t>( p ) * H * hd + c] ) ) ); }
+		if ( g ) { v *= engine::math::sigmoid( __half2float( g[static_cast<size_t>( p ) * H * hd + c] ) ); }
 		y[static_cast<size_t>( p ) * H * hd + c] = __float2half( v );
 	}
 }
@@ -94,7 +95,7 @@ __global__ void k_swiglu( const half* up, half* act, int F ) {
 	const size_t p = blockIdx.x;
 	for ( int c = threadIdx.x; c < F; c += blockDim.x ) {
 		const float a = __half2float( up[p * 2 * F + c] ), b = __half2float( up[p * 2 * F + F + c] );
-		act[p * F + c] = __float2half( a / ( 1.0f + __expf( -a ) ) * b );
+		act[p * F + c] = __float2half( engine::math::silu( a ) * b );
 	}
 }
 

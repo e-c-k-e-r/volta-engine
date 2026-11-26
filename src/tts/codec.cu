@@ -108,8 +108,6 @@ __global__ void k_clamp( float* y, size_t n ) {
 
 int grid( size_t n ) { return static_cast<int>( std::min<size_t>( 4096, ( n + 255 ) / 256 ) ); }
 
-std::string act_name( const nlohmann::json& c ) { return c.at( "activation" ).get<std::string>(); }
-
 }  // namespace
 
 NemoCodec::~NemoCodec() {
@@ -131,43 +129,65 @@ bool NemoCodec::load( const std::string& path, int device ) {
 		LOG_ERROR( "codec: %s isn't a codec export (python -m vall_e.export codec)", path.c_str() );
 		return false;
 	}
-	try {
-		auto c = nlohmann::json::parse( *config );
-		cfg_.sample_rate = c.at( "sample_rate" );
-		cfg_.samples_per_frame = c.at( "samples_per_frame" );
-		cfg_.levels = c.at( "levels" ).get<std::vector<int>>();
-		cfg_.groups = c.at( "groups" );
-		cfg_.fsq_eps = c.at( "fsq_eps" );
-		const auto& e = c.at( "encoder" );
-		const auto& d = c.at( "decoder" );
-		cfg_.enc_channels = e.at( "base_channels" );
-		cfg_.enc_dim = e.at( "encoded_dim" );
-		cfg_.enc_in_kernel = e.at( "in_kernel_size" );
-		cfg_.enc_out_kernel = e.at( "out_kernel_size" );
-		cfg_.down_rates = e.at( "down_sample_rates" ).get<std::vector<int>>();
-		cfg_.enc_res_kernels = e.at( "resblock_kernel_sizes" ).get<std::vector<int>>();
-		cfg_.enc_res_dilations = e.at( "resblock_dilation_sizes" ).get<std::vector<int>>();
-		cfg_.dec_dim = d.at( "input_dim" );
-		cfg_.dec_channels = d.at( "base_channels" );
-		cfg_.dec_in_kernel = d.at( "in_kernel_size" );
-		cfg_.dec_out_kernel = d.at( "out_kernel_size" );
-		cfg_.up_rates = d.at( "up_sample_rates" ).get<std::vector<int>>();
-		cfg_.dec_res_kernels = d.at( "resblock_kernel_sizes" ).get<std::vector<int>>();
-		cfg_.dec_res_dilations = d.at( "resblock_dilation_sizes" ).get<std::vector<int>>();
-		if ( act_name( e ) != "lrelu" || act_name( d ) != "half_snake" || d.at( "output_activation" ) != "ClampActivation" ) {
-			LOG_ERROR( "codec: only the leaky ReLU encoder and the HalfSnake / clamp decoder are supported" );
-			return false;
+	// the engine builds without exceptions: every key is checked before it's read (a missing or mistyped one would abort)
+	const auto c = nlohmann::json::parse( *config, nullptr, false );
+	auto nums = []( const nlohmann::json& o, std::initializer_list<const char*> keys ) {
+		for ( const char* k : keys ) { if ( !o.contains( k ) || !o[k].is_number() ) { return false; } }
+		return true;
+	};
+	auto int_lists = []( const nlohmann::json& o, std::initializer_list<const char*> keys ) {
+		for ( const char* k : keys ) {
+			if ( !o.contains( k ) || !o[k].is_array() ) { return false; }
+			for ( const auto& v : o[k] ) { if ( !v.is_number_integer() ) { return false; } }
 		}
-	} catch ( const std::exception& ex ) {
-		LOG_ERROR( "codec: bad config metadata: %s", ex.what() );
+		return true;
+	};
+	auto strings = []( const nlohmann::json& o, std::initializer_list<const char*> keys ) {
+		for ( const char* k : keys ) { if ( !o.contains( k ) || !o[k].is_string() ) { return false; } }
+		return true;
+	};
+	const bool good = c.is_object() && nums( c, { "sample_rate", "samples_per_frame", "groups", "fsq_eps" } ) && int_lists( c, { "levels" } ) &&
+		c.contains( "encoder" ) && c["encoder"].is_object() && c.contains( "decoder" ) && c["decoder"].is_object() &&
+		nums( c["encoder"], { "base_channels", "encoded_dim", "in_kernel_size", "out_kernel_size" } ) &&
+		int_lists( c["encoder"], { "down_sample_rates", "resblock_kernel_sizes", "resblock_dilation_sizes" } ) && strings( c["encoder"], { "activation" } ) &&
+		nums( c["decoder"], { "input_dim", "base_channels", "in_kernel_size", "out_kernel_size" } ) &&
+		int_lists( c["decoder"], { "up_sample_rates", "resblock_kernel_sizes", "resblock_dilation_sizes" } ) &&
+		strings( c["decoder"], { "activation", "output_activation" } );
+	if ( !good ) {
+		LOG_ERROR( "codec: bad config metadata in %s", path.c_str() );
+		return false;
+	}
+	cfg_.sample_rate = c["sample_rate"];
+	cfg_.samples_per_frame = c["samples_per_frame"];
+	cfg_.levels = c["levels"].get<std::vector<int>>();
+	cfg_.groups = c["groups"];
+	cfg_.fsq_eps = c["fsq_eps"];
+	const auto& e = c["encoder"];
+	const auto& d = c["decoder"];
+	cfg_.enc_channels = e["base_channels"];
+	cfg_.enc_dim = e["encoded_dim"];
+	cfg_.enc_in_kernel = e["in_kernel_size"];
+	cfg_.enc_out_kernel = e["out_kernel_size"];
+	cfg_.down_rates = e["down_sample_rates"].get<std::vector<int>>();
+	cfg_.enc_res_kernels = e["resblock_kernel_sizes"].get<std::vector<int>>();
+	cfg_.enc_res_dilations = e["resblock_dilation_sizes"].get<std::vector<int>>();
+	cfg_.dec_dim = d["input_dim"];
+	cfg_.dec_channels = d["base_channels"];
+	cfg_.dec_in_kernel = d["in_kernel_size"];
+	cfg_.dec_out_kernel = d["out_kernel_size"];
+	cfg_.up_rates = d["up_sample_rates"].get<std::vector<int>>();
+	cfg_.dec_res_kernels = d["resblock_kernel_sizes"].get<std::vector<int>>();
+	cfg_.dec_res_dilations = d["resblock_dilation_sizes"].get<std::vector<int>>();
+	if ( e["activation"] != "lrelu" || d["activation"] != "half_snake" || d["output_activation"] != "ClampActivation" ) {
+		LOG_ERROR( "codec: only the leaky ReLU encoder and the HalfSnake / clamp decoder are supported" );
 		return false;
 	}
 	if ( cfg_.enc_dim != 32 || cfg_.dec_dim != 32 || cfg_.levels.size() != 4 || cfg_.groups * 4 != 32 ) {
 		LOG_ERROR( "codec: expected 8 FSQ groups of 4 dimensions" );
 		return false;
 	}
-	// the regrouped transposed-conv weights are 3 / 2 the size of the stored ones
-	if ( !engine::core::arena_create( arena_, device, st_.file_size * 2 + ( 64ull << 20 ) ) ) {
+	// the regrouped transposed-conv weights are 3 / 2 the size of the stored ones, the rest as stored
+	if ( !engine::core::arena_create( arena_, device, st_.file_size * 3 / 2 + ( 64ull << 20 ) ) ) {
 		LOG_ERROR( "codec: can't allocate the weight arena" );
 		return false;
 	}
@@ -265,10 +285,11 @@ bool NemoCodec::load( const std::string& path, int device ) {
 	return true;
 }
 
-void NemoCodec::reserve( int n_frames ) {
-	if ( n_frames <= frames_ ) { return; }
+bool NemoCodec::reserve( int n_frames ) {
+	if ( n_frames <= frames_ ) { return true; }
 	for ( float** p : { &x_, &cur_, &a_, &b_, &acc_ } ) { if ( *p ) { cudaFree( *p ); *p = nullptr; } }
-	if ( digits_ ) { cudaFree( digits_ ); }
+	if ( digits_ ) { cudaFree( digits_ ); digits_ = nullptr; }
+	frames_ = 0;
 	// the largest [C, T] anywhere in either half
 	size_t most = static_cast<size_t>( cfg_.dec_channels ) * n_frames;
 	size_t T = n_frames;
@@ -278,9 +299,18 @@ void NemoCodec::reserve( int n_frames ) {
 	C = cfg_.enc_channels;
 	most = std::max( most, static_cast<size_t>( C ) * T );
 	for ( int s : cfg_.down_rates ) { T /= s; C *= 2; most = std::max( most, static_cast<size_t>( C ) * T ); }
-	for ( float** p : { &x_, &cur_, &a_, &b_, &acc_ } ) { CUDA_CHECK( cudaMalloc( p, most * 4 ) ); }
-	CUDA_CHECK( cudaMalloc( &digits_, static_cast<size_t>( n_frames ) * 32 ) );
+	bool ok = true;
+	for ( float** p : { &x_, &cur_, &a_, &b_, &acc_ } ) { ok = ok && cudaMalloc( p, most * 4 ) == cudaSuccess; }
+	ok = ok && cudaMalloc( &digits_, static_cast<size_t>( n_frames ) * 32 ) == cudaSuccess;
+	if ( !ok ) {
+		cudaGetLastError();   // an allocation failure isn't sticky: cleared so later checks don't report it
+		for ( float** p : { &x_, &cur_, &a_, &b_, &acc_ } ) { if ( *p ) { cudaFree( *p ); *p = nullptr; } }
+		if ( digits_ ) { cudaFree( digits_ ); digits_ = nullptr; }
+		LOG_ERROR( "codec: no GPU memory for %d frames (%.2f GiB of activations)", n_frames, ( most * 20.0 + n_frames * 32.0 ) / 1073741824.0 );
+		return false;
+	}
 	frames_ = n_frames;
+	return true;
 }
 
 int NemoCodec::conv( const Conv& c, const float* x, float* y, int T ) {
@@ -335,7 +365,7 @@ void NemoCodec::res_layer( const ResLayer& r, int C, int T ) {
 std::vector<float> NemoCodec::decode( const std::vector<uint8_t>& digits, int n_frames ) {
 	ENGINE_ASSERT( static_cast<int>( digits.size() ) >= n_frames * 32, "codec: fewer digits than frames" );
 	ENGINE_ASSERT( n_frames >= 4, "codec: at least 4 frames" );
-	reserve( n_frames );
+	if ( !reserve( n_frames ) ) { return {}; }
 	CUDA_CHECK( cudaMemcpy( digits_, digits.data(), static_cast<size_t>( n_frames ) * 32, cudaMemcpyHostToDevice ) );
 	const int4 hl = make_int4( cfg_.levels[0] / 2, cfg_.levels[1] / 2, cfg_.levels[2] / 2, cfg_.levels[3] / 2 );
 	k_dequant<<<grid( static_cast<size_t>( 32 ) * n_frames ), 256>>>( digits_, a_, n_frames, hl );
@@ -362,7 +392,7 @@ std::vector<uint8_t> NemoCodec::encode( const std::vector<float>& audio ) {
 	const int spf = cfg_.samples_per_frame;
 	const int n_frames = static_cast<int>( ( audio.size() + spf - 1 ) / spf );
 	ENGINE_ASSERT( n_frames >= 4, "codec: at least 4 frames of audio" );
-	reserve( n_frames );
+	if ( !reserve( n_frames ) ) { return {}; }
 	int T = n_frames * spf, C = cfg_.enc_channels;
 	CUDA_CHECK( cudaMemset( a_, 0, static_cast<size_t>( T ) * 4 ) );   // zero-padded to whole frames
 	CUDA_CHECK( cudaMemcpy( a_, audio.data(), audio.size() * 4, cudaMemcpyHostToDevice ) );

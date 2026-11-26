@@ -4,16 +4,13 @@
 // against vall_e on store texts). Text is handled as code points; Python's \s, \w and isupper() are Unicode-aware, so
 // they're taken from the C.UTF-8 locale's classification.
 #include "engine/tts/g2p.h"
-#include <cstdio>
+#include "engine/core/log.h"
 #include <espeak-ng/speak_lib.h>
 #include <clocale>
 #include <cwctype>
 #include <locale.h>
 #include <mutex>
 #include <string_view>
-
-// standalone (no engine_kernels): errors to stderr
-#define G2P_ERROR( ... ) ( std::fprintf( stderr, __VA_ARGS__ ), std::fputc( '\n', stderr ) )
 
 namespace engine::tts {
 
@@ -294,7 +291,7 @@ bool G2P::init( const std::vector<std::string>& vocab ) {
 		espeak_ok = espeak_Initialize( AUDIO_OUTPUT_SYNCHRONOUS, 0, nullptr, 0 ) > 0;
 	} );
 	if ( !espeak_ok ) {
-		G2P_ERROR( "g2p: espeak-ng failed to initialize" );
+		LOG_ERROR( "g2p: espeak-ng failed to initialize" );
 		return false;
 	}
 	// wrapper.py set_voice: the first listed voice of each language code (a voice's first language, after its priority byte)
@@ -310,11 +307,11 @@ bool G2P::set_voice( const std::string& code ) {
 	if ( code == voice_ ) { return true; }
 	const auto it = voices_.find( code );
 	if ( it == voices_.end() ) {
-		G2P_ERROR( "g2p: espeak has no voice for \"%s\"", code.c_str() );
+		LOG_ERROR( "g2p: espeak has no voice for \"%s\"", code.c_str() );
 		return false;
 	}
 	if ( espeak_SetVoiceByName( it->second.c_str() ) != EE_OK ) {
-		G2P_ERROR( "g2p: failed to load the voice for \"%s\"", code.c_str() );
+		LOG_ERROR( "g2p: failed to load the voice for \"%s\"", code.c_str() );
 		return false;
 	}
 	voice_ = code;
@@ -347,7 +344,7 @@ std::string G2P::phonemize( const std::string& text_in, const std::string& langu
 		for ( char32_t& c : t ) {
 			if ( c >= 0x30a1 && c <= 0x30f6 ) { c -= 0x60; }
 			else if ( ( c >= 0x4e00 && c <= 0x9fff ) || ( c >= 0x3400 && c <= 0x4dbf ) ) {
-				G2P_ERROR( "g2p: Japanese text with kanji needs pykakasi's readings, which aren't ported: give it as kana" );
+				LOG_ERROR( "g2p: Japanese text with kanji needs pykakasi's readings, which aren't ported: give it as kana" );
 				return "";
 			}
 		}
@@ -364,7 +361,7 @@ std::string G2P::phonemize( const std::string& text_in, const std::string& langu
 	for ( const auto& c : kept ) { phonemized.push_back( postprocess_line( utf8_to_u32( espeak_phonemes( u32_to_utf8( c ) ) ) ) ); }
 	const auto lines = restore( phonemized, marks );
 	if ( lines.empty() ) {
-		G2P_ERROR( "g2p: nothing to phonemize in \"%s\"", text_in.c_str() );
+		LOG_ERROR( "g2p: nothing to phonemize in \"%s\"", text_in.c_str() );
 		return "";
 	}
 	std::u32string ph = lines[0];   // encode() keeps the first of phonemize()'s outputs
