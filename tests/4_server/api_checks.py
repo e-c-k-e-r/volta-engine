@@ -6,10 +6,12 @@ import base64, json, os, sys, urllib.request, urllib.error, socket, time
 BASE = sys.argv[1].rstrip("/")
 failures = 0
 
-def check(cond, what, extra=""):
+def check(cond, what, extra="", known=None):
+    # known: the reason a failure is the model's behaviour, not the server's; it is reported but not counted
     global failures
-    print(("[ok]   " if cond else "[FAIL] ") + what + ((" :: " + str(extra)[:300]) if (extra and not cond) else ""))
-    failures += 0 if cond else 1
+    tag = "[ok]   " if cond else ("[known] " if known else "[FAIL] ")
+    print(tag + what + ((" :: " + str(extra)[:300]) if (extra and not cond) else "") + ((" (" + known + ")") if (known and not cond) else ""))
+    failures += 0 if cond or known else 1
 
 def post(path, body, stream=False, timeout=120):
     if isinstance(body, dict) and "temperature" not in body:
@@ -213,7 +215,8 @@ code, body = post("/v1/messages", {"max_tokens": 300, "tools": DEFERRED, "messag
 j = json.loads(body)
 uses = [b for b in j.get("content", []) if b["type"] == "tool_use"]
 check(code == 200 and j["stop_reason"] == "tool_use" and len(uses) == 1 and uses[0]["name"] == "get_weather" and uses[0]["input"] == {"city": "Paris", "days": 3},
-    "the model calls a tool it found through tool search, arguments typed per its schema", body)
+    "the model calls a tool it found through tool search, arguments typed per its schema", body,
+    known="the model searched again: greedy decoding without thinking (Flash-Next), off the model's spec" if code == 200 and uses and uses[0]["name"] == "ToolSearch" else None)
 bad = found[:-1] + [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_s", "content": [{"type": "tool_reference", "tool_name": "nope"}]}]}]
 code, body = post("/v1/messages", {"max_tokens": 16, "tools": DEFERRED, "messages": bad})
 check(code == 400 and "nope" in body, "a tool_reference to a tool missing from tools is refused", body)

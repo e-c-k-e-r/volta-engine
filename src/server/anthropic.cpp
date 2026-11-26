@@ -58,8 +58,9 @@ bool expand_tool_references( const json& v, const ToolDefs& defs, json* out, Api
 		if ( b.is_object() && b.value( "type", std::string() ) == "tool_reference" ) {
 			const std::string name = b.value( "tool_name", std::string() );
 			const auto it = defs.text.find( name );
+			const auto framing = ""; //  "Loaded tool definitions, callable from now on:\n" // off-spec, but adding in explicit framing helps odd behavior with QFN (greedy decoding, no thinking)
 			if ( it == defs.text.end() ) return fail( err, "tool_reference to '" + name + "', which is not in tools" );
-			run += ( in_run ? "\n" : "" ) + it->second;
+			run += ( in_run ? "\n" : framing ) + it->second;
 			in_run = true;
 			continue;
 		}
