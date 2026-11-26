@@ -1,8 +1,8 @@
 # Architecture
 
 Volta Engine is a from-scratch inference engine for tensor-parallel decoding on 4x Tesla V100 (SM70), with ROCm, CPU and Vulkan backends. Models:
-Qwen3.8-27B (`qwen3_5`), GLM-5.3-Flash (`glm5_next`), Qwen3.8-Flash-Next (`qwen4_exp`), DeepSeek-V4.1-Flash (`deepseek_v41`) and Gemma 4 31B
-(`gemma4`), with EXL3, NVFP4 or GGUF weights and speculative decoding ([MODELS.md](MODELS.md), [FEATURES.md](FEATURES.md)). The same server also runs
+Qwen3.8-27B (`qwen3_5`), GLM-5.3-Flash (`glm5_next`), Qwen3.8-Flash-Next (`qwen4_exp`), DeepSeek-V4.1-Flash (`deepseek_v41`) and Gemma 4 31B and
+E4B (`gemma4`), with EXL3, NVFP4 or GGUF weights and speculative decoding ([MODELS.md](MODELS.md), [FEATURES.md](FEATURES.md)). The same server also runs
 MiniMax-H3 video + audio generation, which is a separate path (`src/video/`, [VIDEO.md](VIDEO.md)) that does not use the language-model runtime. See
 [GETTING_STARTED.md](GETTING_STARTED.md) to build and run, [CONFIG.md](CONFIG.md) for options.
 

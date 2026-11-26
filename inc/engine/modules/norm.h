@@ -56,6 +56,10 @@ struct Elementwise {
 
 	// out = x * scale, FP16 in, FP32 out (an embedding into an FP32 residual stream)
 	static void scale_to_f32( const pod::TensorView& x, pod::TensorView& out, float scale, backend::stream_t stream = nullptr );
+	// Gemma 4's per-layer inputs: proj and tok [rows, layers * dim] (FP16) hold each row's layer slices of dim values; out [layers, rows, dim]
+	// (FP16) = ( rms_norm( the proj slice ) * weight + the tok slice * tok_scale ) * out_scale, layer-major
+	static void ple_mix( const pod::TensorView& proj, const pod::TensorView& tok, const pod::TensorView& weight, pod::TensorView& out, int layers, int dim,
+		float eps, float tok_scale, float out_scale, backend::stream_t stream = nullptr );
 
 	// x = cap * tanh( x / cap ), in place (FP16; Gemma's final logit softcap)
 	static void softcap( pod::TensorView& x, float cap, backend::stream_t stream = nullptr );

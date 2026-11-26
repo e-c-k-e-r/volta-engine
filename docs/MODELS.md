@@ -10,7 +10,7 @@ and the features shared by every model (prefix cache, expert tier, speculation, 
 | Qwen3.8-27B | `qwen3_5` | EXL3, NVFP4, GGUF | 1, 2, 4 | DFlash2, MTP | yes | CUDA, CPU, Vulkan |
 | GLM-5.3-Flash | `glm5_next` | EXL3 (stock or Volta tile order), NVFP4 dense groups and expert layers, GGUF | 1, 2, 4 | DFlash2, MTP | yes | CUDA, CPU, Vulkan |
 | Qwen3.8-Flash-Next | `qwen4_exp` | EXL3, NVFP4, GGUF | 1, 2, 4 | MTP, DFlash2 | yes | CUDA, CPU, Vulkan |
-| Gemma 4 31B | `gemma4` | EXL3, NVFP4, GGUF | 1, 2, 4 | DFlash, suffix | yes | CUDA, CPU, Vulkan |
+| Gemma 4 31B, E4B | `gemma4` | EXL3, NVFP4, GGUF | 1, 2, 4 (E4B: 1, 2) | DFlash (31B), suffix | yes | CUDA, CPU, Vulkan |
 | DeepSeek-V4.1-Flash | `deepseek_v41` | EXL3, GGUF | 1, 2, 4 | DSpark, suffix | yes | CUDA |
 
 * Speculators (`speculator`, with `--speculative` / `use_speculation`): `dflash` (the default: a DFlash2 or DFlash drafter in `draft_model_dir`), `mtp`
@@ -168,19 +168,29 @@ build/volta_server --config configs/flash_next_nvfp4.json      # the NVFP4 check
 build/volta_server --model-dir <Flash-Next EXL3> --speculative --set speculator=mtp
 ```
 
-## Gemma 4 31B (`gemma4`)
+## Gemma 4 (`gemma4`)
 
-* The text model of `google/gemma-4-31B-it`: 60 layers, every 6th full attention (10 layers: 4 KV heads, head_dim 512, K = V, proportional RoPE
-  over 64 pairs), the other 50 sliding-window attention (1024 positions, 16 KV heads, head_dim 256); 32 Q heads, hidden 5376, MLP 21504,
-  sandwich norms, an FP32 residual stream, a tied head with a final logit softcap of 30, vocabulary 262144.
+* The text models of `google/gemma-4-31B-it` and `google/gemma-4-E4B-it`, the layout read from the checkpoint's `config.json` (`text_config`): the
+  layers in the order of `layer_types` (sliding-window or full attention), each kind's KV heads and head_dim, the window, the full layers' K = V
+  (`attention_k_eq_v`) and proportional RoPE (`partial_rotary_factor`), the widths, KV sharing and per-layer inputs. A field the pipeline doesn't
+  implement (the MoE block of the 26B-A4B, attention biases, another activation or RoPE) fails the load with the reason.
+  * 31B: 60 layers, every 6th full attention (10 layers: 4 KV heads, head_dim 512, K = V, proportional RoPE over 64 pairs), the other 50
+    sliding-window attention (1024 positions, 16 KV heads, head_dim 256); 32 Q heads, hidden 5376, MLP 21504.
+  * E4B: 42 layers, every 6th full attention (7 layers: 2 KV heads, head_dim 512, a V projection of their own), the other 35 sliding-window attention
+    (512 positions, 2 KV heads, head_dim 256); 8 Q heads, hidden 2560, MLP 10240. The last 18 layers have no K / V of their own: each attends with
+    those of layer 22 (sliding) or 23 (full). Per-layer inputs: a [262144, 42 x 256] table that stays in the checkpoint's mapping on the host (a
+    forward's rows are copied up and decoded on the device), mixed with a projection of the token embeddings, a 256-value slice of it gated into every
+    layer after its MLP. A prefill chunk that needs at most its last row's logits runs the KV-sharing layers over its last 17 rows only (the smallest
+    prefill-sized forward, so those logits are the whole chunk's), and none of them without logits. `tp` 1 or 2.
+  * Both: sandwich norms, an FP32 residual stream, a tied head with a final logit softcap of 30, vocabulary 262144.
 * Weights: EXL3 (exllamav3's conversions), NVFP4 (modelopt: the MLP in NVFP4, attention and the tied head BF16; `nvfp4_dense=attn,head` or `all`
-  quantizes those at load), GGUF (llama.cpp's `gemma4` architecture, e.g. the QAT Q4_0 release).
-* Caches: the sliding-window layers keep a ring of 1536 positions per slot (the window and one 512-row prefill chunk), the full-attention layers every
-  position; prefix-cache snapshots keep the sliding layers' last window.
-* Speculation: the DFlash drafter `z-lab/gemma-4-31B-it-DFlash` (a DFlash v1 `DFlashDraftModel`, also as an EXL3 conversion) through
+  quantizes those at load), GGUF (llama.cpp's `gemma4` architecture, e.g. the QAT Q4_0 releases).
+* Caches: the sliding-window layers keep a ring of the window and one 512-row prefill chunk per slot (31B: 1536 positions, E4B: 1024), the
+  full-attention layers every position; prefix-cache snapshots keep the sliding layers' last window.
+* Speculation (31B): the DFlash drafter `z-lab/gemma-4-31B-it-DFlash` (a DFlash v1 `DFlashDraftModel`, also as an EXL3 conversion) through
   `draft_model_dir`: a 16-row block of which the first 8 rows are verified, taps of layers 1, 12, 23, 35, 46 and 57, one full-attention layer over every
   position (the drafter takes each prefill chunk's taps as they are written). `speculator=suffix` with `spec_suffix` needs no model.
-* Images: the checkpoint's vision tower (ViT blocks with a 2-D rotary, 3 x 3 pooling into at most 280 soft tokens, `max_image_tokens` caps that)
+* Images (31B): the checkpoint's vision tower (ViT blocks with a 2-D rotary, 3 x 3 pooling into at most 280 soft tokens, `max_image_tokens` caps that)
   from the BF16 `model.vision_tower.*` tensors, on CUDA, CPU and Vulkan. An image's tokens attend to the whole image on the sliding-window layers and
   causally on the full-attention ones, and a prefill forward never splits an image. A GGUF directory's tower is its `mmproj` file (llama.cpp's `clip`
   architecture with the `gemma4v` projector).

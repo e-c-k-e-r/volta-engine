@@ -86,7 +86,7 @@ OPTS = [
 ]
 
 out = {"templates": {}}
-for name in ("qwen3_5", "glm5_next", "glm5_next_upstream", "gemma4"):
+for name in ("qwen3_5", "glm5_next", "glm5_next_upstream", "gemma4", "gemma4_canonical"):
     path = os.path.join(data, name + "_chat_template.jinja")
     tpl = env.from_string(open(path, encoding="utf-8").read())
     cases = []
@@ -94,7 +94,7 @@ for name in ("qwen3_5", "glm5_next", "glm5_next_upstream", "gemma4"):
         for opts in OPTS:
             for gen in (True, False):
                 kw = dict(opts, messages=messages, add_generation_prompt=gen)
-                if name == "gemma4":
+                if name.startswith("gemma4"):
                     kw["bos_token"] = "<bos>"
                     if opts.get("enable_thinking") is False:
                         kw["enable_thinking"] = True   # Gemma 4 thinks only when asked: cover the system-turn <|think|> instead

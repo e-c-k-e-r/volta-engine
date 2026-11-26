@@ -41,6 +41,7 @@ struct EmbedParams { uint64_t table, token_ids, out_; int hidden_size, rows; };
 struct RopeParams { uint64_t q, k, pos; int num_q_heads, num_kv_heads, head_dim, rot_dim, interleaved; float freq_base; int rot_pairs; };
 struct NormF32Params { uint64_t src, dst, weight; int hidden_size, has_weight; float eps, bias; };
 struct AddNormedParams { uint64_t resid, y, weight; int hidden_size, has_weight; float eps, bias, scale; };
+struct PleMixParams { uint64_t proj, tok, weight, out_; int rows, layers, dim; float eps, tok_scale, out_scale; };
 struct ScaleF32Params { uint64_t x, out_; int n; float scale; };
 struct SoftcapParams { uint64_t x; int n; float cap; };
 struct ArgmaxParams { uint64_t logits, out_idx, out_val; int numel, batch_size, index_offset, row_stride, has_val; };

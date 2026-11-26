@@ -55,6 +55,16 @@ void Elementwise::add_normed( pod::TensorView& resid, const pod::TensorView& y, 
 	impl::cpu_dispatch( ::add_normed, &p, static_cast<uint32_t>( y.numel() / hidden_size ) );
 }
 
+void Elementwise::ple_mix( const pod::TensorView& proj, const pod::TensorView& tok, const pod::TensorView& weight, pod::TensorView& out, int layers, int dim,
+	float eps, float tok_scale, float out_scale, backend::stream_t ) {
+	const int rows = proj.shape[0];
+	ENGINE_ASSERT( proj.shape[1] == layers * dim && tok.shape[1] == layers * dim && weight.numel() == static_cast<size_t>( dim ), "Elementwise::ple_mix: shapes" );
+	if ( rows == 0 ) return;
+	PleMixParams p{ const_cast<half*>( proj.ptr<const half>() ), const_cast<half*>( tok.ptr<const half>() ), const_cast<half*>( weight.ptr<const half>() ), out.ptr<half>(),
+		rows, layers, dim, eps, tok_scale, out_scale };
+	impl::cpu_dispatch_mt( ::ple_mix, &p, static_cast<uint32_t>( rows ), static_cast<uint32_t>( layers ) );
+}
+
 void Elementwise::scale_to_f32( const pod::TensorView& x, pod::TensorView& out, float scale, backend::stream_t ) {
 	const int n = static_cast<int>( x.numel() );
 	ScaleF32Params p{ const_cast<half*>( x.ptr<const half>() ), out.ptr<float>(), n, scale };

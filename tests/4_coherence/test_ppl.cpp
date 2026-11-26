@@ -20,8 +20,8 @@
 //   not trained on system and user text, whose loss is meaningless, so only the tokens between <|im_start|>assistant and <|im_end|> after the shared prefix are scored); --select hold takes every 10th session in name order, train the rest
 //   test_ppl --model qwen4_exp --qbench qbench_prompts.md [--chunk C]   scores only the response tokens of each traced row (input as context), the
 //   quantity the checkpoint's model card reports as PPL
-// --model: qwen3_5 (the default), qwen4_exp or glm5_next for that family's test checkpoint (tests/models.env), or a checkpoint directory.
-// The default text is the docs/ folder concatenated; ids never include special tokens.
+// --model: qwen3_5 (the default), qwen4_exp, glm5_next or gemma4 for that family's test checkpoint (tests/models.env), or a checkpoint directory.
+// The default text is the docs/ folder concatenated; ids never include special tokens (but Gemma 4's <bos> first).
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"
 #include "engine/backend/numeric.h"
@@ -102,7 +102,7 @@ int main( int argc, char** argv ) {
 		else if ( !std::strcmp( argv[i], "--stride" ) && i + 1 < argc ) stride = std::max( 1, std::atoi( argv[++i] ) );
 	}
 	const test::TestModel tm = test::model_arg( argc, argv, "qwen3_5" );
-	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "qwen4_exp" ) || tm.is( "glm5_next" ), "test_ppl: --model qwen3_5, qwen4_exp or glm5_next" );
+	ENGINE_ASSERT( tm.is( "qwen3_5" ) || tm.is( "qwen4_exp" ) || tm.is( "glm5_next" ) || tm.is( "gemma4" ), "test_ppl: --model qwen3_5, qwen4_exp, glm5_next or gemma4" );
 	const bool glm = tm.is( "glm5_next" ), flash = tm.is( "qwen4_exp" );
 	// --calibrate with ENGINE_CALIB_MTP set (Flash-Next): the MTP head runs after every forward on the same rows (hidden stack of position p with the token
 	// of p + 1), so ENGINE_HESSIAN_DIR also collects the head's sites (layers 48 and 49 of the file names); the head keeps its own KV like in serving
@@ -448,6 +448,7 @@ int main( int argc, char** argv ) {
 		for ( int t; f >> t; ) ids.push_back( t );
 		text.clear();
 	}
+	else if ( tm.is( "gemma4" ) ) ids.push_back( tok.get_special_token( "<bos>" ) );   // Gemma's text starts at its <bos>, without which it degrades
 	for ( size_t at = 0; at < text.size(); ) {
 		size_t end = std::min( text.size(), at + 4096 );
 		if ( end < text.size() ) {

@@ -54,6 +54,7 @@ struct Ctx {
 	bool sem_fd = false;        // VK_KHR_external_semaphore_fd: timeline semaphores shared with the other devices
 	size_t host_import_align = 0;   // VK_KHR_push_descriptor: storage buffers bound inside the command buffer
 	bool int_dot = false;   // shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product) enabled: packed 4 x int8 dot products
+	bool budget = false;    // VK_EXT_memory_budget: the heaps' budget and usage (the driver's and other processes' allocations included)
 	bool rte16 = false;   // shaderRoundingModeRTEFloat16: float -> half conversions can be made round-to-nearest-even
 	std::map<uint64_t, Alloc> allocs; // keyed by device address
 	std::multimap<size_t, Staging> staging_pool;   // idle pooled staging buffers by capacity
@@ -149,7 +150,7 @@ bool init_context( int dev ) {
 	}
 
 	// Feature requirements of the Slang SPIR-V: PhysicalStorageBufferAddresses, Float16, Int64 (+ Int16 for the BF16 table)
-	bool has_dot_ext = false, has_push_desc = false, has_host_import = false, has_sem_fd = false, has_mem_fd = false;
+	bool has_dot_ext = false, has_push_desc = false, has_host_import = false, has_sem_fd = false, has_mem_fd = false, has_budget = false;
 	{
 		uint32_t en = 0;
 		vkEnumerateDeviceExtensionProperties( g.phys, nullptr, &en, nullptr );
@@ -161,6 +162,7 @@ bool init_context( int dev ) {
 			has_host_import = has_host_import || std::strcmp( e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME ) == 0;
 			has_sem_fd = has_sem_fd || std::strcmp( e.extensionName, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME ) == 0;
 			has_mem_fd = has_mem_fd || std::strcmp( e.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME ) == 0;
+			has_budget = has_budget || std::strcmp( e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME ) == 0;
 		}
 	}
 	VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR fdot{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR };
@@ -210,9 +212,11 @@ bool init_context( int dev ) {
 	if ( has_push_desc ) exts.push_back( VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME );
 	if ( has_host_import ) exts.push_back( VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME );
 	if ( has_sem_fd ) exts.push_back( VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME );
+	if ( has_budget ) exts.push_back( VK_EXT_MEMORY_BUDGET_EXTENSION_NAME );
 	dci.enabledExtensionCount = static_cast<uint32_t>( exts.size() );
 	dci.ppEnabledExtensionNames = exts.data();
 	if ( vkCreateDevice( g.phys, &dci, nullptr, &g.device ) != VK_SUCCESS ) return false;
+	g.budget = has_budget;
 	if ( has_push_desc ) g.push_descriptor = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>( vkGetDeviceProcAddr( g.device, "vkCmdPushDescriptorSetKHR" ) );
 	g.host_import = has_host_import;
 	g.sem_fd = has_sem_fd;
@@ -592,14 +596,25 @@ bool set_device_try( int device ) {
 	return true;
 }
 
-// Device-local heap size less what this process allocated (no VK_EXT_memory_budget: other processes are not accounted for)
+// The largest device-local heap's budget less its usage (VK_EXT_memory_budget: what the driver, this process and the others hold), else its
+// size less what this process allocated
 size_t device_free_bytes( int device ) {
 	if ( device < 0 || device >= MAX_DEV ) device = t_dev;
 	if ( !gs[device].ok && !init_context( device ) ) return 0;
 	const Ctx& c = gs[device];
+	uint32_t hi = 0;
 	uint64_t heap = 0;
 	for ( uint32_t i = 0; i < c.mem.memoryHeapCount; ++i ) {
-		if ( c.mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ) heap = MAX( heap, c.mem.memoryHeaps[i].size );
+		if ( ( c.mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ) && c.mem.memoryHeaps[i].size > heap ) {
+			heap = c.mem.memoryHeaps[i].size;
+			hi = i;
+		}
+	}
+	if ( c.budget ) {
+		VkPhysicalDeviceMemoryBudgetPropertiesEXT b{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+		VkPhysicalDeviceMemoryProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b };
+		vkGetPhysicalDeviceMemoryProperties2( c.phys, &p2 );
+		return b.heapBudget[hi] > b.heapUsage[hi] ? size_t( b.heapBudget[hi] - b.heapUsage[hi] ) : 0;
 	}
 	return heap > c.allocated ? size_t( heap - c.allocated ) : 0;
 }

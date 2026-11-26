@@ -20,6 +20,7 @@ void rms_norm( ComputeVaryingInput*, void*, void* );
 void rms_norm_heads( ComputeVaryingInput*, void*, void* );
 void rms_norm_f32( ComputeVaryingInput*, void*, void* );
 void add_normed( ComputeVaryingInput*, void*, void* );
+void ple_mix( ComputeVaryingInput*, void*, void* );
 void scale_to_f32( ComputeVaryingInput*, void*, void* );
 void softcap( ComputeVaryingInput*, void*, void* );
 void add_residual( ComputeVaryingInput*, void*, void* );
@@ -60,6 +61,7 @@ struct EmbedParams { uint16_t* table; int* token_ids; half* out_; int hidden_siz
 struct RopeParams { half* q; half* k; int* pos; int num_q_heads; int num_kv_heads; int head_dim; int rot_dim; int interleaved; float freq_base; int rot_pairs; };
 struct NormF32Params { float* src; half* dst; half* weight; int hidden_size; int has_weight; float eps; float bias; };
 struct AddNormedParams { float* resid; half* y; half* weight; int hidden_size; int has_weight; float eps; float bias; float scale; };
+struct PleMixParams { half* proj; half* tok; half* weight; half* out_; int rows; int layers; int dim; float eps; float tok_scale; float out_scale; };
 struct ScaleF32Params { half* x; float* out_; int n; float scale; };
 struct SoftcapParams { half* x; int n; float cap; };
 

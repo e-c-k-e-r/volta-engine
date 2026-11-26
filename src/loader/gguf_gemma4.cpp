@@ -29,6 +29,16 @@ const Name kLayer[] = {
 	{ "ffn_gate.weight", "mlp.gate_proj.weight" },
 	{ "ffn_up.weight", "mlp.up_proj.weight" },
 	{ "ffn_down.weight", "mlp.down_proj.weight" },
+	{ "inp_gate.weight", "per_layer_input_gate.weight" },
+	{ "proj.weight", "per_layer_projection.weight" },
+	{ "post_norm.weight", "post_per_layer_input_norm.weight" },
+};
+
+// The per-layer input embeddings (the E2B / E4B models), under model.language_model.
+const Name kGlobal[] = {
+	{ "per_layer_token_embd.weight", "embed_tokens_per_layer.weight" },
+	{ "per_layer_model_proj.weight", "per_layer_model_projection.weight" },
+	{ "per_layer_proj_norm.weight", "per_layer_projection_norm.weight" },
 };
 
 void map_gemma4( const GgufArch&, const GgufKv&, const std::string& g, std::vector<GgufMapped>* out ) {
@@ -44,6 +54,9 @@ void map_gemma4( const GgufArch&, const GgufKv&, const std::string& g, std::vect
 	}
 	if ( g == "output.weight" ) { emit( "lm_head.weight" ); return; }
 	if ( g == "output_norm.weight" ) { emit( "model.language_model.norm.weight" ); return; }
+	for ( const Name& n : kGlobal ) {
+		if ( g == n.gguf ) { emit( std::string( "model.language_model." ) + n.hf ); return; }
+	}
 	int layer = -1, used = 0;
 	if ( std::sscanf( g.c_str(), "blk.%d.%n", &layer, &used ) != 1 || used == 0 ) return;
 	const std::string rest = g.substr( static_cast<size_t>( used ) );

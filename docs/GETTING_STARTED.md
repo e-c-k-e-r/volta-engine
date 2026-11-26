@@ -103,7 +103,7 @@ Per-model setup (checkpoints, weight formats, speculators, images, model-specifi
 | [Qwen3.8-27B](MODELS.md#qwen38-27b-qwen3_5) | `qwen3_5` | `configs/example_qwen.json`, `configs/qwen_agent.json` (256K, 2 slots), `configs/qwen_nvfp4.json` |
 | [GLM-5.3-Flash](MODELS.md#glm-53-flash-glm5_next) | `glm5_next` | `configs/glm_256k.json` (256K, 4 slots, DFlash2), `configs/glm_volta.json` (Volta tile order: one shared 512K pool for 4 slots with kv_shard, DFlash2, every expert resident), `configs/glm_mtp.json` (MTP) |
 | [Qwen3.8-Flash-Next](MODELS.md#qwen38-flash-next-qwen4_exp) | `qwen4_exp` | `configs/flash_next_nvfp4.json` (the NVFP4 checkpoint, 4 slots of 256K, MTP), `configs/flash_next_nvfp4_only.json`, `configs/flash_next_dflash2.json`, `configs/flash_next_cpu_experts.json` |
-| [Gemma 4 31B](MODELS.md#gemma-4-31b-gemma4) | `gemma4` | none: `--model-dir` and, for the DFlash drafter, `--speculative --draft-model-dir` |
+| [Gemma 4 31B, E4B](MODELS.md#gemma-4-gemma4) | `gemma4` | none: `--model-dir` and, for the 31B's DFlash drafter, `--speculative --draft-model-dir` |
 | [DeepSeek-V4.1-Flash](MODELS.md#deepseek-v41-flash-deepseek_v41) | `deepseek_v41` | `configs/deepseek_v41.json` (DSpark drafter; the model directory needs `engram_hash.bin`) |
 | MiniMax-H3 (video) | | [VIDEO.md](VIDEO.md) |
 

@@ -1015,7 +1015,21 @@ private:
 			// target: name, name.attr, or a comma separated list of names
 			size_t eq = 0;
 			while ( eq < toks.size() && !( toks[eq].type == TokType::Op && toks[eq].text == "=" ) ) ++eq;
-			if ( eq == toks.size() ) { fail( "block set is not supported" ); return; }
+			if ( eq == toks.size() ) {
+				// block set: {% set name %} ... {% endset %} assigns the body's rendered text
+				std::vector<Token> target = toks;
+				target.push_back( Token() );
+				ExprParser tp( target, err_ );
+				NodeP t = tp.parse_postfix( tp.parse_primary() );
+				if ( tp.failed || !tp.at_end() ) { fail( "malformed block set target" ); return; }
+				n->kids.push_back( t );
+				std::string stop;
+				parse_body( n->body, { "endset" }, stop );
+				if ( stop != "endset" ) { fail( "unterminated block set" ); return; }
+				++pos_;
+				body.push_back( n );
+				return;
+			}
 			std::vector<Token> target( toks.begin(), toks.begin() + static_cast<long>( eq ) );
 			target.push_back( Token() );
 			ExprParser tp( target, err_ );
@@ -1154,6 +1168,12 @@ private:
 			}
 			case NT::For: return exec_for( n, out );
 			case NT::Set: {
+				if ( n.expr == nullptr ) {   // block set
+					std::string text;
+					exec_body( n.body, text );
+					if ( !failed ) assign_target( *n.kids[0], Value::string( std::move( text ) ) );
+					return Flow::Normal;
+				}
 				const Value v = eval( *n.expr );
 				if ( failed ) return Flow::Normal;
 				if ( n.kids.size() == 1 ) {

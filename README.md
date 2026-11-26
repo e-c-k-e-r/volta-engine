@@ -41,7 +41,7 @@ Supported, tested configurations are narrow, as it's limited to what I currently
 
 ## Features
 
-* models: Qwen3.8-27B, GLM-5.3-Flash, Qwen3.8-Flash-Next, Gemma 4 31B and DeepSeek-V4.1-Flash, plus MiniMax-H3 video + audio generation
+* models: Qwen3.8-27B, GLM-5.3-Flash, Qwen3.8-Flash-Next, Gemma 4 (31B, E4B) and DeepSeek-V4.1-Flash, plus MiniMax-H3 video + audio generation
 * weight formats: EXL3 (stock or Volta tile order), NVFP4 and GGUF, and EXL3 checkpoints with NVFP4 experts or dense groups swapped in at load
 * serving: OpenAI and Anthropic APIs with reasoning and tool-call parsing, a prefix cache in pinned host RAM, a `/monitor` page
 * speculative decoding: MTP, DFlash(2), DSpark

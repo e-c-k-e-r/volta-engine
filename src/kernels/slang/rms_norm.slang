@@ -36,6 +36,21 @@ struct AddNormedParams {
 	float scale;
 };
 
+// Gemma 4's per-layer inputs: proj and tok [rows, layers * dim] hold each row's layer slices; out [layers, rows, dim] =
+// ( rms_norm( the proj slice ) * weight + the tok slice * tok_scale ) * out_scale. A group per (row, layer)
+struct PleMixParams {
+	half* proj;
+	half* tok;
+	half* weight;
+	half* out;
+	int rows;
+	int layers;
+	int dim;
+	float eps;
+	float tok_scale;
+	float out_scale;
+};
+
 groupshared float s_red[256];
 
 float inv_rms_from(float total, int n, float eps) {
@@ -148,6 +163,29 @@ void add_normed(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform Ad
 		row_r[i] = (row_r[i] + float(row_y[i]) * inv * w) * p.scale;
 	}
 }
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void ple_mix(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform PleMixParams p) {
+	let t = int(tid.x);
+	let in_off = (int64_t(gid.x) * p.layers + int64_t(gid.y)) * p.dim;
+	half* pr = p.proj + in_off;
+	half* tk = p.tok + in_off;
+	half* o = p.out + (int64_t(gid.y) * p.rows + int64_t(gid.x)) * p.dim;
+	float sq = 0.0f;
+	for (int i = t; i < p.dim; i += 256) {
+		let v = float(pr[i]);
+		sq = fma(v, v, sq);
+	}
+	s_red[t] = sq;
+	GroupMemoryBarrierWithGroupSync();
+	for (int s = 128; s > 0; s >>= 1) {
+		if (t < s) s_red[t] += s_red[t + s];
+		GroupMemoryBarrierWithGroupSync();
+	}
+	let inv = inv_rms_from(s_red[0], p.dim, p.eps);
+	for (int i = t; i < p.dim; i += 256) o[i] = half((float(pr[i]) * inv * float(p.weight[i]) + float(tk[i]) * p.tok_scale) * p.out_scale);
+}
 #else
 // Host target: one invocation per row / per (head, row), serial sums
 struct HeadNormParams {
@@ -221,5 +259,21 @@ void add_normed(uint3 gid : SV_GroupID, uniform AddNormedParams p) {
 		let w = p.has_weight != 0 ? float(p.weight[i]) + p.bias : 1.0f;
 		row_r[i] = (row_r[i] + float(row_y[i]) * inv * w) * p.scale;
 	}
+}
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void ple_mix(uint3 gid : SV_GroupID, uniform PleMixParams p) {
+	let in_off = (int64_t(gid.x) * p.layers + int64_t(gid.y)) * p.dim;
+	half* pr = p.proj + in_off;
+	half* tk = p.tok + in_off;
+	half* o = p.out + (int64_t(gid.y) * p.rows + int64_t(gid.x)) * p.dim;
+	float sq = 0.0f;
+	for (int i = 0; i < p.dim; ++i) {
+		let v = float(pr[i]);
+		sq = fma(v, v, sq);
+	}
+	let inv = inv_rms_from(sq, p.dim, p.eps);
+	for (int i = 0; i < p.dim; ++i) o[i] = half((float(pr[i]) * inv * float(p.weight[i]) + float(tk[i]) * p.tok_scale) * p.out_scale);
 }
 #endif

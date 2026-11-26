@@ -21,7 +21,7 @@ Options are set with `--set key=value` or in the launch file's `options` object;
 | GLM-5.3-Flash | `glm5_next` | KDA linear attention (34 layers) + absorbed MLA with a DSA indexer (11 layers), routed MoE (288 experts, top 8) | 1, 2 or 4 | EXL3 or GGUF experts; NVFP4 for the dense groups; the DFlash2 drafter or the MTP head |
 | Qwen3.8-Flash-Next | `qwen4_exp` | GDN + QSA block-sparse attention, 512-expert MoE, gated residual streams, one n-gram embedding layer | 1, 2 or 4 | EXL3 2/3/4 bpw experts with 7/8 bpw projections; NVFP4 experts and dense groups; GGUF; the MTP head or the DFlash2 drafter |
 | DeepSeek-V4.1-Flash | `deepseek_v41` | 40 layers of sliding-window + compressed sparse attention, routed MoE (384 experts, top 6) on four hyper-connection streams, Engram n-gram lookups at two layers | 1, 2 or 4 | EXL3 (also packs that keep the FP8 attention weights) or GGUF; the DSpark drafter or suffix speculation; the CUDA backend only |
-| Gemma 4 31B | `gemma4` | 60 layers of sliding-window attention, every 6th full attention (head_dim 512, V = K), sandwich norms, an FP32 residual stream | 1, 2 or 4 | EXL3, NVFP4 or GGUF; the DFlash (v1) drafter |
+| Gemma 4 31B, E4B | `gemma4` | sliding-window attention, every 6th layer full attention (head_dim 512; the 31B's V = K), sandwich norms, an FP32 residual stream; E4B's last 18 layers on earlier layers' K / V and per-layer input embeddings; the layout from the checkpoint's config | 1, 2 or 4 (E4B: 1 or 2) | EXL3, NVFP4 or GGUF; the 31B's DFlash (v1) drafter |
 
 The model type is read from the checkpoint, never configured. Anything else is a fatal error at start.
 
@@ -96,7 +96,8 @@ After a prefix restore the MTP head does one plain step first, because it does n
   devices with the all-reduce meeting in host memory the devices import
   * a second server can run on the other pair of GPUs (`CUDA_VISIBLE_DEVICES=2,3`, `--tp-size 2`)
 * one arena per GPU, allocated at boot from the free memory minus a reserve for what the CUDA driver takes later (`arena_gib`, `vram_reserve_mib`, 384 MiB); the
-  kernels' workspaces come out of the arena (`scratch_mib`), and nothing allocates while decoding
+  kernels' workspaces come out of the arena (`scratch_mib`), and nothing allocates while decoding. On Vulkan the free memory is the device-local heap's
+  budget less its usage (`VK_EXT_memory_budget`: the driver's and other processes' allocations counted), or without it the heap less this process's allocations
 * up to `max_slots` concurrent sequences, `max_batch_size` of them stepped together; the scheduler thread owns the slots
 * the image embeddings and the vision tower run on rank 0 only
 

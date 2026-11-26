@@ -63,6 +63,15 @@ void Elementwise::add_normed( pod::TensorView& resid, const pod::TensorView& y, 
 	vki::launch( "add_normed", p, stream, static_cast<int>( y.numel() / hidden_size ) );
 }
 
+void Elementwise::ple_mix( const pod::TensorView& proj, const pod::TensorView& tok, const pod::TensorView& weight, pod::TensorView& out, int layers, int dim,
+	float eps, float tok_scale, float out_scale, backend::stream_t stream ) {
+	const int rows = proj.shape[0];
+	ENGINE_ASSERT( proj.shape[1] == layers * dim && tok.shape[1] == layers * dim && weight.numel() == static_cast<size_t>( dim ), "Elementwise::ple_mix: shapes" );
+	if ( rows == 0 ) return;
+	vki::PleMixParams p{ vki::dp( proj.data ), vki::dp( tok.data ), vki::dp( weight.data ), vki::dp( out.data ), rows, layers, dim, eps, tok_scale, out_scale };
+	vki::launch( "ple_mix", p, stream, rows, layers );
+}
+
 void Elementwise::scale_to_f32( const pod::TensorView& x, pod::TensorView& out, float scale, backend::stream_t stream ) {
 	const int n = static_cast<int>( x.numel() );
 	vki::ScaleF32Params p{ vki::dp( x.data ), vki::dp( out.data ), n, scale };

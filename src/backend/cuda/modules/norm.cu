@@ -293,7 +293,34 @@ __global__ void scale_to_f32_kernel( const half* __restrict__ x, float* __restri
 	if ( i < n ) out[i] = __half2float( x[i] ) * scale;
 }
 
+// out[l][r] = ( rms_norm( proj[r][l] ) * w + tok[r][l] * tok_scale ) * out_scale, a block per (row, layer) slice of dim values
+__global__ void ple_mix_kernel( const half* __restrict__ proj, const half* __restrict__ tok, const half* __restrict__ weight, half* __restrict__ out,
+	int rows, int layers, int dim, float eps, float tok_scale, float out_scale ) {
+	const int r = blockIdx.x, l = blockIdx.y;
+	const size_t in = ( static_cast<size_t>( r ) * layers + l ) * dim;
+	const half* p = proj + in;
+	const half* t = tok + in;
+	half* o = out + ( static_cast<size_t>( l ) * rows + r ) * dim;
+	float local_sq = 0.0f;
+	for ( int i = threadIdx.x; i < dim; i += blockDim.x ) {
+		const float v = __half2float( p[i] );
+		local_sq = fmaf( v, v, local_sq );
+	}
+	const float inv_rms = rsqrtf( engine::math::block_sum<8>( local_sq ) / static_cast<float>( dim ) + eps );
+	for ( int i = threadIdx.x; i < dim; i += blockDim.x )
+		o[i] = __float2half_rn( ( __half2float( p[i] ) * inv_rms * __half2float( weight[i] ) + __half2float( t[i] ) * tok_scale ) * out_scale );
+}
+
 } // namespace
+
+void Elementwise::ple_mix( const pod::TensorView& proj, const pod::TensorView& tok, const pod::TensorView& weight, pod::TensorView& out, int layers, int dim,
+	float eps, float tok_scale, float out_scale, cudaStream_t stream ) {
+	const int rows = proj.shape[0];
+	ENGINE_ASSERT( proj.shape[1] == layers * dim && tok.shape[1] == layers * dim && weight.numel() == static_cast<size_t>( dim ), "Elementwise::ple_mix: shapes" );
+	if ( rows == 0 ) return;
+	ple_mix_kernel<<<dim3( rows, layers ), dim3( 256 ), 0, stream>>>( proj.ptr<const half>(), tok.ptr<const half>(), weight.ptr<const half>(), out.ptr<half>(), rows,
+		layers, dim, eps, tok_scale, out_scale );
+}
 
 void Elementwise::add_normed( pod::TensorView& resid, const pod::TensorView& y, const pod::TensorView& weight, float eps, float constant_bias,
 	float scale, cudaStream_t stream ) {

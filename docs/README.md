@@ -8,7 +8,7 @@
   * Qwen3.8-27B (`qwen3_5`): GDN linear attention + full attention
   * GLM-5.3-Flash (`glm5_next`): KDA linear attention + absorbed MLA with a sparse indexer, routed MoE
   * Qwen3.8-Flash-Next (`qwen4_exp`): GDN + QSA block-sparse attention, 512-expert MoE, gated residuals, n-gram embedding layer
-  * Gemma 4 31B (`gemma4`): sliding-window (1024) and full attention (head_dim 512, K = V), sandwich norms, an FP32 residual stream; EXL3, NVFP4 and GGUF on CUDA, CPU and Vulkan
+  * Gemma 4 31B and E4B (`gemma4`): sliding-window and full attention (head_dim 512), sandwich norms, an FP32 residual stream, E4B's KV sharing and per-layer inputs, the layout from the checkpoint's config; EXL3, NVFP4 and GGUF on CUDA, CPU and Vulkan
   * DeepSeek-V4.1-Flash (`deepseek_v41`): sliding-window + compressed sparse attention, 384-expert MoE, hyper-connection streams, Engram n-gram lookups; CUDA only
   * MiniMax-H3: video + audio generation (see [VIDEO.md](VIDEO.md))
 * weight formats

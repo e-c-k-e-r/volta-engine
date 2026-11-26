@@ -11,16 +11,22 @@
 #include "engine/models/gemma4_vision.h"
 #include "engine/backend/types.h"
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <vector>
+
+namespace engine::loader { class SafeTensorsRepo; }
 
 namespace engine::models {
 
-// Gemma 4 31B (gemma4_text): 60 layers, every 6th full attention, the rest sliding-window attention
+// A Gemma 4 text model (gemma4_text), its layout read from the checkpoint's config.json (read_gemma4_config); the defaults are the 31B's:
+// 60 layers, every 6th full attention, the rest sliding-window attention
 struct Gemma4Config {
 	int num_layers = 60;
-	int full_every = 6;          // layers 5, 11, ... are full attention
+	std::vector<uint8_t> full;   // per layer: full attention (else sliding window), layer_types; empty: every 6th (layers 5, 11, ...)
 	int hidden_size = 5376;
 	int intermediate_size = 21504;
+	bool double_wide_shared = false;   // the KV-sharing layers' MLPs are twice as wide (use_double_wide_mlp)
 	int num_q_heads = 32;
 
 	// Sliding-window layers
@@ -29,12 +35,21 @@ struct Gemma4Config {
 	int swa_window = 1024;       // a row attends to its last 1024 positions, its own included
 	float swa_rope_theta = 10000.0f;
 
-	// Full-attention layers: K = V (no v_proj), "proportional" RoPE over 512 dims with 64 rotating pairs
+	// Full-attention layers: "proportional" RoPE over 512 dims with 64 rotating pairs; K = V (attention_k_eq_v: no v_proj)
 	int full_kv_heads = 4;
 	int full_head_dim = 512;
 	int full_rot_pairs = 64;
 	float full_rope_theta = 1000000.0f;
+	bool full_k_eq_v = true;
 
+	// The last kv_shared_layers layers have no K / V of their own: each attends with those of the last earlier layer of its kind
+	int kv_shared_layers = 0;
+	// Per-layer input embeddings (hidden_size_per_layer_input): a [ple_vocab, num_layers * ple_dim] table, every layer's slice mixed in
+	// after its MLP
+	int ple_dim = 0;
+	int ple_vocab = 0;
+
+	bool bidirectional_images = true;   // an image's tokens attend to the whole image on the sliding-window layers (use_bidirectional_attention "vision")
 	int max_seq = 32768;
 	int max_slots = 8;
 	int vocab_size = 262144;
@@ -42,10 +57,21 @@ struct Gemma4Config {
 	float final_softcap = 30.0f;
 	static constexpr int kTaps = 6;
 	int tap_layers[kTaps] = { 1, 12, 23, 35, 46, 57 };   // the DFlash drafter's target_layer_ids (z-lab gemma-4-31B-it-DFlash)
+
+	bool is_full( int layer ) const { return full.empty() ? ( layer + 1 ) % 6 == 0 : full[layer] != 0; }
+	int first_shared() const { return num_layers - kv_shared_layers; }
 };
+
+// The text_config of a checkpoint's config.json into c (its fields over the defaults); false, with the reason logged, when the file is
+// unreadable or describes something this pipeline doesn't implement (MoE blocks, attention biases, another activation or RoPE)
+bool read_gemma4_config( const char* model_dir, Gemma4Config* c );
 
 struct Gemma4LayerWeights {
 	bool is_full = false;
+	bool shared_kv = false;      // attends with the K / V of layer kv_source (no k_proj / v_proj of its own)
+	int kv_source = 0;
+	int kv_layer = 0;            // its (or its source's) layer in the pool of its kind
+	int inter = 0;               // MLP width on this rank
 	float layer_scalar = 1.0f;
 
 	pod::TensorView input_norm;
@@ -55,7 +81,7 @@ struct Gemma4LayerWeights {
 
 	pod::LinearWeight q_proj;
 	pod::LinearWeight k_proj;
-	pod::LinearWeight v_proj;    // sliding layers only
+	pod::LinearWeight v_proj;    // none on full layers with K = V
 	pod::LinearWeight o_proj;
 	pod::TensorView q_norm;
 	pod::TensorView k_norm;
@@ -63,6 +89,11 @@ struct Gemma4LayerWeights {
 	pod::LinearWeight gate_proj;
 	pod::LinearWeight up_proj;
 	pod::LinearWeight down_proj;
+
+	// Per-layer input: x += post_ple_norm( ple_proj( gelu( ple_gate( x ) ) * the layer's slice ) )
+	pod::LinearWeight ple_gate;
+	pod::LinearWeight ple_proj;
+	pod::TensorView post_ple_norm;
 };
 
 class Gemma4Pipeline : public ModelPipeline {
@@ -72,12 +103,13 @@ public:
 
 	using ModelPipeline::forward;
 
+	void set_model_dir( const char* dir ) override { model_dir_ = dir != nullptr ? dir : ""; }
 	bool init( int device_id, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring ) override;
 	bool init( const Gemma4Config& config, int rank, pod::MemoryArena& arena, engine::comm::CollectiveRing* ring );
 	bool load_weights( const char* model_dir, backend::stream_t stream = nullptr ) override;
 
 	void embed_tokens( const int* token_ids, int count, backend::stream_t stream = nullptr ) override;
-	bool embeds_device_tokens() const override { return true; }
+	bool embeds_device_tokens() const override { return config_.ple_dim == 0; }   // the per-layer table's rows are gathered on the host
 	void embed_tokens_device( const int* d_tokens, int src_dev, int count, backend::stream_t stream = nullptr ) override;
 	void forward( const pod::BatchRows& rows, backend::stream_t stream = nullptr ) override;
 	void sample_tokens( int* out_preds, int count, backend::stream_t stream = nullptr ) override;
@@ -114,7 +146,7 @@ public:
 	bool load_vision( const char* model_dir, backend::stream_t stream = nullptr ) override;
 	const engine::loader::VisionParams* vision_params() const override { return vision_.loaded() ? &vision_.params() : nullptr; }
 	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
-	bool bidirectional_images() const override { return true; }
+	bool bidirectional_images() const override { return config_.bidirectional_images; }
 	bool image_mrope() const override { return false; }
 
 	pod::TensorView& logits() override { return logits_; }
@@ -125,7 +157,10 @@ public:
 
 private:
 	void set_rows( int m );
-	bool layer_forward( const Gemma4LayerWeights& lw, int kv_layer, int m, backend::stream_t stream, bool input_normed = false, const pod::TensorView* next_norm = nullptr );
+	bool layer_forward( const Gemma4LayerWeights& lw, int layer, int m, backend::stream_t stream, bool input_normed = false, const pod::TensorView* next_norm = nullptr );
+	bool load_ple_table( engine::loader::SafeTensorsRepo& repo, const char* model_dir, backend::stream_t stream );
+	void ple_rows( const int* token_ids, int count, backend::stream_t stream );
+	void ple_mix( int m, backend::stream_t stream );
 	void forward_body( int m, backend::stream_t stream );
 	void copy_kv_rows( const engine::runtime::KVCachePool& pool, int slot_id, int from, int tokens, char* host, bool to_host, backend::stream_t stream );
 	size_t tap_snapshot_bytes( int tokens ) const;
@@ -139,6 +174,7 @@ private:
 	int tap_shift_ = 0;
 
 	Gemma4Config config_;
+	std::string model_dir_;
 	ModelMetadata metadata_;
 	int rank_ = 0;
 	pod::MemoryArena* arena_ = nullptr;
@@ -155,6 +191,14 @@ private:
 	engine::runtime::KVCachePool full_pool_;   // the full-attention layers
 
 	pod::BatchRows* d_rows_ = nullptr;
+	// A prefill chunk that needs one row's logits at most runs the KV-sharing layers (which store nothing) over its last kTailRows rows alone
+	// (d_tail_rows_) or not at all; rows_ is the descriptor the layers read, ple_m_ / ple_row0_ where their per-layer inputs sit
+	static constexpr int kTailRows = pod::MAX_BATCH + 1;
+	pod::BatchRows* d_tail_rows_ = nullptr;
+	pod::BatchRows tail_host_;
+	const pod::BatchRows* rows_ = nullptr;
+	bool tail_ = false;
+	int ple_m_ = 0, ple_row0_ = 0;
 	engine::core::GraphCache graphs_;
 	int* d_token_ids_ = nullptr;
 	int lm_mode_ = 0;
@@ -174,8 +218,26 @@ private:
 	pod::TensorView mlp_inter_;
 	pod::TensorView mlp_out_;
 
-	Gemma4LayerWeights layers_[60];
+	std::vector<Gemma4LayerWeights> layers_;
 	pod::TensorView embed_tokens_;
+
+	// Per-layer input embeddings: the table's rows stay in the checkpoint's mapping on the host (block-quantized GGUF rows, or BF16 / FP16 /
+	// FP32 ones); a forward's rows are staged (ple_stage_, pinned), copied up and decoded to FP16 (ple_tok_), then mixed with the projection
+	// of the embeddings into ple_ (FP16, layer-major [num_layers][rows][ple_dim])
+	std::unique_ptr<engine::loader::SafeTensorsRepo> ple_repo_;   // keeps the table's file mapped
+	struct PleTable {
+		const uint8_t* rows = nullptr;
+		size_t row_bytes = 0;
+		pod::DType dtype = pod::DType::FP16;   // GGUF: block rows of gguf_type
+		uint32_t gguf_type = 0;
+	} ple_table_;
+	pod::LinearWeight ple_model_proj_;
+	pod::TensorView ple_proj_norm_;
+	uint8_t* ple_stage_ = nullptr;
+	void* ple_blocks_ = nullptr;     // the staged rows on the device (block rows only)
+	pod::TensorView ple_tok_;        // [MAX_ROWS, num_layers * ple_dim] the rows' table values
+	pod::TensorView ple_proj_;       // [MAX_ROWS, num_layers * ple_dim] the projection of their embeddings
+	pod::TensorView ple_;            // [num_layers, rows, ple_dim] both mixed (the rows of the current forward)
 	pod::TensorView final_norm_;
 	pod::LinearWeight lm_head_;
 	pod::TensorView logits_;

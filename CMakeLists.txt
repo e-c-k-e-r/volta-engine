@@ -405,7 +405,7 @@ if(SLANGC)
 	set(SLANG_INCLUDE_DIR ${SLANG_BIN_DIR}/../include)
 	set(SLANG_OUT ${PROJECT_BINARY_DIR}/slang)
 	file(MAKE_DIRECTORY ${SLANG_OUT})
-	set(SLANG_KERNELS rms_norm:rms_norm rms_norm:rms_norm_heads rms_norm:rms_norm_f32 rms_norm:add_normed elementwise:add_residual elementwise:swiglu
+	set(SLANG_KERNELS rms_norm:rms_norm rms_norm:rms_norm_heads rms_norm:rms_norm_f32 rms_norm:add_normed rms_norm:ple_mix elementwise:add_residual elementwise:swiglu
 		elementwise:scale_to_f32 elementwise:softcap
 		elementwise:swiglu_fused elementwise:embed_tokens rope:rope elementwise:moe_sum_planes elementwise:moe_accumulate
 		select:batched_argmax select:router_select gdn:l2_norm_heads gdn:gated_rmsnorm
@@ -728,6 +728,9 @@ set_target_properties(test_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_B
 add_executable(test_gguf_linear tests/2_parity/test_gguf_linear.cpp)
 target_link_libraries(test_gguf_linear PRIVATE engine_kernels)
 set_target_properties(test_gguf_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_gguf_rows tests/2_parity/test_gguf_rows.cpp)
+target_link_libraries(test_gguf_rows PRIVATE engine_kernels)
+set_target_properties(test_gguf_rows PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 add_executable(test_fp8_moe tests/2_parity/test_fp8_moe.cpp)
 target_link_libraries(test_fp8_moe PRIVATE engine_kernels)
 set_target_properties(test_fp8_moe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
