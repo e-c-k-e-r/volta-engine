@@ -120,7 +120,7 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
 	# NVFP4 W4A16 linear and the NVFP4 experts (src/kernels/slang/nvfp4.slang)
-	foreach(entry nvfp4_gemm nvfp4_gemv nvfp4_dequant nvfp4_moe_gate_up nvfp4_moe_down)
+	foreach(entry nvfp4_gemm nvfp4_gemv nvfp4_dequant nvfp4_moe_gate_up nvfp4_moe_down nvfp4_moe_gate_up_grp nvfp4_moe_down_grp)
 		set(sout ${SLANG_OUT}/${entry}.spv)
 		add_custom_command(OUTPUT ${sout}
 			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/nvfp4.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}

@@ -220,6 +220,180 @@ void nvfp4_moe_down(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, unifor
 	}
 }
 
+// ---- the experts of a prefill chunk, a group of up to NVR routes of one expert a workgroup (the chunk's local routes in expert order, `order`;
+// groups[3 g] the local expert of group g, groups[3 g + 1] its first entry of order, groups[3 g + 2] its routes): the routes' rows staged in
+// chunks of NVR_CK values (FP32 in shared memory), each lane's weights of a K group decoded once for every route of the group, the eight warps
+// over the K groups of a chunk and their sums added in order. The same FP16 weights and rounding points as the one-route kernels
+
+struct Nvfp4MoeGrpParams { uint8_t** tbl; float* gs; half* x; half* out_; int* order; int* groups; int topk; int num_local; int hidden; int inter; float act_limit; };
+
+static const int NVR = 8;
+static const int NVR_CK = 1024;
+groupshared float4 s_xr[NVR * NVR_CK / 4];   // the routes' chunk; at the end the warps' partials
+
+// The lane's 16 weights of K group g (16 FP32 values in four float4, K order)
+void nv_weights(uint8_t* codes, uint8_t* scales, int64_t at, half gm, out float4 wv[4]) {
+	let q = loadAligned<8>((uint2*)codes + at);
+	let s = half(e4m3_value(uint(scales[at]))) * gm;
+	let s2 = half2(s, s);
+	[ForceUnroll]
+	for (int h = 0; h < 2; ++h) {
+		let cw = h == 0 ? q.x : q.y;
+		[ForceUnroll]
+		for (int i = 0; i < 4; i += 2) {
+			let n0 = (cw >> uint(4 * i)) & 0x000F000Fu;
+			let n1 = (cw >> uint(4 * i + 4)) & 0x000F000Fu;
+			let w0 = float2(bit_cast<half2>(((n0 & 0x00070007u) << 9) | ((n0 & 0x00080008u) << 12)) * s2);
+			let w1 = float2(bit_cast<half2>(((n1 & 0x00070007u) << 9) | ((n1 & 0x00080008u) << 12)) * s2);
+			wv[h * 2 + (i >> 1)] = float4(w0.x, w0.y, w1.x, w1.y);
+		}
+	}
+}
+
+// The group's rows [k0, k0 + ck) into s_xr: route r of the group reads row row_of(order[first + r]) of x (gate_up: the token, down: the route)
+void nv_stage_routes(half* x, int K, int* order, int first, int cnt, int k0, int ck, int div, int t) {
+	for (int i = t; i < cnt * (ck / 4); i += 256) {
+		let r = i / (ck / 4);
+		let c4 = i % (ck / 4);
+		let row = order[first + r] / div;
+		let w = loadAligned<8>((uint2*)(x + int64_t(row) * K + k0) + c4);
+		let a = float2(bit_cast<half2>(w.x));
+		let b = float2(bit_cast<half2>(w.y));
+		s_xr[r * (NVR_CK / 4) + c4] = float4(a.x, a.y, b.x, b.y);
+	}
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void nvfp4_moe_gate_up_grp(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform Nvfp4MoeGrpParams p) {
+	let t = int(tid.x);
+	let lane = t & 31;
+	let warp = t >> 5;
+	let tile = int(gid.x);
+	let e = p.groups[3 * gid.y];
+	let first = p.groups[3 * gid.y + 1];
+	let cnt = p.groups[3 * gid.y + 2];
+	let K = p.hidden;
+	let G = K / 16;
+	let off = int64_t(tile) * G * 32 + lane;
+	let E = p.num_local;
+	let gm_g = half(p.gs[e] * 16384.0f);
+	let gm_u = half(p.gs[E + e] * 16384.0f);
+	float ag[NVR];
+	float au[NVR];
+	[ForceUnroll]
+	for (int r = 0; r < NVR; ++r) { ag[r] = 0.0f; au[r] = 0.0f; }
+	for (int k0 = 0; k0 < K; k0 += NVR_CK) {
+		let ck = min(NVR_CK, K - k0);
+		nv_stage_routes(p.x, K, p.order, first, cnt, k0, ck, p.topk, t);
+		GroupMemoryBarrierWithGroupSync();
+		for (int g = k0 / 16 + warp; g < (k0 + ck) / 16; g += NV_WARPS) {
+			float4 wg[4];
+			float4 wu[4];
+			nv_weights(p.tbl[0 * E + e], p.tbl[1 * E + e], off + int64_t(g) * 32, gm_g, wg);
+			nv_weights(p.tbl[2 * E + e], p.tbl[3 * E + e], off + int64_t(g) * 32, gm_u, wu);
+			let c4 = (g * 16 - k0) / 4;
+			[ForceUnroll]
+			for (int r = 0; r < NVR; ++r) {
+				if (r < cnt) {
+					float a = ag[r];
+					float b = au[r];
+					[ForceUnroll]
+					for (int u = 0; u < 4; ++u) {
+						let xv = s_xr[r * (NVR_CK / 4) + c4 + u];
+						a = fma(xv.x, wg[u].x, fma(xv.y, wg[u].y, fma(xv.z, wg[u].z, fma(xv.w, wg[u].w, a))));
+						b = fma(xv.x, wu[u].x, fma(xv.y, wu[u].y, fma(xv.z, wu[u].z, fma(xv.w, wu[u].w, b))));
+					}
+					ag[r] = a;
+					au[r] = b;
+				}
+			}
+		}
+		GroupMemoryBarrierWithGroupSync();   // the next chunk (or the partials) rewrite s_xr
+	}
+	// the warps' partials, (warp, lane) a float4 per pair of routes: [gate r, up r, gate r + 1, up r + 1]
+	[ForceUnroll]
+	for (int r = 0; r < NVR; r += 2) s_xr[(warp * 32 + lane) * (NVR / 2) + r / 2] = float4(ag[r], au[r], ag[r + 1], au[r + 1]);
+	GroupMemoryBarrierWithGroupSync();
+	if (t < 32 * cnt) {
+		let r = t >> 5;
+		let l = t & 31;
+		float g = 0.0f, u = 0.0f;
+		[ForceUnroll]
+		for (int w = 0; w < NV_WARPS; ++w) {
+			let v = s_xr[(w * 32 + l) * (NVR / 2) + r / 2];
+			g += (r & 1) != 0 ? v.z : v.x;
+			u += (r & 1) != 0 ? v.w : v.y;
+		}
+		let gh = r16(g);
+		float up = r16(u);
+		float act = gh / (1.0f + exp(-gh));
+		if (p.act_limit > 0.0f) {
+			up = min(max(up, -p.act_limit), p.act_limit);
+			act = min(act, p.act_limit);
+		}
+		p.out_[int64_t(p.order[first + r]) * p.inter + tile * 32 + nv_lane_col(l)] = half(act * up);
+	}
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void nvfp4_moe_down_grp(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform Nvfp4MoeGrpParams p) {
+	let t = int(tid.x);
+	let lane = t & 31;
+	let warp = t >> 5;
+	let tile = int(gid.x);
+	let e = p.groups[3 * gid.y];
+	let first = p.groups[3 * gid.y + 1];
+	let cnt = p.groups[3 * gid.y + 2];
+	let K = p.inter;
+	let G = K / 16;
+	let off = int64_t(tile) * G * 32 + lane;
+	let E = p.num_local;
+	let gm = half(p.gs[2 * E + e] * 16384.0f);
+	float ad[NVR];
+	[ForceUnroll]
+	for (int r = 0; r < NVR; ++r) ad[r] = 0.0f;
+	for (int k0 = 0; k0 < K; k0 += NVR_CK) {
+		let ck = min(NVR_CK, K - k0);
+		nv_stage_routes(p.x, K, p.order, first, cnt, k0, ck, 1, t);
+		GroupMemoryBarrierWithGroupSync();
+		for (int g = k0 / 16 + warp; g < (k0 + ck) / 16; g += NV_WARPS) {
+			float4 wd[4];
+			nv_weights(p.tbl[4 * E + e], p.tbl[5 * E + e], off + int64_t(g) * 32, gm, wd);
+			let c4 = (g * 16 - k0) / 4;
+			[ForceUnroll]
+			for (int r = 0; r < NVR; ++r) {
+				if (r < cnt) {
+					float a = ad[r];
+					[ForceUnroll]
+					for (int u = 0; u < 4; ++u) {
+						let xv = s_xr[r * (NVR_CK / 4) + c4 + u];
+						a = fma(xv.x, wd[u].x, fma(xv.y, wd[u].y, fma(xv.z, wd[u].z, fma(xv.w, wd[u].w, a))));
+					}
+					ad[r] = a;
+				}
+			}
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	[ForceUnroll]
+	for (int r = 0; r < NVR; r += 4) s_xr[(warp * 32 + lane) * (NVR / 4) + r / 4] = float4(ad[r], ad[r + 1], ad[r + 2], ad[r + 3]);
+	GroupMemoryBarrierWithGroupSync();
+	if (t < 32 * cnt) {
+		let r = t >> 5;
+		let l = t & 31;
+		float v = 0.0f;
+		[ForceUnroll]
+		for (int w = 0; w < NV_WARPS; ++w) {
+			let q = s_xr[(w * 32 + l) * (NVR / 4) + r / 4];
+			let c = r & 3;
+			v += c == 0 ? q.x : c == 1 ? q.y : c == 2 ? q.z : q.w;
+		}
+		p.out_[int64_t(p.order[first + r]) * p.hidden + tile * 32 + nv_lane_col(l)] = half(v);
+	}
+}
+
 // ---- the dense linear for a few rows (LinearNVFP4::forward up to 8 rows): a workgroup of 256 per 32-column tile, a lane per column, the eight
 // warps over the K groups of each chunk of 1024 values staged for every row (FP32 in shared memory); a lane decodes its 16 weights of a group once
 // (the experts' FP16 products) and multiplies them into every row, the warps' sums added in order

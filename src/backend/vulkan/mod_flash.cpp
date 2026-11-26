@@ -258,7 +258,7 @@ void MoE::forward( const pod::TensorView& x, const pod::MoELayerWeights& weights
 	const pod::LinearWeight& ref = weights.up[0];
 	// NVFP4 experts on the device: a workgroup per (tile, route), then the routes combined in order. Up to MAX_BATCH rows every route in place
 	// (a local one computes, another leaves at once), h and the routes' outputs in scratch sized for MAX_BATCH rows (a captured forward must never
-	// see it move); a prefill chunk (eager) reads its routes back and runs just the local ones, expert by expert
+	// see it move); a prefill chunk (eager) reads its routes back and runs just the local ones, in groups of up to 8 routes of one expert
 	if ( weights.type == pod::QuantType::NVFP4 && weights.device_ptrs != nullptr && weights.staged_ptrs == nullptr ) {
 		const int inter = ref.w0.shape[0];   // up's packed codes are [inter, hidden / 2] bytes
 		ENGINE_ASSERT( hidden % 64 == 0 && inter % 64 == 0 && hidden <= 8192 && inter <= 8192, "MoE::forward (Vulkan): NVFP4 experts need hidden and inter multiples of 64, at most 8192" );
@@ -267,8 +267,11 @@ void MoE::forward( const pod::TensorView& x, const pod::MoELayerWeights& weights
 		backend::half_t* h = static_cast<backend::half_t*>( vki::scratch( decode ? 31 : 35, routes_max * inter * sizeof( backend::half_t ), stream ) );
 		backend::half_t* route_out = static_cast<backend::half_t*>( vki::scratch( decode ? 32 : 36, routes_max * hidden * sizeof( backend::half_t ), stream ) );
 		uint32_t routes = static_cast<uint32_t>( rows * topk );
-		int* order = nullptr;
+		const char* tbl = static_cast<const char*>( weights.device_ptrs );
+		const uint64_t gs = vki::dp( tbl + 6 * E * sizeof( const void* ) );
 		if ( !decode ) {
+			// the local routes expert by expert, in groups of up to kGroupRoutes of one expert (each lane's weights decoded once per group)
+			constexpr int kGroupRoutes = 8;
 			std::vector<int> idx( static_cast<size_t>( rows ) * topk );
 			backend::memcpy_async( idx.data(), d_topk_indices, idx.size() * sizeof( int ), backend::Copy::D2H, stream );
 			backend::stream_sync( stream );
@@ -277,17 +280,33 @@ void MoE::forward( const pod::TensorView& x, const pod::MoELayerWeights& weights
 				const int e = idx[i] - start_expert;
 				if ( e >= 0 && e < E ) by[e].push_back( i );
 			}
-			std::vector<int> list;
+			std::vector<int> list, groups;
 			list.reserve( idx.size() );
-			for ( const auto& v : by ) list.insert( list.end(), v.begin(), v.end() );
-			routes = static_cast<uint32_t>( list.size() );
-			if ( routes > 0 ) {
-				order = static_cast<int*>( vki::scratch( 37, idx.size() * sizeof( int ), stream ) );
-				backend::memcpy_async( order, list.data(), list.size() * sizeof( int ), backend::Copy::H2D, stream );
+			for ( int e = 0; e < E; ++e ) {
+				for ( size_t j = 0; j < by[e].size(); j += kGroupRoutes ) {
+					groups.push_back( e );
+					groups.push_back( static_cast<int>( list.size() + j ) );
+					groups.push_back( static_cast<int>( std::min<size_t>( kGroupRoutes, by[e].size() - j ) ) );
+				}
+				list.insert( list.end(), by[e].begin(), by[e].end() );
 			}
+			if ( !list.empty() ) {
+				int* order = static_cast<int*>( vki::scratch( 37, idx.size() * sizeof( int ), stream ) );
+				int* grp = static_cast<int*>( vki::scratch( 38, idx.size() * 3 * sizeof( int ), stream ) );
+				backend::memcpy_async( order, list.data(), list.size() * sizeof( int ), backend::Copy::H2D, stream );
+				backend::memcpy_async( grp, groups.data(), groups.size() * sizeof( int ), backend::Copy::H2D, stream );
+				const uint32_t ng = static_cast<uint32_t>( groups.size() / 3 );
+				struct GrpParams { uint64_t tbl, gs, x, out_, order, groups; int topk, num_local, hidden, inter; float act_limit; };
+				const GrpParams pg{ vki::dp( tbl ), gs, vki::dp( x.data ), vki::dp( h ), vki::dp( order ), vki::dp( grp ), topk, E, hidden, inter, act_limit };
+				vki::launch( "nvfp4_moe_gate_up_grp", pg, stream, static_cast<uint32_t>( inter / 32 ), ng );
+				const GrpParams pd{ vki::dp( tbl ), gs, vki::dp( h ), vki::dp( route_out ), vki::dp( order ), vki::dp( grp ), topk, E, hidden, inter, act_limit };
+				vki::launch( "nvfp4_moe_down_grp", pd, stream, static_cast<uint32_t>( hidden / 32 ), ng );
+			}
+			vki::MoeCombineParams pc{ vki::dp( route_out ), vki::dp( d_topk_weights ), vki::dp( d_topk_indices ), vki::dp( out.data ), hidden, topk, start_expert, end_expert };
+			vki::launch( "moe_combine_routes", pc, stream, tiles( hidden, 256 ), rows );
+			return;
 		}
-		const char* tbl = static_cast<const char*>( weights.device_ptrs );
-		const uint64_t gs = vki::dp( tbl + 6 * E * sizeof( const void* ) );
+		int* order = nullptr;
 		if ( routes > 0 ) {
 			vki::Nvfp4MoeParams pg{ vki::dp( tbl ), gs, vki::dp( x.data ), vki::dp( d_topk_indices ), vki::dp( h ), vki::dp( order ), topk, E, start_expert, hidden, inter, act_limit };
 			vki::launch( "nvfp4_moe_gate_up", pg, stream, static_cast<uint32_t>( inter / 32 ), routes );
