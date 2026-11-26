@@ -67,6 +67,9 @@ public:
 	// The final hidden states of every position of `row` into out (device, [L, d] FP32). taps: if given, the input of
 	// every block (and finally the output, after the final norm) copied to the host, [layers + 1][L * d]
 	void hidden( const TtsRow& row, float* out, std::vector<std::vector<float>>* taps = nullptr );
+	// The same for n rows of one mode in one pass, one after another in out ([sum of lengths, d]; at most MAX_LEN positions in all):
+	// the linears see them as one block, attention stays within each row
+	void hidden( const TtsRow* const* rows, int n, float* out, std::vector<std::vector<float>>* taps = nullptr );
 	static constexpr int MAX_LEN = 2560;  // positions per row (30 s targets with 10 s prompts and long texts fit)
 
 	struct Sampling {
@@ -112,8 +115,9 @@ private:
 	struct Workspace {
 		float *x = nullptr, *a = nullptr, *S = nullptr;
 		half *xn = nullptr, *qkv = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr, *g = nullptr, *y = nullptr, *up = nullptr, *act = nullptr, *P = nullptr, *vals = nullptr;
-		int *ids = nullptr;
+		int *ids = nullptr, *pos = nullptr;  // pos: each position's place in its row
 		uint8_t *kind = nullptr, *masked = nullptr, *digits = nullptr;
+		float *rope_cs = nullptr, *rope_sn = nullptr;  // [MAX_LEN, rot / 2]
 	} ws_;
 	struct FlowWorkspace {
 		float *h = nullptr, *cond = nullptr, *c = nullptr, *mod = nullptr, *xf = nullptr, *m2 = nullptr, *m1 = nullptr, *v = nullptr, *x = nullptr, *temb = nullptr, *t0 = nullptr;

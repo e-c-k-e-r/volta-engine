@@ -34,34 +34,69 @@ __global__ void k_embed_mix( float* x, const float* a, const half* text_emb, con
 	}
 }
 
-// qkv [L, 3, H, hd] -> q, k, v [H, L, hd]: q and k RMS-normalised per head (weights qn / kn, eps) and rotated (RoPE on
-// the first `rot` dims, rotate-half, theta), v copied. One block of hd threads per (position, head).
-__global__ void k_qk_norm_rope( const half* qkv, const float* qn, const float* kn, half* q, half* k, half* v, int L, int H, int hd, int rot, float theta, float eps ) {
-	const int p = blockIdx.x / H, h = blockIdx.x % H, c = threadIdx.x;
+// The rotary angles' cos / sin of every position and pair, [n, rot / 2] each
+__global__ void k_rope_table( float* cs, float* sn, int n, int rot, float theta ) {
+	const int half_rot = rot / 2;
+	for ( int i = blockIdx.x * blockDim.x + threadIdx.x; i < n * half_rot; i += gridDim.x * blockDim.x ) {
+		engine::math::rope_cos_sin<false>( i / half_rot, i % half_rot, rot, theta, cs[i], sn[i] );
+	}
+}
+
+// qkv [L, 3, H, hd] -> q, k, v, each [H, L, hd] (head_major, for the batched GEMMs) or [L, H, hd] (the fused attention): q and k
+// RMS-normalised per head (weights qn / kn, eps) and rotated (RoPE on the first `rot` dims, rotate-half, the angles from k_rope_table at
+// each position's place in its row, pos), v copied. A warp per (position, head), hd a multiple of 32 up to 128; blocks of QK_WARPS warps
+// with 2 * hd floats of shared memory each.
+constexpr int QK_WARPS = 8;
+__global__ void k_qk_norm_rope( const half* qkv, const float* qn, const float* kn, half* q, half* k, half* v, const int* pos, int L, int H, int hd, int rot,
+	const float* rope_cs, const float* rope_sn, float eps, bool head_major ) {
+	extern __shared__ float sh[];  // [QK_WARPS][2 * hd]
+	const int lane = threadIdx.x % 32, w = threadIdx.x / 32, item = blockIdx.x * QK_WARPS + w;
+	if ( item >= L * H ) { return; }
+	const int p = item / H, h = item % H, n = hd / 32;
 	const size_t src = ( static_cast<size_t>( p ) * 3 * H + h ) * hd;
-	const size_t dst = ( static_cast<size_t>( h ) * L + p ) * hd;
-	extern __shared__ float sh[];  // [2 * hd]
+	const size_t dst = head_major ? ( static_cast<size_t>( h ) * L + p ) * hd : ( static_cast<size_t>( p ) * H + h ) * hd;
+	float* s = sh + w * 2 * hd;
 	for ( int which = 0; which < 2; ++which ) {
-		const float x = __half2float( qkv[src + static_cast<size_t>( which ) * H * hd + c] );
-		__syncthreads();  // block_sum reuses its shared array
-		float ss = engine::math::block_sum<32>( x * x );
-		const float* w = which == 0 ? qn : kn;
-		const float y = w ? x * rsqrtf( ss / hd + eps ) * w[c] : x;
-		sh[which * hd + c] = y;
-	}
-	__syncthreads();
-	for ( int which = 0; which < 2; ++which ) {
-		float o = sh[which * hd + c];
-		if ( c < rot ) {
-			const int half_rot = rot / 2, i = c % half_rot;
-			float s, co;
-			engine::math::rope_cos_sin<false>( p, i, rot, theta, co, s );
-			const float x1 = sh[which * hd + i], x2 = sh[which * hd + i + half_rot];
-			o = c < half_rot ? x1 * co - x2 * s : x2 * co + x1 * s;
+		float x[4], ss = 0.0f;
+		#pragma unroll
+		for ( int e = 0; e < 4; ++e ) {
+			if ( e < n ) {
+				x[e] = __half2float( qkv[src + static_cast<size_t>( which ) * H * hd + lane + 32 * e] );
+				ss += x[e] * x[e];
+			}
 		}
-		( which == 0 ? q : k )[dst + c] = __float2half( o );
+		ss = engine::math::warp_sum( ss );
+		const float* wt = which == 0 ? qn : kn;
+		const float r = rsqrtf( ss / hd + eps );
+		#pragma unroll
+		for ( int e = 0; e < 4; ++e ) {
+			const int c = lane + 32 * e;
+			if ( e < n ) { s[which * hd + c] = wt ? x[e] * r * wt[c] : x[e]; }
+		}
 	}
-	v[dst + c] = qkv[src + static_cast<size_t>( 2 ) * H * hd + c];
+	__syncwarp();
+	const int half_rot = rot / 2;
+	#pragma unroll
+	for ( int e = 0; e < 4; ++e ) {
+		const int c = lane + 32 * e;
+		if ( e >= n ) { continue; }
+		float sn = 0.0f, co = 1.0f;
+		if ( c < rot ) {
+			const size_t t = static_cast<size_t>( pos[p] ) * half_rot + c % half_rot;
+			co = rope_cs[t];
+			sn = rope_sn[t];
+		}
+		for ( int which = 0; which < 2; ++which ) {
+			float o = s[which * hd + c];
+			if ( c < rot ) {
+				const int i = c % half_rot;
+				const float x1 = s[which * hd + i], x2 = s[which * hd + i + half_rot];
+				o = c < half_rot ? x1 * co - x2 * sn : x2 * co + x1 * sn;
+			}
+			( which == 0 ? q : k )[dst + c] = __float2half( o );
+		}
+		v[dst + c] = qkv[src + static_cast<size_t>( 2 ) * H * hd + c];
+	}
 }
 
 // Row softmax of scale * S ([rows, n] FP32) into P (FP16)
@@ -79,12 +114,12 @@ __global__ void k_softmax( const float* S, half* P, int n, float scale ) {
 	for ( int j = threadIdx.x; j < n; j += blockDim.x ) { P[r * n + j] = __float2half( __expf( ( s[j] - m ) * scale ) * inv ); }
 }
 
-// o [H, L, hd] -> y [L, H * hd], times sigmoid(g [L, H * hd]) if g (the attention output gate)
-__global__ void k_heads_gate( const half* o, const half* g, half* y, int L, int H, int hd ) {
+// o [H, L, hd] (head_major) or [L, H * hd] -> y [L, H * hd], times sigmoid(g [L, H * hd]) if g (the attention output gate)
+__global__ void k_heads_gate( const half* o, const half* g, half* y, int L, int H, int hd, bool head_major ) {
 	const int p = blockIdx.x;
 	for ( int c = threadIdx.x; c < H * hd; c += blockDim.x ) {
 		const int h = c / hd, e = c % hd;
-		float v = __half2float( o[( static_cast<size_t>( h ) * L + p ) * hd + e] );
+		float v = __half2float( o[head_major ? ( static_cast<size_t>( h ) * L + p ) * hd + e : static_cast<size_t>( p ) * H * hd + c] );
 		if ( g ) { v *= engine::math::sigmoid( __half2float( g[static_cast<size_t>( p ) * H * hd + c] ) ); }
 		y[static_cast<size_t>( p ) * H * hd + c] = __float2half( v );
 	}

@@ -1,10 +1,12 @@
 // The TTS backbone (vall_e/model.py V3.hidden) for one unpadded row: embeddings, pre-norm blocks of bidirectional
-// gated attention (QK RMS norm, RoPE) and a SwiGLU MLP, then the final RMS norm. Attention is the plain version for now:
-// scores by batched GEMM, a row softmax, a second batched GEMM (rows are at most MAX_LEN long).
+// gated attention (QK RMS norm, RoPE) and a SwiGLU MLP, then the final RMS norm. Attention is the fused WMMA kernel on CUDA
+// (h3_attention: head_dim 64 or 128); on ROCm, whose WMMA accumulator layout that kernel doesn't follow, scores by batched GEMM,
+// a row softmax and a second batched GEMM (rows are at most MAX_LEN long).
 #include "engine/tts/tts_model.h"
 #include "engine/core/blas_check.h"
 #include "engine/core/log.h"
 #include "engine/kernels/dense.cuh"
+#include "engine/video/h3_attn.h"
 #include "tts_kernels.cuh"
 #include <cublas_v2.h>
 #include <algorithm>
@@ -21,6 +23,15 @@ static constexpr float EPS_QK = 0.0078125f;
 // MAX_LEN (one head needs 39 MiB there)
 static constexpr size_t ATTN_BYTES = 128ull << 20;
 
+static bool fused_attention( int head_dim ) {
+#if defined(USE_ROCM)
+	( void ) head_dim;
+	return false;
+#else
+	return head_dim == 64 || head_dim == 128;
+#endif
+}
+
 int TtsRow::length() const {
 	return static_cast<int>( text.size() ) + static_cast<int>( prompt.size() / 64 ) + ( len_query ? 1 : static_cast<int>( masked.size() ) );
 }
@@ -28,14 +39,17 @@ int TtsRow::length() const {
 void TtsModel::alloc_workspace() {
 	const size_t L = MAX_LEN, d = cfg_.d_model, F = cfg_.ffn(), V = cfg_.values();
 	static_assert( ATTN_BYTES >= static_cast<size_t>( MAX_LEN ) * MAX_LEN * ( 4 + 2 ), "one head's scores at MAX_LEN" );
-	const size_t bytes = L * d * 4 * 2 + ATTN_BYTES + L * d * 2 * 9 + L * 3 * d * 2 + L * 2 * F * 2 + L * F * 2 + L * V * 3 + L * 16 + ( 64 << 20 )
+	const bool scores = !fused_attention( cfg_.head_dim() );
+	const size_t bytes = L * d * 4 * 2 + ( scores ? ATTN_BYTES : 0 ) + L * d * 2 * 9 + L * 3 * d * 2 + L * 2 * F * 2 + L * F * 2 + L * V * 3 + L * 16 + ( 64 << 20 )
 		+ 3 * L * ( d * 6 + cfg_.flow_width * 4 * 12 + V * 16 ) + ( 16 << 20 );  // + the flow head's (tts_flow.cu)
 	ENGINE_ASSERT( engine::core::arena_create( ws_arena_, device_, bytes ), "tts: can't allocate the workspace" );
 	auto A = [&]( size_t n ) { return engine::core::arena_alloc( ws_arena_, n ); };
 	ws_.x = static_cast<float*>( A( L * d * 4 ) );
 	ws_.a = static_cast<float*>( A( L * d * 4 ) );
-	ws_.S = static_cast<float*>( A( ATTN_BYTES / 6 * 4 ) );
-	ws_.P = static_cast<half*>( A( ATTN_BYTES / 6 * 2 ) );
+	if ( scores ) {
+		ws_.S = static_cast<float*>( A( ATTN_BYTES / 6 * 4 ) );
+		ws_.P = static_cast<half*>( A( ATTN_BYTES / 6 * 2 ) );
+	}
 	ws_.xn = static_cast<half*>( A( L * d * 2 ) );
 	ws_.qkv = static_cast<half*>( A( L * 3 * d * 2 ) );
 	ws_.q = static_cast<half*>( A( L * d * 2 ) );
@@ -49,8 +63,13 @@ void TtsModel::alloc_workspace() {
 	ws_.vals = static_cast<half*>( A( L * V * 2 ) );
 	ws_.digits = static_cast<uint8_t*>( A( L * V ) );
 	ws_.ids = static_cast<int*>( A( L * 4 ) );
+	ws_.pos = static_cast<int*>( A( L * 4 ) );
 	ws_.kind = static_cast<uint8_t*>( A( L ) );
 	ws_.masked = static_cast<uint8_t*>( A( L ) );
+	const int rot = static_cast<int>( cfg_.head_dim() * cfg_.rot_frac ) / 2 * 2;
+	ws_.rope_cs = static_cast<float*>( A( L * rot / 2 * 4 ) );
+	ws_.rope_sn = static_cast<float*>( A( L * rot / 2 * 4 ) );
+	if ( rot ) { kern::k_rope_table<<<256, 256>>>( ws_.rope_cs, ws_.rope_sn, MAX_LEN, rot, cfg_.rope_theta ); }
 	alloc_flow_workspace();
 	cublasHandle_t h;
 	CUBLAS_CHECK( cublasCreate( &h ) );
@@ -81,26 +100,42 @@ void TtsModel::gemm( const half* A, const half* W, void* C, int M, int N, int K,
 }
 
 void TtsModel::hidden( const TtsRow& row, float* out, std::vector<std::vector<float>>* taps ) {
+	const TtsRow* r = &row;
+	hidden( &r, 1, out, taps );
+}
+
+void TtsModel::hidden( const TtsRow* const* rows, int n, float* out, std::vector<std::vector<float>>* taps ) {
 	const int d = cfg_.d_model, H = cfg_.heads, hd = cfg_.head_dim(), F = cfg_.ffn(), V = cfg_.values();
-	const int Lt = static_cast<int>( row.text.size() ), Lp = static_cast<int>( row.prompt.size() / V );
-	const int La = row.len_query ? 1 : static_cast<int>( row.masked.size() );
-	const int L = Lt + Lp + La;
-	ENGINE_ASSERT( L <= MAX_LEN, "tts: row longer than MAX_LEN" );
+	// the rows one after another: the linears and norms see them as one block of positions, attention stays within each row
+	std::vector<int> start( n + 1, 0 );
+	for ( int r = 0; r < n; ++r ) {
+		start[r + 1] = start[r] + rows[r]->length();
+		ENGINE_ASSERT( rows[r]->mode == rows[0]->mode, "tts: rows of one pass share their mode" );
+	}
+	const int L = start[n];
+	ENGINE_ASSERT( L <= MAX_LEN, "tts: rows longer than MAX_LEN" );
 	cublasHandle_t blas = static_cast<cublasHandle_t>( blas_ );
 
-	// host-side layout of the row
-	std::vector<int> ids( L, 0 );
+	// host-side layout of the rows
+	std::vector<int> ids( L, 0 ), pos( L );
 	std::vector<uint8_t> kind( L ), masked( L, 0 ), digits( static_cast<size_t>( L ) * V, 0 );
-	for ( int i = 0; i < Lt; ++i ) { ids[i] = row.text[i]; kind[i] = 1; }
-	for ( int i = 0; i < Lp; ++i ) { kind[Lt + i] = 2; }
-	std::copy( row.prompt.begin(), row.prompt.end(), digits.begin() + static_cast<size_t>( Lt ) * V );
-	if ( row.len_query ) {
-		kind[Lt + Lp] = 5;
-	} else {
-		for ( int i = 0; i < La; ++i ) { kind[Lt + Lp + i] = 3; masked[Lt + Lp + i] = row.masked[i]; }
-		std::copy( row.target.begin(), row.target.end(), digits.begin() + static_cast<size_t>( Lt + Lp ) * V );
+	for ( int r = 0; r < n; ++r ) {
+		const TtsRow& row = *rows[r];
+		const int s = start[r], Lt = static_cast<int>( row.text.size() ), Lp = static_cast<int>( row.prompt.size() / V );
+		const int La = row.len_query ? 1 : static_cast<int>( row.masked.size() );
+		for ( int i = 0; i < Lt + Lp + La; ++i ) { pos[s + i] = i; }
+		for ( int i = 0; i < Lt; ++i ) { ids[s + i] = row.text[i]; kind[s + i] = 1; }
+		for ( int i = 0; i < Lp; ++i ) { kind[s + Lt + i] = 2; }
+		std::copy( row.prompt.begin(), row.prompt.end(), digits.begin() + static_cast<size_t>( s + Lt ) * V );
+		if ( row.len_query ) {
+			kind[s + Lt + Lp] = 5;
+		} else {
+			for ( int i = 0; i < La; ++i ) { kind[s + Lt + Lp + i] = 3; masked[s + Lt + Lp + i] = row.masked[i]; }
+			std::copy( row.target.begin(), row.target.end(), digits.begin() + static_cast<size_t>( s + Lt + Lp ) * V );
+		}
 	}
 	CUDA_CHECK( cudaMemcpy( ws_.ids, ids.data(), L * 4, cudaMemcpyHostToDevice ) );
+	CUDA_CHECK( cudaMemcpy( ws_.pos, pos.data(), L * 4, cudaMemcpyHostToDevice ) );
 	CUDA_CHECK( cudaMemcpy( ws_.kind, kind.data(), L, cudaMemcpyHostToDevice ) );
 	CUDA_CHECK( cudaMemcpy( ws_.masked, masked.data(), L, cudaMemcpyHostToDevice ) );
 	CUDA_CHECK( cudaMemcpy( ws_.digits, digits.data(), digits.size(), cudaMemcpyHostToDevice ) );
@@ -110,7 +145,7 @@ void TtsModel::hidden( const TtsRow& row, float* out, std::vector<std::vector<fl
 	gemm( ws_.vals, w_.audio_in, ws_.a, L, d, V, true );
 	engine::dense::k_add_bias<<<256, 256>>>( ws_.a, w_.audio_in_b, L, d );
 	kern::k_embed_mix<<<L, 256>>>( ws_.x, ws_.a, w_.text, ws_.ids, ws_.kind, ws_.masked, w_.mask_emb, w_.len_q, w_.segment,
-		w_.mode + static_cast<size_t>( row.mode ) * d, d );
+		w_.mode + static_cast<size_t>( rows[0]->mode ) * d, d );
 
 	auto tap = [&]( const float* src ) {
 		if ( !taps ) { return; }
@@ -120,38 +155,48 @@ void TtsModel::hidden( const TtsRow& row, float* out, std::vector<std::vector<fl
 	const int rot = static_cast<int>( hd * cfg_.rot_frac ) / 2 * 2;
 	const float scale = 1.0f / std::sqrt( static_cast<float>( hd ) );
 	const float one = 1.0f, zero = 0.0f;
-	const int hg = std::min( H, static_cast<int>( ATTN_BYTES / 6 / ( static_cast<size_t>( L ) * L ) ) );   // heads per batch of scores
+	const bool fused = fused_attention( hd );
+	const float* branch = nullptr;   // the MLP's output, added into the residual stream by the next norm (k_norm_mod adds it first)
 	for ( const TtsBlock& b : w_.blocks ) {
-		tap( ws_.x );
 		// attention
-		engine::dense::k_norm_mod<half><<<L, 256>>>( ws_.x, nullptr, nullptr, 0, b.n1, nullptr, nullptr, 0, nullptr, d, EPS_FP32, ws_.xn );
+		engine::dense::k_norm_mod<half><<<L, 256>>>( ws_.x, branch, nullptr, 0, b.n1, nullptr, nullptr, 0, nullptr, d, EPS_FP32, ws_.xn );
+		tap( ws_.x );
 		gemm( ws_.xn, b.qkv, ws_.qkv, L, 3 * d, d, false );
-		kern::k_qk_norm_rope<<<L * H, hd, 2 * hd * sizeof( float )>>>( ws_.qkv, b.q_norm, b.k_norm, ws_.q, ws_.k, ws_.v, L, H, hd, rot, cfg_.rope_theta, EPS_QK );
-		for ( int h0 = 0; h0 < H; h0 += hg ) {
-			const int nh = std::min( hg, H - h0 );
-			const size_t at = static_cast<size_t>( h0 ) * L * hd;
-			// S[h] = Q[h] K[h]^T, row-major [L(q), L(k)]
-			CUBLAS_CHECK( cublasGemmStridedBatchedEx( blas, CUBLAS_OP_T, CUBLAS_OP_N, L, L, hd, &one, ws_.k + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd,
-				ws_.q + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd, &zero, ws_.S, CUDA_R_32F, L, static_cast<long long>( L ) * L, nh, CUBLAS_COMPUTE_32F,
-				CUBLAS_GEMM_DEFAULT ) );
-			kern::k_softmax<<<nh * L, 256>>>( ws_.S, ws_.P, L, scale );
-			// O[h] = P[h] V[h], row-major [L, hd]
-			CUBLAS_CHECK( cublasGemmStridedBatchedEx( blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, L, L, &one, ws_.v + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd,
-				ws_.P, CUDA_R_16F, L, static_cast<long long>( L ) * L, &zero, ws_.o + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd, nh, CUBLAS_COMPUTE_32F,
-				CUBLAS_GEMM_DEFAULT ) );
+		kern::k_qk_norm_rope<<<( L * H + kern::QK_WARPS - 1 ) / kern::QK_WARPS, 32 * kern::QK_WARPS, kern::QK_WARPS * 2 * hd * sizeof( float )>>>( ws_.qkv,
+			b.q_norm, b.k_norm, ws_.q, ws_.k, ws_.v, ws_.pos, L, H, hd, rot, ws_.rope_cs, ws_.rope_sn, EPS_QK, !fused );
+		for ( int r = 0; r < n; ++r ) {
+			const int s = start[r], Lr = start[r + 1] - start[r];
+			if ( fused ) {
+				const size_t at = static_cast<size_t>( s ) * d;   // [L, H, hd]
+				ENGINE_ASSERT( engine::video::h3_attention( ws_.q + at, ws_.k + at, ws_.v + at, ws_.o + at, Lr, Lr, H, scale, false, nullptr, hd ), "tts: fused attention" );
+				continue;
+			}
+			const int hg = std::min( H, static_cast<int>( ATTN_BYTES / 6 / ( static_cast<size_t>( Lr ) * Lr ) ) );   // heads per batch of scores
+			for ( int h0 = 0; h0 < H; h0 += hg ) {
+				const int nh = std::min( hg, H - h0 );
+				const size_t at = ( static_cast<size_t>( h0 ) * L + s ) * hd;   // [H, L, hd]: this row's positions of head h0, heads L * hd apart
+				// S[h] = Q[h] K[h]^T, row-major [Lr(q), Lr(k)]
+				CUBLAS_CHECK( cublasGemmStridedBatchedEx( blas, CUBLAS_OP_T, CUBLAS_OP_N, Lr, Lr, hd, &one, ws_.k + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd,
+					ws_.q + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd, &zero, ws_.S, CUDA_R_32F, Lr, static_cast<long long>( Lr ) * Lr, nh, CUBLAS_COMPUTE_32F,
+					CUBLAS_GEMM_DEFAULT ) );
+				kern::k_softmax<<<nh * Lr, 256>>>( ws_.S, ws_.P, Lr, scale );
+				// O[h] = P[h] V[h], row-major [Lr, hd]
+				CUBLAS_CHECK( cublasGemmStridedBatchedEx( blas, CUBLAS_OP_N, CUBLAS_OP_N, hd, Lr, Lr, &one, ws_.v + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd,
+					ws_.P, CUDA_R_16F, Lr, static_cast<long long>( Lr ) * Lr, &zero, ws_.o + at, CUDA_R_16F, hd, static_cast<long long>( L ) * hd, nh, CUBLAS_COMPUTE_32F,
+					CUBLAS_GEMM_DEFAULT ) );
+			}
 		}
 		if ( b.gate ) { gemm( ws_.xn, b.gate, ws_.g, L, d, d, false ); }
-		kern::k_heads_gate<<<L, 256>>>( ws_.o, b.gate ? ws_.g : nullptr, ws_.y, L, H, hd );
+		kern::k_heads_gate<<<L, 256>>>( ws_.o, b.gate ? ws_.g : nullptr, ws_.y, L, H, hd, !fused );
 		gemm( ws_.y, b.out, ws_.a, L, d, d, true );
-		engine::dense::k_add_gated<<<L, 256>>>( ws_.x, ws_.a, nullptr, nullptr, 0, nullptr, d );
-		// MLP
-		engine::dense::k_norm_mod<half><<<L, 256>>>( ws_.x, nullptr, nullptr, 0, b.n2, nullptr, nullptr, 0, nullptr, d, EPS_FP32, ws_.xn );
+		// MLP (the attention's output added first)
+		engine::dense::k_norm_mod<half><<<L, 256>>>( ws_.x, ws_.a, nullptr, 0, b.n2, nullptr, nullptr, 0, nullptr, d, EPS_FP32, ws_.xn );
 		gemm( ws_.xn, b.up, ws_.up, L, 2 * F, d, false );
 		kern::k_swiglu<<<L, 256>>>( ws_.up, ws_.act, F );
 		gemm( ws_.act, b.down, ws_.a, L, d, F, true );
-		engine::dense::k_add_gated<<<L, 256>>>( ws_.x, ws_.a, nullptr, nullptr, 0, nullptr, d );
+		branch = ws_.a;
 	}
-	engine::dense::k_norm_mod<float><<<L, 256>>>( ws_.x, nullptr, nullptr, 0, w_.norm, nullptr, nullptr, 0, nullptr, d, EPS_FP32, out );
+	engine::dense::k_norm_mod<float><<<L, 256>>>( ws_.x, branch, nullptr, 0, w_.norm, nullptr, nullptr, 0, nullptr, d, EPS_FP32, out );
 	CUDA_CHECK( cudaGetLastError() );
 	tap( out );
 }

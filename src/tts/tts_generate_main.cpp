@@ -254,7 +254,7 @@ static int check_backbone( engine::tts::TtsModel& m, const char* path ) {
 		}
 		std::printf( "\n" );
 	}
-	std::printf( "worst cosine %.5f -> %s\n", worst, worst > 0.999 ? "PASS" : "FAIL" );
+	std::printf( "worst cosine %.5f (1 - cos %.3e) -> %s\n", worst, 1.0 - worst, worst > 0.999 ? "PASS" : "FAIL" );
 	cudaFree( out );
 	engine::loader::safetensors_close( g );
 	return worst > 0.999 ? 0 : 1;

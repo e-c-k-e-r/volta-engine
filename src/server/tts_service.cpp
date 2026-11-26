@@ -20,8 +20,8 @@ struct TtsService::Impl {
 	TtsConfig cfg;
 	engine::tts::Tts tts;
 	std::mutex voice_mu;
-	struct Voice { std::vector<float> audio; int rate = 0; bool loaded = false; };
-	std::map<std::string, Voice> voices;  // name -> its audio, read on first use
+	struct Voice { std::vector<uint8_t> codes; bool loaded = false; };
+	std::map<std::string, Voice> voices;  // name -> its prompt, read and encoded on first use
 
 	void scan_voices() {
 		if ( cfg.voices_dir.empty() ) { return; }
@@ -39,7 +39,11 @@ struct TtsService::Impl {
 		auto it = voices.find( name );
 		if ( it == voices.end() ) { error = "no voice \"" + name + "\" (GET /v1/audio/voices lists them)"; return nullptr; }
 		if ( !it->second.loaded ) {
-			if ( !engine::tts::read_wav( cfg.voices_dir + "/" + name + ".wav", it->second.audio, it->second.rate, &error ) ) { return nullptr; }
+			std::vector<float> audio;
+			int rate = 0;
+			if ( !engine::tts::read_wav( cfg.voices_dir + "/" + name + ".wav", audio, rate, &error ) ) { return nullptr; }
+			cudaSetDevice( cfg.device );
+			if ( !tts.encode_prompt( audio, rate, it->second.codes, &error ) ) { return nullptr; }
 			it->second.loaded = true;
 		}
 		return &it->second;
@@ -102,7 +106,11 @@ struct TtsService::Impl {
 			const size_t comma = b64.find( "base64," );
 			if ( comma != std::string::npos ) { b64 = b64.substr( comma + 7 ); }
 			if ( !engine::loader::base64_decode( b64, &wav ) || wav.empty() ) { return send_error( c, 400, "invalid_request_error", "voice_audio holds invalid base64" ); }
-			if ( !engine::tts::parse_wav( wav, uploaded.audio, uploaded.rate, &error ) ) { return send_error( c, 400, "invalid_request_error", "voice_audio: " + error ); }
+			std::vector<float> pcm;
+			int rate = 0;
+			if ( !engine::tts::parse_wav( wav, pcm, rate, &error ) ) { return send_error( c, 400, "invalid_request_error", "voice_audio: " + error ); }
+			cudaSetDevice( cfg.device );
+			if ( !tts.encode_prompt( pcm, rate, uploaded.codes, &error ) ) { return send_error( c, 400, "invalid_request_error", "voice_audio: " + error ); }
 			v = &uploaded;
 		} else if ( named ) {
 			v = voice( j["voice"].get<std::string>(), error );
@@ -112,8 +120,8 @@ struct TtsService::Impl {
 		cudaSetDevice( cfg.device );
 		const auto t0 = std::chrono::steady_clock::now();
 		std::vector<float> audio;
-		static const std::vector<float> none;
-		if ( !tts.synthesize( j["input"].get<std::string>(), v ? v->audio : none, v ? v->rate : 0, o, audio, &error ) ) {
+		static const std::vector<uint8_t> none;
+		if ( !tts.synthesize( j["input"].get<std::string>(), v ? v->codes : none, o, audio, &error ) ) {
 			return send_error( c, 400, "invalid_request_error", error );
 		}
 		const double dt = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();

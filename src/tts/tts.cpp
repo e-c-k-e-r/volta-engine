@@ -92,9 +92,37 @@ std::vector<std::vector<int>> Tts::split( const std::string& text, const std::st
 	return out;
 }
 
+bool Tts::encode_prompt( const std::vector<float>& audio, int rate, std::vector<uint8_t>& codes, std::string* error ) {
+	std::lock_guard<std::mutex> lock( mu_ );
+	return encode( audio, rate, codes, error );
+}
+
 bool Tts::synthesize( const std::string& text, const std::vector<float>& prompt_audio, int prompt_rate, const SynthOptions& o, std::vector<float>& out,
 	std::string* error ) {
 	std::lock_guard<std::mutex> lock( mu_ );
+	std::vector<uint8_t> prompt;
+	return encode( prompt_audio, prompt_rate, prompt, error ) && generate( text, prompt, o, out, error );
+}
+
+bool Tts::synthesize( const std::string& text, const std::vector<uint8_t>& prompt, const SynthOptions& o, std::vector<float>& out, std::string* error ) {
+	std::lock_guard<std::mutex> lock( mu_ );
+	return generate( text, prompt, o, out, error );
+}
+
+bool Tts::encode( const std::vector<float>& audio, int rate, std::vector<uint8_t>& prompt, std::string* error ) {
+	// 44.1 kHz, its first 10 s, encoded, in patches (the last frame repeated to a whole patch, as to_patches); no audio: no prompt
+	prompt.clear();
+	if ( audio.empty() ) { return true; }
+	std::vector<float> a = rate == sample_rate() ? audio : resample( audio, rate, sample_rate() );
+	a.resize( std::min( a.size(), static_cast<size_t>( PROMPT_S * sample_rate() ) ) );
+	if ( a.size() < static_cast<size_t>( 4 * codec_.config().samples_per_frame ) ) { set_error( error, "the voice prompt is too short" ); return false; }
+	prompt = codec_.encode( a );
+	if ( prompt.empty() ) { set_error( error, "not enough GPU memory to encode the voice prompt" ); return false; }
+	while ( prompt.size() / 32 % model_.config().patch ) { prompt.insert( prompt.end(), prompt.end() - 32, prompt.end() ); }
+	return true;
+}
+
+bool Tts::generate( const std::string& text, const std::vector<uint8_t>& prompt, const SynthOptions& o, std::vector<float>& out, std::string* error ) {
 	const auto& c = model_.config();
 	TtsModel::Sampling s = model_.default_sampling();
 	if ( o.cfg >= 0.0f ) { s.cfg = o.cfg; }
@@ -102,16 +130,6 @@ bool Tts::synthesize( const std::string& text, const std::vector<float>& prompt_
 	s.steps = o.steps;
 	s.flow_steps = o.flow_steps;
 	s.sway = o.sway;
-	// the prompt: 44.1 kHz, its first 10 s, encoded, in patches (the last frame repeated to a whole patch, as to_patches)
-	std::vector<uint8_t> prompt;
-	if ( !prompt_audio.empty() ) {
-		std::vector<float> a = prompt_rate == sample_rate() ? prompt_audio : resample( prompt_audio, prompt_rate, sample_rate() );
-		a.resize( std::min( a.size(), static_cast<size_t>( PROMPT_S * sample_rate() ) ) );
-		if ( a.size() < static_cast<size_t>( 4 * codec_.config().samples_per_frame ) ) { set_error( error, "the voice prompt is too short" ); return false; }
-		prompt = codec_.encode( a );
-		if ( prompt.empty() ) { set_error( error, "not enough GPU memory to encode the voice prompt" ); return false; }
-		while ( prompt.size() / 32 % c.patch ) { prompt.insert( prompt.end(), prompt.end() - 32, prompt.end() ); }
-	}
 	const auto parts = split( text, o.language );
 	size_t total = 0;
 	for ( const auto& p : parts ) { total += p.size(); }

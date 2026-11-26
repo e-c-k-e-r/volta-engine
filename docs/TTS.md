@@ -25,14 +25,18 @@ tts_generate --model model.sft --codec codec.sft --text "Hello there." --prompt 
 ```
 
 The server (CONFIG.md, the `tts` section) also has a page at `/tts` (at `/` when it serves speech alone): text, a named or uploaded voice,
-the sampling settings, and the session's results with players and downloads.
+the sampling settings, and the session's results with players and downloads. A named voice's prompt is encoded once, at its first use.
+
+Each demasking step runs the backbone over its guidance rows (cond, null, promptless) in one pass of up to 2560 positions: the linears see
+them as one block, attention stays within each row (on CUDA the fused WMMA attention kernel of the video service, `h3_attention`; on ROCm,
+where that kernel isn't correct, batched GEMMs around a softmax).
 
 The export's guidance is the default (v2.0 3.0 / 2.0, the distilled v2.0-fast 0 / 0, older exports 6.0 / 2.0); `--cfg` / `--cfg-prompt` override it.
 
 ## Memory
 
-v2.0 takes 3.0 GiB of its GPU at load: the weights (1.4 GiB), the model's workspaces for rows of up to 2560 positions (the attention scores
-in batches of heads within 128 MiB), and the codec with its activations for 10 s of audio. A longer sentence grows the codec's activations
+v2.0 takes 2.9 GiB of its GPU at load: the weights (1.4 GiB), the model's workspaces for 2560 positions (on ROCm also the attention
+scores, in batches of heads within 128 MiB), and the codec with its activations for 10 s of audio. A longer sentence grows the codec's activations
 by 42 MB a second; when the GPU has no room for them the request fails with an error.
 
 Beside a language model the server loads the TTS first, so the model's arena is sized from what is left on that GPU (GLM slices its
@@ -56,6 +60,7 @@ language model also uses, they queue with its work instead of overlapping it.
 - Japanese must be given as kana: vall_e reads kanji through pykakasi's dictionary, which isn't ported (kanji are refused with a message).
 - No language detection (vall_e's `auto`): requests name the language.
 - Voices are single WAV files; vall_e's multi-clip folder prompts (speaker-embedding and MOS selection) aren't ported.
-- Speed (a 7 s line with a voice prompt): RX 7900 XTX v2.0 about 4.3x real time, v2.0-fast 8x, the 225M 9.5x; V100 v2.0 3.5x, v2.0-fast
-  6.2x, the 225M 7.0x. The backbone is compute-bound (a pass over ~670 positions is ~1 TFLOP); its attention is still plain batched GEMMs
-  with a separate softmax (5% of the time).
+- Speed (a 7 s line with a voice prompt, one run of tts_generate): V100 v2.0 4.7x real time, v2.0-fast 6.9x, the 225M 8.8x; RX 7900 XTX
+  (measured before the guidance rows shared a pass) v2.0 about 4.3x, v2.0-fast 8x, the 225M 9.5x. The backbone is compute-bound (a pass
+  over ~670 positions is ~1 TFLOP); on a V100 a v2.0 generation's GPU time is ~57% the backbone's GEMMs, ~21% the FP32 codec, ~11%
+  attention.

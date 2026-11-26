@@ -143,18 +143,28 @@ void TtsModel::demask_step( const std::vector<int>& text, const std::vector<uint
 	if ( k == 0 ) { return; }
 	const bool guided = s.cfg > 1.0f;
 	const int R = guided ? ( s.cfg_prompt > 0.0f && !prompt.empty() ? 3 : 2 ) : 1;
-	// the backbone over each guidance row, its hidden states at the revealed positions gathered into fw_.hh [R * k, d]
+	// the backbone over the guidance rows (as many in one pass as MAX_LEN holds), their hidden states at the revealed positions gathered
+	// into fw_.hh [R * k, d]
 	int* pos = fw_.pos;
 	CUDA_CHECK( cudaMemcpy( pos, reveal.data(), k * sizeof( int ), cudaMemcpyHostToDevice ) );
+	TtsRow rows[3];
 	for ( int r = 0; r < R; ++r ) {
-		TtsRow row;
-		if ( r != 1 ) { row.text = text; }
-		if ( r == 0 ) { row.prompt = prompt; }
-		row.target = digits;
-		row.masked = masked;
-		hidden( row, fw_.h, nullptr );
-		const int offset = static_cast<int>( row.text.size() + row.prompt.size() / V );
-		kern::k_gather_half<<<k, 256>>>( fw_.h, pos, offset, fw_.hh + static_cast<size_t>( r ) * k * d, d );
+		if ( r != 1 ) { rows[r].text = text; }
+		if ( r == 0 ) { rows[r].prompt = prompt; }
+		rows[r].target = digits;
+		rows[r].masked = masked;
+	}
+	for ( int r0 = 0; r0 < R; ) {
+		int r1 = r0 + 1, len = rows[r0].length();
+		while ( r1 < R && len + rows[r1].length() <= MAX_LEN ) { len += rows[r1++].length(); }
+		const TtsRow* pass[3];
+		for ( int r = r0; r < r1; ++r ) { pass[r - r0] = &rows[r]; }
+		hidden( pass, r1 - r0, fw_.h, nullptr );
+		for ( int r = r0, at = 0; r < r1; at += rows[r++].length() ) {
+			const int offset = at + static_cast<int>( rows[r].text.size() + rows[r].prompt.size() / V );
+			kern::k_gather_half<<<k, 256>>>( fw_.h, pos, offset, fw_.hh + static_cast<size_t>( r ) * k * d, d );
+		}
+		r0 = r1;
 	}
 	const int N = R * k;
 	// cond(h): the same for every flow step

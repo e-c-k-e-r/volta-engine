@@ -35,10 +35,17 @@ public:
 	// speech at sample_rate(), or false with *error set. One synthesis at a time (the model's workspaces are shared)
 	bool synthesize( const std::string& text, const std::vector<float>& prompt, int prompt_rate, const SynthOptions& o, std::vector<float>& out,
 		std::string* error = nullptr );
+	// A voice prompt encoded once (its first 10 s at 44.1 kHz, as the codec's digits in whole patches; empty audio: no prompt), and the
+	// synthesis from such codes, for a voice used again and again
+	bool encode_prompt( const std::vector<float>& audio, int rate, std::vector<uint8_t>& codes, std::string* error = nullptr );
+	bool synthesize( const std::string& text, const std::vector<uint8_t>& prompt_codes, const SynthOptions& o, std::vector<float>& out,
+		std::string* error = nullptr );
 	int sample_rate() const { return codec_.config().sample_rate; }
 	const TtsModel& model() const { return model_; }
 
 private:
+	bool encode( const std::vector<float>& audio, int rate, std::vector<uint8_t>& codes, std::string* error );
+	bool generate( const std::string& text, const std::vector<uint8_t>& prompt, const SynthOptions& o, std::vector<float>& out, std::string* error );
 	std::vector<std::vector<int>> split( const std::string& text, const std::string& language );
 
 	TtsModel model_;
