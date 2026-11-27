@@ -65,7 +65,7 @@ pool, and the threads of the two share the device).
 - Voices are single WAV files; vall_e's multi-clip folder prompts (speaker-embedding and MOS selection) aren't ported.
 - Speed (a 7 s line with a voice prompt, one run of tts_generate): V100 v2.0 4.7x real time, v2.0-fast 6.9x, the 225M 8.8x; RX 7900 XTX
   4.3x / 5.9x / 5.7x (the same cold run: first-call kernel loads and the prompt's encoding weigh more there), and served warm with a named
-  voice v2.0 5.4x, v2.0-fast 7.9x, the 225M 10x; V100 under Vulkan, served without a voice: v2.0 1.3x (no tensor cores through Vulkan on
+  voice v2.0 5.4x, v2.0-fast 7.9x, the 225M 10x; V100 under Vulkan, served without a voice: v2.0 1.8x (no tensor cores through Vulkan on
   Volta: the GEMMs run on the FP32 units). The backbone is compute-bound (a pass
   over ~670 positions is ~1 TFLOP); on a V100 a v2.0 generation's GPU time is ~57% the backbone's GEMMs, ~21% the FP32 codec, ~11%
   attention.
