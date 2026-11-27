@@ -355,6 +355,12 @@ bool Glm5NextPipeline::init(
 	// KDA linear attention buffers
 	int qkv_shape[2] = { R, config_.kda_channels };
 	qkv_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
+	conv_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );   // prefill conv output
+	{
+		const size_t chunk_bytes = engine::modules::GDN::recurrent_step_kda_chunked_scratch_bytes( R, lh_ );
+		if ( chunk_bytes > 0 ) kda_chunk_scratch_ = engine::core::arena_alloc( arena, chunk_bytes );
+		ENGINE_ASSERT( conv_out_.data != nullptr && ( chunk_bytes == 0 || kda_chunk_scratch_ != nullptr ), "Glm5NextPipeline::init: arena exhausted allocating the KDA prefill buffers" );
+	}
 
 	int fa_shape[2] = { R, 128 };
 	f_a_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, fa_shape, 2 );
@@ -1703,6 +1709,7 @@ void Glm5NextPipeline::set_rows( int m ) {
 	v_head_buf_.shape[0] = m;
 	mla_heads_out_.shape[0] = m;
 	qkv_buf_.shape[0] = m;
+	conv_out_.shape[0] = m;
 	f_a_buf_.shape[0] = m;
 	g_a_buf_.shape[0] = m;
 	beta_buf_.shape[0] = m;
@@ -2096,28 +2103,44 @@ void Glm5NextPipeline::layer_body( int layer, Glm5NextLayerWeights& lw, int m, b
 				norm_hidden_, lw.qkv, qkv_buf_, stream
 			);
 
-			engine::modules::GDN::causal_conv1d_silu_rows(
-				qkv_buf_, layer_conv, lw.conv1d_weights, config_.kda_channels, m, d_rows_, slot_conv_floats,
-				conv_snap, slot_conv_floats, snap_rows, state_.d_snap_on, stream
-			);
+			// Prefill chunks (one slot, no snapshots) run the conv in parallel row tiles into conv_out_, which the rest of the layer then reads, and
+			// the chunked form of the recurrence
+			const bool prefill = m > pod::MAX_BATCH;
+			pod::TensorView kqkv = prefill ? conv_out_ : qkv_buf_;
+			if ( prefill ) {
+				engine::modules::GDN::causal_conv1d_silu_tiled(
+					qkv_buf_, kqkv, layer_conv, lw.conv1d_weights, config_.kda_channels, m, d_rows_, slot_conv_floats, stream );
+			}
+			else {
+				engine::modules::GDN::causal_conv1d_silu_rows(
+					qkv_buf_, layer_conv, lw.conv1d_weights, config_.kda_channels, m, d_rows_, slot_conv_floats,
+					conv_snap, slot_conv_floats, snap_rows, state_.d_snap_on, stream
+				);
+			}
 
 			engine::modules::GDN::l2_norm_heads(
-				qkv_buf_, lh_, 128, stream, true, m, config_.kda_channels
+				kqkv, lh_, 128, stream, true, m, config_.kda_channels
 			);
 
 			if ( kda_overlap ) backend::stream_join( stream, side_stream_ );
 
-			if ( use_journal_ ) {
+			if ( prefill && runtime::options().gdn_chunked ) {
+				engine::modules::GDN::recurrent_step_kda_chunked(
+					layer_kda, kqkv, g_decay_buf_, beta_buf_, z_buf_, lw.o_norm, attn_head_out_,
+					lh_, 128, 1e-5f, m, d_rows_, slot_kda_floats, kda_chunk_scratch_, stream
+				);
+			}
+			else if ( use_journal_ ) {
 				ENGINE_ASSERT( lh_ == config_.kda_heads, "Glm5NextPipeline: the KDA journal is sized for the configured head count" );
 				engine::modules::GDN::recurrent_step_kda_rows_journal(
-					layer_kda, qkv_buf_, g_decay_buf_, beta_buf_, z_buf_, lw.o_norm, attn_head_out_,
+					layer_kda, kqkv, g_decay_buf_, beta_buf_, z_buf_, lw.o_norm, attn_head_out_,
 					lh_, 128, 1e-5f, m, d_rows_, slot_kda_floats, state_.kda_journal + lin * state_.journal_layer_stride, state_.journal_row_stride, snap_rows,
 					state_.d_snap_on, stream
 				);
 			}
 			else {
 				engine::modules::GDN::recurrent_step_kda_rows(
-					layer_kda, qkv_buf_, g_decay_buf_, beta_buf_, z_buf_, lw.o_norm, attn_head_out_,
+					layer_kda, kqkv, g_decay_buf_, beta_buf_, z_buf_, lw.o_norm, attn_head_out_,
 					lh_, 128, 1e-5f, m, d_rows_, slot_kda_floats, kda_snap, slot_kda_floats, snap_rows, state_.d_snap_on, stream
 				);
 			}

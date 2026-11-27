@@ -414,6 +414,8 @@ private:
 	pod::TensorView g_decay_buf_;   // [1, 2048] FP32
 	pod::TensorView z_buf_;         // [1, 2048] FP16
 	pod::TensorView attn_head_out_; // [1, 2048] FP16
+	pod::TensorView conv_out_;      // [MAX_ROWS, kda_channels] FP16: the conv output of prefill chunks
+	void* kda_chunk_scratch_ = nullptr;   // GDN::recurrent_step_kda_chunked scratch for prefill chunks
 
 	// Dense / shared-expert FFN buffers
 	pod::TensorView moe_gate_buf_;

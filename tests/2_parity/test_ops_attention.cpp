@@ -626,6 +626,59 @@ void test_gdn_chunked() {
 	run( 0.01f, "gdn_chunked_slow" );
 }
 
+// ---- KDA prefill form: the chunked delta rule (decay per key channel) against the rows kernel, 4 full chunks and a partial one, slot 1 of 2
+void test_kda_chunked() {
+	std::printf( "KDA chunked prefill\n" );
+	GoldenRng rng( 5007 );
+	const int nh = 4, hd = 128, rows = 300, slots = 2, ch = nh * hd;
+	const size_t state_stride = static_cast<size_t>( nh ) * hd * hd, out_n = static_cast<size_t>( rows ) * ch;
+	auto run = [&]( bool slow, const std::string& name ) {
+		// q and k unit-length per head (q also times 1 / sqrt( 128 )), as l2_norm_heads leaves them
+		std::vector<half_t> qkv( static_cast<size_t>( rows ) * 3 * ch );
+		for ( int r = 0; r < rows; ++r ) {
+			for ( int hh = 0; hh < 3 * nh; ++hh ) {
+				float x[128], ss = 0.0f;
+				for ( int i = 0; i < hd; ++i ) {
+					x[i] = rng.uniform( 1.0f );
+					ss += x[i] * x[i];
+				}
+				const float sc = hh < nh ? 1.0f / std::sqrt( ss * hd ) : hh < 2 * nh ? 1.0f / std::sqrt( ss ) : 0.5f;
+				for ( int i = 0; i < hd; ++i ) qkv[static_cast<size_t>( r ) * 3 * ch + hh * hd + i] = backend::from_float_half( x[i] * sc );
+			}
+		}
+		// The gate's range: -5 sigmoid( x ), here channels from nearly no decay to strong decay; the slow case keeps every channel near -0.01
+		std::vector<float> gd( out_n ), beta( static_cast<size_t>( rows ) * nh );
+		for ( auto& g : gd ) g = slow ? -0.01f - std::fabs( rng.uniform( 0.01f ) ) : -5.0f / ( 1.0f + std::exp( -( rng.uniform( 4.0f ) - 2.0f ) ) );
+		for ( auto& b : beta ) b = 0.5f + rng.uniform( 0.45f );
+		std::vector<half_t> z = rh( rng, out_n, 1.0f ), on = rh( rng, hd, 0.1f );
+		for ( auto& v : on ) v = backend::from_float_half( 1.0f + backend::to_float( v ) );
+		const std::vector<float> state = rf( rng, state_stride * slots, 0.1f );
+		std::vector<int> sl( rows, 1 ), ps( rows );
+		for ( int r = 0; r < rows; ++r ) ps[r] = r;
+		pod::BatchRows* drows = up_rows( pod::BatchRows::batched( rows, sl.data(), ps.data() ) );
+		float* dstate = up( state );
+		float* dstate_rows = up( state );
+		half_t* dout = zeros<half_t>( out_n );
+		half_t* dout_rows = zeros<half_t>( out_n );
+		void* scratch = zeros<unsigned char>( std::max<size_t>( GDN::recurrent_step_kda_chunked_scratch_bytes( rows, nh ), 16 ) );
+		pod::TensorView tq = tv( up( qkv ), pod::DType::FP16, rows, 3 * ch ), tg = tv( up( gd ), pod::DType::FP32, rows, ch ), tb = tv( up( beta ), pod::DType::FP32, rows, nh );
+		pod::TensorView tz = tv( up( z ), pod::DType::FP16, rows, ch ), ton = tv( up( on ), pod::DType::FP16, 1, hd );
+		pod::TensorView to = tv( dout, pod::DType::FP16, rows, ch ), tor = tv( dout_rows, pod::DType::FP16, rows, ch );
+		GDN::recurrent_step_kda_chunked( dstate, tq, tg, tb, tz, ton, to, nh, hd, 1e-5f, rows, drows, state_stride, scratch, nullptr );
+		GDN::recurrent_step_kda_rows( dstate_rows, tq, tg, tb, tz, ton, tor, nh, hd, 1e-5f, rows, drows, state_stride, nullptr, 0, 0, nullptr, nullptr );
+		backend::device_sync();
+		const auto out = dl( dout, out_n ), st = dlf( dstate + state_stride, state_stride );
+		g_cases += 3;
+		if ( !golden_compare( ( name + " vs rows: out" ).c_str(), dl( dout_rows, out_n ), out, 0.99999, 0.002 ) ) ++g_fail;
+		if ( !golden_compare( ( name + " vs rows: state" ).c_str(), dlf( dstate_rows + state_stride, state_stride ), st, 0.99999, 0.002 ) ) ++g_fail;
+		if ( !golden_compare( ( name + ": slot 0 kept" ).c_str(), std::vector<float>( state.begin(), state.begin() + state_stride ), dlf( dstate, state_stride ), 1.0, 0.0 ) ) ++g_fail;
+		emit( ( name + "_out" ).c_str(), out );
+		emit( ( name + "_state" ).c_str(), st );
+	};
+	run( false, "kda_chunked" );
+	run( true, "kda_chunked_slow" );
+}
+
 }
 
 int main( int argc, char** argv ) {
@@ -637,7 +690,7 @@ int main( int argc, char** argv ) {
 	}
 	backend::set_device( 0 );
 	std::printf( "test_ops_attention (%s, dir %s)\n", args.dump ? "dump" : "check", args.dir.c_str() );
-	// `--only <name>[,<name>...]` runs a subset of {attention, kvq, latent, latentq, dsa, mhc, gdn, gdn_single, gdn_chunked} (a backend that lacks some modules)
+	// `--only <name>[,<name>...]` runs a subset of {attention, kvq, latent, latentq, dsa, mhc, gdn, gdn_single, gdn_chunked, kda_chunked} (a backend that lacks some modules)
 	std::string only;
 	for ( int i = 1; i + 1 < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--only" ) ) only = std::string( "," ) + argv[i + 1] + ",";
@@ -660,6 +713,7 @@ int main( int argc, char** argv ) {
 	if ( want( "gdn" ) ) test_gdn( false );
 	if ( want( "gdn_single" ) ) test_gdn( true );
 	if ( want( "gdn_chunked" ) ) test_gdn_chunked();
+	if ( want( "kda_chunked" ) ) test_kda_chunked();
 	backend::device_sync();
 	for ( void* p : g_allocs ) backend::device_free( p );
 	std::printf( "%d outputs, %d failures\n", g_cases, g_fail );

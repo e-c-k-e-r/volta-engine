@@ -176,6 +176,29 @@ struct GDN {
 		backend::stream_t stream
 	);
 
+	// Prefill form of recurrent_step_kda_rows (rows above the decode sizes, at most pod::MAX_ROWS, one slot, no snapshots): the chunked delta
+	// rule over 64-row chunks with the decay per key channel, then the gated RMS norm of each row. As recurrent_step_chunked, the terms that do
+	// not depend on the state are computed for every chunk at once, and the sums run in another order (not bit-identical to the rows form).
+	// scratch: recurrent_step_kda_chunked_scratch_bytes( rows, num_heads ) bytes of device memory (0 where the form runs the rows kernel).
+	static size_t recurrent_step_kda_chunked_scratch_bytes( int rows, int num_heads );
+	static void recurrent_step_kda_chunked(
+		float* gdn_state,                 // layer base; slot s at + s * slot_stride
+		const pod::TensorView& qkv,       // [rows, 3 * heads * 128]
+		const pod::TensorView& g_decay,   // [rows, heads * 128]
+		const pod::TensorView& beta,      // [rows, heads]
+		const pod::TensorView& z,         // [rows, heads * 128]
+		const pod::TensorView& o_norm,
+		pod::TensorView& attn_out,        // [rows, heads * 128]
+		int num_heads,
+		int head_dim,
+		float eps,
+		int rows,
+		const pod::BatchRows* d_rows,
+		size_t slot_stride,
+		void* scratch,
+		backend::stream_t stream
+	);
+
 	// Speculative verify without a state snapshot per row (36 MiB each): while *journal_on is set the rows step leaves the slot state as it was before
 	// the block and records each row's k, v, decay and beta (kda_journal_row_bytes( heads ) bytes at journal + row * journal_row_stride, rows
 	// below journal_rows); kda_replay then applies rows [first_row, first_row + nrows) of the journal to a slot's state of every linear layer

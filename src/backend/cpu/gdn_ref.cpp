@@ -204,4 +204,12 @@ void GDN::recurrent_step_kda_rows( float* gdn_state, const pod::TensorView& qkv,
 	}
 }
 
+// The prefill form is the rows step here
+size_t GDN::recurrent_step_kda_chunked_scratch_bytes( int, int ) { return 0; }
+void GDN::recurrent_step_kda_chunked( float* gdn_state, const pod::TensorView& qkv, const pod::TensorView& g_decay, const pod::TensorView& beta, const pod::TensorView& z,
+	const pod::TensorView& o_norm, pod::TensorView& attn_out, int num_heads, int head_dim, float eps, int rows, const pod::BatchRows* d_rows, size_t slot_stride, void*,
+	backend::stream_t stream ) {
+	recurrent_step_kda_rows( gdn_state, qkv, g_decay, beta, z, o_norm, attn_out, num_heads, head_dim, eps, rows, d_rows, slot_stride, nullptr, 0, 0, nullptr, stream );
+}
+
 } // namespace engine::modules
