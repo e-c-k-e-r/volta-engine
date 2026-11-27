@@ -136,6 +136,7 @@ struct CombinePartsParams { uint64_t parts, w, shared_out, out_; int hidden, top
 struct SelectRouterParams { uint64_t partials, bias, topk_idx, topk_w; int num_experts, top_k, k_slices, max_slices; float scale; int has_bias; };
 struct AccumParams { uint64_t accum, expert_out; float weight; int n; };
 struct KdaStepParams { uint64_t state, qkv, g_decay, beta, z, o_norm, out_, slots, snap, snap_on; int64_t slot_stride, snap_stride; int num_heads, has_norm, has_z, has_o_norm, decay_first, snap_rows, rows; float eps; };
+struct KdaChunkParams { uint64_t qkv, g_decay, beta, z, o_norm, state, slots, output, pm, qt, kb, s0, wy, uu, dd, dl; int heads, rows, has_z, has_norm; float eps; int pad0; int64_t slot_stride; };
 } // namespace engine::backend::impl
 
 // Qwen4Exp kernels (src/kernels/slang/flash.slang)

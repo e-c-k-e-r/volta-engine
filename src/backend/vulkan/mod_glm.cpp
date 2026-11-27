@@ -144,12 +144,34 @@ void GDN::recurrent_step_kda_rows( float* gdn_state, const pod::TensorView& qkv,
 	kda_launch( gdn_state, qkv, g_decay, beta, z, o_norm, attn_out, num_heads, eps, rows, vki::rows_slot( d_rows ), slot_stride, snap, snap_stride, snap_rows, snap_on, true, true, stream );
 }
 
-// The prefill form is the rows kernel here
-size_t GDN::recurrent_step_kda_chunked_scratch_bytes( int, int ) { return 0; }
+// The chunked delta rule on the shader cores (kda_chunk.slang): the scratch holds, per head and 64-row chunk, P, Qt (FP16), Kbar, the prep's Ktilde whose
+// room then holds S0, W (then the output's unnormed rows), U, Delta and exp( gamma_last ), FP32
+size_t GDN::recurrent_step_kda_chunked_scratch_bytes( int rows, int num_heads ) {
+	const size_t hc = static_cast<size_t>( rows + 63 ) / 64 * num_heads;
+	return hc * ( 4096 + 4096 + 8192 + 16384 + 8192 + 8192 + 8192 + 128 ) * sizeof( float );
+}
+
 void GDN::recurrent_step_kda_chunked( float* gdn_state, const pod::TensorView& qkv, const pod::TensorView& g_decay, const pod::TensorView& beta, const pod::TensorView& z,
-	const pod::TensorView& o_norm, pod::TensorView& attn_out, int num_heads, int head_dim, float eps, int rows, const pod::BatchRows* d_rows, size_t slot_stride, void*,
+	const pod::TensorView& o_norm, pod::TensorView& attn_out, int num_heads, int head_dim, float eps, int rows, const pod::BatchRows* d_rows, size_t slot_stride, void* scratch,
 	backend::stream_t stream ) {
-	recurrent_step_kda_rows( gdn_state, qkv, g_decay, beta, z, o_norm, attn_out, num_heads, head_dim, eps, rows, d_rows, slot_stride, nullptr, 0, 0, nullptr, stream );
+	ENGINE_ASSERT( head_dim == 128, "GDN::recurrent_step_kda_chunked (Vulkan): the kernels are specialized for head_dim 128" );
+	const int chunks = ( rows + 63 ) / 64;
+	const size_t hc = static_cast<size_t>( chunks ) * num_heads;
+	float* pm = static_cast<float*>( scratch );
+	backend::half_t* qt = reinterpret_cast<backend::half_t*>( pm + hc * 4096 );
+	float* kb = reinterpret_cast<float*>( qt + hc * 8192 );
+	float* s0 = kb + hc * 8192;
+	float* wy = s0 + hc * 16384;
+	float* uu = wy + hc * 8192;
+	float* dd = uu + hc * 8192;
+	float* dl = dd + hc * 8192;
+	vki::KdaChunkParams p{ vki::dp( qkv.data ), vki::dp( g_decay.data ), vki::dp( beta.data ), vki::dp( z.data ), vki::dp( o_norm.data ), vki::dp( gdn_state ), vki::rows_slot( d_rows ),
+		vki::dp( attn_out.data ), vki::dp( pm ), vki::dp( qt ), vki::dp( kb ), vki::dp( s0 ), vki::dp( wy ), vki::dp( uu ), vki::dp( dd ), vki::dp( dl ), num_heads, rows,
+		z.data != nullptr ? 1 : 0, o_norm.data != nullptr ? 1 : 0, eps, 0, static_cast<int64_t>( slot_stride ) };
+	vki::launch( "kda_chunk_prep", p, stream, num_heads, chunks );
+	vki::launch( "kda_chunk_scan", p, stream, num_heads, 128 / 16 );
+	vki::launch( "kda_chunk_out", p, stream, num_heads, chunks, 128 / 32 );
+	vki::launch( "kda_chunk_norm", p, stream, num_heads, chunks );
 }
 
 // ---------------------------------------------------------------- MoE router (sigmoid routing) and combine

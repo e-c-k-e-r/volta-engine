@@ -117,7 +117,8 @@ FP32 scores): bidirectional attention for the TTS backbone and the vision towers
 the step before the attention in one kernel (`Attention::norm_rope_store`: q / k / v head norms, the rotary embedding of q and k, k and v into
 an FP16 cache, a group per row and head), bit for bit the three kernels it replaces; other cache formats take those three. `gdn_chunk.slang` is the
 Vulkan form of the GDN prefill's chunked delta rule (the CUDA kernels' three steps in FP32 on the shader cores, held against the rows kernel and the
-CUDA kernels by `test_ops_attention`). `tts.slang` holds the
+CUDA kernels by `test_ops_attention`); `kda_chunk.slang` is the same for GLM's KDA prefill (the decay per key channel, with the gated RMS norm as a fourth
+step). `tts.slang` holds the
 TTS and NeMo codec operators of the Vulkan build (embedding mix, the norms, QK norm + RoPE, gate, SwiGLU, the flow head's AdaLN and guided step,
 FSQ, the codec's K-major columns, HalfSnake, interleave); the CUDA forms are `src/backend/cuda/modules/tts.cu`, and the Vulkan GEMMs are llama.cpp's
 FP16 matmul (FP16 or FP32 out) and its FP32 one (`bench_tts_ops`). `trellis.slang` is the Vulkan EXL3 linear, compiled once per width code (and
