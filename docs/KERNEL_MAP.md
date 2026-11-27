@@ -117,10 +117,11 @@ The H3 tests take the checkpoints and their goldens (safetensors files written b
 tiles in shared memory (16-byte loads, FP16 products accumulated in FP32), and splits a long key range over workgroups whose partials `fa_reduce` combines;
 a decode or short verify on an FP16 cache with head_dim 256 or 512 takes `fa_decode_256` / `fa_decode_512` (the same grid and partials, no tiles: each
 lane holds its dimensions of the query vectors and accumulators, each warp streams its keys from the cache and sums their dot products across the warp);
-`test_vulkan_attention` holds both against `ref_attention` on the same device. Where the device launches CUDA kernels (Volta), prefill chunks on an
-FP16 cache with head_dim 256 or 512 take `src/kernels/cuda/attention/attn_prefill_vk.cu` instead (`cuda_attn.ptx`: the tensor-core tiles of
-attention.cu's prefill kernel on 32-key tiles within a launch's 48 KiB of shared memory, the K and transposed V tiles in one buffer, its key
-splits merged by `fa_reduce`), held against `ref_attention` by the same test. Without a cache (no slots) `fa_attn` attends dense rows to every key,
+`test_vulkan_attention` holds both against `ref_attention` on the same device. Where the device launches CUDA kernels (Volta), head_dim 256 and
+512 take `src/kernels/cuda/attention/attn_prefill_vk.cu` instead for prefill chunks and, on quantized caches, decode rows (`cuda_attn.ptx`: the
+tensor-core tiles of attention.cu's prefill kernel on 32-key tiles within a launch's 48 KiB of shared memory, the K and transposed V tiles in one
+buffer, every cache format through the CUDA backend's codecs, a block per 32 query vectors of a slot or per row, its key splits merged by
+`fa_reduce`), held against `ref_attention` by the same test. Without a cache (no slots) `fa_attn` attends dense rows to every key,
 and `fa_dense_64` is the head_dim 64 form of that (a thread per query with its accumulators in registers, a warp per quarter of each 64-key tile,
 FP32 scores): bidirectional attention for the TTS backbone and the vision towers (`test_ops_vision`, `tts_generate --golden`). `attn_prep.slang`'s `norm_rope_store` is
 the step before the attention in one kernel (`Attention::norm_rope_store`: q / k / v head norms, the rotary embedding of q and k, k and v into

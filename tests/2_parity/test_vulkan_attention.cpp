@@ -1,8 +1,8 @@
 // The Vulkan backend's tiled attention (fa.slang) against its portable reference kernel (ref_attention.slang) on the same device, over the
 // cases the models give it: head_dim 128, 256 and 512; 1 to 8 query heads per KV head; decode rows in distinct slots, decode rows of one slot,
 // and prefill chunks; full attention, and sliding windows on ring caches; image rows that see past their position; every KV format; with
-// and without a gate. Each case: the relative RMS of the two outputs (the tiled kernel's FP16 dot products: well under 5e-3); rows of one slot
-// also on the tensor-core prefill attention where the device launches CUDA kernels (its cases: FP16 caches, head_dim 256 and 512).
+// and without a gate. Each case: the relative RMS of the two outputs (the tiled kernel's FP16 dot products: well under 5e-3); also on the
+// tensor-core attention where the device launches CUDA kernels (its cases: head_dim 256 and 512, FP16 caches where fa_decode does not take them).
 //   test_vulkan_attention
 #include "../../src/backend/vulkan/mod_attention.h"
 #include "engine/backend/runtime.h"
@@ -168,11 +168,12 @@ bool run( const Case& c ) {
 		return ok;
 	};
 	bool ok = check( o_fa, ms, c.name );
-	// the tensor-core prefill attention where the rows share a slot and the device launches CUDA kernels
-	if ( one_slot ) {
+	// the tensor-core attention where the device launches CUDA kernels (rows of distinct slots a block each)
+	{
 		half_t* o_tc = static_cast<half_t*>( dev( qn * sizeof( half_t ) ) );
 		pod::TensorView tt = pod::make_tensor_2d( o_tc, pod::DType::FP16, c.count, c.hq * c.hd );
-		auto tc = [&]() { return modules::vk_attn::tensor_core( kv, tq, tg, tt, slot_stride, kLayer, drows, c.count, c.hq, c.hkv, c.hd, c.max_seq, nullptr, scale, c.window, key_hint ); };
+		auto tc = [&]() { return modules::vk_attn::tensor_core( kv, tq, tg, tt, slot_stride, kLayer, drows, c.count, c.hq, c.hkv, c.hd, c.max_seq, nullptr, scale, c.window, key_hint,
+			!one_slot ); };
 		if ( tc() ) {
 			const double ms_tc = timed( tc );
 			const std::string name = std::string( c.name ) + ", tensor cores";
@@ -210,6 +211,11 @@ int main() {
 		{ "decode 3 slots, nvfp4", 256, 8, 2, 2048, false, 0, F::NVFP4, Rows::Slots, 3, 0, true, false },
 		{ "prefill 256, k8v4", 256, 8, 2, 2048, false, 0, F::K8V4, Rows::Prefill, 256, 512, true, false },
 		{ "prefill 256, k8v4 x 512", 512, 8, 2, 2048, false, 0, F::K8V4, Rows::Prefill, 256, 512, false, false },
+		{ "prefill 512, 24/4 x 256 k8v4, gate", 256, 24, 4, 2048, false, 0, F::K8V4, Rows::Prefill, 512, 0, true, false },
+		{ "prefill 512, fp8 window 512 ring 1024", 256, 8, 2, 1024, true, 512, F::FP8, Rows::Prefill, 512, 1000, false, false },
+		{ "prefill 256, fp8 x 512", 512, 8, 2, 2048, false, 0, F::FP8, Rows::Prefill, 256, 512, true, false },
+		{ "prefill 512, 24/4 x 256 nvfp4, gate", 256, 24, 4, 2048, false, 0, F::NVFP4, Rows::Prefill, 512, 300, true, false },
+		{ "prefill 256, nvfp4 x 512", 512, 8, 2, 2048, false, 0, F::NVFP4, Rows::Prefill, 256, 512, false, false },
 		// Gemma 4 E4B's two layer kinds at a few context lengths (one decode row, a 512-row chunk)
 		{ "E4B sliding: decode at 600", 256, 8, 2, 1024, true, 512, F::FP16, Rows::OneSlot, 1, 600, false, false },
 		{ "E4B sliding: decode at 7000", 256, 8, 2, 1024, true, 512, F::FP16, Rows::OneSlot, 1, 7000, false, false },

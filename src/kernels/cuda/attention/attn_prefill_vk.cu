@@ -1,17 +1,24 @@
 // Tensor-core prefill attention (Volta mma.m8n8k4, FP32 accumulate) as the PTX of the Vulkan backend's launches through
 // VK_NV_cuda_kernel_launch (src/backend/vulkan/mod_cuda.cpp), within the 48 KiB of shared memory such a launch has: the tiles of
-// attention.cu's attn_prefill_tc_kernel on 32-key tiles. A block owns 32 query vectors (row, head pairs of one slot) of one kv head and walks
-// the keys in tiles of 32. S = Q K^T: warp (half, qg, kg) computes a 16 x 16 tile over one 128-dimension half of a 256-dimension part, the two
+// attention.cu's attn_prefill_tc_kernel on 32-key tiles. A block owns 32 query vectors (row, head pairs of one slot; or one row's query
+// heads, for rows of distinct slots: decode and verify rows) of one kv head and walks the keys in tiles of 32. S = Q K^T: warp (half, qg, kg) computes a 16 x 16 tile over one 128-dimension half of a 256-dimension part, the two
 // halves summed in the softmax; the softmax runs on 8 lanes per query row, P is written as FP16, and O += P V gives each warp 32 dimensions
 // of each 256-dimension part (interleaved: d = 32w + dn + 4c) for all 32 queries. The K tile and the transposed V tile share one buffer (V is
-// staged once S is done); head_dim 512 stages Q, K and V one 256-dimension part at a time. FP16 KV; causal, sliding windows, ring caches,
-// bidirectional image spans, the output gate, and key splits whose partials (unnormalized output, max, sum) take fa.slang's layout for its
-// fa_reduce.
+// staged once S is done); head_dim 512 stages Q, K and V one 256-dimension part at a time. Every cache format (the CUDA backend's codecs,
+// kv_quant.cuh: a tile's raw words fetched early and decoded to FP16 as they are staged; Q4 values rotated back per 64 dimensions at the end);
+// causal, sliding windows, ring caches, bidirectional image spans, the output gate, and key splits whose partials (unnormalized output, max,
+// sum) take fa.slang's layout for its fa_reduce.
 #include <cuda_fp16.h>
 #include <cstdint>
 #include "../mma_sm80.cuh"
+#include "../../../backend/cuda/modules/kv_quant.cuh"
 
 namespace {
+
+using engine::modules::KVRaw8;
+using engine::modules::kv_decode8_h;
+using engine::modules::kv_fetch8;
+using pod::KVQ;
 
 constexpr int BQ = 32, BK = 32, KS = 260, VS = BK + 4, SS = BK + 4;
 constexpr int OFF_Q = 256 * VS * 2;           // [0, OFF_Q): the K tile (BK x KS) or the transposed V tile (256 x VS)
@@ -25,11 +32,13 @@ static_assert( SMEM <= 48 * 1024, "a CUDA launch from Vulkan has 48 KiB of share
 
 __device__ __forceinline__ float sigmoid( float x ) { return 1.0f / ( 1.0f + __expf( -x ) ); }
 
-template <int HD>
+template <int HD, KVQ KQ, KVQ VQ>
 __device__ __forceinline__ void attn_prefill_body(
 	const half* __restrict__ q,
-	const half* __restrict__ kc,
-	const half* __restrict__ vc,
+	const void* __restrict__ kc,
+	const void* __restrict__ vc,
+	const void* __restrict__ ks,
+	const void* __restrict__ vs,
 	const half* __restrict__ gate,
 	half* __restrict__ out,
 	long long slot_stride,
@@ -46,7 +55,8 @@ __device__ __forceinline__ void attn_prefill_body(
 	float* __restrict__ part,
 	int nsplit,
 	int window,
-	int ring
+	int ring,
+	int tile_q   // query vectors a block owns: BQ (rows of one slot), or G to give every row its own block (rows of distinct slots)
 ) {
 	constexpr int NP = HD / 256;   // 256-dimension parts
 	extern __shared__ __align__( 16 ) unsigned char smem[];
@@ -62,8 +72,8 @@ __device__ __forceinline__ void attn_prefill_body(
 
 	const int G = num_q_heads / num_kv_heads;
 	const int kvh = blockIdx.x;
-	const int q_base = blockIdx.y * BQ;
-	const int q_end = min( q_base + BQ, count * G );
+	const int q_base = blockIdx.y * tile_q;
+	const int q_end = min( q_base + tile_q, count * G );
 	const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
 	const int t = lane & 3, hi = lane >> 4, e = t + 4 * hi, qp = ( lane >> 2 ) & 3;
 	const bool bidir = window > 0 && *rows_bidir != 0;
@@ -126,40 +136,42 @@ __device__ __forceinline__ void attn_prefill_body(
 		if ( ring > 0 ) tok %= ring;
 		return static_cast<long long>( tok );
 	};
-	auto fetch_k = [&]( int kb, int part0, uint4 ( &rk )[4] ) {
+	auto fetch_k = [&]( int kb, int part0, KVRaw8 ( &rk )[4] ) {
 		#pragma unroll
 		for ( int u = 0; u < 4; ++u ) {
 			const int it = tid + 256 * u, key = ( it & 15 ) + 16 * ( it >> 9 ), c = ( it >> 4 ) & 31;
 			const long long row = key_row( kb, key );
-			rk[u] = row < 0 ? make_uint4( 0, 0, 0, 0 ) : *reinterpret_cast<const uint4*>( kc + kv_base + row * kv_stride + part0 + c * 8 );
+			rk[u] = row < 0 ? KVRaw8{} : kv_fetch8<KQ>( kc, ks, kv_base + row * kv_stride + part0 + c * 8 );
 		}
 	};
-	auto store_k = [&]( const uint4 ( &rk )[4] ) {
+	auto store_k = [&]( const KVRaw8 ( &rk )[4] ) {
 		#pragma unroll
 		for ( int u = 0; u < 4; ++u ) {
 			const int it = tid + 256 * u, key = ( it & 15 ) + 16 * ( it >> 9 ), c = ( it >> 4 ) & 31;
+			const uint4 kh = kv_decode8_h<KQ>( rk[u] );
 			uint2* dst = reinterpret_cast<uint2*>( sK + key * KS + c * 8 );
-			dst[0] = make_uint2( rk[u].x, rk[u].y );
-			dst[1] = make_uint2( rk[u].z, rk[u].w );
+			dst[0] = make_uint2( kh.x, kh.y );
+			dst[1] = make_uint2( kh.z, kh.w );
 		}
 	};
-	auto fetch_v = [&]( int kb, int part0, uint4 ( &rv )[2][2] ) {
+	auto fetch_v = [&]( int kb, int part0, KVRaw8 ( &rv )[2][2] ) {
 		#pragma unroll
 		for ( int u = 0; u < 2; ++u ) {
 			const int it = tid + 256 * u, kp = it & 15, c = it >> 4;
 			#pragma unroll
 			for ( int kk = 0; kk < 2; ++kk ) {
 				const long long row = key_row( kb, 2 * kp + kk );
-				rv[u][kk] = row < 0 ? make_uint4( 0, 0, 0, 0 ) : *reinterpret_cast<const uint4*>( vc + kv_base + row * kv_stride + part0 + c * 8 );
+				rv[u][kk] = row < 0 ? KVRaw8{} : kv_fetch8<VQ>( vc, vs, kv_base + row * kv_stride + part0 + c * 8 );
 			}
 		}
 	};
-	auto store_v = [&]( const uint4 ( &rv )[2][2] ) {
+	auto store_v = [&]( const KVRaw8 ( &rv )[2][2] ) {
 		#pragma unroll
 		for ( int u = 0; u < 2; ++u ) {
 			const int it = tid + 256 * u, kp = it & 15, c = it >> 4;
-			const half* v0 = reinterpret_cast<const half*>( &rv[u][0] );
-			const half* v1 = reinterpret_cast<const half*>( &rv[u][1] );
+			const uint4 va = kv_decode8_h<VQ>( rv[u][0] ), vb = kv_decode8_h<VQ>( rv[u][1] );
+			const half* v0 = reinterpret_cast<const half*>( &va );
+			const half* v1 = reinterpret_cast<const half*>( &vb );
 			#pragma unroll
 			for ( int i = 0; i < 8; ++i ) *reinterpret_cast<half2*>( sVt + ( c * 8 + i ) * VS + 2 * kp ) = __halves2half2( v0[i], v1[i] );
 		}
@@ -170,8 +182,8 @@ __device__ __forceinline__ void attn_prefill_body(
 	const int kb0 = key_lo + ( blockIdx.z * ntiles / nsplit ) * BK;
 	const int kb1 = key_lo + ( ( blockIdx.z + 1 ) * ntiles / nsplit ) * BK;
 
-	uint4 rk[4];
-	uint4 rv[2][2];
+	KVRaw8 rk[4];
+	KVRaw8 rv[2][2];
 	if ( NP == 1 ) {
 		stage_q( 0 );
 		if ( kb0 < kb1 ) fetch_k( kb0, 0, rk );
@@ -291,6 +303,23 @@ __device__ __forceinline__ void attn_prefill_body(
 			}
 		}
 		__syncthreads();
+		if constexpr ( VQ == KVQ::Q4 ) {
+			// the values were stored rotated per 64 dimensions (a Hadamard transform): rotate the output back, a thread per 64 of a query
+			if ( nsplit == 1 && tid < BQ * 4 ) {
+				float* x = sO + ( tid >> 2 ) * KS + ( tid & 3 ) * 64;
+				for ( int h = 1; h < 64; h <<= 1 ) {
+					for ( int i = 0; i < 64; ++i ) {
+						if ( ( i & h ) == 0 ) {
+							const float a = x[i], b = x[i | h];
+							x[i] = a + b;
+							x[i | h] = a - b;
+						}
+					}
+				}
+				for ( int i = 0; i < 64; ++i ) x[i] *= 0.125f;
+			}
+			__syncthreads();
+		}
 		for ( int u = tid; u < BQ * 32; u += 256 ) {
 			const int qq = u >> 5, cc = u & 31;
 			const int qi = q_base + qq;
@@ -335,12 +364,24 @@ __device__ __forceinline__ void attn_prefill_body(
 } // namespace
 
 #define VK_ATTN_ARGS                                                                                                                              \
-	const half *q, const half *kc, const half *vc, const half *gate, half *out, long long slot_stride, int layer_idx, const int *rows_slot,       \
+	const half *q, const void *kc, const void *vc, const void *ks, const void *vs, const half *gate, half *out, long long slot_stride,           \
+		int layer_idx, const int *rows_slot,                                                                                                      \
 		const int *rows_pos, const int *rows_key_end, const int *rows_bidir, int count, int num_q_heads, int num_kv_heads, int max_seq,           \
-		float scale, float *part, int nsplit, int window, int ring
+		float scale, float *part, int nsplit, int window, int ring, int tile_q
 #define VK_ATTN_PASS                                                                                                                              \
-	q, kc, vc, gate, out, slot_stride, layer_idx, rows_slot, rows_pos, rows_key_end, rows_bidir, count, num_q_heads, num_kv_heads, max_seq,       \
-		scale, part, nsplit, window, ring
+	q, kc, vc, ks, vs, gate, out, slot_stride, layer_idx, rows_slot, rows_pos, rows_key_end, rows_bidir, count, num_q_heads, num_kv_heads, max_seq,       \
+		scale, part, nsplit, window, ring, tile_q
 
-extern "C" __global__ __launch_bounds__( 256 ) void vk_attn_prefill_256( VK_ATTN_ARGS ) { attn_prefill_body<256>( VK_ATTN_PASS ); }
-extern "C" __global__ __launch_bounds__( 256 ) void vk_attn_prefill_512( VK_ATTN_ARGS ) { attn_prefill_body<512>( VK_ATTN_PASS ); }
+// an entry per head_dim and cache format pair (attention.cu's KV_DISPATCH: fp16, fp8, k8v4, nvfp4)
+#define VK_ATTN_ENTRY( HD, NAME, KQ, VQ )                                                                                                         \
+	extern "C" __global__ __launch_bounds__( 256 ) void vk_attn_prefill_##HD##_##NAME( VK_ATTN_ARGS ) {                                          \
+		attn_prefill_body<HD, KVQ::KQ, KVQ::VQ>( VK_ATTN_PASS );                                                                                \
+	}
+VK_ATTN_ENTRY( 256, f16, F16, F16 )
+VK_ATTN_ENTRY( 256, e5m2, E5M2, E5M2 )
+VK_ATTN_ENTRY( 256, i8q4, I8, Q4 )
+VK_ATTN_ENTRY( 256, fp4, FP4, FP4 )
+VK_ATTN_ENTRY( 512, f16, F16, F16 )
+VK_ATTN_ENTRY( 512, e5m2, E5M2, E5M2 )
+VK_ATTN_ENTRY( 512, i8q4, I8, Q4 )
+VK_ATTN_ENTRY( 512, fp4, FP4, FP4 )

@@ -310,7 +310,7 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	if(ENGINE_NVCC)
 		set(KDIR ${PROJECT_SOURCE_DIR}/src/kernels/cuda)
 		foreach(ptx "cuda_gemm|gemm/gemm_f16_vk.cu|gemm/gemm_f16_kernel.cuh" "cuda_nvfp4|nvfp4/nvfp4_vk.cu|nvfp4/nvfp4_linear_kernels.cuh;nvfp4/nvfp4_common.cuh;nvfp4/nvfp4_frag.h;mma_sm80.cuh;mma_frag.h"
-			"cuda_attn|attention/attn_prefill_vk.cu|mma_sm80.cuh;mma_frag.h")
+			"cuda_attn|attention/attn_prefill_vk.cu|mma_sm80.cuh;mma_frag.h;../../backend/cuda/modules/kv_quant.cuh")
 			string(REPLACE "|" ";" parts "${ptx}")
 			list(GET parts 0 name)
 			list(GET parts 1 src)
@@ -319,7 +319,7 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			set(sout ${SLANG_OUT}/${name}.ptx)
 			add_custom_command(OUTPUT ${sout}
 				COMMAND ${ENGINE_NVCC} -arch=compute_70 -ptx -std=c++17 -O3 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 177
-					${KDIR}/${src} -o ${sout}
+					-I${PROJECT_SOURCE_DIR}/inc ${KDIR}/${src} -o ${sout}
 				DEPENDS ${KDIR}/${src} ${deps}
 				COMMENT "nvcc ${src} -> ptx")
 			list(APPEND VK_FLASH_SPV ${sout})

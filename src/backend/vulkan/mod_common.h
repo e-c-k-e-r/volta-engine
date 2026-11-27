@@ -45,15 +45,16 @@ bool cuda_gemm_tn( const void* w, const void* x, void* out, int m, int n, int k,
 // The NVFP4 W4A16 linear out[m, n] = x[m, k] W^T on the CUDA backend's kernels (the prepacked codes and scales, the global scale as stored),
 // false where the tensor path is not CudaLaunch or the rows are a chunk for the dequantization and the FP16 GEMM
 bool cuda_nvfp4_linear( const void* codes, const void* scales, const void* x, void* out, int m, int n, int k, float gscale, stream_t stream );
-// The tensor-core prefill attention (src/kernels/cuda/attention/attn_prefill_vk.cu) over rows of one slot, FP16 KV, head_dim 256 or 512: the
+// The tensor-core attention (src/kernels/cuda/attention/attn_prefill_vk.cu) over rows of one slot or a row each, any cache format, head_dim 256 or 512: the
 // key tiles over `splits` blocks, whose partials go to part in fa.slang's layout for fa_reduce (splits 1: the output, gated, straight to out).
 // False where the tensor path is not CudaLaunch
 struct AttnPrefillArgs {
-	const void* q; const void* k; const void* v; const void* gate; void* out;
+	const void* q; const void* k; const void* v; const void* ks; const void* vs; const void* gate; void* out;
 	long long slot_stride; int layer_idx;
 	uint64_t rows_slot, rows_pos, rows_key_end, rows_bidir;
 	int count, num_q_heads, num_kv_heads, max_seq; float scale; float* part; int splits, window, ring;
-	int head_dim;
+	int head_dim; int kq, vq;   // pod::KVQ: (F16, F16), (E5M2, E5M2), (I8, Q4) or (FP4, FP4)
+	bool per_row;               // rows of distinct slots: a block per row
 };
 bool cuda_attn_prefill( const AttnPrefillArgs& a, stream_t stream );
 // FP32: d [n rows of stride_d][m] = a [m, k] times b [n, k]^T (d[j * stride_d + i] = a row i . b row j), on llama.cpp's matmul; false where it
