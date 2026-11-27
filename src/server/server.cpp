@@ -118,7 +118,7 @@ bool VoltaServer::init_tts() {
 	if ( tts_->init( config_ ) ) return true;
 	LOG_ERROR( "Failed to initialize the TTS service.\n" );
 #else
-	LOG_ERROR( "vall-e TTS needs a build with libespeak-ng.\n" );
+	LOG_ERROR( "vall-e TTS needs a build with propan2ol (the deps/propan2ol submodule).\n" );
 #endif
 	return false;
 }

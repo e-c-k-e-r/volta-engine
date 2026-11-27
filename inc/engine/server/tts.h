@@ -8,7 +8,7 @@
 
 // vall-e text to speech in volta_server (the launch config's "tts" section; see docs/CONFIG.md): POST /v1/audio/speech in OpenAI's shape (input,
 // voice, response_format "wav", speed) with vall-e's own fields (language, seed, cfg, cfg_prompt, steps, duration), and GET /v1/audio/voices.
-// Served next to a language model, or alone when the config has no model_dir. Needs libespeak-ng at build time (ENGINE_TTS).
+// Served next to a language model, or alone when the config has no model_dir. Needs propan2ol at build time (ENGINE_TTS).
 namespace engine::server {
 
 // A /v1/audio/speech body (the endpoint's and the library's): the text, the voice by name or as a WAV file in the request (voice_audio, base64),

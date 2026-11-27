@@ -17,7 +17,8 @@ ninja -C build_vklib volta test_library
   hidden symbols, so the engine's copies of nlohmann::json and the rest don't clash with the host's.
 - Every kernel's SPIR-V is linked in (a generated table of `.incbin` blobs, looked up by name), so the library needs no kernel files at run time.
   `ENGINE_SPV_DIR` still makes the loader read a directory instead.
-- With libespeak-ng installed the library has speech (the same condition as volta_server); without it `speak` returns an error.
+- With propan2ol (the deps/propan2ol submodule, or an installed one) the library has speech, the same condition as volta_server; propan2ol's
+  data is built in, so speech needs no files beyond the models. Without it `speak` returns an error.
 - The host builds with the same C++ standard library (std::string, std::vector and std::function cross the boundary). Linux only.
 
 ## The API

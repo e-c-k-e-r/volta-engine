@@ -197,16 +197,21 @@ set(ENGINE_HOST_SOURCES
 )
 
 # vall-e TTS: the model and codec (host code over engine/modules/tts.h, built with the CUDA, ROCm and Vulkan backends); the text front-end,
-# the pipeline and the server's speech endpoint when libespeak-ng is installed (GPL-3.0, which the AGPL-3.0 allows combining with); without it
-# the model and codec build alone (tts_generate's golden checks)
+# the pipeline and the server's speech endpoint with propan2ol (text to IPA, a port of espeak-ng's phonemizing; GPL-3.0-or-later, which the
+# AGPL-3.0 allows combining with): the deps/propan2ol submodule, else an installed one (its package config: CMAKE_PREFIX_PATH, or ~/.local);
+# without either the model and codec build alone (tts_generate's golden checks)
 set(ENGINE_TTS_SOURCES src/tts/tts_model.cpp src/tts/tts_backbone.cpp src/tts/tts_flow.cpp src/tts/codec.cpp)
-find_library(ESPEAK_NG_LIBRARY espeak-ng)
-find_path(ESPEAK_NG_INCLUDE espeak-ng/speak_lib.h)
-if(ESPEAK_NG_LIBRARY AND ESPEAK_NG_INCLUDE)
+if(EXISTS ${PROJECT_SOURCE_DIR}/deps/propan2ol/CMakeLists.txt)
+	add_subdirectory(${PROJECT_SOURCE_DIR}/deps/propan2ol ${PROJECT_BINARY_DIR}/propan2ol EXCLUDE_FROM_ALL)
+	set(propan2ol_FOUND ON)
+else()
+	find_package(propan2ol 0.1 CONFIG QUIET HINTS $ENV{HOME}/.local)
+endif()
+if(propan2ol_FOUND)
 	set(ENGINE_TTS ON)
 	list(APPEND ENGINE_TTS_SOURCES src/tts/g2p.cpp src/tts/tts.cpp src/server/tts_service.cpp src/server/tts_page.cpp)
 else()
-	message(STATUS "libespeak-ng not found: vall-e TTS without its text front-end, pipeline and speech endpoint")
+	message(STATUS "propan2ol not found: vall-e TTS without its text front-end, pipeline and speech endpoint")
 endif()
 
 if(ENGINE_GPU)
@@ -375,8 +380,7 @@ add_library(engine_kernels STATIC
 	${TRELLIS_SOURCES}
 )
 if(ENGINE_TTS)
-	target_include_directories(engine_kernels PUBLIC ${ESPEAK_NG_INCLUDE})
-	target_link_libraries(engine_kernels PUBLIC ${ESPEAK_NG_LIBRARY})
+	target_link_libraries(engine_kernels PUBLIC propan2ol::propan2ol)
 	target_compile_definitions(engine_kernels PUBLIC ENGINE_TTS=1)
 	add_executable(test_tts_g2p tests/2_parity/test_tts_g2p.cpp)
 	target_link_libraries(test_tts_g2p PRIVATE engine_kernels)

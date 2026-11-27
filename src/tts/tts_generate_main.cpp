@@ -305,7 +305,7 @@ int main( int argc, char** argv ) {
 			audio.size() / static_cast<double>( tts.sample_rate() ) / dt );
 		return 0;
 #else
-		std::fprintf( stderr, "--text needs a build with libespeak-ng (the text front-end)\n" );
+		std::fprintf( stderr, "--text needs a build with propan2ol (the text front-end)\n" );
 		return 2;
 #endif
 	}

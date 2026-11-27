@@ -1,15 +1,13 @@
-// The vall-e text front-end: vall_e/emb/g2p.py (normalize_en, coerce_language, encode) and phonemizer 3.3's espeak
-// backend (punctuation.py preserve / restore, espeak.py _postprocess_line, wrapper.py text_to_phonemes / set_voice) ported
-// as they are, quirks included, so the output matches vall_e's character for character (tests/2_parity/tts_g2p checks it
-// against vall_e on store texts). Text is handled as code points; Python's \s, \w and isupper() are Unicode-aware, so
-// they're taken from the C.UTF-8 locale's classification.
+// The vall-e text front-end: vall_e/emb/g2p.py (normalize_en, coerce_language, encode) ported as it is, quirks included,
+// over propan2ol (espeak-ng 1.52.0 plus phonemizer 3.3's espeak backend, character for character), so the output matches
+// vall_e's (tests/2_parity/test_tts_g2p checks it against vall_e on store texts). Text is handled as code points; Python's
+// \s, \w and isupper() are Unicode-aware, so they're taken from the C.UTF-8 locale's classification.
 #include "engine/tts/g2p.h"
 #include "engine/core/log.h"
-#include <espeak-ng/speak_lib.h>
+#include <propan2ol/propan2ol.h>
 #include <clocale>
 #include <cwctype>
 #include <locale.h>
-#include <mutex>
 #include <string_view>
 
 namespace engine::tts {
@@ -72,25 +70,11 @@ bool str_is_upper( const std::u32string& s ) {
 	return cased;
 }
 
-std::u32string strip( const std::u32string& s ) {
-	size_t a = 0, b = s.size();
-	while ( a < b && is_space( s[a] ) ) { ++a; }
-	while ( b > a && is_space( s[b - 1] ) ) { --b; }
-	return s.substr( a, b - a );
-}
 std::u32string rstrip( const std::u32string& s ) {
 	size_t b = s.size();
 	while ( b > 0 && is_space( s[b - 1] ) ) { --b; }
 	return s.substr( 0, b );
 }
-std::u32string replace_all( std::u32string s, const std::u32string& from, const std::u32string& to ) {  // str.replace
-	std::u32string out;
-	size_t i = 0;
-	for ( size_t j; ( j = s.find( from, i ) ) != std::u32string::npos; i = j + from.size() ) { out += s.substr( i, j - i ) + to; }
-	return out + s.substr( i );
-}
-bool starts_with( const std::u32string& s, const std::u32string& p ) { return s.size() >= p.size() && s.compare( 0, p.size(), p ) == 0; }
-bool ends_with( const std::u32string& s, const std::u32string& p ) { return s.size() >= p.size() && s.compare( s.size() - p.size(), p.size(), p ) == 0; }
 
 // ---- normalize_en ----
 struct Abbrev { const char32_t* word; const char32_t* full; };
@@ -114,133 +98,6 @@ bool match_abbrev( const std::u32string& t, size_t i, const char32_t* word, size
 	if ( gap == t.size() || ( gap + 1 == t.size() && t[gap] == U'\n' ) ) { end = gap; return true; }
 	return false;
 }
-
-// ---- phonemizer: punctuation ----
-constexpr std::u32string_view MARKS = U";:,.!?¡¿—…\"«»“”(){}[]";
-bool is_mark( char32_t c ) { return MARKS.find( c ) != std::u32string_view::npos; }
-
-struct Mark { int index; std::u32string mark; char position; };
-
-// (\s*[marks]+\s*)+ found left to right: the maximal runs of whitespace and marks that hold a mark
-std::vector<std::pair<size_t, size_t>> mark_runs( const std::u32string& s ) {
-	std::vector<std::pair<size_t, size_t>> out;
-	for ( size_t i = 0; i < s.size(); ) {
-		if ( !is_space( s[i] ) && !is_mark( s[i] ) ) { ++i; continue; }
-		size_t j = i;
-		bool has = false;
-		while ( j < s.size() && ( is_space( s[j] ) || is_mark( s[j] ) ) ) { has |= is_mark( s[j] ); ++j; }
-		if ( has ) {
-			// the run's leading whitespace belongs to the match, its trailing whitespace too; a whitespace-only stretch
-			// before the first mark that isn't followed by one can't occur inside a run
-			out.emplace_back( i, j );
-		}
-		i = j;
-	}
-	return out;
-}
-
-void preserve_line( const std::u32string& line0, int num, std::vector<std::u32string>& chunks, std::vector<Mark>& marks ) {
-	std::u32string line = line0;
-	const auto runs = mark_runs( line );
-	if ( runs.empty() ) { chunks.push_back( line ); return; }
-	if ( runs.size() == 1 && runs[0].first == 0 && runs[0].second == line.size() ) { marks.push_back( { num, line, 'A' } ); return; }
-	std::vector<Mark> ms;
-	for ( size_t k = 0; k < runs.size(); ++k ) {
-		const std::u32string g = line.substr( runs[k].first, runs[k].second - runs[k].first );
-		char position = 'I';
-		if ( k == 0 && starts_with( line, g ) ) { position = 'B'; }
-		else if ( k + 1 == runs.size() && ends_with( line, g ) ) { position = 'E'; }
-		ms.push_back( { num, g, position } );
-	}
-	for ( const Mark& m : ms ) {
-		// line.split(mark): the text before its first occurrence, and the rest
-		const size_t at = line.find( m.mark );
-		if ( at == std::u32string::npos ) { chunks.push_back( line ); line.clear(); continue; }
-		chunks.push_back( line.substr( 0, at ) );
-		line = line.substr( at + m.mark.size() );
-	}
-	chunks.push_back( line );
-	marks.insert( marks.end(), ms.begin(), ms.end() );
-}
-
-std::vector<std::u32string> restore( std::vector<std::u32string> text, std::vector<Mark> marks ) {
-	// Punctuation.restore with the default separator (word " ") and strip=True
-	const std::u32string sep = U" ";
-	std::vector<std::u32string> out;
-	int pos = 0;
-	size_t mi = 0, ti = 0;
-	while ( ti < text.size() || mi < marks.size() ) {
-		if ( mi == marks.size() ) {
-			for ( ; ti < text.size(); ++ti ) { out.push_back( text[ti] ); }
-		} else if ( ti == text.size() ) {
-			std::u32string all;
-			for ( ; mi < marks.size(); ++mi ) { all += marks[mi].mark; }
-			out.push_back( all );
-		} else {
-			const Mark& cur = marks[mi];
-			if ( cur.index == pos ) {
-				const std::u32string mark = cur.mark;   // re.sub(' ', ' ', ...)
-				++mi;
-				if ( ends_with( text[ti], sep ) ) { text[ti] = text[ti].substr( 0, text[ti].size() - sep.size() ); }
-				if ( cur.position == 'B' ) {
-					text[ti] = mark + text[ti];
-				} else if ( cur.position == 'E' ) {
-					out.push_back( text[ti] + mark );
-					++ti;
-					++pos;
-				} else if ( cur.position == 'A' ) {
-					out.push_back( mark );
-					++pos;
-				} else if ( ti + 1 == text.size() ) {
-					text[ti] = text[ti] + mark;
-				} else {
-					const std::u32string first = text[ti];
-					++ti;
-					text[ti] = first + mark + text[ti];
-				}
-			} else {
-				out.push_back( text[ti] );
-				++ti;
-				++pos;
-			}
-		}
-	}
-	return out;
-}
-
-// espeak.py _postprocess_line with stress kept, no tie, the default separator and strip=True
-std::u32string postprocess_line( std::u32string line ) {
-	line = replace_all( replace_all( strip( line ), U"\n", U" " ), U"  ", U" " );
-	std::u32string a;
-	for ( char32_t c : line ) { if ( !( c == U'_' && !a.empty() && a.back() == U'_' ) ) { a += c; } }   // _+ -> _
-	line = replace_all( a, U"_ ", U" " );
-	// remove-flags: every \(.+?\)
-	std::u32string b;
-	for ( size_t i = 0; i < line.size(); ) {
-		if ( line[i] == U'(' ) {
-			const size_t close = line.find( U')', i + 2 );
-			if ( i + 1 < line.size() && line[i + 1] != U'\n' && close != std::u32string::npos && line.find( U'\n', i + 1 ) > close ) { i = close + 1; continue; }
-		}
-		b += line[i++];
-	}
-	line = b;
-	if ( line.empty() ) { return line; }
-	std::u32string out;
-	size_t i = 0;
-	while ( true ) {
-		const size_t j = line.find( U' ', i );
-		std::u32string word = strip( line.substr( i, j == std::u32string::npos ? std::u32string::npos : j - i ) );
-		word = replace_all( word, U"_", U"" );
-		out += word + U" ";
-		if ( j == std::u32string::npos ) { break; }
-		i = j + 1;
-	}
-	out.pop_back();
-	return out;
-}
-
-std::once_flag espeak_once;
-bool espeak_ok = false;
 
 }  // namespace
 
@@ -282,56 +139,29 @@ std::string G2P::coerce_language( const std::string& lang ) {
 	return lang;
 }
 
+G2P::G2P() = default;
+G2P::~G2P() = default;
+
 bool G2P::init( const std::vector<std::string>& vocab ) {
 	for ( size_t i = 0; i < vocab.size(); ++i ) {
 		const std::u32string c = utf8_to_u32( vocab[i] );
 		if ( c.size() == 1 ) { ids_[c[0]] = static_cast<int>( i ) + 1; }
 	}
-	std::call_once( espeak_once, [] {
-		espeak_ok = espeak_Initialize( AUDIO_OUTPUT_SYNCHRONOUS, 0, nullptr, 0 ) > 0;
-	} );
-	if ( !espeak_ok ) {
-		LOG_ERROR( "g2p: espeak-ng failed to initialize" );
-		return false;
-	}
-	// wrapper.py set_voice: the first listed voice of each language code (a voice's first language, after its priority byte)
-	for ( const espeak_VOICE** v = espeak_ListVoices( nullptr ); v && *v; ++v ) {
-		if ( !( *v )->languages || !( *v )->identifier ) { continue; }
-		const std::string code = ( *v )->languages + 1;
-		voices_.emplace( code, ( *v )->identifier );
-	}
 	return true;
 }
 
-bool G2P::set_voice( const std::string& code ) {
-	if ( code == voice_ ) { return true; }
-	const auto it = voices_.find( code );
-	if ( it == voices_.end() ) {
-		LOG_ERROR( "g2p: espeak has no voice for \"%s\"", code.c_str() );
-		return false;
-	}
-	if ( espeak_SetVoiceByName( it->second.c_str() ) != EE_OK ) {
-		LOG_ERROR( "g2p: failed to load the voice for \"%s\"", code.c_str() );
-		return false;
-	}
-	voice_ = code;
-	return true;
-}
-
-std::string G2P::espeak_phonemes( const std::string& text ) {
-	// wrapper.py text_to_phonemes: UTF-8 in, IPA out with '_' between phonemes, a clause per call, joined by spaces
-	const void* p = text.c_str();
-	std::string out;
-	bool first = true;
-	while ( p ) {
-		const char* ph = espeak_TextToPhonemes( &p, espeakCHARS_UTF8, ( '_' << 8 ) | 0x02 );
-		if ( ph && *ph ) {
-			if ( !first ) { out += ' '; }
-			out += ph;
-			first = false;
+const propan2ol::Phonemizer* G2P::phonemizer( const std::string& code ) {
+	auto it = phonemizers_.find( code );
+	if ( it == phonemizers_.end() ) {
+		std::string error;
+		auto p = propan2ol::Phonemizer::create( propan2ol::DEFAULT_PROFILE, code, &error );
+		if ( !p ) {
+			LOG_ERROR( "g2p: no phonemizer for \"%s\": %s", code.c_str(), error.c_str() );
+			return nullptr;
 		}
+		it = phonemizers_.emplace( code, std::move( p ) ).first;
 	}
-	return out;
+	return it->second.get();
 }
 
 std::string G2P::phonemize( const std::string& text_in, const std::string& language ) {
@@ -350,21 +180,21 @@ std::string G2P::phonemize( const std::string& text_in, const std::string& langu
 		}
 		text = u32_to_utf8( t );
 	}
-	if ( !set_voice( lang ) ) { return ""; }
-	// BaseBackend.phonemize with preserve_punctuation: the pieces between runs of marks, each phonemized as a line
-	std::vector<std::u32string> chunks;
-	std::vector<Mark> marks;
-	preserve_line( utf8_to_u32( text ), 0, chunks, marks );
-	std::vector<std::u32string> kept;
-	for ( auto& c : chunks ) { if ( !c.empty() ) { kept.push_back( c ); } }
-	std::vector<std::u32string> phonemized;
-	for ( const auto& c : kept ) { phonemized.push_back( postprocess_line( utf8_to_u32( espeak_phonemes( u32_to_utf8( c ) ) ) ) ); }
-	const auto lines = restore( phonemized, marks );
+	const propan2ol::Phonemizer* phonemizer = this->phonemizer( lang );
+	if ( !phonemizer ) { return ""; }
+	// vall_e's backend: EspeakBackend( language, preserve_punctuation=True, with_stress=True ).phonemize( [text], strip=True ), the
+	// language-switch flags removed
+	propan2ol::Options o;
+	o.preserve_punctuation = true;
+	o.with_stress = true;
+	o.strip = true;
+	o.language_switch = propan2ol::LanguageSwitch::RemoveFlags;
+	const std::vector<std::string> lines = phonemizer->phonemize( std::vector<std::string>{ text }, o );
 	if ( lines.empty() ) {
 		LOG_ERROR( "g2p: nothing to phonemize in \"%s\"", text_in.c_str() );
 		return "";
 	}
-	std::u32string ph = lines[0];   // encode() keeps the first of phonemize()'s outputs
+	std::u32string ph = utf8_to_u32( lines[0] );   // encode() keeps the first of phonemize()'s outputs
 	if ( lang == "cmn-latn-pinyin" ) {
 		for ( char32_t& c : ph ) {
 			switch ( c ) {

@@ -8,14 +8,15 @@ volta_server serves it as `POST /v1/audio/speech` (see CONFIG.md, the `tts` sect
 
 | Piece | Source | What it reproduces |
 |---|---|---|
-| Text front-end | src/tts/g2p.cpp | vall_e/emb/g2p.py `encode` and phonemizer 3.3's espeak backend, through libespeak-ng |
+| Text front-end | src/tts/g2p.cpp | vall_e/emb/g2p.py `encode` over propan2ol (deps/propan2ol: espeak-ng 1.52.0's phonemizing and phonemizer 3.3's espeak backend, ported) |
 | Model | src/tts/tts_model.cpp, tts_backbone.cpp, tts_flow.cpp | vall_e/model.py: the backbone, the length head, the flow head and the demasking loop with guidance |
 | Codec | src/tts/codec.cpp | the NeMo codec's HiFi-GAN encoder, FSQ and HiFi-GAN decoder, in FP32 |
 | Pipeline | src/tts/tts.cpp, audio.cpp | vall_e/tts.py `TTS.generate`: the prompt (mono, resampled as torchaudio does, its first 10 s), sentence splitting past 160 phonemes, trailing-silence trimming, pauses; WAV files in and out |
 
 The model and the codec are host code over the backend's TTS operators (engine/modules/tts.h: `TtsOps`, `CodecOps`): src/backend/cuda/modules/tts.cu
 on CUDA and ROCm, src/backend/vulkan/mod_tts.cpp with src/kernels/slang/tts.slang on Vulkan. They build in the CUDA, ROCm and Vulkan configurations;
-the front-end, the pipeline and the endpoint need libespeak-ng at build time (`ENGINE_TTS`; GPL-3.0, which the AGPL-3.0 allows combining with).
+the front-end, the pipeline and the endpoint need propan2ol (`ENGINE_TTS`): the deps/propan2ol submodule (`git submodule update --init`), or an
+installed one found through its package config. It is GPL-3.0-or-later, which the AGPL-3.0 allows combining with, and has its data built in.
 
 ## Files
 

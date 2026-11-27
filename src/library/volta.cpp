@@ -169,7 +169,7 @@ struct Engine::Impl {
 #else
 		( void )request_json;
 		( void )out;
-		*error = "this libvolta was built without libespeak-ng: no speech";
+		*error = "this libvolta was built without propan2ol: no speech";
 		return false;
 #endif
 	}
@@ -270,7 +270,7 @@ std::unique_ptr<Engine> Engine::create( const std::string& config_json, std::str
 			return nullptr;
 		}
 #else
-		*error = "this libvolta was built without libespeak-ng: no speech";
+		*error = "this libvolta was built without propan2ol: no speech";
 		return nullptr;
 #endif
 	}
@@ -370,7 +370,7 @@ bool Engine::add_voice( const std::string& name, const std::vector<float>& pcm, 
 	( void )name;
 	( void )pcm;
 	( void )sample_rate;
-	*error = "this libvolta was built without libespeak-ng: no speech";
+	*error = "this libvolta was built without propan2ol: no speech";
 	return false;
 #endif
 }

@@ -5,6 +5,7 @@
 CUDA 12.x (13+ drops SM_70) and CMake 3.24+ with Ninja. The CUDA build is the primary one:
 
 ```
+git submodule update --init   # deps/json and deps/propan2ol (the TTS text front-end)
 cmake -S . -B build -G Ninja && cmake --build build
 ```
 
