@@ -135,6 +135,12 @@ std::vector<int> sample_video_frames( const VisionParams& p, int total, double f
 	std::vector<int> out;
 	if ( total < 1 ) return out;
 	if ( !( fps > 0.0 ) ) fps = 24.0;
+	if ( p.gemma ) {
+		// default_sample_indices_fn: num_frames at i * total // num_frames (every frame of a shorter video)
+		const int n = std::min( std::max( 1, p.video_max_frames ), total );
+		for ( int i = 0; i < n; ++i ) out.push_back( static_cast<int>( static_cast<int64_t>( i ) * total / n ) );
+		return out;
+	}
 	if ( !p.canvas ) {
 		// Qwen3VLVideoProcessor.sample_frames: video_fps frames a second, evenly spaced and rounded
 		int n = static_cast<int>( total / fps * p.video_fps );
@@ -280,6 +286,26 @@ void prepare_video_step( const DecodedImage& a, const DecodedImage& b, const Vid
 	out->hash = hash_bytes( dims, sizeof( dims ), hash_bytes( b.rgb.data(), b.rgb.size(), hash_bytes( a.rgb.data(), a.rgb.size() ) ) );
 }
 
+VisionParams gemma_video_frame_params( const VisionParams& p ) {
+	VisionParams f = p;
+	f.max_tokens = std::min( p.video_frame_tokens, p.max_tokens );
+	return f;
+}
+
+std::vector<int> gemma_video_pick( const DecodedImage& first, int count, const VisionParams& p, int max_tokens, std::string* error ) {
+	PreparedImage probe;
+	if ( !prepare_image( first, gemma_video_frame_params( p ), &probe, error ) ) return {};
+	const int per = std::max( 1, probe.tokens( p.merge_size ) );
+	const int n = std::min( { count, std::max( 1, p.video_max_frames ), max_tokens / per } );
+	if ( n < 1 ) {
+		if ( error ) *error = "the video does not fit the video token budget (max_video_tokens)";
+		return {};
+	}
+	std::vector<int> pick;
+	for ( int i = 0; i < n; ++i ) pick.push_back( n == count ? i : static_cast<int>( std::nearbyint( linspace_at( 0.0, count - 1, n, i ) ) ) );
+	return pick;
+}
+
 bool prepare_video( const VideoFrames& video, const VisionParams& p, int max_tokens, PreparedVideo* out, std::string* error ) {
 	const auto& frames = video.frames;
 	if ( frames.empty() ) {
@@ -289,6 +315,19 @@ bool prepare_video( const VideoFrames& video, const VisionParams& p, int max_tok
 	if ( video.times.size() != frames.size() ) {
 		if ( error ) *error = "a video needs one time per frame";
 		return false;
+	}
+	if ( p.gemma ) {
+		// Gemma 4: each frame an image of its own
+		const std::vector<int> pick = gemma_video_pick( frames[0], static_cast<int>( frames.size() ), p, max_tokens, error );
+		if ( pick.empty() ) return false;
+		const VisionParams fp = gemma_video_frame_params( p );
+		out->steps.assign( pick.size(), PreparedImage() );
+		out->times.assign( pick.size(), 0.0 );
+		for ( size_t k = 0; k < pick.size(); ++k ) {
+			if ( !prepare_image( frames[pick[k]], fp, &out->steps[k], error ) ) return false;
+			out->times[k] = video.times[pick[k]];
+		}
+		return true;
 	}
 	for ( const DecodedImage& f : frames ) {
 		if ( f.width != frames[0].width || f.height != frames[0].height || f.rgb.size() != static_cast<size_t>( f.width ) * f.height * 3 ) {

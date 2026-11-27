@@ -151,6 +151,8 @@ public:
 	// True when the vision_cpu tower on the host encodes the images: any thread may call encode_image then, unlike with the on-GPU tower
 	bool host_vision() const { return host_vision_ != nullptr; }
 	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out );
+	bool encode_audio( const engine::loader::PreparedAudio& audio, std::vector<backend::half_t>* out );
+	const engine::loader::AudioParams* audio_params() const { return models_[0]->audio_params(); }
 	void checkpoint( int slot );
 	void rollback( int slot );
 	void set_spec_snapshot( bool on );

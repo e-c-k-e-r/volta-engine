@@ -265,7 +265,117 @@ void vision_bias_act(uint3 tid : SV_DispatchThreadID, uniform BiasActParams p) {
 		let e = 1.0f - poly * exp(-a * a);
 		v = 0.5f * v * (1.0f + (z < 0.0f ? -e : e));
 	}
+	else if (p.act == 3) {
+		v = v / (1.0f + exp(-v));
+	}
 	p.x[i] = half(v);
+}
+
+// Gemma 4's clipped linears: x = clamp( x, lo, hi ) in place
+struct ClampParams { half* x; int64_t n; float lo; float hi; };
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void vision_clamp(uint3 tid : SV_DispatchThreadID, uniform ClampParams p) {
+	let i = int64_t(tid.x) + int64_t(tid.y) * 65535 * 256;
+	if (i >= p.n) return;
+	p.x[i] = half(min(max(float(p.x[i]), p.lo), p.hi));
+}
+
+// Gemma 4's audio subsampler layer: one group per output position (row, frequency), a thread per channel (O <= 256): the 3x3 stride-2 taps over the
+// input channels (in [T, F, C], w [O, C, 3, 3], FP32), then the channel LayerNorm (gain g) and ReLU (vsum256)
+struct ConvLnReluParams { float* in_; float* w; float* g; float* out_; int T; int F; int C; int O; float eps; };
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void vision_conv_ln_relu(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform ConvLnReluParams p) {
+	let o = int(tid.x);
+	let Fo = (p.F + 1) / 2;
+	let pos = int(gid.x) + int(gid.y) * 65535;
+	if (pos >= ((p.T + 1) / 2) * Fo) return;
+	let t = pos / Fo;
+	let f = pos % Fo;
+	float acc = 0.0f;
+	if (o < p.O) {
+		for (int ky = 0; ky < 3; ++ky) {
+			let ti = 2 * t - 1 + ky;
+			if (ti < 0 || ti >= p.T) continue;
+			for (int kx = 0; kx < 3; ++kx) {
+				let fi = 2 * f - 1 + kx;
+				if (fi < 0 || fi >= p.F) continue;
+				let src = (int64_t(ti) * p.F + fi) * p.C;
+				let wk = int64_t(o) * p.C * 9 + ky * 3 + kx;
+				for (int c = 0; c < p.C; ++c) acc += p.w[wk + c * 9] * p.in_[src + c];
+			}
+		}
+	}
+	let mean = vsum256(o, o < p.O ? acc : 0.0f) / float(p.O);
+	let d = o < p.O ? acc - mean : 0.0f;
+	let inv = rsqrt(vsum256(o, d * d) / float(p.O) + p.eps);
+	if (o < p.O) p.out_[int64_t(pos) * p.O + o] = max(0.0f, d * inv * p.g[o]);
+}
+
+// Gemma 4's audio light conv: the GLU of x [T, 2D] through a causal depthwise convolution of K taps (w [D, K]), one thread per output
+struct GluDwconvParams { half* x; half* w; half* out_; int64_t total; int D; int K; };
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void vision_glu_dwconv(uint3 tid : SV_DispatchThreadID, uniform GluDwconvParams p) {
+	let i = int64_t(tid.x) + int64_t(tid.y) * 65535 * 256;
+	if (i >= p.total) return;
+	let t = int(i / p.D);
+	let c = int(i % p.D);
+	float acc = 0.0f;
+	for (int k = 0; k < p.K; ++k) {
+		let r = t - p.K + 1 + k;
+		if (r < 0) continue;
+		let a = float(p.x[int64_t(r) * 2 * p.D + c]);
+		let g = float(p.x[int64_t(r) * 2 * p.D + p.D + c]);
+		acc += float(p.w[int64_t(c) * p.K + k]) * a / (1.0f + exp(-g));
+	}
+	p.out_[i] = half(acc);
+}
+
+// Gemma 4's audio attention, one thread per (row, head): row t attends to rows t - window + 1 .. t, score = cap * tanh( ( q'·k * k_scale + q'·rel[t - j] )
+// / cap ) with q' = q * q_scale; window <= 32
+struct LocalRelAttnParams { half* q; half* k; half* v; float* q_scale; float* rel; half* out_; int T; int heads; int hd; int window; float k_scale; float cap; };
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void vision_local_rel_attention(uint3 tid : SV_DispatchThreadID, uniform LocalRelAttnParams p) {
+	let idx = int(tid.x);
+	if (idx >= p.T * p.heads) return;
+	let t = idx / p.heads;
+	let h = idx % p.heads;
+	let HD = p.heads * p.hd;
+	let qo = int64_t(t) * HD + h * p.hd;
+	float s[32];
+	let n = min(p.window, t + 1);
+	float mx = -3.0e38f;
+	for (int d = 0; d < n; ++d) {
+		let ko = int64_t(t - d) * HD + h * p.hd;
+		let ro = int64_t(d) * HD + h * p.hd;
+		float ac = 0.0f;
+		float bd = 0.0f;
+		for (int e = 0; e < p.hd; ++e) {
+			let qe = float(p.q[qo + e]) * p.q_scale[e];
+			ac += qe * float(p.k[ko + e]);
+			bd += qe * p.rel[ro + e];
+		}
+		s[d] = p.cap * tanh((ac * p.k_scale + bd) / p.cap);
+		mx = max(mx, s[d]);
+	}
+	float sum = 0.0f;
+	for (int d = 0; d < n; ++d) {
+		s[d] = exp(s[d] - mx);
+		sum += s[d];
+	}
+	let inv = 1.0f / sum;
+	for (int e = 0; e < p.hd; ++e) {
+		float acc = 0.0f;
+		for (int d = 0; d < n; ++d) acc += s[d] * float(p.v[int64_t(t - d) * HD + h * p.hd + e]);
+		p.out_[qo + e] = half(acc * inv);
+	}
 }
 
 struct BiasResidualParams { float* hidden; half* y; half* bias; int64_t total; int n; };

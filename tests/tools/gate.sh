@@ -113,6 +113,10 @@ tier2_models() {
 	# out of the gate until a Gemma 4 checkpoint is kept again
 	# run tokenizer_cases_gemma ./test_tokenizer_file $(model_dir ENGINE_TEST_GEMMA_DIR) --cases $ROOT/tests/data/tokenizer_cases_gemma4.json
 	run dsv41_encoding ./test_dsv41_encoding $DSV41
+	# Gemma 4 E4B's image and audio towers against llama.cpp's encoders (the GGUF directory with its mmproj file)
+	local E4B=$(model_dir ENGINE_TEST_GEMMA_E4B_DIR)
+	run gemma4_audio gpu ./test_gemma4_audio $E4B $ROOT/tests/data/speech_en_16k.wav $ROOT/tests/data/gemma4_e4b_audio.json
+	run gemma4_vision_e4b gpu ./test_gemma4_vision $E4B --llama $ROOT/tests/data/gemma4_e4b_image.json $ROOT/tests/data/image_shapes_624x480.png
 	# DeepSeek-V4.1 weights: out of the gate until a quantized checkpoint is kept again (the role names the original, for its tokenizer and encoding/)
 	# the vision tower against the checkpoint reference (FP32): the goldens come from the reference's torch code (needs the exllamav3 venv), made once
 	# local vg=$ROOT/results/dsv41_vision_golden

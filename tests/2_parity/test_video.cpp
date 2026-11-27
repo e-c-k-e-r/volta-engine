@@ -1,5 +1,5 @@
-// Video preprocessing against transformers' video processors (tests/tools/gen_video_goldens.py): Qwen3-VL's and GLM-5's frame samples and
-// canvases, the engine's token budget, a step's temporal patch layout and times, and (with FFmpeg) a decoded clip's steps
+// Video preprocessing against transformers' video processors (tests/tools/gen_video_goldens.py): Qwen3-VL's, GLM-5's and Gemma 4's frame samples,
+// Qwen3-VL's and GLM-5's canvases, the engine's token budget, a step's temporal patch layout and times, and (with FFmpeg) a decoded clip's steps
 #include "engine/loader/video.h"
 
 #include <nlohmann/json.hpp>
@@ -92,6 +92,16 @@ int main() {
 		std::vector<int> want = c["frames"].get<std::vector<int>>();
 		if ( want.empty() ) want = { 0, 0 };   // the processor samples nothing from a clip shorter than an interval; the engine takes its first frame
 		check( got == want, "glm sample " + std::to_string( c["total"].get<int>() ) + " frames at " + c["fps"].dump() + " fps, " + c["duration"].dump() + " s -> " + std::to_string( got.size() ) );
+	}
+	{
+		VisionParams p;
+		p.gemma = true;
+		p.video = true;
+		p.video_max_frames = 32;
+		for ( const auto& c : cases["gemma_sample"] ) {
+			const std::vector<int> got = engine::loader::sample_video_frames( p, c["total"].get<int>(), 30.0, 0.0 );
+			check( got == c["frames"].get<std::vector<int>>(), "gemma sample " + std::to_string( c["total"].get<int>() ) + " frames -> " + std::to_string( got.size() ) );
+		}
 	}
 	for ( const char* family : { "qwen_canvas", "glm_canvas" } ) {
 		const VisionParams& p = family[0] == 'q' ? qp : gp;

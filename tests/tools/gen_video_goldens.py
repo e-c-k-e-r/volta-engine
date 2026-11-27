@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Writes tests/data/video_cases.json and tests/data/video_rgb.mp4: frame samples and canvases of transformers' video processors
-(video_processing_qwen3_vl.py with cap_pixels_per_frame, video_processing_glm5_next.py; their functions restated here without torch) and a
+(video_processing_qwen3_vl.py with cap_pixels_per_frame, video_processing_glm5_next.py, Gemma 4's default sampler; their functions restated
+here without torch) and a
 three-second clip of solid red, green and blue seconds (FFmpeg's command line)."""
 import json, math, os, subprocess
 import numpy as np
@@ -92,7 +93,14 @@ def glm_canvas(n, height, width):
 		scale = min(1.0, scale)
 	return ah, aw, max(1, min(ah, math.floor(height * scale))), max(1, min(aw, math.floor(width * scale)))
 
-cases = {"qwen_sample": [], "glm_sample": [], "qwen_canvas": [], "glm_canvas": []}
+def gemma_sample(total, num_frames=32):
+	# default_sample_indices_fn with Gemma4VideoProcessor's num_frames (it refuses a shorter video; the engine takes all of its frames)
+	n = min(num_frames, total)
+	return (np.arange(n, dtype=int) * total // n).tolist()
+
+cases = {"qwen_sample": [], "glm_sample": [], "gemma_sample": [], "qwen_canvas": [], "glm_canvas": []}
+for total in [300, 32, 20, 1000, 241]:
+	cases["gemma_sample"].append({"total": total, "frames": gemma_sample(total)})
 for total, fps in [(300, 30), (90, 30), (10, 30), (5000, 25), (61, 29.97), (3, 24), (100000, 30)]:
 	cases["qwen_sample"].append({"total": total, "fps": fps, "frames": qwen_sample(total, fps)})
 for total, fps, dur in [(300, 30, 10.0), (90, 30, 3.0), (10, 30, 0.34), (5000, 25, 200.0), (61, 29.97, 2.035), (7, 2, 3.5), (30000, 30, 1000.0), (300, 30, 0)]:

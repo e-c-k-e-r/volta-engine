@@ -6,7 +6,9 @@
 #include "engine/loader/image.h"
 #include "engine/loader/safetensors.h"
 #include "engine/backend/types.h"
+#include "engine/backend/numeric.h"
 #include <nlohmann/json.hpp>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -38,6 +40,71 @@ inline nlohmann::json read_json( const std::string& path ) {
 	std::ifstream f( path );
 	if ( !f ) return nlohmann::json::value_t::discarded;
 	return nlohmann::json::parse( std::string( std::istreambuf_iterator<char>( f ), std::istreambuf_iterator<char>() ), nullptr, false );
+}
+
+// A clipped projection's ranges (Gemma 4's Gemma4ClippableLinear): the input and the output clamped, each side on when the checkpoint gives it
+struct ClipRange {
+	float in_lo = -3.0e38f, in_hi = 3.0e38f, out_lo = -3.0e38f, out_hi = 3.0e38f;
+	bool in() const { return in_lo > -3.0e38f || in_hi < 3.0e38f; }
+	bool out() const { return out_lo > -3.0e38f || out_hi < 3.0e38f; }
+	bool same_input( const ClipRange& o ) const { return in_lo == o.in_lo && in_hi == o.in_hi; }
+};
+
+// A scalar tensor of the repo (F32, BF16 or FP16), fallback when it is missing
+inline float repo_scalar( const engine::loader::SafeTensorsRepo& repo, const std::string& name, float fallback ) {
+	const pod::SafeTensorMeta* m = repo.find( name.c_str() );
+	const void* p = m ? repo.cpu_data( name.c_str() ) : nullptr;
+	if ( !p ) return fallback;
+	if ( m->dtype == pod::DType::FP32 ) {
+		float v;
+		std::memcpy( &v, p, 4 );
+		return v;
+	}
+	uint16_t h;
+	std::memcpy( &h, p, 2 );
+	if ( m->dtype == pod::DType::BF16 ) {
+		const uint32_t u = static_cast<uint32_t>( h ) << 16;
+		float v;
+		std::memcpy( &v, &u, 4 );
+		return v;
+	}
+	return m->dtype == pod::DType::FP16 ? backend::to_float( *reinterpret_cast<const backend::half_t*>( p ) ) : fallback;
+}
+
+// A tensor of the repo (F32, BF16 or FP16) as FP32 on the host; false when it is missing or of another type
+inline bool repo_host_floats( const engine::loader::SafeTensorsRepo& repo, const std::string& name, std::vector<float>* out ) {
+	const pod::SafeTensorMeta* m = repo.find( name.c_str() );
+	const void* p = m ? repo.cpu_data( name.c_str() ) : nullptr;
+	if ( !p ) return false;
+	size_t n = 1;
+	for ( int d = 0; d < m->ndim; ++d ) n *= static_cast<size_t>( m->shape[d] );
+	out->resize( n );
+	if ( m->dtype == pod::DType::FP32 ) {
+		std::memcpy( out->data(), p, n * 4 );
+		return true;
+	}
+	if ( m->dtype != pod::DType::BF16 && m->dtype != pod::DType::FP16 ) return false;
+	const auto* h = static_cast<const uint16_t*>( p );
+	for ( size_t i = 0; i < n; ++i ) {
+		if ( m->dtype == pod::DType::BF16 ) {
+			const uint32_t u = static_cast<uint32_t>( h[i] ) << 16;
+			std::memcpy( &( *out )[i], &u, 4 );
+		}
+		else {
+			( *out )[i] = backend::to_float( *reinterpret_cast<const backend::half_t*>( &h[i] ) );
+		}
+	}
+	return true;
+}
+
+// The ranges of the clipped projection under `base` (its .input_min / .input_max / .output_min / .output_max)
+inline ClipRange repo_clip( const engine::loader::SafeTensorsRepo& repo, const std::string& base ) {
+	ClipRange c;
+	c.in_lo = repo_scalar( repo, base + ".input_min", c.in_lo );
+	c.in_hi = repo_scalar( repo, base + ".input_max", c.in_hi );
+	c.out_lo = repo_scalar( repo, base + ".output_min", c.out_lo );
+	c.out_hi = repo_scalar( repo, base + ".output_max", c.out_hi );
+	return c;
 }
 
 // 2-D rotary tables of a patch grid in merge order: [h * w, head_dim] cos / sin (rotate_half layout; half the head dimension

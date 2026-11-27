@@ -216,6 +216,43 @@ int main( int argc, char** argv ) {
 		emit( "vis_bias_residual", dlf( hidden, static_cast<size_t>( m ) * nn ) );
 	}
 
+	{ // Gemma 4's audio tower: SiLU, the clipped projections' clamp, the GLU through the causal depthwise taps, the local attention with relative
+	  // position keys and a softcap, a subsampler layer
+		const int m = 19, nn = 56;
+		half_t* x = up( rh( rng, static_cast<size_t>( m ) * nn, 3.0f ) );
+		Vision::bias_act( x, nullptr, m, nn, Vision::ACT_SILU );
+		emit( "vis_bias_act_silu", dl( x, static_cast<size_t>( m ) * nn ) );
+		half_t* c = up( rh( rng, static_cast<size_t>( m ) * nn, 4.0f ) );
+		Vision::clamp( c, static_cast<size_t>( m ) * nn, -1.25f, 2.5f );
+		emit( "vis_clamp", dl( c, static_cast<size_t>( m ) * nn ) );
+
+		const int T = 37, D = 48, K = 5;
+		half_t* gx = up( rh( rng, static_cast<size_t>( T ) * 2 * D, 2.0f ) );
+		half_t* gw = up( rh( rng, static_cast<size_t>( D ) * K, 0.5f ) );
+		half_t* go = zeros<half_t>( static_cast<size_t>( T ) * D );
+		Vision::glu_dwconv( gx, gw, go, T, D, K );
+		emit( "vis_glu_dwconv", dl( go, static_cast<size_t>( T ) * D ) );
+
+		const int heads = 3, hd = 32, window = 12;
+		half_t* q = up( rh( rng, static_cast<size_t>( T ) * heads * hd, 1.0f ) );
+		half_t* k = up( rh( rng, static_cast<size_t>( T ) * heads * hd, 1.0f ) );
+		half_t* v = up( rh( rng, static_cast<size_t>( T ) * heads * hd, 1.0f ) );
+		float* qs = up( rf( rng, hd, 0.5f ) );
+		float* rel = up( rf( rng, static_cast<size_t>( window ) * heads * hd, 0.5f ) );
+		half_t* ao = zeros<half_t>( static_cast<size_t>( T ) * heads * hd );
+		Vision::local_rel_attention( q, k, v, qs, 1.9f, rel, ao, T, heads, hd, window, 5.0f );
+		emit( "vis_local_rel_attention", dl( ao, static_cast<size_t>( T ) * heads * hd ) );
+
+		const int ct = 13, cf = 10, cc = 6, co = 24;
+		float* cin = up( rf( rng, static_cast<size_t>( ct ) * cf * cc, 1.0f ) );
+		float* cw = up( rf( rng, static_cast<size_t>( co ) * cc * 9, 0.5f ) );
+		float* cg = up( rf( rng, co, 1.0f ) );
+		const size_t cn = static_cast<size_t>( ( ct + 1 ) / 2 ) * ( ( cf + 1 ) / 2 ) * co;
+		float* cout = zeros<float>( cn );
+		Vision::conv_ln_relu( cin, cw, cg, cout, ct, cf, cc, co, 1e-6f );
+		emit( "vis_conv_ln_relu", dlf( cout, cn ) );
+	}
+
 	backend::device_sync();
 	for ( void* p : g_allocs ) backend::device_free( p );
 	std::printf( "%d outputs, %d failures\n", g_cases, g_fail );

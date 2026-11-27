@@ -7,6 +7,7 @@
 #include "engine/core/comm.h"
 #include "engine/core/batch.h"
 #include "engine/loader/image.h"
+#include "engine/loader/audio.h"
 #include "engine/backend/types.h"
 #include "engine/modules/steer.h"
 #include "engine/spec/tap_ring.h"
@@ -326,6 +327,11 @@ public:
 	virtual bool load_vision( const char* model_dir, backend::stream_t stream = nullptr ) { (void) model_dir; (void) stream; return false; }
 	virtual const engine::loader::VisionParams* vision_params() const { return nullptr; }
 	virtual bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) { (void) image; (void) out; (void) stream; return false; }
+	// Audio input (Gemma 4's small models): the audio encoder loads after the image encoder, rank 0; audio_params() is null when the model has
+	// none loaded
+	virtual bool load_audio( const char* model_dir, backend::stream_t stream = nullptr ) { (void) model_dir; (void) stream; return false; }
+	virtual const engine::loader::AudioParams* audio_params() const { return nullptr; }
+	virtual bool encode_audio( const engine::loader::PreparedAudio& audio, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) { (void) audio; (void) out; (void) stream; return false; }
 
 	// 5d. MTP head: a one-layer next-token predictor on the target's final hidden state (checkpoints that ship mtp.*). A step runs
 	// rows.count rows of one slot: row j takes the hidden row selected by hidden_mode and the embedding of tokens[j] (the token that

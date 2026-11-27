@@ -16,7 +16,8 @@ struct VideoFrames {
 };
 
 // A video cut for the vision tower: one prepared image per temporal patch (a pair of frames on one canvas; the tower attends within a step,
-// as the checkpoints' towers do over a video's frames), each with its time: Qwen3-VL the mean of its two frames', GLM-5 its first frame's
+// as the checkpoints' towers do over a video's frames), each with its time: Qwen3-VL the mean of its two frames', GLM-5 its first frame's;
+// Gemma 4: one image per frame, with its time
 struct PreparedVideo {
 	std::vector<PreparedImage> steps;
 	std::vector<double> times;
@@ -35,7 +36,7 @@ struct VideoPlan {
 
 // The frames the checkpoint's video processor samples from `total` frames at `fps` (duration: the container's, 0 = total / fps). Qwen3-VL:
 // video_fps per second evenly spaced, within [video_min_frames, video_max_frames]; GLM-5: one per 1 / video_fps seconds up to
-// video_max_frames, an even count
+// video_max_frames, an even count; Gemma 4: video_max_frames evenly spaced (all of a shorter video)
 std::vector<int> sample_video_frames( const VisionParams& p, int total, double fps, double duration );
 
 // The canvas of `count` frames of height x width and the frames that fit: the processor's budget (Qwen3-VL: frames x pixels within
@@ -49,6 +50,12 @@ void prepare_video_step( const DecodedImage& a, const DecodedImage& b, const Vid
 
 // Frames given with their times (all of one size), planned and cut into steps
 bool prepare_video( const VideoFrames& video, const VisionParams& p, int max_tokens, PreparedVideo* out, std::string* error );
+
+// Gemma 4 (VisionParams::gemma): a video's frames are images of their own, at most video_frame_tokens soft tokens each (the video processor's
+// max_soft_tokens), video_max_frames of them sampled evenly (num_frames). The image parameters of a frame, and the frames of `count` that fit
+// max_tokens given the first one (empty with *error set when none does)
+VisionParams gemma_video_frame_params( const VisionParams& p );
+std::vector<int> gemma_video_pick( const DecodedImage& first, int count, const VisionParams& p, int max_tokens, std::string* error );
 
 // A video file (any container and codec FFmpeg's libraries read) sampled as the checkpoint's processor samples, decoded one frame at a time
 // and cut into steps; false with *error set when the build has no FFmpeg

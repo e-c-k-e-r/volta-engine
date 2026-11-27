@@ -1,7 +1,8 @@
-// Video files through FFmpeg's libraries (libavformat, libavcodec, libswscale; built with ENGINE_FFMPEG where CMake finds them): the frame
-// count and rate from the container, the checkpoint processor's sample of frames, and the sampled frames decoded in order as RGB, two at a
-// time into a step (video.cpp)
+// Video and audio files through FFmpeg's libraries (libavformat, libavcodec, libswscale; built with ENGINE_FFMPEG where CMake finds them).
+// Video: the frame count and rate from the container, the checkpoint processor's sample of frames, and the sampled frames decoded in order as
+// RGB, two at a time into a step (video.cpp). Audio: the best audio stream decoded whole, its channels averaged (audio.cpp)
 #include "engine/loader/video.h"
+#include "engine/loader/audio.h"
 
 #if ENGINE_FFMPEG
 extern "C" {
@@ -12,6 +13,7 @@ extern "C" {
 }
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #endif
 
 namespace engine::loader {
@@ -62,7 +64,7 @@ struct Input {
 		}
 	}
 
-	bool open( const uint8_t* data, size_t size, std::string* error ) {
+	bool open( const uint8_t* data, size_t size, std::string* error, AVMediaType type = AVMEDIA_TYPE_VIDEO ) {
 		reader = { data, size, 0 };
 		constexpr int kBuffer = 1 << 16;
 		auto* buf = static_cast<uint8_t*>( av_malloc( kBuffer ) );
@@ -84,9 +86,10 @@ struct Input {
 			return false;
 		}
 		const AVCodec* codec = nullptr;
-		const int s = av_find_best_stream( fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0 );
+		const int s = av_find_best_stream( fmt, type, -1, -1, &codec, 0 );
+		const char* kind = type == AVMEDIA_TYPE_VIDEO ? "video" : "audio";
 		if ( s < 0 || !codec ) {
-			*error = s == AVERROR_DECODER_NOT_FOUND ? "no decoder for the video's codec" : "the file has no video stream";
+			*error = s == AVERROR_DECODER_NOT_FOUND ? std::string( "no decoder for the " ) + kind + " codec" : std::string( "the file has no " ) + kind + " stream";
 			return false;
 		}
 		st = fmt->streams[s];
@@ -155,13 +158,51 @@ bool decode_video( const uint8_t* data, size_t size, const VisionParams& p, int 
 	}
 	if ( total < 1 || width < 1 || height < 1 ) return fail( "the video has no frames" );
 	const std::vector<int> sampled = sample_video_frames( p, total, fps, duration );
+	std::vector<int> need;   // the source frames taken, in order (repeats where the sampler or an odd count repeats a frame)
+	std::function<bool( size_t, const DecodedImage& )> place;
 	VideoPlan plan;
-	if ( !plan_video( static_cast<int>( sampled.size() ), height, width, p, max_tokens, &plan, error ) ) return false;
-	// The source frames the steps take, in order (repeats where the sampler or an odd count repeats a frame)
-	std::vector<int> need( plan.frames.size() );
-	for ( size_t k = 0; k < need.size(); ++k ) need[k] = sampled[plan.frames[k]];
-	out->steps.assign( plan.steps(), PreparedImage() );
-	out->times.assign( plan.steps(), 0.0 );
+	DecodedImage first;
+	const VisionParams fp = gemma_video_frame_params( p );
+	std::vector<char> keep;
+	out->steps.clear();
+	out->times.clear();
+	if ( p.gemma ) {
+		// Gemma 4: each sampled frame an image; the first one sets the tokens a frame takes, and so how many fit the budget
+		need = sampled;
+		place = [&]( size_t k, const DecodedImage& img ) {
+			if ( k == 0 ) {
+				const std::vector<int> pick = gemma_video_pick( img, static_cast<int>( need.size() ), p, max_tokens, &why );
+				if ( pick.empty() ) return false;
+				keep.assign( need.size(), 0 );
+				for ( int i : pick ) keep[i] = 1;
+			}
+			if ( !keep[k] ) return true;
+			PreparedImage st;
+			if ( !prepare_image( img, fp, &st, &why ) ) return false;
+			out->steps.push_back( std::move( st ) );
+			out->times.push_back( need[k] / fps );
+			return true;
+		};
+	}
+	else {
+		if ( !plan_video( static_cast<int>( sampled.size() ), height, width, p, max_tokens, &plan, error ) ) return false;
+		need.resize( plan.frames.size() );
+		for ( size_t k = 0; k < need.size(); ++k ) need[k] = sampled[plan.frames[k]];
+		out->steps.assign( plan.steps(), PreparedImage() );
+		out->times.assign( plan.steps(), 0.0 );
+		place = [&]( size_t k, const DecodedImage& img ) {
+			const double t = need[k] / fps;
+			if ( k % 2 == 0 ) {
+				first = img;
+				out->times[k / 2] = t;
+			}
+			else {
+				prepare_video_step( first, img, plan, p, &out->steps[k / 2] );
+				if ( !p.canvas ) out->times[k / 2] = 0.5 * ( out->times[k / 2] + t );
+			}
+			return true;
+		};
+	}
 
 	Input in;
 	if ( !in.open( data, size, &why ) ) return fail( why );
@@ -170,21 +211,9 @@ bool decode_video( const uint8_t* data, size_t size, const VisionParams& p, int 
 	SwsContext* sws = nullptr;
 	size_t next = 0;
 	int index = 0;
-	bool ok = pkt && frm;
-	DecodedImage first, last;
+	bool ok = pkt && frm, placed = true;
+	DecodedImage last;
 	bool have_last = false;
-	auto place = [&]( const DecodedImage& img ) {
-		const size_t k = next++;
-		const double t = need[k] / fps;
-		if ( k % 2 == 0 ) {
-			first = img;
-			out->times[k / 2] = t;
-		}
-		else {
-			prepare_video_step( first, img, plan, p, &out->steps[k / 2] );
-			if ( !p.canvas ) out->times[k / 2] = 0.5 * ( out->times[k / 2] + t );
-		}
-	};
 	auto take = [&]( const AVFrame* f ) {
 		if ( next < need.size() && need[next] == index ) {
 			DecodedImage img;
@@ -192,7 +221,10 @@ bool decode_video( const uint8_t* data, size_t size, const VisionParams& p, int 
 				ok = false;
 				return;
 			}
-			while ( next < need.size() && need[next] == index ) place( img );
+			while ( ok && next < need.size() && need[next] == index ) {
+				placed = place( next++, img );
+				ok = placed;
+			}
 			last = std::move( img );
 			have_last = true;
 		}
@@ -210,16 +242,87 @@ bool decode_video( const uint8_t* data, size_t size, const VisionParams& p, int 
 	sws_freeContext( sws );
 	av_frame_free( &frm );
 	av_packet_free( &pkt );
+	if ( !placed ) return fail( why );
 	if ( !ok ) return fail( "a video frame could not be converted to RGB" );
 	if ( !have_last ) return fail( "no frame of the video decodes" );
 	// the container counted more frames than decode: the rest repeat the last one
-	while ( next < need.size() ) place( last );
+	while ( next < need.size() ) {
+		if ( !place( next, last ) ) return fail( why );
+		++next;
+	}
+	return true;
+}
+
+// One decoded audio frame's samples, channels averaged, appended to pcm
+bool append_mono( const AVFrame* f, std::vector<float>* pcm ) {
+	const auto fmt = static_cast<AVSampleFormat>( f->format );
+	const int ch = f->ch_layout.nb_channels, n = f->nb_samples;
+	if ( ch < 1 ) return false;
+	const bool planar = av_sample_fmt_is_planar( fmt ) != 0;
+	const AVSampleFormat packed = av_get_packed_sample_fmt( fmt );
+	auto sample = [&]( int i, int c ) -> double {
+		const uint8_t* base = planar ? f->extended_data[c] : f->extended_data[0];
+		const size_t at = planar ? static_cast<size_t>( i ) : static_cast<size_t>( i ) * ch + c;
+		switch ( packed ) {
+			case AV_SAMPLE_FMT_U8: return ( base[at] - 128.0 ) / 128.0;
+			case AV_SAMPLE_FMT_S16: return reinterpret_cast<const int16_t*>( base )[at] / 32768.0;
+			case AV_SAMPLE_FMT_S32: return reinterpret_cast<const int32_t*>( base )[at] / 2147483648.0;
+			case AV_SAMPLE_FMT_S64: return static_cast<double>( reinterpret_cast<const int64_t*>( base )[at] ) / 9223372036854775808.0;
+			case AV_SAMPLE_FMT_FLT: return reinterpret_cast<const float*>( base )[at];
+			case AV_SAMPLE_FMT_DBL: return reinterpret_cast<const double*>( base )[at];
+			default: return 0.0;
+		}
+	};
+	if ( packed != AV_SAMPLE_FMT_U8 && packed != AV_SAMPLE_FMT_S16 && packed != AV_SAMPLE_FMT_S32 && packed != AV_SAMPLE_FMT_S64 && packed != AV_SAMPLE_FMT_FLT &&
+	     packed != AV_SAMPLE_FMT_DBL ) {
+		return false;
+	}
+	for ( int i = 0; i < n; ++i ) {
+		double acc = 0.0;
+		for ( int c = 0; c < ch; ++c ) acc += sample( i, c );
+		pcm->push_back( static_cast<float>( acc / ch ) );
+	}
+	return true;
+}
+
+bool decode_audio_ffmpeg( const uint8_t* data, size_t size, std::vector<float>* pcm, int* rate, std::string* error ) {
+	std::string why;
+	Input in;
+	if ( !in.open( data, size, &why, AVMEDIA_TYPE_AUDIO ) ) {
+		if ( error ) *error = why;
+		return false;
+	}
+	*rate = in.dec->sample_rate;
+	pcm->clear();
+	AVPacket* pkt = av_packet_alloc();
+	AVFrame* frm = av_frame_alloc();
+	bool ok = pkt && frm && *rate > 0;
+	while ( ok && av_read_frame( in.fmt, pkt ) >= 0 ) {
+		if ( pkt->stream_index == in.st->index && avcodec_send_packet( in.dec, pkt ) >= 0 ) {
+			while ( ok && avcodec_receive_frame( in.dec, frm ) == 0 ) ok = append_mono( frm, pcm );
+		}
+		av_packet_unref( pkt );
+	}
+	if ( ok && avcodec_send_packet( in.dec, nullptr ) >= 0 ) {
+		while ( ok && avcodec_receive_frame( in.dec, frm ) == 0 ) ok = append_mono( frm, pcm );
+	}
+	av_frame_free( &frm );
+	av_packet_free( &pkt );
+	if ( !ok || pcm->empty() ) {
+		if ( error ) *error = ok ? "no audio samples decode" : "the audio's sample format is not read";
+		return false;
+	}
 	return true;
 }
 
 #else
 
 bool video_decoding_available() { return false; }
+
+bool decode_audio_ffmpeg( const uint8_t*, size_t, std::vector<float>*, int*, std::string* error ) {
+	if ( error ) *error = "this build reads WAV audio only (built without FFmpeg's libraries)";
+	return false;
+}
 
 bool decode_video( const uint8_t*, size_t, const VisionParams&, int, PreparedVideo*, std::string* error ) {
 	if ( error ) *error = "this build reads no video files (built without FFmpeg's libraries); send the frames instead";

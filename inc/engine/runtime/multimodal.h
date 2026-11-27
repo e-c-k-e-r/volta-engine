@@ -15,6 +15,7 @@ struct MmImage {
 	int grid_h = 0;
 	int grid_w = 0;
 	uint64_t hash = 0;
+	bool bidir = true;   // the rows see the whole span where the model has bidirectional images (false: audio)
 	// [count, hidden] embeddings from the vision tower; null when the rows are not needed (the prefix cache restored past them)
 	std::shared_ptr<const std::vector<backend::half_t>> embeds;
 };

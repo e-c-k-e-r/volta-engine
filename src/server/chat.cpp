@@ -135,51 +135,61 @@ namespace {
 
 using ImageList = std::vector<engine::runtime::GenerationRequest::Image>;
 
-// How a prompt's media placeholders expand. An image pad becomes its `count` pads (between Gemma 4's markers when those are set); a video's
-// placeholder becomes its run, the steps' pads among their timestamp text and markers (Qwen3-VL also drops the template's vision_start /
-// vision_end around the placeholder, since every step carries its own). Images and videos each expand in their own order; a prompt prefix
-// expands the same way (its media come first), which is how checkpoint positions stay valid.
+// How a prompt's media placeholders expand. An image pad becomes its `count` pads (between Gemma 4's markers when those are set); a video's or
+// an audio clip's placeholder becomes its run, the steps' pads among their markers and timestamp text (Qwen3-VL also drops the template's
+// vision_start / vision_end around a video's placeholder, since every step carries its own). Images, videos and clips each expand in their own
+// order; a prompt prefix expands the same way (its media come first), which is how checkpoint positions stay valid.
+struct MediaRuns {
+	int pad = -1, wrap_begin = -1, wrap_end = -1;
+	std::vector<std::vector<int>> runs;     // per item: the tokens that replace its placeholder
+	std::vector<std::vector<int>> starts;   // per item: where each step's pads begin in its run
+};
+enum MediaKind { kVideo = 0, kAudio = 1, kRunKinds = 2 };
 struct MediaTokens {
 	int image_pad = -1, image_begin = -1, image_end = -1;
 	std::vector<int> image_counts;
-	int video_pad = -1, wrap_begin = -1, wrap_end = -1;
-	std::vector<std::vector<int>> video_runs;
-	std::vector<std::vector<int>> video_starts;   // where each step's pads begin in its video's run
+	MediaRuns run[kRunKinds];
 };
 
-// Where an expanded image's or video step's pads begin: video -1 is image `index`, else step `index` of that video
+// Where an expanded image's or step's pads begin: kind -1 is image `index`, else step `step` of item `index` of that kind
 struct MediaSpan {
-	int video = -1;
+	int kind = -1;
 	int index = 0;
+	int step = 0;
 	int start = 0;
 };
 
 std::vector<int> expand_media( const std::vector<int>& tokens, const MediaTokens& mt, std::vector<MediaSpan>* spans = nullptr ) {
-	if ( mt.image_counts.empty() && mt.video_runs.empty() ) return tokens;
+	bool any = !mt.image_counts.empty();
+	for ( const MediaRuns& r : mt.run ) any = any || !r.runs.empty();
+	if ( !any ) return tokens;
 	std::vector<int> out;
 	out.reserve( tokens.size() );
-	size_t img = 0, vid = 0;
+	size_t img = 0, next[kRunKinds] = {};
 	for ( size_t i = 0; i < tokens.size(); ++i ) {
 		const int t = tokens[i];
 		if ( t == mt.image_pad && mt.image_pad >= 0 && img < mt.image_counts.size() ) {
 			if ( mt.image_begin >= 0 ) out.push_back( mt.image_begin );
-			if ( spans ) spans->push_back( { -1, static_cast<int>( img ), static_cast<int>( out.size() ) } );
+			if ( spans ) spans->push_back( { -1, static_cast<int>( img ), 0, static_cast<int>( out.size() ) } );
 			out.insert( out.end(), mt.image_counts[img++], mt.image_pad );
 			if ( mt.image_end >= 0 ) out.push_back( mt.image_end );
+			continue;
 		}
-		else if ( t == mt.video_pad && mt.video_pad >= 0 && vid < mt.video_runs.size() ) {
-			if ( mt.wrap_begin >= 0 && !out.empty() && out.back() == mt.wrap_begin ) out.pop_back();
+		bool placed = false;
+		for ( int kind = 0; kind < kRunKinds && !placed; ++kind ) {
+			const MediaRuns& r = mt.run[kind];
+			if ( t != r.pad || r.pad < 0 || next[kind] >= r.runs.size() ) continue;
+			const size_t item = next[kind]++;
+			if ( r.wrap_begin >= 0 && !out.empty() && out.back() == r.wrap_begin ) out.pop_back();
 			const int base = static_cast<int>( out.size() );
-			out.insert( out.end(), mt.video_runs[vid].begin(), mt.video_runs[vid].end() );
+			out.insert( out.end(), r.runs[item].begin(), r.runs[item].end() );
 			if ( spans ) {
-				for ( size_t k = 0; k < mt.video_starts[vid].size(); ++k ) spans->push_back( { static_cast<int>( vid ), static_cast<int>( k ), base + mt.video_starts[vid][k] } );
+				for ( size_t k = 0; k < r.starts[item].size(); ++k ) spans->push_back( { kind, static_cast<int>( item ), static_cast<int>( k ), base + r.starts[item][k] } );
 			}
-			++vid;
-			if ( mt.wrap_end >= 0 && i + 1 < tokens.size() && tokens[i + 1] == mt.wrap_end ) ++i;
+			if ( r.wrap_end >= 0 && i + 1 < tokens.size() && tokens[i + 1] == r.wrap_end ) ++i;
+			placed = true;
 		}
-		else {
-			out.push_back( t );
-		}
+		if ( !placed ) out.push_back( t );
 	}
 	return out;
 }
@@ -222,11 +232,13 @@ void omit_media( nlohmann::ordered_json& messages, const char* type, const char*
 
 // A video's placeholder and its steps' markers. Qwen3-VL: the template's vision_start video_pad vision_end becomes, per step,
 // "<t seconds>" vision_start video_pad x n vision_end (t: the mean of the step's two frame times); GLM-5: the template's video pad becomes,
-// per step, begin_of_image image x n end_of_image "t seconds" (t: the step's first frame time) inside begin_of_video ... end_of_video
+// per step, begin_of_image image x n end_of_image "t seconds" (t: the step's first frame time) inside begin_of_video ... end_of_video;
+// Gemma 4: the template's video token becomes, per frame, "mm:ss" <|image> video x n <image|>, the frames joined by spaces
 struct VideoMarkers {
 	int pad = -1, wrap_begin = -1, wrap_end = -1;
 	int step_begin = -1, step_pad = -1, step_end = -1;
 	bool time_after = false;
+	bool clock = false;   // Gemma 4: "mm:ss" before each frame, the frames joined by spaces
 };
 
 bool video_markers( engine::loader::ModelFamily fam, const engine::loader::Tokenizer& tok, VideoMarkers* out ) {
@@ -235,6 +247,12 @@ bool video_markers( engine::loader::ModelFamily fam, const engine::loader::Token
 		out->wrap_begin = out->step_begin = tok.get_special_token( "<|vision_start|>" );
 		out->wrap_end = out->step_end = tok.get_special_token( "<|vision_end|>" );
 		out->time_after = false;
+	}
+	else if ( fam == engine::loader::ModelFamily::GEMMA ) {
+		out->pad = out->step_pad = tok.get_special_token( "<|video|>" );
+		out->step_begin = tok.get_special_token( "<|image>" );
+		out->step_end = tok.get_special_token( "<image|>" );
+		out->clock = true;
 	}
 	else if ( fam == engine::loader::ModelFamily::GLM ) {
 		out->pad = tok.get_special_token( "<|video|>" );
@@ -248,6 +266,19 @@ bool video_markers( engine::loader::ModelFamily fam, const engine::loader::Token
 		return false;
 	}
 	return out->pad >= 0 && out->step_begin >= 0 && out->step_pad >= 0 && out->step_end >= 0;
+}
+
+// An audio clip's placeholder (the template's audio token) and a chunk's markers (Gemma 4: <|audio> ... <audio|>)
+struct AudioMarkers {
+	int pad = -1, begin = -1, end = -1;
+};
+
+bool audio_markers( engine::loader::ModelFamily fam, const engine::loader::Tokenizer& tok, AudioMarkers* out ) {
+	if ( fam != engine::loader::ModelFamily::GEMMA ) return false;
+	out->pad = tok.get_special_token( "<|audio|>" );
+	out->begin = tok.get_special_token( "<|audio>" );
+	out->end = tok.get_special_token( "<audio|>" );
+	return out->pad >= 0 && out->begin >= 0 && out->end >= 0;
 }
 
 // A video request part into its prepared steps: a file through FFmpeg, encoded frames, or the host's decoded frames
@@ -361,7 +392,7 @@ int reply_window( int max_context ) {
 
 PromptModel prompt_model( engine::runtime::Generator& gen ) {
 	return { gen.chat_template(), gen.tokenizer(), gen.vision_params(), gen.max_context(),
-		[&gen]( const engine::runtime::GenerationRequest::Image& im ) { gen.prefetch_image( im ); } };
+		[&gen]( const engine::runtime::GenerationRequest::Image& im ) { gen.prefetch_image( im ); }, gen.audio_params() };
 }
 
 bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ImageList* images,
@@ -386,6 +417,10 @@ bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatReq
 	VideoMarkers vm;
 	const bool watch = !req.videos.empty() && m.vision && m.vision->video && runtime::options().max_video_tokens > 0 && video_markers( family, m.tokenizer, &vm );
 	if ( !req.videos.empty() && !watch && vars["messages"].is_array() ) omit_media( vars["messages"], "video", "[video omitted: this model cannot view videos]" );
+	// Audio: an audio tower (Gemma 4's small models) and its markers
+	AudioMarkers am;
+	const bool hear = !req.audios.empty() && m.audio && runtime::options().max_audio_seconds > 0 && audio_markers( family, m.tokenizer, &am );
+	if ( !req.audios.empty() && !hear && vars["messages"].is_array() ) omit_media( vars["messages"], "audio", "[audio omitted: this model cannot hear audio]" );
 	if ( family == engine::loader::ModelFamily::GEMMA ) {
 		if ( vars["messages"].is_array() ) gemma_tool_messages( vars["messages"] );
 		vars["bos_token"] = m.tokenizer.decode_token( m.tokenizer.get_special_token( "<bos>" ) );
@@ -435,7 +470,7 @@ bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatReq
 	MediaTokens& mt = media ? *media : local;
 	mt = MediaTokens();
 	ImageList stills;
-	std::vector<ImageList> steps;
+	std::vector<ImageList> steps[kRunKinds];
 	if ( see ) {
 		const engine::loader::VisionParams* vp = m.vision;
 		const int pad_id = m.tokenizer.get_special_token( image_pad_name( family ) );
@@ -474,9 +509,10 @@ bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatReq
 			err->message = "the conversation holds " + std::to_string( req.videos.size() ) + " videos but the chat template placed " + std::to_string( pads ) + " (videos are only allowed in user and tool messages)";
 			return false;
 		}
-		mt.video_pad = vm.pad;
-		mt.wrap_begin = vm.wrap_begin;
-		mt.wrap_end = vm.wrap_end;
+		MediaRuns& vr = mt.run[kVideo];
+		vr.pad = vm.pad;
+		vr.wrap_begin = vm.wrap_begin;
+		vr.wrap_end = vm.wrap_end;
 		for ( const ChatRequest::Video& v : req.videos ) {
 			engine::loader::PreparedVideo pv;
 			std::string verr;
@@ -484,38 +520,103 @@ bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatReq
 				err->message = verr;
 				return false;
 			}
-			const int n = pv.tokens_per_step( vp.merge_size );
 			std::vector<int> run, starts;
 			ImageList list;
 			for ( size_t k = 0; k < pv.steps.size(); ++k ) {
 				char stamp[48];
-				std::snprintf( stamp, sizeof( stamp ), vm.time_after ? "%.1f seconds" : "<%.1f seconds>", pv.times[k] );
+				if ( vm.clock ) {
+					const int sec = static_cast<int>( pv.times[k] );
+					std::snprintf( stamp, sizeof( stamp ), k == 0 ? "%02d:%02d " : " %02d:%02d ", sec / 60, sec % 60 );
+				}
+				else {
+					std::snprintf( stamp, sizeof( stamp ), vm.time_after ? "%.1f seconds" : "<%.1f seconds>", pv.times[k] );
+				}
 				const std::vector<int> text = m.tokenizer.encode( stamp, false );
 				if ( !vm.time_after ) run.insert( run.end(), text.begin(), text.end() );
 				run.push_back( vm.step_begin );
 				starts.push_back( static_cast<int>( run.size() ) );
-				run.insert( run.end(), n, vm.step_pad );
+				run.insert( run.end(), pv.steps[k].tokens( vp.merge_size ), vm.step_pad );
 				run.push_back( vm.step_end );
 				if ( vm.time_after ) run.insert( run.end(), text.begin(), text.end() );
 				engine::runtime::GenerationRequest::Image im;
 				im.grid_h = pv.steps[k].grid_h / vp.merge_size;
 				im.grid_w = pv.steps[k].grid_w / vp.merge_size;
-				im.count = n;
+				im.count = pv.steps[k].tokens( vp.merge_size );
 				im.hash = pv.steps[k].hash;
 				im.prepared = std::make_shared<engine::loader::PreparedImage>( std::move( pv.steps[k] ) );
 				list.push_back( std::move( im ) );
 			}
-			mt.video_runs.push_back( std::move( run ) );
-			mt.video_starts.push_back( std::move( starts ) );
-			steps.push_back( std::move( list ) );
+			vr.runs.push_back( std::move( run ) );
+			vr.starts.push_back( std::move( starts ) );
+			steps[kVideo].push_back( std::move( list ) );
 		}
 	}
-	if ( see || watch ) {
+	if ( hear ) {
+		// Gemma 4: the template's audio token becomes, per chunk of a clip, <|audio> audio x n <audio|>
+		size_t pads = 0;
+		for ( int t : *tokens ) pads += ( t == am.pad ) ? 1 : 0;
+		if ( pads != req.audios.size() ) {
+			err->message = "the conversation holds " + std::to_string( req.audios.size() ) + " audio clips but the chat template placed " + std::to_string( pads ) + " (audio is only allowed in user and tool messages)";
+			return false;
+		}
+		MediaRuns& ar = mt.run[kAudio];
+		ar.pad = am.pad;
+		double seconds = 0.0;
+		for ( const ChatRequest::Audio& a : req.audios ) {
+			std::vector<float> decoded;
+			int rate = 0;
+			const std::vector<float>* pcm = a.pcm.get();
+			std::string aerr;
+			if ( !pcm ) {
+				if ( a.file.empty() ) {
+					err->message = "an audio part needs input_audio data (a base64 audio file)";
+					return false;
+				}
+				if ( !engine::loader::decode_audio( reinterpret_cast<const uint8_t*>( a.file.data() ), a.file.size(), &decoded, &rate, &aerr ) ) {
+					err->message = "the audio cannot be decoded: " + aerr;
+					return false;
+				}
+				pcm = &decoded;
+			}
+			else {
+				rate = a.rate;
+			}
+			seconds += rate > 0 ? static_cast<double>( pcm->size() ) / rate : 0.0;
+			if ( seconds > runtime::options().max_audio_seconds ) {
+				err->message = "the conversation holds " + std::to_string( static_cast<int>( seconds ) ) + " s of audio; max_audio_seconds is " + std::to_string( runtime::options().max_audio_seconds );
+				return false;
+			}
+			std::vector<engine::loader::PreparedAudio> chunks;
+			if ( !engine::loader::prepare_audio( *pcm, rate, *m.audio, &chunks, &aerr ) ) {
+				err->message = aerr;
+				return false;
+			}
+			std::vector<int> run, starts;
+			ImageList list;
+			for ( engine::loader::PreparedAudio& c : chunks ) {
+				run.push_back( am.begin );
+				starts.push_back( static_cast<int>( run.size() ) );
+				run.insert( run.end(), c.tokens, am.pad );
+				run.push_back( am.end );
+				engine::runtime::GenerationRequest::Image im;
+				im.grid_h = 1;
+				im.grid_w = c.tokens;
+				im.count = c.tokens;
+				im.hash = c.hash;
+				im.audio = std::make_shared<engine::loader::PreparedAudio>( std::move( c ) );
+				list.push_back( std::move( im ) );
+			}
+			ar.runs.push_back( std::move( run ) );
+			ar.starts.push_back( std::move( starts ) );
+			steps[kAudio].push_back( std::move( list ) );
+		}
+	}
+	if ( see || watch || hear ) {
 		std::vector<MediaSpan> spans;
 		*tokens = expand_media( *tokens, mt, &spans );
 		// the images and video steps in prompt order, each where its pads begin
 		for ( const MediaSpan& sp : spans ) {
-			engine::runtime::GenerationRequest::Image& im = sp.video < 0 ? stills[sp.index] : steps[sp.video][sp.index];
+			engine::runtime::GenerationRequest::Image& im = sp.kind < 0 ? stills[sp.index] : steps[sp.kind][sp.index][sp.step];
 			im.start = sp.start;
 			images->push_back( std::move( im ) );
 		}

@@ -7,13 +7,13 @@ refuses another variant with each differing field named (`test_config_check`). G
 [CONFIG.md](CONFIG.md), weight formats, bit widths and perplexity in [QUANTIZATION.md](QUANTIZATION.md), speed in [PERFORMANCE.md](PERFORMANCE.md),
 and the features shared by every model (prefix cache, expert tier, speculation, images, serving) in [FEATURES.md](FEATURES.md).
 
-| Model | Type | Weights | `tp` | Speculators | Images | Backends |
+| Model | Type | Weights | `tp` | Speculators | Input | Backends |
 |---|---|---|---|---|---|---|
-| Qwen3.8-27B | `qwen3_5` | EXL3, NVFP4, GGUF | 1, 2, 4 | DFlash2, MTP | yes | CUDA, CPU, Vulkan |
-| GLM-5.3-Flash | `glm5_next` | EXL3 (stock or Volta tile order), NVFP4 dense groups and expert layers, GGUF | 1, 2, 4 | DFlash2, MTP | yes | CUDA, CPU, Vulkan |
-| Qwen3.8-Flash-Next | `qwen4_exp` | EXL3, NVFP4, GGUF | 1, 2, 4 | MTP, DFlash2 | yes | CUDA, CPU, Vulkan |
-| Gemma 4 31B, E4B | `gemma4` | EXL3, NVFP4, GGUF | 1, 2, 4 (E4B: 1, 2) | DFlash (31B), suffix | yes | CUDA, CPU, Vulkan |
-| DeepSeek-V4.1-Flash | `deepseek_v41` | EXL3, GGUF | 1, 2, 4 | DSpark, suffix | yes | CUDA |
+| Qwen3.8-27B | `qwen3_5` | EXL3, NVFP4, GGUF | 1, 2, 4 | DFlash2, MTP | images, video | CUDA, CPU, Vulkan |
+| GLM-5.3-Flash | `glm5_next` | EXL3 (stock or Volta tile order), NVFP4 dense groups and expert layers, GGUF | 1, 2, 4 | DFlash2, MTP | images, video | CUDA, CPU, Vulkan |
+| Qwen3.8-Flash-Next | `qwen4_exp` | EXL3, NVFP4, GGUF | 1, 2, 4 | MTP, DFlash2 | images, video | CUDA, CPU, Vulkan |
+| Gemma 4 31B, E4B | `gemma4` | EXL3, NVFP4, GGUF | 1, 2, 4 (E4B: 1, 2) | DFlash (31B), suffix | images, video; audio (E4B) | CUDA, CPU, Vulkan |
+| DeepSeek-V4.1-Flash | `deepseek_v41` | EXL3, GGUF | 1, 2, 4 | DSpark, suffix | images | CUDA |
 
 * Speculators (`speculator`, with `--speculative` / `use_speculation`): `dflash` (the default: a DFlash2 or DFlash drafter in `draft_model_dir`), `mtp`
   (the checkpoint's own head, no draft model), `dspark` (DeepSeek's block drafter in `draft_model_dir`) and `suffix` (no model: the text that followed the
@@ -31,8 +31,9 @@ and the features shared by every model (prefix cache, expert tier, speculation, 
   fetched. `max_image_tokens` (default 1024 language-model tokens per image, 0 = off) sizes the tower's scratch; the tower runs on rank 0 and loads
   last, into what is left of the arena. Without a loaded tower an image part reaches the model as the note `[image omitted: this model cannot view
   images]`. `vision_cpu` runs the tower on the host CPU instead (every model but Gemma 4; [FEATURES.md](FEATURES.md#multimodal)).
-* Video: Qwen3.8 (27B, Flash-Next) and GLM-5.3-Flash take videos through the same tower, as OpenAI `video_url` parts (a file, decoded with
-  FFmpeg's libraries) or `video` parts with the frames; `max_video_tokens` (default 8192) bounds a video ([FEATURES.md](FEATURES.md#multimodal)).
+* Video: Qwen3.8 (27B, Flash-Next), GLM-5.3-Flash and Gemma 4 take videos through the same tower, as OpenAI `video_url` parts (a file, decoded
+  with FFmpeg's libraries) or `video` parts with the frames; `max_video_tokens` (default 8192) bounds a video ([FEATURES.md](FEATURES.md#multimodal)).
+* Audio: Gemma 4 E4B, as OpenAI `input_audio` parts (`max_audio_seconds`, default 300).
 
 ## Qwen3.8-27B (`qwen3_5`)
 
@@ -194,10 +195,12 @@ build/volta_server --model-dir <Flash-Next EXL3> --speculative --set speculator=
 * Speculation (31B): the DFlash drafter `z-lab/gemma-4-31B-it-DFlash` (a DFlash v1 `DFlashDraftModel`, also as an EXL3 conversion) through
   `draft_model_dir`: a 16-row block of which the first 8 rows are verified, taps of layers 1, 12, 23, 35, 46 and 57, one full-attention layer over every
   position (the drafter takes each prefill chunk's taps as they are written). `speculator=suffix` with `spec_suffix` needs no model.
-* Images (31B): the checkpoint's vision tower (ViT blocks with a 2-D rotary, 3 x 3 pooling into at most 280 soft tokens, `max_image_tokens` caps that)
-  from the BF16 `model.vision_tower.*` tensors, on CUDA, CPU and Vulkan. An image's tokens attend to the whole image on the sliding-window layers and
-  causally on the full-attention ones, and a prefill forward never splits an image. A GGUF directory's tower is its `mmproj` file (llama.cpp's `clip`
-  architecture with the `gemma4v` projector).
+* Images: the checkpoint's vision tower (ViT blocks with a 2-D rotary, 3 x 3 pooling into at most 280 soft tokens, `max_image_tokens` caps that)
+  from the BF16 `model.vision_tower.*` tensors, on CUDA, CPU and Vulkan; E4B's projections clamp to the checkpoint's ranges. The 31B's image tokens
+  attend to the whole image on the sliding-window layers and causally on the full-attention ones, and a prefill forward never splits an image. A GGUF
+  directory's towers are its `mmproj` file (llama.cpp's `clip` architecture with the `gemma4v` projector, and for E4B the `gemma4a` audio tower, e.g.
+  `mmproj-gemma-4-E4B-it-BF16.gguf` beside the model). Video: 32 frames as images of at most 70 soft tokens each, with `mm:ss` stamps.
+* Audio (E4B): the checkpoint's conformer audio tower, 25 tokens a second of audio (`input_audio` parts; `max_audio_seconds`, [FEATURES.md](FEATURES.md#multimodal)).
 * Prompts: the chat template's `<|channel>thought ... <channel|>` reasoning and `<|tool_call>` calls are parsed ([SERVER.md](SERVER.md#output_parsercpp)).
 * Defaults: `max_seq` 32768, `max_slots` 8.
 

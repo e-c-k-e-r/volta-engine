@@ -137,6 +137,10 @@ struct MergeGatherParams { uint64_t h, out_; int n, group; };
 struct VAttnParams { uint64_t q, k, v, out_; int m, heads, head_dim; float scale; };
 struct BiasActParams { uint64_t x, bias; int64_t total; int n, act, has_bias; };
 struct BiasResidualParams { uint64_t hidden, y, bias; int64_t total; int n; };
+struct ClampParams { uint64_t x; int64_t n; float lo, hi; };
+struct GluDwconvParams { uint64_t x, w, out_; int64_t total; int D, K; };
+struct ConvLnReluParams { uint64_t in_, w, g, out_; int T, F, C, O; float eps; };
+struct LocalRelAttnParams { uint64_t q, k, v, q_scale, rel, out_; int T, heads, hd, window; float k_scale, cap; };
 } // namespace engine::backend::impl
 
 // NVFP4 linear (src/kernels/slang/nvfp4.slang)

@@ -691,6 +691,19 @@ bool Gemma4Pipeline::encode_image( const engine::loader::PreparedImage& image, s
 	return vision_.encode( image, out, stream );
 }
 
+bool Gemma4Pipeline::load_audio( const char* model_dir, backend::stream_t stream ) {
+	if ( rank_ != 0 || runtime::options().max_audio_seconds <= 0 ) return false;
+	backend::set_device( rank_ );
+	const engine::loader::AudioParams p;
+	return audio_.load( model_dir, *arena_, p.tokens( ( p.chunk_seconds * p.sample_rate + p.frame_length / 2 - ( p.frame_length + 1 ) ) / p.hop + 1 ), stream );
+}
+
+bool Gemma4Pipeline::encode_audio( const engine::loader::PreparedAudio& audio, std::vector<backend::half_t>* out, backend::stream_t stream ) {
+	if ( rank_ != 0 || !audio_.loaded() ) return false;
+	backend::set_device( rank_ );
+	return audio_.encode( audio, out, stream );
+}
+
 bool Gemma4Pipeline::inject_embeddings( const backend::half_t* host_rows, int dst_row, int rows, backend::stream_t stream ) {
 	ENGINE_ASSERT( dst_row >= 0 && rows >= 1 && dst_row + rows <= pod::MAX_ROWS, "Gemma4Pipeline::inject_embeddings: rows out of range" );
 	backend::set_device( rank_ );

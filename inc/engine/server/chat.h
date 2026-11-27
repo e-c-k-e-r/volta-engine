@@ -5,6 +5,7 @@
 #include "engine/server/http.h"
 #include "engine/server/output_parser.h"
 #include "engine/loader/video.h"
+#include "engine/loader/audio.h"
 
 #include <nlohmann/json.hpp>
 #include <atomic>
@@ -42,6 +43,13 @@ struct ChatRequest {
 		std::shared_ptr<const engine::loader::VideoFrames> decoded;
 	};
 	std::vector<Video> videos;
+	// Audio clips in prompt order, {"type": "audio"} parts in messages_json: an audio file, or (libvolta) the host's mono samples at `rate`
+	struct Audio {
+		std::string file;
+		std::shared_ptr<const std::vector<float>> pcm;
+		int rate = 0;
+	};
+	std::vector<Audio> audios;
 	// a text completion (OpenAI /v1/completions): the prompt as given instead of messages through the chat template (its special-token strings
 	// are those tokens, nothing is prepended), and the reply as plain text (no reasoning or tool-call parsing)
 	bool raw = false;
@@ -140,6 +148,7 @@ struct PromptModel {
 	const engine::loader::VisionParams* vision = nullptr;
 	int max_context = 0;
 	std::function<void( const engine::runtime::GenerationRequest::Image& )> prefetch_image;   // vision_cpu: encode before the request queues
+	const engine::loader::AudioParams* audio = nullptr;   // the audio tower's feature extractor (nullptr: an audio part becomes a note)
 };
 
 // The prompt a request renders to, as the server feeds it to the model (prompt text with special tokens escaped, and its token ids);

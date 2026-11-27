@@ -122,17 +122,17 @@ private:
 	std::function<void()> done_;
 };
 
-// The host's videos into the request's video parts that have no source of their own, in order
-bool attach_videos( engine::server::ChatRequest* req, const std::vector<Video>& videos, std::string* error ) {
+// The host's media into the request's parts that have no source of their own, in order
+bool attach_media( engine::server::ChatRequest* req, const Media& media, std::string* error ) {
 	size_t next = 0;
 	for ( auto& v : req->videos ) {
 		if ( !v.file.empty() || !v.frames.empty() ) continue;
-		if ( next == videos.size() ) {
+		if ( next == media.videos.size() ) {
 			*error = "the request has more video parts without a source than videos were given";
 			return false;
 		}
 		auto frames = std::make_shared<engine::loader::VideoFrames>();
-		for ( const VideoFrame& f : videos[next].frames ) {
+		for ( const VideoFrame& f : media.videos[next].frames ) {
 			engine::loader::DecodedImage img;
 			img.width = f.width;
 			img.height = f.height;
@@ -143,8 +143,23 @@ bool attach_videos( engine::server::ChatRequest* req, const std::vector<Video>& 
 		v.decoded = std::move( frames );
 		++next;
 	}
-	if ( next != videos.size() ) {
+	if ( next != media.videos.size() ) {
 		*error = "the request has fewer video parts without a source than videos were given";
+		return false;
+	}
+	next = 0;
+	for ( auto& a : req->audios ) {
+		if ( !a.file.empty() ) continue;
+		if ( next == media.audio.size() ) {
+			*error = "the request has more audio parts without data than audio clips were given";
+			return false;
+		}
+		a.pcm = std::make_shared<const std::vector<float>>( media.audio[next].pcm );
+		a.rate = media.audio[next].sample_rate;
+		++next;
+	}
+	if ( next != media.audio.size() ) {
+		*error = "the request has fewer audio parts without data than audio clips were given";
 		return false;
 	}
 	return true;
@@ -324,10 +339,10 @@ bool Engine::has_speech() const {
 }
 
 uint64_t Engine::chat( const std::string& request_json, std::function<bool( const ChatEvent& )> on_event, std::string* error ) {
-	return chat( request_json, {}, std::move( on_event ), error );
+	return chat( request_json, Media(), std::move( on_event ), error );
 }
 
-uint64_t Engine::chat( const std::string& request_json, const std::vector<Video>& videos, std::function<bool( const ChatEvent& )> on_event, std::string* error ) {
+uint64_t Engine::chat( const std::string& request_json, const Media& media, std::function<bool( const ChatEvent& )> on_event, std::string* error ) {
 	Impl& P = *p_;
 	if ( !P.gen ) {
 		*error = "no text model (the config has no model_dir)";
@@ -339,7 +354,7 @@ uint64_t Engine::chat( const std::string& request_json, const std::vector<Video>
 		*error = err.message;
 		return 0;
 	}
-	if ( !attach_videos( &req, videos, error ) ) return 0;
+	if ( !attach_media( &req, media, error ) ) return 0;
 	const uint64_t id = ++P.next_id;
 	auto flag = std::make_shared<std::atomic<bool>>( false );
 	{
@@ -367,10 +382,10 @@ void Engine::cancel( uint64_t id ) {
 }
 
 int Engine::count_tokens( const std::string& request_json, std::string* error ) {
-	return count_tokens( request_json, {}, error );
+	return count_tokens( request_json, Media(), error );
 }
 
-int Engine::count_tokens( const std::string& request_json, const std::vector<Video>& videos, std::string* error ) {
+int Engine::count_tokens( const std::string& request_json, const Media& media, std::string* error ) {
 	Impl& P = *p_;
 	if ( !P.gen ) {
 		*error = "no text model (the config has no model_dir)";
@@ -383,7 +398,7 @@ int Engine::count_tokens( const std::string& request_json, const std::vector<Vid
 		*error = err.message;
 		return -1;
 	}
-	if ( !attach_videos( &req, videos, error ) ) return -1;
+	if ( !attach_media( &req, media, error ) ) return -1;
 	if ( !engine::server::count_chat_tokens( *P.gen, P.cfg, req, ++P.next_id, &tokens, &err ) ) {
 		*error = err.message;
 		return -1;

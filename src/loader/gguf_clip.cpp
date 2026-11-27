@@ -1,5 +1,5 @@
-// GGUF architecture clip (llama.cpp's mmproj files) for the projector types gemma4v (Gemma 4's vision tower and embedding projection under the
-// Hugging Face names Gemma4VisionTower loads), glm5v (GLM-5's tower and merger under the checkpoint's model.visual.* names) and deepseek41v
+// GGUF architecture clip (llama.cpp's mmproj files) for the projector types gemma4v (Gemma 4's vision tower and embedding projection, and in the
+// same file the gemma4a audio tower and its projection, under the Hugging Face names Gemma4VisionTower and Gemma4AudioTower load), glm5v (GLM-5's tower and merger under the checkpoint's model.visual.* names) and deepseek41v
 // (DeepSeek-V4.1's tower, aligner and delimiter embeddings under the checkpoint's vision.* / aligner.* names) and qwen3vl_merger (the Qwen3-VL tower
 // of Flash-Next under model.visual.*). The converter keeps every tensor as it is (norms F32, projections BF16) except the
 // patch embedding, which it stores as a conv kernel [n, channel, y, x]: the PatchChwToHwc transform restores [n, y * x * channel].
@@ -32,6 +32,61 @@ const Name kBlock[] = {
 	{ "ffn_down.weight", "mlp.down_proj.linear.weight" },
 };
 
+// Gemma 4's audio tower (gemma4a, in the same file as the vision tower), per block under model.audio_tower.layers.N.: the clipped projections
+// (their weights under .linear., their ranges beside) and the rest. The converter stores softplus( per_dim_scale ), named apart here
+const Name kAudioLinear[] = {
+	{ "ffn_up", "feed_forward1.ffw_layer_1" },
+	{ "ffn_down", "feed_forward1.ffw_layer_2" },
+	{ "ffn_up_1", "feed_forward2.ffw_layer_1" },
+	{ "ffn_down_1", "feed_forward2.ffw_layer_2" },
+	{ "attn_q", "self_attn.q_proj" },
+	{ "attn_k", "self_attn.k_proj" },
+	{ "attn_v", "self_attn.v_proj" },
+	{ "attn_out", "self_attn.post" },
+	{ "conv_pw1", "lconv1d.linear_start" },
+	{ "conv_pw2", "lconv1d.linear_end" },
+};
+const Name kAudioBlock[] = {
+	{ "ffn_norm.weight", "feed_forward1.pre_layer_norm.weight" },
+	{ "ffn_post_norm.weight", "feed_forward1.post_layer_norm.weight" },
+	{ "ffn_norm_1.weight", "feed_forward2.pre_layer_norm.weight" },
+	{ "ffn_post_norm_1.weight", "feed_forward2.post_layer_norm.weight" },
+	{ "attn_pre_norm.weight", "norm_pre_attn.weight" },
+	{ "attn_post_norm.weight", "norm_post_attn.weight" },
+	{ "attn_k_rel.weight", "self_attn.relative_k_proj.weight" },
+	{ "per_dim_scale.weight", "self_attn.per_dim_scale_softplus" },
+	{ "conv_norm.weight", "lconv1d.pre_layer_norm.weight" },
+	{ "conv_dw.weight", "lconv1d.depthwise_conv1d.weight" },
+	{ "norm_conv.weight", "lconv1d.conv_norm.weight" },
+	{ "ln2.weight", "norm_out.weight" },
+};
+const Name kAudioTop[] = {
+	{ "a.conv1d.0.weight", "model.audio_tower.subsample_conv_projection.layer0.conv.weight" },
+	{ "a.conv1d.0.norm.weight", "model.audio_tower.subsample_conv_projection.layer0.norm.weight" },
+	{ "a.conv1d.1.weight", "model.audio_tower.subsample_conv_projection.layer1.conv.weight" },
+	{ "a.conv1d.1.norm.weight", "model.audio_tower.subsample_conv_projection.layer1.norm.weight" },
+	{ "a.input_projection.weight", "model.audio_tower.subsample_conv_projection.input_proj_linear.weight" },
+	{ "a.pre_encode.out.weight", "model.audio_tower.output_proj.weight" },
+	{ "a.pre_encode.out.bias", "model.audio_tower.output_proj.bias" },
+	{ "mm.a.input_projection.weight", "model.embed_audio.embedding_projection.weight" },
+};
+const char* const kClipSuffix[] = { "input_min", "input_max", "output_min", "output_max" };
+
+// A clipped projection's tensor: <gguf>.weight is <hf>.linear.weight, <gguf>.<range> is <hf>.<range>
+bool map_clipped( const std::string& rest, const std::string& gguf, const std::string& hf, std::string* name ) {
+	if ( rest == gguf + ".weight" ) {
+		*name = hf + ".linear.weight";
+		return true;
+	}
+	for ( const char* sfx : kClipSuffix ) {
+		if ( rest == gguf + "." + sfx ) {
+			*name = hf + "." + sfx;
+			return true;
+		}
+	}
+	return false;
+}
+
 void map_gemma4v( const GgufArch&, const GgufKv&, const std::string& g, std::vector<GgufMapped>* out ) {
 	auto emit = [&]( const std::string& name, GgufTransform tr = GgufTransform::None ) {
 		GgufMapped m;
@@ -39,6 +94,23 @@ void map_gemma4v( const GgufArch&, const GgufKv&, const std::string& g, std::vec
 		m.transform = tr;
 		out->push_back( std::move( m ) );
 	};
+	for ( const Name& n : kAudioTop ) {
+		if ( g == n.gguf ) { emit( n.hf ); return; }
+	}
+	{
+		int layer = -1, used = 0;
+		if ( std::sscanf( g.c_str(), "a.blk.%d.%n", &layer, &used ) == 1 && used > 0 ) {
+			const std::string rest = g.substr( static_cast<size_t>( used ) ), base = "model.audio_tower.layers." + std::to_string( layer ) + ".";
+			std::string name;
+			for ( const Name& n : kAudioLinear ) {
+				if ( map_clipped( rest, n.gguf, n.hf, &name ) ) { emit( base + name ); return; }
+			}
+			for ( const Name& n : kAudioBlock ) {
+				if ( rest == n.gguf ) { emit( base + n.hf ); return; }
+			}
+			return;
+		}
+	}
 	if ( g == "v.patch_embd.weight" ) { emit( "model.vision_tower.patch_embedder.input_proj.weight", GgufTransform::PatchChwToHwc ); return; }
 	if ( g == "v.position_embd.weight" ) { emit( "model.vision_tower.patch_embedder.position_embedding_table" ); return; }
 	if ( g == "v.std_bias" ) { emit( "model.vision_tower.std_bias" ); return; }
@@ -46,9 +118,18 @@ void map_gemma4v( const GgufArch&, const GgufKv&, const std::string& g, std::vec
 	if ( g == "mm.input_projection.weight" ) { emit( "model.embed_vision.embedding_projection.weight" ); return; }
 	int layer = -1, used = 0;
 	if ( std::sscanf( g.c_str(), "v.blk.%d.%n", &layer, &used ) != 1 || used == 0 ) return;
-	const std::string rest = g.substr( static_cast<size_t>( used ) );
+	const std::string rest = g.substr( static_cast<size_t>( used ) ), base = "model.vision_tower.encoder.layers." + std::to_string( layer ) + ".";
 	for ( const Name& n : kBlock ) {
-		if ( rest == n.gguf ) { emit( "model.vision_tower.encoder.layers." + std::to_string( layer ) + "." + n.hf ); return; }
+		if ( rest == n.gguf ) { emit( base + n.hf ); return; }
+	}
+	// the clipped projections' ranges (the small models)
+	for ( const Name& n : kBlock ) {
+		const std::string gw = n.gguf, hw = n.hf;
+		const size_t gs = gw.rfind( ".weight" ), hs = hw.rfind( ".linear.weight" );
+		if ( gs == std::string::npos || hs == std::string::npos ) continue;
+		for ( const char* sfx : kClipSuffix ) {
+			if ( rest == gw.substr( 0, gs ) + "." + sfx ) { emit( base + hw.substr( 0, hs ) + "." + sfx ); return; }
+		}
 	}
 }
 

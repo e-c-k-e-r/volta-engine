@@ -574,7 +574,102 @@ __global__ void bias_act_kernel( half* x, const half* bias, int n, size_t total,
 	float v = __half2float( x[i] ) + ( bias ? __half2float( bias[i % n] ) : 0.0f );
 	if ( act == Vision::ACT_GELU_TANH ) v = gelu_tanh_f( v );
 	else if ( act == Vision::ACT_GELU_ERF ) v = gelu_erf_f( v );
+	else if ( act == Vision::ACT_SILU ) v = v / ( 1.0f + __expf( -v ) );
 	x[i] = __float2half( v );
+}
+
+__global__ void clamp_kernel( half* x, size_t n, float lo, float hi ) {
+	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
+	if ( i < n ) x[i] = __float2half( fminf( fmaxf( __half2float( x[i] ), lo ), hi ) );
+}
+
+// One block per output position (row, frequency), a thread per channel: the 3x3 taps over the input channels, then the channel LayerNorm and ReLU
+__global__ void conv_ln_relu_kernel( const float* __restrict__ in, const float* __restrict__ w, const float* __restrict__ g, float* __restrict__ out, int T, int F,
+	int C, int O, float eps ) {
+	__shared__ float red[256];
+	const int Fo = ( F + 1 ) / 2, pos = blockIdx.x, t = pos / Fo, f = pos % Fo, o = threadIdx.x;
+	float acc = 0.0f;
+	if ( o < O ) {
+		for ( int ky = 0; ky < 3; ++ky ) {
+			const int ti = 2 * t - 1 + ky;
+			if ( ti < 0 || ti >= T ) continue;
+			for ( int kx = 0; kx < 3; ++kx ) {
+				const int fi = 2 * f - 1 + kx;
+				if ( fi < 0 || fi >= F ) continue;
+				const float* src = in + ( static_cast<size_t>( ti ) * F + fi ) * C;
+				const float* wk = w + static_cast<size_t>( o ) * C * 9 + ky * 3 + kx;
+				for ( int c = 0; c < C; ++c ) acc += wk[c * 9] * src[c];
+			}
+		}
+	}
+	red[o] = o < O ? acc : 0.0f;
+	__syncthreads();
+	for ( int s = blockDim.x / 2; s > 0; s >>= 1 ) {
+		if ( o < s ) red[o] += red[o + s];
+		__syncthreads();
+	}
+	const float mean = red[0] / O;
+	__syncthreads();
+	const float d = o < O ? acc - mean : 0.0f;
+	red[o] = d * d;
+	__syncthreads();
+	for ( int s = blockDim.x / 2; s > 0; s >>= 1 ) {
+		if ( o < s ) red[o] += red[o + s];
+		__syncthreads();
+	}
+	if ( o < O ) out[static_cast<size_t>( pos ) * O + o] = fmaxf( 0.0f, d * rsqrtf( red[0] / O + eps ) * g[o] );
+}
+
+// One thread per output element: the GLU of the K rows up to t, weighted by the channel's taps
+__global__ void glu_dwconv_kernel( const half* __restrict__ x, const half* __restrict__ w, half* __restrict__ out, int T, int D, int K ) {
+	const size_t i = static_cast<size_t>( blockIdx.x ) * blockDim.x + threadIdx.x;
+	if ( i >= static_cast<size_t>( T ) * D ) return;
+	const int t = static_cast<int>( i / D ), c = static_cast<int>( i % D );
+	float acc = 0.0f;
+	for ( int k = 0; k < K; ++k ) {
+		const int r = t - K + 1 + k;
+		if ( r < 0 ) continue;
+		const float a = __half2float( x[static_cast<size_t>( r ) * 2 * D + c] ), g = __half2float( x[static_cast<size_t>( r ) * 2 * D + D + c] );
+		acc += __half2float( w[static_cast<size_t>( c ) * K + k] ) * a / ( 1.0f + __expf( -g ) );
+	}
+	out[i] = __float2half( acc );
+}
+
+// One thread per (row, head): the window's scores, their softmax and the weighted values, in FP32
+__global__ void local_rel_attention_kernel( const half* __restrict__ q, const half* __restrict__ k, const half* __restrict__ v, const float* __restrict__ q_scale,
+	float k_scale, const float* __restrict__ rel, half* __restrict__ out, int T, int heads, int hd, int window, float cap ) {
+	const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if ( idx >= T * heads ) return;
+	const int t = idx / heads, h = idx % heads, HD = heads * hd;
+	const half* qr = q + static_cast<size_t>( t ) * HD + h * hd;
+	float s[32];
+	const int n = min( window, t + 1 );
+	float mx = -3.0e38f;
+	for ( int d = 0; d < n; ++d ) {
+		const half* kr = k + static_cast<size_t>( t - d ) * HD + h * hd;
+		const float* rr = rel + static_cast<size_t>( d ) * HD + h * hd;
+		float ac = 0.0f, bd = 0.0f;
+		for ( int e = 0; e < hd; ++e ) {
+			const float qe = __half2float( qr[e] ) * q_scale[e];
+			ac += qe * __half2float( kr[e] );
+			bd += qe * rr[e];
+		}
+		const float sc = cap * tanhf( ( ac * k_scale + bd ) / cap );
+		s[d] = sc;
+		mx = fmaxf( mx, sc );
+	}
+	float sum = 0.0f;
+	for ( int d = 0; d < n; ++d ) {
+		s[d] = __expf( s[d] - mx );
+		sum += s[d];
+	}
+	const float inv = 1.0f / sum;
+	half* orow = out + static_cast<size_t>( t ) * HD + h * hd;
+	for ( int e = 0; e < hd; ++e ) {
+		float acc = 0.0f;
+		for ( int d = 0; d < n; ++d ) acc += s[d] * __half2float( v[static_cast<size_t>( t - d ) * HD + h * hd + e] );
+		orow[e] = __float2half( acc * inv );
+	}
 }
 
 __global__ void bias_residual_kernel( float* hidden, const half* y, const half* bias, int n, size_t total ) {
@@ -733,6 +828,33 @@ void Vision::bias_act( half* x, const half* bias, int m, int n, int act, cudaStr
 void Vision::bias_residual( float* hidden, const half* y, const half* bias, int m, int n, cudaStream_t stream ) {
 	const size_t total = static_cast<size_t>( m ) * n;
 	bias_residual_kernel<<<static_cast<unsigned>( ( total + 255 ) / 256 ), 256, 0, stream>>>( hidden, y, bias, n, total );
+}
+
+void Vision::clamp( half* x, size_t n, float lo, float hi, cudaStream_t stream ) {
+	if ( n == 0 ) return;
+	clamp_kernel<<<static_cast<unsigned>( ( n + 255 ) / 256 ), 256, 0, stream>>>( x, n, lo, hi );
+}
+
+void Vision::conv_ln_relu( const float* in, const float* w, const float* g, float* out, int T, int F, int C, int O, float eps, cudaStream_t stream ) {
+	ENGINE_ASSERT( O >= 1 && O <= 256, "Vision::conv_ln_relu: 1 to 256 channels" );
+	const int positions = ( ( T + 1 ) / 2 ) * ( ( F + 1 ) / 2 );
+	if ( positions == 0 ) return;
+	const int threads = O <= 32 ? 32 : O <= 64 ? 64 : O <= 128 ? 128 : 256;
+	conv_ln_relu_kernel<<<positions, threads, 0, stream>>>( in, w, g, out, T, F, C, O, eps );
+}
+
+void Vision::glu_dwconv( const half* x, const half* w, half* out, int T, int D, int K, cudaStream_t stream ) {
+	const size_t total = static_cast<size_t>( T ) * D;
+	if ( total == 0 ) return;
+	glu_dwconv_kernel<<<static_cast<unsigned>( ( total + 255 ) / 256 ), 256, 0, stream>>>( x, w, out, T, D, K );
+}
+
+void Vision::local_rel_attention( const half* q, const half* k, const half* v, const float* q_scale, float k_scale, const float* rel, half* out, int T,
+	int heads, int head_dim, int window, float cap, cudaStream_t stream ) {
+	ENGINE_ASSERT( window <= 32, "Vision::local_rel_attention: window above 32" );
+	const int total = T * heads;
+	if ( total == 0 ) return;
+	local_rel_attention_kernel<<<( total + 127 ) / 128, 128, 0, stream>>>( q, k, v, q_scale, k_scale, rel, out, T, heads, head_dim, window, cap );
 }
 
 } // namespace engine::modules

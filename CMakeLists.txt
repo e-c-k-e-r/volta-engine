@@ -148,6 +148,7 @@ set(ENGINE_HOST_SOURCES
 	src/loader/image.cpp
 	src/loader/video.cpp
 	src/loader/video_decode.cpp
+	src/loader/audio.cpp
 	src/loader/ngram_table.cpp
 	src/models/model.cpp
 	src/models/config_check.cpp
@@ -164,6 +165,7 @@ set(ENGINE_HOST_SOURCES
 	src/models/deepseek_v41.cpp
 	src/models/gemma4.cpp
 	src/models/gemma4_vision.cpp
+	src/models/gemma4_audio.cpp
 	src/runtime/options.cpp
 	src/runtime/kv_cache.cpp
 	src/runtime/cluster.cpp
@@ -556,6 +558,9 @@ set_target_properties(test_dsv41_vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${P
 add_executable(test_gemma4_vision tests/2_parity/test_gemma4_vision.cpp)
 target_link_libraries(test_gemma4_vision PRIVATE engine_kernels)
 set_target_properties(test_gemma4_vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_gemma4_audio tests/2_parity/test_gemma4_audio.cpp)
+target_link_libraries(test_gemma4_audio PRIVATE engine_kernels)
+set_target_properties(test_gemma4_audio PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_jinja tests/2_parity/test_jinja.cpp)
 target_link_libraries(test_jinja PRIVATE engine_kernels)

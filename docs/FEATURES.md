@@ -111,7 +111,7 @@ Covered by `test_all_reduce`, `bench_all_reduce`, `test_coherence`, `tests/4_ser
 | GLM | 24 RMSNorm / SwiGLU blocks with q/k norm, 2x2 conv merge | aspect-preserving resize onto a zero-padded canvas aligned to 28; embeddings only, no M-RoPE |
 | Flash-Next | the checkpoint's own tower (the Qwen3.5 family's) | |
 | DeepSeek | 32 RMSNorm / SwiGLU blocks, fused qkv, 2-D rotary, whole-image attention; a 3x3 aligner (raster order, zero padded) | grey-padded resize under a 1024-token budget; each image is a span of start, rows with a newline each, end; image tokens route with `bias_vl` and skip the Engram n-grams; the tower's memory comes out of rank 0's resident experts |
-| Gemma 4 | 27 sandwich-normed ViT blocks (per-head q / k norms, a 2-D rotary, a GELU-tanh gated MLP), 3 x 3 average pooling into at most 280 soft tokens | BF16 `model.vision_tower.*` tensors loaded as FP16, or a GGUF directory's `mmproj` file; image rows attend to their whole image, and a prefill forward holds whole images; CUDA, CPU and Vulkan |
+| Gemma 4 | sandwich-normed ViT blocks (31B: 27, E4B: 16; per-head q / k norms, a 2-D rotary, a GELU-tanh gated MLP), 3 x 3 average pooling into at most 280 soft tokens; E4B's projections clamp their inputs and outputs to the checkpoint's ranges and its pooler has no standardization | BF16 `model.vision_tower.*` tensors loaded as FP16, or a GGUF directory's `mmproj` file; image rows attend to their whole image (31B), and a prefill forward holds whole images; CUDA, CPU and Vulkan |
 
 * Option: `max_image_tokens` (default 1024 language-model tokens per image, 0 turns images off). The tower loads last into what the arena has left; GLM with the drafter
   leaves too little, so images stay off there unless memory is freed.
@@ -127,7 +127,7 @@ Covered by `test_all_reduce`, `bench_all_reduce`, `test_coherence`, `tests/4_ser
 * The vision tower of a Volta-order EXL3 checkpoint is read in the stock tile order (`model.visual.*`: the quantizer skips it, see [QUANTIZATION.md](QUANTIZATION.md));
   read in the Volta order its embeddings are noise.
 * Video (Qwen, Flash-Next and GLM, whose checkpoints ship a video processor: Qwen3-VL's `video_preprocessor_config.json`, GLM-5's
-  `video_processor` in `processor_config.json`): an OpenAI `video_url` part (a video file's base64 `data:` URL, decoded with FFmpeg's libraries
+  `video_processor` in `processor_config.json`; and Gemma 4): an OpenAI `video_url` part (a video file's base64 `data:` URL, decoded with FFmpeg's libraries
   where the build has them) or a `video` part with the file's `data:` URL or its frames' (images, with `timestamps` in seconds or an `fps`,
   default 2); libvolta takes the frames from the host. A file's frames are sampled as the processor samples them (Qwen: 2 a second, evenly
   spaced, 4 to 768; GLM: one every half second, up to 2048, an even count) and decoded one at a time; frames given are kept as given. All of a
@@ -137,10 +137,21 @@ Covered by `test_all_reduce`, `bench_all_reduce`, `test_coherence`, `tests/4_ser
   temporal patch, encoded as an image of its own (both towers attend within a frame pair); each step is placed as the processors place it:
   Qwen `<t seconds>` and its tokens between vision_start / vision_end, with its own M-RoPE grid, t the mean of its two frames' times; GLM its
   tokens between begin_of_image / end_of_image followed by `t seconds`, inside begin_of_video / end_of_video, t its first frame's time.
-  Steps are cached and keyed like images. A model without video gets the note `[video omitted: this model cannot view videos]`. Covered by
-  `test_video`.
+  Steps are cached and keyed like images. Gemma 4 takes a video as images: 32 frames evenly spaced (all of a shorter video), each at most 70 soft
+  tokens, placed as `mm:ss <|image> ... <image|>` and joined by spaces. A model without video gets the note `[video omitted: this model cannot
+  view videos]`. Covered by `test_video`.
+* Audio (Gemma 4's small models: E4B, with its audio tower, from the checkpoint's `model.audio_tower.*` tensors or a GGUF directory's `mmproj` file):
+  an OpenAI `input_audio` part (base64 `data` of an audio file) or `audio_url` (a `data:` URL); libvolta takes mono samples from the host. WAV is
+  read directly, other formats through FFmpeg's libraries, channels averaged and resampled to 16 kHz (torchaudio's sinc resampler). The features
+  are the checkpoint's: 128 log-mel bins every 10 ms. The tower (on the device, CUDA, CPU and Vulkan): two stride-2 3 x 3 convolutions with a
+  channel LayerNorm (on the host), 12 conformer blocks (half-step SiLU feed-forwards, attention over the row and the 11 before it with sinusoidal
+  relative position keys and a logit softcap of 50, a light convolution: GLU, 5 causal depthwise taps, norm, SiLU), the output projection and the
+  embedding projection; every projection clamps its input and output to the checkpoint's ranges. 25 tokens a second, placed as `<|audio> ...
+  <audio|>`; a clip longer than 30 s is encoded in 30 s chunks, each a span of its own; audio rows stay causal. Option `max_audio_seconds`
+  (default 300, 0 = off: no audio tower loads) bounds a request's audio. A model without an audio tower gets the note `[audio omitted: this model
+  cannot hear audio]`. Covered by `test_gemma4_audio` (against llama.cpp's encoder), `test_ops_vision`.
 * Embeddings are cached by content hash (1 GiB of host RAM), and prefix-cache keys use the image content instead of the placeholder ids.
-* Covered by `test_vision`, `test_ops_vision`, `test_image`, `test_video`, `test_dsv41_vision`, `test_gemma4_vision`, `test_api.sh`.
+* Covered by `test_vision`, `test_ops_vision`, `test_image`, `test_video`, `test_dsv41_vision`, `test_gemma4_vision`, `test_gemma4_audio`, `test_api.sh`.
 
 ## Serving
 

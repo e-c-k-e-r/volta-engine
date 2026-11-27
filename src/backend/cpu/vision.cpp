@@ -289,6 +289,7 @@ void Vision::bias_act( h16* x, const h16* bias, int m, int n, int act, backend::
 			float val = h2f( x[i] ) + ( bias != nullptr ? h2f( bias[i % n] ) : 0.0f );
 			if ( act == ACT_GELU_TANH ) val = gelu_tanh_f( val );
 			else if ( act == ACT_GELU_ERF ) val = gelu_erf_f( val );
+			else if ( act == ACT_SILU ) val = val / ( 1.0f + std::exp( -val ) );
 			x[i] = f2h( val );
 		}
 	} );
@@ -297,6 +298,99 @@ void Vision::bias_act( h16* x, const h16* bias, int m, int n, int act, backend::
 void Vision::bias_residual( float* hidden, const h16* y, const h16* bias, int m, int n, backend::stream_t ) {
 	const size_t total = static_cast<size_t>( m ) * n;
 	for ( size_t i = 0; i < total; ++i ) hidden[i] += h2f( y[i] ) + h2f( bias[i % n] );
+}
+
+void Vision::clamp( h16* x, size_t n, float lo, float hi, backend::stream_t ) {
+	impl::cpu_parallel_for( static_cast<int64_t>( n ), 4096, [&]( int64_t i0, int64_t i1 ) {
+		for ( int64_t i = i0; i < i1; ++i ) x[i] = f2h( std::min( std::max( h2f( x[i] ), lo ), hi ) );
+	} );
+}
+
+void Vision::conv_ln_relu( const float* in, const float* w, const float* g, float* out, int T, int F, int C, int O, float eps, backend::stream_t ) {
+	const int To = ( T + 1 ) / 2, Fo = ( F + 1 ) / 2;
+	impl::cpu_parallel_for( static_cast<int64_t>( To ) * Fo, 16, [&]( int64_t p0, int64_t p1 ) {
+		std::vector<float> acc( static_cast<size_t>( O ) );
+		for ( int64_t pos = p0; pos < p1; ++pos ) {
+			const int t = static_cast<int>( pos / Fo ), f = static_cast<int>( pos % Fo );
+			for ( int o = 0; o < O; ++o ) {
+				float a = 0.0f;
+				for ( int ky = 0; ky < 3; ++ky ) {
+					const int ti = 2 * t - 1 + ky;
+					if ( ti < 0 || ti >= T ) continue;
+					for ( int kx = 0; kx < 3; ++kx ) {
+						const int fi = 2 * f - 1 + kx;
+						if ( fi < 0 || fi >= F ) continue;
+						const float* src = in + ( static_cast<size_t>( ti ) * F + fi ) * C;
+						const float* wk = w + static_cast<size_t>( o ) * C * 9 + ky * 3 + kx;
+						for ( int c = 0; c < C; ++c ) a += wk[c * 9] * src[c];
+					}
+				}
+				acc[o] = a;
+			}
+			float mean = 0.0f;
+			for ( int o = 0; o < O; ++o ) mean += acc[o];
+			mean /= O;
+			float var = 0.0f;
+			for ( int o = 0; o < O; ++o ) var += ( acc[o] - mean ) * ( acc[o] - mean );
+			const float inv = 1.0f / std::sqrt( var / O + eps );
+			for ( int o = 0; o < O; ++o ) out[pos * O + o] = std::max( 0.0f, ( acc[o] - mean ) * inv * g[o] );
+		}
+	} );
+}
+
+void Vision::glu_dwconv( const h16* x, const h16* w, h16* out, int T, int D, int K, backend::stream_t ) {
+	impl::cpu_parallel_for( static_cast<int64_t>( T ), 1, [&]( int64_t t0, int64_t t1 ) {
+		for ( int64_t t = t0; t < t1; ++t ) {
+			for ( int c = 0; c < D; ++c ) {
+				float acc = 0.0f;
+				for ( int k = 0; k < K; ++k ) {
+					const int64_t r = t - K + 1 + k;
+					if ( r < 0 ) continue;
+					const float a = h2f( x[r * 2 * D + c] ), g = h2f( x[r * 2 * D + D + c] );
+					acc += h2f( w[static_cast<size_t>( c ) * K + k] ) * a / ( 1.0f + std::exp( -g ) );
+				}
+				out[t * D + c] = f2h( acc );
+			}
+		}
+	} );
+}
+
+void Vision::local_rel_attention( const h16* q, const h16* k, const h16* v, const float* q_scale, float k_scale, const float* rel, h16* out, int T, int heads,
+	int hd, int window, float cap, backend::stream_t ) {
+	const int HD = heads * hd;
+	impl::cpu_parallel_for( static_cast<int64_t>( T ) * heads, 8, [&]( int64_t i0, int64_t i1 ) {
+		std::vector<float> s( static_cast<size_t>( window ) ), acc( static_cast<size_t>( hd ) );
+		for ( int64_t idx = i0; idx < i1; ++idx ) {
+			const int t = static_cast<int>( idx / heads ), h = static_cast<int>( idx % heads );
+			const h16* qr = q + static_cast<size_t>( t ) * HD + h * hd;
+			const int n = std::min( window, t + 1 );
+			float mx = -3.0e38f;
+			for ( int d = 0; d < n; ++d ) {
+				const h16* kr = k + static_cast<size_t>( t - d ) * HD + h * hd;
+				const float* rr = rel + static_cast<size_t>( d ) * HD + h * hd;
+				float ac = 0.0f, bd = 0.0f;
+				for ( int e = 0; e < hd; ++e ) {
+					const float qe = h2f( qr[e] ) * q_scale[e];
+					ac += qe * h2f( kr[e] );
+					bd += qe * rr[e];
+				}
+				s[d] = cap * std::tanh( ( ac * k_scale + bd ) / cap );
+				mx = std::max( mx, s[d] );
+			}
+			float sum = 0.0f;
+			for ( int d = 0; d < n; ++d ) {
+				s[d] = std::exp( s[d] - mx );
+				sum += s[d];
+			}
+			std::fill( acc.begin(), acc.end(), 0.0f );
+			for ( int d = 0; d < n; ++d ) {
+				const h16* vr = v + static_cast<size_t>( t - d ) * HD + h * hd;
+				for ( int e = 0; e < hd; ++e ) acc[e] += s[d] * h2f( vr[e] );
+			}
+			h16* orow = out + static_cast<size_t>( t ) * HD + h * hd;
+			for ( int e = 0; e < hd; ++e ) orow[e] = f2h( acc[e] / sum );
+		}
+	} );
 }
 
 } // namespace engine::modules

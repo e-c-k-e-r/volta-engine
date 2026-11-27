@@ -64,8 +64,26 @@ bool video_part( const json& p, ChatRequest::Video* v, ApiError* err ) {
 	return true;
 }
 
+// An audio part: input_audio ({data: base64 file, format}), audio_url (a file's data: URL), or input_audio without data (libvolta: the host's next
+// clip)
+bool audio_part( const json& p, ChatRequest::Audio* a, ApiError* err ) {
+	if ( p.value( "type", std::string() ) == "audio_url" ) {
+		const json& au = p.contains( "audio_url" ) ? p["audio_url"] : json();
+		const std::string url = au.is_string() ? au.get<std::string>() : ( au.is_object() ? au.value( "url", std::string() ) : std::string() );
+		return data_url( url, &a->file, "audio_url", err );
+	}
+	const json& ia = p.contains( "input_audio" ) ? p["input_audio"] : json();
+	if ( ia.is_null() ) return true;
+	const std::string data = ia.is_object() ? ia.value( "data", std::string() ) : std::string();
+	if ( data.empty() ) return fail( err, "input_audio needs data (a base64 audio file)" );
+	if ( data.compare( 0, 5, "data:" ) == 0 ) return data_url( data, &a->file, "input_audio", err );
+	if ( !engine::loader::base64_decode( data, &a->file ) || a->file.empty() ) return fail( err, "input_audio holds invalid base64" );
+	return true;
+}
+
 // OpenAI content (string | null | [parts]) -> template content (string | [text parts])
-bool normalize_content( const json& c, json* out, std::vector<std::string>* images, std::vector<ChatRequest::Video>* videos, ApiError* err ) {
+bool normalize_content( const json& c, json* out, std::vector<std::string>* images, std::vector<ChatRequest::Video>* videos, std::vector<ChatRequest::Audio>* audios,
+	ApiError* err ) {
 	if ( c.is_null() ) {
 		*out = "";
 		return true;
@@ -97,8 +115,14 @@ bool normalize_content( const json& c, json* out, std::vector<std::string>* imag
 			videos->push_back( std::move( v ) );
 			parts.push_back( { { "type", "video" } } );
 		}
+		else if ( p.is_object() && ( p.value( "type", std::string() ) == "input_audio" || p.value( "type", std::string() ) == "audio_url" ) ) {
+			ChatRequest::Audio a;
+			if ( !audio_part( p, &a, err ) ) return false;
+			audios->push_back( std::move( a ) );
+			parts.push_back( { { "type", "audio" } } );
+		}
 		else if ( p.is_object() && p.contains( "type" ) && p["type"].is_string() ) {
-			return fail( err, "unsupported content part type '" + p["type"].get<std::string>() + "' (text, image_url, video_url and video are supported)" );
+			return fail( err, "unsupported content part type '" + p["type"].get<std::string>() + "' (text, image_url, video_url, video, input_audio and audio_url are supported)" );
 		}
 		else {
 			return fail( err, "malformed content part" );
@@ -108,7 +132,8 @@ bool normalize_content( const json& c, json* out, std::vector<std::string>* imag
 	return true;
 }
 
-bool normalize_messages( const json& messages, json* out, std::vector<std::string>* images, std::vector<ChatRequest::Video>* videos, ApiError* err ) {
+bool normalize_messages( const json& messages, json* out, std::vector<std::string>* images, std::vector<ChatRequest::Video>* videos, std::vector<ChatRequest::Audio>* audios,
+	ApiError* err ) {
 	if ( !messages.is_array() || messages.empty() ) return fail( err, "messages must be a non-empty array" );
 	*out = json::array();
 	for ( const auto& m : messages ) {
@@ -119,7 +144,7 @@ bool normalize_messages( const json& messages, json* out, std::vector<std::strin
 		json nm = json::object();
 		nm["role"] = role;
 		json content;
-		if ( !normalize_content( m.contains( "content" ) ? m["content"] : json(), &content, images, videos, err ) ) return false;
+		if ( !normalize_content( m.contains( "content" ) ? m["content"] : json(), &content, images, videos, audios, err ) ) return false;
 		nm["content"] = content;
 		if ( role == "assistant" ) {
 			for ( const char* key : { "reasoning_content", "reasoning" } ) {
@@ -382,7 +407,7 @@ public:
 		r.model = j.value( "model", std::string() );
 		if ( !j.contains( "messages" ) ) return fail( err, "messages is required" );
 		json messages;
-		if ( !normalize_messages( j["messages"], &messages, &r.images, &r.videos, err ) ) return false;
+		if ( !normalize_messages( j["messages"], &messages, &r.images, &r.videos, &r.audios, err ) ) return false;
 		r.messages_json = messages.dump();
 
 		bool tools_off = j.contains( "tool_choice" ) && j["tool_choice"].is_string() && j["tool_choice"] == "none";

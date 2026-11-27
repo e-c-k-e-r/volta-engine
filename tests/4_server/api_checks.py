@@ -301,6 +301,10 @@ code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "conten
 check(code == 400, "video timestamps need one per frame", body)
 code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": [{"type": "video"}, {"type": "text", "text": "hi"}]}]})
 check(code == 400, "a video part without a source is refused (the server has no host frames)", body)
+# ---- audio: these models have no audio tower, so a clip reaches them as a note and the request still runs
+WAV = base64.b64encode(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "speech_en_16k.wav"), "rb").read()).decode()
+code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": WAV, "format": "wav"}}, {"type": "text", "text": "Did you get the audio? Answer yes or no."}]}], "max_tokens": 8})
+check(code == 200, "an input_audio part without an audio tower becomes a note", body)
 code, body = post("/v1/messages", {"model": "claude-x", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
                                    "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]})
 check(code == 400 and "server tool" in json.loads(body)["error"]["message"], "Anthropic server tools are refused by name", body)

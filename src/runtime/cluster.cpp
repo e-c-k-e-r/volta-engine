@@ -206,6 +206,7 @@ bool ModelCluster::init( const ClusterConfig& cfg ) {
 		if ( !host_vision_ ) LOG_WARN( "[vision] vision_cpu: %s; image input stays off\n", verr.c_str() );
 	}
 	else models_[0]->load_vision( cfg.model_dir.c_str(), streams_[0] );
+	models_[0]->load_audio( cfg.model_dir.c_str(), streams_[0] );
 	if ( opt.mem_log ) {
 		for ( int d = 0; d < tp_; ++d ) {
 			LOG_INFO( "[mem] GPU %d after loading: arena %.0f / %.0f MiB used, %.0f MiB free outside it (reserve %.0f MiB)\n", d, arenas_[d].offset_bytes / 1048576.0,
@@ -282,6 +283,11 @@ void ModelCluster::set_slot_mm( int slot, MmLayout layout ) {
 	slot_mm_[slot] = std::move( layout );
 }
 
+bool ModelCluster::encode_audio( const engine::loader::PreparedAudio& audio, std::vector<backend::half_t>* out ) {
+	backend::set_device( 0 );
+	return models_[0]->encode_audio( audio, out, streams_[0] );
+}
+
 bool ModelCluster::encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out ) {
 	if ( host_vision_ ) return host_vision_->encode( image, out, nullptr );
 	backend::set_device( 0 );
@@ -300,6 +306,7 @@ void ModelCluster::apply_mrope( pod::BatchRows& rows ) const {
 			const int slot = rows.slot[m];
 			const MmLayout* layout = ( static_cast<size_t>( slot ) < slot_mm_.size() && !slot_mm_[slot].empty() ) ? &slot_mm_[slot] : nullptr;
 			const MmImage* im = layout ? layout->image_at( rows.pos[m] ) : nullptr;
+			if ( im && !im->bidir ) im = nullptr;
 			rows.key_end[m] = im ? im->start + im->count : rows.pos[m] + 1;
 			any = any || im != nullptr;
 		}
@@ -496,6 +503,7 @@ void ModelCluster::mtp_save_hist( int src_row, int rows, int dst_row ) {
 int ModelCluster::span_safe_end( int slot, int from, int end ) const {
 	if ( mm_slots_ == 0 || !models_[0]->bidirectional_images() || slot < 0 || static_cast<size_t>( slot ) >= slot_mm_.size() ) return end;
 	for ( const MmImage& im : slot_mm_[slot].images ) {
+		if ( !im.bidir ) continue;
 		if ( end > im.start && end < im.start + im.count ) return im.start > from ? im.start : im.start + im.count;
 	}
 	return end;

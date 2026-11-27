@@ -67,9 +67,27 @@ struct Vision {
 	static void attention_simt( const backend::half_t* q, const backend::half_t* k, const backend::half_t* v, backend::half_t* out,
 		int m, int heads, int head_dim, float scale, backend::stream_t stream = nullptr );
 
-	enum Act : int { ACT_NONE = 0, ACT_GELU_TANH = 1, ACT_GELU_ERF = 2 };
+	enum Act : int { ACT_NONE = 0, ACT_GELU_TANH = 1, ACT_GELU_ERF = 2, ACT_SILU = 3 };
 	// x[m, n] = act( x + bias ), in place (bias may be null)
 	static void bias_act( backend::half_t* x, const backend::half_t* bias, int m, int n, int act, backend::stream_t stream = nullptr );
+
+	// x[n] = min( max( x, lo ), hi ), in place (Gemma 4's clipped linears)
+	static void clamp( backend::half_t* x, size_t n, float lo, float hi, backend::stream_t stream = nullptr );
+
+	// Gemma 4's audio subsampler layer: a 3x3 stride-2 convolution (zero padding 1) of in [T, F, C] (FP32, channels last) by w [O, C, 3, 3]
+	// (FP32) into out [( T + 1 ) / 2, ( F + 1 ) / 2, O], then a LayerNorm over the O channels (gain g, no bias) and ReLU; O <= 256
+	static void conv_ln_relu( const float* in, const float* w, const float* g, float* out, int T, int F, int C, int O, float eps,
+		backend::stream_t stream = nullptr );
+
+	// Gemma 4's audio light conv: the GLU of x [T, 2D] (g = x[:, :D] * sigmoid( x[:, D:] )) through a causal depthwise convolution of K taps,
+	// out[t][c] = sum_k w[c][k] * g[t - K + 1 + k][c] (zero before the first row), out [T, D]
+	static void glu_dwconv( const backend::half_t* x, const backend::half_t* w, backend::half_t* out, int T, int D, int K, backend::stream_t stream = nullptr );
+
+	// Gemma 4's audio attention, per head: row t attends to rows t - window + 1 .. t; score = softcap( q'·k_j * k_scale + q'·rel[t - j] ) with
+	// q' = q * q_scale (per dimension), softcap( s ) = cap * tanh( s / cap ); rel [window, heads * head_dim] FP32 (the relative position keys);
+	// q / k / v / out [T, heads * head_dim]
+	static void local_rel_attention( const backend::half_t* q, const backend::half_t* k, const backend::half_t* v, const float* q_scale, float k_scale,
+		const float* rel, backend::half_t* out, int T, int heads, int head_dim, int window, float cap, backend::stream_t stream = nullptr );
 
 	// hidden[m, n] += y + bias (FP32 residual stream)
 	static void bias_residual( float* hidden, const backend::half_t* y, const backend::half_t* bias, int m, int n,

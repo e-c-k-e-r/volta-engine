@@ -73,10 +73,23 @@ struct VideoFrame {
 	double time = 0.0;
 };
 
-// A video as its frames, all of one size, in order (the engine keeps them as given, resized to the model's canvas and paired into the tower's
-// temporal patches; past the max_video_tokens option evenly spaced frames drop)
+// A video as its frames, all of one size, in order (the engine keeps them as given, resized to the model's canvas and, where the model's tower
+// takes them in pairs, paired into its temporal patches; past the max_video_tokens option evenly spaced frames drop)
 struct Video {
 	std::vector<VideoFrame> frames;
+};
+
+// An audio clip: mono samples in [-1, 1] at sample_rate (resampled to the model's rate)
+struct Audio {
+	std::vector<float> pcm;
+	int sample_rate = 16000;
+};
+
+// The host's media for one request: each {"type": "video"} content part without a source of its own takes the next of `videos`, each
+// {"type": "input_audio"} part without input_audio data the next of `audio`, in message order (as many parts as entries)
+struct Media {
+	std::vector<Video> videos;
+	std::vector<Audio> audio;
 };
 
 // Mono float PCM in [-1, 1]
@@ -102,15 +115,15 @@ public:
 	// ...; "stream" is ignored). The events come on the engine's scheduler thread; returning false from on_event cancels the reply. Returns the
 	// request's id, or 0 with *error set (nothing is called then)
 	uint64_t chat( const std::string& request_json, std::function<bool( const ChatEvent& )> on_event, std::string* error );
-	// With videos from the host: each {"type": "video"} content part without a source of its own takes the next of `videos`, in message
-	// order (as many parts as videos). Parts with sources are the server's: image_url and video_url as base64 data: URLs, video with a
-	// video file's data: URL or its frames' (and "timestamps" in seconds, or "fps"); video files need a build with FFmpeg
-	uint64_t chat( const std::string& request_json, const std::vector<Video>& videos, std::function<bool( const ChatEvent& )> on_event, std::string* error );
+	// With media from the host (Media). Parts with sources are the server's: image_url, video_url and audio_url as base64 data: URLs, video
+	// with a video file's data: URL or its frames' (and "timestamps" in seconds, or "fps"), input_audio with base64 data; video files and
+	// audio other than WAV need a build with FFmpeg
+	uint64_t chat( const std::string& request_json, const Media& media, std::function<bool( const ChatEvent& )> on_event, std::string* error );
 	// Ends a reply early (its Finish event reports "cancelled"); unknown or finished ids are ignored
 	void cancel( uint64_t id );
 	// The prompt length a chat body renders to, or -1 with *error set
 	int count_tokens( const std::string& request_json, std::string* error );
-	int count_tokens( const std::string& request_json, const std::vector<Video>& videos, std::string* error );
+	int count_tokens( const std::string& request_json, const Media& media, std::string* error );
 
 	// Speech: an OpenAI /v1/audio/speech body (input, voice, speed) with vall-e's fields (language, seed, cfg, cfg_prompt, steps, duration,
 	// temperature, ...; docs/TTS.md). Blocks the calling thread; one synthesis runs at a time

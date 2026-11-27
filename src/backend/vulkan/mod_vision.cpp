@@ -116,4 +116,36 @@ void Vision::bias_residual( float* hidden, const backend::half_t* y, const backe
 	vki::launch( "vision_bias_residual", p, stream, static_cast<uint32_t>( std::min<int64_t>( groups, 65535 ) ), static_cast<uint32_t>( ( groups + 65534 ) / 65535 ) );
 }
 
+void Vision::clamp( backend::half_t* x, size_t n, float lo, float hi, backend::stream_t stream ) {
+	if ( n == 0 ) return;
+	vki::ClampParams p{ vki::dp( x ), static_cast<int64_t>( n ), lo, hi };
+	const int64_t groups = ( static_cast<int64_t>( n ) + 255 ) / 256;
+	vki::launch( "vision_clamp", p, stream, static_cast<uint32_t>( std::min<int64_t>( groups, 65535 ) ), static_cast<uint32_t>( ( groups + 65534 ) / 65535 ) );
+}
+
+void Vision::conv_ln_relu( const float* in, const float* w, const float* g, float* out, int T, int F, int C, int O, float eps, backend::stream_t stream ) {
+	ENGINE_ASSERT( O >= 1 && O <= 256, "Vision::conv_ln_relu: 1 to 256 channels" );
+	const int positions = ( ( T + 1 ) / 2 ) * ( ( F + 1 ) / 2 );
+	if ( positions == 0 ) return;
+	vki::ConvLnReluParams p{ vki::dp( in ), vki::dp( w ), vki::dp( g ), vki::dp( out ), T, F, C, O, eps };
+	vki::launch( "vision_conv_ln_relu", p, stream, static_cast<uint32_t>( std::min( positions, 65535 ) ), static_cast<uint32_t>( ( positions + 65534 ) / 65535 ) );
+}
+
+void Vision::glu_dwconv( const backend::half_t* x, const backend::half_t* w, backend::half_t* out, int T, int D, int K, backend::stream_t stream ) {
+	const int64_t total = static_cast<int64_t>( T ) * D;
+	if ( total == 0 ) return;
+	vki::GluDwconvParams p{ vki::dp( x ), vki::dp( w ), vki::dp( out ), total, D, K };
+	const int64_t groups = ( total + 255 ) / 256;
+	vki::launch( "vision_glu_dwconv", p, stream, static_cast<uint32_t>( std::min<int64_t>( groups, 65535 ) ), static_cast<uint32_t>( ( groups + 65534 ) / 65535 ) );
+}
+
+void Vision::local_rel_attention( const backend::half_t* q, const backend::half_t* k, const backend::half_t* v, const float* q_scale, float k_scale,
+	const float* rel, backend::half_t* out, int T, int heads, int head_dim, int window, float cap, backend::stream_t stream ) {
+	ENGINE_ASSERT( window <= 32, "Vision::local_rel_attention: window above 32" );
+	const int total = T * heads;
+	if ( total == 0 ) return;
+	vki::LocalRelAttnParams p{ vki::dp( q ), vki::dp( k ), vki::dp( v ), vki::dp( q_scale ), vki::dp( rel ), vki::dp( out ), T, heads, head_dim, window, k_scale, cap };
+	vki::launch( "vision_local_rel_attention", p, stream, static_cast<uint32_t>( ( total + 63 ) / 64 ) );
+}
+
 } // namespace engine::modules

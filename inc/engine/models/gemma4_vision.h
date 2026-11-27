@@ -28,8 +28,9 @@ struct Gemma4VisionConfig {
 
 // Gemma 4's image encoder: a patch projection plus learned x / y position embeddings, sandwich-normed ViT blocks (per-head q / k norms, an
 // unweighted v norm, a 2-D rotary, softmax scale 1, a GELU-tanh gated MLP), a pool x pool average pooler with the checkpoint's
-// standardization, an unweighted RMSNorm and the projection into the language model. Weights are the checkpoint's model.vision_tower.* and
-// model.embed_vision.* tensors (BF16, loaded as FP16).
+// standardization (std_bias / std_scale, where the checkpoint has them), an unweighted RMSNorm and the projection into the language model.
+// The projections of the small models clamp their inputs and outputs to the checkpoint's ranges (use_clipped_linears). Weights are the
+// checkpoint's model.vision_tower.* and model.embed_vision.* tensors (BF16, loaded as FP16).
 class Gemma4VisionTower : public VisionTower {
 public:
 	// False without a vision_config or without the vision tensors
@@ -42,7 +43,10 @@ private:
 	struct Block {
 		pod::TensorView input_norm, post_attn_norm, pre_ffn_norm, post_ffn_norm, q_norm, k_norm;
 		pod::LinearWeight q, k, v, o, gate, up, down;
+		ClipRange cq, ck, cv, co, cgate, cup, cdown;
 	};
+	// A clipped projection: in (its input, clamped in place, or in a copy at `spare` when the input's other readers clip it otherwise)
+	void clipped( pod::TensorView& in, const pod::LinearWeight& w, const ClipRange& c, pod::TensorView& out, backend::half_t* spare, backend::stream_t stream );
 
 	bool loaded_ = false;
 	Gemma4VisionConfig cfg_;

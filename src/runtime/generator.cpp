@@ -550,7 +550,7 @@ void Generator::finish_slot( int s, FinishReason reason ) {
 }
 
 void Generator::prefetch_image( const GenerationRequest::Image& im ) {
-	if ( cluster_.host_vision() ) image_embeddings( im );
+	if ( cluster_.host_vision() && !im.audio ) image_embeddings( im );   // audio encodes on the device, from the scheduler thread
 }
 
 std::shared_ptr<const std::vector<backend::half_t>> Generator::image_embeddings( const GenerationRequest::Image& im ) {
@@ -561,12 +561,19 @@ std::shared_ptr<const std::vector<backend::half_t>> Generator::image_embeddings(
 		image_cache_lru_.push_front( im.hash );
 		return it->second;
 	}
-	if ( !im.prepared ) return nullptr;
+	if ( !im.prepared && !im.audio ) return nullptr;
 	auto out = std::make_shared<std::vector<backend::half_t>>();
 	const auto t0 = std::chrono::steady_clock::now();
-	if ( !cluster_.encode_image( *im.prepared, out.get() ) ) return nullptr;
-	LOG_INFO( "[vision] encoded %dx%d patches -> %d tokens in %.0f ms\n", im.prepared->grid_h, im.prepared->grid_w, im.count,
-		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
+	if ( im.audio ) {
+		if ( !cluster_.encode_audio( *im.audio, out.get() ) ) return nullptr;
+		LOG_INFO( "[audio] encoded %d frames -> %d tokens in %.0f ms\n", im.audio->frames, im.count,
+			std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
+	}
+	else {
+		if ( !cluster_.encode_image( *im.prepared, out.get() ) ) return nullptr;
+		LOG_INFO( "[vision] encoded %dx%d patches -> %d tokens in %.0f ms\n", im.prepared->grid_h, im.prepared->grid_w, im.count,
+			std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
+	}
 	constexpr size_t kCacheBytes = 1024ULL << 20;
 	image_cache_bytes_ += out->size() * sizeof( backend::half_t );
 	image_cache_[im.hash] = out;
@@ -614,6 +621,7 @@ bool Generator::prefill_slot( int s, int budget ) {
 				mi.grid_h = im.grid_h;
 				mi.grid_w = im.grid_w;
 				mi.hash = im.hash;
+				mi.bidir = !im.audio;
 				// Rows before the resume point are already in the restored KV; only images that reach past it need embeddings
 				if ( im.start + im.count > pos ) {
 					mi.embeds = image_embeddings( im );

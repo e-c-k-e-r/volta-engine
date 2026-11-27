@@ -11,8 +11,8 @@ cmake -S . -B build -G Ninja && cmake --build build
 
 A full CUDA build takes a while (the trellis kernels are template heavy); incremental builds are quick.
 
-Video files as model input need FFmpeg's libraries (libavformat, libavcodec, libswscale; found with pkg-config, in every configuration).
-`-DENGINE_FFMPEG=OFF` leaves them out; a video then arrives as its frames.
+Video files and audio other than WAV as model input need FFmpeg's libraries (libavformat, libavcodec, libswscale; found with pkg-config, in
+every configuration). `-DENGINE_FFMPEG=OFF` leaves them out; a video then arrives as its frames, audio as WAV.
 
 ### Build time
 

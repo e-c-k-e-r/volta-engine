@@ -7,6 +7,7 @@
 #include <vulkan/vulkan.h>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -282,10 +283,19 @@ int main( int argc, char** argv ) {
 				clip.frames.push_back( std::move( f ) );
 			}
 			const char* body = R"({"messages":[{"role":"user","content":[{"type":"video"},{"type":"text","text":"What happens?"}]}]})";
-			const int nv = engine->count_tokens( body, { clip }, &error );
+			volta::Media media;
+			media.videos.push_back( clip );
+			const int nv = engine->count_tokens( body, media, &error );
 			check( nv > n, "count_tokens with the host's video" );
 			std::string verr;
-			check( engine->count_tokens( body, {}, &verr ) < 0 && !verr.empty(), "a video part without a video is an error" );
+			check( engine->count_tokens( body, volta::Media(), &verr ) < 0 && !verr.empty(), "a video part without a video is an error" );
+			// a clip of the host's samples (a model without audio renders its note instead)
+			volta::Media sound;
+			sound.audio.push_back( { std::vector<float>( 16000 * 2, 0.0f ), 16000 } );
+			for ( size_t i = 0; i < sound.audio[0].pcm.size(); ++i ) sound.audio[0].pcm[i] = 0.3f * std::sin( 6.2831853f * 440.0f * i / 16000.0f );
+			const char* abody = R"({"messages":[{"role":"user","content":[{"type":"input_audio"},{"type":"text","text":"What do you hear?"}]}]})";
+			const int na = engine->count_tokens( abody, sound, &error );
+			check( na > n, "count_tokens with the host's audio" );
 		}
 		check( engine->chat( "{ not json", Reply().handler(), &error ) == 0 && !error.empty(), "a bad body is an error" );
 	}

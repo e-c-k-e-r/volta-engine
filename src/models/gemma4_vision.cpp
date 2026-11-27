@@ -41,6 +41,19 @@ bool Gemma4VisionTower::load( const char* model_dir, pod::MemoryArena& arena, in
 	params_.merge_size = cfg_.pool;
 	params_.gemma = true;
 	params_.max_tokens = cfg_.max_soft_tokens;
+	// video (Gemma4VideoProcessor): num_frames frames of at most max_soft_tokens soft tokens each, from the checkpoint's processor config or
+	// the processor's defaults
+	params_.video = true;
+	params_.video_max_frames = 32;
+	params_.video_frame_tokens = 70;
+	for ( const char* f : { "/video_preprocessor_config.json", "/processor_config.json" } ) {
+		nlohmann::json vp = read_json( std::string( model_dir ) + f );
+		if ( !vp.is_discarded() && vp.contains( "video_processor" ) ) vp = vp["video_processor"];
+		if ( vp.is_discarded() || !vp.is_object() || !vp.contains( "max_soft_tokens" ) ) continue;
+		params_.video_max_frames = vp.value( "num_frames", params_.video_max_frames );
+		params_.video_frame_tokens = vp.value( "max_soft_tokens", params_.video_frame_tokens );
+		break;
+	}
 
 	engine::loader::SafeTensorsRepo repo;
 	if ( !repo.open( model_dir ) ) return false;
@@ -74,8 +87,12 @@ bool Gemma4VisionTower::load( const char* model_dir, pod::MemoryArena& arena, in
 	};
 	patch_proj_ = dense( std::string( VT ) + "patch_embedder.input_proj.weight" );
 	out_proj_ = dense( "model.embed_vision.embedding_projection.weight" );
-	std_bias_ = fp16( std::string( VT ) + "std_bias" );
-	std_scale_ = fp16( std::string( VT ) + "std_scale" );
+	// the standardization after the pooler (vision_config.standardize; the small models have none)
+	if ( vc.value( "standardize", true ) && has( std::string( VT ) + "std_bias" ) && has( std::string( VT ) + "std_scale" ) ) {
+		std_bias_ = fp16( std::string( VT ) + "std_bias" );
+		std_scale_ = fp16( std::string( VT ) + "std_scale" );
+	}
+	const bool clipped_linears = vc.value( "use_clipped_linears", false );
 	{
 		const std::string name = std::string( VT ) + "patch_embedder.position_embedding_table";
 		pos_table_.resize( static_cast<size_t>( 2 ) * cfg_.pos_table * H );
@@ -98,6 +115,15 @@ bool Gemma4VisionTower::load( const char* model_dir, pod::MemoryArena& arena, in
 		b.gate = dense( p + "mlp.gate_proj.linear.weight" );
 		b.up = dense( p + "mlp.up_proj.linear.weight" );
 		b.down = dense( p + "mlp.down_proj.linear.weight" );
+		if ( clipped_linears ) {
+			b.cq = repo_clip( repo, p + "self_attn.q_proj" );
+			b.ck = repo_clip( repo, p + "self_attn.k_proj" );
+			b.cv = repo_clip( repo, p + "self_attn.v_proj" );
+			b.co = repo_clip( repo, p + "self_attn.o_proj" );
+			b.cgate = repo_clip( repo, p + "mlp.gate_proj" );
+			b.cup = repo_clip( repo, p + "mlp.up_proj" );
+			b.cdown = repo_clip( repo, p + "mlp.down_proj" );
+		}
 	}
 	repo.close();
 
@@ -123,6 +149,22 @@ bool Gemma4VisionTower::load( const char* model_dir, pod::MemoryArena& arena, in
 	loaded_ = true;
 	LOG_INFO( "[vision] Gemma 4 tower loaded: %d blocks, up to %d soft tokens (%d patches)\n", cfg_.depth, cfg_.max_soft_tokens, max_patches_ );
 	return true;
+}
+
+void Gemma4VisionTower::clipped( pod::TensorView& in, const pod::LinearWeight& w, const ClipRange& c, pod::TensorView& out, backend::half_t* spare,
+	backend::stream_t stream ) {
+	using engine::modules::Vision;
+	pod::TensorView x = in;
+	if ( c.in() ) {
+		const size_t n = static_cast<size_t>( in.shape[0] ) * in.shape[1];
+		if ( spare != nullptr ) {
+			backend::memcpy_async( spare, in.data, n * sizeof( backend::half_t ), backend::Copy::D2D, stream );
+			x = view2d( spare, in.shape[0], in.shape[1] );
+		}
+		Vision::clamp( x.ptr<backend::half_t>(), n, c.in_lo, c.in_hi, stream );
+	}
+	engine::modules::Linear::forward( x, w, out, stream );
+	if ( c.out() ) Vision::clamp( out.ptr<backend::half_t>(), static_cast<size_t>( out.shape[0] ) * out.shape[1], c.out_lo, c.out_hi, stream );
 }
 
 bool Gemma4VisionTower::encode( const engine::loader::PreparedImage& img, std::vector<backend::half_t>* out, backend::stream_t stream ) {
@@ -167,22 +209,25 @@ bool Gemma4VisionTower::encode( const engine::loader::PreparedImage& img, std::v
 	for ( const Block& b : blocks_ ) {
 		Vision::rms_norm( d_hidden_, b.input_norm.ptr<const backend::half_t>(), d_ln_, m, H, cfg_.eps, stream );
 		pod::TensorView ln = view2d( d_ln_, m, H ), qv = view2d( d_q_, m, H ), kv = view2d( d_k_, m, H ), vv = view2d( d_v_, m, H );
-		Linear::forward( ln, b.q, qv, stream );
-		Linear::forward( ln, b.k, kv, stream );
-		Linear::forward( ln, b.v, vv, stream );
+		// q, k and v read the norm with their own input ranges: one range clamps it in place, others clamp a copy in the output's buffer
+		const bool shared = b.cq.same_input( b.ck ) && b.cq.same_input( b.cv );
+		clipped( ln, b.q, b.cq, qv, shared ? nullptr : d_attn_, stream );
+		clipped( ln, b.k, b.ck, kv, shared ? nullptr : d_attn_, stream );
+		clipped( ln, b.v, b.cv, vv, shared ? nullptr : d_attn_, stream );
 		Vision::qkv_norm_rope2d( d_q_, d_k_, d_v_, b.q_norm.ptr<const backend::half_t>(), b.k_norm.ptr<const backend::half_t>(), d_pos_xy_, m, cfg_.heads,
 			cfg_.head_dim, cfg_.rope_theta, cfg_.eps, stream );
 		Vision::attention( d_q_, d_k_, d_v_, d_attn_, m, cfg_.heads, cfg_.head_dim, 1.0f, stream );
 		pod::TensorView at = view2d( d_attn_, m, H ), tmp = view2d( d_tmp_, m, H );
-		Linear::forward( at, b.o, tmp, stream );
+		clipped( at, b.o, b.co, tmp, nullptr, stream );
 		engine::modules::Elementwise::add_normed( resid, tmp, b.post_attn_norm, cfg_.eps, 0.0f, 1.0f, stream );
 
 		Vision::rms_norm( d_hidden_, b.pre_ffn_norm.ptr<const backend::half_t>(), d_ln_, m, H, cfg_.eps, stream );
 		pod::TensorView gate = view2d( d_gate_, m, I ), up = view2d( d_up_, m, I ), mlp = view2d( d_mlp_, m, I );
-		Linear::forward( ln, b.gate, gate, stream );
-		Linear::forward( ln, b.up, up, stream );
+		const bool shared_mlp = b.cgate.same_input( b.cup );
+		clipped( ln, b.gate, b.cgate, gate, shared_mlp ? nullptr : d_tmp_, stream );
+		clipped( ln, b.up, b.cup, up, shared_mlp ? nullptr : d_tmp_, stream );
 		engine::modules::SwiGLU::forward( gate, up, mlp, stream, 0.0f, true );
-		Linear::forward( mlp, b.down, tmp, stream );
+		clipped( mlp, b.down, b.cdown, tmp, nullptr, stream );
 		engine::modules::Elementwise::add_normed( resid, tmp, b.post_ffn_norm, cfg_.eps, 0.0f, 1.0f, stream );
 	}
 

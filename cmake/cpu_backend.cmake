@@ -14,6 +14,11 @@ set(ENGINE_CPU_HOST_SOURCES ${ENGINE_HOST_SOURCES})
 file(GLOB ENGINE_CPU_BACKEND_SOURCES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/src/backend/cpu/*.cpp ${PROJECT_SOURCE_DIR}/src/backend/stubs/*.cpp)
 
 add_library(engine_cpu_host OBJECT ${ENGINE_CPU_HOST_SOURCES})
+# FFmpeg's libraries for video and audio files: the host objects' headers, and every target made below links them
+if(ENGINE_FFMPEG_FOUND)
+	target_link_libraries(engine_cpu_host PRIVATE PkgConfig::FFMPEG)
+	link_libraries(PkgConfig::FFMPEG)
+endif()
 
 add_library(engine_cpu_backend OBJECT ${ENGINE_CPU_BACKEND_SOURCES})
 target_include_directories(engine_cpu_backend PRIVATE ${SLANG_INCLUDE_DIR})
@@ -65,6 +70,9 @@ target_link_libraries(test_cpu_forward PRIVATE pthread)
 add_executable(test_gemma4_vision tests/2_parity/test_gemma4_vision.cpp ${ENGINE_CPU_OBJECTS})
 set_target_properties(test_gemma4_vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 target_link_libraries(test_gemma4_vision PRIVATE pthread)
+add_executable(test_gemma4_audio tests/2_parity/test_gemma4_audio.cpp ${ENGINE_CPU_OBJECTS})
+set_target_properties(test_gemma4_audio PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+target_link_libraries(test_gemma4_audio PRIVATE pthread)
 
 add_executable(test_gguf_linear tests/2_parity/test_gguf_linear.cpp ${ENGINE_CPU_OBJECTS})
 set_target_properties(test_gguf_linear PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")

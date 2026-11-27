@@ -9,6 +9,7 @@
 #include "engine/core/graph_cache.h"
 #include "engine/modules/linear.h"
 #include "engine/models/gemma4_vision.h"
+#include "engine/models/gemma4_audio.h"
 #include "engine/backend/types.h"
 #include <cstdint>
 #include <memory>
@@ -146,6 +147,9 @@ public:
 	bool load_vision( const char* model_dir, backend::stream_t stream = nullptr ) override;
 	const engine::loader::VisionParams* vision_params() const override { return vision_.loaded() ? &vision_.params() : nullptr; }
 	bool encode_image( const engine::loader::PreparedImage& image, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
+	bool load_audio( const char* model_dir, backend::stream_t stream = nullptr ) override;
+	const engine::loader::AudioParams* audio_params() const override { return audio_.loaded() ? &audio_.params() : nullptr; }
+	bool encode_audio( const engine::loader::PreparedAudio& audio, std::vector<backend::half_t>* out, backend::stream_t stream = nullptr ) override;
 	bool bidirectional_images() const override { return config_.bidirectional_images; }
 	bool image_mrope() const override { return false; }
 
@@ -166,6 +170,7 @@ private:
 	size_t tap_snapshot_bytes( int tokens ) const;
 
 	Gemma4VisionTower vision_;   // rank 0 only
+	Gemma4AudioTower audio_;   // rank 0 only
 
 	// DFlash drafter attachment: a tap ring per slot (6 taps per position), the head scratch
 	DraftHooks draft_hooks_;

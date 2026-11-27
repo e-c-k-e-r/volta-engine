@@ -91,6 +91,8 @@ struct GenerationRequest {
 		int grid_w = 0;
 		uint64_t hash = 0;
 		std::shared_ptr<const engine::loader::PreparedImage> prepared;
+		// an audio chunk instead (Gemma 4's audio tower; grid 1 x count): its rows stay causal where an image's see the whole image
+		std::shared_ptr<const engine::loader::PreparedAudio> audio;
 	};
 	std::vector<Image> images;
 	std::vector<Checkpoint> checkpoint_at;   // ascending prompt positions to snapshot into the prefix cache (system-prompt end, turn boundary)
@@ -232,6 +234,7 @@ public:
 	int max_context() const { return cluster_.metadata().max_seq_len; }
 	// Image preprocessing parameters of the loaded vision tower; null when the model takes no images
 	const engine::loader::VisionParams* vision_params() const { return cluster_.vision_params(); }
+	const engine::loader::AudioParams* audio_params() const { return cluster_.audio_params(); }
 	// With vision_cpu: encodes an image on the calling (request) thread and caches the rows, so the scheduler finds them ready and the slots keep
 	// decoding meanwhile; a no-op for the on-GPU tower, which only the scheduler thread may drive
 	void prefetch_image( const GenerationRequest::Image& im );
